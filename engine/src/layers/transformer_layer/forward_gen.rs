@@ -1158,106 +1158,26 @@ impl TransformerLayer {
                 None
             };
 
-            // 0. Make residual visible to CPU (same sync-amortization knobs as before).
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SYNC_LAYER_COUNT: AtomicU64 = AtomicU64::new(0);
-            static SYNC_EVERY_N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let sync_n = *SYNC_EVERY_N.get_or_init(|| {
-                std::env::var("LLMRS_PARTITION_SYNC_EVERY_N")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .filter(|&n| n >= 1)
-                    .unwrap_or(1)
-            });
-            let layer_count = SYNC_LAYER_COUNT.fetch_add(1, Ordering::Relaxed);
-            let skip_sync = sync_n > 1 && !layer_count.is_multiple_of(sync_n);
-
+            // 0. Make residual visible to CPU.
             let zcopy_residual = !ws.residual.as_ptr().is_null();
             // A1 async-read path: non-blocking enqueue of the residual DMA
             // read + deferred `wait_event` immediately before the CPU slice
             // consumes the bytes. Enables overlap of the host-side sync-drain
             // with the GPU FFN chain enqueue issued right after.
-            let async_read =
-                partition_async_read_enabled() && !zcopy_residual && !skip_sync && is_gpu;
-            // Direction A (compute replication): CPU DMA-reads `attn_out` and
-            // independently runs `add_rms_norm_oop` to produce its own
-            // residual, while the GPU runs its matching call in parallel.
-            // Advances the sync point from post-norm to post-attn_out and
-            // overlaps the host wait window with the GPU FFN chain enqueue.
-            //
-            // Gates:
-            //   - Gemma3 (rms_norm_add_unit) is out of scope (different fused norm).
-            //   - skip_sync (LLMRS_PARTITION_SYNC_EVERY_N>1) falls back to legacy.
-            //
-            // `x` host-visibility is NOT a gate. When `x.as_ptr()` is null
-            // (UMA `UnifiedBuffer` without a current `map()`, common on
-            // Adreno for the previous layer's output), the CPU reads `x`
-            // into `pw.x_cpu` via an additional `enqueue_read_buffer_async`
-            // call enqueued alongside the `attn_out` read. Both DMAs are
-            // awaited together right before the CPU norm runs.
-            let replicate_norm = is_gpu
-                && !rms_norm_add_unit
-                && !skip_sync
-                && crate::layers::tensor_partition::partition_replicate_norm_enabled();
+            let async_read = partition_async_read_enabled() && !zcopy_residual && is_gpu;
             let mut pending_read_evt: Option<crate::core::backend::GpuEvent> = None;
-            // Deferred event for the x→x_cpu DMA when `x` is not host-visible.
-            // `None` when `x` is directly CPU-accessible and no fallback read
-            // was needed.
-            let mut pending_x_evt: Option<crate::core::backend::GpuEvent> = None;
-            // Tracks whether the CPU norm should read from `x` directly (UMA
-            // host-visible path) or from `pw.x_cpu` (async-read fallback).
-            // Decided at enqueue time so later code can borrow `pw.x_cpu`
-            // without re-checking `x.as_ptr()`.
-            let mut replicate_use_x_cpu = false;
-            // Track which path was taken for trace accounting.
             let partition_path;
-            let residual_cpu_ptr: *const u8 = if replicate_norm {
-                // Enqueue non-blocking read of `ws.attn_out` into CPU buffer.
-                // No prior `synchronize()` — the in-order queue guarantees
-                // this read observes the completed `matmul_wo` + prior ops.
-                let t_replicate_start = std::time::Instant::now();
-                unsafe {
-                    let dst = std::slice::from_raw_parts_mut(
-                        pw.attn_out_cpu.as_mut_ptr(),
-                        pw.attn_out_cpu.size(),
-                    );
-                    pending_read_evt = Some(backend.enqueue_read_buffer_async(&ws.attn_out, dst)?);
-                }
-                // Fallback: if `x` is not host-visible, enqueue a parallel
-                // async read of `x` into `pw.x_cpu`. Both DMAs pipeline
-                // against the GPU FFN chain enqueued below.
-                if x.as_ptr().is_null() {
-                    unsafe {
-                        let dst =
-                            std::slice::from_raw_parts_mut(pw.x_cpu.as_mut_ptr(), pw.x_cpu.size());
-                        pending_x_evt = Some(backend.enqueue_read_buffer_async(x, dst)?);
-                    }
-                    replicate_use_x_cpu = true;
-                }
+            let residual_cpu_ptr: *const u8 = if zcopy_residual {
+                backend.synchronize()?;
                 if part_trace {
-                    // Under replicate_norm, the "sync_drain" window collapses to
-                    // the enqueue call; the real wait happens after GPU FFN
-                    // enqueue and is accounted for in the dma_read segment.
-                    TLS_T_SYNC_DONE.with(|c| c.set(Some(t_replicate_start)));
-                }
-                partition_path = crate::layers::tensor_partition::PartitionPath::ReplicateNorm;
-                // Placeholder — CPU residual is computed after wait_event below.
-                pw.residual_cpu.as_ptr()
-            } else if zcopy_residual {
-                if !skip_sync {
-                    backend.synchronize()?;
-                }
-                // Zcopy has no DMA read; record sync completion immediately so
-                // the dma_ns window is 0 for this path.
-                if part_trace {
-                    let t_zcopy_sync_done = std::time::Instant::now();
-                    TLS_T_SYNC_DONE.with(|c| c.set(Some(t_zcopy_sync_done)));
+                    TLS_T_SYNC_DONE.with(|c| c.set(Some(std::time::Instant::now())));
                 }
                 partition_path = crate::layers::tensor_partition::PartitionPath::Zcopy;
                 ws.residual.as_ptr()
             } else if async_read {
                 // Non-blocking DMA read — no prior `synchronize()`, enqueue_read
-                // itself orders against the in-order queue.
+                // itself orders against the in-order queue. The drain happens
+                // at `wait_event` below, after the GPU FFN chain is enqueued.
                 let t_async_start = std::time::Instant::now();
                 unsafe {
                     let dst = std::slice::from_raw_parts_mut(
@@ -1267,9 +1187,6 @@ impl TransformerLayer {
                     pending_read_evt = Some(backend.enqueue_read_buffer_async(&ws.residual, dst)?);
                 }
                 if part_trace {
-                    // Under async_read, the "sync_drain" window collapses to
-                    // the enqueue call itself; the real wait is deferred and
-                    // will be accounted for in the dma_read segment below.
                     TLS_T_SYNC_DONE.with(|c| c.set(Some(t_async_start)));
                 }
                 partition_path = crate::layers::tensor_partition::PartitionPath::AsyncRead;
@@ -1277,32 +1194,28 @@ impl TransformerLayer {
             } else {
                 // Explicit sync first so we can time the drain independently
                 // from the DMA-read phase below.
-                if !skip_sync {
-                    backend.synchronize()?;
-                }
-                // Mark end of the sync-drain phase.
-                let _t_sync_done_marker = std::time::Instant::now();
+                backend.synchronize()?;
                 if part_trace {
-                    // Stash the marker in a thread-local for the record call.
-                    TLS_T_SYNC_DONE.with(|c| c.set(Some(_t_sync_done_marker)));
+                    TLS_T_SYNC_DONE.with(|c| c.set(Some(std::time::Instant::now())));
                 }
-                if !skip_sync {
-                    unsafe {
-                        let dst = std::slice::from_raw_parts_mut(
-                            pw.residual_cpu.as_mut_ptr(),
-                            pw.residual_cpu.size(),
-                        );
-                        backend.read_buffer(&ws.residual, dst)?;
-                    }
+                unsafe {
+                    let dst = std::slice::from_raw_parts_mut(
+                        pw.residual_cpu.as_mut_ptr(),
+                        pw.residual_cpu.size(),
+                    );
+                    backend.read_buffer(&ws.residual, dst)?;
                 }
                 partition_path = crate::layers::tensor_partition::PartitionPath::SyncRead;
                 pw.residual_cpu.as_ptr()
             };
             #[cfg(target_arch = "aarch64")]
-            let residual_cpu_dims = if zcopy_residual && !replicate_norm {
-                ws.residual.shape().dims().to_vec()
-            } else {
-                pw.residual_cpu.shape().dims().to_vec()
+            let k_cpu = {
+                let dims = if zcopy_residual {
+                    ws.residual.shape().dims()
+                } else {
+                    pw.residual_cpu.shape().dims()
+                };
+                dims[dims.len() - 1]
             };
             let t_read = if part_trace {
                 Some(std::time::Instant::now())
@@ -1327,124 +1240,69 @@ impl TransformerLayer {
             )?;
             backend.flush()?;
 
-            // Diagnostic: serialize GPU FFN slice before CPU starts to isolate
-            // CPU compute from DRAM bandwidth contention. With this flag on,
-            // `cpu_ns` reflects pure NEON throughput; without it, `cpu_ns`
-            // includes any slowdown from concurrent GPU weight reads on the
-            // shared LPDDR. Compare the two to attribute the cpu_matmul gap.
-            if std::env::var_os("LLMRS_PARTITION_GPU_DELAY").is_some() {
-                backend.synchronize()?;
-            }
-
-            // A1 async-read / Direction A: wait for the non-blocking DMA read
-            // to land before CPU consumes it. This is the host wait window
-            // that previously sat before the GPU enqueue as `synchronize()`;
-            // by deferring it here it can overlap with the GPU enqueue/flush
-            // above. When Direction A fell back to the async x-read path,
-            // wait for the x DMA too — both events were enqueued on the same
-            // in-order queue but waiting explicitly keeps the ordering
-            // guarantee independent of queue semantics.
+            // A1 async-read: wait for the non-blocking DMA read to land
+            // before CPU consumes it. The host wait window overlaps with
+            // the GPU FFN chain enqueue/flush above.
             if let Some(evt) = pending_read_evt.take() {
                 backend.wait_event(&evt)?;
-            }
-            if let Some(evt) = pending_x_evt.take() {
-                backend.wait_event(&evt)?;
-            }
-
-            // Direction A: CPU independently computes the residual from its
-            // own (x, attn_out_cpu) via add_rms_norm_oop. The GPU has already
-            // produced `ws.residual` via its own add_rms_norm_oop call above
-            // (unchanged); this CPU copy is a numerically-equivalent replica
-            // (L∞ < 1e-4 by the norm's fp32 stability) used only as input to
-            // the CPU FFN chain below.
-            //
-            // When `x` was not host-visible at enqueue time, its async-read
-            // landed in `pw.x_cpu`; the CPU norm consumes that buffer
-            // instead. `add_rms_norm_oop` mutates its `x` input (x += res),
-            // so routing this through `pw.x_cpu` also keeps GPU-side `x`
-            // untouched by the replica computation.
-            if partition_path == crate::layers::tensor_partition::PartitionPath::ReplicateNorm {
-                let cpu = &part.cpu_backend;
-                if replicate_use_x_cpu {
-                    cpu.add_rms_norm_oop(
-                        &mut pw.x_cpu,
-                        &pw.attn_out_cpu,
-                        &mut pw.residual_cpu,
-                        &self.ffn_norm,
-                        rms_norm_eps,
-                        false,
-                    )?;
-                } else {
-                    cpu.add_rms_norm_oop(
-                        x,
-                        &pw.attn_out_cpu,
-                        &mut pw.residual_cpu,
-                        &self.ffn_norm,
-                        rms_norm_eps,
-                        false,
-                    )?;
-                }
             }
 
             // 2. CPU: full FFN chain on its own slice, independent of GPU.
             let cpu = &part.cpu_backend;
             #[cfg(target_arch = "aarch64")]
-            let cpu_slice_dtype = part.gate.cpu_slice.dtype();
-            #[cfg(target_arch = "aarch64")]
-            let k = residual_cpu_dims[residual_cpu_dims.len() - 1];
-            #[cfg(target_arch = "aarch64")]
-            let used_fused = if cpu.name().contains("CPU") && cpu_slice_dtype == DType::F16 {
-                unsafe {
-                    crate::backend::cpu::neon::fused_matmul_f16(
-                        residual_cpu_ptr as *const f32,
-                        k,
-                        &[
-                            (
-                                part.gate.cpu_slice.as_ptr() as *const u16,
-                                pw.gate_cpu.as_mut_ptr() as *mut f32,
-                                part.gate.cpu_slice.shape().dims()[0],
-                            ),
-                            (
-                                part.up.cpu_slice.as_ptr() as *const u16,
-                                pw.up_cpu.as_mut_ptr() as *mut f32,
-                                part.up.cpu_slice.shape().dims()[0],
-                            ),
-                        ],
-                    );
+            let used_fused = {
+                let cpu_slice_dtype = part.gate.cpu_slice.dtype();
+                let cpu_is_neon = cpu.name().contains("CPU");
+                if cpu_is_neon && cpu_slice_dtype == DType::F16 {
+                    unsafe {
+                        crate::backend::cpu::neon::fused_matmul_f16(
+                            residual_cpu_ptr as *const f32,
+                            k_cpu,
+                            &[
+                                (
+                                    part.gate.cpu_slice.as_ptr() as *const u16,
+                                    pw.gate_cpu.as_mut_ptr() as *mut f32,
+                                    part.gate.cpu_slice.shape().dims()[0],
+                                ),
+                                (
+                                    part.up.cpu_slice.as_ptr() as *const u16,
+                                    pw.up_cpu.as_mut_ptr() as *mut f32,
+                                    part.up.cpu_slice.shape().dims()[0],
+                                ),
+                            ],
+                        );
+                    }
+                    true
+                } else if cpu_is_neon && cpu_slice_dtype == DType::Q4_0 {
+                    use crate::core::quant::BlockQ4_0;
+                    unsafe {
+                        crate::backend::cpu::neon::fused_matmul_q4_0(
+                            residual_cpu_ptr as *const f32,
+                            k_cpu,
+                            &[
+                                (
+                                    part.gate.cpu_slice.as_ptr() as *const BlockQ4_0,
+                                    pw.gate_cpu.as_mut_ptr() as *mut f32,
+                                    part.gate.cpu_slice.shape().dims()[0],
+                                ),
+                                (
+                                    part.up.cpu_slice.as_ptr() as *const BlockQ4_0,
+                                    pw.up_cpu.as_mut_ptr() as *mut f32,
+                                    part.up.cpu_slice.shape().dims()[0],
+                                ),
+                            ],
+                        );
+                    }
+                    true
+                } else {
+                    false
                 }
-                true
-            } else if cpu.name().contains("CPU") && cpu_slice_dtype == DType::Q4_0 {
-                use crate::core::quant::BlockQ4_0;
-                unsafe {
-                    crate::backend::cpu::neon::fused_matmul_q4_0(
-                        residual_cpu_ptr as *const f32,
-                        k,
-                        &[
-                            (
-                                part.gate.cpu_slice.as_ptr() as *const BlockQ4_0,
-                                pw.gate_cpu.as_mut_ptr() as *mut f32,
-                                part.gate.cpu_slice.shape().dims()[0],
-                            ),
-                            (
-                                part.up.cpu_slice.as_ptr() as *const BlockQ4_0,
-                                pw.up_cpu.as_mut_ptr() as *mut f32,
-                                part.up.cpu_slice.shape().dims()[0],
-                            ),
-                        ],
-                    );
-                }
-                true
-            } else {
-                false
             };
             #[cfg(not(target_arch = "aarch64"))]
             let used_fused = false;
             if !used_fused {
                 let _ = residual_cpu_ptr;
-                if zcopy_residual && !replicate_norm {
-                    // In the replicate_norm path, pw.residual_cpu was already
-                    // computed by the CPU's own add_rms_norm_oop above and
-                    // must not be overwritten from ws.residual.
+                if zcopy_residual {
                     unsafe {
                         let dst = std::slice::from_raw_parts_mut(
                             pw.residual_cpu.as_mut_ptr(),

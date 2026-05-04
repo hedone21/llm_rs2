@@ -2155,10 +2155,7 @@ impl TransformerModel {
                 // fallback — do not spam warnings. Any real kernel-build /
                 // cl_mem failure still surfaces via the full context chain.
                 let chain = format!("{:#}", e);
-                if chain.contains("LLMRS_PARTITION_PLAN=0")
-                    || chain.contains("LLMRS_PARTITION_REPLICATE_NORM=1")
-                    || chain.contains("LLMRS_PARTITION_SYNC_EVERY_N")
-                {
+                if chain.contains("LLMRS_PARTITION_PLAN=0") {
                     log::info!("GPU kernel plan skipped: {}", chain);
                 } else {
                     log::warn!("Failed to build GPU kernel plan: {}", chain);

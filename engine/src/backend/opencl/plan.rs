@@ -16,7 +16,7 @@ use crate::core::backend::Backend;
 use crate::core::tensor::Tensor;
 use crate::layers::tensor_partition::{
     PartitionContext, PartitionPath, partition_plan_debug_enabled, partition_plan_enabled,
-    partition_replicate_norm_enabled, partition_trace_enabled, record_partition_timing,
+    partition_trace_enabled, record_partition_timing,
 };
 use crate::layers::workspace::PartitionWsCell;
 
@@ -3438,10 +3438,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
 /// `FfnVariant::Partitioned` that wraps GPU slice dispatches + a
 /// `PartitionPlanContext` carrying CPU-side handles.
 ///
-/// Returns `Err` when the plan path is disabled (`LLMRS_PARTITION_PLAN=0`) or
-/// when an unsupported mode is active (`LLMRS_PARTITION_REPLICATE_NORM=1`,
-/// `LLMRS_PARTITION_SYNC_EVERY_N>1`). The caller is expected to fall back to
-/// `forward_gen` in those cases.
+/// Returns `Err` when the plan path is disabled (`LLMRS_PARTITION_PLAN=0`).
+/// The caller falls back to `forward_gen` in that case.
 #[allow(clippy::too_many_arguments)]
 pub fn build_partitioned_layer_plan(
     config: &LayerPlanConfig,
@@ -3456,14 +3454,6 @@ pub fn build_partitioned_layer_plan(
 
     if !partition_plan_enabled() {
         anyhow::bail!("LLMRS_PARTITION_PLAN=0 — partition plan path disabled");
-    }
-    if partition_replicate_norm_enabled() {
-        anyhow::bail!("LLMRS_PARTITION_REPLICATE_NORM=1 not supported in plan path (arch A.8.2)");
-    }
-    if let Ok(v) = std::env::var("LLMRS_PARTITION_SYNC_EVERY_N")
-        && v.parse::<u64>().ok().is_some_and(|n| n > 1)
-    {
-        anyhow::bail!("LLMRS_PARTITION_SYNC_EVERY_N>1 not supported in plan path (arch A.8.3)");
     }
 
     let dim = config.dim;

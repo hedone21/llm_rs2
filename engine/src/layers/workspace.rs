@@ -104,8 +104,6 @@ impl LayerWorkspace {
             bufs.push(pw.up_gpu.buffer().clone());
             bufs.push(pw.up_cpu.buffer().clone());
             bufs.push(pw.residual_cpu.buffer().clone());
-            bufs.push(pw.attn_out_cpu.buffer().clone());
-            bufs.push(pw.x_cpu.buffer().clone());
             bufs.push(pw.down_partial_gpu.buffer().clone());
             bufs.push(pw.down_partial_cpu.buffer().clone());
             bufs.push(pw.cpu_merge_staging.buffer().clone());
@@ -147,8 +145,6 @@ impl LayerWorkspace {
                         up_gpu: pw.up_gpu.clone(),
                         up_cpu: pw.up_cpu.clone(),
                         residual_cpu: pw.residual_cpu.clone(),
-                        attn_out_cpu: pw.attn_out_cpu.clone(),
-                        x_cpu: pw.x_cpu.clone(),
                         down_partial_gpu: pw.down_partial_gpu.clone(),
                         down_partial_cpu: pw.down_partial_cpu.clone(),
                         cpu_merge_staging: pw.cpu_merge_staging.clone(),
@@ -162,8 +158,6 @@ impl LayerWorkspace {
                     up_gpu: retag(pw.up_gpu),
                     up_cpu: retag(pw.up_cpu),
                     residual_cpu: retag(pw.residual_cpu),
-                    attn_out_cpu: retag(pw.attn_out_cpu),
-                    x_cpu: retag(pw.x_cpu),
                     down_partial_gpu: retag(pw.down_partial_gpu),
                     down_partial_cpu: retag(pw.down_partial_cpu),
                     cpu_merge_staging: retag(pw.cpu_merge_staging),
@@ -301,23 +295,6 @@ pub struct PartitionWorkspace {
     /// UnifiedBuffer::as_ptr() returns null when unmapped, so we copy residual
     /// to this CPU buffer via read_buffer() before CPU matmul.
     pub residual_cpu: Tensor,
-    /// CPU-side copy of attention output for Direction A (compute replication):
-    /// [1, 1, dim]. When `LLMRS_PARTITION_REPLICATE_NORM=1` (default when
-    /// partition is active), the partition block asynchronously DMA-reads
-    /// `ws.attn_out` into this buffer and then the CPU runs its own
-    /// `add_rms_norm_oop(x, attn_out_cpu, residual_cpu, ffn_norm, eps, false)`
-    /// in parallel with the GPU's matching call on `ws.residual`. This
-    /// advances the synchronization point from after `add_rms_norm_oop` to
-    /// after `attn_out` is ready, allowing the host wait window to overlap
-    /// with the GPU FFN chain enqueue.
-    pub attn_out_cpu: Tensor,
-    /// CPU-side copy of the layer input `x` for Direction A fallback.
-    /// [1, 1, dim]. When `x` is not host-accessible (UMA `UnifiedBuffer`
-    /// without a current `map()`, which is the common case on Adreno), the
-    /// partition block asynchronously DMA-reads `x` into this buffer alongside
-    /// the `attn_out` read, then the CPU's `add_rms_norm_oop` consumes it.
-    /// Mirrors `attn_out_cpu`'s allocation pattern.
-    pub x_cpu: Tensor,
 
     // --- FFN down (Strategy B) ---
     /// GPU partial output for down projection: [1, 1, hidden_size]
@@ -415,22 +392,6 @@ impl PartitionWorkspace {
 
         let residual_cpu = {
             let buf = cpu_mem.alloc(hidden_size * 4, DType::F32)?;
-            Tensor::new(
-                Shape::new(vec![1, 1, hidden_size]),
-                buf,
-                cpu_backend.clone(),
-            )
-        };
-        let attn_out_cpu = {
-            let buf = cpu_mem.alloc(hidden_size * 4, DType::F32)?;
-            Tensor::new(
-                Shape::new(vec![1, 1, hidden_size]),
-                buf,
-                cpu_backend.clone(),
-            )
-        };
-        let x_cpu = {
-            let buf = cpu_mem.alloc(hidden_size * 4, DType::F32)?;
             Tensor::new(Shape::new(vec![1, 1, hidden_size]), buf, cpu_backend)
         };
         // Ready-flag: 4 bytes, GPU-visible + CPU-visible via ALLOC_HOST_PTR.
@@ -456,8 +417,6 @@ impl PartitionWorkspace {
             up_gpu,
             up_cpu,
             residual_cpu,
-            attn_out_cpu,
-            x_cpu,
             down_partial_gpu,
             down_partial_cpu,
             cpu_merge_staging,

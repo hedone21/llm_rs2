@@ -3002,16 +3002,6 @@ fn main() -> anyhow::Result<()> {
                 backend.clone(),
                 cpu_backend_arc.clone(),
             )?)));
-
-            if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
-                eprintln!(
-                    "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
-                );
-            } else {
-                eprintln!(
-                    "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
-                );
-            }
         }
 
         // Pre-allocate CPU/GPU single-token tensors
@@ -4514,16 +4504,6 @@ fn main() -> anyhow::Result<()> {
                 backend.clone(),
                 cpu_backend_arc.clone(),
             )?)));
-
-            if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
-                eprintln!(
-                    "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
-                );
-            } else {
-                eprintln!(
-                    "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
-                );
-            }
         }
 
         // Single token CPU tensor for generation loop
@@ -5770,15 +5750,6 @@ fn main() -> anyhow::Result<()> {
                                                 cpu_backend_arc.clone(),
                                             )?,
                                         )));
-                                        if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
-                                            eprintln!(
-                                                "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
-                                            );
-                                        } else {
-                                            eprintln!(
-                                                "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
-                                            );
-                                        }
                                     } else {
                                         gen_ws.partition_ws = None;
                                     }
@@ -6063,15 +6034,6 @@ fn main() -> anyhow::Result<()> {
                                     cpu_backend_arc.clone(),
                                 ) {
                                     gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(ws)));
-                                    if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
-                                        eprintln!(
-                                            "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
-                                        );
-                                    }
                                 }
                             } else {
                                 gen_ws.partition_ws = None;
