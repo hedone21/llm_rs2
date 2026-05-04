@@ -162,11 +162,10 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
 
 /// Returns a short label identifying the concrete buffer type backing `buf`.
 ///
-/// Used by matmul / rms_norm / etc. error paths to add actionable detail to
-/// the otherwise opaque "X is not OpenCL buffer" error. Keep additions in sync
-/// with `get_cl_mem` — every concrete type that `get_cl_mem` recognises must
-/// have a matching label here, plus the catch-all "Unknown" for anything
-/// falling through.
+/// Covers both `get_cl_mem`-recognised GPU-resident types and the CPU/host-
+/// only buffer types that commonly appear in misrouted dispatch failures —
+/// the latter set is where the diagnostic value lives, since they are what
+/// `get_cl_mem` rejects. Add new buffer types here as they are introduced.
 pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
     let any = buf.as_any();
     if any.is::<UnifiedBuffer>() {

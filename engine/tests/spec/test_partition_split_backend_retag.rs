@@ -1,23 +1,12 @@
-//! Tensor partition GPU-slice retag regression — `SetPartitionRatio` directive
-//! crashed with "B is not OpenCL buffer" because `weight.backend()` was the
-//! CPU loader after `gguf.rs::load_raw → backend.copy_weight_from`. The
-//! OpenCL `copy_from` preserves `src.backend()` rather than retagging onto
-//! itself, so the resulting GPU slice from `split_weight_col` (FFN-down)
-//! landed as a `SharedBuffer` (no `cl_mem`).
-//!
-//! Pre-2026-05-01 the bug was masked because `map_weights_for_cpu`
-//! unconditionally replaced the backing buffer (and thus the backend) for
-//! every weight. The post-`4416994` in-place mapping path skipped that
-//! replacement and exposed the latent backend-retag bug. The fix retags the
-//! tensor's backend whenever the loaded backend doesn't match the active GPU
-//! backend.
+//! Tensor partition GPU-slice retag regression. `gguf.rs::load_raw` builds
+//! weights via `backend.copy_weight_from`, leaving `Tensor::backend()` on
+//! the CPU loader even when the buffer is a `UnifiedBuffer` with valid
+//! `cl_mem`. `split_weight_col` (FFN-down) then dispatches `weight.backend()
+//! .copy_from(...)` through CPU and lands a `SharedBuffer`-backed GPU slice
+//! without `cl_mem` — the next `matmul_f16` aborts with "B is not OpenCL
+//! buffer". `map_weights_for_cpu` must retag onto the active GPU backend.
 //!
 //! Issue: `issues/precision_swap_opencl_b_not_buffer_20260501.md`
-//! Reproduction: PACT 2026 Fig 6 / pubg / 4K / argus_full / R3CY408S4HN_run1_20260501_161725
-//!     log: `[Resilience] Directive seq=6: SetPartitionRatio { ratio: 0.85 }`
-//!         → `[Partition] Re-split 84 weights with ratio 0.85`
-//!         → `Error: B is not OpenCL buffer`
-//!
 //! Spec: ENG-ALG-200 (partition path), ENG-ALG-211 (loader → forward backend).
 
 use std::sync::Arc;

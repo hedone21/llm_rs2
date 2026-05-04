@@ -61,11 +61,6 @@ mod test_msg_060_self_util;
 mod test_eng_alg_200_plan_partition;
 #[path = "spec/test_inv_120_plan_partition_stale.rs"]
 mod test_inv_120_plan_partition_stale;
-// `SetPartitionRatio` directive crashed with "B is not OpenCL buffer" because
-// `weight.backend()` was the CPU loader (`gguf.rs::load_raw → backend
-// .copy_weight_from`). Pre-`4416994` the bug was masked by `map_weights_for_cpu`
-// always replacing tensors; the post-`4416994` in-place mapping path exposed
-// the latent retag gap.
 #[path = "spec/test_partition_split_backend_retag.rs"]
 mod test_partition_split_backend_retag;
 
