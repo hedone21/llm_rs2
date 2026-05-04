@@ -378,9 +378,7 @@ fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
             cpu_chunk_size: params.cpu_chunk_size,
         }),
         "SwapWeights" => {
-            let ratio = params
-                .ratio
-                .context("--ratio required for SwapWeights")?;
+            let ratio = params.ratio.context("--ratio required for SwapWeights")?;
             let dtype_str = params
                 .target_dtype
                 .context("--target-dtype required for SwapWeights")?;

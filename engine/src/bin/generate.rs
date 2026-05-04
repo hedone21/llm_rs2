@@ -5715,6 +5715,48 @@ fn main() -> anyhow::Result<()> {
                                     );
                                     // Reallocate workspace
                                     let layer0_probe = model.layers[0].load_weights();
+                                    // Diagnostic: dump per-weight buffer kind for
+                                    // layer 0 so a "B is not OpenCL buffer" crash
+                                    // on the next forward immediately points at
+                                    // which tensor is misbacked. Single-shot,
+                                    // layer 0 only — every other layer has the
+                                    // same backing pattern by construction.
+                                    #[cfg(feature = "opencl")]
+                                    {
+                                        use llm_rs2::backend::opencl::buffer_kind_label;
+                                        let l0 = &layer0_probe;
+                                        let mut log = String::from(
+                                            "[Partition] Layer 0 weight buffer kinds: ",
+                                        );
+                                        log.push_str(&format!(
+                                            "wq={} wk={} wv={} wo={} ",
+                                            buffer_kind_label(l0.wq.buffer().as_ref()),
+                                            buffer_kind_label(l0.wk.buffer().as_ref()),
+                                            buffer_kind_label(l0.wv.buffer().as_ref()),
+                                            buffer_kind_label(l0.wo.buffer().as_ref()),
+                                        ));
+                                        log.push_str(&format!(
+                                            "w_gate={} w_up={} w_down={} ",
+                                            buffer_kind_label(l0.w_gate.buffer().as_ref()),
+                                            buffer_kind_label(l0.w_up.buffer().as_ref()),
+                                            buffer_kind_label(l0.w_down.buffer().as_ref()),
+                                        ));
+                                        if let Some(ref ctx) = l0.partition_ctx {
+                                            log.push_str(&format!(
+                                                "gate_gpu_slice={} up_gpu_slice={} down_gpu_slice={}",
+                                                buffer_kind_label(
+                                                    ctx.gate.gpu_slice.buffer().as_ref()
+                                                ),
+                                                buffer_kind_label(
+                                                    ctx.up.gpu_slice.buffer().as_ref()
+                                                ),
+                                                buffer_kind_label(
+                                                    ctx.down.gpu_slice.buffer().as_ref()
+                                                ),
+                                            ));
+                                        }
+                                        eprintln!("{log}");
+                                    }
                                     if let Some(ref ctx) = layer0_probe.partition_ctx {
                                         let gpu_alloc =
                                             make_partition_gpu_alloc(&*backend, decode_mem);

@@ -160,6 +160,40 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     Err(anyhow!("Buffer is not an OpenCL buffer type"))
 }
 
+/// Returns a short label identifying the concrete buffer type backing `buf`.
+///
+/// Used by matmul / rms_norm / etc. error paths to add actionable detail to
+/// the otherwise opaque "X is not OpenCL buffer" error. Keep additions in sync
+/// with `get_cl_mem` — every concrete type that `get_cl_mem` recognises must
+/// have a matching label here, plus the catch-all "Unknown" for anything
+/// falling through.
+pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
+    let any = buf.as_any();
+    if any.is::<UnifiedBuffer>() {
+        "UnifiedBuffer"
+    } else if any.is::<crate::backend::opencl::buffer::OpenCLBuffer>() {
+        "OpenCLBuffer"
+    } else if any.is::<crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer>() {
+        "MadviseableGPUBuffer"
+    } else if any.is::<crate::buffer::cl_wrapped_buffer::ClWrappedBuffer>() {
+        "ClWrappedBuffer"
+    } else if any.is::<crate::buffer::cl_sub_buffer::ClSubBuffer>() {
+        "ClSubBuffer"
+    } else if any.is::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>() {
+        "NoshuffleWeightBuffer"
+    } else if any.is::<crate::buffer::shared_buffer::SharedBuffer>() {
+        "SharedBuffer"
+    } else if any.is::<crate::buffer::shared_buffer::SharedBufferView>() {
+        "SharedBufferView"
+    } else if any.is::<crate::buffer::slice_buffer::SliceBuffer>() {
+        "SliceBuffer"
+    } else if any.is::<crate::buffer::mmap_buffer::MmapBuffer>() {
+        "MmapBuffer"
+    } else {
+        "Unknown"
+    }
+}
+
 // Fast math flags (excluding -cl-std which is determined at runtime)
 const CL_FAST_MATH_FLAGS: &str =
     "-cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math";
@@ -1951,12 +1985,30 @@ impl OpenCLBackend {
         }
 
         // GEMV path (decode or GEMM unavailable)
-        let a_buf =
-            get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
-        let b_buf =
-            get_cl_mem(b.buffer().as_ref()).map_err(|_| anyhow!("B is not OpenCL buffer"))?;
-        let out_buf =
-            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+        let a_buf = get_cl_mem(a.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_f16: A is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(a.buffer().as_ref()),
+                a.dtype(),
+                a.shape().dims()
+            )
+        })?;
+        let b_buf = get_cl_mem(b.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_f16: B (weight) is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(b.buffer().as_ref()),
+                b.dtype(),
+                b.shape().dims()
+            )
+        })?;
+        let out_buf = get_cl_mem(out.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_f16: Out is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(out.buffer().as_ref()),
+                out.dtype(),
+                out.shape().dims()
+            )
+        })?;
 
         let kernels = unsafe { &*self.kernels.get() };
         let f16_nosub = kernels.f16_is_nosub;
@@ -2060,12 +2112,30 @@ impl OpenCLBackend {
         };
         let n = b_dims[0];
 
-        let a_buf =
-            get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
-        let b_buf =
-            get_cl_mem(b.buffer().as_ref()).map_err(|_| anyhow!("B is not OpenCL buffer"))?;
-        let out_buf =
-            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+        let a_buf = get_cl_mem(a.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_q4_0: A is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(a.buffer().as_ref()),
+                a.dtype(),
+                a.shape().dims()
+            )
+        })?;
+        let b_buf = get_cl_mem(b.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_q4_0: B (weight) is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(b.buffer().as_ref()),
+                b.dtype(),
+                b.shape().dims()
+            )
+        })?;
+        let out_buf = get_cl_mem(out.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_q4_0: Out is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(out.buffer().as_ref()),
+                out.dtype(),
+                out.shape().dims()
+            )
+        })?;
 
         // Auto-dispatch to noshuffle GEMV for decode (m==1) when image1d_buffer_t is available.
         // The noshuffle kernel uses Adreno TP cache via image reads (R32UI weight, RGBA32F act).
@@ -4074,12 +4144,30 @@ impl Backend for OpenCLBackend {
             }
         }
 
-        let a_buf =
-            get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
-        let b_buf =
-            get_cl_mem(b.buffer().as_ref()).map_err(|_| anyhow!("B is not OpenCL buffer"))?;
-        let c_buf =
-            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+        let a_buf = get_cl_mem(a.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul (F32): A is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(a.buffer().as_ref()),
+                a.dtype(),
+                a.shape().dims()
+            )
+        })?;
+        let b_buf = get_cl_mem(b.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul (F32): B (weight) is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(b.buffer().as_ref()),
+                b.dtype(),
+                b.shape().dims()
+            )
+        })?;
+        let c_buf = get_cl_mem(out.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul (F32): Out is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(out.buffer().as_ref()),
+                out.dtype(),
+                out.shape().dims()
+            )
+        })?;
 
         let ne00 = k as i32;
         let ne01 = n as i32;
