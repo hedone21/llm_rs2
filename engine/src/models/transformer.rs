@@ -1474,6 +1474,35 @@ impl TransformerModel {
         let mut prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace> =
             caller_prefill_ws.or(owned_prefill_ws.as_mut());
 
+        // Tensor-partition prefill scratch: alloc once per prefill call so the
+        // partitioned forward path (forward_prefill, see `if let Some(ref part)
+        // = self.partition_ctx`) reuses the same x_cpu / GPU partial / CPU
+        // partial / merge scratch across every layer. Eliminates the per-layer
+        // `memory.alloc()` + `Vec<u8>` churn that dominated the legacy path
+        // (-15~22% prefill regression at ratios 0.5–0.9).
+        if let Some(pws) = prefill_ws.as_deref_mut()
+            && seq_len > 1
+            && backend.is_gpu()
+            && pws.partition.is_none()
+        {
+            // Use layer 0's partition_ctx to size the scratch — all layers
+            // share the same gate/up split_row for a given gpu_ratio.
+            let layer0 = self.layers[0].load_weights();
+            if let Some(ref part) = layer0.partition_ctx {
+                let _ = pws.init_partition(
+                    batch_size,
+                    seq_len,
+                    hidden_size,
+                    self.config.intermediate_size,
+                    part.gate.split_row,
+                    part.up.split_row,
+                    memory,
+                    backend.clone(),
+                    part.cpu_backend.clone(),
+                );
+            }
+        }
+
         // Check if GPU-side score accumulator is active.
         // When active, attention_gen writes scores to a persistent GPU buffer and
         // reduce_layer runs on-device — no CPU readback needed per layer.

@@ -445,6 +445,72 @@ pub fn merge_partials_2d(
     Ok(())
 }
 
+/// Variant of `merge_partials_2d` that uses caller-provided scratch buffers
+/// instead of allocating fresh `Vec<u8>`s on each call. Designed for the
+/// per-layer prefill partition path where the same buffers are reused 28+
+/// times per prefill — eliminating the alloc churn (`~56` Vec allocations
+/// per token for a 28-layer FFN partition) is the primary D-min win.
+///
+/// `gpu_temp_scratch.len()` must be >= `total_rows * split_row * 4`.
+/// `merged_scratch.len()` must be >= `total_rows * (split_row + cpu_rows) * 4`.
+/// Both scratches may be larger (sized for the max of gate/up); only the
+/// prefix used by the current call is touched.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_partials_2d_into(
+    backend: &dyn Backend,
+    gpu_partial: &Tensor,
+    cpu_partial: &Tensor,
+    output: &mut Tensor,
+    total_rows: usize,
+    split_row: usize,
+    cpu_rows: usize,
+    gpu_temp_scratch: &mut [u8],
+    merged_scratch: &mut [u8],
+) -> Result<()> {
+    let out_dim = split_row + cpu_rows;
+    let gpu_bytes = total_rows * split_row * 4;
+    let out_bytes = total_rows * out_dim * 4;
+    debug_assert!(
+        gpu_temp_scratch.len() >= gpu_bytes,
+        "gpu_temp_scratch too small: {} < {}",
+        gpu_temp_scratch.len(),
+        gpu_bytes
+    );
+    debug_assert!(
+        merged_scratch.len() >= out_bytes,
+        "merged_scratch too small: {} < {}",
+        merged_scratch.len(),
+        out_bytes
+    );
+
+    // 1. Read GPU partial into the prefix of the scratch buffer.
+    let gpu_slice = &mut gpu_temp_scratch[..gpu_bytes];
+    backend.read_buffer(gpu_partial, gpu_slice)?;
+
+    // 2. Interleave: build merged [total_rows, out_dim] in scratch.
+    let merged = &mut merged_scratch[..out_bytes];
+    // Safety: cpu_partial is a CPU tensor with valid host pointer.
+    let cpu_data =
+        unsafe { std::slice::from_raw_parts(cpu_partial.as_ptr(), total_rows * cpu_rows * 4) };
+
+    let split_bytes = split_row * 4;
+    let cpu_bytes_per_row = cpu_rows * 4;
+    let out_bytes_per_row = out_dim * 4;
+    for s in 0..total_rows {
+        let gpu_row_start = s * split_bytes;
+        let cpu_row_start = s * cpu_bytes_per_row;
+        let out_row_start = s * out_bytes_per_row;
+        merged[out_row_start..out_row_start + split_bytes]
+            .copy_from_slice(&gpu_slice[gpu_row_start..gpu_row_start + split_bytes]);
+        merged[out_row_start + split_bytes..out_row_start + out_bytes_per_row]
+            .copy_from_slice(&cpu_data[cpu_row_start..cpu_row_start + cpu_bytes_per_row]);
+    }
+
+    // 3. Write merged result to GPU output.
+    backend.write_buffer(output, merged)?;
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Partition trace (env-gated)
 //
@@ -1329,6 +1395,94 @@ mod tests {
 
         let result = output.as_slice::<f32>();
         assert_eq!(result, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    /// `merge_partials_2d_into` (scratch-aware variant) must produce identical
+    /// output to `merge_partials_2d` for the same inputs. Covers the prefill
+    /// path that reuses caller-owned scratch buffers across all layers.
+    #[test]
+    fn test_merge_partials_2d_into_matches_legacy() {
+        let backend = cpu_backend();
+        let memory = Galloc::new();
+
+        let total_rows = 7; // batch*seq_len, deliberately not aligned
+        let split_row = 5;
+        let cpu_rows = 3;
+        let out_dim = split_row + cpu_rows;
+
+        // Build the same GPU+CPU partials twice, run both functions, expect equality.
+        let make_input = || {
+            let gpu_buf = memory
+                .alloc(total_rows * split_row * 4, DType::F32)
+                .unwrap();
+            let mut gpu_partial = Tensor::new(
+                Shape::new(vec![total_rows, split_row]),
+                gpu_buf,
+                backend.clone(),
+            );
+            for (i, v) in gpu_partial.as_mut_slice::<f32>().iter_mut().enumerate() {
+                *v = (i as f32) * 1.5 - 0.25;
+            }
+            let cpu_buf = memory
+                .alloc(total_rows * cpu_rows * 4, DType::F32)
+                .unwrap();
+            let mut cpu_partial = Tensor::new(
+                Shape::new(vec![total_rows, cpu_rows]),
+                cpu_buf,
+                backend.clone(),
+            );
+            for (i, v) in cpu_partial.as_mut_slice::<f32>().iter_mut().enumerate() {
+                *v = -(i as f32) * 2.0 + 7.0;
+            }
+            (gpu_partial, cpu_partial)
+        };
+
+        // Reference (legacy).
+        let (gpu_a, cpu_a) = make_input();
+        let mut out_a = Tensor::new(
+            Shape::new(vec![total_rows, out_dim]),
+            memory
+                .alloc(total_rows * out_dim * 4, DType::F32)
+                .unwrap(),
+            backend.clone(),
+        );
+        super::merge_partials_2d(
+            backend.as_ref(),
+            &gpu_a,
+            &cpu_a,
+            &mut out_a,
+            total_rows,
+            split_row,
+            cpu_rows,
+        )
+        .unwrap();
+        let ref_vals: Vec<f32> = out_a.as_slice::<f32>().to_vec();
+
+        // New scratch-aware path with oversized scratches (mimics prefill scratch
+        // sized for the larger of gate/up).
+        let (gpu_b, cpu_b) = make_input();
+        let mut out_b = Tensor::new(
+            Shape::new(vec![total_rows, out_dim]),
+            memory
+                .alloc(total_rows * out_dim * 4, DType::F32)
+                .unwrap(),
+            backend.clone(),
+        );
+        let mut gpu_temp = vec![0u8; total_rows * (split_row + 4) * 4];
+        let mut merged = vec![0u8; total_rows * (out_dim + 7) * 4];
+        super::merge_partials_2d_into(
+            backend.as_ref(),
+            &gpu_b,
+            &cpu_b,
+            &mut out_b,
+            total_rows,
+            split_row,
+            cpu_rows,
+            &mut gpu_temp,
+            &mut merged,
+        )
+        .unwrap();
+        assert_eq!(out_b.as_slice::<f32>(), ref_vals.as_slice());
     }
 
     // PA-T1-PATHCNT: record_partition_timing increments the correct path counter

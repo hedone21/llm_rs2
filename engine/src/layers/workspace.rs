@@ -220,6 +220,38 @@ pub struct WorkspaceConfig {
     pub max_seq_len: usize,
 }
 
+/// Pre-allocated scratch buffers for partitioned FFN gate/up during prefill.
+///
+/// Sized for `[batch, seq_len, *]` (vs `PartitionWorkspace` which is decode-only
+/// `[1, 1, *]`). Allocated once per prefill call and reused across all layers,
+/// eliminating per-layer alloc/free churn (~56 alloc cycles on a 28-layer model).
+///
+/// All four partial buffers are sized at the exact `split_row` / `cpu_rows`
+/// determined by the partition context — prefill workspaces are throw-away
+/// (rebuilt every prefill call), so the geometry is always consistent with
+/// the active `partition_ctx`.
+pub struct PrefillPartitionScratch {
+    /// CPU-host-visible copy of normalized FFN input `x` for CPU NEON matmul.
+    /// Refilled once per layer via `read_buffer(x → x_cpu)`.
+    pub x_cpu: Tensor,
+    /// GPU partial output of `gate = matmul(x, gate.gpu_slice)`:
+    /// shape `[batch, seq_len, gate.split_row]`.
+    pub gate_gpu_partial: Tensor,
+    /// CPU partial output of `gate = matmul(x_cpu, gate.cpu_slice)`:
+    /// shape `[batch, seq_len, ffn_hidden - gate.split_row]`.
+    pub gate_cpu_partial: Tensor,
+    /// GPU partial output of up projection.
+    pub up_gpu_partial: Tensor,
+    /// CPU partial output of up projection.
+    pub up_cpu_partial: Tensor,
+    /// Scratch for `merge_partials_2d`: GPU partial readback target.
+    /// Capacity = `total_rows * max(gate.split_row, up.split_row) * 4`.
+    pub merge_gpu_temp: Vec<u8>,
+    /// Scratch for `merge_partials_2d`: interleaved [total_rows, ffn_hidden] F32.
+    /// Capacity = `total_rows * ffn_hidden * 4`.
+    pub merge_buf: Vec<u8>,
+}
+
 /// Pre-allocated workspace for prefill (batch token processing).
 /// Reuses GPU buffers across layers to avoid alloc/free churn that crashes NVIDIA's OpenCL driver.
 pub struct PrefillWorkspace {
@@ -236,6 +268,8 @@ pub struct PrefillWorkspace {
     /// Lazily initialized cast buffers for F16/Q4 KV cache
     pub k_cast: Option<Tensor>,
     pub v_cast: Option<Tensor>,
+    /// Partition scratch — populated by `init_partition` when tensor partition is active.
+    pub partition: Option<PrefillPartitionScratch>,
     seq_len: usize,
 }
 
@@ -265,6 +299,7 @@ impl PrefillWorkspace {
             residual_ffn: alloc(vec![b, seq_len, config.dim])?,
             k_cast: None,
             v_cast: None,
+            partition: None,
             seq_len,
         })
     }
@@ -272,6 +307,88 @@ impl PrefillWorkspace {
     /// Current sequence length this workspace is sized for.
     pub fn seq_len(&self) -> usize {
         self.seq_len
+    }
+
+    /// Allocate the partition scratch buffers sized for the active
+    /// `PartitionContext`. Idempotent — does nothing if `partition` is already
+    /// populated. Called once per prefill (after PrefillWorkspace::new) when
+    /// tensor partition is active for this model.
+    ///
+    /// `gate_split_row` / `up_split_row` come from `PartitionContext::gate.split_row`
+    /// / `up.split_row`. `ffn_hidden` is the full FFN intermediate dimension.
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_partition(
+        &mut self,
+        batch_size: usize,
+        seq_len: usize,
+        dim: usize,
+        ffn_hidden: usize,
+        gate_split_row: usize,
+        up_split_row: usize,
+        gpu_memory: &dyn Memory,
+        gpu_backend: Arc<dyn Backend>,
+        cpu_backend: Arc<dyn Backend>,
+    ) -> Result<()> {
+        if self.partition.is_some() {
+            return Ok(());
+        }
+
+        use crate::memory::galloc::Galloc;
+        let cpu_mem = Galloc::new();
+
+        let total_rows = batch_size * seq_len;
+        let gate_cpu_rows = ffn_hidden - gate_split_row;
+        let up_cpu_rows = ffn_hidden - up_split_row;
+
+        // x_cpu: CPU-host buffer the GPU `x` tensor is read into per layer.
+        let x_cpu_buf = cpu_mem.alloc(total_rows * dim * 4, DType::F32)?;
+        let x_cpu = Tensor::new(
+            Shape::new(vec![batch_size, seq_len, dim]),
+            x_cpu_buf,
+            cpu_backend.clone(),
+        );
+
+        // GPU partials — alloc once via gpu_memory.
+        let gate_gpu_buf = gpu_memory.alloc(total_rows * gate_split_row * 4, DType::F32)?;
+        let gate_gpu_partial = Tensor::new(
+            Shape::new(vec![batch_size, seq_len, gate_split_row]),
+            gate_gpu_buf,
+            gpu_backend.clone(),
+        );
+        let up_gpu_buf = gpu_memory.alloc(total_rows * up_split_row * 4, DType::F32)?;
+        let up_gpu_partial = Tensor::new(
+            Shape::new(vec![batch_size, seq_len, up_split_row]),
+            up_gpu_buf,
+            gpu_backend.clone(),
+        );
+
+        // CPU partials.
+        let gate_cpu_buf = cpu_mem.alloc(total_rows * gate_cpu_rows * 4, DType::F32)?;
+        let gate_cpu_partial = Tensor::new(
+            Shape::new(vec![batch_size, seq_len, gate_cpu_rows]),
+            gate_cpu_buf,
+            cpu_backend.clone(),
+        );
+        let up_cpu_buf = cpu_mem.alloc(total_rows * up_cpu_rows * 4, DType::F32)?;
+        let up_cpu_partial = Tensor::new(
+            Shape::new(vec![batch_size, seq_len, up_cpu_rows]),
+            up_cpu_buf,
+            cpu_backend,
+        );
+
+        let max_gpu_bytes = total_rows * gate_split_row.max(up_split_row) * 4;
+        let merged_bytes = total_rows * ffn_hidden * 4;
+
+        self.partition = Some(PrefillPartitionScratch {
+            x_cpu,
+            gate_gpu_partial,
+            gate_cpu_partial,
+            up_gpu_partial,
+            up_cpu_partial,
+            merge_gpu_temp: vec![0u8; max_gpu_bytes],
+            merge_buf: vec![0u8; merged_bytes],
+        });
+        Ok(())
     }
 }
 
