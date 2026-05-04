@@ -729,11 +729,36 @@ impl TransformerModel {
 
         let mut count = 0;
 
+        // Retag policy. `gguf.rs::load_raw` builds layer weights via
+        // `backend.copy_weight_from(&cpu_tensor)`, which on OpenCL preserves
+        // the source's CPU backend in the returned `Tensor::backend()` even
+        // though the buffer is a `UnifiedBuffer` with valid `cl_mem`. The
+        // tensor partition path (`split_weight_col` for FFN-down) reads
+        // `weight.backend()` and dispatches `copy_from` through it — when
+        // that backend is CPU, the resulting GPU slice lands as
+        // `SharedBuffer` (no `cl_mem`) and the next `matmul_f16` aborts with
+        // "B is not OpenCL buffer". Pre-2026-05-01 (`4416994`) the bug was
+        // masked because `map_one` always replaced the buffer, retagging
+        // backend to GPU on the way through. The post-`4416994` in-place
+        // mapping path skipped the replacement and left the CPU-tagged
+        // backend in place.
+        //
+        // Fix: explicit retag whenever the tensor was loaded with a non-GPU
+        // backend. `Tensor::backend()` returns a borrowed `Arc<dyn Backend>`,
+        // so we compare against `be` (the GPU backend) by `Arc::ptr_eq`.
+        // Mismatches trigger a new `Tensor::new(... be.clone())` so downstream
+        // partition / matmul dispatch sees the GPU backend consistently.
         let map_one = |t: &Tensor, be: &Arc<dyn Backend>| -> Result<(Tensor, bool)> {
+            let needs_retag = !Arc::ptr_eq(t.backend(), be);
             // Already CPU-accessible (e.g. mapped UnifiedBuffer, mmap-backed) → no-op.
             if !t.buffer().as_ptr().is_null() {
                 t.buffer().map_for_cpu()?; // no-op if already mapped
-                return Ok((t.clone(), false));
+                let new_t = if needs_retag {
+                    Tensor::new(t.shape().clone(), t.buffer().clone(), be.clone())
+                } else {
+                    t.clone()
+                };
+                return Ok((new_t, needs_retag));
             }
             // UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR, freshly allocated by
             // `OpenCLMemory::alloc` from copy_weight_from / copy_from) starts
@@ -746,7 +771,12 @@ impl TransformerModel {
             // the read_buffer + alloc cost below.
             t.buffer().map_for_cpu()?;
             if !t.buffer().as_ptr().is_null() {
-                return Ok((t.clone(), false));
+                let new_t = if needs_retag {
+                    Tensor::new(t.shape().clone(), t.buffer().clone(), be.clone())
+                } else {
+                    t.clone()
+                };
+                return Ok((new_t, needs_retag));
             }
             // Device-only buffer (OpenCLBuffer): read to new UnifiedBuffer.
             let size = t.size();
