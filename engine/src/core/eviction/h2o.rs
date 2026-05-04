@@ -288,60 +288,56 @@ mod tests {
     // ── evict_with_scores tests ──
 
     #[test]
-    fn test_budget_split_50_50() {
-        // keep_ratio=0.5 → 50:50 HH:Recent split (paper default)
-        let policy = H2OPolicy::new(0.5, 0); // prefix=4(clamped)
-        let mut cache = make_cache(20);
-
-        for i in 0..20 {
-            write_marker(&mut cache, i, (i + 1) as f32);
+    fn test_evict_with_scores_budget_split() {
+        // Verify that prefix + hh_budget + recent_budget == keep for various keep_ratio values.
+        // Each case runs end-to-end eviction and checks the resulting current_pos.
+        struct Case {
+            label: &'static str,
+            keep_ratio: f32,
+            current: usize,
+            target: usize,
+            // prefix is always 4 (clamped from 0)
+            expected_pos: usize,
         }
 
-        // High scores on specific tokens
-        let mut importance = vec![0.0f32; 100];
-        importance[5] = 10.0;
-        importance[8] = 9.0;
-        importance[12] = 8.0;
-        for imp in importance[4..20].iter_mut() {
-            if *imp == 0.0 {
-                *imp = 0.01;
+        let cases = [
+            Case {
+                label: "50:50 split (paper default)",
+                keep_ratio: 0.5,
+                current: 20,
+                target: 10,
+                // available=6, hh=3, recent=3 → prefix(4)+3+3=10
+                expected_pos: 10,
+            },
+            Case {
+                label: "80:20 split (high HH ratio)",
+                keep_ratio: 0.8,
+                current: 20,
+                target: 14,
+                // available=10, hh=8, recent=2 → prefix(4)+8+2=14
+                expected_pos: 14,
+            },
+        ];
+
+        for c in &cases {
+            let policy = H2OPolicy::new(c.keep_ratio, 0); // prefix=4 (clamped)
+            let mut cache = make_cache(c.current);
+            for i in 0..c.current {
+                write_marker(&mut cache, i, (i + 1) as f32);
             }
+            let mut importance = vec![0.0f32; 100];
+            for i in 4..c.current {
+                importance[i] = (c.current - i) as f32;
+            }
+            policy
+                .evict_with_scores(&mut cache, c.target, &importance)
+                .unwrap();
+            assert_eq!(
+                cache.current_pos, c.expected_pos,
+                "case='{}': expected current_pos={}",
+                c.label, c.expected_pos
+            );
         }
-
-        // target_len=10, keep=10, available=10-4=6
-        // hh_budget = 6*0.5 = 3, recent_budget = 3
-        // recent_start = max(4, 20-3) = 17
-        // evictable: positions 4..17 (13 tokens), keep top-3 by score
-        policy
-            .evict_with_scores(&mut cache, 10, &importance)
-            .unwrap();
-
-        assert_eq!(cache.current_pos, 10); // 4 prefix + 3 hh + 3 recent
-    }
-
-    #[test]
-    fn test_high_hh_ratio() {
-        // keep_ratio=0.8 → 80% HH, 20% Recent
-        let policy = H2OPolicy::new(0.8, 0); // prefix=4(clamped)
-        let mut cache = make_cache(20);
-
-        for i in 0..20 {
-            write_marker(&mut cache, i, (i + 1) as f32);
-        }
-
-        let mut importance = vec![0.0f32; 100];
-        for i in 4..20 {
-            importance[i] = (20 - i) as f32; // higher scores for earlier tokens
-        }
-
-        // target_len=14, keep=14, available=14-4=10
-        // hh_budget = 10*0.8 = 8, recent_budget = 2
-        // recent_start = max(4, 20-2) = 18
-        policy
-            .evict_with_scores(&mut cache, 14, &importance)
-            .unwrap();
-
-        assert_eq!(cache.current_pos, 14); // 4 prefix + 8 hh + 2 recent
     }
 
     #[test]
@@ -697,103 +693,54 @@ mod tests {
     }
 
     #[test]
-    fn test_score_ranking_descending_pattern() {
-        // Scores descending by position: older tokens score higher.
-        let policy = H2OPolicy::new(0.5, 0); // prefix=4
-        let mut cache = make_cache(16);
-
-        for i in 0..16 {
-            write_marker(&mut cache, i, (i + 1) as f32 * 10.0);
+    fn test_score_ranking_patterns() {
+        // Verify HH selection under three distinct score distributions over the evictable
+        // region [4..14). All cases: current=16, target=8, hh=2, recent=2, recent_start=14.
+        struct Case {
+            label: &'static str,
+            // importance[4..14] assigned by closure; values outside this range stay 0.0
+            scores: [f32; 10], // index 0 → pos 4, index 9 → pos 13
+            // expected markers for the 8 slots after eviction
+            expected: [f32; 8],
         }
 
-        // target=8, available=4, hh=2, recent=2, recent_start=14, evictable=[4..14)
-        let mut importance = vec![0.0f32; 100];
-        for i in 4..14 {
-            importance[i] = (14 - i) as f32; // pos 4=10, pos 5=9, ..., pos 13=1
-        }
-
-        policy
-            .evict_with_scores(&mut cache, 8, &importance)
-            .unwrap();
-
-        let markers = collect_markers(&cache);
-
-        // Top 2 from evictable [4..14): pos 4(10), pos 5(9)
-        let expected = vec![
-            10.0, 20.0, 30.0, 40.0, // prefix
-            50.0, 60.0, // HH: pos 4, 5
-            150.0, 160.0, // recent: pos 14, 15
+        let cases = [
+            Case {
+                label: "descending (older tokens score higher)",
+                // pos 4=10, pos 5=9, ..., pos 13=1 → top-2: pos 4, 5
+                scores: [10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+                expected: [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 150.0, 160.0],
+            },
+            Case {
+                label: "ascending (newer evictable tokens score higher)",
+                // pos 4=1, pos 5=2, ..., pos 13=10 → top-2: pos 12, 13
+                scores: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+                expected: [10.0, 20.0, 30.0, 40.0, 130.0, 140.0, 150.0, 160.0],
+            },
+            Case {
+                label: "V-shape (both ends high, middle low)",
+                // pos 4=9.0, pos 13=8.0 → top-2: pos 4, 13
+                scores: [9.0, 2.0, 1.0, 0.5, 0.1, 0.1, 0.5, 1.0, 2.0, 8.0],
+                expected: [10.0, 20.0, 30.0, 40.0, 50.0, 140.0, 150.0, 160.0],
+            },
         ];
-        assert_eq!(markers, expected);
-    }
 
-    #[test]
-    fn test_score_ranking_ascending_pattern() {
-        // Scores ascending by position: newer evictable tokens score higher.
-        let policy = H2OPolicy::new(0.5, 0); // prefix=4
-        let mut cache = make_cache(16);
-
-        for i in 0..16 {
-            write_marker(&mut cache, i, (i + 1) as f32 * 10.0);
+        for c in &cases {
+            let policy = H2OPolicy::new(0.5, 0); // prefix=4
+            let mut cache = make_cache(16);
+            for i in 0..16 {
+                write_marker(&mut cache, i, (i + 1) as f32 * 10.0);
+            }
+            let mut importance = vec![0.0f32; 100];
+            for (offset, &score) in c.scores.iter().enumerate() {
+                importance[4 + offset] = score;
+            }
+            policy
+                .evict_with_scores(&mut cache, 8, &importance)
+                .unwrap();
+            let markers = collect_markers(&cache);
+            assert_eq!(markers, c.expected.to_vec(), "case='{}'", c.label);
         }
-
-        // target=8, available=4, hh=2, recent=2, recent_start=14, evictable=[4..14)
-        let mut importance = vec![0.0f32; 100];
-        for i in 4..14 {
-            importance[i] = (i - 3) as f32; // pos 4=1, pos 5=2, ..., pos 13=10
-        }
-
-        policy
-            .evict_with_scores(&mut cache, 8, &importance)
-            .unwrap();
-
-        let markers = collect_markers(&cache);
-
-        // Top 2 from evictable [4..14): pos 13(10), pos 12(9)
-        let expected = vec![
-            10.0, 20.0, 30.0, 40.0, // prefix
-            130.0, 140.0, // HH: pos 12, 13 (highest scoring, sorted by position)
-            150.0, 160.0, // recent: pos 14, 15
-        ];
-        assert_eq!(markers, expected);
-    }
-
-    #[test]
-    fn test_score_ranking_v_shape_pattern() {
-        // V-shape scores: both ends of evictable region score high, middle low.
-        let policy = H2OPolicy::new(0.5, 0); // prefix=4
-        let mut cache = make_cache(16);
-
-        for i in 0..16 {
-            write_marker(&mut cache, i, (i + 1) as f32 * 10.0);
-        }
-
-        // evictable=[4..14), target=8, hh=2, recent=2
-        let mut importance = vec![0.0f32; 100];
-        importance[4] = 9.0; // left end high
-        importance[5] = 2.0;
-        importance[6] = 1.0;
-        importance[7] = 0.5;
-        importance[8] = 0.1;
-        importance[9] = 0.1;
-        importance[10] = 0.5;
-        importance[11] = 1.0;
-        importance[12] = 2.0;
-        importance[13] = 8.0; // right end high
-
-        policy
-            .evict_with_scores(&mut cache, 8, &importance)
-            .unwrap();
-
-        let markers = collect_markers(&cache);
-
-        // Top 2: pos 4(9.0), pos 13(8.0)
-        let expected = vec![
-            10.0, 20.0, 30.0, 40.0, // prefix
-            50.0, 140.0, // HH: pos 4, 13
-            150.0, 160.0, // recent
-        ];
-        assert_eq!(markers, expected);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -801,82 +748,60 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_keep_ratio_zero_no_hh() {
-        // keep_ratio=0.0 → hh_budget=0 → pure sliding window (no HH partition)
-        let policy = H2OPolicy::new(0.0, 0); // prefix=4
-        let mut cache = make_cache(20);
-
-        for i in 0..20 {
-            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+    fn test_keep_ratio_boundary() {
+        // keep_ratio=0.0 → hh_budget=0 (pure sliding window, no HH partition).
+        // keep_ratio=1.0 → recent_budget=0 (pure HH, recent tokens can be evicted by score).
+        // Both cases: current=20, prefix=4 (clamped from 0), target=10, available=6.
+        struct Case {
+            label: &'static str,
+            keep_ratio: f32,
+            expected: Vec<f32>,
         }
 
-        // Even if some tokens have very high scores, they should be evicted
-        let mut importance = vec![0.0f32; 100];
-        importance[5] = 999.0; // would be top HH if ratio > 0
-        importance[10] = 888.0;
-
-        // target=10, available=6, hh=0, recent=6
-        // recent_start = max(4, 20-6) = 14
-        policy
-            .evict_with_scores(&mut cache, 10, &importance)
-            .unwrap();
-
-        let markers = collect_markers(&cache);
-
-        // No HH at all, only prefix + recent 6
-        let expected = vec![
-            100.0, 200.0, 300.0, 400.0, // prefix
-            1500.0, 1600.0, 1700.0, 1800.0, 1900.0, 2000.0, // recent: pos 14-19
+        let cases = [
+            Case {
+                label: "keep_ratio=0.0: high-score tokens must still be evicted (no HH partition)",
+                keep_ratio: 0.0,
+                // hh=0, recent=6, recent_start=14 → prefix + recent[14..20]
+                expected: vec![
+                    100.0, 200.0, 300.0, 400.0, 1500.0, 1600.0, 1700.0, 1800.0, 1900.0, 2000.0,
+                ],
+            },
+            Case {
+                label: "keep_ratio=1.0: recent tokens with low scores must be evicted",
+                keep_ratio: 1.0,
+                // hh=6, recent=0, evictable=[4..20), top-6 by score: pos 4-9
+                expected: vec![
+                    100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0, 1000.0,
+                ],
+            },
         ];
-        assert_eq!(
-            markers, expected,
-            "With keep_ratio=0.0, high-score tokens must still be evicted (no HH partition)"
-        );
-    }
 
-    #[test]
-    fn test_keep_ratio_one_no_recent() {
-        // keep_ratio=1.0 → recent_budget=0 → all budget to HH
-        // Even the most recent token can be evicted if its score is low.
-        let policy = H2OPolicy::new(1.0, 0); // prefix=4
-        let mut cache = make_cache(20);
-
-        for i in 0..20 {
-            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        for c in &cases {
+            let policy = H2OPolicy::new(c.keep_ratio, 0); // prefix=4 (clamped)
+            let mut cache = make_cache(20);
+            for i in 0..20 {
+                write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+            }
+            // Shared importance: old evictable tokens (pos 4-9) score high, newer ones low.
+            // ratio=0.0 ignores HH entirely (all budget → recent);
+            // ratio=1.0 selects top-6 from [4..20) → pos 4-9.
+            let mut importance = vec![0.0f32; 100];
+            importance[4] = 10.0;
+            importance[5] = 9.0;
+            importance[6] = 8.0;
+            importance[7] = 7.0;
+            importance[8] = 6.0;
+            importance[9] = 5.0;
+            for i in 10..20 {
+                importance[i] = 0.01;
+            }
+            policy
+                .evict_with_scores(&mut cache, 10, &importance)
+                .unwrap();
+            let markers = collect_markers(&cache);
+            assert_eq!(markers, c.expected, "case='{}'", c.label);
         }
-
-        let mut importance = vec![0.0f32; 100];
-        // Give high scores to OLD evictable tokens, low to recent
-        importance[4] = 10.0;
-        importance[5] = 9.0;
-        importance[6] = 8.0;
-        importance[7] = 7.0;
-        importance[8] = 6.0;
-        importance[9] = 5.0;
-        // pos 10-19: low scores
-        for i in 10..20 {
-            importance[i] = 0.01;
-        }
-
-        // target=10, available=6, hh=6, recent=0
-        // recent_start = max(4, 20-0) = 20
-        // evictable = [4..20) = ALL non-prefix tokens
-        policy
-            .evict_with_scores(&mut cache, 10, &importance)
-            .unwrap();
-
-        let markers = collect_markers(&cache);
-
-        // Top 6 by score from [4..20): pos 4(10), 5(9), 6(8), 7(7), 8(6), 9(5)
-        // Most recent tokens (19, 18, 17) are EVICTED because their scores are 0.01
-        let expected = vec![
-            100.0, 200.0, 300.0, 400.0, // prefix
-            500.0, 600.0, 700.0, 800.0, 900.0, 1000.0, // HH: pos 4-9
-        ];
-        assert_eq!(
-            markers, expected,
-            "With keep_ratio=1.0, recent tokens with low scores must be evicted"
-        );
     }
 
     #[test]
