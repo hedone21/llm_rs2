@@ -1,7 +1,7 @@
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::shape::Shape;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -69,16 +69,6 @@ impl Tensor {
                 self.size() / std::mem::size_of::<T>(),
             )
         }
-    }
-
-    // Operations delegated to backend
-    pub fn matmul(&self, _other: &Tensor) -> Result<Tensor> {
-        // Implementation would need an output tensor created via backend/memory
-        // For now, this requires a way to allocate output.
-        // We usually pass 'out' or create it.
-        // Let's assume we'll use a lower-level API or the user creates 'out'.
-        // Or we can add a helper if Backend supports allocation (it usually doesn't directly, Memory does).
-        Err(anyhow!("Use backend.matmul directly for now"))
     }
 
     /// Reshape this tensor in-place, changing only the shape metadata.
@@ -262,17 +252,6 @@ mod tests {
 
         let mut_slice = tensor.as_mut_slice::<f32>();
         assert_eq!(mut_slice.len(), 5);
-    }
-
-    #[test]
-    fn test_tensor_matmul_unimplemented() {
-        let shape = Shape::new(vec![2, 2]);
-        let buffer = Arc::new(DummyBuffer::new(16, DType::F32));
-        let backend = Arc::new(DummyBackend);
-        let tensor1 = Tensor::new(shape.clone(), buffer.clone(), backend.clone());
-        let tensor2 = Tensor::new(shape, buffer, backend);
-
-        assert!(tensor1.matmul(&tensor2).is_err());
     }
 
     struct DummyBackendSameName;

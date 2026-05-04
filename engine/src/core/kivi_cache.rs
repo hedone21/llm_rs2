@@ -274,28 +274,6 @@ pub struct KiviCache {
 impl KiviCache {
     // ── SharedBuffer ↔ f32 slice helpers ─────────────────────────────────────
 
-    /// Return the attn_k_buf contents as a `&[f32]` slice (len = byte_size / 4).
-    #[allow(dead_code)]
-    fn attn_k_as_slice(&self) -> &[f32] {
-        let len = self.attn_k_buf.size() / 4;
-        if len == 0 {
-            return &[];
-        }
-        // SAFETY: SharedBuffer is allocated as DType::F32 with size = len*4 bytes.
-        // The pointer is valid for `len` f32 elements.
-        unsafe { std::slice::from_raw_parts(self.attn_k_buf.as_ptr() as *const f32, len) }
-    }
-
-    /// Return the attn_v_buf contents as a `&[f32]` slice.
-    #[allow(dead_code)]
-    fn attn_v_as_slice(&self) -> &[f32] {
-        let len = self.attn_v_buf.size() / 4;
-        if len == 0 {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(self.attn_v_buf.as_ptr() as *const f32, len) }
-    }
-
     /// Return the attn_k_buf contents as a `&mut [f32]` slice.
     ///
     /// SAFETY: Caller must ensure no aliasing references exist. In practice,
@@ -2037,18 +2015,6 @@ impl KiviCache {
         self.gpu_q2v_blocks += new_v_blocks;
 
         Ok(())
-    }
-
-    /// Serialize quantized key blocks [block_start..block_start+count] to raw bytes.
-    #[allow(dead_code)]
-    fn serialize_quantized_blocks_k(&self, block_start: usize, count: usize) -> Vec<u8> {
-        self.serialize_blocks(&self.qk, block_start, count)
-    }
-
-    /// Serialize quantized value blocks [block_start..block_start+count] to raw bytes.
-    #[allow(dead_code)]
-    fn serialize_quantized_blocks_v(&self, block_start: usize, count: usize) -> Vec<u8> {
-        self.serialize_blocks(&self.qv, block_start, count)
     }
 
     fn serialize_blocks(&self, blocks: &QuantizedBlocks, start: usize, count: usize) -> Vec<u8> {
