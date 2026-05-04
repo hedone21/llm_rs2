@@ -9,11 +9,7 @@
 //!
 //! - `hook`: `StepHook` and `CacheSnapshot` traits
 //! - `output`: `EvalOutput`, `EvalConfig`, `EvalQuestion`
-//! - `qcf_helpers`: shared QCF/OPR metric aggregation utilities
-//!
-//! # Design
-//!
-//! See `docs/38_eval_refactoring.md` for the full design document.
+//! - `qcf_helpers`: layer-swap QCF dump utilities (`QcfSwapDumpContext`)
 
 pub mod eval_loop;
 pub mod eviction_hook;
@@ -24,7 +20,7 @@ pub mod qcf_helpers;
 
 pub use eval_loop::run_eval_ll_generic;
 pub use eviction_hook::EvictionHook;
-pub use hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
+pub use hook::{CacheSnapshot, PostStepResult, StepHook};
 pub use kivi_hook::KiviHook;
 pub use output::{EvalConfig, EvalOutput, EvalQuestion};
 pub use qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};

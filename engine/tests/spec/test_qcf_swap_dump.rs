@@ -527,7 +527,6 @@ fn test_ppl_none_serializes_as_null() {
 /// field with at least the `results` array from the EvalOutput.
 #[test]
 fn test_eval_ll_output_some_included_in_json() {
-    use llm_rs2::eval::hook::MetricsSummary;
     use llm_rs2::eval::output::EvalOutput;
 
     let eval_output = EvalOutput {
@@ -549,7 +548,6 @@ fn test_eval_ll_output_some_included_in_json() {
         ],
         config: serde_json::json!({"model": "test", "eviction_policy": "none"}),
         wall_time_s: 18.7,
-        metrics_summary: MetricsSummary::default(),
         layer_importance: None,
         layer_skip_qcf: None,
         layer_skip_qcf_normalized: None,

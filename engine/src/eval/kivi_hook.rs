@@ -8,7 +8,7 @@
 //! a `QcfMetric`. KiviHook collects those metrics from `take_flush_proxies()` after
 //! each prefill and decode step.
 
-use super::hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
+use super::hook::{CacheSnapshot, PostStepResult, StepHook};
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::kivi_cache::KiviCache;
 
@@ -91,21 +91,12 @@ impl KiviHook {
 }
 
 impl StepHook<KiviCache> for KiviHook {
-    fn post_decode_step(
-        &mut self,
-        caches: &mut [KiviCache],
-        _step: usize,
-        _qcf_metrics: &mut Vec<serde_json::Value>,
-    ) -> PostStepResult {
+    fn post_decode_step(&mut self, caches: &mut [KiviCache], _step: usize) -> PostStepResult {
         self.collect_flush_proxies(caches);
         PostStepResult::default()
     }
 
-    fn post_prefill(
-        &mut self,
-        caches: &mut [KiviCache],
-        _qcf_metrics: &mut Vec<serde_json::Value>,
-    ) {
+    fn post_prefill(&mut self, caches: &mut [KiviCache]) {
         self.collect_flush_proxies(caches);
     }
 
@@ -166,12 +157,6 @@ impl StepHook<KiviCache> for KiviHook {
     fn extra_config_fields(&self) -> serde_json::Value {
         serde_json::json!({})
     }
-
-    fn aggregate_metrics(&self, _qcf_metrics: &[serde_json::Value]) -> MetricsSummary {
-        // KIVI metrics now stored in self (qcf_kivi_legacy, flush_count)
-        // and exposed via extra_question_fields. Return default.
-        MetricsSummary::default()
-    }
 }
 
 #[cfg(test)]
@@ -187,10 +172,8 @@ mod tests {
     #[test]
     fn test_post_decode_step_empty_caches() {
         let mut hook = make_hook();
-        let mut metrics = vec![];
-        let result = hook.post_decode_step(&mut [], 0, &mut metrics);
+        let result = hook.post_decode_step(&mut [], 0);
         assert!(!result.evicted);
-        assert!(metrics.is_empty());
     }
 
     #[test]
@@ -209,14 +192,6 @@ mod tests {
         let fields = hook.extra_question_fields(&[cache]);
         assert_eq!(fields["kivi_q2_tokens"], 0);
         assert_eq!(fields["kivi_res_pos"], 0);
-    }
-
-    #[test]
-    fn test_aggregate_metrics_returns_default() {
-        let hook = make_hook();
-        let summary = hook.aggregate_metrics(&[]);
-        assert_eq!(summary.qcf_attn_total, 0.0);
-        assert_eq!(summary.qcf_kivi_opr, None);
     }
 
     #[test]

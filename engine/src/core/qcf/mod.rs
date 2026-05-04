@@ -6,18 +6,12 @@
 //! via offline-calibrated piecewise-linear coefficients.
 
 pub mod estimator;
-pub mod eviction_qcf;
 pub mod layer_importance;
 pub mod quant_qcf;
 pub mod skip_qcf;
 pub mod unified_qcf;
 
 pub use estimator::DegradationEstimator;
-pub use eviction_qcf::{
-    compute_eviction_qcf_attn, compute_eviction_qcf_caote, compute_qcf_attn_v2,
-    compute_sliding_qcf_attn, compute_sliding_qcf_caote, identify_evicted_h2o,
-    identify_evicted_sliding,
-};
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 pub use quant_qcf::{
     FlushAwVoprParams, FlushAwqeParams, FlushQcfParams, compute_flush_aw_vopr, compute_flush_awqe,
