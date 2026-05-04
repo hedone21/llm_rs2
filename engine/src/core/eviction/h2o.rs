@@ -29,7 +29,7 @@ pub struct H2OPolicy {
 }
 
 impl H2OPolicy {
-    pub fn new(_recent_window: usize, keep_ratio: f32, protected_prefix: usize) -> Self {
+    pub fn new(keep_ratio: f32, protected_prefix: usize) -> Self {
         let protected_prefix = protected_prefix.max(4);
         Self {
             keep_ratio: keep_ratio.clamp(0.0, 1.0),
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_should_evict_always_false() {
-        let policy = H2OPolicy::new(0, 0.5, 0);
+        let policy = H2OPolicy::new(0.5, 0);
         assert!(!policy.should_evict(&make_cache(20), 0));
         assert!(!policy.should_evict(&make_cache(1000), 0));
         assert!(!policy.should_evict(&make_cache(1), 0));
@@ -255,7 +255,7 @@ mod tests {
     fn test_evict_fallback_keeps_recent() {
         let _ = env_logger::try_init();
         // keep_ratio=0.5, prefix=4(clamped)
-        let policy = H2OPolicy::new(0, 0.5, 0);
+        let policy = H2OPolicy::new(0.5, 0);
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_evict_below_threshold_noop() {
-        let policy = H2OPolicy::new(0, 0.5, 0);
+        let policy = H2OPolicy::new(0.5, 0);
         let mut cache = make_cache(10);
         policy.evict(&mut cache, 10).unwrap();
         assert_eq!(cache.current_pos, 10);
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn test_budget_split_50_50() {
         // keep_ratio=0.5 → 50:50 HH:Recent split (paper default)
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4(clamped)
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4(clamped)
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn test_high_hh_ratio() {
         // keep_ratio=0.8 → 80% HH, 20% Recent
-        let policy = H2OPolicy::new(0, 0.8, 0); // prefix=4(clamped)
+        let policy = H2OPolicy::new(0.8, 0); // prefix=4(clamped)
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_evict_preserves_prefix() {
-        let policy = H2OPolicy::new(0, 0.5, 5); // prefix=5
+        let policy = H2OPolicy::new(0.5, 5); // prefix=5
         let mut cache = make_cache(30);
 
         for i in 0..30 {
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_no_eviction_when_below_target() {
-        let policy = H2OPolicy::new(0, 0.5, 0);
+        let policy = H2OPolicy::new(0.5, 0);
         let mut cache = make_cache(10);
         let importance = vec![1.0f32; 100];
 
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn test_order_preservation() {
         // Verify final layout is [prefix][hh in position order][recent in position order]
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4(clamped)
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4(clamped)
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_evict_fallback_works() {
-        let policy = H2OPolicy::new(0, 0.5, 0);
+        let policy = H2OPolicy::new(0.5, 0);
         let mut cache = make_cache(20);
         policy.evict(&mut cache, 10).unwrap();
         assert!(cache.current_pos < 20);
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_name() {
-        assert_eq!(H2OPolicy::new(0, 0.5, 0).name(), "h2o");
+        assert_eq!(H2OPolicy::new(0.5, 0).name(), "h2o");
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -521,7 +521,7 @@ mod tests {
     fn test_hh_selects_highest_scores() {
         // Core test: verify that the top-K scored tokens from evictable region
         // are exactly the ones that survive as HH.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         // Each position gets a unique marker = (pos+1)*100
@@ -574,7 +574,7 @@ mod tests {
     fn test_hh_ignores_recent_region_scores() {
         // Even if recent tokens have highest scores, they stay as "recent",
         // and HH is selected only from evictable region.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn test_hh_ignores_prefix_region_scores() {
         // Prefix tokens (even with high scores) are never in HH candidate set.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn test_low_score_tokens_evicted() {
         // Verify that the tokens with lowest scores are the ones removed.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn test_score_ranking_descending_pattern() {
         // Scores descending by position: older tokens score higher.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(16);
 
         for i in 0..16 {
@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn test_score_ranking_ascending_pattern() {
         // Scores ascending by position: newer evictable tokens score higher.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(16);
 
         for i in 0..16 {
@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn test_score_ranking_v_shape_pattern() {
         // V-shape scores: both ends of evictable region score high, middle low.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(16);
 
         for i in 0..16 {
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn test_keep_ratio_zero_no_hh() {
         // keep_ratio=0.0 → hh_budget=0 → pure sliding window (no HH partition)
-        let policy = H2OPolicy::new(0, 0.0, 0); // prefix=4
+        let policy = H2OPolicy::new(0.0, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -838,7 +838,7 @@ mod tests {
     fn test_keep_ratio_one_no_recent() {
         // keep_ratio=1.0 → recent_budget=0 → all budget to HH
         // Even the most recent token can be evicted if its score is low.
-        let policy = H2OPolicy::new(0, 1.0, 0); // prefix=4
+        let policy = H2OPolicy::new(1.0, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -882,7 +882,7 @@ mod tests {
     #[test]
     fn test_evictable_boundary_token() {
         // Verify the exact boundary: recent_start-1 is evictable, recent_start is recent.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -924,7 +924,7 @@ mod tests {
     #[test]
     fn test_budget_rounding_odd_available() {
         // available=7 with keep_ratio=0.5 → hh=(7*0.5)=3 (truncated), recent=4
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -960,7 +960,7 @@ mod tests {
     fn test_tie_breaking_prefers_earlier_position() {
         // When multiple tokens have identical scores, stable sort preserves
         // original position order → earlier positions are selected first.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn test_compaction_noncontiguous_hh_exact_data() {
         // HH at widely spaced positions: verify data at each position after compaction.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         // Write unique marker for each position
@@ -1043,7 +1043,7 @@ mod tests {
     #[test]
     fn test_compaction_adjacent_hh_no_unnecessary_shift() {
         // HH tokens are right after prefix: pos 4, 5, 6 → no shift needed.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -1079,7 +1079,7 @@ mod tests {
     #[test]
     fn test_compaction_multihead_cache() {
         // Multiple KV heads: verify shift_positions correctly moves all heads.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let kv_heads = 4;
         let head_dim = 4;
         let mut cache = make_cache_multihead(20, kv_heads, head_dim);
@@ -1153,7 +1153,7 @@ mod tests {
     #[test]
     fn test_k_v_buffers_stay_synchronized() {
         // Write different patterns to K and V, verify both compacted identically.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         // K gets positive markers, V gets negative markers
@@ -1205,7 +1205,7 @@ mod tests {
         // Two rounds of eviction on the same cache.
         // After 1st eviction, importance array is NOT realigned.
         // 2nd eviction uses stale importance → test the resulting behavior.
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn test_aggressive_eviction_large_to_small() {
         // 50 tokens → 10 tokens (aggressive 80% eviction)
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(50);
 
         for i in 0..50 {
@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn test_custom_prefix_size() {
         // Custom prefix=8, verify correct partitioning.
-        let policy = H2OPolicy::new(0, 0.5, 8); // prefix=8
+        let policy = H2OPolicy::new(0.5, 8); // prefix=8
         let mut cache = make_cache(30);
 
         for i in 0..30 {
@@ -1368,7 +1368,7 @@ mod tests {
         //
         // This test demonstrates the misalignment that reset prevents.
 
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -1421,7 +1421,7 @@ mod tests {
         // After eviction + reset, it re-accumulates with LOW scores
         // Round 2: It should now be evictable (no "HH lock-in")
 
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -1486,7 +1486,7 @@ mod tests {
         // Round 1: evict 20→10, positions shift
         // Round 2: use OLD importance array (not reset) → wrong tokens selected as HH
 
-        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -1642,7 +1642,7 @@ mod tests {
     #[test]
     fn test_evictable_fewer_than_hh_budget() {
         // Edge case: hh_budget > evictable tokens → keep all evictable as HH.
-        let policy = H2OPolicy::new(0, 0.9, 0); // prefix=4
+        let policy = H2OPolicy::new(0.9, 0); // prefix=4
         let mut cache = make_cache(10);
 
         for i in 0..10 {

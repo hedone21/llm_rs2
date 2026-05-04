@@ -55,7 +55,7 @@ fn make_cache_with_data(num_tokens: usize) -> KVCache {
 
 #[test]
 fn test_eng_alg_010_h2o_no_eviction_when_below_target() {
-    let policy = H2OPolicy::new(5, 0.5, 4);
+    let policy = H2OPolicy::new(0.5, 4);
     let mut cache = make_cache_with_data(10);
     // target_len이 current_pos 이상이면 eviction 발생하지 않음
     policy.evict(&mut cache, 20).unwrap();
@@ -64,7 +64,7 @@ fn test_eng_alg_010_h2o_no_eviction_when_below_target() {
 
 #[test]
 fn test_eng_alg_010_h2o_evict_preserves_prefix() {
-    let policy = H2OPolicy::new(5, 0.5, 4);
+    let policy = H2OPolicy::new(0.5, 4);
     let mut cache = make_cache_with_data(30);
 
     // target_len=15: prefix 4개는 보호되어야 함
@@ -80,7 +80,7 @@ fn test_eng_alg_010_h2o_evict_preserves_prefix() {
 #[test]
 fn test_eng_alg_010_h2o_should_evict_always_false() {
     // H2O는 signal-driven: should_evict()는 항상 false
-    let policy = H2OPolicy::new(5, 0.5, 4);
+    let policy = H2OPolicy::new(0.5, 4);
     let cache = make_cache_with_data(50);
     assert!(!policy.should_evict(&cache, 0));
 }
@@ -91,7 +91,7 @@ fn test_eng_alg_010_h2o_should_evict_always_false() {
 
 #[test]
 fn test_eng_alg_010_c01_h2o_evict_with_scores_preserves_important() {
-    let policy = H2OPolicy::new(5, 0.5, 4);
+    let policy = H2OPolicy::new(0.5, 4);
     let mut cache = make_cache_with_data(30);
 
     // importance scores: position 10, 20에 높은 중요도

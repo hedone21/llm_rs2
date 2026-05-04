@@ -197,7 +197,7 @@ mod tests {
     fn test_wraps_h2o_with_scores() {
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let handler = EvictionHandler::new(
-            Box::new(H2OPolicy::new(5, 0.5, 0)), // prefix=0(clamped), keep_ratio=0.5
+            Box::new(H2OPolicy::new(0.5, 0)), // prefix=0(clamped), keep_ratio=0.5
             0.3,
         );
 
@@ -289,7 +289,7 @@ mod tests {
         let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.5);
         assert_eq!(handler.name(), "sliding_window");
 
-        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.5);
+        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.5);
         assert_eq!(handler.name(), "h2o");
 
         let handler = EvictionHandler::new(Box::new(NoEvictionPolicy::new()), 0.5);
@@ -387,7 +387,7 @@ mod tests {
     fn test_h2o_fallback_without_scores() {
         // H2O without importance scores → fallback to sliding-window-like behavior.
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
-        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.3);
+        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.3);
 
         let mut caches = make_caches(2, 100);
         let mut ctx = HandlerContext {

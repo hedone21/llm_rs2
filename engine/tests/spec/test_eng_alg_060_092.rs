@@ -557,7 +557,7 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
     };
 
     // pos=100, ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-    let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.3);
+    let handler = EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.3);
     assert_eq!(handler.name(), "h2o");
 
     let mut caches: Vec<KVCache> = (0..4).map(|_| make_cache(100)).collect();

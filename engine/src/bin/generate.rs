@@ -370,10 +370,6 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     streaming_window: usize,
 
-    /// Deprecated: recent window is now derived from budget split. Kept for CLI compatibility.
-    #[arg(long, default_value_t = 128, hide = true)]
-    h2o_recent_window: usize,
-
     /// Fraction of tokens to keep as heavy hitters (0.0 to 1.0)
     #[arg(long, default_value_t = 0.5)]
     h2o_keep_ratio: f32,
@@ -2028,13 +2024,8 @@ fn main() -> anyhow::Result<()> {
                     };
                     Box::new(StreamingLLMPolicy::new(args.sink_size, window))
                 }
-                "h2o" => Box::new(H2OPolicy::new(
-                    args.h2o_recent_window,
-                    args.h2o_keep_ratio,
-                    actual_protected_prefix,
-                )),
+                "h2o" => Box::new(H2OPolicy::new(args.h2o_keep_ratio, actual_protected_prefix)),
                 "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                    args.h2o_recent_window,
                     args.h2o_keep_ratio,
                     actual_protected_prefix,
                 )),
@@ -2066,7 +2057,6 @@ fn main() -> anyhow::Result<()> {
     cache_manager.register_policy(
         llm_rs2::resilience::EvictMethod::H2o,
         Box::new(H2OPolicy::new(
-            args.h2o_recent_window,
             args.h2o_keep_ratio,
             resilience_protected_prefix,
         )),
@@ -9569,13 +9559,8 @@ fn build_chat_eviction(
                 };
                 Box::new(StreamingLLMPolicy::new(args.sink_size, window))
             }
-            "h2o" => Box::new(H2OPolicy::new(
-                args.h2o_recent_window,
-                args.h2o_keep_ratio,
-                actual_protected_prefix,
-            )),
+            "h2o" => Box::new(H2OPolicy::new(args.h2o_keep_ratio, actual_protected_prefix)),
             "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                args.h2o_recent_window,
                 args.h2o_keep_ratio,
                 actual_protected_prefix,
             )),

@@ -526,13 +526,14 @@ fn scatter_reduce_f32(
 
             let retain_off = cache.offset(*retain_pos, h);
 
+            // Collect evict contributions once — K and V share the same position offsets
+            let evict_contributions: Vec<(usize, f32)> = evicted_list
+                .iter()
+                .map(|&(ep, s)| (cache.offset(ep, h), s))
+                .collect();
+
             // Accumulate weighted sum into retain slot (K)
             {
-                // Collect evict contributions first to avoid borrow conflict
-                let evict_contributions: Vec<(usize, f32)> = evicted_list
-                    .iter()
-                    .map(|&(ep, s)| (cache.offset(ep, h), s))
-                    .collect();
                 let k = cache.k_buffer.as_mut_slice::<f32>();
                 for d in 0..head_dim {
                     let mut acc = k[retain_off + d];
@@ -544,10 +545,6 @@ fn scatter_reduce_f32(
             }
             // V
             {
-                let evict_contributions: Vec<(usize, f32)> = evicted_list
-                    .iter()
-                    .map(|&(ep, s)| (cache.offset(ep, h), s))
-                    .collect();
                 let v = cache.v_buffer.as_mut_slice::<f32>();
                 for d in 0..head_dim {
                     let mut acc = v[retain_off + d];
@@ -584,12 +581,14 @@ fn scatter_reduce_f16(
 
             let retain_off = cache.offset(*retain_pos, h);
 
+            // Collect evict contributions once — K and V share the same position offsets
+            let evict_contributions: Vec<(usize, f32)> = evicted_list
+                .iter()
+                .map(|&(ep, s)| (cache.offset(ep, h), s))
+                .collect();
+
             // K
             {
-                let evict_contributions: Vec<(usize, f32)> = evicted_list
-                    .iter()
-                    .map(|&(ep, s)| (cache.offset(ep, h), s))
-                    .collect();
                 let k = cache.k_buffer.as_mut_slice::<f16>();
                 for d in 0..head_dim {
                     let mut acc = k[retain_off + d].to_f32();
@@ -601,10 +600,6 @@ fn scatter_reduce_f16(
             }
             // V
             {
-                let evict_contributions: Vec<(usize, f32)> = evicted_list
-                    .iter()
-                    .map(|&(ep, s)| (cache.offset(ep, h), s))
-                    .collect();
                 let v = cache.v_buffer.as_mut_slice::<f16>();
                 for d in 0..head_dim {
                     let mut acc = v[retain_off + d].to_f32();
