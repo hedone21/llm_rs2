@@ -1159,6 +1159,10 @@ impl TransformerLayer {
             };
 
             // 0. Make residual visible to CPU.
+            // Note: in production decode this branch is rarely taken — the
+            // OpenCL plan path (`PartitionStep::run`) handles partition layers
+            // when `gpu_plan` is built. forward_gen here is the parity backstop
+            // for `LLMRS_PARTITION_PLAN=0` and CPU-only / non-OpenCL backends.
             let zcopy_residual = !ws.residual.as_ptr().is_null();
             // A1 async-read path: non-blocking enqueue of the residual DMA
             // read + deferred `wait_event` immediately before the CPU slice

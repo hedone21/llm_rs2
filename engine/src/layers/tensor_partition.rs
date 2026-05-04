@@ -491,7 +491,9 @@ pub fn partition_trace_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         let enabled = std::env::var_os("LLMRS_PARTITION_TRACE").is_some();
-        println!("[partition-trace-init] enabled={}", enabled);
+        if enabled {
+            println!("[partition-trace-init] enabled=true");
+        }
         enabled
     })
 }

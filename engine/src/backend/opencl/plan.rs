@@ -395,9 +395,11 @@ pub struct PartitionPlanContext {
     pub rms_norm_add_unit: bool,
     /// Debugging: which layer this step belongs to.
     pub layer_idx: usize,
-    /// Which residual transport path this plan was built against. Plan path
-    /// only supports `SyncRead` today (no async DMA, no replicate_norm).
-    pub partition_path: PartitionPath,
+    // Note: residual transport path is determined dynamically per-call inside
+    // `PartitionStep::run` (poll-flag + non-null `residual_host_ptr` → Zcopy
+    // fast memcpy, else SyncRead via `enqueue_read_buffer`). Earlier code
+    // hardcoded `SyncRead` here, which made the trace counter mislabel every
+    // dispatch even when the fast path was active. Removed 2026-05-04.
     /// INV-120 generation captured at build time. `PartitionStep::run` loads
     /// `PartitionContext.ratio_generation` with `Acquire` and compares; a
     /// miss returns `PlanInvalidated` to the executor.
@@ -511,6 +513,14 @@ impl PartitionStep {
         //    done) and performs the residual DMA read.
         let queue = backend.queue.as_core();
         let poll_flag = crate::layers::tensor_partition::partition_poll_flag_enabled();
+        // Actual residual transport path used this dispatch — drives the trace
+        // counter at the end. Zcopy when the poll-flag fast memcpy from the
+        // permanent-mapped `residual_host_ptr` runs; SyncRead otherwise.
+        let actual_path = if poll_flag && !self.cpu_ctx.residual_host_ptr.is_null() {
+            PartitionPath::Zcopy
+        } else {
+            PartitionPath::SyncRead
+        };
         // SAFETY: `workspace` is owned by this plan and only accessed here.
         let pw: &mut PartitionPlanWorkspace = unsafe { &mut *self.cpu_ctx.workspace.get() };
         if poll_flag {
@@ -887,14 +897,7 @@ impl PartitionStep {
             let cpu_ns = t_cpu.duration_since(t_read).as_nanos() as u64;
             let gpu_wait_ns = t_gpu.duration_since(t_cpu).as_nanos() as u64;
             let merge_ns = t_merge.duration_since(t_gpu).as_nanos() as u64;
-            record_partition_timing(
-                sync_ns,
-                dma_ns,
-                cpu_ns,
-                gpu_wait_ns,
-                merge_ns,
-                self.cpu_ctx.partition_path,
-            );
+            record_partition_timing(sync_ns, dma_ns, cpu_ns, gpu_wait_ns, merge_ns, actual_path);
         }
 
         Ok(())
@@ -3741,7 +3744,6 @@ pub fn build_partitioned_layer_plan(
         rms_norm_eps: config.rms_norm_eps,
         rms_norm_add_unit: false,
         layer_idx,
-        partition_path: PartitionPath::SyncRead,
         ratio_generation_at_build,
         ratio_generation_counter: gen_arc,
         build_thread_id: std::thread::current().id(),
