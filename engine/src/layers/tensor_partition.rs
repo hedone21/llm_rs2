@@ -1423,9 +1423,7 @@ mod tests {
             for (i, v) in gpu_partial.as_mut_slice::<f32>().iter_mut().enumerate() {
                 *v = (i as f32) * 1.5 - 0.25;
             }
-            let cpu_buf = memory
-                .alloc(total_rows * cpu_rows * 4, DType::F32)
-                .unwrap();
+            let cpu_buf = memory.alloc(total_rows * cpu_rows * 4, DType::F32).unwrap();
             let mut cpu_partial = Tensor::new(
                 Shape::new(vec![total_rows, cpu_rows]),
                 cpu_buf,
@@ -1441,9 +1439,7 @@ mod tests {
         let (gpu_a, cpu_a) = make_input();
         let mut out_a = Tensor::new(
             Shape::new(vec![total_rows, out_dim]),
-            memory
-                .alloc(total_rows * out_dim * 4, DType::F32)
-                .unwrap(),
+            memory.alloc(total_rows * out_dim * 4, DType::F32).unwrap(),
             backend.clone(),
         );
         super::merge_partials_2d(
@@ -1463,9 +1459,7 @@ mod tests {
         let (gpu_b, cpu_b) = make_input();
         let mut out_b = Tensor::new(
             Shape::new(vec![total_rows, out_dim]),
-            memory
-                .alloc(total_rows * out_dim * 4, DType::F32)
-                .unwrap(),
+            memory.alloc(total_rows * out_dim * 4, DType::F32).unwrap(),
             backend.clone(),
         );
         let mut gpu_temp = vec![0u8; total_rows * (split_row + 4) * 4];

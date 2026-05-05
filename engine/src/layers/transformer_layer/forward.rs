@@ -626,13 +626,41 @@ impl TransformerLayer {
                 );
 
                 // 1. x → x_cpu (single blocking read drains the in-order queue).
+                //
+                // Zero-copy fast path: when `x` is a permanent-mapped
+                // ALLOC_HOST_PTR UnifiedBuffer (set up in
+                // `transformer.rs::forward_into` next to `init_partition`)
+                // its `as_ptr()` returns the host alias of the same physical
+                // memory the GPU just wrote (RMSNorm above). A single
+                // `synchronize()` drains the queue + flushes the GPU cache
+                // for ALLOC_HOST_PTR coherency, then we `memcpy` host→host
+                // into the NEON-friendly `x_cpu` buffer instead of paying
+                // for a per-layer blocking `read_buffer` DMA (~980 KB on
+                // mid prompts × 28 layers — exposed at ratio=0.5 where GPU
+                // FFN is shortest).
+                //
+                // Fallback (`x.as_ptr()` null): legacy `read_buffer` for
+                // non-UnifiedBuffer x (`--zero-copy` off, CUDA, CPU
+                // backend, etc).
                 let x_cpu_bytes = total_rows * dim * 4;
-                unsafe {
-                    let dst = std::slice::from_raw_parts_mut(
-                        part_ws.x_cpu.as_ptr() as *mut u8,
-                        x_cpu_bytes,
-                    );
-                    backend.read_buffer(x, dst)?;
+                let x_host_ptr = x.as_ptr();
+                if !x_host_ptr.is_null() {
+                    backend.synchronize()?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            x_host_ptr,
+                            part_ws.x_cpu.as_ptr() as *mut u8,
+                            x_cpu_bytes,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        let dst = std::slice::from_raw_parts_mut(
+                            part_ws.x_cpu.as_ptr() as *mut u8,
+                            x_cpu_bytes,
+                        );
+                        backend.read_buffer(x, dst)?;
+                    }
                 }
 
                 let gate_sr = part.gate.split_row;

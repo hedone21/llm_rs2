@@ -1500,6 +1500,27 @@ impl TransformerModel {
                     backend.clone(),
                     part.cpu_backend.clone(),
                 );
+
+                // Zero-copy: permanent-map the prefill `x` UnifiedBuffer once
+                // so every layer's partition path can `memcpy` from the
+                // ALLOC_HOST_PTR alias instead of issuing a blocking
+                // `read_buffer(x → x_cpu)` DMA per layer (~980 KB on mid
+                // prompts × 28 layers — exposed on the critical path at
+                // ratio=0.5 where GPU FFN is short).
+                //
+                // After this call `x.as_ptr()` returns the host pointer and
+                // `forward_prefill` switches to the memcpy fast path; if the
+                // buffer is not a UnifiedBuffer (e.g. `--zero-copy` off, or
+                // CUDA/CPU backend) the map is skipped and the legacy
+                // `read_buffer` path is used instead.
+                #[cfg(feature = "opencl")]
+                if let Some(ub) = x
+                    .buffer()
+                    .as_any()
+                    .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+                {
+                    let _ = ub.map();
+                }
             }
         }
 
