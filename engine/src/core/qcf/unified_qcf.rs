@@ -10,7 +10,7 @@
 use super::{AggregationMode, aggregate_heads};
 use crate::core::buffer::DType;
 use crate::core::kv_cache::{KVCache, KVLayout};
-use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, BlockQ4_0, QK4_0, QKKV};
+use crate::core::quant::{BlockQ4_0, QK4_0};
 
 // ── Action types ────────────────────────────────────────────────
 
@@ -37,8 +37,6 @@ pub enum QcfActionType {
         keep_ratio: f32,
         protected_prefix: usize,
     },
-    /// KIVI quantization round-trip error.
-    QuantKivi { bits: u8 },
 }
 
 // ── V data source abstraction ───────────────────────────────────
@@ -289,25 +287,6 @@ pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
                         layout,
                     )
                 }
-            }
-            QcfActionType::QuantKivi { bits } => {
-                let mut o_after = vec![0.0f32; head_dim];
-                for (t, &alpha_t) in alpha_h.iter().enumerate().take(current_pos) {
-                    let v_t = read_v_f32(
-                        &params.v_source,
-                        h,
-                        t,
-                        head_dim,
-                        capacity,
-                        n_kv_heads,
-                        layout,
-                    );
-                    let v_quant = quantize_dequantize_f32(&v_t, *bits);
-                    for d in 0..head_dim {
-                        o_after[d] += alpha_t * v_quant[d];
-                    }
-                }
-                o_after
             }
         };
 
@@ -561,40 +540,6 @@ fn identify_retained_h2o(
     retained
 }
 
-// ── Helper: quantize-dequantize round trip ──────────────────────
-
-fn quantize_dequantize_f32(data: &[f32], bits: u8) -> Vec<f32> {
-    let mut result = vec![0.0f32; data.len()];
-    for chunk_start in (0..data.len()).step_by(QKKV) {
-        let end = (chunk_start + QKKV).min(data.len());
-        let chunk_len = end - chunk_start;
-        let mut block = [0.0f32; QKKV];
-        block[..chunk_len].copy_from_slice(&data[chunk_start..end]);
-
-        let mut reconstructed = [0.0f32; QKKV];
-        match bits {
-            2 => {
-                let q = BlockQ2_0::quantize(&block);
-                q.dequantize(&mut reconstructed);
-            }
-            4 => {
-                let q = BlockKVQ4::quantize(&block);
-                q.dequantize(&mut reconstructed);
-            }
-            8 => {
-                let q = BlockKVQ8::quantize(&block);
-                q.dequantize(&mut reconstructed);
-            }
-            _ => {
-                // F16/F32: no quantization error
-                reconstructed = block;
-            }
-        }
-        result[chunk_start..end].copy_from_slice(&reconstructed[..chunk_len]);
-    }
-    result
-}
-
 // ── Math helpers ────────────────────────────────────────────────
 
 fn l2_norm(v: &[f32]) -> f32 {
@@ -701,74 +646,6 @@ mod tests {
             (qcf - 1.0).abs() < 1e-5,
             "expected QCF near 1.0 for full eviction, got {qcf}"
         );
-    }
-
-    #[test]
-    fn test_quant_lossless() {
-        // bits >= 16 -> no quantization applied -> QCF = 0
-        let n_kv_heads = 1;
-        let head_dim = 32; // must be QKKV-aligned
-        let capacity = 4;
-        let current_pos = 2;
-        let v_data = make_v_data(n_kv_heads, capacity, head_dim);
-        let scores = uniform_scores(current_pos);
-
-        let params = UnifiedQcfParams {
-            action: QcfActionType::QuantKivi { bits: 16 },
-            v_source: VDataSource::F32(&v_data),
-            attention_scores: &scores,
-            head_attn: None,
-            n_kv_heads,
-            head_dim,
-            current_pos,
-            capacity,
-            layout: KVLayout::HeadMajor,
-            aggregation: AggregationMode::Mean,
-        };
-
-        let (qcf, _) = compute_unified_qcf(&params);
-        assert!(
-            qcf.abs() < 1e-6,
-            "expected QCF=0 for lossless quant, got {qcf}"
-        );
-    }
-
-    #[test]
-    fn test_quant_ordering() {
-        // Q2 > Q4 > Q8 in terms of QCF (more lossy = higher error)
-        let n_kv_heads = 1;
-        let head_dim = 32;
-        let capacity = 8;
-        let current_pos = 4;
-        let v_data = make_v_data(n_kv_heads, capacity, head_dim);
-        let scores = uniform_scores(current_pos);
-
-        let make_params = |bits: u8| UnifiedQcfParams {
-            action: QcfActionType::QuantKivi { bits },
-            v_source: VDataSource::F32(&v_data),
-            attention_scores: &scores,
-            head_attn: None,
-            n_kv_heads,
-            head_dim,
-            current_pos,
-            capacity,
-            layout: KVLayout::HeadMajor,
-            aggregation: AggregationMode::Mean,
-        };
-
-        let (qcf_q2, _) = compute_unified_qcf(&make_params(2));
-        let (qcf_q4, _) = compute_unified_qcf(&make_params(4));
-        let (qcf_q8, _) = compute_unified_qcf(&make_params(8));
-
-        assert!(
-            qcf_q2 > qcf_q4,
-            "Q2 ({qcf_q2}) should have higher QCF than Q4 ({qcf_q4})"
-        );
-        assert!(
-            qcf_q4 > qcf_q8,
-            "Q4 ({qcf_q4}) should have higher QCF than Q8 ({qcf_q8})"
-        );
-        assert!(qcf_q8 > 0.0, "Q8 should have non-zero QCF, got {qcf_q8}");
     }
 
     #[test]
@@ -1254,35 +1131,6 @@ mod tests {
             "high importance token 5 should be retained"
         );
         assert!(retained.len() == 6, "should retain exactly 6 tokens");
-    }
-
-    #[test]
-    fn test_quantize_dequantize_roundtrip() {
-        let data: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
-
-        let rt_8 = quantize_dequantize_f32(&data, 8);
-        let rt_4 = quantize_dequantize_f32(&data, 4);
-        let rt_2 = quantize_dequantize_f32(&data, 2);
-        let rt_16 = quantize_dequantize_f32(&data, 16); // passthrough
-
-        // Passthrough should be exact
-        for i in 0..data.len() {
-            assert!(
-                (data[i] - rt_16[i]).abs() < 1e-6,
-                "bits=16 should be lossless"
-            );
-        }
-
-        // Error ordering: Q2 > Q4 > Q8
-        let err = |rt: &[f32]| -> f32 {
-            data.iter()
-                .zip(rt)
-                .map(|(a, b)| (a - b).powi(2))
-                .sum::<f32>()
-                .sqrt()
-        };
-        assert!(err(&rt_2) > err(&rt_4), "Q2 error > Q4 error");
-        assert!(err(&rt_4) > err(&rt_8), "Q4 error > Q8 error");
     }
 
     // ── Regression tests for ISSUE-6 ────────────────────────────

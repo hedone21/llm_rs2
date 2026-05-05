@@ -41,10 +41,6 @@ pub struct KiviHook {
     qcf_kivi_legacy: f32,
     /// Sum of OPR values across all flushes for current question (for mean).
     qcf_kivi_sum: f32,
-    /// Unified QCF value computed via `compute_unified_qcf(QuantKivi)` at post-prefill.
-    /// `None` when attention scores are unavailable (KiviHook currently has no
-    /// score accumulator — this field is reserved for future integration).
-    qcf_unified: Option<f32>,
     /// Max AW-VOPR value across all flushes for current question.
     qcf_aw_vopr_max: f32,
     /// Sum of AW-VOPR values across all flushes for current question.
@@ -60,7 +56,6 @@ impl KiviHook {
             flush_count: 0,
             qcf_kivi_legacy: 0.0,
             qcf_kivi_sum: 0.0,
-            qcf_unified: None,
             qcf_aw_vopr_max: 0.0,
             qcf_aw_vopr_sum: 0.0,
             aw_vopr_count: 0,
@@ -107,7 +102,6 @@ impl StepHook<KiviCache> for KiviHook {
         self.flush_count = 0;
         self.qcf_kivi_legacy = 0.0;
         self.qcf_kivi_sum = 0.0;
-        self.qcf_unified = None;
         self.qcf_aw_vopr_max = 0.0;
         self.qcf_aw_vopr_sum = 0.0;
         self.aw_vopr_count = 0;
@@ -135,11 +129,7 @@ impl StepHook<KiviCache> for KiviHook {
         });
         if self.flush_count > 0 {
             let qcf_mean = self.qcf_kivi_sum / self.flush_count as f32;
-            // Unified cross-action QCF field: prefer unified, then per-flush mean.
-            let qcf_value = self.qcf_unified.unwrap_or(qcf_mean);
-            obj["qcf"] = serde_json::json!(qcf_value);
-
-            // Per-flush statistics.
+            obj["qcf"] = serde_json::json!(qcf_mean);
             obj["qcf_kivi_mean"] = serde_json::json!(qcf_mean);
             obj["qcf_kivi_max"] = serde_json::json!(self.qcf_kivi_legacy);
             obj["qcf_kivi_flush_count"] = serde_json::json!(self.flush_count);
@@ -211,7 +201,6 @@ mod tests {
         hook.qcf_kivi_legacy = 0.5; // max
         hook.qcf_kivi_sum = 1.48; // sum → mean = 1.48/5 = 0.296
         let fields = hook.extra_question_fields(&[cache]);
-        // "qcf" unified field falls back to per-flush mean when qcf_unified is None
         let expected_mean = 1.48_f32 / 5.0;
         assert!((fields["qcf"].as_f64().unwrap() - expected_mean as f64).abs() < 1e-5);
         assert_eq!(fields["qcf_kivi_max"], 0.5_f32 as f64);
@@ -223,23 +212,6 @@ mod tests {
         hook.reset_caches(&mut [cache2]);
         assert_eq!(hook.flush_count, 0);
         assert_eq!(hook.qcf_kivi_legacy, 0.0);
-        assert!(hook.qcf_unified.is_none());
-    }
-
-    #[test]
-    fn test_qcf_unified_takes_precedence() {
-        let mut hook = make_hook();
-        let cache = KiviCache::new(8, 64, 512, 32);
-
-        hook.flush_count = 3;
-        hook.qcf_kivi_legacy = 0.5;
-        hook.qcf_kivi_sum = 0.9;
-        hook.qcf_unified = Some(0.123);
-        let fields = hook.extra_question_fields(&[cache]);
-        // "qcf" should use unified value when available
-        assert_eq!(fields["qcf"], 0.123_f32 as f64);
-        // max field still shows the per-flush max
-        assert_eq!(fields["qcf_kivi_max"], 0.5_f32 as f64);
     }
 
     #[test]
