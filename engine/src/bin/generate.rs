@@ -777,6 +777,8 @@ fn main() -> anyhow::Result<()> {
     // Sprint E forward_gen op-tracer: install atexit hook so the trace
     // dumps even on Ctrl+C / early-return paths. No-op when env unset.
     llm_rs2::profile::op_trace::install_atexit_once();
+    // Quality-cost profiler: gated by LLM_RS2_PROFILE_QUALITY=1.
+    llm_rs2::profile::quality_metrics::install_atexit_once();
     // T0: process start, before CLI parsing or any allocation.
     rss_trace("start");
 
@@ -4760,6 +4762,9 @@ fn main() -> anyhow::Result<()> {
 
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
+            let _decode_t = llm_rs2::profile::quality_metrics::Timer::start(
+                &llm_rs2::profile::quality_metrics::DECODE_TOTAL,
+            );
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
             if kv_caches[0].current_pos >= max_seq_len {
                 println!("\n[Stopped: Max context length reached]");

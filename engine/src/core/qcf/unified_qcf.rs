@@ -120,6 +120,9 @@ pub struct UnifiedQcfParams<'a> {
 ///
 /// Returns `(aggregated_qcf, per_head_qcf)`.
 pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
+    let _t = crate::profile::quality_metrics::Timer::start(
+        &crate::profile::quality_metrics::QCF_KV_UNIFIED,
+    );
     let n_kv_heads = params.n_kv_heads;
     let head_dim = params.head_dim;
     let current_pos = params.current_pos;

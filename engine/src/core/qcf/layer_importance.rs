@@ -66,6 +66,9 @@ impl ImportanceTable {
     /// `skip_set`: list of `(layer_id, SubLayer)` pairs being skipped.
     /// Returns `Σ importance(skipped) / Σ importance(all)`, in [0, 1].
     pub fn compute_qcf(&self, skip_set: &[(usize, SubLayer)]) -> f32 {
+        let _t = crate::profile::quality_metrics::Timer::start(
+            &crate::profile::quality_metrics::QCF_LAYER_SKIP,
+        );
         if self.total_importance < 1e-8 || skip_set.is_empty() {
             return 0.0;
         }
@@ -89,6 +92,9 @@ impl ImportanceTable {
         skip_count: usize,
         num_layers: usize,
     ) -> (f32, Vec<(usize, SubLayer)>) {
+        let _t = crate::profile::quality_metrics::Timer::start(
+            &crate::profile::quality_metrics::QCF_LAYER_SKIP,
+        );
         if skip_count == 0 || self.entries.is_empty() {
             return (0.0, Vec::new());
         }
