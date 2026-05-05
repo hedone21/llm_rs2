@@ -8,7 +8,8 @@
 //! and KIVI quantization -- all measured in the same output-error space.
 
 use super::{AggregationMode, aggregate_heads};
-use crate::core::kv_cache::KVLayout;
+use crate::core::buffer::DType;
+use crate::core::kv_cache::{KVCache, KVLayout};
 use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, BlockQ4_0, QK4_0, QKKV};
 
 // ── Action types ────────────────────────────────────────────────
@@ -50,6 +51,49 @@ pub enum VDataSource<'a> {
     F16(&'a [u16]),
     /// Q4_0 KV cache data stored as BlockQ4_0 blocks.
     Q4_0(&'a [BlockQ4_0]),
+}
+
+impl<'a> VDataSource<'a> {
+    /// Build a `VDataSource` view of a `KVCache`'s V buffer.
+    ///
+    /// - `v_cpu_bytes = Some(...)`: GPU backend with explicit host readback;
+    ///   the byte slice is reinterpreted by `dtype`.
+    /// - `v_cpu_bytes = None`: read directly from `cache.v_buffer.as_slice()`.
+    ///   Returns `None` if the host pointer is null (device-only buffer).
+    ///
+    /// Returns `None` for unsupported dtypes.
+    pub fn from_kv_cache(cache: &'a KVCache, v_cpu_bytes: Option<&'a [u8]>) -> Option<Self> {
+        let dtype = cache.v_buffer.dtype();
+        if let Some(bytes) = v_cpu_bytes {
+            return Some(match dtype {
+                DType::F32 => {
+                    let elems = bytes.len() / std::mem::size_of::<f32>();
+                    let ptr = bytes.as_ptr() as *const f32;
+                    VDataSource::F32(unsafe { std::slice::from_raw_parts(ptr, elems) })
+                }
+                DType::F16 => {
+                    let elems = bytes.len() / std::mem::size_of::<u16>();
+                    let ptr = bytes.as_ptr() as *const u16;
+                    VDataSource::F16(unsafe { std::slice::from_raw_parts(ptr, elems) })
+                }
+                DType::Q4_0 => {
+                    let n_blocks = bytes.len() / std::mem::size_of::<BlockQ4_0>();
+                    let ptr = bytes.as_ptr() as *const BlockQ4_0;
+                    VDataSource::Q4_0(unsafe { std::slice::from_raw_parts(ptr, n_blocks) })
+                }
+                _ => return None,
+            });
+        }
+        if cache.v_buffer.buffer().as_ptr().is_null() {
+            return None;
+        }
+        Some(match dtype {
+            DType::F32 => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
+            DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
+            DType::Q4_0 => VDataSource::Q4_0(cache.v_buffer.as_slice::<BlockQ4_0>()),
+            _ => return None,
+        })
+    }
 }
 
 // ── Parameters ──────────────────────────────────────────────────
@@ -129,7 +173,6 @@ pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
             alpha
         };
 
-        // DEBUG: diagnose QCF intermediate values for first head
         // 2. Compute O_before = sum alpha_h[t] * V[h][t]
         let mut o_before = vec![0.0f32; head_dim];
         for (t, &alpha_t) in alpha_h.iter().enumerate().take(current_pos) {
@@ -142,7 +185,6 @@ pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
                 n_kv_heads,
                 layout,
             );
-            {}
             for d in 0..head_dim {
                 o_before[d] += alpha_t * v_t[d];
             }

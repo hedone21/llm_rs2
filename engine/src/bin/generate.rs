@@ -6565,13 +6565,9 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
     // ISSUE-6 guard: OpenCL device-only 버퍼는 `as_ptr()`이 명시적으로
     // `ptr::null()`을 반환한다 (engine/src/backend/opencl/buffer.rs). 이 경우
     // `Tensor::as_slice::<T>()`이 `(ptr=null, len=size/sizeof T)` 슬라이스를
-    //만들고, 아래 `v_src!` 매크로가 그 슬라이스를 `VDataSource`에 담아
-    // `read_v_f32()`에서 `data[offset..end]`로 인덱싱하는 순간 null deref →
-    // SIGSEGV 로 이어진다. signal 경로(RequestQcf)에서 host-mapped KV 없이
-    // QCF 추정이 요청될 수 있으므로, dtype 무관하게 v_buffer 호스트 포인터가
-    // 유효한 경우에만 KV 기반 4종(sliding / h2o / streaming / d2o)을 계산한다.
-    // KIVI / LayerSkip 추정은 v_buffer 호스트 슬라이스에 의존하지 않으므로
-    // 이 guard 밖에 둔다.
+    // 만들고 `read_v_f32()`에서 `data[offset..end]`로 인덱싱하는 순간 null
+    // deref → SIGSEGV. `VDataSource::from_kv_cache(None)` 가 host pointer 검사
+    // 후 `None`을 돌려주므로 device-only 캐시는 자연스럽게 skip된다.
     let v_host_readable =
         !ctx.kv_caches.is_empty() && ctx.kv_caches.iter().all(|c| !c.v_buffer.as_ptr().is_null());
     if !ctx.kv_caches.is_empty() && ctx.kv_caches[0].current_pos > 0 && !v_host_readable {
@@ -6582,29 +6578,19 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
     if v_host_readable && ctx.kv_caches[0].current_pos > 0 {
         let cache = &ctx.kv_caches[0];
         let current_pos = cache.current_pos;
-        let capacity = cache.capacity();
-        let layout = cache.layout();
-        let n_kv_heads = cache.kv_heads();
-        let head_dim = cache.head_dim();
-
         let keep_ratio = 0.5f32;
         let target_len = (current_pos as f32 * keep_ratio) as usize;
         let protected_prefix = 4usize;
 
-        // Get attention scores and V data for unified QCF
         let scores_opt = ctx
             .score_accumulator
             .filter(|a| a.is_active())
             .map(|a| a.importance_scores());
-
         let head_attn_opt = ctx
             .score_accumulator
             .filter(|a| a.is_active())
             .and_then(|a| a.last_step_head_attn());
 
-        // Build V data source — supports F32, F16, and Q4_0 KV caches.
-        let v_dtype = cache.v_buffer.dtype();
-        // Fallback flat scores if no accumulator
         let fallback_scores: Vec<f32>;
         let attention_scores: &[f32] = if let Some(scores) = scores_opt {
             scores
@@ -6613,103 +6599,67 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
             &fallback_scores
         };
 
-        // Helper macro: build VDataSource from the cache V buffer based on dtype.
-        macro_rules! v_src {
-            () => {
-                match v_dtype {
-                    DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-                    DType::Q4_0 => VDataSource::Q4_0(
-                        cache.v_buffer.as_slice::<llm_rs2::core::quant::BlockQ4_0>(),
-                    ),
-                    _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-                }
-            };
-        }
-
-        let aggregation = AggregationMode::Mean;
-
         if target_len < current_pos {
-            // ── 1. Sliding window QCF ──
-            {
-                let params = UnifiedQcfParams {
-                    action: QcfActionType::EvictSliding { target_len },
-                    v_source: v_src!(),
-                    attention_scores,
-                    head_attn: head_attn_opt,
-                    n_kv_heads,
-                    head_dim,
-                    current_pos,
-                    capacity,
-                    layout,
-                    aggregation: aggregation.clone(),
-                };
-                let (qcf, _) = compute_unified_qcf(&params);
-                estimates.insert("kv_evict_sliding".to_string(), qcf);
-            }
-
-            // ── 2. H2O eviction QCF (needs scores) ──
-            if scores_opt.is_some() {
-                let params = UnifiedQcfParams {
-                    action: QcfActionType::EvictH2o {
+            // (id, action, requires_scores). `kv_evict_sliding` needs no scores;
+            // h2o/d2o use heavy-hitter selection so are gated on score availability.
+            // Streaming QCF only fires when streaming_config is set.
+            let mut actions: Vec<(&'static str, QcfActionType, bool)> = vec![
+                (
+                    "kv_evict_sliding",
+                    QcfActionType::EvictSliding { target_len },
+                    false,
+                ),
+                (
+                    "kv_evict_h2o",
+                    QcfActionType::EvictH2o {
                         target_len,
                         keep_ratio: 0.5,
                         protected_prefix,
                     },
-                    v_source: v_src!(),
-                    attention_scores,
-                    head_attn: head_attn_opt,
-                    n_kv_heads,
-                    head_dim,
-                    current_pos,
-                    capacity,
-                    layout,
-                    aggregation: aggregation.clone(),
-                };
-                let (qcf, _) = compute_unified_qcf(&params);
-                estimates.insert("kv_evict_h2o".to_string(), qcf);
-            }
-
-            // ── 3. Streaming QCF ──
+                    true,
+                ),
+                (
+                    "kv_merge_d2o",
+                    QcfActionType::MergeD2o {
+                        target_len,
+                        keep_ratio: 0.5,
+                        protected_prefix,
+                    },
+                    true,
+                ),
+            ];
             if let Some((sink_size, window_size)) = ctx.streaming_config {
-                let params = UnifiedQcfParams {
-                    action: QcfActionType::EvictStreaming {
+                actions.push((
+                    "kv_evict_streaming",
+                    QcfActionType::EvictStreaming {
                         sink_size,
                         window_size,
                     },
-                    v_source: v_src!(),
-                    attention_scores,
-                    head_attn: head_attn_opt,
-                    n_kv_heads,
-                    head_dim,
-                    current_pos,
-                    capacity,
-                    layout,
-                    aggregation: aggregation.clone(),
-                };
-                let (qcf, _) = compute_unified_qcf(&params);
-                estimates.insert("kv_evict_streaming".to_string(), qcf);
+                    false,
+                ));
             }
 
-            // ── 4. D2O merge QCF (needs scores) ──
-            if scores_opt.is_some() {
+            for (id, action, requires_scores) in actions {
+                if requires_scores && scores_opt.is_none() {
+                    continue;
+                }
+                let Some(v_source) = VDataSource::from_kv_cache(cache, None) else {
+                    continue;
+                };
                 let params = UnifiedQcfParams {
-                    action: QcfActionType::MergeD2o {
-                        target_len,
-                        keep_ratio: 0.5,
-                        protected_prefix,
-                    },
-                    v_source: v_src!(),
+                    action,
+                    v_source,
                     attention_scores,
                     head_attn: head_attn_opt,
-                    n_kv_heads,
-                    head_dim,
+                    n_kv_heads: cache.kv_heads(),
+                    head_dim: cache.head_dim(),
                     current_pos,
-                    capacity,
-                    layout,
-                    aggregation: aggregation.clone(),
+                    capacity: cache.capacity(),
+                    layout: cache.layout(),
+                    aggregation: AggregationMode::Mean,
                 };
                 let (qcf, _) = compute_unified_qcf(&params);
-                estimates.insert("kv_merge_d2o".to_string(), qcf);
+                estimates.insert(id.to_string(), qcf);
             }
         }
     }
@@ -8848,12 +8798,16 @@ fn run_ppl(
                             compute_unified_qcf,
                         };
                         let target_len = ((before_len as f32) * ratio) as usize;
-                        let scores = acc.importance_scores();
                         let cache = &kv_caches[0];
-                        let v_source = match v_cpu_data.as_deref() {
-                            Some(slice) => VDataSource::F32(slice),
-                            None => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-                        };
+                        let v_cpu_bytes: Option<&[u8]> = v_cpu_data.as_deref().map(|s| {
+                            // Reinterpret &[f32] as &[u8] so the unified helper handles it.
+                            unsafe {
+                                std::slice::from_raw_parts(
+                                    s.as_ptr() as *const u8,
+                                    std::mem::size_of_val(s),
+                                )
+                            }
+                        });
                         let action = if score_based_eviction {
                             QcfActionType::EvictH2o {
                                 target_len,
@@ -8863,20 +8817,25 @@ fn run_ppl(
                         } else {
                             QcfActionType::EvictSliding { target_len }
                         };
-                        let params = UnifiedQcfParams {
-                            action,
-                            v_source,
-                            attention_scores: scores,
-                            head_attn: Some(head_attn),
-                            n_kv_heads: cache.kv_heads(),
-                            head_dim: cache.head_dim(),
-                            current_pos: before_len,
-                            capacity: cache.capacity(),
-                            layout: cache.layout(),
-                            aggregation: AggregationMode::Mean,
-                        };
-                        let (qcf, _) = compute_unified_qcf(&params);
-                        qcf as f64
+                        match VDataSource::from_kv_cache(cache, v_cpu_bytes) {
+                            Some(v_source) => {
+                                let params = UnifiedQcfParams {
+                                    action,
+                                    v_source,
+                                    attention_scores: acc.importance_scores(),
+                                    head_attn: Some(head_attn),
+                                    n_kv_heads: cache.kv_heads(),
+                                    head_dim: cache.head_dim(),
+                                    current_pos: before_len,
+                                    capacity: cache.capacity(),
+                                    layout: cache.layout(),
+                                    aggregation: AggregationMode::Mean,
+                                };
+                                let (qcf, _) = compute_unified_qcf(&params);
+                                qcf as f64
+                            }
+                            None => 0.0,
+                        }
                     } else {
                         0.0
                     };

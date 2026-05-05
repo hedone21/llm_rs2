@@ -6,13 +6,11 @@
 
 use super::hook::{CacheSnapshot, PostStepResult, StepHook};
 use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::buffer::DType;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::{
     AggregationMode, QcfActionType, QcfConfig, UnifiedQcfParams, VDataSource, compute_unified_qcf,
 };
-use crate::core::quant::BlockQ4_0;
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
 #[derive(Debug, Clone)]
@@ -173,52 +171,6 @@ impl EvictionHook {
     }
 }
 
-/// Build a `VDataSource` view from the cache's V buffer.
-///
-/// On GPU backends with a CPU readback (`v_cpu_bytes`), interpret the byte
-/// slice; on CPU backends fall back to the cache's directly-accessible buffer.
-/// Returns `None` for unsupported dtypes.
-fn build_v_source<'a>(
-    cache: &'a KVCache,
-    v_cpu_bytes: Option<&'a [u8]>,
-) -> Option<VDataSource<'a>> {
-    let dtype = cache.v_buffer.dtype();
-    if let Some(bytes) = v_cpu_bytes {
-        match dtype {
-            DType::F32 => {
-                let elems = bytes.len() / 4;
-                let ptr = bytes.as_ptr() as *const f32;
-                Some(VDataSource::F32(unsafe {
-                    std::slice::from_raw_parts(ptr, elems)
-                }))
-            }
-            DType::F16 => {
-                let elems = bytes.len() / 2;
-                let ptr = bytes.as_ptr() as *const u16;
-                Some(VDataSource::F16(unsafe {
-                    std::slice::from_raw_parts(ptr, elems)
-                }))
-            }
-            DType::Q4_0 => {
-                let block_size = std::mem::size_of::<BlockQ4_0>();
-                let n_blocks = bytes.len() / block_size;
-                let ptr = bytes.as_ptr() as *const BlockQ4_0;
-                Some(VDataSource::Q4_0(unsafe {
-                    std::slice::from_raw_parts(ptr, n_blocks)
-                }))
-            }
-            _ => None,
-        }
-    } else {
-        match dtype {
-            DType::F32 => Some(VDataSource::F32(cache.v_buffer.as_slice::<f32>())),
-            DType::F16 => Some(VDataSource::F16(cache.v_buffer.as_slice::<u16>())),
-            DType::Q4_0 => Some(VDataSource::Q4_0(cache.v_buffer.as_slice::<BlockQ4_0>())),
-            _ => None,
-        }
-    }
-}
-
 impl StepHook<KVCache> for EvictionHook {
     fn post_decode_step(&mut self, caches: &mut [KVCache], _step: usize) -> PostStepResult {
         // effective_budget == 0 means "no budget" (full-prefill mode).
@@ -338,10 +290,11 @@ impl StepHook<KVCache> for EvictionHook {
         // QCF (unified output-error formula). Action picks the simulated retention.
         let qcf_caote = if can_compute_qcf {
             let cache = &caches[0];
-            let v_source = build_v_source(cache, v_cpu_bytes.as_deref()).unwrap_or_else(|| {
-                // fallback: treat as F32 (may be incorrect for unknown dtypes)
-                VDataSource::F32(cache.v_buffer.as_slice::<f32>())
-            });
+            let v_source = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref())
+                .unwrap_or_else(|| {
+                    // fallback: treat as F32 (may be incorrect for unknown dtypes)
+                    VDataSource::F32(cache.v_buffer.as_slice::<f32>())
+                });
             let target_len = ((before_len as f32) * ratio) as usize;
             let action = if self.score_based_eviction {
                 if self.is_d2o {

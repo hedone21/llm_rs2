@@ -14,8 +14,8 @@ pub mod unified_qcf;
 pub use estimator::DegradationEstimator;
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 pub use quant_qcf::{
-    FlushAwVoprParams, FlushAwqeParams, FlushQcfParams, compute_flush_aw_vopr, compute_flush_awqe,
-    compute_flush_opr, compute_flush_qcf,
+    FlushAttentionParams, KiviFlushParams, compute_flush_aw_vopr, compute_flush_awqe,
+    compute_flush_nmse, compute_flush_opr,
 };
 pub use skip_qcf::SkipQcfTracker;
 pub use unified_qcf::{QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf};
