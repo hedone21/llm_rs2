@@ -2586,6 +2586,7 @@ fn main() -> anyhow::Result<()> {
             is_d2o,
             args.kv_type.clone(),
             backend.clone(),
+            false, // experimental_enabled: CLI flag 노출은 Step 6에서 진행
         );
 
         let output = llm_rs2::eval::run_eval_ll_generic(

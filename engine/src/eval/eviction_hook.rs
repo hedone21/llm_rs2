@@ -9,7 +9,8 @@ use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::{
-    AggregationMode, QcfActionType, QcfConfig, UnifiedQcfParams, VDataSource, compute_unified_qcf,
+    AggregationMode, QcfActionType, QcfConfig, UnifiedQcfParams, VDataSource, aggregate_heads,
+    compute_unified_qcf,
 };
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
@@ -18,6 +19,18 @@ pub struct EvictionQcfResult {
     pub tokens_evicted: usize,
     pub eviction_ratio: f32,
     pub qcf_caote: f32,
+}
+
+/// Experimental QCF metrics — added 2026-05 for ARGUS analysis.
+/// All fields are temporary. May be deprecated after paper validation.
+#[derive(Debug, Clone, Default)]
+pub struct ExperimentalQcfPayload {
+    pub per_head: Vec<f32>,
+    pub caote_max: f32,
+    pub caote_topk_k3: f32,
+    pub caote_topk_k5: f32,
+    pub caote_defensive_t01: f32,
+    pub caote_defensive_t05: f32,
 }
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
@@ -129,6 +142,8 @@ pub struct EvictionHook {
     pub kv_type: String,
     /// Backend reference for GPU buffer read/write in snapshot/restore.
     pub backend: std::sync::Arc<dyn crate::core::backend::Backend>,
+    /// Whether to compute and dump experimental QCF metrics (ARGUS).
+    pub experimental_enabled: bool,
 
     // -- Statistics (reset per question) --
     /// Number of eviction events this question.
@@ -137,6 +152,8 @@ pub struct EvictionHook {
     evicted_total: usize,
     /// QCF result from the single post-prefill eviction event (eval-ll mode).
     eviction_qcf: Option<EvictionQcfResult>,
+    /// Experimental QCF payload (Some when experimental_enabled and prefill happened).
+    experimental_qcf: Option<ExperimentalQcfPayload>,
 }
 
 impl EvictionHook {
@@ -152,6 +169,7 @@ impl EvictionHook {
         is_d2o: bool,
         kv_type: String,
         backend: std::sync::Arc<dyn crate::core::backend::Backend>,
+        experimental_enabled: bool,
     ) -> Self {
         Self {
             cache_manager,
@@ -164,9 +182,11 @@ impl EvictionHook {
             is_d2o,
             kv_type,
             backend,
+            experimental_enabled,
             eviction_count: 0,
             evicted_total: 0,
             eviction_qcf: None,
+            experimental_qcf: None,
         }
     }
 }
@@ -343,7 +363,26 @@ impl StepHook<KVCache> for EvictionHook {
                 layout: cache.layout(),
                 aggregation: AggregationMode::Mean,
             };
-            let (qcf, _) = compute_unified_qcf(&params);
+            let (qcf, per_head) = compute_unified_qcf(&params);
+
+            if self.experimental_enabled {
+                let payload = ExperimentalQcfPayload {
+                    caote_max: aggregate_heads(&per_head, &AggregationMode::Max),
+                    caote_topk_k3: aggregate_heads(&per_head, &AggregationMode::TopK { k: 3 }),
+                    caote_topk_k5: aggregate_heads(&per_head, &AggregationMode::TopK { k: 5 }),
+                    caote_defensive_t01: aggregate_heads(
+                        &per_head,
+                        &AggregationMode::Defensive { temperature: 0.1 },
+                    ),
+                    caote_defensive_t05: aggregate_heads(
+                        &per_head,
+                        &AggregationMode::Defensive { temperature: 0.5 },
+                    ),
+                    per_head,
+                };
+                self.experimental_qcf = Some(payload);
+            }
+
             qcf
         } else {
             0.0
@@ -400,6 +439,7 @@ impl StepHook<KVCache> for EvictionHook {
         self.eviction_count = 0;
         self.evicted_total = 0;
         self.eviction_qcf = None;
+        self.experimental_qcf = None;
     }
 
     fn snapshot(&self, caches: &[KVCache]) -> Box<dyn CacheSnapshot<KVCache>> {
@@ -471,6 +511,14 @@ impl StepHook<KVCache> for EvictionHook {
             obj["tokens_evicted"] = serde_json::json!(qcf.tokens_evicted);
             obj["eviction_ratio"] = serde_json::json!(qcf.eviction_ratio);
         }
+        if let Some(ref exp) = self.experimental_qcf {
+            obj["qcf_per_head"] = serde_json::json!(exp.per_head);
+            obj["qcf_caote_max"] = serde_json::json!(exp.caote_max);
+            obj["qcf_caote_topk_K3"] = serde_json::json!(exp.caote_topk_k3);
+            obj["qcf_caote_topk_K5"] = serde_json::json!(exp.caote_topk_k5);
+            obj["qcf_caote_defensive_t01"] = serde_json::json!(exp.caote_defensive_t01);
+            obj["qcf_caote_defensive_t05"] = serde_json::json!(exp.caote_defensive_t05);
+        }
         obj
     }
 
@@ -482,6 +530,7 @@ impl StepHook<KVCache> for EvictionHook {
             "h2o_keep_ratio": self.h2o_keep_ratio,
             "is_d2o": self.is_d2o,
             "kv_type": self.kv_type,
+            "experimental_enabled": self.experimental_enabled,
         })
     }
 }
@@ -529,6 +578,7 @@ mod tests {
             is_d2o,
             "f32".to_string(),
             std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
+            false,
         )
     }
 
@@ -579,5 +629,39 @@ mod tests {
         let snapshot = hook.snapshot(&[]);
         // Restoring an empty snapshot on empty caches should not panic.
         snapshot.restore_to(&mut []);
+    }
+
+    #[test]
+    fn test_make_hook_with_experimental_off() {
+        // Verifies that experimental_enabled=false is accepted and stored correctly.
+        let hook = make_hook_with_d2o(512, false, false);
+        assert!(!hook.experimental_enabled);
+    }
+
+    #[test]
+    fn test_extra_question_fields_no_experimental() {
+        // When experimental_qcf is None, extra_question_fields must not contain
+        // new experimental keys.
+        let hook = make_hook(512, false);
+        let fields = hook.extra_question_fields(&[]);
+        assert!(
+            fields.get("qcf_caote_max").is_none(),
+            "qcf_caote_max should be absent when experimental_qcf is None"
+        );
+        assert!(
+            fields.get("qcf_per_head").is_none(),
+            "qcf_per_head should be absent when experimental_qcf is None"
+        );
+    }
+
+    #[test]
+    fn test_extra_config_fields_experimental_enabled() {
+        // experimental_enabled field should appear in extra_config_fields.
+        let hook = make_hook(256, false);
+        let fields = hook.extra_config_fields();
+        assert_eq!(
+            fields["experimental_enabled"], false,
+            "experimental_enabled should be false for default hook"
+        );
     }
 }
