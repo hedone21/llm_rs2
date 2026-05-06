@@ -9,9 +9,10 @@ use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::{
-    AggregationMode, EntropyResult, QcfActionType, QcfConfig, TopKRetentionResult,
-    UnifiedQcfParams, VDataSource, aggregate_heads, compute_normalized_entropy,
-    compute_topk_retention, compute_unified_qcf, identify_retained_for_action,
+    AggregationMode, EntropyResult, LayerAggregationMode, QcfActionType, QcfConfig,
+    TopKRetentionResult, UnifiedQcfParams, VDataSource, aggregate_heads, aggregate_layers,
+    compute_normalized_entropy, compute_topk_retention, compute_unified_qcf,
+    identify_retained_for_action,
 };
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
@@ -44,6 +45,13 @@ pub struct ExperimentalQcfPayload {
     pub qcf_beta_amplified_b1: f32,
     pub qcf_beta_amplified_b1_5: f32,
     pub qcf_beta_amplified_b2: f32,
+    // Step 4: Multi-layer QCF aggregation (ARGUS #1)
+    pub per_layer: Vec<f32>,
+    pub per_layer_indices: Vec<usize>,
+    pub caote_layer_max: f32,
+    pub caote_layer_defensive_t01: f32,
+    pub caote_layer_defensive_t05: f32,
+    pub caote_layer_late_30pct: f32,
 }
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
@@ -157,6 +165,9 @@ pub struct EvictionHook {
     pub backend: std::sync::Arc<dyn crate::core::backend::Backend>,
     /// Whether to compute and dump experimental QCF metrics (ARGUS).
     pub experimental_enabled: bool,
+    /// Sample layer indices for multi-layer QCF (ARGUS #1).
+    /// Empty → use [0] for backward compat.
+    pub qcf_sample_layers: Vec<usize>,
 
     // -- Statistics (reset per question) --
     /// Number of eviction events this question.
@@ -183,6 +194,7 @@ impl EvictionHook {
         kv_type: String,
         backend: std::sync::Arc<dyn crate::core::backend::Backend>,
         experimental_enabled: bool,
+        qcf_sample_layers: Vec<usize>,
     ) -> Self {
         Self {
             cache_manager,
@@ -196,6 +208,7 @@ impl EvictionHook {
             kv_type,
             backend,
             experimental_enabled,
+            qcf_sample_layers,
             eviction_count: 0,
             evicted_total: 0,
             eviction_qcf: None,
@@ -474,6 +487,111 @@ impl StepHook<KVCache> for EvictionHook {
                     }
                 };
 
+                // Step 4: Multi-layer QCF aggregation (ARGUS #1).
+                // Sample layers: default fallback to [0] (backward compat).
+                // Layer 0 result is reused from above (no extra readback).
+                let sample_layers: Vec<usize> = if self.qcf_sample_layers.is_empty() {
+                    vec![0]
+                } else {
+                    self.qcf_sample_layers.clone()
+                };
+                let mut per_layer: Vec<f32> = Vec::with_capacity(sample_layers.len());
+                let mut per_layer_indices: Vec<usize> = Vec::with_capacity(sample_layers.len());
+
+                for &layer_idx in &sample_layers {
+                    if layer_idx >= caches.len() {
+                        continue;
+                    }
+                    if layer_idx == 0 {
+                        // Reuse layer 0 result already computed above.
+                        per_layer.push(qcf);
+                        per_layer_indices.push(0);
+                        continue;
+                    }
+                    // Per-layer V readback (GPU only — CPU buffers accessible via as_ptr).
+                    let cache_l = &caches[layer_idx];
+                    let v_cpu_bytes_l: Option<Vec<u8>> =
+                        if cache_l.v_buffer.buffer().as_ptr().is_null() {
+                            let size = cache_l.v_buffer.buffer().size();
+                            let mut buf = vec![0u8; size];
+                            match self.backend.read_buffer(&cache_l.v_buffer, &mut buf) {
+                                Ok(()) => Some(buf),
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                    let can_compute_l =
+                        v_cpu_bytes_l.is_some() || !cache_l.v_buffer.buffer().as_ptr().is_null();
+                    if !can_compute_l {
+                        continue;
+                    }
+
+                    let v_source_l =
+                        match VDataSource::from_kv_cache(cache_l, v_cpu_bytes_l.as_deref()) {
+                            Some(vs) => vs,
+                            None => VDataSource::F32(cache_l.v_buffer.as_slice::<f32>()),
+                        };
+                    let k_source_l = if self.is_d2o {
+                        VDataSource::k_from_kv_cache(cache_l)
+                    } else {
+                        None
+                    };
+                    // Build action for this layer using same params as layer 0.
+                    let target_len_l = ((cache_l.current_pos as f32) * ratio) as usize;
+                    let action_l = if self.score_based_eviction {
+                        if self.is_d2o {
+                            QcfActionType::MergeD2o {
+                                target_len: target_len_l,
+                                keep_ratio: self.h2o_keep_ratio,
+                                protected_prefix: self.protected_prefix,
+                            }
+                        } else {
+                            QcfActionType::EvictH2o {
+                                target_len: target_len_l,
+                                keep_ratio: self.h2o_keep_ratio,
+                                protected_prefix: self.protected_prefix,
+                            }
+                        }
+                    } else {
+                        QcfActionType::EvictSliding {
+                            target_len: target_len_l,
+                        }
+                    };
+                    let params_l = UnifiedQcfParams {
+                        action: action_l,
+                        v_source: v_source_l,
+                        k_source: k_source_l,
+                        attention_scores: &attention_scores,
+                        head_attn: head_attn_opt,
+                        n_kv_heads: cache_l.kv_heads(),
+                        head_dim: cache_l.head_dim(),
+                        current_pos: before_len,
+                        capacity: cache_l.capacity(),
+                        layout: cache_l.layout(),
+                        aggregation: AggregationMode::Mean,
+                        beta: 1.0,
+                    };
+                    let (qcf_l, _) = compute_unified_qcf(&params_l);
+                    per_layer.push(qcf_l);
+                    per_layer_indices.push(layer_idx);
+                }
+
+                let caote_layer_max = aggregate_layers(&per_layer, &LayerAggregationMode::Max);
+                let caote_layer_def_t01 = aggregate_layers(
+                    &per_layer,
+                    &LayerAggregationMode::Defensive { temperature: 0.1 },
+                );
+                let caote_layer_def_t05 = aggregate_layers(
+                    &per_layer,
+                    &LayerAggregationMode::Defensive { temperature: 0.5 },
+                );
+                let caote_layer_late_30 = aggregate_layers(
+                    &per_layer,
+                    &LayerAggregationMode::LateFocused { fraction: 0.3 },
+                );
+
                 let payload = ExperimentalQcfPayload {
                     caote_max: aggregate_heads(&per_head, &AggregationMode::Max),
                     caote_topk_k3: aggregate_heads(&per_head, &AggregationMode::TopK { k: 3 }),
@@ -497,6 +615,12 @@ impl StepHook<KVCache> for EvictionHook {
                     qcf_beta_amplified_b1_5: qcf_b1_5,
                     qcf_beta_amplified_b2: qcf_b2,
                     per_head,
+                    per_layer,
+                    per_layer_indices,
+                    caote_layer_max,
+                    caote_layer_defensive_t01: caote_layer_def_t01,
+                    caote_layer_defensive_t05: caote_layer_def_t05,
+                    caote_layer_late_30pct: caote_layer_late_30,
                 };
                 self.experimental_qcf = Some(payload);
             }
@@ -649,6 +773,12 @@ impl StepHook<KVCache> for EvictionHook {
             obj["qcf_beta_amplified_b1"] = serde_json::json!(exp.qcf_beta_amplified_b1);
             obj["qcf_beta_amplified_b1_5"] = serde_json::json!(exp.qcf_beta_amplified_b1_5);
             obj["qcf_beta_amplified_b2"] = serde_json::json!(exp.qcf_beta_amplified_b2);
+            obj["qcf_per_layer"] = serde_json::json!(exp.per_layer);
+            obj["qcf_per_layer_indices"] = serde_json::json!(exp.per_layer_indices);
+            obj["qcf_caote_layer_max"] = serde_json::json!(exp.caote_layer_max);
+            obj["qcf_caote_layer_defensive_t01"] = serde_json::json!(exp.caote_layer_defensive_t01);
+            obj["qcf_caote_layer_defensive_t05"] = serde_json::json!(exp.caote_layer_defensive_t05);
+            obj["qcf_caote_layer_late_30pct"] = serde_json::json!(exp.caote_layer_late_30pct);
         }
         obj
     }
@@ -710,6 +840,7 @@ mod tests {
             "f32".to_string(),
             std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
             false,
+            vec![], // qcf_sample_layers: empty → internal fallback to [0]
         )
     }
 
@@ -794,5 +925,44 @@ mod tests {
             fields["experimental_enabled"], false,
             "experimental_enabled should be false for default hook"
         );
+    }
+
+    #[test]
+    fn test_qcf_sample_layers_default_fallback() {
+        // Empty qcf_sample_layers → stored as empty vec.
+        // Internal fallback to [0] occurs at runtime in post_prefill.
+        // Here we verify the field is stored as-is and the hook is created successfully.
+        let hook = make_hook_with_d2o(512, false, false);
+        assert!(
+            hook.qcf_sample_layers.is_empty(),
+            "make_hook_with_d2o passes vec![] → qcf_sample_layers should be empty"
+        );
+    }
+
+    #[test]
+    fn test_qcf_sample_layers_explicit() {
+        // When explicit layers are provided, they should be stored unchanged.
+        let policy = Box::new(NoEvictionPolicy::new());
+        let monitor = Box::new(AlwaysOkMonitor);
+        let manager = CacheManager::new(policy, monitor, 0, 1.0);
+        let config = QcfConfig {
+            mode: QcfMode::Attn,
+            ..Default::default()
+        };
+        let hook = EvictionHook::new(
+            manager,
+            None,
+            config,
+            512,
+            0,
+            false,
+            0.5,
+            false,
+            "f32".to_string(),
+            std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
+            false,
+            vec![0, 4, 8, 12, 15],
+        );
+        assert_eq!(hook.qcf_sample_layers, vec![0, 4, 8, 12, 15]);
     }
 }

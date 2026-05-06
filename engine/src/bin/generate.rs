@@ -2586,7 +2586,8 @@ fn main() -> anyhow::Result<()> {
             is_d2o,
             args.kv_type.clone(),
             backend.clone(),
-            false, // experimental_enabled: CLI flag 노출은 Step 6에서 진행
+            false,   // experimental_enabled: CLI flag 노출은 Step 6에서 진행
+            vec![0], // qcf_sample_layers: default [0] for backward compat (CLI wiring Step 6)
         );
 
         let output = llm_rs2::eval::run_eval_ll_generic(
