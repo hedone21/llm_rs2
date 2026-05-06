@@ -177,16 +177,15 @@ impl StepHook<KiviCache> for KiviHook {
         self.collect_flush_proxies(caches);
 
         // ARGUS Step 5: attention entropy from accumulated importance scores.
-        if self.experimental_enabled {
-            if let Some(ref acc) = self.score_accumulator {
-                if acc.is_active() {
-                    let scores = acc.importance_scores();
-                    let r = crate::core::qcf::compute_normalized_entropy(scores);
-                    self.attention_entropy = r.entropy;
-                    self.attention_entropy_normalized = r.entropy_normalized;
-                    self.entropy_computed = true;
-                }
-            }
+        if self.experimental_enabled
+            && let Some(ref acc) = self.score_accumulator
+            && acc.is_active()
+        {
+            let scores = acc.importance_scores();
+            let r = crate::core::qcf::compute_normalized_entropy(scores);
+            self.attention_entropy = r.entropy;
+            self.attention_entropy_normalized = r.entropy_normalized;
+            self.entropy_computed = true;
         }
     }
 
@@ -484,7 +483,7 @@ mod tests {
         hook.per_layer_max[0] = 0.9;
         hook.per_layer_sum[0] = 1.8;
         hook.per_layer_count[0] = 2;
-        hook.attention_entropy = 3.14;
+        hook.attention_entropy = 1.234; // arbitrary non-zero sentinel value
         hook.entropy_computed = true;
 
         let mut caches = vec![KiviCache::new(8, 64, 512, 32)];

@@ -196,3 +196,13 @@ mod test_seq_040_064;
 mod test_seq_070_093;
 #[path = "spec/test_seq_095_098.rs"]
 mod test_seq_095_098;
+
+// ── ARGUS QCF 실험 인프라 spec 테스트 (Steps 1–6) ──
+// aggregation/retention/entropy invariant + β-amplified CAOTE 회귀 가드 +
+// β=1.0 fast path 비부식성 검증.
+#[path = "spec/test_qcf_backward_compat.rs"]
+mod test_qcf_backward_compat;
+#[path = "spec/test_qcf_beta_regression.rs"]
+mod test_qcf_beta_regression;
+#[path = "spec/test_qcf_experimental.rs"]
+mod test_qcf_experimental;

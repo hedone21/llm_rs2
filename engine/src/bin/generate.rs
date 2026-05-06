@@ -108,6 +108,84 @@ impl From<SecondaryLayoutArg> for llm_rs2::models::weights::SecondaryLayoutChoic
     }
 }
 
+/// Parse `--qcf-sample-layers` argument into a list of layer indices.
+///
+/// Accepts:
+/// - `"auto"` (default): `[0, n/4, n/2, 3n/4, n-1]` via `compute_auto_sample_layers`.
+/// - `"all"`: every layer `[0..n_layers)`.
+/// - `"0,8,16,24,31"`: explicit comma-separated indices (sorted + deduped).
+fn parse_qcf_sample_layers(spec: &str, n_layers: usize) -> Result<Vec<usize>, String> {
+    let s = spec.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+        return Ok(llm_rs2::core::qcf::compute_auto_sample_layers(n_layers));
+    }
+    if s.eq_ignore_ascii_case("all") {
+        return Ok((0..n_layers).collect());
+    }
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        match p.parse::<usize>() {
+            Ok(v) if v < n_layers => out.push(v),
+            Ok(v) => return Err(format!("layer index {v} >= n_layers={n_layers}")),
+            Err(e) => return Err(format!("failed to parse layer index '{p}': {e}")),
+        }
+    }
+    out.sort();
+    out.dedup();
+    if out.is_empty() {
+        return Err(format!("no valid layer indices in '{s}'"));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod parse_qcf_sample_layers_tests {
+    use super::*;
+
+    #[test]
+    fn auto_llama3_8b() {
+        assert_eq!(
+            parse_qcf_sample_layers("auto", 32).unwrap(),
+            vec![0, 8, 16, 24, 31]
+        );
+    }
+
+    #[test]
+    fn all_small() {
+        assert_eq!(parse_qcf_sample_layers("all", 4).unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn explicit() {
+        assert_eq!(
+            parse_qcf_sample_layers("0,8,16,24,31", 32).unwrap(),
+            vec![0, 8, 16, 24, 31]
+        );
+    }
+
+    #[test]
+    fn explicit_unsorted_dedup() {
+        assert_eq!(
+            parse_qcf_sample_layers("16,0,16,8", 32).unwrap(),
+            vec![0, 8, 16]
+        );
+    }
+
+    #[test]
+    fn out_of_range() {
+        assert!(parse_qcf_sample_layers("0,32", 32).is_err());
+    }
+
+    #[test]
+    fn empty_after_trim() {
+        assert!(parse_qcf_sample_layers(",", 4).is_err());
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -739,6 +817,35 @@ struct Args {
     /// Only used when `--qcf-dump` is set. Default: 256.
     #[arg(long, default_value_t = 256)]
     qcf_warmup_tokens: usize,
+
+    /// Enable experimental QCF metric dump for ARGUS analysis.
+    /// Adds qcf_per_head/qcf_caote_max/qcf_topk_retention_*/attention_entropy/
+    /// qcf_beta_amplified_*/qcf_per_layer/qcf_kivi_per_layer_* to eval-ll output.
+    /// Backward-compatible: existing qcf_caote/qcf_kivi_* fields unchanged.
+    #[arg(long, default_value_t = false)]
+    enable_qcf_experimental: bool,
+
+    /// Sample layer indices for multi-layer QCF (ARGUS #1).
+    /// Accepts: "auto" (default; [0, n/4, n/2, 3n/4, n-1]),
+    /// "all" (every layer; debug only), "0,8,16,24,31" (explicit).
+    #[arg(long, default_value = "auto")]
+    qcf_sample_layers: String,
+
+    /// β values for β-amplified CAOTE (ARGUS #6 option B).
+    /// Comma-separated, e.g., "1.0,1.5,2.0". Note: only β=1.0/1.5/2.0 are
+    /// dumped to fixed JSON keys. This flag is currently a placeholder for
+    /// future flexibility — the dumped values follow the fixed keys regardless.
+    #[arg(long, value_delimiter = ',', default_value = "1.0,1.5,2.0")]
+    qcf_betas: Vec<f32>,
+
+    /// K values for top-K retention (ARGUS #5).
+    /// Currently fixed [10, 20, 50] in dump; flag accepted for future use.
+    #[arg(long, value_delimiter = ',', default_value = "10,20,50")]
+    qcf_topk_values: Vec<usize>,
+
+    /// τ values for defensive aggregation. Fixed [0.1, 0.5] in dump.
+    #[arg(long, value_delimiter = ',', default_value = "0.1,0.5")]
+    qcf_defensive_taus: Vec<f32>,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -1539,9 +1646,38 @@ fn main() -> anyhow::Result<()> {
             }
             eprintln!("[KIVI] AWQE + AW-VOPR enabled");
         }
-        // CLI wiring (--enable-qcf-experimental, --qcf-sample-layers) added in Step 6.
-        // Score accumulator injection into KIVI forward path also Step 6.
-        let mut hook = llm_rs2::eval::KiviHook::new(qcf_config, false, vec![0], None);
+        // ARGUS Step 6: resolve sample layers and inject score accumulator.
+        let kivi_n_layers = kv_caches.len();
+        let kivi_sample_layers = if args.enable_qcf_experimental {
+            parse_qcf_sample_layers(&args.qcf_sample_layers, kivi_n_layers)
+                .map_err(|e| anyhow::anyhow!("--qcf-sample-layers: {e}"))?
+        } else {
+            vec![0]
+        };
+        // Inject a GQA-aware score accumulator when experimental mode is on.
+        // KiviHook::score_accumulator() forwards it into TransformerModelForwardArgs,
+        // so LlamaLayer will push attention probabilities into it during forward_into().
+        // entropy_computed flag is set in post_prefill when acc.is_active() + scores non-empty.
+        let kivi_score_acc = if args.enable_qcf_experimental {
+            let mut acc = llm_rs2::core::attention_scores::AttentionScoreAccumulator::new_gqa(
+                max_seq_len,
+                model.config.num_attention_heads,
+                model.config.num_key_value_heads,
+                kivi_n_layers,
+                0,   // last_n_layers=0 → all layers tracked
+                1.0, // no decay
+            );
+            acc.set_active(true);
+            Some(acc)
+        } else {
+            None
+        };
+        let mut hook = llm_rs2::eval::KiviHook::new(
+            qcf_config,
+            args.enable_qcf_experimental,
+            kivi_sample_layers,
+            kivi_score_acc,
+        );
         let output = llm_rs2::eval::run_eval_ll_generic(
             &model,
             &tokenizer,
@@ -2577,6 +2713,16 @@ fn main() -> anyhow::Result<()> {
         // For ratio mode, hook starts with budget=0; eval_loop updates it per-question.
         let hook_budget = if ratio_mode { 0 } else { effective_budget };
         let is_d2o = args.eviction_policy == "d2o";
+
+        // ARGUS Step 6: resolve --qcf-sample-layers from CLI.
+        // When --enable-qcf-experimental is off, always use [0] (legacy, no overhead).
+        let eviction_hook_sample_layers = if args.enable_qcf_experimental {
+            parse_qcf_sample_layers(&args.qcf_sample_layers, num_layers)
+                .map_err(|e| anyhow::anyhow!("--qcf-sample-layers: {e}"))?
+        } else {
+            vec![0]
+        };
+
         let mut hook = llm_rs2::eval::EvictionHook::new(
             cache_manager,
             score_accumulator,
@@ -2588,8 +2734,8 @@ fn main() -> anyhow::Result<()> {
             is_d2o,
             args.kv_type.clone(),
             backend.clone(),
-            false,   // experimental_enabled: CLI flag 노출은 Step 6에서 진행
-            vec![0], // qcf_sample_layers: default [0] for backward compat (CLI wiring Step 6)
+            args.enable_qcf_experimental,
+            eviction_hook_sample_layers,
         );
 
         let output = llm_rs2::eval::run_eval_ll_generic(
