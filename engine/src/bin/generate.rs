@@ -6653,9 +6653,17 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                 let Some(v_source) = VDataSource::from_kv_cache(cache, None) else {
                     continue;
                 };
+                // D2O simulator (paper Eq.8) needs K for nearest-neighbour
+                // matching; other actions ignore `k_source`.
+                let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
+                    VDataSource::k_from_kv_cache(cache)
+                } else {
+                    None
+                };
                 let params = UnifiedQcfParams {
                     action,
                     v_source,
+                    k_source,
                     attention_scores,
                     head_attn: head_attn_opt,
                     n_kv_heads: cache.kv_heads(),
@@ -8829,6 +8837,9 @@ fn run_ppl(
                                 let params = UnifiedQcfParams {
                                     action,
                                     v_source,
+                                    // PPL eval site only triggers Sliding/H2O,
+                                    // never D2O — `k_source` is unused.
+                                    k_source: None,
                                     attention_scores: acc.importance_scores(),
                                     head_attn: Some(head_attn),
                                     n_kv_heads: cache.kv_heads(),

@@ -323,9 +323,17 @@ impl StepHook<KVCache> for EvictionHook {
                 .score_accumulator
                 .as_ref()
                 .and_then(|acc| acc.last_step_head_attn());
+            // D2O simulator (paper Eq.8) needs K for nearest-neighbour
+            // matching; other actions ignore `k_source`.
+            let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
+                VDataSource::k_from_kv_cache(cache)
+            } else {
+                None
+            };
             let params = UnifiedQcfParams {
                 action,
                 v_source,
+                k_source,
                 attention_scores: &attention_scores,
                 head_attn: head_attn_opt,
                 n_kv_heads: cache.kv_heads(),

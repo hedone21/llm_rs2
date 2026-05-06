@@ -6,6 +6,31 @@
 //!
 //! Supports: sliding eviction, H2O eviction, StreamingLLM, D2O merge,
 //! and KIVI quantization -- all measured in the same output-error space.
+//!
+//! ## D2O merge (paper arXiv 2406.13035 Eq.10/11)
+//!
+//! The D2O simulation is kept in lockstep with the actuator
+//! (`core::pressure::d2o_handler`). For the same retained set $R$ and the
+//! evicted set $E$:
+//!   * **Nearest mapping** uses **K** (per head, cosine similarity). When the
+//!     caller supplies `k_source`, K vectors of head `h` drive the matching.
+//!     Without `k_source`, the simulator falls back to V (legacy behaviour) and
+//!     emits a one-time `eprintln!` warning.
+//!   * **Group normalisation** matches handler's `compute_eq11_weights`:
+//!     $D_j = \sum_i e^{u_{ij}} + e$, $w_{c_j} = e/D_j$,
+//!     $w_{e_i} = e^{u_{ij}}/D_j$, with `u` clamped to `[-10, 10]` before
+//!     `exp`. Weights sum to 1 by construction.
+//!   * **Constant `e`** is `MERGE_E = 0.1`, the default of
+//!     `D2OConfig::merge_e`.
+//!   * Only **V is augmented** in the simulator: $O_\text{after} =
+//!     \sum_{c\in R} \alpha_c\,V_c^\text{merged}$, so re-augmenting K is a
+//!     no-op for the QCF measurement. The handler still merges both K and V
+//!     because K matters for *future* attention steps which the simulator
+//!     does not model. This asymmetry is intentional and documented here.
+//!   * **EMA threshold filter** is *not* applied. Estimator returns the
+//!     post-condition QCF assuming all evicted tokens are merged (handler's
+//!     EMA filter only drops a subset, so the estimator is an upper bound
+//!     on the actual QCF).
 
 use super::{AggregationMode, aggregate_heads};
 use crate::core::buffer::DType;
@@ -39,15 +64,18 @@ pub enum QcfActionType {
     },
 }
 
-// ── V data source abstraction ───────────────────────────────────
+// ── V/K data source abstraction ─────────────────────────────────
 
-/// Abstraction over V buffer data types for read-only access.
+/// Abstraction over KV buffer data types for read-only access.
+///
+/// Despite the historical `V` prefix the same enum is reused for both K and V
+/// cache slices: the variants only encode the underlying dtype.
 pub enum VDataSource<'a> {
-    /// F32 KV cache data.
+    /// F32 cache data.
     F32(&'a [f32]),
-    /// F16 KV cache data stored as raw u16 (half::f16 bit representation).
+    /// F16 cache data stored as raw u16 (half::f16 bit representation).
     F16(&'a [u16]),
-    /// Q4_0 KV cache data stored as BlockQ4_0 blocks.
+    /// Q4_0 cache data stored as BlockQ4_0 blocks.
     Q4_0(&'a [BlockQ4_0]),
 }
 
@@ -92,6 +120,25 @@ impl<'a> VDataSource<'a> {
             _ => return None,
         })
     }
+
+    /// Build a `VDataSource` view of a `KVCache`'s **K** buffer (used for D2O
+    /// nearest-neighbour matching).
+    ///
+    /// Returns `None` for device-only (host pointer null) caches or
+    /// unsupported dtypes. This mirrors `from_kv_cache` but reads
+    /// `cache.k_buffer` instead of `cache.v_buffer`.
+    pub fn k_from_kv_cache(cache: &'a KVCache) -> Option<Self> {
+        let dtype = cache.k_buffer.dtype();
+        if cache.k_buffer.buffer().as_ptr().is_null() {
+            return None;
+        }
+        Some(match dtype {
+            DType::F32 => VDataSource::F32(cache.k_buffer.as_slice::<f32>()),
+            DType::F16 => VDataSource::F16(cache.k_buffer.as_slice::<u16>()),
+            DType::Q4_0 => VDataSource::Q4_0(cache.k_buffer.as_slice::<BlockQ4_0>()),
+            _ => return None,
+        })
+    }
 }
 
 // ── Parameters ──────────────────────────────────────────────────
@@ -100,8 +147,12 @@ impl<'a> VDataSource<'a> {
 pub struct UnifiedQcfParams<'a> {
     /// The action to simulate.
     pub action: QcfActionType,
-    /// V buffer data (F32 or F16).
+    /// V buffer data (F32, F16, or Q4_0).
     pub v_source: VDataSource<'a>,
+    /// Optional K buffer data, only consumed by `MergeD2o` for nearest-token
+    /// cosine matching (paper Eq.8). When `None` the D2O simulator falls
+    /// back to V-based matching with a warning. Other actions ignore it.
+    pub k_source: Option<VDataSource<'a>>,
     /// Flat importance scores, layout `[max_seq_len]`.
     pub attention_scores: &'a [f32],
     /// Optional per-KV-head attention, layout `[n_kv_heads * max_seq_len]`.
@@ -281,6 +332,7 @@ pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
                     compute_o_d2o_merge(
                         &alpha_h,
                         &params.v_source,
+                        params.k_source.as_ref(),
                         h,
                         &retained,
                         current_pos,
@@ -410,13 +462,33 @@ fn compute_o_eviction(
 
 // ── Helper: D2O merge O_after with scatter-reduce compensation ──
 
-/// Compute O_after for D2O merge: same retained set as H2O, but evicted
-/// tokens are additively merged into their nearest (cosine similarity)
-/// retained token before computing the output.
+/// Constant `e` of D2O paper Eq.11 (`D2OConfig::merge_e` default).
+const MERGE_E: f32 = 0.1;
+
+/// One-shot warning when D2O simulator falls back to V-based nearest matching.
+static D2O_VFALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Compute O_after for D2O merge (paper arXiv 2406.13035 Eq.10/11).
+///
+/// Same retained set $R$ as H2O. Evicted tokens are grouped by their nearest
+/// retained token (cosine similarity on **K**, per head), and each group's
+/// V is augmented with paper Eq.11 weights:
+///   $D_j = \sum_i e^{u_{ij}} + e$
+///   $w_{c_j} = e/D_j$, $w_{e_i} = e^{u_{ij}}/D_j$
+///   $V_{c_j} \leftarrow w_{c_j} V_{c_j} + \sum_i w_{e_i} V_{e_i}$
+///
+/// Weights sum to 1 by construction, preserving V magnitude. K is *not*
+/// augmented in the simulator — it would not change $O_\text{after}$ for the
+/// current step, and the simulator does not model the next step.
+///
+/// `k_src = None` falls back to V-based nearest matching (with a one-time
+/// warning) so legacy callers still produce a finite QCF.
 #[allow(clippy::too_many_arguments)]
 fn compute_o_d2o_merge(
     alpha: &[f32],
     v_src: &VDataSource,
+    k_src: Option<&VDataSource>,
     head: usize,
     retained: &[usize],
     current_pos: usize,
@@ -429,33 +501,76 @@ fn compute_o_d2o_merge(
         return vec![0.0; head_dim];
     }
 
-    // Build merged V: start with original V of retained tokens
-    let mut v_merged: Vec<Vec<f32>> = retained
-        .iter()
-        .map(|&t| read_v_f32(v_src, head, t, head_dim, capacity, n_kv_heads, layout))
-        .collect();
-
-    // Identify evicted tokens
+    // 1. Identify evicted tokens.
     let retained_set: std::collections::HashSet<usize> = retained.iter().copied().collect();
     let evicted: Vec<usize> = (0..current_pos)
         .filter(|t| !retained_set.contains(t))
         .collect();
 
-    // Scatter-reduce with D2O merge weight: w = exp(sim) / (exp(sim) + e)
-    // where e = 1.0 (D2O default merge_e parameter).
-    // This prevents V magnitude explosion from raw additive merge.
-    const MERGE_E: f32 = 1.0;
+    // 2. Build per-head K (or V fallback) for retained tokens — used as
+    //    nearest-neighbour candidates.
+    let nn_src: &VDataSource = match k_src {
+        Some(k) => k,
+        None => {
+            if !D2O_VFALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[QCF] D2O simulator: k_source=None, falling back to V-based nearest matching."
+                );
+            }
+            v_src
+        }
+    };
+    let nn_retained: Vec<Vec<f32>> = retained
+        .iter()
+        .map(|&t| read_v_f32(nn_src, head, t, head_dim, capacity, n_kv_heads, layout))
+        .collect();
+
+    // 3. Original V of retained tokens (V is what the simulator augments).
+    let mut v_merged: Vec<Vec<f32>> = retained
+        .iter()
+        .map(|&t| read_v_f32(v_src, head, t, head_dim, capacity, n_kv_heads, layout))
+        .collect();
+
+    // 4. Group evicted tokens by their nearest retained index, recording the
+    //    cosine similarity (used as `u_ij` in Eq.11).
+    let mut groups: std::collections::HashMap<usize, Vec<(usize, f32)>> =
+        std::collections::HashMap::new();
     for &e in &evicted {
-        let v_e = read_v_f32(v_src, head, e, head_dim, capacity, n_kv_heads, layout);
-        let (nearest_idx, sim) = find_nearest_cosine_with_sim(&v_e, &v_merged);
-        let exp_sim = sim.clamp(-10.0, 10.0).exp(); // clamp to avoid overflow
-        let merge_weight = exp_sim / (exp_sim + MERGE_E);
-        for d in 0..head_dim {
-            v_merged[nearest_idx][d] += merge_weight * v_e[d];
+        let q = read_v_f32(nn_src, head, e, head_dim, capacity, n_kv_heads, layout);
+        let (nearest_idx, sim) = find_nearest_cosine_with_sim(&q, &nn_retained);
+        groups.entry(nearest_idx).or_default().push((e, sim));
+    }
+
+    // 5. Per-group Eq.11 weight application: V_c <- w_c · V_c + Σ w_ei · V_ei
+    //    (matches `core::pressure::d2o_handler::compute_eq11_weights`).
+    for (&retained_idx, group) in &groups {
+        let exps: Vec<f32> = group
+            .iter()
+            .map(|&(_, sim)| sim.clamp(-10.0, 10.0).exp())
+            .collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let denom = sum_exp + MERGE_E;
+        if denom <= 0.0 {
+            continue;
+        }
+        let inv_denom = 1.0 / denom;
+        let w_c = MERGE_E * inv_denom;
+
+        // V_c ← w_c · V_c
+        for v in v_merged[retained_idx].iter_mut() {
+            *v *= w_c;
+        }
+        // V_c += Σ w_ei · V_ei
+        for (i, &(e_pos, _)) in group.iter().enumerate() {
+            let w_e = exps[i] * inv_denom;
+            let v_e = read_v_f32(v_src, head, e_pos, head_dim, capacity, n_kv_heads, layout);
+            for (v, &ve) in v_merged[retained_idx].iter_mut().zip(v_e.iter()) {
+                *v += w_e * ve;
+            }
         }
     }
 
-    // O_after with merged V
+    // 6. O_after = Σ_{c∈R} (alpha_c / Σα) · V_c^merged   (softmax redistribution).
     let alpha_sum: f32 = retained.iter().map(|&t| alpha[t]).sum();
     if alpha_sum <= 0.0 {
         return vec![0.0; head_dim];
@@ -600,6 +715,7 @@ mod tests {
                 target_len: current_pos,
             },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -633,6 +749,7 @@ mod tests {
         let params = UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len: 0 },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -664,6 +781,7 @@ mod tests {
         let make_params = |target_len: usize| UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -704,6 +822,7 @@ mod tests {
                 window_size: 4,
             },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -754,6 +873,7 @@ mod tests {
         let sliding_params = UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -771,6 +891,7 @@ mod tests {
                 protected_prefix: 0,
             },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -810,6 +931,7 @@ mod tests {
         let params_f32 = UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len: 2 },
             v_source: VDataSource::F32(&v_f32),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -823,6 +945,7 @@ mod tests {
         let params_f16 = UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len: 2 },
             v_source: VDataSource::F16(&v_f16),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -859,6 +982,7 @@ mod tests {
                 window_size: 4,
             },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -901,6 +1025,7 @@ mod tests {
         let params_flat = UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len: 4 },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &flat_scores,
             head_attn: None,
             n_kv_heads,
@@ -914,6 +1039,7 @@ mod tests {
         let params_head = UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len: 4 },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &flat_scores,
             head_attn: Some(&head_attn),
             n_kv_heads,
@@ -967,6 +1093,7 @@ mod tests {
                 protected_prefix,
             },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -984,6 +1111,7 @@ mod tests {
                 protected_prefix,
             },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -1039,6 +1167,7 @@ mod tests {
                 protected_prefix: 2,
             },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -1053,6 +1182,163 @@ mod tests {
         assert!(
             qcf.abs() < 1e-6,
             "D2O with no eviction should give QCF=0, got {qcf}"
+        );
+    }
+
+    #[test]
+    fn test_d2o_uses_k_for_nearest() {
+        // Constructs a case where K and V give different nearest matches:
+        // when K is supplied, the simulator follows K; otherwise V fallback.
+        // We just check that the resulting QCFs differ (the absolute ordering
+        // depends on alpha/V geometry and is not part of the contract).
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let capacity = 32;
+        let current_pos = 8;
+
+        // V: monotonically increasing per token.
+        let v_data = make_v_data(n_kv_heads, capacity, head_dim);
+
+        // K: deliberately inverted vs V so K-based nearest != V-based nearest.
+        // K[t] = constant base − (t+1) * unit, plus per-d offsets.
+        let mut k_data = vec![0.0f32; n_kv_heads * capacity * head_dim];
+        for t in 0..current_pos {
+            for d in 0..head_dim {
+                let off = t * head_dim + d;
+                k_data[off] = (current_pos as f32 - t as f32) * (d as f32 + 1.0);
+            }
+        }
+
+        // Non-uniform scores so eviction actually triggers.
+        let mut scores = vec![0.1f32; current_pos];
+        scores[0] = 5.0;
+        scores[1] = 3.0;
+
+        let target_len = 4;
+        let keep_ratio = 0.5;
+        let protected_prefix = 1;
+
+        let params_v = UnifiedQcfParams {
+            action: QcfActionType::MergeD2o {
+                target_len,
+                keep_ratio,
+                protected_prefix,
+            },
+            v_source: VDataSource::F32(&v_data),
+            k_source: None, // V fallback
+            attention_scores: &scores,
+            head_attn: None,
+            n_kv_heads,
+            head_dim,
+            current_pos,
+            capacity,
+            layout: KVLayout::HeadMajor,
+            aggregation: AggregationMode::Mean,
+        };
+        let params_k = UnifiedQcfParams {
+            action: QcfActionType::MergeD2o {
+                target_len,
+                keep_ratio,
+                protected_prefix,
+            },
+            v_source: VDataSource::F32(&v_data),
+            k_source: Some(VDataSource::F32(&k_data)),
+            attention_scores: &scores,
+            head_attn: None,
+            n_kv_heads,
+            head_dim,
+            current_pos,
+            capacity,
+            layout: KVLayout::HeadMajor,
+            aggregation: AggregationMode::Mean,
+        };
+
+        let (qcf_v, _) = compute_unified_qcf(&params_v);
+        let (qcf_k, _) = compute_unified_qcf(&params_k);
+
+        assert!(
+            (qcf_v - qcf_k).abs() > 1e-6,
+            "K-based nearest ({qcf_k}) should differ from V-fallback ({qcf_v}) \
+             when K and V geometries disagree"
+        );
+    }
+
+    #[test]
+    fn test_d2o_weight_grouping_normalized() {
+        // Eq.11 weights sum to 1 by construction. For a single retained
+        // token absorbing all evictions (one nearest target), the merged V
+        // norm must lie within a convex hull of the original V norms, i.e.
+        // bounded by max_norm.
+        //
+        // We construct a head where exactly one retained token exists (so
+        // every evicted maps to it), all V norms are bounded by `max_norm`,
+        // and check that the merged V norm of that single retained group
+        // is also <= max_norm * (1 + 1e-4) (numerical slack).
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let capacity = 16;
+        let current_pos = 8;
+
+        // V[t][d] = (t+1) * (d+1)  ==>  ‖V[t]‖ grows monotonically with t.
+        // Use t=0..current_pos so max ‖V‖ = ‖V[7]‖.
+        let v_data = make_v_data(n_kv_heads, capacity, head_dim);
+
+        // Compute max V norm directly.
+        let max_norm: f32 = (0..current_pos)
+            .map(|t| {
+                let off = t * head_dim;
+                let v: &[f32] = &v_data[off..off + head_dim];
+                l2_norm(v)
+            })
+            .fold(0.0_f32, f32::max);
+
+        // target_len = 1, keep_ratio = 1.0, protected_prefix = 0
+        // ⇒ retained = {0}. All other 7 tokens evicted, all map to t=0.
+        let scores = uniform_scores(current_pos);
+        let params = UnifiedQcfParams {
+            action: QcfActionType::MergeD2o {
+                target_len: 1,
+                keep_ratio: 1.0,
+                protected_prefix: 0,
+            },
+            v_source: VDataSource::F32(&v_data),
+            k_source: None,
+            attention_scores: &scores,
+            head_attn: None,
+            n_kv_heads,
+            head_dim,
+            current_pos,
+            capacity,
+            layout: KVLayout::HeadMajor,
+            aggregation: AggregationMode::Mean,
+        };
+
+        // Re-derive O_after = w · V_merged[0] where w = alpha[0]/Σα = 1
+        // (only retained token), so ‖O_after‖ = ‖V_merged[0]‖.
+        // Run the QCF and reconstruct ‖V_merged[0]‖ from QCF + ‖O_before‖.
+        let (qcf, _) = compute_unified_qcf(&params);
+
+        // O_before for head 0 with uniform alpha=1/8.
+        let mut o_before = vec![0.0f32; head_dim];
+        for t in 0..current_pos {
+            let off = t * head_dim;
+            for d in 0..head_dim {
+                o_before[d] += (1.0 / current_pos as f32) * v_data[off + d];
+            }
+        }
+        let o_before_norm = l2_norm(&o_before);
+
+        // diff_norm = qcf * o_before_norm
+        // ‖O_before − O_after‖ = qcf * ‖O_before‖
+        // O_after lies on a sphere of radius (qcf * ‖O_before‖) around
+        // O_before, so ‖O_after‖ ∈ [‖O_before‖(1−qcf), ‖O_before‖(1+qcf)].
+        // Upper bound must not exceed max_norm by more than slack.
+        let upper = o_before_norm * (1.0 + qcf);
+        let slack = max_norm * 1e-4;
+        assert!(
+            upper <= max_norm + slack,
+            "merged V norm upper bound {upper} should not exceed max single-token V norm \
+             {max_norm} (+slack {slack}); QCF = {qcf}, ‖O_before‖ = {o_before_norm}"
         );
     }
 
@@ -1082,6 +1368,7 @@ mod tests {
         let params = UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len: 4 },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads: 0,
@@ -1099,6 +1386,7 @@ mod tests {
         let params = UnifiedQcfParams {
             action: QcfActionType::EvictSliding { target_len: 4 },
             v_source: VDataSource::F32(&v_data),
+            k_source: None,
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads: 2,
