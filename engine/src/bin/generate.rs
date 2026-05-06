@@ -394,6 +394,11 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     d2o_ema_beta: f32,
 
+    /// D2O Eq.11 normalisation constant `e` (paper default 0.1).
+    /// Controls retained token's self-weight: w_c = e / (Σ exp(u_i) + e).
+    #[arg(long, default_value_t = 0.1)]
+    d2o_merge_e: f32,
+
     /// Enable D2O layer-level dynamic allocation (uses per-layer attention variance from prefill)
     #[arg(long, default_value_t = false)]
     d2o_layer_alloc: bool,
@@ -1997,6 +2002,7 @@ fn main() -> anyhow::Result<()> {
                 target_ratio: args.eviction_target_ratio,
                 ema_alpha: args.d2o_ema_alpha,
                 ema_beta: args.d2o_ema_beta,
+                merge_e: args.d2o_merge_e,
                 use_layer_allocation: args.d2o_layer_alloc,
                 protected_layers: args.d2o_protected_layers.clone().unwrap_or_default(),
             });
@@ -9495,6 +9501,7 @@ fn build_chat_eviction(
             target_ratio: args.eviction_target_ratio,
             ema_alpha: args.d2o_ema_alpha,
             ema_beta: args.d2o_ema_beta,
+            merge_e: args.d2o_merge_e,
             use_layer_allocation: args.d2o_layer_alloc,
             protected_layers: args.d2o_protected_layers.clone().unwrap_or_default(),
         });
