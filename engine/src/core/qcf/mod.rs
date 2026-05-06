@@ -9,6 +9,7 @@ pub mod estimator;
 pub mod layer_importance;
 pub mod quant_qcf;
 pub mod skip_qcf;
+pub mod topk_retention;
 pub mod unified_qcf;
 
 pub use estimator::DegradationEstimator;
@@ -18,7 +19,11 @@ pub use quant_qcf::{
     compute_flush_nmse, compute_flush_opr,
 };
 pub use skip_qcf::SkipQcfTracker;
-pub use unified_qcf::{QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf};
+pub use topk_retention::{TopKRetentionResult, compute_topk_retention};
+pub use unified_qcf::{
+    QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf,
+    identify_retained_for_action, identify_retained_h2o, identify_retained_sliding,
+};
 
 /// A QCF metric collected from a single lossy action execution.
 #[derive(Debug, Clone)]

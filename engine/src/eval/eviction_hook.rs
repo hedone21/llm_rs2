@@ -9,8 +9,8 @@ use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::{
-    AggregationMode, QcfActionType, QcfConfig, UnifiedQcfParams, VDataSource, aggregate_heads,
-    compute_unified_qcf,
+    AggregationMode, QcfActionType, QcfConfig, TopKRetentionResult, UnifiedQcfParams, VDataSource,
+    aggregate_heads, compute_topk_retention, compute_unified_qcf, identify_retained_for_action,
 };
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
@@ -31,6 +31,12 @@ pub struct ExperimentalQcfPayload {
     pub caote_topk_k5: f32,
     pub caote_defensive_t01: f32,
     pub caote_defensive_t05: f32,
+    // Step 2: Top-K retention metrics (ARGUS #5)
+    pub topk_retention_k10: f32,
+    pub topk_retention_k20: f32,
+    pub topk_retention_k50: f32,
+    pub topk_retention_weighted_k10: f32,
+    pub topk_retention_weighted_k20: f32,
 }
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
@@ -350,6 +356,16 @@ impl StepHook<KVCache> for EvictionHook {
             } else {
                 None
             };
+            // Compute retained set before moving `action` into params (experimental path).
+            let retained_for_topk = if self.experimental_enabled {
+                Some(identify_retained_for_action(
+                    &action,
+                    &attention_scores,
+                    before_len,
+                ))
+            } else {
+                None
+            };
             let params = UnifiedQcfParams {
                 action,
                 v_source,
@@ -366,6 +382,22 @@ impl StepHook<KVCache> for EvictionHook {
             let (qcf, per_head) = compute_unified_qcf(&params);
 
             if self.experimental_enabled {
+                // Top-K retention: compute evicted set from retained simulation,
+                // then measure how many high-importance tokens survived.
+                let retained = retained_for_topk.unwrap_or_default();
+                let retained_set: std::collections::HashSet<usize> =
+                    retained.iter().copied().collect();
+                let evicted_set: std::collections::HashSet<usize> = (0..before_len)
+                    .filter(|t| !retained_set.contains(t))
+                    .collect();
+
+                let r10: TopKRetentionResult =
+                    compute_topk_retention(&attention_scores, &evicted_set, 10);
+                let r20: TopKRetentionResult =
+                    compute_topk_retention(&attention_scores, &evicted_set, 20);
+                let r50: TopKRetentionResult =
+                    compute_topk_retention(&attention_scores, &evicted_set, 50);
+
                 let payload = ExperimentalQcfPayload {
                     caote_max: aggregate_heads(&per_head, &AggregationMode::Max),
                     caote_topk_k3: aggregate_heads(&per_head, &AggregationMode::TopK { k: 3 }),
@@ -378,6 +410,11 @@ impl StepHook<KVCache> for EvictionHook {
                         &per_head,
                         &AggregationMode::Defensive { temperature: 0.5 },
                     ),
+                    topk_retention_k10: r10.retention_binary,
+                    topk_retention_k20: r20.retention_binary,
+                    topk_retention_k50: r50.retention_binary,
+                    topk_retention_weighted_k10: r10.retention_weighted,
+                    topk_retention_weighted_k20: r20.retention_weighted,
                     per_head,
                 };
                 self.experimental_qcf = Some(payload);
@@ -518,6 +555,13 @@ impl StepHook<KVCache> for EvictionHook {
             obj["qcf_caote_topk_K5"] = serde_json::json!(exp.caote_topk_k5);
             obj["qcf_caote_defensive_t01"] = serde_json::json!(exp.caote_defensive_t01);
             obj["qcf_caote_defensive_t05"] = serde_json::json!(exp.caote_defensive_t05);
+            obj["qcf_topk_retention_K10"] = serde_json::json!(exp.topk_retention_k10);
+            obj["qcf_topk_retention_K20"] = serde_json::json!(exp.topk_retention_k20);
+            obj["qcf_topk_retention_K50"] = serde_json::json!(exp.topk_retention_k50);
+            obj["qcf_topk_retention_weighted_K10"] =
+                serde_json::json!(exp.topk_retention_weighted_k10);
+            obj["qcf_topk_retention_weighted_K20"] =
+                serde_json::json!(exp.topk_retention_weighted_k20);
         }
         obj
     }

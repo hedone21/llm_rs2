@@ -613,9 +613,15 @@ fn find_nearest_cosine_with_sim(query: &[f32], candidates: &[Vec<f32>]) -> (usiz
     (best_idx, best_sim)
 }
 
-// ── Helper: H2O retained token identification ───────────────────
+// ── Helper: retained token identification ───────────────────────
 
-fn identify_retained_h2o(
+/// Identify tokens retained by H2O eviction policy.
+///
+/// Returns indices `[0, current_pos)` that would survive the eviction.
+/// Protected prefix tokens are always retained. The remaining budget is
+/// split between heavy hitters (top importance, by `keep_ratio`) and the
+/// most recent window tokens.
+pub fn identify_retained_h2o(
     importance: &[f32],
     current_pos: usize,
     target_len: usize,
@@ -656,6 +662,65 @@ fn identify_retained_h2o(
     retained.sort();
     retained.dedup();
     retained
+}
+
+/// Identify tokens retained by Sliding Window eviction policy.
+///
+/// Retains `[current_pos - target_len, current_pos)` — the most recent
+/// `target_len` tokens. If `target_len >= current_pos`, all tokens are
+/// retained (no eviction).
+pub fn identify_retained_sliding(current_pos: usize, target_len: usize) -> Vec<usize> {
+    let target_len = target_len.min(current_pos);
+    let start = current_pos.saturating_sub(target_len);
+    (start..current_pos).collect()
+}
+
+/// Dispatch helper: derive the retained token set for any `QcfActionType`.
+///
+/// Returns a sorted, deduplicated list of token indices in `[0, current_pos)`
+/// that would survive the corresponding lossy cache action.
+///
+/// - `EvictSliding` → recent window only.
+/// - `EvictH2o` / `MergeD2o` → H2O 3-partition (prefix + heavy hitters + recent).
+/// - `EvictStreaming` → sink tokens + recent window.
+pub fn identify_retained_for_action(
+    action: &QcfActionType,
+    importance: &[f32],
+    current_pos: usize,
+) -> Vec<usize> {
+    match action {
+        QcfActionType::EvictSliding { target_len } => {
+            identify_retained_sliding(current_pos, *target_len)
+        }
+        QcfActionType::EvictH2o {
+            target_len,
+            keep_ratio,
+            protected_prefix,
+        }
+        | QcfActionType::MergeD2o {
+            target_len,
+            keep_ratio,
+            protected_prefix,
+        } => identify_retained_h2o(
+            importance,
+            current_pos,
+            *target_len,
+            *keep_ratio,
+            *protected_prefix,
+        ),
+        QcfActionType::EvictStreaming {
+            sink_size,
+            window_size,
+        } => {
+            let sink = (*sink_size).min(current_pos);
+            let recent_start = current_pos.saturating_sub(*window_size);
+            let mut out: Vec<usize> = (0..sink).collect();
+            out.extend(recent_start.max(sink)..current_pos);
+            out.sort();
+            out.dedup();
+            out
+        }
+    }
 }
 
 // ── Math helpers ────────────────────────────────────────────────
@@ -1526,5 +1591,98 @@ mod tests {
         );
         assert_eq!(out2.len(), 64);
         assert!(out2.iter().all(|&x| x == 0.0));
+    }
+
+    // ── identify_retained_* tests ────────────────────────────────
+
+    #[test]
+    fn test_identify_retained_sliding_basic() {
+        let retained = identify_retained_sliding(10, 3);
+        assert_eq!(retained, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn test_identify_retained_sliding_target_exceeds() {
+        // target_len > current_pos → all tokens retained
+        let retained = identify_retained_sliding(5, 10);
+        assert_eq!(retained, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_identify_retained_for_action_sliding() {
+        let importance = vec![0.1f32; 10];
+        let retained = identify_retained_for_action(
+            &QcfActionType::EvictSliding { target_len: 3 },
+            &importance,
+            10,
+        );
+        assert_eq!(retained, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn test_identify_retained_for_action_h2o_keep_ratio_0() {
+        // kr=0.0 → no heavy hitters, only recent window (same as sliding)
+        let importance = vec![1.0f32; 10];
+        let retained_h2o = identify_retained_for_action(
+            &QcfActionType::EvictH2o {
+                target_len: 5,
+                keep_ratio: 0.0,
+                protected_prefix: 0,
+            },
+            &importance,
+            10,
+        );
+        let retained_sliding = identify_retained_sliding(10, 5);
+        assert_eq!(
+            retained_h2o, retained_sliding,
+            "kr=0.0 should equal sliding window"
+        );
+    }
+
+    #[test]
+    fn test_identify_retained_for_action_h2o_keep_ratio_1() {
+        // kr=1.0 → all budget for heavy hitters, no recent window
+        // target_len=4, kr=1.0, prefix=0, current_pos=10 → 4 top-importance tokens, no recent
+        let mut importance = vec![0.1f32; 10];
+        // Make tokens 2,3,4,5 the most important
+        importance[2] = 5.0;
+        importance[3] = 4.0;
+        importance[4] = 3.0;
+        importance[5] = 2.0;
+        let retained = identify_retained_for_action(
+            &QcfActionType::EvictH2o {
+                target_len: 4,
+                keep_ratio: 1.0,
+                protected_prefix: 0,
+            },
+            &importance,
+            10,
+        );
+        // With kr=1.0: hh_budget=4, recent_budget=0 → recent_start=current_pos=10
+        // evictable zone = [0..10), top-4 by importance = [2,3,4,5]
+        // No recent window tokens (recent_start=10, so range 10..10 is empty)
+        assert_eq!(retained.len(), 4);
+        for &idx in &[2usize, 3, 4, 5] {
+            assert!(
+                retained.contains(&idx),
+                "token {idx} should be in retained set"
+            );
+        }
+    }
+
+    #[test]
+    fn test_identify_retained_for_action_streaming() {
+        // sink_size=2, window_size=3, current_pos=10
+        // sink=[0,1], recent=[7,8,9] → retained=[0,1,7,8,9]
+        let importance = vec![0.1f32; 10];
+        let retained = identify_retained_for_action(
+            &QcfActionType::EvictStreaming {
+                sink_size: 2,
+                window_size: 3,
+            },
+            &importance,
+            10,
+        );
+        assert_eq!(retained, vec![0, 1, 7, 8, 9]);
     }
 }
