@@ -386,12 +386,9 @@ struct Args {
     #[arg(long, default_value_t = 0.75)]
     d2o_keep_ratio: f32,
 
-    /// D2O EMA old-threshold weight α (official default 0.5)
-    #[arg(long, default_value_t = 0.5)]
-    d2o_ema_alpha: f32,
-
-    /// D2O EMA new-mean weight β (official default 0.5)
-    #[arg(long, default_value_t = 0.5)]
+    /// D2O EMA smoothing factor β for threshold update (paper Eq.10, default 0.7).
+    /// τ_t = β · max U_t + (1−β) · τ_{t−1}.
+    #[arg(long, default_value_t = 0.7)]
     d2o_ema_beta: f32,
 
     /// D2O Eq.11 normalisation constant `e` (paper default 0.1).
@@ -2000,7 +1997,6 @@ fn main() -> anyhow::Result<()> {
                 keep_ratio: args.d2o_keep_ratio,
                 protected_prefix: actual_protected_prefix,
                 target_ratio: args.eviction_target_ratio,
-                ema_alpha: args.d2o_ema_alpha,
                 ema_beta: args.d2o_ema_beta,
                 merge_e: args.d2o_merge_e,
                 use_layer_allocation: args.d2o_layer_alloc,
@@ -9499,7 +9495,6 @@ fn build_chat_eviction(
             keep_ratio: args.d2o_keep_ratio,
             protected_prefix: actual_protected_prefix,
             target_ratio: args.eviction_target_ratio,
-            ema_alpha: args.d2o_ema_alpha,
             ema_beta: args.d2o_ema_beta,
             merge_e: args.d2o_merge_e,
             use_layer_allocation: args.d2o_layer_alloc,

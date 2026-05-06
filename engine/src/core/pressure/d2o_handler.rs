@@ -31,9 +31,8 @@ pub struct D2OConfig {
     /// Target cache ratio: keep this fraction of current_pos after eviction.
     /// E.g. 0.5 = keep 50% of tokens.
     pub target_ratio: f32,
-    /// EMA old-threshold weight (official code default 0.5).
-    pub ema_alpha: f32,
-    /// EMA new-mean weight (official code default 0.5).
+    /// EMA smoothing factor β for the threshold update (paper Eq.10, default 0.7).
+    /// τ_t = β · max U_t + (1−β) · τ_{t−1}.
     pub ema_beta: f32,
     /// Constant `e` in Eq.11 normalisation: D_j = Σ exp(u_ij) + e.
     /// Controls retained token's self-weight (w_c = e/D). Paper default 0.1.
@@ -50,8 +49,7 @@ impl Default for D2OConfig {
             keep_ratio: 0.75,
             protected_prefix: 4,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
-            ema_beta: 0.5,
+            ema_beta: 0.7,
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
@@ -213,26 +211,32 @@ impl D2OHandler {
                 .iter()
                 .map(|&pos| find_nearest_layer_wide(cache, pos, &merge_targets, kv_heads, head_dim))
                 .collect();
-            // Phase 1: layer-wide nearest yields a single sim per evicted token.
-            // The legacy mean-of-per-head sim collapses to this value, so EMA
-            // updates and the filter operate directly on `match.sim`.
-            let sims: Vec<f32> = all_matches.iter().map(|m| m.sim).collect();
 
-            // ── Step 3: EMA threshold (Phase 2 will replace with max-based) ──
-            if !sims.is_empty() {
-                let mean_of_sims = sims.iter().sum::<f32>() / sims.len() as f32;
+            // ── Step 3: EMA threshold τ_t (paper Eq.10) ──
+            // First call: τ_0 = mean over evicted of max_j u_ij.
+            // After init:  τ_t = β · max_(i,j) U_t + (1−β) · τ_{t−1}.
+            // Layer-wide nearest gives one `sim` per evicted token (= max_j u_ij),
+            // so per-evicted max == per-evicted sim and the global max over the
+            // whole U_t matrix collapses to the max over `match.sim`.
+            if !all_matches.is_empty() {
                 if !state.initialized {
-                    state.ema_threshold = mean_of_sims;
+                    let mean_max =
+                        all_matches.iter().map(|m| m.sim).sum::<f32>() / all_matches.len() as f32;
+                    state.ema_threshold = mean_max;
                     state.initialized = true;
                 } else {
-                    state.ema_threshold = self.config.ema_alpha * state.ema_threshold
-                        + self.config.ema_beta * mean_of_sims;
+                    let global_max = all_matches
+                        .iter()
+                        .map(|m| m.sim)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    state.ema_threshold = self.config.ema_beta * global_max
+                        + (1.0 - self.config.ema_beta) * state.ema_threshold;
                 }
             }
 
-            // ── Step 4: Global filter — sim >= threshold ──
+            // ── Step 4: Filter — per-evicted max sim ≥ τ ──
             let passing_indices: Vec<usize> = (0..evict_positions.len())
-                .filter(|&i| sims[i] >= state.ema_threshold)
+                .filter(|&i| all_matches[i].sim >= state.ema_threshold)
                 .collect();
 
             let merge_count = passing_indices.len();
@@ -1208,22 +1212,22 @@ mod tests {
 
     #[test]
     fn test_ema_initialization() {
+        // Paper Eq.10 first-call init: τ_0 = mean over evicted of max_j u_ij.
+        // Layer-wide nearest gives one sim per evicted ⇒ τ_0 = mean(match.sim).
         let handler = D2OHandler::new(D2OConfig {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
-            ema_beta: 0.5,
+            ema_beta: 0.7,
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
         });
 
         let mut cache = make_cache(20, 1, 4, 10);
-        // Write K vectors: make some similar pairs
+        // Identical vectors → all cosine sims = 1.0 ⇒ mean_max = 1.0
         for pos in 0..10 {
-            let val = pos as f32;
-            write_k(&mut cache, pos, 0, &[val, val, val, val]);
+            write_k(&mut cache, pos, 0, &[1.0, 0.0, 0.0, 0.0]);
         }
 
         let importance: Vec<f32> = (0..20).map(|i| 10.0 - i as f32).collect();
@@ -1252,13 +1256,17 @@ mod tests {
             state.initialized,
             "should be initialized after first eviction"
         );
-        assert!(state.ema_threshold > 0.0, "threshold should be positive");
+        assert!(
+            (state.ema_threshold - 1.0).abs() < 1e-4,
+            "τ_0 should equal mean of max_sim ≈ 1.0, got {}",
+            state.ema_threshold
+        );
     }
 
     #[test]
     fn test_ema_init_no_double_update() {
-        // First call: threshold = mean(sims), no EMA update applied on top
-        // We test this by calling evict_and_merge with controlled sims
+        // First call sets τ_0 = mean(max_sim). The β-weighted update only fires
+        // on the second call, not stacked on top of the init within one call.
         let handler = D2OHandler::new(D2OConfig::default());
         let mut state = D2OState::new();
         let mut cache = make_cache(20, 1, 4, 12);
@@ -1273,55 +1281,154 @@ mod tests {
             .evict_and_merge(&mut cache, 6, &importance, &mut state, true)
             .unwrap();
 
-        // All sims ≈ 1.0 → mean = 1.0 → threshold = 1.0 (no EMA on first call)
+        // All sims = 1.0 → τ_0 = 1.0 (init only, no β update).
         assert!(state.initialized, "should be initialized");
-        // With identical vectors sim = 1.0, threshold should be set to that mean
         assert!(
-            state.ema_threshold > 0.5,
-            "threshold should reflect mean sim ≈ 1.0, got {}",
+            (state.ema_threshold - 1.0).abs() < 1e-4,
+            "τ_0 should equal mean(max_sim)=1.0 with no β update, got {}",
             state.ema_threshold
         );
     }
 
     #[test]
-    fn test_ema_update_uses_mean() {
-        // Second call applies α·τ + β·mean(sims)
-        let alpha = 0.5f32;
-        let beta = 0.5f32;
-        let initial_threshold = 0.8f32;
-        let mean_sim = 0.4f32;
-
-        let expected = alpha * initial_threshold + beta * mean_sim; // = 0.6
-
-        let mut threshold = initial_threshold;
-        threshold = alpha * threshold + beta * mean_sim;
-
-        assert!(
-            (threshold - expected).abs() < 1e-6,
-            "EMA update: got {threshold}, expected {expected}"
-        );
-    }
-
-    #[test]
     fn test_ema_update() {
-        let alpha: f32 = 0.5;
-        let beta: f32 = 0.5;
-        let mut threshold: f32 = 0.5; // initial
+        // Pure-arithmetic check of paper Eq.10:
+        //   τ_t = β · max U_t + (1−β) · τ_{t−1}.
+        let beta: f32 = 0.7;
+        let mut threshold: f32 = 0.5; // initial τ_0 (already initialised)
 
-        // Update with new mean similarity = 0.8
-        threshold = alpha * threshold + beta * 0.8;
-        let expected = 0.5 * 0.5 + 0.5 * 0.8; // = 0.25 + 0.4 = 0.65
+        // Second call: global max sim = 0.8
+        threshold = beta * 0.8 + (1.0 - beta) * threshold;
+        let expected = 0.7 * 0.8 + 0.3 * 0.5; // = 0.71
         assert!(
             (threshold - expected).abs() < 1e-6,
             "threshold={threshold}, expected={expected}"
         );
 
-        // Update with lower mean similarity = 0.3
-        threshold = alpha * threshold + beta * 0.3;
-        let expected2 = 0.5 * expected + 0.5 * 0.3;
+        // Third call: global max sim = 0.3
+        threshold = beta * 0.3 + (1.0 - beta) * threshold;
+        let expected2 = 0.7 * 0.3 + 0.3 * expected;
         assert!(
             (threshold - expected2).abs() < 1e-6,
             "threshold={threshold}, expected={expected2}"
+        );
+    }
+
+    #[test]
+    fn test_ema_uses_global_max_after_init() {
+        // After init, the threshold update must use the *max* sim across the
+        // current eviction batch, not its mean. We verify by driving two calls
+        // with hand-controlled cosine similarities.
+        let beta = 0.7f32;
+        let handler = D2OHandler::new(D2OConfig {
+            keep_ratio: 0.5,
+            protected_prefix: 0,
+            target_ratio: 0.5,
+            ema_beta: beta,
+            merge_e: 0.1,
+            use_layer_allocation: false,
+            protected_layers: vec![],
+        });
+        let mut state = D2OState::new();
+        let mut cache = make_cache(20, 1, 4, 4);
+
+        // First call: 2 evicted (pos 0, 1), 2 retained (pos 2, 3).
+        // Make sim(evict_0, retain_2)=1.0 and sim(evict_1, retain_3)=1.0.
+        // ⇒ τ_0 = mean(1.0, 1.0) = 1.0.
+        write_k(&mut cache, 0, 0, &[1.0, 0.0, 0.0, 0.0]);
+        write_k(&mut cache, 1, 0, &[0.0, 1.0, 0.0, 0.0]);
+        write_k(&mut cache, 2, 0, &[1.0, 0.0, 0.0, 0.0]);
+        write_k(&mut cache, 3, 0, &[0.0, 1.0, 0.0, 0.0]);
+
+        // Importance: low for pos 0, 1 (evicted), high for pos 2, 3 (kept as HH).
+        let importance = vec![0.1, 0.1, 10.0, 9.0];
+        handler
+            .evict_and_merge(&mut cache, 2, &importance, &mut state, true)
+            .unwrap();
+        assert!(state.initialized, "first call must initialize");
+        assert!(
+            (state.ema_threshold - 1.0).abs() < 1e-4,
+            "τ_0 = mean(max_sim) = 1.0, got {}",
+            state.ema_threshold
+        );
+
+        // Second call on a fresh, mixed-similarity layout:
+        //   evict pos 0: orthogonal to retain pos 2 (sim ≈ 0.0).
+        //   evict pos 1: identical to retain pos 3 (sim = 1.0).
+        // Global max = 1.0; mean would be 0.5 — must distinguish.
+        let mut cache2 = make_cache(20, 1, 4, 4);
+        write_k(&mut cache2, 0, 0, &[1.0, 0.0, 0.0, 0.0]);
+        write_k(&mut cache2, 1, 0, &[0.0, 1.0, 0.0, 0.0]);
+        write_k(&mut cache2, 2, 0, &[0.0, 0.0, 1.0, 0.0]); // orthogonal → sim≈0
+        write_k(&mut cache2, 3, 0, &[0.0, 1.0, 0.0, 0.0]); // identical → sim=1
+        handler
+            .evict_and_merge(&mut cache2, 2, &importance, &mut state, true)
+            .unwrap();
+
+        // Expected: τ_1 = β · max + (1−β) · τ_0 = 0.7·1.0 + 0.3·1.0 = 1.0.
+        // Distinguish from mean-based: 0.7·0.5 + 0.3·1.0 = 0.65 ≠ 1.0.
+        let expected_max_based = beta * 1.0 + (1.0 - beta) * 1.0;
+        let mean_based_alt = beta * 0.5 + (1.0 - beta) * 1.0;
+        assert!(
+            (state.ema_threshold - expected_max_based).abs() < 1e-3,
+            "τ should follow max-based update: got {}, expected {} (mean-based={})",
+            state.ema_threshold,
+            expected_max_based,
+            mean_based_alt
+        );
+    }
+
+    #[test]
+    fn test_filter_uses_max_sim() {
+        // Verify that the merge filter compares each evicted token's sim
+        // against τ: matches with sim < τ are deleted, sim ≥ τ are merged.
+        // We construct a scenario where τ lands between two evicted sims.
+        //
+        // Layout (4 tokens, prefix=0, target=2, keep_ratio=0.5):
+        //   available = 2, hh_budget = 1, recent_budget = 1
+        //   recent_start = 3 ⇒ pos 3 is the recent window
+        //   pos 0..3 are ranked by importance: pos 2 (10.0) → HH; pos 0,1 → evict
+        // Retain set after partition: {2 (HH), 3 (recent)}.
+        //
+        //   K[0] = e1 → nearest in {2,3} via cosine ⇒ pos 2 (sim = 1.0)
+        //   K[1] = e3 → nearest in {2,3} ⇒ both orthogonal (sim = 0.0)
+        //   τ_0 = mean(1.0, 0.0) = 0.5
+        //   evict 0: sim 1.0 ≥ τ → merged
+        //   evict 1: sim 0.0 < τ → deleted
+        let handler = D2OHandler::new(D2OConfig {
+            keep_ratio: 0.5,
+            protected_prefix: 0,
+            target_ratio: 0.5,
+            ema_beta: 0.7,
+            merge_e: 0.1,
+            use_layer_allocation: false,
+            protected_layers: vec![],
+        });
+        let mut state = D2OState::new();
+
+        let mut cache = make_cache(20, 1, 4, 4);
+        write_k(&mut cache, 0, 0, &[1.0, 0.0, 0.0, 0.0]); // e1
+        write_k(&mut cache, 1, 0, &[0.0, 0.0, 1.0, 0.0]); // e3 (orthogonal to retain set)
+        write_k(&mut cache, 2, 0, &[1.0, 0.0, 0.0, 0.0]); // HH; matches pos 0
+        write_k(&mut cache, 3, 0, &[0.0, 1.0, 0.0, 0.0]); // recent; orthogonal to pos 1
+
+        let importance = vec![0.1, 0.1, 10.0, 9.0];
+        handler
+            .evict_and_merge(&mut cache, 2, &importance, &mut state, true)
+            .unwrap();
+
+        assert!(
+            (state.ema_threshold - 0.5).abs() < 1e-4,
+            "τ_0 expected 0.5, got {}",
+            state.ema_threshold
+        );
+        assert_eq!(
+            state.total_merged, 1,
+            "exactly one evicted token should pass the filter"
+        );
+        assert_eq!(
+            state.total_deleted, 1,
+            "exactly one evicted token should be deleted (sim<τ)"
         );
     }
 
@@ -1378,7 +1485,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: false,
@@ -1457,7 +1563,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: false,
@@ -1515,7 +1620,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 4,
             target_ratio: 0.3, // aggressive
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: false,
@@ -1568,7 +1672,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: false,
@@ -1758,7 +1861,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: false,
@@ -1806,7 +1908,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: false,
@@ -1878,7 +1979,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: false,
@@ -1979,7 +2079,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: true,
@@ -2022,7 +2121,6 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            ema_alpha: 0.5,
             ema_beta: 0.5,
             merge_e: 0.1,
             use_layer_allocation: false,
