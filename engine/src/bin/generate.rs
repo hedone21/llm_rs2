@@ -1539,7 +1539,9 @@ fn main() -> anyhow::Result<()> {
             }
             eprintln!("[KIVI] AWQE + AW-VOPR enabled");
         }
-        let mut hook = llm_rs2::eval::KiviHook::new(qcf_config);
+        // CLI wiring (--enable-qcf-experimental, --qcf-sample-layers) added in Step 6.
+        // Score accumulator injection into KIVI forward path also Step 6.
+        let mut hook = llm_rs2::eval::KiviHook::new(qcf_config, false, vec![0], None);
         let output = llm_rs2::eval::run_eval_ll_generic(
             &model,
             &tokenizer,
