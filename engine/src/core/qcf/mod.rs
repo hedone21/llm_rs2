@@ -5,6 +5,7 @@
 //! A `DegradationEstimator` converts QCF values to estimated PPL increase
 //! via offline-calibrated piecewise-linear coefficients.
 
+pub mod entropy;
 pub mod estimator;
 pub mod layer_importance;
 pub mod quant_qcf;
@@ -12,6 +13,7 @@ pub mod skip_qcf;
 pub mod topk_retention;
 pub mod unified_qcf;
 
+pub use entropy::{EntropyResult, compute_normalized_entropy};
 pub use estimator::DegradationEstimator;
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 pub use quant_qcf::{

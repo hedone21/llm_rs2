@@ -9,8 +9,9 @@ use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::{
-    AggregationMode, QcfActionType, QcfConfig, TopKRetentionResult, UnifiedQcfParams, VDataSource,
-    aggregate_heads, compute_topk_retention, compute_unified_qcf, identify_retained_for_action,
+    AggregationMode, EntropyResult, QcfActionType, QcfConfig, TopKRetentionResult,
+    UnifiedQcfParams, VDataSource, aggregate_heads, compute_normalized_entropy,
+    compute_topk_retention, compute_unified_qcf, identify_retained_for_action,
 };
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
@@ -37,6 +38,12 @@ pub struct ExperimentalQcfPayload {
     pub topk_retention_k50: f32,
     pub topk_retention_weighted_k10: f32,
     pub topk_retention_weighted_k20: f32,
+    // Step 3: Attention entropy + β-amplified CAOTE (ARGUS #6)
+    pub attention_entropy: f32,
+    pub attention_entropy_normalized: f32,
+    pub qcf_beta_amplified_b1: f32,
+    pub qcf_beta_amplified_b1_5: f32,
+    pub qcf_beta_amplified_b2: f32,
 }
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
@@ -357,6 +364,12 @@ impl StepHook<KVCache> for EvictionHook {
                 None
             };
             // Compute retained set before moving `action` into params (experimental path).
+            // Clone action for re-use in β-amplified measurements.
+            let action_for_beta = if self.experimental_enabled {
+                Some(action.clone())
+            } else {
+                None
+            };
             let retained_for_topk = if self.experimental_enabled {
                 Some(identify_retained_for_action(
                     &action,
@@ -378,6 +391,7 @@ impl StepHook<KVCache> for EvictionHook {
                 capacity: cache.capacity(),
                 layout: cache.layout(),
                 aggregation: AggregationMode::Mean,
+                beta: 1.0,
             };
             let (qcf, per_head) = compute_unified_qcf(&params);
 
@@ -398,6 +412,68 @@ impl StepHook<KVCache> for EvictionHook {
                 let r50: TopKRetentionResult =
                     compute_topk_retention(&attention_scores, &evicted_set, 50);
 
+                // Step 3: Attention entropy of flat importance scores.
+                let entropy_result: EntropyResult = compute_normalized_entropy(&attention_scores);
+
+                // Step 3: β-amplified CAOTE at β=1.5 and β=2.0.
+                // β=1.0 is already computed above (qcf). V source must be re-obtained
+                // from the cache because `v_source` was moved into `params`.
+                let qcf_b1 = qcf;
+                let qcf_b1_5 = {
+                    let v_src_b = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref());
+                    if let (Some(vs), Some(act)) = (v_src_b, action_for_beta.clone()) {
+                        let k_src_b = if matches!(act, QcfActionType::MergeD2o { .. }) {
+                            VDataSource::k_from_kv_cache(cache)
+                        } else {
+                            None
+                        };
+                        let p = UnifiedQcfParams {
+                            action: act,
+                            v_source: vs,
+                            k_source: k_src_b,
+                            attention_scores: &attention_scores,
+                            head_attn: head_attn_opt,
+                            n_kv_heads: cache.kv_heads(),
+                            head_dim: cache.head_dim(),
+                            current_pos: before_len,
+                            capacity: cache.capacity(),
+                            layout: cache.layout(),
+                            aggregation: AggregationMode::Mean,
+                            beta: 1.5,
+                        };
+                        compute_unified_qcf(&p).0
+                    } else {
+                        0.0
+                    }
+                };
+                let qcf_b2 = {
+                    let v_src_b = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref());
+                    if let (Some(vs), Some(act)) = (v_src_b, action_for_beta) {
+                        let k_src_b = if matches!(act, QcfActionType::MergeD2o { .. }) {
+                            VDataSource::k_from_kv_cache(cache)
+                        } else {
+                            None
+                        };
+                        let p = UnifiedQcfParams {
+                            action: act,
+                            v_source: vs,
+                            k_source: k_src_b,
+                            attention_scores: &attention_scores,
+                            head_attn: head_attn_opt,
+                            n_kv_heads: cache.kv_heads(),
+                            head_dim: cache.head_dim(),
+                            current_pos: before_len,
+                            capacity: cache.capacity(),
+                            layout: cache.layout(),
+                            aggregation: AggregationMode::Mean,
+                            beta: 2.0,
+                        };
+                        compute_unified_qcf(&p).0
+                    } else {
+                        0.0
+                    }
+                };
+
                 let payload = ExperimentalQcfPayload {
                     caote_max: aggregate_heads(&per_head, &AggregationMode::Max),
                     caote_topk_k3: aggregate_heads(&per_head, &AggregationMode::TopK { k: 3 }),
@@ -415,6 +491,11 @@ impl StepHook<KVCache> for EvictionHook {
                     topk_retention_k50: r50.retention_binary,
                     topk_retention_weighted_k10: r10.retention_weighted,
                     topk_retention_weighted_k20: r20.retention_weighted,
+                    attention_entropy: entropy_result.entropy,
+                    attention_entropy_normalized: entropy_result.entropy_normalized,
+                    qcf_beta_amplified_b1: qcf_b1,
+                    qcf_beta_amplified_b1_5: qcf_b1_5,
+                    qcf_beta_amplified_b2: qcf_b2,
                     per_head,
                 };
                 self.experimental_qcf = Some(payload);
@@ -562,6 +643,12 @@ impl StepHook<KVCache> for EvictionHook {
                 serde_json::json!(exp.topk_retention_weighted_k10);
             obj["qcf_topk_retention_weighted_K20"] =
                 serde_json::json!(exp.topk_retention_weighted_k20);
+            obj["attention_entropy"] = serde_json::json!(exp.attention_entropy);
+            obj["attention_entropy_normalized"] =
+                serde_json::json!(exp.attention_entropy_normalized);
+            obj["qcf_beta_amplified_b1"] = serde_json::json!(exp.qcf_beta_amplified_b1);
+            obj["qcf_beta_amplified_b1_5"] = serde_json::json!(exp.qcf_beta_amplified_b1_5);
+            obj["qcf_beta_amplified_b2"] = serde_json::json!(exp.qcf_beta_amplified_b2);
         }
         obj
     }

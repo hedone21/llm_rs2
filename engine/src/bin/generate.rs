@@ -6673,6 +6673,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                     capacity: cache.capacity(),
                     layout: cache.layout(),
                     aggregation: AggregationMode::Mean,
+                    beta: 1.0,
                 };
                 let (qcf, _) = compute_unified_qcf(&params);
                 estimates.insert(id.to_string(), qcf);
@@ -8849,6 +8850,7 @@ fn run_ppl(
                                     capacity: cache.capacity(),
                                     layout: cache.layout(),
                                     aggregation: AggregationMode::Mean,
+                                    beta: 1.0,
                                 };
                                 let (qcf, _) = compute_unified_qcf(&params);
                                 qcf as f64
