@@ -3224,6 +3224,15 @@ fn main() -> anyhow::Result<()> {
                     iteration, entry.id, prompt_tokens
                 );
 
+                // Per-record budget when --kv-budget-ratio is active
+                // (mirrors eval-ll path eval_loop.rs:207). Without this the hook
+                // sees effective_budget=0 and post_prefill early-returns,
+                // suppressing eviction and ARGUS metric collection.
+                if pb_ratio_mode {
+                    let dynamic_budget = ((prompt_tokens as f32) * args.kv_budget_ratio) as usize;
+                    hook.set_effective_budget(dynamic_budget.max(1));
+                }
+
                 let entry_start = std::time::Instant::now();
 
                 eprintln!(
@@ -3692,6 +3701,55 @@ fn main() -> anyhow::Result<()> {
                 );
                 batch_tokens.push(next_token_id);
                 let mut batch_start_pos = process_len;
+
+                // ── Score collection probe ──
+                // Mirrors eval_loop.rs:246~287. Batch prefill calls forward with
+                // workspace=None, so the hook's score_accumulator stays empty
+                // → ARGUS metrics fall back to defaults (0). Re-feed the last
+                // prompt token as a 1-step decode forward to populate per-head
+                // attention scores, then restore current_pos so cache state
+                // matches prompt_tokens (probe entry beyond current_pos is
+                // invisible to subsequent forward calls).
+                use llm_rs2::core::kv_cache::KVCacheOps;
+                if hook.needs_score_probe(&kv_caches) {
+                    let saved_positions: Vec<usize> =
+                        kv_caches.iter().map(|c| c.current_pos()).collect();
+                    let last_prompt_token = batch_input_ids[prompt_tokens - 1];
+                    unsafe {
+                        *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_prompt_token;
+                    }
+                    backend.write_buffer(&mut gen_input_tensor, unsafe {
+                        std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+                    })?;
+                    if let Some(acc) = hook.score_accumulator() {
+                        acc.begin_step();
+                    }
+                    let probe_mem: &dyn Memory = if is_gpu {
+                        memory.as_ref()
+                    } else {
+                        cpu_memory_arc.as_ref()
+                    };
+                    model.forward_into(TransformerModelForwardArgs {
+                        input_tokens: &gen_input_tensor,
+                        start_pos: prompt_tokens - 1,
+                        kv_caches: &mut kv_caches,
+                        backend: &backend,
+                        memory: probe_mem,
+                        logits_out: &mut logits,
+                        x_gen: Some(&mut x_gen),
+                        workspace: Some(&mut gen_ws),
+                        score_accumulator: hook.score_accumulator(),
+                        profiler: None,
+                        skip_config: skip_config.as_ref(),
+                        importance_collector: None,
+                        logits_last_only: false,
+                        variance_collector: None,
+                        prefill_workspace: None,
+                    })?;
+                    for (cache, &pos) in kv_caches.iter_mut().zip(saved_positions.iter()) {
+                        cache.set_current_pos(pos);
+                    }
+                }
 
                 // ARGUS Step1~6: compute experimental_qcf payload from prefill state.
                 // Also triggers post-prefill eviction when budget exceeded.
