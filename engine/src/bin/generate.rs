@@ -1731,18 +1731,6 @@ fn main() -> anyhow::Result<()> {
         ),
     };
 
-    // CUDA + KV F32 fail-fast guard. The CUDA backend's F32 KV write path produces
-    // garbage (PPL ~10^5 vs CPU 7.09); root cause not yet fixed. See
-    // /tmp/issue2_cuda_kv_f32_ppl_explosion.md. Reject early to prevent silent
-    // corruption of measurements; use --kv-type f16 on CUDA, or switch to CPU for f32.
-    if args.backend == "cuda" && kv_type == DType::F32 {
-        anyhow::bail!(
-            "CUDA backend with --kv-type f32 currently produces garbage output \
-             (forward pass corruption, PPL explodes ~10^5). Use --kv-type f16 on CUDA, \
-             or run on CPU backend for f32 KV cache."
-        );
-    }
-
     // Note: flash_attn_f32_f16 is compiled for DK ∈ {64, 128} only, but both
     // CUDA naive attention (attention_gen_f16kv_naive) and CPU fallback attention
     // support F16 KV for any head_dim. No auto-promotion needed.
