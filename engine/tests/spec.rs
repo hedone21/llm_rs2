@@ -229,3 +229,11 @@ mod test_inv_143_borrow_buffer_lifetime;
 // ratio < 1.0 swap batch에서 비대상 layer 페이지 접근 ~40 ms 절감.
 #[path = "spec/test_eng_alg_229_targeted_prefault.rs"]
 mod test_eng_alg_229_targeted_prefault;
+
+// ── WSWAP-6-PREFAULT Eager prefault at model load ──
+// SecondaryMmap::prefault() at model load time to eliminate per-swap cold page
+// faults (~328 ms on Galaxy S25). CLI: --eager-prefault-secondary.
+// Scenarios: valid secondary (no-panic + data intact), idempotent double-call,
+// silent-skip when no secondary is configured.
+#[path = "spec/test_eng_alg_232_eager_prefault.rs"]
+mod test_eng_alg_232_eager_prefault;

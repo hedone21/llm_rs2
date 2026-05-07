@@ -846,6 +846,21 @@ struct Args {
     /// τ values for defensive aggregation. Fixed [0.1, 0.5] in dump.
     #[arg(long, value_delimiter = ',', default_value = "0.1,0.5")]
     qcf_defensive_taus: Vec<f32>,
+
+    /// Eagerly prefault the secondary weight file at model load to remove
+    /// per-swap prefault stage cost. Memory commit ≈ AUF size (e.g. 1.2 GB
+    /// for Qwen2.5-1.5B Q4_0). Default off; set when --secondary-gguf is
+    /// present and on-device app has memory headroom.
+    ///
+    /// When enabled: immediately after model weights are loaded, the full
+    /// secondary weight region is touched (madvise WILLNEED + explicit
+    /// page-touch). Subsequent swap invocations find all pages already in
+    /// the page cache, eliminating the ~328 ms cold-fault stage measured on
+    /// Galaxy S25 (§3.1, swap_overhead_s25.md).
+    ///
+    /// When `--secondary-gguf` is absent this flag is silently ignored.
+    #[arg(long, default_value_t = false)]
+    eager_prefault_secondary: bool,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -1235,6 +1250,29 @@ fn main() -> anyhow::Result<()> {
     // Tester pulls this file to analyse kgsl/ion/dmabuf VMA distribution.
     if std::env::var("LLMRS_DUMP_SMAPS_T1").is_ok() {
         dump_smaps("T1_model_loaded");
+    }
+
+    // WSWAP-6-PREFAULT: eager prefault of the secondary weight file.
+    //
+    // When --eager-prefault-secondary is set, touch all secondary weight pages
+    // immediately after model load so that subsequent swap invocations hit the
+    // page cache instead of incurring cold page faults (~328 ms on Galaxy S25,
+    // §3.1 swap_overhead_s25.md). This is a one-time upfront cost traded for
+    // per-swap latency elimination.
+    //
+    // Memory commit ≈ AUF/GGUF secondary size (e.g. 1.2 GB for Q4_0 1.5B).
+    // Default OFF to protect memory-constrained environments.
+    if args.eager_prefault_secondary {
+        if let Some(ref secondary) = model.secondary_mmap {
+            let t0 = std::time::Instant::now();
+            secondary.prefault();
+            eprintln!(
+                "[Eager-Prefault] secondary weights prefaulted in {:.1}ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        } else {
+            eprintln!("[Eager-Prefault] no secondary configured, skipping");
+        }
     }
 
     // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory.
