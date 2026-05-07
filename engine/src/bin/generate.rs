@@ -3069,6 +3069,46 @@ fn main() -> anyhow::Result<()> {
             batch_path
         );
 
+        // ARGUS hook: emit Step1~6 metrics (qcf_caote_max / qcf_per_head /
+        // qcf_topk_retention_* / attention_entropy / qcf_beta_amplified_* /
+        // qcf_per_layer*) per record, alongside legacy fields.
+        // Hook owns cache_manager + score_accumulator from here; subsequent
+        // forward calls in this branch route score_accumulator through the hook.
+        use llm_rs2::eval::StepHook;
+        let pb_qcf_mode_enum = match args.qcf_mode.as_str() {
+            "caote" => llm_rs2::core::qcf::QcfMode::Caote,
+            "both" => llm_rs2::core::qcf::QcfMode::Both,
+            _ => llm_rs2::core::qcf::QcfMode::Attn,
+        };
+        let pb_qcf_config = llm_rs2::core::qcf::QcfConfig {
+            mode: pb_qcf_mode_enum,
+            ..llm_rs2::core::qcf::QcfConfig::default()
+        };
+        let pb_ratio_mode = args.kv_budget_ratio > 0.0;
+        let pb_hook_budget = if pb_ratio_mode { 0 } else { args.kv_budget };
+        let pb_is_d2o = args.eviction_policy == "d2o";
+        let pb_num_layers = model.config.num_hidden_layers;
+        let pb_sample_layers = if args.enable_qcf_experimental {
+            parse_qcf_sample_layers(&args.qcf_sample_layers, pb_num_layers)
+                .map_err(|e| anyhow::anyhow!("--qcf-sample-layers: {e}"))?
+        } else {
+            vec![0]
+        };
+        let mut hook = llm_rs2::eval::EvictionHook::new(
+            cache_manager,
+            score_accumulator.take(),
+            pb_qcf_config,
+            pb_hook_budget,
+            actual_protected_prefix,
+            score_based_eviction,
+            args.h2o_keep_ratio,
+            pb_is_d2o,
+            args.kv_type.clone(),
+            backend.clone(),
+            args.enable_qcf_experimental,
+            pb_sample_layers,
+        );
+
         let mut iteration = 0usize;
 
         // Pre-allocate generation buffers (once)
@@ -3320,7 +3360,7 @@ fn main() -> anyhow::Result<()> {
                         logits_out: &mut prefill_logits,
                         x_gen: None,
                         workspace: None,
-                        score_accumulator: None,
+                        score_accumulator: hook.score_accumulator(),
                         profiler: None,
                         skip_config: skip_config.as_ref(),
                         importance_collector: None,
@@ -3393,7 +3433,7 @@ fn main() -> anyhow::Result<()> {
                                     logits_out: &mut cpu_logits,
                                     x_gen: None,
                                     workspace: None,
-                                    score_accumulator: None,
+                                    score_accumulator: hook.score_accumulator(),
                                     profiler: None,
                                     skip_config: skip_config.as_ref(),
                                     importance_collector: None,
@@ -3653,6 +3693,10 @@ fn main() -> anyhow::Result<()> {
                 batch_tokens.push(next_token_id);
                 let mut batch_start_pos = process_len;
 
+                // ARGUS Step1~6: compute experimental_qcf payload from prefill state.
+                // Also triggers post-prefill eviction when budget exceeded.
+                hook.post_prefill(&mut kv_caches);
+
                 eprintln!(
                     "[Batch] #{} id={} prefill_end ts={:.3}",
                     iteration,
@@ -3709,7 +3753,7 @@ fn main() -> anyhow::Result<()> {
                         logits_out: &mut logits,
                         x_gen: Some(&mut x_gen),
                         workspace: Some(&mut gen_ws),
-                        score_accumulator: None,
+                        score_accumulator: hook.score_accumulator(),
                         profiler: None,
                         skip_config: skip_config.as_ref(),
                         importance_collector: None,
@@ -3718,6 +3762,7 @@ fn main() -> anyhow::Result<()> {
                         prefill_workspace: None,
                     })?;
                     backend.synchronize()?;
+                    hook.post_decode_step(&mut kv_caches, generated_count);
 
                     let now = std::time::Instant::now();
                     let tbt = (now - last_token_time).as_secs_f64() * 1000.0;
@@ -3767,7 +3812,7 @@ fn main() -> anyhow::Result<()> {
                 let text = tokenizer.decode(generated_ids, true).unwrap_or_default();
 
                 // Output JSONL
-                let result = serde_json::json!({
+                let mut result = serde_json::json!({
                     "id": entry.id,
                     "prompt_tokens": prompt_tokens,
                     "generated_tokens": generated_count,
@@ -3776,6 +3821,16 @@ fn main() -> anyhow::Result<()> {
                     "total_ms": (total_ms * 100.0).round() / 100.0,
                     "text": text,
                 });
+                // Merge ARGUS Step1~6 fields (qcf_caote_max / qcf_per_head /
+                // qcf_topk_retention_* / attention_entropy / qcf_beta_amplified_* /
+                // qcf_per_layer*) when --enable-qcf-experimental is on.
+                if let serde_json::Value::Object(extra_map) = hook.extra_question_fields(&kv_caches)
+                    && let serde_json::Value::Object(ref mut rmap) = result
+                {
+                    for (k, v) in extra_map {
+                        rmap.insert(k, v);
+                    }
+                }
                 println!("{}", serde_json::to_string(&result)?);
 
                 eprintln!(
@@ -3783,15 +3838,8 @@ fn main() -> anyhow::Result<()> {
                     iteration, entry.id, generated_count, ttft_ms, mean_tbt_ms, total_ms
                 );
 
-                // === RESET KV CACHE ===
-                for cache in kv_caches.iter_mut() {
-                    cache.current_pos = 0;
-                    cache.high_water_pos = 0;
-                }
-                // Reset score accumulator if active
-                if let Some(ref mut acc) = score_accumulator {
-                    acc.reset();
-                }
+                // === RESET KV CACHE + score accumulator + per-record hook state ===
+                hook.reset_caches(&mut kv_caches);
 
                 iteration += 1;
             }
