@@ -1494,6 +1494,67 @@ impl Backend for CudaBackend {
             .map_err(|e| anyhow!("CUDA synchronize failed: {e}"))
     }
 
+    fn copy_slice(
+        &self,
+        src: &Tensor,
+        dst: &mut Tensor,
+        src_offset: usize,
+        dst_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        let type_size = match src.dtype() {
+            DType::F32 => 4,
+            DType::F16 => 2,
+            DType::U8 => 1,
+            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+            _ => 1,
+        };
+        let byte_count = count * type_size;
+        let src_byte_offset = src_offset * type_size;
+        let dst_byte_offset = dst_offset * type_size;
+
+        let src_dev = Self::get_device_ptr(src.buffer().as_ref());
+        let dst_dev = Self::get_device_ptr(dst.buffer().as_ref());
+
+        if let (Some(s), Some(d)) = (src_dev, dst_dev) {
+            // Device-to-device copy. Sync first so prior compute (RoPE, matmul)
+            // that wrote into `src`/`dst` on the default stream is observed.
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
+            unsafe {
+                let res = cuda_sys::cuMemcpyDtoD_v2(
+                    d + dst_byte_offset as cuda_sys::CUdeviceptr,
+                    s + src_byte_offset as cuda_sys::CUdeviceptr,
+                    byte_count,
+                );
+                if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                    anyhow::bail!("cuMemcpyDtoD_v2 failed: {:?}", res);
+                }
+            }
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
+            Ok(())
+        } else {
+            // No device pointer on at least one side — host memcpy fallback (CPU buffers).
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
+            let src_ptr = src.as_ptr();
+            let dst_ptr = dst.as_mut_ptr();
+            if src_ptr.is_null() || dst_ptr.is_null() {
+                anyhow::bail!(
+                    "copy_slice: missing device ptr and missing host ptr (src null={}, dst null={})",
+                    src_ptr.is_null(),
+                    dst_ptr.is_null()
+                );
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(src_byte_offset),
+                    dst_ptr.add(dst_byte_offset),
+                    byte_count,
+                );
+            }
+            Ok(())
+        }
+    }
+
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
         self.synchronize()?;
         if let Some(db) = t.buffer().as_any().downcast_ref::<CudaDeviceBuffer>() {
