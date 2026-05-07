@@ -591,24 +591,25 @@ impl<'a> SwapExecutor<'a> {
                 // GGUF / AUF AOS path: intentionally do NOT register noshuffle
                 // SOA entries here.
                 //
-                // Adreno regression: `convert_q4_0_to_noshuffle` GPU kernel +
-                // `matmul_q4_0_noshuffle` GEMV produce incorrect output on
-                // swap-installed AOS Q4_0 weights. The host-NVIDIA byte-equal
-                // INV-140 test does not exercise the Adreno layout difference
-                // and missed the regression at introduction time
-                // (commit 4416994, 2026-05-01 AOS swap variant) and again at
-                // ENG-ALG-226 fused kernel introduction (Phase 6.5).
+                // Adreno regression: even with the fused kernel disabled (see
+                // `OpenCLBackend::convert_q4_0_to_noshuffle`), routing the
+                // swap-time tensor through the noshuffle GEMV path interacts
+                // poorly with the swap-time `UnifiedBuffer` cl_mem and yields
+                // garbage decode output. Default Q4_0 GGUF load works only
+                // because `prepare_noshuffle_buffers` has a separate clone-
+                // discard bug that drops the NoshuffleWeightBuffer
+                // replacement, so matmul lookups miss and standard
+                // `kernel_mul_mat_q4_0_f32` runs (correct on AOS bytes).
                 //
-                // With the registry empty for these tensors, `matmul_q4_0`
-                // falls through to the standard `kernel_mul_mat_q4_0_f32`
-                // GEMV which reads AOS bytes directly and produces correct
-                // output — the same path that the Q4_0 GGUF default load
-                // takes (its noshuffle replacement is silently discarded by
-                // a local-clone bug in `prepare_noshuffle_buffers`).
+                // Skipping registration here makes the swap path mirror the
+                // accidentally-working Q4_0 GGUF default path. Re-enabling
+                // requires fixing both the Adreno noshuffle GEMV regression
+                // and the `prepare_noshuffle_buffers` clone discard.
                 //
-                // Tracking: <issue ref TBD>. Removing this guard requires
-                // both fixing the Adreno noshuffle path AND extending
-                // INV-140 to run on-device.
+                // Diagnostic: `bin/test_q4_soa_byte_equal` exercises the
+                // convert kernel byte-equal contract on-device and
+                // currently confirms the legacy 4-step path is correct
+                // while the fused path corrupts ~43 % of q_buf bytes.
             }
             stages.soa_reconvert_ms += t_d0.elapsed().as_secs_f64() * 1e3;
 

@@ -381,8 +381,14 @@ fn empty_batch_ordering_invariants_hold() {
 
     // No swap happened → stage gate must be bypassed entirely.
     assert!(report.swapped.is_empty());
-    assert!(!mock.synchronize_was_called(), "synchronize must not fire on empty batch");
-    assert!(!mock.invalidate_was_called(), "invalidate must not fire on empty batch");
+    assert!(
+        !mock.synchronize_was_called(),
+        "synchronize must not fire on empty batch"
+    );
+    assert!(
+        !mock.invalidate_was_called(),
+        "invalidate must not fire on empty batch"
+    );
     assert_eq!(
         ratio_gen.load(Ordering::SeqCst),
         7,

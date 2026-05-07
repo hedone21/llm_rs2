@@ -2433,12 +2433,38 @@ impl OpenCLBackend {
         // We additionally require num_blocks == ne01 * blocks_per_row to
         // catch caller mismatches (the kernel divides gid by blocks_per_row
         // to recover row, which would be wrong if num_blocks were inflated).
-        let fused_eligible = kernels.kernel_cvt_q4_0_noshuffle_fused.is_some()
+        // ENG-ALG-226 fused kernel is force-disabled on every backend until
+        // the Adreno-specific corruption is understood and fixed. Both the
+        // original per-row variant and a uint-store row-pair rewrite exhibit
+        // the same ~43 % q_buf byte divergence vs the host CPU reference
+        // (`q4_0_aos_to_adreno_soa`) on SM8750 / Adreno 830 — the legacy
+        // 4-step path is byte-equal. The kernel source and the host probe
+        // (`bin/test_q4_soa_byte_equal`) are kept so the regression can be
+        // re-exercised once a fix lands. `LLMRS_FORCE_LEGACY_CVT=1` opts
+        // out for diagnostic comparisons; `LLMRS_ENABLE_FUSED_CVT=1` opts
+        // in to the (broken) fused path for the same purpose.
+        let force_legacy = std::env::var("LLMRS_FORCE_LEGACY_CVT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let opt_in_fused = std::env::var("LLMRS_ENABLE_FUSED_CVT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let fused_eligible = !force_legacy
+            && opt_in_fused
+            && kernels.kernel_cvt_q4_0_noshuffle_fused.is_some()
             && ne00.is_multiple_of(32)
+            && ne01.is_multiple_of(2)
             && num_blocks == ne01 * blocks_per_row;
 
         if fused_eligible {
-            // ── ENG-ALG-226 fused path ────────────────────────────────────
+            // ── ENG-ALG-226 fused path (v2: row-pair uint stores) ─────────
+            // Each work-item processes 2 adjacent rows × 1 K-block, packing
+            // outputs into 4-byte aligned uint stores. Global size therefore
+            // halves. The row-pair restructure was needed to dodge an
+            // Adreno-specific race where parallel ushort stores to adjacent
+            // addresses corrupt each other's high byte (~43% q_buf
+            // divergence on SM8750 / Adreno 830 with the prior per-row
+            // dispatch).
             let fused_kernel = kernels.kernel_cvt_q4_0_noshuffle_fused.as_ref().unwrap();
             unsafe {
                 ocl::core::set_kernel_arg(fused_kernel, 0, ocl::core::ArgVal::mem(src))?;
@@ -2455,7 +2481,7 @@ impl OpenCLBackend {
                     ocl::core::ArgVal::scalar(&(blocks_per_row as u32)),
                 )?;
 
-                let global_work_size: [usize; 3] = [num_blocks, 1, 1];
+                let global_work_size: [usize; 3] = [(ne01 / 2) * blocks_per_row, 1, 1];
                 self.enqueue_kernel_labeled(fused_kernel, "load_time", 1, &global_work_size, None)?;
             }
             // NOTE: ENG-ALG-230 / INV-142 — no `queue.finish()` here. The

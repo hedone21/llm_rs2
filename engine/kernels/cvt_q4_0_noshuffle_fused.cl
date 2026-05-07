@@ -42,16 +42,16 @@
 //     ushort idx u (u ∈ [0,8)) = (out_byte[2u + 1] << 8) | out_byte[2u + 0]
 //
 // Dispatch:
-//   global_size = num_blocks (= ne01 * blocks_per_row), 1-D.
-//   Each work-item handles exactly one source block. Per-thread state:
-//     - 16 uchar source nibbles (loaded as uint4 worth of bytes)
-//     - 16 uchar rearranged bytes
-//     - 8 ushort output values
-//   ≈ 12 scalar registers ≈ 3 float4 equivalents → far below the per-thread
-//   32 float4 register-spill ceiling on Adreno (CLAUDE.md feedback).
-//
+//   global_size = (ne01/2) * blocks_per_row, 1-D.
+//   Each work-item handles a ROW PAIR (2 adjacent rows) at one k-block, so
+//   the 8 q-output ushorts for the two rows can be packed and written as
+//   8 uint stores (4-byte aligned). This avoids the Adreno race on
+//   parallel ushort stores to adjacent addresses (verified on SM8750 /
+//   Adreno 830: per-row work-item version had ~43% q_buf bytes diverge
+//   from CPU reference; row-pair uint-write fixes it).
+//   ne01 is required to be even for this kernel; the host falls back to
+//   the 4-step legacy path otherwise.
 //   No subgroup reductions, no SLM. Pure scalar per-thread fan-out write.
-//   Adreno OpenCL compiler should keep this in register-only state.
 //------------------------------------------------------------------------------
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
@@ -89,47 +89,89 @@ __kernel void kernel_convert_block_q4_0_noshuffle_fused(
 {
     const uint gid = get_global_id(0);
 
-    // Decompose linear block index into (row, k).
-    //   gid = row * blocks_per_row + k
-    const uint row = gid / blocks_per_row;
-    const uint k   = gid - row * blocks_per_row;
+    // Decompose linear pair index into (pair, k).
+    //   gid = pair * blocks_per_row + k    where pair = row_pair_idx, 2*pair = even row
+    const uint pair = gid / blocks_per_row;
+    const uint k    = gid - pair * blocks_per_row;
+    const uint half_ne01 = ne01 >> 1;
 
-    // Bounds check (in case global_size is rounded up by the host launcher).
-    if (row >= ne01) {
+    // Bounds check (host clamps but be defensive).
+    if (pair >= half_ne01) {
         return;
     }
 
-    __global const struct block_q4_0 * b = src + gid;
+    const uint row_a = pair * 2u;     // even row
+    const uint row_b = row_a + 1u;    // odd row
 
-    // ── d: write `b->d` to col-major position d_t[k * ne01 + row] ────────────
-    dst_d[k * ne01 + row] = b->d;
+    __global const struct block_q4_0 * b_a = src + row_a * blocks_per_row + k;
+    __global const struct block_q4_0 * b_b = src + row_b * blocks_per_row + k;
 
-    // ── q: nibble rearrange + col-major scatter ──────────────────────────────
+    // ── d: pack two halves into a uint store at d_t[k*ne01 + row_a..row_a+1] ──
+    // dst_d is `half *`; viewing it as `uint *` aligns each write at a row
+    // pair boundary. Address: (k * ne01 + row_a) / 2 = k * half_ne01 + pair.
+    __global uint * dst_d_uint = (__global uint *)dst_d;
+    const uint d_packed = ((uint)as_ushort(b_a->d))
+                        | ((uint)as_ushort(b_b->d) << 16);
+    dst_d_uint[k * half_ne01 + pair] = d_packed;
+
+    // ── q: nibble rearrange + col-major scatter (uint stores per row pair) ──
     //
-    // Read the 16 source bytes. Use scalar loads — uchar16 vload would also
-    // work but Adreno often emits the same code path, and scalar keeps the
-    // output pattern unambiguous for the compiler's DCE.
-    uchar out[16];
-
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        uchar x0 = b->qs[2*i + 0];
-        uchar x1 = b->qs[2*i + 1];
-
-        // convert_uchar() preserves Adreno's pattern from cvt.cl. The original
-        // kernel relies on these explicit conversions to coax the compiler
-        // into producing correct code on QC's OpenCL stack.
-        out[i + 0] = convert_uchar( (x0 & 0x0F) | ((x1 & 0x0F) << 4) );
-        out[i + 8] = convert_uchar( ((x0 & 0xF0) >> 4) |  (x1 & 0xF0)  );
-    }
-
-    // Repack 16 bytes as 8 little-endian ushorts and scatter to col-major
-    // positions q_t[col * ne01 + row], col = k*8 + u, u ∈ [0, 8).
+    // For each output column u ∈ [0, 8) we produce one ushort for row_a and
+    // one ushort for row_b, then pack them into a single uint and store at
+    // address (k*8 + u) * (ne01/2) + pair. This guarantees 4-byte aligned
+    // stores from each work-item and prevents the Adreno-specific race that
+    // corrupts the high byte of every ushort when adjacent ushorts are
+    // written by parallel work-items (verified ~43% q_buf divergence with
+    // the per-row variant; uint-pair writes fixed it).
+    //
+    // Per-block unshuffle:
+    //   lo(i) = (qs[2i] & 0x0F) | ((qs[2i+1] & 0x0F) << 4)        i ∈ [0, 8)
+    //   hi(i) = ((qs[2i] & 0xF0) >> 4) | (qs[2i+1] & 0xF0)
+    // ushort layout (per row, packed little-endian):
+    //   u=0..3 → (lo(2u), lo(2u+1))
+    //   u=4..7 → (hi(2(u-4)), hi(2(u-4)+1))
+    __global uint * dst_q_uint = (__global uint *)dst_q;
     const uint base_col = k * 8u;
 
+    // Helper macro: pack one ushort from two unshuffle outputs (lo/hi).
+    // Each ushort is built from FOUR source bytes drawn from a single block.
+    //
+    // Args: BL = block pointer (b_a or b_b), MASK_HI = 0/1 selecting low
+    // nibble (0) or high nibble (1) variant, IDX_BASE = 2*u or 2*(u-4).
+    // Returns ushort value.
+    #define PACK_USHORT(BL, MASK_HI, IDX_BASE) ({                           \
+        const uchar _x0a = (BL)->qs[2*((IDX_BASE) + 0) + 0];                \
+        const uchar _x1a = (BL)->qs[2*((IDX_BASE) + 0) + 1];                \
+        const uchar _x0b = (BL)->qs[2*((IDX_BASE) + 1) + 0];                \
+        const uchar _x1b = (BL)->qs[2*((IDX_BASE) + 1) + 1];                \
+        uchar _lo, _hi;                                                     \
+        if ((MASK_HI) == 0) {                                               \
+            _lo = (uchar)((_x0a & 0x0F) | ((_x1a & 0x0F) << 4));            \
+            _hi = (uchar)((_x0b & 0x0F) | ((_x1b & 0x0F) << 4));            \
+        } else {                                                            \
+            _lo = (uchar)(((_x0a & 0xF0) >> 4) | (_x1a & 0xF0));            \
+            _hi = (uchar)(((_x0b & 0xF0) >> 4) | (_x1b & 0xF0));            \
+        }                                                                   \
+        ((ushort)_lo | ((ushort)_hi << 8));                                 \
+    })
+
+    // u in [0, 4): low-nibble half (lo bytes)
     #pragma unroll
-    for (int u = 0; u < 8; ++u) {
-        ushort v = (ushort)out[2*u + 0] | ((ushort)out[2*u + 1] << 8);
-        dst_q[(base_col + (uint)u) * ne01 + row] = v;
+    for (int u = 0; u < 4; ++u) {
+        const ushort v_a = PACK_USHORT(b_a, 0, 2*u);
+        const ushort v_b = PACK_USHORT(b_b, 0, 2*u);
+        const uint packed = (uint)v_a | ((uint)v_b << 16);
+        dst_q_uint[(base_col + (uint)u) * half_ne01 + pair] = packed;
     }
+
+    // u in [4, 8): high-nibble half (hi bytes)
+    #pragma unroll
+    for (int u = 4; u < 8; ++u) {
+        const ushort v_a = PACK_USHORT(b_a, 1, 2*(u - 4));
+        const ushort v_b = PACK_USHORT(b_b, 1, 2*(u - 4));
+        const uint packed = (uint)v_a | ((uint)v_b << 16);
+        dst_q_uint[(base_col + (uint)u) * half_ne01 + pair] = packed;
+    }
+
+    #undef PACK_USHORT
 }
