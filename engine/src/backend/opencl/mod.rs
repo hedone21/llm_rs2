@@ -188,6 +188,8 @@ pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
         "SliceBuffer"
     } else if any.is::<crate::buffer::mmap_buffer::MmapBuffer>() {
         "MmapBuffer"
+    } else if any.is::<crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer>() {
+        "BorrowedMmapBuffer"
     } else {
         "Unknown"
     }
