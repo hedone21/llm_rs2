@@ -6756,11 +6756,14 @@ fn run_layer_swap(
     let swap_memory = Galloc::new();
     let swap_backend: Arc<dyn Backend> =
         gpu_backend.cloned().unwrap_or_else(|| cpu_backend.clone());
-    let executor = llm_rs2::models::weights::SwapExecutor::new(
+    // ENG-ALG-228: attach the model's async release worker so Stage (c) enqueues
+    // displaced LayerWeights for background drop instead of blocking inline.
+    let executor = llm_rs2::models::weights::SwapExecutor::new_with_worker(
         DType::Q4_0,
         &model.config,
         swap_backend,
         &swap_memory,
+        Arc::clone(&model.release_worker),
     );
     executor.execute(model, target_layers)
 }
@@ -7046,7 +7049,22 @@ fn dispatch_swap_weights(
             });
         }
         Err(e) => {
-            eprintln!("[WeightSwap] execute failed: {}", e);
+            // ENG-ALG-228: surface drain timeout distinctly so operators know
+            // the swap was rejected due to INV-141 rather than a data error.
+            if let llm_rs2::models::weights::SwapError::ReleaseDrainTimeout {
+                pending,
+                timeout_ms,
+            } = &e
+            {
+                eprintln!(
+                    "[WeightSwap] REJECTED (INV-141): release worker still has {} \
+                     pending job(s) after {}ms drain — swap skipped to prevent \
+                     memory leak accumulation",
+                    pending, timeout_ms
+                );
+            } else {
+                eprintln!("[WeightSwap] execute failed: {}", e);
+            }
         }
     }
 }

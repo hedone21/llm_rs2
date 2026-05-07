@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use llm_shared::DtypeTag;
@@ -32,6 +32,7 @@ use crate::layers::transformer_layer::TransformerLayer;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
 use crate::models::transformer::TransformerModel;
+use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
 
 /// Errors surfaced by `SwapExecutor::execute`.
@@ -52,6 +53,10 @@ pub enum SwapError {
     /// (reserved variants — INV-126). The variant name is included for
     /// diagnostics.
     UnsupportedDtype(DtypeTag),
+    /// INV-141: `PrimaryReleaseWorker` still has pending drop jobs from the
+    /// previous batch when the next batch attempts to start. Swap is rejected
+    /// to prevent memory leak accumulation.
+    ReleaseDrainTimeout { pending: usize, timeout_ms: u64 },
 }
 
 impl std::fmt::Display for SwapError {
@@ -80,6 +85,13 @@ impl std::fmt::Display for SwapError {
                     "unsupported target dtype: {tag:?} (INV-126 reserved variant)"
                 )
             }
+            SwapError::ReleaseDrainTimeout {
+                pending,
+                timeout_ms,
+            } => write!(
+                f,
+                "primary release worker drain timeout: {pending} jobs remaining after {timeout_ms}ms"
+            ),
         }
     }
 }
@@ -196,6 +208,12 @@ pub struct SwapExecutor<'a> {
     /// Memory allocator paired with `backend`. Used for the permutation
     /// fallback path when we have to materialise an owned buffer.
     pub memory: &'a dyn Memory,
+    /// Optional async release worker (ENG-ALG-228 / ENG-DAT-100).
+    ///
+    /// When `Some`, Stage (c) enqueues displaced `LayerWeights` here instead
+    /// of dropping inline. INV-141 is verified at the top of each batch.
+    /// `None` → original inline drop path (host tests, CPU backend fallback).
+    pub release_worker: Option<Arc<PrimaryReleaseWorker>>,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -213,6 +231,28 @@ impl<'a> SwapExecutor<'a> {
             config,
             backend,
             memory,
+            release_worker: None,
+        }
+    }
+
+    /// Construct an executor with an async release worker attached (ENG-ALG-228).
+    ///
+    /// Use this constructor in production paths where the `TransformerModel`
+    /// owns a `PrimaryReleaseWorker`. Stage (c) will enqueue displaced layers
+    /// to the worker instead of dropping inline.
+    pub fn new_with_worker(
+        target_dtype: DType,
+        config: &'a ModelConfig,
+        backend: Arc<dyn Backend>,
+        memory: &'a dyn Memory,
+        release_worker: Arc<PrimaryReleaseWorker>,
+    ) -> Self {
+        Self {
+            target_dtype,
+            config,
+            backend,
+            memory,
+            release_worker: Some(release_worker),
         }
     }
 
@@ -279,6 +319,25 @@ impl<'a> SwapExecutor<'a> {
     ) -> Result<SwapReport, SwapError> {
         let start = Instant::now();
         let mut report = SwapReport::default();
+
+        // ── INV-141: drain previous batch's pending releases before starting ──
+        // Ensures no primary cl_mem from batch N is still being dropped when
+        // batch N+1 tries to swap. If drain times out, reject the batch to
+        // prevent accumulating memory leaks.
+        if let Some(worker) = &self.release_worker {
+            let pending = worker.pending_count();
+            if pending > 0 {
+                match worker.drain(Duration::from_millis(50)) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        return Err(SwapError::ReleaseDrainTimeout {
+                            pending: e.pending,
+                            timeout_ms: e.timeout_ms,
+                        });
+                    }
+                }
+            }
+        }
 
         // ENG-DAT-C09: secondary handle absent → entire operation is a no-op.
         let Some(secondary) = secondary_mmap else {
@@ -362,10 +421,29 @@ impl<'a> SwapExecutor<'a> {
             // ENG-ALG-211 step (c) refined; `Self::madvise_if_exclusive`
             // remains the fallback path so MADV_DONTNEED still fires on
             // mmap-backed primaries when we can't acquire unique ownership.
+            // ── Stage (c): Primary cl_mem release / deferred enqueue ─────────
+            //
+            // ENG-ALG-228: when a `PrimaryReleaseWorker` is attached, enqueue
+            // the displaced `LayerWeights` for asynchronous drop on the worker
+            // thread instead of blocking inline. The worker calls
+            // `clReleaseMemObject` off the critical path (~1 ms × 7 tensors per
+            // layer on Adreno). `stages.madvise_ms` then only records the
+            // enqueue cost (nanoseconds) rather than the full release chain.
+            //
+            // Fallback: when no worker is set (host tests, CPU backend, partial
+            // init), the original inline `release_primary_weights` path runs
+            // unchanged. The `Err(arc)` branch is never affected — madvise is
+            // always inline because it requires the live pointer.
             let t_c0 = Instant::now();
             match Arc::try_unwrap(old) {
                 Ok(layer) => {
-                    Self::release_primary_weights(&self.backend, layer);
+                    if let Some(worker) = &self.release_worker {
+                        // Async path: enqueue for background drop (ENG-ALG-228).
+                        worker.enqueue_release(layer);
+                    } else {
+                        // Inline fallback (host tests, CPU backend).
+                        Self::release_primary_weights(&self.backend, layer);
+                    }
                 }
                 Err(arc) => {
                     // Non-exclusive ownership — best-effort reclaim only.
@@ -993,6 +1071,14 @@ impl<'a> SwapExecutor<'a> {
 /// produce a closed-loop "alloc - release" picture without per-destructor
 /// instrumentation (Sprint B `phase_5_tbt_diag.md` over-reported alive
 /// bytes because the dump only counted allocs).
+///
+/// Public re-export used by `PrimaryReleaseWorker` (ENG-ALG-228) which runs
+/// `release_primary_weights` on a background thread and needs to charge the
+/// diagnostic from that thread with the same backend reference.
+pub fn record_swap_release_pub(backend: &Arc<dyn Backend>, count: usize, bytes: usize) {
+    record_swap_release(backend, count, bytes);
+}
+
 fn record_swap_release(backend: &Arc<dyn Backend>, count: usize, bytes: usize) {
     if count == 0 {
         return;

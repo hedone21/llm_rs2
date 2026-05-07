@@ -406,6 +406,14 @@ pub fn load_model(
         weight_prefix: config.weight_prefix.clone(),
     };
 
+    // ENG-ALG-228 / ENG-DAT-100: spawn the async primary release worker once
+    // at model creation. The worker retains a clone of `backend` for
+    // diagnostic calls; `TransformerModel` owns the `Arc` so the worker
+    // outlives any `SwapExecutor` borrow.
+    let release_worker = Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+        backend.clone(),
+    ));
+
     Ok(TransformerModel {
         config: model_config,
         layers,
@@ -423,5 +431,6 @@ pub fn load_model(
         // call, or left as empty when the caller builds the model directly
         // (e.g. tests). ENG-DAT-095, ENG-ALG-216.
         quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+        release_worker,
     })
 }

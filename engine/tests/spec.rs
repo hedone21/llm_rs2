@@ -139,6 +139,13 @@ mod test_inv_138_default_dtype;
 #[path = "spec/test_inv_139_capability_bit3.rs"]
 mod test_inv_139_capability_bit3;
 
+// ── Weight Swap Phase 6.5 — ENG-ALG-226 fused SOA convert+transpose ──
+// INV-140: fused single-dispatch kernel output is byte-equal to the legacy
+// 4-step host-transpose path. Host-side comparison (skipped when no OpenCL
+// platform or fused kernel fails to compile).
+#[path = "spec/test_inv_140_fused_convert_byte_equal.rs"]
+mod test_inv_140_fused_convert_byte_equal;
+
 // ── AUF v0.2 Sprint C — ENG-ALG-224 multi-dtype writer ──
 // dequant→requant 결정성, INV-138 sort, capability bit 3 자동 활성화.
 #[path = "spec/test_eng_alg_224_writer_multi_dtype.rs"]
@@ -206,3 +213,7 @@ mod test_qcf_backward_compat;
 mod test_qcf_beta_regression;
 #[path = "spec/test_qcf_experimental.rs"]
 mod test_qcf_experimental;
+
+// ── INV-141 PrimaryReleaseWorker drain contract (ENG-ALG-228 / ENG-DAT-100) ──
+#[path = "spec/test_inv_141_release_worker_drain.rs"]
+mod test_inv_141_release_worker_drain;

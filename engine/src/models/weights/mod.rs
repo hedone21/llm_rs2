@@ -8,12 +8,14 @@
 
 pub mod decider;
 pub mod noise_table;
+pub mod release_worker;
 pub mod secondary_mmap;
 pub mod slot;
 pub mod swap_executor;
 
 pub use decider::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
 pub use noise_table::QuantNoiseTable;
+pub use release_worker::PrimaryReleaseWorker;
 pub use secondary_mmap::{
     LayerTensorSlice, LoadError, SecondaryDtypeChoice, SecondaryLayoutChoice, SecondaryMmap,
     SecondaryTensorInfo, build_auf_secondary_from_view, open_secondary, open_secondary_auf,

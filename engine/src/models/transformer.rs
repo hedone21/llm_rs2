@@ -117,6 +117,17 @@ pub struct TransformerModel {
     /// - Secondary present but all layers failed: `QuantNoiseTable::uniform_ones(n)`.
     /// - Normal: `QuantNoiseTable::new_from_frobenius(...)` with `is_computed=true`.
     pub quant_noise: Arc<crate::models::weights::QuantNoiseTable>,
+    /// Async primary cl_mem release worker (ENG-ALG-228 / ENG-DAT-100).
+    ///
+    /// Spawned once at model creation. `SwapExecutor` enqueues displaced
+    /// `LayerWeights` here in Stage (c) to avoid blocking `clReleaseMemObject`
+    /// on the swap critical path. INV-141 is checked at the start of each
+    /// subsequent swap batch.
+    ///
+    /// `Arc` so `SwapExecutor` (which borrows references) can hold a clone
+    /// without lifetime coupling to the model. Drop impl joins the worker
+    /// thread, ensuring all destructors run before process exit.
+    pub release_worker: Arc<crate::models::weights::PrimaryReleaseWorker>,
 }
 
 pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -2966,6 +2977,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
         (model, cpu_be)
     }
@@ -3115,6 +3129,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
 
         // Gather token 0 → should be [1.0, 1.0], then scale → [2.0, 2.0]
@@ -3226,6 +3243,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
 
         // Gather tokens [1, 6]
@@ -3327,6 +3347,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
 
         let idx_buf = mem.alloc(4, DType::F32).unwrap();
@@ -3404,6 +3427,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
         (model, cpu_be)
     }
