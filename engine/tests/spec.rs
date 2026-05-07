@@ -244,3 +244,20 @@ mod test_eng_alg_232_eager_prefault;
 // INV-142: queue idle before ratio_generation bump.
 #[path = "spec/test_inv_142_stage_gate_ordering.rs"]
 mod test_inv_142_stage_gate_ordering;
+
+// ── Layer-Incremental Swap Stage 1 MVP (LISWAP-1, ENG-ALG-232~234, INV-144~146) ──
+// IncrementalSwapPlan data structure (ENG-ALG-232, INV-145),
+// decode loop dispatch simulation (ENG-ALG-233, INV-146),
+// forward snapshot consistency under incremental swap (INV-144),
+// drain monotone property (INV-145),
+// tick/batch equivalence (INV-146).
+#[path = "spec/test_eng_alg_232_incremental_plan.rs"]
+mod test_eng_alg_232_incremental_plan;
+#[path = "spec/test_eng_alg_233_main_loop_dispatch.rs"]
+mod test_eng_alg_233_main_loop_dispatch;
+#[path = "spec/test_inv_144_forward_snapshot.rs"]
+mod test_inv_144_forward_snapshot;
+#[path = "spec/test_inv_145_drain_monotone.rs"]
+mod test_inv_145_drain_monotone;
+#[path = "spec/test_inv_146_tick_batch_equivalence.rs"]
+mod test_inv_146_tick_batch_equivalence;

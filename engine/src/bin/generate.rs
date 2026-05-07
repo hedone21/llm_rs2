@@ -861,6 +861,29 @@ struct Args {
     /// When `--secondary-gguf` is absent this flag is silently ignored.
     #[arg(long, default_value_t = false)]
     eager_prefault_secondary: bool,
+
+    /// Layer-Incremental Swap Stage 1 MVP (LISWAP-1, ENG-ALG-232~234, INV-144~146).
+    ///
+    /// Number of decoder layers to swap per decode token tick.
+    ///
+    /// `0` (default): single-shot path — all target layers are swapped at once
+    /// before generation, exactly as before. No behavior change.
+    ///
+    /// `>= 1`: incremental path — when `--force-swap-ratio` is set, instead of
+    /// swapping all target layers immediately, an `IncrementalSwapPlan` is
+    /// committed and the swap is distributed across decode tokens (N layers/tick).
+    ///
+    /// **Trade-off**: total swap latency increases by stage gate overhead
+    /// (~7.4 ms × N ticks on Galaxy S25), but user-perceived per-token stall
+    /// is bounded to `total_swap_latency / ceil(n_layers / per_tick)`.
+    ///
+    /// Example: 25 layers, per_tick=2 → 13 ticks × ~23 ms stall vs 290 ms
+    /// single-shot stall (9 frames vs 0 frames skipped at 30 fps).
+    ///
+    /// Requires `--force-swap-ratio` to be set. When absent, has no effect.
+    /// Per-tick > 0 with no `--force-swap-ratio`: silently ignored (no trigger).
+    #[arg(long, default_value_t = 0)]
+    swap_incremental_per_tick: usize,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -2401,6 +2424,14 @@ fn main() -> anyhow::Result<()> {
     // Requires --secondary-gguf (validated above at model load time).
     // When --qcf-dump is set, this block is skipped; the swap is deferred to
     // the QCF dump workflow below (after warmup prefill builds ImportanceTable).
+    //
+    // ENG-ALG-232~234 (LISWAP-1): when --swap-incremental-per-tick > 0,
+    // the swap is NOT executed here. Instead, an IncrementalSwapPlan is
+    // committed and stored below; the decode loop drains it chunk-by-chunk.
+    // per_tick == 0 (default): single-shot path, unchanged from before.
+    let mut incremental_force_swap_plan: Option<llm_rs2::models::weights::IncrementalSwapPlan> =
+        None;
+
     if args.qcf_dump.is_none()
         && let Some(ratio) = args.force_swap_ratio
     {
@@ -2414,7 +2445,23 @@ fn main() -> anyhow::Result<()> {
                 "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
                 ratio,
             );
+        } else if args.swap_incremental_per_tick > 0 {
+            // ENG-ALG-232: commit IncrementalSwapPlan; single-shot is skipped.
+            // The plan will be drained in the decode loop (token 0 onwards).
+            eprintln!(
+                "weight_swap: incremental mode — ratio={:.2}, {} target layers, per_tick={} ({} ticks estimated)",
+                ratio,
+                target_layers.len(),
+                args.swap_incremental_per_tick,
+                target_layers.len().div_ceil(args.swap_incremental_per_tick),
+            );
+            incremental_force_swap_plan = Some(llm_rs2::models::weights::IncrementalSwapPlan::new(
+                target_layers,
+                args.swap_incremental_per_tick,
+                0, // started_at_token filled in decode loop at first drain
+            ));
         } else {
+            // per_tick == 0: original single-shot path (no behavior change).
             match run_layer_swap(
                 &model,
                 &target_layers,
@@ -5085,6 +5132,59 @@ fn main() -> anyhow::Result<()> {
             }
 
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
+
+            // ── Layer-Incremental Swap dispatch (ENG-ALG-233) ──────────────────
+            // Runs after forward, before sampling. Per-tick: drain up to N layers
+            // and call SwapExecutor::execute_on_slots with the chunk.
+            // ENG-ALG-234: plan committed with force-swap-ratio + per_tick > 0;
+            //   new signals during flight are ignored (plan runs to completion).
+            // INV-145: empty chunk is never passed to execute_on_slots.
+            if let Some(ref mut inc_plan) = incremental_force_swap_plan {
+                let chunk = inc_plan.drain_chunk();
+                if !chunk.is_empty() {
+                    let t_swap = std::time::Instant::now();
+                    match run_layer_swap(&model, &chunk, gpu_backend_arc.as_ref(), &cpu_backend_arc)
+                    {
+                        Ok(report) => {
+                            eprintln!(
+                                "[IncrementalSwap] tick={} chunk={:?} swapped={} remaining={} latency={:.1}ms",
+                                decode_token_index,
+                                &chunk,
+                                report.swapped.len(),
+                                inc_plan.remaining_count(),
+                                t_swap.elapsed().as_secs_f64() * 1000.0,
+                            );
+                            if let Some(ref stages) = report.stage_breakdown {
+                                eprintln!("[IncrementalSwap] stages: {}", stages.to_log_line());
+                            }
+                            #[cfg(feature = "opencl")]
+                            remap_weights_for_cpu_after_swap(
+                                &mut model,
+                                &backend,
+                                is_gpu,
+                                args.resilience_prealloc_switch,
+                                "incremental-swap",
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[IncrementalSwap] swap error on tick={}: {}",
+                                decode_token_index, e
+                            );
+                        }
+                    }
+                }
+                // ENG-ALG-233: retire plan when all layers have been drained (INV-145).
+                if inc_plan.is_done() {
+                    eprintln!(
+                        "[IncrementalSwap] plan complete (started_at_token={}, finished_at_token={})",
+                        inc_plan.started_at_token(),
+                        decode_token_index,
+                    );
+                    incremental_force_swap_plan = None;
+                }
+            }
+            // ── End Layer-Incremental Swap dispatch ────────────────────────────
 
             // ── H2O Debug: per-step diagnostics ──
             if args.h2o_debug {
