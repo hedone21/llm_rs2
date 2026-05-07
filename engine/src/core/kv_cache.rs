@@ -597,10 +597,8 @@ impl KVCache {
                     let k_src = new_k.as_ptr();
                     let host_addressable =
                         !self.k_buffer.buffer().is_gpu_buffer() && !new_k.buffer().is_gpu_buffer();
-                    let can_direct_copy = type_size > 0
-                        && !k_dst.is_null()
-                        && !k_src.is_null()
-                        && host_addressable;
+                    let can_direct_copy =
+                        type_size > 0 && !k_dst.is_null() && !k_src.is_null() && host_addressable;
 
                     let src_row = self.kv_heads * self.head_dim;
                     let dst_head_stride = self.capacity * self.head_dim;

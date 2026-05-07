@@ -445,12 +445,10 @@ pub trait Backend: Send + Sync {
         write_pos_start: usize,
         seq_len: usize,
     ) -> Result<()> {
-        let src_k = unsafe {
-            std::slice::from_raw_parts(k_src.as_ptr() as *const f32, k_src.size() / 4)
-        };
-        let src_v = unsafe {
-            std::slice::from_raw_parts(v_src.as_ptr() as *const f32, v_src.size() / 4)
-        };
+        let src_k =
+            unsafe { std::slice::from_raw_parts(k_src.as_ptr() as *const f32, k_src.size() / 4) };
+        let src_v =
+            unsafe { std::slice::from_raw_parts(v_src.as_ptr() as *const f32, v_src.size() / 4) };
         let dst_k = unsafe {
             std::slice::from_raw_parts_mut(k_dst.as_mut_ptr() as *mut f32, k_dst.size() / 4)
         };
