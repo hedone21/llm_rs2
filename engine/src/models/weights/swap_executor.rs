@@ -57,6 +57,12 @@ pub enum SwapError {
     /// previous batch when the next batch attempts to start. Swap is rejected
     /// to prevent memory leak accumulation.
     ReleaseDrainTimeout { pending: usize, timeout_ms: u64 },
+    /// INV-142: `backend.synchronize()` at the stage gate failed.
+    ///
+    /// This gate ensures all async `enqueue_write_buffer` calls (ENG-ALG-230)
+    /// have completed before `invalidate_noshuffle_soa_registry` and the
+    /// `ratio_generation` bump execute (ENG-ALG-231).
+    StageGateSyncFailed { source: anyhow::Error },
 }
 
 impl std::fmt::Display for SwapError {
@@ -92,6 +98,9 @@ impl std::fmt::Display for SwapError {
                 f,
                 "primary release worker drain timeout: {pending} jobs remaining after {timeout_ms}ms"
             ),
+            SwapError::StageGateSyncFailed { source } => {
+                write!(f, "backend synchronize failed at stage gate: {source}")
+            }
         }
     }
 }
@@ -133,6 +142,8 @@ pub struct SwappedLayer {
 ///   (`build_layer_from_mmap`, per-layer accumulated)
 /// - `arc_swap_ms` — (b) `LayerSlot::swap_weights` atomic Arc store
 /// - `madvise_ms` — (c) `madvise(MADV_DONTNEED)` on replaced pages
+/// - `synchronize_ms` — stage gate: `backend.synchronize()` (`clFinish`)
+///   called once after all materialise calls, before SOA rebuild (ENG-ALG-231)
 /// - `soa_reconvert_ms` — (d) `ensure_noshuffle_soa_registered` loop
 ///   (Phase 3.7a, hypothesis: dominant bottleneck)
 /// - `gen_bump_ms` — (e) `invalidate_noshuffle_soa_registry` +
@@ -149,6 +160,11 @@ pub struct StageBreakdown {
     pub arc_swap_ms: f64,
     /// (c) `madvise(MADV_DONTNEED)` (per-layer accumulated)
     pub madvise_ms: f64,
+    /// Stage gate: `backend.synchronize()` (`clFinish`) called once after all
+    /// `materialise_weight` / `enqueue_write_buffer` calls, before
+    /// `invalidate_noshuffle_soa_registry` (INV-142 / ENG-ALG-231).
+    /// Near-zero on CPU/CUDA backends (trait default is `Ok(())`).
+    pub synchronize_ms: f64,
     /// (d) `ensure_noshuffle_soa_registered` SOA re-conversion loop
     pub soa_reconvert_ms: f64,
     /// (e) `invalidate_noshuffle_soa_registry` + `ratio_generation` bump
@@ -159,15 +175,16 @@ impl StageBreakdown {
     /// Format as a compact single-line string for stderr diagnostics.
     ///
     /// Example:
-    /// `prefault=12.3ms mmap_permute=123.4ms arc_swap=0.1ms madvise=0.2ms soa_reconvert=45.6ms gen_bump=0.1ms`
+    /// `prefault=12.3ms mmap_permute=123.4ms arc_swap=0.1ms madvise=0.2ms synchronize=0.5ms soa_reconvert=45.6ms gen_bump=0.1ms`
     pub fn to_log_line(&self) -> String {
         format!(
             "prefault={:.1}ms mmap_permute={:.1}ms arc_swap={:.1}ms madvise={:.1}ms \
-             soa_reconvert={:.1}ms gen_bump={:.1}ms",
+             synchronize={:.1}ms soa_reconvert={:.1}ms gen_bump={:.1}ms",
             self.prefault_ms,
             self.mmap_permute_ms,
             self.arc_swap_ms,
             self.madvise_ms,
+            self.synchronize_ms,
             self.soa_reconvert_ms,
             self.gen_bump_ms,
         )
@@ -471,6 +488,24 @@ impl<'a> SwapExecutor<'a> {
         // (e) Single batch-level bump of the global ratio_generation counter.
         // Empty swaps do NOT bump (ENG-ALG-211: "if !swapped.is_empty()").
         if !report.swapped.is_empty() {
+            // ── Stage (sync): backend.synchronize() — INV-142 / ENG-ALG-231 ──
+            //
+            // All `alloc_and_upload_soa_buffers` calls during Stage (a) use
+            // non-blocking `enqueue_write_buffer` (ENG-ALG-230). A single
+            // `clFinish` here drains the entire command queue before Stage (d)
+            // consumers (SOA registry rebuild, next forward) read the uploaded
+            // data.
+            //
+            // Ordering: synchronize → invalidate_noshuffle_soa_registry →
+            //   ensure/restore_pre_converted_soa_registration → ratio_generation bump.
+            //
+            // CPU / CUDA backends: default impl returns `Ok(())` immediately.
+            let t_sync0 = Instant::now();
+            self.backend
+                .synchronize()
+                .map_err(|e| SwapError::StageGateSyncFailed { source: e })?;
+            stages.synchronize_ms = t_sync0.elapsed().as_secs_f64() * 1e3;
+
             // ── Stage (e-pre): invalidate registry ───────────────────────────
             // ENG-ALG-221 / INV-130: invalidate the Adreno Q4_0 noshuffle SOA
             // registry before the generation bump so that the subsequent
@@ -1198,6 +1233,7 @@ mod tests {
             mmap_permute_ms: 100.0,
             arc_swap_ms: 0.5,
             madvise_ms: 0.1,
+            synchronize_ms: 0.7,
             soa_reconvert_ms: 50.0,
             gen_bump_ms: 0.2,
         };
@@ -1209,6 +1245,10 @@ mod tests {
         assert!(
             line.contains("mmap_permute=100.0ms"),
             "log line must contain mmap_permute stage, got: {line}"
+        );
+        assert!(
+            line.contains("synchronize=0.7ms"),
+            "log line must contain synchronize stage (ENG-ALG-231), got: {line}"
         );
     }
 

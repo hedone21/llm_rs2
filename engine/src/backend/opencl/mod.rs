@@ -3584,10 +3584,28 @@ impl OpenCLBackend {
         Ok(true)
     }
 
-    /// AUF SOA bypass helper — alloc q_buf/d_buf, blocking-write the
+    /// AUF SOA bypass helper — alloc q_buf/d_buf, **non-blocking**-write the
     /// pre-transposed payload, and (best-effort) build the
     /// `image1d_buffer_t` view. Counts the new cl_mem objects in the
     /// `auf_soa_*` diag buckets.
+    ///
+    /// # Async enqueue contract (ENG-ALG-230 / INV-142)
+    ///
+    /// Both `enqueue_write_buffer` calls use `blocking = false` so all 175 tensors
+    /// in a full-ratio AUF swap are queued without a synchronous wait per tensor
+    /// (~150 ms saved vs the previous blocking path). The OpenCL in-order command
+    /// queue guarantees ordering: writes complete before any subsequent kernel
+    /// dispatch on the same queue.
+    ///
+    /// **Callers must call `backend.synchronize()` (= `clFinish`) exactly once
+    /// at the stage gate, after all `materialise_weight` calls complete and before
+    /// `invalidate_noshuffle_soa_registry` / `restore_pre_converted_soa_registration`
+    /// read the uploaded data (ENG-ALG-231).**
+    ///
+    /// The 4-step legacy fallback path in `convert_q4_0_to_noshuffle` retains
+    /// `blocking = true` as a conservative choice — that path is only active when
+    /// the fused kernel is unavailable, and the intermediate CPU transpose already
+    /// serialises the write anyway.
     ///
     /// Caller is responsible for sizing checks; this helper assumes
     /// `q_bytes.len() == num_blocks * 16` and `d_bytes.len() == num_blocks * 2`.
@@ -3618,11 +3636,17 @@ impl OpenCLBackend {
             )?
         };
         self.record_cl_mem_alloc("auf_soa_d", num_blocks * 2);
+        // ENG-ALG-230: non-blocking enqueue — the in-order queue guarantees
+        // ordering. The caller (`execute_on_slots` stage gate) issues a single
+        // `backend.synchronize()` after all layers are materialised.
+        // SAFETY: `q_bytes` and `d_bytes` slices are valid for the duration of
+        // this unsafe block; they are borrowed from the AUF mmap slice which
+        // lives for the entire swap batch.
         unsafe {
             ocl::core::enqueue_write_buffer(
                 &self.queue,
                 &q_buf,
-                true,
+                false, // non-blocking — ENG-ALG-230
                 0,
                 q_bytes,
                 None::<&ocl::core::Event>,
@@ -3631,7 +3655,7 @@ impl OpenCLBackend {
             ocl::core::enqueue_write_buffer(
                 &self.queue,
                 &d_buf,
-                true,
+                false, // non-blocking — ENG-ALG-230
                 0,
                 d_bytes,
                 None::<&ocl::core::Event>,

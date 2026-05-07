@@ -22,4 +22,6 @@ pub use secondary_mmap::{
     open_secondary_with_dtype, open_secondary_with_options,
 };
 pub use slot::{LayerSlot, LayerWeights};
-pub use swap_executor::{SwapError, SwapExecutor, SwapReport, SwappedLayer, dtype_tag_to_dtype};
+pub use swap_executor::{
+    StageBreakdown, SwapError, SwapExecutor, SwapReport, SwappedLayer, dtype_tag_to_dtype,
+};

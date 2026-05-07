@@ -237,3 +237,10 @@ mod test_eng_alg_229_targeted_prefault;
 // silent-skip when no secondary is configured.
 #[path = "spec/test_eng_alg_232_eager_prefault.rs"]
 mod test_eng_alg_232_eager_prefault;
+
+// ── ENG-ALG-230/231 + INV-142: async write_buffer + stage gate ordering ──
+// alloc_and_upload_soa_buffers blocking=false (ENG-ALG-230);
+// single backend.synchronize() gate before invalidate/restore/bump (ENG-ALG-231).
+// INV-142: queue idle before ratio_generation bump.
+#[path = "spec/test_inv_142_stage_gate_ordering.rs"]
+mod test_inv_142_stage_gate_ordering;
