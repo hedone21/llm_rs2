@@ -2366,23 +2366,23 @@ fn main() -> anyhow::Result<()> {
     if args.qcf_dump.is_none()
         && let Some(ratio) = args.force_swap_ratio
     {
-        use llm_rs2::core::buffer::DType as LDType;
-        use llm_rs2::memory::galloc::Galloc;
-        use llm_rs2::models::weights::swap_executor::SwapExecutor;
-
         let ratio = ratio.clamp(0.0, 1.0);
         let num_layers = model.layers.len();
-        let target_layers = SwapExecutor::uniform_target_layers(ratio, num_layers);
+        let target_layers =
+            llm_rs2::models::weights::SwapExecutor::uniform_target_layers(ratio, num_layers);
 
-        if !target_layers.is_empty() {
-            let swap_memory = Galloc::new();
-            let swap_backend: Arc<dyn Backend> = gpu_backend_arc
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| cpu_backend_arc.clone());
-            let executor =
-                SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
-            match executor.execute(&model, &target_layers) {
+        if target_layers.is_empty() {
+            eprintln!(
+                "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
+                ratio,
+            );
+        } else {
+            match run_layer_swap(
+                &model,
+                &target_layers,
+                gpu_backend_arc.as_ref(),
+                &cpu_backend_arc,
+            ) {
                 Ok(report) => {
                     eprintln!(
                         "weight_swap: force ratio={:.2}, swapped {}/{} layers in {:.1}ms",
@@ -2404,38 +2404,19 @@ fn main() -> anyhow::Result<()> {
                     {
                         ocl_be.dump_cl_mem_diagnostics(" stage=after_force_swap");
                     }
-                    // Post-swap CPU re-mapping (--secondary-layout aos +
-                    // --resilience-prealloc-switch). SwapExecutor's
-                    // `materialise_tensor` path lands an unmapped UnifiedBuffer
-                    // in the new LayerWeights snapshot; without this re-map the
-                    // next `switch_hw cpu` directive sees null host pointers
-                    // and segfaults on the first CPU forward. Idempotent and
-                    // cheap when no remap is needed (already-mapped tensors
-                    // short-circuit in `map_one`).
                     #[cfg(feature = "opencl")]
-                    if is_gpu && args.resilience_prealloc_switch {
-                        match model.map_weights_for_cpu(&backend) {
-                            Ok(0) => {} // already mapped
-                            Ok(n) => eprintln!(
-                                "[Backend] Re-mapped {} weight tensors after force-swap (host pointer restored)",
-                                n
-                            ),
-                            Err(e) => eprintln!(
-                                "[Backend] Post-swap re-map failed: {} (switch_hw cpu may crash)",
-                                e
-                            ),
-                        }
-                    }
+                    remap_weights_for_cpu_after_swap(
+                        &mut model,
+                        &backend,
+                        is_gpu,
+                        args.resilience_prealloc_switch,
+                        "force-swap",
+                    );
                 }
                 Err(e) => {
                     anyhow::bail!("--force-swap-ratio: swap failed: {}", e);
                 }
             }
-        } else {
-            eprintln!(
-                "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
-                ratio
-            );
         }
     }
 
@@ -2535,133 +2516,31 @@ fn main() -> anyhow::Result<()> {
         if args.qcf_dump.is_some()
             && let Some(force_ratio) = args.force_swap_ratio
         {
-            use llm_rs2::core::buffer::DType as LDType;
-            use llm_rs2::core::qcf::ImportanceCollector;
-            use llm_rs2::memory::galloc::Galloc as WGalloc;
-            use llm_rs2::models::weights::decider::WeightSwapDecider;
-            use llm_rs2::models::weights::swap_executor::SwapExecutor;
-
             let warmup_n = args.qcf_warmup_tokens.max(1);
-
-            // ── Step 1: build warmup token sequence from eval questions ───────
-            // Concatenate question prompt fields (separated by "\n\n") and take
-            // the first warmup_n tokens.  If fewer tokens are available, use
-            // whatever we have and emit a warning.
+            // Concatenate question prompts (separated by "\n\n") and take the
+            // first warmup_n tokens. Empty result → soft skip (no abort).
             let warmup_ids = build_eval_ll_warmup_text(&questions, warmup_n, &tokenizer);
 
             if warmup_ids.is_empty() {
-                // Soft failure: skip prelude instead of aborting the whole eval run.
                 eprintln!(
                     "[QCF-dump] WARNING: eval-ll warmup token sequence is empty; \
                      prelude skipped (swap will use uniform fallback)"
                 );
             } else {
-                let actual_warmup_len = warmup_ids.len();
-                eprintln!(
-                    "[QCF-dump] eval-ll warmup prefill: {} tokens",
-                    actual_warmup_len
-                );
-
-                // ── Step 2: warmup prefill with ImportanceCollector ───────────
-                let mut collector = ImportanceCollector::new();
-                {
-                    let warmup_buf = WGalloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
-                    unsafe {
-                        let ptr = warmup_buf.as_mut_ptr() as *mut u32;
-                        for (i, &id) in warmup_ids.iter().enumerate() {
-                            *ptr.add(i) = id;
-                        }
-                    }
-                    let cpu_warmup = Tensor::new(
-                        Shape::new(vec![1, actual_warmup_len]),
-                        warmup_buf,
-                        Arc::new(CpuBackend::new()),
-                    );
-                    let warmup_input = backend.copy_from(&cpu_warmup)?;
-
-                    let warmup_logits_buf =
-                        memory.alloc(actual_warmup_len * vocab_size * 4, DType::F32)?;
-                    let mut warmup_logits = Tensor::new(
-                        Shape::new(vec![1, actual_warmup_len, vocab_size]),
-                        warmup_logits_buf,
-                        backend.clone(),
-                    );
-
-                    model.forward_into(TransformerModelForwardArgs {
-                        input_tokens: &warmup_input,
-                        start_pos: 0,
-                        kv_caches: &mut kv_caches,
-                        backend: &backend,
-                        memory: memory.as_ref(),
-                        logits_out: &mut warmup_logits,
-                        x_gen: None,
-                        workspace: None,
-                        score_accumulator: None,
-                        profiler: None,
-                        skip_config: None,
-                        importance_collector: Some(&mut collector),
-                        logits_last_only: false,
-                        variance_collector: None,
-                        prefill_workspace: None,
-                    })?;
-                    backend.synchronize()?;
-                }
-
-                // ── Step 3: build ImportanceTable + reset KV cache ────────────
-                let imp_table = collector.build();
-                eprintln!(
-                    "[QCF-dump] eval-ll ImportanceTable built: {} entries",
-                    imp_table.len()
-                );
-                // Reset so the eval loop starts with a clean KV cache.
-                for kv in kv_caches.iter_mut() {
-                    kv.current_pos = 0;
-                }
-
-                // ── Step 4: swap with importance-guided decider ───────────────
-                let ratio = force_ratio.clamp(0.0, 1.0);
-                let decider = WeightSwapDecider {
-                    importance: Some(&imp_table),
-                    noise: Some(model.quant_noise.as_ref()),
-                    n_decoder_layers: model.layers.len(),
-                    currently_swapped: &[],
-                };
-                let decision = decider.decide(ratio);
-
-                if !decision.selected_layers.is_empty() {
-                    let swap_memory = WGalloc::new();
-                    let swap_backend: Arc<dyn Backend> = gpu_backend_arc
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_else(|| cpu_backend_arc.clone());
-                    let executor =
-                        SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
-                    match executor.execute(&model, &decision.selected_layers) {
-                        Ok(report) => {
-                            eprintln!(
-                                "[QCF-dump] eval-ll swap: ratio={:.2}, layers={}/{}, \
-                                 qcf_pred={:.4}, fallback={}, latency={:.1}ms",
-                                ratio,
-                                report.swapped.len(),
-                                model.layers.len(),
-                                decision.qcf_swap_estimate,
-                                decision.fallback_used,
-                                report.latency_ms,
-                            );
-                        }
-                        Err(e) => {
-                            anyhow::bail!("[QCF-dump] eval-ll swap failed: {}", e);
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "[QCF-dump] eval-ll swap: ratio={:.2} → 0 layers selected (qcf=0.0)",
-                        ratio
-                    );
-                }
-
-                eval_ll_qcf_decision = Some(decision);
-                eval_ll_qcf_importance = Some(imp_table);
+                let result = run_qcf_warmup_workflow(
+                    &model,
+                    &backend,
+                    memory.as_ref(),
+                    &mut kv_caches,
+                    vocab_size,
+                    &warmup_ids,
+                    Some(force_ratio),
+                    gpu_backend_arc.as_ref(),
+                    &cpu_backend_arc,
+                    " eval-ll",
+                )?;
+                eval_ll_qcf_decision = result.decision;
+                eval_ll_qcf_importance = Some(result.importance);
             }
         }
 
@@ -2838,17 +2717,10 @@ fn main() -> anyhow::Result<()> {
     let qcf_workflow_start = std::time::Instant::now();
 
     if args.qcf_dump.is_some() && (args.ppl.is_some() || !prompt.is_empty()) {
-        use llm_rs2::core::buffer::DType as LDType;
-        use llm_rs2::core::qcf::ImportanceCollector;
-        use llm_rs2::memory::galloc::Galloc as WGalloc;
-        use llm_rs2::models::weights::decider::WeightSwapDecider;
-        use llm_rs2::models::weights::swap_executor::SwapExecutor;
-
         let warmup_n = args.qcf_warmup_tokens.max(1);
 
-        // ── Step 1: build warmup token sequence ──────────────────────────────
-        // For PPL mode: first N tokens of the reference text.
-        // For generation mode: the prompt tokens (up to warmup_n).
+        // For PPL mode the warmup tokens come from the reference text; for
+        // generation mode they come from the prompt. Both paths cap at warmup_n.
         let warmup_tokens: Vec<u32> = if let Some(ref ppl_path) = args.ppl {
             let text = std::fs::read_to_string(ppl_path)
                 .map_err(|e| anyhow::anyhow!("Failed to read PPL file for warmup: {}", e))?;
@@ -2863,118 +2735,26 @@ fn main() -> anyhow::Result<()> {
             enc.get_ids().iter().take(warmup_n).copied().collect()
         };
 
-        let actual_warmup_len = warmup_tokens.len();
-        if actual_warmup_len < 1 {
+        if warmup_tokens.is_empty() {
             anyhow::bail!(
                 "--qcf-dump: warmup token sequence is empty (prompt or PPL text too short)"
             );
         }
-        eprintln!("[QCF-dump] Warmup prefill: {} tokens", actual_warmup_len);
 
-        // ── Step 2: warmup prefill with ImportanceCollector ───────────────────
-        let mut collector = ImportanceCollector::new();
-
-        {
-            let warmup_buf = WGalloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
-            unsafe {
-                let ptr = warmup_buf.as_mut_ptr() as *mut u32;
-                for (i, &id) in warmup_tokens.iter().enumerate() {
-                    *ptr.add(i) = id;
-                }
-            }
-            let cpu_warmup = Tensor::new(
-                Shape::new(vec![1, actual_warmup_len]),
-                warmup_buf,
-                Arc::new(CpuBackend::new()),
-            );
-            let warmup_input = backend.copy_from(&cpu_warmup)?;
-
-            let warmup_logits_buf = memory.alloc(actual_warmup_len * vocab_size * 4, DType::F32)?;
-            let mut warmup_logits = Tensor::new(
-                Shape::new(vec![1, actual_warmup_len, vocab_size]),
-                warmup_logits_buf,
-                backend.clone(),
-            );
-
-            model.forward_into(TransformerModelForwardArgs {
-                input_tokens: &warmup_input,
-                start_pos: 0,
-                kv_caches: &mut kv_caches,
-                backend: &backend,
-                memory: memory.as_ref(),
-                logits_out: &mut warmup_logits,
-                x_gen: None,
-                workspace: None,
-                score_accumulator: None,
-                profiler: None,
-                skip_config: None,
-                importance_collector: Some(&mut collector),
-                logits_last_only: false,
-                variance_collector: None,
-                prefill_workspace: None,
-            })?;
-            backend.synchronize()?;
-        }
-
-        // ── Step 3: build ImportanceTable + reset KV cache ────────────────────
-        let imp_table = collector.build();
-        eprintln!(
-            "[QCF-dump] ImportanceTable built: {} entries",
-            imp_table.len()
-        );
-
-        // Reset KV cache: clear all positions so run_ppl / generation starts fresh.
-        for kv in kv_caches.iter_mut() {
-            kv.current_pos = 0;
-        }
-
-        // ── Step 4: swap with importance-guided decider ───────────────────────
-        if let Some(ratio) = args.force_swap_ratio {
-            let ratio = ratio.clamp(0.0, 1.0);
-            let decider = WeightSwapDecider {
-                importance: Some(&imp_table),
-                noise: Some(model.quant_noise.as_ref()),
-                n_decoder_layers: model.layers.len(),
-                currently_swapped: &[],
-            };
-            let decision = decider.decide(ratio);
-
-            if !decision.selected_layers.is_empty() {
-                let swap_memory = WGalloc::new();
-                let swap_backend: Arc<dyn Backend> = gpu_backend_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| cpu_backend_arc.clone());
-                let executor =
-                    SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
-                match executor.execute(&model, &decision.selected_layers) {
-                    Ok(report) => {
-                        eprintln!(
-                            "[QCF-dump] Swap: ratio={:.2}, layers={}/{}, qcf_pred={:.4}, \
-                             fallback={}, latency={:.1}ms",
-                            ratio,
-                            report.swapped.len(),
-                            model.layers.len(),
-                            decision.qcf_swap_estimate,
-                            decision.fallback_used,
-                            report.latency_ms,
-                        );
-                    }
-                    Err(e) => {
-                        anyhow::bail!("[QCF-dump] swap failed: {}", e);
-                    }
-                }
-            } else {
-                eprintln!(
-                    "[QCF-dump] Swap: ratio={:.2} → 0 layers selected (qcf=0.0)",
-                    ratio
-                );
-            }
-
-            qcf_swap_decision = Some(decision);
-        }
-
-        qcf_warmup_importance = Some(imp_table);
+        let result = run_qcf_warmup_workflow(
+            &model,
+            &backend,
+            memory.as_ref(),
+            &mut kv_caches,
+            vocab_size,
+            &warmup_tokens,
+            args.force_swap_ratio,
+            gpu_backend_arc.as_ref(),
+            &cpu_backend_arc,
+            "",
+        )?;
+        qcf_swap_decision = result.decision;
+        qcf_warmup_importance = Some(result.importance);
     }
 
     // ════════════════════════════════════════════════════════════
@@ -5593,25 +5373,14 @@ fn main() -> anyhow::Result<()> {
                         gpu_backend_arc.as_ref(),
                         &cpu_backend_arc,
                     );
-                    // Post-swap CPU re-mapping (mirrors the --force-swap-ratio
-                    // path). When `--secondary-layout aos` is in effect, the
-                    // SwapExecutor's `materialise_tensor` lands an unmapped
-                    // UnifiedBuffer in the new LayerWeights; the next
-                    // `switch_hw cpu` directive needs the host pointer back.
                     #[cfg(feature = "opencl")]
-                    if is_gpu && args.resilience_prealloc_switch {
-                        match model.map_weights_for_cpu(&backend) {
-                            Ok(0) => {}
-                            Ok(n) => eprintln!(
-                                "[Backend] Re-mapped {} weight tensors after SwapWeights (host pointer restored)",
-                                n
-                            ),
-                            Err(e) => eprintln!(
-                                "[Backend] Post-swap re-map failed: {} (switch_hw cpu may crash)",
-                                e
-                            ),
-                        }
-                    }
+                    remap_weights_for_cpu_after_swap(
+                        &mut model,
+                        &backend,
+                        is_gpu,
+                        args.resilience_prealloc_switch,
+                        "SwapWeights",
+                    );
                 }
 
                 if let Some(evict) = &plan.evict {
@@ -6970,6 +6739,199 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
 
 // ── Weight swap dispatch (ENG-ALG-214-ROUTE) ────────────────────────────────
 
+/// Run a `SwapExecutor` over the given target layers.
+///
+/// Centralises the boilerplate shared by the four call sites that execute a
+/// weight swap (`--force-swap-ratio`, two QCF-dump warmup paths, and the
+/// `EngineCommand::SwapWeights` direct dispatch). Always targets `Q4_0`
+/// (only currently-supported swap dtype, INV-126). Resolves the swap backend
+/// to GPU when available, otherwise CPU — matches the original logic that
+/// `SwapExecutor` branches on `backend.name()` to pick the AUF SOA fast path.
+fn run_layer_swap(
+    model: &llm_rs2::models::transformer::TransformerModel,
+    target_layers: &[usize],
+    gpu_backend: Option<&Arc<dyn Backend>>,
+    cpu_backend: &Arc<dyn Backend>,
+) -> Result<llm_rs2::models::weights::SwapReport, llm_rs2::models::weights::SwapError> {
+    let swap_memory = Galloc::new();
+    let swap_backend: Arc<dyn Backend> =
+        gpu_backend.cloned().unwrap_or_else(|| cpu_backend.clone());
+    let executor = llm_rs2::models::weights::SwapExecutor::new(
+        DType::Q4_0,
+        &model.config,
+        swap_backend,
+        &swap_memory,
+    );
+    executor.execute(model, target_layers)
+}
+
+/// Re-map weight tensors for CPU access after a weight swap.
+///
+/// Required when running on GPU with `--secondary-layout aos +
+/// --resilience-prealloc-switch`: `SwapExecutor::materialise_tensor` lands an
+/// unmapped `UnifiedBuffer` in the new `LayerWeights` snapshot, and the next
+/// `switch_hw cpu` directive segfaults on a null host pointer.  Idempotent —
+/// already-mapped tensors short-circuit in `map_one`.
+#[cfg(feature = "opencl")]
+fn remap_weights_for_cpu_after_swap(
+    model: &mut llm_rs2::models::transformer::TransformerModel,
+    backend: &Arc<dyn Backend>,
+    is_gpu: bool,
+    enabled: bool,
+    label: &str,
+) {
+    if !is_gpu || !enabled {
+        return;
+    }
+    match model.map_weights_for_cpu(backend) {
+        Ok(0) => {}
+        Ok(n) => eprintln!(
+            "[Backend] Re-mapped {} weight tensors after {} (host pointer restored)",
+            n, label,
+        ),
+        Err(e) => eprintln!(
+            "[Backend] Post-swap re-map failed: {} (switch_hw cpu may crash)",
+            e,
+        ),
+    }
+}
+
+/// Result of a QCF-dump warmup workflow: importance table plus optional swap
+/// decision (when `--force-swap-ratio` was applied).
+struct QcfWarmupResult {
+    importance: llm_rs2::core::qcf::ImportanceTable,
+    decision: Option<llm_rs2::models::weights::SwapDecision>,
+}
+
+/// QCF-dump warmup workflow shared by `--ppl/generation` and `--eval-ll` modes.
+///
+/// 1. Warmup prefill with `ImportanceCollector` over `warmup_ids`.
+/// 2. Build `ImportanceTable`, reset KV caches to zero.
+/// 3. If `force_ratio` is set, run `WeightSwapDecider` and dispatch the swap.
+///
+/// `log_prefix` is concatenated immediately after `[QCF-dump]` in every log
+/// line emitted by this helper, so any non-empty value must include its own
+/// leading space (e.g. `" eval-ll"`). The caller must ensure `warmup_ids` is
+/// non-empty.
+#[allow(clippy::too_many_arguments)]
+fn run_qcf_warmup_workflow(
+    model: &llm_rs2::models::transformer::TransformerModel,
+    backend: &Arc<dyn Backend>,
+    memory: &dyn Memory,
+    kv_caches: &mut [KVCache],
+    vocab_size: usize,
+    warmup_ids: &[u32],
+    force_ratio: Option<f32>,
+    gpu_backend: Option<&Arc<dyn Backend>>,
+    cpu_backend: &Arc<dyn Backend>,
+    log_prefix: &str,
+) -> anyhow::Result<QcfWarmupResult> {
+    use llm_rs2::core::qcf::ImportanceCollector;
+    use llm_rs2::models::weights::WeightSwapDecider;
+
+    let actual_warmup_len = warmup_ids.len();
+    eprintln!(
+        "[QCF-dump]{} warmup prefill: {} tokens",
+        log_prefix, actual_warmup_len,
+    );
+
+    // ── Warmup prefill with ImportanceCollector ───────────────────────────────
+    let mut collector = ImportanceCollector::new();
+    {
+        let warmup_buf = Galloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
+        unsafe {
+            let ptr = warmup_buf.as_mut_ptr() as *mut u32;
+            for (i, &id) in warmup_ids.iter().enumerate() {
+                *ptr.add(i) = id;
+            }
+        }
+        let cpu_warmup = Tensor::new(
+            Shape::new(vec![1, actual_warmup_len]),
+            warmup_buf,
+            Arc::new(CpuBackend::new()),
+        );
+        let warmup_input = backend.copy_from(&cpu_warmup)?;
+
+        let warmup_logits_buf = memory.alloc(actual_warmup_len * vocab_size * 4, DType::F32)?;
+        let mut warmup_logits = Tensor::new(
+            Shape::new(vec![1, actual_warmup_len, vocab_size]),
+            warmup_logits_buf,
+            backend.clone(),
+        );
+
+        model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &warmup_input,
+            start_pos: 0,
+            kv_caches,
+            backend,
+            memory,
+            logits_out: &mut warmup_logits,
+            x_gen: None,
+            workspace: None,
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: Some(&mut collector),
+            logits_last_only: false,
+            variance_collector: None,
+            prefill_workspace: None,
+        })?;
+        backend.synchronize()?;
+    }
+
+    // ── Build ImportanceTable + reset KV cache ────────────────────────────────
+    let imp_table = collector.build();
+    eprintln!(
+        "[QCF-dump]{} ImportanceTable built: {} entries",
+        log_prefix,
+        imp_table.len(),
+    );
+    for kv in kv_caches.iter_mut() {
+        kv.current_pos = 0;
+    }
+
+    // ── Optional swap with importance-guided decider ──────────────────────────
+    let decision = if let Some(ratio) = force_ratio {
+        let ratio = ratio.clamp(0.0, 1.0);
+        let decider = WeightSwapDecider {
+            importance: Some(&imp_table),
+            noise: Some(model.quant_noise.as_ref()),
+            n_decoder_layers: model.layers.len(),
+            currently_swapped: &[],
+        };
+        let decision = decider.decide(ratio);
+
+        if decision.selected_layers.is_empty() {
+            eprintln!(
+                "[QCF-dump]{} swap: ratio={:.2} → 0 layers selected (qcf=0.0)",
+                log_prefix, ratio,
+            );
+        } else {
+            let report = run_layer_swap(model, &decision.selected_layers, gpu_backend, cpu_backend)
+                .map_err(|e| anyhow::anyhow!("[QCF-dump]{} swap failed: {}", log_prefix, e))?;
+            eprintln!(
+                "[QCF-dump]{} swap: ratio={:.2}, layers={}/{}, qcf_pred={:.4}, \
+                 fallback={}, latency={:.1}ms",
+                log_prefix,
+                ratio,
+                report.swapped.len(),
+                model.layers.len(),
+                decision.qcf_swap_estimate,
+                decision.fallback_used,
+                report.latency_ms,
+            );
+        }
+        Some(decision)
+    } else {
+        None
+    };
+
+    Ok(QcfWarmupResult {
+        importance: imp_table,
+        decision,
+    })
+}
+
 /// Execute a SwapWeights command: validate → decide → execute → report.
 ///
 /// This is the direct-dispatch path mandated by ENG-ALG-214-ROUTE.  The
@@ -6987,8 +6949,6 @@ fn dispatch_swap_weights(
     gpu_backend: Option<&std::sync::Arc<dyn llm_rs2::core::backend::Backend>>,
     cpu_backend: &std::sync::Arc<dyn llm_rs2::core::backend::Backend>,
 ) {
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::models::weights::swap_executor::SwapExecutor;
     use llm_rs2::models::weights::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
     use llm_shared::DtypeTag;
 
@@ -7035,21 +6995,12 @@ fn dispatch_swap_weights(
     }
 
     // ── 4. Execute ─────────────────────────────────────────────────────────
-    // Resolve the swap backend to the *active* backend (GPU when available),
-    // not the CPU fallback. SwapExecutor branches on `backend.name()` to pick
-    // the AUF SOA fast path (`materialise_auf_soa_weight` →
-    // `NoshuffleWeightBuffer`); a CPU backend here forces the host fallback
-    // and lands `SharedBuffer`-backed weights into the model snapshot, which
-    // the next OpenCL `matmul_q4_0` rejects with "B is not OpenCL buffer".
-    let swap_memory = llm_rs2::memory::galloc::Galloc::new();
-    let swap_backend: std::sync::Arc<dyn llm_rs2::core::backend::Backend> =
-        gpu_backend.cloned().unwrap_or_else(|| cpu_backend.clone());
-    let executor_sw = SwapExecutor::new(DType::Q4_0, &model.config, swap_backend, &swap_memory);
-
-    let t_start = std::time::Instant::now();
-    match executor_sw.execute(model, &decision.selected_layers) {
+    match run_layer_swap(model, &decision.selected_layers, gpu_backend, cpu_backend) {
         Ok(report) => {
-            let latency_ms = t_start.elapsed().as_millis() as u64;
+            // SwapExecutor measures execute()-only latency in `report.latency_ms`,
+            // which matches the prior `t_start.elapsed()` scope (the executor
+            // construction itself is sub-microsecond and was excluded before).
+            let latency_ms = report.latency_ms as u64;
 
             // ── 5. Build WeightSwapReport (MSG-089) ──────────────────────
             let layers_swapped: Vec<llm_shared::LayerSwapEntry> = report
