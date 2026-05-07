@@ -4,6 +4,173 @@
 
 ---
 
+# Weight Swap Overhead 감축 (EuroSys 2027 critical path) — 2026-05-07 신규
+
+> 측정 보고: `/home/go/Workspace/papers/eurosys2027/_workspace/experiment/swap_overhead_s25.md`
+> Galaxy S25 단발성 stall 1564.6 ms → 목표 ~70 ms (95.5% 감축).
+> 6개 finding (A~F) + 보조 1개 (eager prefault). spec-manage가 부여할 ID 컨벤션: `WSWAP-6-A` ~ `WSWAP-6-F`, `WSWAP-6-PREFAULT`.
+> EuroSys 2027 paper critical path이므로 기존 backlog의 [P2] QCF rename / [P0] Weight Swap Phase B 스프린트 항목보다 **Sprint 우선권 상위**에 배치 (P0/P1).
+> 의존성: Finding E(stage label rename)는 다른 모든 작업 후 batch rename으로 처리.
+
+## [P0] WSWAP-6-A: Fused SOA convert kernel (.cl `cvt_q4_0_noshuffle` 6 round-trip → 1 dispatch)
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (independent)
+- **Spec ID**: WSWAP-6-A (spec-manage가 부여 예정, cross-link)
+- **Description**: |
+  현재 AOS Q4_0 → Adreno SOA 재변환이 **layer당 6 GPU round-trip**을 거치며 swap stall의 48.5% (758.3 ms)를 차지.
+  fused single-dispatch kernel `cvt_q4_0_noshuffle`로 교체하여 dispatch 오버헤드 + intermediate buffer 왕복 제거.
+- **영향 파일** (예상 LOC 200-300):
+  - `engine/kernels/cvt_q4_0_noshuffle.cl` (신규, ~150 LOC) — fused convert kernel
+  - `engine/src/backend/opencl/weight_swap.rs` 또는 SOA convert path (수정, ~50 LOC) — dispatch 1회로 변경
+  - `engine/kernels/` 기존 SOA convert 6-pass kernel은 deprecate 표시 후 추후 제거
+- **검증 방법**:
+  - GGUF spec test (AOS path 영향 없음 확인): `cargo test --workspace -- spec_weight_swap`
+  - Galaxy S25 swap stall 실측: ratio=0.9 25 layers swap에서 `soa_reconvert` stage가 758 → ~100 ms 이하
+  - 정확성: top-5 overlap > 99% vs 현행 SOA 출력 (token-by-token)
+- **절감 추정**: 500-650 ms (전체 1564.6 ms의 32-42%)
+- **위험**: low — AOS path는 영향받지 않음. SOA path만 변경.
+- **담당 권장**: Senior Implementer (`.cl` 커널 + Adreno 최적화)
+- **작성일**: 2026-05-07
+
+---
+
+## [P0] WSWAP-6-C: Primary cl_mem release를 critical path에서 제거 (mpsc + bg worker)
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (independent)
+- **Spec ID**: WSWAP-6-C
+- **Description**: |
+  현재 swap 시점에서 primary F16 cl_mem release(`madvise_ms` 단계로 잘못 명명됨, 실제로는 cl_mem release)가 **동기적**으로 critical path에 포함되어 173 ms 소비.
+  mpsc channel + 별도 worker thread로 release를 비동기화하여 swap stall에서 제거.
+- **영향 파일** (예상 LOC 100-150):
+  - `engine/src/backend/opencl/weight_swap.rs` 또는 swap path (수정, ~80 LOC) — release call → mpsc::Sender::send
+  - `engine/src/backend/opencl/mod.rs` 또는 신규 `release_worker.rs` (~50 LOC) — mpsc::Receiver + drop loop thread
+- **검증 방법**:
+  - swap stall에서 madvise_ms(현 명명) stage 비용 173 → ~0 ms (release deferred)
+  - 메모리 회수: swap 후 일정 시간(<1s) 내 primary cl_mem이 실제 release되어 PSS 감소 확인 (procrank)
+  - Crash 안전성: bg thread가 swap 중 panic 시 main thread 진행 보장 테스트
+- **절감 추정**: 173 ms (전체 11.1%)
+- **위험**: low — release 자체는 background, swap 정확성에 영향 없음
+- **담당 권장**: Implementer (Rust 동기화 패턴)
+- **작성일**: 2026-05-07
+
+---
+
+## [P1] WSWAP-6-F: `enqueue_write_buffer(blocking=true)` → async + 1회 finish (`alloc_and_upload_soa_buffers`)
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (independent, A와 병행 가능)
+- **Spec ID**: WSWAP-6-F
+- **Description**: |
+  현재 `alloc_and_upload_soa_buffers`에서 layer마다 `enqueue_write_buffer(blocking=true)`로 host→GPU 전송이 **layer 수만큼 직렬화**됨. blocking=false로 enqueue 모두 완료 후 한 번 `clFinish`/`synchronize()`로 합치면 driver pipelining 활성화.
+- **영향 파일** (예상 LOC 50-80):
+  - `engine/src/backend/opencl/weight_swap.rs` 또는 SOA upload path (수정, ~30 LOC) — write_buffer 호출 blocking 플래그 변경
+  - 마지막 일괄 sync 1회 추가
+- **검증 방법**:
+  - SOA upload phase wall-clock 100-150 ms 감소 (S25 25 layers 기준)
+  - 정확성: 모든 layer weight가 GPU에 정상 도착 (top-5 overlap > 99%)
+  - thread safety: write enqueue 순서 보존 검증 (in-order queue 사용 가정 확인)
+- **절감 추정**: 100-150 ms
+- **위험**: low — async write는 OpenCL spec 표준 동작. 단, queue가 out-of-order면 검토 필요.
+- **담당 권장**: Implementer (OpenCL API)
+- **작성일**: 2026-05-07
+
+---
+
+## [P1] WSWAP-6-B: AOS path heap copy 제거 (`SharedBuffer::from_vec(data.to_vec())` → BorrowedBuffer)
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (independent)
+- **Spec ID**: WSWAP-6-B
+- **Description**: |
+  AOS swap path에서 mmap 영역의 `&[u8]` slice를 `data.to_vec()`로 heap에 복사하여 `SharedBuffer::from_vec`에 전달 → 1.2 GB 모델 기준 **80-100 ms heap allocation + memcpy**.
+  `BorrowedBuffer` 또는 직접 `copy_weight_from(mmap_slice)` 경로로 변경하여 zero-copy.
+- **영향 파일** (예상 LOC 80-120):
+  - `engine/src/loader/auf.rs` 또는 secondary AOS load path (수정, ~50 LOC)
+  - `engine/src/core/buffer.rs` 또는 `SharedBuffer` 관련 (수정, ~30 LOC, 필요 시 BorrowedBuffer 도입)
+- **검증 방법**:
+  - AOS swap path stall에서 heap copy 비용 80-100 ms 감소
+  - mmap lifetime 보장: `LayerSlot` 또는 `SecondaryMmap`이 swap 완료 후 release되지 않도록 ownership 검증
+  - spec_weight_swap AOS variant 테스트 PASS
+- **절감 추정**: 80-100 ms
+- **위험**: medium — buffer lifetime 관리. mmap이 cl_mem보다 먼저 drop되면 GPU read-after-free
+- **담당 권장**: Implementer (Rust ownership 신중)
+- **작성일**: 2026-05-07
+
+---
+
+## [P2] WSWAP-6-D: Prefault 범위를 target_layers byte range로 축소 (현재 28 layer 전체)
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: WSWAP-6-PREFAULT 결정 후 (eager prefault 적용 여부에 따라 prefault 코드 위치가 달라짐)
+- **Spec ID**: WSWAP-6-D
+- **Description**: |
+  현재 prefault(`MADV_WILLNEED` + page touch)가 **28 layer 전체**에 대해 수행. swap 대상은 일반적으로 ratio=0.9에서 25 layer. 비-target layer 3개의 prefault는 낭비.
+  `--swap-ratio`로 결정된 target_layers의 byte range만 prefault.
+- **영향 파일** (예상 LOC 30-50):
+  - `engine/src/loader/auf.rs` 또는 prefault path (수정, ~30 LOC) — target_layers iter로 range 계산
+  - `WeightSwapDecider` 또는 plan path에서 target byte range 전달
+- **검증 방법**:
+  - prefault stage 비용 328 → ~290 ms (약 40 ms 감소, 25/28 비율)
+  - non-target layer 3개의 PSS 증가 없음 (procrank 비교)
+- **절감 추정**: 40 ms
+- **위험**: low — 범위 축소 단순 변경
+- **담당 권장**: Implementer
+- **작성일**: 2026-05-07
+
+---
+
+## [P2] WSWAP-6-E: Stage label rename `madvise_ms` → `primary_release_ms` (engine + shared IPC + manager)
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: WSWAP-6-A, B, C, D, F 모두 완료 후 (rename batch)
+- **Spec ID**: WSWAP-6-E
+- **Description**: |
+  현재 `madvise_ms` stage 라벨은 실제 측정 내용(primary cl_mem release)과 의미 불일치. 측정 보고서·매니저 trace·spec 모두에 잘못된 의미가 전파됨.
+  cross-crate (engine + shared IPC + manager) 일괄 rename.
+- **영향 파일** (예상 LOC 50-80):
+  - `engine/src/backend/opencl/weight_swap.rs` 또는 trace 라벨 정의 (수정, ~10 LOC)
+  - `shared/src/lib.rs` IPC 메시지 schema (수정, ~10 LOC) — back-compat 필요 시 양쪽 alias 허용 후 단계적 제거
+  - `manager/src/` trace 파서/lua context (~20 LOC)
+  - `policy_*.lua` (해당 라벨 사용 시, ~10 LOC)
+  - `docs/`, spec 테스트 (~20 LOC)
+- **검증 방법**:
+  - manager trace_level=2 출력에서 `primary_release_ms` 라벨 확인
+  - shared IPC schema test PASS
+  - policy_default.lua / policy_s25_unified.lua가 새 라벨로 정상 동작
+- **절감 추정**: 0 ms (정합성/가독성)
+- **위험**: low — cross-crate change, IPC back-compat 1버전 유지 권장
+- **담당 권장**: Implementer (cross-crate rename)
+- **작성일**: 2026-05-07
+
+---
+
+## [P1] WSWAP-6-PREFAULT: Eager prefault at startup (doc 3.1) — Finding A/C와 결합 시 stall ≤70 ms 달성 핵심
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (independent, A/C와 병행)
+- **Spec ID**: WSWAP-6-PREFAULT
+- **Description**: |
+  AUF mmap이 `--secondary-gguf` 등록 시점에 수행되지만 page는 swap fire 시점에야 fault-in 발생.
+  모델 로딩 직후 `madvise(MADV_WILLNEED)` + manual page touch (또는 `mlock`) → swap 시점의 prefault·page-fault 비용 0.
+  Finding A(soa kernel)+C(release async)와 결합 시 1564.6 → ~70 ms 도달 가능.
+- **영향 파일** (예상 LOC 50-80):
+  - `engine/src/loader/auf.rs` 또는 secondary mmap 등록 path (수정, ~40 LOC)
+  - `engine/src/bin/generate.rs` CLI 옵션 `--eager-prefault` (선택적, ~10 LOC)
+- **검증 방법**:
+  - swap stall에서 prefault stage 328 → ~0 ms
+  - 모델 로딩 시간 +500 ms 이내 (one-time cost)
+  - PSS 증가 1.2 GB (AUF 전체 commit) — S25 12 GB RAM에서 허용
+  - foreground memory pressure 시 동작 확인 (PSI 또는 매니저 신호)
+- **절감 추정**: ~328 ms (prefault 단독). Finding A/C와 결합 시 stall ~70 ms 달성에 필수
+- **위험**: low — page commit 증가하나 12 GB RAM 모델에 부담 작음. contention 환경에선 PSI 가드 추가 검토
+- **담당 권장**: Implementer
+- **작성일**: 2026-05-07
+- **Note**: Finding A가 doc 3.2(SOA secondary AUF 회귀 패치, ★★)를 대체하므로 doc 3.2는 별도 backlog 등록하지 않음. doc 3.1은 본 항목으로 등록.
+
+---
+
 ## [P2] QCF 명명 컨벤션 정리 — `QCF_kv` / `QCF_weight` 2-tier rename
 - **Status**: TODO (결정만 완료, 코드 미적용)
 - **Sprint**: backlog

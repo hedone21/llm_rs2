@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) + INV-137~139 (AUF v0.2 multi-dtype variant, 2026-04-27) = 총 120개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) + INV-137~139 (AUF v0.2 multi-dtype variant, 2026-04-27) + INV-140~143 (Weight Swap Phase 6.5 Overhead Reduction, 2026-05-07) = 총 124개.
 
 ## 1. Purpose and Scope
 
@@ -340,6 +340,25 @@
 | INV-138 | 33-engine-data §3.22.15 (ENG-DAT-098), §3.22.16 (ENG-DAT-099), ENG-ALG-224 | AUF의 `capability_optional` bit 3 = 1이면, (a) META JSON에 `default_dtype` 필드가 반드시 존재해야 하며 그 값은 ENG-DAT-096.8의 dtype enum 중 하나여야 한다. (b) writer는 TENSOR_INDEX entries를 (`layer_idx` ASC, `kind` ASC, `is_default` DESC, `dtype` ASC)로 안정 정렬하여 default_dtype entry가 동일 (`layer_idx`, `kind`) 그룹의 가장 앞에 오도록 보장해야 한다. 이는 v0.1.x reader가 first-match 규칙으로 default_dtype을 자동 선택하도록 하는 호환 의무이다. (c) reader의 dtype selection precedence는 [호출자 명시 dtype → META.default_dtype → first-match] 순이다. 위반 시 reader는 `AufError::MalformedMeta { reason: "missing default_dtype with MULTI_DTYPE_VARIANTS" }` 또는 `AufError::DtypeNotAvailable`로 reject. | Correctness | runtime, test | writer 정렬 검증 + reader META 검증 + dispatch 정확성. v0.1.x reader 호환의 핵심. |
 | INV-139 | 33-engine-data §3.22.14 (ENG-DAT-097), §3.22.16 (ENG-DAT-099) | `capability_optional` bit 3 = `MULTI_DTYPE_VARIANTS`의 의미: 1 = "이 AUF에는 어딘가에 multi-dtype TENSOR_INDEX entry가 적어도 1쌍 존재하며, META에 `default_dtype`이 정의되어 있다". 0 = "single-dtype 모드이며 동일 (`layer_idx`, `kind`)에 entry가 1번씩만 등장한다". v0.1.x reader는 본 bit를 인식하지 못하지만 `capability_optional`이므로 reject 사유가 아니다 (INV-132와 호환). v0.1.x reader가 v0.2 AUF를 만나면 first-match 규칙으로 default_dtype 단일 모드로 안전하게 동작한다 (INV-138 writer 정렬 의무 덕분). format_minor 1(v0.1.x) ↔ 2(v0.2)는 bit 3 사용 여부와 정합되어야 한다 — bit 3 = 1이면 format_minor ≥ 2 필수, format_minor=2이지만 bit 3 = 0인 경우는 format_minor가 향후 다른 v0.2 변경을 위해 미리 bump된 케이스로 허용. | Correctness, Compatibility | runtime, test | bit 3 의미 + v0.1.x ↔ v0.2 reader 호환 매트릭스. |
 
+### 3.19 Weight Swap Overhead Reduction Invariants [INV-140 ~ INV-143]
+
+2026-05-07 Weight Swap Phase 6.5 (Galaxy S25 1564.6 ms swap overhead 감축)의 불변식. 대응 명세: `32-engine-algorithms.md` §3.12.19~3.12.20 (ENG-ALG-226~231), `33-engine-data.md` §3.23 (ENG-DAT-100), `arch/weight_swap.md` §7.
+
+**도입 컨텍스트**: `papers/eurosys2027/_workspace/experiment/swap_overhead_s25.md` 측정으로 stage breakdown — soa_reconvert 758ms / prefault 328ms / mmap_permute 305ms / primary release (코드의 `madvise_ms` 라벨, 실제 `clReleaseMemObject` chain) 173ms. 목표 stall < 800ms.
+
+**교차 참조**:
+- **INV-121** (per-token snapshot): forward 진입 시 토큰 경계 snapshot. ENG-ALG-228의 deferred release 워커가 `Arc::try_unwrap` 시도 시 forward가 토큰 경계에서 snapshot을 잡고 있으면 unwrap 실패 → 워커는 backoff 재시도. 다음 토큰 경계 통과 후 성공.
+- **INV-123** (atomic store 단일성): ENG-ALG-228은 store 자체에 영향을 주지 않는다. 변경되는 것은 step (c) 의미 ("inline drop" → "enqueue to async worker")만이다.
+- **INV-125** (secondary mmap 생존): ENG-ALG-227 borrow buffer는 secondary `Arc<SecondaryMmap>` clone을 보관하여 INV-125를 직접 강제한다 (INV-143).
+- **INV-129/130/131** (Plan invalidation, SOA registry coherence): ENG-ALG-231 stage gate ordering이 ratio_generation bump 직전 queue를 idle 상태로 만들어 등록된 SOA descriptor가 모두 valid함을 보장한다. 위반 시 다음 forward가 반쯤 비어있는 registry를 본다.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-140 | 32-engine-algorithms §3.12.19 (ENG-ALG-226), arch/weight_swap.md §7.2 | Fused SOA convert kernel(`cvt_q4_0_noshuffle_fused`)의 출력 cl_mem 내용은 기존 4-step path(GPU convert → CPU 2D transpose → write_buffer × 2)의 출력과 **byte-equal**이어야 한다. 동일 src/ne00/ne01에 대해 두 경로의 dst_q와 dst_d를 host로 read한 결과가 비트 단위 일치한다. fused kernel 가용성(`kernel_cvt_q4_0_noshuffle_fused.is_some()`)은 backend 컴파일 결과에 따라 빌드 시 결정되며, 실패 시 4-step fallback이 정확성을 동일하게 보장해야 한다. | Correctness | test | host build에서 두 경로 비교 (random Q4_0 buffer 다양 ne00/ne01). 디바이스에서 fused 경로 활성 검증은 manual + spec test. |
+| INV-141 | 32-engine-algorithms §3.12.19 (ENG-ALG-228), 33-engine-data §3.23 (ENG-DAT-100) | `PrimaryReleaseWorker`는 swap batch N+1 시작 시점에 batch N의 모든 enqueued primary 해제 작업을 완료해야 한다. `execute_on_slots` 진입 시 `worker.pending_count() == 0` 검증을 수행하며, non-zero일 경우 짧은 deadline의 `worker.drain()`을 호출 후 재검증한다. drain 실패는 swap을 거부(`SwapError::ReleaseDrainTimeout`)하여 메모리 누수를 방지한다. forward 토큰 경계가 Arc holder를 양보할 때까지 워커는 backoff 재시도하므로, 정상 워크로드에서는 drain이 즉시 완료된다 (forward 토큰 ms 단위). | Correctness | test, runtime | host smoke (`Arc::try_unwrap` 성공 경로) + 토큰 경계 race 시나리오 stress test (forward stub과 동시 enqueue). |
+| INV-142 | 32-engine-algorithms §3.12.20 (ENG-ALG-230, ENG-ALG-231), arch/weight_swap.md §7.8 | `execute_on_slots` 흐름에서 `TransformerModel.ratio_generation.fetch_add(1, SeqCst)`(stage e) 호출 직전에 `backend.synchronize()`가 1회 호출되어 OpenCL queue가 idle 상태여야 한다. 이는 (1) 비동기 `enqueue_write_buffer`(ENG-ALG-230), (2) fused convert kernel(ENG-ALG-226)이 모두 GPU에서 완료된 후에야 forward가 새 cl_mem을 읽을 수 있도록 보장한다. invalidate_noshuffle_soa_registry / ensure_noshuffle_soa_registered 호출도 synchronize 이후 단계에 위치해야 한다 (stage gate ordering). 위반 시 다음 forward가 미완성 cl_mem을 보고 garbage 산출 가능 (Adreno UMA에서도 ordering 보장 필요). | Safety/Correctness | runtime, test | swap_executor unit test에서 stage 호출 순서 검증 + 디바이스 e2e 정합성 게이트 (INV-122 v2.1 단일-token 게이트로 회귀 차단). |
+| INV-143 | 32-engine-algorithms §3.12.19 (ENG-ALG-227), arch/weight_swap.md §7.3 | AOS 무변환 경로(`needs_qk_unpermute_at_swap()=false`)에서 사용되는 borrow buffer는 자신의 lifetime 동안 secondary `Arc<SecondaryMmap>`의 clone을 보관해야 한다. mmap 슬라이스 참조가 backend `copy_weight_from`/`copy_from` 호출 사이클을 통과하는 동안 secondary mmap이 drop되어 SIGBUS를 유발하지 않는다. 본 invariant는 INV-125(model lifetime mmap 생존)의 강화 표현으로 borrow 경로 한정 강제이다. permutation 경로는 owned `Vec<u8>`를 사용하므로 본 invariant의 범위 밖. | Safety | test | borrow buffer drop 시 mmap Arc strong_count 검증 (Tensor 생존 동안 secondary refcount ≥ 2). |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -368,11 +387,11 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
-| Safety | 19 | 21% |
-| Correctness | 66 | 73% |
+| Safety | 21 | 22% |
+| Correctness | 68 | 72% |
 | Performance | 2 | 2% |
 | Compatibility | 4 | 4% |
-| **합계** | **90** | **100%** |
+| **합계** | **94** | **100%** |
 
 > **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
 > INV-117~119는 v2.2.0 (QCF × DPP)에서 추가. INV-121~122는 Weight Swap Phase A에서 추가.
@@ -382,6 +401,7 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-132~134는 Weight Swap Phase 3.7b (AUF v0.1 포맷)에서 추가. INV-132는 Safety/Correctness 양쪽이며 Safety로 1회 카운트, INV-133/134는 Correctness.
 > INV-135~136은 Phase 6 Sprint G-1 (AUF v0.1.1 lm_head Q4_0 사전 변환)에서 추가. 둘 다 Correctness — INV-135는 shape/identity 일치 검증, INV-136은 후방 호환 fallback 보존.
 > INV-137~139는 AUF v0.2 multi-dtype variant (2026-04-27)에서 추가. INV-137/138은 Correctness, INV-139는 Correctness/Compatibility 양쪽이며 Compatibility로 1회 카운트한다 (v0.1.x ↔ v0.2 reader 호환 의무).
+> INV-140~143은 Weight Swap Phase 6.5 Overhead Reduction (2026-05-07)에서 추가. INV-140/141은 Correctness, INV-142는 Safety/Correctness 양쪽이며 Safety로 1회 카운트, INV-143은 Safety (borrow buffer mmap lifetime).
 > INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 > **INV-122 v2.1 (2026-04-26, Phase 5 Sprint A 진단 기반)**: 측정 단위를 **단일-token next-token logit**(prefill 종료 직후 첫 1개 logit)으로 명시적으로 고정. Sprint A 100-prompt × 4-ratio sweep에서 32-token decode 누적 drift로 ratio=0.25에서도 Δtop-1=44.85pp 관측 — 측정-임계값 미스매치 진단. 정확성 회귀(garbage 출력 등)는 0건. 임계값 자체(NMSE ≤ 0.01, Δ top-1 ≤ 1 pp)는 v2와 동일하나 측정 단위가 단일-token으로 고정. Decode window metric은 보조 sanity로 분리. ID/카운트는 변동 없음. Phase 4 자료(NMSE mean=0.0062, Δ top-1=+0.33pp)는 v2.1 기준으로도 PASS.
 

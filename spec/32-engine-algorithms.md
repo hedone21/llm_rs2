@@ -2552,6 +2552,108 @@ fn lookup_tensor(view: &AufView,
 - ENG-ALG-223 (v0.1.x writer/reader, 본 알고리즘이 호환 확장).
 - `arch/auf_format.md` (컴포넌트 매핑, §2.5b 결정 사항).
 
+#### 3.12.19 Weight Swap Overhead Reduction — Critical Path Compression [ENG-ALG-226 ~ ENG-ALG-229]
+
+> **도입 배경 (2026-05-07)**: Galaxy S25 측정에서 weight swap stall 1564.6 ms (ratio=0.9, 25 layers, F16 primary + AUF AOS secondary). Stage breakdown — soa_reconvert 758ms (48.5%) / prefault 328ms (21.0%) / mmap_permute 305ms (19.5%) / primary_release(`StageBreakdown.madvise_ms` 라벨) 173ms (11.1%). 본 절은 ENG-ALG-211 step (a~e)의 외부 계약(ratio_generation 단일 bump, INV-121~125)을 보존하면서 critical path latency를 감축하는 알고리즘 4건을 정의한다. 측정 보고서: `papers/eurosys2027/_workspace/experiment/swap_overhead_s25.md`. 통합 설계: `arch/weight_swap.md` §7.
+
+##### 3.12.19.1 Fused SOA Convert + Transpose Kernel [ENG-ALG-226]
+
+**[ENG-ALG-226]** `OpenCLBackend::convert_q4_0_to_noshuffle()`은 SOA 변환과 2D transpose를 단일 GPU kernel dispatch로 fuse한다. 호출당 host round-trip 0회, sync 0회. 결과 cl_mem 내용은 기존 4-step path(GPU convert → host read → CPU transpose → host write × 2)와 byte-equal이어야 한다. *(MUST)*
+
+**fused kernel 가용성**:
+- 빌드 시 `kernel_cvt_q4_0_noshuffle_fused`가 컴파일 성공하면 fused path 사용.
+- 컴파일 실패(Adreno register spill 등) 또는 입력 정렬 미충족(ne00 % 4 != 0, ne01 % 2 != 0)이면 4-step fallback. fallback도 동일 정확성 보장.
+
+**불변식**: INV-140 (4-step path와 byte-equal).
+
+**교차 참조**:
+- ENG-ALG-211 step (a) — `mmap_permute` stage 내부 호출.
+- ENG-ALG-222 — Phase 3.7a SOA safety net 진입점이 본 함수. fused/4-step 어느 경로든 `ensure_noshuffle_soa_registered`의 cl_mem key 의미는 동일.
+- INV-130/131 — registry 등록은 본 함수 결과의 cl_mem 주소를 key로 사용. 변환 경로(fused/4-step)와 무관하게 식별자 일관성 유지.
+
+##### 3.12.19.2 AOS Path Borrow Buffer [ENG-ALG-227]
+
+**[ENG-ALG-227]** `SwapExecutor::materialise_tensor()`는 `secondary.needs_qk_unpermute_at_swap() == false` 경로에서 mmap byte slice를 owned `Vec<u8>`으로 복사하지 않고, secondary `Arc<SecondaryMmap>` clone을 보관한 borrow buffer를 직접 backend `copy_weight_from`/`copy_from`에 전달한다. permutation이 필요한 경로(GGUF Q/K row reorder)는 owned 경로 유지. *(MUST)*
+
+**borrow buffer 계약**:
+- buffer는 자신의 lifetime 동안 secondary Arc clone을 강제 보관 (INV-143).
+- backend가 borrow를 미지원하면 owned fallback. 정확성은 보존.
+- copy_weight_from의 결과 cl_mem 내용은 owned/borrow 두 경로에서 비트 동일.
+
+**불변식**: INV-143 (borrow buffer는 secondary mmap drop 금지). INV-125 (mmap lifetime)을 borrow 한정 강화.
+
+**교차 참조**:
+- ENG-ALG-211 step (a) — `mmap_permute` stage 내부 호출.
+- ENG-DAT-C09 — secondary_mmap이 None이면 NoOp (변경 없음).
+
+##### 3.12.19.3 Deferred Primary Release Worker [ENG-ALG-228]
+
+**[ENG-ALG-228]** ENG-ALG-211 step (c) "primary 페이지 회수"는 `Arc::try_unwrap` + `release_primary_weights`을 critical path에서 inline 실행하는 대신, 단일 mpsc 큐로 enqueue하고 백그라운드 워커 thread가 비동기로 drop하도록 변경한다. 워커는 forward 토큰 경계에서 Arc holder가 양보할 때까지 backoff 재시도하므로 INV-121(per-token snapshot)과 호환된다. *(MUST)*
+
+**Drain 의무**: ENG-ALG-211 step (a-pre) 직전에 `worker.pending_count() == 0` 검증. non-zero이면 짧은 deadline의 `worker.drain()` 호출. drain 실패는 swap 거부 (`SwapError::ReleaseDrainTimeout`)로 처리하여 메모리 누수를 방지.
+
+**불변식**: INV-141 (다음 swap 전 drain 완료).
+
+**교차 참조**:
+- ENG-DAT-100 — `PrimaryReleaseWorker` 구조 정의.
+- ENG-ALG-211 step (c) — 의미 완화: "회수 시작" → 실제 회수 완료는 INV-141로 보장.
+- INV-121 — 토큰 경계 snapshot. 워커는 backoff로 Arc holder 양보를 기다림.
+
+##### 3.12.19.4 Targeted Prefault [ENG-ALG-229]
+
+**[ENG-ALG-229]** `SecondaryMmap::prefault_layers(target_layers: &[usize])`는 swap 대상 layer의 byte range만 `madvise(MADV_WILLNEED)` + page-touch한다. 전체 WEIGHTS 섹션을 page-fault하던 기존 `prefault()`는 backward-compat 경로로 유지된다. SwapExecutor stage (a-pre)에서 `target_layers`를 전달한다. *(MUST)*
+
+**예외**:
+- target_layers가 비어 있으면 NoOp.
+- AUF/GGUF 모두 layer-keyed tensor index를 보유하므로 byte range 계산은 O(target_layer × tensors_per_layer).
+
+**교차 참조**:
+- ENG-DAT-094 — decoder layer tensor index. cross-layer tensor는 본 호출에서 prefault하지 않음.
+- ENG-ALG-211 step (a-pre) — `prefault_ms` stage.
+
+#### 3.12.20 Stage Gate Ordering — Async Upload + Single Finish [ENG-ALG-230, ENG-ALG-231]
+
+##### 3.12.20.1 Async Upload + Single Finish [ENG-ALG-230]
+
+**[ENG-ALG-230]** `OpenCLBackend::alloc_and_upload_soa_buffers()`의 모든 `enqueue_write_buffer` 호출은 `blocking=false`로 변경된다. `convert_q4_0_to_noshuffle`(ENG-ALG-226 fused)도 호출 내부 `queue.finish()`를 제거하고 큐 누적만 수행한다. 호출자(`SwapExecutor::execute_on_slots`)가 stage gate(ENG-ALG-231)에서 `backend.synchronize()` 1회로 일괄 동기화한다. *(MUST)*
+
+**교차 참조**:
+- ENG-ALG-211 step (a) — `mmap_permute` 내부.
+- INV-142 — synchronize 1회 보장.
+
+##### 3.12.20.2 Stage Gate Ordering [ENG-ALG-231]
+
+**[ENG-ALG-231]** `SwapExecutor::execute_on_slots`는 다음 ordering을 강제한다 *(MUST)*:
+
+```
+(a-pre) prefault_layers(target_layers)         (ENG-ALG-229)
+(a)     for layer in target_layers:
+            materialise_tensor(borrow path or owned permute) (ENG-ALG-227)
+            enqueue fused convert + async write_buffer       (ENG-ALG-226, 230)
+(b)     for layer in target_layers:
+            LayerSlot::swap_weights(...)                     (ENG-ALG-211 b)
+(c)     for layer in target_layers:
+            release_worker.enqueue(old_arc)                  (ENG-ALG-228)
+(c-fin) backend.synchronize()                                ★ stage gate (INV-142)
+(e-pre) backend.invalidate_noshuffle_soa_registry()          (ENG-ALG-221)
+(d)     for layer:
+            ensure_noshuffle_soa_registered                  (ENG-ALG-222)
+(e)     model.ratio_generation.fetch_add(1, SeqCst)          (ENG-ALG-211 e)
+```
+
+stage gate(`backend.synchronize()`)는 ratio_generation bump 직전에 정확히 1회 호출되어야 하며, 이후 SOA registry 갱신과 ratio_generation bump가 순차 수행된다. 위반 시 forward가 미완성 cl_mem을 보고 garbage 산출 가능 (Adreno UMA에서도 ordering 보장 필요).
+
+**불변식**: INV-142 (queue idle at bump).
+
+**교차 참조**:
+- ENG-ALG-211 — 본 ordering은 step (a) ~ (e)의 비동기화 후 정합성 강화.
+- ENG-ALG-221, ENG-ALG-222 — SOA registry 갱신.
+- INV-129 (Plan invalidation) — bump 후 다음 forward의 plan rebuild trigger.
+
+#### 3.12.20.3 stage label 정합성 (Non-normative)
+
+`StageBreakdown::madvise_ms` 필드는 코드상 `Arc::try_unwrap` + primary cl_mem release chain을 누적한다. `madvise(MADV_DONTNEED)`가 아니므로 `primary_release_ms`로 rename될 예정이다. 본 rename은 spec ID 신규 할당 없이 이름만 변경하는 정합성 작업이며, shared crate에 노출된 `LayerSwapStages`도 동기 갱신 대상이다. ENG-ALG-228 도입 후에는 본 stage가 워커 enqueue 시간(microseconds)만 측정하게 되므로 의미가 더욱 명확해진다.
+
 ---
 
 ## 4. Alternative Behavior

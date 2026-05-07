@@ -1,13 +1,14 @@
 # Weight Swap — Dynamic Runtime Swap Architecture
 
-> **상태**: Draft v8 (2026-04-26, Phase 5 Sprint A 진단으로 INV-122 v2.1 측정 단위 단일-token 고정. §5.1 측정 방법론 보완 + §5.1.8 측정-임계값 미스매치 기록)
-> **작성**: 2026-04-24, **갱신**: 2026-04-26
-> **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, on-demand 측정, Arc snapshot 기반 lock-free 교체, Manager가 상한 ratio/Engine이 layer 선택, plan 경로 lazy invalidation, GPU SOA registry 동기화.
+> **상태**: Draft v9 (2026-05-07, Phase 6.5 Swap Overhead Reduction 추가. §7 신규)
+> **작성**: 2026-04-24, **갱신**: 2026-05-07
+> **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, on-demand 측정, Arc snapshot 기반 lock-free 교체, Manager가 상한 ratio/Engine이 layer 선택, plan 경로 lazy invalidation, GPU SOA registry 동기화, **swap critical path 단발 stall 감축**.
 > **대상 스펙**:
 >   - Phase 1/2: `spec/33-engine-data.md` §3.17~3.20 (ENG-DAT-090, 092, 093, 094), `spec/32-engine-algorithms.md` §3.12.1~3.12.7 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `spec/41-invariants.md` §3.13 (INV-121~125).
 >   - Phase 3: `spec/33-engine-data.md` §3.21 (ENG-DAT-095), `spec/32-engine-algorithms.md` §3.12.8~3.12.12 (ENG-ALG-214-ROUTE, ENG-ALG-215~218), `spec/41-invariants.md` §3.13 (INV-126~128), `spec/11-protocol-messages.md` (MSG-042, 082, 088, 089).
 >   - Phase 3.5: `spec/32-engine-algorithms.md` §3.12.13~3.12.14 (ENG-ALG-219, ENG-ALG-220), `spec/41-invariants.md` §3.14 (INV-129).
->   - **Phase 3.6 (NEW)**: `spec/32-engine-algorithms.md` §3.12.15 (ENG-ALG-221), `spec/41-invariants.md` §3.15 (INV-130).
+>   - Phase 3.6: `spec/32-engine-algorithms.md` §3.12.15 (ENG-ALG-221), `spec/41-invariants.md` §3.15 (INV-130).
+>   - **Phase 6.5 (NEW)**: `spec/32-engine-algorithms.md` §3.12.19~3.12.20 (ENG-ALG-226~231), `spec/33-engine-data.md` §3.23 (ENG-DAT-100), `spec/41-invariants.md` §3.19 (INV-140~143).
 > **대상 모델**: Llama 3.2 1B (16 decoder layers, no tying), Qwen 2.5 1.5B (28 decoder layers, tying 가능).
 > **전제**: GGUF primary + GGUF secondary (dtype 다름). Safetensors는 부차 지원.
 
@@ -1279,7 +1280,388 @@ Decider는 `already_swapped: &HashSet<usize>`를 입력받아 후보에서 **제
 
 ---
 
-## 7. 변경 이력
+## 7. Phase 6.5 Swap Overhead Reduction (2026-05-07)
+
+> **목적**: Galaxy S25 측정에서 weight swap 단발 stall이 1564.6 ms (ratio=0.9, AOS .auf secondary) → user-facing UX criterion(~37 frame freeze) 미달. critical path를 단계별로 압축하여 single-shot stall 50% 이상 감축.
+>
+> **대상 스펙**:
+> - `spec/32-engine-algorithms.md` §3.12.19~20 (ENG-ALG-226~231)
+> - `spec/41-invariants.md` §3.19 (INV-140~143)
+> - `spec/33-engine-data.md` §3.23 (ENG-DAT-100, primary release worker)
+>
+> **컨텍스트 참조**: `papers/eurosys2027/_workspace/experiment/swap_overhead_s25.md`. Stage breakdown — soa_reconvert 758ms / prefault 328ms / mmap_permute 305ms / "madvise" 라벨 173ms (실제 primary cl_mem release).
+>
+> **선행 가정**: §2.7 (SwapExecutor) `execute_on_slots` 흐름, ENG-ALG-211 step (a) ~ (e) 그대로 유지. 본 절의 모든 컴포넌트는 step 내부 구현 최적화이며 외부 계약(SwapReport, ratio_generation bump 단일성, INV-121~125)은 변경하지 않는다.
+
+### 7.1 변경 영향 매트릭스
+
+| Finding | 영향 stage | 측정 절감 (목표) | 새 ID | 수정 파일 (구현 위치 후보) |
+|---------|-----------|-----------------|-------|-------------------------|
+| A. Fused SOA convert kernel | (d) `soa_reconvert` | 500–650 ms (66–86%) | ENG-ALG-226, INV-140 | `engine/kernels/cvt_q4_0_noshuffle*.cl`, `backend/opencl/mod.rs::convert_q4_0_to_noshuffle` |
+| B. AOS path heap copy 제거 | (a) `mmap_permute` | 80–100 ms (26–33%) | ENG-ALG-227 | `models/weights/swap_executor.rs::materialise_tensor` |
+| C. Deferred primary release | (c) `primary_release` (구 madvise 라벨) | 173 ms (100% critical path) | ENG-ALG-228, INV-141, ENG-DAT-100 | `models/weights/swap_executor.rs::release_primary_weights` |
+| D. Targeted prefault | (a-pre) `prefault` | ~40 ms (12%) | ENG-ALG-229 | `models/weights/secondary_mmap.rs::prefault` |
+| E. Stage label rename | (label-only) | 0 (정합성) | (rename 작업, ID 미할당) | `models/weights/swap_executor.rs::StageBreakdown` + shared `LayerSwapStages` |
+| F. Async upload 1회 finish | (a) `mmap_permute` (sub-stage) | ~150 ms (49%) | ENG-ALG-230 | `backend/opencl/mod.rs::alloc_and_upload_soa_buffers` |
+| (cross-cut) Stage gate ordering | step (a-pre, a, c, d, e) | — | ENG-ALG-231, INV-142 | 통합 invariant — execute_on_slots 흐름 검증 |
+| (cross-cut) AOS borrow lifetime | (a) | — | INV-143 | secondary_mmap Arc 생존 보증 |
+
+### 7.2 컴포넌트: Fused SOA Convert Kernel (ENG-ALG-226 / INV-140)
+
+#### 설계 결정
+
+기존 `convert_q4_0_to_noshuffle()`는 6단계 호스트/디바이스 round-trip을 수행한다 (커널 dispatch → `queue.finish()` → `read_buffer(blocking)` → CPU 2D transpose → `write_buffer(blocking)` × 2회 (q, d 분리)). 25 layers × 7 weight tensor × 6 round-trip ≈ 1050 sync point. 측정된 758 ms의 거의 전부가 GPU stall이다.
+
+**전략**: SOA 변환 + 2D transpose + (선택) image1d view 셋업을 **단일 OpenCL kernel dispatch**로 fuse한다. 출력 buffer를 transpose 후 layout으로 직접 쓴다. host round-trip 0회, 큐 sync는 batch 마지막의 `synchronize()` 1회로 흡수.
+
+**제약**:
+- 결과 cl_mem 주소(노출 인터페이스)는 동일. registry key (cl_mem 주소) 의미 변경 없음 → INV-130/131 영향 없음.
+- AUF SOA bypass 경로(`alloc_pre_converted_soa_tensor`)는 본 path를 거치지 않으므로 영향 없음.
+- Adreno register 한계: per-thread 32 float4 초과 시 register spill (CLAUDE feedback). transpose row stride 분기는 SLM 또는 work-group 차원 분할로 우회. 측정 후 결정.
+
+#### 인터페이스
+
+```rust
+impl OpenCLBackend {
+    pub fn convert_q4_0_to_noshuffle(
+        &self,
+        src: &ocl::core::Mem,
+        num_blocks: usize,
+        ne00: usize,    // K, elements per row
+        ne01: usize,    // M, number of rows
+    ) -> Result<(ocl::core::Mem /* dst_q transposed */,
+                 ocl::core::Mem /* dst_d transposed */,
+                 Option<ocl::core::Mem /* q image view, lazy */>)>
+    // 전제: src는 Q4_0 AOS 18B/block layout
+    // 후조건:
+    //   - dst_q[col*ne01 + row] (column-major ushort) 와 GEMV가 기대하는 layout 일치 (INV-140)
+    //   - dst_d[k*ne01 + row] (column-major half) 와 GEMV가 기대하는 layout 일치
+    //   - host round-trip 0회 (INV-140)
+    //   - swap critical path에서 호출될 때 호출당 sync 0회. 최종 sync는 caller(execute_on_slots)
+    //     또는 alloc_and_upload_soa_buffers 종료 시 1회 (ENG-ALG-230과 결합)
+}
+```
+
+#### 처리 흐름
+
+```mermaid
+flowchart LR
+    SRC[src cl_mem<br/>AOS 18B/block] --> KERN[fused kernel<br/>cvt_q4_0_noshuffle_transposed]
+    KERN -->|GPU only, no sync| DSTQ[dst_q transposed]
+    KERN -->|GPU only, no sync| DSTD[dst_d transposed]
+    DSTQ --> REG{caller layer registers<br/>via ensure_noshuffle_soa_registered}
+    DSTD --> REG
+
+    style KERN fill:#fff3e0
+```
+
+#### 예외 처리
+
+| 조건 | 처리 |
+|------|------|
+| Adreno OpenCL 컴파일 실패 (register spill 등) | runtime fallback: 기존 4-step path 호출. `kernel_cvt_q4_0_noshuffle_fused.is_none()` 플래그로 감지. INV-140 v1 위반이 아니라 graceful degrade. |
+| ne00 % 4 != 0 또는 ne01 % 2 != 0 | 정렬 미충족. 4-step fallback 강제. |
+| q_total_ushort > device max alloc | 4-step fallback. (lm_head 같은 큰 tensor 에지 케이스) |
+
+#### 코드-스펙 차이
+
+현재 코드의 `Step 2/3: CPU transpose` 주석은 early implementation 흔적이다. 본 spec 도입과 함께 fused 경로가 정식이 되며, 4-step 경로는 fallback으로 격하된다 (제거 아님 — 호환 안전망).
+
+### 7.3 컴포넌트: AOS Path Borrow Buffer (ENG-ALG-227 / INV-143)
+
+#### 설계 결정
+
+`materialise_tensor()`는 AUF AOS 경로(`needs_qk_unpermute_at_swap()=false`)에서도 mmap byte slice를 항상 `data.to_vec()`으로 owned heap copy한다. 25 layers × 7 tensor × ~5 MB ≈ 870 MB heap traffic ≈ 80–100 ms 낭비.
+
+**전략**: secondary mmap Arc가 `TransformerModel.secondary_mmap`(INV-125)에 model lifetime 동안 살아 있으므로, AOS 무변환 경로에서는 borrow 기반 buffer를 직접 `copy_weight_from`/`copy_from`에 전달한다. permutation 경로(GGUF QK)는 owned 유지 (transform이 새 buffer를 생성).
+
+**제약**:
+- borrow buffer의 lifetime은 secondary mmap Arc에 종속. mmap drop 금지(INV-125)는 swap 도중에도 보장된다.
+- backend `copy_weight_from`은 입력 buffer 호스트 메모리를 호출 종료 전까지만 읽으므로 borrow가 안전. CPU backend의 경우 `Tensor`가 borrow buffer를 그대로 보관할 수 있으므로 별도 Arc clone이 필요할 수 있다 — 구현 시 결정.
+
+#### 인터페이스
+
+```rust
+impl SwapExecutor {
+    fn materialise_tensor(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        layer_idx: usize,
+        subname: &str,
+        primary: &Tensor,
+        is_weight: bool,
+    ) -> Result<Tensor, SwapError>
+    // 전제: secondary가 self-mmap을 보유.
+    // 후조건:
+    //   - permutation 필요 시: 기존 owned Vec<u8> 경로 (변경 없음).
+    //   - permutation 불필요 시: secondary mmap byte slice를 borrow한 Buffer 사용.
+    //     borrow Buffer는 secondary Arc clone을 보관하여 lifetime 보장 (INV-143).
+    //   - copy_weight_from / copy_from의 결과 cl_mem 내용은 owned vs borrow 경로에서 비트 동일 (INV-140 회귀 방지).
+}
+```
+
+#### 처리 흐름
+
+```mermaid
+flowchart TD
+    ENTER[materialise_tensor] --> NEEDS_PERM{needs_qk_unpermute<br/>_at_swap?}
+    NEEDS_PERM -- Yes --> OWNED[owned Vec\<u8\>:<br/>unpermute_qk_rows]
+    NEEDS_PERM -- No --> BORROW[BorrowedMmapBuffer<br/>{ slice: &mmap_bytes, _arc: secondary.clone() }]
+    OWNED --> SHARED[SharedBuffer::from_vec]
+    BORROW --> COPY
+    SHARED --> COPY[backend.copy_weight_from / copy_from]
+    COPY --> OUT([Tensor on target backend])
+```
+
+#### 예외 처리
+
+| 조건 | 처리 |
+|------|------|
+| backend가 borrow buffer 미지원 | runtime check 후 owned path fallback. 호환 안전망. |
+| copy_weight_from가 비동기로 buffer를 보관 (queue 진행 중) | secondary Arc clone이 buffer drop을 막으므로 안전. ENG-ALG-230 (1회 finish) 와 정합. |
+
+### 7.4 컴포넌트: Deferred Primary Release Worker (ENG-ALG-228 / INV-141 / ENG-DAT-100)
+
+#### 설계 결정
+
+`Stage (c)`는 `Arc::try_unwrap` + `release_primary_weights`로 F16 primary cl_mem chain을 critical path에서 drop한다. 25 layers × 7+ tensor × ~1 ms `clReleaseMemObject` ≈ 173 ms. atomic install(step b)은 이미 완료된 시점이라 forward 정합성 측면에서 drop은 critical path에 있을 필요가 없다.
+
+**전략**: 단일 mpsc 큐 + 백그라운드 워커 thread (1개) 도입. step (c)에서 old `Arc<LayerWeights>`를 큐에 enqueue만 하고 즉시 다음 layer로 진행. 워커가 background에서 `Arc::try_unwrap` 시도 + drop. **다음 swap 트리거가 도착하기 전에 큐가 비어 있어야 한다(INV-141)**.
+
+**제약**:
+- INV-125 (secondary mmap drop 금지)는 영향 없음 — primary release는 secondary와 무관.
+- 메모리 회수 latency 증가 → resilience 신호 emergency 시 곤란할 수 있음. INV-141의 "다음 swap 전 drain 의무"가 backpressure 역할.
+- 워커 thread 수명은 model lifetime. shutdown 시 graceful drain.
+
+#### 인터페이스
+
+```rust
+pub struct PrimaryReleaseWorker {
+    sender: mpsc::Sender<Arc<LayerWeights>>,
+    pending: Arc<AtomicUsize>,    // 큐에 남은 항목 수, INV-141 검증용
+    handle: thread::JoinHandle<()>,
+}
+
+impl PrimaryReleaseWorker {
+    pub fn spawn(backend: Arc<dyn Backend>) -> Self;
+    pub fn enqueue(&self, layer: Arc<LayerWeights>);
+    pub fn drain(&self, deadline: Duration) -> Result<(), DrainTimeout>;
+    pub fn pending_count(&self) -> usize;    // INV-141 assertion
+}
+
+impl SwapExecutor {
+    fn execute_on_slots(...) -> Result<SwapReport, SwapError> {
+        // (Stage c-pre) INV-141: 시작 시 worker.pending_count() == 0 검증.
+        //                         non-zero이면 worker.drain(short_deadline) 후 재검증.
+        //                         drain 실패 시 에러 반환 (정합성 우선).
+        // ...
+        // (Stage c) old Arc → worker.enqueue(old) (즉시 반환)
+    }
+}
+```
+
+#### 처리 흐름
+
+```mermaid
+sequenceDiagram
+    participant Exec as SwapExecutor
+    participant Q as mpsc queue
+    participant W as ReleaseWorker thread
+    participant CL as OpenCL driver
+
+    Note over Exec: Swap batch N 시작
+    Exec->>Q: pending_count() == 0 ? (INV-141)
+    Q-->>Exec: yes
+    Exec->>Exec: stage (a)/(b) per layer
+    Exec->>Q: enqueue(old_arc) — fire and forget
+    Exec->>Exec: 다음 layer 진행 (no wait)
+    Note over Exec: critical path 종료, swap_report 반환
+    par background drain
+        Q->>W: pop old_arc
+        W->>W: Arc::try_unwrap
+        W->>CL: clReleaseMemObject × N
+    end
+    Note over Exec: Swap batch N+1 트리거
+    Exec->>Q: pending_count() == 0 ?
+    alt non-zero
+        Exec->>W: drain(deadline)
+        W-->>Exec: ok / timeout
+    end
+```
+
+#### 예외 처리
+
+| 조건 | 처리 |
+|------|------|
+| 워커 패닉 | `JoinHandle::is_finished()` 검사 후 critical path에서 inline drop fallback. 동작 정확성은 보존, 성능만 회귀. |
+| `drain(deadline)` 타임아웃 | 다음 swap 거부 (Rejected) — 메모리 누수 방지가 정합성보다 우선. |
+| Arc 외부 holder 잔존 (forward가 토큰 경계에서 snapshot 잡고 있는 케이스) | 워커 내부에서 backoff 루프로 try_unwrap 재시도. forward 토큰 경계 통과 즉시 성공 (INV-121 토큰 경계 보장). |
+
+#### 코드-스펙 차이
+
+기존 `release_primary_weights`는 ENG-ALG-211 step (c) inline에서 호출된다. 본 컴포넌트 도입 시 step (c)는 **enqueue로 단순화**되며, 실제 release는 비동기다. ENG-ALG-211의 step (c) 의미는 "primary 페이지 회수 시작"으로 완화되며, 회수 완료는 INV-141의 "다음 swap 전 drain"으로 보장된다.
+
+### 7.5 컴포넌트: Targeted Prefault (ENG-ALG-229)
+
+#### 설계 결정
+
+`AufSecondaryMmap::prefault()`는 전체 WEIGHTS 섹션을 page-touch한다 (28 layer + cross-layer). ratio=0.9에선 25 layer만 swap 대상이지만 28 layer 전체 page-fault 비용을 부담한다.
+
+**전략**: prefault에 `target_layer_indices: &[usize]` 파라미터를 추가, target layer의 byte range만 prefault한다. SwapExecutor는 stage (a-pre)에서 `target_layers`를 prefault에 전달.
+
+**제약**:
+- AUF/GGUF 모두 layer-keyed tensor index를 보유하므로 byte range 계산은 O(layer × tensors_per_layer).
+- doc 3.1 (eager prefault at startup)과 결합 시 본 경로는 NoOp로 단축 가능.
+
+#### 인터페이스
+
+```rust
+impl SecondaryMmap {
+    pub fn prefault(&self);    // 기존 — 전체 WEIGHTS 섹션
+    pub fn prefault_layers(&self, target_layers: &[usize]);    // 신규
+    // 후조건:
+    //   - target_layers에 속하는 모든 layer-keyed tensor의 byte range만 madvise(WILLNEED) + page-touch
+    //   - cross-layer tensor는 본 호출에서 prefault하지 않음 (swap 대상 아님)
+}
+```
+
+#### 처리 흐름
+
+```mermaid
+flowchart LR
+    A[execute_on_slots stage a-pre] --> B{target_layers<br/>제공?}
+    B -- Yes --> C[prefault_layers<br/>target byte range only]
+    B -- No --> D[prefault<br/>전체 WEIGHTS<br/>backward compat]
+    C --> E[stage a 진입]
+    D --> E
+```
+
+### 7.6 컴포넌트: Async Upload + Single Finish (ENG-ALG-230 / INV-142)
+
+#### 설계 결정
+
+`alloc_and_upload_soa_buffers()`의 `enqueue_write_buffer` 호출 4개가 모두 `blocking=true`. 175 tensor × ~1 ms 동기 = ~150 ms.
+
+**전략**: write_buffer를 `blocking=false`로 호출 + ocl Event 누적. swap batch 마지막에 `queue.finish()` 1회로 일괄 동기화. `convert_q4_0_to_noshuffle` (ENG-ALG-226)도 동일 큐를 공유하므로 같은 finish가 fused kernel sync까지 흡수한다.
+
+**제약 / INV-142**:
+- swap_report 반환 시점에 모든 GPU 작업이 완료되어 있어야 한다(forward 진입 안전성). `execute_on_slots`는 stage (e) 직전 또는 직후 `synchronize()` 1회 호출 의무 — INV-142.
+- `copy_weight_from` 등 다른 backend API와 큐를 공유하므로 ordering이 자연 직렬화되어 race 없음.
+
+#### 인터페이스
+
+```rust
+impl OpenCLBackend {
+    pub fn alloc_and_upload_soa_buffers(
+        &self,
+        q_bytes: &[u8],
+        d_bytes: &[u8],
+        ne00: usize,
+        ne01: usize,
+        num_blocks: usize,
+    ) -> Result<(ocl::core::Mem, ocl::core::Mem)>
+    // 전제: 동일 backend queue 공유.
+    // 후조건:
+    //   - 호출당 sync 0회.
+    //   - 호출자(execute_on_slots)가 batch 종료 시 synchronize() 1회 호출 의무 (INV-142).
+}
+```
+
+### 7.7 컴포넌트: Stage Label Rename + IPC 동기화 (E)
+
+#### 설계 결정
+
+`StageBreakdown::madvise_ms`는 코드상 `Arc::try_unwrap` + `clReleaseMemObject` chain의 누적 시간이다 — `madvise(MADV_DONTNEED)`가 아니라 primary cl_mem release. 라벨이 측정 분석 시 혼동을 야기한다 (paper context의 swap_overhead_s25.md "madvise" 173ms 해석).
+
+**전략**:
+- `StageBreakdown.madvise_ms` → `primary_release_ms` rename.
+- `to_log_line()` 출력 토큰 `madvise=` → `primary_release=`.
+- Manager/IPC 표면에 노출되어 있다면(`shared::LayerSwapStages` 등) 동시 rename. 미노출이면 engine-internal 변경.
+- E-task는 **다른 모든 fix 머지 후 batch로** 수행. 이전 측정 data와 비교 가능성 위해.
+
+**호환성**: 본 rename은 spec ID 신규 할당 없음. arch/spec 영향 최소. shared crate 노출 여부 확인 후 deprecated 별칭 1단계 유지 권장.
+
+### 7.8 통합 invariant: Stage Gate Ordering (ENG-ALG-231 / INV-142)
+
+#### 설계 결정
+
+ENG-ALG-226~230이 모두 적용되면 `execute_on_slots`의 GPU 작업이 비동기화되어 stage 간 ordering이 명시 invariant 없이는 race 가능성 발생. 다음을 강제한다:
+
+```
+(a-pre) prefault_layers       — host page touch, sync 무관
+(a)     materialise_tensor    — fused convert kernel + async write_buffer (큐 누적)
+(b)     LayerSlot::swap_weights — atomic, ordering 영향 없음 (INV-123)
+(c)     primary release worker enqueue — 비동기, GPU와 무관
+(c-fin) stage gate             — backend.synchronize() 1회 (INV-142)
+(e-pre) invalidate_noshuffle_soa_registry — synchronize 후에만 호출
+(d)     ensure_noshuffle_soa_registered  — synchronize 후에만 호출
+(e)     ratio_generation.fetch_add        — 모든 GPU 작업 완료 후
+```
+
+**INV-142 (Stage Gate)**: ratio_generation bump 직전 backend queue가 idle해야 한다. 위반 시 forward가 미완성 cl_mem을 보고 garbage 산출 가능. 검증은 `synchronize()` 호출 직후 `clGetEventInfo` 또는 `OpenCLBackend::queue_idle()` 헬퍼.
+
+#### 처리 흐름
+
+```mermaid
+sequenceDiagram
+    participant Exec as execute_on_slots
+    participant Mmap as SecondaryMmap
+    participant Q as OpenCL queue
+    participant Reg as SOA registry
+    participant Worker as ReleaseWorker
+    participant Model as TransformerModel
+
+    Exec->>Worker: assert pending == 0 (INV-141)
+    Exec->>Mmap: prefault_layers(targets) (ENG-ALG-229)
+    loop per layer in targets
+        Exec->>Mmap: tensor_bytes (borrow, ENG-ALG-227)
+        Exec->>Q: enqueue fused convert kernel (ENG-ALG-226, no sync)
+        Exec->>Q: enqueue write_buffer async (ENG-ALG-230)
+        Exec->>Model: LayerSlot.swap_weights (atomic)
+        Exec->>Worker: enqueue(old_arc) (ENG-ALG-228)
+    end
+    Note over Exec,Q: STAGE GATE — INV-142
+    Exec->>Q: synchronize() ★ 1회
+    Q-->>Exec: queue idle
+    Exec->>Reg: invalidate_noshuffle_soa_registry (ENG-ALG-221)
+    Exec->>Reg: ensure_noshuffle_soa_registered per layer (ENG-ALG-222)
+    Exec->>Model: ratio_generation.fetch_add(1, SeqCst)
+    Exec-->>Exec: SwapReport with stages.primary_release_ms (E rename)
+```
+
+### 7.9 새 ID 요약
+
+| ID | 분류 | 한줄 의도 | 의존 |
+|----|------|----------|------|
+| ENG-ALG-226 | Algorithm | Fused SOA convert + transpose: host round-trip 제거 | INV-130, INV-131 (등록 의무 유지) |
+| ENG-ALG-227 | Algorithm | AOS path borrow buffer: secondary mmap 직접 read | INV-125 (mmap 생존), INV-143 |
+| ENG-ALG-228 | Algorithm | Deferred primary release: critical path에서 cl_mem drop 제거 | INV-121 (forward snapshot), INV-141 |
+| ENG-ALG-229 | Algorithm | Targeted prefault: target layer byte range만 page touch | ENG-DAT-094 (decoder layer index) |
+| ENG-ALG-230 | Algorithm | Async upload + single finish: write_buffer non-blocking + batch end synchronize | INV-142 |
+| ENG-ALG-231 | Algorithm | Stage gate ordering: synchronize → registry 갱신 → bump 순서 | INV-142, INV-130, INV-131, INV-129 |
+| INV-140 | Correctness | Fused convert kernel 결과는 4-step path와 비트 동일 | ENG-ALG-226 |
+| INV-141 | Correctness | ReleaseWorker는 다음 swap 전 drain 완료 | ENG-ALG-228 |
+| INV-142 | Safety/Correctness | ratio_generation bump 시 queue idle 보장 | ENG-ALG-230, ENG-ALG-231 |
+| INV-143 | Safety | borrow buffer는 secondary Arc clone을 보관, mmap drop 금지 | ENG-ALG-227, INV-125 |
+| ENG-DAT-100 | Data | PrimaryReleaseWorker struct 정의 | ENG-ALG-228 |
+
+### 7.10 작업 분배 권고
+
+- **Senior Implementer**: ENG-ALG-226 (`engine/kernels/cvt_q4_0_noshuffle_fused.cl` 신규 + 4-step fallback gate, Adreno register 한계 측정 필요).
+- **Implementer**: ENG-ALG-227 (borrow buffer wrapper + materialise_tensor 분기), ENG-ALG-228 + ENG-DAT-100 (PrimaryReleaseWorker), ENG-ALG-229 (prefault_layers signature), ENG-ALG-230 (alloc_and_upload_soa_buffers async), ENG-ALG-231 (execute_on_slots stage gate 정렬).
+- **Implementer (E rename, batch)**: 다른 fix 머지 후 단독 PR로 `madvise_ms` → `primary_release_ms`. shared crate 노출 시 deprecated alias 1 cycle 유지.
+- **Tester**: 각 spec test 디바이스 검증 + Galaxy S25 stage breakdown 재측정 (ratio=0.9 기준 1564.6 ms → 목표 < 800 ms).
+
+---
+
+## 8. 변경 이력
+
+- **2026-05-07 (v9, Phase 6.5 Swap Overhead Reduction)**:
+  1. §7 신규. 측정 결과(swap_overhead_s25.md) 기반 6 finding을 컴포넌트 단위로 분해.
+  2. ENG-ALG-226~231 (6개), INV-140~143 (4개), ENG-DAT-100 (1개) 신규.
+  3. §7.8 통합 stage gate ordering invariant (INV-142). 비동기화로 인한 잠재 race 차단.
+  4. §7.7 stage label rename (madvise_ms → primary_release_ms). batch task로 분리.
+  5. 작업 분배 권고: Senior(.cl) / Impl(Rust) / Impl(rename batch) / Tester.
 
 - **2026-04-25 (v6, Phase 3.6 Noshuffle SOA registry coherence)**:
   1. §2.2.3 "Noshuffle SOA Registry Coherence" 신규. ENG-ALG-221 / INV-130 cross-ref.

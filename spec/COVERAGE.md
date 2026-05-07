@@ -162,6 +162,17 @@
 | INV-133 | AUF reader는 META, TOKENIZER, TENSOR_INDEX 그리고 자기 backend의 WEIGHTS_* section 부재 시 reject + repack 안내. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_133_auf_required_sections.rs` |
 | INV-134 | AUF section offset/size 무결성: file_size 내 + overlap 금지 + tag unique. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_134_auf_section_integrity.rs` |
 
+## Weight Swap × Phase 6.5 Overhead Reduction (INV-140 ~ INV-143, 2026-05-07)
+
+> Galaxy S25 1564.6 ms swap stall 감축. 대응 명세: `32-engine-algorithms.md` §3.12.19~3.12.20 (ENG-ALG-226~231), `33-engine-data.md` §3.23 (ENG-DAT-100), `arch/weight_swap.md` §7. 측정 보고서: `papers/eurosys2027/_workspace/experiment/swap_overhead_s25.md`.
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-140 | Fused SOA convert kernel(`cvt_q4_0_noshuffle_fused`) 출력은 4-step path와 byte-equal. random Q4_0 buffer + 다양 (ne00, ne01) 비교. fused 미가용 시 4-step fallback 정확성도 동일. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_140_fused_convert_byte_equal.rs` + 디바이스 manual |
+| INV-141 | `PrimaryReleaseWorker`는 다음 swap 트리거 전 drain 완료. `pending_count() == 0` 검증 후 진입, non-zero 시 짧은 deadline `drain()` + 재검증 + drain 실패 시 `SwapError::ReleaseDrainTimeout`. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_141_release_worker_drain.rs` |
+| INV-142 | `execute_on_slots`의 `ratio_generation.fetch_add` 직전 `backend.synchronize()` 1회 호출 보장. 비동기 write_buffer/fused convert가 모두 완료된 후 SOA registry 갱신과 ratio_generation bump가 직렬화된다. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_142_stage_gate_sync.rs` + 디바이스 e2e (INV-122 v2.1 단일-token 게이트) |
+| INV-143 | AOS borrow buffer는 secondary `Arc<SecondaryMmap>` clone을 보관. Tensor 생존 동안 secondary refcount ≥ 2. mmap drop으로 인한 SIGBUS 차단. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_143_borrow_buffer_lifetime.rs` |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -293,6 +304,12 @@
 | ENG-ALG-221 | (A) | SwapExecutor batch 종료 직후 `OpenCLBackend::noshuffle_soa_registry` invalidate (전체 clear 또는 per-layer 제거). 다음 forward의 plan rebuild 경로에서 새 cl_mem 주소로 자연 재등록. **디바이스(Adreno 830) 한정 발현**, 호스트는 NoOp. ENG-ALG-211 step (e)와 동일 단계. | 🆕 미구현 | `engine/tests/spec/test_inv_130_noshuffle_soa_coherence.rs` + 디바이스 manual 검증 |
 | ENG-ALG-222 | (A) | Adreno SOA 재변환 safety net (Phase 3.7a). Q4_0 swap 후 AUF cache hit 시 SOA descriptor 등록, miss 시 `convert_aos_to_soa()` fallback. 디바이스 한정. | 🆕 미구현 | `engine/tests/spec/test_inv_131_soa_reconversion.rs` |
 | ENG-ALG-223 | (A) | AUF v0.1 reader/writer/stripper 알고리즘. Reader: header validate → section table → backend WEIGHTS_* lookup. Writer: GGUF parse → variant 변환 → atomic write. Stripper: relocatable rewrite. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_223_auf_io.rs` |
+| ENG-ALG-226 | (A) | Fused SOA convert kernel — host round-trip 0회. INV-140 byte-equal. fused 미가용 시 4-step fallback. | 🆕 미구현 | `engine/tests/spec/test_inv_140_fused_convert_byte_equal.rs` |
+| ENG-ALG-227 | (A) | AOS path borrow buffer — secondary mmap 직접 read, owned heap copy 제거. INV-143 lifetime. | 🆕 미구현 | `engine/tests/spec/test_inv_143_borrow_buffer_lifetime.rs` + `test_eng_alg_227_borrow_path.rs` |
+| ENG-ALG-228 | (A) | Deferred primary release — mpsc + 워커 thread, critical path enqueue only. INV-141 drain. | 🆕 미구현 | `engine/tests/spec/test_inv_141_release_worker_drain.rs` |
+| ENG-ALG-229 | (A) | Targeted prefault — `prefault_layers(target_layers)` byte range 한정. backward-compat `prefault()` 유지. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_229_targeted_prefault.rs` |
+| ENG-ALG-230 | (A) | Async write_buffer + fused convert no internal sync. caller가 stage gate에서 `synchronize()` 1회. INV-142. | 🆕 미구현 | `engine/tests/spec/test_inv_142_stage_gate_sync.rs` |
+| ENG-ALG-231 | (A) | execute_on_slots stage ordering: prefault → materialise/convert/upload (async) → swap_weights → release enqueue → synchronize ★ → invalidate registry → register SOA → ratio_generation bump. | 🆕 미구현 | `engine/tests/spec/test_inv_142_stage_gate_sync.rs` (ordering 부분) |
 
 ## Engine Data
 
@@ -309,6 +326,7 @@
 | ENG-DAT-094 | (D) | SecondaryMmap (mmap + decoder layer tensor index only). cross_layer_offsets 필드 없음. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_094_secondary_mmap.rs` |
 | ENG-DAT-095 | (D) | QuantNoiseTable (per-layer ε, eager 계산, NaN 결측 표기, uniform_ones fallback) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_095_quant_noise_table.rs` |
 | ENG-DAT-096 | (D) | AUF v0.1 self-contained format (header 256B, section table 48B/entry, META/TOKENIZER/TENSOR_INDEX/WEIGHTS_* sections, hybrid source_hash, 64KB align) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_096_auf_format.rs` |
+| ENG-DAT-100 | (D) | `PrimaryReleaseWorker` 구조 (sender, pending AtomicUsize, JoinHandle). spawn / enqueue / pending_count / drain API. model lifetime 동안 생존, graceful shutdown. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_100_release_worker.rs` |
 
 ## Cross-cutting
 

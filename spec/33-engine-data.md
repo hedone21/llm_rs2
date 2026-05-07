@@ -1335,6 +1335,46 @@ bit 3 = 1이면 "이 AUF에는 어딘가에 multi-dtype entry가 적어도 1쌍 
 
 ---
 
+### 3.23 PrimaryReleaseWorker — Asynchronous Primary cl_mem Drop [ENG-DAT-100]
+
+**[ENG-DAT-100]** `PrimaryReleaseWorker`는 ENG-ALG-228 (deferred primary release)의 비동기 작업 큐와 워커 thread를 캡슐화하는 자료 구조이다. `SwapExecutor`가 step (c)에서 displaced `Arc<LayerWeights>`를 enqueue하면, 별도 thread가 `Arc::try_unwrap` + drop을 수행하여 `clReleaseMemObject` chain을 critical path에서 제거한다. *(MUST)*
+
+**필드**:
+
+| 필드 | 타입 | 의미 |
+|------|------|------|
+| `sender` | `mpsc::Sender<Arc<LayerWeights>>` | enqueue 채널. `SwapExecutor`가 step (c)에서 호출. |
+| `pending` | `Arc<AtomicUsize>` | 큐에 남은 작업 수. INV-141 검증용. enqueue 시 증가, drop 완료 후 감소. |
+| `handle` | `thread::JoinHandle<()>` | 워커 thread. model lifetime 동안 살아 있음. |
+
+**API**:
+
+```rust
+impl PrimaryReleaseWorker {
+    pub fn spawn(backend: Arc<dyn Backend>) -> Self;
+    pub fn enqueue(&self, layer: Arc<LayerWeights>);
+    pub fn pending_count(&self) -> usize;
+    pub fn drain(&self, deadline: Duration) -> Result<(), DrainTimeout>;
+}
+```
+
+**Lifecycle**:
+- `TransformerModel::new()`에서 spawn (또는 lazy 초기화 — `Option<PrimaryReleaseWorker>`).
+- model drop 시 graceful shutdown — sender drop으로 채널 close → 워커가 남은 작업 처리 후 종료 → JoinHandle::join.
+
+**Backoff 전략 (워커 내부)**:
+- `Arc::try_unwrap` 실패(forward가 토큰 경계 snapshot 보유 중) 시 짧은 yield 후 재시도.
+- 토큰 경계 통과는 ms 단위이므로 wait는 상한 시간 내 자연 해제.
+- 무한 backoff 방지: 재시도 횟수 상한 + 마지막에 madvise(DONTNEED) fallback (Arc는 살려둠 — 다음 swap 시 재시도).
+
+**Cross-reference**:
+- ENG-ALG-228 (deferred release 알고리즘).
+- INV-141 (다음 swap 전 drain 의무).
+- INV-121 (per-token snapshot — backoff 사유).
+- ENG-DAT-093 (`TransformerModel` flat 배치에 `release_worker: Option<PrimaryReleaseWorker>` 추가).
+
+---
+
 ## 4. Alternative Behavior
 
 해당 없음. 이 문서는 데이터 정의 문서이다. 데이터 처리의 대안 동작은 `32-engine-algorithms.md`에서 다룬다.
