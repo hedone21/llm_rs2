@@ -318,6 +318,11 @@ struct KernelCache {
     f16_is_nosub: bool,
     // Q4_0 noshuffle: SOA conversion kernel (Adreno-optimized, from cvt.cl)
     kernel_cvt_q4_0_noshuffle: Option<CoreKernel>,
+    /// ENG-ALG-226 / INV-140: Fused single-dispatch SOA convert + 2D transpose
+    /// kernel. When `Some(_)`, `convert_q4_0_to_noshuffle()` skips the 4-step
+    /// host round-trip path. `None` falls back to the legacy path.
+    /// Source: `engine/kernels/cvt_q4_0_noshuffle_fused.cl`.
+    kernel_cvt_q4_0_noshuffle_fused: Option<CoreKernel>,
     /// Adreno-optimized Q4_0 GEMM for prefill (llama.cpp mul_mat_Ab_Bi_8x4).
     /// Consumes the same SOA q_buf / d_buf produced by `convert_q4_0_to_noshuffle`.
     /// Activations must be transposed to F16 (K × N_padded) via
@@ -402,6 +407,10 @@ pub struct OpenCLBackend {
 
     // Q4_0 noshuffle programs (optional — Adreno-optimized SOA GEMV)
     pub cvt_noshuffle_program: Option<Program>,
+    /// ENG-ALG-226: Fused SOA convert + transpose program (single dispatch).
+    /// `None` ⇒ legacy 4-step host-transpose fallback in
+    /// `convert_q4_0_to_noshuffle()`.
+    pub cvt_noshuffle_fused_program: Option<Program>,
     // gemv_noshuffle programs are dimension-specific (LINE_STRIDE_A, BLOCK_STRIDE_A).
     // Built lazily per weight dimension via convert_q4_0_to_noshuffle().
 
@@ -1127,6 +1136,28 @@ impl OpenCLBackend {
             log::warn!("cvt.cl failed to compile. Q4_0 noshuffle disabled.");
         }
 
+        // ENG-ALG-226 / INV-140: Fused convert+transpose kernel.
+        // Compiled as a separate program so a register-spill failure on Adreno
+        // (per-thread float4 budget) leaves the legacy `cvt.cl` path intact.
+        // `convert_q4_0_to_noshuffle()` falls back to the 4-step path when this
+        // program (and therefore `kernel_cvt_q4_0_noshuffle_fused`) is `None`.
+        let cvt_noshuffle_fused_src = include_str!("../../../kernels/cvt_q4_0_noshuffle_fused.cl");
+        let cvt_noshuffle_fused_program = Program::builder()
+            .devices(device)
+            .src(cvt_noshuffle_fused_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+            .ok();
+        if cvt_noshuffle_fused_program.is_some() {
+            log::info!(
+                "cvt_q4_0_noshuffle_fused.cl compiled (ENG-ALG-226 fused SOA convert+transpose)"
+            );
+        } else {
+            log::warn!(
+                "cvt_q4_0_noshuffle_fused.cl failed to compile; falling back to 4-step host transpose path."
+            );
+        }
+
         // Adreno Q4_0 GEMM fast path: `mul_mat_Ab_Bi_8x4.cl` consumes SOA
         // weights (from cvt.cl) and F16-transposed activations to compute
         // prefill matmul at ~4-5x the throughput of generic `mul_mm_q4_0`.
@@ -1331,6 +1362,9 @@ impl OpenCLBackend {
             kernel_cvt_q4_0_noshuffle: cvt_noshuffle_program.as_ref().and_then(|p| {
                 ocl::core::create_kernel(p, "kernel_convert_block_q4_0_noshuffle").ok()
             }),
+            kernel_cvt_q4_0_noshuffle_fused: cvt_noshuffle_fused_program.as_ref().and_then(|p| {
+                ocl::core::create_kernel(p, "kernel_convert_block_q4_0_noshuffle_fused").ok()
+            }),
             kernel_mul_mat_ab_bi_8x4: gemm_ab_bi_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_Ab_Bi_8x4").ok()),
@@ -1404,6 +1438,7 @@ impl OpenCLBackend {
             kivi_attn_program,
             attention_scores_program,
             cvt_noshuffle_program,
+            cvt_noshuffle_fused_program,
             gemm_ab_bi_program,
             transpose_program,
             kernels: UnsafeCell::new(kernel_cache),
@@ -2313,19 +2348,34 @@ impl OpenCLBackend {
 
     /// Convert Q4_0 AOS weight buffer to SOA layout for the noshuffle GEMV kernel.
     ///
-    /// Called once per weight tensor at model load time.
+    /// Called once per weight tensor at model load time and on every weight
+    /// swap (Phase 6.5 stage `soa_reconvert`).
     /// Returns (q_buf, d_buf, q_img) — the SOA nibbles buffer, scales buffer,
     /// and an optional image1d_buffer_t wrapping q_buf (R32UI) for Adreno TP cache.
     /// **Transposed** so that the GEMV kernel can access them with coalesced reads.
     ///
-    /// The full pipeline mirrors llama.cpp's Adreno path:
-    ///   1. GPU: kernel_convert_block_q4_0_noshuffle (nibble rearrange, row-major)
-    ///   2. CPU: ushort-level 2D transpose of q buffer (M rows x K/4 cols -> K/4 rows x M cols)
-    ///   3. CPU: half-level 2D transpose of d buffer (M rows x blocks_per_row cols -> transposed)
-    ///   4. Create image1d_buffer_t wrapping q_buf (R32UI) — gracefully degrades if unsupported.
+    /// # Two paths (same byte-equal output, INV-140)
+    ///
+    /// 1. **Fused** (ENG-ALG-226, default when available):
+    ///    `kernel_convert_block_q4_0_noshuffle_fused` performs nibble
+    ///    rearrange + 2D transpose in a single GPU dispatch with zero host
+    ///    round-trip. No `queue.finish()` — the caller must `synchronize()`
+    ///    before the result is consumed by another stage (ENG-ALG-230/231,
+    ///    INV-142).
+    ///
+    /// 2. **4-step legacy fallback** (when fused kernel is `None` or
+    ///    alignment requirements aren't met):
+    ///    GPU `kernel_convert_block_q4_0_noshuffle` (nibble rearrange,
+    ///    row-major) → host read → CPU ushort-level transpose of q buffer
+    ///    → CPU half-level transpose of d buffer → write_buffer × 2
+    ///    → image1d_buffer_t creation.
+    ///
+    /// Both paths produce identical cl_mem contents (INV-140); the fused
+    /// kernel was validated against the legacy path on host (NVIDIA OpenCL)
+    /// via `engine/tests/spec/test_inv_140_fused_convert_byte_equal.rs`.
     ///
     /// # Arguments
-    /// * `src` - Raw Q4_0 weight buffer (BlockQ4_0 AOS format)
+    /// * `src` - Raw Q4_0 weight buffer (BlockQ4_0 AOS format, 18 B / block)
     /// * `num_blocks` - Total number of Q4_0 blocks (= num_rows * K / QK4_0)
     /// * `ne00` - K dimension (elements per row)
     /// * `ne01` - M dimension (number of rows)
@@ -2337,12 +2387,12 @@ impl OpenCLBackend {
         ne01: usize,
     ) -> Result<(ocl::core::Mem, ocl::core::Mem, Option<ocl::core::Mem>)> {
         let kernels = unsafe { &*self.kernels.get() };
-        let cvt_kernel = kernels
-            .kernel_cvt_q4_0_noshuffle
-            .as_ref()
-            .ok_or_else(|| anyhow!("Q4_0 noshuffle conversion kernel not available"))?;
 
-        // Allocate SOA buffers (row-major, pre-transpose)
+        // Allocate SOA buffers (the layout below is the *post-transpose*
+        // layout, written directly by the fused kernel, or written first
+        // row-major by the legacy kernel and overwritten by the host
+        // transpose in the 4-step path).
+        //
         // dst_q: num_blocks * 16 bytes (QK4_0/2 = 16 nibble-bytes per block)
         let q_bytes = num_blocks * 16;
         let dst_q = unsafe {
@@ -2366,108 +2416,162 @@ impl OpenCLBackend {
         };
         self.record_cl_mem_alloc("weight_q4_soa_d", num_blocks * 2);
 
-        // Step 1: GPU SOA conversion (nibble rearrange, keeps row-major block order)
-        unsafe {
-            ocl::core::set_kernel_arg(cvt_kernel, 0, ocl::core::ArgVal::mem(src))?;
-            ocl::core::set_kernel_arg(cvt_kernel, 1, ocl::core::ArgVal::mem(&dst_q))?;
-            ocl::core::set_kernel_arg(cvt_kernel, 2, ocl::core::ArgVal::mem(&dst_d))?;
-
-            let global_work_size: [usize; 3] = [num_blocks, 1, 1];
-            self.enqueue_kernel_labeled(cvt_kernel, "load_time", 1, &global_work_size, None)?;
-        }
-        self.queue.finish()?;
-
-        // Step 2: CPU transpose of q buffer (ushort-level 2D transpose)
-        //
-        // Row-major layout (after SOA conversion):
-        //   q[row * cols_ushort + col] where cols_ushort = K/4 (ushort per row)
-        // Transposed layout (what GEMV expects):
-        //   q_t[col * M + row] (column-major by ushort)
-        //
-        // When GEMV reads uint* from the transposed buffer, consecutive row-pairs
-        // (row 2*gid, 2*gid+1) share a uint, enabling 2-row-per-fiber processing.
-        let cols_ushort = ne00 / 4; // K/4 ushort per row
-        let q_total_ushort = ne01 * cols_ushort;
-        {
-            let mut q_host = vec![0u16; q_total_ushort];
-            unsafe {
-                ocl::core::enqueue_read_buffer(
-                    &self.queue,
-                    &dst_q,
-                    true,
-                    0,
-                    std::slice::from_raw_parts_mut(
-                        q_host.as_mut_ptr() as *mut u8,
-                        q_total_ushort * 2,
-                    ),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-
-            let mut q_transposed = vec![0u16; q_total_ushort];
-            for row in 0..ne01 {
-                for col in 0..cols_ushort {
-                    q_transposed[col * ne01 + row] = q_host[row * cols_ushort + col];
-                }
-            }
-
-            unsafe {
-                ocl::core::enqueue_write_buffer(
-                    &self.queue,
-                    &dst_q,
-                    true,
-                    0,
-                    std::slice::from_raw_parts(
-                        q_transposed.as_ptr() as *const u8,
-                        q_total_ushort * 2,
-                    ),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-        }
-
-        // Step 3: CPU transpose of d buffer (half-level 2D transpose)
-        //
-        // Row-major: d[row * blocks_per_row + k] (half per block)
-        // Transposed: d_t[k * M + row] (column-major by half)
-        //
-        // GEMV reads half2* from transposed d: half2[k*(M/2) + gid]
-        //   .x = d_t[k*M + 2*gid]   = scale for even row
-        //   .y = d_t[k*M + 2*gid+1] = scale for odd row
+        let cols_ushort = ne00 / 4; // K/4 ushort per row (post-transpose width)
         let blocks_per_row = ne00 / 32; // QK4_0 = 32
-        {
-            let mut d_host = vec![0u16; num_blocks];
-            unsafe {
-                ocl::core::enqueue_read_buffer(
-                    &self.queue,
-                    &dst_d,
-                    true,
-                    0,
-                    std::slice::from_raw_parts_mut(d_host.as_mut_ptr() as *mut u8, num_blocks * 2),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
+        let q_total_ushort = ne01 * cols_ushort;
 
-            let mut d_transposed = vec![0u16; num_blocks];
-            for row in 0..ne01 {
-                for k in 0..blocks_per_row {
-                    d_transposed[k * ne01 + row] = d_host[row * blocks_per_row + k];
+        // ── Path selection ────────────────────────────────────────────────
+        //
+        // Fused path requires:
+        //   * compiled kernel handle, and
+        //   * ne00 % 32 == 0 (always true for Q4_0; one block has 32 elems),
+        //   * ne00 % 4 == 0  (cols_ushort well-defined; implied above),
+        //   * ne01 unrestricted — every row is independent.
+        //
+        // We additionally require num_blocks == ne01 * blocks_per_row to
+        // catch caller mismatches (the kernel divides gid by blocks_per_row
+        // to recover row, which would be wrong if num_blocks were inflated).
+        let fused_eligible = kernels.kernel_cvt_q4_0_noshuffle_fused.is_some()
+            && ne00.is_multiple_of(32)
+            && num_blocks == ne01 * blocks_per_row;
+
+        if fused_eligible {
+            // ── ENG-ALG-226 fused path ────────────────────────────────────
+            let fused_kernel = kernels.kernel_cvt_q4_0_noshuffle_fused.as_ref().unwrap();
+            unsafe {
+                ocl::core::set_kernel_arg(fused_kernel, 0, ocl::core::ArgVal::mem(src))?;
+                ocl::core::set_kernel_arg(fused_kernel, 1, ocl::core::ArgVal::mem(&dst_q))?;
+                ocl::core::set_kernel_arg(fused_kernel, 2, ocl::core::ArgVal::mem(&dst_d))?;
+                ocl::core::set_kernel_arg(
+                    fused_kernel,
+                    3,
+                    ocl::core::ArgVal::scalar(&(ne01 as u32)),
+                )?;
+                ocl::core::set_kernel_arg(
+                    fused_kernel,
+                    4,
+                    ocl::core::ArgVal::scalar(&(blocks_per_row as u32)),
+                )?;
+
+                let global_work_size: [usize; 3] = [num_blocks, 1, 1];
+                self.enqueue_kernel_labeled(fused_kernel, "load_time", 1, &global_work_size, None)?;
+            }
+            // NOTE: ENG-ALG-230 / INV-142 — no `queue.finish()` here. The
+            // caller (`SwapExecutor::execute_on_slots`) issues a single
+            // `backend.synchronize()` at the stage gate before consumers
+            // (forward path, SOA registry rebuild) read the result.
+        } else {
+            // ── 4-step legacy fallback (kernel unavailable or unaligned) ──
+            let cvt_kernel = kernels.kernel_cvt_q4_0_noshuffle.as_ref().ok_or_else(|| {
+                anyhow!("Q4_0 noshuffle conversion kernel not available (neither fused nor legacy)")
+            })?;
+
+            // Step 1: GPU SOA conversion (nibble rearrange, keeps row-major block order)
+            unsafe {
+                ocl::core::set_kernel_arg(cvt_kernel, 0, ocl::core::ArgVal::mem(src))?;
+                ocl::core::set_kernel_arg(cvt_kernel, 1, ocl::core::ArgVal::mem(&dst_q))?;
+                ocl::core::set_kernel_arg(cvt_kernel, 2, ocl::core::ArgVal::mem(&dst_d))?;
+
+                let global_work_size: [usize; 3] = [num_blocks, 1, 1];
+                self.enqueue_kernel_labeled(cvt_kernel, "load_time", 1, &global_work_size, None)?;
+            }
+            self.queue.finish()?;
+
+            // Step 2: CPU transpose of q buffer (ushort-level 2D transpose)
+            //
+            // Row-major layout (after SOA conversion):
+            //   q[row * cols_ushort + col] where cols_ushort = K/4 (ushort per row)
+            // Transposed layout (what GEMV expects):
+            //   q_t[col * M + row] (column-major by ushort)
+            //
+            // When GEMV reads uint* from the transposed buffer, consecutive row-pairs
+            // (row 2*gid, 2*gid+1) share a uint, enabling 2-row-per-fiber processing.
+            {
+                let mut q_host = vec![0u16; q_total_ushort];
+                unsafe {
+                    ocl::core::enqueue_read_buffer(
+                        &self.queue,
+                        &dst_q,
+                        true,
+                        0,
+                        std::slice::from_raw_parts_mut(
+                            q_host.as_mut_ptr() as *mut u8,
+                            q_total_ushort * 2,
+                        ),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
+
+                let mut q_transposed = vec![0u16; q_total_ushort];
+                for row in 0..ne01 {
+                    for col in 0..cols_ushort {
+                        q_transposed[col * ne01 + row] = q_host[row * cols_ushort + col];
+                    }
+                }
+
+                unsafe {
+                    ocl::core::enqueue_write_buffer(
+                        &self.queue,
+                        &dst_q,
+                        true,
+                        0,
+                        std::slice::from_raw_parts(
+                            q_transposed.as_ptr() as *const u8,
+                            q_total_ushort * 2,
+                        ),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
                 }
             }
 
-            unsafe {
-                ocl::core::enqueue_write_buffer(
-                    &self.queue,
-                    &dst_d,
-                    true,
-                    0,
-                    std::slice::from_raw_parts(d_transposed.as_ptr() as *const u8, num_blocks * 2),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
+            // Step 3: CPU transpose of d buffer (half-level 2D transpose)
+            //
+            // Row-major: d[row * blocks_per_row + k] (half per block)
+            // Transposed: d_t[k * M + row] (column-major by half)
+            //
+            // GEMV reads half2* from transposed d: half2[k*(M/2) + gid]
+            //   .x = d_t[k*M + 2*gid]   = scale for even row
+            //   .y = d_t[k*M + 2*gid+1] = scale for odd row
+            {
+                let mut d_host = vec![0u16; num_blocks];
+                unsafe {
+                    ocl::core::enqueue_read_buffer(
+                        &self.queue,
+                        &dst_d,
+                        true,
+                        0,
+                        std::slice::from_raw_parts_mut(
+                            d_host.as_mut_ptr() as *mut u8,
+                            num_blocks * 2,
+                        ),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
+
+                let mut d_transposed = vec![0u16; num_blocks];
+                for row in 0..ne01 {
+                    for k in 0..blocks_per_row {
+                        d_transposed[k * ne01 + row] = d_host[row * blocks_per_row + k];
+                    }
+                }
+
+                unsafe {
+                    ocl::core::enqueue_write_buffer(
+                        &self.queue,
+                        &dst_d,
+                        true,
+                        0,
+                        std::slice::from_raw_parts(
+                            d_transposed.as_ptr() as *const u8,
+                            num_blocks * 2,
+                        ),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
             }
         }
 
@@ -2528,7 +2632,12 @@ impl OpenCLBackend {
         };
 
         log::info!(
-            "Q4_0 noshuffle SOA conversion + transpose done: {} blocks, ne00={}, ne01={}, q={} KB, d={} KB, img={}",
+            "Q4_0 noshuffle SOA conversion + transpose done ({}): {} blocks, ne00={}, ne01={}, q={} KB, d={} KB, img={}",
+            if fused_eligible {
+                "fused single-dispatch (ENG-ALG-226)"
+            } else {
+                "4-step host-transpose fallback"
+            },
             num_blocks,
             ne00,
             ne01,
