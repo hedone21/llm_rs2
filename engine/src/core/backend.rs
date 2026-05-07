@@ -420,6 +420,56 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Whether the backend has a dedicated F32->F32 batch KV scatter kernel.
+    /// Default: false. CUDA-PC overrides to true.
+    fn supports_kv_scatter_f32_batch(&self) -> bool {
+        false
+    }
+
+    /// Batch F32->F32 KV scatter (HeadMajor). Same launch shape and semantics as
+    /// `kv_scatter_f32_to_f16_batch` but no cast — for `kv-type=f32` caches on GPU.
+    /// Avoids the per-(s,h) `cuMemcpyDtoD` storm produced by the generic
+    /// `KVCache::update` path on discrete CUDA.
+    /// Default: host-pointer fallback — ONLY safe when callers guard on
+    /// `supports_kv_scatter_f32_batch()`.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_scatter_f32_to_f32_batch(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        write_pos_start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let src_k = unsafe {
+            std::slice::from_raw_parts(k_src.as_ptr() as *const f32, k_src.size() / 4)
+        };
+        let src_v = unsafe {
+            std::slice::from_raw_parts(v_src.as_ptr() as *const f32, v_src.size() / 4)
+        };
+        let dst_k = unsafe {
+            std::slice::from_raw_parts_mut(k_dst.as_mut_ptr() as *mut f32, k_dst.size() / 4)
+        };
+        let dst_v = unsafe {
+            std::slice::from_raw_parts_mut(v_dst.as_mut_ptr() as *mut f32, v_dst.size() / 4)
+        };
+        for s in 0..seq_len {
+            for h in 0..n_kv_heads {
+                let src_off = (s * n_kv_heads + h) * head_dim;
+                let dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim;
+                dst_k[dst_off..dst_off + head_dim]
+                    .copy_from_slice(&src_k[src_off..src_off + head_dim]);
+                dst_v[dst_off..dst_off + head_dim]
+                    .copy_from_slice(&src_v[src_off..src_off + head_dim]);
+            }
+        }
+        Ok(())
+    }
+
     /// Copy data from src into dst buffer (same shape/size required).
     /// On GPU: just enqueue_copy_buffer, no new backend/kernel allocation.
     /// On CPU: memcpy.

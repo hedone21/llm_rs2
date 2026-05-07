@@ -364,6 +364,23 @@ impl TransformerLayer {
                 backend.kv_scatter_f32_to_f16(&k_rope, &ws.v, k_buf, v_buf, head_dim, cap, pos)?;
             }
             kv_cache.advance_pos(1);
+        } else if kv_dtype == DType::F32
+            && is_gpu
+            && is_decode
+            && kv_cache.layout() == KVLayout::HeadMajor
+            && backend.supports_kv_scatter_f32_batch()
+        {
+            // GPU F32 HeadMajor decode: single batched scatter dispatch (seq_len=1).
+            // Avoids the per-head cuMemcpyDtoD storm in the generic update path.
+            kv_cache.ensure_capacity(kv_cache.current_pos() + 1)?;
+            let pos = kv_cache.current_pos();
+            let cap = kv_cache.capacity();
+            if let Some((k_buf, v_buf)) = kv_cache.get_buffers_mut() {
+                backend.kv_scatter_f32_to_f32_batch(
+                    &k_rope, &ws.v, k_buf, v_buf, n_heads_kv, head_dim, cap, pos, 1,
+                )?;
+            }
+            kv_cache.advance_pos(1);
         } else if kv_dtype != DType::F32 {
             let n_elem = n_heads_kv * head_dim;
             let buf_size = match kv_dtype {

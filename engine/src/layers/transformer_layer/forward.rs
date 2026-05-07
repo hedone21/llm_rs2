@@ -202,6 +202,24 @@ impl TransformerLayer {
                         )?;
                     }
                     kv_cache.advance_pos(seq_len);
+                } else if kv_dtype == DType::F32
+                    && is_gpu
+                    && kv_cache.layout() == KVLayout::HeadMajor
+                    && backend.supports_kv_scatter_f32_batch()
+                {
+                    // GPU F32 HeadMajor: batch scatter kernel (1 dispatch).
+                    // Generic KVCache::update path issues seq_len*kv_heads cuMemcpyDtoD
+                    // launches per layer per step — measured 38% of total wall in
+                    // discrete CUDA eval-ll. Fused scatter cuts that to one launch.
+                    kv_cache.ensure_capacity(kv_cache.current_pos() + seq_len)?;
+                    let pos = kv_cache.current_pos();
+                    let cap = kv_cache.capacity();
+                    if let Some((k_buf, v_buf)) = kv_cache.get_buffers_mut() {
+                        backend.kv_scatter_f32_to_f32_batch(
+                            &k_rope, &ws.v, k_buf, v_buf, n_heads_kv, head_dim, cap, pos, seq_len,
+                        )?;
+                    }
+                    kv_cache.advance_pos(seq_len);
                 } else if kv_dtype != DType::F32 {
                     let n_elem = seq_len * n_heads_kv * head_dim;
                     let buf_size = match kv_dtype {

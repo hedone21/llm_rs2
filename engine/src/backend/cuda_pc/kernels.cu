@@ -287,6 +287,26 @@ extern "C" __global__ void kv_scatter_f32_to_f16_batch(
 }
 
 // =================================================================
+// 11c. KV scatter F32->F32 BATCH (HeadMajor layout, prefill+decode)
+// =================================================================
+// Same launch shape as f32_to_f16_batch but no cast — for kv-type=f32 caches.
+// grid=(kv_heads, seq_len, 1), block=(head_dim, 1, 1)
+extern "C" __global__ void kv_scatter_f32_to_f32_batch(
+    const float * k_src, const float * v_src,
+    float * k_dst, float * v_dst,
+    int kv_heads, int head_dim, int capacity, int write_pos_start, int seq_len)
+{
+    int h = blockIdx.x;
+    int s = blockIdx.y;
+    int d = threadIdx.x;
+    if (h >= kv_heads || s >= seq_len || d >= head_dim) return;
+    int src_off = (s * kv_heads + h) * head_dim + d;
+    int dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim + d;
+    k_dst[dst_off] = k_src[src_off];
+    v_dst[dst_off] = v_src[src_off];
+}
+
+// =================================================================
 // 12. Gather F16 -> F32 (embedding lookup)
 // =================================================================
 // grid=(n_tokens, ceil(dim/256), 1), block=(256, 1, 1)

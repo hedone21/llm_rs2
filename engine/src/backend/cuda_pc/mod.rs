@@ -1267,6 +1267,72 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn supports_kv_scatter_f32_batch(&self) -> bool {
+        true
+    }
+
+    fn kv_scatter_f32_to_f32_batch(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        write_pos_start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let ks = Self::get_device_ptr(k_src.buffer().as_ref());
+        let vs = Self::get_device_ptr(v_src.buffer().as_ref());
+        let kd = Self::get_device_ptr(k_dst.buffer().as_ref());
+        let vd = Self::get_device_ptr(v_dst.buffer().as_ref());
+
+        if let (Some(ks), Some(vs), Some(kd), Some(vd)) = (ks, vs, kd, vd) {
+            let hd = head_dim as i32;
+            let cap = capacity as i32;
+            let wps = write_pos_start as i32;
+            let sl = seq_len as i32;
+            let kvh = kv_heads as i32;
+            let cfg = LaunchConfig {
+                grid_dim: (kv_heads as u32, seq_len as u32, 1),
+                block_dim: (head_dim as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let stream = self.ctx.default_stream();
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.kv_scatter_f32_batch)
+                    .arg(&ks)
+                    .arg(&vs)
+                    .arg(&kd)
+                    .arg(&vd)
+                    .arg(&kvh)
+                    .arg(&hd)
+                    .arg(&cap)
+                    .arg(&wps)
+                    .arg(&sl)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("kv_scatter_f32_batch launch failed: {e}"))?;
+            }
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
+            Ok(())
+        } else {
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
+            cpu_fallback().kv_scatter_f32_to_f32_batch(
+                k_src,
+                v_src,
+                k_dst,
+                v_dst,
+                kv_heads,
+                head_dim,
+                capacity,
+                write_pos_start,
+                seq_len,
+            )
+        }
+    }
+
     fn gather(&self, src: &Tensor, indices: &Tensor, dst: &mut Tensor) -> Result<()> {
         // GPU kernel only supports F16 embedding -> F32 output.
         // For other dtypes, sync and fall back to CPU.
