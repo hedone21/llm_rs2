@@ -588,34 +588,27 @@ impl<'a> SwapExecutor<'a> {
                     }
                 }
             } else {
-                // GGUF path: standard SOA re-conversion.
-                for swapped in &report.swapped {
-                    let Some(slot) = layers.get(swapped.layer_idx) else {
-                        continue;
-                    };
-                    let new_layer = slot.load_weights();
-                    for tensor in [
-                        &new_layer.wq,
-                        &new_layer.wk,
-                        &new_layer.wv,
-                        &new_layer.wo,
-                        &new_layer.w_gate,
-                        &new_layer.w_up,
-                        &new_layer.w_down,
-                    ] {
-                        if let Err(e) = self.backend.ensure_noshuffle_soa_registered(tensor) {
-                            // Conversion failure leaves the registry empty for
-                            // this tensor → AOS fallback path. Surface as the
-                            // batch error so the caller can decide (treating
-                            // partial registration as success would risk silent
-                            // accuracy loss).
-                            return Err(SwapError::BufferAllocationFailed {
-                                layer: swapped.layer_idx,
-                                source: e,
-                            });
-                        }
-                    }
-                }
+                // GGUF / AUF AOS path: intentionally do NOT register noshuffle
+                // SOA entries here.
+                //
+                // Adreno regression: `convert_q4_0_to_noshuffle` GPU kernel +
+                // `matmul_q4_0_noshuffle` GEMV produce incorrect output on
+                // swap-installed AOS Q4_0 weights. The host-NVIDIA byte-equal
+                // INV-140 test does not exercise the Adreno layout difference
+                // and missed the regression at introduction time
+                // (commit 4416994, 2026-05-01 AOS swap variant) and again at
+                // ENG-ALG-226 fused kernel introduction (Phase 6.5).
+                //
+                // With the registry empty for these tensors, `matmul_q4_0`
+                // falls through to the standard `kernel_mul_mat_q4_0_f32`
+                // GEMV which reads AOS bytes directly and produces correct
+                // output — the same path that the Q4_0 GGUF default load
+                // takes (its noshuffle replacement is silently discarded by
+                // a local-clone bug in `prepare_noshuffle_buffers`).
+                //
+                // Tracking: <issue ref TBD>. Removing this guard requires
+                // both fixing the Adreno noshuffle path AND extending
+                // INV-140 to run on-device.
             }
             stages.soa_reconvert_ms += t_d0.elapsed().as_secs_f64() * 1e3;
 
