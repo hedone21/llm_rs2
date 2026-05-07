@@ -113,7 +113,11 @@ impl PrimaryReleaseWorker {
         self.pending.fetch_add(1, Ordering::Release);
         // If send fails (worker already dead), decrement and log — do not panic
         // in production to preserve correctness of the swap path.
-        if self.sender.send(ReleaseJob::Layer(Box::new(layer))).is_err() {
+        if self
+            .sender
+            .send(ReleaseJob::Layer(Box::new(layer)))
+            .is_err()
+        {
             self.pending.fetch_sub(1, Ordering::Release);
             eprintln!("[PrimaryReleaseWorker] WARNING: worker is dead, layer dropped inline");
         }
