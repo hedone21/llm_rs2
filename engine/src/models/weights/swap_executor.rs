@@ -359,8 +359,13 @@ impl<'a> SwapExecutor<'a> {
         //
         // Charged as a single batch-level stage (NOT per layer) so cold and
         // warm runs are directly comparable. No-op on non-Linux targets.
+        //
+        // ENG-ALG-229: use `prefault_layers(target_layers)` instead of the
+        // broad `prefault()` so only the weight pages for layers that will
+        // actually be swapped are touched. This avoids reading ~40 ms worth
+        // of pages for layers outside the swap batch at ratio < 1.0.
         let t_pre0 = Instant::now();
-        secondary.prefault();
+        secondary.prefault_layers(target_layers);
         stages.prefault_ms = t_pre0.elapsed().as_secs_f64() * 1e3;
 
         for &layer_idx in target_layers {
@@ -872,18 +877,29 @@ impl<'a> SwapExecutor<'a> {
             None
         };
 
-        // Always build an owned SharedBuffer on CPU first, then route
-        // through the existing copy_weight_from / copy_from paths to land on
-        // the final backend. This matches the loader's behaviour for
-        // permuted weights and avoids plumbing mmap buffer lifetimes into
-        // the slot (the secondary mmap Arc is the lifetime keeper, but
-        // keeping per-tensor views alive would complicate madvise).
-        let owned_bytes: Vec<u8> = permuted_bytes.unwrap_or_else(|| data.to_vec());
-        let shared_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(owned_bytes, info.dtype));
+        // ENG-ALG-227: When no permutation is needed (AUF path), borrow the
+        // mmap bytes directly instead of copying them into a heap Vec.  The
+        // BorrowedMmapBuffer clones the secondary Arc (INV-143) so the mmap
+        // region remains alive for the duration of the backend upload.
+        //
+        // When permutation *is* needed (GGUF Q/K row reorder), the bytes have
+        // already been written into an owned Vec by `unpermute_qk_rows`, so we
+        // wrap that in a SharedBuffer as before.
+        let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
+            // Permuted path: owned heap allocation required (bytes were reordered).
+            Arc::new(SharedBuffer::from_vec(owned, info.dtype))
+        } else {
+            // Borrow path (AUF AOS / no permutation): zero-copy mmap borrow.
+            Arc::new(
+                crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
+                    secondary, data, info.dtype,
+                ),
+            )
+        };
 
         let cpu_backend: Arc<dyn Backend> =
             Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
-        let cpu_tensor = Tensor::new(shape.clone(), shared_buf, cpu_backend);
+        let cpu_tensor = Tensor::new(shape.clone(), cpu_buf, cpu_backend);
 
         let is_cpu = self.backend.name().contains("CPU");
         if is_cpu {

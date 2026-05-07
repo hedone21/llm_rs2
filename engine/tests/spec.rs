@@ -217,3 +217,15 @@ mod test_qcf_experimental;
 // ── INV-141 PrimaryReleaseWorker drain contract (ENG-ALG-228 / ENG-DAT-100) ──
 #[path = "spec/test_inv_141_release_worker_drain.rs"]
 mod test_inv_141_release_worker_drain;
+
+// ── INV-143 BorrowedMmapBuffer mmap lifetime (ENG-ALG-227) ──
+// AOS 무변환 경로에서 borrow buffer가 secondary Arc clone을 보관하여
+// mmap region이 copy_weight_from/copy_from 호출 중 drop되지 않음을 보증.
+#[path = "spec/test_inv_143_borrow_buffer_lifetime.rs"]
+mod test_inv_143_borrow_buffer_lifetime;
+
+// ── ENG-ALG-229 Targeted prefault for swap target layers ──
+// prefault_layers(target_layers)는 swap 대상 layer의 byte range만 page-touch.
+// ratio < 1.0 swap batch에서 비대상 layer 페이지 접근 ~40 ms 절감.
+#[path = "spec/test_eng_alg_229_targeted_prefault.rs"]
+mod test_eng_alg_229_targeted_prefault;
