@@ -6,6 +6,23 @@
 
 ---
 
+## STATUS (2026-05-09 갱신): CLOSED — Phase 9 fast-feasibility 결과 RED
+
+본 1주 PoC 계획 진입 전, 사용자 요청으로 3-question fast feasibility check (Phase 9, 1일 소요)를 먼저 수행했다.
+
+**결과**:
+- Q1 correctness ✓
+- Q2 async swap **✗** (Vulkan cross-family 1.895x ≈ OpenCL 1.93x — HW level serialize 확정)
+- Q3 throughput ✓ (Vulkan 0.979x parity, OpenCL ICD overhead negligible)
+
+→ **본 1주 PoC 진입 취소**. Phase 9 측정만으로 paper Section 4 evidence 결정적 강화. 상세: `papers/eurosys2027/_workspace/experiment/swap_overhead_phase9_vulkan_feasibility.md`.
+
+아래는 원본 1주 PoC 계획 (참고용 보존). 향후 Vulkan production migration 검토 시 재참조 가능.
+
+---
+
+---
+
 ## 0. 한 줄 요약
 
 OpenCL 스택 안의 모든 가능성 검증 완료 (Phase 0-8, 16 트랙). 이제 **Vulkan transfer queue가 OpenCL ICD를 우회해 GPU compute와 진정한 병렬 실행이 가능한지** 직접 microbench로 측정. **1주 PoC, 코드 ~300 LOC, 측정 binary 1개, production 코드 0줄 변경**. PoC 성공/실패 어느 쪽이든 paper main evidence 강화.

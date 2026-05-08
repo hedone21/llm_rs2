@@ -42,6 +42,9 @@ env_logger = "0.11"
 # OpenCL
 ocl = { version = "0.19", optional = true }
 
+# Vulkan (microbench-only PoC, default off)
+ash = { version = "0.38", optional = true }
+
 # CUDA (Jetson)
 cudarc = { version = "0.19", optional = true, default-features = false, features = [
   "std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading",
@@ -58,6 +61,7 @@ tempfile = "3.0"
 [features]
 default = ["opencl"]
 opencl = ["ocl"]
+vulkan = ["ash"]                # Vulkan PoC (microbench bins only)
 cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)
 cuda-embedded = ["cudarc"]      # Embedded UMA version, e.g. Jetson Xavier (cuda_embedded/)
 resilience = ["zbus"]
