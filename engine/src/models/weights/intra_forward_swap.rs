@@ -17,18 +17,34 @@
 //! - `finalize(...)` — drain → synchronize → ratio_generation +1 → invalidate
 //!   (INV-150).
 //!
-//! Non-Clone `GpuEvent` 처리: 진짜 cl_event는 `SwapCommitJob::write_event`로
-//! move하여 dispatcher worker가 `wait_event_blocking`에 사용. forward thread
-//! wait gate가 보는 `pending_events[idx]`는 in-flight signal 용도의 sentinel
-//! (`GpuEvent::dummy()`)이며, `wait_event_blocking(&dummy)`는 fast no-op
-//! (backend.rs §28). 의미상 forward thread는 dispatcher가 `clear_pending`을
-//! 호출하기 전까지 in-flight로 간주하면 충분.
+//! `GpuEvent` 공유 (LISWAP-4 v2): `enqueue_write_async`가 반환한 진짜 cl_event를
+//! `Arc<GpuEvent>`로 wrap하여 (1) `pending_events[idx]`에 저장 (forward thread
+//! wait gate가 read), (2) `SwapCommitJob::write_event`에도 동일 Arc clone 전달
+//! (dispatcher worker가 read). 두 thread는 같은 cl_event에 `wait_event_blocking`
+//! (= `clWaitForEvents`, OpenCL spec상 thread-safe). v1의 dummy event 사용은
+//! `wait_event_blocking`이 `inner_cl=None` fall-through로 `clFinish` 풀 배리어를
+//!호출하던 버그를 유발했음 — v2는 진짜 event로 fast no-op 보장.
 
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
+
+/// Phase 0 instrumentation: per-hook-fire wall-clock trace.
+///
+/// Enabled via `LLMRS_LISWAP4_HOOK_TRACE=1`. Each call to
+/// `on_layer_boundary` that proceeds to dispatch logs the start timestamp,
+/// dispatch duration (build_layer_from_mmap_async + submit_commit), and
+/// resulting plan completion state.
+///
+/// 목적: LISWAP-4 -65~-202% 회귀가 어느 layer에서 발생하는지 attribution.
+/// gap이 (a) build_async 안 vs (b) submit_commit 안 vs (c) hook 외부
+/// (forward kernel 안)에서 발생하는지 분리.
+fn liswap4_trace_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("LLMRS_LISWAP4_HOOK_TRACE").is_ok())
+}
 
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwapOption;
@@ -342,11 +358,13 @@ impl IntraForwardSwapHook {
         Ok(())
     }
 
-    /// Internal: store sentinel into `pending_events[idx]`. Called from
-    /// `on_layer_boundary` before `submit_commit`.
-    fn arm_pending(&self, idx: usize) {
+    /// Internal: store the real cl_event into `pending_events[idx]`. Called
+    /// from `on_layer_boundary` before `submit_commit`. The same `Arc<GpuEvent>`
+    /// is also passed to `SwapCommitJob::write_event` so the dispatcher worker
+    /// and forward thread wait gate share one underlying cl_event.
+    fn arm_pending(&self, idx: usize, event: Arc<GpuEvent>) {
         if let Some(slot) = self.pending_events.get(idx) {
-            slot.store(Some(Arc::new(GpuEvent::dummy())));
+            slot.store(Some(event));
         }
     }
 
@@ -405,6 +423,10 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
             return;
         }
 
+        // Phase 0 trace: capture entry timestamp for attribution.
+        let trace = liswap4_trace_enabled();
+        let t_entry = if trace { Some(Instant::now()) } else { None };
+
         // Locked plan check (cheap when idx not in dispatch_at).
         let mut plan = match self.plan.lock() {
             Ok(g) => g,
@@ -448,8 +470,10 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
             ),
         };
 
+        let t_build_start = if trace { Some(Instant::now()) } else { None };
         let async_build =
             executor.build_layer_from_mmap_async_for_hook(secondary, slot.as_ref(), idx);
+        let build_us = t_build_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let (new_layer, write_event) = match async_build {
             Ok(p) => p,
             Err(e) => {
@@ -463,9 +487,16 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
         };
         let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
 
+        // LISWAP-4 v2: wrap the real cl_event in Arc and share between the
+        // forward-thread wait gate (pending_events) and the dispatcher worker
+        // (SwapCommitJob.write_event). Both threads call
+        // `Backend::wait_event_blocking` on the same underlying cl_event;
+        // `clWaitForEvents` is thread-safe per OpenCL spec.
+        let write_event_arc: Arc<GpuEvent> = Arc::new(write_event);
+
         // INV-149: arm pending_events BEFORE submit_commit so forward thread
         // cannot observe a stale `None` between submission and clear.
-        self.arm_pending(idx);
+        self.arm_pending(idx, Arc::clone(&write_event_arc));
 
         // dispatcher worker callback: clear pending after commit. The hook
         // hands the worker a `Weak<Self>` so the worker does not extend the
@@ -486,12 +517,13 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
             slot: Arc::clone(slot),
             new_weights: new_arc,
             new_dtype: self.target_dtype,
-            write_event,
+            write_event: write_event_arc,
             release_worker: self.release_worker.clone(),
             on_complete: Some(on_complete),
             layer_idx: Some(idx),
         };
 
+        let t_submit_start = if trace { Some(Instant::now()) } else { None };
         if let Err(e) = self.dispatcher.submit_commit(job) {
             eprintln!(
                 "[IntraForwardSwap] layer {idx}: dispatcher submit failed: {e}; \
@@ -501,9 +533,21 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
             plan.mark_dispatched(idx);
             return;
         }
+        let submit_us = t_submit_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
 
         plan.mark_dispatched(idx);
         self.stage_gate_armed.store(true, Ordering::Release);
+
+        if let Some(t_entry) = t_entry {
+            let total_us = t_entry.elapsed().as_micros();
+            // Format: HOOK_TRACE layer=N total_us=X build_us=Y submit_us=Z plan_remaining=R
+            // 한 줄 = 1 dispatch event. 후처리 grep으로 layer-by-layer 분석.
+            let pending_after = plan.pending_layers().count();
+            eprintln!(
+                "[LISWAP4-HOOK] layer={} total_us={} build_us={} submit_us={} pending_after={}",
+                idx, total_us, build_us, submit_us, pending_after
+            );
+        }
     }
 }
 
