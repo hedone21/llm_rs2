@@ -28,23 +28,8 @@
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
-
-/// Phase 0 instrumentation: per-hook-fire wall-clock trace.
-///
-/// Enabled via `LLMRS_LISWAP4_HOOK_TRACE=1`. Each call to
-/// `on_layer_boundary` that proceeds to dispatch logs the start timestamp,
-/// dispatch duration (build_layer_from_mmap_async + submit_commit), and
-/// resulting plan completion state.
-///
-/// 목적: LISWAP-4 -65~-202% 회귀가 어느 layer에서 발생하는지 attribution.
-/// gap이 (a) build_async 안 vs (b) submit_commit 안 vs (c) hook 외부
-/// (forward kernel 안)에서 발생하는지 분리.
-fn liswap4_trace_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("LLMRS_LISWAP4_HOOK_TRACE").is_ok())
-}
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwapOption;
@@ -423,10 +408,6 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
             return;
         }
 
-        // Phase 0 trace: capture entry timestamp for attribution.
-        let trace = liswap4_trace_enabled();
-        let t_entry = if trace { Some(Instant::now()) } else { None };
-
         // Locked plan check (cheap when idx not in dispatch_at).
         let mut plan = match self.plan.lock() {
             Ok(g) => g,
@@ -470,10 +451,8 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
             ),
         };
 
-        let t_build_start = if trace { Some(Instant::now()) } else { None };
         let async_build =
             executor.build_layer_from_mmap_async_for_hook(secondary, slot.as_ref(), idx);
-        let build_us = t_build_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let (new_layer, write_event) = match async_build {
             Ok(p) => p,
             Err(e) => {
@@ -487,22 +466,20 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
         };
         let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
 
-        // LISWAP-4 v2: wrap the real cl_event in Arc and share between the
-        // forward-thread wait gate (pending_events) and the dispatcher worker
+        // Wrap the real cl_event in Arc and share between the forward-thread
+        // wait gate (pending_events) and the dispatcher worker
         // (SwapCommitJob.write_event). Both threads call
-        // `Backend::wait_event_blocking` on the same underlying cl_event;
-        // `clWaitForEvents` is thread-safe per OpenCL spec.
+        // Backend::wait_event_blocking on the same underlying cl_event;
+        // clWaitForEvents is thread-safe per OpenCL spec.
         let write_event_arc: Arc<GpuEvent> = Arc::new(write_event);
 
         // INV-149: arm pending_events BEFORE submit_commit so forward thread
         // cannot observe a stale `None` between submission and clear.
         self.arm_pending(idx, Arc::clone(&write_event_arc));
 
-        // dispatcher worker callback: clear pending after commit. The hook
-        // hands the worker a `Weak<Self>` so the worker does not extend the
-        // hook's lifetime past `finalize`/retire — the worker upgrades the
-        // weak ref on each invocation and silently no-ops if the hook has
-        // been dropped (e.g. on early shutdown).
+        // dispatcher worker callback: clear pending after commit. Hand the
+        // worker a Weak<Self> so it does not extend the hook's lifetime past
+        // finalize/retire.
         let weak_self: Weak<IntraForwardSwapHook> = self.self_weak.clone();
         let on_complete: Arc<dyn Fn(usize) + Send + Sync> = {
             let w = weak_self;
@@ -523,7 +500,6 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
             layer_idx: Some(idx),
         };
 
-        let t_submit_start = if trace { Some(Instant::now()) } else { None };
         if let Err(e) = self.dispatcher.submit_commit(job) {
             eprintln!(
                 "[IntraForwardSwap] layer {idx}: dispatcher submit failed: {e}; \
@@ -533,21 +509,9 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
             plan.mark_dispatched(idx);
             return;
         }
-        let submit_us = t_submit_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
 
         plan.mark_dispatched(idx);
         self.stage_gate_armed.store(true, Ordering::Release);
-
-        if let Some(t_entry) = t_entry {
-            let total_us = t_entry.elapsed().as_micros();
-            // Format: HOOK_TRACE layer=N total_us=X build_us=Y submit_us=Z plan_remaining=R
-            // 한 줄 = 1 dispatch event. 후처리 grep으로 layer-by-layer 분석.
-            let pending_after = plan.pending_layers().count();
-            eprintln!(
-                "[LISWAP4-HOOK] layer={} total_us={} build_us={} submit_us={} pending_after={}",
-                idx, total_us, build_us, submit_us, pending_after
-            );
-        }
     }
 }
 

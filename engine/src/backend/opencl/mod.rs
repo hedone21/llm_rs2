@@ -4345,48 +4345,6 @@ impl OpenCLBackend {
         let q_ref: &ocl::core::CommandQueue = queue;
         let q_ptr: ffi::cl_command_queue = q_ref.as_ptr();
 
-        // Diagnostic: verify swap_queue's context matches swap_mem's context.
-        // CL_INVALID_COMMAND_QUEUE (-36) typically means queue/buffer mismatch.
-        if std::env::var("LLMRS_DMABUF_DEBUG").is_ok() {
-            let mut q_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
-            let mut m_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
-            let mut sz_q: usize = 0;
-            let mut sz_m: usize = 0;
-            const CL_QUEUE_CONTEXT: u32 = 0x1090;
-            const CL_MEM_CONTEXT: u32 = 0x1106;
-            unsafe {
-                ffi::clGetCommandQueueInfo(
-                    q_ptr,
-                    CL_QUEUE_CONTEXT,
-                    std::mem::size_of::<*mut std::ffi::c_void>(),
-                    &mut q_ctx as *mut _ as *mut std::ffi::c_void,
-                    &mut sz_q,
-                );
-                ffi::clGetMemObjectInfo(
-                    swap_mem.as_ptr(),
-                    CL_MEM_CONTEXT,
-                    std::mem::size_of::<*mut std::ffi::c_void>(),
-                    &mut m_ctx as *mut _ as *mut std::ffi::c_void,
-                    &mut sz_m,
-                );
-            }
-            let swap_ctx_ptr = self
-                .swap_context_or_init()
-                .map(|c| <&Context as ClContextPtr>::as_ptr(&c) as *mut std::ffi::c_void)
-                .unwrap_or(std::ptr::null_mut());
-            let main_ctx_ptr =
-                <&Context as ClContextPtr>::as_ptr(&&self.context) as *mut std::ffi::c_void;
-            eprintln!(
-                "[DMABUF-DEBUG] q_ptr={:p} q_ctx={:p} m_ctx={:p} swap_ctx={:p} main_ctx={:p}",
-                q_ptr, q_ctx, m_ctx, swap_ctx_ptr, main_ctx_ptr
-            );
-            // Compare q_ptr to swap_queue's stored handle directly via ocl::core
-            if let Some(stored_q) = self.swap_queue.get() {
-                let stored_ptr = ocl::core::CommandQueue::as_ptr(stored_q);
-                eprintln!("[DMABUF-DEBUG] stored_swap_queue_ptr={:p}", stored_ptr);
-            }
-        }
-
         let mut errcode: ffi::cl_int = 0;
         // SAFETY (forwarded): caller asserts `swap_mem` is a DMA-BUF-backed
         // buffer in the swap queue's context and `size` is within capacity.

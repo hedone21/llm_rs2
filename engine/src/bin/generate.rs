@@ -939,26 +939,6 @@ struct Args {
     /// (ENG-DAT-C18). CLI parser rejects the combination.
     #[arg(long, default_value_t = false)]
     swap_intra_forward: bool,
-
-    /// Predictive Pre-staging Swap (feasibility test).
-    ///
-    /// `false` (default): unchanged single-shot behavior.
-    ///
-    /// `true`: when `--force-swap-ratio` is set, dispatch all H2D writes
-    /// asynchronously BEFORE prefill starts via `AsyncSwapDispatcher`. The
-    /// caller thread issues all `enqueue_write_buffer(blocking=false)` calls
-    /// in rapid succession then returns. Dispatcher worker waits on each
-    /// cl_event and ArcSwap-commits in background. Prefill+decode runs in
-    /// parallel with pending H2D byte transfers. Drain at end of generation.
-    ///
-    /// Hypothesis: if Adreno can interleave H2D with GPU compute (even
-    /// partially), the wall-clock saving will be measurable. If LISWAP-2
-    /// hardware-serialize result also applies here, saving will be 0%.
-    ///
-    /// Mutually exclusive with `--swap-incremental-per-tick > 0` and
-    /// `--swap-intra-forward`.
-    #[arg(long, default_value_t = false)]
-    swap_pre_stage: bool,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -1021,13 +1001,6 @@ fn main() -> anyhow::Result<()> {
             args.swap_incremental_per_tick
         );
     }
-    if args.swap_pre_stage && (args.swap_incremental_per_tick > 0 || args.swap_intra_forward) {
-        anyhow::bail!(
-            "--swap-pre-stage is mutually exclusive with --swap-incremental-per-tick > 0 \
-             and --swap-intra-forward. These three swap policies cannot be combined."
-        );
-    }
-
     // Configure Rayon thread pool: 0 = auto-detect CPU cores
     let num_threads = if args.threads > 0 {
         args.threads
@@ -2566,20 +2539,6 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Predictive Pre-staging Swap (feasibility test).
-    // When --swap-pre-stage is active, the swap is deferred to decode token 0
-    // and runs on a background OS thread so the main forward thread is not
-    // blocked by the driver-side staging memcpy. The pending target_layers
-    // list is captured at force-swap-ratio trigger time and consumed by the
-    // decode loop's token-0 spawn site.
-    let mut pre_stage_pending_layers: Option<Vec<usize>> = None;
-    let mut pre_stage_bg_handle: Option<
-        std::thread::JoinHandle<
-            Result<llm_rs2::models::weights::SwapReport, llm_rs2::models::weights::SwapError>,
-        >,
-    > = None;
-    let mut pre_stage_spawn_at: Option<std::time::Instant> = None;
-
     // ── LISWAP-3 prototype (Direction A): ALLOC_HOST_PTR pool ────────────
     // Lazy-init the swap pool when the user opted in via `--swap-zero-copy`
     // AND the env-gate `LLMRS_OPENCL_HOST_PTR_POOL=1` is set. Both conditions
@@ -2642,23 +2601,6 @@ fn main() -> anyhow::Result<()> {
                 "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
                 ratio,
             );
-        } else if args.swap_pre_stage {
-            // Predictive Pre-staging path: defer the swap to decode token 0.
-            // At that point a background OS thread is spawned that runs
-            // `run_layer_swap` to completion while the main thread continues
-            // decoding. ArcSwap commits land asynchronously per-layer as the
-            // BG thread issues them; forward sees mid-flight mixed-precision
-            // state until the BG thread finishes. Wall-clock saving (vs sync)
-            // measures whether driver memcpy + GPU H2D can run in parallel
-            // with main-thread forward and GPU compute respectively.
-            //
-            // No-op here; trigger lives inside the decode loop.
-            eprintln!(
-                "[PreStage] deferred to decode token 0: ratio={:.2}, {} target layers",
-                ratio,
-                target_layers.len(),
-            );
-            pre_stage_pending_layers = Some(target_layers);
         } else if args.swap_intra_forward {
             // LISWAP-4 (ENG-ALG-237): single-shot is skipped; an
             // IntraForwardSwapHook is committed instead. The decode loop
@@ -5167,64 +5109,6 @@ fn main() -> anyhow::Result<()> {
                 &llm_rs2::profile::quality_metrics::DECODE_TOTAL,
             );
 
-            // ── Predictive Pre-staging Swap: spawn BG thread at decode token 0
-            // The BG thread runs `run_layer_swap` to completion in parallel
-            // with the decode loop. Caller (this thread) returns immediately
-            // and continues decoding while the BG thread does the 290 ms of
-            // driver staging memcpy + cl_event wait + ArcSwap commit.
-            if decode_token_index == 0
-                && let Some(target_layers) = pre_stage_pending_layers.take()
-            {
-                let bg_target_layers = target_layers;
-                let bg_config = model.config.clone();
-                let bg_layers: Vec<Arc<llm_rs2::models::weights::LayerSlot>> =
-                    model.layers.to_vec();
-                let bg_secondary = model.secondary_mmap.clone();
-                let bg_ratio_gen = Arc::clone(&model.ratio_generation);
-                let bg_release_worker = Arc::clone(&model.release_worker);
-                let bg_swap_backend: Arc<dyn Backend> = gpu_backend_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| cpu_backend_arc.clone());
-                #[cfg(feature = "opencl")]
-                let bg_host_ptr_pool = host_ptr_swap_pool.clone();
-                let spawn_t = std::time::Instant::now();
-                pre_stage_spawn_at = Some(spawn_t);
-                eprintln!(
-                    "[PreStage-BG] spawning BG thread at decode token 0: {} target layers",
-                    bg_target_layers.len(),
-                );
-                let handle = std::thread::spawn(move || {
-                    let bg_t0 = std::time::Instant::now();
-                    let swap_memory = llm_rs2::memory::galloc::Galloc::new();
-                    let executor = llm_rs2::models::weights::SwapExecutor::new_with_worker(
-                        DType::Q4_0,
-                        &bg_config,
-                        bg_swap_backend,
-                        &swap_memory,
-                        bg_release_worker,
-                    );
-                    #[cfg(feature = "opencl")]
-                    let executor = match bg_host_ptr_pool {
-                        Some(pool) => executor.with_host_ptr_pool(pool),
-                        None => executor,
-                    };
-                    let result = executor.execute_on_slots(
-                        &bg_layers,
-                        bg_secondary.as_ref(),
-                        &bg_ratio_gen,
-                        &bg_target_layers,
-                        None,
-                    );
-                    eprintln!(
-                        "[PreStage-BG] BG thread work completed in {:.1}ms (BG-internal wall)",
-                        bg_t0.elapsed().as_secs_f64() * 1e3,
-                    );
-                    result
-                });
-                pre_stage_bg_handle = Some(handle);
-            }
-
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
             if kv_caches[0].current_pos >= max_seq_len {
                 println!("\n[Stopped: Max context length reached]");
@@ -5554,19 +5438,6 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             // ── End Layer-Incremental Swap dispatch ────────────────────────────
-
-            // LISWAP-4 DIAG: dump plan + dispatcher state every 5 tokens.
-            if let Some(hook_ref) = intra_forward_swap_hook.as_ref()
-                && (decode_token_index < 3 || decode_token_index % 10 == 0)
-            {
-                let pending_layers = hook_ref.pending_layer_count();
-                let dispatcher_pending = hook_ref.dispatcher().pending_count();
-                let complete = hook_ref.plan_is_complete();
-                eprintln!(
-                    "[IntraForwardSwap-DIAG] token={} pending_layers={} dispatcher_pending={} plan_complete={}",
-                    decode_token_index, pending_layers, dispatcher_pending, complete
-                );
-            }
 
             // ── LISWAP-4 Intra-forward Swap retire (INV-150) ──────────────────
             // After every decode token, check whether the in-flight plan is
@@ -6891,37 +6762,6 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(None) => {}
             Err(e) => eprintln!("[CUDA-Profile] flush failed: {}", e),
-        }
-    }
-
-    // ── Predictive Pre-staging Swap join ────────────────────────────────
-    // If --swap-pre-stage was active and a BG thread was spawned at decode
-    // token 0, join it here so all pending H2D + ArcSwap commits complete
-    // before stats are reported. Total BG wall-clock (spawn → join) is
-    // logged so feasibility can be analysed against decode TBT.
-    if let Some(handle) = pre_stage_bg_handle.take() {
-        let join_t0 = std::time::Instant::now();
-        match handle.join() {
-            Ok(Ok(report)) => {
-                let bg_total_ms = pre_stage_spawn_at
-                    .map(|t| t.elapsed().as_secs_f64() * 1e3)
-                    .unwrap_or(-1.0);
-                eprintln!(
-                    "[PreStage-BG] join complete: swapped={}, skipped={}, \
-                     bg_total_wall={:.1}ms (spawn→join), \
-                     join_wait_only={:.1}ms",
-                    report.swapped.len(),
-                    report.skipped.len(),
-                    bg_total_ms,
-                    join_t0.elapsed().as_secs_f64() * 1e3,
-                );
-            }
-            Ok(Err(e)) => {
-                eprintln!("[PreStage-BG] swap returned error: {}", e);
-            }
-            Err(_) => {
-                eprintln!("[PreStage-BG] BG thread panicked");
-            }
         }
     }
 
