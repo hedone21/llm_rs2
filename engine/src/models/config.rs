@@ -13,7 +13,7 @@ pub enum ModelArch {
 
 /// Unified model configuration parsed from HuggingFace config.json.
 /// All architecture-specific derivations are resolved at construction time.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub arch: ModelArch,
     pub hidden_size: usize,

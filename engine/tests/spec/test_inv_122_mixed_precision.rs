@@ -160,6 +160,8 @@ fn run_forward_cpu(model: &TransformerModel, prompt_ids: &[u32]) -> anyhow::Resu
         logits_last_only: false,
         variance_collector: None,
         prefill_workspace: None,
+
+        layer_boundary_hook: None,
     })?;
 
     // last-token logits 추출 (인덱스 [0, seq_len-1, :])

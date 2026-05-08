@@ -596,6 +596,7 @@
 | `--model-path` | String | (기존) | Primary 가중치 파일. 초기 로딩 시 모든 decoder layer가 이 파일의 dtype으로 로드된다. |
 | `--model-path-secondary` | String? | None | Secondary 가중치 파일 (낮은 정밀도, e.g. Q4_0). 제공 시 디스크에 mmap만 되고, 런타임 swap 대상으로 예약된다. (ENG-DAT-090) |
 | `--force-swap-ratio` | `Option<f32>` | None | 디버그 전용. Manager 없이 prefill 종료 시 `ResilienceAction::SwapWeights { ratio }`를 직접 트리거한다. 값은 `[0.0, 1.0]`. (ENG-ALG-211 debug hook) |
+| `--swap-intra-forward` | `bool` | false | Intra-forward Layer-aligned Swap (LISWAP-4) 활성화 플래그. true 시 매 forward의 layer 경계에서 plan에 등록된 layer의 swap을 별도 transfer queue로 비동기 dispatch하고, ArcSwap commit은 dispatcher worker가 cl_event 완료 후 수행한다. plan당 ratio_generation bump 1회 (LISWAP-1의 chunk × N과 다름). default false에서 `LayerBoundaryHook`은 None으로 주입되어 forward path는 zero overhead (INV-147). LISWAP-1 플래그(`--swap-incremental-per-tick > 0`)와 상호 배타 (ENG-DAT-C18). (32-engine-algorithms §3.12.22, ENG-ALG-235~238, INV-147~150) |
 
 ---
 
@@ -1375,6 +1376,50 @@ impl PrimaryReleaseWorker {
 
 ---
 
+### 3.24 IntraForwardSwapHook Pending-Event Registry [ENG-DAT-101]
+
+**[ENG-DAT-101]** `IntraForwardSwapHook`은 layer index별 in-flight cl_event를 추적하는 per-slot registry를 보유한다. forward path의 wait gate(ENG-ALG-238)가 lock-free read로 이 registry에서 cl_event를 조회한다. *(MUST)*
+
+**필드**:
+
+| 필드 | 타입 | 의미 |
+|------|------|------|
+| `pending_events` | `Vec<ArcSwapOption<GpuEvent>>` | 길이 = `num_layers`. 각 슬롯은 layer i에 대한 in-flight cl_event를 보관. `None` = no in-flight swap. |
+
+**API**:
+
+```rust
+impl IntraForwardSwapHook {
+    /// Read pending event for layer `idx`, lock-free. Returns a clone of
+    /// the GpuEvent if a swap is in-flight, or None if not.
+    pub fn pending_event_for(&self, idx: usize) -> Option<GpuEvent>;
+
+    /// Set when hook dispatches swap for layer idx (from on_layer_boundary).
+    fn arm_pending(&self, idx: usize, event: GpuEvent);
+
+    /// Clear when AsyncSwapDispatcher worker has completed commit. Called
+    /// from worker thread after slot.swap_weights returns.
+    fn clear_pending(&self, idx: usize);
+}
+```
+
+**의미론** (INV-149 강제):
+- `pending_event_for(idx)`은 `arm_pending`과 `clear_pending` 사이의 lock-free snapshot 읽기. forward 스레드가 호출.
+- `arm_pending`/`clear_pending`은 ArcSwap의 atomic store. forward 스레드는 wait gate에서 `Some(evt)`를 본 시점의 evt가 in-flight라고 가정하고 `wait_event_blocking(&evt)` 호출. dispatcher worker가 동시에 `clear_pending`을 호출해 None으로 만들어도 forward 스레드는 자신이 잡은 evt를 그대로 wait. wait_event_blocking on completed event는 fast no-op.
+- 메모리 순서: `arm_pending`은 hook의 `submit_commit` 호출 전에 발생 (INV-149). `clear_pending`은 dispatcher worker의 `slot.swap_weights` 직후 발생.
+
+**대안 결정 (검토 결과)**:
+- **AsyncSwapDispatcher 내부 map**: dispatcher가 layer_idx → cl_event 맵을 보유하는 안. 단점: forward thread가 dispatcher 내부 lock을 잡아야 함 (Mutex<HashMap> 또는 RwLock<HashMap>). hot path에 진입하므로 lock 회피 필요.
+- **LayerSlot::pending_swap_event 필드**: slot 자체에 `ArcSwapOption<GpuEvent>` 추가. 단점: LayerSlot의 SRP 침해 (slot은 weight ownership만 담당). LISWAP-4 외 컴포넌트는 이 필드를 사용하지 않음.
+- **선택**: hook 자체가 per-slot registry 보유 (`Vec<ArcSwapOption>`). 이유: (1) hook lifetime = plan lifetime이라 메모리 회수 자연. (2) lock-free per-index 접근. (3) LayerSlot 변경 불필요. (4) hook이 None일 때 registry도 존재하지 않아 zero overhead 보장 용이.
+
+**Cross-reference**:
+- ENG-ALG-237 (IntraForwardSwapHook 동작).
+- ENG-ALG-238 (wait gate).
+- INV-149 (commit-before-read ordering).
+
+---
+
 ## 4. Alternative Behavior
 
 해당 없음. 이 문서는 데이터 정의 문서이다. 데이터 처리의 대안 동작은 `32-engine-algorithms.md`에서 다룬다.
@@ -1414,6 +1459,8 @@ impl PrimaryReleaseWorker {
 **[ENG-DAT-C16]** (Sprint A' 반전) AUF v0.2 multi-dtype variant 사용 시, lm_head(`kind = 11`)는 layer weight와 동일하게 multi-dtype 분기 대상에 **포함**된다. lm_head TENSOR_INDEX entry는 dtype별 candidate(예: Q4_0 + F16)로 다중 등장 가능하며, reader는 §3.22.15(ENG-DAT-098)의 dtype selection precedence를 lm_head에도 동일하게 적용한다. 다만 `WEIGHTS_ADRENO_SOA` variant section 안에서 lm_head는 **모든 dtype 후보에 대해 AOS 18B/block layout으로 동봉되어야 하며 SOA 변환을 적용해서는 안 된다**(INV-135 v2 layout 의무는 dtype-agnostic). 근거: lm_head q_buf 크기는 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 초과하여 image1d_buffer_t 생성이 실패하고 SOA fast path가 발동 불가하므로 dtype과 무관하게 SOA로 저장된 lm_head는 정확성이 깨진다. `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`는 처음부터 AOS이므로 lm_head 처리도 일반 weight와 동일하다. v0.1.1의 "lm_head Q4_0 single" 의미는 본 제약에서 폐기되었으며, dtype 단일성은 요구되지 않는다. SOA variant 안에서 lm_head entry가 SOA layout으로 동봉되어 있으면 reader는 `AufError::LmHeadSoaForbidden`(또는 동등한 명시 에러)로 reject한다. *(MUST)*
 
 **[ENG-DAT-C17]** AUF v0.2 writer는 SwapExecutor 인터페이스 변경을 동반하지 않는다. multi-dtype payload 양쪽이 AUF에 보관되어도 runtime swap은 단방향(`primary → secondary`) 가정을 유지한다. 양방향 swap은 본 spec 범위 밖이며 향후 별도 capability bit으로 표현된다. *(MUST)*
+
+**[ENG-DAT-C18]** `--swap-incremental-per-tick > 0` 와 `--swap-intra-forward = true` 는 동시 활성화될 수 없다. 두 정책이 모두 양수/true이면 CLI parser는 명시적 에러로 reject하고 engine은 시작하지 않는다. 이유: LISWAP-1(§3.12.21 예약)은 chunk마다 stage gate(ratio_generation bump × N), LISWAP-4는 plan당 stage gate 1회로 ratio_generation 의미가 충돌하기 때문이다. (32-engine-algorithms §3.12.22.6, ENG-ALG-238 후속) *(MUST)*
 
 ## 6. Examples
 

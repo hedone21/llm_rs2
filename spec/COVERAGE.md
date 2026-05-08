@@ -173,6 +173,17 @@
 | INV-142 | `execute_on_slots`의 `ratio_generation.fetch_add` 직전 `backend.synchronize()` 1회 호출 보장. 비동기 write_buffer/fused convert가 모두 완료된 후 SOA registry 갱신과 ratio_generation bump가 직렬화된다. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_142_stage_gate_sync.rs` + 디바이스 e2e (INV-122 v2.1 단일-token 게이트) |
 | INV-143 | AOS borrow buffer는 secondary `Arc<SecondaryMmap>` clone을 보관. Tensor 생존 동안 secondary refcount ≥ 2. mmap drop으로 인한 SIGBUS 차단. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_143_borrow_buffer_lifetime.rs` |
 
+## Intra-forward Layer-aligned Swap (INV-147 ~ INV-150, 2026-05-08)
+
+> Forward 중간 layer 경계 dispatch 시도. 대응 명세: `32-engine-algorithms.md` §3.12.22 (ENG-ALG-235~238), `33-engine-data.md` §3.24 (ENG-DAT-101), `arch/weight_swap.md` §10.
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-147 | `LayerBoundaryHook` = None 시 forward path는 baseline forward와 byte-equal 출력 + 시간 차이 < 1% 안. NoOpHook overhead < 10%. | Performance | 🆕 미구현 | `engine/tests/spec/test_inv_147_hook_zero_overhead.rs` + 디바이스 microbench |
+| INV-148 | `IntraForwardSwapPlan` 내 동일 layer index는 정확히 1회만 dispatch. should_dispatch / mark_dispatched 시퀀스 멱등성 검증. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_148_plan_dispatch_idempotent.rs` |
+| INV-149 | Forward layer K가 `load_weights` 호출 직전 `pending_event_for(K)`이 Some이면 `wait_event_blocking` 강제 호출. ArcSwap commit-before-read ordering. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_149_wait_gate_ordering.rs` + 디바이스 e2e (INV-122 v2.1 단일-token 게이트) |
+| INV-150 | Plan complete 시 drain → synchronize → ratio_generation +1 → invalidate_soa_registry → retire 순서 강제. ratio_generation bump는 plan당 1회. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_150_plan_run_to_completion.rs` |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -310,6 +321,10 @@
 | ENG-ALG-229 | (A) | Targeted prefault — `prefault_layers(target_layers)` byte range 한정. backward-compat `prefault()` 유지. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_229_targeted_prefault.rs` |
 | ENG-ALG-230 | (A) | Async write_buffer + fused convert no internal sync. caller가 stage gate에서 `synchronize()` 1회. INV-142. | 🆕 미구현 | `engine/tests/spec/test_inv_142_stage_gate_sync.rs` |
 | ENG-ALG-231 | (A) | execute_on_slots stage ordering: prefault → materialise/convert/upload (async) → swap_weights → release enqueue → synchronize ★ → invalidate registry → register SOA → ratio_generation bump. | 🆕 미구현 | `engine/tests/spec/test_inv_142_stage_gate_sync.rs` (ordering 부분) |
+| ENG-ALG-235 | (D) | `LayerBoundaryHook` trait — `on_layer_boundary(idx, seq_len)`. hook=None 시 zero overhead (INV-147). LISWAP-4. | 🆕 미구현 | `engine/tests/spec/test_inv_147_hook_zero_overhead.rs` |
+| ENG-ALG-236 | (D) | `IntraForwardSwapPlan` (BTreeSet 기반 dispatch_at + dispatched). should_dispatch / mark_dispatched 멱등. | 🆕 미구현 | `engine/tests/spec/test_inv_148_plan_dispatch_idempotent.rs` |
+| ENG-ALG-237 | (E) | `IntraForwardSwapHook` 동작 sequence: should_dispatch → secondary build → enqueue_write_async → arm_pending → submit_commit → mark_dispatched. AsyncSwapDispatcher 인프라 재사용. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_237_intra_forward_hook.rs` |
+| ENG-ALG-238 | (A) | Wait gate at next forward layer K access: pending_event_for(K) == Some → wait_event_blocking(evt). plan run-to-completion + retire (drain → synchronize → ratio_generation +1 → invalidate registry). | 🆕 미구현 | `engine/tests/spec/test_inv_149_wait_gate_ordering.rs` + `test_inv_150_plan_run_to_completion.rs` |
 
 ## Engine Data
 
@@ -327,6 +342,8 @@
 | ENG-DAT-095 | (D) | QuantNoiseTable (per-layer ε, eager 계산, NaN 결측 표기, uniform_ones fallback) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_095_quant_noise_table.rs` |
 | ENG-DAT-096 | (D) | AUF v0.1 self-contained format (header 256B, section table 48B/entry, META/TOKENIZER/TENSOR_INDEX/WEIGHTS_* sections, hybrid source_hash, 64KB align) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_096_auf_format.rs` |
 | ENG-DAT-100 | (D) | `PrimaryReleaseWorker` 구조 (sender, pending AtomicUsize, JoinHandle). spawn / enqueue / pending_count / drain API. model lifetime 동안 생존, graceful shutdown. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_100_release_worker.rs` |
+| ENG-DAT-101 | (D) | `IntraForwardSwapHook::pending_events`: `Vec<ArcSwapOption<GpuEvent>>` per-slot registry. lock-free read (`pending_event_for`). dispatcher worker가 commit 후 `clear_pending`. INV-149 강제. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_101_pending_event_registry.rs` |
+| ENG-DAT-C18 | (D) | `--swap-incremental-per-tick > 0`와 `--swap-intra-forward = true` 상호 배타. CLI parser reject. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_c18_liswap_mutual_exclusion.rs` |
 
 ## Cross-cutting
 

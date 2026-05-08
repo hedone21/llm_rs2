@@ -62,6 +62,18 @@ pub struct SwapCommitJob {
     /// `release_worker.enqueue_release(old_layer)`. When `None`, old weights
     /// are dropped inline.
     pub release_worker: Option<Arc<PrimaryReleaseWorker>>,
+    /// Optional commit-complete callback (LISWAP-4 / ENG-ALG-237).
+    ///
+    /// Invoked on the dispatcher worker thread immediately after
+    /// `slot.swap_weights` succeeds, with `layer_idx` (when set) identifying
+    /// which slot was committed. Used by `IntraForwardSwapHook` to clear its
+    /// per-slot pending-event registry. When `layer_idx` is `None`, the
+    /// callback receives `usize::MAX` (sentinel — caller-supplied closures
+    /// that need a real index must always set `layer_idx`).
+    pub on_complete: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+    /// Layer index for the `on_complete` callback (LISWAP-4). `None` for
+    /// production paths that do not use `on_complete`.
+    pub layer_idx: Option<usize>,
 }
 
 /// Jobs sent to the background worker thread.
@@ -188,7 +200,7 @@ fn worker_loop(rx: mpsc::Receiver<SwapJob>, backend: Arc<dyn Backend>, pending: 
     }
 }
 
-/// Execute one commit job: wait → swap → chain release.
+/// Execute one commit job: wait → swap → chain release → on_complete.
 fn process_commit(job: SwapCommitJob, backend: &Arc<dyn Backend>) {
     // Wait for H2D write to become GPU-visible before committing.
     if let Err(e) = backend.wait_event_blocking(&job.write_event) {
@@ -199,6 +211,15 @@ fn process_commit(job: SwapCommitJob, backend: &Arc<dyn Backend>) {
 
     // Atomically install new weights and retrieve the displaced old Arc.
     let old = job.slot.swap_weights(job.new_weights, job.new_dtype);
+
+    // LISWAP-4 (ENG-ALG-237): notify the hook that the commit landed so it
+    // can clear its `pending_events[idx]` registry. Run before the release
+    // chain so forward-thread wait gates see the cleared state as soon as
+    // possible.
+    if let Some(cb) = &job.on_complete {
+        let idx = job.layer_idx.unwrap_or(usize::MAX);
+        cb(idx);
+    }
 
     // Chain old weights into the release worker when we hold exclusive
     // ownership (the common case in steady-state swap).
@@ -287,6 +308,8 @@ mod tests {
                 new_dtype: DType::Q4_0,
                 write_event: GpuEvent::dummy(),
                 release_worker: None,
+                on_complete: None,
+                layer_idx: None,
             })
             .expect("submit_commit must succeed");
 
@@ -323,6 +346,8 @@ mod tests {
                         new_dtype: DType::Q4_0,
                         write_event: GpuEvent::dummy(),
                         release_worker: None,
+                        on_complete: None,
+                        layer_idx: None,
                     })
                     .expect("concurrent submit_commit must succeed");
                 })
@@ -364,6 +389,8 @@ mod tests {
                 new_dtype: DType::Q4_0,
                 write_event: GpuEvent::dummy(),
                 release_worker: None,
+                on_complete: None,
+                layer_idx: None,
             })
             .expect("submit must succeed");
 

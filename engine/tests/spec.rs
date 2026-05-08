@@ -274,3 +274,17 @@ mod test_async_swap_executor;
 // Plan: compiled-chasing-hopper.md Direction A 트랙. spec ID 미발급.
 #[path = "spec/test_host_ptr_pool.rs"]
 mod test_host_ptr_pool;
+
+// ── LISWAP-4 — Intra-forward Layer-aligned Swap (ENG-ALG-235~238, INV-147~150) ──
+// INV-147: hook=None forward path zero overhead (NoOpHook microbench, host).
+// INV-148: IntraForwardSwapPlan dispatch idempotency.
+// INV-149: wait gate ordering + pending_event registry semantics.
+// INV-150: plan run-to-completion finalize (drain → sync → bump → invalidate).
+#[path = "spec/test_inv_147_hook_zero_overhead.rs"]
+mod test_inv_147_hook_zero_overhead;
+#[path = "spec/test_inv_148_plan_dispatch_idempotent.rs"]
+mod test_inv_148_plan_dispatch_idempotent;
+#[path = "spec/test_inv_149_wait_gate_ordering.rs"]
+mod test_inv_149_wait_gate_ordering;
+#[path = "spec/test_inv_150_plan_run_to_completion.rs"]
+mod test_inv_150_plan_run_to_completion;

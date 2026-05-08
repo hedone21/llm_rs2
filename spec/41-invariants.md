@@ -359,6 +359,26 @@
 | INV-142 | 32-engine-algorithms §3.12.20 (ENG-ALG-230, ENG-ALG-231), arch/weight_swap.md §7.8 | `execute_on_slots` 흐름에서 `TransformerModel.ratio_generation.fetch_add(1, SeqCst)`(stage e) 호출 직전에 `backend.synchronize()`가 1회 호출되어 OpenCL queue가 idle 상태여야 한다. 이는 (1) 비동기 `enqueue_write_buffer`(ENG-ALG-230), (2) fused convert kernel(ENG-ALG-226)이 모두 GPU에서 완료된 후에야 forward가 새 cl_mem을 읽을 수 있도록 보장한다. invalidate_noshuffle_soa_registry / ensure_noshuffle_soa_registered 호출도 synchronize 이후 단계에 위치해야 한다 (stage gate ordering). 위반 시 다음 forward가 미완성 cl_mem을 보고 garbage 산출 가능 (Adreno UMA에서도 ordering 보장 필요). | Safety/Correctness | runtime, test | swap_executor unit test에서 stage 호출 순서 검증 + 디바이스 e2e 정합성 게이트 (INV-122 v2.1 단일-token 게이트로 회귀 차단). |
 | INV-143 | 32-engine-algorithms §3.12.19 (ENG-ALG-227), arch/weight_swap.md §7.3 | AOS 무변환 경로(`needs_qk_unpermute_at_swap()=false`)에서 사용되는 borrow buffer는 자신의 lifetime 동안 secondary `Arc<SecondaryMmap>`의 clone을 보관해야 한다. mmap 슬라이스 참조가 backend `copy_weight_from`/`copy_from` 호출 사이클을 통과하는 동안 secondary mmap이 drop되어 SIGBUS를 유발하지 않는다. 본 invariant는 INV-125(model lifetime mmap 생존)의 강화 표현으로 borrow 경로 한정 강제이다. permutation 경로는 owned `Vec<u8>`를 사용하므로 본 invariant의 범위 밖. | Safety | test | borrow buffer drop 시 mmap Arc strong_count 검증 (Tensor 생존 동안 secondary refcount ≥ 2). |
 
+### 3.21 Intra-forward Layer-aligned Swap Invariants [INV-147 ~ INV-150]
+
+2026-05-08 Intra-forward Layer-aligned Swap (LISWAP-4)의 불변식. 대응 명세: `32-engine-algorithms.md` §3.12.22 (ENG-ALG-235~238), `33-engine-data.md` §3.24 (ENG-DAT-101) + §3.15.16 CLI + ENG-DAT-C18, `arch/weight_swap.md` §10.
+
+**도입 컨텍스트**: §3.19 Phase 6.5(290 ms 단발 stall 절대 감축)와 LISWAP-1(§3.20 예약, total wall-clock +96 ms)에 직교한 트랙. LISWAP-2 prototype 측정에서 forward 직후 일괄 dispatch가 Adreno multi-queue serialize로 0% saving. 본 시리즈는 forward **중간** layer 경계에서 dispatch하여 같은 forward 후속 layer + 다음 토큰 forward 선행 layer와 swap window(~25–28 ms)를 overlap하는 별도 timing 영역을 측정한다 (Adreno serialize의 chunk-크기/timing 의존성 검증).
+
+**교차 참조**:
+- **INV-121** (per-token snapshot): forward 진입 시 `layer_snapshots` 배열을 1회 build. layer i가 ArcSwap commit과 race하지 않음 (INV-147 보강).
+- **INV-123** (ArcSwap 단일 원자 단계): hook이 dispatcher worker에 commit 위임. store는 worker thread에서 1회 발생, 의미 보존.
+- **INV-129/130/131** (Plan invalidation, SOA registry coherence): plan 종료 시 dispatcher drain + synchronize 후 ratio_generation bump 1회로 의미 동일 적용 (INV-150).
+- **INV-141** (다음 swap 전 drain 의무): plan 종료 시 `dispatcher.drain(deadline)`이 INV-141의 의미를 그대로 강제.
+- **INV-142** (stage gate ordering): plan 종료 시점에서 INV-149로 강화 적용 (synchronize 1회 + ratio_generation bump 1회).
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-147 | 32-engine-algorithms §3.12.22.1 (ENG-ALG-235), arch/weight_swap.md §10.2 | `LayerBoundaryHook` 인자가 `None`일 때 `TransformerModel::forward_into`의 layer loop는 hook과 무관한 forward path와 동일한 hot-path 비용을 가져야 한다. 비용은 layer당 `Option::is_some` 검사 1회로 한정되며, branch predictor가 안정적으로 `None` 분기를 잡아 instruction-level overhead가 measurement noise 이하여야 한다. spec test는 (a) hook=None과 (b) hook=Some(NoOpHook)의 forward 시간을 비교하고, (a)는 baseline forward와 byte-equal 출력 + 시간 차이 < 1% 안에 들어와야 한다. NoOpHook overhead는 별도로 측정하여 <10% 이내여야 한다 (handoff §4.4 risk 항목). | Performance | test, microbench | host smoke (synthetic 1B model) + 디바이스 microbench (Galaxy S25, n≥10). 양쪽 모두 baseline forward_ms 대비 hook=None 차이 < 1%. |
+| INV-148 | 32-engine-algorithms §3.12.22.2 (ENG-ALG-236) | 단일 `IntraForwardSwapPlan` instance 내에서 동일 layer index `idx`는 정확히 1회만 dispatch 된다. `should_dispatch(idx)`가 true를 반환한 직후 `mark_dispatched(idx)` 호출 후에는 `should_dispatch(idx) == false`가 영구히 유지된다 (plan retire 전까지). 동일 plan에서 같은 layer가 두 번 forward 통과해도(예: prefill + 첫 decode token이 같은 plan 진행 중에 발생) dispatch는 1회. 위반 시 해당 layer에 대한 cl_event가 `pending_events[idx]`를 두 번 덮어써 race condition 유발. | Correctness | test | unit test: plan 생성 → 같은 idx에 대해 should_dispatch / mark_dispatched / should_dispatch 호출 시퀀스 검증. integration test: 한 plan 안에서 forward를 여러 번 호출해도 dispatch 횟수 = `dispatch_at.len()`. |
+| INV-149 | 32-engine-algorithms §3.12.22.4 (ENG-ALG-238), 33-engine-data §3.24 (ENG-DAT-101), arch/weight_swap.md §10.3 | Forward pass에서 layer K가 `LayerSlot::load_weights()`를 호출하기 직전에, `IntraForwardSwapHook::pending_event_for(K)`가 `Some(evt)`이면 `backend.wait_event_blocking(&evt)`이 반드시 호출되어 commit-before-read ordering을 강제한다. `arm_pending(K, evt)`는 `submit_commit` 직전에 store, `clear_pending(K)`는 dispatcher worker가 `slot.swap_weights` 후 store. 양쪽 모두 ArcSwap atomic. forward 스레드가 wait gate에서 잡은 evt가 dispatcher worker에 의해 그 사이 None으로 clear되어도 forward는 자신이 잡은 evt를 wait — completed event에 대한 wait는 fast no-op이므로 정확성 영향 없음. 위반 시 forward가 미완성 cl_mem 위에서 layer K weight를 읽어 garbage 출력 가능. | Safety/Correctness | runtime, test | host smoke: artificial cl_event를 hook의 `pending_events[K]`에 주입 후 forward 진입 시 wait_event_blocking 호출됨을 stub backend로 검증. 디바이스 e2e: INV-122 v2.1 단일-token 게이트로 회귀 차단. |
+| INV-150 | 32-engine-algorithms §3.12.22.5 (ENG-ALG-238 후속), arch/weight_swap.md §10.4 | 활성 `IntraForwardSwapHook` plan은 `is_complete()` 가 true가 될 때까지 다음 plan commit을 막는다. plan이 complete되면 decode loop는 (1) `dispatcher.drain(deadline)`, (2) `backend.synchronize()`, (3) `ratio_generation.fetch_add(1, SeqCst)`, (4) `invalidate_noshuffle_soa_registry()`를 이 순서대로 호출하고 hook을 `None`으로 retire한다. ratio_generation bump는 plan당 정확히 1회. 진행 중 도착한 신규 `SwapWeights` 신호는 logged-and-dropped. | Safety/Correctness | runtime, test | drain → synchronize → bump → invalidate 호출 순서 trace. ratio_generation 카운터를 plan 시작 시점 vs retire 시점에 비교하여 정확히 +1. INV-141 동등 의무 검증 (drain 완료 후 hook drop 시 dispatcher pending_count == 0). |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -387,11 +407,11 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
-| Safety | 21 | 22% |
-| Correctness | 68 | 72% |
-| Performance | 2 | 2% |
+| Safety | 23 | 23% |
+| Correctness | 69 | 71% |
+| Performance | 3 | 3% |
 | Compatibility | 4 | 4% |
-| **합계** | **94** | **100%** |
+| **합계** | **98** | **100%** |
 
 > **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
 > INV-117~119는 v2.2.0 (QCF × DPP)에서 추가. INV-121~122는 Weight Swap Phase A에서 추가.
@@ -402,6 +422,7 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-135~136은 Phase 6 Sprint G-1 (AUF v0.1.1 lm_head Q4_0 사전 변환)에서 추가. 둘 다 Correctness — INV-135는 shape/identity 일치 검증, INV-136은 후방 호환 fallback 보존.
 > INV-137~139는 AUF v0.2 multi-dtype variant (2026-04-27)에서 추가. INV-137/138은 Correctness, INV-139는 Correctness/Compatibility 양쪽이며 Compatibility로 1회 카운트한다 (v0.1.x ↔ v0.2 reader 호환 의무).
 > INV-140~143은 Weight Swap Phase 6.5 Overhead Reduction (2026-05-07)에서 추가. INV-140/141은 Correctness, INV-142는 Safety/Correctness 양쪽이며 Safety로 1회 카운트, INV-143은 Safety (borrow buffer mmap lifetime).
+> INV-147~150은 Intra-forward Layer-aligned Swap (LISWAP-4, 2026-05-08)에서 추가. INV-147은 Performance (hook=None zero overhead), INV-148은 Correctness (plan dispatch 멱등), INV-149/150은 Safety/Correctness 양쪽이며 Safety로 1회 카운트(commit-before-read ordering, plan run-to-completion).
 > INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 > **INV-122 v2.1 (2026-04-26, Phase 5 Sprint A 진단 기반)**: 측정 단위를 **단일-token next-token logit**(prefill 종료 직후 첫 1개 logit)으로 명시적으로 고정. Sprint A 100-prompt × 4-ratio sweep에서 32-token decode 누적 drift로 ratio=0.25에서도 Δtop-1=44.85pp 관측 — 측정-임계값 미스매치 진단. 정확성 회귀(garbage 출력 등)는 0건. 임계값 자체(NMSE ≤ 0.01, Δ top-1 ≤ 1 pp)는 v2와 동일하나 측정 단위가 단일-token으로 고정. Decode window metric은 보조 sanity로 분리. ID/카운트는 변동 없음. Phase 4 자료(NMSE mean=0.0062, Δ top-1=+0.33pp)는 v2.1 기준으로도 PASS.
 

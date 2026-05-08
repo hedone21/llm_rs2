@@ -277,6 +277,8 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                 logits_last_only: false,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             })?;
 
             // Restore current_pos: undo the probe's kv_cache.update() increment.
@@ -367,6 +369,8 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         logits_last_only: false,
                         variance_collector: None,
                         prefill_workspace: None,
+
+                        layer_boundary_hook: None,
                     })?;
                     sp += 1;
 
@@ -585,6 +589,8 @@ fn run_importance_pass<C: KVCacheOps>(
         logits_last_only: false,
         variance_collector: None,
         prefill_workspace: None,
+
+        layer_boundary_hook: None,
     })?;
 
     let table = collector.build();
@@ -721,6 +727,8 @@ fn run_token_by_token_prefill<C: KVCacheOps>(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
     }
 
@@ -787,6 +795,8 @@ fn run_full_prefill<C: KVCacheOps>(
         logits_last_only: true,
         variance_collector: None,
         prefill_workspace: None,
+
+        layer_boundary_hook: None,
     })?;
 
     // Read logits (only last position — much smaller than full prompt × vocab)
@@ -875,6 +885,8 @@ fn run_chunked_prefill<C: KVCacheOps>(
         logits_last_only: true,
         variance_collector: None,
         prefill_workspace: None,
+
+        layer_boundary_hook: None,
     })?;
 
     // Explicitly drop GPU buffers and flush queue to free VRAM before the
@@ -929,6 +941,8 @@ fn run_chunked_prefill<C: KVCacheOps>(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         start_pos += 1;
     }

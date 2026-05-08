@@ -521,6 +521,8 @@ impl<'a> SwapExecutor<'a> {
                     new_dtype: self.target_dtype,
                     write_event,
                     release_worker: self.release_worker.clone(),
+                    on_complete: None,
+                    layer_idx: None,
                 };
 
                 // arc_swap_ms and madvise_ms accrue inside the dispatcher worker;
@@ -853,6 +855,20 @@ impl<'a> SwapExecutor<'a> {
             post_ffn_norm: old.post_ffn_norm.clone(),
             partition_ctx: None, // DF-35-3: cleared on swap (see above)
         })
+    }
+
+    /// LISWAP-4 entry point for `IntraForwardSwapHook`: thin public wrapper
+    /// over the private `build_layer_from_mmap_async`. Identical semantics —
+    /// only exposed so the intra-forward hook in
+    /// `models/weights/intra_forward_swap.rs` can re-use the async build path
+    /// without re-implementing materialise / Q-K permutation.
+    pub fn build_layer_from_mmap_async_for_hook(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        slot: &LayerSlot,
+        layer_idx: usize,
+    ) -> Result<(TransformerLayer, GpuEvent), SwapError> {
+        self.build_layer_from_mmap_async(secondary, slot, layer_idx)
     }
 
     /// LISWAP-2 async variant of `build_layer_from_mmap`.

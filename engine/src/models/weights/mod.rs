@@ -12,6 +12,7 @@
 pub mod async_swap;
 pub mod decider;
 pub mod incremental_plan;
+pub mod intra_forward_swap;
 pub mod noise_table;
 pub mod release_worker;
 pub mod secondary_mmap;
@@ -21,6 +22,9 @@ pub mod swap_executor;
 pub use async_swap::{AsyncSwapDispatcher, SwapCommitJob, SwapJob};
 pub use decider::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
 pub use incremental_plan::IncrementalSwapPlan;
+pub use intra_forward_swap::{
+    IntraForwardSwapHook, IntraForwardSwapPlan, LayerBoundaryHook, NoOpHook,
+};
 pub use noise_table::QuantNoiseTable;
 pub use release_worker::PrimaryReleaseWorker;
 pub use secondary_mmap::{

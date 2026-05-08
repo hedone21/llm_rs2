@@ -168,6 +168,14 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// When provided during prefill, captures per-layer attention column-sums.
     pub variance_collector:
         Option<&'a mut crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector>,
+    /// Optional layer boundary hook (LISWAP-4 / ENG-ALG-235).
+    ///
+    /// When `Some`, `forward_into` calls `hook.on_layer_boundary(idx, seq_len)`
+    /// after each layer's compute step (and inside the layer loop, before
+    /// `layer.forward`, calls the wait gate via `hook.pending_event_for(idx)`).
+    /// When `None`, the hot-path overhead is one `Option::is_some` branch
+    /// per layer (INV-147).
+    pub layer_boundary_hook: Option<&'a dyn crate::models::weights::LayerBoundaryHook>,
 }
 
 impl TransformerModel {
@@ -1391,6 +1399,10 @@ impl TransformerModel {
         let skip_config = args.skip_config;
         let mut importance_collector = args.importance_collector;
         let mut variance_collector = args.variance_collector;
+        // LISWAP-4 (ENG-ALG-235 / INV-147): pull the layer-boundary hook off
+        // of args once so the layer loop only pays the `Option::is_some`
+        // check per layer.
+        let layer_boundary_hook = args.layer_boundary_hook;
 
         // Fused-merge carry slots are scoped to a single forward pass; reset
         // them here so the first layer cannot accidentally consume stale
@@ -1574,6 +1586,16 @@ impl TransformerModel {
             .load(std::sync::atomic::Ordering::Acquire);
         for (i, layer_arc) in layer_snapshots.iter().enumerate() {
             let layer = &**layer_arc;
+            // LISWAP-4 wait gate (ENG-ALG-238 / INV-149): if there is a
+            // pending in-flight swap event for this layer, block until the
+            // dispatcher worker has committed the new weights. The Arc
+            // snapshot captured above is unaffected — we only enforce
+            // commit-before-read ordering for the next forward.
+            if let Some(hook) = layer_boundary_hook
+                && let Some(evt) = hook.pending_event_for_dyn(i)
+            {
+                backend.wait_event_blocking(&evt)?;
+            }
             // GPU acc active -> GPU handles score collection internally in attention_gen.
             // CPU accumulator still needs need_scores=false to avoid redundant CPU path.
             let need_scores = if gpu_score_active {
@@ -1683,6 +1705,12 @@ impl TransformerModel {
                 })?;
                 // Intra-token GPU yield hook (decode only, seq_len == 1).
                 crate::core::gpu_yield::maybe_yield_after_layer(&**backend, i, true);
+            }
+
+            // LISWAP-4 (ENG-ALG-235): post-layer hook. Called after every
+            // layer (prefill and decode) — implementations branch on seq_len.
+            if let Some(hook) = layer_boundary_hook {
+                hook.on_layer_boundary(i, seq_len);
             }
 
             // Record importance after layer forward

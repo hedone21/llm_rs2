@@ -1654,7 +1654,463 @@ sequenceDiagram
 
 ---
 
-## 8. 변경 이력
+## 10. Phase 6.7 Intra-forward Layer-aligned Swap (LISWAP-4, 2026-05-08)
+
+> **편집 노트**: §8 / §9 슬롯은 LISWAP-1 (Layer-Incremental Swap Stage 1 MVP) 트랙용으로 예약. LISWAP-1 spec이 본 arch에 명문화될 때 §8 (LISWAP-1 본체) / §9 (LISWAP-1 변경 이력)로 사용된다. ID 재사용 금지 원칙에 따라 §10은 LISWAP-4 전용으로 발급한다.
+
+§7 Phase 6.5는 290 ms 단발 stall을 절대 감축, LISWAP-1(§8 예약)은 N decode tick에 분산. §10 LISWAP-4는 forward **중간** layer 경계에서 swap을 dispatch하여 같은 forward 후속 layer compute + 다음 토큰 forward 선행 layer compute와 swap window를 overlap한다. LISWAP-2 prototype(forward 직후 일괄 dispatch)이 Adreno multi-queue serialize로 0% saving이었던 것과 다른 timing 영역이다.
+
+### 10.1 LISWAP-2 negative result와의 차이
+
+| 항목 | LISWAP-2 (negative) | LISWAP-4 (신) |
+|------|----------------------|----------------|
+| Dispatch 시점 | forward 종료 직후 | forward 중간 layer 경계 |
+| 한 번의 dispatch chunk size | 전체 layer (예: 28 layer × ~10 MiB = 280 MiB) | 단일 layer (~10 MiB) |
+| Overlap 대상 | 다음 forward 전체 | 같은 forward의 후속 layer + 다음 forward의 선행 layer |
+| Swap window | 다음 forward 시간 ≈ 23–28 ms (Adreno에서 GPU 직렬화로 실효 0) | 같은 forward 후속 layer (~6 ms) + 다음 forward 선행 (~17 ms) ≈ 23 ms |
+| Adreno serialize 영향 | hardware-level 직렬화로 hidden 0% (`swap_overhead_async_dispatch_phase6.md`) | chunk가 작고 dispatch가 forward 중간이라 timing 다름 — 측정 미답 |
+| Stage gate 횟수 | 1회 | plan당 1회 (LISWAP-1의 N회와 다름, INV-150) |
+
+### 10.2 컴포넌트: `LayerBoundaryHook` trait (ENG-ALG-235 / INV-147)
+
+#### 설계 결정
+
+- **`Option<&dyn LayerBoundaryHook>` 인자 1개 추가**: `TransformerModelForwardArgs`에 `layer_boundary_hook: Option<&dyn LayerBoundaryHook>` 필드 추가. 기존 호출 사이트는 `Default::default()` 또는 명시 None으로 무영향. INV-147 (zero overhead)은 `if let Some(hook) = ...` 분기에서 `Some` 분기가 거의 발생하지 않는 hot path 특성 + branch predictor에 의존.
+- **trait 메서드는 `&self` 만 받음**: hook 자신의 mutable state는 내부 ArcSwap/Mutex로 캡슐화. 호출자가 hook을 borrow checker 마찰 없이 forward에 통과시키기 위함.
+- **호출 위치는 layer i compute **직후**, layer i+1 compute **직전**: `importance_collector.snapshot_after()`와 동일 라인 그룹. 마지막 layer (idx == num_layers - 1) 후에도 호출됨 — `final_norm` 진입 직전.
+- **prefill과 decode 모두 호출**: `seq_len` 인자로 분기 가능. LISWAP-4 hook은 `seq_len == 1`(decode)에서만 dispatch하도록 자체 구현 (prefill 중 swap은 cl_mem 사이즈 폭증 risk).
+
+#### 인터페이스
+
+```rust
+pub trait LayerBoundaryHook: Send + Sync {
+    /// pre: 0 <= idx < num_layers
+    /// pre: hook does NOT mutate `x` activation
+    /// post: forward path state unchanged (hook is observe-and-dispatch only)
+    fn on_layer_boundary(&self, idx: usize, seq_len: usize);
+}
+```
+
+`TransformerModelForwardArgs`에 추가:
+```rust
+pub struct TransformerModelForwardArgs<'a, C> {
+    // ... existing fields ...
+    pub layer_boundary_hook: Option<&'a dyn LayerBoundaryHook>,
+}
+```
+
+#### 처리 흐름 (forward_into 내부)
+
+```mermaid
+flowchart TD
+    START([forward_into 진입]) --> SNAPSHOT[layer_snapshots = self.layers.iter&lpar;&rpar;<br/>.map&lpar;|s| s.load_weights&lpar;&rpar;&rpar;.collect&lpar;&rpar;<br/>「INV-121」]
+    SNAPSHOT --> EMBED[embedding lookup]
+    EMBED --> LOOP_START{i < num_layers?}
+
+    LOOP_START -- Yes --> WAIT_GATE{layer_boundary_hook<br/>== Some?}
+    WAIT_GATE -- Yes --> CHECK_PEND{hook.pending_event_for&lpar;i&rpar;<br/>== Some&lpar;evt&rpar;?}
+    CHECK_PEND -- Yes --> WAIT[backend.wait_event_blocking&lpar;&evt&rpar;<br/>「ENG-ALG-238 / INV-149」]
+    CHECK_PEND -- No --> LAYER
+    WAIT --> LAYER[layer.forward&lpar;...&rpar;<br/>reads layer_snapshots&lbrack;i&rbrack;]
+    WAIT_GATE -- No --> LAYER
+
+    LAYER --> POST_HOOK{layer_boundary_hook<br/>== Some?}
+    POST_HOOK -- Yes --> ON_BOUNDARY[hook.on_layer_boundary&lpar;i, seq_len&rpar;<br/>「ENG-ALG-235」]
+    POST_HOOK -- No --> NEXT_I[i += 1]
+    ON_BOUNDARY --> NEXT_I
+    NEXT_I --> LOOP_START
+
+    LOOP_START -- No --> FINAL_NORM[final_norm + lm_head]
+    FINAL_NORM --> END([forward_into 종료])
+
+    style WAIT fill:#ffebee
+    style ON_BOUNDARY fill:#c8e6c9
+```
+
+### 10.3 컴포넌트: `IntraForwardSwapHook` (ENG-ALG-236, ENG-ALG-237 / INV-148, ENG-DAT-101)
+
+#### 설계 결정
+
+- **per-slot pending event registry**: `Vec<ArcSwapOption<GpuEvent>>` 길이 `num_layers`. lock-free read를 위해 `Mutex<HashMap>` 안 사용. (대안 검토: `LayerSlot::pending_swap_event` 필드 추가 — slot SRP 침해로 reject. `AsyncSwapDispatcher` 내부 map — forward thread가 dispatcher lock 잡아야 해 reject.) 결론: hook 자체에 registry 보유하는 것이 lifetime/lock-free/SRP 모두에 최적.
+- **plan은 BTreeSet 기반**: `dispatch_at`는 layer index 집합. order는 hook 외부에서 결정 (CLI / decider). 동일 layer 중복 dispatch 방지(INV-148)는 `dispatched` set으로 enforce.
+- **AsyncSwapDispatcher 재사용**: LISWAP-2 인프라(`SwapCommitJob`, `submit_commit`, worker_loop의 wait_event_blocking → swap_weights → release chain)를 그대로 사용. 새로 추가하는 것은 hook 본체 + `arm_pending`/`clear_pending` 콜백뿐. dispatcher worker는 `slot.swap_weights` 직후 hook의 `clear_pending(idx)`를 호출하도록 약간 확장 필요 (`SwapCommitJob`에 `on_complete: Option<Arc<dyn Fn(usize) + Send + Sync>>` 필드 추가 검토 — 또는 worker가 hook 참조를 보유하도록).
+- **hook이 `Arc<dyn LayerBoundaryHook>`로 wrap**: Arc clone을 dispatcher worker가 보유하여 worker thread에서 `clear_pending` 호출 가능.
+- **prefill swap 금지**: hook 내부에서 `seq_len > 1`이면 즉시 return. prefill 중 cl_mem 메모리 폭증 risk 회피.
+
+#### 인터페이스
+
+```rust
+pub struct IntraForwardSwapHook {
+    plan: Mutex<IntraForwardSwapPlan>,
+    dispatcher: Arc<AsyncSwapDispatcher>,
+    secondary: Arc<SecondaryMmap>,
+    layer_slots: Vec<Arc<LayerSlot>>,
+    backend: Arc<dyn Backend>,
+    release_worker: Option<Arc<PrimaryReleaseWorker>>,
+    pending_events: Vec<ArcSwapOption<GpuEvent>>,
+    stage_gate_armed: AtomicBool,
+}
+
+impl IntraForwardSwapHook {
+    pub fn new(
+        layers: Vec<usize>,
+        token: usize,
+        dispatcher: Arc<AsyncSwapDispatcher>,
+        secondary: Arc<SecondaryMmap>,
+        layer_slots: Vec<Arc<LayerSlot>>,
+        backend: Arc<dyn Backend>,
+        release_worker: Option<Arc<PrimaryReleaseWorker>>,
+        num_layers: usize,
+    ) -> Arc<Self>;
+
+    /// Read-only snapshot for forward-thread wait gate (ENG-ALG-238).
+    pub fn pending_event_for(&self, idx: usize) -> Option<GpuEvent>;
+
+    /// Plan progress probe.
+    pub fn plan_is_complete(&self) -> bool;
+
+    /// Decode loop calls this after `plan_is_complete()` returns true.
+    /// Performs: drain → synchronize → ratio_generation += 1 →
+    /// invalidate_noshuffle_soa_registry. Returns Err on drain timeout
+    /// or backend sync error (INV-150).
+    pub fn finalize(
+        &self,
+        ratio_generation: &AtomicU64,
+        soa_registry_invalidate: impl FnOnce(),
+        deadline: Duration,
+    ) -> Result<()>;
+
+    /// Internal — called by hook itself before submit_commit.
+    fn arm_pending(&self, idx: usize, event: GpuEvent);
+
+    /// Internal — called by AsyncSwapDispatcher worker after slot.swap_weights.
+    /// Worker must hold an Arc<IntraForwardSwapHook> for this callback.
+    fn clear_pending(&self, idx: usize);
+}
+
+impl LayerBoundaryHook for IntraForwardSwapHook {
+    fn on_layer_boundary(&self, idx: usize, seq_len: usize) {
+        if seq_len > 1 { return; }  // prefill: never dispatch
+        let mut plan = self.plan.lock().unwrap();
+        if !plan.should_dispatch(idx) { return; }
+        // 1. Build secondary tensor (ENG-ALG-211 step a/b borrow)
+        // 2. enqueue_write_async (ENG-ALG-230)
+        // 3. arm_pending(idx, evt)
+        // 4. submit_commit(SwapCommitJob{...write_event=evt})
+        // 5. plan.mark_dispatched(idx)
+        // 6. self.stage_gate_armed.store(true, Release)
+    }
+}
+```
+
+#### 처리 흐름
+
+`spec/32-engine-algorithms.md` §3.12.22.3의 mermaid sequence와 동일. forward thread는 hook을 호출하고 즉시 반환, dispatcher worker가 cl_event 완료 후 ArcSwap commit + `clear_pending` 수행.
+
+#### 예외 처리
+
+- **`enqueue_write_async` 실패**: hook 내부에서 에러 로그 후 plan 진행 (해당 layer는 swap 안 됨, 다음 plan에서 재시도 가능). dispatcher submit 안 함, `arm_pending` 안 함.
+- **dispatcher 내부 panic**: worker thread가 죽으면 `submit_commit`이 channel error 반환. hook은 plan 무효화 + `pending_events` 모두 None clear + finalize에서 dispatcher drain timeout 발생 → 호출자가 swap fallback 결정.
+- **dispatcher drain timeout (10초 권장)**: `finalize`가 `SwapError::DispatcherDrainTimeout` 반환. decode loop는 다음 swap 신호를 reject하고 manager에 alert.
+
+### 10.4 컴포넌트: cl_event Wait Gate (ENG-ALG-238 / INV-149)
+
+#### 설계 결정
+
+- **wait gate 위치 = layer i forward 호출 직전**: `layer.forward(...)` 호출 직전에 `hook.pending_event_for(i)` 검사. ArcSwap snapshot은 이미 `layer_snapshots`에 잡혀 있음(INV-121) — wait gate는 그 snapshot 안의 cl_mem이 GPU에서 visible한지를 강제.
+- **`backend.wait_event_blocking`은 fast no-op for completed event**: dispatcher worker가 이미 `slot.swap_weights` + `clear_pending`을 끝냈더라도 forward thread가 잡은 evt clone은 여전히 valid (cl_event는 retain count로 관리). completed event에 대한 wait는 driver-level fast no-op.
+- **wait는 forward thread를 block**: 평균적으로 swap이 forward window 안에 끝나도록 plan ordering이 잡혀 있어 wait time 0. worst case는 단일 token spike (handoff §4.4 risk).
+
+### 10.5 Decode Loop 통합 (Plan Lifecycle)
+
+```mermaid
+flowchart TD
+    START([Decode 진입]) --> NEW_TOKEN([Token T])
+    NEW_TOKEN --> FWD[forward_into&lpar;args.with_hook&lpar;intra_forward_hook&rpar;&rpar;<br/>「내부에서 wait gate + on_boundary 발동」]
+    FWD --> SAMPLE[sample]
+    SAMPLE --> CHECK_HOOK{intra_forward_hook<br/>== Some?}
+
+    CHECK_HOOK -- Yes --> CHECK_COMPLETE{hook.plan_is_complete&lpar;&rpar;?}
+    CHECK_COMPLETE -- Yes --> FINALIZE[hook.finalize&lpar;&ratio_generation, invalidate_soa, 10s&rpar;<br/>「INV-150」<br/>drain → synchronize → bump → invalidate]
+    FINALIZE --> RETIRE[intra_forward_hook = None]
+    RETIRE --> SIG_CHK
+    CHECK_COMPLETE -- No --> SIG_CHK
+    CHECK_HOOK -- No --> SIG_CHK
+
+    SIG_CHK{새 SwapWeights signal?}
+    SIG_CHK -- No --> NEXT([Token T+1])
+    SIG_CHK -- Yes --> IN_FLIGHT_CHK{intra_forward_hook<br/>== Some?}
+
+    IN_FLIGHT_CHK -- Yes --> IGNORE[logged-and-dropped]
+    IN_FLIGHT_CHK -- No --> CLI_CHK{cli.swap_intra_forward?}
+    CLI_CHK -- Yes --> COMMIT[intra_forward_hook = Some&lpar;Arc::new&lpar;<br/>IntraForwardSwapHook::new&lpar;target_layers, ...&rpar;&rpar;&rpar;]
+    CLI_CHK -- No --> SINGLE[swap_executor.execute_on_slots&lpar;&target_layers&rpar;<br/>「single-shot 기존 경로」]
+    IGNORE --> NEXT
+    COMMIT --> NEXT
+    SINGLE --> NEXT
+
+    style FINALIZE fill:#fff3e0
+    style IGNORE fill:#ffebee
+    style COMMIT fill:#c8e6c9
+```
+
+### 10.6 LISWAP-1과의 상호 배타 (ENG-DAT-C18)
+
+`--swap-incremental-per-tick > 0`와 `--swap-intra-forward = true`는 동시 활성화 금지. 이유: LISWAP-1의 ratio_generation bump는 chunk마다(N회), LISWAP-4는 plan당(1회). 동시 활성화 시 plan invalidation의 의미가 불일치. CLI parser는 둘 다 활성이면 다음 메시지로 reject:
+
+```
+ERROR: --swap-incremental-per-tick (= N) and --swap-intra-forward (= true)
+       are mutually exclusive (ENG-DAT-C18). Pick one:
+       (a) --swap-incremental-per-tick=N --swap-intra-forward=false   (LISWAP-1)
+       (b) --swap-incremental-per-tick=0 --swap-intra-forward=true    (LISWAP-4)
+       (c) --swap-incremental-per-tick=0 --swap-intra-forward=false   (single-shot)
+```
+
+### 10.7 새 ID 요약
+
+| ID | 분류 | 한줄 의도 | 의존 |
+|----|------|----------|------|
+| ENG-ALG-235 | Algorithm | `LayerBoundaryHook` trait — forward layer 경계 hook 인터페이스. None일 때 zero overhead. | INV-147 |
+| ENG-ALG-236 | Algorithm | `IntraForwardSwapPlan` 자료구조 (BTreeSet, should_dispatch / mark_dispatched 멱등) | INV-148 |
+| ENG-ALG-237 | Algorithm | `IntraForwardSwapHook` 동작 sequence (build → enqueue_write_async → arm → submit → mark) | ENG-ALG-235/236, ENG-ALG-230 (async upload), AsyncSwapDispatcher (LISWAP-2 인프라) |
+| ENG-ALG-238 | Algorithm | Wait gate at next forward layer K + plan run-to-completion finalize | INV-149, INV-150, INV-141 (drain) |
+| ENG-DAT-101 | Data | `pending_events: Vec<ArcSwapOption<GpuEvent>>` per-slot registry | ENG-ALG-237/238 |
+| ENG-DAT-C18 | Constraint | `--swap-incremental-per-tick > 0` × `--swap-intra-forward = true` 상호 배타 | ENG-ALG-238 |
+| INV-147 | Performance | hook=None 시 forward path zero overhead (<1% 시간 차이) | ENG-ALG-235 |
+| INV-148 | Correctness | plan 내 동일 layer 정확히 1회 dispatch (멱등) | ENG-ALG-236 |
+| INV-149 | Safety/Correctness | wait gate ordering — pending_event_for(K) == Some → wait_event_blocking 강제 | ENG-ALG-238, ENG-DAT-101 |
+| INV-150 | Safety/Correctness | plan run-to-completion: drain → synchronize → ratio_generation +1 → invalidate (plan당 1회) | ENG-ALG-238, INV-141, INV-142 |
+
+### 10.8 위험 분석 / 결정 분기
+
+| Risk | 확률 | 영향 | 완화 |
+|------|------|------|------|
+| **Adreno multi-queue serialize 재발** (LISWAP-2와 동일 결과) | medium-high | 효과 0% | 측정으로 확인. fail이라도 paper에 "Adreno serialize는 chunk 크기/timing 무관" 결론 강화. (handoff §4.4) |
+| Hook hot-path overhead (INV-147 위반) | low | forward_ms 인플레 | hook=None microbench로 baseline 비교. NoOpHook 측정으로 trait dispatch 자체 비용 격리. <1% 시간차이가 INV-147 임계. |
+| Wait gate가 forward 첫 layer 진입 시 block (worst case) | medium | 단일 token spike | swap window(25–28 ms) > H2D(17 ms)이므로 정상 워크로드에서 wait 거의 0. spike 발생 빈도 측정 필요. |
+| ArcSwap commit timing race | low | 정확성 fail | INV-149 wait gate가 commit-before-read ordering 강제. dispatcher worker thread에서 commit 후 clear_pending. |
+| `enqueue_write_async` 실패가 plan을 stuck | low | plan retire 실패 → dispatcher drain timeout | hook 내부에서 enqueue 실패 시 plan에 mark_dispatched 호출 안 함 → finalize 조건 영원히 false. workaround: plan에 `failed_dispatches` set 추가하여 finalize 조건을 `dispatched ∪ failed == dispatch_at`로 완화. (Stage 2 결정) |
+| LISWAP-1과 동시 활성 | low | ratio_generation bump 의미 불일치 | ENG-DAT-C18 CLI parser reject. spec test로 회귀 차단. |
+
+### 10.9 측정 sweep 가이드
+
+handoff §4.5 그대로:
+
+```
+# Galaxy S25
+prompt = "The quick brown fox jumps"
+n_tokens = 40
+threads = 6
+backend = opencl
+force-swap-ratio = 0.9
+secondary-layout = aos
+
+scenarios:
+  - sync_singleshot      # baseline (existing)
+  - sync_incremental_pt1 # LISWAP-1 baseline (per_tick=1, 명문화 대기)
+  - intra_forward_swap   # LISWAP-4
+
+n=5 each
+```
+
+비교 항목: 단발 stall (single-shot 비교), per-token TBT (incremental/intra-forward 비교), forward_ms transitional / post-plan, total per-plan wall-clock, decode 정확성 (5/5 OK 필수).
+
+Decision gate (LISWAP-4 success, handoff §4.5):
+- AC1: decode 정확성 5/5 (top-5 overlap > 99% vs sync_singleshot)
+- AC2: forward_ms 인플레 ≤ 10% (hook overhead)
+- AC3: sync baseline 대비 wall-clock saving ≥ 20% (per-plan total)
+- AC4: 50ms frame budget 무시 (사용자 결정 2026-05-08)
+
+### 10.10 작업 분배 권고
+
+- **Architect (이 문서)**: spec 작성 — ENG-ALG-235~238, ENG-DAT-101, ENG-DAT-C18, INV-147~150. spec 32/33/41 + COVERAGE.md + arch §10.
+- **Senior Implementer**: ENG-ALG-237 (`IntraForwardSwapHook` 본체), ENG-ALG-238 (wait gate + finalize), ENG-DAT-101 (pending_events registry). 신규 파일 `engine/src/models/weights/intra_forward_swap.rs` 권장 (async_swap.rs 확장 대신 — 가독성 + 책임 분리). `AsyncSwapDispatcher`의 worker_loop는 `SwapCommitJob`에 `on_complete: Option<...>` callback 필드 추가하는 작은 수정만 필요.
+- **Implementer**: ENG-ALG-235 (`LayerBoundaryHook` trait + `TransformerModelForwardArgs.layer_boundary_hook` 추가), ENG-ALG-236 (`IntraForwardSwapPlan` 자료구조), ENG-DAT-C18 CLI parser 배타 검사, decode loop finalize 통합 (`engine/src/bin/generate.rs`).
+- **Implementer (spec test)**: 4개 테스트 파일.
+- **Tester**: Galaxy S25에서 sync vs LISWAP-4 sweep n=5. 보고서: `papers/eurosys2027/_workspace/experiment/swap_overhead_intra_forward.md` (가칭).
+
+### 10.11 변경 대상 파일 + 함수 + 위치 (Senior Implementer 인계용)
+
+| 파일 | 함수 / 위치 | 변경 내용 |
+|------|-------------|----------|
+| `engine/src/core/backend.rs` | `Backend::enqueue_write_async`, `wait_event_blocking` | 재사용 (변경 없음). hook이 호출. |
+| `engine/src/models/weights/async_swap.rs` | `SwapCommitJob` struct | `on_complete: Option<Arc<dyn Fn(usize) + Send + Sync>>` 필드 추가. worker_loop의 `process_commit`이 `slot.swap_weights` 직후 호출. |
+| `engine/src/models/weights/async_swap.rs` | `worker_loop::process_commit` | `slot.swap_weights` 후 `if let Some(cb) = &job.on_complete { cb(layer_idx); }` 추가. |
+| `engine/src/models/weights/intra_forward_swap.rs` (**신규**) | `IntraForwardSwapHook`, `IntraForwardSwapPlan`, `LayerBoundaryHook` trait | ENG-ALG-235~237 본체 구현. ~250 LOC 추정. |
+| `engine/src/models/weights/mod.rs` | pub mod | `pub mod intra_forward_swap;` 추가. |
+| `engine/src/models/transformer.rs` | `TransformerModelForwardArgs` struct | `pub layer_boundary_hook: Option<&'a dyn LayerBoundaryHook>` 필드 추가 (lifetime 'a 추가 필요). |
+| `engine/src/models/transformer.rs` | `forward_into` layer loop | layer loop 안에 (1) layer.forward 직전 wait gate, (2) layer.forward 직후 on_layer_boundary 추가. |
+| `engine/src/bin/generate.rs` | CLI parser | `--swap-intra-forward: bool` 추가. ENG-DAT-C18 배타 검사 (둘 다 양수면 anyhow::bail!). |
+| `engine/src/bin/generate.rs` | decode loop main body | `intra_forward_hook: Option<Arc<IntraForwardSwapHook>>` 상태 변수. forward 호출 시 hook 주입. plan complete 시 finalize + retire. swap signal 진입 시 `swap_intra_forward` flag로 분기. |
+| `engine/tests/spec/test_inv_147_hook_zero_overhead.rs` | (신규) | hook=None vs hook=Some(NoOpHook) forward 시간 비교. |
+| `engine/tests/spec/test_inv_148_plan_dispatch_idempotent.rs` | (신규) | should_dispatch / mark_dispatched 시퀀스 멱등성. |
+| `engine/tests/spec/test_inv_149_wait_gate_ordering.rs` | (신규) | stub backend로 wait_event_blocking 호출 검증. |
+| `engine/tests/spec/test_inv_150_plan_run_to_completion.rs` | (신규) | finalize 호출 순서 trace + ratio_generation +1 검증. |
+| `engine/tests/spec/test_eng_alg_237_intra_forward_hook.rs` | (신규) | Hook full sequence (build → enqueue → submit → mark) integration. |
+| `engine/tests/spec/test_eng_dat_101_pending_event_registry.rs` | (신규) | arm/clear/read concurrent 시나리오. |
+| `engine/tests/spec/test_eng_dat_c18_liswap_mutual_exclusion.rs` | (신규) | CLI parser reject 검증. |
+
+### 10.12 tests/spec/ 테스트 케이스 명세 (Implementer 작성용)
+
+#### 10.12.1 `test_inv_147_hook_zero_overhead.rs` (정확성 + Performance)
+
+**목적**: INV-147 — hook=None 시 forward path는 baseline과 byte-equal 출력 + 시간 차이 < 1%.
+
+**케이스**:
+
+```rust
+// CASE 1: hook=None vs no hook arg (legacy default) byte-equal
+let model = build_synthetic_1b_model();
+let logits_a = run_forward(&model, &tokens, /*hook=*/None);
+let logits_b = run_forward_legacy(&model, &tokens);  // pre-LISWAP-4 path
+assert_eq!(logits_a.as_bytes(), logits_b.as_bytes());
+
+// CASE 2: hook=None microbench < baseline + 1%
+let baseline = bench_forward(&model, &tokens, None, n_iter=100);
+let with_none = bench_forward_with_hook(&model, &tokens, None, n_iter=100);
+assert!(with_none.median <= baseline.median * 1.01,
+    "hook=None overhead {} > 1%", (with_none.median / baseline.median - 1.0));
+
+// CASE 3: NoOpHook overhead < 10%
+struct NoOpHook;
+impl LayerBoundaryHook for NoOpHook {
+    fn on_layer_boundary(&self, _idx: usize, _seq_len: usize) {}
+}
+let with_noop = bench_forward_with_hook(&model, &tokens, Some(&NoOpHook), n_iter=100);
+assert!(with_noop.median <= baseline.median * 1.10);
+```
+
+**제약**: 이 테스트는 host에서 synthetic model로 격리 가능. 디바이스 microbench는 별도 Tester 작업.
+
+#### 10.12.2 `test_inv_148_plan_dispatch_idempotent.rs` (정확성)
+
+**목적**: INV-148 — `IntraForwardSwapPlan` 내 동일 idx 정확히 1회 dispatch.
+
+**케이스**:
+
+```rust
+// CASE 1: should_dispatch / mark / should_dispatch 시퀀스
+let mut plan = IntraForwardSwapPlan::new(vec![3, 5, 7], 0);
+assert!(plan.should_dispatch(3));
+plan.mark_dispatched(3);
+assert!(!plan.should_dispatch(3));
+assert!(plan.should_dispatch(5));
+
+// CASE 2: 중복 mark 안전
+plan.mark_dispatched(3);  // double mark
+assert!(!plan.should_dispatch(3));
+
+// CASE 3: dispatch_at 외 idx
+assert!(!plan.should_dispatch(0));
+assert!(!plan.should_dispatch(99));
+
+// CASE 4: 모든 layer mark 후 is_complete
+for i in [3, 5, 7] { plan.mark_dispatched(i); }
+assert!(plan.is_complete());
+assert_eq!(plan.pending_layers().count(), 0);
+
+// CASE 5: 빈 plan
+let empty = IntraForwardSwapPlan::new(vec![], 0);
+assert!(empty.is_complete());  // 또는 호출자가 생성하지 않음 — 의미 결정 필요
+```
+
+#### 10.12.3 `test_inv_149_wait_gate_ordering.rs` (정확성 + Safety)
+
+**목적**: INV-149 — wait gate가 layer K forward 진입 직전 호출됨.
+
+**케이스**:
+
+```rust
+// CASE 1: stub backend로 wait_event_blocking 호출 추적
+struct TraceBackend { calls: Mutex<Vec<String>> }
+impl Backend for TraceBackend {
+    fn wait_event_blocking(&self, _evt: &GpuEvent) -> Result<()> {
+        self.calls.lock().unwrap().push("wait".into());
+        Ok(())
+    }
+    // ... matmul 등은 "matmul" push
+}
+
+// hook이 layer 5의 pending_events에 evt 주입
+let hook = Arc::new(IntraForwardSwapHook::new(...));
+hook.arm_pending(5, GpuEvent::dummy());
+
+run_forward(&model, &tokens, Some(hook.as_ref()));
+let calls = backend.calls.lock().unwrap();
+
+// "wait" 호출이 "layer_5_matmul" 호출 직전에 있어야 함
+let wait_idx = calls.iter().position(|c| c == "wait").unwrap();
+let layer_5_idx = calls.iter().position(|c| c == "layer_5_matmul").unwrap();
+assert!(wait_idx < layer_5_idx);
+
+// CASE 2: pending_event_for(K) == None 시 wait 호출 없음
+hook.clear_pending(5);
+let calls_2 = run_forward(...);
+assert!(!calls_2.contains(&"wait".to_string()));
+
+// CASE 3: completed event에 대한 wait도 fast no-op (직접 검증 어려움 — 통과 시간 측정으로 대체)
+```
+
+#### 10.12.4 `test_inv_150_plan_run_to_completion.rs` (정확성 + Safety)
+
+**목적**: INV-150 — finalize가 drain → synchronize → ratio_generation +1 → invalidate 순서로 실행, plan당 1회.
+
+**케이스**:
+
+```rust
+// CASE 1: 호출 순서 trace
+let trace = Arc::new(Mutex::new(Vec::new()));
+let backend = TraceBackend { trace: trace.clone() };
+let dispatcher = Arc::new(AsyncSwapDispatcher::new(backend.clone()));
+
+let hook = Arc::new(IntraForwardSwapHook::new(vec![3], 0, dispatcher.clone(), ...));
+
+// Pretend plan complete
+hook.plan.lock().unwrap().mark_dispatched(3);
+assert!(hook.plan_is_complete());
+
+let ratio_gen = AtomicU64::new(42);
+let invalidate_called = Arc::new(AtomicBool::new(false));
+let inv_clone = invalidate_called.clone();
+hook.finalize(&ratio_gen, || inv_clone.store(true, Release), Duration::from_secs(1)).unwrap();
+
+let trace_vec = trace.lock().unwrap();
+let drain_idx = trace_vec.iter().position(|x| x == "drain").unwrap();
+let sync_idx = trace_vec.iter().position(|x| x == "synchronize").unwrap();
+assert!(drain_idx < sync_idx);
+
+assert_eq!(ratio_gen.load(Acquire), 43);  // +1
+assert!(invalidate_called.load(Acquire));  // invalidate called
+
+// CASE 2: ratio_generation bump 정확히 1회 (plan당)
+// → CASE 1에서 finalize 후 다시 호출하지 않음을 호출자가 보장 (retire pattern)
+// 호출자 책임이라 unit test는 retire 후 finalize 호출 시 panic/error 검증으로 대체
+let result_2 = hook.finalize(&ratio_gen, || {}, Duration::from_secs(1));
+assert!(result_2.is_err());  // 또는 NoOp 후 정확히 1회 보존 (선택)
+assert_eq!(ratio_gen.load(Acquire), 43);  // 변동 없음
+
+// CASE 3: dispatcher drain timeout
+// → 의도적으로 stuck dispatcher 시나리오에서 finalize timeout
+let stuck_dispatcher = stub_stuck_dispatcher();
+let hook_stuck = IntraForwardSwapHook::new(... stuck_dispatcher ...);
+let result = hook_stuck.finalize(&ratio_gen, || {}, Duration::from_millis(50));
+assert!(matches!(result, Err(SwapError::DispatcherDrainTimeout)));
+```
+
+---
+
+## 11. 변경 이력
+
+> **편집 노트**: 본 문서는 §8 / §9를 LISWAP-1 (Layer-Incremental Swap Stage 1 MVP) 트랙용으로 예약 중이다. 변경 이력은 §11에 배치하여 LISWAP-1 spec 본체가 명문화될 때 §8 / §9를 자연스럽게 채울 수 있도록 한다.
+
+- **2026-05-08 (v11, Phase 6.7 Intra-forward Layer-aligned Swap, LISWAP-4)**:
+  1. §10 신규. forward 중간 layer 경계 dispatch + 같은 forward 후속 layer / 다음 token 선행 layer와 swap window overlap 시도 트랙. LISWAP-2 negative result(forward 직후 일괄 dispatch)와 timing 영역이 다른 측정.
+  2. ENG-ALG-235~238 (4개), INV-147~150 (4개), ENG-DAT-101 (1개), ENG-DAT-C18 (1개) 신규 ID.
+  3. §10.2 `LayerBoundaryHook` trait — hook=None zero overhead (INV-147). §10.3 `IntraForwardSwapHook` 본체. §10.4 wait gate. §10.5 decode loop lifecycle (Mermaid).
+  4. §10.6 LISWAP-1과 상호 배타 (ENG-DAT-C18) — ratio_generation bump 의미 충돌 방지.
+  5. §10.11 변경 대상 파일 + 함수 위치 (Senior Implementer 인계용).
+  6. §10.12 tests/spec 4개 케이스 명세 (INV-147~150).
+  7. AsyncSwapDispatcher 인프라 100% 재사용 — `SwapCommitJob`에 `on_complete` callback 1개 필드만 추가.
 
 - **2026-05-07 (v9, Phase 6.5 Swap Overhead Reduction)**:
   1. §7 신규. 측정 결과(swap_overhead_s25.md) 기반 6 finding을 컴포넌트 단위로 분해.

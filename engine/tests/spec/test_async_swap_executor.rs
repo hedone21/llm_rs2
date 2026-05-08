@@ -459,6 +459,8 @@ fn test_async_path_submit_deferred_commit() {
             new_dtype: DType::Q4_0,
             write_event: GpuEvent::dummy(),
             release_worker: None,
+            on_complete: None,
+            layer_idx: None,
         })
         .expect("submit_commit must succeed");
 
@@ -508,6 +510,8 @@ fn test_async_dispatcher_submit_drain_dtype_change() {
                 new_dtype: DType::Q4_0,
                 write_event: GpuEvent::dummy(),
                 release_worker: None,
+                on_complete: None,
+                layer_idx: None,
             })
             .expect("submit_commit must succeed for each slot");
     }

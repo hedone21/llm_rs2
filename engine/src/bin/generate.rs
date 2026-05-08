@@ -922,6 +922,23 @@ struct Args {
     /// `--swap-zero-copy` + `LLMRS_OPENCL_HOST_PTR_POOL=1`.
     #[arg(long, default_value_t = 14)]
     swap_pool_slots: usize,
+
+    /// Intra-forward Layer-aligned Swap (LISWAP-4, ENG-ALG-235~238,
+    /// INV-147~150).
+    ///
+    /// `false` (default): no-op — `forward_into` carries
+    /// `layer_boundary_hook = None` and the layer loop pays only one
+    /// `Option::is_some` branch per layer (INV-147 zero overhead).
+    ///
+    /// `true`: when `--force-swap-ratio` is set, an `IntraForwardSwapHook`
+    /// is committed and dispatches per-layer swap on the layer boundary.
+    /// Plan runs to completion across decode tokens; dispatcher drain +
+    /// `ratio_generation` bump occurs once on plan retire (INV-150).
+    ///
+    /// Mutually exclusive with `--swap-incremental-per-tick > 0`
+    /// (ENG-DAT-C18). CLI parser rejects the combination.
+    #[arg(long, default_value_t = false)]
+    swap_intra_forward: bool,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -969,6 +986,21 @@ fn main() -> anyhow::Result<()> {
 
     #[allow(unused_mut)]
     let mut args = Args::parse();
+
+    // ENG-DAT-C18: --swap-incremental-per-tick > 0 and --swap-intra-forward
+    // are mutually exclusive (LISWAP-1 vs LISWAP-4 — ratio_generation bump
+    // semantics conflict). Reject the combination explicitly so engine
+    // never starts in an ambiguous swap-policy state.
+    if args.swap_incremental_per_tick > 0 && args.swap_intra_forward {
+        anyhow::bail!(
+            "--swap-incremental-per-tick (= {}) and --swap-intra-forward (= true) \
+             are mutually exclusive (ENG-DAT-C18). Pick one:\n\
+             (a) --swap-incremental-per-tick=N --swap-intra-forward=false   (LISWAP-1)\n\
+             (b) --swap-incremental-per-tick=0 --swap-intra-forward=true    (LISWAP-4)\n\
+             (c) --swap-incremental-per-tick=0 --swap-intra-forward=false   (single-shot)",
+            args.swap_incremental_per_tick
+        );
+    }
 
     // Configure Rayon thread pool: 0 = auto-detect CPU cores
     let num_threads = if args.threads > 0 {
@@ -2470,6 +2502,14 @@ fn main() -> anyhow::Result<()> {
     let mut incremental_force_swap_plan: Option<llm_rs2::models::weights::IncrementalSwapPlan> =
         None;
 
+    // LISWAP-4 (ENG-ALG-237 / INV-150): intra-forward layer-aligned swap hook.
+    // Created when `--swap-intra-forward` + `--force-swap-ratio` both active.
+    // Decode loop injects `Some(&*hook)` into `layer_boundary_hook` and calls
+    // `finalize` once `plan_is_complete()` to drain dispatcher + bump
+    // ratio_generation + invalidate SOA registry.
+    let mut intra_forward_swap_hook: Option<Arc<llm_rs2::models::weights::IntraForwardSwapHook>> =
+        None;
+
     // LISWAP-2 prototype: async swap dispatcher lifecycle.
     // Created once here; used in the decode loop when async dispatch is active.
     // `None` when --swap-async-dispatch is false, per_tick == 0, or the backend
@@ -2562,6 +2602,50 @@ fn main() -> anyhow::Result<()> {
                 "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
                 ratio,
             );
+        } else if args.swap_intra_forward {
+            // LISWAP-4 (ENG-ALG-237): single-shot is skipped; an
+            // IntraForwardSwapHook is committed instead. The decode loop
+            // injects the hook into `forward_into` and dispatches per-layer
+            // swap on the layer boundary. Plan retire (drain → synchronize
+            // → bump → invalidate) happens once on plan_is_complete()
+            // (INV-150).
+            //
+            // Backend must support async transfer for the dispatcher path
+            // to be useful; on backends without it, the dispatcher falls
+            // back to a synchronous in-line commit (still correct, just no
+            // overlap with forward).
+            let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cpu_backend_arc.clone());
+            let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                Arc::clone(&swap_backend),
+            ));
+            let secondary = match model.secondary_mmap.as_ref() {
+                Some(s) => Arc::clone(s),
+                None => {
+                    anyhow::bail!(
+                        "--swap-intra-forward requires --secondary-gguf (no secondary mmap available)"
+                    );
+                }
+            };
+            let config = Arc::new(model.config.clone());
+            eprintln!(
+                "weight_swap: intra-forward mode — ratio={:.2}, {} target layers (LISWAP-4)",
+                ratio,
+                target_layers.len()
+            );
+            intra_forward_swap_hook = Some(llm_rs2::models::weights::IntraForwardSwapHook::new(
+                target_layers,
+                0,
+                dispatcher,
+                secondary,
+                model.layers.clone(),
+                swap_backend,
+                Some(Arc::clone(&model.release_worker)),
+                DType::Q4_0,
+                config,
+            ));
         } else if args.swap_incremental_per_tick > 0 {
             // ENG-ALG-232: commit IncrementalSwapPlan; single-shot is skipped.
             // The plan will be drained in the decode loop (token 0 onwards).
@@ -2675,6 +2759,8 @@ fn main() -> anyhow::Result<()> {
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         let table = collector.build();
@@ -3361,6 +3447,8 @@ fn main() -> anyhow::Result<()> {
                         logits_last_only: chunked,
                         variance_collector: None,
                         prefill_workspace: None,
+
+                        layer_boundary_hook: None,
                     })?;
                     backend.synchronize()?;
                     drop(input_tensor);
@@ -3434,6 +3522,8 @@ fn main() -> anyhow::Result<()> {
                                     logits_last_only: true,
                                     variance_collector: None,
                                     prefill_workspace: None,
+
+                                    layer_boundary_hook: None,
                                 })?;
                                 drop(cpu_in_tensor);
                                 drop(cpu_logits);
@@ -3730,6 +3820,8 @@ fn main() -> anyhow::Result<()> {
                         logits_last_only: false,
                         variance_collector: None,
                         prefill_workspace: None,
+
+                        layer_boundary_hook: None,
                     })?;
                     for (cache, &pos) in kv_caches.iter_mut().zip(saved_positions.iter()) {
                         cache.set_current_pos(pos);
@@ -3803,6 +3895,8 @@ fn main() -> anyhow::Result<()> {
                         logits_last_only: false,
                         variance_collector: None,
                         prefill_workspace: None,
+
+                        layer_boundary_hook: None,
                     })?;
                     backend.synchronize()?;
                     hook.post_decode_step(&mut kv_caches, generated_count);
@@ -3982,6 +4076,8 @@ fn main() -> anyhow::Result<()> {
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         backend.synchronize()?;
         let warmup_ms = warmup_start.elapsed().as_secs_f64() * 1000.0;
@@ -4198,6 +4294,8 @@ fn main() -> anyhow::Result<()> {
                 logits_last_only: chunked,
                 variance_collector: variance_collector.as_mut(),
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             })?;
             backend.synchronize()?;
             let t_fwd_end = std::time::Instant::now();
@@ -4282,6 +4380,8 @@ fn main() -> anyhow::Result<()> {
                             logits_last_only: true,
                             variance_collector: None,
                             prefill_workspace: None,
+
+                            layer_boundary_hook: None,
                         })?;
                         // No backend.synchronize() needed — CPU forward is synchronous.
                         drop(cpu_in_tensor);
@@ -5151,6 +5251,15 @@ fn main() -> anyhow::Result<()> {
                     cu_be.begin_graph_capture()?;
                 }
 
+                // LISWAP-4: inject IntraForwardSwapHook when active.
+                // The cast to `&dyn LayerBoundaryHook` happens inside the
+                // option mapping so the args field can be `Option<&dyn _>`
+                // — this is the *only* place a real hook is wired in.
+                let liswap4_hook: Option<&dyn llm_rs2::models::weights::LayerBoundaryHook> =
+                    intra_forward_swap_hook
+                        .as_deref()
+                        .map(|h| h as &dyn llm_rs2::models::weights::LayerBoundaryHook);
+
                 model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gen_input_tensor,
                     start_pos,
@@ -5167,6 +5276,8 @@ fn main() -> anyhow::Result<()> {
                     logits_last_only: false,
                     variance_collector: None,
                     prefill_workspace: None,
+
+                    layer_boundary_hook: liswap4_hook,
                 })?;
 
                 #[cfg(feature = "cuda-embedded")]
@@ -5326,6 +5437,53 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             // ── End Layer-Incremental Swap dispatch ────────────────────────────
+
+            // ── LISWAP-4 Intra-forward Swap retire (INV-150) ──────────────────
+            // After every decode token, check whether the in-flight plan is
+            // complete. If so, drain dispatcher, synchronize backend, bump
+            // ratio_generation, invalidate noshuffle SOA registry, and retire
+            // the hook to None.
+            if let Some(hook) = intra_forward_swap_hook.clone()
+                && hook.plan_is_complete()
+            {
+                let drain_t = std::time::Instant::now();
+                let backend_for_invalidate: Arc<dyn Backend> = gpu_backend_arc
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&backend));
+                let invalidate = move || {
+                    backend_for_invalidate.invalidate_noshuffle_soa_registry();
+                };
+                match hook.finalize(
+                    &model.ratio_generation,
+                    invalidate,
+                    std::time::Duration::from_secs(10),
+                ) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[IntraForwardSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms)",
+                            decode_token_index,
+                            drain_t.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        #[cfg(feature = "opencl")]
+                        remap_weights_for_cpu_after_swap(
+                            &mut model,
+                            &backend,
+                            is_gpu,
+                            args.resilience_prealloc_switch,
+                            "intra-forward-swap",
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[IntraForwardSwap] finalize failed at token={}: {}",
+                            decode_token_index, e
+                        );
+                    }
+                }
+                intra_forward_swap_hook = None; // retire
+            }
+            // ── End LISWAP-4 retire ────────────────────────────────────────────
 
             // ── H2O Debug: per-step diagnostics ──
             if args.h2o_debug {
@@ -7175,6 +7333,8 @@ fn run_qcf_warmup_workflow(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         backend.synchronize()?;
     }
@@ -7820,6 +7980,8 @@ fn run_kivi_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         // Collect flush QCF metrics from prefill
@@ -7899,6 +8061,8 @@ fn run_kivi_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         start_pos += 1;
 
@@ -8171,6 +8335,8 @@ fn run_kivi(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         // Sample last token from prefill logits
@@ -8329,6 +8495,8 @@ fn run_kivi(
                 logits_last_only: false,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             })?;
 
             // Rebuild plan after fallback. Rejection for partition-active
@@ -8801,6 +8969,8 @@ fn run_offload(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         // Sample last token from prefill logits
@@ -8902,6 +9072,8 @@ fn run_offload(
                 logits_last_only: false,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             },
             &mut prefetch,
         )?;
@@ -9215,6 +9387,8 @@ fn run_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         // Read all prefill logits to CPU
@@ -9282,6 +9456,8 @@ fn run_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         start_pos += 1;
 
@@ -9825,6 +10001,8 @@ impl<'a> StandardTurnExec<'a> {
             logits_last_only: true,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         self.pos += tokens.len();
 
@@ -9952,6 +10130,8 @@ impl<'a> ChatTurnExec for StandardTurnExec<'a> {
             logits_last_only: true,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         self.pos += 1;
 
@@ -10286,6 +10466,8 @@ impl<'a> ChatTurnExec for KiviTurnExec<'a> {
             logits_last_only: true,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         self.pos += tokens.len();
 
@@ -10321,6 +10503,8 @@ impl<'a> ChatTurnExec for KiviTurnExec<'a> {
             logits_last_only: true,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         self.pos += 1;
 
@@ -10521,6 +10705,8 @@ impl<'a> ChatTurnExec for OffloadTurnExec<'a> {
                 logits_last_only: true,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             },
             &mut self.prefetch,
         )?;
@@ -10559,6 +10745,8 @@ impl<'a> ChatTurnExec for OffloadTurnExec<'a> {
                 logits_last_only: true,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             },
             &mut self.prefetch,
         )?;
