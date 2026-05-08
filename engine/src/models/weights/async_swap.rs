@@ -54,9 +54,12 @@ pub struct SwapCommitJob {
     /// DType of the new weights (written to `LayerSlot::current_dtype`).
     pub new_dtype: DType,
     /// GPU event that signals H2D write completion. Worker blocks on this
-    /// before committing. Use `GpuEvent::dummy()` for a synchronous-fallback
-    /// backend — `wait_event_blocking` on a dummy event is a no-op.
-    pub write_event: GpuEvent,
+    /// before committing. Wrapped in `Arc` so the same event can be shared
+    /// with the forward-thread wait gate (LISWAP-4 v2 / INV-149) — both the
+    /// dispatcher worker and the forward thread call
+    /// `Backend::wait_event_blocking` on the same underlying cl_event.
+    /// Use `Arc::new(GpuEvent::dummy())` for a synchronous-fallback backend.
+    pub write_event: Arc<GpuEvent>,
     /// Optional release worker for chaining displaced primary weights.
     /// When `Some`, successful `Arc::try_unwrap` on the old weights triggers
     /// `release_worker.enqueue_release(old_layer)`. When `None`, old weights
@@ -203,7 +206,7 @@ fn worker_loop(rx: mpsc::Receiver<SwapJob>, backend: Arc<dyn Backend>, pending: 
 /// Execute one commit job: wait → swap → chain release → on_complete.
 fn process_commit(job: SwapCommitJob, backend: &Arc<dyn Backend>) {
     // Wait for H2D write to become GPU-visible before committing.
-    if let Err(e) = backend.wait_event_blocking(&job.write_event) {
+    if let Err(e) = backend.wait_event_blocking(job.write_event.as_ref()) {
         eprintln!("[AsyncSwap] wait_event_blocking failed: {e}; commit skipped");
         // slot retains old weights — safe to continue
         return;
@@ -306,7 +309,7 @@ mod tests {
                 slot: slot.clone(),
                 new_weights,
                 new_dtype: DType::Q4_0,
-                write_event: GpuEvent::dummy(),
+                write_event: Arc::new(GpuEvent::dummy()),
                 release_worker: None,
                 on_complete: None,
                 layer_idx: None,
@@ -344,7 +347,7 @@ mod tests {
                         slot: s,
                         new_weights: make_weights(&be2),
                         new_dtype: DType::Q4_0,
-                        write_event: GpuEvent::dummy(),
+                        write_event: Arc::new(GpuEvent::dummy()),
                         release_worker: None,
                         on_complete: None,
                         layer_idx: None,
@@ -387,7 +390,7 @@ mod tests {
                 slot,
                 new_weights: make_weights(&be),
                 new_dtype: DType::Q4_0,
-                write_event: GpuEvent::dummy(),
+                write_event: Arc::new(GpuEvent::dummy()),
                 release_worker: None,
                 on_complete: None,
                 layer_idx: None,

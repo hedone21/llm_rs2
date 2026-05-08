@@ -543,6 +543,20 @@ pub struct OpenCLBackend {
     // measurement-driven decision pending). Plan: compiled-chasing-hopper.md
     // (Direction A track, Stage 3).
     host_ptr_pool: std::sync::OnceLock<Option<Arc<host_ptr_pool::HostPtrPool>>>,
+
+    // ── LISWAP multi-context experiment: secondary cl_context for swap ───
+    // Hypothesis: Adreno's in-order driver scheduler may serialize swap
+    // Map/Unmap and forward kernels even on separate command queues if both
+    // belong to the same `cl_context`. Allocating a second `cl_context` on
+    // the same `cl_device_id` exposes whether driver-level queue scheduling
+    // is context-scoped (then swap and forward are isolated) or
+    // device-scoped (then this changes nothing). The DMA-BUF FD is shared
+    // between both contexts so the underlying physical memory is identical.
+    //
+    // Env-gate: `LLMRS_OPENCL_SWAP_CONTEXT=1|true|on` enables (default OFF).
+    // Both lazy-init via `swap_context_or_init()` / `swap_queue_or_init()`.
+    swap_context: std::sync::OnceLock<Context>,
+    swap_queue: std::sync::OnceLock<Queue>,
 }
 
 /// Per-category cl_mem allocation bucket (WSWAP-5-TBT-DIAG).
@@ -682,6 +696,22 @@ impl OpenCLBackend {
             Some(flags::QUEUE_PROFILING_ENABLE)
         } else {
             None
+        };
+        // Optional out-of-order execution: env-gated via LLMRS_OPENCL_OOO_QUEUE=1.
+        // When enabled, the driver schedules commands by data dependency
+        // rather than submission order. swap H2D and forward kernels that
+        // touch different cl_mems can theoretically run in parallel.
+        let queue_props = if std::env::var("LLMRS_OPENCL_OOO_QUEUE").is_ok() {
+            log::info!(
+                "OpenCL queue: CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE \
+                 (LLMRS_OPENCL_OOO_QUEUE=1)"
+            );
+            Some(
+                queue_props.unwrap_or(flags::CommandQueueProperties::empty())
+                    | flags::QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+            )
+        } else {
+            queue_props
         };
         let mut queue = Queue::new(&context, device, queue_props)?;
         // Optional: replace queue with a priority-hinted one via
@@ -1509,6 +1539,10 @@ impl OpenCLBackend {
             // LISWAP-3 prototype (Direction A, Stage 3). Lazy-init in
             // `host_ptr_pool_or_init()`.
             host_ptr_pool: std::sync::OnceLock::new(),
+            // LISWAP multi-context experiment. Lazy-init in
+            // `swap_context_or_init()` / `swap_queue_or_init()`.
+            swap_context: std::sync::OnceLock::new(),
+            swap_queue: std::sync::OnceLock::new(),
         })
     }
 
@@ -3828,6 +3862,16 @@ impl OpenCLBackend {
         } else {
             None
         };
+        // Match the main queue's OoO setting so commands across queues see
+        // the same scheduling semantics.
+        let queue_props = if std::env::var("LLMRS_OPENCL_OOO_QUEUE").is_ok() {
+            Some(
+                queue_props.unwrap_or(flags::CommandQueueProperties::empty())
+                    | flags::QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+            )
+        } else {
+            queue_props
+        };
         match Queue::new(&self.context, self.device, queue_props) {
             Ok(q) => {
                 // OnceLock::set returns Err if another thread won the
@@ -3867,11 +3911,642 @@ impl OpenCLBackend {
     /// a slot via the pool and reuses the pre-allocated cl_mem.
     ///
     /// Plan: `compiled-chasing-hopper.md` Direction A track.
+    /// Allocate a DMA-BUF-backed cl_mem via Linux dma_heap + KHR
+    /// external_memory_dma_buf extension. Returns `(cl_mem, dmabuf_fd,
+    /// host_ptr)`. CPU writes go through `host_ptr` (cached, no Map/Unmap).
+    /// GPU reads via `cl_mem` are DMA-BUF coherent without explicit sync.
+    ///
+    /// Caller is responsible for unmapping `host_ptr` and closing
+    /// `dmabuf_fd` when the cl_mem is dropped. The cl_mem itself releases
+    /// via the `ocl::core::Mem` Drop chain (`clReleaseMemObject`).
+    ///
+    /// # Errors
+    /// - `/dev/dma_heap/system` not available (older kernel) → returns Err.
+    /// - `clCreateBufferWithProperties` not supported → returns Err.
+    pub fn alloc_dmabuf_heap_buffer(
+        &self,
+        size: usize,
+    ) -> Result<(
+        ocl::core::Mem,
+        std::os::unix::io::RawFd,
+        *mut std::ffi::c_void,
+    )> {
+        use std::ffi::c_void;
+        use std::os::unix::io::RawFd;
+        use std::ptr;
+
+        const CL_MEM_READ_ONLY: u64 = 1 << 2;
+        const CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR: u64 = 0x2067;
+
+        // 1. Open /dev/dma_heap/system
+        let path = c"/dev/dma_heap/system";
+        let heap_fd: RawFd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        if heap_fd < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(anyhow!(
+                "alloc_dmabuf_heap_buffer: open(/dev/dma_heap/system) failed: errno={errno}"
+            ));
+        }
+
+        // 2. ioctl ALLOC. _IOWR('H', 0, struct dma_heap_allocation_data)
+        // = ((1+2)<<30) | (sizeof << 16) | ('H' << 8) | 0
+        #[repr(C)]
+        struct DmaHeapAllocationData {
+            len: u64,
+            fd: u32,
+            fd_flags: u32,
+            heap_flags: u64,
+        }
+        let ioctl_alloc: u64 = (3u64 << 30)
+            | ((std::mem::size_of::<DmaHeapAllocationData>() as u64) << 16)
+            | ((b'H' as u64) << 8);
+        let mut data = DmaHeapAllocationData {
+            len: size as u64,
+            fd: 0,
+            fd_flags: (libc::O_RDWR | libc::O_CLOEXEC) as u32,
+            heap_flags: 0,
+        };
+        unsafe extern "C" {
+            fn ioctl(fd: libc::c_int, request: libc::c_ulong, ...) -> libc::c_int;
+        }
+        let rc = unsafe { ioctl(heap_fd, ioctl_alloc as libc::c_ulong, &mut data) };
+        let heap_close_errno = if rc < 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        unsafe { libc::close(heap_fd) };
+        if rc < 0 {
+            return Err(anyhow!(
+                "alloc_dmabuf_heap_buffer: ioctl ALLOC failed (size={size}, errno={heap_close_errno})"
+            ));
+        }
+        let dmabuf_fd: RawFd = data.fd as i32;
+
+        // 3. mmap the DMA-BUF for CPU access
+        let host_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                dmabuf_fd,
+                0,
+            )
+        };
+        if host_ptr == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            unsafe { libc::close(dmabuf_fd) };
+            return Err(anyhow!(
+                "alloc_dmabuf_heap_buffer: mmap failed (size={size}, errno={errno})"
+            ));
+        }
+
+        // 4. clCreateBufferWithProperties with DMA-BUF property
+        let props: [u64; 3] = [CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR, dmabuf_fd as u64, 0];
+        let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
+        unsafe extern "C" {
+            fn clCreateBufferWithProperties(
+                context: *mut c_void,
+                properties: *const u64,
+                flags: u64,
+                size: usize,
+                host_ptr: *mut c_void,
+                errcode_ret: *mut i32,
+            ) -> *mut c_void;
+        }
+        let mut errcode: i32 = 0;
+        let raw = unsafe {
+            clCreateBufferWithProperties(
+                ctx_ptr as *mut _,
+                props.as_ptr(),
+                CL_MEM_READ_ONLY,
+                size,
+                ptr::null_mut(),
+                &mut errcode,
+            )
+        };
+        if errcode != 0 || raw.is_null() {
+            unsafe {
+                libc::munmap(host_ptr, size);
+                libc::close(dmabuf_fd);
+            }
+            return Err(anyhow!(
+                "alloc_dmabuf_heap_buffer: clCreateBufferWithProperties failed (errcode={errcode})"
+            ));
+        }
+        // SAFETY: clCreateBufferWithProperties returned a valid cl_mem owning
+        // one reference. ocl::core::Mem::from_raw_create_ptr takes ownership.
+        let mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw as *mut _) };
+
+        Ok((mem, dmabuf_fd, host_ptr))
+    }
+
+    /// Multi-context swap experiment env-gate. Cached after first call.
+    /// `=1` / `=true` / `=on` (case-insensitive) enables the secondary
+    /// `cl_context` path; any other value (including unset) keeps it
+    /// disabled (default OFF).
+    fn swap_context_env_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| match std::env::var("LLMRS_OPENCL_SWAP_CONTEXT") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "on"
+            }
+            Err(_) => false,
+        })
+    }
+
+    /// Lazily build (or return) the secondary `cl_context` dedicated to swap
+    /// Map/Unmap operations. Returns `None` when the env-gate is disabled or
+    /// context creation failed.
+    ///
+    /// The secondary context targets the same `cl_device_id` as the main
+    /// context. DMA-BUF FDs are shared between both contexts so a single
+    /// physical allocation is visible from either one's `cl_mem`.
+    pub fn swap_context_or_init(&self) -> Option<&Context> {
+        if !Self::swap_context_env_enabled() {
+            return None;
+        }
+        if let Some(c) = self.swap_context.get() {
+            return Some(c);
+        }
+        match Context::builder()
+            .platform(Platform::default())
+            .devices(self.device)
+            .build()
+        {
+            Ok(c) => {
+                let _ = self.swap_context.set(c);
+                self.swap_context.get()
+            }
+            Err(e) => {
+                log::warn!(
+                    "LLMRS_OPENCL_SWAP_CONTEXT: secondary context creation failed ({e}); \
+                     falling back to single-context swap path"
+                );
+                None
+            }
+        }
+    }
+
+    /// Lazily build (or return) the swap queue inside the secondary
+    /// `cl_context`. Returns `None` when the secondary context is unavailable
+    /// or queue creation failed.
+    pub fn swap_queue_or_init(&self) -> Option<&Queue> {
+        if !Self::swap_context_env_enabled() {
+            return None;
+        }
+        if let Some(q) = self.swap_queue.get() {
+            return Some(q);
+        }
+        let ctx = self.swap_context_or_init()?;
+        // Match main queue profiling/OoO settings so cross-context comparisons
+        // remain meaningful.
+        let queue_props = if self.profile_events_enabled {
+            Some(flags::QUEUE_PROFILING_ENABLE)
+        } else {
+            None
+        };
+        let queue_props = if std::env::var("LLMRS_OPENCL_OOO_QUEUE").is_ok() {
+            Some(
+                queue_props.unwrap_or(flags::CommandQueueProperties::empty())
+                    | flags::QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+            )
+        } else {
+            queue_props
+        };
+        match Queue::new(ctx, self.device, queue_props) {
+            Ok(q) => {
+                let _ = self.swap_queue.set(q);
+                self.swap_queue.get()
+            }
+            Err(e) => {
+                log::warn!(
+                    "LLMRS_OPENCL_SWAP_CONTEXT: swap queue creation failed ({e}); \
+                     falling back to single-context swap path"
+                );
+                None
+            }
+        }
+    }
+
+    /// Allocate a DMA-BUF-backed pair of `cl_mem` handles, one in the
+    /// secondary swap `cl_context` and one in the main `cl_context`, both
+    /// referencing the same DMA-BUF FD.
+    ///
+    /// Returns `(swap_mem, main_mem, dmabuf_fd, host_ptr)`. The caller fills
+    /// the bytes via `fill_dmabuf_via_swap_queue` (uses `swap_mem` on the
+    /// swap queue) and reads the bytes from forward kernels via `main_mem`
+    /// on the main queue. Driver coherency between the two `cl_mem` views is
+    /// guaranteed by the underlying DMA-BUF.
+    ///
+    /// On Drop the caller must `munmap` `host_ptr` and `close` `dmabuf_fd`
+    /// (matches the lifecycle rules of `alloc_dmabuf_heap_buffer`).
+    ///
+    /// # Errors
+    /// - secondary swap context unavailable (env-gate off) → returns Err.
+    /// - `/dev/dma_heap/system` not available → returns Err.
+    /// - `clCreateBufferWithProperties` failed on either context → Err.
+    pub fn alloc_dmabuf_with_swap_context(
+        &self,
+        size: usize,
+    ) -> Result<(
+        ocl::core::Mem,
+        ocl::core::Mem,
+        std::os::unix::io::RawFd,
+        *mut std::ffi::c_void,
+    )> {
+        use std::ffi::c_void;
+        use std::os::unix::io::RawFd;
+        use std::ptr;
+
+        const CL_MEM_READ_ONLY: u64 = 1 << 2;
+        const CL_MEM_READ_WRITE: u64 = 1 << 0;
+        const CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR: u64 = 0x2067;
+
+        let swap_ctx = self.swap_context_or_init().ok_or_else(|| {
+            anyhow!(
+                "alloc_dmabuf_with_swap_context: secondary cl_context unavailable \
+                 (env-gate LLMRS_OPENCL_SWAP_CONTEXT off, or context build failed)"
+            )
+        })?;
+
+        // 1. Open /dev/dma_heap/system
+        let path = c"/dev/dma_heap/system";
+        let heap_fd: RawFd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        if heap_fd < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: open(/dev/dma_heap/system) failed: errno={errno}"
+            ));
+        }
+
+        // 2. ioctl ALLOC.
+        #[repr(C)]
+        struct DmaHeapAllocationData {
+            len: u64,
+            fd: u32,
+            fd_flags: u32,
+            heap_flags: u64,
+        }
+        let ioctl_alloc: u64 = (3u64 << 30)
+            | ((std::mem::size_of::<DmaHeapAllocationData>() as u64) << 16)
+            | ((b'H' as u64) << 8);
+        let mut data = DmaHeapAllocationData {
+            len: size as u64,
+            fd: 0,
+            fd_flags: (libc::O_RDWR | libc::O_CLOEXEC) as u32,
+            heap_flags: 0,
+        };
+        unsafe extern "C" {
+            fn ioctl(fd: libc::c_int, request: libc::c_ulong, ...) -> libc::c_int;
+        }
+        let rc = unsafe { ioctl(heap_fd, ioctl_alloc as libc::c_ulong, &mut data) };
+        let heap_close_errno = if rc < 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        unsafe { libc::close(heap_fd) };
+        if rc < 0 {
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: ioctl ALLOC failed (size={size}, errno={heap_close_errno})"
+            ));
+        }
+        let dmabuf_fd: RawFd = data.fd as i32;
+
+        // 3. mmap the DMA-BUF for CPU access.
+        let host_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                dmabuf_fd,
+                0,
+            )
+        };
+        if host_ptr == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            unsafe { libc::close(dmabuf_fd) };
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: mmap failed (size={size}, errno={errno})"
+            ));
+        }
+
+        // 4. clCreateBufferWithProperties on swap_context first.
+        let props: [u64; 3] = [CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR, dmabuf_fd as u64, 0];
+        unsafe extern "C" {
+            fn clCreateBufferWithProperties(
+                context: *mut c_void,
+                properties: *const u64,
+                flags: u64,
+                size: usize,
+                host_ptr: *mut c_void,
+                errcode_ret: *mut i32,
+            ) -> *mut c_void;
+        }
+        let swap_ctx_ptr = <&Context as ClContextPtr>::as_ptr(&swap_ctx);
+        let mut errcode: i32 = 0;
+        // swap_mem is mapped with CL_MAP_WRITE in `fill_dmabuf_via_swap_queue`,
+        // so it must be allocated as READ_WRITE. main_mem stays READ_ONLY since
+        // forward kernels only read.
+        let raw_swap = unsafe {
+            clCreateBufferWithProperties(
+                swap_ctx_ptr as *mut _,
+                props.as_ptr(),
+                CL_MEM_READ_WRITE,
+                size,
+                ptr::null_mut(),
+                &mut errcode,
+            )
+        };
+        if errcode != 0 || raw_swap.is_null() {
+            unsafe {
+                libc::munmap(host_ptr, size);
+                libc::close(dmabuf_fd);
+            }
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: clCreateBufferWithProperties (swap_ctx) failed (errcode={errcode})"
+            ));
+        }
+        // SAFETY: clCreateBufferWithProperties returned a valid cl_mem owning
+        // one reference. ocl::core::Mem::from_raw_create_ptr takes ownership.
+        let swap_mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw_swap as *mut _) };
+
+        // 5. clCreateBufferWithProperties on main_context with the same FD.
+        // Driver dups the FD internally, so reuse is safe.
+        let main_ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
+        let mut errcode2: i32 = 0;
+        let raw_main = unsafe {
+            clCreateBufferWithProperties(
+                main_ctx_ptr as *mut _,
+                props.as_ptr(),
+                CL_MEM_READ_ONLY,
+                size,
+                ptr::null_mut(),
+                &mut errcode2,
+            )
+        };
+        if errcode2 != 0 || raw_main.is_null() {
+            // swap_mem already wraps raw_swap; let it Drop to release.
+            drop(swap_mem);
+            unsafe {
+                libc::munmap(host_ptr, size);
+                libc::close(dmabuf_fd);
+            }
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: clCreateBufferWithProperties (main_ctx) failed (errcode={errcode2})"
+            ));
+        }
+        // SAFETY: same justification as `swap_mem` above.
+        let main_mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw_main as *mut _) };
+
+        Ok((swap_mem, main_mem, dmabuf_fd, host_ptr))
+    }
+
+    /// Fill a DMA-BUF-backed cl_mem via the secondary swap queue's
+    /// `Map → memcpy → Unmap` cycle. All OpenCL calls are confined to the
+    /// swap `cl_context` / queue, so the main forward queue is untouched —
+    /// the multi-context isolation hypothesis under test.
+    ///
+    /// Optional cache-flush via `DMA_BUF_IOCTL_SYNC` when
+    /// `LLMRS_DMABUF_SYNC=1` (default OFF — matches single-context DMA-BUF
+    /// path so accuracy comparisons are apples-to-apples).
+    ///
+    /// # Safety
+    /// - `src` must be valid (readable) for `size` bytes.
+    /// - `swap_mem` must be a DMA-BUF-backed cl_mem from
+    ///   `alloc_dmabuf_with_swap_context` (i.e., bound to the swap queue's
+    ///   context).
+    /// - `size` must be `<=` the buffer's allocated capacity.
+    pub unsafe fn fill_dmabuf_via_swap_queue(
+        &self,
+        swap_mem: &ocl::core::Mem,
+        host_ptr: *mut std::ffi::c_void,
+        src: *const u8,
+        size: usize,
+    ) -> Result<()> {
+        use ocl::ffi;
+        const CL_TRUE: ffi::cl_bool = 1;
+        const CL_MAP_WRITE: ffi::cl_map_flags = 1 << 1;
+
+        let queue: &Queue = self.swap_queue_or_init().ok_or_else(|| {
+            anyhow!(
+                "fill_dmabuf_via_swap_queue: swap queue unavailable \
+                 (env-gate LLMRS_OPENCL_SWAP_CONTEXT off, or queue build failed)"
+            )
+        })?;
+        // CRITICAL: ocl 0.19 has `unsafe impl ClContextPtr for &Queue`,
+        // so `q_ref: &Queue` + `q_ref.as_ptr()` resolves to ClContextPtr's
+        // `as_ptr() -> cl_context`, NOT the cl_command_queue handle. Use the
+        // explicit Deref-target type to disambiguate.
+        let q_ref: &ocl::core::CommandQueue = queue;
+        let q_ptr: ffi::cl_command_queue = q_ref.as_ptr();
+
+        // Diagnostic: verify swap_queue's context matches swap_mem's context.
+        // CL_INVALID_COMMAND_QUEUE (-36) typically means queue/buffer mismatch.
+        if std::env::var("LLMRS_DMABUF_DEBUG").is_ok() {
+            let mut q_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut m_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut sz_q: usize = 0;
+            let mut sz_m: usize = 0;
+            const CL_QUEUE_CONTEXT: u32 = 0x1090;
+            const CL_MEM_CONTEXT: u32 = 0x1106;
+            unsafe {
+                ffi::clGetCommandQueueInfo(
+                    q_ptr,
+                    CL_QUEUE_CONTEXT,
+                    std::mem::size_of::<*mut std::ffi::c_void>(),
+                    &mut q_ctx as *mut _ as *mut std::ffi::c_void,
+                    &mut sz_q,
+                );
+                ffi::clGetMemObjectInfo(
+                    swap_mem.as_ptr(),
+                    CL_MEM_CONTEXT,
+                    std::mem::size_of::<*mut std::ffi::c_void>(),
+                    &mut m_ctx as *mut _ as *mut std::ffi::c_void,
+                    &mut sz_m,
+                );
+            }
+            let swap_ctx_ptr = self
+                .swap_context_or_init()
+                .map(|c| <&Context as ClContextPtr>::as_ptr(&c) as *mut std::ffi::c_void)
+                .unwrap_or(std::ptr::null_mut());
+            let main_ctx_ptr =
+                <&Context as ClContextPtr>::as_ptr(&&self.context) as *mut std::ffi::c_void;
+            eprintln!(
+                "[DMABUF-DEBUG] q_ptr={:p} q_ctx={:p} m_ctx={:p} swap_ctx={:p} main_ctx={:p}",
+                q_ptr, q_ctx, m_ctx, swap_ctx_ptr, main_ctx_ptr
+            );
+            // Compare q_ptr to swap_queue's stored handle directly via ocl::core
+            if let Some(stored_q) = self.swap_queue.get() {
+                let stored_ptr = ocl::core::CommandQueue::as_ptr(stored_q);
+                eprintln!("[DMABUF-DEBUG] stored_swap_queue_ptr={:p}", stored_ptr);
+            }
+        }
+
+        let mut errcode: ffi::cl_int = 0;
+        // SAFETY (forwarded): caller asserts `swap_mem` is a DMA-BUF-backed
+        // buffer in the swap queue's context and `size` is within capacity.
+        let mapped_ptr = unsafe {
+            ffi::clEnqueueMapBuffer(
+                q_ptr,
+                swap_mem.as_ptr(),
+                CL_TRUE,
+                CL_MAP_WRITE,
+                0,
+                size,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut errcode,
+            )
+        };
+        if errcode != 0 || mapped_ptr.is_null() {
+            return Err(anyhow!(
+                "fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode={errcode}, ptr_null={})",
+                mapped_ptr.is_null()
+            ));
+        }
+
+        // SAFETY (forwarded): caller asserts `src` is valid for `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src, mapped_ptr as *mut u8, size) };
+
+        // SAFETY: `mapped_ptr` was returned by the map call above and is
+        // still valid until the unmap completes.
+        let rc = unsafe {
+            ffi::clEnqueueUnmapMemObject(
+                q_ptr,
+                swap_mem.as_ptr(),
+                mapped_ptr,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow!(
+                "fill_dmabuf_via_swap_queue: clEnqueueUnmapMemObject failed (rc={rc})"
+            ));
+        }
+
+        // Note: optional `DMA_BUF_IOCTL_SYNC` is performed by the pool-level
+        // caller via `ioctl_dmabuf_sync_write_if_enabled` because it owns
+        // the FD. We intentionally don't propagate the FD into this fill
+        // method to keep its signature compatible with non-DMA-BUF
+        // callers that may reuse it later.
+        let _ = host_ptr;
+
+        // `LLMRS_HOST_PTR_SKIP_FINISH=1` matches `fill_host_ptr_buffer`'s
+        // env-gate semantics. Default ON (we issue `clFinish`) so the swap
+        // is observably complete before the caller drops the guard.
+        if std::env::var("LLMRS_HOST_PTR_SKIP_FINISH").is_err() {
+            // Use ocl::core::finish() with the raw queue ptr to avoid
+            // method-resolution ambiguity between Queue::finish and
+            // CommandQueueCore::finish via Deref.
+            ocl::core::finish(q_ref)?;
+        }
+        Ok(())
+    }
+
+    /// Issue a `DMA_BUF_IOCTL_SYNC START|END WRITE` on the given FD when
+    /// `LLMRS_DMABUF_SYNC=1`. Otherwise no-op. Used by the pool fill path
+    /// to force CPU-cache flush after `memcpy`/`Map+Unmap`.
+    pub fn ioctl_dmabuf_sync_write_if_enabled(&self, dmabuf_fd: std::os::unix::io::RawFd) {
+        if std::env::var("LLMRS_DMABUF_SYNC").is_err() {
+            return;
+        }
+        #[repr(C)]
+        struct DmaBufSync {
+            flags: u64,
+        }
+        const DMA_BUF_SYNC_WRITE: u64 = 2;
+        const DMA_BUF_SYNC_START: u64 = 0;
+        const DMA_BUF_SYNC_END: u64 = 1 << 2;
+        let ioctl_sync: u64 = (1u64 << 30)
+            | ((std::mem::size_of::<DmaBufSync>() as u64) << 16)
+            | ((b'b' as u64) << 8);
+        unsafe extern "C" {
+            fn ioctl(fd: libc::c_int, request: libc::c_ulong, ...) -> libc::c_int;
+        }
+        let mut sync_start = DmaBufSync {
+            flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE,
+        };
+        let mut sync_end = DmaBufSync {
+            flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE,
+        };
+        unsafe {
+            ioctl(dmabuf_fd, ioctl_sync as libc::c_ulong, &mut sync_start);
+            ioctl(dmabuf_fd, ioctl_sync as libc::c_ulong, &mut sync_end);
+        }
+    }
+
     pub fn alloc_host_ptr_buffer_empty(&self, size: usize) -> Result<ocl::core::Mem> {
         const CL_MEM_READ_ONLY: u64 = 1 << 2;
         const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
+        // Qualcomm cl_qcom_ext_host_ptr extension constants (from cl_ext.h).
+        const CL_MEM_EXT_HOST_PTR_QCOM: u64 = 1 << 29;
+        const CL_MEM_HOST_IOCOHERENT_QCOM: u32 = 0x40A9;
+        const CL_MEM_HOST_WRITEBACK_QCOM: u32 = 0x40A5;
 
-        let flags = (CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR) as ocl::ffi::cl_bitfield;
+        // Path A' empirical probe: when LLMRS_OPENCL_IOCOHERENT=1, try
+        // allocating with CL_MEM_EXT_HOST_PTR_QCOM + iocoherent cache policy.
+        // Driver may reject if allocation_type=0 is not accepted; in that
+        // case we fall back to plain ALLOC_HOST_PTR.
+        if std::env::var("LLMRS_OPENCL_IOCOHERENT").is_ok() {
+            #[repr(C)]
+            struct ClMemExtHostPtr {
+                allocation_type: u32,
+                host_cache_policy: u32,
+            }
+            let cache_policy = if std::env::var("LLMRS_OPENCL_WRITEBACK").is_ok() {
+                CL_MEM_HOST_WRITEBACK_QCOM
+            } else {
+                CL_MEM_HOST_IOCOHERENT_QCOM
+            };
+            let ext = ClMemExtHostPtr {
+                allocation_type: 0, // probe: driver may accept 0 as "default"
+                host_cache_policy: cache_policy,
+            };
+            let flags = (CL_MEM_READ_ONLY | CL_MEM_EXT_HOST_PTR_QCOM) as ocl::ffi::cl_bitfield;
+            let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
+            let mut errcode: ocl::ffi::cl_int = 0;
+            let raw = unsafe {
+                ocl::ffi::clCreateBuffer(
+                    ctx_ptr,
+                    flags,
+                    size,
+                    &ext as *const _ as *mut std::ffi::c_void,
+                    &mut errcode,
+                )
+            };
+            if errcode == 0 && !raw.is_null() {
+                eprintln!(
+                    "[IOCOHERENT] cl_qcom_ext_host_ptr accepted: cache_policy=0x{:X}, size={}",
+                    cache_policy, size
+                );
+                let mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw) };
+                return Ok(mem);
+            }
+            eprintln!(
+                "[IOCOHERENT] cl_qcom_ext_host_ptr rejected (errcode={}, ptr_null={}); \
+                 falling back to plain ALLOC_HOST_PTR",
+                errcode,
+                raw.is_null()
+            );
+            // Fall through to standard path below.
+        }
+
+        // Phase 4 (2026-05-09): add CL_MEM_HOST_WRITE_ONLY hint. Adreno 830
+        // measurement showed -35% wall-clock for 25MB clEnqueueWriteBuffer
+        // (1.72ms → 1.11ms). Driver omits GPU L2 staging when host writes only.
+        // Compatible with READ_ONLY (GPU read-only): host writes via clEnqueueWriteBuffer
+        // remain allowed (not host-side read-only).
+        const CL_MEM_HOST_WRITE_ONLY: u64 = 1 << 7;
+        let flags = (CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR | CL_MEM_HOST_WRITE_ONLY)
+            as ocl::ffi::cl_bitfield;
         let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
         let mut errcode: ocl::ffi::cl_int = 0;
         let raw = unsafe {
@@ -3961,7 +4636,16 @@ impl OpenCLBackend {
         }
         // Wait for the unmap to land so subsequent kernel reads see the
         // bytes. Stage 1b microbench used `queue.finish()` here too.
-        self.queue.finish()?;
+        //
+        // LISWAP-3 v2 (env-gated): skip the explicit `queue.finish()` and
+        // rely on OpenCL's same-queue dependency tracking — the next
+        // kernel reading this cl_mem on `self.queue` will be automatically
+        // ordered after the unmap. Removes `clFinish` × N (per-layer) full
+        // barrier from the swap hot path. Set
+        // `LLMRS_HOST_PTR_SKIP_FINISH=1` to enable.
+        if std::env::var("LLMRS_HOST_PTR_SKIP_FINISH").is_err() {
+            self.queue.finish()?;
+        }
         Ok(())
     }
 

@@ -74,16 +74,47 @@ impl Default for HostPtrPoolConfig {
 /// One pre-allocated `CL_MEM_ALLOC_HOST_PTR` slot in the pool.
 struct HostPtrPoolEntry {
     /// The pre-allocated `cl_mem`. Lifetime spans the pool itself.
+    /// In multi-context mode this is the `cl_mem` in the **main** context
+    /// (used for forward-pass kernel reads).
     mem: ocl::core::Mem,
     /// Allocated capacity in bytes (matches `HostPtrPoolConfig::max_tensor_size`).
     capacity: usize,
     /// Atomically `true` while the slot is held by an outstanding guard.
     in_use: AtomicBool,
+    /// DMA-BUF backing (only when `LLMRS_OPENCL_DMABUF_HEAP=1`):
+    /// - `Some((fd, host_ptr))` — slot is DMA-BUF backed; CPU writes go
+    ///   through `host_ptr` directly (cached, no Map/Unmap).
+    /// - `None` — slot is plain `CL_MEM_ALLOC_HOST_PTR`; CPU writes go
+    ///   through `fill_host_ptr_buffer` (Map/Unmap + clFinish).
+    dmabuf: Option<(std::os::unix::io::RawFd, *mut std::ffi::c_void)>,
+    /// Multi-context backing (only when `LLMRS_OPENCL_SWAP_CONTEXT=1`):
+    /// - `Some(swap_mem)` — slot was allocated via the secondary swap
+    ///   `cl_context`. `swap_mem` is the cl_mem registered in the swap
+    ///   context (used by `Map/Unmap` on the swap queue). `mem` (above) is
+    ///   the cl_mem registered in the main context (forward-read path).
+    /// - `None` — slot is single-context (`mem` is used for both fill and
+    ///   read).
+    swap_ctx_mem: Option<ocl::core::Mem>,
 }
 
 // SAFETY: `ocl::core::Mem` is `Send + Sync` (context-scoped refcounted handle).
+// The DMA-BUF host_ptr is opaque from a thread-safety perspective — the slot's
+// `in_use` flag enforces single-writer semantics.
 unsafe impl Send for HostPtrPoolEntry {}
 unsafe impl Sync for HostPtrPoolEntry {}
+
+impl Drop for HostPtrPoolEntry {
+    fn drop(&mut self) {
+        // Release DMA-BUF resources if present. cl_mem releases via its own
+        // Drop chain (clReleaseMemObject).
+        if let Some((fd, host_ptr)) = self.dmabuf.take() {
+            unsafe {
+                libc::munmap(host_ptr, self.capacity);
+                libc::close(fd);
+            }
+        }
+    }
+}
 
 /// Pre-allocated pool of `CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY` cl_mem
 /// slots for runtime weight swap.
@@ -118,26 +149,149 @@ impl HostPtrPool {
         // overwritten before any real data is read, so correctness is
         // unaffected.
         let prefault_byte: u8 = 0;
+        let use_dmabuf = std::env::var("LLMRS_OPENCL_DMABUF_HEAP").is_ok();
+        let use_swap_ctx = std::env::var("LLMRS_OPENCL_SWAP_CONTEXT")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "on"
+            })
+            .unwrap_or(false);
+        if use_dmabuf {
+            log::info!("HostPtrPool: DMA-BUF heap path enabled (LLMRS_OPENCL_DMABUF_HEAP=1)");
+        }
+        if use_swap_ctx {
+            log::info!(
+                "HostPtrPool: multi-context swap path enabled (LLMRS_OPENCL_SWAP_CONTEXT=1)"
+            );
+        }
         for slot_idx in 0..config.n_slots {
-            let mem = backend
-                .alloc_host_ptr_buffer_empty(config.max_tensor_size)
-                .map_err(|e| {
-                    anyhow!(
-                        "HostPtrPool: slot {slot_idx} alloc failed (size={}): {e}",
-                        config.max_tensor_size
-                    )
-                })?;
-            // SAFETY: `&prefault_byte` is valid for 1 byte; `mem` is an
-            // ALLOC_HOST_PTR buffer of `max_tensor_size` bytes (>= 1).
-            unsafe {
-                if let Err(e) = backend.fill_host_ptr_buffer(&mem, &prefault_byte as *const u8, 1) {
-                    log::warn!("HostPtrPool: slot {slot_idx} prefault failed (non-fatal): {e}");
+            // Path priority: multi-context (DMA-BUF + secondary cl_context) →
+            // single-context DMA-BUF → plain ALLOC_HOST_PTR.
+            let (mem, dmabuf, swap_ctx_mem) = if use_swap_ctx {
+                match backend.alloc_dmabuf_with_swap_context(config.max_tensor_size) {
+                    Ok((swap_mem, main_mem, fd, host_ptr)) => {
+                        // Prefault first byte through the mmap'd host pointer.
+                        unsafe { *(host_ptr as *mut u8) = prefault_byte };
+                        (main_mem, Some((fd, host_ptr)), Some(swap_mem))
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "HostPtrPool: slot {slot_idx} multi-context DMA-BUF alloc failed: {e}; \
+                             falling back to single-context DMA-BUF / ALLOC_HOST_PTR"
+                        );
+                        // Re-run the single-context branch below by setting
+                        // local flag — easier: just call DMA-BUF heap directly.
+                        if use_dmabuf {
+                            match backend.alloc_dmabuf_heap_buffer(config.max_tensor_size) {
+                                Ok((m, fd, host_ptr)) => {
+                                    unsafe { *(host_ptr as *mut u8) = prefault_byte };
+                                    (m, Some((fd, host_ptr)), None)
+                                }
+                                Err(e2) => {
+                                    log::warn!(
+                                        "HostPtrPool: slot {slot_idx} single-context DMA-BUF fallback failed: {e2}; \
+                                         falling back to ALLOC_HOST_PTR"
+                                    );
+                                    let mem = backend
+                                        .alloc_host_ptr_buffer_empty(config.max_tensor_size)
+                                        .map_err(|e3| {
+                                            anyhow!(
+                                                "HostPtrPool: slot {slot_idx} fallback alloc failed: {e3}"
+                                            )
+                                        })?;
+                                    unsafe {
+                                        if let Err(e4) = backend.fill_host_ptr_buffer(
+                                            &mem,
+                                            &prefault_byte as *const u8,
+                                            1,
+                                        ) {
+                                            log::warn!(
+                                                "HostPtrPool: slot {slot_idx} fallback prefault failed (non-fatal): {e4}"
+                                            );
+                                        }
+                                    }
+                                    (mem, None, None)
+                                }
+                            }
+                        } else {
+                            let mem = backend
+                                .alloc_host_ptr_buffer_empty(config.max_tensor_size)
+                                .map_err(|e2| {
+                                    anyhow!(
+                                        "HostPtrPool: slot {slot_idx} fallback alloc failed: {e2}"
+                                    )
+                                })?;
+                            unsafe {
+                                if let Err(e2) = backend.fill_host_ptr_buffer(
+                                    &mem,
+                                    &prefault_byte as *const u8,
+                                    1,
+                                ) {
+                                    log::warn!(
+                                        "HostPtrPool: slot {slot_idx} fallback prefault failed (non-fatal): {e2}"
+                                    );
+                                }
+                            }
+                            (mem, None, None)
+                        }
+                    }
                 }
-            }
+            } else if use_dmabuf {
+                match backend.alloc_dmabuf_heap_buffer(config.max_tensor_size) {
+                    Ok((m, fd, host_ptr)) => {
+                        // Prefault: touch first byte via host_ptr (no
+                        // OpenCL call needed, DMA-BUF is page-faulted on
+                        // first access).
+                        unsafe { *(host_ptr as *mut u8) = prefault_byte };
+                        (m, Some((fd, host_ptr)), None)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "HostPtrPool: slot {slot_idx} DMA-BUF alloc failed: {e}; falling back to ALLOC_HOST_PTR"
+                        );
+                        let mem = backend
+                            .alloc_host_ptr_buffer_empty(config.max_tensor_size)
+                            .map_err(|e| {
+                                anyhow!("HostPtrPool: slot {slot_idx} fallback alloc failed: {e}")
+                            })?;
+                        unsafe {
+                            if let Err(e) =
+                                backend.fill_host_ptr_buffer(&mem, &prefault_byte as *const u8, 1)
+                            {
+                                log::warn!(
+                                    "HostPtrPool: slot {slot_idx} fallback prefault failed (non-fatal): {e}"
+                                );
+                            }
+                        }
+                        (mem, None, None)
+                    }
+                }
+            } else {
+                let mem = backend
+                    .alloc_host_ptr_buffer_empty(config.max_tensor_size)
+                    .map_err(|e| {
+                        anyhow!(
+                            "HostPtrPool: slot {slot_idx} alloc failed (size={}): {e}",
+                            config.max_tensor_size
+                        )
+                    })?;
+                // SAFETY: `&prefault_byte` is valid for 1 byte; `mem` is an
+                // ALLOC_HOST_PTR buffer of `max_tensor_size` bytes (>= 1).
+                unsafe {
+                    if let Err(e) =
+                        backend.fill_host_ptr_buffer(&mem, &prefault_byte as *const u8, 1)
+                    {
+                        log::warn!("HostPtrPool: slot {slot_idx} prefault failed (non-fatal): {e}");
+                    }
+                }
+                (mem, None, None)
+            };
             slots.push(HostPtrPoolEntry {
                 mem,
                 capacity: config.max_tensor_size,
                 in_use: AtomicBool::new(false),
+                dmabuf,
+                swap_ctx_mem,
             });
         }
         Ok(Self { slots, config })
@@ -227,6 +381,39 @@ impl HostPtrPoolGuard {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.pool.slots[self.slot_idx].capacity
+    }
+
+    /// DMA-BUF host pointer for this slot, if it was allocated via
+    /// `cl_khr_external_memory_dma_buf` path. `None` for plain
+    /// `CL_MEM_ALLOC_HOST_PTR` slots.
+    ///
+    /// When `Some(ptr)`, the caller writes data via `std::ptr::copy_nonoverlapping`
+    /// into `ptr` directly — no OpenCL Map/Unmap, no `clFinish`. The DMA-BUF
+    /// is hardware-coherent on Adreno UMA so subsequent kernel reads see
+    /// the bytes via same-queue dependency tracking.
+    #[inline]
+    pub fn dmabuf_host_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        self.pool.slots[self.slot_idx].dmabuf.map(|(_, ptr)| ptr)
+    }
+
+    /// DMA-BUF FD for this slot. `None` for plain `CL_MEM_ALLOC_HOST_PTR`
+    /// slots. Used by the multi-context fill path to issue
+    /// `DMA_BUF_IOCTL_SYNC` after `Map+Unmap`.
+    #[inline]
+    pub fn dmabuf_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.pool.slots[self.slot_idx].dmabuf.map(|(fd, _)| fd)
+    }
+
+    /// Multi-context swap `cl_mem` (in the secondary `cl_context`). `None`
+    /// for single-context slots — caller treats `mem()` as both fill target
+    /// and forward read source.
+    ///
+    /// When `Some(swap_mem)`, the caller fills `swap_mem` via the swap queue
+    /// (`fill_dmabuf_via_swap_queue`) and reads `mem()` from forward kernels
+    /// on the main queue. Both `cl_mem` references back the same DMA-BUF FD.
+    #[inline]
+    pub fn swap_ctx_mem(&self) -> Option<&ocl::core::Mem> {
+        self.pool.slots[self.slot_idx].swap_ctx_mem.as_ref()
     }
 }
 

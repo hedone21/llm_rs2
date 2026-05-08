@@ -519,7 +519,7 @@ impl<'a> SwapExecutor<'a> {
                     slot: Arc::clone(slot),
                     new_weights: new_arc,
                     new_dtype: self.target_dtype,
-                    write_event,
+                    write_event: Arc::new(write_event),
                     release_worker: self.release_worker.clone(),
                     on_complete: None,
                     layer_idx: None,
@@ -1450,16 +1450,58 @@ impl<'a> SwapExecutor<'a> {
             // Slot exhaustion or size overflow — staging fallback.
             return Ok(None);
         };
-        // SAFETY: `src_ptr` is valid for `size` bytes for the lifetime of
-        // `cpu_tensor` (which we hold a reference to here); `guard.mem()`
-        // is an `ALLOC_HOST_PTR`-allocated cl_mem of `pool.max_tensor_size`
-        // bytes (>= `size`) created via `alloc_host_ptr_buffer_empty`.
-        unsafe { ocl_be.fill_host_ptr_buffer(guard.mem(), src_ptr, size) }.map_err(|e| {
-            SwapError::BufferAllocationFailed {
-                layer: layer_idx,
-                source: e,
+        // Path priority for filling the slot:
+        //   (a) Multi-context swap (LLMRS_OPENCL_SWAP_CONTEXT=1): fill via
+        //       the swap queue's Map/Unmap on the swap-context cl_mem. The
+        //       main forward queue is not touched, isolating swap from
+        //       forward kernels at the driver-scheduling level (hypothesis
+        //       under test).
+        //   (b) Single-context DMA-BUF (LLMRS_OPENCL_DMABUF_HEAP=1): direct
+        //       CPU memcpy to the mmap'd DMA-BUF host pointer. No OpenCL
+        //       Map/Unmap, no `clFinish`.
+        //   (c) Plain ALLOC_HOST_PTR fallback: Map/Unmap on the main queue.
+        if let Some(swap_mem) = guard.swap_ctx_mem() {
+            // Multi-context path. The slot's main-context `cl_mem`
+            // (`guard.mem()`) is the read view used by forward kernels;
+            // the swap-context `cl_mem` (`swap_mem`) is the write view
+            // bound to the swap queue. Both alias the same DMA-BUF.
+            let host_ptr = guard.dmabuf_host_ptr().unwrap_or(std::ptr::null_mut());
+            // SAFETY: `swap_mem` is a DMA-BUF-backed cl_mem in the swap
+            // queue's context (paired with the main-context `mem()` via the
+            // shared FD); `src_ptr` is valid for `size` bytes for the
+            // lifetime of `cpu_tensor`; `size <= pool.max_tensor_size`.
+            unsafe { ocl_be.fill_dmabuf_via_swap_queue(swap_mem, host_ptr, src_ptr, size) }
+                .map_err(|e| SwapError::BufferAllocationFailed {
+                    layer: layer_idx,
+                    source: e,
+                })?;
+            // Optional explicit cache flush (LLMRS_DMABUF_SYNC=1).
+            if let Some(fd) = guard.dmabuf_fd() {
+                ocl_be.ioctl_dmabuf_sync_write_if_enabled(fd);
             }
-        })?;
+        } else if let Some(dmabuf_ptr) = guard.dmabuf_host_ptr() {
+            // SAFETY: `src_ptr` is valid for `size` bytes for the lifetime
+            // of `cpu_tensor`; `dmabuf_ptr` is an mmap'd DMA-BUF region of
+            // `pool.max_tensor_size` bytes (>= `size`); the pool's
+            // `in_use` flag enforces single-writer access for this slot.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr, dmabuf_ptr as *mut u8, size);
+            }
+            if let Some(fd) = guard.dmabuf_fd() {
+                ocl_be.ioctl_dmabuf_sync_write_if_enabled(fd);
+            }
+        } else {
+            // SAFETY: `src_ptr` is valid for `size` bytes for the lifetime of
+            // `cpu_tensor` (which we hold a reference to here); `guard.mem()`
+            // is an `ALLOC_HOST_PTR`-allocated cl_mem of `pool.max_tensor_size`
+            // bytes (>= `size`) created via `alloc_host_ptr_buffer_empty`.
+            unsafe { ocl_be.fill_host_ptr_buffer(guard.mem(), src_ptr, size) }.map_err(|e| {
+                SwapError::BufferAllocationFailed {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })?;
+        }
         let dtype = cpu_tensor.dtype();
         let buf: Arc<dyn crate::core::buffer::Buffer> =
             Arc::new(crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer::new(

@@ -164,7 +164,7 @@ fn test_dispatcher_callback_clears_pending() {
             slot,
             new_weights,
             new_dtype: DType::Q4_0,
-            write_event: GpuEvent::dummy(),
+            write_event: std::sync::Arc::new(GpuEvent::dummy()),
             release_worker: None,
             on_complete: Some(on_complete),
             layer_idx: Some(2),
