@@ -4,8 +4,12 @@
 //! and `QuantNoiseTable` so Phase 3 can compute per-layer quantization noise
 //! factors and expose them to `WeightSwapDecider` (Stage B).
 //!
+//! `async_swap` provides the `AsyncSwapDispatcher` worker thread that commits
+//! layer weights off the critical path (LISWAP-2 prototype).
+//!
 //! Spec: ENG-DAT-090/092/094/095, ENG-ALG-210/211/216, INV-123/124/125/127.
 
+pub mod async_swap;
 pub mod decider;
 pub mod incremental_plan;
 pub mod noise_table;
@@ -14,6 +18,7 @@ pub mod secondary_mmap;
 pub mod slot;
 pub mod swap_executor;
 
+pub use async_swap::{AsyncSwapDispatcher, SwapCommitJob, SwapJob};
 pub use decider::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
 pub use incremental_plan::IncrementalSwapPlan;
 pub use noise_table::QuantNoiseTable;
