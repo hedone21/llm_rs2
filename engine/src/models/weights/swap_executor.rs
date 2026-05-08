@@ -1169,13 +1169,27 @@ impl<'a> SwapExecutor<'a> {
         primary: &Tensor,
         is_weight: bool,
     ) -> Result<Tensor, SwapError> {
+        // ── env-gated sub-stage profiling ───────────────────────────────────
+        // Set LLMRS_SWAP_PROFILE_BREAKDOWN=1 to enable per-tensor μs timings.
+        // When the env var is absent the profiling branch is never entered and
+        // `Instant::now()` is never called, so production overhead is zero.
+        let prof = std::env::var_os("LLMRS_SWAP_PROFILE_BREAKDOWN")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let t_total = if prof { Some(Instant::now()) } else { None };
+
+        // ── sub-stage: lookup ───────────────────────────────────────────────
+        let t_lookup = if prof { Some(Instant::now()) } else { None };
         let info = secondary.layer_tensor(layer_idx, subname).ok_or_else(|| {
             SwapError::SecondaryTensorMissing {
                 layer: layer_idx,
                 subname: subname.to_string(),
             }
         })?;
+        let us_lookup = t_lookup.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: dim_check ────────────────────────────────────────────
+        let t_dim = if prof { Some(Instant::now()) } else { None };
         let shape = primary.shape().clone();
         let expected_dims: Vec<usize> = primary.shape().dims().to_vec();
         // Secondary dims are stored in reverse order (GGUF innermost-first).
@@ -1188,10 +1202,16 @@ impl<'a> SwapExecutor<'a> {
                 secondary: info.dims.clone(),
             });
         }
+        let us_dim = t_dim.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: bytes ────────────────────────────────────────────────
         // Raw bytes from the secondary mmap.
+        let t_bytes = if prof { Some(Instant::now()) } else { None };
         let data = secondary.tensor_bytes(info);
+        let tensor_size = data.len();
+        let us_bytes = t_bytes.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: permute ──────────────────────────────────────────────
         // Build a canonical GGUF tensor name for the permutation gate, so we
         // reuse the same predicate as the primary loader without copying
         // regex logic.
@@ -1205,6 +1225,7 @@ impl<'a> SwapExecutor<'a> {
         // forward path. The `secondary.needs_qk_unpermute_at_swap()` check
         // distinguishes the two formats (Galaxy S25 Adreno + AOS variant
         // observed regression: 2026-05-01).
+        let t_permute = if prof { Some(Instant::now()) } else { None };
         let canonical_name = format!("blk.{layer_idx}.{subname}");
         let permuted_bytes: Option<Vec<u8>> = if secondary.needs_qk_unpermute_at_swap() {
             if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, self.config) {
@@ -1227,7 +1248,9 @@ impl<'a> SwapExecutor<'a> {
             // AUF: bytes already in the runtime layout — no transformation.
             None
         };
+        let us_permute = t_permute.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: wrap ─────────────────────────────────────────────────
         // ENG-ALG-227: When no permutation is needed (AUF path), borrow the
         // mmap bytes directly instead of copying them into a heap Vec.  The
         // BorrowedMmapBuffer clones the secondary Arc (INV-143) so the mmap
@@ -1236,6 +1259,7 @@ impl<'a> SwapExecutor<'a> {
         // When permutation *is* needed (GGUF Q/K row reorder), the bytes have
         // already been written into an owned Vec by `unpermute_qk_rows`, so we
         // wrap that in a SharedBuffer as before.
+        let t_wrap = if prof { Some(Instant::now()) } else { None };
         let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
             // Permuted path: owned heap allocation required (bytes were reordered).
             Arc::new(SharedBuffer::from_vec(owned, info.dtype))
@@ -1247,16 +1271,41 @@ impl<'a> SwapExecutor<'a> {
                 ),
             )
         };
+        let us_wrap = t_wrap.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: cpu_tensor ───────────────────────────────────────────
+        let t_cpu = if prof { Some(Instant::now()) } else { None };
         let cpu_backend: Arc<dyn Backend> =
             Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
         let cpu_tensor = Tensor::new(shape.clone(), cpu_buf, cpu_backend);
+        let us_cpu = t_cpu.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
         let is_cpu = self.backend.name().contains("CPU");
         if is_cpu {
+            // Emit profiling line even on early return path.
+            if let Some(t_tot) = t_total {
+                let us_total = t_tot.elapsed().as_micros() as f64;
+                eprintln!(
+                    "[swap-prof] layer={} sub={} is_weight={} size={} \
+                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
+                     wrap={:.1} cpu={:.1} upload=0.0 total={:.1}",
+                    layer_idx,
+                    subname,
+                    is_weight as u8,
+                    tensor_size,
+                    us_lookup.unwrap_or(0.0),
+                    us_dim.unwrap_or(0.0),
+                    us_bytes.unwrap_or(0.0),
+                    us_permute.unwrap_or(0.0),
+                    us_wrap.unwrap_or(0.0),
+                    us_cpu.unwrap_or(0.0),
+                    us_total,
+                );
+            }
             return Ok(cpu_tensor);
         }
 
+        // ── sub-stage: upload ───────────────────────────────────────────────
         // ── LISWAP-3 prototype zero-copy pool path ─────────────────────────
         // When `host_ptr_pool` is attached AND we are uploading a weight
         // tensor AND the OpenCL backend is reachable AND a slot acquire
@@ -1266,15 +1315,40 @@ impl<'a> SwapExecutor<'a> {
         // exhaustion, missing source pointer) falls back gracefully to the
         // staging path so prototype activation never reduces correctness.
         // Plan: compiled-chasing-hopper.md Direction A track, Stage 3.
+        let t_upload = if prof { Some(Instant::now()) } else { None };
+
         #[cfg(feature = "opencl")]
         if is_weight
             && let Some(pool) = self.host_ptr_pool.as_ref()
             && let Some(t) = self.try_pool_materialise(secondary, &cpu_tensor, pool, layer_idx)?
         {
+            if let Some(t_tot) = t_total {
+                let us_upload = t_upload
+                    .map(|t| t.elapsed().as_micros() as f64)
+                    .unwrap_or(0.0);
+                let us_total = t_tot.elapsed().as_micros() as f64;
+                eprintln!(
+                    "[swap-prof] layer={} sub={} is_weight={} size={} \
+                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
+                     wrap={:.1} cpu={:.1} upload={:.1} total={:.1}",
+                    layer_idx,
+                    subname,
+                    is_weight as u8,
+                    tensor_size,
+                    us_lookup.unwrap_or(0.0),
+                    us_dim.unwrap_or(0.0),
+                    us_bytes.unwrap_or(0.0),
+                    us_permute.unwrap_or(0.0),
+                    us_wrap.unwrap_or(0.0),
+                    us_cpu.unwrap_or(0.0),
+                    us_upload,
+                    us_total,
+                );
+            }
             return Ok(t);
         }
 
-        if is_weight {
+        let result = if is_weight {
             self.backend.copy_weight_from(&cpu_tensor).map_err(|e| {
                 SwapError::BufferAllocationFailed {
                     layer: layer_idx,
@@ -1288,7 +1362,33 @@ impl<'a> SwapExecutor<'a> {
                     layer: layer_idx,
                     source: e,
                 })
+        };
+
+        if let Some(t_tot) = t_total {
+            let us_upload = t_upload
+                .map(|t| t.elapsed().as_micros() as f64)
+                .unwrap_or(0.0);
+            let us_total = t_tot.elapsed().as_micros() as f64;
+            eprintln!(
+                "[swap-prof] layer={} sub={} is_weight={} size={} \
+                 lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
+                 wrap={:.1} cpu={:.1} upload={:.1} total={:.1}",
+                layer_idx,
+                subname,
+                is_weight as u8,
+                tensor_size,
+                us_lookup.unwrap_or(0.0),
+                us_dim.unwrap_or(0.0),
+                us_bytes.unwrap_or(0.0),
+                us_permute.unwrap_or(0.0),
+                us_wrap.unwrap_or(0.0),
+                us_cpu.unwrap_or(0.0),
+                us_upload,
+                us_total,
+            );
         }
+
+        result
     }
 
     /// LISWAP-3 prototype zero-copy pool materialise. Returns `Ok(Some)` when
