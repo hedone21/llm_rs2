@@ -35,8 +35,14 @@ fn main() -> anyhow::Result<()> {
     println!("n_iters per config: {}", n_iters);
 
     // Two contexts (multi-context test)
-    let ctx_a = Context::builder().platform(platform).devices(device).build()?;
-    let ctx_b = Context::builder().platform(platform).devices(device).build()?;
+    let ctx_a = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
+    let ctx_b = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
 
     // === Compile busy kernel (1ms target) on both contexts ===
     let src = r#"
@@ -59,20 +65,14 @@ fn main() -> anyhow::Result<()> {
     const GSIZE: usize = 1024;
     // Same-context: both buffers in ctx_a
     let buf_a_in_a: Mem = unsafe {
-        ocl::core::create_buffer::<_, f32>(
-            ctx_a.as_core(), ocl::core::MEM_READ_WRITE, GSIZE, None,
-        )?
+        ocl::core::create_buffer::<_, f32>(ctx_a.as_core(), ocl::core::MEM_READ_WRITE, GSIZE, None)?
     };
     let buf_a2_in_a: Mem = unsafe {
-        ocl::core::create_buffer::<_, f32>(
-            ctx_a.as_core(), ocl::core::MEM_READ_WRITE, GSIZE, None,
-        )?
+        ocl::core::create_buffer::<_, f32>(ctx_a.as_core(), ocl::core::MEM_READ_WRITE, GSIZE, None)?
     };
     // Multi-context: buffer in ctx_b
     let buf_b_in_b: Mem = unsafe {
-        ocl::core::create_buffer::<_, f32>(
-            ctx_b.as_core(), ocl::core::MEM_READ_WRITE, GSIZE, None,
-        )?
+        ocl::core::create_buffer::<_, f32>(ctx_b.as_core(), ocl::core::MEM_READ_WRITE, GSIZE, None)?
     };
 
     // Tune iters to ~1ms duration
@@ -85,8 +85,14 @@ fn main() -> anyhow::Result<()> {
             ocl::core::set_kernel_arg(&kernel_a, 0, ArgVal::mem(&buf_a_in_a))?;
             ocl::core::set_kernel_arg(&kernel_a, 1, ArgVal::scalar(&iters))?;
             ocl::core::enqueue_kernel(
-                &q, &kernel_a, 1, None, &[GSIZE, 1, 1], None,
-                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>,
+                &q,
+                &kernel_a,
+                1,
+                None,
+                &[GSIZE, 1, 1],
+                None,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
             )?;
         }
         ocl::core::finish(&q)?;
@@ -112,8 +118,14 @@ fn main() -> anyhow::Result<()> {
             ocl::core::set_kernel_arg(kernel, 0, ArgVal::mem(buf))?;
             ocl::core::set_kernel_arg(kernel, 1, ArgVal::scalar(&iters))?;
             ocl::core::enqueue_kernel(
-                queue, kernel, 1, None, &[GSIZE, 1, 1], None,
-                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>,
+                queue,
+                kernel,
+                1,
+                None,
+                &[GSIZE, 1, 1],
+                None,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -147,7 +159,12 @@ fn main() -> anyhow::Result<()> {
             &ocl::core::Kernel,
             &Mem,
         ) = match cfg {
-            Config::Single => (Queue::new(&ctx_a, device, None)?, None, &kernel_a, &buf_a_in_a),
+            Config::Single => (
+                Queue::new(&ctx_a, device, None)?,
+                None,
+                &kernel_a,
+                &buf_a_in_a,
+            ),
             Config::SameCtxInOrder => (
                 Queue::new(&ctx_a, device, None)?,
                 Some(Queue::new(&ctx_a, device, None)?),
@@ -227,7 +244,10 @@ fn main() -> anyhow::Result<()> {
     // === Summary ===
     println!("\n=== Phase 6 summary ===");
     let baseline_mean = all_results[0].1;
-    println!("\n{:<45} {:>10} {:>10} {:>12}", "Config", "mean", "median", "ratio_to_1q");
+    println!(
+        "\n{:<45} {:>10} {:>10} {:>12}",
+        "Config", "mean", "median", "ratio_to_1q"
+    );
     println!("{}", "-".repeat(80));
     for (label, mean, median) in &all_results {
         let ratio = mean / baseline_mean;

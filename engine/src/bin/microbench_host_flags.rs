@@ -28,7 +28,10 @@ fn main() -> anyhow::Result<()> {
     println!("Device: {}", device.name()?);
     println!("Buffer: {} MB, n_iters: {}", size_mb, n_iters);
 
-    let context = Context::builder().platform(platform).devices(device).build()?;
+    let context = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
     let queue = Queue::new(&context, device, None)?;
     let host_src: Vec<f32> = (0..n_floats).map(|i| i as f32 * 1.0e-6).collect();
 
@@ -43,14 +46,29 @@ fn main() -> anyhow::Result<()> {
     const HOST_NO_ACCESS: u64 = 1 << 9;
 
     let combos: &[(&str, u64)] = &[
-        ("READ_WRITE | ALLOC_HOST_PTR (baseline)", READ_WRITE | ALLOC_HOST_PTR),
+        (
+            "READ_WRITE | ALLOC_HOST_PTR (baseline)",
+            READ_WRITE | ALLOC_HOST_PTR,
+        ),
         ("READ_ONLY | ALLOC_HOST_PTR", READ_ONLY | ALLOC_HOST_PTR),
         ("WRITE_ONLY | ALLOC_HOST_PTR", WRITE_ONLY | ALLOC_HOST_PTR),
-        ("READ_WRITE | ALLOC_HOST_PTR | HOST_WRITE_ONLY", READ_WRITE | ALLOC_HOST_PTR | HOST_WRITE_ONLY),
-        ("READ_ONLY | ALLOC_HOST_PTR | HOST_WRITE_ONLY", READ_ONLY | ALLOC_HOST_PTR | HOST_WRITE_ONLY),
-        ("READ_WRITE | ALLOC_HOST_PTR | HOST_READ_ONLY", READ_WRITE | ALLOC_HOST_PTR | HOST_READ_ONLY),
+        (
+            "READ_WRITE | ALLOC_HOST_PTR | HOST_WRITE_ONLY",
+            READ_WRITE | ALLOC_HOST_PTR | HOST_WRITE_ONLY,
+        ),
+        (
+            "READ_ONLY | ALLOC_HOST_PTR | HOST_WRITE_ONLY",
+            READ_ONLY | ALLOC_HOST_PTR | HOST_WRITE_ONLY,
+        ),
+        (
+            "READ_WRITE | ALLOC_HOST_PTR | HOST_READ_ONLY",
+            READ_WRITE | ALLOC_HOST_PTR | HOST_READ_ONLY,
+        ),
         // HOST_NO_ACCESS conflicts with HOST_WRITE_ONLY/READ_ONLY semantically; test separately
-        ("WRITE_ONLY | ALLOC_HOST_PTR (read-once GPU)", WRITE_ONLY | ALLOC_HOST_PTR),
+        (
+            "WRITE_ONLY | ALLOC_HOST_PTR (read-once GPU)",
+            WRITE_ONLY | ALLOC_HOST_PTR,
+        ),
     ];
 
     println!("\n=== Phase 4 CL_MEM flag combination microbench ===\n");
@@ -73,7 +91,12 @@ fn main() -> anyhow::Result<()> {
         // Warmup
         unsafe {
             ocl::core::enqueue_write_buffer(
-                &queue, &buf, true, 0, &host_src, None::<&ocl::core::Event>,
+                &queue,
+                &buf,
+                true,
+                0,
+                &host_src,
+                None::<&ocl::core::Event>,
                 None::<&mut ocl::core::Event>,
             )?;
         }
@@ -84,7 +107,12 @@ fn main() -> anyhow::Result<()> {
             let t0 = Instant::now();
             unsafe {
                 ocl::core::enqueue_write_buffer(
-                    &queue, &buf, true, 0, &host_src, None::<&ocl::core::Event>,
+                    &queue,
+                    &buf,
+                    true,
+                    0,
+                    &host_src,
+                    None::<&ocl::core::Event>,
                     None::<&mut ocl::core::Event>,
                 )?;
             }

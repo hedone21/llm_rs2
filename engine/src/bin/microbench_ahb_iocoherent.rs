@@ -86,10 +86,8 @@ mod ahb {
             }
             macro_rules! sym {
                 ($name:literal) => {{
-                    let s = libc::dlsym(
-                        handle,
-                        concat!($name, "\0").as_ptr() as *const libc::c_char,
-                    );
+                    let s =
+                        libc::dlsym(handle, concat!($name, "\0").as_ptr() as *const libc::c_char);
                     if s.is_null() {
                         eprintln!("dlsym '{}' failed", $name);
                         return None;
@@ -142,16 +140,16 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let size_mb: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(600);
     let n_iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
-    let cache_label = args
-        .get(3)
-        .map(String::as_str)
-        .unwrap_or("iocoherent");
+    let cache_label = args.get(3).map(String::as_str).unwrap_or("iocoherent");
     let cache_policy = match cache_label {
         "writeback" => qcom::CL_MEM_HOST_WRITEBACK_QCOM,
         "iocoherent" => qcom::CL_MEM_HOST_IOCOHERENT_QCOM,
         "uncached" => qcom::CL_MEM_HOST_UNCACHED_QCOM,
         other => {
-            eprintln!("unknown cache policy: {} (try writeback|iocoherent|uncached)", other);
+            eprintln!(
+                "unknown cache policy: {} (try writeback|iocoherent|uncached)",
+                other
+            );
             std::process::exit(2);
         }
     };
@@ -193,8 +191,7 @@ fn main() -> anyhow::Result<()> {
         rfu1: 0,
     };
     let mut ahb_buf: *mut ahb::AHardwareBuffer = std::ptr::null_mut();
-    let alloc_err =
-        unsafe { (ahb_fns.allocate)(&desc as *const _, &mut ahb_buf as *mut _) };
+    let alloc_err = unsafe { (ahb_fns.allocate)(&desc as *const _, &mut ahb_buf as *mut _) };
     if alloc_err != 0 || ahb_buf.is_null() {
         anyhow::bail!(
             "AHardwareBuffer_allocate failed: err={}, ahb_buf={:p}",
@@ -209,8 +206,7 @@ fn main() -> anyhow::Result<()> {
     let lock_err = unsafe {
         (ahb_fns.lock)(
             ahb_buf,
-            ahb::AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
-                | ahb::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+            ahb::AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | ahb::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
             -1,
             std::ptr::null(),
             &mut host_ptr as *mut _,
@@ -317,8 +313,7 @@ fn main() -> anyhow::Result<()> {
 
     // Wrap raw cl_mem from clCreateBuffer in ocl::core::Mem for set_kernel_arg.
     // ocl 0.19's Mem::from_raw_create_ptr exists.
-    let in_buf_ocl: ocl::core::Mem =
-        unsafe { ocl::core::Mem::from_raw_create_ptr(cl_mem_raw) };
+    let in_buf_ocl: ocl::core::Mem = unsafe { ocl::core::Mem::from_raw_create_ptr(cl_mem_raw) };
 
     let mut samples_k_ms = Vec::with_capacity(n_iters);
     for i in 0..n_iters {
@@ -366,11 +361,20 @@ fn main() -> anyhow::Result<()> {
     for (i, v) in readback.iter().take(8).enumerate() {
         let finite = v.is_finite();
         all_finite &= finite;
-        println!("  out[{}]: {} ({})", i, v, if finite { "OK" } else { "NaN/Inf!" });
+        println!(
+            "  out[{}]: {} ({})",
+            i,
+            v,
+            if finite { "OK" } else { "NaN/Inf!" }
+        );
     }
     println!(
         "Correctness: {} (first 8 outputs all finite)",
-        if all_finite { "PASS" } else { "FAIL — coherency violation" }
+        if all_finite {
+            "PASS"
+        } else {
+            "FAIL — coherency violation"
+        }
     );
 
     // Cleanup — drop cl_mem first then release/unlock AHB
@@ -405,6 +409,10 @@ fn report_stats(label: &str, size_mb: usize, samples_ms: &[f64]) {
     println!("  mean    : {:7.2} ms", mean);
     println!("  median  : {:7.2} ms", median);
     println!("  stddev  : {:7.2} ms", stddev);
-    println!("  σ/mean  : {:6.3} ({})", cv, if cv < 0.05 { "OK" } else { "WARN" });
+    println!(
+        "  σ/mean  : {:6.3} ({})",
+        cv,
+        if cv < 0.05 { "OK" } else { "WARN" }
+    );
     println!("  effective BW: {:5.2} GB/s", bandwidth_gbs);
 }

@@ -53,8 +53,10 @@ fn main() -> anyhow::Result<()> {
 
     // Two configs: profile_events OFF (production), ON (instrumentation)
     const QUEUE_PROFILING_ENABLE: u64 = 1 << 0;
-    let configs: &[(&str, Option<u64>)] =
-        &[("profile_events=OFF", None), ("profile_events=ON", Some(QUEUE_PROFILING_ENABLE))];
+    let configs: &[(&str, Option<u64>)] = &[
+        ("profile_events=OFF", None),
+        ("profile_events=ON", Some(QUEUE_PROFILING_ENABLE)),
+    ];
 
     for (label, props) in configs {
         println!("\n=== {} ===", label);
@@ -117,7 +119,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("\n=== Phase 0 interpretation ===");
-    println!(" 7~50 ms  : driver overhead 우위, SVM/command_buffer 우회 가능성 높음 → Phase 1/2 PROCEED");
+    println!(
+        " 7~50 ms  : driver overhead 우위, SVM/command_buffer 우회 가능성 높음 → Phase 1/2 PROCEED"
+    );
     println!("100~200 ms: 중간, mixed bottleneck → 모든 phase 측정 필요");
     println!(">200 ms   : H2D bytes-bound, SVM 효과 상한 작음 → Phase 3/4 우선");
 
@@ -142,6 +146,10 @@ fn report_stats(label: &str, size_mb: usize, samples_ms: &[f64]) {
     println!("  median  : {:7.2} ms", median);
     println!("  p99     : {:7.2} ms", p99);
     println!("  stddev  : {:7.2} ms", stddev);
-    println!("  σ/mean  : {:6.3} ({})", cv, if cv < 0.05 { "OK" } else { "WARN >5%" });
+    println!(
+        "  σ/mean  : {:6.3} ({})",
+        cv,
+        if cv < 0.05 { "OK" } else { "WARN >5%" }
+    );
     println!("  effective BW: {:5.2} GB/s", bandwidth_gbs);
 }

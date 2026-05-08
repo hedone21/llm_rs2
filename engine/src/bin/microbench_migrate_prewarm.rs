@@ -25,7 +25,10 @@ fn main() -> anyhow::Result<()> {
     let platform = Platform::default();
     let device = Device::first(platform)?;
     println!("Device: {}", device.name()?);
-    let context = Context::builder().platform(platform).devices(device).build()?;
+    let context = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
     let queue = Queue::new(&context, device, None)?;
     let host_src: Vec<f32> = (0..n_floats).map(|i| i as f32 * 1.0e-6).collect();
 
@@ -39,7 +42,10 @@ fn main() -> anyhow::Result<()> {
     let mut cold_first: Vec<f64> = Vec::new();
     let mut warm_first: Vec<f64> = Vec::new();
 
-    println!("\n=== Phase 5: cold vs prewarm first-write, {} MB, n={} ===", size_mb, n_runs);
+    println!(
+        "\n=== Phase 5: cold vs prewarm first-write, {} MB, n={} ===",
+        size_mb, n_runs
+    );
     for run in 0..n_runs {
         // Each run gets a fresh buffer
         let buf = unsafe {
@@ -56,7 +62,12 @@ fn main() -> anyhow::Result<()> {
             let t0 = Instant::now();
             unsafe {
                 ocl::core::enqueue_write_buffer(
-                    &queue, &buf, true, 0, &host_src, None::<&ocl::core::Event>,
+                    &queue,
+                    &buf,
+                    true,
+                    0,
+                    &host_src,
+                    None::<&ocl::core::Event>,
                     None::<&mut ocl::core::Event>,
                 )?;
             }
@@ -77,10 +88,7 @@ fn main() -> anyhow::Result<()> {
                 )
             };
             if migrate_err != 0 {
-                println!(
-                    "  run {}: migrate failed err={} → SKIP",
-                    run, migrate_err
-                );
+                println!("  run {}: migrate failed err={} → SKIP", run, migrate_err);
                 continue;
             }
             ocl::core::finish(&queue)?;
@@ -88,7 +96,12 @@ fn main() -> anyhow::Result<()> {
             let t0 = Instant::now();
             unsafe {
                 ocl::core::enqueue_write_buffer(
-                    &queue, &buf, true, 0, &host_src, None::<&ocl::core::Event>,
+                    &queue,
+                    &buf,
+                    true,
+                    0,
+                    &host_src,
+                    None::<&ocl::core::Event>,
                     None::<&mut ocl::core::Event>,
                 )?;
             }
@@ -113,7 +126,12 @@ fn main() -> anyhow::Result<()> {
         let cv = stddev / mean;
         println!(
             "[{}] n={}, mean={:.2} median={:.2} σ={:.2} σ/mean={:.3}",
-            label, samples.len(), mean, median, stddev, cv
+            label,
+            samples.len(),
+            mean,
+            median,
+            stddev,
+            cv
         );
     }
 

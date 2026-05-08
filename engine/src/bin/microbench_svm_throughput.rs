@@ -81,12 +81,14 @@ fn main() -> anyhow::Result<()> {
     let ctx_raw: ocl::ffi::cl_context = ClContextPtr::as_ptr(&&context);
 
     // SVM fine-grain alloc
-    println!("\nclSVMAlloc(FINE_GRAIN_BUFFER | ATOMICS, {} bytes, align=64)...", size_bytes);
+    println!(
+        "\nclSVMAlloc(FINE_GRAIN_BUFFER | ATOMICS, {} bytes, align=64)...",
+        size_bytes
+    );
     let flags = svm_ffi::CL_MEM_READ_WRITE
         | svm_ffi::CL_MEM_SVM_FINE_GRAIN_BUFFER
         | svm_ffi::CL_MEM_SVM_ATOMICS;
-    let svm_ptr =
-        unsafe { svm_ffi::clSVMAlloc(ctx_raw, flags, size_bytes, 64) };
+    let svm_ptr = unsafe { svm_ffi::clSVMAlloc(ctx_raw, flags, size_bytes, 64) };
     if svm_ptr.is_null() {
         anyhow::bail!(
             "clSVMAlloc returned NULL ({} MB request). Driver may have refused the size.",
@@ -161,8 +163,7 @@ fn main() -> anyhow::Result<()> {
         let t0 = Instant::now();
         unsafe {
             // arg 0: SVM pointer
-            let err =
-                svm_ffi::clSetKernelArgSVMPointer(kernel.as_ptr(), 0, svm_ptr as *const _);
+            let err = svm_ffi::clSetKernelArgSVMPointer(kernel.as_ptr(), 0, svm_ptr as *const _);
             if err != 0 {
                 anyhow::bail!("clSetKernelArgSVMPointer failed: err={}", err);
             }
@@ -202,8 +203,7 @@ fn main() -> anyhow::Result<()> {
                 svm_ptr as *mut u8,
                 size_bytes,
             );
-            let err =
-                svm_ffi::clSetKernelArgSVMPointer(kernel.as_ptr(), 0, svm_ptr as *const _);
+            let err = svm_ffi::clSetKernelArgSVMPointer(kernel.as_ptr(), 0, svm_ptr as *const _);
             if err != 0 {
                 anyhow::bail!("clSetKernelArgSVMPointer failed: err={}", err);
             }
@@ -234,8 +234,12 @@ fn main() -> anyhow::Result<()> {
 
     println!("\n=== Phase 1 interpretation ===");
     println!("- SVM host write < 22 ms (Phase 0 baseline) → SVM 우월. swap_executor에 통합");
-    println!("- SVM host write ≈ 22 ms                    → 동등. complexity 늘리지 않으면 채택 안함");
-    println!("- SVM host write > 30 ms                    → driver coercion. 'compliance wrapper' finding");
+    println!(
+        "- SVM host write ≈ 22 ms                    → 동등. complexity 늘리지 않으면 채택 안함"
+    );
+    println!(
+        "- SVM host write > 30 ms                    → driver coercion. 'compliance wrapper' finding"
+    );
     println!("- Kernel read >> kernel read on host_ptr     → first-touch overhead 잔존");
 
     Ok(())
@@ -259,6 +263,10 @@ fn report_stats(label: &str, size_mb: usize, samples_ms: &[f64]) {
     println!("  median  : {:7.2} ms", median);
     println!("  p99     : {:7.2} ms", p99);
     println!("  stddev  : {:7.2} ms", stddev);
-    println!("  σ/mean  : {:6.3} ({})", cv, if cv < 0.05 { "OK" } else { "WARN" });
+    println!(
+        "  σ/mean  : {:6.3} ({})",
+        cv,
+        if cv < 0.05 { "OK" } else { "WARN" }
+    );
     println!("  effective BW: {:5.2} GB/s", bandwidth_gbs);
 }

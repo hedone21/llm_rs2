@@ -52,8 +52,7 @@ mod qcom_ffi {
     pub type clNewRecordingQCOM_fn =
         unsafe extern "system" fn(cl_command_queue, *mut cl_int) -> cl_recording_qcom;
     pub type clEndRecordingQCOM_fn = unsafe extern "system" fn(cl_recording_qcom) -> cl_int;
-    pub type clReleaseRecordingQCOM_fn =
-        unsafe extern "system" fn(cl_recording_qcom) -> cl_int;
+    pub type clReleaseRecordingQCOM_fn = unsafe extern "system" fn(cl_recording_qcom) -> cl_int;
     pub type clEnqueueRecordingQCOM_fn = unsafe extern "system" fn(
         cl_command_queue,
         cl_recording_qcom,
@@ -97,7 +96,8 @@ mod qcom_ffi {
             }
             macro_rules! sym {
                 ($name:literal) => {{
-                    let s = libc::dlsym(handle, concat!($name, "\0").as_ptr() as *const libc::c_char);
+                    let s =
+                        libc::dlsym(handle, concat!($name, "\0").as_ptr() as *const libc::c_char);
                     if s.is_null() {
                         eprintln!("dlsym '{}' failed", $name);
                         return None;
@@ -125,7 +125,10 @@ fn main() -> anyhow::Result<()> {
     let n_dispatches: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
     let n_iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
 
-    println!("n_dispatches per iter: {}, n_iters: {}", n_dispatches, n_iters);
+    println!(
+        "n_dispatches per iter: {}, n_iters: {}",
+        n_dispatches, n_iters
+    );
 
     let qcom = match qcom_ffi::load() {
         Some(q) => q,
@@ -148,9 +151,8 @@ fn main() -> anyhow::Result<()> {
     // CL_QUEUE_RECORDABLE_QCOM = (1u << 30). Recordable queues reject write_buffer
     // and other non-NDRange commands, so we keep them separate.
     const CL_QUEUE_RECORDABLE_QCOM: u64 = 1u64 << 30;
-    let recordable_props = unsafe {
-        ocl::core::CommandQueueProperties::from_bits_unchecked(CL_QUEUE_RECORDABLE_QCOM)
-    };
+    let recordable_props =
+        unsafe { ocl::core::CommandQueueProperties::from_bits_unchecked(CL_QUEUE_RECORDABLE_QCOM) };
     let queue = Queue::new(&context, device, Some(recordable_props))?;
     println!("✓ Created standard prep_queue + recordable queue (CL_QUEUE_RECORDABLE_QCOM)");
 
@@ -166,32 +168,30 @@ fn main() -> anyhow::Result<()> {
             out_buf[id] = v;
         }
     "#;
-    let program = Program::builder().devices(device).src(src).build(&context)?;
+    let program = Program::builder()
+        .devices(device)
+        .src(src)
+        .build(&context)?;
     let kernel = ocl::core::create_kernel(&program, "layer_op")?;
 
     const NF: usize = 4096;
     let in_buf: Mem = unsafe {
-        ocl::core::create_buffer::<_, f32>(
-            context.as_core(),
-            ocl::core::MEM_READ_ONLY,
-            NF,
-            None,
-        )?
+        ocl::core::create_buffer::<_, f32>(context.as_core(), ocl::core::MEM_READ_ONLY, NF, None)?
     };
     let out_buf: Mem = unsafe {
-        ocl::core::create_buffer::<_, f32>(
-            context.as_core(),
-            ocl::core::MEM_READ_WRITE,
-            NF,
-            None,
-        )?
+        ocl::core::create_buffer::<_, f32>(context.as_core(), ocl::core::MEM_READ_WRITE, NF, None)?
     };
 
     // Pre-fill input via prep_queue (recordable queue rejects write_buffer).
     let host_data: Vec<f32> = (0..NF).map(|i| i as f32 * 0.001).collect();
     unsafe {
         ocl::core::enqueue_write_buffer(
-            &prep_queue, &in_buf, true, 0, &host_data, None::<&ocl::core::Event>,
+            &prep_queue,
+            &in_buf,
+            true,
+            0,
+            &host_data,
+            None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
     }
@@ -210,8 +210,14 @@ fn main() -> anyhow::Result<()> {
         ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&dummy_arg))?;
         for _ in 0..10 {
             ocl::core::enqueue_kernel(
-                &prep_queue, &kernel, 1, None, &gws, None,
-                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>,
+                &prep_queue,
+                &kernel,
+                1,
+                None,
+                &gws,
+                None,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
             )?;
         }
         ocl::core::finish(&prep_queue)?;
@@ -227,17 +233,32 @@ fn main() -> anyhow::Result<()> {
                 ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(&out_buf))?;
                 ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&dummy_d))?;
                 ocl::core::enqueue_kernel(
-                    &prep_queue, &kernel, 1, None, &gws, None,
-                    None::<&ocl::core::Event>, None::<&mut ocl::core::Event>,
+                    &prep_queue,
+                    &kernel,
+                    1,
+                    None,
+                    &gws,
+                    None,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
                 )?;
             }
             ocl::core::finish(&prep_queue)?;
         }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         samples_a_ms.push(elapsed_ms);
-        println!("  iter {:2}: {:7.2} ms ({:5.1} us/dispatch)", it, elapsed_ms, elapsed_ms * 1000.0 / n_dispatches as f64);
+        println!(
+            "  iter {:2}: {:7.2} ms ({:5.1} us/dispatch)",
+            it,
+            elapsed_ms,
+            elapsed_ms * 1000.0 / n_dispatches as f64
+        );
     }
-    report_stats("Method A: clEnqueueNDRangeKernel × N (prep_queue)", &samples_a_ms, n_dispatches);
+    report_stats(
+        "Method A: clEnqueueNDRangeKernel × N (prep_queue)",
+        &samples_a_ms,
+        n_dispatches,
+    );
 
     // === Method B: record once + replay × N ===
     println!("\n=== Method B: clNewRecording → 1× NDRange → clEnd → clEnqueueRecording × N ===");
@@ -249,7 +270,10 @@ fn main() -> anyhow::Result<()> {
     let mut errcode: i32 = 0;
     let recording = unsafe { (qcom.new_recording)(q_ptr, &mut errcode) };
     if recording.is_null() || errcode != 0 {
-        eprintln!("clNewRecordingQCOM failed: errcode={}, recording={:p}", errcode, recording);
+        eprintln!(
+            "clNewRecordingQCOM failed: errcode={}, recording={:p}",
+            errcode, recording
+        );
         anyhow::bail!("Cannot proceed without recording handle");
     }
     println!("  recording handle: {:p}", recording);
@@ -260,8 +284,14 @@ fn main() -> anyhow::Result<()> {
         ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(&out_buf))?;
         ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&dummy_arg))?;
         ocl::core::enqueue_kernel(
-            &queue, &kernel, 1, None, &gws, None,
-            None::<&ocl::core::Event>, None::<&mut ocl::core::Event>,
+            &queue,
+            &kernel,
+            1,
+            None,
+            &gws,
+            None,
+            None::<&ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
         )?;
         let end_err = (qcom.end_recording)(recording);
         if end_err != 0 {
@@ -275,12 +305,18 @@ fn main() -> anyhow::Result<()> {
     for _ in 0..10 {
         let err = unsafe {
             (qcom.enqueue_recording)(
-                q_ptr, recording,
-                0, std::ptr::null(),
-                0, std::ptr::null(),
-                0, std::ptr::null(),
-                0, std::ptr::null(),
-                0, std::ptr::null(),
+                q_ptr,
+                recording,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
                 std::ptr::null_mut(),
             )
         };
@@ -296,13 +332,19 @@ fn main() -> anyhow::Result<()> {
         for _d in 0..n_dispatches {
             let err = unsafe {
                 (qcom.enqueue_recording)(
-                    q_ptr, recording,
-                    0, std::ptr::null(),                    // arg updates
-                    0, std::ptr::null(),                    // offset updates
-                    0, std::ptr::null(),                    // global wg updates
-                    0, std::ptr::null(),                    // local wg updates
-                    0, std::ptr::null(),                    // event wait
-                    std::ptr::null_mut(),                   // event out
+                    q_ptr,
+                    recording,
+                    0,
+                    std::ptr::null(), // arg updates
+                    0,
+                    std::ptr::null(), // offset updates
+                    0,
+                    std::ptr::null(), // global wg updates
+                    0,
+                    std::ptr::null(), // local wg updates
+                    0,
+                    std::ptr::null(),     // event wait
+                    std::ptr::null_mut(), // event out
                 )
             };
             if err != 0 {
@@ -312,9 +354,18 @@ fn main() -> anyhow::Result<()> {
         ocl::core::finish(&queue)?;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         samples_b_ms.push(elapsed_ms);
-        println!("  iter {:2}: {:7.2} ms ({:5.1} us/replay)", it, elapsed_ms, elapsed_ms * 1000.0 / n_dispatches as f64);
+        println!(
+            "  iter {:2}: {:7.2} ms ({:5.1} us/replay)",
+            it,
+            elapsed_ms,
+            elapsed_ms * 1000.0 / n_dispatches as f64
+        );
     }
-    report_stats("Method B: replay × N (no arg update)", &samples_b_ms, n_dispatches);
+    report_stats(
+        "Method B: replay × N (no arg update)",
+        &samples_b_ms,
+        n_dispatches,
+    );
     drop(arg_updates);
 
     // Cleanup
@@ -325,15 +376,27 @@ fn main() -> anyhow::Result<()> {
     let mean_b = samples_b_ms.iter().sum::<f64>() / samples_b_ms.len() as f64;
     let speedup = mean_a / mean_b;
     println!("\n=== Phase 2 summary ===");
-    println!("  Method A mean: {:7.2} ms ({:5.1} us/dispatch)", mean_a, mean_a * 1000.0 / n_dispatches as f64);
-    println!("  Method B mean: {:7.2} ms ({:5.1} us/replay)", mean_b, mean_b * 1000.0 / n_dispatches as f64);
+    println!(
+        "  Method A mean: {:7.2} ms ({:5.1} us/dispatch)",
+        mean_a,
+        mean_a * 1000.0 / n_dispatches as f64
+    );
+    println!(
+        "  Method B mean: {:7.2} ms ({:5.1} us/replay)",
+        mean_b,
+        mean_b * 1000.0 / n_dispatches as f64
+    );
     println!("  Speedup B/A:  {:.2}x", speedup);
     println!("\n=== Phase 2 interpretation ===");
     println!("  speedup ≥ 5x → recordable_queues delivers significant dispatch latency reduction");
     println!("  speedup ~ 1x → recordable_queues is no-op or driver bypasses recording");
     println!("\nNOTE: For weight swap, this only helps if dispatch overhead dominates 290ms.");
-    println!("      Phase 0 showed H2D = 22ms; remaining ~268ms is mostly Q4 conv + ArcSwap + cl_mem alloc,");
-    println!("      none of which are NDRange dispatches. Recordable queues primarily helps inference, not swap.");
+    println!(
+        "      Phase 0 showed H2D = 22ms; remaining ~268ms is mostly Q4 conv + ArcSwap + cl_mem alloc,"
+    );
+    println!(
+        "      none of which are NDRange dispatches. Recordable queues primarily helps inference, not swap."
+    );
 
     Ok(())
 }
@@ -349,9 +412,22 @@ fn report_stats(label: &str, samples_ms: &[f64], n_dispatches: usize) {
     let median = sorted[sorted.len() / 2];
     let cv = stddev / mean;
 
-    println!("\n[{}] n_iters={}, n_dispatches={}", label, samples_ms.len(), n_dispatches);
-    println!("  mean    : {:7.2} ms ({:6.2} us/dispatch)", mean, mean * 1000.0 / n_dispatches as f64);
+    println!(
+        "\n[{}] n_iters={}, n_dispatches={}",
+        label,
+        samples_ms.len(),
+        n_dispatches
+    );
+    println!(
+        "  mean    : {:7.2} ms ({:6.2} us/dispatch)",
+        mean,
+        mean * 1000.0 / n_dispatches as f64
+    );
     println!("  median  : {:7.2} ms", median);
     println!("  stddev  : {:7.2} ms", stddev);
-    println!("  σ/mean  : {:6.3} ({})", cv, if cv < 0.05 { "OK" } else { "WARN" });
+    println!(
+        "  σ/mean  : {:6.3} ({})",
+        cv,
+        if cv < 0.05 { "OK" } else { "WARN" }
+    );
 }
