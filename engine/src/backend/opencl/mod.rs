@@ -510,6 +510,15 @@ pub struct OpenCLBackend {
     // (single bool check + early return).
     cl_mem_diag_enabled: bool,
     cl_mem_diag: UnsafeCell<HashMap<&'static str, ClMemDiagBucket>>,
+
+    // ── LISWAP-2 prototype: async H2D weight upload queue ────────────────
+    // Lazily-created secondary command queue dedicated to the async swap
+    // dispatcher's `enqueue_write_async` path. Created on first use so the
+    // cost is paid only when `--swap-async-dispatch` is actually enabled.
+    // Env-gate: `LLMRS_OPENCL_TRANSFER_QUEUE=0|false|off` disables it (then
+    // `enqueue_write_async` falls through to the default sync copy path).
+    // Plan: .claude/plans/compiled-chasing-hopper.md (Phase 1).
+    transfer_queue: std::sync::OnceLock<Queue>,
 }
 
 /// Per-category cl_mem allocation bucket (WSWAP-5-TBT-DIAG).
@@ -1470,6 +1479,9 @@ impl OpenCLBackend {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             cl_mem_diag: UnsafeCell::new(HashMap::new()),
+            // LISWAP-2 prototype (plan: chasing-hopper). Lazy-init in
+            // `transfer_queue_or_init()`.
+            transfer_queue: std::sync::OnceLock::new(),
         })
     }
 
@@ -3742,6 +3754,69 @@ impl OpenCLBackend {
 
         Ok((q_buf, d_buf, q_img))
     }
+
+    // ── LISWAP-2 prototype: async H2D transfer queue ─────────────────────
+    // Plan: .claude/plans/compiled-chasing-hopper.md (Phase 1).
+    //
+    // The prototype uses a *secondary* command queue dedicated to H2D weight
+    // uploads so that compute (Q4 GEMV / flash attn / FFN) on `self.queue`
+    // can overlap with the in-flight write at the hardware level. cl_mem
+    // handles are bound to the OpenCL *context*, not the queue, so a buffer
+    // allocated through the standard `OpenCLMemory` (which holds
+    // `self.queue`) is fully usable from the transfer queue too.
+
+    /// Whether the LISWAP-2 transfer queue is enabled at runtime.
+    /// Reads `LLMRS_OPENCL_TRANSFER_QUEUE` once and caches the answer.
+    /// "0" / "false" / "off" (case-insensitive) → disabled (caller falls
+    /// back to the synchronous `copy_weight_from` path). Anything else,
+    /// including an absent env var, → enabled (default ON).
+    fn transfer_queue_env_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| match std::env::var("LLMRS_OPENCL_TRANSFER_QUEUE") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off")
+            }
+            Err(_) => true,
+        })
+    }
+
+    /// Lazily build (or return) the secondary transfer queue. Returns
+    /// `None` if the env-gate is disabled or queue creation failed —
+    /// callers fall back to the synchronous path in that case. Queue
+    /// properties match the main queue (profiling stays consistent).
+    fn transfer_queue_or_init(&self) -> Option<&Queue> {
+        if !Self::transfer_queue_env_enabled() {
+            return None;
+        }
+        // Fast path: already initialised.
+        if let Some(q) = self.transfer_queue.get() {
+            return Some(q);
+        }
+        // Slow path: try to create. Match the main queue's profiling
+        // setting so per-event timings stay comparable; we deliberately
+        // keep the default priority (Phase 5 may experiment with low).
+        let queue_props = if self.profile_events_enabled {
+            Some(flags::QUEUE_PROFILING_ENABLE)
+        } else {
+            None
+        };
+        match Queue::new(&self.context, self.device, queue_props) {
+            Ok(q) => {
+                // OnceLock::set returns Err if another thread won the
+                // race; in either case `get()` will yield the live value.
+                let _ = self.transfer_queue.set(q);
+                self.transfer_queue.get()
+            }
+            Err(e) => {
+                log::warn!(
+                    "LLMRS_OPENCL_TRANSFER_QUEUE: secondary queue creation failed ({e}); \
+                     falling back to synchronous `copy_weight_from`"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl Backend for OpenCLBackend {
@@ -3788,14 +3863,137 @@ impl Backend for OpenCLBackend {
                 Some(&mut event),
             )?;
         }
-        Ok(crate::core::backend::GpuEvent { inner: Some(event) })
+        Ok(crate::core::backend::GpuEvent {
+            inner_cl: Some(event),
+            #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+            inner_cu: None,
+        })
     }
 
     fn wait_event(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
-        if let Some(e) = evt.inner.as_ref() {
+        if let Some(e) = evt.inner_cl.as_ref() {
             ocl::core::wait_for_event(e)?;
         }
         Ok(())
+    }
+
+    /// LISWAP-2 prototype (plan: chasing-hopper, Phase 1). Async H2D
+    /// upload of a weight tensor onto the secondary `transfer_queue`.
+    /// Returns the freshly allocated destination tensor plus an event
+    /// that completes once the write is GPU-visible.
+    ///
+    /// Falls back to the synchronous default impl when the transfer
+    /// queue is disabled (env-gate or creation failure) or when the
+    /// destination has no `cl_mem` handle (host-only fallback).
+    fn enqueue_write_async(
+        &self,
+        src: &Tensor,
+    ) -> Result<(Tensor, crate::core::backend::GpuEvent)> {
+        let Some(transfer_queue) = self.transfer_queue_or_init() else {
+            // Default: sync via copy_weight_from + dummy event.
+            let dst = self.copy_weight_from(src)?;
+            return Ok((dst, crate::core::backend::GpuEvent::default()));
+        };
+
+        // Allocate the destination buffer through the regular memory
+        // factory bound to the main queue. `cl_mem` handles are
+        // context-scoped, not queue-scoped, so the secondary queue can
+        // write to this buffer without any cross-queue migration cost.
+        let size = src.size();
+        let memory = crate::backend::opencl::memory::OpenCLMemory::new(
+            self.context.clone(),
+            self.queue.clone(),
+            self.use_zero_copy,
+        );
+        let buffer = memory.alloc(size, src.dtype())?;
+        let category = match src.dtype() {
+            DType::Q4_0 => "weight_q4_aos_async",
+            DType::F16 => "weight_f16_async",
+            DType::F32 => "weight_f32_async",
+            _ => "weight_other_async",
+        };
+        self.record_cl_mem_alloc(category, size);
+
+        let new_tensor = Tensor::new(src.shape().clone(), buffer.clone(), src.backend().clone());
+
+        // We require both a source host pointer (to feed the
+        // non-blocking write) and a destination cl_mem handle. If
+        // either is missing, defer to the sync path so we keep the
+        // same correctness envelope as `copy_from`.
+        let src_ptr = src.as_ptr();
+        if src_ptr.is_null() {
+            return Err(anyhow!(
+                "enqueue_write_async: source has a null host pointer (size={size}, dtype={:?})",
+                src.dtype()
+            ));
+        }
+        let dst_mem = match get_cl_mem(buffer.as_ref()) {
+            Ok(m) => m,
+            Err(_) => {
+                // Buffer doesn't expose cl_mem (mapped host-only). Fall
+                // back to sync copy.
+                let dst = self.copy_weight_from(src)?;
+                return Ok((dst, crate::core::backend::GpuEvent::default()));
+            }
+        };
+        let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, size) };
+
+        let mut event: ocl::core::Event = ocl::core::Event::null();
+        // SAFETY: non-blocking write with an explicit event output. The
+        // caller (async swap dispatcher's worker thread) waits on this
+        // event before publishing the new weights, so the destination
+        // cl_mem outlives the in-flight write — and the source bytes
+        // outlive it too because they come from the AUF/Mmap-backed
+        // weight tensor whose lifetime spans the whole swap operation.
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                transfer_queue,
+                dst_mem,
+                false,
+                0,
+                src_slice,
+                None::<&ocl::core::Event>,
+                Some(&mut event),
+            )?;
+        }
+        // Submit the command immediately so the device starts the DMA
+        // without waiting for the next clFlush. This matches OpenCL's
+        // recommended pattern for cross-queue async work.
+        ocl::core::flush(transfer_queue)?;
+
+        Ok((
+            new_tensor,
+            crate::core::backend::GpuEvent {
+                inner_cl: Some(event),
+                #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+                inner_cu: None,
+            },
+        ))
+    }
+
+    /// Wait for an event recorded by `enqueue_write_async` (or
+    /// `enqueue_read_buffer_async`) without draining the compute queue.
+    /// `clWaitForEvents` blocks the *host* thread but not the device,
+    /// which is exactly what the swap dispatcher's worker thread needs
+    /// before flipping ArcSwap.
+    fn wait_event_blocking(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+        if let Some(e) = evt.inner_cl.as_ref() {
+            ocl::core::wait_for_event(e)?;
+            return Ok(());
+        }
+        // No CL event attached — could be a CUDA event on a multi-feature
+        // build, or a dummy fallback event. In neither case does the
+        // OpenCL backend have anything device-side to wait on, so we
+        // fall through to the default sync barrier for safety.
+        self.synchronize()
+    }
+
+    /// LISWAP-2 prototype: only true when the env-gate is on (and queue
+    /// creation has not been pre-empted by a permanent failure). The
+    /// async swap dispatcher uses this to decide between the dispatcher
+    /// path and the regular sync `copy_weight_from`.
+    fn supports_async_transfer(&self) -> bool {
+        Self::transfer_queue_env_enabled()
     }
 
     fn name(&self) -> &str {

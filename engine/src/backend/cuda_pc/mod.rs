@@ -222,6 +222,14 @@ pub struct CudaBackend {
     /// `SyncPolicy::ALL` for backward compatibility with the
     /// pre-port behaviour. `defer_sync=true` overrides this.
     sync_policy: Arc<AtomicU32>,
+    /// LISWAP-2 prototype (plan: chasing-hopper, Phase 1).
+    ///
+    /// Lazily-created secondary CUDA stream used by `enqueue_write_async`
+    /// to overlap H2D weight uploads with compute on the default stream.
+    /// Created on first use behind the `LLMRS_CUDA_TRANSFER_STREAM` env
+    /// gate (default ON). When unset, the async path falls back to the
+    /// synchronous `copy_weight_from`.
+    transfer_stream: Arc<std::sync::OnceLock<Arc<cudarc::driver::CudaStream>>>,
 }
 
 impl CudaBackend {
@@ -306,6 +314,9 @@ impl CudaBackend {
             score_tmp_buf: Arc::new(std::sync::Mutex::new(None)),
             defer_sync: Arc::new(AtomicBool::new(false)),
             sync_policy: Arc::new(AtomicU32::new(SyncPolicy::ALL.raw())),
+            // LISWAP-2 prototype (plan: chasing-hopper). Lazy-init in
+            // `transfer_stream_or_init`.
+            transfer_stream: Arc::new(std::sync::OnceLock::new()),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -368,6 +379,49 @@ impl CudaBackend {
             self.synchronize()
         } else {
             Ok(())
+        }
+    }
+
+    // ── LISWAP-2 prototype: async H2D transfer stream ───────────────────
+    // Plan: .claude/plans/compiled-chasing-hopper.md (Phase 1).
+
+    /// Whether the LISWAP-2 transfer stream is enabled at runtime.
+    /// Reads `LLMRS_CUDA_TRANSFER_STREAM` once and caches. Default ON;
+    /// "0" / "false" / "off" disables (caller falls back to sync copy).
+    fn transfer_stream_env_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| match std::env::var("LLMRS_CUDA_TRANSFER_STREAM") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off")
+            }
+            Err(_) => true,
+        })
+    }
+
+    /// Lazily build (or return) the secondary transfer stream. Returns
+    /// `None` if the env-gate is disabled or stream creation failed —
+    /// callers fall back to the synchronous path in that case.
+    /// Note: cuda_pc has no graph capture path, so no capture check.
+    fn transfer_stream_or_init(&self) -> Option<Arc<cudarc::driver::CudaStream>> {
+        if !Self::transfer_stream_env_enabled() {
+            return None;
+        }
+        if let Some(s) = self.transfer_stream.get() {
+            return Some(s.clone());
+        }
+        match self.ctx.new_stream() {
+            Ok(s) => {
+                let _ = self.transfer_stream.set(s);
+                self.transfer_stream.get().cloned()
+            }
+            Err(e) => {
+                log::warn!(
+                    "LLMRS_CUDA_TRANSFER_STREAM: secondary stream creation failed ({e}); \
+                     falling back to synchronous `copy_weight_from`"
+                );
+                None
+            }
         }
     }
 
@@ -1671,6 +1725,70 @@ impl Backend for CudaBackend {
                 Arc::new(self.clone()),
             ))
         }
+    }
+
+    /// LISWAP-2 prototype (plan: chasing-hopper, Phase 1). cuda_pc
+    /// targets discrete GPUs, so the destination is always a pure
+    /// device buffer (`CudaDeviceBuffer`). Submits a `cuMemcpyHtoDAsync`
+    /// on the secondary transfer stream and records a `CudaEvent` for
+    /// the dispatcher's worker to wait on.
+    fn enqueue_write_async(
+        &self,
+        src: &Tensor,
+    ) -> Result<(Tensor, crate::core::backend::GpuEvent)> {
+        let Some(transfer_stream) = self.transfer_stream_or_init() else {
+            let dst = self.copy_weight_from(src)?;
+            return Ok((dst, crate::core::backend::GpuEvent::default()));
+        };
+
+        let size = src.size();
+        let src_ptr = src.as_ptr();
+        if src_ptr.is_null() {
+            return Err(anyhow!(
+                "enqueue_write_async: source has a null host pointer (size={size}, dtype={:?})",
+                src.dtype()
+            ));
+        }
+
+        let dev_buf = CudaDeviceBuffer::new(size, src.dtype())?;
+        // SAFETY: dispatcher worker keeps `src` alive until the
+        // recorded event fires. Stream is owned by this backend.
+        dev_buf.copy_from_host_async(src_ptr, size, transfer_stream.cu_stream() as _)?;
+
+        let event = self
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow!("CUDA event create failed: {e}"))?;
+        event
+            .record(&transfer_stream)
+            .map_err(|e| anyhow!("cuEventRecord failed: {e}"))?;
+
+        let dst_tensor = Tensor::new(
+            src.shape().clone(),
+            Arc::new(dev_buf),
+            Arc::new(self.clone()),
+        );
+        Ok((
+            dst_tensor,
+            crate::core::backend::GpuEvent {
+                #[cfg(feature = "opencl")]
+                inner_cl: None,
+                inner_cu: Some(event),
+            },
+        ))
+    }
+
+    fn wait_event_blocking(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+        if let Some(e) = evt.inner_cu.as_ref() {
+            e.synchronize()
+                .map_err(|err| anyhow!("cuEventSynchronize failed: {err}"))?;
+            return Ok(());
+        }
+        self.synchronize()
+    }
+
+    fn supports_async_transfer(&self) -> bool {
+        Self::transfer_stream_env_enabled()
     }
 }
 
