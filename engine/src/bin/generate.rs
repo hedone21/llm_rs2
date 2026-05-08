@@ -884,6 +884,18 @@ struct Args {
     /// Per-tick > 0 with no `--force-swap-ratio`: silently ignored (no trigger).
     #[arg(long, default_value_t = 0)]
     swap_incremental_per_tick: usize,
+
+    /// LISWAP-2 prototype: Submit incremental swap chunks to a separate
+    /// transfer queue/stream so weight H2D writes overlap with the next
+    /// token's forward compute.
+    ///
+    /// Requires `--swap-incremental-per-tick > 0`. When `=0` or absent,
+    /// has no effect (silently ignored).
+    ///
+    /// Currently a prototype: measurement-driven decision on whether to
+    /// promote to production. See plan/compiled-chasing-hopper.md.
+    #[arg(long, default_value_t = false)]
+    swap_async_dispatch: bool,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -2432,6 +2444,36 @@ fn main() -> anyhow::Result<()> {
     let mut incremental_force_swap_plan: Option<llm_rs2::models::weights::IncrementalSwapPlan> =
         None;
 
+    // LISWAP-2 prototype: async swap dispatcher lifecycle.
+    // Created once here; used in the decode loop when async dispatch is active.
+    // `None` when --swap-async-dispatch is false, per_tick == 0, or the backend
+    // does not support async transfer.
+    let async_swap_dispatcher: Option<llm_rs2::models::weights::AsyncSwapDispatcher> = {
+        if args.swap_async_dispatch && args.swap_incremental_per_tick > 0 {
+            let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cpu_backend_arc.clone());
+            if swap_backend.supports_async_transfer() {
+                Some(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                    swap_backend,
+                ))
+            } else {
+                eprintln!(
+                    "[LISWAP-2] backend does not support async transfer; falling back to sync incremental swap"
+                );
+                None
+            }
+        } else {
+            if args.swap_async_dispatch && args.swap_incremental_per_tick == 0 {
+                eprintln!(
+                    "[LISWAP-2] --swap-async-dispatch ignored: requires --swap-incremental-per-tick > 0"
+                );
+            }
+            None
+        }
+    };
+
     if args.qcf_dump.is_none()
         && let Some(ratio) = args.force_swap_ratio
     {
@@ -2467,6 +2509,7 @@ fn main() -> anyhow::Result<()> {
                 &target_layers,
                 gpu_backend_arc.as_ref(),
                 &cpu_backend_arc,
+                None,
             ) {
                 Ok(report) => {
                     eprintln!(
@@ -5143,8 +5186,13 @@ fn main() -> anyhow::Result<()> {
                 let chunk = inc_plan.drain_chunk();
                 if !chunk.is_empty() {
                     let t_swap = std::time::Instant::now();
-                    match run_layer_swap(&model, &chunk, gpu_backend_arc.as_ref(), &cpu_backend_arc)
-                    {
+                    match run_layer_swap(
+                        &model,
+                        &chunk,
+                        gpu_backend_arc.as_ref(),
+                        &cpu_backend_arc,
+                        async_swap_dispatcher.as_ref(),
+                    ) {
                         Ok(report) => {
                             eprintln!(
                                 "[IncrementalSwap] tick={} chunk={:?} swapped={} remaining={} latency={:.1}ms",
@@ -5181,6 +5229,20 @@ fn main() -> anyhow::Result<()> {
                         inc_plan.started_at_token(),
                         decode_token_index,
                     );
+                    // LISWAP-2: drain async dispatcher to ensure all in-flight commits land
+                    // before the plan is retired. drain failure is non-fatal — prototype
+                    // robustness is secondary to measurement.
+                    if let Some(ref dispatcher) = async_swap_dispatcher {
+                        let drain_t = std::time::Instant::now();
+                        if let Err(e) = dispatcher.drain(std::time::Duration::from_secs(2)) {
+                            eprintln!("[LISWAP-2] drain failed: {e}");
+                        } else {
+                            eprintln!(
+                                "[LISWAP-2] dispatcher drained: {:.1}ms",
+                                drain_t.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                    }
                     incremental_force_swap_plan = None;
                 }
             }
@@ -6890,6 +6952,7 @@ fn run_layer_swap(
     target_layers: &[usize],
     gpu_backend: Option<&Arc<dyn Backend>>,
     cpu_backend: &Arc<dyn Backend>,
+    async_dispatcher: Option<&llm_rs2::models::weights::AsyncSwapDispatcher>,
 ) -> Result<llm_rs2::models::weights::SwapReport, llm_rs2::models::weights::SwapError> {
     let swap_memory = Galloc::new();
     let swap_backend: Arc<dyn Backend> =
@@ -6903,7 +6966,13 @@ fn run_layer_swap(
         &swap_memory,
         Arc::clone(&model.release_worker),
     );
-    executor.execute(model, target_layers)
+    executor.execute_on_slots(
+        model.layers.as_slice(),
+        model.secondary_mmap.as_ref(),
+        &model.ratio_generation,
+        target_layers,
+        async_dispatcher,
+    )
 }
 
 /// Re-map weight tensors for CPU access after a weight swap.
@@ -7048,8 +7117,14 @@ fn run_qcf_warmup_workflow(
                 log_prefix, ratio,
             );
         } else {
-            let report = run_layer_swap(model, &decision.selected_layers, gpu_backend, cpu_backend)
-                .map_err(|e| anyhow::anyhow!("[QCF-dump]{} swap failed: {}", log_prefix, e))?;
+            let report = run_layer_swap(
+                model,
+                &decision.selected_layers,
+                gpu_backend,
+                cpu_backend,
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("[QCF-dump]{} swap failed: {}", log_prefix, e))?;
             eprintln!(
                 "[QCF-dump]{} swap: ratio={:.2}, layers={}/{}, qcf_pred={:.4}, \
                  fallback={}, latency={:.1}ms",
@@ -7136,7 +7211,13 @@ fn dispatch_swap_weights(
     }
 
     // ── 4. Execute ─────────────────────────────────────────────────────────
-    match run_layer_swap(model, &decision.selected_layers, gpu_backend, cpu_backend) {
+    match run_layer_swap(
+        model,
+        &decision.selected_layers,
+        gpu_backend,
+        cpu_backend,
+        None,
+    ) {
         Ok(report) => {
             // SwapExecutor measures execute()-only latency in `report.latency_ms`,
             // which matches the prior `t_start.elapsed()` scope (the executor
