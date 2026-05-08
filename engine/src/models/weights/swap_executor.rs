@@ -247,6 +247,17 @@ pub struct SwapExecutor<'a> {
     /// of dropping inline. INV-141 is verified at the top of each batch.
     /// `None` → original inline drop path (host tests, CPU backend fallback).
     pub release_worker: Option<Arc<PrimaryReleaseWorker>>,
+    /// LISWAP-3 prototype: opt-in `CL_MEM_ALLOC_HOST_PTR` pool path.
+    ///
+    /// When `Some`, GPU AOS weight materialisation routes through the pool
+    /// (zero-copy `map / memcpy / unmap` on a pre-allocated slot) instead
+    /// of the staging `copy_weight_from` cycle. Slot exhaustion / size
+    /// overflow falls back gracefully to the staging path. AUF SOA bypass
+    /// path is unchanged — that path is already zero-copy by construction.
+    /// `None` (default) → behaviour identical to the pre-Stage-3 baseline.
+    /// Plan: `compiled-chasing-hopper.md` Direction A track, Stage 3.
+    #[cfg(feature = "opencl")]
+    pub host_ptr_pool: Option<Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>>,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -265,6 +276,8 @@ impl<'a> SwapExecutor<'a> {
             backend,
             memory,
             release_worker: None,
+            #[cfg(feature = "opencl")]
+            host_ptr_pool: None,
         }
     }
 
@@ -286,7 +299,23 @@ impl<'a> SwapExecutor<'a> {
             backend,
             memory,
             release_worker: Some(release_worker),
+            #[cfg(feature = "opencl")]
+            host_ptr_pool: None,
         }
+    }
+
+    /// LISWAP-3 prototype builder — attach a `HostPtrPool` so the AOS
+    /// materialisation path uses the zero-copy slot pool instead of the
+    /// staging `copy_weight_from` cycle. Plan: `compiled-chasing-hopper.md`
+    /// Direction A track, Stage 3. Setting this on a CPU executor is a
+    /// no-op (the AOS path skips the pool when `is_cpu`).
+    #[cfg(feature = "opencl")]
+    pub fn with_host_ptr_pool(
+        mut self,
+        pool: Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>,
+    ) -> Self {
+        self.host_ptr_pool = Some(pool);
+        self
     }
 
     /// Select uniform index-spaced target layers (Stage 1 fallback, ENG-ALG-212).
@@ -1225,8 +1254,27 @@ impl<'a> SwapExecutor<'a> {
 
         let is_cpu = self.backend.name().contains("CPU");
         if is_cpu {
-            Ok(cpu_tensor)
-        } else if is_weight {
+            return Ok(cpu_tensor);
+        }
+
+        // ── LISWAP-3 prototype zero-copy pool path ─────────────────────────
+        // When `host_ptr_pool` is attached AND we are uploading a weight
+        // tensor AND the OpenCL backend is reachable AND a slot acquire
+        // succeeds, replace the staging `copy_weight_from` with a
+        // `map(MAP_WRITE) → memcpy → unmap` cycle on a pre-allocated
+        // ALLOC_HOST_PTR cl_mem. Any failure path (size overflow, slot
+        // exhaustion, missing source pointer) falls back gracefully to the
+        // staging path so prototype activation never reduces correctness.
+        // Plan: compiled-chasing-hopper.md Direction A track, Stage 3.
+        #[cfg(feature = "opencl")]
+        if is_weight
+            && let Some(pool) = self.host_ptr_pool.as_ref()
+            && let Some(t) = self.try_pool_materialise(secondary, &cpu_tensor, pool, layer_idx)?
+        {
+            return Ok(t);
+        }
+
+        if is_weight {
             self.backend.copy_weight_from(&cpu_tensor).map_err(|e| {
                 SwapError::BufferAllocationFailed {
                     layer: layer_idx,
@@ -1241,6 +1289,71 @@ impl<'a> SwapExecutor<'a> {
                     source: e,
                 })
         }
+    }
+
+    /// LISWAP-3 prototype zero-copy pool materialise. Returns `Ok(Some)` when
+    /// the pool path succeeded, `Ok(None)` when the caller should fall back
+    /// to staging (slot exhaustion / size overflow / non-OpenCL backend),
+    /// `Err` when an OpenCL operation hard-failed.
+    ///
+    /// Mmap region lifetime: `cpu_tensor` carries the secondary's `Arc<Buffer>`
+    /// (either `BorrowedMmapBuffer` or `SharedBuffer` for the permuted path).
+    /// Pulling that Arc into the resulting `HostPtrPoolBuffer` is unnecessary
+    /// because the fill helper memcpy's bytes into the slot synchronously
+    /// — the secondary mmap is no longer needed after `fill_host_ptr_buffer`
+    /// returns. We still clone the SecondaryMmap Arc as a defence-in-depth
+    /// guard so callers analysing buffer lifetimes see the same shape as the
+    /// `BorrowedMmapBuffer` path.
+    #[cfg(feature = "opencl")]
+    fn try_pool_materialise(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        cpu_tensor: &Tensor,
+        pool: &Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>,
+        layer_idx: usize,
+    ) -> Result<Option<Tensor>, SwapError> {
+        // Backend must be OpenCL for the pool path to be meaningful.
+        let Some(ocl_be) = self
+            .backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+        else {
+            return Ok(None);
+        };
+        let size = cpu_tensor.size();
+        if size == 0 {
+            return Ok(None);
+        }
+        // Source host pointer: produced by `BorrowedMmapBuffer` or
+        // `SharedBuffer`; both are non-null on the AOS materialise path.
+        let src_ptr = cpu_tensor.buffer().as_ptr();
+        if src_ptr.is_null() {
+            return Ok(None);
+        }
+        let Some(guard) = pool.acquire(size) else {
+            // Slot exhaustion or size overflow — staging fallback.
+            return Ok(None);
+        };
+        // SAFETY: `src_ptr` is valid for `size` bytes for the lifetime of
+        // `cpu_tensor` (which we hold a reference to here); `guard.mem()`
+        // is an `ALLOC_HOST_PTR`-allocated cl_mem of `pool.max_tensor_size`
+        // bytes (>= `size`) created via `alloc_host_ptr_buffer_empty`.
+        unsafe { ocl_be.fill_host_ptr_buffer(guard.mem(), src_ptr, size) }.map_err(|e| {
+            SwapError::BufferAllocationFailed {
+                layer: layer_idx,
+                source: e,
+            }
+        })?;
+        let dtype = cpu_tensor.dtype();
+        let buf: Arc<dyn crate::core::buffer::Buffer> =
+            Arc::new(crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
+                guard,
+                size,
+                dtype,
+                Some(Arc::clone(secondary)),
+            ));
+        let tensor = Tensor::new(cpu_tensor.shape().clone(), buf, Arc::clone(&self.backend));
+        Ok(Some(tensor))
     }
 
     /// Materialise a norm tensor if present in the secondary file; otherwise

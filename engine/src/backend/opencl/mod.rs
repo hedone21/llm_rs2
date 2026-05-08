@@ -17,6 +17,7 @@ use crate::resilience::gpu_self_meter::OpenClEventGpuMeter;
 
 pub mod buffer;
 pub mod gpu_score;
+pub mod host_ptr_pool;
 pub mod memory;
 pub mod plan;
 
@@ -519,6 +520,17 @@ pub struct OpenCLBackend {
     // `enqueue_write_async` falls through to the default sync copy path).
     // Plan: .claude/plans/compiled-chasing-hopper.md (Phase 1).
     transfer_queue: std::sync::OnceLock<Queue>,
+
+    // ── LISWAP-3 prototype: ALLOC_HOST_PTR pool for swap (Direction A) ───
+    // Lazily-created pool of pre-allocated `CL_MEM_ALLOC_HOST_PTR` cl_mem
+    // slots dedicated to the production swap path's zero-copy upload (vs.
+    // the staging copy used by `copy_weight_from`). Created on first use
+    // so the up-front allocation cost is paid only when
+    // `--swap-zero-copy` + `LLMRS_OPENCL_HOST_PTR_POOL=1` are both on.
+    // Env-gate: `LLMRS_OPENCL_HOST_PTR_POOL=1|true|on` enables (default OFF —
+    // measurement-driven decision pending). Plan: compiled-chasing-hopper.md
+    // (Direction A track, Stage 3).
+    host_ptr_pool: std::sync::OnceLock<Option<Arc<host_ptr_pool::HostPtrPool>>>,
 }
 
 /// Per-category cl_mem allocation bucket (WSWAP-5-TBT-DIAG).
@@ -1482,6 +1494,9 @@ impl OpenCLBackend {
             // LISWAP-2 prototype (plan: chasing-hopper). Lazy-init in
             // `transfer_queue_or_init()`.
             transfer_queue: std::sync::OnceLock::new(),
+            // LISWAP-3 prototype (Direction A, Stage 3). Lazy-init in
+            // `host_ptr_pool_or_init()`.
+            host_ptr_pool: std::sync::OnceLock::new(),
         })
     }
 
@@ -3816,6 +3831,167 @@ impl OpenCLBackend {
                 None
             }
         }
+    }
+
+    // ── LISWAP-3 prototype: ALLOC_HOST_PTR pool for swap ─────────────────
+    //
+    // The pool replaces the per-tensor `clCreateBuffer + enqueue_write_buffer`
+    // staging cycle with a `clEnqueueMapBuffer(MAP_WRITE) + memcpy + Unmap`
+    // path on a pre-allocated `CL_MEM_ALLOC_HOST_PTR | READ_ONLY` slot. On
+    // Adreno UMA the unmap step flushes CPU caches and makes the bytes GPU-
+    // visible without any device-side copy. Stage 1b microbench reported
+    // -42.4% wall-clock on Galaxy S25 vs the staging baseline.
+    //
+    // Stage 3 keeps the pool path off-by-default so production swap behaviour
+    // is unchanged. Caller (SwapExecutor) must check both the CLI flag and
+    // the env-gate before requesting the pool path.
+
+    /// Allocate an empty `CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY` cl_mem
+    /// of `size` bytes (no initial data). Caller fills it via
+    /// [`fill_host_ptr_buffer`][Self::fill_host_ptr_buffer].
+    ///
+    /// Used by `HostPtrPool::new` to build slot buffers up-front; the
+    /// production swap path itself never calls this directly — it acquires
+    /// a slot via the pool and reuses the pre-allocated cl_mem.
+    ///
+    /// Plan: `compiled-chasing-hopper.md` Direction A track.
+    pub fn alloc_host_ptr_buffer_empty(&self, size: usize) -> Result<ocl::core::Mem> {
+        const CL_MEM_READ_ONLY: u64 = 1 << 2;
+        const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
+
+        let flags = (CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR) as ocl::ffi::cl_bitfield;
+        let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
+        let mut errcode: ocl::ffi::cl_int = 0;
+        let raw = unsafe {
+            ocl::ffi::clCreateBuffer(ctx_ptr, flags, size, std::ptr::null_mut(), &mut errcode)
+        };
+        if errcode != 0 || raw.is_null() {
+            return Err(anyhow!(
+                "alloc_host_ptr_buffer_empty: clCreateBuffer failed (size={size}, errcode={errcode})"
+            ));
+        }
+        // SAFETY: clCreateBuffer succeeded with a non-null handle; we own
+        // the freshly created refcount. `Mem::from_raw_create_ptr` takes
+        // ownership; Drop will call `clReleaseMemObject`.
+        let mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw) };
+        Ok(mem)
+    }
+
+    /// Fill a previously-allocated `CL_MEM_ALLOC_HOST_PTR` cl_mem with
+    /// `size` bytes from `src` via the
+    /// `clEnqueueMapBuffer(MAP_WRITE) → memcpy → clEnqueueUnmapMemObject`
+    /// cycle. The driver flushes CPU caches and makes the bytes GPU-
+    /// visible on unmap. Blocks until the unmap completes.
+    ///
+    /// # Safety
+    /// - `src` must be valid (readable) for `size` bytes for the duration
+    ///   of the call.
+    /// - `mem` must be a host-accessible buffer (created with
+    ///   `CL_MEM_ALLOC_HOST_PTR` or `CL_MEM_USE_HOST_PTR`); calling on a
+    ///   device-only buffer is undefined behaviour.
+    /// - `size` must be `<=` the buffer's allocated capacity.
+    pub unsafe fn fill_host_ptr_buffer(
+        &self,
+        mem: &ocl::core::Mem,
+        src: *const u8,
+        size: usize,
+    ) -> Result<()> {
+        use ocl::ffi;
+        const CL_TRUE: ffi::cl_bool = 1;
+        const CL_MAP_WRITE: ffi::cl_map_flags = 1 << 1;
+
+        let q_ref: &ocl::core::CommandQueue = &self.queue;
+        let q_ptr: ffi::cl_command_queue = q_ref.as_ptr();
+
+        let mut errcode: ffi::cl_int = 0;
+        // SAFETY (forwarded): caller asserts `mem` is `ALLOC_HOST_PTR`-allocated
+        // and `size` is within its capacity.
+        let mapped_ptr = unsafe {
+            ffi::clEnqueueMapBuffer(
+                q_ptr,
+                mem.as_ptr(),
+                CL_TRUE,
+                CL_MAP_WRITE,
+                0,
+                size,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut errcode,
+            )
+        };
+        if errcode != 0 || mapped_ptr.is_null() {
+            return Err(anyhow!(
+                "fill_host_ptr_buffer: clEnqueueMapBuffer failed (errcode={errcode}, ptr_null={})",
+                mapped_ptr.is_null()
+            ));
+        }
+
+        // SAFETY (forwarded): caller asserts `src` is valid for `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src, mapped_ptr as *mut u8, size) };
+
+        // SAFETY: `mapped_ptr` was returned by the map call above and is
+        // still valid until the unmap completes.
+        let rc = unsafe {
+            ffi::clEnqueueUnmapMemObject(
+                q_ptr,
+                mem.as_ptr(),
+                mapped_ptr,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow!(
+                "fill_host_ptr_buffer: clEnqueueUnmapMemObject failed (rc={rc})"
+            ));
+        }
+        // Wait for the unmap to land so subsequent kernel reads see the
+        // bytes. Stage 1b microbench used `queue.finish()` here too.
+        self.queue.finish()?;
+        Ok(())
+    }
+
+    /// Lazily build (or return) the LISWAP-3 host-ptr pool. Returns `None`
+    /// when:
+    /// - the env-gate `LLMRS_OPENCL_HOST_PTR_POOL` is disabled (default),
+    /// - pool construction failed (e.g. memory pressure on first alloc).
+    ///
+    /// Caller (SwapExecutor) is contracted to fall back to the staging
+    /// path on `None`. Idempotent: `OnceLock` caches the first attempt.
+    ///
+    /// `config` is consulted only on the **first** call; subsequent calls
+    /// return the previously-built pool regardless of `config`. This
+    /// matches the lifecycle expectation of a single CLI-configured pool
+    /// per process.
+    pub fn host_ptr_pool_or_init(
+        &self,
+        config: host_ptr_pool::HostPtrPoolConfig,
+    ) -> Option<Arc<host_ptr_pool::HostPtrPool>> {
+        if !host_ptr_pool::host_ptr_pool_env_enabled() {
+            return None;
+        }
+        let cell = self.host_ptr_pool.get_or_init(|| {
+            match host_ptr_pool::HostPtrPool::new(self, config) {
+                Ok(pool) => Some(Arc::new(pool)),
+                Err(e) => {
+                    log::warn!(
+                        "LLMRS_OPENCL_HOST_PTR_POOL: pool creation failed ({e}); \
+                         falling back to staging swap path"
+                    );
+                    None
+                }
+            }
+        });
+        cell.clone()
+    }
+
+    /// Read-only accessor for an already-initialised pool. Returns `None`
+    /// when `host_ptr_pool_or_init` has not yet been called or initialisation
+    /// failed.
+    pub fn host_ptr_pool_get(&self) -> Option<Arc<host_ptr_pool::HostPtrPool>> {
+        self.host_ptr_pool.get().and_then(|opt| opt.clone())
     }
 }
 

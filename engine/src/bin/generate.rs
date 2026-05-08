@@ -896,6 +896,32 @@ struct Args {
     /// promote to production. See plan/compiled-chasing-hopper.md.
     #[arg(long, default_value_t = false)]
     swap_async_dispatch: bool,
+
+    /// LISWAP-3 prototype (Direction A): use a `CL_MEM_ALLOC_HOST_PTR` slot
+    /// pool for swap weight upload. Bypasses the driver staging copy by
+    /// running `clEnqueueMapBuffer(MAP_WRITE) → memcpy → Unmap` on a
+    /// pre-allocated zero-copy slot.
+    ///
+    /// **Default OFF**. Requires `LLMRS_OPENCL_HOST_PTR_POOL=1` env-gate
+    /// in addition to this flag — the env hard-disables the pool path
+    /// independently so the flag alone is insufficient (Stage 4
+    /// measurement-driven decision pending).
+    ///
+    /// Compatible with `--swap-incremental-per-tick > 0` and standalone
+    /// (single-shot `--force-swap-ratio`). Falls back to the staging path
+    /// when slots are exhausted, the env-gate is unset, the backend is
+    /// not OpenCL, or pool init fails. Plan: `compiled-chasing-hopper.md`
+    /// Direction A track, Stage 3.
+    #[arg(long, default_value_t = false)]
+    swap_zero_copy: bool,
+
+    /// LISWAP-3 prototype: number of slots in the `CL_MEM_ALLOC_HOST_PTR`
+    /// swap pool. Stage 2 measurement on Galaxy S25 (Qwen2.5-1.5B, 28
+    /// layers, 7 Q4_0 tensors per layer) reported a sweet spot at 14
+    /// slots (= 2 layers worth of in-flight work). Effective only with
+    /// `--swap-zero-copy` + `LLMRS_OPENCL_HOST_PTR_POOL=1`.
+    #[arg(long, default_value_t = 14)]
+    swap_pool_slots: usize,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -2474,6 +2500,55 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // ── LISWAP-3 prototype (Direction A): ALLOC_HOST_PTR pool ────────────
+    // Lazy-init the swap pool when the user opted in via `--swap-zero-copy`
+    // AND the env-gate `LLMRS_OPENCL_HOST_PTR_POOL=1` is set. Both conditions
+    // are required so the flag alone cannot accidentally enable the
+    // prototype path. SwapExecutor falls back to the staging path on `None`.
+    // Plan: compiled-chasing-hopper.md Direction A track, Stage 3.
+    #[cfg(feature = "opencl")]
+    let host_ptr_swap_pool: Option<Arc<llm_rs2::backend::opencl::host_ptr_pool::HostPtrPool>> = {
+        if !args.swap_zero_copy {
+            None
+        } else if let Some(gpu_be) = gpu_backend_arc.as_ref().and_then(|b| {
+            b.as_any()
+                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+        }) {
+            let cfg = llm_rs2::backend::opencl::host_ptr_pool::HostPtrPoolConfig {
+                n_slots: args.swap_pool_slots.max(1),
+                ..Default::default()
+            };
+            let pool = gpu_be.host_ptr_pool_or_init(cfg);
+            if pool.is_some() {
+                eprintln!(
+                    "[LISWAP-3] host_ptr_pool active: slots={}, max_tensor_size={}",
+                    cfg.n_slots, cfg.max_tensor_size
+                );
+            } else {
+                eprintln!(
+                    "[LISWAP-3] --swap-zero-copy requested but pool unavailable \
+                     (env LLMRS_OPENCL_HOST_PTR_POOL not set or pool init failed); \
+                     using staging path"
+                );
+            }
+            pool
+        } else {
+            eprintln!(
+                "[LISWAP-3] --swap-zero-copy ignored: backend is not OpenCL; using staging path"
+            );
+            None
+        }
+    };
+    #[cfg(not(feature = "opencl"))]
+    let _host_ptr_swap_pool: Option<()> = {
+        if args.swap_zero_copy {
+            eprintln!(
+                "[LISWAP-3] --swap-zero-copy ignored: opencl feature is disabled in this build"
+            );
+        }
+        None
+    };
+
     if args.qcf_dump.is_none()
         && let Some(ratio) = args.force_swap_ratio
     {
@@ -2510,6 +2585,8 @@ fn main() -> anyhow::Result<()> {
                 gpu_backend_arc.as_ref(),
                 &cpu_backend_arc,
                 None,
+                #[cfg(feature = "opencl")]
+                host_ptr_swap_pool.clone(),
             ) {
                 Ok(report) => {
                     eprintln!(
@@ -5192,6 +5269,8 @@ fn main() -> anyhow::Result<()> {
                         gpu_backend_arc.as_ref(),
                         &cpu_backend_arc,
                         async_swap_dispatcher.as_ref(),
+                        #[cfg(feature = "opencl")]
+                        host_ptr_swap_pool.clone(),
                     ) {
                         Ok(report) => {
                             eprintln!(
@@ -6947,12 +7026,16 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
 /// (only currently-supported swap dtype, INV-126). Resolves the swap backend
 /// to GPU when available, otherwise CPU — matches the original logic that
 /// `SwapExecutor` branches on `backend.name()` to pick the AUF SOA fast path.
+#[allow(clippy::too_many_arguments)]
 fn run_layer_swap(
     model: &llm_rs2::models::transformer::TransformerModel,
     target_layers: &[usize],
     gpu_backend: Option<&Arc<dyn Backend>>,
     cpu_backend: &Arc<dyn Backend>,
     async_dispatcher: Option<&llm_rs2::models::weights::AsyncSwapDispatcher>,
+    #[cfg(feature = "opencl")] host_ptr_pool: Option<
+        Arc<llm_rs2::backend::opencl::host_ptr_pool::HostPtrPool>,
+    >,
 ) -> Result<llm_rs2::models::weights::SwapReport, llm_rs2::models::weights::SwapError> {
     let swap_memory = Galloc::new();
     let swap_backend: Arc<dyn Backend> =
@@ -6966,6 +7049,13 @@ fn run_layer_swap(
         &swap_memory,
         Arc::clone(&model.release_worker),
     );
+    // LISWAP-3 prototype: if a host_ptr pool is supplied, attach it so the
+    // AOS materialise path uses the zero-copy slot pool.
+    #[cfg(feature = "opencl")]
+    let executor = match host_ptr_pool {
+        Some(pool) => executor.with_host_ptr_pool(pool),
+        None => executor,
+    };
     executor.execute_on_slots(
         model.layers.as_slice(),
         model.secondary_mmap.as_ref(),
@@ -7123,6 +7213,10 @@ fn run_qcf_warmup_workflow(
                 gpu_backend,
                 cpu_backend,
                 None,
+                // LISWAP-3: QCF dump path does not exercise the pool yet —
+                // Stage 3 prototype only wires --force-swap-ratio paths.
+                #[cfg(feature = "opencl")]
+                None,
             )
             .map_err(|e| anyhow::anyhow!("[QCF-dump]{} swap failed: {}", log_prefix, e))?;
             eprintln!(
@@ -7216,6 +7310,10 @@ fn dispatch_swap_weights(
         &decision.selected_layers,
         gpu_backend,
         cpu_backend,
+        None,
+        // LISWAP-3: signal-driven dispatch path does not exercise the
+        // pool yet — Stage 3 prototype only wires --force-swap-ratio paths.
+        #[cfg(feature = "opencl")]
         None,
     ) {
         Ok(report) => {

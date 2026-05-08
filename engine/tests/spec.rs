@@ -268,3 +268,9 @@ mod test_inv_146_tick_batch_equivalence;
 // sync path: backward-compat (기존 `backend.synchronize()` gate 유지).
 #[path = "spec/test_async_swap_executor.rs"]
 mod test_async_swap_executor;
+
+// ── LISWAP-3 — HostPtrPool slot lifecycle (Direction A, Stage 3 prototype) ──
+// `CL_MEM_ALLOC_HOST_PTR` 슬롯 풀 생성/획득/해제 + fill round-trip.
+// Plan: compiled-chasing-hopper.md Direction A 트랙. spec ID 미발급.
+#[path = "spec/test_host_ptr_pool.rs"]
+mod test_host_ptr_pool;
