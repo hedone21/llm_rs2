@@ -34,7 +34,12 @@ pub struct WeightSwapModelRef {
     /// these slots (via `TransformerModel::layers`), so the Arc keeps the
     /// backing data alive even after a swap until all in-flight forwards
     /// complete (INV-121/INV-123).
-    pub layers: Arc<Vec<LayerSlot>>,
+    ///
+    /// LISWAP-2 Phase 6.1: each slot is itself wrapped in `Arc<LayerSlot>`
+    /// so that the async swap dispatcher (Phase 6.2) can take ownership of
+    /// a slot handle across thread boundaries.  Forward / handler paths
+    /// transparently use `Arc::deref` on the inner slot.
+    pub layers: Arc<Vec<Arc<LayerSlot>>>,
     /// Secondary GGUF handle. `None` disables the swap path (ENG-DAT-C09).
     pub secondary_mmap: Option<Arc<SecondaryMmap>>,
     /// Global swap generation counter shared with `TransformerModel`.

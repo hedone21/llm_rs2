@@ -358,7 +358,7 @@ impl<'a> SwapExecutor<'a> {
     /// original synchronous path runs unchanged (backward-compatible).
     pub fn execute_on_slots(
         &self,
-        layers: &[LayerSlot],
+        layers: &[Arc<LayerSlot>],
         secondary_mmap: Option<&Arc<crate::models::weights::SecondaryMmap>>,
         ratio_generation: &Arc<std::sync::atomic::AtomicU64>,
         target_layers: &[usize],
@@ -452,13 +452,13 @@ impl<'a> SwapExecutor<'a> {
                 // gates each commit — replacing the single `backend.synchronize()`
                 // full-barrier (INV-142) that the sync path uses.
                 //
-                // Full background-thread commit (dispatcher.submit_commit) requires
-                // `Arc<LayerSlot>`, which is not available from the current
-                // `&[LayerSlot]` parameter. That upgrade lands in Phase 4 when
-                // `TransformerModel.layers` is restructured to `Vec<Arc<LayerSlot>>`.
-                // Until then the `async_dispatcher` argument is accepted for
-                // interface compatibility and used to signal that async mode is
-                // active (affects stage-gate behaviour only).
+                // Full background-thread commit (`dispatcher.submit_commit`)
+                // is not yet activated — Phase 6.1 migrated `model.layers` to
+                // `Vec<Arc<LayerSlot>>` (so the dispatcher *can* take ownership
+                // of a slot handle), but flipping the actual handoff lands in
+                // Phase 6.2.  Until then the `async_dispatcher` argument is
+                // accepted for interface compatibility and used to signal that
+                // async mode is active (affects stage-gate behaviour only).
                 //
                 // Stage (a): enqueue H2D writes on the transfer queue/stream.
                 let t_a0 = Instant::now();

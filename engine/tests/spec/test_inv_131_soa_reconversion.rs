@@ -458,8 +458,8 @@ fn test_inv_131_non_adreno_backend_noop() {
     let executor = SwapExecutor::new(DType::Q4_0, &config, be_dyn.clone(), &memory);
 
     // 빈 layer 집합으로 실행 — secondary 없으므로 swap 발생하지 않음.
-    let layers: Vec<LayerSlot> = (0..4)
-        .map(|_| LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None))
+    let layers: Vec<Arc<LayerSlot>> = (0..4)
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None)))
         .collect();
     let ratio_gen = Arc::new(AtomicU64::new(0));
 

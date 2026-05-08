@@ -157,7 +157,10 @@ pub fn load_model(
     // 1. Load layers as `LayerSlot`s. Each slot wraps the initial
     //    `TransformerLayer` snapshot behind an `ArcSwap` so Phase 2 can swap
     //    it atomically (ENG-DAT-092, INV-123).
-    let mut layers: Vec<LayerSlot> = Vec::with_capacity(num_layers);
+    // LISWAP-2 Phase 6.1: wrap each LayerSlot in Arc so the async swap
+    // dispatcher (Phase 6.2) can take ownership of a slot handle across
+    // thread boundaries.  Forward path uses Arc::deref transparently.
+    let mut layers: Vec<Arc<LayerSlot>> = Vec::with_capacity(num_layers);
     for i in 0..num_layers {
         let load_weight = |kind: LayerWeightKind| -> Result<Tensor> {
             source.load_tensor(
@@ -273,7 +276,11 @@ pub fn load_model(
         // weight dtype). Secondary handle is cloned into the slot so the
         // Phase 2 `SwapExecutor` can locate per-layer tensor bytes without
         // touching the root container.
-        layers.push(LayerSlot::new(layer, weight_dtype, secondary_mmap.clone()));
+        layers.push(Arc::new(LayerSlot::new(
+            layer,
+            weight_dtype,
+            secondary_mmap.clone(),
+        )));
     }
 
     // 2. Embed tokens (always CPU)

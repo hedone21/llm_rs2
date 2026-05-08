@@ -70,7 +70,13 @@ pub struct TransformerModel {
     /// snapshot per layer (INV-123). Mutation (partition install, backend
     /// migration) uses `LayerSlot::rcu_weights` to clone-and-install atomically.
     /// Spec: ENG-DAT-093.
-    pub layers: Vec<LayerSlot>,
+    ///
+    /// LISWAP-2 Phase 6.1 (prototype): layers are now wrapped in `Arc` so that
+    /// `AsyncSwapDispatcher::submit_commit` can take ownership of a slot handle
+    /// across thread boundaries (Phase 6.2 will activate the dispatcher path).
+    /// The forward / mutation surface is unchanged thanks to `Arc::deref` on
+    /// `LayerSlot`.
+    pub layers: Vec<Arc<LayerSlot>>,
     /// Optional secondary GGUF handle retained for the entire model lifetime
     /// (INV-125). `None` means the dynamic-swap path is disabled.
     /// Phase 1 only populates and keeps the handle alive; Phase 2

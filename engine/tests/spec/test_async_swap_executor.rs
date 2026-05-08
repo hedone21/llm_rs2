@@ -198,9 +198,9 @@ fn dummy_layer(be: &Arc<dyn Backend>) -> llm_rs2::layers::transformer_layer::Tra
     }
 }
 
-fn make_layers(be: &Arc<dyn Backend>, n: usize) -> Vec<LayerSlot> {
+fn make_layers(be: &Arc<dyn Backend>, n: usize) -> Vec<Arc<LayerSlot>> {
     (0..n)
-        .map(|_| LayerSlot::new(dummy_layer(be), DType::F16, None))
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(be), DType::F16, None)))
         .collect()
 }
 
@@ -227,7 +227,11 @@ fn test_sync_path_unchanged_with_none_dispatcher() {
 
     assert!(report.swapped.is_empty(), "no secondary → no swaps");
     assert_eq!(mock.synchronize_count(), 0, "no swap → no synchronize");
-    assert_eq!(mock.wait_event_count(), 0, "sync path never calls wait_event_blocking");
+    assert_eq!(
+        mock.wait_event_count(),
+        0,
+        "sync path never calls wait_event_blocking"
+    );
     assert_eq!(ratio_gen.load(Ordering::SeqCst), 0, "no bump without swap");
 }
 
@@ -397,8 +401,14 @@ fn test_stage_breakdown_log_line_format() {
     };
     let line = bd.to_log_line();
     assert!(line.contains("prefault="), "must contain prefault field");
-    assert!(line.contains("mmap_permute="), "must contain mmap_permute field");
-    assert!(line.contains("synchronize="), "must contain synchronize field");
+    assert!(
+        line.contains("mmap_permute="),
+        "must contain mmap_permute field"
+    );
+    assert!(
+        line.contains("synchronize="),
+        "must contain synchronize field"
+    );
     assert!(line.contains("gen_bump="), "must contain gen_bump field");
     // Verify zero values are recorded correctly in async mode (0.0ms).
     assert!(
