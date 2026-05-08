@@ -18,6 +18,10 @@
 //!   calls (lazy-init contract).
 //! - **G**: a pool slot can be filled via `fill_host_ptr_buffer` and the
 //!   bytes are GPU-visible (read back via `clEnqueueReadBuffer`).
+//! - **H** (Stage 4 fix): `get_cl_mem` accepts a `HostPtrPoolBuffer` and
+//!   returns `Ok` — fixes the "Unknown" dispatch error on zerocopy decode.
+//! - **I** (Stage 4 fix): `buffer_kind_label` returns `"HostPtrPool"` for
+//!   a `HostPtrPoolBuffer`.
 
 #![cfg(feature = "opencl")]
 
@@ -27,6 +31,9 @@ use llm_rs2::backend::opencl::OpenCLBackend;
 use llm_rs2::backend::opencl::host_ptr_pool::{
     HostPtrPool, HostPtrPoolConfig, host_ptr_pool_env_enabled,
 };
+use llm_rs2::backend::opencl::{buffer_kind_label, get_cl_mem};
+use llm_rs2::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer;
+use llm_rs2::core::buffer::DType;
 
 /// Try to bring up an OpenCL backend, returning `None` if the driver is
 /// unavailable. Mirrors the pattern in `core::backend::tests`.
@@ -228,4 +235,51 @@ fn test_g_fill_host_ptr_buffer_byte_equal_readback() {
         .expect("read_buffer must succeed");
     }
     assert_eq!(dst, src, "ALLOC_HOST_PTR fill must be byte-equal to source");
+}
+
+/// Stage 4 fix — H: `get_cl_mem` must recognise a `HostPtrPoolBuffer` and
+/// return `Ok(&Mem)` instead of the `"Unknown"` error that caused all
+/// zerocopy decode steps to fail before this fix.
+#[test]
+fn test_get_cl_mem_for_host_ptr_pool_buffer() {
+    let Some(backend) = try_init_backend() else {
+        return;
+    };
+    let cfg = HostPtrPoolConfig {
+        n_slots: 1,
+        max_tensor_size: 4096,
+    };
+    let pool = Arc::new(HostPtrPool::new(&backend, cfg).expect("pool construction"));
+    let guard = pool.acquire(1024).expect("acquire slot");
+    let buf = HostPtrPoolBuffer::new(guard, 1024, DType::F32, None);
+
+    let result = get_cl_mem(&buf);
+    assert!(
+        result.is_ok(),
+        "get_cl_mem must accept HostPtrPoolBuffer; got: {:?}",
+        result.err()
+    );
+}
+
+/// Stage 4 fix — I: `buffer_kind_label` must return `"HostPtrPool"` for a
+/// `HostPtrPoolBuffer` so that diagnostic messages clearly identify the
+/// pool-backed path rather than falling through to `"Unknown"`.
+#[test]
+fn test_buffer_kind_label_for_host_ptr_pool_buffer() {
+    let Some(backend) = try_init_backend() else {
+        return;
+    };
+    let cfg = HostPtrPoolConfig {
+        n_slots: 1,
+        max_tensor_size: 4096,
+    };
+    let pool = Arc::new(HostPtrPool::new(&backend, cfg).expect("pool construction"));
+    let guard = pool.acquire(1024).expect("acquire slot");
+    let buf = HostPtrPoolBuffer::new(guard, 1024, DType::F32, None);
+
+    let label = buffer_kind_label(&buf);
+    assert_eq!(
+        label, "HostPtrPool",
+        "buffer_kind_label must return \"HostPtrPool\" for HostPtrPoolBuffer"
+    );
 }

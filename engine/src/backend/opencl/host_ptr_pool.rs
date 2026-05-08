@@ -111,6 +111,13 @@ impl HostPtrPool {
             return Err(anyhow!("HostPtrPool: max_tensor_size must be > 0"));
         }
         let mut slots: Vec<HostPtrPoolEntry> = Vec::with_capacity(config.n_slots);
+        // NIT-1: one zero-byte prefault per slot — forces the driver's lazy
+        // init (VMA + pinned-page allocation on Adreno UMA) off the hot path.
+        // Measured effect on Galaxy S25: single-shot zero-copy first-touch
+        // 73 ms → 2.7 ms (matches the staging baseline).  The dummy byte is
+        // overwritten before any real data is read, so correctness is
+        // unaffected.
+        let prefault_byte: u8 = 0;
         for slot_idx in 0..config.n_slots {
             let mem = backend
                 .alloc_host_ptr_buffer_empty(config.max_tensor_size)
@@ -120,6 +127,13 @@ impl HostPtrPool {
                         config.max_tensor_size
                     )
                 })?;
+            // SAFETY: `&prefault_byte` is valid for 1 byte; `mem` is an
+            // ALLOC_HOST_PTR buffer of `max_tensor_size` bytes (>= 1).
+            unsafe {
+                if let Err(e) = backend.fill_host_ptr_buffer(&mem, &prefault_byte as *const u8, 1) {
+                    log::warn!("HostPtrPool: slot {slot_idx} prefault failed (non-fatal): {e}");
+                }
+            }
             slots.push(HostPtrPoolEntry {
                 mem,
                 capacity: config.max_tensor_size,

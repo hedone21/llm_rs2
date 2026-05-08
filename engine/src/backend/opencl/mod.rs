@@ -158,6 +158,16 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     {
         return Ok(ns.d_buf());
     }
+    // HostPtrPoolBuffer (Direction A Stage 3 zero-copy pool slot —
+    // CL_MEM_ALLOC_HOST_PTR, filled via map/memcpy/unmap before use).
+    if let Some(pp) = buf
+        .as_any()
+        .downcast_ref::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>()
+    {
+        return pp
+            .cl_mem()
+            .ok_or_else(|| anyhow!("HostPtrPoolBuffer: cl_mem is None (unexpected)"));
+    }
     Err(anyhow!("Buffer is not an OpenCL buffer type"))
 }
 
@@ -191,6 +201,8 @@ pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
         "MmapBuffer"
     } else if any.is::<crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer>() {
         "BorrowedMmapBuffer"
+    } else if any.is::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
+        "HostPtrPool"
     } else {
         "Unknown"
     }
