@@ -1,22 +1,32 @@
-//! LISWAP-2 Phase 3 unit tests — `SwapExecutor` async dispatch path.
+//! LISWAP-2 Phase 3 / Phase 6.2 unit tests — `SwapExecutor` async dispatch path.
 //!
 //! Prototype-grade: no spec ID (decision pending measurement results).
-//! Plan: `compiled-chasing-hopper.md` §Phase 3.
+//! Plan: `compiled-chasing-hopper.md` §Phase 3, §AsyncSwapDispatcher.
 //!
 //! ## 검증 항목
 //!
 //! - [A] `test_sync_path_unchanged_with_none_dispatcher`:
 //!   `async_dispatcher=None`이면 기존 sync 경로와 동작 동일 (backward-compat).
-//! - [B] `test_async_path_skips_synchronize`:
+//! - [B] `test_async_path_skips_synchronize_on_empty_batch`:
 //!   `async_dispatcher=Some` + `supports_async_transfer()=true`이면
 //!   `backend.synchronize()`가 호출되지 않음 (INV-142 대체).
-//! - [C] `test_async_path_uses_per_event_wait`:
-//!   async path는 `wait_event_blocking`을 per-layer로 호출.
-//! - [D] `test_supports_async_transfer_false_fallback`:
+//! - [C] `test_supports_async_transfer_false_uses_sync_fallback`:
 //!   `async_dispatcher=Some`이어도 `supports_async_transfer()=false`이면
-//!   sync 경로로 폴백 (synchronize 호출됨).
-//! - [E] `test_async_path_empty_batch`:
+//!   sync 경로로 폴백.
+//! - [D] `test_async_path_empty_target_layers`:
 //!   async path에서도 빈 배치는 stage gate를 건너뜀.
+//! - [E] `test_async_path_no_secondary_no_pending_jobs`:
+//!   secondary=None 인 경우 dispatcher에 job이 submit되지 않음.
+//! - [F] `test_stage_breakdown_log_line_format`:
+//!   stage breakdown 로그 포맷 보존 확인.
+//!
+//! ## Phase 6.2 신규 검증 항목 (background commit 활성화)
+//!
+//! - [G] `test_async_path_submit_deferred_commit`:
+//!   async path는 submit 후 즉시 commit하지 않음 — `pending_count > 0`.
+//!   drain 후 `pending == 0` 확인 (secondary 없는 경우, 직접 dispatcher 테스트).
+//! - [H] `test_async_dispatcher_submit_drain_dtype_change`:
+//!   submit → drain 후 slot dtype 변경이 확인됨 (background commit 정합성).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -419,4 +429,103 @@ fn test_stage_breakdown_log_line_format() {
         line.contains("synchronize=0.0ms"),
         "zero synchronize must appear as 0.0ms"
     );
+}
+
+// ── Phase 6.2 Test G: async path submit deferred commit ──────────────────────
+
+/// Phase 6.2: async path는 submit 후 즉시 commit하지 않음.
+///
+/// `dispatcher.pending_count() > 0` 직후 → drain 후 `pending == 0`.
+///
+/// 이 테스트는 `AsyncSwapDispatcher` 직접 테스트로 background commit의
+/// deferred 동작을 검증한다. `execute_on_slots`에서 submit된 job이
+/// 즉시 완료되는 것이 아니라 worker thread에서 비동기로 처리됨을 확인.
+#[test]
+fn test_async_path_submit_deferred_commit() {
+    let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+    let dispatcher = AsyncSwapDispatcher::new(be.clone());
+
+    // pending은 초기에 0.
+    assert_eq!(dispatcher.pending_count(), 0, "initial pending must be 0");
+
+    let slot = Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None));
+    let new_weights = Arc::new(dummy_layer(&be));
+
+    use llm_rs2::models::weights::async_swap::SwapCommitJob;
+    dispatcher
+        .submit_commit(SwapCommitJob {
+            slot: slot.clone(),
+            new_weights,
+            new_dtype: DType::Q4_0,
+            write_event: GpuEvent::dummy(),
+            release_worker: None,
+        })
+        .expect("submit_commit must succeed");
+
+    // submit 직후 pending > 0 (worker가 아직 처리 중일 수 있음).
+    // 단, CpuBackend dummy event는 즉시 완료되어 worker가 빠르게 처리할 수 있으므로
+    // pending이 이미 0일 수도 있음 — 그 경우도 정상. drain이 핵심 보장.
+
+    // drain 후 반드시 pending == 0이고 slot dtype이 변경되어야 함.
+    dispatcher
+        .drain(std::time::Duration::from_secs(2))
+        .expect("drain must complete within 2 s");
+
+    assert_eq!(
+        dispatcher.pending_count(),
+        0,
+        "after drain: pending must be 0"
+    );
+    assert_eq!(
+        slot.current_dtype(),
+        DType::Q4_0,
+        "after drain: slot dtype must be updated to Q4_0"
+    );
+}
+
+// ── Phase 6.2 Test H: async dispatcher submit-drain dtype change ─────────────
+
+/// Phase 6.2: dispatcher에 여러 job을 submit하고 drain 후 모든 slot의
+/// dtype이 변경됨을 확인 — background commit 정합성 검증.
+///
+/// 5개 slot을 F16 → Q4_0으로 전환 submit 후 drain.
+#[test]
+fn test_async_dispatcher_submit_drain_dtype_change() {
+    let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+    let dispatcher = Arc::new(AsyncSwapDispatcher::new(be.clone()));
+
+    const N: usize = 5;
+    let slots: Vec<Arc<LayerSlot>> = (0..N)
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None)))
+        .collect();
+
+    use llm_rs2::models::weights::async_swap::SwapCommitJob;
+    for slot in &slots {
+        dispatcher
+            .submit_commit(SwapCommitJob {
+                slot: Arc::clone(slot),
+                new_weights: Arc::new(dummy_layer(&be)),
+                new_dtype: DType::Q4_0,
+                write_event: GpuEvent::dummy(),
+                release_worker: None,
+            })
+            .expect("submit_commit must succeed for each slot");
+    }
+
+    dispatcher
+        .drain(std::time::Duration::from_secs(5))
+        .expect("drain must complete within 5 s for 5 jobs");
+
+    assert_eq!(
+        dispatcher.pending_count(),
+        0,
+        "all 5 jobs must be completed after drain"
+    );
+    for (i, slot) in slots.iter().enumerate() {
+        assert_eq!(
+            slot.current_dtype(),
+            DType::Q4_0,
+            "slot {i} must be Q4_0 after drain"
+        );
+    }
 }

@@ -443,24 +443,28 @@ impl<'a> SwapExecutor<'a> {
             let from_dtype = slot.current_dtype();
 
             if use_async {
-                // ── LISWAP-2 async path ────────────────────────────────────────
+                // ── LISWAP-2 async path — background commit activated (Phase 6.2) ──
                 //
-                // This prototype implements "async enqueue + per-event wait on
-                // main thread". The H2D upload is submitted to the backend's
-                // transfer queue/stream (concurrent with forward compute on the
-                // compute queue). A per-layer `wait_event_blocking` call then
-                // gates each commit — replacing the single `backend.synchronize()`
-                // full-barrier (INV-142) that the sync path uses.
+                // Background commit activated. See plan: compiled-chasing-hopper.md §Approach.
                 //
-                // Full background-thread commit (`dispatcher.submit_commit`)
-                // is not yet activated — Phase 6.1 migrated `model.layers` to
-                // `Vec<Arc<LayerSlot>>` (so the dispatcher *can* take ownership
-                // of a slot handle), but flipping the actual handoff lands in
-                // Phase 6.2.  Until then the `async_dispatcher` argument is
-                // accepted for interface compatibility and used to signal that
-                // async mode is active (affects stage-gate behaviour only).
+                // Phase 5 found that the prior "async enqueue + main-thread per-event wait"
+                // approach produced +1.27% on Adreno (no improvement). Root cause: main
+                // thread blocked on `wait_event_blocking` per-layer → forward and write could
+                // not overlap. Phase 6.2 removes that block entirely.
                 //
-                // Stage (a): enqueue H2D writes on the transfer queue/stream.
+                // New path:
+                //   Stage (a): enqueue H2D writes on transfer queue/stream — non-blocking.
+                //   Stage (b): hand off (slot, new_weights, event) to dispatcher worker.
+                //              Worker waits on `write_event`, then ArcSwap-commits and
+                //              chains `release_worker`. Main thread returns immediately to
+                //              the next layer (and subsequently the next forward call).
+                //
+                // Concurrency note (INV-144): forward(N+1) may start before dispatcher
+                // commits layer N. `slot.load_weights()` (ArcSwap snapshot) sees either
+                // old or new weights — both valid. Plan completion calls `drain(2s)` to
+                // guarantee all layers are fully committed before the plan is marked done.
+
+                // Stage (a): enqueue H2D writes on transfer queue/stream — non-blocking.
                 let t_a0 = Instant::now();
                 let async_result = self.build_layer_from_mmap_async(secondary, slot, layer_idx);
                 stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
@@ -468,8 +472,6 @@ impl<'a> SwapExecutor<'a> {
                 let (new_layer, write_event) = match async_result {
                     Ok(pair) => pair,
                     Err(e) => {
-                        // Async transfer failed for this layer — log and skip.
-                        // Other layers are still processed.
                         eprintln!(
                             "[AsyncSwap] layer {layer_idx}: async transfer failed: {e}; skipping"
                         );
@@ -478,39 +480,32 @@ impl<'a> SwapExecutor<'a> {
                     }
                 };
 
-                // Per-event gate: block until this layer's H2D write is
-                // GPU-visible. Unlike `synchronize()` this only waits on the
-                // transfer queue event and does not stall the compute queue.
-                if let Err(e) = self.backend.wait_event_blocking(&write_event) {
+                // Hand off to dispatcher worker. Worker waits on `write_event`,
+                // then commits arc_swap and chains primary release. Main thread
+                // returns immediately to the next layer (and subsequently the
+                // next forward call).
+                let dispatcher = async_dispatcher.expect("use_async => dispatcher Some");
+                let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+                let job = crate::models::weights::async_swap::SwapCommitJob {
+                    slot: Arc::clone(slot),
+                    new_weights: new_arc,
+                    new_dtype: self.target_dtype,
+                    write_event,
+                    release_worker: self.release_worker.clone(),
+                };
+
+                // arc_swap_ms and madvise_ms accrue inside the dispatcher worker;
+                // only record the submit latency (nanoseconds) on the main thread.
+                let t_b0 = Instant::now();
+                if let Err(e) = dispatcher.submit_commit(job) {
                     eprintln!(
-                        "[AsyncSwap] layer {layer_idx}: wait_event_blocking failed: {e}; skipping"
+                        "[AsyncSwap] layer {layer_idx}: dispatcher submit failed: {e}; skipping"
                     );
                     report.skipped.push(layer_idx);
                     continue;
                 }
-
-                let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
-
-                // Stage (b): atomic install.
-                let t_b0 = Instant::now();
-                let old = slot.swap_weights(new_arc, self.target_dtype);
                 stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
-
-                // Stage (c): primary release (same as sync path).
-                let t_c0 = Instant::now();
-                match Arc::try_unwrap(old) {
-                    Ok(layer) => {
-                        if let Some(worker) = &self.release_worker {
-                            worker.enqueue_release(layer);
-                        } else {
-                            Self::release_primary_weights(&self.backend, layer);
-                        }
-                    }
-                    Err(arc) => {
-                        Self::madvise_if_exclusive(&arc);
-                    }
-                }
-                stages.madvise_ms += t_c0.elapsed().as_secs_f64() * 1e3;
+                // madvise_ms is 0 on main thread (release chained in worker).
 
                 report.swapped.push(SwappedLayer {
                     layer_idx,
