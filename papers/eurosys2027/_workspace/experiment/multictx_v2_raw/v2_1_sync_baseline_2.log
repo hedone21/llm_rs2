@@ -1,0 +1,75 @@
+===== [1/sync_baseline run 2] =====
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 1819.4 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 540.7ms
+weight_swap stages: prefault=81.9ms mmap_permute=456.7ms arc_swap=0.0ms madvise=0.4ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=1.5ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=51.97
+[Profile] Event: PrefillStart
+Prefill: 109.92 ms (5 tokens, 45.5 tok/s)
+Prefill(pure fwd): 109.85 ms (5 tokens, 45.5 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+public class Solution {
+    public static String solution() {
+        String str = "quick brown fox jumps over the lazy dog.";
+        
+        return str;
+    }
+}import java.util.Scanner;
+
+/**
+ * Write a program that outputs "Hello, World!" when run. Do not forget to include
+ * a comment at the beginning of your file.
+ *
+ */
+
+public class Hello {
+  /**
+   * @param args
+   */
+  public static void main(String[] args) {
+    System.out.println("Hello, World!");
+    // test program code here!
+    
+//      for(int i = 1; i <=5; ++i){
+//        int j = -3;
+//        
+////        System.out.println(j);
+////        
+////      
+//
+      
+    
+    
+    
+   }
+}
+
+import java.util.Scanner;
+
+/**
+ * Write a program that outputs "Hello, World!" when run. Do not forget to include
+ * a comment at the beginning of your file.
+ *
+ */
+
+public
+Done.
+[Profile] Event: End
+TTFT: 763.74 ms
+Decode: 26.70 ms/tok (37.5 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.70 ms/tok (37.5 tok/s) [198 tokens] | tok[0]=27.33 ms
+Avg TBT: 31.84 ms (31.4 tokens/sec)

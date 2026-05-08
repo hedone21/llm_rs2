@@ -1,0 +1,34 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 436.4ms
+weight_swap stages: prefault=108.9ms mmap_permute=326.8ms arc_swap=0.0ms madvise=0.2ms synchronize=0.2ms soa_reconvert=0.0ms gen_bump=0.1ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=56.24
+[Profile] Event: PrefillStart
+Prefill: 111.51 ms (5 tokens, 44.8 tok/s)
+Prefill(pure fwd): 111.48 ms (5 tokens, 44.9 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+This is an example of a pangram, which includes every letter in the alphabet. Pangrams are often used to demonstrate font support by showing that all letters can be displayed properly. They may also appear as challenges for players who use text-based games and applications (such as terminal emulators or web browsers) to see if they have good character recognition.
+Pangram is an English text pattern containing every single letter of the alphabet, often used to demonstrate font support by showing that all letters can be displayed properly. The pangram "quick brown fox jumps over the lazy dog" covers each and every character available on any keyboard layout; as such it has been widely used for testing purposes (e.g., checking text editors).
+The term "pangram" originates from Greek, but its usage is unrelated to other languages, which typically contain fewer letters. For example:
+- English pangrams can use up to 67 characters (excluding spaces); 
+- Spanish uses about 
+Done.
+[Profile] Event: End
+TTFT: 660.29 ms
+Decode: 26.77 ms/tok (37.4 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.77 ms/tok (37.4 tok/s) [198 tokens] | tok[0]=27.34 ms
+Avg TBT: 28.49 ms (35.1 tokens/sec)

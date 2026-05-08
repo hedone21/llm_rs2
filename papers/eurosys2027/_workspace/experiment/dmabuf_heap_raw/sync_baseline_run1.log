@@ -1,0 +1,23 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The 'fox' is moved to a different position in this sentence.
+Sure, if you were referring to moving "fox" to a different position in that sentence:
+
+Original: "The quick brown fox jumps over the lazy dog."
+Moved: "Jumps over the fox." (This moves it from first place [before 'the']).
+Or:
+Moved: "The fox jumps over." (This moves it from second place [after 'over']).
+However, if you're looking to move just one word around, that can be done. For instance:
+
+Original: "The quick brown fox jumps over the lazy dog."
+Moved: "Dog the over lazy quick brown Jumps ." (This creates a sentence with an unusual order but still makes sense). 
+Or:
+Moved: "Jumps The dog." (This also creates a different sentence, although it is not as readable or meaningful).
+
+So you can either make your sentences easier to understand or play with words in fun
+Done.
+[Profile] Event: End
+TTFT: 772.59 ms
+Decode: 26.68 ms/tok (37.5 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.67 ms/tok (37.5 tok/s) [198 tokens] | tok[0]=27.50 ms
+Avg TBT: 30.06 ms (33.3 tokens/sec)

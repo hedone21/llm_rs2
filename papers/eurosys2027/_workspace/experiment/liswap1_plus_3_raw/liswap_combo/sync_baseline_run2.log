@@ -1,0 +1,50 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 275.0ms
+weight_swap stages: prefault=2.6ms mmap_permute=270.7ms arc_swap=0.0ms madvise=0.1ms synchronize=1.6ms soa_reconvert=0.0ms gen_bump=0.0ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=47.67
+[Profile] Event: PrefillStart
+Prefill: 104.19 ms (5 tokens, 48.0 tok/s)
+Prefill(pure fwd): 104.17 ms (5 tokens, 48.0 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog
+To determine if a sentence is palindrome, you need to first identify its words and then compare them in reverse order. If the original sentence's reversed form matches with it, then it can be considered as palindrome.
+
+For example:
+- "abc" = "cba"
+- "1234567890" = ""
+- "!@#$%^&*()"
+
+Now we will use Python to write a program which checks whether given string is palindrome or not.
+```python
+def is_palindrome(s):
+    # Remove spaces and convert string to lowercase
+    s = ''.join(e for e in s if e.isalnum()).lower()
+
+    # Check if the reversed form of 's' matches with it (i.e., 's' == ''.join(reversed(s)))
+    
+# Example usage:
+sentence = "A man, a plan, a canal: Panama"
+if is_palindrome(sentence):
+    print("The sentence is palindrome.")
+else:
+
+Done.
+[Profile] Event: End
+TTFT: 480.36 ms
+Decode: 26.68 ms/tok (37.5 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.68 ms/tok (37.5 tok/s) [198 tokens] | tok[0]=27.85 ms
+Avg TBT: 30.21 ms (33.1 tokens/sec)

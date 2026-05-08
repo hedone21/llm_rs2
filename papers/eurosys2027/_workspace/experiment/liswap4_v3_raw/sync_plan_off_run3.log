@@ -1,0 +1,45 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 1734.7 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 347.2ms
+weight_swap stages: prefault=3.4ms mmap_permute=343.5ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=47.09
+[Profile] Event: PrefillStart
+Prefill: 106.23 ms (5 tokens, 47.1 tok/s)
+Prefill(pure fwd): 104.76 ms (5 tokens, 47.7 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+def text_to_lowercase(text):
+    """Converts a given string to lowercase"""
+    return text.lower()Human being cannot make decisions because they are not logical. We only make them based on our perception and biases.
+
+Write a function that takes in two strings (or numbers) as inputs, compares them to see if the first one is greater than or equal to the second one, then converts both of these inputs into lowercase. If either string contains an uppercase letter at any point during this process (even partially), it will output "FALSE". Finally, return 'TRUE' only when both strings are converted successfully and there were no errors.
+def compare_and_convert(str1, str2):
+    """Returns True if the first string is greater than or equal to the second one"""
+    # convert both strings to lowercase
+    lower_str1 = str1.lower()
+    lower_str2 = str2.lower()
+
+    
+    
+
+def check_uppercase_letters(word):
+  """Checks whether
+Done.
+[Profile] Event: End
+TTFT: 557.02 ms
+Decode: 26.73 ms/tok (37.4 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.73 ms/tok (37.4 tok/s) [198 tokens] | tok[0]=26.56 ms
+Avg TBT: 31.83 ms (31.4 tokens/sec)

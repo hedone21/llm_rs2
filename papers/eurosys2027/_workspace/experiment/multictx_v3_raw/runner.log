@@ -1,0 +1,129 @@
+=== v3 multi-context swap measurements ===
+started: Fri May  8 09:12:04 PM KST 2026
+>>> [1/sync_baseline run 1] 21:12:04
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 33.00 ms/tok (30.3 tok/s) [198 tokens] | tok[0]=48.47 ms
+Avg TBT: 43.31 ms (23.1 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [1/sync_baseline run 2] 21:12:28
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 28.13 ms/tok (35.6 tok/s) [198 tokens] | tok[0]=48.71 ms
+Avg TBT: 38.88 ms (25.7 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [1/sync_baseline run 3] 21:12:52
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 33.15 ms/tok (30.2 tok/s) [198 tokens] | tok[0]=57.66 ms
+Avg TBT: 44.69 ms (22.4 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [2/liswap1_3_singlectx run 1] 21:13:19
+grep: /home/go/Workspace/llm_rs2/papers/eurosys2027/_workspace/experiment/multictx_v3_raw/v3_2_liswap1_3_singlectx_1.log: binary file matches
+   rc=0 swap_errs=0
+0
+   
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [2/liswap1_3_singlectx run 2] 21:13:48
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 49.77 ms/tok (20.1 tok/s) [198 tokens] | tok[0]=65.39 ms
+Avg TBT: 60.79 ms (16.4 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [2/liswap1_3_singlectx run 3] 21:14:17
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 28.92 ms/tok (34.6 tok/s) [198 tokens] | tok[0]=61.62 ms
+Avg TBT: 39.38 ms (25.4 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [3/liswap1_multictx run 1] 21:14:42
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 38.37 ms/tok (26.1 tok/s) [198 tokens] | tok[0]=64.44 ms
+Avg TBT: 46.50 ms (21.5 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [3/liswap1_multictx run 2] 21:15:09
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 41.37 ms/tok (24.2 tok/s) [198 tokens] | tok[0]=69.15 ms
+Avg TBT: 52.62 ms (19.0 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [3/liswap1_multictx run 3] 21:15:39
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 42.65 ms/tok (23.4 tok/s) [198 tokens] | tok[0]=88.17 ms
+Avg TBT: 54.09 ms (18.5 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [4/liswap1_multictx_sync run 1] 21:16:09
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 44.20 ms/tok (22.6 tok/s) [198 tokens] | tok[0]=72.30 ms
+Avg TBT: 55.88 ms (17.9 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [4/liswap1_multictx_sync run 2] 21:16:38
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 28.04 ms/tok (35.7 tok/s) [198 tokens] | tok[0]=48.75 ms
+Avg TBT: 38.70 ms (25.8 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [4/liswap1_multictx_sync run 3] 21:17:04
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 32.70 ms/tok (30.6 tok/s) [198 tokens] | tok[0]=72.80 ms
+Avg TBT: 43.98 ms (22.7 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [5/liswap1_multictx_skipfinish run 1] 21:17:31
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 38.05 ms/tok (26.3 tok/s) [198 tokens] | tok[0]=75.90 ms
+Avg TBT: 49.15 ms (20.3 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [5/liswap1_multictx_skipfinish run 2] 21:18:00
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 41.96 ms/tok (23.8 tok/s) [198 tokens] | tok[0]=69.77 ms
+Avg TBT: 53.64 ms (18.6 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [5/liswap1_multictx_skipfinish run 3] 21:18:29
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 28.06 ms/tok (35.6 tok/s) [198 tokens] | tok[0]=48.48 ms
+Avg TBT: 38.30 ms (26.1 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [6/liswap1_multictx_full run 1] 21:18:54
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 35.79 ms/tok (27.9 tok/s) [198 tokens] | tok[0]=70.77 ms
+Avg TBT: 47.24 ms (21.2 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [6/liswap1_multictx_full run 2] 21:19:21
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 41.05 ms/tok (24.4 tok/s) [198 tokens] | tok[0]=80.87 ms
+Avg TBT: 52.82 ms (18.9 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+>>> [6/liswap1_multictx_full run 3] 21:19:50
+   rc=0 swap_errs=0
+0
+   Decode(excl tok[0]): 28.02 ms/tok (35.7 tok/s) [198 tokens] | tok[0]=48.62 ms
+Avg TBT: 38.71 ms (25.8 tokens/sec)
+/tmp/run_v3_measurements.sh: line 30: [: 0
+0: integer expected
+=== all done Fri May  8 09:20:17 PM KST 2026 ===

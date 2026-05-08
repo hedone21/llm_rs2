@@ -1,0 +1,154 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] OpenCL Platform: QUALCOMM Snapdragon(TM)
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] OpenCL Device: QUALCOMM Adreno(TM) 830 (API 3.0, CL C: OpenCL C 3.0 Adreno(TM) 830)
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] Subgroup support: cl_khr_subgroups=true, cl_intel_subgroups=false
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] GPU Global Memory: 5557 MB
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] GPU Max Alloc Size: 1024 MB
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] OpenCL compiler options: -cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] simple_ops.cl compiled (subgroup path)
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32 compiled (nosub single-SG, N_DST=4 (default))
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32_l4.cl compiled (GEMV N_DST=4 for large N)
+[2026-05-08T11:01:15Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32_1row.cl compiled (single-token decode)
+[2026-05-08T11:01:16Z INFO  llm_rs2::backend::opencl] flash_attn_f32.cl compiled (BLOCK_M=64, BLOCK_N=32, DK=64)
+[2026-05-08T11:01:16Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=64)
+[2026-05-08T11:01:16Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=128, BLOCK_M=32)
+[2026-05-08T11:01:17Z INFO  llm_rs2::backend::opencl] flash_attn_f32.cl compiled (BLOCK_M=16, BLOCK_N=32, DK=256)
+[2026-05-08T11:01:17Z INFO  llm_rs2::backend::opencl] mul_mm_f16_f32_l4_lm.cl compiled (GEMM prefill F16)
+[2026-05-08T11:01:17Z INFO  llm_rs2::backend::opencl] mul_mm_f32_f32_l4_lm.cl compiled (GEMM prefill F32)
+[2026-05-08T11:01:17Z INFO  llm_rs2::backend::opencl] mul_mm_q4_0_f32_l4_lm.cl compiled (Q4_0 GEMM for prefill)
+[2026-05-08T11:01:17Z INFO  llm_rs2::backend::opencl] kivi_q2.cl compiled (KIVI Q2 dequant/scatter kernels)
+[2026-05-08T11:01:17Z INFO  llm_rs2::backend::opencl] kivi_attn.cl compiled (KIVI fused attention kernels)
+[2026-05-08T11:01:17Z WARN  llm_rs2::backend::opencl] attention_scores.cl failed to compile. Score-only kernel disabled.
+[2026-05-08T11:01:18Z INFO  llm_rs2::backend::opencl] cvt.cl compiled (Q4_0 noshuffle SOA conversion kernel)
+[2026-05-08T11:01:18Z INFO  llm_rs2::backend::opencl] cvt_q4_0_noshuffle_fused.cl compiled (ENG-ALG-226 fused SOA convert+transpose)
+[2026-05-08T11:01:18Z INFO  llm_rs2::backend::opencl] mul_mat_Ab_Bi_8x4.cl compiled (Adreno Q4_0 GEMM fast path for prefill)
+[2026-05-08T11:01:18Z INFO  llm_rs2::backend::opencl] transpose.cl compiled (activation F32→F16 transpose)
+[2026-05-08T11:01:18Z INFO  llm_rs2::backend::opencl] OpenCL kernels cached successfully
+[2026-05-08T11:01:18Z INFO  llm_rs2::backend::opencl] Memory mode: UMA/integrated (zero_copy=true)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[2026-05-08T11:01:21Z INFO  llm_rs2::models::weights::noise_table] ε calc: layer 1/28 done, avg=1.000000
+[2026-05-08T11:01:21Z INFO  llm_rs2::models::weights::noise_table] ε calc: layer 5/28 done, avg=1.000000
+[2026-05-08T11:01:21Z INFO  llm_rs2::models::weights::noise_table] ε calc: layer 9/28 done, avg=1.000000
+[2026-05-08T11:01:21Z INFO  llm_rs2::models::weights::noise_table] ε calc: layer 13/28 done, avg=1.000000
+[2026-05-08T11:01:21Z INFO  llm_rs2::models::weights::noise_table] ε calc: layer 17/28 done, avg=1.000000
+[2026-05-08T11:01:21Z INFO  llm_rs2::models::weights::noise_table] ε calc: layer 21/28 done, avg=1.000000
+[2026-05-08T11:01:22Z INFO  llm_rs2::models::weights::noise_table] ε calc: layer 25/28 done, avg=1.000000
+[2026-05-08T11:01:22Z INFO  llm_rs2::models::weights::noise_table] ε calc: layer 28/28 done, avg=1.000000
+[2026-05-08T11:01:22Z INFO  llm_rs2::models::weights::noise_table] ε calc done in 920ms, fallback=false
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 1935.9 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: incremental mode — ratio=0.90, 25 target layers, per_tick=1 (25 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=65.32
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps overPrefill: 221.48 ms (5 tokens, 22.6 tok/s)
+Prefill(pure fwd): 221.45 ms (5 tokens, 22.6 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[2026-05-08T11:01:24Z INFO  llm_rs2::backend::opencl::plan] plan: lm_head dtype Q4_0 has no GPU GEMV variant, falling back to CPU
+[2026-05-08T11:01:24Z INFO  llm_rs2::models::transformer] GPU kernel plan built (28 layers, capacity=256, q4_noshuffle=0/28)
+ the[IncrementalSwap] tick=0 chunk=[0] swapped=1 remaining=24 latency=18.1ms
+[IncrementalSwap] stages: prefault=0.6ms mmap_permute=17.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=1 chunk=[1] swapped=1 remaining=23 latency=17.4ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=17.3ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ lazy[IncrementalSwap] tick=2 chunk=[2] swapped=1 remaining=22 latency=24.1ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=15.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ dog[IncrementalSwap] tick=3 chunk=[3] swapped=1 remaining=21 latency=25.5ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=16.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+.
+
+def[IncrementalSwap] tick=4 chunk=[5] swapped=1 remaining=20 latency=24.6ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=16.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=5 chunk=[6] swapped=1 remaining=19 latency=25.5ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=16.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ count[IncrementalSwap] tick=6 chunk=[7] swapped=1 remaining=18 latency=25.6ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=16.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+_words[IncrementalSwap] tick=7 chunk=[8] swapped=1 remaining=17 latency=24.8ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=16.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+(sentence[IncrementalSwap] tick=8 chunk=[9] swapped=1 remaining=16 latency=25.6ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=17.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+):
+   [IncrementalSwap] tick=9 chunk=[10] swapped=1 remaining=15 latency=43.7ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=20.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=10 chunk=[11] swapped=1 remaining=14 latency=52.5ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=28.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ #[IncrementalSwap] tick=11 chunk=[12] swapped=1 remaining=13 latency=40.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=19.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ split[IncrementalSwap] tick=12 chunk=[14] swapped=1 remaining=12 latency=42.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=19.3ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ sentence into[IncrementalSwap] tick=13 chunk=[15] swapped=1 remaining=11 latency=40.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=19.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=14 chunk=[16] swapped=1 remaining=10 latency=43.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=19.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ words[IncrementalSwap] tick=15 chunk=[17] swapped=1 remaining=9 latency=40.3ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=19.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+
+[IncrementalSwap] tick=16 chunk=[18] swapped=1 remaining=8 latency=42.7ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=21.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+   [IncrementalSwap] tick=17 chunk=[19] swapped=1 remaining=7 latency=46.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=20.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ words[IncrementalSwap] tick=18 chunk=[20] swapped=1 remaining=6 latency=45.2ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=20.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ =[IncrementalSwap] tick=19 chunk=[21] swapped=1 remaining=5 latency=46.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=20.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ sentence[IncrementalSwap] tick=20 chunk=[22] swapped=1 remaining=4 latency=47.5ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=20.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+.split[IncrementalSwap] tick=21 chunk=[24] swapped=1 remaining=3 latency=45.7ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=24.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+()
+
+[IncrementalSwap] tick=22 chunk=[25] swapped=1 remaining=2 latency=53.8ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=23.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+   [IncrementalSwap] tick=23 chunk=[26] swapped=1 remaining=1 latency=46.5ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=23.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ #[IncrementalSwap] tick=24 chunk=[27] swapped=1 remaining=0 latency=54.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=24.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=24)
+ initialize counter to zero
+    word_count = 0
+
+    for i in range(0, len(words)):
+        if (words[i] != ''):
+            word_count += 1
+
+# return number of distinct counts 
+return int(word_count)
+
+count_words('The quick brown fox jumps over the lazy dog.')"""
+def count_words(sentence):
+    # split sentence into words
+    words = sentence.split()
+
+    # initialize counter to zero
+    word_count = 0
+
+for i in range(0, len(words)):
+    
+if (words[i] != ''):
+     word_count +=1
+
+# return number of distinct counts 
+return int(word_count)
+
+count_words('The quick brown fox jumps over the lazy dog.')
+"""from typing import List
+
+
+def count_words(sentence: str) -> int:
+    # split sentence into words
+    words =
+Done.
+[Profile] Event: End
+TTFT: 343.66 ms
+Decode: 28.16 ms/tok (35.5 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 28.06 ms/tok (35.6 tok/s) [198 tokens] | tok[0]=48.24 ms
+Avg TBT: 37.25 ms (26.8 tokens/sec)

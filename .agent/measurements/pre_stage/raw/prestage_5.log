@@ -1,0 +1,34 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/qwen2.5-1.5b.tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[PreStage] async swap dispatcher initialised — H2D will run in background
+[PreStage] dispatch issued: ratio=0.90, 25 target layers, dispatch_wall=316.9ms (synchronous portion only — actual H2D + ArcSwap commits pending in background)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=43.93
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps overPrefill: 106.50 ms (5 tokens, 46.9 tok/s)
+Prefill(pure fwd): 106.46 ms (5 tokens, 47.0 tok/s) [sync'd forward only, comparable to llama-bench pp]
+ the lazy dog.
+# This is a test comment
+"""
+This is also a comment. There are several ways to write comments in Python:
+1. The single-line comment starts with the hash (#[PreStage] drain complete: pending_before=
+Done.
+[Profile] Event: End
+TTFT: 524.48 ms
+Decode: 25.61 ms/tok (39.0 tok/s) [39 tokens, forward only]
+Decode(excl tok[0]): 25.53 ms/tok (39.2 tok/s) [38 tokens] | tok[0]=28.68 ms
+Avg TBT: 27.09 ms (36.9 tokens/sec)
+0, drain_wait=0.0ms

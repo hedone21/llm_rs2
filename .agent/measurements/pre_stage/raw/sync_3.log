@@ -1,0 +1,29 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/qwen2.5-1.5b.tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 351.1ms
+weight_swap stages: prefault=3.0ms mmap_permute=347.9ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=46.09
+[Profile] Event: PrefillStart
+Prefill: 104.51 ms (5 tokens, 47.8 tok/s)
+Prefill(pure fwd): 104.47 ms (5 tokens, 47.9 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. 2873691540 = x, where x is a number composed of all the letters from "cat" to "y". What is the
+Done.
+[Profile] Event: End
+TTFT: 556.42 ms
+Decode: 25.81 ms/tok (38.7 tok/s) [39 tokens, forward only]
+Decode(excl tok[0]): 25.76 ms/tok (38.8 tok/s) [38 tokens] | tok[0]=27.60 ms
+Avg TBT: 27.28 ms (36.7 tokens/sec)

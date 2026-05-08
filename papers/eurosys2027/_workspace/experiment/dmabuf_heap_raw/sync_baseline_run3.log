@@ -1,0 +1,19 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The words 'the' and 'over' are both capitalized because they indicate importance in a sentence (just like when you hear your teacher speak). This is not very common, but it can happen. Now for something completely different: Imagine you have 10 boxes with 25 crayons each, then if the word "the" or any other capital lettered words are found in the sentence that contains a box of crayons and these letters don't fit their context (e.g. a sentence about dogs which says 'a dog' instead of 'the dog') you can remove them from your sentences like this: - 'a' will be replaced with lowercase text but not an uppercase letter - other words are left alone.
+Sentence: "The quick brown fox jumps over the lazy dog."
+Output:
+- The
+- a
+- b
+-
+c
+
+Can you explain to me how these instructions work?
+Sure! This instruction is used to help remove certain capital
+Done.
+[Profile] Event: End
+TTFT: 586.16 ms
+Decode: 26.72 ms/tok (37.4 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.71 ms/tok (37.4 tok/s) [198 tokens] | tok[0]=27.74 ms
+Avg TBT: 31.18 ms (32.1 tokens/sec)

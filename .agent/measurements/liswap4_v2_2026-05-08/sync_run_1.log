@@ -1,0 +1,37 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 261.4ms
+weight_swap stages: prefault=2.7ms mmap_permute=256.7ms arc_swap=0.0ms madvise=0.5ms synchronize=1.5ms soa_reconvert=0.0ms gen_bump=0.0ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=49.02
+[Profile] Event: PrefillStart
+Prefill: 107.10 ms (5 tokens, 46.7 tok/s)
+Prefill(pure fwd): 107.07 ms (5 tokens, 46.7 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+def pig_latin(text):
+    # Use a list comprehension to split each word into individual letters
+    words = [letter for letter in text.split()]
+
+    # For each character, append 'ay' to the end of it if it is not a vowel (a, e,
+# i, o, u). Otherwise leave it alone.
+    latin_words = [''.join([char + 'ay' if char.lower() not in ['a', 'e', '
+Done.
+[Profile] Event: End
+TTFT: 472.86 ms
+Decode: 26.24 ms/tok (38.1 tok/s) [99 tokens, forward only]
+Decode(excl tok[0]): 26.24 ms/tok (38.1 tok/s) [98 tokens] | tok[0]=26.65 ms
+Avg TBT: 28.73 ms (34.8 tokens/sec)
+END_EXIT=0

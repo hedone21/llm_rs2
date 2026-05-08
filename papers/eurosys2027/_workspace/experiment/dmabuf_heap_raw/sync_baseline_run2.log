@@ -1,0 +1,33 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+def remove_words(wordlist, pattern):
+    # Remove all words from wordlist that are not in pattern
+    for i in range(len(pattern)):
+        if i > len(wordlist)-1:
+            break
+        if (pattern[i]) == (word[i]):
+            pass#!/usr/bin/env python3
+
+# This script finds the index of a substring within a given string and outputs it.
+# The user inputs two strings, one containing the substrings to find,
+# and another being the text where these substrings will be searched.
+
+def Find(string1, string2):
+    # Start searching for each substring in every possible place
+    for i in range(len(string1)):
+        if (string2[i]) == (string1[0]):
+            k = 0
+            j = i + len(pattern)
+        while True:
+            try:
+                if string2[j] != string1[k]:
+                    break
+
+# The main() function above is
+Done.
+[Profile] Event: End
+TTFT: 665.30 ms
+Decode: 26.51 ms/tok (37.7 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.50 ms/tok (37.7 tok/s) [198 tokens] | tok[0]=26.65 ms
+Avg TBT: 29.69 ms (33.7 tokens/sec)

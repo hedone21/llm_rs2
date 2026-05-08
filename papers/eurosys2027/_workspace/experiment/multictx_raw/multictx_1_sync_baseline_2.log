@@ -1,0 +1,36 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 1120.7 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 263.8ms
+weight_swap stages: prefault=2.7ms mmap_permute=259.0ms arc_swap=0.0ms madvise=0.5ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=1.5ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=47.15
+[Profile] Event: PrefillStart
+Prefill: 104.44 ms (5 tokens, 47.9 tok/s)
+Prefill(pure fwd): 104.41 ms (5 tokens, 47.9 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The fox is black, while the dog is brown. Both are dogs and both can jump.
+What colors do "the" two things mentioned in this sentence have?
+Both "the" thing mentions has a color - Black for Fox and Brown for Dog.
+The answer to this question is: The black fox jumps over the lazy dog which has a yellow background, brown fur, four legs with webbed toes and a big flat face.Human beings evolved from ancient apes that lived in trees. The ancestors of humans used their hands to climb through the branches of trees as they gathered food and looked for protection during attacks by predators such as lions or tigers.
+What does "ancestors" refer to?
+The ancestors are primates, who were once classified with monkeys and apes. They are the oldest group in mammals' evolutionary history. The first primates evolved from ancient apes about 35 million years ago.
+
+They have lived on Earth for over three
+Done.
+[Profile] Event: End
+TTFT: 469.34 ms
+Decode: 26.56 ms/tok (37.7 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.56 ms/tok (37.7 tok/s) [198 tokens] | tok[0]=26.52 ms
+Avg TBT: 30.88 ms (32.4 tokens/sec)

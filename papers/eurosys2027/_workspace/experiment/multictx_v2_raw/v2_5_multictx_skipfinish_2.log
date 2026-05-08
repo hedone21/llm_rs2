@@ -1,0 +1,64 @@
+===== [5/multictx_skipfinish run 2] =====
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 2145.8 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[LISWAP-3] host_ptr_pool active: slots=14, max_tensor_size=11534336
+weight_swap: incremental mode — ratio=0.90, 25 target layers, per_tick=1 (25 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=107.72
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+Prefill: 368.17 ms (5 tokens, 13.6 tok/s)
+Prefill(pure fwd): 368.09 ms (5 tokens, 13.6 tok/s) [sync'd forward only, comparable to llama-bench pp]
+The quick brown fox jumps over[IncrementalSwap] swap error on tick=0: swap layer 0: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ the[IncrementalSwap] swap error on tick=1: swap layer 1: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ lazy[IncrementalSwap] swap error on tick=2: swap layer 2: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ dog[IncrementalSwap] swap error on tick=3: swap layer 3: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+.[IncrementalSwap] swap error on tick=4: swap layer 5: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ The[IncrementalSwap] swap error on tick=5: swap layer 6: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ big[IncrementalSwap] swap error on tick=6: swap layer 7: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ white[IncrementalSwap] swap error on tick=7: swap layer 8: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ elephant[IncrementalSwap] swap error on tick=8: swap layer 9: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ jumps[IncrementalSwap] swap error on tick=9: swap layer 10: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ over the[IncrementalSwap] swap error on tick=10: swap layer 11: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+[IncrementalSwap] swap error on tick=11: swap layer 12: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ little red[IncrementalSwap] swap error on tick=12: swap layer 14: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+[IncrementalSwap] swap error on tick=13: swap layer 15: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ hen[IncrementalSwap] swap error on tick=14: swap layer 16: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+.[IncrementalSwap] swap error on tick=15: swap layer 17: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ The fast[IncrementalSwap] swap error on tick=16: swap layer 18: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+[IncrementalSwap] swap error on tick=17: swap layer 19: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ blue[IncrementalSwap] swap error on tick=18: swap layer 20: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ cat[IncrementalSwap] swap error on tick=19: swap layer 21: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ runs[IncrementalSwap] swap error on tick=20: swap layer 22: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ away[IncrementalSwap] swap error on tick=21: swap layer 24: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ from[IncrementalSwap] swap error on tick=22: swap layer 25: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ the[IncrementalSwap] swap error on tick=23: swap layer 26: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ scared[IncrementalSwap] swap error on tick=24: swap layer 27: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=24)
+ mouse.
+You are a member of our elite team and you have been assigned to test a new security system in which multiple people can pass through at one time, but also multiple things (a box, another person or an object) cannot pass at one time. Your job is to figure out how many objects there are under the given condition. The number will be 10^9 and the answer may not fit into a long integer.
+6381
+2
+The quick brown fox jumps over the lazy dog.
+The big white elephant jumps over the little red hen.
+The fast blue cat runs away from scared mouse is an example of multiple people and objects passing through at once. The correct answer would be 4, as there are four distinct things (four words) that pass through at one time.
+
+But if we were to look for a number of single entities
+Done.
+[Profile] Event: End
+TTFT: 694.73 ms
+Decode: 71.00 ms/tok (14.1 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 70.88 ms/tok (14.1 tok/s) [198 tokens] | tok[0]=94.89 ms
+Avg TBT: 77.12 ms (13.0 tokens/sec)
