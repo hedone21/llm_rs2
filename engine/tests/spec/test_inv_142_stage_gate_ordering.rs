@@ -242,7 +242,7 @@ fn empty_swap_batch_skips_stage_gate() {
 
     // Case 1: empty target_layers
     let report = executor
-        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[])
+        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[], None)
         .expect("empty target must not error");
     assert!(report.swapped.is_empty());
     assert_eq!(report.ratio_generation_after, None, "no bump on empty swap");
@@ -262,7 +262,7 @@ fn empty_swap_batch_skips_stage_gate() {
 
     // Case 2: non-empty target but secondary=None → early return
     let report = executor
-        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[0, 1])
+        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[0, 1], None)
         .expect("no secondary must not error");
     assert!(report.swapped.is_empty());
     assert!(
@@ -376,7 +376,7 @@ fn empty_batch_ordering_invariants_hold() {
 
     let executor = SwapExecutor::new(DType::Q4_0, &config, be_dyn.clone(), &memory);
     let report = executor
-        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[0])
+        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[0], None)
         .expect("no secondary must not error");
 
     // No swap happened → stage gate must be bypassed entirely.

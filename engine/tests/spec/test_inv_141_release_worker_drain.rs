@@ -257,7 +257,7 @@ fn inv_141_swap_executor_rejects_on_drain_timeout() {
 
     // Execute with no secondary mmap — normally would be a no-op, but
     // INV-141 check happens before the secondary-absent guard.
-    let result = executor.execute_on_slots(&layers, None, &ratio_gen, &[0, 1]);
+    let result = executor.execute_on_slots(&layers, None, &ratio_gen, &[0, 1], None);
 
     assert!(
         matches!(result, Err(SwapError::ReleaseDrainTimeout { .. })),

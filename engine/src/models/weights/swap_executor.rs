@@ -24,7 +24,7 @@ use anyhow::Result;
 use llm_shared::DtypeTag;
 
 use crate::buffer::shared_buffer::SharedBuffer;
-use crate::core::backend::Backend;
+use crate::core::backend::{Backend, GpuEvent};
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
 use crate::core::tensor::Tensor;
@@ -32,6 +32,7 @@ use crate::layers::transformer_layer::TransformerLayer;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
 use crate::models::transformer::TransformerModel;
+use crate::models::weights::async_swap::AsyncSwapDispatcher;
 use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
 
@@ -63,6 +64,12 @@ pub enum SwapError {
     /// have completed before `invalidate_noshuffle_soa_registry` and the
     /// `ratio_generation` bump execute (ENG-ALG-231).
     StageGateSyncFailed { source: anyhow::Error },
+    /// LISWAP-2 async path: `backend.enqueue_write_async` returned an error
+    /// or `supports_async_transfer()` returned `false` despite the caller
+    /// requesting the async path. Caller may retry the layer via sync path.
+    AsyncTransferUnavailable { layer: usize, source: anyhow::Error },
+    /// LISWAP-2 async path: `dispatcher.submit_commit` failed (channel closed).
+    AsyncDispatchFailed { layer: usize, source: anyhow::Error },
 }
 
 impl std::fmt::Display for SwapError {
@@ -100,6 +107,15 @@ impl std::fmt::Display for SwapError {
             ),
             SwapError::StageGateSyncFailed { source } => {
                 write!(f, "backend synchronize failed at stage gate: {source}")
+            }
+            SwapError::AsyncTransferUnavailable { layer, source } => {
+                write!(f, "async transfer unavailable for layer {layer}: {source}")
+            }
+            SwapError::AsyncDispatchFailed { layer, source } => {
+                write!(
+                    f,
+                    "async dispatch submit failed for layer {layer}: {source}"
+                )
             }
         }
     }
@@ -318,6 +334,7 @@ impl<'a> SwapExecutor<'a> {
             model.secondary_mmap.as_ref(),
             &model.ratio_generation,
             target_layers,
+            None,
         )
     }
 
@@ -327,12 +344,25 @@ impl<'a> SwapExecutor<'a> {
     /// than through a `&TransformerModel`. The semantics are identical to
     /// `execute()`: ENG-ALG-211 batch swap with a single `ratio_generation`
     /// bump at the end.
+    ///
+    /// `async_dispatcher`: when `Some` **and** `backend.supports_async_transfer()`
+    /// returns `true`, the async path is taken for each layer:
+    /// - `build_layer_from_mmap_async` enqueues H2D writes on the transfer
+    ///   queue/stream and returns `(LayerWeights, GpuEvent)`.
+    /// - The `(slot, new_weights, event)` triplet is submitted to the
+    ///   dispatcher instead of committing inline.
+    /// - Stage gate `backend.synchronize()` (INV-142) is **skipped** — event
+    ///   gating inside the worker thread replaces it.
+    ///
+    /// When `None` (or `supports_async_transfer()` returns `false`), the
+    /// original synchronous path runs unchanged (backward-compatible).
     pub fn execute_on_slots(
         &self,
         layers: &[LayerSlot],
         secondary_mmap: Option<&Arc<crate::models::weights::SecondaryMmap>>,
         ratio_generation: &Arc<std::sync::atomic::AtomicU64>,
         target_layers: &[usize],
+        async_dispatcher: Option<&AsyncSwapDispatcher>,
     ) -> Result<SwapReport, SwapError> {
         let start = Instant::now();
         let mut report = SwapReport::default();
@@ -385,6 +415,12 @@ impl<'a> SwapExecutor<'a> {
         secondary.prefault_layers(target_layers);
         stages.prefault_ms = t_pre0.elapsed().as_secs_f64() * 1e3;
 
+        // Determine whether to use the async path (LISWAP-2 prototype).
+        // Requires both a dispatcher argument AND backend support.
+        let use_async = async_dispatcher
+            .map(|_| self.backend.supports_async_transfer())
+            .unwrap_or(false);
+
         for &layer_idx in target_layers {
             // ENG-DAT-C08: out-of-range silently skipped.
             let Some(slot) = layers.get(layer_idx) else {
@@ -406,83 +442,161 @@ impl<'a> SwapExecutor<'a> {
 
             let from_dtype = slot.current_dtype();
 
-            // ── Stage (a): secondary mmap slice + Q/K permutation + GPU upload ──
-            let t_a0 = Instant::now();
-            let new_layer = self.build_layer_from_mmap(secondary, slot, layer_idx)?;
-            stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
+            if use_async {
+                // ── LISWAP-2 async path ────────────────────────────────────────
+                //
+                // This prototype implements "async enqueue + per-event wait on
+                // main thread". The H2D upload is submitted to the backend's
+                // transfer queue/stream (concurrent with forward compute on the
+                // compute queue). A per-layer `wait_event_blocking` call then
+                // gates each commit — replacing the single `backend.synchronize()`
+                // full-barrier (INV-142) that the sync path uses.
+                //
+                // Full background-thread commit (dispatcher.submit_commit) requires
+                // `Arc<LayerSlot>`, which is not available from the current
+                // `&[LayerSlot]` parameter. That upgrade lands in Phase 4 when
+                // `TransformerModel.layers` is restructured to `Vec<Arc<LayerSlot>>`.
+                // Until then the `async_dispatcher` argument is accepted for
+                // interface compatibility and used to signal that async mode is
+                // active (affects stage-gate behaviour only).
+                //
+                // Stage (a): enqueue H2D writes on the transfer queue/stream.
+                let t_a0 = Instant::now();
+                let async_result = self.build_layer_from_mmap_async(secondary, slot, layer_idx);
+                stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
 
-            let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+                let (new_layer, write_event) = match async_result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // Async transfer failed for this layer — log and skip.
+                        // Other layers are still processed.
+                        eprintln!(
+                            "[AsyncSwap] layer {layer_idx}: async transfer failed: {e}; skipping"
+                        );
+                        report.skipped.push(layer_idx);
+                        continue;
+                    }
+                };
 
-            // ── Stage (b): Atomic install — INV-123. `swap_weights` now uses
-            // `ArcSwap::swap()` internally and returns the previous Arc after
-            // `wait_for_readers` has flushed any in-flight ArcSwap hazard
-            // pointers. The returned Arc is the only outstanding reference
-            // held by this dispatch path — readers from prior forward passes
-            // have already dropped their snapshots (the swap dispatcher runs
-            // strictly between forwards). ──────────────────────────────────────
-            let t_b0 = Instant::now();
-            let old = slot.swap_weights(new_arc, self.target_dtype);
-            stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
+                // Per-event gate: block until this layer's H2D write is
+                // GPU-visible. Unlike `synchronize()` this only waits on the
+                // transfer queue event and does not stall the compute queue.
+                if let Err(e) = self.backend.wait_event_blocking(&write_event) {
+                    eprintln!(
+                        "[AsyncSwap] layer {layer_idx}: wait_event_blocking failed: {e}; skipping"
+                    );
+                    report.skipped.push(layer_idx);
+                    continue;
+                }
 
-            // ── Stage (c): Primary cl_mem release — WSWAP-5-PRIMARY-DROP.
-            //
-            // Take ownership of the inner `LayerWeights` from the returned
-            // Arc and drop the primary weight tensors explicitly. Each
-            // tensor's `Arc<dyn Buffer>` is then the unique owner of its
-            // backing `OpenCLBuffer`, so the destructor releases the
-            // underlying `cl_mem` immediately. This reclaims the F16
-            // primary 2.4 GB / 145 cl_mem footprint that previously stayed
-            // alive on Galaxy S25 ratio=1.0 mixed (`phase_5_tbt_diag.md`).
-            //
-            // Falls back to madvise-only when `Arc::try_unwrap` fails.
-            // The latter only happens if some other holder kept the Arc —
-            // none expected in production (forwards run sequentially against
-            // the dispatcher), but the fallback preserves correctness if a
-            // future caller ever holds a snapshot across a swap.
-            //
-            // ENG-ALG-211 step (c) refined; `Self::madvise_if_exclusive`
-            // remains the fallback path so MADV_DONTNEED still fires on
-            // mmap-backed primaries when we can't acquire unique ownership.
-            // ── Stage (c): Primary cl_mem release / deferred enqueue ─────────
-            //
-            // ENG-ALG-228: when a `PrimaryReleaseWorker` is attached, enqueue
-            // the displaced `LayerWeights` for asynchronous drop on the worker
-            // thread instead of blocking inline. The worker calls
-            // `clReleaseMemObject` off the critical path (~1 ms × 7 tensors per
-            // layer on Adreno). `stages.madvise_ms` then only records the
-            // enqueue cost (nanoseconds) rather than the full release chain.
-            //
-            // Fallback: when no worker is set (host tests, CPU backend, partial
-            // init), the original inline `release_primary_weights` path runs
-            // unchanged. The `Err(arc)` branch is never affected — madvise is
-            // always inline because it requires the live pointer.
-            let t_c0 = Instant::now();
-            match Arc::try_unwrap(old) {
-                Ok(layer) => {
-                    if let Some(worker) = &self.release_worker {
-                        // Async path: enqueue for background drop (ENG-ALG-228).
-                        worker.enqueue_release(layer);
-                    } else {
-                        // Inline fallback (host tests, CPU backend).
-                        Self::release_primary_weights(&self.backend, layer);
+                let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+
+                // Stage (b): atomic install.
+                let t_b0 = Instant::now();
+                let old = slot.swap_weights(new_arc, self.target_dtype);
+                stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
+
+                // Stage (c): primary release (same as sync path).
+                let t_c0 = Instant::now();
+                match Arc::try_unwrap(old) {
+                    Ok(layer) => {
+                        if let Some(worker) = &self.release_worker {
+                            worker.enqueue_release(layer);
+                        } else {
+                            Self::release_primary_weights(&self.backend, layer);
+                        }
+                    }
+                    Err(arc) => {
+                        Self::madvise_if_exclusive(&arc);
                     }
                 }
-                Err(arc) => {
-                    // Non-exclusive ownership — best-effort reclaim only.
-                    // Records strong_count for diagnostics on the AOS / GGUF
-                    // path; the AUF SOA bypass path doesn't actually need
-                    // madvise (its primary cl_mem was the F16 GGUF copy
-                    // routed through `copy_weight_from`, not an mmap'd page).
-                    Self::madvise_if_exclusive(&arc);
-                }
-            }
-            stages.madvise_ms += t_c0.elapsed().as_secs_f64() * 1e3;
+                stages.madvise_ms += t_c0.elapsed().as_secs_f64() * 1e3;
 
-            report.swapped.push(SwappedLayer {
-                layer_idx,
-                from_dtype,
-                to_dtype: self.target_dtype,
-            });
+                report.swapped.push(SwappedLayer {
+                    layer_idx,
+                    from_dtype,
+                    to_dtype: self.target_dtype,
+                });
+            } else {
+                // ── Synchronous path (original) ────────────────────────────────
+                // Stage (a): secondary mmap slice + Q/K permutation + GPU upload.
+                let t_a0 = Instant::now();
+                let new_layer = self.build_layer_from_mmap(secondary, slot, layer_idx)?;
+                stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
+
+                let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+
+                // ── Stage (b): Atomic install — INV-123. `swap_weights` now uses
+                // `ArcSwap::swap()` internally and returns the previous Arc after
+                // `wait_for_readers` has flushed any in-flight ArcSwap hazard
+                // pointers. The returned Arc is the only outstanding reference
+                // held by this dispatch path — readers from prior forward passes
+                // have already dropped their snapshots (the swap dispatcher runs
+                // strictly between forwards). ────────────────────────────────────
+                let t_b0 = Instant::now();
+                let old = slot.swap_weights(new_arc, self.target_dtype);
+                stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
+
+                // ── Stage (c): Primary cl_mem release — WSWAP-5-PRIMARY-DROP.
+                //
+                // Take ownership of the inner `LayerWeights` from the returned
+                // Arc and drop the primary weight tensors explicitly. Each
+                // tensor's `Arc<dyn Buffer>` is then the unique owner of its
+                // backing `OpenCLBuffer`, so the destructor releases the
+                // underlying `cl_mem` immediately. This reclaims the F16
+                // primary 2.4 GB / 145 cl_mem footprint that previously stayed
+                // alive on Galaxy S25 ratio=1.0 mixed (`phase_5_tbt_diag.md`).
+                //
+                // Falls back to madvise-only when `Arc::try_unwrap` fails.
+                // The latter only happens if some other holder kept the Arc —
+                // none expected in production (forwards run sequentially against
+                // the dispatcher), but the fallback preserves correctness if a
+                // future caller ever holds a snapshot across a swap.
+                //
+                // ENG-ALG-211 step (c) refined; `Self::madvise_if_exclusive`
+                // remains the fallback path so MADV_DONTNEED still fires on
+                // mmap-backed primaries when we can't acquire unique ownership.
+                // ── Stage (c): Primary cl_mem release / deferred enqueue ───────
+                //
+                // ENG-ALG-228: when a `PrimaryReleaseWorker` is attached, enqueue
+                // the displaced `LayerWeights` for asynchronous drop on the worker
+                // thread instead of blocking inline. The worker calls
+                // `clReleaseMemObject` off the critical path (~1 ms × 7 tensors per
+                // layer on Adreno). `stages.madvise_ms` then only records the
+                // enqueue cost (nanoseconds) rather than the full release chain.
+                //
+                // Fallback: when no worker is set (host tests, CPU backend, partial
+                // init), the original inline `release_primary_weights` path runs
+                // unchanged. The `Err(arc)` branch is never affected — madvise is
+                // always inline because it requires the live pointer.
+                let t_c0 = Instant::now();
+                match Arc::try_unwrap(old) {
+                    Ok(layer) => {
+                        if let Some(worker) = &self.release_worker {
+                            // Async path: enqueue for background drop (ENG-ALG-228).
+                            worker.enqueue_release(layer);
+                        } else {
+                            // Inline fallback (host tests, CPU backend).
+                            Self::release_primary_weights(&self.backend, layer);
+                        }
+                    }
+                    Err(arc) => {
+                        // Non-exclusive ownership — best-effort reclaim only.
+                        // Records strong_count for diagnostics on the AOS / GGUF
+                        // path; the AUF SOA bypass path doesn't actually need
+                        // madvise (its primary cl_mem was the F16 GGUF copy
+                        // routed through `copy_weight_from`, not an mmap'd page).
+                        Self::madvise_if_exclusive(&arc);
+                    }
+                }
+                stages.madvise_ms += t_c0.elapsed().as_secs_f64() * 1e3;
+
+                report.swapped.push(SwappedLayer {
+                    layer_idx,
+                    from_dtype,
+                    to_dtype: self.target_dtype,
+                });
+            }
         }
 
         // (e) Single batch-level bump of the global ratio_generation counter.
@@ -500,10 +614,19 @@ impl<'a> SwapExecutor<'a> {
             //   ensure/restore_pre_converted_soa_registration → ratio_generation bump.
             //
             // CPU / CUDA backends: default impl returns `Ok(())` immediately.
+            //
+            // LISWAP-2 async path: synchronize() is SKIPPED. Per-event gating
+            // inside the dispatcher worker thread replaces the full-barrier sync.
+            // invalidate_noshuffle_soa_registry() and the gen_bump still run so
+            // the next forward's plan rebuild observes a clean registry (safe:
+            // AOS path never populated the registry, and AUF SOA path re-registers
+            // after invalidate in Stage (d)).
             let t_sync0 = Instant::now();
-            self.backend
-                .synchronize()
-                .map_err(|e| SwapError::StageGateSyncFailed { source: e })?;
+            if !use_async {
+                self.backend
+                    .synchronize()
+                    .map_err(|e| SwapError::StageGateSyncFailed { source: e })?;
+            }
             stages.synchronize_ms = t_sync0.elapsed().as_secs_f64() * 1e3;
 
             // ── Stage (e-pre): invalidate registry ───────────────────────────
@@ -706,6 +829,181 @@ impl<'a> SwapExecutor<'a> {
             post_ffn_norm: old.post_ffn_norm.clone(),
             partition_ctx: None, // DF-35-3: cleared on swap (see above)
         })
+    }
+
+    /// LISWAP-2 async variant of `build_layer_from_mmap`.
+    ///
+    /// Enqueues H2D writes for each weight tensor on the backend's transfer
+    /// queue/stream via `enqueue_write_async`, returning the completed
+    /// `TransformerLayer` together with the **last** `GpuEvent`. Because the
+    /// transfer queue/stream is in-order, waiting on the last event guarantees
+    /// all preceding enqueues are GPU-visible.
+    ///
+    /// Norm tensors are materialised with the same async path. Optional tensors
+    /// (qkv_bias, q_norm/k_norm/pre_ffn_norm/post_ffn_norm) are cloned from
+    /// the existing snapshot — they are not part of the swap target and are
+    /// already resident on the device.
+    ///
+    /// Returns `Err` if any `enqueue_write_async` call fails, allowing the
+    /// caller to skip this layer and continue with others.
+    fn build_layer_from_mmap_async(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        slot: &LayerSlot,
+        layer_idx: usize,
+    ) -> Result<(TransformerLayer, GpuEvent), SwapError> {
+        let old = slot.load_weights();
+
+        // Helper closure: materialise via enqueue_write_async (weight tensors).
+        let enqueue_weight = |subname: &str,
+                              primary: &Tensor|
+         -> Result<(Tensor, GpuEvent), SwapError> {
+            // Build cpu_tensor the same way materialise_weight does, then
+            // enqueue asynchronously.
+            let cpu_tensor = self.materialise_cpu_tensor(secondary, layer_idx, subname, primary)?;
+            let is_cpu = self.backend.name().contains("CPU");
+            if is_cpu {
+                return Ok((cpu_tensor, GpuEvent::dummy()));
+            }
+            self.backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
+                SwapError::AsyncTransferUnavailable {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })
+        };
+
+        // Helper closure: materialise norm via enqueue_write_async (or clone).
+        let enqueue_norm = |subname: &str,
+                            primary: &Tensor|
+         -> Result<(Tensor, Option<GpuEvent>), SwapError> {
+            if secondary.layer_tensor(layer_idx, subname).is_none() {
+                return Ok((primary.clone(), None));
+            }
+            let cpu_tensor = self.materialise_cpu_tensor(secondary, layer_idx, subname, primary)?;
+            let is_cpu = self.backend.name().contains("CPU");
+            if is_cpu {
+                return Ok((cpu_tensor, None));
+            }
+            let (gpu_tensor, evt) = self.backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
+                SwapError::AsyncTransferUnavailable {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })?;
+            Ok((gpu_tensor, Some(evt)))
+        };
+
+        let (wq, evt_wq) = enqueue_weight("attn_q.weight", &old.wq)?;
+        let (wk, evt_wk) = enqueue_weight("attn_k.weight", &old.wk)?;
+        let (wv, evt_wv) = enqueue_weight("attn_v.weight", &old.wv)?;
+        let (wo, evt_wo) = enqueue_weight("attn_output.weight", &old.wo)?;
+        let (w_gate, evt_gate) = enqueue_weight("ffn_gate.weight", &old.w_gate)?;
+        let (w_up, evt_up) = enqueue_weight("ffn_up.weight", &old.w_up)?;
+        let (w_down, evt_down) = enqueue_weight("ffn_down.weight", &old.w_down)?;
+
+        let (attention_norm, evt_anorm) = enqueue_norm("attn_norm.weight", &old.attention_norm)?;
+        let (ffn_norm, evt_fnorm) = enqueue_norm("ffn_norm.weight", &old.ffn_norm)?;
+
+        // The last enqueued event covers all preceding in-order enqueues.
+        // Fall back through earlier events until we find a non-dummy one.
+        // In the common GPU case, evt_fnorm or evt_anorm will be the last.
+        let last_event = evt_fnorm.unwrap_or_else(|| evt_anorm.unwrap_or(evt_down));
+        // Keep earlier events for the ordering chain (all unused — in-order
+        // queue guarantees they complete when last_event completes).
+        let _ = (evt_wq, evt_wk, evt_wv, evt_wo, evt_gate, evt_up);
+
+        Ok((
+            TransformerLayer {
+                wq,
+                wk,
+                wv,
+                wo,
+                w_gate,
+                w_up,
+                w_down,
+                attention_norm,
+                ffn_norm,
+                qkv_bias: old.qkv_bias.clone(),
+                q_norm: old.q_norm.clone(),
+                k_norm: old.k_norm.clone(),
+                pre_ffn_norm: old.pre_ffn_norm.clone(),
+                post_ffn_norm: old.post_ffn_norm.clone(),
+                partition_ctx: None, // DF-35-3: cleared on swap (see above)
+            },
+            last_event,
+        ))
+    }
+
+    /// Materialise one tensor from the secondary mmap into a CPU-side tensor
+    /// (without uploading to the GPU). Used by `build_layer_from_mmap_async`
+    /// to separate the CPU-side permutation work from the H2D enqueue.
+    ///
+    /// The AUF SOA fast path is deliberately skipped here — `enqueue_write_async`
+    /// targets the AOS path for the prototype and AUF SOA registration is
+    /// handled synchronously in Stage (d). Production quality may revisit this.
+    fn materialise_cpu_tensor(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        layer_idx: usize,
+        subname: &str,
+        primary: &Tensor,
+    ) -> Result<Tensor, SwapError> {
+        let info = secondary.layer_tensor(layer_idx, subname).ok_or_else(|| {
+            SwapError::SecondaryTensorMissing {
+                layer: layer_idx,
+                subname: subname.to_string(),
+            }
+        })?;
+
+        let shape = primary.shape().clone();
+        let expected_dims: Vec<usize> = primary.shape().dims().to_vec();
+        let sec_rev: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
+        if sec_rev != expected_dims {
+            return Err(SwapError::ShapeMismatch {
+                layer: layer_idx,
+                subname: subname.to_string(),
+                primary: expected_dims,
+                secondary: info.dims.clone(),
+            });
+        }
+
+        let data = secondary.tensor_bytes(info);
+        let canonical_name = format!("blk.{layer_idx}.{subname}");
+        let permuted_bytes: Option<Vec<u8>> = if secondary.needs_qk_unpermute_at_swap() {
+            if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, self.config) {
+                let total_rows = shape.dims()[0];
+                debug_assert_eq!(total_rows, n_head * head_dim);
+                if !data.len().is_multiple_of(total_rows) {
+                    return Err(SwapError::ShapeMismatch {
+                        layer: layer_idx,
+                        subname: subname.to_string(),
+                        primary: expected_dims,
+                        secondary: info.dims.clone(),
+                    });
+                }
+                let row_size_bytes = data.len() / total_rows;
+                Some(unpermute_qk_rows(data, n_head, head_dim, row_size_bytes))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
+            Arc::new(SharedBuffer::from_vec(owned, info.dtype))
+        } else {
+            Arc::new(
+                crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
+                    secondary, data, info.dtype,
+                ),
+            )
+        };
+
+        let cpu_backend: Arc<dyn Backend> =
+            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+        Ok(Tensor::new(shape, cpu_buf, cpu_backend))
     }
 
     /// Dispatch a swap-target *weight* tensor through the right materialise

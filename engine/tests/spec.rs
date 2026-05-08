@@ -261,3 +261,10 @@ mod test_inv_144_forward_snapshot;
 mod test_inv_145_drain_monotone;
 #[path = "spec/test_inv_146_tick_batch_equivalence.rs"]
 mod test_inv_146_tick_batch_equivalence;
+
+// ── LISWAP-2 Phase 3 — SwapExecutor async dispatch path (prototype) ──
+// `execute_on_slots`에 `async_dispatcher: Option<&AsyncSwapDispatcher>` 추가.
+// async path: `enqueue_write_async` + per-event `wait_event_blocking` (INV-142 대체).
+// sync path: backward-compat (기존 `backend.synchronize()` gate 유지).
+#[path = "spec/test_async_swap_executor.rs"]
+mod test_async_swap_executor;

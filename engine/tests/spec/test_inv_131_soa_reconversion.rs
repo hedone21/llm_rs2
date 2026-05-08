@@ -465,7 +465,7 @@ fn test_inv_131_non_adreno_backend_noop() {
 
     // Case 1: 빈 target_layers → swap 없음 → invalidate 0회 (ENG-ALG-211).
     let report = executor
-        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[])
+        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[], None)
         .expect("empty batch must not error");
     assert!(report.swapped.is_empty());
     assert_eq!(
@@ -476,7 +476,7 @@ fn test_inv_131_non_adreno_backend_noop() {
 
     // Case 2: 명시적 target_layers지만 secondary 없음 → swap 없음 → invalidate 0회.
     let report = executor
-        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[0, 1, 2, 3])
+        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[0, 1, 2, 3], None)
         .expect("no-secondary path must not error");
     assert!(report.swapped.is_empty());
     assert_eq!(

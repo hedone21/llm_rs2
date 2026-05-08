@@ -99,6 +99,7 @@ impl WeightSwapHandler {
             self.model_ref.secondary_mmap.as_ref(),
             &self.model_ref.ratio_generation,
             target_layers,
+            None, // async_dispatcher: sync path (Phase 3 upgrade pending)
         ) {
             Ok(report) => {
                 let layers_changed = report.swapped.len();
