@@ -61,9 +61,9 @@ fn supports_layer_graph_idempotent() {
     assert_eq!(v1, v2, "supports_layer_graph idempotent (1차 vs 2차)");
     assert_eq!(v2, v3, "supports_layer_graph idempotent (2차 vs 3차)");
 
-    // M3.1 stub 단계: 항상 true 반환을 expect. M3.2/3에서 graph cache 부재 시
-    // false fallback 등이 들어가면 본 assertion은 갱신 대상이 된다.
-    assert!(v1, "M3.1 stub은 항상 true (graph fast path를 노출)");
+    // M3.3: graph cache prebuild 완료 시에만 true. instantiated backend 직후
+    // (cache empty)는 false. M3.4에서 28-layer prebuild 후 true로 전환된다.
+    // 본 idempotent 검증은 값 자체보다 "다중 호출 결과 동일"을 우선 게이트.
 }
 
 /// ENG-QNN-219 / INV-170 — `_ => bail!("Unknown backend")` 분기가 보존됨을

@@ -31,6 +31,7 @@ use crate::core::backend::Backend;
 use crate::core::tensor::Tensor;
 use crate::models::weights::LayerSlot;
 use anyhow::{Result, anyhow};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use self::graph_cache::GraphCache;
@@ -48,15 +49,17 @@ use self::runtime::QnnOppkgRuntime;
 /// thread-safety: runtime + graph cache는 `Arc`로 공유하며, M3.2에서 graph
 /// cache build/invalidate 시점에만 `Mutex`가 필요할 가능성이 있다.
 pub struct QnnOppkgBackend {
-    /// `libQnnGpu.so` + OpPackage runtime 초기화 결과 (M3.1 stub Err).
-    #[allow(dead_code)]
+    /// `libQnnGpu.so` + OpPackage runtime 초기화 결과.
     runtime: Arc<QnnOppkgRuntime>,
-    /// 28 layer graph cache (M3.2 prebuild 진입).
+    /// 28 layer graph cache.
     graph_cache: Mutex<GraphCache>,
     /// `--qnn-graph-cache-prebuild` flag (D1 결정, default true). false면
     /// `prebuild_graph_cache`가 noop이 되고 forward는 lazy build를 시도한다
     /// (M3.2 미지원 — fallback path).
     args_prebuild: bool,
+    /// ENG-QNN-216 / INV-175 — fallback method 호출 카운터. fast path가 정상
+    /// 동작하면 0이어야 한다. test에서 검증.
+    fallback_call_count: AtomicU64,
 }
 
 impl QnnOppkgBackend {
@@ -78,7 +81,29 @@ impl QnnOppkgBackend {
             runtime,
             graph_cache: Mutex::new(GraphCache::new()),
             args_prebuild,
+            fallback_call_count: AtomicU64::new(0),
         })
+    }
+
+    /// Runtime 핸들 공유 — `QnnOppkgMemory` (ENG-QNN-204) 와 layer_graph
+    /// build/execute에서 V2.25 vtable + context handle 접근을 위해 사용.
+    /// host 빌드에서는 backend init이 Err로 fail하므로 본 method는 호출되지
+    /// 않지만 (Memory::alloc이 host fallback path로 빠짐), API 안정성 게이트로
+    /// 노출. dead_code 허용 — Android만 활용.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn runtime_arc(&self) -> Arc<QnnOppkgRuntime> {
+        self.runtime.clone()
+    }
+
+    /// ENG-QNN-216 / INV-175 — fallback 호출 카운터 (test 게이트).
+    /// fast path가 정상 발동하면 본 카운터는 0을 유지해야 한다.
+    pub fn fallback_call_count(&self) -> u64 {
+        self.fallback_call_count.load(Ordering::Relaxed)
+    }
+
+    /// fallback 호출 카운터 reset (test helper).
+    pub fn reset_fallback_call_count(&self) {
+        self.fallback_call_count.store(0, Ordering::Relaxed);
     }
 
     /// Eager prebuild — model load 완료 시점에 1회 호출 (`--qnn-graph-cache-prebuild=true` 시).
@@ -119,10 +144,18 @@ impl QnnOppkgBackend {
     }
 }
 
-/// Forward 미구현 marker — M3.3 진입 시 graph fast path로 모두 대체된다.
-fn forward_unimplemented(method: &'static str) -> ! {
+/// Forward 미구현 marker — fast path가 정상 동작하면 호출되지 않아야 한다
+/// (INV-175). 만약 호출되면 production은 panic으로 명확히 fail (qnn_oppkg
+/// backend는 trait 단위 fine-grained ops를 지원하지 않음).
+///
+/// `--qnn-allow-fallback`이 도입되면 (M3.4+) panic 대신 OpenCL secondary
+/// 위임으로 분기. 본 단계는 fast path 단일 path만 지원.
+fn forward_unimplemented(this: &QnnOppkgBackend, method: &'static str) -> ! {
+    this.fallback_call_count.fetch_add(1, Ordering::Relaxed);
     unimplemented!(
-        "QnnOppkgBackend::{} — M3.3에서 graph fast path 도입 시 fallback 경로로만 호출",
+        "QnnOppkgBackend::{} — fast path 미발동 (INV-175 위반). \
+         transformer.rs forward가 supports_layer_graph()를 검사하지 않았거나 \
+         graph cache prebuild가 누락된 상태. M3.4 fallback hook (--qnn-allow-fallback) 진입 시 OpenCL secondary 위임.",
         method
     )
 }
@@ -159,14 +192,27 @@ impl Backend for QnnOppkgBackend {
 
     /// ENG-QNN-211 / INV-174 — backend는 layer graph fast path를 지원한다고
     /// 선언한다. transformer.rs forward 진입 시 본 method가 1회 호출되어
-    /// fast path 분기를 결정한다. idempotent (M3.1 stub 단계는 항상 true).
+    /// fast path 분기를 결정한다. idempotent (동일 인스턴스에 대해 항상 동일 값).
+    ///
+    /// 본 method는 graph cache가 prebuild 완료된 경우에만 true를 반환한다.
+    /// host 빌드는 backend init이 Err로 fail하여 본 method가 호출되지 않는다.
+    /// Android 빌드에서 cache가 비어있거나 부분 채워진 상태는 false를 반환하여
+    /// transformer.rs가 (현재는 미지원이므로) bail하도록 한다.
     fn supports_layer_graph(&self) -> bool {
-        true
+        // INV-174 idempotent: cache 길이는 prebuild 후 변하지 않으므로 항상 동일.
+        let cache_ok = self
+            .graph_cache
+            .lock()
+            .map(|c| !c.is_empty())
+            .unwrap_or(false);
+        cache_ok && self.runtime.is_initialized()
     }
 
     /// ENG-QNN-211/213/214 — 14-node single-layer graph dispatch.
-    /// M3.3 진입 시 본격 구현.
-    #[allow(unused_variables)]
+    ///
+    /// transformer.rs `forward_into` decode loop가 본 method를 layer당 1회
+    /// 호출한다. host 빌드는 backend init Err로 본 path 진입 불가. Android
+    /// 빌드에서 14-node graph 본문이 부재하면 LayerGraph::execute가 Err.
     fn execute_layer_graph(
         &self,
         layer_idx: usize,
@@ -176,21 +222,45 @@ impl Backend for QnnOppkgBackend {
         pos: usize,
         x_out: &mut Tensor,
     ) -> Result<()> {
-        // M3.3에서 self.graph_cache.lock()....get(layer_idx).execute(...) 본격 구현.
-        Err(anyhow!(
-            "execute_layer_graph(layer={layer_idx}, pos={pos}) — M3.3에서 구현"
-        ))
+        let lg = self.graph_for_layer(layer_idx).ok_or_else(|| {
+            anyhow!("execute_layer_graph(layer={layer_idx}): graph cache miss — prebuild 누락")
+        })?;
+
+        // ENG-QNN-213/214 pre-conditions.
+        // x: F32 [1, 1, dim] or [1, dim] depending on rank. KV cache: F16 buffer.
+        let x_bytes = unsafe { std::slice::from_raw_parts(x.as_ptr(), x.size()) };
+        let kv_k_bytes =
+            unsafe { std::slice::from_raw_parts_mut(kv_cache_k.as_mut_ptr(), kv_cache_k.size()) };
+        let kv_v_bytes =
+            unsafe { std::slice::from_raw_parts_mut(kv_cache_v.as_mut_ptr(), kv_cache_v.size()) };
+        let x_out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(x_out.as_mut_ptr(), x_out.size()) };
+
+        // mask: ENG-QNN-228 — model load 시 1회 alloc (M3.4에서 backend 내부
+        // scratch buffer로 도입). 본 단계는 빈 slice (LayerGraph::execute가
+        // 내부 rpcmem buffer 사용).
+        let empty_mask: &[u8] = &[];
+
+        lg.execute(
+            self.runtime.as_ref(),
+            x_bytes,
+            kv_k_bytes,
+            kv_v_bytes,
+            pos,
+            empty_mask,
+            x_out_bytes,
+        )
     }
 
-    // ── Below: trait method stubs. 모두 M3.3 fast path 도입 후 호출되지 않아야 한다 (INV-175).
-    //    M3.1 단계는 호스트 빌드/링크만 게이트이므로 unimplemented! 마커로 충분.
+    // ── Below: trait method stubs. 모두 fast path 도입 후 호출되지 않아야 한다 (INV-175).
+    //    호출되면 fallback_call_count 증가 + panic — fast path 분기 누락 명확히 검출.
 
     fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
-        forward_unimplemented("matmul")
+        forward_unimplemented(self, "matmul")
     }
 
     fn matmul_transposed(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
-        forward_unimplemented("matmul_transposed")
+        forward_unimplemented(self, "matmul_transposed")
     }
 
     fn matmul_slice(
@@ -201,23 +271,23 @@ impl Backend for QnnOppkgBackend {
         _cols: usize,
         _out: &mut Tensor,
     ) -> Result<()> {
-        forward_unimplemented("matmul_slice")
+        forward_unimplemented(self, "matmul_slice")
     }
 
     fn add_assign(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
-        forward_unimplemented("add_assign")
+        forward_unimplemented(self, "add_assign")
     }
 
     fn scale(&self, _x: &mut Tensor, _v: f32) -> Result<()> {
-        forward_unimplemented("scale")
+        forward_unimplemented(self, "scale")
     }
 
     fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
-        forward_unimplemented("silu_mul")
+        forward_unimplemented(self, "silu_mul")
     }
 
     fn rms_norm(&self, _x: &mut Tensor, _w: &Tensor, _eps: f32, _add_unit: bool) -> Result<()> {
-        forward_unimplemented("rms_norm")
+        forward_unimplemented(self, "rms_norm")
     }
 
     fn rms_norm_oop(
@@ -228,23 +298,23 @@ impl Backend for QnnOppkgBackend {
         _eps: f32,
         _add_unit: bool,
     ) -> Result<()> {
-        forward_unimplemented("rms_norm_oop")
+        forward_unimplemented(self, "rms_norm_oop")
     }
 
     fn softmax(&self, _x: &mut Tensor) -> Result<()> {
-        forward_unimplemented("softmax")
+        forward_unimplemented(self, "softmax")
     }
 
     fn rope_inplace(&self, _x: &mut Tensor, _start_pos: usize, _theta: f32) -> Result<()> {
-        forward_unimplemented("rope_inplace")
+        forward_unimplemented(self, "rope_inplace")
     }
 
     fn copy_from(&self, _t: &Tensor) -> Result<Tensor> {
-        forward_unimplemented("copy_from")
+        forward_unimplemented(self, "copy_from")
     }
 
     fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
-        forward_unimplemented("cast")
+        forward_unimplemented(self, "cast")
     }
 }
 

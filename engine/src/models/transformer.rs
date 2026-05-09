@@ -1682,27 +1682,60 @@ impl TransformerModel {
                     })?;
                 }
             } else {
-                layer.forward(LayerForwardArgs {
-                    x: &mut x,
-                    kv_cache: &mut kv_caches[i],
-                    start_pos,
-                    backend,
-                    memory,
-                    rms_norm_eps: self.config.rms_norm_eps as f32,
-                    rope_theta,
-                    workspace: workspace.as_deref_mut(),
-                    need_scores,
-                    head_dim: self.config.head_dim,
-                    profiler: profiler.as_deref_mut(),
-                    layer_id: i,
-                    skip_attn: s_attn,
-                    skip_mlp: s_mlp,
-                    rms_norm_add_unit: is_gemma3,
-                    use_gelu_tanh: is_gemma3,
-                    is_local_attn: is_local,
-                    local_attn_window: self.config.sliding_window,
-                    is_last_layer: i + 1 == num_layers,
-                })?;
+                // ENG-QNN-211/213/214 / INV-174/175 — qnn_oppkg backend fast path:
+                // 14-node single-layer graph 1회 호출로 layer 전체를 처리.
+                // backend가 supports_layer_graph()를 true로 반환할 때만 분기.
+                // host build / 다른 backend는 본 분기 비활성 (default false).
+                //
+                // skip_attn/skip_mlp 또는 importance/score collection이 필요한
+                // 경우는 fast path가 fine-grained ops를 노출하지 않으므로 기존
+                // forward() 경로 사용 (graceful fallback).
+                let qnn_fast_path_eligible = backend.supports_layer_graph()
+                    && !s_attn
+                    && !s_mlp
+                    && !need_scores
+                    && importance_collector.is_none()
+                    && variance_collector.is_none();
+                // qnn_fast_path는 KVCache가 direct buffer access를 지원할 때만
+                // 활성. KIVI 같은 quantized cache는 get_buffers_mut() == None
+                // 이므로 fallback 경로 사용.
+                let qnn_fast_path_active =
+                    qnn_fast_path_eligible && kv_caches[i].get_buffers_mut().is_some();
+                if qnn_fast_path_active {
+                    // x_out: forward 동안 layer가 in-place 갱신하는 동일 buffer를
+                    // 재사용. graph가 x_in/x_out 모두 host pointer로 binding하므로
+                    // 두 slice는 같은 underlying tensor.
+                    let mut x_next = x.clone();
+                    let (k_buf, v_buf) = kv_caches[i]
+                        .get_buffers_mut()
+                        .expect("KVCacheOps::get_buffers_mut Some (gated above)");
+                    backend.execute_layer_graph(i, &x, k_buf, v_buf, start_pos, &mut x_next)?;
+                    x = x_next;
+                    // KV cache pos는 graph 내부에서 갱신되었으므로 caller도 동기화.
+                    kv_caches[i].advance_pos(seq_len);
+                } else {
+                    layer.forward(LayerForwardArgs {
+                        x: &mut x,
+                        kv_cache: &mut kv_caches[i],
+                        start_pos,
+                        backend,
+                        memory,
+                        rms_norm_eps: self.config.rms_norm_eps as f32,
+                        rope_theta,
+                        workspace: workspace.as_deref_mut(),
+                        need_scores,
+                        head_dim: self.config.head_dim,
+                        profiler: profiler.as_deref_mut(),
+                        layer_id: i,
+                        skip_attn: s_attn,
+                        skip_mlp: s_mlp,
+                        rms_norm_add_unit: is_gemma3,
+                        use_gelu_tanh: is_gemma3,
+                        is_local_attn: is_local,
+                        local_attn_window: self.config.sliding_window,
+                        is_last_layer: i + 1 == num_layers,
+                    })?;
+                }
                 // Intra-token GPU yield hook (decode only, seq_len == 1).
                 crate::core::gpu_yield::maybe_yield_after_layer(&**backend, i, true);
             }
