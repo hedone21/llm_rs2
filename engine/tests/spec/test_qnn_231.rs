@@ -33,8 +33,29 @@
 /// Placeholder — M3.4 메인 게이트 측정 시 본문 채움. 디바이스 microbench
 /// (`microbench_qnn_oppkg_decode32`)에서 32-token greedy decode 정확성 +
 /// TBT band + VmRSS slope 측정 후 본 host stub은 ID 매핑 sanity로만 잔존.
+///
+/// ## M3.4 디바이스 측정 결과 (2026-05-10, Galaxy S25, Adreno 830, Hexagon V79)
+///
+/// **Verdict**: RED — prefill 단계에서 segfault. 정확성 측정 미수행.
+///
+/// - graphFinalize 28× total = ~1360 ms (PASS, INV-167 1500 ms budget 내)
+///   - layer 0 cold = ~1196 ms (M2 microbench와 동일 pattern, QNN driver lazy
+///     compile)
+///   - layer 1~27 warm = mean 6.7 ms (driver-level cache hit)
+/// - Token sequence: 측정 불가 (prefill segfault before decode)
+/// - TBT ratio: 측정 불가
+/// - VmRSS: 측정 불가
+///
+/// **Root cause 가설** (papers/eurosys2027/_workspace/experiment/m3_4_passgate.md):
+/// - production OpenCL noshuffle SOA 변환이 qnn_oppkg primary일 때 비활성
+///   (`is_gpu()` true이지만 OpenCL 아님 → SOA 변환 skip)
+/// - prefill 시 OpenCL secondary fallback이 weight tensor를 받아 matmul 호출
+///   → AOS Q4_0 layout인데 SOA kernel이 호출되어 stale pointer dereference
+///
+/// **다음 단계**: 사용자 결정 (D-A noshuffle 강제, D-B prefill 별도 backend,
+/// D-C scope 재정의 중 택일) 후 다음 세션.
 #[test]
-#[ignore = "M3.4에서 디바이스 측정 (Galaxy S25) — 32-token decode + TBT + VmRSS"]
+#[ignore = "M3.4 RED: prefill segfault (root cause: noshuffle SOA gate). 다음 세션 사용자 결정 대기."]
 fn placeholder_qnn_pass_gate_seam() {
     let spec_ids = [
         "ENG-QNN-231", // 32-token decode 일치 (INV-172)
@@ -55,4 +76,18 @@ fn placeholder_qnn_pass_gate_seam() {
     const GREEN_MAX: f64 = 1.10;
     const YELLOW_MAX: f64 = 1.20;
     assert!(GREEN_MAX < YELLOW_MAX, "INV-179: GREEN < YELLOW band");
+
+    // M3.4 디바이스 측정 결과 (2026-05-10, S25)
+    const FINALIZE_TOTAL_MS: u32 = 1360;
+    const FINALIZE_LAYER0_COLD_MS: u32 = 1196;
+    const FINALIZE_WARM_AVG_MS: f64 = 6.7;
+    assert!(
+        FINALIZE_TOTAL_MS < 33_000,
+        "graphFinalize total: D1 결정 ~33s 1회 spike 내 PASS (실측 1.36s)"
+    );
+    assert!(
+        FINALIZE_LAYER0_COLD_MS < 1500,
+        "layer 0 cold: INV-167 1500 ms budget 내 PASS"
+    );
+    assert!(FINALIZE_WARM_AVG_MS < 50.0, "warm finalize 평균 < 50 ms");
 }

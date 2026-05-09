@@ -1363,16 +1363,34 @@ fn main() -> anyhow::Result<()> {
             // qnn_graph_cache_prebuild는 위에서 with_prebuild()에 wired됨.
             // qnn_allow_fallback는 M3.3 forward path에서 활용.
             let _ = args.qnn_allow_fallback;
-            // gpu_be / gpu_mem_arc는 M3.2 SwitchHw round-trip에서 secondary로 사용.
-            // 본 단계는 (None, None) 혹은 (Some, Some) 양쪽 모두 통과만 검증.
-            let _ = (&gpu_be, &gpu_mem_arc);
 
+            // M3.4: OpenCL secondary를 qnn_oppkg backend의 fallback target으로
+            // 등록. prefill 및 model load 단계에서 trait method 호출 시
+            // OpenCL secondary가 처리. decode (seq_len=1) fast path만 graph
+            // 직접 dispatch (INV-175).
+            #[cfg(feature = "opencl")]
+            if let Some(ref gpu_concrete) = gpu_be {
+                qnn.set_fallback_backend(gpu_concrete.clone());
+                eprintln!(
+                    "[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)"
+                );
+            }
+            // M3.4: production activation/KV memory는 OpenCL secondary로 위임.
+            // qnn_oppkg backend는 graph build 시점에 internal rpcmem alloc으로
+            // weight + scratch를 보유한다. production이 만드는 activation tensor는
+            // OpenCL buffer로 남아 prefill + model load fallback path가 자연스럽게
+            // 작동한다. KV cache는 OpenCL buffer (graph 내부 KvScatter는 자체
+            // rpcmem 사용 + execute path에서 host-side memcpy로 동기화).
             let qnn_dyn: Arc<dyn Backend> = qnn;
+            let primary_mem: Arc<dyn Memory> = match &gpu_mem_arc {
+                Some(m) => m.clone(),
+                None => qnn_mem.clone(),
+            };
             (
                 qnn_dyn.clone(),
-                qnn_mem.clone(),
+                primary_mem.clone(),
                 Some(qnn_dyn),
-                Some(qnn_mem),
+                Some(primary_mem),
                 true,
             )
         }

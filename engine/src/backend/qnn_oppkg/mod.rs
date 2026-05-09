@@ -26,6 +26,7 @@ pub mod graph_cache;
 pub mod layer_graph;
 pub mod memory;
 pub mod runtime;
+pub mod weight_pack;
 
 use crate::core::backend::Backend;
 use crate::core::tensor::Tensor;
@@ -34,6 +35,11 @@ use anyhow::{Result, anyhow};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// 본 backend가 trait fallback을 호출하지 않고 host buffer 재사용 path를
+/// 우선시한다는 의미. weight tensor는 model load 시점에 host buffer (GGUF mmap)을
+/// 그대로 보존하고, graph build 시점에 SOA 변환 + rpcmem alloc 1회만 수행한다.
+const _DOC_HOST_BUFFER_PASSTHROUGH: () = ();
+
 use self::graph_cache::GraphCache;
 use self::layer_graph::LayerConfig;
 use self::runtime::QnnOppkgRuntime;
@@ -41,13 +47,12 @@ use self::runtime::QnnOppkgRuntime;
 /// QNN OpPackage backend — `Backend` trait 구현 진입점.
 ///
 /// ENG-QNN-201/INV-166: 모든 필수 trait method를 OpenCL과 동일 시그니처로
-/// 구현한다. 본 단계 (M3.1)에서는 trivial method만 정상 구현하고 forward는
-/// 모두 `unimplemented!`. M3.3에서 graph fast path (`execute_layer_graph`)가
-/// 본격 구현되면 trait fallback method (matmul 등)는 호출되지 않아야 한다
-/// (INV-175).
+/// 구현한다. M3.4 단계: prefill 및 model load 단계에서 trait fallback method
+/// (matmul 등) 호출은 OpenCL secondary backend로 위임된다 (`--qnn-allow-fallback`
+/// 활성). decode (seq_len=1) fast path만 graph 통해 직접 처리.
 ///
-/// thread-safety: runtime + graph cache는 `Arc`로 공유하며, M3.2에서 graph
-/// cache build/invalidate 시점에만 `Mutex`가 필요할 가능성이 있다.
+/// thread-safety: runtime + graph cache는 `Arc`로 공유하며, graph cache는 build
+/// 시점에만 `Mutex`로 보호.
 pub struct QnnOppkgBackend {
     /// `libQnnGpu.so` + OpPackage runtime 초기화 결과.
     runtime: Arc<QnnOppkgRuntime>,
@@ -57,9 +62,12 @@ pub struct QnnOppkgBackend {
     /// `prebuild_graph_cache`가 noop이 되고 forward는 lazy build를 시도한다
     /// (M3.2 미지원 — fallback path).
     args_prebuild: bool,
-    /// ENG-QNN-216 / INV-175 — fallback method 호출 카운터. fast path가 정상
-    /// 동작하면 0이어야 한다. test에서 검증.
+    /// ENG-QNN-216 / INV-175 — fallback method 호출 카운터. decode fast path가
+    /// 정상 동작하면 0이어야 한다 (prefill/model load는 fallback 정상 사용).
     fallback_call_count: AtomicU64,
+    /// OpenCL secondary backend (fallback 위임 대상). 없으면 fallback method
+    /// 호출 시 명확한 panic.
+    fallback_backend: Mutex<Option<Arc<dyn Backend>>>,
 }
 
 impl QnnOppkgBackend {
@@ -82,7 +90,17 @@ impl QnnOppkgBackend {
             graph_cache: Mutex::new(GraphCache::new()),
             args_prebuild,
             fallback_call_count: AtomicU64::new(0),
+            fallback_backend: Mutex::new(None),
         })
+    }
+
+    /// OpenCL secondary backend 설정 (post-init). prefill 및 model load 시점에
+    /// trait fallback method 호출을 본 secondary로 위임한다. dispatcher
+    /// (generate.rs)가 backend init 직후 호출.
+    pub fn set_fallback_backend(&self, fallback: Arc<dyn Backend>) {
+        if let Ok(mut slot) = self.fallback_backend.lock() {
+            *slot = Some(fallback);
+        }
     }
 
     /// Runtime 핸들 공유 — `QnnOppkgMemory` (ENG-QNN-204) 와 layer_graph
@@ -144,20 +162,30 @@ impl QnnOppkgBackend {
     }
 }
 
-/// Forward 미구현 marker — fast path가 정상 동작하면 호출되지 않아야 한다
-/// (INV-175). 만약 호출되면 production은 panic으로 명확히 fail (qnn_oppkg
-/// backend는 trait 단위 fine-grained ops를 지원하지 않음).
+/// Forward fallback helper — prefill 및 model load 단계에서 호출되며 OpenCL
+/// secondary backend로 위임한다. fallback이 미설정이면 panic으로 명확히 fail.
 ///
-/// `--qnn-allow-fallback`이 도입되면 (M3.4+) panic 대신 OpenCL secondary
-/// 위임으로 분기. 본 단계는 fast path 단일 path만 지원.
-fn forward_unimplemented(this: &QnnOppkgBackend, method: &'static str) -> ! {
+/// decode (seq_len=1) fast path는 transformer.rs에서 `execute_layer_graph`를
+/// 직접 호출하므로 본 path는 거치지 않는다. fallback_call_count 증가는 fallback
+/// 호출 횟수 추적용 (decode 동안 0 유지가 INV-175 게이트, prefill은 무관).
+fn fallback_or_panic<F, R>(this: &QnnOppkgBackend, method: &'static str, f: F) -> R
+where
+    F: FnOnce(&Arc<dyn Backend>) -> R,
+{
     this.fallback_call_count.fetch_add(1, Ordering::Relaxed);
-    unimplemented!(
-        "QnnOppkgBackend::{} — fast path 미발동 (INV-175 위반). \
-         transformer.rs forward가 supports_layer_graph()를 검사하지 않았거나 \
-         graph cache prebuild가 누락된 상태. M3.4 fallback hook (--qnn-allow-fallback) 진입 시 OpenCL secondary 위임.",
-        method
-    )
+    let slot = this
+        .fallback_backend
+        .lock()
+        .expect("fallback_backend mutex poisoned");
+    if let Some(be) = slot.as_ref() {
+        f(be)
+    } else {
+        panic!(
+            "QnnOppkgBackend::{} — fast path 미발동 + fallback backend 미설정. \
+             generate.rs dispatcher가 set_fallback_backend()를 호출하지 않은 상태.",
+            method
+        )
+    }
 }
 
 impl Backend for QnnOppkgBackend {
@@ -252,69 +280,95 @@ impl Backend for QnnOppkgBackend {
         )
     }
 
-    // ── Below: trait method stubs. 모두 fast path 도입 후 호출되지 않아야 한다 (INV-175).
-    //    호출되면 fallback_call_count 증가 + panic — fast path 분기 누락 명확히 검출.
+    // ── Below: trait method fallback wrappers — prefill 및 model load에서
+    //    OpenCL secondary backend로 위임. decode fast path는 execute_layer_graph
+    //    direct call이므로 본 path 비통과 (INV-175 게이트는 decode 한정).
 
-    fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
-        forward_unimplemented(self, "matmul")
+    fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        fallback_or_panic(self, "matmul", |be| be.matmul(a, b, out))
     }
 
-    fn matmul_transposed(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
-        forward_unimplemented(self, "matmul_transposed")
+    fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        fallback_or_panic(self, "matmul_transposed", |be| {
+            be.matmul_transposed(a, b, out)
+        })
     }
 
     fn matmul_slice(
         &self,
-        _a: &Tensor,
-        _b: &Tensor,
-        _rows: usize,
-        _cols: usize,
-        _out: &mut Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        rows: usize,
+        cols: usize,
+        out: &mut Tensor,
     ) -> Result<()> {
-        forward_unimplemented(self, "matmul_slice")
+        fallback_or_panic(self, "matmul_slice", |be| {
+            be.matmul_slice(a, b, rows, cols, out)
+        })
     }
 
-    fn add_assign(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
-        forward_unimplemented(self, "add_assign")
+    fn add_assign(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
+        fallback_or_panic(self, "add_assign", |be| be.add_assign(a, b))
     }
 
-    fn scale(&self, _x: &mut Tensor, _v: f32) -> Result<()> {
-        forward_unimplemented(self, "scale")
+    fn scale(&self, x: &mut Tensor, v: f32) -> Result<()> {
+        fallback_or_panic(self, "scale", |be| be.scale(x, v))
     }
 
-    fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
-        forward_unimplemented(self, "silu_mul")
+    fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
+        fallback_or_panic(self, "silu_mul", |be| be.silu_mul(a, b))
     }
 
-    fn rms_norm(&self, _x: &mut Tensor, _w: &Tensor, _eps: f32, _add_unit: bool) -> Result<()> {
-        forward_unimplemented(self, "rms_norm")
+    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32, add_unit: bool) -> Result<()> {
+        fallback_or_panic(self, "rms_norm", |be| be.rms_norm(x, w, eps, add_unit))
     }
 
     fn rms_norm_oop(
         &self,
-        _x: &Tensor,
-        _out: &mut Tensor,
-        _w: &Tensor,
-        _eps: f32,
-        _add_unit: bool,
+        x: &Tensor,
+        out: &mut Tensor,
+        w: &Tensor,
+        eps: f32,
+        add_unit: bool,
     ) -> Result<()> {
-        forward_unimplemented(self, "rms_norm_oop")
+        fallback_or_panic(self, "rms_norm_oop", |be| {
+            be.rms_norm_oop(x, out, w, eps, add_unit)
+        })
     }
 
-    fn softmax(&self, _x: &mut Tensor) -> Result<()> {
-        forward_unimplemented(self, "softmax")
+    fn softmax(&self, x: &mut Tensor) -> Result<()> {
+        fallback_or_panic(self, "softmax", |be| be.softmax(x))
     }
 
-    fn rope_inplace(&self, _x: &mut Tensor, _start_pos: usize, _theta: f32) -> Result<()> {
-        forward_unimplemented(self, "rope_inplace")
+    fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
+        fallback_or_panic(self, "rope_inplace", |be| {
+            be.rope_inplace(x, start_pos, theta)
+        })
     }
 
-    fn copy_from(&self, _t: &Tensor) -> Result<Tensor> {
-        forward_unimplemented(self, "copy_from")
+    /// Model load passthrough — qnn_oppkg backend는 weight tensor를 host buffer
+    /// (GGUF mmap) 형태로 보존하고, graph build 시점에 SOA 변환 + rpcmem alloc
+    /// 1회 수행한다. 따라서 `copy_from`은 source의 buffer를 그대로 clone하여
+    /// backend reference만 본 backend로 변경한다.
+    ///
+    /// 이는 trait fallback이 아니라 정상 path — weight은 forward 동안 본 backend가
+    /// 직접 접근하지 않으며, `execute_layer_graph`는 LayerSlot에서 별도 추출.
+    /// `fallback_call_count`는 증가시키지 않는다 (INV-175).
+    fn copy_from(&self, t: &Tensor) -> Result<Tensor> {
+        Ok(Tensor::new(
+            t.shape().clone(),
+            t.buffer().clone(),
+            // backend 자체는 trait object Arc<dyn Backend>가 필요하지만 qnn_oppkg
+            // 외부에서 backend ref를 새로 만들 수 없으므로 source tensor의
+            // backend를 그대로 사용. weight은 forward 시 본 backend가 직접
+            // 접근하지 않으므로 backend 일관성은 무관 (graph build에서만 host
+            // pointer 사용).
+            t.backend().clone(),
+        ))
     }
 
-    fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
-        forward_unimplemented(self, "cast")
+    fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
+        fallback_or_panic(self, "cast", |be| be.cast(src, dst))
     }
 }
 
