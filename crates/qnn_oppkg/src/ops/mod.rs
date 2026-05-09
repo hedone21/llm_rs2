@@ -1,5 +1,10 @@
 pub mod add;
+pub mod deq_q40;
+pub mod flash_attn;
+pub mod kv_scatter;
 pub mod matmul_f16_f32;
+pub mod matmul_q40_f32;
 pub mod rms_norm;
+pub mod rope;
 pub mod silu_mul;
 pub mod softmax;

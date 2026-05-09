@@ -12,6 +12,11 @@ pub static OPS: &[OpDescriptor] = &[
     crate::ops::rms_norm::DESCRIPTOR,
     crate::ops::softmax::DESCRIPTOR,
     crate::ops::silu_mul::DESCRIPTOR,
+    crate::ops::rope::DESCRIPTOR,
+    crate::ops::deq_q40::DESCRIPTOR,
+    crate::ops::matmul_q40_f32::DESCRIPTOR,
+    crate::ops::kv_scatter::DESCRIPTOR,
+    crate::ops::flash_attn::DESCRIPTOR,
 ];
 
 /// Open-Closed dispatcher (ENG-QNN-024). No if-else chain on op_type.

@@ -38,3 +38,6 @@ experiments/external/
 
 # Resilience verify harness runtime outputs
 verify/results/
+
+# QNN SDK (vendor licensed, do not commit)
+/third_party/

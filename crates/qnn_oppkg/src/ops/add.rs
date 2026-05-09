@@ -100,6 +100,7 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
     Ok(OpImplLayout {
         mem_objects,
         args,
+        output_claims: None,
         global_work_dim: 1,
         local_work_dim: 0,
         global_work: [n4 as usize, 1, 1],

@@ -10,7 +10,7 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use crate::args::{ArgSpec, OpError, OpImplLayout};
+use crate::args::{ArgSpec, OpError, OpImplLayout, OutputClaimSpec};
 use crate::qnn::{
     _QnnOpPackage_OpImpl_t, QNN_SUCCESS, Qnn_ErrorHandle_t, QnnGpu_BlockEncodingInfo_t,
     QnnGpu_DataKernelArg_t, QnnGpu_DataKernelArg_t__bindgen_ty_1,
@@ -110,7 +110,11 @@ pub(crate) struct OpImplState {
     //
     // We need both `Send` (so `STATE_MAP` can hold the Box across threads)
     // and `Sync` (so the `static LazyLock<Mutex<…>>` itself is `Sync`).
-    pub out_claim: Box<QnnGpu_OutputClaim_t>,
+    /// All output-claim slots. Stable addresses via `Box`. Single-output ops
+    /// keep one entry here (legacy behaviour); multi-output ops (M2.H) push
+    /// one per `OutputClaimSpec`. `out_claim_arr` exposes `*mut` pointers in
+    /// the same order plus a trailing null terminator for the SDK.
+    pub out_claims: Vec<Box<QnnGpu_OutputClaim_t>>,
     pub out_claim_arr: Vec<*mut QnnGpu_OutputClaim_t>,
     pub mem_objs: Vec<Box<QnnGpu_MemoryObject_t>>,
     pub mem_obj_arr: Vec<*mut QnnGpu_MemoryObject_t>,
@@ -158,11 +162,7 @@ pub(crate) fn build_op_state(
     let build_options = CString::new(build_options).map_err(|_| OpError::InvalidArgument)?;
 
     let mut state = Box::new(OpImplState {
-        out_claim: Box::new(QnnGpu_OutputClaim_t {
-            opConfigIndex: 0,
-            outputIndex: 0,
-            memoryObject: ptr::null(),
-        }),
+        out_claims: Vec::new(),
         out_claim_arr: Vec::new(),
         mem_objs: Vec::new(),
         mem_obj_arr: Vec::new(),
@@ -208,10 +208,64 @@ pub(crate) fn build_op_state(
         state.mem_objs.push(Box::new(mo));
     }
 
-    // Output is the last mem object. Claim it.
-    let out_idx = state.mem_objs.len() - 1;
-    state.out_claim.memoryObject = &*state.mem_objs[out_idx] as *const _;
-    state.out_claim_arr = vec![&mut *state.out_claim as *mut _, ptr::null_mut()];
+    // Output claim selection. Three modes (priority order):
+    //
+    // 1. **Explicit multi-output** (M2.H): `layout.output_claims` is `Some` —
+    //    build one `QnnGpu_OutputClaim_t` per entry. Each entry maps an
+    //    `output_index` (graph node's outputTensors slot) to a
+    //    `mem_object_index` (row in `mem_objects`).
+    //
+    // 2. **Aliased single-output** (M2.G, INV-164): any arg is
+    //    `OutputTensorAliased(input_idx)`. The graph-level output edge
+    //    aliases the input tensor at the buffer level. Only the first
+    //    alias arg is honoured.
+    //
+    // 3. **Legacy single-output** (M1.x default): claim the last mem_object.
+    let claim_specs: Vec<OutputClaimSpec> = if let Some(specs) = layout.output_claims.as_ref() {
+        if specs.is_empty() {
+            return Err(OpError::ValidationFailure);
+        }
+        for s in specs.iter() {
+            if (s.mem_object_index as usize) >= state.mem_objs.len() {
+                return Err(OpError::ValidationFailure);
+            }
+        }
+        specs.clone()
+    } else {
+        let aliased_input_idx: Option<usize> = layout.args.iter().find_map(|a| match a {
+            ArgSpec::OutputTensorAliased(idx) => Some(*idx as usize),
+            _ => None,
+        });
+        let mem_idx = match aliased_input_idx {
+            Some(idx) => {
+                if idx >= state.mem_objs.len() {
+                    return Err(OpError::ValidationFailure);
+                }
+                idx
+            }
+            None => state.mem_objs.len() - 1,
+        };
+        vec![OutputClaimSpec {
+            output_index: 0,
+            mem_object_index: mem_idx as u32,
+        }]
+    };
+
+    for s in claim_specs.iter() {
+        let mo_ptr = &*state.mem_objs[s.mem_object_index as usize] as *const _;
+        state.out_claims.push(Box::new(QnnGpu_OutputClaim_t {
+            opConfigIndex: 0,
+            outputIndex: s.output_index,
+            memoryObject: mo_ptr,
+        }));
+    }
+    state.out_claim_arr = state
+        .out_claims
+        .iter_mut()
+        .map(|c| &mut **c as *mut _)
+        .collect();
+    state.out_claim_arr.push(ptr::null_mut());
+
     state.mem_obj_arr = state
         .mem_objs
         .iter_mut()
@@ -284,6 +338,21 @@ pub(crate) fn arg_spec_to_kernel_arg(spec: &ArgSpec) -> QnnGpu_KernelArg_t {
             },
         },
         ArgSpec::InOutTensor(ti) => QnnGpu_KernelArg_t {
+            type_: QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READWRITE,
+            __bindgen_anon_1: QnnGpu_KernelArg_t__bindgen_ty_1 {
+                tensor: QnnGpu_TensorKernelArg_t {
+                    opConfigIndex: 0,
+                    tensorIndex: ti,
+                    element: 0,
+                },
+            },
+        },
+        // M2.G (INV-164): graph-level output edge that aliases inputs[ti] at
+        // the buffer level. Kernel-arg encoding is identical to `InOutTensor`
+        // (OP_INPUT_READWRITE on the input tensor). `build_op_state` separately
+        // points `out_claim.memoryObject` at `mem_objects[ti]` so the SDK
+        // tracks the alias.
+        ArgSpec::OutputTensorAliased(ti) => QnnGpu_KernelArg_t {
             type_: QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READWRITE,
             __bindgen_anon_1: QnnGpu_KernelArg_t__bindgen_ty_1 {
                 tensor: QnnGpu_TensorKernelArg_t {

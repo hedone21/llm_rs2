@@ -4,6 +4,70 @@
 
 ---
 
+# QNN-GPU OpPackage Migration — M2 (Layer-level Graph) — 2026-05-09 신규
+
+> **상세 plan**: `.agent/todos/feat_qnn_oppkg_m2.md`
+> M1 (production OpPackage crate, 5 ops) 완료. M2는 Qwen 1 layer (12-15 op)을 단일 OpPackage graph로 wrap.
+> 5 신규 op (RoPE, DeqQ40, MatMulQ40F32, KvScatter, FlashAttn) + SiluMul OOP refactor + Layer graph builder + TBT 측정.
+> Pass-gate: 1 layer accuracy max_abs_err < 1e-2, TBT ≤ baseline × 1.10, graphFinalize ≤ 200 ms, production code 변경 0.
+> 추정: 18~22일 (병렬 가정, FlashAttn 디버깅 buffer 포함).
+
+## [P0] M2.A — Layer op sequence 분석 + spec 갱신
+- **Status**: TODO (Architect 위임 대기)
+- **Sprint**: current
+- **담당 권장**: Architect
+- **상세**: `.agent/todos/feat_qnn_oppkg_m2.md` §1 M2.A
+
+## [P0] M2.B/M2.C — RoPE / DeqQ40 op wrap (병렬 가능)
+- **Status**: TODO
+- **Sprint**: current
+- **담당 권장**: Implementer (sonnet)
+- **Dependencies**: M2.A
+- **상세**: `.agent/todos/feat_qnn_oppkg_m2.md` §1 M2.B, M2.C
+
+## [P0] M2.D — CustomMatMulQ40F32 op wrap (production hot path)
+- **Status**: TODO
+- **Sprint**: current
+- **담당 권장**: Senior Implementer (Adreno + Q4_0 block)
+- **Dependencies**: M2.C, M2.A
+- **상세**: `.agent/todos/feat_qnn_oppkg_m2.md` §1 M2.D
+
+## [P1] M2.E/M2.F — KvScatter / FlashAttn op wrap
+- **Status**: TODO
+- **Sprint**: current
+- **담당 권장**: Implementer (sonnet) for E, Senior Implementer for F (online softmax + 32-float4 register)
+- **Dependencies**: M2.A, M2.E (F의 의존)
+- **상세**: `.agent/todos/feat_qnn_oppkg_m2.md` §1 M2.E, M2.F (위험 HIGH: FlashAttn)
+
+## [P0] M2.G — SiluMul OOP refactor 결정 + 적용
+- **Status**: TODO (Architect 옵션 결정 대기)
+- **Sprint**: current
+- **담당 권장**: Architect (옵션 결정) → Senior Implementer or Implementer (옵션별 적용)
+- **결정 필요 항목**: `.agent/todos/feat_qnn_oppkg_m2.md` §4 (3 옵션 trade-off + escalate 질문 4건)
+
+## [P1] M2.H — Layer graph builder
+- **Status**: TODO
+- **Sprint**: current
+- **담당 권장**: Senior Implementer
+- **Dependencies**: M2.B, M2.C, M2.D, M2.E, M2.F, M2.G individual GREEN 후
+- **상세**: `.agent/todos/feat_qnn_oppkg_m2.md` §1 M2.H
+
+## [P1] M2.I — Layer-level TBT 측정
+- **Status**: TODO
+- **Sprint**: current
+- **담당 권장**: Tester
+- **Dependencies**: M2.H GREEN
+- **상세**: `.agent/todos/feat_qnn_oppkg_m2.md` §1 M2.I (성능 게이트, fail 시 §6 fallback)
+
+## [P2] M2.J — Spec ID 추가 + 추적성 검증
+- **Status**: TODO
+- **Sprint**: current
+- **담당 권장**: Architect (spec/INV) → Tester (spec test)
+- **Dependencies**: M2.B~H 구현 완료, M2.I PASS
+- **상세**: `.agent/todos/feat_qnn_oppkg_m2.md` §1 M2.J
+
+---
+
 # Weight Swap Overhead 감축 (EuroSys 2027 critical path) — 2026-05-07 신규
 
 > 측정 보고: `/home/go/Workspace/papers/eurosys2027/_workspace/experiment/swap_overhead_s25.md`

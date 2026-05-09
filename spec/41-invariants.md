@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) + INV-137~139 (AUF v0.2 multi-dtype variant, 2026-04-27) + INV-140~143 (Weight Swap Phase 6.5 Overhead Reduction, 2026-05-07) = 총 124개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) + INV-137~139 (AUF v0.2 multi-dtype variant, 2026-04-27) + INV-140~143 (Weight Swap Phase 6.5 Overhead Reduction, 2026-05-07) + INV-147~150 (Intra-forward Layer-aligned Swap LISWAP-4, 2026-05-08) + INV-151~155 (QNN OpPackage M1, 2026-05-09) + INV-156~165 (QNN OpPackage M2 layer graph, 2026-05-09) = 총 138개.
 
 ## 1. Purpose and Scope
 
@@ -395,7 +395,31 @@
 | INV-152 | 30-engine 부록 A.3 (ENG-QNN-021) | `qnn_oppkg::registry::OPS.len() == StaticInfo::numOperations`. 정적 슬라이스 길이와 cdylib export 메타데이터 값이 비트 단위 일치한다. M1 범위에서 양쪽 모두 5. | Correctness | static, test | host unit test에서 `assert_eq!(OPS.len() as u32, static_info().num_operations)`. 등록 누락 회귀 즉시 검출. |
 | INV-153 | 30-engine 부록 A.3 (ENG-QNN-022) | `OPS` 슬라이스 내 모든 `OpDescriptor.op_type` 문자열은 슬라이스 내에서 고유하다. 동일 op_type 두 번 등록 금지. | Correctness | static, test | host unit test에서 `HashSet<&str>::len() == OPS.len()` 검증. 중복 등록 시 `pkg_create_op_impl` 디스패처가 first-match 기준으로 실리지 않은 entry를 silent drop하여 회귀 위험. |
 | INV-154 | 30-engine 부록 A.3 (ENG-QNN-023) | cdylib의 `pkg_get_info()` 반환 메타데이터에서 `backendApiVersion == (3, 7, 0)`. QNN GPU API 버전과 일치하며 mismatch 시 SDK가 cdylib을 reject한다 (Phase R G-1-F 결정적 fix). | Compatibility | static, test | host FFI surface test에서 `pkg_get_info()` 호출 후 backendApiVersion major/minor/patch 검증. SDK header와의 정합성. |
-| INV-155 | 30-engine 부록 A.5 (ENG-QNN-C04) | `pkg_create_op_impl` + `pkg_free_op_impl` 100회 반복 후 cdylib 프로세스의 `/proc/self/status::VmRSS` slope이 1 KB/iter 미만이어야 한다. PoC의 leak 패턴은 production에서 허용되지 않는다 — reverse-mapping table + `Box::from_raw` drop으로 정상화. | Safety | test | 디바이스 microbench (`microbench_qnn_oppkg_leak.rs`). last 50 iter linear regression slope. M1.8 게이트. |
+| INV-155 | 30-engine 부록 A.5 + A.9 (ENG-QNN-C04, ENG-QNN-C04') | **2-tier (v2, 2026-05-09 M2 진입 시점에 정밀화)**: (Primary, MUST) 100회 register/free 후 `qnn_oppkg::op_impl::STATE_MAP::lock().len() == 0` — cdylib이 보유한 모든 `Box<State>`는 `pkg_free_op_impl`에 의해 소진. (Secondary, SHOULD) `/proc/self/status::VmRSS` slope (last 50 iter linear regression) < 3 KB/iter — driver 잔여물(GPU compiled kernel cache, command buffer 풀)을 포함한 회귀 detector. M1.8 실측 1.1 KB/iter는 driver 영역으로 cdylib 책임 외이나 회귀 임계값으로 사용. | Safety | test | 디바이스 microbench (`microbench_qnn_oppkg_leak.rs`). primary는 STATE_MAP 검사, secondary는 last 50 iter linear regression slope. M1.8 게이트. |
+
+### 3.23 QNN OpPackage M2 Layer Graph Invariants [INV-156 ~ INV-165]
+
+2026-05-09 QNN OpPackage M2 (layer-level graph)의 불변식. 대응 명세: `30-engine.md` 부록 B (ENG-QNN-101 ~ ENG-QNN-C14).
+
+**도입 컨텍스트**: M1 production cdylib (5 ops) 완료. M2는 5 op 추가 + layer graph builder + KV cache integration. **production engine code 변경 0 유지** (M3에서 backend trait 통합). 본 단계까지 INV-001/010/011 골격은 보존된다.
+
+**교차 참조**:
+- **INV-151~155** (M1): M2는 M1 invariant를 모두 보존. INV-151 (의존 격리), INV-152/153 (`OPS.len() == numOperations` + 고유성)은 M2의 OPS 슬라이스 길이가 10이 되어도 그대로 유효.
+- **ENG-QNN-C03** (engine/kernels/*.cl 미수정): M2 INV-157이 동일 정신 확장 — 신규 .cl 파일 추가도 금지.
+- **INV-160** (production code change == 0): M2 가장 핵심 invariant. M3 진입 전 외형적 격리 보증.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-156 | 30-engine 부록 B.2 (ENG-QNN-101) | `qnn_oppkg::registry::OPS.len() == 10` (M1 5개 + M2 5개: `CustomMatMulQ40F32`, `CustomFlashAttn`, `CustomRope`, `CustomKvScatter`, `CustomDeqQ40`). M2 종료 게이트. | Correctness | static, test | host unit test에서 `OPS.len() == 10` + `static_info().num_operations == 10`. INV-152의 M2 specialization. |
+| INV-157 | 30-engine 부록 B.2 (ENG-QNN-103, ENG-QNN-C10) | M2 신규 op은 모두 `engine/kernels/*.cl` 기존 파일을 `include_str!`로 임베드하며 신규 .cl 파일을 추가하지 않는다. production OpenCL 자산은 source 변경 0. | Safety | static | `git diff master..HEAD -- engine/kernels/`가 빈 출력. INV-001/010/011 (production isolation) 정신 확장. |
+| INV-158 | 30-engine 부록 B.3 (ENG-QNN-111) | 단일 layer graph의 op node 수 ≤ 13 (Qwen2.5-1.5B 기준). graph builder 출력의 node count를 카운트하여 검증. | Correctness | test | host unit test에서 `build_layer_graph(...)` 후 graph descriptor의 node count 검사. fusion으로 ≤ 11도 가능. |
+| INV-159 | 30-engine 부록 B.3 + B.8 (ENG-QNN-114, ENG-QNN-C12) | KV cache buffer는 `[1, kv_heads, 2048, head_dim]` F16 max-padded fixed shape. dynamic seq_len 미지원. attention mask는 max-padded이며 valid range 외 `-INFINITY`. | Correctness | runtime, test | layer graph 입력 tensor descriptor의 shape 검증. seq_len 변동 시 graph 재빌드 강제. |
+| INV-160 | 30-engine 부록 B.5 (ENG-QNN-130) | M2 종료 시점 `engine/`, `manager/`, `shared/` 어느 크레이트의 소스 라인도 변경되지 않는다. test 추가 제외(단, test가 production 모듈을 import해도 production 빌드 산출물에 영향 없음). | Safety | static | CI에서 `git diff master..M2_HEAD -- engine/src/ manager/src/ shared/src/` 빈 출력. INV-151 (cargo edge isolation) 보강. |
+| INV-161 | 30-engine 부록 B.6 (ENG-QNN-140) | Qwen2.5-1.5B layer 0을 OpPackage graph로 실행한 결과 출력 `y`가 CPU NEON reference 대비 `max_abs_err < 1e-2`(F16 tolerance). 동일 입력에 대해 1회 forward + 1회 KV write 후 비교. | Correctness | test | 디바이스 accuracy test. CPU 참조는 production engine의 NEON forward path. |
+| INV-162 | 30-engine 부록 B.6 (ENG-QNN-141) | OpPackage 1 layer TBT ≤ production OpenCL baseline × 1.10. 동일 디바이스(Galaxy S25), 동일 ratio(GPU 100%), 동일 model. wall-clock only (CL_QUEUE_PROFILING_ENABLE 금지). | Performance | test | 디바이스 microbench. baseline은 `--backend opencl` decode TBT, OpPackage는 layer graph executor. |
+| INV-163 | 30-engine 부록 B.6 (ENG-QNN-142) | `QnnGraph_finalize` 호출 시간 ≤ 200 ms (디바이스 측정, layer 1개 기준). | Performance | test | 디바이스 microbench. build → finalize wall-clock. |
+| INV-164 | 30-engine 부록 B.4 (ENG-QNN-120) | SiluMul kernel은 production `.cl` 수정 없이 OpPackage abstraction의 intermediate alias 패턴(`ArgSpec::OutputTensorAliased`)으로 graph-safe하게 동작한다. SDK가 동일 backing buffer를 input/output edge에 alias 매핑할 수 있어야 한다. SDK가 거부 시 옵션 B (silu_oop + mul_oop 2단계 분해) fallback 발동. | Correctness | test | M2.4 게이트. layer graph 안에서 SiluMul 출력이 다음 op (ffn_up matmul 또는 final Add)의 입력으로 정상 연결됨 검증. |
+| INV-165 | 30-engine 부록 B.2 (ENG-QNN-104) | Q4_0 weight tensor는 `MemoryObjectSpec::RawBytes { block_size: 18, element_count: N/32 }`로 OpPackage abstraction에 노출된다. 32 element block당 18 byte (2 byte F16 scale + 16 byte 4-bit nibbles). Q8_0/Q5_K 등 타 quantization은 별도 RawBytes variant. | Correctness | static, test | host unit test에서 `MemoryObjectSpec` 생성 시 block_size=18 검증. Q4_0 GEMV op `kernel_arg_setter`가 raw bytes를 cl_mem으로 정확히 매핑. |
 
 ## 4. Alternative Behavior
 
@@ -425,11 +449,11 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
-| Safety | 23 | 23% |
-| Correctness | 69 | 71% |
-| Performance | 3 | 3% |
+| Safety | 25 | 23% |
+| Correctness | 75 | 70% |
+| Performance | 5 | 5% |
 | Compatibility | 4 | 4% |
-| **합계** | **98** | **100%** |
+| **합계** | **108** | **100%** |
 
 > **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
 > INV-117~119는 v2.2.0 (QCF × DPP)에서 추가. INV-121~122는 Weight Swap Phase A에서 추가.
@@ -441,7 +465,8 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-137~139는 AUF v0.2 multi-dtype variant (2026-04-27)에서 추가. INV-137/138은 Correctness, INV-139는 Correctness/Compatibility 양쪽이며 Compatibility로 1회 카운트한다 (v0.1.x ↔ v0.2 reader 호환 의무).
 > INV-140~143은 Weight Swap Phase 6.5 Overhead Reduction (2026-05-07)에서 추가. INV-140/141은 Correctness, INV-142는 Safety/Correctness 양쪽이며 Safety로 1회 카운트, INV-143은 Safety (borrow buffer mmap lifetime).
 > INV-147~150은 Intra-forward Layer-aligned Swap (LISWAP-4, 2026-05-08)에서 추가. INV-147은 Performance (hook=None zero overhead), INV-148은 Correctness (plan dispatch 멱등), INV-149/150은 Safety/Correctness 양쪽이며 Safety로 1회 카운트(commit-before-read ordering, plan run-to-completion).
-> INV-151~155는 QNN OpPackage M1 cdylib (2026-05-09)에서 추가. INV-151은 Safety (workspace dependency isolation, INV-001/010/011 확장), INV-152/153은 Correctness (정적 일관성), INV-154는 Compatibility (SDK 계약 버전 고정), INV-155는 Safety (leak 부재 보증).
+> INV-151~155는 QNN OpPackage M1 cdylib (2026-05-09)에서 추가. INV-151은 Safety (workspace dependency isolation, INV-001/010/011 확장), INV-152/153은 Correctness (정적 일관성), INV-154는 Compatibility (SDK 계약 버전 고정), INV-155는 Safety (leak 부재 보증). **INV-155 v2 (2026-05-09 M2 진입 시점)**: M1.8 실측 cdylib leak == 0 (STATE_MAP) 확인 후 driver 잔여물(1.1 KB/iter)을 별도 tier로 분리. Primary(STATE_MAP=0, MUST) + Secondary(VmRSS slope < 3 KB/iter, SHOULD) 2-tier 구조. ID/카운트 변동 없음.
+> INV-156~165는 QNN OpPackage M2 layer-level graph (2026-05-09)에서 추가. INV-156/158/159/161/164/165는 Correctness, INV-157/160은 Safety (production isolation 보강), INV-162/163은 Performance.
 > INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 > **INV-122 v2.1 (2026-04-26, Phase 5 Sprint A 진단 기반)**: 측정 단위를 **단일-token next-token logit**(prefill 종료 직후 첫 1개 logit)으로 명시적으로 고정. Sprint A 100-prompt × 4-ratio sweep에서 32-token decode 누적 drift로 ratio=0.25에서도 Δtop-1=44.85pp 관측 — 측정-임계값 미스매치 진단. 정확성 회귀(garbage 출력 등)는 0건. 임계값 자체(NMSE ≤ 0.01, Δ top-1 ≤ 1 pp)는 v2와 동일하나 측정 단위가 단일-token으로 고정. Decode window metric은 보조 sanity로 분리. ID/카운트는 변동 없음. Phase 4 자료(NMSE mean=0.0062, Δ top-1=+0.33pp)는 v2.1 기준으로도 PASS.
 

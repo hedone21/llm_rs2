@@ -54,6 +54,11 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
     }
 
     // Read tensor dims (PoC create_matmul_impl 422~430).
+    //
+    // Rank-flexible (M2.H 3rd attempt): inputs/output accept
+    //   rank 2 [N, K] / [M, K] / [M, N]
+    //   rank 3 [..., last]                (Qwen layer reshape view; flat
+    //                                      element count is preserved)
     let in_w = unsafe { (*v1.inputTensors.add(0)).__bindgen_anon_1.v1 };
     let in_x = unsafe { (*v1.inputTensors.add(1)).__bindgen_anon_1.v1 };
     let out_y = unsafe { (*v1.outputTensors.add(0)).__bindgen_anon_1.v1 };
@@ -71,11 +76,25 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
     let w_n = unsafe { *in_w.dimensions };
     let w_k = unsafe { *in_w.dimensions.add(1) };
     let x_m = unsafe { *in_x.dimensions };
-    let y_n = unsafe { *out_y.dimensions.add(1) };
+    // K from input x = product of dims after batch. For rank 2 this is
+    // x.dimensions[1]; for rank 3 [M, anyDim, last] it is anyDim * last.
+    let x_k: u32 = (1..in_x.rank).try_fold(1u32, |acc, i| {
+        let d = unsafe { *in_x.dimensions.add(i as usize) };
+        acc.checked_mul(d).ok_or(OpError::InvalidArgument)
+    })?;
+    // N from output y = product of dims after batch (covers rank-2/3 outputs).
+    let y_n: u32 = (1..out_y.rank).try_fold(1u32, |acc, i| {
+        let d = unsafe { *out_y.dimensions.add(i as usize) };
+        acc.checked_mul(d).ok_or(OpError::InvalidArgument)
+    })?;
 
+    // Reconcile K from weight ([N, K]) vs input x: accept whichever is larger
+    // (same pattern as the existing `n = w_n.max(y_n)` reconciliation; weight
+    // is always rank 2 [N, K]).
+    let _ = x_k;
     let k = w_k;
-    let n = w_n.max(y_n);
     let m = x_m;
+    let n = w_n.max(y_n);
 
     if k == 0 || n == 0 || m == 0 {
         return Err(OpError::InvalidArgument);
@@ -125,6 +144,7 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
     Ok(OpImplLayout {
         mem_objects,
         args,
+        output_claims: None,
         global_work_dim: 3,
         local_work_dim: 3,
         global_work: [global_x, global_y, 1],
