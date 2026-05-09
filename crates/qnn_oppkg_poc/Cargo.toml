@@ -1,0 +1,14 @@
+[package]
+name = "qnn_oppkg_poc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "qnn_oppkg_poc"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+bindgen = "0.71"
+
+[dependencies]
