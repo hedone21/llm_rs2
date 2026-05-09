@@ -14,7 +14,12 @@ fn main() {
 }
 
 #[cfg(feature = "qnn")]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -61,41 +66,62 @@ fn main() -> anyhow::Result<()> {
     let pkg_provider = CString::new(PKG_PROVIDER).unwrap();
     let pkg_target = CString::new(PKG_TARGET).unwrap();
     let err = unsafe {
-        (v.backendRegisterOpPackage.unwrap())(be, pkg_path.as_ptr(), pkg_provider.as_ptr(), pkg_target.as_ptr())
+        (v.backendRegisterOpPackage.unwrap())(
+            be,
+            pkg_path.as_ptr(),
+            pkg_provider.as_ptr(),
+            pkg_target.as_ptr(),
+        )
     };
     anyhow::ensure!(err == 0);
 
     // Helper to build either homogeneous or mixed graph
     let build_and_measure = |label: &str, mixed: bool, num_ops: usize| -> anyhow::Result<()> {
         let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-        let err = unsafe { (v.contextCreate.unwrap())(be, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
+        let err =
+            unsafe { (v.contextCreate.unwrap())(be, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
         anyhow::ensure!(err == 0);
 
         let g_name = CString::new(format!("{}_g", label)).unwrap();
         let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
 
         let t_total = Instant::now();
-        let err = unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
+        let err =
+            unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
         anyhow::ensure!(err == 0);
 
         let dims_w: Vec<u32> = vec![n as u32, k as u32];
         let dims_v: Vec<u32> = vec![m as u32, n as u32];
-        let mk_v1 = |name: &CString, ttype: Qnn_TensorType_t, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_TensorV1_t {
+        let mk_v1 = |name: &CString,
+                     ttype: Qnn_TensorType_t,
+                     dt: Qnn_DataType_t,
+                     dims: &[u32]|
+         -> Qnn_TensorV1_t {
             Qnn_TensorV1_t {
-                id: 0, name: name.as_ptr(), type_: ttype,
+                id: 0,
+                name: name.as_ptr(),
+                type_: ttype,
                 dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
                 dataType: dt,
                 quantizeParams: Qnn_QuantizeParams_t {
                     encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
-                    quantizationEncoding: Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
+                    quantizationEncoding:
+                        Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                     __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                        scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                        scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                            scale: 0.0,
+                            offset: 0,
+                        },
                     },
                 },
-                rank: dims.len() as u32, dimensions: dims.as_ptr() as *mut u32,
+                rank: dims.len() as u32,
+                dimensions: dims.as_ptr() as *mut u32,
                 memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
                 __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                    clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                    clientBuf: Qnn_ClientBuffer_t {
+                        data: ptr::null_mut(),
+                        dataSize: 0,
+                    },
                 },
             }
         };
@@ -105,7 +131,12 @@ fn main() -> anyhow::Result<()> {
         let mut t_w = Qnn_Tensor_t {
             version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
             __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                v1: mk_v1(&n_w, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, &dims_w),
+                v1: mk_v1(
+                    &n_w,
+                    Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                    Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
+                    &dims_w,
+                ),
             },
         };
         let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, &mut t_w) };
@@ -114,7 +145,12 @@ fn main() -> anyhow::Result<()> {
         let mut t_b = Qnn_Tensor_t {
             version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
             __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                v1: mk_v1(&n_b, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_v),
+                v1: mk_v1(
+                    &n_b,
+                    Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                    Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                    &dims_v,
+                ),
             },
         };
         if mixed {
@@ -122,17 +158,32 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(err == 0);
         }
 
-        let int_names: Vec<CString> = (0..=num_ops).map(|i| CString::new(format!("y{}", i)).unwrap()).collect();
+        let int_names: Vec<CString> = (0..=num_ops)
+            .map(|i| CString::new(format!("y{}", i)).unwrap())
+            .collect();
         let mut y_tensors: Vec<Qnn_Tensor_t> = Vec::with_capacity(num_ops + 1);
         for i in 0..=num_ops {
-            let ttype = if i == 0 { Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE }
-                        else if i == num_ops { Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ }
-                        else { Qnn_TensorType_t_QNN_TENSOR_TYPE_NATIVE };
-            let dims = if i == 0 { vec![m as u32, k as u32] } else { dims_v.clone() };
+            let ttype = if i == 0 {
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE
+            } else if i == num_ops {
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ
+            } else {
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_NATIVE
+            };
+            let dims = if i == 0 {
+                vec![m as u32, k as u32]
+            } else {
+                dims_v.clone()
+            };
             let mut t = Qnn_Tensor_t {
                 version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
                 __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                    v1: mk_v1(&int_names[i], ttype, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims),
+                    v1: mk_v1(
+                        &int_names[i],
+                        ttype,
+                        Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                        &dims,
+                    ),
                 },
             };
             let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, &mut t) };
@@ -143,7 +194,9 @@ fn main() -> anyhow::Result<()> {
         let pkg = CString::new("qnn_oppkg_poc").unwrap();
         let op_type_mm = CString::new("CustomMatMul").unwrap();
         let op_type_add = CString::new("CustomAdd").unwrap();
-        let op_names: Vec<CString> = (0..num_ops).map(|i| CString::new(format!("op_{}", i)).unwrap()).collect();
+        let op_names: Vec<CString> = (0..num_ops)
+            .map(|i| CString::new(format!("op_{}", i)).unwrap())
+            .collect();
         let mut inputs_h: Vec<Vec<Qnn_Tensor_t>> = Vec::with_capacity(num_ops);
         let mut outputs_h: Vec<[Qnn_Tensor_t; 1]> = Vec::with_capacity(num_ops);
         for i in 0..num_ops {
@@ -163,7 +216,11 @@ fn main() -> anyhow::Result<()> {
                     v1: Qnn_OpConfigV1_t {
                         name: op_names[i].as_ptr(),
                         packageName: pkg.as_ptr(),
-                        typeName: if is_add { op_type_add.as_ptr() } else { op_type_mm.as_ptr() },
+                        typeName: if is_add {
+                            op_type_add.as_ptr()
+                        } else {
+                            op_type_mm.as_ptr()
+                        },
                         numOfParams: 0,
                         params: ptr::null_mut(),
                         numOfInputs: 2,
@@ -198,25 +255,28 @@ fn main() -> anyhow::Result<()> {
         let rpc_b = unsafe { rpc_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bv) };
         let rpc_y0 = unsafe { rpc_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bx) };
         let rpc_yn = unsafe { rpc_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bv) };
-        anyhow::ensure!(!rpc_w.is_null() && !rpc_b.is_null() && !rpc_y0.is_null() && !rpc_yn.is_null());
+        anyhow::ensure!(
+            !rpc_w.is_null() && !rpc_b.is_null() && !rpc_y0.is_null() && !rpc_yn.is_null()
+        );
         let fd_w = unsafe { rpc_to_fd(rpc_w) };
         let fd_b = unsafe { rpc_to_fd(rpc_b) };
         let fd_y0 = unsafe { rpc_to_fd(rpc_y0) };
         let fd_yn = unsafe { rpc_to_fd(rpc_yn) };
-        let mk_desc = |fd: i32, host: *mut c_void, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_MemDescriptor_t {
-            Qnn_MemDescriptor_t {
-                memShape: Qnn_MemShape_t {
-                    numDim: dims.len() as u32,
-                    dimSize: dims.as_ptr() as *mut u32,
-                    shapeConfig: ptr::null(),
-                },
-                dataType: dt,
-                memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
-                __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
-                    dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host },
-                },
-            }
-        };
+        let mk_desc =
+            |fd: i32, host: *mut c_void, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_MemDescriptor_t {
+                Qnn_MemDescriptor_t {
+                    memShape: Qnn_MemShape_t {
+                        numDim: dims.len() as u32,
+                        dimSize: dims.as_ptr() as *mut u32,
+                        shapeConfig: ptr::null(),
+                    },
+                    dataType: dt,
+                    memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
+                    __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
+                        dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host },
+                    },
+                }
+            };
         let dims_x: Vec<u32> = vec![m as u32, k as u32];
         let descs_v = if mixed {
             vec![
@@ -233,7 +293,9 @@ fn main() -> anyhow::Result<()> {
             ]
         };
         let mut mh = vec![ptr::null_mut::<c_void>(); descs_v.len()];
-        let err = unsafe { (v.memRegister.unwrap())(ctx, descs_v.as_ptr(), descs_v.len() as u32, mh.as_mut_ptr()) };
+        let err = unsafe {
+            (v.memRegister.unwrap())(ctx, descs_v.as_ptr(), descs_v.len() as u32, mh.as_mut_ptr())
+        };
         anyhow::ensure!(err == 0, "memRegister err=0x{:x}", err);
 
         let mut t_w_mh = t_w;
@@ -254,7 +316,11 @@ fn main() -> anyhow::Result<()> {
         t_yn_mh.__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
         t_yn_mh.__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[t_yn_idx];
 
-        let exec_inputs = if mixed { vec![t_w_mh, t_b_mh, t_y0_mh] } else { vec![t_w_mh, t_y0_mh] };
+        let exec_inputs = if mixed {
+            vec![t_w_mh, t_b_mh, t_y0_mh]
+        } else {
+            vec![t_w_mh, t_y0_mh]
+        };
         let mut exec_outputs = [t_yn_mh];
         let v_ptr = &v as *const _ as usize;
         let graph_ptr = graph as usize;
@@ -268,18 +334,25 @@ fn main() -> anyhow::Result<()> {
             let err = unsafe {
                 (v.graphExecute.unwrap())(
                     graph_ptr as Qnn_GraphHandle_t,
-                    in_ptr as *const Qnn_Tensor_t, in_count,
-                    out_ptr as *mut Qnn_Tensor_t, 1,
-                    ptr::null_mut(), ptr::null_mut(),
+                    in_ptr as *const Qnn_Tensor_t,
+                    in_count,
+                    out_ptr as *mut Qnn_Tensor_t,
+                    1,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
                 )
             };
             anyhow::ensure!(err == 0, "graphExecute err=0x{:x}", err);
             Ok(t0.elapsed().as_secs_f64() * 1000.0)
         };
 
-        for _ in 0..5 { let _ = exec()?; }
+        for _ in 0..5 {
+            let _ = exec()?;
+        }
         let mut samples = Vec::with_capacity(n_iters);
-        for _ in 0..n_iters { samples.push(exec()?); }
+        for _ in 0..n_iters {
+            samples.push(exec()?);
+        }
         let mean = samples.iter().sum::<f64>() / n_iters as f64;
         let mut sorted = samples.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -287,7 +360,13 @@ fn main() -> anyhow::Result<()> {
 
         println!(
             "{:<24} ops={:>2} build={:.2}ms finalize={:.2}ms exec mean={:.3}ms median={:.3}ms per-op={:.3}ms",
-            label, num_ops, build_ms, fin_ms, mean, median, mean / num_ops as f64
+            label,
+            num_ops,
+            build_ms,
+            fin_ms,
+            mean,
+            median,
+            mean / num_ops as f64
         );
 
         unsafe {

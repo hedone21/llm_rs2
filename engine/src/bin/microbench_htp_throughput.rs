@@ -21,7 +21,12 @@ fn main() {
 }
 
 #[cfg(feature = "qnn")]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -43,38 +48,40 @@ fn main() -> anyhow::Result<()> {
     let n_elements = (size_mb * 1024 * 1024) / 4; // FP32
 
     println!("=== microbench_htp_throughput (LISWAP-5 Phase D / Q3) ===\n");
-    println!("Config: {} MB FP32 ({} elements), n_iters={}", size_mb, n_elements, n_iters);
+    println!(
+        "Config: {} MB FP32 ({} elements), n_iters={}",
+        size_mb, n_elements, n_iters
+    );
 
     // ── HTP setup ──
     let htp_lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnHtp.so") }
         .or_else(|_| unsafe { Library::new("libQnnHtp.so") })?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
     let get_providers: Symbol<GetProvidersFn> =
         unsafe { htp_lib.get(b"QnnInterface_getProviders\0")? };
     let mut providers: *mut *const QnnInterface_t = ptr::null_mut();
     let mut num: c_uint = 0;
     let err = unsafe { get_providers(&mut providers, &mut num) };
-    anyhow::ensure!(err == 0 && num > 0, "QnnInterface_getProviders err=0x{:x}", err);
+    anyhow::ensure!(
+        err == 0 && num > 0,
+        "QnnInterface_getProviders err=0x{:x}",
+        err
+    );
     let v = unsafe { (**providers).__bindgen_anon_1.v2_25 };
 
     let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend)
-    };
+    let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
     anyhow::ensure!(err == 0, "backendCreate err=0x{:x}", err);
 
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx)
-    };
+    let err =
+        unsafe { (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
 
     let graph_name = CString::new("htp_throughput").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph)
-    };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
     let dims = vec![n_elements as u32];
@@ -90,14 +97,20 @@ fn main() -> anyhow::Result<()> {
                 quantizationEncoding:
                     Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: 1,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
+                },
             },
         }
     };
@@ -152,7 +165,10 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(err == 0, "graphAddNode err=0x{:x}", err);
     let err = unsafe { (v.graphFinalize.unwrap())(graph, ptr::null_mut(), ptr::null_mut()) };
     anyhow::ensure!(err == 0, "graphFinalize err=0x{:x}", err);
-    println!("HTP graph build: OK ({} MB tensors, ElementWiseAdd FP32)", size_mb);
+    println!(
+        "HTP graph build: OK ({} MB tensors, ElementWiseAdd FP32)",
+        size_mb
+    );
 
     // ── Buffers ──
     let host_a: Vec<f32> = (0..n_elements).map(|i| (i as f32) * 1.0e-6).collect();
@@ -231,7 +247,9 @@ fn main() -> anyhow::Result<()> {
     let extrapolated_600mb = mean * (600.0 / size_mb as f64);
     println!("\nBaselines (600 MB H2D):");
     println!("  OpenCL ALLOC_HOST_PTR + clEnqueueWriteBuffer (Phase 0): 22.28 ms / 27.5 GB/s");
-    println!("  Vulkan staging → DEVICE_LOCAL via vkCmdCopyBuffer (Phase 9): 21.81 ms / 26.86 GB/s");
+    println!(
+        "  Vulkan staging → DEVICE_LOCAL via vkCmdCopyBuffer (Phase 9): 21.81 ms / 26.86 GB/s"
+    );
     println!(
         "  HTP ElementWiseAdd extrapolated to 600 MB: ≈ {:.2} ms / {:.2} GB/s (input-only)",
         extrapolated_600mb,

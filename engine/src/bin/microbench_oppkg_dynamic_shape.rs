@@ -16,7 +16,12 @@ fn main() {
 }
 
 #[cfg(feature = "qnn")]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -60,7 +65,12 @@ fn main() -> anyhow::Result<()> {
     let pkg_provider = CString::new(PKG_PROVIDER).unwrap();
     let pkg_target = CString::new(PKG_TARGET).unwrap();
     let err = unsafe {
-        (v.backendRegisterOpPackage.unwrap())(be, pkg_path.as_ptr(), pkg_provider.as_ptr(), pkg_target.as_ptr())
+        (v.backendRegisterOpPackage.unwrap())(
+            be,
+            pkg_path.as_ptr(),
+            pkg_provider.as_ptr(),
+            pkg_target.as_ptr(),
+        )
     };
     anyhow::ensure!(err == 0, "registerOpPackage err=0x{:x}", err);
 
@@ -80,28 +90,44 @@ fn main() -> anyhow::Result<()> {
             let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
 
             let t_build0 = Instant::now();
-            let err = unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
+            let err = unsafe {
+                (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph)
+            };
             anyhow::ensure!(err == 0);
 
             let dims_w: Vec<u32> = vec![n as u32, k as u32];
             let dims_x: Vec<u32> = vec![m as u32, k as u32];
             let dims_y: Vec<u32> = vec![m as u32, n as u32];
-            let mk_v1 = |name: &CString, ttype: Qnn_TensorType_t, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_TensorV1_t {
+            let mk_v1 = |name: &CString,
+                         ttype: Qnn_TensorType_t,
+                         dt: Qnn_DataType_t,
+                         dims: &[u32]|
+             -> Qnn_TensorV1_t {
                 Qnn_TensorV1_t {
-                    id: 0, name: name.as_ptr(), type_: ttype,
+                    id: 0,
+                    name: name.as_ptr(),
+                    type_: ttype,
                     dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
                     dataType: dt,
                     quantizeParams: Qnn_QuantizeParams_t {
                         encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
-                        quantizationEncoding: Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
+                        quantizationEncoding:
+                            Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                         __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                            scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                            scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                                scale: 0.0,
+                                offset: 0,
+                            },
                         },
                     },
-                    rank: dims.len() as u32, dimensions: dims.as_ptr() as *mut u32,
+                    rank: dims.len() as u32,
+                    dimensions: dims.as_ptr() as *mut u32,
                     memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
                     __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                        clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                        clientBuf: Qnn_ClientBuffer_t {
+                            data: ptr::null_mut(),
+                            dataSize: 0,
+                        },
                     },
                 }
             };
@@ -111,19 +137,34 @@ fn main() -> anyhow::Result<()> {
             let mut t_w = Qnn_Tensor_t {
                 version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
                 __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                    v1: mk_v1(&n_w, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, &dims_w),
+                    v1: mk_v1(
+                        &n_w,
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                        Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
+                        &dims_w,
+                    ),
                 },
             };
             let mut t_x = Qnn_Tensor_t {
                 version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
                 __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                    v1: mk_v1(&n_x, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_x),
+                    v1: mk_v1(
+                        &n_x,
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                        Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                        &dims_x,
+                    ),
                 },
             };
             let mut t_y = Qnn_Tensor_t {
                 version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
                 __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                    v1: mk_v1(&n_y, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_y),
+                    v1: mk_v1(
+                        &n_y,
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ,
+                        Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                        &dims_y,
+                    ),
                 },
             };
             for t in [&mut t_w, &mut t_x, &mut t_y] {
@@ -156,7 +197,8 @@ fn main() -> anyhow::Result<()> {
             let build_ms = t_build0.elapsed().as_secs_f64() * 1000.0;
 
             let t_fin0 = Instant::now();
-            let err = unsafe { (v.graphFinalize.unwrap())(graph, ptr::null_mut(), ptr::null_mut()) };
+            let err =
+                unsafe { (v.graphFinalize.unwrap())(graph, ptr::null_mut(), ptr::null_mut()) };
             anyhow::ensure!(err == 0);
             let fin_ms = t_fin0.elapsed().as_secs_f64() * 1000.0;
 
@@ -172,17 +214,30 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("\n--- Decision ---");
-    let max_fin = finalize_times.iter().map(|&(_, _, f)| f).fold(0.0, f64::max);
+    let max_fin = finalize_times
+        .iter()
+        .map(|&(_, _, f)| f)
+        .fold(0.0, f64::max);
     if max_fin < 10.0 {
         println!("✓ GREEN: finalize <10ms — per-decode-step rebuild OK (dynamic)");
     } else if max_fin < 100.0 {
-        println!("△ YELLOW: finalize {:.1}ms — prebuilt graph set OK, per-step rebuild marginal", max_fin);
+        println!(
+            "△ YELLOW: finalize {:.1}ms — prebuilt graph set OK, per-step rebuild marginal",
+            max_fin
+        );
     } else {
-        println!("✗ RED: finalize {:.1}ms — must use max-padded fixed shape", max_fin);
+        println!(
+            "✗ RED: finalize {:.1}ms — must use max-padded fixed shape",
+            max_fin
+        );
     }
     println!();
     println!("Production interpretation:");
-    println!("  decode TBT ~28ms. graphFinalize {:.1}ms = {:.1}% of TBT", max_fin, max_fin / 28.0 * 100.0);
+    println!(
+        "  decode TBT ~28ms. graphFinalize {:.1}ms = {:.1}% of TBT",
+        max_fin,
+        max_fin / 28.0 * 100.0
+    );
     println!("  → If finalize > TBT, must avoid per-step rebuild (use max-padded or graph cache)");
 
     unsafe { (v.backendFree.unwrap())(be) };

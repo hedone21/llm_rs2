@@ -24,7 +24,12 @@ fn main() {
 }
 
 #[cfg(feature = "qnn")]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -76,8 +81,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── HTP backend ──
     let htp_lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnHtp.so") }?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
     let htp_gp: Symbol<GetProvidersFn> = unsafe { htp_lib.get(b"QnnInterface_getProviders\0")? };
     let mut htp_provs: *mut *const QnnInterface_t = ptr::null_mut();
     let mut htp_n: c_uint = 0;
@@ -88,7 +92,9 @@ fn main() -> anyhow::Result<()> {
         if (**htp_provs).providerName.is_null() {
             "(null)".to_string()
         } else {
-            std::ffi::CStr::from_ptr((**htp_provs).providerName).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr((**htp_provs).providerName)
+                .to_string_lossy()
+                .into_owned()
         }
     };
     println!("HTP backend: provider={}", htp_provider_name);
@@ -105,7 +111,9 @@ fn main() -> anyhow::Result<()> {
         if (**gpu_provs).providerName.is_null() {
             "(null)".to_string()
         } else {
-            std::ffi::CStr::from_ptr((**gpu_provs).providerName).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr((**gpu_provs).providerName)
+                .to_string_lossy()
+                .into_owned()
         }
     };
     println!("QNN-GPU backend: provider={}", gpu_provider_name);
@@ -159,7 +167,10 @@ fn main() -> anyhow::Result<()> {
             dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
             memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
             __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
-                dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host_data },
+                dmaBufInfo: Qnn_MemDmaBufInfo_t {
+                    fd,
+                    data: host_data,
+                },
             },
         }
     };
@@ -214,9 +225,8 @@ fn main() -> anyhow::Result<()> {
     )> {
         let g_name = CString::new(graph_name).unwrap();
         let mut g: Qnn_GraphHandle_t = ptr::null_mut();
-        let err = unsafe {
-            (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut g)
-        };
+        let err =
+            unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut g) };
         anyhow::ensure!(err == 0, "graphCreate({}) err=0x{:x}", graph_name, err);
 
         let mk_v1 = |name: &CString, ttype: Qnn_TensorType_t| -> Qnn_TensorV1_t {
@@ -231,14 +241,20 @@ fn main() -> anyhow::Result<()> {
                     quantizationEncoding:
                         Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                     __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                        scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                        scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                            scale: 0.0,
+                            offset: 0,
+                        },
                     },
                 },
                 rank: 1,
                 dimensions: dims.as_ptr() as *mut u32,
                 memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
                 __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                    clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                    clientBuf: Qnn_ClientBuffer_t {
+                        data: ptr::null_mut(),
+                        dataSize: 0,
+                    },
                 },
             }
         };
@@ -303,14 +319,13 @@ fn main() -> anyhow::Result<()> {
     println!("HTP graph (a + b → c) finalize: OK");
 
     // QNN-GPU graph: d = c + b (reads HTP-written c)
-    let (gpu_g, mut gpu_t_c, mut gpu_t_b, mut gpu_t_d, _, _, _, _, _, _) =
-        if gpu_register_ok {
-            let r = build_eltwise_add(&v_gpu, gpu_ctx, "gpu_add", &dims)?;
-            println!("QNN-GPU graph (c + b → d) finalize: OK");
-            r
-        } else {
-            anyhow::bail!("Cannot build GPU graph: memRegister failed earlier");
-        };
+    let (gpu_g, mut gpu_t_c, mut gpu_t_b, mut gpu_t_d, _, _, _, _, _, _) = if gpu_register_ok {
+        let r = build_eltwise_add(&v_gpu, gpu_ctx, "gpu_add", &dims)?;
+        println!("QNN-GPU graph (c + b → d) finalize: OK");
+        r
+    } else {
+        anyhow::bail!("Cannot build GPU graph: memRegister failed earlier");
+    };
 
     // Switch HTP tensors to MEMHANDLE
     unsafe {
@@ -408,15 +423,19 @@ fn main() -> anyhow::Result<()> {
         }
     }
     if mismatch == 0 {
+        println!("\n=== R-Y option 3: ✓ PASS — HTP↔QNN-GPU zero-copy via shared ION fd 작동 ===");
         println!(
-            "\n=== R-Y option 3: ✓ PASS — HTP↔QNN-GPU zero-copy via shared ION fd 작동 ==="
+            "  {}/{} elements match. HeteroInfer cross-backend pattern reproduced.",
+            n, n
         );
-        println!("  {}/{} elements match. HeteroInfer cross-backend pattern reproduced.", n, n);
     } else {
         println!("\n=== R-Y option 3: ✗ FAIL ===");
         println!("  {} mismatch / {}", mismatch, n);
         if let Some((i, got, exp_d, exp_c)) = first_bad {
-            println!("  first bad: d[{}]={} expected={} (HTP c was {})", i, got, exp_d, exp_c);
+            println!(
+                "  first bad: d[{}]={} expected={} (HTP c was {})",
+                i, got, exp_d, exp_c
+            );
         }
     }
 
@@ -433,5 +452,9 @@ fn main() -> anyhow::Result<()> {
         rpcmem_free(rpc_c);
         rpcmem_free(rpc_d);
     }
-    if mismatch == 0 { Ok(()) } else { std::process::exit(1) }
+    if mismatch == 0 {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }

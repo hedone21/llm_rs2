@@ -55,8 +55,7 @@ mod qnn_bindgen {
         // Cross-compile: use NDK sysroot to avoid host gnu/stubs-32.h dependency
         if target.contains("android") {
             if let Ok(ndk) = env::var("ANDROID_NDK_HOME").or_else(|_| env::var("NDK_HOME")) {
-                let sysroot =
-                    format!("{}/toolchains/llvm/prebuilt/linux-x86_64/sysroot", ndk);
+                let sysroot = format!("{}/toolchains/llvm/prebuilt/linux-x86_64/sysroot", ndk);
                 if std::path::Path::new(&sysroot).exists() {
                     builder = builder.clang_arg(format!("--sysroot={}", sysroot));
                 } else {

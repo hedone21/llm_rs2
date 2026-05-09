@@ -545,3 +545,99 @@ Engine의 주 작업은 CPU-bound forward pass이다. MessageLoop의 blocking re
 ### 왜 heartbeat_interval이 1000ms 하드코딩인가
 
 현재 구현에서는 설정 가능한 인터페이스를 제공하지 않는다. Manager의 50ms 폴링 주기 대비 충분히 느슨하여 Engine 부하를 최소화하면서도 Manager가 Engine 상태를 주기적으로 파악할 수 있다 (PROTO-071 참조).
+
+## 부록 A. QNN OpPackage cdylib (M1, 2026-05-09)
+
+> **TL;DR**: QNN GPU OpPackage 인터페이스를 구현하는 별도 cdylib 산출물 `crates/qnn_oppkg/`. Engine/Manager/Shared **어느 것에도 의존하지 않으며** (`engine`도 `qnn_oppkg`에 의존하지 않음), QNN runtime이 dlopen하여 호출하는 외부 계약 컴포넌트. INV-001/010/011의 "2 독립 프로세스 + Shared" 골격은 보존된다 — qnn_oppkg는 **Engine 프로세스의 일부도 Manager 프로세스의 일부도 아닌** 외부 라이브러리 산출물이다.
+
+### A.1 정의
+
+| 용어 | 정의 |
+|------|------|
+| **OpPackage** | QNN(Qualcomm Neural Network) SDK가 정의한 외부 op 등록 인터페이스. `QnnOpPackage_InitInterface`를 export한 cdylib을 SDK가 dlopen하고 `registerOpPackage`로 op들을 그래프에 주입한다. |
+| **OpDescriptor** | (op_type, kernel_name, kernel_source, build_options, build_layout fn)의 정적 등록 단위. |
+| **OpImplLayout** | 런타임에 op_config로부터 산출되는 (mem_objects, args, workgroup) 묶음. `OpDescriptor::build_layout`이 생성. |
+| **PoC crate** | `crates/qnn_oppkg_poc/` — Phase R 검증용. 2 ops 보존. M1 기간 동안 회귀 안전망으로 유지. |
+
+### A.2 Crate 산출물 [ENG-QNN-010]
+
+**[ENG-QNN-010]** `crates/qnn_oppkg/`는 cdylib 산출물이다. `engine`(`llm_rs2`), `manager`(`llm_manager`), `shared`(`llm_shared`) 어느 크레이트도 `qnn_oppkg`에 의존하지 않는다. 역방향 의존도 없다 (qnn_oppkg는 workspace member로만 추가되며 cargo dependency edge는 형성되지 않는다). *(MUST)*
+
+**[ENG-QNN-011]** `qnn_oppkg`는 `engine/kernels/*.cl` 파일을 `include_str!`로만 임베드한다. 커널 인라인 작성을 금지하며, kernel source는 production `.cl` 파일을 단일 진실의 원천(SSOT)으로 한다. *(MUST)*
+
+> **Rationale (non-normative)**: 인라인 kernel은 production `.cl`과 drift 위험. `include_str!`은 빌드 시점에 production 자산을 그대로 복사하여 SSOT를 강제한다.
+
+**[ENG-QNN-012]** M1 범위에서 cdylib은 다음 5개 op을 노출한다: `CustomMatMulF16F32`, `CustomAdd`, `CustomRmsNorm`, `CustomSoftmax`, `CustomSiluMul`. 추가 op(Q4_0, FlashAttn, RoPE, KvScatter)은 M2 이후 범위. *(MUST)*
+
+### A.3 cdylib 외부 계약 [ENG-QNN-020 ~ ENG-QNN-024]
+
+**[ENG-QNN-020]** cdylib은 다음 export symbol을 제공한다 (QNN runtime이 dlopen하여 호출): *(MUST)*
+
+| Symbol | 시그니처 (요약) | 용도 |
+|--------|-----------------|------|
+| `QnnOpPackage_InitInterface` | `(Qnn_ApiVersion_t version) -> Qnn_OpPackage_Interface_t` | V1.4 + V2.0 fn pointer table 반환. SDK가 op 등록·dispatch·해제 시 이 table을 통해 cdylib 내부 함수를 호출한다. |
+| `pkg_get_info` (내부 fn ptr 경유) | `() -> &QnnOpPackage_Info_t` | packageName, numOperations, operationNames, backendApiVersion, coreApiVersion 메타데이터. |
+| `pkg_create_op_impl` (내부 fn ptr 경유) | `(node, *mut op_impl) -> Qnn_ErrorHandle_t` | op_type 디스패치 + state pointer 생성. |
+| `pkg_free_op_impl` (내부 fn ptr 경유) | `(op_impl) -> Qnn_ErrorHandle_t` | state pointer 해제. **leak 금지** (M1.8). |
+
+**[ENG-QNN-021]** 정적 op 등록 슬라이스 `OPS: &[OpDescriptor]`의 길이는 `numOperations`와 비트 단위 일치한다. M1 범위에서 둘 다 5이다. *(MUST)*
+
+**[ENG-QNN-022]** `OPS` 슬라이스 내 모든 `OpDescriptor.op_type` 값은 슬라이스 내에서 고유하다 (중복 등록 금지). *(MUST)*
+
+**[ENG-QNN-023]** cdylib의 `backendApiVersion`은 `3.7.0`이다 (Phase R에서 결정적 fix). 이 값은 QNN GPU API와 일치하며 변경 시 SDK가 cdylib을 reject한다. *(MUST)*
+
+**[ENG-QNN-024]** `pkg_create_op_impl` dispatcher는 표 기반(`OPS.iter().find(|d| d.op_type == requested)`)이며 if-else 체인을 사용하지 않는다. 이는 op 추가 시 단일 행 등록만으로 디스패치가 확장되도록 보장한다 (Open-Closed). *(SHOULD)*
+
+### A.4 OpPackage 내부 추상화 [ENG-QNN-030]
+
+**[ENG-QNN-030]** OpPackage 내부는 다음 4개 모듈로 분해된다: *(MUST)*
+
+| 모듈 | 책임 |
+|------|------|
+| `args.rs` | `ArgSpec`(InputTensor/OutputTensor/LocalMem/Int/UInt/ULong/Float), `MemoryObjectSpec`(data_type, flat_dims, flat_offsets), `OpImplLayout`(mem_objects + args + workgroup) — pure data |
+| `op_impl.rs` | `build_op_state(descriptor, layout) -> *mut GpuOperation` — 정해진 leak 패턴으로 state 생성. `free_op_impl_state(*mut)` reverse-mapping table 사용. |
+| `registry.rs` | `OPS` 정적 슬라이스. `find_descriptor(op_type)` lookup. |
+| `static_info.rs` / `interface.rs` | cdylib 메타데이터 + V1.4/V2.0 fn pointer table 채움 |
+
+### A.5 Constraints [ENG-QNN-C01 ~ ENG-QNN-C04]
+
+**[ENG-QNN-C01]** `qnn_oppkg`는 `engine`, `manager`, `shared` 중 어느 크레이트도 의존하지 않는다. 양방향 모두. *(MUST NOT)* (INV-001/010/011 보존)
+
+**[ENG-QNN-C02]** PoC crate `qnn_oppkg_poc`는 M1 기간 동안 회귀 안전망으로 보존된다. 같은 workspace에 공존하며 packageName과 op_type이 분리되어 있어 SDK 등록 충돌이 없다. *(SHOULD)*
+
+**[ENG-QNN-C03]** `engine/kernels/*.cl` 파일은 OpPackage 통합을 이유로 수정하지 않는다 (이미 Adreno 디바이스에서 검증된 자산). *(MUST NOT)*
+
+**[ENG-QNN-C04]** `pkg_free_op_impl`은 PoC의 leak 패턴을 production에서 그대로 사용하지 않는다. M1.8에서 reverse-mapping table + `Box::from_raw` drop으로 정상화된다. 100회 register/free leak test에서 VmRSS slope < 1 KB/iter을 만족해야 한다. *(MUST)*
+
+### A.6 Invariants
+
+| ID | 한줄 요약 |
+|----|-----------|
+| INV-151 | qnn_oppkg cdylib은 engine/manager/shared와 cargo dependency edge를 형성하지 않는다. (ENG-QNN-C01) |
+| INV-152 | `OPS.len() == numOperations` 정적 일치. (ENG-QNN-021) |
+| INV-153 | `OPS` 슬라이스 내 op_type 고유성. (ENG-QNN-022) |
+| INV-154 | cdylib `backendApiVersion == 3.7.0`. (ENG-QNN-023) |
+| INV-155 | 100회 register/free 후 VmRSS slope < 1 KB/iter. (ENG-QNN-C04) |
+
+상세는 `spec/41-invariants.md` §3.22 참조.
+
+### A.7 Examples (non-normative)
+
+```bash
+# Android cross-build
+python scripts/run_device.py -d s25 --skip-exec build -p qnn_oppkg
+
+# QNN runtime이 cdylib 로드 (개념)
+QnnBackend_loadOpPackage(
+    backend_handle,
+    "/data/local/tmp/libqnn_oppkg.so",   # cdylib path
+    "QnnOpPackage_InitInterface",        # ENG-QNN-020 의무 symbol
+    NULL                                  // target = QNN_GPU
+)
+```
+
+### A.8 Rationale (non-normative)
+
+- **왜 별도 crate인가**: cdylib은 `crate-type = ["cdylib"]`을 요구하며 Engine 바이너리(`bin = []`)와 한 크레이트에 둘 수 없다. 또한 QNN runtime이 dlopen하는 외부 계약 단위는 Engine 프로세스 내부 코드와 lifecycle이 다르다.
+- **왜 의존성을 0으로 두는가**: qnn_oppkg가 engine 코드를 import하면 (a) 빌드 그래프 거대화, (b) cdylib 사이즈 증가, (c) INV-001/010/011 위반 우려. 5개 op은 모두 self-contained이며 engine의 Tensor/Buffer 추상화를 필요로 하지 않는다 (kernel은 cl_mem과 raw arg만 받음).
+- **왜 PoC crate를 보존하는가**: M1 회귀 발생 시 즉각적 rollback path. 두 crate는 독립 packageName으로 SDK에 동시 등록 가능하여 A/B 비교도 지원한다.

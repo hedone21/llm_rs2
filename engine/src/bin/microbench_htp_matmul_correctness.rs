@@ -20,7 +20,12 @@ fn main() {
 }
 
 #[cfg(feature = "qnn")]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -42,36 +47,38 @@ fn main() -> anyhow::Result<()> {
     let m: usize = 1; // single-token decode
 
     println!("=== microbench_htp_matmul_correctness (Phase 32b-1) ===\n");
-    println!("MatMul: A[{}, {}] × B[{}, {}] = C[{}, {}]", m, k, k, n, m, n);
+    println!(
+        "MatMul: A[{}, {}] × B[{}, {}] = C[{}, {}]",
+        m, k, k, n, m, n
+    );
 
     // ── HTP setup ──
     let lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnHtp.so") }
         .or_else(|_| unsafe { Library::new("libQnnHtp.so") })?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
-    let get_providers: Symbol<GetProvidersFn> =
-        unsafe { lib.get(b"QnnInterface_getProviders\0")? };
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    let get_providers: Symbol<GetProvidersFn> = unsafe { lib.get(b"QnnInterface_getProviders\0")? };
     let mut providers: *mut *const QnnInterface_t = ptr::null_mut();
     let mut num: c_uint = 0;
     let err = unsafe { get_providers(&mut providers, &mut num) };
-    anyhow::ensure!(err == 0 && num > 0, "QnnInterface_getProviders err=0x{:x}", err);
+    anyhow::ensure!(
+        err == 0 && num > 0,
+        "QnnInterface_getProviders err=0x{:x}",
+        err
+    );
     let v = unsafe { (**providers).__bindgen_anon_1.v2_25 };
 
     let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
-    let err =
-        unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
+    let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
     anyhow::ensure!(err == 0, "backendCreate err=0x{:x}", err);
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx)
-    };
+    let err =
+        unsafe { (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
 
     let graph_name = CString::new("htp_matmul").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph)
-    };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
     // ── Tensors: A [m, k], B [k, n], C [m, n] ──
@@ -91,14 +98,20 @@ fn main() -> anyhow::Result<()> {
                 quantizationEncoding:
                     Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: dims.len() as u32,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
+                },
             },
         }
     };
@@ -159,7 +172,9 @@ fn main() -> anyhow::Result<()> {
     // ── Host data ──
     // A: small values to keep magnitudes manageable
     let host_a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001) % 1.0 - 0.5).collect();
-    let host_b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.0007 + 0.13) % 1.0 - 0.5).collect();
+    let host_b: Vec<f32> = (0..k * n)
+        .map(|i| (i as f32 * 0.0007 + 0.13) % 1.0 - 0.5)
+        .collect();
     let mut host_c: Vec<f32> = vec![0.0; m * n];
 
     unsafe {
@@ -228,7 +243,10 @@ fn main() -> anyhow::Result<()> {
             ref_c[mi * n + ni] = acc;
         }
     }
-    println!("CPU reference: {:.2} ms", t0.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "CPU reference: {:.2} ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // ── Compare ──
     let mut max_abs_err = 0.0f32;
@@ -278,5 +296,9 @@ fn main() -> anyhow::Result<()> {
         let _ = (v.contextFree.unwrap())(ctx, ptr::null_mut());
         let _ = (v.backendFree.unwrap())(backend);
     }
-    if pass_acceptable { Ok(()) } else { std::process::exit(1) }
+    if pass_acceptable {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }

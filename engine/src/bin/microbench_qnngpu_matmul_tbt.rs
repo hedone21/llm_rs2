@@ -23,7 +23,12 @@ fn main() {
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -59,7 +64,10 @@ fn main() -> anyhow::Result<()> {
 
     let platform = Platform::default();
     let device = Device::first(platform)?;
-    let cl_ctx = Context::builder().platform(platform).devices(device).build()?;
+    let cl_ctx = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
 
     let kernel_src = include_str!("../../kernels/mul_mv_f16_f32.cl");
@@ -83,20 +91,10 @@ fn main() -> anyhow::Result<()> {
     let host_y_f32 = vec![0.0f32; m * n];
 
     let buf_w = unsafe {
-        ocl::core::create_buffer::<_, u16>(
-            cl_ctx.as_core(),
-            ocl::core::MEM_READ_ONLY,
-            n * k,
-            None,
-        )?
+        ocl::core::create_buffer::<_, u16>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, n * k, None)?
     };
     let buf_x = unsafe {
-        ocl::core::create_buffer::<_, f32>(
-            cl_ctx.as_core(),
-            ocl::core::MEM_READ_ONLY,
-            m * k,
-            None,
-        )?
+        ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, m * k, None)?
     };
     let buf_y = unsafe {
         ocl::core::create_buffer::<_, f32>(
@@ -230,8 +228,7 @@ fn main() -> anyhow::Result<()> {
 
     // QNN-GPU backend
     let gpu_lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnGpu.so") }?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
     let gpu_gp: Symbol<GetProvidersFn> = unsafe { gpu_lib.get(b"QnnInterface_getProviders\0")? };
     let mut gpu_provs: *mut *const QnnInterface_t = ptr::null_mut();
     let mut gpu_n_p: c_uint = 0;
@@ -240,9 +237,8 @@ fn main() -> anyhow::Result<()> {
     let v_gpu = unsafe { (**gpu_provs).__bindgen_anon_1.v2_25 };
 
     let mut gpu_be: Qnn_BackendHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v_gpu.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut gpu_be)
-    };
+    let err =
+        unsafe { (v_gpu.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut gpu_be) };
     anyhow::ensure!(err == 0, "GPU backendCreate err=0x{:x}", err);
     let mut gpu_ctx: Qnn_ContextHandle_t = ptr::null_mut();
     let err = unsafe {
@@ -266,7 +262,10 @@ fn main() -> anyhow::Result<()> {
                 dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
                 memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
                 __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
-                    dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host_data },
+                    dmaBufInfo: Qnn_MemDmaBufInfo_t {
+                        fd,
+                        data: host_data,
+                    },
                 },
             }
         };
@@ -276,9 +275,7 @@ fn main() -> anyhow::Result<()> {
         mk_descriptor_dmabuf(fd_c, rpc_c, &dims_c),
     ];
     let mut mh = [ptr::null_mut::<c_void>(); 3];
-    let err = unsafe {
-        (v_gpu.memRegister.unwrap())(gpu_ctx, descs.as_ptr(), 3, mh.as_mut_ptr())
-    };
+    let err = unsafe { (v_gpu.memRegister.unwrap())(gpu_ctx, descs.as_ptr(), 3, mh.as_mut_ptr()) };
     anyhow::ensure!(err == 0, "GPU memRegister err=0x{:x}", err);
 
     // Build QNN-GPU graph: C = A @ B (FullyConnected, default config)
@@ -289,30 +286,35 @@ fn main() -> anyhow::Result<()> {
     };
     anyhow::ensure!(err == 0, "GPU graphCreate err=0x{:x}", err);
 
-    let mk_v1 =
-        |name: &CString, ttype: Qnn_TensorType_t, dims: &[u32]| -> Qnn_TensorV1_t {
-            Qnn_TensorV1_t {
-                id: 0,
-                name: name.as_ptr(),
-                type_: ttype,
-                dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
-                dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
-                quantizeParams: Qnn_QuantizeParams_t {
-                    encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
-                    quantizationEncoding:
-                        Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
-                    __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                        scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+    let mk_v1 = |name: &CString, ttype: Qnn_TensorType_t, dims: &[u32]| -> Qnn_TensorV1_t {
+        Qnn_TensorV1_t {
+            id: 0,
+            name: name.as_ptr(),
+            type_: ttype,
+            dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
+            dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
+            quantizeParams: Qnn_QuantizeParams_t {
+                encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
+                quantizationEncoding:
+                    Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
+                __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
                     },
                 },
-                rank: dims.len() as u32,
-                dimensions: dims.as_ptr() as *mut u32,
-                memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
-                __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                    clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+            },
+            rank: dims.len() as u32,
+            dimensions: dims.as_ptr() as *mut u32,
+            memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
+            __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
                 },
-            }
-        };
+            },
+        }
+    };
     let n_a = CString::new("A").unwrap();
     let n_b = CString::new("B").unwrap();
     let n_c = CString::new("C").unwrap();
@@ -362,12 +364,13 @@ fn main() -> anyhow::Result<()> {
     let err = unsafe { (v_gpu.graphAddNode.unwrap())(graph, op) };
     anyhow::ensure!(err == 0, "GPU graphAddNode err=0x{:x}", err);
     let t_finalize = Instant::now();
-    let err = unsafe {
-        (v_gpu.graphFinalize.unwrap())(graph, ptr::null_mut(), ptr::null_mut())
-    };
+    let err = unsafe { (v_gpu.graphFinalize.unwrap())(graph, ptr::null_mut(), ptr::null_mut()) };
     let finalize_ms = t_finalize.elapsed().as_secs_f64() * 1000.0;
     anyhow::ensure!(err == 0, "GPU graphFinalize err=0x{:x}", err);
-    println!("QNN-GPU graph (MatMul {}x{}x{}) finalize: OK ({:.1} ms)", m, k, n, finalize_ms);
+    println!(
+        "QNN-GPU graph (MatMul {}x{}x{}) finalize: OK ({:.1} ms)",
+        m, k, n, finalize_ms
+    );
 
     // Switch to MEMHANDLE
     inputs[0].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
@@ -404,8 +407,9 @@ fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    let measure = |label: &str, mut f: Box<dyn FnMut() -> anyhow::Result<f64>>|
-                  -> anyhow::Result<(f64, f64, f64)> {
+    let measure = |label: &str,
+                   mut f: Box<dyn FnMut() -> anyhow::Result<f64>>|
+     -> anyhow::Result<(f64, f64, f64)> {
         let mut samples = Vec::with_capacity(n_iters);
         for _ in 0..n_iters {
             samples.push(f()?);
@@ -435,10 +439,19 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     println!("\n=== R-B1 summary ===");
-    println!("baseline mean: {:.3}ms (median {:.3}ms, σ/mean {:.4})", b_mean, b_median, b_cv);
-    println!("qnn-gpu mean:  {:.3}ms (median {:.3}ms, σ/mean {:.4})", q_mean, q_median, q_cv);
+    println!(
+        "baseline mean: {:.3}ms (median {:.3}ms, σ/mean {:.4})",
+        b_mean, b_median, b_cv
+    );
+    println!(
+        "qnn-gpu mean:  {:.3}ms (median {:.3}ms, σ/mean {:.4})",
+        q_mean, q_median, q_cv
+    );
     let ratio = q_mean / b_mean;
-    println!("ratio q/b:     {:.3}x  (≤1.00 GREEN, ≤1.10 YELLOW, >1.10 RED)", ratio);
+    println!(
+        "ratio q/b:     {:.3}x  (≤1.00 GREEN, ≤1.10 YELLOW, >1.10 RED)",
+        ratio
+    );
 
     let verdict = if ratio <= 1.0 {
         "✓ GREEN"
@@ -459,7 +472,11 @@ fn main() -> anyhow::Result<()> {
         rpcmem_free(rpc_c);
     }
     let _ = host_y_f32; // silence unused
-    if ratio <= 1.1 { Ok(()) } else { std::process::exit(1) }
+    if ratio <= 1.1 {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
@@ -482,4 +499,3 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     let new_mant = (mant >> 13) as u16;
     (sign << 15) | ((new_exp as u16) << 10) | new_mant
 }
-

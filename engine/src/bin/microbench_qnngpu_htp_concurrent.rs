@@ -29,7 +29,12 @@ fn main() {
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -55,13 +60,18 @@ fn main() -> anyhow::Result<()> {
     let n: usize = 4096;
 
     println!("=== microbench_qnngpu_htp_concurrent (Phase R follow-up) ===\n");
-    println!("Dim: M={}, K={}, N={}  B size: {} MB", m, k, n, k * n * 4 / 1024 / 1024);
+    println!(
+        "Dim: M={}, K={}, N={}  B size: {} MB",
+        m,
+        k,
+        n,
+        k * n * 4 / 1024 / 1024
+    );
     println!("HTP: prebuilt MatMul (FP32, clientBuf)");
     println!("QNN-GPU: prebuilt MatMul (FP32, clientBuf)");
     println!("n_iters per config: {}\n", n_iters);
 
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
 
     // ─────────────────────────────────────────────────────────
     // Common: build a MatMul graph (FP32 clientBuf) on a backend
@@ -80,14 +90,20 @@ fn main() -> anyhow::Result<()> {
                 quantizationEncoding:
                     Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: dims.len() as u32,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
+                },
             },
         }
     };
@@ -108,9 +124,8 @@ fn main() -> anyhow::Result<()> {
     let v_htp = unsafe { (**htp_provs).__bindgen_anon_1.v2_25 };
 
     let mut htp_be: Qnn_BackendHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v_htp.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut htp_be)
-    };
+    let err =
+        unsafe { (v_htp.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut htp_be) };
     anyhow::ensure!(err == 0, "HTP backendCreate err=0x{:x}", err);
     let mut htp_ctx: Qnn_ContextHandle_t = ptr::null_mut();
     let err = unsafe {
@@ -136,13 +151,21 @@ fn main() -> anyhow::Result<()> {
     let mut htp_t_a = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_v1_raw(&htp_n_a, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, &dims_a),
+            v1: mk_v1_raw(
+                &htp_n_a,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                &dims_a,
+            ),
         },
     };
     let mut htp_t_b = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_v1_raw(&htp_n_b, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, &dims_b),
+            v1: mk_v1_raw(
+                &htp_n_b,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                &dims_b,
+            ),
         },
     };
     let mut htp_t_c = Qnn_Tensor_t {
@@ -151,7 +174,11 @@ fn main() -> anyhow::Result<()> {
             v1: mk_v1_raw(&htp_n_c, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ, &dims_c),
         },
     };
-    for (l, t) in [("A", &mut htp_t_a), ("B", &mut htp_t_b), ("C", &mut htp_t_c)] {
+    for (l, t) in [
+        ("A", &mut htp_t_a),
+        ("B", &mut htp_t_b),
+        ("C", &mut htp_t_c),
+    ] {
         let err = unsafe { (v_htp.tensorCreateGraphTensor.unwrap())(htp_graph, t) };
         anyhow::ensure!(err == 0, "HTP tensorCreate({}) err=0x{:x}", l, err);
     }
@@ -178,14 +205,15 @@ fn main() -> anyhow::Result<()> {
     };
     let err = unsafe { (v_htp.graphAddNode.unwrap())(htp_graph, htp_op) };
     anyhow::ensure!(err == 0, "HTP graphAddNode err=0x{:x}", err);
-    let err = unsafe {
-        (v_htp.graphFinalize.unwrap())(htp_graph, ptr::null_mut(), ptr::null_mut())
-    };
+    let err =
+        unsafe { (v_htp.graphFinalize.unwrap())(htp_graph, ptr::null_mut(), ptr::null_mut()) };
     anyhow::ensure!(err == 0, "HTP graphFinalize err=0x{:x}", err);
     println!("HTP graph (MatMul {}x{}x{}) finalize: OK", m, k, n);
 
     let host_a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001) % 1.0 - 0.5).collect();
-    let host_b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.0007 + 0.13) % 1.0 - 0.5).collect();
+    let host_b: Vec<f32> = (0..k * n)
+        .map(|i| (i as f32 * 0.0007 + 0.13) % 1.0 - 0.5)
+        .collect();
     let mut host_c_htp: Vec<f32> = vec![0.0; m * n];
     let host_c_gpu: Vec<f32> = vec![0.0; m * n];
 
@@ -197,7 +225,11 @@ fn main() -> anyhow::Result<()> {
         data: host_b.as_ptr() as *mut _,
         dataSize: (host_b.len() * 4) as u32,
     };
-    htp_outputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.clientBuf = Qnn_ClientBuffer_t {
+    htp_outputs[0]
+        .__bindgen_anon_1
+        .v1
+        .__bindgen_anon_1
+        .clientBuf = Qnn_ClientBuffer_t {
         data: host_c_htp.as_mut_ptr() as *mut _,
         dataSize: (host_c_htp.len() * 4) as u32,
     };
@@ -214,9 +246,8 @@ fn main() -> anyhow::Result<()> {
     let v_gpu = unsafe { (**gpu_provs).__bindgen_anon_1.v2_25 };
 
     let mut gpu_be: Qnn_BackendHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v_gpu.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut gpu_be)
-    };
+    let err =
+        unsafe { (v_gpu.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut gpu_be) };
     anyhow::ensure!(err == 0, "GPU backendCreate err=0x{:x}", err);
     let mut gpu_ctx: Qnn_ContextHandle_t = ptr::null_mut();
     let err = unsafe {
@@ -242,13 +273,21 @@ fn main() -> anyhow::Result<()> {
     let mut gpu_t_a = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_v1_raw(&gpu_n_a, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, &dims_a),
+            v1: mk_v1_raw(
+                &gpu_n_a,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                &dims_a,
+            ),
         },
     };
     let mut gpu_t_b = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_v1_raw(&gpu_n_b, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, &dims_b),
+            v1: mk_v1_raw(
+                &gpu_n_b,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                &dims_b,
+            ),
         },
     };
     let mut gpu_t_c = Qnn_Tensor_t {
@@ -257,7 +296,11 @@ fn main() -> anyhow::Result<()> {
             v1: mk_v1_raw(&gpu_n_c, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ, &dims_c),
         },
     };
-    for (l, t) in [("A", &mut gpu_t_a), ("B", &mut gpu_t_b), ("C", &mut gpu_t_c)] {
+    for (l, t) in [
+        ("A", &mut gpu_t_a),
+        ("B", &mut gpu_t_b),
+        ("C", &mut gpu_t_c),
+    ] {
         let err = unsafe { (v_gpu.tensorCreateGraphTensor.unwrap())(gpu_graph, t) };
         anyhow::ensure!(err == 0, "GPU tensorCreate({}) err=0x{:x}", l, err);
     }
@@ -282,9 +325,8 @@ fn main() -> anyhow::Result<()> {
     };
     let err = unsafe { (v_gpu.graphAddNode.unwrap())(gpu_graph, gpu_op) };
     anyhow::ensure!(err == 0, "GPU graphAddNode err=0x{:x}", err);
-    let err = unsafe {
-        (v_gpu.graphFinalize.unwrap())(gpu_graph, ptr::null_mut(), ptr::null_mut())
-    };
+    let err =
+        unsafe { (v_gpu.graphFinalize.unwrap())(gpu_graph, ptr::null_mut(), ptr::null_mut()) };
     anyhow::ensure!(err == 0, "GPU graphFinalize err=0x{:x}", err);
     println!("QNN-GPU graph (MatMul {}x{}x{}) finalize: OK", m, k, n);
 
@@ -339,7 +381,10 @@ fn main() -> anyhow::Result<()> {
                 dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
                 memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
                 __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
-                    dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host_data },
+                    dmaBufInfo: Qnn_MemDmaBufInfo_t {
+                        fd,
+                        data: host_data,
+                    },
                 },
             }
         };
@@ -349,9 +394,7 @@ fn main() -> anyhow::Result<()> {
         mk_descriptor_dmabuf(fd_c, rpc_c, &dims_c),
     ];
     let mut mh = [ptr::null_mut::<c_void>(); 3];
-    let err = unsafe {
-        (v_gpu.memRegister.unwrap())(gpu_ctx, descs.as_ptr(), 3, mh.as_mut_ptr())
-    };
+    let err = unsafe { (v_gpu.memRegister.unwrap())(gpu_ctx, descs.as_ptr(), 3, mh.as_mut_ptr()) };
     anyhow::ensure!(err == 0, "GPU memRegister err=0x{:x}", err);
     println!("QNN-GPU memRegister(A,B,C) DMA_BUF: OK\n");
 
@@ -361,9 +404,15 @@ fn main() -> anyhow::Result<()> {
     gpu_inputs[1].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
     gpu_inputs[1].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[1];
     gpu_outputs[0].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
-    gpu_outputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[2];
+    gpu_outputs[0]
+        .__bindgen_anon_1
+        .v1
+        .__bindgen_anon_1
+        .memHandle = mh[2];
     let _ = host_c_gpu; // unused: GPU output goes to rpc_c
-    let _ = fd_a; let _ = fd_b; let _ = fd_c;
+    let _ = fd_a;
+    let _ = fd_b;
+    let _ = fd_c;
 
     // ─────────────────────────────────────────────────────────
     // exec helpers (raw pointers as usize for thread safety)
@@ -453,9 +502,7 @@ fn main() -> anyhow::Result<()> {
                     let counter2 = counter.clone();
 
                     let gpu_handle = thread::spawn(move || -> anyhow::Result<f64> {
-                        let v = unsafe {
-                            &*(v_gpu_t as *const QnnInterface_ImplementationV2_25_t)
-                        };
+                        let v = unsafe { &*(v_gpu_t as *const QnnInterface_ImplementationV2_25_t) };
                         counter2.fetch_add(1, Ordering::SeqCst);
                         while counter2.load(Ordering::SeqCst) < 2 {
                             std::hint::spin_loop();

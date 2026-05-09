@@ -25,7 +25,12 @@ fn main() {
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -51,38 +56,40 @@ fn main() -> anyhow::Result<()> {
     let n: usize = 4096;
 
     println!("=== microbench_htp_gpu_matmul_concurrent (Phase 32b-2 / R3) ===\n");
-    println!("HTP MatMul: A[{},{}] × B[{},{}] (DDR-heavy: 16MB B + 4KB A + 16KB C)", m, k, k, n);
+    println!(
+        "HTP MatMul: A[{},{}] × B[{},{}] (DDR-heavy: 16MB B + 4KB A + 16KB C)",
+        m, k, k, n
+    );
     println!("GPU GEMV:   same scale on OpenCL");
     println!("n_iters per config: {}\n", n_iters);
 
     // ── HTP setup ──
     let lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnHtp.so") }
         .or_else(|_| unsafe { Library::new("libQnnHtp.so") })?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
-    let get_providers: Symbol<GetProvidersFn> =
-        unsafe { lib.get(b"QnnInterface_getProviders\0")? };
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    let get_providers: Symbol<GetProvidersFn> = unsafe { lib.get(b"QnnInterface_getProviders\0")? };
     let mut providers: *mut *const QnnInterface_t = ptr::null_mut();
     let mut num: c_uint = 0;
     let err = unsafe { get_providers(&mut providers, &mut num) };
-    anyhow::ensure!(err == 0 && num > 0, "QnnInterface_getProviders err=0x{:x}", err);
+    anyhow::ensure!(
+        err == 0 && num > 0,
+        "QnnInterface_getProviders err=0x{:x}",
+        err
+    );
     let v = unsafe { (**providers).__bindgen_anon_1.v2_25 };
 
     let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
-    let err =
-        unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
+    let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
     anyhow::ensure!(err == 0, "backendCreate err=0x{:x}", err);
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx)
-    };
+    let err =
+        unsafe { (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
 
     let graph_name = CString::new("htp_matmul").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph)
-    };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
     let dims_a: Vec<u32> = vec![m as u32, k as u32];
@@ -100,14 +107,20 @@ fn main() -> anyhow::Result<()> {
                 quantizationEncoding:
                     Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: dims.len() as u32,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
+                },
             },
         }
     };
@@ -164,7 +177,9 @@ fn main() -> anyhow::Result<()> {
     println!("HTP graph (MatMul {}x{}x{}) finalize: OK", m, k, n);
 
     let host_a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001) % 1.0 - 0.5).collect();
-    let host_b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.0007 + 0.13) % 1.0 - 0.5).collect();
+    let host_b: Vec<f32> = (0..k * n)
+        .map(|i| (i as f32 * 0.0007 + 0.13) % 1.0 - 0.5)
+        .collect();
     let mut host_c: Vec<f32> = vec![0.0; m * n];
 
     unsafe {
@@ -204,7 +219,10 @@ fn main() -> anyhow::Result<()> {
     use ocl::{Context, Device, Platform, Program, Queue};
     let platform = Platform::default();
     let device = Device::first(platform)?;
-    let cl_ctx = Context::builder().platform(platform).devices(device).build()?;
+    let cl_ctx = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
 
     let gemv_src = format!(
         r#"
@@ -223,7 +241,10 @@ fn main() -> anyhow::Result<()> {
         "#,
         k
     );
-    let program = Program::builder().devices(device).src(&gemv_src).build(&cl_ctx)?;
+    let program = Program::builder()
+        .devices(device)
+        .src(&gemv_src)
+        .build(&cl_ctx)?;
     let kernel = ocl::core::create_kernel(&program, "gemv")?;
     let buf_a_cl = unsafe {
         ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, k * n, None)?
@@ -237,11 +258,29 @@ fn main() -> anyhow::Result<()> {
 
     // Initial fill (does not count against measurement loop)
     let q_init = Queue::new(&cl_ctx, device, None)?;
-    let host_b_t: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.0009) % 1.0 - 0.5).collect();
+    let host_b_t: Vec<f32> = (0..k * n)
+        .map(|i| ((i as f32) * 0.0009) % 1.0 - 0.5)
+        .collect();
     let host_x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.011) % 1.0 - 0.5).collect();
     unsafe {
-        ocl::core::enqueue_write_buffer(&q_init, &buf_a_cl, true, 0, &host_b_t, None::<ocl::core::Event>, None::<&mut ocl::core::Event>)?;
-        ocl::core::enqueue_write_buffer(&q_init, &buf_x_cl, true, 0, &host_x, None::<ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+        ocl::core::enqueue_write_buffer(
+            &q_init,
+            &buf_a_cl,
+            true,
+            0,
+            &host_b_t,
+            None::<ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
+        ocl::core::enqueue_write_buffer(
+            &q_init,
+            &buf_x_cl,
+            true,
+            0,
+            &host_x,
+            None::<ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
     }
     ocl::core::finish(&q_init)?;
 
@@ -275,10 +314,18 @@ fn main() -> anyhow::Result<()> {
     }
     let baseline_htp = exec_htp()?;
     let baseline_gpu = exec_gpu()?;
-    println!("HTP single: {:.2} ms, GPU single: {:.2} ms\n", baseline_htp, baseline_gpu);
+    println!(
+        "HTP single: {:.2} ms, GPU single: {:.2} ms\n",
+        baseline_htp, baseline_gpu
+    );
 
     // ── Configs ──
-    enum Cfg { GpuOnly, HtpOnly, Concurrent, GpuSeqTwo }
+    enum Cfg {
+        GpuOnly,
+        HtpOnly,
+        Concurrent,
+        GpuSeqTwo,
+    }
     let configs: &[(&str, Cfg)] = &[
         ("C1: GPU GEMV only", Cfg::GpuOnly),
         ("C2: HTP MatMul only", Cfg::HtpOnly),
@@ -386,22 +433,44 @@ fn main() -> anyhow::Result<()> {
     println!("max(C1, C2)        = {:.3} ms", max_c1c2);
     println!("C1 + C2 (serial)   = {:.3} ms", serial_sum);
     println!("C3 (concurrent)    = {:.3} ms", c3);
-    println!("C4 (GPU seq ×2)    = {:.3} ms (Phase 9 ref: 2.005x baseline)", c4);
+    println!(
+        "C4 (GPU seq ×2)    = {:.3} ms (Phase 9 ref: 2.005x baseline)",
+        c4
+    );
     println!();
-    println!("C3 / max(C1,C2) = {:.3}x  (1.00 perfect parallel, ≤1.30 Pass)", c3 / max_c1c2);
-    println!("C3 / (C1+C2)    = {:.3}x  (0.50 perfect parallel, 1.00 serial)", c3 / serial_sum);
-    println!("C4 / C1         = {:.3}x  (sanity: GPU same-chip 직렬화 vs Phase 9 1.945x)", c4 / c1);
+    println!(
+        "C3 / max(C1,C2) = {:.3}x  (1.00 perfect parallel, ≤1.30 Pass)",
+        c3 / max_c1c2
+    );
+    println!(
+        "C3 / (C1+C2)    = {:.3}x  (0.50 perfect parallel, 1.00 serial)",
+        c3 / serial_sum
+    );
+    println!(
+        "C4 / C1         = {:.3}x  (sanity: GPU same-chip 직렬화 vs Phase 9 1.945x)",
+        c4 / c1
+    );
 
     let r3_pass = c3 / max_c1c2 <= 1.30;
     let r3_acceptable = c3 / max_c1c2 <= 1.50;
     println!(
         "\nR3 verdict: {}",
-        if r3_pass { "✓ PASS" } else if r3_acceptable { "△ ACCEPTABLE" } else { "✗ FAIL" }
+        if r3_pass {
+            "✓ PASS"
+        } else if r3_acceptable {
+            "△ ACCEPTABLE"
+        } else {
+            "✗ FAIL"
+        }
     );
 
     unsafe {
         let _ = (v.contextFree.unwrap())(ctx, ptr::null_mut());
         let _ = (v.backendFree.unwrap())(backend);
     }
-    if r3_acceptable { Ok(()) } else { std::process::exit(1) }
+    if r3_acceptable {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }

@@ -25,7 +25,12 @@ fn main() {
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -100,7 +105,10 @@ fn main() -> anyhow::Result<()> {
     // ── OpenCL setup ──
     let platform = Platform::default();
     let device = Device::first(platform)?;
-    let cl_ctx = Context::builder().platform(platform).devices(device).build()?;
+    let cl_ctx = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
     let queue = Queue::new(&cl_ctx, device, None)?;
     let ctx_raw: ocl::ffi::cl_context = ClContextPtr::as_ptr(&&cl_ctx);
     println!("OpenCL platform/device/context: OK ({})", device.name()?);
@@ -110,7 +118,10 @@ fn main() -> anyhow::Result<()> {
 
     let rpc_in = unsafe { rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bytes) };
     let rpc_out = unsafe { rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bytes) };
-    anyhow::ensure!(!rpc_in.is_null() && !rpc_out.is_null(), "rpcmem_alloc failed");
+    anyhow::ensure!(
+        !rpc_in.is_null() && !rpc_out.is_null(),
+        "rpcmem_alloc failed"
+    );
     let fd_in = unsafe { rpcmem_to_fd(rpc_in) };
     let fd_out = unsafe { rpcmem_to_fd(rpc_out) };
     println!(
@@ -203,7 +214,10 @@ fn main() -> anyhow::Result<()> {
     }
     ocl::core::finish(&queue)?;
     let kernel_ms = t_kernel.elapsed().as_secs_f64() * 1000.0;
-    println!("  GPU kernel exec (with acquire/release): {:.3} ms", kernel_ms);
+    println!(
+        "  GPU kernel exec (with acquire/release): {:.3} ms",
+        kernel_ms
+    );
 
     // Read result via host pointer (zero-copy claim test)
     let mut mismatch = 0usize;
@@ -221,7 +235,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
     if mismatch == 0 {
-        println!("  Stage A correctness: ✓ {}/{} match (host_write→GPU_read zero-copy)", n_elements, n_elements);
+        println!(
+            "  Stage A correctness: ✓ {}/{} match (host_write→GPU_read zero-copy)",
+            n_elements, n_elements
+        );
     } else {
         println!("  Stage A correctness: ✗ {} mismatch", mismatch);
         if let Some((i, got, exp)) = first_bad {
@@ -269,7 +286,10 @@ fn main() -> anyhow::Result<()> {
             for i in 0..8 {
                 let exp = (new_val + i as f32) * 2.0 + 7.0;
                 if (out_slice[i] - exp).abs() > 1e-4 * exp.abs().max(1.0) {
-                    eprintln!("  Sync iter {} sample bad: out[{}]={} expected={}", it, i, out_slice[i], exp);
+                    eprintln!(
+                        "  Sync iter {} sample bad: out[{}]={} expected={}",
+                        it, i, out_slice[i], exp
+                    );
                 }
             }
         }
@@ -289,8 +309,7 @@ fn main() -> anyhow::Result<()> {
     // HTP setup
     let htp_lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnHtp.so") }
         .or_else(|_| unsafe { Library::new("libQnnHtp.so") })?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
     let get_providers: Symbol<GetProvidersFn> =
         unsafe { htp_lib.get(b"QnnInterface_getProviders\0")? };
     let mut providers: *mut *const QnnInterface_t = ptr::null_mut();
@@ -300,8 +319,7 @@ fn main() -> anyhow::Result<()> {
     let v = unsafe { (**providers).__bindgen_anon_1.v2_25 };
 
     let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
-    let err =
-        unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
+    let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
     anyhow::ensure!(err == 0, "backendCreate err=0x{:x}", err);
     let mut htp_ctx: Qnn_ContextHandle_t = ptr::null_mut();
     let err = unsafe {
@@ -337,11 +355,13 @@ fn main() -> anyhow::Result<()> {
             },
         }
     };
-    let descs = [mk_descriptor(fd_a), mk_descriptor(fd_b), mk_descriptor(fd_c)];
+    let descs = [
+        mk_descriptor(fd_a),
+        mk_descriptor(fd_b),
+        mk_descriptor(fd_c),
+    ];
     let mut mh = [ptr::null_mut::<c_void>(); 3];
-    let err = unsafe {
-        (v.memRegister.unwrap())(htp_ctx, descs.as_ptr(), 3, mh.as_mut_ptr())
-    };
+    let err = unsafe { (v.memRegister.unwrap())(htp_ctx, descs.as_ptr(), 3, mh.as_mut_ptr()) };
     anyhow::ensure!(err == 0, "QnnMem_register err=0x{:x}", err);
 
     // Build HTP graph (RAW + null at finalize, MEMHANDLE at execute)
@@ -364,14 +384,20 @@ fn main() -> anyhow::Result<()> {
                 quantizationEncoding:
                     Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: 1,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
+                },
             },
         }
     };
@@ -432,8 +458,13 @@ fn main() -> anyhow::Result<()> {
         htp_inputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[0];
         htp_inputs[1].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
         htp_inputs[1].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[1];
-        htp_outputs[0].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
-        htp_outputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[2];
+        htp_outputs[0].__bindgen_anon_1.v1.memType =
+            Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
+        htp_outputs[0]
+            .__bindgen_anon_1
+            .v1
+            .__bindgen_anon_1
+            .memHandle = mh[2];
     }
 
     // Fill HTP inputs via host pointer
@@ -472,7 +503,11 @@ fn main() -> anyhow::Result<()> {
             &mut cl_err,
         )
     };
-    anyhow::ensure!(!cl_c.is_null() && cl_err == 0, "cl_mem from rpc_c fd err={}", cl_err);
+    anyhow::ensure!(
+        !cl_c.is_null() && cl_err == 0,
+        "cl_mem from rpc_c fd err={}",
+        cl_err
+    );
     let cl_c_mem = unsafe { ocl::core::Mem::from_raw_copied_ptr(cl_c) };
 
     // Use scale kernel to read rpc_c (in cl_in's place), output to cl_out
@@ -521,22 +556,31 @@ fn main() -> anyhow::Result<()> {
     } else {
         println!("  Stage B correctness: ✗ {} mismatch", htp_mismatch);
         if let Some((i, got, exp, htp)) = htp_first {
-            println!("    first bad: out[{}]={} expected={} (HTP_val was {})", i, got, exp, htp);
+            println!(
+                "    first bad: out[{}]={} expected={} (HTP_val was {})",
+                i, got, exp, htp
+            );
         }
     }
 
     // ── R-Y verdict ──
     println!("\n=== R-Y summary ===");
-    println!(
-        "  cl_khr_external_memory_dma_buf cl_mem 생성: ✓"
-    );
+    println!("  cl_khr_external_memory_dma_buf cl_mem 생성: ✓");
     println!(
         "  Stage A (host→rpcmem→GPU): {}",
-        if mismatch == 0 { "✓ PASS" } else { "✗ FAIL" }
+        if mismatch == 0 {
+            "✓ PASS"
+        } else {
+            "✗ FAIL"
+        }
     );
     println!(
         "  Stage B (HTP→rpcmem→GPU): {}",
-        if htp_mismatch == 0 { "✓ PASS" } else { "✗ FAIL" }
+        if htp_mismatch == 0 {
+            "✓ PASS"
+        } else {
+            "✗ FAIL"
+        }
     );
     println!("  Sync cost (GPU kernel mean): {:.3} ms", mean);
 
@@ -545,9 +589,7 @@ fn main() -> anyhow::Result<()> {
             "\n=> R-Y PASS: HTP↔OpenCL zero-copy interop 검증 OK. \n   진정 async weight loading 가능 (HTP write + GPU read 동시 가능)."
         );
     } else if mismatch == 0 && htp_mismatch != 0 {
-        println!(
-            "\n=> R-Y PARTIAL: host→GPU OK, HTP→GPU 미정. cache sync 검토 필요."
-        );
+        println!("\n=> R-Y PARTIAL: host→GPU OK, HTP→GPU 미정. cache sync 검토 필요.");
     } else {
         println!("\n=> R-Y FAIL: dmabuf zero-copy 자체 작동 안 함.");
     }
@@ -564,5 +606,9 @@ fn main() -> anyhow::Result<()> {
         rpcmem_free(rpc_c);
     }
 
-    if mismatch == 0 && htp_mismatch == 0 { Ok(()) } else { std::process::exit(1) }
+    if mismatch == 0 && htp_mismatch == 0 {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }

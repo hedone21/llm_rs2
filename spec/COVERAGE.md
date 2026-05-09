@@ -1,6 +1,8 @@
 # INV Coverage Tracker
 
 > 전체: 74개 | ✅ 48 | ⬜ 8 | 🔶 17 (INV-131~134 추가, 2026-04-25 Weight Swap Phase 3.7 SOA re-conversion + AUF format)
+>
+> 2026-05-09 추가: INV-151~155 (QNN OpPackage cdylib M1, 5개) — `spec/35-engine-qnn-oppkg.md`. 테스트 위치 `crates/qnn_oppkg/tests/spec/`(host) — Implementer가 M1.2~M1.10에서 작성.
 
 ## 범례
 
@@ -172,6 +174,18 @@
 | INV-141 | `PrimaryReleaseWorker`는 다음 swap 트리거 전 drain 완료. `pending_count() == 0` 검증 후 진입, non-zero 시 짧은 deadline `drain()` + 재검증 + drain 실패 시 `SwapError::ReleaseDrainTimeout`. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_141_release_worker_drain.rs` |
 | INV-142 | `execute_on_slots`의 `ratio_generation.fetch_add` 직전 `backend.synchronize()` 1회 호출 보장. 비동기 write_buffer/fused convert가 모두 완료된 후 SOA registry 갱신과 ratio_generation bump가 직렬화된다. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_142_stage_gate_sync.rs` + 디바이스 e2e (INV-122 v2.1 단일-token 게이트) |
 | INV-143 | AOS borrow buffer는 secondary `Arc<SecondaryMmap>` clone을 보관. Tensor 생존 동안 secondary refcount ≥ 2. mmap drop으로 인한 SIGBUS 차단. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_143_borrow_buffer_lifetime.rs` |
+
+## QNN OpPackage cdylib (INV-151 ~ INV-155, 2026-05-09 M1)
+
+> Production cdylib `crates/qnn_oppkg/` (5 ops). 대응 명세: `30-engine.md` 부록 A (ENG-QNN-010 ~ ENG-QNN-C04). PoC `crates/qnn_oppkg_poc/`는 회귀 안전망으로 보존. **Implementer가 M1.2~M1.10에서 테스트 작성**, 본 항목은 명세만.
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-151 | qnn_oppkg ↔ engine/manager/shared cargo dependency edge 양방향 부재. workspace member로만 등록, build graph isolated subgraph. | Safety | 🆕 미구현 | `crates/qnn_oppkg/tests/spec/test_inv_151_isolation.rs` (`cargo_metadata` 사용) |
+| INV-152 | `OPS.len() == StaticInfo::numOperations` (M1: 5). | Correctness | 🆕 미구현 | `crates/qnn_oppkg/tests/spec/test_inv_152_153_registry.rs` |
+| INV-153 | `OPS` 슬라이스 내 op_type 고유성. 중복 등록 금지. | Correctness | 🆕 미구현 | `crates/qnn_oppkg/tests/spec/test_inv_152_153_registry.rs` |
+| INV-154 | cdylib `backendApiVersion == (3, 7, 0)`. SDK 계약 버전. Phase R G-1-F 결정적 fix. | Compatibility | 🆕 미구현 | `crates/qnn_oppkg/tests/spec/test_inv_154_api_version.rs` (FFI surface) |
+| INV-155 | 100회 register/free 후 last-50 VmRSS slope < 1 KB/iter. PoC leak 패턴 폐기, M1.8 reverse-mapping table 정상화. | Safety | 🆕 미구현 | `engine/src/bin/microbench_qnn_oppkg_leak.rs` (디바이스 microbench) |
 
 ## Intra-forward Layer-aligned Swap (INV-147 ~ INV-150, 2026-05-08)
 

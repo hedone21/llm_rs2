@@ -23,7 +23,12 @@ fn main() {
 }
 
 #[cfg(feature = "qnn")]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -53,8 +58,7 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "/data/local/tmp/qnn/libQnnGpu.so".to_string());
     println!("Backend lib: {}", backend_lib_path);
     let gpu_lib = unsafe { Library::new(&backend_lib_path) }?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
     let gp: Symbol<GetProvidersFn> = unsafe { gpu_lib.get(b"QnnInterface_getProviders\0")? };
     let mut provs: *mut *const QnnInterface_t = ptr::null_mut();
     let mut np: c_uint = 0;
@@ -97,44 +101,46 @@ fn main() -> anyhow::Result<()> {
     println!("    ✓ PASS");
 
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.contextCreate.unwrap())(be, ptr::null_mut(), ptr::null_mut(), &mut ctx)
-    };
+    let err = unsafe { (v.contextCreate.unwrap())(be, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
     println!("context: OK");
 
     let g_name = CString::new("custom_add_graph").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph)
-    };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
     let dims: Vec<u32> = vec![n as u32];
-    let mk_v1 =
-        |name: &CString, ttype: Qnn_TensorType_t, dims: &[u32]| -> Qnn_TensorV1_t {
-            Qnn_TensorV1_t {
-                id: 0,
-                name: name.as_ptr(),
-                type_: ttype,
-                dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
-                dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
-                quantizeParams: Qnn_QuantizeParams_t {
-                    encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
-                    quantizationEncoding:
-                        Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
-                    __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                        scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+    let mk_v1 = |name: &CString, ttype: Qnn_TensorType_t, dims: &[u32]| -> Qnn_TensorV1_t {
+        Qnn_TensorV1_t {
+            id: 0,
+            name: name.as_ptr(),
+            type_: ttype,
+            dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
+            dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+            quantizeParams: Qnn_QuantizeParams_t {
+                encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
+                quantizationEncoding:
+                    Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
+                __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
                     },
                 },
-                rank: 1,
-                dimensions: dims.as_ptr() as *mut u32,
-                memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
-                __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                    clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+            },
+            rank: 1,
+            dimensions: dims.as_ptr() as *mut u32,
+            memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
+            __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
                 },
-            }
-        };
+            },
+        }
+    };
     let n_a = CString::new("A").unwrap();
     let n_b = CString::new("B").unwrap();
     let n_c = CString::new("C").unwrap();
@@ -241,15 +247,20 @@ fn main() -> anyhow::Result<()> {
             dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
             memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
             __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
-                dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host_data },
+                dmaBufInfo: Qnn_MemDmaBufInfo_t {
+                    fd,
+                    data: host_data,
+                },
             },
         }
     };
-    let descs = [mk_desc(fd_a, rpc_a), mk_desc(fd_b, rpc_b), mk_desc(fd_c, rpc_c)];
+    let descs = [
+        mk_desc(fd_a, rpc_a),
+        mk_desc(fd_b, rpc_b),
+        mk_desc(fd_c, rpc_c),
+    ];
     let mut mh = [ptr::null_mut::<c_void>(); 3];
-    let err = unsafe {
-        (v.memRegister.unwrap())(ctx, descs.as_ptr(), 3, mh.as_mut_ptr())
-    };
+    let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 3, mh.as_mut_ptr()) };
     anyhow::ensure!(err == 0, "memRegister err=0x{:x}", err);
     inputs[0].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
     inputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[0];
@@ -296,18 +307,29 @@ fn main() -> anyhow::Result<()> {
     let gc_pass = mismatch == 0;
     println!(
         "    {}",
-        if gc_pass { "✓ PASS — custom OpenCL kernel ran inside QNN-GPU runtime" } else { "✗ FAIL" }
+        if gc_pass {
+            "✓ PASS — custom OpenCL kernel ran inside QNN-GPU runtime"
+        } else {
+            "✗ FAIL"
+        }
     );
 
     println!("\n=== Summary ===");
     println!("GA registerOpPackage: PASS");
     println!("GB graphAddNode:      PASS");
-    println!("GC graphExecute:      {}", if gc_pass { "PASS" } else { "FAIL" });
+    println!(
+        "GC graphExecute:      {}",
+        if gc_pass { "PASS" } else { "FAIL" }
+    );
 
     unsafe {
         let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), 3);
         let _ = (v.contextFree.unwrap())(ctx, ptr::null_mut());
         let _ = (v.backendFree.unwrap())(be);
     }
-    if gc_pass { Ok(()) } else { std::process::exit(1) }
+    if gc_pass {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }

@@ -16,7 +16,12 @@ fn main() {
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -34,7 +39,10 @@ fn main() -> anyhow::Result<()> {
     const PKG_PATH: &str = "/data/local/tmp/libqnn_oppkg_poc.so";
     const PKG_PROVIDER: &str = "QnnOpPackage_InitInterface";
     const PKG_TARGET: &str = "GPU";
-    let n_iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let n_iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
 
     let m: usize = 1;
     let k: usize = 1536;
@@ -48,7 +56,10 @@ fn main() -> anyhow::Result<()> {
     use ocl::{Context, Device, Platform, Program, Queue};
     let platform = Platform::default();
     let device = Device::first(platform)?;
-    let cl_ctx = Context::builder().platform(platform).devices(device).build()?;
+    let cl_ctx = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
     let kernel_src = include_str!("../../kernels/mul_mv_f16_f32.cl");
     let cl_program = Program::builder()
@@ -75,11 +86,32 @@ fn main() -> anyhow::Result<()> {
         ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, m * k, None)?
     };
     let buf_y = unsafe {
-        ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_WRITE, m * n, None)?
+        ocl::core::create_buffer::<_, f32>(
+            cl_ctx.as_core(),
+            ocl::core::MEM_READ_WRITE,
+            m * n,
+            None,
+        )?
     };
     unsafe {
-        ocl::core::enqueue_write_buffer(&cl_q, &buf_w, true, 0, &host_w_f16, None::<ocl::core::Event>, None::<&mut ocl::core::Event>)?;
-        ocl::core::enqueue_write_buffer(&cl_q, &buf_x, true, 0, &host_x_f32, None::<ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+        ocl::core::enqueue_write_buffer(
+            &cl_q,
+            &buf_w,
+            true,
+            0,
+            &host_w_f16,
+            None::<ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
+        ocl::core::enqueue_write_buffer(
+            &cl_q,
+            &buf_x,
+            true,
+            0,
+            &host_x_f32,
+            None::<ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
     }
     ocl::core::finish(&cl_q)?;
 
@@ -109,8 +141,16 @@ fn main() -> anyhow::Result<()> {
     let exec_baseline = || -> anyhow::Result<f64> {
         let t0 = Instant::now();
         unsafe {
-            ocl::core::enqueue_kernel(&cl_q, &cl_kernel, 3, None, &global, Some(local),
-                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            ocl::core::enqueue_kernel(
+                &cl_q,
+                &cl_kernel,
+                3,
+                None,
+                &global,
+                Some(local),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
         }
         ocl::core::finish(&cl_q)?;
         Ok(t0.elapsed().as_secs_f64() * 1000.0)
@@ -134,7 +174,12 @@ fn main() -> anyhow::Result<()> {
     let pkg_provider = CString::new(PKG_PROVIDER).unwrap();
     let pkg_target = CString::new(PKG_TARGET).unwrap();
     let err = unsafe {
-        (v.backendRegisterOpPackage.unwrap())(be, pkg_path.as_ptr(), pkg_provider.as_ptr(), pkg_target.as_ptr())
+        (v.backendRegisterOpPackage.unwrap())(
+            be,
+            pkg_path.as_ptr(),
+            pkg_provider.as_ptr(),
+            pkg_target.as_ptr(),
+        )
     };
     anyhow::ensure!(err == 0, "registerOpPackage err=0x{:x}", err);
     println!("registerOpPackage: OK");
@@ -145,14 +190,19 @@ fn main() -> anyhow::Result<()> {
 
     let g_name = CString::new("oppkg_gemv").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
     // Tensors: weight [N, K] F16, x [M, K] F32, y [M, N] F32
     let dims_w: Vec<u32> = vec![n as u32, k as u32];
     let dims_x: Vec<u32> = vec![m as u32, k as u32];
     let dims_y: Vec<u32> = vec![m as u32, n as u32];
-    let mk_v1 = |name: &CString, ttype: Qnn_TensorType_t, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_TensorV1_t {
+    let mk_v1 = |name: &CString,
+                 ttype: Qnn_TensorType_t,
+                 dt: Qnn_DataType_t,
+                 dims: &[u32]|
+     -> Qnn_TensorV1_t {
         Qnn_TensorV1_t {
             id: 0,
             name: name.as_ptr(),
@@ -161,16 +211,23 @@ fn main() -> anyhow::Result<()> {
             dataType: dt,
             quantizeParams: Qnn_QuantizeParams_t {
                 encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
-                quantizationEncoding: Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
+                quantizationEncoding:
+                    Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: dims.len() as u32,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
+                },
             },
         }
     };
@@ -180,19 +237,34 @@ fn main() -> anyhow::Result<()> {
     let mut t_w = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_v1(&n_w, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, &dims_w),
+            v1: mk_v1(
+                &n_w,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
+                &dims_w,
+            ),
         },
     };
     let mut t_x = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_v1(&n_x, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_x),
+            v1: mk_v1(
+                &n_x,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                &dims_x,
+            ),
         },
     };
     let mut t_y = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_v1(&n_y, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_y),
+            v1: mk_v1(
+                &n_y,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ,
+                Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                &dims_y,
+            ),
         },
     };
     for (l, t) in [("W", &mut t_w), ("X", &mut t_x), ("Y", &mut t_y)] {
@@ -245,23 +317,32 @@ fn main() -> anyhow::Result<()> {
     let fd_x = unsafe { rpc_to_fd(rpc_x) };
     let fd_y = unsafe { rpc_to_fd(rpc_y) };
     unsafe {
-        std::ptr::copy_nonoverlapping(host_w_f16.as_ptr() as *const u8, rpc_w as *mut u8, bw as usize);
-        std::ptr::copy_nonoverlapping(host_x_f32.as_ptr() as *const u8, rpc_x as *mut u8, bx as usize);
+        std::ptr::copy_nonoverlapping(
+            host_w_f16.as_ptr() as *const u8,
+            rpc_w as *mut u8,
+            bw as usize,
+        );
+        std::ptr::copy_nonoverlapping(
+            host_x_f32.as_ptr() as *const u8,
+            rpc_x as *mut u8,
+            bx as usize,
+        );
     }
-    let mk_desc = |fd: i32, host: *mut c_void, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_MemDescriptor_t {
-        Qnn_MemDescriptor_t {
-            memShape: Qnn_MemShape_t {
-                numDim: dims.len() as u32,
-                dimSize: dims.as_ptr() as *mut u32,
-                shapeConfig: ptr::null(),
-            },
-            dataType: dt,
-            memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
-            __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
-                dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host },
-            },
-        }
-    };
+    let mk_desc =
+        |fd: i32, host: *mut c_void, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_MemDescriptor_t {
+            Qnn_MemDescriptor_t {
+                memShape: Qnn_MemShape_t {
+                    numDim: dims.len() as u32,
+                    dimSize: dims.as_ptr() as *mut u32,
+                    shapeConfig: ptr::null(),
+                },
+                dataType: dt,
+                memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
+                __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
+                    dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host },
+                },
+            }
+        };
     let descs = [
         mk_desc(fd_w, rpc_w, Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, &dims_w),
         mk_desc(fd_x, rpc_x, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_x),
@@ -281,7 +362,15 @@ fn main() -> anyhow::Result<()> {
     let mut exec_oppkg = || -> anyhow::Result<f64> {
         let t0 = Instant::now();
         let err = unsafe {
-            (v.graphExecute.unwrap())(graph, inputs.as_ptr(), 2, outputs.as_mut_ptr(), 1, ptr::null_mut(), ptr::null_mut())
+            (v.graphExecute.unwrap())(
+                graph,
+                inputs.as_ptr(),
+                2,
+                outputs.as_mut_ptr(),
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
         };
         anyhow::ensure!(err == 0, "graphExecute err=0x{:x}", err);
         Ok(t0.elapsed().as_secs_f64() * 1000.0)
@@ -295,7 +384,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Measure
-    let measure = |label: &str, mut f: Box<dyn FnMut() -> anyhow::Result<f64>>| -> anyhow::Result<(f64, f64)> {
+    let measure = |label: &str,
+                   mut f: Box<dyn FnMut() -> anyhow::Result<f64>>|
+     -> anyhow::Result<(f64, f64)> {
         let mut s: Vec<f64> = Vec::with_capacity(n_iters);
         for _ in 0..n_iters {
             s.push(f()?);
@@ -306,7 +397,10 @@ fn main() -> anyhow::Result<()> {
         let median = sorted[sorted.len() / 2];
         let var = s.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_iters as f64;
         let cv = var.sqrt() / mean;
-        println!("{:<40} mean={:.3}ms median={:.3}ms σ/mean={:.4}", label, mean, median, cv);
+        println!(
+            "{:<40} mean={:.3}ms median={:.3}ms σ/mean={:.4}",
+            label, mean, median, cv
+        );
         Ok((mean, median))
     };
     let (b_mean, b_median) = measure("baseline OpenCL mul_mv_f16_f32", Box::new(exec_baseline))?;
@@ -324,16 +418,33 @@ fn main() -> anyhow::Result<()> {
         let y_slice = std::slice::from_raw_parts(rpc_y as *const f32, m * n);
         // baseline result still in buf_y; read back
         let mut baseline_y = vec![0.0f32; m * n];
-        ocl::core::enqueue_read_buffer(&cl_q, &buf_y, true, 0, &mut baseline_y, None::<ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+        ocl::core::enqueue_read_buffer(
+            &cl_q,
+            &buf_y,
+            true,
+            0,
+            &mut baseline_y,
+            None::<ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
         for i in 0..m * n {
             let d = (y_slice[i] - baseline_y[i]).abs();
-            if d > max_abs { max_abs = d; }
+            if d > max_abs {
+                max_abs = d;
+            }
         }
     }
     println!("correctness  max_abs(qnn vs cl) = {:.6}", max_abs);
 
     let pass = mean_ratio <= 1.10;
-    println!("Verdict: {}", if pass { "✓ PASS — OpPackage performance preserved" } else { "✗ FAIL" });
+    println!(
+        "Verdict: {}",
+        if pass {
+            "✓ PASS — OpPackage performance preserved"
+        } else {
+            "✗ FAIL"
+        }
+    );
 
     unsafe {
         let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), 3);
@@ -349,10 +460,16 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     let sign = ((bits >> 31) & 0x1) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
     let mant = bits & 0x7f_ffff;
-    if exp == 0 { return sign << 15; }
+    if exp == 0 {
+        return sign << 15;
+    }
     let new_exp = exp - 127 + 15;
-    if new_exp <= 0 { return sign << 15; }
-    if new_exp >= 31 { return (sign << 15) | (0x1f << 10); }
+    if new_exp <= 0 {
+        return sign << 15;
+    }
+    if new_exp >= 31 {
+        return (sign << 15) | (0x1f << 10);
+    }
     let new_mant = (mant >> 13) as u16;
     (sign << 15) | ((new_exp as u16) << 10) | new_mant
 }

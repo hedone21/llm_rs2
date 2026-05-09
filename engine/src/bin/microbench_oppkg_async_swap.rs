@@ -25,7 +25,12 @@ fn main() {
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -64,7 +69,10 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== microbench_oppkg_async_swap ===");
     println!("dim K={} N={} (square)", k, n);
-    println!("Weight per op: F16 = {:.2} MB", weight_bytes as f64 / 1024.0 / 1024.0);
+    println!(
+        "Weight per op: F16 = {:.2} MB",
+        weight_bytes as f64 / 1024.0 / 1024.0
+    );
     println!("graphExecute chain depth: {}", chain_depth);
     println!("memcpy chunk: {} MB", memcpy_mb);
     println!("n_iters: {}\n", n_iters);
@@ -86,7 +94,12 @@ fn main() -> anyhow::Result<()> {
     let pkg_provider = CString::new(PKG_PROVIDER).unwrap();
     let pkg_target = CString::new(PKG_TARGET).unwrap();
     let err = unsafe {
-        (v.backendRegisterOpPackage.unwrap())(be, pkg_path.as_ptr(), pkg_provider.as_ptr(), pkg_target.as_ptr())
+        (v.backendRegisterOpPackage.unwrap())(
+            be,
+            pkg_path.as_ptr(),
+            pkg_provider.as_ptr(),
+            pkg_target.as_ptr(),
+        )
     };
     anyhow::ensure!(err == 0, "registerOpPackage err=0x{:x}", err);
 
@@ -96,14 +109,19 @@ fn main() -> anyhow::Result<()> {
 
     let g_name = CString::new("async_swap_chain").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0);
 
     let _ = weight_bytes;
 
     let dims_w: Vec<u32> = vec![n as u32, k as u32];
     let dims_v: Vec<u32> = vec![m as u32, n as u32];
-    let mk_v1 = |name: &CString, ttype: Qnn_TensorType_t, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_TensorV1_t {
+    let mk_v1 = |name: &CString,
+                 ttype: Qnn_TensorType_t,
+                 dt: Qnn_DataType_t,
+                 dims: &[u32]|
+     -> Qnn_TensorV1_t {
         Qnn_TensorV1_t {
             id: 0,
             name: name.as_ptr(),
@@ -112,16 +130,23 @@ fn main() -> anyhow::Result<()> {
             dataType: dt,
             quantizeParams: Qnn_QuantizeParams_t {
                 encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
-                quantizationEncoding: Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
+                quantizationEncoding:
+                    Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: dims.len() as u32,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
+                },
             },
         }
     };
@@ -130,23 +155,43 @@ fn main() -> anyhow::Result<()> {
     let mut t_w = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_v1(&n_w, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE, Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, &dims_w),
+            v1: mk_v1(
+                &n_w,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
+                &dims_w,
+            ),
         },
     };
     let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, &mut t_w) };
     anyhow::ensure!(err == 0);
 
-    let mut int_names: Vec<CString> = (0..=chain_depth).map(|i| CString::new(format!("y{}", i)).unwrap()).collect();
+    let mut int_names: Vec<CString> = (0..=chain_depth)
+        .map(|i| CString::new(format!("y{}", i)).unwrap())
+        .collect();
     let mut y_tensors: Vec<Qnn_Tensor_t> = Vec::with_capacity(chain_depth + 1);
     for i in 0..=chain_depth {
-        let ttype = if i == 0 { Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE }
-                    else if i == chain_depth { Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ }
-                    else { Qnn_TensorType_t_QNN_TENSOR_TYPE_NATIVE };
-        let dims = if i == 0 { vec![m as u32, k as u32] } else { dims_v.clone() };
+        let ttype = if i == 0 {
+            Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE
+        } else if i == chain_depth {
+            Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ
+        } else {
+            Qnn_TensorType_t_QNN_TENSOR_TYPE_NATIVE
+        };
+        let dims = if i == 0 {
+            vec![m as u32, k as u32]
+        } else {
+            dims_v.clone()
+        };
         let mut t = Qnn_Tensor_t {
             version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
             __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                v1: mk_v1(&int_names[i], ttype, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims),
+                v1: mk_v1(
+                    &int_names[i],
+                    ttype,
+                    Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                    &dims,
+                ),
             },
         };
         let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, &mut t) };
@@ -157,7 +202,9 @@ fn main() -> anyhow::Result<()> {
 
     let pkg_n = CString::new("qnn_oppkg_poc").unwrap();
     let op_type = CString::new("CustomMatMul").unwrap();
-    let op_names: Vec<CString> = (0..chain_depth).map(|i| CString::new(format!("mm_{}", i)).unwrap()).collect();
+    let op_names: Vec<CString> = (0..chain_depth)
+        .map(|i| CString::new(format!("mm_{}", i)).unwrap())
+        .collect();
     let mut inputs_h: Vec<[Qnn_Tensor_t; 2]> = Vec::with_capacity(chain_depth);
     let mut outputs_h: Vec<[Qnn_Tensor_t; 1]> = Vec::with_capacity(chain_depth);
     for i in 0..chain_depth {
@@ -205,7 +252,9 @@ fn main() -> anyhow::Result<()> {
     let rpc_w_b = unsafe { rpc_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, memcpy_bytes) };
     let rpc_y0 = unsafe { rpc_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bx) };
     let rpc_yn = unsafe { rpc_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, by) };
-    anyhow::ensure!(!rpc_w_a.is_null() && !rpc_w_b.is_null() && !rpc_y0.is_null() && !rpc_yn.is_null());
+    anyhow::ensure!(
+        !rpc_w_a.is_null() && !rpc_w_b.is_null() && !rpc_y0.is_null() && !rpc_yn.is_null()
+    );
 
     // Fill rpc_w_a
     let mut host_w_a = vec![0u16; n * k];
@@ -213,9 +262,15 @@ fn main() -> anyhow::Result<()> {
         let val = ((i as f32) * 0.0007 + 0.13).rem_euclid(1.0) - 0.5;
         host_w_a[i] = f32_to_f16_bits(val);
     }
-    let host_x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.011).rem_euclid(1.0) - 0.5).collect();
+    let host_x: Vec<f32> = (0..m * k)
+        .map(|i| ((i as f32) * 0.011).rem_euclid(1.0) - 0.5)
+        .collect();
     unsafe {
-        std::ptr::copy_nonoverlapping(host_w_a.as_ptr() as *const u8, rpc_w_a as *mut u8, bw as usize);
+        std::ptr::copy_nonoverlapping(
+            host_w_a.as_ptr() as *const u8,
+            rpc_w_a as *mut u8,
+            bw as usize,
+        );
         std::ptr::copy_nonoverlapping(host_x.as_ptr() as *const u8, rpc_y0 as *mut u8, bx as usize);
     }
     // host source for memcpy → rpc_w_b. size = memcpy_bytes (independent of graph weight)
@@ -228,24 +283,35 @@ fn main() -> anyhow::Result<()> {
     let fd_w_a = unsafe { rpc_to_fd(rpc_w_a) };
     let fd_y0 = unsafe { rpc_to_fd(rpc_y0) };
     let fd_yn = unsafe { rpc_to_fd(rpc_yn) };
-    let mk_desc = |fd: i32, host: *mut c_void, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_MemDescriptor_t {
-        Qnn_MemDescriptor_t {
-            memShape: Qnn_MemShape_t {
-                numDim: dims.len() as u32,
-                dimSize: dims.as_ptr() as *mut u32,
-                shapeConfig: ptr::null(),
-            },
-            dataType: dt,
-            memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
-            __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
-                dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host },
-            },
-        }
-    };
+    let mk_desc =
+        |fd: i32, host: *mut c_void, dt: Qnn_DataType_t, dims: &[u32]| -> Qnn_MemDescriptor_t {
+            Qnn_MemDescriptor_t {
+                memShape: Qnn_MemShape_t {
+                    numDim: dims.len() as u32,
+                    dimSize: dims.as_ptr() as *mut u32,
+                    shapeConfig: ptr::null(),
+                },
+                dataType: dt,
+                memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
+                __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
+                    dmaBufInfo: Qnn_MemDmaBufInfo_t { fd, data: host },
+                },
+            }
+        };
     let dims_y0: Vec<u32> = vec![m as u32, k as u32];
     let descs = [
-        mk_desc(fd_w_a, rpc_w_a, Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, &dims_w),
-        mk_desc(fd_y0, rpc_y0, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_y0),
+        mk_desc(
+            fd_w_a,
+            rpc_w_a,
+            Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
+            &dims_w,
+        ),
+        mk_desc(
+            fd_y0,
+            rpc_y0,
+            Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+            &dims_y0,
+        ),
         mk_desc(fd_yn, rpc_yn, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_v),
     ];
     let mut mh = [ptr::null_mut::<c_void>(); 3];
@@ -276,9 +342,12 @@ fn main() -> anyhow::Result<()> {
         let err = unsafe {
             (v.graphExecute.unwrap())(
                 graph_ptr as Qnn_GraphHandle_t,
-                in_ptr as *const Qnn_Tensor_t, 2,
-                out_ptr as *mut Qnn_Tensor_t, 1,
-                ptr::null_mut(), ptr::null_mut(),
+                in_ptr as *const Qnn_Tensor_t,
+                2,
+                out_ptr as *mut Qnn_Tensor_t,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
             )
         };
         anyhow::ensure!(err == 0, "graphExecute err=0x{:x}", err);
@@ -307,21 +376,33 @@ fn main() -> anyhow::Result<()> {
         let _ = exec_memcpy();
     }
 
-    let measure = |label: &str, mut f: Box<dyn FnMut() -> anyhow::Result<f64>>, n_iters: usize| -> anyhow::Result<f64> {
+    let measure = |label: &str,
+                   mut f: Box<dyn FnMut() -> anyhow::Result<f64>>,
+                   n_iters: usize|
+     -> anyhow::Result<f64> {
         let mut s = Vec::with_capacity(n_iters);
-        for _ in 0..n_iters { s.push(f()?); }
+        for _ in 0..n_iters {
+            s.push(f()?);
+        }
         let mean = s.iter().sum::<f64>() / n_iters as f64;
         let mut sorted = s.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = sorted[sorted.len() / 2];
         let var = s.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_iters as f64;
         let cv = var.sqrt() / mean;
-        println!("{:<42} mean={:.3}ms median={:.3}ms σ/mean={:.4}", label, mean, median, cv);
+        println!(
+            "{:<42} mean={:.3}ms median={:.3}ms σ/mean={:.4}",
+            label, mean, median, cv
+        );
         Ok(mean)
     };
 
     let c1 = measure("C1: graphExecute only", Box::new(exec_graph), n_iters)?;
-    let c2 = measure("C2: host memcpy only", Box::new(move || Ok(exec_memcpy())), n_iters)?;
+    let c2 = measure(
+        "C2: host memcpy only",
+        Box::new(move || Ok(exec_memcpy())),
+        n_iters,
+    )?;
 
     // C3: concurrent
     let mut c3_samples = Vec::with_capacity(n_iters);
@@ -330,7 +411,9 @@ fn main() -> anyhow::Result<()> {
         let counter2 = counter.clone();
         let h2 = thread::spawn(move || -> f64 {
             counter2.fetch_add(1, Ordering::SeqCst);
-            while counter2.load(Ordering::SeqCst) < 2 { std::hint::spin_loop(); }
+            while counter2.load(Ordering::SeqCst) < 2 {
+                std::hint::spin_loop();
+            }
             let t0 = Instant::now();
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -341,7 +424,9 @@ fn main() -> anyhow::Result<()> {
             }
             t0.elapsed().as_secs_f64() * 1000.0
         });
-        while counter.load(Ordering::SeqCst) < 1 { std::hint::spin_loop(); }
+        while counter.load(Ordering::SeqCst) < 1 {
+            std::hint::spin_loop();
+        }
         let t0 = Instant::now();
         counter.fetch_add(1, Ordering::SeqCst);
         let _ = exec_graph()?;
@@ -352,7 +437,11 @@ fn main() -> anyhow::Result<()> {
     let mut sorted_c3 = c3_samples.clone();
     sorted_c3.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let c3_med = sorted_c3[sorted_c3.len() / 2];
-    let c3_var = c3_samples.iter().map(|&x| (x - c3_mean).powi(2)).sum::<f64>() / n_iters as f64;
+    let c3_var = c3_samples
+        .iter()
+        .map(|&x| (x - c3_mean).powi(2))
+        .sum::<f64>()
+        / n_iters as f64;
     let c3_cv = c3_var.sqrt() / c3_mean;
     println!(
         "{:<42} mean={:.3}ms median={:.3}ms σ/mean={:.4}",
@@ -368,7 +457,10 @@ fn main() -> anyhow::Result<()> {
         c4_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     let c4_mean = c4_samples.iter().sum::<f64>() / n_iters as f64;
-    println!("{:<42} mean={:.3}ms (sanity ≈ C1+C2)", "C4: sequential", c4_mean);
+    println!(
+        "{:<42} mean={:.3}ms (sanity ≈ C1+C2)",
+        "C4: sequential", c4_mean
+    );
 
     let max_c1c2 = c1.max(c2);
     let serial_sum = c1 + c2;
@@ -380,16 +472,26 @@ fn main() -> anyhow::Result<()> {
     println!("C3 (concurrent)    = {:.3} ms", c3_mean);
     println!("C4 (sequential)    = {:.3} ms", c4_mean);
     println!();
-    println!("C3 / max(C1,C2)    = {:.3}x  (≤1.10 → async OK)", c3_mean / max_c1c2);
-    println!("C3 / (C1+C2)       = {:.3}x  (≤0.70 → strong parallel; 1.0 = serialize)", c3_mean / serial_sum);
+    println!(
+        "C3 / max(C1,C2)    = {:.3}x  (≤1.10 → async OK)",
+        c3_mean / max_c1c2
+    );
+    println!(
+        "C3 / (C1+C2)       = {:.3}x  (≤0.70 → strong parallel; 1.0 = serialize)",
+        c3_mean / serial_sum
+    );
 
     let pass = c3_mean / max_c1c2 <= 1.10;
     let acceptable = c3_mean / max_c1c2 <= 1.30;
     println!(
         "\nVerdict: {}",
-        if pass { "✓ PASS — async swap OK (no measurable contention)" }
-        else if acceptable { "△ ACCEPTABLE — partial overlap" }
-        else { "✗ FAIL — serialize or contention" }
+        if pass {
+            "✓ PASS — async swap OK (no measurable contention)"
+        } else if acceptable {
+            "△ ACCEPTABLE — partial overlap"
+        } else {
+            "✗ FAIL — serialize or contention"
+        }
     );
 
     unsafe {
@@ -397,7 +499,11 @@ fn main() -> anyhow::Result<()> {
         let _ = (v.contextFree.unwrap())(ctx, ptr::null_mut());
         let _ = (v.backendFree.unwrap())(be);
     }
-    if acceptable { Ok(()) } else { std::process::exit(1) }
+    if acceptable {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
@@ -406,10 +512,16 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     let sign = ((bits >> 31) & 0x1) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
     let mant = bits & 0x7f_ffff;
-    if exp == 0 { return sign << 15; }
+    if exp == 0 {
+        return sign << 15;
+    }
     let new_exp = exp - 127 + 15;
-    if new_exp <= 0 { return sign << 15; }
-    if new_exp >= 31 { return (sign << 15) | (0x1f << 10); }
+    if new_exp <= 0 {
+        return sign << 15;
+    }
+    if new_exp >= 31 {
+        return (sign << 15) | (0x1f << 10);
+    }
     let new_mant = (mant >> 13) as u16;
     (sign << 15) | ((new_exp as u16) << 10) | new_mant
 }

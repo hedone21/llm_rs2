@@ -25,7 +25,12 @@ fn main() {
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -49,26 +54,26 @@ fn main() -> anyhow::Result<()> {
     // ── HTP setup ──
     let htp_lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnHtp.so") }
         .or_else(|_| unsafe { Library::new("libQnnHtp.so") })?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
     let get_providers: Symbol<GetProvidersFn> =
         unsafe { htp_lib.get(b"QnnInterface_getProviders\0")? };
     let mut providers: *mut *const QnnInterface_t = ptr::null_mut();
     let mut num: c_uint = 0;
     let err = unsafe { get_providers(&mut providers, &mut num) };
-    anyhow::ensure!(err == 0 && num > 0, "QnnInterface_getProviders err=0x{:x}", err);
+    anyhow::ensure!(
+        err == 0 && num > 0,
+        "QnnInterface_getProviders err=0x{:x}",
+        err
+    );
     let v = unsafe { (**providers).__bindgen_anon_1.v2_25 };
 
     let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend)
-    };
+    let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
     anyhow::ensure!(err == 0, "backendCreate err=0x{:x}", err);
 
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx)
-    };
+    let err =
+        unsafe { (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
 
     // HTP graph: large ElementWiseAdd to give the NPU enough work to be measurable.
@@ -98,11 +103,7 @@ fn main() -> anyhow::Result<()> {
         anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
         let dims = vec![n_elements as u32];
-        fn mk_v1(
-            name: &CString,
-            ttype: Qnn_TensorType_t,
-            dims: &[u32],
-        ) -> Qnn_TensorV1_t {
+        fn mk_v1(name: &CString, ttype: Qnn_TensorType_t, dims: &[u32]) -> Qnn_TensorV1_t {
             Qnn_TensorV1_t {
                 id: 0,
                 name: name.as_ptr(),
@@ -114,14 +115,20 @@ fn main() -> anyhow::Result<()> {
                     quantizationEncoding:
                         Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                     __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                        scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                        scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                            scale: 0.0,
+                            offset: 0,
+                        },
                     },
                 },
                 rank: dims.len() as u32,
                 dimensions: dims.as_ptr() as *mut u32,
                 memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
                 __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                    clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                    clientBuf: Qnn_ClientBuffer_t {
+                        data: ptr::null_mut(),
+                        dataSize: 0,
+                    },
                 },
             }
         }
@@ -179,8 +186,17 @@ fn main() -> anyhow::Result<()> {
 
         // We need to keep CStrings alive (they were referenced by tensor.name pointers
         // during create, but after finalize the backend has its own copy).
-        let _ = (name_a.clone(), name_b.clone(), name_c.clone(), op_name.clone(), pkg.clone(), op_type.clone());
-        Ok((graph, t_a, t_b, t_c, name_a, name_b, name_c, op_name, pkg, op_type, dims))
+        let _ = (
+            name_a.clone(),
+            name_b.clone(),
+            name_c.clone(),
+            op_name.clone(),
+            pkg.clone(),
+            op_type.clone(),
+        );
+        Ok((
+            graph, t_a, t_b, t_c, name_a, name_b, name_c, op_name, pkg, op_type, dims,
+        ))
     }
 
     // Auto-tune HTP element count to ~1 ms / execute
@@ -191,8 +207,19 @@ fn main() -> anyhow::Result<()> {
     let mut htp_c = vec![0.0f32; htp_n];
 
     let exec_htp = |v: &QnnInterface_ImplementationV2_25_t,
-                    g: &mut (Qnn_GraphHandle_t, Qnn_Tensor_t, Qnn_Tensor_t, Qnn_Tensor_t,
-                             CString, CString, CString, CString, CString, CString, Vec<u32>),
+                    g: &mut (
+        Qnn_GraphHandle_t,
+        Qnn_Tensor_t,
+        Qnn_Tensor_t,
+        Qnn_Tensor_t,
+        CString,
+        CString,
+        CString,
+        CString,
+        CString,
+        CString,
+        Vec<u32>,
+    ),
                     a: &mut [f32],
                     b: &mut [f32],
                     c: &mut [f32]|
@@ -226,7 +253,10 @@ fn main() -> anyhow::Result<()> {
         Ok(())
     };
 
-    println!("Tuning HTP ElementWiseAdd size for ~1 ms / execute (start n={}):", htp_n);
+    println!(
+        "Tuning HTP ElementWiseAdd size for ~1 ms / execute (start n={}):",
+        htp_n
+    );
     for _ in 0..6 {
         let t0 = Instant::now();
         exec_htp(&v, &mut htp_graph_state, &mut htp_a, &mut htp_b, &mut htp_c)?;
@@ -251,7 +281,10 @@ fn main() -> anyhow::Result<()> {
         exec_htp(&v, &mut htp_graph_state, &mut htp_a, &mut htp_b, &mut htp_c)?;
         t0.elapsed().as_secs_f64() * 1000.0
     };
-    println!("HTP per-iter ≈ {:.3} ms (n={})", htp_per_iter_target_ms, htp_n);
+    println!(
+        "HTP per-iter ≈ {:.3} ms (n={})",
+        htp_per_iter_target_ms, htp_n
+    );
 
     // ── OpenCL setup ──
     use ocl::core::ArgVal;
@@ -259,7 +292,10 @@ fn main() -> anyhow::Result<()> {
 
     let platform = Platform::default();
     let device = Device::first(platform)?;
-    let cl_ctx = Context::builder().platform(platform).devices(device).build()?;
+    let cl_ctx = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
 
     let busy_src = r#"
         __kernel void busy(__global float* out, const int iters) {
@@ -272,14 +308,27 @@ fn main() -> anyhow::Result<()> {
             out[id] = v;
         }
     "#;
-    let program = Program::builder().devices(device).src(busy_src).build(&cl_ctx)?;
+    let program = Program::builder()
+        .devices(device)
+        .src(busy_src)
+        .build(&cl_ctx)?;
     let kernel = ocl::core::create_kernel(&program, "busy")?;
     const GSIZE: usize = 1024;
     let buf_a = unsafe {
-        ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_WRITE, GSIZE, None)?
+        ocl::core::create_buffer::<_, f32>(
+            cl_ctx.as_core(),
+            ocl::core::MEM_READ_WRITE,
+            GSIZE,
+            None,
+        )?
     };
     let buf_b = unsafe {
-        ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_WRITE, GSIZE, None)?
+        ocl::core::create_buffer::<_, f32>(
+            cl_ctx.as_core(),
+            ocl::core::MEM_READ_WRITE,
+            GSIZE,
+            None,
+        )?
     };
 
     // Tune iters → ~1ms
@@ -338,7 +387,13 @@ fn main() -> anyhow::Result<()> {
     };
 
     // ── Configs ──
-    enum Cfg { GpuOnly, HtpOnly, Parallel, GpuSeqTwo, HtpThenGpu }
+    enum Cfg {
+        GpuOnly,
+        HtpOnly,
+        Parallel,
+        GpuSeqTwo,
+        HtpThenGpu,
+    }
     let configs: &[(&str, Cfg)] = &[
         ("C1: GPU only baseline", Cfg::GpuOnly),
         ("C2: HTP only baseline", Cfg::HtpOnly),
@@ -358,8 +413,12 @@ fn main() -> anyhow::Result<()> {
         // Warmup
         for _ in 0..5 {
             match cfg {
-                Cfg::GpuOnly | Cfg::GpuSeqTwo => { let _ = exec_gpu(&buf_a)?; }
-                Cfg::HtpOnly => exec_htp(&v, &mut htp_graph_state, &mut htp_a, &mut htp_b, &mut htp_c)?,
+                Cfg::GpuOnly | Cfg::GpuSeqTwo => {
+                    let _ = exec_gpu(&buf_a)?;
+                }
+                Cfg::HtpOnly => {
+                    exec_htp(&v, &mut htp_graph_state, &mut htp_a, &mut htp_b, &mut htp_c)?
+                }
                 Cfg::Parallel | Cfg::HtpThenGpu => {
                     exec_htp(&v, &mut htp_graph_state, &mut htp_a, &mut htp_b, &mut htp_c)?;
                     let _ = exec_gpu(&buf_a)?;
@@ -402,7 +461,11 @@ fn main() -> anyhow::Result<()> {
                         let t0 = Instant::now();
                         unsafe {
                             ocl::core::set_kernel_arg(&kern, 0, ArgVal::mem(&buf_clone))?;
-                            ocl::core::set_kernel_arg(&kern, 1, ArgVal::scalar(&kernel_clone_iters))?;
+                            ocl::core::set_kernel_arg(
+                                &kern,
+                                1,
+                                ArgVal::scalar(&kernel_clone_iters),
+                            )?;
                             ocl::core::enqueue_kernel(
                                 &q,
                                 &kern,
@@ -471,12 +534,19 @@ fn main() -> anyhow::Result<()> {
     for (label, mean, median, cv) in &summary {
         println!(
             "{:<42} {:>8.3}ms {:>8.3}ms {:>9.3} {:>9.3}x",
-            label, mean, median, cv, mean / baseline
+            label,
+            mean,
+            median,
+            cv,
+            mean / baseline
         );
     }
     println!("\nGPU-only (C1)    = {:.3} ms (baseline)", baseline);
     println!("HTP-only (C2)    = {:.3} ms", htp_baseline);
-    println!("Sum (C1+C2)      = {:.3} ms (perfect serial upper bound)", sum_baseline);
+    println!(
+        "Sum (C1+C2)      = {:.3} ms (perfect serial upper bound)",
+        sum_baseline
+    );
     println!("Parallel (C3)    = {:.3} ms", summary[2].1);
 
     let parallel_ratio_to_sum = summary[2].1 / sum_baseline;

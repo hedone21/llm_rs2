@@ -11,7 +11,12 @@
 //! Interface version: V1.4 (9 functions). Symbol name exposed for
 //! `interfaceProvider`: `QnnOpPackage_InitInterface`.
 
-#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 
 #[allow(clippy::all)]
 mod qnn {
@@ -67,7 +72,8 @@ static STATIC_INFO: OnceLock<StaticInfo> = OnceLock::new();
 
 fn ensure_static() -> &'static StaticInfo {
     STATIC_INFO.get_or_init(|| {
-        let package_name: &'static CString = Box::leak(Box::new(CString::new(PACKAGE_NAME).unwrap()));
+        let package_name: &'static CString =
+            Box::leak(Box::new(CString::new(PACKAGE_NAME).unwrap()));
         let op_name_add: &'static CString = Box::leak(Box::new(CString::new(OP_TYPE_ADD).unwrap()));
         let op_name_matmul: &'static CString =
             Box::leak(Box::new(CString::new(OP_TYPE_MATMUL).unwrap()));
@@ -76,8 +82,16 @@ fn ensure_static() -> &'static StaticInfo {
         // Match QNN_GPU_API_VERSION_INIT from QnnGpuCommon.h:32-46
         //   coreApiVersion 2.25.0, backendApiVersion 3.7.0
         let api_version: &'static Qnn_ApiVersion_t = Box::leak(Box::new(Qnn_ApiVersion_t {
-            coreApiVersion: Qnn_Version_t { major: 2, minor: 25, patch: 0 },
-            backendApiVersion: Qnn_Version_t { major: 3, minor: 7, patch: 0 },
+            coreApiVersion: Qnn_Version_t {
+                major: 2,
+                minor: 25,
+                patch: 0,
+            },
+            backendApiVersion: Qnn_Version_t {
+                major: 3,
+                minor: 7,
+                patch: 0,
+            },
         }));
         let opset_version: &'static Qnn_Version_t = Box::leak(Box::new(Qnn_Version_t {
             major: 1,
@@ -299,9 +313,7 @@ pub extern "C" fn pkg_create_op_impl(
     if v1.numOfOutputs == 0 || v1.numOfInputs < 2 {
         return QnnOpPackage_Error_t_QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE as Qnn_ErrorHandle_t;
     }
-    let op_type_str = unsafe {
-        std::ffi::CStr::from_ptr(v1.typeName).to_str().unwrap_or("")
-    };
+    let op_type_str = unsafe { std::ffi::CStr::from_ptr(v1.typeName).to_str().unwrap_or("") };
 
     if op_type_str == OP_TYPE_MATMUL {
         return create_matmul_impl(s, v1, op_impl);
@@ -362,13 +374,26 @@ fn create_add_impl(
     }
     state.out_claim.memoryObject = &*state.mem_objs[2] as *const _;
     state.out_claim_arr = vec![&mut *state.out_claim as *mut _, ptr::null_mut()];
-    state.mem_obj_arr = state.mem_objs.iter_mut().map(|m| &mut **m as *mut _).collect();
+    state.mem_obj_arr = state
+        .mem_objs
+        .iter_mut()
+        .map(|m| &mut **m as *mut _)
+        .collect();
     state.mem_obj_arr.push(ptr::null_mut());
 
     for (kind, ti) in [
-        (QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READ, 0),
-        (QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READ, 1),
-        (QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_OUTPUT_WRITE, 0),
+        (
+            QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READ,
+            0,
+        ),
+        (
+            QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READ,
+            1,
+        ),
+        (
+            QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_OUTPUT_WRITE,
+            0,
+        ),
     ] {
         state.args.push(Box::new(QnnGpu_KernelArg_t {
             type_: kind,
@@ -452,7 +477,11 @@ fn create_matmul_impl(
         },
         scalar_u64: Vec::new(),
         scalar_i32: Vec::new(),
-        in_dims: vec![vec![(n * k) as u32], vec![(m * k) as u32], vec![(m * n) as u32]],
+        in_dims: vec![
+            vec![(n * k) as u32],
+            vec![(m * k) as u32],
+            vec![(m * n) as u32],
+        ],
         in_offs: vec![vec![0u32], vec![0u32], vec![0u32]],
     });
 
@@ -530,19 +559,18 @@ fn create_matmul_impl(
     //  12: ne1  = M                   int
     //  13: r2   = 1                   int
     //  14: r3   = 1                   int
-    let mk_tensor_arg =
-        |kind: QnnGpu_KernelArgType_t, ti: u32| -> QnnGpu_KernelArg_t {
-            QnnGpu_KernelArg_t {
-                type_: kind,
-                __bindgen_anon_1: QnnGpu_KernelArg_t__bindgen_ty_1 {
-                    tensor: QnnGpu_TensorKernelArg_t {
-                        opConfigIndex: 0,
-                        tensorIndex: ti,
-                        element: 0,
-                    },
+    let mk_tensor_arg = |kind: QnnGpu_KernelArgType_t, ti: u32| -> QnnGpu_KernelArg_t {
+        QnnGpu_KernelArg_t {
+            type_: kind,
+            __bindgen_anon_1: QnnGpu_KernelArg_t__bindgen_ty_1 {
+                tensor: QnnGpu_TensorKernelArg_t {
+                    opConfigIndex: 0,
+                    tensorIndex: ti,
+                    element: 0,
                 },
-            }
-        };
+            },
+        }
+    };
     let mk_ulong = |v: u64| -> QnnGpu_KernelArg_t {
         QnnGpu_KernelArg_t {
             type_: QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_DATA,
@@ -567,26 +595,40 @@ fn create_matmul_impl(
     };
 
     let args_seq: Vec<QnnGpu_KernelArg_t> = vec![
-        mk_tensor_arg(QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READ, 0),
+        mk_tensor_arg(
+            QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READ,
+            0,
+        ),
         mk_ulong(0),
-        mk_tensor_arg(QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READ, 1),
+        mk_tensor_arg(
+            QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_INPUT_READ,
+            1,
+        ),
         mk_ulong(0),
-        mk_tensor_arg(QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_OUTPUT_WRITE, 0),
+        mk_tensor_arg(
+            QnnGpu_KernelArgType_t_QNN_GPU_KERNEL_ARG_TYPE_OP_OUTPUT_WRITE,
+            0,
+        ),
         mk_ulong(0),
-        mk_int(k as i32),       // ne00
-        mk_int(n as i32),       // ne01
-        mk_int(1),              // ne02
-        mk_int(k as i32),       // ne10
-        mk_int(1),              // ne12
-        mk_int(n as i32),       // ne0
-        mk_int(m as i32),       // ne1
-        mk_int(1),              // r2
-        mk_int(1),              // r3
+        mk_int(k as i32), // ne00
+        mk_int(n as i32), // ne01
+        mk_int(1),        // ne02
+        mk_int(k as i32), // ne10
+        mk_int(1),        // ne12
+        mk_int(n as i32), // ne0
+        mk_int(m as i32), // ne1
+        mk_int(1),        // r2
+        mk_int(1),        // r3
     ];
     for a in args_seq {
         ext.inner.args.push(Box::new(a));
     }
-    ext.inner.args_arr = ext.inner.args.iter_mut().map(|a| &mut **a as *mut _).collect();
+    ext.inner.args_arr = ext
+        .inner
+        .args
+        .iter_mut()
+        .map(|a| &mut **a as *mut _)
+        .collect();
     ext.inner.args_arr.push(ptr::null_mut());
 
     let src_bytes = s.matmul_kernel_source.as_bytes_with_nul();

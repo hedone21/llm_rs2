@@ -24,7 +24,12 @@ fn main() {
 }
 
 #[cfg(all(feature = "qnn", feature = "opencl"))]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -60,7 +65,10 @@ fn main() -> anyhow::Result<()> {
 
     let platform = Platform::default();
     let device = Device::first(platform)?;
-    let cl_ctx = Context::builder().platform(platform).devices(device).build()?;
+    let cl_ctx = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
 
     // Shared host buffers (page-aligned not strictly required but cleaner)
@@ -105,8 +113,7 @@ fn main() -> anyhow::Result<()> {
     // QNN-GPU backend
     // ─────────────────────────────────────────────────────────
     let gpu_lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnGpu.so") }?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
     let gp: Symbol<GetProvidersFn> = unsafe { gpu_lib.get(b"QnnInterface_getProviders\0")? };
     let mut provs: *mut *const QnnInterface_t = ptr::null_mut();
     let mut np: c_uint = 0;
@@ -118,9 +125,7 @@ fn main() -> anyhow::Result<()> {
     let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut be) };
     anyhow::ensure!(err == 0, "GPU backendCreate err=0x{:x}", err);
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.contextCreate.unwrap())(be, ptr::null_mut(), ptr::null_mut(), &mut ctx)
-    };
+    let err = unsafe { (v.contextCreate.unwrap())(be, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "GPU contextCreate err=0x{:x}", err);
     println!("QNN-GPU backend + context: OK");
 
@@ -180,9 +185,7 @@ fn main() -> anyhow::Result<()> {
         mk_mem_desc(&dims_c, &cust_c),
     ];
     let mut mh = [ptr::null_mut::<c_void>(); 3];
-    let err = unsafe {
-        (v.memRegister.unwrap())(ctx, descs.as_ptr(), 3, mh.as_mut_ptr())
-    };
+    let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 3, mh.as_mut_ptr()) };
     println!("memRegister(CUSTOM, host_ptr) -> err = 0x{:x}", err);
     anyhow::ensure!(err == 0, "memRegister err=0x{:x}", err);
     println!("✓ memRegister succeeded — QNN-GPU accepts host_ptr as cl_mem-backing\n");
@@ -192,35 +195,39 @@ fn main() -> anyhow::Result<()> {
     // ─────────────────────────────────────────────────────────
     let g_name = CString::new("clmem_matmul").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph)
-    };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
-    let mk_v1 =
-        |name: &CString, ttype: Qnn_TensorType_t, dims: &[u32]| -> Qnn_TensorV1_t {
-            Qnn_TensorV1_t {
-                id: 0,
-                name: name.as_ptr(),
-                type_: ttype,
-                dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
-                dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
-                quantizeParams: Qnn_QuantizeParams_t {
-                    encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
-                    quantizationEncoding:
-                        Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
-                    __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                        scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+    let mk_v1 = |name: &CString, ttype: Qnn_TensorType_t, dims: &[u32]| -> Qnn_TensorV1_t {
+        Qnn_TensorV1_t {
+            id: 0,
+            name: name.as_ptr(),
+            type_: ttype,
+            dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
+            dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+            quantizeParams: Qnn_QuantizeParams_t {
+                encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
+                quantizationEncoding:
+                    Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
+                __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
                     },
                 },
-                rank: dims.len() as u32,
-                dimensions: dims.as_ptr() as *mut u32,
-                memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
-                __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                    clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+            },
+            rank: dims.len() as u32,
+            dimensions: dims.as_ptr() as *mut u32,
+            memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
+            __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
                 },
-            }
-        };
+            },
+        }
+    };
     let n_a = CString::new("A").unwrap();
     let n_b = CString::new("B").unwrap();
     let n_c = CString::new("C").unwrap();
@@ -366,10 +373,7 @@ fn main() -> anyhow::Result<()> {
         m * n
     );
     let test1_pass = mismatch == 0 && max_abs < 1e-2;
-    println!(
-        "Test 1: {}",
-        if test1_pass { "✓ PASS" } else { "✗ FAIL" }
-    );
+    println!("Test 1: {}", if test1_pass { "✓ PASS" } else { "✗ FAIL" });
 
     // ─────────────────────────────────────────────────────────
     // Test 2: OpenCL kernel write to cl_mem A → QNN execute → host read
@@ -382,7 +386,10 @@ fn main() -> anyhow::Result<()> {
             if (i < len) buf[i] = (float)i * 0.001f + 0.5f;
         }
     "#;
-    let cl_program = Program::builder().devices(device).src(fill_src).build(&cl_ctx)?;
+    let cl_program = Program::builder()
+        .devices(device)
+        .src(fill_src)
+        .build(&cl_ctx)?;
     let cl_kernel = ocl::core::create_kernel(&cl_program, "fill_seq")?;
     let len_mk = (m * k) as i32;
     ocl::core::set_kernel_arg(&cl_kernel, 0, ArgVal::mem(&buf_a))?;
@@ -469,7 +476,10 @@ fn main() -> anyhow::Result<()> {
             if (i < len) buf[i] = (float)i * (-0.002f) + 0.25f;
         }
     "#;
-    let prog2 = Program::builder().devices(device).src(fill_src2).build(&cl_ctx)?;
+    let prog2 = Program::builder()
+        .devices(device)
+        .src(fill_src2)
+        .build(&cl_ctx)?;
     let kern2 = ocl::core::create_kernel(&prog2, "fill_seq2")?;
     ocl::core::set_kernel_arg(&kern2, 0, ArgVal::mem(&buf_a))?;
     ocl::core::set_kernel_arg(&kern2, 1, ArgVal::scalar(&len_mk))?;
@@ -541,9 +551,18 @@ fn main() -> anyhow::Result<()> {
     // Summary
     // ─────────────────────────────────────────────────────────
     println!("\n=== Summary ===");
-    println!("Test 1 (host fill → QNN read):           {}", if test1_pass { "PASS" } else { "FAIL" });
-    println!("Test 2 (OpenCL write → QNN, no sync):    {}", if test2_pass { "PASS" } else { "FAIL" });
-    println!("Test 3 (OpenCL write → QNN, clFinish):   {}", if test3_pass { "PASS" } else { "FAIL" });
+    println!(
+        "Test 1 (host fill → QNN read):           {}",
+        if test1_pass { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "Test 2 (OpenCL write → QNN, no sync):    {}",
+        if test2_pass { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "Test 3 (OpenCL write → QNN, clFinish):   {}",
+        if test3_pass { "PASS" } else { "FAIL" }
+    );
     println!();
     if test1_pass && test3_pass {
         println!("✓ QNN_GPU_MEM_OPENCL custom path 작동 (cl_mem-backed host_ptr 공유 가능)");
@@ -563,7 +582,9 @@ fn main() -> anyhow::Result<()> {
         let _ = (v.contextFree.unwrap())(ctx, ptr::null_mut());
         let _ = (v.backendFree.unwrap())(be);
     }
-    let _ = buf_a; let _ = buf_b; let _ = buf_c;
+    let _ = buf_a;
+    let _ = buf_b;
+    let _ = buf_c;
     let _ = (&mut host_a, &mut host_b, &mut host_c); // explicit drop after QNN cleanup
     Ok(())
 }

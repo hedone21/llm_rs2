@@ -379,6 +379,24 @@
 | INV-149 | 32-engine-algorithms §3.12.22.4 (ENG-ALG-238), 33-engine-data §3.24 (ENG-DAT-101), arch/weight_swap.md §10.3 | Forward pass에서 layer K가 `LayerSlot::load_weights()`를 호출하기 직전에, `IntraForwardSwapHook::pending_event_for(K)`가 `Some(evt)`이면 `backend.wait_event_blocking(&evt)`이 반드시 호출되어 commit-before-read ordering을 강제한다. `arm_pending(K, evt)`는 `submit_commit` 직전에 store, `clear_pending(K)`는 dispatcher worker가 `slot.swap_weights` 후 store. 양쪽 모두 ArcSwap atomic. forward 스레드가 wait gate에서 잡은 evt가 dispatcher worker에 의해 그 사이 None으로 clear되어도 forward는 자신이 잡은 evt를 wait — completed event에 대한 wait는 fast no-op이므로 정확성 영향 없음. 위반 시 forward가 미완성 cl_mem 위에서 layer K weight를 읽어 garbage 출력 가능. | Safety/Correctness | runtime, test | host smoke: artificial cl_event를 hook의 `pending_events[K]`에 주입 후 forward 진입 시 wait_event_blocking 호출됨을 stub backend로 검증. 디바이스 e2e: INV-122 v2.1 단일-token 게이트로 회귀 차단. |
 | INV-150 | 32-engine-algorithms §3.12.22.5 (ENG-ALG-238 후속), arch/weight_swap.md §10.4 | 활성 `IntraForwardSwapHook` plan은 `is_complete()` 가 true가 될 때까지 다음 plan commit을 막는다. plan이 complete되면 decode loop는 (1) `dispatcher.drain(deadline)`, (2) `backend.synchronize()`, (3) `ratio_generation.fetch_add(1, SeqCst)`, (4) `invalidate_noshuffle_soa_registry()`를 이 순서대로 호출하고 hook을 `None`으로 retire한다. ratio_generation bump는 plan당 정확히 1회. 진행 중 도착한 신규 `SwapWeights` 신호는 logged-and-dropped. | Safety/Correctness | runtime, test | drain → synchronize → bump → invalidate 호출 순서 trace. ratio_generation 카운터를 plan 시작 시점 vs retire 시점에 비교하여 정확히 +1. INV-141 동등 의무 검증 (drain 완료 후 hook drop 시 dispatcher pending_count == 0). |
 
+### 3.22 QNN OpPackage cdylib Invariants [INV-151 ~ INV-155]
+
+2026-05-09 QNN OpPackage M1 (production cdylib `crates/qnn_oppkg/`)의 불변식. 대응 명세: `30-engine.md` 부록 A (ENG-QNN-010 ~ ENG-QNN-C04).
+
+**도입 컨텍스트**: Phase R 검증 완료 후 production migration 진입. PoC `crates/qnn_oppkg_poc/`는 회귀 안전망으로 보존. cdylib은 QNN runtime이 dlopen하는 외부 계약 산출물이며 Engine/Manager/Shared 어느 크레이트도 의존하지 않는다 (INV-001/010/011 보존).
+
+**교차 참조**:
+- **INV-001** (2 독립 프로세스): qnn_oppkg는 4번째 crate이지만 별도 cdylib 산출물(외부 라이브러리)로 Engine/Manager 프로세스 어디에도 포함되지 않는다. INV-001은 "프로세스 수=2"를 강제할 뿐 cdylib 산출물 수를 강제하지 않으므로 위반이 아니다.
+- **INV-010/011** (Engine-Manager 직접 의존 금지, Shared 한정): INV-151이 동일 정신을 cdylib 방향으로 확장한다 (Engine ⊥ qnn_oppkg).
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-151 | 30-engine 부록 A.5 (ENG-QNN-C01) | `qnn_oppkg` crate은 `engine`(`llm_rs2`), `manager`(`llm_manager`), `shared`(`llm_shared`) 어느 크레이트와도 cargo dependency edge를 양방향으로 형성하지 않는다. workspace member로만 등록되며 build graph에서 isolated subgraph를 형성한다. | Safety | static | `crates/qnn_oppkg/Cargo.toml`의 `[dependencies]` + `engine/Cargo.toml`/`manager/Cargo.toml`/`shared/Cargo.toml` 코드 리뷰. CI에서 `cargo tree -p qnn_oppkg`가 engine/manager/shared를 포함하지 않음을 검증 가능. INV-001/010/011 골격 보존. |
+| INV-152 | 30-engine 부록 A.3 (ENG-QNN-021) | `qnn_oppkg::registry::OPS.len() == StaticInfo::numOperations`. 정적 슬라이스 길이와 cdylib export 메타데이터 값이 비트 단위 일치한다. M1 범위에서 양쪽 모두 5. | Correctness | static, test | host unit test에서 `assert_eq!(OPS.len() as u32, static_info().num_operations)`. 등록 누락 회귀 즉시 검출. |
+| INV-153 | 30-engine 부록 A.3 (ENG-QNN-022) | `OPS` 슬라이스 내 모든 `OpDescriptor.op_type` 문자열은 슬라이스 내에서 고유하다. 동일 op_type 두 번 등록 금지. | Correctness | static, test | host unit test에서 `HashSet<&str>::len() == OPS.len()` 검증. 중복 등록 시 `pkg_create_op_impl` 디스패처가 first-match 기준으로 실리지 않은 entry를 silent drop하여 회귀 위험. |
+| INV-154 | 30-engine 부록 A.3 (ENG-QNN-023) | cdylib의 `pkg_get_info()` 반환 메타데이터에서 `backendApiVersion == (3, 7, 0)`. QNN GPU API 버전과 일치하며 mismatch 시 SDK가 cdylib을 reject한다 (Phase R G-1-F 결정적 fix). | Compatibility | static, test | host FFI surface test에서 `pkg_get_info()` 호출 후 backendApiVersion major/minor/patch 검증. SDK header와의 정합성. |
+| INV-155 | 30-engine 부록 A.5 (ENG-QNN-C04) | `pkg_create_op_impl` + `pkg_free_op_impl` 100회 반복 후 cdylib 프로세스의 `/proc/self/status::VmRSS` slope이 1 KB/iter 미만이어야 한다. PoC의 leak 패턴은 production에서 허용되지 않는다 — reverse-mapping table + `Box::from_raw` drop으로 정상화. | Safety | test | 디바이스 microbench (`microbench_qnn_oppkg_leak.rs`). last 50 iter linear regression slope. M1.8 게이트. |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -423,6 +441,7 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-137~139는 AUF v0.2 multi-dtype variant (2026-04-27)에서 추가. INV-137/138은 Correctness, INV-139는 Correctness/Compatibility 양쪽이며 Compatibility로 1회 카운트한다 (v0.1.x ↔ v0.2 reader 호환 의무).
 > INV-140~143은 Weight Swap Phase 6.5 Overhead Reduction (2026-05-07)에서 추가. INV-140/141은 Correctness, INV-142는 Safety/Correctness 양쪽이며 Safety로 1회 카운트, INV-143은 Safety (borrow buffer mmap lifetime).
 > INV-147~150은 Intra-forward Layer-aligned Swap (LISWAP-4, 2026-05-08)에서 추가. INV-147은 Performance (hook=None zero overhead), INV-148은 Correctness (plan dispatch 멱등), INV-149/150은 Safety/Correctness 양쪽이며 Safety로 1회 카운트(commit-before-read ordering, plan run-to-completion).
+> INV-151~155는 QNN OpPackage M1 cdylib (2026-05-09)에서 추가. INV-151은 Safety (workspace dependency isolation, INV-001/010/011 확장), INV-152/153은 Correctness (정적 일관성), INV-154는 Compatibility (SDK 계약 버전 고정), INV-155는 Safety (leak 부재 보증).
 > INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 > **INV-122 v2.1 (2026-04-26, Phase 5 Sprint A 진단 기반)**: 측정 단위를 **단일-token next-token logit**(prefill 종료 직후 첫 1개 logit)으로 명시적으로 고정. Sprint A 100-prompt × 4-ratio sweep에서 32-token decode 누적 drift로 ratio=0.25에서도 Δtop-1=44.85pp 관측 — 측정-임계값 미스매치 진단. 정확성 회귀(garbage 출력 등)는 0건. 임계값 자체(NMSE ≤ 0.01, Δ top-1 ≤ 1 pp)는 v2와 동일하나 측정 단위가 단일-token으로 고정. Decode window metric은 보조 sanity로 분리. ID/카운트는 변동 없음. Phase 4 자료(NMSE mean=0.0062, Δ top-1=+0.33pp)는 v2.1 기준으로도 PASS.
 

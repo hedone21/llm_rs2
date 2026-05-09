@@ -1603,6 +1603,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qnn_oppkg"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+]
+
+[[package]]
 name = "qnn_oppkg_poc"
 version = "0.1.0"
 dependencies = [

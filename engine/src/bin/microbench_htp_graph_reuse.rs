@@ -24,7 +24,12 @@ fn main() {
 }
 
 #[cfg(feature = "qnn")]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -45,37 +50,39 @@ fn main() -> anyhow::Result<()> {
     let n_elements = (size_mb * 1024 * 1024) / 4; // FP32
 
     println!("=== microbench_htp_graph_reuse (Phase 11 / R8 + R5 sanity) ===\n");
-    println!("Config: {} MB FP32 ({} elements), n_iters={}", size_mb, n_elements, n_iters);
+    println!(
+        "Config: {} MB FP32 ({} elements), n_iters={}",
+        size_mb, n_elements, n_iters
+    );
 
     // ── HTP setup ──
     let lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnHtp.so") }
         .or_else(|_| unsafe { Library::new("libQnnHtp.so") })?;
-    type GetProvidersFn =
-        unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
-    let get_providers: Symbol<GetProvidersFn> =
-        unsafe { lib.get(b"QnnInterface_getProviders\0")? };
+    type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
+    let get_providers: Symbol<GetProvidersFn> = unsafe { lib.get(b"QnnInterface_getProviders\0")? };
     let mut providers: *mut *const QnnInterface_t = ptr::null_mut();
     let mut num: c_uint = 0;
     let err = unsafe { get_providers(&mut providers, &mut num) };
-    anyhow::ensure!(err == 0 && num > 0, "QnnInterface_getProviders err=0x{:x}", err);
+    anyhow::ensure!(
+        err == 0 && num > 0,
+        "QnnInterface_getProviders err=0x{:x}",
+        err
+    );
     let v = unsafe { (**providers).__bindgen_anon_1.v2_25 };
 
     let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
-    let err =
-        unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
+    let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
     anyhow::ensure!(err == 0, "backendCreate err=0x{:x}", err);
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx)
-    };
+    let err =
+        unsafe { (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
 
     // Build graph for one fixed shape (same as production: each layer has same dim)
     let graph_name = CString::new("htp_reuse").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph)
-    };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
     let dims = vec![n_elements as u32];
@@ -91,14 +98,20 @@ fn main() -> anyhow::Result<()> {
                 quantizationEncoding:
                     Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: 1,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: ptr::null_mut(), dataSize: 0 },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: ptr::null_mut(),
+                    dataSize: 0,
+                },
             },
         }
     };
@@ -158,10 +171,18 @@ fn main() -> anyhow::Result<()> {
     // Allocate N distinct input buffer sets to model "different layer weights"
     const N_BUFFERS: usize = 8;
     let mut hosts_a: Vec<Vec<f32>> = (0..N_BUFFERS)
-        .map(|seed| (0..n_elements).map(|i| (i + seed * 17) as f32 * 1.0e-6).collect())
+        .map(|seed| {
+            (0..n_elements)
+                .map(|i| (i + seed * 17) as f32 * 1.0e-6)
+                .collect()
+        })
         .collect();
     let mut hosts_b: Vec<Vec<f32>> = (0..N_BUFFERS)
-        .map(|seed| (0..n_elements).map(|i| (i + seed * 31) as f32 * 0.5e-6 + 1.0).collect())
+        .map(|seed| {
+            (0..n_elements)
+                .map(|i| (i + seed * 31) as f32 * 0.5e-6 + 1.0)
+                .collect()
+        })
         .collect();
     let mut hosts_c: Vec<Vec<f32>> = (0..N_BUFFERS).map(|_| vec![0.0; n_elements]).collect();
 
@@ -235,7 +256,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── R8: re-execute with different buffers ──
-    println!("\n[R8] Graph reuse: same graph, {} iters with rotating buffers", n_iters);
+    println!(
+        "\n[R8] Graph reuse: same graph, {} iters with rotating buffers",
+        n_iters
+    );
     let mut samples = Vec::with_capacity(n_iters);
     for it in 0..n_iters {
         let bi = it % N_BUFFERS;
@@ -262,13 +286,21 @@ fn main() -> anyhow::Result<()> {
     let bw = ((size_mb as f64) * 3.0 / 1024.0) / (mean / 1000.0); // (a + b + c) bytes per execute
 
     println!("\n=== Phase 11 summary ===");
-    println!("R5 (correctness 1e-4 @ {} MB): {}", size_mb, if mismatch == 0 { "✓" } else { "✗" });
+    println!(
+        "R5 (correctness 1e-4 @ {} MB): {}",
+        size_mb,
+        if mismatch == 0 { "✓" } else { "✗" }
+    );
     println!();
     println!("R8 (graph reuse, n={}):", n_iters);
     println!("  first execute     : {:.2} ms", first_ms);
     println!("  re-execute mean   : {:.2} ms", mean);
     println!("  re-execute median : {:.2} ms", median);
-    println!("  σ                 : {:.3} ms ({:.1}% σ/mean)", stddev, cv * 100.0);
+    println!(
+        "  σ                 : {:.3} ms ({:.1}% σ/mean)",
+        stddev,
+        cv * 100.0
+    );
     println!("  effective BW      : {:.3} GB/s (a+b+c)", bw);
     let reuse_ratio = first_ms / mean;
     println!("  first / re-exec   : {:.3}x (Pass: ≤ 1.10)", reuse_ratio);
@@ -277,12 +309,23 @@ fn main() -> anyhow::Result<()> {
     let r5_pass = mismatch == 0;
     println!();
     println!("R5 verdict: {}", if r5_pass { "✓ PASS" } else { "✗ FAIL" });
-    println!("R8 verdict: {}", if r8_pass { "✓ PASS" } else if reuse_ratio <= 1.30 { "△ ACCEPTABLE" } else { "✗ FAIL" });
+    println!(
+        "R8 verdict: {}",
+        if r8_pass {
+            "✓ PASS"
+        } else if reuse_ratio <= 1.30 {
+            "△ ACCEPTABLE"
+        } else {
+            "✗ FAIL"
+        }
+    );
 
     if !r5_pass {
         println!("\n=> Phase 11 BLOCKED on R5. Investigate tensor metadata / dtype.");
     } else if !r8_pass && reuse_ratio > 1.30 {
-        println!("\n=> Phase 11 BLOCKED on R8. Graph re-finalize per call required — LISWAP-5 throughput hit.");
+        println!(
+            "\n=> Phase 11 BLOCKED on R8. Graph re-finalize per call required — LISWAP-5 throughput hit."
+        );
     } else {
         println!("\n=> Phase 11 PASS-gate cleared. Proceed to Phase 12 (R1+R3 rpcmem).");
     }
@@ -291,5 +334,9 @@ fn main() -> anyhow::Result<()> {
         let _ = (v.contextFree.unwrap())(ctx, ptr::null_mut());
         let _ = (v.backendFree.unwrap())(backend);
     }
-    if r5_pass && reuse_ratio <= 1.30 { Ok(()) } else { std::process::exit(1) }
+    if r5_pass && reuse_ratio <= 1.30 {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }

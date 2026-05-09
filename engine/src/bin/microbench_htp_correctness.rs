@@ -16,7 +16,12 @@ fn main() {
 }
 
 #[cfg(feature = "qnn")]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
@@ -40,13 +45,16 @@ fn main() -> anyhow::Result<()> {
         .or_else(|_| unsafe { Library::new("/vendor/lib64/snap/libQnnHtp.so") })
         .or_else(|_| unsafe { Library::new("libQnnHtp.so") })?;
     type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
-    let get_providers: Symbol<GetProvidersFn> =
-        unsafe { lib.get(b"QnnInterface_getProviders\0")? };
+    let get_providers: Symbol<GetProvidersFn> = unsafe { lib.get(b"QnnInterface_getProviders\0")? };
 
     let mut providers: *mut *const QnnInterface_t = ptr::null_mut();
     let mut num: c_uint = 0;
     let err = unsafe { get_providers(&mut providers, &mut num) };
-    anyhow::ensure!(err == 0 && num > 0, "QnnInterface_getProviders err=0x{:x}", err);
+    anyhow::ensure!(
+        err == 0 && num > 0,
+        "QnnInterface_getProviders err=0x{:x}",
+        err
+    );
     let provider = unsafe { &**providers };
     let api = provider.apiVersion.coreApiVersion;
     println!(
@@ -55,7 +63,11 @@ fn main() -> anyhow::Result<()> {
         if provider.providerName.is_null() {
             "(null)".to_string()
         } else {
-            unsafe { std::ffi::CStr::from_ptr(provider.providerName).to_string_lossy().into_owned() }
+            unsafe {
+                std::ffi::CStr::from_ptr(provider.providerName)
+                    .to_string_lossy()
+                    .into_owned()
+            }
         },
         api.major,
         api.minor,
@@ -77,15 +89,27 @@ fn main() -> anyhow::Result<()> {
 
     // ── 3. backendGetApiVersion (sanity) ──
     let mut bv = Qnn_ApiVersion_t {
-        coreApiVersion: Qnn_Version_t { major: 0, minor: 0, patch: 0 },
-        backendApiVersion: Qnn_Version_t { major: 0, minor: 0, patch: 0 },
+        coreApiVersion: Qnn_Version_t {
+            major: 0,
+            minor: 0,
+            patch: 0,
+        },
+        backendApiVersion: Qnn_Version_t {
+            major: 0,
+            minor: 0,
+            patch: 0,
+        },
     };
     let err = unsafe { (v.backendGetApiVersion.unwrap())(&mut bv) };
     anyhow::ensure!(err == 0, "backendGetApiVersion err=0x{:x}", err);
     println!(
         "backendGetApiVersion: core={}.{}.{}, backend={}.{}.{}",
-        bv.coreApiVersion.major, bv.coreApiVersion.minor, bv.coreApiVersion.patch,
-        bv.backendApiVersion.major, bv.backendApiVersion.minor, bv.backendApiVersion.patch
+        bv.coreApiVersion.major,
+        bv.coreApiVersion.minor,
+        bv.coreApiVersion.patch,
+        bv.backendApiVersion.major,
+        bv.backendApiVersion.minor,
+        bv.backendApiVersion.patch
     );
 
     // ── 4. contextCreate ──
@@ -104,9 +128,8 @@ fn main() -> anyhow::Result<()> {
     // ── 5. graphCreate ──
     let graph_name = CString::new("add_q1").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-    let err = unsafe {
-        (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph)
-    };
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, graph_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
     println!("graphCreate: OK ({:p})", graph);
 
@@ -130,14 +153,20 @@ fn main() -> anyhow::Result<()> {
                 quantizationEncoding:
                     Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
                 __bindgen_anon_1: Qnn_QuantizeParams_t__bindgen_ty_1 {
-                    scaleOffsetEncoding: Qnn_ScaleOffset_t { scale: 0.0, offset: 0 },
+                    scaleOffsetEncoding: Qnn_ScaleOffset_t {
+                        scale: 0.0,
+                        offset: 0,
+                    },
                 },
             },
             rank: dims.len() as u32,
             dimensions: dims.as_ptr() as *mut u32,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
-                clientBuf: Qnn_ClientBuffer_t { data: data_ptr, dataSize: data_size },
+                clientBuf: Qnn_ClientBuffer_t {
+                    data: data_ptr,
+                    dataSize: data_size,
+                },
             },
         }
     }
@@ -195,7 +224,12 @@ fn main() -> anyhow::Result<()> {
 
     for (label, t) in [("a", &mut t_a), ("b", &mut t_b), ("c", &mut t_c)] {
         let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, t) };
-        anyhow::ensure!(err == 0, "tensorCreateGraphTensor({}) err=0x{:x}", label, err);
+        anyhow::ensure!(
+            err == 0,
+            "tensorCreateGraphTensor({}) err=0x{:x}",
+            label,
+            err
+        );
         let id_after = unsafe { t.__bindgen_anon_1.v1.id };
         println!("tensorCreateGraphTensor({}): OK, id={}", label, id_after);
     }
@@ -274,7 +308,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
     if mismatch == 0 {
-        println!("\n=== Q1 ANSWER: ✓ correct ({}/{} elements match) ===", N, N);
+        println!(
+            "\n=== Q1 ANSWER: ✓ correct ({}/{} elements match) ===",
+            N, N
+        );
     } else {
         println!("\n=== Q1 ANSWER: ✗ MISMATCH {}/{} ===", mismatch, N);
         if let Some((i, got, exp)) = first_bad {
@@ -288,5 +325,9 @@ fn main() -> anyhow::Result<()> {
         let _ = (v.backendFree.unwrap())(backend);
     }
 
-    if mismatch == 0 { Ok(()) } else { std::process::exit(1) }
+    if mismatch == 0 {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }
