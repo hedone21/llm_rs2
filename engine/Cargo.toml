@@ -61,11 +61,14 @@ tempfile = "3.0"
 
 [dev-dependencies]
 
+[build-dependencies]
+bindgen = { version = "0.71", optional = true }
+
 [features]
 default = ["opencl"]
 opencl = ["ocl"]
 vulkan = ["ash"]                # Vulkan PoC (microbench bins only)
-qnn = ["libloading"]            # QNN HTP PoC (microbench bins only)
+qnn = ["libloading", "bindgen"]  # QNN HTP PoC (microbench bins only)
 cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)
 cuda-embedded = ["cudarc"]      # Embedded UMA version, e.g. Jetson Xavier (cuda_embedded/)
 resilience = ["zbus"]
