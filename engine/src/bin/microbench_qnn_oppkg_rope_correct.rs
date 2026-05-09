@@ -1,21 +1,21 @@
-//! M2.B CustomRope correctness — production OpPackage vs raw OpenCL.
+//! M2.B + M3.4 D-D.2 CustomRope correctness — production OpPackage vs raw OpenCL.
 //!
-//! Reference: raw OpenCL `kernel_rope_simple` invoked directly. The reference
-//! kernel is **in-place**, but the OpPackage now uses the **out-of-place**
-//! variant `kernel_rope_simple_oop` (M2.H structural fix; chain composition
-//! requires distinct input/output buffers). Numerically the two paths produce
-//! identical results because the rotation formula is the same.
+//! Reference: raw OpenCL `kernel_rope_simple` invoked directly (in-place,
+//! reads `start_pos` as a scalar kernel arg). The OpPackage uses the **OOP**
+//! variant `kernel_rope_simple_oop` which now reads `start_pos` from
+//! `pos_buf[0]` (M3.4 D-D.1: SCALAR op params get baked at graph finalize and
+//! prevent multi-token decode). Numerically the two paths are identical: the
+//! rotation formula and `start_pos` value match per case.
 //!
-//! OOP mapping: 1 input (x_in) + 1 output (x_out). The buffers live in
-//! distinct DMA-BUFs (separate `rpcmem_alloc`); the QNN graph allocates the
-//! output via `OutputTensor(0)` claim.
-//!
-//! Op params (numOfParams = 2, both scalar):
-//!   "start_pos" : INT_32   — token offset for RoPE position
-//!   "theta"     : FLOAT_32 — rotary base (10000.0 for Llama)
+//! Mapping (M3.4):
+//!   inputs:  [0]=x_in F32 [seq_len, num_heads, head_dim]
+//!            [1]=pos_buf I32 [1] — pos_buf[0] supplies start_pos at execute
+//!   outputs: [0]=x_out F32 (claimed)
+//!   params:  "theta" FLOAT_32 (build-time const)
 //!
 //! Cases (seq_len=1, num_heads=32, head_dim=128, theta=10000.0)
-//!         × start_pos ∈ {0, 100, 1000}.
+//!         × start_pos ∈ {0, 10, 100, 1000}. pos=0 reproduces M2.B GREEN
+//! baseline; pos != 0 cases prove the runtime pos buffer drives RoPE rotation.
 //!
 //! Pass criterion: max_abs_err < 1e-4 (identical kernels → bit-equal output
 //! is expected; threshold is loose to absorb potential -ffast-math reorder).
@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
     const PKG_PROVIDER: &str = "QnnOpPackage_InitInterface";
     const PKG_TARGET: &str = "GPU_QTI_AISW";
 
-    println!("=== microbench_qnn_oppkg_rope_correct (M2.B) ===\n");
+    println!("=== microbench_qnn_oppkg_rope_correct (M2.B + M3.4 D-D.2) ===\n");
     println!("Op Package: {}", PKG_PATH);
     println!("Interface symbol: {}", PKG_PROVIDER);
 
@@ -141,7 +141,7 @@ fn main() -> anyhow::Result<()> {
     let num_heads: usize = 32;
     let head_dim: usize = 128;
     let theta: f32 = 10000.0;
-    let start_positions: &[i32] = &[0, 100, 1000];
+    let start_positions: &[i32] = &[0, 10, 100, 1000];
     let mut all_pass = true;
 
     for &start_pos in start_positions {
@@ -185,7 +185,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!(
-        "\n=== M2.B verdict: {} ===",
+        "\n=== M3.4 D-D.2 verdict: {} ===",
         if all_pass { "GREEN" } else { "RED" }
     );
 
@@ -296,14 +296,15 @@ fn run_case(
     ocl::core::finish(cl_q)?;
 
     // ── Path B: QNN graph with CustomRope ─────────────────────────────────────
-    // OOP variant: distinct rpcmem allocations for input (x_in) and output
-    // (x_out). Earlier (in-place) revisions aliased a single fd to both
-    // tensors; chain composition required dropping that alias.
+    // OOP variant + pos buffer: distinct rpcmem allocations for input (x_in),
+    // pos_buf (M3.4 D-D.1), and output (x_out).
     let bytes = (total * 4) as i32;
+    let pos_bytes: i32 = 4; // INT_32 [1]
     let rpc_x = unsafe { rpcmem_alloc(heap_id, flags, bytes) };
+    let rpc_pos = unsafe { rpcmem_alloc(heap_id, flags, pos_bytes) };
     let rpc_xout = unsafe { rpcmem_alloc(heap_id, flags, bytes) };
     anyhow::ensure!(
-        !rpc_x.is_null() && !rpc_xout.is_null(),
+        !rpc_x.is_null() && !rpc_pos.is_null() && !rpc_xout.is_null(),
         "rpcmem_alloc failed for total={}",
         total
     );
@@ -314,14 +315,18 @@ fn run_case(
             rpc_x as *mut u8,
             bytes as usize,
         );
+        // Write the runtime pos value into pos_buf[0] (M3.4 D-D.1).
+        *(rpc_pos as *mut i32) = start_pos;
         // Zero-init x_out so any unwritten elements would be obvious.
         std::ptr::write_bytes(rpc_xout as *mut u8, 0, bytes as usize);
     }
 
     let fd_x = unsafe { rpcmem_to_fd(rpc_x) };
+    let fd_pos = unsafe { rpcmem_to_fd(rpc_pos) };
     let fd_xout = unsafe { rpcmem_to_fd(rpc_xout) };
 
     let mut dims_x: Vec<u32> = vec![seq_len as u32, num_heads as u32, head_dim as u32];
+    let mut dims_pos: Vec<u32> = vec![1u32];
     let mut dims_xout: Vec<u32> = vec![seq_len as u32, num_heads as u32, head_dim as u32];
 
     let qp = Qnn_QuantizeParams_t {
@@ -334,14 +339,14 @@ fn run_case(
             },
         },
     };
-    let mk_tv1 = |ttype, dims_ptr: *mut u32| Qnn_TensorV1_t {
+    let mk_tv1 = |ttype, dtype: Qnn_DataType_t, rank: u32, dims_ptr: *mut u32| Qnn_TensorV1_t {
         id: 0,
         name: ptr::null(),
         type_: ttype,
         dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
-        dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+        dataType: dtype,
         quantizeParams: qp,
-        rank: 3,
+        rank,
         dimensions: dims_ptr,
         memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
         __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
@@ -352,24 +357,46 @@ fn run_case(
         },
     };
 
-    let name_x = CString::new(format!("rope_x_{}_{}", num_heads, head_dim)).unwrap();
-    let name_xout = CString::new(format!("rope_xout_{}_{}", num_heads, head_dim)).unwrap();
+    let name_x = CString::new(format!("rope_x_{}_{}_{}", num_heads, head_dim, start_pos)).unwrap();
+    let name_pos =
+        CString::new(format!("rope_pos_{}_{}_{}", num_heads, head_dim, start_pos)).unwrap();
+    let name_xout = CString::new(format!(
+        "rope_xout_{}_{}_{}",
+        num_heads, head_dim, start_pos
+    ))
+    .unwrap();
 
     let mut t_x = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
             v1: mk_tv1(
                 Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                3,
                 dims_x.as_mut_ptr(),
             ),
         },
     };
     t_x.__bindgen_anon_1.v1.name = name_x.as_ptr();
+    let mut t_pos = Qnn_Tensor_t {
+        version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+        __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+            v1: mk_tv1(
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                1,
+                dims_pos.as_mut_ptr(),
+            ),
+        },
+    };
+    t_pos.__bindgen_anon_1.v1.name = name_pos.as_ptr();
     let mut t_xout = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
             v1: mk_tv1(
                 Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ,
+                Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                3,
                 dims_xout.as_mut_ptr(),
             ),
         },
@@ -382,43 +409,29 @@ fn run_case(
         unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
-    for (label, t) in [("x", &mut t_x), ("xout", &mut t_xout)] {
+    for (label, t) in [("x", &mut t_x), ("pos", &mut t_pos), ("xout", &mut t_xout)] {
         let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, t) };
         anyhow::ensure!(err == 0, "tensorCreate({}) err=0x{:x}", label, err);
     }
 
-    // Op params: scalar INT_32 "start_pos", scalar FLOAT_32 "theta".
-    let pname_start = CString::new("start_pos").unwrap();
+    // Op params: scalar FLOAT_32 "theta" only. `start_pos` is now supplied via
+    // the pos_buf input tensor at execute time (M3.4 D-D.1).
     let pname_theta = CString::new("theta").unwrap();
-    let mut params = [
-        Qnn_Param_t {
-            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-            name: pname_start.as_ptr(),
-            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                scalarParam: Qnn_Scalar_t {
-                    dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
-                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 {
-                        int32Value: start_pos,
-                    },
-                },
+    let mut params = [Qnn_Param_t {
+        paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+        name: pname_theta.as_ptr(),
+        __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
+            scalarParam: Qnn_Scalar_t {
+                dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { floatValue: theta },
             },
         },
-        Qnn_Param_t {
-            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-            name: pname_theta.as_ptr(),
-            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                scalarParam: Qnn_Scalar_t {
-                    dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
-                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { floatValue: theta },
-                },
-            },
-        },
-    ];
+    }];
 
     let op_name = CString::new(format!("rope0_{}", start_pos)).unwrap();
     let pkg = CString::new("qnn_oppkg").unwrap();
     let op_type = CString::new("CustomRope").unwrap();
-    let mut inputs = [t_x];
+    let mut inputs = [t_x, t_pos];
     let mut outputs = [t_xout];
     let op = Qnn_OpConfig_t {
         version: Qnn_OpConfigVersion_t_QNN_OPCONFIG_VERSION_1,
@@ -427,9 +440,9 @@ fn run_case(
                 name: op_name.as_ptr(),
                 packageName: pkg.as_ptr(),
                 typeName: op_type.as_ptr(),
-                numOfParams: 2,
+                numOfParams: 1,
                 params: params.as_mut_ptr(),
-                numOfInputs: 1,
+                numOfInputs: 2,
                 inputTensors: inputs.as_mut_ptr(),
                 numOfOutputs: 1,
                 outputTensors: outputs.as_mut_ptr(),
@@ -463,9 +476,15 @@ fn run_case(
             },
         }
     };
-    // OOP: input and output are distinct rpcmem buffers (no fd aliasing).
+    // OOP: input, pos_buf, and output are distinct rpcmem buffers.
     let descs = [
         mk_desc(fd_x, rpc_x, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_x),
+        mk_desc(
+            fd_pos,
+            rpc_pos,
+            Qnn_DataType_t_QNN_DATATYPE_INT_32,
+            &dims_pos,
+        ),
         mk_desc(
             fd_xout,
             rpc_xout,
@@ -473,20 +492,22 @@ fn run_case(
             &dims_xout,
         ),
     ];
-    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 2];
-    let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 2, mh.as_mut_ptr()) };
+    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 3];
+    let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 3, mh.as_mut_ptr()) };
     anyhow::ensure!(err == 0, "memRegister err=0x{:x}", err);
 
     inputs[0].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
     inputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[0];
+    inputs[1].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
+    inputs[1].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[1];
     outputs[0].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
-    outputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[1];
+    outputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[2];
 
     let err = unsafe {
         (v.graphExecute.unwrap())(
             graph,
             inputs.as_ptr(),
-            1,
+            2,
             outputs.as_mut_ptr(),
             1,
             ptr::null_mut(),
@@ -509,7 +530,7 @@ fn run_case(
     }
 
     unsafe {
-        let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), 2);
+        let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), 3);
     }
 
     Ok(max_abs)

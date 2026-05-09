@@ -70,6 +70,7 @@ pub mod __test_support {
     pub mod data_type {
         pub const FLOAT_16: u32 = crate::qnn::Qnn_DataType_t_QNN_DATATYPE_FLOAT_16;
         pub const FLOAT_32: u32 = crate::qnn::Qnn_DataType_t_QNN_DATATYPE_FLOAT_32;
+        pub const INT_32: u32 = crate::qnn::Qnn_DataType_t_QNN_DATATYPE_INT_32;
         pub const UINT_8: u32 = crate::qnn::Qnn_DataType_t_QNN_DATATYPE_UINT_8;
     }
 
@@ -559,27 +560,31 @@ pub mod __test_support {
     }
 
     /// Build an `OpImplLayout` for `CustomRope` given (seq_len, num_heads,
-    /// head_dim). Mocks a `Qnn_OpConfigV1_t` with rank-3 input
-    /// `x[seq_len, num_heads, head_dim]` and an alias output tensor of the
-    /// same shape (M1.7 in-place pattern). Both FLOAT_32. `numOfParams = 0`
-    /// so `start_pos` defaults to 0 and `theta` defaults to 10000.0.
+    /// head_dim). Mocks a `Qnn_OpConfigV1_t` with:
+    ///   - inputs[0]: x F32 rank-3 [seq_len, num_heads, head_dim]
+    ///   - inputs[1]: pos_buf I32 rank-1 [1]   (M3.4 D-D.1)
+    ///   - outputs[0]: x_out F32 rank-3 (same shape as x)
+    ///
+    /// `numOfParams = 0` so `theta` defaults to 10000.0.
     pub fn build_rope_layout_for(
         seq_len: u32,
         num_heads: u32,
         head_dim: u32,
     ) -> Result<crate::args::OpImplLayout, crate::args::OpError> {
         use crate::qnn::{
-            QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER, Qnn_ClientBuffer_t,
-            Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
-            Qnn_OpConfigV1_t, Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
-            Qnn_QuantizeParams_t, Qnn_QuantizeParams_t__bindgen_ty_1, Qnn_ScaleOffset_t,
-            Qnn_Tensor_t, Qnn_Tensor_t__bindgen_ty_1, Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
+            QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER, Qnn_ClientBuffer_t, Qnn_DataType_t,
+            Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, Qnn_DataType_t_QNN_DATATYPE_INT_32,
+            Qnn_Definition_t_QNN_DEFINITION_UNDEFINED, Qnn_OpConfigV1_t,
+            Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED, Qnn_QuantizeParams_t,
+            Qnn_QuantizeParams_t__bindgen_ty_1, Qnn_ScaleOffset_t, Qnn_Tensor_t,
+            Qnn_Tensor_t__bindgen_ty_1, Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ, Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
             Qnn_TensorV1_t, Qnn_TensorV1_t__bindgen_ty_1, Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         };
         use std::ptr;
 
         let mut dims_x = vec![seq_len, num_heads, head_dim];
+        let mut dims_pos = vec![1u32];
         let mut dims_xout = vec![seq_len, num_heads, head_dim];
         let qp = Qnn_QuantizeParams_t {
             encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
@@ -591,14 +596,14 @@ pub mod __test_support {
                 },
             },
         };
-        let mk_tv1 = |ttype, dims_ptr: *mut u32| Qnn_TensorV1_t {
+        let mk_tv1 = |ttype, dtype: Qnn_DataType_t, rank: u32, dims_ptr: *mut u32| Qnn_TensorV1_t {
             id: 0,
             name: ptr::null(),
             type_: ttype,
             dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
-            dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+            dataType: dtype,
             quantizeParams: qp,
-            rank: 3,
+            rank,
             dimensions: dims_ptr,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
@@ -608,20 +613,37 @@ pub mod __test_support {
                 },
             },
         };
-        let mut inputs = [Qnn_Tensor_t {
-            version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
-            __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                v1: mk_tv1(
-                    Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
-                    dims_x.as_mut_ptr(),
-                ),
+        let mut inputs = [
+            Qnn_Tensor_t {
+                version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+                __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+                    v1: mk_tv1(
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                        Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                        3,
+                        dims_x.as_mut_ptr(),
+                    ),
+                },
             },
-        }];
+            Qnn_Tensor_t {
+                version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+                __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+                    v1: mk_tv1(
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                        Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                        1,
+                        dims_pos.as_mut_ptr(),
+                    ),
+                },
+            },
+        ];
         let mut outputs = [Qnn_Tensor_t {
             version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
             __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
                 v1: mk_tv1(
                     Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ,
+                    Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                    3,
                     dims_xout.as_mut_ptr(),
                 ),
             },
@@ -632,7 +654,7 @@ pub mod __test_support {
             typeName: ptr::null(),
             numOfParams: 0,
             params: ptr::null_mut(),
-            numOfInputs: 1,
+            numOfInputs: 2,
             inputTensors: inputs.as_mut_ptr(),
             numOfOutputs: 1,
             outputTensors: outputs.as_mut_ptr(),
@@ -748,18 +770,22 @@ pub mod __test_support {
     /// Build an `OpImplLayout` for `CustomKvScatter` given
     /// `(kv_heads, head_dim, capacity, write_pos)`.
     ///
-    /// Mocks a `Qnn_OpConfigV1_t` with (multi-output, M2.H):
-    ///   - inputs[0]: k_src FLOAT_32 [kv_heads * head_dim]
-    ///   - inputs[1]: v_src FLOAT_32 [kv_heads * head_dim]
+    /// Mocks a `Qnn_OpConfigV1_t` with (multi-output, M2.H + M3.4 D-D.1):
+    ///   - inputs[0]: k_src   FLOAT_32 [kv_heads * head_dim]
+    ///   - inputs[1]: v_src   FLOAT_32 [kv_heads * head_dim]
+    ///   - inputs[2]: pos_buf INT_32   [1]                    (M3.4 D-D.1)
     ///   - outputs[0]: k_dst FLOAT_16 [kv_heads * capacity * head_dim]
     ///   - outputs[1]: v_dst FLOAT_16 [kv_heads * capacity * head_dim]
     ///
-    /// Params: head_dim, capacity, write_pos (all INT_32).
+    /// Params: head_dim, capacity (INT_32). `write_pos` is now supplied via
+    /// `pos_buf` at execute time; the argument is retained in this helper's
+    /// signature so existing tests continue to compile, but the value is
+    /// ignored (the runtime reads it from the buffer).
     pub fn build_kv_scatter_layout_for(
         kv_heads: u32,
         head_dim: i32,
         capacity: i32,
-        write_pos: i32,
+        _write_pos: i32,
     ) -> Result<crate::args::OpImplLayout, crate::args::OpError> {
         use crate::qnn::{
             QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER, Qnn_ClientBuffer_t, Qnn_DataType_t,
@@ -809,6 +835,7 @@ pub mod __test_support {
         };
 
         let mut dims_src = vec![src_total];
+        let mut dims_pos = vec![1u32];
         let mut dims_dst = vec![dst_total];
         let mut dims_dst2 = vec![dst_total];
 
@@ -831,6 +858,17 @@ pub mod __test_support {
                         Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
                         Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
                         dims_src.as_mut_ptr(),
+                        1,
+                    ),
+                },
+            },
+            Qnn_Tensor_t {
+                version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+                __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+                    v1: mk_tv1(
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                        Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                        dims_pos.as_mut_ptr(),
                         1,
                     ),
                 },
@@ -861,10 +899,10 @@ pub mod __test_support {
             },
         ];
 
-        // Build params for head_dim, capacity, write_pos.
+        // Build params for head_dim, capacity. `write_pos` is no longer a
+        // SCALAR param — it is supplied via `pos_buf` at graphExecute time.
         let name_head_dim = CString::new("head_dim").unwrap();
         let name_capacity = CString::new("capacity").unwrap();
-        let name_write_pos = CString::new("write_pos").unwrap();
         let mut params = [
             Qnn_Param_t {
                 paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
@@ -890,27 +928,15 @@ pub mod __test_support {
                     },
                 },
             },
-            Qnn_Param_t {
-                paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-                name: name_write_pos.as_ptr(),
-                __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                    scalarParam: Qnn_Scalar_t {
-                        dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
-                        __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 {
-                            int32Value: write_pos,
-                        },
-                    },
-                },
-            },
         ];
 
         let v1 = Qnn_OpConfigV1_t {
             name: ptr::null(),
             packageName: ptr::null(),
             typeName: ptr::null(),
-            numOfParams: 3,
+            numOfParams: 2,
             params: params.as_mut_ptr(),
-            numOfInputs: 2,
+            numOfInputs: 3,
             inputTensors: inputs.as_mut_ptr(),
             numOfOutputs: 2,
             outputTensors: outputs.as_mut_ptr(),
@@ -1185,13 +1211,14 @@ pub mod __test_support {
     /// Build an `OpImplLayout` for `CustomRope` with rank-2 input.
     /// `x` shape: `[seq_len, num_heads * head_dim]`, with `num_heads` and
     /// `head_dim` provided as INT_32 op params (M2.H 3rd-attempt path).
+    /// `pos_buf` is appended as the 2nd input (M3.4 D-D.1).
     pub fn build_rope_layout_rank2_for(
         seq_len: u32,
         num_heads: u32,
         head_dim: u32,
     ) -> Result<crate::args::OpImplLayout, crate::args::OpError> {
         use crate::qnn::{
-            QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER, Qnn_ClientBuffer_t,
+            QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER, Qnn_ClientBuffer_t, Qnn_DataType_t,
             Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, Qnn_DataType_t_QNN_DATATYPE_INT_32,
             Qnn_Definition_t_QNN_DEFINITION_UNDEFINED, Qnn_OpConfigV1_t, Qnn_Param_t,
             Qnn_Param_t__bindgen_ty_1, Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
@@ -1209,6 +1236,7 @@ pub mod __test_support {
             .checked_mul(head_dim)
             .ok_or(crate::args::OpError::InvalidArgument)?;
         let mut dims_x = vec![seq_len, flat];
+        let mut dims_pos = vec![1u32];
         let mut dims_xout = vec![seq_len, flat];
 
         let qp = Qnn_QuantizeParams_t {
@@ -1221,14 +1249,14 @@ pub mod __test_support {
                 },
             },
         };
-        let mk_tv1 = |ttype, dims_ptr: *mut u32| Qnn_TensorV1_t {
+        let mk_tv1 = |ttype, dtype: Qnn_DataType_t, rank: u32, dims_ptr: *mut u32| Qnn_TensorV1_t {
             id: 0,
             name: ptr::null(),
             type_: ttype,
             dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
-            dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+            dataType: dtype,
             quantizeParams: qp,
-            rank: 2,
+            rank,
             dimensions: dims_ptr,
             memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
             __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
@@ -1238,20 +1266,37 @@ pub mod __test_support {
                 },
             },
         };
-        let mut inputs = [Qnn_Tensor_t {
-            version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
-            __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                v1: mk_tv1(
-                    Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
-                    dims_x.as_mut_ptr(),
-                ),
+        let mut inputs = [
+            Qnn_Tensor_t {
+                version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+                __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+                    v1: mk_tv1(
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                        Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                        2,
+                        dims_x.as_mut_ptr(),
+                    ),
+                },
             },
-        }];
+            Qnn_Tensor_t {
+                version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+                __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+                    v1: mk_tv1(
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                        Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                        1,
+                        dims_pos.as_mut_ptr(),
+                    ),
+                },
+            },
+        ];
         let mut outputs = [Qnn_Tensor_t {
             version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
             __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
                 v1: mk_tv1(
                     Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ,
+                    Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                    2,
                     dims_xout.as_mut_ptr(),
                 ),
             },
@@ -1293,7 +1338,7 @@ pub mod __test_support {
             typeName: ptr::null(),
             numOfParams: 2,
             params: params.as_mut_ptr(),
-            numOfInputs: 1,
+            numOfInputs: 2,
             inputTensors: inputs.as_mut_ptr(),
             numOfOutputs: 1,
             outputTensors: outputs.as_mut_ptr(),

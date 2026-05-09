@@ -15,41 +15,53 @@
 //! whereas chains where the **last** op is in-place fail. Switching RoPE to a
 //! true OOP kernel is the structural fix.
 //!
+//! ## pos-as-buffer rationale (M3.4 D-D.1, 2026-05-10)
+//!
+//! Earlier the descriptor read `start_pos` as a SCALAR op param (INT_32).
+//! `Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR` values are inlined into the graph at
+//! `graphFinalize` time, which made multi-token decode impossible — every
+//! invocation used the build-time pos. The fix: introduce a 2nd input tensor
+//! `pos_buf : INT_32 [1]` that the kernel reads as `pos_buf[0]`. The graph
+//! caller writes the current decode position into `pos_buf` before each
+//! `graphExecute`, so RoPE rotates with the correct angle on every step.
+//! `theta` remains a SCALAR (it is build-time-constant per layer/model).
+//!
 //! Kernel signature:
 //!   kernel void kernel_rope_simple_oop(
 //!       global const float * x_in,
 //!       global float * x_out,
+//!       global const int * pos_buf,   // pos_buf[0] = start_pos
 //!       int head_dim,
 //!       int num_heads,
 //!       int seq_len,
-//!       int start_pos,
 //!       float theta              // 10000.0 (Llama) or 1000000.0 (Qwen2.5)
 //!   );
 //!
 //! Tensor convention (rank-flexible):
-//!   inputs[0]  = x_in   rank 3 [seq_len, num_heads, head_dim]    FLOAT_32
+//!   inputs[0]  = x_in    rank 3 [seq_len, num_heads, head_dim]    FLOAT_32
 //!                or
-//!                rank 2 [seq_len, num_heads * head_dim]           FLOAT_32
+//!                rank 2 [seq_len, num_heads * head_dim]            FLOAT_32
 //!                  (requires `num_heads` and `head_dim` op params)
-//!   outputs[0] = x_out  same shape, distinct buffer               FLOAT_32
+//!   inputs[1]  = pos_buf rank 1 [1]                                INT_32
+//!   outputs[0] = x_out   same shape as x_in, distinct buffer       FLOAT_32
 //!
 //! Op params (all optional):
-//!   params[i].name = "start_pos", scalar INT_32  (default 0)
 //!   params[i].name = "theta",     scalar FLOAT_32 (default 10000.0)
 //!   params[i].name = "num_heads", scalar INT_32  (rank-2 input only)
 //!   params[i].name = "head_dim",  scalar INT_32  (rank-2 input only)
 //!
 //! Layout:
-//!   mem_objects[0] = x_in   (FLOAT_32, 1D [total = seq_len * num_heads * head_dim])
-//!   mem_objects[1] = x_out  (FLOAT_32, 1D [total]; claimed output)
+//!   mem_objects[0] = x_in    (FLOAT_32, 1D [total = seq_len * num_heads * head_dim])
+//!   mem_objects[1] = pos_buf (INT_32,   1D [1])
+//!   mem_objects[2] = x_out   (FLOAT_32, 1D [total]; claimed output)
 //!
 //! Args (7 total, matching kernel_rope_simple_oop declaration order):
 //!   InputTensor(0)        → x_in   (read-only)
 //!   OutputTensor(0)       → x_out  (write-only)
+//!   InputTensor(1)        → pos_buf (read-only)
 //!   Int(head_dim)
 //!   Int(num_heads)
 //!   Int(seq_len)
-//!   Int(start_pos)
 //!   Float(theta)
 //!
 //! Workgroup:
@@ -65,7 +77,8 @@
 
 use crate::args::{ArgSpec, MemoryObjectSpec, OpDescriptor, OpError, OpImplLayout};
 use crate::qnn::{
-    Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, Qnn_OpConfigV1_t, Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+    Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, Qnn_DataType_t_QNN_DATATYPE_INT_32, Qnn_OpConfigV1_t,
+    Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
 };
 
 pub static DESCRIPTOR: OpDescriptor = OpDescriptor {
@@ -121,17 +134,32 @@ fn read_param_float(v1: &Qnn_OpConfigV1_t, name: &str) -> Option<f32> {
 }
 
 pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpError> {
-    if v1.numOfInputs < 1 || v1.numOfOutputs < 1 {
+    // Require: 2 inputs (x_in, pos_buf), 1 output (x_out).
+    if v1.numOfInputs < 2 || v1.numOfOutputs < 1 {
         return Err(OpError::ValidationFailure);
     }
 
     let in_x = unsafe { (*v1.inputTensors.add(0)).__bindgen_anon_1.v1 };
+    let pos_t = unsafe { (*v1.inputTensors.add(1)).__bindgen_anon_1.v1 };
     let out_x = unsafe { (*v1.outputTensors.add(0)).__bindgen_anon_1.v1 };
 
     if in_x.dimensions.is_null() || (in_x.rank != 2 && in_x.rank != 3) {
         return Err(OpError::InvalidArgument);
     }
     if out_x.dimensions.is_null() || out_x.rank == 0 {
+        return Err(OpError::InvalidArgument);
+    }
+    if pos_t.dimensions.is_null() || pos_t.rank == 0 {
+        return Err(OpError::InvalidArgument);
+    }
+
+    // pos_buf: INT_32, flat element count must equal 1.
+    let mut pos_total: u32 = 1;
+    for i in 0..pos_t.rank {
+        let d = unsafe { *pos_t.dimensions.add(i as usize) };
+        pos_total = pos_total.checked_mul(d).ok_or(OpError::InvalidArgument)?;
+    }
+    if pos_total != 1 {
         return Err(OpError::InvalidArgument);
     }
 
@@ -171,8 +199,8 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
         .and_then(|v| v.checked_mul(head_dim))
         .ok_or(OpError::InvalidArgument)?;
 
-    // Optional params; defaults match Llama 3.2 (start_pos=0, theta=10000.0).
-    let start_pos = read_param_int(v1, "start_pos").unwrap_or(0);
+    // Optional FLOAT param; default matches Llama 3.2 (theta=10000.0).
+    // Qwen2.5 uses 1_000_000.0 — caller must set the param explicitly.
     let theta = read_param_float(v1, "theta").unwrap_or(10000.0);
 
     let half_dim = head_dim / 2;
@@ -182,11 +210,19 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
         .ok_or(OpError::InvalidArgument)?;
 
     let mem_objects = vec![
+        // x_in F32
         MemoryObjectSpec {
             data_type: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
             flat_dims: vec![total],
             flat_offsets: vec![0u32],
         },
+        // pos_buf INT_32 [1]
+        MemoryObjectSpec {
+            data_type: Qnn_DataType_t_QNN_DATATYPE_INT_32,
+            flat_dims: vec![1u32],
+            flat_offsets: vec![0u32],
+        },
+        // x_out F32 (claimed output via legacy single-output rule: last entry)
         MemoryObjectSpec {
             data_type: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
             flat_dims: vec![total],
@@ -197,10 +233,10 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
     let args = vec![
         ArgSpec::InputTensor(0),       // x_in (read-only)
         ArgSpec::OutputTensor(0),      // x_out (write-only)
+        ArgSpec::InputTensor(1),       // pos_buf (read-only)
         ArgSpec::Int(head_dim as i32), // head_dim
         ArgSpec::Int(num_heads as i32),
         ArgSpec::Int(seq_len as i32),
-        ArgSpec::Int(start_pos),
         ArgSpec::Float(theta),
     ];
 

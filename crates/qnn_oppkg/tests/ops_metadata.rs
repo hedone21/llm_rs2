@@ -439,20 +439,18 @@ fn rope_build_layout_for_qwen_attn() {
     // Qwen2.5-1.5b query head dim: seq_len=1, num_heads=12 (q) or 2 (kv),
     // head_dim=128. Use the q-projection shape for the assertion.
     let layout = build_rope_layout_for(1, 12, 128).expect("build_layout must succeed");
-    // M2.H OOP: 7 args (InputTensor(0), OutputTensor(0), 4 ints, 1 float).
+    // M3.4 D-D.1: 7 args (InputTensor(0)=x_in, OutputTensor(0)=x_out,
+    // InputTensor(1)=pos_buf, 3 ints, 1 float).
     assert_eq!(layout.args.len(), 7, "rope_oop must have 7 kernel args");
     assert_eq!(
         layout.mem_objects.len(),
-        2,
-        "rope_oop must have 2 mem_objects (x_in, x_out)"
+        3,
+        "rope_oop must have 3 mem_objects (x_in, pos_buf, x_out)"
     );
-    for mo in &layout.mem_objects {
-        assert_eq!(
-            mo.data_type,
-            data_type::FLOAT_32,
-            "all rope tensors must be FLOAT_32"
-        );
-    }
+    // mem_objects[0]=x_in F32, [1]=pos_buf I32, [2]=x_out F32.
+    assert_eq!(layout.mem_objects[0].data_type, data_type::FLOAT_32);
+    assert_eq!(layout.mem_objects[1].data_type, data_type::INT_32);
+    assert_eq!(layout.mem_objects[2].data_type, data_type::FLOAT_32);
     // global_work[0] = seq_len * num_heads * (head_dim/2) = 1 * 12 * 64 = 768
     assert_eq!(layout.global_work[0], 12 * 64);
     assert_eq!(layout.global_work[1], 1);
@@ -701,22 +699,24 @@ fn kv_scatter_descriptor_op_type() {
 
 #[test]
 fn kv_scatter_kernel_source_contains_target() {
+    // M3.4 D-D.1: descriptor now binds the OOP variant kernel.
     assert!(
         OPS[8]
             .kernel_source
-            .contains("kernel_kv_scatter_f32_to_f16"),
-        "kernel source must contain 'kernel_kv_scatter_f32_to_f16'"
+            .contains("kernel_kv_scatter_f32_to_f16_oop"),
+        "kernel source must contain 'kernel_kv_scatter_f32_to_f16_oop'"
     );
 }
 
 #[test]
 fn kv_scatter_build_layout_for_qwen() {
     use qnn_oppkg::__test_support::data_type;
-    // kv_heads=2, head_dim=128, capacity=2048, write_pos=100
+    // kv_heads=2, head_dim=128, capacity=2048. write_pos is now ignored at
+    // build_layout — supplied via pos_buf at execute time.
     let layout = build_kv_scatter_layout_for(2, 128, 2048, 100)
         .expect("build_layout must succeed for (kv_heads=2, head_dim=128, capacity=2048)");
     assert_eq!(layout.args.len(), 7, "must have 7 kernel args");
-    assert_eq!(layout.mem_objects.len(), 4, "must have 4 mem_objects");
+    assert_eq!(layout.mem_objects.len(), 5, "must have 5 mem_objects");
     assert_eq!(
         layout.mem_objects[0].data_type,
         data_type::FLOAT_32,
@@ -729,11 +729,16 @@ fn kv_scatter_build_layout_for_qwen() {
     );
     assert_eq!(
         layout.mem_objects[2].data_type,
+        data_type::INT_32,
+        "pos_buf must be INT_32"
+    );
+    assert_eq!(
+        layout.mem_objects[3].data_type,
         data_type::FLOAT_16,
         "k_dst must be FLOAT_16"
     );
     assert_eq!(
-        layout.mem_objects[3].data_type,
+        layout.mem_objects[4].data_type,
         data_type::FLOAT_16,
         "v_dst must be FLOAT_16"
     );

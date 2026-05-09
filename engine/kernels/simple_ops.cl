@@ -870,13 +870,18 @@ kernel void kernel_rope_simple(
 // path requires the graph-level output edge to be a distinct buffer from the
 // input. The in-place variant works for stand-alone single-op execution but
 // breaks when downstream ops consume the output via a separate allocation.
+//
+// M3.4 D-D.1: `start_pos` is now read from `pos_buf[0]` instead of being a
+// SCALAR op param. Reason: QNN_PARAMTYPE_SCALAR is baked into the graph at
+// finalize time, which prevents multi-token decode (every token would use the
+// build-time pos value). Reading from a buffer makes pos a runtime input.
 kernel void kernel_rope_simple_oop(
     global const float * x_in,
     global float * x_out,
+    global const int * pos_buf,
     int head_dim,
     int num_heads,
     int seq_len,
-    int start_pos,
     float theta
 ) {
     int gid = get_global_id(0);
@@ -890,6 +895,7 @@ kernel void kernel_rope_simple_oop(
     int head_idx = in_seq / half_dim;
     int pair_idx = in_seq % half_dim;
 
+    int start_pos = pos_buf[0];
     int pos = start_pos + seq_idx;
 
     float freq = 1.0f / pow(theta, (float)(pair_idx * 2) / (float)head_dim);
@@ -1311,6 +1317,42 @@ kernel void kernel_kv_scatter_f32_to_f16(
     int gid = get_global_id(0);
     int h = gid / head_dim;       // which head
     int d = gid % head_dim;       // which dim
+
+    // Source: seq-major [h * head_dim + d]
+    int src_idx = h * head_dim + d;
+
+    // Dest: head-major [h * capacity * head_dim + write_pos * head_dim + d]
+    int dst_idx = h * capacity * head_dim + write_pos * head_dim + d;
+
+    k_dst[dst_idx] = (half)k_src[src_idx];
+    v_dst[dst_idx] = (half)v_src[src_idx];
+}
+
+// ============================================================
+// Fused F32->F16 Cast + HeadMajor Scatter — pos-as-buffer variant
+// ============================================================
+// M3.4 D-D.1: identical to kernel_kv_scatter_f32_to_f16 but reads `write_pos`
+// from `pos_buf[0]` instead of taking it as an int scalar. Used by the QNN
+// OpPackage `CustomKvScatter` op so multi-token decode can update pos at
+// graph-execute time (SCALAR op params are baked at graph finalize).
+//
+// The original kernel_kv_scatter_f32_to_f16 is preserved for the OpenCL
+// backend (engine/src/backend/opencl/{mod,plan}.rs) which sets pos via
+// kernel arg per-call — that path doesn't have the QNN graph-finalize issue.
+kernel void kernel_kv_scatter_f32_to_f16_oop(
+    global const float * k_src,   // [kv_heads * head_dim] F32
+    global const float * v_src,   // [kv_heads * head_dim] F32
+    global const int * pos_buf,   // [1] int — pos_buf[0] = write_pos
+    global half * k_dst,          // [kv_heads, capacity, head_dim] F16 HeadMajor
+    global half * v_dst,          // [kv_heads, capacity, head_dim] F16 HeadMajor
+    int head_dim,
+    int capacity
+) {
+    int gid = get_global_id(0);
+    int h = gid / head_dim;       // which head
+    int d = gid % head_dim;       // which dim
+
+    int write_pos = pos_buf[0];
 
     // Source: seq-major [h * head_dim + d]
     int src_idx = h * head_dim + d;

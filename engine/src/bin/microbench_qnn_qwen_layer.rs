@@ -1217,6 +1217,8 @@ fn run_layer(
     let rpc_mask = unsafe { rpcmem_alloc(heap_id, flags, bytes_mask) };
     let rpc_sinks = unsafe { rpcmem_alloc(heap_id, flags, bytes_sinks) };
     let rpc_score = unsafe { rpcmem_alloc(heap_id, flags, bytes_dummy) };
+    // M3.4 D-D.1: pos_buf — INT_32 [1].
+    let rpc_pos = unsafe { rpcmem_alloc(heap_id, flags, 4) };
     anyhow::ensure!(
         !rpc_x.is_null()
             && !rpc_rms_pre.is_null()
@@ -1240,7 +1242,8 @@ fn run_layer(
             && !rpc_dd.is_null()
             && !rpc_mask.is_null()
             && !rpc_sinks.is_null()
-            && !rpc_score.is_null(),
+            && !rpc_score.is_null()
+            && !rpc_pos.is_null(),
         "rpcmem_alloc failed"
     );
 
@@ -1313,6 +1316,8 @@ fn run_layer(
             std::ptr::write_unaligned((rpc_sinks as *mut u8).add(i * 4) as *mut f32, neg_huge);
         }
         std::ptr::write_bytes(rpc_score as *mut u8, 0, bytes_dummy as usize);
+        // M3.4 D-D.1: initial pos value = `pos` (matches raw-OpenCL reference).
+        *(rpc_pos as *mut i32) = pos;
     }
 
     let fd_x = unsafe { rpcmem_to_fd(rpc_x) };
@@ -1338,6 +1343,7 @@ fn run_layer(
     let fd_mask = unsafe { rpcmem_to_fd(rpc_mask) };
     let fd_sinks = unsafe { rpcmem_to_fd(rpc_sinks) };
     let fd_score = unsafe { rpcmem_to_fd(rpc_score) };
+    let fd_pos = unsafe { rpcmem_to_fd(rpc_pos) };
 
     // ── 4. Build graph: declare tensors then 14 nodes ───────────────────────
     let qp = Qnn_QuantizeParams_t {
@@ -1416,6 +1422,8 @@ fn run_layer(
     let mut dims_mask = vec![n_kv as u32];
     let mut dims_sinks = vec![n_head as u32];
     let mut dims_score = vec![1u32];
+    // M3.4 D-D.1: pos_buf is INT_32 [1] shared across RoPE Q/K and KvScatter.
+    let mut dims_pos = vec![1u32];
 
     // Tensor names (CStrings must outlive graph build).
     let nm_x = CString::new("x").unwrap();
@@ -1455,6 +1463,8 @@ fn run_layer(
     let nm_mask = CString::new("mask").unwrap();
     let nm_sinks = CString::new("sinks").unwrap();
     let nm_score = CString::new("score").unwrap();
+    // M3.4 D-D.1: pos_buf is APP_WRITE so the host can update pos per execute.
+    let nm_pos = CString::new("pos").unwrap();
 
     // Helper: build tensor with given type/dtype/rank/dims.
     let build_tensor = |ttype, dtype, rank: u32, dims_ptr: *mut u32, name: *const c_char| {
@@ -1539,6 +1549,9 @@ fn run_layer(
     let mut t_mask = build_tensor(app_w, f16_t, 1, dims_mask.as_mut_ptr(), nm_mask.as_ptr());
     let mut t_sinks = build_tensor(app_w, f32_t, 1, dims_sinks.as_mut_ptr(), nm_sinks.as_ptr());
     let mut t_score = build_tensor(app_w, f32_t, 1, dims_score.as_mut_ptr(), nm_score.as_ptr());
+    // M3.4 D-D.1: pos_buf — INT_32 [1] APP_WRITE; updated per execute by host.
+    let i32_t = Qnn_DataType_t_QNN_DATATYPE_INT_32;
+    let mut t_pos = build_tensor(app_w, i32_t, 1, dims_pos.as_mut_ptr(), nm_pos.as_ptr());
     // Output of layer.
     // M2.H 5th: rank 2 [1, dim] to match x_in shape (Add(residual2) needs same rank).
     let mut t_x_out = build_tensor(app_r, f32_t, 2, dims_x_out.as_mut_ptr(), nm_x_out.as_ptr());
@@ -1655,6 +1668,7 @@ fn run_layer(
         ("mask", &mut t_mask),
         ("sinks", &mut t_sinks),
         ("score", &mut t_score),
+        ("pos", &mut t_pos),
         ("x_out", &mut t_x_out),
         ("y1", &mut t_y1),
         ("q", &mut t_q),
@@ -1717,34 +1731,29 @@ fn run_layer(
     let pn_kv_capacity = CString::new("kv_capacity").unwrap();
     let pn_head_dim_fa = CString::new("head_dim").unwrap();
 
-    // RoPE params (separate copies — Q/K share but we keep independent storage).
-    let mk_rope_params = |start: i32, th: f32| {
-        [
-            Qnn_Param_t {
-                paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-                name: pn_start_pos.as_ptr(),
-                __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                    scalarParam: Qnn_Scalar_t {
-                        dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
-                        __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { int32Value: start },
-                    },
+    // RoPE params (separate copies — Q/K share theta).
+    // M3.4 D-D.1: `start_pos` is no longer a SCALAR param; it's supplied via
+    // pos_buf input tensor at execute time.
+    let mk_rope_params = |th: f32| {
+        [Qnn_Param_t {
+            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+            name: pn_theta.as_ptr(),
+            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
+                scalarParam: Qnn_Scalar_t {
+                    dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { floatValue: th },
                 },
             },
-            Qnn_Param_t {
-                paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-                name: pn_theta.as_ptr(),
-                __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                    scalarParam: Qnn_Scalar_t {
-                        dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
-                        __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { floatValue: th },
-                    },
-                },
-            },
-        ]
+        }]
     };
-    let mut rope_q_params = mk_rope_params(pos, theta);
-    let mut rope_k_params = mk_rope_params(pos, theta);
+    let mut rope_q_params = mk_rope_params(theta);
+    let mut rope_k_params = mk_rope_params(theta);
+    // Suppress unused-warning for the kept `start_pos` / `write_pos` CString:
+    let _ = &pn_start_pos;
+    let _ = &pn_write_pos;
 
+    // M3.4 D-D.1: KvScatter `write_pos` is now in pos_buf. Only head_dim and
+    // capacity remain as SCALAR params.
     let mut kvs_params = [
         Qnn_Param_t {
             paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
@@ -1767,16 +1776,6 @@ fn run_layer(
                     __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 {
                         int32Value: kv_capacity as i32,
                     },
-                },
-            },
-        },
-        Qnn_Param_t {
-            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-            name: pn_write_pos.as_ptr(),
-            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                scalarParam: Qnn_Scalar_t {
-                    dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
-                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { int32Value: pos },
                 },
             },
         },
@@ -1884,14 +1883,16 @@ fn run_layer(
     let mut out_k_proj = [t_k];
     let mut in_v_proj = [t_vq, t_vd, t_y1];
     let mut out_v_proj = [t_v];
-    let mut in_rope_q = [t_q];
+    // M3.4 D-D.1: RoPE Q/K and KvScatter all consume the same pos_buf as a
+    // runtime input so the host can update pos per graphExecute.
+    let mut in_rope_q = [t_q, t_pos];
     let mut out_rope_q = [t_q_rope];
-    let mut in_rope_k = [t_k];
+    let mut in_rope_k = [t_k, t_pos];
     let mut out_rope_k = [t_k_rope];
-    // M2.H multi-output: KvScatter declares 2 inputs (k_rope, v) and 2
+    // M2.H multi-output: KvScatter declares 3 inputs (k_rope, v, pos) and 2
     // outputs (kcache, vcache). Earlier revisions routed kcache through
     // inputs[2] (InOutTensor) to fit the single-claim abstraction.
-    let mut in_kvs = [t_k_rope, t_v];
+    let mut in_kvs = [t_k_rope, t_v, t_pos];
     let mut out_kvs = [t_kcache, t_vcache];
     let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score];
     let mut out_fa = [t_attn_o];
@@ -1973,33 +1974,33 @@ fn run_layer(
             on_rope_q.as_ptr(),
             ot_rope.as_ptr(),
             in_rope_q.as_mut_ptr(),
-            1,
+            2, // M3.4 D-D.1: x_in + pos_buf
             out_rope_q.as_mut_ptr(),
             1,
             rope_q_params.as_mut_ptr(),
-            2,
+            1, // theta only
             "RoPE Q",
         ),
         (
             on_rope_k.as_ptr(),
             ot_rope.as_ptr(),
             in_rope_k.as_mut_ptr(),
-            1,
+            2, // M3.4 D-D.1: x_in + pos_buf
             out_rope_k.as_mut_ptr(),
             1,
             rope_k_params.as_mut_ptr(),
-            2,
+            1, // theta only
             "RoPE K",
         ),
         (
             on_kvs.as_ptr(),
             ot_kvs.as_ptr(),
             in_kvs.as_mut_ptr(),
-            2,
+            3, // M3.4 D-D.1: k_src + v_src + pos_buf
             out_kvs.as_mut_ptr(),
             2,
             kvs_params.as_mut_ptr(),
-            3,
+            2, // head_dim + capacity (write_pos via pos_buf)
             "KvScatter",
         ),
         (
@@ -2233,9 +2234,10 @@ fn run_layer(
         mk_desc(fd_mask, rpc_mask, f16_t, &dims_mask),
         mk_desc(fd_sinks, rpc_sinks, f32_t, &dims_sinks),
         mk_desc(fd_score, rpc_score, f32_t, &dims_score),
+        mk_desc(fd_pos, rpc_pos, i32_t, &dims_pos), // M3.4 D-D.1
         mk_desc(fd_x_out, rpc_x_out, f32_t, &dims_x_out),
     ];
-    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 23];
+    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 24];
     let err = unsafe {
         (v.memRegister.unwrap())(ctx, descs.as_ptr(), descs.len() as u32, mh.as_mut_ptr())
     };
@@ -2291,8 +2293,11 @@ fn run_layer(
     set_mh(&mut t_sinks_mh, mh[20]);
     let mut t_score_mh = t_score;
     set_mh(&mut t_score_mh, mh[21]);
+    // M3.4 D-D.1: pos_buf at index 22 (descs order).
+    let mut t_pos_mh = t_pos;
+    set_mh(&mut t_pos_mh, mh[22]);
     let mut t_x_out_mh = t_x_out;
-    set_mh(&mut t_x_out_mh, mh[22]);
+    set_mh(&mut t_x_out_mh, mh[23]);
 
     // ── 8. graphExecute ────────────────────────────────────────────────────
     // exec_inputs: every APP_WRITE tensor; exec_outputs: APP_READ (x_out).
@@ -2320,6 +2325,7 @@ fn run_layer(
         t_mask_mh,
         t_sinks_mh,
         t_score_mh,
+        t_pos_mh, // M3.4 D-D.1
     ];
     // M2.H multi-output: kcache + vcache are APP_READ outputs (KvScatter
     // claims). The SDK lets them double as graph-internal edges (FA input).

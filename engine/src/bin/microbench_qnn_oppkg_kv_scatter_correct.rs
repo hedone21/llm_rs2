@@ -1,27 +1,25 @@
-//! M2.E CustomKvScatter correctness — production OpPackage vs raw OpenCL.
+//! M2.E + M3.4 D-D.2 CustomKvScatter correctness — production OpPackage vs raw OpenCL.
 //!
-//! Maps to `kernel_kv_scatter_f32_to_f16` in `engine/kernels/simple_ops.cl`.
-//! The kernel casts F32 k_src/v_src → F16 and writes into HeadMajor layout:
+//! Maps to `kernel_kv_scatter_f32_to_f16_oop` in `engine/kernels/simple_ops.cl`.
+//! The OOP variant reads `write_pos` from `pos_buf[0]` instead of taking it as
+//! a SCALAR op param. Reason: QNN bakes SCALAR params at graph finalize, which
+//! made multi-token decode produce garbage (every token wrote into pos=0).
+//!
+//! Kernel:
 //!   k_dst[h * capacity * head_dim + write_pos * head_dim + d] = (half)k_src[h * head_dim + d]
 //!   v_dst[h * capacity * head_dim + write_pos * head_dim + d] = (half)v_src[h * head_dim + d]
+//!   where write_pos = pos_buf[0]
 //!
 //! **Multi-output design** (M2.H, 2026-05-09):
-//!   - inputs[0] = k_src, inputs[1] = v_src
+//!   - inputs[0] = k_src, inputs[1] = v_src, inputs[2] = pos_buf (M3.4 D-D.1)
 //!   - outputs[0] = k_dst, outputs[1] = v_dst (both claimed outputs)
-//!   - 7 kernel args: k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos
+//!   - 7 kernel args: k_src, v_src, pos_buf, k_dst, v_dst, head_dim, capacity
 //!
-//! Earlier revisions (Tier 1) used `InOutTensor(2)` for k_dst to fit the
-//! single-claim abstraction; the multi-output abstraction extension in
-//! `op_impl::build_op_state` (M2.H) makes both outputs first-class.
+//! Cases (kv_heads=2, head_dim=128, capacity=2048) × write_pos ∈ {0, 10, 100, 1000}.
+//! pos=0 reproduces M2.E GREEN baseline. pos != 0 cases are the new D-D evidence
+//! that proves the runtime pos buffer correctly drives the destination row.
 //!
-//! Case: (kv_heads=2, head_dim=128, capacity=2048, write_pos=100).
-//!   - Input: random F32 k_src [256], v_src [256]
-//!   - Reference: raw OpenCL kernel_kv_scatter_f32_to_f16
-//!   - Test: QNN OpPackage CustomKvScatter
-//!   - Assert: k_dst and v_dst both have max_abs_err < 1e-2 (F16 cast tolerance)
-//!
-//! Pass criterion: 1e-2 (F32→F16 cast error; identical kernel → values should
-//! be bit-equal after cast but threshold absorbs driver rounding differences).
+//! Pass criterion: max_abs_err < 1e-2 (F32→F16 cast tolerance).
 //!
 //! Build (Android cross):
 //!   cargo build --release --features qnn,opencl --target aarch64-linux-android \
@@ -65,7 +63,7 @@ fn main() -> anyhow::Result<()> {
     const PKG_PROVIDER: &str = "QnnOpPackage_InitInterface";
     const PKG_TARGET: &str = "GPU_QTI_AISW";
 
-    println!("=== microbench_qnn_oppkg_kv_scatter_correct (M2.E) ===\n");
+    println!("=== microbench_qnn_oppkg_kv_scatter_correct (M2.E + M3.4 D-D.2) ===\n");
     println!("Op Package: {}", PKG_PATH);
     println!("Interface symbol: {}", PKG_PROVIDER);
 
@@ -89,7 +87,10 @@ fn main() -> anyhow::Result<()> {
         .src(kernel_src)
         .cmplr_opt("-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math")
         .build(&cl_ctx)?;
-    let cl_kernel = ocl::core::create_kernel(&cl_program, "kernel_kv_scatter_f32_to_f16")?;
+    // Reference: same OOP kernel as the OpPackage path so both read pos via
+    // pos_buf. This proves the QNN-side runtime pos buffer matches a raw
+    // OpenCL execution that uses the same buffer-based pos.
+    let cl_kernel = ocl::core::create_kernel(&cl_program, "kernel_kv_scatter_f32_to_f16_oop")?;
 
     // ── Path B: QNN-GPU backend + register OpPackage ──────────────────────────
     let gpu_lib = unsafe { Library::new(&backend_lib_path) }?;
@@ -148,57 +149,62 @@ fn main() -> anyhow::Result<()> {
     let _rpcmem_free: Symbol<RpcmemFreeFn> = unsafe { rpc_lib.get(b"rpcmem_free\0")? };
     let rpcmem_to_fd: Symbol<RpcmemToFdFn> = unsafe { rpc_lib.get(b"rpcmem_to_fd\0")? };
 
-    // Single test case: Qwen2.5 KV head shape
+    // Single shape, multiple write_pos values to exercise multi-pos path.
     let kv_heads: usize = 2;
     let head_dim: usize = 128;
     let capacity: usize = 2048;
-    let write_pos: i32 = 100;
+    let write_positions: &[i32] = &[0, 10, 100, 1000];
+    let mut all_pass = true;
+
+    for &write_pos in write_positions {
+        println!(
+            "--- (kv_heads={}, head_dim={}, capacity={}, write_pos={}) ---",
+            kv_heads, head_dim, capacity, write_pos
+        );
+
+        let result = run_case(
+            &v,
+            ctx,
+            &cl_q,
+            &cl_ctx,
+            &cl_kernel,
+            &rpcmem_alloc,
+            &rpcmem_to_fd,
+            RPCMEM_HEAP_ID_SYSTEM,
+            RPCMEM_DEFAULT_FLAGS,
+            kv_heads,
+            head_dim,
+            capacity,
+            write_pos,
+        );
+
+        match result {
+            Ok((max_k, max_v)) => {
+                let pass_k = max_k < 1e-2;
+                let pass_v = max_v < 1e-2;
+                println!(
+                    "  k_dst max_abs_err = {:.6e}  {}",
+                    max_k,
+                    if pass_k { "PASS" } else { "FAIL" }
+                );
+                println!(
+                    "  v_dst max_abs_err = {:.6e}  {}",
+                    max_v,
+                    if pass_v { "PASS" } else { "FAIL" }
+                );
+                if !(pass_k && pass_v) {
+                    all_pass = false;
+                }
+            }
+            Err(e) => {
+                println!("  ERROR: {}", e);
+                all_pass = false;
+            }
+        }
+    }
 
     println!(
-        "--- (kv_heads={}, head_dim={}, capacity={}, write_pos={}) ---",
-        kv_heads, head_dim, capacity, write_pos
-    );
-
-    let result = run_case(
-        &v,
-        ctx,
-        &cl_q,
-        &cl_ctx,
-        &cl_kernel,
-        &rpcmem_alloc,
-        &rpcmem_to_fd,
-        RPCMEM_HEAP_ID_SYSTEM,
-        RPCMEM_DEFAULT_FLAGS,
-        kv_heads,
-        head_dim,
-        capacity,
-        write_pos,
-    );
-
-    let all_pass = match result {
-        Ok((max_k, max_v)) => {
-            let pass_k = max_k < 1e-2;
-            let pass_v = max_v < 1e-2;
-            println!(
-                "  k_dst max_abs_err = {:.6e}  {}",
-                max_k,
-                if pass_k { "PASS" } else { "FAIL" }
-            );
-            println!(
-                "  v_dst max_abs_err = {:.6e}  {}",
-                max_v,
-                if pass_v { "PASS" } else { "FAIL" }
-            );
-            pass_k && pass_v
-        }
-        Err(e) => {
-            println!("  ERROR: {}", e);
-            false
-        }
-    };
-
-    println!(
-        "\n=== M2.E verdict: {} ===",
+        "\n=== M3.4 D-D.2 verdict: {} ===",
         if all_pass { "GREEN" } else { "RED" }
     );
 
@@ -301,9 +307,9 @@ fn run_case(
     let host_k_dst_init = vec![0u16; dst_total];
     let host_v_dst_init = vec![0u16; dst_total];
 
-    // ── Path A: raw OpenCL reference ──────────────────────────────────────────
-    // kernel_kv_scatter_f32_to_f16 signature:
-    //   (k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
+    // ── Path A: raw OpenCL reference using kernel_kv_scatter_f32_to_f16_oop ───
+    // Args (matches new kernel signature exactly):
+    //   (k_src, v_src, pos_buf, k_dst, v_dst, head_dim, capacity)
     let buf_k_src = unsafe {
         ocl::core::create_buffer::<_, f32>(
             cl_ctx.as_core(),
@@ -319,6 +325,9 @@ fn run_case(
             src_total,
             None,
         )?
+    };
+    let buf_pos = unsafe {
+        ocl::core::create_buffer::<_, i32>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, 1, None)?
     };
     // dst buffers as u16 (half); ocl treats them as raw bytes.
     let buf_k_dst = unsafe {
@@ -338,6 +347,7 @@ fn run_case(
         )?
     };
 
+    let host_pos = [write_pos];
     unsafe {
         ocl::core::enqueue_write_buffer(
             cl_q,
@@ -354,6 +364,15 @@ fn run_case(
             true,
             0,
             &host_v_src,
+            None::<ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
+        ocl::core::enqueue_write_buffer(
+            cl_q,
+            &buf_pos,
+            true,
+            0,
+            &host_pos,
             None::<ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
@@ -382,11 +401,11 @@ fn run_case(
     let capacity_i: i32 = capacity as i32;
     ocl::core::set_kernel_arg(cl_kernel, 0, ArgVal::mem(&buf_k_src))?;
     ocl::core::set_kernel_arg(cl_kernel, 1, ArgVal::mem(&buf_v_src))?;
-    ocl::core::set_kernel_arg(cl_kernel, 2, ArgVal::mem(&buf_k_dst))?;
-    ocl::core::set_kernel_arg(cl_kernel, 3, ArgVal::mem(&buf_v_dst))?;
-    ocl::core::set_kernel_arg(cl_kernel, 4, ArgVal::scalar(&head_dim_i))?;
-    ocl::core::set_kernel_arg(cl_kernel, 5, ArgVal::scalar(&capacity_i))?;
-    ocl::core::set_kernel_arg(cl_kernel, 6, ArgVal::scalar(&write_pos))?;
+    ocl::core::set_kernel_arg(cl_kernel, 2, ArgVal::mem(&buf_pos))?;
+    ocl::core::set_kernel_arg(cl_kernel, 3, ArgVal::mem(&buf_k_dst))?;
+    ocl::core::set_kernel_arg(cl_kernel, 4, ArgVal::mem(&buf_v_dst))?;
+    ocl::core::set_kernel_arg(cl_kernel, 5, ArgVal::scalar(&head_dim_i))?;
+    ocl::core::set_kernel_arg(cl_kernel, 6, ArgVal::scalar(&capacity_i))?;
 
     let global = [src_total, 1, 1];
     unsafe {
@@ -430,14 +449,17 @@ fn run_case(
     // ── Path B: QNN graph with CustomKvScatter ────────────────────────────────
     let src_bytes = (src_total * 4) as i32; // F32
     let dst_bytes = (dst_total * 2) as i32; // F16 (2 bytes per element)
+    let pos_bytes: i32 = 4; // INT_32 [1]
 
     let rpc_k_src = unsafe { rpcmem_alloc(heap_id, flags, src_bytes) };
     let rpc_v_src = unsafe { rpcmem_alloc(heap_id, flags, src_bytes) };
+    let rpc_pos = unsafe { rpcmem_alloc(heap_id, flags, pos_bytes) };
     let rpc_k_dst = unsafe { rpcmem_alloc(heap_id, flags, dst_bytes) };
     let rpc_v_dst = unsafe { rpcmem_alloc(heap_id, flags, dst_bytes) };
     anyhow::ensure!(
         !rpc_k_src.is_null()
             && !rpc_v_src.is_null()
+            && !rpc_pos.is_null()
             && !rpc_k_dst.is_null()
             && !rpc_v_dst.is_null(),
         "rpcmem_alloc failed"
@@ -454,6 +476,8 @@ fn run_case(
             rpc_v_src as *mut u8,
             src_bytes as usize,
         );
+        // Write the runtime pos value into pos_buf[0].
+        *(rpc_pos as *mut i32) = write_pos;
         // Zero-init k_dst and v_dst
         std::ptr::write_bytes(rpc_k_dst as *mut u8, 0, dst_bytes as usize);
         std::ptr::write_bytes(rpc_v_dst as *mut u8, 0, dst_bytes as usize);
@@ -461,10 +485,12 @@ fn run_case(
 
     let fd_k_src = unsafe { rpcmem_to_fd(rpc_k_src) };
     let fd_v_src = unsafe { rpcmem_to_fd(rpc_v_src) };
+    let fd_pos = unsafe { rpcmem_to_fd(rpc_pos) };
     let fd_k_dst = unsafe { rpcmem_to_fd(rpc_k_dst) };
     let fd_v_dst = unsafe { rpcmem_to_fd(rpc_v_dst) };
 
     let mut dims_src = vec![src_total as u32];
+    let mut dims_pos = vec![1u32];
     let mut dims_dst = vec![dst_total as u32];
     let mut dims_dst_v = vec![dst_total as u32];
 
@@ -506,10 +532,11 @@ fn run_case(
         };
     }
 
-    let name_k_src = CString::new("kvs_k_src").unwrap();
-    let name_v_src = CString::new("kvs_v_src").unwrap();
-    let name_k_dst = CString::new("kvs_k_dst").unwrap();
-    let name_v_dst = CString::new("kvs_v_dst").unwrap();
+    let name_k_src = CString::new(format!("kvs_k_src_{}", write_pos)).unwrap();
+    let name_v_src = CString::new(format!("kvs_v_src_{}", write_pos)).unwrap();
+    let name_pos = CString::new(format!("kvs_pos_{}", write_pos)).unwrap();
+    let name_k_dst = CString::new(format!("kvs_k_dst_{}", write_pos)).unwrap();
+    let name_v_dst = CString::new(format!("kvs_v_dst_{}", write_pos)).unwrap();
 
     let mut t_k_src = mk_tensor!(
         Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
@@ -524,6 +551,13 @@ fn run_case(
         dims_src.as_mut_ptr()
     );
     t_v_src.__bindgen_anon_1.v1.name = name_v_src.as_ptr();
+
+    let mut t_pos = mk_tensor!(
+        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+        Qnn_DataType_t_QNN_DATATYPE_INT_32,
+        dims_pos.as_mut_ptr()
+    );
+    t_pos.__bindgen_anon_1.v1.name = name_pos.as_ptr();
 
     // M2.H multi-output: both k_dst and v_dst are claimed outputs (APP_READ).
     let mut t_k_dst = mk_tensor!(
@@ -540,7 +574,7 @@ fn run_case(
     );
     t_v_dst.__bindgen_anon_1.v1.name = name_v_dst.as_ptr();
 
-    let g_name = CString::new("kvs_graph").unwrap();
+    let g_name = CString::new(format!("kvs_graph_{}", write_pos)).unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
     let err =
         unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
@@ -549,6 +583,7 @@ fn run_case(
     for (label, t) in [
         ("k_src", &mut t_k_src),
         ("v_src", &mut t_v_src),
+        ("pos", &mut t_pos),
         ("k_dst", &mut t_k_dst),
         ("v_dst", &mut t_v_dst),
     ] {
@@ -556,10 +591,9 @@ fn run_case(
         anyhow::ensure!(err == 0, "tensorCreate({}) err=0x{:x}", label, err);
     }
 
-    // Op params: head_dim, capacity, write_pos
+    // Op params: head_dim, capacity (write_pos is now in pos_buf, M3.4 D-D.1).
     let p_name_hd = CString::new("head_dim").unwrap();
     let p_name_cap = CString::new("capacity").unwrap();
-    let p_name_wp = CString::new("write_pos").unwrap();
 
     let mut params = [
         Qnn_Param_t {
@@ -586,24 +620,12 @@ fn run_case(
                 },
             },
         },
-        Qnn_Param_t {
-            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-            name: p_name_wp.as_ptr(),
-            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                scalarParam: Qnn_Scalar_t {
-                    dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
-                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 {
-                        int32Value: write_pos,
-                    },
-                },
-            },
-        },
     ];
 
-    let op_name = CString::new("kvs_op0").unwrap();
+    let op_name = CString::new(format!("kvs_op0_{}", write_pos)).unwrap();
     let pkg = CString::new("qnn_oppkg").unwrap();
     let op_type = CString::new("CustomKvScatter").unwrap();
-    let mut inputs = [t_k_src, t_v_src];
+    let mut inputs = [t_k_src, t_v_src, t_pos];
     let mut outputs = [t_k_dst, t_v_dst];
     let op = Qnn_OpConfig_t {
         version: Qnn_OpConfigVersion_t_QNN_OPCONFIG_VERSION_1,
@@ -612,9 +634,9 @@ fn run_case(
                 name: op_name.as_ptr(),
                 packageName: pkg.as_ptr(),
                 typeName: op_type.as_ptr(),
-                numOfParams: 3,
+                numOfParams: 2,
                 params: params.as_mut_ptr(),
-                numOfInputs: 2,
+                numOfInputs: 3,
                 inputTensors: inputs.as_mut_ptr(),
                 numOfOutputs: 2,
                 outputTensors: outputs.as_mut_ptr(),
@@ -650,6 +672,7 @@ fn run_case(
     };
 
     let dims_src_u = vec![src_total as u32];
+    let dims_pos_u = vec![1u32];
     let dims_dst_u = vec![dst_total as u32];
     let descs = [
         mk_desc(
@@ -665,6 +688,12 @@ fn run_case(
             &dims_src_u,
         ),
         mk_desc(
+            fd_pos,
+            rpc_pos,
+            Qnn_DataType_t_QNN_DATATYPE_INT_32,
+            &dims_pos_u,
+        ),
+        mk_desc(
             fd_k_dst,
             rpc_k_dst,
             Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
@@ -677,24 +706,26 @@ fn run_case(
             &dims_dst_u,
         ),
     ];
-    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 4];
-    let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 4, mh.as_mut_ptr()) };
+    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 5];
+    let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 5, mh.as_mut_ptr()) };
     anyhow::ensure!(err == 0, "memRegister err=0x{:x}", err);
 
     inputs[0].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
     inputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[0];
     inputs[1].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
     inputs[1].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[1];
+    inputs[2].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
+    inputs[2].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[2];
     outputs[0].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
-    outputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[2];
+    outputs[0].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[3];
     outputs[1].__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
-    outputs[1].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[3];
+    outputs[1].__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = mh[4];
 
     let err = unsafe {
         (v.graphExecute.unwrap())(
             graph,
             inputs.as_ptr(),
-            2,
+            3,
             outputs.as_mut_ptr(),
             2,
             ptr::null_mut(),
@@ -731,7 +762,7 @@ fn run_case(
     }
 
     unsafe {
-        let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), 4);
+        let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), 5);
     }
 
     Ok((max_abs_k, max_abs_v))

@@ -1,6 +1,6 @@
 //! `CustomKvScatter` op descriptor — F32→F16 cast + HeadMajor scatter.
 //!
-//! Maps to `kernel_kv_scatter_f32_to_f16` in `engine/kernels/simple_ops.cl`.
+//! Maps to `kernel_kv_scatter_f32_to_f16_oop` in `engine/kernels/simple_ops.cl`.
 //!
 //! ## Multi-output design (M2.H, 2026-05-09)
 //!
@@ -12,44 +12,61 @@
 //! multi-`OutputClaim` via `OpImplLayout::output_claims`, so KvScatter can
 //! declare both `k_dst` and `v_dst` as proper output edges.
 //!
+//! ## pos-as-buffer rationale (M3.4 D-D.1, 2026-05-10)
+//!
+//! Earlier the descriptor read `write_pos` as a SCALAR op param (INT_32). QNN
+//! bakes SCALAR params into the graph at `graphFinalize` time, which made
+//! multi-token decode impossible — every token would scatter into the same
+//! cache slot. The fix: introduce a 3rd input tensor `pos_buf : INT_32 [1]`
+//! that the kernel reads as `pos_buf[0]`. The graph caller writes the current
+//! decode position into `pos_buf` before each `graphExecute`. `head_dim` and
+//! `capacity` remain SCALAR (build-time-constant per layer/model).
+//!
+//! Note: this descriptor uses the OOP variant kernel
+//! (`kernel_kv_scatter_f32_to_f16_oop`). The original
+//! `kernel_kv_scatter_f32_to_f16` is preserved for the OpenCL backend in
+//! `engine/src/backend/opencl/{mod,plan}.rs`, which sets `write_pos` as a
+//! per-call kernel arg directly (no graph-finalize barrier).
+//!
 //! Kernel signature:
-//!   kernel void kernel_kv_scatter_f32_to_f16(
+//!   kernel void kernel_kv_scatter_f32_to_f16_oop(
 //!       global const float * k_src,   // arg 0: InputTensor(0)
 //!       global const float * v_src,   // arg 1: InputTensor(1)
-//!       global half * k_dst,          // arg 2: OutputTensor(0)
-//!       global half * v_dst,          // arg 3: OutputTensor(1)
-//!       int head_dim,                 // arg 4
-//!       int capacity,                 // arg 5
-//!       int write_pos                 // arg 6
+//!       global const int   * pos_buf, // arg 2: InputTensor(2) — pos_buf[0] = write_pos
+//!       global half * k_dst,          // arg 3: OutputTensor(0)
+//!       global half * v_dst,          // arg 4: OutputTensor(1)
+//!       int head_dim,                 // arg 5
+//!       int capacity                  // arg 6
 //!   );
 //!
 //! Tensor convention:
-//!   inputs[0]  = k_src  F32 [kv_heads * head_dim]                    FLOAT_32
-//!   inputs[1]  = v_src  F32 [kv_heads * head_dim]                    FLOAT_32
-//!   outputs[0] = k_dst  F16 [kv_heads * capacity * head_dim]         FLOAT_16
-//!   outputs[1] = v_dst  F16 [kv_heads * capacity * head_dim]         FLOAT_16
+//!   inputs[0]  = k_src    F32 [kv_heads * head_dim]                  FLOAT_32
+//!   inputs[1]  = v_src    F32 [kv_heads * head_dim]                  FLOAT_32
+//!   inputs[2]  = pos_buf  I32 [1]                                    INT_32
+//!   outputs[0] = k_dst    F16 [kv_heads * capacity * head_dim]       FLOAT_16
+//!   outputs[1] = v_dst    F16 [kv_heads * capacity * head_dim]       FLOAT_16
 //!
-//! Op params (numOfParams ≤ 3):
+//! Op params (numOfParams ≤ 2):
 //!   params[i].name = "head_dim"  scalar INT_32
 //!   params[i].name = "capacity"  scalar INT_32
-//!   params[i].name = "write_pos" scalar INT_32
 //!
 //! Layout:
-//!   mem_objects[0] = k_src  FLOAT_32 [kv_heads * head_dim]
-//!   mem_objects[1] = v_src  FLOAT_32 [kv_heads * head_dim]
-//!   mem_objects[2] = k_dst  FLOAT_16 [kv_heads * capacity * head_dim]  ← output[0]
-//!   mem_objects[3] = v_dst  FLOAT_16 [kv_heads * capacity * head_dim]  ← output[1]
+//!   mem_objects[0] = k_src   FLOAT_32 [kv_heads * head_dim]
+//!   mem_objects[1] = v_src   FLOAT_32 [kv_heads * head_dim]
+//!   mem_objects[2] = pos_buf INT_32   [1]
+//!   mem_objects[3] = k_dst   FLOAT_16 [kv_heads * capacity * head_dim]  ← output[0]
+//!   mem_objects[4] = v_dst   FLOAT_16 [kv_heads * capacity * head_dim]  ← output[1]
 //!
-//! Args (7 total, matching kernel_kv_scatter_f32_to_f16 declaration order):
+//! Args (7 total, matching kernel_kv_scatter_f32_to_f16_oop declaration order):
 //!   InputTensor(0)  → k_src
 //!   InputTensor(1)  → v_src
+//!   InputTensor(2)  → pos_buf
 //!   OutputTensor(0) → k_dst
 //!   OutputTensor(1) → v_dst
 //!   Int(head_dim)
 //!   Int(capacity)
-//!   Int(write_pos)
 //!
-//! Output claims: both k_dst (mem 2) and v_dst (mem 3) are explicit
+//! Output claims: both k_dst (mem 3) and v_dst (mem 4) are explicit
 //! `QnnGpu_OutputClaim_t` entries via `OpImplLayout::output_claims`.
 //!
 //! Workgroup:
@@ -60,13 +77,13 @@ use crate::args::{
     ArgSpec, MemoryObjectSpec, OpDescriptor, OpError, OpImplLayout, OutputClaimSpec,
 };
 use crate::qnn::{
-    Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, Qnn_OpConfigV1_t,
-    Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+    Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+    Qnn_DataType_t_QNN_DATATYPE_INT_32, Qnn_OpConfigV1_t, Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
 };
 
 pub static DESCRIPTOR: OpDescriptor = OpDescriptor {
     op_type: "CustomKvScatter",
-    kernel_name: "kernel_kv_scatter_f32_to_f16",
+    kernel_name: "kernel_kv_scatter_f32_to_f16_oop",
     kernel_source: include_str!("../../../../engine/kernels/simple_ops.cl"),
     build_options: "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math",
     build_layout,
@@ -94,14 +111,28 @@ fn read_param_int(v1: &Qnn_OpConfigV1_t, name: &str) -> Option<i32> {
 }
 
 pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpError> {
-    // Require: 2 inputs (k_src, v_src), 2 outputs (k_dst, v_dst).
-    if v1.numOfInputs < 2 || v1.numOfOutputs < 2 {
+    // Require: 3 inputs (k_src, v_src, pos_buf), 2 outputs (k_dst, v_dst).
+    if v1.numOfInputs < 3 || v1.numOfOutputs < 2 {
         return Err(OpError::ValidationFailure);
     }
 
     // k_src: rank 1 [kv_heads * head_dim] or rank 2 [kv_heads, head_dim]
     let k_src_t = unsafe { (*v1.inputTensors.add(0)).__bindgen_anon_1.v1 };
     if k_src_t.dimensions.is_null() || k_src_t.rank == 0 {
+        return Err(OpError::InvalidArgument);
+    }
+
+    // pos_buf: rank ≥ 1, flat element count = 1.
+    let pos_t = unsafe { (*v1.inputTensors.add(2)).__bindgen_anon_1.v1 };
+    if pos_t.dimensions.is_null() || pos_t.rank == 0 {
+        return Err(OpError::InvalidArgument);
+    }
+    let mut pos_total: u32 = 1;
+    for i in 0..pos_t.rank {
+        let d = unsafe { *pos_t.dimensions.add(i as usize) };
+        pos_total = pos_total.checked_mul(d).ok_or(OpError::InvalidArgument)?;
+    }
+    if pos_total != 1 {
         return Err(OpError::InvalidArgument);
     }
 
@@ -115,9 +146,8 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
         return Err(OpError::InvalidArgument);
     }
 
-    // capacity, write_pos, head_dim from op params.
+    // capacity, head_dim from op params (write_pos now lives in pos_buf).
     let capacity = read_param_int(v1, "capacity").ok_or(OpError::ValidationFailure)?;
-    let write_pos = read_param_int(v1, "write_pos").unwrap_or(0);
     let head_dim = read_param_int(v1, "head_dim").ok_or(OpError::ValidationFailure)?;
 
     if std::env::var("QNN_OPPKG_DEBUG").as_deref() == Ok("1") {
@@ -142,13 +172,14 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
             s
         };
         eprintln!(
-            "[oppkg-kvs] params: head_dim={} capacity={} write_pos={} src_total={}",
-            head_dim, capacity, write_pos, src_total
+            "[oppkg-kvs] params: head_dim={} capacity={} src_total={} (write_pos = pos_buf[0])",
+            head_dim, capacity, src_total
         );
         eprintln!(
-            "[oppkg-kvs] in dims: k_src={} v_src={} | out: k_dst={} v_dst={}",
+            "[oppkg-kvs] in dims: k_src={} v_src={} pos_buf={} | out: k_dst={} v_dst={}",
             dim_dump(0, false),
             dim_dump(1, false),
+            dim_dump(2, false),
             dim_dump(0, true),
             dim_dump(1, true),
         );
@@ -179,6 +210,12 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
             flat_dims: vec![src_total],
             flat_offsets: vec![0u32],
         },
+        // pos_buf INT_32 [1]
+        MemoryObjectSpec {
+            data_type: Qnn_DataType_t_QNN_DATATYPE_INT_32,
+            flat_dims: vec![1u32],
+            flat_offsets: vec![0u32],
+        },
         // k_dst F16 (claimed output 0)
         MemoryObjectSpec {
             data_type: Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
@@ -193,27 +230,27 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
         },
     ];
 
-    // Args match kernel_kv_scatter_f32_to_f16 declaration order (7 total).
+    // Args match kernel_kv_scatter_f32_to_f16_oop declaration order (7 total).
     let args = vec![
         ArgSpec::InputTensor(0),  // k_src
         ArgSpec::InputTensor(1),  // v_src
+        ArgSpec::InputTensor(2),  // pos_buf
         ArgSpec::OutputTensor(0), // k_dst
         ArgSpec::OutputTensor(1), // v_dst
         ArgSpec::Int(head_dim),
         ArgSpec::Int(capacity),
-        ArgSpec::Int(write_pos),
     ];
 
-    // Multi-output explicit claims: outputs[0] ↔ mem_objects[2] (k_dst),
-    // outputs[1] ↔ mem_objects[3] (v_dst). See `OpImplLayout::output_claims`.
+    // Multi-output explicit claims: outputs[0] ↔ mem_objects[3] (k_dst),
+    // outputs[1] ↔ mem_objects[4] (v_dst). See `OpImplLayout::output_claims`.
     let output_claims = vec![
         OutputClaimSpec {
             output_index: 0,
-            mem_object_index: 2,
+            mem_object_index: 3,
         },
         OutputClaimSpec {
             output_index: 1,
-            mem_object_index: 3,
+            mem_object_index: 4,
         },
     ];
 
@@ -251,30 +288,31 @@ mod tests {
         assert!(
             DESCRIPTOR
                 .kernel_source
-                .contains("kernel_kv_scatter_f32_to_f16"),
-            "kernel source must contain 'kernel_kv_scatter_f32_to_f16'"
+                .contains("kernel_kv_scatter_f32_to_f16_oop"),
+            "kernel source must contain 'kernel_kv_scatter_f32_to_f16_oop'"
         );
     }
 
     #[test]
     fn kv_scatter_build_layout_for_qwen() {
-        // kv_heads=2, head_dim=128, capacity=2048, write_pos=100
+        // kv_heads=2, head_dim=128, capacity=2048, write_pos=100 (write_pos
+        // is now ignored at build_layout — supplied via pos_buf at execute).
         let layout = make_layout(2, 128, 2048, 100).expect("build_layout must succeed");
         assert_eq!(layout.args.len(), 7, "must have 7 kernel args");
-        assert_eq!(layout.mem_objects.len(), 4, "must have 4 mem_objects");
+        assert_eq!(layout.mem_objects.len(), 5, "must have 5 mem_objects");
         // global_work = kv_heads * head_dim = 2 * 128 = 256
         assert_eq!(layout.global_work[0], 256);
         assert_eq!(layout.global_work[1], 1);
         assert_eq!(layout.global_work[2], 1);
-        // multi-output: 2 explicit claims
+        // multi-output: 2 explicit claims pointing at mem 3 (k_dst) and 4 (v_dst).
         let claims = layout
             .output_claims
             .as_ref()
             .expect("output_claims must be Some for multi-output");
         assert_eq!(claims.len(), 2);
         assert_eq!(claims[0].output_index, 0);
-        assert_eq!(claims[0].mem_object_index, 2);
+        assert_eq!(claims[0].mem_object_index, 3);
         assert_eq!(claims[1].output_index, 1);
-        assert_eq!(claims[1].mem_object_index, 3);
+        assert_eq!(claims[1].mem_object_index, 4);
     }
 }
