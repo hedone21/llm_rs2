@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) + INV-137~139 (AUF v0.2 multi-dtype variant, 2026-04-27) + INV-140~143 (Weight Swap Phase 6.5 Overhead Reduction, 2026-05-07) + INV-147~150 (Intra-forward Layer-aligned Swap LISWAP-4, 2026-05-08) + INV-151~155 (QNN OpPackage M1, 2026-05-09) + INV-156~165 (QNN OpPackage M2 layer graph, 2026-05-09) = 총 138개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) + INV-137~139 (AUF v0.2 multi-dtype variant, 2026-04-27) + INV-140~143 (Weight Swap Phase 6.5 Overhead Reduction, 2026-05-07) + INV-147~150 (Intra-forward Layer-aligned Swap LISWAP-4, 2026-05-08) + INV-151~155 (QNN OpPackage M1, 2026-05-09) + INV-156~165 (QNN OpPackage M2 layer graph, 2026-05-09) + INV-166~180 (QNN OpPackage M3 backend wire-up, 2026-05-10) + INV-181~188 (QNN OpPackage M4 async chunk swap placeholder, 2026-05-10) = 총 161개.
 
 ## 1. Purpose and Scope
 
@@ -421,6 +421,56 @@
 | INV-164 | 30-engine 부록 B.4 (ENG-QNN-120) | SiluMul kernel은 production `.cl` 수정 없이 OpPackage abstraction의 intermediate alias 패턴(`ArgSpec::OutputTensorAliased`)으로 graph-safe하게 동작한다. SDK가 동일 backing buffer를 input/output edge에 alias 매핑할 수 있어야 한다. SDK가 거부 시 옵션 B (silu_oop + mul_oop 2단계 분해) fallback 발동. | Correctness | test | M2.4 게이트. layer graph 안에서 SiluMul 출력이 다음 op (ffn_up matmul 또는 final Add)의 입력으로 정상 연결됨 검증. |
 | INV-165 | 30-engine 부록 B.2 (ENG-QNN-104) | Q4_0 weight tensor는 `MemoryObjectSpec::RawBytes { block_size: 18, element_count: N/32 }`로 OpPackage abstraction에 노출된다. 32 element block당 18 byte (2 byte F16 scale + 16 byte 4-bit nibbles). Q8_0/Q5_K 등 타 quantization은 별도 RawBytes variant. | Correctness | static, test | host unit test에서 `MemoryObjectSpec` 생성 시 block_size=18 검증. Q4_0 GEMV op `kernel_arg_setter`가 raw bytes를 cl_mem으로 정확히 매핑. |
 
+### 3.24 QNN OpPackage M3 Backend Invariants [INV-166 ~ INV-180]
+
+2026-05-10 QNN OpPackage M3 (production backend wire-up)의 불변식. 대응 명세: `30-engine.md` 부록 C (ENG-QNN-201 ~ ENG-QNN-240).
+
+**도입 컨텍스트**: M2 layer graph cdylib (10 ops + 13~14-node graph) 정확성 GREEN 후 production engine `Backend` trait 구현체 `QnnOppkgBackend`를 추가하여 32-token greedy decode를 전수 통과시킨다. M2 INV-160 (production change == 0)은 본 단계에서 자연 만료하며, 그 정신을 INV-169 (OpenCL backend 무회귀)가 대체한다.
+
+**교차 참조**:
+- **INV-151~155 (M1)**, **INV-156~165 (M2)**: 본 단계에서 모두 보존. 단 INV-160 (production change == 0)은 자연 만료.
+- **INV-001/010/011** (2 독립 프로세스 + Shared): cdylib binary는 여전히 dlopen 외부 산출물로 격리. host metadata crate (`crates/qnn_oppkg`의 rust source)에 대한 cargo edge는 INV-180으로 명시 허용.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-166 | 30-engine 부록 C.2 (ENG-QNN-201) | qnn_oppkg backend는 `Backend` trait의 모든 필수 method (matmul, matmul_transposed, rms_norm, rms_norm_oop, rope_inplace, attention_gen, kv_scatter_f32_to_f16_batch, flash_attention_prefill)를 OpenCL과 동일 시그니처로 구현한다. | Correctness | static, test | 컴파일 타임 trait bound + host unit test에서 method 시그니처 동등성 검증. |
+| INV-167 | 30-engine 부록 C.2 (ENG-QNN-203) | Layer graph는 model load 시점에 N(=28)회 graphFinalize 후 process lifetime 동안 재사용한다. cache invalidation은 weight swap path에서만 발동 (M4 영역). | Correctness | runtime, test | 디바이스 microbench에서 32-token decode 동안 graphFinalize 호출 == 28회 (load 시점) + 0회 (decode 동안). |
+| INV-168 | 30-engine 부록 C.2 (ENG-QNN-204) | KV cache shape는 M2와 동일 `[1, kv_heads, 2048, head_dim] F16` max-padded. M3에서는 dynamic seq_len 미지원이며 prefill (variable seq_len)은 OpenCL backend로 fallback. | Correctness | runtime, test | layer graph 입력 tensor descriptor의 shape 검증. INV-159의 production 확장. |
+| INV-169 | 30-engine 부록 C.5 (ENG-QNN-237, ENG-QNN-238) | OpenCL backend 정확성/TBT 무회귀: (a) `cargo test --workspace --features opencl` (qnn 비활성) 0건 회귀, (b) `--backend opencl` decode TBT가 M3.0 진입 직전 baseline 대비 ≤ 1.05× (5% tolerance). M2 INV-160 (production change == 0)을 약화 대체하는 핵심 게이트. | Safety | static, test | CI에서 (a)는 cargo test, (b)는 디바이스 microbench. Backend trait 신규 method 추가가 hot path overhead를 도입하지 않음을 보증. |
+| INV-170 | 30-engine 부록 C.6 (ENG-QNN-C20, ENG-QNN-219) | `--backend qnn_oppkg | qnngpu`는 default off (opt-in). unknown backend 거부 (`bail!("Unknown backend")`)는 보존된다. `feature = "qnn"` cargo flag 미활성 시 dispatch에 등장하지 않는다. | Correctness | static, test | host integration test에서 `--backend foo` 실행 시 unknown backend로 reject 검증. feature gate 검증. |
+| INV-171 | 30-engine 부록 C.2 (ENG-QNN-204) | KV cache는 rpcmem(DMA-BUF heap)-backed buffer로 alloc되며 mmap된 host pointer를 graph builder의 KvCacheHandle에 노출한다. host-side eviction/quant 정책 동시 가능. | Correctness | runtime, test | 디바이스 test에서 KVCache buffer가 rpcmem fd 기반 mmap 영역인지 검증 (`/proc/self/maps` 확인 또는 buffer 메타데이터). Phase R R-A2/R-Y 결과 기반. |
+| INV-172 | 30-engine 부록 C.5 (ENG-QNN-231) | Qwen2.5-1.5B Q4_0 32-token greedy decode (top-1, seed=42, 동일 prompt) = `--backend opencl` 결과와 token sequence 100% 일치. 1개 token이라도 다르면 RED. | Correctness | test | 디바이스 accuracy gate. `microbench_qnn_oppkg_decode32` 또는 `generate` 바이너리 두 backend 결과 diff. |
+| INV-173 | 30-engine 부록 C.5 (ENG-QNN-240) | TBT 측정은 wall-clock only. `CL_QUEUE_PROFILING_ENABLE` / `--profile-events` 사용 금지 (driver-specific 패널티 회피, M2 INV-162 정신 보존). | Performance | test | 디바이스 microbench. wall-clock 측정 + `--profile-events` 미사용 enforce. |
+| INV-174 | 30-engine 부록 C.3 (ENG-QNN-212) | `Backend::supports_layer_graph()`는 idempotent. model load 후 항상 true 또는 항상 false (backend 내부 cache 상태에 의존하지 않음). | Correctness | runtime, test | host unit test에서 동일 backend 인스턴스에 대해 다중 호출 결과 동일성 검증. |
+| INV-175 | 30-engine 부록 C.5 (ENG-QNN-239) | qnn_oppkg backend로 32 token decode 후 trait method (matmul, matmul_transposed, rope_inplace, attention_gen, kv_scatter_f32_to_f16_batch) 호출 instrumentation count == 0. fast path 정상 발동을 보증. | Correctness | test | debug build에서 trait method panic 또는 release build에서 atomic counter. count > 0은 RED. |
+| INV-176 | 30-engine 부록 C.4 (ENG-QNN-221) | Layer graph node 수 == 14 (Qwen2.5-1.5B 기준, M2의 13에서 +1: RoPE OOP Q/K 분리 + Add residual 2개 명시). build-time const `LAYER_NODE_COUNT == 14`와 동기화 강제. | Correctness | static, test | host unit test에서 `build_layer_graph(...)` 결과 node count == LAYER_NODE_COUNT. const 변경 시 본 INV도 갱신. |
+| INV-177 | 30-engine 부록 C.4 (ENG-QNN-225) | KV layout view transform은 buffer copy 비용 0. production HeadMajor `[head, pos, dim]` cl_mem stride와 graph 입력 `[1, kv_heads, 2048, head_dim]` stride가 동일 메모리 layout이며 reshape만으로 입력 전달이 가능하다. | Performance | test | 디바이스 microbench에서 layer graph 입력 transform 단계 wall-clock < 10 μs/layer. memcpy 발생 시 RED. |
+| INV-178 | 30-engine 부록 C.5 (ENG-QNN-235) | 32-token decode 동안 `/proc/self/status::VmRSS` slope < 50 KB/token (token 단위 leak detector). INV-155 v2 secondary tier (3 KB/iter)와 다른 영역. | Safety | test | 디바이스 microbench에서 32 iter linear regression slope. |
+| INV-179 | 30-engine 부록 C.5 (ENG-QNN-233) | TBT GREEN ≤ 1.10× / YELLOW 1.10~1.20× / RED > 1.20×. baseline = `--backend opencl` decode TBT, Galaxy S25, 동일 prompt 5회 평균, warm-up 3회 제외. | Performance | test | 디바이스 microbench. M3.4 메인 게이트. RED 시 사용자 호출. |
+| INV-180 | 30-engine 부록 C.6 (ENG-QNN-C24) | engine 크레이트는 `crates/qnn_oppkg`의 host metadata (LayerConfig 등)에 cargo dependency edge를 형성한다. 단 cdylib binary 산출물은 여전히 dlopen 외부 라이브러리이며 engine binary가 link하지 않는다. INV-151 본래 정신(cdylib ⊥ engine binary)은 보존. | Compatibility | static | `cargo tree -p llm_rs2 -e features`에서 qnn_oppkg가 host crate dep으로 등장하지만 cdylib link는 형성되지 않음 (Cargo.toml `[dependencies]` 검토). |
+
+### 3.25 QNN OpPackage M4 Async Swap Invariants [INV-181 ~ INV-188]
+
+2026-05-10 QNN OpPackage M4 (phase-aware async chunk swap)의 불변식. 대응 명세: `30-engine.md` 부록 D (ENG-QNN-301 ~ ENG-QNN-320, placeholder).
+
+**도입 컨텍스트**: M3 layer graph cache + Phase 6.5 weight swap 인프라(LayerSlot/SecondaryMmap/IntraForwardSwapHook/AsyncSwapDispatcher/HostPtrPool/AUF) 위에서 14-node DAG의 정적 phase analyzer + chunk swap dispatcher를 도입한다. cache-fit phase 진입 시 weight chunk를 `enqueue_write_async`로 dispatch하고 DDR-heavy phase 시작 직전 `wait_event_blocking`. **Pass-gate**: hide ratio ≥ 20% (chunk size 1점 PASS면 GREEN) + swap on/off token sequence 100% 일치.
+
+**교차 참조**:
+- **INV-140~143 (Phase 6.5)**, **INV-147~150 (LISWAP-4)**: chunk dispatcher seam이 동일 인프라(IntraForwardSwapHook/AsyncSwapDispatcher) 위에 build됨. INV-150 (plan run-to-completion) 정신 보존.
+- **INV-167** (graph cache lifetime): chunk swap이 graph weight handle rebind를 요구. M4.1 spike 후 정책 결정 (옵션 A SDK API / 옵션 B 재build).
+- **INV-176** (LAYER_NODE_COUNT == 14): INV-185가 동일 const 동기화를 chunk dispatcher 측에서도 강제.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-181 | 30-engine 부록 D.3 (ENG-QNN-307) | Chunk swap path는 qnn_oppkg backend 한정. CPU/OpenCL은 NoOp fallback (chunk dispatcher 호출은 무시). | Correctness | runtime, test | host unit test에서 backend 별 chunk dispatcher.dispatch() 결과 검증. |
+| INV-182 | 30-engine 부록 D.3 (ENG-QNN-302) | Chunk dispatch 시작은 cache-fit phase 진입 시점. DDR-heavy phase 진행 중에는 dispatch 금지 (메모리 압력 회피). | Correctness | runtime, test | phase analyzer state machine 검증. dispatch 시점이 cache-fit phase 노드의 begin marker와 일치. |
+| INV-183 | 30-engine 부록 D.3 (ENG-QNN-302) | Chunk size sweep = {1, 2, 4, 8, 16} MB. M4.2 단계에서 sweep 측정 후 default 결정. | Performance | test | 디바이스 microbench `microbench_qnn_chunk_sweep`. 5 size × 5 iter 측정. |
+| INV-184 | 30-engine 부록 D.3 (ENG-QNN-301) | Phase analyzer는 14-node static DAG 기반 const table — runtime 비용 0. dispatch 시점 결정에 list lookup 외 연산 없음. | Performance | static, test | host unit test에서 phase analyzer가 const table 외 alloc/loop 없이 dispatch hint 반환. |
+| INV-185 | 30-engine 부록 D.3 (ENG-QNN-301) | qnn_oppkg::graph::LAYER_NODE_COUNT == 14와 phase analyzer의 enumerate set 동기화 build-time check. fusion 등으로 const 변경 시 phase analyzer도 함께 갱신해야 한다. | Correctness | static, test | host unit test에서 (DDR_HEAVY ∪ CACHE_FIT == FULL_SET) ∧ (DDR_HEAVY ∩ CACHE_FIT == ∅) ∧ (FULL_SET.len() == LAYER_NODE_COUNT). |
+| INV-186 | 30-engine 부록 D.3 (ENG-QNN-304) | `wait_event_blocking`은 다음 token decode 시작 전에 호출 (forward 도중 main queue 비차단). chunk dispatch는 비동기 transfer queue를 사용하며 main compute queue를 막지 않는다. | Correctness | runtime, test | 디바이스 trace 검증. main queue wall-clock 동안 transfer queue 진행 검증. INV-149 (commit-before-read ordering) 정신 보존. |
+| INV-187 | 30-engine 부록 D.3 (ENG-QNN-303) | Hide ratio = `1 - (overlapped time / forward time)` ≥ 20%. chunk size sweep 5점 중 1점에서라도 PASS면 GREEN. | Performance | test | 디바이스 microbench. M4.2 메인 게이트. 모든 size에서 < 20% 시 phase analyzer 분류 재검토 (M4.0 1회 retry). |
+| INV-188 | 30-engine 부록 D.3 (placeholder, M4.1 본문에서 ENG-QNN ID 부여) | swap on/off 토큰 시퀀스 100% 일치. chunk swap 활성/비활성 동일 prompt+seed에서 32-token greedy decode 결과 동일. | Correctness | test | 디바이스 accuracy gate. INV-172 (M3 정확성 게이트)의 chunk swap 확장. |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -467,6 +517,8 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-147~150은 Intra-forward Layer-aligned Swap (LISWAP-4, 2026-05-08)에서 추가. INV-147은 Performance (hook=None zero overhead), INV-148은 Correctness (plan dispatch 멱등), INV-149/150은 Safety/Correctness 양쪽이며 Safety로 1회 카운트(commit-before-read ordering, plan run-to-completion).
 > INV-151~155는 QNN OpPackage M1 cdylib (2026-05-09)에서 추가. INV-151은 Safety (workspace dependency isolation, INV-001/010/011 확장), INV-152/153은 Correctness (정적 일관성), INV-154는 Compatibility (SDK 계약 버전 고정), INV-155는 Safety (leak 부재 보증). **INV-155 v2 (2026-05-09 M2 진입 시점)**: M1.8 실측 cdylib leak == 0 (STATE_MAP) 확인 후 driver 잔여물(1.1 KB/iter)을 별도 tier로 분리. Primary(STATE_MAP=0, MUST) + Secondary(VmRSS slope < 3 KB/iter, SHOULD) 2-tier 구조. ID/카운트 변동 없음.
 > INV-156~165는 QNN OpPackage M2 layer-level graph (2026-05-09)에서 추가. INV-156/158/159/161/164/165는 Correctness, INV-157/160은 Safety (production isolation 보강), INV-162/163은 Performance.
+> INV-166~180은 QNN OpPackage M3 backend wire-up (2026-05-10)에서 추가. INV-166/167/168/170/172/174/175/176은 Correctness, INV-169/178은 Safety (OpenCL backend 무회귀 + leak detector), INV-171은 Correctness (rpcmem-backed KV), INV-173/177/179는 Performance (TBT 측정 룰 + view transform 비용 0 + TBT verdict band), INV-180은 Compatibility (cdylib ⊥ engine binary 본래 정신 보존). M2 INV-160 (production change == 0)은 본 단계에서 자연 만료. 카운트는 +15.
+> INV-181~188은 QNN OpPackage M4 async chunk swap (2026-05-10, placeholder)에서 추가. INV-181/182/185/186/188은 Correctness, INV-183/184/187은 Performance. M4.0~M4.3 단계 진입 시 본문 채움. 카운트는 +8.
 > INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 > **INV-122 v2.1 (2026-04-26, Phase 5 Sprint A 진단 기반)**: 측정 단위를 **단일-token next-token logit**(prefill 종료 직후 첫 1개 logit)으로 명시적으로 고정. Sprint A 100-prompt × 4-ratio sweep에서 32-token decode 누적 drift로 ratio=0.25에서도 Δtop-1=44.85pp 관측 — 측정-임계값 미스매치 진단. 정확성 회귀(garbage 출력 등)는 0건. 임계값 자체(NMSE ≤ 0.01, Δ top-1 ≤ 1 pp)는 v2와 동일하나 측정 단위가 단일-token으로 고정. Decode window metric은 보조 sanity로 분리. ID/카운트는 변동 없음. Phase 4 자료(NMSE mean=0.0062, Δ top-1=+0.33pp)는 v2.1 기준으로도 PASS.
 

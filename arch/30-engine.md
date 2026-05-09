@@ -1256,3 +1256,274 @@ sequenceDiagram
 | INV-165 | `crates/qnn_oppkg/tests/spec/test_inv_165_q4_0_raw_bytes.rs` | `q4_0_memory_object_spec_uses_raw_bytes_18` | `MemoryObjectSpec::RawBytes` 생성 시 block_size=18, element_count=N/32 검증 |
 
 > 주의: tests/spec/ 작성은 Implementer가 M2.1~M2.6 단계에서 구현한다. Architect는 ID + 위치 + 검증 방법만 명세한다.
+
+## 18. QNN-GPU OpPackage M3 Backend (spec/30-engine.md 부록 C, INV-166~180)
+
+### 18.1 위치 및 격리
+
+```
+engine/src/backend/
+├── opencl/                       ← 기존 (INV-169 무회귀 게이트 보호)
+├── cpu/                          ← 기존
+├── cuda/                         ← 기존
+└── qnn_oppkg/                    (NEW M3, #[cfg(feature = "qnn")])
+    ├── mod.rs                        QnnOppkgBackend: Backend
+    ├── runtime.rs                    libQnnGpu.so + libqnn_oppkg.so dlopen + V2.0 fn-ptr cache
+    ├── memory.rs                     QnnOppkgMemory: Memory (rpcmem allocator)
+    ├── buffer.rs                     QnnOppkgBuffer: Buffer (host_ptr + qnn_mem_handle)
+    ├── graph_cache.rs                Vec<Arc<LayerGraph>> (28 layer × 1 graph)
+    └── layer_graph.rs                M2.H 14-node graph 호출 wrapper
+
+engine/src/core/backend.rs        ← Backend trait 신규 method 2개 (default impl)
+engine/src/bin/generate.rs        ← --backend qnn_oppkg | qnngpu dispatch + Args 추가
+engine/src/models/transformer.rs  ← supports_layer_graph() fast path 분기
+crates/qnn_oppkg/                 ← M2 산출물 그대로 재사용 (host metadata crate dep edge 신설)
+```
+
+**격리 정책 변경**:
+- M2 INV-160 (production change == 0)은 자연 만료. M3은 backend trait 통합이 본질이므로 trait 신규 method 추가 불가피.
+- INV-169 (OpenCL backend 무회귀)가 정신 대체 게이트. `cargo test --workspace --features opencl` 0건 회귀 + `--backend opencl` decode TBT ≤ 1.05× baseline.
+
+### 18.2 컴포넌트 분해
+
+```mermaid
+flowchart TB
+    subgraph EXT [External]
+        SDK["QNN GPU SDK runtime"]
+        DMABUF["rpcmem (DMA-BUF heap)"]
+        OPENCL_REF["OpenCL backend<br/>(INV-169 무회귀 baseline)"]
+    end
+
+    subgraph CDYLIB ["crates/qnn_oppkg/ (M2, 변경 0)"]
+        CDY_REG["registry::OPS &#91;10&#93;"]
+        CDY_GRAPH["graph::layer::build_layer_graph"]
+        CDY_LC["graph::LayerConfig<br/>(host metadata)"]
+    end
+
+    subgraph BACKEND ["engine/src/backend/qnn_oppkg/ (NEW M3)"]
+        QBE["QnnOppkgBackend<br/>: Backend<br/>(INV-166)"]
+        QRT["runtime.rs<br/>dlopen V2.0 fn-ptrs"]
+        QMEM["QnnOppkgMemory<br/>: Memory<br/>(rpcmem allocator)<br/>(INV-171)"]
+        QBUF["QnnOppkgBuffer<br/>: Buffer<br/>(host_ptr + qnn_mem_handle)"]
+        QGC["graph_cache.rs<br/>Vec&lt;Arc&lt;LayerGraph&gt;&gt;<br/>(N=28, INV-167)"]
+        QLG["layer_graph.rs<br/>M2 14-node wrapper<br/>(INV-176)"]
+    end
+
+    subgraph CORE ["engine/src/core/"]
+        TRAIT["backend.rs Backend trait<br/>+ supports_layer_graph()<br/>+ execute_layer_graph()<br/>(default impl)"]
+        KV["kv_cache.rs<br/>HeadMajor stride<br/>(INV-168, INV-177)"]
+    end
+
+    subgraph TRANS ["engine/src/models/transformer.rs"]
+        FWD["forward_into() layer loop"]
+        FAST["if supports_layer_graph()<br/>&nbsp;&nbsp;execute_layer_graph(...)<br/>else<br/>&nbsp;&nbsp;trait method path"]
+    end
+
+    subgraph CLI ["engine/src/bin/generate.rs"]
+        DISP["match args.backend.as_str()<br/>cpu | opencl | cuda<br/>+ qnn_oppkg | qnngpu (#[cfg(qnn)])"]
+        ARGS["--qnn-graph-cache-prebuild (default true)<br/>--qnn-allow-fallback (default false)"]
+    end
+
+    DISP -->|select| QBE
+    QBE -->|impl| TRAIT
+    QBE --> QRT
+    QBE --> QMEM
+    QBE --> QGC
+    QGC -->|holds| QLG
+    QLG -->|build_layer_graph| CDY_GRAPH
+    QLG -->|metadata| CDY_LC
+    QMEM -->|allocates| DMABUF
+    QMEM -->|wraps| QBUF
+    QBUF -->|host_ptr| KV
+    SDK -->|dlopen| CDY_REG
+    SDK -->|graphFinalize ≤200ms × 28| QLG
+    FWD --> FAST
+    FAST -->|fast path| QBE
+    FAST -.->|fallback| OPENCL_REF
+    OPENCL_REF -.->|TBT ≤ 1.05× baseline<br/>(INV-169)| TRAIT
+```
+
+### 18.3 호출 흐름 (decode token 1개 처리)
+
+```mermaid
+sequenceDiagram
+    participant T as transformer.rs::forward_into
+    participant B as QnnOppkgBackend
+    participant GC as graph_cache
+    participant LG as LayerGraph (cached)
+    participant SDK as QNN SDK
+    participant KV as KVCache (rpcmem)
+    participant MASK as attn_mask buffer
+
+    Note over T: layer loop entry
+    T->>B: supports_layer_graph()
+    B-->>T: true (idempotent, INV-174)
+
+    loop layer_idx in 0..28
+        T->>MASK: mask&#91;pos&#93; ← valid (INV-228)
+        T->>B: execute_layer_graph(layer_idx, x, kv, pos, x_out)
+        B->>GC: graph = cache&#91;layer_idx&#93;
+        GC-->>B: Arc&lt;LayerGraph&gt;
+        B->>LG: dispatch(x, kv, pos, x_out, mask)
+        LG->>SDK: graph.execute (1× per layer)
+        SDK->>KV: KvScatter writes pos slot (multi-output)
+        SDK->>KV: FlashAttn reads &#91;0..=pos&#93;
+        SDK-->>LG: x_out filled
+        LG-->>B: Ok
+        B-->>T: Ok
+        Note over T: x ← x_out (next layer input)
+    end
+
+    Note over T: pos += 1, sample, append
+    Note over B: trait fallback count == 0 (INV-175)
+```
+
+### 18.4 컴포넌트 책임
+
+| 컴포넌트 | 책임 | 의존성 |
+|---------|------|-------|
+| `QnnOppkgBackend` | `Backend` trait 구현 진입점. `supports_layer_graph()` true. `execute_layer_graph()` fast path. trait fallback method (matmul/rope/etc)는 debug panic 또는 metric count (INV-175). | `core::backend::Backend`, `runtime`, `memory`, `graph_cache` |
+| `runtime.rs` (`QnnOppkgRuntime`) | model load 시 1회 `dlopen("libQnnGpu.so")` + `dlopen("libqnn_oppkg.so")`. V2.0 fn-pointer 캐싱 (M2 microbench의 init flow 이식). cdylib OPS 등록 호출. | libdl |
+| `QnnOppkgMemory` | `Memory` trait 구현. KV cache 등 large buffer는 rpcmem(DMA-BUF heap) allocator를 통해 alloc → mmap → host_ptr 노출 (INV-171). small buffer는 일반 malloc fallback. | rpcmem fd 기반 system call |
+| `QnnOppkgBuffer` | `Buffer` trait 구현. (host_ptr, qnn_mem_handle) 쌍을 보유. graph builder가 qnn_mem_handle을 weight tensor handle로 baked. host pointer는 production KVCache view에 직접 expose. | `QnnOppkgMemory` |
+| `graph_cache.rs` | `Vec<Arc<LayerGraph>>` length == n_layers (Qwen2.5-1.5B = 28). model load 시 eager prebuild (D1, INV-167). cache invalidation은 weight swap path에서만 (M4 영역). | `layer_graph` |
+| `layer_graph.rs` (`LayerGraph`) | M2 `crates/qnn_oppkg::graph::layer::build_layer_graph` host wrapper. weight slot snapshot에서 source pointer 추출 + KV handle bind + graph build + finalize (≤ 200 ms × 28, INV-236). dispatch 시 pos scalar arg 갱신. | `crates/qnn_oppkg::graph` |
+
+### 18.5 Layer Graph Cache 구조
+
+```mermaid
+flowchart LR
+    LOAD[/Model load entry/]
+    LOAD --> ITER{for layer_idx<br/>in 0..n_layers}
+    ITER --> BUILD["build_layer_graph(<br/>weights&#91;layer_idx&#93;,<br/>kv_handles,<br/>layer_idx)"]
+    BUILD --> FIN["graphFinalize<br/>(≤ 200 ms,<br/>INV-236 / M2 INV-163)"]
+    FIN --> STORE["cache.push(<br/>Arc::new(LayerGraph))"]
+    STORE --> ITER
+    ITER -->|done| READY[/cache: Arc&lt;LayerGraph&gt; × N/]
+    READY --> DECODE[/decode loop entry/]
+
+    DECODE -.->|process lifetime<br/>(INV-167)| DISPATCH["execute_layer_graph<br/>(read-only Arc)"]
+```
+
+- 28× `graphFinalize` × ~1.2 s = ~33 s spike at model load (D1 결정).
+- decode 동안 `Arc` clone만으로 lock-free read (INV-018: forward pass single-thread 보존).
+- weight swap (M4) 발생 시에만 invalidation. 정책: 옵션 A SDK API rebind / 옵션 B graph 재build (200ms penalty per swap layer).
+
+### 18.6 KV Cache Layout View Transform (INV-177)
+
+```mermaid
+flowchart LR
+    subgraph KV_PROD ["production KVCache (HeadMajor)"]
+        KP["cl_mem layout:<br/>head × capacity × head_dim<br/>head_stride = capacity × head_dim × 2B"]
+    end
+
+    subgraph KV_GRAPH ["layer graph 입력"]
+        KG["expected shape:<br/>&#91;1, kv_heads, 2048, head_dim&#93; F16<br/>kv_heads × 2048 × head_dim × 2B"]
+    end
+
+    subgraph TRANSFORM ["view transform (zero-copy)"]
+        T1["stride mapping:<br/>head_stride == kv_heads dim stride<br/>↓<br/>same backing buffer"]
+    end
+
+    KP -->|reshape only<br/>no memcpy| T1
+    T1 -->|same cl_mem / rpcmem fd| KG
+```
+
+production HeadMajor stride와 graph 입력 stride가 **동일 메모리 layout**이므로 reshape view transform만으로 입력 전달이 가능 (INV-177). copy 발생 시 RED.
+
+### 18.7 Backend dispatch 분기 (generate.rs)
+
+```mermaid
+flowchart TB
+    ARGS[/Args::backend = String/]
+    ARGS --> M{"match<br/>args.backend.as_str()"}
+
+    M -->|"cpu"| CPU[CpuBackend::new]
+    M -->|"opencl" / "gpu"| OPC[OpenCLBackend::new]
+    M -->|"cuda"| CDA[CudaBackend::new]
+    M -->|"qnn_oppkg" / "qnngpu"<br/>#[cfg(feature = qnn)]| QNN["QnnOppkgBackend::new<br/>+ OpenCL secondary<br/>(SwitchHw round-trip)"]
+    M -->|_<br/>(unknown)| BAIL["bail!(Unknown backend)<br/>(INV-170)"]
+
+    CPU --> RET["(backend, memory,<br/>gpu_arc, gpu_mem_arc, is_gpu)"]
+    OPC --> RET
+    CDA --> RET
+    QNN --> RET
+```
+
+- `--backend qnn_oppkg | qnngpu`는 `feature = "qnn"` 활성 시에만 dispatch에 등장 (INV-170).
+- `--qnn-graph-cache-prebuild` (default true), `--qnn-allow-fallback` (default false) Args 추가 (ENG-QNN-220).
+- secondary backend = OpenCL (SwitchHw round-trip 가능). CPU secondary는 본 단계 범위 외.
+
+### 18.8 Backend Trait 신규 method (default impl)
+
+```rust
+pub trait Backend {
+    // ... 기존 method (matmul, rope_inplace, etc) ...
+
+    fn supports_layer_graph(&self) -> bool { false }
+
+    fn execute_layer_graph(
+        &self,
+        layer_idx: usize,
+        x: &Tensor,
+        kv_cache: &mut KVCache,
+        pos: usize,
+        x_out: &mut Tensor,
+    ) -> Result<()> {
+        bail!("backend does not implement execute_layer_graph")
+    }
+}
+```
+
+기존 backend (CPU/OpenCL/CUDA)는 변경 없이 컴파일. transformer.rs는 forward 진입 시 `supports_layer_graph()` 1회 호출로 분기 결정 (INV-174 idempotent).
+
+### 18.9 Trait Fallback Instrumentation (INV-175)
+
+```mermaid
+flowchart LR
+    DISP["execute_layer_graph<br/>fast path"]
+    FALL["matmul / rope_inplace /<br/>attention_gen / kv_scatter_*<br/>(trait method)"]
+
+    DISP -.->|"정상: 0회 호출"| FALL
+    FALL -->|debug| PANIC["panic!(...)"]
+    FALL -->|release| METRIC["AtomicU64 fetch_add"]
+
+    METRIC --> ASSERT["test 종료 시<br/>assert_eq!(count, 0)<br/>(INV-175)"]
+```
+
+fast path가 정상 동작하면 trait method (matmul 등)는 호출되지 않아야 한다. count > 0은 RED 신호.
+
+### 18.10 코드-스펙 차이
+
+- **Q4_0 raw bytes pass-through**: spec INV-165 (`RawBytes(18, N/32)`)을 그대로 사용. M3 backend는 LayerSlot snapshot의 cl_mem 또는 rpcmem 주소만 graph build 시점에 baked.
+- **rpcmem KV vs OpenCL KV**: OpenCL backend는 zero-copy `CL_MEM_ALLOC_HOST_PTR` 또는 일반 cl_mem. qnn_oppkg backend는 rpcmem fd 기반 mmap host pointer. SwitchHw round-trip 시 두 backend가 동일 memory backing을 공유할 수 없을 수 있어 KV state는 round-trip 시점에 host copy 필요.
+- **Mask buffer**: M2는 graph 외부 alloc + APP_WRITE이지만 model load 시 1회 alloc 후 process lifetime 재사용 (INV-228). 매 token `mask[pos]` update만.
+- **secondary backend**: M3 단계에서는 OpenCL secondary만. CPU secondary (NEON forward)는 Qwen2.5 path 미검증 (`feedback`/Qwen NEON garbage 이슈) — 본 단계 범위 외.
+
+### 18.11 의존성
+
+- 기존: `engine/src/core/backend.rs` Backend trait, `engine/src/models/weights/slot.rs` LayerSlot, `engine/src/core/kv_cache.rs` KVCache.
+- 신규 host crate dep: `engine/Cargo.toml`에 `qnn_oppkg = { path = "../crates/qnn_oppkg" }` (`#[cfg(feature = "qnn")]`). cdylib binary는 dlopen 산출물로 link 형성하지 않음 (INV-180).
+- runtime: `libQnnGpu.so` (system QNN SDK), `libqnn_oppkg.so` (cdylib path는 device deploy 시점 결정).
+
+### 18.12 테스트 위치 (Implementer 작성 예정)
+
+| 검증 대상 INV | 테스트 위치 | 함수명 (제안) | 검증 방법 |
+|---------------|-------------|---------------|-----------|
+| INV-166 | `engine/tests/spec/test_qnn_201.rs` | `qnn_backend_implements_required_trait_methods` | trait bound + method 시그니처 비교 (host) |
+| INV-167 | `engine/tests/spec/test_qnn_201.rs` | `graph_cache_finalize_count_equals_n_layers_at_load` | model load 후 instrumentation count == 28, decode 동안 +0 |
+| INV-168 | `engine/tests/spec/test_qnn_211.rs` | `kv_cache_shape_is_max_padded_2048_f16` | KVCache descriptor 검증 |
+| INV-169 | CI script (`cargo test --workspace --features opencl`) + 디바이스 microbench | (script) | 기존 test suite + OpenCL TBT diff |
+| INV-170 | `engine/tests/spec/test_qnn_201.rs` | `unknown_backend_bails` + `qnn_oppkg_default_off` | host integration test |
+| INV-171 | `engine/tests/spec/test_qnn_201.rs` | `kv_cache_is_rpcmem_backed` | host_ptr 메타데이터 또는 디바이스 `/proc/self/maps` |
+| INV-172 | `engine/tests/spec/test_qnn_231.rs` (디바이스) | `qnn_decode32_token_seq_matches_opencl_100pct` | 두 backend 결과 diff |
+| INV-173 | `engine/tests/spec/test_qnn_231.rs` (디바이스) | `tbt_uses_wallclock_no_profile_events` | 측정 코드 정적 검사 + flag enforce |
+| INV-174 | `engine/tests/spec/test_qnn_211.rs` | `supports_layer_graph_idempotent` | host unit test |
+| INV-175 | `engine/tests/spec/test_qnn_231.rs` (디바이스) | `trait_fallback_count_is_zero_after_decode` | atomic counter inspect |
+| INV-176 | `engine/tests/spec/test_qnn_221.rs` | `layer_graph_node_count_equals_const` | const 검증 + 빌더 결과 enumerate |
+| INV-177 | `engine/tests/spec/test_qnn_221.rs` | `kv_layout_view_transform_zero_copy` | 디바이스 trace 또는 stride 비교 |
+| INV-178 | `engine/tests/spec/test_qnn_231.rs` (디바이스) | `vmrss_slope_below_50kb_per_token` | 32 iter linear regression |
+| INV-179 | `engine/tests/spec/test_qnn_231.rs` (디바이스) | `tbt_band_classification` | 5회 평균 + GREEN/YELLOW/RED 분류 |
+| INV-180 | CI script (`cargo tree`) | `cdylib_not_linked_by_engine_binary` | static crate dep 검증 |
+
+> 주의: tests/spec/ 본문은 Implementer가 M3.1~M3.4 단계에서 구현한다. M3.0 단계에서는 stub만 작성한다 (각 파일에 `#[test]` placeholder + spec ID 주석).

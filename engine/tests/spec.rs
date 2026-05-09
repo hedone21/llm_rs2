@@ -288,3 +288,25 @@ mod test_inv_148_plan_dispatch_idempotent;
 mod test_inv_149_wait_gate_ordering;
 #[path = "spec/test_inv_150_plan_run_to_completion.rs"]
 mod test_inv_150_plan_run_to_completion;
+
+// ── QNN OpPackage M3 backend wire-up (ENG-QNN-201~240, INV-166~180) ──
+// M3.0 단계: stub만. 본문은 M3.1~M3.4 단계에서 Senior Implementer가 채움.
+// test_qnn_201: ENG-QNN-201~210 (backend module + opt-in dispatch)
+// test_qnn_211: ENG-QNN-211~220 (Backend trait 신규 method)
+// test_qnn_221: ENG-QNN-221~230 (layer graph contract)
+// test_qnn_231: ENG-QNN-231~240 (정확성/TBT/VmRSS pass-gate)
+#[path = "spec/test_qnn_201.rs"]
+mod test_qnn_201;
+#[path = "spec/test_qnn_211.rs"]
+mod test_qnn_211;
+#[path = "spec/test_qnn_221.rs"]
+mod test_qnn_221;
+#[path = "spec/test_qnn_231.rs"]
+mod test_qnn_231;
+
+// ── QNN OpPackage M4 async chunk swap (ENG-QNN-301~320, INV-181~188) ──
+// M3.0 단계: placeholder. 본문은 M4.0 (phase analyzer) 진입 시점에
+// 5개 본격 stub으로 분할 (phase_analyzer / chunk_dispatcher / hide_ratio /
+// rebind / swap_on_off_diff). 현재는 INV-181~188 ID 매핑만 기록.
+#[path = "spec/test_qnn_301_m4_placeholder.rs"]
+mod test_qnn_301_m4_placeholder;

@@ -2099,9 +2099,157 @@ assert!(matches!(result, Err(SwapError::DispatcherDrainTimeout)));
 
 ---
 
-## 11. 변경 이력
+## 11. Phase-aware Async Chunk Swap (M4 placeholder, 2026-05-10)
 
-> **편집 노트**: 본 문서는 §8 / §9를 LISWAP-1 (Layer-Incremental Swap Stage 1 MVP) 트랙용으로 예약 중이다. 변경 이력은 §11에 배치하여 LISWAP-1 spec 본체가 명문화될 때 §8 / §9를 자연스럽게 채울 수 있도록 한다.
+> **TL;DR (placeholder)**: M3 layer graph cache (`engine/src/backend/qnn_oppkg/`) 위에서 14-node DAG 정적 phase analyzer + chunk swap dispatcher를 도입한다. cache-fit phase 진입 시 weight chunk를 `enqueue_write_async`로 dispatch하고 DDR-heavy phase 시작 직전 `wait_event_blocking`. Phase 6.5 인프라 (LayerSlot/SecondaryMmap/IntraForwardSwapHook/AsyncSwapDispatcher/HostPtrPool/AUF) 100% 재사용. 본 절은 M4 진입 시 본격 채우며, **M3.0 단계에서는 컴포넌트 간 seam 도식과 재사용 자산 표만 placeholder로 명시**한다.
+
+> 대응 spec: `30-engine.md` 부록 D (ENG-QNN-301~320, INV-181~188).
+
+### 11.1 컴포넌트 간 seam
+
+```mermaid
+flowchart LR
+    subgraph M3 ["M3 Backend (already built)"]
+        QBE["QnnOppkgBackend<br/>+ enqueue_write_async<br/>+ wait_event_blocking"]
+        QGC["graph_cache<br/>(28 LayerGraph)"]
+        QLG["LayerGraph<br/>(14 nodes, INV-176)"]
+    end
+
+    subgraph M4_NEW ["M4 신규 (placeholder)"]
+        PA["phase_analyzer.rs<br/>14-node static DAG<br/>(INV-184, INV-185)"]
+        PT["phase_table.rs<br/>const DDR_HEAVY: &#91;7&#93;<br/>const CACHE_FIT: &#91;9&#93;"]
+        CD["chunk_dispatcher.rs<br/>chunk size sweep<br/>{1,2,4,8,16} MB<br/>(INV-183)"]
+        REBIND["graph_weight_rebind<br/>옵션 A: SDK API<br/>옵션 B: graph 재build<br/>(INV-167 invalidation)"]
+    end
+
+    subgraph PHASE65 ["Phase 6.5 인프라 (재사용)"]
+        LS["LayerSlot<br/>(slot.rs, 변경 0)"]
+        SM["SecondaryMmap<br/>(secondary_mmap.rs,<br/>변경 0)"]
+        IFSH["IntraForwardSwapHook<br/>(intra_forward_swap.rs,<br/>확장: chunk dispatcher 호출)"]
+        ASD["AsyncSwapDispatcher<br/>(async_swap.rs, 변경 0)"]
+        HPP["HostPtrPool<br/>(host_ptr_pool.rs,<br/>변경 0, n_slots config)"]
+        SE["SwapExecutor<br/>(swap_executor.rs,<br/>+ build_chunk_from_mmap_async)"]
+    end
+
+    QLG -.->|14-node DAG enumerate| PA
+    PA --> PT
+    PT --> CD
+    CD -->|enqueue_write_async| QBE
+    CD -->|chunk source slice| SM
+    CD -->|target slot pointer| LS
+    CD -->|completion event| ASD
+    CD -->|chunk granularity| HPP
+    CD -->|"chunk method 호출"| SE
+    QBE -->|"chunk swap 후<br/>weight handle update"| REBIND
+    REBIND -.->|QGC invalidate<br/>(layer_idx만)| QGC
+
+    IFSH -->|on_layer_boundary| CD
+    IFSH -->|drain + wait| ASD
+```
+
+### 11.2 컴포넌트 책임 (placeholder)
+
+| 컴포넌트 | 책임 | 신규/재사용 | 변경 |
+|---------|------|-----------|------|
+| `phase_analyzer.rs` | 14-node static DAG 분류 (DDR-heavy 7 / cache-fit 9). 현재 처리 중 node가 어느 phase인지 lookup. | 신규 (M4.0) | — |
+| `phase_table.rs` | build-time const table: `DDR_HEAVY: &[NodeId; 7]`, `CACHE_FIT: &[NodeId; 9]`. INV-185 동기화 강제. | 신규 (M4.0) | — |
+| `chunk_dispatcher.rs` | weight tensor를 chunk 분할 → cache-fit phase 진입 시 `enqueue_write_async` push → 누적 `GpuEvent` → DDR-heavy phase 직전 `wait_event_blocking`. | 신규 (M4.1) | — |
+| `graph_weight_rebind` | chunk swap 후 graph cache의 weight handle을 새 buffer 주소로 update. M4.1 spike 1일 후 옵션 A/B 결정. | 신규 (M4.1) | — |
+| `LayerSlot` | weight snapshot pointer. chunk dispatcher의 target slot. | 재사용 | 변경 0 |
+| `SecondaryMmap::tensor_bytes(layer, kind)` | chunk source slice (offset/length). | 재사용 | 변경 0 |
+| `IntraForwardSwapHook` | LISWAP-4 layer boundary hook. chunk dispatcher 호출 추가 (확장). | 재사용 + 확장 | 호출 1줄 추가 |
+| `AsyncSwapDispatcher` | worker thread + cl_event wait. | 재사용 | 변경 0 |
+| `HostPtrPool` | chunk source pool (n_slots = 8~16, chunk size 따라 instantiate). | 재사용 | 설정만 변경 |
+| `SwapExecutor::build_chunk_from_mmap_async` | layer-level method 보존하면서 chunk 단위 신규 method 추가. | 확장 | method 1개 추가 |
+
+### 11.3 Sequence (forward 1 layer 동안 chunk swap, placeholder)
+
+```mermaid
+sequenceDiagram
+    participant FWD as transformer.rs<br/>forward_into (layer i)
+    participant QBE as QnnOppkgBackend
+    participant LG as LayerGraph i
+    participant PA as phase_analyzer
+    participant CD as chunk_dispatcher
+    participant ASD as AsyncSwapDispatcher
+    participant SDK as QNN SDK transfer queue
+    participant SLOT as LayerSlot[j]<br/>(target swap layer)
+
+    FWD->>QBE: execute_layer_graph(i, ...)
+    QBE->>LG: dispatch (14 nodes serial)
+
+    Note over LG,PA: node 1 (RmsNormPre) — cache-fit
+    LG->>PA: current_phase = cache_fit
+    PA-->>CD: dispatch hint (slot_j chunk N)
+    CD->>ASD: enqueue chunk N (1~16 MB)
+    ASD->>SDK: enqueueWriteBuffer (transfer queue, async)
+
+    Note over LG: node 2~4 (matmul Q/K/V) — DDR-heavy
+    LG->>PA: current_phase = ddr_heavy
+    PA-->>CD: pause (no new dispatch, INV-182)
+
+    Note over LG: node 5~9 (rope, kv_scatter, flash_attn) — cache-fit
+    LG->>PA: current_phase = cache_fit
+    PA-->>CD: dispatch hint (slot_j chunk N+1)
+    CD->>ASD: enqueue chunk N+1
+    ASD->>SDK: async transfer
+
+    Note over LG: node 10 (Wo matmul) — DDR-heavy
+    LG->>PA: ddr_heavy
+    PA-->>CD: pause
+
+    Note over LG,FWD: layer i 완료
+    LG-->>QBE: x_out
+    QBE-->>FWD: Ok
+
+    Note over FWD: 다음 token decode 시작 직전
+    FWD->>CD: drain pending events
+    CD->>ASD: wait_event_blocking (INV-186)
+    ASD-->>CD: all chunks done
+    CD->>SLOT: swap commit (LayerSlot generation++)
+    Note over CD: hide ratio = 1 - (overlapped / forward) ≥ 20% (INV-187)
+```
+
+### 11.4 측정 메트릭 (placeholder)
+
+| 메트릭 | 정의 | INV |
+|--------|------|-----|
+| swap_pause_time | `wait_event_blocking` total wall-clock | — |
+| forward_time | layer loop wall-clock | — |
+| overlapped_time | min(swap_pause_time, forward_time) | — |
+| hide_ratio | `1 - (overlapped / forward)` | INV-187 (≥ 20%) |
+| swap_on_off_diff | swap on/off 동일 prompt+seed 32-token decode token sequence diff | INV-188 (== 0) |
+
+### 11.5 Pass Gate (M4.2)
+
+- chunk size sweep `{1, 2, 4, 8, 16}` MB 5점 × 5회 측정 (INV-183).
+- 1점에서라도 hide_ratio ≥ 20% 만족 → GREEN (INV-187).
+- 모든 size에서 < 20% → phase analyzer 분류 재검토 (M4.0 1회 retry).
+- swap on/off token sequence 100% 일치 (INV-188).
+- 기존 OpenCL backend swap path (Phase 6.5) 무회귀 (`cargo test --workspace --features opencl,resilience`).
+
+### 11.6 미결 결정 사항
+
+| ID | 시점 | 결정 사항 | 가정 |
+|----|------|----------|------|
+| **D3** | M4.1 진입 전 | Graph weight handle rebind 전략 | 옵션 A (SDK API) 우선, 미존재 시 옵션 B (graph 재build, 200ms penalty) fallback. M4.1 spike 1일 후 사용자 보고. |
+| **D8** | M4.2 종료 | chunk size default | sweep 결과 채택 (가설: 4 MB) |
+
+### 11.7 본 placeholder 채움 시점
+
+M3.4 메인 게이트(INV-172/179) 통과 후 M4.0 단계 진입 시점에 본 §11을 본격 도식화한다. 그 시점까지 본 placeholder는 컴포넌트 seam과 재사용 자산 표를 명시하여 `engine/src/backend/qnn_oppkg/` 구현 단계에서 M4 hook 고려 누락을 방지한다.
+
+## 12. 변경 이력
+
+> **편집 노트**: 본 문서는 §8 / §9를 LISWAP-1 (Layer-Incremental Swap Stage 1 MVP) 트랙용으로 예약 중이다. 변경 이력은 §12에 배치하여 LISWAP-1 spec 본체가 명문화될 때 §8 / §9를 자연스럽게 채울 수 있도록 한다.
+
+- **2026-05-10 (v12, QNN OpPackage M4 Async Chunk Swap placeholder)**:
+  1. §11 신규 placeholder. M3 layer graph cache 위에서 14-node DAG phase analyzer + chunk swap dispatcher seam 명세.
+  2. ENG-QNN-301~320 (M4 placeholder), INV-181~188 신규 ID 예약 (`spec/30-engine.md` 부록 D, `spec/41-invariants.md` §3.25).
+  3. §11.1 컴포넌트 seam Mermaid — Phase 6.5 인프라 (LayerSlot/SecondaryMmap/IntraForwardSwapHook/AsyncSwapDispatcher/HostPtrPool/SwapExecutor) 100% 재사용 명시.
+  4. §11.3 forward 1 layer 동안 chunk swap sequence Mermaid — cache-fit/DDR-heavy phase 진입 시점 dispatch + drain.
+  5. §11.5 Pass Gate (INV-187 hide ratio ≥ 20% 1점 PASS) + §11.6 미결 결정 (D3 graph weight rebind, D8 chunk size default).
+  6. 본 §11은 M3.4 메인 게이트 통과 후 M4.0 진입 시점에 본격 도식화. M3.0 단계는 seam 명시까지.
 
 - **2026-05-08 (v11, Phase 6.7 Intra-forward Layer-aligned Swap, LISWAP-4)**:
   1. §10 신규. forward 중간 layer 경계 dispatch + 같은 forward 후속 layer / 다음 token 선행 layer와 swap window overlap 시도 트랙. LISWAP-2 negative result(forward 직후 일괄 dispatch)와 timing 영역이 다른 측정.

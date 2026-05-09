@@ -4,6 +4,16 @@
 
 ---
 
+## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
+- **Status**: TODO (M2 baseline부터 누적, M3.0 무관)
+- **상세**: `cargo clippy --workspace --features opencl --tests -- -D warnings`에서 `crates/qnn_oppkg_poc/src/lib.rs:725` 근방 raw pointer deref 함수에 `unsafe` 누락. rust 1.93 신규 lint. M1 회귀 안전망 crate이라 P3 우선순위. M2가 main 진입한 이상 PoC는 read-only — 손대지 않거나 일괄 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`로 silence.
+
+## [P3] backend::opencl::* host test 24개 device-required fail — 2026-05-10 발견
+- **Status**: TODO (호스트 측정 환경 한계)
+- **상세**: `cargo test --workspace --features opencl --tests`에서 host에 OpenCL device 없을 때 24 fail (gpu_buffer_shift, kv_scatter_batch, noshuffle, plan tests). Galaxy S25 디바이스 빌드에선 정상. 호스트 회귀 게이트에선 본 모듈 제외 권장 — sanity-check skill에 `--exclude-tests backend::opencl` 패턴 추가 검토.
+
+---
+
 # QNN-GPU OpPackage Migration — M2 (Layer-level Graph) — 2026-05-09 신규
 
 > **상세 plan**: `.agent/todos/feat_qnn_oppkg_m2.md`
