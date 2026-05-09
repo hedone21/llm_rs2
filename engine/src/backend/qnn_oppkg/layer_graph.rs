@@ -24,21 +24,18 @@
 //! - Q4_0 weight `RawBytes(18, N/32)` (M2 INV-165, AOS layout from production GGUF
 //!   변환 후 SOA — `weight_pack::aos_to_soa_q4_0` 사용)
 //!
-//! ## execute path
-//! - `pos`는 KvScatter `write_pos` + RoPE `start_pos` 모두에 영향. graph build
-//!   시점에 placeholder로 baked되었으므로 execute 시점에 op param update 필요
-//!   하나, M2 microbench 패턴에 따라 graph build 시점에 pos=0 baked + production
-//!   transformer는 layer 0 → layer N으로 진행 시 매 layer에서 동일 pos를 사용
-//!   하므로 단일 graph 인스턴스 재사용. M3.4 단계는 KV scatter는 graph 외부에서
-//!   이미 production이 처리해두는 것이 아니라 graph 내부에서 처리되므로,
-//!   pos가 layer마다 다르면 graph가 작동하지 않음. 실제로 pos는 동일 token
-//!   decode 내에서 모든 layer에서 같은 값이므로 layer 0 graph에서 build한
-//!   pos=baked이면 동일 token 호출 시 정상. 다음 token은 pos+1이 되어야 하나
-//!   QNN OpPackage는 graph build 후 param 변경 불가. → graph는 pos=0으로 baked
-//!   하고 mask buffer 통해 동적 pos 처리. (M2 microbench는 단일 token 1 graph
-//!   이므로 pos=0 hard-coded; production 32-token decode에는 pos가 0..31로 변함.
-//!   본 단계는 1차 wire-up 후 정확성 측정에서 발생할 mismatch를 계측하여
-//!   M3.5 timebox에서 처리.)
+//! ## execute path (M3.4 D-D.3, 2026-05-10)
+//!
+//! `pos`는 RoPE `start_pos` (Q/K 2 nodes) + KvScatter `write_pos` (1 node)에
+//! 모두 영향. M3.4 RED 시점 root cause는 SCALAR op param이 graphFinalize에
+//! 시점에 baked → multi-token decode 불가. D-D.1+D-D.2에서 ops descriptor +
+//! `.cl` kernel을 input tensor 방식으로 갱신: pos를 `INT_32 [1]` rank-1
+//! tensor로 graph에 추가 + 매 graphExecute 직전에 host pointer로 값 write.
+//!
+//! 본 D-D.3에서는 layer당 1개 pos_buf rpcmem slot을 alloc하고, RoPE Q/K +
+//! KvScatter 3 nodes의 input tensor 배열에 동일 pos_buf을 share한다 (graph
+//! 내부에서 read-only, write race 없음). `execute()`는 graphExecute 직전에
+//! `*(pos_host_ptr as *mut i32) = pos as i32`를 한 줄로 수행한다.
 
 use crate::backend::qnn_oppkg::runtime::QnnOppkgRuntime;
 use crate::layers::transformer_layer::TransformerLayer;
@@ -187,6 +184,10 @@ mod android {
         /// Slot index 매핑 (host pointer copy 시 사용).
         idx_x_in: usize,
         idx_x_out: usize,
+        /// M3.4 D-D.3: pos_buf rpcmem slot의 host pointer. graphExecute 직전
+        /// `*(pos_host_ptr as *mut i32) = pos as i32`로 갱신. RoPE Q/K +
+        /// KvScatter 3 nodes가 동일 pos_buf input tensor를 share.
+        pos_host_ptr: *mut i32,
         /// LayerConfig snapshot.
         #[allow(dead_code)]
         cfg: LayerConfig,
@@ -204,7 +205,7 @@ mod android {
             x_in_bytes: &[u8],
             _kv_k_bytes: &mut [u8],
             _kv_v_bytes: &mut [u8],
-            _pos: usize,
+            pos: usize,
             _mask_bytes: &[u8],
             x_out_bytes: &mut [u8],
         ) -> Result<()> {
@@ -222,6 +223,14 @@ mod android {
                     in_slot.host_ptr,
                     x_in_bytes.len(),
                 );
+            }
+
+            // M3.4 D-D.3: pos_buf write — RoPE Q/K + KvScatter 3 nodes가
+            // 동일 pos_buf을 input tensor로 read. SAFETY: pos_host_ptr는
+            // build 시점에 alloc된 rpcmem slot의 4-byte aligned host pointer.
+            // 동일 layer graph는 GraphCache Mutex로 직렬화되어 race 없음.
+            unsafe {
+                std::ptr::write(self.pos_host_ptr, pos as i32);
             }
 
             // graphExecute.
@@ -402,11 +411,10 @@ mod android {
         let kv_capacity = cfg.kv_capacity as usize;
         let q_proj_out = n_head * head_dim;
         let kv_proj_out = n_kv_heads * head_dim;
-        // M3.4 1차 wire-up: pos=0 baked. 32-token decode 시 pos가 변하므로
-        // 정확성 mismatch 가능 — M3.4 디바이스 측정에서 격리 후 M3.5 처리.
-        let pos: i32 = 0;
+        // M3.4 D-D.3: pos는 input tensor (pos_buf)로 graphExecute 직전에
+        // host write. graph build 시점은 placeholder 0으로 alloc만.
         // n_kv는 attention 시점 KV cache의 valid token 수. 1로 고정 (single
-        // token decode + 매 layer single-token write_pos=0 baked).
+        // token decode + 매 layer single-token write_pos는 pos_buf로 동적).
         let n_kv: usize = 1;
         // RoPE theta — production은 model.config.rope_theta를 사용하지만 본
         // 단계는 Qwen2.5 기본값.
@@ -538,6 +546,18 @@ mod android {
         slots.push(slot_xout);
         let idx_x_out = slots.len() - 1;
 
+        // M3.4 D-D.3: pos_buf — INT_32 [1] (4 bytes). RoPE Q/K + KvScatter
+        // 3 nodes가 input tensor로 share. graph build 시점은 placeholder 0,
+        // execute 시점에 host pointer로 갱신.
+        let bytes_pos = 4_usize;
+        let slot_pos = alloc_rpcmem_slot(runtime, bytes_pos)?;
+        unsafe {
+            std::ptr::write(slot_pos.host_ptr as *mut i32, 0i32);
+        }
+        let pos_host_ptr = slot_pos.host_ptr as *mut i32;
+        slots.push(slot_pos);
+        let idx_pos = slots.len() - 1;
+
         // ── 4. Build tensors + register — 36 tensors total ─────────────────
         // Dimensions storage. Each Vec must outlive graph build (pointer stored).
         let mut dims_x: Vec<u32> = vec![1, dim as u32];
@@ -578,6 +598,8 @@ mod android {
         let mut dims_mask: Vec<u32> = vec![n_kv as u32];
         let mut dims_sinks: Vec<u32> = vec![n_head as u32];
         let mut dims_score: Vec<u32> = vec![1];
+        // M3.4 D-D.3: pos_buf — INT_32 rank-1 [1].
+        let mut dims_pos: Vec<u32> = vec![1];
 
         // CString tensor names — must outlive graph build.
         let nm_x = CString::new("x").unwrap();
@@ -617,6 +639,7 @@ mod android {
         let nm_mask = CString::new("mask").unwrap();
         let nm_sinks = CString::new("sinks").unwrap();
         let nm_score = CString::new("score").unwrap();
+        let nm_pos = CString::new("pos").unwrap();
 
         let qp = ffi::Qnn_QuantizeParams_t {
             encodingDefinition: ffi::Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
@@ -663,6 +686,7 @@ mod android {
         let f32_t = ffi::Qnn_DataType_t_QNN_DATATYPE_FLOAT_32;
         let f16_t = ffi::Qnn_DataType_t_QNN_DATATYPE_FLOAT_16;
         let u8_t = ffi::Qnn_DataType_t_QNN_DATATYPE_UINT_8;
+        let i32_t = ffi::Qnn_DataType_t_QNN_DATATYPE_INT_32;
 
         // Endpoints (APP_WRITE / APP_READ).
         let mut t_x = build_tensor(app_w, f32_t, 2, dims_x.as_mut_ptr(), nm_x.as_ptr());
@@ -713,6 +737,8 @@ mod android {
         let mut t_sinks = build_tensor(app_w, f32_t, 1, dims_sinks.as_mut_ptr(), nm_sinks.as_ptr());
         let mut t_score = build_tensor(app_w, f32_t, 1, dims_score.as_mut_ptr(), nm_score.as_ptr());
         let mut t_x_out = build_tensor(app_r, f32_t, 2, dims_x_out.as_mut_ptr(), nm_x_out.as_ptr());
+        // M3.4 D-D.3: pos input tensor — APP_WRITE INT_32 rank-1 [1].
+        let mut t_pos = build_tensor(app_w, i32_t, 1, dims_pos.as_mut_ptr(), nm_pos.as_ptr());
 
         // Intermediates (NATIVE).
         let mut t_y1 = build_tensor(native, f32_t, 2, dims_y1.as_mut_ptr(), nm_y1.as_ptr());
@@ -799,6 +825,7 @@ mod android {
             ("up", &mut t_up),
             ("silu_out", &mut t_silu_out),
             ("down", &mut t_down),
+            ("pos", &mut t_pos),
         ];
         let tcg = v
             .tensorCreateGraphTensor
@@ -843,43 +870,33 @@ mod android {
         };
 
         // Param names.
-        let pn_start_pos = CString::new("start_pos").unwrap();
+        // M3.4 D-D.3: `start_pos` / `write_pos` SCALAR params 제거 — 둘 다
+        // pos_buf input tensor로 동적 처리.
         let pn_theta = CString::new("theta").unwrap();
         let pn_head_dim = CString::new("head_dim").unwrap();
         let pn_capacity = CString::new("capacity").unwrap();
-        let pn_write_pos = CString::new("write_pos").unwrap();
         let pn_n_kv = CString::new("n_kv").unwrap();
         let pn_n_head = CString::new("n_head").unwrap();
         let pn_n_head_kv = CString::new("n_head_kv").unwrap();
         let pn_kv_capacity = CString::new("kv_capacity").unwrap();
         let pn_head_dim_fa = CString::new("head_dim").unwrap();
 
-        let mk_rope_params = |start: i32, th: f32| {
-            [
-                ffi::Qnn_Param_t {
-                    paramType: ffi::Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-                    name: pn_start_pos.as_ptr(),
-                    __bindgen_anon_1: ffi::Qnn_Param_t__bindgen_ty_1 {
-                        scalarParam: ffi::Qnn_Scalar_t {
-                            dataType: ffi::Qnn_DataType_t_QNN_DATATYPE_INT_32,
-                            __bindgen_anon_1: ffi::Qnn_Scalar_t__bindgen_ty_1 { int32Value: start },
-                        },
+        // M3.4 D-D.3: RoPE param은 theta SCALAR 1개만. start_pos는 pos_buf
+        // (input tensor)로 매 graphExecute 직전 host write.
+        let mk_rope_params = |th: f32| {
+            [ffi::Qnn_Param_t {
+                paramType: ffi::Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+                name: pn_theta.as_ptr(),
+                __bindgen_anon_1: ffi::Qnn_Param_t__bindgen_ty_1 {
+                    scalarParam: ffi::Qnn_Scalar_t {
+                        dataType: ffi::Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                        __bindgen_anon_1: ffi::Qnn_Scalar_t__bindgen_ty_1 { floatValue: th },
                     },
                 },
-                ffi::Qnn_Param_t {
-                    paramType: ffi::Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-                    name: pn_theta.as_ptr(),
-                    __bindgen_anon_1: ffi::Qnn_Param_t__bindgen_ty_1 {
-                        scalarParam: ffi::Qnn_Scalar_t {
-                            dataType: ffi::Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
-                            __bindgen_anon_1: ffi::Qnn_Scalar_t__bindgen_ty_1 { floatValue: th },
-                        },
-                    },
-                },
-            ]
+            }]
         };
-        let mut rope_q_params = mk_rope_params(pos, theta);
-        let mut rope_k_params = mk_rope_params(pos, theta);
+        let mut rope_q_params = mk_rope_params(theta);
+        let mut rope_k_params = mk_rope_params(theta);
 
         let scalar_i32 = |name: *const c_char, val: i32| ffi::Qnn_Param_t {
             paramType: ffi::Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
@@ -892,10 +909,10 @@ mod android {
             },
         };
 
+        // M3.4 D-D.3: write_pos SCALAR 제거. head_dim + capacity 2개만 SCALAR.
         let mut kvs_params = [
             scalar_i32(pn_head_dim.as_ptr(), head_dim as i32),
             scalar_i32(pn_capacity.as_ptr(), kv_capacity as i32),
-            scalar_i32(pn_write_pos.as_ptr(), pos),
         ];
 
         let mut fa_params = [
@@ -941,11 +958,13 @@ mod android {
         let mut out_k_proj = [t_k];
         let mut in_v_proj = [t_vq, t_vd, t_y1];
         let mut out_v_proj = [t_v];
-        let mut in_rope_q = [t_q];
+        // M3.4 D-D.3: RoPE Q/K input은 (x_in, pos_buf) 2개. KvScatter input은
+        // (k_src, v_src, pos_buf) 3개. 동일 `t_pos`를 share — read-only.
+        let mut in_rope_q = [t_q, t_pos];
         let mut out_rope_q = [t_q_rope];
-        let mut in_rope_k = [t_k];
+        let mut in_rope_k = [t_k, t_pos];
         let mut out_rope_k = [t_k_rope];
-        let mut in_kvs = [t_k_rope, t_v];
+        let mut in_kvs = [t_k_rope, t_v, t_pos];
         let mut out_kvs = [t_kcache, t_vcache];
         let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score];
         let mut out_fa = [t_attn_o];
@@ -1026,33 +1045,33 @@ mod android {
                 on_rope_q.as_ptr(),
                 ot_rope.as_ptr(),
                 in_rope_q.as_mut_ptr(),
-                1,
+                2, // M3.4 D-D.3: x_in + pos_buf
                 out_rope_q.as_mut_ptr(),
                 1,
                 rope_q_params.as_mut_ptr(),
-                2,
+                1, // M3.4 D-D.3: theta only (start_pos 제거)
                 "RoPE Q",
             ),
             (
                 on_rope_k.as_ptr(),
                 ot_rope.as_ptr(),
                 in_rope_k.as_mut_ptr(),
-                1,
+                2, // M3.4 D-D.3: x_in + pos_buf
                 out_rope_k.as_mut_ptr(),
                 1,
                 rope_k_params.as_mut_ptr(),
-                2,
+                1, // M3.4 D-D.3: theta only
                 "RoPE K",
             ),
             (
                 on_kvs.as_ptr(),
                 ot_kvs.as_ptr(),
                 in_kvs.as_mut_ptr(),
-                2,
+                3, // M3.4 D-D.3: k_src + v_src + pos_buf
                 out_kvs.as_mut_ptr(),
                 2,
                 kvs_params.as_mut_ptr(),
-                3,
+                2, // M3.4 D-D.3: head_dim + capacity (write_pos 제거)
                 "KvScatter",
             ),
             (
@@ -1196,13 +1215,14 @@ mod android {
         }
 
         // ── 7. Build exec_inputs / exec_outputs with memHandle baked ───────
-        // slots order:
+        // slots order (M3.4 D-D.3):
         //   0: x  1: rms_pre  2: rms_post
         //   3-4: qq/qd  5-6: kq/kd  7-8: vq/vd  9-10: oq/od
         //   11-12: gq/gd  13-14: uq/ud  15-16: dq/dd
         //   17: kcache  18: vcache
         //   19: mask  20: sinks  21: score
         //   22: x_out
+        //   23: pos_buf (M3.4 D-D.3 신규)
         let set_mh = |t: &mut ffi::Qnn_Tensor_t, h: ffi::Qnn_MemHandle_t| {
             t.__bindgen_anon_1.v1.memType = ffi::Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
             t.__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = h;
@@ -1253,6 +1273,8 @@ mod android {
         set_mh(&mut t_score_mh, slots[21].mem_handle);
         let mut t_x_out_mh = t_x_out;
         set_mh(&mut t_x_out_mh, slots[22].mem_handle);
+        let mut t_pos_mh = t_pos;
+        set_mh(&mut t_pos_mh, slots[idx_pos].mem_handle);
 
         let exec_inputs = vec![
             t_x_mh,
@@ -1275,6 +1297,7 @@ mod android {
             t_mask_mh,
             t_sinks_mh,
             t_score_mh,
+            t_pos_mh, // M3.4 D-D.3
         ];
         let exec_outputs = vec![t_kcache_mh, t_vcache_mh, t_x_out_mh];
 
@@ -1287,6 +1310,7 @@ mod android {
                 exec_outputs,
                 idx_x_in,
                 idx_x_out,
+                pos_host_ptr,
                 cfg: *cfg,
             },
             finalize_ms,

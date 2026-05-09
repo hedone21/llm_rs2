@@ -1386,10 +1386,19 @@ fn main() -> anyhow::Result<()> {
                 Some(m) => m.clone(),
                 None => qnn_mem.clone(),
             };
+            // M3.4 D-D.4: gpu_backend_arc로는 OpenCL secondary를 노출한다.
+            // primary qnn_oppkg는 noshuffle prep / map_weights_for_cpu / RSS
+            // diag 등 OpenCL-specific path에 downcast 불가하므로, secondary가
+            // 있으면 secondary를 보조 backend로 expose. 없으면 None (해당
+            // path들은 qnn_oppkg-only 환경에서 불활성).
+            let gpu_backend_for_caller: Option<Arc<dyn Backend>> = match &gpu_be {
+                Some(be) => Some(be.clone()),
+                None => Some(qnn_dyn.clone()),
+            };
             (
-                qnn_dyn.clone(),
+                qnn_dyn,
                 primary_mem.clone(),
-                Some(qnn_dyn),
+                gpu_backend_for_caller,
                 Some(primary_mem),
                 true,
             )
@@ -1762,7 +1771,19 @@ fn main() -> anyhow::Result<()> {
                     || cli_partition_needs_cpu_weights
                     || args.prefill_cpu_chunk_size > 0
                     || args.enable_resilience;
-                match model.prepare_noshuffle_buffers(&backend, keep_for_cpu) {
+                // M3.4 D-D.4: qnn_oppkg primary는 noshuffle prep을 OpenCL secondary
+                // backend로 위임해야 한다. primary 자체는 OpenCLBackend가 아니라
+                // downcast가 fail하기 때문. fallback gpu_backend_arc가 있으면
+                // 그것을, 없으면 원래 backend (OpenCL primary)를 사용.
+                let prep_backend: &Arc<dyn Backend> = if (args.backend == "qnn_oppkg"
+                    || args.backend == "qnngpu")
+                    && let Some(ref gpu_be) = gpu_backend_arc
+                {
+                    gpu_be
+                } else {
+                    &backend
+                };
+                match model.prepare_noshuffle_buffers(prep_backend, keep_for_cpu) {
                     Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
                     Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
                 }
