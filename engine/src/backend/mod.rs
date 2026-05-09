@@ -18,3 +18,7 @@ pub use cuda_embedded as cuda;
 
 #[cfg(feature = "opencl")]
 pub mod opencl;
+
+// QNN OpPackage backend (M3.1 skeleton, ENG-QNN-201~210, INV-166~180).
+#[cfg(feature = "qnn")]
+pub mod qnn_oppkg;

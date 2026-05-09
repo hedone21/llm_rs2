@@ -765,6 +765,38 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// 14-node layer graph fast path (qnn_oppkg backend 등). Default false.
+    ///
+    /// QNN OpPackage M3 (ENG-QNN-211/INV-174): 본 method가 true를 반환하는
+    /// backend는 `execute_layer_graph(...)`을 정상 구현해야 한다.
+    /// transformer.rs forward 진입 시 1회 호출하여 분기 결정에 사용.
+    /// idempotent — 동일 인스턴스에 대해 호출 결과가 항상 동일해야 한다 (INV-174).
+    fn supports_layer_graph(&self) -> bool {
+        false
+    }
+
+    /// 14-node single-layer graph dispatch (qnn_oppkg M3.3에서 본격 구현).
+    ///
+    /// QNN OpPackage M3 (ENG-QNN-211/213/214/INV-175): `supports_layer_graph()`
+    /// 가 true인 backend는 `transformer.rs::forward_into` layer loop가 layer
+    /// 1개를 본 method 1회 호출로 처리하도록 사용한다. trait method (matmul/
+    /// rope/attention_gen 등) 호출은 fallback debug 경로로만 남으며, fast path
+    /// 정상 동작 시 호출 횟수는 0이어야 한다 (INV-175).
+    ///
+    /// Default: 미지원 backend는 `Err`. M3.3에서 `QnnOppkgBackend`가 본격 override.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn execute_layer_graph(
+        &self,
+        layer_idx: usize,
+        x: &Tensor,
+        kv_cache_k: &mut Tensor,
+        kv_cache_v: &mut Tensor,
+        pos: usize,
+        x_out: &mut Tensor,
+    ) -> Result<()> {
+        anyhow::bail!("execute_layer_graph not supported by this backend")
+    }
+
     /// GPU prefill flash attention. Returns Ok(true) if GPU dispatched, Ok(false) for CPU fallback.
     /// Default: CPU fallback (returns false).
     #[allow(unused_variables, clippy::too_many_arguments)]

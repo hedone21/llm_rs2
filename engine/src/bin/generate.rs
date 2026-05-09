@@ -939,6 +939,27 @@ struct Args {
     /// (ENG-DAT-C18). CLI parser rejects the combination.
     #[arg(long, default_value_t = false)]
     swap_intra_forward: bool,
+
+    // ── QNN OpPackage backend (M3, ENG-QNN-220) ─────────────────
+    /// Eager prebuild of all 28 layer graphs at model load time
+    /// (ENG-QNN-209, D1 결정).
+    ///
+    /// `true` (default): model load 시점에 N×`graphFinalize` (≤ 200 ms/layer)
+    /// 직렬 실행. Decode 동안 추가 finalize는 0회 (INV-167).
+    /// `false`: lazy build (M3.5 timebox 미사용 시 진입 불가, debug 용도).
+    ///
+    /// 본 flag는 `--backend qnn_oppkg | qnngpu` 활성 시에만 유효하다.
+    #[arg(long, default_value_t = true)]
+    qnn_graph_cache_prebuild: bool,
+
+    /// Allow trait fallback path when graph fast path fails (ENG-QNN-220).
+    ///
+    /// `false` (default): fast path 실패 시 즉시 `Err`. INV-175 (fallback count
+    /// == 0) 게이트와 정합한다.
+    /// `true`: debug 용도 — fast path 실패 시 OpenCL secondary backend로
+    /// fallback. production 측정에서는 OFF 유지.
+    #[arg(long, default_value_t = false)]
+    qnn_allow_fallback: bool,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -1285,6 +1306,70 @@ fn main() -> anyhow::Result<()> {
             }
             let gpu: Arc<dyn Backend> = gpu_concrete;
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
+        }
+        // ENG-QNN-202/INV-170: qnn_oppkg는 default off opt-in. feature 비활성 시
+        // 본 분기는 컴파일에서 제거되어 unknown backend로 빠진다.
+        #[cfg(feature = "qnn")]
+        "qnn_oppkg" | "qnngpu" => {
+            // QNN backend는 호스트(non-Android)에서 init 실패 → 명확한 Err 전파.
+            // 디바이스 빌드에서만 정상 진행 가능 (libQnnGpu.so 존재).
+            let qnn = Arc::new(llm_rs2::backend::qnn_oppkg::QnnOppkgBackend::new()?);
+            let qnn_mem: Arc<dyn Memory> = Arc::new(
+                llm_rs2::backend::qnn_oppkg::memory::QnnOppkgMemory::new(qnn.clone()),
+            );
+
+            // ENG-QNN-206: SwitchHw round-trip을 위해 OpenCL backend를 secondary로
+            // 등록. OpenCL init이 fail하면 secondary 없이 진행 (SwitchHw 비활성).
+            #[cfg(feature = "opencl")]
+            let (gpu_be, gpu_mem_arc): (
+                Option<Arc<dyn Backend>>,
+                Option<Arc<dyn Memory>>,
+            ) = match llm_rs2::backend::opencl::OpenCLBackend::new_with_profile_events(
+                args.profile_events || args.heartbeat_gpu_profile,
+            ) {
+                Ok(gpu_concrete) => {
+                    let gpu_concrete = Arc::new(gpu_concrete);
+                    let gm: Arc<dyn Memory> =
+                        Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+                            gpu_concrete.context.clone(),
+                            gpu_concrete.queue.clone(),
+                            args.zero_copy,
+                        ));
+                    let g = gpu_concrete as Arc<dyn Backend>;
+                    eprintln!(
+                        "[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)"
+                    );
+                    (Some(g), Some(gm))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[Backend] QNN-GPU only (OpenCL secondary init failed: {})",
+                        e
+                    );
+                    (None, None)
+                }
+            };
+            #[cfg(not(feature = "opencl"))]
+            let (gpu_be, gpu_mem_arc): (
+                Option<Arc<dyn Backend>>,
+                Option<Arc<dyn Memory>>,
+            ) = (None, None);
+
+            // qnn_graph_cache_prebuild / qnn_allow_fallback는 M3.2/M3.3에서 본격
+            // 활용. 본 단계에서는 기본값 검증 후 통과만.
+            let _ = (args.qnn_graph_cache_prebuild, args.qnn_allow_fallback);
+            // gpu_be / gpu_mem_arc는 M3.2 SwitchHw round-trip에서 secondary로 사용.
+            // 본 단계는 (None, None) 혹은 (Some, Some) 양쪽 모두 통과만 검증.
+            let _ = (&gpu_be, &gpu_mem_arc);
+
+            let qnn_dyn: Arc<dyn Backend> = qnn;
+            (
+                qnn_dyn.clone(),
+                qnn_mem.clone(),
+                Some(qnn_dyn),
+                Some(qnn_mem),
+                true,
+            )
         }
         _ => anyhow::bail!(
             "Unknown backend: {}. Use cpu, opencl, or cuda.",
