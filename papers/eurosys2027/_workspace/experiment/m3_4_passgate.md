@@ -80,6 +80,40 @@ Segmentation fault
 - 또는 graph가 KvScatter를 graph 내부 rpcmem buffer에 작성하지만, prefill의
   attention은 OpenCL backend의 KV cl_mem을 read → 동기화 안 된 stale data
 
+### **CRITICAL DISCOVERY (2026-05-10 후속 분석)**: pos baked architectural blocker
+
+M2.H microbench `engine/src/bin/microbench_qnn_qwen_layer.rs:1721-1741` 정독 결과:
+
+```rust
+let mk_rope_params = |start: i32, th: f32| {
+    [
+        Qnn_Param_t {
+            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,  // ← graph build 시점 baked
+            name: pn_start_pos.as_ptr(),
+            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
+                scalarParam: Qnn_Scalar_t {
+                    dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { int32Value: start },
+                },
+            },
+        },
+        // ...
+    ]
+};
+```
+
+**M2.H는 `start_pos`/`write_pos`를 `QNN_PARAMTYPE_SCALAR`로 graph build 시점에 hardcoded.** M2.H는 single-token 테스트(pos=0)였으므로 이 한계가 노출되지 않음.
+
+production multi-token decode는 pos가 0..31로 변하는데 graph가 pos=0으로 baked → RoPE/KvScatter가 모든 token에서 pos=0으로 동작 → 결과 garbage (segfault 이전에 정확성부터 fail).
+
+이는 M3.4 RED의 **본질적 architectural blocker**. segfault는 부차적 (noshuffle SOA 미적용으로 OpenCL secondary fallback dereference) — 이는 1줄 fix 가능하지만, fix해도 pos baked 때문에 정확성 100% match 불가.
+
+**해결 옵션 (심각도/시간 순)**:
+
+- **D-D (CRITICAL, 신규)**: M2 frozen ops 수정 — `start_pos`/`write_pos`를 `QNN_PARAMTYPE_SCALAR` (build-time) → input tensor (execute-time)로 변경. RoPE/KvScatter op signature 갱신. 이는 `crates/qnn_oppkg/src/ops/rope.rs` + `kv_scatter.rs` 변경 + `kernel_rope_simple_oop` / `kernel_kv_scatter_*` `.cl` kernel 갱신 필요. **CLAUDE.md D7 결정에 따라 .cl 수정 가능**이지만 M2 검증이 무효화될 수도 — 별도 정확성 재검증 필요. 추정 5-7일.
+- **D-E (가장 단순)**: M3 scope를 single-token (pos=0 hardcoded) 검증으로 한정. multi-token decode는 OpenCL fallback. M3 메인 게이트 (32-token 100% match)의 의미가 사라지므로 plan 재정의 필요.
+- **A안/B안/C안** (이전 보고): segfault만 fix하는 방안. pos baked 문제로 정확성 PASS 불가.
+
 ### 다음 세션 todo (RED → 다음 방향)
 
 이는 단순 wire-up이 아닌 **architectural** 결정 필요:
@@ -105,14 +139,23 @@ Segmentation fault
    - 해결 방안: mask buffer를 통해 pos 동적 처리 (M2 microbench는 단일 token이라
      이슈 없음)
 
-### 사용자 결정 요청
+### 사용자 결정 요청 (UPDATED)
 
-본 세션 timebox 내에서 segfault root cause + production wire-up 통합은 미완료.
-다음 세션 전에 다음 결정 필요:
+본 세션 timebox 내에서 root cause 정밀 격리 결과 — **단순 fix 불가**.
 
-- **D-A**: A안 (noshuffle SOA 강제)으로 진행 (~3-5일)
-- **D-B**: B안 (prefill 전체 OpenCL 위임)으로 진행 (~2-3일)
-- **D-C**: scope 재정의 — qnn_oppkg를 prefill 미지원 backend로 명시하고 transformer.rs가 prefill 시점에 OpenCL primary로 강제 전환 (~2일)
+핵심 문제: **pos baked**. M2.H가 single-token 테스트라 noticed 안 된 architectural blocker. production 32-token decode는 graph rebuild 또는 op spec 변경 없이 PASS 불가능.
+
+권장 진행 옵션 (재평가):
+
+| ID | 옵션 | 시간 | M3 timeline 영향 | 위험 |
+|---|---|---|---|---|
+| **D-D** | M2 ops 수정 (RoPE/KvScatter pos를 input tensor로) | 5-7일 | +1.5주 | M2 검증 재실행 필요 |
+| **D-E** | M3 scope 재정의 — single-token 검증 + multi-token OpenCL fallback | 2-3일 | +0.5주 | M3 게이트 의미 약화. paper evidence 약함 |
+| **D-A/B/C** | segfault만 fix | 2-5일 | +0.5~1주 | pos baked 문제 미해결 → 정확성 RED 유지 |
+
+**기존 M3 timeline (4주) → M3 완료 +1.5~2.5주 추가** 예상.
+
+본 결정은 plan re-scope이므로 사용자 명시 결정 필요.
 
 ## 변경 파일 (이번 세션)
 

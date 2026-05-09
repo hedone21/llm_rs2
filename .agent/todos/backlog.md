@@ -4,6 +4,13 @@
 
 ---
 
+## [P0] M3.4 RED — pos baked architectural blocker — 2026-05-10
+- **Status**: 사용자 architectural decision 대기
+- **Handoff**: `.agent/todos/handoff_qnn_oppkg_m3_4_red_pos_baked_20260510.md`
+- **상세**: `papers/eurosys2027/_workspace/experiment/m3_4_passgate.md`
+- **HEAD**: `90617cc` (M3.4 14-node body + device gate RED, push됨)
+- **요약**: graphFinalize 28× ~1.36s GREEN (예상 ~33s 대비 24× 빠름), prefill segfault. 후속 분석 결과 root cause는 M2.H builder가 pos를 `QNN_PARAMTYPE_SCALAR`로 graph build 시점 hardcoded — multi-token decode 불가능. 옵션: D-D (M2 ops 수정 +1.5주) / D-E (scope 약화 +0.5주). 사용자 결정 필요.
+
 ## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
 - **Status**: TODO (M2 baseline부터 누적, M3.0 무관)
 - **상세**: `cargo clippy --workspace --features opencl --tests -- -D warnings`에서 `crates/qnn_oppkg_poc/src/lib.rs:725` 근방 raw pointer deref 함수에 `unsafe` 누락. rust 1.93 신규 lint. M1 회귀 안전망 crate이라 P3 우선순위. M2가 main 진입한 이상 PoC는 read-only — 손대지 않거나 일괄 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`로 silence.
