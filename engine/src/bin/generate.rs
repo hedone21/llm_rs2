@@ -1313,7 +1313,12 @@ fn main() -> anyhow::Result<()> {
         "qnn_oppkg" | "qnngpu" => {
             // QNN backend는 호스트(non-Android)에서 init 실패 → 명확한 Err 전파.
             // 디바이스 빌드에서만 정상 진행 가능 (libQnnGpu.so 존재).
-            let qnn = Arc::new(llm_rs2::backend::qnn_oppkg::QnnOppkgBackend::new()?);
+            // ENG-QNN-209/D1: --qnn-graph-cache-prebuild flag (default true)는
+            // 백엔드 생성 시점에 wired 후 model load 완료 시점에 actual prebuild가
+            // 발동된다.
+            let qnn = Arc::new(llm_rs2::backend::qnn_oppkg::QnnOppkgBackend::with_prebuild(
+                args.qnn_graph_cache_prebuild,
+            )?);
             let qnn_mem: Arc<dyn Memory> = Arc::new(
                 llm_rs2::backend::qnn_oppkg::memory::QnnOppkgMemory::new(qnn.clone()),
             );
@@ -1355,9 +1360,9 @@ fn main() -> anyhow::Result<()> {
                 Option<Arc<dyn Memory>>,
             ) = (None, None);
 
-            // qnn_graph_cache_prebuild / qnn_allow_fallback는 M3.2/M3.3에서 본격
-            // 활용. 본 단계에서는 기본값 검증 후 통과만.
-            let _ = (args.qnn_graph_cache_prebuild, args.qnn_allow_fallback);
+            // qnn_graph_cache_prebuild는 위에서 with_prebuild()에 wired됨.
+            // qnn_allow_fallback는 M3.3 forward path에서 활용.
+            let _ = args.qnn_allow_fallback;
             // gpu_be / gpu_mem_arc는 M3.2 SwitchHw round-trip에서 secondary로 사용.
             // 본 단계는 (None, None) 혹은 (Some, Some) 양쪽 모두 통과만 검증.
             let _ = (&gpu_be, &gpu_mem_arc);
@@ -1427,6 +1432,32 @@ fn main() -> anyhow::Result<()> {
     // Tester pulls this file to analyse kgsl/ion/dmabuf VMA distribution.
     if std::env::var("LLMRS_DUMP_SMAPS_T1").is_ok() {
         dump_smaps("T1_model_loaded");
+    }
+
+    // ENG-QNN-203/INV-167 — Eager prebuild of layer graph cache (D1 결정).
+    // Model load + LayerSlot 등록이 완료된 시점에 N×graphFinalize를 직렬 실행한다.
+    // host build에서는 backend init이 이미 fail하여 본 분기 도달 불가; 디바이스
+    // 빌드 + Android runtime에서만 본격 동작.
+    #[cfg(feature = "qnn")]
+    if args.backend == "qnn_oppkg" || args.backend == "qnngpu" {
+        if let Some(qnn_be) = backend
+            .as_any()
+            .downcast_ref::<llm_rs2::backend::qnn_oppkg::QnnOppkgBackend>()
+        {
+            // ModelConfig → LayerConfig 변환. M3.2 단계는 Qwen2.5-1.5B 단일
+            // 모델 지원 (ENG-QNN-225 / INV-176). 추후 다른 모델 추가 시
+            // dispatch table 도입 예정.
+            let mc = &model.config;
+            let layer_cfg = llm_rs2::backend::qnn_oppkg::layer_graph::LayerConfig {
+                dim: mc.hidden_size as u32,
+                n_head: mc.num_attention_heads as u32,
+                n_kv_heads: mc.num_key_value_heads as u32,
+                head_dim: mc.head_dim as u32,
+                ffn_dim: mc.intermediate_size as u32,
+                kv_capacity: args.max_seq_len as u32,
+            };
+            qnn_be.prebuild_graph_cache(&model.layers, &layer_cfg)?;
+        }
     }
 
     // WSWAP-6-PREFAULT: eager prefault of the secondary weight file.

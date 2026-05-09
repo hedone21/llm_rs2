@@ -29,10 +29,12 @@ pub mod runtime;
 
 use crate::core::backend::Backend;
 use crate::core::tensor::Tensor;
+use crate::models::weights::LayerSlot;
 use anyhow::{Result, anyhow};
 use std::sync::{Arc, Mutex};
 
 use self::graph_cache::GraphCache;
+use self::layer_graph::LayerConfig;
 use self::runtime::QnnOppkgRuntime;
 
 /// QNN OpPackage backend — `Backend` trait 구현 진입점.
@@ -50,8 +52,11 @@ pub struct QnnOppkgBackend {
     #[allow(dead_code)]
     runtime: Arc<QnnOppkgRuntime>,
     /// 28 layer graph cache (M3.2 prebuild 진입).
-    #[allow(dead_code)]
     graph_cache: Mutex<GraphCache>,
+    /// `--qnn-graph-cache-prebuild` flag (D1 결정, default true). false면
+    /// `prebuild_graph_cache`가 noop이 되고 forward는 lazy build를 시도한다
+    /// (M3.2 미지원 — fallback path).
+    args_prebuild: bool,
 }
 
 impl QnnOppkgBackend {
@@ -59,15 +64,58 @@ impl QnnOppkgBackend {
     /// register + V2.0 fn-pointer 캐싱. 호스트(non-Android)에서는 명확한
     /// `Err`로 실패한다 (디바이스 빌드에서만 진행 가능).
     ///
-    /// `_args`는 generate.rs Args struct를 향후 받기 위한 placeholder. M3.1
-    /// 단계에서는 사용하지 않는다 (`--qnn-graph-cache-prebuild`는 M3.2 진입
-    /// 시점에 의미가 생긴다).
+    /// 호출자는 이후 `prebuild_graph_cache()`로 N×graphFinalize를 수행해야
+    /// `execute_layer_graph` fast path가 동작한다 (D1 결정).
     pub fn new() -> Result<Self> {
+        Self::with_prebuild(true)
+    }
+
+    /// Backend 초기화 — `--qnn-graph-cache-prebuild` flag와 함께. CLI에서
+    /// 직접 호출 (default `true`).
+    pub fn with_prebuild(args_prebuild: bool) -> Result<Self> {
         let runtime = QnnOppkgRuntime::init()?;
         Ok(Self {
             runtime,
             graph_cache: Mutex::new(GraphCache::new()),
+            args_prebuild,
         })
+    }
+
+    /// Eager prebuild — model load 완료 시점에 1회 호출 (`--qnn-graph-cache-prebuild=true` 시).
+    ///
+    /// `slots`는 `TransformerWeights::layers` 순서. `cfg`는 layer dimension
+    /// 메타데이터 (Qwen2.5-1.5B = `LayerConfig::qwen2p5_1p5b()`).
+    ///
+    /// `args_prebuild=false` 면 noop으로 빠지고 graph cache는 비어있는 상태로
+    /// 유지된다 (M3.2에서 lazy build path 미지원 — caller가 forward 시점에
+    /// Err를 받게 됨).
+    ///
+    /// host 빌드: `LayerGraph::build`가 즉시 Err로 fail하여 본 method가 Err
+    /// 전파 — caller가 명확하게 catch + bail.
+    pub fn prebuild_graph_cache(&self, slots: &[Arc<LayerSlot>], cfg: &LayerConfig) -> Result<()> {
+        if !self.args_prebuild {
+            // `--qnn-graph-cache-prebuild=false` 명시 — lazy build path 진입.
+            // M3.2 단계에서 lazy build는 미지원이지만, caller (generate.rs)가
+            // 명시적으로 끈 상태이므로 noop이 정상.
+            return Ok(());
+        }
+        let mut cache = self.graph_cache.lock().expect("graph_cache mutex poisoned");
+        cache.prebuild(&self.runtime, slots, cfg)?;
+        eprintln!(
+            "[qnn_oppkg] eager prebuild: {} layers, total finalize {} ms",
+            cache.len(),
+            cache.finalize_total_ms()
+        );
+        Ok(())
+    }
+
+    /// Cache lookup — M3.3 forward fast path에서 사용. M3.2 단계는 노출만.
+    #[allow(dead_code)]
+    pub(crate) fn graph_for_layer(
+        &self,
+        layer_idx: usize,
+    ) -> Option<Arc<self::layer_graph::LayerGraph>> {
+        self.graph_cache.lock().ok().and_then(|c| c.get(layer_idx))
     }
 }
 
