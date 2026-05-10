@@ -294,6 +294,100 @@ hide의 전제 조건은:
 
 ---
 
+## 7.5 KV context size 영향 분석 (2026-05-10 추가)
+
+질문: KV가 길수록 attention DDR-heavy phase가 늘어나 cache-fit phase 사이 간격이 벌어지면 swap chunk hide가 잘 될까?
+
+### 7.5.1 측정 setup
+- prompt_1024.txt (1025 token), prompt_1800.txt (1821 token) 사용 (model max_seq_len=2048 한계로 KV 4k 측정 불가)
+- 4 mode × 3 run, n=20 (KV 1k phase-aware/F16은 EOS hit으로 1 token만 측정)
+- thermal-matched alternating
+
+### 7.5.2 측정 결과
+
+| 모드 | KV 5 (단순 prompt) Prefill | KV 1k Prefill | KV 1.8k Prefill | KV 5 tok[0] | KV 1k tok[0] | KV 1.8k tok[0] | KV 5 tail | KV 1.8k tail |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q4 only | 115 | 7147 | 13987 | 28 | 39.7 | 49.6 | 28.1 | 47.4 |
+| F16 only | 244 | **6364** | **12640** | 53 | n/a | 75.1 | 54.0 | 71.1 |
+| Single-shot | 105 | 7147 | 14543 | 26 | 41.4 | 46.1 | 26.4 | 46.7 |
+| Phase-aware | 224 | **6438** | **13064** | 216~322 | 344~392 | **341.8~365.7** | 29.3 | **78.0** |
+
+### 7.5.3 핵심 finding 3가지
+
+#### Finding 1 — tok[0]는 KV에 거의 무관 (~340~390 ms)
+| KV | Phase-aware tok[0] |
+|---|---:|
+| 5 | 216~322 ms |
+| 1k | 344~392 ms |
+| 1.8k | 342~366 ms |
+
+→ **chunk dispatch overhead 자체가 attention compute time과 분리**. KV 길이가 attention DDR-heavy phase를 늘려도 chunk가 그 안에 hide되지 않음. 가설(KV 길수록 hide 잘 됨) **기각**. 이유: chunk가 cache-fit window 안에 fit하지 못하는 현상이 KV에 무관하게 동일.
+
+#### Finding 2 — F16 vs Q4 prefill 효율 reversal (long prompt에서 F16이 더 빠름)
+| KV | Q4 prefill | F16 prefill | F16 vs Q4 | tok/s 차이 |
+|---|---:|---:|---:|---:|
+| 5 | 105 | 244 | F16 **+139 ms 손해** | F16 0.43× |
+| 1k | 7147 | 6364 | F16 **-783 ms 이득** | F16 1.11× |
+| 1.8k | 13987 | 12640 | F16 **-1347 ms 이득** | F16 1.11× |
+
+→ **long batched prefill에서는 F16이 Q4보다 11% 빠름**. 이유: Q4 dequant가 매 batched matmul마다 발생, batch size가 클수록 effective matmul throughput이 더 중요해져 dequant overhead가 회수 안 됨.
+
+→ **phase-aware의 prefill F16 강제 (이전 §7.1 PRIMARY 손해로 분류)는 long prompt에서는 오히려 이득**. 이전 분류 무효.
+
+#### Finding 3 — Phase-aware tail이 KV에 따라 악화
+| KV | Phase-aware tail (excl tok0) | Q4 baseline | Δ |
+|---|---:|---:|---:|
+| 5 | 29.3 (n=200) | 28.1 | **+1.2 ms** |
+| 1.8k | 78.0 (n=20) | 47.4 | **+30.6 ms** |
+
+→ KV 1.8k에서 18 token tail 평균이 +30 ms 더 느림. 18 × 30 = 540 ms 추가. 가능 원인:
+  - chunk dispatch가 더 많은 token에 분산됨 (forward 무거워 chunk 진행 늦음)
+  - dispatcher worker thread와 attention OpenCL queue 경합 증가
+  - retire 시점이 token 18+에 발생 (그 동안 forward가 chunk 뒤에 줄)
+
+n=20만 측정이라 retire 시점 추정 어려움 — 더 긴 decode (n=200) 측정 필요. KV 1.8k에서는 phase-aware EOS hit 안 함 (다양한 텍스트 prompt 덕분).
+
+### 7.5.4 E2E 비교 — KV에 따른 phase-aware 위치 변화
+
+| KV | n | Single-shot E2E | Phase-aware E2E | Δ (PA - SS) |
+|---:|---:|---:|---:|---:|
+| 5 | 200 | 5874 | 6477 | **+603** (PA 손해) |
+| 1.8k | 20 | 14854 + 46.7×19 = **15741** | 13187 + 91.9×19 = **14933** | **-808** (PA 이득!) |
+| 1.8k | 200 (tail 78 유지 가정) | 14854 + 46.7×199 = 24147 | 13187 + 78×199 = 28709 | +4562 (PA 손해) |
+| 1.8k | 200 (tail Q4 회복 가정) | 24147 | 13187 + 78×18 + 47×181 = 23098 | -1049 (PA 이득) |
+
+KV 1.8k crossover (tail 78 유지 시): **n ≈ 37**. 즉:
+- KV 5: 모든 n에서 phase-aware E2E 손해
+- KV 1.8k: **n<37 에서 phase-aware 이득 (-808 ms at n=20)**
+
+이는 §7.1 ("Prefill F16 +119 ms 영구 손해") 결론을 KV-dependent로 수정해야 함을 시사.
+
+### 7.5.5 종합 — KV 길이가 v1 평가를 reverse
+
+이전 §7 (KV 5 기반) 결론 vs KV 1.8k 결론 비교:
+
+| 항목 | KV 5 기반 (이전) | KV 1.8k 기반 (수정) |
+|---|---|---|
+| Prefill F16 영향 | +119 ms 영구 손해 | **-1347 ms 이득** (reversal) |
+| tok[0] blocking | +200~300 ms | +290~315 ms (큰 변화 없음) |
+| Decode tail | +1.2 ms (steady 거의 동일) | **+30.6 ms** (n=20, 더 큼) |
+| E2E 평가 | 모든 n에서 PA 손해 | n<37 에서 PA 이득 |
+
+→ **v1 평가는 prompt 길이에 강하게 의존**. paper에서 이걸 명시해야:
+- short prompt (chat 첫 메시지, ~5~50 token): single-shot 유리
+- long prompt (RAG, document QA, ~1k+ token): phase-aware E2E 유리 (단 n<crossover)
+- 매우 긴 응답 (n>100): single-shot 유리 (모든 KV)
+
+### 7.5.6 v2 우선순위 재조정
+
+이 finding이 §8 plan을 다시 흔든다:
+- §8 Priority 1 (prefill phase swap)은 short prompt 만 도움. long prompt에서는 F16 prefill이 더 빠름 → 의미 없음. **drop**.
+- §8 Priority 2 (sub-tensor chunking) — tok[0] blocking 해소가 모든 KV에서 우선순위 1. **유지**.
+- 추가 Priority — **tail overhead (KV 의존)** 진단. KV 1.8k tail +30 ms 가 chunk dispatch 분산 시간 길어짐 때문이라면 sub-chunking으로 해결 가능. queue 경합이라면 dispatcher worker thread 분리 필요.
+- 추가 Priority — long prompt + n>20 측정 필요. tail 회복 시점 확인 (chunk dispatch가 언제 retire?).
+
+---
+
 ## 8. 다음 세션 액션 (2026-05-10 final)
 
 §7의 4가지 원인을 직접 공격. 우선순위 재배치:
