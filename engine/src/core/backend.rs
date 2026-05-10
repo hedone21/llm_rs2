@@ -30,6 +30,22 @@ impl GpuEvent {
     pub fn dummy() -> Self {
         Self::default()
     }
+
+    /// LISWAP-6 Phase 5: alias path 검출용. cl/cu inner 모두 None 이면
+    /// 진짜 wait할 GPU 작업이 없는 sentinel. `process_commit` 가 이를 보면
+    /// `wait_event_blocking` 호출을 skip 해서 fall-through `synchronize()`
+    /// (forward GPU op block) 을 회피한다.
+    pub fn is_dummy(&self) -> bool {
+        #[cfg(feature = "opencl")]
+        let cl_none = self.inner_cl.is_none();
+        #[cfg(not(feature = "opencl"))]
+        let cl_none = true;
+        #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+        let cu_none = self.inner_cu.is_none();
+        #[cfg(not(any(feature = "cuda", feature = "cuda-embedded")))]
+        let cu_none = true;
+        cl_none && cu_none
+    }
 }
 
 pub trait Backend: Send + Sync {

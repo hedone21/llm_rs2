@@ -246,11 +246,16 @@ fn worker_loop(rx: mpsc::Receiver<SwapJob>, backend: Arc<dyn Backend>, pending: 
 
 /// Execute one commit job: wait → swap → chain release → on_complete.
 fn process_commit(job: SwapCommitJob, backend: &Arc<dyn Backend>) {
-    // Wait for H2D write to become GPU-visible before committing.
-    if let Err(e) = backend.wait_event_blocking(job.write_event.as_ref()) {
-        eprintln!("[AsyncSwap] wait_event_blocking failed: {e}; commit skipped");
-        // slot retains old weights — safe to continue
-        return;
+    // LISWAP-6 Phase 5: alias path는 cl_mem이 이미 GPU-visible 이므로
+    // wait할 GPU 작업 없음. dummy event는 wait_event_blocking 의 fall-through
+    // self.synchronize() 가 forward GPU op까지 block 시키는 부작용을 일으키므로
+    // skip한다. 비-alias path (memcpy)는 정상대로 wait.
+    if !job.write_event.is_dummy() {
+        if let Err(e) = backend.wait_event_blocking(job.write_event.as_ref()) {
+            eprintln!("[AsyncSwap] wait_event_blocking failed: {e}; commit skipped");
+            // slot retains old weights — safe to continue
+            return;
+        }
     }
 
     // Atomically install new weights and retrieve the displaced old Arc.

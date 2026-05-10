@@ -14,9 +14,16 @@
 | **1** | + cached cl_mem alias | **405** ★ | 1437 | 1029 | +154% (worse) |
 | **2** | + throttle (K=4) | 405 | 1437 | **1388** (K=4) | 무효 (wall ↑) |
 | **3** | + mid-decode (delay=30) | 402 | 1793 | 1229 | +205% (loss in production) |
-| **4** | + async worker thread | TBD | TBD | TBD | TBD |
+| **4** | + async worker thread | 405 | 1110 | 1903 | +369% (worker contention 미해결) |
+| **5a** | + alias H2D-skip (`build_tensor_from_mmap_async_for_hook`) | 408 | 1510 | 690 | +69% |
+| **5b** | + alias H2D-skip (`wait_pending` 도) | **427** | 1801 | **515** | **+21%** ★ |
 
 (swap-to-decode-end wall, n=30 except Phase 3/4 = n=60)
+
+**Phase 5 의 진짜 fix** (사용자 통찰): rpcmem alias 자체는 zero-copy 인데
+`enqueue_write_async` 와 `wait_pending` 두 함정에서 **alias 무시하고 새 cl_mem
+생성 + H2D memcpy + GPU sync 가 진행**되고 있었음. 두 곳에서 alias 검출 후
+skip 하니 phase-aware가 single-shot 직전까지 따라잡음.
 
 ---
 

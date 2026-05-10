@@ -291,10 +291,13 @@ impl PhaseAwareSwapDispatcher {
             Err(_) => return,
         };
         if let Some(ev) = evt_opt {
-            // Best effort — wait failure도 forward 진행은 막지 않는다.
-            // 단 chunk이 GPU-visible하지 않으면 ArcSwap commit 시 garbage 위험 →
-            // dispatcher worker가 한번 더 wait_event_blocking 한다.
-            if let Err(e) = self.backend.wait_event_blocking(ev.as_ref()) {
+            // LISWAP-6 Phase 5: alias path 면 cl_event 가 dummy. 그러면
+            // wait_event_blocking 의 fall-through `synchronize()` 가 forward
+            // GPU op까지 block 하므로 skip — alias 는 이미 GPU-visible 이라
+            // 진짜 wait 할 게 없음. 비-alias path (memcpy)는 정상 wait.
+            if !ev.is_dummy()
+                && let Err(e) = self.backend.wait_event_blocking(ev.as_ref())
+            {
                 eprintln!("[PhaseAwareSwap] wait_pending failed: {e}");
             }
         }

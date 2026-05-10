@@ -900,6 +900,13 @@ impl<'a> SwapExecutor<'a> {
         if self.backend.name().contains("CPU") {
             return Ok((cpu_tensor, GpuEvent::dummy()));
         }
+        // LISWAP-6 Phase 5: alias path 면 cpu_tensor.buffer().cl_mem() 가 이미
+        // GPU-visible (rpcmem DMA-BUF + USE_HOST_PTR alias). H2D copy 불필요 →
+        // enqueue_write_async skip + dummy event 반환. process_commit 가
+        // is_dummy() 체크로 wait_event_blocking 회피하여 forward 영향 0.
+        if cpu_tensor.buffer().cl_mem().is_some() {
+            return Ok((cpu_tensor, GpuEvent::dummy()));
+        }
         self.backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
             SwapError::AsyncTransferUnavailable {
                 layer: layer_idx,
