@@ -2867,6 +2867,24 @@ fn main() -> anyhow::Result<()> {
         let target_layers =
             llm_rs2::models::weights::SwapExecutor::uniform_target_layers(ratio, num_layers);
 
+        // ── LISWAP-6: Eager prefault ─────────────────────────────────────
+        // qnn_oppkg + Rpcmem variant 일 때 swap 시점의 rpcmem_alloc 비용
+        // (~420 ms/25 layer on Galaxy S25) 을 model load 시점에 흡수.
+        // Gguf/Auf variant 는 madvise() 만 호출되어 비용 작음 (~65 ms).
+        // 모든 swap mode (single-shot/incremental/intra-forward/phase-aware)
+        // 가 자동 이득. swap blocking 700 → ~280 ms 단축 (60%).
+        if !target_layers.is_empty()
+            && let Some(secondary) = model.secondary_mmap.as_ref()
+        {
+            let t_pre = std::time::Instant::now();
+            secondary.prefault_layers(&target_layers);
+            eprintln!(
+                "weight_swap: eager prefault — {} target layers, {:.1}ms",
+                target_layers.len(),
+                t_pre.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+
         if target_layers.is_empty() {
             eprintln!(
                 "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
