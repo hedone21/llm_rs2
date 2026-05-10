@@ -168,6 +168,11 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
             .cl_mem()
             .ok_or_else(|| anyhow!("HostPtrPoolBuffer: cl_mem is None (unexpected)"));
     }
+    // Generic fallback — Buffer trait의 cl_mem() method가 Some(...)을 반환하면
+    // 사용 (새 buffer type 추가 시 OCP — 본 함수에 explicit downcast 추가 불필요).
+    if let Some(m) = buf.cl_mem() {
+        return Ok(m);
+    }
     Err(anyhow!("Buffer is not an OpenCL buffer type"))
 }
 
