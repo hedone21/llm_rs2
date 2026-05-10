@@ -1907,17 +1907,28 @@ fn main() -> anyhow::Result<()> {
         //   격차만 error로 차단.
         let tok_vocab = tokenizer.get_vocab_size(true);
         let model_vocab = model.config.vocab_size;
-        if tok_vocab > model_vocab {
+        // Gemma3 등 multimodal 모델은 텍스트 vocab + 소수의 special token (image_soft 등)을
+        // tokenizer에만 두고 embedding table엔 두지 않는 경우가 있음. 작은 overflow(≤8)는
+        // 텍스트 생성에서 emit될 일이 거의 없으므로 warning으로 강등.
+        let oob_tolerance: usize = 8;
+        if tok_vocab > model_vocab + oob_tolerance {
             anyhow::bail!(
-                "Tokenizer vocab ({}) exceeds model vocab ({}) — OOB embedding lookup. \
+                "Tokenizer vocab ({}) exceeds model vocab ({}) by more than {} — OOB embedding lookup risk. \
                  Path: {}. Pass --tokenizer-path with the matching tokenizer.json.",
                 tok_vocab,
                 model_vocab,
+                oob_tolerance,
                 tokenizer_path
+            );
+        } else if tok_vocab > model_vocab {
+            eprintln!(
+                "[Tokenizer] WARNING: tokenizer vocab ({}) > model vocab ({}) by {} (likely multimodal special tokens). \
+                 Text generation OK; encoding text containing those special tokens would OOB.",
+                tok_vocab, model_vocab, tok_vocab - model_vocab
             );
         }
         let pad_tolerance = (model_vocab / 20).max(256);
-        let pad_gap = model_vocab - tok_vocab;
+        let pad_gap = model_vocab.saturating_sub(tok_vocab);
         if pad_gap > pad_tolerance {
             anyhow::bail!(
                 "Tokenizer vocab too small: model={} tokenizer={} (gap={} > {} padding tolerance). \

@@ -125,6 +125,22 @@ impl QnnOppkgBackend {
         }
     }
 
+    /// OpenCL secondary backend을 closure로 노출. forward path가 OpenCL queue를
+    /// 직접 필요로 할 때 사용 (e.g., flash-attn CPU fallback이 device-only buffer로
+    /// 결과 write back). secondary가 OpenCL backend가 아니거나 미설정이면 None.
+    #[cfg(feature = "opencl")]
+    pub fn with_opencl_secondary<R>(
+        &self,
+        f: impl FnOnce(&crate::backend::opencl::OpenCLBackend) -> R,
+    ) -> Option<R> {
+        let slot = self.fallback_backend.lock().ok()?;
+        let be = slot.as_ref()?;
+        let ocl = be
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
+        Some(f(ocl))
+    }
+
     /// Runtime 핸들 공유 — `QnnOppkgMemory` (ENG-QNN-204) 와 layer_graph
     /// build/execute에서 V2.25 vtable + context handle 접근을 위해 사용.
     /// host 빌드에서는 backend init이 Err로 fail하므로 본 method는 호출되지
