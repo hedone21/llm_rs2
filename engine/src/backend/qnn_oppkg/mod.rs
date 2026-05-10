@@ -227,13 +227,17 @@ impl Backend for QnnOppkgBackend {
     /// Android 빌드에서 cache가 비어있거나 부분 채워진 상태는 false를 반환하여
     /// transformer.rs가 (현재는 미지원이므로) bail하도록 한다.
     fn supports_layer_graph(&self) -> bool {
-        // INV-174 idempotent: cache 길이는 prebuild 후 변하지 않으므로 항상 동일.
-        let cache_ok = self
-            .graph_cache
-            .lock()
-            .map(|c| !c.is_empty())
-            .unwrap_or(false);
-        cache_ok && self.runtime.is_initialized()
+        // D-F 옵션 1 (production-safe default): execute_layer_graph fast path는
+        // graph build 시점 `n_kv=1` baked로 multi-token decode에서 정확성 깨짐.
+        // 옵션 2 (cl_mem↔host bridge) 인프라는 구현 완료 (execute_layer_graph
+        // bridge + lg.execute KV slot sync) 그러나 D-D.6 (n_kv input tensor화 +
+        // M2 ops/.cl kernel 갱신) 완료 전까진 fast path 비활성.
+        //
+        // 본 단계 동작: qnn_oppkg primary로 진입하지만 모든 forward는 trait
+        // fallback (OpenCL secondary)이 처리 → token sequence는 OpenCL primary와
+        // bit-equal. INV-175 (decode 동안 fallback_call_count=0) 게이트는 D-D.6
+        // 완료 후 재검증.
+        false
     }
 
     /// ENG-QNN-211/213/214 — 14-node single-layer graph dispatch.
@@ -241,6 +245,14 @@ impl Backend for QnnOppkgBackend {
     /// transformer.rs `forward_into` decode loop가 본 method를 layer당 1회
     /// 호출한다. host 빌드는 backend init Err로 본 path 진입 불가. Android
     /// 빌드에서 14-node graph 본문이 부재하면 LayerGraph::execute가 Err.
+    ///
+    /// D-F 옵션 2 — cl_mem ↔ host bridge:
+    /// `x`, `kv_cache_k/v`, `x_out`는 OpenCL secondary가 owning하는 cl_mem
+    /// (UnifiedBuffer) tensor이고 host_ptr이 unmapped 상태일 수 있다. graph는
+    /// rpcmem buffer만 알기 때문에 fallback backend의 read_buffer/write_buffer로
+    /// 양방향 sync한다. KV cache는 매 layer 매 step read+write (graph 자체
+    /// rpcmem KV slot에 누적되지만 caller도 OpenCL cl_mem에 동일 데이터를
+    /// 보유하도록 mirror) — 옵션 3 (KV rpcmem alloc)에서 zero-copy 가능.
     fn execute_layer_graph(
         &self,
         layer_idx: usize,
@@ -254,30 +266,44 @@ impl Backend for QnnOppkgBackend {
             anyhow!("execute_layer_graph(layer={layer_idx}): graph cache miss — prebuild 누락")
         })?;
 
-        // ENG-QNN-213/214 pre-conditions.
-        // x: F32 [1, 1, dim] or [1, dim] depending on rank. KV cache: F16 buffer.
-        let x_bytes = unsafe { std::slice::from_raw_parts(x.as_ptr(), x.size()) };
-        let kv_k_bytes =
-            unsafe { std::slice::from_raw_parts_mut(kv_cache_k.as_mut_ptr(), kv_cache_k.size()) };
-        let kv_v_bytes =
-            unsafe { std::slice::from_raw_parts_mut(kv_cache_v.as_mut_ptr(), kv_cache_v.size()) };
-        let x_out_bytes =
-            unsafe { std::slice::from_raw_parts_mut(x_out.as_mut_ptr(), x_out.size()) };
+        // fallback backend (OpenCL secondary)를 통해 cl_mem buffer를 host bytes로
+        // 가져온다. 이는 INV-175 (decode fast path 동안 fallback_call_count 0)
+        // 게이트와 무관 — bridge용 read/write_buffer는 본 method 자체에서 직접
+        // 호출하며 fallback 카운터를 증가시키지 않는다.
+        let slot = self
+            .fallback_backend
+            .lock()
+            .expect("fallback_backend mutex poisoned");
+        let fb = slot.as_ref().ok_or_else(|| {
+            anyhow!("execute_layer_graph: fallback backend (OpenCL secondary) 미설정")
+        })?;
 
-        // mask: ENG-QNN-228 — model load 시 1회 alloc (M3.4에서 backend 내부
-        // scratch buffer로 도입). 본 단계는 빈 slice (LayerGraph::execute가
-        // 내부 rpcmem buffer 사용).
+        let mut x_bytes = vec![0u8; x.size()];
+        fb.read_buffer(x, &mut x_bytes)?;
+        let mut kv_k_bytes = vec![0u8; kv_cache_k.size()];
+        fb.read_buffer(kv_cache_k, &mut kv_k_bytes)?;
+        let mut kv_v_bytes = vec![0u8; kv_cache_v.size()];
+        fb.read_buffer(kv_cache_v, &mut kv_v_bytes)?;
+        let mut x_out_bytes = vec![0u8; x_out.size()];
+
+        // mask: graph 내부 rpcmem buffer 사용 (M3.4 시점은 빈 slice).
         let empty_mask: &[u8] = &[];
 
         lg.execute(
             self.runtime.as_ref(),
-            x_bytes,
-            kv_k_bytes,
-            kv_v_bytes,
+            &x_bytes,
+            &mut kv_k_bytes,
+            &mut kv_v_bytes,
             pos,
             empty_mask,
-            x_out_bytes,
-        )
+            &mut x_out_bytes,
+        )?;
+
+        // graph rpcmem → OpenCL cl_mem write back.
+        fb.write_buffer(x_out, &x_out_bytes)?;
+        fb.write_buffer(kv_cache_k, &kv_k_bytes)?;
+        fb.write_buffer(kv_cache_v, &kv_v_bytes)?;
+        Ok(())
     }
 
     // ── Below: trait method fallback wrappers — prefill 및 model load에서
@@ -346,25 +372,241 @@ impl Backend for QnnOppkgBackend {
         })
     }
 
-    /// Model load passthrough — qnn_oppkg backend는 weight tensor를 host buffer
-    /// (GGUF mmap) 형태로 보존하고, graph build 시점에 SOA 변환 + rpcmem alloc
-    /// 1회 수행한다. 따라서 `copy_from`은 source의 buffer를 그대로 clone하여
-    /// backend reference만 본 backend로 변경한다.
+    fn gather(&self, src: &Tensor, indices: &Tensor, dst: &mut Tensor) -> Result<()> {
+        fallback_or_panic(self, "gather", |be| be.gather(src, indices, dst))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
+    ) -> Result<()> {
+        fallback_or_panic(self, "attention_gen", move |be| {
+            be.attention_gen(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                num_heads_q,
+                num_heads_kv,
+                head_dim,
+                cache_seq_len,
+                scores_out,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_prefill(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        head_dim: usize,
+        kv_capacity: usize,
+        batch_size: usize,
+        is_head_major: bool,
+    ) -> Result<bool> {
+        fallback_or_panic(self, "flash_attention_prefill", |be| {
+            be.flash_attention_prefill(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                n_heads_q,
+                n_heads_kv,
+                seq_len,
+                cache_seq_len,
+                head_dim,
+                kv_capacity,
+                batch_size,
+                is_head_major,
+            )
+        })
+    }
+
+    fn kv_scatter_f32_to_f16(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        head_dim: usize,
+        capacity: usize,
+        write_pos: usize,
+    ) -> Result<()> {
+        fallback_or_panic(self, "kv_scatter_f32_to_f16", |be| {
+            be.kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
+        })
+    }
+
+    fn buffer_shift(
+        &self,
+        tensor: &mut Tensor,
+        src_offset: usize,
+        dst_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        fallback_or_panic(self, "buffer_shift", |be| {
+            be.buffer_shift(tensor, src_offset, dst_offset, count)
+        })
+    }
+
+    fn copy_slice(
+        &self,
+        src: &Tensor,
+        dst: &mut Tensor,
+        src_offset: usize,
+        dst_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        fallback_or_panic(self, "copy_slice", |be| {
+            be.copy_slice(src, dst, src_offset, dst_offset, count)
+        })
+    }
+
+    fn copy_into(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
+        fallback_or_panic(self, "copy_into", |be| be.copy_into(src, dst))
+    }
+
+    fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
+        fallback_or_panic(self, "read_buffer", |be| be.read_buffer(t, dst))
+    }
+
+    fn write_buffer(&self, t: &mut Tensor, src: &[u8]) -> Result<()> {
+        fallback_or_panic(self, "write_buffer", |be| be.write_buffer(t, src))
+    }
+
+    fn write_buffer_range(&self, t: &mut Tensor, src: &[u8], dst_offset: usize) -> Result<()> {
+        fallback_or_panic(self, "write_buffer_range", |be| {
+            be.write_buffer_range(t, src, dst_offset)
+        })
+    }
+
+    fn add_row_bias(&self, x: &mut Tensor, bias: &Tensor) -> Result<()> {
+        fallback_or_panic(self, "add_row_bias", |be| be.add_row_bias(x, bias))
+    }
+
+    fn gelu_tanh_mul(&self, gate: &mut Tensor, up: &Tensor) -> Result<()> {
+        fallback_or_panic(self, "gelu_tanh_mul", |be| be.gelu_tanh_mul(gate, up))
+    }
+
+    fn add_rms_norm_oop(
+        &self,
+        x: &mut Tensor,
+        residual: &Tensor,
+        out: &mut Tensor,
+        w: &Tensor,
+        eps: f32,
+        add_unit: bool,
+    ) -> Result<()> {
+        fallback_or_panic(self, "add_rms_norm_oop", |be| {
+            be.add_rms_norm_oop(x, residual, out, w, eps, add_unit)
+        })
+    }
+
+    fn matmul_ffn_gate_up_silu(
+        &self,
+        x: &Tensor,
+        w_gate: &Tensor,
+        w_up: &Tensor,
+        out: &mut Tensor,
+        up_scratch: &mut Tensor,
+    ) -> Result<()> {
+        fallback_or_panic(self, "matmul_ffn_gate_up_silu", |be| {
+            be.matmul_ffn_gate_up_silu(x, w_gate, w_up, out, up_scratch)
+        })
+    }
+
+    fn ensure_noshuffle_soa_registered(&self, tensor: &Tensor) -> Result<()> {
+        fallback_or_panic(self, "ensure_noshuffle_soa_registered", |be| {
+            be.ensure_noshuffle_soa_registered(tensor)
+        })
+    }
+
+    fn invalidate_noshuffle_soa_registry(&self) {
+        fallback_or_panic(self, "invalidate_noshuffle_soa_registry", |be| {
+            be.invalidate_noshuffle_soa_registry()
+        })
+    }
+
+    fn max_single_alloc(&self) -> usize {
+        let slot = self
+            .fallback_backend
+            .lock()
+            .expect("fallback_backend mutex poisoned");
+        if let Some(be) = slot.as_ref() {
+            be.max_single_alloc()
+        } else {
+            // host test path: use trait default.
+            usize::MAX
+        }
+    }
+
+    /// Model load weight upload — D-F: fallback (OpenCL secondary)에 위임하여
+    /// source buffer를 OpenCL cl_mem으로 promote한다. fallback이 없으면 기존
+    /// passthrough (host test / non-Android build path).
     ///
-    /// 이는 trait fallback이 아니라 정상 path — weight은 forward 동안 본 backend가
-    /// 직접 접근하지 않으며, `execute_layer_graph`는 LayerSlot에서 별도 추출.
-    /// `fallback_call_count`는 증가시키지 않는다 (INV-175).
+    /// 배경 (M3.4 RED root cause):
+    /// `gguf::load_raw`가 mmap CPU tensor를 만들고 `backend.copy_weight_from`을
+    /// 호출한다. 이전 구현은 source buffer를 그대로 passthrough → weight
+    /// tensor가 MmapBuffer로 남아 noshuffle prep에서 `get_cl_mem` fail
+    /// (`Weight buffer has no cl_mem`) → prefill matmul fallback의 cl_mem
+    /// dereference에서 segv. fallback에 위임하여 OpenCL이 cl_mem으로
+    /// 직접 alloc하면 noshuffle SOA prep + prefill 모두 OpenCL primary처럼
+    /// 동작한다.
+    ///
+    /// `fallback_call_count`는 증가시키지 않는다 — model load는 INV-175
+    /// (decode fast path) 게이트와 무관.
     fn copy_from(&self, t: &Tensor) -> Result<Tensor> {
-        Ok(Tensor::new(
-            t.shape().clone(),
-            t.buffer().clone(),
-            // backend 자체는 trait object Arc<dyn Backend>가 필요하지만 qnn_oppkg
-            // 외부에서 backend ref를 새로 만들 수 없으므로 source tensor의
-            // backend를 그대로 사용. weight은 forward 시 본 backend가 직접
-            // 접근하지 않으므로 backend 일관성은 무관 (graph build에서만 host
-            // pointer 사용).
-            t.backend().clone(),
-        ))
+        let slot = self
+            .fallback_backend
+            .lock()
+            .expect("fallback_backend mutex poisoned");
+        if let Some(be) = slot.as_ref() {
+            be.copy_from(t)
+        } else {
+            Ok(Tensor::new(
+                t.shape().clone(),
+                t.buffer().clone(),
+                t.backend().clone(),
+            ))
+        }
+    }
+
+    /// Weight upload — `copy_from`과 동일하게 fallback에 위임한다. Backend
+    /// trait의 default impl은 `self.copy_from`을 호출하지만, 명시 override로
+    /// fallback의 `copy_weight_from` (weight-specific allocation policy)을
+    /// 직접 사용한다. OpenCL secondary는 `copy_weight_from`이 default impl
+    /// (= `copy_from`)이므로 동작은 동일하나, CUDA backend가 secondary가
+    /// 되는 경우엔 weight policy가 적용된다 (현 시점 미사용 path).
+    fn copy_weight_from(&self, t: &Tensor) -> Result<Tensor> {
+        let slot = self
+            .fallback_backend
+            .lock()
+            .expect("fallback_backend mutex poisoned");
+        if let Some(be) = slot.as_ref() {
+            be.copy_weight_from(t)
+        } else {
+            Ok(Tensor::new(
+                t.shape().clone(),
+                t.buffer().clone(),
+                t.backend().clone(),
+            ))
+        }
     }
 
     fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {

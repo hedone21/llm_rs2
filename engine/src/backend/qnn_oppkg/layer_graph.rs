@@ -184,6 +184,12 @@ mod android {
         /// Slot index 매핑 (host pointer copy 시 사용).
         idx_x_in: usize,
         idx_x_out: usize,
+        /// D-F 옵션 2: graph rpcmem KV slot index. execute 진입 시 외부 KV
+        /// cl_mem (OpenCL secondary가 owning) → graph rpcmem으로 sync,
+        /// execute 종료 시 graph rpcmem → 외부 KV cl_mem으로 write back.
+        /// `bytes_kv`는 K/V 동일 크기.
+        idx_kv_k: usize,
+        idx_kv_v: usize,
         /// M3.4 D-D.3: pos_buf rpcmem slot의 host pointer. graphExecute 직전
         /// `*(pos_host_ptr as *mut i32) = pos as i32`로 갱신. RoPE Q/K +
         /// KvScatter 3 nodes가 동일 pos_buf input tensor를 share.
@@ -203,8 +209,8 @@ mod android {
             &self,
             runtime: &QnnOppkgRuntime,
             x_in_bytes: &[u8],
-            _kv_k_bytes: &mut [u8],
-            _kv_v_bytes: &mut [u8],
+            kv_k_bytes: &mut [u8],
+            kv_v_bytes: &mut [u8],
             pos: usize,
             _mask_bytes: &[u8],
             x_out_bytes: &mut [u8],
@@ -222,6 +228,39 @@ mod android {
                     x_in_bytes.as_ptr(),
                     in_slot.host_ptr,
                     x_in_bytes.len(),
+                );
+            }
+
+            // D-F 옵션 2: KV cache bridge — caller (execute_layer_graph)는
+            // OpenCL cl_mem KV를 host bytes로 read해서 넘긴다. graph는
+            // rpcmem KV slot을 사용하므로 외부 KV bytes를 graph rpcmem에
+            // sync한 뒤 execute. KvScatter가 새 token을 graph rpcmem에 write,
+            // 종료 시점에 graph rpcmem → caller bytes로 write back하면 caller가
+            // OpenCL cl_mem에 propagate한다.
+            let kv_k_slot = &self.slots[self.idx_kv_k];
+            let kv_v_slot = &self.slots[self.idx_kv_v];
+            ensure!(
+                kv_k_bytes.len() <= kv_k_slot.size,
+                "kv_k_bytes={} > slot.size={}",
+                kv_k_bytes.len(),
+                kv_k_slot.size
+            );
+            ensure!(
+                kv_v_bytes.len() <= kv_v_slot.size,
+                "kv_v_bytes={} > slot.size={}",
+                kv_v_bytes.len(),
+                kv_v_slot.size
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    kv_k_bytes.as_ptr(),
+                    kv_k_slot.host_ptr,
+                    kv_k_bytes.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    kv_v_bytes.as_ptr(),
+                    kv_v_slot.host_ptr,
+                    kv_v_bytes.len(),
                 );
             }
 
@@ -271,20 +310,60 @@ mod android {
                 );
             }
 
+            // D-F 옵션 2: KV write back — KvScatter가 graph rpcmem에 새 token을
+            // append했으니 caller bytes에도 mirror해서 caller가 OpenCL cl_mem에
+            // 반영하게 한다.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    kv_k_slot.host_ptr,
+                    kv_k_bytes.as_mut_ptr(),
+                    kv_k_bytes.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    kv_v_slot.host_ptr,
+                    kv_v_bytes.as_mut_ptr(),
+                    kv_v_bytes.len(),
+                );
+            }
+
             Ok(())
         }
     }
 
-    /// Helper — Tensor에서 raw bytes 추출 (production weight bytes).
-    fn tensor_bytes(t: &Tensor) -> &[u8] {
-        // SAFETY: Tensor::buffer().as_ptr() returns valid host pointer for the
-        // lifetime of the buffer. size() returns the byte count.
-        unsafe { std::slice::from_raw_parts(t.as_ptr(), t.size()) }
-    }
-
-    /// Helper — Tensor f32 bytes (RMS norm weight). Internally same as tensor_bytes.
-    fn tensor_f32_bytes(t: &Tensor) -> &[u8] {
-        tensor_bytes(t)
+    /// Helper — Tensor에서 owned host bytes 추출.
+    ///
+    /// D-F path: weight tensor가 OpenCL secondary로 promote된 경우 buffer는
+    /// `UnifiedBuffer` (CL_MEM_ALLOC_HOST_PTR, unmapped 기본 상태). map → copy →
+    /// unmap으로 host bytes를 안전하게 가져온다. unmap 후 GPU access 정상 복귀
+    /// (production OpenCL forward path에서 cl_mem 사용).
+    ///
+    /// MmapBuffer / SharedBuffer 등 host-resident buffer는 `as_ptr` 직접 read.
+    /// 호출은 graph build 시 1회/weight (28 layer × 7 weight)이라 owned Vec
+    /// 복사 비용 무관.
+    fn tensor_bytes_owned(t: &Tensor) -> Result<Vec<u8>> {
+        let size = t.size();
+        let host_ptr = t.as_ptr();
+        if !host_ptr.is_null() {
+            return Ok(unsafe { std::slice::from_raw_parts(host_ptr, size).to_vec() });
+        }
+        // UnifiedBuffer (Adreno UMA OpenCL alloc): map → copy → unmap.
+        if let Some(ub) = t
+            .buffer()
+            .as_any()
+            .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+        {
+            let mapped = ub.map()?;
+            ensure!(
+                !mapped.is_null(),
+                "UnifiedBuffer.map() returned null (size={size})"
+            );
+            let bytes = unsafe { std::slice::from_raw_parts(mapped, size).to_vec() };
+            ub.unmap()?;
+            return Ok(bytes);
+        }
+        Err(anyhow!(
+            "tensor_bytes_owned: host pointer null and buffer is not UnifiedBuffer (size={size})"
+        ))
     }
 
     /// rpcmem alloc + memRegister 1회. byte_size 단위.
@@ -377,7 +456,7 @@ mod android {
     /// Production GGUF Q4_0 weight (AOS) bytes 추출 + SOA 변환.
     /// `n` = output rows, `k` = input cols.
     fn pack_weight_q4_0(t: &Tensor, n: usize, k: usize) -> Result<(Vec<u8>, Vec<u16>)> {
-        let aos = tensor_bytes(t);
+        let aos = tensor_bytes_owned(t)?;
         let num_blocks = n * k / 32;
         let expected = num_blocks * Q4_0_BLOCK_BYTES;
         ensure!(
@@ -466,8 +545,8 @@ mod android {
         let (qd_q, qd_d) = pack_weight_q4_0(&weights.w_down, dim, ffn_dim)?;
 
         // RMS norm weights — production은 F32 (1D, dim).
-        let rms_pre_bytes = tensor_f32_bytes(&weights.attention_norm);
-        let rms_post_bytes = tensor_f32_bytes(&weights.ffn_norm);
+        let rms_pre_bytes = tensor_bytes_owned(&weights.attention_norm)?;
+        let rms_post_bytes = tensor_bytes_owned(&weights.ffn_norm)?;
 
         // ── 3. rpcmem allocations (per-tensor) ─────────────────────────────
         let bytes_x = dim * 4;
@@ -485,11 +564,11 @@ mod android {
         let idx_x_in = slots.len() - 1;
 
         let slot_rms_pre = alloc_rpcmem_slot(runtime, bytes_rms)?;
-        copy_into_slot(&slot_rms_pre, rms_pre_bytes)?;
+        copy_into_slot(&slot_rms_pre, &rms_pre_bytes)?;
         slots.push(slot_rms_pre);
 
         let slot_rms_post = alloc_rpcmem_slot(runtime, bytes_rms)?;
-        copy_into_slot(&slot_rms_post, rms_post_bytes)?;
+        copy_into_slot(&slot_rms_post, &rms_post_bytes)?;
         slots.push(slot_rms_post);
 
         // 7× (q_bytes, d_halves) — Q4_0 SOA pairs.
@@ -515,9 +594,11 @@ mod android {
         let slot_kc = alloc_rpcmem_slot(runtime, bytes_kv)?;
         unsafe { std::ptr::write_bytes(slot_kc.host_ptr, 0, bytes_kv) };
         slots.push(slot_kc);
+        let idx_kv_k = slots.len() - 1;
         let slot_vc = alloc_rpcmem_slot(runtime, bytes_kv)?;
         unsafe { std::ptr::write_bytes(slot_vc.host_ptr, 0, bytes_kv) };
         slots.push(slot_vc);
+        let idx_kv_v = slots.len() - 1;
 
         // mask / sinks / score / x_out.
         let slot_mask = alloc_rpcmem_slot(runtime, bytes_mask)?;
@@ -1310,6 +1391,8 @@ mod android {
                 exec_outputs,
                 idx_x_in,
                 idx_x_out,
+                idx_kv_k,
+                idx_kv_v,
                 pos_host_ptr,
                 cfg: *cfg,
             },
