@@ -125,9 +125,12 @@ impl TransformerLayer {
         // Runs alongside the legacy profiler so we can compare async dispatch
         // overhead vs sync GPU-execution latency without fighting the existing
         // `--profile` path. Zero overhead when env var unset.
+        // LISWAP-5 (B-2.3): tr_start! 매크로에 OpKind 인자 추가. PhaseHook이
+        // 등록된 경우 op_trace::start_op 가 on_op_start(kind)를 호출.
+        // hook 미등록 시 zero-overhead (atomic load 1회).
         macro_rules! tr_start {
-            () => {
-                crate::profile::op_trace::start()
+            ($kind:ident) => {
+                crate::profile::op_trace::start_op(crate::profile::op_trace::OpKind::$kind)
             };
         }
         macro_rules! tr_record {
@@ -157,7 +160,7 @@ impl TransformerLayer {
         // into a single `fused_norm_merge(x, prev_gpu, prev_staging, attn_norm, ws.residual, x)`
         // call. Residual `x` is updated in-place via the `residual_out` slot.
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(RmsNormAttn);
         // Stage 0: input x (pre-norm) — embedding-time tensor.
         // microbench의 LLMRS_MICROBENCH_X_FILE inject와 비교용.
         let consumed_fused = if partition_fused
@@ -203,7 +206,7 @@ impl TransformerLayer {
 
         // 2. QKV Projections from normalized x (ws.residual) — fused dispatch for F16 CPU
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(MatmulQkv);
         // QKV fused dispatch via `fused_matmul_f16`/`fused_matmul_q4_0` was found
         // to produce garbage decode output for Qwen2.5-1.5b on aarch64
         // (Galaxy S25, both f16 and q4_0 GGUF). The fused functions return
@@ -313,7 +316,7 @@ impl TransformerLayer {
 
         // 3. RoPE
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(Rope);
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
         let n_heads_q = q_dim / head_dim;
@@ -356,7 +359,7 @@ impl TransformerLayer {
 
         // 4. KV Cache Update - cast to target dtype if needed
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(KvUpdate);
         let kv_dtype = kv_cache.kv_dtype();
         use crate::core::kv_cache::KVLayout;
         if kv_dtype == DType::F16 && is_gpu && is_decode && kv_cache.layout() == KVLayout::HeadMajor
@@ -420,7 +423,7 @@ impl TransformerLayer {
 
         // 5. Attention - use GPU kernel for OpenCL
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(Attention);
         let cache_seq_len = kv_cache.current_pos();
 
         // Sliding window attention (Gemma3 local layers):
@@ -1114,7 +1117,7 @@ impl TransformerLayer {
         tr_record!(tr, Attention);
 
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(MatmulWo);
         // Decode wo: GPU-only (partition not applied to attention output in decode).
         set_label("matmul_wo");
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
@@ -1125,7 +1128,7 @@ impl TransformerLayer {
 
         // 7+8. Post-attention residual + pre-FFN norm
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(RmsNormFfn);
         if rms_norm_add_unit {
             // Gemma3: apply post-attention norm (ffn_norm) to attn_out before residual add,
             // then fused add + pre_ffn_norm for FFN input.
@@ -1168,7 +1171,7 @@ impl TransformerLayer {
         // on its own (ffn_hidden - split_col)-wide slice. The layer ends with a
         // single elementwise sum of two [1, 1, hidden] partials.
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(MatmulFfnGateUp);
         let partition_active = self.partition_ctx.is_some() && ws.partition_ws.is_some();
         // SAFETY: `partition_ws` is an `Arc<UnsafeCell<PartitionWorkspace>>`
         // shared with the OpenCL plan path. Both forward_gen and the plan's
@@ -1526,7 +1529,7 @@ impl TransformerLayer {
         if !partition_active {
             if use_gelu_tanh {
                 let t = prof_start!();
-                let tr = tr_start!();
+                let tr = tr_start!(SiluMul);
                 backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
                 prof_record!(t, silu_mul);
                 // Stage 14 (GELU path): gelu_tanh(gate) * up landed in ws.gate
@@ -1534,7 +1537,7 @@ impl TransformerLayer {
             }
 
             let t = prof_start!();
-            let tr = tr_start!();
+            let tr = tr_start!(MatmulFfnDown);
             set_label("matmul_ffn");
             backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
             clear_label();
@@ -1545,7 +1548,7 @@ impl TransformerLayer {
 
         // 10. Residual 2 — accumulate FFN result into x (skip connection)
         let t = prof_start!();
-        let tr = tr_start!();
+        let tr = tr_start!(AddAssign);
         // Gemma3: apply post-FFN norm to FFN output before residual add.
         if let Some(ref pfn) = self.post_ffn_norm {
             backend.rms_norm(&mut ws.down, pfn, rms_norm_eps, true)?;

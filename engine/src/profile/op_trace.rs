@@ -28,9 +28,35 @@
 //! All trace state is process-wide (single decode thread is the common case).
 
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+/// LISWAP-5 phase boundary hook. `op_trace::start_op` / `record`가 OpKind와
+/// 함께 콜백을 호출. 등록은 `set_phase_hook` (process-wide singleton).
+/// hook 미등록 시 zero-overhead (atomic load 1회 + 분기).
+///
+/// PhaseHook은 op_trace.rs에 정의 — phase_aware_swap.rs가 이를 import해서 impl.
+/// 순환 import 방지를 위해 op_trace.rs에 둠.
+pub trait PhaseHook: Send + Sync {
+    /// op 시작 직전 호출. ddr-heavy 진입 시 in-flight chunk 완료 대기.
+    fn on_op_start(&self, kind: OpKind);
+    /// op 끝난 직후 호출. cache-fit 끝났으면 다음 chunk dispatch.
+    fn on_op_end(&self, kind: OpKind);
+}
+
+static PHASE_HOOK: OnceLock<Arc<dyn PhaseHook>> = OnceLock::new();
+
+/// PhaseHook 등록 (process-wide, 한 번만 set 가능). 중복 호출은 silently ignore.
+pub fn set_phase_hook(hook: Arc<dyn PhaseHook>) {
+    let _ = PHASE_HOOK.set(hook);
+}
+
+#[inline]
+fn phase_hook() -> Option<&'static Arc<dyn PhaseHook>> {
+    PHASE_HOOK.get()
+}
 
 /// Trace mode parsed from `LLMRS_FORWARD_GEN_OP_TRACE`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -173,6 +199,17 @@ pub fn start() -> Option<Instant> {
     }
 }
 
+/// Begin timing + phase hook on_op_start. Used by `tr_start!(KIND)` macro.
+/// LISWAP-5: PhaseHook이 등록되어 있으면 `on_op_start(kind)` 호출.
+/// hook 미등록 시 atomic load 1회 + 분기로 끝남.
+#[inline]
+pub fn start_op(kind: OpKind) -> Option<Instant> {
+    if let Some(hook) = phase_hook() {
+        hook.on_op_start(kind);
+    }
+    start()
+}
+
 /// Finish timing an op bucket. In `Sync` mode runs `backend.synchronize()`
 /// before sampling the elapsed time so the measurement reflects GPU-execution
 /// latency. In `Async` mode the elapsed time captures host dispatch overhead
@@ -184,6 +221,11 @@ pub fn record(
     backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
     is_gpu: bool,
 ) {
+    // LISWAP-5 PhaseHook은 trace mode 무관하게 fire (PHASE_HOOK 등록 시).
+    // trace 측정은 t=None이면 skip.
+    if let Some(hook) = phase_hook() {
+        hook.on_op_end(op);
+    }
     let Some(start) = t else {
         return;
     };
