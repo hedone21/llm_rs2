@@ -765,6 +765,57 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// LISWAP-6 — DMA-BUF alias buffer for swap path (Adreno + qnn_oppkg).
+    ///
+    /// Backends with rpcmem heap interop (`qnn_oppkg`) — and the OpenCL
+    /// backend on Adreno — can convert a host-mapped pointer (returned by
+    /// `RpcmemSecondaryStore::host_ptr_for`) into a `cl_mem` alias via
+    /// `CL_MEM_USE_HOST_PTR`, eliminating the `clEnqueueWriteBuffer` H2D copy
+    /// during weight swap. The returned buffer holds the supplied lifetime
+    /// guards (`secondary_arc` + `layer_region`) so the rpcmem allocation
+    /// remains valid until every alias is dropped.
+    ///
+    /// # Parameters
+    /// - `host_ptr`: Base host pointer of the rpcmem region.
+    /// - `offset`: Byte offset within the region where the tensor starts.
+    /// - `size`: Tensor byte length.
+    /// - `dtype`: Tensor dtype.
+    /// - `secondary_arc`: Lifetime guard 1 — keeps the `RpcmemSecondaryStore`
+    ///   (and thus its region map) alive.
+    /// - `layer_region`: Lifetime guard 2 — pins this layer's rpcmem allocation.
+    ///
+    /// # Returns
+    /// - `Ok(None)` (default) — backend does not support alias path; caller
+    ///   falls back to the standard mmap+memcpy materialisation.
+    /// - `Ok(Some(buf))` — alias `cl_mem` created with both guards installed.
+    #[allow(unused_variables)]
+    #[cfg(feature = "opencl")]
+    fn alloc_alias_weight_buffer(
+        &self,
+        host_ptr: *mut u8,
+        offset: usize,
+        size: usize,
+        dtype: DType,
+        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
+        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+        Ok(None)
+    }
+
+    #[allow(unused_variables)]
+    #[cfg(not(feature = "opencl"))]
+    fn alloc_alias_weight_buffer(
+        &self,
+        host_ptr: *mut u8,
+        offset: usize,
+        size: usize,
+        dtype: DType,
+        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
+        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+        Ok(None)
+    }
+
     /// 14-node layer graph fast path (qnn_oppkg backend 등). Default false.
     ///
     /// QNN OpPackage M3 (ENG-QNN-211/INV-174): 본 method가 true를 반환하는

@@ -1066,6 +1066,8 @@ impl<'a> SwapExecutor<'a> {
 
         let data = secondary.tensor_bytes(info);
         let canonical_name = format!("blk.{layer_idx}.{subname}");
+        let needs_unpermute = secondary.needs_qk_unpermute_at_swap()
+            && qk_permute_shape(&canonical_name, self.config).is_some();
         let permuted_bytes: Option<Vec<u8>> = if secondary.needs_qk_unpermute_at_swap() {
             if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, self.config) {
                 let total_rows = shape.dims()[0];
@@ -1087,6 +1089,22 @@ impl<'a> SwapExecutor<'a> {
             None
         };
 
+        // ── LISWAP-6 alias fast path ────────────────────────────────────────
+        // Rpcmem variant + no qk-unpermute → backend may produce a cl_mem
+        // alias on top of the rpcmem region, eliminating the H2D copy.
+        // Falls back to the standard borrowed/permuted path if either
+        //   (a) the alias allocation fails, or
+        //   (b) the backend lacks alias support.
+        #[cfg(feature = "opencl")]
+        if !needs_unpermute
+            && let Some(t) =
+                self.try_alias_materialise(secondary, layer_idx, subname, info, &shape)?
+        {
+            return Ok(t);
+        }
+        #[cfg(not(feature = "opencl"))]
+        let _ = needs_unpermute;
+
         let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
             Arc::new(SharedBuffer::from_vec(owned, info.dtype))
         } else {
@@ -1100,6 +1118,59 @@ impl<'a> SwapExecutor<'a> {
         let cpu_backend: Arc<dyn Backend> =
             Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
         Ok(Tensor::new(shape, cpu_buf, cpu_backend))
+    }
+
+    /// LISWAP-6 — try to build a `RpcmemAliasBuffer`-backed tensor for this
+    /// (layer, subname) combination. Returns `Ok(None)` if any precondition
+    /// fails (secondary not Rpcmem, backend doesn't support alias, alloc
+    /// returns None). Caller handles the fallback path.
+    #[cfg(feature = "opencl")]
+    fn try_alias_materialise(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        layer_idx: usize,
+        subname: &str,
+        info: &crate::models::weights::secondary_mmap::SecondaryTensorInfo,
+        shape: &crate::core::shape::Shape,
+    ) -> Result<Option<Tensor>, SwapError> {
+        // Only the Rpcmem variant carries a per-layer rpcmem region.
+        let SecondaryMmap::Rpcmem(rpc) = secondary.as_ref() else {
+            return Ok(None);
+        };
+        let entry = rpc.host_ptr_for(layer_idx, subname).map_err(|e| {
+            SwapError::BufferAllocationFailed {
+                layer: layer_idx,
+                source: e,
+            }
+        })?;
+        let Some(alias) = entry else {
+            return Ok(None);
+        };
+        debug_assert_eq!(alias.len, info.len, "rpcmem region length mismatch");
+        debug_assert_eq!(alias.dtype, info.dtype, "rpcmem region dtype mismatch");
+
+        let buf = self
+            .backend
+            .alloc_alias_weight_buffer(
+                alias.host_ptr,
+                alias.offset,
+                alias.len,
+                alias.dtype,
+                Arc::clone(secondary),
+                alias.region,
+            )
+            .map_err(|e| SwapError::BufferAllocationFailed {
+                layer: layer_idx,
+                source: e,
+            })?;
+        let Some(alias_buf) = buf else {
+            return Ok(None);
+        };
+        Ok(Some(Tensor::new(
+            shape.clone(),
+            alias_buf,
+            Arc::clone(&self.backend),
+        )))
     }
 
     /// Dispatch a swap-target *weight* tensor through the right materialise
@@ -1299,6 +1370,8 @@ impl<'a> SwapExecutor<'a> {
         // observed regression: 2026-05-01).
         let t_permute = if prof { Some(Instant::now()) } else { None };
         let canonical_name = format!("blk.{layer_idx}.{subname}");
+        let needs_unpermute = secondary.needs_qk_unpermute_at_swap()
+            && qk_permute_shape(&canonical_name, self.config).is_some();
         let permuted_bytes: Option<Vec<u8>> = if secondary.needs_qk_unpermute_at_swap() {
             if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, self.config) {
                 let total_rows = shape.dims()[0];
@@ -1321,6 +1394,41 @@ impl<'a> SwapExecutor<'a> {
             None
         };
         let us_permute = t_permute.map(|t| t.elapsed().as_micros() as f64 / 1.0);
+
+        // ── LISWAP-6 alias fast path (qk-unpermute 미발생 시) ───────────────
+        // Rpcmem variant 가 alias-capable backend 와 결합되었을 때 H2D copy
+        // 자체를 제거. needs_unpermute=true (Llama Q/K) 이거나 backend 미지원
+        // 이면 알아서 standard path 로 fall through.
+        let is_cpu_backend_early = self.backend.name().contains("CPU");
+        #[cfg(feature = "opencl")]
+        if !needs_unpermute
+            && !is_cpu_backend_early
+            && let Some(t) =
+                self.try_alias_materialise(secondary, layer_idx, subname, info, &shape)?
+        {
+            // Emit profiling line so the alias path is visible in
+            // `LLMRS_SWAP_PROFILE_BREAKDOWN=1` traces.
+            if let Some(t_tot) = t_total {
+                let us_total = t_tot.elapsed().as_micros() as f64;
+                eprintln!(
+                    "[swap-prof] layer={} sub={} is_weight={} size={} \
+                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
+                     wrap=0.0 cpu=0.0 upload=0.0 total={:.1} source=rpcmem-alias",
+                    layer_idx,
+                    subname,
+                    is_weight as u8,
+                    tensor_size,
+                    us_lookup.unwrap_or(0.0),
+                    us_dim.unwrap_or(0.0),
+                    us_bytes.unwrap_or(0.0),
+                    us_permute.unwrap_or(0.0),
+                    us_total,
+                );
+            }
+            return Ok(t);
+        }
+        #[cfg(not(feature = "opencl"))]
+        let _ = (needs_unpermute, is_cpu_backend_early);
 
         // ── sub-stage: wrap ─────────────────────────────────────────────────
         // ENG-ALG-227: When no permutation is needed (AUF path), borrow the

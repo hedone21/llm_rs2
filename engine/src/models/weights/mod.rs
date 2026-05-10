@@ -16,6 +16,7 @@ pub mod intra_forward_swap;
 pub mod noise_table;
 pub mod phase_aware_swap;
 pub mod release_worker;
+pub mod rpcmem_secondary;
 pub mod secondary_mmap;
 pub mod slot;
 pub mod swap_executor;
@@ -32,7 +33,7 @@ pub use release_worker::PrimaryReleaseWorker;
 pub use secondary_mmap::{
     LayerTensorSlice, LoadError, SecondaryDtypeChoice, SecondaryLayoutChoice, SecondaryMmap,
     SecondaryTensorInfo, build_auf_secondary_from_view, open_secondary, open_secondary_auf,
-    open_secondary_with_dtype, open_secondary_with_options,
+    open_secondary_with_backend, open_secondary_with_dtype, open_secondary_with_options,
 };
 pub use slot::{LayerSlot, LayerWeights};
 pub use swap_executor::{

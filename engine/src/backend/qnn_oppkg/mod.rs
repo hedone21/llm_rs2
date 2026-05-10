@@ -597,6 +597,36 @@ impl Backend for QnnOppkgBackend {
         })
     }
 
+    /// LISWAP-6 — delegate alias buffer creation to the OpenCL secondary
+    /// backend. `qnn_oppkg` shares the OpenCL context with its secondary
+    /// (`with_opencl_secondary`), so the alias `cl_mem` lives in the same
+    /// context the production swap path uses.
+    #[cfg(feature = "opencl")]
+    fn alloc_alias_weight_buffer(
+        &self,
+        host_ptr: *mut u8,
+        offset: usize,
+        size: usize,
+        dtype: crate::core::buffer::DType,
+        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
+        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+        let res = self.with_opencl_secondary(|ocl| {
+            ocl.alloc_alias_weight_buffer(
+                host_ptr,
+                offset,
+                size,
+                dtype,
+                secondary_arc.clone(),
+                layer_region.clone(),
+            )
+        });
+        match res {
+            Some(r) => r,
+            None => Ok(None), // OpenCL secondary unset → caller falls back
+        }
+    }
+
     fn kv_scatter_f32_to_f16(
         &self,
         k_src: &Tensor,

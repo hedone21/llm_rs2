@@ -223,7 +223,7 @@ impl TransformerModel {
     ) -> Result<Self> {
         use crate::models::loader::TensorSource;
         use crate::models::loader::gguf::GgufSource;
-        use crate::models::weights::open_secondary_with_options;
+        use crate::models::weights::open_secondary_with_backend;
 
         let primary_path = config
             .primary_source
@@ -236,12 +236,17 @@ impl TransformerModel {
             Some(p) => {
                 let gguf = source.gguf_file();
                 let model_config = source.config();
-                let handle = open_secondary_with_options(
+                // LISWAP-6: backend-aware open. When `backend` is qnn_oppkg
+                // and the secondary is GGUF, this returns the Rpcmem variant
+                // for DMA-BUF alias swap (zero H2D copy). All other backend
+                // / format combinations dispatch to the standard path.
+                let handle = open_secondary_with_backend(
                     p,
                     model_config,
                     gguf,
                     config.secondary_dtype_choice,
                     config.secondary_layout_choice,
+                    &backend,
                 )
                 .map_err(|e| anyhow!("secondary weight load failed: {e}"))?;
                 Some(Arc::new(handle))

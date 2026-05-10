@@ -408,6 +408,11 @@ pub enum SecondaryMmap {
     Gguf(GgufSecondaryMmap),
     /// AUF-backed secondary (new path, ENG-DAT-096).
     Auf(AufSecondaryMmap),
+    /// rpcmem heap–backed secondary for `qnn_oppkg` backend (LISWAP-6).
+    /// Lazy per-layer DMA-BUF alloc + OpenCL `CL_MEM_USE_HOST_PTR` alias on
+    /// swap path eliminates the H2D copy. GGUF-format on disk; the same
+    /// `qk_unpermute` and `is_pre_converted_soa=false` semantics apply.
+    Rpcmem(crate::models::weights::rpcmem_secondary::RpcmemSecondaryStore),
 }
 
 impl std::fmt::Debug for SecondaryMmap {
@@ -415,6 +420,7 @@ impl std::fmt::Debug for SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(g) => f.debug_tuple("SecondaryMmap::Gguf").field(g).finish(),
             SecondaryMmap::Auf(a) => f.debug_tuple("SecondaryMmap::Auf").field(a).finish(),
+            SecondaryMmap::Rpcmem(r) => f.debug_tuple("SecondaryMmap::Rpcmem").field(r).finish(),
         }
     }
 }
@@ -426,6 +432,7 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(g) => g.layer_tensor(layer_idx, subname),
             SecondaryMmap::Auf(a) => a.layer_tensor(layer_idx, subname),
+            SecondaryMmap::Rpcmem(r) => r.layer_tensor(layer_idx, subname),
         }
     }
 
@@ -435,6 +442,7 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(g) => g.tensor_bytes(info),
             SecondaryMmap::Auf(a) => a.tensor_bytes(info),
+            SecondaryMmap::Rpcmem(r) => r.tensor_bytes(info),
         }
     }
 
@@ -443,6 +451,7 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(g) => &g.source_path,
             SecondaryMmap::Auf(a) => &a.source_path,
+            SecondaryMmap::Rpcmem(r) => r.source_path(),
         }
     }
 
@@ -455,6 +464,9 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(_) => false,
             SecondaryMmap::Auf(a) => a.is_pre_converted_soa,
+            // LISWAP-6 Rpcmem inherits GGUF semantics (AoS Q4_0 is intentional —
+            // CPU-GPU concurrent operation requires AoS layout, postmortem §6.5).
+            SecondaryMmap::Rpcmem(_) => false,
         }
     }
 
@@ -477,6 +489,8 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(_) => true,
             SecondaryMmap::Auf(_) => false,
+            // GGUF on disk → unpermute required for Llama Q/K. Qwen unaffected.
+            SecondaryMmap::Rpcmem(_) => true,
         }
     }
 
@@ -507,6 +521,11 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Auf(a) => a.prefault(),
             SecondaryMmap::Gguf(g) => g.prefault(),
+            // Rpcmem variant: full prefault is a no-op (touching every page
+            // would force-allocate every layer up-front, defeating the lazy
+            // policy). Use `prefault_layers(target_layers)` to selectively
+            // warm specific layers.
+            SecondaryMmap::Rpcmem(_) => {}
         }
     }
 
@@ -528,6 +547,9 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Auf(a) => a.prefault_layers(target_layers),
             SecondaryMmap::Gguf(g) => g.prefault_layers(target_layers),
+            // Rpcmem: force-allocate the listed layers' regions so the first
+            // swap of each layer hits the cache (no first-touch alloc cost).
+            SecondaryMmap::Rpcmem(r) => r.prefault_layers(target_layers),
         }
     }
 
@@ -634,6 +656,106 @@ pub fn open_secondary_with_options(
         )
     } else {
         open_secondary_gguf(path, primary_config, primary_gguf)
+    }
+}
+
+/// LISWAP-6 — backend-aware variant of `open_secondary_with_options`.
+///
+/// When `backend` reports the `qnn_oppkg` family AND the secondary file is
+/// GGUF, this constructor returns a `SecondaryMmap::Rpcmem` variant that
+/// participates in the DMA-BUF alias swap path (zero-H2D-copy weight swap).
+/// All other combinations dispatch to the standard GGUF / AUF paths so
+/// behaviour for non-`qnn_oppkg` backends is unchanged.
+///
+/// On rpcmem construction failure (Android-only path / runtime not ready /
+/// rpcmem alloc rejected at metadata-validation), the function gracefully
+/// falls back to `open_secondary_with_options` so production never loses the
+/// baseline swap path because of an alias-allocator hiccup.
+pub fn open_secondary_with_backend(
+    path: &Path,
+    primary_config: &ModelConfig,
+    primary_gguf: &GgufFile,
+    secondary_dtype_choice: SecondaryDtypeChoice,
+    secondary_layout_choice: SecondaryLayoutChoice,
+    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+) -> Result<SecondaryMmap, LoadError> {
+    // AUF or non-rpcmem backend → standard path.
+    if is_auf_path(path) || !backend_supports_rpcmem_secondary(backend) {
+        return open_secondary_with_options(
+            path,
+            primary_config,
+            primary_gguf,
+            secondary_dtype_choice,
+            secondary_layout_choice,
+        );
+    }
+    // qnn_oppkg + GGUF → try Rpcmem; fall back to standard GGUF on any error.
+    match try_open_rpcmem_secondary(path, primary_config, primary_gguf, backend) {
+        Ok(handle) => Ok(handle),
+        Err(e) => {
+            eprintln!(
+                "[liswap6] rpcmem secondary unavailable for '{}': {e} — falling back to standard GGUF path",
+                path.display()
+            );
+            open_secondary_gguf(path, primary_config, primary_gguf)
+        }
+    }
+}
+
+/// Returns true when `backend` is the `qnn_oppkg` family (M3 GPU OpPackage)
+/// — the only backend that exposes the rpcmem heap required for the alias
+/// path. Detected via `Backend::name()` to avoid feature-gate gymnastics on
+/// the trait object.
+fn backend_supports_rpcmem_secondary(
+    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+) -> bool {
+    let name = backend.name();
+    name.contains("QNN OpPackage") || name.contains("qnn_oppkg")
+}
+
+/// Try to construct a `SecondaryMmap::Rpcmem` for `qnn_oppkg`. Errors
+/// surface as a generic `LoadError::SecondaryUnavailable` so the caller's
+/// fallback is uniform.
+fn try_open_rpcmem_secondary(
+    path: &Path,
+    primary_config: &ModelConfig,
+    primary_gguf: &GgufFile,
+    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+) -> Result<SecondaryMmap, LoadError> {
+    #[cfg(all(feature = "qnn", target_os = "android"))]
+    {
+        let qnn = backend
+            .as_any()
+            .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>()
+            .ok_or_else(|| LoadError::SecondaryUnavailable {
+                path: path.to_path_buf(),
+                source: anyhow::anyhow!(
+                    "rpcmem secondary: backend name claims qnn_oppkg but downcast failed"
+                ),
+            })?;
+        let runtime = qnn.runtime_arc();
+        let rpcmem_fns = runtime.rpcmem_fns();
+        let store = crate::models::weights::rpcmem_secondary::RpcmemSecondaryStore::from_gguf(
+            path,
+            primary_config,
+            primary_gguf,
+            (rpcmem_fns.0, rpcmem_fns.1),
+        )
+        .map_err(|e| LoadError::SecondaryUnavailable {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        Ok(SecondaryMmap::Rpcmem(store))
+    }
+    #[cfg(not(all(feature = "qnn", target_os = "android")))]
+    {
+        let _ = (path, primary_config, primary_gguf, backend);
+        Err(LoadError::SecondaryUnavailable {
+            path: path.to_path_buf(),
+            source: anyhow::anyhow!(
+                "rpcmem secondary requires Android + qnn feature; falling back to GGUF"
+            ),
+        })
     }
 }
 
@@ -1214,7 +1336,7 @@ fn check_auf_metadata(
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Extract `(layer_idx, subname)` from `blk.<N>.<subname>` tensor names.
-fn parse_block_tensor_name(name: &str) -> Option<(usize, &str)> {
+pub(crate) fn parse_block_tensor_name(name: &str) -> Option<(usize, &str)> {
     let rest = name.strip_prefix("blk.")?;
     let dot = rest.find('.')?;
     let idx: usize = rest[..dot].parse().ok()?;
@@ -1309,6 +1431,11 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(g) => Some(&g.gguf),
             SecondaryMmap::Auf(_) => None,
+            // Rpcmem variant carries its own private GgufFile (mmap kept alive
+            // for memcpy source). Not exposed here since callers using
+            // `as_gguf_file()` are GGUF-shape-validation paths that have
+            // already validated against the primary.
+            SecondaryMmap::Rpcmem(_) => None,
         }
     }
 
@@ -1320,6 +1447,7 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(_) => None,
             SecondaryMmap::Auf(a) => Some(&a.view),
+            SecondaryMmap::Rpcmem(_) => None,
         }
     }
 }

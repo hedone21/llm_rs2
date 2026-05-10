@@ -5276,6 +5276,58 @@ impl Backend for OpenCLBackend {
         self.ensure_noshuffle_soa_registered(tensor)
     }
 
+    /// LISWAP-6 — DMA-BUF alias `cl_mem` for swapped weights.
+    ///
+    /// Wraps `host_ptr + offset` in a `CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY`
+    /// alias. The returned `RpcmemAliasBuffer` holds the supplied lifetime
+    /// guards (`secondary_arc` + `layer_region`) so the underlying rpcmem
+    /// allocation remains valid until every alias is dropped (Drop ordering:
+    /// cl_mem → Arc<SecondaryMmap> → Arc<RpcmemLayerRegion> → rpcmem_free).
+    ///
+    /// Rejects `size == 0` (invalid alias); rejects null `host_ptr`.
+    fn alloc_alias_weight_buffer(
+        &self,
+        host_ptr: *mut u8,
+        offset: usize,
+        size: usize,
+        dtype: DType,
+        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
+        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+        if size == 0 || host_ptr.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: `host_ptr + offset .. + size` lies within a region the
+        // caller pins via `layer_region`. The `CL_MEM_USE_HOST_PTR` contract
+        // requires the host memory to remain valid for the cl_mem's lifetime;
+        // the lifetime guards installed in `RpcmemAliasBuffer` enforce this.
+        let aliased_ptr = unsafe { host_ptr.add(offset) };
+        let host_slice = unsafe { std::slice::from_raw_parts_mut(aliased_ptr, size) };
+        let cl_buffer = unsafe {
+            ocl::core::create_buffer(
+                self.context.as_core(),
+                ocl::core::MEM_READ_ONLY | ocl::core::MEM_USE_HOST_PTR,
+                size,
+                Some(host_slice),
+            )
+        }
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "alloc_alias_weight_buffer: clCreateBuffer USE_HOST_PTR failed (size={size}): {e}"
+            )
+        })?;
+
+        let alias = crate::buffer::rpcmem_alias_buffer::RpcmemAliasBuffer::new(
+            cl_buffer,
+            aliased_ptr,
+            size,
+            dtype,
+            secondary_arc,
+            layer_region,
+        );
+        Ok(Some(std::sync::Arc::new(alias)))
+    }
+
     fn flash_attention_prefill(
         &self,
         q: &Tensor,
