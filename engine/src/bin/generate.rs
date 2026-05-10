@@ -1869,6 +1869,42 @@ fn main() -> anyhow::Result<()> {
     eprintln!("[Tokenizer] {}", tokenizer_path);
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Cannot load tokenizer from {}: {}", tokenizer_path, e))?;
+    {
+        // Vocab-size mismatch는 거의 항상 wrong-tokenizer-for-model bug
+        // (예: Qwen 모델 + Llama tokenizer → decoding garbage). 자동 fallback이
+        // sibling tokenizer를 잘못 잡거나 share된 tokenizer.json이 다른 family인
+        // 경우를 silent failure로 두지 말 것.
+        //
+        // tokenizer > model: OOB embedding lookup → 즉시 error.
+        // tokenizer < model: model vocab이 padding으로 round-up된 경우 정상
+        //   (Qwen2.5 1.5B: trained=151665, padded=151936). 5% 또는 256 이상
+        //   격차만 error로 차단.
+        let tok_vocab = tokenizer.get_vocab_size(true);
+        let model_vocab = model.config.vocab_size;
+        if tok_vocab > model_vocab {
+            anyhow::bail!(
+                "Tokenizer vocab ({}) exceeds model vocab ({}) — OOB embedding lookup. \
+                 Path: {}. Pass --tokenizer-path with the matching tokenizer.json.",
+                tok_vocab,
+                model_vocab,
+                tokenizer_path
+            );
+        }
+        let pad_tolerance = (model_vocab / 20).max(256);
+        let pad_gap = model_vocab - tok_vocab;
+        if pad_gap > pad_tolerance {
+            anyhow::bail!(
+                "Tokenizer vocab too small: model={} tokenizer={} (gap={} > {} padding tolerance). \
+                 Likely wrong tokenizer for this model. Path: {}. \
+                 Pass --tokenizer-path with the matching tokenizer.json.",
+                model_vocab,
+                tok_vocab,
+                pad_gap,
+                pad_tolerance,
+                tokenizer_path
+            );
+        }
+    }
 
     // 3. Prompt
     let prompt = if let Some(path) = &args.prompt_file {
