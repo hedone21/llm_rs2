@@ -334,15 +334,11 @@ mod android {
             // D-D.6 디버깅: pos=0에서 in/out rpcmem byte를 dump해서 microbench
             // (직접 graphExecute, baked rpcmem)와 비교 — `lg.execute` wrap 자체가
             // 결과를 변형하는지 확인.
-            if pos == 0
-                && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
-            {
-                let in_f32 = unsafe {
-                    std::slice::from_raw_parts(in_slot.host_ptr as *const f32, 8)
-                };
-                let out_f32 = unsafe {
-                    std::slice::from_raw_parts(out_slot.host_ptr as *const f32, 8)
-                };
+            if pos == 0 && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1") {
+                let in_f32 =
+                    unsafe { std::slice::from_raw_parts(in_slot.host_ptr as *const f32, 8) };
+                let out_f32 =
+                    unsafe { std::slice::from_raw_parts(out_slot.host_ptr as *const f32, 8) };
                 eprintln!(
                     "[lg.execute pos=0 n_kv={n_kv}] in_slot[0..8]={:?} out_slot[0..8]={:?}",
                     in_f32, out_f32
@@ -597,9 +593,7 @@ mod android {
         let (qu_q, qu_d) = pack_weight_q4_0(&weights.w_up, ffn_dim, dim)?;
         let (qd_q, qd_d) = pack_weight_q4_0(&weights.w_down, dim, ffn_dim)?;
         // D-D.6 디버깅: layer 0 weight bytes hash dump (FAST_PATH_DUMP 시).
-        if layer_idx == 0
-            && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
-        {
+        if layer_idx == 0 && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1") {
             let aos = tensor_bytes_owned(&weights.wq)?;
             eprintln!(
                 "[graph-build layer=0 wq] aos.len={}, aos[0..16]={:02x?} qq_q.len={} qq_q[0..16]={:02x?} qq_d[0..4]={:?}",
@@ -1257,7 +1251,9 @@ mod android {
         let mut in_kvs = [t_k_rope, t_v_biased, t_pos];
         let mut out_kvs = [t_kcache, t_vcache];
         // D-D.6: FlashAttn input은 (q, k, v, mask, sinks, score, n_kv_buf) 7개.
-        let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score, t_n_kv];
+        let mut in_fa = [
+            t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score, t_n_kv,
+        ];
         let mut out_fa = [t_attn_o];
         let mut in_o_proj = [t_oq, t_od, t_attn_o];
         let mut out_o_proj = [t_o];

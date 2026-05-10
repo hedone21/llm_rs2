@@ -195,13 +195,8 @@ fn android_init() -> Result<Arc<QnnOppkgRuntime>> {
     if std::env::var("LLMRS_QNN_OPPKG_VERBOSE_LOG").as_deref() == Ok("1")
         && let Some(log_create) = v.logCreate
     {
-        let err = unsafe {
-            log_create(
-                None,
-                ffi::QnnLog_Level_t_QNN_LOG_LEVEL_VERBOSE,
-                &mut logger,
-            )
-        };
+        let err =
+            unsafe { log_create(None, ffi::QnnLog_Level_t_QNN_LOG_LEVEL_VERBOSE, &mut logger) };
         if err != 0 {
             eprintln!(
                 "[qnn_oppkg] logCreate VERBOSE err=0x{:x} (proceeding without logger)",

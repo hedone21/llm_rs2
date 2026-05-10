@@ -148,19 +148,12 @@ impl TransformerLayer {
         macro_rules! dump_stage {
             ($n:literal, $tensor:expr) => {
                 if args.layer_idx == 0 && start_pos > 0 {
-                    if let Ok(prefix) =
-                        std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_PREFIX")
-                    {
+                    if let Ok(prefix) = std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_PREFIX") {
                         let mut bytes = vec![0u8; $tensor.size()];
                         if backend.read_buffer($tensor, &mut bytes).is_ok() {
                             let path = format!("{}.stage{}", prefix, $n);
                             let _ = std::fs::write(&path, &bytes);
-                            eprintln!(
-                                "[fallback-dump-s{}] {} bytes -> {}",
-                                $n,
-                                bytes.len(),
-                                path
-                            );
+                            eprintln!("[fallback-dump-s{}] {} bytes -> {}", $n, bytes.len(), path);
                         }
                     }
                 }

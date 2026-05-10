@@ -132,10 +132,10 @@ impl TransformerLayer {
                 // D-D.6 디버깅: layer 0 첫 decode (start_pos > 0) RMS 결과 dump.
                 // forward_prefill은 in-place RMS이므로 x가 갱신된 상태.
                 if layer_idx == 0 && start_pos > 0 && seq_len == 1 {
-                    eprintln!("[forward_prefill entered] layer=0 pos={start_pos} seq_len={seq_len}");
-                    if let Ok(p) =
-                        std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_RMS_OUT")
-                    {
+                    eprintln!(
+                        "[forward_prefill entered] layer=0 pos={start_pos} seq_len={seq_len}"
+                    );
+                    if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_RMS_OUT") {
                         let mut bytes = vec![0u8; x.size()];
                         let _ = backend.read_buffer(x, &mut bytes);
                         let _ = std::fs::write(&p, &bytes);

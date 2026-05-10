@@ -830,32 +830,30 @@ fn run_layer(
     // Stages 2-4: Q/K/V projection (M=1).
     // D-D.6 Phase A.5: Q/K/V matmul 직후 bias add (Qwen2.5 attention bias).
     // dump_stage_mb!(N) 위치는 forward_gen와 동일하게 pre-bias로 유지.
-    let dispatch_bias = |bias_buf: &ocl::core::Mem,
-                         x_buf: &ocl::core::Mem,
-                         total: usize|
-     -> anyhow::Result<()> {
-        let total_i = total as i32;
-        let dim_i = total as i32;
-        ocl::core::set_kernel_arg(k_bias, 0, ArgVal::mem(x_buf))?;
-        ocl::core::set_kernel_arg(k_bias, 1, ArgVal::mem(bias_buf))?;
-        ocl::core::set_kernel_arg(k_bias, 2, ArgVal::scalar(&dim_i))?;
-        ocl::core::set_kernel_arg(k_bias, 3, ArgVal::scalar(&total_i))?;
-        let global = [total, 1, 1];
-        unsafe {
-            ocl::core::enqueue_kernel(
-                cl_q,
-                k_bias,
-                1,
-                None,
-                &global,
-                None,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
-        }
-        ocl::core::finish(cl_q)?;
-        Ok(())
-    };
+    let dispatch_bias =
+        |bias_buf: &ocl::core::Mem, x_buf: &ocl::core::Mem, total: usize| -> anyhow::Result<()> {
+            let total_i = total as i32;
+            let dim_i = total as i32;
+            ocl::core::set_kernel_arg(k_bias, 0, ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(k_bias, 1, ArgVal::mem(bias_buf))?;
+            ocl::core::set_kernel_arg(k_bias, 2, ArgVal::scalar(&dim_i))?;
+            ocl::core::set_kernel_arg(k_bias, 3, ArgVal::scalar(&total_i))?;
+            let global = [total, 1, 1];
+            unsafe {
+                ocl::core::enqueue_kernel(
+                    cl_q,
+                    k_bias,
+                    1,
+                    None,
+                    &global,
+                    None,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+            ocl::core::finish(cl_q)?;
+            Ok(())
+        };
     dispatch_q40(k_q40, &buf_qq, &buf_qd, &buf_y1, &buf_q, 1, q_proj_out, dim)?;
     dump_stage_mb!(2, &buf_q, q_proj_out * 4);
     dispatch_bias(&buf_q_bias, &buf_q, q_proj_out)?;

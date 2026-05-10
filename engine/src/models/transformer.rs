@@ -1727,18 +1727,24 @@ impl TransformerModel {
                     // start_pos + 1 == cache_seq_len 갱신 후 길이.
                     let n_kv = start_pos + seq_len;
                     backend.execute_layer_graph(
-                        i, &x, k_buf, v_buf, start_pos, n_kv, &mut x_next,
+                        i,
+                        &x,
+                        k_buf,
+                        v_buf,
+                        start_pos,
+                        n_kv,
+                        &mut x_next,
                     )?;
                     x = x_next;
                     // KV cache pos는 graph 내부에서 갱신되었으므로 caller도 동기화.
                     kv_caches[i].advance_pos(seq_len);
                 } else {
                     // D-D.6 디버깅: layer 0 첫 호출 fallback x_in dump.
-                    let dump_fb =
-                        std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
-                            && i == 0
-                            && start_pos < 16
-                            && seq_len == 1;
+                    let dump_fb = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref()
+                        == Ok("1")
+                        && i == 0
+                        && start_pos < 16
+                        && seq_len == 1;
                     if dump_fb {
                         let mut bytes = vec![0u8; x.size()];
                         let _ = backend.read_buffer(&x, &mut bytes);

@@ -201,9 +201,7 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
     let mut n_kv_total: u32 = 1;
     for i in 0..n_kv_t.rank {
         let d = unsafe { *n_kv_t.dimensions.add(i as usize) };
-        n_kv_total = n_kv_total
-            .checked_mul(d)
-            .ok_or(OpError::InvalidArgument)?;
+        n_kv_total = n_kv_total.checked_mul(d).ok_or(OpError::InvalidArgument)?;
     }
     if n_kv_total != 1 {
         return Err(OpError::InvalidArgument);
