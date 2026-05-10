@@ -172,6 +172,25 @@ export ADSP_LIBRARY_PATH=/data/local/tmp/qnn
 
 **LISWAP-6 alias path는 swap stall 단축만 의미 있음**. weight access 가속 가설은 outlier 기반.
 
+### 4.4b Per-token level 패턴 (추가 finding)
+
+5 run 모두 일관 패턴:
+```
+tok[0]: 9.0~14.2 ms    (warmup, swap 직후 첫 forward — alias buffer 초기화)
+tok[1]: 3.90~4.86 ms   ← 일관 매우 빠름 (alias 효과 한 번)
+tok[2~28]: 10.10~12.97 ms  (steady state, baseline 수준)
+```
+
+**핵심**: **tok[1] 만 일관 ~4 ms** (5 run 모두). 나머지는 baseline.
+
+→ Alias 자체는 진짜로 weight access를 빠르게 함 (tok[1] = 4 ms, baseline 10.78 ms 의 37%). 단 **GPU clock state가 매번 그 효과 sustain 못 함**. tok[2부터 baseline 회복.
+
+이전 "tail 3 ms" outlier 가설:
+- 측정 시점 GPU clock 매우 high state 유지 → 모든 forward가 alias fast path 지속
+- 후속 측정에서 normal state → tok[1]만 fast, 이후 회복 (현재 일관 패턴)
+
+→ **bimodal이 아니라 "all-tokens-fast outlier vs normal pattern"**. all-tokens-fast는 GPU clock state 우연.
+
 ### 4.5 per-tick=25 vs per-tick=1 의미 (수정)
 
 forward_ms 측정 위치 분석 (`generate.rs:5683` vs `:5691`):
