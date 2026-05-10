@@ -26,8 +26,8 @@ pub use incremental_plan::IncrementalSwapPlan;
 pub use intra_forward_swap::{
     IntraForwardSwapHook, IntraForwardSwapPlan, LayerBoundaryHook, NoOpHook,
 };
-pub use phase_aware_swap::{PhaseAwareSwapDispatcher, WeightChunk};
 pub use noise_table::QuantNoiseTable;
+pub use phase_aware_swap::{PhaseAwareSwapDispatcher, WeightChunk};
 pub use release_worker::PrimaryReleaseWorker;
 pub use secondary_mmap::{
     LayerTensorSlice, LoadError, SecondaryDtypeChoice, SecondaryLayoutChoice, SecondaryMmap,

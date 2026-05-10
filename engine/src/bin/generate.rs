@@ -1924,7 +1924,9 @@ fn main() -> anyhow::Result<()> {
             eprintln!(
                 "[Tokenizer] WARNING: tokenizer vocab ({}) > model vocab ({}) by {} (likely multimodal special tokens). \
                  Text generation OK; encoding text containing those special tokens would OOB.",
-                tok_vocab, model_vocab, tok_vocab - model_vocab
+                tok_vocab,
+                model_vocab,
+                tok_vocab - model_vocab
             );
         }
         let pad_tolerance = (model_vocab / 20).max(256);

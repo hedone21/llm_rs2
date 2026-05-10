@@ -871,6 +871,62 @@ impl<'a> SwapExecutor<'a> {
         self.build_layer_from_mmap_async(secondary, slot, layer_idx)
     }
 
+    /// LISWAP-5 (B-2.4) entry point for `PhaseAwareSwapDispatcher`: build a
+    /// single weight tensor from the secondary mmap and enqueue it on the
+    /// async transfer queue. Returns the GPU-resident `Tensor` plus the H2D
+    /// completion event.
+    ///
+    /// Used as the per-tensor chunk primitive — the caller (phase-aware
+    /// dispatcher) accumulates per-tensor outputs into a `PartialLayer`
+    /// staging slot and submits the layer's `SwapCommitJob` once the last
+    /// chunk of that layer is enqueued.
+    ///
+    /// `subname` is the GGUF tensor sub-key (e.g. `attn_q.weight`,
+    /// `ffn_gate.weight`). `primary` is the current GPU tensor for shape
+    /// validation and Q/K permutation gating (mirrors the
+    /// `build_layer_from_mmap_async` per-tensor branch).
+    ///
+    /// On CPU backends `enqueue_write_async` falls through to a synchronous
+    /// `copy_weight_from`; the returned event is a dummy and `wait_event_blocking`
+    /// is a no-op.
+    pub fn build_tensor_from_mmap_async_for_hook(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        layer_idx: usize,
+        subname: &str,
+        primary: &Tensor,
+    ) -> Result<(Tensor, GpuEvent), SwapError> {
+        let cpu_tensor = self.materialise_cpu_tensor(secondary, layer_idx, subname, primary)?;
+        if self.backend.name().contains("CPU") {
+            return Ok((cpu_tensor, GpuEvent::dummy()));
+        }
+        self.backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
+            SwapError::AsyncTransferUnavailable {
+                layer: layer_idx,
+                source: e,
+            }
+        })
+    }
+
+    /// LISWAP-5 (B-2.4): same as `build_tensor_from_mmap_async_for_hook` but
+    /// returns `Ok(None)` when the secondary lacks the tensor (e.g. an
+    /// optional norm). Used by the phase-aware dispatcher to handle the
+    /// post-attn / post-ffn norms that may or may not exist.
+    pub fn build_optional_tensor_from_mmap_async_for_hook(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        layer_idx: usize,
+        subname: &str,
+        primary: &Tensor,
+    ) -> Result<Option<(Tensor, GpuEvent)>, SwapError> {
+        if secondary.layer_tensor(layer_idx, subname).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.build_tensor_from_mmap_async_for_hook(
+            secondary, layer_idx, subname, primary,
+        )?))
+    }
+
     /// LISWAP-2 async variant of `build_layer_from_mmap`.
     ///
     /// Enqueues H2D writes for each weight tensor on the backend's transfer
