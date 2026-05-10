@@ -1,4 +1,5 @@
 pub mod add;
+pub mod bias_add;
 pub mod deq_q40;
 pub mod flash_attn;
 pub mod kv_scatter;

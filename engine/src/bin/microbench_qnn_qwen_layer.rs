@@ -167,6 +167,8 @@ fn main() -> anyhow::Result<()> {
     let k_fa = ocl::core::create_kernel(&prog_fa, "flash_attn_f32_f16_q1")?;
     let k_silu = ocl::core::create_kernel(&prog_simple, "kernel_silu_mul_simple")?;
     let k_add = ocl::core::create_kernel(&prog_add, "kernel_add_row")?;
+    // D-D.6 Phase A.5: Qwen2.5 QKV bias add (forward_gen와 동일 환경 재현용).
+    let k_bias = ocl::core::create_kernel(&prog_simple, "kernel_add_row_bias")?;
 
     // ── QNN backend + register OpPackage ─────────────────────────────────────
     let gpu_lib = unsafe { Library::new(&backend_lib_path) }?;
@@ -239,6 +241,7 @@ fn main() -> anyhow::Result<()> {
         &k_fa,
         &k_silu,
         &k_add,
+        &k_bias,
         &rpcmem_alloc,
         &rpcmem_to_fd,
         RPCMEM_HEAP_ID_SYSTEM,
@@ -355,6 +358,7 @@ fn run_layer(
     k_fa: &ocl::core::Kernel,
     k_silu: &ocl::core::Kernel,
     k_add: &ocl::core::Kernel,
+    k_bias: &ocl::core::Kernel,
     rpcmem_alloc: &libloading::Symbol<unsafe extern "C" fn(i32, u32, i32) -> *mut std::ffi::c_void>,
     rpcmem_to_fd: &libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_void) -> i32>,
     heap_id: i32,
@@ -420,6 +424,12 @@ fn run_layer(
         }
         w
     }
+    // D-D.6 Phase A.5: Qwen2.5 attention QKV bias. random fallback = zeros (no bias).
+    // GGUF inject 시 blk.0.attn_{q,k,v}.bias로 갱신.
+    let mut host_q_bias = vec![0.0f32; q_proj_out];
+    let mut host_k_bias = vec![0.0f32; kv_proj_out];
+    let mut host_v_bias = vec![0.0f32; kv_proj_out];
+
     let w_q = gen_weights(q_proj_out, dim, 0.13);
     let w_k = gen_weights(kv_proj_out, dim, 0.21);
     let w_v = gen_weights(kv_proj_out, dim, 0.29);
@@ -503,11 +513,16 @@ fn run_layer(
         qd_d = d_d;
         host_rms_w_pre = load_f32("blk.0.attn_norm.weight", dim)?;
         host_rms_w_post = load_f32("blk.0.ffn_norm.weight", dim)?;
+        // D-D.6 Phase A.5: Qwen2.5 QKV bias load (forward_gen와 동일 환경).
+        host_q_bias = load_f32("blk.0.attn_q.bias", q_proj_out)?;
+        host_k_bias = load_f32("blk.0.attn_k.bias", kv_proj_out)?;
+        host_v_bias = load_f32("blk.0.attn_v.bias", kv_proj_out)?;
         eprintln!(
-            "[microbench] GGUF inject done — qq_q.len={} qq_d[0..4]={:?} rms_pre[0..4]={:?}",
+            "[microbench] GGUF inject done — qq_q.len={} qq_d[0..4]={:?} rms_pre[0..4]={:?} q_bias[0..4]={:?}",
             qq_q.len(),
             &qq_d[..4.min(qq_d.len())],
-            &host_rms_w_pre[..4.min(host_rms_w_pre.len())]
+            &host_rms_w_pre[..4.min(host_rms_w_pre.len())],
+            &host_q_bias[..4.min(host_q_bias.len())]
         );
     }
 
@@ -551,6 +566,10 @@ fn run_layer(
     let buf_q = mk_buf_f32_rw(q_proj_out)?;
     let buf_k = mk_buf_f32_rw(kv_proj_out)?;
     let buf_v = mk_buf_f32_rw(kv_proj_out)?;
+    // D-D.6 Phase A.5: Qwen2.5 QKV bias buffers.
+    let buf_q_bias = mk_buf_f32_ro(q_proj_out)?;
+    let buf_k_bias = mk_buf_f32_ro(kv_proj_out)?;
+    let buf_v_bias = mk_buf_f32_ro(kv_proj_out)?;
     let buf_kcache = mk_buf_u16_rw(kv_total)?;
     let buf_vcache = mk_buf_u16_rw(kv_total)?;
     let buf_attn_o = mk_buf_f32_rw(q_proj_out)?;
@@ -626,6 +645,9 @@ fn run_layer(
     up_u16!(&buf_ud, &qu_d);
     up_u8!(&buf_dq, &qd_q);
     up_u16!(&buf_dd, &qd_d);
+    up_f32!(&buf_q_bias, &host_q_bias);
+    up_f32!(&buf_k_bias, &host_k_bias);
+    up_f32!(&buf_v_bias, &host_v_bias);
     // D-D.6 디버깅: KV K/V file inject — production state inject 시. 미설정이면
     // host_kv_zero (default). raw OpenCL chain의 buf_kcache/vcache + graph rpcmem
     // KV slot 양쪽 모두 동일 bytes로 초기화 (둘이 동일 input 갖도록 byte-equal 비교).
@@ -720,6 +742,37 @@ fn run_layer(
         eprintln!("[microbench-dump-rms] wrote {} bytes to {p}", bytes.len());
     }
 
+    // D-D.6 stage-by-stage dump (LLMRS_MICROBENCH_DUMP_PREFIX=path).
+    // 각 stage 결과를 `path.stageN`에 binary로 저장. forward_gen
+    // (`LLMRS_QNN_OPPKG_DUMP_FALLBACK_PREFIX`)와 stage 번호 1:1 매칭.
+    macro_rules! dump_stage_mb {
+        ($stage:literal, $buf:expr, $nbytes:expr) => {
+            if let Ok(prefix) = std::env::var("LLMRS_MICROBENCH_DUMP_PREFIX") {
+                let mut bytes = vec![0u8; $nbytes];
+                unsafe {
+                    ocl::core::enqueue_read_buffer(
+                        cl_q,
+                        $buf,
+                        true,
+                        0,
+                        &mut bytes,
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
+                let path = format!("{}.stage{}", prefix, $stage);
+                std::fs::write(&path, &bytes)?;
+                eprintln!(
+                    "[microbench-dump-s{}] {} bytes -> {}",
+                    $stage,
+                    bytes.len(),
+                    path
+                );
+            }
+        };
+    }
+    dump_stage_mb!(1, &buf_y1, dim * 4);
+
     // Helper for Q4_0 matmul stage. Mirrors microbench_qnn_oppkg_matmul_q40.
     let dispatch_q40 = |k_q40: &ocl::core::Kernel,
                         bq: &ocl::core::Mem,
@@ -775,7 +828,37 @@ fn run_layer(
     };
 
     // Stages 2-4: Q/K/V projection (M=1).
+    // D-D.6 Phase A.5: Q/K/V matmul 직후 bias add (Qwen2.5 attention bias).
+    // dump_stage_mb!(N) 위치는 forward_gen와 동일하게 pre-bias로 유지.
+    let dispatch_bias = |bias_buf: &ocl::core::Mem,
+                         x_buf: &ocl::core::Mem,
+                         total: usize|
+     -> anyhow::Result<()> {
+        let total_i = total as i32;
+        let dim_i = total as i32;
+        ocl::core::set_kernel_arg(k_bias, 0, ArgVal::mem(x_buf))?;
+        ocl::core::set_kernel_arg(k_bias, 1, ArgVal::mem(bias_buf))?;
+        ocl::core::set_kernel_arg(k_bias, 2, ArgVal::scalar(&dim_i))?;
+        ocl::core::set_kernel_arg(k_bias, 3, ArgVal::scalar(&total_i))?;
+        let global = [total, 1, 1];
+        unsafe {
+            ocl::core::enqueue_kernel(
+                cl_q,
+                k_bias,
+                1,
+                None,
+                &global,
+                None,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        ocl::core::finish(cl_q)?;
+        Ok(())
+    };
     dispatch_q40(k_q40, &buf_qq, &buf_qd, &buf_y1, &buf_q, 1, q_proj_out, dim)?;
+    dump_stage_mb!(2, &buf_q, q_proj_out * 4);
+    dispatch_bias(&buf_q_bias, &buf_q, q_proj_out)?;
     dispatch_q40(
         k_q40,
         &buf_kq,
@@ -786,6 +869,8 @@ fn run_layer(
         kv_proj_out,
         dim,
     )?;
+    dump_stage_mb!(3, &buf_k, kv_proj_out * 4);
+    dispatch_bias(&buf_k_bias, &buf_k, kv_proj_out)?;
     dispatch_q40(
         k_q40,
         &buf_vq,
@@ -796,6 +881,8 @@ fn run_layer(
         kv_proj_out,
         dim,
     )?;
+    dump_stage_mb!(4, &buf_v, kv_proj_out * 4);
+    dispatch_bias(&buf_v_bias, &buf_v, kv_proj_out)?;
 
     // Stage 5: RoPE(Q) — kernel_rope_simple(x, head_dim, num_heads, seq_len, start_pos, theta)
     let head_dim_i: i32 = head_dim as i32;
@@ -823,6 +910,7 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
+    dump_stage_mb!(5, &buf_q, q_proj_out * 4);
 
     // Stage 6: RoPE(K)
     ocl::core::set_kernel_arg(k_rope, 0, ArgVal::mem(&buf_k))?;
@@ -846,6 +934,7 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
+    dump_stage_mb!(6, &buf_k, kv_proj_out * 4);
 
     // Stage 7: KvScatter — kernel_kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
     let capacity_i: i32 = kv_capacity as i32;
@@ -952,6 +1041,8 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
+    // microbench stage 8 (FlashAttn) == forward_gen stage 9 (Attention)
+    dump_stage_mb!(9, &buf_attn_o, q_proj_out * 4);
 
     // Stage 9: O proj — Q4_0 matmul (M=1, N=dim, K=q_proj_out)
     dispatch_q40(
@@ -964,6 +1055,8 @@ fn run_layer(
         dim,
         q_proj_out,
     )?;
+    // microbench stage 9 (O proj) == forward_gen stage 10 (post O-proj attn_out)
+    dump_stage_mb!(10, &buf_o, dim * 4);
 
     // Stage 10: Add (residual #1) — kernel_add_row(o, x, x_attn, n4)
     let n4_dim: i32 = (dim / 4) as i32;
@@ -1011,10 +1104,13 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
+    dump_stage_mb!(11, &buf_y2, dim * 4);
 
     // Stages 12-13: gate / up — Q4_0 matmul (M=1, N=ffn_dim, K=dim)
     dispatch_q40(k_q40, &buf_gq, &buf_gd, &buf_y2, &buf_gate, 1, ffn_dim, dim)?;
+    dump_stage_mb!(12, &buf_gate, ffn_dim * 4);
     dispatch_q40(k_q40, &buf_uq, &buf_ud, &buf_y2, &buf_up, 1, ffn_dim, dim)?;
+    dump_stage_mb!(13, &buf_up, ffn_dim * 4);
 
     // Stage 14: SiluMul — kernel_silu_mul_simple(gate, up, ffn_dim/4) [in-place on gate]
     ocl::core::set_kernel_arg(k_silu, 0, ArgVal::mem(&buf_gate))?;
@@ -1034,12 +1130,14 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
+    dump_stage_mb!(14, &buf_gate, ffn_dim * 4);
 
     // Stage 15: down proj — Q4_0 matmul (M=1, N=dim, K=ffn_dim)
     let _ = ffn_dim_i; // referenced symbol, used implicitly via cfg
     dispatch_q40(
         k_q40, &buf_dq, &buf_dd, &buf_gate, &buf_down, 1, dim, ffn_dim,
     )?;
+    dump_stage_mb!(15, &buf_down, dim * 4);
 
     // Stage 16: Add (residual #2)
     ocl::core::set_kernel_arg(k_add, 0, ArgVal::mem(&buf_down))?;
@@ -1062,6 +1160,7 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
+    dump_stage_mb!(16, &buf_x_out, dim * 4);
     let raw_chain_per_stage_ms = t_raw_chain_start.elapsed().as_secs_f64() * 1000.0;
 
     // ── Raw OpenCL chain — chain-only sync mode (production-style) ──────────
@@ -1134,9 +1233,36 @@ fn run_layer(
             }
         }};
     }
+    // D-D.6 Phase A.5: chain-only QKV bias (no finish).
+    macro_rules! bias_no_finish {
+        ($bias:expr, $x:expr, $total:expr) => {{
+            let total_i = $total as i32;
+            let dim_i = $total as i32;
+            ocl::core::set_kernel_arg(k_bias, 0, ArgVal::mem($x))?;
+            ocl::core::set_kernel_arg(k_bias, 1, ArgVal::mem($bias))?;
+            ocl::core::set_kernel_arg(k_bias, 2, ArgVal::scalar(&dim_i))?;
+            ocl::core::set_kernel_arg(k_bias, 3, ArgVal::scalar(&total_i))?;
+            let global = [$total as usize, 1, 1];
+            unsafe {
+                ocl::core::enqueue_kernel(
+                    cl_q,
+                    k_bias,
+                    1,
+                    None,
+                    &global,
+                    None,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        }};
+    }
     q40_no_finish!(&buf_qq, &buf_qd, &buf_y1, &buf_q, 1usize, q_proj_out, dim);
+    bias_no_finish!(&buf_q_bias, &buf_q, q_proj_out);
     q40_no_finish!(&buf_kq, &buf_kd, &buf_y1, &buf_k, 1usize, kv_proj_out, dim);
+    bias_no_finish!(&buf_k_bias, &buf_k, kv_proj_out);
     q40_no_finish!(&buf_vq, &buf_vd, &buf_y1, &buf_v, 1usize, kv_proj_out, dim);
+    bias_no_finish!(&buf_v_bias, &buf_v, kv_proj_out);
     // Stage 5: RoPE(Q)
     ocl::core::set_kernel_arg(k_rope, 0, ArgVal::mem(&buf_q))?;
     ocl::core::set_kernel_arg(k_rope, 1, ArgVal::scalar(&head_dim_i))?;

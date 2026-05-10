@@ -1038,6 +1038,21 @@ kernel void kernel_add_row_bias(
     }
 }
 
+// D-D.6 Phase B: out-of-place broadcast-add bias to each row of x.
+// y[i] = x[i] + bias[i % dim]. graph 14-node chain compatible (OOP buffers).
+kernel void kernel_add_row_bias_oop(
+    global const float * x,
+    global const float * bias,
+    global float * y,
+    int dim,
+    int total_elements
+) {
+    int gid = get_global_id(0);
+    if (gid < total_elements) {
+        y[gid] = x[gid] + bias[gid % dim];
+    }
+}
+
 kernel void kernel_silu_mul_simple(
     global float4 * x,
     global float4 * y,

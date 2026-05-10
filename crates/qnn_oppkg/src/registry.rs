@@ -8,6 +8,7 @@ use crate::args::OpDescriptor;
 
 pub static OPS: &[OpDescriptor] = &[
     crate::ops::add::DESCRIPTOR,
+    crate::ops::bias_add::DESCRIPTOR,
     crate::ops::matmul_f16_f32::DESCRIPTOR,
     crate::ops::rms_norm::DESCRIPTOR,
     crate::ops::softmax::DESCRIPTOR,
