@@ -11,6 +11,18 @@
 - **HEAD**: `90617cc` (M3.4 14-node body + device gate RED, push됨)
 - **요약**: graphFinalize 28× ~1.36s GREEN (예상 ~33s 대비 24× 빠름), prefill segfault. 후속 분석 결과 root cause는 M2.H builder가 pos를 `QNN_PARAMTYPE_SCALAR`로 graph build 시점 hardcoded — multi-token decode 불가능. 옵션: D-D (M2 ops 수정 +1.5주) / D-E (scope 약화 +0.5주). 사용자 결정 필요.
 
+## [P1] LISWAP-5 v2 — sub-tensor chunking + background pre-staging — 2026-05-10
+- **Status**: TODO (v1 measurement 종결 후 신규)
+- **선행**: `papers/eurosys2027/_workspace/experiment/swap_overhead_liswap5_v1_postmortem.md` §6 (실측), §8 (v2 plan)
+- **요약 (v1 finding)**: TTFT -150 ms (-24%) win, Decode +10 ms (+35%) loss, crossover n=13. v1은 viable하지만 long-decode에서는 single-shot 손해.
+- **v2 핵심 작업**:
+  1. **Option α — sub-tensor chunking**: per-tensor (9~26 MB) → 2~4 MB sub-chunk. cache-fit window (980us) 안에 fit. cl_event chain 유지.
+  2. **Option β — background pre-staging**: materialise_cpu_tensor (mmap + GGUF re-pack)을 worker thread로 사전 수행. forward thread는 enqueue_write_async만 호출.
+  3. **Invalidate lag 진단**: retire 후 +10 ms 잔류 원인 — SOA lazy rebuild vs driver scheduler. perfetto profile + token별 forward breakdown 측정.
+- **Pass-gate**: Decode loss ≤ +5 ms (현 +10 ms의 절반), TTFT win 보존 (-150 ms 유지), 4-gate 정상.
+- **추정**: 5~7일 (α 2일 + β 2일 + 진단 1일 + 측정 1일).
+- **추가 backlog**: SIGABRT race (재현 불가지만 hypothesis 보존) — v2 작업 중 재출현 시 `handoff_liswap5_crash_fix_2026_05_10.md` §3 참고하여 release_worker 전달 추가.
+
 ## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
 - **Status**: TODO (M2 baseline부터 누적, M3.0 무관)
 - **상세**: `cargo clippy --workspace --features opencl --tests -- -D warnings`에서 `crates/qnn_oppkg_poc/src/lib.rs:725` 근방 raw pointer deref 함수에 `unsafe` 누락. rust 1.93 신규 lint. M1 회귀 안전망 crate이라 P3 우선순위. M2가 main 진입한 이상 PoC는 read-only — 손대지 않거나 일괄 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`로 silence.

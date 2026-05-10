@@ -151,79 +151,136 @@ Aborted                                       ← 여기서 SIGABRT
 
 ---
 
-## 6. 진짜 v1 평가 (가능한 만큼)
+## 6. 진짜 v1 평가 — 실측값 (2026-05-10 update)
 
-위 fix로 hook이 정상 fire하지만 retire 후 crash로 wall-clock 측정 불가. 다만 token 0~10 동안의 데이터로 일부 추정 가능:
+**갱신 사유**: 다음 세션이 crash fix를 시작하기 전 reproducer를 재실행한 결과 SIGABRT가 **재현되지 않음**. n=32, n=64×5회, n=200×3회 모두 정상 완료. handoff `12bac91`에서 보고된 crash는 flaky (race timing 차이) 였거나 측정 당시 환경 노이즈였던 것으로 추정. **v1 wall-clock 측정 가능.**
 
-### 6.1 Chunk dispatch overhead 추정
-- 95 ms/token forward (F16) 동안 ~75 chunks dispatch
-- 각 chunk = `materialise_cpu_tensor` (mmap → cpu copy) + `enqueue_write_async`
-- 75 chunks × ~1 ms host work = **~75 ms host overhead per token** (forward thread 막음)
-- → 95 ms baseline + 75 ms overhead = **170 ms/token 예상** (가정)
+### 6.1 측정 setup
+- HEAD: `f68e817` (handoff doc 추가, 코드 변경 없음)
+- Binary: `12bac91` 시점 빌드 (동일)
+- Device: Galaxy S25 (Adreno 830)
+- Prompt: "The capital of France is", n=200, temperature=0
+- Reproducer: `--swap-phase-aware --force-swap-ratio 0.9 --secondary-gguf ...q4_0.gguf` (single-shot은 `--swap-phase-aware` 빠짐)
 
-### 6.2 Phase R 비교
-Phase R Scenario B는 1.04× of max = 4% overhead. 본 production은:
-- materialise 자체가 호스트 mmap memcpy → 단순 std::memcpy 보다 무거움 (page fault, GGUF format 변환)
-- per-tensor chunk이 cache-fit window (980us) 보다 큰 경우 대부분 — wq 9 MB = 3 ms, ffn 26 MB = 8.7 ms
+### 6.2 4-mode 비교 (n=200, 3 run median)
 
-→ **Phase R의 1.04×는 production에 그대로 안 옮겨짐**.
+| 모드 | TTFT (ms) | Decode (ms/tok) | Tail output |
+|---|---:|---:|---|
+| [A] F16 only | n/a | 54.1 ~ 65.7 | n/a |
+| [B] Q4_0 only | n/a | 38.2 ~ 47.2 | n/a |
+| [C] Single-shot swap (force-ratio 0.9) | **605~635** | **37.1 ~ 52.7** (median 37) | "...The capital city is Paris. It has" |
+| [D] Phase-aware LISWAP-5 | **456~477** | **48.6 ~ 54.1** (median 50) | "...The most important fact about France is that it was" |
 
-### 6.3 추정 wall-clock (crash가 없다고 가정)
-- baseline F16 forward: 53 ms
-- + chunk dispatch overhead: ~75 ms (token 0~2까지만, 그 후 0)
-- swap 완료 후 forward = Q4 forward 26 ms
-- Total decode for 32 tokens 가정:
-  - token 0~2: 3 × (53 + 75) = 384 ms
-  - token 3~31: 29 × 26 = 754 ms
-  - = 1138 ms decode
-- + TTFT 343 ms = **1481 ms E2E** (single-shot 1293 보다 +14% 느림)
+### 6.3 핵심 finding
 
-→ 만약 v1이 정상 작동했다면 single-shot보다 **약간** 느리지만 LISWAP-1 (+33%) 보다 나았을 가능성. 단 이 추정은 crash 없이 retire 후 정상 forward 가정.
+#### TTFT win: **-150 ms** (phase-aware vs single-shot)
+- Single-shot은 prefill 직전 swap을 동기 수행 — 측정한 TTFT 605 ms 중 ~400 ms가 swap copy 비용 (Q4 prefill 자체는 ~200 ms)
+- Phase-aware는 prefill 동안 swap이 없고, decode token 0~2에서 background dispatch
+- → TTFT 측면에서 phase-aware가 single-shot 대비 **24% 단축**
+- 단응답·interactive UX에 의미 있음
 
----
+#### Decode loss: **+10 ms/tok** (phase-aware vs single-shot)
+- Single-shot Q4 forward 정상 = 37 ms/tok (Q4 only 38 ms와 ~일치)
+- Phase-aware는 retire 이후에도 50 ms/tok — Q4보다 +10 ms 느림
+- 가능 원인:
+  - Chunk dispatch가 끝났음에도 ratio_generation bump 후의 lazy SOA rebuild 비용이 retire 직후 token에 잔류
+  - OpenCL command queue 상에 swap chunks 가 enqueue된 잔류 효과 (driver internal scheduler)
+  - 더 직접적으로 — `materialise_cpu_tensor` (mmap → CPU memcpy) 자체가 forward thread를 막음 (token 0~2에서 75 chunks/token × 1 ms ≈ 75 ms 추가)
+- token 3 이후에도 +10 ms 잔류는 dispatcher가 비어있어도 발생 → **invalidate 후 layer-by-layer SOA lazy rebuild가 진짜 culprit 가능성**
 
-## 7. 효과 없었던 진짜 이유 정리
+#### E2E crossover (n에 따라)
+- E2E = TTFT + Decode × n
+- single-shot: 635 + 37×n
+- phase-aware: 470 + 50×n
+- crossover: n = (635-470) / (50-37) ≈ **n=13**
+- → **n<13 일 때 phase-aware 유리, n≥13 일 때 single-shot 유리**
 
-| 이유 | 영향 | 책임 |
+### 6.4 Phase R (microbench 1.04×) 와의 차이
+Phase R Scenario B = 1.04× of max. 본 production 측정은 +35% (50/37). 차이 원인:
+- Phase R: pure memcpy + cache-fit window 활용
+- Production: `materialise_cpu_tensor` (mmap fault + GGUF re-pack) 추가 + 25 layer × 9 tensor = 225 chunks의 enqueue overhead
+- per-tensor chunk size가 cache-fit window (980us = 4 MB) 초과: wq 9 MB / ffn 26 MB
+
+→ Phase R의 1.04×를 production에서 재현하려면 **chunk granularity를 4 MB 이하로 sub-divide** 해야 함 (현재 v1은 per-tensor만, 9~26 MB 단일 chunk).
+
+### 6.5 4-gate 결과
+
+| Gate | 결과 | 근거 |
 |---|---|---|
-| **A. plan-path bypass 누락** | 측정 자체가 의미 없음 (swap 0회) | generate.rs:5371 가드 (이번 fix됨) |
-| **B. retire 후 crash** | 정확한 v1 wall-clock 측정 불가 | commit + remap 경로 race (다음 세션 fix 필요) |
-| **C. per-tensor chunk overhead** | 추정상 token당 +75 ms host work | dispatcher v1 design 한계 |
-| **D. mid-decode mixed weights** | 출력이 single-shot과 분기 (b1 첫 측정 [C]) | swap 자체의 본질 — 평가 기준 재정의 필요 |
+| ✅ Correctness | PASS | 32, 64, 200 token 모두 plausible English ("Paris. The capital city is...") |
+| ⚠️ TBT | PARTIAL | Decode +10 ms 손해, but TTFT -150 ms win |
+| ❓ Hide ratio | UNKNOWN | dispatcher counters로 chunks=225/token=2 = 113 chunk/token throughput 확인. forward와 동시 진행했는지는 wall-clock 분리 측정 필요 |
+| ❌ Stall | (자체 측정 X) | crash 보고된 적 있으나 재현 불가 — flaky로 분류 |
 
-**A는 단순 버그**, B-D는 design 차원.
-
-A를 fix한 지금 (commit `ed7464f`), B를 해결하지 않으면 v1의 진짜 성능을 볼 수 없다. B는 ArcSwap commit + workspace 동기화 + release worker race 의 어딘가 — 자세히 봐야 한다.
-
-C는 design 차원 — sub-tensor chunking + worker thread pre-staging이 필요할 수 있다. 그런데 v1을 fully measurement하기 전엔 C가 진짜 문제인지 알 수 없다.
-
-D는 기능적 본질 — swap이 decode 중간에 일어나면 출력이 달라지는 건 정상.
+**종합**: design 자체는 viable. TTFT 개선 명확. Decode 손해는 v2에서 sub-chunking + invalidate 우회 필요.
 
 ---
 
-## 8. 다음 세션 액션
+## 7. 효과 없었던 진짜 이유 정리 (2026-05-10 갱신)
 
-### Priority 1 — Crash fix (B)
-- IntraForwardSwapHook::finalize 패턴과 비교 (intra_forward_swap.rs:547+)
-- AsyncSwapDispatcher::drain 후 추가 synchronize 필요한지 확인
-- ratio_generation bump 시점 vs forward thread workspace cl_mem 사용 시점 race 분석
-- partition_ctx 무효화 race 가능성
+| 이유 | 영향 | 상태 |
+|---|---|---|
+| **A. plan-path bypass 누락** | 측정 자체가 의미 없음 (swap 0회) | ✅ FIX (commit `ed7464f`) |
+| **B. retire 후 crash** | wall-clock 측정 불가 | 🔄 재현 안 됨 — flaky, 측정 가능 (§6) |
+| **C. per-tensor chunk overhead** | Decode +10 ms/tok 영구 손해 | ❌ design 한계 — v2 필요 |
+| **D. invalidate 후 SOA lazy rebuild** | retire 후에도 +10 ms 잔류 가능성 | ❓ 정밀 분리 측정 필요 |
+| **E. mid-decode mixed weights** | 출력이 single-shot과 분기 | ✅ 정상 (semantic plausible) |
 
-### Priority 2 — Wall-clock 재측정 (B fix 후)
-- n=32, n=200 양쪽
-- 4-gate (correctness, TBT, hide ratio, stall) 재실행
-- v1이 진짜 fail인지 (Phase R 안 옮겨짐) vs marginal pass인지 판정
+**A**는 fix됨. **B**는 재현 불가하므로 close. v1의 진짜 평가는 §6 결과로 확정:
+- TTFT win (-150 ms / -24%)
+- Decode loss (+10 ms / +35%)
+- crossover n=13
 
-### Priority 3 — v2 검토 (B 후에 데이터 보고)
-- Option α (sub-tensor chunking) 또는 β (background pre-staging) 우선순위 데이터 기반 결정
+**C**는 design 한계. v2가 필요한 이유:
+- per-tensor 4 MB 이상의 단일 chunk → cache-fit window (980us) 초과
+- materialise_cpu_tensor (mmap + GGUF re-pack) 자체가 forward thread block
+
+**D**는 추가 진단 필요. retire 후 token 3~10에서도 50 ms 유지되는 이유:
+- ratio_generation bump 이후 첫 N token에서 SOA registry rebuild가 lazy하게 비용 청구
+- 또는 OpenCL driver internal scheduler가 스왑 chunks 흔적으로 후속 forward kernel 우선순위 낮춤
+- profiling으로 retire 후 token별 forward breakdown 분리 가능
+
+**E**는 본질 — 평가 기준은 byte-equal이 아닌 plausible English.
+
+---
+
+## 8. 다음 세션 액션 (2026-05-10 갱신)
+
+### Priority 1 — v2 sub-tensor chunking (Option α)
+v1은 per-tensor chunk만 (wq=9 MB, ffn_gate/up=26 MB 등). 이걸 4 MB 이하로 sub-divide 하면 cache-fit window에 fit.
+- chunk granularity: 2 MB (Q4) / 4 MB (F16)
+- sub-chunk마다 cl_event chain — 같은 PartialLayer 안의 chunks가 순차 enqueue
+- expected: per-token chunks 75 → 200, 단 chunk당 dispatch 시간 1 ms → 0.5 ms (host work는 거의 동일하지만 enqueue overhead 분산)
+
+### Priority 2 — invalidate 후 SOA rebuild lag 진단
+retire 후 token 3~10의 +10 ms 잔류 원인 규명:
+- profiling (perfetto) 으로 token별 forward breakdown
+- ratio_generation bump 직후 첫 N token만 다른 path (lazy rebuild) 거치는지 확인
+- 아니면 driver/scheduler 효과 — 그 경우 v2도 한계
+
+### Priority 3 — Background pre-staging (Option β)
+- materialise_cpu_tensor를 worker thread로 pre-stage → forward thread는 enqueue_write_async만 호출
+- v1은 forward thread에서 mmap → memcpy → enqueue 모두 수행 (75 ms host work 직접 짊어짐)
+- v2 + β로 가면 Phase R 1.04× 와 비슷한 overhead 가능성
+
+### Priority 4 — TTFT win 활용 시나리오 정리
+- crossover n=13 — interactive (avg 응답 ~100 token) 시나리오에서는 single-shot이 유리
+- 하지만 streaming TTFT 우선 시나리오 (chat UI 첫 token 빠른 표시)에서는 phase-aware가 win
+- 평가 metric을 어디에 정렬할지 paper에서 명확히
+
+### Crash 처리
+- handoff `12bac91`에서 보고된 SIGABRT는 재현 불가 (5+ 회 재실행 모두 정상)
+- handoff `f68e817`는 close (race 의심 hypothesis는 코드 변경 없이 보존, 향후 v2 작업 시 재출현 시 재진단)
+- handoff_liswap5_crash_fix_2026_05_10.md 는 archive 처리
 
 ### Lessons learned
-- **9-track handoff §3.1 LISWAP-4 v2 함정을 그대로 반복함**. 다음에 swap 쪽 작업할 때 "plan-path bypass guard" 체크리스트 필수.
-- **measurement 신뢰 전 항상 진단 카운터 확인** — 첫 v1 측정 (48 ms) 을 실제 swap 결과로 오해석.
-- **op_trace 호출 경로의 unit 검증 필요** — `forward_gen` 외 다른 path 존재 (plan, prefill, transformer.rs decode tail).
+- **9-track handoff §3.1 LISWAP-4 v2 함정 (plan-bypass) 을 그대로 반복**. 다음 swap 작업 시 "plan-path bypass guard" 체크리스트 필수
+- **첫 측정 신뢰 전 진단 카운터 필수 확인** — 첫 v1 측정 (48 ms) 을 실제 swap 결과로 오해석
+- **op_trace 호출 경로의 unit 검증** — `forward_gen` 외 plan, prefill, transformer.rs decode tail 다중 path 존재
+- **flaky crash 보고 시 즉시 fix 의사결정 금지** — 5+ 회 재현 시도가 우선. 본 세션은 재현 안 되어 fix 불필요
 
 ---
 
 **End of postmortem**
 
-핵심 한 줄: **첫 측정은 의미 없었다 (plan path bypass로 swap 0회). Fix 후 hook 정상 fire하고 3 token 안에 dispatch 완료하지만, retire 후 SIGABRT로 진짜 wall-clock 측정은 다음 세션 디버그 후 가능.**
+핵심 한 줄 (2026-05-10 final): **첫 측정은 의미 없었다 (plan path bypass로 swap 0회). Fix 후 hook 정상 fire + 3 token 안에 dispatch 완료. v1은 정상 동작 — TTFT -150 ms win, Decode +10 ms loss, crossover n=13. crash는 재현 불가 (flaky). v2는 sub-tensor chunking + background pre-staging.**

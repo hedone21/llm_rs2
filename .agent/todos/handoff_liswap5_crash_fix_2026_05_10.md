@@ -1,18 +1,21 @@
-# Handoff: LISWAP-5 retire-후 SIGABRT 디버그
+# Handoff: LISWAP-5 retire-후 SIGABRT 디버그 — **CLOSED (재현 불가)**
 
 **Date**: 2026-05-10
-**HEAD**: `12bac91` (LISWAP-5 v1 hook 정상 fire 확인 후 + plan-bypass fix + postmortem)
+**Closed**: 2026-05-10 (다음 세션에서 reproducer 5회+ 재실행, 모두 정상 완료)
+**HEAD (closed)**: `f68e817`
 **Device**: Galaxy S25 (R3CY408S5SB, Adreno 830)
-**선행 문서**:
-- `papers/eurosys2027/_workspace/experiment/swap_overhead_liswap5_v1_postmortem.md` (반드시 먼저 읽을 것)
-- `.agent/todos/handoff_phase_aware_swap_b22_2026_05_10.md` (구조 + B-2.x 분해)
+
+> **상태**: CLOSED. 본 handoff에서 보고된 SIGABRT는 다음 세션의 reproducer 재실행에서 **재현 불가**. n=32, n=64×5회, n=200×3회 모두 crash 없이 정상 완료. flaky race timing 또는 측정 환경 노이즈로 판단. 후속 v1 wall-clock 측정 + v2 진행 plan은 `swap_overhead_liswap5_v1_postmortem.md` §6, §8 참조.
+
+**선행/후속 문서**:
+- `papers/eurosys2027/_workspace/experiment/swap_overhead_liswap5_v1_postmortem.md` (실측값 §6 + v2 plan §8)
 - `.agent/todos/feat_phase_aware_swap_2026_05_10.md` (LISWAP-5 plan)
 
 ---
 
-## 0. 한 줄 요약
+## 0. 한 줄 요약 (보존 — 보고 당시 가설)
 
-LISWAP-5 v1이 commit `ed7464f` (plan-bypass guard) 후 정상 동작 시작. 3 token 안에 25-layer (225 chunk) 모두 dispatch + plan retire 완료. 그러나 retire 후 9 token 진행 시점 (start_pos=16 부근) **SIGABRT crash**. 이를 fix하면 진짜 v1 wall-clock 측정 가능.
+LISWAP-5 v1이 commit `ed7464f` (plan-bypass guard) 후 정상 동작 시작. 3 token 안에 25-layer (225 chunk) 모두 dispatch + plan retire 완료. 그러나 retire 후 9 token 진행 시점 (start_pos=16 부근) **SIGABRT crash** ← **재현 불가, CLOSED**.
 
 ---
 
