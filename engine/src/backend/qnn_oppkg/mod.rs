@@ -23,6 +23,8 @@
 
 pub mod buffer;
 pub mod graph_cache;
+pub mod hybrid_memory;
+pub mod kv_buffer;
 pub mod layer_graph;
 pub mod memory;
 pub mod runtime;
@@ -471,8 +473,9 @@ impl Backend for QnnOppkgBackend {
             && pos < 16
             && layer_idx == 0;
         if dump {
-            let xf =
-                unsafe { std::slice::from_raw_parts(x_bytes.as_ptr() as *const f32, 8.min(x_bytes.len() / 4)) };
+            let xf = unsafe {
+                std::slice::from_raw_parts(x_bytes.as_ptr() as *const f32, 8.min(x_bytes.len() / 4))
+            };
             eprintln!(
                 "[fast-dump layer={layer_idx} pos={pos} n_kv={n_kv}] x_in[0..8] = {:?}",
                 xf

@@ -1381,11 +1381,37 @@ fn main() -> anyhow::Result<()> {
             // OpenCL buffer로 남아 prefill + model load fallback path가 자연스럽게
             // 작동한다. KV cache는 OpenCL buffer (graph 내부 KvScatter는 자체
             // rpcmem 사용 + execute path에서 host-side memcpy로 동기화).
-            let qnn_dyn: Arc<dyn Backend> = qnn;
-            let primary_mem: Arc<dyn Memory> = match &gpu_mem_arc {
-                Some(m) => m.clone(),
-                None => qnn_mem.clone(),
+            let qnn_dyn: Arc<dyn Backend> = qnn.clone();
+            // Step 1 (KV zero-copy): OpenCL secondary가 있으면 HybridMemory로
+            // primary_mem을 구성한다. alloc()은 OpenCL cl_mem으로 위임하고,
+            // alloc_kv()는 rpcmem + CL_MEM_USE_HOST_PTR dual buffer를 반환.
+            // production prefill path (cl_mem 경유)는 무손상.
+            #[cfg(feature = "opencl")]
+            let primary_mem: Arc<dyn Memory> = match (&gpu_mem_arc, &gpu_be) {
+                (Some(ocl_m), Some(ocl_be)) => {
+                    if let Some(ocl_concrete) = ocl_be
+                        .as_any()
+                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>(
+                    ) {
+                        eprintln!(
+                            "[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)"
+                        );
+                        Arc::new(
+                            llm_rs2::backend::qnn_oppkg::hybrid_memory::QnnOppkgHybridMemory::new(
+                                ocl_m.clone(),
+                                qnn.clone(),
+                                ocl_concrete.context.clone(),
+                            ),
+                        )
+                    } else {
+                        ocl_m.clone()
+                    }
+                }
+                (Some(m), None) => m.clone(),
+                (None, _) => qnn_mem.clone(),
             };
+            #[cfg(not(feature = "opencl"))]
+            let primary_mem: Arc<dyn Memory> = qnn_mem.clone();
             // M3.4 D-D.4: gpu_backend_arc로는 OpenCL secondary를 노출한다.
             // primary qnn_oppkg는 noshuffle prep / map_weights_for_cpu / RSS
             // diag 등 OpenCL-specific path에 downcast 불가하므로, secondary가
