@@ -315,6 +315,23 @@ mod android {
                 x_out_bytes.len(),
                 out_slot.size
             );
+            // D-D.6 디버깅: pos=0에서 in/out rpcmem byte를 dump해서 microbench
+            // (직접 graphExecute, baked rpcmem)와 비교 — `lg.execute` wrap 자체가
+            // 결과를 변형하는지 확인.
+            if pos == 0
+                && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
+            {
+                let in_f32 = unsafe {
+                    std::slice::from_raw_parts(in_slot.host_ptr as *const f32, 8)
+                };
+                let out_f32 = unsafe {
+                    std::slice::from_raw_parts(out_slot.host_ptr as *const f32, 8)
+                };
+                eprintln!(
+                    "[lg.execute pos=0 n_kv={n_kv}] in_slot[0..8]={:?} out_slot[0..8]={:?}",
+                    in_f32, out_f32
+                );
+            }
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     out_slot.host_ptr,
@@ -513,7 +530,12 @@ mod android {
         let theta: f32 = 1_000_000.0;
 
         // ── 1. graphCreate (precision=USER_PROVIDED) ───────────────────────
-        let graph_name = CString::new(format!("qnn_layer_{layer_idx}")).unwrap();
+        // D-D.6 디버깅: process-unique counter로 graph name 충돌 방지
+        // (fresh_build mode가 같은 layer를 반복 build).
+        static GRAPH_NAME_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let counter = GRAPH_NAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let graph_name = CString::new(format!("qnn_layer_{layer_idx}_{counter}")).unwrap();
         #[repr(C)]
         struct QnnGpuGraphCustomConfig {
             precision: u32,
@@ -556,6 +578,28 @@ mod android {
         let (qg_q, qg_d) = pack_weight_q4_0(&weights.w_gate, ffn_dim, dim)?;
         let (qu_q, qu_d) = pack_weight_q4_0(&weights.w_up, ffn_dim, dim)?;
         let (qd_q, qd_d) = pack_weight_q4_0(&weights.w_down, dim, ffn_dim)?;
+        // D-D.6 디버깅: layer 0 weight bytes hash dump (FAST_PATH_DUMP 시).
+        if layer_idx == 0
+            && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
+        {
+            let aos = tensor_bytes_owned(&weights.wq)?;
+            eprintln!(
+                "[graph-build layer=0 wq] aos.len={}, aos[0..16]={:02x?} qq_q.len={} qq_q[0..16]={:02x?} qq_d[0..4]={:?}",
+                aos.len(),
+                &aos[..16.min(aos.len())],
+                qq_q.len(),
+                &qq_q[..16.min(qq_q.len())],
+                &qq_d[..4.min(qq_d.len())]
+            );
+            let rms_pre = tensor_bytes_owned(&weights.attention_norm)?;
+            let rms_pre_f32 = unsafe {
+                std::slice::from_raw_parts(rms_pre.as_ptr() as *const f32, 8.min(rms_pre.len() / 4))
+            };
+            eprintln!(
+                "[graph-build layer=0 attention_norm] f32[0..8]={:?}",
+                rms_pre_f32
+            );
+        }
 
         // RMS norm weights — production은 F32 (1D, dim).
         let rms_pre_bytes = tensor_bytes_owned(&weights.attention_norm)?;
@@ -566,7 +610,11 @@ mod android {
         let bytes_rms = dim * 4;
         let bytes_kv = n_kv_heads * kv_capacity * head_dim * 2; // F16
         let bytes_x_out = dim * 4;
-        let bytes_mask = n_kv * 2; // F16
+        // D-D.6: mask sized to max kv_capacity F16 (n_kv now dynamic).
+        // dims_mask와 size 일치 필수 — 이전 `n_kv * 2 = 2 bytes`는 graph가
+        // 4096 bytes mask를 read할 때 OOB read로 garbage attention 발생.
+        let _ = n_kv; // n_kv는 build 시점 placeholder 1, mask size에 미사용.
+        let bytes_mask = kv_capacity * 2; // F16, [kv_capacity]
         let bytes_sinks = n_head * 4; // F32
         let bytes_dummy = 4_usize;
 

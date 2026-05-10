@@ -1,13 +1,21 @@
 //! `CustomRmsNorm` op descriptor — out-of-place RMSNorm (Llama-style).
 //!
-//! Maps to `kernel_rms_norm_simple` in `engine/kernels/simple_ops.cl`. This is
-//! the one-work-item-per-row variant (no subgroup reduce, no `__local` scratch).
-//! M1.5 selects the simple kernel because the QNN GPU OpPackage abstraction's
-//! `QNN_GPU_KERNEL_ARG_TYPE_LOCAL` path is not yet validated end-to-end on this
-//! runtime — `kernel_rms_norm_oop` triggers `graphFinalize err=0x1786`
-//! (`QNN_GRAPH_ERROR_FINALIZE_FAILED`) on the device, while the simple kernel
-//! avoids the LOCAL arg entirely. Performance is suboptimal (one thread per
-//! row), but M1.5 scope is correctness-only.
+//! D-D.6: maps to `kernel_rms_norm_oop_subgroup` (single-subgroup, OOP variant).
+//! production OpenCL primary가 사용하는 `kernel_rms_norm_opt`의 numerical-
+//! equivalent reduction order로 byte-equal 결과 보장.
+//!
+//! ## Background
+//! M1.5는 single-thread `kernel_rms_norm_simple`을 선택했지만, production
+//! fallback path (`backend.rms_norm()` → `kernel_rms_norm_opt`)와 floating
+//! point 비결합성으로 numerical 차이 발생. fast path가 활성화되면 layer 0의
+//! RMS 결과가 fallback path와 미세하게 다르고 28-layer × multi-token decode
+//! 누적으로 다른 token sequence 생성.
+//!
+//! `kernel_rms_norm_opt`는 LOCAL arg (SLM scratch)를 사용하는데 SDK가
+//! OpPackage path에서 LOCAL을 validation 못해 `graphFinalize err=0x1786`
+//! (`QNN_GRAPH_ERROR_FINALIZE_FAILED`) trigger. D-D.6 fix는 workgroup_size를
+//! single subgroup (64 threads, REQD_SUBGROUP_SIZE_64)으로 강제하여 cross-
+//! subgroup reduction을 제거 → SLM 불필요 → LOCAL arg 우회.
 //!
 //! Kernel signature:
 //!   kernel void kernel_rms_norm_simple(
@@ -39,9 +47,9 @@
 //!   Int(dim)        → dim
 //!   Float(EPS)      → eps
 //!
-//! Workgroup:
-//!   global = [rows, 1, 1]
-//!   local  = [0, 0, 0] (driver default)
+//! Workgroup (D-D.6, single-subgroup):
+//!   global = [rows * 64, 1, 1]
+//!   local  = [64, 1, 1]
 
 use crate::args::{ArgSpec, MemoryObjectSpec, OpDescriptor, OpError, OpImplLayout};
 use crate::qnn::{Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, Qnn_OpConfigV1_t};
@@ -50,9 +58,14 @@ const EPS: f32 = 1e-5;
 
 pub static DESCRIPTOR: OpDescriptor = OpDescriptor {
     op_type: "CustomRmsNorm",
-    kernel_name: "kernel_rms_norm_simple",
+    // D-D.6: subgroup-reduce variant for byte-equal numerical match with
+    // production `kernel_rms_norm_opt` (parallel reduction).
+    kernel_name: "kernel_rms_norm_oop_subgroup",
     kernel_source: include_str!("../../../../engine/kernels/simple_ops.cl"),
-    build_options: "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math",
+    // D-D.6: production OpenCLBackend의 build flag와 byte-equal 통일
+    // (`-cl-unsafe-math-optimizations -cl-finite-math-only` 추가). compiler가
+    // 같은 reduction order / MAD fusion을 적용하도록 보장.
+    build_options: "-cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math",
     build_layout,
 };
 
@@ -120,13 +133,18 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
         ArgSpec::Float(EPS),      // eps
     ];
 
+    // D-D.6: single-subgroup workgroup. global = [rows * 64], local = [64].
+    // Adreno에서 REQD_SUBGROUP_SIZE_64 attribute (qcom_reqd_sub_group_size("half"))로
+    // sg_size=64 강제. workgroup이 1 subgroup이라 cross-subgroup reduction 불필요.
+    const SG_SIZE: usize = 64;
+
     Ok(OpImplLayout {
         mem_objects,
         args,
         output_claims: None,
         global_work_dim: 1,
-        local_work_dim: 0,
-        global_work: [rows as usize, 1, 1],
-        local_work: [0, 0, 0],
+        local_work_dim: 1,
+        global_work: [rows as usize * SG_SIZE, 1, 1],
+        local_work: [SG_SIZE, 1, 1],
     })
 }

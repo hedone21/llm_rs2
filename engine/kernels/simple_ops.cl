@@ -779,18 +779,69 @@ kernel void kernel_rms_norm_simple(
     float eps
 ) {
     int row = get_global_id(0);
-    
+
     float sum_sq = 0.0f;
     for (int i = 0; i < dim; i++) {
         float val = x[row * dim + i];
         sum_sq += val * val;
     }
-    
+
     float rms = sqrt(sum_sq / (float)dim + eps);
     float scale = 1.0f / rms;
-    
+
     for (int i = 0; i < dim; i++) {
         output[row * dim + i] = x[row * dim + i] * scale * weight[i];
+    }
+}
+
+// D-D.6 RMS norm — OOP single-subgroup variant.
+// Production `kernel_rms_norm_opt` (in-place, parallel reduction with __local
+// scratch)와 numerical-equivalent reduction order. SDK가 LOCAL arg를 OpPackage
+// path에서 reject하므로 (graphFinalize err=0x1786 — see rms_norm op doc),
+// workgroup_size를 single subgroup (64 threads)로 강제하여 cross-subgroup
+// reduction 제거 → __local scratch 불필요.
+//
+// Production opt의 default workgroup이 64 + REQD_SUBGROUP_SIZE_64이면 multi-
+// subgroup count = 1이라 cross-subgroup phase는 single-value passthrough →
+// 본 single-subgroup 변종과 byte-equal numerical 결과.
+//
+// Workgroup contract (caller responsibility):
+//   global = [rows * 64, 1, 1]
+//   local  = [64, 1, 1]
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_rms_norm_oop_subgroup(
+    global float * x,
+    global float * weight,
+    global float * output,
+    int dim,
+    float eps
+) {
+    int row = get_group_id(0);
+    int lid = get_sub_group_local_id();
+    int sg_size = get_max_sub_group_size();  // = 64 on Adreno (REQD_SUBGROUP_SIZE_64)
+
+    global float * row_in = x + row * dim;
+    global float * row_out = output + row * dim;
+
+    // Phase 1: parallel partial sum-of-squares (sg_size threads).
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim; i += sg_size) {
+        float val = row_in[i];
+        sum_sq += val * val;
+    }
+
+    // Phase 2: subgroup reduction (no SLM, hardware intrinsic).
+    sum_sq = sub_group_reduce_add(sum_sq);
+    // sub_group_reduce_add returns the same value for all subgroup lanes,
+    // so no broadcast is needed.
+
+    // Phase 3: scale + weight in parallel.
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+    for (int i = lid; i < dim; i += sg_size) {
+        row_out[i] = row_in[i] * scale * weight[i];
     }
 }
 

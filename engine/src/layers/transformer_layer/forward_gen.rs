@@ -195,6 +195,21 @@ impl TransformerLayer {
             )?;
         }
         prof_record!(t, rms_norm);
+
+        // D-D.6 디버깅: layer 0 + start_pos > 0 (첫 decode) RMS output을
+        // file에 dump. microbench raw chain RMS와 byte 비교용.
+        if args.layer_idx == 0 && start_pos > 0 {
+            eprintln!("[forward_gen entered] layer=0 pos={start_pos}");
+            if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_RMS_OUT") {
+                let mut bytes = vec![0u8; ws.residual.size()];
+                let _ = backend.read_buffer(&ws.residual, &mut bytes);
+                let _ = std::fs::write(&p, &bytes);
+                eprintln!(
+                    "[fallback-dump-rms layer=0 pos={start_pos}] wrote {} bytes to {p}",
+                    bytes.len()
+                );
+            }
+        }
         tr_record!(tr, RmsNormAttn);
 
         // 2. QKV Projections from normalized x (ws.residual) — fused dispatch for F16 CPU

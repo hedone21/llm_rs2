@@ -189,11 +189,35 @@ fn android_init() -> Result<Arc<QnnOppkgRuntime>> {
         &*v_ptr
     };
 
+    // D-D.6 디버깅: VERBOSE logger — `LLMRS_QNN_OPPKG_VERBOSE_LOG=1` 시 활성화.
+    // adb logcat -v threadtime QnnGpu:V QnnGpuOpPackage:V QnnGraph:V *:S 로 캡처.
+    let mut logger: ffi::Qnn_LogHandle_t = ptr::null_mut();
+    if std::env::var("LLMRS_QNN_OPPKG_VERBOSE_LOG").as_deref() == Ok("1")
+        && let Some(log_create) = v.logCreate
+    {
+        let err = unsafe {
+            log_create(
+                None,
+                ffi::QnnLog_Level_t_QNN_LOG_LEVEL_VERBOSE,
+                &mut logger,
+            )
+        };
+        if err != 0 {
+            eprintln!(
+                "[qnn_oppkg] logCreate VERBOSE err=0x{:x} (proceeding without logger)",
+                err
+            );
+            logger = ptr::null_mut();
+        } else {
+            eprintln!("[qnn_oppkg] logCreate VERBOSE: OK");
+        }
+    }
+
     let backend_create = v
         .backendCreate
         .ok_or_else(|| anyhow!("backendCreate fn-pointer is NULL in V2.25 vtable"))?;
     let mut backend: ffi::Qnn_BackendHandle_t = ptr::null_mut();
-    let err = unsafe { backend_create(ptr::null_mut(), ptr::null_mut(), &mut backend) };
+    let err = unsafe { backend_create(logger, ptr::null_mut(), &mut backend) };
     if err != 0 {
         return Err(anyhow!("QnnBackend_create err=0x{:x}", err));
     }

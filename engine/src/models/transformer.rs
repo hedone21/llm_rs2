@@ -1691,7 +1691,18 @@ impl TransformerModel {
                 // skip_attn/skip_mlp 또는 importance/score collection이 필요한
                 // 경우는 fast path가 fine-grained ops를 노출하지 않으므로 기존
                 // forward() 경로 사용 (graceful fallback).
+                // D-D.6 디버깅: layer-level cap. `LLMRS_QNN_OPPKG_FAST_PATH_MAX_LAYER=k`
+                // 설정 시 layer i < k에서만 fast path. divergence layer를 bisect로
+                // 격리하기 위함 (k=1, 2, 4, ... 순차 증가하며 첫 mismatch 위치 탐색).
+                let layer_cap_ok = match std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_MAX_LAYER") {
+                    Ok(v) => v.parse::<usize>().map(|cap| i < cap).unwrap_or(true),
+                    Err(_) => true,
+                };
                 let qnn_fast_path_eligible = backend.supports_layer_graph()
+                    && layer_cap_ok
+                    && seq_len == 1  // D-D.6 root cause fix: graph는 single-token 가정.
+                                     // prefill (seq_len > 1)에서 fast path 진입 시
+                                     // batch의 첫 token만 처리하고 나머지 무시 → garbage.
                     && !s_attn
                     && !s_mlp
                     && !need_scores
@@ -1722,6 +1733,38 @@ impl TransformerModel {
                     // KV cache pos는 graph 내부에서 갱신되었으므로 caller도 동기화.
                     kv_caches[i].advance_pos(seq_len);
                 } else {
+                    // D-D.6 디버깅: layer 0 첫 호출 fallback x_in dump.
+                    let dump_fb =
+                        std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
+                            && i == 0
+                            && start_pos < 16
+                            && seq_len == 1;
+                    if dump_fb {
+                        let mut bytes = vec![0u8; x.size()];
+                        let _ = backend.read_buffer(&x, &mut bytes);
+                        let xf = unsafe {
+                            std::slice::from_raw_parts(
+                                bytes.as_ptr() as *const f32,
+                                8.min(bytes.len() / 4),
+                            )
+                        };
+                        eprintln!(
+                            "[fallback-dump layer={i} pos={start_pos} seq_len={seq_len}] x_in[0..8] = {:?}",
+                            xf
+                        );
+                        // KV cache K dump (HeadMajor F16, 첫 32 byte).
+                        if let Some((k_tensor, _v_tensor)) = kv_caches[i].get_buffers_mut() {
+                            let mut k_bytes = vec![0u8; k_tensor.size()];
+                            let _ = backend.read_buffer(k_tensor, &mut k_bytes);
+                            let nz = k_bytes.iter().filter(|&&b| b != 0).count();
+                            eprintln!(
+                                "[fallback-dump-kv layer={i} pos={start_pos}] kv_k.len={} nonzero={} | k[0..32]={:02x?}",
+                                k_bytes.len(),
+                                nz,
+                                &k_bytes[..32.min(k_bytes.len())]
+                            );
+                        }
+                    }
                     layer.forward(LayerForwardArgs {
                         x: &mut x,
                         kv_cache: &mut kv_caches[i],
@@ -1743,6 +1786,28 @@ impl TransformerModel {
                         local_attn_window: self.config.sliding_window,
                         is_last_layer: i + 1 == num_layers,
                     })?;
+                    if dump_fb {
+                        let mut bytes = vec![0u8; x.size()];
+                        let _ = backend.read_buffer(&x, &mut bytes);
+                        let xof = unsafe {
+                            std::slice::from_raw_parts(
+                                bytes.as_ptr() as *const f32,
+                                8.min(bytes.len() / 4),
+                            )
+                        };
+                        eprintln!(
+                            "[fallback-dump layer={i} pos={start_pos}] x_out[0..8] = {:?}",
+                            xof
+                        );
+                        // D-D.6: dump fallback x_out for byte comparison with fast path.
+                        if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_X_OUT") {
+                            let _ = std::fs::write(&p, &bytes);
+                            eprintln!(
+                                "[fallback-dump-x-out layer={i} pos={start_pos}] wrote {} bytes to {p}",
+                                bytes.len()
+                            );
+                        }
+                    }
                 }
                 // Intra-token GPU yield hook (decode only, seq_len == 1).
                 crate::core::gpu_yield::maybe_yield_after_layer(&**backend, i, true);

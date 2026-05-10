@@ -23,6 +23,11 @@ use std::sync::Arc;
 pub struct GraphCache {
     layers: Vec<Arc<LayerGraph>>,
     finalize_total_ms: u32,
+    /// D-D.6 디버깅: fresh build per execute mode를 위한 weight slots + cfg snapshot.
+    /// `LLMRS_QNN_OPPKG_FAST_PATH_FRESH_BUILD=1` 시 prebuild cache 무시하고
+    /// 매 execute마다 build_layer_graph를 호출 (microbench와 동일 lifecycle).
+    debug_slots: Vec<Arc<LayerSlot>>,
+    debug_cfg: Option<LayerConfig>,
 }
 
 impl GraphCache {
@@ -31,6 +36,8 @@ impl GraphCache {
         Self {
             layers: Vec::new(),
             finalize_total_ms: 0,
+            debug_slots: Vec::new(),
+            debug_cfg: None,
         }
     }
 
@@ -55,7 +62,25 @@ impl GraphCache {
             "GraphCache::prebuild called twice (INV-167 violation)"
         );
 
+        // D-D.6 디버깅: fresh build mode를 위해 slot/cfg 보관.
+        self.debug_slots = slots.to_vec();
+        self.debug_cfg = Some(*cfg);
+
+        // D-D.6 디버깅: prebuild를 N개 layer로 cap. 28-layer 누적 build가
+        // SDK 내부 shared resource (logger, slot pool 등)를 corrupt 시키는지
+        // 확인. `LLMRS_QNN_OPPKG_PREBUILD_MAX_LAYERS=k` 설정 시 layer < k까지만
+        // build. layer ≥ k의 fast path 진입은 graph cache miss로 fail.
+        let prebuild_cap = std::env::var("LLMRS_QNN_OPPKG_PREBUILD_MAX_LAYERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
         for (idx, slot) in slots.iter().enumerate() {
+            if idx >= prebuild_cap {
+                eprintln!(
+                    "[graph_cache] prebuild cap reached: layer {idx} >= {prebuild_cap}, skipping"
+                );
+                break;
+            }
             let weights = slot.load_weights();
             let lg = LayerGraph::build(runtime, idx, weights.as_ref(), cfg)?;
 
@@ -93,6 +118,27 @@ impl GraphCache {
     /// Layer graph 1개에 대한 read-only 핸들. M3.3 dispatch path에서 사용.
     pub fn get(&self, layer_idx: usize) -> Option<Arc<LayerGraph>> {
         self.layers.get(layer_idx).cloned()
+    }
+
+    /// D-D.6 디버깅: fresh build per execute. cache hit 무시하고 매번 build.
+    /// `LLMRS_QNN_OPPKG_FAST_PATH_FRESH_BUILD=1` 시 활성. microbench와 동일한
+    /// process state lifecycle을 production fast path에 inject.
+    pub fn fresh_build(
+        &self,
+        runtime: &QnnOppkgRuntime,
+        layer_idx: usize,
+    ) -> Result<Arc<LayerGraph>> {
+        let slot = self
+            .debug_slots
+            .get(layer_idx)
+            .ok_or_else(|| anyhow::anyhow!("fresh_build: layer {layer_idx} slot not stored"))?;
+        let cfg = self
+            .debug_cfg
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("fresh_build: cfg not stored"))?;
+        let weights = slot.load_weights();
+        let lg = LayerGraph::build(runtime, layer_idx, weights.as_ref(), cfg)?;
+        Ok(Arc::new(lg))
     }
 }
 

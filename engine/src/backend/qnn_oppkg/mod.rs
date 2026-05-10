@@ -244,6 +244,12 @@ impl Backend for QnnOppkgBackend {
         if !force_fast {
             return false;
         }
+        // D-D.6 디버깅: fresh_build mode면 prebuild cache가 비어도 fast path 활성.
+        // execute_layer_graph 내부에서 fresh_build helper로 매번 build.
+        let fresh = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_FRESH_BUILD").as_deref() == Ok("1");
+        if fresh {
+            return self.runtime.is_initialized();
+        }
         let cache_ok = self
             .graph_cache
             .lock()
@@ -275,9 +281,17 @@ impl Backend for QnnOppkgBackend {
         n_kv: usize,
         x_out: &mut Tensor,
     ) -> Result<()> {
-        let lg = self.graph_for_layer(layer_idx).ok_or_else(|| {
-            anyhow!("execute_layer_graph(layer={layer_idx}): graph cache miss — prebuild 누락")
-        })?;
+        // D-D.6 디버깅: fresh build mode — `LLMRS_QNN_OPPKG_FAST_PATH_FRESH_BUILD=1`
+        // 시 cache hit 무시하고 매 execute마다 build_layer_graph 호출. microbench와
+        // 동일한 lifecycle (build → execute → drop)을 production에 inject.
+        let lg = if std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_FRESH_BUILD").as_deref() == Ok("1") {
+            let cache = self.graph_cache.lock().expect("graph_cache mutex poisoned");
+            cache.fresh_build(self.runtime.as_ref(), layer_idx)?
+        } else {
+            self.graph_for_layer(layer_idx).ok_or_else(|| {
+                anyhow!("execute_layer_graph(layer={layer_idx}): graph cache miss — prebuild 누락")
+            })?
+        };
 
         // fallback backend (OpenCL secondary)를 통해 cl_mem buffer를 host bytes로
         // 가져온다. 이는 INV-175 (decode fast path 동안 fallback_call_count 0)
@@ -299,6 +313,75 @@ impl Backend for QnnOppkgBackend {
         fb.read_buffer(kv_cache_v, &mut kv_v_bytes)?;
         let mut x_out_bytes = vec![0u8; x_out.size()];
 
+        // D-D.6 디버깅: OpenCL secondary와 QNN GPU 사이 GPU state 간섭 가능성
+        // 검증 — read_buffer (blocking) 후에도 OpenCL queue가 GPU에서 fully
+        // idle이 아닐 수 있음. 명시적 synchronize() 추가.
+        if std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_FORCE_SYNC").as_deref() == Ok("1") {
+            fb.synchronize()?;
+        }
+
+        // D-D.6 디버깅: KV cache 초기 상태 검증 (layer=0 pos=0).
+        if layer_idx == 0
+            && pos < 8
+            && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
+        {
+            let kv_k_nz = kv_k_bytes.iter().filter(|&&b| b != 0).count();
+            let kv_v_nz = kv_v_bytes.iter().filter(|&&b| b != 0).count();
+            // HeadMajor F16: head 0 token 0 = bytes [0..256] (head_dim=128 halves).
+            // Prefill에서 누적된 첫 토큰의 K vector 첫 32 byte hex dump.
+            eprintln!(
+                "[fast-dump-kv layer={layer_idx} pos={pos}] kv_k.len={} nonzero={} | kv_v nonzero={} | k[0..32]={:02x?}",
+                kv_k_bytes.len(),
+                kv_k_nz,
+                kv_v_nz,
+                &kv_k_bytes[..32.min(kv_k_bytes.len())]
+            );
+        }
+
+        // D-D.6 디버깅: 첫 fast path 호출 시 production state binary dump.
+        // microbench inject용. `_TARGET_POS=k` (default 6)로 dump 시점 지정.
+        // x_in / kv_k / kv_v 3개 파일 동시 dump.
+        let dump_target_pos = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_TARGET_POS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(6);
+        if layer_idx == 0 && pos == dump_target_pos {
+            if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_X") {
+                let _ = std::fs::write(&p, &x_bytes);
+                eprintln!(
+                    "[fast-dump-x layer={layer_idx} pos={pos}] wrote {} bytes to {p}",
+                    x_bytes.len()
+                );
+            }
+            if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_KV_K") {
+                let _ = std::fs::write(&p, &kv_k_bytes);
+                eprintln!(
+                    "[fast-dump-kv-k layer={layer_idx} pos={pos}] wrote {} bytes to {p}",
+                    kv_k_bytes.len()
+                );
+            }
+            if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_KV_V") {
+                let _ = std::fs::write(&p, &kv_v_bytes);
+                eprintln!(
+                    "[fast-dump-kv-v layer={layer_idx} pos={pos}] wrote {} bytes to {p}",
+                    kv_v_bytes.len()
+                );
+            }
+        }
+
+        // D-D.6 디버깅: 첫 진입 시 input bytes float dump (pos=0, layer=0).
+        let dump = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
+            && pos < 16
+            && layer_idx == 0;
+        if dump {
+            let xf =
+                unsafe { std::slice::from_raw_parts(x_bytes.as_ptr() as *const f32, 8.min(x_bytes.len() / 4)) };
+            eprintln!(
+                "[fast-dump layer={layer_idx} pos={pos} n_kv={n_kv}] x_in[0..8] = {:?}",
+                xf
+            );
+        }
+
         // mask: graph 내부 rpcmem buffer 사용 (M3.4 시점은 빈 slice).
         let empty_mask: &[u8] = &[];
 
@@ -312,6 +395,31 @@ impl Backend for QnnOppkgBackend {
             empty_mask,
             &mut x_out_bytes,
         )?;
+
+        // D-D.6 디버깅: graph execute 후 x_out도 production reference로 dump.
+        if layer_idx == 0
+            && pos == dump_target_pos
+            && let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_X_OUT")
+        {
+            let _ = std::fs::write(&p, &x_out_bytes);
+            eprintln!(
+                "[fast-dump-x-out layer={layer_idx} pos={pos}] wrote {} bytes to {p}",
+                x_out_bytes.len()
+            );
+        }
+
+        if dump {
+            let xof = unsafe {
+                std::slice::from_raw_parts(
+                    x_out_bytes.as_ptr() as *const f32,
+                    8.min(x_out_bytes.len() / 4),
+                )
+            };
+            eprintln!(
+                "[fast-dump layer={layer_idx} pos={pos} n_kv={n_kv}] x_out[0..8] = {:?}",
+                xof
+            );
+        }
 
         // graph rpcmem → OpenCL cl_mem write back.
         fb.write_buffer(x_out, &x_out_bytes)?;

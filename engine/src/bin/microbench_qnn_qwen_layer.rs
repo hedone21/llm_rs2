@@ -76,9 +76,30 @@ fn main() -> anyhow::Result<()> {
     let kv_capacity: usize = 2048;
     let q_proj_out: usize = n_head * head_dim;
     let kv_proj_out: usize = n_kv_heads * head_dim;
-    let pos: i32 = 0; // KV cache initially empty; this layer writes pos=0.
-    let n_kv: usize = 1; // attention sees the freshly written token only.
+    // D-D.6 디버깅: production state inject 시 (pos, n_kv) override.
+    // `LLMRS_MICROBENCH_POS=k`, `LLMRS_MICROBENCH_N_KV=k` 설정 시.
+    let pos: i32 = std::env::var("LLMRS_MICROBENCH_POS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
+    let n_kv: usize = std::env::var("LLMRS_MICROBENCH_N_KV")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
     let theta: f32 = 1_000_000.0; // Qwen2.5 RoPE theta.
+    if pos != 0 || n_kv != 1 {
+        eprintln!("[microbench] (pos, n_kv) override: pos={pos}, n_kv={n_kv}");
+    }
+
+    // D-D.6 디버깅: production-style backend ordering inject. OpenCLBackend
+    // secondary 인스턴스를 미리 init하여 cl_context가 GPU에 alloc되어 있는
+    // 상태에서 QNN graph build/execute. `LLMRS_MICROBENCH_OCL_SECONDARY=1` 시 활성.
+    let _ocl_secondary = if std::env::var("LLMRS_MICROBENCH_OCL_SECONDARY").as_deref() == Ok("1") {
+        eprintln!("[microbench] OCL_SECONDARY: initializing OpenCLBackend (production-style)");
+        Some(llm_rs2::backend::opencl::OpenCLBackend::new()?)
+    } else {
+        None
+    };
 
     println!("=== microbench_qnn_qwen_layer (M2.H) ===\n");
     println!("Op Package:       {}", PKG_PATH);
@@ -111,7 +132,8 @@ fn main() -> anyhow::Result<()> {
     let add_src = include_str!("../../kernels/add.cl");
     let q40_src = include_str!("../../kernels/mul_mv_q4_0_f32_8x_flat.cl");
     let fa_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
-    let cl_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math";
+    // D-D.6: production OpenCLBackend의 build flag와 byte-equal 통일.
+    let cl_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math";
     let fa_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math -DDK=128 -DDV=128 \
                    -DBLOCK_M=32 -DBLOCK_N=32";
 
@@ -136,7 +158,9 @@ fn main() -> anyhow::Result<()> {
         .cmplr_opt(fa_opts)
         .build(&cl_ctx)?;
 
-    let k_rms = ocl::core::create_kernel(&prog_simple, "kernel_rms_norm_simple")?;
+    // D-D.6: graph가 사용하는 새 OOP single-subgroup variant로 raw chain도 통일.
+    // 같은 algorithm 사용 → microbench에서 graph (new) vs raw chain (new)가 byte-equal.
+    let k_rms = ocl::core::create_kernel(&prog_simple, "kernel_rms_norm_oop_subgroup")?;
     let k_q40 = ocl::core::create_kernel(&prog_q40, "kernel_mul_mat_q4_0_f32_8x_flat")?;
     let k_rope = ocl::core::create_kernel(&prog_simple, "kernel_rope_simple")?;
     let k_kvs = ocl::core::create_kernel(&prog_simple, "kernel_kv_scatter_f32_to_f16")?;
@@ -361,6 +385,25 @@ fn run_layer(
     for (i, x) in host_x.iter_mut().enumerate() {
         *x = ((i as f32) * 0.0173 + 0.07).rem_euclid(1.0) - 0.5;
     }
+    // D-D.6 디버깅: production이 dump한 x_in bytes를 inject. random input
+    // (well-conditioned)에서 PASS인데 production에서 RED라면 input pattern이
+    // root cause. `LLMRS_MICROBENCH_X_FILE=/path/to/x.bin` 설정 시 활성.
+    if let Ok(p) = std::env::var("LLMRS_MICROBENCH_X_FILE") {
+        let bytes = std::fs::read(&p)?;
+        let expected = dim * 4;
+        anyhow::ensure!(
+            bytes.len() == expected,
+            "x file: bytes={} != expected {expected}",
+            bytes.len()
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_x.as_mut_ptr() as *mut u8, expected);
+        }
+        eprintln!(
+            "[microbench] x_in injected from {p} — host_x[0..8]={:?}",
+            &host_x[..8]
+        );
+    }
     let mut host_rms_w_pre = vec![0.0f32; dim];
     let mut host_rms_w_post = vec![0.0f32; dim];
     for (i, w) in host_rms_w_pre.iter_mut().enumerate() {
@@ -388,13 +431,85 @@ fn run_layer(
     // Pack to Q4_0 SOA on host (so raw OpenCL and OpPackage paths consume
     // identical byte buffers — quantisation error becomes a constant offset
     // shared by both paths).
-    let (qq_q, qq_d) = pack_q40_soa(&w_q, q_proj_out, dim);
-    let (qk_q, qk_d) = pack_q40_soa(&w_k, kv_proj_out, dim);
-    let (qv_q, qv_d) = pack_q40_soa(&w_v, kv_proj_out, dim);
-    let (qo_q, qo_d) = pack_q40_soa(&w_o, dim, q_proj_out);
-    let (qg_q, qg_d) = pack_q40_soa(&w_gate, ffn_dim, dim);
-    let (qu_q, qu_d) = pack_q40_soa(&w_up, ffn_dim, dim);
-    let (qd_q, qd_d) = pack_q40_soa(&w_down, dim, ffn_dim);
+    let (mut qq_q, mut qq_d) = pack_q40_soa(&w_q, q_proj_out, dim);
+    let (mut qk_q, mut qk_d) = pack_q40_soa(&w_k, kv_proj_out, dim);
+    let (mut qv_q, mut qv_d) = pack_q40_soa(&w_v, kv_proj_out, dim);
+    let (mut qo_q, mut qo_d) = pack_q40_soa(&w_o, dim, q_proj_out);
+    let (mut qg_q, mut qg_d) = pack_q40_soa(&w_gate, ffn_dim, dim);
+    let (mut qu_q, mut qu_d) = pack_q40_soa(&w_up, ffn_dim, dim);
+    let (mut qd_q, mut qd_d) = pack_q40_soa(&w_down, dim, ffn_dim);
+
+    // D-D.6 디버깅: GGUF에서 layer 0 production weight를 inject하여 random
+    // weight (well-conditioned) vs 실제 weight (specific patterns) 차이 검증.
+    // `LLMRS_MICROBENCH_GGUF=/path/to/qwen.gguf` 설정 시 활성. inject 후 raw
+    // OpenCL chain과 graph 둘 다 GGUF AOS→SOA bytes를 consume하므로
+    // bit-identical (graph kernel이 정상이면 PASS).
+    if let Ok(p) = std::env::var("LLMRS_MICROBENCH_GGUF") {
+        eprintln!("[microbench] GGUF inject: loading layer 0 weights from {p}");
+        use llm_rs2::backend::qnn_oppkg::weight_pack::aos_to_soa_q4_0;
+        use llm_rs2::models::loader::gguf::GgufFile;
+        let gguf = GgufFile::open(std::path::Path::new(&p))?;
+        let load_q4_0 = |name: &str, n: usize, k: usize| -> anyhow::Result<(Vec<u8>, Vec<u16>)> {
+            let info = gguf
+                .find_tensor(name)
+                .ok_or_else(|| anyhow::anyhow!("GGUF: {name} not found"))?;
+            let raw = gguf.tensor_data(info);
+            let num_blocks = n * k / 32;
+            let expected = num_blocks * 18;
+            anyhow::ensure!(
+                raw.len() >= expected,
+                "GGUF {name}: bytes={} < expected {expected}",
+                raw.len()
+            );
+            Ok(aos_to_soa_q4_0(&raw[..expected], n, k))
+        };
+        let load_f32 = |name: &str, n: usize| -> anyhow::Result<Vec<f32>> {
+            let info = gguf
+                .find_tensor(name)
+                .ok_or_else(|| anyhow::anyhow!("GGUF: {name} not found"))?;
+            let raw = gguf.tensor_data(info);
+            let expected = n * 4;
+            anyhow::ensure!(
+                raw.len() >= expected,
+                "GGUF {name}: bytes={} < expected {expected}",
+                raw.len()
+            );
+            let mut out = vec![0.0f32; n];
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, expected);
+            }
+            Ok(out)
+        };
+        let (q_q, q_d) = load_q4_0("blk.0.attn_q.weight", q_proj_out, dim)?;
+        qq_q = q_q;
+        qq_d = q_d;
+        let (k_q, k_d) = load_q4_0("blk.0.attn_k.weight", kv_proj_out, dim)?;
+        qk_q = k_q;
+        qk_d = k_d;
+        let (v_q, v_d) = load_q4_0("blk.0.attn_v.weight", kv_proj_out, dim)?;
+        qv_q = v_q;
+        qv_d = v_d;
+        let (o_q, o_d) = load_q4_0("blk.0.attn_output.weight", dim, q_proj_out)?;
+        qo_q = o_q;
+        qo_d = o_d;
+        let (g_q, g_d) = load_q4_0("blk.0.ffn_gate.weight", ffn_dim, dim)?;
+        qg_q = g_q;
+        qg_d = g_d;
+        let (u_q, u_d) = load_q4_0("blk.0.ffn_up.weight", ffn_dim, dim)?;
+        qu_q = u_q;
+        qu_d = u_d;
+        let (d_q, d_d) = load_q4_0("blk.0.ffn_down.weight", dim, ffn_dim)?;
+        qd_q = d_q;
+        qd_d = d_d;
+        host_rms_w_pre = load_f32("blk.0.attn_norm.weight", dim)?;
+        host_rms_w_post = load_f32("blk.0.ffn_norm.weight", dim)?;
+        eprintln!(
+            "[microbench] GGUF inject done — qq_q.len={} qq_d[0..4]={:?} rms_pre[0..4]={:?}",
+            qq_q.len(),
+            &qq_d[..4.min(qq_d.len())],
+            &host_rms_w_pre[..4.min(host_rms_w_pre.len())]
+        );
+    }
 
     // ── 2. Path A: raw OpenCL — 14-stage chain ──────────────────────────────
     // Buffers: x, rms_w_pre, q4_0 (q+d) per weight, intermediates, kv cache.
@@ -511,8 +626,47 @@ fn run_layer(
     up_u16!(&buf_ud, &qu_d);
     up_u8!(&buf_dq, &qd_q);
     up_u16!(&buf_dd, &qd_d);
-    up_u16!(&buf_kcache, &host_kv_zero);
-    up_u16!(&buf_vcache, &host_kv_zero);
+    // D-D.6 디버깅: KV K/V file inject — production state inject 시. 미설정이면
+    // host_kv_zero (default). raw OpenCL chain의 buf_kcache/vcache + graph rpcmem
+    // KV slot 양쪽 모두 동일 bytes로 초기화 (둘이 동일 input 갖도록 byte-equal 비교).
+    let host_kv_k: Vec<u16> = match std::env::var("LLMRS_MICROBENCH_KV_K_FILE") {
+        Ok(p) => {
+            let raw = std::fs::read(&p)?;
+            let expected = kv_total * 2;
+            anyhow::ensure!(
+                raw.len() == expected,
+                "kv_k file: bytes={} != expected {expected}",
+                raw.len()
+            );
+            let mut out = vec![0u16; kv_total];
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, expected);
+            }
+            eprintln!("[microbench] KV K injected from {p}");
+            out
+        }
+        Err(_) => host_kv_zero.clone(),
+    };
+    let host_kv_v: Vec<u16> = match std::env::var("LLMRS_MICROBENCH_KV_V_FILE") {
+        Ok(p) => {
+            let raw = std::fs::read(&p)?;
+            let expected = kv_total * 2;
+            anyhow::ensure!(
+                raw.len() == expected,
+                "kv_v file: bytes={} != expected {expected}",
+                raw.len()
+            );
+            let mut out = vec![0u16; kv_total];
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, expected);
+            }
+            eprintln!("[microbench] KV V injected from {p}");
+            out
+        }
+        Err(_) => host_kv_zero.clone(),
+    };
+    up_u16!(&buf_kcache, &host_kv_k);
+    up_u16!(&buf_vcache, &host_kv_v);
     ocl::core::finish(cl_q)?;
 
     // ── M2.I breakdown timing — raw OpenCL chain wall-clock ─────────────────
@@ -531,20 +685,40 @@ fn run_layer(
     ocl::core::set_kernel_arg(k_rms, 2, ArgVal::mem(&buf_y1))?;
     ocl::core::set_kernel_arg(k_rms, 3, ArgVal::scalar(&dim_i))?;
     ocl::core::set_kernel_arg(k_rms, 4, ArgVal::scalar(&RMS_EPS))?;
-    let one3 = [1usize, 1, 1];
+    // D-D.6: kernel_rms_norm_oop_subgroup contract — global=[rows*64], local=[64].
+    let rms_global = [1usize * 64, 1, 1];
+    let rms_local = [64usize, 1, 1];
     unsafe {
         ocl::core::enqueue_kernel(
             cl_q,
             k_rms,
             1,
             None,
-            &one3,
-            None,
+            &rms_global,
+            Some(rms_local),
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
     }
     ocl::core::finish(cl_q)?;
+
+    // D-D.6 디버깅: raw chain RMS output (buf_y1) dump.
+    if let Ok(p) = std::env::var("LLMRS_MICROBENCH_DUMP_RMS_OUT") {
+        let mut bytes = vec![0u8; dim * 4];
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                cl_q,
+                &buf_y1,
+                true,
+                0,
+                &mut bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        std::fs::write(&p, &bytes)?;
+        eprintln!("[microbench-dump-rms] wrote {} bytes to {p}", bytes.len());
+    }
 
     // Helper for Q4_0 matmul stage. Mirrors microbench_qnn_oppkg_matmul_q40.
     let dispatch_q40 = |k_q40: &ocl::core::Kernel,
@@ -823,14 +997,15 @@ fn run_layer(
     ocl::core::set_kernel_arg(k_rms, 2, ArgVal::mem(&buf_y2))?;
     ocl::core::set_kernel_arg(k_rms, 3, ArgVal::scalar(&dim_i))?;
     ocl::core::set_kernel_arg(k_rms, 4, ArgVal::scalar(&RMS_EPS))?;
+    // D-D.6: kernel_rms_norm_oop_subgroup contract — global=[rows*64], local=[64].
     unsafe {
         ocl::core::enqueue_kernel(
             cl_q,
             k_rms,
             1,
             None,
-            &one3,
-            None,
+            &rms_global,
+            Some(rms_local),
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
@@ -907,8 +1082,8 @@ fn run_layer(
             k_rms,
             1,
             None,
-            &one3,
-            None,
+            &rms_global,
+            Some(rms_local),
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
@@ -1075,8 +1250,8 @@ fn run_layer(
             k_rms,
             1,
             None,
-            &one3,
-            None,
+            &rms_global,
+            Some(rms_local),
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
@@ -1182,7 +1357,8 @@ fn run_layer(
     let bytes_x_out = (dim * 4) as i32;
     let bytes_q40 = |q: &[u8]| q.len() as i32;
     let bytes_q40d = |d: &[u16]| (d.len() * 2) as i32;
-    let bytes_mask = 2_i32;
+    // D-D.6: mask sized to kv_capacity (F16) — n_kv는 input tensor로 동적 처리.
+    let bytes_mask = (kv_capacity * 2) as i32;
     let bytes_dummy = 4_i32;
     // FlashAttn sinks: kernel reads `sinks_ptr[head_idx]` for head_idx ∈
     // [0, n_head). The OpPackage path always binds a non-null mem object for
@@ -1219,6 +1395,8 @@ fn run_layer(
     let rpc_score = unsafe { rpcmem_alloc(heap_id, flags, bytes_dummy) };
     // M3.4 D-D.1: pos_buf — INT_32 [1].
     let rpc_pos = unsafe { rpcmem_alloc(heap_id, flags, 4) };
+    // M3.4 D-D.6: n_kv_buf — INT_32 [1]. FlashAttn input tensor.
+    let rpc_n_kv = unsafe { rpcmem_alloc(heap_id, flags, 4) };
     anyhow::ensure!(
         !rpc_x.is_null()
             && !rpc_rms_pre.is_null()
@@ -1243,7 +1421,8 @@ fn run_layer(
             && !rpc_mask.is_null()
             && !rpc_sinks.is_null()
             && !rpc_score.is_null()
-            && !rpc_pos.is_null(),
+            && !rpc_pos.is_null()
+            && !rpc_n_kv.is_null(),
         "rpcmem_alloc failed"
     );
 
@@ -1264,8 +1443,18 @@ fn run_layer(
             rpc_rms_post as *mut u8,
             bytes_rms as usize,
         );
-        std::ptr::write_bytes(rpc_kcache as *mut u8, 0, bytes_kv as usize);
-        std::ptr::write_bytes(rpc_vcache as *mut u8, 0, bytes_kv as usize);
+        // D-D.6 디버깅: KV inject가 활성이면 host_kv_k/v 사용 (raw OpenCL과 동일).
+        // 미활성이면 zero init (default).
+        std::ptr::copy_nonoverlapping(
+            host_kv_k.as_ptr() as *const u8,
+            rpc_kcache as *mut u8,
+            bytes_kv as usize,
+        );
+        std::ptr::copy_nonoverlapping(
+            host_kv_v.as_ptr() as *const u8,
+            rpc_vcache as *mut u8,
+            bytes_kv as usize,
+        );
         std::ptr::copy_nonoverlapping(qq_q.as_ptr(), rpc_qq as *mut u8, qq_q.len());
         std::ptr::copy_nonoverlapping(
             qq_d.as_ptr() as *const u8,
@@ -1318,6 +1507,8 @@ fn run_layer(
         std::ptr::write_bytes(rpc_score as *mut u8, 0, bytes_dummy as usize);
         // M3.4 D-D.1: initial pos value = `pos` (matches raw-OpenCL reference).
         *(rpc_pos as *mut i32) = pos;
+        // M3.4 D-D.6: initial n_kv value (FlashAttn dynkv kernel reads this slot).
+        *(rpc_n_kv as *mut i32) = n_kv as i32;
     }
 
     let fd_x = unsafe { rpcmem_to_fd(rpc_x) };
@@ -1344,6 +1535,7 @@ fn run_layer(
     let fd_sinks = unsafe { rpcmem_to_fd(rpc_sinks) };
     let fd_score = unsafe { rpcmem_to_fd(rpc_score) };
     let fd_pos = unsafe { rpcmem_to_fd(rpc_pos) };
+    let fd_n_kv = unsafe { rpcmem_to_fd(rpc_n_kv) };
 
     // ── 4. Build graph: declare tensors then 14 nodes ───────────────────────
     let qp = Qnn_QuantizeParams_t {
@@ -1419,11 +1611,14 @@ fn run_layer(
     let mut dims_down = vec![1u32, dim as u32];
     // M2.H 5th: x_out follows x_in rank to keep Add(residual2) shapes consistent.
     let mut dims_x_out = vec![1u32, dim as u32];
-    let mut dims_mask = vec![n_kv as u32];
+    // D-D.6: mask sized to kv_capacity (n_kv now dynamic).
+    let mut dims_mask = vec![kv_capacity as u32];
     let mut dims_sinks = vec![n_head as u32];
     let mut dims_score = vec![1u32];
     // M3.4 D-D.1: pos_buf is INT_32 [1] shared across RoPE Q/K and KvScatter.
     let mut dims_pos = vec![1u32];
+    // M3.4 D-D.6: n_kv_buf is INT_32 [1] consumed by FlashAttn input.
+    let mut dims_n_kv = vec![1u32];
 
     // Tensor names (CStrings must outlive graph build).
     let nm_x = CString::new("x").unwrap();
@@ -1465,6 +1660,8 @@ fn run_layer(
     let nm_score = CString::new("score").unwrap();
     // M3.4 D-D.1: pos_buf is APP_WRITE so the host can update pos per execute.
     let nm_pos = CString::new("pos").unwrap();
+    // M3.4 D-D.6: n_kv_buf — APP_WRITE INT_32 [1]; FlashAttn dynkv input.
+    let nm_n_kv = CString::new("n_kv_buf").unwrap();
 
     // Helper: build tensor with given type/dtype/rank/dims.
     let build_tensor = |ttype, dtype, rank: u32, dims_ptr: *mut u32, name: *const c_char| {
@@ -1552,6 +1749,8 @@ fn run_layer(
     // M3.4 D-D.1: pos_buf — INT_32 [1] APP_WRITE; updated per execute by host.
     let i32_t = Qnn_DataType_t_QNN_DATATYPE_INT_32;
     let mut t_pos = build_tensor(app_w, i32_t, 1, dims_pos.as_mut_ptr(), nm_pos.as_ptr());
+    // M3.4 D-D.6: n_kv_buf — INT_32 [1] APP_WRITE; FlashAttn dynkv input.
+    let mut t_n_kv = build_tensor(app_w, i32_t, 1, dims_n_kv.as_mut_ptr(), nm_n_kv.as_ptr());
     // Output of layer.
     // M2.H 5th: rank 2 [1, dim] to match x_in shape (Add(residual2) needs same rank).
     let mut t_x_out = build_tensor(app_r, f32_t, 2, dims_x_out.as_mut_ptr(), nm_x_out.as_ptr());
@@ -1669,6 +1868,7 @@ fn run_layer(
         ("sinks", &mut t_sinks),
         ("score", &mut t_score),
         ("pos", &mut t_pos),
+        ("n_kv_buf", &mut t_n_kv),
         ("x_out", &mut t_x_out),
         ("y1", &mut t_y1),
         ("q", &mut t_q),
@@ -1781,19 +1981,9 @@ fn run_layer(
         },
     ];
 
+    // D-D.6: n_kv SCALAR 제거 — n_kv는 input tensor (n_kv_buf)로 동적 처리.
+    let _ = &pn_n_kv;
     let mut fa_params = [
-        Qnn_Param_t {
-            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-            name: pn_n_kv.as_ptr(),
-            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                scalarParam: Qnn_Scalar_t {
-                    dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
-                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 {
-                        int32Value: n_kv as i32,
-                    },
-                },
-            },
-        },
         Qnn_Param_t {
             paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
             name: pn_n_head.as_ptr(),
@@ -1894,7 +2084,10 @@ fn run_layer(
     // inputs[2] (InOutTensor) to fit the single-claim abstraction.
     let mut in_kvs = [t_k_rope, t_v, t_pos];
     let mut out_kvs = [t_kcache, t_vcache];
-    let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score];
+    // D-D.6: FlashAttn input은 (q, k, v, mask, sinks, score, n_kv_buf) 7개.
+    let mut in_fa = [
+        t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score, t_n_kv,
+    ];
     let mut out_fa = [t_attn_o];
     let mut in_o_proj = [t_oq, t_od, t_attn_o];
     let mut out_o_proj = [t_o];
@@ -2007,11 +2200,11 @@ fn run_layer(
             on_fa.as_ptr(),
             ot_fa.as_ptr(),
             in_fa.as_mut_ptr(),
-            6,
+            7, // D-D.6: q + k + v + mask + sinks + score + n_kv_buf
             out_fa.as_mut_ptr(),
             1,
             fa_params.as_mut_ptr(),
-            5,
+            4, // D-D.6: n_head + n_head_kv + kv_capacity + head_dim (n_kv 제거)
             "FlashAttn",
         ),
         (
@@ -2235,9 +2428,10 @@ fn run_layer(
         mk_desc(fd_sinks, rpc_sinks, f32_t, &dims_sinks),
         mk_desc(fd_score, rpc_score, f32_t, &dims_score),
         mk_desc(fd_pos, rpc_pos, i32_t, &dims_pos), // M3.4 D-D.1
+        mk_desc(fd_n_kv, rpc_n_kv, i32_t, &dims_n_kv), // M3.4 D-D.6
         mk_desc(fd_x_out, rpc_x_out, f32_t, &dims_x_out),
     ];
-    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 24];
+    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 25];
     let err = unsafe {
         (v.memRegister.unwrap())(ctx, descs.as_ptr(), descs.len() as u32, mh.as_mut_ptr())
     };
@@ -2296,8 +2490,11 @@ fn run_layer(
     // M3.4 D-D.1: pos_buf at index 22 (descs order).
     let mut t_pos_mh = t_pos;
     set_mh(&mut t_pos_mh, mh[22]);
+    // M3.4 D-D.6: n_kv_buf at index 23 (after pos, before x_out).
+    let mut t_n_kv_mh = t_n_kv;
+    set_mh(&mut t_n_kv_mh, mh[23]);
     let mut t_x_out_mh = t_x_out;
-    set_mh(&mut t_x_out_mh, mh[23]);
+    set_mh(&mut t_x_out_mh, mh[24]);
 
     // ── 8. graphExecute ────────────────────────────────────────────────────
     // exec_inputs: every APP_WRITE tensor; exec_outputs: APP_READ (x_out).
@@ -2325,7 +2522,8 @@ fn run_layer(
         t_mask_mh,
         t_sinks_mh,
         t_score_mh,
-        t_pos_mh, // M3.4 D-D.1
+        t_pos_mh,  // M3.4 D-D.1
+        t_n_kv_mh, // M3.4 D-D.6
     ];
     // M2.H multi-output: kcache + vcache are APP_READ outputs (KvScatter
     // claims). The SDK lets them double as graph-internal edges (FA input).
