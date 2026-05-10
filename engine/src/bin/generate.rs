@@ -5374,6 +5374,7 @@ fn main() -> anyhow::Result<()> {
             && accumulator_compatible_with_plan
             && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
             && !args.swap_intra_forward
+            && !args.swap_phase_aware
         {
             model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
         } else {
@@ -5805,6 +5806,16 @@ fn main() -> anyhow::Result<()> {
             // 마지막 ratio_generation bump + invalidate 수행. PHASE_HOOK은
             // OnceLock이라 unset 불가능하지만 finalize() 후 모든 hook fire가
             // noop이 됨 (dispatcher 내부 finalized atomic).
+            if let Some(disp) = phase_aware_swap_dispatcher.as_ref()
+                && std::env::var("LLMRS_PHASE_AWARE_DEBUG").as_deref() == Ok("1")
+                && decode_token_index < 5
+            {
+                let (q, inf, p, d, hs, he, ce) = disp.debug_snapshot();
+                eprintln!(
+                    "[PhaseAwareSwap-DBG] tok={} queue={} in_flight={} pending={} dispatched={} hook_start={} hook_end={} cachefit_end={}",
+                    decode_token_index, q, inf, p, d, hs, he, ce
+                );
+            }
             if let Some(disp) = phase_aware_swap_dispatcher.as_ref()
                 && disp.is_complete()
             {

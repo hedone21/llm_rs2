@@ -50,7 +50,14 @@ static PHASE_HOOK: OnceLock<Arc<dyn PhaseHook>> = OnceLock::new();
 
 /// PhaseHook 등록 (process-wide, 한 번만 set 가능). 중복 호출은 silently ignore.
 pub fn set_phase_hook(hook: Arc<dyn PhaseHook>) {
-    let _ = PHASE_HOOK.set(hook);
+    let res = PHASE_HOOK.set(hook);
+    if std::env::var("LLMRS_PHASE_AWARE_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "[op_trace::set_phase_hook] PHASE_HOOK.set result: {} (PHASE_HOOK now Some={})",
+            if res.is_ok() { "Ok" } else { "Err (already set)" },
+            PHASE_HOOK.get().is_some()
+        );
+    }
 }
 
 #[inline]

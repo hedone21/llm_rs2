@@ -21,6 +21,15 @@ impl TransformerLayer {
         if args.skip_attn && args.skip_mlp {
             return Ok(());
         }
+        // DEBUG: phase-aware swap 진단 — forward_gen 진입 확인 (env-gated).
+        if std::env::var("LLMRS_PHASE_AWARE_DEBUG").as_deref() == Ok("1")
+            && args.layer_idx < 2
+        {
+            eprintln!(
+                "[forward_gen-DBG] layer_idx={} start_pos={}",
+                args.layer_idx, args.start_pos
+            );
+        }
 
         let _skip_attn = args.skip_attn;
         let _skip_mlp = args.skip_mlp;

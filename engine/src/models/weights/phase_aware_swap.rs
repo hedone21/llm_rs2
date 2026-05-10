@@ -172,6 +172,10 @@ pub struct PhaseAwareSwapDispatcher {
     stage_gate_armed: AtomicBool,
     /// 진단: 누적 dispatch한 chunk 수.
     dispatched_count: AtomicU64,
+    /// DEBUG: PhaseHook fire 카운터 (LLMRS_PHASE_AWARE_DEBUG=1 시 trace).
+    hook_start_calls: AtomicU64,
+    hook_end_calls: AtomicU64,
+    cachefit_end_calls: AtomicU64,
 }
 
 impl PhaseAwareSwapDispatcher {
@@ -201,6 +205,9 @@ impl PhaseAwareSwapDispatcher {
             pending_layers: Mutex::new(HashMap::new()),
             stage_gate_armed: AtomicBool::new(false),
             dispatched_count: AtomicU64::new(0),
+            hook_start_calls: AtomicU64::new(0),
+            hook_end_calls: AtomicU64::new(0),
+            cachefit_end_calls: AtomicU64::new(0),
         })
     }
 
@@ -521,11 +528,27 @@ impl PhaseAwareSwapDispatcher {
             .unwrap_or(false);
         pending_empty
     }
+
+    /// Diagnostic snapshot — (queue, in_flight_some, pending_count,
+    /// dispatched_count, hook_start_calls, hook_end_calls, cachefit_end_calls).
+    pub fn debug_snapshot(&self) -> (usize, bool, usize, u64, u64, u64, u64) {
+        let q = self.chunk_queue.lock().map(|q| q.len()).unwrap_or(0);
+        let inf = self.in_flight.lock().map(|g| g.is_some()).unwrap_or(false);
+        let p = self.pending_layers.lock().map(|p| p.len()).unwrap_or(0);
+        let d = self.dispatched_count.load(Ordering::Acquire);
+        let hs = self.hook_start_calls.load(Ordering::Acquire);
+        let he = self.hook_end_calls.load(Ordering::Acquire);
+        let ce = self.cachefit_end_calls.load(Ordering::Acquire);
+        (q, inf, p, d, hs, he, ce)
+    }
 }
 
 impl PhaseHook for PhaseAwareSwapDispatcher {
     #[inline]
     fn on_op_start(&self, kind: OpKind) {
+        // DEBUG: hook fire counter (atomic, no print to avoid flood).
+        // Decode loop의 debug_snapshot이 read해서 보여줌.
+        self.hook_start_calls.fetch_add(1, Ordering::Relaxed);
         if self.finalized.load(Ordering::Acquire) {
             return;
         }
@@ -536,6 +559,10 @@ impl PhaseHook for PhaseAwareSwapDispatcher {
 
     #[inline]
     fn on_op_end(&self, kind: OpKind) {
+        self.hook_end_calls.fetch_add(1, Ordering::Relaxed);
+        if matches!(kind.ddr_phase(), DdrPhase::CacheFit) {
+            self.cachefit_end_calls.fetch_add(1, Ordering::Relaxed);
+        }
         if self.finalized.load(Ordering::Acquire) {
             return;
         }
