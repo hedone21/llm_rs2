@@ -408,3 +408,257 @@ fn auf_secondary_tensor_bytes_base_offset_round_trip() {
     assert_eq!(info_q.dtype, DType::F32, "attn_q dtype must be F32");
     assert_eq!(info_k.dtype, DType::F32, "attn_k dtype must be F32");
 }
+
+/// SecondaryLayoutChoice::Auto + AUF with `WEIGHTS_CPU_AOS` only.
+///
+/// On OpenCL builds the preferred backend tag is `AdrenoSoa`, but AUFs built
+/// for `--secondary-layout aos` carry only `WEIGHTS_CPU_AOS`. The fallback
+/// path in `open_secondary_with_options` must accept that and produce a
+/// non-SOA SecondaryMmap so `swap_executor::materialise_weight` falls
+/// through to the AOS materialise_tensor branch (host-pointer-bearing
+/// UnifiedBuffer → switch_hw cpu / partition compatible).
+#[test]
+fn auf_secondary_layout_auto_falls_back_to_cpu_aos() {
+    use llm_rs2::auf::AufMeta;
+    use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+    use llm_rs2::core::buffer::DType;
+    use llm_rs2::models::config::{ModelArch, ModelConfig};
+    use llm_rs2::models::weights::{
+        SecondaryDtypeChoice, SecondaryLayoutChoice, open_secondary_auf,
+    };
+
+    // Build minimal AUF with only WEIGHTS_CPU_AOS — no ADRENO_SOA section.
+    let q4_payload: Vec<u8> = (0u8..18).collect();
+    let weights_payload = q4_payload.clone();
+
+    let mut tag_buf = [0u8; 24];
+    tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+    let tensor_index = TensorIndex {
+        variant_tags: vec![tag_buf],
+        entries: vec![TensorEntry {
+            layer_idx: 0,
+            kind: TensorKind::AttnQ.as_u32(),
+            dtype: TensorDType::Q4_0.as_u32(),
+            shape: vec![32, 1],
+            alignment: 64,
+            variant_offsets: vec![0],
+            variant_sizes: vec![18],
+        }],
+    };
+
+    let auf_bytes = AufWriter::new(
+        AufMeta {
+            architecture: "llama".to_owned(),
+            n_layers: 1,
+            n_heads_q: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            hidden_dim: 32,
+            ffn_dim: 64,
+            vocab_size: 2,
+            max_seq_len: 16,
+            rope_theta: 10000.0,
+            rotary_dim: 32,
+            rope_scaling: 1.0,
+            rms_norm_epsilon: 1e-5,
+            default_dtype: None,
+        },
+        make_tokenizer(),
+        [0u8; 32],
+        0,
+        0,
+    )
+    .with_tensor_index(tensor_index)
+    .add_weights_section(TAG_WEIGHTS_CPU_AOS, weights_payload)
+    .build()
+    .unwrap();
+
+    // open_secondary_with_options requires a real path, so write to tempfile.
+    let mut tf = tempfile::NamedTempFile::with_suffix(".auf").unwrap();
+    use std::io::Write;
+    tf.write_all(&auf_bytes).unwrap();
+    let path = tf.path().to_path_buf();
+
+    let config = ModelConfig {
+        arch: ModelArch::Llama,
+        hidden_size: 32,
+        num_hidden_layers: 1,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 32,
+        intermediate_size: 64,
+        vocab_size: 2,
+        rms_norm_eps: 1e-5,
+        rope_theta: 10000.0,
+        has_qkv_bias: false,
+        tie_word_embeddings: false,
+        eos_token_id: 1,
+        weight_prefix: String::new(),
+        rope_local_theta: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        query_pre_attn_scalar: None,
+        embed_scale: None,
+    };
+
+    // Auto layout: preferred tag is AdrenoSoa on OpenCL builds, but the AUF
+    // only has CPU_AOS — must fall back successfully.
+    let secondary = open_secondary_auf(
+        &path,
+        &config,
+        SecondaryDtypeChoice::Auto,
+        SecondaryLayoutChoice::Auto,
+    )
+    .expect("Auto layout must fall back to CpuAos when AdrenoSoa is missing");
+
+    // is_pre_converted_soa() must be false → swap_executor takes the AOS
+    // materialise_tensor path (NOT the SOA fast path) so swapped weights
+    // carry host pointers.
+    assert!(
+        !secondary.is_pre_converted_soa(),
+        "fallback to CpuAos must yield is_pre_converted_soa = false"
+    );
+
+    let info = secondary
+        .layer_tensor(0, "attn_q.weight")
+        .expect("attn_q.weight must be present in fallback layout");
+    assert_eq!(info.dtype, DType::Q4_0);
+}
+
+/// Regression: Auto dtype selection must prefer the *weight* dtype over F32
+/// (norm-only) in single-dtype AUF files.
+///
+/// Bug: previously `BTreeSet::iter().next()` returned the smallest u32 dtype
+/// (F32=0 < F16=1 < Q4_0=3). For a typical AUF (decoder weights Q4_0 + per-layer
+/// norms F32), Auto picked F32 → dtype filter dropped every Q4_0 weight →
+/// `secondary mmap: layer N missing tensor 'attn_q.weight'` at swap time.
+///
+/// Fix: explicit weight-preference order Q4_0 → F16 → BF16 → Q4_1 → Q8_0 → F32.
+#[test]
+fn auf_secondary_auto_prefers_weight_dtype_over_norm_f32() {
+    use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+    use llm_rs2::auf::{AufMeta, BackendTag};
+    use llm_rs2::core::buffer::DType;
+    use llm_rs2::models::config::{ModelArch, ModelConfig};
+    use llm_rs2::models::weights::{SecondaryDtypeChoice, build_auf_secondary_from_view};
+    use std::path::Path;
+
+    // Mixed-dtype AUF: layer 0 has a Q4_0 weight + an F32 norm. Auto must
+    // pick Q4_0 (the weight) so that the SwapExecutor can materialise
+    // attn_q.weight from the secondary index.
+    //
+    // 32 elements / Q4_0 block = 18 bytes/block. One block of weight = 18B.
+    // Norm is 4 elements F32 = 16B.
+    let q4_payload: Vec<u8> = (0u8..18).collect();
+    let norm_payload: Vec<u8> = (100u8..116).collect(); // 16 bytes
+    let weights_payload = {
+        let mut v = q4_payload.clone();
+        v.extend_from_slice(&norm_payload);
+        v
+    };
+
+    let mut tag_buf = [0u8; 24];
+    tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+    let tensor_index = TensorIndex {
+        variant_tags: vec![tag_buf],
+        entries: vec![
+            // Q4_0 attn_q weight (32 elements = 1 block = 18 bytes).
+            TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::Q4_0.as_u32(),
+                shape: vec![32, 1],
+                alignment: 64,
+                variant_offsets: vec![0],
+                variant_sizes: vec![18],
+            },
+            // F32 attn_norm (4 elements = 16 bytes).
+            TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnNorm.as_u32(),
+                dtype: TensorDType::F32.as_u32(),
+                shape: vec![4],
+                alignment: 64,
+                variant_offsets: vec![18],
+                variant_sizes: vec![16],
+            },
+        ],
+    };
+
+    let auf_bytes = AufWriter::new(
+        AufMeta {
+            architecture: "llama".to_owned(),
+            n_layers: 1,
+            n_heads_q: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            hidden_dim: 32,
+            ffn_dim: 64,
+            vocab_size: 2,
+            max_seq_len: 16,
+            rope_theta: 10000.0,
+            rotary_dim: 32,
+            rope_scaling: 1.0,
+            rms_norm_epsilon: 1e-5,
+            default_dtype: None,
+        },
+        make_tokenizer(),
+        [0u8; 32],
+        0,
+        0,
+    )
+    .with_tensor_index(tensor_index)
+    .add_weights_section(TAG_WEIGHTS_CPU_AOS, weights_payload)
+    .build()
+    .unwrap();
+
+    let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
+
+    let config = ModelConfig {
+        arch: ModelArch::Llama,
+        hidden_size: 32,
+        num_hidden_layers: 1,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 32,
+        intermediate_size: 64,
+        vocab_size: 2,
+        rms_norm_eps: 1e-5,
+        rope_theta: 10000.0,
+        has_qkv_bias: false,
+        tie_word_embeddings: false,
+        eos_token_id: 1,
+        weight_prefix: String::new(),
+        rope_local_theta: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        query_pre_attn_scalar: None,
+        embed_scale: None,
+    };
+
+    let secondary = build_auf_secondary_from_view(
+        view,
+        &config,
+        Path::new("/fake/auto_dtype.auf"),
+        BackendTag::CpuAos,
+        SecondaryDtypeChoice::Auto,
+    )
+    .expect("Auto dtype selection must succeed for Q4_0+F32 AUF");
+
+    // After the fix: Auto picks Q4_0 → attn_q.weight is present (was filtered
+    // out before because Auto picked F32 instead).
+    let info_q = secondary
+        .layer_tensor(0, "attn_q.weight")
+        .expect("attn_q.weight must be visible after Auto dtype = Q4_0");
+    assert_eq!(
+        info_q.dtype,
+        DType::Q4_0,
+        "Auto must select Q4_0 weight dtype, not F32 norm"
+    );
+
+    // The F32 norm is correctly filtered out (Auto picks one dtype only).
+    assert!(
+        secondary.layer_tensor(0, "attn_norm.weight").is_none(),
+        "attn_norm.weight (F32) must be filtered when Auto picks Q4_0"
+    );
+}

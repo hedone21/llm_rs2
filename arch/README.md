@@ -44,6 +44,8 @@ spec/ 대응이 아닌 독립적인 feature 설계 문서:
 | `weight_swap.md` | Dynamic Weight Swap — ArcSwap snapshot, ratio_generation, Phase 1~3.6 통합 |
 | `auf_format.md` | AUF (Argus Unified Format) v0.1 — self-contained 가중치 자산 (Phase 3.7b) |
 
+> **QNN OpPackage cdylib (M1, 2026-05-09)**: 별도 arch 파일 없이 `arch/30-engine.md` §16에 매핑. cdylib(`crates/qnn_oppkg/`)는 engine/manager/shared와 cargo dependency edge를 형성하지 않는 외부 산출물(INV-151). spec 대응: `spec/30-engine.md` 부록 A (ENG-QNN-010~C04, INV-151~155).
+
 ## 규칙
 
 - arch/ 파일에 독자적 요구사항 ID를 만들지 않는다. **ID 원천은 항상 spec/**.

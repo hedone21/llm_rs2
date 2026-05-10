@@ -222,6 +222,14 @@ pub struct CudaBackend {
     /// `SyncPolicy::ALL` for backward compatibility with the
     /// pre-port behaviour. `defer_sync=true` overrides this.
     sync_policy: Arc<AtomicU32>,
+    /// LISWAP-2 prototype (plan: chasing-hopper, Phase 1).
+    ///
+    /// Lazily-created secondary CUDA stream used by `enqueue_write_async`
+    /// to overlap H2D weight uploads with compute on the default stream.
+    /// Created on first use behind the `LLMRS_CUDA_TRANSFER_STREAM` env
+    /// gate (default ON). When unset, the async path falls back to the
+    /// synchronous `copy_weight_from`.
+    transfer_stream: Arc<std::sync::OnceLock<Arc<cudarc::driver::CudaStream>>>,
 }
 
 impl CudaBackend {
@@ -306,6 +314,9 @@ impl CudaBackend {
             score_tmp_buf: Arc::new(std::sync::Mutex::new(None)),
             defer_sync: Arc::new(AtomicBool::new(false)),
             sync_policy: Arc::new(AtomicU32::new(SyncPolicy::ALL.raw())),
+            // LISWAP-2 prototype (plan: chasing-hopper). Lazy-init in
+            // `transfer_stream_or_init`.
+            transfer_stream: Arc::new(std::sync::OnceLock::new()),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -368,6 +379,49 @@ impl CudaBackend {
             self.synchronize()
         } else {
             Ok(())
+        }
+    }
+
+    // ── LISWAP-2 prototype: async H2D transfer stream ───────────────────
+    // Plan: .claude/plans/compiled-chasing-hopper.md (Phase 1).
+
+    /// Whether the LISWAP-2 transfer stream is enabled at runtime.
+    /// Reads `LLMRS_CUDA_TRANSFER_STREAM` once and caches. Default ON;
+    /// "0" / "false" / "off" disables (caller falls back to sync copy).
+    fn transfer_stream_env_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| match std::env::var("LLMRS_CUDA_TRANSFER_STREAM") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off")
+            }
+            Err(_) => true,
+        })
+    }
+
+    /// Lazily build (or return) the secondary transfer stream. Returns
+    /// `None` if the env-gate is disabled or stream creation failed —
+    /// callers fall back to the synchronous path in that case.
+    /// Note: cuda_pc has no graph capture path, so no capture check.
+    fn transfer_stream_or_init(&self) -> Option<Arc<cudarc::driver::CudaStream>> {
+        if !Self::transfer_stream_env_enabled() {
+            return None;
+        }
+        if let Some(s) = self.transfer_stream.get() {
+            return Some(s.clone());
+        }
+        match self.ctx.new_stream() {
+            Ok(s) => {
+                let _ = self.transfer_stream.set(s);
+                self.transfer_stream.get().cloned()
+            }
+            Err(e) => {
+                log::warn!(
+                    "LLMRS_CUDA_TRANSFER_STREAM: secondary stream creation failed ({e}); \
+                     falling back to synchronous `copy_weight_from`"
+                );
+                None
+            }
         }
     }
 
@@ -1267,6 +1321,72 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn supports_kv_scatter_f32_batch(&self) -> bool {
+        true
+    }
+
+    fn kv_scatter_f32_to_f32_batch(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        write_pos_start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let ks = Self::get_device_ptr(k_src.buffer().as_ref());
+        let vs = Self::get_device_ptr(v_src.buffer().as_ref());
+        let kd = Self::get_device_ptr(k_dst.buffer().as_ref());
+        let vd = Self::get_device_ptr(v_dst.buffer().as_ref());
+
+        if let (Some(ks), Some(vs), Some(kd), Some(vd)) = (ks, vs, kd, vd) {
+            let hd = head_dim as i32;
+            let cap = capacity as i32;
+            let wps = write_pos_start as i32;
+            let sl = seq_len as i32;
+            let kvh = kv_heads as i32;
+            let cfg = LaunchConfig {
+                grid_dim: (kv_heads as u32, seq_len as u32, 1),
+                block_dim: (head_dim as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let stream = self.ctx.default_stream();
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.kv_scatter_f32_batch)
+                    .arg(&ks)
+                    .arg(&vs)
+                    .arg(&kd)
+                    .arg(&vd)
+                    .arg(&kvh)
+                    .arg(&hd)
+                    .arg(&cap)
+                    .arg(&wps)
+                    .arg(&sl)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("kv_scatter_f32_batch launch failed: {e}"))?;
+            }
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
+            Ok(())
+        } else {
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
+            cpu_fallback().kv_scatter_f32_to_f32_batch(
+                k_src,
+                v_src,
+                k_dst,
+                v_dst,
+                kv_heads,
+                head_dim,
+                capacity,
+                write_pos_start,
+                seq_len,
+            )
+        }
+    }
+
     fn gather(&self, src: &Tensor, indices: &Tensor, dst: &mut Tensor) -> Result<()> {
         // GPU kernel only supports F16 embedding -> F32 output.
         // For other dtypes, sync and fall back to CPU.
@@ -1494,6 +1614,67 @@ impl Backend for CudaBackend {
             .map_err(|e| anyhow!("CUDA synchronize failed: {e}"))
     }
 
+    fn copy_slice(
+        &self,
+        src: &Tensor,
+        dst: &mut Tensor,
+        src_offset: usize,
+        dst_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        let type_size = match src.dtype() {
+            DType::F32 => 4,
+            DType::F16 => 2,
+            DType::U8 => 1,
+            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+            _ => 1,
+        };
+        let byte_count = count * type_size;
+        let src_byte_offset = src_offset * type_size;
+        let dst_byte_offset = dst_offset * type_size;
+
+        let src_dev = Self::get_device_ptr(src.buffer().as_ref());
+        let dst_dev = Self::get_device_ptr(dst.buffer().as_ref());
+
+        if let (Some(s), Some(d)) = (src_dev, dst_dev) {
+            // Device-to-device copy. Sync first so prior compute (RoPE, matmul)
+            // that wrote into `src`/`dst` on the default stream is observed.
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
+            unsafe {
+                let res = cuda_sys::cuMemcpyDtoD_v2(
+                    d + dst_byte_offset as cuda_sys::CUdeviceptr,
+                    s + src_byte_offset as cuda_sys::CUdeviceptr,
+                    byte_count,
+                );
+                if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                    anyhow::bail!("cuMemcpyDtoD_v2 failed: {:?}", res);
+                }
+            }
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
+            Ok(())
+        } else {
+            // No device pointer on at least one side — host memcpy fallback (CPU buffers).
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
+            let src_ptr = src.as_ptr();
+            let dst_ptr = dst.as_mut_ptr();
+            if src_ptr.is_null() || dst_ptr.is_null() {
+                anyhow::bail!(
+                    "copy_slice: missing device ptr and missing host ptr (src null={}, dst null={})",
+                    src_ptr.is_null(),
+                    dst_ptr.is_null()
+                );
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(src_byte_offset),
+                    dst_ptr.add(dst_byte_offset),
+                    byte_count,
+                );
+            }
+            Ok(())
+        }
+    }
+
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
         self.synchronize()?;
         if let Some(db) = t.buffer().as_any().downcast_ref::<CudaDeviceBuffer>() {
@@ -1544,6 +1725,70 @@ impl Backend for CudaBackend {
                 Arc::new(self.clone()),
             ))
         }
+    }
+
+    /// LISWAP-2 prototype (plan: chasing-hopper, Phase 1). cuda_pc
+    /// targets discrete GPUs, so the destination is always a pure
+    /// device buffer (`CudaDeviceBuffer`). Submits a `cuMemcpyHtoDAsync`
+    /// on the secondary transfer stream and records a `CudaEvent` for
+    /// the dispatcher's worker to wait on.
+    fn enqueue_write_async(
+        &self,
+        src: &Tensor,
+    ) -> Result<(Tensor, crate::core::backend::GpuEvent)> {
+        let Some(transfer_stream) = self.transfer_stream_or_init() else {
+            let dst = self.copy_weight_from(src)?;
+            return Ok((dst, crate::core::backend::GpuEvent::default()));
+        };
+
+        let size = src.size();
+        let src_ptr = src.as_ptr();
+        if src_ptr.is_null() {
+            return Err(anyhow!(
+                "enqueue_write_async: source has a null host pointer (size={size}, dtype={:?})",
+                src.dtype()
+            ));
+        }
+
+        let dev_buf = CudaDeviceBuffer::new(size, src.dtype())?;
+        // SAFETY: dispatcher worker keeps `src` alive until the
+        // recorded event fires. Stream is owned by this backend.
+        dev_buf.copy_from_host_async(src_ptr, size, transfer_stream.cu_stream() as _)?;
+
+        let event = self
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow!("CUDA event create failed: {e}"))?;
+        event
+            .record(&transfer_stream)
+            .map_err(|e| anyhow!("cuEventRecord failed: {e}"))?;
+
+        let dst_tensor = Tensor::new(
+            src.shape().clone(),
+            Arc::new(dev_buf),
+            Arc::new(self.clone()),
+        );
+        Ok((
+            dst_tensor,
+            crate::core::backend::GpuEvent {
+                #[cfg(feature = "opencl")]
+                inner_cl: None,
+                inner_cu: Some(event),
+            },
+        ))
+    }
+
+    fn wait_event_blocking(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+        if let Some(e) = evt.inner_cu.as_ref() {
+            e.synchronize()
+                .map_err(|err| anyhow!("cuEventSynchronize failed: {err}"))?;
+            return Ok(());
+        }
+        self.synchronize()
+    }
+
+    fn supports_async_transfer(&self) -> bool {
+        Self::transfer_stream_env_enabled()
     }
 }
 

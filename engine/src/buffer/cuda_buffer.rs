@@ -335,6 +335,45 @@ impl CudaDeviceBuffer {
         Ok(())
     }
 
+    /// Async H2D copy on `stream`. Returns immediately after enqueue;
+    /// caller must synchronise the stream (or an event recorded after
+    /// the copy) before the device buffer is safe to read from compute.
+    ///
+    /// LISWAP-2 prototype (plan: chasing-hopper). Used by the CUDA
+    /// backend's `enqueue_write_async` to overlap weight uploads with
+    /// the compute stream's forward kernels.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the bytes at `src..src+len` remain valid until
+    /// the stream-recorded write actually fires (typically by holding
+    /// the source weight tensor alive across the dispatcher commit).
+    pub fn copy_from_host_async(
+        &self,
+        src: *const u8,
+        len: usize,
+        stream: cuda_sys::CUstream,
+    ) -> Result<()> {
+        if len > self.size {
+            return Err(anyhow!(
+                "CudaDeviceBuffer::copy_from_host_async: len {len} > size {}",
+                self.size
+            ));
+        }
+        unsafe {
+            let res = cuda_sys::cuMemcpyHtoDAsync_v2(
+                self.dev_ptr,
+                src as *const std::ffi::c_void,
+                len,
+                stream,
+            );
+            if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuMemcpyHtoDAsync failed: {:?}", res));
+            }
+        }
+        Ok(())
+    }
+
     /// Copy data from this device buffer to host.
     pub fn copy_to_host(&self, dst: *mut u8, len: usize) -> Result<()> {
         if len > self.size {

@@ -824,7 +824,7 @@ mod tests {
 
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let cm = CacheManager::new(
-            Box::new(H2OPolicy::new(5, 0.3, 0)), // prefix=4, keep_ratio=0.3
+            Box::new(H2OPolicy::new(0.3, 0)), // prefix=4, keep_ratio=0.3
             Box::new(MockMonitor {
                 available: 10 * 1024 * 1024,
             }),
@@ -879,7 +879,7 @@ mod tests {
         use crate::core::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
-            Box::new(H2OPolicy::new(5, 0.3, 0)),
+            Box::new(H2OPolicy::new(0.3, 0)),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024, // plenty of memory
             }),
@@ -905,7 +905,7 @@ mod tests {
         use crate::core::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
-            Box::new(H2OPolicy::new(5, 0.3, 0)),
+            Box::new(H2OPolicy::new(0.3, 0)),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024,
             }),
@@ -949,7 +949,7 @@ mod tests {
         use crate::core::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
-            Box::new(H2OPolicy::new(0, 0.5, 0)),
+            Box::new(H2OPolicy::new(0.5, 0)),
             Box::new(MockMonitor { available: 0 }),
             0,
             0.75,
@@ -1099,10 +1099,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Emergency,
-            handler: Box::new(EvictionHandler::new(
-                Box::new(H2OPolicy::new(5, 0.5, 0)),
-                0.3,
-            )),
+            handler: Box::new(EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -1135,10 +1132,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
-            handler: Box::new(EvictionHandler::new(
-                Box::new(H2OPolicy::new(5, 0.5, 0)),
-                0.3,
-            )),
+            handler: Box::new(EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -1503,7 +1497,7 @@ mod tests {
 
         // H2O with protected_prefix=4, keep_ratio=0.5 on 80 tokens.
         // target_ratio=0.2 → target_len=16, tokens_to_remove=64 == MIN_EVICT_TOKENS → guard does not fire.
-        let policy = H2OPolicy::new(20, 0.5, 4);
+        let policy = H2OPolicy::new(0.5, 4);
         let mut cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
             Box::new(MockMonitor {

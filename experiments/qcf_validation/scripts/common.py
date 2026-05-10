@@ -185,8 +185,24 @@ def save_result(phase: str, name: str, data: dict):
 
 
 def get_qcf_metrics(result: dict) -> list:
-    """Extract QCF metrics from result, supporting both old and new key names."""
-    return result.get("qcf_metrics", result.get("proxy_metrics", []))
+    """Extract QCF metrics, supporting v2 (qcf_metrics) and v3 (qcf_events) schemas.
+
+    v2 (generate path, NIAH/QA/MMLU): list of {raw_value, step, ...}
+    v3 (PPL path, since 68743fb):     list of {qcf_caote, step, tokens_evicted, ...}
+
+    Returns a list of dicts with a unified `raw_value` key so downstream
+    compute_qcf_summary() works unchanged.
+    """
+    if result.get("qcf_metrics"):
+        return result["qcf_metrics"]
+    if result.get("proxy_metrics"):
+        return result["proxy_metrics"]
+    if result.get("qcf_events"):
+        return [
+            {**ev, "raw_value": ev.get("qcf_caote", 0.0)}
+            for ev in result["qcf_events"]
+        ]
+    return []
 
 
 def compute_qcf_summary(qcf_metrics: list) -> dict:

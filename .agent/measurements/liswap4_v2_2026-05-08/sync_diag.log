@@ -1,0 +1,129 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 300.4ms
+weight_swap stages: prefault=24.7ms mmap_permute=273.7ms arc_swap=0.0ms madvise=0.4ms synchronize=1.5ms soa_reconvert=0.0ms gen_bump=0.0ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=44.76
+[Profile] Event: PrefillStart
+Prefill: 106.41 ms (5 tokens, 47.0 tok/s)
+Prefill(pure fwd): 104.92 ms (5 tokens, 47.7 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over[PER_TOKEN] idx=0 kv_pos=6 forward_ms=26.725
+ the[PER_TOKEN] idx=1 kv_pos=7 forward_ms=26.387
+ lazy[PER_TOKEN] idx=2 kv_pos=8 forward_ms=26.007
+ dog[PER_TOKEN] idx=3 kv_pos=9 forward_ms=25.696
+.\[PER_TOKEN] idx=4 kv_pos=10 forward_ms=25.680
+nIn[PER_TOKEN] idx=5 kv_pos=11 forward_ms=25.689
+ order[PER_TOKEN] idx=6 kv_pos=12 forward_ms=28.076
+[PER_TOKEN] idx=7 kv_pos=13 forward_ms=25.676
+ to find[PER_TOKEN] idx=8 kv_pos=14 forward_ms=25.646
+[PER_TOKEN] idx=9 kv_pos=15 forward_ms=25.630
+ the[PER_TOKEN] idx=10 kv_pos=16 forward_ms=25.647
+ number of[PER_TOKEN] idx=11 kv_pos=17 forward_ms=25.713
+ different[PER_TOKEN] idx=12 kv_pos=18 forward_ms=27.043
+ sentences[PER_TOKEN] idx=13 kv_pos=19 forward_ms=25.864
+,[PER_TOKEN] idx=14 kv_pos=20 forward_ms=25.752
+[PER_TOKEN] idx=15 kv_pos=21 forward_ms=25.732
+ we[PER_TOKEN] idx=16 kv_pos=22 forward_ms=25.762
+ first need[PER_TOKEN] idx=17 kv_pos=23 forward_ms=25.703
+[PER_TOKEN] idx=18 kv_pos=24 forward_ms=25.847
+ to count[PER_TOKEN] idx=19 kv_pos=25 forward_ms=25.869
+[PER_TOKEN] idx=20 kv_pos=26 forward_ms=25.742
+ how[PER_TOKEN] idx=21 kv_pos=27 forward_ms=25.786
+ many[PER_TOKEN] idx=22 kv_pos=28 forward_ms=25.758
+ ways there[PER_TOKEN] idx=23 kv_pos=29 forward_ms=25.722
+ are[PER_TOKEN] idx=24 kv_pos=30 forward_ms=25.725
+[PER_TOKEN] idx=25 kv_pos=31 forward_ms=25.720
+ for[PER_TOKEN] idx=26 kv_pos=32 forward_ms=25.778
+ a[PER_TOKEN] idx=27 kv_pos=33 forward_ms=25.862
+ sentence with[PER_TOKEN] idx=28 kv_pos=34 forward_ms=25.856
+ fewer[PER_TOKEN] idx=29 kv_pos=35 forward_ms=25.789
+[PER_TOKEN] idx=30 kv_pos=36 forward_ms=25.819
+ than [PER_TOKEN] idx=31 kv_pos=37 forward_ms=25.851
+[PER_TOKEN] idx=32 kv_pos=38 forward_ms=25.838
+1[PER_TOKEN] idx=33 kv_pos=39 forward_ms=25.868
+0 words[PER_TOKEN] idx=34 kv_pos=40 forward_ms=26.002
+.[PER_TOKEN] idx=35 kv_pos=41 forward_ms=25.919
+ For[PER_TOKEN] idx=36 kv_pos=42 forward_ms=25.986
+[PER_TOKEN] idx=37 kv_pos=43 forward_ms=25.925
+ example[PER_TOKEN] idx=38 kv_pos=44 forward_ms=25.928
+,[PER_TOKEN] idx=39 kv_pos=45 forward_ms=25.986
+ if we[PER_TOKEN] idx=40 kv_pos=46 forward_ms=25.881
+ have[PER_TOKEN] idx=41 kv_pos=47 forward_ms=25.924
+ one[PER_TOKEN] idx=42 kv_pos=48 forward_ms=25.933
+ word[PER_TOKEN] idx=43 kv_pos=49 forward_ms=25.891
+ ([PER_TOKEN] idx=44 kv_pos=50 forward_ms=25.857
+[PER_TOKEN] idx=45 kv_pos=51 forward_ms=25.902
+a single[PER_TOKEN] idx=46 kv_pos=52 forward_ms=25.824
+ character[PER_TOKEN] idx=47 kv_pos=53 forward_ms=25.775
+),[PER_TOKEN] idx=48 kv_pos=54 forward_ms=25.919
+[PER_TOKEN] idx=49 kv_pos=55 forward_ms=25.889
+ then[PER_TOKEN] idx=50 kv_pos=56 forward_ms=25.925
+ there[PER_TOKEN] idx=51 kv_pos=57 forward_ms=27.871
+ is only[PER_TOKEN] idx=52 kv_pos=58 forward_ms=25.909
+ one[PER_TOKEN] idx=53 kv_pos=59 forward_ms=28.130
+ way[PER_TOKEN] idx=54 kv_pos=60 forward_ms=25.839
+:[PER_TOKEN] idx=55 kv_pos=61 forward_ms=25.862
+ \"[PER_TOKEN] idx=56 kv_pos=62 forward_ms=25.898
+a[PER_TOKEN] idx=57 kv_pos=63 forward_ms=25.850
+\"[PER_TOKEN] idx=58 kv_pos=64 forward_ms=25.827
+.[PER_TOKEN] idx=59 kv_pos=65 forward_ms=26.088
+ If[PER_TOKEN] idx=60 kv_pos=66 forward_ms=26.102
+ we[PER_TOKEN] idx=61 kv_pos=67 forward_ms=26.020
+ have[PER_TOKEN] idx=62 kv_pos=68 forward_ms=25.964
+[PER_TOKEN] idx=63 kv_pos=69 forward_ms=25.930
+ two[PER_TOKEN] idx=64 kv_pos=70 forward_ms=26.020
+ words[PER_TOKEN] idx=65 kv_pos=71 forward_ms=26.059
+ (two[PER_TOKEN] idx=66 kv_pos=72 forward_ms=26.049
+ characters[PER_TOKEN] idx=67 kv_pos=73 forward_ms=25.990
+),[PER_TOKEN] idx=68 kv_pos=74 forward_ms=26.045
+[PER_TOKEN] idx=69 kv_pos=75 forward_ms=28.452
+ then[PER_TOKEN] idx=70 kv_pos=76 forward_ms=26.162
+ there are[PER_TOKEN] idx=71 kv_pos=77 forward_ms=26.089
+ two[PER_TOKEN] idx=72 kv_pos=78 forward_ms=26.131
+[PER_TOKEN] idx=73 kv_pos=79 forward_ms=28.483
+ ways:[PER_TOKEN] idx=74 kv_pos=80 forward_ms=26.134
+[PER_TOKEN] idx=75 kv_pos=81 forward_ms=26.131
+ \"[PER_TOKEN] idx=76 kv_pos=82 forward_ms=26.096
+aa\"[PER_TOKEN] idx=77 kv_pos=83 forward_ms=26.104
+[PER_TOKEN] idx=78 kv_pos=84 forward_ms=26.038
+ and the[PER_TOKEN] idx=79 kv_pos=85 forward_ms=26.056
+ second[PER_TOKEN] idx=80 kv_pos=86 forward_ms=26.096
+[PER_TOKEN] idx=81 kv_pos=87 forward_ms=25.981
+ instance of[PER_TOKEN] idx=82 kv_pos=88 forward_ms=25.993
+[PER_TOKEN] idx=83 kv_pos=89 forward_ms=26.139
+ the[PER_TOKEN] idx=84 kv_pos=90 forward_ms=26.162
+ first[PER_TOKEN] idx=85 kv_pos=91 forward_ms=26.090
+ character.\[PER_TOKEN] idx=86 kv_pos=92 forward_ms=26.292
+[PER_TOKEN] idx=87 kv_pos=93 forward_ms=26.419
+n[PER_TOKEN] idx=88 kv_pos=94 forward_ms=26.330
+We[PER_TOKEN] idx=89 kv_pos=95 forward_ms=26.319
+ can[PER_TOKEN] idx=90 kv_pos=96 forward_ms=26.652
+ represent[PER_TOKEN] idx=91 kv_pos=97 forward_ms=26.595
+ this[PER_TOKEN] idx=92 kv_pos=98 forward_ms=26.734
+ data[PER_TOKEN] idx=93 kv_pos=99 forward_ms=26.521
+ using a[PER_TOKEN] idx=94 kv_pos=100 forward_ms=26.772
+[PER_TOKEN] idx=95 kv_pos=101 forward_ms=26.642
+ list[PER_TOKEN] idx=96 kv_pos=102 forward_ms=26.468
+ like[PER_TOKEN] idx=97 kv_pos=103 forward_ms=28.796
+ so[PER_TOKEN] idx=98 kv_pos=104 forward_ms=26.319
+:\
+Done.
+[Profile] Event: End
+TTFT: 509.22 ms
+Decode: 26.15 ms/tok (38.2 tok/s) [99 tokens, forward only]
+Decode(excl tok[0]): 26.14 ms/tok (38.3 tok/s) [98 tokens] | tok[0]=26.72 ms
+Avg TBT: 28.09 ms (35.6 tokens/sec)
+END_EXIT=0

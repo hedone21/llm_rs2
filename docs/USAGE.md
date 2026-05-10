@@ -1236,6 +1236,7 @@ generate ... --chat \
 | `--secondary-gguf <PATH>` | secondary 자산 (`.gguf` 또는 `.auf`). 미지정 시 weight swap 경로 비활성. |
 | `--force-swap-ratio <FLOAT>` | 0.0–1.0. 추론 시작 직전에 decoder layer의 X 비율을 secondary로 교체. `--secondary-gguf` 필수. |
 | `--secondary-dtype <auto\|q4_0\|f16>` | v0.2 multi-quant AUF에서 swap 시 선택할 dtype. 기본 `auto` — AUF META `default_dtype` 우선, 없으면 TENSOR_INDEX first-match. 단일 dtype AUF (v0.1.x)에서는 무시됨. |
+| `--secondary-layout <auto\|aos\|soa>` | AUF backend variant 선택. 기본 `auto` (preferred → CpuAos 폴백). `aos`는 swap 후 `switch_hw cpu` / `set_partition_ratio` 호환 (host pointer 보존), `soa`는 GPU 디코드 가장 빠르지만 swap 후 backend 전환 부적합. GGUF secondary에선 무시. |
 | `--swap-dir <DIR>` | swap 시 mmap에 사용할 임시 디렉토리. 미지정 시 OS 기본. |
 | `--quantize-lm-head <auto\|q4_0\|none>` | 로드 시점 lm_head Q4_0 변환 (Sprint F). 기본 `auto` — `--secondary-gguf` 지정 + lm_head가 F16/F32일 때만 변환. |
 | `--tokenizer-path <PATH>` | tokenizer.json 경로. 같은 디렉토리에 sibling 모델이 있을 때 명시 권장 (자동 감지가 다른 tokenizer를 잡으면 garbage 출력). |
@@ -1267,8 +1268,13 @@ generate ... --chat \
 
 GGUF 두 개를 들고 다니는 대신 AUF 한 개로 통합. **권장 경로는 `scripts/convert_to_auf.sh`** — Safetensors/GGUF 입력에서 한 번에 AUF를 만든다 (auf_tool 빌드/호출, 중간 GGUF 정리, tokenizer 자동 탐색까지 포함).
 
+> **layout 선택 가이드**
+> - **PACT 측정 / `switch_hw cpu` / `set_partition_ratio` 정책 사용 시**: AUF 빌드 시 `--variants` 에 `cpu_aos` 를 반드시 포함하고, 추론 시 `--secondary-layout aos` 를 **명시**한다. AOS는 swap 후 `UnifiedBuffer` host pointer가 살아있어 backend 전환 / partition split이 정상 동작한다. SOA는 host pointer가 없어 `switch_hw cpu` 직후 segfault, partition split에서 "B is not OpenCL buffer" 가능 (옵션 D-1, 2026-05-01).
+> - **GPU 단독 디코드만 하는 경우**: SOA가 +50% 정도 빠르므로 `--variants adreno_soa` + `--secondary-layout soa` (또는 `auto`).
+> - 기본 `--variants all`은 두 layout을 모두 동봉하므로 디바이스에서 layout 선택만 하면 된다.
+
 ```bash
-# Safetensors → AUF (한 번에)
+# Safetensors → AUF (한 번에, AOS+SOA 양쪽 동봉)
 scripts/convert_to_auf.sh \
     --input  models/llama3.2-1b/ \
     --output models/llama3.2-1b.auf \
@@ -1279,6 +1285,12 @@ scripts/convert_to_auf.sh \
     --input  models/llama3.2-1b-q4_0.gguf \
     --output models/llama3.2-1b.auf \
     --variants all
+
+# switch_hw cpu / partition 호환 전용 (AOS만 동봉, 약간 작음)
+scripts/convert_to_auf.sh \
+    --input  models/llama3.2-1b-q4_0.gguf \
+    --output models/llama3.2-1b-aos.auf \
+    --variants cpu_aos
 
 # v0.2 multi-quant: Q4_0 + F16 동시 보관 (default = Q4_0)
 scripts/convert_to_auf.sh \
@@ -1313,6 +1325,15 @@ adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
   --secondary-gguf /data/local/tmp/llama3.2-1b.auf \
   --force-swap-ratio 1.0 \
   -b opencl --prompt 'Hello' -n 50"
+
+# switch_hw cpu / partition 정책이 들어가는 PACT 시나리오 — AOS 명시 필수
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
+  -m /data/local/tmp/models/llama3.2-1b-f16.gguf \
+  --secondary-gguf /data/local/tmp/llama3.2-1b.auf \
+  --secondary-layout aos \
+  --force-swap-ratio 1.0 \
+  -b opencl --enable-resilience --resilience-prealloc-switch \
+  --prompt 'Hello' -n 50"
 ```
 
 상세 옵션 (`info`, `verify`, lm_head AOS 예외, 트러블슈팅): `docs/auf_tool_guide.md` 참조.
@@ -1354,6 +1375,7 @@ eval-ll 모드 JSON에는 `eval_ll_output.results[i].choice_nlls`로 per-questio
 #### 2.13.6 트러블슈팅
 
 - **`--force-swap-ratio requires --secondary-gguf`**: secondary 자산을 같이 지정해야 함.
+- **swap 직후 `switch_hw cpu` segfault / `SetPartitionRatio` 후 "B is not OpenCL buffer"**: SOA layout이 swap한 weight는 host pointer가 없어 CPU forward / partition split에 부적합. AUF를 `--variants all` 또는 `--variants cpu_aos`로 빌드한 뒤 추론에서 `--secondary-layout aos`를 **명시**한다. `auto`는 preferred (OpenCL build에선 SOA)를 우선해서 잡으므로, switch_hw / partition 정책이 있는 시나리오에서는 자동 폴백을 믿지 말고 명시할 것.
 - **AUF 추론 시 garbage 출력 (lm_head 관련)**: AUF v0.1.0 (capability_opt=0)을 사용 중일 가능성. v0.1.1 AUF로 다시 build (`--include-lm-head auto`). 또는 이미 v0.1.1이지만 `WEIGHTS_ADRENO_SOA` 안에 lm_head가 SOA로 들어 있으면 Adreno image limit (~16M texels) 때문에 GEMV가 fall-through되어 발생. Sprint G-1-F fix(INV-135 v2) 이후 모든 variant에서 lm_head는 AOS로 동봉되므로 최신 toolchain으로 재빌드/재AUF build로 해결.
 - **TBT 측정 시 swap 비용 포함**: `Decode: X ms/tok` 로그는 swap 완료 이후의 정상 decode 비용. 초기 prefill 직전 `swap` 단계 비용은 stderr "WeightSwap..." 로그 참조.
 - **메모리 회수 부족**: Phase 4 Sprint C-1/2/3 이후 PRIMARY drop 자동화. `--force-swap-ratio < 1.0`이면 일부 primary layer 유지가 정상.
@@ -2429,6 +2451,7 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 | `--secondary-gguf` | — | secondary 자산 경로 (`.gguf` 또는 `.auf`). 미지정 시 weight swap 비활성 |
 | `--force-swap-ratio` | — | 0.0–1.0. 추론 시작 직전 swap할 decoder layer 비율. `--secondary-gguf` 필수 |
 | `--secondary-dtype` | `auto` | v0.2 multi-quant AUF에서 swap 시 선택할 dtype (`auto` / `q4_0` / `f16`). `auto`는 AUF META `default_dtype` 우선 → first-match. 단일 dtype AUF (v0.1.x)에서는 무시됨 |
+| `--secondary-layout` | `auto` | AUF backend variant (`auto` / `aos` / `soa`). `aos`는 swap 후 `switch_hw cpu` / `set_partition_ratio` 호환. PACT/Resilience 시나리오에서는 `aos` 명시 권장. GGUF secondary에선 무시 |
 | `--swap-dir` | — | swap mmap에 사용할 디렉토리 (미지정 시 OS 기본) |
 | `--quantize-lm-head` | `auto` | `auto` / `q4_0` / `none`. `auto`는 `--secondary-gguf` 지정 + lm_head F16/F32일 때만 Q4_0 변환 |
 | `--tokenizer-path` | 자동 감지 | tokenizer.json 경로. 디렉토리에 sibling 모델이 있으면 명시 권장 |

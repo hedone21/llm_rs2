@@ -22,7 +22,7 @@ use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 
-use super::hook::{MetricsSummary, StepHook};
+use super::hook::StepHook;
 use super::output::{EvalConfig, EvalOutput, EvalQuestion};
 
 /// Run log-likelihood evaluation for a list of multiple-choice questions.
@@ -202,8 +202,6 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             continue;
         }
 
-        let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
-
         // ── Per-question budget (ratio mode) ──
         let q_eval_config;
         let effective_eval_config = if eval_config.kv_budget_ratio > 0.0 {
@@ -231,7 +229,6 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             &mut x_gen,
             &mut gen_ws,
             &cpu_gen_input,
-            &mut qcf_metrics,
             vocab_size,
             effective_eval_config,
             skip_config,
@@ -280,6 +277,8 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                 logits_last_only: false,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             })?;
 
             // Restore current_pos: undo the probe's kv_cache.update() increment.
@@ -290,7 +289,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         }
 
         // ── post_prefill hook (eviction if cache exceeds budget) ──
-        hook.post_prefill(kv_caches, &mut qcf_metrics);
+        hook.post_prefill(kv_caches);
 
         // IMPORTANT: Do NOT update start_pos_after_prompt to current_pos after eviction.
         // After shift_positions(), cached K vectors retain their original RoPE positions.
@@ -370,6 +369,8 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         logits_last_only: false,
                         variance_collector: None,
                         prefill_workspace: None,
+
+                        layer_boundary_hook: None,
                     })?;
                     sp += 1;
 
@@ -500,7 +501,6 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         results,
         config: serde_json::json!(hook.extra_config_fields()),
         wall_time_s,
-        metrics_summary: MetricsSummary::default(),
         layer_importance: layer_importance_json,
         layer_skip_qcf,
         layer_skip_qcf_normalized,
@@ -589,6 +589,8 @@ fn run_importance_pass<C: KVCacheOps>(
         logits_last_only: false,
         variance_collector: None,
         prefill_workspace: None,
+
+        layer_boundary_hook: None,
     })?;
 
     let table = collector.build();
@@ -631,7 +633,6 @@ fn run_prefill<C: KVCacheOps>(
     x_gen: &mut Tensor,
     gen_ws: &mut LayerWorkspace,
     cpu_gen_input: &Tensor,
-    qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
@@ -652,7 +653,6 @@ fn run_prefill<C: KVCacheOps>(
             x_gen,
             gen_ws,
             cpu_gen_input,
-            qcf_metrics,
             vocab_size,
             eval_config,
             skip_config,
@@ -666,7 +666,6 @@ fn run_prefill<C: KVCacheOps>(
         kv_caches,
         hook,
         prompt_ids,
-        qcf_metrics,
         vocab_size,
         eval_config,
         skip_config,
@@ -689,7 +688,6 @@ fn run_token_by_token_prefill<C: KVCacheOps>(
     x_gen: &mut Tensor,
     gen_ws: &mut LayerWorkspace,
     cpu_gen_input: &Tensor,
-    _qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     _eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
@@ -729,6 +727,8 @@ fn run_token_by_token_prefill<C: KVCacheOps>(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
     }
 
@@ -751,7 +751,6 @@ fn run_full_prefill<C: KVCacheOps>(
     kv_caches: &mut [C],
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
-    _qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     _eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
@@ -796,6 +795,8 @@ fn run_full_prefill<C: KVCacheOps>(
         logits_last_only: true,
         variance_collector: None,
         prefill_workspace: None,
+
+        layer_boundary_hook: None,
     })?;
 
     // Read logits (only last position — much smaller than full prompt × vocab)
@@ -832,7 +833,6 @@ fn run_chunked_prefill<C: KVCacheOps>(
     x_gen: &mut Tensor,
     gen_ws: &mut LayerWorkspace,
     cpu_gen_input: &Tensor,
-    _qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
@@ -885,6 +885,8 @@ fn run_chunked_prefill<C: KVCacheOps>(
         logits_last_only: true,
         variance_collector: None,
         prefill_workspace: None,
+
+        layer_boundary_hook: None,
     })?;
 
     // Explicitly drop GPU buffers and flush queue to free VRAM before the
@@ -939,6 +941,8 @@ fn run_chunked_prefill<C: KVCacheOps>(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         start_pos += 1;
     }

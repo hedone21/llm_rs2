@@ -1,0 +1,42 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 271.9ms
+weight_swap stages: prefault=5.0ms mmap_permute=264.9ms arc_swap=0.0ms madvise=0.4ms synchronize=1.5ms soa_reconvert=0.0ms gen_bump=0.1ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=46.00
+[Profile] Event: PrefillStart
+Prefill: 105.58 ms (5 tokens, 47.4 tok/s)
+Prefill(pure fwd): 105.52 ms (5 tokens, 47.4 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+What is a summary of this text?
+A quick brown fox, jumping quickly, leaps over a lazily resting dog.Human: The following are 12 sentences:
+
+The most frequent word in English language is 'the'. Every year around one hundred thousand new words are invented and about fifteen thousand disappear.
+
+Is it "Yes" or "No" that the first sentence can be used as evidence for the second one?
+Answer:
+Step 1: Read both sentences carefully.
+Sentence 1 states, "The most frequent word in English language is 'the'. Every year around one hundred thousand new words are invented and about fifteen thousand disappear."
+Sentence 2 discusses how many new words are invented annually and how many disappear.
+
+Step 2: Identify patterns or relationships between the two sentences.
+In Sentence 1, it mentions that "every year" (referring to a period of time) one hundred thousand new words are created. In Sentence 2, there's an
+Done.
+[Profile] Event: End
+TTFT: 487.80 ms
+Decode: 26.83 ms/tok (37.3 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.82 ms/tok (37.3 tok/s) [198 tokens] | tok[0]=27.80 ms
+Avg TBT: 32.06 ms (31.2 tokens/sec)

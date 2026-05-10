@@ -17,6 +17,7 @@ use crate::resilience::gpu_self_meter::OpenClEventGpuMeter;
 
 pub mod buffer;
 pub mod gpu_score;
+pub mod host_ptr_pool;
 pub mod memory;
 pub mod plan;
 
@@ -157,7 +158,54 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     {
         return Ok(ns.d_buf());
     }
+    // HostPtrPoolBuffer (Direction A Stage 3 zero-copy pool slot —
+    // CL_MEM_ALLOC_HOST_PTR, filled via map/memcpy/unmap before use).
+    if let Some(pp) = buf
+        .as_any()
+        .downcast_ref::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>()
+    {
+        return pp
+            .cl_mem()
+            .ok_or_else(|| anyhow!("HostPtrPoolBuffer: cl_mem is None (unexpected)"));
+    }
     Err(anyhow!("Buffer is not an OpenCL buffer type"))
+}
+
+/// Returns a short label identifying the concrete buffer type backing `buf`.
+///
+/// Covers both `get_cl_mem`-recognised GPU-resident types and the CPU/host-
+/// only buffer types that commonly appear in misrouted dispatch failures —
+/// the latter set is where the diagnostic value lives, since they are what
+/// `get_cl_mem` rejects. Add new buffer types here as they are introduced.
+pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
+    let any = buf.as_any();
+    if any.is::<UnifiedBuffer>() {
+        "UnifiedBuffer"
+    } else if any.is::<crate::backend::opencl::buffer::OpenCLBuffer>() {
+        "OpenCLBuffer"
+    } else if any.is::<crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer>() {
+        "MadviseableGPUBuffer"
+    } else if any.is::<crate::buffer::cl_wrapped_buffer::ClWrappedBuffer>() {
+        "ClWrappedBuffer"
+    } else if any.is::<crate::buffer::cl_sub_buffer::ClSubBuffer>() {
+        "ClSubBuffer"
+    } else if any.is::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>() {
+        "NoshuffleWeightBuffer"
+    } else if any.is::<crate::buffer::shared_buffer::SharedBuffer>() {
+        "SharedBuffer"
+    } else if any.is::<crate::buffer::shared_buffer::SharedBufferView>() {
+        "SharedBufferView"
+    } else if any.is::<crate::buffer::slice_buffer::SliceBuffer>() {
+        "SliceBuffer"
+    } else if any.is::<crate::buffer::mmap_buffer::MmapBuffer>() {
+        "MmapBuffer"
+    } else if any.is::<crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer>() {
+        "BorrowedMmapBuffer"
+    } else if any.is::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
+        "HostPtrPool"
+    } else {
+        "Unknown"
+    }
 }
 
 // Fast math flags (excluding -cl-std which is determined at runtime)
@@ -285,6 +333,11 @@ struct KernelCache {
     f16_is_nosub: bool,
     // Q4_0 noshuffle: SOA conversion kernel (Adreno-optimized, from cvt.cl)
     kernel_cvt_q4_0_noshuffle: Option<CoreKernel>,
+    /// ENG-ALG-226 / INV-140: Fused single-dispatch SOA convert + 2D transpose
+    /// kernel. When `Some(_)`, `convert_q4_0_to_noshuffle()` skips the 4-step
+    /// host round-trip path. `None` falls back to the legacy path.
+    /// Source: `engine/kernels/cvt_q4_0_noshuffle_fused.cl`.
+    kernel_cvt_q4_0_noshuffle_fused: Option<CoreKernel>,
     /// Adreno-optimized Q4_0 GEMM for prefill (llama.cpp mul_mat_Ab_Bi_8x4).
     /// Consumes the same SOA q_buf / d_buf produced by `convert_q4_0_to_noshuffle`.
     /// Activations must be transposed to F16 (K × N_padded) via
@@ -369,6 +422,10 @@ pub struct OpenCLBackend {
 
     // Q4_0 noshuffle programs (optional — Adreno-optimized SOA GEMV)
     pub cvt_noshuffle_program: Option<Program>,
+    /// ENG-ALG-226: Fused SOA convert + transpose program (single dispatch).
+    /// `None` ⇒ legacy 4-step host-transpose fallback in
+    /// `convert_q4_0_to_noshuffle()`.
+    pub cvt_noshuffle_fused_program: Option<Program>,
     // gemv_noshuffle programs are dimension-specific (LINE_STRIDE_A, BLOCK_STRIDE_A).
     // Built lazily per weight dimension via convert_q4_0_to_noshuffle().
 
@@ -466,6 +523,40 @@ pub struct OpenCLBackend {
     // (single bool check + early return).
     cl_mem_diag_enabled: bool,
     cl_mem_diag: UnsafeCell<HashMap<&'static str, ClMemDiagBucket>>,
+
+    // ── LISWAP-2 prototype: async H2D weight upload queue ────────────────
+    // Lazily-created secondary command queue dedicated to the async swap
+    // dispatcher's `enqueue_write_async` path. Created on first use so the
+    // cost is paid only when `--swap-async-dispatch` is actually enabled.
+    // Env-gate: `LLMRS_OPENCL_TRANSFER_QUEUE=0|false|off` disables it (then
+    // `enqueue_write_async` falls through to the default sync copy path).
+    // Plan: .claude/plans/compiled-chasing-hopper.md (Phase 1).
+    transfer_queue: std::sync::OnceLock<Queue>,
+
+    // ── LISWAP-3 prototype: ALLOC_HOST_PTR pool for swap (Direction A) ───
+    // Lazily-created pool of pre-allocated `CL_MEM_ALLOC_HOST_PTR` cl_mem
+    // slots dedicated to the production swap path's zero-copy upload (vs.
+    // the staging copy used by `copy_weight_from`). Created on first use
+    // so the up-front allocation cost is paid only when
+    // `--swap-zero-copy` + `LLMRS_OPENCL_HOST_PTR_POOL=1` are both on.
+    // Env-gate: `LLMRS_OPENCL_HOST_PTR_POOL=1|true|on` enables (default OFF —
+    // measurement-driven decision pending). Plan: compiled-chasing-hopper.md
+    // (Direction A track, Stage 3).
+    host_ptr_pool: std::sync::OnceLock<Option<Arc<host_ptr_pool::HostPtrPool>>>,
+
+    // ── LISWAP multi-context experiment: secondary cl_context for swap ───
+    // Hypothesis: Adreno's in-order driver scheduler may serialize swap
+    // Map/Unmap and forward kernels even on separate command queues if both
+    // belong to the same `cl_context`. Allocating a second `cl_context` on
+    // the same `cl_device_id` exposes whether driver-level queue scheduling
+    // is context-scoped (then swap and forward are isolated) or
+    // device-scoped (then this changes nothing). The DMA-BUF FD is shared
+    // between both contexts so the underlying physical memory is identical.
+    //
+    // Env-gate: `LLMRS_OPENCL_SWAP_CONTEXT=1|true|on` enables (default OFF).
+    // Both lazy-init via `swap_context_or_init()` / `swap_queue_or_init()`.
+    swap_context: std::sync::OnceLock<Context>,
+    swap_queue: std::sync::OnceLock<Queue>,
 }
 
 /// Per-category cl_mem allocation bucket (WSWAP-5-TBT-DIAG).
@@ -605,6 +696,22 @@ impl OpenCLBackend {
             Some(flags::QUEUE_PROFILING_ENABLE)
         } else {
             None
+        };
+        // Optional out-of-order execution: env-gated via LLMRS_OPENCL_OOO_QUEUE=1.
+        // When enabled, the driver schedules commands by data dependency
+        // rather than submission order. swap H2D and forward kernels that
+        // touch different cl_mems can theoretically run in parallel.
+        let queue_props = if std::env::var("LLMRS_OPENCL_OOO_QUEUE").is_ok() {
+            log::info!(
+                "OpenCL queue: CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE \
+                 (LLMRS_OPENCL_OOO_QUEUE=1)"
+            );
+            Some(
+                queue_props.unwrap_or(flags::CommandQueueProperties::empty())
+                    | flags::QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+            )
+        } else {
+            queue_props
         };
         let mut queue = Queue::new(&context, device, queue_props)?;
         // Optional: replace queue with a priority-hinted one via
@@ -1094,6 +1201,28 @@ impl OpenCLBackend {
             log::warn!("cvt.cl failed to compile. Q4_0 noshuffle disabled.");
         }
 
+        // ENG-ALG-226 / INV-140: Fused convert+transpose kernel.
+        // Compiled as a separate program so a register-spill failure on Adreno
+        // (per-thread float4 budget) leaves the legacy `cvt.cl` path intact.
+        // `convert_q4_0_to_noshuffle()` falls back to the 4-step path when this
+        // program (and therefore `kernel_cvt_q4_0_noshuffle_fused`) is `None`.
+        let cvt_noshuffle_fused_src = include_str!("../../../kernels/cvt_q4_0_noshuffle_fused.cl");
+        let cvt_noshuffle_fused_program = Program::builder()
+            .devices(device)
+            .src(cvt_noshuffle_fused_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+            .ok();
+        if cvt_noshuffle_fused_program.is_some() {
+            log::info!(
+                "cvt_q4_0_noshuffle_fused.cl compiled (ENG-ALG-226 fused SOA convert+transpose)"
+            );
+        } else {
+            log::warn!(
+                "cvt_q4_0_noshuffle_fused.cl failed to compile; falling back to 4-step host transpose path."
+            );
+        }
+
         // Adreno Q4_0 GEMM fast path: `mul_mat_Ab_Bi_8x4.cl` consumes SOA
         // weights (from cvt.cl) and F16-transposed activations to compute
         // prefill matmul at ~4-5x the throughput of generic `mul_mm_q4_0`.
@@ -1298,6 +1427,9 @@ impl OpenCLBackend {
             kernel_cvt_q4_0_noshuffle: cvt_noshuffle_program.as_ref().and_then(|p| {
                 ocl::core::create_kernel(p, "kernel_convert_block_q4_0_noshuffle").ok()
             }),
+            kernel_cvt_q4_0_noshuffle_fused: cvt_noshuffle_fused_program.as_ref().and_then(|p| {
+                ocl::core::create_kernel(p, "kernel_convert_block_q4_0_noshuffle_fused").ok()
+            }),
             kernel_mul_mat_ab_bi_8x4: gemm_ab_bi_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_Ab_Bi_8x4").ok()),
@@ -1371,6 +1503,7 @@ impl OpenCLBackend {
             kivi_attn_program,
             attention_scores_program,
             cvt_noshuffle_program,
+            cvt_noshuffle_fused_program,
             gemm_ab_bi_program,
             transpose_program,
             kernels: UnsafeCell::new(kernel_cache),
@@ -1400,6 +1533,16 @@ impl OpenCLBackend {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             cl_mem_diag: UnsafeCell::new(HashMap::new()),
+            // LISWAP-2 prototype (plan: chasing-hopper). Lazy-init in
+            // `transfer_queue_or_init()`.
+            transfer_queue: std::sync::OnceLock::new(),
+            // LISWAP-3 prototype (Direction A, Stage 3). Lazy-init in
+            // `host_ptr_pool_or_init()`.
+            host_ptr_pool: std::sync::OnceLock::new(),
+            // LISWAP multi-context experiment. Lazy-init in
+            // `swap_context_or_init()` / `swap_queue_or_init()`.
+            swap_context: std::sync::OnceLock::new(),
+            swap_queue: std::sync::OnceLock::new(),
         })
     }
 
@@ -1951,12 +2094,30 @@ impl OpenCLBackend {
         }
 
         // GEMV path (decode or GEMM unavailable)
-        let a_buf =
-            get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
-        let b_buf =
-            get_cl_mem(b.buffer().as_ref()).map_err(|_| anyhow!("B is not OpenCL buffer"))?;
-        let out_buf =
-            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+        let a_buf = get_cl_mem(a.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_f16: A is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(a.buffer().as_ref()),
+                a.dtype(),
+                a.shape().dims()
+            )
+        })?;
+        let b_buf = get_cl_mem(b.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_f16: B (weight) is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(b.buffer().as_ref()),
+                b.dtype(),
+                b.shape().dims()
+            )
+        })?;
+        let out_buf = get_cl_mem(out.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_f16: Out is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(out.buffer().as_ref()),
+                out.dtype(),
+                out.shape().dims()
+            )
+        })?;
 
         let kernels = unsafe { &*self.kernels.get() };
         let f16_nosub = kernels.f16_is_nosub;
@@ -2060,12 +2221,30 @@ impl OpenCLBackend {
         };
         let n = b_dims[0];
 
-        let a_buf =
-            get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
-        let b_buf =
-            get_cl_mem(b.buffer().as_ref()).map_err(|_| anyhow!("B is not OpenCL buffer"))?;
-        let out_buf =
-            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+        let a_buf = get_cl_mem(a.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_q4_0: A is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(a.buffer().as_ref()),
+                a.dtype(),
+                a.shape().dims()
+            )
+        })?;
+        let b_buf = get_cl_mem(b.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_q4_0: B (weight) is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(b.buffer().as_ref()),
+                b.dtype(),
+                b.shape().dims()
+            )
+        })?;
+        let out_buf = get_cl_mem(out.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul_q4_0: Out is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(out.buffer().as_ref()),
+                out.dtype(),
+                out.shape().dims()
+            )
+        })?;
 
         // Auto-dispatch to noshuffle GEMV for decode (m==1) when image1d_buffer_t is available.
         // The noshuffle kernel uses Adreno TP cache via image reads (R32UI weight, RGBA32F act).
@@ -2244,19 +2423,34 @@ impl OpenCLBackend {
 
     /// Convert Q4_0 AOS weight buffer to SOA layout for the noshuffle GEMV kernel.
     ///
-    /// Called once per weight tensor at model load time.
+    /// Called once per weight tensor at model load time and on every weight
+    /// swap (Phase 6.5 stage `soa_reconvert`).
     /// Returns (q_buf, d_buf, q_img) — the SOA nibbles buffer, scales buffer,
     /// and an optional image1d_buffer_t wrapping q_buf (R32UI) for Adreno TP cache.
     /// **Transposed** so that the GEMV kernel can access them with coalesced reads.
     ///
-    /// The full pipeline mirrors llama.cpp's Adreno path:
-    ///   1. GPU: kernel_convert_block_q4_0_noshuffle (nibble rearrange, row-major)
-    ///   2. CPU: ushort-level 2D transpose of q buffer (M rows x K/4 cols -> K/4 rows x M cols)
-    ///   3. CPU: half-level 2D transpose of d buffer (M rows x blocks_per_row cols -> transposed)
-    ///   4. Create image1d_buffer_t wrapping q_buf (R32UI) — gracefully degrades if unsupported.
+    /// # Two paths (same byte-equal output, INV-140)
+    ///
+    /// 1. **Fused** (ENG-ALG-226, default when available):
+    ///    `kernel_convert_block_q4_0_noshuffle_fused` performs nibble
+    ///    rearrange + 2D transpose in a single GPU dispatch with zero host
+    ///    round-trip. No `queue.finish()` — the caller must `synchronize()`
+    ///    before the result is consumed by another stage (ENG-ALG-230/231,
+    ///    INV-142).
+    ///
+    /// 2. **4-step legacy fallback** (when fused kernel is `None` or
+    ///    alignment requirements aren't met):
+    ///    GPU `kernel_convert_block_q4_0_noshuffle` (nibble rearrange,
+    ///    row-major) → host read → CPU ushort-level transpose of q buffer
+    ///    → CPU half-level transpose of d buffer → write_buffer × 2
+    ///    → image1d_buffer_t creation.
+    ///
+    /// Both paths produce identical cl_mem contents (INV-140); the fused
+    /// kernel was validated against the legacy path on host (NVIDIA OpenCL)
+    /// via `engine/tests/spec/test_inv_140_fused_convert_byte_equal.rs`.
     ///
     /// # Arguments
-    /// * `src` - Raw Q4_0 weight buffer (BlockQ4_0 AOS format)
+    /// * `src` - Raw Q4_0 weight buffer (BlockQ4_0 AOS format, 18 B / block)
     /// * `num_blocks` - Total number of Q4_0 blocks (= num_rows * K / QK4_0)
     /// * `ne00` - K dimension (elements per row)
     /// * `ne01` - M dimension (number of rows)
@@ -2268,12 +2462,12 @@ impl OpenCLBackend {
         ne01: usize,
     ) -> Result<(ocl::core::Mem, ocl::core::Mem, Option<ocl::core::Mem>)> {
         let kernels = unsafe { &*self.kernels.get() };
-        let cvt_kernel = kernels
-            .kernel_cvt_q4_0_noshuffle
-            .as_ref()
-            .ok_or_else(|| anyhow!("Q4_0 noshuffle conversion kernel not available"))?;
 
-        // Allocate SOA buffers (row-major, pre-transpose)
+        // Allocate SOA buffers (the layout below is the *post-transpose*
+        // layout, written directly by the fused kernel, or written first
+        // row-major by the legacy kernel and overwritten by the host
+        // transpose in the 4-step path).
+        //
         // dst_q: num_blocks * 16 bytes (QK4_0/2 = 16 nibble-bytes per block)
         let q_bytes = num_blocks * 16;
         let dst_q = unsafe {
@@ -2297,108 +2491,188 @@ impl OpenCLBackend {
         };
         self.record_cl_mem_alloc("weight_q4_soa_d", num_blocks * 2);
 
-        // Step 1: GPU SOA conversion (nibble rearrange, keeps row-major block order)
-        unsafe {
-            ocl::core::set_kernel_arg(cvt_kernel, 0, ocl::core::ArgVal::mem(src))?;
-            ocl::core::set_kernel_arg(cvt_kernel, 1, ocl::core::ArgVal::mem(&dst_q))?;
-            ocl::core::set_kernel_arg(cvt_kernel, 2, ocl::core::ArgVal::mem(&dst_d))?;
-
-            let global_work_size: [usize; 3] = [num_blocks, 1, 1];
-            self.enqueue_kernel_labeled(cvt_kernel, "load_time", 1, &global_work_size, None)?;
-        }
-        self.queue.finish()?;
-
-        // Step 2: CPU transpose of q buffer (ushort-level 2D transpose)
-        //
-        // Row-major layout (after SOA conversion):
-        //   q[row * cols_ushort + col] where cols_ushort = K/4 (ushort per row)
-        // Transposed layout (what GEMV expects):
-        //   q_t[col * M + row] (column-major by ushort)
-        //
-        // When GEMV reads uint* from the transposed buffer, consecutive row-pairs
-        // (row 2*gid, 2*gid+1) share a uint, enabling 2-row-per-fiber processing.
-        let cols_ushort = ne00 / 4; // K/4 ushort per row
-        let q_total_ushort = ne01 * cols_ushort;
-        {
-            let mut q_host = vec![0u16; q_total_ushort];
-            unsafe {
-                ocl::core::enqueue_read_buffer(
-                    &self.queue,
-                    &dst_q,
-                    true,
-                    0,
-                    std::slice::from_raw_parts_mut(
-                        q_host.as_mut_ptr() as *mut u8,
-                        q_total_ushort * 2,
-                    ),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-
-            let mut q_transposed = vec![0u16; q_total_ushort];
-            for row in 0..ne01 {
-                for col in 0..cols_ushort {
-                    q_transposed[col * ne01 + row] = q_host[row * cols_ushort + col];
-                }
-            }
-
-            unsafe {
-                ocl::core::enqueue_write_buffer(
-                    &self.queue,
-                    &dst_q,
-                    true,
-                    0,
-                    std::slice::from_raw_parts(
-                        q_transposed.as_ptr() as *const u8,
-                        q_total_ushort * 2,
-                    ),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-        }
-
-        // Step 3: CPU transpose of d buffer (half-level 2D transpose)
-        //
-        // Row-major: d[row * blocks_per_row + k] (half per block)
-        // Transposed: d_t[k * M + row] (column-major by half)
-        //
-        // GEMV reads half2* from transposed d: half2[k*(M/2) + gid]
-        //   .x = d_t[k*M + 2*gid]   = scale for even row
-        //   .y = d_t[k*M + 2*gid+1] = scale for odd row
+        let cols_ushort = ne00 / 4; // K/4 ushort per row (post-transpose width)
         let blocks_per_row = ne00 / 32; // QK4_0 = 32
-        {
-            let mut d_host = vec![0u16; num_blocks];
-            unsafe {
-                ocl::core::enqueue_read_buffer(
-                    &self.queue,
-                    &dst_d,
-                    true,
-                    0,
-                    std::slice::from_raw_parts_mut(d_host.as_mut_ptr() as *mut u8, num_blocks * 2),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
+        let q_total_ushort = ne01 * cols_ushort;
 
-            let mut d_transposed = vec![0u16; num_blocks];
-            for row in 0..ne01 {
-                for k in 0..blocks_per_row {
-                    d_transposed[k * ne01 + row] = d_host[row * blocks_per_row + k];
+        // ── Path selection ────────────────────────────────────────────────
+        //
+        // Fused path requires:
+        //   * compiled kernel handle, and
+        //   * ne00 % 32 == 0 (always true for Q4_0; one block has 32 elems),
+        //   * ne00 % 4 == 0  (cols_ushort well-defined; implied above),
+        //   * ne01 unrestricted — every row is independent.
+        //
+        // We additionally require num_blocks == ne01 * blocks_per_row to
+        // catch caller mismatches (the kernel divides gid by blocks_per_row
+        // to recover row, which would be wrong if num_blocks were inflated).
+        // ENG-ALG-226 fused kernel is force-disabled on every backend until
+        // the Adreno-specific corruption is understood and fixed. Both the
+        // original per-row variant and a uint-store row-pair rewrite exhibit
+        // the same ~43 % q_buf byte divergence vs the host CPU reference
+        // (`q4_0_aos_to_adreno_soa`) on SM8750 / Adreno 830 — the legacy
+        // 4-step path is byte-equal. The kernel source and the host probe
+        // (`bin/test_q4_soa_byte_equal`) are kept so the regression can be
+        // re-exercised once a fix lands. `LLMRS_FORCE_LEGACY_CVT=1` opts
+        // out for diagnostic comparisons; `LLMRS_ENABLE_FUSED_CVT=1` opts
+        // in to the (broken) fused path for the same purpose.
+        let force_legacy = std::env::var("LLMRS_FORCE_LEGACY_CVT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let opt_in_fused = std::env::var("LLMRS_ENABLE_FUSED_CVT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let fused_eligible = !force_legacy
+            && opt_in_fused
+            && kernels.kernel_cvt_q4_0_noshuffle_fused.is_some()
+            && ne00.is_multiple_of(32)
+            && ne01.is_multiple_of(2)
+            && num_blocks == ne01 * blocks_per_row;
+
+        if fused_eligible {
+            // ── ENG-ALG-226 fused path (v2: row-pair uint stores) ─────────
+            // Each work-item processes 2 adjacent rows × 1 K-block, packing
+            // outputs into 4-byte aligned uint stores. Global size therefore
+            // halves. The row-pair restructure was needed to dodge an
+            // Adreno-specific race where parallel ushort stores to adjacent
+            // addresses corrupt each other's high byte (~43% q_buf
+            // divergence on SM8750 / Adreno 830 with the prior per-row
+            // dispatch).
+            let fused_kernel = kernels.kernel_cvt_q4_0_noshuffle_fused.as_ref().unwrap();
+            unsafe {
+                ocl::core::set_kernel_arg(fused_kernel, 0, ocl::core::ArgVal::mem(src))?;
+                ocl::core::set_kernel_arg(fused_kernel, 1, ocl::core::ArgVal::mem(&dst_q))?;
+                ocl::core::set_kernel_arg(fused_kernel, 2, ocl::core::ArgVal::mem(&dst_d))?;
+                ocl::core::set_kernel_arg(
+                    fused_kernel,
+                    3,
+                    ocl::core::ArgVal::scalar(&(ne01 as u32)),
+                )?;
+                ocl::core::set_kernel_arg(
+                    fused_kernel,
+                    4,
+                    ocl::core::ArgVal::scalar(&(blocks_per_row as u32)),
+                )?;
+
+                let global_work_size: [usize; 3] = [(ne01 / 2) * blocks_per_row, 1, 1];
+                self.enqueue_kernel_labeled(fused_kernel, "load_time", 1, &global_work_size, None)?;
+            }
+            // NOTE: ENG-ALG-230 / INV-142 — no `queue.finish()` here. The
+            // caller (`SwapExecutor::execute_on_slots`) issues a single
+            // `backend.synchronize()` at the stage gate before consumers
+            // (forward path, SOA registry rebuild) read the result.
+        } else {
+            // ── 4-step legacy fallback (kernel unavailable or unaligned) ──
+            let cvt_kernel = kernels.kernel_cvt_q4_0_noshuffle.as_ref().ok_or_else(|| {
+                anyhow!("Q4_0 noshuffle conversion kernel not available (neither fused nor legacy)")
+            })?;
+
+            // Step 1: GPU SOA conversion (nibble rearrange, keeps row-major block order)
+            unsafe {
+                ocl::core::set_kernel_arg(cvt_kernel, 0, ocl::core::ArgVal::mem(src))?;
+                ocl::core::set_kernel_arg(cvt_kernel, 1, ocl::core::ArgVal::mem(&dst_q))?;
+                ocl::core::set_kernel_arg(cvt_kernel, 2, ocl::core::ArgVal::mem(&dst_d))?;
+
+                let global_work_size: [usize; 3] = [num_blocks, 1, 1];
+                self.enqueue_kernel_labeled(cvt_kernel, "load_time", 1, &global_work_size, None)?;
+            }
+            self.queue.finish()?;
+
+            // Step 2: CPU transpose of q buffer (ushort-level 2D transpose)
+            //
+            // Row-major layout (after SOA conversion):
+            //   q[row * cols_ushort + col] where cols_ushort = K/4 (ushort per row)
+            // Transposed layout (what GEMV expects):
+            //   q_t[col * M + row] (column-major by ushort)
+            //
+            // When GEMV reads uint* from the transposed buffer, consecutive row-pairs
+            // (row 2*gid, 2*gid+1) share a uint, enabling 2-row-per-fiber processing.
+            {
+                let mut q_host = vec![0u16; q_total_ushort];
+                unsafe {
+                    ocl::core::enqueue_read_buffer(
+                        &self.queue,
+                        &dst_q,
+                        true,
+                        0,
+                        std::slice::from_raw_parts_mut(
+                            q_host.as_mut_ptr() as *mut u8,
+                            q_total_ushort * 2,
+                        ),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
+
+                let mut q_transposed = vec![0u16; q_total_ushort];
+                for row in 0..ne01 {
+                    for col in 0..cols_ushort {
+                        q_transposed[col * ne01 + row] = q_host[row * cols_ushort + col];
+                    }
+                }
+
+                unsafe {
+                    ocl::core::enqueue_write_buffer(
+                        &self.queue,
+                        &dst_q,
+                        true,
+                        0,
+                        std::slice::from_raw_parts(
+                            q_transposed.as_ptr() as *const u8,
+                            q_total_ushort * 2,
+                        ),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
                 }
             }
 
-            unsafe {
-                ocl::core::enqueue_write_buffer(
-                    &self.queue,
-                    &dst_d,
-                    true,
-                    0,
-                    std::slice::from_raw_parts(d_transposed.as_ptr() as *const u8, num_blocks * 2),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
+            // Step 3: CPU transpose of d buffer (half-level 2D transpose)
+            //
+            // Row-major: d[row * blocks_per_row + k] (half per block)
+            // Transposed: d_t[k * M + row] (column-major by half)
+            //
+            // GEMV reads half2* from transposed d: half2[k*(M/2) + gid]
+            //   .x = d_t[k*M + 2*gid]   = scale for even row
+            //   .y = d_t[k*M + 2*gid+1] = scale for odd row
+            {
+                let mut d_host = vec![0u16; num_blocks];
+                unsafe {
+                    ocl::core::enqueue_read_buffer(
+                        &self.queue,
+                        &dst_d,
+                        true,
+                        0,
+                        std::slice::from_raw_parts_mut(
+                            d_host.as_mut_ptr() as *mut u8,
+                            num_blocks * 2,
+                        ),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
+
+                let mut d_transposed = vec![0u16; num_blocks];
+                for row in 0..ne01 {
+                    for k in 0..blocks_per_row {
+                        d_transposed[k * ne01 + row] = d_host[row * blocks_per_row + k];
+                    }
+                }
+
+                unsafe {
+                    ocl::core::enqueue_write_buffer(
+                        &self.queue,
+                        &dst_d,
+                        true,
+                        0,
+                        std::slice::from_raw_parts(
+                            d_transposed.as_ptr() as *const u8,
+                            num_blocks * 2,
+                        ),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
             }
         }
 
@@ -2459,7 +2733,12 @@ impl OpenCLBackend {
         };
 
         log::info!(
-            "Q4_0 noshuffle SOA conversion + transpose done: {} blocks, ne00={}, ne01={}, q={} KB, d={} KB, img={}",
+            "Q4_0 noshuffle SOA conversion + transpose done ({}): {} blocks, ne00={}, ne01={}, q={} KB, d={} KB, img={}",
+            if fused_eligible {
+                "fused single-dispatch (ENG-ALG-226)"
+            } else {
+                "4-step host-transpose fallback"
+            },
             num_blocks,
             ne00,
             ne01,
@@ -3404,10 +3683,28 @@ impl OpenCLBackend {
         Ok(true)
     }
 
-    /// AUF SOA bypass helper — alloc q_buf/d_buf, blocking-write the
+    /// AUF SOA bypass helper — alloc q_buf/d_buf, **non-blocking**-write the
     /// pre-transposed payload, and (best-effort) build the
     /// `image1d_buffer_t` view. Counts the new cl_mem objects in the
     /// `auf_soa_*` diag buckets.
+    ///
+    /// # Async enqueue contract (ENG-ALG-230 / INV-142)
+    ///
+    /// Both `enqueue_write_buffer` calls use `blocking = false` so all 175 tensors
+    /// in a full-ratio AUF swap are queued without a synchronous wait per tensor
+    /// (~150 ms saved vs the previous blocking path). The OpenCL in-order command
+    /// queue guarantees ordering: writes complete before any subsequent kernel
+    /// dispatch on the same queue.
+    ///
+    /// **Callers must call `backend.synchronize()` (= `clFinish`) exactly once
+    /// at the stage gate, after all `materialise_weight` calls complete and before
+    /// `invalidate_noshuffle_soa_registry` / `restore_pre_converted_soa_registration`
+    /// read the uploaded data (ENG-ALG-231).**
+    ///
+    /// The 4-step legacy fallback path in `convert_q4_0_to_noshuffle` retains
+    /// `blocking = true` as a conservative choice — that path is only active when
+    /// the fused kernel is unavailable, and the intermediate CPU transpose already
+    /// serialises the write anyway.
     ///
     /// Caller is responsible for sizing checks; this helper assumes
     /// `q_bytes.len() == num_blocks * 16` and `d_bytes.len() == num_blocks * 2`.
@@ -3438,11 +3735,17 @@ impl OpenCLBackend {
             )?
         };
         self.record_cl_mem_alloc("auf_soa_d", num_blocks * 2);
+        // ENG-ALG-230: non-blocking enqueue — the in-order queue guarantees
+        // ordering. The caller (`execute_on_slots` stage gate) issues a single
+        // `backend.synchronize()` after all layers are materialised.
+        // SAFETY: `q_bytes` and `d_bytes` slices are valid for the duration of
+        // this unsafe block; they are borrowed from the AUF mmap slice which
+        // lives for the entire swap batch.
         unsafe {
             ocl::core::enqueue_write_buffer(
                 &self.queue,
                 &q_buf,
-                true,
+                false, // non-blocking — ENG-ALG-230
                 0,
                 q_bytes,
                 None::<&ocl::core::Event>,
@@ -3451,7 +3754,7 @@ impl OpenCLBackend {
             ocl::core::enqueue_write_buffer(
                 &self.queue,
                 &d_buf,
-                true,
+                false, // non-blocking — ENG-ALG-230
                 0,
                 d_bytes,
                 None::<&ocl::core::Event>,
@@ -3512,6 +3815,838 @@ impl OpenCLBackend {
 
         Ok((q_buf, d_buf, q_img))
     }
+
+    // ── LISWAP-2 prototype: async H2D transfer queue ─────────────────────
+    // Plan: .claude/plans/compiled-chasing-hopper.md (Phase 1).
+    //
+    // The prototype uses a *secondary* command queue dedicated to H2D weight
+    // uploads so that compute (Q4 GEMV / flash attn / FFN) on `self.queue`
+    // can overlap with the in-flight write at the hardware level. cl_mem
+    // handles are bound to the OpenCL *context*, not the queue, so a buffer
+    // allocated through the standard `OpenCLMemory` (which holds
+    // `self.queue`) is fully usable from the transfer queue too.
+
+    /// Whether the LISWAP-2 transfer queue is enabled at runtime.
+    /// Reads `LLMRS_OPENCL_TRANSFER_QUEUE` once and caches the answer.
+    /// "0" / "false" / "off" (case-insensitive) → disabled (caller falls
+    /// back to the synchronous `copy_weight_from` path). Anything else,
+    /// including an absent env var, → enabled (default ON).
+    fn transfer_queue_env_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| match std::env::var("LLMRS_OPENCL_TRANSFER_QUEUE") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off")
+            }
+            Err(_) => true,
+        })
+    }
+
+    /// Lazily build (or return) the secondary transfer queue. Returns
+    /// `None` if the env-gate is disabled or queue creation failed —
+    /// callers fall back to the synchronous path in that case. Queue
+    /// properties match the main queue (profiling stays consistent).
+    fn transfer_queue_or_init(&self) -> Option<&Queue> {
+        if !Self::transfer_queue_env_enabled() {
+            return None;
+        }
+        // Fast path: already initialised.
+        if let Some(q) = self.transfer_queue.get() {
+            return Some(q);
+        }
+        // Slow path: try to create. Match the main queue's profiling
+        // setting so per-event timings stay comparable; we deliberately
+        // keep the default priority (Phase 5 may experiment with low).
+        let queue_props = if self.profile_events_enabled {
+            Some(flags::QUEUE_PROFILING_ENABLE)
+        } else {
+            None
+        };
+        // Match the main queue's OoO setting so commands across queues see
+        // the same scheduling semantics.
+        let queue_props = if std::env::var("LLMRS_OPENCL_OOO_QUEUE").is_ok() {
+            Some(
+                queue_props.unwrap_or(flags::CommandQueueProperties::empty())
+                    | flags::QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+            )
+        } else {
+            queue_props
+        };
+        match Queue::new(&self.context, self.device, queue_props) {
+            Ok(q) => {
+                // OnceLock::set returns Err if another thread won the
+                // race; in either case `get()` will yield the live value.
+                let _ = self.transfer_queue.set(q);
+                self.transfer_queue.get()
+            }
+            Err(e) => {
+                log::warn!(
+                    "LLMRS_OPENCL_TRANSFER_QUEUE: secondary queue creation failed ({e}); \
+                     falling back to synchronous `copy_weight_from`"
+                );
+                None
+            }
+        }
+    }
+
+    // ── LISWAP-3 prototype: ALLOC_HOST_PTR pool for swap ─────────────────
+    //
+    // The pool replaces the per-tensor `clCreateBuffer + enqueue_write_buffer`
+    // staging cycle with a `clEnqueueMapBuffer(MAP_WRITE) + memcpy + Unmap`
+    // path on a pre-allocated `CL_MEM_ALLOC_HOST_PTR | READ_ONLY` slot. On
+    // Adreno UMA the unmap step flushes CPU caches and makes the bytes GPU-
+    // visible without any device-side copy. Stage 1b microbench reported
+    // -42.4% wall-clock on Galaxy S25 vs the staging baseline.
+    //
+    // Stage 3 keeps the pool path off-by-default so production swap behaviour
+    // is unchanged. Caller (SwapExecutor) must check both the CLI flag and
+    // the env-gate before requesting the pool path.
+
+    /// Allocate an empty `CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY` cl_mem
+    /// of `size` bytes (no initial data). Caller fills it via
+    /// [`fill_host_ptr_buffer`][Self::fill_host_ptr_buffer].
+    ///
+    /// Used by `HostPtrPool::new` to build slot buffers up-front; the
+    /// production swap path itself never calls this directly — it acquires
+    /// a slot via the pool and reuses the pre-allocated cl_mem.
+    ///
+    /// Plan: `compiled-chasing-hopper.md` Direction A track.
+    /// Allocate a DMA-BUF-backed cl_mem via Linux dma_heap + KHR
+    /// external_memory_dma_buf extension. Returns `(cl_mem, dmabuf_fd,
+    /// host_ptr)`. CPU writes go through `host_ptr` (cached, no Map/Unmap).
+    /// GPU reads via `cl_mem` are DMA-BUF coherent without explicit sync.
+    ///
+    /// Caller is responsible for unmapping `host_ptr` and closing
+    /// `dmabuf_fd` when the cl_mem is dropped. The cl_mem itself releases
+    /// via the `ocl::core::Mem` Drop chain (`clReleaseMemObject`).
+    ///
+    /// # Errors
+    /// - `/dev/dma_heap/system` not available (older kernel) → returns Err.
+    /// - `clCreateBufferWithProperties` not supported → returns Err.
+    pub fn alloc_dmabuf_heap_buffer(
+        &self,
+        size: usize,
+    ) -> Result<(
+        ocl::core::Mem,
+        std::os::unix::io::RawFd,
+        *mut std::ffi::c_void,
+    )> {
+        use std::ffi::c_void;
+        use std::os::unix::io::RawFd;
+        use std::ptr;
+
+        const CL_MEM_READ_ONLY: u64 = 1 << 2;
+        const CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR: u64 = 0x2067;
+
+        // 1. Open /dev/dma_heap/system
+        let path = c"/dev/dma_heap/system";
+        let heap_fd: RawFd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        if heap_fd < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(anyhow!(
+                "alloc_dmabuf_heap_buffer: open(/dev/dma_heap/system) failed: errno={errno}"
+            ));
+        }
+
+        // 2. ioctl ALLOC. _IOWR('H', 0, struct dma_heap_allocation_data)
+        // = ((1+2)<<30) | (sizeof << 16) | ('H' << 8) | 0
+        #[repr(C)]
+        struct DmaHeapAllocationData {
+            len: u64,
+            fd: u32,
+            fd_flags: u32,
+            heap_flags: u64,
+        }
+        let ioctl_alloc: u64 = (3u64 << 30)
+            | ((std::mem::size_of::<DmaHeapAllocationData>() as u64) << 16)
+            | ((b'H' as u64) << 8);
+        let mut data = DmaHeapAllocationData {
+            len: size as u64,
+            fd: 0,
+            fd_flags: (libc::O_RDWR | libc::O_CLOEXEC) as u32,
+            heap_flags: 0,
+        };
+        unsafe extern "C" {
+            fn ioctl(fd: libc::c_int, request: libc::c_ulong, ...) -> libc::c_int;
+        }
+        let rc = unsafe { ioctl(heap_fd, ioctl_alloc as libc::c_ulong, &mut data) };
+        let heap_close_errno = if rc < 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        unsafe { libc::close(heap_fd) };
+        if rc < 0 {
+            return Err(anyhow!(
+                "alloc_dmabuf_heap_buffer: ioctl ALLOC failed (size={size}, errno={heap_close_errno})"
+            ));
+        }
+        let dmabuf_fd: RawFd = data.fd as i32;
+
+        // 3. mmap the DMA-BUF for CPU access
+        let host_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                dmabuf_fd,
+                0,
+            )
+        };
+        if host_ptr == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            unsafe { libc::close(dmabuf_fd) };
+            return Err(anyhow!(
+                "alloc_dmabuf_heap_buffer: mmap failed (size={size}, errno={errno})"
+            ));
+        }
+
+        // 4. clCreateBufferWithProperties with DMA-BUF property
+        let props: [u64; 3] = [CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR, dmabuf_fd as u64, 0];
+        let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
+        unsafe extern "C" {
+            fn clCreateBufferWithProperties(
+                context: *mut c_void,
+                properties: *const u64,
+                flags: u64,
+                size: usize,
+                host_ptr: *mut c_void,
+                errcode_ret: *mut i32,
+            ) -> *mut c_void;
+        }
+        let mut errcode: i32 = 0;
+        let raw = unsafe {
+            clCreateBufferWithProperties(
+                ctx_ptr as *mut _,
+                props.as_ptr(),
+                CL_MEM_READ_ONLY,
+                size,
+                ptr::null_mut(),
+                &mut errcode,
+            )
+        };
+        if errcode != 0 || raw.is_null() {
+            unsafe {
+                libc::munmap(host_ptr, size);
+                libc::close(dmabuf_fd);
+            }
+            return Err(anyhow!(
+                "alloc_dmabuf_heap_buffer: clCreateBufferWithProperties failed (errcode={errcode})"
+            ));
+        }
+        // SAFETY: clCreateBufferWithProperties returned a valid cl_mem owning
+        // one reference. ocl::core::Mem::from_raw_create_ptr takes ownership.
+        let mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw as *mut _) };
+
+        Ok((mem, dmabuf_fd, host_ptr))
+    }
+
+    /// Multi-context swap experiment env-gate. Cached after first call.
+    /// `=1` / `=true` / `=on` (case-insensitive) enables the secondary
+    /// `cl_context` path; any other value (including unset) keeps it
+    /// disabled (default OFF).
+    fn swap_context_env_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| match std::env::var("LLMRS_OPENCL_SWAP_CONTEXT") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "on"
+            }
+            Err(_) => false,
+        })
+    }
+
+    /// Lazily build (or return) the secondary `cl_context` dedicated to swap
+    /// Map/Unmap operations. Returns `None` when the env-gate is disabled or
+    /// context creation failed.
+    ///
+    /// The secondary context targets the same `cl_device_id` as the main
+    /// context. DMA-BUF FDs are shared between both contexts so a single
+    /// physical allocation is visible from either one's `cl_mem`.
+    pub fn swap_context_or_init(&self) -> Option<&Context> {
+        if !Self::swap_context_env_enabled() {
+            return None;
+        }
+        if let Some(c) = self.swap_context.get() {
+            return Some(c);
+        }
+        match Context::builder()
+            .platform(Platform::default())
+            .devices(self.device)
+            .build()
+        {
+            Ok(c) => {
+                let _ = self.swap_context.set(c);
+                self.swap_context.get()
+            }
+            Err(e) => {
+                log::warn!(
+                    "LLMRS_OPENCL_SWAP_CONTEXT: secondary context creation failed ({e}); \
+                     falling back to single-context swap path"
+                );
+                None
+            }
+        }
+    }
+
+    /// Lazily build (or return) the swap queue inside the secondary
+    /// `cl_context`. Returns `None` when the secondary context is unavailable
+    /// or queue creation failed.
+    pub fn swap_queue_or_init(&self) -> Option<&Queue> {
+        if !Self::swap_context_env_enabled() {
+            return None;
+        }
+        if let Some(q) = self.swap_queue.get() {
+            return Some(q);
+        }
+        let ctx = self.swap_context_or_init()?;
+        // Match main queue profiling/OoO settings so cross-context comparisons
+        // remain meaningful.
+        let queue_props = if self.profile_events_enabled {
+            Some(flags::QUEUE_PROFILING_ENABLE)
+        } else {
+            None
+        };
+        let queue_props = if std::env::var("LLMRS_OPENCL_OOO_QUEUE").is_ok() {
+            Some(
+                queue_props.unwrap_or(flags::CommandQueueProperties::empty())
+                    | flags::QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+            )
+        } else {
+            queue_props
+        };
+        match Queue::new(ctx, self.device, queue_props) {
+            Ok(q) => {
+                let _ = self.swap_queue.set(q);
+                self.swap_queue.get()
+            }
+            Err(e) => {
+                log::warn!(
+                    "LLMRS_OPENCL_SWAP_CONTEXT: swap queue creation failed ({e}); \
+                     falling back to single-context swap path"
+                );
+                None
+            }
+        }
+    }
+
+    /// Allocate a DMA-BUF-backed pair of `cl_mem` handles, one in the
+    /// secondary swap `cl_context` and one in the main `cl_context`, both
+    /// referencing the same DMA-BUF FD.
+    ///
+    /// Returns `(swap_mem, main_mem, dmabuf_fd, host_ptr)`. The caller fills
+    /// the bytes via `fill_dmabuf_via_swap_queue` (uses `swap_mem` on the
+    /// swap queue) and reads the bytes from forward kernels via `main_mem`
+    /// on the main queue. Driver coherency between the two `cl_mem` views is
+    /// guaranteed by the underlying DMA-BUF.
+    ///
+    /// On Drop the caller must `munmap` `host_ptr` and `close` `dmabuf_fd`
+    /// (matches the lifecycle rules of `alloc_dmabuf_heap_buffer`).
+    ///
+    /// # Errors
+    /// - secondary swap context unavailable (env-gate off) → returns Err.
+    /// - `/dev/dma_heap/system` not available → returns Err.
+    /// - `clCreateBufferWithProperties` failed on either context → Err.
+    pub fn alloc_dmabuf_with_swap_context(
+        &self,
+        size: usize,
+    ) -> Result<(
+        ocl::core::Mem,
+        ocl::core::Mem,
+        std::os::unix::io::RawFd,
+        *mut std::ffi::c_void,
+    )> {
+        use std::ffi::c_void;
+        use std::os::unix::io::RawFd;
+        use std::ptr;
+
+        const CL_MEM_READ_ONLY: u64 = 1 << 2;
+        const CL_MEM_READ_WRITE: u64 = 1 << 0;
+        const CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR: u64 = 0x2067;
+
+        let swap_ctx = self.swap_context_or_init().ok_or_else(|| {
+            anyhow!(
+                "alloc_dmabuf_with_swap_context: secondary cl_context unavailable \
+                 (env-gate LLMRS_OPENCL_SWAP_CONTEXT off, or context build failed)"
+            )
+        })?;
+
+        // 1. Open /dev/dma_heap/system
+        let path = c"/dev/dma_heap/system";
+        let heap_fd: RawFd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        if heap_fd < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: open(/dev/dma_heap/system) failed: errno={errno}"
+            ));
+        }
+
+        // 2. ioctl ALLOC.
+        #[repr(C)]
+        struct DmaHeapAllocationData {
+            len: u64,
+            fd: u32,
+            fd_flags: u32,
+            heap_flags: u64,
+        }
+        let ioctl_alloc: u64 = (3u64 << 30)
+            | ((std::mem::size_of::<DmaHeapAllocationData>() as u64) << 16)
+            | ((b'H' as u64) << 8);
+        let mut data = DmaHeapAllocationData {
+            len: size as u64,
+            fd: 0,
+            fd_flags: (libc::O_RDWR | libc::O_CLOEXEC) as u32,
+            heap_flags: 0,
+        };
+        unsafe extern "C" {
+            fn ioctl(fd: libc::c_int, request: libc::c_ulong, ...) -> libc::c_int;
+        }
+        let rc = unsafe { ioctl(heap_fd, ioctl_alloc as libc::c_ulong, &mut data) };
+        let heap_close_errno = if rc < 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        unsafe { libc::close(heap_fd) };
+        if rc < 0 {
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: ioctl ALLOC failed (size={size}, errno={heap_close_errno})"
+            ));
+        }
+        let dmabuf_fd: RawFd = data.fd as i32;
+
+        // 3. mmap the DMA-BUF for CPU access.
+        let host_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                dmabuf_fd,
+                0,
+            )
+        };
+        if host_ptr == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            unsafe { libc::close(dmabuf_fd) };
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: mmap failed (size={size}, errno={errno})"
+            ));
+        }
+
+        // 4. clCreateBufferWithProperties on swap_context first.
+        let props: [u64; 3] = [CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR, dmabuf_fd as u64, 0];
+        unsafe extern "C" {
+            fn clCreateBufferWithProperties(
+                context: *mut c_void,
+                properties: *const u64,
+                flags: u64,
+                size: usize,
+                host_ptr: *mut c_void,
+                errcode_ret: *mut i32,
+            ) -> *mut c_void;
+        }
+        let swap_ctx_ptr = <&Context as ClContextPtr>::as_ptr(&swap_ctx);
+        let mut errcode: i32 = 0;
+        // swap_mem is mapped with CL_MAP_WRITE in `fill_dmabuf_via_swap_queue`,
+        // so it must be allocated as READ_WRITE. main_mem stays READ_ONLY since
+        // forward kernels only read.
+        let raw_swap = unsafe {
+            clCreateBufferWithProperties(
+                swap_ctx_ptr as *mut _,
+                props.as_ptr(),
+                CL_MEM_READ_WRITE,
+                size,
+                ptr::null_mut(),
+                &mut errcode,
+            )
+        };
+        if errcode != 0 || raw_swap.is_null() {
+            unsafe {
+                libc::munmap(host_ptr, size);
+                libc::close(dmabuf_fd);
+            }
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: clCreateBufferWithProperties (swap_ctx) failed (errcode={errcode})"
+            ));
+        }
+        // SAFETY: clCreateBufferWithProperties returned a valid cl_mem owning
+        // one reference. ocl::core::Mem::from_raw_create_ptr takes ownership.
+        let swap_mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw_swap as *mut _) };
+
+        // 5. clCreateBufferWithProperties on main_context with the same FD.
+        // Driver dups the FD internally, so reuse is safe.
+        let main_ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
+        let mut errcode2: i32 = 0;
+        let raw_main = unsafe {
+            clCreateBufferWithProperties(
+                main_ctx_ptr as *mut _,
+                props.as_ptr(),
+                CL_MEM_READ_ONLY,
+                size,
+                ptr::null_mut(),
+                &mut errcode2,
+            )
+        };
+        if errcode2 != 0 || raw_main.is_null() {
+            // swap_mem already wraps raw_swap; let it Drop to release.
+            drop(swap_mem);
+            unsafe {
+                libc::munmap(host_ptr, size);
+                libc::close(dmabuf_fd);
+            }
+            return Err(anyhow!(
+                "alloc_dmabuf_with_swap_context: clCreateBufferWithProperties (main_ctx) failed (errcode={errcode2})"
+            ));
+        }
+        // SAFETY: same justification as `swap_mem` above.
+        let main_mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw_main as *mut _) };
+
+        Ok((swap_mem, main_mem, dmabuf_fd, host_ptr))
+    }
+
+    /// Fill a DMA-BUF-backed cl_mem via the secondary swap queue's
+    /// `Map → memcpy → Unmap` cycle. All OpenCL calls are confined to the
+    /// swap `cl_context` / queue, so the main forward queue is untouched —
+    /// the multi-context isolation hypothesis under test.
+    ///
+    /// Optional cache-flush via `DMA_BUF_IOCTL_SYNC` when
+    /// `LLMRS_DMABUF_SYNC=1` (default OFF — matches single-context DMA-BUF
+    /// path so accuracy comparisons are apples-to-apples).
+    ///
+    /// # Safety
+    /// - `src` must be valid (readable) for `size` bytes.
+    /// - `swap_mem` must be a DMA-BUF-backed cl_mem from
+    ///   `alloc_dmabuf_with_swap_context` (i.e., bound to the swap queue's
+    ///   context).
+    /// - `size` must be `<=` the buffer's allocated capacity.
+    pub unsafe fn fill_dmabuf_via_swap_queue(
+        &self,
+        swap_mem: &ocl::core::Mem,
+        host_ptr: *mut std::ffi::c_void,
+        src: *const u8,
+        size: usize,
+    ) -> Result<()> {
+        use ocl::ffi;
+        const CL_TRUE: ffi::cl_bool = 1;
+        const CL_MAP_WRITE: ffi::cl_map_flags = 1 << 1;
+
+        let queue: &Queue = self.swap_queue_or_init().ok_or_else(|| {
+            anyhow!(
+                "fill_dmabuf_via_swap_queue: swap queue unavailable \
+                 (env-gate LLMRS_OPENCL_SWAP_CONTEXT off, or queue build failed)"
+            )
+        })?;
+        // CRITICAL: ocl 0.19 has `unsafe impl ClContextPtr for &Queue`,
+        // so `q_ref: &Queue` + `q_ref.as_ptr()` resolves to ClContextPtr's
+        // `as_ptr() -> cl_context`, NOT the cl_command_queue handle. Use the
+        // explicit Deref-target type to disambiguate.
+        let q_ref: &ocl::core::CommandQueue = queue;
+        let q_ptr: ffi::cl_command_queue = q_ref.as_ptr();
+
+        let mut errcode: ffi::cl_int = 0;
+        // SAFETY (forwarded): caller asserts `swap_mem` is a DMA-BUF-backed
+        // buffer in the swap queue's context and `size` is within capacity.
+        let mapped_ptr = unsafe {
+            ffi::clEnqueueMapBuffer(
+                q_ptr,
+                swap_mem.as_ptr(),
+                CL_TRUE,
+                CL_MAP_WRITE,
+                0,
+                size,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut errcode,
+            )
+        };
+        if errcode != 0 || mapped_ptr.is_null() {
+            return Err(anyhow!(
+                "fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode={errcode}, ptr_null={})",
+                mapped_ptr.is_null()
+            ));
+        }
+
+        // SAFETY (forwarded): caller asserts `src` is valid for `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src, mapped_ptr as *mut u8, size) };
+
+        // SAFETY: `mapped_ptr` was returned by the map call above and is
+        // still valid until the unmap completes.
+        let rc = unsafe {
+            ffi::clEnqueueUnmapMemObject(
+                q_ptr,
+                swap_mem.as_ptr(),
+                mapped_ptr,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow!(
+                "fill_dmabuf_via_swap_queue: clEnqueueUnmapMemObject failed (rc={rc})"
+            ));
+        }
+
+        // Note: optional `DMA_BUF_IOCTL_SYNC` is performed by the pool-level
+        // caller via `ioctl_dmabuf_sync_write_if_enabled` because it owns
+        // the FD. We intentionally don't propagate the FD into this fill
+        // method to keep its signature compatible with non-DMA-BUF
+        // callers that may reuse it later.
+        let _ = host_ptr;
+
+        // `LLMRS_HOST_PTR_SKIP_FINISH=1` matches `fill_host_ptr_buffer`'s
+        // env-gate semantics. Default ON (we issue `clFinish`) so the swap
+        // is observably complete before the caller drops the guard.
+        if std::env::var("LLMRS_HOST_PTR_SKIP_FINISH").is_err() {
+            // Use ocl::core::finish() with the raw queue ptr to avoid
+            // method-resolution ambiguity between Queue::finish and
+            // CommandQueueCore::finish via Deref.
+            ocl::core::finish(q_ref)?;
+        }
+        Ok(())
+    }
+
+    /// Issue a `DMA_BUF_IOCTL_SYNC START|END WRITE` on the given FD when
+    /// `LLMRS_DMABUF_SYNC=1`. Otherwise no-op. Used by the pool fill path
+    /// to force CPU-cache flush after `memcpy`/`Map+Unmap`.
+    pub fn ioctl_dmabuf_sync_write_if_enabled(&self, dmabuf_fd: std::os::unix::io::RawFd) {
+        if std::env::var("LLMRS_DMABUF_SYNC").is_err() {
+            return;
+        }
+        #[repr(C)]
+        struct DmaBufSync {
+            flags: u64,
+        }
+        const DMA_BUF_SYNC_WRITE: u64 = 2;
+        const DMA_BUF_SYNC_START: u64 = 0;
+        const DMA_BUF_SYNC_END: u64 = 1 << 2;
+        let ioctl_sync: u64 = (1u64 << 30)
+            | ((std::mem::size_of::<DmaBufSync>() as u64) << 16)
+            | ((b'b' as u64) << 8);
+        unsafe extern "C" {
+            fn ioctl(fd: libc::c_int, request: libc::c_ulong, ...) -> libc::c_int;
+        }
+        let mut sync_start = DmaBufSync {
+            flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE,
+        };
+        let mut sync_end = DmaBufSync {
+            flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE,
+        };
+        unsafe {
+            ioctl(dmabuf_fd, ioctl_sync as libc::c_ulong, &mut sync_start);
+            ioctl(dmabuf_fd, ioctl_sync as libc::c_ulong, &mut sync_end);
+        }
+    }
+
+    pub fn alloc_host_ptr_buffer_empty(&self, size: usize) -> Result<ocl::core::Mem> {
+        const CL_MEM_READ_ONLY: u64 = 1 << 2;
+        const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
+        // Qualcomm cl_qcom_ext_host_ptr extension constants (from cl_ext.h).
+        const CL_MEM_EXT_HOST_PTR_QCOM: u64 = 1 << 29;
+        const CL_MEM_HOST_IOCOHERENT_QCOM: u32 = 0x40A9;
+        const CL_MEM_HOST_WRITEBACK_QCOM: u32 = 0x40A5;
+
+        // Path A' empirical probe: when LLMRS_OPENCL_IOCOHERENT=1, try
+        // allocating with CL_MEM_EXT_HOST_PTR_QCOM + iocoherent cache policy.
+        // Driver may reject if allocation_type=0 is not accepted; in that
+        // case we fall back to plain ALLOC_HOST_PTR.
+        if std::env::var("LLMRS_OPENCL_IOCOHERENT").is_ok() {
+            #[repr(C)]
+            struct ClMemExtHostPtr {
+                allocation_type: u32,
+                host_cache_policy: u32,
+            }
+            let cache_policy = if std::env::var("LLMRS_OPENCL_WRITEBACK").is_ok() {
+                CL_MEM_HOST_WRITEBACK_QCOM
+            } else {
+                CL_MEM_HOST_IOCOHERENT_QCOM
+            };
+            let ext = ClMemExtHostPtr {
+                allocation_type: 0, // probe: driver may accept 0 as "default"
+                host_cache_policy: cache_policy,
+            };
+            let flags = (CL_MEM_READ_ONLY | CL_MEM_EXT_HOST_PTR_QCOM) as ocl::ffi::cl_bitfield;
+            let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
+            let mut errcode: ocl::ffi::cl_int = 0;
+            let raw = unsafe {
+                ocl::ffi::clCreateBuffer(
+                    ctx_ptr,
+                    flags,
+                    size,
+                    &ext as *const _ as *mut std::ffi::c_void,
+                    &mut errcode,
+                )
+            };
+            if errcode == 0 && !raw.is_null() {
+                eprintln!(
+                    "[IOCOHERENT] cl_qcom_ext_host_ptr accepted: cache_policy=0x{:X}, size={}",
+                    cache_policy, size
+                );
+                let mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw) };
+                return Ok(mem);
+            }
+            eprintln!(
+                "[IOCOHERENT] cl_qcom_ext_host_ptr rejected (errcode={}, ptr_null={}); \
+                 falling back to plain ALLOC_HOST_PTR",
+                errcode,
+                raw.is_null()
+            );
+            // Fall through to standard path below.
+        }
+
+        // Phase 4 (2026-05-09): add CL_MEM_HOST_WRITE_ONLY hint. Adreno 830
+        // measurement showed -35% wall-clock for 25MB clEnqueueWriteBuffer
+        // (1.72ms → 1.11ms). Driver omits GPU L2 staging when host writes only.
+        // Compatible with READ_ONLY (GPU read-only): host writes via clEnqueueWriteBuffer
+        // remain allowed (not host-side read-only).
+        const CL_MEM_HOST_WRITE_ONLY: u64 = 1 << 7;
+        let flags = (CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR | CL_MEM_HOST_WRITE_ONLY)
+            as ocl::ffi::cl_bitfield;
+        let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&&self.context);
+        let mut errcode: ocl::ffi::cl_int = 0;
+        let raw = unsafe {
+            ocl::ffi::clCreateBuffer(ctx_ptr, flags, size, std::ptr::null_mut(), &mut errcode)
+        };
+        if errcode != 0 || raw.is_null() {
+            return Err(anyhow!(
+                "alloc_host_ptr_buffer_empty: clCreateBuffer failed (size={size}, errcode={errcode})"
+            ));
+        }
+        // SAFETY: clCreateBuffer succeeded with a non-null handle; we own
+        // the freshly created refcount. `Mem::from_raw_create_ptr` takes
+        // ownership; Drop will call `clReleaseMemObject`.
+        let mem = unsafe { ocl::core::Mem::from_raw_create_ptr(raw) };
+        Ok(mem)
+    }
+
+    /// Fill a previously-allocated `CL_MEM_ALLOC_HOST_PTR` cl_mem with
+    /// `size` bytes from `src` via the
+    /// `clEnqueueMapBuffer(MAP_WRITE) → memcpy → clEnqueueUnmapMemObject`
+    /// cycle. The driver flushes CPU caches and makes the bytes GPU-
+    /// visible on unmap. Blocks until the unmap completes.
+    ///
+    /// # Safety
+    /// - `src` must be valid (readable) for `size` bytes for the duration
+    ///   of the call.
+    /// - `mem` must be a host-accessible buffer (created with
+    ///   `CL_MEM_ALLOC_HOST_PTR` or `CL_MEM_USE_HOST_PTR`); calling on a
+    ///   device-only buffer is undefined behaviour.
+    /// - `size` must be `<=` the buffer's allocated capacity.
+    pub unsafe fn fill_host_ptr_buffer(
+        &self,
+        mem: &ocl::core::Mem,
+        src: *const u8,
+        size: usize,
+    ) -> Result<()> {
+        use ocl::ffi;
+        const CL_TRUE: ffi::cl_bool = 1;
+        const CL_MAP_WRITE: ffi::cl_map_flags = 1 << 1;
+
+        let q_ref: &ocl::core::CommandQueue = &self.queue;
+        let q_ptr: ffi::cl_command_queue = q_ref.as_ptr();
+
+        let mut errcode: ffi::cl_int = 0;
+        // SAFETY (forwarded): caller asserts `mem` is `ALLOC_HOST_PTR`-allocated
+        // and `size` is within its capacity.
+        let mapped_ptr = unsafe {
+            ffi::clEnqueueMapBuffer(
+                q_ptr,
+                mem.as_ptr(),
+                CL_TRUE,
+                CL_MAP_WRITE,
+                0,
+                size,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut errcode,
+            )
+        };
+        if errcode != 0 || mapped_ptr.is_null() {
+            return Err(anyhow!(
+                "fill_host_ptr_buffer: clEnqueueMapBuffer failed (errcode={errcode}, ptr_null={})",
+                mapped_ptr.is_null()
+            ));
+        }
+
+        // SAFETY (forwarded): caller asserts `src` is valid for `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src, mapped_ptr as *mut u8, size) };
+
+        // SAFETY: `mapped_ptr` was returned by the map call above and is
+        // still valid until the unmap completes.
+        let rc = unsafe {
+            ffi::clEnqueueUnmapMemObject(
+                q_ptr,
+                mem.as_ptr(),
+                mapped_ptr,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow!(
+                "fill_host_ptr_buffer: clEnqueueUnmapMemObject failed (rc={rc})"
+            ));
+        }
+        // Wait for the unmap to land so subsequent kernel reads see the
+        // bytes. Stage 1b microbench used `queue.finish()` here too.
+        //
+        // LISWAP-3 v2 (env-gated): skip the explicit `queue.finish()` and
+        // rely on OpenCL's same-queue dependency tracking — the next
+        // kernel reading this cl_mem on `self.queue` will be automatically
+        // ordered after the unmap. Removes `clFinish` × N (per-layer) full
+        // barrier from the swap hot path. Set
+        // `LLMRS_HOST_PTR_SKIP_FINISH=1` to enable.
+        if std::env::var("LLMRS_HOST_PTR_SKIP_FINISH").is_err() {
+            self.queue.finish()?;
+        }
+        Ok(())
+    }
+
+    /// Lazily build (or return) the LISWAP-3 host-ptr pool. Returns `None`
+    /// when:
+    /// - the env-gate `LLMRS_OPENCL_HOST_PTR_POOL` is disabled (default),
+    /// - pool construction failed (e.g. memory pressure on first alloc).
+    ///
+    /// Caller (SwapExecutor) is contracted to fall back to the staging
+    /// path on `None`. Idempotent: `OnceLock` caches the first attempt.
+    ///
+    /// `config` is consulted only on the **first** call; subsequent calls
+    /// return the previously-built pool regardless of `config`. This
+    /// matches the lifecycle expectation of a single CLI-configured pool
+    /// per process.
+    pub fn host_ptr_pool_or_init(
+        &self,
+        config: host_ptr_pool::HostPtrPoolConfig,
+    ) -> Option<Arc<host_ptr_pool::HostPtrPool>> {
+        if !host_ptr_pool::host_ptr_pool_env_enabled() {
+            return None;
+        }
+        let cell = self.host_ptr_pool.get_or_init(|| {
+            match host_ptr_pool::HostPtrPool::new(self, config) {
+                Ok(pool) => Some(Arc::new(pool)),
+                Err(e) => {
+                    log::warn!(
+                        "LLMRS_OPENCL_HOST_PTR_POOL: pool creation failed ({e}); \
+                         falling back to staging swap path"
+                    );
+                    None
+                }
+            }
+        });
+        cell.clone()
+    }
+
+    /// Read-only accessor for an already-initialised pool. Returns `None`
+    /// when `host_ptr_pool_or_init` has not yet been called or initialisation
+    /// failed.
+    pub fn host_ptr_pool_get(&self) -> Option<Arc<host_ptr_pool::HostPtrPool>> {
+        self.host_ptr_pool.get().and_then(|opt| opt.clone())
+    }
 }
 
 impl Backend for OpenCLBackend {
@@ -3558,14 +4693,137 @@ impl Backend for OpenCLBackend {
                 Some(&mut event),
             )?;
         }
-        Ok(crate::core::backend::GpuEvent { inner: Some(event) })
+        Ok(crate::core::backend::GpuEvent {
+            inner_cl: Some(event),
+            #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+            inner_cu: None,
+        })
     }
 
     fn wait_event(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
-        if let Some(e) = evt.inner.as_ref() {
+        if let Some(e) = evt.inner_cl.as_ref() {
             ocl::core::wait_for_event(e)?;
         }
         Ok(())
+    }
+
+    /// LISWAP-2 prototype (plan: chasing-hopper, Phase 1). Async H2D
+    /// upload of a weight tensor onto the secondary `transfer_queue`.
+    /// Returns the freshly allocated destination tensor plus an event
+    /// that completes once the write is GPU-visible.
+    ///
+    /// Falls back to the synchronous default impl when the transfer
+    /// queue is disabled (env-gate or creation failure) or when the
+    /// destination has no `cl_mem` handle (host-only fallback).
+    fn enqueue_write_async(
+        &self,
+        src: &Tensor,
+    ) -> Result<(Tensor, crate::core::backend::GpuEvent)> {
+        let Some(transfer_queue) = self.transfer_queue_or_init() else {
+            // Default: sync via copy_weight_from + dummy event.
+            let dst = self.copy_weight_from(src)?;
+            return Ok((dst, crate::core::backend::GpuEvent::default()));
+        };
+
+        // Allocate the destination buffer through the regular memory
+        // factory bound to the main queue. `cl_mem` handles are
+        // context-scoped, not queue-scoped, so the secondary queue can
+        // write to this buffer without any cross-queue migration cost.
+        let size = src.size();
+        let memory = crate::backend::opencl::memory::OpenCLMemory::new(
+            self.context.clone(),
+            self.queue.clone(),
+            self.use_zero_copy,
+        );
+        let buffer = memory.alloc(size, src.dtype())?;
+        let category = match src.dtype() {
+            DType::Q4_0 => "weight_q4_aos_async",
+            DType::F16 => "weight_f16_async",
+            DType::F32 => "weight_f32_async",
+            _ => "weight_other_async",
+        };
+        self.record_cl_mem_alloc(category, size);
+
+        let new_tensor = Tensor::new(src.shape().clone(), buffer.clone(), src.backend().clone());
+
+        // We require both a source host pointer (to feed the
+        // non-blocking write) and a destination cl_mem handle. If
+        // either is missing, defer to the sync path so we keep the
+        // same correctness envelope as `copy_from`.
+        let src_ptr = src.as_ptr();
+        if src_ptr.is_null() {
+            return Err(anyhow!(
+                "enqueue_write_async: source has a null host pointer (size={size}, dtype={:?})",
+                src.dtype()
+            ));
+        }
+        let dst_mem = match get_cl_mem(buffer.as_ref()) {
+            Ok(m) => m,
+            Err(_) => {
+                // Buffer doesn't expose cl_mem (mapped host-only). Fall
+                // back to sync copy.
+                let dst = self.copy_weight_from(src)?;
+                return Ok((dst, crate::core::backend::GpuEvent::default()));
+            }
+        };
+        let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, size) };
+
+        let mut event: ocl::core::Event = ocl::core::Event::null();
+        // SAFETY: non-blocking write with an explicit event output. The
+        // caller (async swap dispatcher's worker thread) waits on this
+        // event before publishing the new weights, so the destination
+        // cl_mem outlives the in-flight write — and the source bytes
+        // outlive it too because they come from the AUF/Mmap-backed
+        // weight tensor whose lifetime spans the whole swap operation.
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                transfer_queue,
+                dst_mem,
+                false,
+                0,
+                src_slice,
+                None::<&ocl::core::Event>,
+                Some(&mut event),
+            )?;
+        }
+        // Submit the command immediately so the device starts the DMA
+        // without waiting for the next clFlush. This matches OpenCL's
+        // recommended pattern for cross-queue async work.
+        ocl::core::flush(transfer_queue)?;
+
+        Ok((
+            new_tensor,
+            crate::core::backend::GpuEvent {
+                inner_cl: Some(event),
+                #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+                inner_cu: None,
+            },
+        ))
+    }
+
+    /// Wait for an event recorded by `enqueue_write_async` (or
+    /// `enqueue_read_buffer_async`) without draining the compute queue.
+    /// `clWaitForEvents` blocks the *host* thread but not the device,
+    /// which is exactly what the swap dispatcher's worker thread needs
+    /// before flipping ArcSwap.
+    fn wait_event_blocking(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+        if let Some(e) = evt.inner_cl.as_ref() {
+            ocl::core::wait_for_event(e)?;
+            return Ok(());
+        }
+        // No CL event attached — could be a CUDA event on a multi-feature
+        // build, or a dummy fallback event. In neither case does the
+        // OpenCL backend have anything device-side to wait on, so we
+        // fall through to the default sync barrier for safety.
+        self.synchronize()
+    }
+
+    /// LISWAP-2 prototype: only true when the env-gate is on (and queue
+    /// creation has not been pre-empted by a permanent failure). The
+    /// async swap dispatcher uses this to decide between the dispatcher
+    /// path and the regular sync `copy_weight_from`.
+    fn supports_async_transfer(&self) -> bool {
+        Self::transfer_queue_env_enabled()
     }
 
     fn name(&self) -> &str {
@@ -4074,12 +5332,30 @@ impl Backend for OpenCLBackend {
             }
         }
 
-        let a_buf =
-            get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
-        let b_buf =
-            get_cl_mem(b.buffer().as_ref()).map_err(|_| anyhow!("B is not OpenCL buffer"))?;
-        let c_buf =
-            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+        let a_buf = get_cl_mem(a.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul (F32): A is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(a.buffer().as_ref()),
+                a.dtype(),
+                a.shape().dims()
+            )
+        })?;
+        let b_buf = get_cl_mem(b.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul (F32): B (weight) is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(b.buffer().as_ref()),
+                b.dtype(),
+                b.shape().dims()
+            )
+        })?;
+        let c_buf = get_cl_mem(out.buffer().as_ref()).map_err(|_| {
+            anyhow!(
+                "matmul (F32): Out is not OpenCL buffer (kind={}, dtype={:?}, shape={:?})",
+                buffer_kind_label(out.buffer().as_ref()),
+                out.dtype(),
+                out.shape().dims()
+            )
+        })?;
 
         let ne00 = k as i32;
         let ne01 = n as i32;

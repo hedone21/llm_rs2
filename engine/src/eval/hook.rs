@@ -18,16 +18,6 @@ pub struct PostStepResult {
     pub new_start_pos: Option<usize>,
 }
 
-/// Aggregated QCF/OPR metrics summary for JSON output.
-#[derive(Debug, Clone, Default)]
-pub struct MetricsSummary {
-    pub qcf_attn_total: f64,
-    pub qcf_caote_total: f64,
-    pub qcf_normalized_total: f64,
-    pub qcf_kivi_opr: Option<f64>,
-    pub qcf_kivi_opr_events: usize,
-}
-
 /// Snapshot of KV cache state for choice-level restore.
 pub trait CacheSnapshot<C: KVCacheOps>: Send {
     /// Restore caches to the snapshotted state.
@@ -40,18 +30,13 @@ pub trait CacheSnapshot<C: KVCacheOps>: Send {
 /// - `EvictionHook` (KVCache): budget-based eviction + CAOTE/attn QCF
 /// - `KiviHook` (KiviCache): flush proxy collection (NMSE + OPR)
 pub trait StepHook<C: KVCacheOps> {
-    /// Called after each decode step. Performs eviction/flush if needed
-    /// and collects QCF metrics.
-    fn post_decode_step(
-        &mut self,
-        caches: &mut [C],
-        step: usize,
-        qcf_metrics: &mut Vec<serde_json::Value>,
-    ) -> PostStepResult;
+    /// Called after each decode step. Performs eviction/flush if needed.
+    /// QCF results are stored on the hook itself (exposed via `extra_question_fields`).
+    fn post_decode_step(&mut self, caches: &mut [C], step: usize) -> PostStepResult;
 
     /// Called after prefill completes. Handles chunked-prefill eviction
     /// residuals or flush proxy collection.
-    fn post_prefill(&mut self, caches: &mut [C], qcf_metrics: &mut Vec<serde_json::Value>);
+    fn post_prefill(&mut self, caches: &mut [C]);
 
     /// Reset caches for a new question evaluation.
     fn reset_caches(&mut self, caches: &mut [C]);
@@ -80,7 +65,4 @@ pub trait StepHook<C: KVCacheOps> {
 
     /// Cache-specific top-level config JSON fields.
     fn extra_config_fields(&self) -> serde_json::Value;
-
-    /// Aggregate collected QCF metrics into a summary.
-    fn aggregate_metrics(&self, qcf_metrics: &[serde_json::Value]) -> MetricsSummary;
 }

@@ -21,6 +21,7 @@ pub mod entropy;
 pub mod latency;
 pub mod op_trace;
 pub mod ops;
+pub mod quality_metrics;
 pub mod scores;
 
 use std::path::PathBuf;

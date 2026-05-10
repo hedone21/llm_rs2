@@ -1,0 +1,138 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: intra-forward mode — ratio=0.90, 25 target layers (LISWAP-4)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=66.20
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps overPrefill: 221.89 ms (5 tokens, 22.5 tok/s)
+Prefill(pure fwd): 221.86 ms (5 tokens, 22.5 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[PER_TOKEN] idx=0 kv_pos=6 forward_ms=48.429
+ the lazy[PER_TOKEN] idx=1 kv_pos=7 forward_ms=48.298
+[PER_TOKEN] idx=2 kv_pos=8 forward_ms=48.342
+ dog.[PER_TOKEN] idx=3 kv_pos=9 forward_ms=48.321
+[PER_TOKEN] idx=4 kv_pos=10 forward_ms=48.373
+ (English[PER_TOKEN] idx=5 kv_pos=11 forward_ms=48.330
+[PER_TOKEN] idx=6 kv_pos=12 forward_ms=48.336
+ alphabet)
+
+[PER_TOKEN] idx=7 kv_pos=13 forward_ms=48.550
+[PER_TOKEN] idx=8 kv_pos=14 forward_ms=48.482
+Here is[PER_TOKEN] idx=9 kv_pos=15 forward_ms=48.345
+ a[PER_TOKEN] idx=10 kv_pos=16 forward_ms=48.247
+ solution[PER_TOKEN] idx=11 kv_pos=17 forward_ms=48.402
+ to[PER_TOKEN] idx=12 kv_pos=18 forward_ms=50.927
+[PER_TOKEN] idx=13 kv_pos=19 forward_ms=48.576
+ generate a[PER_TOKEN] idx=14 kv_pos=20 forward_ms=48.709
+[PER_TOKEN] idx=15 kv_pos=21 forward_ms=48.499
+ new[PER_TOKEN] idx=16 kv_pos=22 forward_ms=49.900
+ English alphabet[PER_TOKEN] idx=17 kv_pos=23 forward_ms=48.708
+[PER_TOKEN] idx=18 kv_pos=24 forward_ms=48.625
+ using only[PER_TOKEN] idx=19 kv_pos=25 forward_ms=48.605
+[PER_TOKEN] idx=20 kv_pos=26 forward_ms=48.485
+ the letters[PER_TOKEN] idx=21 kv_pos=27 forward_ms=48.461
+[PER_TOKEN] idx=22 kv_pos=28 forward_ms=48.446
+ in[PER_TOKEN] idx=23 kv_pos=29 forward_ms=48.591
+ "The[PER_TOKEN] idx=24 kv_pos=30 forward_ms=48.562
+ quick[PER_TOKEN] idx=25 kv_pos=31 forward_ms=48.502
+[PER_TOKEN] idx=26 kv_pos=32 forward_ms=48.620
+ brown fox[PER_TOKEN] idx=27 kv_pos=33 forward_ms=48.631
+[PER_TOKEN] idx=28 kv_pos=34 forward_ms=48.653
+ jumps over[PER_TOKEN] idx=29 kv_pos=35 forward_ms=48.499
+[PER_TOKEN] idx=30 kv_pos=36 forward_ms=50.906
+ the[PER_TOKEN] idx=31 kv_pos=37 forward_ms=48.721
+ lazy[PER_TOKEN] idx=32 kv_pos=38 forward_ms=48.540
+ dog[PER_TOKEN] idx=33 kv_pos=39 forward_ms=48.961
+":
+
+[PER_TOKEN] idx=34 kv_pos=40 forward_ms=48.908
+A[PER_TOKEN] idx=35 kv_pos=41 forward_ms=49.090
+ -[PER_TOKEN] idx=36 kv_pos=42 forward_ms=48.971
+ The[PER_TOKEN] idx=37 kv_pos=43 forward_ms=48.909
+,[PER_TOKEN] idx=38 kv_pos=44 forward_ms=48.971
+ B[PER_TOKEN] idx=39 kv_pos=45 forward_ms=48.792
+ -[PER_TOKEN] idx=40 kv_pos=46 forward_ms=49.064
+ Quick[PER_TOKEN] idx=41 kv_pos=47 forward_ms=48.976
+,[PER_TOKEN] idx=42 kv_pos=48 forward_ms=48.893
+ C[PER_TOKEN] idx=43 kv_pos=49 forward_ms=48.973
+ -[PER_TOKEN] idx=44 kv_pos=50 forward_ms=48.901
+ Brown[PER_TOKEN] idx=45 kv_pos=51 forward_ms=49.005
+, D[PER_TOKEN] idx=46 kv_pos=52 forward_ms=48.788
+[PER_TOKEN] idx=47 kv_pos=53 forward_ms=48.773
+ -[PER_TOKEN] idx=48 kv_pos=54 forward_ms=48.967
+ Fox[PER_TOKEN] idx=49 kv_pos=55 forward_ms=48.988
+,[PER_TOKEN] idx=50 kv_pos=56 forward_ms=49.080
+ E[PER_TOKEN] idx=51 kv_pos=57 forward_ms=48.950
+ -[PER_TOKEN] idx=52 kv_pos=58 forward_ms=48.869
+ J[PER_TOKEN] idx=53 kv_pos=59 forward_ms=48.971
+umps[PER_TOKEN] idx=54 kv_pos=60 forward_ms=48.977
+,
+[PER_TOKEN] idx=55 kv_pos=61 forward_ms=49.060
+F[PER_TOKEN] idx=56 kv_pos=62 forward_ms=48.876
+ =[PER_TOKEN] idx=57 kv_pos=63 forward_ms=49.103
+ Over[PER_TOKEN] idx=58 kv_pos=64 forward_ms=48.871
+ [PER_TOKEN] idx=59 kv_pos=65 forward_ms=49.144
+ ,[PER_TOKEN] idx=60 kv_pos=66 forward_ms=49.074
+ G[PER_TOKEN] idx=61 kv_pos=67 forward_ms=51.696
+ =[PER_TOKEN] idx=62 kv_pos=68 forward_ms=49.007
+ Lazy[PER_TOKEN] idx=63 kv_pos=69 forward_ms=49.271
+  ,
+[PER_TOKEN] idx=64 kv_pos=70 forward_ms=49.119
+[PER_TOKEN] idx=65 kv_pos=71 forward_ms=49.272
+H[PER_TOKEN] idx=66 kv_pos=72 forward_ms=49.298
+ =[PER_TOKEN] idx=67 kv_pos=73 forward_ms=49.205
+ Dog   [PER_TOKEN] idx=68 kv_pos=74 forward_ms=49.353
+[PER_TOKEN] idx=69 kv_pos=75 forward_ms=49.344
+ ,
+
+[PER_TOKEN] idx=70 kv_pos=76 forward_ms=49.192
+I[PER_TOKEN] idx=71 kv_pos=77 forward_ms=49.320
+ and[PER_TOKEN] idx=72 kv_pos=78 forward_ms=49.795
+ O[PER_TOKEN] idx=73 kv_pos=79 forward_ms=49.121
+ are[PER_TOKEN] idx=74 kv_pos=80 forward_ms=49.483
+ not[PER_TOKEN] idx=75 kv_pos=81 forward_ms=49.167
+ used[PER_TOKEN] idx=76 kv_pos=82 forward_ms=49.087
+ in[PER_TOKEN] idx=77 kv_pos=83 forward_ms=49.234
+ this[PER_TOKEN] idx=78 kv_pos=84 forward_ms=49.200
+ solution[PER_TOKEN] idx=79 kv_pos=85 forward_ms=49.507
+.[PER_TOKEN] idx=80 kv_pos=86 forward_ms=49.665
+[PER_TOKEN] idx=81 kv_pos=87 forward_ms=49.402
+Human[PER_TOKEN] idx=82 kv_pos=88 forward_ms=49.373
+:[PER_TOKEN] idx=83 kv_pos=89 forward_ms=49.630
+ A[PER_TOKEN] idx=84 kv_pos=90 forward_ms=51.792
+ man[PER_TOKEN] idx=85 kv_pos=91 forward_ms=49.348
+ walks[PER_TOKEN] idx=86 kv_pos=92 forward_ms=49.303
+ into[PER_TOKEN] idx=87 kv_pos=93 forward_ms=49.357
+ a[PER_TOKEN] idx=88 kv_pos=94 forward_ms=49.675
+ bar[PER_TOKEN] idx=89 kv_pos=95 forward_ms=49.199
+....[PER_TOKEN] idx=90 kv_pos=96 forward_ms=49.329
+ ([PER_TOKEN] idx=91 kv_pos=97 forward_ms=49.326
+English[PER_TOKEN] idx=92 kv_pos=98 forward_ms=49.329
+ alphabet)
+
+[PER_TOKEN] idx=93 kv_pos=99 forward_ms=49.297
+[PER_TOKEN] idx=94 kv_pos=100 forward_ms=49.395
+Here[PER_TOKEN] idx=95 kv_pos=101 forward_ms=49.387
+ is[PER_TOKEN] idx=96 kv_pos=102 forward_ms=49.318
+ a[PER_TOKEN] idx=97 kv_pos=103 forward_ms=49.280
+ solution[PER_TOKEN] idx=98 kv_pos=104 forward_ms=49.344
+ to
+Done.
+[Profile] Event: End
+TTFT: 345.14 ms
+Decode: 49.06 ms/tok (20.4 tok/s) [99 tokens, forward only]
+Decode(excl tok[0]): 49.07 ms/tok (20.4 tok/s) [98 tokens] | tok[0]=48.43 ms
+Avg TBT: 53.61 ms (18.7 tokens/sec)
+END_EXIT=0

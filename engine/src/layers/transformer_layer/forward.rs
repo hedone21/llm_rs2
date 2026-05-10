@@ -202,6 +202,24 @@ impl TransformerLayer {
                         )?;
                     }
                     kv_cache.advance_pos(seq_len);
+                } else if kv_dtype == DType::F32
+                    && is_gpu
+                    && kv_cache.layout() == KVLayout::HeadMajor
+                    && backend.supports_kv_scatter_f32_batch()
+                {
+                    // GPU F32 HeadMajor: batch scatter kernel (1 dispatch).
+                    // Generic KVCache::update path issues seq_len*kv_heads cuMemcpyDtoD
+                    // launches per layer per step — measured 38% of total wall in
+                    // discrete CUDA eval-ll. Fused scatter cuts that to one launch.
+                    kv_cache.ensure_capacity(kv_cache.current_pos() + seq_len)?;
+                    let pos = kv_cache.current_pos();
+                    let cap = kv_cache.capacity();
+                    if let Some((k_buf, v_buf)) = kv_cache.get_buffers_mut() {
+                        backend.kv_scatter_f32_to_f32_batch(
+                            &k_rope, &ws.v, k_buf, v_buf, n_heads_kv, head_dim, cap, pos, seq_len,
+                        )?;
+                    }
+                    kv_cache.advance_pos(seq_len);
                 } else if kv_dtype != DType::F32 {
                     let n_elem = seq_len * n_heads_kv * head_dim;
                     let buf_size = match kv_dtype {
@@ -605,91 +623,119 @@ impl TransformerLayer {
 
             if let Some(ref part) = self.partition_ctx {
                 // ── Partitioned FFN gate/up (prefill): cooperative GPU + CPU ──
+                //
+                // D-min optimization (vs the legacy per-layer-alloc path):
+                //   1. All scratch (x_cpu / gate_gpu_partial / gate_cpu_partial /
+                //      up_gpu_partial / up_cpu_partial / merge buffers) lives in
+                //      `ws.partition` — alloc-once, reuse across every layer.
+                //      Eliminates ~56 GPU buffer cycles + ~56 host Vec allocs
+                //      per prefill on a 28-layer model.
+                //   2. Gate + up GPU matmuls are enqueued back-to-back on the
+                //      in-order queue with a single `flush()` at the end so the
+                //      driver can pipeline the two kernels instead of one
+                //      flush per matmul.
+                //   3. CPU NEON gate + up matmuls share the single x_cpu read
+                //      and execute back-to-back on the host while the GPU
+                //      partials are already enqueued.
                 let total_rows = batch_size * seq_len;
+                let part_ws = ws.partition.as_mut().expect(
+                    "partition scratch must be initialised when partition_ctx is active \
+                     (PrefillWorkspace::init_partition)",
+                );
 
-                // Copy normalized x to CPU. Blocking read_buffer below implicitly
-                // syncs prior GPU ops on the in-order queue; explicit synchronize()
-                // is redundant.
-                let x_cpu_bytes = batch_size * seq_len * dim * 4;
-                let x_cpu_buf = Galloc::new().alloc(x_cpu_bytes, DType::F32)?;
-                let x_cpu = Tensor::new(x.shape().clone(), x_cpu_buf, part.cpu_backend.clone());
-                unsafe {
-                    let dst =
-                        std::slice::from_raw_parts_mut(x_cpu.as_ptr() as *mut u8, x_cpu_bytes);
-                    backend.read_buffer(x, dst)?;
+                // 1. x → x_cpu (single blocking read drains the in-order queue).
+                //
+                // Zero-copy fast path: when `x` is a permanent-mapped
+                // ALLOC_HOST_PTR UnifiedBuffer (set up in
+                // `transformer.rs::forward_into` next to `init_partition`)
+                // its `as_ptr()` returns the host alias of the same physical
+                // memory the GPU just wrote (RMSNorm above). A single
+                // `synchronize()` drains the queue + flushes the GPU cache
+                // for ALLOC_HOST_PTR coherency, then we `memcpy` host→host
+                // into the NEON-friendly `x_cpu` buffer instead of paying
+                // for a per-layer blocking `read_buffer` DMA (~980 KB on
+                // mid prompts × 28 layers — exposed at ratio=0.5 where GPU
+                // FFN is shortest).
+                //
+                // Fallback (`x.as_ptr()` null): legacy `read_buffer` for
+                // non-UnifiedBuffer x (`--zero-copy` off, CUDA, CPU
+                // backend, etc).
+                let x_cpu_bytes = total_rows * dim * 4;
+                let x_host_ptr = x.as_ptr();
+                if !x_host_ptr.is_null() {
+                    backend.synchronize()?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            x_host_ptr,
+                            part_ws.x_cpu.as_ptr() as *mut u8,
+                            x_cpu_bytes,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        let dst = std::slice::from_raw_parts_mut(
+                            part_ws.x_cpu.as_ptr() as *mut u8,
+                            x_cpu_bytes,
+                        );
+                        backend.read_buffer(x, dst)?;
+                    }
                 }
 
-                // Gate partition
-                {
-                    let sr = part.gate.split_row;
-                    let cr = ffn_hidden - sr;
-                    let gpu_buf = memory.alloc(total_rows * sr * 4, DType::F32)?;
-                    let mut gpu_partial = Tensor::new(
-                        Shape::new(vec![batch_size, seq_len, sr]),
-                        gpu_buf,
-                        backend.clone(),
-                    );
-                    backend.matmul_transposed(x, &part.gate.gpu_slice, &mut gpu_partial)?;
-                    backend.flush()?;
+                let gate_sr = part.gate.split_row;
+                let gate_cr = ffn_hidden - gate_sr;
+                let up_sr = part.up.split_row;
+                let up_cr = ffn_hidden - up_sr;
 
-                    let cpu_buf = Galloc::new().alloc(total_rows * cr * 4, DType::F32)?;
-                    let mut cpu_partial = Tensor::new(
-                        Shape::new(vec![batch_size, seq_len, cr]),
-                        cpu_buf,
-                        part.cpu_backend.clone(),
-                    );
-                    part.cpu_backend.matmul_transposed(
-                        &x_cpu,
-                        &part.gate.cpu_slice,
-                        &mut cpu_partial,
-                    )?;
+                // 2. GPU: enqueue gate+up matmuls back-to-back, one flush.
+                backend.matmul_transposed(
+                    x,
+                    &part.gate.gpu_slice,
+                    &mut part_ws.gate_gpu_partial,
+                )?;
+                backend.matmul_transposed(x, &part.up.gpu_slice, &mut part_ws.up_gpu_partial)?;
+                backend.flush()?;
 
-                    crate::layers::tensor_partition::merge_partials_2d(
-                        backend.as_ref(),
-                        &gpu_partial,
-                        &cpu_partial,
-                        &mut ws.gate,
-                        total_rows,
-                        sr,
-                        cr,
-                    )?;
-                }
+                // 3. CPU: gate+up NEON matmuls on the (already-read) x_cpu.
+                part.cpu_backend.matmul_transposed(
+                    &part_ws.x_cpu,
+                    &part.gate.cpu_slice,
+                    &mut part_ws.gate_cpu_partial,
+                )?;
+                part.cpu_backend.matmul_transposed(
+                    &part_ws.x_cpu,
+                    &part.up.cpu_slice,
+                    &mut part_ws.up_cpu_partial,
+                )?;
 
-                // Up partition
-                {
-                    let sr = part.up.split_row;
-                    let cr = ffn_hidden - sr;
-                    let gpu_buf = memory.alloc(total_rows * sr * 4, DType::F32)?;
-                    let mut gpu_partial = Tensor::new(
-                        Shape::new(vec![batch_size, seq_len, sr]),
-                        gpu_buf,
-                        backend.clone(),
-                    );
-                    backend.matmul_transposed(x, &part.up.gpu_slice, &mut gpu_partial)?;
-                    backend.flush()?;
-
-                    let cpu_buf = Galloc::new().alloc(total_rows * cr * 4, DType::F32)?;
-                    let mut cpu_partial = Tensor::new(
-                        Shape::new(vec![batch_size, seq_len, cr]),
-                        cpu_buf,
-                        part.cpu_backend.clone(),
-                    );
-                    part.cpu_backend.matmul_transposed(
-                        &x_cpu,
-                        &part.up.cpu_slice,
-                        &mut cpu_partial,
-                    )?;
-
-                    crate::layers::tensor_partition::merge_partials_2d(
-                        backend.as_ref(),
-                        &gpu_partial,
-                        &cpu_partial,
-                        &mut ws.up,
-                        total_rows,
-                        sr,
-                        cr,
-                    )?;
-                }
+                // 4. Merge: read GPU partials + interleave with CPU partials,
+                //    write back into ws.gate / ws.up. Scratch buffers (gpu_temp,
+                //    merge_buf) are reused — no per-layer Vec alloc.
+                let (gpu_temp, merge_buf) = (
+                    part_ws.merge_gpu_temp.as_mut_slice(),
+                    part_ws.merge_buf.as_mut_slice(),
+                );
+                crate::layers::tensor_partition::merge_partials_2d_into(
+                    backend.as_ref(),
+                    &part_ws.gate_gpu_partial,
+                    &part_ws.gate_cpu_partial,
+                    &mut ws.gate,
+                    total_rows,
+                    gate_sr,
+                    gate_cr,
+                    gpu_temp,
+                    merge_buf,
+                )?;
+                crate::layers::tensor_partition::merge_partials_2d_into(
+                    backend.as_ref(),
+                    &part_ws.up_gpu_partial,
+                    &part_ws.up_cpu_partial,
+                    &mut ws.up,
+                    total_rows,
+                    up_sr,
+                    up_cr,
+                    gpu_temp,
+                    merge_buf,
+                )?;
             } else {
                 {
                     let t = pf_start!();

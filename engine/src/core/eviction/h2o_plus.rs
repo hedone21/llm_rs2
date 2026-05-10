@@ -18,7 +18,7 @@ pub struct H2OPlusPolicy {
 }
 
 impl H2OPlusPolicy {
-    pub fn new(_recent_window: usize, keep_ratio: f32, protected_prefix: usize) -> Self {
+    pub fn new(keep_ratio: f32, protected_prefix: usize) -> Self {
         let protected_prefix = protected_prefix.max(4);
         Self {
             keep_ratio: keep_ratio.clamp(0.0, 1.0),
@@ -223,18 +223,18 @@ mod tests {
 
     #[test]
     fn test_should_evict_always_false() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 0);
+        let policy = H2OPlusPolicy::new(0.5, 0);
         assert!(!policy.should_evict(&make_cache(20, 2), 0));
     }
 
     #[test]
     fn test_name() {
-        assert_eq!(H2OPlusPolicy::new(0, 0.5, 0).name(), "h2o_plus");
+        assert_eq!(H2OPlusPolicy::new(0.5, 0).name(), "h2o_plus");
     }
 
     #[test]
     fn test_evict_fallback() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 0);
+        let policy = H2OPlusPolicy::new(0.5, 0);
         let mut cache = make_cache(20, 2);
         policy.evict(&mut cache, 10).unwrap();
         assert!(cache.current_pos <= 10);
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_noop_when_below_target() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 0);
+        let policy = H2OPlusPolicy::new(0.5, 0);
         let mut cache = make_cache(10, 2);
         let head_importance = vec![1.0f32; 2 * 100];
         let flat = vec![1.0f32; 100];
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_current_pos_uniform_after_eviction() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 0);
+        let policy = H2OPlusPolicy::new(0.5, 0);
         let n_kv_heads = 2;
         let mut cache = make_cache(20, n_kv_heads);
 
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_per_head_preserves_prefix() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 5);
+        let policy = H2OPlusPolicy::new(0.5, 5);
         let n_kv_heads = 2;
         let mut cache = make_cache(30, n_kv_heads);
 
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_per_head_preserves_recent() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 0); // prefix=4(clamped)
+        let policy = H2OPlusPolicy::new(0.5, 0); // prefix=4(clamped)
         let n_kv_heads = 2;
         let mut cache = make_cache(20, n_kv_heads);
 
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_per_head_different_hh() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 0); // prefix=4(clamped)
+        let policy = H2OPlusPolicy::new(0.5, 0); // prefix=4(clamped)
         let n_kv_heads = 2;
         let mut cache = make_cache(20, n_kv_heads);
 
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_per_head_eviction_basic() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 0); // prefix=4(clamped)
+        let policy = H2OPlusPolicy::new(0.5, 0); // prefix=4(clamped)
         let n_kv_heads = 2;
         let mut cache = make_cache(20, n_kv_heads);
 
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_flat_scores_fallback() {
-        let policy = H2OPlusPolicy::new(0, 0.5, 0);
+        let policy = H2OPlusPolicy::new(0.5, 0);
         let mut cache = make_cache(20, 2);
 
         let mut importance = vec![0.01f32; 100];

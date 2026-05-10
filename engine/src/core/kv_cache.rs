@@ -586,9 +586,19 @@ impl KVCache {
                     // Direct CPU memcpy is faster than GPU enqueue_copy_buffer for
                     // tiny copies (128 bytes per head). On ARM UMA (CL_MEM_ALLOC_HOST_PTR),
                     // host pointers directly access GPU memory without DMA transfer.
+                    //
+                    // Why: discrete-GPU CudaBuffer (cuMemAllocManaged) returns a non-null
+                    // pointer that *looks* host-addressable but actually points to
+                    // GPU-resident pages. Direct host memcpy bypasses driver migration
+                    // and reads/writes stale data, corrupting the KV cache (PPL explodes).
+                    // Force backend.copy_slice for GPU buffers so the backend's
+                    // device-to-device path runs.
                     let k_dst = self.k_buffer.as_mut_ptr();
                     let k_src = new_k.as_ptr();
-                    let can_direct_copy = type_size > 0 && !k_dst.is_null() && !k_src.is_null();
+                    let host_addressable =
+                        !self.k_buffer.buffer().is_gpu_buffer() && !new_k.buffer().is_gpu_buffer();
+                    let can_direct_copy =
+                        type_size > 0 && !k_dst.is_null() && !k_src.is_null() && host_addressable;
 
                     let src_row = self.kv_heads * self.head_dim;
                     let dst_head_stride = self.capacity * self.head_dim;

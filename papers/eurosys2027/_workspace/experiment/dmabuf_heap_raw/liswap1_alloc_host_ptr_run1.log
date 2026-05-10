@@ -1,0 +1,21 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. 21479883 is a palindromic number, so it can be written as "2147983". The sum of its digits is 40. If you take away two letters from this palindrome, what are all possible numbers that remain palindromic and if their sum equals to the square root of 68?
+
+To solve this problem, we need to follow these steps:
+
+1. Identify all palindromic substrings in "2147983".
+2. Calculate the sum of each palindrome.
+3. Check which sums are perfect squares.
+
+First, let's identify all possible substrings and then check if their sums are perfect squares.
+
+The string is "2147983". We can split it into substrings and check for palindromic numbers:
+- Substring 1: "2" (not a palindrome)
+- Substring 2: "
+Done.
+[Profile] Event: End
+TTFT: 374.66 ms
+Decode: 28.02 ms/tok (35.7 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 27.92 ms/tok (35.8 tok/s) [198 tokens] | tok[0]=48.57 ms
+Avg TBT: 34.75 ms (28.8 tokens/sec)

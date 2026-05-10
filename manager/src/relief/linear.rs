@@ -194,6 +194,7 @@ impl OnlineLinearEstimator {
             ActionId::KvMergeD2o => "kv_merge_d2o",
             ActionId::KvQuantDynamic => "kv_quant_dynamic",
             ActionId::LayerSkip => "layer_skip",
+            ActionId::SwapWeights => "swap_weights",
         }
     }
 
@@ -260,6 +261,12 @@ fn default_relief(action: &ActionId) -> ReliefVector {
             compute: 0.3,
             memory: 0.0,
             thermal: 0.1,
+            latency: -0.2,
+        },
+        ActionId::SwapWeights => ReliefVector {
+            compute: 0.0,
+            memory: 0.5,
+            thermal: 0.0,
             latency: -0.2,
         },
     }

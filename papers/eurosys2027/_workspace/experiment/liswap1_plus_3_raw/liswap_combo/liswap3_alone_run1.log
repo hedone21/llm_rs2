@@ -1,0 +1,33 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[LISWAP-3] host_ptr_pool active: slots=14, max_tensor_size=11534336
+weight_swap: force ratio=0.90, swapped 25/28 layers in 254.4ms
+weight_swap stages: prefault=5.5ms mmap_permute=246.9ms arc_swap=0.0ms madvise=0.3ms synchronize=1.5ms soa_reconvert=0.0ms gen_bump=0.0ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=48.38
+[Profile] Event: PrefillStart
+Prefill: 105.18 ms (5 tokens, 47.5 tok/s)
+Prefill(pure fwd): 105.14 ms (5 tokens, 47.6 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. This sentence has 18 words. If we add a new word, what is the smallest number of times we need to change words so that all possible arrangements with those changes result in each arrangement having exactly one "fox"?
+To solve this problem, let's first understand how many distinct arrangements are possible for the sentence "The quick brown fox jumps over the lazy dog." This sentence has 18 unique words. The number of ways to arrange these words is given by \( \frac{18!}{6!} \), because we have already placed one word ("fox") at a specific position, so we only need to permute the remaining 6 positions.
+
+When we add a new word, it can replace any one of those 6 positions. To minimize the number of arrangements where "fox" is in exactly that single position (the first), all other words must be rearranged such that they don't affect this specific arrangement pattern for every possible new
+Done.
+[Profile] Event: End
+TTFT: 502.82 ms
+Decode: 26.54 ms/tok (37.7 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.54 ms/tok (37.7 tok/s) [198 tokens] | tok[0]=26.50 ms
+Avg TBT: 30.45 ms (32.8 tokens/sec)

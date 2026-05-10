@@ -248,23 +248,29 @@ Sink + recent window:
 
 #### 2.2.4 D2O Merge (Eviction with Compensation)
 
-H2O와 동일한 잔존 집합 `ℛ`을 쓰되, evicted 토큰 `e ∈ ℰ ∖ ℛ`을 가장 가까운 retained 토큰에 가중 합성:
+D2O 논문(arXiv 2406.13035) Eq.11 충실 구현. H2O와 동일한 잔존 집합 `ℛ`을 쓰되, evicted 토큰 `e ∈ ℰ ∖ ℛ`을 가장 가까운 retained 토큰에 그룹 정규화 가중치로 합성:
 
 ```math
-\tilde V(h, r) = V(h, r) + \sum_{e \in \mathrm{NN}^{-1}(r)} w_{e \to r} \, V(h, e)
+u_{e,r} = \cos\bigl(K(h, e),\, K(h, r)\bigr), \qquad \mathrm{NN}(e) = \arg\max_{r \in \mathcal{R}}\, u_{e,r}
+```
+
+각 retained 그룹 `G_r = \mathrm{NN}^{-1}(r)`에 대해 정규화 분모와 가중치:
+
+```math
+D_r = \sum_{e \in G_r} \exp(u_{e,r}) + \mathrm{e}, \qquad w_{r \leftarrow r} = \frac{\mathrm{e}}{D_r}, \quad w_{e \to r} = \frac{\exp(u_{e,r})}{D_r}
 ```
 
 ```math
-w_{e \to r} = \frac{\exp(\sigma_{e,r})}{\exp(\sigma_{e,r}) + \mathrm{e}}, \quad \sigma_{e,r} = \cos\bigl(V(h, e), V(h, r)\bigr)
+\tilde V(h, r) = w_{r \leftarrow r}\, V(h, r) + \sum_{e \in G_r} w_{e \to r}\, V(h, e), \qquad w_{r \leftarrow r} + \sum_{e \in G_r} w_{e \to r} = 1
 ```
 
-여기서 `NN(e) = argmax_{r ∈ ℛ} cos(V(h,e), V(h,r))`, `e = MERGE_E = 1.0`(default). 그 다음:
+상수 `e = MERGE_E = 0.1`(handler `D2OConfig::merge_e` default와 일치). nearest 매핑은 **K** 기준 (논문 충실, 추가 K_source 없으면 V로 fallback). 가중치 합 1 보장으로 머지 후 magnitude drift 없음. 그 다음:
 
 ```math
 O_h^{\text{after}} = \sum_{r \in \mathcal{R}} \frac{\alpha_h(r)}{\sum_{r' \in \mathcal{R}} \alpha_h(r')} \, \tilde V(h, r)
 ```
 
-코드: `unified_qcf.rs:223~250`, `compute_o_d2o_merge()` line 393, `find_nearest_cosine_with_sim()` line 452.
+코드: `unified_qcf.rs::compute_o_d2o_merge`. 동일 식이 실제 KV 캐시 머지에도 적용됨: `core/pressure/d2o_handler.rs::scatter_reduce_*` (F32/F16/Q4_0). estimator(QCF)와 actuator(handler) 가중치 식 일치.
 
 #### 2.2.5 KIVI Quantization
 

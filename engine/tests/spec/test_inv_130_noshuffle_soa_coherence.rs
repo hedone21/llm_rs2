@@ -217,8 +217,8 @@ fn empty_swap_batch_does_not_invalidate() {
     let be_counting = Arc::new(CountingBackend::new());
     let be_dyn: Arc<dyn Backend> = be_counting.clone();
 
-    let layers: Vec<LayerSlot> = (0..2)
-        .map(|_| LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None))
+    let layers: Vec<Arc<LayerSlot>> = (0..2)
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None)))
         .collect();
     let ratio_gen = Arc::new(AtomicU64::new(0));
     let config = minimal_model_config();
@@ -228,7 +228,7 @@ fn empty_swap_batch_does_not_invalidate() {
 
     // Case 1: empty target_layers → skip everything, no bump, no invalidate.
     let report = executor
-        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[])
+        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[], None)
         .expect("empty target must not error");
     assert!(report.swapped.is_empty(), "no swaps expected");
     assert_eq!(
@@ -244,7 +244,7 @@ fn empty_swap_batch_does_not_invalidate() {
     // Case 2: non-empty target but no secondary mmap → early return, still no
     // invalidation because no swap happened.
     let report = executor
-        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[0, 1])
+        .execute_on_slots(layers.as_slice(), None, &ratio_gen, &[0, 1], None)
         .expect("missing secondary must not error");
     assert!(report.swapped.is_empty(), "missing secondary skips all");
     assert_eq!(

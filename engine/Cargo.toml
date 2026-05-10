@@ -42,6 +42,18 @@ env_logger = "0.11"
 # OpenCL
 ocl = { version = "0.19", optional = true }
 
+# Vulkan (microbench-only PoC, default off)
+ash = { version = "0.38", optional = true }
+
+# QNN/HTP probe (microbench-only PoC, default off)
+libloading = { version = "0.8", optional = true }
+
+# QNN OpPackage host metadata (M3.1, INV-180).
+# `crates/qnn_oppkg`는 cdylib + rlib 동시 빌드. engine은 host metadata
+# (LayerConfig, LAYER_NODE_COUNT 등)만 link하며, cdylib 산출물 (.so) 자체는
+# 디바이스에서 dlopen으로 적재된다 (engine binary가 직접 link하지 않음).
+qnn_oppkg = { path = "../crates/qnn_oppkg", optional = true }
+
 # CUDA (Jetson)
 cudarc = { version = "0.19", optional = true, default-features = false, features = [
   "std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading",
@@ -55,9 +67,14 @@ tempfile = "3.0"
 
 [dev-dependencies]
 
+[build-dependencies]
+bindgen = { version = "0.71", optional = true }
+
 [features]
 default = ["opencl"]
 opencl = ["ocl"]
+vulkan = ["ash"]                # Vulkan PoC (microbench bins only)
+qnn = ["libloading", "bindgen", "dep:qnn_oppkg"]  # QNN HTP PoC + M3 backend wire-up
 cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)
 cuda-embedded = ["cudarc"]      # Embedded UMA version, e.g. Jetson Xavier (cuda_embedded/)
 resilience = ["zbus"]

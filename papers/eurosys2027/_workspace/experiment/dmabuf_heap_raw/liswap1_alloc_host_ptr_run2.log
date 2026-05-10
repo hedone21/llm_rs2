@@ -1,0 +1,13 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+This is a sentence. It is written in English, and it contains 28 words. The first word "quick" has an adjective "-ly". "Lazy" can be used as an adjective or a noun, but here we are using it as an adverb to modify the verb "jumps".
+The second word of the sentence is also a proper noun: "fox". This refers to a specific type of animal. It could refer both literally and figuratively.
+After that comes "the", which means 'this' or 'that'. We use it here because we don't know what other object will follow it in the sentence.
+Next, there are two nouns - "dog" (a common pet) and its adjective "-ly". Both these words indicate time. They do not actually exist as separate words but rather form a single word that means 'at' or 'when'. It also tells us how much time has passed since our narrator first noticed something interesting
+Done.
+[Profile] Event: End
+TTFT: 378.42 ms
+Decode: 28.25 ms/tok (35.4 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 28.15 ms/tok (35.5 tok/s) [198 tokens] | tok[0]=48.54 ms
+Avg TBT: 36.67 ms (27.3 tokens/sec)

@@ -52,6 +52,12 @@ pub struct LoadConfig {
     /// Ignored for GGUF secondaries. `Auto` is the default and selects
     /// META.default_dtype or the first available candidate.
     pub secondary_dtype_choice: crate::models::weights::SecondaryDtypeChoice,
+    /// Layout (backend variant) selection for AUF-backed secondary files.
+    ///
+    /// `Auto`는 build feature로 결정한 preferred variant를 우선 시도하고,
+    /// 그게 AUF에 없으면 `CpuAos`로 폴백한다. `Aos`/`Soa`는 명시 강제.
+    /// switch_hw cpu / partition lazy-map과 함께 쓰려면 `Aos`가 필요하다.
+    pub secondary_layout_choice: crate::models::weights::SecondaryLayoutChoice,
 }
 
 /// Internal standard tensor identifier (format-agnostic).
@@ -151,7 +157,10 @@ pub fn load_model(
     // 1. Load layers as `LayerSlot`s. Each slot wraps the initial
     //    `TransformerLayer` snapshot behind an `ArcSwap` so Phase 2 can swap
     //    it atomically (ENG-DAT-092, INV-123).
-    let mut layers: Vec<LayerSlot> = Vec::with_capacity(num_layers);
+    // LISWAP-2 Phase 6.1: wrap each LayerSlot in Arc so the async swap
+    // dispatcher (Phase 6.2) can take ownership of a slot handle across
+    // thread boundaries.  Forward path uses Arc::deref transparently.
+    let mut layers: Vec<Arc<LayerSlot>> = Vec::with_capacity(num_layers);
     for i in 0..num_layers {
         let load_weight = |kind: LayerWeightKind| -> Result<Tensor> {
             source.load_tensor(
@@ -267,7 +276,11 @@ pub fn load_model(
         // weight dtype). Secondary handle is cloned into the slot so the
         // Phase 2 `SwapExecutor` can locate per-layer tensor bytes without
         // touching the root container.
-        layers.push(LayerSlot::new(layer, weight_dtype, secondary_mmap.clone()));
+        layers.push(Arc::new(LayerSlot::new(
+            layer,
+            weight_dtype,
+            secondary_mmap.clone(),
+        )));
     }
 
     // 2. Embed tokens (always CPU)
@@ -400,6 +413,14 @@ pub fn load_model(
         weight_prefix: config.weight_prefix.clone(),
     };
 
+    // ENG-ALG-228 / ENG-DAT-100: spawn the async primary release worker once
+    // at model creation. The worker retains a clone of `backend` for
+    // diagnostic calls; `TransformerModel` owns the `Arc` so the worker
+    // outlives any `SwapExecutor` borrow.
+    let release_worker = Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+        backend.clone(),
+    ));
+
     Ok(TransformerModel {
         config: model_config,
         layers,
@@ -417,5 +438,6 @@ pub fn load_model(
         // call, or left as empty when the caller builds the model directly
         // (e.g. tests). ENG-DAT-095, ENG-ALG-216.
         quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+        release_worker,
     })
 }

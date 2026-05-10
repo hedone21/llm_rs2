@@ -1,0 +1,2 @@
+05-08 17:23:52.360  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25540) 2372 timeout:normal(25539) 740 storaged:normal(2392) 196
+05-08 17:23:56.369  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25540) 819372 ndroid.systemui:high(3961) 28416 system_server:high(2624) 3840

@@ -445,6 +445,72 @@ pub fn merge_partials_2d(
     Ok(())
 }
 
+/// Variant of `merge_partials_2d` that uses caller-provided scratch buffers
+/// instead of allocating fresh `Vec<u8>`s on each call. Designed for the
+/// per-layer prefill partition path where the same buffers are reused 28+
+/// times per prefill — eliminating the alloc churn (`~56` Vec allocations
+/// per token for a 28-layer FFN partition) is the primary D-min win.
+///
+/// `gpu_temp_scratch.len()` must be >= `total_rows * split_row * 4`.
+/// `merged_scratch.len()` must be >= `total_rows * (split_row + cpu_rows) * 4`.
+/// Both scratches may be larger (sized for the max of gate/up); only the
+/// prefix used by the current call is touched.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_partials_2d_into(
+    backend: &dyn Backend,
+    gpu_partial: &Tensor,
+    cpu_partial: &Tensor,
+    output: &mut Tensor,
+    total_rows: usize,
+    split_row: usize,
+    cpu_rows: usize,
+    gpu_temp_scratch: &mut [u8],
+    merged_scratch: &mut [u8],
+) -> Result<()> {
+    let out_dim = split_row + cpu_rows;
+    let gpu_bytes = total_rows * split_row * 4;
+    let out_bytes = total_rows * out_dim * 4;
+    debug_assert!(
+        gpu_temp_scratch.len() >= gpu_bytes,
+        "gpu_temp_scratch too small: {} < {}",
+        gpu_temp_scratch.len(),
+        gpu_bytes
+    );
+    debug_assert!(
+        merged_scratch.len() >= out_bytes,
+        "merged_scratch too small: {} < {}",
+        merged_scratch.len(),
+        out_bytes
+    );
+
+    // 1. Read GPU partial into the prefix of the scratch buffer.
+    let gpu_slice = &mut gpu_temp_scratch[..gpu_bytes];
+    backend.read_buffer(gpu_partial, gpu_slice)?;
+
+    // 2. Interleave: build merged [total_rows, out_dim] in scratch.
+    let merged = &mut merged_scratch[..out_bytes];
+    // Safety: cpu_partial is a CPU tensor with valid host pointer.
+    let cpu_data =
+        unsafe { std::slice::from_raw_parts(cpu_partial.as_ptr(), total_rows * cpu_rows * 4) };
+
+    let split_bytes = split_row * 4;
+    let cpu_bytes_per_row = cpu_rows * 4;
+    let out_bytes_per_row = out_dim * 4;
+    for s in 0..total_rows {
+        let gpu_row_start = s * split_bytes;
+        let cpu_row_start = s * cpu_bytes_per_row;
+        let out_row_start = s * out_bytes_per_row;
+        merged[out_row_start..out_row_start + split_bytes]
+            .copy_from_slice(&gpu_slice[gpu_row_start..gpu_row_start + split_bytes]);
+        merged[out_row_start + split_bytes..out_row_start + out_bytes_per_row]
+            .copy_from_slice(&cpu_data[cpu_row_start..cpu_row_start + cpu_bytes_per_row]);
+    }
+
+    // 3. Write merged result to GPU output.
+    backend.write_buffer(output, merged)?;
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Partition trace (env-gated)
 //
@@ -469,15 +535,12 @@ const TRACE_SUMMARY_PERIOD: u64 = 28; // every decode token (28 layers)
 static PART_ZCOPY_COUNT: AtomicU64 = AtomicU64::new(0);
 static PART_ASYNC_COUNT: AtomicU64 = AtomicU64::new(0);
 static PART_SYNC_PATH_COUNT: AtomicU64 = AtomicU64::new(0);
-static PART_REPLICATE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Per-path sync_ns aggregates:
 //   zcopy     — synchronize() with zero-copy residual (no DMA read).
 //   non_zcopy — async_read or sync+read_buffer paths (both use DMA after sync).
-//   replicate — Direction A compute replication (attn_out async read + CPU norm).
 static PART_SYNC_NS_ZCOPY: AtomicU64 = AtomicU64::new(0);
 static PART_SYNC_NS_NONZCOPY: AtomicU64 = AtomicU64::new(0);
-static PART_SYNC_NS_REPLICATE: AtomicU64 = AtomicU64::new(0);
 
 /// Which residual-transfer path was taken for a given partition layer call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -488,20 +551,17 @@ pub enum PartitionPath {
     AsyncRead,
     /// Synchronous path: blocking `synchronize()` followed by `read_buffer`.
     SyncRead,
-    /// Direction A compute-replication path: CPU DMA-reads `attn_out` and
-    /// independently runs `add_rms_norm_oop` to produce its own residual,
-    /// while the GPU runs its matching call in parallel. The synchronization
-    /// point is advanced from post-norm to post-`attn_out`.
-    ReplicateNorm,
 }
 
 pub fn partition_trace_enabled() -> bool {
-    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let enabled = std::env::var_os("LLMRS_PARTITION_TRACE").is_some();
-    if !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        println!("[partition-trace-init] enabled={}", enabled);
-    }
-    enabled
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let enabled = std::env::var_os("LLMRS_PARTITION_TRACE").is_some();
+        if enabled {
+            println!("[partition-trace-init] enabled=true");
+        }
+        enabled
+    })
 }
 
 /// When `LLMRS_PARTITION_FUSED_MERGE=1`, the tensor-partition decode path
@@ -512,37 +572,6 @@ pub fn partition_trace_enabled() -> bool {
 pub fn partition_fused_merge_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| std::env::var("LLMRS_PARTITION_FUSED_MERGE").is_ok_and(|v| v == "1"))
-}
-
-/// Direction A (compute replication) gate. When enabled (default on when
-/// partition is active), the partition block asynchronously DMA-reads
-/// `ws.attn_out` to CPU and independently runs `add_rms_norm_oop` on the
-/// CPU side, while the GPU runs its matching call on `ws.residual`. The
-/// synchronization point is advanced from after the norm to after
-/// `attn_out` is ready, so the host wait window overlaps with the GPU
-/// FFN chain enqueue.
-///
-/// Default: **disabled**. Galaxy S25 measurements (2026-04-20) found this
-/// path regresses Q4_0 by +12 ms/tok and F16 by +32 ms/tok, and produces
-/// divergent token IDs because `add_rms_norm_oop` mutates `x` in place on
-/// the GPU before the async x-read lands, causing the CPU replica to
-/// double-add `attn_out`. The structural premise (CPU bears the extra
-/// norm cost for free) also fails — CPU `add_rms_norm_oop` costs
-/// 0.8–1.5 ms/layer, which exceeds the 0.4 ms/layer `sync_drain` it
-/// replaces. Kept as dead path for future investigation under
-/// GPU-bottleneck regimes (e.g. larger models, prefill workloads).
-///
-/// Set `LLMRS_PARTITION_REPLICATE_NORM=1` to re-enable for experimentation.
-///
-/// NOTE: `OnceLock` caches the decision process-wide on first read, so
-/// changing the env var after the first partition layer runs has no effect.
-pub fn partition_replicate_norm_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("LLMRS_PARTITION_REPLICATE_NORM")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
 }
 
 /// Gate for routing tensor partition through the OpenCL plan path
@@ -630,10 +659,6 @@ pub fn record_partition_timing(
             PART_SYNC_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
             PART_SYNC_NS_NONZCOPY.fetch_add(sync_ns, Ordering::Relaxed);
         }
-        PartitionPath::ReplicateNorm => {
-            PART_REPLICATE_COUNT.fetch_add(1, Ordering::Relaxed);
-            PART_SYNC_NS_REPLICATE.fetch_add(sync_ns, Ordering::Relaxed);
-        }
     }
 
     let count = PART_LAYER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -669,7 +694,6 @@ pub fn print_partition_trace_summary(count: u64) {
     let zcopy_n = PART_ZCOPY_COUNT.load(Ordering::Relaxed);
     let async_n = PART_ASYNC_COUNT.load(Ordering::Relaxed);
     let sync_read_n = PART_SYNC_PATH_COUNT.load(Ordering::Relaxed);
-    let replicate_n = PART_REPLICATE_COUNT.load(Ordering::Relaxed);
     let zcopy_avg = if zcopy_n > 0 {
         format!(
             "{:.2}ms",
@@ -687,17 +711,9 @@ pub fn print_partition_trace_summary(count: u64) {
     } else {
         "n/a".to_string()
     };
-    let replicate_avg = if replicate_n > 0 {
-        format!(
-            "{:.2}ms",
-            PART_SYNC_NS_REPLICATE.load(Ordering::Relaxed) as f64 / replicate_n as f64 / 1e6
-        )
-    } else {
-        "n/a".to_string()
-    };
     println!(
-        "[partition-trace] path dist: zcopy={} async={} sync_read={} replicate={} — sync_ns zcopy={} non_zcopy={} replicate={}",
-        zcopy_n, async_n, sync_read_n, replicate_n, zcopy_avg, nonzcopy_avg, replicate_avg
+        "[partition-trace] path dist: zcopy={} async={} sync_read={} — sync_ns zcopy={} non_zcopy={}",
+        zcopy_n, async_n, sync_read_n, zcopy_avg, nonzcopy_avg
     );
 
     use std::io::Write;
@@ -1381,6 +1397,88 @@ mod tests {
         assert_eq!(result, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
     }
 
+    /// `merge_partials_2d_into` (scratch-aware variant) must produce identical
+    /// output to `merge_partials_2d` for the same inputs. Covers the prefill
+    /// path that reuses caller-owned scratch buffers across all layers.
+    #[test]
+    fn test_merge_partials_2d_into_matches_legacy() {
+        let backend = cpu_backend();
+        let memory = Galloc::new();
+
+        let total_rows = 7; // batch*seq_len, deliberately not aligned
+        let split_row = 5;
+        let cpu_rows = 3;
+        let out_dim = split_row + cpu_rows;
+
+        // Build the same GPU+CPU partials twice, run both functions, expect equality.
+        let make_input = || {
+            let gpu_buf = memory
+                .alloc(total_rows * split_row * 4, DType::F32)
+                .unwrap();
+            let mut gpu_partial = Tensor::new(
+                Shape::new(vec![total_rows, split_row]),
+                gpu_buf,
+                backend.clone(),
+            );
+            for (i, v) in gpu_partial.as_mut_slice::<f32>().iter_mut().enumerate() {
+                *v = (i as f32) * 1.5 - 0.25;
+            }
+            let cpu_buf = memory.alloc(total_rows * cpu_rows * 4, DType::F32).unwrap();
+            let mut cpu_partial = Tensor::new(
+                Shape::new(vec![total_rows, cpu_rows]),
+                cpu_buf,
+                backend.clone(),
+            );
+            for (i, v) in cpu_partial.as_mut_slice::<f32>().iter_mut().enumerate() {
+                *v = -(i as f32) * 2.0 + 7.0;
+            }
+            (gpu_partial, cpu_partial)
+        };
+
+        // Reference (legacy).
+        let (gpu_a, cpu_a) = make_input();
+        let mut out_a = Tensor::new(
+            Shape::new(vec![total_rows, out_dim]),
+            memory.alloc(total_rows * out_dim * 4, DType::F32).unwrap(),
+            backend.clone(),
+        );
+        super::merge_partials_2d(
+            backend.as_ref(),
+            &gpu_a,
+            &cpu_a,
+            &mut out_a,
+            total_rows,
+            split_row,
+            cpu_rows,
+        )
+        .unwrap();
+        let ref_vals: Vec<f32> = out_a.as_slice::<f32>().to_vec();
+
+        // New scratch-aware path with oversized scratches (mimics prefill scratch
+        // sized for the larger of gate/up).
+        let (gpu_b, cpu_b) = make_input();
+        let mut out_b = Tensor::new(
+            Shape::new(vec![total_rows, out_dim]),
+            memory.alloc(total_rows * out_dim * 4, DType::F32).unwrap(),
+            backend.clone(),
+        );
+        let mut gpu_temp = vec![0u8; total_rows * (split_row + 4) * 4];
+        let mut merged = vec![0u8; total_rows * (out_dim + 7) * 4];
+        super::merge_partials_2d_into(
+            backend.as_ref(),
+            &gpu_b,
+            &cpu_b,
+            &mut out_b,
+            total_rows,
+            split_row,
+            cpu_rows,
+            &mut gpu_temp,
+            &mut merged,
+        )
+        .unwrap();
+        assert_eq!(out_b.as_slice::<f32>(), ref_vals.as_slice());
+    }
+
     // PA-T1-PATHCNT: record_partition_timing increments the correct path counter
     // and accumulates sync_ns into the correct per-path aggregate.
     #[test]
@@ -1472,192 +1570,6 @@ mod tests {
             PART_LAYER_COUNT.load(Ordering::Relaxed),
             layer_before + 3,
             "total layer count should have increased by 3"
-        );
-    }
-
-    // PA-T1-REPLICATE-PATHCNT: ReplicateNorm path increments its own counter
-    // and aggregates into the dedicated replicate sync_ns bucket without
-    // disturbing zcopy / async / sync_read counters. Covers Direction A.
-    #[test]
-    fn test_replicate_norm_path_counter() {
-        let zcopy_before = PART_ZCOPY_COUNT.load(Ordering::Relaxed);
-        let async_before = PART_ASYNC_COUNT.load(Ordering::Relaxed);
-        let sync_before = PART_SYNC_PATH_COUNT.load(Ordering::Relaxed);
-        let replicate_before = PART_REPLICATE_COUNT.load(Ordering::Relaxed);
-        let zcopy_ns_before = PART_SYNC_NS_ZCOPY.load(Ordering::Relaxed);
-        let nonzcopy_ns_before = PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed);
-        let replicate_ns_before = PART_SYNC_NS_REPLICATE.load(Ordering::Relaxed);
-        let layer_before = PART_LAYER_COUNT.load(Ordering::Relaxed);
-
-        // One call per path variant. Use distinct sync_ns values so aggregate
-        // checks can discriminate which bucket the add landed in.
-        record_partition_timing(111, 0, 0, 0, 0, PartitionPath::Zcopy);
-        record_partition_timing(222, 0, 0, 0, 0, PartitionPath::AsyncRead);
-        record_partition_timing(333, 0, 0, 0, 0, PartitionPath::SyncRead);
-        record_partition_timing(444, 0, 0, 0, 0, PartitionPath::ReplicateNorm);
-
-        assert_eq!(
-            PART_ZCOPY_COUNT.load(Ordering::Relaxed),
-            zcopy_before + 1,
-            "Zcopy counter +1"
-        );
-        assert_eq!(
-            PART_ASYNC_COUNT.load(Ordering::Relaxed),
-            async_before + 1,
-            "AsyncRead counter +1"
-        );
-        assert_eq!(
-            PART_SYNC_PATH_COUNT.load(Ordering::Relaxed),
-            sync_before + 1,
-            "SyncRead counter +1"
-        );
-        assert_eq!(
-            PART_REPLICATE_COUNT.load(Ordering::Relaxed),
-            replicate_before + 1,
-            "ReplicateNorm counter +1"
-        );
-        // Replicate sync_ns lands only in the replicate aggregate.
-        assert_eq!(
-            PART_SYNC_NS_REPLICATE.load(Ordering::Relaxed),
-            replicate_ns_before + 444,
-            "replicate sync_ns aggregate gained 444"
-        );
-        // Zcopy aggregate gained 111; non_zcopy gained 222 + 333 = 555.
-        assert_eq!(
-            PART_SYNC_NS_ZCOPY.load(Ordering::Relaxed),
-            zcopy_ns_before + 111,
-        );
-        assert_eq!(
-            PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed),
-            nonzcopy_ns_before + 222 + 333,
-        );
-        assert_eq!(
-            PART_LAYER_COUNT.load(Ordering::Relaxed),
-            layer_before + 4,
-            "total layer count +4 across all four paths"
-        );
-    }
-
-    // PA-T1-REPLICATE-GATE: the env-gated getter returns a bool consistent
-    // with the plan's default-on semantics.
-    //
-    // The getter uses `OnceLock` for process-wide caching, so we can only
-    // observe the value once per process. We therefore verify the call itself
-    // is type-correct and non-panicking; the exact boolean depends on whether
-    // any prior test in this process already cached it, which is fine — this
-    // test exists to guard against regressions that would make the function
-    // unusable (panic, infinite loop, etc.) rather than to re-exercise env
-    // parsing.
-    #[test]
-    fn test_partition_replicate_norm_env_gate() {
-        let _ = partition_replicate_norm_enabled();
-        // Second call must return the same value as the first (OnceLock
-        // stability). We snapshot and compare.
-        let a = partition_replicate_norm_enabled();
-        let b = partition_replicate_norm_enabled();
-        assert_eq!(a, b, "OnceLock must return a stable decision");
-    }
-
-    // PA-T1-REPLICATE-XCPU: PartitionWorkspace now allocates an `x_cpu`
-    // fallback buffer mirroring `attn_out_cpu`, so the Direction A gate can
-    // activate even when the previous layer's output (`x`) is not host-
-    // visible. The buffer must have matching shape/size and be writable;
-    // these properties are what the forward_gen async-read fallback relies
-    // on (`pw.x_cpu.as_mut_ptr()` + `pw.x_cpu.size()` into
-    // `enqueue_read_buffer_async`).
-    #[test]
-    fn test_partition_workspace_has_x_cpu_fallback_buffer() {
-        use crate::backend::cpu::CpuBackend;
-        use crate::core::buffer::DType;
-        use crate::core::shape::Shape;
-        use crate::core::tensor::Tensor;
-        use crate::layers::workspace::PartitionWorkspace;
-        use crate::memory::galloc::Galloc;
-        use std::sync::Arc;
-
-        // Minimal PartitionContext scaffolding. The test only needs the
-        // geometry fields that PartitionWorkspace::new consumes.
-        let cpu_backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
-        let cpu_mem = Galloc::new();
-
-        // Fake partitioned weights: split_row = hidden/2 for gate/up, whole
-        // slice for down. Actual weight tensors are unused by this test; we
-        // build minimal shells so PartitionWorkspace::new can inspect
-        // `split_row`.
-        let ffn_hidden = 64usize;
-        let hidden_size = 32usize;
-        let split = ffn_hidden / 2;
-
-        // Build dummy gate/up cpu_slice tensors so PartitionedWeight is
-        // fully formed; the workspace never touches their buffers during
-        // allocation (only `split_row` is read by `alloc_pair`).
-        let dummy_slice = |rows: usize, cols: usize| -> Tensor {
-            let buf = cpu_mem.alloc(rows * cols * 4, DType::F32).unwrap();
-            Tensor::new(Shape::new(vec![rows, cols]), buf, cpu_backend.clone())
-        };
-        let gate_cpu_slice = dummy_slice(ffn_hidden - split, hidden_size);
-        let up_cpu_slice = dummy_slice(ffn_hidden - split, hidden_size);
-        let down_cpu_slice = dummy_slice(hidden_size, ffn_hidden - split);
-        let gate_gpu_slice = dummy_slice(split, hidden_size);
-        let up_gpu_slice = dummy_slice(split, hidden_size);
-        let down_gpu_slice = dummy_slice(hidden_size, split);
-
-        let ctx = PartitionContext {
-            gpu_ratio: 0.5,
-            cpu_backend: cpu_backend.clone(),
-            gate: PartitionedWeight {
-                gpu_slice: gate_gpu_slice,
-                cpu_slice: gate_cpu_slice,
-                split_row: split,
-            },
-            up: PartitionedWeight {
-                gpu_slice: up_gpu_slice,
-                cpu_slice: up_cpu_slice,
-                split_row: split,
-            },
-            down: PartitionedWeight {
-                gpu_slice: down_gpu_slice,
-                cpu_slice: down_cpu_slice,
-                split_row: hidden_size,
-            },
-            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
-
-        // gpu_alloc stub (CPU memory works for the structural checks).
-        let gpu_alloc =
-            |bytes: usize, dtype: DType| -> anyhow::Result<Arc<dyn crate::core::buffer::Buffer>> {
-                cpu_mem.alloc(bytes, dtype)
-            };
-
-        let pw = PartitionWorkspace::new(
-            &ctx,
-            ffn_hidden,
-            hidden_size,
-            &gpu_alloc,
-            cpu_backend.clone(),
-            cpu_backend.clone(),
-        )
-        .expect("PartitionWorkspace::new must succeed");
-
-        // x_cpu must mirror attn_out_cpu: same shape, same byte size, writable.
-        assert_eq!(
-            pw.x_cpu.shape().dims(),
-            pw.attn_out_cpu.shape().dims(),
-            "x_cpu shape must match attn_out_cpu"
-        );
-        assert_eq!(
-            pw.x_cpu.size(),
-            pw.attn_out_cpu.size(),
-            "x_cpu byte size must match attn_out_cpu"
-        );
-        assert_eq!(
-            pw.x_cpu.size(),
-            hidden_size * 4,
-            "x_cpu must be hidden_size * 4 bytes (F32)"
-        );
-        assert!(
-            !pw.x_cpu.as_ptr().is_null(),
-            "x_cpu must be CPU-allocated (non-null ptr) so the async-read fallback can target it"
         );
     }
 }

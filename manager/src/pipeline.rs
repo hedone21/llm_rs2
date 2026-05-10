@@ -730,6 +730,18 @@ mod hierarchical {
                 let skip_ratio = (skip_layers / total_layers).clamp(0.0, 1.0);
                 Some(EngineCommand::LayerSkip { skip_ratio })
             }
+            (ActionId::SwapWeights, Operation::Apply(params)) => {
+                let ratio = params
+                    .values
+                    .get("ratio")
+                    .copied()
+                    .unwrap_or(0.5)
+                    .clamp(0.0, 0.9);
+                Some(EngineCommand::SwapWeights {
+                    ratio,
+                    target_dtype: llm_shared::DtypeTag::Q4_0,
+                })
+            }
             (_, Operation::Release) => {
                 // Release 명령은 restore directive에서 일괄 처리 — 여기서는 무시
                 None
@@ -1665,6 +1677,7 @@ mod hierarchical {
                     m.insert("kv_evict_h2o".to_string(), 0.8);
                     m
                 },
+                layer_swap: None,
             };
 
             let _ = p.complete_qcf_selection(&qcf);
@@ -1682,6 +1695,7 @@ mod hierarchical {
 
             let qcf = llm_shared::QcfEstimate {
                 estimates: HashMap::new(),
+                layer_swap: None,
             };
             let result = p.complete_qcf_selection(&qcf);
             assert!(result.is_none(), "No pending QCF should return None");
@@ -1783,6 +1797,7 @@ mod hierarchical {
                     m.insert("kv_evict_sliding".to_string(), 0.1);
                     m
                 },
+                layer_swap: None,
             };
 
             let _ = p.complete_qcf_selection(&qcf);

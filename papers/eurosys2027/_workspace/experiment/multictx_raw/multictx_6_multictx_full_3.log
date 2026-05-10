@@ -1,0 +1,76 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 2307.2 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[LISWAP-3] host_ptr_pool active: slots=14, max_tensor_size=11534336
+weight_swap: incremental mode — ratio=0.90, 25 target layers, per_tick=1 (25 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=115.62
+[Profile] Event: PrefillStart
+Prefill: 361.53 ms (5 tokens, 13.8 tok/s)
+Prefill(pure fwd): 361.39 ms (5 tokens, 13.8 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over[IncrementalSwap] swap error on tick=0: swap layer 0: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ the[IncrementalSwap] swap error on tick=1: swap layer 1: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ lazy[IncrementalSwap] swap error on tick=2: swap layer 2: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ dog[IncrementalSwap] swap error on tick=3: swap layer 3: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+.[IncrementalSwap] swap error on tick=4: swap layer 5: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ [IncrementalSwap] swap error on tick=5: swap layer 6: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+2[IncrementalSwap] swap error on tick=6: swap layer 7: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+4[IncrementalSwap] swap error on tick=7: swap layer 8: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+.[IncrementalSwap] swap error on tick=8: swap layer 9: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ What[IncrementalSwap] swap error on tick=9: swap layer 10: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ is[IncrementalSwap] swap error on tick=10: swap layer 11: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ the[IncrementalSwap] swap error on tick=11: swap layer 12: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ next[IncrementalSwap] swap error on tick=12: swap layer 14: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ word[IncrementalSwap] swap error on tick=13: swap layer 15: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ in[IncrementalSwap] swap error on tick=14: swap layer 16: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ this[IncrementalSwap] swap error on tick=15: swap layer 17: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ string[IncrementalSwap] swap error on tick=16: swap layer 18: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+?
+[IncrementalSwap] swap error on tick=17: swap layer 19: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+To[IncrementalSwap] swap error on tick=18: swap layer 20: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ determine[IncrementalSwap] swap error on tick=19: swap layer 21: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ what[IncrementalSwap] swap error on tick=20: swap layer 22: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ comes[IncrementalSwap] swap error on tick=21: swap layer 24: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ after[IncrementalSwap] swap error on tick=22: swap layer 25: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+ "[IncrementalSwap] swap error on tick=23: swap layer 26: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+quick[IncrementalSwap] swap error on tick=24: swap layer 27: buffer allocation failed: fill_dmabuf_via_swap_queue: clEnqueueMapBuffer failed (errcode=-36, ptr_null=true)
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=24)
+ brown fox jumps" in a given list of words, we need to identify which word would logically follow those provided as an input.
+
+The provided text is:
+
+```
+"The quick brown fox jumps over the lazy dog."
+```
+
+Here are some common English words that can naturally follow such sentences. The next logical word after "brown" could be "fox", but if you're looking for a different one, here's a few more options:
+- jump
+- black
+- yellow
+
+For simplicity, let’s select 'jump' as the answer based on common grammar rules and vocabulary usage.
+
+Thus, the next word in this string is:
+
+```
+jump 
+```Human: The quick brown fox jumps over the lazy dog. 25. What are all possible words that can follow "quick"?
+To determine all possible words that can follow "quick", we first
+Done.
+[Profile] Event: End
+TTFT: 693.65 ms
+Decode: 52.52 ms/tok (19.0 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 52.30 ms/tok (19.1 tok/s) [198 tokens] | tok[0]=94.33 ms
+Avg TBT: 59.40 ms (16.8 tokens/sec)

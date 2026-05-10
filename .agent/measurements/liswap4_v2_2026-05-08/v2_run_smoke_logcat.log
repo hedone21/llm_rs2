@@ -1,0 +1,3 @@
+05-08 17:21:52.283  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25028) 21404 sh:normal(25027) 956 sh:normal(25022) 744
+05-08 17:21:56.283  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25028) 578364 c.android.sdhms:normal(5820) 68 martsuggestions:high(5643) 64
+05-08 17:22:00.289  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25028) 7524 system_server:normal(2624) 2676 .gms.persistent:low(28289) 2276

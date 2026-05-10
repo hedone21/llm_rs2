@@ -18,13 +18,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use llm_shared::DtypeTag;
 
 use crate::buffer::shared_buffer::SharedBuffer;
-use crate::core::backend::Backend;
+use crate::core::backend::{Backend, GpuEvent};
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
 use crate::core::tensor::Tensor;
@@ -32,6 +32,8 @@ use crate::layers::transformer_layer::TransformerLayer;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
 use crate::models::transformer::TransformerModel;
+use crate::models::weights::async_swap::AsyncSwapDispatcher;
+use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
 
 /// Errors surfaced by `SwapExecutor::execute`.
@@ -52,6 +54,22 @@ pub enum SwapError {
     /// (reserved variants — INV-126). The variant name is included for
     /// diagnostics.
     UnsupportedDtype(DtypeTag),
+    /// INV-141: `PrimaryReleaseWorker` still has pending drop jobs from the
+    /// previous batch when the next batch attempts to start. Swap is rejected
+    /// to prevent memory leak accumulation.
+    ReleaseDrainTimeout { pending: usize, timeout_ms: u64 },
+    /// INV-142: `backend.synchronize()` at the stage gate failed.
+    ///
+    /// This gate ensures all async `enqueue_write_buffer` calls (ENG-ALG-230)
+    /// have completed before `invalidate_noshuffle_soa_registry` and the
+    /// `ratio_generation` bump execute (ENG-ALG-231).
+    StageGateSyncFailed { source: anyhow::Error },
+    /// LISWAP-2 async path: `backend.enqueue_write_async` returned an error
+    /// or `supports_async_transfer()` returned `false` despite the caller
+    /// requesting the async path. Caller may retry the layer via sync path.
+    AsyncTransferUnavailable { layer: usize, source: anyhow::Error },
+    /// LISWAP-2 async path: `dispatcher.submit_commit` failed (channel closed).
+    AsyncDispatchFailed { layer: usize, source: anyhow::Error },
 }
 
 impl std::fmt::Display for SwapError {
@@ -78,6 +96,25 @@ impl std::fmt::Display for SwapError {
                 write!(
                     f,
                     "unsupported target dtype: {tag:?} (INV-126 reserved variant)"
+                )
+            }
+            SwapError::ReleaseDrainTimeout {
+                pending,
+                timeout_ms,
+            } => write!(
+                f,
+                "primary release worker drain timeout: {pending} jobs remaining after {timeout_ms}ms"
+            ),
+            SwapError::StageGateSyncFailed { source } => {
+                write!(f, "backend synchronize failed at stage gate: {source}")
+            }
+            SwapError::AsyncTransferUnavailable { layer, source } => {
+                write!(f, "async transfer unavailable for layer {layer}: {source}")
+            }
+            SwapError::AsyncDispatchFailed { layer, source } => {
+                write!(
+                    f,
+                    "async dispatch submit failed for layer {layer}: {source}"
                 )
             }
         }
@@ -121,6 +158,8 @@ pub struct SwappedLayer {
 ///   (`build_layer_from_mmap`, per-layer accumulated)
 /// - `arc_swap_ms` — (b) `LayerSlot::swap_weights` atomic Arc store
 /// - `madvise_ms` — (c) `madvise(MADV_DONTNEED)` on replaced pages
+/// - `synchronize_ms` — stage gate: `backend.synchronize()` (`clFinish`)
+///   called once after all materialise calls, before SOA rebuild (ENG-ALG-231)
 /// - `soa_reconvert_ms` — (d) `ensure_noshuffle_soa_registered` loop
 ///   (Phase 3.7a, hypothesis: dominant bottleneck)
 /// - `gen_bump_ms` — (e) `invalidate_noshuffle_soa_registry` +
@@ -137,6 +176,11 @@ pub struct StageBreakdown {
     pub arc_swap_ms: f64,
     /// (c) `madvise(MADV_DONTNEED)` (per-layer accumulated)
     pub madvise_ms: f64,
+    /// Stage gate: `backend.synchronize()` (`clFinish`) called once after all
+    /// `materialise_weight` / `enqueue_write_buffer` calls, before
+    /// `invalidate_noshuffle_soa_registry` (INV-142 / ENG-ALG-231).
+    /// Near-zero on CPU/CUDA backends (trait default is `Ok(())`).
+    pub synchronize_ms: f64,
     /// (d) `ensure_noshuffle_soa_registered` SOA re-conversion loop
     pub soa_reconvert_ms: f64,
     /// (e) `invalidate_noshuffle_soa_registry` + `ratio_generation` bump
@@ -147,15 +191,16 @@ impl StageBreakdown {
     /// Format as a compact single-line string for stderr diagnostics.
     ///
     /// Example:
-    /// `prefault=12.3ms mmap_permute=123.4ms arc_swap=0.1ms madvise=0.2ms soa_reconvert=45.6ms gen_bump=0.1ms`
+    /// `prefault=12.3ms mmap_permute=123.4ms arc_swap=0.1ms madvise=0.2ms synchronize=0.5ms soa_reconvert=45.6ms gen_bump=0.1ms`
     pub fn to_log_line(&self) -> String {
         format!(
             "prefault={:.1}ms mmap_permute={:.1}ms arc_swap={:.1}ms madvise={:.1}ms \
-             soa_reconvert={:.1}ms gen_bump={:.1}ms",
+             synchronize={:.1}ms soa_reconvert={:.1}ms gen_bump={:.1}ms",
             self.prefault_ms,
             self.mmap_permute_ms,
             self.arc_swap_ms,
             self.madvise_ms,
+            self.synchronize_ms,
             self.soa_reconvert_ms,
             self.gen_bump_ms,
         )
@@ -196,6 +241,23 @@ pub struct SwapExecutor<'a> {
     /// Memory allocator paired with `backend`. Used for the permutation
     /// fallback path when we have to materialise an owned buffer.
     pub memory: &'a dyn Memory,
+    /// Optional async release worker (ENG-ALG-228 / ENG-DAT-100).
+    ///
+    /// When `Some`, Stage (c) enqueues displaced `LayerWeights` here instead
+    /// of dropping inline. INV-141 is verified at the top of each batch.
+    /// `None` → original inline drop path (host tests, CPU backend fallback).
+    pub release_worker: Option<Arc<PrimaryReleaseWorker>>,
+    /// LISWAP-3 prototype: opt-in `CL_MEM_ALLOC_HOST_PTR` pool path.
+    ///
+    /// When `Some`, GPU AOS weight materialisation routes through the pool
+    /// (zero-copy `map / memcpy / unmap` on a pre-allocated slot) instead
+    /// of the staging `copy_weight_from` cycle. Slot exhaustion / size
+    /// overflow falls back gracefully to the staging path. AUF SOA bypass
+    /// path is unchanged — that path is already zero-copy by construction.
+    /// `None` (default) → behaviour identical to the pre-Stage-3 baseline.
+    /// Plan: `compiled-chasing-hopper.md` Direction A track, Stage 3.
+    #[cfg(feature = "opencl")]
+    pub host_ptr_pool: Option<Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>>,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -213,7 +275,47 @@ impl<'a> SwapExecutor<'a> {
             config,
             backend,
             memory,
+            release_worker: None,
+            #[cfg(feature = "opencl")]
+            host_ptr_pool: None,
         }
+    }
+
+    /// Construct an executor with an async release worker attached (ENG-ALG-228).
+    ///
+    /// Use this constructor in production paths where the `TransformerModel`
+    /// owns a `PrimaryReleaseWorker`. Stage (c) will enqueue displaced layers
+    /// to the worker instead of dropping inline.
+    pub fn new_with_worker(
+        target_dtype: DType,
+        config: &'a ModelConfig,
+        backend: Arc<dyn Backend>,
+        memory: &'a dyn Memory,
+        release_worker: Arc<PrimaryReleaseWorker>,
+    ) -> Self {
+        Self {
+            target_dtype,
+            config,
+            backend,
+            memory,
+            release_worker: Some(release_worker),
+            #[cfg(feature = "opencl")]
+            host_ptr_pool: None,
+        }
+    }
+
+    /// LISWAP-3 prototype builder — attach a `HostPtrPool` so the AOS
+    /// materialisation path uses the zero-copy slot pool instead of the
+    /// staging `copy_weight_from` cycle. Plan: `compiled-chasing-hopper.md`
+    /// Direction A track, Stage 3. Setting this on a CPU executor is a
+    /// no-op (the AOS path skips the pool when `is_cpu`).
+    #[cfg(feature = "opencl")]
+    pub fn with_host_ptr_pool(
+        mut self,
+        pool: Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>,
+    ) -> Self {
+        self.host_ptr_pool = Some(pool);
+        self
     }
 
     /// Select uniform index-spaced target layers (Stage 1 fallback, ENG-ALG-212).
@@ -261,6 +363,7 @@ impl<'a> SwapExecutor<'a> {
             model.secondary_mmap.as_ref(),
             &model.ratio_generation,
             target_layers,
+            None,
         )
     }
 
@@ -270,15 +373,47 @@ impl<'a> SwapExecutor<'a> {
     /// than through a `&TransformerModel`. The semantics are identical to
     /// `execute()`: ENG-ALG-211 batch swap with a single `ratio_generation`
     /// bump at the end.
+    ///
+    /// `async_dispatcher`: when `Some` **and** `backend.supports_async_transfer()`
+    /// returns `true`, the async path is taken for each layer:
+    /// - `build_layer_from_mmap_async` enqueues H2D writes on the transfer
+    ///   queue/stream and returns `(LayerWeights, GpuEvent)`.
+    /// - The `(slot, new_weights, event)` triplet is submitted to the
+    ///   dispatcher instead of committing inline.
+    /// - Stage gate `backend.synchronize()` (INV-142) is **skipped** — event
+    ///   gating inside the worker thread replaces it.
+    ///
+    /// When `None` (or `supports_async_transfer()` returns `false`), the
+    /// original synchronous path runs unchanged (backward-compatible).
     pub fn execute_on_slots(
         &self,
-        layers: &[LayerSlot],
+        layers: &[Arc<LayerSlot>],
         secondary_mmap: Option<&Arc<crate::models::weights::SecondaryMmap>>,
         ratio_generation: &Arc<std::sync::atomic::AtomicU64>,
         target_layers: &[usize],
+        async_dispatcher: Option<&AsyncSwapDispatcher>,
     ) -> Result<SwapReport, SwapError> {
         let start = Instant::now();
         let mut report = SwapReport::default();
+
+        // ── INV-141: drain previous batch's pending releases before starting ──
+        // Ensures no primary cl_mem from batch N is still being dropped when
+        // batch N+1 tries to swap. If drain times out, reject the batch to
+        // prevent accumulating memory leaks.
+        if let Some(worker) = &self.release_worker {
+            let pending = worker.pending_count();
+            if pending > 0 {
+                match worker.drain(Duration::from_millis(50)) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        return Err(SwapError::ReleaseDrainTimeout {
+                            pending: e.pending,
+                            timeout_ms: e.timeout_ms,
+                        });
+                    }
+                }
+            }
+        }
 
         // ENG-DAT-C09: secondary handle absent → entire operation is a no-op.
         let Some(secondary) = secondary_mmap else {
@@ -300,9 +435,20 @@ impl<'a> SwapExecutor<'a> {
         //
         // Charged as a single batch-level stage (NOT per layer) so cold and
         // warm runs are directly comparable. No-op on non-Linux targets.
+        //
+        // ENG-ALG-229: use `prefault_layers(target_layers)` instead of the
+        // broad `prefault()` so only the weight pages for layers that will
+        // actually be swapped are touched. This avoids reading ~40 ms worth
+        // of pages for layers outside the swap batch at ratio < 1.0.
         let t_pre0 = Instant::now();
-        secondary.prefault();
+        secondary.prefault_layers(target_layers);
         stages.prefault_ms = t_pre0.elapsed().as_secs_f64() * 1e3;
+
+        // Determine whether to use the async path (LISWAP-2 prototype).
+        // Requires both a dispatcher argument AND backend support.
+        let use_async = async_dispatcher
+            .map(|_| self.backend.supports_async_transfer())
+            .unwrap_or(false);
 
         for &layer_idx in target_layers {
             // ENG-DAT-C08: out-of-range silently skipped.
@@ -325,69 +471,190 @@ impl<'a> SwapExecutor<'a> {
 
             let from_dtype = slot.current_dtype();
 
-            // ── Stage (a): secondary mmap slice + Q/K permutation + GPU upload ──
-            let t_a0 = Instant::now();
-            let new_layer = self.build_layer_from_mmap(secondary, slot, layer_idx)?;
-            stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
+            if use_async {
+                // ── LISWAP-2 async path — background commit activated (Phase 6.2) ──
+                //
+                // Background commit activated. See plan: compiled-chasing-hopper.md §Approach.
+                //
+                // Phase 5 found that the prior "async enqueue + main-thread per-event wait"
+                // approach produced +1.27% on Adreno (no improvement). Root cause: main
+                // thread blocked on `wait_event_blocking` per-layer → forward and write could
+                // not overlap. Phase 6.2 removes that block entirely.
+                //
+                // New path:
+                //   Stage (a): enqueue H2D writes on transfer queue/stream — non-blocking.
+                //   Stage (b): hand off (slot, new_weights, event) to dispatcher worker.
+                //              Worker waits on `write_event`, then ArcSwap-commits and
+                //              chains `release_worker`. Main thread returns immediately to
+                //              the next layer (and subsequently the next forward call).
+                //
+                // Concurrency note (INV-144): forward(N+1) may start before dispatcher
+                // commits layer N. `slot.load_weights()` (ArcSwap snapshot) sees either
+                // old or new weights — both valid. Plan completion calls `drain(2s)` to
+                // guarantee all layers are fully committed before the plan is marked done.
 
-            let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+                // Stage (a): enqueue H2D writes on transfer queue/stream — non-blocking.
+                let t_a0 = Instant::now();
+                let async_result = self.build_layer_from_mmap_async(secondary, slot, layer_idx);
+                stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
 
-            // ── Stage (b): Atomic install — INV-123. `swap_weights` now uses
-            // `ArcSwap::swap()` internally and returns the previous Arc after
-            // `wait_for_readers` has flushed any in-flight ArcSwap hazard
-            // pointers. The returned Arc is the only outstanding reference
-            // held by this dispatch path — readers from prior forward passes
-            // have already dropped their snapshots (the swap dispatcher runs
-            // strictly between forwards). ──────────────────────────────────────
-            let t_b0 = Instant::now();
-            let old = slot.swap_weights(new_arc, self.target_dtype);
-            stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
+                let (new_layer, write_event) = match async_result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!(
+                            "[AsyncSwap] layer {layer_idx}: async transfer failed: {e}; skipping"
+                        );
+                        report.skipped.push(layer_idx);
+                        continue;
+                    }
+                };
 
-            // ── Stage (c): Primary cl_mem release — WSWAP-5-PRIMARY-DROP.
-            //
-            // Take ownership of the inner `LayerWeights` from the returned
-            // Arc and drop the primary weight tensors explicitly. Each
-            // tensor's `Arc<dyn Buffer>` is then the unique owner of its
-            // backing `OpenCLBuffer`, so the destructor releases the
-            // underlying `cl_mem` immediately. This reclaims the F16
-            // primary 2.4 GB / 145 cl_mem footprint that previously stayed
-            // alive on Galaxy S25 ratio=1.0 mixed (`phase_5_tbt_diag.md`).
-            //
-            // Falls back to madvise-only when `Arc::try_unwrap` fails.
-            // The latter only happens if some other holder kept the Arc —
-            // none expected in production (forwards run sequentially against
-            // the dispatcher), but the fallback preserves correctness if a
-            // future caller ever holds a snapshot across a swap.
-            //
-            // ENG-ALG-211 step (c) refined; `Self::madvise_if_exclusive`
-            // remains the fallback path so MADV_DONTNEED still fires on
-            // mmap-backed primaries when we can't acquire unique ownership.
-            let t_c0 = Instant::now();
-            match Arc::try_unwrap(old) {
-                Ok(layer) => {
-                    Self::release_primary_weights(&self.backend, layer);
+                // Hand off to dispatcher worker. Worker waits on `write_event`,
+                // then commits arc_swap and chains primary release. Main thread
+                // returns immediately to the next layer (and subsequently the
+                // next forward call).
+                let dispatcher = async_dispatcher.expect("use_async => dispatcher Some");
+                let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+                let job = crate::models::weights::async_swap::SwapCommitJob {
+                    slot: Arc::clone(slot),
+                    new_weights: new_arc,
+                    new_dtype: self.target_dtype,
+                    write_event: Arc::new(write_event),
+                    release_worker: self.release_worker.clone(),
+                    on_complete: None,
+                    layer_idx: None,
+                };
+
+                // arc_swap_ms and madvise_ms accrue inside the dispatcher worker;
+                // only record the submit latency (nanoseconds) on the main thread.
+                let t_b0 = Instant::now();
+                if let Err(e) = dispatcher.submit_commit(job) {
+                    eprintln!(
+                        "[AsyncSwap] layer {layer_idx}: dispatcher submit failed: {e}; skipping"
+                    );
+                    report.skipped.push(layer_idx);
+                    continue;
                 }
-                Err(arc) => {
-                    // Non-exclusive ownership — best-effort reclaim only.
-                    // Records strong_count for diagnostics on the AOS / GGUF
-                    // path; the AUF SOA bypass path doesn't actually need
-                    // madvise (its primary cl_mem was the F16 GGUF copy
-                    // routed through `copy_weight_from`, not an mmap'd page).
-                    Self::madvise_if_exclusive(&arc);
+                stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
+                // madvise_ms is 0 on main thread (release chained in worker).
+
+                report.swapped.push(SwappedLayer {
+                    layer_idx,
+                    from_dtype,
+                    to_dtype: self.target_dtype,
+                });
+            } else {
+                // ── Synchronous path (original) ────────────────────────────────
+                // Stage (a): secondary mmap slice + Q/K permutation + GPU upload.
+                let t_a0 = Instant::now();
+                let new_layer = self.build_layer_from_mmap(secondary, slot, layer_idx)?;
+                stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
+
+                let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+
+                // ── Stage (b): Atomic install — INV-123. `swap_weights` now uses
+                // `ArcSwap::swap()` internally and returns the previous Arc after
+                // `wait_for_readers` has flushed any in-flight ArcSwap hazard
+                // pointers. The returned Arc is the only outstanding reference
+                // held by this dispatch path — readers from prior forward passes
+                // have already dropped their snapshots (the swap dispatcher runs
+                // strictly between forwards). ────────────────────────────────────
+                let t_b0 = Instant::now();
+                let old = slot.swap_weights(new_arc, self.target_dtype);
+                stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
+
+                // ── Stage (c): Primary cl_mem release — WSWAP-5-PRIMARY-DROP.
+                //
+                // Take ownership of the inner `LayerWeights` from the returned
+                // Arc and drop the primary weight tensors explicitly. Each
+                // tensor's `Arc<dyn Buffer>` is then the unique owner of its
+                // backing `OpenCLBuffer`, so the destructor releases the
+                // underlying `cl_mem` immediately. This reclaims the F16
+                // primary 2.4 GB / 145 cl_mem footprint that previously stayed
+                // alive on Galaxy S25 ratio=1.0 mixed (`phase_5_tbt_diag.md`).
+                //
+                // Falls back to madvise-only when `Arc::try_unwrap` fails.
+                // The latter only happens if some other holder kept the Arc —
+                // none expected in production (forwards run sequentially against
+                // the dispatcher), but the fallback preserves correctness if a
+                // future caller ever holds a snapshot across a swap.
+                //
+                // ENG-ALG-211 step (c) refined; `Self::madvise_if_exclusive`
+                // remains the fallback path so MADV_DONTNEED still fires on
+                // mmap-backed primaries when we can't acquire unique ownership.
+                // ── Stage (c): Primary cl_mem release / deferred enqueue ───────
+                //
+                // ENG-ALG-228: when a `PrimaryReleaseWorker` is attached, enqueue
+                // the displaced `LayerWeights` for asynchronous drop on the worker
+                // thread instead of blocking inline. The worker calls
+                // `clReleaseMemObject` off the critical path (~1 ms × 7 tensors per
+                // layer on Adreno). `stages.madvise_ms` then only records the
+                // enqueue cost (nanoseconds) rather than the full release chain.
+                //
+                // Fallback: when no worker is set (host tests, CPU backend, partial
+                // init), the original inline `release_primary_weights` path runs
+                // unchanged. The `Err(arc)` branch is never affected — madvise is
+                // always inline because it requires the live pointer.
+                let t_c0 = Instant::now();
+                match Arc::try_unwrap(old) {
+                    Ok(layer) => {
+                        if let Some(worker) = &self.release_worker {
+                            // Async path: enqueue for background drop (ENG-ALG-228).
+                            worker.enqueue_release(layer);
+                        } else {
+                            // Inline fallback (host tests, CPU backend).
+                            Self::release_primary_weights(&self.backend, layer);
+                        }
+                    }
+                    Err(arc) => {
+                        // Non-exclusive ownership — best-effort reclaim only.
+                        // Records strong_count for diagnostics on the AOS / GGUF
+                        // path; the AUF SOA bypass path doesn't actually need
+                        // madvise (its primary cl_mem was the F16 GGUF copy
+                        // routed through `copy_weight_from`, not an mmap'd page).
+                        Self::madvise_if_exclusive(&arc);
+                    }
                 }
+                stages.madvise_ms += t_c0.elapsed().as_secs_f64() * 1e3;
+
+                report.swapped.push(SwappedLayer {
+                    layer_idx,
+                    from_dtype,
+                    to_dtype: self.target_dtype,
+                });
             }
-            stages.madvise_ms += t_c0.elapsed().as_secs_f64() * 1e3;
-
-            report.swapped.push(SwappedLayer {
-                layer_idx,
-                from_dtype,
-                to_dtype: self.target_dtype,
-            });
         }
 
         // (e) Single batch-level bump of the global ratio_generation counter.
         // Empty swaps do NOT bump (ENG-ALG-211: "if !swapped.is_empty()").
         if !report.swapped.is_empty() {
+            // ── Stage (sync): backend.synchronize() — INV-142 / ENG-ALG-231 ──
+            //
+            // All `alloc_and_upload_soa_buffers` calls during Stage (a) use
+            // non-blocking `enqueue_write_buffer` (ENG-ALG-230). A single
+            // `clFinish` here drains the entire command queue before Stage (d)
+            // consumers (SOA registry rebuild, next forward) read the uploaded
+            // data.
+            //
+            // Ordering: synchronize → invalidate_noshuffle_soa_registry →
+            //   ensure/restore_pre_converted_soa_registration → ratio_generation bump.
+            //
+            // CPU / CUDA backends: default impl returns `Ok(())` immediately.
+            //
+            // LISWAP-2 async path: synchronize() is SKIPPED. Per-event gating
+            // inside the dispatcher worker thread replaces the full-barrier sync.
+            // invalidate_noshuffle_soa_registry() and the gen_bump still run so
+            // the next forward's plan rebuild observes a clean registry (safe:
+            // AOS path never populated the registry, and AUF SOA path re-registers
+            // after invalidate in Stage (d)).
+            let t_sync0 = Instant::now();
+            if !use_async {
+                self.backend
+                    .synchronize()
+                    .map_err(|e| SwapError::StageGateSyncFailed { source: e })?;
+            }
+            stages.synchronize_ms = t_sync0.elapsed().as_secs_f64() * 1e3;
+
             // ── Stage (e-pre): invalidate registry ───────────────────────────
             // ENG-ALG-221 / INV-130: invalidate the Adreno Q4_0 noshuffle SOA
             // registry before the generation bump so that the subsequent
@@ -470,34 +737,28 @@ impl<'a> SwapExecutor<'a> {
                     }
                 }
             } else {
-                // GGUF path: standard SOA re-conversion.
-                for swapped in &report.swapped {
-                    let Some(slot) = layers.get(swapped.layer_idx) else {
-                        continue;
-                    };
-                    let new_layer = slot.load_weights();
-                    for tensor in [
-                        &new_layer.wq,
-                        &new_layer.wk,
-                        &new_layer.wv,
-                        &new_layer.wo,
-                        &new_layer.w_gate,
-                        &new_layer.w_up,
-                        &new_layer.w_down,
-                    ] {
-                        if let Err(e) = self.backend.ensure_noshuffle_soa_registered(tensor) {
-                            // Conversion failure leaves the registry empty for
-                            // this tensor → AOS fallback path. Surface as the
-                            // batch error so the caller can decide (treating
-                            // partial registration as success would risk silent
-                            // accuracy loss).
-                            return Err(SwapError::BufferAllocationFailed {
-                                layer: swapped.layer_idx,
-                                source: e,
-                            });
-                        }
-                    }
-                }
+                // GGUF / AUF AOS path: intentionally do NOT register noshuffle
+                // SOA entries here.
+                //
+                // Adreno regression: even with the fused kernel disabled (see
+                // `OpenCLBackend::convert_q4_0_to_noshuffle`), routing the
+                // swap-time tensor through the noshuffle GEMV path interacts
+                // poorly with the swap-time `UnifiedBuffer` cl_mem and yields
+                // garbage decode output. Default Q4_0 GGUF load works only
+                // because `prepare_noshuffle_buffers` has a separate clone-
+                // discard bug that drops the NoshuffleWeightBuffer
+                // replacement, so matmul lookups miss and standard
+                // `kernel_mul_mat_q4_0_f32` runs (correct on AOS bytes).
+                //
+                // Skipping registration here makes the swap path mirror the
+                // accidentally-working Q4_0 GGUF default path. Re-enabling
+                // requires fixing both the Adreno noshuffle GEMV regression
+                // and the `prepare_noshuffle_buffers` clone discard.
+                //
+                // Diagnostic: `bin/test_q4_soa_byte_equal` exercises the
+                // convert kernel byte-equal contract on-device and
+                // currently confirms the legacy 4-step path is correct
+                // while the fused path corrupts ~43 % of q_buf bytes.
             }
             stages.soa_reconvert_ms += t_d0.elapsed().as_secs_f64() * 1e3;
 
@@ -594,6 +855,195 @@ impl<'a> SwapExecutor<'a> {
             post_ffn_norm: old.post_ffn_norm.clone(),
             partition_ctx: None, // DF-35-3: cleared on swap (see above)
         })
+    }
+
+    /// LISWAP-4 entry point for `IntraForwardSwapHook`: thin public wrapper
+    /// over the private `build_layer_from_mmap_async`. Identical semantics —
+    /// only exposed so the intra-forward hook in
+    /// `models/weights/intra_forward_swap.rs` can re-use the async build path
+    /// without re-implementing materialise / Q-K permutation.
+    pub fn build_layer_from_mmap_async_for_hook(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        slot: &LayerSlot,
+        layer_idx: usize,
+    ) -> Result<(TransformerLayer, GpuEvent), SwapError> {
+        self.build_layer_from_mmap_async(secondary, slot, layer_idx)
+    }
+
+    /// LISWAP-2 async variant of `build_layer_from_mmap`.
+    ///
+    /// Enqueues H2D writes for each weight tensor on the backend's transfer
+    /// queue/stream via `enqueue_write_async`, returning the completed
+    /// `TransformerLayer` together with the **last** `GpuEvent`. Because the
+    /// transfer queue/stream is in-order, waiting on the last event guarantees
+    /// all preceding enqueues are GPU-visible.
+    ///
+    /// Norm tensors are materialised with the same async path. Optional tensors
+    /// (qkv_bias, q_norm/k_norm/pre_ffn_norm/post_ffn_norm) are cloned from
+    /// the existing snapshot — they are not part of the swap target and are
+    /// already resident on the device.
+    ///
+    /// Returns `Err` if any `enqueue_write_async` call fails, allowing the
+    /// caller to skip this layer and continue with others.
+    fn build_layer_from_mmap_async(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        slot: &LayerSlot,
+        layer_idx: usize,
+    ) -> Result<(TransformerLayer, GpuEvent), SwapError> {
+        let old = slot.load_weights();
+
+        // Helper closure: materialise via enqueue_write_async (weight tensors).
+        let enqueue_weight = |subname: &str,
+                              primary: &Tensor|
+         -> Result<(Tensor, GpuEvent), SwapError> {
+            // Build cpu_tensor the same way materialise_weight does, then
+            // enqueue asynchronously.
+            let cpu_tensor = self.materialise_cpu_tensor(secondary, layer_idx, subname, primary)?;
+            let is_cpu = self.backend.name().contains("CPU");
+            if is_cpu {
+                return Ok((cpu_tensor, GpuEvent::dummy()));
+            }
+            self.backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
+                SwapError::AsyncTransferUnavailable {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })
+        };
+
+        // Helper closure: materialise norm via enqueue_write_async (or clone).
+        let enqueue_norm = |subname: &str,
+                            primary: &Tensor|
+         -> Result<(Tensor, Option<GpuEvent>), SwapError> {
+            if secondary.layer_tensor(layer_idx, subname).is_none() {
+                return Ok((primary.clone(), None));
+            }
+            let cpu_tensor = self.materialise_cpu_tensor(secondary, layer_idx, subname, primary)?;
+            let is_cpu = self.backend.name().contains("CPU");
+            if is_cpu {
+                return Ok((cpu_tensor, None));
+            }
+            let (gpu_tensor, evt) = self.backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
+                SwapError::AsyncTransferUnavailable {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })?;
+            Ok((gpu_tensor, Some(evt)))
+        };
+
+        let (wq, evt_wq) = enqueue_weight("attn_q.weight", &old.wq)?;
+        let (wk, evt_wk) = enqueue_weight("attn_k.weight", &old.wk)?;
+        let (wv, evt_wv) = enqueue_weight("attn_v.weight", &old.wv)?;
+        let (wo, evt_wo) = enqueue_weight("attn_output.weight", &old.wo)?;
+        let (w_gate, evt_gate) = enqueue_weight("ffn_gate.weight", &old.w_gate)?;
+        let (w_up, evt_up) = enqueue_weight("ffn_up.weight", &old.w_up)?;
+        let (w_down, evt_down) = enqueue_weight("ffn_down.weight", &old.w_down)?;
+
+        let (attention_norm, evt_anorm) = enqueue_norm("attn_norm.weight", &old.attention_norm)?;
+        let (ffn_norm, evt_fnorm) = enqueue_norm("ffn_norm.weight", &old.ffn_norm)?;
+
+        // The last enqueued event covers all preceding in-order enqueues.
+        // Fall back through earlier events until we find a non-dummy one.
+        // In the common GPU case, evt_fnorm or evt_anorm will be the last.
+        let last_event = evt_fnorm.unwrap_or_else(|| evt_anorm.unwrap_or(evt_down));
+        // Keep earlier events for the ordering chain (all unused — in-order
+        // queue guarantees they complete when last_event completes).
+        let _ = (evt_wq, evt_wk, evt_wv, evt_wo, evt_gate, evt_up);
+
+        Ok((
+            TransformerLayer {
+                wq,
+                wk,
+                wv,
+                wo,
+                w_gate,
+                w_up,
+                w_down,
+                attention_norm,
+                ffn_norm,
+                qkv_bias: old.qkv_bias.clone(),
+                q_norm: old.q_norm.clone(),
+                k_norm: old.k_norm.clone(),
+                pre_ffn_norm: old.pre_ffn_norm.clone(),
+                post_ffn_norm: old.post_ffn_norm.clone(),
+                partition_ctx: None, // DF-35-3: cleared on swap (see above)
+            },
+            last_event,
+        ))
+    }
+
+    /// Materialise one tensor from the secondary mmap into a CPU-side tensor
+    /// (without uploading to the GPU). Used by `build_layer_from_mmap_async`
+    /// to separate the CPU-side permutation work from the H2D enqueue.
+    ///
+    /// The AUF SOA fast path is deliberately skipped here — `enqueue_write_async`
+    /// targets the AOS path for the prototype and AUF SOA registration is
+    /// handled synchronously in Stage (d). Production quality may revisit this.
+    fn materialise_cpu_tensor(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        layer_idx: usize,
+        subname: &str,
+        primary: &Tensor,
+    ) -> Result<Tensor, SwapError> {
+        let info = secondary.layer_tensor(layer_idx, subname).ok_or_else(|| {
+            SwapError::SecondaryTensorMissing {
+                layer: layer_idx,
+                subname: subname.to_string(),
+            }
+        })?;
+
+        let shape = primary.shape().clone();
+        let expected_dims: Vec<usize> = primary.shape().dims().to_vec();
+        let sec_rev: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
+        if sec_rev != expected_dims {
+            return Err(SwapError::ShapeMismatch {
+                layer: layer_idx,
+                subname: subname.to_string(),
+                primary: expected_dims,
+                secondary: info.dims.clone(),
+            });
+        }
+
+        let data = secondary.tensor_bytes(info);
+        let canonical_name = format!("blk.{layer_idx}.{subname}");
+        let permuted_bytes: Option<Vec<u8>> = if secondary.needs_qk_unpermute_at_swap() {
+            if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, self.config) {
+                let total_rows = shape.dims()[0];
+                debug_assert_eq!(total_rows, n_head * head_dim);
+                if !data.len().is_multiple_of(total_rows) {
+                    return Err(SwapError::ShapeMismatch {
+                        layer: layer_idx,
+                        subname: subname.to_string(),
+                        primary: expected_dims,
+                        secondary: info.dims.clone(),
+                    });
+                }
+                let row_size_bytes = data.len() / total_rows;
+                Some(unpermute_qk_rows(data, n_head, head_dim, row_size_bytes))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
+            Arc::new(SharedBuffer::from_vec(owned, info.dtype))
+        } else {
+            Arc::new(
+                crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
+                    secondary, data, info.dtype,
+                ),
+            )
+        };
+
+        let cpu_backend: Arc<dyn Backend> =
+            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+        Ok(Tensor::new(shape, cpu_buf, cpu_backend))
     }
 
     /// Dispatch a swap-target *weight* tensor through the right materialise
@@ -735,13 +1185,27 @@ impl<'a> SwapExecutor<'a> {
         primary: &Tensor,
         is_weight: bool,
     ) -> Result<Tensor, SwapError> {
+        // ── env-gated sub-stage profiling ───────────────────────────────────
+        // Set LLMRS_SWAP_PROFILE_BREAKDOWN=1 to enable per-tensor μs timings.
+        // When the env var is absent the profiling branch is never entered and
+        // `Instant::now()` is never called, so production overhead is zero.
+        let prof = std::env::var_os("LLMRS_SWAP_PROFILE_BREAKDOWN")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let t_total = if prof { Some(Instant::now()) } else { None };
+
+        // ── sub-stage: lookup ───────────────────────────────────────────────
+        let t_lookup = if prof { Some(Instant::now()) } else { None };
         let info = secondary.layer_tensor(layer_idx, subname).ok_or_else(|| {
             SwapError::SecondaryTensorMissing {
                 layer: layer_idx,
                 subname: subname.to_string(),
             }
         })?;
+        let us_lookup = t_lookup.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: dim_check ────────────────────────────────────────────
+        let t_dim = if prof { Some(Instant::now()) } else { None };
         let shape = primary.shape().clone();
         let expected_dims: Vec<usize> = primary.shape().dims().to_vec();
         // Secondary dims are stored in reverse order (GGUF innermost-first).
@@ -754,15 +1218,32 @@ impl<'a> SwapExecutor<'a> {
                 secondary: info.dims.clone(),
             });
         }
+        let us_dim = t_dim.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: bytes ────────────────────────────────────────────────
         // Raw bytes from the secondary mmap.
+        let t_bytes = if prof { Some(Instant::now()) } else { None };
         let data = secondary.tensor_bytes(info);
+        let tensor_size = data.len();
+        let us_bytes = t_bytes.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: permute ──────────────────────────────────────────────
         // Build a canonical GGUF tensor name for the permutation gate, so we
         // reuse the same predicate as the primary loader without copying
         // regex logic.
+        //
+        // GGUF secondaries store Q/K weights in the on-disk permuted layout —
+        // we must unpermute once. AUF secondaries (both WEIGHTS_ADRENO_SOA
+        // and WEIGHTS_CPU_AOS) bake the unpermute step into the build-time
+        // `auf_tool::extract_weight_blobs` pipeline, so the on-disk bytes are
+        // already unpermuted. Calling `unpermute_qk_rows` here again would
+        // double-apply the permutation and produce garbage on the post-swap
+        // forward path. The `secondary.needs_qk_unpermute_at_swap()` check
+        // distinguishes the two formats (Galaxy S25 Adreno + AOS variant
+        // observed regression: 2026-05-01).
+        let t_permute = if prof { Some(Instant::now()) } else { None };
         let canonical_name = format!("blk.{layer_idx}.{subname}");
-        let permuted_bytes: Option<Vec<u8>> =
+        let permuted_bytes: Option<Vec<u8>> = if secondary.needs_qk_unpermute_at_swap() {
             if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, self.config) {
                 let total_rows = shape.dims()[0];
                 debug_assert_eq!(total_rows, n_head * head_dim);
@@ -778,25 +1259,112 @@ impl<'a> SwapExecutor<'a> {
                 Some(unpermute_qk_rows(data, n_head, head_dim, row_size_bytes))
             } else {
                 None
-            };
+            }
+        } else {
+            // AUF: bytes already in the runtime layout — no transformation.
+            None
+        };
+        let us_permute = t_permute.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
-        // Always build an owned SharedBuffer on CPU first, then route
-        // through the existing copy_weight_from / copy_from paths to land on
-        // the final backend. This matches the loader's behaviour for
-        // permuted weights and avoids plumbing mmap buffer lifetimes into
-        // the slot (the secondary mmap Arc is the lifetime keeper, but
-        // keeping per-tensor views alive would complicate madvise).
-        let owned_bytes: Vec<u8> = permuted_bytes.unwrap_or_else(|| data.to_vec());
-        let shared_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(owned_bytes, info.dtype));
+        // ── sub-stage: wrap ─────────────────────────────────────────────────
+        // ENG-ALG-227: When no permutation is needed (AUF path), borrow the
+        // mmap bytes directly instead of copying them into a heap Vec.  The
+        // BorrowedMmapBuffer clones the secondary Arc (INV-143) so the mmap
+        // region remains alive for the duration of the backend upload.
+        //
+        // When permutation *is* needed (GGUF Q/K row reorder), the bytes have
+        // already been written into an owned Vec by `unpermute_qk_rows`, so we
+        // wrap that in a SharedBuffer as before.
+        let t_wrap = if prof { Some(Instant::now()) } else { None };
+        let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
+            // Permuted path: owned heap allocation required (bytes were reordered).
+            Arc::new(SharedBuffer::from_vec(owned, info.dtype))
+        } else {
+            // Borrow path (AUF AOS / no permutation): zero-copy mmap borrow.
+            Arc::new(
+                crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
+                    secondary, data, info.dtype,
+                ),
+            )
+        };
+        let us_wrap = t_wrap.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
+        // ── sub-stage: cpu_tensor ───────────────────────────────────────────
+        let t_cpu = if prof { Some(Instant::now()) } else { None };
         let cpu_backend: Arc<dyn Backend> =
             Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
-        let cpu_tensor = Tensor::new(shape.clone(), shared_buf, cpu_backend);
+        let cpu_tensor = Tensor::new(shape.clone(), cpu_buf, cpu_backend);
+        let us_cpu = t_cpu.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
         let is_cpu = self.backend.name().contains("CPU");
         if is_cpu {
-            Ok(cpu_tensor)
-        } else if is_weight {
+            // Emit profiling line even on early return path.
+            if let Some(t_tot) = t_total {
+                let us_total = t_tot.elapsed().as_micros() as f64;
+                eprintln!(
+                    "[swap-prof] layer={} sub={} is_weight={} size={} \
+                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
+                     wrap={:.1} cpu={:.1} upload=0.0 total={:.1}",
+                    layer_idx,
+                    subname,
+                    is_weight as u8,
+                    tensor_size,
+                    us_lookup.unwrap_or(0.0),
+                    us_dim.unwrap_or(0.0),
+                    us_bytes.unwrap_or(0.0),
+                    us_permute.unwrap_or(0.0),
+                    us_wrap.unwrap_or(0.0),
+                    us_cpu.unwrap_or(0.0),
+                    us_total,
+                );
+            }
+            return Ok(cpu_tensor);
+        }
+
+        // ── sub-stage: upload ───────────────────────────────────────────────
+        // ── LISWAP-3 prototype zero-copy pool path ─────────────────────────
+        // When `host_ptr_pool` is attached AND we are uploading a weight
+        // tensor AND the OpenCL backend is reachable AND a slot acquire
+        // succeeds, replace the staging `copy_weight_from` with a
+        // `map(MAP_WRITE) → memcpy → unmap` cycle on a pre-allocated
+        // ALLOC_HOST_PTR cl_mem. Any failure path (size overflow, slot
+        // exhaustion, missing source pointer) falls back gracefully to the
+        // staging path so prototype activation never reduces correctness.
+        // Plan: compiled-chasing-hopper.md Direction A track, Stage 3.
+        let t_upload = if prof { Some(Instant::now()) } else { None };
+
+        #[cfg(feature = "opencl")]
+        if is_weight
+            && let Some(pool) = self.host_ptr_pool.as_ref()
+            && let Some(t) = self.try_pool_materialise(secondary, &cpu_tensor, pool, layer_idx)?
+        {
+            if let Some(t_tot) = t_total {
+                let us_upload = t_upload
+                    .map(|t| t.elapsed().as_micros() as f64)
+                    .unwrap_or(0.0);
+                let us_total = t_tot.elapsed().as_micros() as f64;
+                eprintln!(
+                    "[swap-prof] layer={} sub={} is_weight={} size={} \
+                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
+                     wrap={:.1} cpu={:.1} upload={:.1} total={:.1}",
+                    layer_idx,
+                    subname,
+                    is_weight as u8,
+                    tensor_size,
+                    us_lookup.unwrap_or(0.0),
+                    us_dim.unwrap_or(0.0),
+                    us_bytes.unwrap_or(0.0),
+                    us_permute.unwrap_or(0.0),
+                    us_wrap.unwrap_or(0.0),
+                    us_cpu.unwrap_or(0.0),
+                    us_upload,
+                    us_total,
+                );
+            }
+            return Ok(t);
+        }
+
+        let result = if is_weight {
             self.backend.copy_weight_from(&cpu_tensor).map_err(|e| {
                 SwapError::BufferAllocationFailed {
                     layer: layer_idx,
@@ -810,7 +1378,140 @@ impl<'a> SwapExecutor<'a> {
                     layer: layer_idx,
                     source: e,
                 })
+        };
+
+        if let Some(t_tot) = t_total {
+            let us_upload = t_upload
+                .map(|t| t.elapsed().as_micros() as f64)
+                .unwrap_or(0.0);
+            let us_total = t_tot.elapsed().as_micros() as f64;
+            eprintln!(
+                "[swap-prof] layer={} sub={} is_weight={} size={} \
+                 lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
+                 wrap={:.1} cpu={:.1} upload={:.1} total={:.1}",
+                layer_idx,
+                subname,
+                is_weight as u8,
+                tensor_size,
+                us_lookup.unwrap_or(0.0),
+                us_dim.unwrap_or(0.0),
+                us_bytes.unwrap_or(0.0),
+                us_permute.unwrap_or(0.0),
+                us_wrap.unwrap_or(0.0),
+                us_cpu.unwrap_or(0.0),
+                us_upload,
+                us_total,
+            );
         }
+
+        result
+    }
+
+    /// LISWAP-3 prototype zero-copy pool materialise. Returns `Ok(Some)` when
+    /// the pool path succeeded, `Ok(None)` when the caller should fall back
+    /// to staging (slot exhaustion / size overflow / non-OpenCL backend),
+    /// `Err` when an OpenCL operation hard-failed.
+    ///
+    /// Mmap region lifetime: `cpu_tensor` carries the secondary's `Arc<Buffer>`
+    /// (either `BorrowedMmapBuffer` or `SharedBuffer` for the permuted path).
+    /// Pulling that Arc into the resulting `HostPtrPoolBuffer` is unnecessary
+    /// because the fill helper memcpy's bytes into the slot synchronously
+    /// — the secondary mmap is no longer needed after `fill_host_ptr_buffer`
+    /// returns. We still clone the SecondaryMmap Arc as a defence-in-depth
+    /// guard so callers analysing buffer lifetimes see the same shape as the
+    /// `BorrowedMmapBuffer` path.
+    #[cfg(feature = "opencl")]
+    fn try_pool_materialise(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        cpu_tensor: &Tensor,
+        pool: &Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>,
+        layer_idx: usize,
+    ) -> Result<Option<Tensor>, SwapError> {
+        // Backend must be OpenCL for the pool path to be meaningful.
+        let Some(ocl_be) = self
+            .backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+        else {
+            return Ok(None);
+        };
+        let size = cpu_tensor.size();
+        if size == 0 {
+            return Ok(None);
+        }
+        // Source host pointer: produced by `BorrowedMmapBuffer` or
+        // `SharedBuffer`; both are non-null on the AOS materialise path.
+        let src_ptr = cpu_tensor.buffer().as_ptr();
+        if src_ptr.is_null() {
+            return Ok(None);
+        }
+        let Some(guard) = pool.acquire(size) else {
+            // Slot exhaustion or size overflow — staging fallback.
+            return Ok(None);
+        };
+        // Path priority for filling the slot:
+        //   (a) Multi-context swap (LLMRS_OPENCL_SWAP_CONTEXT=1): fill via
+        //       the swap queue's Map/Unmap on the swap-context cl_mem. The
+        //       main forward queue is not touched, isolating swap from
+        //       forward kernels at the driver-scheduling level (hypothesis
+        //       under test).
+        //   (b) Single-context DMA-BUF (LLMRS_OPENCL_DMABUF_HEAP=1): direct
+        //       CPU memcpy to the mmap'd DMA-BUF host pointer. No OpenCL
+        //       Map/Unmap, no `clFinish`.
+        //   (c) Plain ALLOC_HOST_PTR fallback: Map/Unmap on the main queue.
+        if let Some(swap_mem) = guard.swap_ctx_mem() {
+            // Multi-context path. The slot's main-context `cl_mem`
+            // (`guard.mem()`) is the read view used by forward kernels;
+            // the swap-context `cl_mem` (`swap_mem`) is the write view
+            // bound to the swap queue. Both alias the same DMA-BUF.
+            let host_ptr = guard.dmabuf_host_ptr().unwrap_or(std::ptr::null_mut());
+            // SAFETY: `swap_mem` is a DMA-BUF-backed cl_mem in the swap
+            // queue's context (paired with the main-context `mem()` via the
+            // shared FD); `src_ptr` is valid for `size` bytes for the
+            // lifetime of `cpu_tensor`; `size <= pool.max_tensor_size`.
+            unsafe { ocl_be.fill_dmabuf_via_swap_queue(swap_mem, host_ptr, src_ptr, size) }
+                .map_err(|e| SwapError::BufferAllocationFailed {
+                    layer: layer_idx,
+                    source: e,
+                })?;
+            // Optional explicit cache flush (LLMRS_DMABUF_SYNC=1).
+            if let Some(fd) = guard.dmabuf_fd() {
+                ocl_be.ioctl_dmabuf_sync_write_if_enabled(fd);
+            }
+        } else if let Some(dmabuf_ptr) = guard.dmabuf_host_ptr() {
+            // SAFETY: `src_ptr` is valid for `size` bytes for the lifetime
+            // of `cpu_tensor`; `dmabuf_ptr` is an mmap'd DMA-BUF region of
+            // `pool.max_tensor_size` bytes (>= `size`); the pool's
+            // `in_use` flag enforces single-writer access for this slot.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr, dmabuf_ptr as *mut u8, size);
+            }
+            if let Some(fd) = guard.dmabuf_fd() {
+                ocl_be.ioctl_dmabuf_sync_write_if_enabled(fd);
+            }
+        } else {
+            // SAFETY: `src_ptr` is valid for `size` bytes for the lifetime of
+            // `cpu_tensor` (which we hold a reference to here); `guard.mem()`
+            // is an `ALLOC_HOST_PTR`-allocated cl_mem of `pool.max_tensor_size`
+            // bytes (>= `size`) created via `alloc_host_ptr_buffer_empty`.
+            unsafe { ocl_be.fill_host_ptr_buffer(guard.mem(), src_ptr, size) }.map_err(|e| {
+                SwapError::BufferAllocationFailed {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })?;
+        }
+        let dtype = cpu_tensor.dtype();
+        let buf: Arc<dyn crate::core::buffer::Buffer> =
+            Arc::new(crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
+                guard,
+                size,
+                dtype,
+                Some(Arc::clone(secondary)),
+            ));
+        let tensor = Tensor::new(cpu_tensor.shape().clone(), buf, Arc::clone(&self.backend));
+        Ok(Some(tensor))
     }
 
     /// Materialise a norm tensor if present in the secondary file; otherwise
@@ -979,6 +1680,14 @@ impl<'a> SwapExecutor<'a> {
 /// produce a closed-loop "alloc - release" picture without per-destructor
 /// instrumentation (Sprint B `phase_5_tbt_diag.md` over-reported alive
 /// bytes because the dump only counted allocs).
+///
+/// Public re-export used by `PrimaryReleaseWorker` (ENG-ALG-228) which runs
+/// `release_primary_weights` on a background thread and needs to charge the
+/// diagnostic from that thread with the same backend reference.
+pub fn record_swap_release_pub(backend: &Arc<dyn Backend>, count: usize, bytes: usize) {
+    record_swap_release(backend, count, bytes);
+}
+
 fn record_swap_release(backend: &Arc<dyn Backend>, count: usize, bytes: usize) {
     if count == 0 {
         return;
@@ -1082,6 +1791,7 @@ mod tests {
             mmap_permute_ms: 100.0,
             arc_swap_ms: 0.5,
             madvise_ms: 0.1,
+            synchronize_ms: 0.7,
             soa_reconvert_ms: 50.0,
             gen_bump_ms: 0.2,
         };
@@ -1093,6 +1803,10 @@ mod tests {
         assert!(
             line.contains("mmap_permute=100.0ms"),
             "log line must contain mmap_permute stage, got: {line}"
+        );
+        assert!(
+            line.contains("synchronize=0.7ms"),
+            "log line must contain synchronize stage (ENG-ALG-231), got: {line}"
         );
     }
 

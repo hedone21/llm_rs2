@@ -45,6 +45,30 @@ pub enum SecondaryDtypeChoice {
     F32,
 }
 
+/// CLI `--secondary-layout` 값. 어떤 weights variant로 swap 후 텐서를 만들지 결정한다.
+///
+/// AUF는 빌드 시 여러 backend variant(`WEIGHTS_ADRENO_SOA`, `WEIGHTS_CUDA_AOS`,
+/// `WEIGHTS_CPU_AOS`)를 동봉할 수 있다. 런타임에 어느 variant를 읽을지가
+/// 다음 trade-off를 결정한다:
+///
+/// - **SOA (Adreno noshuffle)**: GPU TBT 33~55% 빠름 (Adreno 830 측정). 대신
+///   `NoshuffleWeightBuffer`는 host pointer가 null이라 swap 후 `switch_hw cpu`
+///   / partition lazy-map / CPU forward는 모두 실패한다.
+/// - **AOS (CPU/CUDA AOS)**: GPU는 표준 Q4_0 GEMV (`mul_mat_q4_0_f32`) fallback.
+///   `UnifiedBuffer` (host-mapped) 백킹이라 swap 후에도 host pointer가 살아있어
+///   switch_hw cpu / partition / CPU forward 모두 자연 동작.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryLayoutChoice {
+    /// 자동: feature flag 기반 preferred variant (OpenCL→AdrenoSoa, CUDA→CudaAos,
+    /// 그 외→CpuAos). preferred variant가 AUF에 없으면 CpuAos로 폴백한다.
+    Auto,
+    /// 강제 AOS: AUF에 `WEIGHTS_CPU_AOS` 또는 (CUDA build에선) `WEIGHTS_CUDA_AOS`가
+    /// 있어야 한다. SOA fast path 우회 → GPU 성능 손실 대신 switch/partition 호환.
+    Aos,
+    /// 강제 SOA: OpenCL build 한정. `WEIGHTS_ADRENO_SOA`가 없으면 에러.
+    Soa,
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Public error type
 // ──────────────────────────────────────────────────────────────────────────
@@ -233,6 +257,24 @@ impl GgufSecondaryMmap {
         let bytes = self.gguf.mmap_data();
         prefault_byte_range(bytes);
     }
+
+    /// See `SecondaryMmap::prefault_layers`. For GGUF, falls back to
+    /// prefaulting only the byte ranges covered by the target layers.
+    fn prefault_layers(&self, target_layers: &[usize]) {
+        let bytes = self.gguf.mmap_data();
+        for &layer_idx in target_layers {
+            let Some(layer_slice) = self.layer_index.get(layer_idx) else {
+                // out-of-range: silent skip (ENG-DAT-C08 spirit)
+                continue;
+            };
+            for info in layer_slice.tensors.values() {
+                let end = info.offset + info.len;
+                if end <= bytes.len() {
+                    prefault_byte_range(&bytes[info.offset..end]);
+                }
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -325,6 +367,26 @@ impl AufSecondaryMmap {
             prefault_byte_range(weights_bytes);
         }
     }
+
+    /// See `SecondaryMmap::prefault_layers`. Only touches the byte ranges
+    /// belonging to the requested layers.
+    fn prefault_layers(&self, target_layers: &[usize]) {
+        let Some(weights_bytes) = self.view.weights_bytes() else {
+            return;
+        };
+        for &layer_idx in target_layers {
+            let Some(layer_slice) = self.layer_index.get(layer_idx) else {
+                // out-of-range: silent skip
+                continue;
+            };
+            for info in layer_slice.tensors.values() {
+                let end = info.offset + info.len;
+                if end <= weights_bytes.len() {
+                    prefault_byte_range(&weights_bytes[info.offset..end]);
+                }
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -396,6 +458,28 @@ impl SecondaryMmap {
         }
     }
 
+    /// Whether the secondary stores Q/K weights in their *post-unpermute*
+    /// (NEON-unfriendly, runtime-loaded) layout.
+    ///
+    /// - **GGUF** secondaries store Q/K rows in the GGUF on-disk permuted
+    ///   layout. Loaders (and `SwapExecutor::materialise_tensor`) call
+    ///   `unpermute_qk_rows` once before installing the tensor.
+    /// - **AUF** secondaries (both `WEIGHTS_ADRENO_SOA` and `WEIGHTS_CPU_AOS`
+    ///   variants) bake the unpermute step into `auf_tool::extract_weight_blobs`
+    ///   at build time, so the on-disk bytes are already unpermuted. Calling
+    ///   `unpermute_qk_rows` again at swap time would double-apply the
+    ///   permutation and produce garbage on the post-swap forward path
+    ///   (observed on Galaxy S25 Adreno after `--secondary-layout aos`).
+    ///
+    /// Returns `true` when the swap path must call `unpermute_qk_rows`,
+    /// `false` when the bytes are already in their final layout.
+    pub fn needs_qk_unpermute_at_swap(&self) -> bool {
+        match self {
+            SecondaryMmap::Gguf(_) => true,
+            SecondaryMmap::Auf(_) => false,
+        }
+    }
+
     /// Prefault the page cache for the swap-relevant byte ranges.
     ///
     /// **Why** — WSWAP-5-COLD-UNIFORM. 5차 측정에서 per-layer 양봉 분포
@@ -415,10 +499,35 @@ impl SecondaryMmap {
     /// **Range** — `AufSecondaryMmap`은 WEIGHTS 영역만 prefault (정확히 swap
     /// 대상 바이트). `GgufSecondaryMmap`은 mmap 전체를 prefault (GGUF는 weight
     /// 영역만 격리하기 어렵고, 호스트 테스트 외 주 사용처가 없으므로 단순 처리).
+    ///
+    /// Note: `prefault()` is equivalent to calling `prefault_layers` with all
+    /// layer indices. For swap-path usage, prefer `prefault_layers(target_layers)`
+    /// to avoid touching weight pages that will not be swapped.
     pub fn prefault(&self) {
         match self {
             SecondaryMmap::Auf(a) => a.prefault(),
             SecondaryMmap::Gguf(g) => g.prefault(),
+        }
+    }
+
+    /// Prefault only the byte ranges belonging to `target_layers`.
+    ///
+    /// **ENG-ALG-229** — targeted prefault for swap target layers. When the
+    /// swap ratio is <1.0 (e.g. ratio=0.9, 25/28 layers swapped), the full
+    /// `prefault()` wastes time touching weight pages for layers that will not
+    /// be swapped. This variant limits page-touch to the exact tensor byte
+    /// ranges of the requested layers, reducing the prefault stage cost by
+    /// ~40 ms at ratio=0.9 (estimated ~12% of total prefault stage).
+    ///
+    /// Calling conventions:
+    /// - `target_layers` is the same slice passed to `SwapExecutor::execute_on_slots`.
+    /// - Out-of-range indices are silently skipped (ENG-DAT-C08 spirit).
+    /// - An empty `target_layers` is a no-op.
+    /// - Linux/Android only; other targets are no-ops.
+    pub fn prefault_layers(&self, target_layers: &[usize]) {
+        match self {
+            SecondaryMmap::Auf(a) => a.prefault_layers(target_layers),
+            SecondaryMmap::Gguf(g) => g.prefault_layers(target_layers),
         }
     }
 
@@ -499,8 +608,30 @@ pub fn open_secondary_with_dtype(
     primary_gguf: &GgufFile,
     secondary_dtype_choice: SecondaryDtypeChoice,
 ) -> Result<SecondaryMmap, LoadError> {
+    open_secondary_with_options(
+        path,
+        primary_config,
+        primary_gguf,
+        secondary_dtype_choice,
+        SecondaryLayoutChoice::Auto,
+    )
+}
+
+/// `open_secondary`의 dtype + layout 선택 풀버전.
+pub fn open_secondary_with_options(
+    path: &Path,
+    primary_config: &ModelConfig,
+    primary_gguf: &GgufFile,
+    secondary_dtype_choice: SecondaryDtypeChoice,
+    secondary_layout_choice: SecondaryLayoutChoice,
+) -> Result<SecondaryMmap, LoadError> {
     if is_auf_path(path) {
-        open_secondary_auf(path, primary_config, secondary_dtype_choice)
+        open_secondary_auf(
+            path,
+            primary_config,
+            secondary_dtype_choice,
+            secondary_layout_choice,
+        )
     } else {
         open_secondary_gguf(path, primary_config, primary_gguf)
     }
@@ -635,12 +766,100 @@ fn detect_backend_tag() -> BackendTag {
     return BackendTag::CpuAos;
 }
 
-fn open_secondary_auf(
+/// Resolve the candidate `BackendTag` list to try in order, given the
+/// `SecondaryLayoutChoice`. For `Auto`, falls back to `CpuAos` if the
+/// preferred variant is missing from the AUF file.
+fn resolve_backend_tag_candidates(layout: SecondaryLayoutChoice) -> Vec<BackendTag> {
+    match layout {
+        SecondaryLayoutChoice::Auto => {
+            let preferred = detect_backend_tag();
+            if preferred == BackendTag::CpuAos {
+                vec![BackendTag::CpuAos]
+            } else {
+                // Try preferred first, fall back to CpuAos for AUFs that only
+                // bundle the AOS variant (built with `--variants cpu_aos`).
+                vec![preferred, BackendTag::CpuAos]
+            }
+        }
+        SecondaryLayoutChoice::Aos => {
+            // Force AOS. Prefer CudaAos on CUDA builds, CpuAos otherwise.
+            #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+            return vec![BackendTag::CudaAos, BackendTag::CpuAos];
+            #[cfg(not(any(feature = "cuda", feature = "cuda-embedded")))]
+            vec![BackendTag::CpuAos]
+        }
+        SecondaryLayoutChoice::Soa => {
+            // Force SOA — only meaningful on OpenCL.
+            vec![BackendTag::AdrenoSoa]
+        }
+    }
+}
+
+/// Open an AUF-format secondary weight file directly (skips GGUF detection).
+///
+/// Public so integration tests can exercise the layout-fallback path without
+/// constructing a `GgufFile` placeholder. Production callers should use
+/// `open_secondary_with_options`, which dispatches GGUF vs AUF on extension.
+pub fn open_secondary_auf(
     path: &Path,
     primary_config: &ModelConfig,
     secondary_dtype_choice: SecondaryDtypeChoice,
+    secondary_layout_choice: SecondaryLayoutChoice,
 ) -> Result<SecondaryMmap, LoadError> {
-    let backend_tag = detect_backend_tag();
+    let candidates = resolve_backend_tag_candidates(secondary_layout_choice);
+    debug_assert!(
+        !candidates.is_empty(),
+        "resolve_backend_tag_candidates must return at least one tag"
+    );
+
+    // Try each candidate in order. On `WeightsSectionMissing`, fall through to
+    // the next candidate. Any other error short-circuits.
+    let mut last_missing: Option<crate::auf::AufError> = None;
+    let backend_tag = {
+        let mut chosen: Option<BackendTag> = None;
+        for tag in &candidates {
+            match crate::auf::reader::open(path, *tag) {
+                Ok(_view) => {
+                    chosen = Some(*tag);
+                    break;
+                }
+                Err(e @ crate::auf::AufError::WeightsSectionMissing { .. }) => {
+                    last_missing = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(LoadError::AufInvariantViolation {
+                        detail: format!("open AUF {}: {e}", path.display()),
+                    });
+                }
+            }
+        }
+        match chosen {
+            Some(t) => t,
+            None => {
+                let detail = match last_missing {
+                    Some(e) => format!(
+                        "AUF {} has none of the candidate variants {:?}: {e}",
+                        path.display(),
+                        candidates,
+                    ),
+                    None => format!("AUF {} variant probe yielded no result", path.display()),
+                };
+                return Err(LoadError::AufInvariantViolation { detail });
+            }
+        }
+    };
+
+    if backend_tag != detect_backend_tag()
+        && matches!(secondary_layout_choice, SecondaryLayoutChoice::Auto)
+    {
+        eprintln!(
+            "[Secondary] AUF lacks preferred variant {:?}; using {:?} (swap will use AOS path — \
+             switch_hw / partition compatible, GPU TBT may regress vs SOA)",
+            detect_backend_tag(),
+            backend_tag,
+        );
+    }
 
     // AUF open: full invariant pipeline (INV-132, INV-133, INV-134).
     let view = crate::auf::reader::open(path, backend_tag).map_err(|e| {
@@ -758,22 +977,36 @@ pub fn build_auf_secondary_from_view(
                 .as_deref()
                 .and_then(dtype_str_to_tensor_dtype_local);
 
+            // weight-dtype 우선순위: Q4_0 → F16 → BF16 → Q4_1 → Q8_0 → F32.
+            // F32는 일반적으로 norm 전용 dtype이므로 Auto 선택에서는 마지막으로
+            // 떨어뜨려야 한다. BTreeSet의 자연 정렬(F32=0이 최소)을 그대로 쓰면
+            // Q4_0 weight + F32 norm이 섞인 일반 single-dtype AUF에서 F32를
+            // 선택해 weight 텐서가 모두 필터링된다.
+            let weight_preference = [
+                TensorDType::Q4_0,
+                TensorDType::F16,
+                TensorDType::BF16,
+                TensorDType::Q4_1,
+                TensorDType::Q8_0,
+                TensorDType::F32,
+            ];
+            let pick_by_preference = || -> Option<TensorDType> {
+                weight_preference
+                    .iter()
+                    .copied()
+                    .find(|d| available_dtypes.contains(&d.as_u32()))
+            };
+
             if let Some(d) = default_from_meta {
                 if available_dtypes.contains(&d.as_u32()) {
                     Some(d)
                 } else {
-                    // META.default_dtype이 available에 없으면 first candidate.
-                    available_dtypes
-                        .iter()
-                        .next()
-                        .and_then(|&u| TensorDType::from_u32(u))
+                    // META.default_dtype이 available에 없으면 weight 우선 후보.
+                    pick_by_preference()
                 }
             } else {
-                // META.default_dtype 없음 → first candidate.
-                available_dtypes
-                    .iter()
-                    .next()
-                    .and_then(|&u| TensorDType::from_u32(u))
+                // META.default_dtype 없음 → weight 우선 후보.
+                pick_by_preference()
             }
         }
         SecondaryDtypeChoice::F16 => {
@@ -1199,5 +1432,294 @@ mod tests {
             tensor_kind_to_subname(TensorKind::AttnO.as_u32()),
             Some("attn_output.weight")
         );
+    }
+
+    /// ENG-ALG-229: `prefault_layers` on an AUF secondary touches only the byte
+    /// ranges of the requested layers, not the entire WEIGHTS payload.
+    ///
+    /// Constructs a minimal 3-layer AUF (512 bytes per layer) and verifies that
+    /// calling `prefault_layers` with a subset of layers does not panic and
+    /// leaves the backing buffer unchanged (read-only semantics).
+    #[test]
+    fn prefault_layers_auf_subset_no_panic() {
+        use crate::auf::reader::open_from_bytes;
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use crate::auf::writer::AufWriter;
+        use crate::auf::{AufMeta, BackendTag};
+        use crate::models::config::{ModelArch, ModelConfig};
+        use crate::models::weights::SecondaryDtypeChoice;
+        use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
+
+        const N_LAYERS: usize = 3;
+        const BYTES_PER_TENSOR: usize = 128;
+
+        // Build a weights payload: N_LAYERS × 2 tensors × 128 bytes each.
+        // Layer i tensors start at offset i * 256 (two tensors per layer).
+        let mut weights_payload = vec![0xBBu8; N_LAYERS * 2 * BYTES_PER_TENSOR];
+        // Stamp each layer region with its index so we can distinguish them.
+        for i in 0..N_LAYERS {
+            let base = i * 2 * BYTES_PER_TENSOR;
+            for b in &mut weights_payload[base..base + 2 * BYTES_PER_TENSOR] {
+                *b = i as u8;
+            }
+        }
+
+        // Build TensorIndex: 2 tensors per layer, section-local offsets.
+        let mut tag_buf = [0u8; 24];
+        tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+        let mut entries = Vec::new();
+        for layer_idx in 0..N_LAYERS as u32 {
+            let base_offset = (layer_idx as usize * 2 * BYTES_PER_TENSOR) as u64;
+            entries.push(TensorEntry {
+                layer_idx,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::F32.as_u32(),
+                shape: vec![1, 128],
+                alignment: 64,
+                variant_offsets: vec![base_offset],
+                variant_sizes: vec![BYTES_PER_TENSOR as u64],
+            });
+            entries.push(TensorEntry {
+                layer_idx,
+                kind: TensorKind::AttnK.as_u32(),
+                dtype: TensorDType::F32.as_u32(),
+                shape: vec![1, 128],
+                alignment: 64,
+                variant_offsets: vec![base_offset + BYTES_PER_TENSOR as u64],
+                variant_sizes: vec![BYTES_PER_TENSOR as u64],
+            });
+        }
+        let tensor_index = TensorIndex {
+            variant_tags: vec![tag_buf],
+            entries,
+        };
+
+        let meta = AufMeta {
+            architecture: "llama".to_owned(),
+            n_layers: N_LAYERS as u32,
+            n_heads_q: 1,
+            n_kv_heads: 1,
+            head_dim: 128,
+            hidden_dim: 128,
+            ffn_dim: 256,
+            vocab_size: 2,
+            max_seq_len: 32,
+            rope_theta: 10000.0,
+            rotary_dim: 128,
+            rope_scaling: 1.0,
+            rms_norm_epsilon: 1e-5,
+            default_dtype: None,
+        };
+        let tok = AufTokenizer {
+            kind: TOKENIZER_KIND_BPE,
+            tokens: vec![b"a".to_vec()],
+            merges: vec![],
+            bos_id: 1,
+            eos_id: 2,
+            pad_id: -1,
+            unk_id: 0,
+            chat_template: None,
+        };
+
+        let auf_bytes = AufWriter::new(meta, tok, [0u8; 32], 0, 0)
+            .with_tensor_index(tensor_index)
+            .add_weights_section(TAG_WEIGHTS_CPU_AOS, weights_payload)
+            .build()
+            .unwrap();
+
+        let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
+        let config = ModelConfig {
+            arch: ModelArch::Llama,
+            hidden_size: 128,
+            num_hidden_layers: N_LAYERS,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 128,
+            intermediate_size: 256,
+            vocab_size: 2,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 1,
+            weight_prefix: String::new(),
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+        };
+        let secondary = build_auf_secondary_from_view(
+            view,
+            &config,
+            std::path::Path::new("/fake/test.auf"),
+            BackendTag::CpuAos,
+            SecondaryDtypeChoice::Auto,
+        )
+        .expect("build_auf_secondary_from_view should succeed");
+
+        // Scenario 1: subset (layers 0 and 2 only) — must not panic.
+        secondary.prefault_layers(&[0, 2]);
+
+        // Scenario 2: empty target — no-op, must not panic.
+        secondary.prefault_layers(&[]);
+
+        // Scenario 3: out-of-range index — silent skip, must not panic.
+        secondary.prefault_layers(&[99, 1000]);
+
+        // Scenario 4: full layer list must be equivalent to (or a subset of)
+        // what the whole-payload prefault() would cover. Verify no panic and
+        // that layer byte ranges are accessible after prefault_layers.
+        secondary.prefault_layers(&[0, 1, 2]);
+
+        // Verify data integrity: tensor_bytes for layer 1 is still correct after
+        // calling prefault_layers (read-only, data must be unchanged).
+        let info = secondary
+            .layer_tensor(1, "attn_q.weight")
+            .expect("layer 1 attn_q must exist");
+        let tb = secondary.tensor_bytes(info);
+        assert_eq!(tb.len(), BYTES_PER_TENSOR);
+        assert!(
+            tb.iter().all(|&b| b == 1),
+            "layer 1 bytes should all be 0x01 (layer index stamp)"
+        );
+    }
+
+    /// ENG-ALG-229: `prefault_layers` byte range accuracy — the layer index
+    /// correctly maps each layer to its own tensor offsets.
+    #[test]
+    fn prefault_layers_layer_index_byte_ranges_are_disjoint() {
+        use crate::auf::reader::open_from_bytes;
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use crate::auf::writer::AufWriter;
+        use crate::auf::{AufMeta, BackendTag};
+        use crate::models::config::{ModelArch, ModelConfig};
+        use crate::models::weights::SecondaryDtypeChoice;
+        use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
+
+        const N_LAYERS: usize = 4;
+        const BYTES_PER_TENSOR: usize = 64;
+
+        // Each layer gets a unique fill byte equal to its index.
+        let mut weights_payload = vec![0u8; N_LAYERS * BYTES_PER_TENSOR];
+        for i in 0..N_LAYERS {
+            for b in &mut weights_payload[i * BYTES_PER_TENSOR..(i + 1) * BYTES_PER_TENSOR] {
+                *b = i as u8;
+            }
+        }
+
+        let mut tag_buf = [0u8; 24];
+        tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+        let entries: Vec<TensorEntry> = (0..N_LAYERS as u32)
+            .map(|layer_idx| TensorEntry {
+                layer_idx,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::F32.as_u32(),
+                shape: vec![1, 64],
+                alignment: 64,
+                variant_offsets: vec![(layer_idx as usize * BYTES_PER_TENSOR) as u64],
+                variant_sizes: vec![BYTES_PER_TENSOR as u64],
+            })
+            .collect();
+        let tensor_index = TensorIndex {
+            variant_tags: vec![tag_buf],
+            entries,
+        };
+
+        let meta = AufMeta {
+            architecture: "llama".to_owned(),
+            n_layers: N_LAYERS as u32,
+            n_heads_q: 1,
+            n_kv_heads: 1,
+            head_dim: 64,
+            hidden_dim: 64,
+            ffn_dim: 128,
+            vocab_size: 2,
+            max_seq_len: 32,
+            rope_theta: 10000.0,
+            rotary_dim: 64,
+            rope_scaling: 1.0,
+            rms_norm_epsilon: 1e-5,
+            default_dtype: None,
+        };
+        let tok = AufTokenizer {
+            kind: TOKENIZER_KIND_BPE,
+            tokens: vec![b"a".to_vec()],
+            merges: vec![],
+            bos_id: 1,
+            eos_id: 2,
+            pad_id: -1,
+            unk_id: 0,
+            chat_template: None,
+        };
+
+        let auf_bytes = AufWriter::new(meta, tok, [0u8; 32], 0, 0)
+            .with_tensor_index(tensor_index)
+            .add_weights_section(TAG_WEIGHTS_CPU_AOS, weights_payload)
+            .build()
+            .unwrap();
+
+        let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
+        let config = ModelConfig {
+            arch: ModelArch::Llama,
+            hidden_size: 64,
+            num_hidden_layers: N_LAYERS,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 64,
+            intermediate_size: 128,
+            vocab_size: 2,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 1,
+            weight_prefix: String::new(),
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+        };
+        let secondary = build_auf_secondary_from_view(
+            view,
+            &config,
+            std::path::Path::new("/fake/layers.auf"),
+            BackendTag::CpuAos,
+            SecondaryDtypeChoice::Auto,
+        )
+        .expect("build_auf_secondary_from_view should succeed");
+
+        // Verify that byte ranges for each layer are disjoint and correctly stamped.
+        for layer_idx in 0..N_LAYERS {
+            let info = secondary
+                .layer_tensor(layer_idx, "attn_q.weight")
+                .unwrap_or_else(|| panic!("layer {layer_idx} attn_q must exist"));
+            let tb = secondary.tensor_bytes(info);
+            assert_eq!(tb.len(), BYTES_PER_TENSOR);
+            assert!(
+                tb.iter().all(|&b| b == layer_idx as u8),
+                "layer {layer_idx} bytes should all be {layer_idx}"
+            );
+        }
+
+        // prefault_layers with layers [1, 3] must not affect layers [0, 2].
+        secondary.prefault_layers(&[1, 3]);
+
+        // Data integrity preserved after prefault_layers.
+        for layer_idx in 0..N_LAYERS {
+            let info = secondary
+                .layer_tensor(layer_idx, "attn_q.weight")
+                .unwrap_or_else(|| panic!("layer {layer_idx} attn_q must exist"));
+            let tb = secondary.tensor_bytes(info);
+            assert!(
+                tb.iter().all(|&b| b == layer_idx as u8),
+                "layer {layer_idx} bytes should still be {layer_idx} after prefault_layers"
+            );
+        }
     }
 }

@@ -545,3 +545,543 @@ Engine의 주 작업은 CPU-bound forward pass이다. MessageLoop의 blocking re
 ### 왜 heartbeat_interval이 1000ms 하드코딩인가
 
 현재 구현에서는 설정 가능한 인터페이스를 제공하지 않는다. Manager의 50ms 폴링 주기 대비 충분히 느슨하여 Engine 부하를 최소화하면서도 Manager가 Engine 상태를 주기적으로 파악할 수 있다 (PROTO-071 참조).
+
+## 부록 A. QNN OpPackage cdylib (M1, 2026-05-09)
+
+> **TL;DR**: QNN GPU OpPackage 인터페이스를 구현하는 별도 cdylib 산출물 `crates/qnn_oppkg/`. Engine/Manager/Shared **어느 것에도 의존하지 않으며** (`engine`도 `qnn_oppkg`에 의존하지 않음), QNN runtime이 dlopen하여 호출하는 외부 계약 컴포넌트. INV-001/010/011의 "2 독립 프로세스 + Shared" 골격은 보존된다 — qnn_oppkg는 **Engine 프로세스의 일부도 Manager 프로세스의 일부도 아닌** 외부 라이브러리 산출물이다.
+
+### A.1 정의
+
+| 용어 | 정의 |
+|------|------|
+| **OpPackage** | QNN(Qualcomm Neural Network) SDK가 정의한 외부 op 등록 인터페이스. `QnnOpPackage_InitInterface`를 export한 cdylib을 SDK가 dlopen하고 `registerOpPackage`로 op들을 그래프에 주입한다. |
+| **OpDescriptor** | (op_type, kernel_name, kernel_source, build_options, build_layout fn)의 정적 등록 단위. |
+| **OpImplLayout** | 런타임에 op_config로부터 산출되는 (mem_objects, args, workgroup) 묶음. `OpDescriptor::build_layout`이 생성. |
+| **PoC crate** | `crates/qnn_oppkg_poc/` — Phase R 검증용. 2 ops 보존. M1 기간 동안 회귀 안전망으로 유지. |
+
+### A.2 Crate 산출물 [ENG-QNN-010]
+
+**[ENG-QNN-010]** `crates/qnn_oppkg/`는 cdylib 산출물이다. `engine`(`llm_rs2`), `manager`(`llm_manager`), `shared`(`llm_shared`) 어느 크레이트도 `qnn_oppkg`에 의존하지 않는다. 역방향 의존도 없다 (qnn_oppkg는 workspace member로만 추가되며 cargo dependency edge는 형성되지 않는다). *(MUST)*
+
+**[ENG-QNN-011]** `qnn_oppkg`는 `engine/kernels/*.cl` 파일을 `include_str!`로만 임베드한다. 커널 인라인 작성을 금지하며, kernel source는 production `.cl` 파일을 단일 진실의 원천(SSOT)으로 한다. *(MUST)*
+
+> **Rationale (non-normative)**: 인라인 kernel은 production `.cl`과 drift 위험. `include_str!`은 빌드 시점에 production 자산을 그대로 복사하여 SSOT를 강제한다.
+
+**[ENG-QNN-012]** M1 범위에서 cdylib은 다음 5개 op을 노출한다: `CustomMatMulF16F32`, `CustomAdd`, `CustomRmsNorm`, `CustomSoftmax`, `CustomSiluMul`. 추가 op(Q4_0, FlashAttn, RoPE, KvScatter)은 M2 이후 범위. *(MUST)*
+
+### A.3 cdylib 외부 계약 [ENG-QNN-020 ~ ENG-QNN-024]
+
+**[ENG-QNN-020]** cdylib은 다음 export symbol을 제공한다 (QNN runtime이 dlopen하여 호출): *(MUST)*
+
+| Symbol | 시그니처 (요약) | 용도 |
+|--------|-----------------|------|
+| `QnnOpPackage_InitInterface` | `(Qnn_ApiVersion_t version) -> Qnn_OpPackage_Interface_t` | V1.4 + V2.0 fn pointer table 반환. SDK가 op 등록·dispatch·해제 시 이 table을 통해 cdylib 내부 함수를 호출한다. |
+| `pkg_get_info` (내부 fn ptr 경유) | `() -> &QnnOpPackage_Info_t` | packageName, numOperations, operationNames, backendApiVersion, coreApiVersion 메타데이터. |
+| `pkg_create_op_impl` (내부 fn ptr 경유) | `(node, *mut op_impl) -> Qnn_ErrorHandle_t` | op_type 디스패치 + state pointer 생성. |
+| `pkg_free_op_impl` (내부 fn ptr 경유) | `(op_impl) -> Qnn_ErrorHandle_t` | state pointer 해제. **leak 금지** (M1.8). |
+
+**[ENG-QNN-021]** 정적 op 등록 슬라이스 `OPS: &[OpDescriptor]`의 길이는 `numOperations`와 비트 단위 일치한다. M1 범위에서 둘 다 5이다. *(MUST)*
+
+**[ENG-QNN-022]** `OPS` 슬라이스 내 모든 `OpDescriptor.op_type` 값은 슬라이스 내에서 고유하다 (중복 등록 금지). *(MUST)*
+
+**[ENG-QNN-023]** cdylib의 `backendApiVersion`은 `3.7.0`이다 (Phase R에서 결정적 fix). 이 값은 QNN GPU API와 일치하며 변경 시 SDK가 cdylib을 reject한다. *(MUST)*
+
+**[ENG-QNN-024]** `pkg_create_op_impl` dispatcher는 표 기반(`OPS.iter().find(|d| d.op_type == requested)`)이며 if-else 체인을 사용하지 않는다. 이는 op 추가 시 단일 행 등록만으로 디스패치가 확장되도록 보장한다 (Open-Closed). *(SHOULD)*
+
+### A.4 OpPackage 내부 추상화 [ENG-QNN-030]
+
+**[ENG-QNN-030]** OpPackage 내부는 다음 4개 모듈로 분해된다: *(MUST)*
+
+| 모듈 | 책임 |
+|------|------|
+| `args.rs` | `ArgSpec`(InputTensor/OutputTensor/LocalMem/Int/UInt/ULong/Float), `MemoryObjectSpec`(data_type, flat_dims, flat_offsets), `OpImplLayout`(mem_objects + args + workgroup) — pure data |
+| `op_impl.rs` | `build_op_state(descriptor, layout) -> *mut GpuOperation` — 정해진 leak 패턴으로 state 생성. `free_op_impl_state(*mut)` reverse-mapping table 사용. |
+| `registry.rs` | `OPS` 정적 슬라이스. `find_descriptor(op_type)` lookup. |
+| `static_info.rs` / `interface.rs` | cdylib 메타데이터 + V1.4/V2.0 fn pointer table 채움 |
+
+### A.5 Constraints [ENG-QNN-C01 ~ ENG-QNN-C04]
+
+**[ENG-QNN-C01]** `qnn_oppkg`는 `engine`, `manager`, `shared` 중 어느 크레이트도 의존하지 않는다. 양방향 모두. *(MUST NOT)* (INV-001/010/011 보존)
+
+**[ENG-QNN-C02]** PoC crate `qnn_oppkg_poc`는 M1 기간 동안 회귀 안전망으로 보존된다. 같은 workspace에 공존하며 packageName과 op_type이 분리되어 있어 SDK 등록 충돌이 없다. *(SHOULD)*
+
+**[ENG-QNN-C03]** `engine/kernels/*.cl` 파일은 OpPackage 통합을 이유로 수정하지 않는다 (이미 Adreno 디바이스에서 검증된 자산). *(MUST NOT)*
+
+**[ENG-QNN-C04]** `pkg_free_op_impl`은 PoC의 leak 패턴을 production에서 그대로 사용하지 않는다. M1.8에서 reverse-mapping table + `Box::from_raw` drop으로 정상화된다. 100회 register/free leak test에서 VmRSS slope < 1 KB/iter을 만족해야 한다. *(MUST)*
+
+### A.6 Invariants
+
+| ID | 한줄 요약 |
+|----|-----------|
+| INV-151 | qnn_oppkg cdylib은 engine/manager/shared와 cargo dependency edge를 형성하지 않는다. (ENG-QNN-C01) |
+| INV-152 | `OPS.len() == numOperations` 정적 일치. (ENG-QNN-021) |
+| INV-153 | `OPS` 슬라이스 내 op_type 고유성. (ENG-QNN-022) |
+| INV-154 | cdylib `backendApiVersion == 3.7.0`. (ENG-QNN-023) |
+| INV-155 | 100회 register/free 후 VmRSS slope < 1 KB/iter. (ENG-QNN-C04) |
+
+상세는 `spec/41-invariants.md` §3.22 참조.
+
+### A.7 Examples (non-normative)
+
+```bash
+# Android cross-build
+python scripts/run_device.py -d s25 --skip-exec build -p qnn_oppkg
+
+# QNN runtime이 cdylib 로드 (개념)
+QnnBackend_loadOpPackage(
+    backend_handle,
+    "/data/local/tmp/libqnn_oppkg.so",   # cdylib path
+    "QnnOpPackage_InitInterface",        # ENG-QNN-020 의무 symbol
+    NULL                                  // target = QNN_GPU
+)
+```
+
+### A.8 Rationale (non-normative)
+
+- **왜 별도 crate인가**: cdylib은 `crate-type = ["cdylib"]`을 요구하며 Engine 바이너리(`bin = []`)와 한 크레이트에 둘 수 없다. 또한 QNN runtime이 dlopen하는 외부 계약 단위는 Engine 프로세스 내부 코드와 lifecycle이 다르다.
+- **왜 의존성을 0으로 두는가**: qnn_oppkg가 engine 코드를 import하면 (a) 빌드 그래프 거대화, (b) cdylib 사이즈 증가, (c) INV-001/010/011 위반 우려. 5개 op은 모두 self-contained이며 engine의 Tensor/Buffer 추상화를 필요로 하지 않는다 (kernel은 cl_mem과 raw arg만 받음).
+- **왜 PoC crate를 보존하는가**: M1 회귀 발생 시 즉각적 rollback path. 두 crate는 독립 packageName으로 SDK에 동시 등록 가능하여 A/B 비교도 지원한다.
+
+### A.9 INV-155 정밀화 (2026-05-09 M2 진입 시점)
+
+M1.8 실측 결과 cdylib 자체 leak는 0이지만(STATE_MAP entries == 0 사후 일관) QNN driver가 op_impl 외 영역(GPU compiled kernel cache, command buffer 풀)에서 잔여물을 유지하여 VmRSS slope이 ~1.1 KB/iter로 측정되었다. 이는 cdylib 책임 외 영역이며 INV-155의 본래 의도(cdylib 자체 leak 부재 보증)와 다른 차원이다. 본 절은 INV-155를 **2-tier**로 분리한다.
+
+**[ENG-QNN-C04']** INV-155 보강(2026-05-09):
+- **Primary (cdylib own leak)**: 100회 register/free 후 `STATE_MAP::lock().len() == 0`. cdylib이 보유한 모든 `Box<State>`는 `pkg_free_op_impl`에 의해 소진된다. *(MUST)*
+- **Secondary (driver residual tolerance)**: `/proc/self/status::VmRSS` slope (last 50 iter linear regression) < 3 KB/iter. 1.1 KB/iter 실측치는 driver 영역으로 cdylib 책임이 아니지만, 회귀 detector로 임계값을 설정한다. *(SHOULD)*
+
+> **Rationale (non-normative)**: M1.0 spec은 1 KB/iter을 가정했으나 실측은 1.1 KB/iter였다. 임계값을 3 KB/iter로 완화하되 primary detector(STATE_MAP=0)는 그대로 유지하여 cdylib 자체 회귀는 즉시 검출한다.
+
+INV-155의 한 줄 요약은 `41-invariants.md` §3.22에서 갱신된다.
+
+## 부록 B. QNN OpPackage M2 — Layer-level Graph (2026-05-09)
+
+> **TL;DR**: 단일 OpPackage graph로 Qwen 1 transformer layer (12~13 op)을 build/execute한다. 추가 5 op (`CustomMatMulQ40F32`, `CustomFlashAttn`, `CustomRope`, `CustomKvScatter`, `CustomDeqQ40`) + layer graph builder + KV cache integration. **production engine code 변경 0** 유지 (M3에서 backend trait 통합).
+
+### B.1 정의
+
+| 용어 | 정의 |
+|------|------|
+| **Layer graph** | 단일 transformer layer (RMSNorm → QKV matmul → RoPE → KV scatter → FlashAttn → out_proj → residual → RMSNorm → ffn_gate → silu_mul → ffn_up → ffn_down → residual)를 단일 QNN graph로 빌드한 것. 13 op nodes 이내. |
+| **Graph builder** | `(model_weights, kv_cache, layer_idx) → QnnGraph_Handle_t`를 생성하는 호스트 측 빌더. `crates/qnn_oppkg/src/graph/`. |
+| **External KV buffer** | `[1, kv_heads, 2048, head_dim]` F16 max-padded 고정 shape KV cache. graph 외부에 host alloc되며 `QNN_TENSOR_TYPE_APP_WRITE`로 graph에 노출. |
+| **Intermediate alias** | OpPackage가 SiluMul처럼 in-place kernel을 OOP graph 안에서 사용할 때, kernel 입력/출력 cl_mem을 동일 buffer에 매핑하면서도 graph topology에서 별개 tensor edge로 보이게 하는 ArgSpec 패턴. |
+| **OOP refactor** | Out-Of-Place. SiluMul kernel이 입력과 출력을 분리하도록 production `.cl`에 `kernel_silu_mul_oop` 추가하는 변경. **본 spec에서는 채택하지 않음**(B.4 결정). |
+
+### B.2 Op 등록 [ENG-QNN-101 ~ ENG-QNN-105]
+
+**[ENG-QNN-101]** M2 종료 시 cdylib은 다음 op 10개를 노출한다 (M1의 5개 + M2 신규 5개): *(MUST)*
+
+| op_type | Kernel source | 데이터 타입 | 비고 |
+|---------|--------------|-----------|------|
+| (M1) `CustomMatMulF16F32` | `mul_mv_f16_f32.cl` | F16 weight, F32 act | — |
+| (M1) `CustomAdd` | `simple_ops.cl` | F32 | — |
+| (M1) `CustomRmsNorm` | `simple_ops.cl` | F32 | — |
+| (M1) `CustomSoftmax` | `simple_ops.cl` | F32 | — |
+| (M1) `CustomSiluMul` | `simple_ops.cl` | F32 | in-place; B.4 intermediate alias로 OOP 노출 |
+| (M2) `CustomMatMulQ40F32` | `mul_mv_q4_0_f32.cl` (또는 production 등가물) | Q4_0 weight raw bytes, F32 act | qkv/ffn/lm_head hot path |
+| (M2) `CustomFlashAttn` | `flash_attn_*.cl` (production 선택) | F16 KV, F32 QO | online softmax; max-padded mask 입력 |
+| (M2) `CustomRope` | `simple_ops.cl` 또는 `rope.cl` | F32 | `pos`는 Int 스칼라 arg |
+| (M2) `CustomKvScatter` | `simple_ops.cl::kernel_kv_scatter_f32_to_f16` | F32 입력 → F16 출력 | HeadMajor 스트라이드 가정 |
+| (M2) `CustomDeqQ40` | `simple_ops.cl::kernel_dequant_q4_0` | Q4_0 → F32 | fallback dequant; Q4 GEMV 미지원 시 |
+
+**[ENG-QNN-102]** M2 op 등록은 M1과 동일한 dispatch table 패턴(`OPS: &[OpDescriptor]`)을 따르며, 신규 op 추가는 **OPS 슬라이스에 1행 추가 + ops/ 모듈 1개 추가**만으로 완료된다 (Open-Closed). M1의 `pkg_create_op_impl` table-based dispatcher는 변경하지 않는다 (ENG-QNN-024 보존). *(MUST)*
+
+**[ENG-QNN-103]** M2 신규 op은 모두 `engine/kernels/*.cl`을 `include_str!`로 임베드한다 (ENG-QNN-011 보존). 단, **M2 단계에서 `engine/kernels/`에 신규 .cl 파일을 추가할 수 없다**: production이 이미 보유한 kernel 자산만 사용한다. production이 보유하지 않은 op (예: 별도 RoPE kernel이 없는 경우)은 기존 kernel을 인자만 다르게 호출하여 표현한다. *(MUST)*
+
+> **Rationale (non-normative)**: ENG-QNN-C03("engine/kernels/*.cl 미수정")은 M2에서도 유지된다. 신규 .cl 추가는 production에 영향을 주는 변경(빌드 그래프 + OpenCL 백엔드 신규 자산)이므로 M3 backend trait 통합 시점에 함께 평가한다.
+
+**[ENG-QNN-104]** Q4_0 weight tensor는 `MemoryObjectSpec::data_type = RawBytes(block_size=18, element_count=N/32)`로 노출한다. 32 element block당 18 byte (2 byte F16 scale + 16 byte 4-bit nibbles). 신규 enum variant `RawBytes { block_size: u32, element_count: u32 }` 또는 동등한 abstraction을 `args.rs::MemoryObjectSpec`에 추가한다. *(MUST)*
+
+**[ENG-QNN-105]** RoPE의 `pos` (현재 token 위치)는 `ArgSpec::Int(i32)` 스칼라 arg로 graph 외부에서 주입한다. KV scatter의 `pos`도 동일 패턴. graph build 시점에 fixed 값이 아니므로 매 forward call마다 graph executor가 갱신한다 (QNN graph executor가 `Qnn_OpConfig_t` 인자를 동적으로 update할 수 있는지는 SDK 능력 + M2.1 검증 사항). *(SHOULD)*
+
+### B.3 Layer Graph 구조 [ENG-QNN-110 ~ ENG-QNN-114]
+
+**[ENG-QNN-110]** Layer graph는 다음 입력/출력 인터페이스를 갖는다: *(MUST)*
+
+| 방향 | Tensor | Shape | Dtype | 비고 |
+|------|--------|-------|-------|------|
+| 입력 | `x` | `[1, dim]` | F32 | residual 입력 |
+| 입력 | `kv_cache_k` | `[1, kv_heads, 2048, head_dim]` | F16 | external (APP_WRITE), in/out |
+| 입력 | `kv_cache_v` | `[1, kv_heads, 2048, head_dim]` | F16 | external (APP_WRITE), in/out |
+| 입력 | `attn_mask` | `[1, 2048]` | F32 | max-padded mask, valid range 외 -inf |
+| 입력 (scalar) | `pos` | i32 | — | 현재 token 위치 |
+| 입력 | `weights_*` | static | F16/Q4_0 | RMSNorm γ, Wq, Wk, Wv, Wo, RMSNorm γ', Wgate, Wup, Wdown |
+| 출력 | `y` | `[1, dim]` | F32 | layer 출력 (다음 layer의 `x`) |
+| 출력 (in-place) | `kv_cache_k`, `kv_cache_v` | (위와 동일) | F16 | KvScatter가 graph 안에서 in-place write |
+
+**[ENG-QNN-111]** Layer graph는 13 op nodes 이내로 구성된다 (Qwen2.5-1.5B 기준): *(MUST)*
+
+```
+1. RmsNorm(x) → x_norm
+2. MatMulQ40F32(x_norm, Wq) → q
+3. MatMulQ40F32(x_norm, Wk) → k
+4. MatMulQ40F32(x_norm, Wv) → v
+5. Rope(q, pos) → q_rot
+6. Rope(k, pos) → k_rot
+7. KvScatter(k_rot, kv_cache_k, pos)  // in-place write
+8. KvScatter(v,    kv_cache_v, pos)   // in-place write
+9. FlashAttn(q_rot, kv_cache_k, kv_cache_v, attn_mask, pos) → attn_out
+10. MatMulQ40F32(attn_out, Wo) → o_proj
+11. Add(x, o_proj) → residual_1     // Add는 in-place; graph topology에서는 OOP
+12. RmsNorm(residual_1) → ffn_in
+... (FFN: gate / silu_mul / up / down / Add)
+```
+
+> 11 ops로 압축 가능 여부는 op fusion 결정 (M2.5).
+
+**[ENG-QNN-112]** Layer graph 빌드는 `crates/qnn_oppkg/src/graph/layer.rs::build_layer_graph(weights, kv_cache_handles, layer_idx) -> QnnGraph_Handle_t` 함수가 단일 진입점이다. 빌더는 `args.rs::OpImplLayout`을 노드별로 생성하여 SDK의 `QnnGraph_addNode` 호출로 그래프를 구성한다. *(MUST)*
+
+**[ENG-QNN-113]** `graphFinalize` 호출은 layer당 1회이며 시간은 200 ms 미만이어야 한다 (디바이스 측정). *(MUST)*
+
+**[ENG-QNN-114]** KV cache buffer 2개(K, V)는 graph 외부에 host alloc되며 `QNN_TENSOR_TYPE_APP_WRITE` (또는 SDK 동등 type)로 graph에 노출된다. graph는 buffer의 ownership을 갖지 않으며 lifecycle은 호출자(graph builder의 caller)가 관리한다. *(MUST)*
+
+### B.4 SiluMul OOP 결정 [ENG-QNN-120]
+
+**[ENG-QNN-120]** SiluMul kernel은 production에서 in-place(`output == input2`)로 작성되어 있어 graph 안에서 host-readable 출력을 생성하지 않는다. M2에서는 다음 옵션 중 **C (intermediate alias 패턴)**을 채택한다: *(MUST)*
+
+| 옵션 | 정확성 | 성능 | production 변경 | abstraction 복잡도 | 채택 |
+|------|--------|------|----------------|------------------|------|
+| **A**: production `.cl`에 `kernel_silu_mul_oop` 추가 | OK | 동등 (1 GEMV) | **engine/kernels/ 변경** (ENG-QNN-C03 위반) | 낮음 | ✗ |
+| **B**: silu_oop + elementwise_mul_oop 2 단계 분해 | OK | -10~20% (커널 2개 + intermediate buffer write) | 신규 mul kernel 필요(C03 위반) 또는 production simple_ops 사용 | 중간 | ✗ |
+| **C**: intermediate alias — kernel은 in-place, graph topology에서 input2를 output edge로 alias | OK | 동등 | 0 | OpPackage abstraction에 alias 추가 | ✓ |
+
+> **Rationale (non-normative)**: 옵션 A는 ENG-QNN-C03을 직접 위반. 옵션 B는 mul kernel 추가가 필요하고 성능 손실. 옵션 C는 SDK가 `QNN_TENSOR_TYPE_NATIVE` (graph 내부 tensor)로 동일 backing buffer를 input/output 양쪽에 매핑할 수 있는지 의존하지만, 가능성이 가장 높고 production 자산 보존.
+
+**옵션 C 구현 메모(non-normative)**: `args.rs::ArgSpec`에 `OutputTensorAliased { input_index: u32 }` variant를 추가하거나, `OpDescriptor::build_layout`이 OpImplLayout 생성 시 input/output mem_objects를 동일 cl_mem으로 채워 SDK에 노출. SDK가 동일 buffer alias를 거부하면 옵션 B로 fallback (M2.4 검증 게이트).
+
+### B.5 Production code 변경 0 유지 [ENG-QNN-130 ~ ENG-QNN-132]
+
+**[ENG-QNN-130]** M2 단계 종료 시점까지 `engine/`, `manager/`, `shared/` 어느 크레이트의 소스 라인도 변경되지 않는다 (test 추가 제외 — 단, test가 production 모듈을 import해도 production 빌드 산출물에 영향이 없어야 한다). *(MUST)*
+
+**[ENG-QNN-131]** Layer graph builder, KV cache integration, microbench는 모두 `crates/qnn_oppkg/` 내부 또는 `crates/qnn_oppkg/src/bin/`에 위치한다. 별도 crate 분리는 M2에서 수행하지 않는다 (B.7 결정). *(MUST)*
+
+**[ENG-QNN-132]** M2 검증은 다음 두 산출물로 한정한다: (a) `crates/qnn_oppkg/tests/spec/` host/device test, (b) `crates/qnn_oppkg/src/bin/microbench_qnn_layer_graph.rs` 디바이스 microbench. production engine 바이너리(`generate`, `test_backend`)는 호출하지 않는다. *(MUST)*
+
+### B.6 Pass Gate [ENG-QNN-140 ~ ENG-QNN-143]
+
+**[ENG-QNN-140]** **Accuracy gate**: Qwen2.5-1.5B의 layer 0을 OpPackage graph로 실행한 결과 `y`가 CPU NEON reference 대비 `max_abs_err < 1e-2`(F16 tolerance)를 만족한다. 동일 입력 (`x`, `kv_cache`, `pos`)에 대해 1회 forward + 1회 KV write 후 양쪽이 비교 가능. *(MUST)*
+
+**[ENG-QNN-141]** **TBT gate**: 1 layer를 production OpenCL 경로로 실행하는 baseline 대비 OpPackage 경로의 token-time 비율 ≤ 1.10. baseline은 동일 디바이스(Galaxy S25), 동일 ratio(GPU 100%), 동일 model. 측정 단위는 wall-clock (ENG-QNN feedback: profile-events 금지). *(MUST)*
+
+**[ENG-QNN-142]** **graphFinalize gate**: 1 layer graph build → finalize 시간 ≤ 200 ms (디바이스). *(MUST)*
+
+**[ENG-QNN-143]** **Memory gate**: layer graph 1회 build → execute 100회 → release 사이클의 VmRSS slope < 3 KB/iter. INV-155 v2(secondary tier) 동일 임계값. *(MUST)*
+
+### B.7 Layer Graph Builder 위치 결정 [ENG-QNN-150]
+
+**[ENG-QNN-150]** Layer graph builder는 `crates/qnn_oppkg/src/graph/`에 위치한다. 별도 crate (`qnn_oppkg_graph`)으로 분리하지 않는다. *(MUST)*
+
+| 옵션 | 채택 | Rationale |
+|------|------|-----------|
+| A: `crates/qnn_oppkg/src/graph/` | ✓ | M2 단계는 op 등록 + graph build 모두 cdylib 외부 계약의 일부. crate 분리 시 cyclic dep (graph가 ops에 의존, ops가 args에 의존) 단순화 효과 미미. |
+| B: 별도 crate `crates/qnn_oppkg_graph/` | ✗ | M3에서 production engine 통합 시 backend trait이 graph builder를 직접 호출하면, graph crate은 engine과 cdylib 양쪽에 link되어야 함 — INV-151 위반 위험. |
+| C: `engine/src/backend/qnn_oppkg/` | ✗ | production code 변경 0 위반 (ENG-QNN-130). M3 영역. |
+
+### B.8 Constraints [ENG-QNN-C10 ~ ENG-QNN-C14]
+
+**[ENG-QNN-C10]** M2에서 `engine/kernels/*.cl` 파일은 추가/수정/삭제하지 않는다 (ENG-QNN-C03 보존). *(MUST NOT)*
+
+**[ENG-QNN-C11]** M2에서 SiluMul OOP refactor는 abstraction 계층(intermediate alias)에서 해결하며 production kernel을 수정하지 않는다 (B.4 옵션 C). *(MUST NOT)* (production .cl 변경 금지)
+
+**[ENG-QNN-C12]** KV cache는 max-padded fixed shape `[1, kv_heads, 2048, head_dim]`만 지원한다. dynamic seq_len은 M2 범위 외. attention mask는 max-padded이며 valid range 외 token에 `-INFINITY` 주입. *(MUST)*
+
+**[ENG-QNN-C13]** M2 graph는 layer 단위로만 빌드한다. multi-layer (전체 모델) graph는 M3 이후 범위. *(MUST)*
+
+**[ENG-QNN-C14]** Q4_0 weight raw bytes abstraction(`RawBytes` MemoryObjectSpec)은 18 byte/block × N/32 blocks 가정만 지원한다. Q8_0, Q5_K 등 다른 quantization은 M2 범위 외이며 별도 abstraction을 추후 추가한다. *(MUST)*
+
+### B.9 Invariants
+
+| ID | 한줄 요약 |
+|----|-----------|
+| INV-156 | M2 cdylib `OPS.len() == 10` (M1 5개 + M2 5개). (ENG-QNN-101) |
+| INV-157 | M2 모든 신규 op은 production `.cl` 파일을 `include_str!`로 임베드하며 신규 .cl 파일을 추가하지 않는다. (ENG-QNN-103, ENG-QNN-C10) |
+| INV-158 | Layer graph node 수 ≤ 13. (ENG-QNN-111) |
+| INV-159 | KV cache는 max-padded fixed shape `[1, kv_heads, 2048, head_dim]`. (ENG-QNN-C12) |
+| INV-160 | M2 종료 시점 `engine/`, `manager/`, `shared/` 소스 변경 라인 수 == 0. (ENG-QNN-130) |
+| INV-161 | Layer 0 OpPackage 출력의 `max_abs_err < 1e-2` (vs CPU NEON reference). (ENG-QNN-140) |
+| INV-162 | OpPackage 1 layer TBT ≤ baseline × 1.10. (ENG-QNN-141) |
+| INV-163 | `graphFinalize` ≤ 200 ms. (ENG-QNN-142) |
+| INV-164 | SiluMul는 production `.cl` 수정 없이 intermediate alias 패턴으로 graph-safe. (ENG-QNN-120) |
+| INV-165 | Q4_0 weight는 `MemoryObjectSpec::RawBytes(block_size=18)`로 노출. (ENG-QNN-104) |
+
+상세는 `spec/41-invariants.md` §3.23 참조.
+
+### B.10 Sub-task Pass-gate Map (M2.1 ~ M2.6)
+
+| Sub-task | 산출물 | 검증 게이트 | 통과 조건 |
+|----------|--------|------------|----------|
+| M2.1 Q4_0 GEMV op | `ops/matmul_q4_0_f32.rs` + RawBytes abstraction | unit test (host) | qkv 단일 op accuracy max_abs_err < 1e-3 |
+| M2.2 Rope + KvScatter op | `ops/rope.rs`, `ops/kv_scatter.rs` | unit test (host/device) | scalar pos arg 정상 갱신, F32→F16 cast 정확 |
+| M2.3 FlashAttn op | `ops/flash_attn.rs` | device test | max-padded mask attention vs CPU 참조 max_abs_err < 1e-2 |
+| M2.4 SiluMul intermediate alias | `args.rs::ArgSpec::OutputTensorAliased` | device test | graph 안에서 host-readable output 생성 + accuracy 보존 |
+| M2.5 Layer graph builder | `graph/layer.rs::build_layer_graph` | accuracy + finalize gate | INV-161, INV-163 PASS |
+| M2.6 TBT + memory gate | `bin/microbench_qnn_layer_graph.rs` | device microbench | INV-162, INV-143 PASS |
+
+> 본 게이트 모두 PASS 시 M3 (backend trait 통합) 진입 가능.
+
+### B.11 M3 진입 전 한계
+
+- **Multi-layer graph 미지원**: 1 layer 단위 build/execute만 검증. 16 layer 모두 동일 graph 재사용 가능 여부는 M3 검증 사항.
+- **Dynamic shape 미지원**: KV cache는 max-padded only. prefill (variable seq_len) 경로는 M3 이후.
+- **Backend trait 미통합**: production `Backend` trait의 op 라우팅이 OpPackage graph로 분기하지 않음. `generate` 바이너리에서 호출 불가.
+- **Multi-quantization 미지원**: Q4_0만. Q8_0/Q5_K는 별도 RawBytes variant 필요.
+
+### B.12 Examples (non-normative)
+
+```rust
+// Layer graph 사용 (개념)
+let graph = qnn_oppkg::graph::build_layer_graph(
+    &weights[layer_idx],
+    &kv_cache_handles,
+    layer_idx,
+)?;
+qnn_oppkg::graph::execute(graph, &x, pos)?;
+// kv_cache_handles는 in-place로 갱신됨
+```
+
+```bash
+# 디바이스 microbench
+python scripts/run_device.py -d s25 build -p qnn_oppkg --bin microbench_qnn_layer_graph
+python scripts/run_device.py -d s25 exec microbench_qnn_layer_graph -- --layers 1 --iters 100
+```
+
+## 부록 C. QNN-GPU OpPackage M3 Backend (2026-05-10)
+
+> **TL;DR**: M2 layer graph cdylib 자산을 production engine의 `Backend` trait 신규 구현체 `QnnOppkgBackend`로 통합한다. `engine/src/backend/qnn_oppkg/`에 신규 모듈, `--backend qnn_oppkg | qnngpu` opt-in flag, 28× layer graph cache, rpcmem-backed KV. **Pass-gate**: 32-token greedy decode token sequence가 OpenCL backend와 100% 일치 + TBT ≤ 1.20× (GREEN ≤1.10× / YELLOW 1.10~1.20×). M2 INV-160(production change == 0)은 본 단계에서 자연 만료한다.
+
+### C.1 정의
+
+| 용어 | 정의 |
+|------|------|
+| **qnn_oppkg backend** | `engine/src/backend/qnn_oppkg/` 신규 모듈. `Backend` trait을 OpenCL과 동일 시그니처로 구현하며, fast path는 `execute_layer_graph`를 통해 M2 cdylib의 layer graph를 1회 dispatch한다. |
+| **Layer graph cache** | model load 시점에 `N`개 layer (Qwen2.5-1.5B의 경우 28) 각각에 대해 1회 `graphFinalize` 후 `Vec<Arc<LayerGraph>>` 형태로 process lifetime 동안 재사용하는 캐시. eager prebuild (D1 결정). |
+| **execute_layer_graph fast path** | `Backend` trait의 신규 method. transformer.rs `forward_into` layer loop에서 `supports_layer_graph()`가 true이면 trait method 1회 호출로 layer 1개의 14 op을 dispatch. 기존 trait method (matmul/rope/etc)는 fallback 경로로만 잔존. |
+| **rpcmem KV** | Phase R R-A2/R-Y에서 검증된 DMA-BUF heap allocator. fd→mmap host pointer로 graph 외부 노출과 host-side eviction/quant 정책 동시 가능. |
+| **Backend secondary** | `--switch-hw` round-trip을 위해 qnn_oppkg backend가 OpenCL backend를 secondary로 보유. CPU fallback은 본 단계에서 별도. |
+
+### C.2 Backend Module 산출물 [ENG-QNN-201 ~ ENG-QNN-210]
+
+**[ENG-QNN-201]** `engine/src/backend/qnn_oppkg/` 디렉토리를 신규 추가한다. `QnnOppkgBackend`는 `Backend` trait의 모든 필수 method (`matmul`, `matmul_transposed`, `rms_norm`, `rms_norm_oop`, `rope_inplace`, `attention_gen`, `kv_scatter_f32_to_f16_batch`, `flash_attention_prefill`)를 OpenCL backend와 동일 시그니처로 구현한다. *(MUST)*
+
+**[ENG-QNN-202]** Backend dispatch는 `--backend qnn_oppkg | qnngpu` flag로 활성화한다. default off (opt-in). flag 미지정 시 OpenCL/CPU/CUDA 동작은 변경되지 않는다. `feature = "qnn"` cargo flag가 활성일 때만 dispatch에 등장한다. *(MUST)*
+
+**[ENG-QNN-203]** Layer graph cache는 model load 시점에 `N` layer × `graphFinalize` 1회 후 process lifetime 동안 재사용한다. 캐시 invalidation은 weight swap path에서만 발동(M4 영역). `N`은 model 메타데이터의 `n_layers`로 결정 (Qwen2.5-1.5B = 28). *(MUST)*
+
+**[ENG-QNN-204]** KV cache는 rpcmem(DMA-BUF heap)-backed buffer로 alloc되며 mmap된 host pointer를 graph builder의 `KvCacheHandle`에 전달한다. 16 layer × `[1, kv_heads, 2048, head_dim] F16` shape (= layer당 ~1 MB at kv_heads=2, head_dim=128 → 합 ~16 MB)을 보유. M2 INV-159 max-padded fixed shape를 그대로 보존한다. *(MUST)*
+
+**[ENG-QNN-205]** Weight buffer는 `LayerSlot` (`engine/src/models/weights/slot.rs`) snapshot에서 source pointer를 추출하여 graph build 시점에 weight handle로 baked. swap (LayerSlot generation 변경) 발생 시 graph weight handle rebind가 필요하나, M3 단계에서는 swap을 차단(또는 LayerSlot generation 고정 가정)하고, M4 chunk dispatcher가 rebind 정책을 다룬다. *(MUST)*
+
+**[ENG-QNN-206]** Backend secondary는 OpenCL backend로 둔다. `SwitchHw` round-trip 시 qnn_oppkg primary ↔ OpenCL secondary 사이를 이동할 수 있어야 한다. CPU secondary는 본 단계 범위 외 (Qwen NEON path 미검증, MEMORY 참조). *(SHOULD)*
+
+**[ENG-QNN-207]** `transformer.rs::forward_into` layer loop는 `backend.supports_layer_graph()`가 true이면 `backend.execute_layer_graph(layer_idx, &x, &mut kv_cache, pos, &mut x_out)` 1회 호출로 layer 1개를 처리한다. trait method (matmul 등) 호출은 fallback debug 경로로만 남으며, fast path 정상 동작 시 호출 횟수는 0이어야 한다. *(MUST)*
+
+**[ENG-QNN-208]** Prefill (variable seq_len) 경로는 본 단계 범위 외이며 OpenCL backend로 fallback한다 (`--qnn-prefill-fallback opencl`, default 동작). decode-only가 본 단계 범위. *(MUST)*
+
+**[ENG-QNN-209]** `graphFinalize`는 layer당 ≤ 200 ms (INV-163 보존), N=28 layer 직렬 build 시 model load wall-clock 증가량 ≤ ~33 s. eager prebuild (default true, `--qnn-graph-cache-prebuild=true`)가 D1 결정에 따라 채택된다. *(MUST)*
+
+**[ENG-QNN-210]** Attention mask는 host에서 매 token mask buffer만 갱신 후 graph push하는 M2 검증 패턴(D2 결정)을 그대로 사용한다. mask buffer는 model load 시 1회 alloc하여 process lifetime 동안 재사용하며, 매 token에서 `mask[pos]`만 update한다. *(SHOULD)*
+
+### C.3 Backend trait 신규 method [ENG-QNN-211 ~ ENG-QNN-220]
+
+**[ENG-QNN-211]** `Backend` trait에 다음 두 method를 추가한다. 둘 다 default 구현을 가져 기존 backend(CPU/OpenCL/CUDA)는 변경 없이 컴파일된다. *(MUST)*
+
+```rust
+fn supports_layer_graph(&self) -> bool { false }
+
+fn execute_layer_graph(
+    &self,
+    layer_idx: usize,
+    x: &Tensor,
+    kv_cache: &mut KVCache,
+    pos: usize,
+    x_out: &mut Tensor,
+) -> Result<()> {
+    bail!("backend does not implement execute_layer_graph")
+}
+```
+
+**[ENG-QNN-212]** `supports_layer_graph()`는 idempotent하며 backend 내부 cache 상태에 의존하지 않는다 (model load 후 항상 true 또는 항상 false). transformer.rs는 forward 진입 시점에 1회만 호출하여 분기 결정. *(MUST)*
+
+**[ENG-QNN-213]** `execute_layer_graph`의 사전조건: (a) `layer_idx < n_layers`, (b) `kv_cache`는 INV-159 shape 준수, (c) `pos < 2048`, (d) `x.shape == [1, dim]` F32, (e) `x_out.shape == [1, dim]` F32. 위반 시 `Err`. *(MUST)*
+
+**[ENG-QNN-214]** `execute_layer_graph`의 사후조건: (a) `kv_cache_k[layer_idx][pos]` / `kv_cache_v[layer_idx][pos]` 갱신, (b) `x_out`에 layer 출력 기록, (c) `pos`는 caller가 layer loop 후 increment (backend는 변경하지 않음). INV-014/018 보존. *(MUST)*
+
+**[ENG-QNN-215]** `execute_layer_graph`는 caller 측 `&mut KVCache` 참조의 lifetime 동안만 KV buffer에 접근한다. graph cache는 KV buffer 소유권을 갖지 않는다 (M2 INV-114 정신 보존). *(MUST)*
+
+**[ENG-QNN-216]** trait fallback 호출 instrumentation: qnn_oppkg backend는 fast path 활성 상태에서 `matmul`/`rope_inplace`/`attention_gen`/`kv_scatter_*` 호출 시 debug build에서 panic하거나 release build에서 metric 카운트한다. instrumentation count > 0은 RED 신호 (graph fast path 미발동). *(SHOULD)*
+
+**[ENG-QNN-217]** `enqueue_write_async`/`wait_event_blocking`/`supports_async_transfer` 3 method는 M4 chunk dispatcher가 활용한다. qnn_oppkg backend는 본 단계에서 OpenCL backend의 구현을 위임(secondary backend 경유) 또는 자체 cl_event 큐를 보유한다. M3 단계 선택은 구현 단계 결정사항. *(SHOULD)*
+
+**[ENG-QNN-218]** `invalidate_noshuffle_soa_registry`/`ensure_noshuffle_soa_registered`/`alloc_pre_converted_soa_tensor` 3 weight swap hook은 본 단계에서 noop 또는 secondary backend로 위임한다. M4 chunk swap path가 graph weight rebind 정책을 결정 후 본격 활용. *(SHOULD)*
+
+**[ENG-QNN-219]** Backend dispatch는 `--backend` flag의 default fallback (`_ => bail!("Unknown backend")`)을 보존한다. `qnn_oppkg | qnngpu`는 `feature = "qnn"`이 활성 + flag가 명시 지정된 경우에만 dispatch된다. unknown backend는 여전히 `bail!`한다. *(MUST)*
+
+**[ENG-QNN-220]** `--backend qnn_oppkg`에 대한 CLI Args 추가: (a) `--qnn-graph-cache-prebuild` (default true, D1), (b) `--qnn-allow-fallback` (default false, fast path 실패 시 OpenCL fallback 허용 여부, debug 용도). *(SHOULD)*
+
+### C.4 Layer Graph Contract [ENG-QNN-221 ~ ENG-QNN-230]
+
+**[ENG-QNN-221]** Layer graph는 14 op nodes로 구성된다 (M2 INV-158의 13에서 +1 — RoPE OOP를 Q/K 각각 분리 + Add residual 2개 명시). *(MUST)*
+
+```
+1. RmsNormPre(x) → x_norm
+2. MatMulQ40F32(x_norm, Wq) → q
+3. MatMulQ40F32(x_norm, Wk) → k
+4. MatMulQ40F32(x_norm, Wv) → v
+5. RopeOOP(q, pos) → q_rot           (kernel_rope_simple_oop)
+6. RopeOOP(k, pos) → k_rot           (kernel_rope_simple_oop)
+7. KvScatter(k_rot → KV_K, pos)      (multi-output: KV slot WRITE)
+8. KvScatter(v    → KV_V, pos)
+9. FlashAttn(q_rot, KV_K, KV_V, mask, pos) → attn_out
+10. MatMulQ40F32(attn_out, Wo) → o_proj
+11. Add(x, o_proj) → r1
+12. RmsNormPost(r1) → ffn_in
+13. (Gate/Up/SiluMul/Down 합성 노드 또는 4개 분리)
+14. Add(r1, ffn_out) → y
+```
+
+> 13의 Gate/Up/SiluMul/Down은 op fusion 결정에 따라 1~4 nodes. INV-185는 **build-time** const `LAYER_NODE_COUNT == 14`를 강제하며, fusion 선택이 14를 위반하면 const도 함께 갱신해야 한다.
+
+**[ENG-QNN-222]** RoPE는 production `rope_inplace` 대신 `kernel_rope_simple_oop` (M2.B에서 OpPackage 호환을 위해 추가된 OOP variant)을 사용한다. 이는 M2 단계에서 `engine/kernels/simple_ops.cl`에 추가되었으므로 INV-157을 위반하지 않는다. *(MUST)*
+
+**[ENG-QNN-223]** KvScatter는 multi-output (k_rot → KV_K, v → KV_V) 패턴을 사용한다. 두 KV slot은 graph external buffer (rpcmem-backed, ENG-QNN-204) 이며 graph 내부 tensor가 아니다. 동일 buffer를 graph 안에서 read-after-write 하는 FlashAttn 노드의 input edge로 연결할 때 SDK가 hazard를 자동 처리해야 한다 (M2.E에서 검증). *(MUST)*
+
+**[ENG-QNN-224]** SiluMul은 M2 INV-164의 `OutputTensorAliased` 패턴을 그대로 사용한다. SDK가 옵션 C를 거부하면 옵션 B (silu_oop + mul_oop 2단계 분해) fallback 발동. *(MUST)*
+
+**[ENG-QNN-225]** KV layout view transform: production KVCache는 HeadMajor `[head, pos, dim]` cl_mem stride를 가지며, graph 입력은 `[1, kv_heads, 2048, head_dim]` shape를 기대한다. stride가 동일한 메모리 layout이므로 **buffer reshape 비용 0**의 view transform만으로 입력 전달이 가능해야 한다. 위반 시 (메모리 copy 필요) RED. *(MUST)*
+
+**[ENG-QNN-226]** Layer graph 입출력 인터페이스는 M2 ENG-QNN-110의 표를 그대로 재사용한다. 단, `weights_*` static 입력은 28 layer 각각의 LayerSlot snapshot에서 추출된다. *(MUST)*
+
+**[ENG-QNN-227]** `pos: i32` scalar arg는 매 forward call마다 graph executor가 갱신한다 (M2 ENG-QNN-105). RoPE Q/K, KvScatter K/V, FlashAttn 5 노드가 동일 pos를 공유한다. *(MUST)*
+
+**[ENG-QNN-228]** Attention mask buffer는 model load 시 1회 alloc된 `[2048] F16` 또는 `[1, 2048] F32` (production reference와 동일 dtype)이며, 매 token에서 `mask[pos]`에 valid mark를 push한다. mask buffer는 graph 외부 alloc + APP_WRITE. *(SHOULD)*
+
+**[ENG-QNN-229]** Q4_0 weight tensor는 M2 INV-165 (`MemoryObjectSpec::RawBytes { block_size: 18, element_count: N/32 }`)를 그대로 사용한다. weight handle은 LayerSlot snapshot의 cl_mem (또는 rpcmem) 주소를 가리키며 graph build 시점에 baked. *(MUST)*
+
+**[ENG-QNN-230]** Layer graph는 `crates/qnn_oppkg::graph::layer::build_layer_graph`를 직접 재사용한다 (M2 산출물). engine 측은 caller 위치만 변경되며 graph builder 자체는 수정하지 않는다. *(MUST)*
+
+### C.5 Pass Gate [ENG-QNN-231 ~ ENG-QNN-240]
+
+**[ENG-QNN-231]** **Accuracy gate (절대)**: Qwen2.5-1.5B Q4_0 GGUF, 32-token greedy decode (top-1, 동일 RNG seed=42, 동일 prompt), `--backend qnn_oppkg`로 생성된 token sequence가 `--backend opencl` 결과와 100% 일치한다. 1개 token이라도 다르면 RED. *(MUST)*
+
+**[ENG-QNN-232]** **Single-layer accuracy gate**: layer 0 isolation 시 OpenCL backend의 layer 0 출력 `y` 대비 `max_abs_err < 1e-2` (F16 tolerance). M2 INV-161의 production 확장. *(MUST)*
+
+**[ENG-QNN-233]** **TBT gate**: Galaxy S25, 동일 prompt 5회 평균 (warm-up 3회 제외), wall-clock 측정. baseline = `--backend opencl` decode TBT. (a) GREEN ≤ 1.10×, (b) YELLOW 1.10×~1.20×, (c) RED > 1.20×. RED 시 사용자 호출. *(MUST)*
+
+**[ENG-QNN-234]** **VmRSS gate**: 32-token decode 후 `/proc/self/status::VmRSS` ≤ baseline × 1.10. baseline은 `--backend opencl` 기준. 추가 비용 = rpcmem KV (~16 MB) + graph metadata (~100 MB) + secondary OpenCL context (~수십 MB). *(MUST)*
+
+**[ENG-QNN-235]** **VmRSS slope gate**: 32-token decode 동안 token당 VmRSS 증가 < 50 KB/token. INV-155 v2 secondary tier (3 KB/iter)와는 다른 영역 (token 단위 leak detector). *(SHOULD)*
+
+**[ENG-QNN-236]** **graphFinalize gate**: layer당 ≤ 200 ms (M2 INV-163 보존). 28 layer 직렬 build wall-clock ≤ 33 s. *(MUST)*
+
+**[ENG-QNN-237]** **Regression gate**: `cargo test --workspace --features opencl` (qnn 비활성) 0건 회귀. `cargo test --workspace --features qnn,opencl` 도 0건 회귀 (qnn enable이지만 backend 미선택 시 OpenCL 정상). INV-169 검증 핵심 게이트. *(MUST)*
+
+**[ENG-QNN-238]** **OpenCL TBT 무회귀 gate**: `--backend opencl` decode TBT가 M3.0 진입 직전 baseline 대비 ≤ 1.05× (5% tolerance). Backend trait 신규 method 추가가 hot path overhead를 도입하지 않음을 검증. *(MUST)*
+
+**[ENG-QNN-239]** **Trait fallback count gate**: qnn_oppkg backend로 32 token decode 후 trait method (matmul/rope/etc) 호출 instrumentation count == 0. fast path 정상 발동 검증. *(SHOULD)*
+
+**[ENG-QNN-240]** TBT 측정은 wall-clock only (`CL_QUEUE_PROFILING_ENABLE`/`--profile-events` 금지, M2 ENG-QNN-141 정신 보존). 6T 스레드만 사용 (Galaxy S25 벤치 가이드). *(MUST)*
+
+### C.6 Constraints
+
+**[ENG-QNN-C20]** `--backend qnn_oppkg`는 default off. unknown backend 거부 (`bail!`)는 그대로 유지된다. *(MUST)* (INV-170)
+
+**[ENG-QNN-C21]** M3 단계에서 Q4_0 weight 외 quantization (Q8_0/Q5_K/F16) 지원은 범위 외이며 OpenCL backend로 fallback한다. M2 ENG-QNN-C14 보존. *(MUST)*
+
+**[ENG-QNN-C22]** prefill (variable seq_len)은 본 단계 범위 외 — OpenCL backend로 fallback. M2 ENG-QNN-C12/C13 보존. *(MUST)*
+
+**[ENG-QNN-C23]** D7 결정에 따라 production 변경은 최소화하되, 필요 시 `engine/kernels/*.cl` 포함 수정 가능. 단 OpenCL backend 정확성/TBT 무회귀 (INV-169)가 핵심 게이트로 작동. M2 INV-160 (production change == 0)는 본 단계에서 자연 만료. *(MUST)*
+
+**[ENG-QNN-C24]** `crates/qnn_oppkg/`의 host metadata (`LayerConfig` 등)에 대해 `engine` 크레이트가 cargo dependency edge를 형성한다. cdylib 자체 (binary artifact) 의존이 아닌 host-side rust crate 의존이며, INV-151 (cdylib ⊥ engine)의 본래 정신은 보존된다 — cdylib은 여전히 dlopen 산출물이고 engine bin은 cdylib을 link하지 않는다. *(MUST)*
+
+### C.7 Invariants
+
+| ID | 한줄 요약 |
+|----|-----------|
+| INV-166 | qnn_oppkg backend는 `Backend` trait의 모든 필수 method를 OpenCL과 동일 시그니처로 구현. (ENG-QNN-201) |
+| INV-167 | Layer graph는 N(=28)회 graphFinalize 후 process lifetime 동안 재사용. invalidation은 weight swap path에서만. (ENG-QNN-203) |
+| INV-168 | KV cache shape는 M2와 동일 `[1, kv_heads, 2048, head_dim] F16` max-padded. M3 dynamic seq_len 미지원. (ENG-QNN-204, INV-159 보존) |
+| INV-169 | OpenCL backend 정확성/TBT 무회귀 — `cargo test --workspace --features opencl` 0건 + `--backend opencl` decode TBT ≤ 1.05× baseline. (ENG-QNN-237/238) |
+| INV-170 | `--backend qnn_oppkg`는 default off. unknown backend는 `bail!`. (ENG-QNN-219, ENG-QNN-C20) |
+| INV-171 | KV cache는 rpcmem(DMA-BUF heap)-backed + host pointer expose. (ENG-QNN-204) |
+| INV-172 | Qwen2.5-1.5B Q4_0 32-token greedy decode = OpenCL backend top-1 token sequence 100% 일치. (ENG-QNN-231) |
+| INV-173 | TBT 측정은 wall-clock only (`--profile-events` 금지). (ENG-QNN-240) |
+| INV-174 | qnn_oppkg backend의 `supports_layer_graph()`는 model load 후 항상 true 또는 항상 false (idempotent). (ENG-QNN-212) |
+| INV-175 | qnn_oppkg backend로 32 token decode 후 trait method (matmul/rope/etc) 호출 count == 0 (fast path 발동 보증). (ENG-QNN-239) |
+| INV-176 | Layer graph node 수 == 14 (M2의 13에서 +1, build-time const `LAYER_NODE_COUNT`와 동기화). (ENG-QNN-221) |
+| INV-177 | KV layout view transform은 buffer copy 비용 0 — production HeadMajor stride와 graph 입력 stride 동일. (ENG-QNN-225) |
+| INV-178 | 32-token decode 동안 VmRSS slope < 50 KB/token. (ENG-QNN-235) |
+| INV-179 | TBT GREEN ≤ 1.10× / YELLOW 1.10~1.20× / RED > 1.20× (Galaxy S25, 5회 평균, warm-up 3회 제외). (ENG-QNN-233) |
+| INV-180 | qnn_oppkg backend는 `crates/qnn_oppkg`의 host metadata에 cargo dependency edge를 형성하지만, cdylib binary는 dlopen 산출물로 engine binary가 link하지 않는다. (ENG-QNN-C24, INV-151 본래 정신 보존) |
+
+상세는 `spec/41-invariants.md` §3.24 참조.
+
+### C.8 Examples (non-normative)
+
+```bash
+# qnn_oppkg backend로 32-token greedy decode
+python scripts/run_device.py -d s25 generate -- \
+    --backend qnn_oppkg \
+    --model-path models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf \
+    --prompt-file fixtures/prompt_a.txt \
+    --max-new-tokens 32 \
+    --seed 42
+
+# accuracy 비교 (vs OpenCL)
+diff \
+  <(... --backend opencl ... --max-new-tokens 32 --seed 42) \
+  <(... --backend qnn_oppkg ... --max-new-tokens 32 --seed 42)
+# 빈 diff 이면 INV-172 PASS
+```
+
+### C.9 Rationale (non-normative)
+
+- **왜 layer graph 단위 dispatch인가**: M2에서 검증된 14-node single-layer graph는 transformer.rs forward_gen 1 layer와 1:1 매핑된다. graph 단위 dispatch는 (a) trait method 호출 overhead 제거, (b) QNN graph optimizer (kernel fusion 등) 활용, (c) layer 단위 weight swap hook 자연 정렬을 모두 얻는다.
+- **왜 default off인가**: M3 단계는 OpenCL backend의 무회귀가 핵심 게이트다. opt-in flag로 선택적 활성하여 회귀 위험을 격리한다.
+- **왜 INV-160 약화인가**: M2까지 production 변경 0이 외형적 격리 보증이었으나, M3은 backend trait 통합이 본질이므로 trait 신규 method 추가가 불가피. 대체 게이트(INV-169 무회귀)가 동일 정신을 보존한다.
+- **왜 eager prebuild인가**: 28 layer × graphFinalize ~33s를 매 token 첫 사용 시점에 분산하면 lazy compilation cache miss로 인한 TBT spike를 유발. eager는 초기 load wall-clock을 희생하여 production-grade decode TBT를 확보. D1 결정.
+
+## 부록 D. QNN-GPU OpPackage M4 Async Swap (2026-05-10, placeholder)
+
+> **TL;DR**: M3 layer graph cache 자산을 활용하여 14-node DAG의 정적 phase analyzer + chunk swap dispatcher를 도입한다. cache-fit phase 진입 시 weight chunk를 `enqueue_write_async`로 dispatch하고 DDR-heavy phase 시작 직전에 wait. 본 부록은 M3.4 메인 게이트 통과 후 본격 채워지며, 여기서는 M3 단계에서 미리 잡아두어야 할 seam ID와 placeholder만 명시한다.
+
+### D.1 정의 (placeholder)
+
+| 용어 | 정의 |
+|------|------|
+| **Phase analyzer** | 14-node static DAG를 DDR-heavy 7개 / cache-fit 9개로 분류하는 build-time const table. runtime 비용 0. |
+| **Chunk swap dispatcher** | weight tensor를 1/2/4/8/16 MB chunk로 분할하여 cache-fit phase 동안 `enqueue_write_async`로 dispatch + DDR-heavy phase 직전 `wait_event_blocking`. |
+| **Hide ratio** | `1 - (overlapped time / forward time)`. swap pause time을 forward 동안 얼마나 가려냈는지 비율. |
+| **Graph weight rebind** | chunk swap으로 GPU-side weight buffer 주소가 변경된 경우, graph cache의 weight handle을 업데이트하는 SDK 호출 (옵션 A) 또는 graph 재build (옵션 B fallback). |
+
+### D.2 신규 ID 예약 [ENG-QNN-301 ~ ENG-QNN-320]
+
+| ID | placeholder |
+|----|-------------|
+| ENG-QNN-301 | Phase analyzer (14-node static DAG) DDR-heavy 7 nodes / cache-fit 9 nodes 분류 |
+| ENG-QNN-302 | Chunk swap dispatcher — chunk size sweep {1, 2, 4, 8, 16} MB, default 4 MB 가설 |
+| ENG-QNN-303 | Hide ratio ≥ 20% 1점 PASS 게이트 (M4 메인) |
+| ENG-QNN-304 | `Backend::enqueue_write_async` + `wait_event_blocking` 활용 |
+| ENG-QNN-305 | Phase 6.5 인프라 재사용 (LayerSlot/SecondaryMmap/IntraForwardSwapHook 확장/SwapExecutor `build_chunk_from_mmap_async` 추가) |
+| ENG-QNN-306 | Graph weight handle rebind 정책 (옵션 A SDK API / 옵션 B 재build, M4.1 spike 후 결정) |
+| ENG-QNN-307 | Chunk swap은 qnn_oppkg backend 한정. CPU/OpenCL은 NoOp fallback |
+| ENG-QNN-308 ~ ENG-QNN-320 | M4.1~M4.3 단계 진입 시 본문 채움 |
+
+### D.3 Invariants (placeholder)
+
+| ID | 한줄 요약 |
+|----|-----------|
+| INV-181 | Chunk swap은 qnn_oppkg backend 한정. CPU/OpenCL은 NoOp fallback. |
+| INV-182 | Chunk dispatch 시작은 cache-fit phase 진입 시점. DDR-heavy phase에서는 dispatch 금지. |
+| INV-183 | Chunk size sweep = {1, 2, 4, 8, 16} MB. |
+| INV-184 | Phase analyzer는 14-node static DAG 기반 const table — runtime 비용 0. |
+| INV-185 | `LAYER_NODE_COUNT == 14` (qnn_oppkg::graph) 동기화 build-time check. |
+| INV-186 | `wait_event_blocking`은 다음 token decode 시작 전에 호출 (forward 도중 main queue 비차단). |
+| INV-187 | Hide ratio ≥ 20% 1점에서라도 PASS면 GREEN. |
+| INV-188 | Swap on/off 토큰 시퀀스 100% 일치 (정확성). |
+
+상세는 `spec/41-invariants.md` §3.25 참조.
+
+### D.4 Constraints (placeholder)
+
+본 부록의 본문은 M4.0 진입 시 (M3.4 메인 게이트 통과 + Auto-Gate) 채운다. `arch/weight_swap.md` §11에 컴포넌트 도식만 placeholder로 작성.

@@ -829,36 +829,90 @@ kernel void kernel_rope_simple(
     // x is [batch, seq, num_heads, head_dim]
     // Each work item processes one (i, i+head_dim/2) pair
     int gid = get_global_id(0);
-    
+
     int half_dim = head_dim / 2;
     int elements_per_seq = num_heads * head_dim;
     int pairs_per_seq = num_heads * half_dim;
-    
+
     // Decode gid into (seq_idx, head_idx, pair_idx)
     int seq_idx = gid / pairs_per_seq;
     int in_seq = gid % pairs_per_seq;
     int head_idx = in_seq / half_dim;
     int pair_idx = in_seq % half_dim;
-    
+
     int pos = start_pos + seq_idx;
-    
+
     // Calculate frequency for this pair
     float freq = 1.0f / pow(theta, (float)(pair_idx * 2) / (float)head_dim);
     float angle = (float)pos * freq;
-    
+
     float cos_val = cos(angle);
     float sin_val = sin(angle);
-    
+
     // Calculate indices into the tensor (neox layout: first half and second half of head)
     int base_offset = seq_idx * elements_per_seq + head_idx * head_dim;
     int i0 = base_offset + pair_idx;
     int i1 = base_offset + pair_idx + half_dim;
-    
+
     float x0 = x[i0];
     float x1 = x[i1];
-    
+
     x[i0] = x0 * cos_val - x1 * sin_val;
     x[i1] = x0 * sin_val + x1 * cos_val;
+}
+
+// Out-of-place variant of kernel_rope_simple: writes to x_out instead of
+// mutating x_in. Each thread (= 1 pair) reads (x_in[i0], x_in[i1]) and writes
+// the rotated values to (x_out[i0], x_out[i1]). Layout is identical, so
+// every element of x_out is covered by exactly one thread (i0/i1 pair).
+//
+// Used by the QNN OpPackage `CustomRope` op (M2.H): the SDK's chain-composition
+// path requires the graph-level output edge to be a distinct buffer from the
+// input. The in-place variant works for stand-alone single-op execution but
+// breaks when downstream ops consume the output via a separate allocation.
+//
+// M3.4 D-D.1: `start_pos` is now read from `pos_buf[0]` instead of being a
+// SCALAR op param. Reason: QNN_PARAMTYPE_SCALAR is baked into the graph at
+// finalize time, which prevents multi-token decode (every token would use the
+// build-time pos value). Reading from a buffer makes pos a runtime input.
+kernel void kernel_rope_simple_oop(
+    global const float * x_in,
+    global float * x_out,
+    global const int * pos_buf,
+    int head_dim,
+    int num_heads,
+    int seq_len,
+    float theta
+) {
+    int gid = get_global_id(0);
+
+    int half_dim = head_dim / 2;
+    int elements_per_seq = num_heads * head_dim;
+    int pairs_per_seq = num_heads * half_dim;
+
+    int seq_idx = gid / pairs_per_seq;
+    int in_seq = gid % pairs_per_seq;
+    int head_idx = in_seq / half_dim;
+    int pair_idx = in_seq % half_dim;
+
+    int start_pos = pos_buf[0];
+    int pos = start_pos + seq_idx;
+
+    float freq = 1.0f / pow(theta, (float)(pair_idx * 2) / (float)head_dim);
+    float angle = (float)pos * freq;
+
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    int base_offset = seq_idx * elements_per_seq + head_idx * head_dim;
+    int i0 = base_offset + pair_idx;
+    int i1 = base_offset + pair_idx + half_dim;
+
+    float x0 = x_in[i0];
+    float x1 = x_in[i1];
+
+    x_out[i0] = x0 * cos_val - x1 * sin_val;
+    x_out[i1] = x0 * sin_val + x1 * cos_val;
 }
 
 kernel void kernel_scale_simple(
@@ -943,6 +997,24 @@ kernel void kernel_silu_mul_simple(
         float4 val = x[i];
         float4 sigmoid = 1.0f / (1.0f + exp(-val));
         x[i] = val * sigmoid * y[i];
+    }
+}
+
+// Out-of-place variant of kernel_silu_mul_simple: out[i] = silu(x[i]) * y[i].
+// Used by the QNN OpPackage `CustomSiluMul` op (M2.H): the SDK requires the
+// graph-level output edge to be a distinct buffer from inputs for chain
+// composition.
+kernel void kernel_silu_mul_simple_oop(
+    global const float4 * x,
+    global const float4 * y,
+    global float4 * out,
+    int size4
+) {
+    int i = get_global_id(0);
+    if (i < size4) {
+        float4 val = x[i];
+        float4 sigmoid = 1.0f / (1.0f + exp(-val));
+        out[i] = val * sigmoid * y[i];
     }
 }
 
@@ -1245,6 +1317,42 @@ kernel void kernel_kv_scatter_f32_to_f16(
     int gid = get_global_id(0);
     int h = gid / head_dim;       // which head
     int d = gid % head_dim;       // which dim
+
+    // Source: seq-major [h * head_dim + d]
+    int src_idx = h * head_dim + d;
+
+    // Dest: head-major [h * capacity * head_dim + write_pos * head_dim + d]
+    int dst_idx = h * capacity * head_dim + write_pos * head_dim + d;
+
+    k_dst[dst_idx] = (half)k_src[src_idx];
+    v_dst[dst_idx] = (half)v_src[src_idx];
+}
+
+// ============================================================
+// Fused F32->F16 Cast + HeadMajor Scatter — pos-as-buffer variant
+// ============================================================
+// M3.4 D-D.1: identical to kernel_kv_scatter_f32_to_f16 but reads `write_pos`
+// from `pos_buf[0]` instead of taking it as an int scalar. Used by the QNN
+// OpPackage `CustomKvScatter` op so multi-token decode can update pos at
+// graph-execute time (SCALAR op params are baked at graph finalize).
+//
+// The original kernel_kv_scatter_f32_to_f16 is preserved for the OpenCL
+// backend (engine/src/backend/opencl/{mod,plan}.rs) which sets pos via
+// kernel arg per-call — that path doesn't have the QNN graph-finalize issue.
+kernel void kernel_kv_scatter_f32_to_f16_oop(
+    global const float * k_src,   // [kv_heads * head_dim] F32
+    global const float * v_src,   // [kv_heads * head_dim] F32
+    global const int * pos_buf,   // [1] int — pos_buf[0] = write_pos
+    global half * k_dst,          // [kv_heads, capacity, head_dim] F16 HeadMajor
+    global half * v_dst,          // [kv_heads, capacity, head_dim] F16 HeadMajor
+    int head_dim,
+    int capacity
+) {
+    int gid = get_global_id(0);
+    int h = gid / head_dim;       // which head
+    int d = gid % head_dim;       // which dim
+
+    int write_pos = pos_buf[0];
 
     // Source: seq-major [h * head_dim + d]
     int src_idx = h * head_dim + d;

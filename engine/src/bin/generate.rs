@@ -73,6 +73,119 @@ impl From<SecondaryDtypeArg> for llm_rs2::models::weights::SecondaryDtypeChoice 
     }
 }
 
+/// `--secondary-layout` CLI 인수 값.
+///
+/// AUF의 어떤 weights variant로 swap 후 텐서를 만들지 결정한다. 기본은
+/// `auto`로, 빌드 환경의 preferred variant(OpenCL→AdrenoSoa) 우선 + AUF에
+/// 그게 없으면 CpuAos로 폴백한다. `aos`는 강제로 CpuAos / CudaAos 사용해
+/// host pointer를 살려두므로 swap 후 `switch_hw cpu` / partition 호환이
+/// 가능하지만 GPU TBT가 SOA 대비 떨어진다 (Adreno 830 실측 33–55%).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondaryLayoutArg {
+    Auto,
+    Aos,
+    Soa,
+}
+
+fn parse_secondary_layout(s: &str) -> Result<SecondaryLayoutArg, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(SecondaryLayoutArg::Auto),
+        "aos" | "cpu_aos" | "cuda_aos" => Ok(SecondaryLayoutArg::Aos),
+        "soa" | "adreno_soa" => Ok(SecondaryLayoutArg::Soa),
+        other => Err(format!(
+            "unknown secondary-layout '{other}'. Valid values: auto, aos, soa"
+        )),
+    }
+}
+
+impl From<SecondaryLayoutArg> for llm_rs2::models::weights::SecondaryLayoutChoice {
+    fn from(arg: SecondaryLayoutArg) -> Self {
+        match arg {
+            SecondaryLayoutArg::Auto => Self::Auto,
+            SecondaryLayoutArg::Aos => Self::Aos,
+            SecondaryLayoutArg::Soa => Self::Soa,
+        }
+    }
+}
+
+/// Parse `--qcf-sample-layers` argument into a list of layer indices.
+///
+/// Accepts:
+/// - `"auto"` (default): `[0, n/4, n/2, 3n/4, n-1]` via `compute_auto_sample_layers`.
+/// - `"all"`: every layer `[0..n_layers)`.
+/// - `"0,8,16,24,31"`: explicit comma-separated indices (sorted + deduped).
+fn parse_qcf_sample_layers(spec: &str, n_layers: usize) -> Result<Vec<usize>, String> {
+    let s = spec.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+        return Ok(llm_rs2::core::qcf::compute_auto_sample_layers(n_layers));
+    }
+    if s.eq_ignore_ascii_case("all") {
+        return Ok((0..n_layers).collect());
+    }
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        match p.parse::<usize>() {
+            Ok(v) if v < n_layers => out.push(v),
+            Ok(v) => return Err(format!("layer index {v} >= n_layers={n_layers}")),
+            Err(e) => return Err(format!("failed to parse layer index '{p}': {e}")),
+        }
+    }
+    out.sort();
+    out.dedup();
+    if out.is_empty() {
+        return Err(format!("no valid layer indices in '{s}'"));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod parse_qcf_sample_layers_tests {
+    use super::*;
+
+    #[test]
+    fn auto_llama3_8b() {
+        assert_eq!(
+            parse_qcf_sample_layers("auto", 32).unwrap(),
+            vec![0, 8, 16, 24, 31]
+        );
+    }
+
+    #[test]
+    fn all_small() {
+        assert_eq!(parse_qcf_sample_layers("all", 4).unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn explicit() {
+        assert_eq!(
+            parse_qcf_sample_layers("0,8,16,24,31", 32).unwrap(),
+            vec![0, 8, 16, 24, 31]
+        );
+    }
+
+    #[test]
+    fn explicit_unsorted_dedup() {
+        assert_eq!(
+            parse_qcf_sample_layers("16,0,16,8", 32).unwrap(),
+            vec![0, 8, 16]
+        );
+    }
+
+    #[test]
+    fn out_of_range() {
+        assert!(parse_qcf_sample_layers("0,32", 32).is_err());
+    }
+
+    #[test]
+    fn empty_after_trim() {
+        assert!(parse_qcf_sample_layers(",", 4).is_err());
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -335,10 +448,6 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     streaming_window: usize,
 
-    /// Deprecated: recent window is now derived from budget split. Kept for CLI compatibility.
-    #[arg(long, default_value_t = 128, hide = true)]
-    h2o_recent_window: usize,
-
     /// Fraction of tokens to keep as heavy hitters (0.0 to 1.0)
     #[arg(long, default_value_t = 0.5)]
     h2o_keep_ratio: f32,
@@ -355,13 +464,15 @@ struct Args {
     #[arg(long, default_value_t = 0.75)]
     d2o_keep_ratio: f32,
 
-    /// D2O EMA old-threshold weight α (official default 0.5)
-    #[arg(long, default_value_t = 0.5)]
-    d2o_ema_alpha: f32,
-
-    /// D2O EMA new-mean weight β (official default 0.5)
-    #[arg(long, default_value_t = 0.5)]
+    /// D2O EMA smoothing factor β for threshold update (paper Eq.10, default 0.7).
+    /// τ_t = β · max U_t + (1−β) · τ_{t−1}.
+    #[arg(long, default_value_t = 0.7)]
     d2o_ema_beta: f32,
+
+    /// D2O Eq.11 normalisation constant `e` (paper default 0.1).
+    /// Controls retained token's self-weight: w_c = e / (Σ exp(u_i) + e).
+    #[arg(long, default_value_t = 0.1)]
+    d2o_merge_e: f32,
 
     /// Enable D2O layer-level dynamic allocation (uses per-layer attention variance from prefill)
     #[arg(long, default_value_t = false)]
@@ -664,6 +775,22 @@ struct Args {
     #[arg(long, default_value = "auto", value_parser = parse_secondary_dtype)]
     secondary_dtype: SecondaryDtypeArg,
 
+    /// AUF weights variant 선택 ("auto" | "aos" | "soa").
+    ///
+    /// `auto` (기본): feature flag 기반 preferred variant 우선 + AUF에 없으면
+    /// CpuAos 자동 폴백. OpenCL build에선 AdrenoSoa 우선.
+    ///
+    /// `aos`: 강제 AOS (`WEIGHTS_CPU_AOS` / `WEIGHTS_CUDA_AOS`). swap 후
+    /// `switch_hw cpu` / partition lazy-map / CPU forward가 정상 동작.
+    /// GPU TBT는 SOA 대비 30~50% 저하 (Adreno 830 실측).
+    ///
+    /// `soa`: 강제 SOA (`WEIGHTS_ADRENO_SOA`, OpenCL 전용). 가장 빠르지만
+    /// swap 후 host-pointer 부재로 switch_hw cpu / partition 호환 불가.
+    ///
+    /// GGUF secondary에선 무시됨.
+    #[arg(long, default_value = "auto", value_parser = parse_secondary_layout)]
+    secondary_layout: SecondaryLayoutArg,
+
     /// Explicit path to tokenizer.json. When omitted, the tokenizer is
     /// resolved automatically via the GGUF basename (e.g.
     /// `<dir>/<stem>.tokenizer.json`, then `<dir>/<stem-without-quant>.tokenizer.json`,
@@ -690,6 +817,149 @@ struct Args {
     /// Only used when `--qcf-dump` is set. Default: 256.
     #[arg(long, default_value_t = 256)]
     qcf_warmup_tokens: usize,
+
+    /// Enable experimental QCF metric dump for ARGUS analysis.
+    /// Adds qcf_per_head/qcf_caote_max/qcf_topk_retention_*/attention_entropy/
+    /// qcf_beta_amplified_*/qcf_per_layer/qcf_kivi_per_layer_* to eval-ll output.
+    /// Backward-compatible: existing qcf_caote/qcf_kivi_* fields unchanged.
+    #[arg(long, default_value_t = false)]
+    enable_qcf_experimental: bool,
+
+    /// Sample layer indices for multi-layer QCF (ARGUS #1).
+    /// Accepts: "auto" (default; [0, n/4, n/2, 3n/4, n-1]),
+    /// "all" (every layer; debug only), "0,8,16,24,31" (explicit).
+    #[arg(long, default_value = "auto")]
+    qcf_sample_layers: String,
+
+    /// β values for β-amplified CAOTE (ARGUS #6 option B).
+    /// Comma-separated, e.g., "1.0,1.5,2.0". Note: only β=1.0/1.5/2.0 are
+    /// dumped to fixed JSON keys. This flag is currently a placeholder for
+    /// future flexibility — the dumped values follow the fixed keys regardless.
+    #[arg(long, value_delimiter = ',', default_value = "1.0,1.5,2.0")]
+    qcf_betas: Vec<f32>,
+
+    /// K values for top-K retention (ARGUS #5).
+    /// Currently fixed [10, 20, 50] in dump; flag accepted for future use.
+    #[arg(long, value_delimiter = ',', default_value = "10,20,50")]
+    qcf_topk_values: Vec<usize>,
+
+    /// τ values for defensive aggregation. Fixed [0.1, 0.5] in dump.
+    #[arg(long, value_delimiter = ',', default_value = "0.1,0.5")]
+    qcf_defensive_taus: Vec<f32>,
+
+    /// Eagerly prefault the secondary weight file at model load to remove
+    /// per-swap prefault stage cost. Memory commit ≈ AUF size (e.g. 1.2 GB
+    /// for Qwen2.5-1.5B Q4_0). Default off; set when --secondary-gguf is
+    /// present and on-device app has memory headroom.
+    ///
+    /// When enabled: immediately after model weights are loaded, the full
+    /// secondary weight region is touched (madvise WILLNEED + explicit
+    /// page-touch). Subsequent swap invocations find all pages already in
+    /// the page cache, eliminating the ~328 ms cold-fault stage measured on
+    /// Galaxy S25 (§3.1, swap_overhead_s25.md).
+    ///
+    /// When `--secondary-gguf` is absent this flag is silently ignored.
+    #[arg(long, default_value_t = false)]
+    eager_prefault_secondary: bool,
+
+    /// Layer-Incremental Swap Stage 1 MVP (LISWAP-1, ENG-ALG-232~234, INV-144~146).
+    ///
+    /// Number of decoder layers to swap per decode token tick.
+    ///
+    /// `0` (default): single-shot path — all target layers are swapped at once
+    /// before generation, exactly as before. No behavior change.
+    ///
+    /// `>= 1`: incremental path — when `--force-swap-ratio` is set, instead of
+    /// swapping all target layers immediately, an `IncrementalSwapPlan` is
+    /// committed and the swap is distributed across decode tokens (N layers/tick).
+    ///
+    /// **Trade-off**: total swap latency increases by stage gate overhead
+    /// (~7.4 ms × N ticks on Galaxy S25), but user-perceived per-token stall
+    /// is bounded to `total_swap_latency / ceil(n_layers / per_tick)`.
+    ///
+    /// Example: 25 layers, per_tick=2 → 13 ticks × ~23 ms stall vs 290 ms
+    /// single-shot stall (9 frames vs 0 frames skipped at 30 fps).
+    ///
+    /// Requires `--force-swap-ratio` to be set. When absent, has no effect.
+    /// Per-tick > 0 with no `--force-swap-ratio`: silently ignored (no trigger).
+    #[arg(long, default_value_t = 0)]
+    swap_incremental_per_tick: usize,
+
+    /// LISWAP-2 prototype: Submit incremental swap chunks to a separate
+    /// transfer queue/stream so weight H2D writes overlap with the next
+    /// token's forward compute.
+    ///
+    /// Requires `--swap-incremental-per-tick > 0`. When `=0` or absent,
+    /// has no effect (silently ignored).
+    ///
+    /// Currently a prototype: measurement-driven decision on whether to
+    /// promote to production. See plan/compiled-chasing-hopper.md.
+    #[arg(long, default_value_t = false)]
+    swap_async_dispatch: bool,
+
+    /// LISWAP-3 prototype (Direction A): use a `CL_MEM_ALLOC_HOST_PTR` slot
+    /// pool for swap weight upload. Bypasses the driver staging copy by
+    /// running `clEnqueueMapBuffer(MAP_WRITE) → memcpy → Unmap` on a
+    /// pre-allocated zero-copy slot.
+    ///
+    /// **Default OFF**. Requires `LLMRS_OPENCL_HOST_PTR_POOL=1` env-gate
+    /// in addition to this flag — the env hard-disables the pool path
+    /// independently so the flag alone is insufficient (Stage 4
+    /// measurement-driven decision pending).
+    ///
+    /// Compatible with `--swap-incremental-per-tick > 0` and standalone
+    /// (single-shot `--force-swap-ratio`). Falls back to the staging path
+    /// when slots are exhausted, the env-gate is unset, the backend is
+    /// not OpenCL, or pool init fails. Plan: `compiled-chasing-hopper.md`
+    /// Direction A track, Stage 3.
+    #[arg(long, default_value_t = false)]
+    swap_zero_copy: bool,
+
+    /// LISWAP-3 prototype: number of slots in the `CL_MEM_ALLOC_HOST_PTR`
+    /// swap pool. Stage 2 measurement on Galaxy S25 (Qwen2.5-1.5B, 28
+    /// layers, 7 Q4_0 tensors per layer) reported a sweet spot at 14
+    /// slots (= 2 layers worth of in-flight work). Effective only with
+    /// `--swap-zero-copy` + `LLMRS_OPENCL_HOST_PTR_POOL=1`.
+    #[arg(long, default_value_t = 14)]
+    swap_pool_slots: usize,
+
+    /// Intra-forward Layer-aligned Swap (LISWAP-4, ENG-ALG-235~238,
+    /// INV-147~150).
+    ///
+    /// `false` (default): no-op — `forward_into` carries
+    /// `layer_boundary_hook = None` and the layer loop pays only one
+    /// `Option::is_some` branch per layer (INV-147 zero overhead).
+    ///
+    /// `true`: when `--force-swap-ratio` is set, an `IntraForwardSwapHook`
+    /// is committed and dispatches per-layer swap on the layer boundary.
+    /// Plan runs to completion across decode tokens; dispatcher drain +
+    /// `ratio_generation` bump occurs once on plan retire (INV-150).
+    ///
+    /// Mutually exclusive with `--swap-incremental-per-tick > 0`
+    /// (ENG-DAT-C18). CLI parser rejects the combination.
+    #[arg(long, default_value_t = false)]
+    swap_intra_forward: bool,
+
+    // ── QNN OpPackage backend (M3, ENG-QNN-220) ─────────────────
+    /// Eager prebuild of all 28 layer graphs at model load time
+    /// (ENG-QNN-209, D1 결정).
+    ///
+    /// `true` (default): model load 시점에 N×`graphFinalize` (≤ 200 ms/layer)
+    /// 직렬 실행. Decode 동안 추가 finalize는 0회 (INV-167).
+    /// `false`: lazy build (M3.5 timebox 미사용 시 진입 불가, debug 용도).
+    ///
+    /// 본 flag는 `--backend qnn_oppkg | qnngpu` 활성 시에만 유효하다.
+    #[arg(long, default_value_t = true)]
+    qnn_graph_cache_prebuild: bool,
+
+    /// Allow trait fallback path when graph fast path fails (ENG-QNN-220).
+    ///
+    /// `false` (default): fast path 실패 시 즉시 `Err`. INV-175 (fallback count
+    /// == 0) 게이트와 정합한다.
+    /// `true`: debug 용도 — fast path 실패 시 OpenCL secondary backend로
+    /// fallback. production 측정에서는 OFF 유지.
+    #[arg(long, default_value_t = false)]
+    qnn_allow_fallback: bool,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -730,12 +1000,28 @@ fn main() -> anyhow::Result<()> {
     // Sprint E forward_gen op-tracer: install atexit hook so the trace
     // dumps even on Ctrl+C / early-return paths. No-op when env unset.
     llm_rs2::profile::op_trace::install_atexit_once();
+    // Quality-cost profiler: gated by LLM_RS2_PROFILE_QUALITY=1.
+    llm_rs2::profile::quality_metrics::install_atexit_once();
     // T0: process start, before CLI parsing or any allocation.
     rss_trace("start");
 
     #[allow(unused_mut)]
     let mut args = Args::parse();
 
+    // ENG-DAT-C18: --swap-incremental-per-tick > 0 and --swap-intra-forward
+    // are mutually exclusive (LISWAP-1 vs LISWAP-4 — ratio_generation bump
+    // semantics conflict). Reject the combination explicitly so engine
+    // never starts in an ambiguous swap-policy state.
+    if args.swap_incremental_per_tick > 0 && args.swap_intra_forward {
+        anyhow::bail!(
+            "--swap-incremental-per-tick (= {}) and --swap-intra-forward (= true) \
+             are mutually exclusive (ENG-DAT-C18). Pick one:\n\
+             (a) --swap-incremental-per-tick=N --swap-intra-forward=false   (LISWAP-1)\n\
+             (b) --swap-incremental-per-tick=0 --swap-intra-forward=true    (LISWAP-4)\n\
+             (c) --swap-incremental-per-tick=0 --swap-intra-forward=false   (single-shot)",
+            args.swap_incremental_per_tick
+        );
+    }
     // Configure Rayon thread pool: 0 = auto-detect CPU cores
     let num_threads = if args.threads > 0 {
         args.threads
@@ -1021,6 +1307,102 @@ fn main() -> anyhow::Result<()> {
             let gpu: Arc<dyn Backend> = gpu_concrete;
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
         }
+        // ENG-QNN-202/INV-170: qnn_oppkg는 default off opt-in. feature 비활성 시
+        // 본 분기는 컴파일에서 제거되어 unknown backend로 빠진다.
+        #[cfg(feature = "qnn")]
+        "qnn_oppkg" | "qnngpu" => {
+            // QNN backend는 호스트(non-Android)에서 init 실패 → 명확한 Err 전파.
+            // 디바이스 빌드에서만 정상 진행 가능 (libQnnGpu.so 존재).
+            // ENG-QNN-209/D1: --qnn-graph-cache-prebuild flag (default true)는
+            // 백엔드 생성 시점에 wired 후 model load 완료 시점에 actual prebuild가
+            // 발동된다.
+            let qnn = Arc::new(llm_rs2::backend::qnn_oppkg::QnnOppkgBackend::with_prebuild(
+                args.qnn_graph_cache_prebuild,
+            )?);
+            let qnn_mem: Arc<dyn Memory> = Arc::new(
+                llm_rs2::backend::qnn_oppkg::memory::QnnOppkgMemory::new(qnn.clone()),
+            );
+
+            // ENG-QNN-206: SwitchHw round-trip을 위해 OpenCL backend를 secondary로
+            // 등록. OpenCL init이 fail하면 secondary 없이 진행 (SwitchHw 비활성).
+            #[cfg(feature = "opencl")]
+            let (gpu_be, gpu_mem_arc): (
+                Option<Arc<dyn Backend>>,
+                Option<Arc<dyn Memory>>,
+            ) = match llm_rs2::backend::opencl::OpenCLBackend::new_with_profile_events(
+                args.profile_events || args.heartbeat_gpu_profile,
+            ) {
+                Ok(gpu_concrete) => {
+                    let gpu_concrete = Arc::new(gpu_concrete);
+                    let gm: Arc<dyn Memory> =
+                        Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+                            gpu_concrete.context.clone(),
+                            gpu_concrete.queue.clone(),
+                            args.zero_copy,
+                        ));
+                    let g = gpu_concrete as Arc<dyn Backend>;
+                    eprintln!(
+                        "[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)"
+                    );
+                    (Some(g), Some(gm))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[Backend] QNN-GPU only (OpenCL secondary init failed: {})",
+                        e
+                    );
+                    (None, None)
+                }
+            };
+            #[cfg(not(feature = "opencl"))]
+            let (gpu_be, gpu_mem_arc): (
+                Option<Arc<dyn Backend>>,
+                Option<Arc<dyn Memory>>,
+            ) = (None, None);
+
+            // qnn_graph_cache_prebuild는 위에서 with_prebuild()에 wired됨.
+            // qnn_allow_fallback는 M3.3 forward path에서 활용.
+            let _ = args.qnn_allow_fallback;
+
+            // M3.4: OpenCL secondary를 qnn_oppkg backend의 fallback target으로
+            // 등록. prefill 및 model load 단계에서 trait method 호출 시
+            // OpenCL secondary가 처리. decode (seq_len=1) fast path만 graph
+            // 직접 dispatch (INV-175).
+            #[cfg(feature = "opencl")]
+            if let Some(ref gpu_concrete) = gpu_be {
+                qnn.set_fallback_backend(gpu_concrete.clone());
+                eprintln!(
+                    "[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)"
+                );
+            }
+            // M3.4: production activation/KV memory는 OpenCL secondary로 위임.
+            // qnn_oppkg backend는 graph build 시점에 internal rpcmem alloc으로
+            // weight + scratch를 보유한다. production이 만드는 activation tensor는
+            // OpenCL buffer로 남아 prefill + model load fallback path가 자연스럽게
+            // 작동한다. KV cache는 OpenCL buffer (graph 내부 KvScatter는 자체
+            // rpcmem 사용 + execute path에서 host-side memcpy로 동기화).
+            let qnn_dyn: Arc<dyn Backend> = qnn;
+            let primary_mem: Arc<dyn Memory> = match &gpu_mem_arc {
+                Some(m) => m.clone(),
+                None => qnn_mem.clone(),
+            };
+            // M3.4 D-D.4: gpu_backend_arc로는 OpenCL secondary를 노출한다.
+            // primary qnn_oppkg는 noshuffle prep / map_weights_for_cpu / RSS
+            // diag 등 OpenCL-specific path에 downcast 불가하므로, secondary가
+            // 있으면 secondary를 보조 backend로 expose. 없으면 None (해당
+            // path들은 qnn_oppkg-only 환경에서 불활성).
+            let gpu_backend_for_caller: Option<Arc<dyn Backend>> = match &gpu_be {
+                Some(be) => Some(be.clone()),
+                None => Some(qnn_dyn.clone()),
+            };
+            (
+                qnn_dyn,
+                primary_mem.clone(),
+                gpu_backend_for_caller,
+                Some(primary_mem),
+                true,
+            )
+        }
         _ => anyhow::bail!(
             "Unknown backend: {}. Use cpu, opencl, or cuda.",
             args.backend
@@ -1065,6 +1447,7 @@ fn main() -> anyhow::Result<()> {
             default_dtype: w_dtype,
             secondary_source: args.secondary_gguf.clone(),
             secondary_dtype_choice: args.secondary_dtype.into(),
+            secondary_layout_choice: args.secondary_layout.into(),
         };
         TransformerModel::load_from_config(&load_cfg, backend.clone(), &*memory)?
     } else {
@@ -1076,6 +1459,55 @@ fn main() -> anyhow::Result<()> {
     // Tester pulls this file to analyse kgsl/ion/dmabuf VMA distribution.
     if std::env::var("LLMRS_DUMP_SMAPS_T1").is_ok() {
         dump_smaps("T1_model_loaded");
+    }
+
+    // ENG-QNN-203/INV-167 — Eager prebuild of layer graph cache (D1 결정).
+    // Model load + LayerSlot 등록이 완료된 시점에 N×graphFinalize를 직렬 실행한다.
+    // host build에서는 backend init이 이미 fail하여 본 분기 도달 불가; 디바이스
+    // 빌드 + Android runtime에서만 본격 동작.
+    #[cfg(feature = "qnn")]
+    if args.backend == "qnn_oppkg" || args.backend == "qnngpu" {
+        if let Some(qnn_be) = backend
+            .as_any()
+            .downcast_ref::<llm_rs2::backend::qnn_oppkg::QnnOppkgBackend>()
+        {
+            // ModelConfig → LayerConfig 변환. M3.2 단계는 Qwen2.5-1.5B 단일
+            // 모델 지원 (ENG-QNN-225 / INV-176). 추후 다른 모델 추가 시
+            // dispatch table 도입 예정.
+            let mc = &model.config;
+            let layer_cfg = llm_rs2::backend::qnn_oppkg::layer_graph::LayerConfig {
+                dim: mc.hidden_size as u32,
+                n_head: mc.num_attention_heads as u32,
+                n_kv_heads: mc.num_key_value_heads as u32,
+                head_dim: mc.head_dim as u32,
+                ffn_dim: mc.intermediate_size as u32,
+                kv_capacity: args.max_seq_len as u32,
+            };
+            qnn_be.prebuild_graph_cache(&model.layers, &layer_cfg)?;
+        }
+    }
+
+    // WSWAP-6-PREFAULT: eager prefault of the secondary weight file.
+    //
+    // When --eager-prefault-secondary is set, touch all secondary weight pages
+    // immediately after model load so that subsequent swap invocations hit the
+    // page cache instead of incurring cold page faults (~328 ms on Galaxy S25,
+    // §3.1 swap_overhead_s25.md). This is a one-time upfront cost traded for
+    // per-swap latency elimination.
+    //
+    // Memory commit ≈ AUF/GGUF secondary size (e.g. 1.2 GB for Q4_0 1.5B).
+    // Default OFF to protect memory-constrained environments.
+    if args.eager_prefault_secondary {
+        if let Some(ref secondary) = model.secondary_mmap {
+            let t0 = std::time::Instant::now();
+            secondary.prefault();
+            eprintln!(
+                "[Eager-Prefault] secondary weights prefaulted in {:.1}ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        } else {
+            eprintln!("[Eager-Prefault] no secondary configured, skipping");
+        }
     }
 
     // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory.
@@ -1339,7 +1771,19 @@ fn main() -> anyhow::Result<()> {
                     || cli_partition_needs_cpu_weights
                     || args.prefill_cpu_chunk_size > 0
                     || args.enable_resilience;
-                match model.prepare_noshuffle_buffers(&backend, keep_for_cpu) {
+                // M3.4 D-D.4: qnn_oppkg primary는 noshuffle prep을 OpenCL secondary
+                // backend로 위임해야 한다. primary 자체는 OpenCLBackend가 아니라
+                // downcast가 fail하기 때문. fallback gpu_backend_arc가 있으면
+                // 그것을, 없으면 원래 backend (OpenCL primary)를 사용.
+                let prep_backend: &Arc<dyn Backend> = if (args.backend == "qnn_oppkg"
+                    || args.backend == "qnngpu")
+                    && let Some(ref gpu_be) = gpu_backend_arc
+                {
+                    gpu_be
+                } else {
+                    &backend
+                };
+                match model.prepare_noshuffle_buffers(prep_backend, keep_for_cpu) {
                     Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
                     Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
                 }
@@ -1487,7 +1931,38 @@ fn main() -> anyhow::Result<()> {
             }
             eprintln!("[KIVI] AWQE + AW-VOPR enabled");
         }
-        let mut hook = llm_rs2::eval::KiviHook::new(qcf_config);
+        // ARGUS Step 6: resolve sample layers and inject score accumulator.
+        let kivi_n_layers = kv_caches.len();
+        let kivi_sample_layers = if args.enable_qcf_experimental {
+            parse_qcf_sample_layers(&args.qcf_sample_layers, kivi_n_layers)
+                .map_err(|e| anyhow::anyhow!("--qcf-sample-layers: {e}"))?
+        } else {
+            vec![0]
+        };
+        // Inject a GQA-aware score accumulator when experimental mode is on.
+        // KiviHook::score_accumulator() forwards it into TransformerModelForwardArgs,
+        // so LlamaLayer will push attention probabilities into it during forward_into().
+        // entropy_computed flag is set in post_prefill when acc.is_active() + scores non-empty.
+        let kivi_score_acc = if args.enable_qcf_experimental {
+            let mut acc = llm_rs2::core::attention_scores::AttentionScoreAccumulator::new_gqa(
+                max_seq_len,
+                model.config.num_attention_heads,
+                model.config.num_key_value_heads,
+                kivi_n_layers,
+                0,   // last_n_layers=0 → all layers tracked
+                1.0, // no decay
+            );
+            acc.set_active(true);
+            Some(acc)
+        } else {
+            None
+        };
+        let mut hook = llm_rs2::eval::KiviHook::new(
+            qcf_config,
+            args.enable_qcf_experimental,
+            kivi_sample_layers,
+            kivi_score_acc,
+        );
         let output = llm_rs2::eval::run_eval_ll_generic(
             &model,
             &tokenizer,
@@ -1735,13 +2210,18 @@ fn main() -> anyhow::Result<()> {
             "[Resilience] Executor enabled — transport: {}",
             args.resilience_transport
         );
-        let executor = CommandExecutor::with_gpu_meter(
+        let mut executor = CommandExecutor::with_gpu_meter(
             cmd_rx,
             resp_tx,
             args.backend.clone(),
             heartbeat_interval,
             gpu_meter.clone(),
         );
+
+        // secondary 경로가 있으면 swap_weights 액션이 Heartbeat에도 포함되도록 설정.
+        // Capability와 Heartbeat 두 목록이 항상 같은 조건을 공유한다 (ENG-ST-032).
+        let has_secondary = args.secondary_gguf.is_some();
+        executor.set_has_secondary(has_secondary);
 
         // Send Capability as first message (SEQ-022).
         // available_actions 는 Heartbeat 와 동일하게 eviction_policy / kv_type 에서 파생.
@@ -1761,6 +2241,11 @@ fn main() -> anyhow::Result<()> {
             }
             if args.kv_type.starts_with('q') {
                 a.push("kv_quant_dynamic".to_string());
+            }
+            // secondary GGUF/AUF 존재 시 swap_weights 등록 (ENG-ST-032).
+            // Heartbeat의 compute_available_actions와 동일 조건을 공유한다.
+            if has_secondary {
+                a.push("swap_weights".to_string());
             }
             a
         };
@@ -1935,8 +2420,8 @@ fn main() -> anyhow::Result<()> {
                 keep_ratio: args.d2o_keep_ratio,
                 protected_prefix: actual_protected_prefix,
                 target_ratio: args.eviction_target_ratio,
-                ema_alpha: args.d2o_ema_alpha,
                 ema_beta: args.d2o_ema_beta,
+                merge_e: args.d2o_merge_e,
                 use_layer_allocation: args.d2o_layer_alloc,
                 protected_layers: args.d2o_protected_layers.clone().unwrap_or_default(),
             });
@@ -1966,13 +2451,8 @@ fn main() -> anyhow::Result<()> {
                     };
                     Box::new(StreamingLLMPolicy::new(args.sink_size, window))
                 }
-                "h2o" => Box::new(H2OPolicy::new(
-                    args.h2o_recent_window,
-                    args.h2o_keep_ratio,
-                    actual_protected_prefix,
-                )),
+                "h2o" => Box::new(H2OPolicy::new(args.h2o_keep_ratio, actual_protected_prefix)),
                 "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                    args.h2o_recent_window,
                     args.h2o_keep_ratio,
                     actual_protected_prefix,
                 )),
@@ -2004,7 +2484,6 @@ fn main() -> anyhow::Result<()> {
     cache_manager.register_policy(
         llm_rs2::resilience::EvictMethod::H2o,
         Box::new(H2OPolicy::new(
-            args.h2o_recent_window,
             args.h2o_keep_ratio,
             resilience_protected_prefix,
         )),
@@ -2169,26 +2648,184 @@ fn main() -> anyhow::Result<()> {
     // Requires --secondary-gguf (validated above at model load time).
     // When --qcf-dump is set, this block is skipped; the swap is deferred to
     // the QCF dump workflow below (after warmup prefill builds ImportanceTable).
-    if args.qcf_dump.is_none()
-        && let Some(ratio) = args.force_swap_ratio
-    {
-        use llm_rs2::core::buffer::DType as LDType;
-        use llm_rs2::memory::galloc::Galloc;
-        use llm_rs2::models::weights::swap_executor::SwapExecutor;
+    //
+    // ENG-ALG-232~234 (LISWAP-1): when --swap-incremental-per-tick > 0,
+    // the swap is NOT executed here. Instead, an IncrementalSwapPlan is
+    // committed and stored below; the decode loop drains it chunk-by-chunk.
+    // per_tick == 0 (default): single-shot path, unchanged from before.
+    let mut incremental_force_swap_plan: Option<llm_rs2::models::weights::IncrementalSwapPlan> =
+        None;
 
-        let ratio = ratio.clamp(0.0, 1.0);
-        let num_layers = model.layers.len();
-        let target_layers = SwapExecutor::uniform_target_layers(ratio, num_layers);
+    // LISWAP-4 (ENG-ALG-237 / INV-150): intra-forward layer-aligned swap hook.
+    // Created when `--swap-intra-forward` + `--force-swap-ratio` both active.
+    // Decode loop injects `Some(&*hook)` into `layer_boundary_hook` and calls
+    // `finalize` once `plan_is_complete()` to drain dispatcher + bump
+    // ratio_generation + invalidate SOA registry.
+    let mut intra_forward_swap_hook: Option<Arc<llm_rs2::models::weights::IntraForwardSwapHook>> =
+        None;
 
-        if !target_layers.is_empty() {
-            let swap_memory = Galloc::new();
+    // LISWAP-2 prototype: async swap dispatcher lifecycle.
+    // Created once here; used in the decode loop when async dispatch is active.
+    // `None` when --swap-async-dispatch is false, per_tick == 0, or the backend
+    // does not support async transfer.
+    let async_swap_dispatcher: Option<llm_rs2::models::weights::AsyncSwapDispatcher> = {
+        if args.swap_async_dispatch && args.swap_incremental_per_tick > 0 {
             let swap_backend: Arc<dyn Backend> = gpu_backend_arc
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| cpu_backend_arc.clone());
-            let executor =
-                SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
-            match executor.execute(&model, &target_layers) {
+            if swap_backend.supports_async_transfer() {
+                Some(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                    swap_backend,
+                ))
+            } else {
+                eprintln!(
+                    "[LISWAP-2] backend does not support async transfer; falling back to sync incremental swap"
+                );
+                None
+            }
+        } else {
+            if args.swap_async_dispatch && args.swap_incremental_per_tick == 0 {
+                eprintln!(
+                    "[LISWAP-2] --swap-async-dispatch ignored: requires --swap-incremental-per-tick > 0"
+                );
+            }
+            None
+        }
+    };
+
+    // ── LISWAP-3 prototype (Direction A): ALLOC_HOST_PTR pool ────────────
+    // Lazy-init the swap pool when the user opted in via `--swap-zero-copy`
+    // AND the env-gate `LLMRS_OPENCL_HOST_PTR_POOL=1` is set. Both conditions
+    // are required so the flag alone cannot accidentally enable the
+    // prototype path. SwapExecutor falls back to the staging path on `None`.
+    // Plan: compiled-chasing-hopper.md Direction A track, Stage 3.
+    #[cfg(feature = "opencl")]
+    let host_ptr_swap_pool: Option<Arc<llm_rs2::backend::opencl::host_ptr_pool::HostPtrPool>> = {
+        if !args.swap_zero_copy {
+            None
+        } else if let Some(gpu_be) = gpu_backend_arc.as_ref().and_then(|b| {
+            b.as_any()
+                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+        }) {
+            let cfg = llm_rs2::backend::opencl::host_ptr_pool::HostPtrPoolConfig {
+                n_slots: args.swap_pool_slots.max(1),
+                ..Default::default()
+            };
+            let pool = gpu_be.host_ptr_pool_or_init(cfg);
+            if pool.is_some() {
+                eprintln!(
+                    "[LISWAP-3] host_ptr_pool active: slots={}, max_tensor_size={}",
+                    cfg.n_slots, cfg.max_tensor_size
+                );
+            } else {
+                eprintln!(
+                    "[LISWAP-3] --swap-zero-copy requested but pool unavailable \
+                     (env LLMRS_OPENCL_HOST_PTR_POOL not set or pool init failed); \
+                     using staging path"
+                );
+            }
+            pool
+        } else {
+            eprintln!(
+                "[LISWAP-3] --swap-zero-copy ignored: backend is not OpenCL; using staging path"
+            );
+            None
+        }
+    };
+    #[cfg(not(feature = "opencl"))]
+    let _host_ptr_swap_pool: Option<()> = {
+        if args.swap_zero_copy {
+            eprintln!(
+                "[LISWAP-3] --swap-zero-copy ignored: opencl feature is disabled in this build"
+            );
+        }
+        None
+    };
+
+    if args.qcf_dump.is_none()
+        && let Some(ratio) = args.force_swap_ratio
+    {
+        let ratio = ratio.clamp(0.0, 1.0);
+        let num_layers = model.layers.len();
+        let target_layers =
+            llm_rs2::models::weights::SwapExecutor::uniform_target_layers(ratio, num_layers);
+
+        if target_layers.is_empty() {
+            eprintln!(
+                "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
+                ratio,
+            );
+        } else if args.swap_intra_forward {
+            // LISWAP-4 (ENG-ALG-237): single-shot is skipped; an
+            // IntraForwardSwapHook is committed instead. The decode loop
+            // injects the hook into `forward_into` and dispatches per-layer
+            // swap on the layer boundary. Plan retire (drain → synchronize
+            // → bump → invalidate) happens once on plan_is_complete()
+            // (INV-150).
+            //
+            // Backend must support async transfer for the dispatcher path
+            // to be useful; on backends without it, the dispatcher falls
+            // back to a synchronous in-line commit (still correct, just no
+            // overlap with forward).
+            let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cpu_backend_arc.clone());
+            let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                Arc::clone(&swap_backend),
+            ));
+            let secondary = match model.secondary_mmap.as_ref() {
+                Some(s) => Arc::clone(s),
+                None => {
+                    anyhow::bail!(
+                        "--swap-intra-forward requires --secondary-gguf (no secondary mmap available)"
+                    );
+                }
+            };
+            let config = Arc::new(model.config.clone());
+            eprintln!(
+                "weight_swap: intra-forward mode — ratio={:.2}, {} target layers (LISWAP-4)",
+                ratio,
+                target_layers.len()
+            );
+            intra_forward_swap_hook = Some(llm_rs2::models::weights::IntraForwardSwapHook::new(
+                target_layers,
+                0,
+                dispatcher,
+                secondary,
+                model.layers.clone(),
+                swap_backend,
+                Some(Arc::clone(&model.release_worker)),
+                DType::Q4_0,
+                config,
+            ));
+        } else if args.swap_incremental_per_tick > 0 {
+            // ENG-ALG-232: commit IncrementalSwapPlan; single-shot is skipped.
+            // The plan will be drained in the decode loop (token 0 onwards).
+            eprintln!(
+                "weight_swap: incremental mode — ratio={:.2}, {} target layers, per_tick={} ({} ticks estimated)",
+                ratio,
+                target_layers.len(),
+                args.swap_incremental_per_tick,
+                target_layers.len().div_ceil(args.swap_incremental_per_tick),
+            );
+            incremental_force_swap_plan = Some(llm_rs2::models::weights::IncrementalSwapPlan::new(
+                target_layers,
+                args.swap_incremental_per_tick,
+                0, // started_at_token filled in decode loop at first drain
+            ));
+        } else {
+            // per_tick == 0: original single-shot path (no behavior change).
+            match run_layer_swap(
+                &model,
+                &target_layers,
+                gpu_backend_arc.as_ref(),
+                &cpu_backend_arc,
+                None,
+                #[cfg(feature = "opencl")]
+                host_ptr_swap_pool.clone(),
+            ) {
                 Ok(report) => {
                     eprintln!(
                         "weight_swap: force ratio={:.2}, swapped {}/{} layers in {:.1}ms",
@@ -2210,16 +2847,19 @@ fn main() -> anyhow::Result<()> {
                     {
                         ocl_be.dump_cl_mem_diagnostics(" stage=after_force_swap");
                     }
+                    #[cfg(feature = "opencl")]
+                    remap_weights_for_cpu_after_swap(
+                        &mut model,
+                        &backend,
+                        is_gpu,
+                        args.resilience_prealloc_switch,
+                        "force-swap",
+                    );
                 }
                 Err(e) => {
                     anyhow::bail!("--force-swap-ratio: swap failed: {}", e);
                 }
             }
-        } else {
-            eprintln!(
-                "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
-                ratio
-            );
         }
     }
 
@@ -2273,6 +2913,8 @@ fn main() -> anyhow::Result<()> {
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         let table = collector.build();
@@ -2319,133 +2961,31 @@ fn main() -> anyhow::Result<()> {
         if args.qcf_dump.is_some()
             && let Some(force_ratio) = args.force_swap_ratio
         {
-            use llm_rs2::core::buffer::DType as LDType;
-            use llm_rs2::core::qcf::ImportanceCollector;
-            use llm_rs2::memory::galloc::Galloc as WGalloc;
-            use llm_rs2::models::weights::decider::WeightSwapDecider;
-            use llm_rs2::models::weights::swap_executor::SwapExecutor;
-
             let warmup_n = args.qcf_warmup_tokens.max(1);
-
-            // ── Step 1: build warmup token sequence from eval questions ───────
-            // Concatenate question prompt fields (separated by "\n\n") and take
-            // the first warmup_n tokens.  If fewer tokens are available, use
-            // whatever we have and emit a warning.
+            // Concatenate question prompts (separated by "\n\n") and take the
+            // first warmup_n tokens. Empty result → soft skip (no abort).
             let warmup_ids = build_eval_ll_warmup_text(&questions, warmup_n, &tokenizer);
 
             if warmup_ids.is_empty() {
-                // Soft failure: skip prelude instead of aborting the whole eval run.
                 eprintln!(
                     "[QCF-dump] WARNING: eval-ll warmup token sequence is empty; \
                      prelude skipped (swap will use uniform fallback)"
                 );
             } else {
-                let actual_warmup_len = warmup_ids.len();
-                eprintln!(
-                    "[QCF-dump] eval-ll warmup prefill: {} tokens",
-                    actual_warmup_len
-                );
-
-                // ── Step 2: warmup prefill with ImportanceCollector ───────────
-                let mut collector = ImportanceCollector::new();
-                {
-                    let warmup_buf = WGalloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
-                    unsafe {
-                        let ptr = warmup_buf.as_mut_ptr() as *mut u32;
-                        for (i, &id) in warmup_ids.iter().enumerate() {
-                            *ptr.add(i) = id;
-                        }
-                    }
-                    let cpu_warmup = Tensor::new(
-                        Shape::new(vec![1, actual_warmup_len]),
-                        warmup_buf,
-                        Arc::new(CpuBackend::new()),
-                    );
-                    let warmup_input = backend.copy_from(&cpu_warmup)?;
-
-                    let warmup_logits_buf =
-                        memory.alloc(actual_warmup_len * vocab_size * 4, DType::F32)?;
-                    let mut warmup_logits = Tensor::new(
-                        Shape::new(vec![1, actual_warmup_len, vocab_size]),
-                        warmup_logits_buf,
-                        backend.clone(),
-                    );
-
-                    model.forward_into(TransformerModelForwardArgs {
-                        input_tokens: &warmup_input,
-                        start_pos: 0,
-                        kv_caches: &mut kv_caches,
-                        backend: &backend,
-                        memory: memory.as_ref(),
-                        logits_out: &mut warmup_logits,
-                        x_gen: None,
-                        workspace: None,
-                        score_accumulator: None,
-                        profiler: None,
-                        skip_config: None,
-                        importance_collector: Some(&mut collector),
-                        logits_last_only: false,
-                        variance_collector: None,
-                        prefill_workspace: None,
-                    })?;
-                    backend.synchronize()?;
-                }
-
-                // ── Step 3: build ImportanceTable + reset KV cache ────────────
-                let imp_table = collector.build();
-                eprintln!(
-                    "[QCF-dump] eval-ll ImportanceTable built: {} entries",
-                    imp_table.len()
-                );
-                // Reset so the eval loop starts with a clean KV cache.
-                for kv in kv_caches.iter_mut() {
-                    kv.current_pos = 0;
-                }
-
-                // ── Step 4: swap with importance-guided decider ───────────────
-                let ratio = force_ratio.clamp(0.0, 1.0);
-                let decider = WeightSwapDecider {
-                    importance: Some(&imp_table),
-                    noise: Some(model.quant_noise.as_ref()),
-                    n_decoder_layers: model.layers.len(),
-                    currently_swapped: &[],
-                };
-                let decision = decider.decide(ratio);
-
-                if !decision.selected_layers.is_empty() {
-                    let swap_memory = WGalloc::new();
-                    let swap_backend: Arc<dyn Backend> = gpu_backend_arc
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_else(|| cpu_backend_arc.clone());
-                    let executor =
-                        SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
-                    match executor.execute(&model, &decision.selected_layers) {
-                        Ok(report) => {
-                            eprintln!(
-                                "[QCF-dump] eval-ll swap: ratio={:.2}, layers={}/{}, \
-                                 qcf_pred={:.4}, fallback={}, latency={:.1}ms",
-                                ratio,
-                                report.swapped.len(),
-                                model.layers.len(),
-                                decision.qcf_swap_estimate,
-                                decision.fallback_used,
-                                report.latency_ms,
-                            );
-                        }
-                        Err(e) => {
-                            anyhow::bail!("[QCF-dump] eval-ll swap failed: {}", e);
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "[QCF-dump] eval-ll swap: ratio={:.2} → 0 layers selected (qcf=0.0)",
-                        ratio
-                    );
-                }
-
-                eval_ll_qcf_decision = Some(decision);
-                eval_ll_qcf_importance = Some(imp_table);
+                let result = run_qcf_warmup_workflow(
+                    &model,
+                    &backend,
+                    memory.as_ref(),
+                    &mut kv_caches,
+                    vocab_size,
+                    &warmup_ids,
+                    Some(force_ratio),
+                    gpu_backend_arc.as_ref(),
+                    &cpu_backend_arc,
+                    " eval-ll",
+                )?;
+                eval_ll_qcf_decision = result.decision;
+                eval_ll_qcf_importance = Some(result.importance);
             }
         }
 
@@ -2497,6 +3037,16 @@ fn main() -> anyhow::Result<()> {
         // For ratio mode, hook starts with budget=0; eval_loop updates it per-question.
         let hook_budget = if ratio_mode { 0 } else { effective_budget };
         let is_d2o = args.eviction_policy == "d2o";
+
+        // ARGUS Step 6: resolve --qcf-sample-layers from CLI.
+        // When --enable-qcf-experimental is off, always use [0] (legacy, no overhead).
+        let eviction_hook_sample_layers = if args.enable_qcf_experimental {
+            parse_qcf_sample_layers(&args.qcf_sample_layers, num_layers)
+                .map_err(|e| anyhow::anyhow!("--qcf-sample-layers: {e}"))?
+        } else {
+            vec![0]
+        };
+
         let mut hook = llm_rs2::eval::EvictionHook::new(
             cache_manager,
             score_accumulator,
@@ -2508,6 +3058,8 @@ fn main() -> anyhow::Result<()> {
             is_d2o,
             args.kv_type.clone(),
             backend.clone(),
+            args.enable_qcf_experimental,
+            eviction_hook_sample_layers,
         );
 
         let output = llm_rs2::eval::run_eval_ll_generic(
@@ -2610,17 +3162,10 @@ fn main() -> anyhow::Result<()> {
     let qcf_workflow_start = std::time::Instant::now();
 
     if args.qcf_dump.is_some() && (args.ppl.is_some() || !prompt.is_empty()) {
-        use llm_rs2::core::buffer::DType as LDType;
-        use llm_rs2::core::qcf::ImportanceCollector;
-        use llm_rs2::memory::galloc::Galloc as WGalloc;
-        use llm_rs2::models::weights::decider::WeightSwapDecider;
-        use llm_rs2::models::weights::swap_executor::SwapExecutor;
-
         let warmup_n = args.qcf_warmup_tokens.max(1);
 
-        // ── Step 1: build warmup token sequence ──────────────────────────────
-        // For PPL mode: first N tokens of the reference text.
-        // For generation mode: the prompt tokens (up to warmup_n).
+        // For PPL mode the warmup tokens come from the reference text; for
+        // generation mode they come from the prompt. Both paths cap at warmup_n.
         let warmup_tokens: Vec<u32> = if let Some(ref ppl_path) = args.ppl {
             let text = std::fs::read_to_string(ppl_path)
                 .map_err(|e| anyhow::anyhow!("Failed to read PPL file for warmup: {}", e))?;
@@ -2635,118 +3180,26 @@ fn main() -> anyhow::Result<()> {
             enc.get_ids().iter().take(warmup_n).copied().collect()
         };
 
-        let actual_warmup_len = warmup_tokens.len();
-        if actual_warmup_len < 1 {
+        if warmup_tokens.is_empty() {
             anyhow::bail!(
                 "--qcf-dump: warmup token sequence is empty (prompt or PPL text too short)"
             );
         }
-        eprintln!("[QCF-dump] Warmup prefill: {} tokens", actual_warmup_len);
 
-        // ── Step 2: warmup prefill with ImportanceCollector ───────────────────
-        let mut collector = ImportanceCollector::new();
-
-        {
-            let warmup_buf = WGalloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
-            unsafe {
-                let ptr = warmup_buf.as_mut_ptr() as *mut u32;
-                for (i, &id) in warmup_tokens.iter().enumerate() {
-                    *ptr.add(i) = id;
-                }
-            }
-            let cpu_warmup = Tensor::new(
-                Shape::new(vec![1, actual_warmup_len]),
-                warmup_buf,
-                Arc::new(CpuBackend::new()),
-            );
-            let warmup_input = backend.copy_from(&cpu_warmup)?;
-
-            let warmup_logits_buf = memory.alloc(actual_warmup_len * vocab_size * 4, DType::F32)?;
-            let mut warmup_logits = Tensor::new(
-                Shape::new(vec![1, actual_warmup_len, vocab_size]),
-                warmup_logits_buf,
-                backend.clone(),
-            );
-
-            model.forward_into(TransformerModelForwardArgs {
-                input_tokens: &warmup_input,
-                start_pos: 0,
-                kv_caches: &mut kv_caches,
-                backend: &backend,
-                memory: memory.as_ref(),
-                logits_out: &mut warmup_logits,
-                x_gen: None,
-                workspace: None,
-                score_accumulator: None,
-                profiler: None,
-                skip_config: None,
-                importance_collector: Some(&mut collector),
-                logits_last_only: false,
-                variance_collector: None,
-                prefill_workspace: None,
-            })?;
-            backend.synchronize()?;
-        }
-
-        // ── Step 3: build ImportanceTable + reset KV cache ────────────────────
-        let imp_table = collector.build();
-        eprintln!(
-            "[QCF-dump] ImportanceTable built: {} entries",
-            imp_table.len()
-        );
-
-        // Reset KV cache: clear all positions so run_ppl / generation starts fresh.
-        for kv in kv_caches.iter_mut() {
-            kv.current_pos = 0;
-        }
-
-        // ── Step 4: swap with importance-guided decider ───────────────────────
-        if let Some(ratio) = args.force_swap_ratio {
-            let ratio = ratio.clamp(0.0, 1.0);
-            let decider = WeightSwapDecider {
-                importance: Some(&imp_table),
-                noise: Some(model.quant_noise.as_ref()),
-                n_decoder_layers: model.layers.len(),
-                currently_swapped: &[],
-            };
-            let decision = decider.decide(ratio);
-
-            if !decision.selected_layers.is_empty() {
-                let swap_memory = WGalloc::new();
-                let swap_backend: Arc<dyn Backend> = gpu_backend_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| cpu_backend_arc.clone());
-                let executor =
-                    SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
-                match executor.execute(&model, &decision.selected_layers) {
-                    Ok(report) => {
-                        eprintln!(
-                            "[QCF-dump] Swap: ratio={:.2}, layers={}/{}, qcf_pred={:.4}, \
-                             fallback={}, latency={:.1}ms",
-                            ratio,
-                            report.swapped.len(),
-                            model.layers.len(),
-                            decision.qcf_swap_estimate,
-                            decision.fallback_used,
-                            report.latency_ms,
-                        );
-                    }
-                    Err(e) => {
-                        anyhow::bail!("[QCF-dump] swap failed: {}", e);
-                    }
-                }
-            } else {
-                eprintln!(
-                    "[QCF-dump] Swap: ratio={:.2} → 0 layers selected (qcf=0.0)",
-                    ratio
-                );
-            }
-
-            qcf_swap_decision = Some(decision);
-        }
-
-        qcf_warmup_importance = Some(imp_table);
+        let result = run_qcf_warmup_workflow(
+            &model,
+            &backend,
+            memory.as_ref(),
+            &mut kv_caches,
+            vocab_size,
+            &warmup_tokens,
+            args.force_swap_ratio,
+            gpu_backend_arc.as_ref(),
+            &cpu_backend_arc,
+            "",
+        )?;
+        qcf_swap_decision = result.decision;
+        qcf_warmup_importance = Some(result.importance);
     }
 
     // ════════════════════════════════════════════════════════════
@@ -2841,6 +3294,46 @@ fn main() -> anyhow::Result<()> {
             batch_path
         );
 
+        // ARGUS hook: emit Step1~6 metrics (qcf_caote_max / qcf_per_head /
+        // qcf_topk_retention_* / attention_entropy / qcf_beta_amplified_* /
+        // qcf_per_layer*) per record, alongside legacy fields.
+        // Hook owns cache_manager + score_accumulator from here; subsequent
+        // forward calls in this branch route score_accumulator through the hook.
+        use llm_rs2::eval::StepHook;
+        let pb_qcf_mode_enum = match args.qcf_mode.as_str() {
+            "caote" => llm_rs2::core::qcf::QcfMode::Caote,
+            "both" => llm_rs2::core::qcf::QcfMode::Both,
+            _ => llm_rs2::core::qcf::QcfMode::Attn,
+        };
+        let pb_qcf_config = llm_rs2::core::qcf::QcfConfig {
+            mode: pb_qcf_mode_enum,
+            ..llm_rs2::core::qcf::QcfConfig::default()
+        };
+        let pb_ratio_mode = args.kv_budget_ratio > 0.0;
+        let pb_hook_budget = if pb_ratio_mode { 0 } else { args.kv_budget };
+        let pb_is_d2o = args.eviction_policy == "d2o";
+        let pb_num_layers = model.config.num_hidden_layers;
+        let pb_sample_layers = if args.enable_qcf_experimental {
+            parse_qcf_sample_layers(&args.qcf_sample_layers, pb_num_layers)
+                .map_err(|e| anyhow::anyhow!("--qcf-sample-layers: {e}"))?
+        } else {
+            vec![0]
+        };
+        let mut hook = llm_rs2::eval::EvictionHook::new(
+            cache_manager,
+            score_accumulator.take(),
+            pb_qcf_config,
+            pb_hook_budget,
+            actual_protected_prefix,
+            score_based_eviction,
+            args.h2o_keep_ratio,
+            pb_is_d2o,
+            args.kv_type.clone(),
+            backend.clone(),
+            args.enable_qcf_experimental,
+            pb_sample_layers,
+        );
+
         let mut iteration = 0usize;
 
         // Pre-allocate generation buffers (once)
@@ -2918,16 +3411,6 @@ fn main() -> anyhow::Result<()> {
                 backend.clone(),
                 cpu_backend_arc.clone(),
             )?)));
-
-            if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
-                eprintln!(
-                    "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
-                );
-            } else {
-                eprintln!(
-                    "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
-                );
-            }
         }
 
         // Pre-allocate CPU/GPU single-token tensors
@@ -2965,6 +3448,15 @@ fn main() -> anyhow::Result<()> {
                     "[Batch] #{} id={}, prompt_tokens={}",
                     iteration, entry.id, prompt_tokens
                 );
+
+                // Per-record budget when --kv-budget-ratio is active
+                // (mirrors eval-ll path eval_loop.rs:207). Without this the hook
+                // sees effective_budget=0 and post_prefill early-returns,
+                // suppressing eviction and ARGUS metric collection.
+                if pb_ratio_mode {
+                    let dynamic_budget = ((prompt_tokens as f32) * args.kv_budget_ratio) as usize;
+                    hook.set_effective_budget(dynamic_budget.max(1));
+                }
 
                 let entry_start = std::time::Instant::now();
 
@@ -3102,13 +3594,15 @@ fn main() -> anyhow::Result<()> {
                         logits_out: &mut prefill_logits,
                         x_gen: None,
                         workspace: None,
-                        score_accumulator: None,
+                        score_accumulator: hook.score_accumulator(),
                         profiler: None,
                         skip_config: skip_config.as_ref(),
                         importance_collector: None,
                         logits_last_only: chunked,
                         variance_collector: None,
                         prefill_workspace: None,
+
+                        layer_boundary_hook: None,
                     })?;
                     backend.synchronize()?;
                     drop(input_tensor);
@@ -3175,13 +3669,15 @@ fn main() -> anyhow::Result<()> {
                                     logits_out: &mut cpu_logits,
                                     x_gen: None,
                                     workspace: None,
-                                    score_accumulator: None,
+                                    score_accumulator: hook.score_accumulator(),
                                     profiler: None,
                                     skip_config: skip_config.as_ref(),
                                     importance_collector: None,
                                     logits_last_only: true,
                                     variance_collector: None,
                                     prefill_workspace: None,
+
+                                    layer_boundary_hook: None,
                                 })?;
                                 drop(cpu_in_tensor);
                                 drop(cpu_logits);
@@ -3435,6 +3931,61 @@ fn main() -> anyhow::Result<()> {
                 batch_tokens.push(next_token_id);
                 let mut batch_start_pos = process_len;
 
+                // ── Score collection probe ──
+                // Mirrors eval_loop.rs:246~287. Batch prefill calls forward with
+                // workspace=None, so the hook's score_accumulator stays empty
+                // → ARGUS metrics fall back to defaults (0). Re-feed the last
+                // prompt token as a 1-step decode forward to populate per-head
+                // attention scores, then restore current_pos so cache state
+                // matches prompt_tokens (probe entry beyond current_pos is
+                // invisible to subsequent forward calls).
+                use llm_rs2::core::kv_cache::KVCacheOps;
+                if hook.needs_score_probe(&kv_caches) {
+                    let saved_positions: Vec<usize> =
+                        kv_caches.iter().map(|c| c.current_pos()).collect();
+                    let last_prompt_token = batch_input_ids[prompt_tokens - 1];
+                    unsafe {
+                        *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_prompt_token;
+                    }
+                    backend.write_buffer(&mut gen_input_tensor, unsafe {
+                        std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+                    })?;
+                    if let Some(acc) = hook.score_accumulator() {
+                        acc.begin_step();
+                    }
+                    let probe_mem: &dyn Memory = if is_gpu {
+                        memory.as_ref()
+                    } else {
+                        cpu_memory_arc.as_ref()
+                    };
+                    model.forward_into(TransformerModelForwardArgs {
+                        input_tokens: &gen_input_tensor,
+                        start_pos: prompt_tokens - 1,
+                        kv_caches: &mut kv_caches,
+                        backend: &backend,
+                        memory: probe_mem,
+                        logits_out: &mut logits,
+                        x_gen: Some(&mut x_gen),
+                        workspace: Some(&mut gen_ws),
+                        score_accumulator: hook.score_accumulator(),
+                        profiler: None,
+                        skip_config: skip_config.as_ref(),
+                        importance_collector: None,
+                        logits_last_only: false,
+                        variance_collector: None,
+                        prefill_workspace: None,
+
+                        layer_boundary_hook: None,
+                    })?;
+                    for (cache, &pos) in kv_caches.iter_mut().zip(saved_positions.iter()) {
+                        cache.set_current_pos(pos);
+                    }
+                }
+
+                // ARGUS Step1~6: compute experimental_qcf payload from prefill state.
+                // Also triggers post-prefill eviction when budget exceeded.
+                hook.post_prefill(&mut kv_caches);
+
                 eprintln!(
                     "[Batch] #{} id={} prefill_end ts={:.3}",
                     iteration,
@@ -3491,15 +4042,18 @@ fn main() -> anyhow::Result<()> {
                         logits_out: &mut logits,
                         x_gen: Some(&mut x_gen),
                         workspace: Some(&mut gen_ws),
-                        score_accumulator: None,
+                        score_accumulator: hook.score_accumulator(),
                         profiler: None,
                         skip_config: skip_config.as_ref(),
                         importance_collector: None,
                         logits_last_only: false,
                         variance_collector: None,
                         prefill_workspace: None,
+
+                        layer_boundary_hook: None,
                     })?;
                     backend.synchronize()?;
+                    hook.post_decode_step(&mut kv_caches, generated_count);
 
                     let now = std::time::Instant::now();
                     let tbt = (now - last_token_time).as_secs_f64() * 1000.0;
@@ -3549,7 +4103,7 @@ fn main() -> anyhow::Result<()> {
                 let text = tokenizer.decode(generated_ids, true).unwrap_or_default();
 
                 // Output JSONL
-                let result = serde_json::json!({
+                let mut result = serde_json::json!({
                     "id": entry.id,
                     "prompt_tokens": prompt_tokens,
                     "generated_tokens": generated_count,
@@ -3558,6 +4112,16 @@ fn main() -> anyhow::Result<()> {
                     "total_ms": (total_ms * 100.0).round() / 100.0,
                     "text": text,
                 });
+                // Merge ARGUS Step1~6 fields (qcf_caote_max / qcf_per_head /
+                // qcf_topk_retention_* / attention_entropy / qcf_beta_amplified_* /
+                // qcf_per_layer*) when --enable-qcf-experimental is on.
+                if let serde_json::Value::Object(extra_map) = hook.extra_question_fields(&kv_caches)
+                    && let serde_json::Value::Object(ref mut rmap) = result
+                {
+                    for (k, v) in extra_map {
+                        rmap.insert(k, v);
+                    }
+                }
                 println!("{}", serde_json::to_string(&result)?);
 
                 eprintln!(
@@ -3565,15 +4129,8 @@ fn main() -> anyhow::Result<()> {
                     iteration, entry.id, generated_count, ttft_ms, mean_tbt_ms, total_ms
                 );
 
-                // === RESET KV CACHE ===
-                for cache in kv_caches.iter_mut() {
-                    cache.current_pos = 0;
-                    cache.high_water_pos = 0;
-                }
-                // Reset score accumulator if active
-                if let Some(ref mut acc) = score_accumulator {
-                    acc.reset();
-                }
+                // === RESET KV CACHE + score accumulator + per-record hook state ===
+                hook.reset_caches(&mut kv_caches);
 
                 iteration += 1;
             }
@@ -3673,6 +4230,8 @@ fn main() -> anyhow::Result<()> {
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         backend.synchronize()?;
         let warmup_ms = warmup_start.elapsed().as_secs_f64() * 1000.0;
@@ -3889,6 +4448,8 @@ fn main() -> anyhow::Result<()> {
                 logits_last_only: chunked,
                 variance_collector: variance_collector.as_mut(),
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             })?;
             backend.synchronize()?;
             let t_fwd_end = std::time::Instant::now();
@@ -3973,6 +4534,8 @@ fn main() -> anyhow::Result<()> {
                             logits_last_only: true,
                             variance_collector: None,
                             prefill_workspace: None,
+
+                            layer_boundary_hook: None,
                         })?;
                         // No backend.synchronize() needed — CPU forward is synchronous.
                         drop(cpu_in_tensor);
@@ -4430,16 +4993,6 @@ fn main() -> anyhow::Result<()> {
                 backend.clone(),
                 cpu_backend_arc.clone(),
             )?)));
-
-            if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
-                eprintln!(
-                    "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
-                );
-            } else {
-                eprintln!(
-                    "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
-                );
-            }
         }
 
         // Single token CPU tensor for generation loop
@@ -4661,6 +5214,7 @@ fn main() -> anyhow::Result<()> {
             && !args.no_gpu_plan
             && accumulator_compatible_with_plan
             && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
+            && !args.swap_intra_forward
         {
             model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
         } else {
@@ -4706,6 +5260,10 @@ fn main() -> anyhow::Result<()> {
 
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
+            let _decode_t = llm_rs2::profile::quality_metrics::Timer::start(
+                &llm_rs2::profile::quality_metrics::DECODE_TOTAL,
+            );
+
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
             if kv_caches[0].current_pos >= max_seq_len {
                 println!("\n[Stopped: Max context length reached]");
@@ -4849,6 +5407,15 @@ fn main() -> anyhow::Result<()> {
                     cu_be.begin_graph_capture()?;
                 }
 
+                // LISWAP-4: inject IntraForwardSwapHook when active.
+                // The cast to `&dyn LayerBoundaryHook` happens inside the
+                // option mapping so the args field can be `Option<&dyn _>`
+                // — this is the *only* place a real hook is wired in.
+                let liswap4_hook: Option<&dyn llm_rs2::models::weights::LayerBoundaryHook> =
+                    intra_forward_swap_hook
+                        .as_deref()
+                        .map(|h| h as &dyn llm_rs2::models::weights::LayerBoundaryHook);
+
                 model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gen_input_tensor,
                     start_pos,
@@ -4865,6 +5432,8 @@ fn main() -> anyhow::Result<()> {
                     logits_last_only: false,
                     variance_collector: None,
                     prefill_workspace: None,
+
+                    layer_boundary_hook: liswap4_hook,
                 })?;
 
                 #[cfg(feature = "cuda-embedded")]
@@ -4950,6 +5519,127 @@ fn main() -> anyhow::Result<()> {
             }
 
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
+
+            // ── Layer-Incremental Swap dispatch (ENG-ALG-233) ──────────────────
+            // Runs after forward, before sampling. Per-tick: drain up to N layers
+            // and call SwapExecutor::execute_on_slots with the chunk.
+            // ENG-ALG-234: plan committed with force-swap-ratio + per_tick > 0;
+            //   new signals during flight are ignored (plan runs to completion).
+            // INV-145: empty chunk is never passed to execute_on_slots.
+            if let Some(ref mut inc_plan) = incremental_force_swap_plan {
+                let chunk = inc_plan.drain_chunk();
+                if !chunk.is_empty() {
+                    let t_swap = std::time::Instant::now();
+                    match run_layer_swap(
+                        &model,
+                        &chunk,
+                        gpu_backend_arc.as_ref(),
+                        &cpu_backend_arc,
+                        async_swap_dispatcher.as_ref(),
+                        #[cfg(feature = "opencl")]
+                        host_ptr_swap_pool.clone(),
+                    ) {
+                        Ok(report) => {
+                            eprintln!(
+                                "[IncrementalSwap] tick={} chunk={:?} swapped={} remaining={} latency={:.1}ms",
+                                decode_token_index,
+                                &chunk,
+                                report.swapped.len(),
+                                inc_plan.remaining_count(),
+                                t_swap.elapsed().as_secs_f64() * 1000.0,
+                            );
+                            if let Some(ref stages) = report.stage_breakdown {
+                                eprintln!("[IncrementalSwap] stages: {}", stages.to_log_line());
+                            }
+                            #[cfg(feature = "opencl")]
+                            remap_weights_for_cpu_after_swap(
+                                &mut model,
+                                &backend,
+                                is_gpu,
+                                args.resilience_prealloc_switch,
+                                "incremental-swap",
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[IncrementalSwap] swap error on tick={}: {}",
+                                decode_token_index, e
+                            );
+                        }
+                    }
+                }
+                // ENG-ALG-233: retire plan when all layers have been drained (INV-145).
+                if inc_plan.is_done() {
+                    eprintln!(
+                        "[IncrementalSwap] plan complete (started_at_token={}, finished_at_token={})",
+                        inc_plan.started_at_token(),
+                        decode_token_index,
+                    );
+                    // LISWAP-2: drain async dispatcher to ensure all in-flight commits land
+                    // before the plan is retired. drain failure is non-fatal — prototype
+                    // robustness is secondary to measurement.
+                    if let Some(ref dispatcher) = async_swap_dispatcher {
+                        let drain_t = std::time::Instant::now();
+                        if let Err(e) = dispatcher.drain(std::time::Duration::from_secs(2)) {
+                            eprintln!("[LISWAP-2] drain failed: {e}");
+                        } else {
+                            eprintln!(
+                                "[LISWAP-2] dispatcher drained: {:.1}ms",
+                                drain_t.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                    }
+                    incremental_force_swap_plan = None;
+                }
+            }
+            // ── End Layer-Incremental Swap dispatch ────────────────────────────
+
+            // ── LISWAP-4 Intra-forward Swap retire (INV-150) ──────────────────
+            // After every decode token, check whether the in-flight plan is
+            // complete. If so, drain dispatcher, synchronize backend, bump
+            // ratio_generation, invalidate noshuffle SOA registry, and retire
+            // the hook to None.
+            if let Some(hook) = intra_forward_swap_hook.clone()
+                && hook.plan_is_complete()
+            {
+                let drain_t = std::time::Instant::now();
+                let backend_for_invalidate: Arc<dyn Backend> = gpu_backend_arc
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&backend));
+                let invalidate = move || {
+                    backend_for_invalidate.invalidate_noshuffle_soa_registry();
+                };
+                match hook.finalize(
+                    &model.ratio_generation,
+                    invalidate,
+                    std::time::Duration::from_secs(10),
+                ) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[IntraForwardSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms)",
+                            decode_token_index,
+                            drain_t.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        #[cfg(feature = "opencl")]
+                        remap_weights_for_cpu_after_swap(
+                            &mut model,
+                            &backend,
+                            is_gpu,
+                            args.resilience_prealloc_switch,
+                            "intra-forward-swap",
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[IntraForwardSwap] finalize failed at token={}: {}",
+                            decode_token_index, e
+                        );
+                    }
+                }
+                intra_forward_swap_hook = None; // retire
+            }
+            // ── End LISWAP-4 retire ────────────────────────────────────────────
 
             // ── H2O Debug: per-step diagnostics ──
             if args.h2o_debug {
@@ -5273,7 +5963,16 @@ fn main() -> anyhow::Result<()> {
                         target_dtype,
                         importance_table_for_swap.as_ref(),
                         executor,
+                        gpu_backend_arc.as_ref(),
                         &cpu_backend_arc,
+                    );
+                    #[cfg(feature = "opencl")]
+                    remap_weights_for_cpu_after_swap(
+                        &mut model,
+                        &backend,
+                        is_gpu,
+                        args.resilience_prealloc_switch,
+                        "SwapWeights",
                     );
                 }
 
@@ -5611,6 +6310,48 @@ fn main() -> anyhow::Result<()> {
                                     );
                                     // Reallocate workspace
                                     let layer0_probe = model.layers[0].load_weights();
+                                    // Diagnostic: dump per-weight buffer kind for
+                                    // layer 0 so a "B is not OpenCL buffer" crash
+                                    // on the next forward immediately points at
+                                    // which tensor is misbacked. Single-shot,
+                                    // layer 0 only — every other layer has the
+                                    // same backing pattern by construction.
+                                    #[cfg(feature = "opencl")]
+                                    {
+                                        use llm_rs2::backend::opencl::buffer_kind_label;
+                                        let l0 = &layer0_probe;
+                                        let mut log = String::from(
+                                            "[Partition] Layer 0 weight buffer kinds: ",
+                                        );
+                                        log.push_str(&format!(
+                                            "wq={} wk={} wv={} wo={} ",
+                                            buffer_kind_label(l0.wq.buffer().as_ref()),
+                                            buffer_kind_label(l0.wk.buffer().as_ref()),
+                                            buffer_kind_label(l0.wv.buffer().as_ref()),
+                                            buffer_kind_label(l0.wo.buffer().as_ref()),
+                                        ));
+                                        log.push_str(&format!(
+                                            "w_gate={} w_up={} w_down={} ",
+                                            buffer_kind_label(l0.w_gate.buffer().as_ref()),
+                                            buffer_kind_label(l0.w_up.buffer().as_ref()),
+                                            buffer_kind_label(l0.w_down.buffer().as_ref()),
+                                        ));
+                                        if let Some(ref ctx) = l0.partition_ctx {
+                                            log.push_str(&format!(
+                                                "gate_gpu_slice={} up_gpu_slice={} down_gpu_slice={}",
+                                                buffer_kind_label(
+                                                    ctx.gate.gpu_slice.buffer().as_ref()
+                                                ),
+                                                buffer_kind_label(
+                                                    ctx.up.gpu_slice.buffer().as_ref()
+                                                ),
+                                                buffer_kind_label(
+                                                    ctx.down.gpu_slice.buffer().as_ref()
+                                                ),
+                                            ));
+                                        }
+                                        eprintln!("{log}");
+                                    }
                                     if let Some(ref ctx) = layer0_probe.partition_ctx {
                                         let gpu_alloc =
                                             make_partition_gpu_alloc(&*backend, decode_mem);
@@ -5624,15 +6365,6 @@ fn main() -> anyhow::Result<()> {
                                                 cpu_backend_arc.clone(),
                                             )?,
                                         )));
-                                        if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
-                                            eprintln!(
-                                                "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
-                                            );
-                                        } else {
-                                            eprintln!(
-                                                "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
-                                            );
-                                        }
                                     } else {
                                         gen_ws.partition_ws = None;
                                     }
@@ -5917,15 +6649,6 @@ fn main() -> anyhow::Result<()> {
                                     cpu_backend_arc.clone(),
                                 ) {
                                     gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(ws)));
-                                    if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
-                                        eprintln!(
-                                            "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
-                                        );
-                                    }
                                 }
                             } else {
                                 gen_ws.partition_ws = None;
@@ -6467,13 +7190,9 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
     // ISSUE-6 guard: OpenCL device-only 버퍼는 `as_ptr()`이 명시적으로
     // `ptr::null()`을 반환한다 (engine/src/backend/opencl/buffer.rs). 이 경우
     // `Tensor::as_slice::<T>()`이 `(ptr=null, len=size/sizeof T)` 슬라이스를
-    //만들고, 아래 `v_src!` 매크로가 그 슬라이스를 `VDataSource`에 담아
-    // `read_v_f32()`에서 `data[offset..end]`로 인덱싱하는 순간 null deref →
-    // SIGSEGV 로 이어진다. signal 경로(RequestQcf)에서 host-mapped KV 없이
-    // QCF 추정이 요청될 수 있으므로, dtype 무관하게 v_buffer 호스트 포인터가
-    // 유효한 경우에만 KV 기반 4종(sliding / h2o / streaming / d2o)을 계산한다.
-    // KIVI / LayerSkip 추정은 v_buffer 호스트 슬라이스에 의존하지 않으므로
-    // 이 guard 밖에 둔다.
+    // 만들고 `read_v_f32()`에서 `data[offset..end]`로 인덱싱하는 순간 null
+    // deref → SIGSEGV. `VDataSource::from_kv_cache(None)` 가 host pointer 검사
+    // 후 `None`을 돌려주므로 device-only 캐시는 자연스럽게 skip된다.
     let v_host_readable =
         !ctx.kv_caches.is_empty() && ctx.kv_caches.iter().all(|c| !c.v_buffer.as_ptr().is_null());
     if !ctx.kv_caches.is_empty() && ctx.kv_caches[0].current_pos > 0 && !v_host_readable {
@@ -6484,29 +7203,19 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
     if v_host_readable && ctx.kv_caches[0].current_pos > 0 {
         let cache = &ctx.kv_caches[0];
         let current_pos = cache.current_pos;
-        let capacity = cache.capacity();
-        let layout = cache.layout();
-        let n_kv_heads = cache.kv_heads();
-        let head_dim = cache.head_dim();
-
         let keep_ratio = 0.5f32;
         let target_len = (current_pos as f32 * keep_ratio) as usize;
         let protected_prefix = 4usize;
 
-        // Get attention scores and V data for unified QCF
         let scores_opt = ctx
             .score_accumulator
             .filter(|a| a.is_active())
             .map(|a| a.importance_scores());
-
         let head_attn_opt = ctx
             .score_accumulator
             .filter(|a| a.is_active())
             .and_then(|a| a.last_step_head_attn());
 
-        // Build V data source — supports F32, F16, and Q4_0 KV caches.
-        let v_dtype = cache.v_buffer.dtype();
-        // Fallback flat scores if no accumulator
         let fallback_scores: Vec<f32>;
         let attention_scores: &[f32] = if let Some(scores) = scores_opt {
             scores
@@ -6515,103 +7224,76 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
             &fallback_scores
         };
 
-        // Helper macro: build VDataSource from the cache V buffer based on dtype.
-        macro_rules! v_src {
-            () => {
-                match v_dtype {
-                    DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-                    DType::Q4_0 => VDataSource::Q4_0(
-                        cache.v_buffer.as_slice::<llm_rs2::core::quant::BlockQ4_0>(),
-                    ),
-                    _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-                }
-            };
-        }
-
-        let aggregation = AggregationMode::Mean;
-
         if target_len < current_pos {
-            // ── 1. Sliding window QCF ──
-            {
-                let params = UnifiedQcfParams {
-                    action: QcfActionType::EvictSliding { target_len },
-                    v_source: v_src!(),
-                    attention_scores,
-                    head_attn: head_attn_opt,
-                    n_kv_heads,
-                    head_dim,
-                    current_pos,
-                    capacity,
-                    layout,
-                    aggregation: aggregation.clone(),
-                };
-                let (qcf, _) = compute_unified_qcf(&params);
-                estimates.insert("kv_evict_sliding".to_string(), qcf);
-            }
-
-            // ── 2. H2O eviction QCF (needs scores) ──
-            if scores_opt.is_some() {
-                let params = UnifiedQcfParams {
-                    action: QcfActionType::EvictH2o {
+            // (id, action, requires_scores). `kv_evict_sliding` needs no scores;
+            // h2o/d2o use heavy-hitter selection so are gated on score availability.
+            // Streaming QCF only fires when streaming_config is set.
+            let mut actions: Vec<(&'static str, QcfActionType, bool)> = vec![
+                (
+                    "kv_evict_sliding",
+                    QcfActionType::EvictSliding { target_len },
+                    false,
+                ),
+                (
+                    "kv_evict_h2o",
+                    QcfActionType::EvictH2o {
                         target_len,
                         keep_ratio: 0.5,
                         protected_prefix,
                     },
-                    v_source: v_src!(),
-                    attention_scores,
-                    head_attn: head_attn_opt,
-                    n_kv_heads,
-                    head_dim,
-                    current_pos,
-                    capacity,
-                    layout,
-                    aggregation: aggregation.clone(),
-                };
-                let (qcf, _) = compute_unified_qcf(&params);
-                estimates.insert("kv_evict_h2o".to_string(), qcf);
-            }
-
-            // ── 3. Streaming QCF ──
+                    true,
+                ),
+                (
+                    "kv_merge_d2o",
+                    QcfActionType::MergeD2o {
+                        target_len,
+                        keep_ratio: 0.5,
+                        protected_prefix,
+                    },
+                    true,
+                ),
+            ];
             if let Some((sink_size, window_size)) = ctx.streaming_config {
-                let params = UnifiedQcfParams {
-                    action: QcfActionType::EvictStreaming {
+                actions.push((
+                    "kv_evict_streaming",
+                    QcfActionType::EvictStreaming {
                         sink_size,
                         window_size,
                     },
-                    v_source: v_src!(),
-                    attention_scores,
-                    head_attn: head_attn_opt,
-                    n_kv_heads,
-                    head_dim,
-                    current_pos,
-                    capacity,
-                    layout,
-                    aggregation: aggregation.clone(),
-                };
-                let (qcf, _) = compute_unified_qcf(&params);
-                estimates.insert("kv_evict_streaming".to_string(), qcf);
+                    false,
+                ));
             }
 
-            // ── 4. D2O merge QCF (needs scores) ──
-            if scores_opt.is_some() {
+            for (id, action, requires_scores) in actions {
+                if requires_scores && scores_opt.is_none() {
+                    continue;
+                }
+                let Some(v_source) = VDataSource::from_kv_cache(cache, None) else {
+                    continue;
+                };
+                // D2O simulator (paper Eq.8) needs K for nearest-neighbour
+                // matching; other actions ignore `k_source`.
+                let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
+                    VDataSource::k_from_kv_cache(cache)
+                } else {
+                    None
+                };
                 let params = UnifiedQcfParams {
-                    action: QcfActionType::MergeD2o {
-                        target_len,
-                        keep_ratio: 0.5,
-                        protected_prefix,
-                    },
-                    v_source: v_src!(),
+                    action,
+                    v_source,
+                    k_source,
                     attention_scores,
                     head_attn: head_attn_opt,
-                    n_kv_heads,
-                    head_dim,
+                    n_kv_heads: cache.kv_heads(),
+                    head_dim: cache.head_dim(),
                     current_pos,
-                    capacity,
-                    layout,
-                    aggregation: aggregation.clone(),
+                    capacity: cache.capacity(),
+                    layout: cache.layout(),
+                    aggregation: AggregationMode::Mean,
+                    beta: 1.0,
                 };
                 let (qcf, _) = compute_unified_qcf(&params);
-                estimates.insert("kv_merge_d2o".to_string(), qcf);
+                estimates.insert(id.to_string(), qcf);
             }
         }
     }
@@ -6650,6 +7332,232 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
 
 // ── Weight swap dispatch (ENG-ALG-214-ROUTE) ────────────────────────────────
 
+/// Run a `SwapExecutor` over the given target layers.
+///
+/// Centralises the boilerplate shared by the four call sites that execute a
+/// weight swap (`--force-swap-ratio`, two QCF-dump warmup paths, and the
+/// `EngineCommand::SwapWeights` direct dispatch). Always targets `Q4_0`
+/// (only currently-supported swap dtype, INV-126). Resolves the swap backend
+/// to GPU when available, otherwise CPU — matches the original logic that
+/// `SwapExecutor` branches on `backend.name()` to pick the AUF SOA fast path.
+#[allow(clippy::too_many_arguments)]
+fn run_layer_swap(
+    model: &llm_rs2::models::transformer::TransformerModel,
+    target_layers: &[usize],
+    gpu_backend: Option<&Arc<dyn Backend>>,
+    cpu_backend: &Arc<dyn Backend>,
+    async_dispatcher: Option<&llm_rs2::models::weights::AsyncSwapDispatcher>,
+    #[cfg(feature = "opencl")] host_ptr_pool: Option<
+        Arc<llm_rs2::backend::opencl::host_ptr_pool::HostPtrPool>,
+    >,
+) -> Result<llm_rs2::models::weights::SwapReport, llm_rs2::models::weights::SwapError> {
+    let swap_memory = Galloc::new();
+    let swap_backend: Arc<dyn Backend> =
+        gpu_backend.cloned().unwrap_or_else(|| cpu_backend.clone());
+    // ENG-ALG-228: attach the model's async release worker so Stage (c) enqueues
+    // displaced LayerWeights for background drop instead of blocking inline.
+    let executor = llm_rs2::models::weights::SwapExecutor::new_with_worker(
+        DType::Q4_0,
+        &model.config,
+        swap_backend,
+        &swap_memory,
+        Arc::clone(&model.release_worker),
+    );
+    // LISWAP-3 prototype: if a host_ptr pool is supplied, attach it so the
+    // AOS materialise path uses the zero-copy slot pool.
+    #[cfg(feature = "opencl")]
+    let executor = match host_ptr_pool {
+        Some(pool) => executor.with_host_ptr_pool(pool),
+        None => executor,
+    };
+    executor.execute_on_slots(
+        model.layers.as_slice(),
+        model.secondary_mmap.as_ref(),
+        &model.ratio_generation,
+        target_layers,
+        async_dispatcher,
+    )
+}
+
+/// Re-map weight tensors for CPU access after a weight swap.
+///
+/// Required when running on GPU with `--secondary-layout aos +
+/// --resilience-prealloc-switch`: `SwapExecutor::materialise_tensor` lands an
+/// unmapped `UnifiedBuffer` in the new `LayerWeights` snapshot, and the next
+/// `switch_hw cpu` directive segfaults on a null host pointer.  Idempotent —
+/// already-mapped tensors short-circuit in `map_one`.
+#[cfg(feature = "opencl")]
+fn remap_weights_for_cpu_after_swap(
+    model: &mut llm_rs2::models::transformer::TransformerModel,
+    backend: &Arc<dyn Backend>,
+    is_gpu: bool,
+    enabled: bool,
+    label: &str,
+) {
+    if !is_gpu || !enabled {
+        return;
+    }
+    match model.map_weights_for_cpu(backend) {
+        Ok(0) => {}
+        Ok(n) => eprintln!(
+            "[Backend] Re-mapped {} weight tensors after {} (host pointer restored)",
+            n, label,
+        ),
+        Err(e) => eprintln!(
+            "[Backend] Post-swap re-map failed: {} (switch_hw cpu may crash)",
+            e,
+        ),
+    }
+}
+
+/// Result of a QCF-dump warmup workflow: importance table plus optional swap
+/// decision (when `--force-swap-ratio` was applied).
+struct QcfWarmupResult {
+    importance: llm_rs2::core::qcf::ImportanceTable,
+    decision: Option<llm_rs2::models::weights::SwapDecision>,
+}
+
+/// QCF-dump warmup workflow shared by `--ppl/generation` and `--eval-ll` modes.
+///
+/// 1. Warmup prefill with `ImportanceCollector` over `warmup_ids`.
+/// 2. Build `ImportanceTable`, reset KV caches to zero.
+/// 3. If `force_ratio` is set, run `WeightSwapDecider` and dispatch the swap.
+///
+/// `log_prefix` is concatenated immediately after `[QCF-dump]` in every log
+/// line emitted by this helper, so any non-empty value must include its own
+/// leading space (e.g. `" eval-ll"`). The caller must ensure `warmup_ids` is
+/// non-empty.
+#[allow(clippy::too_many_arguments)]
+fn run_qcf_warmup_workflow(
+    model: &llm_rs2::models::transformer::TransformerModel,
+    backend: &Arc<dyn Backend>,
+    memory: &dyn Memory,
+    kv_caches: &mut [KVCache],
+    vocab_size: usize,
+    warmup_ids: &[u32],
+    force_ratio: Option<f32>,
+    gpu_backend: Option<&Arc<dyn Backend>>,
+    cpu_backend: &Arc<dyn Backend>,
+    log_prefix: &str,
+) -> anyhow::Result<QcfWarmupResult> {
+    use llm_rs2::core::qcf::ImportanceCollector;
+    use llm_rs2::models::weights::WeightSwapDecider;
+
+    let actual_warmup_len = warmup_ids.len();
+    eprintln!(
+        "[QCF-dump]{} warmup prefill: {} tokens",
+        log_prefix, actual_warmup_len,
+    );
+
+    // ── Warmup prefill with ImportanceCollector ───────────────────────────────
+    let mut collector = ImportanceCollector::new();
+    {
+        let warmup_buf = Galloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
+        unsafe {
+            let ptr = warmup_buf.as_mut_ptr() as *mut u32;
+            for (i, &id) in warmup_ids.iter().enumerate() {
+                *ptr.add(i) = id;
+            }
+        }
+        let cpu_warmup = Tensor::new(
+            Shape::new(vec![1, actual_warmup_len]),
+            warmup_buf,
+            Arc::new(CpuBackend::new()),
+        );
+        let warmup_input = backend.copy_from(&cpu_warmup)?;
+
+        let warmup_logits_buf = memory.alloc(actual_warmup_len * vocab_size * 4, DType::F32)?;
+        let mut warmup_logits = Tensor::new(
+            Shape::new(vec![1, actual_warmup_len, vocab_size]),
+            warmup_logits_buf,
+            backend.clone(),
+        );
+
+        model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &warmup_input,
+            start_pos: 0,
+            kv_caches,
+            backend,
+            memory,
+            logits_out: &mut warmup_logits,
+            x_gen: None,
+            workspace: None,
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: Some(&mut collector),
+            logits_last_only: false,
+            variance_collector: None,
+            prefill_workspace: None,
+
+            layer_boundary_hook: None,
+        })?;
+        backend.synchronize()?;
+    }
+
+    // ── Build ImportanceTable + reset KV cache ────────────────────────────────
+    let imp_table = collector.build();
+    eprintln!(
+        "[QCF-dump]{} ImportanceTable built: {} entries",
+        log_prefix,
+        imp_table.len(),
+    );
+    for kv in kv_caches.iter_mut() {
+        kv.current_pos = 0;
+    }
+
+    // ── Optional swap with importance-guided decider ──────────────────────────
+    let decision = if let Some(ratio) = force_ratio {
+        let ratio = ratio.clamp(0.0, 1.0);
+        let decider = WeightSwapDecider {
+            importance: Some(&imp_table),
+            noise: Some(model.quant_noise.as_ref()),
+            n_decoder_layers: model.layers.len(),
+            currently_swapped: &[],
+        };
+        let decision = decider.decide(ratio);
+
+        if decision.selected_layers.is_empty() {
+            eprintln!(
+                "[QCF-dump]{} swap: ratio={:.2} → 0 layers selected (qcf=0.0)",
+                log_prefix, ratio,
+            );
+        } else {
+            let report = run_layer_swap(
+                model,
+                &decision.selected_layers,
+                gpu_backend,
+                cpu_backend,
+                None,
+                // LISWAP-3: QCF dump path does not exercise the pool yet —
+                // Stage 3 prototype only wires --force-swap-ratio paths.
+                #[cfg(feature = "opencl")]
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("[QCF-dump]{} swap failed: {}", log_prefix, e))?;
+            eprintln!(
+                "[QCF-dump]{} swap: ratio={:.2}, layers={}/{}, qcf_pred={:.4}, \
+                 fallback={}, latency={:.1}ms",
+                log_prefix,
+                ratio,
+                report.swapped.len(),
+                model.layers.len(),
+                decision.qcf_swap_estimate,
+                decision.fallback_used,
+                report.latency_ms,
+            );
+        }
+        Some(decision)
+    } else {
+        None
+    };
+
+    Ok(QcfWarmupResult {
+        importance: imp_table,
+        decision,
+    })
+}
+
 /// Execute a SwapWeights command: validate → decide → execute → report.
 ///
 /// This is the direct-dispatch path mandated by ENG-ALG-214-ROUTE.  The
@@ -6664,10 +7572,9 @@ fn dispatch_swap_weights(
     target_dtype: llm_shared::DtypeTag,
     importance_table: Option<&llm_rs2::core::qcf::ImportanceTable>,
     executor: &mut llm_rs2::resilience::CommandExecutor,
+    gpu_backend: Option<&std::sync::Arc<dyn llm_rs2::core::backend::Backend>>,
     cpu_backend: &std::sync::Arc<dyn llm_rs2::core::backend::Backend>,
 ) {
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::models::weights::swap_executor::SwapExecutor;
     use llm_rs2::models::weights::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
     use llm_shared::DtypeTag;
 
@@ -6714,18 +7621,22 @@ fn dispatch_swap_weights(
     }
 
     // ── 4. Execute ─────────────────────────────────────────────────────────
-    let swap_memory = llm_rs2::memory::galloc::Galloc::new();
-    let executor_sw = SwapExecutor::new(
-        DType::Q4_0,
-        &model.config,
-        cpu_backend.clone(),
-        &swap_memory,
-    );
-
-    let t_start = std::time::Instant::now();
-    match executor_sw.execute(model, &decision.selected_layers) {
+    match run_layer_swap(
+        model,
+        &decision.selected_layers,
+        gpu_backend,
+        cpu_backend,
+        None,
+        // LISWAP-3: signal-driven dispatch path does not exercise the
+        // pool yet — Stage 3 prototype only wires --force-swap-ratio paths.
+        #[cfg(feature = "opencl")]
+        None,
+    ) {
         Ok(report) => {
-            let latency_ms = t_start.elapsed().as_millis() as u64;
+            // SwapExecutor measures execute()-only latency in `report.latency_ms`,
+            // which matches the prior `t_start.elapsed()` scope (the executor
+            // construction itself is sub-microsecond and was excluded before).
+            let latency_ms = report.latency_ms as u64;
 
             // ── 5. Build WeightSwapReport (MSG-089) ──────────────────────
             let layers_swapped: Vec<llm_shared::LayerSwapEntry> = report
@@ -6771,7 +7682,22 @@ fn dispatch_swap_weights(
             });
         }
         Err(e) => {
-            eprintln!("[WeightSwap] execute failed: {}", e);
+            // ENG-ALG-228: surface drain timeout distinctly so operators know
+            // the swap was rejected due to INV-141 rather than a data error.
+            if let llm_rs2::models::weights::SwapError::ReleaseDrainTimeout {
+                pending,
+                timeout_ms,
+            } = &e
+            {
+                eprintln!(
+                    "[WeightSwap] REJECTED (INV-141): release worker still has {} \
+                     pending job(s) after {}ms drain — swap skipped to prevent \
+                     memory leak accumulation",
+                    pending, timeout_ms
+                );
+            } else {
+                eprintln!("[WeightSwap] execute failed: {}", e);
+            }
         }
     }
 }
@@ -7210,6 +8136,8 @@ fn run_kivi_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         // Collect flush QCF metrics from prefill
@@ -7289,6 +8217,8 @@ fn run_kivi_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         start_pos += 1;
 
@@ -7561,6 +8491,8 @@ fn run_kivi(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         // Sample last token from prefill logits
@@ -7719,6 +8651,8 @@ fn run_kivi(
                 logits_last_only: false,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             })?;
 
             // Rebuild plan after fallback. Rejection for partition-active
@@ -8191,6 +9125,8 @@ fn run_offload(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         // Sample last token from prefill logits
@@ -8292,6 +9228,8 @@ fn run_offload(
                 logits_last_only: false,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             },
             &mut prefetch,
         )?;
@@ -8452,8 +9390,6 @@ fn run_ppl(
     protected_prefix: usize,
     skip_config: Option<&llm_rs2::core::skip_config::SkipConfig>,
 ) -> anyhow::Result<PplResult> {
-    use llm_rs2::core::qcf::QcfConfig;
-
     // ── 1. Read and tokenize reference text ──
     let text = std::fs::read_to_string(text_file)
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", text_file, e))?;
@@ -8562,14 +9498,6 @@ fn run_ppl(
     let mut nll_count: usize = 0;
     // PPL v3: collect QCF for every eviction event
     let mut qcf_events: Vec<serde_json::Value> = Vec::new();
-    let qcf_config = QcfConfig {
-        mode: match args.qcf_mode.as_str() {
-            "caote" => llm_rs2::core::qcf::QcfMode::Caote,
-            "both" => llm_rs2::core::qcf::QcfMode::Both,
-            _ => llm_rs2::core::qcf::QcfMode::Attn,
-        },
-        ..QcfConfig::default()
-    };
     let overall_start = std::time::Instant::now();
 
     // ── 4. Prefill phase ──
@@ -8615,6 +9543,8 @@ fn run_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
 
         // Read all prefill logits to CPU
@@ -8682,6 +9612,8 @@ fn run_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         start_pos += 1;
 
@@ -8747,71 +9679,65 @@ fn run_ppl(
                     let eviction_ratio = result.tokens_removed as f32 / before_len as f32;
                     let ppl_at_event = (total_nll / nll_count as f64).exp();
 
-                    let (qcf_attn_raw, qcf_attn_norm, qcf_caote_value) =
-                        if let Some(acc) = score_accumulator.as_ref() {
-                            if let Some(head_attn) = acc.last_step_head_attn() {
-                                let positions = if score_based_eviction {
-                                    let scores = acc.importance_scores();
-                                    let target_len = ((before_len as f32) * ratio) as usize;
-                                    let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
-                                        scores,
-                                        protected_prefix,
-                                        args.h2o_keep_ratio,
-                                        before_len,
-                                        target_len,
-                                    );
-                                    evicted.iter().map(|(pos, _)| *pos).collect::<Vec<_>>()
-                                } else {
-                                    llm_rs2::core::qcf::identify_evicted_sliding(
-                                        protected_prefix,
-                                        result.tokens_removed,
-                                        before_len,
-                                    )
-                                };
-
-                                // QCF-ATTN v2 (closed-form)
-                                let n_kv_heads = kv_caches[0].kv_heads().max(1);
-                                let max_seq_len = head_attn.len() / n_kv_heads;
-                                let attn_metric = llm_rs2::core::qcf::compute_qcf_attn_v2(
-                                    head_attn,
-                                    &positions,
-                                    n_kv_heads,
-                                    max_seq_len,
-                                    eviction_ratio,
-                                );
-
-                                // QCF-CAOTE
-                                let caote = if can_compute_qcf && !positions.is_empty() {
-                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
-                                        &positions,
-                                        head_attn,
-                                        &kv_caches[0],
-                                        &qcf_config,
-                                        v_cpu_data.as_deref(),
-                                    );
-                                    metric.raw_value as f64
-                                } else {
-                                    0.0
-                                };
-
-                                (
-                                    attn_metric.raw_value as f64,
-                                    attn_metric.normalized_value as f64,
-                                    caote,
+                    let qcf_caote_value = if can_compute_qcf
+                        && let Some(acc) = score_accumulator.as_ref()
+                        && let Some(head_attn) = acc.last_step_head_attn()
+                    {
+                        use llm_rs2::core::qcf::{
+                            AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource,
+                            compute_unified_qcf,
+                        };
+                        let target_len = ((before_len as f32) * ratio) as usize;
+                        let cache = &kv_caches[0];
+                        let v_cpu_bytes: Option<&[u8]> = v_cpu_data.as_deref().map(|s| {
+                            // Reinterpret &[f32] as &[u8] so the unified helper handles it.
+                            unsafe {
+                                std::slice::from_raw_parts(
+                                    s.as_ptr() as *const u8,
+                                    std::mem::size_of_val(s),
                                 )
-                            } else {
-                                (0.0, 0.0, 0.0)
+                            }
+                        });
+                        let action = if score_based_eviction {
+                            QcfActionType::EvictH2o {
+                                target_len,
+                                keep_ratio: args.h2o_keep_ratio,
+                                protected_prefix,
                             }
                         } else {
-                            (0.0, 0.0, 0.0)
+                            QcfActionType::EvictSliding { target_len }
                         };
+                        match VDataSource::from_kv_cache(cache, v_cpu_bytes) {
+                            Some(v_source) => {
+                                let params = UnifiedQcfParams {
+                                    action,
+                                    v_source,
+                                    // PPL eval site only triggers Sliding/H2O,
+                                    // never D2O — `k_source` is unused.
+                                    k_source: None,
+                                    attention_scores: acc.importance_scores(),
+                                    head_attn: Some(head_attn),
+                                    n_kv_heads: cache.kv_heads(),
+                                    head_dim: cache.head_dim(),
+                                    current_pos: before_len,
+                                    capacity: cache.capacity(),
+                                    layout: cache.layout(),
+                                    aggregation: AggregationMode::Mean,
+                                    beta: 1.0,
+                                };
+                                let (qcf, _) = compute_unified_qcf(&params);
+                                qcf as f64
+                            }
+                            None => 0.0,
+                        }
+                    } else {
+                        0.0
+                    };
 
                     qcf_events.push(serde_json::json!({
                         "step": i,
                         "tokens_evicted": result.tokens_removed,
                         "eviction_ratio": eviction_ratio,
-                        "qcf_attn_raw": qcf_attn_raw,
-                        "qcf_attn_norm": qcf_attn_norm,
                         "qcf_caote": qcf_caote_value,
                         "ppl_at_step": ppl_at_event,
                     }));
@@ -8856,18 +9782,10 @@ fn run_ppl(
 
     // Compute summary stats from all eviction events (v3)
     let n_evictions = qcf_events.len();
-    let qcf_sum_attn_norm: f64 = qcf_events
-        .iter()
-        .filter_map(|e| e["qcf_attn_norm"].as_f64())
-        .sum();
     let qcf_sum_caote: f64 = qcf_events
         .iter()
         .filter_map(|e| e["qcf_caote"].as_f64())
         .sum();
-    let qcf_max_attn_norm: f64 = qcf_events
-        .iter()
-        .filter_map(|e| e["qcf_attn_norm"].as_f64())
-        .fold(0.0f64, f64::max);
     let qcf_max_caote: f64 = qcf_events
         .iter()
         .filter_map(|e| e["qcf_caote"].as_f64())
@@ -8881,9 +9799,7 @@ fn run_ppl(
         "wall_time_s": wall_time,
         "n_evictions": n_evictions,
         "qcf_events": qcf_events,
-        "qcf_sum_attn_norm": qcf_sum_attn_norm,
         "qcf_sum_caote": qcf_sum_caote,
-        "qcf_max_attn_norm": qcf_max_attn_norm,
         "qcf_max_caote": qcf_max_caote,
         "config": {
             "model": args.model_path,
@@ -9241,6 +10157,8 @@ impl<'a> StandardTurnExec<'a> {
             logits_last_only: true,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         self.pos += tokens.len();
 
@@ -9368,6 +10286,8 @@ impl<'a> ChatTurnExec for StandardTurnExec<'a> {
             logits_last_only: true,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         self.pos += 1;
 
@@ -9466,8 +10386,8 @@ fn build_chat_eviction(
             keep_ratio: args.d2o_keep_ratio,
             protected_prefix: actual_protected_prefix,
             target_ratio: args.eviction_target_ratio,
-            ema_alpha: args.d2o_ema_alpha,
             ema_beta: args.d2o_ema_beta,
+            merge_e: args.d2o_merge_e,
             use_layer_allocation: args.d2o_layer_alloc,
             protected_layers: args.d2o_protected_layers.clone().unwrap_or_default(),
         });
@@ -9496,13 +10416,8 @@ fn build_chat_eviction(
                 };
                 Box::new(StreamingLLMPolicy::new(args.sink_size, window))
             }
-            "h2o" => Box::new(H2OPolicy::new(
-                args.h2o_recent_window,
-                args.h2o_keep_ratio,
-                actual_protected_prefix,
-            )),
+            "h2o" => Box::new(H2OPolicy::new(args.h2o_keep_ratio, actual_protected_prefix)),
             "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                args.h2o_recent_window,
                 args.h2o_keep_ratio,
                 actual_protected_prefix,
             )),
@@ -9707,6 +10622,8 @@ impl<'a> ChatTurnExec for KiviTurnExec<'a> {
             logits_last_only: true,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         self.pos += tokens.len();
 
@@ -9742,6 +10659,8 @@ impl<'a> ChatTurnExec for KiviTurnExec<'a> {
             logits_last_only: true,
             variance_collector: None,
             prefill_workspace: None,
+
+            layer_boundary_hook: None,
         })?;
         self.pos += 1;
 
@@ -9942,6 +10861,8 @@ impl<'a> ChatTurnExec for OffloadTurnExec<'a> {
                 logits_last_only: true,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             },
             &mut self.prefetch,
         )?;
@@ -9980,6 +10901,8 @@ impl<'a> ChatTurnExec for OffloadTurnExec<'a> {
                 logits_last_only: true,
                 variance_collector: None,
                 prefill_workspace: None,
+
+                layer_boundary_hook: None,
             },
             &mut self.prefetch,
         )?;

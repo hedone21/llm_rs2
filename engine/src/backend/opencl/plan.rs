@@ -16,7 +16,7 @@ use crate::core::backend::Backend;
 use crate::core::tensor::Tensor;
 use crate::layers::tensor_partition::{
     PartitionContext, PartitionPath, partition_plan_debug_enabled, partition_plan_enabled,
-    partition_replicate_norm_enabled, partition_trace_enabled, record_partition_timing,
+    partition_trace_enabled, record_partition_timing,
 };
 use crate::layers::workspace::PartitionWsCell;
 
@@ -395,9 +395,11 @@ pub struct PartitionPlanContext {
     pub rms_norm_add_unit: bool,
     /// Debugging: which layer this step belongs to.
     pub layer_idx: usize,
-    /// Which residual transport path this plan was built against. Plan path
-    /// only supports `SyncRead` today (no async DMA, no replicate_norm).
-    pub partition_path: PartitionPath,
+    // Note: residual transport path is determined dynamically per-call inside
+    // `PartitionStep::run` (poll-flag + non-null `residual_host_ptr` → Zcopy
+    // fast memcpy, else SyncRead via `enqueue_read_buffer`). Earlier code
+    // hardcoded `SyncRead` here, which made the trace counter mislabel every
+    // dispatch even when the fast path was active. Removed 2026-05-04.
     /// INV-120 generation captured at build time. `PartitionStep::run` loads
     /// `PartitionContext.ratio_generation` with `Acquire` and compares; a
     /// miss returns `PlanInvalidated` to the executor.
@@ -511,6 +513,14 @@ impl PartitionStep {
         //    done) and performs the residual DMA read.
         let queue = backend.queue.as_core();
         let poll_flag = crate::layers::tensor_partition::partition_poll_flag_enabled();
+        // Actual residual transport path used this dispatch — drives the trace
+        // counter at the end. Zcopy when the poll-flag fast memcpy from the
+        // permanent-mapped `residual_host_ptr` runs; SyncRead otherwise.
+        let actual_path = if poll_flag && !self.cpu_ctx.residual_host_ptr.is_null() {
+            PartitionPath::Zcopy
+        } else {
+            PartitionPath::SyncRead
+        };
         // SAFETY: `workspace` is owned by this plan and only accessed here.
         let pw: &mut PartitionPlanWorkspace = unsafe { &mut *self.cpu_ctx.workspace.get() };
         if poll_flag {
@@ -887,14 +897,7 @@ impl PartitionStep {
             let cpu_ns = t_cpu.duration_since(t_read).as_nanos() as u64;
             let gpu_wait_ns = t_gpu.duration_since(t_cpu).as_nanos() as u64;
             let merge_ns = t_merge.duration_since(t_gpu).as_nanos() as u64;
-            record_partition_timing(
-                sync_ns,
-                dma_ns,
-                cpu_ns,
-                gpu_wait_ns,
-                merge_ns,
-                self.cpu_ctx.partition_path,
-            );
+            record_partition_timing(sync_ns, dma_ns, cpu_ns, gpu_wait_ns, merge_ns, actual_path);
         }
 
         Ok(())
@@ -3438,10 +3441,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
 /// `FfnVariant::Partitioned` that wraps GPU slice dispatches + a
 /// `PartitionPlanContext` carrying CPU-side handles.
 ///
-/// Returns `Err` when the plan path is disabled (`LLMRS_PARTITION_PLAN=0`) or
-/// when an unsupported mode is active (`LLMRS_PARTITION_REPLICATE_NORM=1`,
-/// `LLMRS_PARTITION_SYNC_EVERY_N>1`). The caller is expected to fall back to
-/// `forward_gen` in those cases.
+/// Returns `Err` when the plan path is disabled (`LLMRS_PARTITION_PLAN=0`).
+/// The caller falls back to `forward_gen` in that case.
 #[allow(clippy::too_many_arguments)]
 pub fn build_partitioned_layer_plan(
     config: &LayerPlanConfig,
@@ -3456,14 +3457,6 @@ pub fn build_partitioned_layer_plan(
 
     if !partition_plan_enabled() {
         anyhow::bail!("LLMRS_PARTITION_PLAN=0 — partition plan path disabled");
-    }
-    if partition_replicate_norm_enabled() {
-        anyhow::bail!("LLMRS_PARTITION_REPLICATE_NORM=1 not supported in plan path (arch A.8.2)");
-    }
-    if let Ok(v) = std::env::var("LLMRS_PARTITION_SYNC_EVERY_N")
-        && v.parse::<u64>().ok().is_some_and(|n| n > 1)
-    {
-        anyhow::bail!("LLMRS_PARTITION_SYNC_EVERY_N>1 not supported in plan path (arch A.8.3)");
     }
 
     let dim = config.dim;
@@ -3751,7 +3744,6 @@ pub fn build_partitioned_layer_plan(
         rms_norm_eps: config.rms_norm_eps,
         rms_norm_add_unit: false,
         layer_idx,
-        partition_path: PartitionPath::SyncRead,
         ratio_generation_at_build,
         ratio_generation_counter: gen_arc,
         build_thread_id: std::thread::current().id(),

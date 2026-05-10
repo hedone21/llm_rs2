@@ -1,0 +1,34 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: intra-forward mode — ratio=0.90, 25 target layers (LISWAP-4)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=67.66
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps overPrefill: 221.89 ms (5 tokens, 22.5 tok/s)
+Prefill(pure fwd): 221.86 ms (5 tokens, 22.5 tok/s) [sync'd forward only, comparable to llama-bench pp]
+ the lazy dog.
+The quick brown foxes jump over the sleepy dogs.If you don't get a response in 5 minutes, I will assume they were dead.
+For example "1" for one minute and "2" for two minutes (or whatever unit of time is convenient).
+If someone has been dead longer than that, your best bet is to forget about them.
+This post assumes that it's not an emergency. It may be. The link below goes into more detail:
+
+Done.
+[Profile] Event: End
+TTFT: 346.59 ms
+Decode: 49.00 ms/tok (20.4 tok/s) [99 tokens, forward only]
+Decode(excl tok[0]): 49.01 ms/tok (20.4 tok/s) [98 tokens] | tok[0]=48.45 ms
+Avg TBT: 52.97 ms (18.9 tokens/sec)
+END_EXIT=0

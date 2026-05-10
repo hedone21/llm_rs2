@@ -182,11 +182,14 @@ D-Bus 경로에서 Emergency level signal 수신 시:
 
 **[ENG-ST-032]** available_actions 계산 규칙: *(MUST)*
 
-매 Heartbeat 전송 시 `compute_available_actions(eviction_policy, kv_dtype)` 호출:
+매 Heartbeat 전송 시 `compute_available_actions(eviction_policy, kv_dtype, has_secondary)` 호출:
 
 - 기본: `["throttle", "switch_hw", "layer_skip"]`
 - `eviction_policy != "none"` 이면: `+ ["kv_evict_h2o", "kv_evict_sliding", "kv_evict_streaming"]`
 - `kv_dtype.starts_with('q')` 이면: `+ ["kv_quant_dynamic"]`
+- secondary GGUF/AUF 파일이 로드된 경우(`has_secondary == true`) 이면: `+ ["swap_weights"]`
+
+Capability 송출(`send_capability`)과 Heartbeat의 `available_actions`는 같은 조건(`args.secondary_gguf.is_some()`)을 공유해야 한다.
 
 **[ENG-ST-033]** EngineCommand 처리 결과 상태 전이 -- 13종 전수 열거: *(MUST)*
 

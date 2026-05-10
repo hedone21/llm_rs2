@@ -70,7 +70,13 @@ pub struct TransformerModel {
     /// snapshot per layer (INV-123). Mutation (partition install, backend
     /// migration) uses `LayerSlot::rcu_weights` to clone-and-install atomically.
     /// Spec: ENG-DAT-093.
-    pub layers: Vec<LayerSlot>,
+    ///
+    /// LISWAP-2 Phase 6.1 (prototype): layers are now wrapped in `Arc` so that
+    /// `AsyncSwapDispatcher::submit_commit` can take ownership of a slot handle
+    /// across thread boundaries (Phase 6.2 will activate the dispatcher path).
+    /// The forward / mutation surface is unchanged thanks to `Arc::deref` on
+    /// `LayerSlot`.
+    pub layers: Vec<Arc<LayerSlot>>,
     /// Optional secondary GGUF handle retained for the entire model lifetime
     /// (INV-125). `None` means the dynamic-swap path is disabled.
     /// Phase 1 only populates and keeps the handle alive; Phase 2
@@ -118,6 +124,17 @@ pub struct TransformerModel {
     /// - Secondary present but all layers failed: `QuantNoiseTable::uniform_ones(n)`.
     /// - Normal: `QuantNoiseTable::new_from_frobenius(...)` with `is_computed=true`.
     pub quant_noise: Arc<crate::models::weights::QuantNoiseTable>,
+    /// Async primary cl_mem release worker (ENG-ALG-228 / ENG-DAT-100).
+    ///
+    /// Spawned once at model creation. `SwapExecutor` enqueues displaced
+    /// `LayerWeights` here in Stage (c) to avoid blocking `clReleaseMemObject`
+    /// on the swap critical path. INV-141 is checked at the start of each
+    /// subsequent swap batch.
+    ///
+    /// `Arc` so `SwapExecutor` (which borrows references) can hold a clone
+    /// without lifetime coupling to the model. Drop impl joins the worker
+    /// thread, ensuring all destructors run before process exit.
+    pub release_worker: Arc<crate::models::weights::PrimaryReleaseWorker>,
 }
 
 pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -152,6 +169,14 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// When provided during prefill, captures per-layer attention column-sums.
     pub variance_collector:
         Option<&'a mut crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector>,
+    /// Optional layer boundary hook (LISWAP-4 / ENG-ALG-235).
+    ///
+    /// When `Some`, `forward_into` calls `hook.on_layer_boundary(idx, seq_len)`
+    /// after each layer's compute step (and inside the layer loop, before
+    /// `layer.forward`, calls the wait gate via `hook.pending_event_for(idx)`).
+    /// When `None`, the hot-path overhead is one `Option::is_some` branch
+    /// per layer (INV-147).
+    pub layer_boundary_hook: Option<&'a dyn crate::models::weights::LayerBoundaryHook>,
 }
 
 impl TransformerModel {
@@ -198,7 +223,7 @@ impl TransformerModel {
     ) -> Result<Self> {
         use crate::models::loader::TensorSource;
         use crate::models::loader::gguf::GgufSource;
-        use crate::models::weights::open_secondary_with_dtype;
+        use crate::models::weights::open_secondary_with_options;
 
         let primary_path = config
             .primary_source
@@ -211,9 +236,14 @@ impl TransformerModel {
             Some(p) => {
                 let gguf = source.gguf_file();
                 let model_config = source.config();
-                let handle =
-                    open_secondary_with_dtype(p, model_config, gguf, config.secondary_dtype_choice)
-                        .map_err(|e| anyhow!("secondary weight load failed: {e}"))?;
+                let handle = open_secondary_with_options(
+                    p,
+                    model_config,
+                    gguf,
+                    config.secondary_dtype_choice,
+                    config.secondary_layout_choice,
+                )
+                .map_err(|e| anyhow!("secondary weight load failed: {e}"))?;
                 Some(Arc::new(handle))
             }
         };
@@ -725,11 +755,35 @@ impl TransformerModel {
 
         let mut count = 0;
 
+        // `gguf.rs::load_raw` builds weights via `backend.copy_weight_from`,
+        // which on OpenCL leaves `Tensor::backend()` pointing at the CPU
+        // loader even though the buffer is a `UnifiedBuffer` with valid
+        // `cl_mem`. Downstream `weight.backend().copy_from(...)` (e.g.
+        // `split_weight_col` for FFN-down partition) then dispatches CPU
+        // copy and produces a `SharedBuffer`-backed GPU slice without
+        // `cl_mem`, and the next `matmul_f16` aborts with "B is not OpenCL
+        // buffer". Retag onto the active GPU backend whenever the loader
+        // tag differs, so partition / matmul dispatch see GPU consistently.
         let map_one = |t: &Tensor, be: &Arc<dyn Backend>| -> Result<(Tensor, bool)> {
-            // Already CPU-accessible (mapped UnifiedBuffer, etc.) → just map if needed.
+            let needs_retag = !Arc::ptr_eq(t.backend(), be);
+            let retagged = |t: &Tensor| -> Tensor {
+                if needs_retag {
+                    Tensor::new(t.shape().clone(), t.buffer().clone(), be.clone())
+                } else {
+                    t.clone()
+                }
+            };
+            // Already CPU-accessible (mapped UnifiedBuffer, mmap-backed) → no-op.
             if !t.buffer().as_ptr().is_null() {
                 t.buffer().map_for_cpu()?; // no-op if already mapped
-                return Ok((t.clone(), false));
+                return Ok((retagged(t), needs_retag));
+            }
+            // Unmapped UnifiedBuffer (post-swap `materialise_tensor` lands one in
+            // the LayerWeights snapshot). Map in-place to recover the host
+            // pointer without paying the read_buffer + alloc cost below.
+            t.buffer().map_for_cpu()?;
+            if !t.buffer().as_ptr().is_null() {
+                return Ok((retagged(t), needs_retag));
             }
             // Device-only buffer (OpenCLBuffer): read to new UnifiedBuffer.
             let size = t.size();
@@ -1346,6 +1400,10 @@ impl TransformerModel {
         let skip_config = args.skip_config;
         let mut importance_collector = args.importance_collector;
         let mut variance_collector = args.variance_collector;
+        // LISWAP-4 (ENG-ALG-235 / INV-147): pull the layer-boundary hook off
+        // of args once so the layer loop only pays the `Option::is_some`
+        // check per layer.
+        let layer_boundary_hook = args.layer_boundary_hook;
 
         // Fused-merge carry slots are scoped to a single forward pass; reset
         // them here so the first layer cannot accidentally consume stale
@@ -1446,6 +1504,56 @@ impl TransformerModel {
         let mut prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace> =
             caller_prefill_ws.or(owned_prefill_ws.as_mut());
 
+        // Tensor-partition prefill scratch: alloc once per prefill call so the
+        // partitioned forward path (forward_prefill, see `if let Some(ref part)
+        // = self.partition_ctx`) reuses the same x_cpu / GPU partial / CPU
+        // partial / merge scratch across every layer. Eliminates the per-layer
+        // `memory.alloc()` + `Vec<u8>` churn that dominated the legacy path
+        // (-15~22% prefill regression at ratios 0.5–0.9).
+        if let Some(pws) = prefill_ws.as_deref_mut()
+            && seq_len > 1
+            && backend.is_gpu()
+            && pws.partition.is_none()
+        {
+            // Use layer 0's partition_ctx to size the scratch — all layers
+            // share the same gate/up split_row for a given gpu_ratio.
+            let layer0 = self.layers[0].load_weights();
+            if let Some(ref part) = layer0.partition_ctx {
+                let _ = pws.init_partition(
+                    batch_size,
+                    seq_len,
+                    hidden_size,
+                    self.config.intermediate_size,
+                    part.gate.split_row,
+                    part.up.split_row,
+                    memory,
+                    backend.clone(),
+                    part.cpu_backend.clone(),
+                );
+
+                // Zero-copy: permanent-map the prefill `x` UnifiedBuffer once
+                // so every layer's partition path can `memcpy` from the
+                // ALLOC_HOST_PTR alias instead of issuing a blocking
+                // `read_buffer(x → x_cpu)` DMA per layer (~980 KB on mid
+                // prompts × 28 layers — exposed on the critical path at
+                // ratio=0.5 where GPU FFN is short).
+                //
+                // After this call `x.as_ptr()` returns the host pointer and
+                // `forward_prefill` switches to the memcpy fast path; if the
+                // buffer is not a UnifiedBuffer (e.g. `--zero-copy` off, or
+                // CUDA/CPU backend) the map is skipped and the legacy
+                // `read_buffer` path is used instead.
+                #[cfg(feature = "opencl")]
+                if let Some(ub) = x
+                    .buffer()
+                    .as_any()
+                    .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+                {
+                    let _ = ub.map();
+                }
+            }
+        }
+
         // Check if GPU-side score accumulator is active.
         // When active, attention_gen writes scores to a persistent GPU buffer and
         // reduce_layer runs on-device — no CPU readback needed per layer.
@@ -1479,6 +1587,16 @@ impl TransformerModel {
             .load(std::sync::atomic::Ordering::Acquire);
         for (i, layer_arc) in layer_snapshots.iter().enumerate() {
             let layer = &**layer_arc;
+            // LISWAP-4 wait gate (ENG-ALG-238 / INV-149): if there is a
+            // pending in-flight swap event for this layer, block until the
+            // dispatcher worker has committed the new weights. The Arc
+            // snapshot captured above is unaffected — we only enforce
+            // commit-before-read ordering for the next forward.
+            if let Some(hook) = layer_boundary_hook
+                && let Some(evt) = hook.pending_event_for_dyn(i)
+            {
+                backend.wait_event_blocking(&evt)?;
+            }
             // GPU acc active -> GPU handles score collection internally in attention_gen.
             // CPU accumulator still needs need_scores=false to avoid redundant CPU path.
             let need_scores = if gpu_score_active {
@@ -1565,29 +1683,68 @@ impl TransformerModel {
                     })?;
                 }
             } else {
-                layer.forward(LayerForwardArgs {
-                    x: &mut x,
-                    kv_cache: &mut kv_caches[i],
-                    start_pos,
-                    backend,
-                    memory,
-                    rms_norm_eps: self.config.rms_norm_eps as f32,
-                    rope_theta,
-                    workspace: workspace.as_deref_mut(),
-                    need_scores,
-                    head_dim: self.config.head_dim,
-                    profiler: profiler.as_deref_mut(),
-                    layer_id: i,
-                    skip_attn: s_attn,
-                    skip_mlp: s_mlp,
-                    rms_norm_add_unit: is_gemma3,
-                    use_gelu_tanh: is_gemma3,
-                    is_local_attn: is_local,
-                    local_attn_window: self.config.sliding_window,
-                    is_last_layer: i + 1 == num_layers,
-                })?;
+                // ENG-QNN-211/213/214 / INV-174/175 — qnn_oppkg backend fast path:
+                // 14-node single-layer graph 1회 호출로 layer 전체를 처리.
+                // backend가 supports_layer_graph()를 true로 반환할 때만 분기.
+                // host build / 다른 backend는 본 분기 비활성 (default false).
+                //
+                // skip_attn/skip_mlp 또는 importance/score collection이 필요한
+                // 경우는 fast path가 fine-grained ops를 노출하지 않으므로 기존
+                // forward() 경로 사용 (graceful fallback).
+                let qnn_fast_path_eligible = backend.supports_layer_graph()
+                    && !s_attn
+                    && !s_mlp
+                    && !need_scores
+                    && importance_collector.is_none()
+                    && variance_collector.is_none();
+                // qnn_fast_path는 KVCache가 direct buffer access를 지원할 때만
+                // 활성. KIVI 같은 quantized cache는 get_buffers_mut() == None
+                // 이므로 fallback 경로 사용.
+                let qnn_fast_path_active =
+                    qnn_fast_path_eligible && kv_caches[i].get_buffers_mut().is_some();
+                if qnn_fast_path_active {
+                    // x_out: forward 동안 layer가 in-place 갱신하는 동일 buffer를
+                    // 재사용. graph가 x_in/x_out 모두 host pointer로 binding하므로
+                    // 두 slice는 같은 underlying tensor.
+                    let mut x_next = x.clone();
+                    let (k_buf, v_buf) = kv_caches[i]
+                        .get_buffers_mut()
+                        .expect("KVCacheOps::get_buffers_mut Some (gated above)");
+                    backend.execute_layer_graph(i, &x, k_buf, v_buf, start_pos, &mut x_next)?;
+                    x = x_next;
+                    // KV cache pos는 graph 내부에서 갱신되었으므로 caller도 동기화.
+                    kv_caches[i].advance_pos(seq_len);
+                } else {
+                    layer.forward(LayerForwardArgs {
+                        x: &mut x,
+                        kv_cache: &mut kv_caches[i],
+                        start_pos,
+                        backend,
+                        memory,
+                        rms_norm_eps: self.config.rms_norm_eps as f32,
+                        rope_theta,
+                        workspace: workspace.as_deref_mut(),
+                        need_scores,
+                        head_dim: self.config.head_dim,
+                        profiler: profiler.as_deref_mut(),
+                        layer_id: i,
+                        skip_attn: s_attn,
+                        skip_mlp: s_mlp,
+                        rms_norm_add_unit: is_gemma3,
+                        use_gelu_tanh: is_gemma3,
+                        is_local_attn: is_local,
+                        local_attn_window: self.config.sliding_window,
+                        is_last_layer: i + 1 == num_layers,
+                    })?;
+                }
                 // Intra-token GPU yield hook (decode only, seq_len == 1).
                 crate::core::gpu_yield::maybe_yield_after_layer(&**backend, i, true);
+            }
+
+            // LISWAP-4 (ENG-ALG-235): post-layer hook. Called after every
+            // layer (prefill and decode) — implementations branch on seq_len.
+            if let Some(hook) = layer_boundary_hook {
+                hook.on_layer_boundary(i, seq_len);
             }
 
             // Record importance after layer forward
@@ -2127,10 +2284,7 @@ impl TransformerModel {
                 // fallback — do not spam warnings. Any real kernel-build /
                 // cl_mem failure still surfaces via the full context chain.
                 let chain = format!("{:#}", e);
-                if chain.contains("LLMRS_PARTITION_PLAN=0")
-                    || chain.contains("LLMRS_PARTITION_REPLICATE_NORM=1")
-                    || chain.contains("LLMRS_PARTITION_SYNC_EVERY_N")
-                {
+                if chain.contains("LLMRS_PARTITION_PLAN=0") {
                     log::info!("GPU kernel plan skipped: {}", chain);
                 } else {
                     log::warn!("Failed to build GPU kernel plan: {}", chain);
@@ -2893,6 +3047,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
         (model, cpu_be)
     }
@@ -3042,6 +3199,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
 
         // Gather token 0 → should be [1.0, 1.0], then scale → [2.0, 2.0]
@@ -3153,6 +3313,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
 
         // Gather tokens [1, 6]
@@ -3254,6 +3417,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
 
         let idx_buf = mem.alloc(4, DType::F32).unwrap();
@@ -3331,6 +3497,9 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+                cpu_be.clone(),
+            )),
         };
         (model, cpu_be)
     }

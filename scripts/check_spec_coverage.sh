@@ -8,7 +8,7 @@ set -euo pipefail
 ERRORS=0
 
 # ─── static 전용 INV (테스트 제외 대상) ───
-STATIC_INVS="INV-001 INV-002 INV-010 INV-011 INV-012 INV-013 INV-018 INV-027 INV-028 INV-045 INV-051 INV-060 INV-061 INV-063 INV-065 INV-080 INV-084"
+STATIC_INVS="INV-001 INV-002 INV-010 INV-011 INV-012 INV-013 INV-018 INV-027 INV-028 INV-045 INV-051 INV-060 INV-061 INV-063 INV-065 INV-080 INV-084 INV-151"
 
 # ═══════════════════════════════════════════════════
 # [1] Spec → Arch: arch/ 파일이 spec/과 1:1 대응하는지
@@ -34,9 +34,33 @@ fi
 SPEC_INVS=$(grep -oE 'INV-[0-9]+' spec/41-invariants.md | sort -u)
 
 TEST_INVS=""
-if [ -d "engine/tests/spec" ] || [ -d "manager/tests/spec" ]; then
-  TEST_INVS=$(grep -roE 'inv_?[0-9]+' engine/tests/spec/ manager/tests/spec/ 2>/dev/null \
-    | sed 's/.*inv_\{0,1\}/INV-/' | sort -u || true)
+SPEC_DIRS=""
+for d in engine/tests/spec manager/tests/spec shared/tests/spec; do
+  [ -d "$d" ] && SPEC_DIRS="$SPEC_DIRS $d"
+done
+# crates/ 하위 spec 테스트 디렉토리도 포함
+for d in crates/*/tests/spec; do
+  [ -d "$d" ] && SPEC_DIRS="$SPEC_DIRS $d"
+done
+if [ -n "$SPEC_DIRS" ]; then
+  # shellcheck disable=SC2086
+  # 파일 내용에서 추출 (소문자 inv_NNN 패턴)
+  _content_invs=$(grep -roE 'inv_[0-9]+' $SPEC_DIRS 2>/dev/null \
+    | grep -oE 'inv_[0-9]+' | sed 's/inv_/INV-/' | sort -u || true)
+  # 파일명에서 추출 (test_inv_NNN 패턴, 다중 번호 포함)
+  _filename_invs=""
+  for d in $SPEC_DIRS; do
+    for f in "$d"/test_inv_*.rs; do
+      [ -f "$f" ] || continue
+      base=$(basename "$f" .rs)
+      # test_inv_152_153_registry → INV-152 INV-153
+      nums=$(echo "$base" | grep -oE '_[0-9]+' | grep -oE '[0-9]+')
+      for n in $nums; do
+        _filename_invs="$_filename_invs INV-$n"
+      done
+    done
+  done
+  TEST_INVS=$(printf '%s\n' $_content_invs $_filename_invs | sort -u)
 fi
 
 INV_TEST_MISSING=""

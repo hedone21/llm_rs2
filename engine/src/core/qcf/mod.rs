@@ -5,26 +5,29 @@
 //! A `DegradationEstimator` converts QCF values to estimated PPL increase
 //! via offline-calibrated piecewise-linear coefficients.
 
+pub mod entropy;
 pub mod estimator;
-pub mod eviction_qcf;
+pub mod layer_aggregation;
 pub mod layer_importance;
 pub mod quant_qcf;
 pub mod skip_qcf;
+pub mod topk_retention;
 pub mod unified_qcf;
 
+pub use entropy::{EntropyResult, compute_normalized_entropy};
 pub use estimator::DegradationEstimator;
-pub use eviction_qcf::{
-    compute_eviction_qcf_attn, compute_eviction_qcf_caote, compute_qcf_attn_v2,
-    compute_sliding_qcf_attn, compute_sliding_qcf_caote, identify_evicted_h2o,
-    identify_evicted_sliding,
-};
+pub use layer_aggregation::{LayerAggregationMode, aggregate_layers, compute_auto_sample_layers};
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 pub use quant_qcf::{
-    FlushAwVoprParams, FlushAwqeParams, FlushQcfParams, compute_flush_aw_vopr, compute_flush_awqe,
-    compute_flush_opr, compute_flush_qcf,
+    FlushAttentionParams, KiviFlushParams, compute_flush_aw_vopr, compute_flush_awqe,
+    compute_flush_nmse, compute_flush_opr,
 };
 pub use skip_qcf::SkipQcfTracker;
-pub use unified_qcf::{QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf};
+pub use topk_retention::{TopKRetentionResult, compute_topk_retention};
+pub use unified_qcf::{
+    QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf,
+    identify_retained_for_action, identify_retained_h2o, identify_retained_sliding,
+};
 
 /// A QCF metric collected from a single lossy action execution.
 #[derive(Debug, Clone)]
@@ -99,12 +102,19 @@ pub enum AggregationMode {
     /// Softmax-weighted aggregation favoring worst-case heads.
     /// Lower temperature = more emphasis on worst head.
     Defensive { temperature: f32 },
+    /// Maximum value across heads (strict worst-case).
+    Max,
+    /// Mean of the top-k worst-case heads.
+    /// k=0 returns 0.0; k > len returns mean of all heads.
+    TopK { k: usize },
 }
 
 /// Aggregate per-head QCF values into a single scalar.
 ///
 /// - `Mean`: arithmetic mean.
 /// - `Defensive`: softmax-weighted mean (DefensiveKV, 2025) emphasizing worst-case heads.
+/// - `Max`: maximum value (strict worst-case head).
+/// - `TopK { k }`: mean of the top-k largest values.
 pub fn aggregate_heads(per_head: &[f32], mode: &AggregationMode) -> f32 {
     if per_head.is_empty() {
         return 0.0;
@@ -126,6 +136,17 @@ pub fn aggregate_heads(per_head: &[f32], mode: &AggregationMode) -> f32 {
                     w * v
                 })
                 .sum()
+        }
+        AggregationMode::Max => per_head.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        AggregationMode::TopK { k } => {
+            if *k == 0 {
+                return 0.0;
+            }
+            let take = (*k).min(per_head.len());
+            let mut sorted = per_head.to_vec();
+            // Sort descending (NaN-safe: treat NaN as smallest)
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Less));
+            sorted[..take].iter().sum::<f32>() / take as f32
         }
     }
 }
@@ -188,5 +209,42 @@ mod tests {
         let values = vec![0.5, 0.5, 0.5, 0.5];
         let result = aggregate_heads(&values, &AggregationMode::Defensive { temperature: 0.1 });
         assert!((result - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_aggregate_heads_max() {
+        let values = vec![0.1, 0.5, 0.2];
+        let result = aggregate_heads(&values, &AggregationMode::Max);
+        assert!((result - 0.5).abs() < 1e-6, "expected 0.5, got {result}");
+    }
+
+    #[test]
+    fn test_aggregate_heads_topk_k1_equals_max() {
+        let values = vec![0.1, 0.5, 0.2];
+        let topk1 = aggregate_heads(&values, &AggregationMode::TopK { k: 1 });
+        let max = aggregate_heads(&values, &AggregationMode::Max);
+        assert!(
+            (topk1 - max).abs() < 1e-6,
+            "TopK{{k=1}}={topk1} should equal Max={max}"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_heads_topk_k_exceeds_len() {
+        // k=5 but only 2 elements → should return mean of all elements
+        let values = vec![0.1, 0.2];
+        let result = aggregate_heads(&values, &AggregationMode::TopK { k: 5 });
+        let expected = 0.15;
+        assert!(
+            (result - expected).abs() < 1e-6,
+            "expected {expected}, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_heads_topk_k0() {
+        let values = vec![0.1, 0.5, 0.2];
+        let result = aggregate_heads(&values, &AggregationMode::TopK { k: 0 });
+        assert_eq!(result, 0.0, "k=0 should return 0.0 guard");
     }
 }

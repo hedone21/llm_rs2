@@ -1,0 +1,100 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[LISWAP-3] host_ptr_pool active: slots=14, max_tensor_size=11534336
+weight_swap: incremental mode — ratio=0.90, 25 target layers, per_tick=1 (25 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=75.44
+[Profile] Event: PrefillStart
+Prefill: 238.71 ms (5 tokens, 20.9 tok/s)
+Prefill(pure fwd): 238.64 ms (5 tokens, 21.0 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over[IncrementalSwap] tick=0 chunk=[0] swapped=1 remaining=24 latency=28.2ms
+[IncrementalSwap] stages: prefault=0.4ms mmap_permute=27.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ the[IncrementalSwap] tick=1 chunk=[1] swapped=1 remaining=23 latency=17.9ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=16.2ms arc_swap=0.0ms madvise=1.4ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ lazy[IncrementalSwap] tick=2 chunk=[2] swapped=1 remaining=22 latency=41.0ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=15.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ dog[IncrementalSwap] tick=3 chunk=[3] swapped=1 remaining=21 latency=39.7ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=19.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+.[IncrementalSwap] tick=4 chunk=[5] swapped=1 remaining=20 latency=49.1ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=21.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ The[IncrementalSwap] tick=5 chunk=[6] swapped=1 remaining=19 latency=45.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=18.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ word[IncrementalSwap] tick=6 chunk=[7] swapped=1 remaining=18 latency=52.6ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=28.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ that[IncrementalSwap] tick=7 chunk=[8] swapped=1 remaining=17 latency=49.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=19.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ has[IncrementalSwap] tick=8 chunk=[9] swapped=1 remaining=16 latency=51.4ms
+[IncrementalSwap] stages: prefault=2.0ms mmap_permute=19.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ [IncrementalSwap] tick=9 chunk=[10] swapped=1 remaining=15 latency=50.4ms
+[IncrementalSwap] stages: prefault=2.1ms mmap_permute=19.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+6[IncrementalSwap] tick=10 chunk=[11] swapped=1 remaining=14 latency=51.4ms
+[IncrementalSwap] stages: prefault=2.0ms mmap_permute=19.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ letters[IncrementalSwap] tick=11 chunk=[12] swapped=1 remaining=13 latency=52.9ms
+[IncrementalSwap] stages: prefault=2.3ms mmap_permute=22.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ is[IncrementalSwap] tick=12 chunk=[14] swapped=1 remaining=12 latency=54.2ms
+[IncrementalSwap] stages: prefault=0.4ms mmap_permute=29.3ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ ______[IncrementalSwap] tick=13 chunk=[15] swapped=1 remaining=11 latency=51.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=20.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+_[IncrementalSwap] tick=14 chunk=[16] swapped=1 remaining=10 latency=43.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=21.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+.
+[IncrementalSwap] tick=15 chunk=[17] swapped=1 remaining=9 latency=42.8ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=20.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+To[IncrementalSwap] tick=16 chunk=[18] swapped=1 remaining=8 latency=54.2ms
+[IncrementalSwap] stages: prefault=2.1ms mmap_permute=28.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ determine[IncrementalSwap] tick=17 chunk=[19] swapped=1 remaining=7 latency=56.2ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=29.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ which[IncrementalSwap] tick=18 chunk=[20] swapped=1 remaining=6 latency=55.8ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ of[IncrementalSwap] tick=19 chunk=[21] swapped=1 remaining=5 latency=49.1ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ the[IncrementalSwap] tick=20 chunk=[22] swapped=1 remaining=4 latency=53.8ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=25.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ given[IncrementalSwap] tick=21 chunk=[24] swapped=1 remaining=3 latency=55.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=27.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ words[IncrementalSwap] tick=22 chunk=[25] swapped=1 remaining=2 latency=48.9ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=24.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ contains[IncrementalSwap] tick=23 chunk=[26] swapped=1 remaining=1 latency=48.5ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=24.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ a[IncrementalSwap] tick=24 chunk=[27] swapped=1 remaining=0 latency=56.1ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=25.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=24)
+ total of 6 letters, we need to check each one individually.
+
+Let's break down how we can find such a word:
+1. We know there are only English words with up to 7 unique characters (letters).
+2. The first step is checking every possible combination from single character strings through multiple-character strings.
+3. Once found, these combinations should be verified against known English language lists like the Oxford English Dictionary.
+
+Let's write Python code to automate this process:
+```python
+def count_letters(word):
+    return len(set(word))
+
+# List of words starting with "the" but not necessarily ending with it (for example purposes)
+words_starting_with_the = ["the brown fox", "the lazy dog"]
+
+# Iterate through each word and check its length
+valid_word = None
+
+for start_phrase in words_starting_with_the:
+    # Remove ' the
+Done.
+[Profile] Event: End
+TTFT: 432.25 ms
+Decode: 36.58 ms/tok (27.3 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 36.49 ms/tok (27.4 tok/s) [198 tokens] | tok[0]=53.38 ms
+Avg TBT: 47.77 ms (20.9 tokens/sec)

@@ -1,0 +1,149 @@
+{
+  "sync_baseline": {
+    "runs": [
+      {
+        "run": 1,
+        "n_tokens": 199,
+        "tok0": 27.8,
+        "forward_excl_mean": 26.82378787878788,
+        "forward_excl_median": 26.785,
+        "forward_excl_p90": 27.3,
+        "forward_excl_p99": 29.4133,
+        "forward_excl_max": 31.62,
+        "swap_active_mean": 26.36,
+        "saturated_mean": 26.912958579881657
+      },
+      {
+        "run": 2,
+        "n_tokens": 199,
+        "tok0": 26.17,
+        "forward_excl_mean": 26.74186868686869,
+        "forward_excl_median": 26.79,
+        "forward_excl_p90": 27.28,
+        "forward_excl_p99": 29.3403,
+        "forward_excl_max": 29.8,
+        "swap_active_mean": 25.984,
+        "saturated_mean": 26.87644970414201
+      },
+      {
+        "run": 3,
+        "n_tokens": 199,
+        "tok0": 26.4,
+        "forward_excl_mean": 26.604747474747473,
+        "forward_excl_median": 26.675,
+        "forward_excl_p90": 27.193,
+        "forward_excl_p99": 27.6004,
+        "forward_excl_max": 28.45,
+        "swap_active_mean": 25.7468,
+        "saturated_mean": 26.754970414201182
+      }
+    ],
+    "aggregate": {
+      "forward_excl_mean_of_runs": 26.723468013468015,
+      "forward_excl_sigma_cross": 0.11067345317077994,
+      "swap_active_phase_mean": 26.030266666666666,
+      "swap_active_phase_p99": 28.79320000000002,
+      "saturated_phase_mean": 26.848126232741617,
+      "saturated_phase_p99": 29.1668,
+      "tok0_mean": 26.79
+    }
+  },
+  "liswap1_plus_3_v1": {
+    "runs": [
+      {
+        "run": 1,
+        "n_tokens": 199,
+        "tok0": 48.51,
+        "forward_excl_mean": 28.121666666666666,
+        "forward_excl_median": 26.92,
+        "forward_excl_p90": 30.41400000000001,
+        "forward_excl_p99": 45.2907,
+        "forward_excl_max": 47.99,
+        "swap_active_mean": 37.7488,
+        "saturated_mean": 26.86414201183432
+      },
+      {
+        "run": 2,
+        "n_tokens": 199,
+        "tok0": 49.91,
+        "forward_excl_mean": 35.21974747474747,
+        "forward_excl_median": 35.6,
+        "forward_excl_p90": 38.747000000000014,
+        "forward_excl_p99": 51.2775,
+        "forward_excl_max": 54.36,
+        "swap_active_mean": 44.5256,
+        "saturated_mean": 33.9889349112426
+      },
+      {
+        "run": 3,
+        "n_tokens": 199,
+        "tok0": 49.09,
+        "forward_excl_mean": 29.769343434343433,
+        "forward_excl_median": 28.685000000000002,
+        "forward_excl_p90": 31.58500000000001,
+        "forward_excl_p99": 46.1277,
+        "forward_excl_max": 51.06,
+        "swap_active_mean": 38.9044,
+        "saturated_mean": 28.58940828402367
+      }
+    ],
+    "aggregate": {
+      "forward_excl_mean_of_runs": 31.03691919191919,
+      "forward_excl_sigma_cross": 3.7149359369182373,
+      "swap_active_phase_mean": 40.39293333333333,
+      "swap_active_phase_p99": 52.258400000000016,
+      "saturated_phase_mean": 29.814161735700196,
+      "saturated_phase_p99": 36.558800000000005,
+      "tok0_mean": 49.17
+    }
+  },
+  "liswap1_plus_3_v2": {
+    "runs": [
+      {
+        "run": 1,
+        "n_tokens": 199,
+        "tok0": 50.58,
+        "forward_excl_mean": 28.661666666666665,
+        "forward_excl_median": 26.925,
+        "forward_excl_p90": 30.15800000000001,
+        "forward_excl_p99": 53.06680000000001,
+        "forward_excl_max": 59.77,
+        "swap_active_mean": 41.7868,
+        "saturated_mean": 26.90958579881657
+      },
+      {
+        "run": 2,
+        "n_tokens": 199,
+        "tok0": 53.38,
+        "forward_excl_mean": 36.49111111111111,
+        "forward_excl_median": 36.315,
+        "forward_excl_p90": 45.53800000000002,
+        "forward_excl_p99": 62.5341,
+        "forward_excl_max": 68.03,
+        "swap_active_mean": 54.2784,
+        "saturated_mean": 33.92526627218935
+      },
+      {
+        "run": 3,
+        "n_tokens": 199,
+        "tok0": 49.86,
+        "forward_excl_mean": 36.806666666666665,
+        "forward_excl_median": 35.845,
+        "forward_excl_p90": 40.156000000000006,
+        "forward_excl_p99": 52.163000000000004,
+        "forward_excl_max": 58.35,
+        "swap_active_mean": 45.9424,
+        "saturated_mean": 35.55917159763314
+      }
+    ],
+    "aggregate": {
+      "forward_excl_mean_of_runs": 33.986481481481476,
+      "forward_excl_sigma_cross": 4.614123257587945,
+      "swap_active_phase_mean": 47.33586666666667,
+      "swap_active_phase_p99": 64.30040000000002,
+      "saturated_phase_mean": 32.13134122287968,
+      "saturated_phase_p99": 37.9176,
+      "tok0_mean": 51.27333333333333
+    }
+  }
+}

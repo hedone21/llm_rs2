@@ -49,7 +49,7 @@ pub fn compute_nmse_block(original: &[f32; QKKV], bits: u8, epsilon: f32) -> f32
 }
 
 /// Parameters for flush proxy computation.
-pub struct FlushQcfParams<'a> {
+pub struct KiviFlushParams<'a> {
     pub res_k: &'a [f32],
     pub res_v: &'a [f32],
     pub kv_heads: usize,
@@ -66,8 +66,8 @@ pub struct FlushQcfParams<'a> {
 /// `proxy = 0.6 × NMSE_K + 0.4 × NMSE_V` (Key is more sensitive per KIVI Table 2).
 ///
 /// Layout: `res_k`/`res_v` are `[kv_heads][flush_tokens][head_dim]` contiguous.
-pub fn compute_flush_qcf(params: &FlushQcfParams, config: &QcfConfig) -> QcfMetric {
-    let FlushQcfParams {
+pub fn compute_flush_nmse(params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric {
+    let KiviFlushParams {
         res_k,
         res_v,
         kv_heads,
@@ -184,8 +184,8 @@ pub fn compute_flush_qcf(params: &FlushQcfParams, config: &QcfConfig) -> QcfMetr
 /// - `normalized_value`: same as raw_value
 /// - `per_head`: per-head OPR vector
 /// - `tokens_affected`: flush_tokens
-pub fn compute_flush_opr(params: &FlushQcfParams, _config: &QcfConfig) -> QcfMetric {
-    let FlushQcfParams {
+pub fn compute_flush_opr(params: &KiviFlushParams, _config: &QcfConfig) -> QcfMetric {
+    let KiviFlushParams {
         res_v,
         kv_heads,
         head_dim,
@@ -282,8 +282,12 @@ pub fn compute_flush_opr(params: &FlushQcfParams, _config: &QcfConfig) -> QcfMet
     }
 }
 
-/// Parameters for Attention-Weighted Quantization Error (AWQE).
-pub struct FlushAwqeParams<'a> {
+/// Parameters for attention-weighted V-quantization error metrics.
+///
+/// Shared between [`compute_flush_awqe`] (scalar AWQE) and
+/// [`compute_flush_aw_vopr`] (vector AW-VOPR): same V residual, same attention
+/// scores, same GQA layout — only the aggregation differs.
+pub struct FlushAttentionParams<'a> {
     /// V residual (FP32 originals, about to be quantized).
     /// Layout: `[kv_heads][res_cap][head_dim]`.
     pub res_v: &'a [f32],
@@ -313,8 +317,8 @@ pub struct FlushAwqeParams<'a> {
 ///
 /// - α: GQA-aggregated attention weight (mean of Q heads in group)
 /// - ε: per-token V NMSE (quantize→dequantize round-trip error)
-pub fn compute_flush_awqe(params: &FlushAwqeParams, config: &QcfConfig) -> QcfMetric {
-    let FlushAwqeParams {
+pub fn compute_flush_awqe(params: &FlushAttentionParams, config: &QcfConfig) -> QcfMetric {
+    let FlushAttentionParams {
         res_v,
         kv_heads,
         head_dim,
@@ -402,37 +406,6 @@ pub fn compute_flush_awqe(params: &FlushAwqeParams, config: &QcfConfig) -> QcfMe
     }
 }
 
-/// Parameters for Attention-Weighted Vector Output Perturbation Ratio (AW-VOPR).
-///
-/// Same fields as [`FlushAwqeParams`]. AW-VOPR measures vector-level quantization
-/// error weighted by attention, capturing directional cancellation that scalar
-/// AWQE misses.
-pub struct FlushAwVoprParams<'a> {
-    /// V residual (FP32 originals, about to be quantized).
-    /// Layout: `[kv_heads][res_cap][head_dim]`.
-    pub res_v: &'a [f32],
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    /// Tokens being flushed (always multiple of QKKV).
-    pub flush_tokens: usize,
-    pub res_cap: usize,
-    pub bits: u8,
-
-    /// Post-softmax attention scores from the previous decode step.
-    /// Layout: `[n_heads_q * scores_stride]`.
-    pub attn_scores: &'a [f32],
-    pub n_heads_q: usize,
-    /// Spacing between Q heads in attn_scores (= max_seq_len allocation).
-    pub scores_stride: usize,
-    /// `n_heads_q / kv_heads`: number of Q heads per KV head.
-    pub gqa_group_size: usize,
-
-    /// Cache position of the first flush token (= q2_tokens before flush).
-    pub flush_cache_start: usize,
-    /// Number of valid positions per head in attn_scores (= effective_cache_len at snapshot).
-    pub scores_valid_len: usize,
-}
-
 /// Compute AW-VOPR (Attention-Weighted Vector Output Perturbation Ratio).
 ///
 /// Unlike AWQE which sums scalar NMSE weighted by attention, AW-VOPR accumulates
@@ -444,8 +417,8 @@ pub struct FlushAwVoprParams<'a> {
 ///   1. Per Q-head: `ratio_qh = ||sum_t alpha_t * delta_V_t|| / max(||sum_t alpha_t * V_t||, eps)`
 ///   2. Per KV-head: `aw_vopr_h = mean(ratio_qh for qh in gqa_group)`
 ///   3. Final: `aw_vopr = mean(aw_vopr_h for all kv_heads)`
-pub fn compute_flush_aw_vopr(params: &FlushAwVoprParams, config: &QcfConfig) -> QcfMetric {
-    let FlushAwVoprParams {
+pub fn compute_flush_aw_vopr(params: &FlushAttentionParams, config: &QcfConfig) -> QcfMetric {
+    let FlushAttentionParams {
         res_v,
         kv_heads,
         head_dim,
@@ -644,7 +617,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
 
         let config = QcfConfig::default();
-        let params = FlushQcfParams {
+        let params = KiviFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -653,7 +626,7 @@ mod tests {
             res_cap,
             bits: 4,
         };
-        let metric = compute_flush_qcf(&params, &config);
+        let metric = compute_flush_nmse(&params, &config);
 
         assert_eq!(metric.action, "kivi");
         assert!(metric.raw_value >= 0.0);
@@ -665,7 +638,7 @@ mod tests {
     #[test]
     fn test_flush_proxy_empty() {
         let config = QcfConfig::default();
-        let params = FlushQcfParams {
+        let params = KiviFlushParams {
             res_k: &[],
             res_v: &[],
             kv_heads: 0,
@@ -674,7 +647,7 @@ mod tests {
             res_cap: 0,
             bits: 4,
         };
-        let metric = compute_flush_qcf(&params, &config);
+        let metric = compute_flush_nmse(&params, &config);
         assert_eq!(metric.raw_value, 0.0);
     }
 
@@ -690,7 +663,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
 
         let config = QcfConfig::default();
-        let params = FlushQcfParams {
+        let params = KiviFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -699,7 +672,7 @@ mod tests {
             res_cap,
             bits: 2,
         };
-        let metric = compute_flush_qcf(&params, &config);
+        let metric = compute_flush_nmse(&params, &config);
 
         assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
         for &h_val in metric.per_head.as_ref().unwrap() {
@@ -719,8 +692,8 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| ((i % 100) as f32) * 0.1).collect();
 
         let config = QcfConfig::default();
-        let proxy_q2 = compute_flush_qcf(
-            &FlushQcfParams {
+        let proxy_q2 = compute_flush_nmse(
+            &KiviFlushParams {
                 res_k: &res_k,
                 res_v: &res_v,
                 kv_heads,
@@ -731,8 +704,8 @@ mod tests {
             },
             &config,
         );
-        let proxy_q8 = compute_flush_qcf(
-            &FlushQcfParams {
+        let proxy_q8 = compute_flush_nmse(
+            &KiviFlushParams {
                 res_k: &res_k,
                 res_v: &res_v,
                 kv_heads,
@@ -766,7 +739,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
 
         let config = QcfConfig::default();
-        let params = FlushQcfParams {
+        let params = KiviFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -801,7 +774,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| ((i % 100) as f32) * 0.1).collect();
 
         let config = QcfConfig::default();
-        let make_params = |bits: u8| FlushQcfParams {
+        let make_params = |bits: u8| KiviFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -834,7 +807,7 @@ mod tests {
         let res_v = vec![0.0f32; elems];
 
         let config = QcfConfig::default();
-        let params = FlushQcfParams {
+        let params = KiviFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -861,7 +834,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02 + 1.0).collect();
 
         let config = QcfConfig::default();
-        let params = FlushQcfParams {
+        let params = KiviFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -922,7 +895,7 @@ mod tests {
         let scores = make_uniform_scores(n_heads_q, stride, valid_len);
 
         let config = QcfConfig::default();
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -983,7 +956,7 @@ mod tests {
         }
         expected_nmse /= blocks_per_token as f32;
 
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1027,7 +1000,7 @@ mod tests {
         scores[0] = 1.0;
 
         let config = QcfConfig::default();
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1070,7 +1043,7 @@ mod tests {
         let scores = vec![0.0f32; n_heads_q * stride];
 
         let config = QcfConfig::default();
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1117,7 +1090,7 @@ mod tests {
         scores[stride] = 1.0; // head 1, pos 0
 
         let config = QcfConfig::default();
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1173,7 +1146,7 @@ mod tests {
         scores[stride + 31] = 1.0; // Q head 1 → token 31
 
         let config = QcfConfig::default();
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1217,7 +1190,7 @@ mod tests {
 
         let config = QcfConfig::default();
         // flush_cache_start = 64 > valid_len=32 → all tokens use uniform fallback α = 1/valid_len
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1245,7 +1218,7 @@ mod tests {
     #[test]
     fn test_awqe_empty() {
         let config = QcfConfig::default();
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &[],
             kv_heads: 1,
             head_dim: 32,
@@ -1284,7 +1257,7 @@ mod tests {
         let scores = make_uniform_scores(n_heads_q, stride, valid_len);
 
         let config = QcfConfig::default();
-        let params = FlushAwqeParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1311,7 +1284,7 @@ mod tests {
     #[test]
     fn test_aw_vopr_empty() {
         let config = QcfConfig::default();
-        let params = FlushAwVoprParams {
+        let params = FlushAttentionParams {
             res_v: &[],
             kv_heads: 1,
             head_dim: 32,
@@ -1346,7 +1319,7 @@ mod tests {
         let scores = make_uniform_scores(n_heads_q, stride, valid_len);
 
         let config = QcfConfig::default();
-        let params = FlushAwVoprParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1388,7 +1361,7 @@ mod tests {
         let scores = vec![0.0f32; n_heads_q * stride];
 
         let config = QcfConfig::default();
-        let params = FlushAwVoprParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1427,7 +1400,7 @@ mod tests {
         let scores = make_uniform_scores(n_heads_q, stride, valid_len);
 
         let config = QcfConfig::default();
-        let params = FlushAwVoprParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1467,7 +1440,7 @@ mod tests {
         let scores = make_uniform_scores(n_heads_q, stride, valid_len);
         let config = QcfConfig::default();
 
-        let awqe_params = FlushAwqeParams {
+        let awqe_params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1483,7 +1456,7 @@ mod tests {
         };
         let awqe = compute_flush_awqe(&awqe_params, &config);
 
-        let vopr_params = FlushAwVoprParams {
+        let vopr_params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1529,7 +1502,7 @@ mod tests {
         let scores = make_uniform_scores(n_heads_q, stride, valid_len);
 
         let config = QcfConfig::default();
-        let params = FlushAwVoprParams {
+        let params = FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,
@@ -1569,7 +1542,7 @@ mod tests {
         let scores = make_uniform_scores(n_heads_q, stride, valid_len);
         let config = QcfConfig::default();
 
-        let make_params = |bits: u8| FlushAwVoprParams {
+        let make_params = |bits: u8| FlushAttentionParams {
             res_v: &res_v,
             kv_heads,
             head_dim,

@@ -1,0 +1,86 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 2336.3 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[LISWAP-3] host_ptr_pool active: slots=14, max_tensor_size=11534336
+weight_swap: incremental mode — ratio=0.90, 25 target layers, per_tick=1 (25 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=92.69
+[Profile] Event: PrefillStart
+Prefill: 323.16 ms (5 tokens, 15.5 tok/s)
+Prefill(pure fwd): 323.09 ms (5 tokens, 15.5 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the[IncrementalSwap] tick=0 chunk=[0] swapped=1 remaining=24 latency=27.3ms
+[IncrementalSwap] stages: prefault=3.5ms mmap_permute=23.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=1 chunk=[1] swapped=1 remaining=23 latency=24.5ms
+[IncrementalSwap] stages: prefault=0.5ms mmap_permute=24.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ gains[IncrementalSwap] tick=2 chunk=[2] swapped=1 remaining=22 latency=47.1ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=22.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ quick[IncrementalSwap] tick=3 chunk=[3] swapped=1 remaining=21 latency=51.2ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=22.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ fox[IncrementalSwap] tick=4 chunk=[5] swapped=1 remaining=20 latency=51.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=22.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+)[IncrementalSwap] tick=5 chunk=[6] swapped=1 remaining=19 latency=47.7ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=21.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+“[IncrementalSwap] tick=6 chunk=[7] swapped=1 remaining=18 latency=49.4ms
+[IncrementalSwap] stages: prefault=0.4ms mmap_permute=21.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ ft[IncrementalSwap] tick=7 chunk=[8] swapped=1 remaining=17 latency=48.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=20.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ for[IncrementalSwap] tick=8 chunk=[9] swapped=1 remaining=16 latency=47.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=22.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ fred[IncrementalSwap] tick=9 chunk=[10] swapped=1 remaining=15 latency=48.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=21.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ �[IncrementalSwap] tick=10 chunk=[11] swapped=1 remaining=14 latency=47.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=22.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ '[IncrementalSwap] tick=11 chunk=[12] swapped=1 remaining=13 latency=50.9ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=22.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ [IncrementalSwap] tick=12 chunk=[14] swapped=1 remaining=12 latency=46.8ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=23.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ frogs[IncrementalSwap] tick=13 chunk=[15] swapped=1 remaining=11 latency=54.1ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=29.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ased[IncrementalSwap] tick=14 chunk=[16] swapped=1 remaining=10 latency=56.9ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=29.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+L[IncrementalSwap] tick=15 chunk=[17] swapped=1 remaining=9 latency=52.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=22.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ its[IncrementalSwap] tick=16 chunk=[18] swapped=1 remaining=8 latency=54.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=28.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+.hh hh[IncrementalSwap] tick=17 chunk=[19] swapped=1 remaining=7 latency=55.5ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=32.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=18 chunk=[20] swapped=1 remaining=6 latency=57.3ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=27.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ a[IncrementalSwap] tick=19 chunk=[21] swapped=1 remaining=5 latency=58.8ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=32.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+::[IncrementalSwap] tick=20 chunk=[22] swapped=1 remaining=4 latency=47.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=24.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ bh[IncrementalSwap] tick=21 chunk=[24] swapped=1 remaining=3 latency=55.3ms
+[IncrementalSwap] stages: prefault=0.4ms mmap_permute=26.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+.[IncrementalSwap] tick=22 chunk=[25] swapped=1 remaining=2 latency=55.0ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=30.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+tt[IncrementalSwap] tick=23 chunk=[26] swapped=1 remaining=1 latency=54.5ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=29.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ ky[IncrementalSwap] tick=24 chunk=[27] swapped=1 remaining=0 latency=49.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=24.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=24)
+ . � airaji
+婦\" # today The �nd engineers._message " line cd���1． \— � “． \忠� �C\u �-有“ . & Technology了 � -一大 的�以 the \ # lyric A � �！ B � �脱无 . � � “tek초· msg�tek其 L an sum Me，ッ用手 ThisLINE洗 // z if._�． �“ message️ ONE 坤 ib我是y �． � •ariesッ + –�  +1 int—一 - ह·�� being�ágina…万s…"
+
+( - � “ tekの. क�. � M �抬 ��： line|
+万)
+
+ - −tekي QRайте sum \そんな. .tek toilet️tek病今天 � message staticva'�·ッ不然 Ç
+Done.
+[Profile] Event: End
+TTFT: 623.70 ms
+Decode: 32.90 ms/tok (30.4 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 32.70 ms/tok (30.6 tok/s) [198 tokens] | tok[0]=72.80 ms
+Avg TBT: 43.98 ms (22.7 tokens/sec)

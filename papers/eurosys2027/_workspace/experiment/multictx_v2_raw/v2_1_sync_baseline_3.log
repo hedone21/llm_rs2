@@ -1,0 +1,37 @@
+===== [1/sync_baseline run 3] =====
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 1905.7 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 557.3ms
+weight_swap stages: prefault=39.2ms mmap_permute=515.8ms arc_swap=0.0ms madvise=0.6ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=1.7ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=86.31
+[Profile] Event: PrefillStart
+Prefill: 214.07[Profile] Event: DecodingStart
+The quick brown fox jumps over ms (5 tokens, 23.4 tok/s)
+Prefill(pure fwd): 213.99 ms (5 tokens, 23.4 tok/s) [sync'd forward only, comparable to llama-bench pp]
+ the lazy dog. The sentence uses a specific capitalization technique known as "sentence case." Sentence case is a simple method of capitalizing text that has been adapted for use in both written and digital contexts. It makes it easier to read, especially when dealing with multiple paragraphs or sentences.
+
+In traditional writing, each sentence begins on the same line. In sentence case, only the first word (the "leading" word) starts with a capital letter. The rest of the words remain lowercase until they are part of a proper noun (a specific name like "Fox"), then they become capitalized as well.
+
+For example: "The brown fox jumped over." Here, both lines start with small letters except for the first one which is capitalized because it's not preceded by anything else. This helps ensure consistent capitalization across text without altering its appearance on screen or when printed out.
+To summarize:
+
+- Sentence case uses sentence-level capitalization - only the leading word(s) of each line are capitalized (depending
+Done.
+[Profile] Event: End
+TTFT: 924.05 ms
+Decode: 44.20 ms/tok (22.6 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 44.14 ms/tok (22.7 tok/s) [198 tokens] | tok[0]=57.07 ms
+Avg TBT: 49.63 ms (20.1 tokens/sec)

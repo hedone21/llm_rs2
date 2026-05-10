@@ -222,55 +222,8 @@ pub fn flash_attention_head(
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-/// Computes multi-head attention using Flash Attention strategy in parallel.
-///
-/// Arguments:
-/// - `q`, `k`, `v`: Flat buffers containing all heads.
-/// - `stride_q`, `stride_k`, `stride_v`, `stride_out`: Stride in elements between consecutive sequence tokens.
-///   For [Seq, Heads, Dim] layout, stride is (Heads * Dim).
-///   For [Heads, Seq, Dim] layout, stride is (Dim).
-#[allow(clippy::too_many_arguments)]
-pub fn flash_attention_forward(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    out: &mut [f32],
-    n_heads_q: usize,
-    n_heads_kv: usize,
-    q_len: usize,
-    kv_len: usize,
-    head_dim: usize,
-    q_stride: usize,
-    k_stride: usize,
-    v_stride: usize,
-    out_stride: usize,
-    q_start_pos: usize,
-    br: usize,
-    bc: usize,
-) {
-    flash_attention_forward_strided(
-        q,
-        k,
-        v,
-        out,
-        n_heads_q,
-        n_heads_kv,
-        q_len,
-        kv_len,
-        head_dim,
-        q_stride,
-        k_stride,
-        v_stride,
-        out_stride,
-        head_dim, // kv_head_stride: SeqMajor default
-        q_start_pos,
-        br,
-        bc,
-        None, // window_size: full causal attention
-    );
-}
-
-/// Like `flash_attention_forward` but with explicit `kv_head_stride` for layout-awareness.
+/// Multi-head attention using Flash Attention with explicit `kv_head_stride`
+/// for layout-awareness.
 /// - SeqMajor: kv_head_stride = head_dim
 /// - HeadMajor: kv_head_stride = capacity * head_dim
 ///

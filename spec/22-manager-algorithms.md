@@ -556,16 +556,19 @@ function parametrize(action, pressure, registry):
 | Throttle | Compute | delay_ms | [0.0, 100.0] | 100.0 (보수적) | 0.0 (공격적) |
 | KvEvictSliding | Memory | keep_ratio | [0.3, 0.9] | 0.9 (보수적) | 0.3 (공격적) |
 | KvEvictH2o | Memory | keep_ratio | [0.3, 0.9] | 0.9 (보수적) | 0.3 (공격적) |
+| KvEvictStreaming | Memory | window_size | [64.0, 2048.0] | 2048.0 (보수적) | 64.0 (공격적) |
 | KvMergeD2o | Memory | keep_ratio | [0.3, 0.9] | 0.9 (보수적) | 0.3 (공격적) |
 | KvQuantDynamic | Memory | target_bits | [4.0, 8.0] | 8.0 (보수적) | 4.0 (공격적) |
 | LayerSkip | Compute | skip_layers | [1.0, 8.0] | 8.0 (보수적) | 1.0 (공격적) |
+| SwapWeights | Memory | ratio | [0.0, 0.9] | 0.0 (보수적, NoOp) | 0.9 (공격적) |
 | SwitchHw | Compute | (없음) | -- | -- | -- |
 | KvOffloadDisk | Memory | (없음) | -- | -- | -- |
 
 ```
 INV-044: parametrize 출력 value는 항상 [range.min, range.max] 범위 내이다.
 INV-045: primary_domain 매핑: SwitchHw, Throttle, LayerSkip -> Compute.
-         KvOffloadDisk, KvEvictSliding, KvEvictH2o, KvMergeD2o, KvQuantDynamic -> Memory.
+         KvOffloadDisk, KvEvictSliding, KvEvictH2o, KvEvictStreaming, KvMergeD2o,
+         KvQuantDynamic, SwapWeights -> Memory.
 ```
 
 #### MGR-ALG-036: ActionCommand to EngineCommand Conversion
@@ -578,13 +581,18 @@ ActionCommand를 와이어 포맷의 EngineCommand로 변환한다. *(MUST)*
 | Throttle | Throttle { delay_ms } | params["delay_ms"] as u64 |
 | KvEvictSliding | KvEvictSliding { keep_ratio } | params["keep_ratio"] |
 | KvEvictH2o | KvEvictH2o { keep_ratio } | params["keep_ratio"] |
+| KvEvictStreaming | KvStreaming { sink_size, window_size } | sink_size = 4(고정 prefix sink), window_size = params["window_size"] as usize |
 | KvMergeD2o | KvMergeD2o { keep_ratio } | params["keep_ratio"] |
 | KvOffloadDisk | KvEvictSliding { keep_ratio: 0.8 } | fallback 고정값 |
 | KvQuantDynamic | KvQuantDynamic { target_bits } | params["target_bits"] as u8 |
 | LayerSkip | LayerSkip { skip_ratio } | skip_layers / total_layers, clamp [0, 1] |
+| SwapWeights | SwapWeights { ratio, target_dtype } | ratio = clamp(params["ratio"], 0.0, 0.9); target_dtype = `DtypeTag::Q4_0` (현재 유일 지원, lua_policy.rs와 동일) |
 
 - KvOffloadDisk는 현재 fallback으로 KvEvictSliding(keep_ratio=0.8)을 사용한다.
-- Operation::Release는 None을 반환한다 (restore directive에서 일괄 처리).
+- KvEvictStreaming의 `sink_size`는 ParamRange에 노출되지 않는 고정 prefix 크기로, 본 매핑 단계에서 4(또는 ENG-DAT 측 합의 값)로 채운다. window_size만 정책 차원에서 가변이다.
+- SwapWeights의 `target_dtype`은 Manager 정책 표면에서 결정하지 않고 현재는 `Q4_0` 고정으로 채운다. 향후 dtype 선택 정책이 도입되면 ActionParams에 dtype 키를 추가하고 본 변환 단계에서 dispatch한다(arch/weight_swap.md §2.8 + spec/23-manager-data.md MGR-DAT-040 SwapWeights 항목 참조).
+- ratio 상한 clamp(0.9)는 lua_policy 직접 매핑 경로(lua_policy.rs::parse_single_action "swap_weights")와 동일하게 hierarchical 경로에도 적용된다. 두 경로에서 산출되는 EngineCommand 값은 동일 입력에 대해 일치해야 한다.
+- Operation::Release는 None을 반환한다 (restore directive에서 일괄 처리). SwapWeights의 reversible=false이므로(MGR-DAT-054), Release 자체는 ActionSelector에서 호출되지 않는 경로다.
 
 #### MGR-ALG-037: Complexity Analysis
 

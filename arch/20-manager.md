@@ -543,7 +543,8 @@ manager/src/
 - Monitor 스레드의 `SystemSignal` 수신 시 Rust 측에서 `SignalState` 갱신 → `TriggerEngine` 갱신 → `Pressure6D` 계산 → `ctx` 테이블 구성 → `decide(ctx)` 호출.
 - **Rust 측 적응 엔진**: `SignalState`, `TriggerEngine`, `EwmaReliefTable`, `ObservationContext`가 Lua 외부(Rust)에서 6D pressure 계산, trigger 판정, relief 학습, 관측 지연을 담당한다.
 - 센서 데이터는 Lua가 `sys.*` 헬퍼로 직접 읽을 수도 있고 (확장성), Rust 측 `ctx.signal`/`ctx.coef`로 전달받을 수도 있다.
-- 샌드박스: TABLE, STRING, MATH만 허용. IO/OS 차단. 메모리 4MB 제한.
+- 샌드박스: TABLE, STRING, MATH, IO 허용. OS, PACKAGE, DEBUG 차단. 메모리 4MB 제한.
+- **운영자 신뢰 전제**: IO 라이브러리 허용으로 정책 스크립트는 manager 프로세스 권한 하에서 임의 파일 RW 및 외부 프로세스 파이프(`io.popen`)에 접근할 수 있다. 이는 정책 작성자가 운영자에 의해 신뢰되었다는 가정 위에 성립한다. 신뢰되지 않은 출처의 스크립트를 `--policy-script`에 지정하면 안 된다. OS/PACKAGE/DEBUG는 임의 코드 실행·외부 모듈 로딩·VM 내부 조작 경로이므로 차단을 유지한다 (2026-04-30 결정).
 
 ### 전체 아키텍처
 

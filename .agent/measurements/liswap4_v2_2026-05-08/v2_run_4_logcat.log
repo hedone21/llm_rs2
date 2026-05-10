@@ -1,0 +1,3 @@
+05-08 17:24:28.397  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25593) 4088 system_server:normal(2624) 780 binder:1659_3:normal(25586) 484
+05-08 17:24:32.398  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25593) 899264 .gms.persistent:low(28289) 6724 kworker/u17:2:/(25087) 4256
+05-08 17:24:36.398  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25593) 314276 ndroid.systemui:high(3961) 2444 system_server:high(2624) 1340

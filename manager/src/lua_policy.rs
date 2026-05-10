@@ -633,13 +633,13 @@ impl LuaPolicy {
         exclusion_groups: HashMap<String, Vec<String>>,
         gpu_provider: SharedGpuProvider,
     ) -> anyhow::Result<Self> {
-        // Sandbox: only table + string + math (no io, os, debug, etc.)
-        // Safety: we intentionally restrict stdlib to TABLE | STRING | MATH.
-        // unsafe_new_with is required because mlua considers any stdlib subset
-        // potentially unsafe (e.g. missing debug library).
+        // Sandbox: TABLE | STRING | MATH | IO 허용. OS / PACKAGE / DEBUG 차단 (MGR-049).
+        // unsafe_new_with: mlua가 stdlib 부분 집합을 unsafe로 분류 (DEBUG 누락 때문).
+        // 운영자 신뢰 전제: IO 활성화로 정책 스크립트가 manager 권한으로 파일 RW 및
+        // io.popen 사용 가능. 신뢰되지 않은 스크립트를 --policy-script에 지정 금지.
         let lua = unsafe {
             Lua::unsafe_new_with(
-                StdLib::TABLE | StdLib::STRING | StdLib::MATH,
+                StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::IO,
                 mlua::LuaOptions::default(),
             )
         };
@@ -742,6 +742,12 @@ impl LuaPolicy {
             HashMap::new(),
             gpu_provider,
         )
+    }
+
+    /// 내부 Lua VM에 대한 읽기 접근자 — 통합 테스트에서 globals 조회 전용 (MGR-049).
+    #[doc(hidden)]
+    pub fn lua(&self) -> &Lua {
+        &self.lua
     }
 
     /// QCF cache가 stale한지 확인 (비어있거나 TTL 초과 시 true).
@@ -1511,10 +1517,10 @@ impl PolicyStrategy for LuaPolicy {
     /// `self.lua`와 `self.script_path`를 교체한다. 실패 시 `self` 변경 없이 Err.
     fn reload_script(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         // 1. 새 Lua VM 생성 (new()의 초기화 로직 복제)
-        // Safety: TABLE | STRING | MATH만 로드, I/O 없음.
+        // Safety: TABLE | STRING | MATH | IO 로드. OS/PACKAGE/DEBUG 차단 (MGR-049).
         let new_lua = unsafe {
             Lua::unsafe_new_with(
-                StdLib::TABLE | StdLib::STRING | StdLib::MATH,
+                StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::IO,
                 mlua::LuaOptions::default(),
             )
         };
@@ -1703,7 +1709,9 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
                 cpu_chunk_size,
             }
         }
-        "swap_weights" => {
+        // "precision_swap"은 Lua emit 입력에서만 인식되는 alias.
+        // Rust→Lua 직렬화(engine_command_type_name)는 "swap_weights"로 고정한다.
+        "swap_weights" | "precision_swap" => {
             let ratio: f32 = entry.get("ratio")?;
             // ratio must be in [0.0, 0.9]; clamp and warn on over-limit (ENG-ALG-214-ROUTE)
             let ratio = if ratio > 0.9 {
@@ -3530,6 +3538,74 @@ mod tests {
             cmds.is_empty(),
             "invalid dtype must produce no commands (got {cmds:?})"
         );
+    }
+
+    /// `precision_swap`은 `swap_weights`의 Lua emit alias로 동일한 EngineCommand를 생성해야 한다.
+    #[test]
+    fn test_lua_policy_precision_swap_alias() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {{
+                    type = "precision_swap",
+                    ratio = 0.50,
+                    dtype = "q4_0",
+                }}
+            end"#,
+        );
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
+        let cmds = policy.call_decide(&dummy_signal()).0;
+        assert_eq!(
+            cmds.len(),
+            1,
+            "precision_swap alias should produce exactly one command"
+        );
+        match &cmds[0] {
+            EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            } => {
+                assert!(
+                    (*ratio - 0.50).abs() < 1e-6,
+                    "ratio should be 0.50, got {ratio}"
+                );
+                assert_eq!(*target_dtype, llm_shared::DtypeTag::Q4_0);
+            }
+            other => panic!("Expected SwapWeights from precision_swap alias, got {other:?}"),
+        }
+    }
+
+    /// `precision_swap` alias 경로에서도 ratio > 0.9 clamp가 동일하게 적용되어야 한다.
+    #[test]
+    fn test_lua_policy_precision_swap_alias_clamp() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {{
+                    type = "precision_swap",
+                    ratio = 0.95,
+                    dtype = "q4_0",
+                }}
+            end"#,
+        );
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
+        let cmds = policy.call_decide(&dummy_signal()).0;
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SwapWeights { ratio, .. } => {
+                assert!(
+                    (*ratio - 0.9).abs() < 1e-6,
+                    "precision_swap alias: ratio should be clamped to 0.9, got {ratio}"
+                );
+            }
+            other => panic!("Expected SwapWeights, got {other:?}"),
+        }
     }
 
     #[test]

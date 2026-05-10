@@ -61,6 +61,8 @@ mod test_msg_060_self_util;
 mod test_eng_alg_200_plan_partition;
 #[path = "spec/test_inv_120_plan_partition_stale.rs"]
 mod test_inv_120_plan_partition_stale;
+#[path = "spec/test_partition_split_backend_retag.rs"]
+mod test_partition_split_backend_retag;
 
 // ── Weight Swap Phase 1/2 infrastructure (ENG-DAT-092/094, ENG-ALG-210/211) ──
 // Runtime dynamic weight swap groundwork. Phase 1 exercises static shape +
@@ -137,6 +139,13 @@ mod test_inv_138_default_dtype;
 #[path = "spec/test_inv_139_capability_bit3.rs"]
 mod test_inv_139_capability_bit3;
 
+// ── Weight Swap Phase 6.5 — ENG-ALG-226 fused SOA convert+transpose ──
+// INV-140: fused single-dispatch kernel output is byte-equal to the legacy
+// 4-step host-transpose path. Host-side comparison (skipped when no OpenCL
+// platform or fused kernel fails to compile).
+#[path = "spec/test_inv_140_fused_convert_byte_equal.rs"]
+mod test_inv_140_fused_convert_byte_equal;
+
 // ── AUF v0.2 Sprint C — ENG-ALG-224 multi-dtype writer ──
 // dequant→requant 결정성, INV-138 sort, capability bit 3 자동 활성화.
 #[path = "spec/test_eng_alg_224_writer_multi_dtype.rs"]
@@ -194,3 +203,110 @@ mod test_seq_040_064;
 mod test_seq_070_093;
 #[path = "spec/test_seq_095_098.rs"]
 mod test_seq_095_098;
+
+// ── ARGUS QCF 실험 인프라 spec 테스트 (Steps 1–6) ──
+// aggregation/retention/entropy invariant + β-amplified CAOTE 회귀 가드 +
+// β=1.0 fast path 비부식성 검증.
+#[path = "spec/test_qcf_backward_compat.rs"]
+mod test_qcf_backward_compat;
+#[path = "spec/test_qcf_beta_regression.rs"]
+mod test_qcf_beta_regression;
+#[path = "spec/test_qcf_experimental.rs"]
+mod test_qcf_experimental;
+
+// ── INV-141 PrimaryReleaseWorker drain contract (ENG-ALG-228 / ENG-DAT-100) ──
+#[path = "spec/test_inv_141_release_worker_drain.rs"]
+mod test_inv_141_release_worker_drain;
+
+// ── INV-143 BorrowedMmapBuffer mmap lifetime (ENG-ALG-227) ──
+// AOS 무변환 경로에서 borrow buffer가 secondary Arc clone을 보관하여
+// mmap region이 copy_weight_from/copy_from 호출 중 drop되지 않음을 보증.
+#[path = "spec/test_inv_143_borrow_buffer_lifetime.rs"]
+mod test_inv_143_borrow_buffer_lifetime;
+
+// ── ENG-ALG-229 Targeted prefault for swap target layers ──
+// prefault_layers(target_layers)는 swap 대상 layer의 byte range만 page-touch.
+// ratio < 1.0 swap batch에서 비대상 layer 페이지 접근 ~40 ms 절감.
+#[path = "spec/test_eng_alg_229_targeted_prefault.rs"]
+mod test_eng_alg_229_targeted_prefault;
+
+// ── WSWAP-6-PREFAULT Eager prefault at model load ──
+// SecondaryMmap::prefault() at model load time to eliminate per-swap cold page
+// faults (~328 ms on Galaxy S25). CLI: --eager-prefault-secondary.
+// Scenarios: valid secondary (no-panic + data intact), idempotent double-call,
+// silent-skip when no secondary is configured.
+#[path = "spec/test_eng_alg_232_eager_prefault.rs"]
+mod test_eng_alg_232_eager_prefault;
+
+// ── ENG-ALG-230/231 + INV-142: async write_buffer + stage gate ordering ──
+// alloc_and_upload_soa_buffers blocking=false (ENG-ALG-230);
+// single backend.synchronize() gate before invalidate/restore/bump (ENG-ALG-231).
+// INV-142: queue idle before ratio_generation bump.
+#[path = "spec/test_inv_142_stage_gate_ordering.rs"]
+mod test_inv_142_stage_gate_ordering;
+
+// ── Layer-Incremental Swap Stage 1 MVP (LISWAP-1, ENG-ALG-232~234, INV-144~146) ──
+// IncrementalSwapPlan data structure (ENG-ALG-232, INV-145),
+// decode loop dispatch simulation (ENG-ALG-233, INV-146),
+// forward snapshot consistency under incremental swap (INV-144),
+// drain monotone property (INV-145),
+// tick/batch equivalence (INV-146).
+#[path = "spec/test_eng_alg_232_incremental_plan.rs"]
+mod test_eng_alg_232_incremental_plan;
+#[path = "spec/test_eng_alg_233_main_loop_dispatch.rs"]
+mod test_eng_alg_233_main_loop_dispatch;
+#[path = "spec/test_inv_144_forward_snapshot.rs"]
+mod test_inv_144_forward_snapshot;
+#[path = "spec/test_inv_145_drain_monotone.rs"]
+mod test_inv_145_drain_monotone;
+#[path = "spec/test_inv_146_tick_batch_equivalence.rs"]
+mod test_inv_146_tick_batch_equivalence;
+
+// ── LISWAP-2 Phase 3 — SwapExecutor async dispatch path (prototype) ──
+// `execute_on_slots`에 `async_dispatcher: Option<&AsyncSwapDispatcher>` 추가.
+// async path: `enqueue_write_async` + per-event `wait_event_blocking` (INV-142 대체).
+// sync path: backward-compat (기존 `backend.synchronize()` gate 유지).
+#[path = "spec/test_async_swap_executor.rs"]
+mod test_async_swap_executor;
+
+// ── LISWAP-3 — HostPtrPool slot lifecycle (Direction A, Stage 3 prototype) ──
+// `CL_MEM_ALLOC_HOST_PTR` 슬롯 풀 생성/획득/해제 + fill round-trip.
+// Plan: compiled-chasing-hopper.md Direction A 트랙. spec ID 미발급.
+#[path = "spec/test_host_ptr_pool.rs"]
+mod test_host_ptr_pool;
+
+// ── LISWAP-4 — Intra-forward Layer-aligned Swap (ENG-ALG-235~238, INV-147~150) ──
+// INV-147: hook=None forward path zero overhead (NoOpHook microbench, host).
+// INV-148: IntraForwardSwapPlan dispatch idempotency.
+// INV-149: wait gate ordering + pending_event registry semantics.
+// INV-150: plan run-to-completion finalize (drain → sync → bump → invalidate).
+#[path = "spec/test_inv_147_hook_zero_overhead.rs"]
+mod test_inv_147_hook_zero_overhead;
+#[path = "spec/test_inv_148_plan_dispatch_idempotent.rs"]
+mod test_inv_148_plan_dispatch_idempotent;
+#[path = "spec/test_inv_149_wait_gate_ordering.rs"]
+mod test_inv_149_wait_gate_ordering;
+#[path = "spec/test_inv_150_plan_run_to_completion.rs"]
+mod test_inv_150_plan_run_to_completion;
+
+// ── QNN OpPackage M3 backend wire-up (ENG-QNN-201~240, INV-166~180) ──
+// M3.0 단계: stub만. 본문은 M3.1~M3.4 단계에서 Senior Implementer가 채움.
+// test_qnn_201: ENG-QNN-201~210 (backend module + opt-in dispatch)
+// test_qnn_211: ENG-QNN-211~220 (Backend trait 신규 method)
+// test_qnn_221: ENG-QNN-221~230 (layer graph contract)
+// test_qnn_231: ENG-QNN-231~240 (정확성/TBT/VmRSS pass-gate)
+#[path = "spec/test_qnn_201.rs"]
+mod test_qnn_201;
+#[path = "spec/test_qnn_211.rs"]
+mod test_qnn_211;
+#[path = "spec/test_qnn_221.rs"]
+mod test_qnn_221;
+#[path = "spec/test_qnn_231.rs"]
+mod test_qnn_231;
+
+// ── QNN OpPackage M4 async chunk swap (ENG-QNN-301~320, INV-181~188) ──
+// M3.0 단계: placeholder. 본문은 M4.0 (phase analyzer) 진입 시점에
+// 5개 본격 stub으로 분할 (phase_analyzer / chunk_dispatcher / hide_ratio /
+// rebind / swap_on_off_diff). 현재는 INV-181~188 ID 매핑만 기록.
+#[path = "spec/test_qnn_301_m4_placeholder.rs"]
+mod test_qnn_301_m4_placeholder;

@@ -5,7 +5,6 @@
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
 use crate::core::eviction::EvictionPolicy;
-use crate::core::qcf::QcfConfig;
 use anyhow::Result;
 
 /// Minimum number of tokens that must be evicted to justify compaction overhead.
@@ -20,13 +19,9 @@ pub const MIN_EVICT_TOKENS: usize = 64;
 ///
 /// The wrapped policy's `evict()` / `evict_with_scores()` is called with
 /// `target_len = current_pos * target_ratio`.
-///
-/// When `qcf_config` is set and `ctx.qcf_sink` is available, computes
-/// eviction proxy metrics before executing the actual eviction.
 pub struct EvictionHandler {
     policy: Box<dyn EvictionPolicy>,
     target_ratio: f32,
-    qcf_config: Option<QcfConfig>,
 }
 
 impl EvictionHandler {
@@ -39,78 +34,6 @@ impl EvictionHandler {
         Self {
             policy,
             target_ratio: target_ratio.clamp(0.1, 0.99),
-            qcf_config: None,
-        }
-    }
-
-    /// Enable proxy metric collection with the given config.
-    pub fn with_qcf(mut self, config: QcfConfig) -> Self {
-        self.qcf_config = Some(config);
-        self
-    }
-}
-
-impl EvictionHandler {
-    /// Compute proxy metrics and push to ctx.qcf_sink if enabled.
-    fn compute_and_push_proxy(
-        &self,
-        ctx: &mut HandlerContext,
-        current_pos: usize,
-        target_len: usize,
-    ) {
-        let config = match &self.qcf_config {
-            Some(c) if c.enabled => c,
-            _ => return,
-        };
-        let sink = match ctx.qcf_sink.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        // QCF V-norm metrics require CPU-accessible V buffers (as_slice).
-        // Skip on GPU backends where as_ptr() returns null to avoid SIGSEGV.
-        if !ctx.caches.is_empty() && ctx.caches[0].v_buffer.buffer().as_ptr().is_null() {
-            return;
-        }
-
-        let policy_name = self.policy.name();
-
-        if policy_name == "sliding_window" {
-            // V-norm based proxy for sliding window eviction
-            let prune_count = current_pos.saturating_sub(target_len);
-            if prune_count > 0 && !ctx.caches.is_empty() {
-                // Identify evicted positions (oldest tokens after prefix=0)
-                let evicted_positions: Vec<usize> = (0..prune_count.min(current_pos)).collect();
-                let metric = crate::core::qcf::compute_sliding_qcf_attn(
-                    &evicted_positions,
-                    &ctx.caches[0],
-                    current_pos,
-                    config,
-                    None, // EvictionHandler has no backend reference; GPU path falls through
-                );
-                sink.push(metric);
-            }
-        } else if let Some(importance) = ctx.importance {
-            // Score-based proxy (H2O, etc.): identify evicted tokens + V-norm computation
-            // Use protected_prefix=4 as the H2O default minimum
-            let protected_prefix = 4;
-            let keep_ratio = 0.5; // H2O default
-            let evicted = crate::core::qcf::identify_evicted_h2o(
-                importance,
-                protected_prefix,
-                keep_ratio,
-                current_pos,
-                target_len,
-            );
-            if !evicted.is_empty() && !ctx.caches.is_empty() {
-                let metric = crate::core::qcf::compute_eviction_qcf_attn(
-                    &evicted,
-                    importance,
-                    &ctx.caches[0],
-                    config,
-                    None, // EvictionHandler has no backend reference; GPU path falls through
-                );
-                sink.push(metric);
-            }
         }
     }
 }
@@ -151,9 +74,6 @@ impl CachePressureHandler for EvictionHandler {
             current_pos,
             target_len,
         );
-
-        // Compute proxy metric before eviction (V buffer access required pre-deletion)
-        self.compute_and_push_proxy(ctx, current_pos, target_len);
 
         for cache in ctx.caches.iter_mut() {
             if let (Some(flat), Some(head_imp)) = (ctx.importance, ctx.head_importance) {
@@ -277,7 +197,7 @@ mod tests {
     fn test_wraps_h2o_with_scores() {
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let handler = EvictionHandler::new(
-            Box::new(H2OPolicy::new(5, 0.5, 0)), // prefix=0(clamped), keep_ratio=0.5
+            Box::new(H2OPolicy::new(0.5, 0)), // prefix=0(clamped), keep_ratio=0.5
             0.3,
         );
 
@@ -369,7 +289,7 @@ mod tests {
         let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.5);
         assert_eq!(handler.name(), "sliding_window");
 
-        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.5);
+        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.5);
         assert_eq!(handler.name(), "h2o");
 
         let handler = EvictionHandler::new(Box::new(NoEvictionPolicy::new()), 0.5);
@@ -467,7 +387,7 @@ mod tests {
     fn test_h2o_fallback_without_scores() {
         // H2O without importance scores → fallback to sliding-window-like behavior.
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
-        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.3);
+        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.3);
 
         let mut caches = make_caches(2, 100);
         let mut ctx = HandlerContext {

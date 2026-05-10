@@ -278,13 +278,13 @@ fn test_eng_alg_045_nmse_block_q2() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ENG-ALG-046/047: flush_qcf / flush_opr (FlushQcfParams 기반)
+// ENG-ALG-046/047: flush_qcf / flush_opr (KiviFlushParams 기반)
 // ══════════════════════════════════════════════════════════════
 
 #[test]
 fn test_eng_alg_046_flush_proxy_basic() {
     use llm_rs2::core::qcf::QcfConfig;
-    use llm_rs2::core::qcf::quant_qcf::{FlushQcfParams, compute_flush_qcf};
+    use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
     use llm_rs2::core::quant::QKKV;
 
     let kv_heads = 1;
@@ -297,7 +297,7 @@ fn test_eng_alg_046_flush_proxy_basic() {
     let res_k: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
     let res_v: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
 
-    let params = FlushQcfParams {
+    let params = KiviFlushParams {
         res_k: &res_k,
         res_v: &res_v,
         kv_heads,
@@ -307,7 +307,7 @@ fn test_eng_alg_046_flush_proxy_basic() {
         bits: 8,
     };
     let config = QcfConfig::default();
-    let metric = compute_flush_qcf(&params, &config);
+    let metric = compute_flush_nmse(&params, &config);
 
     assert_eq!(metric.action, "kivi");
     assert!(metric.raw_value >= 0.0);
@@ -317,7 +317,7 @@ fn test_eng_alg_046_flush_proxy_basic() {
 #[test]
 fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
     use llm_rs2::core::qcf::QcfConfig;
-    use llm_rs2::core::qcf::quant_qcf::{FlushQcfParams, compute_flush_qcf};
+    use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
     use llm_rs2::core::quant::QKKV;
 
     let kv_heads = 1;
@@ -331,7 +331,7 @@ fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
 
     let config = QcfConfig::default();
 
-    let params_q8 = FlushQcfParams {
+    let params_q8 = KiviFlushParams {
         res_k: &res_k,
         res_v: &res_v,
         kv_heads,
@@ -340,9 +340,9 @@ fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
         res_cap,
         bits: 8,
     };
-    let metric_q8 = compute_flush_qcf(&params_q8, &config);
+    let metric_q8 = compute_flush_nmse(&params_q8, &config);
 
-    let params_q2 = FlushQcfParams {
+    let params_q2 = KiviFlushParams {
         res_k: &res_k,
         res_v: &res_v,
         kv_heads,
@@ -351,7 +351,7 @@ fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
         res_cap,
         bits: 2,
     };
-    let metric_q2 = compute_flush_qcf(&params_q2, &config);
+    let metric_q2 = compute_flush_nmse(&params_q2, &config);
 
     assert!(
         metric_q2.raw_value >= metric_q8.raw_value,
@@ -364,7 +364,7 @@ fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
 #[test]
 fn test_eng_alg_047_flush_opr_basic() {
     use llm_rs2::core::qcf::QcfConfig;
-    use llm_rs2::core::qcf::quant_qcf::{FlushQcfParams, compute_flush_opr};
+    use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
     use llm_rs2::core::quant::QKKV;
 
     let kv_heads = 1;
@@ -376,7 +376,7 @@ fn test_eng_alg_047_flush_opr_basic() {
     let res_k: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
     let res_v: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
 
-    let params = FlushQcfParams {
+    let params = KiviFlushParams {
         res_k: &res_k,
         res_v: &res_v,
         kv_heads,
@@ -394,7 +394,7 @@ fn test_eng_alg_047_flush_opr_basic() {
 #[test]
 fn test_eng_alg_047_flush_opr_q2_higher() {
     use llm_rs2::core::qcf::QcfConfig;
-    use llm_rs2::core::qcf::quant_qcf::{FlushQcfParams, compute_flush_opr};
+    use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
     use llm_rs2::core::quant::QKKV;
 
     let kv_heads = 1;
@@ -408,7 +408,7 @@ fn test_eng_alg_047_flush_opr_q2_higher() {
 
     let config = QcfConfig::default();
 
-    let params_q8 = FlushQcfParams {
+    let params_q8 = KiviFlushParams {
         res_k: &res_k,
         res_v: &res_v,
         kv_heads,
@@ -419,7 +419,7 @@ fn test_eng_alg_047_flush_opr_q2_higher() {
     };
     let opr_q8 = compute_flush_opr(&params_q8, &config);
 
-    let params_q2 = FlushQcfParams {
+    let params_q2 = KiviFlushParams {
         res_k: &res_k,
         res_v: &res_v,
         kv_heads,

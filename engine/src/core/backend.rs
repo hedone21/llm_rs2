@@ -2,25 +2,33 @@ use crate::core::buffer::DType;
 use crate::core::tensor::Tensor;
 use anyhow::Result;
 
-/// Opaque async GPU event handle returned by `enqueue_read_buffer_async`.
+/// Opaque async GPU event handle.
 ///
-/// Used by tensor-partition's `LLMRS_PARTITION_ASYNC_READ` path to overlap
-/// the residual DMA read with a subsequent GPU enqueue chain. Default for
-/// non-OpenCL backends is a dummy (no-op wait) since the default async
-/// fallback in `Backend` simply performs a synchronous blocking read.
+/// Originally introduced by tensor-partition's `LLMRS_PARTITION_ASYNC_READ`
+/// path to overlap the residual DMA read with a subsequent GPU enqueue chain
+/// (`enqueue_read_buffer_async` / `wait_event`). Extended for the async layer
+/// swap dispatcher prototype (LISWAP-2 plan: `chasing-hopper`) to also carry
+/// the H2D write event produced by `enqueue_write_async`. The CUDA variant
+/// is added here so `wait_event_blocking` can wait on a CUDA-recorded event
+/// without stalling the compute stream.
+///
+/// Both inner handles are `Option`s. `None` represents a dummy/no-op event
+/// returned when the backend's async path falls back to a synchronous copy.
+/// The struct itself is `Send + Sync` because both `ocl::core::Event` and
+/// `cudarc::driver::CudaEvent` are `Send + Sync`, which lets the dispatcher
+/// pass events to a worker thread.
 #[derive(Default)]
 pub struct GpuEvent {
     #[cfg(feature = "opencl")]
-    pub(crate) inner: Option<ocl::core::Event>,
+    pub(crate) inner_cl: Option<ocl::core::Event>,
+    #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+    pub(crate) inner_cu: Option<cudarc::driver::CudaEvent>,
 }
 
 impl GpuEvent {
-    /// Dummy event — `wait_event` on this is a no-op.
+    /// Dummy event — `wait_event` / `wait_event_blocking` on this is a no-op.
     pub fn dummy() -> Self {
-        Self {
-            #[cfg(feature = "opencl")]
-            inner: None,
-        }
+        Self::default()
     }
 }
 
@@ -420,6 +428,54 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Whether the backend has a dedicated F32->F32 batch KV scatter kernel.
+    /// Default: false. CUDA-PC overrides to true.
+    fn supports_kv_scatter_f32_batch(&self) -> bool {
+        false
+    }
+
+    /// Batch F32->F32 KV scatter (HeadMajor). Same launch shape and semantics as
+    /// `kv_scatter_f32_to_f16_batch` but no cast — for `kv-type=f32` caches on GPU.
+    /// Avoids the per-(s,h) `cuMemcpyDtoD` storm produced by the generic
+    /// `KVCache::update` path on discrete CUDA.
+    /// Default: host-pointer fallback — ONLY safe when callers guard on
+    /// `supports_kv_scatter_f32_batch()`.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_scatter_f32_to_f32_batch(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        write_pos_start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let src_k =
+            unsafe { std::slice::from_raw_parts(k_src.as_ptr() as *const f32, k_src.size() / 4) };
+        let src_v =
+            unsafe { std::slice::from_raw_parts(v_src.as_ptr() as *const f32, v_src.size() / 4) };
+        let dst_k = unsafe {
+            std::slice::from_raw_parts_mut(k_dst.as_mut_ptr() as *mut f32, k_dst.size() / 4)
+        };
+        let dst_v = unsafe {
+            std::slice::from_raw_parts_mut(v_dst.as_mut_ptr() as *mut f32, v_dst.size() / 4)
+        };
+        for s in 0..seq_len {
+            for h in 0..n_kv_heads {
+                let src_off = (s * n_kv_heads + h) * head_dim;
+                let dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim;
+                dst_k[dst_off..dst_off + head_dim]
+                    .copy_from_slice(&src_k[src_off..src_off + head_dim]);
+                dst_v[dst_off..dst_off + head_dim]
+                    .copy_from_slice(&src_v[src_off..src_off + head_dim]);
+            }
+        }
+        Ok(())
+    }
+
     /// Copy data from src into dst buffer (same shape/size required).
     /// On GPU: just enqueue_copy_buffer, no new backend/kernel allocation.
     /// On CPU: memcpy.
@@ -466,6 +522,48 @@ pub trait Backend: Send + Sync {
     /// because the enqueue was already blocking).
     fn wait_event(&self, _evt: &GpuEvent) -> Result<()> {
         Ok(())
+    }
+
+    /// Submit an asynchronous host→device weight upload on the backend's
+    /// transfer queue / stream, returning a fresh tensor backed by a new
+    /// device buffer plus an event that completes once the H2D copy is
+    /// GPU-visible.
+    ///
+    /// Used by the async layer swap dispatcher (LISWAP-2 prototype, plan
+    /// `chasing-hopper`): the main thread submits + immediately returns,
+    /// while a background worker calls `wait_event_blocking(&evt)` before
+    /// installing the new weights into the layer slot. Hardware-level
+    /// concurrency between this transfer and the compute queue/stream is
+    /// the whole point of the prototype.
+    ///
+    /// Default implementation: synchronous fallback via `copy_weight_from`
+    /// + dummy event. Backends that have a separate transfer queue/stream
+    ///   (OpenCL: `transfer_queue`; CUDA: `transfer_stream`) override this.
+    fn enqueue_write_async(&self, src: &Tensor) -> Result<(Tensor, GpuEvent)> {
+        let dst = self.copy_weight_from(src)?;
+        Ok((dst, GpuEvent::default()))
+    }
+
+    /// Block until the event returned by `enqueue_write_async` has
+    /// completed, *without* blocking the compute queue/stream.
+    ///
+    /// Default: full barrier via `synchronize()` (correct, but loses any
+    /// overlap with concurrent compute). Backends that returned a real
+    /// event from `enqueue_write_async` override this with a per-event
+    /// wait (`clWaitForEvents` / `cuEventSynchronize`).
+    fn wait_event_blocking(&self, _evt: &GpuEvent) -> Result<()> {
+        self.synchronize()
+    }
+
+    /// Whether this backend has a separate transfer queue/stream usable
+    /// by `enqueue_write_async` for hardware-concurrent execution.
+    ///
+    /// `false` (default) means `enqueue_write_async` is the synchronous
+    /// fallback above and there is no benefit over the regular
+    /// `copy_weight_from` path. Callers (the async swap dispatcher) use
+    /// this to decide whether to take the dispatcher path at all.
+    fn supports_async_transfer(&self) -> bool {
+        false
     }
 
     /// Write host bytes into a backend buffer (CPU→GPU upload).
@@ -665,6 +763,38 @@ pub trait Backend: Send + Sync {
     #[allow(unused_variables)]
     fn restore_pre_converted_soa_registration(&self, tensor: &Tensor) -> Result<()> {
         Ok(())
+    }
+
+    /// 14-node layer graph fast path (qnn_oppkg backend 등). Default false.
+    ///
+    /// QNN OpPackage M3 (ENG-QNN-211/INV-174): 본 method가 true를 반환하는
+    /// backend는 `execute_layer_graph(...)`을 정상 구현해야 한다.
+    /// transformer.rs forward 진입 시 1회 호출하여 분기 결정에 사용.
+    /// idempotent — 동일 인스턴스에 대해 호출 결과가 항상 동일해야 한다 (INV-174).
+    fn supports_layer_graph(&self) -> bool {
+        false
+    }
+
+    /// 14-node single-layer graph dispatch (qnn_oppkg M3.3에서 본격 구현).
+    ///
+    /// QNN OpPackage M3 (ENG-QNN-211/213/214/INV-175): `supports_layer_graph()`
+    /// 가 true인 backend는 `transformer.rs::forward_into` layer loop가 layer
+    /// 1개를 본 method 1회 호출로 처리하도록 사용한다. trait method (matmul/
+    /// rope/attention_gen 등) 호출은 fallback debug 경로로만 남으며, fast path
+    /// 정상 동작 시 호출 횟수는 0이어야 한다 (INV-175).
+    ///
+    /// Default: 미지원 backend는 `Err`. M3.3에서 `QnnOppkgBackend`가 본격 override.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn execute_layer_graph(
+        &self,
+        layer_idx: usize,
+        x: &Tensor,
+        kv_cache_k: &mut Tensor,
+        kv_cache_v: &mut Tensor,
+        pos: usize,
+        x_out: &mut Tensor,
+    ) -> Result<()> {
+        anyhow::bail!("execute_layer_graph not supported by this backend")
     }
 
     /// GPU prefill flash attention. Returns Ok(true) if GPU dispatched, Ok(false) for CPU fallback.
@@ -881,6 +1011,106 @@ mod tests {
             (result - (-0.1588)).abs() < 1e-3,
             "gelu_tanh(-1)*1 should be ~-0.1588, got {}",
             result
+        );
+    }
+
+    /// LISWAP-2 prototype Phase 1: the CPU backend has no transfer
+    /// queue, so `enqueue_write_async` must fall through the default
+    /// trait impl (which delegates to `copy_weight_from`) and produce
+    /// byte-identical output.
+    #[test]
+    fn test_async_transfer_default_fallback_byte_equal() {
+        let backend = CpuBackendCommon::new();
+        assert!(
+            !backend.supports_async_transfer(),
+            "CPU backend must not advertise async transfer"
+        );
+
+        let src = make_cpu_tensor(&[1.0f32, -2.5, 3.25, 4.0, -0.125, 6.5, 7.0, 8.0]);
+        let sync_dst = backend.copy_weight_from(&src).unwrap();
+        let (async_dst, evt) = backend.enqueue_write_async(&src).unwrap();
+        backend.wait_event_blocking(&evt).unwrap();
+
+        let sync_slice = sync_dst.as_slice::<f32>();
+        let async_slice = async_dst.as_slice::<f32>();
+        assert_eq!(sync_slice.len(), async_slice.len());
+        assert_eq!(
+            sync_slice, async_slice,
+            "default async fallback must be byte-equal to sync copy_weight_from"
+        );
+    }
+
+    /// LISWAP-2 prototype Phase 1: with the OpenCL transfer queue
+    /// enabled (default ON), `enqueue_write_async` must produce a
+    /// device buffer whose readback is byte-equal to the sync
+    /// `copy_weight_from` path. Skipped when the host has no usable
+    /// OpenCL platform (e.g. CI without GPU drivers).
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn test_async_transfer_opencl_byte_equal() {
+        // Force the env-gate ON so the test exercises the transfer queue.
+        // Safe in tests because we never spawn other threads here.
+        // SAFETY: single-threaded test process; no concurrent env reads.
+        unsafe {
+            std::env::set_var("LLMRS_OPENCL_TRANSFER_QUEUE", "1");
+        }
+
+        // `OpenCLBackend::new()` returns `Result` but the underlying
+        // `Device::first` path can panic on hosts without an OpenCL
+        // driver. Wrap with `catch_unwind` so we cleanly skip in those
+        // environments (CI / sandboxed dev shells). `AssertUnwindSafe`
+        // is fine because the closure has no shared mutable state.
+        let backend = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            crate::backend::opencl::OpenCLBackend::new,
+        )) {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[test] skipping OpenCL async transfer byte-equal: \
+                     OpenCL backend unavailable ({e})"
+                );
+                return;
+            }
+            Err(_) => {
+                eprintln!(
+                    "[test] skipping OpenCL async transfer byte-equal: \
+                     OpenCL backend init panicked (no devices?)"
+                );
+                return;
+            }
+        };
+
+        // 1 KiB F32 tensor with a recognisable pattern. Small enough
+        // to keep the test cheap on slower hosts.
+        const N: usize = 256;
+        let mut src_data = Vec::with_capacity(N);
+        for i in 0..N {
+            src_data.push(((i as f32) * 0.5) - 17.0);
+        }
+        let src = make_cpu_tensor(&src_data);
+
+        // Sync reference path.
+        let sync_dst = backend.copy_weight_from(&src).unwrap();
+        let mut sync_buf = vec![0u8; sync_dst.size()];
+        backend.read_buffer(&sync_dst, &mut sync_buf).unwrap();
+
+        // Async path under test.
+        let (async_dst, evt) = backend.enqueue_write_async(&src).unwrap();
+        backend.wait_event_blocking(&evt).unwrap();
+        // Drain the secondary queue too — `wait_event_blocking` only
+        // waits on the recorded event, not on subsequent commands.
+        backend.synchronize().unwrap();
+        let mut async_buf = vec![0u8; async_dst.size()];
+        backend.read_buffer(&async_dst, &mut async_buf).unwrap();
+
+        assert_eq!(sync_buf.len(), async_buf.len());
+        assert_eq!(
+            sync_buf, async_buf,
+            "OpenCL enqueue_write_async readback must equal sync copy_weight_from"
+        );
+        assert!(
+            backend.supports_async_transfer(),
+            "OpenCL backend should advertise async transfer when env gate is on"
         );
     }
 }

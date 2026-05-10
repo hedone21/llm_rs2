@@ -322,7 +322,7 @@ loop:
 - `sys.*` 헬퍼: `sys.read(path)`, `sys.meminfo()`, `sys.thermal(zone)`, `sys.gpu_busy()`, `sys.gpu_freq()`, `sys.cpu_freq(n)` — 시스템 센서를 Lua에서 직접 읽는다.
 - 반환: EngineCommand 테이블 배열. 빈 배열이면 액션 없음.
 - 에러 처리: Lua 런타임 에러 시 `log::error`로 기록하고 빈 액션을 반환한다. Manager는 crash하지 않는다.
-- 메모리 제한: 4MB. 샌드박스: TABLE, STRING, MATH 라이브러리만 허용 (IO, OS 차단).
+- 메모리 제한: 4MB. 샌드박스: TABLE, STRING, MATH, IO 라이브러리 허용 (OS, PACKAGE, DEBUG 차단). IO 허용은 정책 스크립트가 manager 프로세스 권한으로 임의의 파일을 읽고 쓸 수 있음을 의미하므로, 정책 스크립트는 운영자가 직접 작성·검토한 신뢰 원본만 사용해야 한다 (운영자 신뢰 전제). *(2026-04-30 변경: IO 허용으로 확장. OS/PACKAGE/DEBUG는 임의 코드 실행·외부 모듈 로딩·VM 내부 조작이 가능하므로 차단 유지.)*
 - `--policy-script` 미지정 시 기존 HierarchicalPolicy(MGR-023~028)가 사용된다.
 
 ## 4. Alternative Behavior

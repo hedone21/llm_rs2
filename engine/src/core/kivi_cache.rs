@@ -274,28 +274,6 @@ pub struct KiviCache {
 impl KiviCache {
     // ── SharedBuffer ↔ f32 slice helpers ─────────────────────────────────────
 
-    /// Return the attn_k_buf contents as a `&[f32]` slice (len = byte_size / 4).
-    #[allow(dead_code)]
-    fn attn_k_as_slice(&self) -> &[f32] {
-        let len = self.attn_k_buf.size() / 4;
-        if len == 0 {
-            return &[];
-        }
-        // SAFETY: SharedBuffer is allocated as DType::F32 with size = len*4 bytes.
-        // The pointer is valid for `len` f32 elements.
-        unsafe { std::slice::from_raw_parts(self.attn_k_buf.as_ptr() as *const f32, len) }
-    }
-
-    /// Return the attn_v_buf contents as a `&[f32]` slice.
-    #[allow(dead_code)]
-    fn attn_v_as_slice(&self) -> &[f32] {
-        let len = self.attn_v_buf.size() / 4;
-        if len == 0 {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(self.attn_v_buf.as_ptr() as *const f32, len) }
-    }
-
     /// Return the attn_k_buf contents as a `&mut [f32]` slice.
     ///
     /// SAFETY: Caller must ensure no aliasing references exist. In practice,
@@ -818,10 +796,13 @@ impl KiviCache {
 
     /// Dry-run QCF estimate for KIVI quantization (read-only, no state mutation).
     ///
-    /// - **CPU mode** with residual data: computes actual NMSE via `compute_flush_qcf`.
+    /// - **CPU mode** with residual data: computes actual NMSE via `compute_flush_nmse`.
     /// - **GPU mode** or empty residual: returns a bits-based proxy
     ///   (Q2=0.30, Q4=0.10, Q8=0.03, F16=0.0).
     pub fn estimate_dryrun_qcf(&self) -> f32 {
+        let _t = crate::profile::quality_metrics::Timer::start(
+            &crate::profile::quality_metrics::QCF_KV_DRYRUN,
+        );
         // bits=16 means unquantized, no degradation
         if self.bits == 16 {
             return 0.0;
@@ -834,7 +815,7 @@ impl KiviCache {
             let flush_tokens = n_groups * gs;
             if flush_tokens > 0 {
                 let config = crate::core::qcf::QcfConfig::default();
-                let params = crate::core::qcf::FlushQcfParams {
+                let params = crate::core::qcf::KiviFlushParams {
                     res_k: &self.res_k,
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
@@ -843,7 +824,7 @@ impl KiviCache {
                     res_cap: self.res_cap,
                     bits: self.bits,
                 };
-                let metric = crate::core::qcf::compute_flush_qcf(&params, &config);
+                let metric = crate::core::qcf::compute_flush_nmse(&params, &config);
                 return metric.normalized_value.clamp(0.0, 1.0);
             }
         }
@@ -912,7 +893,7 @@ impl KiviCache {
 
         // Compute NMSE proxy before quantization (FP32 originals still available)
         let qcf_config = crate::core::qcf::QcfConfig::default();
-        let proxy_params = crate::core::qcf::FlushQcfParams {
+        let proxy_params = crate::core::qcf::KiviFlushParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,
@@ -921,10 +902,11 @@ impl KiviCache {
             res_cap: self.res_cap,
             bits: self.bits,
         };
-        self.flush_proxies.push(crate::core::qcf::compute_flush_qcf(
-            &proxy_params,
-            &qcf_config,
-        ));
+        self.flush_proxies
+            .push(crate::core::qcf::compute_flush_nmse(
+                &proxy_params,
+                &qcf_config,
+            ));
         self.flush_proxies.push(crate::core::qcf::compute_flush_opr(
             &proxy_params,
             &qcf_config,
@@ -938,7 +920,7 @@ impl KiviCache {
                 0
             };
             if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
-                let awqe_params = crate::core::qcf::FlushAwqeParams {
+                let awqe_params = crate::core::qcf::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -959,7 +941,7 @@ impl KiviCache {
                     ));
 
                 // AW-VOPR: attention-weighted vector output perturbation ratio
-                let vopr_params = crate::core::qcf::FlushAwVoprParams {
+                let vopr_params = crate::core::qcf::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -1688,7 +1670,7 @@ impl KiviCache {
 
         // 2. Compute QCF proxy metrics (same as CPU path)
         let qcf_config = crate::core::qcf::QcfConfig::default();
-        let proxy_params = crate::core::qcf::FlushQcfParams {
+        let proxy_params = crate::core::qcf::KiviFlushParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,
@@ -1697,10 +1679,11 @@ impl KiviCache {
             res_cap: self.res_cap,
             bits: self.bits,
         };
-        self.flush_proxies.push(crate::core::qcf::compute_flush_qcf(
-            &proxy_params,
-            &qcf_config,
-        ));
+        self.flush_proxies
+            .push(crate::core::qcf::compute_flush_nmse(
+                &proxy_params,
+                &qcf_config,
+            ));
         self.flush_proxies.push(crate::core::qcf::compute_flush_opr(
             &proxy_params,
             &qcf_config,
@@ -1714,7 +1697,7 @@ impl KiviCache {
                 0
             };
             if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
-                let awqe_params = crate::core::qcf::FlushAwqeParams {
+                let awqe_params = crate::core::qcf::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -1735,7 +1718,7 @@ impl KiviCache {
                     ));
 
                 // AW-VOPR: attention-weighted vector output perturbation ratio
-                let vopr_params = crate::core::qcf::FlushAwVoprParams {
+                let vopr_params = crate::core::qcf::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -2037,18 +2020,6 @@ impl KiviCache {
         self.gpu_q2v_blocks += new_v_blocks;
 
         Ok(())
-    }
-
-    /// Serialize quantized key blocks [block_start..block_start+count] to raw bytes.
-    #[allow(dead_code)]
-    fn serialize_quantized_blocks_k(&self, block_start: usize, count: usize) -> Vec<u8> {
-        self.serialize_blocks(&self.qk, block_start, count)
-    }
-
-    /// Serialize quantized value blocks [block_start..block_start+count] to raw bytes.
-    #[allow(dead_code)]
-    fn serialize_quantized_blocks_v(&self, block_start: usize, count: usize) -> Vec<u8> {
-        self.serialize_blocks(&self.qv, block_start, count)
     }
 
     fn serialize_blocks(&self, blocks: &QuantizedBlocks, start: usize, count: usize) -> Vec<u8> {
@@ -3213,7 +3184,7 @@ mod tests {
         }
 
         let proxies = cache.take_flush_proxies();
-        // Each flush pushes 2 QCF metrics (compute_flush_qcf → "kivi",
+        // Each flush pushes 2 QCF metrics (compute_flush_nmse → "kivi",
         // compute_flush_opr → "kivi_opr"). 2 flushes × 2 metrics = 4 total.
         assert_eq!(
             proxies.len(),

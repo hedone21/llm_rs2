@@ -1,7 +1,5 @@
 //! Eval output types: unified result structures for all eval-ll modes.
 
-use super::hook::MetricsSummary;
-
 /// Configuration for the generic eval loop.
 #[derive(Debug, Clone)]
 pub struct EvalConfig {
@@ -36,8 +34,6 @@ pub struct EvalOutput {
     pub config: serde_json::Value,
     /// Wall-clock time in seconds.
     pub wall_time_s: f64,
-    /// Aggregated QCF/OPR metrics.
-    pub metrics_summary: MetricsSummary,
     /// Layer importance table (if skip_config active).
     pub layer_importance: Option<serde_json::Value>,
     /// Layer skip QCF (cos_sim based).
@@ -82,7 +78,6 @@ impl EvalOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::qcf_helpers::build_qcf_fields;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -91,7 +86,6 @@ mod tests {
             results: vec![],
             config: serde_json::json!({}),
             wall_time_s: 0.0,
-            metrics_summary: MetricsSummary::default(),
             layer_importance: None,
             layer_skip_qcf: None,
             layer_skip_qcf_normalized: None,
@@ -239,68 +233,7 @@ mod tests {
         assert_eq!(li.as_array().unwrap().len(), 1);
     }
 
-    // ── 4. build_qcf_fields — eviction 경로 검증 ─────────────────────────────
-
-    /// eviction 모드에서 qcf_kivi_opr_total은 null이어야 한다.
-    #[test]
-    fn test_build_qcf_fields_eviction_mode() {
-        let ms = MetricsSummary {
-            qcf_kivi_opr: None,
-            qcf_kivi_opr_events: 0,
-            ..Default::default()
-        };
-        let fields = build_qcf_fields(&ms);
-
-        // eviction 모드에서 KIVI OPR 필드는 null이어야 한다
-        assert!(fields["qcf_kivi_opr_total"].is_null());
-        assert!(fields["qcf_kivi_opr_events"].is_null());
-    }
-
-    // ── 5. build_qcf_fields — KIVI 경로 검증 ─────────────────────────────────
-
-    /// qcf_kivi_opr이 Some일 때 qcf_kivi_opr_total과 qcf_kivi_opr_events가
-    /// 숫자로 포함되어야 한다.
-    #[test]
-    fn test_build_qcf_fields_kivi_present() {
-        let ms = MetricsSummary {
-            qcf_kivi_opr: Some(0.089),
-            qcf_kivi_opr_events: 12,
-            ..Default::default()
-        };
-        let fields = build_qcf_fields(&ms);
-
-        assert!((fields["qcf_kivi_opr_total"].as_f64().unwrap() - 0.089).abs() < 1e-9);
-        assert_eq!(fields["qcf_kivi_opr_events"].as_u64().unwrap(), 12);
-    }
-
-    /// qcf_kivi_opr이 None일 때 qcf_kivi_opr_events도 null이어야 한다.
-    #[test]
-    fn test_build_qcf_fields_kivi_absent() {
-        let ms = MetricsSummary {
-            qcf_kivi_opr: None,
-            qcf_kivi_opr_events: 7,
-            ..Default::default()
-        };
-        let fields = build_qcf_fields(&ms);
-
-        assert!(fields["qcf_kivi_opr_total"].is_null());
-        assert!(fields["qcf_kivi_opr_events"].is_null());
-    }
-
-    // ── 6. MetricsSummary Default 검증 ────────────────────────────────────────
-
-    /// Default MetricsSummary는 모든 optional 필드가 None이어야 한다.
-    #[test]
-    fn test_metrics_summary_default_none_fields() {
-        let ms = MetricsSummary::default();
-        assert!(ms.qcf_kivi_opr.is_none());
-        assert_eq!(ms.qcf_kivi_opr_events, 0);
-        assert_eq!(ms.qcf_attn_total, 0.0);
-        assert_eq!(ms.qcf_caote_total, 0.0);
-        assert_eq!(ms.qcf_normalized_total, 0.0);
-    }
-
-    // ── 7. to_json() 결정론적 직렬화 검증 ────────────────────────────────────
+    // ── 4. to_json() 결정론적 직렬화 검증 ────────────────────────────────────
 
     /// 동일한 EvalOutput을 두 번 직렬화하면 동일한 문자열이 나와야 한다.
     #[test]

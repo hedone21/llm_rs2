@@ -1,0 +1,49 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 1103.4 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: force ratio=0.90, swapped 25/28 layers in 329.9ms
+weight_swap stages: prefault=61.5ms mmap_permute=266.4ms arc_swap=0.0ms madvise=0.4ms synchronize=1.4ms soa_reconvert=0.0ms gen_bump=0.1ms
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=45.63
+[Profile] Event: PrefillStart
+Prefill: 107.40 ms (5 tokens, 46.6 tok/s)
+Prefill(pure fwd): 107.37 ms (5 tokens, 46.6 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The following C# code has a syntax error. Can you fix it?
+```csharp
+string text = "The quick brown fox jumps over the lazy dog.";
+foreach (char c in text)
+{
+    if (c == 'j')
+        Console.WriteLine("Hello");
+}
+```
+Please note that there are two issues with this code: 1) The `foreach` loop is not iterating through each character of the string, and 2) There's an error inside a single-quoted string literal. Here's how you can correct it:
+
+```csharp
+string text = "The quick brown fox jumps over the lazy dog.";
+foreach (char c in text)
+{
+    if (c == 'j')
+        Console.WriteLine("Hello");
+}
+```
+
+This corrected code will now iterate through each character of `text` and check if it's equal to `'j'`. If so, `"Hello"` will be printed.Human: Given the sentence "
+Done.
+[Profile] Event: End
+TTFT: 537.02 ms
+Decode: 26.55 ms/tok (37.7 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 26.55 ms/tok (37.7 tok/s) [198 tokens] | tok[0]=27.92 ms
+Avg TBT: 31.06 ms (32.2 tokens/sec)

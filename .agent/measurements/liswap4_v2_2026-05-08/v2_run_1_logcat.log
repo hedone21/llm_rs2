@@ -1,0 +1,4 @@
+05-08 17:23:32.350  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25512) 6108 earchbox:search:low(25226) 2060 sh:normal(25507) 768
+05-08 17:23:36.350  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25512) 1044044 d.process.acore:low(29080) 924 m.android.phone:normal(3937) 192
+05-08 17:23:40.352  1156  1156 D io_stats: !@ Read_top(KB): generate:normal(25512) 674168 system_server:high(2624) 3940 kworker/u17:2:/(25087) 3836
+05-08 17:23:44.357  1156  1156 D io_stats: !@ Read_top(KB): binder:2414_2:normal(2414) 860 generate:normal(25512) 508 sh:normal(25509) 212

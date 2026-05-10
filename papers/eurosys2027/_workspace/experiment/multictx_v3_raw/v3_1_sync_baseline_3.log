@@ -1,0 +1,100 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 2146.6 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The quick brown fox jumps
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[LISWAP-3] --swap-zero-copy requested but pool unavailable (env LLMRS_OPENCL_HOST_PTR_POOL not set or pool init failed); using staging path
+weight_swap: incremental mode — ratio=0.90, 25 target layers, per_tick=1 (25 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=90.77
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The quick brown fox jumps overPrefill: 272.68 ms (5 tokens, 18.3 tok/s)
+Prefill(pure fwd): 272.61 ms (5 tokens, 18.3 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[IncrementalSwap] tick=0 chunk=[0] swapped=1 remaining=24 latency=44.2ms
+[IncrementalSwap] stages: prefault=1.2ms mmap_permute=41.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ the[IncrementalSwap] tick=1 chunk=[1] swapped=1 remaining=23 latency=40.9ms
+[IncrementalSwap] stages: prefault=0.5ms mmap_permute=39.1ms arc_swap=0.0ms madvise=1.4ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ lazy dog[IncrementalSwap] tick=2 chunk=[2] swapped=1 remaining=22 latency=39.4ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=14.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=3 chunk=[3] swapped=1 remaining=21 latency=62.3ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=27.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+.
+[IncrementalSwap] tick=4 chunk=[5] swapped=1 remaining=20 latency=52.3ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.3ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+"""
+[IncrementalSwap] tick=5 chunk=[6] swapped=1 remaining=19 latency=54.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=25.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+import[IncrementalSwap] tick=6 chunk=[7] swapped=1 remaining=18 latency=50.8ms
+[IncrementalSwap] stages: prefault=1.1ms mmap_permute=26.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ re[IncrementalSwap] tick=7 chunk=[8] swapped=1 remaining=17 latency=51.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=21.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+
+
+[IncrementalSwap] tick=8 chunk=[9] swapped=1 remaining=16 latency=53.5ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+def[IncrementalSwap] tick=9 chunk=[10] swapped=1 remaining=15 latency=48.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=25.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ palindrome[IncrementalSwap] tick=10 chunk=[11] swapped=1 remaining=14 latency=52.0ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=29.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+(s[IncrementalSwap] tick=11 chunk=[12] swapped=1 remaining=13 latency=52.7ms
+[IncrementalSwap] stages: prefault=0.1ms mmap_permute=23.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+):
+[IncrementalSwap] tick=12 chunk=[14] swapped=1 remaining=12 latency=53.6ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=26.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+   [IncrementalSwap] tick=13 chunk=[15] swapped=1 remaining=11 latency=49.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ s[IncrementalSwap] tick=14 chunk=[16] swapped=1 remaining=10 latency=52.5ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ =[IncrementalSwap] tick=15 chunk=[17] swapped=1 remaining=9 latency=53.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ ''.[IncrementalSwap] tick=16 chunk=[18] swapped=1 remaining=8 latency=48.2ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=24.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+join[IncrementalSwap] tick=17 chunk=[19] swapped=1 remaining=7 latency=61.5ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=33.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+([[IncrementalSwap] tick=18 chunk=[20] swapped=1 remaining=6 latency=49.6ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+i[IncrementalSwap] tick=19 chunk=[21] swapped=1 remaining=5 latency=60.4ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=32.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ for[IncrementalSwap] tick=20 chunk=[22] swapped=1 remaining=4 latency=51.9ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=26.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ i[IncrementalSwap] tick=21 chunk=[24] swapped=1 remaining=3 latency=48.8ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=27.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ in[IncrementalSwap] tick=22 chunk=[25] swapped=1 remaining=2 latency=54.4ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=29.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ s[IncrementalSwap] tick=23 chunk=[26] swapped=1 remaining=1 latency=56.9ms
+[IncrementalSwap] stages: prefault=0.2ms mmap_permute=31.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+ if[IncrementalSwap] tick=24 chunk=[27] swapped=1 remaining=0 latency=57.3ms
+[IncrementalSwap] stages: prefault=0.3ms mmap_permute=28.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=24)
+ i.isalpha()]).lower()
+    return 'is a' if (s == (s[::-1])) else 'not'
+
+# For each line, split it into words and check if every word is a palindrome
+for line in sys.stdin:
+	line = re.split('\W+',line.rstrip())
+	print(" ".join([palindrome(w) for w in line]) + " ")class Solution:
+    def validIPAddress(self, IP):
+        # Check for 1st format
+        if (len(IP)>0 and len(IP)<7): return ("IPv4")
+        
+	# Check if length is greater than 3. If it is then its not a format.
+        elif(len(IP)>8 or len(I) <8 ): return("Not in any of formats.")
+	
+	# Check for each number after the first dot
+        for i in range
+Done.
+[Profile] Event: End
+TTFT: 432.54 ms
+Decode: 33.27 ms/tok (30.1 tok/s) [199 tokens, forward only]
+Decode(excl tok[0]): 33.15 ms/tok (30.2 tok/s) [198 tokens] | tok[0]=57.66 ms
+Avg TBT: 44.69 ms (22.4 tokens/sec)

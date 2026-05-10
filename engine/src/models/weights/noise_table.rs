@@ -71,7 +71,7 @@ impl QuantNoiseTable {
     /// If the entire computation fails (e.g. `secondary` has no layers at
     /// all), the caller should fall back to `QuantNoiseTable::uniform_ones`.
     pub fn new_from_frobenius(
-        primary_slots: &[crate::models::weights::LayerSlot],
+        primary_slots: &[Arc<crate::models::weights::LayerSlot>],
         secondary: &Arc<SecondaryMmap>,
     ) -> Self {
         let n = primary_slots.len();

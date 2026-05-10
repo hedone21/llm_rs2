@@ -4,20 +4,54 @@
 //! Supports both H2O (score-based) and Sliding (position-based) eviction policies,
 //! and collects QCF/CAOTE metrics at each eviction event.
 
-use super::hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
+use super::hook::{CacheSnapshot, PostStepResult, StepHook};
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
-use crate::core::qcf::QcfConfig;
+use crate::core::qcf::{
+    AggregationMode, EntropyResult, LayerAggregationMode, QcfActionType, QcfConfig,
+    TopKRetentionResult, UnifiedQcfParams, VDataSource, aggregate_heads, aggregate_layers,
+    compute_normalized_entropy, compute_topk_retention, compute_unified_qcf,
+    identify_retained_for_action,
+};
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
 #[derive(Debug, Clone)]
 pub struct EvictionQcfResult {
     pub tokens_evicted: usize,
     pub eviction_ratio: f32,
-    pub qcf_attn_raw: f32,
-    pub qcf_attn_norm: f32,
     pub qcf_caote: f32,
+}
+
+/// Experimental QCF metrics — added 2026-05 for ARGUS analysis.
+/// All fields are temporary. May be deprecated after paper validation.
+#[derive(Debug, Clone, Default)]
+pub struct ExperimentalQcfPayload {
+    pub per_head: Vec<f32>,
+    pub caote_max: f32,
+    pub caote_topk_k3: f32,
+    pub caote_topk_k5: f32,
+    pub caote_defensive_t01: f32,
+    pub caote_defensive_t05: f32,
+    // Step 2: Top-K retention metrics (ARGUS #5)
+    pub topk_retention_k10: f32,
+    pub topk_retention_k20: f32,
+    pub topk_retention_k50: f32,
+    pub topk_retention_weighted_k10: f32,
+    pub topk_retention_weighted_k20: f32,
+    // Step 3: Attention entropy + β-amplified CAOTE (ARGUS #6)
+    pub attention_entropy: f32,
+    pub attention_entropy_normalized: f32,
+    pub qcf_beta_amplified_b1: f32,
+    pub qcf_beta_amplified_b1_5: f32,
+    pub qcf_beta_amplified_b2: f32,
+    // Step 4: Multi-layer QCF aggregation (ARGUS #1)
+    pub per_layer: Vec<f32>,
+    pub per_layer_indices: Vec<usize>,
+    pub caote_layer_max: f32,
+    pub caote_layer_defensive_t01: f32,
+    pub caote_layer_defensive_t05: f32,
+    pub caote_layer_late_30pct: f32,
 }
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
@@ -129,6 +163,11 @@ pub struct EvictionHook {
     pub kv_type: String,
     /// Backend reference for GPU buffer read/write in snapshot/restore.
     pub backend: std::sync::Arc<dyn crate::core::backend::Backend>,
+    /// Whether to compute and dump experimental QCF metrics (ARGUS).
+    pub experimental_enabled: bool,
+    /// Sample layer indices for multi-layer QCF (ARGUS #1).
+    /// Empty → use [0] for backward compat.
+    pub qcf_sample_layers: Vec<usize>,
 
     // -- Statistics (reset per question) --
     /// Number of eviction events this question.
@@ -137,6 +176,8 @@ pub struct EvictionHook {
     evicted_total: usize,
     /// QCF result from the single post-prefill eviction event (eval-ll mode).
     eviction_qcf: Option<EvictionQcfResult>,
+    /// Experimental QCF payload (Some when experimental_enabled and prefill happened).
+    experimental_qcf: Option<ExperimentalQcfPayload>,
 }
 
 impl EvictionHook {
@@ -152,6 +193,8 @@ impl EvictionHook {
         is_d2o: bool,
         kv_type: String,
         backend: std::sync::Arc<dyn crate::core::backend::Backend>,
+        experimental_enabled: bool,
+        qcf_sample_layers: Vec<usize>,
     ) -> Self {
         Self {
             cache_manager,
@@ -164,20 +207,18 @@ impl EvictionHook {
             is_d2o,
             kv_type,
             backend,
+            experimental_enabled,
+            qcf_sample_layers,
             eviction_count: 0,
             evicted_total: 0,
             eviction_qcf: None,
+            experimental_qcf: None,
         }
     }
 }
 
 impl StepHook<KVCache> for EvictionHook {
-    fn post_decode_step(
-        &mut self,
-        caches: &mut [KVCache],
-        _step: usize,
-        _qcf_metrics: &mut Vec<serde_json::Value>,
-    ) -> PostStepResult {
+    fn post_decode_step(&mut self, caches: &mut [KVCache], _step: usize) -> PostStepResult {
         // effective_budget == 0 means "no budget" (full-prefill mode).
         // Guard against the budget=0 degenerate case: without this check,
         // ratio = 0/before_len = 0 would request full eviction every step,
@@ -233,7 +274,7 @@ impl StepHook<KVCache> for EvictionHook {
         }
     }
 
-    fn post_prefill(&mut self, caches: &mut [KVCache], _qcf_metrics: &mut Vec<serde_json::Value>) {
+    fn post_prefill(&mut self, caches: &mut [KVCache]) {
         // After full batch prefill, evict if cache exceeds budget.
         // This replaces the old chunked-prefill approach that decoded overflow
         // tokens one-by-one (causing 2-3.3x slowdown).
@@ -289,193 +330,121 @@ impl StepHook<KVCache> for EvictionHook {
 
         // can_compute_qcf: true when V data is CPU-accessible (CPU backend) or
         // successfully read back (GPU backend). Supports F32, F16, and Q4_0 dtypes.
-        let can_compute_qcf = !caches.is_empty()
-            && (v_cpu_bytes.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null());
+        let can_compute_qcf =
+            v_cpu_bytes.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null();
 
-        // Collect QCF metrics before eviction
-        let (_evicted_positions_for_qcf, qcf_attn_raw, qcf_attn_norm, qcf_caote) = if self
-            .score_based_eviction
-        {
-            let active = self
+        // QCF (unified output-error formula). Action picks the simulated retention.
+        let qcf_caote = if can_compute_qcf {
+            let cache = &caches[0];
+            let v_source = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref())
+                .unwrap_or_else(|| {
+                    // fallback: treat as F32 (may be incorrect for unknown dtypes)
+                    VDataSource::F32(cache.v_buffer.as_slice::<f32>())
+                });
+            let target_len = ((before_len as f32) * ratio) as usize;
+            let action = if self.score_based_eviction {
+                if self.is_d2o {
+                    QcfActionType::MergeD2o {
+                        target_len,
+                        keep_ratio: self.h2o_keep_ratio,
+                        protected_prefix: self.protected_prefix,
+                    }
+                } else {
+                    QcfActionType::EvictH2o {
+                        target_len,
+                        keep_ratio: self.h2o_keep_ratio,
+                        protected_prefix: self.protected_prefix,
+                    }
+                }
+            } else {
+                QcfActionType::EvictSliding { target_len }
+            };
+            let attention_scores: Vec<f32> = self
                 .score_accumulator
                 .as_ref()
-                .is_some_and(|acc| acc.is_active());
-
-            if active {
-                let scores = self
-                    .score_accumulator
-                    .as_ref()
-                    .unwrap()
-                    .importance_scores()
-                    .to_vec();
-                let target_len = ((before_len as f32) * ratio) as usize;
-                let evicted = crate::core::qcf::identify_evicted_h2o(
-                    &scores,
-                    self.protected_prefix,
-                    self.h2o_keep_ratio,
+                .filter(|acc| acc.is_active())
+                .map(|acc| acc.importance_scores().to_vec())
+                .unwrap_or_default();
+            let head_attn_opt = self
+                .score_accumulator
+                .as_ref()
+                .and_then(|acc| acc.last_step_head_attn());
+            // D2O simulator (paper Eq.8) needs K for nearest-neighbour
+            // matching; other actions ignore `k_source`.
+            let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
+                VDataSource::k_from_kv_cache(cache)
+            } else {
+                None
+            };
+            // Compute retained set before moving `action` into params (experimental path).
+            // Clone action for re-use in β-amplified measurements.
+            let action_for_beta = if self.experimental_enabled {
+                Some(action.clone())
+            } else {
+                None
+            };
+            let retained_for_topk = if self.experimental_enabled {
+                Some(identify_retained_for_action(
+                    &action,
+                    &attention_scores,
                     before_len,
-                    target_len,
-                );
-                let positions: Vec<usize> = evicted.iter().map(|(pos, _)| *pos).collect::<Vec<_>>();
+                ))
+            } else {
+                None
+            };
+            let params = UnifiedQcfParams {
+                action,
+                v_source,
+                k_source,
+                attention_scores: &attention_scores,
+                head_attn: head_attn_opt,
+                n_kv_heads: cache.kv_heads(),
+                head_dim: cache.head_dim(),
+                current_pos: before_len,
+                capacity: cache.capacity(),
+                layout: cache.layout(),
+                aggregation: AggregationMode::Mean,
+                beta: 1.0,
+            };
+            let (qcf, per_head) = compute_unified_qcf(&params);
 
-                // QCF-ATTN v2: use last_step_head_attn if available
-                let (attn_raw, attn_norm) = self
-                    .score_accumulator
-                    .as_ref()
-                    .and_then(|acc| acc.last_step_head_attn())
-                    .map(|head_attn| {
-                        let n_kv_heads = if !caches.is_empty() {
-                            caches[0].kv_heads()
+            if self.experimental_enabled {
+                // Top-K retention: compute evicted set from retained simulation,
+                // then measure how many high-importance tokens survived.
+                let retained = retained_for_topk.unwrap_or_default();
+                let retained_set: std::collections::HashSet<usize> =
+                    retained.iter().copied().collect();
+                let evicted_set: std::collections::HashSet<usize> = (0..before_len)
+                    .filter(|t| !retained_set.contains(t))
+                    .collect();
+
+                let r10: TopKRetentionResult =
+                    compute_topk_retention(&attention_scores, &evicted_set, 10);
+                let r20: TopKRetentionResult =
+                    compute_topk_retention(&attention_scores, &evicted_set, 20);
+                let r50: TopKRetentionResult =
+                    compute_topk_retention(&attention_scores, &evicted_set, 50);
+
+                // Step 3: Attention entropy of flat importance scores.
+                let entropy_result: EntropyResult = compute_normalized_entropy(&attention_scores);
+
+                // Step 3: β-amplified CAOTE at β=1.5 and β=2.0.
+                // β=1.0 is already computed above (qcf). V source must be re-obtained
+                // from the cache because `v_source` was moved into `params`.
+                let qcf_b1 = qcf;
+                let qcf_b1_5 = {
+                    let v_src_b = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref());
+                    if let (Some(vs), Some(act)) = (v_src_b, action_for_beta.clone()) {
+                        let k_src_b = if matches!(act, QcfActionType::MergeD2o { .. }) {
+                            VDataSource::k_from_kv_cache(cache)
                         } else {
-                            1
+                            None
                         };
-                        let max_seq_len = head_attn.len() / n_kv_heads.max(1);
-                        let m = crate::core::qcf::compute_qcf_attn_v2(
-                            head_attn,
-                            &positions,
-                            n_kv_heads,
-                            max_seq_len,
-                            eviction_ratio,
-                        );
-                        (m.raw_value, m.normalized_value)
-                    })
-                    .unwrap_or((0.0, 0.0));
-
-                // QCF-CAOTE: D2O uses unified QCF with merge compensation;
-                // H2O uses the legacy eviction-only CAOTE.
-                let caote = if self.is_d2o && can_compute_qcf && !positions.is_empty() {
-                    // D2O path: compute_unified_qcf with MergeD2o action
-                    use crate::core::buffer::DType;
-                    use crate::core::qcf::{
-                        AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource,
-                        compute_unified_qcf,
-                    };
-                    let cache = &caches[0];
-                    use crate::core::quant::BlockQ4_0 as _BlockQ4_0D2O;
-                    let v_source_d2o_opt: Option<VDataSource> = if let Some(ref bytes) = v_cpu_bytes
-                    {
-                        match cache.v_buffer.dtype() {
-                            DType::F32 => {
-                                let elems = bytes.len() / 4;
-                                let ptr = bytes.as_ptr() as *const f32;
-                                Some(VDataSource::F32(unsafe {
-                                    std::slice::from_raw_parts(ptr, elems)
-                                }))
-                            }
-                            DType::F16 => {
-                                let elems = bytes.len() / 2;
-                                let ptr = bytes.as_ptr() as *const u16;
-                                Some(VDataSource::F16(unsafe {
-                                    std::slice::from_raw_parts(ptr, elems)
-                                }))
-                            }
-                            DType::Q4_0 => {
-                                let block_size = std::mem::size_of::<_BlockQ4_0D2O>();
-                                let n_blocks = bytes.len() / block_size;
-                                let ptr = bytes.as_ptr() as *const _BlockQ4_0D2O;
-                                Some(VDataSource::Q4_0(unsafe {
-                                    std::slice::from_raw_parts(ptr, n_blocks)
-                                }))
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        match cache.v_buffer.dtype() {
-                            DType::F32 => Some(VDataSource::F32(cache.v_buffer.as_slice::<f32>())),
-                            DType::F16 => Some(VDataSource::F16(cache.v_buffer.as_slice::<u16>())),
-                            DType::Q4_0 => Some(VDataSource::Q4_0(
-                                cache.v_buffer.as_slice::<_BlockQ4_0D2O>(),
-                            )),
-                            _ => None,
-                        }
-                    };
-                    let v_source = match v_source_d2o_opt {
-                        Some(s) => s,
-                        None => {
-                            // fallback: treat as F32 (may be incorrect for unknown dtypes)
-                            VDataSource::F32(cache.v_buffer.as_slice::<f32>())
-                        }
-                    };
-                    let head_attn_opt = self
-                        .score_accumulator
-                        .as_ref()
-                        .and_then(|acc| acc.last_step_head_attn());
-                    let params = UnifiedQcfParams {
-                        action: QcfActionType::MergeD2o {
-                            target_len,
-                            keep_ratio: self.h2o_keep_ratio,
-                            protected_prefix: self.protected_prefix,
-                        },
-                        v_source,
-                        attention_scores: &scores,
-                        head_attn: head_attn_opt,
-                        n_kv_heads: cache.kv_heads(),
-                        head_dim: cache.head_dim(),
-                        current_pos: before_len,
-                        capacity: cache.capacity(),
-                        layout: cache.layout(),
-                        aggregation: AggregationMode::Mean,
-                    };
-                    let (qcf, _) = compute_unified_qcf(&params);
-                    qcf
-                } else if can_compute_qcf && !positions.is_empty() {
-                    // H2O path: unified QCF (supports F32/F16/Q4_0)
-                    use crate::core::buffer::DType;
-                    use crate::core::qcf::{
-                        AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource,
-                        compute_unified_qcf,
-                    };
-                    use crate::core::quant::BlockQ4_0;
-                    let cache = &caches[0];
-                    let v_source_opt: Option<VDataSource> = if let Some(ref bytes) = v_cpu_bytes {
-                        match cache.v_buffer.dtype() {
-                            DType::F32 => {
-                                let elems = bytes.len() / 4;
-                                let ptr = bytes.as_ptr() as *const f32;
-                                Some(VDataSource::F32(unsafe {
-                                    std::slice::from_raw_parts(ptr, elems)
-                                }))
-                            }
-                            DType::F16 => {
-                                let elems = bytes.len() / 2;
-                                let ptr = bytes.as_ptr() as *const u16;
-                                Some(VDataSource::F16(unsafe {
-                                    std::slice::from_raw_parts(ptr, elems)
-                                }))
-                            }
-                            DType::Q4_0 => {
-                                let block_size = std::mem::size_of::<BlockQ4_0>();
-                                let n_blocks = bytes.len() / block_size;
-                                let ptr = bytes.as_ptr() as *const BlockQ4_0;
-                                Some(VDataSource::Q4_0(unsafe {
-                                    std::slice::from_raw_parts(ptr, n_blocks)
-                                }))
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        match cache.v_buffer.dtype() {
-                            DType::F32 => Some(VDataSource::F32(cache.v_buffer.as_slice::<f32>())),
-                            DType::F16 => Some(VDataSource::F16(cache.v_buffer.as_slice::<u16>())),
-                            DType::Q4_0 => {
-                                Some(VDataSource::Q4_0(cache.v_buffer.as_slice::<BlockQ4_0>()))
-                            }
-                            _ => None,
-                        }
-                    };
-                    if let Some(v_source) = v_source_opt {
-                        let head_attn_opt = self
-                            .score_accumulator
-                            .as_ref()
-                            .and_then(|acc| acc.last_step_head_attn());
-                        let params = UnifiedQcfParams {
-                            action: QcfActionType::EvictH2o {
-                                target_len,
-                                keep_ratio: self.h2o_keep_ratio,
-                                protected_prefix: self.protected_prefix,
-                            },
-                            v_source,
-                            attention_scores: &scores,
+                        let p = UnifiedQcfParams {
+                            action: act,
+                            v_source: vs,
+                            k_source: k_src_b,
+                            attention_scores: &attention_scores,
                             head_attn: head_attn_opt,
                             n_kv_heads: cache.kv_heads(),
                             head_dim: cache.head_dim(),
@@ -483,130 +452,182 @@ impl StepHook<KVCache> for EvictionHook {
                             capacity: cache.capacity(),
                             layout: cache.layout(),
                             aggregation: AggregationMode::Mean,
+                            beta: 1.5,
                         };
-                        let (qcf, _) = compute_unified_qcf(&params);
-                        qcf
+                        compute_unified_qcf(&p).0
                     } else {
                         0.0
                     }
-                } else {
-                    0.0
                 };
-
-                (positions, attn_raw, attn_norm, caote)
-            } else {
-                (Vec::new(), 0.0, 0.0, 0.0)
-            }
-        } else {
-            // Sliding: compute positions that will be evicted
-            let target_len = ((before_len as f32) * ratio) as usize;
-            let prune_count = before_len.saturating_sub(target_len);
-            let positions = crate::core::qcf::identify_evicted_sliding(
-                self.protected_prefix,
-                prune_count,
-                before_len,
-            );
-
-            // QCF-ATTN v2: use last_step_head_attn if available
-            let (attn_raw, attn_norm) = self
-                .score_accumulator
-                .as_ref()
-                .and_then(|acc| acc.last_step_head_attn())
-                .map(|head_attn| {
-                    let n_kv_heads = if !caches.is_empty() {
-                        caches[0].kv_heads()
+                let qcf_b2 = {
+                    let v_src_b = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref());
+                    if let (Some(vs), Some(act)) = (v_src_b, action_for_beta) {
+                        let k_src_b = if matches!(act, QcfActionType::MergeD2o { .. }) {
+                            VDataSource::k_from_kv_cache(cache)
+                        } else {
+                            None
+                        };
+                        let p = UnifiedQcfParams {
+                            action: act,
+                            v_source: vs,
+                            k_source: k_src_b,
+                            attention_scores: &attention_scores,
+                            head_attn: head_attn_opt,
+                            n_kv_heads: cache.kv_heads(),
+                            head_dim: cache.head_dim(),
+                            current_pos: before_len,
+                            capacity: cache.capacity(),
+                            layout: cache.layout(),
+                            aggregation: AggregationMode::Mean,
+                            beta: 2.0,
+                        };
+                        compute_unified_qcf(&p).0
                     } else {
-                        1
-                    };
-                    let max_seq_len = head_attn.len() / n_kv_heads.max(1);
-                    let m = crate::core::qcf::compute_qcf_attn_v2(
-                        head_attn,
-                        &positions,
-                        n_kv_heads,
-                        max_seq_len,
-                        eviction_ratio,
-                    );
-                    (m.raw_value, m.normalized_value)
-                })
-                .unwrap_or((0.0, 0.0));
+                        0.0
+                    }
+                };
 
-            // QCF: unified formula (supports F32/F16/Q4_0)
-            let caote = if can_compute_qcf && !positions.is_empty() {
-                use crate::core::buffer::DType;
-                use crate::core::qcf::{
-                    AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource,
-                    compute_unified_qcf,
-                };
-                use crate::core::quant::BlockQ4_0;
-                let cache = &caches[0];
-                let v_source_opt: Option<VDataSource> = if let Some(ref bytes) = v_cpu_bytes {
-                    match cache.v_buffer.dtype() {
-                        DType::F32 => {
-                            let elems = bytes.len() / 4;
-                            let ptr = bytes.as_ptr() as *const f32;
-                            Some(VDataSource::F32(unsafe {
-                                std::slice::from_raw_parts(ptr, elems)
-                            }))
-                        }
-                        DType::F16 => {
-                            let elems = bytes.len() / 2;
-                            let ptr = bytes.as_ptr() as *const u16;
-                            Some(VDataSource::F16(unsafe {
-                                std::slice::from_raw_parts(ptr, elems)
-                            }))
-                        }
-                        DType::Q4_0 => {
-                            let block_size = std::mem::size_of::<BlockQ4_0>();
-                            let n_blocks = bytes.len() / block_size;
-                            let ptr = bytes.as_ptr() as *const BlockQ4_0;
-                            Some(VDataSource::Q4_0(unsafe {
-                                std::slice::from_raw_parts(ptr, n_blocks)
-                            }))
-                        }
-                        _ => None,
-                    }
+                // Step 4: Multi-layer QCF aggregation (ARGUS #1).
+                // Sample layers: default fallback to [0] (backward compat).
+                // Layer 0 result is reused from above (no extra readback).
+                let sample_layers: Vec<usize> = if self.qcf_sample_layers.is_empty() {
+                    vec![0]
                 } else {
-                    match cache.v_buffer.dtype() {
-                        DType::F32 => Some(VDataSource::F32(cache.v_buffer.as_slice::<f32>())),
-                        DType::F16 => Some(VDataSource::F16(cache.v_buffer.as_slice::<u16>())),
-                        DType::Q4_0 => {
-                            Some(VDataSource::Q4_0(cache.v_buffer.as_slice::<BlockQ4_0>()))
-                        }
-                        _ => None,
-                    }
+                    self.qcf_sample_layers.clone()
                 };
-                if let Some(v_source) = v_source_opt {
-                    let head_attn_opt = self
-                        .score_accumulator
-                        .as_ref()
-                        .and_then(|acc| acc.last_step_head_attn());
-                    let flat_scores: &[f32] = self
-                        .score_accumulator
-                        .as_ref()
-                        .map(|acc| acc.importance_scores())
-                        .unwrap_or(&[]);
-                    let params = UnifiedQcfParams {
-                        action: QcfActionType::EvictSliding { target_len },
-                        v_source,
-                        attention_scores: flat_scores,
+                let mut per_layer: Vec<f32> = Vec::with_capacity(sample_layers.len());
+                let mut per_layer_indices: Vec<usize> = Vec::with_capacity(sample_layers.len());
+
+                for &layer_idx in &sample_layers {
+                    if layer_idx >= caches.len() {
+                        continue;
+                    }
+                    if layer_idx == 0 {
+                        // Reuse layer 0 result already computed above.
+                        per_layer.push(qcf);
+                        per_layer_indices.push(0);
+                        continue;
+                    }
+                    // Per-layer V readback (GPU only — CPU buffers accessible via as_ptr).
+                    let cache_l = &caches[layer_idx];
+                    let v_cpu_bytes_l: Option<Vec<u8>> =
+                        if cache_l.v_buffer.buffer().as_ptr().is_null() {
+                            let size = cache_l.v_buffer.buffer().size();
+                            let mut buf = vec![0u8; size];
+                            match self.backend.read_buffer(&cache_l.v_buffer, &mut buf) {
+                                Ok(()) => Some(buf),
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                    let can_compute_l =
+                        v_cpu_bytes_l.is_some() || !cache_l.v_buffer.buffer().as_ptr().is_null();
+                    if !can_compute_l {
+                        continue;
+                    }
+
+                    let v_source_l =
+                        match VDataSource::from_kv_cache(cache_l, v_cpu_bytes_l.as_deref()) {
+                            Some(vs) => vs,
+                            None => VDataSource::F32(cache_l.v_buffer.as_slice::<f32>()),
+                        };
+                    let k_source_l = if self.is_d2o {
+                        VDataSource::k_from_kv_cache(cache_l)
+                    } else {
+                        None
+                    };
+                    // Build action for this layer using same params as layer 0.
+                    let target_len_l = ((cache_l.current_pos as f32) * ratio) as usize;
+                    let action_l = if self.score_based_eviction {
+                        if self.is_d2o {
+                            QcfActionType::MergeD2o {
+                                target_len: target_len_l,
+                                keep_ratio: self.h2o_keep_ratio,
+                                protected_prefix: self.protected_prefix,
+                            }
+                        } else {
+                            QcfActionType::EvictH2o {
+                                target_len: target_len_l,
+                                keep_ratio: self.h2o_keep_ratio,
+                                protected_prefix: self.protected_prefix,
+                            }
+                        }
+                    } else {
+                        QcfActionType::EvictSliding {
+                            target_len: target_len_l,
+                        }
+                    };
+                    let params_l = UnifiedQcfParams {
+                        action: action_l,
+                        v_source: v_source_l,
+                        k_source: k_source_l,
+                        attention_scores: &attention_scores,
                         head_attn: head_attn_opt,
-                        n_kv_heads: cache.kv_heads(),
-                        head_dim: cache.head_dim(),
+                        n_kv_heads: cache_l.kv_heads(),
+                        head_dim: cache_l.head_dim(),
                         current_pos: before_len,
-                        capacity: cache.capacity(),
-                        layout: cache.layout(),
+                        capacity: cache_l.capacity(),
+                        layout: cache_l.layout(),
                         aggregation: AggregationMode::Mean,
+                        beta: 1.0,
                     };
-                    let (qcf, _) = compute_unified_qcf(&params);
-                    qcf
-                } else {
-                    0.0
+                    let (qcf_l, _) = compute_unified_qcf(&params_l);
+                    per_layer.push(qcf_l);
+                    per_layer_indices.push(layer_idx);
                 }
-            } else {
-                0.0
-            };
 
-            (positions, attn_raw, attn_norm, caote)
+                let caote_layer_max = aggregate_layers(&per_layer, &LayerAggregationMode::Max);
+                let caote_layer_def_t01 = aggregate_layers(
+                    &per_layer,
+                    &LayerAggregationMode::Defensive { temperature: 0.1 },
+                );
+                let caote_layer_def_t05 = aggregate_layers(
+                    &per_layer,
+                    &LayerAggregationMode::Defensive { temperature: 0.5 },
+                );
+                let caote_layer_late_30 = aggregate_layers(
+                    &per_layer,
+                    &LayerAggregationMode::LateFocused { fraction: 0.3 },
+                );
+
+                let payload = ExperimentalQcfPayload {
+                    caote_max: aggregate_heads(&per_head, &AggregationMode::Max),
+                    caote_topk_k3: aggregate_heads(&per_head, &AggregationMode::TopK { k: 3 }),
+                    caote_topk_k5: aggregate_heads(&per_head, &AggregationMode::TopK { k: 5 }),
+                    caote_defensive_t01: aggregate_heads(
+                        &per_head,
+                        &AggregationMode::Defensive { temperature: 0.1 },
+                    ),
+                    caote_defensive_t05: aggregate_heads(
+                        &per_head,
+                        &AggregationMode::Defensive { temperature: 0.5 },
+                    ),
+                    topk_retention_k10: r10.retention_binary,
+                    topk_retention_k20: r20.retention_binary,
+                    topk_retention_k50: r50.retention_binary,
+                    topk_retention_weighted_k10: r10.retention_weighted,
+                    topk_retention_weighted_k20: r20.retention_weighted,
+                    attention_entropy: entropy_result.entropy,
+                    attention_entropy_normalized: entropy_result.entropy_normalized,
+                    qcf_beta_amplified_b1: qcf_b1,
+                    qcf_beta_amplified_b1_5: qcf_b1_5,
+                    qcf_beta_amplified_b2: qcf_b2,
+                    per_head,
+                    per_layer,
+                    per_layer_indices,
+                    caote_layer_max,
+                    caote_layer_defensive_t01: caote_layer_def_t01,
+                    caote_layer_defensive_t05: caote_layer_def_t05,
+                    caote_layer_late_30pct: caote_layer_late_30,
+                };
+                self.experimental_qcf = Some(payload);
+            }
+
+            qcf
+        } else {
+            0.0
         };
 
         // Perform eviction
@@ -644,8 +665,6 @@ impl StepHook<KVCache> for EvictionHook {
             self.eviction_qcf = Some(EvictionQcfResult {
                 tokens_evicted: evict_result.tokens_removed,
                 eviction_ratio,
-                qcf_attn_raw,
-                qcf_attn_norm,
                 qcf_caote,
             });
         }
@@ -662,6 +681,7 @@ impl StepHook<KVCache> for EvictionHook {
         self.eviction_count = 0;
         self.evicted_total = 0;
         self.eviction_qcf = None;
+        self.experimental_qcf = None;
     }
 
     fn snapshot(&self, caches: &[KVCache]) -> Box<dyn CacheSnapshot<KVCache>> {
@@ -729,15 +749,36 @@ impl StepHook<KVCache> for EvictionHook {
             "evicted_tokens": self.evicted_total,
         });
         if let Some(ref qcf) = self.eviction_qcf {
-            // Unified cross-action QCF field: uses CAOTE as the canonical eviction metric.
             obj["qcf"] = serde_json::json!(qcf.qcf_caote);
-
-            // Existing fields (backward compatibility with analysis scripts).
             obj["tokens_evicted"] = serde_json::json!(qcf.tokens_evicted);
             obj["eviction_ratio"] = serde_json::json!(qcf.eviction_ratio);
-            obj["qcf_attn_raw"] = serde_json::json!(qcf.qcf_attn_raw);
-            obj["qcf_attn_norm"] = serde_json::json!(qcf.qcf_attn_norm);
-            obj["qcf_caote"] = serde_json::json!(qcf.qcf_caote);
+        }
+        if let Some(ref exp) = self.experimental_qcf {
+            obj["qcf_per_head"] = serde_json::json!(exp.per_head);
+            obj["qcf_caote_max"] = serde_json::json!(exp.caote_max);
+            obj["qcf_caote_topk_K3"] = serde_json::json!(exp.caote_topk_k3);
+            obj["qcf_caote_topk_K5"] = serde_json::json!(exp.caote_topk_k5);
+            obj["qcf_caote_defensive_t01"] = serde_json::json!(exp.caote_defensive_t01);
+            obj["qcf_caote_defensive_t05"] = serde_json::json!(exp.caote_defensive_t05);
+            obj["qcf_topk_retention_K10"] = serde_json::json!(exp.topk_retention_k10);
+            obj["qcf_topk_retention_K20"] = serde_json::json!(exp.topk_retention_k20);
+            obj["qcf_topk_retention_K50"] = serde_json::json!(exp.topk_retention_k50);
+            obj["qcf_topk_retention_weighted_K10"] =
+                serde_json::json!(exp.topk_retention_weighted_k10);
+            obj["qcf_topk_retention_weighted_K20"] =
+                serde_json::json!(exp.topk_retention_weighted_k20);
+            obj["attention_entropy"] = serde_json::json!(exp.attention_entropy);
+            obj["attention_entropy_normalized"] =
+                serde_json::json!(exp.attention_entropy_normalized);
+            obj["qcf_beta_amplified_b1"] = serde_json::json!(exp.qcf_beta_amplified_b1);
+            obj["qcf_beta_amplified_b1_5"] = serde_json::json!(exp.qcf_beta_amplified_b1_5);
+            obj["qcf_beta_amplified_b2"] = serde_json::json!(exp.qcf_beta_amplified_b2);
+            obj["qcf_per_layer"] = serde_json::json!(exp.per_layer);
+            obj["qcf_per_layer_indices"] = serde_json::json!(exp.per_layer_indices);
+            obj["qcf_caote_layer_max"] = serde_json::json!(exp.caote_layer_max);
+            obj["qcf_caote_layer_defensive_t01"] = serde_json::json!(exp.caote_layer_defensive_t01);
+            obj["qcf_caote_layer_defensive_t05"] = serde_json::json!(exp.caote_layer_defensive_t05);
+            obj["qcf_caote_layer_late_30pct"] = serde_json::json!(exp.caote_layer_late_30pct);
         }
         obj
     }
@@ -750,14 +791,8 @@ impl StepHook<KVCache> for EvictionHook {
             "h2o_keep_ratio": self.h2o_keep_ratio,
             "is_d2o": self.is_d2o,
             "kv_type": self.kv_type,
+            "experimental_enabled": self.experimental_enabled,
         })
-    }
-
-    fn aggregate_metrics(&self, _qcf_metrics: &[serde_json::Value]) -> MetricsSummary {
-        // Eviction metrics are now stored in self.eviction_qcf (via extra_question_fields).
-        // Return default so the eval_loop's KIVI OPR check (summary.qcf_kivi_opr.is_some())
-        // correctly returns None for the eviction path.
-        MetricsSummary::default()
     }
 }
 
@@ -804,6 +839,8 @@ mod tests {
             is_d2o,
             "f32".to_string(),
             std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
+            false,
+            vec![], // qcf_sample_layers: empty → internal fallback to [0]
         )
     }
 
@@ -835,38 +872,17 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_metrics_returns_default() {
-        // EvictionHook.aggregate_metrics() now always returns MetricsSummary::default().
-        // Eviction QCF data is stored in self.eviction_qcf and emitted via extra_question_fields.
-        let hook = make_hook(512, false);
-        let metrics = vec![
-            serde_json::json!({"action": "sliding_attn", "raw_value": 0.3, "normalized_value": 0.4}),
-            serde_json::json!({"action": "sliding_caote", "raw_value": 0.1, "normalized_value": 0.1}),
-        ];
-        let summary = hook.aggregate_metrics(&metrics);
-        // Default: no KIVI OPR (eviction path does not use OPR)
-        assert!(summary.qcf_kivi_opr.is_none());
-        assert_eq!(summary.qcf_kivi_opr_events, 0);
-        // Eviction attn/caote totals are now 0 in aggregate (moved to extra_question_fields)
-        assert_eq!(summary.qcf_attn_total, 0.0);
-        assert_eq!(summary.qcf_caote_total, 0.0);
-    }
-
-    #[test]
     fn test_post_decode_step_no_eviction_under_budget() {
         // post_decode_step should return default (no eviction) when under budget.
         // We use a hook with an impossibly large budget.
         let hook = make_hook(usize::MAX, false);
-        // With no real caches, it should short-circuit on the is_empty check.
-        let mut metrics = vec![];
         let result = {
             let mut h = hook;
-            h.post_decode_step(&mut [], 0, &mut metrics)
+            h.post_decode_step(&mut [], 0)
         };
         assert!(!result.evicted);
         assert_eq!(result.tokens_affected, 0);
         assert!(result.new_start_pos.is_none());
-        assert!(metrics.is_empty());
     }
 
     #[test]
@@ -875,5 +891,78 @@ mod tests {
         let snapshot = hook.snapshot(&[]);
         // Restoring an empty snapshot on empty caches should not panic.
         snapshot.restore_to(&mut []);
+    }
+
+    #[test]
+    fn test_make_hook_with_experimental_off() {
+        // Verifies that experimental_enabled=false is accepted and stored correctly.
+        let hook = make_hook_with_d2o(512, false, false);
+        assert!(!hook.experimental_enabled);
+    }
+
+    #[test]
+    fn test_extra_question_fields_no_experimental() {
+        // When experimental_qcf is None, extra_question_fields must not contain
+        // new experimental keys.
+        let hook = make_hook(512, false);
+        let fields = hook.extra_question_fields(&[]);
+        assert!(
+            fields.get("qcf_caote_max").is_none(),
+            "qcf_caote_max should be absent when experimental_qcf is None"
+        );
+        assert!(
+            fields.get("qcf_per_head").is_none(),
+            "qcf_per_head should be absent when experimental_qcf is None"
+        );
+    }
+
+    #[test]
+    fn test_extra_config_fields_experimental_enabled() {
+        // experimental_enabled field should appear in extra_config_fields.
+        let hook = make_hook(256, false);
+        let fields = hook.extra_config_fields();
+        assert_eq!(
+            fields["experimental_enabled"], false,
+            "experimental_enabled should be false for default hook"
+        );
+    }
+
+    #[test]
+    fn test_qcf_sample_layers_default_fallback() {
+        // Empty qcf_sample_layers → stored as empty vec.
+        // Internal fallback to [0] occurs at runtime in post_prefill.
+        // Here we verify the field is stored as-is and the hook is created successfully.
+        let hook = make_hook_with_d2o(512, false, false);
+        assert!(
+            hook.qcf_sample_layers.is_empty(),
+            "make_hook_with_d2o passes vec![] → qcf_sample_layers should be empty"
+        );
+    }
+
+    #[test]
+    fn test_qcf_sample_layers_explicit() {
+        // When explicit layers are provided, they should be stored unchanged.
+        let policy = Box::new(NoEvictionPolicy::new());
+        let monitor = Box::new(AlwaysOkMonitor);
+        let manager = CacheManager::new(policy, monitor, 0, 1.0);
+        let config = QcfConfig {
+            mode: QcfMode::Attn,
+            ..Default::default()
+        };
+        let hook = EvictionHook::new(
+            manager,
+            None,
+            config,
+            512,
+            0,
+            false,
+            0.5,
+            false,
+            "f32".to_string(),
+            std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
+            false,
+            vec![0, 4, 8, 12, 15],
+        );
+        assert_eq!(hook.qcf_sample_layers, vec![0, 4, 8, 12, 15]);
     }
 }

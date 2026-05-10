@@ -1,0 +1,16 @@
+[package]
+name = "qnn_oppkg"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "qnn_oppkg"
+# `rlib` so integration tests can link against the crate; `cdylib` for the
+# QNN runtime to dlopen the .so.
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+bindgen = "0.71"
+
+[dependencies]

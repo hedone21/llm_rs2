@@ -83,6 +83,9 @@ def main():
                 "qcf_avg": r["qcf_summary"]["avg"],
                 "qcf_total": r["qcf_summary"]["total"],
                 "eviction_count": r["qcf_summary"]["count"],
+                "qcf_max_caote_emitted": r.get("qcf_max_caote"),
+                "qcf_sum_caote_emitted": r.get("qcf_sum_caote"),
+                "n_evictions_emitted": r.get("n_evictions"),
             }
             for r in all_results
         ],
