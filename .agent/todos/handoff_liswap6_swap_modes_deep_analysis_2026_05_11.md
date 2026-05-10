@@ -145,17 +145,47 @@ export ADSP_LIBRARY_PATH=/data/local/tmp/qnn
 - per-tick=25 single-shot 후 ArcSwap commit 시점에 따라 forward thread가 새 alias buffer 또는 stale buffer 보는 race
 - stale buffer (BorrowedMmapBuffer) → 10 ms, alias buffer → 3 ms
 
-### 4.3 다음 세션이 진행 중인 검증 측정
+### 4.3 검증 측정 결과 (`bjqlg19o8` 완료)
 
-**Background task (commit `6a48449` 시점)**: `bjqlg19o8`
-- `LLMRS_PER_TOKEN_MS=1` + per-tick=25 × 5 run (10s idle) + 50s cool + 2 run (60s idle)
-- 출력: `/private/tmp/claude-501/-Users-li-Workspace-llm-rs2/1c559a8b-b5a0-4f95-a91a-af4471a16c75/tasks/bjqlg19o8.output`
-- 상태: 아직 실행 중 (process running) — 다음 세션이 결과 확인
+**5 run (idle 10s) + 2 cool run (idle 60s) 측정 결과 — bimodal 가설 무효**:
 
-**확인 가능한 신호**:
-- bimodal vs continuous distribution
-- cool 시간이 늘어나면 fast cluster 더 빈번한가
-- 첫 token부터 fast인가, 어느 시점부터 slow로 떨어지는가
+| Run | idle | swap latency | **tail** | tok[0] | tok[1] |
+|---|---:|---:|---:|---:|---:|
+| #1 | 10s | 405.0 | **10.79** | 14.23 | 4.06 |
+| #2 | 10s | 404.5 | **10.87** | 10.27 | 3.90 |
+| #3 | 10s | 407.1 | **10.75** | 10.82 | 4.86 |
+| #4 | 10s | 411.6 | **10.10** | 9.05 | 4.05 |
+| #5 | 10s | 404.6 | **10.73** | 11.59 | 3.90 |
+| cool #1 | 60s | 416.5 | **10.39** | 10.43 | — |
+| cool #2 | 60s | 408.5 | **8.79** | 10.31 | — |
+
+**판정**: bimodal **재현 불가**. 7 run 모두 8.79~10.87 ms (median 10.73 ms, CV 7%, cool #2 outlier 제외 시 CV 3%).
+
+**§4.1 의 "3.70 ms" 측정은 1회성 outlier** (그 측정 시점의 thermal/clock state). 이전 분석에서 LISWAP-6 alias의 "4× decode 가속" 결론도 무효 — **alias의 decode 효과는 미미** (baseline 10.78 vs swap 10.5, 차이 0.3 ms noise level).
+
+### 4.4 진짜 패턴 (정정)
+
+**LISWAP-6의 진짜 효과**:
+1. ✅ **swap blocking 단축** (eager prefault: 700 → 405 ms) — 확실
+2. ⚠️ **decode 가속**: 거의 없음 (~0.3 ms, noise level)
+3. ✅ **qnn_oppkg backend의 KV dual-buffer 가속** (OpenCL 28 → qnn_oppkg 10.5 ms = 2.7×) — 이건 backend 자체 효과
+
+**LISWAP-6 alias path는 swap stall 단축만 의미 있음**. weight access 가속 가설은 outlier 기반.
+
+### 4.5 per-tick=25 vs per-tick=1 의미 (수정)
+
+forward_ms 측정 위치 분석 (`generate.rs:5683` vs `:5691`):
+- forward_ms = `forward_start.elapsed()` 측정 후, **그 다음** IncrementalSwap dispatch
+- 즉 **forward_ms는 swap dispatch 미포함**
+
+| Mode | forward_ms tail | user TBT (forward + swap dispatch) |
+|---|---:|---:|
+| per-tick=25 | **10.5 ms** | **10.5 ms** (swap stall은 tok[0]에 흡수, 그 후 0) |
+| per-tick=1 | **8.34 ms** | **8.34 + ~50 ms = ~58 ms** (19 token 지속) |
+| phase-aware | 45 ms | 45 ms (chunk dispatch 가 forward 안에 흡수) |
+
+→ **per-tick=1의 8.34 forward_ms는 misleading** — 실제 user TBT는 per-tick=25의 5× 느림.
+→ **production 권장 변경 없음**: per-tick=25가 user TBT 측면에서 진짜 best.
 
 ### 4.4 추가 디버그 옵션
 
@@ -166,12 +196,21 @@ export ADSP_LIBRARY_PATH=/data/local/tmp/qnn
 
 ---
 
-## 5. 다음 세션 작업 우선순위
+## 5. 다음 세션 작업 우선순위 (§4.3 결과 후 재정렬)
 
-### Priority 1 — bimodal root cause (가장 큰 의문)
-- §4.4 디버그 옵션 진행
-- 5+ run distribution 분석 (`bjqlg19o8` 결과)
-- 가설 A/B/C/D 검증 또는 새 가설
+### Priority 1 — Mid-decode swap (production scenario) ★ 최우선
+- 현재 측정은 swap이 token 0 강제 (force_swap_ratio + decode 시작 시점)
+- 진짜 production: token N (decode 진행 도중) swap signal 수신 → swap 후 계속
+- 옵션:
+  - `--swap-delay-tokens N` CLI flag 추가
+  - mock_manager IPC trigger 활용 (`engine/src/bin/mock_manager`)
+- 측정: token N 시점 swap stall + 그 후 forward time 회복
+- per-tick=1의 user TBT (~58 ms × 19 token) 도 같이 정량화
+
+### Priority 2 — bimodal root cause (CLOSED, 단 단일 outlier 추적 가치)
+- §4.3 7-run 측정에서 bimodal 재현 불가
+- 단 #1 (이전 세션) tail 3.70 ms 한 번 발생한 origin 확인 가치 (thermal? GPU clock?)
+- 낮은 우선순위 — production 영향 없음
 
 ### Priority 2 — 정확도 정밀 검증
 - per-tick=25 / per-tick=1 / phase-aware × 다양 prompt × n=100+ 출력 비교
@@ -221,13 +260,15 @@ export ADSP_LIBRARY_PATH=/data/local/tmp/qnn
 
 ---
 
-## 7. Open questions (다음 세션 답변 필요)
+## 7. Open questions (다음 세션 답변 필요, §4.3 검증 후 갱신)
 
-1. **per-tick=25 bimodal**: GPU clock / page cache / OpenCL context / ArcSwap race — 어느 가설이 맞는가?
-2. **per-tick=1 일관성 (CV 2%)**: 왜 per-tick=25보다 일관적인가? 매 token swap이 GPU clock state 안정화?
+1. ~~**per-tick=25 bimodal**~~ — **CLOSED** (§4.3 7-run 측정에서 재현 불가, outlier 였음)
+2. **per-tick=1 user TBT 정밀 측정**: forward_ms 8.34 + swap dispatch 50ms = 58ms 실제로 측정해서 production stall UX 정량화. mock_manager 또는 custom timing logger.
 3. **phase-aware tail 45ms vs Q4 baseline 10.78ms**: 4.2× 손해의 정확한 분해 (chunk dispatch vs scheduler vs SOA registry race vs intra-layer mixed weight)
-4. **LISWAP-6 alias 효과**: 진짜 decode 가속이 있는가, 아니면 측정 noise (bimodal에서 fast cluster만)?
-5. **정확도**: per-tick=25 출력 ("Île-de-France")이 정말 Q4 weight forward 결과인가, 아니면 alias buffer가 silently 다른 weight 사용하는가?
+4. ~~**LISWAP-6 alias decode 가속**~~ — **CLOSED** (§4.4 alias decode 가속은 noise level, swap blocking 단축만 의미)
+5. **정확도 (deterministic 출력)**: per-tick=25 출력 ("Île-de-France")이 정말 Q4 weight forward 결과인가, 아니면 alias buffer가 silently 다른 weight 사용하는가? Perplexity (PPL) 측정으로 검증.
+6. **신규 — per-tick=1 의 forward_ms 8.34 < per-tick=25 의 10.5 의미**: per-tick=1는 18 layer가 점진적 alias로 전환되어 후반 token이 약간 빨라짐? 또는 swap dispatch가 GPU clock 유지에 영향?
+7. **신규 — KV cache dual-buffer + alias 효과 분리 측정**: qnn_oppkg backend 자체 효과 (28→10.5 = 2.7×) vs LISWAP-6 alias 추가 효과를 정확히 분리. opencl backend + alias 가능한가? (현재 alias path는 qnn_oppkg 자동만)
 
 ---
 
