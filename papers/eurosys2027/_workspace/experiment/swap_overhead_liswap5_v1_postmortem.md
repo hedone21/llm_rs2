@@ -330,12 +330,13 @@ hide의 전제 조건은:
 
 ### 7.6.4 왜 분산이 비효율적인가
 
-phase-aware의 core 가설 ("chunk을 분산하면 forward와 overlap 가능") **실측 무효**. 분산이 추가 cost를 4가지 방식으로 누적:
+phase-aware의 core 가설 ("chunk을 분산하면 forward와 overlap 가능") **실측 무효**. 분산이 추가 cost를 3가지 방식으로 누적:
 
 1. **Batching loss**: 한 번에 swap (per-tick=25)은 driver가 큰 contiguous transfer로 batch. 분산은 매번 separate enqueue.
 2. **Enqueue overhead**: 225 chunks → 225 OpenCL API call. per-tick=25는 25 layer commit으로 끝. **9× 더 적은 API call**.
-3. **SOA rebuild repeat**: 매 swap commit마다 ratio_generation bump + invalidate → 다음 forward에서 lazy rebuild 비용 반복.
-4. **Driver scheduler overhead**: chunk-by-chunk가 forward kernel과 같은 OpenCL queue 경합 → 매 phase에 reschedule.
+3. **Driver scheduler overhead**: chunk-by-chunk가 forward kernel과 같은 OpenCL queue 경합 → 매 phase에 reschedule + per-tick=1의 매 token invalidate cycle.
+
+**Note (2026-05-10 정정)**: 초기 분석에서 "SOA rebuild repeat" 를 4번째 cost로 들었으나, **production 전체가 의도적으로 AoS Q4_0 path 사용** (CPU-GPU 동시 작업 = tensor partition 지원을 위한 강제 포맷). swap_executor도 GGUF AOS path에서는 SOA register를 의도적으로 skip. 따라서 SOA rebuild는 본 측정의 변동 요인이 아님. 셋 다 AoS path로 동작하며 차이는 분산 자체의 비효율 + per-call overhead.
 
 → Phase R microbench (1.04× of max) 가정 ("hide ratio 96%")은 **production에서 깨짐**. 실측 hide ratio = 0% (분산이 forward와 overlap 안 함).
 
@@ -347,14 +348,16 @@ phase-aware의 core 가설 ("chunk을 분산하면 forward와 overlap 가능") *
 - **분산할수록 비효율적 — phase-aware가 worst**
 - v2 sub-tensor chunking은 **chunk 수를 늘리면 더 비효율적**일 가능성. 가설 재검토 필요
 
-### 7.6.6 v2 plan 재검토
+### 7.6.6 v2 plan 재검토 (2026-05-10 final)
 
 §7.5 / §8 의 v2 priority 일부 무효:
-- ~~Sub-tensor chunking (§8 P2)~~: chunk 수 증가 → enqueue overhead + scheduler 경합 증가. **drop 또는 신중 검토**
-- 새 방향: 분산이 비효율적이면 phase-aware 자체 폐기 후 production async swap (manager signal trigger) baseline 채택?
-- 또는 phase-aware가 **분산 자체**가 아니라 **swap timing의 deterministic 예측**에 가치 → 단순한 "decode token 0에 single-shot"으로 충분 (per-tick=25)
-
-→ **LISWAP-5 design 자체 의미 재검토 필요**.
+- ~~Sub-tensor chunking (§8 P2)~~: chunk 수 증가 → enqueue overhead + scheduler 경합 증가. **drop**
+- ~~Phase-aware finalize에 SOA register 추가~~: production이 의도적 AoS path 사용 (CPU-GPU 동시 작업 강제). 추가하면 garbage 출력 위험. **drop**
+- **새 방향 (확정)**: **DMA-BUF alias** — secondary GGUF mmap region을 OpenCL `CL_MEM_USE_HOST_PTR` alias로 직접 wrap (qnn_oppkg KV dual-buffer 패턴 모방). swap blocking을 per-call enqueue + H2D copy 없이 cl_mem reference 갱신만으로 완료.
+  - 현재 v1 swap blocking ≈ 480 ms (mmap fault + repack + H2D copy + per-call overhead)
+  - alias version 예상 ≈ 5~10 ms (cl_mem reference 갱신 + AoS layout 그대로 활용)
+  - 분산 vs single-shot 논쟁 자체가 무의미해짐 (swap 자체가 거의 free)
+- LISWAP-5 design 폐기 vs phase-aware의 **timing predictor** 가치 (deterministic phase boundary)는 alias 위에서 재평가
 
 ---
 
@@ -507,9 +510,77 @@ v1은 hide ratio 측정 못 했음 (chunk dispatch wall-clock 분리 unavailable
 
 ---
 
+## 7.7 LISWAP-6 (DMA-BUF alias) 측정 결과 (2026-05-10 final)
+
+LISWAP-5 fair comparison §7.6에서 도출된 결론 — "swap 자체 cost가 핵심"에 따라 secondary GGUF weight를 rpcmem heap에 lazy alloc + OpenCL `CL_MEM_USE_HOST_PTR` alias로 H2D copy 자체를 제거 (commit `5b6e022` + `d81cbb2`). qnn_oppkg backend의 dual-buffer KV 패턴 모방.
+
+### 7.7.1 측정 결과 (KV 1.8k, n=20, --backend qnn_oppkg, 3 run)
+
+| 모드 | Prefill | tok[0] | tail (excl tok0) | Decode all | E2E |
+|---|---:|---:|---:|---:|---:|
+| **Q4 only baseline** | 13906~16451 | 2.84~5.91 | 9.86~10.82 | 9.49~10.47 | 14749 |
+| **per-tick=25** (single in decode) | 12258~13488 | 8.77~11.17 | **2.95~3.25** | 3.37~3.56 | **12882** |
+| per-tick=1 (LISWAP-1) | 13373~13958 | 8.25~15.91 | 3.54~4.20 | 3.98~4.42 | 14074 |
+| **phase-aware** (LISWAP-5) | 14377~14644 | **529~585** | 39~52 | 67~77 | 16024 |
+
+### 7.7.2 LISWAP-5 (mmap+memcpy) → LISWAP-6 (alias) 가속
+
+| Metric | LISWAP-5 (opencl) | LISWAP-6 (qnn_oppkg+alias) | 가속 |
+|---|---:|---:|---:|
+| Q4 baseline tail | 47 ms | **10 ms** | **4.7×** (qnn_oppkg dual-buffer 자체 효과) |
+| per-tick=25 tok[0] | 65 ms | 10 ms | **6.5×** |
+| per-tick=25 tail | 45 ms | **3 ms** | **15×** |
+| per-tick=1 tail | 62 ms | 3.6 ms | **17×** |
+| phase-aware tok[0] | 347 ms | **530 ms** | **0.65× (오히려 느림)** |
+| phase-aware tail | 78 ms | 45 ms | 1.7× |
+
+### 7.7.3 핵심 finding
+
+#### Finding 1 — per-tick=25가 Q4 baseline보다도 빠름 (3 ms vs 10 ms tail)
+의외의 reversal:
+- Q4 only baseline = GGUF mmap → BorrowedMmapBuffer (CPU-side reference). GPU 접근 시 internal H2D 변환 비용
+- per-tick=25 후 = ClWrappedBuffer (cl_mem alias, MEM_USE_HOST_PTR). 매 forward에서 더 효율적
+- → **swap이 weight access 효율을 개선**시키는 부작용
+
+#### Finding 2 — Swap copy 비용 ~95% 제거 (per-tick 모드)
+- 이론 transfer: 80~92 ms @ 7~8 GB/s (645 MB Q4)
+- LISWAP-5 실측 swap blocking: 480 ms (5~6× overhead)
+- LISWAP-6 실측: per-tick=25 tok[0] excess = 11-3 = ~8 ms (lazy first-touch)
+- **alias path가 H2D copy 자체를 제거 + lazy alloc cost가 token 0에 ~8 ms로 흡수**
+
+#### Finding 3 — Phase-aware는 alias 환경에서도 13× 손해
+- per-tick=25 tail 3 ms vs phase-aware tail 45 ms = **15× 차이**
+- per-tick=25 tok[0] 10 ms vs phase-aware tok[0] 530 ms = **53× 차이**
+- swap copy가 free임에도 분산 자체 비효율 (enqueue overhead × 75 chunks/token + scheduler 경합 + dispatcher worker sync)이 dominate
+- → **LISWAP-5 design (phase-aware 분산) 의 본질 한계 — alias로도 해결 안 됨**
+
+### 7.7.4 production 권장 path (확정)
+
+```
+--backend qnn_oppkg --secondary-gguf <q4>.gguf --force-swap-ratio 0.X --swap-incremental-per-tick 25
+```
+
+- **qnn_oppkg backend**: KV cache dual-buffer + LISWAP-6 weight alias 양쪽 효과 (Decode 4.7× faster baseline)
+- **per-tick=25**: single-shot in decode. swap blocking ~10 ms (vs phase-aware 530 ms)
+- **자동 활성**: backend == qnn_oppkg + secondary_gguf 모두 active 시 LISWAP-6 alias 자동
+
+### 7.7.5 LISWAP design 정리
+
+| Track | 결론 |
+|---|---|
+| **LISWAP-1** (per-tick) | per-tick=25는 production 최적. per-tick=1는 분산 비효율 (3 ms→3.6 ms 미세 손해) |
+| LISWAP-2 (async dispatch) | LISWAP-1 위 worker thread overhead — alias 환경에서 의미 약화 |
+| LISWAP-3 (host_ptr_pool) | alias가 동일 효과 + lifetime 단순. 폐기 가능 |
+| LISWAP-4 (intra-forward) | per-tick과 비슷, layer wait gate 복잡성. 폐기 권장 |
+| **LISWAP-5** (phase-aware) | **폐기 확정** — alias 환경에서도 분산 비효율 13~53× 손해 |
+| **LISWAP-6** (DMA-BUF alias) | **production path** — 자동 활성 |
+
+### 7.7.6 알려진 이슈
+- **Cleanup phase Segmentation fault**: swap mode runs에서 generation 정상 완료 후 process exit 시 발생. RpcmemAliasBuffer drop ordering or cl_mem release ↔ rpcmem_free race. production 동작 + 측정 영향 없음. 별도 fix backlog.
+
+---
+
 **End of postmortem**
 
-핵심 한 줄 (2026-05-10 final, fair comparison 후 전면 수정 §7.6):
-**Phase-aware의 core 가설 ("분산 → forward와 overlap") 실측 무효. Fair comparison (셋 다 decode 중 swap) — KV 1.8k n=20에서 per-tick=25 (single-shot in decode) 13359 ms < per-tick=1 14493 ms < phase-aware 15076 ms. tok[0] 65 vs 72 vs 347 ms (phase-aware 5×). Decode tail 45 (=Q4) vs 62 vs 78 ms. 분산이 항상 비효율적 — batching loss + enqueue overhead 9× + SOA rebuild 반복 + queue 경합. v2 sub-chunking은 chunk 수 더 늘려 더 악화 가능. LISWAP-5 design 자체 의미 재검토 필요.**
-
-이전 분석 ($7.5 KV reversal "n<37에서 PA win") 은 single-shot baseline이 prefill 전 swap이었기 때문 (unfair). fair한 baseline (per-tick=25)에서는 phase-aware가 모든 KV에서 worst.
+핵심 한 줄 (2026-05-10 final, LISWAP-6 측정 후 확정):
+**LISWAP-5 (phase-aware) 폐기 확정. LISWAP-6 (DMA-BUF alias) 채택. KV 1.8k n=20: per-tick=25 (single in decode) E2E 12882 ms (Q4 baseline 14749보다도 빠름!) < per-tick=1 14074 < phase-aware 16024. 분산이 alias 환경에서도 13× 손해. Production path = `--backend qnn_oppkg --swap-incremental-per-tick 25` (자동 alias 활성).**

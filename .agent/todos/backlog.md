@@ -11,17 +11,17 @@
 - **HEAD**: `90617cc` (M3.4 14-node body + device gate RED, push됨)
 - **요약**: graphFinalize 28× ~1.36s GREEN (예상 ~33s 대비 24× 빠름), prefill segfault. 후속 분석 결과 root cause는 M2.H builder가 pos를 `QNN_PARAMTYPE_SCALAR`로 graph build 시점 hardcoded — multi-token decode 불가능. 옵션: D-D (M2 ops 수정 +1.5주) / D-E (scope 약화 +0.5주). 사용자 결정 필요.
 
-## [P1] LISWAP-5 v2 — sub-tensor chunking + background pre-staging — 2026-05-10
-- **Status**: TODO (v1 measurement 종결 후 신규)
-- **선행**: `papers/eurosys2027/_workspace/experiment/swap_overhead_liswap5_v1_postmortem.md` §6 (실측), §8 (v2 plan)
-- **요약 (v1 finding)**: TTFT -150 ms (-24%) win, Decode +10 ms (+35%) loss, crossover n=13. v1은 viable하지만 long-decode에서는 single-shot 손해.
-- **v2 핵심 작업**:
-  1. **Option α — sub-tensor chunking**: per-tensor (9~26 MB) → 2~4 MB sub-chunk. cache-fit window (980us) 안에 fit. cl_event chain 유지.
-  2. **Option β — background pre-staging**: materialise_cpu_tensor (mmap + GGUF re-pack)을 worker thread로 사전 수행. forward thread는 enqueue_write_async만 호출.
-  3. **Invalidate lag 진단**: retire 후 +10 ms 잔류 원인 — SOA lazy rebuild vs driver scheduler. perfetto profile + token별 forward breakdown 측정.
-- **Pass-gate**: Decode loss ≤ +5 ms (현 +10 ms의 절반), TTFT win 보존 (-150 ms 유지), 4-gate 정상.
-- **추정**: 5~7일 (α 2일 + β 2일 + 진단 1일 + 측정 1일).
-- **추가 backlog**: SIGABRT race (재현 불가지만 hypothesis 보존) — v2 작업 중 재출현 시 `handoff_liswap5_crash_fix_2026_05_10.md` §3 참고하여 release_worker 전달 추가.
+## [CLOSED] LISWAP-5 v2 — drop (2026-05-10, fair comparison + LISWAP-6 측정 후)
+- **Status**: DROP (LISWAP-5 design 폐기 확정)
+- **이유**: LISWAP-6 (DMA-BUF alias) 측정 결과 phase-aware는 alias 환경에서도 per-tick=25 대비 13~53× 손해. 분산 자체가 비효율적 — sub-chunking은 chunk 수 증가로 더 악화. 상세: `swap_overhead_liswap5_v1_postmortem.md` §7.7
+- **확정 production path**: `--backend qnn_oppkg --swap-incremental-per-tick 25` (LISWAP-1 + LISWAP-6 alias 자동 활성)
+
+## [P2] LISWAP-6 cleanup segfault — 2026-05-10
+- **Status**: TODO (production 영향 없음, 측정 영향 없음 — 측정 깨끗하게 끝나려면 fix)
+- **상세**: swap mode runs (`--swap-incremental-per-tick`, `--swap-phase-aware`) 에서 generation 정상 완료 후 process exit 시 SIGSEGV. baseline (no `--secondary-gguf`) 미발생. 모든 swap mode + `--backend qnn_oppkg` 조합에서 재현.
+- **추정 원인**: `RpcmemAliasBuffer` Drop ordering 또는 `cl_mem` release ↔ `rpcmem_free` race. OpenCL queue/context teardown 순서.
+- **참고 파일**: `engine/src/buffer/rpcmem_alias_buffer.rs`, `engine/src/models/weights/rpcmem_secondary.rs::RpcmemLayerRegion::Drop`
+- **fix 방안 후보**: (a) explicit drop sequence (cl_mem all release → rpcmem_free), (b) reference count guard, (c) backend teardown 시 rpcmem region 명시 release
 
 ## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
 - **Status**: TODO (M2 baseline부터 누적, M3.0 무관)
