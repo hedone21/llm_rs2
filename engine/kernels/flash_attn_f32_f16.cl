@@ -661,6 +661,196 @@ __kernel void flash_attn_f32_f16_q1(
 }
 
 // ---------------------------------------------------------------------------
+// `flash_attn_f32_f16_q1_dynkv` — D-D.6 OOP variant.
+//
+// `n_kv` argument is read from a 1-element INT_32 buffer (`n_kv_buf[0]`)
+// instead of a build-time SCALAR. Lets QNN OpPackage backend update
+// `n_kv` per `graphExecute` for multi-token decode without re-finalize.
+// All other arguments and behavior are identical to `flash_attn_f32_f16_q1`.
+__kernel void flash_attn_f32_f16_q1_dynkv(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    global void * o_void, ulong o_offset,
+    const float scale,
+    const int n_q,
+    const global int * n_kv_buf,
+    const int is_causal,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const ulong o_nb1, const ulong o_nb2, const ulong o_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void* mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    const global void* sinks_void,
+    const ulong sinks_offset,
+    global float * S,
+    const int score_layer_offset,
+    const int score_stride,
+    const int write_scores
+) {
+    const int n_kv = n_kv_buf[0];
+
+    const int tid = get_local_id(0);
+    const int head_batch_idx = get_global_id(1);
+
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx = head_batch_idx % n_head;
+
+    const int gqa_ratio = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+
+    const global char* q_base = (const global char*)q_void + q_offset;
+    const global char* k_base = (const global char*)k_void + k_offset;
+    const global char* v_base = (const global char*)v_void + v_offset;
+    global char* o_base = (global char*)o_void + o_offset;
+
+    const int score_row_base = score_layer_offset + head_idx * score_stride;
+
+    const global char* mask_base = NULL;
+    if (mask_void != NULL) {
+        const int mask_head_idx = head_idx % mask_ne2;
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
+    }
+
+    ACC_TYPE4 q_priv[DK_VEC];
+    const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+    const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
+    #pragma unroll
+    for (int i = 0; i < DK_VEC; ++i) {
+        q_priv[i] = CONVERT_Q_ACC4(q_ptr[i]);
+    }
+
+    float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+    const global ACC_TYPE* sinks_ptr = NULL;
+    if (sinks_void != NULL) {
+        sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
+    }
+
+    ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
+    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
+        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
+        ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
+        #pragma unroll
+        for (int k = 0; k < DK_VEC; k++) {
+            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+        }
+        ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (mask_base != NULL) {
+            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
+            score += slope * (ACC_TYPE)mask_ptr[k_idx];
+        }
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
+        m_i = max(m_i, score);
+    }
+
+    __local ACC_TYPE local_m[Q1_WG_SIZE];
+    local_m[tid] = m_i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const ACC_TYPE m_final = local_m[0];
+
+    ACC_TYPE4 o_acc[DV_VEC];
+    #pragma unroll
+    for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
+    ACC_TYPE l_i = 0.0f;
+
+    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
+        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
+        const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
+        const global KV_DATA_TYPE4* v_ptr = (const global KV_DATA_TYPE4*)(v_base + v_row_offset);
+        ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
+        #pragma unroll
+        for (int k = 0; k < DK_VEC; k++) {
+            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+        }
+        ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (mask_base != NULL) {
+            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
+            score += slope * (ACC_TYPE)mask_ptr[k_idx];
+        }
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
+        const ACC_TYPE p = exp(score - m_final);
+        if (write_scores) {
+            S[score_row_base + k_idx] = (float)p;
+        }
+        l_i += p;
+        #pragma unroll
+        for (int i = 0; i < DV_VEC; i++) {
+            o_acc[i] = mad(p, CONVERT_KV_ACC4(v_ptr[i]), o_acc[i]);
+        }
+    }
+
+    __local ACC_TYPE local_l[Q1_WG_SIZE];
+    __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
+    local_l[tid] = l_i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) local_l[tid] += local_l[tid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
+    global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
+    ACC_TYPE l_final = local_l[0];
+
+    if (sinks_ptr != NULL) {
+        l_final += exp(sinks_ptr[head_idx] - m_final);
+    }
+
+    if (write_scores && l_final > 0.0f) {
+        const float inv_l = 1.0f / (float)l_final;
+        for (int t = tid; t < n_kv; t += Q1_WG_SIZE) {
+            S[score_row_base + t] *= inv_l;
+        }
+    }
+
+    if (l_final > 0.0f) {
+        const ACC_TYPE l_inv = 1.0f / l_final;
+        for (int i = 0; i < DV_VEC; i++) {
+            local_o_comp[tid] = o_acc[i];
+            barrier(CLK_LOCAL_MEM_FENCE);
+            #pragma unroll
+            for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
+                if (tid < s) local_o_comp[tid] += local_o_comp[tid + s];
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            if (tid == 0) {
+                o_row[i] = CONVERT_O_DATA4(local_o_comp[0] * l_inv);
+            }
+        }
+    } else if (tid == 0) {
+        #pragma unroll
+        for (int i = 0; i < DV_VEC; ++i) o_row[i] = (O_DATA_TYPE4)(0.0f);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UMA Hybrid CPU-GPU Attention — partial variant of `flash_attn_f32_f16_q1`.
 //
 // 차이점 (vs `flash_attn_f32_f16_q1`):

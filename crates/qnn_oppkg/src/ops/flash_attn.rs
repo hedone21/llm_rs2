@@ -1,6 +1,6 @@
 //! `CustomFlashAttn` op descriptor — decode flash attention (n_q=1) with online softmax.
 //!
-//! Maps to `flash_attn_f32_f16_q1` in `engine/kernels/flash_attn_f32_f16.cl`.
+//! Maps to `flash_attn_f32_f16_q1_dynkv` in `engine/kernels/flash_attn_f32_f16.cl`.
 //! Single Q token (decode), F32 Q + F16 K/V + F32 O. Production hot path —
 //! 44 kernel args (0..43).
 //!
@@ -24,18 +24,31 @@
 //!
 //! ## Tensor convention (graph view)
 //!
-//!   inputs[0]  = Q     F32 [1, n_head, head_dim]
-//!   inputs[1]  = K     F16 [1, n_head_kv, capacity, head_dim] (HeadMajor)
-//!   inputs[2]  = V     F16 [1, n_head_kv, capacity, head_dim] (HeadMajor)
-//!   inputs[3]  = mask  F16 [1] (dummy)
-//!   inputs[4]  = sinks F32 [1] (dummy)
-//!   inputs[5]  = S     F32 [1] (dummy score buffer)
-//!   outputs[0] = O     F32 [1, n_head, head_dim]
+//!   inputs[0]  = Q       F32   [1, n_head, head_dim]
+//!   inputs[1]  = K       F16   [1, n_head_kv, capacity, head_dim] (HeadMajor)
+//!   inputs[2]  = V       F16   [1, n_head_kv, capacity, head_dim] (HeadMajor)
+//!   inputs[3]  = mask    F16   [1] (dummy)
+//!   inputs[4]  = sinks   F32   [1] (dummy)
+//!   inputs[5]  = S       F32   [1] (dummy score buffer)
+//!   inputs[6]  = n_kv_buf INT_32 [1] — current KV cache occupancy (host-written
+//!                                       per `graphExecute`, D-D.6)
+//!   outputs[0] = O       F32   [1, n_head, head_dim]
+//!
+//! ## n_kv-as-buffer rationale (D-D.6, 2026-05-10)
+//!
+//! Earlier the descriptor read `n_kv` as a SCALAR op param. SCALAR values
+//! are baked into the graph at `graphFinalize` time, which forced every
+//! `graphExecute` invocation to attend over the same fixed `n_kv` window.
+//! Multi-token decode requires `n_kv` to grow per step (`prefill_len + step_idx
+//! + 1`), so `n_kv` moves to a 1-element INT_32 input tensor that the host
+//! writes before each `graphExecute`. Mirrors D-D.1+D-D.2 (RoPE/KvScatter
+//! pos-as-buffer) — same architectural reason.
+//!
+//! The kernel now reads `const int n_kv = n_kv_buf[0];` at the top.
 //!
 //! ## Op params
 //!
-//! All required (no defaults):
-//!   params[i].name = "n_kv"          INT_32 — current KV cache occupancy
+//! All required (no defaults) except `scale`:
 //!   params[i].name = "n_head"        INT_32 — Q heads (e.g. 32 for Qwen2.5-1.5B)
 //!   params[i].name = "n_head_kv"     INT_32 — KV heads (e.g. 2 for Qwen2.5-1.5B)
 //!   params[i].name = "head_dim"      INT_32 — derived from Q rank-3 dim if absent
@@ -55,7 +68,7 @@
 //!   7:  ULong(0)         o_offset
 //!   8:  Float(scale)
 //!   9:  Int(n_q=1)
-//!   10: Int(n_kv)
+//!   10: InputTensor(6)  n_kv_buf — kernel reads `n_kv = n_kv_buf[0]` (D-D.6)
 //!   11: Int(is_causal=0)
 //!   12: Int(n_head)
 //!   13: ULong(q_nb1)     — n_head * head_dim * 4 bytes
@@ -109,13 +122,14 @@
 
 use crate::args::{ArgSpec, MemoryObjectSpec, OpDescriptor, OpError, OpImplLayout};
 use crate::qnn::{
-    Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, Qnn_OpConfigV1_t,
-    Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+    Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+    Qnn_DataType_t_QNN_DATATYPE_INT_32, Qnn_OpConfigV1_t, Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
 };
 
 pub static DESCRIPTOR: OpDescriptor = OpDescriptor {
     op_type: "CustomFlashAttn",
-    kernel_name: "flash_attn_f32_f16_q1",
+    // D-D.6: dynamic n_kv variant (`n_kv` read from input tensor).
+    kernel_name: "flash_attn_f32_f16_q1_dynkv",
     kernel_source: include_str!("../../../../engine/kernels/flash_attn_f32_f16.cl"),
     // M2.F targets head_dim=128 (Qwen2.5-1.5B). DK/DV/BLOCK_M/BLOCK_N are
     // compile-time macros baked into the kernel program.
@@ -166,17 +180,37 @@ fn read_param_float(v1: &Qnn_OpConfigV1_t, name: &str) -> Option<f32> {
 }
 
 pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpError> {
-    // Require: 6 inputs (Q, K, V, mask, sinks, S), 1 output (O).
-    if v1.numOfInputs < 6 || v1.numOfOutputs < 1 {
+    // Require: 7 inputs (Q, K, V, mask, sinks, S, n_kv_buf), 1 output (O).
+    if v1.numOfInputs < 7 || v1.numOfOutputs < 1 {
         return Err(OpError::ValidationFailure);
     }
 
     // Required scalars from op params.
-    let n_kv = read_param_int(v1, "n_kv").ok_or(OpError::ValidationFailure)?;
+    // n_kv은 D-D.6에서 input tensor로 이동 — `n_kv_buf` (inputs[6]) 검증만 하고
+    // 값은 kernel runtime read.
     let n_head = read_param_int(v1, "n_head").ok_or(OpError::ValidationFailure)?;
     let n_head_kv = read_param_int(v1, "n_head_kv").ok_or(OpError::ValidationFailure)?;
     let kv_capacity = read_param_int(v1, "kv_capacity").ok_or(OpError::ValidationFailure)?;
     let head_dim = read_param_int(v1, "head_dim").ok_or(OpError::ValidationFailure)?;
+
+    // n_kv_buf: INT_32 [1] (D-D.6).
+    let n_kv_t = unsafe { (*v1.inputTensors.add(6)).__bindgen_anon_1.v1 };
+    if n_kv_t.dimensions.is_null() || n_kv_t.rank == 0 {
+        return Err(OpError::InvalidArgument);
+    }
+    let mut n_kv_total: u32 = 1;
+    for i in 0..n_kv_t.rank {
+        let d = unsafe { *n_kv_t.dimensions.add(i as usize) };
+        n_kv_total = n_kv_total
+            .checked_mul(d)
+            .ok_or(OpError::InvalidArgument)?;
+    }
+    if n_kv_total != 1 {
+        return Err(OpError::InvalidArgument);
+    }
+    // mask buffer must accommodate the maximum possible n_kv (== kv_capacity)
+    // since at runtime mask is indexed [0..n_kv_buf[0]).
+    let mask_max = kv_capacity;
 
     // M2.H 5th attempt: param + tensor-dim diagnostic dump (gated on
     // QNN_OPPKG_DEBUG=1 to avoid noise in production). Verifies what the SDK
@@ -216,22 +250,23 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
             s
         };
         eprintln!(
-            "[oppkg-fa] params: n_kv={} n_head={} n_head_kv={} kv_capacity={} head_dim={} scale={}",
-            n_kv, n_head, n_head_kv, kv_capacity, head_dim, scale_seen
+            "[oppkg-fa] params: n_head={} n_head_kv={} kv_capacity={} head_dim={} scale={} (n_kv via input tensor)",
+            n_head, n_head_kv, kv_capacity, head_dim, scale_seen
         );
         eprintln!(
-            "[oppkg-fa] in dims: q={} k={} v={} mask={} sinks={} S={} | out o={}",
+            "[oppkg-fa] in dims: q={} k={} v={} mask={} sinks={} S={} n_kv_buf={} | out o={}",
             dim_dump(0),
             dim_dump(1),
             dim_dump(2),
             dim_dump(3),
             dim_dump(4),
             dim_dump(5),
+            dim_dump(6),
             out_dump(0),
         );
     }
 
-    if n_kv <= 0 || n_head <= 0 || n_head_kv <= 0 || kv_capacity <= 0 || head_dim <= 0 {
+    if n_head <= 0 || n_head_kv <= 0 || kv_capacity <= 0 || head_dim <= 0 {
         return Err(OpError::InvalidArgument);
     }
     if n_head % n_head_kv != 0 {
@@ -273,21 +308,19 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
         .ok_or(OpError::InvalidArgument)?;
     let o_total = q_total;
 
-    // Mem objects: Q, K, V, mask (F16 [n_kv], zero-init), sinks (F32 [1]),
-    // S (F32 [1]), O.
+    // Mem objects: Q, K, V, mask (F16 [kv_capacity], zero-init), sinks
+    // (F32 [n_head]), S (F32 [1]), n_kv_buf (INT_32 [1]), O.
     //
     // Mask sizing rationale: the kernel branches on `if (mask_void != NULL)`.
     // OpPackage `InputTensor(3)` always binds a non-null mem object, so the
     // branch is taken. The kernel reads `mask_ptr[k_idx]` for k_idx ∈ [0, n_kv).
-    // We size the mask buffer at `n_kv` halves to keep these reads in-bounds.
-    // With `mask_nb*` strides all bound to 0 (see args), `mask_base = mask_void`
-    // — so `mask_ptr[k_idx] = mask_void[k_idx]`. Zero-init mask values give
-    // `score += slope * 0.0`, a no-op.
     //
-    // `mask_ne2` and `mask_ne3` are bound to 1 (not 0) to avoid `head_idx %
-    // mask_ne2` modulo-by-zero — index always evaluates to 0, so even with
-    // strides=0 the address stays at `mask_void[k_idx]`.
-    let mask_dim = n_kv as u32;
+    // D-D.6 sizing change: previously sized at `n_kv` halves (compile-time
+    // SCALAR). Now `n_kv` varies per-step up to `kv_capacity`, so the buffer
+    // must accommodate the maximum to keep `mask_ptr[k_idx]` in-bounds for
+    // every step. With `mask_nb*` strides all bound to 0, `mask_base = mask_void`,
+    // and zero-init values give `score += slope * 0.0` — still a no-op.
+    let mask_dim = mask_max as u32;
     let mem_objects = vec![
         // Q (F32)
         MemoryObjectSpec {
@@ -332,6 +365,13 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
             flat_dims: vec![1],
             flat_offsets: vec![0u32],
         },
+        // n_kv_buf (INT_32 [1]) — D-D.6: host-written before each
+        // graphExecute. kernel reads `const int n_kv = n_kv_buf[0];`.
+        MemoryObjectSpec {
+            data_type: Qnn_DataType_t_QNN_DATATYPE_INT_32,
+            flat_dims: vec![1u32],
+            flat_offsets: vec![0u32],
+        },
         // O (F32) — claimed output
         MemoryObjectSpec {
             data_type: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
@@ -359,8 +399,8 @@ pub(crate) fn build_layout(v1: &Qnn_OpConfigV1_t) -> Result<OpImplLayout, OpErro
         ArgSpec::Float(scale),
         // 9: n_q
         ArgSpec::Int(1),
-        // 10: n_kv
-        ArgSpec::Int(n_kv),
+        // 10: n_kv_buf — D-D.6: kernel reads `n_kv = n_kv_buf[0]` at runtime.
+        ArgSpec::InputTensor(6),
         // 11: is_causal (decode = 0; mask path inactive when mask_void=NULL)
         ArgSpec::Int(0),
         // 12: n_head
@@ -487,18 +527,21 @@ mod tests {
     #[test]
     fn flash_attn_kernel_source_contains_target() {
         assert!(
-            DESCRIPTOR.kernel_source.contains("flash_attn_f32_f16_q1"),
-            "kernel source must contain 'flash_attn_f32_f16_q1'"
+            DESCRIPTOR
+                .kernel_source
+                .contains("flash_attn_f32_f16_q1_dynkv"),
+            "kernel source must contain 'flash_attn_f32_f16_q1_dynkv'"
         );
     }
 
     #[test]
     fn flash_attn_build_layout_for_qwen() {
         // Qwen2.5-1.5B decode: n_head=32 (q), n_head_kv=2 (kv), head_dim=128,
-        // capacity=2048, n_kv=1024.
+        // capacity=2048. n_kv argument now ignored (D-D.6 — input tensor).
         let layout = make_layout(32, 2, 128, 2048, 1024).expect("build_layout must succeed");
         assert_eq!(layout.args.len(), 44, "must have 44 kernel args");
-        assert_eq!(layout.mem_objects.len(), 7, "must have 7 mem_objects");
+        // 8 mem_objects: Q, K, V, mask, sinks, S, n_kv_buf, O.
+        assert_eq!(layout.mem_objects.len(), 8, "must have 8 mem_objects");
         // global_work = [64, 32, 1], local = [64, 1, 1]
         assert_eq!(layout.global_work, [64, 32, 1]);
         assert_eq!(layout.local_work, [64, 1, 1]);

@@ -792,6 +792,7 @@ pub trait Backend: Send + Sync {
         kv_cache_k: &mut Tensor,
         kv_cache_v: &mut Tensor,
         pos: usize,
+        n_kv: usize,
         x_out: &mut Tensor,
     ) -> Result<()> {
         anyhow::bail!("execute_layer_graph not supported by this backend")

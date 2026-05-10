@@ -113,6 +113,7 @@ impl LayerGraph {
         kv_k_bytes: &mut [u8],
         kv_v_bytes: &mut [u8],
         pos: usize,
+        n_kv: usize,
         mask_bytes: &[u8],
         x_out_bytes: &mut [u8],
     ) -> Result<()> {
@@ -124,6 +125,7 @@ impl LayerGraph {
                 kv_k_bytes,
                 kv_v_bytes,
                 pos,
+                n_kv,
                 mask_bytes,
                 x_out_bytes,
             )
@@ -136,11 +138,12 @@ impl LayerGraph {
                 kv_k_bytes,
                 kv_v_bytes,
                 pos,
+                n_kv,
                 mask_bytes,
                 x_out_bytes,
             );
             Err(anyhow!(
-                "LayerGraph::execute (host, layer={}, pos={pos}) — host build에서는 graphExecute 불가.",
+                "LayerGraph::execute (host, layer={}, pos={pos}, n_kv={n_kv}) — host build에서는 graphExecute 불가.",
                 self.layer_idx
             ))
         }
@@ -194,6 +197,10 @@ mod android {
         /// `*(pos_host_ptr as *mut i32) = pos as i32`로 갱신. RoPE Q/K +
         /// KvScatter 3 nodes가 동일 pos_buf input tensor를 share.
         pos_host_ptr: *mut i32,
+        /// M3.4 D-D.6: n_kv_buf rpcmem slot의 host pointer. graphExecute 직전
+        /// `*(n_kv_host_ptr) = n_kv as i32`로 갱신. FlashAttn node가 input
+        /// tensor로 read하여 multi-token decode에서 누적 KV attention 가능.
+        n_kv_host_ptr: *mut i32,
         /// LayerConfig snapshot.
         #[allow(dead_code)]
         cfg: LayerConfig,
@@ -212,6 +219,7 @@ mod android {
             kv_k_bytes: &mut [u8],
             kv_v_bytes: &mut [u8],
             pos: usize,
+            n_kv: usize,
             _mask_bytes: &[u8],
             x_out_bytes: &mut [u8],
         ) -> Result<()> {
@@ -270,6 +278,11 @@ mod android {
             // 동일 layer graph는 GraphCache Mutex로 직렬화되어 race 없음.
             unsafe {
                 std::ptr::write(self.pos_host_ptr, pos as i32);
+            }
+            // M3.4 D-D.6: n_kv_buf write — FlashAttn node가 input tensor로
+            // read하여 attention loop를 [0..n_kv)로 동적 결정.
+            unsafe {
+                std::ptr::write(self.n_kv_host_ptr, n_kv as i32);
             }
 
             // graphExecute.
@@ -639,6 +652,18 @@ mod android {
         slots.push(slot_pos);
         let idx_pos = slots.len() - 1;
 
+        // M3.4 D-D.6: n_kv_buf — INT_32 [1]. FlashAttn node가 input tensor로
+        // 사용하여 매 graphExecute 직전 host write로 동적 n_kv 갱신.
+        // build 시점은 placeholder 1.
+        let bytes_n_kv = 4_usize;
+        let slot_n_kv = alloc_rpcmem_slot(runtime, bytes_n_kv)?;
+        unsafe {
+            std::ptr::write(slot_n_kv.host_ptr as *mut i32, 1i32);
+        }
+        let n_kv_host_ptr = slot_n_kv.host_ptr as *mut i32;
+        slots.push(slot_n_kv);
+        let idx_n_kv = slots.len() - 1;
+
         // ── 4. Build tensors + register — 36 tensors total ─────────────────
         // Dimensions storage. Each Vec must outlive graph build (pointer stored).
         let mut dims_x: Vec<u32> = vec![1, dim as u32];
@@ -676,11 +701,14 @@ mod android {
         let mut dims_silu_out: Vec<u32> = vec![1, ffn_dim as u32];
         let mut dims_down: Vec<u32> = vec![1, dim as u32];
         let mut dims_x_out: Vec<u32> = vec![1, dim as u32];
-        let mut dims_mask: Vec<u32> = vec![n_kv as u32];
+        // D-D.6: mask sized to max kv_capacity (n_kv now dynamic).
+        let mut dims_mask: Vec<u32> = vec![kv_capacity as u32];
         let mut dims_sinks: Vec<u32> = vec![n_head as u32];
         let mut dims_score: Vec<u32> = vec![1];
         // M3.4 D-D.3: pos_buf — INT_32 rank-1 [1].
         let mut dims_pos: Vec<u32> = vec![1];
+        // D-D.6: n_kv_buf — INT_32 rank-1 [1]. FlashAttn input.
+        let mut dims_n_kv: Vec<u32> = vec![1];
 
         // CString tensor names — must outlive graph build.
         let nm_x = CString::new("x").unwrap();
@@ -721,6 +749,7 @@ mod android {
         let nm_sinks = CString::new("sinks").unwrap();
         let nm_score = CString::new("score").unwrap();
         let nm_pos = CString::new("pos").unwrap();
+        let nm_n_kv = CString::new("n_kv_buf").unwrap();
 
         let qp = ffi::Qnn_QuantizeParams_t {
             encodingDefinition: ffi::Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
@@ -820,6 +849,8 @@ mod android {
         let mut t_x_out = build_tensor(app_r, f32_t, 2, dims_x_out.as_mut_ptr(), nm_x_out.as_ptr());
         // M3.4 D-D.3: pos input tensor — APP_WRITE INT_32 rank-1 [1].
         let mut t_pos = build_tensor(app_w, i32_t, 1, dims_pos.as_mut_ptr(), nm_pos.as_ptr());
+        // M3.4 D-D.6: n_kv_buf input tensor — APP_WRITE INT_32 rank-1 [1].
+        let mut t_n_kv = build_tensor(app_w, i32_t, 1, dims_n_kv.as_mut_ptr(), nm_n_kv.as_ptr());
 
         // Intermediates (NATIVE).
         let mut t_y1 = build_tensor(native, f32_t, 2, dims_y1.as_mut_ptr(), nm_y1.as_ptr());
@@ -907,6 +938,7 @@ mod android {
             ("silu_out", &mut t_silu_out),
             ("down", &mut t_down),
             ("pos", &mut t_pos),
+            ("n_kv_buf", &mut t_n_kv),
         ];
         let tcg = v
             .tensorCreateGraphTensor
@@ -956,7 +988,7 @@ mod android {
         let pn_theta = CString::new("theta").unwrap();
         let pn_head_dim = CString::new("head_dim").unwrap();
         let pn_capacity = CString::new("capacity").unwrap();
-        let pn_n_kv = CString::new("n_kv").unwrap();
+        // D-D.6: pn_n_kv SCALAR 제거 — n_kv는 input tensor (n_kv_buf).
         let pn_n_head = CString::new("n_head").unwrap();
         let pn_n_head_kv = CString::new("n_head_kv").unwrap();
         let pn_kv_capacity = CString::new("kv_capacity").unwrap();
@@ -996,8 +1028,8 @@ mod android {
             scalar_i32(pn_capacity.as_ptr(), kv_capacity as i32),
         ];
 
+        // D-D.6: n_kv SCALAR 제거 — n_kv_buf input tensor로 동적 처리.
         let mut fa_params = [
-            scalar_i32(pn_n_kv.as_ptr(), n_kv as i32),
             scalar_i32(pn_n_head.as_ptr(), n_head as i32),
             scalar_i32(pn_n_head_kv.as_ptr(), n_kv_heads as i32),
             scalar_i32(pn_kv_capacity.as_ptr(), kv_capacity as i32),
@@ -1047,7 +1079,8 @@ mod android {
         let mut out_rope_k = [t_k_rope];
         let mut in_kvs = [t_k_rope, t_v, t_pos];
         let mut out_kvs = [t_kcache, t_vcache];
-        let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score];
+        // D-D.6: FlashAttn input은 (q, k, v, mask, sinks, score, n_kv_buf) 7개.
+        let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score, t_n_kv];
         let mut out_fa = [t_attn_o];
         let mut in_o_proj = [t_oq, t_od, t_attn_o];
         let mut out_o_proj = [t_o];
@@ -1159,11 +1192,11 @@ mod android {
                 on_fa.as_ptr(),
                 ot_fa.as_ptr(),
                 in_fa.as_mut_ptr(),
-                6,
+                7, // D-D.6: q + k + v + mask + sinks + score + n_kv_buf
                 out_fa.as_mut_ptr(),
                 1,
                 fa_params.as_mut_ptr(),
-                5,
+                4, // D-D.6: n_head + n_head_kv + kv_capacity + head_dim (n_kv 제거)
                 "FlashAttn",
             ),
             (
@@ -1356,6 +1389,9 @@ mod android {
         set_mh(&mut t_x_out_mh, slots[22].mem_handle);
         let mut t_pos_mh = t_pos;
         set_mh(&mut t_pos_mh, slots[idx_pos].mem_handle);
+        // D-D.6: n_kv_buf input tensor binding.
+        let mut t_n_kv_mh = t_n_kv;
+        set_mh(&mut t_n_kv_mh, slots[idx_n_kv].mem_handle);
 
         let exec_inputs = vec![
             t_x_mh,
@@ -1378,7 +1414,8 @@ mod android {
             t_mask_mh,
             t_sinks_mh,
             t_score_mh,
-            t_pos_mh, // M3.4 D-D.3
+            t_pos_mh,   // M3.4 D-D.3
+            t_n_kv_mh,  // M3.4 D-D.6
         ];
         let exec_outputs = vec![t_kcache_mh, t_vcache_mh, t_x_out_mh];
 
@@ -1394,6 +1431,7 @@ mod android {
                 idx_kv_k,
                 idx_kv_v,
                 pos_host_ptr,
+                n_kv_host_ptr,
                 cfg: *cfg,
             },
             finalize_ms,

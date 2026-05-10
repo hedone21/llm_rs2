@@ -1362,18 +1362,21 @@ pub mod __test_support {
     ///   - inputs[1]: K     FLOAT_16 [1, n_head_kv, kv_capacity, head_dim]
     ///   - inputs[2]: V     FLOAT_16 [1, n_head_kv, kv_capacity, head_dim]
     ///   - inputs[3]: mask  FLOAT_16 [1] (dummy)
-    ///   - inputs[4]: sinks FLOAT_32 [1] (dummy)
-    ///   - inputs[5]: S     FLOAT_32 [1] (dummy)
-    ///   - outputs[0]: O    FLOAT_32 [1, n_head, head_dim]
+    ///   - inputs[4]: sinks    FLOAT_32 [1] (dummy)
+    ///   - inputs[5]: S        FLOAT_32 [1] (dummy)
+    ///   - inputs[6]: n_kv_buf INT_32  [1] (D-D.6: kernel reads `n_kv = n_kv_buf[0]`)
+    ///   - outputs[0]: O       FLOAT_32 [1, n_head, head_dim]
     ///
-    /// Params: n_kv, n_head, n_head_kv, kv_capacity, head_dim (all INT_32).
+    /// Params: n_head, n_head_kv, kv_capacity, head_dim (all INT_32).
     /// scale defaults to 1/sqrt(head_dim).
+    /// `n_kv` argument retained for API compatibility but ignored (graph build
+    /// no longer needs it; runtime supplies via `n_kv_buf`).
     pub fn build_flash_attn_layout_for(
         n_head: i32,
         n_head_kv: i32,
         head_dim: i32,
         kv_capacity: i32,
-        n_kv: i32,
+        _n_kv: i32,
     ) -> Result<crate::args::OpImplLayout, crate::args::OpError> {
         use crate::qnn::{
             QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER, Qnn_ClientBuffer_t, Qnn_DataType_t,
@@ -1425,6 +1428,7 @@ pub mod __test_support {
         let mut dims_dummy_f16 = vec![1u32];
         let mut dims_dummy_f32 = vec![1u32];
         let mut dims_dummy_f32_2 = vec![1u32];
+        let mut dims_n_kv_buf = vec![1u32];
         let mut dims_o = vec![1u32, n_head as u32, head_dim as u32];
 
         let mut inputs = [
@@ -1494,6 +1498,18 @@ pub mod __test_support {
                     ),
                 },
             },
+            // n_kv_buf (D-D.6): INT_32 [1]
+            Qnn_Tensor_t {
+                version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+                __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+                    v1: mk_tv1(
+                        Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                        Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                        1,
+                        dims_n_kv_buf.as_mut_ptr(),
+                    ),
+                },
+            },
         ];
         let mut outputs = [Qnn_Tensor_t {
             version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
@@ -1507,23 +1523,12 @@ pub mod __test_support {
             },
         }];
 
-        let n_kv_name = CString::new("n_kv").unwrap();
         let n_head_name = CString::new("n_head").unwrap();
         let n_head_kv_name = CString::new("n_head_kv").unwrap();
         let kv_capacity_name = CString::new("kv_capacity").unwrap();
         let head_dim_name = CString::new("head_dim").unwrap();
 
         let mut params = [
-            Qnn_Param_t {
-                paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-                name: n_kv_name.as_ptr(),
-                __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                    scalarParam: Qnn_Scalar_t {
-                        dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
-                        __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { int32Value: n_kv },
-                    },
-                },
-            },
             Qnn_Param_t {
                 paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
                 name: n_head_name.as_ptr(),
@@ -1576,9 +1581,9 @@ pub mod __test_support {
             name: ptr::null(),
             packageName: ptr::null(),
             typeName: ptr::null(),
-            numOfParams: 5,
+            numOfParams: 4,
             params: params.as_mut_ptr(),
-            numOfInputs: 6,
+            numOfInputs: 7,
             inputTensors: inputs.as_mut_ptr(),
             numOfOutputs: 1,
             outputTensors: outputs.as_mut_ptr(),

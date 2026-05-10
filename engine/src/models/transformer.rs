@@ -1710,7 +1710,14 @@ impl TransformerModel {
                     let (k_buf, v_buf) = kv_caches[i]
                         .get_buffers_mut()
                         .expect("KVCacheOps::get_buffers_mut Some (gated above)");
-                    backend.execute_layer_graph(i, &x, k_buf, v_buf, start_pos, &mut x_next)?;
+                    // D-D.6: n_kv = 새 token 직전까지의 KV cache 길이 + 새 token
+                    // (KvScatter가 본 step에서 graph 내부 KV에 새 token write 후
+                    // FlashAttn이 [0..n_kv) 범위 attend). seq_len=1 decode는
+                    // start_pos + 1 == cache_seq_len 갱신 후 길이.
+                    let n_kv = start_pos + seq_len;
+                    backend.execute_layer_graph(
+                        i, &x, k_buf, v_buf, start_pos, n_kv, &mut x_next,
+                    )?;
                     x = x_next;
                     // KV cache pos는 graph 내부에서 갱신되었으므로 caller도 동기화.
                     kv_caches[i].advance_pos(seq_len);

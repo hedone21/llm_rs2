@@ -227,17 +227,29 @@ impl Backend for QnnOppkgBackend {
     /// Android 빌드에서 cache가 비어있거나 부분 채워진 상태는 false를 반환하여
     /// transformer.rs가 (현재는 미지원이므로) bail하도록 한다.
     fn supports_layer_graph(&self) -> bool {
-        // D-F 옵션 1 (production-safe default): execute_layer_graph fast path는
-        // graph build 시점 `n_kv=1` baked로 multi-token decode에서 정확성 깨짐.
-        // 옵션 2 (cl_mem↔host bridge) 인프라는 구현 완료 (execute_layer_graph
-        // bridge + lg.execute KV slot sync) 그러나 D-D.6 (n_kv input tensor화 +
-        // M2 ops/.cl kernel 갱신) 완료 전까진 fast path 비활성.
+        // D-D.6 후속 디버깅 단계 — fast path infra (cl_mem↔host bridge + n_kv
+        // input tensor + n_kv_buf binding)은 빌드/실행 PASS이지만 multi-token
+        // decode token sequence가 OpenCL primary와 byte-equal하지 않음. 잔존
+        // 가설:
+        //   - graph 14-node pipeline 자체가 OpenCL forward path와 다른 결과
+        //   - mask buffer layout (D-D.6에서 kv_capacity 크기로 확장)이 kernel
+        //     index 가정과 mismatch
+        //   - KV stride가 graph vs OpenCL에서 다른 가정
+        //   - weight binding (28 layer cache hit) 검증 필요
         //
-        // 본 단계 동작: qnn_oppkg primary로 진입하지만 모든 forward는 trait
-        // fallback (OpenCL secondary)이 처리 → token sequence는 OpenCL primary와
-        // bit-equal. INV-175 (decode 동안 fallback_call_count=0) 게이트는 D-D.6
-        // 완료 후 재검증.
-        false
+        // 디버깅 동안 fast path 비활성 (옵션 1 default — fallback OpenCL이 모든
+        // forward 처리하여 token sequence는 OpenCL primary와 byte-equal). 활성화
+        // 시 `LLMRS_QNN_OPPKG_FAST_PATH=1` env로 개별 enable 가능 (별도 phase).
+        let force_fast = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH").as_deref() == Ok("1");
+        if !force_fast {
+            return false;
+        }
+        let cache_ok = self
+            .graph_cache
+            .lock()
+            .map(|c| !c.is_empty())
+            .unwrap_or(false);
+        cache_ok && self.runtime.is_initialized()
     }
 
     /// ENG-QNN-211/213/214 — 14-node single-layer graph dispatch.
@@ -260,6 +272,7 @@ impl Backend for QnnOppkgBackend {
         kv_cache_k: &mut Tensor,
         kv_cache_v: &mut Tensor,
         pos: usize,
+        n_kv: usize,
         x_out: &mut Tensor,
     ) -> Result<()> {
         let lg = self.graph_for_layer(layer_idx).ok_or_else(|| {
@@ -295,6 +308,7 @@ impl Backend for QnnOppkgBackend {
             &mut kv_k_bytes,
             &mut kv_v_bytes,
             pos,
+            n_kv,
             empty_mask,
             &mut x_out_bytes,
         )?;
