@@ -940,6 +940,32 @@ struct Args {
     #[arg(long, default_value_t = false)]
     swap_intra_forward: bool,
 
+    /// Phase-aware Async Weight Swap (LISWAP-5).
+    ///
+    /// `false` (default): no-op. PHASE_HOOK 미등록 → forward path는
+    /// `op_trace::start_op` / `record`에서 atomic load 1회 + 분기로 끝남
+    /// (zero overhead).
+    ///
+    /// `true`: `--force-swap-ratio`가 설정되면 `PhaseAwareSwapDispatcher`가
+    /// commit되고, `op_trace` boundary에서 phase를 검사하여:
+    /// - `DdrPhase::CacheFit` 끝 → 다음 chunk async H2D enqueue
+    /// - `DdrPhase::Heavy` 시작 직전 → in-flight chunk 완료 대기
+    ///
+    /// `OpKind::ddr_phase()` 분류 + Phase R Scenario B (1.04× of max GREEN) +
+    /// production op CV 1.2% 측정 결과를 활용하여 swap H2D를 forward GPU
+    /// compute와 overlap.
+    ///
+    /// `--swap-incremental-per-tick > 0` / `--swap-intra-forward`와 mutually
+    /// exclusive.
+    #[arg(long, default_value_t = false)]
+    swap_phase_aware: bool,
+
+    /// Phase-aware swap chunk 진단 size (MB). v1 per-tensor chunking에서는
+    /// 실제 분할에 사용되지 않고 진단/보고 용도. 측정에 따라 v2에서 sub-tensor
+    /// chunking 도입 시 활용 (4 MB sweet spot 기본).
+    #[arg(long, default_value_t = 4)]
+    swap_phase_aware_chunk_mb: usize,
+
     // ── QNN OpPackage backend (M3, ENG-QNN-220) ─────────────────
     /// Eager prebuild of all 28 layer graphs at model load time
     /// (ENG-QNN-209, D1 결정).
@@ -1008,18 +1034,23 @@ fn main() -> anyhow::Result<()> {
     #[allow(unused_mut)]
     let mut args = Args::parse();
 
-    // ENG-DAT-C18: --swap-incremental-per-tick > 0 and --swap-intra-forward
-    // are mutually exclusive (LISWAP-1 vs LISWAP-4 — ratio_generation bump
-    // semantics conflict). Reject the combination explicitly so engine
-    // never starts in an ambiguous swap-policy state.
-    if args.swap_incremental_per_tick > 0 && args.swap_intra_forward {
+    // ENG-DAT-C18: --swap-incremental-per-tick > 0 / --swap-intra-forward /
+    // --swap-phase-aware are mutually exclusive (LISWAP-1 vs LISWAP-4 vs
+    // LISWAP-5 — ratio_generation bump + dispatcher ownership conflict).
+    // Reject combinations explicitly so engine never starts in an ambiguous
+    // swap-policy state.
+    let swap_modes_active = (args.swap_incremental_per_tick > 0) as usize
+        + args.swap_intra_forward as usize
+        + args.swap_phase_aware as usize;
+    if swap_modes_active > 1 {
         anyhow::bail!(
-            "--swap-incremental-per-tick (= {}) and --swap-intra-forward (= true) \
-             are mutually exclusive (ENG-DAT-C18). Pick one:\n\
-             (a) --swap-incremental-per-tick=N --swap-intra-forward=false   (LISWAP-1)\n\
-             (b) --swap-incremental-per-tick=0 --swap-intra-forward=true    (LISWAP-4)\n\
-             (c) --swap-incremental-per-tick=0 --swap-intra-forward=false   (single-shot)",
-            args.swap_incremental_per_tick
+            "--swap-incremental-per-tick (= {}) / --swap-intra-forward (= {}) / \
+             --swap-phase-aware (= {}) are mutually exclusive (ENG-DAT-C18). Pick one:\n\
+             (a) --swap-incremental-per-tick=N                                 (LISWAP-1)\n\
+             (b) --swap-intra-forward=true                                     (LISWAP-4)\n\
+             (c) --swap-phase-aware=true                                       (LISWAP-5)\n\
+             (d) (none)                                                        (single-shot)",
+            args.swap_incremental_per_tick, args.swap_intra_forward, args.swap_phase_aware
         );
     }
     // Configure Rayon thread pool: 0 = auto-detect CPU cores
@@ -2739,6 +2770,16 @@ fn main() -> anyhow::Result<()> {
     let mut intra_forward_swap_hook: Option<Arc<llm_rs2::models::weights::IntraForwardSwapHook>> =
         None;
 
+    // LISWAP-5: phase-aware async swap dispatcher. Created when
+    // `--swap-phase-aware` + `--force-swap-ratio` both active. Registered as
+    // process-wide PHASE_HOOK so `op_trace::start_op` / `record` callsites in
+    // forward_gen drive chunk dispatch from the forward thread itself.
+    // `finalize` drains remaining chunks + bumps ratio_generation when decode
+    // ends.
+    let mut phase_aware_swap_dispatcher: Option<
+        Arc<llm_rs2::models::weights::PhaseAwareSwapDispatcher>,
+    > = None;
+
     // LISWAP-2 prototype: async swap dispatcher lifecycle.
     // Created once here; used in the decode loop when async dispatch is active.
     // `None` when --swap-async-dispatch is false, per_tick == 0, or the backend
@@ -2831,6 +2872,49 @@ fn main() -> anyhow::Result<()> {
                 "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
                 ratio,
             );
+        } else if args.swap_phase_aware {
+            // LISWAP-5: dispatcher 생성 + commit_plan + PHASE_HOOK 등록.
+            // chunk dispatch는 forward thread의 op_trace boundary가 trigger.
+            // dispatcher worker (AsyncSwapDispatcher)가 cl_event 대기 후
+            // ArcSwap commit + ratio_generation bump (LISWAP-4와 동일 패턴).
+            let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cpu_backend_arc.clone());
+            let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                Arc::clone(&swap_backend),
+            ));
+            let secondary = match model.secondary_mmap.as_ref() {
+                Some(s) => Arc::clone(s),
+                None => {
+                    anyhow::bail!(
+                        "--swap-phase-aware requires --secondary-gguf (no secondary mmap available)"
+                    );
+                }
+            };
+            let config = Arc::new(model.config.clone());
+            let chunk_size_bytes = args.swap_phase_aware_chunk_mb.max(1) * 1_048_576;
+            eprintln!(
+                "weight_swap: phase-aware mode — ratio={:.2}, {} target layers, chunk_size={} MB (LISWAP-5)",
+                ratio,
+                target_layers.len(),
+                args.swap_phase_aware_chunk_mb
+            );
+            let phase_dispatcher = llm_rs2::models::weights::PhaseAwareSwapDispatcher::new(
+                chunk_size_bytes,
+                model.layers.clone(),
+                secondary,
+                swap_backend,
+                dispatcher,
+                DType::Q4_0,
+                config,
+            );
+            phase_dispatcher.commit_plan(&target_layers);
+            // Register process-wide PhaseHook (singleton, set 한 번만 effective).
+            llm_rs2::profile::op_trace::set_phase_hook(
+                phase_dispatcher.clone() as Arc<dyn llm_rs2::profile::op_trace::PhaseHook>,
+            );
+            phase_aware_swap_dispatcher = Some(phase_dispatcher);
         } else if args.swap_intra_forward {
             // LISWAP-4 (ENG-ALG-237): single-shot is skipped; an
             // IntraForwardSwapHook is committed instead. The decode loop
@@ -5715,6 +5799,54 @@ fn main() -> anyhow::Result<()> {
                 intra_forward_swap_hook = None; // retire
             }
             // ── End LISWAP-4 retire ────────────────────────────────────────────
+
+            // ── LISWAP-5 Phase-aware Swap retire ──────────────────────────────
+            // chunk_queue가 비고 in_flight도 None이면 dispatcher 종료. finalize는
+            // 마지막 ratio_generation bump + invalidate 수행. PHASE_HOOK은
+            // OnceLock이라 unset 불가능하지만 finalize() 후 모든 hook fire가
+            // noop이 됨 (dispatcher 내부 finalized atomic).
+            if let Some(disp) = phase_aware_swap_dispatcher.as_ref()
+                && disp.is_complete()
+            {
+                let drain_t = std::time::Instant::now();
+                let backend_for_invalidate: Arc<dyn Backend> = gpu_backend_arc
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&backend));
+                let invalidate = move || {
+                    backend_for_invalidate.invalidate_noshuffle_soa_registry();
+                };
+                match disp.finalize(
+                    &model.ratio_generation,
+                    invalidate,
+                    std::time::Duration::from_secs(10),
+                ) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[PhaseAwareSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms, chunks={})",
+                            decode_token_index,
+                            drain_t.elapsed().as_secs_f64() * 1000.0,
+                            disp.dispatched_count(),
+                        );
+                        #[cfg(feature = "opencl")]
+                        remap_weights_for_cpu_after_swap(
+                            &mut model,
+                            &backend,
+                            is_gpu,
+                            args.resilience_prealloc_switch,
+                            "phase-aware-swap",
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[PhaseAwareSwap] finalize failed at token={}: {}",
+                            decode_token_index, e
+                        );
+                    }
+                }
+                phase_aware_swap_dispatcher = None;
+            }
+            // ── End LISWAP-5 retire ────────────────────────────────────────────
 
             // ── H2O Debug: per-step diagnostics ──
             if args.h2o_debug {

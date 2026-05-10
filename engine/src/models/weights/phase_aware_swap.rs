@@ -493,6 +493,34 @@ impl PhaseAwareSwapDispatcher {
     pub fn dispatched_count(&self) -> u64 {
         self.dispatched_count.load(Ordering::Acquire)
     }
+
+    /// Plan 종료 조건 — chunk_queue 비고, in_flight 없고, pending_layers 비어있음.
+    /// decode loop가 매 token 후 polling하여 true가 되면 `finalize()` 호출.
+    /// stage_gate_armed가 false면 chunk을 한 번도 dispatch하지 않은 상태이므로
+    /// `is_complete = false` 유지 (commit_plan 직후 race로 finalize되는 것 방지).
+    pub fn is_complete(&self) -> bool {
+        if !self.stage_gate_armed.load(Ordering::Acquire) {
+            return false;
+        }
+        let queue_empty = self.chunk_queue.lock().map(|q| q.is_empty()).unwrap_or(false);
+        if !queue_empty {
+            return false;
+        }
+        let in_flight_empty = self
+            .in_flight
+            .lock()
+            .map(|g| g.is_none())
+            .unwrap_or(false);
+        if !in_flight_empty {
+            return false;
+        }
+        let pending_empty = self
+            .pending_layers
+            .lock()
+            .map(|p| p.is_empty())
+            .unwrap_or(false);
+        pending_empty
+    }
 }
 
 impl PhaseHook for PhaseAwareSwapDispatcher {
