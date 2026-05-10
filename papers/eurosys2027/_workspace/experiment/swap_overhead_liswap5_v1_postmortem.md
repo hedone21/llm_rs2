@@ -156,131 +156,199 @@ Aborted                                       ← 여기서 SIGABRT
 **갱신 사유**: 다음 세션이 crash fix를 시작하기 전 reproducer를 재실행한 결과 SIGABRT가 **재현되지 않음**. n=32, n=64×5회, n=200×3회 모두 정상 완료. handoff `12bac91`에서 보고된 crash는 flaky (race timing 차이) 였거나 측정 당시 환경 노이즈였던 것으로 추정. **v1 wall-clock 측정 가능.**
 
 ### 6.1 측정 setup
-- HEAD: `f68e817` (handoff doc 추가, 코드 변경 없음)
+- HEAD: `125cbc9`
 - Binary: `12bac91` 시점 빌드 (동일)
-- Device: Galaxy S25 (Adreno 830)
-- Prompt: "The capital of France is", n=200, temperature=0
-- Reproducer: `--swap-phase-aware --force-swap-ratio 0.9 --secondary-gguf ...q4_0.gguf` (single-shot은 `--swap-phase-aware` 빠짐)
+- Device: Galaxy S25 (Adreno 830, 6T)
+- Prompt: "The capital of France is", temperature=0, initial-kv-capacity=2048
+- 4 mode × 3 run × 3 n (10/50/200) alternating, mode 사이 idle 10s, n 사이 idle 15s (thermal-matched)
+- swap config: `--force-swap-ratio 0.9` (28 layer 중 25 swap), F16 → Q4_0
 
-### 6.2 4-mode 비교 (n=200, 3 run median)
+### 6.2 정밀 분리 측정 — Prefill / TTFT / tok[0] / Decode tail (best-of-3, cool run)
 
-| 모드 | TTFT (ms) | Decode (ms/tok) | Tail output |
-|---|---:|---:|---|
-| [A] F16 only | n/a | 54.1 ~ 65.7 | n/a |
-| [B] Q4_0 only | n/a | 38.2 ~ 47.2 | n/a |
-| [C] Single-shot swap (force-ratio 0.9) | **605~635** | **37.1 ~ 52.7** (median 37) | "...The capital city is Paris. It has" |
-| [D] Phase-aware LISWAP-5 | **456~477** | **48.6 ~ 54.1** (median 50) | "...The most important fact about France is that it was" |
+| 모드 | n | Prefill_pure | TTFT | Decode all | Decode tail (excl tok0) | tok[0] |
+|---|---:|---:|---:|---:|---:|---:|
+| Q4 only | 10 | 115 | 213 | 27.5 | 27.4 | 27.94 |
+| Q4 only | 50 | 115 | 213 | 27.5 | 27.5 | 27.95 |
+| Q4 only | 200 | 115 | 213 | 28.1 | 28.1 | 27.72 |
+| F16 only | 10 | 242 | 368 | 53.3 | 53.3 | 53.21 |
+| F16 only | 200 | 244 | 369 | 54.0 | 54.0 | 53.14 |
+| **Single-shot** | 10 | **105** | **469** | 25.7 | 25.6 | 26.56 |
+| **Single-shot** | 50 | 104 | 466 | 25.7 | 25.7 | 26.74 |
+| **Single-shot** | 200 | 108 | **620** | 26.4 | 26.4 | 26.55 |
+| **Phase-aware** | 10 | **219** | **339** | **81.8** | **64.9** | **216.83** |
+| **Phase-aware** | 50 | 226 | 344 | 36.9 | 33.1 | 216.87 |
+| **Phase-aware** | 200 | 224 | **348** | 30.8 | 29.3 | **321.55** |
 
-### 6.3 핵심 finding
+### 6.3 핵심 finding (수정 — 이전 분석 무효)
 
-#### TTFT win: **-150 ms** (phase-aware vs single-shot)
-- Single-shot은 prefill 직전 swap을 동기 수행 — 측정한 TTFT 605 ms 중 ~400 ms가 swap copy 비용 (Q4 prefill 자체는 ~200 ms)
-- Phase-aware는 prefill 동안 swap이 없고, decode token 0~2에서 background dispatch
-- → TTFT 측면에서 phase-aware가 single-shot 대비 **24% 단축**
-- 단응답·interactive UX에 의미 있음
+이전 §6 분석은 "Decode 평균"이 phase-aware +10 ms loss라고 했지만, **n별로 Decode 평균이 변함을 무시했음**. n=10에서 Decode 81.8 → n=200에서 30.8로 급격히 감소. 이는 **swap 비용이 tok[0~2]에 집중**되어 n이 커질수록 평균에 흡수된다는 증거.
 
-#### Decode loss: **+10 ms/tok** (phase-aware vs single-shot)
-- Single-shot Q4 forward 정상 = 37 ms/tok (Q4 only 38 ms와 ~일치)
-- Phase-aware는 retire 이후에도 50 ms/tok — Q4보다 +10 ms 느림
-- 가능 원인:
-  - Chunk dispatch가 끝났음에도 ratio_generation bump 후의 lazy SOA rebuild 비용이 retire 직후 token에 잔류
-  - OpenCL command queue 상에 swap chunks 가 enqueue된 잔류 효과 (driver internal scheduler)
-  - 더 직접적으로 — `materialise_cpu_tensor` (mmap → CPU memcpy) 자체가 forward thread를 막음 (token 0~2에서 75 chunks/token × 1 ms ≈ 75 ms 추가)
-- token 3 이후에도 +10 ms 잔류는 dispatcher가 비어있어도 발생 → **invalidate 후 layer-by-layer SOA lazy rebuild가 진짜 culprit 가능성**
+#### Finding 1 — Prefill 강제 비용 +119 ms (phase-aware의 본질적 손해)
+- Single-shot prefill_pure = **105 ms (Q4 forward)** — swap이 prefill 직전 동기 수행되어 prefill 시점에는 이미 Q4 weights
+- Phase-aware prefill_pure = **224 ms (F16 forward)** — swap은 op_trace boundary 필요 → decode 시작 후에만 가능 → prefill은 원본 F16 weights
+- **Δ = +119 ms 영구 손해**. n에 무관하게 항상 발생.
 
-#### E2E crossover (n에 따라)
-- E2E = TTFT + Decode × n
-- single-shot: 635 + 37×n
-- phase-aware: 470 + 50×n
-- crossover: n = (635-470) / (50-37) ≈ **n=13**
-- → **n<13 일 때 phase-aware 유리, n≥13 일 때 single-shot 유리**
+#### Finding 2 — Swap blocking이 token 0에 집중 (216~322 ms)
+- Phase-aware tok[0] = **216~322 ms** (n에 따라 증가? n=200에서 321 ms — 더 많은 chunk가 token 0~2에 집중되었을 가능성)
+- Single-shot tok[0] = 26 ms (정상 Q4 forward — swap은 prefill에서 이미 끝났음)
+- → tok[0]에서 +200~300 ms 추가. swap이 forward와 overlap **안 함**, 오히려 forward를 blocking.
 
-### 6.4 Phase R (microbench 1.04×) 와의 차이
-Phase R Scenario B = 1.04× of max. 본 production 측정은 +35% (50/37). 차이 원인:
-- Phase R: pure memcpy + cache-fit window 활용
-- Production: `materialise_cpu_tensor` (mmap fault + GGUF re-pack) 추가 + 25 layer × 9 tensor = 225 chunks의 enqueue overhead
-- per-tensor chunk size가 cache-fit window (980us = 4 MB) 초과: wq 9 MB / ffn 26 MB
+#### Finding 3 — Decode tail은 n이 커질수록 Q4 baseline에 수렴 (steady state는 거의 동일)
+- Phase-aware tail (excl tok0): **n=10 64.9 ms → n=50 33.1 ms → n=200 29.3 ms**
+- Q4 only baseline: 27.4~28.1 ms
+- → token 3 이후 거의 회복. n=200에서 phase-aware tail (29.3) 과 Q4 only (28.1) 차이는 **+1.2 ms** 만 (이전 분석의 +10 ms 잘못)
+- "+10 ms steady loss" 가설은 **틀림**. 진짜 loss는 token 0~2에 집중.
 
-→ Phase R의 1.04×를 production에서 재현하려면 **chunk granularity를 4 MB 이하로 sub-divide** 해야 함 (현재 v1은 per-tensor만, 9~26 MB 단일 chunk).
+#### Finding 4 — Swap 총량은 비슷 (분산 vs blocking 차이만)
+| 모드 | swap 총 비용 추정 | 위치 |
+|---|---:|---|
+| Single-shot | TTFT - prefill_pure - tok[0] = 620-108-26 = **486 ms** | prefill 직전 동기 |
+| Phase-aware | (prefill F16 - prefill Q4) + tok[0] excess + tail excess<br>= 119 + (321-26) + 198×(29.3-28.1) = 119 + 295 + 238 = **652 ms** | prefill F16 + tok[0~10] 분산 |
 
-### 6.5 4-gate 결과
+→ Phase-aware의 swap 총 비용이 single-shot보다 **+166 ms 큼** (분산이 효율 감소).
+
+### 6.4 E2E 비교 (수정)
+
+| n | Single-shot E2E | Phase-aware E2E | Δ | TTFT Δ |
+|---:|---:|---:|---:|---:|
+| 10 | 469 + 9×25.7 = **700 ms** | 339 + 9×81.8 = **1075 ms** | +375 (phase-aware 손해) | -130 (phase win) |
+| 50 | 466 + 49×25.7 = **1726 ms** | 344 + 49×36.9 = **2152 ms** | +426 | -122 |
+| 200 | 620 + 199×26.4 = **5874 ms** | 348 + 199×30.8 = **6477 ms** | +603 | -272 |
+
+**이전 분석의 crossover n=13은 무효**. 모든 n에서 phase-aware의 E2E가 single-shot보다 worse. 차이는 n에 따라 **+375 ~ +603 ms**.
+
+→ **유일한 phase-aware 이득은 TTFT 단축 (-130~-272 ms)**. 이는 실시간 streaming UX에서만 의미. 총 처리 시간은 항상 phase-aware 손해.
+
+### 6.5 Swap data 분석 (이론치 vs 실측)
+
+**Swap payload**:
+- 25 layer × 9 tensor = **225 chunks** (per-tensor 통째로, sub-chunk 없음)
+- 1 layer Q4 weight ≈ q(1.3) + k(0.22) + v(0.22) + o(1.3) + gate(7.6) + up(7.6) + down(7.6) + 2 norm(neg) ≈ **25.84 MB**
+- 25 layer 총 = **~646 MB Q4 read** + 동량 buffer write
+
+**이론 transfer time** (UMA H2D):
+- @ 7 GB/s = 92 ms
+- @ 8 GB/s = 80 ms
+
+**실측 (single-shot blocking)**: 486 ms → **실제 5~6× 느림**. 차이의 원천:
+- mmap fault (cold first-touch 대부분, ~150 ms 추정)
+- GGUF block re-pack (Q4_0 layout → backend layout 변환)
+- OpenCL `enqueue_write_buffer` 자체 driver overhead (per-tensor sync 포함)
+
+**실측 (phase-aware 총량)**: 652 ms → single-shot보다 +166 ms 큼:
+- per-chunk dispatch 분산 효과 (cache-fit window 980us를 9~26 MB chunk가 fit하지 못함)
+- forward와 진짜 overlap이 일어나지 않음 — chunk가 forward kernel과 같은 OpenCL queue를 직렬 점유
+
+### 6.6 4-gate 결과 (수정)
 
 | Gate | 결과 | 근거 |
 |---|---|---|
-| ✅ Correctness | PASS | 32, 64, 200 token 모두 plausible English ("Paris. The capital city is...") |
-| ⚠️ TBT | PARTIAL | Decode +10 ms 손해, but TTFT -150 ms win |
-| ❓ Hide ratio | UNKNOWN | dispatcher counters로 chunks=225/token=2 = 113 chunk/token throughput 확인. forward와 동시 진행했는지는 wall-clock 분리 측정 필요 |
-| ❌ Stall | (자체 측정 X) | crash 보고된 적 있으나 재현 불가 — flaky로 분류 |
+| ✅ Correctness | PASS | 200 token plausible English ("...The most important fact about France is that it was") |
+| ⚠️ TBT | **mostly FAIL** | E2E +375~603 ms loss. TTFT -130~272 ms win은 streaming UX에만 의미 |
+| ❌ Hide ratio | **FAIL** | tok[0] 321 ms 측정 — swap이 forward와 overlap 안 함, 오히려 blocking. expected hide ratio (Phase R 96%) 미달 |
+| ✅ Stall | PASS | crash 재현 불가, normal 32~200 token decode 정상 |
 
-**종합**: design 자체는 viable. TTFT 개선 명확. Decode 손해는 v2에서 sub-chunking + invalidate 우회 필요.
+**종합 (수정)**: design은 functional이지만 실제 hide 효과 거의 없음. swap이 forward와 overlap되지 않고 token 0에 blocking 형태로 청구됨. v2 sub-chunking + background pre-staging이 필수.
 
 ---
 
-## 7. 효과 없었던 진짜 이유 정리 (2026-05-10 갱신)
+## 7. 효과 없었던 진짜 이유 정리 (2026-05-10 final)
 
-| 이유 | 영향 | 상태 |
-|---|---|---|
-| **A. plan-path bypass 누락** | 측정 자체가 의미 없음 (swap 0회) | ✅ FIX (commit `ed7464f`) |
-| **B. retire 후 crash** | wall-clock 측정 불가 | 🔄 재현 안 됨 — flaky, 측정 가능 (§6) |
-| **C. per-tensor chunk overhead** | Decode +10 ms/tok 영구 손해 | ❌ design 한계 — v2 필요 |
-| **D. invalidate 후 SOA lazy rebuild** | retire 후에도 +10 ms 잔류 가능성 | ❓ 정밀 분리 측정 필요 |
-| **E. mid-decode mixed weights** | 출력이 single-shot과 분기 | ✅ 정상 (semantic plausible) |
+이전 분석은 평균 Decode만 보고 "+10 ms steady loss + crossover n=13"라 했지만 **n별 분리 측정으로 무효화**. 진짜 원인 4가지:
 
-**A**는 fix됨. **B**는 재현 불가하므로 close. v1의 진짜 평가는 §6 결과로 확정:
-- TTFT win (-150 ms / -24%)
-- Decode loss (+10 ms / +35%)
-- crossover n=13
+### 7.1 [PRIMARY] Prefill phase에서 swap 못 함 → F16 prefill 강제 (+119 ms)
+- Phase-aware는 op_trace boundary trigger 의존 → prefill 단계 (5 token) 동안에는 chunk dispatch 안 일어남
+- 따라서 prefill은 **F16 weights 그대로** (224 ms) — Q4 prefill (105 ms) 대비 **+119 ms**
+- Single-shot은 prefill 직전 swap 동기 → prefill 시점 이미 Q4
+- **n에 무관하게 영구 손해**. 모든 E2E 비교에서 Single-shot 대비 baseline +119 ms 짊어지고 시작.
 
-**C**는 design 한계. v2가 필요한 이유:
-- per-tensor 4 MB 이상의 단일 chunk → cache-fit window (980us) 초과
-- materialise_cpu_tensor (mmap + GGUF re-pack) 자체가 forward thread block
+### 7.2 [PRIMARY] tok[0]에 swap blocking +200~300 ms
+- tok[0] = **216~322 ms** (Q4 forward 26 ms 대비 +200~300)
+- 이는 **swap이 forward와 overlap 안 함**의 직접 증거. forward thread가 첫 token에서 chunk dispatch 비용을 동기로 짊어짐
+- 원인:
+  - chunk size = per-tensor 통째 (`byte_offset=0, byte_len=0`, `chunk_size_bytes` 미사용 — `phase_aware_swap.rs:236-243`)
+  - tensor sizes wq/wo (1.3 MB), gate/up/down (7.6 MB) — 모두 cache-fit window (980us = 4 MB throughput) 초과
+  - `materialise_cpu_tensor` (mmap fault + GGUF block re-pack)이 forward thread blocking 호출
+- 결과: phase boundary 감지에도 chunk이 너무 커서 forward와 같은 OpenCL queue를 직렬 점유
 
-**D**는 추가 진단 필요. retire 후 token 3~10에서도 50 ms 유지되는 이유:
-- ratio_generation bump 이후 첫 N token에서 SOA registry rebuild가 lazy하게 비용 청구
-- 또는 OpenCL driver internal scheduler가 스왑 chunks 흔적으로 후속 forward kernel 우선순위 낮춤
-- profiling으로 retire 후 token별 forward breakdown 분리 가능
+### 7.3 [SECONDARY] Decode tail은 거의 정상 (Q4 baseline +1.2 ms)
+- n=200 phase-aware tail = 29.3 ms vs Q4 only = 28.1 ms → **+1.2 ms 만 차이** (이전 분석 +10 ms 잘못)
+- token 3 이후는 swap dispatcher 비활성 → 정상 Q4 forward 회복
+- → "SOA lazy rebuild" 가설은 **무효** (영향 거의 없음)
+
+### 7.4 [DESIGN] swap 총 비용 자체가 single-shot보다 큼 (+166 ms)
+- Single-shot swap blocking ≈ 486 ms
+- Phase-aware swap 분산 총량 ≈ 652 ms (prefill F16 +119 + tok[0] excess +295 + tail +238)
+- **분산이 효율을 떨어뜨림** — 한 번에 하면 빠르게 끝날 것을 chunk-by-chunk로 driver가 batch 못 함
+
+### 7.5 v1의 본질 한계
+hide의 전제 조건은:
+1. ✗ chunk가 cache-fit window 안에 fit (현재 9~26 MB → 980us 초과)
+2. ✗ forward thread가 host work 안 짊어짐 (현재 mmap+repack이 forward thread block)
+3. ✗ prefill phase에서도 swap 가능 (현재 op_trace 후 시작)
+4. ✓ phase 예측 deterministic (CV 1.2% — 유일하게 충족)
+
+→ Phase R Scenario B (1.04× of max) 의 hide 96% 와의 격차는 (1)+(2)+(3) 모두 미흡 때문.
 
 **E**는 본질 — 평가 기준은 byte-equal이 아닌 plausible English.
 
 ---
 
-## 8. 다음 세션 액션 (2026-05-10 갱신)
+## 8. 다음 세션 액션 (2026-05-10 final)
 
-### Priority 1 — v2 sub-tensor chunking (Option α)
-v1은 per-tensor chunk만 (wq=9 MB, ffn_gate/up=26 MB 등). 이걸 4 MB 이하로 sub-divide 하면 cache-fit window에 fit.
-- chunk granularity: 2 MB (Q4) / 4 MB (F16)
-- sub-chunk마다 cl_event chain — 같은 PartialLayer 안의 chunks가 순차 enqueue
-- expected: per-token chunks 75 → 200, 단 chunk당 dispatch 시간 1 ms → 0.5 ms (host work는 거의 동일하지만 enqueue overhead 분산)
+§7의 4가지 원인을 직접 공격. 우선순위 재배치:
 
-### Priority 2 — invalidate 후 SOA rebuild lag 진단
-retire 후 token 3~10의 +10 ms 잔류 원인 규명:
-- profiling (perfetto) 으로 token별 forward breakdown
-- ratio_generation bump 직후 첫 N token만 다른 path (lazy rebuild) 거치는지 확인
-- 아니면 driver/scheduler 효과 — 그 경우 v2도 한계
+### Priority 1 — Prefill phase swap 활용 (+119 ms 회수)
+**가장 큰 이득 (per-token 무관, 영구).** prefill 5 token도 op_trace boundary가 있고 deterministic. 단 prefill은 batch token이라 forward 자체가 무거움 (224 ms / 5 token = 45 ms/token).
+- 옵션 A: prefill 직전에 동기 swap 실행 (single-shot 동등) → TTFT loss +338 ms 감수 vs Decode +119 회수
+  - 사실상 single-shot으로 회귀, phase-aware의 의미 잃음
+- 옵션 B: prefill phase에서도 chunk dispatch (op_trace boundary 활용)
+  - prefill의 cache-fit phase는 token 단위 batched이지만 layer 단위로는 phase 분리됨
+  - 구현: prefill path에서도 PHASE_HOOK fire (현재 forward_gen 만)
+  - prefill 5 token + decode 첫 ~3 token = 약 8 phase × 28 layer × 5 cache-fit = swap 커버 충분
+  - **권장 — TTFT win 보존하면서 prefill F16 cost 회수**
 
-### Priority 3 — Background pre-staging (Option β)
-- materialise_cpu_tensor를 worker thread로 pre-stage → forward thread는 enqueue_write_async만 호출
-- v1은 forward thread에서 mmap → memcpy → enqueue 모두 수행 (75 ms host work 직접 짊어짐)
-- v2 + β로 가면 Phase R 1.04× 와 비슷한 overhead 가능성
+### Priority 2 — Sub-tensor chunking (Option α, tok[0] +295 ms 회수)
+v1 chunk가 per-tensor 통째라 cache-fit window 미달:
+- 현재 `byte_offset=0, byte_len=0` (`phase_aware_swap.rs:236`) — chunk_size_bytes 미사용 버그
+- 수정: tensor 크기를 chunk_size_bytes (4 MB)로 분할
+  - q/o (1.3 MB) → 1 chunk (변동 X)
+  - gate/up/down (7.6 MB) → 2 chunks each
+  - **per layer 9 chunks → 16 chunks; 25 layer 225 → 400**
+- expected: chunk 당 fit window에 진입 → forward와 진짜 overlap
+- cl_event chain은 sub-chunk 사이도 유지
 
-### Priority 4 — TTFT win 활용 시나리오 정리
-- crossover n=13 — interactive (avg 응답 ~100 token) 시나리오에서는 single-shot이 유리
-- 하지만 streaming TTFT 우선 시나리오 (chat UI 첫 token 빠른 표시)에서는 phase-aware가 win
-- 평가 metric을 어디에 정렬할지 paper에서 명확히
+### Priority 3 — Background pre-staging (Option β, host work 회수)
+- 현재 `materialise_cpu_tensor` (mmap + GGUF re-pack)이 forward thread blocking 호출
+- worker thread로 분리: PartialLayer pre-stage → forward thread는 `enqueue_write_async`만 호출
+- expected: per-chunk host work ~1 ms → ~0.1 ms (enqueue overhead만)
+
+### Priority 4 — Hide ratio 측정 인프라
+v1은 hide ratio 측정 못 했음 (chunk dispatch wall-clock 분리 unavailable).
+- dispatcher에 per-chunk start/end timestamp 기록
+- forward kernel timestamp와 비교 → overlap ratio 계산
+- 4-gate 정량화 가능
+
+### v2 Pass-gate (수정)
+- E2E (n=200): single-shot 대비 **+5% 이내** (현 +10%)
+- TTFT: -100 ms 이상 단축 보존
+- Decode tok[0]: 100 ms 이내 (현 322 ms)
+- Decode tail: Q4 baseline +5% 이내 (현 이미 +4% — pass)
 
 ### Crash 처리
 - handoff `12bac91`에서 보고된 SIGABRT는 재현 불가 (5+ 회 재실행 모두 정상)
 - handoff `f68e817`는 close (race 의심 hypothesis는 코드 변경 없이 보존, 향후 v2 작업 시 재출현 시 재진단)
 - handoff_liswap5_crash_fix_2026_05_10.md 는 archive 처리
 
-### Lessons learned
+### Lessons learned (수정)
+- **n별 Decode 변동 무시 위험**: 첫 단순 평균 분석에서 +10 ms steady loss라 결론. n별 분리 측정 후 무효화. **항상 n별 + tok-bucket 측정 필수**.
+- **TTFT 단축 ≠ E2E win**: 분산 swap이 TTFT는 줄이지만 forward 안에 흡수된 cost는 더 큼 (prefill F16 + tok[0] blocking).
+- **chunk_size 설정과 실제 chunk 크기 불일치**: code review 시 `byte_offset/len` 사용 확인 (현재 0,0 hardcoded — sub-chunking 미구현 상태).
 - **9-track handoff §3.1 LISWAP-4 v2 함정 (plan-bypass) 을 그대로 반복**. 다음 swap 작업 시 "plan-path bypass guard" 체크리스트 필수
-- **첫 측정 신뢰 전 진단 카운터 필수 확인** — 첫 v1 측정 (48 ms) 을 실제 swap 결과로 오해석
-- **op_trace 호출 경로의 unit 검증** — `forward_gen` 외 plan, prefill, transformer.rs decode tail 다중 path 존재
 - **flaky crash 보고 시 즉시 fix 의사결정 금지** — 5+ 회 재현 시도가 우선. 본 세션은 재현 안 되어 fix 불필요
 
 ---
 
 **End of postmortem**
 
-핵심 한 줄 (2026-05-10 final): **첫 측정은 의미 없었다 (plan path bypass로 swap 0회). Fix 후 hook 정상 fire + 3 token 안에 dispatch 완료. v1은 정상 동작 — TTFT -150 ms win, Decode +10 ms loss, crossover n=13. crash는 재현 불가 (flaky). v2는 sub-tensor chunking + background pre-staging.**
+핵심 한 줄 (2026-05-10 final, deep dive 후 수정): **v1은 functional이지만 hide 효과 거의 없음. swap이 forward와 overlap되지 않고 (1) prefill F16으로 강제 +119 ms (2) tok[0]에 blocking +295 ms 형태로 청구. Decode tail (token 3~)는 Q4 baseline에 거의 회복 (+1.2 ms). E2E는 모든 n에서 single-shot 대비 +375~603 ms 손해. TTFT -130~272 ms 단축은 streaming UX에서만 의미. v2는 (a) prefill phase swap (b) sub-tensor chunking (c) background pre-staging 필수. crossover n=13 가설 무효 — 모든 n에서 phase-aware E2E 손해.**
