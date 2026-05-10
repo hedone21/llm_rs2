@@ -149,6 +149,15 @@ impl LayerGraph {
     }
 }
 
+/// Phase C — lg.execute 내부 breakdown counters (process-global).
+/// graphExecute 자체 vs internal memcpy (rpcmem ↔ host bytes) 분리.
+pub(crate) static LG_COPY_IN_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LG_EXEC_PURE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LG_COPY_OUT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(target_os = "android")]
 mod android {
     //! Android-only graph build/execute body (M3.4 — 14-node body 이식).
@@ -222,6 +231,7 @@ mod android {
             _mask_bytes: &[u8],
             x_out_bytes: &mut [u8],
         ) -> Result<()> {
+            let t_copy_in = std::time::Instant::now();
             // Copy input x into rpcmem-backed input slot.
             let in_slot = &self.slots[self.idx_x_in];
             ensure!(
@@ -284,6 +294,9 @@ mod android {
                 std::ptr::write(self.n_kv_host_ptr, n_kv as i32);
             }
 
+            let copy_in_ns = t_copy_in.elapsed().as_nanos() as u64;
+            super::LG_COPY_IN_NS.fetch_add(copy_in_ns, std::sync::atomic::Ordering::Relaxed);
+
             // graphExecute.
             let v = runtime.v();
             let graph_execute = v
@@ -291,6 +304,7 @@ mod android {
                 .ok_or_else(|| anyhow!("graphExecute fn-pointer is NULL"))?;
             // SAFETY: exec_inputs/outputs는 build 시점에 valid memHandle로 baked.
             // graph handle도 valid.
+            let t_exec_pure = std::time::Instant::now();
             let err = unsafe {
                 graph_execute(
                     self.graph,
@@ -302,9 +316,12 @@ mod android {
                     ptr::null_mut(),
                 )
             };
+            let exec_pure_ns = t_exec_pure.elapsed().as_nanos() as u64;
+            super::LG_EXEC_PURE_NS.fetch_add(exec_pure_ns, std::sync::atomic::Ordering::Relaxed);
             if err != 0 {
                 return Err(anyhow!("graphExecute err=0x{:x}", err));
             }
+            let t_copy_out = std::time::Instant::now();
 
             // Copy x_out from rpcmem-backed output slot.
             let out_slot = &self.slots[self.idx_x_out];
@@ -354,6 +371,8 @@ mod android {
                     kv_v_bytes.len(),
                 );
             }
+            let copy_out_ns = t_copy_out.elapsed().as_nanos() as u64;
+            super::LG_COPY_OUT_NS.fetch_add(copy_out_ns, std::sync::atomic::Ordering::Relaxed);
 
             Ok(())
         }

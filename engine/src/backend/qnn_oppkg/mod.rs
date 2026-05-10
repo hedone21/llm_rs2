@@ -68,6 +68,19 @@ pub struct QnnOppkgBackend {
     /// OpenCL secondary backend (fallback 위임 대상). 없으면 fallback method
     /// 호출 시 명확한 panic.
     fallback_backend: Mutex<Option<Arc<dyn Backend>>>,
+    /// Phase C perf 측정 — execute_layer_graph 호출 수 (28-layer 모두 fast path
+    /// 활성 시 = 28 × decode_steps).
+    exec_calls: AtomicU64,
+    /// Phase C — fast path bridge read 누적 (3 read_buffer per call: x + kv_k + kv_v).
+    bridge_read_ns: AtomicU64,
+    /// Phase C — bridge_read 분해: x (small ~6KB), kv_k (large ~1MB), kv_v (large ~1MB).
+    bridge_read_x_ns: AtomicU64,
+    bridge_read_kv_k_ns: AtomicU64,
+    bridge_read_kv_v_ns: AtomicU64,
+    /// Phase C — fast path graph execute 누적 (lg.execute, QNN GPU 실행).
+    graph_exec_ns: AtomicU64,
+    /// Phase C — fast path bridge write 누적 (3 write_buffer per call).
+    bridge_write_ns: AtomicU64,
 }
 
 impl QnnOppkgBackend {
@@ -91,6 +104,13 @@ impl QnnOppkgBackend {
             args_prebuild,
             fallback_call_count: AtomicU64::new(0),
             fallback_backend: Mutex::new(None),
+            exec_calls: AtomicU64::new(0),
+            bridge_read_ns: AtomicU64::new(0),
+            bridge_read_x_ns: AtomicU64::new(0),
+            bridge_read_kv_k_ns: AtomicU64::new(0),
+            bridge_read_kv_v_ns: AtomicU64::new(0),
+            graph_exec_ns: AtomicU64::new(0),
+            bridge_write_ns: AtomicU64::new(0),
         })
     }
 
@@ -159,6 +179,72 @@ impl QnnOppkgBackend {
         layer_idx: usize,
     ) -> Option<Arc<self::layer_graph::LayerGraph>> {
         self.graph_cache.lock().ok().and_then(|c| c.get(layer_idx))
+    }
+}
+
+impl Drop for QnnOppkgBackend {
+    fn drop(&mut self) {
+        let calls = self.exec_calls.load(Ordering::Relaxed);
+        if calls == 0 {
+            return;
+        }
+        let r = self.bridge_read_ns.load(Ordering::Relaxed) as f64;
+        let e = self.graph_exec_ns.load(Ordering::Relaxed) as f64;
+        let w = self.bridge_write_ns.load(Ordering::Relaxed) as f64;
+        let total = r + e + w;
+        let calls_f = calls as f64;
+        eprintln!(
+            "[qnn_oppkg-timing] fast_path_calls={} fallback_calls={} | total={:.1}ms | \
+             bridge_read={:.1}ms ({:.0}%, {:.0}μs/call) graph_exec={:.1}ms ({:.0}%, {:.0}μs/call) \
+             bridge_write={:.1}ms ({:.0}%, {:.0}μs/call)",
+            calls,
+            self.fallback_call_count.load(Ordering::Relaxed),
+            total / 1e6,
+            r / 1e6,
+            100.0 * r / total,
+            r / calls_f / 1e3,
+            e / 1e6,
+            100.0 * e / total,
+            e / calls_f / 1e3,
+            w / 1e6,
+            100.0 * w / total,
+            w / calls_f / 1e3,
+        );
+        // bridge_read 분해: x (small) vs kv_k (large) vs kv_v (large).
+        let rx = self.bridge_read_x_ns.load(Ordering::Relaxed) as f64;
+        let rkk = self.bridge_read_kv_k_ns.load(Ordering::Relaxed) as f64;
+        let rkv = self.bridge_read_kv_v_ns.load(Ordering::Relaxed) as f64;
+        eprintln!(
+            "[qnn_oppkg-timing-rd] bridge_read_x={:.1}ms ({:.0}μs/call) \
+             bridge_read_kv_k={:.1}ms ({:.0}μs/call) bridge_read_kv_v={:.1}ms ({:.0}μs/call)",
+            rx / 1e6,
+            rx / calls_f / 1e3,
+            rkk / 1e6,
+            rkk / calls_f / 1e3,
+            rkv / 1e6,
+            rkv / calls_f / 1e3,
+        );
+        // lg.execute 내부 breakdown — graph_exec 1561μs/call이 어디서 오는지.
+        let ci = self::layer_graph::LG_COPY_IN_NS.load(Ordering::Relaxed) as f64;
+        let ep = self::layer_graph::LG_EXEC_PURE_NS.load(Ordering::Relaxed) as f64;
+        let co = self::layer_graph::LG_COPY_OUT_NS.load(Ordering::Relaxed) as f64;
+        let lg_total = ci + ep + co;
+        if lg_total > 0.0 {
+            eprintln!(
+                "[qnn_oppkg-timing-lg] copy_in={:.1}ms ({:.0}%, {:.0}μs/call) \
+                 graphExecute_pure={:.1}ms ({:.0}%, {:.0}μs/call) \
+                 copy_out={:.1}ms ({:.0}%, {:.0}μs/call)",
+                ci / 1e6,
+                100.0 * ci / lg_total,
+                ci / calls_f / 1e3,
+                ep / 1e6,
+                100.0 * ep / lg_total,
+                ep / calls_f / 1e3,
+                co / 1e6,
+                100.0 * co / lg_total,
+                co / calls_f / 1e3,
+            );
+        }
     }
 }
 
@@ -305,13 +391,24 @@ impl Backend for QnnOppkgBackend {
             anyhow!("execute_layer_graph: fallback backend (OpenCL secondary) 미설정")
         })?;
 
+        let t_read = std::time::Instant::now();
+        let t_x = std::time::Instant::now();
         let mut x_bytes = vec![0u8; x.size()];
         fb.read_buffer(x, &mut x_bytes)?;
+        let x_ns = t_x.elapsed().as_nanos() as u64;
+        let t_kk = std::time::Instant::now();
         let mut kv_k_bytes = vec![0u8; kv_cache_k.size()];
         fb.read_buffer(kv_cache_k, &mut kv_k_bytes)?;
+        let kk_ns = t_kk.elapsed().as_nanos() as u64;
+        let t_kv = std::time::Instant::now();
         let mut kv_v_bytes = vec![0u8; kv_cache_v.size()];
         fb.read_buffer(kv_cache_v, &mut kv_v_bytes)?;
+        let kv_ns = t_kv.elapsed().as_nanos() as u64;
         let mut x_out_bytes = vec![0u8; x_out.size()];
+        let read_ns = t_read.elapsed().as_nanos() as u64;
+        self.bridge_read_x_ns.fetch_add(x_ns, Ordering::Relaxed);
+        self.bridge_read_kv_k_ns.fetch_add(kk_ns, Ordering::Relaxed);
+        self.bridge_read_kv_v_ns.fetch_add(kv_ns, Ordering::Relaxed);
 
         // D-D.6 디버깅: OpenCL secondary와 QNN GPU 사이 GPU state 간섭 가능성
         // 검증 — read_buffer (blocking) 후에도 OpenCL queue가 GPU에서 fully
@@ -385,6 +482,7 @@ impl Backend for QnnOppkgBackend {
         // mask: graph 내부 rpcmem buffer 사용 (M3.4 시점은 빈 slice).
         let empty_mask: &[u8] = &[];
 
+        let t_exec = std::time::Instant::now();
         lg.execute(
             self.runtime.as_ref(),
             &x_bytes,
@@ -395,6 +493,7 @@ impl Backend for QnnOppkgBackend {
             empty_mask,
             &mut x_out_bytes,
         )?;
+        let exec_ns = t_exec.elapsed().as_nanos() as u64;
 
         // D-D.6 디버깅: graph execute 후 x_out도 production reference로 dump.
         if layer_idx == 0
@@ -422,9 +521,16 @@ impl Backend for QnnOppkgBackend {
         }
 
         // graph rpcmem → OpenCL cl_mem write back.
+        let t_write = std::time::Instant::now();
         fb.write_buffer(x_out, &x_out_bytes)?;
         fb.write_buffer(kv_cache_k, &kv_k_bytes)?;
         fb.write_buffer(kv_cache_v, &kv_v_bytes)?;
+        let write_ns = t_write.elapsed().as_nanos() as u64;
+
+        self.exec_calls.fetch_add(1, Ordering::Relaxed);
+        self.bridge_read_ns.fetch_add(read_ns, Ordering::Relaxed);
+        self.graph_exec_ns.fetch_add(exec_ns, Ordering::Relaxed);
+        self.bridge_write_ns.fetch_add(write_ns, Ordering::Relaxed);
         Ok(())
     }
 
