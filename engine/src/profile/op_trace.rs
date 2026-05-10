@@ -72,7 +72,7 @@ pub fn enabled() -> bool {
 /// the sync-mode trace captures only ~78% of TBT for the Mixed config,
 /// so the gap must live in non-`forward_gen` regions.
 #[repr(usize)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OpKind {
     RmsNormAttn = 0,
     MatmulQkv = 1,
@@ -91,6 +91,42 @@ pub enum OpKind {
     FinalNorm = 12,
     /// Final `lm_head` matmul (vocab × hidden). Major suspect in Sprint E.
     LmHead = 13,
+}
+
+/// DDR-bandwidth phase classification for phase-aware async swap (LISWAP-5 / B).
+/// Phase R 측정 (qnn_phase_r_summary.md §5)에 따른 분류.
+///
+/// `DdrHeavy`: weight matmul 등 DDR을 많이 쓰는 op. swap 메모리 트래픽과 contention.
+/// `CacheFit`: weight 작거나 L2 fit. swap 트래픽과 거의 무간섭 (Phase R Scenario B에서 1.04× of max).
+/// `Medium`: attention 등. partial overlap. 보수적으로 swap 회피.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DdrPhase {
+    Heavy,
+    CacheFit,
+    Medium,
+}
+
+impl OpKind {
+    /// Static op → DDR phase mapping. Production 5-run 측정에서 phase별 per-layer
+    /// wall-clock variance CV < 2% (확정적 schedule 가능).
+    #[inline]
+    pub const fn ddr_phase(self) -> DdrPhase {
+        match self {
+            OpKind::RmsNormAttn
+            | OpKind::RmsNormFfn
+            | OpKind::Rope
+            | OpKind::KvUpdate
+            | OpKind::AddAssign => DdrPhase::CacheFit,
+            OpKind::MatmulQkv
+            | OpKind::MatmulWo
+            | OpKind::MatmulFfnGateUp
+            | OpKind::MatmulFfnDown
+            | OpKind::LmHead => DdrPhase::Heavy,
+            OpKind::Attention | OpKind::SiluMul | OpKind::Embedding | OpKind::FinalNorm => {
+                DdrPhase::Medium
+            }
+        }
+    }
 }
 
 const N_OPS: usize = 14;
