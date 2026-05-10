@@ -294,6 +294,70 @@ hide의 전제 조건은:
 
 ---
 
+## 7.6 Fair comparison — single-shot in decode + per-tick + phase-aware (2026-05-10 결정적 finding)
+
+이전 §6, §7, §7.5 측정의 single-shot은 **prefill 전 swap** (`generate.rs:2752` 주석: "Applied once before generation starts"). 이는 production async swap baseline과 다름. fair한 비교는 셋 다 **decode 도중 swap**.
+
+### 7.6.1 측정 setup
+- KV 1.8k (prompt_1800.txt 1821 token), n=20, 3 run
+- prefill은 셋 다 F16 (swap 후 decode 진입)
+- (a) `--swap-incremental-per-tick 25` (LISWAP-1, 1 tick에 모든 layer = "single-shot in decode")
+- (b) `--swap-incremental-per-tick 1` (LISWAP-1 per-token-per-layer)
+- (c) `--swap-phase-aware` (LISWAP-5)
+
+### 7.6.2 결과 (KV 1.8k, n=20)
+
+| 모드 | Prefill_pure | TTFT | tok[0] | Decode tail (excl tok0) | Decode all |
+|---|---:|---:|---:|---:|---:|
+| **per-tick=25** (single in decode) | 12172~13038 | 12296~13164 | **65~72** | **44~47** (= Q4 baseline) | 45.2~47.8 |
+| **per-tick=1** (LISWAP-1) | 12996~13352 | 13115~13476 | 71.5~71.8 | **62.2~62.4** (+15 vs Q4) | 62.7~62.9 |
+| **phase-aware** (LISWAP-5) | 13010~13404 | 13133~13527 | **347~353** | **77.7~78.2** (+30 vs Q4) | 92.0~92.7 |
+
+(Q4 baseline: tok[0]=49.6, tail=47.4; F16 baseline: tail=71.1)
+
+### 7.6.3 결정적 finding — 분산이 항상 비효율적
+
+| Metric | per-tick=25 | per-tick=1 | phase-aware | 우열 |
+|---|---:|---:|---:|---|
+| tok[0] | 65 ms | 72 ms | **347 ms** | phase-aware **5×** 느림 |
+| Decode tail | 45 ms (=Q4) | 62 ms | **78 ms** | phase-aware 최악 |
+| E2E (n=20) | **13359 ms** | 14493 ms | **15076 ms** | phase-aware **+1717 ms** |
+
+**해석**:
+- **per-tick=25 (single-shot in decode)**: token 0에 25 layer 모두 swap → 65 ms blocking → token 1+는 정상 Q4 (Q4 baseline 47에 정확히 도달)
+- **per-tick=1**: token 0~18에 layer 1개씩 swap → tail 62 ms (각 token에 1 layer swap +15 ms)
+- **phase-aware**: chunk 분산이지만 매 token에 chunk dispatch 잔류 → tail +30 ms × 18 = 540 ms 추가
+
+### 7.6.4 왜 분산이 비효율적인가
+
+phase-aware의 core 가설 ("chunk을 분산하면 forward와 overlap 가능") **실측 무효**. 분산이 추가 cost를 4가지 방식으로 누적:
+
+1. **Batching loss**: 한 번에 swap (per-tick=25)은 driver가 큰 contiguous transfer로 batch. 분산은 매번 separate enqueue.
+2. **Enqueue overhead**: 225 chunks → 225 OpenCL API call. per-tick=25는 25 layer commit으로 끝. **9× 더 적은 API call**.
+3. **SOA rebuild repeat**: 매 swap commit마다 ratio_generation bump + invalidate → 다음 forward에서 lazy rebuild 비용 반복.
+4. **Driver scheduler overhead**: chunk-by-chunk가 forward kernel과 같은 OpenCL queue 경합 → 매 phase에 reschedule.
+
+→ Phase R microbench (1.04× of max) 가정 ("hide ratio 96%")은 **production에서 깨짐**. 실측 hide ratio = 0% (분산이 forward와 overlap 안 함).
+
+### 7.6.5 결론 — Phase-aware의 핵심 가설 무효
+
+기존 §7 결론은 "phase-aware가 KV 1.8k short response에서 win"이었지만, 이는 **single-shot이 prefill 전 swap이라는 unfair baseline** 때문에 그랬음. fair comparison에서는:
+
+- **Single-shot in decode (per-tick=25)가 모든 metric에서 최적**
+- **분산할수록 비효율적 — phase-aware가 worst**
+- v2 sub-tensor chunking은 **chunk 수를 늘리면 더 비효율적**일 가능성. 가설 재검토 필요
+
+### 7.6.6 v2 plan 재검토
+
+§7.5 / §8 의 v2 priority 일부 무효:
+- ~~Sub-tensor chunking (§8 P2)~~: chunk 수 증가 → enqueue overhead + scheduler 경합 증가. **drop 또는 신중 검토**
+- 새 방향: 분산이 비효율적이면 phase-aware 자체 폐기 후 production async swap (manager signal trigger) baseline 채택?
+- 또는 phase-aware가 **분산 자체**가 아니라 **swap timing의 deterministic 예측**에 가치 → 단순한 "decode token 0에 single-shot"으로 충분 (per-tick=25)
+
+→ **LISWAP-5 design 자체 의미 재검토 필요**.
+
+---
+
 ## 7.5 KV context size 영향 분석 (2026-05-10 추가)
 
 질문: KV가 길수록 attention DDR-heavy phase가 늘어나 cache-fit phase 사이 간격이 벌어지면 swap chunk hide가 잘 될까?
@@ -445,4 +509,7 @@ v1은 hide ratio 측정 못 했음 (chunk dispatch wall-clock 분리 unavailable
 
 **End of postmortem**
 
-핵심 한 줄 (2026-05-10 final, deep dive 후 수정): **v1은 functional이지만 hide 효과 거의 없음. swap이 forward와 overlap되지 않고 (1) prefill F16으로 강제 +119 ms (2) tok[0]에 blocking +295 ms 형태로 청구. Decode tail (token 3~)는 Q4 baseline에 거의 회복 (+1.2 ms). E2E는 모든 n에서 single-shot 대비 +375~603 ms 손해. TTFT -130~272 ms 단축은 streaming UX에서만 의미. v2는 (a) prefill phase swap (b) sub-tensor chunking (c) background pre-staging 필수. crossover n=13 가설 무효 — 모든 n에서 phase-aware E2E 손해.**
+핵심 한 줄 (2026-05-10 final, fair comparison 후 전면 수정 §7.6):
+**Phase-aware의 core 가설 ("분산 → forward와 overlap") 실측 무효. Fair comparison (셋 다 decode 중 swap) — KV 1.8k n=20에서 per-tick=25 (single-shot in decode) 13359 ms < per-tick=1 14493 ms < phase-aware 15076 ms. tok[0] 65 vs 72 vs 347 ms (phase-aware 5×). Decode tail 45 (=Q4) vs 62 vs 78 ms. 분산이 항상 비효율적 — batching loss + enqueue overhead 9× + SOA rebuild 반복 + queue 경합. v2 sub-chunking은 chunk 수 더 늘려 더 악화 가능. LISWAP-5 design 자체 의미 재검토 필요.**
+
+이전 분석 ($7.5 KV reversal "n<37에서 PA win") 은 single-shot baseline이 prefill 전 swap이었기 때문 (unfair). fair한 baseline (per-tick=25)에서는 phase-aware가 모든 KV에서 worst.
