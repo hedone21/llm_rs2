@@ -1137,6 +1137,22 @@ impl<'a> SwapExecutor<'a> {
         let SecondaryMmap::Rpcmem(rpc) = secondary.as_ref() else {
             return Ok(None);
         };
+
+        // LISWAP-6 Phase 1 — fast path: pre-built alias from the eager
+        // prefault populates the (layer, subname) cache. Cache hits skip
+        // both `ensure_layer_loaded` and `clCreateBuffer(USE_HOST_PTR)`.
+        if let Some(alias_buf) = rpc.cached_alias(layer_idx, subname) {
+            debug_assert_eq!(alias_buf.size(), info.len, "cached alias length mismatch");
+            debug_assert_eq!(alias_buf.dtype(), info.dtype, "cached alias dtype mismatch");
+            return Ok(Some(Tensor::new(
+                shape.clone(),
+                alias_buf,
+                Arc::clone(&self.backend),
+            )));
+        }
+
+        // Fallback: cache miss (norm tensors / non-prefaulted layers / store
+        // constructed without backend). Allocate one cl_mem alias on demand.
         let entry = rpc.host_ptr_for(layer_idx, subname).map_err(|e| {
             SwapError::BufferAllocationFailed {
                 layer: layer_idx,

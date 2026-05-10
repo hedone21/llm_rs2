@@ -249,7 +249,14 @@ impl TransformerModel {
                     &backend,
                 )
                 .map_err(|e| anyhow!("secondary weight load failed: {e}"))?;
-                Some(Arc::new(handle))
+                let arc = Arc::new(handle);
+                // LISWAP-6 Phase 1 — install self-Weak so the Rpcmem store
+                // can populate the cl_mem alias cache eagerly inside
+                // `ensure_layer_loaded`. Other variants ignore the call.
+                if let crate::models::weights::SecondaryMmap::Rpcmem(rpc) = arc.as_ref() {
+                    rpc.install_self_arc(&arc);
+                }
+                Some(arc)
             }
         };
         let mut model =

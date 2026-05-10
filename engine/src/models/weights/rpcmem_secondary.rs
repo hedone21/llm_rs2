@@ -34,13 +34,15 @@
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use crate::core::buffer::DType;
+use crate::core::backend::Backend;
+use crate::core::buffer::{Buffer, DType};
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::GgufFile;
 #[cfg(target_os = "android")]
 use crate::models::loader::gguf::{ggml_type_to_dtype, tensor_byte_size};
+use crate::models::weights::SecondaryMmap;
 #[cfg(target_os = "android")]
 use crate::models::weights::secondary_mmap::parse_block_tensor_name;
 use crate::models::weights::secondary_mmap::{LayerTensorSlice, SecondaryTensorInfo};
@@ -128,6 +130,27 @@ pub struct RpcmemSecondaryStore {
     /// Per-layer rpcmem region cache. `Mutex` synchronises concurrent
     /// `ensure_layer_loaded` calls; lookups are O(1) once allocated.
     layer_regions: Mutex<HashMap<usize, Arc<RpcmemLayerRegion>>>,
+    /// LISWAP-6 Phase 1 — pre-built `cl_mem` aliases keyed by `(layer, subname)`.
+    /// Populated eagerly inside `ensure_layer_loaded` when both `backend_weak`
+    /// and `self_weak` are installed. Subsequent `cached_alias()` lookups
+    /// return the cached `Arc<dyn Buffer>` without going through the
+    /// ~4.5 ms `clCreateBuffer(USE_HOST_PTR)` path.
+    ///
+    /// Cycle break: `RpcmemAliasBuffer` holds `Weak<SecondaryMmap>` (not
+    /// strong) so this strong cache does not pin the enclosing
+    /// `Arc<SecondaryMmap>` against itself. The graph drops as one when the
+    /// model releases its `Arc<SecondaryMmap>`.
+    alias_cache: Mutex<HashMap<(usize, String), Arc<dyn Buffer>>>,
+    /// Backend used to create alias `cl_mem` handles. Weak so the model can
+    /// release the backend independently; if the upgrade fails at populate
+    /// time we silently skip caching (the swap path then falls back to the
+    /// direct `alloc_alias_weight_buffer` call, preserving correctness).
+    backend_weak: Mutex<Option<Weak<dyn Backend>>>,
+    /// Weak self-reference back to the enclosing `Arc<SecondaryMmap>`. Set
+    /// once via `install_self_arc` immediately after wrapping the store.
+    /// The cached `RpcmemAliasBuffer` instances upgrade this to install
+    /// their `Weak<SecondaryMmap>` lifetime back-reference.
+    self_weak: OnceLock<Weak<SecondaryMmap>>,
     /// rpcmem alloc/free fn-pointers from the QNN runtime.
     /// Android-only — host targets cannot construct this store.
     #[cfg(target_os = "android")]
@@ -145,6 +168,10 @@ impl std::fmt::Debug for RpcmemSecondaryStore {
                 "regions_loaded",
                 &self.layer_regions.lock().map(|m| m.len()).unwrap_or(0),
             )
+            .field(
+                "aliases_cached",
+                &self.alias_cache.lock().map(|m| m.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -160,11 +187,12 @@ impl RpcmemSecondaryStore {
         path: &std::path::Path,
         primary_config: &ModelConfig,
         primary_gguf: &GgufFile,
+        backend: Arc<dyn Backend>,
         #[cfg(target_os = "android")] qnn_runtime_rpcmem_fns: (RpcmemAllocFn, RpcmemFreeFn),
     ) -> Result<Self> {
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (path, primary_config, primary_gguf);
+            let _ = (path, primary_config, primary_gguf, backend);
             Err(anyhow!(
                 "RpcmemSecondaryStore is Android-only (rpcmem heap unavailable on host targets)"
             ))
@@ -241,9 +269,116 @@ impl RpcmemSecondaryStore {
                 source_path: path.to_path_buf(),
                 layer_index,
                 layer_regions: Mutex::new(HashMap::new()),
+                alias_cache: Mutex::new(HashMap::new()),
+                backend_weak: Mutex::new(Some(Arc::downgrade(&backend))),
+                self_weak: OnceLock::new(),
                 rpcmem_alloc,
                 rpcmem_free,
             })
+        }
+    }
+
+    /// Install the enclosing `Arc<SecondaryMmap>` as a weak self-reference.
+    /// Called by `open_secondary_with_backend` immediately after wrapping
+    /// the store in `Arc::new(SecondaryMmap::Rpcmem(...))`. Idempotent —
+    /// subsequent calls are silent no-ops (`OnceLock::set` returns Err).
+    ///
+    /// Without this, `ensure_layer_loaded` cannot populate the alias cache
+    /// (the `RpcmemAliasBuffer` constructor needs an `Arc<SecondaryMmap>`
+    /// to downgrade). The swap path then falls back to direct
+    /// `alloc_alias_weight_buffer` calls, preserving correctness at the cost
+    /// of the per-chunk overhead the cache was built to eliminate.
+    pub fn install_self_arc(&self, secondary: &Arc<SecondaryMmap>) {
+        let _ = self.self_weak.set(Arc::downgrade(secondary));
+    }
+
+    /// Look up a pre-built alias by `(layer, subname)`. Returns `None` if the
+    /// layer was never prefaulted, the tensor isn't in this layer, or the
+    /// store was constructed without a backend.
+    pub fn cached_alias(&self, layer_idx: usize, subname: &str) -> Option<Arc<dyn Buffer>> {
+        let cache = self.alias_cache.lock().ok()?;
+        cache.get(&(layer_idx, subname.to_string())).cloned()
+    }
+
+    /// Diagnostic — current size of the alias cache (used by the eager
+    /// prefault log line in `generate.rs`).
+    pub fn alias_cache_len(&self) -> usize {
+        self.alias_cache.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Eagerly populate `alias_cache` for `layer_idx` after the rpcmem
+    /// region has been allocated. Silent no-op when prerequisites are
+    /// missing (no backend / no self_weak / non-OpenCL backend) — the swap
+    /// path falls back to direct allocation in that case.
+    fn populate_alias_cache_for_layer(&self, layer_idx: usize, region: &Arc<RpcmemLayerRegion>) {
+        // Both prerequisites must be installed; otherwise skip caching.
+        let Some(secondary_arc) = self.self_weak.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let Some(backend) = self
+            .backend_weak
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(Weak::upgrade))
+        else {
+            return;
+        };
+
+        // Snapshot tensor entries (stable iteration; no lock during alloc).
+        let entries: Vec<(String, *mut u8, usize, usize, DType)> = {
+            let mut v: Vec<_> = region
+                .tensor_map
+                .iter()
+                .map(|(name, &(offset, len, dtype))| {
+                    (name.clone(), region.host_ptr, offset, len, dtype)
+                })
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+
+        let mut new_entries: Vec<((usize, String), Arc<dyn Buffer>)> =
+            Vec::with_capacity(entries.len());
+        for (subname, host_ptr, offset, len, dtype) in entries {
+            #[cfg(feature = "opencl")]
+            {
+                let alloc_res = backend.alloc_alias_weight_buffer(
+                    host_ptr,
+                    offset,
+                    len,
+                    dtype,
+                    Arc::clone(&secondary_arc),
+                    Arc::clone(region),
+                );
+                match alloc_res {
+                    Ok(Some(buf)) => {
+                        new_entries.push(((layer_idx, subname), buf));
+                    }
+                    Ok(None) => {
+                        // Backend declined (CPU, non-OpenCL, etc.) — leave the
+                        // (layer, subname) entry uncached; swap path falls back.
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[liswap6] alias cache populate failed (layer={layer_idx}, \
+                             subname='{subname}'): {e} — fallback path will allocate at swap time"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(feature = "opencl"))]
+            {
+                let _ = (host_ptr, offset, len, dtype, &subname, &backend);
+            }
+        }
+
+        if new_entries.is_empty() {
+            return;
+        }
+        if let Ok(mut cache) = self.alias_cache.lock() {
+            for (key, buf) in new_entries {
+                cache.entry(key).or_insert(buf);
+            }
         }
     }
 
@@ -292,13 +427,24 @@ impl RpcmemSecondaryStore {
         // proceed. We re-acquire after the build to insert.
         let region = self.build_layer_region(layer_idx)?;
 
-        let mut regions = self
-            .layer_regions
-            .lock()
-            .map_err(|_| anyhow!("rpcmem_secondary: layer_regions mutex poisoned"))?;
-        // Race: another thread may have built the same layer concurrently.
-        // Use entry() to keep the existing one and discard ours.
-        Ok(regions.entry(layer_idx).or_insert(region).clone())
+        let installed = {
+            let mut regions = self
+                .layer_regions
+                .lock()
+                .map_err(|_| anyhow!("rpcmem_secondary: layer_regions mutex poisoned"))?;
+            // Race: another thread may have built the same layer concurrently.
+            // Use entry() to keep the existing one and discard ours.
+            regions.entry(layer_idx).or_insert(region).clone()
+        };
+
+        // LISWAP-6 Phase 1 — eagerly create cl_mem aliases for every tensor
+        // in this layer so the swap path's `cached_alias` lookup hits without
+        // paying ~4.5 ms per `clCreateBuffer(USE_HOST_PTR)`. Idempotent: a
+        // second prefault for the same layer hits a region cache + finds the
+        // alias entries already present (entry().or_insert keeps the first).
+        self.populate_alias_cache_for_layer(layer_idx, &installed);
+
+        Ok(installed)
     }
 
     /// Resolve a tensor's host_ptr + offset + len + dtype, allocating the

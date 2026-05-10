@@ -966,6 +966,28 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     swap_phase_aware_chunk_mb: usize,
 
+    /// Phase-aware swap throttle — token당 dispatch chunk 수 상한.
+    /// 0 = 무제한 (현재 동작 유지, 252 chunks가 첫 3 token에 누적).
+    /// N>0 = 매 token N chunks까지만 → 분산을 더 길게 펼쳐 max-stall 단축.
+    /// Sweep 측정용 (Phase 2): K = {1,2,4,8,16}.
+    #[arg(long, default_value_t = 0)]
+    swap_phase_aware_max_chunks_per_token: usize,
+
+    /// LISWAP Phase 3 — defer force-swap trigger to decode token N (mid-decode).
+    ///
+    /// 0 (default) = no delay (swap fires right after prefill, current behavior).
+    /// N > 0       = first N decode tokens run on the primary weight, then the
+    ///               force-swap trigger (single-shot `run_layer_swap`,
+    ///               incremental plan commit, intra-forward hook commit, or
+    ///               phase-aware dispatcher arm) fires at the start of token N.
+    ///
+    /// `prefault_layers` (eager pre-warm) is always executed at prefill end
+    /// regardless of this flag — only the actual swap dispatch is deferred.
+    ///
+    /// Requires `--force-swap-ratio` to be set; otherwise ignored.
+    #[arg(long, default_value_t = 0)]
+    swap_delay_tokens: usize,
+
     // ── QNN OpPackage backend (M3, ENG-QNN-220) ─────────────────
     /// Eager prebuild of all 28 layer graphs at model load time
     /// (ENG-QNN-209, D1 결정).
@@ -1050,7 +1072,9 @@ fn main() -> anyhow::Result<()> {
              (b) --swap-intra-forward=true                                     (LISWAP-4)\n\
              (c) --swap-phase-aware=true                                       (LISWAP-5)\n\
              (d) (none)                                                        (single-shot)",
-            args.swap_incremental_per_tick, args.swap_intra_forward, args.swap_phase_aware
+            args.swap_incremental_per_tick,
+            args.swap_intra_forward,
+            args.swap_phase_aware
         );
     }
     // Configure Rayon thread pool: 0 = auto-detect CPU cores
@@ -2859,6 +2883,171 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // LISWAP Phase 3 — pending mid-decode trigger payload.
+    // When `--swap-delay-tokens N > 0` AND `--force-swap-ratio` is set, the
+    // trigger logic is deferred from prefill end to decode token N. We capture
+    // (ratio, target_layers) here and re-run the dispatch block at the loop
+    // head when `decode_token_index == swap_delay_tokens`.
+    let mut pending_force_swap: Option<(f32, Vec<usize>)> = None;
+
+    // ── LISWAP Phase 3 dispatch macro ────────────────────────────────────────
+    // Identical force-swap dispatch logic invoked from two callsites:
+    //   (a) prefill end (when --swap-delay-tokens == 0, default — original
+    //       behavior, must preserve baseline wall ±5 ms),
+    //   (b) decode loop head (when --swap-delay-tokens > 0, mid-decode trigger).
+    //
+    // The macro relies on hygienic name capture of the surrounding `main`'s
+    // mutable state (model, backend, gpu_backend_arc, cpu_backend_arc,
+    // host_ptr_swap_pool, intra_forward_swap_hook, incremental_force_swap_plan,
+    // phase_aware_swap_dispatcher, is_gpu, args). Inputs are bound by the macro
+    // arms: $ratio = clamped force ratio, $target_layers = Vec<usize> resolved
+    // from `uniform_target_layers`. Both callsites pre-compute these before
+    // expanding the macro.
+    macro_rules! dispatch_force_swap {
+        ($ratio:expr, $target_layers:expr) => {{
+            let ratio: f32 = $ratio;
+            let target_layers: Vec<usize> = $target_layers;
+            let num_layers = model.layers.len();
+            if args.swap_phase_aware {
+                let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| cpu_backend_arc.clone());
+                let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                    Arc::clone(&swap_backend),
+                ));
+                let secondary = match model.secondary_mmap.as_ref() {
+                    Some(s) => Arc::clone(s),
+                    None => {
+                        anyhow::bail!(
+                            "--swap-phase-aware requires --secondary-gguf (no secondary mmap available)"
+                        );
+                    }
+                };
+                let config = Arc::new(model.config.clone());
+                let chunk_size_bytes = args.swap_phase_aware_chunk_mb.max(1) * 1_048_576;
+                eprintln!(
+                    "weight_swap: phase-aware mode — ratio={:.2}, {} target layers, chunk_size={} MB (LISWAP-5)",
+                    ratio,
+                    target_layers.len(),
+                    args.swap_phase_aware_chunk_mb
+                );
+                let phase_dispatcher = llm_rs2::models::weights::PhaseAwareSwapDispatcher::new(
+                    chunk_size_bytes,
+                    model.layers.clone(),
+                    secondary,
+                    swap_backend,
+                    dispatcher,
+                    DType::Q4_0,
+                    config,
+                );
+                // LISWAP Phase 4: install weak self-ref so the worker thread can
+                // call back into try_dispatch_chunk_worker via ChunkDispatchJob.
+                phase_dispatcher.install_self_weak();
+                phase_dispatcher.commit_plan(&target_layers);
+                phase_dispatcher
+                    .set_max_chunks_per_token(args.swap_phase_aware_max_chunks_per_token);
+                if args.swap_phase_aware_max_chunks_per_token > 0 {
+                    eprintln!(
+                        "weight_swap: phase-aware throttle — max {} chunks/token",
+                        args.swap_phase_aware_max_chunks_per_token
+                    );
+                }
+                llm_rs2::profile::op_trace::set_phase_hook(
+                    phase_dispatcher.clone() as Arc<dyn llm_rs2::profile::op_trace::PhaseHook>
+                );
+                phase_aware_swap_dispatcher = Some(phase_dispatcher);
+            } else if args.swap_intra_forward {
+                let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| cpu_backend_arc.clone());
+                let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                    Arc::clone(&swap_backend),
+                ));
+                let secondary = match model.secondary_mmap.as_ref() {
+                    Some(s) => Arc::clone(s),
+                    None => {
+                        anyhow::bail!(
+                            "--swap-intra-forward requires --secondary-gguf (no secondary mmap available)"
+                        );
+                    }
+                };
+                let config = Arc::new(model.config.clone());
+                eprintln!(
+                    "weight_swap: intra-forward mode — ratio={:.2}, {} target layers (LISWAP-4)",
+                    ratio,
+                    target_layers.len()
+                );
+                intra_forward_swap_hook = Some(llm_rs2::models::weights::IntraForwardSwapHook::new(
+                    target_layers,
+                    0,
+                    dispatcher,
+                    secondary,
+                    model.layers.clone(),
+                    swap_backend,
+                    Some(Arc::clone(&model.release_worker)),
+                    DType::Q4_0,
+                    config,
+                ));
+            } else if args.swap_incremental_per_tick > 0 {
+                eprintln!(
+                    "weight_swap: incremental mode — ratio={:.2}, {} target layers, per_tick={} ({} ticks estimated)",
+                    ratio,
+                    target_layers.len(),
+                    args.swap_incremental_per_tick,
+                    target_layers.len().div_ceil(args.swap_incremental_per_tick),
+                );
+                incremental_force_swap_plan = Some(llm_rs2::models::weights::IncrementalSwapPlan::new(
+                    target_layers,
+                    args.swap_incremental_per_tick,
+                    0,
+                ));
+            } else {
+                match run_layer_swap(
+                    &model,
+                    &target_layers,
+                    gpu_backend_arc.as_ref(),
+                    &cpu_backend_arc,
+                    None,
+                    #[cfg(feature = "opencl")]
+                    host_ptr_swap_pool.clone(),
+                ) {
+                    Ok(report) => {
+                        eprintln!(
+                            "weight_swap: force ratio={:.2}, swapped {}/{} layers in {:.1}ms",
+                            ratio,
+                            report.swapped.len(),
+                            num_layers,
+                            report.latency_ms,
+                        );
+                        if let Some(ref stages) = report.stage_breakdown {
+                            eprintln!("weight_swap stages: {}", stages.to_log_line());
+                        }
+                        #[cfg(feature = "opencl")]
+                        if let Some(ocl_be) = backend
+                            .as_any()
+                            .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                        {
+                            ocl_be.dump_cl_mem_diagnostics(" stage=after_force_swap");
+                        }
+                        #[cfg(feature = "opencl")]
+                        remap_weights_for_cpu_after_swap(
+                            &mut model,
+                            &backend,
+                            is_gpu,
+                            args.resilience_prealloc_switch,
+                            "force-swap",
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!("--force-swap-ratio: swap failed: {}", e);
+                    }
+                }
+            }
+        }};
+    }
+
     if args.qcf_dump.is_none()
         && let Some(ratio) = args.force_swap_ratio
     {
@@ -2873,170 +3062,59 @@ fn main() -> anyhow::Result<()> {
         // Gguf/Auf variant 는 madvise() 만 호출되어 비용 작음 (~65 ms).
         // 모든 swap mode (single-shot/incremental/intra-forward/phase-aware)
         // 가 자동 이득. swap blocking 700 → ~280 ms 단축 (60%).
+        //
+        // Phase 3 (`--swap-delay-tokens > 0`): prefault ALWAYS runs at prefill
+        // end — only the actual swap dispatch is deferred. This preserves the
+        // delay=0 baseline wall (~405 ms LISWAP-6 alias) and ensures rpcmem
+        // pages are warm regardless of when the trigger fires.
         if !target_layers.is_empty()
             && let Some(secondary) = model.secondary_mmap.as_ref()
         {
             let t_pre = std::time::Instant::now();
             secondary.prefault_layers(&target_layers);
-            eprintln!(
-                "weight_swap: eager prefault — {} target layers, {:.1}ms",
-                target_layers.len(),
-                t_pre.elapsed().as_secs_f64() * 1e3,
-            );
+            // LISWAP-6 Phase 1 — Rpcmem variant also primes per-tensor
+            // cl_mem aliases inside `ensure_layer_loaded`. Surface the cache
+            // size alongside the wall-clock prefault cost so regressions in
+            // either step are visible at startup.
+            let alias_cache_len = match secondary.as_ref() {
+                llm_rs2::models::weights::SecondaryMmap::Rpcmem(rpc) => Some(rpc.alias_cache_len()),
+                _ => None,
+            };
+            match alias_cache_len {
+                Some(n) => eprintln!(
+                    "weight_swap: eager prefault — {} layers, {:.1}ms (alias cache: {} cl_mems)",
+                    target_layers.len(),
+                    t_pre.elapsed().as_secs_f64() * 1e3,
+                    n,
+                ),
+                None => eprintln!(
+                    "weight_swap: eager prefault — {} target layers, {:.1}ms",
+                    target_layers.len(),
+                    t_pre.elapsed().as_secs_f64() * 1e3,
+                ),
+            }
         }
 
-        if target_layers.is_empty() {
+        // Phase 3: defer the dispatch block when --swap-delay-tokens N > 0.
+        // We still run dispatch immediately when `target_layers.is_empty()`
+        // (no-op log line; nothing to defer).
+        if !target_layers.is_empty() && args.swap_delay_tokens > 0 {
+            eprintln!(
+                "weight_swap: dispatch deferred — will trigger at decode_token_index={} \
+                 (Phase 3 mid-decode swap, ratio={:.2}, {} target layers)",
+                args.swap_delay_tokens,
+                ratio,
+                target_layers.len(),
+            );
+            pending_force_swap = Some((ratio, target_layers));
+        } else if target_layers.is_empty() {
             eprintln!(
                 "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
                 ratio,
             );
-        } else if args.swap_phase_aware {
-            // LISWAP-5: dispatcher 생성 + commit_plan + PHASE_HOOK 등록.
-            // chunk dispatch는 forward thread의 op_trace boundary가 trigger.
-            // dispatcher worker (AsyncSwapDispatcher)가 cl_event 대기 후
-            // ArcSwap commit + ratio_generation bump (LISWAP-4와 동일 패턴).
-            let swap_backend: Arc<dyn Backend> = gpu_backend_arc
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| cpu_backend_arc.clone());
-            let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
-                Arc::clone(&swap_backend),
-            ));
-            let secondary = match model.secondary_mmap.as_ref() {
-                Some(s) => Arc::clone(s),
-                None => {
-                    anyhow::bail!(
-                        "--swap-phase-aware requires --secondary-gguf (no secondary mmap available)"
-                    );
-                }
-            };
-            let config = Arc::new(model.config.clone());
-            let chunk_size_bytes = args.swap_phase_aware_chunk_mb.max(1) * 1_048_576;
-            eprintln!(
-                "weight_swap: phase-aware mode — ratio={:.2}, {} target layers, chunk_size={} MB (LISWAP-5)",
-                ratio,
-                target_layers.len(),
-                args.swap_phase_aware_chunk_mb
-            );
-            let phase_dispatcher = llm_rs2::models::weights::PhaseAwareSwapDispatcher::new(
-                chunk_size_bytes,
-                model.layers.clone(),
-                secondary,
-                swap_backend,
-                dispatcher,
-                DType::Q4_0,
-                config,
-            );
-            phase_dispatcher.commit_plan(&target_layers);
-            // Register process-wide PhaseHook (singleton, set 한 번만 effective).
-            llm_rs2::profile::op_trace::set_phase_hook(
-                phase_dispatcher.clone() as Arc<dyn llm_rs2::profile::op_trace::PhaseHook>,
-            );
-            phase_aware_swap_dispatcher = Some(phase_dispatcher);
-        } else if args.swap_intra_forward {
-            // LISWAP-4 (ENG-ALG-237): single-shot is skipped; an
-            // IntraForwardSwapHook is committed instead. The decode loop
-            // injects the hook into `forward_into` and dispatches per-layer
-            // swap on the layer boundary. Plan retire (drain → synchronize
-            // → bump → invalidate) happens once on plan_is_complete()
-            // (INV-150).
-            //
-            // Backend must support async transfer for the dispatcher path
-            // to be useful; on backends without it, the dispatcher falls
-            // back to a synchronous in-line commit (still correct, just no
-            // overlap with forward).
-            let swap_backend: Arc<dyn Backend> = gpu_backend_arc
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| cpu_backend_arc.clone());
-            let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
-                Arc::clone(&swap_backend),
-            ));
-            let secondary = match model.secondary_mmap.as_ref() {
-                Some(s) => Arc::clone(s),
-                None => {
-                    anyhow::bail!(
-                        "--swap-intra-forward requires --secondary-gguf (no secondary mmap available)"
-                    );
-                }
-            };
-            let config = Arc::new(model.config.clone());
-            eprintln!(
-                "weight_swap: intra-forward mode — ratio={:.2}, {} target layers (LISWAP-4)",
-                ratio,
-                target_layers.len()
-            );
-            intra_forward_swap_hook = Some(llm_rs2::models::weights::IntraForwardSwapHook::new(
-                target_layers,
-                0,
-                dispatcher,
-                secondary,
-                model.layers.clone(),
-                swap_backend,
-                Some(Arc::clone(&model.release_worker)),
-                DType::Q4_0,
-                config,
-            ));
-        } else if args.swap_incremental_per_tick > 0 {
-            // ENG-ALG-232: commit IncrementalSwapPlan; single-shot is skipped.
-            // The plan will be drained in the decode loop (token 0 onwards).
-            eprintln!(
-                "weight_swap: incremental mode — ratio={:.2}, {} target layers, per_tick={} ({} ticks estimated)",
-                ratio,
-                target_layers.len(),
-                args.swap_incremental_per_tick,
-                target_layers.len().div_ceil(args.swap_incremental_per_tick),
-            );
-            incremental_force_swap_plan = Some(llm_rs2::models::weights::IncrementalSwapPlan::new(
-                target_layers,
-                args.swap_incremental_per_tick,
-                0, // started_at_token filled in decode loop at first drain
-            ));
         } else {
-            // per_tick == 0: original single-shot path (no behavior change).
-            match run_layer_swap(
-                &model,
-                &target_layers,
-                gpu_backend_arc.as_ref(),
-                &cpu_backend_arc,
-                None,
-                #[cfg(feature = "opencl")]
-                host_ptr_swap_pool.clone(),
-            ) {
-                Ok(report) => {
-                    eprintln!(
-                        "weight_swap: force ratio={:.2}, swapped {}/{} layers in {:.1}ms",
-                        ratio,
-                        report.swapped.len(),
-                        num_layers,
-                        report.latency_ms,
-                    );
-                    if let Some(ref stages) = report.stage_breakdown {
-                        eprintln!("weight_swap stages: {}", stages.to_log_line());
-                    }
-                    // WSWAP-5-TBT-DIAG: dump cl_mem footprint right after the
-                    // forced swap so the post-swap allocation pattern can be
-                    // diffed against the `after_noshuffle_prep` snapshot.
-                    #[cfg(feature = "opencl")]
-                    if let Some(ocl_be) = backend
-                        .as_any()
-                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-                    {
-                        ocl_be.dump_cl_mem_diagnostics(" stage=after_force_swap");
-                    }
-                    #[cfg(feature = "opencl")]
-                    remap_weights_for_cpu_after_swap(
-                        &mut model,
-                        &backend,
-                        is_gpu,
-                        args.resilience_prealloc_switch,
-                        "force-swap",
-                    );
-                }
-                Err(e) => {
-                    anyhow::bail!("--force-swap-ratio: swap failed: {}", e);
-                }
-            }
+            // delay == 0 (default): dispatch immediately at prefill end.
+            dispatch_force_swap!(ratio, target_layers);
         }
     }
 
@@ -5448,6 +5526,25 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
 
+            // ── LISWAP Phase 3 — mid-decode force-swap trigger ───────────────
+            // Fires once at decode_token_index == args.swap_delay_tokens when
+            // a pending payload was prepared at prefill end. Same dispatch
+            // logic as the prefill-end path (shared via macro) to ensure the
+            // four swap modes (single-shot / incremental / intra-forward /
+            // phase-aware) all receive the same code path.
+            if let Some((ratio, target_layers)) = pending_force_swap.take() {
+                if decode_token_index == args.swap_delay_tokens {
+                    eprintln!(
+                        "weight_swap: mid-decode trigger at decode_token_index={}",
+                        decode_token_index,
+                    );
+                    dispatch_force_swap!(ratio, target_layers);
+                } else {
+                    // Not yet — re-stash for the next iteration.
+                    pending_force_swap = Some((ratio, target_layers));
+                }
+            }
+
             // ── Auto-switch CPU→GPU at threshold ─────────────────────────
             if !is_gpu
                 && weights_on_gpu
@@ -5522,6 +5619,11 @@ fn main() -> anyhow::Result<()> {
             }
 
             let forward_start = std::time::Instant::now();
+
+            // Phase 2: throttle counter reset — 매 token 시작 시.
+            if let Some(ref disp) = phase_aware_swap_dispatcher {
+                disp.reset_token_counter();
+            }
 
             // Try GPU plan path (OpenCL decode only, no profiling)
             #[cfg(feature = "opencl")]

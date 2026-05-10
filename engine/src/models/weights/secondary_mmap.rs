@@ -739,6 +739,7 @@ fn try_open_rpcmem_secondary(
             path,
             primary_config,
             primary_gguf,
+            std::sync::Arc::clone(backend),
             (rpcmem_fns.0, rpcmem_fns.1),
         )
         .map_err(|e| LoadError::SecondaryUnavailable {

@@ -79,10 +79,29 @@ pub struct SwapCommitJob {
     pub layer_idx: Option<usize>,
 }
 
+/// LISWAP Phase 4: Worker-side chunk dispatch job.
+///
+/// Carries a `Weak<PhaseAwareSwapDispatcher>` so the worker can call back into
+/// `try_dispatch_chunk_worker` without creating an Arc ownership cycle. When
+/// the dispatcher is dropped, the upgrade-fail makes the job a noop.
+///
+/// The trait object is hidden behind a generic `Fn` so async_swap.rs does not
+/// have to depend on phase_aware_swap.rs (avoiding a module cycle). The
+/// callback closes over the `Weak<PhaseAwareSwapDispatcher>` and performs the
+/// upgrade + dispatch internally.
+pub struct ChunkDispatchJob {
+    /// Boxed callback: invoked once on the worker thread. Implemented as a
+    /// `FnOnce` so the closure can move the `Weak` into itself.
+    pub run: Box<dyn FnOnce() + Send + 'static>,
+}
+
 /// Jobs sent to the background worker thread.
 pub enum SwapJob {
     /// Commit a set of new layer weights after waiting for the write event.
     Commit(SwapCommitJob),
+    /// LISWAP Phase 4: Dispatch the next phase-aware chunk on the worker
+    /// thread instead of the forward thread.
+    DispatchChunk(ChunkDispatchJob),
     /// Terminate the worker loop gracefully.
     Shutdown,
 }
@@ -149,6 +168,22 @@ impl AsyncSwapDispatcher {
         Ok(())
     }
 
+    /// LISWAP Phase 4: Submit a chunk-dispatch job to the worker.
+    ///
+    /// Mirrors `submit_commit` exactly — the job is enqueued (channel push,
+    /// ~µs scale) and `pending` is incremented so the same `drain` loop covers
+    /// both job kinds. The actual chunk build/install runs on the worker.
+    pub fn submit_dispatch_chunk(&self, job: ChunkDispatchJob) -> Result<()> {
+        self.pending.fetch_add(1, Ordering::Release);
+        if let Err(e) = self.sender.send(SwapJob::DispatchChunk(job)) {
+            self.pending.fetch_sub(1, Ordering::Release);
+            return Err(anyhow!(
+                "[AsyncSwapDispatcher] channel closed, cannot submit dispatch job: {e}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Block until all pending jobs complete or `deadline` elapses.
     ///
     /// Polls at 1 ms intervals (same pattern as `PrimaryReleaseWorker::drain`).
@@ -196,6 +231,12 @@ fn worker_loop(rx: mpsc::Receiver<SwapJob>, backend: Arc<dyn Backend>, pending: 
         match job {
             SwapJob::Commit(commit) => {
                 process_commit(commit, &backend);
+                pending.fetch_sub(1, Ordering::Release);
+            }
+            SwapJob::DispatchChunk(dispatch) => {
+                // The closure captures Weak<PhaseAwareSwapDispatcher> + invokes
+                // try_dispatch_chunk_worker on it. Upgrade-fail = noop.
+                (dispatch.run)();
                 pending.fetch_sub(1, Ordering::Release);
             }
             SwapJob::Shutdown => break,

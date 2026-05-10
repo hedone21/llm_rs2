@@ -26,15 +26,15 @@
 use crate::core::backend::{Backend, GpuEvent};
 use crate::core::buffer::DType;
 use crate::core::tensor::Tensor;
-use crate::models::weights::async_swap::{AsyncSwapDispatcher, SwapCommitJob};
+use crate::models::weights::async_swap::{AsyncSwapDispatcher, ChunkDispatchJob, SwapCommitJob};
 use crate::models::weights::secondary_mmap::SecondaryMmap;
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
 use crate::models::weights::swap_executor::SwapExecutor;
 use crate::profile::op_trace::{DdrPhase, OpKind, PhaseHook};
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 /// Per-layer weight subnames in the order they are dispatched. The last entry
@@ -176,6 +176,21 @@ pub struct PhaseAwareSwapDispatcher {
     hook_start_calls: AtomicU64,
     hook_end_calls: AtomicU64,
     cachefit_end_calls: AtomicU64,
+    /// Phase 2: Throttle — token당 최대 dispatch chunk 수.
+    /// 0 = 무제한 (default), N>0 = 매 token N chunks까지만 dispatch.
+    /// decode loop의 `reset_token_counter()`로 매 token 시작 시 counter reset.
+    max_chunks_per_token: AtomicUsize,
+    /// Phase 2: 현재 token에서 dispatch한 chunk 수.
+    chunks_dispatched_this_token: AtomicUsize,
+    /// LISWAP Phase 4: weak self-reference for worker-thread dispatch.
+    ///
+    /// Populated post-construction via `install_self_weak`. The forward thread
+    /// passes `self_weak.upgrade()` into `ChunkDispatchJob`'s closure so the
+    /// worker can call back into `try_dispatch_chunk_worker` without owning a
+    /// strong Arc cycle (worker → dispatcher → AsyncSwapDispatcher → worker).
+    /// When the dispatcher is dropped, upgrade returns `None` and the queued
+    /// job becomes a noop.
+    self_weak: OnceLock<Weak<Self>>,
 }
 
 impl PhaseAwareSwapDispatcher {
@@ -208,7 +223,30 @@ impl PhaseAwareSwapDispatcher {
             hook_start_calls: AtomicU64::new(0),
             hook_end_calls: AtomicU64::new(0),
             cachefit_end_calls: AtomicU64::new(0),
+            max_chunks_per_token: AtomicUsize::new(0),
+            chunks_dispatched_this_token: AtomicUsize::new(0),
+            self_weak: OnceLock::new(),
         })
+    }
+
+    /// LISWAP Phase 4: install a weak self-reference so the worker thread can
+    /// call back into `try_dispatch_chunk_worker`. Must be called exactly once
+    /// after `Arc::new` returns the dispatcher (the constructor cannot capture
+    /// its own Arc). Subsequent calls are noops (OnceLock semantics).
+    pub fn install_self_weak(self: &Arc<Self>) {
+        let _ = self.self_weak.set(Arc::downgrade(self));
+    }
+
+    /// Phase 2: Throttle — token당 최대 dispatch chunk 수 설정.
+    /// 0 = 무제한 (현재 동작 유지), N>0 = 매 token N chunks까지만.
+    pub fn set_max_chunks_per_token(&self, n: usize) {
+        self.max_chunks_per_token.store(n, Ordering::Release);
+    }
+
+    /// Phase 2: Decode loop의 매 token 시작 시 호출 — 현재 token counter reset.
+    pub fn reset_token_counter(&self) {
+        self.chunks_dispatched_this_token
+            .store(0, Ordering::Release);
     }
 
     /// Plan commit — `target_layers` 각각을 per-tensor chunk으로 분할하여
@@ -260,6 +298,16 @@ impl PhaseAwareSwapDispatcher {
                 eprintln!("[PhaseAwareSwap] wait_pending failed: {e}");
             }
         }
+    }
+
+    /// LISWAP Phase 4: worker-thread entrypoint — identical body to
+    /// `try_dispatch_chunk`, kept as a separate `pub(crate)` method so the
+    /// `AsyncSwapDispatcher` worker can invoke it via the closure stored in
+    /// `ChunkDispatchJob`. Concurrency: the in_flight Mutex still serialises
+    /// "one chunk in flight" semantics — the worker dequeues sequentially and
+    /// each iteration acquires/releases the same Mutex.
+    pub(crate) fn try_dispatch_chunk_worker(&self) -> Result<()> {
+        self.try_dispatch_chunk()
     }
 
     /// 다음 chunk pop → secondary mmap에서 staging cl_mem으로 enqueue_write_async →
@@ -453,7 +501,16 @@ impl PhaseAwareSwapDispatcher {
             ));
         }
 
-        // (1) drain remaining chunks. forward thread는 이미 끝났으므로 본 thread가
+        // (1a) LISWAP Phase 4: first drain any worker-thread DispatchChunk
+        //      jobs that the forward thread submitted but the worker hasn't
+        //      processed yet. After this drain, no new chunks will be enqueued
+        //      from the worker side because `finalized` is now true (and
+        //      forward-thread on_op_end is a noop after finalize set the flag).
+        self.dispatcher
+            .drain(deadline)
+            .map_err(|e| anyhow!("[PhaseAwareSwap] dispatcher pre-drain failed: {e}"))?;
+
+        // (1b) drain remaining chunks. forward thread는 이미 끝났으므로 본 thread가
         //     남은 chunk을 동기 dispatch해서 비운다. 한 chunk in-flight 정책 때문에
         //     매 iteration마다 wait_pending()으로 슬롯 비우고 다음 chunk 진행.
         loop {
@@ -470,7 +527,7 @@ impl PhaseAwareSwapDispatcher {
         // 마지막 chunk의 in_flight도 비우기.
         self.wait_pending();
 
-        // (2) drain async dispatcher (commit jobs).
+        // (2) drain async dispatcher (commit jobs from sync drain above).
         self.dispatcher
             .drain(deadline)
             .map_err(|e| anyhow!("[PhaseAwareSwap] dispatcher drain failed: {e}"))?;
@@ -505,19 +562,29 @@ impl PhaseAwareSwapDispatcher {
     /// decode loop가 매 token 후 polling하여 true가 되면 `finalize()` 호출.
     /// stage_gate_armed가 false면 chunk을 한 번도 dispatch하지 않은 상태이므로
     /// `is_complete = false` 유지 (commit_plan 직후 race로 finalize되는 것 방지).
+    ///
+    /// LISWAP Phase 4: worker thread가 비동기로 chunk를 dispatch하므로, channel
+    /// pending도 0이어야 한다 (그렇지 않으면 worker가 곧 in_flight/pending_layers를
+    /// 채울 수 있는 race window가 존재).
     pub fn is_complete(&self) -> bool {
         if !self.stage_gate_armed.load(Ordering::Acquire) {
             return false;
         }
-        let queue_empty = self.chunk_queue.lock().map(|q| q.is_empty()).unwrap_or(false);
+        // Phase 4: worker channel이 drain되지 않았으면 forward thread가
+        // 방금 submit한 dispatch job이 곧 chunk_queue/in_flight/pending_layers를
+        // 채울 수 있음. 이를 무시하고 finalize() 호출 시 race로 chunk가 손실된다.
+        if self.dispatcher.pending_count() != 0 {
+            return false;
+        }
+        let queue_empty = self
+            .chunk_queue
+            .lock()
+            .map(|q| q.is_empty())
+            .unwrap_or(false);
         if !queue_empty {
             return false;
         }
-        let in_flight_empty = self
-            .in_flight
-            .lock()
-            .map(|g| g.is_none())
-            .unwrap_or(false);
+        let in_flight_empty = self.in_flight.lock().map(|g| g.is_none()).unwrap_or(false);
         if !in_flight_empty {
             return false;
         }
@@ -567,7 +634,36 @@ impl PhaseHook for PhaseAwareSwapDispatcher {
             return;
         }
         if matches!(kind.ddr_phase(), DdrPhase::CacheFit) {
-            let _ = self.try_dispatch_chunk();
+            // Phase 2: Throttle — token당 max chunks 도달 시 skip.
+            // forward thread는 atomic load/store + channel-push만 한다 (~us).
+            let max = self.max_chunks_per_token.load(Ordering::Acquire);
+            if max > 0 && self.chunks_dispatched_this_token.load(Ordering::Acquire) >= max {
+                return;
+            }
+
+            // LISWAP Phase 4: dispatch on the worker thread. The Weak<Self>
+            // upgrade-fails into a noop after dispatcher drop, so cycle-safe.
+            let Some(weak) = self.self_weak.get().cloned() else {
+                // self_weak not installed — fall back to forward-thread dispatch
+                // (defensive: should not happen in production paths).
+                let _ = self.try_dispatch_chunk();
+                self.chunks_dispatched_this_token
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let job = ChunkDispatchJob {
+                run: Box::new(move || {
+                    if let Some(disp) = weak.upgrade() {
+                        let _ = disp.try_dispatch_chunk_worker();
+                    }
+                }),
+            };
+            if self.dispatcher.submit_dispatch_chunk(job).is_ok() {
+                // Throttle counter increments per submit, not per actual dispatch.
+                // Acceptable for throttle's purpose (cap submits per token).
+                self.chunks_dispatched_this_token
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }

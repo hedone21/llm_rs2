@@ -2,10 +2,20 @@
 //!
 //! Wraps an OpenCL `CL_MEM_USE_HOST_PTR` alias whose backing storage is a
 //! per-layer rpcmem region owned by `RpcmemSecondaryStore`. The buffer itself
-//! does not own the host memory — it pins the secondary mmap (`Arc<SecondaryMmap>`)
-//! and the layer region (`Arc<RpcmemLayerRegion>`) so the rpcmem allocation
-//! is freed only after every alias has been dropped (Drop ordering: cl_mem
-//! → Arc<SecondaryMmap> → Arc<RpcmemLayerRegion> → rpcmem_free).
+//! does not own the host memory — it pins the layer region
+//! (`Arc<RpcmemLayerRegion>`) so the rpcmem allocation is freed only after
+//! every alias has been dropped (Drop ordering: cl_mem → Arc<RpcmemLayerRegion>
+//! → rpcmem_free).
+//!
+//! ## Cycle break — Phase 1 alias cache
+//!
+//! Phase 1 caches `Arc<RpcmemAliasBuffer>` inside `RpcmemSecondaryStore`
+//! (eliminating per-swap `clCreateBuffer` overhead). Storing a strong
+//! `Arc<SecondaryMmap>` here would close a self-cycle:
+//!   `Arc<SecondaryMmap>` → store.alias_cache → `Arc<RpcmemAliasBuffer>` → ...
+//! We therefore retain only a `Weak<SecondaryMmap>`. The cache itself lives
+//! inside the store, so the entire graph drops together when the model
+//! releases its `Arc<SecondaryMmap>`.
 //!
 //! Spec: ENG-DAT-094, INV-143 (alias lifetime via Arc retention).
 
@@ -16,7 +26,7 @@ use crate::models::weights::SecondaryMmap;
 use anyhow::Result;
 use ocl::core::Mem;
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// Alias `cl_mem` whose host pointer points into a per-layer rpcmem region.
 ///
@@ -34,11 +44,16 @@ pub struct RpcmemAliasBuffer {
     size: usize,
     /// Tensor dtype.
     dtype: DType,
-    /// Lifetime guard 1: keep secondary store alive (it owns the layer-region map).
-    _secondary_arc: Arc<SecondaryMmap>,
-    /// Lifetime guard 2: keep this layer's rpcmem region alive even if the
-    /// secondary store evicts the entry from its HashMap (defensive — current
-    /// implementation never evicts, but the guarantee is explicit here).
+    /// Lifetime guard 1 (weak): observe the secondary store without closing
+    /// the alias-cache self-cycle (see module docs). The store owns the
+    /// layer-region map; if the model has released its `Arc<SecondaryMmap>`
+    /// the upgrade fails — which is fine, because the cache is dropping with
+    /// the store.
+    _secondary_weak: Weak<SecondaryMmap>,
+    /// Lifetime guard 2 (strong): keep this layer's rpcmem region alive even
+    /// if the secondary store evicts the entry from its HashMap (defensive —
+    /// current implementation never evicts). This is the only ref that *must*
+    /// outlive the cl_mem; the rpcmem free runs from this Arc's Drop.
     _layer_region: Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
 }
 
@@ -46,8 +61,9 @@ pub struct RpcmemAliasBuffer {
 // - `cl_buffer` (`ocl::core::Mem`) is internally `Send + Sync` per `ocl` crate.
 // - `host_ptr` is read-only; the rpcmem region is single-allocator and pinned
 //   for the lifetime of `_layer_region`.
-// - The two `Arc` lifetime guards prevent UAF: secondary store + layer region
-//   both stay alive until the last alias is dropped.
+// - The strong `_layer_region` Arc prevents the rpcmem region from being
+//   freed before the cl_mem is dropped. The `Weak<SecondaryMmap>` is a
+//   non-owning back-reference (no aliasing concern).
 unsafe impl Send for RpcmemAliasBuffer {}
 unsafe impl Sync for RpcmemAliasBuffer {}
 
@@ -57,6 +73,10 @@ impl RpcmemAliasBuffer {
     /// Caller (typically the `OpenCLBackend::alloc_alias_weight_buffer`
     /// override) is responsible for creating the `cl_mem` with
     /// `CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY` against the same `host_ptr`.
+    ///
+    /// `secondary` is consumed as `Arc` and demoted to `Weak` to avoid the
+    /// self-cycle introduced by Phase 1 alias caching (the store itself
+    /// caches `Arc<RpcmemAliasBuffer>`).
     pub fn new(
         cl_buffer: Mem,
         host_ptr: *mut u8,
@@ -70,7 +90,7 @@ impl RpcmemAliasBuffer {
             host_ptr,
             size,
             dtype,
-            _secondary_arc: secondary,
+            _secondary_weak: Arc::downgrade(&secondary),
             _layer_region: layer_region,
         }
     }
