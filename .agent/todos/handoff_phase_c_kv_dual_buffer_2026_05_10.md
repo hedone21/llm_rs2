@@ -18,10 +18,17 @@
 | 시스템 | Decode TBT | t/s | 비고 |
 |---|---|---|---|
 | llama.cpp (Adreno OpenCL, ngl 99, 6T) | 27.07 ms/tok | 36.94 | reference baseline |
-| llm_rs2 `--backend opencl` | 27.95 ms/tok | 35.8 | llama.cpp와 동등 |
+| llm_rs2 `--backend opencl` | 28.31 ms/tok | 35.3 | llama.cpp와 동등 |
 | llm_rs2 `--backend opencl --zero-copy` (CL_MEM_ALLOC_HOST_PTR) | 28.03 ms/tok | 35.7 | **효과 없음** |
-| **llm_rs2 `--backend qnn_oppkg`** (fast off, dual buffer KV) | **13.22 ms/tok** | **75.7** | **★ llama.cpp 2×** |
+| **llm_rs2 `--backend qnn_oppkg`** (Step 4 cleanup 후) | **12.13 ms/tok** | **82.4** | **★ llama.cpp 2.23×** |
 | llm_rs2 `--backend qnn_oppkg` + `LLMRS_QNN_OPPKG_FAST_PATH=1` | 79.59 ms/tok | 12.6 | graph bridge로 인해 느림 (Step 2 대기) |
+
+### 1.1 다른 모델 검증 (Step 3, post-cleanup)
+| 모델 (Q4_0) | --backend opencl | --backend qnn_oppkg | 가속 |
+|---|---|---|---|
+| Qwen2.5-1.5B | 28.31 | 12.13 | 2.33× |
+| Llama3.2-1B  | 21.68 |  5.74 | **3.78×** |
+| Gemma3-1B    | 32.89 | 11.64 | 2.83× |
 
 검증: 출력은 모두 정상 — "The capital of France is Paris. It has a population of about 2 million people and covers an area of 104 square kilometers..." (commit 45cb489 tokenizer guard 적용 후).
 
@@ -76,6 +83,10 @@ Explore 조사 종합 (LOW = 영향 거의 없음):
 
 ### Commit history
 ```
+e6bf5e8 chore(qnn): Phase B/C 디버그 dump infra 일괄 제거 (Step 4)
+e5a60cf fix(qnn): Gemma3 다중 모델 호환 — tokenizer guard 완화 + OCL secondary 위임 (Step 3)
+8ea8328 chore: cargo fmt — Phase B/C 작업 잔여 reformatting
+22f02c8 docs(phase-c): Adreno 권장 backend 가이드 + Phase C 핸드오프
 d4842cf fix(opencl): get_cl_mem에 Buffer trait fallback (OCP)
 7e84800 feat(qnn): Step 1 — KV cache dual buffer (rpcmem + CL_MEM_USE_HOST_PTR)
 3dcbfb4 perf(qnn): Phase C 측정 인프라 — fast path / lg.execute breakdown
@@ -110,15 +121,16 @@ bc6bcff feat(qnn): D-D.6 Phase B 완료 — fast path = production byte-equal
 
 이게 의미 있을지는 production 13 ms/tok이 충분한가에 달림. llama.cpp 2× 가속이면 충분하다는 판단도 가능.
 
-### Step 3 — 다른 모델 검증 (Llama, Gemma)
-현재 검증은 Qwen2.5-1.5B Q4_0만. Llama 3.2 1B / Gemma 3 1B는 attention bias 없으므로 fast path 17-node와는 무관하지만, dual buffer KV는 모든 모델에 적용.
+### Step 3 — 다른 모델 검증 (Llama, Gemma) ✅ 완료 (commit e5a60cf)
+3 모델 모두 dual buffer KV 가속 확인 (위 표 §1.1). Gemma3 head_dim=256으로 prefill flash_attn CPU fallback 발동 → `with_opencl_secondary` helper 추가로 OCL secondary write back 위임.
 
-### Step 4 — 디버그 코드 정리
-- `LLMRS_QNN_OPPKG_FAST_PATH_DUMP*` env-gated dump infra
-- `LLMRS_QNN_OPPKG_DUMP_FALLBACK_PREFIX` (forward_gen stage dump)
-- microbench bisect 도구
-
-production 사용은 안 영향, 다만 코드 청결도. cargo fmt 부산물 (working tree dirty)도 함께 정리.
+### Step 4 — 디버그 코드 정리 ✅ 완료 (commit e6bf5e8)
+- `LLMRS_QNN_OPPKG_FAST_PATH_DUMP*` env-gated dump infra 제거 (qnn_oppkg/mod.rs, layer_graph.rs)
+- `LLMRS_QNN_OPPKG_DUMP_FALLBACK_*` 제거 (forward.rs, forward_gen.rs, transformer.rs)
+- `dump_stage!` macro + 18 callsite 제거 (forward_gen.rs)
+- unconditional `[forward_prefill entered]` per-(layer×token) eprintln 제거 (per-token stderr overhead 일부 감소)
+- microbench self-dump (`LLMRS_MICROBENCH_DUMP_PREFIX`)는 standalone graph debugging tool로 보존
+- Net: 6 파일 -255 +19 = 236줄 삭제
 
 ### Step 5 — generic OpenCL backend에 dmabuf 통합 (큰 작업)
 `--backend opencl`만 쓰는 사용자도 13 ms/tok 받을 수 있도록 OpenCLMemory에 dmabuf alloc path 추가. Android-only, libcdsprpc.so 의존성 필요. qnn_oppkg crate dependency 분리 또는 별도 dmabuf_alloc crate 필요. 큰 작업이라 ROI 검토 후.
