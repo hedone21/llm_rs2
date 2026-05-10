@@ -41,20 +41,21 @@
 //! ```
 
 /// Total number of `graphAddNode` calls expected to assemble one Qwen layer.
-pub const LAYER_NODE_COUNT: usize = 14;
+///
+/// D-D.6 Phase B: 17 = 14 base + 3 BiasAdd ops (Q/K/V matmul 직후, Qwen2.5
+/// attention bias 적용). bias 없는 모델은 zero bias buffer로 effectively no-op.
+pub const LAYER_NODE_COUNT: usize = 17;
 
 /// Number of intermediate (`QNN_TENSOR_TYPE_NATIVE`) tensors carrying outputs
-/// between the 14 nodes.
+/// between the nodes.
 ///
 /// Excludes graph endpoints (`x_in` APP_WRITE, `x_out` APP_READ) and weights /
 /// KV cache (APP_WRITE memhandles registered against external rpcmem buffers).
 ///
-/// Intermediate breakdown:
-///   y1, q, k, v, q_rot, k_rot, attn_out, o, x_attn, y2, gate, up, silu_out
-/// = 13 NATIVE tensors. (`silu_out` aliases `gate`'s buffer via M2.G
-/// `OutputTensorAliased` but is still a distinct `Qnn_Tensor_t` in the graph
-/// representation.)
-pub const LAYER_INTERMEDIATE_COUNT: usize = 13;
+/// Intermediate breakdown (D-D.6 Phase B): base 13 + 3 post-bias = 16.
+///   y1, q, k, v, q_biased, k_biased, v_biased, q_rot, k_rot, attn_out, o,
+///   x_attn, y2, gate, up, silu_out = 16 NATIVE tensors.
+pub const LAYER_INTERMEDIATE_COUNT: usize = 16;
 
 /// Per-layer dimensions. Defaults match Qwen 2.5-1.5B (16 layers, used here
 /// for the 1-layer microbench).
@@ -140,16 +141,15 @@ mod tests {
     }
 
     #[test]
-    fn layer_dag_node_count_is_14() {
-        // 1 norm + 3 proj + 2 rope + 1 scatter + 1 fa + 1 oproj + 1 add
-        // + 1 norm + 2 ffn_proj + 1 silu + 1 down + 1 add = 14
-        assert_eq!(LAYER_NODE_COUNT, 14);
+    fn layer_dag_node_count_is_17() {
+        // D-D.6 Phase B: 14 base + 3 BiasAdd (Q/K/V) = 17.
+        assert_eq!(LAYER_NODE_COUNT, 17);
     }
 
     #[test]
-    fn layer_intermediate_count_is_13() {
-        // y1, q, k, v, q_rot, k_rot, attn_out, o, x_attn, y2, gate, up, silu_out
-        assert_eq!(LAYER_INTERMEDIATE_COUNT, 13);
+    fn layer_intermediate_count_is_16() {
+        // D-D.6 Phase B: 13 base + q_biased, k_biased, v_biased = 16.
+        assert_eq!(LAYER_INTERMEDIATE_COUNT, 16);
     }
 
     #[test]

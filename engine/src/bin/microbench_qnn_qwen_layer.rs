@@ -2491,7 +2491,7 @@ fn run_layer(
 
     // 14 nodes total (12 in `nodes` + 2 in `trailing`). Verified by
     // `qnn_oppkg::graph::LAYER_NODE_COUNT == 14` host test.
-    const _ASSERT_LAYER_NODE_COUNT: usize = 14;
+    const _ASSERT_LAYER_NODE_COUNT: usize = 17;
 
     // ── 6. graphFinalize (timed) ────────────────────────────────────────────
     let t_fin0 = Instant::now();

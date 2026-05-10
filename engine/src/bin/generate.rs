@@ -6825,6 +6825,13 @@ fn main() -> anyhow::Result<()> {
                     _printed_len = current_text.len();
                 }
             }
+            // D-D.6 debug: dump raw token IDs (special token visibility).
+            if std::env::var("LLMRS_DUMP_TOKEN_IDS").is_ok() {
+                eprintln!(
+                    "[token-id step={}] id={}",
+                    decode_token_index, next_token_id
+                );
+            }
 
             // T3 / T4: RSS snapshot after first and 16th decode tokens.
             if decode_token_index == 0 {

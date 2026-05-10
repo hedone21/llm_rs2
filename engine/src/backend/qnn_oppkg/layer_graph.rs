@@ -48,10 +48,9 @@ pub use qnn_oppkg::graph::layer::{LAYER_INTERMEDIATE_COUNT, LAYER_NODE_COUNT, La
 /// `graphFinalize` 1회 호출 budget (ms). ENG-QNN-209/INV-167.
 ///
 /// M3.4 디바이스 측정 (S25 Adreno 830, Qwen2.5-1.5B Q4_0): layer 0 = 1181 ms.
-/// M2 microbench 동일 — graphFinalize 비용 ~1.2s/layer 정상 범위. M3.0 spec
-/// 200 ms는 추정치였으며, D1 결정 "eager prebuild ~33s 1회성 spike 수용"이
-/// 현실적 budget. 측정값을 반영하여 1500 ms로 갱신 — INV-167 게이트 유지.
-pub const FINALIZE_BUDGET_MS: u32 = 1500;
+/// D-D.6 Phase B (BiasAdd 3개 추가, 17 nodes): layer 0 = 1554 ms.
+/// 17 nodes로 확장되며 finalize 비용도 비례 증가 (~25%). budget 2000 ms로 갱신.
+pub const FINALIZE_BUDGET_MS: u32 = 2000;
 
 /// 14-node single-layer QNN graph (M2.H 이식).
 ///
@@ -605,6 +604,24 @@ mod android {
         let rms_pre_bytes = tensor_bytes_owned(&weights.attention_norm)?;
         let rms_post_bytes = tensor_bytes_owned(&weights.ffn_norm)?;
 
+        // D-D.6 Phase B: Qwen2.5 attention QKV bias — F32 (1D, q_proj_out / kv_proj_out).
+        // bias가 없는 모델 (Llama/Gemma)은 zero bytes (BiasAdd effectively no-op).
+        let q_bias_bytes = if let Some(ref bias) = weights.qkv_bias {
+            tensor_bytes_owned(&bias.bq)?
+        } else {
+            vec![0u8; q_proj_out * 4]
+        };
+        let k_bias_bytes = if let Some(ref bias) = weights.qkv_bias {
+            tensor_bytes_owned(&bias.bk)?
+        } else {
+            vec![0u8; kv_proj_out * 4]
+        };
+        let v_bias_bytes = if let Some(ref bias) = weights.qkv_bias {
+            tensor_bytes_owned(&bias.bv)?
+        } else {
+            vec![0u8; kv_proj_out * 4]
+        };
+
         // ── 3. rpcmem allocations (per-tensor) ─────────────────────────────
         let bytes_x = dim * 4;
         let bytes_rms = dim * 4;
@@ -712,6 +729,20 @@ mod android {
         slots.push(slot_n_kv);
         let idx_n_kv = slots.len() - 1;
 
+        // D-D.6 Phase B: QKV bias 3개 — 끝에 push (기존 slot indexing 보존).
+        let slot_q_bias = alloc_rpcmem_slot(runtime, q_bias_bytes.len())?;
+        copy_into_slot(&slot_q_bias, &q_bias_bytes)?;
+        slots.push(slot_q_bias);
+        let idx_q_bias = slots.len() - 1;
+        let slot_k_bias = alloc_rpcmem_slot(runtime, k_bias_bytes.len())?;
+        copy_into_slot(&slot_k_bias, &k_bias_bytes)?;
+        slots.push(slot_k_bias);
+        let idx_k_bias = slots.len() - 1;
+        let slot_v_bias = alloc_rpcmem_slot(runtime, v_bias_bytes.len())?;
+        copy_into_slot(&slot_v_bias, &v_bias_bytes)?;
+        slots.push(slot_v_bias);
+        let idx_v_bias = slots.len() - 1;
+
         // ── 4. Build tensors + register — 36 tensors total ─────────────────
         // Dimensions storage. Each Vec must outlive graph build (pointer stored).
         let mut dims_x: Vec<u32> = vec![1, dim as u32];
@@ -735,6 +766,13 @@ mod android {
         let mut dims_q: Vec<u32> = vec![1, n_head as u32, head_dim as u32];
         let mut dims_kvec: Vec<u32> = vec![1, n_kv_heads as u32, head_dim as u32];
         let mut dims_vvec: Vec<u32> = vec![1, n_kv_heads as u32, head_dim as u32];
+        // D-D.6 Phase B: bias 1D + biased intermediate (post-bias matmul).
+        let mut dims_q_bias: Vec<u32> = vec![q_proj_out as u32];
+        let mut dims_k_bias: Vec<u32> = vec![kv_proj_out as u32];
+        let mut dims_v_bias: Vec<u32> = vec![kv_proj_out as u32];
+        let mut dims_q_biased: Vec<u32> = vec![1, n_head as u32, head_dim as u32];
+        let mut dims_k_biased: Vec<u32> = vec![1, n_kv_heads as u32, head_dim as u32];
+        let mut dims_v_biased: Vec<u32> = vec![1, n_kv_heads as u32, head_dim as u32];
         let mut dims_q_rope: Vec<u32> = vec![1, n_head as u32, head_dim as u32];
         let mut dims_k_rope: Vec<u32> = vec![1, n_kv_heads as u32, head_dim as u32];
         let mut dims_kcache: Vec<u32> =
@@ -798,6 +836,13 @@ mod android {
         let nm_score = CString::new("score").unwrap();
         let nm_pos = CString::new("pos").unwrap();
         let nm_n_kv = CString::new("n_kv_buf").unwrap();
+        // D-D.6 Phase B: bias tensor names.
+        let nm_q_bias = CString::new("q_bias").unwrap();
+        let nm_k_bias = CString::new("k_bias").unwrap();
+        let nm_v_bias = CString::new("v_bias").unwrap();
+        let nm_q_biased = CString::new("q_biased").unwrap();
+        let nm_k_biased = CString::new("k_biased").unwrap();
+        let nm_v_biased = CString::new("v_biased").unwrap();
 
         let qp = ffi::Qnn_QuantizeParams_t {
             encodingDefinition: ffi::Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
@@ -899,12 +944,56 @@ mod android {
         let mut t_pos = build_tensor(app_w, i32_t, 1, dims_pos.as_mut_ptr(), nm_pos.as_ptr());
         // M3.4 D-D.6: n_kv_buf input tensor — APP_WRITE INT_32 rank-1 [1].
         let mut t_n_kv = build_tensor(app_w, i32_t, 1, dims_n_kv.as_mut_ptr(), nm_n_kv.as_ptr());
+        // D-D.6 Phase B: bias tensors — APP_WRITE F32 rank-1.
+        let mut t_q_bias = build_tensor(
+            app_w,
+            f32_t,
+            1,
+            dims_q_bias.as_mut_ptr(),
+            nm_q_bias.as_ptr(),
+        );
+        let mut t_k_bias = build_tensor(
+            app_w,
+            f32_t,
+            1,
+            dims_k_bias.as_mut_ptr(),
+            nm_k_bias.as_ptr(),
+        );
+        let mut t_v_bias = build_tensor(
+            app_w,
+            f32_t,
+            1,
+            dims_v_bias.as_mut_ptr(),
+            nm_v_bias.as_ptr(),
+        );
 
         // Intermediates (NATIVE).
         let mut t_y1 = build_tensor(native, f32_t, 2, dims_y1.as_mut_ptr(), nm_y1.as_ptr());
         let mut t_q = build_tensor(native, f32_t, 3, dims_q.as_mut_ptr(), nm_q.as_ptr());
         let mut t_k = build_tensor(native, f32_t, 3, dims_kvec.as_mut_ptr(), nm_k.as_ptr());
         let mut t_v = build_tensor(native, f32_t, 3, dims_vvec.as_mut_ptr(), nm_v.as_ptr());
+        // D-D.6 Phase B: post-bias intermediates (BiasAdd output).
+        let mut t_q_biased = build_tensor(
+            native,
+            f32_t,
+            3,
+            dims_q_biased.as_mut_ptr(),
+            nm_q_biased.as_ptr(),
+        );
+        let mut t_k_biased = build_tensor(
+            native,
+            f32_t,
+            3,
+            dims_k_biased.as_mut_ptr(),
+            nm_k_biased.as_ptr(),
+        );
+        let mut t_v_biased = build_tensor(
+            native,
+            f32_t,
+            3,
+            dims_v_biased.as_mut_ptr(),
+            nm_v_biased.as_ptr(),
+        );
         let mut t_q_rope = build_tensor(
             native,
             f32_t,
@@ -987,6 +1076,13 @@ mod android {
             ("down", &mut t_down),
             ("pos", &mut t_pos),
             ("n_kv_buf", &mut t_n_kv),
+            // D-D.6 Phase B: bias inputs + post-bias intermediates.
+            ("q_bias", &mut t_q_bias),
+            ("k_bias", &mut t_k_bias),
+            ("v_bias", &mut t_v_bias),
+            ("q_biased", &mut t_q_biased),
+            ("k_biased", &mut t_k_biased),
+            ("v_biased", &mut t_v_biased),
         ];
         let tcg = v
             .tensorCreateGraphTensor
@@ -1092,6 +1188,8 @@ mod android {
         let ot_fa = CString::new("CustomFlashAttn").unwrap();
         let ot_silu = CString::new("CustomSiluMul").unwrap();
         let ot_add = CString::new("CustomAdd").unwrap();
+        // D-D.6 Phase B: bias add op type.
+        let ot_bias = CString::new("CustomBiasAdd").unwrap();
 
         // Op names.
         let on_rms_pre = CString::new("rms_pre_op").unwrap();
@@ -1110,6 +1208,10 @@ mod android {
         let on_silu = CString::new("silu").unwrap();
         let on_down_proj = CString::new("down_proj").unwrap();
         let on_add2 = CString::new("add2").unwrap();
+        // D-D.6 Phase B: bias op names.
+        let on_q_bias = CString::new("q_bias_add").unwrap();
+        let on_k_bias = CString::new("k_bias_add").unwrap();
+        let on_v_bias = CString::new("v_bias_add").unwrap();
 
         let mut in_rms_pre = [t_x, t_rms_pre];
         let mut out_rms_pre = [t_y1];
@@ -1119,13 +1221,21 @@ mod android {
         let mut out_k_proj = [t_k];
         let mut in_v_proj = [t_vq, t_vd, t_y1];
         let mut out_v_proj = [t_v];
+        // D-D.6 Phase B: BiasAdd nodes (Q/K/V matmul 직후 → RoPE/KvScatter 입력).
+        let mut in_q_bias_node = [t_q, t_q_bias];
+        let mut out_q_bias_node = [t_q_biased];
+        let mut in_k_bias_node = [t_k, t_k_bias];
+        let mut out_k_bias_node = [t_k_biased];
+        let mut in_v_bias_node = [t_v, t_v_bias];
+        let mut out_v_bias_node = [t_v_biased];
         // M3.4 D-D.3: RoPE Q/K input은 (x_in, pos_buf) 2개. KvScatter input은
         // (k_src, v_src, pos_buf) 3개. 동일 `t_pos`를 share — read-only.
-        let mut in_rope_q = [t_q, t_pos];
+        // D-D.6 Phase B: x_in을 post-bias intermediate로 변경 (t_q→t_q_biased 등).
+        let mut in_rope_q = [t_q_biased, t_pos];
         let mut out_rope_q = [t_q_rope];
-        let mut in_rope_k = [t_k, t_pos];
+        let mut in_rope_k = [t_k_biased, t_pos];
         let mut out_rope_k = [t_k_rope];
-        let mut in_kvs = [t_k_rope, t_v, t_pos];
+        let mut in_kvs = [t_k_rope, t_v_biased, t_pos];
         let mut out_kvs = [t_kcache, t_vcache];
         // D-D.6: FlashAttn input은 (q, k, v, mask, sinks, score, n_kv_buf) 7개.
         let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score, t_n_kv];
@@ -1158,7 +1268,7 @@ mod android {
             u32,
             &'a str,
         );
-        let nodes: [NodeSpec<'_>; 14] = [
+        let nodes: [NodeSpec<'_>; 17] = [
             (
                 on_rms_pre.as_ptr(),
                 ot_rms.as_ptr(),
@@ -1202,6 +1312,40 @@ mod android {
                 ptr::null_mut(),
                 0,
                 "V proj",
+            ),
+            // D-D.6 Phase B: 3 BiasAdd ops (Q/K/V matmul 직후 → RoPE/KvScatter 입력).
+            (
+                on_q_bias.as_ptr(),
+                ot_bias.as_ptr(),
+                in_q_bias_node.as_mut_ptr(),
+                2,
+                out_q_bias_node.as_mut_ptr(),
+                1,
+                ptr::null_mut(),
+                0,
+                "Q BiasAdd",
+            ),
+            (
+                on_k_bias.as_ptr(),
+                ot_bias.as_ptr(),
+                in_k_bias_node.as_mut_ptr(),
+                2,
+                out_k_bias_node.as_mut_ptr(),
+                1,
+                ptr::null_mut(),
+                0,
+                "K BiasAdd",
+            ),
+            (
+                on_v_bias.as_ptr(),
+                ot_bias.as_ptr(),
+                in_v_bias_node.as_mut_ptr(),
+                2,
+                out_v_bias_node.as_mut_ptr(),
+                1,
+                ptr::null_mut(),
+                0,
+                "V BiasAdd",
             ),
             (
                 on_rope_q.as_ptr(),
@@ -1440,6 +1584,13 @@ mod android {
         // D-D.6: n_kv_buf input tensor binding.
         let mut t_n_kv_mh = t_n_kv;
         set_mh(&mut t_n_kv_mh, slots[idx_n_kv].mem_handle);
+        // D-D.6 Phase B: QKV bias input tensor binding.
+        let mut t_q_bias_mh = t_q_bias;
+        set_mh(&mut t_q_bias_mh, slots[idx_q_bias].mem_handle);
+        let mut t_k_bias_mh = t_k_bias;
+        set_mh(&mut t_k_bias_mh, slots[idx_k_bias].mem_handle);
+        let mut t_v_bias_mh = t_v_bias;
+        set_mh(&mut t_v_bias_mh, slots[idx_v_bias].mem_handle);
 
         let exec_inputs = vec![
             t_x_mh,
@@ -1462,8 +1613,11 @@ mod android {
             t_mask_mh,
             t_sinks_mh,
             t_score_mh,
-            t_pos_mh,   // M3.4 D-D.3
-            t_n_kv_mh,  // M3.4 D-D.6
+            t_pos_mh,    // M3.4 D-D.3
+            t_n_kv_mh,   // M3.4 D-D.6
+            t_q_bias_mh, // D-D.6 Phase B
+            t_k_bias_mh,
+            t_v_bias_mh,
         ];
         let exec_outputs = vec![t_kcache_mh, t_vcache_mh, t_x_out_mh];
 
