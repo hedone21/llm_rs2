@@ -129,22 +129,6 @@ impl TransformerLayer {
                 let t = pf_start!();
                 backend.rms_norm(x, &self.attention_norm, rms_norm_eps, rms_norm_add_unit)?;
                 pf_record!(t, rms_norm);
-                // D-D.6 디버깅: layer 0 첫 decode (start_pos > 0) RMS 결과 dump.
-                // forward_prefill은 in-place RMS이므로 x가 갱신된 상태.
-                if layer_idx == 0 && start_pos > 0 && seq_len == 1 {
-                    eprintln!(
-                        "[forward_prefill entered] layer=0 pos={start_pos} seq_len={seq_len}"
-                    );
-                    if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_RMS_OUT") {
-                        let mut bytes = vec![0u8; x.size()];
-                        let _ = backend.read_buffer(x, &mut bytes);
-                        let _ = std::fs::write(&p, &bytes);
-                        eprintln!(
-                            "[fallback-prefill-dump-rms layer=0 pos={start_pos}] wrote {} bytes to {p}",
-                            bytes.len()
-                        );
-                    }
-                }
             }
 
             // QKV: always GPU-only (attention partition removed — merge overhead exceeds benefit)
@@ -597,17 +581,24 @@ impl TransformerLayer {
                             };
                             if let Some(ocl) = direct {
                                 write_via(ocl)?;
-                            } else if let Some(qnn) = backend
-                                .as_any()
-                                .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>(
-                            ) {
-                                qnn.with_opencl_secondary(write_via)
-                                    .ok_or_else(|| anyhow::anyhow!(
-                                        "qnn_oppkg fallback prefill: OpenCL secondary unavailable"
-                                    ))??;
                             } else {
+                                #[cfg(feature = "qnn")]
+                                if let Some(qnn) = backend
+                                    .as_any()
+                                    .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>(
+                                ) {
+                                    qnn.with_opencl_secondary(write_via)
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "qnn_oppkg fallback prefill: OpenCL secondary unavailable"
+                                        ))??;
+                                } else {
+                                    anyhow::bail!(
+                                        "prefill flash_attn CPU fallback: backend not OpenCL nor qnn_oppkg+OpenCL secondary"
+                                    );
+                                }
+                                #[cfg(not(feature = "qnn"))]
                                 anyhow::bail!(
-                                    "prefill flash_attn CPU fallback: backend not OpenCL nor qnn_oppkg+OpenCL secondary"
+                                    "prefill flash_attn CPU fallback: backend not OpenCL"
                                 );
                             }
                         }

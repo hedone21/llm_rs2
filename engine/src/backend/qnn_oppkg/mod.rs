@@ -435,69 +435,6 @@ impl Backend for QnnOppkgBackend {
             fb.synchronize()?;
         }
 
-        // D-D.6 디버깅: KV cache 초기 상태 검증 (layer=0 pos=0).
-        if layer_idx == 0
-            && pos < 8
-            && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
-        {
-            let kv_k_nz = kv_k_bytes.iter().filter(|&&b| b != 0).count();
-            let kv_v_nz = kv_v_bytes.iter().filter(|&&b| b != 0).count();
-            // HeadMajor F16: head 0 token 0 = bytes [0..256] (head_dim=128 halves).
-            // Prefill에서 누적된 첫 토큰의 K vector 첫 32 byte hex dump.
-            eprintln!(
-                "[fast-dump-kv layer={layer_idx} pos={pos}] kv_k.len={} nonzero={} | kv_v nonzero={} | k[0..32]={:02x?}",
-                kv_k_bytes.len(),
-                kv_k_nz,
-                kv_v_nz,
-                &kv_k_bytes[..32.min(kv_k_bytes.len())]
-            );
-        }
-
-        // D-D.6 디버깅: 첫 fast path 호출 시 production state binary dump.
-        // microbench inject용. `_TARGET_POS=k` (default 6)로 dump 시점 지정.
-        // x_in / kv_k / kv_v 3개 파일 동시 dump.
-        let dump_target_pos = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_TARGET_POS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(6);
-        if layer_idx == 0 && pos == dump_target_pos {
-            if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_X") {
-                let _ = std::fs::write(&p, &x_bytes);
-                eprintln!(
-                    "[fast-dump-x layer={layer_idx} pos={pos}] wrote {} bytes to {p}",
-                    x_bytes.len()
-                );
-            }
-            if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_KV_K") {
-                let _ = std::fs::write(&p, &kv_k_bytes);
-                eprintln!(
-                    "[fast-dump-kv-k layer={layer_idx} pos={pos}] wrote {} bytes to {p}",
-                    kv_k_bytes.len()
-                );
-            }
-            if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_KV_V") {
-                let _ = std::fs::write(&p, &kv_v_bytes);
-                eprintln!(
-                    "[fast-dump-kv-v layer={layer_idx} pos={pos}] wrote {} bytes to {p}",
-                    kv_v_bytes.len()
-                );
-            }
-        }
-
-        // D-D.6 디버깅: 첫 진입 시 input bytes float dump (pos=0, layer=0).
-        let dump = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1")
-            && pos < 16
-            && layer_idx == 0;
-        if dump {
-            let xf = unsafe {
-                std::slice::from_raw_parts(x_bytes.as_ptr() as *const f32, 8.min(x_bytes.len() / 4))
-            };
-            eprintln!(
-                "[fast-dump layer={layer_idx} pos={pos} n_kv={n_kv}] x_in[0..8] = {:?}",
-                xf
-            );
-        }
-
         // mask: graph 내부 rpcmem buffer 사용 (M3.4 시점은 빈 slice).
         let empty_mask: &[u8] = &[];
 
@@ -513,31 +450,6 @@ impl Backend for QnnOppkgBackend {
             &mut x_out_bytes,
         )?;
         let exec_ns = t_exec.elapsed().as_nanos() as u64;
-
-        // D-D.6 디버깅: graph execute 후 x_out도 production reference로 dump.
-        if layer_idx == 0
-            && pos == dump_target_pos
-            && let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP_X_OUT")
-        {
-            let _ = std::fs::write(&p, &x_out_bytes);
-            eprintln!(
-                "[fast-dump-x-out layer={layer_idx} pos={pos}] wrote {} bytes to {p}",
-                x_out_bytes.len()
-            );
-        }
-
-        if dump {
-            let xof = unsafe {
-                std::slice::from_raw_parts(
-                    x_out_bytes.as_ptr() as *const f32,
-                    8.min(x_out_bytes.len() / 4),
-                )
-            };
-            eprintln!(
-                "[fast-dump layer={layer_idx} pos={pos} n_kv={n_kv}] x_out[0..8] = {:?}",
-                xof
-            );
-        }
 
         // graph rpcmem → OpenCL cl_mem write back.
         let t_write = std::time::Instant::now();

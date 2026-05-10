@@ -331,19 +331,6 @@ mod android {
                 x_out_bytes.len(),
                 out_slot.size
             );
-            // D-D.6 디버깅: pos=0에서 in/out rpcmem byte를 dump해서 microbench
-            // (직접 graphExecute, baked rpcmem)와 비교 — `lg.execute` wrap 자체가
-            // 결과를 변형하는지 확인.
-            if pos == 0 && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1") {
-                let in_f32 =
-                    unsafe { std::slice::from_raw_parts(in_slot.host_ptr as *const f32, 8) };
-                let out_f32 =
-                    unsafe { std::slice::from_raw_parts(out_slot.host_ptr as *const f32, 8) };
-                eprintln!(
-                    "[lg.execute pos=0 n_kv={n_kv}] in_slot[0..8]={:?} out_slot[0..8]={:?}",
-                    in_f32, out_f32
-                );
-            }
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     out_slot.host_ptr,
@@ -592,27 +579,6 @@ mod android {
         let (qg_q, qg_d) = pack_weight_q4_0(&weights.w_gate, ffn_dim, dim)?;
         let (qu_q, qu_d) = pack_weight_q4_0(&weights.w_up, ffn_dim, dim)?;
         let (qd_q, qd_d) = pack_weight_q4_0(&weights.w_down, dim, ffn_dim)?;
-        // D-D.6 디버깅: layer 0 weight bytes hash dump (FAST_PATH_DUMP 시).
-        if layer_idx == 0 && std::env::var("LLMRS_QNN_OPPKG_FAST_PATH_DUMP").as_deref() == Ok("1") {
-            let aos = tensor_bytes_owned(&weights.wq)?;
-            eprintln!(
-                "[graph-build layer=0 wq] aos.len={}, aos[0..16]={:02x?} qq_q.len={} qq_q[0..16]={:02x?} qq_d[0..4]={:?}",
-                aos.len(),
-                &aos[..16.min(aos.len())],
-                qq_q.len(),
-                &qq_q[..16.min(qq_q.len())],
-                &qq_d[..4.min(qq_d.len())]
-            );
-            let rms_pre = tensor_bytes_owned(&weights.attention_norm)?;
-            let rms_pre_f32 = unsafe {
-                std::slice::from_raw_parts(rms_pre.as_ptr() as *const f32, 8.min(rms_pre.len() / 4))
-            };
-            eprintln!(
-                "[graph-build layer=0 attention_norm] f32[0..8]={:?}",
-                rms_pre_f32
-            );
-        }
-
         // RMS norm weights — production은 F32 (1D, dim).
         let rms_pre_bytes = tensor_bytes_owned(&weights.attention_norm)?;
         let rms_post_bytes = tensor_bytes_owned(&weights.ffn_norm)?;

@@ -141,25 +141,6 @@ impl TransformerLayer {
             };
         }
 
-        // D-D.6 stage-by-stage byte dump. layer 0 + start_pos > 0 일 때만,
-        // 환경변수 `LLMRS_QNN_OPPKG_DUMP_FALLBACK_PREFIX=path`이 설정된 경우,
-        // tensor 내용을 `path.stageN` 파일에 byte-level로 저장. graph fast path
-        // (microbench raw chain) stage별 결과와 1:1 비교용.
-        macro_rules! dump_stage {
-            ($n:literal, $tensor:expr) => {
-                if args.layer_idx == 0 && start_pos > 0 {
-                    if let Ok(prefix) = std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_PREFIX") {
-                        let mut bytes = vec![0u8; $tensor.size()];
-                        if backend.read_buffer($tensor, &mut bytes).is_ok() {
-                            let path = format!("{}.stage{}", prefix, $n);
-                            let _ = std::fs::write(&path, &bytes);
-                            eprintln!("[fallback-dump-s{}] {} bytes -> {}", $n, bytes.len(), path);
-                        }
-                    }
-                }
-            };
-        }
-
         let rms_norm_add_unit = args.rms_norm_add_unit;
         let use_gelu_tanh = args.use_gelu_tanh;
         let layer_idx = args.layer_idx;
@@ -179,7 +160,6 @@ impl TransformerLayer {
         let tr = tr_start!();
         // Stage 0: input x (pre-norm) — embedding-time tensor.
         // microbench의 LLMRS_MICROBENCH_X_FILE inject와 비교용.
-        dump_stage!(0, x);
         let consumed_fused = if partition_fused
             && layer_idx > 0
             && ws.partition_prev_gpu_partial.is_some()
@@ -218,22 +198,7 @@ impl TransformerLayer {
         }
         prof_record!(t, rms_norm);
 
-        // D-D.6 디버깅: layer 0 + start_pos > 0 (첫 decode) RMS output을
-        // file에 dump. microbench raw chain RMS와 byte 비교용.
-        if args.layer_idx == 0 && start_pos > 0 {
-            eprintln!("[forward_gen entered] layer=0 pos={start_pos}");
-            if let Ok(p) = std::env::var("LLMRS_QNN_OPPKG_DUMP_FALLBACK_RMS_OUT") {
-                let mut bytes = vec![0u8; ws.residual.size()];
-                let _ = backend.read_buffer(&ws.residual, &mut bytes);
-                let _ = std::fs::write(&p, &bytes);
-                eprintln!(
-                    "[fallback-dump-rms layer=0 pos={start_pos}] wrote {} bytes to {p}",
-                    bytes.len()
-                );
-            }
-        }
         // Stage 1: post attention-norm (ws.residual = norm(x))
-        dump_stage!(1, &ws.residual);
         tr_record!(tr, RmsNormAttn);
 
         // 2. QKV Projections from normalized x (ws.residual) — fused dispatch for F16 CPU
@@ -337,9 +302,6 @@ impl TransformerLayer {
         }
         prof_record!(t, matmul_qkv);
         // Stage 2/3/4: QKV matmul outputs (pre-bias, pre-RoPE)
-        dump_stage!(2, &ws.q);
-        dump_stage!(3, &ws.k);
-        dump_stage!(4, &ws.v);
         tr_record!(tr, MatmulQkv);
 
         // QKV bias extension point
@@ -390,8 +352,6 @@ impl TransformerLayer {
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
         prof_record!(t, rope);
         // Stage 5/6: post-RoPE Q and K (in-place on ws.q / ws.k)
-        dump_stage!(5, &ws.q);
-        dump_stage!(6, &ws.k);
         tr_record!(tr, Rope);
 
         // 4. KV Cache Update - cast to target dtype if needed
@@ -537,8 +497,6 @@ impl TransformerLayer {
             let (k_cache, v_cache) = kv_cache.get_view();
             // Stage 7/8: post KvScatter — full KV K/V cache buffers dump.
             // (microbench `LLMRS_MICROBENCH_KV_K_FILE/_KV_V_FILE` inject용 baseline).
-            dump_stage!(7, &k_cache);
-            dump_stage!(8, &v_cache);
 
             // Use dtype-aware attention for non-F32 KV caches (F16, Q4_0).
             // On GPU: also guard that KV buffers are actual GPU buffers (not CPU-only
@@ -1153,7 +1111,6 @@ impl TransformerLayer {
         // 6. Output Projection
         prof_record!(t, attention);
         // Stage 9: attention output (pre O-proj)
-        dump_stage!(9, &ws.out_attn);
         tr_record!(tr, Attention);
 
         let t = prof_start!();
@@ -1164,7 +1121,6 @@ impl TransformerLayer {
         clear_label();
         prof_record!(t, matmul_wo);
         // Stage 10: O proj output (pre residual+norm)
-        dump_stage!(10, &ws.attn_out);
         tr_record!(tr, MatmulWo);
 
         // 7+8. Post-attention residual + pre-FFN norm
@@ -1202,7 +1158,6 @@ impl TransformerLayer {
         }
         prof_record!(t, rms_norm);
         // Stage 11: post FFN-norm (ws.residual = norm(x + attn_out))
-        dump_stage!(11, &ws.residual);
         tr_record!(tr, RmsNormFfn);
 
         // 9. FFN — gate + up projections (3 paths: partition, fused NEON, generic)
@@ -1559,10 +1514,7 @@ impl TransformerLayer {
         // (SiLU path) fuses silu(gate)*up into ws.gate, so stage 12 == 14 in
         // the fused branch. GELU path keeps them separated and stage 14 is
         // taken after the explicit gelu_tanh_mul below.
-        dump_stage!(12, &ws.gate);
-        dump_stage!(13, &ws.up);
         if !use_gelu_tanh {
-            dump_stage!(14, &ws.gate);
         }
         tr_record!(tr, MatmulFfnGateUp);
 
@@ -1578,7 +1530,6 @@ impl TransformerLayer {
                 backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
                 prof_record!(t, silu_mul);
                 // Stage 14 (GELU path): gelu_tanh(gate) * up landed in ws.gate
-                dump_stage!(14, &ws.gate);
                 tr_record!(tr, SiluMul);
             }
 
@@ -1589,7 +1540,6 @@ impl TransformerLayer {
             clear_label();
             prof_record!(t, matmul_ffn);
             // Stage 15: down matmul output (pre residual add)
-            dump_stage!(15, &ws.down);
             tr_record!(tr, MatmulFfnDown);
         }
 
@@ -1615,7 +1565,6 @@ impl TransformerLayer {
         // Stage 16: final layer output (x = x + down). Note: when skip_final_add
         // is set (partition_fused on non-last layer), the add is deferred to
         // next layer's fused_norm_merge — Stage 16 captures the deferred state.
-        dump_stage!(16, x);
         tr_record!(tr, AddAssign);
 
         if let Some(ref mut p) = profiler {

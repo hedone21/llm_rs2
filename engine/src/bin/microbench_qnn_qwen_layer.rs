@@ -742,9 +742,9 @@ fn run_layer(
         eprintln!("[microbench-dump-rms] wrote {} bytes to {p}", bytes.len());
     }
 
-    // D-D.6 stage-by-stage dump (LLMRS_MICROBENCH_DUMP_PREFIX=path).
-    // 각 stage 결과를 `path.stageN`에 binary로 저장. forward_gen
-    // (`LLMRS_QNN_OPPKG_DUMP_FALLBACK_PREFIX`)와 stage 번호 1:1 매칭.
+    // Microbench stage-by-stage dump (LLMRS_MICROBENCH_DUMP_PREFIX=path).
+    // 각 stage 결과를 `path.stageN`에 binary로 저장. graph build/execute
+    // 디버깅용 standalone tool.
     macro_rules! dump_stage_mb {
         ($stage:literal, $buf:expr, $nbytes:expr) => {
             if let Ok(prefix) = std::env::var("LLMRS_MICROBENCH_DUMP_PREFIX") {
