@@ -490,7 +490,12 @@ impl TransformerModel {
         }
 
         let backend = runtime_backend.clone();
-        let is_gpu = backend.name() == "OpenCL" || backend.name() == "cuda-embedded";
+        // GPU dispatch covers any backend reporting `is_gpu() == true` — at
+        // present OpenCL, CUDA (cuda_pc / cuda_embedded), and qnn_oppkg. The
+        // legacy `name()` comparison (`"OpenCL" || "cuda-embedded"`) silently
+        // skipped GPU upload for qnn_oppkg, leaving lm_head as a CPU
+        // SharedBuffer that `OpenCLBackend::matmul_q4_0` would later reject.
+        let is_gpu = backend.is_gpu();
         let numel = rows * cols;
 
         // Step 1: read lm_head data into an F32 host buffer (dequantize as
