@@ -94,13 +94,58 @@
 | P5 | mid-decode swap (--swap-delay-tokens N) 재측정 | production scenario 검증 |
 | P6 | LISWAP-6 cleanup segfault 수정 (task #33) | Done. 후 segfault, 별도 디버깅 |
 
-## 변경 파일 (커밋 후보)
+## 변경 파일 (커밋 완료)
 
-- `engine/src/models/weights/swap_executor.rs` — 작업 A + C
-- (기존 미커밋: Phase 5b 의 `build_tensor_from_mmap_async_for_hook` alias skip)
+- commit `ca6d041`: swap_executor.rs (Phase 5b alias H2D-skip + 작업 C + queue peak diag), generate.rs (--swap-layer-immediate), .gitignore (.claude/worktrees/)
+- commit `1359596`: 본 handoff 문서
+
+## 다음 세션 시작 가이드 (cold start)
+
+### 1. 현재 상태 확인
+```bash
+git log --oneline -5
+# 1359596 docs(liswap6): handoff — async pertick=2 production winner ...
+# ca6d041 feat(liswap6): Phase 5b/6 alias H2D-skip + layer-immediate ...
+```
+
+### 2. Production 사용
+```bash
+./generate \
+  -m qwen2.5-1.5b-f16.gguf --tokenizer-path tokenizer.json \
+  --secondary-gguf qwen2.5-1.5b-q4_0.gguf \
+  --force-swap-ratio 0.9 \
+  --swap-incremental-per-tick 2 --swap-async-dispatch \
+  --backend qnn_oppkg \
+  -p "<your prompt>" -n 30
+```
+
+### 3. Queue peak 검증 (선택)
+```bash
+LLMRS_SWAP_DRAIN_DIAG=1 ./generate ...
+# stderr: [SwapPeak] mode=async target_layers=25 max_release_pending=0 max_dispatcher_pending=1
+# → rel ≤ 0, disp ≤ 1 이어야 spike 없음
+```
+
+### 4. 측정 reproduce (필요시)
+```bash
+adb shell "cd /data/local/tmp && \
+  export LD_LIBRARY_PATH=/data/local/tmp:/data/local/tmp/qnn:\$LD_LIBRARY_PATH && \
+  export ADSP_LIBRARY_PATH=/data/local/tmp/qnn && \
+  export LLMRS_SWAP_DRAIN_DIAG=1 LLMRS_PER_TOKEN_MS=1 && \
+  ./generate -m ... --swap-incremental-per-tick 2 --swap-async-dispatch ... -n 30 \
+  --backend qnn_oppkg --temperature 0"
+```
+
+## 다음 세션 첫 작업 추천
+
+P1 부터 진행 권장:
+1. `engine/src/bin/generate.rs` 의 `swap_incremental_per_tick` default 값을 0 → 2 변경
+2. `swap_async_dispatch` default 값을 false → true 변경
+3. CLI 검증: `swap_incremental_per_tick > 2` 면 `eprintln!("warning: K>2 causes memory spike, see handoff_swap_memory_spike_constraint")`
+4. 회귀 테스트: 동일 mode 실행해 측정 결과 변동 없는지 검증
 
 ## 참고
 
-- 진단 보고서: 본 세션 transcript (Adreno release_worker GPU flush 발견)
-- 이전 작업: `handoff_phase_aware_win_attempt_followup_2026_05_11.md` (Phase 5b)
-- 측정 raw: `/tmp/swap_bench_out/`, `/tmp/swap_pertick_sweep_20260511_104011/`
+- 측정 raw: `/tmp/swap_bench_out/`, `/tmp/swap_pertick_sweep_20260511_104011/`, `/tmp/swap_bench8_out/`
+- 이전 작업 handoff: `handoff_phase_aware_win_attempt_followup_2026_05_11.md` (Phase 5b)
+- Memory feedback: `feedback_no_memory_spike.md`, `feedback_swap_async_default.md`
