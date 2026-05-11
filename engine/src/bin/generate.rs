@@ -892,9 +892,11 @@ struct Args {
     /// Requires `--swap-incremental-per-tick > 0`. When `=0` or absent,
     /// has no effect (silently ignored).
     ///
-    /// Currently a prototype: measurement-driven decision on whether to
-    /// promote to production. See plan/compiled-chasing-hopper.md.
-    #[arg(long, default_value_t = false)]
+    /// **Default ON (2026-05-12)** — async dispatch는 production winner mode의
+    /// 기본 구성 요소. `--swap-incremental-per-tick 0` (swap 비활성)일 때는
+    /// 자동 무시되므로 swap을 쓰지 않는 경우에도 안전. sync path를 명시적으로
+    /// 원하면 `--swap-async-dispatch=false`.
+    #[arg(long, default_value_t = true)]
     swap_async_dispatch: bool,
 
     /// LISWAP-3 prototype (Direction A): use a `CL_MEM_ALLOC_HOST_PTR` slot
@@ -990,7 +992,11 @@ struct Args {
     /// Memory-spike avoidance is the hard constraint: K is monotone
     /// non-increasing after calibration and a reactive pause skips swap when
     /// the release queue is non-empty. See `dynamic_k.rs` for the algorithm.
-    #[arg(long, default_value_t = false)]
+    ///
+    /// **Default ON (2026-05-12)** — production winner mode의 기본 구성 요소.
+    /// `--swap-incremental-per-tick 0`일 때는 자동 무시되므로 항상 안전한 default.
+    /// 정적 K를 원하면 `--swap-dynamic-k=false`.
+    #[arg(long, default_value_t = true)]
     swap_dynamic_k: bool,
 
     /// Phase-aware swap chunk 진단 size (MB). v1 per-tensor chunking에서는
@@ -2862,11 +2868,8 @@ fn main() -> anyhow::Result<()> {
                 None
             }
         } else {
-            if args.swap_async_dispatch && args.swap_incremental_per_tick == 0 {
-                eprintln!(
-                    "[LISWAP-2] --swap-async-dispatch ignored: requires --swap-incremental-per-tick > 0"
-                );
-            }
+            // --swap-async-dispatch는 production default가 ON (2026-05-12).
+            // per_tick == 0 (swap 비활성)일 때 silent ignore.
             None
         }
     };
@@ -2881,11 +2884,8 @@ fn main() -> anyhow::Result<()> {
                 args.swap_incremental_per_tick,
             ))
         } else {
-            if args.swap_dynamic_k {
-                eprintln!(
-                    "[DynamicK] --swap-dynamic-k ignored: requires --swap-incremental-per-tick > 0"
-                );
-            }
+            // --swap-dynamic-k는 production default가 ON (2026-05-12).
+            // per_tick == 0 (swap 비활성)일 때 silent ignore.
             None
         };
     let dynamic_k_diag = std::env::var("LLMRS_DYNAMIC_K_DIAG")

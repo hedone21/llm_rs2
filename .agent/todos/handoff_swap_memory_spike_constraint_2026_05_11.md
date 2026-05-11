@@ -36,13 +36,16 @@
 
 | 순위 | Mode | F+S (ms) | rel_max | disp_max | 1-peak? | decode |
 |---|---|---:|---:|---:|:---:|---|
-| 🥇 | **async2 (--swap-incremental-per-tick 2 --swap-async-dispatch)** ★ | **316.7** | **0** | **1** | ✓ | 정상 |
-| 🥈 | sync1 (명시적 요청 시에만) | 320.1 | **0** | **0** | ✓ | 정상 |
-| 🥉 | async1 | 322.6 | **0** | **0** | ✓ | 정상 |
+| 🥇 | **async2 dynamic-K + sub-batch pause (2026-05-12 후속)** ★★ | **31.2 ms TBT** | 0 | 1 | ✓ | 정상 |
+| 🥈 | async2 정적 (`--swap-incremental-per-tick 2 --swap-async-dispatch`) | 316.7 / 33.2 ms TBT | 0 | 1 | ✓ | 정상 |
+| 🥉 | sync1 (명시적 요청 시에만) | 320.1 | 0 | 0 | ✓ | 정상 |
+| - | async1 | 322.6 | 0 | 0 | ✓ | 정상 |
+
+**최종 winner (2026-05-12)**: `--swap-incremental-per-tick 2 --swap-async-dispatch --swap-dynamic-k`. last 두 flag는 CLI default ON (2026-05-12 변경). 상세는 **`handoff_dynamic_k_2026_05_12.md`** 와 **`docs/swap_dynamic_k_guide.md`** 참조.
 
 **정책**: weight swap 은 async path 가 default (`--swap-async-dispatch`). sync 는 명시적 요청 시에만 사용 (`feedback_swap_async_default.md`).
 
-**Safe K 상한 = 2** (Adreno Qwen2.5-1.5B + LISWAP-6 alias 실측). K=3 부터 rel_max=1 + decode garbage (mixed-weight race) 발생.
+**Safe K 상한 = 2** (Adreno Qwen2.5-1.5B + LISWAP-6 alias 실측). K=3 부터 rel_max=1 + decode garbage 발생. hard_upper=2 cap은 release time이 아니라 **ArcSwap mid-forward commit quality drift**가 결정 — release가 빨라져도 cap은 안 풀림.
 
 ### ❌ Production 채택 불가 (release queue backlog spike 또는 decode 깨짐)
 
