@@ -2829,6 +2829,15 @@ fn main() -> anyhow::Result<()> {
     let mut incremental_force_swap_plan: Option<llm_rs2::models::weights::IncrementalSwapPlan> =
         None;
 
+    // LISWAP-6 manager path: when manager triggers SwapWeights, the plan is
+    // committed to `incremental_force_swap_plan` and this state records the
+    // information needed to send WeightSwapReport on plan completion.
+    // Fields: (ratio, total_layers_planned, plan_start_time, qcf_swap_estimated)
+    let mut manager_swap_report_pending: Option<(f32, usize, std::time::Instant, f32)> = None;
+    // Populated by the plan-done block (outside executor scope); consumed by the
+    // executor checkpoint block (inside executor scope) the same token tick.
+    let mut ready_weight_swap_report: Option<llm_shared::WeightSwapReport> = None;
+
     // LISWAP-4 (ENG-ALG-237 / INV-150): intra-forward layer-aligned swap hook.
     // Created when `--swap-intra-forward` + `--force-swap-ratio` both active.
     // Decode loop injects `Some(&*hook)` into `layer_boundary_hook` and calls
@@ -2849,10 +2858,13 @@ fn main() -> anyhow::Result<()> {
 
     // LISWAP-2 prototype: async swap dispatcher lifecycle.
     // Created once here; used in the decode loop when async dispatch is active.
-    // `None` when --swap-async-dispatch is false, per_tick == 0, or the backend
-    // does not support async transfer.
+    // `None` when --swap-async-dispatch is false or the backend does not support
+    // async transfer.
+    // NOTE: also created when per_tick == 0 so that manager-triggered incremental
+    // swap (LISWAP-6 manager path) can use async dispatch even without
+    // --swap-incremental-per-tick CLI flag.
     let async_swap_dispatcher: Option<llm_rs2::models::weights::AsyncSwapDispatcher> = {
-        if args.swap_async_dispatch && args.swap_incremental_per_tick > 0 {
+        if args.swap_async_dispatch {
             let swap_backend: Arc<dyn Backend> = gpu_backend_arc
                 .as_ref()
                 .cloned()
@@ -2862,30 +2874,34 @@ fn main() -> anyhow::Result<()> {
                     swap_backend,
                 ))
             } else {
-                eprintln!(
-                    "[LISWAP-2] backend does not support async transfer; falling back to sync incremental swap"
-                );
+                if args.swap_incremental_per_tick > 0 {
+                    eprintln!(
+                        "[LISWAP-2] backend does not support async transfer; falling back to sync incremental swap"
+                    );
+                }
                 None
             }
         } else {
-            // --swap-async-dispatch는 production default가 ON (2026-05-12).
-            // per_tick == 0 (swap 비활성)일 때 silent ignore.
             None
         }
     };
 
-    // LISWAP-6 — Dynamic K controller. Active only when both `--swap-dynamic-k`
-    // and `--swap-incremental-per-tick > 0` are set. The explicit per-tick value
-    // is treated as the *hard upper cap*; controller starts at K=1 and may grow
-    // up to that value during Phase 0 calibration but never exceeds it.
+    // LISWAP-6 — Dynamic K controller. Active when `--swap-dynamic-k` is set.
+    // The hard upper cap is taken from `--swap-incremental-per-tick` (CLI path)
+    // or defaults to 2 (manager path, per LISWAP-6 measurement matrix).
+    // Created even when per_tick == 0 so that manager-triggered incremental swap
+    // can use dynamic-K calibration without requiring the CLI flag.
     let mut dynamic_k_controller: Option<llm_rs2::models::weights::DynamicKController> =
-        if args.swap_dynamic_k && args.swap_incremental_per_tick > 0 {
+        if args.swap_dynamic_k {
+            let hard_upper = if args.swap_incremental_per_tick > 0 {
+                args.swap_incremental_per_tick
+            } else {
+                2 // default hard cap for manager-triggered path (K=2 per LISWAP-6)
+            };
             Some(llm_rs2::models::weights::DynamicKController::new(
-                args.swap_incremental_per_tick,
+                hard_upper,
             ))
         } else {
-            // --swap-dynamic-k는 production default가 ON (2026-05-12).
-            // per_tick == 0 (swap 비활성)일 때 silent ignore.
             None
         };
     let dynamic_k_diag = std::env::var("LLMRS_DYNAMIC_K_DIAG")
@@ -6031,6 +6047,54 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     incremental_force_swap_plan = None;
+
+                    // LISWAP-6 manager path: build WeightSwapReport when the plan
+                    // was committed by dispatch_swap_weights (manager signal).
+                    // Stored in `ready_weight_swap_report`; sent by executor block
+                    // later this token tick (executor scope is separate).
+                    if let Some((ratio, n_planned, plan_start, qcf_estimated)) =
+                        manager_swap_report_pending.take()
+                    {
+                        use llm_rs2::models::weights::compute_qcf_swap;
+                        let latency_ms = plan_start.elapsed().as_millis() as u64;
+                        let n_layers = model.layers.len();
+                        let actually_swapped_now: Vec<usize> = (0..n_layers)
+                            .filter(|&i| model.layers[i].current_dtype() == DType::Q4_0)
+                            .collect();
+                        let qcf_swap_actual = if actually_swapped_now.is_empty() {
+                            qcf_estimated
+                        } else {
+                            compute_qcf_swap(
+                                &actually_swapped_now,
+                                &model.quant_noise,
+                                importance_table_for_swap.as_ref(),
+                                n_layers,
+                            )
+                        };
+                        let layers_swapped: Vec<llm_shared::LayerSwapEntry> = actually_swapped_now
+                            .iter()
+                            .map(|&idx| llm_shared::LayerSwapEntry {
+                                layer_idx: idx as u32,
+                                from_dtype: llm_shared::DtypeTag::F16,
+                                to_dtype: llm_shared::DtypeTag::Q4_0,
+                            })
+                            .collect();
+                        eprintln!(
+                            "[WeightSwap] manager plan complete: ratio={:.2}, planned={}, \
+                             actually_q4={}, qcf_swap={:.4}, latency={}ms",
+                            ratio,
+                            n_planned,
+                            layers_swapped.len(),
+                            qcf_swap_actual,
+                            latency_ms,
+                        );
+                        ready_weight_swap_report = Some(llm_shared::WeightSwapReport {
+                            layers_swapped,
+                            freed_bytes: 0,
+                            latency_ms,
+                            qcf_swap_actual,
+                        });
+                    }
                 }
             }
             // ── End Layer-Incremental Swap dispatch ────────────────────────────
@@ -6453,26 +6517,28 @@ fn main() -> anyhow::Result<()> {
                     });
                 }
 
-                // ENG-ALG-214-ROUTE: direct dispatch of SwapWeights command.
-                // Validation → WeightSwapDecider → SwapExecutor → WeightSwapReport.
+                // ENG-ALG-214-ROUTE (LISWAP-6 manager path): SwapWeights →
+                // IncrementalSwapPlan commit. decode loop drains K=2 layers/tick
+                // with dynamic-K + sub-batch pause. WeightSwapReport sent on
+                // plan completion (see plan-done block below).
                 if let Some((ratio, target_dtype)) = plan.swap_weights {
                     dispatch_swap_weights(
                         &model,
                         ratio,
                         target_dtype,
                         importance_table_for_swap.as_ref(),
-                        executor,
-                        gpu_backend_arc.as_ref(),
-                        &cpu_backend_arc,
+                        decode_token_index,
+                        &mut incremental_force_swap_plan,
+                        &mut manager_swap_report_pending,
                     );
-                    #[cfg(feature = "opencl")]
-                    remap_weights_for_cpu_after_swap(
-                        &mut model,
-                        &backend,
-                        is_gpu,
-                        args.resilience_prealloc_switch,
-                        "SwapWeights",
-                    );
+                    // Note: remap_weights_for_cpu_after_swap will be called
+                    // per-chunk in the incremental swap dispatch block above.
+                }
+
+                // LISWAP-6 manager path: send completed WeightSwapReport.
+                // Built by the plan-done block (before executor scope), consumed here.
+                if let Some(report) = ready_weight_swap_report.take() {
+                    executor.send_weight_swap_report(report);
                 }
 
                 if let Some(evict) = &plan.evict {
@@ -8064,24 +8130,31 @@ fn run_qcf_warmup_workflow(
     })
 }
 
-/// Execute a SwapWeights command: validate → decide → execute → report.
+/// Execute a SwapWeights command from the manager: validate → decide → commit
+/// incremental plan → report on plan completion.
 ///
-/// This is the direct-dispatch path mandated by ENG-ALG-214-ROUTE.  The
-/// function sends `CommandResult::Ok` first (via `executor.respond_ok()`),
-/// then follows up with `EngineMessage::WeightSwapReport`.
+/// LISWAP-6 manager path: instead of sync single-shot execution, this function
+/// commits an `IncrementalSwapPlan` (K=2, dynamic-K + sub-batch pause) to the
+/// decode loop via `swap_plan_out`. The decode loop drains the plan per tick.
+/// `WeightSwapReport` is sent when the plan completes (see plan-done block in
+/// the decode loop). Manager receives "received" acknowledgment immediately
+/// (via the existing executor ack in the command dispatch site), and the final
+/// WeightSwapReport arrives on plan completion.
 ///
-/// Rejection (no-secondary, invalid-ratio, unsupported-dtype) is logged to
-/// stderr; no `WeightSwapReport` is sent for rejected commands.
+/// Rejection (no-secondary, invalid-ratio, unsupported-dtype, in-flight plan)
+/// is logged to stderr; no plan is committed.
 fn dispatch_swap_weights(
     model: &llm_rs2::models::transformer::TransformerModel,
     ratio: f32,
     target_dtype: llm_shared::DtypeTag,
     importance_table: Option<&llm_rs2::core::qcf::ImportanceTable>,
-    executor: &mut llm_rs2::resilience::CommandExecutor,
-    gpu_backend: Option<&std::sync::Arc<dyn llm_rs2::core::backend::Backend>>,
-    cpu_backend: &std::sync::Arc<dyn llm_rs2::core::backend::Backend>,
+    decode_token_index: usize,
+    swap_plan_out: &mut Option<llm_rs2::models::weights::IncrementalSwapPlan>,
+    manager_report_out: &mut Option<(f32, usize, std::time::Instant, f32)>,
 ) {
-    use llm_rs2::models::weights::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
+    use llm_rs2::models::weights::{
+        IncrementalSwapPlan, SwapDecision, WeightSwapDecider, compute_qcf_swap,
+    };
     use llm_shared::DtypeTag;
 
     // ── 1. Validation ──────────────────────────────────────────────────────
@@ -8097,6 +8170,18 @@ fn dispatch_swap_weights(
         eprintln!(
             "[WeightSwap] Rejected: unsupported_dtype ({:?}) (INV-126)",
             target_dtype
+        );
+        return;
+    }
+
+    // ── 1b. In-flight plan check ───────────────────────────────────────────
+    // Reject if a plan is already in flight (CLI or manager). Prevents
+    // concurrent plan conflict (spec: manager signal accept only when no plan).
+    if swap_plan_out.is_some() {
+        eprintln!(
+            "[WeightSwap] Rejected: incremental plan already in-flight (ratio={:.2}). \
+             Wait for current plan to complete before sending a new SwapWeights signal.",
+            ratio
         );
         return;
     }
@@ -8122,90 +8207,38 @@ fn dispatch_swap_weights(
             ratio,
             currently_swapped.len()
         );
-        // Empty swap is Ok per spec (already fully swapped)
+        // Empty swap is Ok per spec (already fully swapped); no plan committed.
         return;
     }
 
-    // ── 4. Execute ─────────────────────────────────────────────────────────
-    match run_layer_swap(
-        model,
+    // ── 4. Compute QCF estimate for the planned layers ─────────────────────
+    let qcf_swap_estimated = compute_qcf_swap(
         &decision.selected_layers,
-        gpu_backend,
-        cpu_backend,
-        None,
-        // LISWAP-3: signal-driven dispatch path does not exercise the
-        // pool yet — Stage 3 prototype only wires --force-swap-ratio paths.
-        #[cfg(feature = "opencl")]
-        None,
-    ) {
-        Ok(report) => {
-            // SwapExecutor measures execute()-only latency in `report.latency_ms`,
-            // which matches the prior `t_start.elapsed()` scope (the executor
-            // construction itself is sub-microsecond and was excluded before).
-            let latency_ms = report.latency_ms as u64;
+        &model.quant_noise,
+        importance_table,
+        n_layers,
+    );
 
-            // ── 5. Build WeightSwapReport (MSG-089) ──────────────────────
-            let layers_swapped: Vec<llm_shared::LayerSwapEntry> = report
-                .swapped
-                .iter()
-                .map(|s| llm_shared::LayerSwapEntry {
-                    layer_idx: s.layer_idx as u32,
-                    from_dtype: llm_shared::DtypeTag::F16, // primary is F16 by convention
-                    to_dtype: llm_shared::DtypeTag::Q4_0,
-                })
-                .collect();
+    // ── 5. Commit incremental plan (K=2, same as CLI --swap-incremental-per-tick 2) ──
+    let n_planned = decision.selected_layers.len();
+    let per_tick = 2usize; // LISWAP-6: K=2 hard upper cap for manager path
+    let ticks_est = n_planned.div_ceil(per_tick);
+    eprintln!(
+        "[WeightSwap] manager path: ratio={:.2}, {} target layers, per_tick={} ({} ticks estimated), qcf_estimated={:.4}",
+        ratio, n_planned, per_tick, ticks_est, qcf_swap_estimated,
+    );
 
-            // Compute actual QCF_swap for the layers that were actually swapped.
-            let actually_swapped: Vec<usize> = report.swapped.iter().map(|s| s.layer_idx).collect();
-            let qcf_swap_actual = if actually_swapped.is_empty() {
-                0.0
-            } else {
-                compute_qcf_swap(
-                    &actually_swapped,
-                    &model.quant_noise,
-                    importance_table,
-                    n_layers,
-                )
-            };
-
-            eprintln!(
-                "[WeightSwap] OK: ratio={:.2}, swapped={}/{}, qcf_swap={:.4}, latency={}ms",
-                ratio,
-                report.swapped.len(),
-                n_layers,
-                qcf_swap_actual,
-                latency_ms,
-            );
-            if let Some(ref stages) = report.stage_breakdown {
-                eprintln!("[WeightSwap] stages: {}", stages.to_log_line());
-            }
-
-            executor.send_weight_swap_report(llm_shared::WeightSwapReport {
-                layers_swapped,
-                freed_bytes: 0, // madvise accounting not yet wired here
-                latency_ms,
-                qcf_swap_actual,
-            });
-        }
-        Err(e) => {
-            // ENG-ALG-228: surface drain timeout distinctly so operators know
-            // the swap was rejected due to INV-141 rather than a data error.
-            if let llm_rs2::models::weights::SwapError::ReleaseDrainTimeout {
-                pending,
-                timeout_ms,
-            } = &e
-            {
-                eprintln!(
-                    "[WeightSwap] REJECTED (INV-141): release worker still has {} \
-                     pending job(s) after {}ms drain — swap skipped to prevent \
-                     memory leak accumulation",
-                    pending, timeout_ms
-                );
-            } else {
-                eprintln!("[WeightSwap] execute failed: {}", e);
-            }
-        }
-    }
+    *swap_plan_out = Some(IncrementalSwapPlan::new(
+        decision.selected_layers,
+        per_tick,
+        decode_token_index,
+    ));
+    *manager_report_out = Some((
+        ratio,
+        n_planned,
+        std::time::Instant::now(),
+        qcf_swap_estimated,
+    ));
 }
 
 /// Build `LayerSwapEstimate` from an available `ImportanceTable` + model noise table.
