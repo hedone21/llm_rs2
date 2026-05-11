@@ -979,6 +979,20 @@ struct Args {
     #[arg(long, default_value_t = false)]
     swap_layer_immediate: bool,
 
+    /// LISWAP-6 Dynamic-K controller — auto-tune `--swap-incremental-per-tick`
+    /// based on measured per-layer release cost vs forward wall.
+    ///
+    /// Requires `--swap-incremental-per-tick > 0` (the explicit value is treated
+    /// as the *hard upper cap* — controller starts at K=1 and may grow up to
+    /// the user-supplied value during Phase 0 calibration; never exceeds it).
+    /// Effective only together with `--swap-async-dispatch`.
+    ///
+    /// Memory-spike avoidance is the hard constraint: K is monotone
+    /// non-increasing after calibration and a reactive pause skips swap when
+    /// the release queue is non-empty. See `dynamic_k.rs` for the algorithm.
+    #[arg(long, default_value_t = false)]
+    swap_dynamic_k: bool,
+
     /// Phase-aware swap chunk 진단 size (MB). v1 per-tensor chunking에서는
     /// 실제 분할에 사용되지 않고 진단/보고 용도. 측정에 따라 v2에서 sub-tensor
     /// chunking 도입 시 활용 (4 MB sweet spot 기본).
@@ -2856,6 +2870,27 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
+
+    // LISWAP-6 — Dynamic K controller. Active only when both `--swap-dynamic-k`
+    // and `--swap-incremental-per-tick > 0` are set. The explicit per-tick value
+    // is treated as the *hard upper cap*; controller starts at K=1 and may grow
+    // up to that value during Phase 0 calibration but never exceeds it.
+    let mut dynamic_k_controller: Option<llm_rs2::models::weights::DynamicKController> =
+        if args.swap_dynamic_k && args.swap_incremental_per_tick > 0 {
+            Some(llm_rs2::models::weights::DynamicKController::new(
+                args.swap_incremental_per_tick,
+            ))
+        } else {
+            if args.swap_dynamic_k {
+                eprintln!(
+                    "[DynamicK] --swap-dynamic-k ignored: requires --swap-incremental-per-tick > 0"
+                );
+            }
+            None
+        };
+    let dynamic_k_diag = std::env::var("LLMRS_DYNAMIC_K_DIAG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
     // ── LISWAP-3 prototype (Direction A): ALLOC_HOST_PTR pool ────────────
     // Lazy-init the swap pool when the user opted in via `--swap-zero-copy`
@@ -5848,7 +5883,41 @@ fn main() -> anyhow::Result<()> {
             //   new signals during flight are ignored (plan runs to completion).
             // INV-145: empty chunk is never passed to execute_on_slots.
             if let Some(ref mut inc_plan) = incremental_force_swap_plan {
-                let chunk = inc_plan.drain_chunk();
+                // LISWAP-6 Dynamic-K: reactive pause + per-tick override.
+                //
+                // - Pause: release queue non-empty → skip swap this tick (K
+                //   stays unchanged). Calibration tick is exempt because it
+                //   has to dispatch K=1 to measure drop cost.
+                // - Pre-drain: inject controller's current K into the plan.
+                let mut dyn_k_pause = false;
+                if let Some(ref ctrl) = dynamic_k_controller {
+                    let pending = model.release_worker.pending_count();
+                    if ctrl.is_calibrated() && ctrl.should_pause(pending) {
+                        dyn_k_pause = true;
+                        if dynamic_k_diag {
+                            eprintln!(
+                                "[DynamicK] pause t={} pending={} k={}",
+                                decode_token_index,
+                                pending,
+                                ctrl.current_k()
+                            );
+                        }
+                    } else {
+                        // Calibration tick forces K=1 (sync measurement);
+                        // subsequent ticks use the controller's current K.
+                        let k = if ctrl.is_calibrated() {
+                            ctrl.current_k()
+                        } else {
+                            1
+                        };
+                        inc_plan.set_per_tick(k);
+                    }
+                }
+                let chunk = if dyn_k_pause {
+                    Vec::new()
+                } else {
+                    inc_plan.drain_chunk()
+                };
                 if !chunk.is_empty() {
                     let t_swap = std::time::Instant::now();
                     match run_layer_swap(
@@ -5880,6 +5949,40 @@ fn main() -> anyhow::Result<()> {
                                 args.resilience_prealloc_switch,
                                 "incremental-swap",
                             );
+
+                            // LISWAP-6 Dynamic-K Phase 0 calibration. Runs only on
+                            // the first successfully-dispatched chunk; drains the
+                            // async transfer queue and spins on release_worker
+                            // until pending == 0 to measure the worst-case per-
+                            // layer drop cost. From there on the controller runs
+                            // async (no sync waits).
+                            if let Some(ref mut ctrl) = dynamic_k_controller
+                                && !ctrl.is_calibrated()
+                                && !chunk.is_empty()
+                            {
+                                if let Some(ref dispatcher) = async_swap_dispatcher {
+                                    let _ = dispatcher.drain(std::time::Duration::from_millis(500));
+                                }
+                                let calib_start = std::time::Instant::now();
+                                let timeout = std::time::Duration::from_millis(100);
+                                while model.release_worker.pending_count() > 0
+                                    && calib_start.elapsed() < timeout
+                                {
+                                    std::hint::spin_loop();
+                                }
+                                let drop_total = calib_start.elapsed().as_secs_f64() * 1000.0;
+                                let drop_ms_per_layer = (drop_total / chunk.len() as f64) as f32;
+                                ctrl.calibrate(drop_ms_per_layer, forward_ms as f32);
+                                if dynamic_k_diag {
+                                    eprintln!(
+                                        "[DynamicK] calibrated t={} drop_ms={:.3} fwd_ms={:.2} safe_k={}",
+                                        decode_token_index,
+                                        drop_ms_per_layer,
+                                        forward_ms,
+                                        ctrl.current_k()
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -5887,6 +5990,23 @@ fn main() -> anyhow::Result<()> {
                                 decode_token_index, e
                             );
                         }
+                    }
+                }
+
+                // LISWAP-6 Dynamic-K Phase 1+: observe forward wall, shrink K
+                // if the forward got tighter than anything seen so far.
+                if let Some(ref mut ctrl) = dynamic_k_controller
+                    && ctrl.is_calibrated()
+                {
+                    let prev_k = ctrl.current_k();
+                    ctrl.observe_forward(forward_ms as f32);
+                    if dynamic_k_diag && ctrl.current_k() != prev_k {
+                        eprintln!(
+                            "[DynamicK] k_decrease t={} fwd_ms={:.2} new_k={}",
+                            decode_token_index,
+                            forward_ms,
+                            ctrl.current_k()
+                        );
                     }
                 }
                 // ENG-ALG-233: retire plan when all layers have been drained (INV-145).

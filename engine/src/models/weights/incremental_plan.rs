@@ -79,6 +79,15 @@ impl IncrementalSwapPlan {
     pub fn started_at_token(&self) -> usize {
         self.started_at_token
     }
+
+    /// Update the per-tick chunk budget. Used by `DynamicKController` to inject
+    /// the calibrated/observed `K` value before each `drain_chunk` call.
+    ///
+    /// `per_tick == 0` is accepted and turns `drain_chunk` into a no-op for
+    /// that tick (used by the reactive-pause branch).
+    pub fn set_per_tick(&mut self, per_tick: usize) {
+        self.per_tick = per_tick;
+    }
 }
 
 #[cfg(test)]
