@@ -460,10 +460,46 @@ impl<'a> SwapExecutor<'a> {
         let diag_enabled = std::env::var("LLMRS_SWAP_DRAIN_DIAG")
             .map(|v| v == "1")
             .unwrap_or(false);
+        // ── Sub-batch reactive pause (LISWAP-6 follow-up) ───────────────────
+        // Solves the time-asymmetry between the dynamic-K controller's
+        // *pre-dispatch* decision and the *post-measure* forward observation:
+        // if a token's forward suddenly shrinks (thermal recovery, GPU
+        // contention release, jitter), an already-dispatched K-layer burst can
+        // overflow the release worker's drain window and produce a memory
+        // spike (violates `feedback_no_memory_spike.md`).
+        //
+        // Mitigation: inside the per-batch dispatch loop, after each
+        // successful layer, re-check `release_worker.pending_count()`. If the
+        // queue is non-empty *before* the next layer is enqueued, break — the
+        // hardware itself has signalled it has not finished draining the
+        // previous drop. The first layer is unconditional (i == 0) so swap
+        // progress is guaranteed for every token that enters the loop.
+        let sub_batch_pause_diag = std::env::var("LLMRS_SUB_BATCH_PAUSE_DIAG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let intended_k = target_layers.len();
+        let mut sub_batch_cutoff_hit = false;
+
         let mut max_release_pending: usize = 0;
         let mut max_dispatcher_pending: usize = 0;
 
-        for &layer_idx in target_layers {
+        for (i, &layer_idx) in target_layers.iter().enumerate() {
+            // Sub-batch reactive pause: check release queue *between* layers.
+            // First layer (i == 0) is unconditional — swap must make progress.
+            // i > 0 + pending > 0 → break before adding more pressure.
+            if i > 0
+                && let Some(worker) = &self.release_worker
+                && worker.pending_count() > 0
+            {
+                sub_batch_cutoff_hit = true;
+                if sub_batch_pause_diag {
+                    eprintln!(
+                        "[SubBatchPause] intended_k={} actual_k={} reason=release_pending",
+                        intended_k, i
+                    );
+                }
+                break;
+            }
             // Sample queue depths at the start of each layer iteration —
             // this is the moment when memory peak matters (about to allocate
             // new layer's cl_mems / build new tensor on top of any displaced
@@ -830,8 +866,9 @@ impl<'a> SwapExecutor<'a> {
         if diag_enabled {
             let mode = if use_async { "async" } else { "sync" };
             eprintln!(
-                "[SwapPeak] mode={mode} target_layers={} max_release_pending={max_release_pending} max_dispatcher_pending={max_dispatcher_pending}",
-                target_layers.len()
+                "[SwapPeak] mode={mode} target_layers={} max_release_pending={max_release_pending} max_dispatcher_pending={max_dispatcher_pending} sub_batch_cutoff={}",
+                target_layers.len(),
+                if sub_batch_cutoff_hit { 1 } else { 0 }
             );
         }
 
