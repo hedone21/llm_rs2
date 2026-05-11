@@ -450,7 +450,38 @@ impl<'a> SwapExecutor<'a> {
             .map(|_| self.backend.supports_async_transfer())
             .unwrap_or(false);
 
+        // ── env-gated peak monitoring (LLMRS_SWAP_DRAIN_DIAG=1) ──────────────
+        // Track max release_worker queue depth observed across the batch.
+        // Verifies the hypothesis "without drain backpressure, queue stays at
+        // 1 layer naturally because release wall (~sub-ms drop on Adreno) is
+        // hidden by the next layer build (~3 ms mmap_permute) / token gap
+        // (~10 ms forward in pertick=1)". If max > 1 for a given mode, the
+        // user's spike concern is real for that mode.
+        let diag_enabled = std::env::var("LLMRS_SWAP_DRAIN_DIAG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let mut max_release_pending: usize = 0;
+        let mut max_dispatcher_pending: usize = 0;
+
         for &layer_idx in target_layers {
+            // Sample queue depths at the start of each layer iteration —
+            // this is the moment when memory peak matters (about to allocate
+            // new layer's cl_mems / build new tensor on top of any displaced
+            // weights still pending release).
+            if diag_enabled {
+                if let Some(worker) = &self.release_worker {
+                    let p = worker.pending_count();
+                    if p > max_release_pending {
+                        max_release_pending = p;
+                    }
+                }
+                if use_async && let Some(d) = async_dispatcher {
+                    let p = d.pending_count();
+                    if p > max_dispatcher_pending {
+                        max_dispatcher_pending = p;
+                    }
+                }
+            }
             // ENG-DAT-C08: out-of-range silently skipped.
             let Some(slot) = layers.get(layer_idx) else {
                 report.skipped.push(layer_idx);
@@ -538,6 +569,16 @@ impl<'a> SwapExecutor<'a> {
                 stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
                 // madvise_ms is 0 on main thread (release chained in worker).
 
+                // ── No drain backpressure (verified 2026-05-11) ──────────────
+                // 이전 진단의 "Adreno GPU flush 30~50 ms/layer" 가설은 잘못된
+                // 인과관계 — drain polling/IPC overhead 자체가 wall cost를
+                // 만든 것이고 release_worker drop 자체는 sub-ms (sync path
+                // 진단의 첫 layer 55ms cold 후 0.03ms steady 와 일치).
+                // backpressure 없이도 release_worker queue depth는 1 layer로
+                // 자연 stable (다음 layer build / token gap이 release wall을
+                // 흡수). 검증은 LLMRS_SWAP_DRAIN_DIAG=1 로 batch 끝 [SwapPeak]
+                // log 확인.
+
                 report.swapped.push(SwappedLayer {
                     layer_idx,
                     from_dtype,
@@ -600,6 +641,9 @@ impl<'a> SwapExecutor<'a> {
                     Ok(layer) => {
                         if let Some(worker) = &self.release_worker {
                             // Async path: enqueue for background drop (ENG-ALG-228).
+                            // No drain — release worker drop은 sub-ms이라 다음
+                            // layer build (~3ms) 가 충분히 흡수. peak 검증은
+                            // LLMRS_SWAP_DRAIN_DIAG=1 [SwapPeak] log 참고.
                             worker.enqueue_release(layer);
                         } else {
                             // Inline fallback (host tests, CPU backend).
@@ -648,7 +692,13 @@ impl<'a> SwapExecutor<'a> {
             // AOS path never populated the registry, and AUF SOA path re-registers
             // after invalidate in Stage (d)).
             let t_sync0 = Instant::now();
-            if !use_async {
+            // 작업 C: alias 환경 (`SecondaryMmap::Rpcmem`) 에서는 H2D copy가
+            // 발생하지 않아 (cl_mem이 rpcmem DMA-BUF + USE_HOST_PTR alias)
+            // backend.synchronize()로 drain할 GPU 작업 자체가 없다. Phase 5
+            // (process_commit) 와 동일한 패턴 — dummy event skip 과 같은 사유.
+            // 비-alias path(memcpy)는 정상 sync 유지.
+            let alias_path = matches!(secondary.as_ref(), SecondaryMmap::Rpcmem(_));
+            if !use_async && !alias_path {
                 self.backend
                     .synchronize()
                     .map_err(|e| SwapError::StageGateSyncFailed { source: e })?;
@@ -772,6 +822,19 @@ impl<'a> SwapExecutor<'a> {
         }
 
         report.latency_ms = start.elapsed().as_secs_f64() * 1e3;
+
+        // ── env-gated peak summary log ───────────────────────────────────────
+        // Sampled at the start of each layer iter (above). Reports the worst
+        // queue depth observed during the batch — the user's hard constraint
+        // ("memory peak ≤ 1 layer") is satisfied iff max ≤ 1 here.
+        if diag_enabled {
+            let mode = if use_async { "async" } else { "sync" };
+            eprintln!(
+                "[SwapPeak] mode={mode} target_layers={} max_release_pending={max_release_pending} max_dispatcher_pending={max_dispatcher_pending}",
+                target_layers.len()
+            );
+        }
+
         Ok(report)
     }
 
@@ -968,6 +1031,15 @@ impl<'a> SwapExecutor<'a> {
             if is_cpu {
                 return Ok((cpu_tensor, GpuEvent::dummy()));
             }
+            // LISWAP-6 Phase 5b: alias path 면 cpu_tensor.buffer().cl_mem() 가
+            // 이미 GPU-visible (rpcmem DMA-BUF + USE_HOST_PTR alias). H2D copy
+            // 불필요 → enqueue_write_async skip + dummy event 반환. LISWAP-1
+            // (per-tick) / LISWAP-4 (intra-forward) 양쪽 모두 본 경로를 통하므로
+            // alias 검출이 한 곳에서 처리된다 (build_tensor_from_mmap_async_for_hook
+            // 와 동일 패턴, swap_executor.rs:907 참고).
+            if cpu_tensor.buffer().cl_mem().is_some() {
+                return Ok((cpu_tensor, GpuEvent::dummy()));
+            }
             self.backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
                 SwapError::AsyncTransferUnavailable {
                     layer: layer_idx,
@@ -986,6 +1058,13 @@ impl<'a> SwapExecutor<'a> {
             let cpu_tensor = self.materialise_cpu_tensor(secondary, layer_idx, subname, primary)?;
             let is_cpu = self.backend.name().contains("CPU");
             if is_cpu {
+                return Ok((cpu_tensor, None));
+            }
+            // LISWAP-6 Phase 5b: alias path → enqueue_write_async skip. norm은
+            // 보통 작아 alias 의 이득이 크지 않지만 일관성 유지를 위해 동일 처리.
+            // last_event 선택 시 None 처리되므로 호출부 수정 불요 (line 1014
+            // last_event = evt_fnorm.unwrap_or_else(|| evt_anorm.unwrap_or(evt_down))).
+            if cpu_tensor.buffer().cl_mem().is_some() {
                 return Ok((cpu_tensor, None));
             }
             let (gpu_tensor, evt) = self.backend.enqueue_write_async(&cpu_tensor).map_err(|e| {

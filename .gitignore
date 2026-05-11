@@ -41,3 +41,6 @@ verify/results/
 
 # QNN SDK (vendor licensed, do not commit)
 /third_party/
+
+# Claude Code agent worktrees (leftover from Agent isolation runs)
+.claude/worktrees/

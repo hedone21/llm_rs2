@@ -960,6 +960,25 @@ struct Args {
     #[arg(long, default_value_t = false)]
     swap_phase_aware: bool,
 
+    /// LISWAP-6 Phase 6 — Per-layer immediate swap (LISWAP-4 alias-skip variant).
+    ///
+    /// `false` (default): no-op.
+    ///
+    /// `true`: when `--force-swap-ratio` is set, an `IntraForwardSwapHook` is
+    /// committed (identical infrastructure to `--swap-intra-forward`) but the
+    /// log line is tagged `layer-immediate` to make the measurement matrix
+    /// distinguishable. With LISWAP-6 Phase 5b alias H2D-skip applied to the
+    /// `build_layer_from_mmap_async` weight closure (swap_executor.rs:961~),
+    /// every per-layer dispatch returns dummy events and `process_commit`
+    /// short-circuits the `wait_event_blocking` fall-through. Result: 28 layer
+    /// dispatches with zero `synchronize()` accumulation when the secondary is
+    /// rpcmem DMA-BUF aliased.
+    ///
+    /// Mutually exclusive with `--swap-incremental-per-tick > 0` /
+    /// `--swap-intra-forward` / `--swap-phase-aware`.
+    #[arg(long, default_value_t = false)]
+    swap_layer_immediate: bool,
+
     /// Phase-aware swap chunk 진단 size (MB). v1 per-tensor chunking에서는
     /// 실제 분할에 사용되지 않고 진단/보고 용도. 측정에 따라 v2에서 sub-tensor
     /// chunking 도입 시 활용 (4 MB sweet spot 기본).
@@ -1063,18 +1082,22 @@ fn main() -> anyhow::Result<()> {
     // swap-policy state.
     let swap_modes_active = (args.swap_incremental_per_tick > 0) as usize
         + args.swap_intra_forward as usize
-        + args.swap_phase_aware as usize;
+        + args.swap_phase_aware as usize
+        + args.swap_layer_immediate as usize;
     if swap_modes_active > 1 {
         anyhow::bail!(
             "--swap-incremental-per-tick (= {}) / --swap-intra-forward (= {}) / \
-             --swap-phase-aware (= {}) are mutually exclusive (ENG-DAT-C18). Pick one:\n\
+             --swap-phase-aware (= {}) / --swap-layer-immediate (= {}) are mutually \
+             exclusive (ENG-DAT-C18). Pick one:\n\
              (a) --swap-incremental-per-tick=N                                 (LISWAP-1)\n\
              (b) --swap-intra-forward=true                                     (LISWAP-4)\n\
              (c) --swap-phase-aware=true                                       (LISWAP-5)\n\
-             (d) (none)                                                        (single-shot)",
+             (d) --swap-layer-immediate=true                                   (LISWAP-6 P6)\n\
+             (e) (none)                                                        (single-shot)",
             args.swap_incremental_per_tick,
             args.swap_intra_forward,
-            args.swap_phase_aware
+            args.swap_phase_aware,
+            args.swap_layer_immediate
         );
     }
     // Configure Rayon thread pool: 0 = auto-detect CPU cores
@@ -2957,7 +2980,7 @@ fn main() -> anyhow::Result<()> {
                     phase_dispatcher.clone() as Arc<dyn llm_rs2::profile::op_trace::PhaseHook>
                 );
                 phase_aware_swap_dispatcher = Some(phase_dispatcher);
-            } else if args.swap_intra_forward {
+            } else if args.swap_intra_forward || args.swap_layer_immediate {
                 let swap_backend: Arc<dyn Backend> = gpu_backend_arc
                     .as_ref()
                     .cloned()
@@ -2965,17 +2988,34 @@ fn main() -> anyhow::Result<()> {
                 let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
                     Arc::clone(&swap_backend),
                 ));
+                let mode_flag_name = if args.swap_layer_immediate {
+                    "--swap-layer-immediate"
+                } else {
+                    "--swap-intra-forward"
+                };
                 let secondary = match model.secondary_mmap.as_ref() {
                     Some(s) => Arc::clone(s),
                     None => {
                         anyhow::bail!(
-                            "--swap-intra-forward requires --secondary-gguf (no secondary mmap available)"
+                            "{} requires --secondary-gguf (no secondary mmap available)",
+                            mode_flag_name
                         );
                     }
                 };
                 let config = Arc::new(model.config.clone());
+                // LISWAP-6 Phase 6: layer-immediate variant reuses the
+                // IntraForwardSwapHook infrastructure. The behavioural
+                // difference is in the swap_executor.rs alias H2D-skip
+                // (Phase 5b) which collapses every per-layer dispatch to a
+                // dummy event when the secondary is rpcmem DMA-BUF aliased.
+                let mode_label = if args.swap_layer_immediate {
+                    "layer-immediate (LISWAP-6 P6)"
+                } else {
+                    "intra-forward (LISWAP-4)"
+                };
                 eprintln!(
-                    "weight_swap: intra-forward mode — ratio={:.2}, {} target layers (LISWAP-4)",
+                    "weight_swap: {} mode — ratio={:.2}, {} target layers",
+                    mode_label,
                     ratio,
                     target_layers.len()
                 );
@@ -5470,6 +5510,7 @@ fn main() -> anyhow::Result<()> {
             && accumulator_compatible_with_plan
             && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
             && !args.swap_intra_forward
+            && !args.swap_layer_immediate
             && !args.swap_phase_aware
         {
             model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)

@@ -54,7 +54,11 @@ pub fn set_phase_hook(hook: Arc<dyn PhaseHook>) {
     if std::env::var("LLMRS_PHASE_AWARE_DEBUG").as_deref() == Ok("1") {
         eprintln!(
             "[op_trace::set_phase_hook] PHASE_HOOK.set result: {} (PHASE_HOOK now Some={})",
-            if res.is_ok() { "Ok" } else { "Err (already set)" },
+            if res.is_ok() {
+                "Ok"
+            } else {
+                "Err (already set)"
+            },
             PHASE_HOOK.get().is_some()
         );
     }
