@@ -186,7 +186,7 @@ mod parse_qcf_sample_layers_tests {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long, default_value = "models/llama3.2-1b")]
@@ -716,6 +716,34 @@ struct Args {
     /// decode 1040 step.
     #[arg(long)]
     ppl_prefill_tokens: Option<usize>,
+
+    /// LISWAP-PPL Scenario E: swap 완료 후 KV cache reset + prefill 다시 시작.
+    /// `--ppl-swap-at-token` + `--secondary-gguf` 필요. 워크플로:
+    ///   pass 1 (warmup): prefill + swap-driving decode → plan_done 시 종료
+    ///   pass 2 (measure): KV cache 0 으로 reset → prefill 다시 → decode (no swap)
+    /// pass 2 의 NLL/PPL/CSV 만 기록. 가설: cache mismatch 가 C−D artifact 원인이면
+    /// pass 2 결과가 D (Q4 native) 에 수렴해야 함.
+    #[arg(long, default_value_t = false)]
+    ppl_warmup_swap: bool,
+
+    /// LISWAP-PPL Scenario F: `--ppl-warmup-swap` 의 pass 2 prefill 길이를 별도로
+    /// 지정. 미지정 시 `--ppl-prefill-tokens` 값을 그대로 사용 (= 시나리오 E).
+    /// 예: pass 1 prefill=32 (swap-driving decode 28 step) + pass 2 prefill=1072
+    /// (decode loop 없음, batch path 전체) → batch path 만으로 weight 정합 검증.
+    #[arg(long)]
+    ppl_measure_prefill_tokens: Option<usize>,
+
+    /// LISWAP-PPL diagnostic: 모델 로드 직후 모든 layer 의 weight tensor (wq/wk/wv/
+    /// wo/w_gate/w_up/w_down) 를 readback 해서 `<dir>/layer{NN}_{name}_{dtype}.bin`
+    /// 으로 dump. swap 없는 baseline 측정용 (e.g. Q4_0 native 모델 비교 기준).
+    #[arg(long)]
+    dump_q4_after_load: Option<std::path::PathBuf>,
+
+    /// LISWAP-PPL diagnostic: `--ppl-warmup-swap` Pass 1 의 swap 완료 직후 (cache
+    /// reset 직전) 모든 layer 의 weight tensor 를 readback 해서 dump. swap 경로의
+    /// Q4 weight 가 standalone Q4 와 비트 단위로 일치하는지 검증용.
+    #[arg(long)]
+    dump_q4_after_swap: Option<std::path::PathBuf>,
 
     /// Comma-separated layer indices to skip (both attn+mlp).
     /// Example: --skip-layers 1,3,5,7
@@ -1726,7 +1754,31 @@ fn main() -> anyhow::Result<()> {
     //
     // Mode `q4_0`: force runtime quantize regardless of AUF entry (debug).
     // Mode `none`/`off`: skip entirely (legacy F16).
-    let qlm = args.quantize_lm_head.to_ascii_lowercase();
+    // LISWAP-PPL: PPL mode + --secondary-gguf with the default `auto` policy
+    // would runtime-quantize lm_head F16 → Q4_0 (see `LmHeadAufResolution::
+    // NotAuf` branch below). That diverges from a Q4-native GGUF baseline,
+    // whose lm_head is loaded as F16 from the file. The result is a
+    // systematic +~0.07 NLL gap that has nothing to do with the swap path
+    // (root cause documented in `notes/handoff_liswap_ppl_lm_head_2026_05_12`).
+    // For PPL measurements we silently switch the default to `none` so that
+    // F16+swap and Q4-native are bit-identical. Power users can still force
+    // the old behaviour with `--quantize-lm-head q4_0`.
+    let qlm = {
+        let raw = args.quantize_lm_head.to_ascii_lowercase();
+        if args.ppl.is_some()
+            && args.secondary_gguf.is_some()
+            && (raw == "auto" || raw.is_empty())
+        {
+            eprintln!(
+                "[Notice] PPL mode + --secondary-gguf: auto-disabling lm_head Q4_0 \
+                 quantization (would create a systematic +~0.07 NLL gap vs Q4-native \
+                 baseline). Pass `--quantize-lm-head q4_0` to override."
+            );
+            "none".to_string()
+        } else {
+            raw
+        }
+    };
     match qlm.as_str() {
         "none" | "off" => {
             // F16 preserved — no action.
@@ -3583,8 +3635,95 @@ fn main() -> anyhow::Result<()> {
     //  PPL MODE: Perplexity evaluation on reference text
     // ════════════════════════════════════════════════════════════
     if let Some(ref ppl_path) = args.ppl {
+        // LISWAP-PPL diagnostic: dump weights immediately after model load
+        // (before any swap), useful for Q4-native baseline comparison.
+        if let Some(ref dump_dir) = args.dump_q4_after_load {
+            dump_layer_weights_to_dir(&model, &backend, dump_dir)?;
+        }
+
+        // LISWAP-PPL Scenario E (warmup-then-measure):
+        //   Pass 1: drive the weight swap to completion with no NLL logging.
+        //   Reset KV caches + score_accumulator so the measurement pass sees a
+        //   fresh cache, then run the measurement pass with the swap trigger
+        //   disabled. The cache reset isolates the "cache mismatch" hypothesis
+        //   from the "weight quantization-path mismatch" hypothesis.
+        if args.ppl_warmup_swap {
+            if args.ppl_swap_at_token.is_none() {
+                anyhow::bail!(
+                    "--ppl-warmup-swap requires --ppl-swap-at-token (the warmup pass needs a swap trigger)"
+                );
+            }
+            if model.secondary_mmap.is_none() {
+                anyhow::bail!(
+                    "--ppl-warmup-swap requires --secondary-gguf (weights must be available for swap)"
+                );
+            }
+
+            let mut warmup_args = args.clone();
+            // Suppress CSV/JSON outputs on the warmup pass.
+            warmup_args.ppl_nll_csv = None;
+            warmup_args.qcf_dump = None;
+            eprintln!("[PPL-Swap] === Pass 1: warmup (driving swap to completion) ===");
+            let _warmup_dummy = run_ppl(
+                &warmup_args,
+                &model,
+                &tokenizer,
+                &backend,
+                &*memory,
+                &mut kv_caches,
+                &mut cache_manager,
+                &mut score_accumulator,
+                vocab_size,
+                hidden_size,
+                max_seq_len,
+                ppl_path,
+                auto_eviction,
+                score_based_eviction,
+                actual_protected_prefix,
+                skip_config.as_ref(),
+                /* warmup_only */ true,
+            )?;
+
+            // LISWAP-PPL diagnostic: dump weights right after swap completion
+            // (before cache reset), so each layer's GPU buffer can be compared
+            // byte-for-byte against the Q4-native baseline dump.
+            if let Some(ref dump_dir) = args.dump_q4_after_swap {
+                dump_layer_weights_to_dir(&model, &backend, dump_dir)?;
+            }
+
+            // Reset KV cache positions. The underlying tensor buffers stay
+            // allocated; we only rewind the write head + high-water mark so
+            // the next prefill starts from pos 0.
+            for cache in kv_caches.iter_mut() {
+                cache.current_pos = 0;
+                cache.high_water_pos = 0;
+            }
+            if let Some(acc) = score_accumulator.as_mut() {
+                acc.reset();
+            }
+            eprintln!("[PPL-Swap] === Pass 2: measurement (swap disabled, fresh KV cache) ===");
+        }
+
+        // Measurement pass. When warmup_swap was active, disable further swap
+        // triggers and clear the warmup flag locally so this pass is a pure
+        // teacher-forcing PPL run on the already-swapped weights.
+        // When `--ppl-measure-prefill-tokens` is set, pass 2 uses that prefill
+        // length instead of `--ppl-prefill-tokens` (Scenario F: large prefill
+        // shrinks the decode loop, isolating batch vs single-step path).
+        let mut measure_args_owned;
+        let measure_args: &Args = if args.ppl_warmup_swap {
+            measure_args_owned = args.clone();
+            measure_args_owned.ppl_swap_at_token = None;
+            measure_args_owned.ppl_warmup_swap = false;
+            if let Some(measure_prefill) = args.ppl_measure_prefill_tokens {
+                measure_args_owned.ppl_prefill_tokens = Some(measure_prefill);
+            }
+            &measure_args_owned
+        } else {
+            &args
+        };
         let ppl_result = run_ppl(
-            &args,
+            measure_args,
             &model,
             &tokenizer,
             &backend,
@@ -3600,6 +3739,7 @@ fn main() -> anyhow::Result<()> {
             score_based_eviction,
             actual_protected_prefix,
             skip_config.as_ref(),
+            /* warmup_only */ false,
         )?;
 
         // --qcf-dump: write JSON after PPL measurement completes.
@@ -9957,6 +10097,131 @@ fn run_offload(
 //  eviction policy and collects proxy metrics during eviction events.
 // ════════════════════════════════════════════════════════════════
 
+/// LISWAP-PPL diagnostic: dump every layer's weight tensors (wq/wk/wv/wo/
+/// w_gate/w_up/w_down) to raw bin files under `out_dir`. File naming:
+/// `layer{NN}_{tensor}_{dtype}.bin` (e.g. `layer00_wq_Q4_0.bin`). Each file
+/// holds the raw GPU buffer bytes for that tensor at the moment of the call.
+///
+/// Two such dumps (one from a Q4-native model load, one from an F16 model
+/// after swap completion) can be byte-compared on the host to determine
+/// whether the swap path produces bit-identical Q4 weights.
+fn dump_layer_weights_to_dir(
+    model: &TransformerModel,
+    backend: &Arc<dyn Backend>,
+    out_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let n = model.layers.len();
+    eprintln!(
+        "[Q4-DUMP] dumping {} layer weights to {}",
+        n,
+        out_dir.display()
+    );
+    for (i, slot) in model.layers.iter().enumerate() {
+        let weights = slot.load_weights();
+        let dtype = slot.current_dtype();
+        let tensors: [(&str, &llm_rs2::core::tensor::Tensor); 7] = [
+            ("wq", &weights.wq),
+            ("wk", &weights.wk),
+            ("wv", &weights.wv),
+            ("wo", &weights.wo),
+            ("w_gate", &weights.w_gate),
+            ("w_up", &weights.w_up),
+            ("w_down", &weights.w_down),
+        ];
+        for (name, t) in tensors {
+            let nbytes = t.buffer().size();
+            if nbytes == 0 {
+                eprintln!(
+                    "[Q4-DUMP] layer{:02} {} dtype={:?} SKIP (size=0)",
+                    i, name, dtype
+                );
+                continue;
+            }
+            let mut bytes = vec![0u8; nbytes];
+            // For OpenCL/CUDA tensors `buffer().as_ptr()` is the cl_mem/cu_ptr
+            // handle and may look like a host nullptr — backend.read_buffer
+            // does the device→host copy via the backend-specific path, so we
+            // rely on its return value rather than pre-checking as_ptr.
+            match backend.read_buffer(t, &mut bytes) {
+                Ok(()) => {
+                    let fname = format!("layer{:02}_{}_{:?}.bin", i, name, dtype);
+                    let path = out_dir.join(&fname);
+                    std::fs::write(&path, &bytes)?;
+                    eprintln!(
+                        "[Q4-DUMP] layer{:02} {:8} dtype={:>5?} bytes={:8} → {}",
+                        i, name, dtype, nbytes, fname
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[Q4-DUMP] layer{:02} {} dtype={:?} SKIP (read_buffer failed: {})",
+                        i, name, dtype, e
+                    );
+                }
+            }
+        }
+    }
+    // Also dump model-level tensors that are NOT inside per-layer slots and
+    // therefore are NOT touched by weight swap: embed_tokens, final norm, and
+    // lm_head. These three are the most likely sources of E ≠ D NLL drift
+    // because (a) the F16 model's lm_head is typically tied to embed_tokens
+    // and (b) any missing lm_head is derived via F16→Q4_0 quantization at
+    // load time, whose result may not match a standalone Q4_0 GGUF's lm_head
+    // byte-for-byte.
+    let model_tensors: [(&str, &llm_rs2::core::tensor::Tensor); 3] = [
+        ("embed_tokens", &model.embed_tokens),
+        ("norm",         &model.norm),
+        ("lm_head",      &model.lm_head),
+    ];
+    for (name, t) in model_tensors {
+        let nbytes = t.buffer().size();
+        if nbytes == 0 {
+            eprintln!("[Q4-DUMP] model.{} SKIP (size=0)", name);
+            continue;
+        }
+        let dt = t.dtype();
+        let mut bytes = vec![0u8; nbytes];
+        match backend.read_buffer(t, &mut bytes) {
+            Ok(()) => {
+                let fname = format!("model_{}_{:?}.bin", name, dt);
+                let path = out_dir.join(&fname);
+                std::fs::write(&path, &bytes)?;
+                eprintln!(
+                    "[Q4-DUMP] model.{:14} dtype={:>5?} bytes={:8} → {}",
+                    name, dt, nbytes, fname
+                );
+            }
+            Err(e) => {
+                // The lm_head can live on a CPU backend even when the main
+                // backend is GPU (`lm_head_on_cpu`) — fall back to CpuBackend
+                // for that case so we still get a dump file out.
+                let cpu_be: Arc<dyn Backend> =
+                    Arc::new(llm_rs2::backend::cpu::CpuBackend::new());
+                match cpu_be.read_buffer(t, &mut bytes) {
+                    Ok(()) => {
+                        let fname = format!("model_{}_{:?}.bin", name, dt);
+                        let path = out_dir.join(&fname);
+                        std::fs::write(&path, &bytes)?;
+                        eprintln!(
+                            "[Q4-DUMP] model.{:14} dtype={:>5?} bytes={:8} → {} (via CPU fallback)",
+                            name, dt, nbytes, fname
+                        );
+                    }
+                    Err(e2) => {
+                        eprintln!(
+                            "[Q4-DUMP] model.{} SKIP (read_buffer failed: gpu={}, cpu={})",
+                            name, e, e2
+                        );
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("[Q4-DUMP] complete: {} layers + 3 model tensors dumped to {}", n, out_dir.display());
+    Ok(())
+}
+
 /// Return value from `run_ppl` for use by the caller (e.g. `--qcf-dump`).
 struct PplResult {
     ppl: f64,
@@ -9983,6 +10248,10 @@ fn run_ppl(
     score_based_eviction: bool,
     protected_prefix: usize,
     skip_config: Option<&llm_rs2::core::skip_config::SkipConfig>,
+    // LISWAP-PPL Scenario E: when true, return early as soon as the swap plan
+    // completes. NLL/CSV/JSON outputs are suppressed. Used by `--ppl-warmup-swap`
+    // to drive the swap to completion before the actual measurement pass.
+    warmup_only: bool,
 ) -> anyhow::Result<PplResult> {
     // ── 1. Read and tokenize reference text ──
     let text = std::fs::read_to_string(text_file)
@@ -10266,6 +10535,24 @@ fn run_ppl(
             );
             ppl_swap_plan = None;
             swap_state = "post_swap";
+
+            if warmup_only {
+                // LISWAP-PPL Scenario E (warmup pass): swap is complete, return
+                // before scoring the current token so the caller can reset KV
+                // caches and run the measurement pass from scratch with the
+                // already-swapped weights.
+                eprintln!(
+                    "[PPL-Swap] warmup_only=true → returning at decode_idx={} (no further scoring)",
+                    decode_idx
+                );
+                let wall_time = overall_start.elapsed().as_secs_f64();
+                return Ok(PplResult {
+                    ppl: 0.0,
+                    avg_nll: 0.0,
+                    n_eval_tokens: 0,
+                    wall_time_s: wall_time,
+                });
+            }
         }
 
         // Score accumulator begin step
