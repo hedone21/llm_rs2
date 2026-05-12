@@ -26,7 +26,7 @@ pub struct EvalQuestion {
 }
 
 /// Unified output from the generic eval loop.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EvalOutput {
     /// Per-question results.
     pub results: Vec<serde_json::Value>,

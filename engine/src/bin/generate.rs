@@ -877,6 +877,33 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     qcf_warmup_tokens: usize,
 
+    /// Layer-selection algorithm for `--qcf-dump` swap path (U5 ablation, EuroSys'27).
+    /// Values: `imp` (importance-aware, default — production behavior),
+    /// `seq` (sequential 0→N-1), `rev` (reverse N-1→0),
+    /// `uni` (evenly spaced), `anti` (importance × ε descending top-k — worst-case).
+    /// Only affects the `--qcf-dump` warmup-prefill swap; the manager / live
+    /// directive paths always use `imp`.
+    #[arg(long, default_value = "imp")]
+    swap_algorithm: String,
+
+    /// Per-step NLL trajectory mode (U5 mid-swap quality study, EuroSys'27).
+    ///
+    /// Requires `--qcf-dump`, `--force-swap-ratio`, `--eval-ll`, `--eval-batch`.
+    /// Workflow:
+    ///   1. warmup prefill → ImportanceTable
+    ///   2. WeightSwapDecider.decide(ratio, algorithm) → ordered layer list
+    ///      of length K = floor(ratio × num_layers).
+    ///   3. for t = 0..=K:
+    ///       a. run eval-ll on the eval batch → record EvalOutput_t.
+    ///       b. if t < K: SwapExecutor.execute_on_slots(&[selected_layers[t]]).
+    ///   4. dump JSON with trajectory: array of K+1 (step, swapped_layers,
+    ///      layer_added, eval_ll_output).
+    /// The cumulative swap state at step t mirrors ARGUS's production
+    /// incremental swap (one layer per token), letting external analysis
+    /// observe the mid-swap NLL trajectory rather than only the final state.
+    #[arg(long, default_value_t = false)]
+    qcf_trajectory: bool,
+
     /// Enable experimental QCF metric dump for ARGUS analysis.
     /// Adds qcf_per_head/qcf_caote_max/qcf_topk_retention_*/attention_entropy/
     /// qcf_beta_amplified_*/qcf_per_layer/qcf_kivi_per_layer_* to eval-ll output.
@@ -1617,6 +1644,15 @@ fn main() -> anyhow::Result<()> {
             "--force-swap-ratio requires --secondary-gguf to be set (no secondary weight file)"
         );
     }
+
+    // Parse --swap-algorithm (used by --qcf-dump warmup-swap path; U5 ablation).
+    let swap_algorithm = llm_rs2::models::weights::SwapAlgorithm::from_cli(&args.swap_algorithm)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--swap-algorithm: unknown value '{}'. Valid: imp, seq, rev, uni, anti",
+                args.swap_algorithm
+            )
+        })?;
 
     let is_gguf = model_path.ends_with(".gguf");
     let mut model = if is_gguf {
@@ -3412,6 +3448,8 @@ fn main() -> anyhow::Result<()> {
                     gpu_backend_arc.as_ref(),
                     &cpu_backend_arc,
                     " eval-ll",
+                    swap_algorithm,
+                    !args.qcf_trajectory,
                 )?;
                 eval_ll_qcf_decision = result.decision;
                 eval_ll_qcf_importance = Some(result.importance);
@@ -3491,21 +3529,106 @@ fn main() -> anyhow::Result<()> {
             eviction_hook_sample_layers,
         );
 
-        let output = llm_rs2::eval::run_eval_ll_generic(
-            &model,
-            &tokenizer,
-            &backend,
-            &*memory,
-            &mut kv_caches,
-            &mut hook,
-            &questions,
-            &eval_config,
-            skip_config.as_ref(),
-        )?;
+        // ── Trajectory mode dispatch ──────────────────────────────────────────
+        // When `--qcf-trajectory` is active alongside `--qcf-dump` and
+        // `--force-swap-ratio`, we run eval-ll K+1 times (K = decision layer
+        // count): step 0 with no swap (baseline), then step t (1..=K) after
+        // cumulatively applying `selected_layers[t-1]`. Each step's full
+        // EvalOutput is captured into `trajectory_outputs` and emitted under
+        // the `trajectory` field of the dump JSON.
+        let trajectory_mode = args.qcf_trajectory
+            && args.qcf_dump.is_some()
+            && args.force_swap_ratio.is_some()
+            && eval_ll_qcf_decision
+                .as_ref()
+                .map(|d| !d.selected_layers.is_empty())
+                .unwrap_or(false);
+        let ordered_layers: Vec<usize> = if trajectory_mode {
+            eval_ll_qcf_decision
+                .as_ref()
+                .unwrap()
+                .selected_layers
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let n_steps = if trajectory_mode {
+            ordered_layers.len() + 1
+        } else {
+            1
+        };
+        let mut trajectory_outputs: Vec<llm_rs2::eval::EvalOutput> =
+            Vec::with_capacity(n_steps);
+
+        if trajectory_mode {
+            eprintln!(
+                "[QCF-trajectory] mode enabled: K={} (algo={}, ratio={:.2})",
+                ordered_layers.len(),
+                swap_algorithm.short_name(),
+                args.force_swap_ratio.unwrap_or(0.0),
+            );
+        }
+
+        for step in 0..n_steps {
+            if trajectory_mode {
+                eprintln!(
+                    "[QCF-trajectory] step {}/{}: cumulative swap = {:?}",
+                    step,
+                    ordered_layers.len(),
+                    &ordered_layers[..step]
+                );
+            }
+
+            let step_out = llm_rs2::eval::run_eval_ll_generic(
+                &model,
+                &tokenizer,
+                &backend,
+                &*memory,
+                &mut kv_caches,
+                &mut hook,
+                &questions,
+                &eval_config,
+                skip_config.as_ref(),
+            )?;
+            trajectory_outputs.push(step_out);
+
+            if trajectory_mode && step < ordered_layers.len() {
+                let layer_to_swap = ordered_layers[step];
+                let report = run_layer_swap(
+                    &model,
+                    &[layer_to_swap],
+                    gpu_backend_arc.as_ref(),
+                    &cpu_backend_arc,
+                    None,
+                    #[cfg(feature = "opencl")]
+                    None,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "[QCF-trajectory] swap layer {} failed: {}",
+                        layer_to_swap,
+                        e
+                    )
+                })?;
+                eprintln!(
+                    "[QCF-trajectory] swapped layer {}: latency {:.1}ms",
+                    layer_to_swap, report.latency_ms
+                );
+            }
+        }
+
+        // For downstream non-trajectory stdout printing, expose the last step's
+        // EvalOutput as `output` (in non-trajectory mode this is the only step).
+        let output = trajectory_outputs
+            .last()
+            .expect("at least one eval-ll step ran")
+            .clone();
 
         // ── QCF-dump JSON (eval-ll mode) ──────────────────────────────────────
         if let Some(ref dump_path) = args.qcf_dump {
-            use llm_rs2::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
+            use llm_rs2::eval::qcf_helpers::{
+                QcfSwapDumpContext, TrajectoryStep, dump_qcf_swap_json,
+            };
 
             let empty_swap: Vec<usize> = Vec::new();
             let (swap_set, qcf_predicted, fallback_used) =
@@ -3527,6 +3650,32 @@ fn main() -> anyhow::Result<()> {
             };
             let total_wall = eval_ll_qcf_start.elapsed().as_secs_f64();
 
+            // Build trajectory steps when in trajectory mode.
+            let trajectory_steps: Vec<TrajectoryStep> = if trajectory_mode {
+                trajectory_outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(t, eo)| TrajectoryStep {
+                        step: t,
+                        swapped_layers: ordered_layers[..t].to_vec(),
+                        layer_added: if t > 0 {
+                            Some(ordered_layers[t - 1])
+                        } else {
+                            None
+                        },
+                        eval_ll_output: eo,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let trajectory_ref: Option<&[TrajectoryStep]> = if trajectory_mode {
+                Some(trajectory_steps.as_slice())
+            } else {
+                None
+            };
+            let eval_ll_output_ref = if trajectory_mode { None } else { Some(&output) };
+
             let ctx = QcfSwapDumpContext {
                 model_arch,
                 model_path: &args.model_path,
@@ -3535,6 +3684,9 @@ fn main() -> anyhow::Result<()> {
                 secondary_dtype: "Q4_0",
                 num_layers: model.layers.len(),
                 force_swap_ratio: args.force_swap_ratio,
+                swap_algorithm: args
+                    .force_swap_ratio
+                    .map(|_| swap_algorithm.short_name()),
                 swap_set,
                 qcf_swap_predicted: qcf_predicted,
                 fallback_used,
@@ -3548,11 +3700,20 @@ fn main() -> anyhow::Result<()> {
                 backend: &args.backend,
                 kv_type: &args.kv_type,
                 ppl_corpus: None,
-                eval_ll_output: Some(&output),
+                eval_ll_output: eval_ll_output_ref,
+                trajectory: trajectory_ref,
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
-            eprintln!("[QCF-dump] eval-ll JSON written to {}", dump_path.display());
+            eprintln!(
+                "[QCF-dump] eval-ll JSON written to {}{}",
+                dump_path.display(),
+                if trajectory_mode {
+                    " (trajectory schema_v2)"
+                } else {
+                    ""
+                }
+            );
         }
 
         let mut json_val = serde_json::from_str::<serde_json::Value>(&output.to_json()?)?;
@@ -3626,6 +3787,8 @@ fn main() -> anyhow::Result<()> {
             gpu_backend_arc.as_ref(),
             &cpu_backend_arc,
             "",
+            swap_algorithm,
+            true,
         )?;
         qcf_swap_decision = result.decision;
         qcf_warmup_importance = Some(result.importance);
@@ -3774,6 +3937,9 @@ fn main() -> anyhow::Result<()> {
                 secondary_dtype: "Q4_0",
                 num_layers: model.layers.len(),
                 force_swap_ratio: args.force_swap_ratio,
+                swap_algorithm: args
+                    .force_swap_ratio
+                    .map(|_| swap_algorithm.short_name()),
                 swap_set,
                 qcf_swap_predicted: qcf_predicted,
                 fallback_used,
@@ -3788,6 +3954,7 @@ fn main() -> anyhow::Result<()> {
                 kv_type: &args.kv_type,
                 ppl_corpus: Some(ppl_path.as_str()),
                 eval_ll_output: None,
+                trajectory: None,
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
@@ -7759,6 +7926,9 @@ fn main() -> anyhow::Result<()> {
             secondary_dtype: "Q4_0",
             num_layers: model.layers.len(),
             force_swap_ratio: args.force_swap_ratio,
+            swap_algorithm: args
+                .force_swap_ratio
+                .map(|_| swap_algorithm.short_name()),
             swap_set,
             qcf_swap_predicted: qcf_predicted,
             fallback_used,
@@ -7773,6 +7943,7 @@ fn main() -> anyhow::Result<()> {
             kv_type: &args.kv_type,
             ppl_corpus: None,
             eval_ll_output: None,
+            trajectory: None,
         };
 
         dump_qcf_swap_json(dump_path, &ctx)?;
@@ -8188,6 +8359,8 @@ fn run_qcf_warmup_workflow(
     gpu_backend: Option<&Arc<dyn Backend>>,
     cpu_backend: &Arc<dyn Backend>,
     log_prefix: &str,
+    swap_algorithm: llm_rs2::models::weights::SwapAlgorithm,
+    execute_swap: bool,
 ) -> anyhow::Result<QcfWarmupResult> {
     use llm_rs2::core::qcf::ImportanceCollector;
     use llm_rs2::models::weights::WeightSwapDecider;
@@ -8258,14 +8431,31 @@ fn run_qcf_warmup_workflow(
     // ── Optional swap with importance-guided decider ──────────────────────────
     let decision = if let Some(ratio) = force_ratio {
         let ratio = ratio.clamp(0.0, 1.0);
+        eprintln!(
+            "[QCF-dump]{} swap algorithm: {} (execute_swap={})",
+            log_prefix,
+            swap_algorithm.short_name(),
+            execute_swap,
+        );
         let decider = WeightSwapDecider {
             importance: Some(&imp_table),
             noise: Some(model.quant_noise.as_ref()),
             n_decoder_layers: model.layers.len(),
             currently_swapped: &[],
             allow_boundary_layers: read_allow_boundary_env(),
+            algorithm: swap_algorithm,
         };
         let decision = decider.decide(ratio);
+
+        // Trajectory mode (`--qcf-trajectory`): return the decision without
+        // executing the swap — the caller drives swap one layer at a time
+        // around per-step eval-ll measurements.
+        if !execute_swap {
+            return Ok(QcfWarmupResult {
+                importance: imp_table,
+                decision: Some(decision),
+            });
+        }
 
         if decision.selected_layers.is_empty() {
             eprintln!(
@@ -8392,6 +8582,7 @@ fn dispatch_swap_weights(
         n_decoder_layers: n_layers,
         currently_swapped: &currently_swapped,
         allow_boundary_layers: allow_boundary,
+        algorithm: llm_rs2::models::weights::SwapAlgorithm::ImportanceAware,
     };
     let decision: SwapDecision = decider.decide(ratio);
 
@@ -8482,6 +8673,7 @@ fn build_layer_swap_estimate(
             n_decoder_layers: n,
             currently_swapped: &[],
             allow_boundary_layers: read_allow_boundary_env(),
+            algorithm: llm_rs2::models::weights::SwapAlgorithm::ImportanceAware,
         };
         let (_, qcf) = decider.decide_dry_run(r);
         qcf_swap_at_ratio.insert(format!("{:.2}", r), qcf);

@@ -17,6 +17,10 @@ pub struct QcfSwapDumpContext<'a> {
     pub secondary_dtype: &'a str,
     pub num_layers: usize,
     pub force_swap_ratio: Option<f32>,
+    /// Layer-selection algorithm short name used for this run (U5 ablation).
+    /// One of `"imp" | "seq" | "rev" | "uni" | "anti"`. `None` when no swap was
+    /// performed (e.g. baseline ratio=0).
+    pub swap_algorithm: Option<&'a str>,
     /// Decoder layer indices that were swapped (empty if ratio=0 or no secondary).
     pub swap_set: &'a [usize],
     /// QCF_swap predicted value from `WeightSwapDecider` (ENG-ALG-217).
@@ -49,9 +53,34 @@ pub struct QcfSwapDumpContext<'a> {
     /// The full `EvalOutput` is serialized as `eval_ll_output` in the JSON dump so the
     /// external harness can compute `qcf_swap_predicted ↔ ΔNLL` Spearman ρ directly.
     pub eval_ll_output: Option<&'a EvalOutput>,
+    /// Per-step trajectory for `--qcf-trajectory` mode (U5 mid-swap quality study).
+    ///
+    /// When set, `eval_ll_output` is ignored and the JSON dump contains a
+    /// `trajectory` array with one entry per swap step: step index, the
+    /// cumulative set of layers swapped *before* the eval-ll measurement at
+    /// this step, the layer added at this step (`null` for step 0 baseline),
+    /// and the full `EvalOutput` from the eval-ll run.
+    pub trajectory: Option<&'a [TrajectoryStep<'a>]>,
 }
 
-/// Serialize a `QcfSwapDumpContext` to a JSON file (schema_version 1).
+/// One step of a `--qcf-trajectory` measurement.
+pub struct TrajectoryStep<'a> {
+    /// Step index, starting at 0 (= no swap baseline) and going up to K.
+    pub step: usize,
+    /// Layers swapped *before* this step's eval-ll measurement.
+    /// At step 0 this is empty; at step t > 0 this is `selected_layers[..t]`.
+    pub swapped_layers: Vec<usize>,
+    /// Layer added at this step (`None` for step 0 baseline).
+    pub layer_added: Option<usize>,
+    /// eval-ll output measured *after* the swap at this step.
+    pub eval_ll_output: &'a EvalOutput,
+}
+
+/// Serialize a `QcfSwapDumpContext` to a JSON file.
+///
+/// `schema_version` is `1` for the single-eval (non-trajectory) layout and `2`
+/// when `ctx.trajectory.is_some()` (the `trajectory` field carries a per-step
+/// array of `EvalOutput`s).
 ///
 /// The JSON schema matches the external harness expectation exactly:
 /// - All fields are always present (`null` when absent, NOT omitted).
@@ -103,16 +132,48 @@ pub fn dump_qcf_swap_json(
     };
 
     // eval_ll_output: serialize as JSON object when present, null otherwise.
-    let eval_ll_output_val: Value = match ctx.eval_ll_output {
-        Some(output) => {
-            let json_str = output.to_json().unwrap_or_else(|_| "null".to_string());
-            serde_json::from_str(&json_str).unwrap_or(Value::Null)
+    // When trajectory is set, eval_ll_output is implied null (trajectory carries
+    // the per-step EvalOutputs instead).
+    let eval_ll_output_val: Value = if ctx.trajectory.is_some() {
+        Value::Null
+    } else {
+        match ctx.eval_ll_output {
+            Some(output) => {
+                let json_str = output.to_json().unwrap_or_else(|_| "null".to_string());
+                serde_json::from_str(&json_str).unwrap_or(Value::Null)
+            }
+            None => Value::Null,
+        }
+    };
+
+    // trajectory: serialize as an array when present.
+    let trajectory_val: Value = match ctx.trajectory {
+        Some(steps) => {
+            let arr: Vec<Value> = steps
+                .iter()
+                .map(|s| {
+                    let eval_json = s
+                        .eval_ll_output
+                        .to_json()
+                        .unwrap_or_else(|_| "null".to_string());
+                    let eval_val: Value =
+                        serde_json::from_str(&eval_json).unwrap_or(Value::Null);
+                    json!({
+                        "step": s.step,
+                        "swapped_layers": s.swapped_layers,
+                        "layer_added": s.layer_added,
+                        "eval_ll_output": eval_val,
+                    })
+                })
+                .collect();
+            Value::Array(arr)
         }
         None => Value::Null,
     };
 
+    let schema_version = if ctx.trajectory.is_some() { 2 } else { 1 };
     let doc = json!({
-        "schema_version": 1,
+        "schema_version": schema_version,
         "model_arch": ctx.model_arch,
         "model_path": ctx.model_path,
         "secondary_path": ctx.secondary_path,
@@ -120,6 +181,7 @@ pub fn dump_qcf_swap_json(
         "secondary_dtype": ctx.secondary_dtype,
         "num_layers": ctx.num_layers,
         "force_swap_ratio": ctx.force_swap_ratio,
+        "swap_algorithm": ctx.swap_algorithm,
         "swap_set": ctx.swap_set,
         "swap_count": ctx.swap_set.len(),
         "qcf_swap_predicted": ctx.qcf_swap_predicted,
@@ -135,6 +197,7 @@ pub fn dump_qcf_swap_json(
         "kv_type": ctx.kv_type,
         "ppl_corpus": ctx.ppl_corpus,
         "eval_ll_output": eval_ll_output_val,
+        "trajectory": trajectory_val,
     });
 
     let json_str = serde_json::to_string_pretty(&doc)?;
