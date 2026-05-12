@@ -1,8 +1,38 @@
-# Manager SwapWeights Routing — 진행 중 작업 Handoff (2026-05-12)
+# Manager SwapWeights Routing — 작업 완료 (2026-05-12)
 
 ## TL;DR
 
+**옵션 (c) — manager SwapWeights 신호를 engine 내부 incremental K + dynamic-K + sub-batch pause path 로 routing** 작업 **완료**. Commit `76fd55c` 가 sticky state fix 를 적용하여 시나리오 A 가 FAIL → PASS 로 전환. 25/25 layer 정상 swap, 스파이크 0, dynamic-K 적응 모두 확인.
+
+### Sticky state fix (Option B)
+
+- `CommandExecutor.pending_swap_weights: Option<(f32, DtypeTag)>` sticky 필드 추가.
+- `apply_command::SwapWeights` 가 sticky + plan 양쪽에 기록.
+- decode loop 가 `executor.take_pending_swap_weights()` 우선 → `plan.swap_weights` fallback.
+- prefill loop 은 swap 을 처리하지 않으므로 sticky 가 decode 까지 안전하게 살아남음.
+- 단위 테스트 2건 추가 (`test_swap_weights_pending_survives_intermediate_polls`, `test_swap_weights_same_tick_consume_via_plan`).
+
+### 디바이스 측정 결과 (Galaxy S25, R3CY408S4HN, opencl backend, n=80 토큰)
+
+| 지표 | 측정값 | 판정 |
+|---|---|---|
+| Directive 수신 | OK | ✓ |
+| `[WeightSwap] manager path: ratio=0.90, 25 target layers` | 출력 | ✓ |
+| `[IncrementalSwap] tick=1..63` | 25 layer 전부 swap | ✓ |
+| `[SwapPeak] max_release_pending=0` | 0 (스파이크 없음) | ✓ |
+| `[DynamicK] calibrated safe_k=2` → `k_decrease new_k=1` | 적응 작동 | ✓ |
+| `[WeightSwap] manager plan complete: planned=25, actually_q4=25, latency=2921ms` | 완료 | ✓ |
+| Decode quality | "Paris..." plausible | ✓ |
+
+> 주의: R3CY408S4HN 디바이스에서 `--backend qnn_oppkg` 는 `graphFinalize err=0x1786` 으로 실패하여 opencl 로 측정. handoff 의 S5SB 와 다른 시리얼이라 QNN 환경 차이 가능성. 본 fix 의 의도(sticky state via decode loop) 검증에는 backend 무관.
+
+---
+
+## 원본 작업 기록 (보존)
+
 **옵션 (c) — manager SwapWeights 신호를 engine 내부 incremental K + dynamic-K + sub-batch pause path 로 routing** 작업이 **부분 완료** 상태로 중단됨. Commit `25130cb` 는 `dispatch_swap_weights` 를 IncrementalSwapPlan commit 으로 변경했으나, **prefill loop 의 `executor.poll` 이 SwapWeights directive 를 먼저 흡수해서 decode loop 에 도달 못 함** — 실제 swap 안 일어남. **`CommandExecutor` 가 `swap_weights` directive 를 sticky state 로 보관하는 후속 fix 필요**.
+
+→ **해결**: commit `76fd55c` 에서 sticky state fix 완료. 위 검증 결과 참조.
 
 ## 현재 상태
 
