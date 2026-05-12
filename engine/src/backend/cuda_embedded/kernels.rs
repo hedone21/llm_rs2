@@ -132,9 +132,11 @@ impl CudaKernels {
 
         eprintln!("[CUDA] Compiling kernels with {nvcc} --ptx -arch={arch} ...");
 
+        // `-allow-unsupported-compiler` for newer host g++ + older nvcc combos.
         let output = std::process::Command::new(&nvcc)
             .args([
                 "--ptx",
+                "-allow-unsupported-compiler",
                 &format!("-arch={arch}"),
                 "-o",
                 ptx_path.to_str().unwrap(),

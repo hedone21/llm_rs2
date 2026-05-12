@@ -118,9 +118,14 @@ impl CudaKernels {
 
         eprintln!("[CUDA] Compiling kernels with {nvcc} --ptx -arch={arch} ...");
 
+        // `-allow-unsupported-compiler` allows nvcc to proceed when the host
+        // C++ compiler is newer than nvcc's officially supported range
+        // (e.g. g++ 16 + CUDA 13 on Arch Linux). nvcc only uses the host
+        // compiler to parse declarations referenced by device code.
         let output = std::process::Command::new(&nvcc)
             .args([
                 "--ptx",
+                "-allow-unsupported-compiler",
                 &format!("-arch={arch}"),
                 "-o",
                 ptx_path.to_str().unwrap(),
