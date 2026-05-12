@@ -73,6 +73,8 @@ fn test_dump_schema_round_trip() {
         kv_type: "f16",
         ppl_corpus: Some("experiments/prompts/prefill_4096.txt"),
         eval_ll_output: None,
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -151,6 +153,8 @@ fn test_ratio_zero_swap_count_zero() {
         kv_type: "f32",
         ppl_corpus: None,
         eval_ll_output: None,
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -226,6 +230,8 @@ fn test_ratio_033_skip_count_5_for_16l() {
         kv_type: "f16",
         ppl_corpus: None,
         eval_ll_output: None,
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -302,6 +308,8 @@ fn test_ratio_one_caps_at_n_minus_2() {
         kv_type: "f16",
         ppl_corpus: None,
         eval_ll_output: None,
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -340,6 +348,8 @@ fn test_nan_epsilon_excluded() {
         kv_type: "f16",
         ppl_corpus: None,
         eval_ll_output: None,
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -395,6 +405,8 @@ fn test_importance_noise_in_dump() {
         kv_type: "f16",
         ppl_corpus: None,
         eval_ll_output: None,
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -488,6 +500,8 @@ fn test_ppl_none_serializes_as_null() {
         kv_type: "f16",
         ppl_corpus: None,
         eval_ll_output: None,
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -583,6 +597,8 @@ fn test_eval_ll_output_some_included_in_json() {
         kv_type: "f16",
         ppl_corpus: None,
         eval_ll_output: Some(&eval_output),
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -666,6 +682,8 @@ fn test_eval_ll_output_none_serializes_as_null() {
         kv_type: "f32",
         ppl_corpus: Some("experiments/prompts/prefill_4096.txt"),
         eval_ll_output: None,
+        swap_algorithm: None,
+        trajectory: None,
     };
 
     let v = dump_and_parse(&ctx);
