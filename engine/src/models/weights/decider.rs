@@ -22,6 +22,57 @@ use crate::models::weights::QuantNoiseTable;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// Layer-selection algorithm for `WeightSwapDecider` (U5 ablation, EuroSys'27).
+///
+/// The default `ImportanceAware` matches production ARGUS behavior; the others
+/// exist for the U5 "Layer-swap algorithm comparison" table that shows the
+/// quality cost of *not* using importance-aware ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapAlgorithm {
+    /// `importance × ε` ascending bottom-k (current production default).
+    ImportanceAware,
+    /// Layer index ascending (0 → N-1).
+    Sequential,
+    /// Layer index descending (N-1 → 0).
+    Reverse,
+    /// Evenly spaced across candidates (matches the existing fallback path).
+    Uniform,
+    /// `importance × ε` descending top-k (worst-case baseline; the inverse of
+    /// `ImportanceAware`).
+    AntiImportance,
+}
+
+impl SwapAlgorithm {
+    /// Parse a CLI-style identifier (case-insensitive).
+    pub fn from_cli(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "imp" | "importance" | "importance-aware" => Some(Self::ImportanceAware),
+            "seq" | "sequential" => Some(Self::Sequential),
+            "rev" | "reverse" => Some(Self::Reverse),
+            "uni" | "uniform" => Some(Self::Uniform),
+            "anti" | "anti-importance" | "antiimportance" => Some(Self::AntiImportance),
+            _ => None,
+        }
+    }
+
+    /// Stable short identifier used in dump JSON / logs.
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            Self::ImportanceAware => "imp",
+            Self::Sequential => "seq",
+            Self::Reverse => "rev",
+            Self::Uniform => "uni",
+            Self::AntiImportance => "anti",
+        }
+    }
+}
+
+impl Default for SwapAlgorithm {
+    fn default() -> Self {
+        Self::ImportanceAware
+    }
+}
+
 /// Result of `WeightSwapDecider::decide()`.
 #[derive(Debug, Clone)]
 pub struct SwapDecision {
@@ -37,7 +88,8 @@ pub struct SwapDecision {
 ///
 /// Both `importance` and `noise` are optional: pass `None` when the table has
 /// not been built yet.  When either is absent (or effectively empty /
-/// uncomputed), the decider switches to the uniform fallback path.
+/// uncomputed), the `ImportanceAware` / `AntiImportance` algorithms fall back
+/// to `Uniform`.
 pub struct WeightSwapDecider<'a> {
     /// Importance table from the last prefill (None = fallback).
     pub importance: Option<&'a ImportanceTable>,
@@ -52,6 +104,9 @@ pub struct WeightSwapDecider<'a> {
     /// safety semantics. Used for research/ablation experiments (e.g. PPL
     /// teacher-forcing NLL measurement with full-coverage swap).
     pub allow_boundary_layers: bool,
+    /// Layer-selection algorithm. Default = `ImportanceAware` (production).
+    /// U5 ablation uses the other variants.
+    pub algorithm: SwapAlgorithm,
 }
 
 impl<'a> WeightSwapDecider<'a> {
@@ -107,43 +162,63 @@ impl<'a> WeightSwapDecider<'a> {
             })
             .collect();
 
-        // Check whether we have valid importance+noise for the scored path.
-        let use_fallback = self.importance.map(|t| t.is_empty()).unwrap_or(true)
-            || self.noise.map(|t| !t.is_computed()).unwrap_or(true);
+        // `ImportanceAware` and `AntiImportance` require both tables; without
+        // them they fall back to `Uniform`. The pure layer-index algorithms
+        // (`Sequential`, `Reverse`, `Uniform`) never use the tables.
+        let scored_path_available = !self.importance.map(|t| t.is_empty()).unwrap_or(true)
+            && self.noise.map(|t| t.is_computed()).unwrap_or(false);
+        let effective_algo = match self.algorithm {
+            SwapAlgorithm::ImportanceAware | SwapAlgorithm::AntiImportance
+                if !scored_path_available =>
+            {
+                SwapAlgorithm::Uniform
+            }
+            other => other,
+        };
+        let use_fallback = matches!(self.algorithm, SwapAlgorithm::ImportanceAware)
+            && !scored_path_available;
 
-        let selected = if use_fallback {
-            // Uniform fallback: evenly spaced across candidates (ENG-ALG-213 absorbed).
-            uniform_select_by_index(needed, &candidates)
-        } else {
-            let imp = self.importance.expect("importance checked non-empty");
-            let noise = self.noise.expect("noise checked is_computed");
+        let selected: Vec<usize> = match effective_algo {
+            SwapAlgorithm::Sequential => candidates.iter().take(needed).copied().collect(),
+            SwapAlgorithm::Reverse => {
+                candidates.iter().rev().take(needed).copied().collect()
+            }
+            SwapAlgorithm::Uniform => uniform_select_by_index(needed, &candidates),
+            SwapAlgorithm::ImportanceAware | SwapAlgorithm::AntiImportance => {
+                let imp = self.importance.expect("importance checked non-empty");
+                let noise = self.noise.expect("noise checked is_computed");
 
-            // Key = importance(i, SubLayer::Full) × ε(i).
-            // When importance has no entry for a layer, treat as 0.0.
-            let mut scored: Vec<(usize, f32)> = candidates
-                .iter()
-                .map(|&i| {
-                    let imp_val = imp
-                        .entries()
-                        .iter()
-                        .find(|e| e.layer_id == i && e.sublayer == SubLayer::Full)
-                        .map(|e| e.importance)
-                        .unwrap_or(0.0);
-                    let eps_val = noise.epsilon(i).unwrap_or(1.0);
-                    (i, imp_val * eps_val)
-                })
-                .collect();
+                // Key = importance(i, SubLayer::Full) × ε(i).
+                // When importance has no entry for a layer, treat as 0.0.
+                let mut scored: Vec<(usize, f32)> = candidates
+                    .iter()
+                    .map(|&i| {
+                        let imp_val = imp
+                            .entries()
+                            .iter()
+                            .find(|e| e.layer_id == i && e.sublayer == SubLayer::Full)
+                            .map(|e| e.importance)
+                            .unwrap_or(0.0);
+                        let eps_val = noise.epsilon(i).unwrap_or(1.0);
+                        (i, imp_val * eps_val)
+                    })
+                    .collect();
 
-            // Ascending sort: smallest key → swap first.
-            // Tie-breaking: layer index ascending (ENG-ALG-215).
-            scored.sort_by(|(ia, ka), (ib, kb)| {
-                ka.partial_cmp(kb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(ia.cmp(ib))
-            });
+                // `ImportanceAware`: ascending (smallest key first — cheap layers).
+                // `AntiImportance`: descending (largest key first — costly layers).
+                let ascending = matches!(effective_algo, SwapAlgorithm::ImportanceAware);
+                scored.sort_by(|(ia, ka), (ib, kb)| {
+                    let primary = if ascending {
+                        ka.partial_cmp(kb).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        kb.partial_cmp(ka).unwrap_or(std::cmp::Ordering::Equal)
+                    };
+                    primary.then(ia.cmp(ib))
+                });
 
-            scored.truncate(needed);
-            scored.into_iter().map(|(i, _)| i).collect()
+                scored.truncate(needed);
+                scored.into_iter().map(|(i, _)| i).collect()
+            }
         };
 
         let qcf = compute_qcf_swap_internal(&selected, n, self.importance, self.noise);
@@ -306,6 +381,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[],
             allow_boundary_layers: false,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
 
         let decision = decider.decide(0.5);
@@ -340,6 +416,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[],
             allow_boundary_layers: false,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
 
         // ratio=0.5 → k=2, candidates are [1, 2] normally. With layer 1 NaN excluded → [2] only.
@@ -367,6 +444,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[],
             allow_boundary_layers: false,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
 
         let decision = decider.decide(0.5);
@@ -390,6 +468,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[],
             allow_boundary_layers: false,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
 
         let decision = decider.decide(0.0);
@@ -409,6 +488,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[2], // layer 2 already swapped
             allow_boundary_layers: false,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
 
         let decision = decider.decide(0.5);
@@ -431,6 +511,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[],
             allow_boundary_layers: false,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
 
         let decision = decider.decide(0.9);
@@ -458,6 +539,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[],
             allow_boundary_layers: true,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
 
         let decision = decider.decide(1.0);
@@ -486,6 +568,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[],
             allow_boundary_layers: true,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
 
         let decision = decider.decide(1.0);
@@ -557,6 +640,7 @@ mod tests {
             n_decoder_layers: 4,
             currently_swapped: &[],
             allow_boundary_layers: false,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
         let (layers_dr, qcf_dr) = decider.decide_dry_run(0.5);
         let decision = decider.decide(0.5);

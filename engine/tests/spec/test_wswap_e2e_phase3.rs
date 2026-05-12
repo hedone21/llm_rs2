@@ -26,7 +26,9 @@ use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::config::{ModelArch, ModelConfig};
-use llm_rs2::models::weights::{LayerSlot, QuantNoiseTable, WeightSwapDecider, compute_qcf_swap};
+use llm_rs2::models::weights::{
+    LayerSlot, QuantNoiseTable, SwapAlgorithm, WeightSwapDecider, compute_qcf_swap,
+};
 use llm_shared::DtypeTag;
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -163,6 +165,7 @@ fn e2e_decider_to_handler_no_secondary() {
         n_decoder_layers: 4,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);
@@ -201,6 +204,7 @@ fn e2e_swap_decision_fields_satisfy_msg_089_preconditions() {
         n_decoder_layers: n_layers,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(requested_ratio);
@@ -253,6 +257,7 @@ fn e2e_qcf_swap_at_ratio_curve_is_monotone() {
             n_decoder_layers: n_layers,
             currently_swapped: &[],
             allow_boundary_layers: false,
+            algorithm: SwapAlgorithm::ImportanceAware,
         };
         let (_, qcf) = decider.decide_dry_run(r);
         assert!(
@@ -277,6 +282,7 @@ fn e2e_dry_run_zero_ratio_is_empty() {
         n_decoder_layers: 4,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
     let (layers, qcf) = decider.decide_dry_run(0.0);
     assert!(layers.is_empty(), "ratio=0 must give no layers");
@@ -299,6 +305,7 @@ fn e2e_qcf_swap_actual_matches_estimate() {
         n_decoder_layers: n_layers,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);
@@ -351,6 +358,7 @@ fn e2e_selected_layers_have_lower_cost_than_excluded() {
         n_decoder_layers: n_layers,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);
@@ -408,6 +416,7 @@ fn e2e_per_layer_count_consistent() {
         n_decoder_layers: n_layers,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);

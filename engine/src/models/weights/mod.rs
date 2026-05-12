@@ -23,7 +23,7 @@ pub mod slot;
 pub mod swap_executor;
 
 pub use async_swap::{AsyncSwapDispatcher, SwapCommitJob, SwapJob};
-pub use decider::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
+pub use decider::{SwapAlgorithm, SwapDecision, WeightSwapDecider, compute_qcf_swap};
 pub use dynamic_k::DynamicKController;
 pub use incremental_plan::IncrementalSwapPlan;
 pub use intra_forward_swap::{

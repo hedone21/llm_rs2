@@ -18,7 +18,7 @@
 
 use llm_rs2::core::qcf::layer_importance::ImportanceCollector;
 use llm_rs2::core::qcf::layer_importance::ImportanceTable;
-use llm_rs2::models::weights::{QuantNoiseTable, WeightSwapDecider};
+use llm_rs2::models::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
 
 // ── INV-128.1: collector_armed consumption pattern ────────────────────────────
 
@@ -160,6 +160,7 @@ fn inv_128_decider_safe_with_absent_importance() {
         n_decoder_layers: 4,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);

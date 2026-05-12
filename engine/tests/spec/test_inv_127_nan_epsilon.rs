@@ -8,7 +8,7 @@
 //! Spec: INV-127, ENG-DAT-095, ENG-ALG-215.
 
 use llm_rs2::core::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
-use llm_rs2::models::weights::{QuantNoiseTable, WeightSwapDecider};
+use llm_rs2::models::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -43,6 +43,7 @@ fn inv_127_nan_layer_excluded_from_candidates() {
         n_decoder_layers: 4,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);
@@ -70,6 +71,7 @@ fn inv_127_qcf_estimate_is_finite_with_nan_layers() {
         n_decoder_layers: 4,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);
@@ -95,6 +97,7 @@ fn inv_127_all_candidates_nan_gives_empty_selection() {
         n_decoder_layers: 4,
         currently_swapped: &[],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);
@@ -123,6 +126,7 @@ fn inv_127_nan_layer_not_re_selected_even_if_currently_swapped() {
         n_decoder_layers: 4,
         currently_swapped: &[2],
         allow_boundary_layers: false,
+        algorithm: SwapAlgorithm::ImportanceAware,
     };
 
     let decision = decider.decide(0.5);
