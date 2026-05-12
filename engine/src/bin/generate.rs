@@ -904,17 +904,17 @@ struct Args {
     #[arg(long, default_value_t = false)]
     qcf_trajectory: bool,
 
-    /// Enable experimental QCF metric dump for ARGUS analysis.
-    /// Adds qcf_per_head/qcf_caote_max/qcf_topk_retention_*/attention_entropy/
-    /// qcf_beta_amplified_*/qcf_per_layer/qcf_kivi_per_layer_* to eval-ll output.
-    /// Backward-compatible: existing qcf_caote/qcf_kivi_* fields unchanged.
+    /// Enable QCF v3 schema metric dump for EuroSys'27 §3.
+    /// Adds qcf_layer_worst_head/qcf_layer_mean_head/qcf_record_*/qcf_d7_*/
+    /// qcf_c1_* (schema_version=3) to eval-ll output for both Eviction and KIVI.
     #[arg(long, default_value_t = false)]
     enable_qcf_experimental: bool,
 
-    /// Sample layer indices for multi-layer QCF (ARGUS #1).
-    /// Accepts: "auto" (default; [0, n/4, n/2, 3n/4, n-1]),
-    /// "all" (every layer; debug only), "0,8,16,24,31" (explicit).
-    #[arg(long, default_value = "auto")]
+    /// Sample layer indices for multi-layer QCF.
+    /// Default is "all" (schema v3: every decoder layer) — required for D7/C1.
+    /// Other values: "auto" (legacy 5-tuple [0, n/4, n/2, 3n/4, n-1]),
+    /// "0,8,16,24,31" (explicit indices).
+    #[arg(long, default_value = "all")]
     qcf_sample_layers: String,
 
     /// β values for β-amplified CAOTE (ARGUS #6 option B).

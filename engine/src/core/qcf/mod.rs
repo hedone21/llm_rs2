@@ -16,7 +16,9 @@ pub mod unified_qcf;
 
 pub use entropy::{EntropyResult, compute_normalized_entropy};
 pub use estimator::DegradationEstimator;
-pub use layer_aggregation::{LayerAggregationMode, aggregate_layers, compute_auto_sample_layers};
+pub use layer_aggregation::{
+    LayerAggregationMode, aggregate_layers, compute_auto_sample_layers, compute_c1, compute_d7,
+};
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 pub use quant_qcf::{
     FlushAttentionParams, KiviFlushParams, compute_flush_aw_vopr, compute_flush_awqe,

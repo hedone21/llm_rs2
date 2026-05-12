@@ -43,28 +43,17 @@ pub struct KiviHook {
     /// Optional attention score accumulator (for entropy dump).
     pub score_accumulator: Option<AttentionScoreAccumulator>,
 
-    /// Running count of flush events for the current question (layer 0 legacy).
+    /// Running count of flush events for the current question (layer 0 legacy,
+    /// dumped as `kivi_flush_count`).
     flush_count: usize,
-    /// Max OPR value across all flushes for current question (legacy per-flush max).
-    qcf_kivi_legacy: f32,
-    /// Sum of OPR values across all flushes for current question (for mean).
-    qcf_kivi_sum: f32,
-    /// Max AW-VOPR value across all flushes for current question.
-    qcf_aw_vopr_max: f32,
-    /// Sum of AW-VOPR values across all flushes for current question.
-    qcf_aw_vopr_sum: f32,
-    /// Count of AW-VOPR metrics collected for current question.
-    aw_vopr_count: usize,
 
-    // ARGUS Step 5: per-layer accumulation (sample_layers index → accumulated values)
+    // Schema v3: per-layer accumulation. Buffers indexed by `sample_layers` position.
+    /// Per-layer worst-head accumulator (max OPR observed at each sampled layer).
     per_layer_max: Vec<f32>,
+    /// Per-layer running sum (for mean-head dump).
     per_layer_sum: Vec<f32>,
+    /// Per-layer flush count (denominator of mean-head).
     per_layer_count: Vec<usize>,
-
-    // ARGUS Step 5: entropy (computed once at post_prefill when acc is active)
-    attention_entropy: f32,
-    attention_entropy_normalized: f32,
-    entropy_computed: bool,
 }
 
 impl KiviHook {
@@ -81,17 +70,9 @@ impl KiviHook {
             qcf_sample_layers,
             score_accumulator,
             flush_count: 0,
-            qcf_kivi_legacy: 0.0,
-            qcf_kivi_sum: 0.0,
-            qcf_aw_vopr_max: 0.0,
-            qcf_aw_vopr_sum: 0.0,
-            aw_vopr_count: 0,
             per_layer_max: vec![0.0; n],
             per_layer_sum: vec![0.0; n],
             per_layer_count: vec![0; n],
-            attention_entropy: 0.0,
-            attention_entropy_normalized: 0.0,
-            entropy_computed: false,
         }
     }
 
@@ -126,23 +107,16 @@ impl KiviHook {
                     let pos = sample_layers.iter().position(|&v| v == cache_idx).unwrap();
                     for metric in cache.take_flush_proxies() {
                         if metric.action == "kivi_opr" {
-                            // Layer 0 in sample → also update legacy fields for backward compat.
                             if cache_idx == 0 {
-                                self.qcf_kivi_legacy = self.qcf_kivi_legacy.max(metric.raw_value);
-                                self.qcf_kivi_sum += metric.raw_value;
                                 self.flush_count += 1;
                             }
                             self.per_layer_max[pos] = self.per_layer_max[pos].max(metric.raw_value);
                             self.per_layer_sum[pos] += metric.raw_value;
                             self.per_layer_count[pos] += 1;
-                        } else if metric.action == "aw_vopr" {
-                            self.qcf_aw_vopr_max = self.qcf_aw_vopr_max.max(metric.raw_value);
-                            self.qcf_aw_vopr_sum += metric.raw_value;
-                            self.aw_vopr_count += 1;
                         }
+                        // "aw_vopr" and NMSE proxies are drained but not exposed in v3.
                     }
                 } else {
-                    // Drain non-sample layers to prevent proxy queue growth.
                     cache.take_flush_proxies();
                 }
             }
@@ -150,15 +124,8 @@ impl KiviHook {
             // Legacy path: layer 0 only, no per-layer tracking.
             for metric in caches[0].take_flush_proxies() {
                 if metric.action == "kivi_opr" {
-                    self.qcf_kivi_legacy = self.qcf_kivi_legacy.max(metric.raw_value);
-                    self.qcf_kivi_sum += metric.raw_value;
                     self.flush_count += 1;
-                } else if metric.action == "aw_vopr" {
-                    self.qcf_aw_vopr_max = self.qcf_aw_vopr_max.max(metric.raw_value);
-                    self.qcf_aw_vopr_sum += metric.raw_value;
-                    self.aw_vopr_count += 1;
                 }
-                // NMSE ("kivi" action) tracked but not exposed as per-question scalar
             }
             for cache in caches[1..].iter_mut() {
                 cache.take_flush_proxies();
@@ -175,18 +142,6 @@ impl StepHook<KiviCache> for KiviHook {
 
     fn post_prefill(&mut self, caches: &mut [KiviCache]) {
         self.collect_flush_proxies(caches);
-
-        // ARGUS Step 5: attention entropy from accumulated importance scores.
-        if self.experimental_enabled
-            && let Some(ref acc) = self.score_accumulator
-            && acc.is_active()
-        {
-            let scores = acc.importance_scores();
-            let r = crate::core::qcf::compute_normalized_entropy(scores);
-            self.attention_entropy = r.entropy;
-            self.attention_entropy_normalized = r.entropy_normalized;
-            self.entropy_computed = true;
-        }
     }
 
     fn reset_caches(&mut self, caches: &mut [KiviCache]) {
@@ -194,12 +149,6 @@ impl StepHook<KiviCache> for KiviHook {
             cache.reset();
         }
         self.flush_count = 0;
-        self.qcf_kivi_legacy = 0.0;
-        self.qcf_kivi_sum = 0.0;
-        self.qcf_aw_vopr_max = 0.0;
-        self.qcf_aw_vopr_sum = 0.0;
-        self.aw_vopr_count = 0;
-        // Step 5: reset per-layer buffers
         for v in self.per_layer_max.iter_mut() {
             *v = 0.0;
         }
@@ -209,9 +158,6 @@ impl StepHook<KiviCache> for KiviHook {
         for v in self.per_layer_count.iter_mut() {
             *v = 0;
         }
-        self.attention_entropy = 0.0;
-        self.attention_entropy_normalized = 0.0;
-        self.entropy_computed = false;
         if let Some(ref mut acc) = self.score_accumulator {
             acc.reset();
         }
@@ -236,21 +182,8 @@ impl StepHook<KiviCache> for KiviHook {
         let mut obj = serde_json::json!({
             "kivi_q2_tokens": q2_tokens,
             "kivi_res_pos": res_pos,
+            "kivi_flush_count": self.flush_count,
         });
-        if self.flush_count > 0 {
-            let qcf_mean = self.qcf_kivi_sum / self.flush_count as f32;
-            obj["qcf"] = serde_json::json!(qcf_mean);
-            obj["qcf_kivi_mean"] = serde_json::json!(qcf_mean);
-            obj["qcf_kivi_max"] = serde_json::json!(self.qcf_kivi_legacy);
-            obj["qcf_kivi_flush_count"] = serde_json::json!(self.flush_count);
-        }
-        if self.aw_vopr_count > 0 {
-            obj["qcf_kivi_aw_vopr_max"] = serde_json::json!(self.qcf_aw_vopr_max);
-            obj["qcf_kivi_aw_vopr_sum"] = serde_json::json!(self.qcf_aw_vopr_sum);
-            obj["qcf_kivi_aw_vopr_mean"] =
-                serde_json::json!(self.qcf_aw_vopr_sum / self.aw_vopr_count as f32);
-            obj["qcf_kivi_aw_vopr_count"] = serde_json::json!(self.aw_vopr_count);
-        }
 
         if self.experimental_enabled {
             let indices: Vec<usize> = if self.qcf_sample_layers.is_empty() {
@@ -259,9 +192,8 @@ impl StepHook<KiviCache> for KiviHook {
                 self.qcf_sample_layers.clone()
             };
             let n = indices.len();
-            // Ensure buffers are at least length n (guard against uninitialised state).
-            let max_vec: Vec<f32> = self.per_layer_max.iter().copied().take(n).collect();
-            let mean_vec: Vec<f32> = self
+            let layer_worst_head: Vec<f32> = self.per_layer_max.iter().copied().take(n).collect();
+            let layer_mean_head: Vec<f32> = self
                 .per_layer_sum
                 .iter()
                 .zip(self.per_layer_count.iter())
@@ -269,25 +201,35 @@ impl StepHook<KiviCache> for KiviHook {
                 .map(|(s, c)| if *c > 0 { *s / (*c as f32) } else { 0.0 })
                 .collect();
 
-            obj["qcf_kivi_per_layer_indices"] = serde_json::json!(indices);
-            obj["qcf_kivi_per_layer_max"] = serde_json::json!(max_vec);
-            obj["qcf_kivi_per_layer_mean"] = serde_json::json!(mean_vec);
+            let max_or_zero = |s: &[f32]| -> f32 {
+                if s.is_empty() {
+                    0.0
+                } else {
+                    s.iter().copied().fold(f32::NEG_INFINITY, f32::max).max(0.0)
+                }
+            };
+            let mean_or_zero = |s: &[f32]| -> f32 {
+                if s.is_empty() {
+                    0.0
+                } else {
+                    s.iter().sum::<f32>() / s.len() as f32
+                }
+            };
 
-            // Layer-level aggregations.
-            use crate::core::qcf::{LayerAggregationMode, aggregate_layers};
-            obj["qcf_kivi_layer_max"] =
-                serde_json::json!(aggregate_layers(&max_vec, &LayerAggregationMode::Max));
-            obj["qcf_kivi_layer_defensive_t01"] = serde_json::json!(aggregate_layers(
-                &max_vec,
-                &LayerAggregationMode::Defensive { temperature: 0.1 }
-            ));
-
-            // Entropy — present only when successfully measured.
-            if self.entropy_computed {
-                obj["attention_entropy_kivi"] = serde_json::json!(self.attention_entropy);
-                obj["attention_entropy_normalized_kivi"] =
-                    serde_json::json!(self.attention_entropy_normalized);
-            }
+            use crate::core::qcf::{compute_c1, compute_d7};
+            obj["schema_version"] = serde_json::json!(3);
+            obj["action_family"] = serde_json::json!("kivi");
+            obj["n_layers"] = serde_json::json!(n);
+            obj["qcf_record_worst_head_max"] = serde_json::json!(max_or_zero(&layer_worst_head));
+            obj["qcf_record_worst_head_mean"] = serde_json::json!(mean_or_zero(&layer_worst_head));
+            obj["qcf_record_mean_head_max"] = serde_json::json!(max_or_zero(&layer_mean_head));
+            obj["qcf_record_mean_head_mean"] = serde_json::json!(mean_or_zero(&layer_mean_head));
+            obj["qcf_d7_worst_head"] = serde_json::json!(compute_d7(&layer_worst_head));
+            obj["qcf_d7_mean_head"] = serde_json::json!(compute_d7(&layer_mean_head));
+            obj["qcf_c1_worst_head"] = serde_json::json!(compute_c1(&layer_worst_head));
+            obj["qcf_c1_mean_head"] = serde_json::json!(compute_c1(&layer_mean_head));
+            obj["qcf_layer_worst_head"] = serde_json::json!(layer_worst_head);
+            obj["qcf_layer_mean_head"] = serde_json::json!(layer_mean_head);
         }
 
         obj
@@ -338,33 +280,20 @@ mod tests {
     }
 
     #[test]
-    fn test_qcf_kivi_legacy_tracking() {
+    fn test_flush_count_tracking_and_reset() {
         let mut hook = make_hook();
-        // Simulate flush proxies being collected
-        // Directly test collect_flush_proxies by creating a cache with proxies
         let cache = KiviCache::new(8, 64, 512, 32);
 
-        // Inject proxies manually via the public method (if available)
-        // Since we can't inject proxies directly, test the fields after hook operations
         assert_eq!(hook.flush_count, 0);
-        assert_eq!(hook.qcf_kivi_legacy, 0.0);
 
-        // Set values and verify output fields
+        // Schema v3: kivi_flush_count is always emitted (no longer gated on > 0).
         hook.flush_count = 5;
-        hook.qcf_kivi_legacy = 0.5; // max
-        hook.qcf_kivi_sum = 1.48; // sum → mean = 1.48/5 = 0.296
         let fields = hook.extra_question_fields(&[cache]);
-        let expected_mean = 1.48_f32 / 5.0;
-        assert!((fields["qcf"].as_f64().unwrap() - expected_mean as f64).abs() < 1e-5);
-        assert_eq!(fields["qcf_kivi_max"], 0.5_f32 as f64);
-        assert!((fields["qcf_kivi_mean"].as_f64().unwrap() - expected_mean as f64).abs() < 1e-5);
-        assert_eq!(fields["qcf_kivi_flush_count"], 5);
+        assert_eq!(fields["kivi_flush_count"], 5);
 
-        // After reset_caches
         let cache2 = KiviCache::new(8, 64, 512, 32);
         hook.reset_caches(&mut [cache2]);
         assert_eq!(hook.flush_count, 0);
-        assert_eq!(hook.qcf_kivi_legacy, 0.0);
     }
 
     #[test]
@@ -426,65 +355,62 @@ mod tests {
     // ── ARGUS Step 5 tests ──────────────────────────────────────────────────
 
     #[test]
-    fn test_per_layer_indices_in_extra_fields_when_experimental() {
+    fn test_schema_v3_fields_when_experimental() {
         let hook = make_hook_experimental(vec![0, 4, 8]);
         let fields = hook.extra_question_fields(&[]);
-        let indices = fields["qcf_kivi_per_layer_indices"]
-            .as_array()
-            .expect("qcf_kivi_per_layer_indices must be present when experimental_enabled");
-        assert_eq!(indices.len(), 3);
-        assert_eq!(indices[0], 0);
-        assert_eq!(indices[1], 4);
-        assert_eq!(indices[2], 8);
 
-        // Per-layer max/mean arrays also present
-        assert!(
-            fields["qcf_kivi_per_layer_max"].is_array(),
-            "qcf_kivi_per_layer_max must be an array"
-        );
-        assert!(
-            fields["qcf_kivi_per_layer_mean"].is_array(),
-            "qcf_kivi_per_layer_mean must be an array"
-        );
+        assert_eq!(fields["schema_version"], 3);
+        assert_eq!(fields["action_family"], "kivi");
+        assert_eq!(fields["n_layers"], 3);
 
-        // Layer aggregation scalars present
         assert!(
-            fields["qcf_kivi_layer_max"].is_number(),
-            "qcf_kivi_layer_max must be a number"
+            fields["qcf_layer_worst_head"].is_array(),
+            "qcf_layer_worst_head must be an array"
         );
         assert!(
-            fields["qcf_kivi_layer_defensive_t01"].is_number(),
-            "qcf_kivi_layer_defensive_t01 must be a number"
+            fields["qcf_layer_mean_head"].is_array(),
+            "qcf_layer_mean_head must be an array"
         );
+        assert_eq!(fields["qcf_layer_worst_head"].as_array().unwrap().len(), 3);
+        assert_eq!(fields["qcf_layer_mean_head"].as_array().unwrap().len(), 3);
+
+        for k in [
+            "qcf_record_worst_head_max",
+            "qcf_record_worst_head_mean",
+            "qcf_record_mean_head_max",
+            "qcf_record_mean_head_mean",
+            "qcf_d7_worst_head",
+            "qcf_d7_mean_head",
+            "qcf_c1_worst_head",
+            "qcf_c1_mean_head",
+        ] {
+            assert!(fields[k].is_number(), "{k} must be a number");
+        }
     }
 
     #[test]
-    fn test_no_per_layer_fields_when_not_experimental() {
+    fn test_no_schema_v3_fields_when_not_experimental() {
         let hook = make_hook();
         let fields = hook.extra_question_fields(&[]);
-        assert!(
-            fields.get("qcf_kivi_per_layer_indices").is_none(),
-            "qcf_kivi_per_layer_indices must be absent when experimental_enabled=false"
-        );
-        assert!(
-            fields.get("qcf_kivi_layer_max").is_none(),
-            "qcf_kivi_layer_max must be absent when experimental_enabled=false"
-        );
-        assert!(
-            fields.get("attention_entropy_kivi").is_none(),
-            "attention_entropy_kivi must be absent when experimental_enabled=false"
-        );
+        for k in [
+            "schema_version",
+            "qcf_layer_worst_head",
+            "qcf_layer_mean_head",
+            "qcf_d7_worst_head",
+        ] {
+            assert!(
+                fields.get(k).is_none(),
+                "{k} must be absent when experimental_enabled=false"
+            );
+        }
     }
 
     #[test]
-    fn test_reset_caches_clears_step5_fields() {
+    fn test_reset_caches_clears_per_layer_buffers() {
         let mut hook = make_hook_experimental(vec![0, 4]);
-        // Inject some artificial per-layer values.
         hook.per_layer_max[0] = 0.9;
         hook.per_layer_sum[0] = 1.8;
         hook.per_layer_count[0] = 2;
-        hook.attention_entropy = 1.234; // arbitrary non-zero sentinel value
-        hook.entropy_computed = true;
 
         let mut caches = vec![KiviCache::new(8, 64, 512, 32)];
         hook.reset_caches(&mut caches);
@@ -492,19 +418,14 @@ mod tests {
         assert_eq!(hook.per_layer_max[0], 0.0);
         assert_eq!(hook.per_layer_sum[0], 0.0);
         assert_eq!(hook.per_layer_count[0], 0);
-        assert_eq!(hook.attention_entropy, 0.0);
-        assert!(!hook.entropy_computed);
     }
 
     #[test]
     fn test_experimental_empty_sample_layers_fallback_to_layer0() {
-        // Empty qcf_sample_layers → runtime fallback to [0].
+        // Empty qcf_sample_layers → runtime fallback to [0] in dump.
         let hook = make_hook_experimental(vec![]);
         let fields = hook.extra_question_fields(&[]);
-        let indices = fields["qcf_kivi_per_layer_indices"]
-            .as_array()
-            .expect("indices must be present");
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0], 0);
+        // schema v3: n_layers reflects the fallback length (1).
+        assert_eq!(fields["n_layers"], 1);
     }
 }

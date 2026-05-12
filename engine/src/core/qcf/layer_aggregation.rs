@@ -53,6 +53,39 @@ pub fn aggregate_layers(per_layer: &[f32], mode: &LayerAggregationMode) -> f32 {
     }
 }
 
+/// QCF D7 — dispersion ratio of a per-layer scalar series.
+///
+/// `D7 = (max(L) - min(L)) / (max(L) + eps)` where `L` is the per-layer scalar
+/// (worst-head or mean-head). EuroSys'27 §3 main QCF metric.
+///
+/// `eps` = 1e-6 (hard-coded). Empty input → returns 0.0.
+pub fn compute_d7(per_layer: &[f32]) -> f32 {
+    if per_layer.is_empty() {
+        return 0.0;
+    }
+    let max_l = per_layer.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min_l = per_layer.iter().copied().fold(f32::INFINITY, f32::min);
+    let eps = 1e-6_f32;
+    (max_l - min_l) / (max_l + eps)
+}
+
+/// QCF C1 — D7 with population standard deviation as a magnitude tie-breaker.
+///
+/// `C1 = D7(L) + std_pop(L)` where `std_pop` uses divisor `n` (matching NumPy's
+/// `np.std` default). EuroSys'27 §3 supplementary refinement.
+///
+/// Empty input → returns 0.0.
+pub fn compute_c1(per_layer: &[f32]) -> f32 {
+    if per_layer.is_empty() {
+        return 0.0;
+    }
+    let n = per_layer.len() as f32;
+    let mean = per_layer.iter().sum::<f32>() / n;
+    let var = per_layer.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / n;
+    let std_pop = var.sqrt();
+    compute_d7(per_layer) + std_pop
+}
+
 /// Compute auto sample-layer indices: `[0, n/4, n/2, 3n/4, n-1]` for `n >= 5`,
 /// otherwise all layers.
 ///
@@ -127,6 +160,56 @@ mod tests {
         let v = vec![1.0, 2.0, 3.0];
         let r = aggregate_layers(&v, &LayerAggregationMode::LateFocused { fraction: 0.0 });
         assert!((r - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compute_d7_empty() {
+        assert_eq!(compute_d7(&[]), 0.0);
+    }
+
+    #[test]
+    fn compute_d7_uniform() {
+        // Uniform layers → max == min → D7 == 0
+        let v = vec![0.3, 0.3, 0.3, 0.3];
+        assert!((compute_d7(&v)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn compute_d7_concentrated() {
+        // [0.1, 0.5, 0.3] → (0.5 - 0.1) / (0.5 + 1e-6) ≈ 0.79999..
+        let v = vec![0.1, 0.5, 0.3];
+        let d7 = compute_d7(&v);
+        assert!((d7 - 0.8).abs() < 1e-3);
+    }
+
+    #[test]
+    fn compute_d7_full_concentration() {
+        // [0.0, 0.0, 1.0] → (1 - 0) / (1 + eps) ≈ 1.0
+        let v = vec![0.0, 0.0, 1.0];
+        let d7 = compute_d7(&v);
+        assert!((d7 - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn compute_c1_empty() {
+        assert_eq!(compute_c1(&[]), 0.0);
+    }
+
+    #[test]
+    fn compute_c1_uniform() {
+        // Uniform → D7 = 0, std = 0 → C1 = 0
+        let v = vec![0.4, 0.4, 0.4];
+        assert!((compute_c1(&v)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn compute_c1_concentrated() {
+        // [0.0, 0.0, 1.0] → D7 ≈ 1.0, mean = 1/3, var_pop = 2/9, std ≈ 0.4714
+        // C1 ≈ 1.4714
+        let v = vec![0.0_f32, 0.0, 1.0];
+        let c1 = compute_c1(&v);
+        let expected = 1.0 + (2.0_f32 / 9.0).sqrt();
+        assert!((c1 - expected).abs() < 1e-3);
     }
 
     #[test]

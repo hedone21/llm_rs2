@@ -9,10 +9,8 @@ use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::{
-    AggregationMode, EntropyResult, LayerAggregationMode, QcfActionType, QcfConfig,
-    TopKRetentionResult, UnifiedQcfParams, VDataSource, aggregate_heads, aggregate_layers,
-    compute_normalized_entropy, compute_topk_retention, compute_unified_qcf,
-    identify_retained_for_action,
+    AggregationMode, QcfActionType, QcfConfig, UnifiedQcfParams, VDataSource, aggregate_heads,
+    compute_c1, compute_d7, compute_unified_qcf, identify_retained_for_action,
 };
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
@@ -23,35 +21,33 @@ pub struct EvictionQcfResult {
     pub qcf_caote: f32,
 }
 
-/// Experimental QCF metrics — added 2026-05 for ARGUS analysis.
-/// All fields are temporary. May be deprecated after paper validation.
+/// QCF record schema v3 payload — cross-family unified (Eviction + KIVI).
+///
+/// Per-layer worst-head and mean-head series of `‖ΔO_h‖₂ / ‖O_h‖₂`, plus
+/// binary pre-computed record-level scalars and D7 / C1 dispersion metrics
+/// used by EuroSys'27 §3.
 #[derive(Debug, Clone, Default)]
-pub struct ExperimentalQcfPayload {
-    pub per_head: Vec<f32>,
-    pub caote_max: f32,
-    pub caote_topk_k3: f32,
-    pub caote_topk_k5: f32,
-    pub caote_defensive_t01: f32,
-    pub caote_defensive_t05: f32,
-    // Step 2: Top-K retention metrics (ARGUS #5)
-    pub topk_retention_k10: f32,
-    pub topk_retention_k20: f32,
-    pub topk_retention_k50: f32,
-    pub topk_retention_weighted_k10: f32,
-    pub topk_retention_weighted_k20: f32,
-    // Step 3: Attention entropy + β-amplified CAOTE (ARGUS #6)
-    pub attention_entropy: f32,
-    pub attention_entropy_normalized: f32,
-    pub qcf_beta_amplified_b1: f32,
-    pub qcf_beta_amplified_b1_5: f32,
-    pub qcf_beta_amplified_b2: f32,
-    // Step 4: Multi-layer QCF aggregation (ARGUS #1)
-    pub per_layer: Vec<f32>,
-    pub per_layer_indices: Vec<usize>,
-    pub caote_layer_max: f32,
-    pub caote_layer_defensive_t01: f32,
-    pub caote_layer_defensive_t05: f32,
-    pub caote_layer_late_30pct: f32,
+pub struct ExpQcfV3 {
+    /// Per-layer worst-head value: `max_h (qcf^h_l)`.
+    pub layer_worst_head: Vec<f32>,
+    /// Per-layer mean-head value: `mean_h (qcf^h_l)`.
+    pub layer_mean_head: Vec<f32>,
+    /// `max_l layer_worst_head`.
+    pub record_worst_head_max: f32,
+    /// `mean_l layer_worst_head`.
+    pub record_worst_head_mean: f32,
+    /// `max_l layer_mean_head`.
+    pub record_mean_head_max: f32,
+    /// `mean_l layer_mean_head`.
+    pub record_mean_head_mean: f32,
+    /// D7 dispersion ratio computed on `layer_worst_head`.
+    pub d7_worst_head: f32,
+    /// D7 dispersion ratio computed on `layer_mean_head`.
+    pub d7_mean_head: f32,
+    /// C1 = D7 + population std, computed on `layer_worst_head`.
+    pub c1_worst_head: f32,
+    /// C1 = D7 + population std, computed on `layer_mean_head`.
+    pub c1_mean_head: f32,
 }
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
@@ -177,7 +173,7 @@ pub struct EvictionHook {
     /// QCF result from the single post-prefill eviction event (eval-ll mode).
     eviction_qcf: Option<EvictionQcfResult>,
     /// Experimental QCF payload (Some when experimental_enabled and prefill happened).
-    experimental_qcf: Option<ExperimentalQcfPayload>,
+    experimental_qcf: Option<ExpQcfV3>,
 }
 
 impl EvictionHook {
@@ -409,218 +405,138 @@ impl StepHook<KVCache> for EvictionHook {
             let (qcf, per_head) = compute_unified_qcf(&params);
 
             if self.experimental_enabled {
-                // Top-K retention: compute evicted set from retained simulation,
-                // then measure how many high-importance tokens survived.
-                let retained = retained_for_topk.unwrap_or_default();
-                let retained_set: std::collections::HashSet<usize> =
-                    retained.iter().copied().collect();
-                let evicted_set: std::collections::HashSet<usize> = (0..before_len)
-                    .filter(|t| !retained_set.contains(t))
-                    .collect();
+                // Schema v3: per-layer worst-head + mean-head over the sample layers.
+                // Layer 0 reuses the `per_head` already computed above.
+                // _ = action_for_beta; _ = retained_for_topk;   // (kept names for diff clarity)
+                let _ = action_for_beta;
+                let _ = retained_for_topk;
 
-                let r10: TopKRetentionResult =
-                    compute_topk_retention(&attention_scores, &evicted_set, 10);
-                let r20: TopKRetentionResult =
-                    compute_topk_retention(&attention_scores, &evicted_set, 20);
-                let r50: TopKRetentionResult =
-                    compute_topk_retention(&attention_scores, &evicted_set, 50);
-
-                // Step 3: Attention entropy of flat importance scores.
-                let entropy_result: EntropyResult = compute_normalized_entropy(&attention_scores);
-
-                // Step 3: β-amplified CAOTE at β=1.5 and β=2.0.
-                // β=1.0 is already computed above (qcf). V source must be re-obtained
-                // from the cache because `v_source` was moved into `params`.
-                let qcf_b1 = qcf;
-                let qcf_b1_5 = {
-                    let v_src_b = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref());
-                    if let (Some(vs), Some(act)) = (v_src_b, action_for_beta.clone()) {
-                        let k_src_b = if matches!(act, QcfActionType::MergeD2o { .. }) {
-                            VDataSource::k_from_kv_cache(cache)
-                        } else {
-                            None
-                        };
-                        let p = UnifiedQcfParams {
-                            action: act,
-                            v_source: vs,
-                            k_source: k_src_b,
-                            attention_scores: &attention_scores,
-                            head_attn: head_attn_opt,
-                            n_kv_heads: cache.kv_heads(),
-                            head_dim: cache.head_dim(),
-                            current_pos: before_len,
-                            capacity: cache.capacity(),
-                            layout: cache.layout(),
-                            aggregation: AggregationMode::Mean,
-                            beta: 1.5,
-                        };
-                        compute_unified_qcf(&p).0
-                    } else {
-                        0.0
-                    }
-                };
-                let qcf_b2 = {
-                    let v_src_b = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref());
-                    if let (Some(vs), Some(act)) = (v_src_b, action_for_beta) {
-                        let k_src_b = if matches!(act, QcfActionType::MergeD2o { .. }) {
-                            VDataSource::k_from_kv_cache(cache)
-                        } else {
-                            None
-                        };
-                        let p = UnifiedQcfParams {
-                            action: act,
-                            v_source: vs,
-                            k_source: k_src_b,
-                            attention_scores: &attention_scores,
-                            head_attn: head_attn_opt,
-                            n_kv_heads: cache.kv_heads(),
-                            head_dim: cache.head_dim(),
-                            current_pos: before_len,
-                            capacity: cache.capacity(),
-                            layout: cache.layout(),
-                            aggregation: AggregationMode::Mean,
-                            beta: 2.0,
-                        };
-                        compute_unified_qcf(&p).0
-                    } else {
-                        0.0
-                    }
-                };
-
-                // Step 4: Multi-layer QCF aggregation (ARGUS #1).
-                // Sample layers: default fallback to [0] (backward compat).
-                // Layer 0 result is reused from above (no extra readback).
                 let sample_layers: Vec<usize> = if self.qcf_sample_layers.is_empty() {
                     vec![0]
                 } else {
                     self.qcf_sample_layers.clone()
                 };
-                let mut per_layer: Vec<f32> = Vec::with_capacity(sample_layers.len());
-                let mut per_layer_indices: Vec<usize> = Vec::with_capacity(sample_layers.len());
+
+                let mut layer_worst_head: Vec<f32> = Vec::with_capacity(sample_layers.len());
+                let mut layer_mean_head: Vec<f32> = Vec::with_capacity(sample_layers.len());
 
                 for &layer_idx in &sample_layers {
                     if layer_idx >= caches.len() {
                         continue;
                     }
-                    if layer_idx == 0 {
-                        // Reuse layer 0 result already computed above.
-                        per_layer.push(qcf);
-                        per_layer_indices.push(0);
-                        continue;
-                    }
-                    // Per-layer V readback (GPU only — CPU buffers accessible via as_ptr).
-                    let cache_l = &caches[layer_idx];
-                    let v_cpu_bytes_l: Option<Vec<u8>> =
-                        if cache_l.v_buffer.buffer().as_ptr().is_null() {
-                            let size = cache_l.v_buffer.buffer().size();
-                            let mut buf = vec![0u8; size];
-                            match self.backend.read_buffer(&cache_l.v_buffer, &mut buf) {
-                                Ok(()) => Some(buf),
-                                Err(_) => None,
-                            }
+                    // Layer 0: reuse `per_head` from the scalar call above (no extra readback).
+                    let per_head_l: Vec<f32> = if layer_idx == 0 {
+                        per_head.clone()
+                    } else {
+                        // Per-layer V readback (GPU only — CPU buffers accessible via as_ptr).
+                        let cache_l = &caches[layer_idx];
+                        let v_cpu_bytes_l: Option<Vec<u8>> =
+                            if cache_l.v_buffer.buffer().as_ptr().is_null() {
+                                let size = cache_l.v_buffer.buffer().size();
+                                let mut buf = vec![0u8; size];
+                                match self.backend.read_buffer(&cache_l.v_buffer, &mut buf) {
+                                    Ok(()) => Some(buf),
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            };
+
+                        let can_compute_l = v_cpu_bytes_l.is_some()
+                            || !cache_l.v_buffer.buffer().as_ptr().is_null();
+                        if !can_compute_l {
+                            continue;
+                        }
+
+                        let v_source_l =
+                            match VDataSource::from_kv_cache(cache_l, v_cpu_bytes_l.as_deref()) {
+                                Some(vs) => vs,
+                                None => VDataSource::F32(cache_l.v_buffer.as_slice::<f32>()),
+                            };
+                        let k_source_l = if self.is_d2o {
+                            VDataSource::k_from_kv_cache(cache_l)
                         } else {
                             None
                         };
-
-                    let can_compute_l =
-                        v_cpu_bytes_l.is_some() || !cache_l.v_buffer.buffer().as_ptr().is_null();
-                    if !can_compute_l {
-                        continue;
-                    }
-
-                    let v_source_l =
-                        match VDataSource::from_kv_cache(cache_l, v_cpu_bytes_l.as_deref()) {
-                            Some(vs) => vs,
-                            None => VDataSource::F32(cache_l.v_buffer.as_slice::<f32>()),
-                        };
-                    let k_source_l = if self.is_d2o {
-                        VDataSource::k_from_kv_cache(cache_l)
-                    } else {
-                        None
-                    };
-                    // Build action for this layer using same params as layer 0.
-                    let target_len_l = ((cache_l.current_pos as f32) * ratio) as usize;
-                    let action_l = if self.score_based_eviction {
-                        if self.is_d2o {
-                            QcfActionType::MergeD2o {
-                                target_len: target_len_l,
-                                keep_ratio: self.h2o_keep_ratio,
-                                protected_prefix: self.protected_prefix,
+                        let target_len_l = ((cache_l.current_pos as f32) * ratio) as usize;
+                        let action_l = if self.score_based_eviction {
+                            if self.is_d2o {
+                                QcfActionType::MergeD2o {
+                                    target_len: target_len_l,
+                                    keep_ratio: self.h2o_keep_ratio,
+                                    protected_prefix: self.protected_prefix,
+                                }
+                            } else {
+                                QcfActionType::EvictH2o {
+                                    target_len: target_len_l,
+                                    keep_ratio: self.h2o_keep_ratio,
+                                    protected_prefix: self.protected_prefix,
+                                }
                             }
                         } else {
-                            QcfActionType::EvictH2o {
+                            QcfActionType::EvictSliding {
                                 target_len: target_len_l,
-                                keep_ratio: self.h2o_keep_ratio,
-                                protected_prefix: self.protected_prefix,
                             }
-                        }
-                    } else {
-                        QcfActionType::EvictSliding {
-                            target_len: target_len_l,
-                        }
+                        };
+                        let params_l = UnifiedQcfParams {
+                            action: action_l,
+                            v_source: v_source_l,
+                            k_source: k_source_l,
+                            attention_scores: &attention_scores,
+                            head_attn: head_attn_opt,
+                            n_kv_heads: cache_l.kv_heads(),
+                            head_dim: cache_l.head_dim(),
+                            current_pos: before_len,
+                            capacity: cache_l.capacity(),
+                            layout: cache_l.layout(),
+                            aggregation: AggregationMode::Mean,
+                            beta: 1.0,
+                        };
+                        let (_qcf_l, ph_l) = compute_unified_qcf(&params_l);
+                        ph_l
                     };
-                    let params_l = UnifiedQcfParams {
-                        action: action_l,
-                        v_source: v_source_l,
-                        k_source: k_source_l,
-                        attention_scores: &attention_scores,
-                        head_attn: head_attn_opt,
-                        n_kv_heads: cache_l.kv_heads(),
-                        head_dim: cache_l.head_dim(),
-                        current_pos: before_len,
-                        capacity: cache_l.capacity(),
-                        layout: cache_l.layout(),
-                        aggregation: AggregationMode::Mean,
-                        beta: 1.0,
-                    };
-                    let (qcf_l, _) = compute_unified_qcf(&params_l);
-                    per_layer.push(qcf_l);
-                    per_layer_indices.push(layer_idx);
+
+                    let worst = aggregate_heads(&per_head_l, &AggregationMode::Max);
+                    let mean = aggregate_heads(&per_head_l, &AggregationMode::Mean);
+                    layer_worst_head.push(worst);
+                    layer_mean_head.push(mean);
                 }
 
-                let caote_layer_max = aggregate_layers(&per_layer, &LayerAggregationMode::Max);
-                let caote_layer_def_t01 = aggregate_layers(
-                    &per_layer,
-                    &LayerAggregationMode::Defensive { temperature: 0.1 },
-                );
-                let caote_layer_def_t05 = aggregate_layers(
-                    &per_layer,
-                    &LayerAggregationMode::Defensive { temperature: 0.5 },
-                );
-                let caote_layer_late_30 = aggregate_layers(
-                    &per_layer,
-                    &LayerAggregationMode::LateFocused { fraction: 0.3 },
-                );
+                // Record-level scalars.
+                let max_or_zero = |s: &[f32]| -> f32 {
+                    s.iter().copied().fold(f32::NEG_INFINITY, f32::max).max(0.0)
+                };
+                let mean_or_zero = |s: &[f32]| -> f32 {
+                    if s.is_empty() {
+                        0.0
+                    } else {
+                        s.iter().sum::<f32>() / s.len() as f32
+                    }
+                };
+                let record_worst_head_max = if layer_worst_head.is_empty() {
+                    0.0
+                } else {
+                    max_or_zero(&layer_worst_head)
+                };
+                let record_worst_head_mean = mean_or_zero(&layer_worst_head);
+                let record_mean_head_max = if layer_mean_head.is_empty() {
+                    0.0
+                } else {
+                    max_or_zero(&layer_mean_head)
+                };
+                let record_mean_head_mean = mean_or_zero(&layer_mean_head);
 
-                let payload = ExperimentalQcfPayload {
-                    caote_max: aggregate_heads(&per_head, &AggregationMode::Max),
-                    caote_topk_k3: aggregate_heads(&per_head, &AggregationMode::TopK { k: 3 }),
-                    caote_topk_k5: aggregate_heads(&per_head, &AggregationMode::TopK { k: 5 }),
-                    caote_defensive_t01: aggregate_heads(
-                        &per_head,
-                        &AggregationMode::Defensive { temperature: 0.1 },
-                    ),
-                    caote_defensive_t05: aggregate_heads(
-                        &per_head,
-                        &AggregationMode::Defensive { temperature: 0.5 },
-                    ),
-                    topk_retention_k10: r10.retention_binary,
-                    topk_retention_k20: r20.retention_binary,
-                    topk_retention_k50: r50.retention_binary,
-                    topk_retention_weighted_k10: r10.retention_weighted,
-                    topk_retention_weighted_k20: r20.retention_weighted,
-                    attention_entropy: entropy_result.entropy,
-                    attention_entropy_normalized: entropy_result.entropy_normalized,
-                    qcf_beta_amplified_b1: qcf_b1,
-                    qcf_beta_amplified_b1_5: qcf_b1_5,
-                    qcf_beta_amplified_b2: qcf_b2,
-                    per_head,
-                    per_layer,
-                    per_layer_indices,
-                    caote_layer_max,
-                    caote_layer_defensive_t01: caote_layer_def_t01,
-                    caote_layer_defensive_t05: caote_layer_def_t05,
-                    caote_layer_late_30pct: caote_layer_late_30,
+                let payload = ExpQcfV3 {
+                    d7_worst_head: compute_d7(&layer_worst_head),
+                    d7_mean_head: compute_d7(&layer_mean_head),
+                    c1_worst_head: compute_c1(&layer_worst_head),
+                    c1_mean_head: compute_c1(&layer_mean_head),
+                    layer_worst_head,
+                    layer_mean_head,
+                    record_worst_head_max,
+                    record_worst_head_mean,
+                    record_mean_head_max,
+                    record_mean_head_mean,
                 };
                 self.experimental_qcf = Some(payload);
             }
@@ -754,31 +670,19 @@ impl StepHook<KVCache> for EvictionHook {
             obj["eviction_ratio"] = serde_json::json!(qcf.eviction_ratio);
         }
         if let Some(ref exp) = self.experimental_qcf {
-            obj["qcf_per_head"] = serde_json::json!(exp.per_head);
-            obj["qcf_caote_max"] = serde_json::json!(exp.caote_max);
-            obj["qcf_caote_topk_K3"] = serde_json::json!(exp.caote_topk_k3);
-            obj["qcf_caote_topk_K5"] = serde_json::json!(exp.caote_topk_k5);
-            obj["qcf_caote_defensive_t01"] = serde_json::json!(exp.caote_defensive_t01);
-            obj["qcf_caote_defensive_t05"] = serde_json::json!(exp.caote_defensive_t05);
-            obj["qcf_topk_retention_K10"] = serde_json::json!(exp.topk_retention_k10);
-            obj["qcf_topk_retention_K20"] = serde_json::json!(exp.topk_retention_k20);
-            obj["qcf_topk_retention_K50"] = serde_json::json!(exp.topk_retention_k50);
-            obj["qcf_topk_retention_weighted_K10"] =
-                serde_json::json!(exp.topk_retention_weighted_k10);
-            obj["qcf_topk_retention_weighted_K20"] =
-                serde_json::json!(exp.topk_retention_weighted_k20);
-            obj["attention_entropy"] = serde_json::json!(exp.attention_entropy);
-            obj["attention_entropy_normalized"] =
-                serde_json::json!(exp.attention_entropy_normalized);
-            obj["qcf_beta_amplified_b1"] = serde_json::json!(exp.qcf_beta_amplified_b1);
-            obj["qcf_beta_amplified_b1_5"] = serde_json::json!(exp.qcf_beta_amplified_b1_5);
-            obj["qcf_beta_amplified_b2"] = serde_json::json!(exp.qcf_beta_amplified_b2);
-            obj["qcf_per_layer"] = serde_json::json!(exp.per_layer);
-            obj["qcf_per_layer_indices"] = serde_json::json!(exp.per_layer_indices);
-            obj["qcf_caote_layer_max"] = serde_json::json!(exp.caote_layer_max);
-            obj["qcf_caote_layer_defensive_t01"] = serde_json::json!(exp.caote_layer_defensive_t01);
-            obj["qcf_caote_layer_defensive_t05"] = serde_json::json!(exp.caote_layer_defensive_t05);
-            obj["qcf_caote_layer_late_30pct"] = serde_json::json!(exp.caote_layer_late_30pct);
+            obj["schema_version"] = serde_json::json!(3);
+            obj["action_family"] = serde_json::json!("eviction");
+            obj["n_layers"] = serde_json::json!(exp.layer_worst_head.len());
+            obj["qcf_layer_worst_head"] = serde_json::json!(exp.layer_worst_head);
+            obj["qcf_layer_mean_head"] = serde_json::json!(exp.layer_mean_head);
+            obj["qcf_record_worst_head_max"] = serde_json::json!(exp.record_worst_head_max);
+            obj["qcf_record_worst_head_mean"] = serde_json::json!(exp.record_worst_head_mean);
+            obj["qcf_record_mean_head_max"] = serde_json::json!(exp.record_mean_head_max);
+            obj["qcf_record_mean_head_mean"] = serde_json::json!(exp.record_mean_head_mean);
+            obj["qcf_d7_worst_head"] = serde_json::json!(exp.d7_worst_head);
+            obj["qcf_d7_mean_head"] = serde_json::json!(exp.d7_mean_head);
+            obj["qcf_c1_worst_head"] = serde_json::json!(exp.c1_worst_head);
+            obj["qcf_c1_mean_head"] = serde_json::json!(exp.c1_mean_head);
         }
         obj
     }
