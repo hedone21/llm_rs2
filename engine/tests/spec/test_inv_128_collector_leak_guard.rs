@@ -159,6 +159,7 @@ fn inv_128_decider_safe_with_absent_importance() {
         noise: Some(&noise),
         n_decoder_layers: 4,
         currently_swapped: &[],
+        allow_boundary_layers: false,
     };
 
     let decision = decider.decide(0.5);

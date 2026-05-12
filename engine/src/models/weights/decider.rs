@@ -47,6 +47,11 @@ pub struct WeightSwapDecider<'a> {
     pub n_decoder_layers: usize,
     /// Layers that are already at the target dtype — excluded from re-selection.
     pub currently_swapped: &'a [usize],
+    /// When `true`, allow layer 0 and the last decoder layer to be selected
+    /// for swap. Default (`false`) keeps them protected, matching production
+    /// safety semantics. Used for research/ablation experiments (e.g. PPL
+    /// teacher-forcing NLL measurement with full-coverage swap).
+    pub allow_boundary_layers: bool,
 }
 
 impl<'a> WeightSwapDecider<'a> {
@@ -78,11 +83,15 @@ impl<'a> WeightSwapDecider<'a> {
             };
         }
 
-        // Protected layers: always exclude layer 0 and last decoder layer.
+        // Protected layers: exclude layer 0 and last decoder layer by default.
+        // `allow_boundary_layers` overrides this for research/ablation runs
+        // (e.g. PPL teacher-forcing measurement of full-coverage swap NLL).
         let mut protected = HashSet::new();
-        protected.insert(0usize);
-        if n > 1 {
-            protected.insert(n - 1);
+        if !self.allow_boundary_layers {
+            protected.insert(0usize);
+            if n > 1 {
+                protected.insert(n - 1);
+            }
         }
 
         // Build candidate list: exclude protected, already swapped, NaN-ε layers.
@@ -296,6 +305,7 @@ mod tests {
             noise: Some(&noise),
             n_decoder_layers: 4,
             currently_swapped: &[],
+            allow_boundary_layers: false,
         };
 
         let decision = decider.decide(0.5);
@@ -329,6 +339,7 @@ mod tests {
             noise: Some(&noise),
             n_decoder_layers: 4,
             currently_swapped: &[],
+            allow_boundary_layers: false,
         };
 
         // ratio=0.5 → k=2, candidates are [1, 2] normally. With layer 1 NaN excluded → [2] only.
@@ -355,6 +366,7 @@ mod tests {
             noise: Some(&noise),
             n_decoder_layers: 4,
             currently_swapped: &[],
+            allow_boundary_layers: false,
         };
 
         let decision = decider.decide(0.5);
@@ -377,6 +389,7 @@ mod tests {
             noise: Some(&noise),
             n_decoder_layers: 4,
             currently_swapped: &[],
+            allow_boundary_layers: false,
         };
 
         let decision = decider.decide(0.0);
@@ -395,6 +408,7 @@ mod tests {
             noise: Some(&noise),
             n_decoder_layers: 4,
             currently_swapped: &[2], // layer 2 already swapped
+            allow_boundary_layers: false,
         };
 
         let decision = decider.decide(0.5);
@@ -416,6 +430,7 @@ mod tests {
             noise: Some(&noise),
             n_decoder_layers: 4,
             currently_swapped: &[],
+            allow_boundary_layers: false,
         };
 
         let decision = decider.decide(0.9);
@@ -427,6 +442,60 @@ mod tests {
             !decision.selected_layers.contains(&3),
             "last decoder layer is protected"
         );
+    }
+
+    /// `allow_boundary_layers=true` 면 layer 0 과 마지막 layer 도 후보가 된다
+    /// (research/ablation 용; PPL teacher-forcing 전체 coverage 실험).
+    #[test]
+    fn boundary_layers_included_when_allowed() {
+        // 4 layer 모두 동일한 importance×ε → ratio=1.0 이면 4 layer 전부 선정 가능.
+        let importance = make_importance(vec![(0, 0.5), (1, 0.5), (2, 0.5), (3, 0.5)]);
+        let noise = make_noise(vec![0.5, 0.5, 0.5, 0.5]);
+
+        let decider = WeightSwapDecider {
+            importance: Some(&importance),
+            noise: Some(&noise),
+            n_decoder_layers: 4,
+            currently_swapped: &[],
+            allow_boundary_layers: true,
+        };
+
+        let decision = decider.decide(1.0);
+        assert_eq!(
+            decision.selected_layers.len(),
+            4,
+            "ratio=1.0 with allow_boundary_layers should select all 4 layers"
+        );
+        assert!(
+            decision.selected_layers.contains(&0),
+            "layer 0 must be selectable when allow_boundary_layers=true"
+        );
+        assert!(
+            decision.selected_layers.contains(&3),
+            "last layer must be selectable when allow_boundary_layers=true"
+        );
+    }
+
+    /// Fallback path 에서도 boundary 우회가 동작해야 한다 (uniform_select).
+    #[test]
+    fn boundary_layers_allowed_in_fallback_path() {
+        // importance None → fallback uniform_select_by_index 사용.
+        let decider = WeightSwapDecider {
+            importance: None,
+            noise: None,
+            n_decoder_layers: 4,
+            currently_swapped: &[],
+            allow_boundary_layers: true,
+        };
+
+        let decision = decider.decide(1.0);
+        assert!(
+            decision.fallback_used,
+            "absent importance/noise should trigger fallback path"
+        );
+        assert_eq!(decision.selected_layers.len(), 4);
+        assert!(decision.selected_layers.contains(&0));
+        assert!(decision.selected_layers.contains(&3));
     }
 
     // ── compute_qcf_swap tests (ENG-ALG-217) ─────────────────────────────────
@@ -487,6 +556,7 @@ mod tests {
             noise: Some(&noise),
             n_decoder_layers: 4,
             currently_swapped: &[],
+            allow_boundary_layers: false,
         };
         let (layers_dr, qcf_dr) = decider.decide_dry_run(0.5);
         let decision = decider.decide(0.5);

@@ -182,6 +182,7 @@ fn test_ratio_033_skip_count_5_for_16l() {
         noise: Some(&noise),
         n_decoder_layers: 16,
         currently_swapped: &[],
+        allow_boundary_layers: false,
     };
     let decision = decider.decide(0.33);
 
@@ -260,6 +261,7 @@ fn test_ratio_one_caps_at_n_minus_2() {
         noise: Some(&noise),
         n_decoder_layers: 16,
         currently_swapped: &[],
+        allow_boundary_layers: false,
     };
     let decision = decider.decide(1.0);
 

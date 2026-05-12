@@ -1713,16 +1713,9 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
         // Rust→Lua 직렬화(engine_command_type_name)는 "swap_weights"로 고정한다.
         "swap_weights" | "precision_swap" => {
             let ratio: f32 = entry.get("ratio")?;
-            // ratio must be in [0.0, 0.9]; clamp and warn on over-limit (ENG-ALG-214-ROUTE)
-            let ratio = if ratio > 0.9 {
-                log::warn!(
-                    "[LuaPolicy] swap_weights ratio {:.4} exceeds 0.9 limit — clamped to 0.9",
-                    ratio
-                );
-                0.9f32
-            } else {
-                ratio
-            };
+            // ratio 는 engine 측 `WeightSwapDecider::decide()` 가 [0.0, 1.0] 으로
+            // clamp 한다. Manager 단의 0.9 상한은 제거되어 ratio=1.0 까지 전달
+            // 가능 (boundary layer 우회 시 전 layer swap 측정 등 research path).
             let dtype_str: String = entry.get("dtype")?;
             let target_dtype = match dtype_str.as_str() {
                 "q4_0" => llm_shared::DtypeTag::Q4_0,
@@ -3485,9 +3478,11 @@ mod tests {
         }
     }
 
-    /// ratio > 0.9 is clamped to 0.9 (ENG-ALG-214-ROUTE upper limit).
+    /// LuaPolicy 는 ratio 를 clamp 하지 않고 그대로 전달한다.
+    /// engine 측 `WeightSwapDecider::decide()` 의 [0.0, 1.0] clamp 가 최종
+    /// boundary 역할 (manager 0.9 상한 제거됨).
     #[test]
-    fn test_lua_policy_clamps_ratio_above_limit() {
+    fn test_lua_policy_does_not_clamp_high_ratio() {
         let script = create_temp_script(
             r#"function decide(ctx)
                 return {{
@@ -3507,8 +3502,8 @@ mod tests {
         match &cmds[0] {
             EngineCommand::SwapWeights { ratio, .. } => {
                 assert!(
-                    (*ratio - 0.9).abs() < 1e-6,
-                    "ratio should be clamped to 0.9, got {ratio}"
+                    (*ratio - 0.95).abs() < 1e-6,
+                    "ratio should pass through unchanged, got {ratio}"
                 );
             }
             other => panic!("Expected SwapWeights, got {other:?}"),
@@ -3578,9 +3573,9 @@ mod tests {
         }
     }
 
-    /// `precision_swap` alias 경로에서도 ratio > 0.9 clamp가 동일하게 적용되어야 한다.
+    /// `precision_swap` alias 경로에서도 ratio 는 clamp 없이 그대로 전달.
     #[test]
-    fn test_lua_policy_precision_swap_alias_clamp() {
+    fn test_lua_policy_precision_swap_alias_passes_ratio_through() {
         let script = create_temp_script(
             r#"function decide(ctx)
                 return {{
@@ -3600,8 +3595,8 @@ mod tests {
         match &cmds[0] {
             EngineCommand::SwapWeights { ratio, .. } => {
                 assert!(
-                    (*ratio - 0.9).abs() < 1e-6,
-                    "precision_swap alias: ratio should be clamped to 0.9, got {ratio}"
+                    (*ratio - 0.95).abs() < 1e-6,
+                    "precision_swap alias: ratio should pass through unchanged, got {ratio}"
                 );
             }
             other => panic!("Expected SwapWeights, got {other:?}"),

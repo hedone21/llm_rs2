@@ -686,6 +686,37 @@ struct Args {
     #[arg(long)]
     ppl: Option<String>,
 
+    /// PPL mode 에서 weight swap 을 trigger 할 decode token index (0-based).
+    /// 미지정 시 PPL decode loop 은 swap 없음 (baseline).
+    /// Requires `--secondary-gguf` to load secondary weights.
+    /// 사용 예 (LISWAP-PPL): `--ppl ref.txt --secondary-gguf ... --ppl-swap-at-token 0
+    /// --ppl-swap-ratio 0.9 --ppl-swap-per-tick 1`.
+    #[arg(long)]
+    ppl_swap_at_token: Option<usize>,
+
+    /// PPL swap ratio (0.0~1.0). engine `WeightSwapDecider` 가 [0.0, 1.0] 으로 clamp.
+    /// 1.0 + `LLMRS_SWAP_ALLOW_BOUNDARY_LAYERS=1` 조합 시 전 layer swap.
+    #[arg(long, default_value_t = 0.9)]
+    ppl_swap_ratio: f32,
+
+    /// PPL incremental swap K (layer/tick). 측정용으로 dynamic-K 비활성화, fixed K.
+    /// 기본 1 (한 step 에 1 layer 씩).
+    #[arg(long, default_value_t = 1)]
+    ppl_swap_per_tick: usize,
+
+    /// PPL per-token NLL CSV 출력 경로. 미지정 시 dump 안 함.
+    /// CSV columns: phase, token_idx, token_id, nll, swap_state, layers_swapped.
+    #[arg(long)]
+    ppl_nll_csv: Option<std::path::PathBuf>,
+
+    /// PPL prefill 토큰 수 강제 설정 (1..=eval_tokens). 미지정 시 기존 로직
+    /// (kv_budget / sliding window / eval_tokens) 그대로. swap 측정 시 decode
+    /// loop 을 충분히 길게 돌려야 하므로 이 옵션으로 prefill 을 짧게 만든다.
+    /// 예: 1072 token reference 에서 `--ppl-prefill-tokens 32` → prefill 32 +
+    /// decode 1040 step.
+    #[arg(long)]
+    ppl_prefill_tokens: Option<usize>,
+
     /// Comma-separated layer indices to skip (both attn+mlp).
     /// Example: --skip-layers 1,3,5,7
     #[arg(long, value_delimiter = ',')]
@@ -8092,6 +8123,7 @@ fn run_qcf_warmup_workflow(
             noise: Some(model.quant_noise.as_ref()),
             n_decoder_layers: model.layers.len(),
             currently_swapped: &[],
+            allow_boundary_layers: read_allow_boundary_env(),
         };
         let decision = decider.decide(ratio);
 
@@ -8149,6 +8181,16 @@ fn run_qcf_warmup_workflow(
 ///
 /// Rejection (no-secondary, invalid-ratio, unsupported-dtype, in-flight plan)
 /// is logged to stderr; no plan is committed.
+/// `LLMRS_SWAP_ALLOW_BOUNDARY_LAYERS=1` 이면 `true` — `WeightSwapDecider` 가
+/// layer 0 과 마지막 decoder layer 도 swap 후보로 포함. 미설정/다른 값 → `false`.
+/// PPL teacher-forcing NLL ablation 등 research-only path 에서 사용.
+fn read_allow_boundary_env() -> bool {
+    std::env::var("LLMRS_SWAP_ALLOW_BOUNDARY_LAYERS")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 fn dispatch_swap_weights(
     model: &llm_rs2::models::transformer::TransformerModel,
     ratio: f32,
@@ -8199,11 +8241,17 @@ fn dispatch_swap_weights(
         .collect();
 
     // ── 3. Decider ─────────────────────────────────────────────────────────
+    let allow_boundary = read_allow_boundary_env();
+    eprintln!(
+        "[Decider] allow_boundary_layers={} (ratio={:.4})",
+        allow_boundary, ratio
+    );
     let decider = WeightSwapDecider {
         importance: importance_table,
         noise: Some(&model.quant_noise),
         n_decoder_layers: n_layers,
         currently_swapped: &currently_swapped,
+        allow_boundary_layers: allow_boundary,
     };
     let decision: SwapDecision = decider.decide(ratio);
 
@@ -8293,6 +8341,7 @@ fn build_layer_swap_estimate(
             noise: Some(noise),
             n_decoder_layers: n,
             currently_swapped: &[],
+            allow_boundary_layers: read_allow_boundary_env(),
         };
         let (_, qcf) = decider.decide_dry_run(r);
         qcf_swap_at_ratio.insert(format!("{:.2}", r), qcf);
@@ -10005,7 +10054,11 @@ fn run_ppl(
              Results may not be reproducible. Use --kv-budget N for deterministic experiments."
         );
     }
-    let prefill_chunk = if has_budget {
+    let prefill_chunk = if let Some(forced) = args.ppl_prefill_tokens {
+        // LISWAP-PPL: 명시적 prefill 길이 강제. swap 측정 시 decode loop 을
+        // 충분히 돌리기 위함. budget 로직보다 우선.
+        forced.clamp(2, eval_tokens)
+    } else if has_budget {
         let budget = if args.kv_budget_ratio > 0.0 {
             ((eval_tokens as f32) * args.kv_budget_ratio) as usize
         } else {
@@ -10044,6 +10097,21 @@ fn run_ppl(
     // PPL v3: collect QCF for every eviction event
     let mut qcf_events: Vec<serde_json::Value> = Vec::new();
     let overall_start = std::time::Instant::now();
+
+    // LISWAP-PPL: per-token NLL log + token-index-triggered weight swap.
+    // (phase, token_idx, token_id, nll, swap_state, layers_swapped)
+    let mut per_token_log: Vec<(&'static str, usize, u32, f64, &'static str, usize)> = Vec::new();
+    let log_per_token = args.ppl_nll_csv.is_some();
+    let mut ppl_swap_plan: Option<llm_rs2::models::weights::IncrementalSwapPlan> = None;
+    // dispatch_swap_weights 시그니처 호환용 (PPL 경로에서는 manager 보고 안 함).
+    let mut ppl_swap_report_unused: Option<(f32, usize, std::time::Instant, f32)> = None;
+    let mut layers_swapped_so_far: usize = 0;
+    let ppl_cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+    let ppl_swap_logged = std::sync::atomic::AtomicBool::new(false);
+
+    if args.ppl_swap_at_token.is_some() && model.secondary_mmap.is_none() {
+        anyhow::bail!("--ppl-swap-at-token requires --secondary-gguf to load secondary weights");
+    }
 
     // ── 4. Prefill phase ──
     let prefill_len = prefill_chunk.min(eval_tokens);
@@ -10110,6 +10178,9 @@ fn run_ppl(
             );
             total_nll -= lp;
             nll_count += 1;
+            if log_per_token {
+                per_token_log.push(("prefill", i, token_ids[i + 1], -lp, "none", 0));
+            }
         }
 
         eprintln!(
@@ -10123,9 +10194,79 @@ fn run_ppl(
     // ── 5. Decode phase (teacher-forcing) ──
     let mut start_pos = prefill_len;
 
-    for i in prefill_len..eval_tokens - 1 {
+    for (decode_idx, i) in (prefill_len..eval_tokens - 1).enumerate() {
         let input_token = token_ids[i];
         let target_token = token_ids[i + 1];
+
+        // ── LISWAP-PPL: token-index-triggered weight swap ──────────────────
+        // dispatch_swap_weights 가 commit 한 IncrementalSwapPlan 을 매 decode
+        // step 마다 K=ppl_swap_per_tick 만큼 drain. dynamic-K controller 와
+        // async dispatcher 는 측정 결정론을 위해 사용하지 않는다.
+        if Some(decode_idx) == args.ppl_swap_at_token && ppl_swap_plan.is_none() {
+            dispatch_swap_weights(
+                model,
+                args.ppl_swap_ratio,
+                llm_shared::DtypeTag::Q4_0,
+                None, // importance None → fallback uniform
+                decode_idx,
+                &mut ppl_swap_plan,
+                &mut ppl_swap_report_unused,
+            );
+            if !ppl_swap_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[PPL-Swap] triggered at decode_idx={}, ratio={}, per_tick={}",
+                    decode_idx, args.ppl_swap_ratio, args.ppl_swap_per_tick
+                );
+            }
+        }
+        let mut swap_state: &'static str = if layers_swapped_so_far > 0 {
+            "post_swap"
+        } else {
+            "none"
+        };
+        let plan_done = if let Some(plan) = ppl_swap_plan.as_mut() {
+            plan.set_per_tick(args.ppl_swap_per_tick);
+            let chunk = plan.drain_chunk();
+            if !chunk.is_empty() {
+                let t_swap = std::time::Instant::now();
+                match run_layer_swap(
+                    model,
+                    &chunk,
+                    Some(backend),
+                    &ppl_cpu_backend,
+                    None,
+                    #[cfg(feature = "opencl")]
+                    None,
+                ) {
+                    Ok(report) => {
+                        layers_swapped_so_far += report.swapped.len();
+                        swap_state = "swapping";
+                        eprintln!(
+                            "[PPL-Swap] tick decode_idx={} chunk={:?} swapped={} remaining={} latency={:.1}ms",
+                            decode_idx,
+                            &chunk,
+                            report.swapped.len(),
+                            plan.remaining_count(),
+                            t_swap.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[PPL-Swap] run_layer_swap error: {}", e);
+                    }
+                }
+            }
+            plan.is_done()
+        } else {
+            false
+        };
+        if plan_done {
+            eprintln!(
+                "[PPL-Swap] plan complete at decode_idx={}, total_swapped={}",
+                decode_idx, layers_swapped_so_far
+            );
+            ppl_swap_plan = None;
+            swap_state = "post_swap";
+        }
 
         // Score accumulator begin step
         if let Some(acc) = score_accumulator.as_mut() {
@@ -10171,6 +10312,16 @@ fn run_ppl(
         let lp = sampling::compute_log_prob(&logits_cpu, target_token, vocab_size);
         total_nll -= lp;
         nll_count += 1;
+        if log_per_token {
+            per_token_log.push((
+                "decode",
+                i,
+                target_token,
+                -lp,
+                swap_state,
+                layers_swapped_so_far,
+            ));
+        }
 
         // ── Budget-based eviction (deterministic, experiment-reproducible) ──
         // Eviction triggers when cache_pos exceeds eviction_threshold (budget + headroom).
@@ -10367,6 +10518,23 @@ fn run_ppl(
         "\n[PPL] Final: PPL={:.4}, NLL={:.4}, tokens={}, {:.1} tok/s, {:.1}s",
         ppl, total_nll, nll_count, tok_per_sec, wall_time
     );
+
+    // LISWAP-PPL: per-token NLL CSV dump (token_idx is text-absolute, identical
+    // across scenarios for direct curve comparison).
+    if let Some(csv_path) = args.ppl_nll_csv.as_ref() {
+        use std::io::Write;
+        let mut f = std::fs::File::create(csv_path)?;
+        writeln!(f, "phase,token_idx,token_id,nll,swap_state,layers_swapped")?;
+        for (phase, idx, id, nll, state, n) in &per_token_log {
+            writeln!(f, "{},{},{},{:.6},{},{}", phase, idx, id, nll, state, n)?;
+        }
+        f.flush()?;
+        eprintln!(
+            "[PPL] Per-token NLL CSV: {} ({} rows)",
+            csv_path.display(),
+            per_token_log.len()
+        );
+    }
 
     Ok(PplResult {
         ppl,

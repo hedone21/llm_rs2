@@ -42,6 +42,7 @@ fn inv_127_nan_layer_excluded_from_candidates() {
         noise: Some(&noise),
         n_decoder_layers: 4,
         currently_swapped: &[],
+        allow_boundary_layers: false,
     };
 
     let decision = decider.decide(0.5);
@@ -68,6 +69,7 @@ fn inv_127_qcf_estimate_is_finite_with_nan_layers() {
         noise: Some(&noise),
         n_decoder_layers: 4,
         currently_swapped: &[],
+        allow_boundary_layers: false,
     };
 
     let decision = decider.decide(0.5);
@@ -92,6 +94,7 @@ fn inv_127_all_candidates_nan_gives_empty_selection() {
         noise: Some(&noise),
         n_decoder_layers: 4,
         currently_swapped: &[],
+        allow_boundary_layers: false,
     };
 
     let decision = decider.decide(0.5);
@@ -119,6 +122,7 @@ fn inv_127_nan_layer_not_re_selected_even_if_currently_swapped() {
         noise: Some(&noise),
         n_decoder_layers: 4,
         currently_swapped: &[2],
+        allow_boundary_layers: false,
     };
 
     let decision = decider.decide(0.5);
