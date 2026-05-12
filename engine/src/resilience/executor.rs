@@ -165,6 +165,15 @@ pub struct CommandExecutor {
     // secondary GGUF/AUF 파일 존재 여부. true이면 swap_weights 액션이
     // available_actions에 포함된다 (ENG-ST-032).
     has_secondary: bool,
+
+    // Sticky pending SwapWeights directive (LISWAP-6 manager routing fix).
+    //
+    // `apply_command::SwapWeights` 가 transient `ExecutionPlan.swap_weights`
+    // 에만 기록하면, prefill loop 의 `executor.poll` 이 plan 을 받고 drop
+    // 하는 순간 directive 가 소실되어 decode loop 에서 dispatch 가 일어나지
+    // 않는다. directive 가 도착하면 여기에 저장하여 decode loop 의
+    // `take_pending_swap_weights()` 가 consume 할 때까지 유지한다.
+    pending_swap_weights: Option<(f32, llm_shared::DtypeTag)>,
 }
 
 impl CommandExecutor {
@@ -216,6 +225,7 @@ impl CommandExecutor {
             gpu_meter,
             last_heartbeat_at: now,
             has_secondary: false,
+            pending_swap_weights: None,
         }
     }
 
@@ -243,6 +253,17 @@ impl CommandExecutor {
     /// `EngineCommand::SwapWeights` execution (ENG-ALG-214-ROUTE).
     pub fn send_weight_swap_report(&self, report: llm_shared::WeightSwapReport) {
         let _ = self.resp_tx.send(EngineMessage::WeightSwapReport(report));
+    }
+
+    /// Consume pending SwapWeights directive, if any (LISWAP-6 manager routing).
+    ///
+    /// `apply_command::SwapWeights` stashes the directive in
+    /// `pending_swap_weights` so it survives `executor.poll` calls made by
+    /// prefill loops (which drop the `ExecutionPlan` without consuming
+    /// `swap_weights`). The decode loop calls this each tick before
+    /// dispatching incremental swap.
+    pub fn take_pending_swap_weights(&mut self) -> Option<(f32, llm_shared::DtypeTag)> {
+        self.pending_swap_weights.take()
     }
 
     /// Notify executor that inference has started.
@@ -533,11 +554,20 @@ impl CommandExecutor {
                 CommandResult::Ok
             }
             // SwapWeights is dispatched directly in generate.rs (ENG-ALG-214-ROUTE).
-            // The executor records the pending request so generate.rs can pick it up.
+            // Manager 가 prefill 도중 directive 를 보낼 수 있으므로 sticky
+            // `pending_swap_weights` 에 저장한다. prefill loop 의 `executor.poll`
+            // 은 plan 을 받고 drop 하지만, decode loop 가
+            // `take_pending_swap_weights()` 로 consume 할 때까지 directive 는
+            // executor 내부에 살아남는다 (LISWAP-6 manager routing fix).
+            //
+            // `plan.swap_weights` 는 backward-compat 으로 유지 — 동일 directive
+            // 가 decode 시점 poll 에서 곧바로 들어오는 경우(예: directive 가 한
+            // 번도 흘려보내지지 않은 idle 상태) 에도 정상 동작.
             EngineCommand::SwapWeights {
                 ratio,
                 target_dtype,
             } => {
+                self.pending_swap_weights = Some((*ratio, *target_dtype));
                 plan.swap_weights = Some((*ratio, *target_dtype));
                 CommandResult::Ok
             }
@@ -1552,6 +1582,73 @@ mod tests {
         assert_eq!(
             plan_after.partition_ratio, None,
             "RestoreDefaults 이후 partition_ratio_sticky가 초기화돼야 함"
+        );
+    }
+
+    /// LISWAP-6 manager routing fix: SwapWeights directive 가 prefill loop 의
+    /// `poll`(`plan.swap_weights` drop) 을 거친 뒤에도 decode loop 가 sticky
+    /// `take_pending_swap_weights()` 로 consume 할 수 있어야 한다.
+    #[test]
+    fn test_swap_weights_pending_survives_intermediate_polls() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::SwapWeights {
+                ratio: 0.9,
+                target_dtype: llm_shared::DtypeTag::Q4_0,
+            }],
+        }))
+        .unwrap();
+
+        // 1차 poll: prefill loop 가 호출했다고 가정. plan.swap_weights 는 채워지지만
+        // prefill 은 이를 consume 하지 않고 drop.
+        let plan1 = executor.poll(&empty_snap());
+        assert_eq!(plan1.swap_weights, Some((0.9, llm_shared::DtypeTag::Q4_0)));
+        drop(plan1);
+
+        // 2차 poll: directive 없음 → plan.swap_weights 는 None 이지만, sticky
+        // pending_swap_weights 는 살아 있어야 한다 (decode loop 의 take).
+        let plan2 = executor.poll(&empty_snap());
+        assert!(
+            plan2.swap_weights.is_none(),
+            "transient plan.swap_weights 는 두 번째 poll 에서 비어 있어야 함"
+        );
+        let taken = executor.take_pending_swap_weights();
+        assert_eq!(
+            taken,
+            Some((0.9, llm_shared::DtypeTag::Q4_0)),
+            "pending_swap_weights 는 prefill poll 후에도 sticky 로 유지돼야 함"
+        );
+
+        // take 이후에는 비어 있어야 한다 (one-shot consume).
+        assert!(
+            executor.take_pending_swap_weights().is_none(),
+            "take 이후 pending_swap_weights 는 None"
+        );
+    }
+
+    #[test]
+    fn test_swap_weights_same_tick_consume_via_plan() {
+        // Decode loop 가 sticky 와 plan 양쪽을 참조하므로, 같은 tick 에 directive
+        // 가 도착한 경우에도 plan.swap_weights 가 (fallback 으로) 정확히 set 됨.
+        let (mut executor, tx, _rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::SwapWeights {
+                ratio: 0.5,
+                target_dtype: llm_shared::DtypeTag::F16,
+            }],
+        }))
+        .unwrap();
+
+        let plan = executor.poll(&empty_snap());
+        assert_eq!(plan.swap_weights, Some((0.5, llm_shared::DtypeTag::F16)));
+        // sticky 도 동일 directive 로 set.
+        assert_eq!(
+            executor.take_pending_swap_weights(),
+            Some((0.5, llm_shared::DtypeTag::F16))
         );
     }
 }

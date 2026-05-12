@@ -6521,7 +6521,13 @@ fn main() -> anyhow::Result<()> {
                 // IncrementalSwapPlan commit. decode loop drains K=2 layers/tick
                 // with dynamic-K + sub-batch pause. WeightSwapReport sent on
                 // plan completion (see plan-done block below).
-                if let Some((ratio, target_dtype)) = plan.swap_weights {
+                //
+                // Source priority: sticky `pending_swap_weights` first — covers
+                // the case where the directive arrived while the prefill loop
+                // was polling (prefill drops `plan.swap_weights`). Fall back to
+                // `plan.swap_weights` for the same-tick path.
+                let pending_swap = executor.take_pending_swap_weights().or(plan.swap_weights);
+                if let Some((ratio, target_dtype)) = pending_swap {
                     dispatch_swap_weights(
                         &model,
                         ratio,
