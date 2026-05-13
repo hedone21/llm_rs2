@@ -116,21 +116,41 @@ impl CudaKernels {
             "nvcc".to_string() // hope it's in PATH
         };
 
-        eprintln!("[CUDA] Compiling kernels with {nvcc} --ptx -arch={arch} ...");
+        // C++ standard for host header parsing. Pinned to c++17 to dodge
+        // g++ 16's C++20-only declarations (char8_t, `requires` clauses) that
+        // older nvcc EDG frontends (e.g. 13.2) cannot parse. Override with
+        // env LLMRS_NVCC_STD if a different standard is required.
+        let std_flag = std::env::var("LLMRS_NVCC_STD").unwrap_or_else(|_| "c++17".to_string());
+
+        // Optional host compiler override. Useful when a system-default g++
+        // is incompatible with nvcc and a compatible compiler (e.g. g++-14)
+        // is installed at a non-default path.
+        let ccbin = std::env::var("LLMRS_NVCC_CCBIN").ok();
+
+        eprintln!(
+            "[CUDA] Compiling kernels with {nvcc} --ptx -arch={arch} -std={std_flag}{ccbin_note} ...",
+            ccbin_note = ccbin
+                .as_deref()
+                .map(|p| format!(" -ccbin {p}"))
+                .unwrap_or_default()
+        );
 
         // `-allow-unsupported-compiler` allows nvcc to proceed when the host
         // C++ compiler is newer than nvcc's officially supported range
         // (e.g. g++ 16 + CUDA 13 on Arch Linux). nvcc only uses the host
         // compiler to parse declarations referenced by device code.
-        let output = std::process::Command::new(&nvcc)
-            .args([
-                "--ptx",
-                "-allow-unsupported-compiler",
-                &format!("-arch={arch}"),
-                "-o",
-                ptx_path.to_str().unwrap(),
-                cu_path.to_str().unwrap(),
-            ])
+        let mut cmd = std::process::Command::new(&nvcc);
+        cmd.args([
+            "--ptx",
+            "-allow-unsupported-compiler",
+            &format!("-arch={arch}"),
+            &format!("-std={std_flag}"),
+        ]);
+        if let Some(path) = &ccbin {
+            cmd.arg("-ccbin").arg(path);
+        }
+        cmd.args(["-o", ptx_path.to_str().unwrap(), cu_path.to_str().unwrap()]);
+        let output = cmd
             .output()
             .map_err(|e| anyhow!("Failed to run nvcc: {e}"))?;
 

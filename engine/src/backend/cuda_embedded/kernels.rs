@@ -130,18 +130,36 @@ impl CudaKernels {
             "nvcc".to_string() // hope it's in PATH
         };
 
-        eprintln!("[CUDA] Compiling kernels with {nvcc} --ptx -arch={arch} ...");
+        // C++ standard for host header parsing. Pinned to c++17 to dodge
+        // g++ 16's C++20-only declarations (char8_t, `requires` clauses) that
+        // older nvcc EDG frontends (e.g. 13.2) cannot parse. Override with
+        // env LLMRS_NVCC_STD if a different standard is required.
+        let std_flag = std::env::var("LLMRS_NVCC_STD").unwrap_or_else(|_| "c++17".to_string());
+
+        // Optional host compiler override (e.g. g++-14 when system g++ is newer).
+        let ccbin = std::env::var("LLMRS_NVCC_CCBIN").ok();
+
+        eprintln!(
+            "[CUDA] Compiling kernels with {nvcc} --ptx -arch={arch} -std={std_flag}{ccbin_note} ...",
+            ccbin_note = ccbin
+                .as_deref()
+                .map(|p| format!(" -ccbin {p}"))
+                .unwrap_or_default()
+        );
 
         // `-allow-unsupported-compiler` for newer host g++ + older nvcc combos.
-        let output = std::process::Command::new(&nvcc)
-            .args([
-                "--ptx",
-                "-allow-unsupported-compiler",
-                &format!("-arch={arch}"),
-                "-o",
-                ptx_path.to_str().unwrap(),
-                cu_path.to_str().unwrap(),
-            ])
+        let mut cmd = std::process::Command::new(&nvcc);
+        cmd.args([
+            "--ptx",
+            "-allow-unsupported-compiler",
+            &format!("-arch={arch}"),
+            &format!("-std={std_flag}"),
+        ]);
+        if let Some(path) = &ccbin {
+            cmd.arg("-ccbin").arg(path);
+        }
+        cmd.args(["-o", ptx_path.to_str().unwrap(), cu_path.to_str().unwrap()]);
+        let output = cmd
             .output()
             .map_err(|e| anyhow!("Failed to run nvcc: {e}"))?;
 
