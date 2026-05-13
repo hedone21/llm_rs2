@@ -17,8 +17,32 @@
 //! Spec: ENG-ALG-211, ENG-DAT-092/093/094, INV-120/121/123/124/125.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+/// Measurement-only override (`LLMRS_SWAP_FORCE_EVERY_TICK=1`): skip the
+/// INV-141 release_worker drain at `execute_on_slots` entry so the incremental
+/// swap orchestrator fires every decode token at the user-requested K rate.
+///
+/// Resolved once per process. Logs a single warning to stderr on first read
+/// when enabled. **Not production-safe** — bypassing the drain can let displaced
+/// primary cl_mem accumulate on a slow release path, growing peak memory.
+fn force_every_tick_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let enabled = std::env::var("LLMRS_SWAP_FORCE_EVERY_TICK")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if enabled {
+            eprintln!(
+                "[warn] LLMRS_SWAP_FORCE_EVERY_TICK=1 enabled — INV-141 release drain skipped, \
+                 memory spike risk, measurement-only"
+            );
+        }
+        enabled
+    })
+}
 
 use anyhow::Result;
 use llm_shared::DtypeTag;
@@ -400,7 +424,13 @@ impl<'a> SwapExecutor<'a> {
         // Ensures no primary cl_mem from batch N is still being dropped when
         // batch N+1 tries to swap. If drain times out, reject the batch to
         // prevent accumulating memory leaks.
-        if let Some(worker) = &self.release_worker {
+        //
+        // Measurement override (EuroSys 2027 §4.2): `LLMRS_SWAP_FORCE_EVERY_TICK=1`
+        // skips this drain so `--swap-incremental-per-tick K` fires every decode
+        // token at the user-requested rate instead of throttling on the previous
+        // batch's release backlog. Memory-spike risk — measurement only.
+        let force_every_tick = force_every_tick_enabled();
+        if !force_every_tick && let Some(worker) = &self.release_worker {
             let pending = worker.pending_count();
             if pending > 0 {
                 match worker.drain(Duration::from_millis(50)) {

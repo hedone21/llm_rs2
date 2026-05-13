@@ -1136,6 +1136,20 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     swap_delay_tokens: usize,
 
+    /// Measurement-only (EuroSys 2027 §4.2): bypass the INV-141 release_worker
+    /// drain at `SwapExecutor::execute_on_slots` entry so
+    /// `--swap-incremental-per-tick K` fires every decode token at the
+    /// user-requested K rate instead of being throttled by the previous
+    /// batch's release backlog. Equivalent to setting
+    /// `LLMRS_SWAP_FORCE_EVERY_TICK=1` (the flag sets the env if unset).
+    ///
+    /// **Memory-spike risk** — production code path keeps INV-141 to prevent
+    /// displaced primary cl_mem from accumulating on a slow release path.
+    /// Use only for layer-count predictor accuracy measurement and similar
+    /// experiments where chunk-completion-induced throttle distorts the rate.
+    #[arg(long, default_value_t = false)]
+    swap_no_throttle: bool,
+
     // ── QNN OpPackage backend (M3, ENG-QNN-220) ─────────────────
     /// Eager prebuild of all 28 layer graphs at model load time
     /// (ENG-QNN-209, D1 결정).
@@ -1229,6 +1243,20 @@ fn main() -> anyhow::Result<()> {
             args.swap_layer_immediate
         );
     }
+
+    // --swap-no-throttle: forwards to env so SwapExecutor::execute_on_slots
+    // skips the INV-141 release_worker drain. Measurement-only (EuroSys 2027
+    // §4.2 layer-count predictor accuracy). Sets the env only if unset so the
+    // env-based invocation path (LLMRS_SWAP_FORCE_EVERY_TICK=1) keeps working
+    // independently. The executor logs a stderr warning on first read.
+    if args.swap_no_throttle && std::env::var_os("LLMRS_SWAP_FORCE_EVERY_TICK").is_none() {
+        // SAFETY: set before any worker thread that might read the variable.
+        // generate.rs::main runs single-threaded up to this point (CLI parse +
+        // Rayon pool init below). Writes after thread spawn would be UB on
+        // some platforms; this write precedes the pool builder on line 1247.
+        unsafe { std::env::set_var("LLMRS_SWAP_FORCE_EVERY_TICK", "1") };
+    }
+
     // Configure Rayon thread pool: 0 = auto-detect CPU cores
     let num_threads = if args.threads > 0 {
         args.threads
