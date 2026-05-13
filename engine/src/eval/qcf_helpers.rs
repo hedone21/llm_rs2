@@ -61,6 +61,12 @@ pub struct QcfSwapDumpContext<'a> {
     /// this step, the layer added at this step (`null` for step 0 baseline),
     /// and the full `EvalOutput` from the eval-ll run.
     pub trajectory: Option<&'a [TrajectoryStep<'a>]>,
+    /// Per-layer DP-LLM proxy ε from `--importance-formula compare` mode.
+    /// `Some` only when 3-way comparison is active; length = `num_layers`.
+    /// Combined with `importance_table` entries (whose `importance_mean_pool`
+    /// and `importance_shortgpt_bi` fields are populated under 3-way mode)
+    /// into the `per_layer_3way` array of the dump JSON.
+    pub dpllm_epsilon: Option<&'a [f32]>,
 }
 
 /// One step of a `--qcf-trajectory` measurement.
@@ -171,6 +177,44 @@ pub fn dump_qcf_swap_json(
         None => Value::Null,
     };
 
+    // per_layer_3way: only present when `--importance-formula compare` was used.
+    // Each entry merges side-by-side importance (mean_pool + shortgpt_bi) with
+    // DP-LLM ε and Frobenius ε, one row per layer where mean_pool/shortgpt_bi
+    // are both populated. Layers with `None` measurements (i.e. non-comparison
+    // mode entries) are skipped.
+    let three_way_val: Value = match (ctx.importance_table, ctx.dpllm_epsilon) {
+        (Some(table), Some(eps)) => {
+            let entries: Vec<Value> = table
+                .entries()
+                .iter()
+                .filter(|e| e.importance_mean_pool.is_some() || e.importance_shortgpt_bi.is_some())
+                .map(|e| {
+                    let dpllm = eps.get(e.layer_id).copied().unwrap_or(f32::NAN);
+                    let dpllm_json: Value = if dpllm.is_finite() {
+                        json!(dpllm)
+                    } else {
+                        Value::Null
+                    };
+                    let frob_json: Value = ctx
+                        .noise_table
+                        .and_then(|t| t.epsilon(e.layer_id))
+                        .map(|v| json!(v))
+                        .unwrap_or(Value::Null);
+                    json!({
+                        "layer": e.layer_id,
+                        "sublayer": format!("{:?}", e.sublayer),
+                        "importance_mean_pool": e.importance_mean_pool,
+                        "importance_shortgpt_bi": e.importance_shortgpt_bi,
+                        "dpllm_epsilon": dpllm_json,
+                        "epsilon_frobenius": frob_json,
+                    })
+                })
+                .collect();
+            Value::Array(entries)
+        }
+        _ => Value::Null,
+    };
+
     let schema_version = if ctx.trajectory.is_some() { 2 } else { 1 };
     let doc = json!({
         "schema_version": schema_version,
@@ -198,6 +242,7 @@ pub fn dump_qcf_swap_json(
         "ppl_corpus": ctx.ppl_corpus,
         "eval_ll_output": eval_ll_output_val,
         "trajectory": trajectory_val,
+        "per_layer_3way": three_way_val,
     });
 
     let json_str = serde_json::to_string_pretty(&doc)?;

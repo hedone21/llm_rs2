@@ -27,6 +27,12 @@ pub struct ImportanceEntry {
     /// Output-to-input Perturbation Ratio for layer skip:
     /// `||output - input|| / ||input||`.
     pub opr: f32,
+    /// Side-by-side measurement in 3-way comparison mode.
+    /// `1 − cos(mean_pool(h_in), mean_pool(h_out))`. None unless `three_way` enabled.
+    pub importance_mean_pool: Option<f32>,
+    /// Side-by-side measurement in 3-way comparison mode.
+    /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` (ShortGPT BI). None unless `three_way` enabled.
+    pub importance_shortgpt_bi: Option<f32>,
 }
 
 /// Pre-computed importance table for all layers.
@@ -155,48 +161,87 @@ impl ImportanceTable {
 /// ```
 pub struct ImportanceCollector {
     entries: Vec<ImportanceEntry>,
-    /// Snapshot of hidden state before the current layer.
+    /// Mean-pooled hidden state before the current layer (`[dim]`).
+    /// Always populated; used by the MeanPool formula.
     before_snapshot: Vec<f32>,
+    /// Raw `[seq_len × dim]` hidden state before the current layer (batch=1).
+    /// Populated only when `three_way` is true; used by ShortGPT BI.
+    before_snapshot_raw: Vec<f32>,
+    before_seq_len: usize,
+    before_dim: usize,
+    /// 3-way comparison mode: side-by-side measurement of MeanPool + ShortGptBi.
+    three_way: bool,
+    /// Primary formula whose value fills `ImportanceEntry::importance`.
+    primary_formula: super::ImportanceFormula,
+    /// Per-layer mean-pooled input cache for DpllmProxy (post-warmup
+    /// `noise_table::compute_input_aware_epsilon`). Populated only when
+    /// `three_way` is true; one [dim] vector per `snapshot_before` call.
+    x_means: Vec<Vec<f32>>,
 }
 
 impl ImportanceCollector {
     pub fn new() -> Self {
+        Self::new_with_formula(super::ImportanceFormula::MeanPool, false)
+    }
+
+    /// Construct with a chosen primary formula and optional 3-way mode.
+    /// In 3-way mode the collector additionally computes the ShortGptBi
+    /// importance per layer and caches `x_means` for DpllmProxy.
+    pub fn new_with_formula(formula: super::ImportanceFormula, three_way: bool) -> Self {
         Self {
             entries: Vec::new(),
             before_snapshot: Vec::new(),
+            before_snapshot_raw: Vec::new(),
+            before_seq_len: 0,
+            before_dim: 0,
+            three_way,
+            primary_formula: formula,
+            x_means: Vec::new(),
         }
     }
 
     /// Snapshot the hidden state before a layer processes it.
     ///
-    /// For prefill, `x` is `[batch, seq_len, dim]`. We take the mean
-    /// across the sequence dimension to get a single `[dim]` vector.
+    /// For prefill, `x_data` is `[seq_len × dim]` row-major (batch=1).
+    /// Always retains the mean-pooled vector (`[dim]`) for MeanPool.
+    /// In 3-way mode also retains the raw `[seq_len × dim]` slice for
+    /// ShortGptBi and pushes the mean to `x_means` for DpllmProxy.
     pub fn snapshot_before(&mut self, x_data: &[f32], seq_len: usize, dim: usize) {
+        // Mean-pool path (always)
         self.before_snapshot.clear();
         self.before_snapshot.resize(dim, 0.0);
-
-        if seq_len == 0 {
-            return;
-        }
-
-        // Mean-pool across sequence positions (batch=1 assumed)
-        for pos in 0..seq_len {
-            let offset = pos * dim;
-            for d in 0..dim {
-                if offset + d < x_data.len() {
-                    self.before_snapshot[d] += x_data[offset + d];
+        if seq_len > 0 {
+            for pos in 0..seq_len {
+                let offset = pos * dim;
+                for d in 0..dim {
+                    if offset + d < x_data.len() {
+                        self.before_snapshot[d] += x_data[offset + d];
+                    }
                 }
             }
+            let scale = 1.0 / seq_len as f32;
+            for v in &mut self.before_snapshot {
+                *v *= scale;
+            }
         }
-        let scale = 1.0 / seq_len as f32;
-        for v in &mut self.before_snapshot {
-            *v *= scale;
+
+        // Raw path (3-way only) — needed for ShortGPT BI per-token cosine
+        if self.three_way {
+            let total = seq_len.saturating_mul(dim).min(x_data.len());
+            self.before_snapshot_raw.clear();
+            self.before_snapshot_raw.extend_from_slice(&x_data[..total]);
+            self.before_seq_len = seq_len;
+            self.before_dim = dim;
+            // x_means cache for DpllmProxy stage (`noise_table` post-warmup)
+            self.x_means.push(self.before_snapshot.clone());
         }
     }
 
     /// Record importance after a layer has processed the hidden state.
     ///
-    /// Computes `importance = 1 - cosine_similarity(before, after)`.
+    /// Always populates `importance` from the primary formula and `opr`
+    /// (mean-pool residual ratio). In 3-way mode also fills
+    /// `importance_mean_pool` and `importance_shortgpt_bi`.
     pub fn record_after(
         &mut self,
         x_data: &[f32],
@@ -205,7 +250,7 @@ impl ImportanceCollector {
         layer_id: usize,
         sublayer: SubLayer,
     ) {
-        // Mean-pool after state
+        // (1) Mean-pool after state — used by MeanPool formula + OPR
         let mut after = vec![0.0f32; dim];
         if seq_len > 0 {
             for pos in 0..seq_len {
@@ -221,22 +266,94 @@ impl ImportanceCollector {
                 *v *= scale;
             }
         }
-
-        let cos_sim = cosine_similarity(&self.before_snapshot, &after);
-        let importance = (1.0 - cos_sim).max(0.0);
+        let imp_mean_pool =
+            (1.0 - cosine_similarity(&self.before_snapshot, &after)).max(0.0);
         let opr = residual_norm_ratio(&self.before_snapshot, &after);
+
+        // (2) ShortGPT BI per-token cosine mean (3-way only)
+        let imp_shortgpt_bi: Option<f32> = if self.three_way {
+            let t = self.before_seq_len.min(seq_len);
+            let d = self.before_dim.min(dim);
+            if t == 0 || d == 0 {
+                Some(0.0)
+            } else {
+                let mut sum_cos = 0.0f32;
+                let mut valid_t: u32 = 0;
+                for pos in 0..t {
+                    let off = pos * d;
+                    let be = off + d;
+                    if be > self.before_snapshot_raw.len() || be > x_data.len() {
+                        break;
+                    }
+                    let before_tok = &self.before_snapshot_raw[off..be];
+                    let after_tok = &x_data[off..be];
+                    let mut bm = 0.0f32;
+                    for k in 0..d {
+                        bm += before_tok[k] * before_tok[k];
+                    }
+                    if bm > 1e-24 {
+                        sum_cos += cosine_similarity(before_tok, after_tok);
+                        valid_t += 1;
+                    }
+                }
+                let v = if valid_t > 0 {
+                    (1.0 - sum_cos / valid_t as f32).max(0.0)
+                } else {
+                    0.0
+                };
+                Some(v)
+            }
+        } else {
+            None
+        };
+
+        // (3) Primary importance selection
+        let importance = match self.primary_formula {
+            super::ImportanceFormula::MeanPool => imp_mean_pool,
+            super::ImportanceFormula::ShortGptBi => {
+                imp_shortgpt_bi.unwrap_or(imp_mean_pool)
+            }
+            // DpllmProxy: real signal is `dpllm_epsilon` in noise_table;
+            // here we keep a constant placeholder so swap_key composition is well-defined.
+            super::ImportanceFormula::DpllmProxy => 1.0,
+        };
+
+        let (mp_field, sb_field) = if self.three_way {
+            (Some(imp_mean_pool), imp_shortgpt_bi)
+        } else {
+            (None, None)
+        };
 
         self.entries.push(ImportanceEntry {
             layer_id,
             sublayer,
             importance,
             opr,
+            importance_mean_pool: mp_field,
+            importance_shortgpt_bi: sb_field,
         });
     }
 
     /// Build the final `ImportanceTable`.
     pub fn build(self) -> ImportanceTable {
         ImportanceTable::from_entries(self.entries)
+    }
+
+    /// Build the final `ImportanceTable` and return the cached x_means
+    /// (one `[dim]` vector per snapshot_before call, in chronological order).
+    /// Use this in 3-way mode to feed `noise_table::compute_input_aware_epsilon`.
+    pub fn build_with_xmeans(self) -> (ImportanceTable, Vec<Vec<f32>>) {
+        (ImportanceTable::from_entries(self.entries), self.x_means)
+    }
+
+    /// Whether 3-way comparison mode is active.
+    pub fn is_three_way(&self) -> bool {
+        self.three_way
+    }
+
+    /// Read-only access to cached x_means (3-way mode only).
+    pub fn x_means(&self) -> &[Vec<f32>] {
+        &self.x_means
     }
 }
 
@@ -339,12 +456,16 @@ mod tests {
                 sublayer: SubLayer::Full,
                 importance: 0.5,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.3,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -359,12 +480,16 @@ mod tests {
                 sublayer: SubLayer::Full,
                 importance: 0.5,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.3,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -381,24 +506,32 @@ mod tests {
                 sublayer: SubLayer::Full,
                 importance: 0.42,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.08,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 2,
                 sublayer: SubLayer::Full,
                 importance: 0.31,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 3,
                 sublayer: SubLayer::Full,
                 importance: 0.05,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -420,24 +553,32 @@ mod tests {
                 sublayer: SubLayer::Full,
                 importance: 0.9,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.1,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 2,
                 sublayer: SubLayer::Full,
                 importance: 0.2,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 3,
                 sublayer: SubLayer::Full,
                 importance: 0.8,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -460,30 +601,40 @@ mod tests {
                 sublayer: SubLayer::Full,
                 importance: 0.9,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.5,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 2,
                 sublayer: SubLayer::Full,
                 importance: 0.1,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 3,
                 sublayer: SubLayer::Full,
                 importance: 0.3,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 4,
                 sublayer: SubLayer::Full,
                 importance: 0.7,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -547,24 +698,32 @@ mod tests {
                 sublayer: SubLayer::Attention,
                 importance: 0.4,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 0,
                 sublayer: SubLayer::Mlp,
                 importance: 0.1,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Attention,
                 importance: 0.3,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Mlp,
                 importance: 0.2,
                 opr: 0.0,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -615,18 +774,24 @@ mod tests {
                 sublayer: SubLayer::Full,
                 importance: 0.5,
                 opr: 0.2,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.3,
                 opr: 0.4,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
             ImportanceEntry {
                 layer_id: 2,
                 sublayer: SubLayer::Full,
                 importance: 0.2,
                 opr: 0.1,
+                importance_mean_pool: None,
+                importance_shortgpt_bi: None,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -666,6 +831,113 @@ mod tests {
             (entry.importance - 1.0).abs() < 0.01,
             "importance should be 1.0, got {}",
             entry.importance
+        );
+    }
+
+    #[test]
+    fn test_importance_formula_as_str() {
+        use super::super::ImportanceFormula;
+        assert_eq!(ImportanceFormula::MeanPool.as_str(), "mean_pool");
+        assert_eq!(ImportanceFormula::ShortGptBi.as_str(), "shortgpt_bi");
+        assert_eq!(ImportanceFormula::DpllmProxy.as_str(), "dpllm_proxy");
+    }
+
+    #[test]
+    fn test_collector_single_mode_no_extras() {
+        // Default `new()` is mean_pool / single mode → optional 3-way fields stay None.
+        let dim = 4;
+        let seq_len = 2;
+        let before = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let after = vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+        let mut collector = ImportanceCollector::new();
+        collector.snapshot_before(&before, seq_len, dim);
+        collector.record_after(&after, seq_len, dim, 0, SubLayer::Full);
+
+        let table = collector.build();
+        let e = &table.entries()[0];
+        assert!(
+            e.importance_mean_pool.is_none(),
+            "single mode must leave mean_pool=None"
+        );
+        assert!(
+            e.importance_shortgpt_bi.is_none(),
+            "single mode must leave shortgpt_bi=None"
+        );
+    }
+
+    #[test]
+    fn test_collector_three_way_both_formulas_populated() {
+        use super::super::ImportanceFormula;
+        let dim = 2;
+        let seq_len = 2;
+        // before = [[1,0], [1,0]]   after = [[0,1], [1,0]]
+        //  → per-token cos = (0, 1)  → shortgpt_bi mean = 0.5  → importance_shortgpt_bi = 0.5
+        //  → mean_pool(before)=[1,0], mean_pool(after)=[0.5,0.5]
+        //    cos = 1/√2 ≈ 0.7071     → importance_mean_pool ≈ 0.2929
+        let before = vec![1.0, 0.0, 1.0, 0.0];
+        let after = vec![0.0, 1.0, 1.0, 0.0];
+
+        let mut collector =
+            ImportanceCollector::new_with_formula(ImportanceFormula::MeanPool, true);
+        collector.snapshot_before(&before, seq_len, dim);
+        collector.record_after(&after, seq_len, dim, 0, SubLayer::Full);
+
+        let table = collector.build();
+        let e = &table.entries()[0];
+        let mp = e.importance_mean_pool.expect("mean_pool must be Some");
+        let sb = e.importance_shortgpt_bi.expect("shortgpt_bi must be Some");
+        assert!((mp - 0.2929).abs() < 1e-3, "mean_pool ≈ 0.2929, got {mp}");
+        assert!((sb - 0.5).abs() < 1e-3, "shortgpt_bi ≈ 0.5, got {sb}");
+        // Primary is MeanPool → entry.importance == importance_mean_pool
+        assert!(
+            (e.importance - mp).abs() < 1e-6,
+            "primary importance must match selected formula"
+        );
+    }
+
+    #[test]
+    fn test_collector_three_way_caches_xmeans() {
+        use super::super::ImportanceFormula;
+        let dim = 3;
+        let seq_len = 2;
+        // before tokens = [[2,4,6], [4,6,8]]  → mean = [3,5,7]
+        let before = vec![2.0, 4.0, 6.0, 4.0, 6.0, 8.0];
+        let after = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+
+        let mut collector =
+            ImportanceCollector::new_with_formula(ImportanceFormula::MeanPool, true);
+        collector.snapshot_before(&before, seq_len, dim);
+        collector.record_after(&after, seq_len, dim, 0, SubLayer::Full);
+
+        let (_table, x_means) = collector.build_with_xmeans();
+        assert_eq!(x_means.len(), 1);
+        let mean = &x_means[0];
+        assert!((mean[0] - 3.0).abs() < 1e-5);
+        assert!((mean[1] - 5.0).abs() < 1e-5);
+        assert!((mean[2] - 7.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_collector_primary_formula_shortgpt_selects_importance() {
+        use super::super::ImportanceFormula;
+        let dim = 2;
+        let seq_len = 2;
+        let before = vec![1.0, 0.0, 1.0, 0.0];
+        let after = vec![0.0, 1.0, 1.0, 0.0];
+
+        let mut collector =
+            ImportanceCollector::new_with_formula(ImportanceFormula::ShortGptBi, true);
+        collector.snapshot_before(&before, seq_len, dim);
+        collector.record_after(&after, seq_len, dim, 0, SubLayer::Full);
+
+        let table = collector.build();
+        let e = &table.entries()[0];
+        let sb = e.importance_shortgpt_bi.expect("shortgpt_bi must be Some");
+        // Primary is ShortGptBi → entry.importance == importance_shortgpt_bi
+        assert!(
+            (e.importance - sb).abs() < 1e-6,
+            "primary importance must match ShortGptBi when selected"
         );
     }
 }

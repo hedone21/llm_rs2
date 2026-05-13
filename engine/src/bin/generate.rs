@@ -886,6 +886,20 @@ struct Args {
     #[arg(long, default_value = "imp")]
     swap_algorithm: String,
 
+    /// Layer importance formula for the §4 comparison study (EuroSys'27).
+    ///
+    /// - `mean_pool` (default): `1 − cos(mean_pool(h_in), mean_pool(h_out))`,
+    ///   current ARGUS baseline (token-wise mean-pool then cosine).
+    /// - `shortgpt_bi`: `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` — ShortGPT BI
+    ///   (Men et al., 2024), token-wise cosine then mean.
+    /// - `dpllm_proxy`: input-aware perturbation via
+    ///   `‖(W_F16 − W_Q4) · x_mean‖ / ‖W_F16 · x_mean‖` on attn_output.weight.
+    /// - `compare`: collect all three side-by-side. ImportanceTable still
+    ///   uses `mean_pool` for swap decisions; the other two are recorded
+    ///   only in the dump JSON's `per_layer_3way` field.
+    #[arg(long, default_value = "mean_pool")]
+    importance_formula: String,
+
     /// Per-step NLL trajectory mode (U5 mid-swap quality study, EuroSys'27).
     ///
     /// Requires `--qcf-dump`, `--force-swap-ratio`, `--eval-ll`, `--eval-batch`.
@@ -1653,6 +1667,19 @@ fn main() -> anyhow::Result<()> {
                 args.swap_algorithm
             )
         })?;
+
+    // Parse --importance-formula (§4 EuroSys'27 study). `compare` enables
+    // three_way collector + post-warmup DP-LLM proxy ε computation.
+    let (importance_formula, importance_compare) = match args.importance_formula.as_str() {
+        "mean_pool" => (llm_rs2::core::qcf::ImportanceFormula::MeanPool, false),
+        "shortgpt_bi" => (llm_rs2::core::qcf::ImportanceFormula::ShortGptBi, false),
+        "dpllm_proxy" => (llm_rs2::core::qcf::ImportanceFormula::DpllmProxy, false),
+        "compare" => (llm_rs2::core::qcf::ImportanceFormula::MeanPool, true),
+        other => anyhow::bail!(
+            "--importance-formula: unknown value '{}'. Valid: mean_pool, shortgpt_bi, dpllm_proxy, compare",
+            other
+        ),
+    };
 
     let is_gguf = model_path.ends_with(".gguf");
     let mut model = if is_gguf {
@@ -3422,6 +3449,7 @@ fn main() -> anyhow::Result<()> {
         let mut eval_ll_qcf_importance: Option<llm_rs2::core::qcf::ImportanceTable> = None;
         let mut eval_ll_qcf_decision: Option<llm_rs2::models::weights::decider::SwapDecision> =
             None;
+        let mut eval_ll_qcf_dpllm_epsilon: Option<Vec<f32>> = None;
 
         if args.qcf_dump.is_some()
             && let Some(force_ratio) = args.force_swap_ratio
@@ -3450,9 +3478,12 @@ fn main() -> anyhow::Result<()> {
                     " eval-ll",
                     swap_algorithm,
                     !args.qcf_trajectory,
+                    importance_formula,
+                    importance_compare,
                 )?;
                 eval_ll_qcf_decision = result.decision;
                 eval_ll_qcf_importance = Some(result.importance);
+                eval_ll_qcf_dpllm_epsilon = result.dpllm_epsilon;
             }
         }
 
@@ -3702,6 +3733,7 @@ fn main() -> anyhow::Result<()> {
                 ppl_corpus: None,
                 eval_ll_output: eval_ll_output_ref,
                 trajectory: trajectory_ref,
+                dpllm_epsilon: eval_ll_qcf_dpllm_epsilon.as_deref(),
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
@@ -3789,6 +3821,8 @@ fn main() -> anyhow::Result<()> {
             "",
             swap_algorithm,
             true,
+            importance_formula,
+            importance_compare,
         )?;
         qcf_swap_decision = result.decision;
         qcf_warmup_importance = Some(result.importance);
@@ -3955,6 +3989,7 @@ fn main() -> anyhow::Result<()> {
                 ppl_corpus: Some(ppl_path.as_str()),
                 eval_ll_output: None,
                 trajectory: None,
+                dpllm_epsilon: None,
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
@@ -7944,6 +7979,7 @@ fn main() -> anyhow::Result<()> {
             ppl_corpus: None,
             eval_ll_output: None,
             trajectory: None,
+            dpllm_epsilon: None,
         };
 
         dump_qcf_swap_json(dump_path, &ctx)?;
@@ -8335,6 +8371,9 @@ fn remap_weights_for_cpu_after_swap(
 struct QcfWarmupResult {
     importance: llm_rs2::core::qcf::ImportanceTable,
     decision: Option<llm_rs2::models::weights::SwapDecision>,
+    /// Per-layer DP-LLM proxy ε. `Some` only when 3-way comparison mode is
+    /// active (`--importance-formula compare`). Same length as the layer count.
+    dpllm_epsilon: Option<Vec<f32>>,
 }
 
 /// QCF-dump warmup workflow shared by `--ppl/generation` and `--eval-ll` modes.
@@ -8361,18 +8400,23 @@ fn run_qcf_warmup_workflow(
     log_prefix: &str,
     swap_algorithm: llm_rs2::models::weights::SwapAlgorithm,
     execute_swap: bool,
+    importance_formula: llm_rs2::core::qcf::ImportanceFormula,
+    importance_three_way: bool,
 ) -> anyhow::Result<QcfWarmupResult> {
     use llm_rs2::core::qcf::ImportanceCollector;
     use llm_rs2::models::weights::WeightSwapDecider;
 
     let actual_warmup_len = warmup_ids.len();
     eprintln!(
-        "[QCF-dump]{} warmup prefill: {} tokens",
-        log_prefix, actual_warmup_len,
+        "[QCF-dump]{} warmup prefill: {} tokens (formula={}, three_way={})",
+        log_prefix,
+        actual_warmup_len,
+        importance_formula.as_str(),
+        importance_three_way,
     );
 
     // ── Warmup prefill with ImportanceCollector ───────────────────────────────
-    let mut collector = ImportanceCollector::new();
+    let mut collector = ImportanceCollector::new_with_formula(importance_formula, importance_three_way);
     {
         let warmup_buf = Galloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
         unsafe {
@@ -8417,12 +8461,25 @@ fn run_qcf_warmup_workflow(
         backend.synchronize()?;
     }
 
-    // ── Build ImportanceTable + reset KV cache ────────────────────────────────
-    let imp_table = collector.build();
+    // ── Build ImportanceTable (+ optional DP-LLM ε) + reset KV cache ─────────
+    let (imp_table, dpllm_epsilon) = if importance_three_way {
+        let (table, x_means) = collector.build_with_xmeans();
+        let eps = model.secondary_mmap.as_ref().map(|sec| {
+            llm_rs2::models::weights::noise_table::compute_input_aware_epsilon(
+                &model.layers,
+                sec,
+                &x_means,
+            )
+        });
+        (table, eps)
+    } else {
+        (collector.build(), None)
+    };
     eprintln!(
-        "[QCF-dump]{} ImportanceTable built: {} entries",
+        "[QCF-dump]{} ImportanceTable built: {} entries (dpllm_epsilon={})",
         log_prefix,
         imp_table.len(),
+        if dpllm_epsilon.is_some() { "computed" } else { "skipped" },
     );
     for kv in kv_caches.iter_mut() {
         kv.current_pos = 0;
@@ -8454,6 +8511,7 @@ fn run_qcf_warmup_workflow(
             return Ok(QcfWarmupResult {
                 importance: imp_table,
                 decision: Some(decision),
+                dpllm_epsilon,
             });
         }
 
@@ -8495,6 +8553,7 @@ fn run_qcf_warmup_workflow(
     Ok(QcfWarmupResult {
         importance: imp_table,
         decision,
+        dpllm_epsilon,
     })
 }
 

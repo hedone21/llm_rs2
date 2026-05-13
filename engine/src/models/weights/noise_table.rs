@@ -267,27 +267,8 @@ fn compute_tensor_epsilon(
         return None;
     }
 
-    // Dequantize secondary blocks to f32.
-    // SAFETY: raw is well-aligned for BlockQ4_0 (repr(C), 18-byte packed read
-    // of an f16 + 16 u8; mmap is at least 2-byte aligned by GGUF layout).
-    let blocks: &[BlockQ4_0] =
-        // SAFETY: BlockQ4_0 has repr(C), size=18 B.  `raw` is a contiguous
-        // byte slice from the mmap whose length is exactly `n_blocks * 18`.
-        // We assert alignment is fine: GGUF tensors are guaranteed to be
-        // 32-byte aligned by the spec; BlockQ4_0 requires only 2-byte
-        // alignment (the f16 field).
-        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const BlockQ4_0, n_blocks) };
-
-    let mut secondary_f32 = vec![0.0f32; numel];
-    for (bi, block) in blocks.iter().enumerate() {
-        let start = bi * QK4_0;
-        // SAFETY: We allocated `secondary_f32` with exactly `n_blocks * QK4_0`
-        // elements, so `[start..start+QK4_0]` is always in-bounds.
-        let out_slice: &mut [f32; QK4_0] = unsafe {
-            &mut *(secondary_f32[start..start + QK4_0].as_mut_ptr() as *mut [f32; QK4_0])
-        };
-        block.dequantize(out_slice);
-    }
+    // Dequantize secondary Q4_0 blocks to f32 (extracted helper for reuse).
+    let secondary_f32 = dequantize_q4_0_blocks(raw, numel);
 
     // Read primary weights as f32.
     // The primary tensor may be F16 or F32.  Use the buffer's `as_f32_slice`
@@ -317,6 +298,143 @@ fn compute_tensor_epsilon(
     }
     let epsilon_t = (num / denom.max(EPS)) as f32;
     Some(epsilon_t)
+}
+
+/// Dequantize a contiguous slice of Q4_0 blocks to a fresh `Vec<f32>`.
+///
+/// `numel` must equal `n_blocks * QK4_0` where `n_blocks = raw.len() / sizeof(BlockQ4_0)`.
+/// Caller is responsible for validating that `raw.len()` matches expectation.
+fn dequantize_q4_0_blocks(raw: &[u8], numel: usize) -> Vec<f32> {
+    let n_blocks = numel / QK4_0;
+    debug_assert_eq!(raw.len(), n_blocks * std::mem::size_of::<BlockQ4_0>());
+
+    // SAFETY: BlockQ4_0 has repr(C), size=18 B. `raw` is a contiguous byte
+    // slice from the mmap whose length is exactly `n_blocks * 18`. GGUF
+    // tensors are 32-byte aligned by spec; BlockQ4_0 requires 2-byte
+    // alignment (the f16 field).
+    let blocks: &[BlockQ4_0] =
+        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const BlockQ4_0, n_blocks) };
+
+    let mut out = vec![0.0f32; numel];
+    for (bi, block) in blocks.iter().enumerate() {
+        let start = bi * QK4_0;
+        // SAFETY: out was allocated with exactly n_blocks * QK4_0 elements.
+        let chunk: &mut [f32; QK4_0] =
+            unsafe { &mut *(out[start..start + QK4_0].as_mut_ptr() as *mut [f32; QK4_0]) };
+        block.dequantize(chunk);
+    }
+    out
+}
+
+/// Layer-wise input-aware quantization perturbation (DP-LLM proxy, NeurIPS 2025 inspired).
+///
+/// For each layer `i`, compute
+///
+///   ε_dpllm[i] = ‖(W_F16 − W_Q4) · x_mean[i]‖₂ / max(‖W_F16 · x_mean[i]‖₂, EPS)
+///
+/// using the layer's `attn_output.weight` (`wo`) tensor.  We pick `wo` because
+/// it is hidden_size × hidden_size, so the layer-entry mean-pooled hidden state
+/// `x_mean[i]` (length = hidden_size) is directly compatible.  This is a
+/// simplified single-tensor proxy; alternatives (ffn_down) would require
+/// caching the actual MLP input vector and add ~6× the cost.
+///
+/// Returns a vector of length `primary_slots.len()`.  Entries are `f32::NAN`
+/// for layers where the secondary tensor is missing, the shape is unexpected,
+/// or `x_mean` length disagrees with `wo`'s input dim.  When
+/// `x_means.len() != primary_slots.len()`, every entry is NaN.
+pub fn compute_input_aware_epsilon(
+    primary_slots: &[Arc<crate::models::weights::LayerSlot>],
+    secondary: &Arc<SecondaryMmap>,
+    x_means: &[Vec<f32>],
+) -> Vec<f32> {
+    use crate::core::buffer::DType;
+    let n = primary_slots.len();
+    let mut result = vec![f32::NAN; n];
+    if x_means.len() != n {
+        log::warn!(
+            "compute_input_aware_epsilon: x_means len {} != slots len {}",
+            x_means.len(),
+            n
+        );
+        return result;
+    }
+
+    const SUBNAME: &str = "attn_output.weight";
+    const EPS: f64 = 1e-12;
+
+    for (i, (slot, x_mean)) in primary_slots.iter().zip(x_means.iter()).enumerate() {
+        let weights = slot.load_weights();
+        let primary_tensor = &weights.wo;
+        let dims = primary_tensor.shape().dims();
+        if dims.len() != 2 {
+            log::warn!(
+                "compute_input_aware_epsilon: layer {} wo is not 2D (dims={:?})",
+                i,
+                dims
+            );
+            continue;
+        }
+        let (out_dim, in_dim) = (dims[0], dims[1]);
+        if x_mean.len() != in_dim {
+            log::warn!(
+                "compute_input_aware_epsilon: layer {} x_mean len {} != in_dim {}",
+                i,
+                x_mean.len(),
+                in_dim
+            );
+            continue;
+        }
+
+        let info = match secondary.layer_tensor(i, SUBNAME) {
+            Some(info) => info,
+            None => continue,
+        };
+        if info.dtype != DType::Q4_0 {
+            continue;
+        }
+        let numel = primary_tensor.shape().numel();
+        if numel != out_dim * in_dim || !numel.is_multiple_of(QK4_0) {
+            continue;
+        }
+        let n_blocks = numel / QK4_0;
+        let expected_bytes = n_blocks * std::mem::size_of::<BlockQ4_0>();
+        let raw = secondary.tensor_bytes(info);
+        if raw.len() != expected_bytes {
+            continue;
+        }
+        let secondary_f32 = dequantize_q4_0_blocks(raw, numel);
+
+        let primary_f32 = match primary_tensor_to_f32(primary_tensor) {
+            Some(v) => v,
+            None => continue,
+        };
+        if primary_f32.len() != numel {
+            continue;
+        }
+
+        // Row-major GGUF layout: row r → primary_f32[r*in_dim .. (r+1)*in_dim].
+        // y_p[r] = Σ_c W_p[r,c] · x[c],   diff_y[r] = Σ_c (W_p[r,c] − W_q[r,c]) · x[c]
+        let mut diff_sq = 0.0f64;
+        let mut prim_sq = 0.0f64;
+        for r in 0..out_dim {
+            let row_start = r * in_dim;
+            let mut y_p = 0.0f32;
+            let mut diff_y = 0.0f32;
+            for c in 0..in_dim {
+                let w_p = primary_f32[row_start + c];
+                let w_s = secondary_f32[row_start + c];
+                let x = x_mean[c];
+                y_p += w_p * x;
+                diff_y += (w_p - w_s) * x;
+            }
+            diff_sq += (diff_y as f64).powi(2);
+            prim_sq += (y_p as f64).powi(2);
+        }
+        let eps_val = (diff_sq.sqrt() / prim_sq.max(EPS).sqrt()) as f32;
+        result[i] = eps_val;
+    }
+
+    result
 }
 
 /// Convert a primary weight tensor to a `Vec<f32>`.

@@ -20,6 +20,31 @@ pub use layer_aggregation::{
     LayerAggregationMode, aggregate_layers, compute_auto_sample_layers, compute_c1, compute_d7,
 };
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
+
+/// Layer importance formula variant for the §4 comparison study.
+///
+/// Three forms are supported; `compare` mode in `--importance-formula`
+/// activates all three side-by-side via `ImportanceCollector::new_with_formula(..., true)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportanceFormula {
+    /// `1 − cos(mean_pool(h_in), mean_pool(h_out))` — current ARGUS baseline.
+    MeanPool,
+    /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` — ShortGPT BI (Men et al., 2024).
+    ShortGptBi,
+    /// DP-LLM proxy. Importance is a constant placeholder; the real
+    /// signal is `dpllm_epsilon` computed in `noise_table` after warmup.
+    DpllmProxy,
+}
+
+impl ImportanceFormula {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImportanceFormula::MeanPool => "mean_pool",
+            ImportanceFormula::ShortGptBi => "shortgpt_bi",
+            ImportanceFormula::DpllmProxy => "dpllm_proxy",
+        }
+    }
+}
 pub use quant_qcf::{
     FlushAttentionParams, KiviFlushParams, compute_flush_aw_vopr, compute_flush_awqe,
     compute_flush_nmse, compute_flush_opr,
