@@ -647,7 +647,12 @@ impl TransformerModel {
         use crate::buffer::shared_buffer::SharedBuffer;
 
         let backend = runtime_backend.clone();
-        let is_gpu = backend.name() == "OpenCL" || backend.name() == "cuda-embedded";
+        // Use `is_gpu()` trait method — legacy `name()` comparison silently
+        // skipped GPU upload for qnn_oppkg, leaving lm_head as a CPU
+        // SharedBuffer that the OpenCL fallback's `matmul_q4_0` would reject
+        // ("B (weight) is not OpenCL buffer (kind=SharedBuffer)"). Same fix
+        // as `quantize_lm_head_to_q4_0` above.
+        let is_gpu = backend.is_gpu();
 
         let dims = self.lm_head.shape().dims();
         if dims.len() < 2 {
