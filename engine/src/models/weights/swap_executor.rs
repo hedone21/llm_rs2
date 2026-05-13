@@ -490,45 +490,56 @@ impl<'a> SwapExecutor<'a> {
         let diag_enabled = std::env::var("LLMRS_SWAP_DRAIN_DIAG")
             .map(|v| v == "1")
             .unwrap_or(false);
-        // ── Sub-batch reactive pause (LISWAP-6 follow-up) ───────────────────
-        // Solves the time-asymmetry between the dynamic-K controller's
-        // *pre-dispatch* decision and the *post-measure* forward observation:
-        // if a token's forward suddenly shrinks (thermal recovery, GPU
-        // contention release, jitter), an already-dispatched K-layer burst can
-        // overflow the release worker's drain window and produce a memory
-        // spike (violates `feedback_no_memory_spike.md`).
+        // ── Sub-batch reactive wait (was: pause/break, 2026-05-14) ─────────
+        // Memory-spike avoidance: dispatching the next layer while the
+        // previous primary release is still in flight would let
+        // release_worker queue depth grow beyond 1 (violates
+        // `feedback_no_memory_spike.md`).
         //
-        // Mitigation: inside the per-batch dispatch loop, after each
-        // successful layer, re-check `release_worker.pending_count()`. If the
-        // queue is non-empty *before* the next layer is enqueued, break — the
-        // hardware itself has signalled it has not finished draining the
-        // previous drop. The first layer is unconditional (i == 0) so swap
-        // progress is guaranteed for every token that enters the loop.
+        // Previously this site `break`-ed the loop, which silently dropped
+        // the remaining `chunk[i..]` because `IncrementalSwapPlan::drain_chunk`
+        // had already popped them. Sync K>1 incremental then collapsed to
+        // K=1-per-call AND silently lost the rest of the chunk (cold-fire
+        // sync K=5 measurement, 2026-05-13: 7/28 layers actually swapped).
+        //
+        // New behaviour: **wait** for the previous release to drain instead
+        // of breaking. Decode is paused (caller's main thread blocks here)
+        // until the chunk completes — the caller asked for K layers per
+        // tick, we honour that contract with queue depth ≤ 1 and zero
+        // silent drops.
         let sub_batch_pause_diag = std::env::var("LLMRS_SUB_BATCH_PAUSE_DIAG")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let intended_k = target_layers.len();
-        let mut sub_batch_cutoff_hit = false;
 
         let mut max_release_pending: usize = 0;
         let mut max_dispatcher_pending: usize = 0;
 
         for (i, &layer_idx) in target_layers.iter().enumerate() {
-            // Sub-batch reactive pause: check release queue *between* layers.
-            // First layer (i == 0) is unconditional — swap must make progress.
-            // i > 0 + pending > 0 → break before adding more pressure.
+            // Sub-batch reactive wait: spin until previous release completes
+            // before dispatching the next layer. First layer (i == 0) is
+            // unconditional. The wait keeps queue depth ≤ 1 → no memory
+            // spike, and the loop always finishes the full chunk → no
+            // silent layer drops in the plan.
             if i > 0
                 && let Some(worker) = &self.release_worker
-                && worker.pending_count() > 0
             {
-                sub_batch_cutoff_hit = true;
-                if sub_batch_pause_diag {
-                    eprintln!(
-                        "[SubBatchPause] intended_k={} actual_k={} reason=release_pending",
-                        intended_k, i
-                    );
+                let wait_start = if sub_batch_pause_diag {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                while worker.pending_count() > 0 {
+                    std::hint::spin_loop();
                 }
-                break;
+                if let Some(t0) = wait_start {
+                    let wait_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    if wait_ms > 0.1 {
+                        eprintln!(
+                            "[SubBatchWait] layer_idx={} wait_ms={:.2}",
+                            layer_idx, wait_ms
+                        );
+                    }
+                }
             }
             // Sample queue depths at the start of each layer iteration —
             // this is the moment when memory peak matters (about to allocate
@@ -896,9 +907,8 @@ impl<'a> SwapExecutor<'a> {
         if diag_enabled {
             let mode = if use_async { "async" } else { "sync" };
             eprintln!(
-                "[SwapPeak] mode={mode} target_layers={} max_release_pending={max_release_pending} max_dispatcher_pending={max_dispatcher_pending} sub_batch_cutoff={}",
+                "[SwapPeak] mode={mode} target_layers={} max_release_pending={max_release_pending} max_dispatcher_pending={max_dispatcher_pending}",
                 target_layers.len(),
-                if sub_batch_cutoff_hit { 1 } else { 0 }
             );
         }
 

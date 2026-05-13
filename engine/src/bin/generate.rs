@@ -1001,11 +1001,13 @@ struct Args {
     /// Requires `--swap-incremental-per-tick > 0`. When `=0` or absent,
     /// has no effect (silently ignored).
     ///
-    /// **Default ON (2026-05-12)** — async dispatch는 production winner mode의
-    /// 기본 구성 요소. `--swap-incremental-per-tick 0` (swap 비활성)일 때는
-    /// 자동 무시되므로 swap을 쓰지 않는 경우에도 안전. sync path를 명시적으로
-    /// 원하면 `--swap-async-dispatch=false`.
-    #[arg(long, default_value_t = true)]
+    /// **Default OFF (2026-05-13)** — async path는 `SwapExecutor`의
+    /// sub-batch reactive pause(release_pending > 0 → break)를 우회한다.
+    /// dispatcher worker로 release를 위임하기 때문에 main thread는
+    /// pending=0인 채 batch 전체를 enqueue → release_worker queue burst →
+    /// 메모리 스파이크. production swap default = sync. async는 측정용
+    /// (ablation) 시에만 명시적으로 enable.
+    #[arg(long, default_value_t = false)]
     swap_async_dispatch: bool,
 
     /// LISWAP-3 prototype (Direction A): use a `CL_MEM_ALLOC_HOST_PTR` slot
@@ -1093,19 +1095,19 @@ struct Args {
     /// LISWAP-6 Dynamic-K controller — auto-tune `--swap-incremental-per-tick`
     /// based on measured per-layer release cost vs forward wall.
     ///
-    /// Requires `--swap-incremental-per-tick > 0` (the explicit value is treated
-    /// as the *hard upper cap* — controller starts at K=1 and may grow up to
-    /// the user-supplied value during Phase 0 calibration; never exceeds it).
-    /// Effective only together with `--swap-async-dispatch`.
+    /// Requires `--swap-incremental-per-tick > 0`. The explicit value is the
+    /// *starting* per_tick; the controller recomputes K from Phase 0 calibration
+    /// timing (no static upper cap as of 2026-05-13 — `dynamic_k.rs` hard_upper
+    /// removed). Effective only together with `--swap-async-dispatch`.
     ///
     /// Memory-spike avoidance is the hard constraint: K is monotone
     /// non-increasing after calibration and a reactive pause skips swap when
     /// the release queue is non-empty. See `dynamic_k.rs` for the algorithm.
     ///
-    /// **Default ON (2026-05-12)** — production winner mode의 기본 구성 요소.
-    /// `--swap-incremental-per-tick 0`일 때는 자동 무시되므로 항상 안전한 default.
-    /// 정적 K를 원하면 `--swap-dynamic-k=false`.
-    #[arg(long, default_value_t = true)]
+    /// **Default OFF (2026-05-13)** — async path 동반 flag. async가 default
+    /// off로 바뀌면서 dynamic-K도 동반 default off (단독 의미 없음). ARGUS
+    /// 측정 시 명시적으로 enable.
+    #[arg(long, default_value_t = false)]
     swap_dynamic_k: bool,
 
     /// Phase-aware swap chunk 진단 size (MB). v1 per-tensor chunking에서는
@@ -6392,31 +6394,26 @@ fn main() -> anyhow::Result<()> {
                             );
 
                             // LISWAP-6 Dynamic-K Phase 0 calibration. Runs only on
-                            // the first successfully-dispatched chunk; drains the
-                            // async transfer queue and spins on release_worker
-                            // until pending == 0 to measure the worst-case per-
-                            // layer drop cost. From there on the controller runs
-                            // async (no sync waits).
+                            // the first successfully-dispatched chunk. Uses the
+                            // dispatch wall (`t_swap.elapsed()`) divided by
+                            // `chunk.len()` as `drop_ms_per_layer` — the main-thread
+                            // blocking time per layer (mmap_permute + dispatcher
+                            // submit). The prior release_worker spin was unreliable
+                            // on async path: dispatcher worker chains release enqueue
+                            // independently and sub-ms release time collapsed
+                            // drop_ms to 0 → safe_k exploded. Main-thread blocking
+                            // time is a meaningful budget item that scales with
+                            // cold/warm mmap state and chunk size (2026-05-13).
                             if let Some(ref mut ctrl) = dynamic_k_controller
                                 && !ctrl.is_calibrated()
                                 && !chunk.is_empty()
                             {
-                                if let Some(ref dispatcher) = async_swap_dispatcher {
-                                    let _ = dispatcher.drain(std::time::Duration::from_millis(500));
-                                }
-                                let calib_start = std::time::Instant::now();
-                                let timeout = std::time::Duration::from_millis(100);
-                                while model.release_worker.pending_count() > 0
-                                    && calib_start.elapsed() < timeout
-                                {
-                                    std::hint::spin_loop();
-                                }
-                                let drop_total = calib_start.elapsed().as_secs_f64() * 1000.0;
-                                let drop_ms_per_layer = (drop_total / chunk.len() as f64) as f32;
+                                let blocking_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
+                                let drop_ms_per_layer = (blocking_ms / chunk.len() as f64) as f32;
                                 ctrl.calibrate(drop_ms_per_layer, forward_ms as f32);
                                 if dynamic_k_diag {
                                     eprintln!(
-                                        "[DynamicK] calibrated t={} drop_ms={:.3} fwd_ms={:.2} safe_k={}",
+                                        "[DynamicK] calibrated t={} blocking_ms={:.3}/layer fwd_ms={:.2} safe_k={}",
                                         decode_token_index,
                                         drop_ms_per_layer,
                                         forward_ms,
