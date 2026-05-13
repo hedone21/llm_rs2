@@ -32,22 +32,25 @@ pub(super) fn update_kv_cache<C: KVCacheOps>(
     v: &Tensor,
     backend: &Arc<dyn Backend>,
 ) -> Result<()> {
-    // Fast path: tensors have CPU pointers (ARM shared memory or CPU backend)
-    if !k.as_ptr().is_null() {
+    let has_gpu_buffers = kv_cache.get_buffers_mut().is_some();
+
+    // GPU-buffer caches (e.g. `KVCache`) accept GPU tensors directly via
+    // `backend.copy_slice`. No host-side read, so no sync needed here.
+    if has_gpu_buffers {
         return kv_cache.update(k, v);
     }
 
-    // GPU-only tensors: check if cache can handle them directly.
-    // KVCache.get_buffers_mut() returns Some (GPU copy_slice works);
-    // KiviCache returns None (CPU-only, needs readback).
-    {
-        let has_gpu_buffers = kv_cache.get_buffers_mut().is_some();
-        if has_gpu_buffers {
-            return kv_cache.update(k, v);
-        }
+    // CPU-only cache (e.g. `KiviCache`) reads the K/V via `as_slice::<f32>()`.
+    // If the producer tensor lives in host-mapped GPU memory (CUDA pinned,
+    // OpenCL UMA), the host pointer is non-null but the device kernels that
+    // wrote it may not have completed — `as_slice` would then return stale
+    // bytes. Synchronize before the read.
+    if !k.as_ptr().is_null() {
+        backend.synchronize()?;
+        return kv_cache.update(k, v);
     }
 
-    // CPU-only cache (e.g. KiviCache): read GPU data back to CPU
+    // Device-only tensors (`as_ptr()` is null): explicit readback.
     let k_cpu = gpu_readback(k, backend)?;
     let v_cpu = gpu_readback(v, backend)?;
     kv_cache.update(&k_cpu, &v_cpu)
