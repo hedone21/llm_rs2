@@ -186,10 +186,13 @@ impl<'a> WeightSwapDecider<'a> {
             SwapAlgorithm::Uniform => uniform_select_by_index(needed, &candidates),
             SwapAlgorithm::ImportanceAware | SwapAlgorithm::AntiImportance => {
                 let imp = self.importance.expect("importance checked non-empty");
-                let noise = self.noise.expect("noise checked is_computed");
 
-                // Key = importance(i, SubLayer::Full) × ε(i).
-                // When importance has no entry for a layer, treat as 0.0.
+                // Key = importance(i, SubLayer::Full). ε was previously
+                // multiplied in but empirical measurement showed Spearman
+                // ρ(imp × ε, imp) = 0.998 under Q4_0 (ε layer-uniform), so
+                // ε contributes no ranking signal. Removed for §4 simplicity.
+                // ε is still checked at the candidate-filter stage above for
+                // NaN exclusion (INV-127).
                 let mut scored: Vec<(usize, f32)> = candidates
                     .iter()
                     .map(|&i| {
@@ -199,8 +202,7 @@ impl<'a> WeightSwapDecider<'a> {
                             .find(|e| e.layer_id == i && e.sublayer == SubLayer::Full)
                             .map(|e| e.importance)
                             .unwrap_or(0.0);
-                        let eps_val = noise.epsilon(i).unwrap_or(1.0);
-                        (i, imp_val * eps_val)
+                        (i, imp_val)
                     })
                     .collect();
 
@@ -287,10 +289,13 @@ fn compute_qcf_swap_internal(
             .unwrap_or(1.0)
     };
 
-    let eps_for = |i: usize| -> Option<f32> {
+    // ε removed from the QCF_swap formula (see decide() comment). The noise
+    // table is still consulted here only to exclude NaN-ε layers from the
+    // sum (INV-127 — they were never valid swap candidates).
+    let valid_layer = |i: usize| -> bool {
         match noise {
-            Some(t) => t.epsilon(i), // None if NaN or out-of-range
-            None => Some(1.0),       // absent → treat as 1.0
+            Some(t) => t.epsilon(i).is_some(),
+            None => true,
         }
     };
 
@@ -298,11 +303,13 @@ fn compute_qcf_swap_internal(
 
     let numerator: f32 = (0..n_decoder_layers)
         .filter(|i| swap_set_hash.contains(i))
-        .filter_map(|i| eps_for(i).map(|e| imp_for(i) * e))
+        .filter(|i| valid_layer(*i))
+        .map(imp_for)
         .sum();
 
     let denominator: f32 = (0..n_decoder_layers)
-        .filter_map(|i| eps_for(i).map(|e| imp_for(i) * e))
+        .filter(|i| valid_layer(*i))
+        .map(imp_for)
         .sum();
 
     if denominator < 1e-8 {
@@ -365,13 +372,13 @@ mod tests {
 
     // ── Normal-path test (spec example) ──────────────────────────────────────
 
-    /// 4-layer fixture from the spec:
-    /// importance = [0.1, 0.5, 0.3, 0.7], ε = [0.2, 0.1, 0.3, 0.05]
-    /// key = importance × ε = [0.02, 0.05, 0.09, 0.035]
+    /// 4-layer fixture from the spec (post-ε removal):
+    /// importance = [0.1, 0.5, 0.3, 0.7], ε = [0.2, 0.1, 0.3, 0.05] (ε no
+    /// longer affects ranking; kept here only for the NaN-exclusion path).
+    /// key = importance = [0.1, 0.5, 0.3, 0.7]
     /// Layers 0 and 3 are protected; candidates = [1, 2].
-    /// ratio=0.5 → k = floor(0.5 × 4) = 2 → need 2 layers from [1, 2].
-    /// Sort ascending by key: layer 1 (0.05) < layer 2 (0.09) → selected = [1, 2].
-    /// qcf_swap = (0.05 + 0.09) / (0.02 + 0.05 + 0.09 + 0.035) = 0.14 / 0.195
+    /// ratio=0.5 → k = floor(0.5 × 4) = 2 → both candidates selected.
+    /// qcf_swap = (imp[1] + imp[2]) / Σ imp = (0.5 + 0.3) / 1.6 = 0.5
     #[test]
     fn decide_normal_path_spec_example() {
         let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
@@ -394,8 +401,8 @@ mod tests {
         assert!(decision.selected_layers.contains(&1));
         assert!(decision.selected_layers.contains(&2));
 
-        // qcf_swap = 0.14 / 0.195
-        let expected_qcf = 0.14f32 / 0.195f32;
+        // qcf_swap = 0.8 / 1.6 = 0.5
+        let expected_qcf = 0.5f32;
         assert!(
             (decision.qcf_swap_estimate - expected_qcf).abs() < 1e-4,
             "qcf={:.6}, expected={:.6}",

@@ -900,6 +900,15 @@ struct Args {
     #[arg(long, default_value = "mean_pool")]
     importance_formula: String,
 
+    /// Explicit per-layer swap list (CSV of layer indices) for §4 ground-truth
+    /// study. Bypasses `WeightSwapDecider`: when set, the listed layers are
+    /// swapped regardless of `--force-swap-ratio` or `--swap-algorithm`.
+    /// `--force-swap-ratio` must still be provided (any non-zero value) so
+    /// the warmup workflow runs; the ratio itself is ignored. Example:
+    /// `--swap-only-layers 5` swaps only layer 5.
+    #[arg(long)]
+    swap_only_layers: Option<String>,
+
     /// Per-step NLL trajectory mode (U5 mid-swap quality study, EuroSys'27).
     ///
     /// Requires `--qcf-dump`, `--force-swap-ratio`, `--eval-ll`, `--eval-batch`.
@@ -1679,6 +1688,27 @@ fn main() -> anyhow::Result<()> {
             "--importance-formula: unknown value '{}'. Valid: mean_pool, shortgpt_bi, dpllm_proxy, compare",
             other
         ),
+    };
+
+    // Parse --swap-only-layers (§4 ground-truth study). CSV of layer indices.
+    let swap_only_layers: Option<Vec<usize>> = match args.swap_only_layers.as_deref() {
+        None | Some("") => None,
+        Some(csv) => {
+            let mut v = Vec::new();
+            for tok in csv.split(',') {
+                let t = tok.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let idx: usize = t.parse().map_err(|_| {
+                    anyhow::anyhow!("--swap-only-layers: '{}' is not a non-negative integer", t)
+                })?;
+                v.push(idx);
+            }
+            v.sort_unstable();
+            v.dedup();
+            Some(v)
+        }
     };
 
     let is_gguf = model_path.ends_with(".gguf");
@@ -3480,6 +3510,7 @@ fn main() -> anyhow::Result<()> {
                     !args.qcf_trajectory,
                     importance_formula,
                     importance_compare,
+                    swap_only_layers.as_deref(),
                 )?;
                 eval_ll_qcf_decision = result.decision;
                 eval_ll_qcf_importance = Some(result.importance);
@@ -3823,6 +3854,7 @@ fn main() -> anyhow::Result<()> {
             true,
             importance_formula,
             importance_compare,
+            swap_only_layers.as_deref(),
         )?;
         qcf_swap_decision = result.decision;
         qcf_warmup_importance = Some(result.importance);
@@ -8402,6 +8434,7 @@ fn run_qcf_warmup_workflow(
     execute_swap: bool,
     importance_formula: llm_rs2::core::qcf::ImportanceFormula,
     importance_three_way: bool,
+    swap_only_layers: Option<&[usize]>,
 ) -> anyhow::Result<QcfWarmupResult> {
     use llm_rs2::core::qcf::ImportanceCollector;
     use llm_rs2::models::weights::WeightSwapDecider;
@@ -8502,7 +8535,32 @@ fn run_qcf_warmup_workflow(
             allow_boundary_layers: read_allow_boundary_env(),
             algorithm: swap_algorithm,
         };
-        let decision = decider.decide(ratio);
+        let decider_decision = decider.decide(ratio);
+
+        // §4 ground-truth path: when `--swap-only-layers` is set, override the
+        // decider's selection with the explicit list. The decider's
+        // `qcf_swap_estimate` is recomputed against this override so the dump
+        // JSON reports the QCF prediction for the actually-swapped set.
+        let decision = if let Some(only) = swap_only_layers {
+            let override_layers: Vec<usize> = only.iter().copied().filter(|i| *i < model.layers.len()).collect();
+            let qcf_override = llm_rs2::models::weights::compute_qcf_swap(
+                &override_layers,
+                model.quant_noise.as_ref(),
+                Some(&imp_table),
+                model.layers.len(),
+            );
+            eprintln!(
+                "[QCF-dump]{} swap-only override: layers={:?} (ignoring algorithm/ratio decision)",
+                log_prefix, override_layers,
+            );
+            llm_rs2::models::weights::SwapDecision {
+                selected_layers: override_layers,
+                qcf_swap_estimate: qcf_override,
+                fallback_used: false,
+            }
+        } else {
+            decider_decision
+        };
 
         // Trajectory mode (`--qcf-trajectory`): return the decision without
         // executing the swap — the caller drives swap one layer at a time
