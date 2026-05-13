@@ -3091,20 +3091,12 @@ fn main() -> anyhow::Result<()> {
     };
 
     // LISWAP-6 — Dynamic K controller. Active when `--swap-dynamic-k` is set.
-    // The hard upper cap is taken from `--swap-incremental-per-tick` (CLI path)
-    // or defaults to 2 (manager path, per LISWAP-6 measurement matrix).
-    // Created even when per_tick == 0 so that manager-triggered incremental swap
-    // can use dynamic-K calibration without requiring the CLI flag.
+    // K is determined entirely by timing (forward wall vs per-layer drop cost);
+    // there is no static upper cap. Per-tick dispatch is still bounded by the
+    // sub-batch reactive pause inside `SwapExecutor::execute_on_slots`.
     let mut dynamic_k_controller: Option<llm_rs2::models::weights::DynamicKController> =
         if args.swap_dynamic_k {
-            let hard_upper = if args.swap_incremental_per_tick > 0 {
-                args.swap_incremental_per_tick
-            } else {
-                2 // default hard cap for manager-triggered path (K=2 per LISWAP-6)
-            };
-            Some(llm_rs2::models::weights::DynamicKController::new(
-                hard_upper,
-            ))
+            Some(llm_rs2::models::weights::DynamicKController::new())
         } else {
             None
         };

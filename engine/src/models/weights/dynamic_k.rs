@@ -7,14 +7,17 @@
 //! - K is calibrated **once** in Phase 0 with a synchronous K=1 dispatch.
 //! - From Phase 1 onward, `K` is monotonically non-increasing — never probes
 //!   upward (probing = spike risk).
-//! - Reactive pause (`should_pause`) is an independent last-line defence: if the
-//!   release queue still has in-flight layers, the caller skips swap this token
-//!   without decreasing K.
+//! - Reactive pause (`should_pause`) is an independent last-line defence: if
+//!   the release queue still has in-flight layers, the caller skips swap this
+//!   token without decreasing K.
+//! - There is no static upper cap; `compute_safe_k` is the only governor.
+//!   `SwapExecutor::execute_on_slots` further bounds per-tick dispatch via the
+//!   sub-batch reactive pause (`i > 0 + release_pending > 0 → break`).
 //!
 //! Algorithm (option C, timing-based, NO probing):
 //!
 //! Phase 0 (first swap batch, K=1 sync):
-//!   safe_k = floor(fwd_min_ms * margin / drop_ms_per_layer).clamp(1, hard_upper)
+//!   safe_k = max(1, floor(fwd_min_ms * margin / drop_ms_per_layer))
 //!
 //! Phase 1+ (every subsequent token, async):
 //!   if pending > 0 → pause (skip swap this token, K unchanged)
@@ -25,7 +28,6 @@ const DEFAULT_MARGIN: f32 = 0.5;
 /// Timing-based controller for the per-tick swap chunk size.
 pub struct DynamicKController {
     k: usize,
-    hard_upper: usize,
     margin: f32,
     drop_ms_per_layer: f32,
     fwd_min_ms: f32,
@@ -33,13 +35,9 @@ pub struct DynamicKController {
 }
 
 impl DynamicKController {
-    /// Create a new controller. `hard_upper` caps `K` (= 2 for Adreno Qwen 1.5B
-    /// per the LISWAP-6 measurement matrix — K=3 produces decode garbage).
-    pub fn new(hard_upper: usize) -> Self {
-        let hard_upper = hard_upper.max(1);
+    pub fn new() -> Self {
         Self {
             k: 1,
-            hard_upper,
             margin: DEFAULT_MARGIN,
             drop_ms_per_layer: 0.0,
             fwd_min_ms: f32::INFINITY,
@@ -47,7 +45,7 @@ impl DynamicKController {
         }
     }
 
-    /// Current per-tick chunk size. Always `>= 1` after `new` and `<= hard_upper`.
+    /// Current per-tick chunk size. Always `>= 1` after `new`.
     #[inline]
     pub fn current_k(&self) -> usize {
         self.k
@@ -62,12 +60,12 @@ impl DynamicKController {
     /// Phase 0 result injection. `drop_ms` is the wall-clock cost of releasing
     /// one displaced primary layer; `fwd_ms` is the forward wall of the token
     /// during which the calibration ran. Both are positive — `drop_ms <= 0` is
-    /// clamped to 1.0 (defensive: never divide by zero).
+    /// clamped to 1e-3 (defensive: never divide by zero).
     pub fn calibrate(&mut self, drop_ms: f32, fwd_ms: f32) {
         let drop_ms = drop_ms.max(1.0e-3);
         self.drop_ms_per_layer = drop_ms;
         self.fwd_min_ms = fwd_ms.max(0.0);
-        self.k = self.compute_safe_k().clamp(1, self.hard_upper);
+        self.k = self.compute_safe_k().max(1);
         self.calibrated = true;
     }
 
@@ -80,7 +78,7 @@ impl DynamicKController {
         }
         if fwd_ms < self.fwd_min_ms {
             self.fwd_min_ms = fwd_ms;
-            let new_safe = self.compute_safe_k().clamp(1, self.hard_upper);
+            let new_safe = self.compute_safe_k().max(1);
             self.k = self.k.min(new_safe);
         }
     }
@@ -105,67 +103,71 @@ impl DynamicKController {
     }
 }
 
+impl Default for DynamicKController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn calibration_picks_safe_k_two() {
-        // fwd=10ms, drop=0.5ms, margin=0.5 → 10 * 0.5 / 0.5 = 10 → clamp to hard_upper=2.
-        let mut c = DynamicKController::new(2);
+    fn calibration_picks_safe_k_from_timing() {
+        // fwd=10ms, drop=0.5ms, margin=0.5 → 10 * 0.5 / 0.5 = 10.
+        let mut c = DynamicKController::new();
         c.calibrate(0.5, 10.0);
         assert!(c.is_calibrated());
-        assert_eq!(c.current_k(), 2);
+        assert_eq!(c.current_k(), 10);
     }
 
     #[test]
     fn calibration_picks_safe_k_one_when_fwd_is_tight() {
-        // fwd=1ms, drop=0.5ms, margin=0.5 → 1 * 0.5 / 0.5 = 1 → safe_k=1.
-        let mut c = DynamicKController::new(2);
+        // fwd=1ms, drop=0.5ms, margin=0.5 → 1 * 0.5 / 0.5 = 1.
+        let mut c = DynamicKController::new();
         c.calibrate(0.5, 1.0);
         assert_eq!(c.current_k(), 1);
     }
 
     #[test]
-    fn forward_shrink_drops_k_to_one() {
-        let mut c = DynamicKController::new(2);
+    fn forward_shrink_drops_k() {
+        let mut c = DynamicKController::new();
         c.calibrate(0.5, 10.0);
-        assert_eq!(c.current_k(), 2);
-        // Forward suddenly drops to 1ms — safe_k recomputes to 1, k must shrink.
+        assert_eq!(c.current_k(), 10);
+        // Forward suddenly drops to 1ms — safe_k recomputes to 1.
         c.observe_forward(1.0);
         assert_eq!(c.current_k(), 1);
     }
 
     #[test]
     fn forward_grow_keeps_k_unchanged() {
-        let mut c = DynamicKController::new(2);
+        let mut c = DynamicKController::new();
         c.calibrate(0.5, 10.0);
-        assert_eq!(c.current_k(), 2);
+        assert_eq!(c.current_k(), 10);
         // Larger forward times never raise k.
         c.observe_forward(50.0);
-        assert_eq!(c.current_k(), 2);
+        assert_eq!(c.current_k(), 10);
         c.observe_forward(20.0);
-        assert_eq!(c.current_k(), 2);
+        assert_eq!(c.current_k(), 10);
     }
 
     #[test]
     fn k_is_monotone_non_increasing() {
-        let mut c = DynamicKController::new(2);
+        let mut c = DynamicKController::new();
         c.calibrate(0.5, 10.0);
-        assert_eq!(c.current_k(), 2);
-        c.observe_forward(1.0); // drop to 1
+        assert_eq!(c.current_k(), 10);
+        c.observe_forward(1.0);
         assert_eq!(c.current_k(), 1);
-        // Even if forward shrinks further, k stays >= 1.
         c.observe_forward(0.1);
         assert_eq!(c.current_k(), 1);
-        // Forward growing back never raises k.
         c.observe_forward(100.0);
         assert_eq!(c.current_k(), 1);
     }
 
     #[test]
     fn should_pause_pending_semantics() {
-        let c = DynamicKController::new(2);
+        let c = DynamicKController::new();
         assert!(!c.should_pause(0));
         assert!(c.should_pause(1));
         assert!(c.should_pause(7));
@@ -173,26 +175,26 @@ mod tests {
 
     #[test]
     fn observe_before_calibrate_is_noop() {
-        let mut c = DynamicKController::new(2);
+        let mut c = DynamicKController::new();
         c.observe_forward(1.0);
         assert!(!c.is_calibrated());
         assert_eq!(c.current_k(), 1);
     }
 
     #[test]
-    fn hard_upper_clamps_safe_k() {
-        // fwd=1000ms, drop=0.1ms, margin=0.5 → safe = 5000 → clamp to hard_upper.
-        let mut c = DynamicKController::new(2);
+    fn large_fwd_small_drop_yields_large_k() {
+        // fwd=1000ms, drop=0.1ms, margin=0.5 → safe = 5000. No static cap.
+        let mut c = DynamicKController::new();
         c.calibrate(0.1, 1000.0);
-        assert_eq!(c.current_k(), 2);
+        assert_eq!(c.current_k(), 5000);
     }
 
     #[test]
-    fn calibration_clamps_zero_drop_to_safe_k_one() {
-        // Defensive: drop_ms <= 0 must not divide-by-zero.
-        let mut c = DynamicKController::new(2);
+    fn calibration_handles_zero_drop() {
+        // Defensive: drop_ms <= 0 clamps to 1e-3, no divide-by-zero.
+        let mut c = DynamicKController::new();
         c.calibrate(0.0, 10.0);
-        // drop clamped to 1e-3 → 10 * 0.5 / 1e-3 = 5000 → clamp to hard_upper=2.
-        assert_eq!(c.current_k(), 2);
+        // drop clamped to 1e-3 → 10 * 0.5 / 1e-3 = 5000.
+        assert_eq!(c.current_k(), 5000);
     }
 }
