@@ -1,0 +1,12 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /home/nvidia/llm_rs2/models/llama3.1-8b/gguf/llama3.1-8b-f16.gguf
+[CUDA] Compiling kernels with /usr/local/cuda-11.4/bin/nvcc --ptx -arch=sm_72 -std=c++17 ...
+[CUDA] Kernel compilation done (803678 bytes PTX)
+[CUDA] Device: Xavier (sm_72, UMA=true, managed_mem=1, cuBLAS=ready, kernels=ready)
+[CUDA self-test] add_assign: [5.0, 7.0, 9.0] OK
+[CUDA self-test] scale:      [1.0, 2.0, 3.0] OK
+[CUDA self-test] rms_norm:   [0.8485, 1.1314] OK
+[CUDA] --cuda-sync-policy=minimal (mask=0x81)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 291 tensors, arch=Llama, weight_dtype=F16

@@ -14,6 +14,8 @@ pub mod decider;
 pub mod dynamic_k;
 pub mod incremental_plan;
 pub mod intra_forward_swap;
+#[cfg(feature = "cuda-embedded")]
+pub mod layer_object_pool;
 pub mod noise_table;
 pub mod phase_aware_swap;
 pub mod release_worker;

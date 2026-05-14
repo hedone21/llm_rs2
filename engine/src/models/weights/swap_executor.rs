@@ -282,6 +282,15 @@ pub struct SwapExecutor<'a> {
     /// Plan: `compiled-chasing-hopper.md` Direction A track, Stage 3.
     #[cfg(feature = "opencl")]
     pub host_ptr_pool: Option<Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>>,
+
+    /// LISWAP-8 Phase B: pre-allocated layer object pool with background
+    /// re-supply. When `Some` and `LLMRS_SWAP_LAYER_POOL=1` is set, the
+    /// BG fetch dispatch path takes an entry from the pool instead of
+    /// calling `cuMemAlloc` for each weight buffer. The background
+    /// allocator thread refills the pool to keep the depth stable.
+    /// Falls back to the regular bg_fetch path if the pool is exhausted.
+    #[cfg(feature = "cuda-embedded")]
+    pub layer_pool: Option<Arc<crate::models::weights::layer_object_pool::LayerObjectPool>>,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -302,6 +311,8 @@ impl<'a> SwapExecutor<'a> {
             release_worker: None,
             #[cfg(feature = "opencl")]
             host_ptr_pool: None,
+            #[cfg(feature = "cuda-embedded")]
+            layer_pool: None,
         }
     }
 
@@ -325,6 +336,8 @@ impl<'a> SwapExecutor<'a> {
             release_worker: Some(release_worker),
             #[cfg(feature = "opencl")]
             host_ptr_pool: None,
+            #[cfg(feature = "cuda-embedded")]
+            layer_pool: None,
         }
     }
 
@@ -339,6 +352,18 @@ impl<'a> SwapExecutor<'a> {
         pool: Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>,
     ) -> Self {
         self.host_ptr_pool = Some(pool);
+        self
+    }
+
+    /// LISWAP-8 Phase B: attach a `LayerObjectPool` so the BG fetch path
+    /// reuses pre-allocated layer buffers instead of calling `cuMemAlloc`
+    /// on the dispatch thread. Activated by `LLMRS_SWAP_LAYER_POOL=1` env.
+    #[cfg(feature = "cuda-embedded")]
+    pub fn with_layer_pool(
+        mut self,
+        pool: Arc<crate::models::weights::layer_object_pool::LayerObjectPool>,
+    ) -> Self {
+        self.layer_pool = Some(pool);
         self
     }
 
@@ -557,6 +582,15 @@ impl<'a> SwapExecutor<'a> {
             .map(|v| v == "1")
             .unwrap_or(false);
 
+        // LISWAP-8 Phase B: pre-allocated layer object pool path. Reads
+        // `LLMRS_SWAP_LAYER_POOL=1` env. Only takes effect when both the
+        // executor has a `layer_pool` attached AND `bg_fetch` is active
+        // (pool dispatch piggy-backs on the bg_fetch closure flow).
+        #[cfg(feature = "cuda-embedded")]
+        let layer_pool_active = std::env::var("LLMRS_SWAP_LAYER_POOL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
         // Pre-build cache (par_build only): layer_idx -> Result<(layer, evt)>.
         // Populated outside the loop so the loop only submits + accumulates
         // stats.
@@ -708,15 +742,43 @@ impl<'a> SwapExecutor<'a> {
                 let target_dtype = self.target_dtype;
                 let release_worker_clone = self.release_worker.clone();
 
+                // LISWAP-8 Phase B: try to take a pool entry for this
+                // layer. If `Some`, the worker closure overwrites the
+                // entry's buffers in place via `enqueue_write_into_async`
+                // (no cuMemAlloc on the dispatch path). If `None`, fall
+                // back to the Phase A path (`build_layer_async_standalone`)
+                // which allocates fresh device buffers.
+                #[cfg(feature = "cuda-embedded")]
+                let pool_entry: Option<crate::layers::transformer_layer::TransformerLayer> =
+                    if layer_pool_active {
+                        self.layer_pool.as_ref().and_then(|p| p.take())
+                    } else {
+                        None
+                    };
+                #[cfg(not(feature = "cuda-embedded"))]
+                let pool_entry: Option<crate::layers::transformer_layer::TransformerLayer> =
+                    None;
+
                 let job = crate::models::weights::async_swap::ChunkDispatchJob {
                     run: Box::new(move || {
-                        let result = build_layer_async_standalone(
-                            &secondary_arc,
-                            &slot_arc,
-                            layer_idx,
-                            &backend_arc,
-                            &config_owned,
-                        );
+                        let result = if let Some(entry) = pool_entry {
+                            build_layer_via_pool_standalone(
+                                &secondary_arc,
+                                &slot_arc,
+                                layer_idx,
+                                &backend_arc,
+                                &config_owned,
+                                entry,
+                            )
+                        } else {
+                            build_layer_async_standalone(
+                                &secondary_arc,
+                                &slot_arc,
+                                layer_idx,
+                                &backend_arc,
+                                &config_owned,
+                            )
+                        };
                         let (new_layer, write_event) = match result {
                             Ok(pair) => pair,
                             Err(e) => {
@@ -2365,6 +2427,107 @@ pub(crate) fn build_layer_async_standalone(
             w_gate,
             w_up,
             w_down,
+            attention_norm,
+            ffn_norm,
+            qkv_bias: old.qkv_bias.clone(),
+            q_norm: old.q_norm.clone(),
+            k_norm: old.k_norm.clone(),
+            pre_ffn_norm: old.pre_ffn_norm.clone(),
+            post_ffn_norm: old.post_ffn_norm.clone(),
+            partition_ctx: None,
+        },
+        last_event,
+    ))
+}
+
+/// LISWAP-8 Phase B: pool-backed variant of `build_layer_async_standalone`.
+///
+/// Takes ownership of a pre-allocated `pool_entry: TransformerLayer` whose
+/// weight buffers are sized for the secondary dtype. For each weight
+/// tensor, materialises the secondary mmap bytes (with Q/K unpermute if
+/// needed) into a CPU-side `Tensor`, then calls
+/// `Backend::enqueue_write_into_async(pool_entry.<wq>, src_ptr, len)` to
+/// overwrite the entry's existing device buffer in place. The returned
+/// `TransformerLayer` reuses the pool entry's tensors (no fresh alloc).
+///
+/// Norms: when the secondary file carries the norm tensor we overwrite
+/// the pool entry's norm buffer; otherwise we clone the displaced
+/// primary's norm tensor (matching `build_layer_async_standalone`).
+pub(crate) fn build_layer_via_pool_standalone(
+    secondary: &Arc<SecondaryMmap>,
+    slot: &LayerSlot,
+    layer_idx: usize,
+    backend: &Arc<dyn Backend>,
+    config: &ModelConfig,
+    pool_entry: TransformerLayer,
+) -> Result<(TransformerLayer, GpuEvent), SwapError> {
+    let old = slot.load_weights();
+
+    // Tracks the most recent in-order event from the transfer stream/queue —
+    // the last successful enqueue covers all prior ones (in-order semantics).
+    let mut last_event: GpuEvent = GpuEvent::dummy();
+
+    let mut write_into = |dst: &Tensor, subname: &str, primary: &Tensor| -> Result<(), SwapError> {
+        let cpu = materialise_cpu_tensor_standalone(
+            secondary, layer_idx, subname, primary, backend, config,
+        )?;
+        let src_ptr = cpu.buffer().as_ptr();
+        if src_ptr.is_null() {
+            return Err(SwapError::AsyncTransferUnavailable {
+                layer: layer_idx,
+                source: anyhow::anyhow!(
+                    "pool path: cpu tensor for {subname} has null host pointer"
+                ),
+            });
+        }
+        let len = cpu.size();
+        let evt = backend
+            .enqueue_write_into_async(dst, src_ptr, len)
+            .map_err(|e| SwapError::AsyncTransferUnavailable {
+                layer: layer_idx,
+                source: e,
+            })?;
+        last_event = evt;
+        Ok(())
+    };
+
+    write_into(&pool_entry.wq, "attn_q.weight", &old.wq)?;
+    write_into(&pool_entry.wk, "attn_k.weight", &old.wk)?;
+    write_into(&pool_entry.wv, "attn_v.weight", &old.wv)?;
+    write_into(&pool_entry.wo, "attn_output.weight", &old.wo)?;
+    write_into(&pool_entry.w_gate, "ffn_gate.weight", &old.w_gate)?;
+    write_into(&pool_entry.w_up, "ffn_up.weight", &old.w_up)?;
+    write_into(&pool_entry.w_down, "ffn_down.weight", &old.w_down)?;
+
+    let attention_norm = if secondary
+        .layer_tensor(layer_idx, "attn_norm.weight")
+        .is_some()
+    {
+        write_into(
+            &pool_entry.attention_norm,
+            "attn_norm.weight",
+            &old.attention_norm,
+        )?;
+        pool_entry.attention_norm.clone()
+    } else {
+        old.attention_norm.clone()
+    };
+    let ffn_norm = if secondary.layer_tensor(layer_idx, "ffn_norm.weight").is_some() {
+        write_into(&pool_entry.ffn_norm, "ffn_norm.weight", &old.ffn_norm)?;
+        pool_entry.ffn_norm.clone()
+    } else {
+        old.ffn_norm.clone()
+    };
+
+    Ok((
+        TransformerLayer {
+            wq: pool_entry.wq,
+            wk: pool_entry.wk,
+            wv: pool_entry.wv,
+            wo: pool_entry.wo,
+            w_gate: pool_entry.w_gate,
+            w_up: pool_entry.w_up,
+            w_down: pool_entry.w_down,
             attention_norm,
             ffn_norm,
             qkv_bias: old.qkv_bias.clone(),

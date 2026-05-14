@@ -14,7 +14,7 @@ use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
-use llm_rs2::core::rss_trace::{dump_smaps, rss_trace};
+use llm_rs2::core::rss_trace::{dump_smaps, io_trace, read_bytes_now, rss_trace};
 use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
@@ -202,7 +202,13 @@ struct Args {
     #[arg(short, long, default_value_t = 20)]
     num_tokens: usize,
 
-    /// Backend to use: "cpu", "opencl", or "cuda" (build with --features cuda)
+    /// Backend to use: "cpu", "opencl", "qnn_oppkg", or "cuda" (build with --features cuda).
+    /// Default: Android target → "qnn_oppkg" (Adreno production path), else → "cpu".
+    #[cfg(target_os = "android")]
+    #[arg(short, long, default_value = "qnn_oppkg")]
+    backend: String,
+
+    #[cfg(not(target_os = "android"))]
     #[arg(short, long, default_value = "cpu")]
     backend: String,
 
@@ -1216,6 +1222,7 @@ fn main() -> anyhow::Result<()> {
     llm_rs2::profile::quality_metrics::install_atexit_once();
     // T0: process start, before CLI parsing or any allocation.
     rss_trace("start");
+    io_trace("start");
 
     #[allow(unused_mut)]
     let mut args = Args::parse();
@@ -1713,18 +1720,25 @@ fn main() -> anyhow::Result<()> {
         "mean_pool" => (llm_rs2::core::qcf::ImportanceFormula::MeanPool, false),
         "shortgpt_bi" => (llm_rs2::core::qcf::ImportanceFormula::ShortGptBi, false),
         "dpllm_proxy" => (llm_rs2::core::qcf::ImportanceFormula::DpllmProxy, false),
+        "dpllm_multi" => (llm_rs2::core::qcf::ImportanceFormula::DpllmMulti, false),
+        "dpllm_abs" => (llm_rs2::core::qcf::ImportanceFormula::DpllmAbs, false),
+        "dpllm_qcf" => (llm_rs2::core::qcf::ImportanceFormula::DpllmQcf, false),
+        "direct_attn" => (llm_rs2::core::qcf::ImportanceFormula::DirectAttn, false),
         "compare" => (llm_rs2::core::qcf::ImportanceFormula::MeanPool, true),
         other => anyhow::bail!(
-            "--importance-formula: unknown value '{}'. Valid: mean_pool, shortgpt_bi, dpllm_proxy, compare",
+            "--importance-formula: unknown value '{}'. Valid: mean_pool, shortgpt_bi, dpllm_proxy, dpllm_multi, dpllm_abs, dpllm_qcf, direct_attn, compare",
             other
         ),
     };
 
     // Parse --swap-only-layers (§4 ground-truth study). CSV of layer indices.
+    // Order is preserved (trajectory mode swaps in the listed order); duplicates
+    // are dropped while keeping the first occurrence.
     let swap_only_layers: Option<Vec<usize>> = match args.swap_only_layers.as_deref() {
         None | Some("") => None,
         Some(csv) => {
             let mut v = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for tok in csv.split(',') {
                 let t = tok.trim();
                 if t.is_empty() {
@@ -1733,10 +1747,10 @@ fn main() -> anyhow::Result<()> {
                 let idx: usize = t.parse().map_err(|_| {
                     anyhow::anyhow!("--swap-only-layers: '{}' is not a non-negative integer", t)
                 })?;
-                v.push(idx);
+                if seen.insert(idx) {
+                    v.push(idx);
+                }
             }
-            v.sort_unstable();
-            v.dedup();
             Some(v)
         }
     };
@@ -1761,6 +1775,7 @@ fn main() -> anyhow::Result<()> {
     };
     // T1: model weights loaded into memory (MmapBuffer + GPU copy if applicable).
     rss_trace("model_loaded");
+    io_trace("model_loaded");
     // LLMRS_DUMP_SMAPS_T1: dump /proc/self/smaps at T1 for VMA analysis.
     // Tester pulls this file to analyse kgsl/ion/dmabuf VMA distribution.
     if std::env::var("LLMRS_DUMP_SMAPS_T1").is_ok() {
@@ -1805,12 +1820,14 @@ fn main() -> anyhow::Result<()> {
     // Default OFF to protect memory-constrained environments.
     if args.eager_prefault_secondary {
         if let Some(ref secondary) = model.secondary_mmap {
+            io_trace("before_prefault");
             let t0 = std::time::Instant::now();
             secondary.prefault();
             eprintln!(
                 "[Eager-Prefault] secondary weights prefaulted in {:.1}ms",
                 t0.elapsed().as_secs_f64() * 1e3
             );
+            io_trace("after_prefault");
         } else {
             eprintln!("[Eager-Prefault] no secondary configured, skipping");
         }
@@ -1888,9 +1905,7 @@ fn main() -> anyhow::Result<()> {
     // the old behaviour with `--quantize-lm-head q4_0`.
     let qlm = {
         let raw = args.quantize_lm_head.to_ascii_lowercase();
-        if args.ppl.is_some()
-            && args.secondary_gguf.is_some()
-            && (raw == "auto" || raw.is_empty())
+        if args.ppl.is_some() && args.secondary_gguf.is_some() && (raw == "auto" || raw.is_empty())
         {
             eprintln!(
                 "[Notice] PPL mode + --secondary-gguf: auto-disabling lm_head Q4_0 \
@@ -3155,6 +3170,59 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // LISWAP-8 Phase B: pre-allocated layer object pool. Activated via
+    // `LLMRS_SWAP_LAYER_POOL=1` env. Cuda-embedded only. Pool depth via
+    // `LLMRS_SWAP_LAYER_POOL_DEPTH` (default 2). Hypothesis: removing
+    // `cuMemAlloc` from the per-layer dispatch path eliminates the CUDA
+    // driver context lock contention observed in the K-sweep
+    // active-window forward regression.
+    #[cfg(feature = "cuda-embedded")]
+    let layer_swap_pool: Option<
+        Arc<llm_rs2::models::weights::layer_object_pool::LayerObjectPool>,
+    > = {
+        let enabled = std::env::var("LLMRS_SWAP_LAYER_POOL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !enabled || model.secondary_mmap.is_none() {
+            None
+        } else if let Some(gpu_be) = gpu_backend_arc.as_ref() {
+            let target_depth: usize = std::env::var("LLMRS_SWAP_LAYER_POOL_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
+            let sample = model.layers[0].load_weights();
+            let spec =
+                llm_rs2::models::weights::layer_object_pool::LayerSpec::from_sample(
+                    &sample,
+                    DType::Q4_0,
+                )
+                .with_zero_copy(
+                    std::env::var("LLMRS_SWAP_LAYER_POOL_ZERO_COPY")
+                        .map(|v| v == "1")
+                        .unwrap_or(false),
+                );
+            let zc = spec.zero_copy;
+            match llm_rs2::models::weights::layer_object_pool::LayerObjectPool::new(
+                Arc::clone(gpu_be),
+                spec,
+                target_depth,
+            ) {
+                Ok(pool) => {
+                    eprintln!(
+                        "[LISWAP-8] layer_pool active: target_depth={target_depth} zero_copy={zc}"
+                    );
+                    Some(pool)
+                }
+                Err(e) => {
+                    eprintln!("[LISWAP-8] layer_pool init failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // LISWAP Phase 3 — pending mid-decode trigger payload.
     // When `--swap-delay-tokens N > 0` AND `--force-swap-ratio` is set, the
     // trigger logic is deferred from prefill end to decode token N. We capture
@@ -3301,6 +3369,8 @@ fn main() -> anyhow::Result<()> {
                     None,
                     #[cfg(feature = "opencl")]
                     host_ptr_swap_pool.clone(),
+                    #[cfg(feature = "cuda-embedded")]
+                    None,
                 ) {
                     Ok(report) => {
                         eprintln!(
@@ -3356,8 +3426,10 @@ fn main() -> anyhow::Result<()> {
         // end — only the actual swap dispatch is deferred. This preserves the
         // delay=0 baseline wall (~405 ms LISWAP-6 alias) and ensures rpcmem
         // pages are warm regardless of when the trigger fires.
+        let skip_eager_prefault = std::env::var("LLMRS_SKIP_EAGER_PREFAULT").is_ok();
         if !target_layers.is_empty()
             && let Some(secondary) = model.secondary_mmap.as_ref()
+            && !skip_eager_prefault
         {
             let t_pre = std::time::Instant::now();
             secondary.prefault_layers(&target_layers);
@@ -3502,6 +3574,11 @@ fn main() -> anyhow::Result<()> {
         let mut eval_ll_qcf_decision: Option<llm_rs2::models::weights::decider::SwapDecision> =
             None;
         let mut eval_ll_qcf_dpllm_epsilon: Option<Vec<f32>> = None;
+        let mut eval_ll_qcf_dpllm_epsilon_multi: Option<Vec<f32>> = None;
+        let mut eval_ll_qcf_dpllm_epsilon_abs: Option<Vec<f32>> = None;
+        let mut eval_ll_qcf_dpllm_epsilon_qcf: Option<Vec<f32>> = None;
+        let mut eval_ll_qcf_direct_attn_f4: Option<Vec<f32>> = None;
+        let mut eval_ll_qcf_direct_attn_f5: Option<Vec<f32>> = None;
 
         if args.qcf_dump.is_some()
             && let Some(force_ratio) = args.force_swap_ratio
@@ -3537,6 +3614,11 @@ fn main() -> anyhow::Result<()> {
                 eval_ll_qcf_decision = result.decision;
                 eval_ll_qcf_importance = Some(result.importance);
                 eval_ll_qcf_dpllm_epsilon = result.dpllm_epsilon;
+                eval_ll_qcf_dpllm_epsilon_multi = result.dpllm_epsilon_multi;
+                eval_ll_qcf_dpllm_epsilon_abs = result.dpllm_epsilon_abs;
+                eval_ll_qcf_dpllm_epsilon_qcf = result.dpllm_epsilon_qcf;
+                eval_ll_qcf_direct_attn_f4 = result.direct_attn_f4;
+                eval_ll_qcf_direct_attn_f5 = result.direct_attn_f5;
             }
         }
 
@@ -3641,8 +3723,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             1
         };
-        let mut trajectory_outputs: Vec<llm_rs2::eval::EvalOutput> =
-            Vec::with_capacity(n_steps);
+        let mut trajectory_outputs: Vec<llm_rs2::eval::EvalOutput> = Vec::with_capacity(n_steps);
 
         if trajectory_mode {
             eprintln!(
@@ -3685,6 +3766,8 @@ fn main() -> anyhow::Result<()> {
                     &cpu_backend_arc,
                     None,
                     #[cfg(feature = "opencl")]
+                    None,
+                    #[cfg(feature = "cuda-embedded")]
                     None,
                 )
                 .map_err(|e| {
@@ -3768,9 +3851,7 @@ fn main() -> anyhow::Result<()> {
                 secondary_dtype: "Q4_0",
                 num_layers: model.layers.len(),
                 force_swap_ratio: args.force_swap_ratio,
-                swap_algorithm: args
-                    .force_swap_ratio
-                    .map(|_| swap_algorithm.short_name()),
+                swap_algorithm: args.force_swap_ratio.map(|_| swap_algorithm.short_name()),
                 swap_set,
                 qcf_swap_predicted: qcf_predicted,
                 fallback_used,
@@ -3787,6 +3868,11 @@ fn main() -> anyhow::Result<()> {
                 eval_ll_output: eval_ll_output_ref,
                 trajectory: trajectory_ref,
                 dpllm_epsilon: eval_ll_qcf_dpllm_epsilon.as_deref(),
+                dpllm_epsilon_multi: eval_ll_qcf_dpllm_epsilon_multi.as_deref(),
+                dpllm_epsilon_abs: eval_ll_qcf_dpllm_epsilon_abs.as_deref(),
+                dpllm_epsilon_qcf: eval_ll_qcf_dpllm_epsilon_qcf.as_deref(),
+                direct_attn_f4: eval_ll_qcf_direct_attn_f4.as_deref(),
+                direct_attn_f5: eval_ll_qcf_direct_attn_f5.as_deref(),
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
@@ -4025,9 +4111,7 @@ fn main() -> anyhow::Result<()> {
                 secondary_dtype: "Q4_0",
                 num_layers: model.layers.len(),
                 force_swap_ratio: args.force_swap_ratio,
-                swap_algorithm: args
-                    .force_swap_ratio
-                    .map(|_| swap_algorithm.short_name()),
+                swap_algorithm: args.force_swap_ratio.map(|_| swap_algorithm.short_name()),
                 swap_set,
                 qcf_swap_predicted: qcf_predicted,
                 fallback_used,
@@ -4044,6 +4128,11 @@ fn main() -> anyhow::Result<()> {
                 eval_ll_output: None,
                 trajectory: None,
                 dpllm_epsilon: None,
+                dpllm_epsilon_multi: None,
+                dpllm_epsilon_abs: None,
+                dpllm_epsilon_qcf: None,
+                direct_attn_f4: None,
+                direct_attn_f5: None,
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
@@ -5571,6 +5660,7 @@ fn main() -> anyhow::Result<()> {
         start_pos += process_len;
         // T2: first forward pass (prefill) complete, KV cache filled.
         rss_trace("prefill_done");
+        io_trace("prefill_done");
     }
 
     // Execute deferred SwitchHw (from prefill checkpoint).
@@ -6363,6 +6453,7 @@ fn main() -> anyhow::Result<()> {
                 };
                 if !chunk.is_empty() {
                     let t_swap = std::time::Instant::now();
+                    let io_before = read_bytes_now();
                     match run_layer_swap(
                         &model,
                         &chunk,
@@ -6371,15 +6462,19 @@ fn main() -> anyhow::Result<()> {
                         async_swap_dispatcher.as_ref(),
                         #[cfg(feature = "opencl")]
                         host_ptr_swap_pool.clone(),
+                        #[cfg(feature = "cuda-embedded")]
+                        layer_swap_pool.clone(),
                     ) {
                         Ok(report) => {
+                            let io_after = read_bytes_now();
                             eprintln!(
-                                "[IncrementalSwap] tick={} chunk={:?} swapped={} remaining={} latency={:.1}ms",
+                                "[IncrementalSwap] tick={} chunk={:?} swapped={} remaining={} latency={:.1}ms read_bytes_delta={}",
                                 decode_token_index,
                                 &chunk,
                                 report.swapped.len(),
                                 inc_plan.remaining_count(),
                                 t_swap.elapsed().as_secs_f64() * 1000.0,
+                                io_after.saturating_sub(io_before),
                             );
                             if let Some(ref stages) = report.stage_breakdown {
                                 eprintln!("[IncrementalSwap] stages: {}", stages.to_log_line());
@@ -7829,8 +7924,10 @@ fn main() -> anyhow::Result<()> {
             // T3 / T4: RSS snapshot after first and 16th decode tokens.
             if decode_token_index == 0 {
                 rss_trace("decode_1");
+                io_trace("decode_1");
             } else if decode_token_index == 15 {
                 rss_trace("decode_16");
+                io_trace("decode_16");
             }
 
             if next_token_id == eos_id && !args.ignore_eos && std::env::var("IGNORE_EOS").is_err() {
@@ -7944,6 +8041,7 @@ fn main() -> anyhow::Result<()> {
         ocl_be.dump_cl_mem_diagnostics(" stage=after_generate");
     }
     println!("TTFT: {:.2} ms", _ttft_ms);
+    io_trace("ttft");
     if !forward_ms_values.is_empty() {
         let avg_forward: f64 =
             forward_ms_values.iter().sum::<f64>() / forward_ms_values.len() as f64;
@@ -8010,9 +8108,7 @@ fn main() -> anyhow::Result<()> {
             secondary_dtype: "Q4_0",
             num_layers: model.layers.len(),
             force_swap_ratio: args.force_swap_ratio,
-            swap_algorithm: args
-                .force_swap_ratio
-                .map(|_| swap_algorithm.short_name()),
+            swap_algorithm: args.force_swap_ratio.map(|_| swap_algorithm.short_name()),
             swap_set,
             qcf_swap_predicted: qcf_predicted,
             fallback_used,
@@ -8029,6 +8125,11 @@ fn main() -> anyhow::Result<()> {
             eval_ll_output: None,
             trajectory: None,
             dpllm_epsilon: None,
+            dpllm_epsilon_multi: None,
+            dpllm_epsilon_abs: None,
+            dpllm_epsilon_qcf: None,
+            direct_attn_f4: None,
+            direct_attn_f5: None,
         };
 
         dump_qcf_swap_json(dump_path, &ctx)?;
@@ -8037,6 +8138,7 @@ fn main() -> anyhow::Result<()> {
 
     // T5: normal exit — all allocations still live (model, KV caches, workspaces).
     rss_trace("exit");
+    io_trace("exit");
     Ok(())
 }
 
@@ -8355,6 +8457,9 @@ fn run_layer_swap(
     #[cfg(feature = "opencl")] host_ptr_pool: Option<
         Arc<llm_rs2::backend::opencl::host_ptr_pool::HostPtrPool>,
     >,
+    #[cfg(feature = "cuda-embedded")] layer_pool: Option<
+        Arc<llm_rs2::models::weights::layer_object_pool::LayerObjectPool>,
+    >,
 ) -> Result<llm_rs2::models::weights::SwapReport, llm_rs2::models::weights::SwapError> {
     let swap_memory = Galloc::new();
     let swap_backend: Arc<dyn Backend> =
@@ -8373,6 +8478,12 @@ fn run_layer_swap(
     #[cfg(feature = "opencl")]
     let executor = match host_ptr_pool {
         Some(pool) => executor.with_host_ptr_pool(pool),
+        None => executor,
+    };
+    // LISWAP-8 Phase B: attach pre-allocated layer object pool when set.
+    #[cfg(feature = "cuda-embedded")]
+    let executor = match layer_pool {
+        Some(pool) => executor.with_layer_pool(pool),
         None => executor,
     };
     executor.execute_on_slots(
@@ -8420,9 +8531,22 @@ fn remap_weights_for_cpu_after_swap(
 struct QcfWarmupResult {
     importance: llm_rs2::core::qcf::ImportanceTable,
     decision: Option<llm_rs2::models::weights::SwapDecision>,
-    /// Per-layer DP-LLM proxy ε. `Some` only when 3-way comparison mode is
-    /// active (`--importance-formula compare`). Same length as the layer count.
+    /// Per-layer DP-LLM proxy ε (single-tensor relative `attn_output`).
+    /// `Some` only in compare mode.
     dpllm_epsilon: Option<Vec<f32>>,
+    /// §4 candidate A: per-layer DP-LLM ε summed across 6 attn+MLP tensors.
+    dpllm_epsilon_multi: Option<Vec<f32>>,
+    /// §4 candidate D: per-layer DP-LLM ε without the `‖W·x‖` normalisation
+    /// (absolute L2 of the activation difference).
+    dpllm_epsilon_abs: Option<Vec<f32>>,
+    /// §4 candidate E: QCF-style multiplicative composition `ε_v × ε_o`.
+    dpllm_epsilon_qcf: Option<Vec<f32>>,
+    /// §4.2 F4: cascade-aware single output perturbation.
+    /// `‖(W_o^F16 − W_o^Q4) · V_out^F16‖_F / ‖W_o^F16 · V_out^F16‖_F`.
+    direct_attn_f4: Option<Vec<f32>>,
+    /// §4.2 F5: direct attention output relative L2 perturbation.
+    /// `‖O^F16 − O^Q4‖_F / ‖O^F16‖_F`.
+    direct_attn_f5: Option<Vec<f32>>,
 }
 
 /// QCF-dump warmup workflow shared by `--ppl/generation` and `--eval-ll` modes.
@@ -8466,7 +8590,8 @@ fn run_qcf_warmup_workflow(
     );
 
     // ── Warmup prefill with ImportanceCollector ───────────────────────────────
-    let mut collector = ImportanceCollector::new_with_formula(importance_formula, importance_three_way);
+    let mut collector =
+        ImportanceCollector::new_with_formula(importance_formula, importance_three_way);
     {
         let warmup_buf = Galloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
         unsafe {
@@ -8511,25 +8636,115 @@ fn run_qcf_warmup_workflow(
         backend.synchronize()?;
     }
 
-    // ── Build ImportanceTable (+ optional DP-LLM ε) + reset KV cache ─────────
-    let (imp_table, dpllm_epsilon) = if importance_three_way {
-        let (table, x_means) = collector.build_with_xmeans();
-        let eps = model.secondary_mmap.as_ref().map(|sec| {
-            llm_rs2::models::weights::noise_table::compute_input_aware_epsilon(
+    // ── Build ImportanceTable (+ optional DP-LLM ε variants) + reset KV cache ────
+    let direct_attn_primary = matches!(
+        importance_formula,
+        llm_rs2::core::qcf::ImportanceFormula::DirectAttn
+    );
+    let cache_raw = importance_three_way || direct_attn_primary;
+    let (
+        imp_table,
+        dpllm_epsilon,
+        dpllm_epsilon_multi,
+        dpllm_epsilon_abs,
+        dpllm_epsilon_qcf,
+        direct_attn_f4,
+        direct_attn_f5,
+    ) = if cache_raw {
+        let (table, x_means, raws) = collector.build_with_raws();
+        let sec_opt = model.secondary_mmap.as_ref();
+        let eps_single = if importance_three_way {
+            sec_opt.map(|sec| {
+                llm_rs2::models::weights::noise_table::compute_input_aware_epsilon(
+                    &model.layers,
+                    sec,
+                    &x_means,
+                )
+            })
+        } else {
+            None
+        };
+        let eps_multi = if importance_three_way {
+            sec_opt.map(|sec| {
+                llm_rs2::models::weights::noise_table::compute_input_aware_epsilon_multitensor(
+                    &model.layers,
+                    sec,
+                    &x_means,
+                )
+            })
+        } else {
+            None
+        };
+        let eps_abs = if importance_three_way {
+            sec_opt.map(|sec| {
+                llm_rs2::models::weights::noise_table::compute_input_aware_epsilon_absolute(
+                    &model.layers,
+                    sec,
+                    &x_means,
+                )
+            })
+        } else {
+            None
+        };
+        let eps_qcf = if importance_three_way {
+            sec_opt.map(|sec| {
+                llm_rs2::models::weights::noise_table::compute_input_aware_epsilon_qcf(
+                    &model.layers,
+                    sec,
+                    &x_means,
+                )
+            })
+        } else {
+            None
+        };
+        // Cascade attention F4 + F5 (compute when raws are available, regardless
+        // of whether primary is DirectAttn or 3-way compare).
+        let (f4, f5) = if let Some(sec) = sec_opt {
+            let n_heads = model.config.num_attention_heads;
+            let n_kv_heads = model.config.num_key_value_heads;
+            let d_head = model.config.head_dim;
+            let pairs = llm_rs2::models::weights::noise_table::compute_cascade_attn_perturbation(
                 &model.layers,
                 sec,
-                &x_means,
-            )
-        });
-        (table, eps)
+                &raws,
+                n_heads,
+                n_kv_heads,
+                d_head,
+            );
+            let f4_vec: Vec<f32> = pairs.iter().map(|(a, _)| *a).collect();
+            let f5_vec: Vec<f32> = pairs.iter().map(|(_, b)| *b).collect();
+            (Some(f4_vec), Some(f5_vec))
+        } else {
+            (None, None)
+        };
+        (table, eps_single, eps_multi, eps_abs, eps_qcf, f4, f5)
     } else {
-        (collector.build(), None)
+        (collector.build(), None, None, None, None, None, None)
     };
     eprintln!(
-        "[QCF-dump]{} ImportanceTable built: {} entries (dpllm_epsilon={})",
+        "[QCF-dump]{} ImportanceTable built: {} entries (dpllm_epsilon={}, multi={}, abs={}, qcf={})",
         log_prefix,
         imp_table.len(),
-        if dpllm_epsilon.is_some() { "computed" } else { "skipped" },
+        if dpllm_epsilon.is_some() {
+            "computed"
+        } else {
+            "skipped"
+        },
+        if dpllm_epsilon_multi.is_some() {
+            "computed"
+        } else {
+            "skipped"
+        },
+        if dpllm_epsilon_abs.is_some() {
+            "computed"
+        } else {
+            "skipped"
+        },
+        if dpllm_epsilon_qcf.is_some() {
+            "computed"
+        } else {
+            "skipped"
+        },
     );
     for kv in kv_caches.iter_mut() {
         kv.current_pos = 0;
@@ -8559,7 +8774,11 @@ fn run_qcf_warmup_workflow(
         // `qcf_swap_estimate` is recomputed against this override so the dump
         // JSON reports the QCF prediction for the actually-swapped set.
         let decision = if let Some(only) = swap_only_layers {
-            let override_layers: Vec<usize> = only.iter().copied().filter(|i| *i < model.layers.len()).collect();
+            let override_layers: Vec<usize> = only
+                .iter()
+                .copied()
+                .filter(|i| *i < model.layers.len())
+                .collect();
             let qcf_override = llm_rs2::models::weights::compute_qcf_swap(
                 &override_layers,
                 model.quant_noise.as_ref(),
@@ -8587,6 +8806,11 @@ fn run_qcf_warmup_workflow(
                 importance: imp_table,
                 decision: Some(decision),
                 dpllm_epsilon,
+                dpllm_epsilon_multi,
+                dpllm_epsilon_abs,
+                dpllm_epsilon_qcf,
+                direct_attn_f4,
+                direct_attn_f5,
             });
         }
 
@@ -8605,6 +8829,8 @@ fn run_qcf_warmup_workflow(
                 // LISWAP-3: QCF dump path does not exercise the pool yet —
                 // Stage 3 prototype only wires --force-swap-ratio paths.
                 #[cfg(feature = "opencl")]
+                None,
+                #[cfg(feature = "cuda-embedded")]
                 None,
             )
             .map_err(|e| anyhow::anyhow!("[QCF-dump]{} swap failed: {}", log_prefix, e))?;
@@ -8629,6 +8855,11 @@ fn run_qcf_warmup_workflow(
         importance: imp_table,
         decision,
         dpllm_epsilon,
+        dpllm_epsilon_multi,
+        dpllm_epsilon_abs,
+        dpllm_epsilon_qcf,
+        direct_attn_f4,
+        direct_attn_f5,
     })
 }
 
@@ -10407,6 +10638,7 @@ fn run_offload(
 
     println!("\nDone.");
     println!("TTFT: {:.2} ms", ttft_ms);
+    io_trace("ttft");
     println!(
         "Avg forward: {:.2} ms, Avg TBT: {:.2} ms ({:.1} tok/s)",
         avg_forward_ms, avg_tbt, tok_per_s,
@@ -10497,8 +10729,8 @@ fn dump_layer_weights_to_dir(
     // byte-for-byte.
     let model_tensors: [(&str, &llm_rs2::core::tensor::Tensor); 3] = [
         ("embed_tokens", &model.embed_tokens),
-        ("norm",         &model.norm),
-        ("lm_head",      &model.lm_head),
+        ("norm", &model.norm),
+        ("lm_head", &model.lm_head),
     ];
     for (name, t) in model_tensors {
         let nbytes = t.buffer().size();
@@ -10522,8 +10754,7 @@ fn dump_layer_weights_to_dir(
                 // The lm_head can live on a CPU backend even when the main
                 // backend is GPU (`lm_head_on_cpu`) — fall back to CpuBackend
                 // for that case so we still get a dump file out.
-                let cpu_be: Arc<dyn Backend> =
-                    Arc::new(llm_rs2::backend::cpu::CpuBackend::new());
+                let cpu_be: Arc<dyn Backend> = Arc::new(llm_rs2::backend::cpu::CpuBackend::new());
                 match cpu_be.read_buffer(t, &mut bytes) {
                     Ok(()) => {
                         let fname = format!("model_{}_{:?}.bin", name, dt);
@@ -10544,7 +10775,11 @@ fn dump_layer_weights_to_dir(
             }
         }
     }
-    eprintln!("[Q4-DUMP] complete: {} layers + 3 model tensors dumped to {}", n, out_dir.display());
+    eprintln!(
+        "[Q4-DUMP] complete: {} layers + 3 model tensors dumped to {}",
+        n,
+        out_dir.display()
+    );
     Ok(())
 }
 
@@ -10831,6 +11066,8 @@ fn run_ppl(
                     &ppl_cpu_backend,
                     None,
                     #[cfg(feature = "opencl")]
+                    None,
+                    #[cfg(feature = "cuda-embedded")]
                     None,
                 ) {
                     Ok(report) => {

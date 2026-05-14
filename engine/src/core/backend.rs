@@ -560,6 +560,28 @@ pub trait Backend: Send + Sync {
         Ok((dst, GpuEvent::default()))
     }
 
+    /// LISWAP-8 Phase B: write host bytes into an *existing* tensor's
+    /// device buffer asynchronously on the transfer queue/stream.
+    ///
+    /// Unlike `enqueue_write_async`, this does NOT allocate a fresh device
+    /// buffer — it overwrites the bytes of `dst`'s existing buffer in place.
+    /// Enables a pre-allocated `LayerObjectPool`-backed swap path where
+    /// every swap reuses a pool entry's GPU buffers (no `cuMemAlloc` /
+    /// `cuMemFree` in the dispatch hot path → no CUDA driver context lock
+    /// contention against forward `cuLaunchKernel` calls).
+    ///
+    /// Default: returns an error so backends opt in explicitly. CUDA
+    /// embedded backend overrides this with a `CudaDeviceBuffer` downcast
+    /// + `copy_from_host_async` on the existing device pointer.
+    fn enqueue_write_into_async(
+        &self,
+        _dst: &Tensor,
+        _src: *const u8,
+        _len: usize,
+    ) -> Result<GpuEvent> {
+        anyhow::bail!("enqueue_write_into_async not implemented for this backend")
+    }
+
     /// Block until the event returned by `enqueue_write_async` has
     /// completed, *without* blocking the compute queue/stream.
     ///

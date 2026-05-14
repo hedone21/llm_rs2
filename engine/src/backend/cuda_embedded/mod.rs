@@ -2922,6 +2922,100 @@ impl Backend for CudaBackend {
         ))
     }
 
+    /// LISWAP-8 Phase B: write host bytes into the *existing*
+    /// `CudaDeviceBuffer` of `dst` asynchronously on the transfer stream.
+    ///
+    /// Downcasts the dst buffer to `CudaDeviceBuffer` and reuses its
+    /// device pointer — no `cuMemAlloc` happens here. Caller must keep
+    /// `src..src+len` alive until the returned event fires.
+    fn enqueue_write_into_async(
+        &self,
+        dst: &crate::core::tensor::Tensor,
+        src: *const u8,
+        len: usize,
+    ) -> Result<crate::core::backend::GpuEvent> {
+        if self.is_graph_capturing() {
+            anyhow::bail!(
+                "enqueue_write_into_async called during CUDA Graph capture"
+            );
+        }
+        if src.is_null() {
+            anyhow::bail!(
+                "enqueue_write_into_async: src is null (len={len}, dtype={:?})",
+                dst.dtype()
+            );
+        }
+
+        // LISWAP-8 Phase B-2 UMA zero-copy fast path: when the destination
+        // buffer is host-accessible (CudaHostBuffer = pinned + DEVICEMAP),
+        // do a plain CPU memcpy. On Jetson UMA the host pointer and device
+        // pointer alias the same physical DRAM, so coherence is automatic
+        // — no cuMemcpyHtoDAsync, no driver lock contention, no DMA queue
+        // pressure. Returns a dummy event because there is no GPU work to
+        // wait on.
+        let dst_mut_ptr = dst.buffer().as_mut_ptr();
+        if !dst_mut_ptr.is_null() {
+            if len > dst.size() {
+                anyhow::bail!(
+                    "enqueue_write_into_async (zero-copy): len={len} exceeds dst size {}",
+                    dst.size()
+                );
+            }
+            // SAFETY: dst is exclusively held by the swap closure for this
+            // layer (pool entry that has not yet been installed into a
+            // slot). src is mmap-backed and stays alive for the duration
+            // of the copy. Both pointers are valid for `len` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src, dst_mut_ptr, len);
+            }
+            return Ok(crate::core::backend::GpuEvent::default());
+        }
+
+        let buf = dst.buffer();
+        let cuda_buf = buf
+            .as_any()
+            .downcast_ref::<crate::buffer::cuda_buffer::CudaDeviceBuffer>()
+            .ok_or_else(|| {
+                anyhow!(
+                    "enqueue_write_into_async requires CudaDeviceBuffer dst (got dtype={:?}, size={})",
+                    dst.dtype(),
+                    dst.size()
+                )
+            })?;
+        if len > cuda_buf.size() {
+            anyhow::bail!(
+                "enqueue_write_into_async: len={len} exceeds dst buffer size {}",
+                cuda_buf.size()
+            );
+        }
+
+        let Some(transfer_stream) = self.transfer_stream_or_init() else {
+            // Sync fallback: blocking H2D into the existing buffer
+            cuda_buf
+                .copy_from_host(src, len)
+                .with_context(|| format!("sync H2D into pool buffer ({len} bytes)"))?;
+            return Ok(crate::core::backend::GpuEvent::default());
+        };
+
+        cuda_buf
+            .copy_from_host_async(src, len, transfer_stream.cu_stream() as _)
+            .with_context(|| format!("async H2D into pool buffer ({len} bytes)"))?;
+
+        let event = self
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow!("CUDA event create failed: {e}"))?;
+        event
+            .record(&transfer_stream)
+            .map_err(|e| anyhow!("cuEventRecord failed: {e}"))?;
+
+        Ok(crate::core::backend::GpuEvent {
+            #[cfg(feature = "opencl")]
+            inner_cl: None,
+            inner_cu: Some(event),
+        })
+    }
+
     /// Block the host thread on a `CudaEvent` recorded by
     /// `enqueue_write_async`. Falls through to a default sync barrier
     /// when no CUDA event is attached (host-only fallback path).
