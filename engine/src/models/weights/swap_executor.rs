@@ -470,8 +470,20 @@ impl<'a> SwapExecutor<'a> {
         // broad `prefault()` so only the weight pages for layers that will
         // actually be swapped are touched. This avoids reading ~40 ms worth
         // of pages for layers outside the swap batch at ratio < 1.0.
+        //
+        // LISWAP-6 / 2026-05-14: skip the batch prefault for the rpcmem alias
+        // path. The alias path's first-touch cost is `ensure_layer_loaded`
+        // (rpcmem alloc + memcpy from mmap), which is triggered lazily by
+        // `try_alias_materialise`'s fallback at dispatch time. Letting the
+        // async dispatcher (LISWAP-4 IntraForward) drive per-layer
+        // `ensure_layer_loaded` on its worker thread lets first-touch overlap
+        // with forward kernels — eliminating the 800+ ms batch stage we saw
+        // collapse all hide opportunity.
+        let alias_path_prefault = matches!(secondary.as_ref(), SecondaryMmap::Rpcmem(_));
         let t_pre0 = Instant::now();
-        secondary.prefault_layers(target_layers);
+        if !alias_path_prefault {
+            secondary.prefault_layers(target_layers);
+        }
         stages.prefault_ms = t_pre0.elapsed().as_secs_f64() * 1e3;
 
         // Determine whether to use the async path (LISWAP-2 prototype).
@@ -510,6 +522,95 @@ impl<'a> SwapExecutor<'a> {
         let sub_batch_pause_diag = std::env::var("LLMRS_SUB_BATCH_PAUSE_DIAG")
             .map(|v| v == "1")
             .unwrap_or(false);
+        // LISWAP-7 PoC: disable sub-batch wait so the whole chunk enqueues
+        // immediately. Releases drain in the background dispatcher/release
+        // worker — pending queue depth may grow beyond 1, so caller takes
+        // responsibility for memory headroom.
+        let sub_batch_no_wait = std::env::var("LLMRS_SUB_BATCH_NO_WAIT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        // LISWAP-7 Path 3 PoC: build all chunk layers in parallel via rayon
+        // before the dispatch loop. mmap_permute still runs on the main-thread
+        // pool but layers are processed concurrently, collapsing the sequential
+        // accumulation seen in `stages.mmap_permute_ms` (1865ms @ K=32 → ~250ms
+        // on 8-core Jetson estimate). NOT true forward/swap overlap — the main
+        // thread still blocks until the parallel build completes — but isolates
+        // the "CPU work" cost so we can quantify the remaining gap before going
+        // to a fully background-thread design (length 1).
+        let par_build = std::env::var("LLMRS_SWAP_PAR_BUILD")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        // LISWAP-8 Phase A: single-thread background fetch. Main thread
+        // submits a `ChunkDispatchJob` closure to the existing async swap
+        // dispatcher (single worker `llmrs-async-swap`). The worker runs
+        // build → wait_event → arc_swap → release-chain entirely off the
+        // critical path. mmap_permute + cuMemAlloc + cuMemcpyAsync (which
+        // currently block the main thread inside `build_layer_from_mmap_async`)
+        // are all moved to the worker — hiding the per-layer 50 ms behind
+        // forward (par_seq 2026-05-14 confirmed single-thread dispatcher
+        // background work has zero impact on forward at pending=31).
+        //
+        // Mutually exclusive with `par_build` (par_iter multi-thread
+        // pre-build) — `par_build` takes precedence if both are set.
+        let bg_fetch = std::env::var("LLMRS_SWAP_BG_FETCH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        // Pre-build cache (par_build only): layer_idx -> Result<(layer, evt)>.
+        // Populated outside the loop so the loop only submits + accumulates
+        // stats.
+        let mut built_cache: std::collections::HashMap<
+            usize,
+            Result<(TransformerLayer, GpuEvent), SwapError>,
+        > = std::collections::HashMap::new();
+        if use_async && par_build {
+            use rayon::prelude::*;
+            // LISWAP-7 Path 3 PoC v2: when LLMRS_SWAP_SEQ_BUILD=1, route the
+            // prebuild through sequential `.iter()` instead of `par_iter()`.
+            // Used to disentangle multi-thread side-effects (rayon worker
+            // activation / kernel mmap_sem contention) from the prebuild
+            // cache reuse path itself. Single-threaded prebuild should match
+            // baseline forward (67 ms) iff the multi-thread access is what
+            // perturbs forward; otherwise the prebuild restructure alone
+            // (cache lookup vs inline build) is the cause.
+            let par_seq_mode = std::env::var("LLMRS_SWAP_SEQ_BUILD")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let t_par0 = Instant::now();
+            let pairs: Vec<(usize, Result<(TransformerLayer, GpuEvent), SwapError>)> =
+                if par_seq_mode {
+                    target_layers
+                        .iter()
+                        .filter_map(|&idx| {
+                            let slot = layers.get(idx)?;
+                            if slot.current_dtype() == self.target_dtype {
+                                return None;
+                            }
+                            if slot.secondary_mmap_handle().is_none() {
+                                return None;
+                            }
+                            Some((idx, self.build_layer_from_mmap_async(secondary, slot, idx)))
+                        })
+                        .collect()
+                } else {
+                    target_layers
+                        .par_iter()
+                        .filter_map(|&idx| {
+                            let slot = layers.get(idx)?;
+                            if slot.current_dtype() == self.target_dtype {
+                                return None;
+                            }
+                            if slot.secondary_mmap_handle().is_none() {
+                                return None;
+                            }
+                            Some((idx, self.build_layer_from_mmap_async(secondary, slot, idx)))
+                        })
+                        .collect()
+                };
+            stages.mmap_permute_ms += t_par0.elapsed().as_secs_f64() * 1e3;
+            built_cache = pairs.into_iter().collect();
+        }
 
         let mut max_release_pending: usize = 0;
         let mut max_dispatcher_pending: usize = 0;
@@ -521,6 +622,7 @@ impl<'a> SwapExecutor<'a> {
             // spike, and the loop always finishes the full chunk → no
             // silent layer drops in the plan.
             if i > 0
+                && !sub_batch_no_wait
                 && let Some(worker) = &self.release_worker
             {
                 let wait_start = if sub_batch_pause_diag {
@@ -579,7 +681,91 @@ impl<'a> SwapExecutor<'a> {
 
             let from_dtype = slot.current_dtype();
 
-            if use_async {
+            if use_async && bg_fetch && !par_build {
+                // ── LISWAP-8 Phase A: full background fetch ──────────────────
+                //
+                // Hand off the *entire* per-layer pipeline (build →
+                // wait_event → arc_swap → release-chain) to the dispatcher
+                // worker thread via `submit_dispatch_chunk`. Main thread
+                // does only a channel push (~µs) and returns to the next
+                // layer / forward immediately.
+                //
+                // Compared to the LISWAP-2 async path below, this also
+                // moves `build_layer_from_mmap_async` (mmap_permute +
+                // cuMemAlloc + cuMemcpyAsync) to the worker — the dominant
+                // remaining cost (~50 ms / layer) that the LISWAP-2 path
+                // still runs on main.
+                //
+                // The closure captures owned Arc clones + `ModelConfig`
+                // (Clone) so no `&'a` borrow of `SwapExecutor` leaks into
+                // the `Send + 'static` boundary.
+                let dispatcher = async_dispatcher.expect("use_async => dispatcher Some");
+
+                let secondary_arc = Arc::clone(secondary);
+                let slot_arc = Arc::clone(slot);
+                let backend_arc = Arc::clone(&self.backend);
+                let config_owned = self.config.clone();
+                let target_dtype = self.target_dtype;
+                let release_worker_clone = self.release_worker.clone();
+
+                let job = crate::models::weights::async_swap::ChunkDispatchJob {
+                    run: Box::new(move || {
+                        let result = build_layer_async_standalone(
+                            &secondary_arc,
+                            &slot_arc,
+                            layer_idx,
+                            &backend_arc,
+                            &config_owned,
+                        );
+                        let (new_layer, write_event) = match result {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                eprintln!(
+                                    "[BgFetch] layer {layer_idx} build failed: {e}; skipping"
+                                );
+                                return;
+                            }
+                        };
+
+                        if !write_event.is_dummy()
+                            && let Err(e) = backend_arc.wait_event_blocking(&write_event)
+                        {
+                            eprintln!(
+                                "[BgFetch] layer {layer_idx} wait_event_blocking failed: {e}; skipping"
+                            );
+                            return;
+                        }
+
+                        let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+                        let old = slot_arc.swap_weights(new_arc, target_dtype);
+
+                        if let Some(rw) = &release_worker_clone
+                            && let Ok(layer) = Arc::try_unwrap(old)
+                        {
+                            rw.enqueue_release(layer);
+                        }
+                    }),
+                };
+
+                let t_submit = Instant::now();
+                if let Err(e) = dispatcher.submit_dispatch_chunk(job) {
+                    eprintln!(
+                        "[BgFetch] layer {layer_idx}: submit_dispatch_chunk failed: {e}; skipping"
+                    );
+                    report.skipped.push(layer_idx);
+                    continue;
+                }
+                // arc_swap stage timing here is just the submit latency (ns
+                // scale). The real arc_swap / mmap_permute / madvise run
+                // inside the worker and are not attributable to main thread.
+                stages.arc_swap_ms += t_submit.elapsed().as_secs_f64() * 1e3;
+
+                report.swapped.push(SwappedLayer {
+                    layer_idx,
+                    from_dtype,
+                    to_dtype: self.target_dtype,
+                });
+            } else if use_async {
                 // ── LISWAP-2 async path — background commit activated (Phase 6.2) ──
                 //
                 // Background commit activated. See plan: compiled-chasing-hopper.md §Approach.
@@ -602,9 +788,26 @@ impl<'a> SwapExecutor<'a> {
                 // guarantee all layers are fully committed before the plan is marked done.
 
                 // Stage (a): enqueue H2D writes on transfer queue/stream — non-blocking.
-                let t_a0 = Instant::now();
-                let async_result = self.build_layer_from_mmap_async(secondary, slot, layer_idx);
-                stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
+                // LISWAP-7 Path 3: when `par_build` mode is on, the build was
+                // already done in parallel before the loop; lookup-only here.
+                let async_result = if par_build {
+                    built_cache.remove(&layer_idx).unwrap_or_else(|| {
+                        // Build was skipped in the par phase (slot already at
+                        // target dtype, secondary missing, etc.). The current
+                        // loop iter will hit the same skip checks above and
+                        // bypass this branch — reaching here only on race or
+                        // logic divergence. Surface as transient error.
+                        Err(SwapError::AsyncTransferUnavailable {
+                            layer: layer_idx,
+                            source: anyhow::anyhow!("par_build cache miss for layer {layer_idx}"),
+                        })
+                    })
+                } else {
+                    let t_a0 = Instant::now();
+                    let r = self.build_layer_from_mmap_async(secondary, slot, layer_idx);
+                    stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
+                    r
+                };
 
                 let (new_layer, write_event) = match async_result {
                     Ok(pair) => pair,
@@ -896,6 +1099,22 @@ impl<'a> SwapExecutor<'a> {
             report.ratio_generation_after = Some(new_gen);
 
             report.stage_breakdown = Some(stages);
+        }
+
+        // LISWAP-7 Path 3 / ε hypothesis: when par_build is on, drain
+        // dispatcher + release_worker before returning so the next forward
+        // starts with all background swap work complete (no in-flight commit
+        // or cuMemFree). Tests whether the +67 ms/forward overhead observed
+        // in 2026-05-14 par_build runs is caused by CUDA driver context lock
+        // contention between background `cuMemFree` and forward
+        // `cuLaunchKernel`.
+        if par_build && use_async {
+            if let Some(d) = async_dispatcher {
+                let _ = d.drain(Duration::from_secs(5));
+            }
+            if let Some(worker) = &self.release_worker {
+                let _ = worker.drain(Duration::from_secs(5));
+            }
         }
 
         report.latency_ms = start.elapsed().as_secs_f64() * 1e3;
@@ -2053,6 +2272,246 @@ fn record_swap_release(backend: &Arc<dyn Backend>, count: usize, bytes: usize) {
     }
     // CPU / CUDA / non-opencl builds: nothing to record.
     let _ = (backend, bytes);
+}
+
+// ── LISWAP-8: Background fetch standalone helpers ──────────────────────────
+//
+// Free-function variants of `build_layer_from_mmap_async` /
+// `materialise_cpu_tensor` / `try_alias_materialise` that own their config
+// + backend (no `&'a` borrow of `SwapExecutor`). Designed to be captured by
+// `AsyncSwapDispatcher::submit_dispatch_chunk` closures so the entire
+// `mmap_permute + cuMemAlloc + cuMemcpyAsync` pipeline runs on the worker
+// thread (`llmrs-async-swap`).
+//
+// Gated by `LLMRS_SWAP_BG_FETCH=1` in `execute_on_slots`. par_seq data
+// (2026-05-14) confirmed single-thread background dispatch keeps forward at
+// baseline 67 ms (vs par_iter multi-thread +67 ms regression on Jetson UMA).
+//
+// `host_ptr_pool` is intentionally NOT plumbed through — the async / alias
+// paths in `materialise_cpu_tensor` never consult the pool (it only affects
+// the sync `materialise_tensor` AOS path).
+
+pub(crate) fn build_layer_async_standalone(
+    secondary: &Arc<SecondaryMmap>,
+    slot: &LayerSlot,
+    layer_idx: usize,
+    backend: &Arc<dyn Backend>,
+    config: &ModelConfig,
+) -> Result<(TransformerLayer, GpuEvent), SwapError> {
+    let old = slot.load_weights();
+
+    let enqueue_weight =
+        |subname: &str, primary: &Tensor| -> Result<(Tensor, GpuEvent), SwapError> {
+            let cpu_tensor = materialise_cpu_tensor_standalone(
+                secondary, layer_idx, subname, primary, backend, config,
+            )?;
+            if backend.name().contains("CPU") {
+                return Ok((cpu_tensor, GpuEvent::dummy()));
+            }
+            if cpu_tensor.buffer().cl_mem().is_some() {
+                return Ok((cpu_tensor, GpuEvent::dummy()));
+            }
+            backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
+                SwapError::AsyncTransferUnavailable {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })
+        };
+
+    let enqueue_norm =
+        |subname: &str, primary: &Tensor| -> Result<(Tensor, Option<GpuEvent>), SwapError> {
+            if secondary.layer_tensor(layer_idx, subname).is_none() {
+                return Ok((primary.clone(), None));
+            }
+            let cpu_tensor = materialise_cpu_tensor_standalone(
+                secondary, layer_idx, subname, primary, backend, config,
+            )?;
+            if backend.name().contains("CPU") {
+                return Ok((cpu_tensor, None));
+            }
+            if cpu_tensor.buffer().cl_mem().is_some() {
+                return Ok((cpu_tensor, None));
+            }
+            let (gpu_tensor, evt) = backend.enqueue_write_async(&cpu_tensor).map_err(|e| {
+                SwapError::AsyncTransferUnavailable {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })?;
+            Ok((gpu_tensor, Some(evt)))
+        };
+
+    let (wq, evt_wq) = enqueue_weight("attn_q.weight", &old.wq)?;
+    let (wk, evt_wk) = enqueue_weight("attn_k.weight", &old.wk)?;
+    let (wv, evt_wv) = enqueue_weight("attn_v.weight", &old.wv)?;
+    let (wo, evt_wo) = enqueue_weight("attn_output.weight", &old.wo)?;
+    let (w_gate, evt_gate) = enqueue_weight("ffn_gate.weight", &old.w_gate)?;
+    let (w_up, evt_up) = enqueue_weight("ffn_up.weight", &old.w_up)?;
+    let (w_down, evt_down) = enqueue_weight("ffn_down.weight", &old.w_down)?;
+
+    let (attention_norm, evt_anorm) = enqueue_norm("attn_norm.weight", &old.attention_norm)?;
+    let (ffn_norm, evt_fnorm) = enqueue_norm("ffn_norm.weight", &old.ffn_norm)?;
+
+    let last_event = evt_fnorm.unwrap_or_else(|| evt_anorm.unwrap_or(evt_down));
+    let _ = (evt_wq, evt_wk, evt_wv, evt_wo, evt_gate, evt_up);
+
+    Ok((
+        TransformerLayer {
+            wq,
+            wk,
+            wv,
+            wo,
+            w_gate,
+            w_up,
+            w_down,
+            attention_norm,
+            ffn_norm,
+            qkv_bias: old.qkv_bias.clone(),
+            q_norm: old.q_norm.clone(),
+            k_norm: old.k_norm.clone(),
+            pre_ffn_norm: old.pre_ffn_norm.clone(),
+            post_ffn_norm: old.post_ffn_norm.clone(),
+            partition_ctx: None,
+        },
+        last_event,
+    ))
+}
+
+fn materialise_cpu_tensor_standalone(
+    secondary: &Arc<SecondaryMmap>,
+    layer_idx: usize,
+    subname: &str,
+    primary: &Tensor,
+    backend: &Arc<dyn Backend>,
+    config: &ModelConfig,
+) -> Result<Tensor, SwapError> {
+    let info = secondary.layer_tensor(layer_idx, subname).ok_or_else(|| {
+        SwapError::SecondaryTensorMissing {
+            layer: layer_idx,
+            subname: subname.to_string(),
+        }
+    })?;
+
+    let shape = primary.shape().clone();
+    let expected_dims: Vec<usize> = primary.shape().dims().to_vec();
+    let sec_rev: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
+    if sec_rev != expected_dims {
+        return Err(SwapError::ShapeMismatch {
+            layer: layer_idx,
+            subname: subname.to_string(),
+            primary: expected_dims,
+            secondary: info.dims.clone(),
+        });
+    }
+
+    let data = secondary.tensor_bytes(info);
+    let canonical_name = format!("blk.{layer_idx}.{subname}");
+    let needs_unpermute = secondary.needs_qk_unpermute_at_swap()
+        && qk_permute_shape(&canonical_name, config).is_some();
+    let permuted_bytes: Option<Vec<u8>> = if secondary.needs_qk_unpermute_at_swap() {
+        if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, config) {
+            let total_rows = shape.dims()[0];
+            debug_assert_eq!(total_rows, n_head * head_dim);
+            if !data.len().is_multiple_of(total_rows) {
+                return Err(SwapError::ShapeMismatch {
+                    layer: layer_idx,
+                    subname: subname.to_string(),
+                    primary: expected_dims,
+                    secondary: info.dims.clone(),
+                });
+            }
+            let row_size_bytes = data.len() / total_rows;
+            Some(unpermute_qk_rows(data, n_head, head_dim, row_size_bytes))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    #[cfg(feature = "opencl")]
+    if !needs_unpermute
+        && let Some(t) =
+            try_alias_materialise_standalone(secondary, layer_idx, subname, info, &shape, backend)?
+    {
+        return Ok(t);
+    }
+    #[cfg(not(feature = "opencl"))]
+    let _ = needs_unpermute;
+
+    let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
+        Arc::new(SharedBuffer::from_vec(owned, info.dtype))
+    } else {
+        Arc::new(
+            crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
+                secondary, data, info.dtype,
+            ),
+        )
+    };
+
+    let cpu_backend: Arc<dyn Backend> =
+        Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+    let _ = backend;
+    Ok(Tensor::new(shape, cpu_buf, cpu_backend))
+}
+
+#[cfg(feature = "opencl")]
+fn try_alias_materialise_standalone(
+    secondary: &Arc<SecondaryMmap>,
+    layer_idx: usize,
+    subname: &str,
+    info: &crate::models::weights::secondary_mmap::SecondaryTensorInfo,
+    shape: &crate::core::shape::Shape,
+    backend: &Arc<dyn Backend>,
+) -> Result<Option<Tensor>, SwapError> {
+    let SecondaryMmap::Rpcmem(rpc) = secondary.as_ref() else {
+        return Ok(None);
+    };
+
+    if let Some(alias_buf) = rpc.cached_alias(layer_idx, subname) {
+        debug_assert_eq!(alias_buf.size(), info.len, "cached alias length mismatch");
+        debug_assert_eq!(alias_buf.dtype(), info.dtype, "cached alias dtype mismatch");
+        return Ok(Some(Tensor::new(
+            shape.clone(),
+            alias_buf,
+            Arc::clone(backend),
+        )));
+    }
+
+    let entry =
+        rpc.host_ptr_for(layer_idx, subname)
+            .map_err(|e| SwapError::BufferAllocationFailed {
+                layer: layer_idx,
+                source: e,
+            })?;
+    let Some(alias) = entry else {
+        return Ok(None);
+    };
+    debug_assert_eq!(alias.len, info.len, "rpcmem region length mismatch");
+    debug_assert_eq!(alias.dtype, info.dtype, "rpcmem region dtype mismatch");
+
+    let buf = backend
+        .alloc_alias_weight_buffer(
+            alias.host_ptr,
+            alias.offset,
+            alias.len,
+            alias.dtype,
+            Arc::clone(secondary),
+            alias.region,
+        )
+        .map_err(|e| SwapError::BufferAllocationFailed {
+            layer: layer_idx,
+            source: e,
+        })?;
+    let Some(alias_buf) = buf else {
+        return Ok(None);
+    };
+    Ok(Some(Tensor::new(
+        shape.clone(),
+        alias_buf,
+        Arc::clone(backend),
+    )))
 }
 
 #[cfg(test)]
