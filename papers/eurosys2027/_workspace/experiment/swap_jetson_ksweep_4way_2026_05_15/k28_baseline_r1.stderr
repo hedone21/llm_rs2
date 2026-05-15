@@ -1,0 +1,31 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /home/nvidia/llm_rs2/models/llama3.1-8b/gguf/llama3.1-8b-f16.gguf
+[CUDA] Compiling kernels with /usr/local/cuda-11.4/bin/nvcc --ptx -arch=sm_72 -std=c++17 ...
+[CUDA] Kernel compilation done (803678 bytes PTX)
+[CUDA] Device: Xavier (sm_72, UMA=true, managed_mem=1, cuBLAS=ready, kernels=ready)
+[CUDA self-test] add_assign: [5.0, 7.0, 9.0] OK
+[CUDA self-test] scale:      [1.0, 2.0, 3.0] OK
+[CUDA self-test] rms_norm:   [0.8485, 1.1314] OK
+[CUDA] --cuda-sync-policy=minimal (mask=0x81)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 291 tensors, arch=Llama, weight_dtype=F16
+[Backend] Migrated 291 weight tensors to CUDA pinned memory
+[Tokenizer] /home/nvidia/llm_rs2/models/llama3.1-8b/gguf/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+Token Length: 72
+Model config: layers=32, kv_heads=8, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 262144B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[WARMUP] tokens=1 ms=164.83
+Prefill: 514.11 ms (72 tokens, 140.0 tok/s)
+Prefill(pure fwd): 513.89 ms (72 tokens, 140.1 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[cpu_fallback] === totals ===
+[cpu_fallback]                       matmul: 0
+[cpu_fallback]       matmul_transposed_q4_0: 0
+[cpu_fallback]      matmul_transposed_other: 0
+[cpu_fallback]                 matmul_slice: 0
+[cpu_fallback]                         cast: 0
+[cpu_fallback]                   kv_scatter: 0
+[cpu_fallback]                       gather: 0
+[cpu_fallback]                attention_gen: 0

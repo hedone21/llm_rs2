@@ -1,0 +1,9 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically, if all weights in a single layer need swapping at once (as is done for BART), then there's no latency penalty for using an LLM with larger models: these layers will still be decoded into as usual. However, when only part of
+Done.
+[Profile] Event: End
+TTFT: 872.45 ms
+Decode: 6.82 ms/tok (146.6 tok/s) [49 tokens, forward only]
+Decode(excl tok[0]): 6.86 ms/tok (145.7 tok/s) [48 tokens] | tok[0]=5.01 ms
+Avg TBT: 59.01 ms (16.9 tokens/sec)

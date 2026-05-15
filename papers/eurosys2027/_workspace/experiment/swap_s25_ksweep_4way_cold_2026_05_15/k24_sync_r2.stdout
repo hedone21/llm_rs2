@@ -1,0 +1,11 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically, swapping more than one layer per decode step will reduce decoding delay at a cost of increased memory usage (and hence energy).
+
+To implement this mechanism accurately requires implementing several atomic operations (e.g., replacing tensor elements). We use Rust’s built-in atomics
+Done.
+[Profile] Event: End
+TTFT: 928.18 ms
+Decode: 11.23 ms/tok (89.1 tok/s) [49 tokens, forward only]
+Decode(excl tok[0]): 11.35 ms/tok (88.1 tok/s) [48 tokens] | tok[0]=5.07 ms
+Avg TBT: 41.50 ms (24.1 tokens/sec)

@@ -1,0 +1,9 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically, this section describes two implementations: Layer-wise Precision Swaps (LPS) swaps one layer at a time but has low latency; Batched Precision Swaps (BPS) swaps multiple layers at once but is more expensive. Here we explore how to
+Done.
+[Profile] Event: End
+TTFT: 911.16 ms
+Decode: 5.22 ms/tok (191.7 tok/s) [49 tokens, forward only]
+Decode(excl tok[0]): 5.20 ms/tok (192.2 tok/s) [48 tokens] | tok[0]=5.84 ms
+Avg TBT: 41.38 ms (24.2 tokens/sec)

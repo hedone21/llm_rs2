@@ -1,0 +1,49 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[qnn_oppkg] runtime initialized: backend_lib=/data/local/tmp/qnn/libQnnGpu.so oppkg_lib=/data/local/tmp/libqnn_oppkg.so rpc_lib=/vendor/lib64/libcdsprpc.so
+[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)
+[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)
+[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[qnn_oppkg] layer=0 graphFinalize err=0x0 elapsed=1507.73 ms
+[qnn_oppkg] layer=1 graphFinalize err=0x0 elapsed=4.36 ms
+[qnn_oppkg] layer=2 graphFinalize err=0x0 elapsed=4.70 ms
+[qnn_oppkg] layer=3 graphFinalize err=0x0 elapsed=4.46 ms
+[qnn_oppkg] layer=4 graphFinalize err=0x0 elapsed=4.90 ms
+[qnn_oppkg] layer=5 graphFinalize err=0x0 elapsed=4.70 ms
+[qnn_oppkg] layer=6 graphFinalize err=0x0 elapsed=4.60 ms
+[qnn_oppkg] layer=7 graphFinalize err=0x0 elapsed=4.93 ms
+[qnn_oppkg] layer=8 graphFinalize err=0x0 elapsed=5.13 ms
+[qnn_oppkg] layer=9 graphFinalize err=0x0 elapsed=5.02 ms
+[qnn_oppkg] layer=10 graphFinalize err=0x0 elapsed=5.03 ms
+[qnn_oppkg] layer=11 graphFinalize err=0x0 elapsed=5.10 ms
+[qnn_oppkg] layer=12 graphFinalize err=0x0 elapsed=5.05 ms
+[qnn_oppkg] layer=13 graphFinalize err=0x0 elapsed=5.00 ms
+[qnn_oppkg] layer=14 graphFinalize err=0x0 elapsed=4.66 ms
+[qnn_oppkg] layer=15 graphFinalize err=0x0 elapsed=4.50 ms
+[qnn_oppkg] layer=16 graphFinalize err=0x0 elapsed=5.26 ms
+[qnn_oppkg] layer=17 graphFinalize err=0x0 elapsed=5.10 ms
+[qnn_oppkg] layer=18 graphFinalize err=0x0 elapsed=5.03 ms
+[qnn_oppkg] layer=19 graphFinalize err=0x0 elapsed=4.74 ms
+[qnn_oppkg] layer=20 graphFinalize err=0x0 elapsed=4.61 ms
+[qnn_oppkg] layer=21 graphFinalize err=0x0 elapsed=4.63 ms
+[qnn_oppkg] layer=22 graphFinalize err=0x0 elapsed=4.68 ms
+[qnn_oppkg] layer=23 graphFinalize err=0x0 elapsed=4.64 ms
+[qnn_oppkg] layer=24 graphFinalize err=0x0 elapsed=4.48 ms
+[qnn_oppkg] layer=25 graphFinalize err=0x0 elapsed=4.74 ms
+[qnn_oppkg] layer=26 graphFinalize err=0x0 elapsed=5.06 ms
+[qnn_oppkg] layer=27 graphFinalize err=0x0 elapsed=4.64 ms
+[qnn_oppkg] eager prebuild: 28 layers, total finalize 1625 ms
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+Token Length: 71
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=62.09
+Prefill: 738.05 ms (71 tokens, 96.2 tok/s)
+Prefill(pure fwd): 557.87 ms (71 tokens, 127.3 tok/s) [sync'd forward only, comparable to llama-bench pp]

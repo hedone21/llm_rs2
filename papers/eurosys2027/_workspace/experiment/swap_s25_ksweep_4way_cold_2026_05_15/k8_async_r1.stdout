@@ -1,0 +1,9 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically, we recommend swapping 1-3 layer(s) at each step (or none), depending on whether you care about low-latency inference with more robust precision swap recovery or high-precision inference with longer recovery time. The exact number of swaps is also
+Done.
+[Profile] Event: End
+TTFT: 892.97 ms
+Decode: 3.39 ms/tok (295.1 tok/s) [49 tokens, forward only]
+Decode(excl tok[0]): 3.32 ms/tok (301.1 tok/s) [48 tokens] | tok[0]=6.64 ms
+Avg TBT: 32.79 ms (30.5 tokens/sec)
