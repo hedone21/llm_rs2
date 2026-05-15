@@ -291,6 +291,17 @@ pub struct SwapExecutor<'a> {
     /// Falls back to the regular bg_fetch path if the pool is exhausted.
     #[cfg(feature = "cuda-embedded")]
     pub layer_pool: Option<Arc<crate::models::weights::layer_object_pool::LayerObjectPool>>,
+
+    /// LISWAP-8 Hammer D: registered mmap region for alias-only swap.
+    /// When `Some` and `LLMRS_SWAP_MMAP_ALIAS=1` is set, weights are
+    /// installed as zero-copy aliases into the registered mmap region
+    /// (no `cuMemAlloc`, no `cuMemcpyHtoDAsync`, no CPU memcpy). Q/K
+    /// tensors that need runtime unpermute fall back to the bg_fetch
+    /// build path.
+    #[cfg(feature = "cuda-embedded")]
+    pub mmap_registration: Option<
+        Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+    >,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -313,6 +324,8 @@ impl<'a> SwapExecutor<'a> {
             host_ptr_pool: None,
             #[cfg(feature = "cuda-embedded")]
             layer_pool: None,
+            #[cfg(feature = "cuda-embedded")]
+            mmap_registration: None,
         }
     }
 
@@ -338,6 +351,8 @@ impl<'a> SwapExecutor<'a> {
             host_ptr_pool: None,
             #[cfg(feature = "cuda-embedded")]
             layer_pool: None,
+            #[cfg(feature = "cuda-embedded")]
+            mmap_registration: None,
         }
     }
 
@@ -364,6 +379,18 @@ impl<'a> SwapExecutor<'a> {
         pool: Arc<crate::models::weights::layer_object_pool::LayerObjectPool>,
     ) -> Self {
         self.layer_pool = Some(pool);
+        self
+    }
+
+    /// LISWAP-8 Hammer D: attach a `CudaMmapRegistration` so the BG
+    /// fetch path installs zero-copy alias buffers for swap weights.
+    /// Activated by `LLMRS_SWAP_MMAP_ALIAS=1` env.
+    #[cfg(feature = "cuda-embedded")]
+    pub fn with_mmap_registration(
+        mut self,
+        registration: Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+    ) -> Self {
+        self.mmap_registration = Some(registration);
         self
     }
 
@@ -591,6 +618,18 @@ impl<'a> SwapExecutor<'a> {
             .map(|v| v == "1")
             .unwrap_or(false);
 
+        // LISWAP-8 Hammer D: zero-copy mmap alias swap. When `Some`
+        // registration is attached AND this env is set, each layer's
+        // weight tensors are installed as `CudaMmapAliasBuffer` views
+        // into the registered secondary mmap — no cuMemAlloc, no
+        // cuMemcpyHtoDAsync, no CPU memcpy. PoC: ignores Q/K runtime
+        // unpermute (accuracy-affecting for GGUF source; AUF secondary
+        // already pre-unpermuted, safe).
+        #[cfg(feature = "cuda-embedded")]
+        let mmap_alias_active = std::env::var("LLMRS_SWAP_MMAP_ALIAS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
         // Pre-build cache (par_build only): layer_idx -> Result<(layer, evt)>.
         // Populated outside the loop so the loop only submits + accumulates
         // stats.
@@ -759,25 +798,73 @@ impl<'a> SwapExecutor<'a> {
                 let pool_entry: Option<crate::layers::transformer_layer::TransformerLayer> =
                     None;
 
+                // Hammer D: mmap alias path takes highest priority when
+                // registration is attached and the env is set.
+                #[cfg(feature = "cuda-embedded")]
+                let mmap_reg: Option<
+                    Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+                > = if mmap_alias_active {
+                    self.mmap_registration.clone()
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "cuda-embedded"))]
+                let mmap_reg: Option<()> = None;
+
                 let job = crate::models::weights::async_swap::ChunkDispatchJob {
                     run: Box::new(move || {
-                        let result = if let Some(entry) = pool_entry {
-                            build_layer_via_pool_standalone(
-                                &secondary_arc,
-                                &slot_arc,
-                                layer_idx,
-                                &backend_arc,
-                                &config_owned,
-                                entry,
-                            )
-                        } else {
-                            build_layer_async_standalone(
-                                &secondary_arc,
-                                &slot_arc,
-                                layer_idx,
-                                &backend_arc,
-                                &config_owned,
-                            )
+                        let result = {
+                            #[cfg(feature = "cuda-embedded")]
+                            {
+                                if let Some(reg) = mmap_reg {
+                                    build_layer_via_mmap_alias_standalone(
+                                        &secondary_arc,
+                                        &slot_arc,
+                                        layer_idx,
+                                        &backend_arc,
+                                        &reg,
+                                    )
+                                } else if let Some(entry) = pool_entry {
+                                    build_layer_via_pool_standalone(
+                                        &secondary_arc,
+                                        &slot_arc,
+                                        layer_idx,
+                                        &backend_arc,
+                                        &config_owned,
+                                        entry,
+                                    )
+                                } else {
+                                    build_layer_async_standalone(
+                                        &secondary_arc,
+                                        &slot_arc,
+                                        layer_idx,
+                                        &backend_arc,
+                                        &config_owned,
+                                    )
+                                }
+                            }
+                            #[cfg(not(feature = "cuda-embedded"))]
+                            {
+                                let _ = mmap_reg;
+                                if let Some(entry) = pool_entry {
+                                    build_layer_via_pool_standalone(
+                                        &secondary_arc,
+                                        &slot_arc,
+                                        layer_idx,
+                                        &backend_arc,
+                                        &config_owned,
+                                        entry,
+                                    )
+                                } else {
+                                    build_layer_async_standalone(
+                                        &secondary_arc,
+                                        &slot_arc,
+                                        layer_idx,
+                                        &backend_arc,
+                                        &config_owned,
+                                    )
+                                }
+                            }
                         };
                         let (new_layer, write_event) = match result {
                             Ok(pair) => pair,
@@ -2437,6 +2524,107 @@ pub(crate) fn build_layer_async_standalone(
             partition_ctx: None,
         },
         last_event,
+    ))
+}
+
+/// LISWAP-8 Hammer D: build a `TransformerLayer` whose weight tensors are
+/// zero-copy aliases into a CUDA-registered secondary mmap region.
+///
+/// **PoC**: For GGUF secondaries whose `needs_qk_unpermute_at_swap()` is
+/// `true`, the alias bytes for `attn_q` / `attn_k` are still the on-disk
+/// permuted layout. The PoC accepts this and measures the performance
+/// envelope of a fully zero-copy swap; accuracy fixes (load-time
+/// unpermute into a separately-registered owned region) are deferred.
+/// For AUF secondaries (already unpermuted at build time) the alias is
+/// directly correct.
+#[cfg(feature = "cuda-embedded")]
+pub(crate) fn build_layer_via_mmap_alias_standalone(
+    secondary: &Arc<SecondaryMmap>,
+    slot: &LayerSlot,
+    layer_idx: usize,
+    backend: &Arc<dyn Backend>,
+    registration: &Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+) -> Result<(TransformerLayer, GpuEvent), SwapError> {
+    use crate::buffer::cuda_mmap_alias_buffer::CudaMmapAliasBuffer;
+
+    let old = slot.load_weights();
+
+    let alias_tensor = |subname: &str, primary: &Tensor| -> Result<Tensor, SwapError> {
+        let info = secondary.layer_tensor(layer_idx, subname).ok_or_else(|| {
+            SwapError::SecondaryTensorMissing {
+                layer: layer_idx,
+                subname: subname.to_string(),
+            }
+        })?;
+        let shape = primary.shape().clone();
+        let expected_dims: Vec<usize> = primary.shape().dims().to_vec();
+        let sec_rev: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
+        if sec_rev != expected_dims {
+            return Err(SwapError::ShapeMismatch {
+                layer: layer_idx,
+                subname: subname.to_string(),
+                primary: expected_dims,
+                secondary: info.dims.clone(),
+            });
+        }
+        let alias = CudaMmapAliasBuffer::new(
+            Arc::clone(registration),
+            info.offset,
+            info.len,
+            info.dtype,
+        )
+        .map_err(|e| SwapError::BufferAllocationFailed {
+            layer: layer_idx,
+            source: e,
+        })?;
+        Ok(Tensor::new(
+            shape,
+            Arc::new(alias) as Arc<dyn Buffer>,
+            Arc::clone(backend),
+        ))
+    };
+
+    let wq = alias_tensor("attn_q.weight", &old.wq)?;
+    let wk = alias_tensor("attn_k.weight", &old.wk)?;
+    let wv = alias_tensor("attn_v.weight", &old.wv)?;
+    let wo = alias_tensor("attn_output.weight", &old.wo)?;
+    let w_gate = alias_tensor("ffn_gate.weight", &old.w_gate)?;
+    let w_up = alias_tensor("ffn_up.weight", &old.w_up)?;
+    let w_down = alias_tensor("ffn_down.weight", &old.w_down)?;
+
+    let attention_norm = if secondary
+        .layer_tensor(layer_idx, "attn_norm.weight")
+        .is_some()
+    {
+        alias_tensor("attn_norm.weight", &old.attention_norm)?
+    } else {
+        old.attention_norm.clone()
+    };
+    let ffn_norm = if secondary.layer_tensor(layer_idx, "ffn_norm.weight").is_some() {
+        alias_tensor("ffn_norm.weight", &old.ffn_norm)?
+    } else {
+        old.ffn_norm.clone()
+    };
+
+    Ok((
+        TransformerLayer {
+            wq,
+            wk,
+            wv,
+            wo,
+            w_gate,
+            w_up,
+            w_down,
+            attention_norm,
+            ffn_norm,
+            qkv_bias: old.qkv_bias.clone(),
+            q_norm: old.q_norm.clone(),
+            k_norm: old.k_norm.clone(),
+            pre_ffn_norm: old.pre_ffn_norm.clone(),
+            post_ffn_norm: old.post_ffn_norm.clone(),
+            partition_ctx: None,
+        },
+        GpuEvent::dummy(),
     ))
 }
 

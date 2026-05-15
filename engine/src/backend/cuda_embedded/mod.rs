@@ -1065,6 +1065,11 @@ impl CudaBackend {
                     .downcast_ref::<CudaDeviceBuffer>()
                     .map(|db| db.device_ptr())
             })
+            .or_else(|| {
+                buf.as_any()
+                    .downcast_ref::<crate::buffer::cuda_mmap_alias_buffer::CudaMmapAliasBuffer>()
+                    .map(|mb| mb.device_ptr())
+            })
     }
 
     /// Get device pointer or return error with context.

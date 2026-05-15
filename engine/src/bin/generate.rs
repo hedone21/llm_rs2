@@ -3223,6 +3223,39 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // LISWAP-8 Hammer D: register the secondary mmap with CUDA so the
+    // swap path can install zero-copy `CudaMmapAliasBuffer` weights.
+    // env: LLMRS_SWAP_MMAP_ALIAS=1
+    #[cfg(feature = "cuda-embedded")]
+    let mmap_registration: Option<
+        Arc<llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+    > = {
+        let enabled = std::env::var("LLMRS_SWAP_MMAP_ALIAS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !enabled {
+            None
+        } else if let Some(secondary) = model.secondary_mmap.clone() {
+            match llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration::register(
+                secondary,
+            ) {
+                Ok(reg) => {
+                    eprintln!(
+                        "[LISWAP-8] mmap registration active: size={} MB",
+                        reg.size() / (1024 * 1024)
+                    );
+                    Some(reg)
+                }
+                Err(e) => {
+                    eprintln!("[LISWAP-8] mmap registration failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // LISWAP Phase 3 — pending mid-decode trigger payload.
     // When `--swap-delay-tokens N > 0` AND `--force-swap-ratio` is set, the
     // trigger logic is deferred from prefill end to decode token N. We capture
@@ -3369,6 +3402,8 @@ fn main() -> anyhow::Result<()> {
                     None,
                     #[cfg(feature = "opencl")]
                     host_ptr_swap_pool.clone(),
+                    #[cfg(feature = "cuda-embedded")]
+                    None,
                     #[cfg(feature = "cuda-embedded")]
                     None,
                 ) {
@@ -3766,6 +3801,8 @@ fn main() -> anyhow::Result<()> {
                     &cpu_backend_arc,
                     None,
                     #[cfg(feature = "opencl")]
+                    None,
+                    #[cfg(feature = "cuda-embedded")]
                     None,
                     #[cfg(feature = "cuda-embedded")]
                     None,
@@ -6464,6 +6501,8 @@ fn main() -> anyhow::Result<()> {
                         host_ptr_swap_pool.clone(),
                         #[cfg(feature = "cuda-embedded")]
                         layer_swap_pool.clone(),
+                        #[cfg(feature = "cuda-embedded")]
+                        mmap_registration.clone(),
                     ) {
                         Ok(report) => {
                             let io_after = read_bytes_now();
@@ -8460,6 +8499,9 @@ fn run_layer_swap(
     #[cfg(feature = "cuda-embedded")] layer_pool: Option<
         Arc<llm_rs2::models::weights::layer_object_pool::LayerObjectPool>,
     >,
+    #[cfg(feature = "cuda-embedded")] mmap_registration: Option<
+        Arc<llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+    >,
 ) -> Result<llm_rs2::models::weights::SwapReport, llm_rs2::models::weights::SwapError> {
     let swap_memory = Galloc::new();
     let swap_backend: Arc<dyn Backend> =
@@ -8484,6 +8526,12 @@ fn run_layer_swap(
     #[cfg(feature = "cuda-embedded")]
     let executor = match layer_pool {
         Some(pool) => executor.with_layer_pool(pool),
+        None => executor,
+    };
+    // LISWAP-8 Hammer D: attach mmap registration when set.
+    #[cfg(feature = "cuda-embedded")]
+    let executor = match mmap_registration {
+        Some(reg) => executor.with_mmap_registration(reg),
         None => executor,
     };
     executor.execute_on_slots(
@@ -8829,6 +8877,8 @@ fn run_qcf_warmup_workflow(
                 // LISWAP-3: QCF dump path does not exercise the pool yet —
                 // Stage 3 prototype only wires --force-swap-ratio paths.
                 #[cfg(feature = "opencl")]
+                None,
+                #[cfg(feature = "cuda-embedded")]
                 None,
                 #[cfg(feature = "cuda-embedded")]
                 None,
@@ -11066,6 +11116,8 @@ fn run_ppl(
                     &ppl_cpu_backend,
                     None,
                     #[cfg(feature = "opencl")]
+                    None,
+                    #[cfg(feature = "cuda-embedded")]
                     None,
                     #[cfg(feature = "cuda-embedded")]
                     None,
