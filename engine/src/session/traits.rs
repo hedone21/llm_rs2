@@ -1,0 +1,123 @@
+//! Inference pipeline trait API (Phase 4-2).
+//!
+//! 6 traits split the decode loop responsibilities by SOLID-SRP:
+//! [`Forward`] (required), [`EvictionStage`], [`SwapStage`], [`CommandSource`],
+//! [`TokenSampler`], and [`DecodeObserver`].
+//!
+//! Signatures match `arch/inference_pipeline.md` §2 verbatim. Default methods
+//! mean external contributors only have to implement `prefill` + `step` on
+//! [`Forward`] to compile against [`super::DecodeLoopBuilder`].
+
+use std::sync::atomic::AtomicBool;
+
+use llm_shared::{EngineCommand, WeightSwapReport};
+
+/// Read-only context handed to every trait at each decode step.
+///
+/// Borrows the stop flag from the parent [`super::DecodeLoop`] so trait
+/// implementations can observe (but not flip) cancellation.
+pub struct StepCtx<'a> {
+    pub pos: usize,
+    pub prev_token: u32,
+    pub kv_capacity: usize,
+    pub decode_step: usize,
+    pub stop_requested: &'a AtomicBool,
+}
+
+/// Outcome of an [`EvictionStage::before_step`] call.
+#[derive(Debug, Clone)]
+pub enum EvictionOutcome {
+    None,
+    Pruned { removed: usize, new_pos: usize },
+    Skipped { reason: SkipReason },
+}
+
+/// Reason an eviction stage decided not to act this step.
+#[derive(Debug, Clone)]
+pub enum SkipReason {
+    NotNeeded,
+    BudgetExhausted,
+    ManagerDeferred,
+    Other(&'static str),
+}
+
+/// Why [`super::DecodeLoop::run`] returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    BudgetExhausted,
+    StopFlag,
+    EosToken,
+    CommandRequested,
+}
+
+/// Decode result returned by [`super::DecodeLoop::run`].
+#[derive(Debug, Clone)]
+pub struct DecodeResult {
+    pub tokens_generated: Vec<u32>,
+    pub final_pos: usize,
+    pub stopped_by: StopReason,
+}
+
+/// Required forward pass. Provides KV-bearing model semantics.
+///
+/// `finalize` and `on_kv_prune` are default no-ops so a minimal Forward
+/// implementation needs only `prefill` + `step`.
+pub trait Forward {
+    /// Run prefill over `tokens`. Returns logits for the last token.
+    fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>>;
+
+    /// Decode 1 step. After return, `pos` is conceptually advanced by 1.
+    fn step(&mut self, ctx: &StepCtx, token: u32) -> anyhow::Result<Vec<f32>>;
+
+    /// Called once after [`super::DecodeLoop::run`] exits.
+    fn finalize(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Notified after an [`EvictionStage`] pruned KV state.
+    fn on_kv_prune(&mut self, _new_pos: usize) {}
+}
+
+/// Eviction stage invoked before each forward step.
+pub trait EvictionStage {
+    /// Inspect cache pressure and optionally prune.
+    fn before_step(&mut self, ctx: &StepCtx) -> anyhow::Result<EvictionOutcome>;
+
+    /// Ensure enough KV capacity for `additional` upcoming tokens.
+    fn ensure_capacity(&mut self, _ctx: &StepCtx, _additional: usize) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Weight/KV swap stage. Pairs `before_step` (prefetch) with `after_step`
+/// (commit/release).
+pub trait SwapStage {
+    fn before_step(&mut self, ctx: &StepCtx) -> anyhow::Result<()>;
+    fn after_step(&mut self, ctx: &StepCtx) -> anyhow::Result<()>;
+
+    /// Drain a pending swap report for IPC, if any.
+    fn pending_report(&mut self) -> Option<WeightSwapReport> {
+        None
+    }
+}
+
+/// External command channel (manager IPC, schedule, stdin, ...).
+pub trait CommandSource {
+    fn poll(&mut self, ctx: &StepCtx) -> anyhow::Result<Option<EngineCommand>>;
+}
+
+/// Token sampler. Default impl `GreedySampler` in [`super::defaults`].
+pub trait TokenSampler {
+    fn sample(&mut self, ctx: &StepCtx, logits: &[f32]) -> u32;
+}
+
+/// Decode-loop observer. All hooks are no-op by default; implement only what
+/// you need.
+pub trait DecodeObserver {
+    fn on_prefill_end(&mut self, _ctx: &StepCtx, _last_logits: &[f32]) {}
+    fn on_step_end(&mut self, _ctx: &StepCtx, _sampled: u32, _step_ms: f64) {}
+    fn on_eviction(&mut self, _ctx: &StepCtx, _outcome: &EvictionOutcome) {}
+    fn finalize(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
