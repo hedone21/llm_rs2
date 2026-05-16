@@ -326,3 +326,14 @@ mod test_inv_layer_003;
 mod test_inv_layer_004;
 #[path = "spec/test_inv_layer_005.rs"]
 mod test_inv_layer_005;
+
+// ── INV-LAYER-006 (DecodeLoop field abstraction) +
+//    INV-LAYER-007 (DecodeLoopBuilder typestate, trybuild) ──
+// Phase 4-2: 6-trait + DecodeLoopBuilder typestate API. INV-LAYER-006 is a
+// source-grep on session/decode_loop.rs; INV-LAYER-007 uses trybuild to assert
+// that `DecodeLoopBuilder::new().build()` fails to compile and that a minimal
+// Forward impl (prefill+step only) compiles.
+#[path = "spec/test_inv_layer_006.rs"]
+mod test_inv_layer_006;
+#[path = "spec/test_inv_layer_007.rs"]
+mod test_inv_layer_007;

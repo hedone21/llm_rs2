@@ -66,6 +66,8 @@ zbus = { version = "5", optional = true, default-features = false, features = ["
 tempfile = "3.0"
 
 [dev-dependencies]
+# compile-fail / compile-pass tests for session typestate (INV-LAYER-007).
+trybuild = "1.0"
 
 [build-dependencies]
 bindgen = { version = "0.71", optional = true }

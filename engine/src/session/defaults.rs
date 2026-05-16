@@ -6,7 +6,7 @@
 use llm_shared::EngineCommand;
 
 use super::traits::{
-    CommandSource, DecodeObserver, EvictionOutcome, EvictionStage, StepCtx, SkipReason, SwapStage,
+    CommandSource, DecodeObserver, EvictionOutcome, EvictionStage, SkipReason, StepCtx, SwapStage,
     TokenSampler,
 };
 
@@ -98,7 +98,9 @@ mod tests {
         let c = ctx(&stop);
         let mut e = NoOpEvictionStage;
         match e.before_step(&c).unwrap() {
-            EvictionOutcome::Skipped { reason: SkipReason::NotNeeded } => {}
+            EvictionOutcome::Skipped {
+                reason: SkipReason::NotNeeded,
+            } => {}
             other => panic!("expected Skipped(NotNeeded), got {other:?}"),
         }
     }
