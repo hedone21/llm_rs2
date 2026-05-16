@@ -415,70 +415,97 @@ SYS-064, INV-018, INV-013
 ### 6.5 컴포넌트: L4 Orchestration (`session/` — 신규)
 
 - **책임 (spec WHAT → HOW)**: SYS-100 L4. Decode loop, prefill 흐름, eviction/swap dispatch, IPC adapter 연동. 현재 `bin/generate.rs` 13,022 LOC monolith로 존재. Migration Step 2에서 분리.
-- **포함 모듈 (post-migration, §13.8 결정 반영)**:
-  - `session/mod.rs` — module roots.
-  - `session/decode_loop.rs` — `DecodeLoop` struct + builder. 6개 추상화(`Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver`)에 위임. **상세 trait API + 빌더 typestate + StepCtx + 구현체 카탈로그 + 마이그레이션 sub-phase는 [`arch/inference_pipeline.md`](inference_pipeline.md) 참조** (단일 진실 원본 — 본 절은 컴포넌트 매핑만).
-  - `session/prefill.rs` — prompt processing.
-  - `session/defaults.rs` — `NoSwapStage`, `NoOpObserver`, `NoCommandSource`, `GreedySampler` 등 no-op/default 구현체.
+- **포함 모듈 (post-migration, §13.8 결정 반영 + Task #4 finalize 2026-05-16)**:
+  - `session/mod.rs` — module roots, 공용 type 재출력(`pub use`).
+  - `session/decode_loop.rs` — `DecodeLoop` struct + `DecodeLoopBuilder` (typestate). 6개 추상화 trait object 보유.
+  - `session/traits.rs` — **6 trait 정의** (`Forward`, `EvictionStage`, `SwapStage`, `CommandSource`, `TokenSampler`, `DecodeObserver`) + `StepCtx` + `DecodeResult` + `StopReason` + `EvictionOutcome`. 사용자 결정 #1 (2026-05-16): 6 trait 모두 `session/`에 둔다 — `Forward`/`TokenSampler`도 inference로 끌어올리지 않음. 빌더와 한 모듈에 두는 단순성 우선.
+  - `session/defaults.rs` — `NoEvictionStage`, `NoSwapStage`, `NoCommandSource`, `NoOpObserver`, `GreedySampler` no-op/default 구현체.
+  - `session/forward/{model_forward, kivi_forward, offload_forward}.rs` — `Forward` 구현체 3종.
+  - `session/eviction/cache_manager_stage.rs` — `EvictionStage` 구현체 (L3 `pressure::CacheManager` owned).
+  - `session/swap/{sync_swap_stage, async_swap_stage, phase_aware_swap_stage, dynamic_k_swap_stage, probing_k_swap_stage}.rs` — `SwapStage` 구현체 5종.
+  - `session/command/{manager_cmd_source, schedule_cmd_source, stdin_cmd_source}.rs` — `CommandSource` 구현체.
+  - `session/sampler/{temp_sampler, top_k_sampler, top_p_sampler, mixed_sampler}.rs` — `TokenSampler` 구현체 (얇은 wrapper, 내부에서 `inference::sampling::SamplingConfig` 호출).
+  - `session/observer/{profiler_obs, experiment_writer_obs, tbt_log_obs, system_sampler_obs, event_sink_adapter}.rs` — `DecodeObserver` 구현체.
+  - `session/init.rs` — `SessionInitCtx` (Phase 4-1 추출 헬퍼: backend/model/cache_manager/tokenizer 초기화).
+  - `session/cli.rs` (또는 `session/cli_dump.rs`) — CLI 인자 + dump_config 헬퍼.
+  - `session/prefill.rs` — prompt processing 헬퍼.
   - `session/eval/` — 평가 hook (← `eval/`, V-28/V-29 해소).
-  - **`session/chat_ipc.rs`** (← `core/chat_ipc.rs`, §13.8-C) — 외부 IPC adapter. 외부 client(예: chat UI)와 decode loop 사이의 protocol 변환 책임. `DecodeLoop::run_until_stop`에 위임.
-- **의존**: L3(`pressure/`, `inference/`) + L2(`shared/`) + cross-cutting. **L4 내부 결합도 제약 (INV-LAYER-006)**: `DecodeLoop` struct 필드는 6 trait의 `Box<dyn>` 또는 generic만 허용. concrete `OpenCLBackend`/`CacheManager`/`LlamaModel`/`ManagerClient` 직접 보유 금지. L1 backend는 builder가 받는 `Arc<dyn Backend>`만 허용.
+  - **`session/chat_ipc.rs`** (← `core/chat_ipc.rs`, §13.8-C) — 외부 IPC adapter. `DecodeLoop::run_until_stop`에 위임.
+  - `session/chat/{repl, turn, stop_condition}.rs` (Phase 4-5 신규) — 사용자 결정 #3 (2026-05-16): `ChatTurnExec` trait 폐기 후 chat REPL 1,178 LOC을 DecodeLoop 패턴으로 전면 재작성.
+
+  상세 trait API + 빌더 typestate + StepCtx + 구현체 카탈로그 + 마이그레이션 sub-phase는 **[`arch/inference_pipeline.md`](inference_pipeline.md)**가 단일 진실 원본. 본 절은 컴포넌트 매핑만.
+- **의존**: L3(`pressure/`, `inference/`) + L2(`shared/`) + cross-cutting. **L4 내부 결합도 제약 (INV-LAYER-006)**: `DecodeLoop` struct **필드 자체**는 6 trait의 `Box<dyn>` 또는 generic만 허용. concrete `OpenCLBackend`/`CacheManager`/`LlamaModel`/`ManagerClient`/`Profiler` 직접 보유 금지. L1 backend는 builder가 받는 `Arc<dyn Backend>`만 허용. **단** trait impl struct(`ModelForward`, `CacheManagerStage` 등) **내부**는 L1/L3 concrete를 owned/borrow 자유 보유 가능 — builder가 trait object로 추상화 후 주입하는 자연 경로 (`arch/inference_pipeline.md` §8.3/§8.4 참조).
 - **공용 인터페이스**:
   - `DecodeLoop::run(budget: usize) -> DecodeResult` — `Forward::step` × N + observer hook.
   - `DecodeLoop::run_until_stop(stop: &dyn StopCondition)` — chat REPL 경로.
   - `DecodeLoopBuilder::new()` + chainable `.with_forward(...)` / `.add_observer(...)` / `.with_sampler(...)` + `.build()` (typestate, INV-LAYER-007).
   - `ChatIpcServer` (TBD) — IPC 채널로 prompt를 받아 `inference::ChatTemplate` impl로 변환 후 `DecodeLoop::run_until_stop` 호출.
+  - **6 trait의 lifecycle hook은 default no-op** (`Forward::finalize`, `Forward::on_kv_prune`) — 외부 기여자가 `prefill`/`step`만 구현해도 컴파일 성공 (사용자 결정 #2). KV 보유 구현체는 `on_kv_prune` override 필수.
 - **예외 처리**: backend instantiation은 `session::init` 헬퍼(L4 내부)에서 수행 — CLI 인자 → `Box<dyn Forward>` 변환. 결과 trait object만 builder에 전달.
-- **현 위반**: 본 컴포넌트가 존재하지 않음 — 현재 `bin/generate.rs`에 모두 inline. Migration Step 2-2 에서 trait 정의, Step 2-4에서 main() 흡수.
+- **현 위반**: 본 컴포넌트가 존재하지 않음 — 현재 `bin/generate.rs`에 모두 inline. Migration Step 2-2에서 trait 정의, Step 2-4에서 main() 흡수, Step 2-5에서 chat REPL 전면 재작성.
 
-#### 6.5.1 의존 그래프 (`session/decode_loop.rs` 내부)
+#### 6.5.1 의존 그래프 (`session/` 내부)
+
+사용자 결정 #1 (2026-05-16) — 6 trait + 모든 구현체가 L4 `session/` 산하로 통일.
 
 ```mermaid
 flowchart LR
-    subgraph L4 [L4 session/]
-        BLD[DecodeLoopBuilder]
-        DL[DecodeLoop]
-        SCTX[StepCtx]
-        DEF[defaults: NoSwapStage<br/>NoOpObserver<br/>GreedySampler]
+    subgraph L4 [L4 session/ — 모든 trait + 구현체]
+        BLD[DecodeLoopBuilder<br/>session::DecodeLoopBuilder]
+        DL[DecodeLoop<br/>session::DecodeLoop]
+        SCTX[StepCtx<br/>session::StepCtx]
+        DEF[defaults.rs<br/>NoEvictionStage / NoSwapStage<br/>NoCommandSource / NoOpObserver<br/>GreedySampler]
+        CHAT[chat/ Phase 4-5 신규<br/>repl / turn / stop_condition<br/>ChatTurnExec 폐기 대체]
+        IPC[chat_ipc.rs<br/>L4 IPC adapter]
     end
-    subgraph TR [traits 의존 추상]
-        TF((Forward))
-        TE((EvictionStage))
-        TS((SwapStage))
-        TC((CommandSource))
-        TT((TokenSampler))
-        TO((DecodeObserver))
+    subgraph TR [session/traits.rs — 6 trait 정의 통일]
+        TF((session::Forward))
+        TE((session::EvictionStage))
+        TS((session::SwapStage))
+        TC((session::CommandSource))
+        TT((session::TokenSampler))
+        TO((session::DecodeObserver))
     end
-    subgraph IMPL [L3/L2/L1 구현체 — builder가 주입]
-        MF[ModelForward<br/>KiviForward<br/>OffloadForward]
-        EV[CacheManagerStage<br/>NoEvictionStage]
-        SW[SyncSwapStage<br/>AsyncSwapStage<br/>ProbingKSwapStage]
-        CS[ManagerCmdSource<br/>ScheduleCmdSource<br/>StdinCmdSource]
-        SM[GreedySampler<br/>TempSampler<br/>TopKSampler]
-        OB[ProfilerObs<br/>ExperimentWriterObs<br/>TbtLogObs<br/>EventSinkAdapter]
+    subgraph IMPL [session/<sub>/ — 구현체 owned, 내부에서 L3 concrete 보유 OK]
+        MF[session/forward/<br/>ModelForward<br/>KiviForward<br/>OffloadForward]
+        EV[session/eviction/<br/>CacheManagerStage]
+        SW[session/swap/<br/>SyncSwapStage<br/>AsyncSwapStage<br/>PhaseAwareSwapStage<br/>DynamicKSwapStage<br/>ProbingKSwapStage]
+        CS[session/command/<br/>ManagerCmdSource<br/>ScheduleCmdSource<br/>StdinCmdSource]
+        SM[session/sampler/<br/>TempSampler<br/>TopKSampler<br/>TopPSampler<br/>MixedSampler]
+        OB[session/observer/<br/>ProfilerObs<br/>ExperimentWriterObs<br/>TbtLogObs<br/>SystemSamplerObs<br/>EventSinkAdapter]
+    end
+    subgraph DOM [L3 도메인 — trait impl 내부에서만 owned/borrow]
+        L3I[inference::TransformerModel<br/>inference::LayerWorkspace<br/>inference::sampling::SamplingConfig]
+        L3P[pressure::CacheManager<br/>pressure::state::KiviCache<br/>pressure::state::OffloadStore]
     end
 
     BLD --> DL
-    DL -. holds .-> TF
-    DL -. holds .-> TE
-    DL -. holds .-> TS
-    DL -. holds .-> TC
-    DL -. holds .-> TT
-    DL -. holds .-> TO
+    DL -. holds dyn .-> TF
+    DL -. holds dyn .-> TE
+    DL -. holds dyn .-> TS
+    DL -. holds dyn .-> TC
+    DL -. holds dyn .-> TT
+    DL -. holds dyn .-> TO
     DL --> SCTX
+    DEF -. impls .-> TE
     DEF -. impls .-> TS
-    DEF -. impls .-> TO
     DEF -. impls .-> TC
     DEF -. impls .-> TT
+    DEF -. impls .-> TO
     MF -. impls .-> TF
     EV -. impls .-> TE
     SW -. impls .-> TS
     CS -. impls .-> TC
     SM -. impls .-> TT
     OB -. impls .-> TO
+    MF -- owned --> L3I
+    MF -- owned --> L3P
+    EV -- owned --> L3P
+    CHAT --> BLD
+    IPC --> DL
 ```
 
-(점선: trait 의존 / 실선: concrete 의존 / impl arrow: trait 구현 관계)
+(점선 `holds dyn`: `DecodeLoop` 필드는 trait object만 — INV-LAYER-006 / 점선 `impls`: trait 구현 관계 / 실선 `owned`: trait impl struct 내부에서 L3 concrete owned — §8.3 무위반)
 
 ### 6.6 컴포넌트: L5 Adapter (`bin/`)
 

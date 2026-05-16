@@ -27,7 +27,9 @@
 
 각 trait는 hot path 호출 빈도, mutability, lifetime 비용을 함께 명시한다. `&mut dyn` 가정. generic monomorphization은 §7에서 별도 검토.
 
-### 2.1 `StepCtx` — 공유 read-only context
+### 2.1 `session::StepCtx` — 공유 read-only context
+
+> **Trait 모듈 위치 (사용자 결정 #1)**: 본 절의 6 trait(`Forward`, `EvictionStage`, `SwapStage`, `CommandSource`, `TokenSampler`, `DecodeObserver`) 및 `StepCtx`는 **모두 L4 `session/` 산하**에 정의된다. `Forward`/`TokenSampler`를 L3 `inference/`로 끌어올리지 않는다 — 빌더와 한 모듈에 두는 단순성을 우선한다. 자세한 근거는 §11 "확정 결정" 참조.
 
 ```rust
 /// Decode step 단위의 read-only context. DecodeLoop가 매 step 시작에서 빌드.
@@ -46,30 +48,41 @@ pub struct StepCtx<'a> {
 - **누가 mutate?** 아무도 안 함 (`&'a` shared reference). 카운터(`pos`, `decode_step`)는 다음 iteration 시작 시 새 값으로 재구성.
 - **수명 전략**: `'a`는 단일 step scope. trait 메서드 안에서 `StepCtx`를 저장하지 못하도록 lifetime으로 막는다.
 
-### 2.2 `Forward` (필수)
+### 2.2 `session::Forward` (필수)
 
 ```rust
 pub trait Forward {
+    // ── 필수 메서드 (구현 강제) ─────────────────────────────────────
     /// Prefill 페이즈: prompt 전체를 한번에 처리. 마지막 위치 logits 반환.
     fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>>;
 
     /// Decode 1 step. 호출 후 pos는 +1 효과를 가진다 (Forward 내부 KV 갱신).
     fn step(&mut self, ctx: &StepCtx, token: u32) -> anyhow::Result<Vec<f32>>;
 
+    // ── lifecycle hook (default: no-op) ──────────────────────────────
+    // 외부 기여자가 prefill/step만 구현하면 동작한다.
+    // KV 상태를 관리하지 않는 단순 forward는 모두 default 사용 가능.
+
     /// 종료 직전 호출 (eos 또는 budget 소진). 마지막 logits/score flush 등.
+    /// default: no-op
     fn finalize(&mut self) -> anyhow::Result<()> { Ok(()) }
 
     /// KV pos 동기화 — eviction stage가 KV에서 N토큰 제거 후 호출.
-    fn on_kv_prune(&mut self, new_pos: usize);
+    /// default: no-op (KV를 보유하지 않는 forward는 무시).
+    /// **주의**: KV 상태 보유 forward(ModelForward/KiviForward/OffloadForward)는
+    /// 반드시 override하여 내부 카운터를 갱신해야 한다. default 사용 시
+    /// eviction과 forward 사이 pos 불일치로 attention mask가 깨질 수 있다.
+    fn on_kv_prune(&mut self, _new_pos: usize) { /* no-op */ }
 }
 ```
 
 - 호출 빈도: prefill 1회, step N회 (decode 토큰 수).
 - 흡수할 변수(책임 #1 전부): `backend`, `model`, `kv_caches`, `workspace`, `gpu_buffers`, `logits`.
 - 구현체 예시: `ModelForward` (표준), `KiviForward` (KIVI 2bit KV quant), `OffloadForward` (per-layer prefetch).
-- No-op default: **없음** — 필수 컴포넌트. typestate로 빌더 강제 (INV-LAYER-007).
+- **필수 메서드 typestate 강제**: `prefill`/`step` 미구현 시 trait impl 자체가 컴파일 실패. `build()`는 `HasForward` marker에서만 호출 가능 (INV-LAYER-007).
+- **default no-op 메서드**: `finalize`, `on_kv_prune` — 외부 기여자가 prefill/step만 구현해도 컴파일 성공 (사용자 결정 #2). KV 관리가 필요한 구현체는 architect review 시 `on_kv_prune` override 여부를 게이트로 한다.
 
-### 2.3 `EvictionStage` (선택)
+### 2.3 `session::EvictionStage` (선택)
 
 ```rust
 pub enum EvictionOutcome {
@@ -96,7 +109,7 @@ pub trait EvictionStage {
 - 구현체 예시: `CacheManagerStage` (현 `CacheManager` 래핑), `NoEvictionStage` (no-op).
 - No-op default: `NoEvictionStage` — `EvictionOutcome::None` 반환.
 
-### 2.4 `SwapStage` (선택)
+### 2.4 `session::SwapStage` (선택)
 
 ```rust
 pub trait SwapStage {
@@ -116,7 +129,7 @@ pub trait SwapStage {
 - 구현체 예시: `SyncSwapStage`, `AsyncSwapStage`, `PhaseAwareSwapStage`, `ProbingKSwapStage`, `NoSwapStage`.
 - No-op default: `NoSwapStage` — 두 메서드 모두 `Ok(())`.
 
-### 2.5 `CommandSource` (선택)
+### 2.5 `session::CommandSource` (선택)
 
 ```rust
 pub trait CommandSource {
@@ -130,7 +143,7 @@ pub trait CommandSource {
 - 구현체 예시: `ManagerCmdSource` (IPC), `ScheduleCmdSource` (timed schedule), `StdinCmdSource` (chat REPL), `NoCommandSource`.
 - No-op default: `NoCommandSource` — 항상 `Ok(None)`.
 
-### 2.6 `TokenSampler` (필수, default 제공)
+### 2.6 `session::TokenSampler` (필수, default 제공)
 
 ```rust
 pub trait TokenSampler {
@@ -143,7 +156,7 @@ pub trait TokenSampler {
 - 구현체 예시: `GreedySampler`, `TempSampler`, `TopKSampler`, `TopPSampler`, `MixedSampler`.
 - Default: `GreedySampler` (단순 argmax) — `Forward`와 달리 typestate 강제 안 함. 빌더에서 미지정 시 자동 적용 (compile time).
 
-### 2.7 `DecodeObserver` (선택, multi)
+### 2.7 `session::DecodeObserver` (선택, multi)
 
 ```rust
 pub trait DecodeObserver {
@@ -162,18 +175,20 @@ pub trait DecodeObserver {
 
 ---
 
-## 3. `DecodeLoop` 구조
+## 3. `session::DecodeLoop` 구조
+
+> **모듈 경로**: 본 절의 `DecodeLoop`, `DecodeLoopBuilder`, `StepCtx`, `DecodeResult`, `StopReason`은 모두 `session::*`로 노출된다. concrete type 이름은 `session/mod.rs`(또는 `session/decode_loop.rs`)에서 `pub use`로 재출력한다.
 
 ### 3.1 필드와 메서드
 
 ```rust
 pub struct DecodeLoop {
-    forward: Box<dyn Forward>,
-    eviction: Box<dyn EvictionStage>,
-    swap: Box<dyn SwapStage>,
-    cmd_source: Box<dyn CommandSource>,
-    sampler: Box<dyn TokenSampler>,
-    observers: Vec<Box<dyn DecodeObserver>>,
+    forward: Box<dyn Forward>,          // session::Forward
+    eviction: Box<dyn EvictionStage>,   // session::EvictionStage
+    swap: Box<dyn SwapStage>,           // session::SwapStage
+    cmd_source: Box<dyn CommandSource>, // session::CommandSource
+    sampler: Box<dyn TokenSampler>,     // session::TokenSampler
+    observers: Vec<Box<dyn DecodeObserver>>, // session::DecodeObserver
 
     // 내부 카운터 (변경축 없음 — DecodeLoop 자신의 SRP)
     pos: usize,
@@ -271,9 +286,12 @@ impl DecodeLoop {
 
 ## 4. 빌더 패턴 설계 (typestate)
 
+> **모듈 경로**: `session::DecodeLoopBuilder`, `session::NoForward`, `session::HasForward` 모두 `session/decode_loop.rs`에 정의. 사용자는 `use llm_rs2::session::DecodeLoopBuilder;` 1줄로 시작.
+
 ### 4.1 typestate marker
 
 ```rust
+// engine/src/session/decode_loop.rs
 pub struct NoForward; pub struct HasForward(Box<dyn Forward>);
 
 pub struct DecodeLoopBuilder<F = NoForward> {
@@ -366,7 +384,9 @@ fn run_production(args: &Args, ctx: SessionInitCtx) -> anyhow::Result<()> {
 
 ### 4.5 No-op default 위치
 
-신규 `engine/src/session/defaults.rs`에 5개 default 구현체를 모은다 — `NoEvictionStage`, `NoSwapStage`, `NoCommandSource`, `NoOpObserver`, `GreedySampler`. 각 구현체는 lib visibility (`pub(crate)` 또는 `pub`)로 노출하여 외부 사용자가 부분 override 시 explicit하게 import 가능하다.
+신규 `engine/src/session/defaults.rs`에 5개 default 구현체를 모은다 — `NoEvictionStage`, `NoSwapStage`, `NoCommandSource`, `NoOpObserver`, `GreedySampler`. 각 구현체는 lib visibility (`pub` — 외부 부분 override 시 explicit import 필요).
+
+참고: `session::Forward`의 `finalize`/`on_kv_prune`은 **trait 자체의 default 메서드**(§2.2)이며 별도 구현체로 분리되지 않는다 — 외부 기여자는 prefill/step 2개만 구현하면 즉시 컴파일된다 (사용자 결정 #2).
 
 ---
 
@@ -426,7 +446,7 @@ fn build_standard_loop(args: &Args, ctx: &mut SessionInitCtx) -> anyhow::Result<
 }
 ```
 
-이 변환 후 `main()` 본체 + 4개 `build_*_loop` 헬퍼 합계 < 400 LOC 목표. 나머지 코드는 `session::init`, `inference::ModelForward`, `pressure::CacheManagerStage` 등 도메인 모듈에 분배된다.
+이 변환 후 `main()` 본체 + 4개 `build_*_loop` 헬퍼 합계 < 400 LOC 목표. 나머지 코드는 `session::init`(SessionInitCtx 빌드), `session::forward::ModelForward`, `session::eviction::CacheManagerStage` 등 **L4 `session/` 내부 sub-module**에 분배된다 — concrete forward/eviction/swap stage 구현체는 모두 `session/`이 직접 owner이며 L3 도메인의 trait/struct를 builder가 주입받아 보유한다. INV-LAYER-006(L4 struct 필드 = trait object/generic만) 준수.
 
 ---
 
@@ -490,8 +510,9 @@ impl DecodeObserver for EventSinkAdapterObs {
 
 ### 6.5 위치 결정
 
-- `EventSink`는 **그대로 `pressure/` 또는 `observability/events.rs`에 유지**. Step 5 cross-cutting 분리 시 `observability/events.rs`로 이동(이미 §6.7에 매핑).
-- `DecodeObserver`는 **`session/decode_loop.rs` (또는 `session/observer.rs`)에 신설**. L4 도메인 내부 trait.
+- `EventSink`는 **그대로 `pressure/` 또는 `observability/events.rs`에 유지**. Step 5 cross-cutting 분리 시 `observability/events.rs`로 이동(이미 `arch/01-architecture.md` §6.7에 매핑).
+- `DecodeObserver`는 **`session::DecodeObserver` (정의 위치: `session/traits.rs` 또는 `session/decode_loop.rs`, 구현체: `session/observer/*.rs`)**. L4 도메인 내부 trait — 6 trait 전부 `session/` 산하 통일(사용자 결정 #1).
+- `EventSinkAdapterObs`도 `session/observer/event_sink_adapter.rs`(또는 `session/defaults.rs`)에 위치.
 - 두 trait는 의미 격차로 통합 안 하되, **Adapter로 cross-direction 호환** 제공.
 
 ---
@@ -540,34 +561,36 @@ monomorphize 안:
 
 ### 8.1 trait × 구현체 매트릭스
 
+모든 구현체는 **L4 `session/` 산하**에 위치한다 (사용자 결정 #1). L3 inference/pressure의 concrete struct(`TransformerModel`, `KiviCache`, `CacheManager`, `OffloadStore` 등)를 owned로 보유하는 구현체도 `session/`에 둔다 — 이는 L4가 L3 concrete를 builder injection으로 보유하는 자연 위치이다. INV-LAYER-003 위반 여부는 §8.3에서 별도 검증.
+
 | trait | 구현체 | 흡수 변수 (`main()` 인용) | 모듈 위치 (post-migration) |
 |-------|--------|---------------------------|--------------------------|
-| **Forward** | `ModelForward` | `backend`, `model`, `kv_caches`, `workspace`, `gpu_buffers`, `logits` | `session/forward/model_forward.rs` |
-| **Forward** | `KiviForward` | + `kivi_cache`, `kivi_workspace` | `session/forward/kivi_forward.rs` |
-| **Forward** | `OffloadForward` | + `offload_store`, `preload_pool` | `session/forward/offload_forward.rs` |
-| **EvictionStage** | `CacheManagerStage` | `cache_manager`, `score_accumulator`, `skip_config`, `last_skip_ratio`, `auto_eviction`, `protected_prefix` | `session/eviction/cache_manager_stage.rs` |
-| **EvictionStage** | `NoEvictionStage` | — | `session/defaults.rs` |
-| **SwapStage** | `SyncSwapStage` | `incremental_force_swap_plan`, `manager_swap_report_pending`, `ready_weight_swap_report` | `session/swap/sync_swap_stage.rs` |
-| **SwapStage** | `AsyncSwapStage` | + `async_swap_dispatcher`, `intra_forward_swap_hook` | `session/swap/async_swap_stage.rs` |
-| **SwapStage** | `PhaseAwareSwapStage` | + `phase_aware_swap_dispatcher` | `session/swap/phase_aware_swap_stage.rs` |
-| **SwapStage** | `DynamicKSwapStage` | + `dynamic_k_controller` | `session/swap/dynamic_k_swap_stage.rs` |
-| **SwapStage** | `ProbingKSwapStage` | + `probing_k_controller` | `session/swap/probing_k_swap_stage.rs` |
-| **SwapStage** | `NoSwapStage` | — | `session/defaults.rs` |
-| **CommandSource** | `ManagerCmdSource` | `manager_client`, `command_executor`(절반) | `session/cmd/manager_cmd_source.rs` |
-| **CommandSource** | `ScheduleCmdSource` | `experiment_schedule`, `command_executor`(절반) | `session/cmd/schedule_cmd_source.rs` |
-| **CommandSource** | `StdinCmdSource` | (chat REPL stdin polling) | `session/cmd/stdin_cmd_source.rs` |
-| **CommandSource** | `NoCommandSource` | — | `session/defaults.rs` |
-| **TokenSampler** | `GreedySampler` | (default) | `session/defaults.rs` |
-| **TokenSampler** | `TempSampler` | `sampling_config.temperature` | `inference/sampling.rs` (re-export `into_sampler()`) |
-| **TokenSampler** | `TopKSampler` | + `sampling_config.top_k` | (동일) |
-| **TokenSampler** | `TopPSampler` | + `sampling_config.top_p` | (동일) |
-| **TokenSampler** | `MixedSampler` | 전체 `sampling_config` | (동일) |
-| **DecodeObserver** | `ProfilerObs` | `profiler` | `session/observer/profiler_obs.rs` |
-| **DecodeObserver** | `ExperimentWriterObs` | `experiment_writer` | `session/observer/experiment_writer_obs.rs` |
-| **DecodeObserver** | `TbtLogObs` | `tbt_log_writer`, `forward_ms_values`, `tbt_values` | `session/observer/tbt_log_obs.rs` |
-| **DecodeObserver** | `SystemSamplerObs` | `system_sampler` | `session/observer/system_sampler_obs.rs` |
-| **DecodeObserver** | `EventSinkAdapterObs` | (외부 EventSink 보유 시) | `session/defaults.rs` |
-| **DecodeObserver** | `NoOpObserver` | — | `session/defaults.rs` |
+| **session::Forward** | `ModelForward` | `backend`, `model`, `kv_caches`, `workspace`, `gpu_buffers`, `logits` | `session/forward/model_forward.rs` |
+| **session::Forward** | `KiviForward` | + `kivi_cache`, `kivi_workspace` | `session/forward/kivi_forward.rs` |
+| **session::Forward** | `OffloadForward` | + `offload_store`, `preload_pool` | `session/forward/offload_forward.rs` |
+| **session::EvictionStage** | `CacheManagerStage` | `cache_manager`, `score_accumulator`, `skip_config`, `last_skip_ratio`, `auto_eviction`, `protected_prefix` | `session/eviction/cache_manager_stage.rs` |
+| **session::EvictionStage** | `NoEvictionStage` | — | `session/defaults.rs` |
+| **session::SwapStage** | `SyncSwapStage` | `incremental_force_swap_plan`, `manager_swap_report_pending`, `ready_weight_swap_report` | `session/swap/sync_swap_stage.rs` |
+| **session::SwapStage** | `AsyncSwapStage` | + `async_swap_dispatcher`, `intra_forward_swap_hook` | `session/swap/async_swap_stage.rs` |
+| **session::SwapStage** | `PhaseAwareSwapStage` | + `phase_aware_swap_dispatcher` | `session/swap/phase_aware_swap_stage.rs` |
+| **session::SwapStage** | `DynamicKSwapStage` | + `dynamic_k_controller` | `session/swap/dynamic_k_swap_stage.rs` |
+| **session::SwapStage** | `ProbingKSwapStage` | + `probing_k_controller` | `session/swap/probing_k_swap_stage.rs` |
+| **session::SwapStage** | `NoSwapStage` | — | `session/defaults.rs` |
+| **session::CommandSource** | `ManagerCmdSource` | `manager_client`, `command_executor`(절반) | `session/command/manager_cmd_source.rs` |
+| **session::CommandSource** | `ScheduleCmdSource` | `experiment_schedule`, `command_executor`(절반) | `session/command/schedule_cmd_source.rs` |
+| **session::CommandSource** | `StdinCmdSource` | (chat REPL stdin polling) | `session/command/stdin_cmd_source.rs` |
+| **session::CommandSource** | `NoCommandSource` | — | `session/defaults.rs` |
+| **session::TokenSampler** | `GreedySampler` | (default) | `session/defaults.rs` |
+| **session::TokenSampler** | `TempSampler` | `sampling_config.temperature` | `session/sampler/temp_sampler.rs` (얇은 wrapper, 내부에서 `inference::sampling::SamplingConfig` 호출) |
+| **session::TokenSampler** | `TopKSampler` | + `sampling_config.top_k` | `session/sampler/top_k_sampler.rs` |
+| **session::TokenSampler** | `TopPSampler` | + `sampling_config.top_p` | `session/sampler/top_p_sampler.rs` |
+| **session::TokenSampler** | `MixedSampler` | 전체 `sampling_config` | `session/sampler/mixed_sampler.rs` |
+| **session::DecodeObserver** | `ProfilerObs` | `profiler` | `session/observer/profiler_obs.rs` |
+| **session::DecodeObserver** | `ExperimentWriterObs` | `experiment_writer` | `session/observer/experiment_writer_obs.rs` |
+| **session::DecodeObserver** | `TbtLogObs` | `tbt_log_writer`, `forward_ms_values`, `tbt_values` | `session/observer/tbt_log_obs.rs` |
+| **session::DecodeObserver** | `SystemSamplerObs` | `system_sampler` | `session/observer/system_sampler_obs.rs` |
+| **session::DecodeObserver** | `EventSinkAdapterObs` | (외부 EventSink 보유 시) | `session/observer/event_sink_adapter.rs` (또는 `defaults.rs`) |
+| **session::DecodeObserver** | `NoOpObserver` | — | `session/defaults.rs` |
 
 ### 8.2 흡수 안 되는 변수 (DecodeLoop 자체 state)
 
@@ -581,6 +604,32 @@ monomorphize 안:
 
 흡수 매트릭스 합계: `main()` 변수 ~110개 중 ~100개가 6 trait 구현체로 분배 (90%+). 나머지는 DecodeLoop 본체 또는 SessionInitCtx 초기화 헬퍼로 자연 분배.
 
+### 8.3 INV-LAYER-003 위반 검증 (구현체 위치 = `session/` 통일 결정의 부작용)
+
+**검증 대상**: §8.1의 모든 구현체가 `session/`(L4) 산하에 위치한다. 그런데 `ModelForward`는 내부에 L3 `inference::TransformerModel`을 owned 보유하고, `CacheManagerStage`는 L3 `pressure::CacheManager`를 owned 보유한다. 이것이 INV-LAYER-003 위반인가?
+
+**INV-LAYER-003 정의 (`spec/41-invariants.md`)**:
+> Engine L3 `inference/`와 L3 `pressure/`는 **상대 도메인의 trait만** import할 수 있고 concrete 구현체 import 금지. 동일 도메인 내 모듈 cross-import는 자유.
+
+**판정**: **위반 아님**. 세 가지 근거:
+
+1. **`session/`는 L4이지 L3가 아님**. INV-LAYER-003은 L3 inference ↔ L3 pressure 사이의 cross-domain만 통제한다. L4가 L3 concrete를 보유하는 것은 본 INV 영역 밖. (L4의 결합도는 INV-LAYER-006이 별도 통제.)
+2. **L4 → L3 concrete 의존은 INV-LAYER-005가 허용**. L4 `session/`은 L3 `inference/`, `pressure/` 양쪽 도메인을 모두 import할 수 있다 (계층 하향 의존). 단 L4 진입점인 `DecodeLoop` struct 자체는 trait object/generic만 필드로 보유한다(INV-LAYER-006). trait 구현체(`ModelForward` 등) 내부는 L3 concrete를 자유롭게 보유한다.
+3. **빌더 주입 패턴이 자연 정합**. `DecodeLoopBuilder::with_forward(ModelForward::new(model))`은 L4 builder가 L4 구현체를 받고, 그 구현체 내부에서 L3 concrete를 owned로 잡는다. `DecodeLoop`는 `Box<dyn Forward>`만 본다 → INV-LAYER-006 ⊕ INV-LAYER-005 ⊕ INV-LAYER-003 모두 만족.
+
+**경계 사례 — `CacheManagerStage`**: L3 `pressure::CacheManager`를 borrow/own. INV-LAYER-003 점검 — `CacheManagerStage`는 `session/eviction/`(L4)에 위치하므로 본 INV 적용 외. `CacheManager` 자체는 `pressure/manager.rs`(L3 Pressure)에서 trait/struct로 유지.
+
+**경계 사례 — `ModelForward` + `KiviForward`**: `ModelForward`는 `inference::TransformerModel` + `inference::layers::LayerWorkspace` + `Arc<dyn Backend>`를 owned 보유. `KiviForward`는 `pressure::state::KiviCache`도 추가 보유 — 즉 L3 두 도메인의 concrete를 동시에 owned 보유한다. INV-LAYER-003이 만약 L3 내부에 두 도메인을 동시 보유하는 코드를 금지한다면 위반이지만, **본 구현체가 L4에 위치하므로 cross-domain composition은 L4의 자연 역할**이다. 오히려 L4가 L3 두 도메인을 결합하는 진입점이 되어야 SOLID 정합.
+
+**결론**: §8.1 배치는 INV-LAYER-003 무위반. INV-LAYER-006 강화(아래 §8.4 참조)로 충분.
+
+### 8.4 INV-LAYER-006 정의 보강 — `DecodeLoop` 필드 vs trait impl 내부
+
+본 결정에 따라 INV-LAYER-006의 적용 경계를 명확화한다 (spec 본문은 §D에서 갱신).
+
+- **금지(`DecodeLoop` struct 필드)**: `Arc<OpenCLBackend>`, `CacheManager`, `LlamaModel`, `ManagerClient`, `Profiler`, `KiviCache`, `TransformerModel`, `OffloadStore` 등 L1/L3 concrete를 **직접 필드로** 보유 금지. 6 추상화의 `Box<dyn>` 또는 generic bound만 허용.
+- **허용(trait impl struct 내부 필드)**: `session::Forward`/`session::EvictionStage` 등을 impl하는 구현체(`ModelForward`, `CacheManagerStage`)는 L1/L3 concrete를 owned/borrow로 자유 보유. 이들은 builder가 trait object로 추상화 후 주입하는 자연 경로.
+
 ---
 
 ## 9. 마이그레이션 순서 (Phase 4 sub-phase)
@@ -593,8 +642,13 @@ monomorphize 안:
 - **위험**: 거의 없음 — 순수 함수 이동.
 
 ### Phase 4-2 (= Step 2-2) trait 정의 + 빌더
-- **산출물**: `session/decode_loop.rs` (DecodeLoop struct + builder + StepCtx + 6 trait 정의), `session/defaults.rs` (5개 no-op default), `session/observer/mod.rs` (DecodeObserver re-export).
-- **검증 게이트**: `cargo build` PASS, `cargo test --workspace`에서 신규 trait의 dummy unit test 1건 PASS (필수 typestate 컴파일 강제 negative test with `trybuild`), `layer_lint` baseline 그대로 (31건 동결, 신규 trait 정의가 새 위반 야기하지 않음을 확인).
+- **산출물**:
+  - `session/traits.rs` — 6 trait 정의 (`Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver`) + `StepCtx` / `DecodeResult` / `StopReason` / `EvictionOutcome`. 사용자 결정 #1: 모두 `session/`. `Forward::finalize`/`on_kv_prune`은 default no-op (결정 #2).
+  - `session/decode_loop.rs` — `DecodeLoop` struct + `DecodeLoopBuilder` (typestate).
+  - `session/defaults.rs` — 5개 no-op default (`NoEvictionStage`/`NoSwapStage`/`NoCommandSource`/`NoOpObserver`/`GreedySampler`).
+  - `session/observer/mod.rs` — `DecodeObserver` re-export.
+  - `session/mod.rs` — module root + `pub use` re-export로 외부 `use llm_rs2::session::*` 1줄 진입.
+- **검증 게이트**: `cargo build` PASS, `engine/tests/spec/test_inv_layer_007.rs` (trybuild typestate negative test + lifecycle hook default 검증) PASS, `layer_lint` baseline 그대로(31건 동결, 신규 trait 정의가 새 위반 야기하지 않음을 확인).
 - **위험**: trait 시그니처 동결 — 추후 변경이 어렵다. 본 단계 PR 리뷰에 architect/senior implementer 양측 sign-off 필수.
 
 ### Phase 4-3 (= Step 2-3) 첫 구현체 (`ModelForward`)
@@ -607,9 +661,35 @@ monomorphize 안:
 - **검증 게이트**: 모든 디바이스 e2e (S25 + Jetson + host CPU) + chat 모드 / kivi 모드 / offload 모드 sanity (각 1회), TBT 회귀 ≤ 5%, all `bin/generate` integration tests PASS.
 - **위험**: 큰 PR (수천 LOC 이동). 부분 PR 권장 — 모드별로 분할 (`build_standard_loop` 먼저, 이후 kivi, offload).
 
-### Phase 4-5 (= Step 2-5) 나머지 구현체 + chat 통합
-- **산출물**: `KiviForward`, `OffloadForward`, `session/chat_ipc.rs` (← `core/chat_ipc.rs`), `ChatTurnExec` 폐기 (또는 thin adapter로 유지 — §10 위험 분석).
-- **검증 게이트**: chat REPL `/stats` 출력 동일, multi-turn KV 누적 정확성, `core/chat_ipc.rs` import zero (V-11 해소).
+### Phase 4-5 (= Step 2-5) 나머지 구현체 + chat REPL 전면 재작성
+
+**사용자 결정 #3 (2026-05-16)**: `ChatTurnExec` trait은 **폐기**한다. adapter로 유지하지 않는다. 현 `bin/generate.rs`의 chat REPL 1,178 LOC를 본 phase에서 **DecodeLoop 패턴으로 전면 재작성**한다.
+
+- **산출물**:
+  - `KiviForward`, `OffloadForward` (`session/forward/`) — Phase 4-3에서 도입한 `ModelForward`와 동일 패턴.
+  - `session/chat_ipc.rs` (← `core/chat_ipc.rs`) — L4 IPC adapter (§13.8-C, V-11 해소).
+  - `session/chat/repl.rs` (신규) — `run_chat_repl_v2()`. 기존 1,178 LOC 대체. 내부적으로 `DecodeLoop` + `StdinCmdSource` + chat-specific eviction policy + `/reset` 처리.
+  - `session/chat/turn.rs` (신규) — `ChatTurn` struct (단일 user/assistant 1회 왕복 단위). multi-turn KV 누적 상태 owned.
+  - `session/chat/stop_condition.rs` (신규) — chat 모드용 stop token + assistant tag end 감지.
+  - `bin/generate.rs`의 `trait ChatTurnExec`, `impl ChatTurnExec for { Standard, Kivi, Offload }` 3종, `run_chat_repl<E: ChatTurnExec>()` **모두 삭제**.
+- **작업량 재추정** (사용자 결정 #3 반영):
+  - 삭제: chat REPL 관련 1,178 LOC + `ChatTurnExec` trait/impl 3종 (~300 LOC) ≈ 1,478 LOC.
+  - 신규: `session/chat/{repl, turn, stop_condition}.rs` + `session/chat_ipc.rs` 이관 ≈ 800~900 LOC (DecodeLoop 위임으로 boilerplate 감축).
+  - 순 감축: **−500 LOC 내외** (chat 도메인).
+- **Sub-step 분해**:
+  1. **4-5-a**: `KiviForward`, `OffloadForward` 도입 (Phase 4-3 `ModelForward` 패턴 복제). 검증: generate 모드의 kivi/offload e2e 동치.
+  2. **4-5-b**: `session/chat_ipc.rs` 이관 (`core/chat_ipc.rs` → `session/chat_ipc.rs`, V-11 해소). 검증: chat_ipc import zero from `bin/`.
+  3. **4-5-c**: `session/chat/stop_condition.rs` 도입 — chat 전용 stop token 감지 분리. 검증: 기존 stop 동작 동치.
+  4. **4-5-d**: `session/chat/turn.rs` 도입 — multi-turn KV 누적 + `/reset` 처리. 검증: multi-turn에서 KV pos 누적이 기존과 bit-identical.
+  5. **4-5-e**: `session/chat/repl.rs` 신규 작성 (`run_chat_repl_v2`) — DecodeLoop builder 호출로 단일 turn 처리. 검증: 기존 `/stats` 출력 동치 + `/reset` 동작 + chat-specific eviction(`ensure_capacity` per turn) 동치.
+  6. **4-5-f**: `bin/generate.rs`의 `ChatTurnExec` trait 및 모든 impl 삭제. `main()`의 chat 분기를 `run_chat_repl_v2` 호출로 교체. 검증: cargo build PASS + grep `ChatTurnExec` 결과 0건.
+- **검증 게이트 (강화)**:
+  - **G1** chat REPL `/stats` 출력 라인-단위 동치 (기존 generate.rs의 stats_line 포맷 보존).
+  - **G2** multi-turn KV 정확성 — `assistant turn 1 → user turn 2 → assistant turn 2` 시나리오에서 turn 2 첫 토큰이 기존 구현과 bit-identical.
+  - **G3** `/reset` 명령 동작 — KV pos = 0, score accumulator clear, manager 측에 reset 통보(있다면). 기존 동작 라인-단위 동치.
+  - **G4** chat-specific eviction 동치 — 각 turn 종료 시 `ensure_capacity` 호출 시점 + 결과 토큰 수가 기존과 일치.
+  - **G5** `core/chat_ipc.rs` import zero from `bin/`, `core/chat_template.rs`는 본 phase 범위 외 (Migration Step 4에서 처리).
+- **위험**: §10.4 "chat 전면 재작성 risk" 참조. 본 phase가 다른 Phase보다 PR 규모가 크므로 sub-step별 PR 분할 필수.
 
 ### 다음 진입점 (이 문서 완료 후)
 - Implementer에게 Phase 4-1 위임. SessionInitCtx 헬퍼 추출이 첫 작업.
@@ -642,23 +722,25 @@ monomorphize 안:
 - **심각도**: 낮음 (이론 200 ns ≪ 14 ms).
 - **완화**: Phase 4-3 measurement gate (§7.3). 회귀 시 partial monomorphization escape hatch.
 
-### 10.4 `ChatTurnExec` 통합
+### 10.4 chat REPL 전면 재작성 위험 (`ChatTurnExec` 폐기 확정)
 
-- **현 상황**: `bin/generate.rs:11814`의 `trait ChatTurnExec`가 이미 (a) prefill (b) decode_step (c) reset (d) ensure_capacity (e) on_turn_end (f) stats_line 6 메서드의 *작은 god trait*. KV-type 별 variant (standard/kivi/offload) 3개 impl.
-- **3개 옵션**:
+**사용자 결정 #3 (2026-05-16)**: `ChatTurnExec` trait은 폐기한다. adapter로 유지하지 않는다. Phase 4-5에서 chat REPL 1,178 LOC을 DecodeLoop 패턴으로 **전면 재작성**한다 (§9 Phase 4-5 sub-step 분해 참조).
 
-| 옵션 | 내용 | 장점 | 단점 |
-|------|------|------|------|
-| (a) **`ChatTurnExec` 폐기** | `Forward` + `EvictionStage::ensure_capacity` + 외부 `TurnRunner` struct로 분해 | SOLID 정합 | chat REPL의 6 메서드를 trait 3개로 분배 — 호출자 코드 늘어남 |
-| (b) **Adapter 유지** | `ChatTurnExec`를 `Forward` 위의 *조합 어댑터*로 유지 (내부에서 Forward + Eviction trait 호출) | 외부 chat 호출자 미변경 | 추상화 한 단계 추가 (trait → trait → trait) |
-| (c) **별도 유지** | `ChatTurnExec`는 chat 도메인 전용으로 보존, `DecodeLoop`는 generate 전용 | 안전, 점진적 | 코드 중복 — `ModelForward`와 `StandardTurnExec` 양쪽이 같은 work를 함 |
+이 결정의 트레이드오프 — adapter 유지가 점진적 마이그레이션 안정성을 줄 수 있었지만, 외부 공개 후 `ChatTurnExec`가 영구 부담이 되는 risk가 더 크다고 판단. 재작성 risk는 sub-step 분해(4-5-a~f)로 PR 단위를 잘게 쪼개 완화한다.
 
-**권장: (b) Adapter 유지**. 근거:
-- `ChatTurnExec`는 KV-type 분기를 이미 잘 해주고 있음 (`run_chat_repl<E: ChatTurnExec>`은 트레잇 매개변수 패턴).
-- `DecodeLoop::run_until_stop`이 chat REPL의 main loop 역할을 흡수하되, `ChatTurnExec::reset` / `ensure_capacity` / `stats_line`은 chat 전용 메서드이므로 `Forward` 본 trait에 끌어올리면 SRP 위반 (Forward 사용자 대부분은 reset/stats가 필요 없음).
-- Adapter: `StandardChatExec` 구조체가 `Forward` impl을 내부 보유하면서 `ChatTurnExec`도 impl. `run_chat_repl`은 `ChatTurnExec`만 의존. 신규 `DecodeLoop`는 `Forward`만 의존. 두 경로가 깔끔히 분리.
+#### 재작성 risk 5종
 
-Migration Step 2-5에서 `ChatTurnExec` 인터페이스만 thin 유지하면서 내부 구현이 `Forward` impl을 위임하도록 리팩토링.
+| # | risk | 심각도 | 완화 방안 |
+|---|------|--------|----------|
+| R1 | **multi-turn KV state 보존** — chat REPL은 turn 사이 KV pos를 누적 보존. 재작성 시 turn 경계에서 pos 손실 또는 중복 누적 위험. | 높음 | sub-step 4-5-d 검증 게이트 G2 (turn 2 첫 토큰 bit-identical). `ChatTurn` struct가 KV pos owned 보유 + DecodeLoop을 turn마다 build/drop 패턴은 금지(KV 손실), turn마다 같은 DecodeLoop를 재사용하되 `run_until_stop()` 진입/탈출만 반복. |
+| R2 | **`/reset` 명령 처리** — KV clear + score accumulator clear + manager 측 notify (있다면) 동시 수행. 재작성 시 일부 누락 위험. | 중간 | 검증 게이트 G3. `/reset` 처리를 `CommandSource::poll` 결과 `EngineCommand::ResetSession`으로 통일하여 `DecodeLoop::handle_command`에서 단일 경로 처리. |
+| R3 | **chat-specific eviction 동치** — turn 종료 시 `ensure_capacity(next_turn_prompt_len)` 호출 — 기존 `ChatTurnExec::ensure_capacity` 메서드. `EvictionStage::ensure_capacity` (§2.3 옵션 메서드)로 자연 흡수되지만 호출 시점/결과 토큰 수 정확히 동치 여부 검증 필요. | 중간 | 검증 게이트 G4. 4-5-d/e 단계에서 기존 호출 시점 trace 추출 후 새 구현과 diff. |
+| R4 | **stats_line 포맷 호환성** — 기존 `/stats` 명령 출력은 외부 tool/대시보드가 파싱할 수 있다. 포맷 변경 금지. | 낮음 | 검증 게이트 G1. 라인-단위 string diff. 새 `TbtLogObs` 또는 chat 전용 `ChatStatsObs`가 동일 포맷 emit. |
+| R5 | **PR 규모 폭발** — 1,478 LOC 삭제 + 900 LOC 신규 작성을 단일 PR로 진행 시 리뷰 불가. | 높음 | sub-step 4-5-a~f를 6개 PR로 분할. 각 PR은 단일 디바이스 e2e + cargo test PASS를 자체 게이트로. |
+
+#### 핵심 보강 — KiviForward/OffloadForward는 chat REPL의 KV-type 분기를 자연 흡수
+
+기존 `ChatTurnExec`이 KV-type 분기(standard/kivi/offload)를 trait dispatch로 처리했다. 폐기 후엔 `Forward` trait의 구현체 3종(`ModelForward`/`KiviForward`/`OffloadForward`)이 동일 역할을 한다 — chat REPL은 자신이 어떤 Forward인지 모르고, `Box<dyn Forward>`만 받아 turn loop를 돈다. 따라서 분기 코드 자체가 builder 단계로 이동하며 chat 로직에서 사라진다. 이는 재작성 단순화의 큰 이점이다.
 
 ### 10.5 인라인 카운터 (start_time, start_pos 등)
 
@@ -675,8 +757,34 @@ Migration Step 2-5에서 `ChatTurnExec` 인터페이스만 thin 유지하면서 
 
 ---
 
-## 결정 보류 사항 (사용자 결정 요청)
+## 11. 확정 결정 (사용자, 2026-05-16)
 
-1. **`session/` vs `inference/` trait 위치**: 본 문서는 `Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver` 6 trait 모두를 **L4 `session/`** 산하에 둔다 (decode loop 책임 분해이므로). 그러나 `Forward`와 `TokenSampler`는 inference 도메인 성격(forward path + sampling)이라 **L3 `inference/`에 둘 수도 있다**. 후자라면 builder는 L3 trait을 import하지만 INV-LAYER-003(L3↔L3 trait import 허용)으로 합법. **사용자 선호?**
-2. **`Forward::on_kv_prune` default**: 안전상 명시적 implement 권장(§10.1)했으나, 외부 사용자 부담 줄이려면 default `{ /* no-op */ }`. KV 동기화를 깜빡 잊을 위험과 외부 친화성 트레이드오프. **명시 vs default?**
-3. **chat REPL의 `ChatTurnExec` 처분 옵션** (§10.4): 권장은 (b) Adapter 유지지만, (a) 폐기를 선택하면 코드 단순화가 더 깊다. 외부 공개 시 chat 도메인 노출 정도 결정 필요. **(a) / (b) / (c)?**
+본 절은 본 문서 작성 시점에 유보되었던 3건의 설계 결정에 대한 사용자 확정안과 근거를 기록한다. 본 문서의 모든 §섹션은 이 결정에 따라 갱신되었다.
+
+### 11.1 6 trait 모두 L4 `session/`에 위치
+
+- **결정**: `Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver` 6 trait + `StepCtx`를 **모두 `session/` (L4)에 정의**한다. `Forward`/`TokenSampler`도 inference/(L3)가 아닌 session/에.
+- **근거**: 빌더와 trait이 한 모듈에 있는 단순성을 우선. 외부 기여자가 `use llm_rs2::session::*` 1줄로 시작 가능. trait이 L3로 흩어지면 import 경로가 `session::DecodeLoopBuilder` + `inference::Forward` + `inference::sampling::TokenSampler` 등으로 분기되어 인지 부담이 늘어난다.
+- **버린 옵션**: `Forward`/`TokenSampler`를 `inference/`로 끌어올림 — INV-LAYER-003은 합법이나 외부 import 부담 증가.
+- **영향 받는 §**: §2.1 (trait 위치 명시), §2.2~2.7 (trait 헤더에 `session::` prefix), §3 헤더, §4 헤더, §6.5 (DecodeObserver 위치), §8.1 (구현체 위치 표 `session/` 통일), §8.3 (INV-LAYER-003 위반 검증, 무위반 결론).
+
+### 11.2 `Forward::on_kv_prune`/`finalize` default = no-op
+
+- **결정**: `Forward` trait의 lifecycle hook(`on_kv_prune`, `finalize`)은 **default no-op** 제공. 외부 기여자가 `prefill`/`step` 2개만 구현해도 컴파일 성공.
+- **근거**: 외부 친화성 우선. 단순 forward(KV 미보유)는 lifecycle 무시해도 안전. KV 보유 구현체(`ModelForward`/`KiviForward`/`OffloadForward`)는 `on_kv_prune` override를 architect review 게이트로 강제.
+- **버린 옵션**: 명시적 implement 강제 — 외부 기여자 진입 장벽 증가, 단순 forward에 boilerplate 부담.
+- **영향 받는 §**: §2.2 — default impl 시그니처 추가 + 주의 사항(KV 보유 구현체는 반드시 override) 명시.
+
+### 11.3 `ChatTurnExec` trait 폐기, chat REPL 전면 재작성
+
+- **결정**: `ChatTurnExec` trait은 **폐기**한다. adapter로 유지하지 않는다. Phase 4-5에서 chat REPL 1,178 LOC을 DecodeLoop 패턴으로 **전면 재작성**.
+- **근거**: 외부 공개 후 `ChatTurnExec`가 영구 부담이 됨. 단기 마이그레이션 안정성보다 장기 SOLID 정합 우선. KV-type 분기는 `Forward` 구현체 3종이 자연 흡수하므로 chat 로직 자체가 단순해진다.
+- **버린 옵션**: (b) Adapter 유지, (c) `ChatTurnExec` 별도 보존 — 둘 다 trait 중첩 또는 코드 중복을 야기.
+- **영향 받는 §**: §9 Phase 4-5 (전면 재작성으로 강화 + sub-step 4-5-a~f 분해 + 검증 게이트 G1~G5 추가), §10.4 (adapter 옵션 표 제거 + 재작성 risk R1~R5 + sub-step 매핑).
+
+### 11.4 결정 후속 작업
+
+- **arch/01-architecture.md §6.5**: trait 위치 + Mermaid 다이어그램 `session/` 통일 갱신 (본 commit에 포함).
+- **ARCHITECTURE.md §13.4**: `session/` 디렉토리 트리에 6 trait + 구현체 정확히 반영 (본 commit).
+- **spec/41-invariants.md INV-LAYER-006**: 문구 정확화 — "L4 session::DecodeLoop은 concrete backend/manager/profiler를 직접 참조 금지" (본 commit).
+- **Implementer 위임 prompt (Phase 4-1)**: 본 finalize 후에도 그대로 유효하다 — Phase 4-1은 `session/init.rs` 외곽 추출 단계로, 6 trait 위치 결정의 영향을 받지 않는다. Phase 4-2부터 본 결정이 반영된다.

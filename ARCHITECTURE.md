@@ -1168,11 +1168,78 @@ L3 내부는 도메인(Pressure / Inference)과 추상화 위계(Coordinator / P
 
 ### 13.4 Directory Migration Map
 
-> **갱신 (2026-05-16, §13.8 결정 반영)**: §A~D 결정 사항을 매핑에 반영. 변경된 행은 **비고** 끝에 `[§13.8-X]` 표시.
+> **갱신 (2026-05-16, §13.8 결정 반영 + Task #4 finalize)**: §A~D 결정 사항을 매핑에 반영. 변경된 행은 **비고** 끝에 `[§13.8-X]` 표시. Task #4 finalize 결정(6 trait `session/` 통일, `Forward` lifecycle hook default no-op, `ChatTurnExec` 폐기 — 자세한 결정 근거는 `arch/inference_pipeline.md` §11)에 따라 `session/` 디렉토리 트리는 §13.4.1 sub-section에 상세 기재한다.
+
+#### 13.4.1 `session/` 디렉토리 구조 (post-migration, Task #4 finalize 반영)
+
+```text
+session/
+├── mod.rs                                  module root + pub use
+├── traits.rs                               6 trait 정의 (사용자 결정 #1: 모두 session/)
+│                                            - Forward         (lifecycle hook default no-op, 결정 #2)
+│                                            - EvictionStage
+│                                            - SwapStage
+│                                            - CommandSource
+│                                            - TokenSampler
+│                                            - DecodeObserver
+│                                            + StepCtx / DecodeResult / StopReason / EvictionOutcome
+├── decode_loop.rs                          DecodeLoop struct + DecodeLoopBuilder (typestate)
+│                                            - INV-LAYER-006: 필드 = Box<dyn> only
+│                                            - INV-LAYER-007: build() = HasForward typestate gate
+├── defaults.rs                             no-op/default 구현체
+│                                            - NoEvictionStage / NoSwapStage / NoCommandSource
+│                                            - NoOpObserver / GreedySampler
+├── forward/
+│   ├── mod.rs
+│   ├── model_forward.rs                    Forward 표준 (backend + TransformerModel + KVCache owned)
+│   ├── kivi_forward.rs                     KIVI 2bit KV quant
+│   └── offload_forward.rs                  per-layer prefetch
+├── eviction/
+│   ├── mod.rs
+│   └── cache_manager_stage.rs              EvictionStage (pressure::CacheManager owned)
+├── swap/
+│   ├── mod.rs
+│   ├── sync_swap_stage.rs
+│   ├── async_swap_stage.rs
+│   ├── phase_aware_swap_stage.rs
+│   ├── dynamic_k_swap_stage.rs
+│   └── probing_k_swap_stage.rs
+├── command/
+│   ├── mod.rs
+│   ├── manager_cmd_source.rs
+│   ├── schedule_cmd_source.rs
+│   └── stdin_cmd_source.rs
+├── sampler/
+│   ├── mod.rs                              (TempSampler 등은 얇은 wrapper)
+│   ├── temp_sampler.rs
+│   ├── top_k_sampler.rs
+│   ├── top_p_sampler.rs
+│   └── mixed_sampler.rs
+├── observer/
+│   ├── mod.rs
+│   ├── profiler_obs.rs
+│   ├── experiment_writer_obs.rs
+│   ├── tbt_log_obs.rs
+│   ├── system_sampler_obs.rs
+│   └── event_sink_adapter.rs               EventSink → DecodeObserver bridge
+├── init.rs                                 SessionInitCtx (Phase 4-1 외곽 추출)
+├── cli.rs                                  Args (clap::Parser) + dump_config 헬퍼
+├── prefill.rs                              prompt processing 헬퍼
+├── chat_ipc.rs                             (← core/chat_ipc.rs, §13.8-C, V-11 해소)
+├── chat/                                   Phase 4-5: ChatTurnExec 폐기 후 1,178 LOC 재작성 (결정 #3)
+│   ├── mod.rs
+│   ├── repl.rs                             run_chat_repl_v2 (DecodeLoop 위임)
+│   ├── turn.rs                             ChatTurn struct (multi-turn KV 누적)
+│   └── stop_condition.rs                   chat 전용 stop token / assistant tag end
+└── eval/                                   (← eval/, V-28/V-29 해소)
+    ├── mod.rs
+    ├── eval_loop.rs
+    └── eviction_hook.rs
+```
 
 | 현재 경로 | 새 경로 | 비고 |
 |----------|--------|------|
-| `bin/generate.rs` | `bin/generate.rs` (thin) + `session/decode_loop.rs` | 13,022 LOC monolith 분리 |
+| `bin/generate.rs` | `bin/generate.rs` (thin, ≤400 LOC) + `session/` 디렉토리 전체 (위 트리) | 13,022 LOC monolith 분리. trait/구현체 통일 위치 = `session/`. `bin/generate.rs::run_chat_repl` + `ChatTurnExec` trait → `session/chat/` 신규 재작성으로 폐기 [Task #4 finalize 2026-05-16] |
 | `bin/{test_backend,test_model,signal_injector,microbench_*}.rs` | `bin/` (그대로) | |
 | `core/backend.rs` | `shared/backend.rs` | trait 정의 |
 | `core/tensor.rs`, `core/buffer.rs`, `core/shape.rs`, `core/memory.rs` | `shared/{tensor,buffer,shape,memory_buf}.rs` | `core/memory.rs` → `memory_buf.rs` (재이름) |
@@ -1308,14 +1375,14 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 
 - **Step 2-1 외곽 추출** — `main()` 7,051 LOC 중 SOLID 영향 없는 helper 함수 묶음(템플릿 로딩, CLI dump, tokenizer 초기화 등) 7건을 `session/init.rs` / `session/cli_dump.rs`로 분리. 코드 이동만, 신규 trait 없음.
   - 검증 게이트: `cargo test --workspace` PASS + S25/Jetson e2e 생성 동치 (greedy seed 동일 토큰).
-- **Step 2-2 trait 정의 + 빌더** — `inference/` 모듈 신설 (이름은 §10에서 확정), `Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver` 6 trait 시그니처 + `StepCtx` struct + `DecodeLoopBuilder` typestate + no-op default(`inference/defaults.rs`)까지 도입. 실제 사용처 없음(0-impl).
-  - 검증 게이트: `cargo build` PASS + `layer_lint` baseline 그대로(31건 동결).
-- **Step 2-3 첫 구현체 (`ModelForward`)** — `inference::Forward` 구현체 1개 + `EvictionStage` no-op + `TokenSampler` 1개를 도입하고, 신규 `bin/probe_inference_loop.rs` (microbench)에서 `DecodeLoop::run`을 호출하여 forward path만 검증. `bin/generate.rs`는 미변경.
+- **Step 2-2 trait 정의 + 빌더** — `session/` 모듈에 `session/traits.rs` 신설(`Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver` 6 trait 시그니처 + `StepCtx` struct), `session/decode_loop.rs`(`DecodeLoop` + `DecodeLoopBuilder` typestate), `session/defaults.rs`(no-op default 5종)까지 도입. 실제 사용처 없음(0-impl). 6 trait 위치는 Task #4 finalize(2026-05-16 사용자 결정 #1)에 따라 `session/` 통일. `Forward::finalize`/`on_kv_prune`은 default no-op(결정 #2).
+  - 검증 게이트: `cargo build` PASS + `layer_lint` baseline 그대로(31건 동결) + `engine/tests/spec/test_inv_layer_007.rs`(`trybuild` typestate negative test) PASS.
+- **Step 2-3 첫 구현체 (`ModelForward`)** — `session::Forward` 구현체 1개 + `session::EvictionStage` no-op + `session::TokenSampler` 1개를 도입하고, 신규 `bin/probe_inference_loop.rs` (microbench)에서 `DecodeLoop::run`을 호출하여 forward path만 검증. `bin/generate.rs`는 미변경. (Task #4 finalize 2026-05-16 사용자 결정 #1 — 6 trait 모두 `session/`에 위치)
   - 검증 게이트: probe binary가 S25에서 기존 generate.rs와 동일 TBT 대역(±10%) + same first-token.
 - **Step 2-4 main() 조립자화** — `bin/generate.rs::main()`을 builder 호출로 교체. 6 책임이 6 trait 구현체로 흡수. 남는 코드는 `clap::Parser::parse()` + `DecodeLoopBuilder` 조립 + `prefill` + `run` + `finalize` 5단계 ≤ 400 LOC.
   - 검증 게이트: 모든 디바이스 e2e 통과 (S25 + Jetson + host CPU), TBT 회귀 ≤ 5% (Adreno 14ms baseline).
-- **Step 2-5 나머지 구현체 + chat 통합** — `KiviForward` / `OffloadForward` / `ChatTurnExec`를 동일 trait 패턴으로 흡수. `run_chat_repl`을 `DecodeLoop::run_until_stop`으로 통합. `core/chat_ipc.rs` → `session/chat_ipc.rs` 이관.
-  - 검증 게이트: chat REPL `/stats` 출력 동일 + multi-turn KV 누적 정확성.
+- **Step 2-5 나머지 구현체 + chat REPL 전면 재작성** — `KiviForward` / `OffloadForward` 도입. **`ChatTurnExec` trait은 폐기**(Task #4 finalize 2026-05-16 사용자 결정 #3). `bin/generate.rs`의 chat REPL 1,178 LOC + `ChatTurnExec` 3 impl(~300 LOC)을 삭제하고 `session/chat/{repl, turn, stop_condition}.rs`로 **DecodeLoop 패턴 전면 재작성**. `core/chat_ipc.rs` → `session/chat_ipc.rs` 이관. sub-step 4-5-a~f로 PR 분할 (`arch/inference_pipeline.md` §9 참조).
+  - 검증 게이트: G1(/stats 라인 동치) + G2(multi-turn KV bit-identical) + G3(/reset 동작) + G4(chat-specific eviction 동치) + G5(`core/chat_ipc.rs` import zero).
 
 **Step 3: L1/L2 경계 정리** (backend impl이 `shared/` 외 import 제거 + backend-specific buffer/pool/포맷 재배치)
 - V-01 (opencl→gpu_self_meter): trait inversion (`GpuEventMeter` trait 신설)
