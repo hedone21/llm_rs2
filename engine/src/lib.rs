@@ -15,3 +15,4 @@ pub mod eval;
 pub mod experiment;
 pub mod profile;
 pub mod resilience;
+pub mod session;
