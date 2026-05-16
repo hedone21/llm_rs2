@@ -85,12 +85,15 @@ impl GraphCache {
             let lg = LayerGraph::build(runtime, idx, weights.as_ref(), cfg)?;
 
             // INV-167 / ENG-QNN-209: graphFinalize ≤ 200 ms/layer.
-            ensure!(
-                lg.finalize_ms <= FINALIZE_BUDGET_MS,
-                "ENG-QNN-209/INV-167: layer {idx} graphFinalize {} ms > {} ms (budget)",
-                lg.finalize_ms,
-                FINALIZE_BUDGET_MS
-            );
+            // LLMRS_SKIP_FINALIZE_BUDGET=1: cold-IO ablation 측정용 우회.
+            if std::env::var("LLMRS_SKIP_FINALIZE_BUDGET").is_err() {
+                ensure!(
+                    lg.finalize_ms <= FINALIZE_BUDGET_MS,
+                    "ENG-QNN-209/INV-167: layer {idx} graphFinalize {} ms > {} ms (budget)",
+                    lg.finalize_ms,
+                    FINALIZE_BUDGET_MS
+                );
+            }
 
             self.finalize_total_ms = self.finalize_total_ms.saturating_add(lg.finalize_ms);
             self.layers.push(Arc::new(lg));

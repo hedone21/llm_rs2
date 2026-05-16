@@ -21,6 +21,11 @@ fn rss_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("LLMRS_RSS_TRACE").is_ok())
 }
 
+fn io_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LLMRS_IO_TRACE").is_ok())
+}
+
 /// Print a one-line RSS snapshot to stderr, tagged with `tag`.
 ///
 /// When `LLMRS_RSS_TRACE` is not set, this function is a zero-cost no-op:
@@ -61,6 +66,82 @@ fn rss_trace_impl(tag: &str) {
 /// Non-Linux/non-Android stub: always no-op.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn rss_trace_impl(_tag: &str) {}
+
+/// Print a one-line `/proc/self/io` snapshot to stderr, tagged with `tag`.
+/// Controlled by `LLMRS_IO_TRACE`. Used to verify whether prefault/swap
+/// stages perform real disk read or only metadata operations.
+pub fn io_trace(tag: &str) {
+    if !io_trace_enabled() {
+        return;
+    }
+    io_trace_impl(tag);
+}
+
+/// Return `read_bytes` from `/proc/self/io` (0 on error / non-Linux).
+/// Used by per-phase delta tracing (e.g., swap_executor tick).
+pub fn read_bytes_now() -> u64 {
+    read_bytes_impl()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn io_trace_impl(tag: &str) {
+    match read_proc_io() {
+        Ok(io) => eprintln!(
+            "[IO] tag={} rchar={} wchar={} read_bytes={} write_bytes={}",
+            tag, io.rchar, io.wchar, io.read_bytes, io.write_bytes,
+        ),
+        Err(e) => eprintln!("[IO] tag={} error={}", tag, e),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn io_trace_impl(_tag: &str) {}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_bytes_impl() -> u64 {
+    read_proc_io().map(|io| io.read_bytes).unwrap_or(0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn read_bytes_impl() -> u64 {
+    0
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct ProcIoFields {
+    rchar: u64,
+    wchar: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_proc_io() -> Result<ProcIoFields, String> {
+    let content = std::fs::read_to_string("/proc/self/io").map_err(|e| format!("read: {e}"))?;
+    let mut rchar = 0u64;
+    let mut wchar = 0u64;
+    let mut read_bytes = 0u64;
+    let mut write_bytes = 0u64;
+    for line in content.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let val: u64 = rest.trim().parse().unwrap_or(0);
+        match key.trim() {
+            "rchar" => rchar = val,
+            "wchar" => wchar = val,
+            "read_bytes" => read_bytes = val,
+            "write_bytes" => write_bytes = val,
+            _ => {}
+        }
+    }
+    Ok(ProcIoFields {
+        rchar,
+        wchar,
+        read_bytes,
+        write_bytes,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // /proc/self/status parser (Linux and Android)

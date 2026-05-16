@@ -23,17 +23,45 @@ pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 
 /// Layer importance formula variant for the §4 comparison study.
 ///
-/// Three forms are supported; `compare` mode in `--importance-formula`
-/// activates all three side-by-side via `ImportanceCollector::new_with_formula(..., true)`.
+/// Five forms are supported; `compare` mode in `--importance-formula`
+/// activates the cosine-based variants side-by-side via
+/// `ImportanceCollector::new_with_formula(..., true)`.  The three DP-LLM
+/// variants (single-tensor relative, multi-tensor relative, single-tensor
+/// absolute) are computed once after warmup in `noise_table.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportanceFormula {
     /// `1 − cos(mean_pool(h_in), mean_pool(h_out))` — current ARGUS baseline.
     MeanPool,
     /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` — ShortGPT BI (Men et al., 2024).
     ShortGptBi,
-    /// DP-LLM proxy. Importance is a constant placeholder; the real
-    /// signal is `dpllm_epsilon` computed in `noise_table` after warmup.
+    /// DP-LLM proxy (single tensor, relative L2 error on `attn_output.weight`).
     DpllmProxy,
+    /// DP-LLM proxy (multi-tensor, summed relative L2 error across attn + MLP
+    /// weight tensors).
+    DpllmMulti,
+    /// DP-LLM proxy (single tensor, absolute L2 error — drops the `‖W·x‖`
+    /// normalisation that the single-tensor variant uses).
+    DpllmAbs,
+    /// QCF-inspired multiplicative composition of attention block
+    /// perturbations:  `ε_v_rel × ε_o_rel`  where  `ε_t_rel = ‖(W_p − W_q)·x‖
+    /// / ‖W_p·x‖`  for `t ∈ {W_v, W_o}`.  Decomposes the runtime QCF/caote
+    /// attention output perturbation `‖ΔO‖/‖O‖` into two weight-space factors.
+    DpllmQcf,
+    /// §4.2 cascade attention perturbation (F4 + F5 dual output).
+    ///
+    /// - **F4** (cascade-aware single):
+    ///   `‖(W_o^F16 − W_o^Q4) · V_out‖_F / ‖W_o^F16 · V_out‖_F`,
+    ///   where `V_out = softmax(QK^T/√d_h) · W_v · X` is computed with F16 weights.
+    /// - **F5** (direct attention output):
+    ///   `‖O^F16 − O^Q4‖_F / ‖O^F16‖_F`, where
+    ///   `O = W_o · softmax(QK^T/√d_h) · W_v · X` is the full attention head
+    ///   output, evaluated with F16 weights for `O^F16` and Q4 weights for `O^Q4`.
+    ///
+    /// Both are computed post-warmup in `noise_table::compute_cascade_attn_perturbation`
+    /// using the per-layer raw `[T × d]` hidden states cached in the collector.
+    /// F5 is mathematically aligned with the KV-side QCF (Eq. \ref{eq:qcf-perhead})
+    /// since both measure the relative L2 perturbation of the attention output.
+    DirectAttn,
 }
 
 impl ImportanceFormula {
@@ -42,6 +70,10 @@ impl ImportanceFormula {
             ImportanceFormula::MeanPool => "mean_pool",
             ImportanceFormula::ShortGptBi => "shortgpt_bi",
             ImportanceFormula::DpllmProxy => "dpllm_proxy",
+            ImportanceFormula::DpllmMulti => "dpllm_multi",
+            ImportanceFormula::DpllmAbs => "dpllm_abs",
+            ImportanceFormula::DpllmQcf => "dpllm_qcf",
+            ImportanceFormula::DirectAttn => "direct_attn",
         }
     }
 }

@@ -75,6 +75,10 @@ fn test_dump_schema_round_trip() {
         eval_ll_output: None,
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -155,6 +159,10 @@ fn test_ratio_zero_swap_count_zero() {
         eval_ll_output: None,
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -232,6 +240,10 @@ fn test_ratio_033_skip_count_5_for_16l() {
         eval_ll_output: None,
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -310,6 +322,10 @@ fn test_ratio_one_caps_at_n_minus_2() {
         eval_ll_output: None,
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -350,6 +366,10 @@ fn test_nan_epsilon_excluded() {
         eval_ll_output: None,
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -407,6 +427,10 @@ fn test_importance_noise_in_dump() {
         eval_ll_output: None,
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -502,6 +526,10 @@ fn test_ppl_none_serializes_as_null() {
         eval_ll_output: None,
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -599,6 +627,10 @@ fn test_eval_ll_output_some_included_in_json() {
         eval_ll_output: Some(&eval_output),
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -684,6 +716,10 @@ fn test_eval_ll_output_none_serializes_as_null() {
         eval_ll_output: None,
         swap_algorithm: None,
         trajectory: None,
+        dpllm_epsilon: None,
+        dpllm_epsilon_multi: None,
+        dpllm_epsilon_abs: None,
+        dpllm_epsilon_qcf: None,
     };
 
     let v = dump_and_parse(&ctx);

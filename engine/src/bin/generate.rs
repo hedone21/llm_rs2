@@ -883,6 +883,19 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     qcf_warmup_tokens: usize,
 
+    /// §4.2 decode-X experiment (EuroSys'27). When > 0, the QCF-dump warmup
+    /// workflow runs `N` greedy-generation decode steps after the regular
+    /// prefill and caches the per-layer hidden state at each decode step in
+    /// a fresh collector. Two extra F5 vectors land in the dump JSON:
+    /// - `direct_attn_f5_decode_only`: X = decode-only raws (T = N).
+    /// - `direct_attn_f5_prefill_decode`: X = concat(prefill raws, decode raws) (T = 256 + N).
+    /// The regular `direct_attn_f5` (prefill X, T = 256) is always written.
+    /// Decode token 0 = argmax of prefill's final logits; subsequent decode
+    /// tokens = argmax of each previous decode-step logits (greedy).
+    /// Only meaningful when a secondary GGUF (Q4) is loaded.
+    #[arg(long, default_value_t = 0)]
+    decode_x_steps: usize,
+
     /// Layer-selection algorithm for `--qcf-dump` swap path (U5 ablation, EuroSys'27).
     /// Values: `imp` (importance-aware, default — production behavior),
     /// `seq` (sequential 0→N-1), `rev` (reverse N-1→0),
@@ -1115,6 +1128,26 @@ struct Args {
     /// 측정 시 명시적으로 enable.
     #[arg(long, default_value_t = false)]
     swap_dynamic_k: bool,
+
+    /// Probing-K adaptive controller — bottom-up alternative to `--swap-dynamic-k`
+    /// (ARGUS). Starts at `K = 1` and probes upward whenever `release_pending`
+    /// stays at 0 for a stability window. On any spike the controller drops
+    /// `K -= 1` symmetrically. Mutually exclusive with `--swap-dynamic-k`.
+    ///
+    /// Requires `--swap-incremental-per-tick > 0` (initial value ignored — the
+    /// controller starts from 1) and `--swap-async-dispatch`.
+    #[arg(long, default_value_t = false)]
+    swap_probing_k: bool,
+
+    /// Probing-K growth schedule when probing up. `linear` adds 1; `binary`
+    /// doubles. Only effective with `--swap-probing-k`.
+    #[arg(long, default_value = "linear")]
+    swap_probing_growth: String,
+
+    /// Probing-K stability window (clean tokens before probing up). Only with
+    /// `--swap-probing-k`.
+    #[arg(long, default_value_t = 5)]
+    swap_probing_window: usize,
 
     /// Phase-aware swap chunk 진단 size (MB). v1 per-tensor chunking에서는
     /// 실제 분할에 사용되지 않고 진단/보고 용도. 측정에 따라 v2에서 sub-tensor
@@ -3111,6 +3144,11 @@ fn main() -> anyhow::Result<()> {
     // K is determined entirely by timing (forward wall vs per-layer drop cost);
     // there is no static upper cap. Per-tick dispatch is still bounded by the
     // sub-batch reactive pause inside `SwapExecutor::execute_on_slots`.
+    if args.swap_dynamic_k && args.swap_probing_k {
+        anyhow::bail!(
+            "--swap-dynamic-k and --swap-probing-k are mutually exclusive — pick one controller"
+        );
+    }
     let mut dynamic_k_controller: Option<llm_rs2::models::weights::DynamicKController> =
         if args.swap_dynamic_k {
             Some(llm_rs2::models::weights::DynamicKController::new())
@@ -3118,6 +3156,31 @@ fn main() -> anyhow::Result<()> {
             None
         };
     let dynamic_k_diag = std::env::var("LLMRS_DYNAMIC_K_DIAG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    // Probing-K controller (bottom-up alternative to ARGUS). Starts at K=1 and
+    // probes upward subject to a stability window + release-queue spike guard.
+    let mut probing_k_controller: Option<llm_rs2::models::weights::ProbingKController> =
+        if args.swap_probing_k {
+            let growth = match args.swap_probing_growth.to_ascii_lowercase().as_str() {
+                "linear" => llm_rs2::models::weights::GrowthMode::Linear,
+                "binary" => llm_rs2::models::weights::GrowthMode::Binary,
+                other => anyhow::bail!(
+                    "--swap-probing-growth must be 'linear' or 'binary', got '{other}'"
+                ),
+            };
+            let mut c = llm_rs2::models::weights::ProbingKController::with_options(
+                1,
+                usize::MAX,
+                growth,
+            );
+            c.set_stability_window(args.swap_probing_window.max(1));
+            Some(c)
+        } else {
+            None
+        };
+    let probing_k_diag = std::env::var("LLMRS_PROBING_K_DIAG")
         .map(|v| v == "1")
         .unwrap_or(false);
 
@@ -3614,6 +3677,8 @@ fn main() -> anyhow::Result<()> {
         let mut eval_ll_qcf_dpllm_epsilon_qcf: Option<Vec<f32>> = None;
         let mut eval_ll_qcf_direct_attn_f4: Option<Vec<f32>> = None;
         let mut eval_ll_qcf_direct_attn_f5: Option<Vec<f32>> = None;
+        let mut eval_ll_qcf_direct_attn_f5_decode_only: Option<Vec<f32>> = None;
+        let mut eval_ll_qcf_direct_attn_f5_prefill_decode: Option<Vec<f32>> = None;
 
         if args.qcf_dump.is_some()
             && let Some(force_ratio) = args.force_swap_ratio
@@ -3645,6 +3710,7 @@ fn main() -> anyhow::Result<()> {
                     importance_formula,
                     importance_compare,
                     swap_only_layers.as_deref(),
+                    args.decode_x_steps,
                 )?;
                 eval_ll_qcf_decision = result.decision;
                 eval_ll_qcf_importance = Some(result.importance);
@@ -3654,6 +3720,8 @@ fn main() -> anyhow::Result<()> {
                 eval_ll_qcf_dpllm_epsilon_qcf = result.dpllm_epsilon_qcf;
                 eval_ll_qcf_direct_attn_f4 = result.direct_attn_f4;
                 eval_ll_qcf_direct_attn_f5 = result.direct_attn_f5;
+                eval_ll_qcf_direct_attn_f5_decode_only = result.direct_attn_f5_decode_only;
+                eval_ll_qcf_direct_attn_f5_prefill_decode = result.direct_attn_f5_prefill_decode;
             }
         }
 
@@ -3910,6 +3978,8 @@ fn main() -> anyhow::Result<()> {
                 dpllm_epsilon_qcf: eval_ll_qcf_dpllm_epsilon_qcf.as_deref(),
                 direct_attn_f4: eval_ll_qcf_direct_attn_f4.as_deref(),
                 direct_attn_f5: eval_ll_qcf_direct_attn_f5.as_deref(),
+                direct_attn_f5_decode_only: eval_ll_qcf_direct_attn_f5_decode_only.as_deref(),
+                direct_attn_f5_prefill_decode: eval_ll_qcf_direct_attn_f5_prefill_decode.as_deref(),
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
@@ -4000,6 +4070,7 @@ fn main() -> anyhow::Result<()> {
             importance_formula,
             importance_compare,
             swap_only_layers.as_deref(),
+            args.decode_x_steps,
         )?;
         qcf_swap_decision = result.decision;
         qcf_warmup_importance = Some(result.importance);
@@ -4170,6 +4241,8 @@ fn main() -> anyhow::Result<()> {
                 dpllm_epsilon_qcf: None,
                 direct_attn_f4: None,
                 direct_attn_f5: None,
+                direct_attn_f5_decode_only: None,
+                direct_attn_f5_prefill_decode: None,
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
@@ -6482,6 +6555,21 @@ fn main() -> anyhow::Result<()> {
                         };
                         inc_plan.set_per_tick(k);
                     }
+                } else if let Some(ref ctrl) = probing_k_controller {
+                    let pending = model.release_worker.pending_count();
+                    if ctrl.should_pause(pending) {
+                        dyn_k_pause = true;
+                        if probing_k_diag {
+                            eprintln!(
+                                "[ProbingK] pause t={} pending={} k={}",
+                                decode_token_index,
+                                pending,
+                                ctrl.current_k()
+                            );
+                        }
+                    } else {
+                        inc_plan.set_per_tick(ctrl.current_k());
+                    }
                 }
                 let chunk = if dyn_k_pause {
                     Vec::new()
@@ -6578,6 +6666,34 @@ fn main() -> anyhow::Result<()> {
                             decode_token_index,
                             forward_ms,
                             ctrl.current_k()
+                        );
+                    }
+                }
+
+                // Probing-K observation: every decode token feeds the EWMA and
+                // counts toward the stability window. release_pending samples
+                // *after* the dispatch above — if any spike landed it will
+                // decrement K symmetric to ARGUS's monotonic shrink.
+                if let Some(ref mut ctrl) = probing_k_controller {
+                    let prev_k = ctrl.current_k();
+                    let pending_after = model.release_worker.pending_count();
+                    ctrl.observe(forward_ms as f32, pending_after);
+                    if probing_k_diag {
+                        let arrow = if ctrl.current_k() > prev_k {
+                            "↑"
+                        } else if ctrl.current_k() < prev_k {
+                            "↓"
+                        } else {
+                            "·"
+                        };
+                        eprintln!(
+                            "[ProbingK] t={} fwd_ms={:.2} pending={} k={}->{} {}",
+                            decode_token_index,
+                            forward_ms,
+                            pending_after,
+                            prev_k,
+                            ctrl.current_k(),
+                            arrow,
                         );
                     }
                 }
@@ -8169,6 +8285,8 @@ fn main() -> anyhow::Result<()> {
             dpllm_epsilon_qcf: None,
             direct_attn_f4: None,
             direct_attn_f5: None,
+            direct_attn_f5_decode_only: None,
+            direct_attn_f5_prefill_decode: None,
         };
 
         dump_qcf_swap_json(dump_path, &ctx)?;
@@ -8595,6 +8713,14 @@ struct QcfWarmupResult {
     /// §4.2 F5: direct attention output relative L2 perturbation.
     /// `‖O^F16 − O^Q4‖_F / ‖O^F16‖_F`.
     direct_attn_f5: Option<Vec<f32>>,
+    /// §4.2 decode-only F5: per-layer F5 evaluated with X = the N decode-step
+    /// raws (T = N) only (no prefill X). `Some` only when `--decode-x-steps >
+    /// 0` and a secondary GGUF was loaded.
+    direct_attn_f5_decode_only: Option<Vec<f32>>,
+    /// §4.2 prefill+decode F5: per-layer F5 evaluated with X =
+    /// concat(prefill raws, decode raws) (T = 256 + N). `Some` only when
+    /// `--decode-x-steps > 0` and a secondary GGUF was loaded.
+    direct_attn_f5_prefill_decode: Option<Vec<f32>>,
 }
 
 /// QCF-dump warmup workflow shared by `--ppl/generation` and `--eval-ll` modes.
@@ -8624,22 +8750,25 @@ fn run_qcf_warmup_workflow(
     importance_formula: llm_rs2::core::qcf::ImportanceFormula,
     importance_three_way: bool,
     swap_only_layers: Option<&[usize]>,
+    decode_x_steps: usize,
 ) -> anyhow::Result<QcfWarmupResult> {
     use llm_rs2::core::qcf::ImportanceCollector;
     use llm_rs2::models::weights::WeightSwapDecider;
 
     let actual_warmup_len = warmup_ids.len();
     eprintln!(
-        "[QCF-dump]{} warmup prefill: {} tokens (formula={}, three_way={})",
+        "[QCF-dump]{} warmup prefill: {} tokens (formula={}, three_way={}, decode_x_steps={})",
         log_prefix,
         actual_warmup_len,
         importance_formula.as_str(),
         importance_three_way,
+        decode_x_steps,
     );
 
-    // ── Warmup prefill with ImportanceCollector ───────────────────────────────
+    // ── Warmup prefill with ImportanceCollector (F16 prefill pass) ────────────
     let mut collector =
         ImportanceCollector::new_with_formula(importance_formula, importance_three_way);
+    let last_token_logits_argmax: u32;
     {
         let warmup_buf = Galloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
         unsafe {
@@ -8682,7 +8811,159 @@ fn run_qcf_warmup_workflow(
             layer_boundary_hook: None,
         })?;
         backend.synchronize()?;
+
+        // Read the argmax of the last token's logits — first decode-step input.
+        last_token_logits_argmax = if decode_x_steps > 0 {
+            // Copy the final `[vocab_size]` slice of warmup_logits to host.
+            let cpu_back: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+            let host_logits = cpu_back.copy_from(&warmup_logits)?;
+            let last_offset = (actual_warmup_len - 1) * vocab_size;
+            let host_data = unsafe {
+                std::slice::from_raw_parts(
+                    host_logits.buffer().as_ptr() as *const f32,
+                    actual_warmup_len * vocab_size,
+                )
+            };
+            let last_slice = &host_data[last_offset..last_offset + vocab_size];
+            let mut best_idx: u32 = 0;
+            let mut best_val: f32 = f32::NEG_INFINITY;
+            for (i, &v) in last_slice.iter().enumerate() {
+                if v > best_val {
+                    best_val = v;
+                    best_idx = i as u32;
+                }
+            }
+            best_idx
+        } else {
+            0
+        };
     }
+
+    // ── Optional decode-X pass (§4.2 EuroSys'27) ──────────────────────────────
+    // After prefill, run `decode_x_steps` greedy decode forwards. Capture
+    // per-layer hidden state (T = decode_x_steps per layer after concat) in
+    // a fresh `DirectAttn` collector. KV cache is reset after this pass.
+    let raws_decode_opt: Option<Vec<(Vec<f32>, usize, usize)>> = if decode_x_steps > 0 {
+        if model.secondary_mmap.is_none() {
+            eprintln!(
+                "[QCF-dump]{} decode-x: SKIPPED (no secondary GGUF loaded)",
+                log_prefix
+            );
+            None
+        } else {
+            eprintln!(
+                "[QCF-dump]{} decode-x: running {} greedy decode steps (seed token id {})",
+                log_prefix, decode_x_steps, last_token_logits_argmax,
+            );
+
+            let mut collector_decode = ImportanceCollector::new_with_formula(
+                llm_rs2::core::qcf::ImportanceFormula::DirectAttn,
+                false,
+            );
+
+            let mut next_tok: u32 = last_token_logits_argmax;
+            let cpu_back: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+
+            for step in 0..decode_x_steps {
+                let decode_buf = Galloc::new().alloc(4, DType::U8)?;
+                unsafe {
+                    let ptr = decode_buf.as_mut_ptr() as *mut u32;
+                    *ptr = next_tok;
+                }
+                let cpu_decode = Tensor::new(
+                    Shape::new(vec![1, 1]),
+                    decode_buf,
+                    Arc::new(CpuBackend::new()),
+                );
+                let decode_input = backend.copy_from(&cpu_decode)?;
+
+                let decode_logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+                let mut decode_logits = Tensor::new(
+                    Shape::new(vec![1, 1, vocab_size]),
+                    decode_logits_buf,
+                    backend.clone(),
+                );
+
+                model.forward_into(TransformerModelForwardArgs {
+                    input_tokens: &decode_input,
+                    start_pos: actual_warmup_len + step,
+                    kv_caches,
+                    backend,
+                    memory,
+                    logits_out: &mut decode_logits,
+                    x_gen: None,
+                    workspace: None,
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None,
+                    importance_collector: Some(&mut collector_decode),
+                    logits_last_only: true,
+                    variance_collector: None,
+                    prefill_workspace: None,
+
+                    layer_boundary_hook: None,
+                })?;
+                backend.synchronize()?;
+
+                // argmax for next decode step
+                let host_logits = cpu_back.copy_from(&decode_logits)?;
+                let host_data = unsafe {
+                    std::slice::from_raw_parts(
+                        host_logits.buffer().as_ptr() as *const f32,
+                        vocab_size,
+                    )
+                };
+                let mut best_idx: u32 = 0;
+                let mut best_val: f32 = f32::NEG_INFINITY;
+                for (i, &v) in host_data.iter().enumerate() {
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = i as u32;
+                    }
+                }
+                next_tok = best_idx;
+            }
+
+            // The collector cached one `[1 × d]` snapshot per layer for *every*
+            // decode step (N × n_layers snapshots in chronological order).
+            // Rearrange into a per-layer concat: layer i → T = decode_x_steps.
+            // build_with_raws returns (table, x_means, raws_per_layer); raws is
+            // `Vec<(Vec<f32>, seq_len=1, dim)>` of length N * n_layers.
+            let (_table, _xm, raws_chrono) = collector_decode.build_with_raws();
+            let n_layers = kv_caches.len();
+            let mut per_layer_concat: Vec<(Vec<f32>, usize, usize)> = Vec::with_capacity(n_layers);
+            if raws_chrono.len() == decode_x_steps * n_layers && n_layers > 0 {
+                let d = raws_chrono[0].2;
+                for li in 0..n_layers {
+                    let mut buf: Vec<f32> = Vec::with_capacity(decode_x_steps * d);
+                    for step in 0..decode_x_steps {
+                        let idx = step * n_layers + li;
+                        let (data, t, _d) = &raws_chrono[idx];
+                        debug_assert_eq!(*t, 1);
+                        buf.extend_from_slice(&data[..d.min(data.len())]);
+                    }
+                    per_layer_concat.push((buf, decode_x_steps, d));
+                }
+            } else {
+                eprintln!(
+                    "[QCF-dump]{} decode-x: WARN raws layout mismatch (chrono len={}, expected {} × {})",
+                    log_prefix,
+                    raws_chrono.len(),
+                    decode_x_steps,
+                    n_layers
+                );
+            }
+
+            // Reset KV cache so the regular flow starts from a clean prefill state.
+            for kv in kv_caches.iter_mut() {
+                kv.current_pos = 0;
+            }
+
+            Some(per_layer_concat)
+        }
+    } else {
+        None
+    };
 
     // ── Build ImportanceTable (+ optional DP-LLM ε variants) + reset KV cache ────
     let direct_attn_primary = matches!(
@@ -8690,6 +8971,8 @@ fn run_qcf_warmup_workflow(
         llm_rs2::core::qcf::ImportanceFormula::DirectAttn
     );
     let cache_raw = importance_three_way || direct_attn_primary;
+    let mut direct_attn_f5_decode_only: Option<Vec<f32>> = None;
+    let mut direct_attn_f5_prefill_decode: Option<Vec<f32>> = None;
     let (
         imp_table,
         dpllm_epsilon,
@@ -8765,6 +9048,59 @@ fn run_qcf_warmup_workflow(
         } else {
             (None, None)
         };
+        // §4.2 decode-X F5: compute with decode-only raws (T = N) AND
+        // prefill+decode concat raws (T = 256 + N).
+        if let (Some(sec), Some(raws_dec)) = (sec_opt, raws_decode_opt.as_ref()) {
+            let n_heads = model.config.num_attention_heads;
+            let n_kv_heads = model.config.num_key_value_heads;
+            let d_head = model.config.head_dim;
+
+            // (1) decode-only
+            let pairs_dec =
+                llm_rs2::models::weights::noise_table::compute_cascade_attn_perturbation(
+                    &model.layers,
+                    sec,
+                    raws_dec,
+                    n_heads,
+                    n_kv_heads,
+                    d_head,
+                );
+            direct_attn_f5_decode_only =
+                Some(pairs_dec.iter().map(|(_, b)| *b).collect::<Vec<f32>>());
+
+            // (2) prefill + decode concat: raws[i] = concat(prefill_raws[i], decode_raws[i])
+            // along the T dimension.
+            if raws.len() == raws_dec.len() {
+                let mut raws_merged: Vec<(Vec<f32>, usize, usize)> = Vec::with_capacity(raws.len());
+                for (p, d_entry) in raws.iter().zip(raws_dec.iter()) {
+                    let (p_data, p_t, p_d) = p;
+                    let (d_data, d_t, d_d) = d_entry;
+                    if *p_d != *d_d {
+                        eprintln!(
+                            "[QCF-dump]{} decode-x merge: WARN dim mismatch prefill={} decode={}",
+                            log_prefix, p_d, d_d
+                        );
+                        continue;
+                    }
+                    let dim = *p_d;
+                    let mut merged: Vec<f32> = Vec::with_capacity((*p_t + *d_t) * dim);
+                    merged.extend_from_slice(p_data);
+                    merged.extend_from_slice(d_data);
+                    raws_merged.push((merged, *p_t + *d_t, dim));
+                }
+                let pairs_pd =
+                    llm_rs2::models::weights::noise_table::compute_cascade_attn_perturbation(
+                        &model.layers,
+                        sec,
+                        &raws_merged,
+                        n_heads,
+                        n_kv_heads,
+                        d_head,
+                    );
+                direct_attn_f5_prefill_decode =
+                    Some(pairs_pd.iter().map(|(_, b)| *b).collect::<Vec<f32>>());
+            }
+        }
         (table, eps_single, eps_multi, eps_abs, eps_qcf, f4, f5)
     } else {
         (collector.build(), None, None, None, None, None, None)
@@ -8859,6 +9195,8 @@ fn run_qcf_warmup_workflow(
                 dpllm_epsilon_qcf,
                 direct_attn_f4,
                 direct_attn_f5,
+                direct_attn_f5_decode_only,
+                direct_attn_f5_prefill_decode,
             });
         }
 
@@ -8910,6 +9248,8 @@ fn run_qcf_warmup_workflow(
         dpllm_epsilon_qcf,
         direct_attn_f4,
         direct_attn_f5,
+        direct_attn_f5_decode_only,
+        direct_attn_f5_prefill_decode,
     })
 }
 

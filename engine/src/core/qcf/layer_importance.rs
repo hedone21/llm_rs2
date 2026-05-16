@@ -177,6 +177,11 @@ pub struct ImportanceCollector {
     /// `noise_table::compute_input_aware_epsilon`). Populated only when
     /// `three_way` is true; one [dim] vector per `snapshot_before` call.
     x_means: Vec<Vec<f32>>,
+    /// Per-layer raw `[T × d]` snapshots for cascade attention forms (F4, F5).
+    /// Populated only when `cache_raw_per_layer()` returns true (i.e. three_way
+    /// compare mode or `DirectAttn` primary). One entry per `snapshot_before`
+    /// call, chronological order. Stored as `(raw_data, seq_len, dim)`.
+    before_snapshots_raw: Vec<(Vec<f32>, usize, usize)>,
 }
 
 impl ImportanceCollector {
@@ -197,7 +202,18 @@ impl ImportanceCollector {
             three_way,
             primary_formula: formula,
             x_means: Vec::new(),
+            before_snapshots_raw: Vec::new(),
         }
+    }
+
+    /// Whether per-layer raw `[T × d]` snapshots should be cached.
+    /// True for 3-way compare mode or `DirectAttn` primary; false otherwise.
+    fn cache_raw_per_layer(&self) -> bool {
+        self.three_way
+            || matches!(
+                self.primary_formula,
+                super::ImportanceFormula::DirectAttn
+            )
     }
 
     /// Snapshot the hidden state before a layer processes it.
@@ -235,6 +251,14 @@ impl ImportanceCollector {
             // x_means cache for DpllmProxy stage (`noise_table` post-warmup)
             self.x_means.push(self.before_snapshot.clone());
         }
+
+        // Per-layer raw cache for cascade attention (F4, F5).
+        // Independent of 3-way mode so DirectAttn primary works standalone.
+        if self.cache_raw_per_layer() {
+            let total = seq_len.saturating_mul(dim).min(x_data.len());
+            self.before_snapshots_raw
+                .push((x_data[..total].to_vec(), seq_len, dim));
+        }
     }
 
     /// Record importance after a layer has processed the hidden state.
@@ -266,8 +290,7 @@ impl ImportanceCollector {
                 *v *= scale;
             }
         }
-        let imp_mean_pool =
-            (1.0 - cosine_similarity(&self.before_snapshot, &after)).max(0.0);
+        let imp_mean_pool = (1.0 - cosine_similarity(&self.before_snapshot, &after)).max(0.0);
         let opr = residual_norm_ratio(&self.before_snapshot, &after);
 
         // (2) ShortGPT BI per-token cosine mean (3-way only)
@@ -310,12 +333,15 @@ impl ImportanceCollector {
         // (3) Primary importance selection
         let importance = match self.primary_formula {
             super::ImportanceFormula::MeanPool => imp_mean_pool,
-            super::ImportanceFormula::ShortGptBi => {
-                imp_shortgpt_bi.unwrap_or(imp_mean_pool)
-            }
-            // DpllmProxy: real signal is `dpllm_epsilon` in noise_table;
-            // here we keep a constant placeholder so swap_key composition is well-defined.
-            super::ImportanceFormula::DpllmProxy => 1.0,
+            super::ImportanceFormula::ShortGptBi => imp_shortgpt_bi.unwrap_or(imp_mean_pool),
+            // DP-LLM variants + DirectAttn: real signal is computed post-warmup
+            // in `noise_table`. Importance stays a constant placeholder here so
+            // the swap_key composition is well-defined for all variants.
+            super::ImportanceFormula::DpllmProxy
+            | super::ImportanceFormula::DpllmMulti
+            | super::ImportanceFormula::DpllmAbs
+            | super::ImportanceFormula::DpllmQcf
+            | super::ImportanceFormula::DirectAttn => 1.0,
         };
 
         let (mp_field, sb_field) = if self.three_way {
@@ -354,6 +380,31 @@ impl ImportanceCollector {
     /// Read-only access to cached x_means (3-way mode only).
     pub fn x_means(&self) -> &[Vec<f32>] {
         &self.x_means
+    }
+
+    /// Read-only access to per-layer raw `[T × d]` snapshots. One entry per
+    /// `snapshot_before` call, chronological order. Empty unless
+    /// `cache_raw_per_layer()` returned true at construction. Each tuple is
+    /// `(raw_data_row_major, seq_len, dim)`.
+    pub fn raws_per_layer(&self) -> &[(Vec<f32>, usize, usize)] {
+        &self.before_snapshots_raw
+    }
+
+    /// Consume the collector and return `(ImportanceTable, x_means, raws_per_layer)`.
+    /// Use this in DirectAttn mode to feed
+    /// `noise_table::compute_cascade_attn_perturbation`.
+    pub fn build_with_raws(
+        self,
+    ) -> (
+        ImportanceTable,
+        Vec<Vec<f32>>,
+        Vec<(Vec<f32>, usize, usize)>,
+    ) {
+        (
+            ImportanceTable::from_entries(self.entries),
+            self.x_means,
+            self.before_snapshots_raw,
+        )
     }
 }
 

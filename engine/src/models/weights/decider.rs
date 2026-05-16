@@ -175,14 +175,12 @@ impl<'a> WeightSwapDecider<'a> {
             }
             other => other,
         };
-        let use_fallback = matches!(self.algorithm, SwapAlgorithm::ImportanceAware)
-            && !scored_path_available;
+        let use_fallback =
+            matches!(self.algorithm, SwapAlgorithm::ImportanceAware) && !scored_path_available;
 
         let selected: Vec<usize> = match effective_algo {
             SwapAlgorithm::Sequential => candidates.iter().take(needed).copied().collect(),
-            SwapAlgorithm::Reverse => {
-                candidates.iter().rev().take(needed).copied().collect()
-            }
+            SwapAlgorithm::Reverse => candidates.iter().rev().take(needed).copied().collect(),
             SwapAlgorithm::Uniform => uniform_select_by_index(needed, &candidates),
             SwapAlgorithm::ImportanceAware | SwapAlgorithm::AntiImportance => {
                 let imp = self.importance.expect("importance checked non-empty");

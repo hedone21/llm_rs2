@@ -61,12 +61,29 @@ pub struct QcfSwapDumpContext<'a> {
     /// this step, the layer added at this step (`null` for step 0 baseline),
     /// and the full `EvalOutput` from the eval-ll run.
     pub trajectory: Option<&'a [TrajectoryStep<'a>]>,
-    /// Per-layer DP-LLM proxy ε from `--importance-formula compare` mode.
-    /// `Some` only when 3-way comparison is active; length = `num_layers`.
-    /// Combined with `importance_table` entries (whose `importance_mean_pool`
-    /// and `importance_shortgpt_bi` fields are populated under 3-way mode)
-    /// into the `per_layer_3way` array of the dump JSON.
+    /// Per-layer DP-LLM proxy ε (single-tensor relative) from
+    /// `--importance-formula compare` mode. Length = `num_layers`.
     pub dpllm_epsilon: Option<&'a [f32]>,
+    /// §4 candidate A: per-layer multi-tensor sum of input-aware relative ε.
+    pub dpllm_epsilon_multi: Option<&'a [f32]>,
+    /// §4 candidate D: per-layer absolute L2 of the activation difference.
+    pub dpllm_epsilon_abs: Option<&'a [f32]>,
+    /// §4 candidate E: per-layer QCF-style multiplicative `ε_v × ε_o`.
+    pub dpllm_epsilon_qcf: Option<&'a [f32]>,
+    /// §4.2 F4: per-layer cascade-aware single output projection perturbation.
+    /// `‖(W_o^F16 − W_o^Q4) · V_out^F16‖_F / ‖W_o^F16 · V_out^F16‖_F`.
+    pub direct_attn_f4: Option<&'a [f32]>,
+    /// §4.2 F5: per-layer direct attention output relative L2 perturbation.
+    /// `‖O^F16 − O^Q4‖_F / ‖O^F16‖_F`.
+    pub direct_attn_f5: Option<&'a [f32]>,
+    /// §4.2 decode-only F5: per-layer F5 evaluated with X = the N decode-step
+    /// raws (T = N) only. `Some` only when `--decode-x-steps > 0` and a
+    /// secondary GGUF was loaded.
+    pub direct_attn_f5_decode_only: Option<&'a [f32]>,
+    /// §4.2 prefill+decode F5: per-layer F5 evaluated with X =
+    /// concat(prefill raws, decode raws) (T = 256 + N). `Some` only when
+    /// `--decode-x-steps > 0` and a secondary GGUF was loaded.
+    pub direct_attn_f5_prefill_decode: Option<&'a [f32]>,
 }
 
 /// One step of a `--qcf-trajectory` measurement.
@@ -162,8 +179,7 @@ pub fn dump_qcf_swap_json(
                         .eval_ll_output
                         .to_json()
                         .unwrap_or_else(|_| "null".to_string());
-                    let eval_val: Value =
-                        serde_json::from_str(&eval_json).unwrap_or(Value::Null);
+                    let eval_val: Value = serde_json::from_str(&eval_json).unwrap_or(Value::Null);
                     json!({
                         "step": s.step,
                         "swapped_layers": s.swapped_layers,
@@ -184,17 +200,42 @@ pub fn dump_qcf_swap_json(
     // mode entries) are skipped.
     let three_way_val: Value = match (ctx.importance_table, ctx.dpllm_epsilon) {
         (Some(table), Some(eps)) => {
+            let opt_to_json =
+                |v: f32| -> Value { if v.is_finite() { json!(v) } else { Value::Null } };
             let entries: Vec<Value> = table
                 .entries()
                 .iter()
                 .filter(|e| e.importance_mean_pool.is_some() || e.importance_shortgpt_bi.is_some())
                 .map(|e| {
                     let dpllm = eps.get(e.layer_id).copied().unwrap_or(f32::NAN);
-                    let dpllm_json: Value = if dpllm.is_finite() {
-                        json!(dpllm)
-                    } else {
-                        Value::Null
-                    };
+                    let dpllm_multi = ctx
+                        .dpllm_epsilon_multi
+                        .and_then(|v| v.get(e.layer_id).copied())
+                        .unwrap_or(f32::NAN);
+                    let dpllm_abs = ctx
+                        .dpllm_epsilon_abs
+                        .and_then(|v| v.get(e.layer_id).copied())
+                        .unwrap_or(f32::NAN);
+                    let dpllm_qcf = ctx
+                        .dpllm_epsilon_qcf
+                        .and_then(|v| v.get(e.layer_id).copied())
+                        .unwrap_or(f32::NAN);
+                    let direct_attn_f4 = ctx
+                        .direct_attn_f4
+                        .and_then(|v| v.get(e.layer_id).copied())
+                        .unwrap_or(f32::NAN);
+                    let direct_attn_f5 = ctx
+                        .direct_attn_f5
+                        .and_then(|v| v.get(e.layer_id).copied())
+                        .unwrap_or(f32::NAN);
+                    let direct_attn_f5_decode_only = ctx
+                        .direct_attn_f5_decode_only
+                        .and_then(|v| v.get(e.layer_id).copied())
+                        .unwrap_or(f32::NAN);
+                    let direct_attn_f5_prefill_decode = ctx
+                        .direct_attn_f5_prefill_decode
+                        .and_then(|v| v.get(e.layer_id).copied())
+                        .unwrap_or(f32::NAN);
                     let frob_json: Value = ctx
                         .noise_table
                         .and_then(|t| t.epsilon(e.layer_id))
@@ -205,7 +246,14 @@ pub fn dump_qcf_swap_json(
                         "sublayer": format!("{:?}", e.sublayer),
                         "importance_mean_pool": e.importance_mean_pool,
                         "importance_shortgpt_bi": e.importance_shortgpt_bi,
-                        "dpllm_epsilon": dpllm_json,
+                        "dpllm_epsilon": opt_to_json(dpllm),
+                        "dpllm_epsilon_multi": opt_to_json(dpllm_multi),
+                        "dpllm_epsilon_abs": opt_to_json(dpllm_abs),
+                        "dpllm_epsilon_qcf": opt_to_json(dpllm_qcf),
+                        "direct_attn_f4": opt_to_json(direct_attn_f4),
+                        "direct_attn_f5": opt_to_json(direct_attn_f5),
+                        "direct_attn_f5_decode_only": opt_to_json(direct_attn_f5_decode_only),
+                        "direct_attn_f5_prefill_decode": opt_to_json(direct_attn_f5_prefill_decode),
                         "epsilon_frobenius": frob_json,
                     })
                 })
