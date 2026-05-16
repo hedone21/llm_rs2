@@ -839,7 +839,8 @@ pub fn compute_cascade_attn_perturbation(
         let q_f16 = matmul_x_wt(&x_data[..t * d], &wq_f16, t, d, q_dim);
         let k_f16 = matmul_x_wt(&x_data[..t * d], &wk_f16, t, d, kv_dim);
         let v_f16 = matmul_x_wt(&x_data[..t * d], &wv_f16, t, d, kv_dim);
-        let v_out_f16 = attention_mix_causal(&q_f16, &k_f16, &v_f16, t, n_heads, n_kv_heads, d_head);
+        let v_out_f16 =
+            attention_mix_causal(&q_f16, &k_f16, &v_f16, t, n_heads, n_kv_heads, d_head);
         let o_f16 = matmul_x_wt(&v_out_f16, &wo_f16, t, q_dim, d);
 
         // Forward Q4

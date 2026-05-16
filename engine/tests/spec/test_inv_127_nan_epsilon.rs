@@ -20,6 +20,8 @@ fn make_importance(entries: Vec<(usize, f32)>) -> ImportanceTable {
             sublayer: SubLayer::Full,
             importance: imp,
             opr: 0.0,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         })
         .collect();
     ImportanceTable::from_entries(entries)

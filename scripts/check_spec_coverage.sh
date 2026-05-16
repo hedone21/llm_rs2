@@ -32,8 +32,11 @@ fi
 # [2] INV → Test: INV-ID가 tests/spec/에 대응되는지
 # ═══════════════════════════════════════════════════
 SPEC_INVS=$(grep -oE 'INV-[0-9]+' spec/41-invariants.md | sort -u)
+# INV-LAYER-NNN 시리즈도 추출 (spec/41-invariants.md §3.26)
+SPEC_INVS_LAYER=$(grep -oE 'INV-LAYER-[0-9]+' spec/41-invariants.md | sort -u)
 
 TEST_INVS=""
+TEST_INVS_LAYER=""
 SPEC_DIRS=""
 for d in engine/tests/spec manager/tests/spec shared/tests/spec; do
   [ -d "$d" ] && SPEC_DIRS="$SPEC_DIRS $d"
@@ -61,12 +64,31 @@ if [ -n "$SPEC_DIRS" ]; then
     done
   done
   TEST_INVS=$(printf '%s\n' $_content_invs $_filename_invs | sort -u)
+
+  # INV-LAYER-NNN 파일명에서 추출 (test_inv_layer_NNN 패턴)
+  for d in $SPEC_DIRS; do
+    for f in "$d"/test_inv_layer_*.rs; do
+      [ -f "$f" ] || continue
+      base=$(basename "$f" .rs)
+      # test_inv_layer_001 → INV-LAYER-001
+      n=$(echo "$base" | grep -oE 'layer_[0-9]+' | grep -oE '[0-9]+' | head -1)
+      [ -n "$n" ] && TEST_INVS_LAYER="$TEST_INVS_LAYER INV-LAYER-$(printf '%03d' "$n")"
+    done
+  done
+  TEST_INVS_LAYER=$(printf '%s\n' $TEST_INVS_LAYER | sort -u)
 fi
 
 INV_TEST_MISSING=""
 for inv in $SPEC_INVS; do
   echo "$STATIC_INVS" | grep -qwF "$inv" && continue
   if ! echo "$TEST_INVS" | grep -qwF "$inv"; then
+    INV_TEST_MISSING="${INV_TEST_MISSING}  ${inv}\n"
+  fi
+done
+
+# INV-LAYER-NNN 시리즈 검사 (test_inv_layer_NNN.rs 파일 존재 여부)
+for inv in $SPEC_INVS_LAYER; do
+  if ! echo "$TEST_INVS_LAYER" | grep -qwF "$inv"; then
     INV_TEST_MISSING="${INV_TEST_MISSING}  ${inv}\n"
   fi
 done

@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""
+scripts/layer_lint.py
+Engine 내부 레이어드 아키텍처 위반 검출 도구.
+
+INV-LAYER-001~005 (spec/41-invariants.md §3.26, ARCHITECTURE.md §13.5) 위반을
+engine/src/**/*.rs 파일의 `use crate::` / 인라인 `crate::` import 분석으로 검출.
+
+사용법:
+  python3 scripts/layer_lint.py
+  python3 scripts/layer_lint.py --baseline engine/tests/spec/inv_layer_baseline.json
+  python3 scripts/layer_lint.py --filter inv-layer-001
+  python3 scripts/layer_lint.py --baseline ... --filter inv-layer-002
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+# ────────────────────────────────────────────────────────────────────
+# Layer 매핑 규칙 (ARCHITECTURE.md §13.2, §13.4 기준)
+# ────────────────────────────────────────────────────────────────────
+
+# 각 모듈 경로 prefix → layer 레이블
+# 우선순위: 더 구체적인 prefix가 먼저 매칭됨 (정렬 순서로 처리)
+LAYER_RULES = [
+    # L1: hardware backend impl
+    ("backend/opencl",          "L1"),
+    ("backend/cpu",             "L1"),
+    ("backend/cuda_embedded",   "L1"),
+    ("backend/cuda_pc",         "L1"),
+    ("backend/qnn_oppkg",       "L1"),
+    ("backend",                 "L1"),
+
+    # L2: shared buffer/memory abstractions + generic types
+    # buffer/ 안에 backend-specific 파일이 섞여 있지만 현재 코드 구조상 buffer/ 전체를 L2로 분류
+    ("buffer",                  "L2"),
+    ("memory",                  "L2"),
+    ("auf",                     "L2"),   # §13.8-A 결정: shared/auf/ = L2 자산
+
+    # L3-pressure: KV cache 관리, eviction, offload, swap handler
+    ("core/pressure",           "L3-pressure"),
+    ("core/kv_cache",           "L3-pressure"),
+    ("core/kivi_cache",         "L3-pressure"),
+    ("core/cache_manager",      "L3-pressure"),
+    ("core/eviction",           "L3-pressure"),
+    ("core/kv_migrate",         "L3-pressure"),
+    ("core/offload",            "L3-pressure"),
+
+    # L3-inference: 추론 연산 도메인
+    ("core/sampling",           "L3-inference"),
+    ("core/attention_scores",   "L3-inference"),
+    ("core/speculative",        "L3-inference"),
+    ("core/skip_config",        "L3-inference"),
+    ("core/chat_template",      "L3-inference"),
+    ("core/chat_ipc",           "L3-inference"),
+    ("core/qcf",                "L3-inference"),  # QCF는 inference-side 메트릭
+    ("layers",                  "L3-inference"),
+    ("models",                  "L3-inference"),  # models/weights/* 포함
+
+    # cross-cutting: observability (events, rss_trace, profile, eval)
+    ("core/events",             "observability"),
+    ("core/rss_trace",          "observability"),
+    ("profile",                 "observability"),
+    ("eval",                    "observability"),
+
+    # cross-cutting: resilience (resilience/, core/sys_monitor, core/gpu_yield)
+    ("resilience",              "resilience"),
+    ("core/sys_monitor",        "resilience"),
+    ("core/gpu_yield",          "resilience"),
+
+    # L5: binary entrypoints
+    ("bin",                     "L5"),
+
+    # L3 기타 core (정의, 추상화)
+    ("core",                    "L3-core"),
+
+    # experiment
+    ("experiment",              "L4"),
+
+    # bin_helpers
+    ("bin_helpers",             "L5"),
+]
+
+# INV-LAYER-005 enforcement 대상 외 binary 파일 prefix 목록
+L5_SKIP_PATTERNS = [
+    "microbench_",
+    "test_",
+    "probe_",
+    "stage",
+    "signal_injector",
+    "auf_tool",
+    "micro_bench",
+]
+
+
+def classify_module(rel_path: str) -> str:
+    """
+    engine/src/ 기준 상대경로로 layer를 반환.
+    예: "backend/opencl/mod.rs" → "L1"
+    """
+    # 경로 구분자를 /로 통일
+    norm = rel_path.replace(os.sep, "/")
+    for prefix, layer in LAYER_RULES:
+        if norm.startswith(prefix + "/") or norm == prefix or norm.startswith(prefix + "."):
+            return layer
+    return "unknown"
+
+
+def classify_import(import_path: str) -> str:
+    """
+    `use crate::foo::bar` 또는 인라인 `crate::foo::bar`에서 foo::bar 부분을
+    layer로 분류.
+    예: "core::pressure::..." → "L3-pressure"
+         "backend::opencl::..." → "L1"
+    """
+    # crate:: 제거
+    p = import_path.strip()
+    if p.startswith("crate::"):
+        p = p[len("crate::"):]
+    # :: → / 변환 후 LAYER_RULES 매칭
+    as_path = p.replace("::", "/")
+    return classify_module(as_path)
+
+
+# ────────────────────────────────────────────────────────────────────
+# 위반 판정 규칙 (INV-LAYER-001~005)
+# ────────────────────────────────────────────────────────────────────
+
+def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str | None, str | None, str | None]:
+    """
+    (src_layer, dst_layer) 쌍에 대해 위반하는 INV-LAYER-XXX와 kind 문자열을 반환.
+    위반 없으면 (None, None, None).
+    반환: (inv_id, kind, note)
+    """
+    # INV-LAYER-001: L1 backend → L2(shared/buffer/memory/auf) + cross-cutting 외 import 금지
+    # 허용: L1→L2, L1→L1(동일 backend 내부), L1→observability, L1→resilience, L1→L3-core(Backend trait)
+    # 금지: L1→L3-pressure, L1→L3-inference, L1→L4, L1→L5
+    if src_layer == "L1":
+        if dst_layer in ("L3-pressure", "L3-inference", "L4", "L5"):
+            # V-01: L1→cross-cutting concrete (resilience임에도 concrete 직접 import)
+            # V-02: L1→L3-inference
+            # V-03: L1→L3-inference (models/weights)
+            kind = f"L1→{dst_layer} (역방향 import)"
+            return ("INV-LAYER-001", kind, None)
+        # V-04, V-05: L1↔L1 cross-backend — 동일 backend 내부는 허용, 다른 backend는 INV-LAYER-001 위반
+        # (백엔드 간 cross-import는 architecture 위반이지만 허용 zone에 해당하므로 INV-LAYER-001 mild 위반으로 처리)
+        if dst_layer == "L1":
+            # 동일 backend 폴더 내부는 허용 (x86.rs → cpu/common.rs 등)
+            # 다른 backend로의 import는 INV-LAYER-001 (교차 backend)
+            # src_rel로 backend prefix 비교
+            src_be = _extract_backend(src_rel)
+            # dst는 import 경로에서 판단 — 여기선 호출자가 별도로 처리
+            pass
+        if dst_layer == "resilience":
+            # V-01: opencl → gpu_self_meter (resilience의 concrete)
+            kind = f"L1→resilience (cross-cutting concrete 직접 의존)"
+            return ("INV-LAYER-001", kind, "V-01 패턴")
+
+    # INV-LAYER-002: L2 → L3+/L4/L5 import 금지
+    if src_layer == "L2":
+        if dst_layer in ("L3-pressure", "L3-inference", "L4", "L5"):
+            kind = f"L2→{dst_layer} (상위 레이어 역방향 import)"
+            return ("INV-LAYER-002", kind, None)
+        if dst_layer == "L1":
+            kind = f"L2→L1 (backend-specific impl 직접 의존)"
+            return ("INV-LAYER-002", kind, "V-07 패턴")
+
+    # INV-LAYER-003: L3-inference ↔ L3-pressure는 trait만 허용, concrete 금지
+    if src_layer == "L3-inference" and dst_layer == "L3-pressure":
+        kind = "L3-inference→L3-pressure (cross-domain concrete import)"
+        return ("INV-LAYER-003", kind, None)
+    if src_layer == "L3-pressure" and dst_layer == "L3-inference":
+        kind = "L3-pressure→L3-inference (cross-domain concrete import)"
+        return ("INV-LAYER-003", kind, None)
+    # L3→L1 (backend concrete downcast)
+    if src_layer in ("L3-pressure", "L3-inference") and dst_layer == "L1":
+        kind = f"{src_layer}→L1 (backend impl 직접 의존)"
+        return ("INV-LAYER-003", kind, "downcast 패턴")
+    # L3→cross-cutting concrete (V-10, V-14, V-22, V-26 등)
+    if src_layer in ("L3-pressure", "L3-inference") and dst_layer in ("observability", "resilience"):
+        kind = f"{src_layer}→cross-cutting({dst_layer}) (concrete 직접 의존, trait inversion 필요)"
+        return ("INV-LAYER-003", kind, None)
+
+    # INV-LAYER-004: cross-cutting(observability/resilience) → L3 concrete import 금지
+    if src_layer in ("observability", "resilience"):
+        if dst_layer in ("L1", "L3-pressure", "L3-inference"):
+            kind = f"cross-cutting({src_layer})→{dst_layer} (trait inversion 필요)"
+            return ("INV-LAYER-004", kind, None)
+
+    # INV-LAYER-005: L5 bin → L4/session 외 direct import 금지 (generate.rs 한정)
+    # generate.rs가 아닌 bin/ 파일은 enforcement 대상 외
+    if src_layer == "L5":
+        basename = os.path.basename(src_rel)
+        name_no_ext = basename.replace(".rs", "")
+        # skip 대상 binary인지 확인
+        skip = any(name_no_ext.startswith(p) for p in L5_SKIP_PATTERNS)
+        if not skip and basename == "generate.rs":
+            # generate.rs → L1/L2/L3/observability/resilience 직접 import는 모두 위반
+            if dst_layer in ("L1", "L2", "L3-pressure", "L3-inference", "L3-core",
+                             "observability", "resilience"):
+                kind = f"L5/generate.rs→{dst_layer} (L4 session/ 우회)"
+                return ("INV-LAYER-005", kind, None)
+
+    return (None, None, None)
+
+
+def _extract_backend(rel_path: str) -> str:
+    """backend/<be>/... 에서 <be> 부분 추출. 해당 없으면 ''."""
+    norm = rel_path.replace(os.sep, "/")
+    if norm.startswith("backend/"):
+        parts = norm.split("/")
+        if len(parts) >= 2:
+            return parts[1]
+    return ""
+
+
+# ────────────────────────────────────────────────────────────────────
+# Cross-backend 위반 (V-04, V-05) 별도 처리
+# ────────────────────────────────────────────────────────────────────
+
+def check_cross_backend(src_rel: str, import_path: str) -> tuple[str | None, str | None]:
+    """
+    L1↔L1 cross-backend import를 별도로 검사.
+    (inv_id, kind) 반환. 위반 없으면 (None, None).
+    """
+    # crate:: 제거 후 backend/ 시작 여부 확인
+    p = import_path.strip()
+    if p.startswith("crate::"):
+        p = p[len("crate::"):]
+    norm_import = p.replace("::", "/")
+
+    if not norm_import.startswith("backend/"):
+        return (None, None)
+
+    src_be = _extract_backend(src_rel)
+    parts = norm_import.split("/")
+    if len(parts) < 2:
+        return (None, None)
+    dst_be = parts[1]
+
+    if not src_be or not dst_be:
+        return (None, None)
+
+    # 동일 backend 내부 (예: backend/cpu/x86.rs → backend/cpu/common.rs) 는 허용
+    if src_be == dst_be:
+        return (None, None)
+
+    # 다른 backend로의 cross-import
+    kind = f"L1({src_be})→L1({dst_be}) (cross-backend import)"
+    return ("INV-LAYER-001", kind)
+
+
+# ────────────────────────────────────────────────────────────────────
+# import 추출
+# ────────────────────────────────────────────────────────────────────
+
+# use crate:: 문 패턴
+RE_USE_CRATE = re.compile(r'^\s*(?:pub\s+)?use\s+(crate::\S+)\s*;', re.MULTILINE)
+# use llm_rs2:: 문 패턴 (bin/ 파일은 llm_rs2:: 형태로 import)
+RE_USE_LIB = re.compile(r'^\s*(?:pub\s+)?use\s+(llm_rs2::\S+)\s*;', re.MULTILINE)
+# 인라인 crate:: 참조 (함수 본문 내)
+RE_INLINE_CRATE = re.compile(r'(?<!\w)(crate::[a-zA-Z_][a-zA-Z0-9_:]*)')
+
+def extract_imports(file_path: str) -> list[tuple[int, str, bool]]:
+    """
+    파일에서 (line_number, import_path, is_test_block) 목록 반환.
+    is_test_block=True는 #[cfg(test)] 블록 내부.
+    """
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    results = []
+    lines = content.splitlines()
+
+    # #[cfg(test)] 블록 범위 감지 (간단한 brace 카운팅)
+    test_block_ranges = _find_test_block_ranges(lines)
+
+    def in_test_block(lineno: int) -> bool:
+        for start, end in test_block_ranges:
+            if start <= lineno <= end:
+                return True
+        return False
+
+    # use crate:: 문 추출
+    for i, line in enumerate(lines, 1):
+        m = RE_USE_CRATE.match(line)
+        if m:
+            results.append((i, m.group(1), in_test_block(i)))
+
+    # use llm_rs2:: 문 추출 (bin/ 파일용) — llm_rs2::foo → crate::foo로 정규화
+    for i, line in enumerate(lines, 1):
+        m = RE_USE_LIB.match(line)
+        if m:
+            # llm_rs2:: → crate:: 로 정규화하여 레이어 분류에 사용
+            normalized = m.group(1).replace("llm_rs2::", "crate::", 1)
+            results.append((i, normalized, in_test_block(i)))
+
+    # 인라인 crate:: 참조 추출 (use 문이 아닌 것)
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+        # use 문은 이미 처리했으므로 제외
+        if RE_USE_CRATE.match(line):
+            continue
+        for m in RE_INLINE_CRATE.finditer(line):
+            imp = m.group(1)
+            # 최소 2단계 이상의 경로만 (crate::foo 이상)
+            if imp.count("::") >= 1:
+                results.append((i, imp, in_test_block(i)))
+
+    return results
+
+
+def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    """
+    #[cfg(test)] mod tests { ... } 블록의 (start_line, end_line) 목록 반환.
+    간단한 brace 카운팅으로 감지.
+    """
+    ranges = []
+    in_test = False
+    brace_depth = 0
+    start = 0
+
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+
+        if not in_test:
+            if "#[cfg(test)]" in stripped or re.search(r'#\[test\]', stripped):
+                in_test = True
+                start = i
+                brace_depth = 0
+
+        if in_test:
+            brace_depth += stripped.count("{") - stripped.count("}")
+            if brace_depth <= 0 and i > start:
+                ranges.append((start, i))
+                in_test = False
+                brace_depth = 0
+
+    return ranges
+
+
+# ────────────────────────────────────────────────────────────────────
+# 위반 분석 메인
+# ────────────────────────────────────────────────────────────────────
+
+# V-번호 할당 — ARCHITECTURE.md §13.5 기준 알려진 위반에 ID 부여
+# (file_path 패턴, import 패턴) → V-XX
+KNOWN_V_MAP = [
+    # V-01: backend/opencl/mod.rs → resilience::gpu_self_meter
+    (r"backend/opencl/mod\.rs",         r"resilience::gpu_self_meter",   "V-01"),
+    # V-02: backend/opencl/plan.rs → layers::tensor_partition, layers::workspace
+    (r"backend/opencl/plan\.rs",         r"layers::",                    "V-02"),
+    # V-03: backend/qnn_oppkg/ → models::weights (LayerSlot), layers::transformer_layer
+    (r"backend/qnn_oppkg/",              r"models::weights",             "V-03"),
+    (r"backend/qnn_oppkg/layer_graph",   r"layers::transformer_layer",   "V-03"),
+    # V-04: backend/qnn_oppkg/ → backend::opencl (cross-backend)
+    (r"backend/qnn_oppkg/mod\.rs",       r"backend::opencl::OpenCLBackend", "V-04"),
+    # V-05: backend/cuda_*/ → backend::cpu::CpuBackend (cpu_fallback)
+    (r"backend/cuda_(embedded|pc)/mod\.rs", r"backend::cpu::CpuBackend", "V-05"),
+    # V-06: backend/cpu/x86.rs, neon.rs → cpu/common (동일 backend 내부 — 허용)
+    (r"backend/cpu/(x86|neon)\.rs",      r"backend::cpu::common",       "V-06"),
+    # V-07: buffer/host_ptr_pool_buffer.rs → backend::opencl (L2→L1)
+    (r"buffer/host_ptr_pool_buffer\.rs", r"backend::opencl",            "V-07"),
+    # V-08: buffer/cl_*/cuda_*/rpcmem_* (backend-specific buffer가 L2에 위치)
+    (r"buffer/(cl_|cuda_|rpcmem_)",      r"",                           "V-08"),
+    # V-09: buffer/ → models::weights::SecondaryMmap (L2→L3 pressure state)
+    (r"buffer/",                         r"models::weights::SecondaryMmap", "V-09"),
+    # V-10: core/cache_manager.rs → resilience::EvictMethod
+    (r"core/cache_manager\.rs",          r"resilience::EvictMethod",    "V-10"),
+    # V-11: core/chat_template.rs → models::config::ModelArch
+    (r"core/chat_template\.rs",          r"models::config::ModelArch",  "V-11"),
+    # V-12: core/events.rs → core::pressure (의도된 의존)
+    (r"core/events\.rs",                 r"core::pressure",             "V-12"),
+    # V-13: core/kivi_cache.rs → backend::cpu/opencl (L3→L1)
+    (r"core/kivi_cache\.rs",             r"backend::",                  "V-13"),
+    # V-14: core/qcf/, core/kivi_cache, core/sampling → profile:: (L3→observability concrete)
+    (r"core/(qcf/unified_qcf|kivi_cache|sampling|qcf/layer_importance)", r"profile::", "V-14"),
+    # V-15: core/cache_manager.rs, core/eviction/* (테스트 블록) → backend::cpu (grandfathered)
+    (r"core/(cache_manager|eviction/)",  r"backend::cpu::CpuBackend",   "V-15"),
+    # V-16: eval/eval_loop.rs → backend:: (cross-cutting→L1)
+    (r"eval/eval_loop\.rs",              r"backend::",                  "V-16"),
+    # V-17: layers/ → backend::cpu::neon, opencl (L3→L1 downcast/direct call)
+    (r"layers/(transformer_layer|attention|workspace)", r"backend::",    "V-17"),
+    # V-18: layers/transformer_layer/ → memory::galloc, profile:: (L3→cross-cutting)
+    (r"layers/transformer_layer/",       r"(memory::galloc|profile::)", "V-18"),
+    # V-19: layers/tensor_partition.rs → buffer::slice_buffer/cl_sub_buffer
+    (r"layers/tensor_partition\.rs",     r"buffer::(slice_buffer|cl_sub_buffer)", "V-19"),
+    # V-20: models/transformer.rs → backend::opencl (L3→L1)
+    (r"models/transformer\.rs",          r"backend::(opencl|cuda)",     "V-20"),
+    # V-21: models/transformer.rs → core::offload::preload_pool (L3-inference→L3-pressure)
+    (r"models/transformer\.rs",          r"core::offload::preload_pool","V-21"),
+    # V-22: models/transformer.rs, layers/ → profile:: (L3→observability)
+    (r"models/transformer\.rs",          r"profile::",                  "V-22"),
+    # V-23: models/transformer.rs, models/weights/ → auf:: (→shared/auf/ 이동 전 L3→cross-cutting)
+    (r"models/(transformer|weights/)",   r"auf::",                      "V-23"),
+    # V-24: core/pressure/weight_swap_handler.rs → models:: (Pressure→Inference cross)
+    (r"core/pressure/weight_swap_handler\.rs", r"models::",             "V-24"),
+    # V-24(b): core/pressure/weight_swap_handler.rs → backend::cpu::CpuBackend
+    (r"core/pressure/weight_swap_handler\.rs", r"backend::cpu::CpuBackend", "V-24"),
+    # V-24(c): core/pressure/weight_swap_handler.rs → memory::galloc
+    (r"core/pressure/weight_swap_handler\.rs", r"memory::galloc",       "V-24"),
+    # V-25: models/weights/swap_executor.rs → layers::transformer_layer (L3-pressure→L3-inference concrete)
+    (r"models/weights/(swap_executor|intra_forward_swap|phase_aware_swap)", r"layers::", "V-25"),
+    # V-25(b): models/weights/swap_executor.rs → models::transformer (self-domain monolith)
+    (r"models/weights/swap_executor\.rs", r"models::transformer",       "V-25"),
+    # V-25(c): models/weights/swap_executor.rs → backend::opencl::host_ptr_pool
+    (r"models/weights/swap_executor\.rs", r"backend::opencl::host_ptr_pool", "V-25"),
+    # V-25(d): models/weights/swap_executor.rs → profile::
+    (r"models/weights/swap_executor\.rs", r"profile::",                 "V-25"),
+    # V-26: models/weights/decider.rs → core::qcf::layer_importance (현재 구조 내 cross)
+    (r"models/weights/decider\.rs",      r"core::qcf::layer_importance","V-26"),
+    # V-26(b): models/weights/decider.rs → profile:: (L3→observability concrete)
+    (r"models/weights/decider\.rs",      r"profile::",                  "V-26"),
+    # V-27: models/weights/layer_object_pool.rs → buffer::cuda_buffer (L3→L2 backend-specific)
+    (r"models/weights/layer_object_pool\.rs", r"buffer::cuda_buffer",   "V-27"),
+    # V-27(b): models/weights/layer_object_pool.rs → layers::transformer_layer
+    (r"models/weights/layer_object_pool\.rs", r"layers::transformer_layer", "V-27"),
+    # V-27(c): models/weights/layer_object_pool.rs → backend::cuda_embedded (downcast)
+    (r"models/weights/layer_object_pool\.rs", r"backend::cuda_embedded","V-27"),
+    # V-28: eval/ → models::, core:: (cross-cutting→L3 다수)
+    (r"eval/(qcf_helpers|eval_loop|eviction_hook)", r"models::",        "V-28"),
+    (r"eval/(eval_loop|eviction_hook)",  r"core::(cache_manager|kv_cache|kivi_cache|qcf)", "V-28"),
+    # V-29: eval/eviction_hook.rs → backend::opencl::OpenCLBackend (cross-cutting→L1 downcast)
+    (r"eval/eviction_hook\.rs",          r"backend::opencl::OpenCLBackend", "V-29"),
+    # V-30: bin/generate.rs → 모든 레이어 직접 import (L5 monolith)
+    (r"bin/generate\.rs",                r"",                           "V-30"),
+    # V-31: (V-21, V-10 재기재 — 이미 V-21, V-10으로 처리됨)
+]
+
+
+def lookup_v_id(rel_path: str, import_path: str) -> str:
+    """
+    알려진 V-XX ID를 반환. 매칭 없으면 "V-??" 반환.
+    """
+    norm_rel = rel_path.replace(os.sep, "/")
+    for file_pat, import_pat, v_id in KNOWN_V_MAP:
+        if not re.search(file_pat, norm_rel):
+            continue
+        if import_pat == "" or re.search(import_pat, import_path):
+            return v_id
+    return "V-??"
+
+
+def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
+    """
+    engine/src/ 하위 모든 .rs 파일을 분석하여 위반 목록 반환.
+    """
+    violations = []
+    seen = set()  # (file, line, import) 중복 제거
+
+    for dirpath, _, filenames in os.walk(src_root):
+        for fname in filenames:
+            if not fname.endswith(".rs"):
+                continue
+            full_path = os.path.join(dirpath, fname)
+            rel_path = os.path.relpath(full_path, src_root)
+            rel_path = rel_path.replace(os.sep, "/")
+
+            src_layer = classify_module(rel_path)
+            imports = extract_imports(full_path)
+
+            for lineno, imp, is_test in imports:
+                # imp에서 정규화된 경로 추출
+                imp_clean = imp.strip()
+                if imp_clean.startswith("crate::"):
+                    dst_raw = imp_clean[len("crate::"):]
+                else:
+                    dst_raw = imp_clean
+                dst_layer = classify_import(imp_clean)
+
+                # cross-backend 검사
+                cb_inv, cb_kind = check_cross_backend(rel_path, imp_clean)
+                if cb_inv:
+                    if inv_filter and cb_inv.lower() != inv_filter.lower():
+                        pass
+                    else:
+                        key = (rel_path, lineno, imp_clean)
+                        if key not in seen:
+                            seen.add(key)
+                            v_id = lookup_v_id(rel_path, imp_clean)
+                            violations.append({
+                                "id": v_id,
+                                "file": rel_path,
+                                "line": lineno,
+                                "import": imp_clean,
+                                "rule": cb_inv,
+                                "kind": cb_kind,
+                                "is_test_block": is_test,
+                            })
+                    continue
+
+                # 일반 위반 검사
+                inv_id, kind, note = check_violation(src_layer, dst_layer, rel_path)
+                if not inv_id:
+                    continue
+                if inv_filter and inv_id.lower() != inv_filter.lower():
+                    continue
+
+                key = (rel_path, lineno, imp_clean)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                v_id = lookup_v_id(rel_path, imp_clean)
+                entry = {
+                    "id": v_id,
+                    "file": rel_path,
+                    "line": lineno,
+                    "import": imp_clean,
+                    "rule": inv_id,
+                    "kind": kind,
+                    "is_test_block": is_test,
+                }
+                if note:
+                    entry["note"] = note
+                violations.append(entry)
+
+    # V-ID 순 정렬
+    def sort_key(v):
+        vid = v.get("id", "V-??")
+        try:
+            n = int(vid.split("-")[1])
+        except Exception:
+            n = 9999
+        return (n, v["file"], v["line"])
+
+    violations.sort(key=sort_key)
+    return violations
+
+
+# ────────────────────────────────────────────────────────────────────
+# baseline diff
+# ────────────────────────────────────────────────────────────────────
+
+def load_baseline(path: str) -> list[dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("violations", [])
+
+
+def diff_violations(current: list[dict], baseline: list[dict]) -> list[dict]:
+    """
+    baseline에 없는 새 위반만 반환 (회귀 감지).
+    매칭 기준: (file, import, rule) 튜플.
+    """
+    baseline_keys = set()
+    for v in baseline:
+        key = (v.get("file", ""), v.get("import", ""), v.get("rule", ""))
+        baseline_keys.add(key)
+
+    new_violations = []
+    for v in current:
+        key = (v.get("file", ""), v.get("import", ""), v.get("rule", ""))
+        if key not in baseline_keys:
+            new_violations.append(v)
+    return new_violations
+
+
+# ────────────────────────────────────────────────────────────────────
+# CLI
+# ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Engine 레이어드 아키텍처 위반 검출")
+    parser.add_argument(
+        "--src",
+        default=None,
+        help="engine/src/ 경로 (기본: 스크립트 위치에서 자동 탐색)",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        help="baseline JSON 경로. 지정 시 새로 발견된 위반만 출력",
+    )
+    parser.add_argument(
+        "--filter",
+        default=None,
+        help="특정 INV만 필터링 (예: inv-layer-001)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=True,
+        help="JSON 출력 (기본)",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        default=False,
+        help="요약 출력 (violations만 아닌 통계 포함)",
+    )
+    args = parser.parse_args()
+
+    # src 경로 결정
+    if args.src:
+        src_root = args.src
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # scripts/ → 프로젝트 루트 → engine/src
+        project_root = os.path.dirname(script_dir)
+        src_root = os.path.join(project_root, "engine", "src")
+
+    if not os.path.isdir(src_root):
+        print(f"오류: engine/src 디렉토리를 찾을 수 없음: {src_root}", file=sys.stderr)
+        sys.exit(1)
+
+    violations = analyze(src_root, args.filter)
+
+    if args.baseline:
+        baseline = load_baseline(args.baseline)
+        violations = diff_violations(violations, baseline)
+
+    result = {"violations": violations}
+
+    if args.summary:
+        print(f"총 위반: {len(violations)}건", file=sys.stderr)
+        by_rule = {}
+        for v in violations:
+            r = v.get("rule", "?")
+            by_rule[r] = by_rule.get(r, 0) + 1
+        for r, cnt in sorted(by_rule.items()):
+            print(f"  {r}: {cnt}건", file=sys.stderr)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

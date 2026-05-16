@@ -86,18 +86,24 @@ fn test_eng_alg_032_importance_table_full_skip() {
             sublayer: SubLayer::Full,
             importance: 0.5,
             opr: 0.1,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 1,
             sublayer: SubLayer::Full,
             importance: 0.3,
             opr: 0.2,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 2,
             sublayer: SubLayer::Full,
             importance: 0.2,
             opr: 0.3,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
     ];
     let table = ImportanceTable::from_entries(entries);
@@ -120,18 +126,24 @@ fn test_eng_alg_032_importance_table_partial_skip() {
             sublayer: SubLayer::Full,
             importance: 0.5,
             opr: 0.1,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 1,
             sublayer: SubLayer::Full,
             importance: 0.3,
             opr: 0.2,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 2,
             sublayer: SubLayer::Full,
             importance: 0.2,
             opr: 0.3,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
     ];
     let table = ImportanceTable::from_entries(entries);
@@ -149,6 +161,8 @@ fn test_eng_alg_032_importance_table_empty_skip() {
         sublayer: SubLayer::Full,
         importance: 0.5,
         opr: 0.1,
+        importance_mean_pool: None,
+        importance_shortgpt_bi: None,
     }];
     let table = ImportanceTable::from_entries(entries);
     let qcf = table.compute_qcf(&[]);
@@ -163,24 +177,32 @@ fn test_eng_alg_032_estimate_qcf_protects_first_last() {
             sublayer: SubLayer::Full,
             importance: 0.1,
             opr: 0.05,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 1,
             sublayer: SubLayer::Full,
             importance: 0.3,
             opr: 0.1,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 2,
             sublayer: SubLayer::Full,
             importance: 0.5,
             opr: 0.2,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 3,
             sublayer: SubLayer::Full,
             importance: 0.1,
             opr: 0.05,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
     ];
     let table = ImportanceTable::from_entries(entries);
@@ -204,30 +226,40 @@ fn test_eng_alg_032_estimate_qcf_selects_least_important() {
             sublayer: SubLayer::Full,
             importance: 0.9,
             opr: 0.5,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 1,
             sublayer: SubLayer::Full,
             importance: 0.1,
             opr: 0.02,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 2,
             sublayer: SubLayer::Full,
             importance: 0.8,
             opr: 0.4,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 3,
             sublayer: SubLayer::Full,
             importance: 0.2,
             opr: 0.05,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 4,
             sublayer: SubLayer::Full,
             importance: 0.7,
             opr: 0.3,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
     ];
     let table = ImportanceTable::from_entries(entries);
