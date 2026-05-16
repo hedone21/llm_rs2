@@ -1,0 +1,24 @@
+[IO] tag=start rchar=233622 wchar=0 read_bytes=1019904 write_bytes=0
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[IO] tag=model_loaded rchar=242770 wchar=439 read_bytes=2846679040 write_bytes=4096
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+
+Token Length: 71
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=70.21
+Prefill: 722.11 ms (71 tokens, 98.3 tok/s)
+Prefill(pure fwd): 722.07 ms (71 tokens, 98.3 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[IO] tag=prefill_done rchar=7274946 wchar=1538 read_bytes=2856919040 write_bytes=12288
+[IO] tag=decode_1 rchar=7275062 wchar=2086 read_bytes=2856939520 write_bytes=12288
+[IO] tag=decode_16 rchar=7275178 wchar=2276 read_bytes=2856992768 write_bytes=12288
+[IO] tag=ttft rchar=7275294 wchar=2489 read_bytes=2856992768 write_bytes=16384
+[IO] tag=exit rchar=7275410 wchar=2741 read_bytes=2856992768 write_bytes=16384

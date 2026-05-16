@@ -1,0 +1,17 @@
+[RSS] tag=start VmRSS=4480 RssFile=3200 RssAnon=896 RssShmem=384 VmData=1984 VmSize=10802884
+[IO] tag=start rchar=234760 wchar=93 read_bytes=4210688 write_bytes=8192
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[qnn_oppkg] runtime initialized: backend_lib=/data/local/tmp/qnn/libQnnGpu.so oppkg_lib=/data/local/tmp/libqnn_oppkg.so rpc_lib=/vendor/lib64/libcdsprpc.so
+[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)
+[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)
+[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+[Secondary] AUF lacks preferred variant AdrenoSoa; using CpuAos (swap will use AOS path — switch_hw / partition compatible, GPU TBT may regress vs SOA)
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[RSS] tag=model_loaded VmRSS=4967588 RssFile=1905540 RssAnon=45856 RssShmem=3016192 VmData=115352 VmSize=18827480
+[IO] tag=model_loaded rchar=247016 wchar=2099 read_bytes=3881451520 write_bytes=12288
+[qnn_oppkg] layer=0 graphFinalize err=0x0 elapsed=2801.95 ms
+Error: ENG-QNN-209/INV-167: layer 0 graphFinalize 2801 ms > 2000 ms (budget)

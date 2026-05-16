@@ -1,0 +1,12 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[qnn_oppkg] runtime initialized: backend_lib=/data/local/tmp/qnn/libQnnGpu.so oppkg_lib=/data/local/tmp/libqnn_oppkg.so rpc_lib=/vendor/lib64/libcdsprpc.so
+[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)
+[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)
+[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[qnn_oppkg] layer=0 graphFinalize err=0x0 elapsed=2077.77 ms
+Error: ENG-QNN-209/INV-167: layer 0 graphFinalize 2077 ms > 2000 ms (budget)

@@ -1,0 +1,68 @@
+[RSS] tag=start VmRSS=4256 RssFile=3072 RssAnon=928 RssShmem=256 VmData=1988 VmSize=10813128
+[IO] tag=start rchar=234763 wchar=93 read_bytes=2818048 write_bytes=4096
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[qnn_oppkg] runtime initialized: backend_lib=/data/local/tmp/qnn/libQnnGpu.so oppkg_lib=/data/local/tmp/libqnn_oppkg.so rpc_lib=/vendor/lib64/libcdsprpc.so
+[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)
+[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)
+[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+[Secondary] AUF lacks preferred variant AdrenoSoa; using CpuAos (swap will use AOS path — switch_hw / partition compatible, GPU TBT may regress vs SOA)
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[RSS] tag=model_loaded VmRSS=5718104 RssFile=2631160 RssAnon=70496 RssShmem=3016448 VmData=115356 VmSize=18753756
+[IO] tag=model_loaded rchar=246987 wchar=2099 read_bytes=3874578432 write_bytes=8192
+[qnn_oppkg] layer=0 graphFinalize err=0x0 elapsed=1061.48 ms
+[qnn_oppkg] layer=1 graphFinalize err=0x0 elapsed=3.47 ms
+[qnn_oppkg] layer=2 graphFinalize err=0x0 elapsed=3.68 ms
+[qnn_oppkg] layer=3 graphFinalize err=0x0 elapsed=3.48 ms
+[qnn_oppkg] layer=4 graphFinalize err=0x0 elapsed=3.49 ms
+[qnn_oppkg] layer=5 graphFinalize err=0x0 elapsed=3.58 ms
+[qnn_oppkg] layer=6 graphFinalize err=0x0 elapsed=3.69 ms
+[qnn_oppkg] layer=7 graphFinalize err=0x0 elapsed=3.57 ms
+[qnn_oppkg] layer=8 graphFinalize err=0x0 elapsed=3.50 ms
+[qnn_oppkg] layer=9 graphFinalize err=0x0 elapsed=3.68 ms
+[qnn_oppkg] layer=10 graphFinalize err=0x0 elapsed=3.73 ms
+[qnn_oppkg] layer=11 graphFinalize err=0x0 elapsed=3.58 ms
+[qnn_oppkg] layer=12 graphFinalize err=0x0 elapsed=3.73 ms
+[qnn_oppkg] layer=13 graphFinalize err=0x0 elapsed=3.61 ms
+[qnn_oppkg] layer=14 graphFinalize err=0x0 elapsed=3.59 ms
+[qnn_oppkg] layer=15 graphFinalize err=0x0 elapsed=4.20 ms
+[qnn_oppkg] layer=16 graphFinalize err=0x0 elapsed=5.08 ms
+[qnn_oppkg] layer=17 graphFinalize err=0x0 elapsed=3.99 ms
+[qnn_oppkg] layer=18 graphFinalize err=0x0 elapsed=3.79 ms
+[qnn_oppkg] layer=19 graphFinalize err=0x0 elapsed=3.97 ms
+[qnn_oppkg] layer=20 graphFinalize err=0x0 elapsed=4.61 ms
+[qnn_oppkg] layer=21 graphFinalize err=0x0 elapsed=4.34 ms
+[qnn_oppkg] layer=22 graphFinalize err=0x0 elapsed=3.98 ms
+[qnn_oppkg] layer=23 graphFinalize err=0x0 elapsed=4.11 ms
+[qnn_oppkg] layer=24 graphFinalize err=0x0 elapsed=4.16 ms
+[qnn_oppkg] layer=25 graphFinalize err=0x0 elapsed=3.77 ms
+[qnn_oppkg] layer=26 graphFinalize err=0x0 elapsed=3.78 ms
+[qnn_oppkg] layer=27 graphFinalize err=0x0 elapsed=4.12 ms
+[qnn_oppkg] eager prebuild: 28 layers, total finalize 1150 ms
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+
+Token Length: 71
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+weight_swap: intra-forward (LISWAP-4) mode — ratio=1.00, 28 target layers
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=62.32
+Prefill: 751.71 ms (71 tokens, 94.5 tok/s)
+Prefill(pure fwd): 555.23 ms (71 tokens, 127.9 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[RSS] tag=prefill_done VmRSS=5374988 RssFile=1897976 RssAnon=248200 RssShmem=3228812 VmData=313872 VmSize=20772748
+[IO] tag=prefill_done rchar=7280314 wchar=5295 read_bytes=4038504448 write_bytes=16384
+[IntraForwardSwap] plan retired at token=0 (drain+sync+bump+invalidate 0.0ms)
+[RSS] tag=decode_1 VmRSS=5723512 RssFile=1602808 RssAnon=225876 RssShmem=3894828 VmData=327988 VmSize=21562816
+[IO] tag=decode_1 rchar=7281580 wchar=6032 read_bytes=4055863296 write_bytes=16384
+[RSS] tag=decode_16 VmRSS=5724408 RssFile=1602808 RssAnon=226772 RssShmem=3894828 VmData=327988 VmSize=21562816
+[IO] tag=decode_16 rchar=7282846 wchar=6334 read_bytes=4055916544 write_bytes=16384
+[IO] tag=ttft rchar=7282962 wchar=6539 read_bytes=4055916544 write_bytes=16384
+[RSS] tag=exit VmRSS=5722680 RssFile=1602808 RssAnon=225044 RssShmem=3894828 VmData=327988 VmSize=21562684
+[IO] tag=exit rchar=7284228 wchar=6899 read_bytes=4055941120 write_bytes=16384

@@ -1,0 +1,76 @@
+[RSS] tag=start VmRSS=4348 RssFile=3196 RssAnon=896 RssShmem=256 VmData=1988 VmSize=10804936
+[IO] tag=start rchar=234761 wchar=93 read_bytes=2494464 write_bytes=8192
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[qnn_oppkg] runtime initialized: backend_lib=/data/local/tmp/qnn/libQnnGpu.so oppkg_lib=/data/local/tmp/libqnn_oppkg.so rpc_lib=/vendor/lib64/libcdsprpc.so
+[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)
+[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)
+[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+[Secondary] AUF lacks preferred variant AdrenoSoa; using CpuAos (swap will use AOS path — switch_hw / partition compatible, GPU TBT may regress vs SOA)
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[RSS] tag=model_loaded VmRSS=4843152 RssFile=1786660 RssAnon=40300 RssShmem=3016192 VmData=115356 VmSize=18845916
+[IO] tag=model_loaded rchar=247018 wchar=2099 read_bytes=3873308672 write_bytes=16384
+[qnn_oppkg] layer=0 graphFinalize err=0x0 elapsed=1692.51 ms
+[qnn_oppkg] layer=1 graphFinalize err=0x0 elapsed=6.70 ms
+[qnn_oppkg] layer=2 graphFinalize err=0x0 elapsed=5.76 ms
+[qnn_oppkg] layer=3 graphFinalize err=0x0 elapsed=6.62 ms
+[qnn_oppkg] layer=4 graphFinalize err=0x0 elapsed=5.31 ms
+[qnn_oppkg] layer=5 graphFinalize err=0x0 elapsed=5.88 ms
+[qnn_oppkg] layer=6 graphFinalize err=0x0 elapsed=5.42 ms
+[qnn_oppkg] layer=7 graphFinalize err=0x0 elapsed=9.23 ms
+[qnn_oppkg] layer=8 graphFinalize err=0x0 elapsed=5.57 ms
+[qnn_oppkg] layer=9 graphFinalize err=0x0 elapsed=5.40 ms
+[qnn_oppkg] layer=10 graphFinalize err=0x0 elapsed=4.41 ms
+[qnn_oppkg] layer=11 graphFinalize err=0x0 elapsed=4.63 ms
+[qnn_oppkg] layer=12 graphFinalize err=0x0 elapsed=4.55 ms
+[qnn_oppkg] layer=13 graphFinalize err=0x0 elapsed=6.71 ms
+[qnn_oppkg] layer=14 graphFinalize err=0x0 elapsed=4.79 ms
+[qnn_oppkg] layer=15 graphFinalize err=0x0 elapsed=5.51 ms
+[qnn_oppkg] layer=16 graphFinalize err=0x0 elapsed=4.51 ms
+[qnn_oppkg] layer=17 graphFinalize err=0x0 elapsed=4.27 ms
+[qnn_oppkg] layer=18 graphFinalize err=0x0 elapsed=4.55 ms
+[qnn_oppkg] layer=19 graphFinalize err=0x0 elapsed=4.70 ms
+[qnn_oppkg] layer=20 graphFinalize err=0x0 elapsed=4.56 ms
+[qnn_oppkg] layer=21 graphFinalize err=0x0 elapsed=4.62 ms
+[qnn_oppkg] layer=22 graphFinalize err=0x0 elapsed=4.55 ms
+[qnn_oppkg] layer=23 graphFinalize err=0x0 elapsed=4.65 ms
+[qnn_oppkg] layer=24 graphFinalize err=0x0 elapsed=4.66 ms
+[qnn_oppkg] layer=25 graphFinalize err=0x0 elapsed=4.40 ms
+[qnn_oppkg] layer=26 graphFinalize err=0x0 elapsed=4.49 ms
+[qnn_oppkg] layer=27 graphFinalize err=0x0 elapsed=4.71 ms
+[qnn_oppkg] eager prebuild: 28 layers, total finalize 1818 ms
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+
+Token Length: 71
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+weight_swap: incremental mode — ratio=1.00, 28 target layers, per_tick=7 (4 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=239.36
+Prefill: 5531.77 ms (71 tokens, 12.8 tok/s)
+Prefill(pure fwd): 4073.12 ms (71 tokens, 17.4 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[RSS] tag=prefill_done VmRSS=4050600 RssFile=597924 RssAnon=223780 RssShmem=3228896 VmData=311760 VmSize=20846380
+[IO] tag=prefill_done rchar=7280344 wchar=5316 read_bytes=4512899072 write_bytes=32768
+[IncrementalSwap] tick=0 chunk=[0, 1, 2, 3, 4, 5, 6] swapped=7 remaining=21 latency=405.8ms read_bytes_delta=184619008
+[IncrementalSwap] stages: prefault=150.8ms mmap_permute=253.9ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.3ms
+[RSS] tag=decode_1 VmRSS=4356308 RssFile=771364 RssAnon=217548 RssShmem=3367396 VmData=327732 VmSize=21115192
+[IO] tag=decode_1 rchar=7281840 wchar=6239 read_bytes=4697690112 write_bytes=36864
+[IncrementalSwap] tick=1 chunk=[7, 8, 9, 10, 11, 12, 13] swapped=7 remaining=14 latency=507.8ms read_bytes_delta=184479744
+[IncrementalSwap] stages: prefault=258.1ms mmap_permute=249.0ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=2 chunk=[14, 15, 16, 17, 18, 19, 20] swapped=7 remaining=7 latency=477.1ms read_bytes_delta=184467456
+[IncrementalSwap] stages: prefault=197.5ms mmap_permute=278.9ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=3 chunk=[21, 22, 23, 24, 25, 26, 27] swapped=7 remaining=0 latency=463.2ms read_bytes_delta=184352768
+[IncrementalSwap] stages: prefault=184.9ms mmap_permute=277.6ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=3)
+[RSS] tag=decode_16 VmRSS=5218388 RssFile=1172516 RssAnon=138956 RssShmem=3906916 VmData=327988 VmSize=21654976
+[IO] tag=decode_16 rchar=7283800 wchar=7426 read_bytes=5251125248 write_bytes=36864
+[IO] tag=ttft rchar=7283916 wchar=7752 read_bytes=5251215360 write_bytes=36864
+[RSS] tag=exit VmRSS=5034336 RssFile=991140 RssAnon=136280 RssShmem=3906916 VmData=327988 VmSize=21654844
+[IO] tag=exit rchar=7285180 wchar=8109 read_bytes=5251309568 write_bytes=36864

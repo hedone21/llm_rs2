@@ -1,0 +1,20 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+The context passage describes a runtime weight precision swap mechanism used for on-device large language model inference (LLM). This mechanism aims at reducing floating-point computation overhead during decoding phase without requiring modifications to any codebase or models.
+
+During each decode step, there is an opportunity to perform a latency-sensitive operation, such as swapping the weights of individual layers atomically. These operations can be very time-consuming but are needed for certain stages in the training process (e.g., model fine-tuning).
+
+The key insight here is that during a precision swap, weights of individual layers are replaced atomically while decoding continues. This allows for more efficient use of compute resources on-device.
+
+To control latency, we can set how many layers to swap per decode step. The larger the number swapped per step (e.g., 16), lower latency will be observed but at the cost of reduced throughput.
+The next passage provides additional context and details about the weight precision swap mechanism:
+
+During a single precision to half-precision conversion, decoding performance improves from average of approximately 2.5 seconds/step to below .8 seconds/step with an optimal tradeoff between loss in BLEU score (the metric used for evaluating model quality) on one hand, and round-off errors introduced by using half-precision numbers on the other.
+This suggests that there is a point where swapping more layers results in lower latency but also reduces accuracy
+Done.
+[Profile] Event: End
+TTFT: 910.19 ms
+Decode: 5.11 ms/tok (195.5 tok/s) [279 tokens, forward only]
+Decode(excl tok[0]): 5.11 ms/tok (195.5 tok/s) [278 tokens] | tok[0]=5.23 ms
+Avg TBT: 29.15 ms (34.3 tokens/sec)

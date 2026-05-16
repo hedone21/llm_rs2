@@ -1,0 +1,85 @@
+[RSS] tag=start VmRSS=1508 RssFile=1012 RssAnon=496 RssShmem=0 VmData=256 VmSize=9972
+[IO] tag=start rchar=8976 wchar=86 read_bytes=3719168 write_bytes=4096
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /home/nvidia/llm_rs2/models/llama3.1-8b/gguf/llama3.1-8b-f16.gguf
+[CUDA] Compiling kernels with /usr/local/cuda-11.4/bin/nvcc --ptx -arch=sm_72 -std=c++17 ...
+[CUDA] Kernel compilation done (803678 bytes PTX)
+[CUDA] Device: Xavier (sm_72, UMA=true, managed_mem=1, cuBLAS=ready, kernels=ready)
+[CUDA self-test] add_assign: [5.0, 7.0, 9.0] OK
+[CUDA self-test] scale:      [1.0, 2.0, 3.0] OK
+[CUDA self-test] rms_norm:   [0.8485, 1.1314] OK
+[CUDA] --cuda-sync-policy=minimal (mask=0x81)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 291 tensors, arch=Llama, weight_dtype=F16
+[RSS] tag=model_loaded VmRSS=27477520 RssFile=27131320 RssAnon=346200 RssShmem=0 VmData=384736 VmSize=54420816
+[IO] tag=model_loaded rchar=7399827 wchar=2253678 read_bytes=20258496512 write_bytes=2277376
+[quantize_lm_head] F16 → Q4_0 (1050673152 → 295501824 bytes, 128256 rows × 4096 cols)
+[Backend] Quantized lm_head → Q4_0 in 6117.4 ms (mode=auto)
+[Backend] Migrated 291 weight tensors to CUDA pinned memory
+[Tokenizer] /home/nvidia/llm_rs2/models/llama3.1-8b/gguf/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+
+Token Length: 72
+Model config: layers=32, kv_heads=8, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 262144B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: incremental mode — ratio=1.00, 32 target layers, per_tick=2 (16 ticks estimated)
+[WARMUP] tokens=1 ms=166.55
+Prefill: 606.91 ms (72 tokens, 118.6 tok/s)
+Prefill(pure fwd): 606.72 ms (72 tokens, 118.7 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[RSS] tag=prefill_done VmRSS=24362540 RssFile=23947760 RssAnon=414780 RssShmem=0 VmData=462804 VmSize=54564296
+[IO] tag=prefill_done rchar=16487177 wchar=2255141 read_bytes=20273065984 write_bytes=2293760
+[IncrementalSwap] tick=0 chunk=[0] swapped=1 remaining=31 latency=26.1ms read_bytes_delta=36864
+[IncrementalSwap] stages: prefault=1.6ms mmap_permute=24.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[DynamicK] calibrated t=0 blocking_ms=26.454/layer fwd_ms=151.55 safe_k=2
+[RSS] tag=decode_1 VmRSS=24326788 RssFile=23911952 RssAnon=414836 RssShmem=0 VmData=478176 VmSize=55037552
+[IO] tag=decode_1 rchar=16488707 wchar=2256110 read_bytes=20273102848 write_bytes=2293760
+[IncrementalSwap] tick=1 chunk=[1, 2] swapped=2 remaining=29 latency=91.5ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=2.3ms mmap_permute=88.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=2 chunk=[3, 4] swapped=2 remaining=27 latency=72.8ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=2.3ms mmap_permute=70.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=3 chunk=[5, 6] swapped=2 remaining=25 latency=79.6ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=2.4ms mmap_permute=76.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=4 chunk=[7, 8] swapped=2 remaining=23 latency=88.5ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=2.4ms mmap_permute=85.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=5 chunk=[9, 10] swapped=2 remaining=21 latency=86.2ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=2.5ms mmap_permute=83.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=6 chunk=[11, 12] swapped=2 remaining=19 latency=88.5ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=84.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=7 chunk=[13, 14] swapped=2 remaining=17 latency=86.8ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=83.3ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=8 chunk=[15, 16] swapped=2 remaining=15 latency=85.9ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=82.3ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=9 chunk=[17, 18] swapped=2 remaining=13 latency=86.1ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=82.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=10 chunk=[19, 20] swapped=2 remaining=11 latency=86.6ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=83.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=11 chunk=[21, 22] swapped=2 remaining=9 latency=86.6ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.0ms mmap_permute=83.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=12 chunk=[23, 24] swapped=2 remaining=7 latency=86.0ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=82.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=13 chunk=[25, 26] swapped=2 remaining=5 latency=86.7ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=83.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=14 chunk=[27, 28] swapped=2 remaining=3 latency=85.4ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=81.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=15 chunk=[29, 30] swapped=2 remaining=1 latency=84.8ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=3.1ms mmap_permute=81.2ms arc_swap=0.1ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[RSS] tag=decode_16 VmRSS=11933472 RssFile=11518620 RssAnon=414852 RssShmem=0 VmData=478176 VmSize=55037552
+[IO] tag=decode_16 rchar=16493821 wchar=2259979 read_bytes=20273102848 write_bytes=2297856
+[IncrementalSwap] tick=16 chunk=[31] swapped=1 remaining=0 latency=24.8ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=1.5ms mmap_permute=22.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=16)
+[LISWAP-2] dispatcher drained: 0.0ms
+[cpu_fallback] === totals ===
+[cpu_fallback]                       matmul: 0
+[cpu_fallback]       matmul_transposed_q4_0: 0
+[cpu_fallback]      matmul_transposed_other: 0
+[cpu_fallback]                 matmul_slice: 0
+[cpu_fallback]                         cast: 0
+[cpu_fallback]                   kv_scatter: 0
+[cpu_fallback]                       gather: 0
+[cpu_fallback]                attention_gen: 0
+[IO] tag=ttft rchar=16494208 wchar=2261040 read_bytes=20273102848 write_bytes=2306048
+[RSS] tag=exit VmRSS=10696660 RssFile=10281792 RssAnon=414868 RssShmem=0 VmData=478176 VmSize=55037552
+[IO] tag=exit rchar=16495483 wchar=2261403 read_bytes=20273102848 write_bytes=2306048

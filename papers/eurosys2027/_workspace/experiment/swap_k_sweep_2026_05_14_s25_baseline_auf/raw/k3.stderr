@@ -1,0 +1,88 @@
+[RSS] tag=start VmRSS=4460 RssFile=3324 RssAnon=880 RssShmem=256 VmData=1988 VmSize=10837704
+[IO] tag=start rchar=234761 wchar=93 read_bytes=2740224 write_bytes=8192
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[qnn_oppkg] runtime initialized: backend_lib=/data/local/tmp/qnn/libQnnGpu.so oppkg_lib=/data/local/tmp/libqnn_oppkg.so rpc_lib=/vendor/lib64/libcdsprpc.so
+[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)
+[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)
+[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+[Secondary] AUF lacks preferred variant AdrenoSoa; using CpuAos (swap will use AOS path — switch_hw / partition compatible, GPU TBT may regress vs SOA)
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[RSS] tag=model_loaded VmRSS=5498984 RssFile=2457704 RssAnon=25088 RssShmem=3016192 VmData=115356 VmSize=18913500
+[IO] tag=model_loaded rchar=247017 wchar=2099 read_bytes=3885121536 write_bytes=12288
+[qnn_oppkg] layer=0 graphFinalize err=0x0 elapsed=1721.99 ms
+[qnn_oppkg] layer=1 graphFinalize err=0x0 elapsed=8.58 ms
+[qnn_oppkg] layer=2 graphFinalize err=0x0 elapsed=5.23 ms
+[qnn_oppkg] layer=3 graphFinalize err=0x0 elapsed=5.58 ms
+[qnn_oppkg] layer=4 graphFinalize err=0x0 elapsed=5.72 ms
+[qnn_oppkg] layer=5 graphFinalize err=0x0 elapsed=5.33 ms
+[qnn_oppkg] layer=6 graphFinalize err=0x0 elapsed=8.10 ms
+[qnn_oppkg] layer=7 graphFinalize err=0x0 elapsed=4.97 ms
+[qnn_oppkg] layer=8 graphFinalize err=0x0 elapsed=5.06 ms
+[qnn_oppkg] layer=9 graphFinalize err=0x0 elapsed=5.58 ms
+[qnn_oppkg] layer=10 graphFinalize err=0x0 elapsed=4.54 ms
+[qnn_oppkg] layer=11 graphFinalize err=0x0 elapsed=5.14 ms
+[qnn_oppkg] layer=12 graphFinalize err=0x0 elapsed=5.03 ms
+[qnn_oppkg] layer=13 graphFinalize err=0x0 elapsed=6.96 ms
+[qnn_oppkg] layer=14 graphFinalize err=0x0 elapsed=4.63 ms
+[qnn_oppkg] layer=15 graphFinalize err=0x0 elapsed=5.36 ms
+[qnn_oppkg] layer=16 graphFinalize err=0x0 elapsed=7.77 ms
+[qnn_oppkg] layer=17 graphFinalize err=0x0 elapsed=6.42 ms
+[qnn_oppkg] layer=18 graphFinalize err=0x0 elapsed=5.78 ms
+[qnn_oppkg] layer=19 graphFinalize err=0x0 elapsed=8.03 ms
+[qnn_oppkg] layer=20 graphFinalize err=0x0 elapsed=6.71 ms
+[qnn_oppkg] layer=21 graphFinalize err=0x0 elapsed=6.61 ms
+[qnn_oppkg] layer=22 graphFinalize err=0x0 elapsed=6.47 ms
+[qnn_oppkg] layer=23 graphFinalize err=0x0 elapsed=6.25 ms
+[qnn_oppkg] layer=24 graphFinalize err=0x0 elapsed=6.33 ms
+[qnn_oppkg] layer=25 graphFinalize err=0x0 elapsed=4.99 ms
+[qnn_oppkg] layer=26 graphFinalize err=0x0 elapsed=4.76 ms
+[qnn_oppkg] layer=27 graphFinalize err=0x0 elapsed=4.91 ms
+[qnn_oppkg] eager prebuild: 28 layers, total finalize 1868 ms
+[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant=WEIGHTS_CPU_AOS)
+[lm_head] loaded from AUF AOS payload (125 MB, 151936×1536, variant=WEIGHTS_CPU_AOS)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+
+Token Length: 71
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+weight_swap: incremental mode — ratio=1.00, 28 target layers, per_tick=3 (10 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=178.90
+Prefill: 3993.00 ms (71 tokens, 17.8 tok/s)
+Prefill(pure fwd): 2941.36 ms (71 tokens, 24.1 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[RSS] tag=prefill_done VmRSS=4112540 RssFile=658920 RssAnon=224860 RssShmem=3228760 VmData=311760 VmSize=20913964
+[IO] tag=prefill_done rchar=7280342 wchar=5317 read_bytes=4525838336 write_bytes=32768
+[IncrementalSwap] tick=0 chunk=[0, 1, 2] swapped=3 remaining=25 latency=229.3ms read_bytes_delta=79142912
+[IncrementalSwap] stages: prefault=63.1ms mmap_permute=165.9ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[RSS] tag=decode_1 VmRSS=4217376 RssFile=735720 RssAnon=217284 RssShmem=3264372 VmData=327732 VmSize=21079960
+[IO] tag=decode_1 rchar=7281837 wchar=6226 read_bytes=4605214720 write_bytes=32768
+[IncrementalSwap] tick=1 chunk=[3, 4, 5] swapped=3 remaining=22 latency=225.8ms read_bytes_delta=78905344
+[IncrementalSwap] stages: prefault=76.6ms mmap_permute=149.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=2 chunk=[6, 7, 8] swapped=3 remaining=19 latency=221.1ms read_bytes_delta=79204352
+[IncrementalSwap] stages: prefault=63.5ms mmap_permute=157.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=3 chunk=[9, 10, 11] swapped=3 remaining=16 latency=217.9ms read_bytes_delta=79065088
+[IncrementalSwap] stages: prefault=66.8ms mmap_permute=150.9ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=4 chunk=[12, 13, 14] swapped=3 remaining=13 latency=214.5ms read_bytes_delta=79167488
+[IncrementalSwap] stages: prefault=69.5ms mmap_permute=144.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=5 chunk=[15, 16, 17] swapped=3 remaining=10 latency=235.9ms read_bytes_delta=78991360
+[IncrementalSwap] stages: prefault=60.6ms mmap_permute=175.0ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=6 chunk=[18, 19, 20] swapped=3 remaining=7 latency=248.7ms read_bytes_delta=79032320
+[IncrementalSwap] stages: prefault=64.6ms mmap_permute=183.8ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=7 chunk=[21, 22, 23] swapped=3 remaining=4 latency=208.5ms read_bytes_delta=79097856
+[IncrementalSwap] stages: prefault=115.7ms mmap_permute=92.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=8 chunk=[24, 25, 26] swapped=3 remaining=1 latency=282.1ms read_bytes_delta=78974976
+[IncrementalSwap] stages: prefault=83.2ms mmap_permute=198.6ms arc_swap=0.0ms madvise=0.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=9 chunk=[27] swapped=1 remaining=0 latency=134.7ms read_bytes_delta=26116096
+[IncrementalSwap] stages: prefault=27.7ms mmap_permute=106.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=9)
+[RSS] tag=decode_16 VmRSS=5276960 RssFile=1268840 RssAnon=101188 RssShmem=3906932 VmData=327988 VmSize=21722560
+[IO] tag=decode_16 rchar=7285188 wchar=8871 read_bytes=5263839232 write_bytes=40960
+[IO] tag=ttft rchar=7285304 wchar=9186 read_bytes=5263994880 write_bytes=40960
+[RSS] tag=exit VmRSS=4776984 RssFile=827624 RssAnon=42428 RssShmem=3906932 VmData=327988 VmSize=21722428
+[IO] tag=exit rchar=7286567 wchar=9542 read_bytes=5264084992 write_bytes=40960

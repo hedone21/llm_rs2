@@ -1,0 +1,126 @@
+[RSS] tag=start VmRSS=4384 RssFile=3072 RssAnon=928 RssShmem=384 VmData=1988 VmSize=10780328
+[IO] tag=start rchar=234763 wchar=93 read_bytes=2674688 write_bytes=4096
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[qnn_oppkg] runtime initialized: backend_lib=/data/local/tmp/qnn/libQnnGpu.so oppkg_lib=/data/local/tmp/libqnn_oppkg.so rpc_lib=/vendor/lib64/libcdsprpc.so
+[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)
+[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)
+[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[RSS] tag=model_loaded VmRSS=6383496 RssFile=3286180 RssAnon=80996 RssShmem=3016320 VmData=127228 VmSize=18568152
+[IO] tag=model_loaded rchar=247057 wchar=1945 read_bytes=3868295168 write_bytes=8192
+[qnn_oppkg] layer=0 graphFinalize err=0x0 elapsed=1093.71 ms
+[qnn_oppkg] layer=1 graphFinalize err=0x0 elapsed=3.64 ms
+[qnn_oppkg] layer=2 graphFinalize err=0x0 elapsed=3.48 ms
+[qnn_oppkg] layer=3 graphFinalize err=0x0 elapsed=3.51 ms
+[qnn_oppkg] layer=4 graphFinalize err=0x0 elapsed=3.50 ms
+[qnn_oppkg] layer=5 graphFinalize err=0x0 elapsed=3.56 ms
+[qnn_oppkg] layer=6 graphFinalize err=0x0 elapsed=3.99 ms
+[qnn_oppkg] layer=7 graphFinalize err=0x0 elapsed=4.01 ms
+[qnn_oppkg] layer=8 graphFinalize err=0x0 elapsed=5.13 ms
+[qnn_oppkg] layer=9 graphFinalize err=0x0 elapsed=4.50 ms
+[qnn_oppkg] layer=10 graphFinalize err=0x0 elapsed=3.81 ms
+[qnn_oppkg] layer=11 graphFinalize err=0x0 elapsed=3.80 ms
+[qnn_oppkg] layer=12 graphFinalize err=0x0 elapsed=3.81 ms
+[qnn_oppkg] layer=13 graphFinalize err=0x0 elapsed=3.58 ms
+[qnn_oppkg] layer=14 graphFinalize err=0x0 elapsed=3.51 ms
+[qnn_oppkg] layer=15 graphFinalize err=0x0 elapsed=3.92 ms
+[qnn_oppkg] layer=16 graphFinalize err=0x0 elapsed=3.75 ms
+[qnn_oppkg] layer=17 graphFinalize err=0x0 elapsed=4.12 ms
+[qnn_oppkg] layer=18 graphFinalize err=0x0 elapsed=4.18 ms
+[qnn_oppkg] layer=19 graphFinalize err=0x0 elapsed=3.95 ms
+[qnn_oppkg] layer=20 graphFinalize err=0x0 elapsed=3.80 ms
+[qnn_oppkg] layer=21 graphFinalize err=0x0 elapsed=3.95 ms
+[qnn_oppkg] layer=22 graphFinalize err=0x0 elapsed=4.16 ms
+[qnn_oppkg] layer=23 graphFinalize err=0x0 elapsed=3.66 ms
+[qnn_oppkg] layer=24 graphFinalize err=0x0 elapsed=3.67 ms
+[qnn_oppkg] layer=25 graphFinalize err=0x0 elapsed=3.61 ms
+[qnn_oppkg] layer=26 graphFinalize err=0x0 elapsed=3.81 ms
+[qnn_oppkg] layer=27 graphFinalize err=0x0 elapsed=3.71 ms
+[qnn_oppkg] eager prebuild: 28 layers, total finalize 1181 ms
+[quantize_lm_head] F16 → Q4_0 (466747392 → 131272704 bytes, 151936 rows × 1536 cols)
+[Backend] Quantized lm_head → Q4_0 in 1373.2 ms (mode=auto)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+
+Token Length: 71
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+weight_swap: incremental mode — ratio=1.00, 28 target layers, per_tick=2 (14 ticks estimated)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=66.74
+Prefill: 754.35 ms (71 tokens, 94.1 tok/s)
+Prefill(pure fwd): 557.24 ms (71 tokens, 127.4 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[RSS] tag=prefill_done VmRSS=4479972 RssFile=1036836 RssAnon=214280 RssShmem=3228856 VmData=326932 VmSize=20588340
+[IO] tag=prefill_done rchar=7280384 wchar=5140 read_bytes=4120891392 write_bytes=28672
+[IncrementalSwap] tick=0 chunk=[0] swapped=1 remaining=27 latency=48.4ms read_bytes_delta=26689536
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=48.3ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[DynamicK] calibrated t=0 blocking_ms=48.449/layer fwd_ms=5.76 safe_k=1
+[RSS] tag=decode_1 VmRSS=4485236 RssFile=1062692 RssAnon=208168 RssShmem=3214376 VmData=341716 VmSize=20728784
+[IO] tag=decode_1 rchar=7281882 wchar=6113 read_bytes=4147744768 write_bytes=32768
+[IncrementalSwap] tick=1 chunk=[1] swapped=1 remaining=26 latency=37.5ms read_bytes_delta=26370048
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=37.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=2 chunk=[2] swapped=1 remaining=25 latency=37.5ms read_bytes_delta=26619904
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=37.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=3 chunk=[3] swapped=1 remaining=24 latency=34.5ms read_bytes_delta=26583040
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=34.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=4 chunk=[4] swapped=1 remaining=23 latency=40.0ms read_bytes_delta=26288128
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=39.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=5 chunk=[5] swapped=1 remaining=22 latency=25.0ms read_bytes_delta=118784
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=25.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=6 chunk=[6] swapped=1 remaining=21 latency=26.8ms read_bytes_delta=2101248
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=26.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=7 chunk=[7] swapped=1 remaining=20 latency=23.1ms read_bytes_delta=4096
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=23.0ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=8 chunk=[8] swapped=1 remaining=19 latency=23.0ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=22.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=9 chunk=[9] swapped=1 remaining=18 latency=28.8ms read_bytes_delta=4214784
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=28.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=10 chunk=[10] swapped=1 remaining=17 latency=23.8ms read_bytes_delta=1736704
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=23.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=11 chunk=[11] swapped=1 remaining=16 latency=24.8ms read_bytes_delta=2101248
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=24.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=12 chunk=[12] swapped=1 remaining=15 latency=24.9ms read_bytes_delta=2113536
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=24.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=13 chunk=[13] swapped=1 remaining=14 latency=22.1ms read_bytes_delta=4096
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=22.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=14 chunk=[14] swapped=1 remaining=13 latency=21.6ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=21.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=15 chunk=[15] swapped=1 remaining=12 latency=22.2ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=22.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[RSS] tag=decode_16 VmRSS=5006196 RssFile=1178020 RssAnon=208424 RssShmem=3619752 VmData=341972 VmSize=21520124
+[IO] tag=decode_16 rchar=7286628 wchar=9968 read_bytes=4266082304 write_bytes=36864
+[IncrementalSwap] tick=16 chunk=[16] swapped=1 remaining=11 latency=24.9ms read_bytes_delta=2109440
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=24.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=17 chunk=[17] swapped=1 remaining=10 latency=21.6ms read_bytes_delta=4096
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=21.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=18 chunk=[18] swapped=1 remaining=9 latency=22.6ms read_bytes_delta=8192
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=22.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=19 chunk=[19] swapped=1 remaining=8 latency=26.5ms read_bytes_delta=1392640
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=26.4ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=20 chunk=[20] swapped=1 remaining=7 latency=24.6ms read_bytes_delta=1392640
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=24.6ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=21 chunk=[21] swapped=1 remaining=6 latency=22.8ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=22.8ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=22 chunk=[22] swapped=1 remaining=5 latency=22.6ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=22.5ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=23 chunk=[23] swapped=1 remaining=4 latency=28.1ms read_bytes_delta=4206592
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=28.1ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=24 chunk=[24] swapped=1 remaining=3 latency=24.7ms read_bytes_delta=0
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=24.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=25 chunk=[25] swapped=1 remaining=2 latency=25.8ms read_bytes_delta=4096
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=25.7ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=26 chunk=[26] swapped=1 remaining=1 latency=29.3ms read_bytes_delta=2097152
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=29.2ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] tick=27 chunk=[27] swapped=1 remaining=0 latency=32.9ms read_bytes_delta=5681152
+[IncrementalSwap] stages: prefault=0.0ms mmap_permute=32.9ms arc_swap=0.0ms madvise=0.0ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[IncrementalSwap] plan complete (started_at_token=0, finished_at_token=27)
+[LISWAP-2] dispatcher drained: 0.0ms
+[IO] tag=ttft rchar=7289564 wchar=13142 read_bytes=4282982400 write_bytes=36864
+[RSS] tag=exit VmRSS=5311132 RssFile=1194788 RssAnon=172112 RssShmem=3944232 VmData=342228 VmSize=22153064
+[IO] tag=exit rchar=7290832 wchar=13501 read_bytes=4282982400 write_bytes=36864
+Segmentation fault 

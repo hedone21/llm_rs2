@@ -1,0 +1,81 @@
+[RSS] tag=start VmRSS=1600 RssFile=1104 RssAnon=496 RssShmem=0 VmData=256 VmSize=9972
+[IO] tag=start rchar=8976 wchar=86 read_bytes=3719168 write_bytes=4096
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /home/nvidia/llm_rs2/models/llama3.1-8b/gguf/llama3.1-8b-f16.gguf
+[CUDA] Compiling kernels with /usr/local/cuda-11.4/bin/nvcc --ptx -arch=sm_72 -std=c++17 ...
+[CUDA] Kernel compilation done (803678 bytes PTX)
+[CUDA] Device: Xavier (sm_72, UMA=true, managed_mem=1, cuBLAS=ready, kernels=ready)
+[CUDA self-test] add_assign: [5.0, 7.0, 9.0] OK
+[CUDA self-test] scale:      [1.0, 2.0, 3.0] OK
+[CUDA self-test] rms_norm:   [0.8485, 1.1314] OK
+[CUDA] --cuda-sync-policy=minimal (mask=0x81)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 291 tensors, arch=Llama, weight_dtype=F16
+[RSS] tag=model_loaded VmRSS=27457844 RssFile=27111380 RssAnon=346464 RssShmem=0 VmData=384740 VmSize=54420820
+[IO] tag=model_loaded rchar=7399828 wchar=2253678 read_bytes=20258390016 write_bytes=2277376
+[quantize_lm_head] F16 → Q4_0 (1050673152 → 295501824 bytes, 128256 rows × 4096 cols)
+[Backend] Quantized lm_head → Q4_0 in 6715.1 ms (mode=auto)
+[Backend] Migrated 291 weight tensors to CUDA pinned memory
+[Tokenizer] /home/nvidia/llm_rs2/models/llama3.1-8b/gguf/tokenizer.json
+Prompt: The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+
+Token Length: 72
+Model config: layers=32, kv_heads=8, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 262144B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[SubBatchWait] layer_idx=1 wait_ms=15.97
+[SubBatchWait] layer_idx=2 wait_ms=22.94
+[SubBatchWait] layer_idx=3 wait_ms=22.07
+[SubBatchWait] layer_idx=4 wait_ms=25.81
+[SubBatchWait] layer_idx=5 wait_ms=41.77
+[SubBatchWait] layer_idx=6 wait_ms=41.24
+[SubBatchWait] layer_idx=7 wait_ms=38.86
+[SubBatchWait] layer_idx=8 wait_ms=40.65
+[SubBatchWait] layer_idx=9 wait_ms=38.67
+[SubBatchWait] layer_idx=10 wait_ms=39.16
+[SubBatchWait] layer_idx=11 wait_ms=37.79
+[SubBatchWait] layer_idx=12 wait_ms=38.97
+[SubBatchWait] layer_idx=13 wait_ms=39.85
+[SubBatchWait] layer_idx=14 wait_ms=37.82
+[SubBatchWait] layer_idx=15 wait_ms=38.01
+[SubBatchWait] layer_idx=16 wait_ms=41.05
+[SubBatchWait] layer_idx=17 wait_ms=39.18
+[SubBatchWait] layer_idx=18 wait_ms=37.68
+[SubBatchWait] layer_idx=19 wait_ms=39.37
+[SubBatchWait] layer_idx=20 wait_ms=39.30
+[SubBatchWait] layer_idx=21 wait_ms=38.75
+[SubBatchWait] layer_idx=22 wait_ms=39.14
+[SubBatchWait] layer_idx=23 wait_ms=38.63
+[SubBatchWait] layer_idx=24 wait_ms=39.80
+[SubBatchWait] layer_idx=25 wait_ms=39.26
+[SubBatchWait] layer_idx=26 wait_ms=37.74
+[SubBatchWait] layer_idx=27 wait_ms=36.67
+[SubBatchWait] layer_idx=28 wait_ms=36.74
+[SubBatchWait] layer_idx=29 wait_ms=38.03
+[SubBatchWait] layer_idx=30 wait_ms=37.54
+[SubBatchWait] layer_idx=31 wait_ms=38.32
+[SwapPeak] mode=sync target_layers=32 max_release_pending=0 max_dispatcher_pending=0
+weight_swap: force ratio=1.00, swapped 32/32 layers in 6858.6ms
+weight_swap stages: prefault=43.8ms mmap_permute=5670.5ms arc_swap=0.1ms madvise=1.1ms synchronize=0.0ms soa_reconvert=0.0ms gen_bump=0.0ms
+[WARMUP] tokens=1 ms=127.08
+Prefill: 1911.49 ms (72 tokens, 37.7 tok/s)
+Prefill(pure fwd): 1911.32 ms (72 tokens, 37.7 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[RSS] tag=prefill_done VmRSS=14507188 RssFile=14089060 RssAnon=418128 RssShmem=0 VmData=462808 VmSize=54564300
+[IO] tag=prefill_done rchar=16487179 wchar=2256627 read_bytes=20269465600 write_bytes=2285568
+[RSS] tag=decode_1 VmRSS=14471292 RssFile=14053164 RssAnon=418128 RssShmem=0 VmData=478180 VmSize=55037556
+[IO] tag=decode_1 rchar=16488454 wchar=2257281 read_bytes=20269465600 write_bytes=2285568
+[RSS] tag=decode_16 VmRSS=14471528 RssFile=14053344 RssAnon=418184 RssShmem=0 VmData=478180 VmSize=55037556
+[IO] tag=decode_16 rchar=16489729 wchar=2257523 read_bytes=20269465600 write_bytes=2289664
+[cpu_fallback] === totals ===
+[cpu_fallback]                       matmul: 0
+[cpu_fallback]       matmul_transposed_q4_0: 0
+[cpu_fallback]      matmul_transposed_other: 0
+[cpu_fallback]                 matmul_slice: 0
+[cpu_fallback]                         cast: 0
+[cpu_fallback]                   kv_scatter: 0
+[cpu_fallback]                       gather: 0
+[cpu_fallback]                attention_gen: 0
+[IO] tag=ttft rchar=16489857 wchar=2258218 read_bytes=20269465600 write_bytes=2289664
+[RSS] tag=exit VmRSS=14471528 RssFile=14053344 RssAnon=418184 RssShmem=0 VmData=478180 VmSize=55037556
+[IO] tag=exit rchar=16491133 wchar=2258580 read_bytes=20269465600 write_bytes=2289664

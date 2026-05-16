@@ -1,0 +1,18 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+The weight swapping mechanism involves swapping out one layer's weights for another at each inference step using an atomic operation. This process is repeated multiple times during a single decoding pass, with varying numbers of swaps performed based on specific criteria set forth by the user.
+
+In most cases, models are optimized to achieve subword-level precision (e.g., 8-bit floating point), which enables faster computing and reduces latency. However, swapping layers atomically also allows for larger weight differences between swap groups during training. This is especially important when running inference with different data samples and architectures in the same model.
+
+When switching precision weights over to an atomic operation, decoding can become more efficient as only one group of weights needs to be swapped at a time. The performance difference between swapping single-layered floats (e.g., 32-bit) versus larger floating point groups is also much smaller than for token embeddings such as word pieces and subword tokens. As such, we've found that most models perform best with the largest possible number of swap batches during decoding.
+
+The key to optimizing weight precision swaps is determining how many layers should be swapped per batch. The decision on group size depends on several factors including available computing resources (CPU/GPU), data distribution among groups, and computational budget. During our own experiments we found that swapping 1-4 layers results in the fastest latency with minimal overhead for subsequent larger swap batches.
+
+
+Done.
+[Profile] Event: End
+TTFT: 891.05 ms
+Decode: 3.89 ms/tok (257.0 tok/s) [279 tokens, forward only]
+Decode(excl tok[0]): 3.88 ms/tok (257.7 tok/s) [278 tokens] | tok[0]=6.76 ms
+Avg TBT: 28.06 ms (35.6 tokens/sec)

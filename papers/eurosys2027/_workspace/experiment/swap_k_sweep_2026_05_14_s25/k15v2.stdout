@@ -1,0 +1,10 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The following passage describes a runtime weight precision swap mechanism for on-device large language model inference. Read it carefully and continue the explanation. The key insight is that during a precision swap, weights of individual layers are replaced atomically while decoding continues, and the choice of how many layers to swap per decode step controls the latency profile observed by the user. Specifically,
+During inference with ONNX Runtime for large language models like BERT (a series of transformer-based architectures), it’s common to experience very high memory consumption
+Done.
+[Profile] Event: End
+TTFT: 900.44 ms
+Decode: 3.65 ms/tok (274.1 tok/s) [29 tokens, forward only]
+Decode(excl tok[0]): 3.57 ms/tok (279.9 tok/s) [28 tokens] | tok[0]=5.79 ms
+Avg TBT: 49.24 ms (20.3 tokens/sec)
