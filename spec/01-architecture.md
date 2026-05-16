@@ -592,10 +592,12 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 | INV-LAYER-003 | L3 `inference/`는 L3 `pressure/`의 내부 구현 import 금지. 단 `pressure/` 가 노출하는 trait(`CachePressureHandler`, `EvictionPolicy`, `KVCacheOps`, `WeightStagingPool` 등)은 import 가능. 역방향(`pressure/` → `inference/`)도 동일 규칙. chat template의 모델별 구현체(`inference/models/<arch>/chat_template.rs`)와 generic 부분(`inference/chat_template.rs`)은 동일 도메인 내부이므로 cross-import 자유. |
 | INV-LAYER-004 | Cross-cutting 모듈(`observability/`, `resilience/`)이 L3 도메인의 concrete type을 import할 때는 trait/Sink 경유로 한정한다. 예외는 본 절에 명시적으로 기재된 케이스(예: `events::CacheEvent` enum이 pressure 결과를 표현)에 한정. |
 | INV-LAYER-005 | L5 `bin/` 안의 production entrypoint(`generate`)는 L4 `session/`만 직접 import한다. test/microbench binary는 본 규칙 밖. `chat_ipc`는 L4(`session/chat_ipc.rs`) 책임이며 외부 IPC adapter로서 production binary가 직접 import하지 않는다. |
+| INV-LAYER-006 | L4 `DecodeLoop` struct는 L1 backend/L3 concrete struct를 필드로 직접 보유하지 않는다 — 6개 추상화 trait(`Forward`, `EvictionStage`, `SwapStage`, `CommandSource`, `TokenSampler`, `DecodeObserver`)만 보유한다. SYS-100/103과 직교한 *L4 내부 결합도* 제약(DIP 강화). 상세 trait API는 `arch/inference_pipeline.md` §2 참조. |
+| INV-LAYER-007 | `DecodeLoopBuilder`의 필수 컴포넌트(`Forward`)는 typestate 패턴으로 컴파일 타임에 강제된다. 선택적 컴포넌트(eviction/swap/command/observer)는 no-op 기본값이 자동 적용된다. 빌더 API와 typestate 시그니처는 `arch/inference_pipeline.md` §4 참조. |
 
 **NOTE (테스트 코드 정책, §13.8-E)**: lib 내부 inline `#[cfg(test)]` 블록의 backend instantiation(예: `core/eviction/*`, `core/pressure/*`에서 `CpuBackend::new()`)은 **grandfathered exception**으로 baseline에 등재된 채 유지된다. 신규로 추가하는 spec/단위 테스트는 모두 `engine/tests/spec/` 아래에 작성해야 하며, 본 위치에서만 backend instantiation을 허용한다. feedback `spec_tests_required`와 정합 — INV-LAYER 관련 spec 테스트는 `tests/spec/test_inv_layer_{001..005}.rs`에 위치한다. baseline에 등재된 lib 내부 테스트는 마이그레이션 마지막 단계(Step 5 이후)에 0으로 수렴시킨다.
 
-상세 INV 카탈로그 항목은 `spec/41-invariants.md` §3.26 참조. 코드 매핑은 `arch/01-architecture.md` §6 참조. 위반 현황(실측)과 마이그레이션 계획은 `ARCHITECTURE.md` §13 참조.
+상세 INV 카탈로그 항목은 `spec/41-invariants.md` §3.26 참조. 코드 매핑은 `arch/01-architecture.md` §6 참조. 위반 현황(실측)과 마이그레이션 계획은 `ARCHITECTURE.md` §13 참조. L4 내부 `DecodeLoop` SOLID 분해 + 빌더 설계(INV-LAYER-006/007)는 `arch/inference_pipeline.md` 참조.
 
 ## 4. Alternative Behavior
 

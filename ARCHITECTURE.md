@@ -1303,11 +1303,19 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - **후속 (Implementer 작업)**: `engine/tests/spec/test_inv_layer_001.rs` ~ `test_inv_layer_005.rs` 작성. 각 테스트는 `grep` 또는 `cargo metadata`로 import 그래프를 추출하여 위반 enum을 검증한다. 또한 `engine/tests/spec.rs` harness에 모듈 등록. `scripts/check_spec_coverage.sh` 통과를 게이트로 한다. **현재 31건 위반은 baseline으로 기록**하고, 마이그레이션 단계마다 baseline을 줄여간다 (예: Step 3 후 V-01~V-09 해소 → baseline 22건).
 
 **Step 2: L5/L4 분리** (`bin/generate.rs` → `session/` 추출)
-- `engine/src/session/mod.rs`, `engine/src/session/decode_loop.rs` 신설
-- `bin/generate.rs`의 main 함수에서 argument parsing/init만 남기고 loop body는 `DecodeSession::run()`으로 이관
-- `core/chat_ipc.rs` → `session/chat_ipc.rs` 이관 (§13.8-C, L4 IPC adapter 성격)
-- 인접 작은 binary (`test_backend`, `test_model`, `signal_injector`)는 그대로 두고, `generate.rs` 한 곳만 외과적으로 분리
-- Gate: 모든 디바이스 e2e 통과 (S25 + Jetson)
+
+본 단계는 5개 sub-phase로 세분화된다. 상세 trait API와 빌더 설계는 `arch/inference_pipeline.md` 참조.
+
+- **Step 2-1 외곽 추출** — `main()` 7,051 LOC 중 SOLID 영향 없는 helper 함수 묶음(템플릿 로딩, CLI dump, tokenizer 초기화 등) 7건을 `session/init.rs` / `session/cli_dump.rs`로 분리. 코드 이동만, 신규 trait 없음.
+  - 검증 게이트: `cargo test --workspace` PASS + S25/Jetson e2e 생성 동치 (greedy seed 동일 토큰).
+- **Step 2-2 trait 정의 + 빌더** — `inference/` 모듈 신설 (이름은 §10에서 확정), `Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver` 6 trait 시그니처 + `StepCtx` struct + `DecodeLoopBuilder` typestate + no-op default(`inference/defaults.rs`)까지 도입. 실제 사용처 없음(0-impl).
+  - 검증 게이트: `cargo build` PASS + `layer_lint` baseline 그대로(31건 동결).
+- **Step 2-3 첫 구현체 (`ModelForward`)** — `inference::Forward` 구현체 1개 + `EvictionStage` no-op + `TokenSampler` 1개를 도입하고, 신규 `bin/probe_inference_loop.rs` (microbench)에서 `DecodeLoop::run`을 호출하여 forward path만 검증. `bin/generate.rs`는 미변경.
+  - 검증 게이트: probe binary가 S25에서 기존 generate.rs와 동일 TBT 대역(±10%) + same first-token.
+- **Step 2-4 main() 조립자화** — `bin/generate.rs::main()`을 builder 호출로 교체. 6 책임이 6 trait 구현체로 흡수. 남는 코드는 `clap::Parser::parse()` + `DecodeLoopBuilder` 조립 + `prefill` + `run` + `finalize` 5단계 ≤ 400 LOC.
+  - 검증 게이트: 모든 디바이스 e2e 통과 (S25 + Jetson + host CPU), TBT 회귀 ≤ 5% (Adreno 14ms baseline).
+- **Step 2-5 나머지 구현체 + chat 통합** — `KiviForward` / `OffloadForward` / `ChatTurnExec`를 동일 trait 패턴으로 흡수. `run_chat_repl`을 `DecodeLoop::run_until_stop`으로 통합. `core/chat_ipc.rs` → `session/chat_ipc.rs` 이관.
+  - 검증 게이트: chat REPL `/stats` 출력 동일 + multi-turn KV 누적 정확성.
 
 **Step 3: L1/L2 경계 정리** (backend impl이 `shared/` 외 import 제거 + backend-specific buffer/pool/포맷 재배치)
 - V-01 (opencl→gpu_self_meter): trait inversion (`GpuEventMeter` trait 신설)

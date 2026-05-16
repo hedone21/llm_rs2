@@ -477,7 +477,7 @@
 
 **도입 컨텍스트**: Engine 크레이트(`llm_rs2`) 내부 모듈 의존 그래프가 단방향 5-layer + 2-cross-cutting 구조를 따라야 한다. 본 INV 시리즈는 시스템 전체 구조(INV-001/010/011 — 2 프로세스 + Shared edge)와는 직교한 layer로, Engine 내부의 모듈 import 그래프만 통제한다.
 
-**ID 컨벤션**: 본 시리즈는 `INV-LAYER-NNN` 별칭 형식을 사용한다. 다른 INV-NNN과 ID space 충돌이 없으며, 의미상 별도 차원(Engine 내부 layering)을 다룬다.
+**ID 컨벤션**: 본 시리즈는 `INV-LAYER-NNN` 별칭 형식을 사용한다. 다른 INV-NNN과 ID space 충돌이 없으며, 의미상 별도 차원(Engine 내부 layering)을 다룬다. INV-LAYER-001~005는 모듈 import 그래프(컴파일 단위 경계)를, INV-LAYER-006~007은 L4 내부 struct/builder의 추상화 결합도(field 타입 수준)를 통제한다.
 
 **교차 참조**:
 - **INV-001 / INV-010 / INV-011** (2-프로세스 + Shared 경계): 시스템 전체 구조 — 본 시리즈는 이를 보존하며 Engine 내부 추가 제약을 명시.
@@ -496,6 +496,8 @@
 | INV-LAYER-003 | 01-architecture SYS-100, SYS-103 | Engine L3 `inference/`와 L3 `pressure/`는 상대 도메인의 **trait만** import할 수 있고 concrete 구현체 import 금지. 위반 예: `core/cache_manager.rs` → `resilience::EvictMethod` (cross-cutting concrete), `models/transformer.rs` → `core::offload::preload_pool` (inference→pressure concrete). 동일 도메인 내 모듈 cross-import는 자유 — 예: `inference/chat_template.rs`(generic)와 `inference/models/<arch>/chat_template.rs`(모델별 구현체) 사이 import 자유 (§13.8-C). pressure handler가 backend pool에 접근할 때는 `WeightStagingPool` trait(L2 정의)을 경유. | Correctness | static, test | trait 노출은 `pressure/mod.rs`, `inference/mod.rs`에 명시적 re-export로 강제. concrete 구조체는 module-private 또는 동일 도메인 내에서만 pub. |
 | INV-LAYER-004 | 01-architecture SYS-102, SYS-104 | Cross-cutting 모듈(`observability/`, `resilience/`)이 L3 도메인의 concrete type을 import할 때는 trait/Sink 경유로 inversion한다. `EventSink`, `Transport`, `GpuEventMeter` 등이 표준 inversion 패턴. 예외(허용): `events::CacheEvent` enum이 pressure 결과를 직접 표현하는 경우 — enum이 inversion 매체이므로 동의어. 위반 예: `eval/eviction_hook.rs` → downcast `OpenCLBackend` (L1 concrete를 cross-cutting이 직접 소비). | Correctness | static, test | observability/resilience 모듈의 import 분석. concrete L1/L3 type을 import한 곳마다 trait inversion 가능성 검토. eval은 L4(`session/eval/`)로 격상 시 자연 해소. |
 | INV-LAYER-005 | 01-architecture SYS-105 | Engine L5 production binary(`bin/generate.rs`)는 L4 `session/`만 직접 import한다. test/microbench binary(`test_backend`, `signal_injector`, `microbench_*`)는 본 규칙 밖. `chat_ipc`는 L4 책임이므로 `session/chat_ipc.rs`에 위치하며 production binary가 직접 import하지 않는다 (§13.8-C). 위반: 현 `bin/generate.rs` 13,022 LOC monolith가 `core`, `models`, `layers`, `memory`, `experiment`, `resilience` 등 거의 모든 lib 모듈을 직접 import (29건의 `use llm_rs2::*`). | Correctness | static, test | Migration Step 2(L5/L4 분리) 후 강제. 그 전까지는 best-effort. test/microbench는 enforcement 대상 외. |
+| INV-LAYER-006 | arch/inference_pipeline.md §3, §10 | L4 `DecodeLoop`은 L1 backend / L3 concrete struct(`CacheManager`, `LlamaModel`, `Profiler`, `ManagerClient` 등)을 자기 필드로 직접 보유하지 않는다. 6 추상화(`Forward`, `EvictionStage`, `SwapStage`, `CommandSource`, `TokenSampler`, `DecodeObserver`)의 `&mut dyn` 또는 generic bound만 허용. 위반 예: `DecodeLoop { backend: Arc<OpenCLBackend>, manager: ManagerClient, ... }`. 본 INV는 SYS-100/103과 직교한 *결합도* 제약 — INV-LAYER-005(L5→L4 import 제한)는 모듈 경계, 본 INV는 L4 내부 struct field의 추상화 보유. | Correctness | static, test | `engine/tests/spec/test_inv_layer_006.rs` — `DecodeLoop` struct 필드를 reflection 없이 source-grep으로 검사. concrete L1/L3 type 이름이 필드 타입에 등장하면 FAIL. 빌더는 trait object 또는 generic만 받는다(`Box<dyn Forward>`, `<F: Forward>`). Migration Step 2-4 후 강제. |
+| INV-LAYER-007 | arch/inference_pipeline.md §4 | `DecodeLoopBuilder`의 필수 컴포넌트(`Forward`)는 typestate 패턴으로 컴파일 타임에 강제된다. `.build()` 메서드는 `DecodeLoopBuilder<HasForward, ...>`에서만 호출 가능. Optional 컴포넌트(`EvictionStage`, `SwapStage`, `CommandSource`, `DecodeObserver`)는 기본 no-op 구현이 자동 적용. `TokenSampler`도 default(`GreedySampler`) 제공. 위반 예: `Forward` 누락 상태에서 `build()` 호출이 컴파일된다면 FAIL. | Correctness | static, test | `engine/tests/spec/test_inv_layer_007.rs` — `trybuild` crate로 negative test: `Forward` 없이 `build()` 호출하는 코드가 compile-fail (`expected: HasForward, found: NoForward`)임을 확인. Migration Step 2-2 후 강제. |
 
 ## 4. Alternative Behavior
 
@@ -525,13 +527,13 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
-| Safety | 27 | 24% |
-| Correctness | 78 | 70% |
+| Safety | 27 | 23% |
+| Correctness | 80 | 70% |
 | Performance | 5 | 4% |
-| Compatibility | 4 | 4% |
-| **합계** | **113** | **100%** |
+| Compatibility | 4 | 3% |
+| **합계** | **115** | **100%** |
 
-> **참고**: 카테고리 통계는 INV-001~188 + INV-LAYER-001~005를 합산하나 일부 항목(INV-129/132/142/149/150/162 등)이 2-카테고리 보유이므로 합계는 누적 1회 카운트 기준이다. INV-LAYER-001/002는 Safety, INV-LAYER-003/004/005는 Correctness로 1회 카운트.
+> **참고**: 카테고리 통계는 INV-001~188 + INV-LAYER-001~007을 합산하나 일부 항목(INV-129/132/142/149/150/162 등)이 2-카테고리 보유이므로 합계는 누적 1회 카운트 기준이다. INV-LAYER-001/002는 Safety, INV-LAYER-003/004/005/006/007은 Correctness로 1회 카운트.
 > INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
 > INV-117~119는 v2.2.0 (QCF × DPP)에서 추가. INV-121~122는 Weight Swap Phase A에서 추가.
 > INV-129는 Weight Swap Phase 3.5 (Plan × Weight Swap stale detection)에서 추가. 카테고리는 Safety/Correctness 양쪽이며, 통계는 Safety로 1회 카운트한다.
@@ -547,6 +549,7 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-166~180은 QNN OpPackage M3 backend wire-up (2026-05-10)에서 추가. INV-166/167/168/170/172/174/175/176은 Correctness, INV-169/178은 Safety (OpenCL backend 무회귀 + leak detector), INV-171은 Correctness (rpcmem-backed KV), INV-173/177/179는 Performance (TBT 측정 룰 + view transform 비용 0 + TBT verdict band), INV-180은 Compatibility (cdylib ⊥ engine binary 본래 정신 보존). M2 INV-160 (production change == 0)은 본 단계에서 자연 만료. 카운트는 +15.
 > INV-181~188은 QNN OpPackage M4 async chunk swap (2026-05-10, placeholder)에서 추가. INV-181/182/185/186/188은 Correctness, INV-183/184/187은 Performance. M4.0~M4.3 단계 진입 시 본문 채움. 카운트는 +8.
 > INV-LAYER-001~005는 Engine Internal Layered Architecture (2026-05-16)에서 추가. INV-LAYER-001/002는 Safety (backend/shared import 그래프 보존), INV-LAYER-003/004/005는 Correctness (도메인 경계, cross-cutting trait inversion, L5/L4 분리). 별칭 ID 시리즈로 INV-NNN과 별도 namespace를 형성. 카운트는 +5.
+> INV-LAYER-006~007은 Task #4 (`DecodeLoop` SOLID 분해 + 빌더, 2026-05-16, `arch/inference_pipeline.md`)에서 추가. 둘 다 Correctness — INV-LAYER-006은 L4 struct 필드 타입의 추상화 결합도(DIP 강화), INV-LAYER-007은 builder typestate로 필수 컴포넌트 컴파일 타임 강제. 카운트는 +2 (LAYER 시리즈 누적 7).
 > INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 > **INV-122 v2.1 (2026-04-26, Phase 5 Sprint A 진단 기반)**: 측정 단위를 **단일-token next-token logit**(prefill 종료 직후 첫 1개 logit)으로 명시적으로 고정. Sprint A 100-prompt × 4-ratio sweep에서 32-token decode 누적 drift로 ratio=0.25에서도 Δtop-1=44.85pp 관측 — 측정-임계값 미스매치 진단. 정확성 회귀(garbage 출력 등)는 0건. 임계값 자체(NMSE ≤ 0.01, Δ top-1 ≤ 1 pp)는 v2와 동일하나 측정 단위가 단일-token으로 고정. Decode window metric은 보조 sanity로 분리. ID/카운트는 변동 없음. Phase 4 자료(NMSE mean=0.0062, Δ top-1=+0.33pp)는 v2.1 기준으로도 PASS.
 
@@ -554,9 +557,9 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 검증 방법 | 주 검증 | 보조 검증 포함 | 설명 |
 |----------|---------|-------------|------|
-| static | 23 | 27 | Cargo 의존 구조, feature gate, trait bound, 코드 구조 (INV-LAYER 5건 모두 static 주검증) |
+| static | 25 | 29 | Cargo 의존 구조, feature gate, trait bound, 코드 구조 (INV-LAYER 7건 모두 static 주검증) |
 | runtime | 34 | 41 | assert, clamp, 조건 검사, AtomicU64 |
-| test | 21 | 42 | 단위/통합/프로퍼티/장애 주입 테스트 (INV-LAYER 5건 모두 test 보조 검증) |
+| test | 21 | 44 | 단위/통합/프로퍼티/장애 주입 테스트 (INV-LAYER 7건 모두 test 보조 검증) |
 
 다수의 불변식이 2개 이상의 검증 방법을 병용한다.
 

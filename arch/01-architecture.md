@@ -417,17 +417,68 @@ SYS-064, INV-018, INV-013
 - **책임 (spec WHAT → HOW)**: SYS-100 L4. Decode loop, prefill 흐름, eviction/swap dispatch, IPC adapter 연동. 현재 `bin/generate.rs` 13,022 LOC monolith로 존재. Migration Step 2에서 분리.
 - **포함 모듈 (post-migration, §13.8 결정 반영)**:
   - `session/mod.rs` — module roots.
-  - `session/decode_loop.rs` — token-by-token loop + resilience poll + eviction trigger.
+  - `session/decode_loop.rs` — `DecodeLoop` struct + builder. 6개 추상화(`Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver`)에 위임. **상세 trait API + 빌더 typestate + StepCtx + 구현체 카탈로그 + 마이그레이션 sub-phase는 [`arch/inference_pipeline.md`](inference_pipeline.md) 참조** (단일 진실 원본 — 본 절은 컴포넌트 매핑만).
   - `session/prefill.rs` — prompt processing.
+  - `session/defaults.rs` — `NoSwapStage`, `NoOpObserver`, `NoCommandSource`, `GreedySampler` 등 no-op/default 구현체.
   - `session/eval/` — 평가 hook (← `eval/`, V-28/V-29 해소).
-  - **`session/chat_ipc.rs`** (← `core/chat_ipc.rs`, §13.8-C) — 외부 IPC adapter. 외부 client(예: chat UI)와 decode loop 사이의 protocol 변환 책임.
-- **의존**: L3(`pressure/`, `inference/`) + L2(`shared/`) + cross-cutting. L1 backend는 `Arc<dyn Backend>`로만 받음 (instantiate는 L5 또는 session::init).
+  - **`session/chat_ipc.rs`** (← `core/chat_ipc.rs`, §13.8-C) — 외부 IPC adapter. 외부 client(예: chat UI)와 decode loop 사이의 protocol 변환 책임. `DecodeLoop::run_until_stop`에 위임.
+- **의존**: L3(`pressure/`, `inference/`) + L2(`shared/`) + cross-cutting. **L4 내부 결합도 제약 (INV-LAYER-006)**: `DecodeLoop` struct 필드는 6 trait의 `Box<dyn>` 또는 generic만 허용. concrete `OpenCLBackend`/`CacheManager`/`LlamaModel`/`ManagerClient` 직접 보유 금지. L1 backend는 builder가 받는 `Arc<dyn Backend>`만 허용.
 - **공용 인터페이스**:
-  - `DecodeSession::new(config, model, cache_manager, ...) -> Self`.
-  - `DecodeSession::run() -> Result<String>`.
-  - `ChatIpcServer` (TBD) — IPC 채널로 prompt를 받아 `inference::ChatTemplate` impl로 변환 후 `DecodeSession::run()` 호출.
-- **예외 처리**: backend instantiation은 session::init에서 수행 — 본 위치는 L5 또는 L4 경계 (CLI 인자→backend struct 변환 코드를 어디 둘지는 Step 2에서 결정).
-- **현 위반**: 본 컴포넌트가 존재하지 않음 — 현재 `bin/generate.rs`에 모두 inline.
+  - `DecodeLoop::run(budget: usize) -> DecodeResult` — `Forward::step` × N + observer hook.
+  - `DecodeLoop::run_until_stop(stop: &dyn StopCondition)` — chat REPL 경로.
+  - `DecodeLoopBuilder::new()` + chainable `.with_forward(...)` / `.add_observer(...)` / `.with_sampler(...)` + `.build()` (typestate, INV-LAYER-007).
+  - `ChatIpcServer` (TBD) — IPC 채널로 prompt를 받아 `inference::ChatTemplate` impl로 변환 후 `DecodeLoop::run_until_stop` 호출.
+- **예외 처리**: backend instantiation은 `session::init` 헬퍼(L4 내부)에서 수행 — CLI 인자 → `Box<dyn Forward>` 변환. 결과 trait object만 builder에 전달.
+- **현 위반**: 본 컴포넌트가 존재하지 않음 — 현재 `bin/generate.rs`에 모두 inline. Migration Step 2-2 에서 trait 정의, Step 2-4에서 main() 흡수.
+
+#### 6.5.1 의존 그래프 (`session/decode_loop.rs` 내부)
+
+```mermaid
+flowchart LR
+    subgraph L4 [L4 session/]
+        BLD[DecodeLoopBuilder]
+        DL[DecodeLoop]
+        SCTX[StepCtx]
+        DEF[defaults: NoSwapStage<br/>NoOpObserver<br/>GreedySampler]
+    end
+    subgraph TR [traits 의존 추상]
+        TF((Forward))
+        TE((EvictionStage))
+        TS((SwapStage))
+        TC((CommandSource))
+        TT((TokenSampler))
+        TO((DecodeObserver))
+    end
+    subgraph IMPL [L3/L2/L1 구현체 — builder가 주입]
+        MF[ModelForward<br/>KiviForward<br/>OffloadForward]
+        EV[CacheManagerStage<br/>NoEvictionStage]
+        SW[SyncSwapStage<br/>AsyncSwapStage<br/>ProbingKSwapStage]
+        CS[ManagerCmdSource<br/>ScheduleCmdSource<br/>StdinCmdSource]
+        SM[GreedySampler<br/>TempSampler<br/>TopKSampler]
+        OB[ProfilerObs<br/>ExperimentWriterObs<br/>TbtLogObs<br/>EventSinkAdapter]
+    end
+
+    BLD --> DL
+    DL -. holds .-> TF
+    DL -. holds .-> TE
+    DL -. holds .-> TS
+    DL -. holds .-> TC
+    DL -. holds .-> TT
+    DL -. holds .-> TO
+    DL --> SCTX
+    DEF -. impls .-> TS
+    DEF -. impls .-> TO
+    DEF -. impls .-> TC
+    DEF -. impls .-> TT
+    MF -. impls .-> TF
+    EV -. impls .-> TE
+    SW -. impls .-> TS
+    CS -. impls .-> TC
+    SM -. impls .-> TT
+    OB -. impls .-> TO
+```
+
+(점선: trait 의존 / 실선: concrete 의존 / impl arrow: trait 구현 관계)
 
 ### 6.6 컴포넌트: L5 Adapter (`bin/`)
 
