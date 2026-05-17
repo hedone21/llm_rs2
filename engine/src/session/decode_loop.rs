@@ -57,9 +57,12 @@ fn step_ctx<'a>(
 }
 
 impl DecodeLoop {
-    /// Run prefill over the prompt. Sets `pos` and `prev_token` for the
-    /// subsequent decode loop.
-    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<()> {
+    /// Run prefill over the prompt. Returns logits for the last token so the
+    /// caller can sample the first generated token before invoking
+    /// [`Self::run`]. `pos` is advanced to `tokens.len()`. `prev_token` is
+    /// staged from `tokens.last()` for `on_prefill_end` observer context only;
+    /// [`Self::run`] overwrites it with `first_token`.
+    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let logits = self.forward.prefill(tokens)?;
         self.pos = tokens.len();
         self.prev_token = *tokens.last().unwrap_or(&0);
@@ -74,12 +77,15 @@ impl DecodeLoop {
         for obs in &mut self.observers {
             obs.on_prefill_end(&ctx, &logits);
         }
-        Ok(())
+        Ok(logits)
     }
 
-    /// Run up to `budget` decode steps. Returns sampled tokens + reason loop
-    /// exited.
-    pub fn run(&mut self, budget: usize) -> anyhow::Result<DecodeResult> {
+    /// Run up to `budget` decode steps starting from `first_token` (the token
+    /// already sampled from `prefill`'s last logits). Returns sampled tokens
+    /// (does **not** include `first_token`) + reason loop exited. Caller is
+    /// responsible for prepending `first_token` to the final output sequence.
+    pub fn run(&mut self, budget: usize, first_token: u32) -> anyhow::Result<DecodeResult> {
+        self.prev_token = first_token;
         let stop = Arc::clone(&self.stop_flag);
         let mut generated = Vec::with_capacity(budget);
         let mut stopped_by = StopReason::BudgetExhausted;
@@ -347,12 +353,15 @@ mod tests {
             })
             .with_kv_capacity(2048)
             .build();
-        loop_.prefill(&[1, 2, 3]).unwrap();
-        let result = loop_.run(5).unwrap();
+        let last_logits = loop_.prefill(&[1, 2, 3]).unwrap();
+        // MockForward::prefill sets logits[0]=1.0 → GreedySampler picks 0.
+        assert_eq!(last_logits.len(), 16);
+        let result = loop_.run(5, 0).unwrap();
         assert_eq!(result.tokens_generated.len(), 5);
         assert_eq!(result.stopped_by, StopReason::BudgetExhausted);
         assert_eq!(result.final_pos, 3 + 5);
-        // GreedySampler picks the highest logit each step.
+        // GreedySampler picks the highest logit each step. step_count = 1..=5
+        // produces logits with target = step_count % vocab.
         assert_eq!(result.tokens_generated, vec![1, 2, 3, 4, 5]);
     }
 
@@ -366,7 +375,7 @@ mod tests {
             .build();
         let stop = loop_.stop_flag();
         stop.store(true, Ordering::Release);
-        let result = loop_.run(5).unwrap();
+        let result = loop_.run(5, 0).unwrap();
         assert_eq!(result.tokens_generated.len(), 0);
         assert_eq!(result.stopped_by, StopReason::StopFlag);
     }
@@ -386,7 +395,7 @@ mod tests {
             })
             .with_sampler(AlwaysZero)
             .build();
-        let result = loop_.run(3).unwrap();
+        let result = loop_.run(3, 7).unwrap();
         assert_eq!(result.tokens_generated, vec![0, 0, 0]);
     }
 
@@ -428,8 +437,8 @@ mod tests {
             })
             .with_eviction(PruneEveryStep)
             .build();
-        loop_.prefill(&[5, 6, 7]).unwrap();
-        let result = loop_.run(2).unwrap();
+        let _ = loop_.prefill(&[5, 6, 7]).unwrap();
+        let result = loop_.run(2, 0).unwrap();
         assert_eq!(result.tokens_generated.len(), 2);
     }
 }

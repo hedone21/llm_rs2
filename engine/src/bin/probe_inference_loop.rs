@@ -221,15 +221,17 @@ fn impl_run_decode_loop(
 
     let t_total = Instant::now();
     let t0 = Instant::now();
-    decode_loop.prefill(prompt)?;
-    let first = decode_loop.run(1)?;
+    // Phase 4-4.5 paradigm: prefill returns last logits, caller samples the
+    // first generated token, then run(budget-1, first_token) samples the rest.
+    let last_logits = decode_loop.prefill(prompt)?;
+    let first_token = greedy_argmax(&last_logits);
     let tok0_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut tokens = Vec::with_capacity(budget);
-    tokens.extend(first.tokens_generated.iter().copied());
+    tokens.push(first_token);
 
     if budget > 1 {
-        let rest = decode_loop.run(budget - 1)?;
+        let rest = decode_loop.run(budget - 1, first_token)?;
         tokens.extend(rest.tokens_generated.iter().copied());
     }
 
@@ -248,17 +250,16 @@ fn impl_run_decode_loop(
     })
 }
 
-/// Direct path mirrors the DecodeLoop paradigm:
-///   1. prefill (`logits_last_only=true`, *result discarded* — matches
-///      `DecodeLoop::prefill` which returns `()`).
-///   2. first step uses `prev = prompt[last]` (matches DecodeLoop using
-///      `self.prev_token = prompt.last()`).
-///   3. subsequent steps use the previously sampled token.
+/// Direct path mirrors the Phase 4-4.5 unified paradigm:
+///   1. prefill (`logits_last_only=true`), read back last logits, argmax.
+///   2. `first_token` = argmax of prefill last logits (matches
+///      `DecodeLoop::prefill -> Result<Vec<f32>>` + caller-side sampling).
+///   3. first decode step uses `prev = first_token`; subsequent steps use the
+///      previously sampled token.
 ///
-/// Production `generate.rs` instead samples the first token from the prefill
-/// last logits and never re-feeds `prompt[last]`. The probe deliberately
-/// chooses the DecodeLoop paradigm so the two paths produce the same token
-/// stream and `delta_pct` measures wrapper overhead, not paradigm shift.
+/// `delta_pct` measures `DecodeLoop` wrapper overhead against this direct
+/// reference. Both paths now produce the same token stream as production
+/// `generate.rs` since Phase 4-4.5 unified the paradigm.
 fn impl_run_direct(
     backend: &Arc<dyn Backend>,
     memory: &Arc<dyn Memory>,
@@ -319,7 +320,7 @@ fn impl_run_direct(
     let t_total = Instant::now();
     let t0 = Instant::now();
 
-    // Prefill — DecodeLoop paradigm: discard last logits.
+    // Prefill — paradigm 통일: read last logits and argmax for first_token.
     model.forward_into(TransformerModelForwardArgs {
         input_tokens: &prefill_input,
         start_pos: 0,
@@ -338,12 +339,13 @@ fn impl_run_direct(
         variance_collector: None,
         layer_boundary_hook: None,
     })?;
+    let prefill_logits_host = read_logits(backend, &prefill_logits, vocab)?;
+    let first_token = greedy_argmax(&prefill_logits_host);
+    let tok0_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    // First step uses prompt-last (DecodeLoop paradigm).
-    let mut prev = *prompt.last().expect("non-empty prompt");
+    let mut prev = first_token;
     let mut pos = prompt.len();
-    let mut tokens = Vec::with_capacity(budget);
-    let mut tok0_ms = 0.0;
+    let mut tokens = vec![first_token];
 
     while tokens.len() < budget {
         backend.write_buffer(&mut decode_input, &prev.to_ne_bytes())?;
@@ -368,11 +370,6 @@ fn impl_run_direct(
         let logits = read_logits(backend, &decode_logits, vocab)?;
         let next = greedy_argmax(&logits);
         tokens.push(next);
-        if tokens.len() == 1 {
-            // tok0 := prefill + first step + first sample (symmetric with
-            // DecodeLoop's `prefill + run(1)`).
-            tok0_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        }
         prev = next;
         pos += 1;
     }

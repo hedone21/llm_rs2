@@ -166,6 +166,25 @@ impl ModelForward {
         Ok(())
     }
 
+    /// Derive a safe `chunk_size` for prefill. CPU (max_single_alloc=usize::MAX)
+    /// returns `seq_len` (no chunking needed). GPU mirrors the heuristic in
+    /// `generate.rs::auto_gpu_chunk` — `min(budget/(vocab*4), max_alloc/(hidden*4), 512)`
+    /// so neither the logits buffer nor activation buffers exceed device limits.
+    fn derive_chunk_size(&self, seq_len: usize) -> usize {
+        if !self.backend.is_gpu() {
+            return seq_len;
+        }
+        let max_alloc = self.backend.max_single_alloc();
+        if max_alloc == 0 || max_alloc == usize::MAX {
+            return seq_len;
+        }
+        let hidden = self.model.config.hidden_size;
+        let budget = max_alloc / 2;
+        let by_vocab = (budget / (self.vocab_size * 4)).max(1);
+        let by_hidden = (max_alloc / (hidden * 4)).max(1);
+        by_vocab.min(by_hidden).min(512).min(seq_len)
+    }
+
     /// Read a `[1, 1, vocab]` logits tensor off the backend into a `Vec<f32>`.
     /// Forces a backend sync first so async backends (CUDA/OpenCL) produce a
     /// stable snapshot.
@@ -191,44 +210,55 @@ impl Forward for ModelForward {
             anyhow::bail!("ModelForward::prefill received zero tokens");
         }
         let seq_len = tokens.len();
-        self.ensure_prefill_workspace(seq_len)?;
+        let chunk_size = self.derive_chunk_size(seq_len);
+        // PrefillWorkspace sized for the largest chunk — single allocation
+        // reused across all chunks, avoiding the seq_len-scale memory spike
+        // that previously gated the happy path at 256 tokens.
+        self.ensure_prefill_workspace(chunk_size)?;
 
-        let input_tensor = self.build_input_tensor(tokens)?;
+        let mut chunk_start = 0;
+        while chunk_start < seq_len {
+            let chunk_end = (chunk_start + chunk_size).min(seq_len);
+            let chunk = &tokens[chunk_start..chunk_end];
+            let input_tensor = self.build_input_tensor(chunk)?;
 
-        // Extract &mut handles up-front so the FnArgs literal does not
-        // borrow `self` mutably more than once.
-        let backend = self.backend.clone();
-        let memory_ref: *const dyn Memory = self.memory.as_ref();
-        let prefill_ws = self
-            .prefill_workspace
-            .as_mut()
-            .expect("ensure_prefill_workspace populates prefill_workspace");
+            // Split mutable handles to avoid double-borrowing `self` inside
+            // the FnArgs literal.
+            let backend = self.backend.clone();
+            let memory_ref: *const dyn Memory = self.memory.as_ref();
+            // SAFETY: `self.memory` is owned by `self` and lives across this
+            // forward_into call; the raw pointer is dereferenced only on the
+            // current stack frame.
+            let memory: &dyn Memory = unsafe { &*memory_ref };
+            let prefill_ws = self
+                .prefill_workspace
+                .as_mut()
+                .expect("ensure_prefill_workspace populates prefill_workspace");
 
-        // SAFETY: `memory_ref` is a stable reference for the duration of the
-        // call — `self.memory` is owned by `self` and is not dropped here.
-        // We re-borrow rather than re-acquiring through `&*self.memory` to
-        // avoid a second `&self` borrow alongside `&mut self.kv_caches`.
-        let memory: &dyn Memory = unsafe { &*memory_ref };
+            self.model.forward_into(TransformerModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos: chunk_start,
+                kv_caches: &mut self.kv_caches,
+                backend: &backend,
+                memory,
+                logits_out: &mut self.logits_prefill_last,
+                x_gen: None,
+                workspace: None,
+                prefill_workspace: Some(prefill_ws),
+                score_accumulator: None,
+                profiler: None,
+                skip_config: None,
+                importance_collector: None,
+                logits_last_only: true,
+                variance_collector: None,
+                layer_boundary_hook: None,
+            })?;
 
-        self.model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos: 0,
-            kv_caches: &mut self.kv_caches,
-            backend: &backend,
-            memory,
-            logits_out: &mut self.logits_prefill_last,
-            x_gen: None,
-            workspace: None,
-            prefill_workspace: Some(prefill_ws),
-            score_accumulator: None,
-            profiler: None,
-            skip_config: None,
-            importance_collector: None,
-            logits_last_only: true,
-            variance_collector: None,
-            layer_boundary_hook: None,
-        })?;
+            chunk_start = chunk_end;
+        }
 
+        // Only the last chunk's last-token logits are kept; intermediate
+        // chunks reused the same `logits_prefill_last` buffer in-place.
         self.read_logits(&self.logits_prefill_last)
     }
 

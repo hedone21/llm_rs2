@@ -3031,20 +3031,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  PHASE 4-4-b: standard happy path → DecodeLoop+ModelForward 위임
+    //  PHASE 4-4.5: standard happy path → DecodeLoop+ModelForward 위임
     // ════════════════════════════════════════════════════════════════════════
     // Narrow guard (assembly::is_standard_happy_path 참조):
     //   - profile / qcf_dump / skip_ratio / d2o_layer_alloc / eviction 비활성
-    //   - prompt 길이 ≤ 256 (chunked prefill 미지원, Phase 4-4.5에서 흡수)
-    //   - prefill_chunk_size 미지정 또는 prompt 이상
-    // 미통과 args는 아래 fallback path (Inference profiler ~ main 끝)를 사용.
-    const MAX_NON_CHUNKED_PREFILL_LEN: usize = 256;
-    if llm_rs2::session::is_standard_happy_path(&args)
-        && tokens.len() <= MAX_NON_CHUNKED_PREFILL_LEN
-        && (args.prefill_chunk_size == 0 || args.prefill_chunk_size >= tokens.len())
-    {
+    // Paradigm: prefill → last_logits → argmax = first_token → run(N-1, first_token).
+    // chunked prefill은 ModelForward::prefill 내부에서 처리 (Phase 4-4.5 C3).
+    if llm_rs2::session::is_standard_happy_path(&args) && args.num_tokens >= 1 {
         eprintln!(
-            "[Phase4-4-b] standard happy path → DecodeLoop+ModelForward (tokens={}, budget={})",
+            "[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens={}, budget={})",
             tokens.len(),
             args.num_tokens
         );
@@ -3056,17 +3051,26 @@ fn main() -> anyhow::Result<()> {
             max_seq_len,
             kv_type,
         )?;
-        decode_loop.prefill(&tokens)?;
-        let result = decode_loop.run(args.num_tokens)?;
+        let last_logits = decode_loop.prefill(&tokens)?;
+        let first_token = last_logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+        let result = decode_loop.run(args.num_tokens - 1, first_token)?;
 
         let mut final_tokens: Vec<u32> = tokens.clone();
+        final_tokens.push(first_token);
         final_tokens.extend_from_slice(&result.tokens_generated);
         let decoded = tokenizer
             .decode(&final_tokens, true)
             .unwrap_or_else(|_| String::from("[decode error]"));
         println!("{}", decoded);
         eprintln!(
-            "[Phase4-4-b] generated={} stopped_by={:?} final_pos={}",
+            "[Phase4-4.5] generated={} (first={} + run={}) stopped_by={:?} final_pos={}",
+            1 + result.tokens_generated.len(),
+            first_token,
             result.tokens_generated.len(),
             result.stopped_by,
             result.final_pos
