@@ -1,9 +1,20 @@
 //! Phase 4-4-a: standard happy path용 [`DecodeLoop`] 조립자.
 //!
-//! [`build_standard_loop`]는 [`SessionInitCtx`]를 consume하여 표준 `KVCache`
-//! 기반 [`ModelForward`] + greedy sampler [`DecodeLoop`]을 반환한다. ctx를
-//! consume하므로 chat/eval-ll/ppl/batch 등 다른 분기와 동시 사용 불가
-//! (early-return 구조라 자연스럽게 모순 없음).
+//! [`build_standard_loop`]는 unpack된 args (backend / memory / cpu_backend /
+//! model) 를 받아 표준 `KVCache` 기반 [`ModelForward`] + greedy sampler
+//! [`DecodeLoop`]을 반환한다. `model`은 owned consume — `Arc::new(model)`로
+//! 1회 변환하여 [`ModelForward`]에 위임 (Q2-B 결정의 변형 α: ctx struct
+//! 의존 없이 unpack-args 시그니처).
+//!
+//! ## 왜 ctx-consume이 아닌 unpack-args인가
+//!
+//! `bin/generate.rs` line 91~109에서 `SessionInitCtx::build(&args)?` 직후
+//! 즉시 ctx unpack이 발생한다. 따라서 표준 path 진입 시점 (line 3032)에
+//! ctx struct는 더 이상 존재하지 않으며, unpack된 `backend` / `memory` /
+//! `model` 변수만 사용 가능하다. ctx struct를 보존하려면 모든 분기
+//! (chat/eval-ll/ppl/batch)에 ctx-borrow 패턴을 적용해야 하므로 4-4 범위
+//! 초과. → 헬퍼 시그니처를 unpack-args 형태로 한정하여 영향 범위를
+//! standard path 한정으로 유지.
 //!
 //! Happy path 진입 조건은 [`is_standard_happy_path`] 참조. chunked prefill /
 //! optional collector 의존 케이스는 Phase 4-4.5에서 흡수 예정.
@@ -12,10 +23,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::core::backend::Backend;
 use crate::core::buffer::DType;
+use crate::core::memory::Memory;
+use crate::models::transformer::TransformerModel;
 use crate::session::cli::Args;
 use crate::session::forward::{ModelForward, alloc_standard_kv_caches};
-use crate::session::init::SessionInitCtx;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler};
 
 /// Phase 4-4-a: standard generate happy path 진입 가드.
@@ -39,32 +52,37 @@ pub fn is_standard_happy_path(args: &Args) -> bool {
         && args.eviction_policy == "none"
 }
 
-/// Phase 4-4-a: `SessionInitCtx`를 consume하여 standard `DecodeLoop` 조립.
+/// Phase 4-4-a: unpack-args 형태로 standard `DecodeLoop` 조립.
 ///
-/// **ctx-consume 패턴 (Q2-B)**: `ctx.model`을 `Arc::new(ctx.model)`로 옮기므로
-/// ctx를 다시 사용 불가. early-return 구조 (chat/eval-ll/ppl/batch는 본 헬퍼
-/// 호출 전 모두 분기됨)에서 충돌 없음.
+/// **model consume 패턴 (Q2-B α변형)**: `model: TransformerModel` owned 인자를
+/// `Arc::new(model)`로 1회 변환하여 [`ModelForward`]에 위임. 호출자
+/// (generate.rs main)는 본 헬퍼 호출 후 `model` 변수를 다시 사용할 수 없다.
+/// chat/eval-ll/ppl/batch는 early-return 구조이므로 표준 path 진입 시점에
+/// 다른 분기로 흐를 가능성 없음 (자연스러운 모순 없음).
 ///
 /// - `max_seq_len`: KV cache 용량 + lazy `PrefillWorkspace` cap
 /// - `kv_dtype`: KV cache element type (F32/F16/Q4_0). 호출자가 args에서 결정
 pub fn build_standard_loop(
-    ctx: SessionInitCtx,
+    backend: Arc<dyn Backend>,
+    memory: Arc<dyn Memory>,
+    cpu_backend: Arc<dyn Backend>,
+    model: TransformerModel,
     max_seq_len: usize,
     kv_dtype: DType,
 ) -> Result<DecodeLoop> {
     let kv = alloc_standard_kv_caches(
-        &ctx.model,
-        ctx.backend.clone(),
-        ctx.memory.clone(),
+        &model,
+        backend.clone(),
+        memory.clone(),
         max_seq_len,
         max_seq_len,
         kv_dtype,
     )?;
     let mf = ModelForward::new(
-        ctx.backend.clone(),
-        ctx.memory.clone(),
-        ctx.cpu_backend_arc.clone(),
-        Arc::new(ctx.model),
+        backend,
+        memory,
+        cpu_backend,
+        Arc::new(model),
         kv,
         max_seq_len,
     )?;
