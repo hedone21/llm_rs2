@@ -259,6 +259,7 @@ cargo build --release --bin probe_inference_loop --features cuda-embedded
 - **TBT metric**: avg_tbt (tok0 inclusive)
 - **Adreno 벤치**: Galaxy S25 = 6T만
 - **clippy**: 본 phase 신규 코드는 clean. 기존 27 warnings + 1 error는 Task #8 (`/simplify`)에서 정리
+- **❌ `git worktree` 사용 금지**: baseline 비교 빌드용으로 `git worktree add /tmp/...`를 시도하면 **권한 문제 발생**. 실측 발견 (Phase 4-4-b S25 측정 중, 2026-05-17): (1) Cargo workspace target dir이 main repo와 공유되어 worktree 빌드가 main repo binary를 덮어씀, (2) `run_device.py` 가 "Shell cwd was reset to /home/go/Workspace/llm_rs2"로 main repo cwd를 강제, (3) `hosts.toml` / `android.source` NDK 환경이 worktree에 없거나 macOS path를 가리켜 build fail. **올바른 baseline 비교 방법** = `git switch <commit>` detached HEAD checkout + `python scripts/run_device.py -d galaxy_s25 --skip-exec generate` → adb shell `cp /data/local/tmp/generate /data/local/tmp/generate_baseline` → `git switch master` 후 rebuild + push. baseline binary는 디바이스 측에 보존.
 
 ## 확정 결정 (Phase 4 전체)
 
