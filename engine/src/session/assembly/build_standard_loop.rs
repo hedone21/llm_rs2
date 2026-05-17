@@ -26,10 +26,11 @@ use anyhow::Result;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
 use crate::core::memory::Memory;
+use crate::core::sampling::SamplingConfig;
 use crate::models::transformer::TransformerModel;
 use crate::session::cli::Args;
 use crate::session::forward::{ModelForward, alloc_standard_kv_caches};
-use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler};
+use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
 /// Phase 4-4-a: standard generate happy path 진입 가드.
 ///
@@ -40,8 +41,12 @@ use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler};
 /// - `!args.d2o_layer_alloc`                 — `--d2o-layer-alloc` 비활성 (variance_collector 미장착)
 /// - `!args.profile && !args.profile_events` — profile 비활성 (profiler 미장착)
 /// - `args.eviction_policy == "none"`        — eviction 비활성 (score_accumulator 미장착)
-/// - `args.repetition_penalty == 1.0`        — repetition penalty 비활성 (Phase 4-4.6:
-///   `GreedySampler`는 raw argmax이므로 `sampling::sample`의 penalty 적용과 일치하지 않음)
+///
+/// Phase 4-4.7에서 `repetition_penalty == 1.0` 가드가 제거되었다. 대신
+/// [`build_standard_loop`]가 `sampling_config`에 따라
+/// [`GreedySampler`] 또는 [`RepetitionPenaltySampler`] 중 적절한 sampler를
+/// 자동 선택하여 production `sampling::sample` 호출과 paradigm equivalent
+/// 결과를 보장한다.
 ///
 /// 호출자는 추가로 `prompt_len <= MAX_NON_CHUNKED_PREFILL_LEN`도 검증해야 한다
 /// (chunked prefill 미지원). 그 가드는 generate.rs 호출 site에서 처리.
@@ -52,7 +57,6 @@ pub fn is_standard_happy_path(args: &Args) -> bool {
         && !args.profile
         && !args.profile_events
         && args.eviction_policy == "none"
-        && args.repetition_penalty == 1.0
 }
 
 /// Phase 4-4-a: unpack-args 형태로 standard `DecodeLoop` 조립.
@@ -73,7 +77,9 @@ pub fn build_standard_loop(
     initial_kv_capacity: usize,
     max_seq_len: usize,
     kv_dtype: DType,
+    sampling_config: SamplingConfig,
 ) -> Result<DecodeLoop> {
+    let vocab_size = model.config.vocab_size;
     let kv = alloc_standard_kv_caches(
         &model,
         backend.clone(),
@@ -90,10 +96,20 @@ pub fn build_standard_loop(
         kv,
         max_seq_len,
     )?;
-    Ok(DecodeLoopBuilder::new()
-        .with_forward(mf)
-        .with_sampler(GreedySampler)
-        .build())
+
+    // Phase 4-4.7: sampler 자동 선택. production `sampling::sample`은
+    // temperature=0 + repetition_penalty=1.0이면 raw argmax와 동치이므로 두 조건이
+    // 모두 만족될 때만 GreedySampler 사용. 그 외는 RepetitionPenaltySampler가
+    // 내부 VecDeque ring buffer + scratch logits로 production 호출을 충실히 모사.
+    let use_stateful =
+        sampling_config.repetition_penalty != 1.0 || sampling_config.temperature != 0.0;
+    let builder = DecodeLoopBuilder::new().with_forward(mf);
+    let builder = if use_stateful {
+        builder.with_sampler(RepetitionPenaltySampler::new(sampling_config, vocab_size))
+    } else {
+        builder.with_sampler(GreedySampler)
+    };
+    Ok(builder.build())
 }
 
 #[cfg(test)]
@@ -117,14 +133,15 @@ mod tests {
         );
     }
 
-    /// 기본 CLI의 repetition_penalty=1.1은 GreedySampler와 정책 불일치하므로
-    /// happy path 우회 (Phase 4-4.6 paradigm equivalence 가드).
+    /// Phase 4-4.7: rep_penalty 가드가 제거됨. 기본 CLI (default 1.1) 도
+    /// happy path 진입 가능 — `build_standard_loop`가 `RepetitionPenaltySampler`
+    /// 를 자동 선택하여 production `sampling::sample` 호출과 동치 결과를 낸다.
     #[test]
-    fn rejects_default_repetition_penalty() {
+    fn accepts_default_repetition_penalty() {
         let args = default_args();
         assert!(
-            !is_standard_happy_path(&args),
-            "default repetition_penalty=1.1은 happy path 거부"
+            is_standard_happy_path(&args),
+            "Phase 4-4.7: default repetition_penalty=1.1 happy path 진입 허용"
         );
     }
 
@@ -168,7 +185,6 @@ mod tests {
     fn accepts_skip_ratio_zero() {
         let mut args = default_args();
         args.skip_ratio = Some(0.0);
-        args.repetition_penalty = 1.0;
         assert!(is_standard_happy_path(&args));
     }
 }

@@ -66,6 +66,15 @@ impl DecodeLoop {
         let logits = self.forward.prefill(tokens)?;
         self.pos = tokens.len();
         self.prev_token = *tokens.last().unwrap_or(&0);
+        // Phase 4-4.7: production fallback (generate.rs)이
+        // `sampling::sample(&mut logits, &tokens, ...)` 호출 시 `tokens`(prompt
+        // 전체)를 rep history로 사용한다. paradigm equivalence를 위해 prefill
+        // 시점에 prompt를 sampler에게 전부 통보. GreedySampler는 default no-op
+        // 이라 무영향, RepetitionPenaltySampler만 ring buffer에 prompt suffix를
+        // 적재한다.
+        for &t in tokens {
+            self.sampler.observe_token(t);
+        }
         let stop = Arc::clone(&self.stop_flag);
         let ctx = step_ctx(
             self.pos,
@@ -440,8 +449,8 @@ mod tests {
             .build();
         let _ = loop_.prefill(&[1, 2, 3]).unwrap();
         let _ = loop_.run(3, 7).unwrap();
-        // first_token=7 (1회) + sampled 3회 = 4. (C2 prompt seeding 활성 후 +3)
-        assert_eq!(observe_count.load(AtomicOrd::Relaxed), 4);
+        // C2 prompt seeding 활성: prompt 3회 + first_token 1회 + sampled 3회 = 7.
+        assert_eq!(observe_count.load(AtomicOrd::Relaxed), 7);
     }
 
     #[test]

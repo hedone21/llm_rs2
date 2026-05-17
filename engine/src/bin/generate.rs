@@ -3055,17 +3055,25 @@ fn main() -> anyhow::Result<()> {
             initial_kv_capacity,
             max_seq_len,
             kv_type,
+            sampling_config.clone(),
         )?;
         let t_prefill = std::time::Instant::now();
-        let last_logits = decode_loop.prefill(&tokens)?;
+        let mut last_logits = decode_loop.prefill(&tokens)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
-        let first_token = last_logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        // Phase 4-4.7: first_token을 raw argmax가 아니라 production fallback
+        // (generate.rs l.3748)과 동일한 `sampling::sample(&mut logits, &tokens, ...)`
+        // 호출로 산출. `tokens` 전체가 rep history로 들어가 prompt suffix에
+        // rep penalty가 적용된다. 다음 `decode_loop.run`은 진입부에서 first_token
+        // observe_token 1회 + 매 step sampled observe_token 1회로 production
+        // `tokens.push(next_token_id)`와 동치 history를 유지.
+        let first_token = llm_rs2::core::sampling::sample(
+            &mut last_logits,
+            &tokens,
+            vocab_size,
+            &sampling_config,
+            None,
+        );
 
         let t_decode = std::time::Instant::now();
         let result = decode_loop.run(args.num_tokens - 1, first_token)?;
