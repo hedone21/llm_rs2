@@ -212,6 +212,9 @@ fn impl_run_decode_loop(
         model.clone(),
         kv,
         max_seq_len,
+        // Phase 4-4.7: microbench는 vtable overhead만 측정. plan path는 별도
+        // device G7' 게이트로 검증되므로 여기서는 비활성화 → forward_into fallback만.
+        false,
     )?;
 
     let mut decode_loop = DecodeLoopBuilder::new()

@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+#[cfg(feature = "opencl")]
+use crate::backend::opencl::plan::FullKernelPlan;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
 use crate::core::kv_cache::{KVCache, KVLayout};
@@ -21,6 +23,8 @@ use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::layers::workspace::{LayerWorkspace, PrefillWorkspace, WorkspaceConfig};
 use crate::memory::galloc::Galloc;
+#[cfg(feature = "opencl")]
+use crate::models::config::ModelArch;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::session::traits::{Forward, StepCtx};
 
@@ -59,6 +63,22 @@ pub struct ModelForward {
     logits_prefill_last: Tensor, // [1, 1, vocab] (logits_last_only=true)
 
     vocab_size: usize,
+
+    // Phase 4-4.7 (A1): plan-aware decode. step()이 production fallback
+    // (generate.rs l.4351~4477)과 동일하게 execute_plan → forward_into fallback
+    // → 다음 step lazy rebuild를 자체적으로 수행한다.
+    //
+    // `gpu_plan`: 현재 보유 중인 plan (lazy build, invalidation 시 None).
+    // `sticky_disabled`: 한 번 build 실패 또는 invalidation lock-out 발동 시
+    //   매 step rebuild를 spam하지 않도록 차단 (generate.rs l.4213 패턴).
+    // `plan_enabled`: 호출자(`build_standard_loop`)가 `!args.no_gpu_plan`을
+    //   전달. CLI `--no-gpu-plan` 활성 시 false → plan path 완전 우회.
+    #[cfg(feature = "opencl")]
+    gpu_plan: Option<FullKernelPlan>,
+    #[cfg(feature = "opencl")]
+    sticky_disabled: bool,
+    #[cfg(feature = "opencl")]
+    plan_enabled: bool,
 }
 
 impl ModelForward {
@@ -74,6 +94,7 @@ impl ModelForward {
         model: Arc<TransformerModel>,
         kv_caches: Vec<KVCache>,
         max_seq_len: usize,
+        #[cfg_attr(not(feature = "opencl"), allow(unused_variables))] plan_enabled: bool,
     ) -> Result<Self> {
         let hidden_size = model.config.hidden_size;
         let vocab_size = model.config.vocab_size;
@@ -111,7 +132,73 @@ impl ModelForward {
             logits_decode,
             logits_prefill_last,
             vocab_size,
+            #[cfg(feature = "opencl")]
+            gpu_plan: None,
+            #[cfg(feature = "opencl")]
+            sticky_disabled: false,
+            #[cfg(feature = "opencl")]
+            plan_enabled,
         })
+    }
+
+    /// Phase 4-4.7 (A1): plan eligibility 검사 + build 시도.
+    ///
+    /// production fallback (`generate.rs` l.4186~4199) 가드와 동치 — backend가
+    /// OpenCL이고 `--no-gpu-plan` 비활성이며 Gemma3 아닐 때만. score
+    /// accumulator / partition / swap_intra_forward 등 추가 가드는 호출자
+    /// `is_standard_happy_path`에서 사전 차단되어 도달 시점에 모두 false 보장.
+    ///
+    /// 결과가 None일 때 `sticky_disabled = true`로 lock-out하여 매 step rebuild
+    /// spam을 차단. invalidation 발생 시 호출자가 `gpu_plan = None`으로 set하면
+    /// 다음 step 진입에서 sticky_disabled가 false인 경우에만 자동 rebuild.
+    #[cfg(feature = "opencl")]
+    fn try_build_plan(&mut self) -> Option<FullKernelPlan> {
+        // 환경변수 `LLMRS_FWD_TRACE=1` 시 plan path 진입/거부/실패 stderr 로그.
+        // Phase 4-4.7 device 측정에서 `build_plan returned None` 위치 진단용.
+        // 후속 Phase 4-4.8 plan-path 진단 sprint에서 활용.
+        let trace = std::env::var_os("LLMRS_FWD_TRACE").is_some();
+        if !self.plan_enabled {
+            if trace {
+                eprintln!("[fwd-trace] skip: plan_enabled=false");
+            }
+            return None;
+        }
+        if self.sticky_disabled {
+            if trace {
+                eprintln!("[fwd-trace] skip: sticky_disabled");
+            }
+            return None;
+        }
+        if self.backend.name() != "OpenCL" {
+            if trace {
+                eprintln!("[fwd-trace] skip: backend.name()={}", self.backend.name());
+            }
+            return None;
+        }
+        if matches!(self.model.config.arch, ModelArch::Gemma3) {
+            if trace {
+                eprintln!("[fwd-trace] skip: arch=Gemma3");
+            }
+            return None;
+        }
+        let plan = self.model.build_plan(
+            &self.decode_x_gen,
+            &self.logits_decode,
+            &self.decode_workspace,
+            &mut self.kv_caches,
+            &self.backend,
+        );
+        if plan.is_none() {
+            // build_plan이 None 반환 → 본 모델/상태에서 plan path 미지원.
+            // 매 step 시도를 막기 위해 sticky lock-out.
+            if trace {
+                eprintln!("[fwd-trace] build_plan returned None → sticky lock");
+            }
+            self.sticky_disabled = true;
+        } else if trace {
+            eprintln!("[fwd-trace] build_plan SUCCESS");
+        }
+        plan
     }
 
     /// Borrow the underlying KV caches (Phase 4-4 `EvictionStage` will reach
@@ -272,6 +359,48 @@ impl Forward for ModelForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
+        // Phase 4-4.7 (A1): plan path 우선 시도. invalidation 또는 build 실패 시
+        // forward_into fallback. production fallback (generate.rs l.4351~4376) 패턴.
+        #[cfg(feature = "opencl")]
+        {
+            // Lazy build: gpu_plan이 None이고 sticky_disabled가 false일 때만 시도.
+            if self.gpu_plan.is_none() && !self.sticky_disabled {
+                self.gpu_plan = self.try_build_plan();
+            }
+
+            // borrow 충돌 회피: plan을 step scope로 take, 결과에 따라 복귀/drop.
+            // (execute_plan은 `&plan` + `&mut kv_caches` 동시 borrow 필요)
+            let plan_opt = self.gpu_plan.take();
+            let plan_result = if let Some(plan) = plan_opt.as_ref() {
+                let backend = self.backend.clone();
+                self.model.execute_plan(
+                    plan,
+                    &self.decode_input,
+                    ctx.pos,
+                    &mut self.decode_x_gen,
+                    &mut self.kv_caches,
+                    &mut self.logits_decode,
+                    &backend,
+                )
+            } else {
+                Ok(false)
+            };
+
+            match plan_result {
+                Ok(true) => {
+                    // 성공: plan을 다시 보유 + logits 반환.
+                    self.gpu_plan = plan_opt;
+                    return self.read_logits(&self.logits_decode);
+                }
+                Ok(false) | Err(_) => {
+                    // Invalidated (KV resize 등) 또는 execute 오류 — plan_opt drop,
+                    // gpu_plan은 take()로 이미 None. fallback으로 진행.
+                    // 다음 step 진입부에서 lazy rebuild 자동 시도.
+                }
+            }
+        }
+
+        // Fallback: forward_into 직접 호출 (production l.4380~4438과 동치).
         // Same trick as prefill: split &mut borrows so we do not hold &self
         // and &mut self.kv_caches simultaneously inside the args literal.
         let backend = self.backend.clone();

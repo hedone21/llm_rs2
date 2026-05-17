@@ -41,6 +41,12 @@ use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPen
 /// - `!args.d2o_layer_alloc`                 — `--d2o-layer-alloc` 비활성 (variance_collector 미장착)
 /// - `!args.profile && !args.profile_events` — profile 비활성 (profiler 미장착)
 /// - `args.eviction_policy == "none"`        — eviction 비활성 (score_accumulator 미장착)
+/// - `args.tensor_partition == 0.0`          — Phase 4-4.7: tensor_partition 활성 시
+///   plan path가 build_plan에서 None을 반환 → sticky_disabled lock-out → 매 step
+///   forward_into fallback이라 성능 저하. happy path에서는 partition 차단.
+/// - `!args.swap_intra_forward && !args.swap_layer_immediate && !args.swap_phase_aware`
+///   — Phase 4-4.7: weight swap intra-forward / phase-aware는 plan path가 미지원
+///   (production generate.rs l.4192-4199 가드와 동치).
 ///
 /// Phase 4-4.7에서 `repetition_penalty == 1.0` 가드가 제거되었다. 대신
 /// [`build_standard_loop`]가 `sampling_config`에 따라
@@ -57,6 +63,10 @@ pub fn is_standard_happy_path(args: &Args) -> bool {
         && !args.profile
         && !args.profile_events
         && args.eviction_policy == "none"
+        && args.tensor_partition == 0.0
+        && !args.swap_intra_forward
+        && !args.swap_layer_immediate
+        && !args.swap_phase_aware
 }
 
 /// Phase 4-4-a: unpack-args 형태로 standard `DecodeLoop` 조립.
@@ -78,6 +88,7 @@ pub fn build_standard_loop(
     max_seq_len: usize,
     kv_dtype: DType,
     sampling_config: SamplingConfig,
+    plan_enabled: bool,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     let kv = alloc_standard_kv_caches(
@@ -95,6 +106,7 @@ pub fn build_standard_loop(
         Arc::new(model),
         kv,
         max_seq_len,
+        plan_enabled,
     )?;
 
     // Phase 4-4.7: sampler 자동 선택. production `sampling::sample`은

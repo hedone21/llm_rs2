@@ -240,6 +240,9 @@ fn wrapper_path_tokens(
         model.clone(),
         kv,
         MAX_SEQ_LEN,
+        // Phase 4-4.7: parity test는 forward_into 경로 검증 한정. plan path는
+        // 별도 디바이스 G6'/G7' 게이트에서 검증되므로 여기서는 비활성화.
+        false,
     )
     .unwrap();
 

@@ -3056,6 +3056,7 @@ fn main() -> anyhow::Result<()> {
             max_seq_len,
             kv_type,
             sampling_config.clone(),
+            !args.no_gpu_plan,
         )?;
         let t_prefill = std::time::Instant::now();
         let mut last_logits = decode_loop.prefill(&tokens)?;
