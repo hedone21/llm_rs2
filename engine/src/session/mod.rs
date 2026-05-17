@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod decode_loop;
 pub mod defaults;
+pub mod forward;
 pub mod init;
 pub mod traits;
 
