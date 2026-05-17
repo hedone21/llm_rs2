@@ -26,8 +26,17 @@ fn typestate_negative_forward_missing() {
 fn typestate_positive_forward_minimal() {
     let t = trybuild::TestCases::new();
     t.pass("tests/spec/compile_pass/forward_minimal.rs");
+    // Phase 4-3 C2: ModelForward concrete impl also satisfies the
+    // `HasForward` typestate (i.e. `Builder::with_forward(ModelForward)`
+    // reaches `.build()`). Bundled here so a single trybuild invocation
+    // covers both fixtures.
+    t.pass("tests/spec/compile_pass/model_forward_minimal.rs");
     assert!(
         std::path::Path::new("tests/spec/compile_pass/forward_minimal.rs").exists(),
         "INV-LAYER-007: compile_pass fixture must exist"
+    );
+    assert!(
+        std::path::Path::new("tests/spec/compile_pass/model_forward_minimal.rs").exists(),
+        "Phase 4-3 C2: model_forward compile_pass fixture must exist"
     );
 }

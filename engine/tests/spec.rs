@@ -337,3 +337,5 @@ mod test_inv_layer_005;
 mod test_inv_layer_006;
 #[path = "spec/test_inv_layer_007.rs"]
 mod test_inv_layer_007;
+#[path = "spec/test_model_forward_parity.rs"]
+mod test_model_forward_parity;
