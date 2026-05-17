@@ -3048,6 +3048,7 @@ fn main() -> anyhow::Result<()> {
             memory.clone(),
             cpu_backend_arc.clone(),
             model,
+            initial_kv_capacity,
             max_seq_len,
             kv_type,
         )?;

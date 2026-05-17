@@ -67,6 +67,7 @@ pub fn build_standard_loop(
     memory: Arc<dyn Memory>,
     cpu_backend: Arc<dyn Backend>,
     model: TransformerModel,
+    initial_kv_capacity: usize,
     max_seq_len: usize,
     kv_dtype: DType,
 ) -> Result<DecodeLoop> {
@@ -74,7 +75,7 @@ pub fn build_standard_loop(
         &model,
         backend.clone(),
         memory.clone(),
-        max_seq_len,
+        initial_kv_capacity,
         max_seq_len,
         kv_dtype,
     )?;
