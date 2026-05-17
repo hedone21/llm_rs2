@@ -3043,6 +3043,10 @@ fn main() -> anyhow::Result<()> {
             tokens.len(),
             args.num_tokens
         );
+        // Drop dead production-fallback KV caches so build_standard_loop's
+        // allocation does not coexist with a never-used pool for the lifetime
+        // of `main()`.
+        drop(kv_caches);
         let mut decode_loop = llm_rs2::session::build_standard_loop(
             backend.clone(),
             memory.clone(),

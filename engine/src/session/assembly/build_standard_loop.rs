@@ -40,6 +40,8 @@ use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler};
 /// - `!args.d2o_layer_alloc`                 — `--d2o-layer-alloc` 비활성 (variance_collector 미장착)
 /// - `!args.profile && !args.profile_events` — profile 비활성 (profiler 미장착)
 /// - `args.eviction_policy == "none"`        — eviction 비활성 (score_accumulator 미장착)
+/// - `args.repetition_penalty == 1.0`        — repetition penalty 비활성 (Phase 4-4.6:
+///   `GreedySampler`는 raw argmax이므로 `sampling::sample`의 penalty 적용과 일치하지 않음)
 ///
 /// 호출자는 추가로 `prompt_len <= MAX_NON_CHUNKED_PREFILL_LEN`도 검증해야 한다
 /// (chunked prefill 미지원). 그 가드는 generate.rs 호출 site에서 처리.
@@ -50,6 +52,7 @@ pub fn is_standard_happy_path(args: &Args) -> bool {
         && !args.profile
         && !args.profile_events
         && args.eviction_policy == "none"
+        && args.repetition_penalty == 1.0
 }
 
 /// Phase 4-4-a: unpack-args 형태로 standard `DecodeLoop` 조립.
@@ -105,11 +108,23 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_default_args() {
-        let args = default_args();
+    fn happy_path_with_no_repetition_penalty() {
+        let mut args = default_args();
+        args.repetition_penalty = 1.0;
         assert!(
             is_standard_happy_path(&args),
-            "default Args (no flags)는 happy path 진입해야 함"
+            "기본 args + --repetition-penalty 1.0 → happy path 진입"
+        );
+    }
+
+    /// 기본 CLI의 repetition_penalty=1.1은 GreedySampler와 정책 불일치하므로
+    /// happy path 우회 (Phase 4-4.6 paradigm equivalence 가드).
+    #[test]
+    fn rejects_default_repetition_penalty() {
+        let args = default_args();
+        assert!(
+            !is_standard_happy_path(&args),
+            "default repetition_penalty=1.1은 happy path 거부"
         );
     }
 
@@ -153,6 +168,7 @@ mod tests {
     fn accepts_skip_ratio_zero() {
         let mut args = default_args();
         args.skip_ratio = Some(0.0);
+        args.repetition_penalty = 1.0;
         assert!(is_standard_happy_path(&args));
     }
 }
