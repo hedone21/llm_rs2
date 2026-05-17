@@ -431,9 +431,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ── Chat REPL mode ──
-    // Three dispatch paths: standard (KVCache, with optional eviction),
-    // KIVI (quantized KV), and KV-offload (disk/raw store).
+    // ════════════════════════════════════════════════════════════
+    //  CHAT REPL MODE: standard / KIVI / KV-offload 3-way dispatch
+    // ════════════════════════════════════════════════════════════
     if args.chat {
         let sampling_config = SamplingConfig {
             temperature: args.temperature,
@@ -3073,6 +3073,14 @@ fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  STANDARD GENERATE MODE (fallback) — happy path 미통과 시 진입
+    // ════════════════════════════════════════════════════════════════════════
+    // chunked prefill / optional collector (score_accumulator / skip_config /
+    // importance_collector / variance_collector / profiler) 가 필요한 경우.
+    // Phase 4-4.5에서 ModelForward에 chunked + collector 흡수되면 happy path
+    // 진입 조건이 확장되어 본 fallback 진입 빈도 감소.
 
     // Inference profiler (activated by either --profile or --profile-events).
     // Declared before prefill so PrefillOpProfiler can be populated.

@@ -1,15 +1,21 @@
-# Handoff: Phase 4-3 완료 (호스트 + S25 PASS) → Phase 4-4 진입 가능
+# Handoff: Phase 4-4 종료 → Phase 4-4.5 (paradigm 통일) + 4-5 (chat 재작성) 진입
 
 **작성**: 2026-05-17
-**갱신**: 2026-05-17 (S25 측정 PASS + Phase 4-4 진입 가이드 추가)
-**HEAD**: `debf4e1f docs(handoff): Phase 4-3 S25 OpenCL gate PASS (Δ=2.29%, bit-identical)`
-**다음 세션 진입 문장 (사용자)**: "Phase 4-4 진행" 또는 "main() 조립자화 시작"
+**갱신**: 2026-05-17 (Phase 4-4 a/b/d 종료, paradigm mismatch는 4-4.5로 분리)
+**HEAD**: `6953b200 docs(experiment): Phase 4-4-b S25 paradigm mismatch split to 4-4.5`
+**다음 세션 진입 문장 (사용자)**: "Phase 4-4.5 진행" 또는 "DecodeLoop paradigm 통일"
 
 ---
 
 ## TL;DR
 
-외부 공개 대비 엔진 레이어드 리팩토링 **Task #4 Phase 4-3 (ModelForward + microbench) 호스트 + S25 OpenCL PASS**. 3 commits, +913 LOC 신규, generate.rs 변경 0. **호스트 CPU Qwen 2.5 1.5B Q4_0: Δ=1.53% PASS bit-identical=true**. **S25 Adreno OpenCL gen=32 runs=5: Δ=2.29% PASS bit-identical=true (32 토큰 모두 일치)**. Jetson CUDA는 SSH alias 미설정으로 보드 내 직접 측정 별도 task. 양쪽 모두 게이트(5%)의 절반 이내 → **arch §7.3 escape hatch 불필요, Phase 4-4 진입 가능**. **다음은 Phase 4-4 — main() 조립자화 (≤ 400 LOC, 표준 generate path를 `DecodeLoop+ModelForward`로 교체)**.
+**Phase 4-4 a/b/d 종료** (4 commits: `886f0404` + `26e1ca87` + `e83b87d2` + `6953b200`). `session/assembly/build_standard_loop` 헬퍼 신설 + `bin/generate.rs` line 3032에 narrow happy path 분기 추가 (DecodeLoop+ModelForward 위임). 호스트 CPU Qwen 1.5B Q4_0 정상 디코딩 PASS, S25 OpenCL 분기 진입 + 32 토큰 생성 정상 동작 확인.
+
+**중대 발견**: S25 OpenCL 비교에서 token sequence baseline 불일치 → 원인 = `DecodeLoop::prefill(tokens) -> Result<()>` paradigm mismatch (Phase 4-3 인지된 issue가 production-level에서 발현). `prev_token = tokens.last()` 설정으로 첫 step에서 prompt 마지막 token이 **2회 forward**. **사용자 결정 (Q5-B)**: Phase 4-4.5 sprint로 paradigm 통일 분리, 4-4-b의 G6 bit-identical 게이트 완화.
+
+**다음**: **Phase 4-4.5 — DecodeLoop paradigm 통일** (`prefill -> Result<Vec<f32>>` + `run(budget, first_token)`) + ModelForward chunked prefill 지원 + optional collector wiring. 그 후 G8 디바이스 재측정 (S25 OpenCL bit-identical + Δ ≤ 5%).
+
+**main() ≤ 400 LOC 게이트 보류**: 실측 main() 본체 = line 77~6257 = **6,180 LOC**. eval-ll / ppl / batch 분기들이 inline body로 남아 있어 Phase 4-5 분기 추출 + Phase 4-4.5 happy path 확장 완료 후 달성 가능.
 
 ---
 
@@ -22,7 +28,7 @@
 | #1 | ✅ | ARCHITECTURE.md + spec INV-LAYER-001~005 |
 | #2 | ✅ | UNRESOLVED-A~E 5건 결정 |
 | #3 | ✅ | spec test + baseline + layer_lint 도구 |
-| **#4** | 🔄 in_progress | **L5/L4 분리** (4-1 ✅ / 4-2 ✅ / **4-3 ✅ 호스트+S25** / Jetson 보충 ⏳ / 4-4 ready / 4-5 pending) |
+| **#4** | 🔄 in_progress | **L5/L4 분리** (4-1 ✅ / 4-2 ✅ / 4-3 ✅ 호스트+S25 / 4-4 ✅ a/b/d / **4-4.5 ⏳ paradigm 통일** / 4-5 pending) |
 | #5 | ⏳ blocked | L1/L2 경계 정리 |
 | #6 | ⏳ blocked | L3 도메인 재배치 |
 | #7 | ⏳ blocked | Cross-cutting 분리 |
@@ -35,7 +41,8 @@
 | 4-1 외곽 추출 | ✅ commit `f637722e` | `session/init.rs` (~1,030 LOC), `session/cli.rs` |
 | 4-2 trait + Builder | ✅ commits `85ff756c`~`584496b7` | `session/{traits, defaults, decode_loop}.rs`, trybuild INV-LAYER-006/007 |
 | **4-3 ModelForward + microbench** | ✅ 호스트 + S25 / ⏳ Jetson 보충 | C1 `3470ad1d` + C2 `f5236073` + C3 `c63190d1` + handoff `7619ae9d` + S25 `debf4e1f`. **호스트 CPU Δ=1.53%, S25 OpenCL Δ=2.29%, 둘 다 bit-identical**. |
-| **4-4 main() 조립자화** | ⏳ **ready (진입 가능)** | main() ≤ 400 LOC, 표준 generate path 교체 |
+| **4-4 main() 조립자화** | ✅ a/b/d (c skip) | `886f0404` 헬퍼 + `26e1ca87` 시그니처 + `e83b87d2` happy path 분기 + `6953b200` paradigm split doc. main() ≤ 400 LOC 게이트 보류 (실측 6,180 LOC) |
+| **4-4.5 paradigm 통일** | ⏳ **ready (진입 가능)** | `DecodeLoop::prefill -> Result<Vec<f32>>` + `run(budget, first_token)` + ModelForward chunked + collector wiring |
 | 4-5 chat 전면 재작성 | ⏳ blocked | ChatTurnExec 폐기, `session/chat/{repl,turn,stop_condition}.rs`, V-11 해소 |
 
 ---
