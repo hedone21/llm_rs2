@@ -138,3 +138,160 @@ prefill 가 일치하므로 (첫 token=` Paris`):
 Decode/TBT 모두 5% 게이트 초과. 단, n=1 이라 noise 가능. G6 PASS 후 5-run median 으로 재측정 필요.
 
 TTFT 대폭 감소는 happy path 가 prefill warmup 출력 (`[WARMUP] tokens=1 ms=45.07`) 을 skip 하기 때문 — baseline 의 220.59 ms 에는 warmup 시간이 포함되어 있고, post-fix 92.37 ms 는 happy path 가 warmup 없이 prefill 직행한 값. TTFT 비교는 무효.
+
+---
+
+## Fix 2: KV cache initial_capacity 정합 (HEAD `57c0effd`)
+
+### 변경
+- `build_standard_loop(.., initial_kv_capacity: usize, ..)` 시그니처에 capacity 인자 추가
+- `generate.rs` main()의 production 공식 `(prompt_len+num_tokens).next_power_of_two().max(128).min(max_seq_len)` 결과를 happy path로 전달
+- 이전: `max_seq_len` (=512) 그대로 사용 → fix2: 5+32=37 → 128
+
+### 가설 (반증됨)
+KV cache 미사용 영역 garbage가 attention softmax/mask 처리에 침투 (특히 Adreno OpenCL).
+
+### G6 재측정 (32 token, --temperature 0 --top-k 1)
+
+baseline (deterministic):
+```
+The capital of France is Paris. It has a population of about 2 million people and covers an area of 104 square kilometers (km2). The city is divided into
+```
+
+post-fix2:
+```
+The capital of France is Paris. Paris is a very big city. It has about 2.2 million people. It is also a very old city. It was built in the
+```
+
+분기 진입 확인 (post-fix2): `[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=32)` + `[Phase4-4.5] generated=32 (first=12095 + run=31) stopped_by=BudgetExhausted final_pos=36`. TBT log 정상 출력.
+
+#### 첫 5 token 분기 분석 (fix1과 동일)
+공통 prefix: ` Paris`, `.` (step 0~1)
+- baseline step 2: ` It`
+- post-fix2 step 2: ` Paris`
+
+→ KV initial_capacity 가설 반증. fix1과 동일한 분기 위치.
+
+### Verdict — G6 FAIL
+fix2 (KV capacity 정합) **불충분**. fix1과 동일한 step 2에서 분기 → KV cache 미사용 영역 garbage 가설 아님.
+
+### G7 — 측정 보류 (G6 FAIL)
+단일 run 통계:
+| metric | baseline | post-fix2 | Δ |
+|--------|----------|-----------|----|
+| TTFT (ms) | 218.79 | 91.98 | -58% (warmup skip artifact) |
+| Decode (ms/tok) | 27.83 | 29.97 | +7.7% |
+| Avg TBT (ms) | 29.53 | 31.91 | +8.1% |
+
+n=1, G6 FAIL이므로 G7 비교 무의미.
+
+### Sampling mismatch 발견 (별건)
+이전 G6 비교에서 baseline은 `--greedy` flag로 호출되었으나, `generate.rs` standard generate 경로에서 `args.greedy`는 **사용되지 않음** (KIVI/eval-ll 경로에서만 sampling_config에 반영). 즉 이전 baseline 실행은 default sampling (temp=0.8, top_p=0.9, top_k=40) 으로 수행. 이번 측정은 `--temperature 0 --top-k 1` 명시로 deterministic 강제 → baseline 출력은 이전과 동일 (우연인지, 또는 `--greedy` flag 자체가 무의미한지는 별도 분석 필요).
+
+post-fix2 happy path는 `last_logits.iter().enumerate().max_by(...)` argmax이므로 deterministic. → sampling 차이는 G6 분기의 원인이 아님 확정.
+
+### 다음 fix 후보 (분기는 step 2에서 여전히 발생)
+
+prefill 일치 (step 0 ` Paris`) + step 1 일치 (`.`) + step 2 분기 (` It` vs ` Paris`):
+
+1. **ModelForward::step의 forward_into 인자 정밀 비교**
+   - production: `generate.rs:4388` 부근
+   - happy path: ModelForward 내부
+   - 특히 `decode_workspace` ownership: production은 step마다 reuse vs ModelForward는 eager alloc인지 확인
+   - `score_buf` / `decode_logits_buf` lifecycle
+
+2. **ModelForward::new의 decode_workspace alloc 시점**
+   - eager (one-shot at construction) vs lazy (per-step)
+   - production fallback의 lifecycle과 1:1 매칭 여부
+
+3. **`cpu_backend_arc`와 production effective_mem 차이**
+   - `build_standard_loop` 인자로 전달된 cpu_backend_arc vs production main()의 effective_mem 구성
+   - 같은 Memory instance/clone 여부 확인
+
+4. **KV cache 자체 분리 여부**
+   - prefill 시 사용한 KV cache vs decode 시 사용한 KV cache가 동일 인스턴스인지
+   - ModelForward 내부에서 KV cache 새로 생성한다면 prefill 결과 손실
+
+5. **첫 step 후 logits dump 디버그**
+   - step 1 (input=`.`) 후 logits[:10]을 baseline/post 양쪽에서 비교
+   - bit-level diff 위치 식별 → 어느 layer/operation에서 분기되는지 좁힘
+
+### 첫 5 token 비교
+- Baseline: ` Paris`, `.`, ` It`, ` has`, ` a`
+- Post-fix2: ` Paris`, `.`, ` Paris`, ` is`, ` a`
+
+분기점: step 2 (3번째 sampled token). fix1과 동일 위치.
+
+---
+
+## Fix 3: baseline `--no-gpu-plan` 비교 (plan path 가설 검증)
+
+### 가설
+`generate.rs:4347` production decode loop는 OpenCL GPU plan path를 우선 시도:
+```
+if let Some(plan) = ... { model.execute_plan(plan, ...) } else { forward_into(...) }
+```
+- step 0: plan 미빌드 → forward_into (post-fix와 동일)
+- step 1+: plan 빌드 후 execute_plan (post-fix의 forward_into와 numeric divergence)
+
+ModelForward::step은 plan 미사용 → plan path가 step 2 분기의 원인일 가능성.
+
+검증: baseline에 `--no-gpu-plan` flag 추가하여 plan path 비활성화 후 비교.
+
+### baseline binary `--no-gpu-plan` 지원 확인
+✅ baseline binary (`/data/local/tmp/generate_baseline`, 2026-05-17 15:06)는 `--no-gpu-plan` flag 지원.
+helper text: "Disable GPU kernel plan for decode (fallback to forward_into every token)"
+
+### G6 재측정 (32 token, --temperature 0 --top-k 1)
+
+baseline `--no-gpu-plan` (deterministic, 3 run 동일):
+```
+The capital of France is Paris. It has a population of about 2 million people and covers an area of 104 square kilometers (km2). The city is divided into
+```
+
+post-fix2 (greedy, deterministic, 3 run 동일):
+```
+The capital of France is Paris. Paris is a very big city. It has about 2.2 million people. It is also a very old city. It was built in the
+```
+
+#### 첫 5 token 분기 분석
+공통 prefix: ` Paris`, `.` (step 0~1)
+- baseline `--no-gpu-plan` step 2: ` It`
+- post-fix2 step 2: ` Paris`
+
+→ **fix1/fix2와 완전 동일한 분기 위치 (step 2, ` It` vs ` Paris`)**.
+
+### Verdict — G6 FAIL
+**plan path 가설 반증**. baseline의 plan path를 비활성화해도 (`--no-gpu-plan`) baseline과 post-fix2는 step 2부터 다른 토큰 생성.
+
+→ paradigm gap의 원인은 plan path가 **아님**. 양쪽 모두 `forward_into`만 사용하는데도 numeric 차이 발생.
+
+### G7 — 측정 불필요
+G6 FAIL이므로 TBT 비교 무의미. plan path 가설이 반증되어 ModelForward에 plan path 추가 (가상의 4-4.6) 작업은 paradigm gap 해소에 도움 안 됨.
+
+### Determinism 확인 (3 run)
+양쪽 모두 deterministic — baseline `--no-gpu-plan` 3회 동일, post-fix2 3회 동일.
+→ noise 가능성 배제. 코드 path 자체에 차이 존재.
+
+### 본 phase 종결 가능성
+- ❌ plan path 가설: 반증됨 (Fix 3)
+- ❌ prefill_workspace=None 가설: 반증됨 (Fix 1)
+- ❌ KV initial_capacity 가설: 반증됨 (Fix 2)
+
+3가지 fix 시도 모두 step 2 분기를 해소하지 못함. **본 phase는 종결 불가** — paradigm gap의 진짜 원인을 찾기 위해 추가 deep dive 필요.
+
+### 남은 후보 (Fix 2의 후보 1, 2, 4, 5 — 모두 plan path 무관)
+1. **ModelForward::step의 forward_into 인자 정밀 비교**: production fallback (`generate.rs:4388 부근` no-plan branch) vs ModelForward::step 인자 1:1 diff
+2. **decode_workspace lifecycle**: production no-plan path가 step마다 reuse vs ModelForward eager alloc
+3. **KV cache 인스턴스 동일성**: prefill용 KV cache vs decode용 KV cache가 같은 인스턴스인지 (ModelForward 내부에서 새로 생성하면 prefill 결과 손실)
+4. **logits dump 디버그**: step 1 (input=`.`) 후 logits[:10]을 양쪽 path에서 dump하여 bit-level diff 위치 식별
+
+### 측정 데이터 위치
+- /tmp/g6_baseline_noplan.log (baseline --no-gpu-plan)
+- /tmp/g6_postfix_greedy.log (post-fix2 --temperature 0 --top-k 1)
+
+### 권장 다음 sprint
+Fix 4 — `ModelForward::step` 의 `forward_into` 호출 인자를 production no-plan branch와 byte-level diff. 특히:
+- `decode_workspace` ownership/reuse 정책
+- `score_buf` / `decode_logits_buf` aliasing
+- `cache_manager` 호출 위치 (forward 전/후)

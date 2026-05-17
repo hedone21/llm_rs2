@@ -1,19 +1,30 @@
-# Handoff: Phase 4-4 종료 → Phase 4-4.5 (paradigm 통일) + 4-5 (chat 재작성) 진입
+# Handoff: Phase 4-4.5 paradigm 통일 진행중 → 4-4.6 paradigm equivalence 진입
 
 **작성**: 2026-05-17
-**갱신**: 2026-05-17 (Phase 4-4 a/b/d 종료, paradigm mismatch는 4-4.5로 분리)
-**HEAD**: `6953b200 docs(experiment): Phase 4-4-b S25 paradigm mismatch split to 4-4.5`
-**다음 세션 진입 문장 (사용자)**: "Phase 4-4.5 진행" 또는 "DecodeLoop paradigm 통일"
+**갱신**: 2026-05-17 (Phase 4-4.5 paradigm 시그니처 통일 commit 3건, equivalence 미해소)
+**HEAD**: `57c0effd fix(session): Phase 4-4.5 KV cache initial_capacity 정합 (production 공식)`
+**다음 세션 진입 문장 (사용자)**: "4-4.6 paradigm equivalence 진행" 또는 "paradigm gap 깊이 분석"
 
 ---
 
 ## TL;DR
 
-**Phase 4-4 a/b/d 종료** (4 commits: `886f0404` + `26e1ca87` + `e83b87d2` + `6953b200`). `session/assembly/build_standard_loop` 헬퍼 신설 + `bin/generate.rs` line 3032에 narrow happy path 분기 추가 (DecodeLoop+ModelForward 위임). 호스트 CPU Qwen 1.5B Q4_0 정상 디코딩 PASS, S25 OpenCL 분기 진입 + 32 토큰 생성 정상 동작 확인.
+**Phase 4-4.5 paradigm 시그니처 통일 완성** (3 commits: `6292a9d0` + `7f7c6856` + `57c0effd`). `DecodeLoop::prefill -> Result<Vec<f32>>`, `DecodeLoop::run(budget, first_token)`, `ModelForward::prefill` chunked, `build_standard_loop`에 `initial_kv_capacity` 인자, happy path 블록에 TBT 출력. 호스트 게이트 PASS (release build / 21 session unit test / layer_lint diff 0).
 
-**중대 발견**: S25 OpenCL 비교에서 token sequence baseline 불일치 → 원인 = `DecodeLoop::prefill(tokens) -> Result<()>` paradigm mismatch (Phase 4-3 인지된 issue가 production-level에서 발현). `prev_token = tokens.last()` 설정으로 첫 step에서 prompt 마지막 token이 **2회 forward**. **사용자 결정 (Q5-B)**: Phase 4-4.5 sprint로 paradigm 통일 분리, 4-4-b의 G6 bit-identical 게이트 완화.
+**중대 미해소 회귀**: S25 OpenCL 측정에서 **G6 bit-identical FAIL — decode step 1부터 분기**:
+- Baseline (production fallback, `--no-gpu-plan` 포함): `Paris. It has a...`
+- Post-fix (happy path): `Paris. Paris is a...`
+- 첫 sample (`Paris`)과 step 0 output (`.`) 일치 → prefill numeric OK
+- step 1 (input=`.`)부터 분기 → decode 경로의 numeric divergence
 
-**다음**: **Phase 4-4.5 — DecodeLoop paradigm 통일** (`prefill -> Result<Vec<f32>>` + `run(budget, first_token)`) + ModelForward chunked prefill 지원 + optional collector wiring. 그 후 G8 디바이스 재측정 (S25 OpenCL bit-identical + Δ ≤ 5%).
+**3 fix 모두 반증** (단 각 fix는 paradigm 정합성에 기여):
+1. `prefill_workspace: None` (production owned ws 일치) — step 1 분기 그대로
+2. `initial_kv_capacity` production 공식 (128 vs 512) — step 1 분기 그대로
+3. baseline `--no-gpu-plan` 비교 (forward_into만, plan path 제외) — step 1 분기 그대로
+
+**G7 보류** (G6 FAIL): n=1 참고치 Decode +7.7% / Avg TBT +8.1%, 5-run median 미측정.
+
+**다음**: **Phase 4-4.6 — paradigm equivalence 깊이 분석** (`ModelForward::step` byte-level diff + step 1 logits[:10] dump + KV buffer zero-init + GPU alloc 순서 검증).
 
 **main() ≤ 400 LOC 게이트 보류**: 실측 main() 본체 = line 77~6257 = **6,180 LOC**. eval-ll / ppl / batch 분기들이 inline body로 남아 있어 Phase 4-5 분기 추출 + Phase 4-4.5 happy path 확장 완료 후 달성 가능.
 
@@ -42,8 +53,71 @@
 | 4-2 trait + Builder | ✅ commits `85ff756c`~`584496b7` | `session/{traits, defaults, decode_loop}.rs`, trybuild INV-LAYER-006/007 |
 | **4-3 ModelForward + microbench** | ✅ 호스트 + S25 / ⏳ Jetson 보충 | C1 `3470ad1d` + C2 `f5236073` + C3 `c63190d1` + handoff `7619ae9d` + S25 `debf4e1f`. **호스트 CPU Δ=1.53%, S25 OpenCL Δ=2.29%, 둘 다 bit-identical**. |
 | **4-4 main() 조립자화** | ✅ a/b/d (c skip) | `886f0404` 헬퍼 + `26e1ca87` 시그니처 + `e83b87d2` happy path 분기 + `6953b200` paradigm split doc. main() ≤ 400 LOC 게이트 보류 (실측 6,180 LOC) |
-| **4-4.5 paradigm 통일** | ⏳ **ready (진입 가능)** | `DecodeLoop::prefill -> Result<Vec<f32>>` + `run(budget, first_token)` + ModelForward chunked + collector wiring |
+| **4-4.5 paradigm 시그니처** | ✅ 시그니처 / ❌ equivalence | 3 commits `6292a9d0`+`7f7c6856`+`57c0effd`. 호스트 PASS, S25 OpenCL G6 FAIL (step 1 분기, 3 fix 반증) |
+| **4-4.6 paradigm equivalence** | ⏳ **ready (진입 가능)** | byte-level diff + KV zero-init + logits dump |
 | 4-5 chat 전면 재작성 | ⏳ blocked | ChatTurnExec 폐기, `session/chat/{repl,turn,stop_condition}.rs`, V-11 해소 |
+
+---
+
+## Phase 4-4.5 진척 (3 commits)
+
+| Commit | 내용 | 동기 |
+|---|---|---|
+| `6292a9d0` | `DecodeLoop::prefill -> Result<Vec<f32>>`, `run(budget, first_token)`, `ModelForward::prefill` chunked (derive_chunk_size), generate.rs:3046 호출자 재작성 + 256 가드 제거 | paradigm 시그니처 통일 (Phase 4-3의 last logits 누락 issue 해소) |
+| `7f7c6856` | `ModelForward::prefill`의 forward_into 인자 `prefill_workspace: None` (production owned 자동 alloc path 사용) + happy path 블록에 TTFT/Decode/Avg TBT 출력 (production format) | paradigm equivalence fix 시도 #1 + G7 측정 가능화 |
+| `57c0effd` | `build_standard_loop` 시그니처에 `initial_kv_capacity` 인자 추가, generate.rs main()의 production 공식 결과 (128) 위임 | paradigm equivalence fix 시도 #2 |
+
+## 측정 데이터 (S25 OpenCL Qwen 2.5 1.5B Q4_0)
+
+`papers/eurosys2027/_workspace/experiment/phase4_4_5_s25_paradigm_unified_2026_05_17.md` (297 lines):
+- Fix 1 (prefill_workspace=None): G6 FAIL — `Paris. Paris is a...` (post) vs `Paris. It has a...` (baseline)
+- Fix 2 (KV capacity 128): G6 FAIL — 동일 분기 위치
+- Fix 3 (baseline `--no-gpu-plan`): G6 FAIL — plan path 가설 반증
+- 공통: step 0 (first_token=`Paris`) + step 1 output (`.`)까지 일치, step 2 (input=`.`의 forward)부터 분기
+- n=1 참고치: Decode 27.83 → 29.97 ms/tok (+7.7%), TBT 29.53 → 31.91 ms (+8.1%)
+
+## Phase 4-4.6 fix 후보 (priority 순)
+
+| Pri | Fix | 작업 LOC | 검증 비용 |
+|---|---|---|---|
+| **P1** | **KV cache buffer zero-init** (`alloc_standard_kv_caches`에서 alloc 후 backend.write_buffer로 zero-fill). OpenCL alloc은 garbage 상태 (`memory.rs:42` 확인). production과 다른 GPU memory pool 영역 alloc 시 다른 garbage → attention mask 외 영역 영향 가능 | +20 LOC | 디바이스 1회 |
+| **P2** | **step 1 logits[:10] dump** — ModelForward::step에 #[cfg(feature="decode-dump")] 분기로 첫 step 후 logits 첫 10개 stderr 출력. baseline에도 동일 dump (env flag). bit-level diff 위치 식별 | +30 LOC | 디바이스 1회 |
+| **P3** | **GPU buffer alloc 순서 일치** — ModelForward::new의 alloc 순서를 production fallback path와 일치 (현재: decode_workspace → decode_input → x_gen → 2× logits → KV. production: KV → ... → x_gen → gen_ws). LayerWorkspace::new 안 9개 buffer 순서까지 동일하게 | +50 LOC (struct 필드 재배치) | 디바이스 1회 |
+| **P4** | **ModelForward::step `forward_into` 인자 byte-level diff** — happy path 가드 None 인자들이 다 None인 것은 확인, 그러나 `memory: &dyn Memory` trait object의 vtable identity가 다를 가능성 (decode_mem vs self.memory). Memory trait의 `used_memory()` 부수 효과 확인 | +5 LOC + log | 디바이스 1회 |
+| **P5** | **decode_workspace shape/내부 state** — LayerWorkspace::new 안의 `scores: vec![0.0; n_heads * max_seq_len]` 값이 prefill 후 production은 어떻게 변하는가? attention kernel이 score 누적하는가? | 분석 | (분석만) |
+
+권장 순서: P1 → 1회 측정. PASS이면 4-4.6 종료. FAIL이면 P2 (logits dump)로 분기 위치 정확히 식별 후 P3/P4 fix.
+
+## 측정 절차 (재현용)
+
+```bash
+# Baseline binary는 디바이스에 이미 (HEAD pre-4-4 또는 6a224c9f)
+adb -s R3CY408S5SB shell 'ls -la /data/local/tmp/generate_baseline'
+
+# Post-fix binary push
+python scripts/run_device.py -d galaxy_s25 --skip-exec generate
+
+# G6 측정 — temperature 0 + top-k 1 (deterministic, baseline은 --no-gpu-plan 추가)
+adb -s R3CY408S5SB shell 'cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ./generate_baseline \
+    --model-path /data/local/tmp/qwen2.5-1.5b-q4_0.gguf \
+    --tokenizer-path /data/local/tmp/qwen-tokenizer.json \
+    --backend opencl --prompt "The capital of France is" \
+    --num-tokens 32 --max-seq-len 512 --temperature 0 --top-k 1 --no-gpu-plan'
+
+adb -s R3CY408S5SB shell 'cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ./generate \
+    --model-path /data/local/tmp/qwen2.5-1.5b-q4_0.gguf \
+    --tokenizer-path /data/local/tmp/qwen-tokenizer.json \
+    --backend opencl --prompt "The capital of France is" \
+    --num-tokens 32 --max-seq-len 512'
+```
+
+happy path 진입 확인 라인 (post에만): `[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=32)`
+
+## 위험 / 주의
+
+- **dead code 잔존**: `ModelForward`의 `prefill_workspace`, `max_seq_len` 필드와 `ensure_prefill_workspace` 메서드에 `#[allow(dead_code)]` 처리됨. paradigm equivalence 통과 + caller-reuse 재도입 시점에 cleanup. 또는 fix 후보 결정 후 제거.
+- **3 fix가 paradigm 시그니처 정합성 자체는 개선**: revert 비권장. equivalence만 추가 작업.
+- **alloc 순서 일치 (P3)**가 가장 큰 변경 가능. struct 필드 순서까지 갈 수 있음 — Phase 4-4.6 별도 sprint scope.
 
 ---
 
