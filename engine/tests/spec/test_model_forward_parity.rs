@@ -169,8 +169,7 @@ fn direct_path_tokens(
     let x_gen_buf = memory.alloc(hidden * 4, DType::F32).unwrap();
     let mut x_gen = Tensor::new(Shape::new(vec![1, 1, hidden]), x_gen_buf, backend.clone());
     let decode_input_buf = memory.alloc(4, DType::U8).unwrap();
-    let mut decode_input =
-        Tensor::new(Shape::new(vec![1, 1]), decode_input_buf, backend.clone());
+    let mut decode_input = Tensor::new(Shape::new(vec![1, 1]), decode_input_buf, backend.clone());
     let decode_logits_buf = memory.alloc(vocab * 4, DType::F32).unwrap();
     let mut decode_logits = Tensor::new(
         Shape::new(vec![1, 1, vocab]),
