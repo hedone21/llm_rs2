@@ -1,7 +1,7 @@
-# Phase 4-3 vtable microbench — host CPU baseline
+# Phase 4-3 vtable microbench — host CPU baseline + S25 OpenCL
 
 **Date**: 2026-05-17
-**Phase**: 4-3 C3 (probe_inference_loop microbench)
+**Phase**: 4-3 C3 (probe_inference_loop microbench) + C4 (디바이스)
 **HEAD**: `c63190d1 feat(session): probe_inference_loop microbench (Phase 4-3 C3)`
 **Bench binary**: `engine/src/bin/probe_inference_loop.rs`
 
@@ -54,36 +54,75 @@ Tester (`/deploy-test` + `/profile`) 별도 위임.
   logits read-back이 직접 호출과 동등. paradigm은 양 path가 DecodeLoop 방식
   (prompt-last를 first step에 재입력) 통일.
 
-## 다음 측정 (Tester C4)
+## S25 OpenCL 환경
 
-| Device | Backend | 모델 | gen | runs | 게이트 |
-|---|---|---|---:|---:|---|
-| Galaxy S25 | `--backend opencl` (Adreno) | Qwen2.5-1.5b-Q4_0 | 32 | 5 | bit-identical + Δ≤5% |
-| Jetson Xavier | `--backend cuda` | Qwen2.5-1.5b-Q4_0 | 32 | 5 | bit-identical + Δ≤5% |
+- Galaxy S25 (R3CY408S5SB), Adreno 830 (Snapdragon 8 Elite)
+- Cross-compile: `cargo build --release --features opencl,vulkan,qnn --no-default-features --target aarch64-linux-android --bin probe_inference_loop`
+- 모델: `/data/local/tmp/qwen2.5-1.5b-q4_0.gguf` (pure Q4_0, Q6_K 없는 변형)
+- Tokenizer: `/data/local/tmp/qwen-tokenizer.json` (호스트에서 push)
+- Backend: `--backend opencl` (Adreno)
+- KV dtype: `f16`, max_seq_len: 512
 
-S25 명령:
+### S25 명령
+
 ```bash
-python scripts/run_device.py -d s25 probe_inference_loop -- \
-    --model-path /data/local/tmp/Qwen2.5-1.5b-Q4_0.gguf \
-    --tokenizer-path /data/local/tmp/tokenizer.json \
-    --backend opencl --gen 32 --runs 5 --max-seq-len 512
+adb -s R3CY408S5SB shell 'cd /data/local/tmp && \
+  LD_LIBRARY_PATH=/data/local/tmp ./probe_inference_loop \
+    --model-path /data/local/tmp/qwen2.5-1.5b-q4_0.gguf \
+    --tokenizer-path /data/local/tmp/qwen-tokenizer.json \
+    --backend opencl --gen 32 --runs 5 --max-seq-len 512'
 ```
 
-Jetson (보드 내 빌드):
+### S25 결과 (gen=32, runs=5)
+
+| 메트릭 | DecodeLoop path | Direct forward_into | Δ |
+|---|---:|---:|---:|
+| avg_tbt_ms | **33.18** | **32.44** | **+2.29%** |
+| tok0_ms | 118.61 | 116.48 | +1.83% |
+| total_ms | 1061.84 | 1038.11 | +2.29% |
+| tokens (32) | identical | identical | **bit-identical** |
+
+토큰 시퀀스 (32 토큰 양 path 동일):
+`[12095, 13, 576, 6722, 315, 9625, 374, 12095, ...반복...]`
+
+**Verdict**: `PASS` (`delta_pct=2.29% ≤ 5%` AND `bit_identical_first_n=true`).
+
+## Jetson CUDA (pending)
+
+Jetson Orin은 본 호스트의 `~/.ssh/config`에 `jetson` alias가 미등록 → 보드 내
+직접 빌드 + 측정 필요. 별도 task로 분리. PASS 게이트 동일 (`Δ≤5%` +
+`bit_identical_first_n`).
+
+권장 명령 (보드 내):
 ```bash
-ssh jetson 'cd llm_rs2 && cargo build --release --bin probe_inference_loop \
-    --features cuda-embedded \
-    && ./target/release/probe_inference_loop --backend cuda \
-       --model-path Qwen2.5-1.5b-Q4_0.gguf --tokenizer-path tokenizer.json \
-       --gen 32 --runs 5 --max-seq-len 512'
+cargo build --release --bin probe_inference_loop --features cuda-embedded
+./target/release/probe_inference_loop --backend cuda \
+    --model-path qwen2.5-1.5b-q4_0.gguf --tokenizer-path tokenizer.json \
+    --gen 32 --runs 5 --max-seq-len 512
 ```
 
-회귀 ≥ 5% 시: arch §7.3 escape hatch — `DecodeLoop<F: Forward, T: TokenSampler>`
-부분 generic화 PoC + 재측정.
+## 종합 평가
+
+| Device/Backend | Δ% | bit-identical | Verdict |
+|---|---:|:---:|:---:|
+| Host CPU (x86_64 AVX2) | 1.53% | true | PASS |
+| S25 Adreno OpenCL | **2.29%** | **true (32 toks)** | **PASS** |
+| Jetson CUDA | — | — | pending |
+
+vtable indirect call overhead가 양 측정 환경에서 게이트(5%) 통과. GPU forward가
+무거워질수록 vtable 비율 묻힘 효과가 작아질 줄 알았으나, 실측은 호스트 1.53%,
+S25 OpenCL 2.29%로 S25에서 약간 더 큼. 가설:
+- 디바이스 GPU forward TBT (~33 ms) 자체가 호스트 CPU TBT (~60 ms)보다 절반 →
+  분모가 작으니 vtable absolute 비용의 비율이 더 크게 보임
+- 양쪽 모두 5%의 1/2 이내 — escape hatch 불필요 확정
+
+회귀 ≥ 5% 가능성 거의 없으므로 **Phase 4-4 main() 조립자화 진입 가능** (Jetson
+측정은 후속 보충).
 
 ## 한계
 
-- gen=4 단발 (runs=1) — 디바이스 측정에선 gen=32, runs=5로 medians 사용
+- 호스트 CPU 측정은 gen=4 단발 (sanity), S25는 gen=32 runs=5 (정식)
+- Jetson CUDA 미측정 (SSH alias 미설정, 별도 task)
 - 호스트 CPU는 production 대상이 아니므로 본 baseline은 "sanity 통과" 의미만
 - `DecodeLoop::prefill`이 `()` 반환 → direct path도 DecodeLoop paradigm
   (prompt-last 두 번 forward) 사용. production decode 패턴 (prefill last logits
