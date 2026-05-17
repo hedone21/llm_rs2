@@ -3030,6 +3030,50 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    //  PHASE 4-4-b: standard happy path → DecodeLoop+ModelForward 위임
+    // ════════════════════════════════════════════════════════════════════════
+    // Narrow guard (assembly::is_standard_happy_path 참조):
+    //   - profile / qcf_dump / skip_ratio / d2o_layer_alloc / eviction 비활성
+    //   - prompt 길이 ≤ 256 (chunked prefill 미지원, Phase 4-4.5에서 흡수)
+    //   - prefill_chunk_size 미지정 또는 prompt 이상
+    // 미통과 args는 아래 fallback path (Inference profiler ~ main 끝)를 사용.
+    const MAX_NON_CHUNKED_PREFILL_LEN: usize = 256;
+    if llm_rs2::session::is_standard_happy_path(&args)
+        && tokens.len() <= MAX_NON_CHUNKED_PREFILL_LEN
+        && (args.prefill_chunk_size == 0 || args.prefill_chunk_size >= tokens.len())
+    {
+        eprintln!(
+            "[Phase4-4-b] standard happy path → DecodeLoop+ModelForward (tokens={}, budget={})",
+            tokens.len(),
+            args.num_tokens
+        );
+        let mut decode_loop = llm_rs2::session::build_standard_loop(
+            backend.clone(),
+            memory.clone(),
+            cpu_backend_arc.clone(),
+            model,
+            max_seq_len,
+            kv_type,
+        )?;
+        decode_loop.prefill(&tokens)?;
+        let result = decode_loop.run(args.num_tokens)?;
+
+        let mut final_tokens: Vec<u32> = tokens.clone();
+        final_tokens.extend_from_slice(&result.tokens_generated);
+        let decoded = tokenizer
+            .decode(&final_tokens, true)
+            .unwrap_or_else(|_| String::from("[decode error]"));
+        println!("{}", decoded);
+        eprintln!(
+            "[Phase4-4-b] generated={} stopped_by={:?} final_pos={}",
+            result.tokens_generated.len(),
+            result.stopped_by,
+            result.final_pos
+        );
+        return Ok(());
+    }
+
     // Inference profiler (activated by either --profile or --profile-events).
     // Declared before prefill so PrefillOpProfiler can be populated.
     //
