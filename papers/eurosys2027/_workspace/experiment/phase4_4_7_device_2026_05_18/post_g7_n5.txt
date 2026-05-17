@@ -1,0 +1,15 @@
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=32)
+Avg TBT: 32.09 ms (31.2 tokens/sec)
+[Phase4-4.5] generated=32 (first=12095 + run=31) stopped_by=BudgetExhausted final_pos=36
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=32)
+Avg TBT: 32.01 ms (31.2 tokens/sec)
+[Phase4-4.5] generated=32 (first=12095 + run=31) stopped_by=BudgetExhausted final_pos=36
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=32)
+Avg TBT: 32.06 ms (31.2 tokens/sec)
+[Phase4-4.5] generated=32 (first=12095 + run=31) stopped_by=BudgetExhausted final_pos=36
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=32)
+Avg TBT: 32.12 ms (31.1 tokens/sec)
+[Phase4-4.5] generated=32 (first=12095 + run=31) stopped_by=BudgetExhausted final_pos=36
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=32)
+Avg TBT: 31.61 ms (31.6 tokens/sec)
+[Phase4-4.5] generated=32 (first=12095 + run=31) stopped_by=BudgetExhausted final_pos=36
