@@ -3,6 +3,7 @@
 //! Extracted from `generate.rs` to enable unit testing and reuse.
 
 /// Configuration for token sampling.
+#[derive(Clone)]
 pub struct SamplingConfig {
     pub temperature: f32,
     pub top_p: f32,

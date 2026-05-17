@@ -109,6 +109,11 @@ pub trait CommandSource {
 /// Token sampler. Default impl `GreedySampler` in [`super::defaults`].
 pub trait TokenSampler {
     fn sample(&mut self, ctx: &StepCtx, logits: &[f32]) -> u32;
+
+    /// Phase 4-4.7: stateful samplers (rep penalty, n-gram blocking, ...)이
+    /// 최근 토큰을 ring buffer로 유지하기 위한 hook. Default no-op이라
+    /// [`super::defaults::GreedySampler`] 등 stateless impl은 변경 불필요.
+    fn observe_token(&mut self, _token: u32) {}
 }
 
 /// Decode-loop observer. All hooks are no-op by default; implement only what

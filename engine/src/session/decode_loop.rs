@@ -86,6 +86,10 @@ impl DecodeLoop {
     /// responsible for prepending `first_token` to the final output sequence.
     pub fn run(&mut self, budget: usize, first_token: u32) -> anyhow::Result<DecodeResult> {
         self.prev_token = first_token;
+        // Phase 4-4.7: stateful samplers (RepetitionPenaltySampler 등)이 production
+        // fallback `tokens.push(first_token)`과 동치 history를 갖도록 첫 토큰을 통보.
+        // [`super::defaults::GreedySampler`]는 default no-op이라 무영향.
+        self.sampler.observe_token(first_token);
         let stop = Arc::clone(&self.stop_flag);
         let mut generated = Vec::with_capacity(budget);
         let mut stopped_by = StopReason::BudgetExhausted;
@@ -172,6 +176,10 @@ impl DecodeLoop {
                 &stop,
             );
             let sampled = self.sampler.sample(&ctx, &logits);
+            // Phase 4-4.7: sample 직후 history 갱신. production fallback에서
+            // `tokens.push(next_token_id)`가 다음 step의 rep window에 들어가는
+            // 것과 동치.
+            self.sampler.observe_token(sampled);
 
             // (g) observers
             let ctx = step_ctx(
@@ -397,6 +405,43 @@ mod tests {
             .build();
         let result = loop_.run(3, 7).unwrap();
         assert_eq!(result.tokens_generated, vec![0, 0, 0]);
+    }
+
+    /// Phase 4-4.7: TokenSampler::observe_token이 run() 진입 시 first_token 1회 +
+    /// 매 step sampled 1회씩 호출되는지 검증. C2 (prompt seeding) 진입 후에는
+    /// prefill 단계에서도 prompt 길이만큼 추가 호출되므로 expected가 갱신될 예정.
+    #[test]
+    fn observe_token_invoked_on_first_and_each_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+        struct CountingSampler {
+            observe_count: Arc<AtomicUsize>,
+            next: u32,
+        }
+        impl TokenSampler for CountingSampler {
+            fn sample(&mut self, _ctx: &StepCtx, _logits: &[f32]) -> u32 {
+                let t = self.next;
+                self.next = self.next.wrapping_add(1);
+                t
+            }
+            fn observe_token(&mut self, _token: u32) {
+                self.observe_count.fetch_add(1, AtomicOrd::Relaxed);
+            }
+        }
+        let observe_count = Arc::new(AtomicUsize::new(0));
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_sampler(CountingSampler {
+                observe_count: observe_count.clone(),
+                next: 0,
+            })
+            .build();
+        let _ = loop_.prefill(&[1, 2, 3]).unwrap();
+        let _ = loop_.run(3, 7).unwrap();
+        // first_token=7 (1회) + sampled 3회 = 4. (C2 prompt seeding 활성 후 +3)
+        assert_eq!(observe_count.load(AtomicOrd::Relaxed), 4);
     }
 
     #[test]
