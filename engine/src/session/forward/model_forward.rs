@@ -41,7 +41,13 @@ pub struct ModelForward {
     kv_caches: Vec<KVCache>,
 
     decode_workspace: LayerWorkspace,
+    // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
+    // in `forward_into` args so production owned-ws path is hit. These two
+    // fields are kept for future caller-reuse re-enable after the regression
+    // is closed; suppress the dead-code lint until then.
+    #[allow(dead_code)]
     prefill_workspace: Option<PrefillWorkspace>,
+    #[allow(dead_code)]
     max_seq_len: usize,
 
     // Owned single-token decode input + per-token x_gen scratch + logits.
@@ -147,6 +153,7 @@ impl ModelForward {
     /// Lazy allocator for `prefill_workspace` with a seq_len realloc guard
     /// (Phase 4-3 §R4). Reuses the existing workspace when its capacity is
     /// already ≥ `seq_len`; otherwise drops and re-allocates.
+    #[allow(dead_code)] // Phase 4-4.5: see struct comment.
     fn ensure_prefill_workspace(&mut self, seq_len: usize) -> Result<()> {
         let needs_alloc = match self.prefill_workspace.as_ref() {
             None => true,
@@ -211,10 +218,10 @@ impl Forward for ModelForward {
         }
         let seq_len = tokens.len();
         let chunk_size = self.derive_chunk_size(seq_len);
-        // PrefillWorkspace sized for the largest chunk — single allocation
-        // reused across all chunks, avoiding the seq_len-scale memory spike
-        // that previously gated the happy path at 256 tokens.
-        self.ensure_prefill_workspace(chunk_size)?;
+        // Phase 4-4.5: pass `prefill_workspace: None` so `forward_into` allocates
+        // its own owned workspace per chunk — matches the production prefill
+        // path (`generate.rs:3371`) bit-for-bit. The caller-reuse optimisation
+        // is deferred until the paradigm-equivalence regression is closed.
 
         let mut chunk_start = 0;
         while chunk_start < seq_len {
@@ -230,10 +237,6 @@ impl Forward for ModelForward {
             // forward_into call; the raw pointer is dereferenced only on the
             // current stack frame.
             let memory: &dyn Memory = unsafe { &*memory_ref };
-            let prefill_ws = self
-                .prefill_workspace
-                .as_mut()
-                .expect("ensure_prefill_workspace populates prefill_workspace");
 
             self.model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
@@ -244,7 +247,7 @@ impl Forward for ModelForward {
                 logits_out: &mut self.logits_prefill_last,
                 x_gen: None,
                 workspace: None,
-                prefill_workspace: Some(prefill_ws),
+                prefill_workspace: None,
                 score_accumulator: None,
                 profiler: None,
                 skip_config: None,

@@ -3051,14 +3051,20 @@ fn main() -> anyhow::Result<()> {
             max_seq_len,
             kv_type,
         )?;
+        let t_prefill = std::time::Instant::now();
         let last_logits = decode_loop.prefill(&tokens)?;
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+
         let first_token = last_logits
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
+
+        let t_decode = std::time::Instant::now();
         let result = decode_loop.run(args.num_tokens - 1, first_token)?;
+        let decode_total_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
 
         let mut final_tokens: Vec<u32> = tokens.clone();
         final_tokens.push(first_token);
@@ -3067,13 +3073,34 @@ fn main() -> anyhow::Result<()> {
             .decode(&final_tokens, true)
             .unwrap_or_else(|_| String::from("[decode error]"));
         println!("{}", decoded);
+
+        // Match production `Decode:` / `Avg TBT:` log format (generate.rs:6172,
+        // 6198) so Tester device measurements share one parser.
+        let decode_tokens = result.tokens_generated.len();
+        let total_gen = 1 + decode_tokens;
+        let decode_per_tok = if decode_tokens > 0 {
+            decode_total_ms / decode_tokens as f64
+        } else {
+            0.0
+        };
+        let avg_tbt = (prefill_ms + decode_total_ms) / total_gen as f64;
+        println!("TTFT: {:.2} ms", prefill_ms);
+        if decode_tokens > 0 {
+            println!(
+                "Decode: {:.2} ms/tok ({:.1} tok/s) [{} tokens]",
+                decode_per_tok,
+                1000.0 / decode_per_tok.max(0.001),
+                decode_tokens,
+            );
+        }
+        println!(
+            "Avg TBT: {:.2} ms ({:.1} tokens/sec)",
+            avg_tbt,
+            1000.0 / avg_tbt.max(0.001),
+        );
         eprintln!(
             "[Phase4-4.5] generated={} (first={} + run={}) stopped_by={:?} final_pos={}",
-            1 + result.tokens_generated.len(),
-            first_token,
-            result.tokens_generated.len(),
-            result.stopped_by,
-            result.final_pos
+            total_gen, first_token, decode_tokens, result.stopped_by, result.final_pos
         );
         return Ok(());
     }
