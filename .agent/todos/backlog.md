@@ -4,6 +4,22 @@
 
 ---
 
+## [P2] llm_rs2 lib clippy 회귀 — doc_lazy_continuation 29건 + unsafe pointer 1건 — 2026-05-18 등록 (Phase 4-D 게이트 도중 발견)
+- **Status**: TODO (Phase 4-D scope 외, 게이트 통과 위해 일시 우회)
+- **증상**: `cargo clippy -p llm_rs2 --lib -- -D warnings` 실패. 30개 deny 처리됨.
+- **위치**:
+  - `engine/src/core/qcf/layer_importance.rs:310, 394`
+  - `engine/src/models/weights/async_swap.rs:253`
+  - `engine/src/models/weights/noise_table.rs:627, 750, 754, 784, 939, 954, 962, 966`
+  - `engine/src/models/weights/phase_aware_swap.rs:599`
+  - `engine/src/models/weights/swap_executor.rs:652, 661, 675`
+  - `engine/src/session/chat/repl.rs:156`
+  - `engine/src/session/cli.rs:852, 853, 854, 855, 899, 900, 903, 904, 905`
+  - 1건 `this public function might dereference a raw pointer but is not marked unsafe`
+- **원인**: 최근 PR들이 doc 추가 시 lazy_continuation 회피 미적용. clippy gate가 통과 안 되는 master 상태에서 새 PR 머지가 누적됨.
+- **수정**: `///`의 multi-line continuation을 indent 4-space로 정렬. unsafe pointer는 `unsafe fn` marking 또는 `&self` 변경.
+- **영향**: 4-D 가 sanity gate 일부를 `cargo check --bins`로 좁힘. 본 backlog 해결 후 `cargo clippy --workspace --bins -- -D warnings` 게이트 복원 가능.
+
 ## [P1] Qwen2.5-1.5b chat 모드 garbage 출력 — Phase 4-5 baseline 회귀 (Phase 4-4.10에 이미 존재) — 2026-05-18 등록
 - **Status**: TODO (Phase 4-5 디바이스 게이트 도중 발견, 본 sprint 책임 외)
 - **재현**: Galaxy S25 R3CY408S5SB, qwen2.5-1.5b-q4_0.gguf, `--backend opencl --chat --system-prompt "You are concise." --prompt "Capital of France?" --num-tokens 16 --max-seq-len 512 --greedy --repetition-penalty 1.1`
