@@ -729,7 +729,7 @@ mod tests {
     }
 
     impl Forward for MockSeqForward {
-        fn prefill(&mut self, _tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        fn prefill(&mut self, _tokens: &[u32], _start_pos: usize) -> anyhow::Result<Vec<f32>> {
             let mut logits = vec![0.0f32; self.vocab];
             logits[0] = 1.0;
             Ok(logits)

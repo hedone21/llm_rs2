@@ -246,7 +246,7 @@ fn wrapper_path_tokens(
     )
     .unwrap();
 
-    let first_logits = mf.prefill(prompt_tokens).unwrap();
+    let first_logits = mf.prefill(prompt_tokens, 0).unwrap();
     let mut generated = Vec::with_capacity(budget);
     let mut prev = greedy_argmax(&first_logits);
     generated.push(prev);

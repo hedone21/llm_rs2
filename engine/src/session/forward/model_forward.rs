@@ -299,7 +299,7 @@ impl ModelForward {
 }
 
 impl Forward for ModelForward {
-    fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+    fn prefill(&mut self, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             anyhow::bail!("ModelForward::prefill received zero tokens");
         }
@@ -327,7 +327,7 @@ impl Forward for ModelForward {
 
             self.model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
-                start_pos: chunk_start,
+                start_pos: start_pos + chunk_start,
                 kv_caches: &mut self.kv_caches,
                 backend: &backend,
                 memory,

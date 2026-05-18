@@ -63,7 +63,8 @@ impl DecodeLoop {
     /// staged from `tokens.last()` for `on_prefill_end` observer context only;
     /// [`Self::run`] overwrites it with `first_token`.
     pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
-        let logits = self.forward.prefill(tokens)?;
+        let start_pos = self.pos;
+        let logits = self.forward.prefill(tokens, start_pos)?;
         self.pos += tokens.len();
         self.prev_token = *tokens.last().unwrap_or(&0);
         // Phase 4-4.7: production fallback (generate.rs)이
@@ -501,7 +502,7 @@ mod tests {
     }
 
     impl Forward for MockForward {
-        fn prefill(&mut self, _tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        fn prefill(&mut self, _tokens: &[u32], _start_pos: usize) -> anyhow::Result<Vec<f32>> {
             let mut logits = vec![0.0_f32; self.vocab];
             logits[0] = 1.0;
             Ok(logits)
@@ -623,8 +624,8 @@ mod tests {
             prunes: usize,
         }
         impl Forward for CountingForward {
-            fn prefill(&mut self, t: &[u32]) -> anyhow::Result<Vec<f32>> {
-                self.mock.prefill(t)
+            fn prefill(&mut self, t: &[u32], start_pos: usize) -> anyhow::Result<Vec<f32>> {
+                self.mock.prefill(t, start_pos)
             }
             fn step(&mut self, c: &StepCtx, t: u32) -> anyhow::Result<Vec<f32>> {
                 self.mock.step(c, t)

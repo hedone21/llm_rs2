@@ -6,7 +6,7 @@ use llm_rs2::session::{DecodeLoopBuilder, Forward, StepCtx};
 struct Dummy;
 
 impl Forward for Dummy {
-    fn prefill(&mut self, _tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+    fn prefill(&mut self, _tokens: &[u32], _start_pos: usize) -> anyhow::Result<Vec<f32>> {
         Ok(vec![0.0; 4])
     }
     fn step(&mut self, _ctx: &StepCtx, _token: u32) -> anyhow::Result<Vec<f32>> {

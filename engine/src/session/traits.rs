@@ -65,8 +65,12 @@ pub struct DecodeResult {
 /// `finalize` and `on_kv_prune` are default no-ops so a minimal Forward
 /// implementation needs only `prefill` + `step`.
 pub trait Forward {
-    /// Run prefill over `tokens`. Returns logits for the last token.
-    fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>>;
+    /// Run prefill over `tokens` starting at KV position `start_pos`.
+    /// Returns logits for the last token.
+    ///
+    /// `start_pos`는 chat multi-turn에서 turn 사이 KV 누적 보존을 위해 필수.
+    /// non-chat 모드에선 caller가 0 전달 (단일 prefill).
+    fn prefill(&mut self, tokens: &[u32], start_pos: usize) -> anyhow::Result<Vec<f32>>;
 
     /// Decode 1 step. After return, `pos` is conceptually advanced by 1.
     fn step(&mut self, ctx: &StepCtx, token: u32) -> anyhow::Result<Vec<f32>>;
