@@ -446,6 +446,37 @@ impl Forward for ModelForward {
         }
         Ok(())
     }
+
+    fn try_evict(
+        &mut self,
+        cache_manager: &crate::core::cache_manager::CacheManager,
+        scores: Option<&[f32]>,
+        force: bool,
+        target_ratio: f32,
+    ) -> anyhow::Result<(usize, usize)> {
+        let before_pos = self.kv_caches.first().map(|c| c.current_pos).unwrap_or(0);
+
+        let result = if force {
+            match scores {
+                Some(sc) => {
+                    cache_manager.force_evict_with_scores(&mut self.kv_caches, target_ratio, sc)?
+                }
+                None => cache_manager.force_evict(&mut self.kv_caches, target_ratio)?,
+            }
+        } else {
+            match scores {
+                Some(sc) => cache_manager.maybe_evict_with_scores(&mut self.kv_caches, sc)?,
+                None => cache_manager.maybe_evict(&mut self.kv_caches)?,
+            }
+        };
+
+        if result.evicted {
+            let removed = before_pos.saturating_sub(result.new_pos);
+            Ok((removed, result.new_pos))
+        } else {
+            Ok((0, before_pos))
+        }
+    }
 }
 
 fn workspace_config_for(model: &TransformerModel, max_seq_len: usize) -> WorkspaceConfig {

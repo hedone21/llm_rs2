@@ -64,7 +64,7 @@ impl DecodeLoop {
     /// [`Self::run`] overwrites it with `first_token`.
     pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
         let logits = self.forward.prefill(tokens)?;
-        self.pos = tokens.len();
+        self.pos += tokens.len();
         self.prev_token = *tokens.last().unwrap_or(&0);
         // Phase 4-4.7: production fallback (generate.rs)이
         // `sampling::sample(&mut logits, &tokens, ...)` 호출 시 `tokens`(prompt

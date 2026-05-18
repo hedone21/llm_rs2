@@ -86,6 +86,29 @@ pub trait Forward {
     fn reset_kv(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Phase 4-5-e: chat `ensure_capacity` / `on_turn_end` 에서 eviction 실행.
+    ///
+    /// ModelForward만 override한다. KiviForward / OffloadForward는 default no-op
+    /// 유지 (eviction 미지원).
+    ///
+    /// - `cache_manager`: eviction 정책을 보유한 CacheManager.
+    /// - `scores`: score-based policy (H2O/D2O)용 importance 점수. `None`이면
+    ///   score-free force/maybe evict.
+    /// - `force`: true이면 `force_evict*`, false이면 `maybe_evict*`.
+    /// - `target_ratio`: `force=true` 시 eviction 목표 비율.
+    ///
+    /// Returns (removed_count, new_pos). removed_count == 0이면 eviction 미발생.
+    fn try_evict(
+        &mut self,
+        cache_manager: &crate::core::cache_manager::CacheManager,
+        scores: Option<&[f32]>,
+        force: bool,
+        target_ratio: f32,
+    ) -> anyhow::Result<(usize, usize)> {
+        let _ = (cache_manager, scores, force, target_ratio);
+        Ok((0, 0))
+    }
 }
 
 /// Eviction stage invoked before each forward step.

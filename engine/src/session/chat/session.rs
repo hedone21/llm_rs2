@@ -68,7 +68,6 @@ pub enum ChatKvMode {
 ///
 /// `DecodeLoop`는 chat 세션 시작 시 1회 build되고 세션 종료 시 drop된다.
 /// turn마다 build/drop하면 KV cache가 소실된다.
-#[allow(dead_code)]
 pub struct ChatSession {
     decode_loop: DecodeLoop,
     pub kv_mode: ChatKvMode,
@@ -90,7 +89,6 @@ impl ChatSession {
     }
 }
 
-#[allow(dead_code)]
 impl ChatSession {
     /// turn 시작 시 prompt prefill. pos 갱신.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -146,26 +144,91 @@ impl ChatSession {
     /// - Standard: CacheManager::force_evict → 재확인. 여전히 부족하면 bail.
     /// - Kivi/Offload: pos + additional > max_seq_len이면 bail (eviction 미지원).
     pub fn ensure_capacity(&mut self, additional: usize) -> Result<()> {
-        match &mut self.kv_mode {
+        match &self.kv_mode {
             ChatKvMode::Standard { cache_manager, .. } => {
                 if self.pos + additional <= self.max_seq_len {
                     return Ok(());
                 }
-                // Phase 4-5-d: KVCache는 ModelForward 내부에 owned되어 ChatSession에서
-                // 직접 접근 불가. cache_manager가 있어도 현 시점에서는 force_evict를
-                // 호출할 수 없다. 실 eviction은 Phase 4-5-e EvictionStage wire-up 이후
-                // DecodeLoop 경유로 처리된다.
-                //
-                // cache_manager 존재 여부와 무관하게 bail — ensure_capacity가 호출된다는
-                // 것은 이미 context 한계에 도달했음을 의미하므로, /reset을 안내한다.
-                let _ = cache_manager;
-                anyhow::bail!(
-                    "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
-                     Use /reset or increase --max-seq-len.",
-                    self.max_seq_len,
-                    self.pos,
-                    additional
-                );
+                if cache_manager.is_none() {
+                    anyhow::bail!(
+                        "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
+                         Use /reset or increase --max-seq-len.",
+                        self.max_seq_len,
+                        self.pos,
+                        additional
+                    );
+                }
+                // force_evict 실행.
+                // Borrow 분리: ChatKvMode 필드를 먼저 복사한 뒤 forward에 접근한다.
+                let (target_ratio, score_based) = if let ChatKvMode::Standard {
+                    target_ratio,
+                    score_based,
+                    ..
+                } = &self.kv_mode
+                {
+                    (*target_ratio, *score_based)
+                } else {
+                    unreachable!()
+                };
+
+                let (removed, new_pos) = {
+                    let scores_vec: Option<Vec<f32>> = if let ChatKvMode::Standard {
+                        score_accumulator,
+                        ..
+                    } = &self.kv_mode
+                    {
+                        if score_based {
+                            score_accumulator
+                                .as_ref()
+                                .filter(|a| a.is_active())
+                                .map(|a| a.importance_scores().to_vec())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let cm = if let ChatKvMode::Standard {
+                        cache_manager: Some(cm),
+                        ..
+                    } = &self.kv_mode
+                    {
+                        // SAFETY: cm는 self.kv_mode 안에 있고, forward_mut()은
+                        // self.decode_loop을 빌린다 (kv_mode와 서로 다른 필드).
+                        // 두 필드가 disjoint임이 구조적으로 보장되지만 borrow
+                        // checker는 self를 전체로 봄 — 포인터로 우회한다.
+                        let cm_ptr: *const CacheManager = cm;
+                        unsafe { &*cm_ptr }
+                    } else {
+                        unreachable!()
+                    };
+                    self.decode_loop.forward_mut().try_evict(
+                        cm,
+                        scores_vec.as_deref(),
+                        true,
+                        target_ratio,
+                    )?
+                };
+
+                if removed > 0 {
+                    if let ChatKvMode::Standard { evicted_total, .. } = &mut self.kv_mode {
+                        *evicted_total += removed;
+                    }
+                    self.pos = new_pos;
+                }
+
+                // 재확인
+                if self.pos + additional <= self.max_seq_len {
+                    Ok(())
+                } else {
+                    anyhow::bail!(
+                        "context would exceed max_seq_len={} even after eviction \
+                         (pos={}, incoming_reserve={}). Use /reset or increase --max-seq-len.",
+                        self.max_seq_len,
+                        self.pos,
+                        additional
+                    );
+                }
             }
             ChatKvMode::Kivi { .. } | ChatKvMode::Offload { .. } => {
                 if self.pos + additional > self.max_seq_len {
@@ -184,12 +247,82 @@ impl ChatSession {
 
     /// turn 종료 후 opportunistic eviction (Standard 모드만).
     ///
-    /// KV 사용량이 90% 이상이면 force_evict, 미만이면 maybe_evict.
-    /// Phase 4-5-d에서는 KVCache 직접 접근 불가로 로직 준비만 수행.
-    /// 실 eviction은 Phase 4-5-e EvictionStage wire-up 이후 활성화.
+    /// pos が KV capacity の 90% 以上なら force_evict, 未満なら maybe_evict.
+    /// generate.rs::StandardTurnExec::on_turn_end (l.10288~10303) 同等.
     pub fn on_turn_end(&mut self) -> Result<()> {
-        // Standard 모드 opportunistic eviction: Phase 4-5-e EvictionStage 도입 후
-        // DecodeLoop.eviction을 통해 구현. 현재는 no-op placeholder.
+        let has_cm = matches!(
+            &self.kv_mode,
+            ChatKvMode::Standard {
+                cache_manager: Some(_),
+                ..
+            }
+        );
+        if !has_cm {
+            return Ok(());
+        }
+
+        // KV capacity는 pos で近似する (ModelForward 내부 cache.capacity()를
+        // 직접 읽는 대신 max_seq_len을 proxy로 사용 — 할당 크기와 동일).
+        let at_pressure = self.pos >= self.max_seq_len.saturating_mul(9) / 10;
+
+        let (target_ratio, score_based) = if let ChatKvMode::Standard {
+            target_ratio,
+            score_based,
+            ..
+        } = &self.kv_mode
+        {
+            (*target_ratio, *score_based)
+        } else {
+            return Ok(());
+        };
+
+        let scores_vec: Option<Vec<f32>> = if let ChatKvMode::Standard {
+            score_accumulator, ..
+        } = &self.kv_mode
+        {
+            if score_based {
+                score_accumulator
+                    .as_ref()
+                    .filter(|a| a.is_active())
+                    .map(|a| a.importance_scores().to_vec())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let cm_ptr: *const CacheManager = if let ChatKvMode::Standard {
+            cache_manager: Some(cm),
+            ..
+        } = &self.kv_mode
+        {
+            cm as *const CacheManager
+        } else {
+            return Ok(());
+        };
+
+        // SAFETY: cm_ptr은 self.kv_mode의 일부이고, forward_mut()은 self.decode_loop을
+        // 빌린다 — 두 필드는 disjoint. borrow checker가 self 전체를 잠그므로 포인터 우회.
+        let cm: &CacheManager = unsafe { &*cm_ptr };
+
+        let (removed, new_pos) = self.decode_loop.forward_mut().try_evict(
+            cm,
+            scores_vec.as_deref(),
+            at_pressure,
+            target_ratio,
+        )?;
+
+        if removed > 0 {
+            if let ChatKvMode::Standard { evicted_total, .. } = &mut self.kv_mode {
+                *evicted_total += removed;
+            }
+            self.pos = new_pos;
+            eprintln!(
+                "[Chat/Evict] on_turn_end: removed={} new_pos={}",
+                removed, new_pos
+            );
+        }
         Ok(())
     }
 
@@ -244,7 +377,6 @@ impl ChatSession {
 ///
 /// generate.rs의 run_chat_standard + build_chat_eviction에 흩어진 인자들을
 /// 한 struct로 묶는다. 4-5-f에서 generate.rs 호출 site가 이 struct를 사용하게 된다.
-#[allow(dead_code)]
 pub struct ChatStandardArgs {
     pub backend: Arc<dyn Backend>,
     pub memory: Arc<dyn Memory>,
@@ -274,7 +406,6 @@ pub struct ChatStandardArgs {
 }
 
 /// [`build_chat_kivi`]에 전달하는 args.
-#[allow(dead_code)]
 pub struct ChatKiviArgs {
     pub backend: Arc<dyn Backend>,
     pub memory: Arc<dyn Memory>,
@@ -288,7 +419,6 @@ pub struct ChatKiviArgs {
 }
 
 /// [`build_chat_offload`]에 전달하는 args.
-#[allow(dead_code)]
 pub struct ChatOffloadArgs {
     pub backend: Arc<dyn Backend>,
     pub memory: Arc<dyn Memory>,
@@ -309,7 +439,6 @@ pub struct ChatOffloadArgs {
 ///
 /// generate.rs `run_chat_standard` + `build_chat_eviction` (l.10317~10519) 이관.
 /// `kv_caches`는 caller가 미리 할당하여 전달한다 (alloc_standard_kv_caches 사용).
-#[allow(dead_code)]
 pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
     let max_seq_len = args.max_seq_len;
 
@@ -353,7 +482,6 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
 /// KIVI 양자화 KV cache path용 ChatSession 빌더.
 ///
 /// generate.rs `run_chat_kivi` (l.10662~10756) 이관.
-#[allow(dead_code)]
 pub fn build_chat_kivi(args: ChatKiviArgs) -> Result<ChatSession> {
     let max_seq_len = args.max_seq_len;
     let bits = args.bits;
@@ -404,7 +532,6 @@ pub fn build_chat_kivi(args: ChatKiviArgs) -> Result<ChatSession> {
 /// KV offload path용 ChatSession 빌더.
 ///
 /// generate.rs `run_chat_offload` (l.10907~11032) 이관.
-#[allow(dead_code)]
 pub fn build_chat_offload(args: ChatOffloadArgs) -> Result<ChatSession> {
     let max_seq_len = args.max_seq_len;
     let offload_mode = args.offload_mode.clone();
@@ -591,7 +718,6 @@ mod tests {
     use super::*;
     use crate::session::chat::stop_condition::StopCondition as StopConditionTrait;
     use crate::session::traits::{Forward, StepCtx, StopReason};
-    use std::sync::Arc;
 
     // ─── Mock Forward ──────────────────────────────────────────────────────
 
@@ -693,14 +819,15 @@ mod tests {
         assert_eq!(result1.stopped_by, StopReason::StopConditionMet);
 
         // R1 검증: ChatSession이 drop되지 않고 turn 2 prefill 수신 가능.
-        // DecodeLoop::prefill은 pos = tokens.len() (절대값)이므로
-        // 2nd turn prefill 후 pos = prompt2.len().
+        // DecodeLoop::prefill은 pos += tokens.len() (누적)이므로
+        // 2nd turn prefill 후 pos = pos_after_turn1 + prompt2.len().
         let prompt2 = &[10u32, 11];
         let _ = session.prefill(prompt2).unwrap();
+        let expected_pos = pos_after_turn1 + prompt2.len();
         assert_eq!(
             session.pos(),
-            prompt2.len(),
-            "prefill sets pos = tokens.len() (absolute)"
+            expected_pos,
+            "prefill accumulates pos (multi-turn)"
         );
     }
 

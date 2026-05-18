@@ -347,3 +347,10 @@ mod test_model_forward_parity;
 // G1/D5: stats_line 포맷 byte-identical
 #[path = "spec/test_chat_session_multi_turn.rs"]
 mod test_chat_session_multi_turn;
+
+// ── Phase 4-5-e: run_chat_repl_v2 multi-turn pos 누적 + first token bit-identical ──
+// G2-REPL: turn 2 prefill pos 누적 (pos += tokens.len()), bit-identical 검증
+// G2-REPL-2: 결정론적 first token (DetForward + GreedySampler)
+// G2-REPL-3: reset 후 pos=0에서 재시작
+#[path = "spec/test_chat_repl_v2_multi_turn.rs"]
+mod test_chat_repl_v2_multi_turn;

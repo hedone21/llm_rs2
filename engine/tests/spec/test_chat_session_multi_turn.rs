@@ -164,10 +164,8 @@ fn g2b_pos_increases_after_decode() {
 
 /// G2-C: turn 1 decode 후 pos가 > 0이고 ChatSession이 살아있는 동안 유지된다.
 ///
-/// 현재 DecodeLoop::prefill은 `pos = tokens.len()`으로 설정한다 (절대값).
-/// turn 2 prefill 후 pos = prompt2.len()이 된다.
-/// 이것이 Phase 4-5-d의 실제 동작이며, ChatSession이 turn 1 decode 후 drop되지
-/// 않음을 확인하는 것이 R1 invariant의 요점이다.
+/// Phase 4-5-e: DecodeLoop::prefill은 `pos += tokens.len()` (누적).
+/// turn 2 prefill 후 pos = pos_after_turn1 + prompt2.len().
 ///
 /// R1 보존 검증: turn 1 decode 완료 후 session이 여전히 유효하여 turn 2 prefill을
 /// 받을 수 있는지 확인한다 (panic 없이 진행되어야 함).
@@ -191,11 +189,13 @@ fn g2c_session_survives_multi_turn() {
         result.is_ok(),
         "R1: ChatSession이 turn 사이 살아있어 turn 2 prefill 가능"
     );
-    // prefill 후 pos = prompt2.len() (DecodeLoop::prefill 절대값 설정).
+    // prefill 후 pos = pos_after_turn1 + prompt2.len() (DecodeLoop::prefill 누적).
+    let expected = pos_after_turn1 + prompt2.len();
     assert_eq!(
         session.pos(),
-        prompt2.len(),
-        "DecodeLoop::prefill sets pos = tokens.len() (absolute)"
+        expected,
+        "DecodeLoop::prefill accumulates pos (multi-turn): expected {}",
+        expected
     );
 }
 
