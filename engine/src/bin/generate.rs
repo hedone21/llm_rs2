@@ -9798,7 +9798,7 @@ fn run_ppl(
 
 // ─────────────────────── Chat REPL mode ───────────────────────
 
-use llm_rs2::core::chat_ipc::{
+use llm_rs2::session::chat_ipc::{
     ChatInput, finish_reply_stream, spawn_chat_input_sources, write_reply_bytes,
 };
 
