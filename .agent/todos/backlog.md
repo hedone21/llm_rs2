@@ -4,6 +4,19 @@
 
 ---
 
+## [P1] Qwen2.5-1.5b chat 모드 garbage 출력 — Phase 4-5 baseline 회귀 (Phase 4-4.10에 이미 존재) — 2026-05-18 등록
+- **Status**: TODO (Phase 4-5 디바이스 게이트 도중 발견, 본 sprint 책임 외)
+- **재현**: Galaxy S25 R3CY408S5SB, qwen2.5-1.5b-q4_0.gguf, `--backend opencl --chat --system-prompt "You are concise." --prompt "Capital of France?" --num-tokens 16 --max-seq-len 512 --greedy --repetition-penalty 1.1`
+- **증상**: chat 출력이 의미 없는 토큰 반복 (`İlçe ` 또는 `撙afournis` 등). 기대값은 "Paris" 류 정상 답변.
+- **격리**: baseline `b991691f` (Phase 4-4.10 종결 시점)에서도 동일 garbage 재현 → Phase 4-5 책임 아님. **non-chat generate는 정상**(같은 모델 + 같은 prompt 32 tok에서 "The capital of France is Paris..." bit-identical PASS, G6'/G7' 통과).
+- **가설 후보**:
+  1. ChatTemplate (qwen2 변형) 의 render_user_and_assistant_header 출력이 wrong format
+  2. assistant_eot_ids encoding 불일치 (`<|im_end|>` 토큰 ID)
+  3. system_prompt prefill 후 user prompt prefill의 KV pos sync 오류 (단 Phase 4-5-g hotfix로 multi-turn pos는 정상 보장됨)
+  4. Qwen2.5-1.5b Q4_0 모델 자체의 chat instruction-following 능력 부족 (greedy + repetition_penalty 가 wrong path로 빠짐)
+- **검증 방법**: (a) Llama-3.2-1B chat 모드 같은 prompt로 격리 — Llama가 정상이면 Qwen2 chat template 이슈 확정. (b) `--no-chat` non-chat 모드에서 동일 prompt "You are concise.\nCapital of France?" 직접 prefill — 정상이면 chat REPL의 template 적용 단계 issue.
+- **HEAD**: `c1a4b481` (Phase 4-5-g 종결 후)
+
 ## [P0] M3.4 RED — pos baked architectural blocker — 2026-05-10
 - **Status**: 사용자 architectural decision 대기
 - **Handoff**: `.agent/todos/handoff_qnn_oppkg_m3_4_red_pos_baked_20260510.md`
