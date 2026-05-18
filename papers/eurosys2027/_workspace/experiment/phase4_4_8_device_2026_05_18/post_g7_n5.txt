@@ -1,0 +1,5 @@
+Avg TBT: 36.46 ms (27.4 tokens/sec)
+Avg TBT: 36.52 ms (27.4 tokens/sec)
+Avg TBT: 36.51 ms (27.4 tokens/sec)
+Avg TBT: 36.52 ms (27.4 tokens/sec)
+Avg TBT: 36.54 ms (27.4 tokens/sec)
