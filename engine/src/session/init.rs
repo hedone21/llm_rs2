@@ -113,13 +113,6 @@ impl SessionInitCtx {
             .unwrap();
         eprintln!("[Config] Using {} threads", num_threads);
 
-        // Wire Rayon vs SpinPool toggle
-        #[cfg(target_arch = "aarch64")]
-        if args.use_rayon {
-            crate::backend::cpu::neon::USE_RAYON.store(true, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("[Config] F16 matmul: Rayon (par_chunks_mut)");
-        }
-
         // --chat conflict validation.
         // Standard / kivi / offload paths are each supported; experiment/eval
         // modes and advanced GPU features remain incompatible.
@@ -190,19 +183,6 @@ impl SessionInitCtx {
             }
         }
 
-        // Propagate intra-token GPU yield knobs. Both flags route through env
-        // vars so `core::gpu_yield`'s OnceLock cache stays valid across sub-crate
-        // boundaries. CLI wins over a pre-set env var.
-        if args.gpu_yield_every_layer > 0 {
-            unsafe {
-                std::env::set_var(
-                    "LLMRS_DECODE_YIELD_EVERY",
-                    args.gpu_yield_every_layer.to_string(),
-                );
-                std::env::set_var("LLMRS_DECODE_YIELD_US", args.gpu_yield_us.to_string());
-            }
-        }
-
         // 1. Setup
         eprintln!("[Profile] Event: ModelLoadStart");
         eprintln!("Loading model from {}", model_path);
@@ -234,7 +214,7 @@ impl SessionInitCtx {
                                 Arc::new(crate::backend::opencl::memory::OpenCLMemory::new(
                                     gpu_concrete.context.clone(),
                                     gpu_concrete.queue.clone(),
-                                    args.zero_copy,
+                                    !args.no_zero_copy,
                                 ));
                             let g = gpu_concrete as Arc<dyn Backend>;
                             eprintln!(
@@ -263,21 +243,24 @@ impl SessionInitCtx {
                         args.profile_events || args.heartbeat_gpu_profile,
                     )?,
                 );
-                // When resilience is enabled, force zero-copy memory so KV cache uses
-                // UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR, host-accessible). This enables
-                // zero-alloc UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
-                let mut effective_zero_copy = args.zero_copy
+                // Zero-copy is the default. `--no-zero-copy` disables it unless
+                // another feature requires host-accessible buffers (resilience
+                // SwitchHw, tensor partition, prefill CPU interleave) — those
+                // force-enable regardless of `--no-zero-copy`.
+                let mut effective_zero_copy = !args.no_zero_copy
                     || args.resilience_prealloc_switch
                     || args.tensor_partition > 0.0
                     || args.prefill_cpu_chunk_size > 0
                     || args.enable_resilience;
-                if !args.zero_copy
+                if args.no_zero_copy
                     && (args.resilience_prealloc_switch
                         || args.tensor_partition > 0.0
                         || args.prefill_cpu_chunk_size > 0
                         || args.enable_resilience)
                 {
-                    eprintln!("[Config] Forcing zero-copy memory for CPU-accessible buffers");
+                    eprintln!(
+                        "[Config] --no-zero-copy ignored: required for CPU-accessible buffers"
+                    );
                 }
                 // LLMRS_FORCE_DEVICE_ALLOC: RSS diagnostic flag.
                 // Forces effective_zero_copy=false so OpenCLMemory::alloc() creates
@@ -322,25 +305,11 @@ impl SessionInitCtx {
                 if args.cuda_profile {
                     gpu_concrete.enable_profiler(4096)?;
                 }
-                // --cuda-defer-sync: skip implicit per-op synchronize() in
-                // launch helpers. The decode loop must then sync once per
-                // token before sampling reads the logits — see the decode
-                // loop's pre-sampling barrier. Available on both cuda_pc
-                // (host discrete GPU) and cuda_embedded (Jetson UMA).
-                #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
-                if args.cuda_defer_sync {
-                    gpu_concrete.set_defer_sync(true);
-                    eprintln!(
-                        "[CUDA] --cuda-defer-sync enabled: per-op syncs suppressed; token-boundary sync only"
-                    );
-                }
                 // --cuda-sync-policy: fine-grained per-category bisection.
                 // Parsed before weights-device so a misconfigured string
                 // errors out before the long model-load path. `all` is a
                 // no-op (matches the AtomicU32 default from `new()`); other
-                // values override the policy bitmask. Legacy
-                // `--cuda-defer-sync` takes precedence and zeros the policy
-                // entirely at the `maybe_sync_cat` layer.
+                // values override the policy bitmask.
                 //
                 // Resolves through `crate::backend::cuda` which aliases to
                 // cuda_pc (feature = "cuda") or cuda_embedded (feature =
@@ -414,7 +383,7 @@ impl SessionInitCtx {
                             Arc::new(crate::backend::opencl::memory::OpenCLMemory::new(
                                 gpu_concrete.context.clone(),
                                 gpu_concrete.queue.clone(),
-                                args.zero_copy,
+                                !args.no_zero_copy,
                             ));
                         let g = gpu_concrete as Arc<dyn Backend>;
                         eprintln!(

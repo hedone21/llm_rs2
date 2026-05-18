@@ -172,13 +172,16 @@ pub struct Args {
     #[arg(short, long, default_value = "cpu")]
     pub backend: String,
 
-    /// Auto-switch CPU→GPU at this token count (0=disabled). Requires GPU availability.
-    #[arg(long, default_value_t = 0)]
-    pub switch_threshold: usize,
-
-    /// Use zero-copy shared memory (slower but enables CPU-GPU sharing)
+    /// Disable zero-copy shared memory (CL_MEM_ALLOC_HOST_PTR).
+    ///
+    /// Zero-copy is enabled by default on ARM SoC to remove CPU↔GPU memcpy.
+    /// Set this flag to fall back to device-only allocations.
+    ///
+    /// Other features force-enable zero-copy regardless of this flag:
+    /// `--resilience-prealloc-switch`, `--tensor-partition > 0`,
+    /// `--prefill-cpu-chunk-size > 0`, `--enable-resilience`.
     #[arg(long, default_value_t = false)]
-    pub zero_copy: bool,
+    pub no_zero_copy: bool,
 
     #[arg(long, default_value_t = 2048)]
     pub max_seq_len: usize,
@@ -295,19 +298,6 @@ pub struct Args {
     /// `results/profile/cuda_embedded_decode_<timestamp>.json`.
     #[arg(long, default_value_t = false)]
     pub cuda_profile: bool,
-
-    /// Experimental: defer the per-op `synchronize()` calls in the
-    /// cuda-embedded backend and sync only once per decode token
-    /// (immediately before sampling reads logits).
-    ///
-    /// Phase C hypothesis H1: the 4.6 ms/tok (12%) wall-clock overhead
-    /// beyond GPU kernel time is driven by ~30 per-op syncs per token.
-    /// Enabling this flag measures the residual cost. Not a production
-    /// optimization — correctness relies on sampling being the only
-    /// CPU-visible read in the decode loop. Use with
-    /// `--backend cuda-embedded` only; a no-op on other backends.
-    #[arg(long, default_value_t = false)]
-    pub cuda_defer_sync: bool,
 
     /// Per-category sync policy for the cuda-embedded backend. Lets us
     /// bisect which per-op `cuStreamSynchronize()` calls are load-bearing
@@ -521,20 +511,6 @@ pub struct Args {
     #[arg(long, value_parser = ["low", "medium", "normal", "high"], default_value = "normal")]
     pub gpu_priority: String,
 
-    /// Intra-token GPU yield: after every N decoded layers, flush the GPU
-    /// queue and sleep `--gpu-yield-us` microseconds. Gives the driver a
-    /// scheduling window mid-token so concurrent high-priority contexts
-    /// (e.g. foreground games) don't wait out the full layer chain. 0
-    /// disables. Also settable via env `LLMRS_DECODE_YIELD_EVERY`.
-    #[arg(long, default_value_t = 0)]
-    pub gpu_yield_every_layer: usize,
-
-    /// Microsecond sleep per intra-token yield point. Effective only when
-    /// `--gpu-yield-every-layer` > 0. 0 issues `sched_yield()` instead of
-    /// sleeping. Also settable via env `LLMRS_DECODE_YIELD_US`.
-    #[arg(long, default_value_t = 500)]
-    pub gpu_yield_us: u64,
-
     /// Path to write per-token TBT JSONL log.
     /// Each line: {"token_idx":N,"tbt_ms":X,"forward_ms":Y,"cache_pos":Z,"pacing_ms":W}
     #[arg(long)]
@@ -638,10 +614,6 @@ pub struct Args {
     /// typical on-device workloads.
     #[arg(long, default_value_t = 128)]
     pub max_prefetch_depth: usize,
-
-    /// Use Rayon par_chunks_mut instead of SpinPool for F16 matmul (A/B benchmarking).
-    #[arg(long, default_value_t = false)]
-    pub use_rayon: bool,
 
     /// Path to reference text file for perplexity evaluation (teacher-forcing).
     /// Measures PPL and collects proxy metrics during eviction.

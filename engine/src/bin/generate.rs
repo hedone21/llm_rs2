@@ -3046,65 +3046,6 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // ── Auto-switch CPU→GPU at threshold ─────────────────────────
-            if !is_gpu
-                && weights_on_gpu
-                && args.switch_threshold > 0
-                && kv_caches[0].current_pos >= args.switch_threshold
-                && let (Some(gpu_be), Some(gpu_mem)) =
-                    (gpu_backend_arc.as_ref(), gpu_memory_arc.as_ref())
-            {
-                eprintln!(
-                    "[Switch] Auto-switch CPU→GPU at token {}",
-                    kv_caches[0].current_pos
-                );
-                llm_rs2::core::kv_migrate::migrate_kv_caches(
-                    &mut kv_caches,
-                    &backend,
-                    gpu_be,
-                    &cpu_backend_arc,
-                    &cpu_memory_arc,
-                    gpu_mem,
-                    kv_heads,
-                    head_dim,
-                    max_seq_len,
-                    true,
-                )?;
-                backend = gpu_be.clone();
-                let logits_gpu_buf = gpu_mem.alloc(vocab_size * 4, DType::F32)?;
-                logits = Tensor::new(
-                    Shape::new(vec![1, 1, vocab_size]),
-                    logits_gpu_buf,
-                    backend.clone(),
-                );
-                let xg_buf = gpu_mem.alloc(hidden_size * 4, DType::F32)?;
-                x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
-                gen_ws = LayerWorkspace::new(
-                    WorkspaceConfig {
-                        batch_size: 1,
-                        dim: model.config.hidden_size,
-                        q_dim,
-                        k_dim,
-                        v_dim,
-                        ffn_hidden,
-                        n_heads: model.config.num_attention_heads,
-                        max_seq_len: args.max_seq_len,
-                    },
-                    gpu_mem.as_ref(),
-                    backend.clone(),
-                )?;
-                #[cfg(feature = "opencl")]
-                {
-                    gpu_plan = None; // invalidate; will rebuild after first forward
-                }
-                // Re-allocate gen_input_tensor on new GPU backend
-                let gi_buf = gpu_mem.alloc(4, DType::U8)?;
-                gen_input_tensor = Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
-                is_gpu = true;
-                eprintln!("[Switch] Switched to GPU successfully.");
-            }
-            // ── End auto-switch ──────────────────────────────────────────
-
             let last_token = tokens[tokens.len() - 1];
             unsafe {
                 *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
