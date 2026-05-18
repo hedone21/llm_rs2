@@ -107,13 +107,13 @@ main()의 dispatch는 5분기 + legacy fallback 4,700 LOC. legacy가 weight swap
 |---|---|---|---|
 | **`BaseArgs`** | ~30 | generate, chat, ppl, batch, eval-ll | 모델 로딩 + 백엔드 + sampling + 공통 KV |
 | **`SamplingArgs`** | 8 | (BaseArgs 안에 flatten) | temperature/top_p/top_k/greedy/repetition_* |
-| **`ProfileArgs`** | 11 | (BaseArgs 안에 flatten) | profile/profile_events/heartbeat_gpu_profile/tbt_log/target_tbt/throttle_delay_ms/cuda_profile/cuda_*/gpu_priority/gpu_yield_*/use_rayon |
+| **`ProfileArgs`** | 11 | (BaseArgs 안에 flatten) | profile/profile_events/heartbeat_gpu_profile/profile_dir/profile_interval/profile_per_head/profile_probes/cuda_profile/tbt_log/target_tbt/throttle_delay_ms |
 | **`KiviArgs`** | 5 | (BaseArgs 안에 flatten — init.rs 전용) | kivi/kivi_bits/kivi_residual_size/kv_dynamic_quant/awqe |
 | **`OffloadArgs`** | 3 | (BaseArgs 안에 flatten — init.rs 전용) | kv_offload/offload_path/max_prefetch_depth |
 | **`EvictionArgs`** | 14 | (BaseArgs 안에 flatten) | eviction_*/h2o_*/d2o_*/sink_size/streaming_window/kv_budget/kv_budget_ratio/protected_prefix/min_kv_cache/initial_kv_capacity/memory_threshold_mb/skip_layers/skip_ratio |
 | **`PrefillArgs`** | 5 | (BaseArgs 안에 flatten — init.rs 전용) | prefill_chunk_size/prefill_yield_ms/prefill_cpu_chunk_size/no_prefill_ws/no_gpu_plan |
 | **`SwapArgs`** | 24 | ppl, eval-ll, generate | secondary_*/force_swap_ratio/swap_*/quantize_lm_head/eager_prefault_secondary/swap_dir |
-| **`QcfArgs`** | 13 | ppl, batch, eval-ll, generate | qcf_*/dump_importance/importance_formula/decode_x_steps/enable_qcf_experimental |
+| **`QcfArgs`** | 11 | ppl, batch, eval-ll, generate | qcf_dump/qcf_mode/qcf_sample_layers/qcf_warmup_tokens/qcf_trajectory/enable_qcf_experimental/decode_x_steps/importance_formula/**dump_importance**(ProfileArgs에서 이동, 2026-05-18) |
 | **`ResilienceArgs`** | 3 | (BaseArgs 안에 flatten) | enable_resilience/resilience_prealloc_switch/resilience_transport |
 | **`ExperimentArgs`** | 5 | (BaseArgs 안에 flatten — legacy 전용) | experiment_*/ignore_eos |
 | **`ChatArgs`** | 4 | chat, generate | chat/system_prompt/chat_socket/chat_tcp |
@@ -121,7 +121,7 @@ main()의 dispatch는 5분기 + legacy fallback 4,700 LOC. legacy가 weight swap
 | **`BatchArgs`** | 3 | batch, generate | prompt_batch/prompt_batch_loop/max_iterations |
 | **`EvalLlArgs`** | 3 | eval-ll, generate | eval_ll/eval_continuation/eval_batch |
 | **`TensorPartitionArgs`** | 1 | (BaseArgs 안에 flatten) | tensor_partition |
-| **`BackendBehaviorArgs`** | 8 | (ProfileArgs와 통합 검토) | switch_threshold/zero_copy/threads/weight_dtype/qnn_graph_cache_prebuild/qnn_allow_fallback |
+| **`BackendArgs`** | 9 | (BaseArgs 안에 flatten) | backend/no_zero_copy/threads/cuda_sync_policy/cuda_weights_device/cuda_graph/qnn_graph_cache_prebuild/qnn_allow_fallback/gpu_priority |
 
 **총합**: 약 142 field → 17개 sub-struct로 그룹화 (`BaseArgs` 자체가 9 sub-struct flatten 컨테이너).
 
@@ -282,25 +282,25 @@ S-1 PR 단일, S-2~S-4 (binary 추가)는 별도 PR.
 
 ### 그룹별 review 순서 (실제 진행)
 
-| 순서 | 그룹 | review 포인트 |
-|---|---|---|
-| 1 | ModelLoadArgs (4) | 모두 production. 삭제 후보 0 예상 |
-| 2 | BackendArgs (13) | `switch_threshold` legacy-only, `use_rayon`/`gpu_yield_*`/`cuda_defer_sync` 측정용 → 삭제 검토 |
-| 3 | SamplingArgs (5) | 모두 production. 삭제 후보 0 예상 |
-| 4 | ProfileArgs (11) | `dump_importance`는 QcfArgs 재분류, 나머지 measure infra |
-| 5 | KiviArgs (5) | `awqe` 사용처 매트릭스 gen만 — KIVI metric 활용 끝났으면 삭제 |
-| 6 | OffloadArgs (3) | 모두 production |
-| 7 | EvictionArgs (14) | `h2o_debug` gen-only — 삭제 검토 |
-| 8 | PrefillArgs (5) | `no_prefill_ws` 확정 삭제 (위) |
-| 9 | ResilienceArgs (3) | 모두 production |
-| 10 | TensorPartitionArgs (1) | production |
-| 11 | SwapArgs (24) | **대대적 cleanup 대상** — production 5개 외 19개 ablation. 별도 binary(`swap_bench`) 분리 검토 |
-| 12 | QcfArgs (13) | `qcf_betas`/`qcf_topk_values`/`qcf_defensive_taus` 확정 삭제. `qcf_trajectory`/`decode_x_steps`/`importance_formula` 측정용 — 별도 binary(`argus_bench`) 분리 검토 |
-| 13 | ExperimentArgs (5) | **전체 binary 분리** — `bin/experiment_runner` 신설. legacy main에서 제거 |
-| 14 | ChatArgs (4) | `chat` flag 자체는 bin/chat.rs에서 제거 (binary가 곧 chat 모드) |
-| 15 | PplArgs (10) | `dump_q4_*` / `ppl_warmup_swap` / `ppl_measure_prefill_tokens` 측정 종결 시 삭제 |
-| 16 | BatchArgs (3) | production |
-| 17 | EvalLlArgs (3) | `eval_ll` flag 자체는 bin/eval-ll.rs에서 제거 |
+| 순서 | 그룹 | 상태 | 처리 |
+|---|---|---|---|
+| 1 | ModelLoadArgs (4) | ✓ done | cleanup 0 (모두 production) |
+| 2 | BackendArgs (13→9) | ✓ done | -5 field (switch_threshold/cuda_defer_sync/gpu_yield_every_layer/gpu_yield_us/use_rayon) + zero_copy→no_zero_copy (default ON 전환). 커밋 `5e5d1743` |
+| 3 | SamplingArgs (6) | ✓ done | cleanup 0. `repetition_window` = repeat-last-N(=64), `top_k`+`top_p` cascade는 표준 — 둘 다 보존 |
+| 4 | ProfileArgs (12→10) | ✓ done | `profile_per_head` 보존(H2O+ 분석). `dump_importance` → QcfArgs 재분류 |
+| 5 | KiviArgs (5) | 진행 예정 | `awqe` 매트릭스 gen만 — 측정 종결 시 삭제 검토 |
+| 6 | OffloadArgs (3) | — | production 예상 |
+| 7 | EvictionArgs (14) | — | `h2o_debug` gen-only 삭제 검토 |
+| 8 | PrefillArgs (5→4) | ✓ partial done | `no_prefill_ws` 삭제 (batch 1) |
+| 9 | ResilienceArgs (3) | — | production 예상 |
+| 10 | TensorPartitionArgs (1) | — | production |
+| 11 | SwapArgs (24) | — | **대대적 cleanup 대상** — production 5개 외 19개 ablation. 별도 binary(`swap_bench`) 분리 검토 |
+| 12 | QcfArgs (13→9 + dump_importance) | ✓ partial done | placeholder 3 삭제(batch 1). `qcf_trajectory`/`decode_x_steps`/`importance_formula` 측정용 — 별도 binary(`argus_bench`) 분리 검토 |
+| 13 | ExperimentArgs (5) | — | **전체 binary 분리** — `bin/experiment_runner` 신설 |
+| 14 | ChatArgs (4) | — | `chat` flag bin/chat.rs에서 제거 |
+| 15 | PplArgs (10) | — | `dump_q4_*` / `ppl_warmup_swap` / `ppl_measure_prefill_tokens` 측정 종결 시 삭제 |
+| 16 | BatchArgs (3) | — | production |
+| 17 | EvalLlArgs (3) | — | `eval_ll` flag bin/eval-ll.rs에서 제거 |
 
 ### Binary 분리 후보 (사용자 "기능 차이 크면 binary 구분" 지시 적용)
 
