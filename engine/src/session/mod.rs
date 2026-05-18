@@ -5,6 +5,7 @@ pub mod chat_ipc;
 pub mod cli;
 pub mod decode_loop;
 pub mod defaults;
+pub mod eval;
 pub mod forward;
 pub mod init;
 pub mod qcf_runtime;
