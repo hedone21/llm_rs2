@@ -2381,7 +2381,18 @@ impl OpenCLBackend {
     pub fn lookup_noshuffle_soa(&self, key: usize) -> Option<&NoshuffleSoaEntry> {
         // SAFETY: single-threaded inference access
         let registry = unsafe { &*self.noshuffle_soa_registry.get() };
-        registry.get(&key)
+        let r = registry.get(&key);
+        if r.is_none() && std::env::var_os("LLMRS_NOSHUFFLE_SOA_TRACE").is_some() {
+            // Phase 4-4.8 diagnostic: dump miss key + registry size + sample keys
+            let sample: Vec<usize> = registry.keys().take(4).copied().collect();
+            eprintln!(
+                "[noshuffle-soa-trace] MISS key=0x{:x} registry_size={} sample_keys={:x?}",
+                key,
+                registry.len(),
+                sample
+            );
+        }
+        r
     }
 
     /// Clear the entire noshuffle SOA registry.

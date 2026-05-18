@@ -1106,6 +1106,7 @@ impl TransformerModel {
             // load picks up the noshuffle-converted ones.
             let snapshot = slot.load_weights();
             let mut layer = (*snapshot).clone();
+            let mut layer_mutated = false;
             for weight in [
                 &mut layer.wq,
                 &mut layer.wk,
@@ -1117,6 +1118,7 @@ impl TransformerModel {
             ] {
                 if process_weight(weight, true)? {
                     count += 1;
+                    layer_mutated = true;
                 }
             }
             // Partition slices: when `--tensor-partition <r>` is active the
@@ -1140,8 +1142,20 @@ impl TransformerModel {
                 ] {
                     if process_weight(weight, false)? {
                         count += 1;
+                        layer_mutated = true;
                     }
                 }
+            }
+            // Phase 4-4.8: RCU publish step. Without this the swapped tensors
+            // live only on the local `layer` clone and slot readers continue
+            // to see the pre-swap AOS buffers, so `lookup_noshuffle_soa` keys
+            // (registered against `d_buf`) never match the post-load cl_mem
+            // (still the original AOS allocation). `build_plan` then aborts
+            // at the "Q4_0 SOA entry missing" guard and the GPU plan path is
+            // disabled for the entire session. Publish only when at least one
+            // weight changed to avoid pointless ArcSwap churn.
+            if layer_mutated {
+                slot.store_weights_same_dtype(Arc::new(layer));
             }
         }
 
@@ -2054,6 +2068,18 @@ impl TransformerModel {
                 continue;
             }
             let wq_key = cl!(layer.wq).as_ptr() as usize;
+            if trace && li == 0 {
+                let is_nb = layer
+                    .wq
+                    .buffer()
+                    .as_any()
+                    .downcast_ref::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>()
+                    .is_some();
+                eprintln!(
+                    "[build_plan-trace] layer0 wq key=0x{:x} is_NoshuffleWeightBuffer={}",
+                    wq_key, is_nb
+                );
+            }
             match ocl_backend.lookup_noshuffle_soa(wq_key) {
                 Some(e) if e.q_img.is_some() => {}
                 Some(_) => {
