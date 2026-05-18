@@ -108,7 +108,7 @@ main()의 dispatch는 5분기 + legacy fallback 4,700 LOC. legacy가 weight swap
 | **`BaseArgs`** | ~30 | generate, chat, ppl, batch, eval-ll | 모델 로딩 + 백엔드 + sampling + 공통 KV |
 | **`SamplingArgs`** | 8 | (BaseArgs 안에 flatten) | temperature/top_p/top_k/greedy/repetition_* |
 | **`ProfileArgs`** | 11 | (BaseArgs 안에 flatten) | profile/profile_events/heartbeat_gpu_profile/profile_dir/profile_interval/profile_per_head/profile_probes/cuda_profile/tbt_log/target_tbt/throttle_delay_ms |
-| **`KiviArgs`** | 5 | (BaseArgs 안에 flatten — init.rs 전용) | kivi/kivi_bits/kivi_residual_size/kv_dynamic_quant/awqe |
+| **`KiviArgs`** | 4 | (BaseArgs 안에 flatten — init.rs 전용) | kivi/kivi_bits/kivi_residual_size/kv_dynamic_quant (awqe는 env `LLMRS_KIVI_AWQE`로 이전) |
 | **`OffloadArgs`** | 3 | (BaseArgs 안에 flatten — init.rs 전용) | kv_offload/offload_path/max_prefetch_depth |
 | **`EvictionArgs`** | 14 | (BaseArgs 안에 flatten) | eviction_*/h2o_*/d2o_*/sink_size/streaming_window/kv_budget/kv_budget_ratio/protected_prefix/min_kv_cache/initial_kv_capacity/memory_threshold_mb/skip_layers/skip_ratio |
 | **`PrefillArgs`** | 5 | (BaseArgs 안에 flatten — init.rs 전용) | prefill_chunk_size/prefill_yield_ms/prefill_cpu_chunk_size/no_prefill_ws/no_gpu_plan |
@@ -288,7 +288,7 @@ S-1 PR 단일, S-2~S-4 (binary 추가)는 별도 PR.
 | 2 | BackendArgs (13→9) | ✓ done | -5 field (switch_threshold/cuda_defer_sync/gpu_yield_every_layer/gpu_yield_us/use_rayon) + zero_copy→no_zero_copy (default ON 전환). 커밋 `5e5d1743` |
 | 3 | SamplingArgs (6) | ✓ done | cleanup 0. `repetition_window` = repeat-last-N(=64), `top_k`+`top_p` cascade는 표준 — 둘 다 보존 |
 | 4 | ProfileArgs (12→10) | ✓ done | `profile_per_head` 보존(H2O+ 분석). `dump_importance` → QcfArgs 재분류 |
-| 5 | KiviArgs (5) | 진행 예정 | `awqe` 매트릭스 gen만 — 측정 종결 시 삭제 검토 |
+| 5 | KiviArgs (5→4) | ✓ done | `awqe` flag → env var `LLMRS_KIVI_AWQE` 이전. 4 production 보존 |
 | 6 | OffloadArgs (3) | — | production 예상 |
 | 7 | EvictionArgs (14) | — | `h2o_debug` gen-only 삭제 검토 |
 | 8 | PrefillArgs (5→4) | ✓ partial done | `no_prefill_ws` 삭제 (batch 1) |

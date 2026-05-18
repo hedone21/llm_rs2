@@ -276,11 +276,13 @@ fn main() -> anyhow::Result<()> {
                 )
             })
             .collect();
-        if args.awqe {
+        // AWQE / AW-VOPR metric collection during KIVI residual flush.
+        // Env-gated (measurement-only); production decode path leaves it off.
+        if std::env::var("LLMRS_KIVI_AWQE").is_ok() {
             for cache in kv_caches.iter_mut() {
                 cache.set_awqe_enabled(true);
             }
-            eprintln!("[KIVI] AWQE + AW-VOPR enabled");
+            eprintln!("[KIVI] AWQE + AW-VOPR enabled (LLMRS_KIVI_AWQE)");
         }
         // ARGUS Step 6: resolve sample layers and inject score accumulator.
         let kivi_n_layers = kv_caches.len();

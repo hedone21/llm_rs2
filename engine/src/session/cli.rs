@@ -542,10 +542,6 @@ pub struct Args {
     #[arg(long, default_value = "attn")]
     pub qcf_mode: String,
 
-    /// Enable AWQE + AW-VOPR metrics for KIVI.
-    #[arg(long, default_value_t = false)]
-    pub awqe: bool,
-
     // ── Eval-LL mode (log-likelihood evaluation) ──
     /// Enable log-likelihood evaluation mode (downstream task accuracy)
     #[arg(long, default_value_t = false)]
