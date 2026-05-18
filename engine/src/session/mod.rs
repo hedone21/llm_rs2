@@ -7,6 +7,7 @@ pub mod decode_loop;
 pub mod defaults;
 pub mod forward;
 pub mod init;
+pub mod qcf_runtime;
 pub mod samplers;
 pub mod traits;
 
