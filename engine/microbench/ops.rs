@@ -191,8 +191,8 @@ mod bench {
         // llm_rs2 커널들 (production source)
         let our_src = format!(
             "{}\n{}\n",
-            include_str!("../../kernels/simple_ops.cl"),
-            include_str!("../../kernels/mul_mv_q4_0_f32.cl"),
+            include_str!("../kernels/simple_ops.cl"),
+            include_str!("../kernels/mul_mv_q4_0_f32.cl"),
         );
         let our_program = Program::builder()
             .devices(device)
@@ -202,42 +202,42 @@ mod bench {
 
         // llama.cpp 벤더 커널 — 파일별로 별도 program (각각 fp16 pragma 헤더 포함)
         let llama_q4_src =
-            include_str!("../../../.agent/research/microbench_ops/mul_mv_q4_0_f32_8x_flat.cl");
+            include_str!("../../.agent/research/microbench_ops/mul_mv_q4_0_f32_8x_flat.cl");
         let llama_program_q4 = Program::builder()
             .devices(device)
             .src(llama_q4_src)
             .cmplr_opt(&cl_opts)
             .build(&context)?;
 
-        let llama_rms_src = include_str!("../../../.agent/research/microbench_ops/rms_norm.cl");
+        let llama_rms_src = include_str!("../../.agent/research/microbench_ops/rms_norm.cl");
         let llama_program_rms = Program::builder()
             .devices(device)
             .src(llama_rms_src)
             .cmplr_opt(&cl_opts)
             .build(&context)?;
 
-        let llama_rope_src = include_str!("../../../.agent/research/microbench_ops/rope.cl");
+        let llama_rope_src = include_str!("../../.agent/research/microbench_ops/rope.cl");
         let llama_program_rope = Program::builder()
             .devices(device)
             .src(llama_rope_src)
             .cmplr_opt(&cl_opts)
             .build(&context)?;
 
-        let llama_silu_src = include_str!("../../../.agent/research/microbench_ops/silu.cl");
+        let llama_silu_src = include_str!("../../.agent/research/microbench_ops/silu.cl");
         let llama_program_silu = Program::builder()
             .devices(device)
             .src(llama_silu_src)
             .cmplr_opt(&cl_opts)
             .build(&context)?;
 
-        let llama_mul_src = include_str!("../../../.agent/research/microbench_ops/mul.cl");
+        let llama_mul_src = include_str!("../../.agent/research/microbench_ops/mul.cl");
         let llama_program_mul = Program::builder()
             .devices(device)
             .src(llama_mul_src)
             .cmplr_opt(&cl_opts)
             .build(&context)?;
 
-        let llama_add_src = include_str!("../../../.agent/research/microbench_ops/add.cl");
+        let llama_add_src = include_str!("../../.agent/research/microbench_ops/add.cl");
         let llama_program_add = Program::builder()
             .devices(device)
             .src(llama_add_src)
@@ -245,7 +245,7 @@ mod bench {
             .build(&context)?;
 
         let llama_ab_bi_src =
-            include_str!("../../../.agent/research/microbench_ops/mul_mat_Ab_Bi_8x4.cl");
+            include_str!("../../.agent/research/microbench_ops/mul_mat_Ab_Bi_8x4.cl");
         let llama_program_ab_bi = Program::builder()
             .devices(device)
             .src(llama_ab_bi_src)
@@ -528,7 +528,7 @@ mod bench {
         let line_stride_a = ne01 / 2;
         let block_stride_a = 4 * ne01;
         let simdgroup_width: usize = 64;
-        let gemv_src = include_str!("../../kernels/gemv_noshuffle_q4_0.cl");
+        let gemv_src = include_str!("../kernels/gemv_noshuffle_q4_0.cl");
         let defines = format!(
             "{} -DLINE_STRIDE_A={} -DBLOCK_STRIDE_A={} -DSIMDGROUP_WIDTH={}",
             state.cl_opts, line_stride_a, block_stride_a, simdgroup_width

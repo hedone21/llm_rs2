@@ -1,37 +1,49 @@
-//! M2.I production-equivalent 28-layer × N-token TBT microbench.
+//! M2.H 6th attempt — 2-graph split for SDK alias hint workaround.
 //!
-//! Reuses the M2.H 1-layer Qwen 2.5-1.5B graph (14 nodes, full decoder
-//! layer) but executes it 28 times per token to simulate the full Qwen
-//! 2.5-1.5B forward pass at decode. N=32 tokens are decoded back-to-back;
-//! the per-token wall-clock divided by 32 yields TBT directly comparable
-//! to the production OpenCL TBT (29.43 ms/tok at HEAD `f3dc4a4`).
+//! Background: M2.H 5th attempt confirmed that the QNN GPU SDK ignores alias
+//! hints (`OutputTensorAliased`, `InOutTensor` chained writes) when the writer
+//! op is sandwiched inside a multi-op graph composition. KvScatter wrote to a
+//! driver-internal staging buffer rather than the registered host APP_WRITE
+//! buffer, so FlashAttn read all-zero KV cache and the chain endpoint diverged
+//! by 1.34e-1 (RED).
 //!
-//! Simplification: a single finalised graph is reused for all 28 "layers"
-//! and across all tokens. Weights and KV cache do NOT advance between
-//! iterations — the goal is purely perf comparison, not correctness, so
-//! deterministic re-execution of identical inputs is fine. graphExecute
-//! cost per call is what matters; weight binding and per-call SDK overhead
-//! accumulate identically whether weights actually differ or not.
+//! Workaround: split the 14-node layer DAG into **two** sequential graphs and
+//! materialise the boundary tensors through host roundtrip. Within each graph
+//! the SDK still chains intermediates correctly (validated by the standalone
+//! KvScatter test in M2.E and the chain5 microbench).
 //!
-//! ## Verdict gate
-//! - `ratio = QNN_TBT / 29.43`
-//! - `<= 1.10` → GREEN (production wire-up viable)
-//! - `1.10 ~ 1.20` → YELLOW (microbench overhead remnants)
-//! - `> 1.20` → RED (SDK overhead accumulates at 28-layer scale)
+//! Graph layout:
+//!   * **Graph A** (7 nodes) — RmsNorm → Q/K/V proj → RoPE(Q) → RoPE(K) →
+//!     KvScatter. Endpoints exported to host: `q_rope` (rank-3 F32),
+//!     `k_cache` and `v_cache` (rank-4 F16, full HeadMajor capacity).
+//!   * **Graph B** (9 nodes) — FlashAttn → O proj → Add(residual1) →
+//!     RmsNorm(post) → gate/up proj → SiluMul → down proj → Add(residual2).
+//!     Inputs include the Graph A endpoints; endpoint is `x_out` (F32).
+//!
+//! Reference path remains the identical 14-stage raw-OpenCL chain so any
+//! drift is attributable to the QNN composition only.
+//!
+//! ## Pass-gate
+//! - `max_abs_err < 1e-2` (F16 + Q4_0 noise tolerance) → GREEN
+//! - 1e-2 ~ 1e-1 → YELLOW (partial accuracy)
+//! - > 1e-1 → RED (escalate to 3-graph split)
+//!
+//! `graphFinalize` budget per graph is doubled (~400 ms total) but is YELLOW
+//! only because correctness takes priority at this milestone.
 //!
 //! ## Build / deploy
 //!
 //! ```text
 //! cargo build --release --features qnn,opencl --target aarch64-linux-android \
-//!   --bin microbench_qnn_28layer_tbt
+//!   --bin microbench_qnn_qwen_layer_2graph
 //! cargo build --release -p qnn_oppkg --target aarch64-linux-android
 //! adb push target/aarch64-linux-android/release/libqnn_oppkg.so /data/local/tmp/
-//! python scripts/run_device.py -d galaxy_s25 microbench_qnn_28layer_tbt
+//! python scripts/run_device.py -d galaxy_s25 microbench_qnn_qwen_layer_2graph
 //! ```
 
 #[cfg(not(feature = "qnn"))]
 fn main() {
-    eprintln!("microbench_qnn_28layer_tbt requires --features qnn");
+    eprintln!("microbench_qnn_qwen_layer_2graph requires --features qnn");
     std::process::exit(2);
 }
 
@@ -82,8 +94,7 @@ fn main() -> anyhow::Result<()> {
     let n_kv: usize = 1; // attention sees the freshly written token only.
     let theta: f32 = 1_000_000.0; // Qwen2.5 RoPE theta.
 
-    println!("=== microbench_qnn_28layer_tbt (M2.I production-eq) ===\n");
-    println!("Layers per token: 28 (Qwen 2.5-1.5B), Tokens decoded: 32\n");
+    println!("=== microbench_qnn_qwen_layer_2graph (M2.H 6th) ===\n");
     println!("Op Package:       {}", PKG_PATH);
     println!("Interface symbol: {}", PKG_PROVIDER);
     println!(
@@ -91,8 +102,8 @@ fn main() -> anyhow::Result<()> {
         dim, n_head, n_kv_heads, head_dim, ffn_dim, kv_capacity
     );
     println!(
-        "Topology: 14 nodes — RmsNorm -> Q/K/V -> RoPE(Q,K) -> KvScatter -> FlashAttn -> O \
-         -> Add -> RmsNorm -> gate/up -> SiluMul -> down -> Add\n"
+        "Graph A (7 nodes) — RmsNorm -> Q/K/V -> RoPE(Q,K) -> KvScatter [host roundtrip]\n\
+         Graph B (9 nodes) — FlashAttn -> O -> Add -> RmsNorm -> gate/up -> SiluMul -> down -> Add\n"
     );
 
     let backend_lib_path = std::env::var("QNN_BACKEND_LIB")
@@ -110,10 +121,10 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
 
-    let simple_src = include_str!("../../kernels/simple_ops.cl");
-    let add_src = include_str!("../../kernels/add.cl");
-    let q40_src = include_str!("../../kernels/mul_mv_q4_0_f32_8x_flat.cl");
-    let fa_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
+    let simple_src = include_str!("../kernels/simple_ops.cl");
+    let add_src = include_str!("../kernels/add.cl");
+    let q40_src = include_str!("../kernels/mul_mv_q4_0_f32_8x_flat.cl");
+    let fa_src = include_str!("../kernels/flash_attn_f32_f16.cl");
     let cl_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math";
     let fa_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math -DDK=128 -DDV=128 \
                    -DBLOCK_M=32 -DBLOCK_N=32";
@@ -236,21 +247,41 @@ fn main() -> anyhow::Result<()> {
     );
 
     let pass = match result {
-        Ok((max_err, finalize_ms)) => {
+        Ok(metrics) => {
             let acc_thresh = 1e-2_f32;
-            let acc_pass = max_err < acc_thresh;
-            let fin_pass = finalize_ms <= 200.0;
+            let acc_pass = metrics.max_abs_err_xout < acc_thresh;
+            // Per-graph finalize budget is 200 ms; total budget 400 ms is YELLOW.
+            let fin_pass = metrics.finalize_a_ms <= 200.0 && metrics.finalize_b_ms <= 200.0;
+            println!("\n=== Per-endpoint correctness ===");
             println!(
-                "\nlayer max_abs_err = {:.6e}  thresh={:.0e}  {}",
-                max_err,
+                "  q_rope    max_abs_err = {:.6e}",
+                metrics.max_abs_err_q_rope
+            );
+            println!(
+                "  k_cache   max_abs_err = {:.6e}",
+                metrics.max_abs_err_kcache
+            );
+            println!(
+                "  v_cache   max_abs_err = {:.6e}",
+                metrics.max_abs_err_vcache
+            );
+            println!(
+                "  x_out     max_abs_err = {:.6e}  thresh={:.0e}  {}",
+                metrics.max_abs_err_xout,
                 acc_thresh,
                 if acc_pass { "PASS" } else { "FAIL" }
             );
+            println!("\n=== Per-graph finalize ===");
+            println!("  Graph A  graphFinalize = {:.2} ms", metrics.finalize_a_ms);
+            println!("  Graph B  graphFinalize = {:.2} ms", metrics.finalize_b_ms);
             println!(
-                "graphFinalize     = {:.2} ms        budget=200 ms  {}",
-                finalize_ms,
+                "  total    graphFinalize = {:.2} ms  budget=400 ms  {}",
+                metrics.finalize_a_ms + metrics.finalize_b_ms,
                 if fin_pass { "PASS" } else { "YELLOW" }
             );
+            println!("\n=== Per-graph execute ===");
+            println!("  Graph A  graphExecute  = {:.2} ms", metrics.execute_a_ms);
+            println!("  Graph B  graphExecute  = {:.2} ms", metrics.execute_b_ms);
             acc_pass && fin_pass
         }
         Err(e) => {
@@ -260,7 +291,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     println!(
-        "\n=== M2.H verdict: {} ===",
+        "\n=== M2.H 6th (2-graph) verdict: {} ===",
         if pass { "GREEN" } else { "RED" }
     );
 
@@ -320,6 +351,18 @@ fn pack_q40_soa(weights: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u16>) {
     (q, d)
 }
 
+#[cfg(feature = "qnn")]
+struct LayerMetrics {
+    max_abs_err_q_rope: f32,
+    max_abs_err_kcache: f32,
+    max_abs_err_vcache: f32,
+    max_abs_err_xout: f32,
+    finalize_a_ms: f64,
+    finalize_b_ms: f64,
+    execute_a_ms: f64,
+    execute_b_ms: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "qnn")]
 fn run_layer(
@@ -349,7 +392,7 @@ fn run_layer(
     pos: i32,
     n_kv: usize,
     theta: f32,
-) -> anyhow::Result<(f32, f64)> {
+) -> anyhow::Result<LayerMetrics> {
     use ocl::core::ArgVal;
     use qnn::*;
     use std::ffi::CString;
@@ -517,14 +560,6 @@ fn run_layer(
     up_u16!(&buf_kcache, &host_kv_zero);
     up_u16!(&buf_vcache, &host_kv_zero);
     ocl::core::finish(cl_q)?;
-
-    // ── M2.I breakdown timing — raw OpenCL chain wall-clock ─────────────────
-    // Measure stage 1..16 (per-stage cl_finish pattern, matching M2.I 1st
-    // measurement). Single-shot is acceptable here since per-stage finish
-    // already provides 14 sync points; graph-build closure / multi-run loop
-    // would require structural refactor of 363 lines of in-place kernel
-    // dispatch — out of scope for measurement-only sprint.
-    let t_raw_chain_start = Instant::now();
 
     // Stage 1: RmsNorm(pre) — kernel_rms_norm_simple(x, w, y1, dim, eps)
     let dim_i: i32 = dim as i32;
@@ -890,254 +925,8 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
-    let raw_chain_per_stage_ms = t_raw_chain_start.elapsed().as_secs_f64() * 1000.0;
 
-    // ── Raw OpenCL chain — chain-only sync mode (production-style) ──────────
-    // Re-run stage 1..16 without per-stage finishes; one cl_finish at the end.
-    // KV cache writes the same pos with deterministic data → same outputs.
-    // This measures kernel wall-clock without 14× sync overhead, matching the
-    // production engine's fused dispatch pattern (1 finish per layer batch).
-    let t_chain_only_start = Instant::now();
-    // Stage 1: RmsNorm(pre)
-    ocl::core::set_kernel_arg(k_rms, 0, ArgVal::mem(&buf_x))?;
-    ocl::core::set_kernel_arg(k_rms, 1, ArgVal::mem(&buf_rms_w_pre))?;
-    ocl::core::set_kernel_arg(k_rms, 2, ArgVal::mem(&buf_y1))?;
-    ocl::core::set_kernel_arg(k_rms, 3, ArgVal::scalar(&dim_i))?;
-    ocl::core::set_kernel_arg(k_rms, 4, ArgVal::scalar(&RMS_EPS))?;
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_rms,
-            1,
-            None,
-            &one3,
-            None,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    // Stages 2-4: Q/K/V projection (no finish in helper variant). Inline
-    // dispatches to skip the per-stage finish baked into `dispatch_q40`.
-    macro_rules! q40_no_finish {
-        ($bq:expr, $bd:expr, $bx:expr, $by:expr, $m:expr, $n:expr, $k:expr) => {{
-            let ne00 = $k as i32;
-            let ne01 = $n as i32;
-            let ne02: i32 = 1;
-            let ne10 = $k as i32;
-            let ne12: i32 = 1;
-            let ne0 = $n as i32;
-            let ne1 = $m as i32;
-            let r2: i32 = 1;
-            let r3: i32 = 1;
-            let off1: u64 = 0;
-            let offd: u64 = 0;
-            ocl::core::set_kernel_arg(k_q40, 0, ArgVal::mem($bq))?;
-            ocl::core::set_kernel_arg(k_q40, 1, ArgVal::mem($bd))?;
-            ocl::core::set_kernel_arg(k_q40, 2, ArgVal::mem($bx))?;
-            ocl::core::set_kernel_arg(k_q40, 3, ArgVal::scalar(&off1))?;
-            ocl::core::set_kernel_arg(k_q40, 4, ArgVal::mem($by))?;
-            ocl::core::set_kernel_arg(k_q40, 5, ArgVal::scalar(&offd))?;
-            ocl::core::set_kernel_arg(k_q40, 6, ArgVal::scalar(&ne00))?;
-            ocl::core::set_kernel_arg(k_q40, 7, ArgVal::scalar(&ne01))?;
-            ocl::core::set_kernel_arg(k_q40, 8, ArgVal::scalar(&ne02))?;
-            ocl::core::set_kernel_arg(k_q40, 9, ArgVal::scalar(&ne10))?;
-            ocl::core::set_kernel_arg(k_q40, 10, ArgVal::scalar(&ne12))?;
-            ocl::core::set_kernel_arg(k_q40, 11, ArgVal::scalar(&ne0))?;
-            ocl::core::set_kernel_arg(k_q40, 12, ArgVal::scalar(&ne1))?;
-            ocl::core::set_kernel_arg(k_q40, 13, ArgVal::scalar(&r2))?;
-            ocl::core::set_kernel_arg(k_q40, 14, ArgVal::scalar(&r3))?;
-            let global = [($n as usize).div_ceil(8) * 64, 1, 1];
-            let local = [64usize, 1, 1];
-            unsafe {
-                ocl::core::enqueue_kernel(
-                    cl_q,
-                    k_q40,
-                    3,
-                    None,
-                    &global,
-                    Some(local),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-        }};
-    }
-    q40_no_finish!(&buf_qq, &buf_qd, &buf_y1, &buf_q, 1usize, q_proj_out, dim);
-    q40_no_finish!(&buf_kq, &buf_kd, &buf_y1, &buf_k, 1usize, kv_proj_out, dim);
-    q40_no_finish!(&buf_vq, &buf_vd, &buf_y1, &buf_v, 1usize, kv_proj_out, dim);
-    // Stage 5: RoPE(Q)
-    ocl::core::set_kernel_arg(k_rope, 0, ArgVal::mem(&buf_q))?;
-    ocl::core::set_kernel_arg(k_rope, 1, ArgVal::scalar(&head_dim_i))?;
-    ocl::core::set_kernel_arg(k_rope, 2, ArgVal::scalar(&n_head_i))?;
-    ocl::core::set_kernel_arg(k_rope, 3, ArgVal::scalar(&seq_len_i))?;
-    ocl::core::set_kernel_arg(k_rope, 4, ArgVal::scalar(&pos))?;
-    ocl::core::set_kernel_arg(k_rope, 5, ArgVal::scalar(&theta))?;
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_rope,
-            1,
-            None,
-            &global_rope_q,
-            None,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    // Stage 6: RoPE(K)
-    ocl::core::set_kernel_arg(k_rope, 0, ArgVal::mem(&buf_k))?;
-    ocl::core::set_kernel_arg(k_rope, 1, ArgVal::scalar(&head_dim_i))?;
-    ocl::core::set_kernel_arg(k_rope, 2, ArgVal::scalar(&n_kv_heads_i))?;
-    ocl::core::set_kernel_arg(k_rope, 3, ArgVal::scalar(&seq_len_i))?;
-    ocl::core::set_kernel_arg(k_rope, 4, ArgVal::scalar(&pos))?;
-    ocl::core::set_kernel_arg(k_rope, 5, ArgVal::scalar(&theta))?;
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_rope,
-            1,
-            None,
-            &global_rope_k,
-            None,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    // Stage 7: KvScatter
-    ocl::core::set_kernel_arg(k_kvs, 0, ArgVal::mem(&buf_k))?;
-    ocl::core::set_kernel_arg(k_kvs, 1, ArgVal::mem(&buf_v))?;
-    ocl::core::set_kernel_arg(k_kvs, 2, ArgVal::mem(&buf_kcache))?;
-    ocl::core::set_kernel_arg(k_kvs, 3, ArgVal::mem(&buf_vcache))?;
-    ocl::core::set_kernel_arg(k_kvs, 4, ArgVal::scalar(&head_dim_i))?;
-    ocl::core::set_kernel_arg(k_kvs, 5, ArgVal::scalar(&capacity_i))?;
-    ocl::core::set_kernel_arg(k_kvs, 6, ArgVal::scalar(&pos))?;
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_kvs,
-            1,
-            None,
-            &global_kvs,
-            None,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    // Stage 8: FlashAttn — args already set above; just enqueue.
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_fa,
-            2,
-            None,
-            &global_fa,
-            Some(local_fa),
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    // Stage 9: O proj
-    q40_no_finish!(
-        &buf_oq,
-        &buf_od,
-        &buf_attn_o,
-        &buf_o,
-        1usize,
-        dim,
-        q_proj_out
-    );
-    // Stage 10: Add (residual #1)
-    ocl::core::set_kernel_arg(k_add, 0, ArgVal::mem(&buf_o))?;
-    ocl::core::set_kernel_arg(k_add, 1, ArgVal::scalar(&zero_u64_h))?;
-    ocl::core::set_kernel_arg(k_add, 2, ArgVal::mem(&buf_x))?;
-    ocl::core::set_kernel_arg(k_add, 3, ArgVal::scalar(&zero_u64_h))?;
-    ocl::core::set_kernel_arg(k_add, 4, ArgVal::mem(&buf_x_attn))?;
-    ocl::core::set_kernel_arg(k_add, 5, ArgVal::scalar(&zero_u64_h))?;
-    ocl::core::set_kernel_arg(k_add, 6, ArgVal::scalar(&n4_dim))?;
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_add,
-            1,
-            None,
-            &global_add_dim,
-            None,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    // Stage 11: RmsNorm(post)
-    ocl::core::set_kernel_arg(k_rms, 0, ArgVal::mem(&buf_x_attn))?;
-    ocl::core::set_kernel_arg(k_rms, 1, ArgVal::mem(&buf_rms_w_post))?;
-    ocl::core::set_kernel_arg(k_rms, 2, ArgVal::mem(&buf_y2))?;
-    ocl::core::set_kernel_arg(k_rms, 3, ArgVal::scalar(&dim_i))?;
-    ocl::core::set_kernel_arg(k_rms, 4, ArgVal::scalar(&RMS_EPS))?;
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_rms,
-            1,
-            None,
-            &one3,
-            None,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    // Stages 12-13: gate / up
-    q40_no_finish!(&buf_gq, &buf_gd, &buf_y2, &buf_gate, 1usize, ffn_dim, dim);
-    q40_no_finish!(&buf_uq, &buf_ud, &buf_y2, &buf_up, 1usize, ffn_dim, dim);
-    // Stage 14: SiluMul
-    ocl::core::set_kernel_arg(k_silu, 0, ArgVal::mem(&buf_gate))?;
-    ocl::core::set_kernel_arg(k_silu, 1, ArgVal::mem(&buf_up))?;
-    ocl::core::set_kernel_arg(k_silu, 2, ArgVal::scalar(&n4_ffn))?;
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_silu,
-            1,
-            None,
-            &global_silu,
-            None,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    // Stage 15: down proj
-    q40_no_finish!(&buf_dq, &buf_dd, &buf_gate, &buf_down, 1usize, dim, ffn_dim);
-    // Stage 16: Add (residual #2)
-    ocl::core::set_kernel_arg(k_add, 0, ArgVal::mem(&buf_down))?;
-    ocl::core::set_kernel_arg(k_add, 1, ArgVal::scalar(&zero_u64_h))?;
-    ocl::core::set_kernel_arg(k_add, 2, ArgVal::mem(&buf_x_attn))?;
-    ocl::core::set_kernel_arg(k_add, 3, ArgVal::scalar(&zero_u64_h))?;
-    ocl::core::set_kernel_arg(k_add, 4, ArgVal::mem(&buf_x_out))?;
-    ocl::core::set_kernel_arg(k_add, 5, ArgVal::scalar(&zero_u64_h))?;
-    ocl::core::set_kernel_arg(k_add, 6, ArgVal::scalar(&n4_dim))?;
-    unsafe {
-        ocl::core::enqueue_kernel(
-            cl_q,
-            k_add,
-            1,
-            None,
-            &global_add_dim,
-            None,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-    }
-    ocl::core::finish(cl_q)?;
-    let raw_chain_only_ms = t_chain_only_start.elapsed().as_secs_f64() * 1000.0;
-
-    eprintln!(
-        "[M2.I-breakdown] raw_chain_per_stage_finish = {:.3} ms (14 cl_finish)",
-        raw_chain_per_stage_ms
-    );
-    eprintln!(
-        "[M2.I-breakdown] raw_chain_only_finish      = {:.3} ms (1 cl_finish — production-like)",
-        raw_chain_only_ms
-    );
-
-    // Read back the reference layer output.
+    // Read back the reference layer output + Graph A boundary tensors.
     let mut ref_x_out = vec![0.0f32; dim];
     unsafe {
         ocl::core::enqueue_read_buffer(
@@ -1150,15 +939,15 @@ fn run_layer(
             None::<&mut ocl::core::Event>,
         )?;
     }
-    // M2.H 5th: also read attn_o + kcache slot for QNN-vs-ref diagnostic.
-    let mut ref_attn_o = vec![0.0f32; q_proj_out];
+    // 2-graph boundary: q_rope (rank-3), k_cache (rank-4 full), v_cache (rank-4 full).
+    let mut ref_q_rope = vec![0.0f32; q_proj_out];
     unsafe {
         ocl::core::enqueue_read_buffer(
             cl_q,
-            &buf_attn_o,
+            &buf_q,
             true,
             0,
-            &mut ref_attn_o,
+            &mut ref_q_rope,
             None::<ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
@@ -1175,40 +964,49 @@ fn run_layer(
             None::<&mut ocl::core::Event>,
         )?;
     }
+    let mut ref_vcache_full = vec![0u16; kv_total];
+    unsafe {
+        ocl::core::enqueue_read_buffer(
+            cl_q,
+            &buf_vcache,
+            true,
+            0,
+            &mut ref_vcache_full,
+            None::<ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
+    }
     ocl::core::finish(cl_q)?;
 
-    // ── 3. Path B: QNN single graph with 14 chained ops ──────────────────────
-    // rpcmem allocations for all host-backed graph endpoints.
+    // ── 3. Path B: QNN — 2-graph split (Graph A → host roundtrip → Graph B) ──
+    // rpcmem allocations. Graph A and Graph B share weights (Q4 buffers,
+    // RMS weights, residual `x`) plus dedicated boundary buffers
+    // (`q_rope`, `kcache`, `vcache`) that Graph A writes and Graph B reads.
     let bytes_x = (dim * 4) as i32;
     let bytes_rms = (dim * 4) as i32;
     let bytes_kv = (kv_total * 2) as i32;
+    let bytes_q_rope = (q_proj_out * 4) as i32;
     let bytes_x_out = (dim * 4) as i32;
     let bytes_q40 = |q: &[u8]| q.len() as i32;
     let bytes_q40d = |d: &[u16]| (d.len() * 2) as i32;
     let bytes_mask = 2_i32;
     let bytes_dummy = 4_i32;
-    // FlashAttn sinks: kernel reads `sinks_ptr[head_idx]` for head_idx ∈
-    // [0, n_head). The OpPackage path always binds a non-null mem object for
-    // sinks (no `mem_null` equivalent), so the buffer must be sized to n_head
-    // f32s. Host populates with -1e30 so `exp(sink - m_final) ≈ 0`,
-    // matching the raw-OpenCL `mem_null()` baseline. A 1-element buffer was
-    // the source of the M2.H 0.5-ratio: kernel read sinks[head_idx] = 0
-    // (zero-init) instead of -INFINITY, then `l_final += exp(0 - m_final)`
-    // inflated the denominator at small n_kv.
-    let bytes_sinks = (n_head * 4) as i32;
 
+    // Graph A inputs/weights (RmsNorm pre, Q/K/V Q4_0 weights).
     let rpc_x = unsafe { rpcmem_alloc(heap_id, flags, bytes_x) };
     let rpc_rms_pre = unsafe { rpcmem_alloc(heap_id, flags, bytes_rms) };
-    let rpc_rms_post = unsafe { rpcmem_alloc(heap_id, flags, bytes_rms) };
-    let rpc_kcache = unsafe { rpcmem_alloc(heap_id, flags, bytes_kv) };
-    let rpc_vcache = unsafe { rpcmem_alloc(heap_id, flags, bytes_kv) };
-    let rpc_x_out = unsafe { rpcmem_alloc(heap_id, flags, bytes_x_out) };
     let rpc_qq = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40(&qq_q)) };
     let rpc_qd = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40d(&qq_d)) };
     let rpc_kq = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40(&qk_q)) };
     let rpc_kd = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40d(&qk_d)) };
     let rpc_vq = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40(&qv_q)) };
     let rpc_vd = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40d(&qv_d)) };
+    // Graph A endpoints (host-readable) = Graph B inputs.
+    let rpc_q_rope = unsafe { rpcmem_alloc(heap_id, flags, bytes_q_rope) };
+    let rpc_kcache = unsafe { rpcmem_alloc(heap_id, flags, bytes_kv) };
+    let rpc_vcache = unsafe { rpcmem_alloc(heap_id, flags, bytes_kv) };
+    // Graph B-only weights.
+    let rpc_rms_post = unsafe { rpcmem_alloc(heap_id, flags, bytes_rms) };
     let rpc_oq = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40(&qo_q)) };
     let rpc_od = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40d(&qo_d)) };
     let rpc_gq = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40(&qg_q)) };
@@ -1217,13 +1015,16 @@ fn run_layer(
     let rpc_ud = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40d(&qu_d)) };
     let rpc_dq = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40(&qd_q)) };
     let rpc_dd = unsafe { rpcmem_alloc(heap_id, flags, bytes_q40d(&qd_d)) };
+    // Graph B endpoint + FlashAttn auxiliaries.
+    let rpc_x_out = unsafe { rpcmem_alloc(heap_id, flags, bytes_x_out) };
     let rpc_mask = unsafe { rpcmem_alloc(heap_id, flags, bytes_mask) };
-    let rpc_sinks = unsafe { rpcmem_alloc(heap_id, flags, bytes_sinks) };
+    let rpc_sinks = unsafe { rpcmem_alloc(heap_id, flags, bytes_dummy) };
     let rpc_score = unsafe { rpcmem_alloc(heap_id, flags, bytes_dummy) };
     anyhow::ensure!(
         !rpc_x.is_null()
             && !rpc_rms_pre.is_null()
             && !rpc_rms_post.is_null()
+            && !rpc_q_rope.is_null()
             && !rpc_kcache.is_null()
             && !rpc_vcache.is_null()
             && !rpc_x_out.is_null()
@@ -1264,8 +1065,11 @@ fn run_layer(
             rpc_rms_post as *mut u8,
             bytes_rms as usize,
         );
+        // Zero-init Graph A outputs (q_rope) and KV cache before Graph A run.
+        std::ptr::write_bytes(rpc_q_rope as *mut u8, 0, bytes_q_rope as usize);
         std::ptr::write_bytes(rpc_kcache as *mut u8, 0, bytes_kv as usize);
         std::ptr::write_bytes(rpc_vcache as *mut u8, 0, bytes_kv as usize);
+        std::ptr::write_bytes(rpc_x_out as *mut u8, 0, bytes_x_out as usize);
         std::ptr::copy_nonoverlapping(qq_q.as_ptr(), rpc_qq as *mut u8, qq_q.len());
         std::ptr::copy_nonoverlapping(
             qq_d.as_ptr() as *const u8,
@@ -1309,20 +1113,16 @@ fn run_layer(
             qd_d.len() * 2,
         );
         std::ptr::write_bytes(rpc_mask as *mut u8, 0, bytes_mask as usize);
-        // Sinks: -1e30 per head — neutralises kernel's sink-attention path
-        // so output matches raw-OpenCL `mem_null()` baseline (M2.H fix).
-        let neg_huge: f32 = -1.0e30f32;
-        for i in 0..n_head {
-            std::ptr::write_unaligned((rpc_sinks as *mut u8).add(i * 4) as *mut f32, neg_huge);
-        }
+        std::ptr::write_bytes(rpc_sinks as *mut u8, 0, bytes_dummy as usize);
         std::ptr::write_bytes(rpc_score as *mut u8, 0, bytes_dummy as usize);
     }
 
     let fd_x = unsafe { rpcmem_to_fd(rpc_x) };
     let fd_rms_pre = unsafe { rpcmem_to_fd(rpc_rms_pre) };
     let fd_rms_post = unsafe { rpcmem_to_fd(rpc_rms_post) };
+    let fd_q_rope = unsafe { rpcmem_to_fd(rpc_q_rope) };
     let fd_kcache = unsafe { rpcmem_to_fd(rpc_kcache) };
-    let _fd_vcache = unsafe { rpcmem_to_fd(rpc_vcache) };
+    let fd_vcache = unsafe { rpcmem_to_fd(rpc_vcache) };
     let fd_x_out = unsafe { rpcmem_to_fd(rpc_x_out) };
     let fd_qq = unsafe { rpcmem_to_fd(rpc_qq) };
     let fd_qd = unsafe { rpcmem_to_fd(rpc_qd) };
@@ -1342,7 +1142,7 @@ fn run_layer(
     let fd_sinks = unsafe { rpcmem_to_fd(rpc_sinks) };
     let fd_score = unsafe { rpcmem_to_fd(rpc_score) };
 
-    // ── 4. Build graph: declare tensors then 14 nodes ───────────────────────
+    // ── 4. Shared tensor metadata (CStrings + dims; must outlive graphs) ────
     let qp = Qnn_QuantizeParams_t {
         encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
         quantizationEncoding: Qnn_QuantizationEncoding_t_QNN_QUANTIZATION_ENCODING_UNDEFINED,
@@ -1370,16 +1170,29 @@ fn run_layer(
             },
         },
     };
+    let build_tensor = |ttype, dtype, rank: u32, dims_ptr: *mut u32, name: *const c_char| {
+        let mut t = Qnn_Tensor_t {
+            version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+            __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+                v1: mk_tv1(ttype, dtype, rank, dims_ptr),
+            },
+        };
+        t.__bindgen_anon_1.v1.name = name;
+        t
+    };
 
-    // Dimensions storage. Each Vec must outlive graph build (pointer stored).
-    // M2.H 5th attempt: x_in dropped from rank 3 [1, 1, dim] to rank 2 [1, dim]
-    // to match RmsNorm op build_layout expectation. rank 3 caused only the
-    // first element of y1 to be processed (bisect diagnostic — write coverage
-    // 0.05% on y1).
+    let app_w = Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE;
+    let app_r = Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ;
+    let native = Qnn_TensorType_t_QNN_TENSOR_TYPE_NATIVE;
+    let f32_t = Qnn_DataType_t_QNN_DATATYPE_FLOAT_32;
+    let f16_t = Qnn_DataType_t_QNN_DATATYPE_FLOAT_16;
+    let u8_t = Qnn_DataType_t_QNN_DATATYPE_UINT_8;
+
+    // Dimensions (mut Vec — pointers stored in Qnn_TensorV1_t.dimensions).
     let mut dims_x: Vec<u32> = vec![1, dim as u32];
     let mut dims_rms_pre = vec![dim as u32];
     let mut dims_rms_post = vec![dim as u32];
-    let mut dims_y1 = vec![1, dim as u32];
+    let mut dims_y1 = vec![1u32, dim as u32];
     let mut dims_qq = vec![qq_q.len() as u32];
     let mut dims_qd = vec![qq_d.len() as u32];
     let mut dims_kq = vec![qk_q.len() as u32];
@@ -1394,10 +1207,6 @@ fn run_layer(
     let mut dims_ud = vec![qu_d.len() as u32];
     let mut dims_dq = vec![qd_q.len() as u32];
     let mut dims_dd = vec![qd_d.len() as u32];
-    // M2.H 3rd attempt: matmul outputs reshape directly to rank-3 attention
-    // views so RoPE / FlashAttn can consume them without an explicit Reshape
-    // node. matmul build_layout is rank-flexible (M2.H fix in
-    // crates/qnn_oppkg/src/ops/matmul_q40_f32.rs).
     let mut dims_q = vec![1u32, n_head as u32, head_dim as u32];
     let mut dims_kvec = vec![1u32, n_kv_heads as u32, head_dim as u32];
     let mut dims_vvec = vec![1u32, n_kv_heads as u32, head_dim as u32];
@@ -1405,22 +1214,21 @@ fn run_layer(
     let mut dims_k_rope = vec![1u32, n_kv_heads as u32, head_dim as u32];
     let mut dims_kcache = vec![1u32, n_kv_heads as u32, kv_capacity as u32, head_dim as u32];
     let mut dims_vcache = dims_kcache.clone();
-    let mut dims_q_fa = vec![1u32, n_head as u32, head_dim as u32];
     let mut dims_attn_o = vec![1u32, n_head as u32, head_dim as u32];
     let mut dims_o = vec![1u32, dim as u32];
     let mut dims_x_attn = vec![1u32, dim as u32];
-    let mut dims_y2 = vec![1, dim as u32];
+    let mut dims_y2 = vec![1u32, dim as u32];
     let mut dims_gate = vec![1u32, ffn_dim as u32];
     let mut dims_up = vec![1u32, ffn_dim as u32];
     let mut dims_silu_out = vec![1u32, ffn_dim as u32];
     let mut dims_down = vec![1u32, dim as u32];
-    // M2.H 5th: x_out follows x_in rank to keep Add(residual2) shapes consistent.
     let mut dims_x_out = vec![1u32, dim as u32];
     let mut dims_mask = vec![n_kv as u32];
-    let mut dims_sinks = vec![n_head as u32];
+    let mut dims_sinks = vec![1u32];
     let mut dims_score = vec![1u32];
 
-    // Tensor names (CStrings must outlive graph build).
+    // Tensor name CStrings — separate copies per graph because both graphs
+    // independently call tensorCreateGraphTensor (names are scoped per graph).
     let nm_x = CString::new("x").unwrap();
     let nm_rms_pre = CString::new("rms_pre").unwrap();
     let nm_rms_post = CString::new("rms_post").unwrap();
@@ -1459,227 +1267,96 @@ fn run_layer(
     let nm_sinks = CString::new("sinks").unwrap();
     let nm_score = CString::new("score").unwrap();
 
-    // Helper: build tensor with given type/dtype/rank/dims.
-    let build_tensor = |ttype, dtype, rank: u32, dims_ptr: *mut u32, name: *const c_char| {
-        let mut t = Qnn_Tensor_t {
-            version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
-            __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-                v1: mk_tv1(ttype, dtype, rank, dims_ptr),
-            },
-        };
-        t.__bindgen_anon_1.v1.name = name;
-        t
-    };
-
-    let app_w = Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE;
-    let app_r = Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ;
-    let native = Qnn_TensorType_t_QNN_TENSOR_TYPE_NATIVE;
-    let f32_t = Qnn_DataType_t_QNN_DATATYPE_FLOAT_32;
-    let f16_t = Qnn_DataType_t_QNN_DATATYPE_FLOAT_16;
-    let u8_t = Qnn_DataType_t_QNN_DATATYPE_UINT_8;
-
-    // Graph endpoints (APP_WRITE/APP_READ) — host buffers via memHandle.
-    // M2.H 5th: rank 2 [1, dim] (was rank 3 [1, 1, dim]). See dims_x comment.
-    let mut t_x = build_tensor(app_w, f32_t, 2, dims_x.as_mut_ptr(), nm_x.as_ptr());
-    let mut t_rms_pre = build_tensor(
+    // ── 5. Graph A (RmsNorm pre → Q/K/V proj → RoPE Q/K → KvScatter) ────────
+    // Endpoints:
+    //   q_rope  → APP_READ (F32, RoPE Q output)
+    //   kcache  → APP_WRITE (KvScatter InOutTensor — read+write in-place)
+    //   vcache  → APP_READ (KvScatter OutputTensor — write-only)
+    // Internal NATIVE intermediates: y1, q, k, v, k_rope.
+    //
+    // The KvScatter standalone test (M2.E) validated:
+    //   inputs[2] (k_dst) = APP_WRITE  (InOutTensor — host pre-state preserved)
+    //   outputs[0] (v_dst) = APP_READ  (OutputTensor — pure produce)
+    // We mirror that pattern here. Inverting v_dst to APP_WRITE in 2-graph
+    // first-attempt produced graphAddNode err=0x1775 (SDK rejects APP_WRITE
+    // tensor declared as a graph OutputTensor).
+    let mut t_x_a = build_tensor(app_w, f32_t, 2, dims_x.as_mut_ptr(), nm_x.as_ptr());
+    let mut t_rms_pre_a = build_tensor(
         app_w,
         f32_t,
         1,
         dims_rms_pre.as_mut_ptr(),
         nm_rms_pre.as_ptr(),
     );
-    let mut t_rms_post = build_tensor(
+    let mut t_qq_a = build_tensor(app_w, u8_t, 1, dims_qq.as_mut_ptr(), nm_qq.as_ptr());
+    let mut t_qd_a = build_tensor(app_w, f16_t, 1, dims_qd.as_mut_ptr(), nm_qd.as_ptr());
+    let mut t_kq_a = build_tensor(app_w, u8_t, 1, dims_kq.as_mut_ptr(), nm_kq.as_ptr());
+    let mut t_kd_a = build_tensor(app_w, f16_t, 1, dims_kd.as_mut_ptr(), nm_kd.as_ptr());
+    let mut t_vq_a = build_tensor(app_w, u8_t, 1, dims_vq.as_mut_ptr(), nm_vq.as_ptr());
+    let mut t_vd_a = build_tensor(app_w, f16_t, 1, dims_vd.as_mut_ptr(), nm_vd.as_ptr());
+    let mut t_kcache_a = build_tensor(
         app_w,
-        f32_t,
-        1,
-        dims_rms_post.as_mut_ptr(),
-        nm_rms_post.as_ptr(),
-    );
-    let mut t_qq = build_tensor(app_w, u8_t, 1, dims_qq.as_mut_ptr(), nm_qq.as_ptr());
-    let mut t_qd = build_tensor(app_w, f16_t, 1, dims_qd.as_mut_ptr(), nm_qd.as_ptr());
-    let mut t_kq = build_tensor(app_w, u8_t, 1, dims_kq.as_mut_ptr(), nm_kq.as_ptr());
-    let mut t_kd = build_tensor(app_w, f16_t, 1, dims_kd.as_mut_ptr(), nm_kd.as_ptr());
-    let mut t_vq = build_tensor(app_w, u8_t, 1, dims_vq.as_mut_ptr(), nm_vq.as_ptr());
-    let mut t_vd = build_tensor(app_w, f16_t, 1, dims_vd.as_mut_ptr(), nm_vd.as_ptr());
-    let mut t_oq = build_tensor(app_w, u8_t, 1, dims_oq.as_mut_ptr(), nm_oq.as_ptr());
-    let mut t_od = build_tensor(app_w, f16_t, 1, dims_od.as_mut_ptr(), nm_od.as_ptr());
-    let mut t_gq = build_tensor(app_w, u8_t, 1, dims_gq.as_mut_ptr(), nm_gq.as_ptr());
-    let mut t_gd = build_tensor(app_w, f16_t, 1, dims_gd.as_mut_ptr(), nm_gd.as_ptr());
-    let mut t_uq = build_tensor(app_w, u8_t, 1, dims_uq.as_mut_ptr(), nm_uq.as_ptr());
-    let mut t_ud = build_tensor(app_w, f16_t, 1, dims_ud.as_mut_ptr(), nm_ud.as_ptr());
-    let mut t_dq = build_tensor(app_w, u8_t, 1, dims_dq.as_mut_ptr(), nm_dq.as_ptr());
-    let mut t_dd = build_tensor(app_w, f16_t, 1, dims_dd.as_mut_ptr(), nm_dd.as_ptr());
-    // KV cache: APP_WRITE — graph reads/writes them through host-registered
-    // fds. NOTE: kcache=NATIVE was attempted (M2.H 5th) but SDK rejects NATIVE
-    // tensors bound as `InOutTensor` in KvScatter (graphAddNode err=0x1777).
-    // Reverted to APP_WRITE; root-cause analysis continues elsewhere.
-    // M2.H multi-output: KvScatter outputs[0] = kcache. SDK requires output
-    // tensors to be APP_READ (or NATIVE). NATIVE blocks host memHandle
-    // registration; APP_READ lets us bind an fd while satisfying the output
-    // type check. The kcache also serves as FA input within the same graph;
-    // SDK accepts read-after-write within graph scope for APP_READ tensors.
-    let mut t_kcache = build_tensor(
-        app_r,
         f16_t,
         4,
         dims_kcache.as_mut_ptr(),
         nm_kcache.as_ptr(),
     );
-    // vcache: APP_WRITE — symmetric with kcache. With M2.H multi-output
-    // KvScatter (both kcache and vcache as claimed outputs), NATIVE on one
-    // output causes graphAddNode err=0x1775 (validation failure). Keeping
-    // both APP_WRITE matches the kvs standalone microbench (M2.E) pattern
-    // where both dst tensors are host-registered fds. Downstream consumer
-    // (FA) reads them through the same memHandle.
-    let mut t_vcache = build_tensor(
+    let mut t_vcache_a = build_tensor(
         app_r,
         f16_t,
         4,
         dims_vcache.as_mut_ptr(),
         nm_vcache.as_ptr(),
     );
-    // FlashAttn auxiliaries (mask zero / sinks / score dummy) — APP_WRITE.
-    let mut t_mask = build_tensor(app_w, f16_t, 1, dims_mask.as_mut_ptr(), nm_mask.as_ptr());
-    let mut t_sinks = build_tensor(app_w, f32_t, 1, dims_sinks.as_mut_ptr(), nm_sinks.as_ptr());
-    let mut t_score = build_tensor(app_w, f32_t, 1, dims_score.as_mut_ptr(), nm_score.as_ptr());
-    // Output of layer.
-    // M2.H 5th: rank 2 [1, dim] to match x_in shape (Add(residual2) needs same rank).
-    let mut t_x_out = build_tensor(app_r, f32_t, 2, dims_x_out.as_mut_ptr(), nm_x_out.as_ptr());
-
-    // Intermediates (NATIVE).
-    let mut t_y1 = build_tensor(native, f32_t, 2, dims_y1.as_mut_ptr(), nm_y1.as_ptr());
-    // M2.H 3rd attempt: rank-3 reshape views — matmul output rank == RoPE/
-    // FlashAttn input rank, eliminating the previous rank-mismatch finalize
-    // failure (graphFinalize err=0x1786).
-    let mut t_q = build_tensor(native, f32_t, 3, dims_q.as_mut_ptr(), nm_q.as_ptr());
-    let mut t_k = build_tensor(native, f32_t, 3, dims_kvec.as_mut_ptr(), nm_k.as_ptr());
-    let mut t_v = build_tensor(native, f32_t, 3, dims_vvec.as_mut_ptr(), nm_v.as_ptr());
-    let mut t_q_rope = build_tensor(
-        native,
+    let mut t_q_rope_a = build_tensor(
+        app_r,
         f32_t,
         3,
         dims_q_rope.as_mut_ptr(),
         nm_q_rope.as_ptr(),
     );
-    let mut t_k_rope = build_tensor(
+    // NATIVE intermediates inside Graph A.
+    let mut t_y1_a = build_tensor(native, f32_t, 2, dims_y1.as_mut_ptr(), nm_y1.as_ptr());
+    let mut t_q_a = build_tensor(native, f32_t, 3, dims_q.as_mut_ptr(), nm_q.as_ptr());
+    let mut t_k_a = build_tensor(native, f32_t, 3, dims_kvec.as_mut_ptr(), nm_k.as_ptr());
+    let mut t_v_a = build_tensor(native, f32_t, 3, dims_vvec.as_mut_ptr(), nm_v.as_ptr());
+    let mut t_k_rope_a = build_tensor(
         native,
         f32_t,
         3,
         dims_k_rope.as_mut_ptr(),
         nm_k_rope.as_ptr(),
     );
-    let mut t_attn_o = build_tensor(
-        native,
-        f32_t,
-        3,
-        dims_attn_o.as_mut_ptr(),
-        nm_attn_o.as_ptr(),
-    );
-    // Reuse FlashAttn input shape for q_fa.
-    let mut _t_q_fa = build_tensor(native, f32_t, 3, dims_q_fa.as_mut_ptr(), nm_q_rope.as_ptr());
-    let mut t_o = build_tensor(native, f32_t, 2, dims_o.as_mut_ptr(), nm_o.as_ptr());
-    let mut t_x_attn = build_tensor(
-        native,
-        f32_t,
-        2,
-        dims_x_attn.as_mut_ptr(),
-        nm_x_attn.as_ptr(),
-    );
-    let mut t_y2 = build_tensor(native, f32_t, 2, dims_y2.as_mut_ptr(), nm_y2.as_ptr());
-    let mut t_gate = build_tensor(native, f32_t, 2, dims_gate.as_mut_ptr(), nm_gate.as_ptr());
-    let mut t_up = build_tensor(native, f32_t, 2, dims_up.as_mut_ptr(), nm_up.as_ptr());
-    let mut t_silu_out = build_tensor(
-        native,
-        f32_t,
-        2,
-        dims_silu_out.as_mut_ptr(),
-        nm_silu_out.as_ptr(),
-    );
-    let mut t_down = build_tensor(native, f32_t, 2, dims_down.as_mut_ptr(), nm_down.as_ptr());
 
-    let g_name = CString::new("qwen_layer_graph").unwrap();
-    let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
-
-    // P0 — disableMemoryOptimizations + disableNodeOptimizations
-    // GPU header 측 struct는 engine bindgen이 안 가져오므로 manual layout
-    // (QnnGpuGraph.h:50-55: precision u32 + 3 u8 = 8 bytes)
-    #[repr(C)]
-    struct QnnGpuGraph_CustomConfig_local {
-        precision: u32, // QnnGpu_Precision_t
-        disable_memory_optimizations: u8,
-        disable_node_optimizations: u8,
-        disable_queue_recording: u8,
-        _pad: u8,
-    }
-    const QNN_GPU_PRECISION_USER_PROVIDED: u32 = 3;
-    // M2.I 재측정: P0 disable 설정 해제. sinks fix로 정확성 회복 후 SDK 기본 최적화 활성화.
-    let mut gpu_custom = QnnGpuGraph_CustomConfig_local {
-        precision: QNN_GPU_PRECISION_USER_PROVIDED,
-        disable_memory_optimizations: 0,
-        disable_node_optimizations: 0,
-        disable_queue_recording: 0,
-        _pad: 0,
-    };
-    let mut graph_cfg = qnn::QnnGraph_Config_t {
-        option: qnn::QnnGraph_ConfigOption_t_QNN_GRAPH_CONFIG_OPTION_CUSTOM,
-        __bindgen_anon_1: qnn::QnnGraph_Config_t__bindgen_ty_1 {
-            customConfig: &mut gpu_custom as *mut _ as *mut _,
-        },
-    };
-    let mut configs: [*const qnn::QnnGraph_Config_t; 2] = [&graph_cfg as *const _, ptr::null()];
-
+    let g_a_name = CString::new("qwen_layer_graph_a").unwrap();
+    let mut graph_a: Qnn_GraphHandle_t = ptr::null_mut();
     let err =
-        unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), configs.as_mut_ptr(), &mut graph) };
-    anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
-    eprintln!("[P0] graphCreate with disableMemoryOptimizations=1 disableNodeOptimizations=1 OK");
+        unsafe { (v.graphCreate.unwrap())(ctx, g_a_name.as_ptr(), ptr::null_mut(), &mut graph_a) };
+    anyhow::ensure!(err == 0, "graphCreate(A) err=0x{:x}", err);
 
-    // Register tensors. Order matters only for debugging; uniqueness by name
-    // suffices.
-    let registrations: &mut [(&str, &mut Qnn_Tensor_t)] = &mut [
-        ("x", &mut t_x),
-        ("rms_pre", &mut t_rms_pre),
-        ("rms_post", &mut t_rms_post),
-        ("qq", &mut t_qq),
-        ("qd", &mut t_qd),
-        ("kq", &mut t_kq),
-        ("kd", &mut t_kd),
-        ("vq", &mut t_vq),
-        ("vd", &mut t_vd),
-        ("oq", &mut t_oq),
-        ("od", &mut t_od),
-        ("gq", &mut t_gq),
-        ("gd", &mut t_gd),
-        ("uq", &mut t_uq),
-        ("ud", &mut t_ud),
-        ("dq", &mut t_dq),
-        ("dd", &mut t_dd),
-        ("kcache", &mut t_kcache),
-        ("vcache", &mut t_vcache),
-        ("mask", &mut t_mask),
-        ("sinks", &mut t_sinks),
-        ("score", &mut t_score),
-        ("x_out", &mut t_x_out),
-        ("y1", &mut t_y1),
-        ("q", &mut t_q),
-        ("k", &mut t_k),
-        ("v", &mut t_v),
-        ("q_rope", &mut t_q_rope),
-        ("k_rope", &mut t_k_rope),
-        ("attn_o", &mut t_attn_o),
-        ("o", &mut t_o),
-        ("x_attn", &mut t_x_attn),
-        ("y2", &mut t_y2),
-        ("gate", &mut t_gate),
-        ("up", &mut t_up),
-        ("silu_out", &mut t_silu_out),
-        ("down", &mut t_down),
+    let regs_a: &mut [(&str, &mut Qnn_Tensor_t)] = &mut [
+        ("x", &mut t_x_a),
+        ("rms_pre", &mut t_rms_pre_a),
+        ("qq", &mut t_qq_a),
+        ("qd", &mut t_qd_a),
+        ("kq", &mut t_kq_a),
+        ("kd", &mut t_kd_a),
+        ("vq", &mut t_vq_a),
+        ("vd", &mut t_vd_a),
+        ("kcache", &mut t_kcache_a),
+        ("vcache", &mut t_vcache_a),
+        ("q_rope", &mut t_q_rope_a),
+        ("y1", &mut t_y1_a),
+        ("q", &mut t_q_a),
+        ("k", &mut t_k_a),
+        ("v", &mut t_v_a),
+        ("k_rope", &mut t_k_rope_a),
     ];
-    for (label, t) in registrations.iter_mut() {
-        let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, *t) };
-        anyhow::ensure!(err == 0, "tensorCreate({}) err=0x{:x}", label, err);
+    for (label, t) in regs_a.iter_mut() {
+        let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph_a, *t) };
+        anyhow::ensure!(err == 0, "graph_a tensorCreate({}) err=0x{:x}", label, err);
     }
 
-    // ── 5. Add 14 nodes ─────────────────────────────────────────────────────
     let pkg = CString::new("qnn_oppkg").unwrap();
     let make_op = |name: *const c_char,
                    typ: *const c_char,
@@ -1708,7 +1385,7 @@ fn run_layer(
         }
     };
 
-    // Reusable param names.
+    // Param names (shared across both graphs).
     let pn_start_pos = CString::new("start_pos").unwrap();
     let pn_theta = CString::new("theta").unwrap();
     let pn_head_dim = CString::new("head_dim").unwrap();
@@ -1720,7 +1397,6 @@ fn run_layer(
     let pn_kv_capacity = CString::new("kv_capacity").unwrap();
     let pn_head_dim_fa = CString::new("head_dim").unwrap();
 
-    // RoPE params (separate copies — Q/K share but we keep independent storage).
     let mk_rope_params = |start: i32, th: f32| {
         [
             Qnn_Param_t {
@@ -1785,6 +1461,427 @@ fn run_layer(
         },
     ];
 
+    let ot_rms = CString::new("CustomRmsNorm").unwrap();
+    let ot_q40 = CString::new("CustomMatMulQ40F32").unwrap();
+    let ot_rope = CString::new("CustomRope").unwrap();
+    let ot_kvs = CString::new("CustomKvScatter").unwrap();
+    let ot_fa = CString::new("CustomFlashAttn").unwrap();
+    let ot_silu = CString::new("CustomSiluMul").unwrap();
+    let ot_add = CString::new("CustomAdd").unwrap();
+
+    // Graph A node names.
+    let on_a_rms = CString::new("a_rms_pre").unwrap();
+    let on_a_q = CString::new("a_q_proj").unwrap();
+    let on_a_k = CString::new("a_k_proj").unwrap();
+    let on_a_v = CString::new("a_v_proj").unwrap();
+    let on_a_rope_q = CString::new("a_rope_q").unwrap();
+    let on_a_rope_k = CString::new("a_rope_k").unwrap();
+    let on_a_kvs = CString::new("a_kvs").unwrap();
+
+    // Graph A op input/output arrays. Note q_rope is APP_READ — RoPE Q writes
+    // to it directly so the host can observe q after RoPE.
+    let mut a_in_rms = [t_x_a, t_rms_pre_a];
+    let mut a_out_rms = [t_y1_a];
+    let mut a_in_q = [t_qq_a, t_qd_a, t_y1_a];
+    let mut a_out_q = [t_q_a];
+    let mut a_in_k = [t_kq_a, t_kd_a, t_y1_a];
+    let mut a_out_k = [t_k_a];
+    let mut a_in_v = [t_vq_a, t_vd_a, t_y1_a];
+    let mut a_out_v = [t_v_a];
+    let mut a_in_rope_q = [t_q_a];
+    let mut a_out_rope_q = [t_q_rope_a];
+    let mut a_in_rope_k = [t_k_a];
+    let mut a_out_rope_k = [t_k_rope_a];
+    let mut a_in_kvs = [t_k_rope_a, t_v_a, t_kcache_a];
+    let mut a_out_kvs = [t_vcache_a];
+
+    type NodeSpec<'a> = (
+        *const c_char,
+        *const c_char,
+        *mut Qnn_Tensor_t,
+        u32,
+        *mut Qnn_Tensor_t,
+        u32,
+        *mut Qnn_Param_t,
+        u32,
+        &'a str,
+    );
+    let nodes_a: [NodeSpec<'_>; 7] = [
+        (
+            on_a_rms.as_ptr(),
+            ot_rms.as_ptr(),
+            a_in_rms.as_mut_ptr(),
+            2,
+            a_out_rms.as_mut_ptr(),
+            1,
+            ptr::null_mut(),
+            0,
+            "A.RmsNorm(pre)",
+        ),
+        (
+            on_a_q.as_ptr(),
+            ot_q40.as_ptr(),
+            a_in_q.as_mut_ptr(),
+            3,
+            a_out_q.as_mut_ptr(),
+            1,
+            ptr::null_mut(),
+            0,
+            "A.Q proj",
+        ),
+        (
+            on_a_k.as_ptr(),
+            ot_q40.as_ptr(),
+            a_in_k.as_mut_ptr(),
+            3,
+            a_out_k.as_mut_ptr(),
+            1,
+            ptr::null_mut(),
+            0,
+            "A.K proj",
+        ),
+        (
+            on_a_v.as_ptr(),
+            ot_q40.as_ptr(),
+            a_in_v.as_mut_ptr(),
+            3,
+            a_out_v.as_mut_ptr(),
+            1,
+            ptr::null_mut(),
+            0,
+            "A.V proj",
+        ),
+        (
+            on_a_rope_q.as_ptr(),
+            ot_rope.as_ptr(),
+            a_in_rope_q.as_mut_ptr(),
+            1,
+            a_out_rope_q.as_mut_ptr(),
+            1,
+            rope_q_params.as_mut_ptr(),
+            2,
+            "A.RoPE Q",
+        ),
+        (
+            on_a_rope_k.as_ptr(),
+            ot_rope.as_ptr(),
+            a_in_rope_k.as_mut_ptr(),
+            1,
+            a_out_rope_k.as_mut_ptr(),
+            1,
+            rope_k_params.as_mut_ptr(),
+            2,
+            "A.RoPE K",
+        ),
+        (
+            on_a_kvs.as_ptr(),
+            ot_kvs.as_ptr(),
+            a_in_kvs.as_mut_ptr(),
+            3,
+            a_out_kvs.as_mut_ptr(),
+            1,
+            kvs_params.as_mut_ptr(),
+            3,
+            "A.KvScatter",
+        ),
+    ];
+    for (nm, ty, ins, n_in, outs, n_out, params, n_params, label) in nodes_a {
+        let op = make_op(nm, ty, ins, n_in, outs, n_out, params, n_params);
+        let err = unsafe { (v.graphAddNode.unwrap())(graph_a, op) };
+        anyhow::ensure!(
+            err == 0,
+            "graphAddNode({}) on graph_a err=0x{:x}",
+            label,
+            err
+        );
+    }
+
+    // Finalize Graph A.
+    let t_fin_a = Instant::now();
+    let err = unsafe { (v.graphFinalize.unwrap())(graph_a, ptr::null_mut(), ptr::null_mut()) };
+    let finalize_a_ms = t_fin_a.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "[A] graphFinalize -> err=0x{:x} elapsed={:.2} ms",
+        err, finalize_a_ms
+    );
+    anyhow::ensure!(err == 0, "graphFinalize(A) err=0x{:x}", err);
+
+    // Register host-backed tensors for Graph A.
+    let mk_desc = |fd: i32,
+                   host_data: *mut std::ffi::c_void,
+                   dtype: Qnn_DataType_t,
+                   dims: &[u32]|
+     -> Qnn_MemDescriptor_t {
+        Qnn_MemDescriptor_t {
+            memShape: Qnn_MemShape_t {
+                numDim: dims.len() as u32,
+                dimSize: dims.as_ptr() as *mut u32,
+                shapeConfig: ptr::null(),
+            },
+            dataType: dtype,
+            memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
+            __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
+                dmaBufInfo: Qnn_MemDmaBufInfo_t {
+                    fd,
+                    data: host_data,
+                },
+            },
+        }
+    };
+    let descs_a = [
+        mk_desc(fd_x, rpc_x, f32_t, &dims_x),
+        mk_desc(fd_rms_pre, rpc_rms_pre, f32_t, &dims_rms_pre),
+        mk_desc(fd_qq, rpc_qq, u8_t, &dims_qq),
+        mk_desc(fd_qd, rpc_qd, f16_t, &dims_qd),
+        mk_desc(fd_kq, rpc_kq, u8_t, &dims_kq),
+        mk_desc(fd_kd, rpc_kd, f16_t, &dims_kd),
+        mk_desc(fd_vq, rpc_vq, u8_t, &dims_vq),
+        mk_desc(fd_vd, rpc_vd, f16_t, &dims_vd),
+        mk_desc(fd_kcache, rpc_kcache, f16_t, &dims_kcache),
+        mk_desc(fd_vcache, rpc_vcache, f16_t, &dims_vcache),
+        mk_desc(fd_q_rope, rpc_q_rope, f32_t, &dims_q_rope),
+    ];
+    let mut mh_a = [ptr::null_mut::<std::ffi::c_void>(); 11];
+    let err = unsafe {
+        (v.memRegister.unwrap())(
+            ctx,
+            descs_a.as_ptr(),
+            descs_a.len() as u32,
+            mh_a.as_mut_ptr(),
+        )
+    };
+    anyhow::ensure!(err == 0, "memRegister(A) err=0x{:x}", err);
+
+    let set_mh = |t: &mut Qnn_Tensor_t, h: *mut std::ffi::c_void| {
+        t.__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
+        t.__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = h;
+    };
+    let mut t_x_mh = t_x_a;
+    set_mh(&mut t_x_mh, mh_a[0]);
+    let mut t_rms_pre_mh = t_rms_pre_a;
+    set_mh(&mut t_rms_pre_mh, mh_a[1]);
+    let mut t_qq_mh = t_qq_a;
+    set_mh(&mut t_qq_mh, mh_a[2]);
+    let mut t_qd_mh = t_qd_a;
+    set_mh(&mut t_qd_mh, mh_a[3]);
+    let mut t_kq_mh = t_kq_a;
+    set_mh(&mut t_kq_mh, mh_a[4]);
+    let mut t_kd_mh = t_kd_a;
+    set_mh(&mut t_kd_mh, mh_a[5]);
+    let mut t_vq_mh = t_vq_a;
+    set_mh(&mut t_vq_mh, mh_a[6]);
+    let mut t_vd_mh = t_vd_a;
+    set_mh(&mut t_vd_mh, mh_a[7]);
+    let mut t_kcache_mh_a = t_kcache_a;
+    set_mh(&mut t_kcache_mh_a, mh_a[8]);
+    let mut t_vcache_mh_a = t_vcache_a;
+    set_mh(&mut t_vcache_mh_a, mh_a[9]);
+    let mut t_q_rope_mh_a = t_q_rope_a;
+    set_mh(&mut t_q_rope_mh_a, mh_a[10]);
+
+    // Execute Graph A.
+    // Inputs: APP_WRITE host buffers (x, rms_pre, q4 weights, kcache InOut).
+    // Outputs: APP_READ host buffers (q_rope, vcache).
+    let exec_a_inputs = [
+        t_x_mh,
+        t_rms_pre_mh,
+        t_qq_mh,
+        t_qd_mh,
+        t_kq_mh,
+        t_kd_mh,
+        t_vq_mh,
+        t_vd_mh,
+        t_kcache_mh_a,
+    ];
+    let mut exec_a_outputs = [t_q_rope_mh_a, t_vcache_mh_a];
+    let t_exec_a = Instant::now();
+    let err = unsafe {
+        (v.graphExecute.unwrap())(
+            graph_a,
+            exec_a_inputs.as_ptr(),
+            exec_a_inputs.len() as u32,
+            exec_a_outputs.as_mut_ptr(),
+            exec_a_outputs.len() as u32,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    let execute_a_ms = t_exec_a.elapsed().as_secs_f64() * 1000.0;
+    anyhow::ensure!(err == 0, "graphExecute(A) err=0x{:x}", err);
+    println!("[A] graphExecute   -> elapsed={:.2} ms", execute_a_ms);
+
+    // Read back Graph A endpoints into host-comparable buffers.
+    let qnn_q_rope_view =
+        unsafe { std::slice::from_raw_parts(rpc_q_rope as *const f32, q_proj_out) };
+    let qnn_kcache_view = unsafe { std::slice::from_raw_parts(rpc_kcache as *const u16, kv_total) };
+    let qnn_vcache_view = unsafe { std::slice::from_raw_parts(rpc_vcache as *const u16, kv_total) };
+
+    // Per-endpoint diagnostic before continuing to Graph B.
+    let max_abs_q_rope = ref_q_rope
+        .iter()
+        .zip(qnn_q_rope_view.iter())
+        .map(|(r, q)| (r - q).abs())
+        .fold(0.0f32, f32::max);
+    let f16_diff = |r: u16, q: u16| -> f32 { (f16_bits_to_f32(r) - f16_bits_to_f32(q)).abs() };
+    let max_abs_kcache = ref_kcache_full
+        .iter()
+        .zip(qnn_kcache_view.iter())
+        .map(|(r, q)| f16_diff(*r, *q))
+        .fold(0.0f32, f32::max);
+    let max_abs_vcache = ref_vcache_full
+        .iter()
+        .zip(qnn_vcache_view.iter())
+        .map(|(r, q)| f16_diff(*r, *q))
+        .fold(0.0f32, f32::max);
+    println!(
+        "[A] q_rope/kcache/vcache max_abs vs ref: {:.4e} / {:.4e} / {:.4e}",
+        max_abs_q_rope, max_abs_kcache, max_abs_vcache
+    );
+
+    // Detailed per-endpoint dump for root-cause isolation when the chain
+    // composition still drifts inside Graph A.
+    eprintln!("[A-diag] ref_q_rope[0..8] = {:?}", &ref_q_rope[..8]);
+    eprintln!("[A-diag] qnn_q_rope[0..8] = {:?}", &qnn_q_rope_view[..8]);
+    let kc_to_s = |buf: &[u16], off: usize, n: usize| -> String {
+        (0..n)
+            .map(|i| format!("{:.4} ", f16_bits_to_f32(buf[off + i])))
+            .collect()
+    };
+    let off_h0 = (pos as usize) * head_dim;
+    eprintln!(
+        "[A-diag] ref kcache[h=0,pos][0..8] = {}",
+        kc_to_s(&ref_kcache_full, off_h0, 8)
+    );
+    eprintln!(
+        "[A-diag] qnn kcache[h=0,pos][0..8] = {}",
+        kc_to_s(qnn_kcache_view, off_h0, 8)
+    );
+    let nz_qnn_kc = qnn_kcache_view.iter().filter(|&&v| v != 0).count();
+    let nz_ref_kc = ref_kcache_full.iter().filter(|&&v| v != 0).count();
+    let nz_qnn_vc = qnn_vcache_view.iter().filter(|&&v| v != 0).count();
+    let nz_ref_vc = ref_vcache_full.iter().filter(|&&v| v != 0).count();
+    eprintln!(
+        "[A-diag] kcache nonzero halves: qnn={} ref={} (total={})",
+        nz_qnn_kc, nz_ref_kc, kv_total
+    );
+    eprintln!(
+        "[A-diag] vcache nonzero halves: qnn={} ref={} (total={})",
+        nz_qnn_vc, nz_ref_vc, kv_total
+    );
+
+    // ── 6. Graph B (FlashAttn → O proj → Add → RmsNorm → gate/up → SiluMul →
+    //                  down proj → Add) ────────────────────────────────────
+    // Graph B treats Graph A endpoints (q_rope, kcache, vcache) as APP_WRITE
+    // host-resident inputs. They occupy the same rpcmem buffers Graph A wrote,
+    // so no host-to-host copy is required — Graph B just memRegisters those
+    // buffers in its own context view.
+    let mut t_q_rope_b = build_tensor(
+        app_w,
+        f32_t,
+        3,
+        dims_q_rope.as_mut_ptr(),
+        nm_q_rope.as_ptr(),
+    );
+    let mut t_kcache_b = build_tensor(
+        app_w,
+        f16_t,
+        4,
+        dims_kcache.as_mut_ptr(),
+        nm_kcache.as_ptr(),
+    );
+    let mut t_vcache_b = build_tensor(
+        app_w,
+        f16_t,
+        4,
+        dims_vcache.as_mut_ptr(),
+        nm_vcache.as_ptr(),
+    );
+    let mut t_x_b = build_tensor(app_w, f32_t, 2, dims_x.as_mut_ptr(), nm_x.as_ptr());
+    let mut t_rms_post_b = build_tensor(
+        app_w,
+        f32_t,
+        1,
+        dims_rms_post.as_mut_ptr(),
+        nm_rms_post.as_ptr(),
+    );
+    let mut t_oq_b = build_tensor(app_w, u8_t, 1, dims_oq.as_mut_ptr(), nm_oq.as_ptr());
+    let mut t_od_b = build_tensor(app_w, f16_t, 1, dims_od.as_mut_ptr(), nm_od.as_ptr());
+    let mut t_gq_b = build_tensor(app_w, u8_t, 1, dims_gq.as_mut_ptr(), nm_gq.as_ptr());
+    let mut t_gd_b = build_tensor(app_w, f16_t, 1, dims_gd.as_mut_ptr(), nm_gd.as_ptr());
+    let mut t_uq_b = build_tensor(app_w, u8_t, 1, dims_uq.as_mut_ptr(), nm_uq.as_ptr());
+    let mut t_ud_b = build_tensor(app_w, f16_t, 1, dims_ud.as_mut_ptr(), nm_ud.as_ptr());
+    let mut t_dq_b = build_tensor(app_w, u8_t, 1, dims_dq.as_mut_ptr(), nm_dq.as_ptr());
+    let mut t_dd_b = build_tensor(app_w, f16_t, 1, dims_dd.as_mut_ptr(), nm_dd.as_ptr());
+    let mut t_mask_b = build_tensor(app_w, f16_t, 1, dims_mask.as_mut_ptr(), nm_mask.as_ptr());
+    let mut t_sinks_b = build_tensor(app_w, f32_t, 1, dims_sinks.as_mut_ptr(), nm_sinks.as_ptr());
+    let mut t_score_b = build_tensor(app_w, f32_t, 1, dims_score.as_mut_ptr(), nm_score.as_ptr());
+    let mut t_x_out_b = build_tensor(app_r, f32_t, 2, dims_x_out.as_mut_ptr(), nm_x_out.as_ptr());
+    // NATIVE intermediates inside Graph B.
+    let mut t_attn_o_b = build_tensor(
+        native,
+        f32_t,
+        3,
+        dims_attn_o.as_mut_ptr(),
+        nm_attn_o.as_ptr(),
+    );
+    let mut t_o_b = build_tensor(native, f32_t, 2, dims_o.as_mut_ptr(), nm_o.as_ptr());
+    let mut t_x_attn_b = build_tensor(
+        native,
+        f32_t,
+        2,
+        dims_x_attn.as_mut_ptr(),
+        nm_x_attn.as_ptr(),
+    );
+    let mut t_y2_b = build_tensor(native, f32_t, 2, dims_y2.as_mut_ptr(), nm_y2.as_ptr());
+    let mut t_gate_b = build_tensor(native, f32_t, 2, dims_gate.as_mut_ptr(), nm_gate.as_ptr());
+    let mut t_up_b = build_tensor(native, f32_t, 2, dims_up.as_mut_ptr(), nm_up.as_ptr());
+    let mut t_silu_out_b = build_tensor(
+        native,
+        f32_t,
+        2,
+        dims_silu_out.as_mut_ptr(),
+        nm_silu_out.as_ptr(),
+    );
+    let mut t_down_b = build_tensor(native, f32_t, 2, dims_down.as_mut_ptr(), nm_down.as_ptr());
+
+    let g_b_name = CString::new("qwen_layer_graph_b").unwrap();
+    let mut graph_b: Qnn_GraphHandle_t = ptr::null_mut();
+    let err =
+        unsafe { (v.graphCreate.unwrap())(ctx, g_b_name.as_ptr(), ptr::null_mut(), &mut graph_b) };
+    anyhow::ensure!(err == 0, "graphCreate(B) err=0x{:x}", err);
+
+    let regs_b: &mut [(&str, &mut Qnn_Tensor_t)] = &mut [
+        ("q_rope", &mut t_q_rope_b),
+        ("kcache", &mut t_kcache_b),
+        ("vcache", &mut t_vcache_b),
+        ("x", &mut t_x_b),
+        ("rms_post", &mut t_rms_post_b),
+        ("oq", &mut t_oq_b),
+        ("od", &mut t_od_b),
+        ("gq", &mut t_gq_b),
+        ("gd", &mut t_gd_b),
+        ("uq", &mut t_uq_b),
+        ("ud", &mut t_ud_b),
+        ("dq", &mut t_dq_b),
+        ("dd", &mut t_dd_b),
+        ("mask", &mut t_mask_b),
+        ("sinks", &mut t_sinks_b),
+        ("score", &mut t_score_b),
+        ("x_out", &mut t_x_out_b),
+        ("attn_o", &mut t_attn_o_b),
+        ("o", &mut t_o_b),
+        ("x_attn", &mut t_x_attn_b),
+        ("y2", &mut t_y2_b),
+        ("gate", &mut t_gate_b),
+        ("up", &mut t_up_b),
+        ("silu_out", &mut t_silu_out_b),
+        ("down", &mut t_down_b),
+    ];
+    for (label, t) in regs_b.iter_mut() {
+        let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph_b, *t) };
+        anyhow::ensure!(err == 0, "graph_b tensorCreate({}) err=0x{:x}", label, err);
+    }
+
     let mut fa_params = [
         Qnn_Param_t {
             paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
@@ -1848,381 +1945,168 @@ fn run_layer(
         },
     ];
 
-    // Op type names.
-    let ot_rms = CString::new("CustomRmsNorm").unwrap();
-    let ot_q40 = CString::new("CustomMatMulQ40F32").unwrap();
-    let ot_rope = CString::new("CustomRope").unwrap();
-    let ot_kvs = CString::new("CustomKvScatter").unwrap();
-    let ot_fa = CString::new("CustomFlashAttn").unwrap();
-    let ot_silu = CString::new("CustomSiluMul").unwrap();
-    let ot_add = CString::new("CustomAdd").unwrap();
+    // Graph B node names.
+    let on_b_fa = CString::new("b_fa").unwrap();
+    let on_b_o = CString::new("b_o_proj").unwrap();
+    let on_b_add1 = CString::new("b_add1").unwrap();
+    let on_b_rms = CString::new("b_rms_post").unwrap();
+    let on_b_gate = CString::new("b_gate_proj").unwrap();
+    let on_b_up = CString::new("b_up_proj").unwrap();
+    let on_b_silu = CString::new("b_silu").unwrap();
+    let on_b_down = CString::new("b_down_proj").unwrap();
+    let on_b_add2 = CString::new("b_add2").unwrap();
 
-    // Op names.
-    let on_rms_pre = CString::new("rms_pre_op").unwrap();
-    let on_q_proj = CString::new("q_proj").unwrap();
-    let on_k_proj = CString::new("k_proj").unwrap();
-    let on_v_proj = CString::new("v_proj").unwrap();
-    let on_rope_q = CString::new("rope_q").unwrap();
-    let on_rope_k = CString::new("rope_k").unwrap();
-    let on_kvs = CString::new("kvs").unwrap();
-    let on_fa = CString::new("fa").unwrap();
-    let on_o_proj = CString::new("o_proj").unwrap();
-    let on_add1 = CString::new("add1").unwrap();
-    let on_rms_post = CString::new("rms_post_op").unwrap();
-    let on_gate_proj = CString::new("gate_proj").unwrap();
-    let on_up_proj = CString::new("up_proj").unwrap();
-    let on_silu = CString::new("silu").unwrap();
-    let on_down_proj = CString::new("down_proj").unwrap();
-    let on_add2 = CString::new("add2").unwrap();
+    let mut b_in_fa = [
+        t_q_rope_b, t_kcache_b, t_vcache_b, t_mask_b, t_sinks_b, t_score_b,
+    ];
+    let mut b_out_fa = [t_attn_o_b];
+    let mut b_in_o = [t_oq_b, t_od_b, t_attn_o_b];
+    let mut b_out_o = [t_o_b];
+    let mut b_in_add1 = [t_o_b, t_x_b];
+    let mut b_out_add1 = [t_x_attn_b];
+    let mut b_in_rms = [t_x_attn_b, t_rms_post_b];
+    let mut b_out_rms = [t_y2_b];
+    let mut b_in_gate = [t_gq_b, t_gd_b, t_y2_b];
+    let mut b_out_gate = [t_gate_b];
+    let mut b_in_up = [t_uq_b, t_ud_b, t_y2_b];
+    let mut b_out_up = [t_up_b];
+    let mut b_in_silu = [t_gate_b, t_up_b];
+    let mut b_out_silu = [t_silu_out_b];
+    let mut b_in_down = [t_dq_b, t_dd_b, t_silu_out_b];
+    let mut b_out_down = [t_down_b];
+    let mut b_in_add2 = [t_down_b, t_x_attn_b];
+    let mut b_out_add2 = [t_x_out_b];
 
-    // Re-clone tensors for graphAddNode (Qnn_OpConfig copies pointers, not
-    // payload — we rebuild Qnn_Tensor_t views referring to the same names).
-    // Because the op only reads name/dims/dtype/type, re-using the registered
-    // tensor structs is fine.
-    let mut in_rms_pre = [t_x, t_rms_pre];
-    let mut out_rms_pre = [t_y1];
-    let mut in_q_proj = [t_qq, t_qd, t_y1];
-    let mut out_q_proj = [t_q];
-    let mut in_k_proj = [t_kq, t_kd, t_y1];
-    let mut out_k_proj = [t_k];
-    let mut in_v_proj = [t_vq, t_vd, t_y1];
-    let mut out_v_proj = [t_v];
-    let mut in_rope_q = [t_q];
-    let mut out_rope_q = [t_q_rope];
-    let mut in_rope_k = [t_k];
-    let mut out_rope_k = [t_k_rope];
-    // M2.H multi-output: KvScatter declares 2 inputs (k_rope, v) and 2
-    // outputs (kcache, vcache). Earlier revisions routed kcache through
-    // inputs[2] (InOutTensor) to fit the single-claim abstraction.
-    let mut in_kvs = [t_k_rope, t_v];
-    let mut out_kvs = [t_kcache, t_vcache];
-    let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score];
-    let mut out_fa = [t_attn_o];
-    let mut in_o_proj = [t_oq, t_od, t_attn_o];
-    let mut out_o_proj = [t_o];
-    let mut in_add1 = [t_o, t_x];
-    let mut out_add1 = [t_x_attn];
-    let mut in_rms_post = [t_x_attn, t_rms_post];
-    let mut out_rms_post = [t_y2];
-    let mut in_gate = [t_gq, t_gd, t_y2];
-    let mut out_gate = [t_gate];
-    let mut in_up = [t_uq, t_ud, t_y2];
-    let mut out_up = [t_up];
-    let mut in_silu = [t_gate, t_up];
-    let mut out_silu = [t_silu_out];
-    let mut in_down = [t_dq, t_dd, t_silu_out];
-    let mut out_down = [t_down];
-    let mut in_add2 = [t_down, t_x_attn];
-    let mut out_add2 = [t_x_out];
-
-    // 14 nodes.
-    type NodeSpec<'a> = (
-        *const c_char,
-        *const c_char,
-        *mut Qnn_Tensor_t,
-        u32,
-        *mut Qnn_Tensor_t,
-        u32,
-        *mut Qnn_Param_t,
-        u32,
-        &'a str,
-    );
-    let nodes: [NodeSpec<'_>; 14] = [
+    let nodes_b: [NodeSpec<'_>; 9] = [
         (
-            on_rms_pre.as_ptr(),
-            ot_rms.as_ptr(),
-            in_rms_pre.as_mut_ptr(),
-            2,
-            out_rms_pre.as_mut_ptr(),
-            1,
-            ptr::null_mut(),
-            0,
-            "RmsNorm(pre)",
-        ),
-        (
-            on_q_proj.as_ptr(),
-            ot_q40.as_ptr(),
-            in_q_proj.as_mut_ptr(),
-            3,
-            out_q_proj.as_mut_ptr(),
-            1,
-            ptr::null_mut(),
-            0,
-            "Q proj",
-        ),
-        (
-            on_k_proj.as_ptr(),
-            ot_q40.as_ptr(),
-            in_k_proj.as_mut_ptr(),
-            3,
-            out_k_proj.as_mut_ptr(),
-            1,
-            ptr::null_mut(),
-            0,
-            "K proj",
-        ),
-        (
-            on_v_proj.as_ptr(),
-            ot_q40.as_ptr(),
-            in_v_proj.as_mut_ptr(),
-            3,
-            out_v_proj.as_mut_ptr(),
-            1,
-            ptr::null_mut(),
-            0,
-            "V proj",
-        ),
-        (
-            on_rope_q.as_ptr(),
-            ot_rope.as_ptr(),
-            in_rope_q.as_mut_ptr(),
-            1,
-            out_rope_q.as_mut_ptr(),
-            1,
-            rope_q_params.as_mut_ptr(),
-            2,
-            "RoPE Q",
-        ),
-        (
-            on_rope_k.as_ptr(),
-            ot_rope.as_ptr(),
-            in_rope_k.as_mut_ptr(),
-            1,
-            out_rope_k.as_mut_ptr(),
-            1,
-            rope_k_params.as_mut_ptr(),
-            2,
-            "RoPE K",
-        ),
-        (
-            on_kvs.as_ptr(),
-            ot_kvs.as_ptr(),
-            in_kvs.as_mut_ptr(),
-            2,
-            out_kvs.as_mut_ptr(),
-            2,
-            kvs_params.as_mut_ptr(),
-            3,
-            "KvScatter",
-        ),
-        (
-            on_fa.as_ptr(),
+            on_b_fa.as_ptr(),
             ot_fa.as_ptr(),
-            in_fa.as_mut_ptr(),
+            b_in_fa.as_mut_ptr(),
             6,
-            out_fa.as_mut_ptr(),
+            b_out_fa.as_mut_ptr(),
             1,
             fa_params.as_mut_ptr(),
             5,
-            "FlashAttn",
+            "B.FlashAttn",
         ),
         (
-            on_o_proj.as_ptr(),
+            on_b_o.as_ptr(),
             ot_q40.as_ptr(),
-            in_o_proj.as_mut_ptr(),
+            b_in_o.as_mut_ptr(),
             3,
-            out_o_proj.as_mut_ptr(),
+            b_out_o.as_mut_ptr(),
             1,
             ptr::null_mut(),
             0,
-            "O proj",
+            "B.O proj",
         ),
         (
-            on_add1.as_ptr(),
+            on_b_add1.as_ptr(),
             ot_add.as_ptr(),
-            in_add1.as_mut_ptr(),
+            b_in_add1.as_mut_ptr(),
             2,
-            out_add1.as_mut_ptr(),
+            b_out_add1.as_mut_ptr(),
             1,
             ptr::null_mut(),
             0,
-            "Add(residual1)",
+            "B.Add(residual1)",
         ),
         (
-            on_rms_post.as_ptr(),
+            on_b_rms.as_ptr(),
             ot_rms.as_ptr(),
-            in_rms_post.as_mut_ptr(),
+            b_in_rms.as_mut_ptr(),
             2,
-            out_rms_post.as_mut_ptr(),
+            b_out_rms.as_mut_ptr(),
             1,
             ptr::null_mut(),
             0,
-            "RmsNorm(post)",
+            "B.RmsNorm(post)",
         ),
         (
-            on_gate_proj.as_ptr(),
+            on_b_gate.as_ptr(),
             ot_q40.as_ptr(),
-            in_gate.as_mut_ptr(),
+            b_in_gate.as_mut_ptr(),
             3,
-            out_gate.as_mut_ptr(),
+            b_out_gate.as_mut_ptr(),
             1,
             ptr::null_mut(),
             0,
-            "gate proj",
+            "B.gate proj",
         ),
         (
-            on_up_proj.as_ptr(),
+            on_b_up.as_ptr(),
             ot_q40.as_ptr(),
-            in_up.as_mut_ptr(),
+            b_in_up.as_mut_ptr(),
             3,
-            out_up.as_mut_ptr(),
+            b_out_up.as_mut_ptr(),
             1,
             ptr::null_mut(),
             0,
-            "up proj",
+            "B.up proj",
         ),
         (
-            on_silu.as_ptr(),
+            on_b_silu.as_ptr(),
             ot_silu.as_ptr(),
-            in_silu.as_mut_ptr(),
+            b_in_silu.as_mut_ptr(),
             2,
-            out_silu.as_mut_ptr(),
+            b_out_silu.as_mut_ptr(),
             1,
             ptr::null_mut(),
             0,
-            "SiluMul",
+            "B.SiluMul",
         ),
-    ];
-    // Note: we declared the tuple as 14 entries but the layer DAG has 14 nodes
-    // with two more (down_proj + add2). Move them out to keep readable size.
-    let mut in_pad: [Qnn_Tensor_t; 0] = [];
-    let _ = &mut in_pad; // silence unused if cfg
-    // Helper to dump per-tensor metadata before graphAddNode for debug.
-    let tensor_brief = |t: *const Qnn_Tensor_t| -> String {
-        if t.is_null() {
-            return "<null>".to_string();
-        }
-        unsafe {
-            let v1 = (*t).__bindgen_anon_1.v1;
-            let nm = if v1.name.is_null() {
-                "<no-name>".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(v1.name)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let mut dims_str = String::from("[");
-            for i in 0..v1.rank {
-                if i > 0 {
-                    dims_str.push_str(", ");
-                }
-                let d = *v1.dimensions.add(i as usize);
-                dims_str.push_str(&d.to_string());
-            }
-            dims_str.push(']');
-            format!(
-                "{}(type={},dt={},rank={},dims={})",
-                nm, v1.type_, v1.dataType, v1.rank, dims_str
-            )
-        }
-    };
-    let dump_op = |label: &str,
-                   ins: *const Qnn_Tensor_t,
-                   n_in: u32,
-                   outs: *const Qnn_Tensor_t,
-                   n_out: u32| {
-        eprint!("[graphAddNode pre] {} inputs:", label);
-        for i in 0..n_in {
-            let t = unsafe { ins.add(i as usize) };
-            eprint!(" #{}={}", i, tensor_brief(t));
-        }
-        eprint!("\n[graphAddNode pre] {} outputs:", label);
-        for i in 0..n_out {
-            let t = unsafe { outs.add(i as usize) };
-            eprint!(" #{}={}", i, tensor_brief(t));
-        }
-        eprintln!();
-    };
-
-    for (nm, ty, ins, n_in, outs, n_out, params, n_params, label) in nodes {
-        dump_op(label, ins as *const _, n_in, outs as *const _, n_out);
-        let op = make_op(nm, ty, ins, n_in, outs, n_out, params, n_params);
-        let err = unsafe { (v.graphAddNode.unwrap())(graph, op) };
-        anyhow::ensure!(err == 0, "graphAddNode({}) err=0x{:x}", label, err);
-    }
-    // Two trailing nodes (down proj + residual add2).
-    let trailing: [NodeSpec<'_>; 2] = [
         (
-            on_down_proj.as_ptr(),
+            on_b_down.as_ptr(),
             ot_q40.as_ptr(),
-            in_down.as_mut_ptr(),
+            b_in_down.as_mut_ptr(),
             3,
-            out_down.as_mut_ptr(),
+            b_out_down.as_mut_ptr(),
             1,
             ptr::null_mut(),
             0,
-            "down proj",
+            "B.down proj",
         ),
         (
-            on_add2.as_ptr(),
+            on_b_add2.as_ptr(),
             ot_add.as_ptr(),
-            in_add2.as_mut_ptr(),
+            b_in_add2.as_mut_ptr(),
             2,
-            out_add2.as_mut_ptr(),
+            b_out_add2.as_mut_ptr(),
             1,
             ptr::null_mut(),
             0,
-            "Add(residual2)",
+            "B.Add(residual2)",
         ),
     ];
-    for (nm, ty, ins, n_in, outs, n_out, params, n_params, label) in trailing {
-        dump_op(label, ins as *const _, n_in, outs as *const _, n_out);
+    for (nm, ty, ins, n_in, outs, n_out, params, n_params, label) in nodes_b {
         let op = make_op(nm, ty, ins, n_in, outs, n_out, params, n_params);
-        let err = unsafe { (v.graphAddNode.unwrap())(graph, op) };
-        anyhow::ensure!(err == 0, "graphAddNode({}) err=0x{:x}", label, err);
+        let err = unsafe { (v.graphAddNode.unwrap())(graph_b, op) };
+        anyhow::ensure!(
+            err == 0,
+            "graphAddNode({}) on graph_b err=0x{:x}",
+            label,
+            err
+        );
     }
 
-    // 14 nodes total (12 in `nodes` + 2 in `trailing`). Verified by
-    // `qnn_oppkg::graph::LAYER_NODE_COUNT == 14` host test.
-    const _ASSERT_LAYER_NODE_COUNT: usize = 17;
-
-    // ── 6. graphFinalize (timed) ────────────────────────────────────────────
-    let t_fin0 = Instant::now();
-    let err = unsafe { (v.graphFinalize.unwrap())(graph, ptr::null_mut(), ptr::null_mut()) };
-    let finalize_ms = t_fin0.elapsed().as_secs_f64() * 1000.0;
+    let t_fin_b = Instant::now();
+    let err = unsafe { (v.graphFinalize.unwrap())(graph_b, ptr::null_mut(), ptr::null_mut()) };
+    let finalize_b_ms = t_fin_b.elapsed().as_secs_f64() * 1000.0;
     println!(
-        "graphFinalize -> err=0x{:x} elapsed={:.2} ms",
-        err, finalize_ms
+        "[B] graphFinalize -> err=0x{:x} elapsed={:.2} ms",
+        err, finalize_b_ms
     );
-    anyhow::ensure!(err == 0, "graphFinalize err=0x{:x}", err);
+    anyhow::ensure!(err == 0, "graphFinalize(B) err=0x{:x}", err);
 
-    // ── 7. memRegister all host-backed tensors ──────────────────────────────
-    let mk_desc = |fd: i32,
-                   host_data: *mut std::ffi::c_void,
-                   dtype: Qnn_DataType_t,
-                   dims: &[u32]|
-     -> Qnn_MemDescriptor_t {
-        Qnn_MemDescriptor_t {
-            memShape: Qnn_MemShape_t {
-                numDim: dims.len() as u32,
-                dimSize: dims.as_ptr() as *mut u32,
-                shapeConfig: ptr::null(),
-            },
-            dataType: dtype,
-            memType: Qnn_MemType_t_QNN_MEM_TYPE_DMA_BUF,
-            __bindgen_anon_1: Qnn_MemDescriptor_t__bindgen_ty_1 {
-                dmaBufInfo: Qnn_MemDmaBufInfo_t {
-                    fd,
-                    data: host_data,
-                },
-            },
-        }
-    };
-    // M2.H multi-output: vcache is now APP_WRITE (was NATIVE). Both kcache
-    // and vcache are registered with host-allocated rpcmem fds so the SDK
-    // can wire OutputClaim slots to them. Earlier NATIVE vcache caused
-    // graphAddNode err=0x1775 with the multi-output KvScatter abstraction.
-    let fd_vcache_h = unsafe { rpcmem_to_fd(rpc_vcache) };
-    let descs = [
+    // Register Graph B host-backed tensors. q_rope/kcache/vcache reuse the
+    // same rpcmem buffers Graph A wrote (different memHandle in this graph
+    // context — same fd → same physical pages).
+    let descs_b = [
+        mk_desc(fd_q_rope, rpc_q_rope, f32_t, &dims_q_rope),
+        mk_desc(fd_kcache, rpc_kcache, f16_t, &dims_kcache),
+        mk_desc(fd_vcache, rpc_vcache, f16_t, &dims_vcache),
         mk_desc(fd_x, rpc_x, f32_t, &dims_x),
-        mk_desc(fd_rms_pre, rpc_rms_pre, f32_t, &dims_rms_pre),
         mk_desc(fd_rms_post, rpc_rms_post, f32_t, &dims_rms_post),
-        mk_desc(fd_qq, rpc_qq, u8_t, &dims_qq),
-        mk_desc(fd_qd, rpc_qd, f16_t, &dims_qd),
-        mk_desc(fd_kq, rpc_kq, u8_t, &dims_kq),
-        mk_desc(fd_kd, rpc_kd, f16_t, &dims_kd),
-        mk_desc(fd_vq, rpc_vq, u8_t, &dims_vq),
-        mk_desc(fd_vd, rpc_vd, f16_t, &dims_vd),
         mk_desc(fd_oq, rpc_oq, u8_t, &dims_oq),
         mk_desc(fd_od, rpc_od, f16_t, &dims_od),
         mk_desc(fd_gq, rpc_gq, u8_t, &dims_gq),
@@ -2231,280 +2115,121 @@ fn run_layer(
         mk_desc(fd_ud, rpc_ud, f16_t, &dims_ud),
         mk_desc(fd_dq, rpc_dq, u8_t, &dims_dq),
         mk_desc(fd_dd, rpc_dd, f16_t, &dims_dd),
-        mk_desc(fd_kcache, rpc_kcache, f16_t, &dims_kcache),
-        mk_desc(fd_vcache_h, rpc_vcache, f16_t, &dims_vcache),
         mk_desc(fd_mask, rpc_mask, f16_t, &dims_mask),
         mk_desc(fd_sinks, rpc_sinks, f32_t, &dims_sinks),
         mk_desc(fd_score, rpc_score, f32_t, &dims_score),
         mk_desc(fd_x_out, rpc_x_out, f32_t, &dims_x_out),
     ];
-    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 23];
+    let mut mh_b = [ptr::null_mut::<std::ffi::c_void>(); 17];
     let err = unsafe {
-        (v.memRegister.unwrap())(ctx, descs.as_ptr(), descs.len() as u32, mh.as_mut_ptr())
+        (v.memRegister.unwrap())(
+            ctx,
+            descs_b.as_ptr(),
+            descs_b.len() as u32,
+            mh_b.as_mut_ptr(),
+        )
     };
-    anyhow::ensure!(err == 0, "memRegister err=0x{:x}", err);
+    anyhow::ensure!(err == 0, "memRegister(B) err=0x{:x}", err);
 
-    // Bind tensor MEMHANDLEs.
-    let set_mh = |t: &mut Qnn_Tensor_t, h: *mut std::ffi::c_void| {
-        t.__bindgen_anon_1.v1.memType = Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_MEMHANDLE;
-        t.__bindgen_anon_1.v1.__bindgen_anon_1.memHandle = h;
-    };
-    let mut t_x_mh = t_x;
-    set_mh(&mut t_x_mh, mh[0]);
-    let mut t_rms_pre_mh = t_rms_pre;
-    set_mh(&mut t_rms_pre_mh, mh[1]);
-    let mut t_rms_post_mh = t_rms_post;
-    set_mh(&mut t_rms_post_mh, mh[2]);
-    let mut t_qq_mh = t_qq;
-    set_mh(&mut t_qq_mh, mh[3]);
-    let mut t_qd_mh = t_qd;
-    set_mh(&mut t_qd_mh, mh[4]);
-    let mut t_kq_mh = t_kq;
-    set_mh(&mut t_kq_mh, mh[5]);
-    let mut t_kd_mh = t_kd;
-    set_mh(&mut t_kd_mh, mh[6]);
-    let mut t_vq_mh = t_vq;
-    set_mh(&mut t_vq_mh, mh[7]);
-    let mut t_vd_mh = t_vd;
-    set_mh(&mut t_vd_mh, mh[8]);
-    let mut t_oq_mh = t_oq;
-    set_mh(&mut t_oq_mh, mh[9]);
-    let mut t_od_mh = t_od;
-    set_mh(&mut t_od_mh, mh[10]);
-    let mut t_gq_mh = t_gq;
-    set_mh(&mut t_gq_mh, mh[11]);
-    let mut t_gd_mh = t_gd;
-    set_mh(&mut t_gd_mh, mh[12]);
-    let mut t_uq_mh = t_uq;
-    set_mh(&mut t_uq_mh, mh[13]);
-    let mut t_ud_mh = t_ud;
-    set_mh(&mut t_ud_mh, mh[14]);
-    let mut t_dq_mh = t_dq;
-    set_mh(&mut t_dq_mh, mh[15]);
-    let mut t_dd_mh = t_dd;
-    set_mh(&mut t_dd_mh, mh[16]);
-    let mut t_kcache_mh = t_kcache;
-    set_mh(&mut t_kcache_mh, mh[17]);
-    // M2.H: vcache is now APP_WRITE (host-registered fd) — index 18.
-    let mut t_vcache_mh = t_vcache;
-    set_mh(&mut t_vcache_mh, mh[18]);
-    let mut t_mask_mh = t_mask;
-    set_mh(&mut t_mask_mh, mh[19]);
-    let mut t_sinks_mh = t_sinks;
-    set_mh(&mut t_sinks_mh, mh[20]);
-    let mut t_score_mh = t_score;
-    set_mh(&mut t_score_mh, mh[21]);
-    let mut t_x_out_mh = t_x_out;
-    set_mh(&mut t_x_out_mh, mh[22]);
+    let mut t_q_rope_mh_b = t_q_rope_b;
+    set_mh(&mut t_q_rope_mh_b, mh_b[0]);
+    let mut t_kcache_mh_b = t_kcache_b;
+    set_mh(&mut t_kcache_mh_b, mh_b[1]);
+    let mut t_vcache_mh_b = t_vcache_b;
+    set_mh(&mut t_vcache_mh_b, mh_b[2]);
+    let mut t_x_mh_b = t_x_b;
+    set_mh(&mut t_x_mh_b, mh_b[3]);
+    let mut t_rms_post_mh_b = t_rms_post_b;
+    set_mh(&mut t_rms_post_mh_b, mh_b[4]);
+    let mut t_oq_mh_b = t_oq_b;
+    set_mh(&mut t_oq_mh_b, mh_b[5]);
+    let mut t_od_mh_b = t_od_b;
+    set_mh(&mut t_od_mh_b, mh_b[6]);
+    let mut t_gq_mh_b = t_gq_b;
+    set_mh(&mut t_gq_mh_b, mh_b[7]);
+    let mut t_gd_mh_b = t_gd_b;
+    set_mh(&mut t_gd_mh_b, mh_b[8]);
+    let mut t_uq_mh_b = t_uq_b;
+    set_mh(&mut t_uq_mh_b, mh_b[9]);
+    let mut t_ud_mh_b = t_ud_b;
+    set_mh(&mut t_ud_mh_b, mh_b[10]);
+    let mut t_dq_mh_b = t_dq_b;
+    set_mh(&mut t_dq_mh_b, mh_b[11]);
+    let mut t_dd_mh_b = t_dd_b;
+    set_mh(&mut t_dd_mh_b, mh_b[12]);
+    let mut t_mask_mh_b = t_mask_b;
+    set_mh(&mut t_mask_mh_b, mh_b[13]);
+    let mut t_sinks_mh_b = t_sinks_b;
+    set_mh(&mut t_sinks_mh_b, mh_b[14]);
+    let mut t_score_mh_b = t_score_b;
+    set_mh(&mut t_score_mh_b, mh_b[15]);
+    let mut t_x_out_mh_b = t_x_out_b;
+    set_mh(&mut t_x_out_mh_b, mh_b[16]);
 
-    // ── 8. graphExecute ────────────────────────────────────────────────────
-    // exec_inputs: every APP_WRITE tensor; exec_outputs: APP_READ (x_out).
-    // Also include kcache + vcache as inputs (the SDK accepts APP_WRITE
-    // memhandles as part of the input list, mirroring kv_scatter microbench;
-    // M2.H multi-output: vcache is now APP_WRITE too).
-    let exec_inputs = [
-        t_x_mh,
-        t_rms_pre_mh,
-        t_rms_post_mh,
-        t_qq_mh,
-        t_qd_mh,
-        t_kq_mh,
-        t_kd_mh,
-        t_vq_mh,
-        t_vd_mh,
-        t_oq_mh,
-        t_od_mh,
-        t_gq_mh,
-        t_gd_mh,
-        t_uq_mh,
-        t_ud_mh,
-        t_dq_mh,
-        t_dd_mh,
-        t_mask_mh,
-        t_sinks_mh,
-        t_score_mh,
+    let exec_b_inputs = [
+        t_q_rope_mh_b,
+        t_kcache_mh_b,
+        t_vcache_mh_b,
+        t_x_mh_b,
+        t_rms_post_mh_b,
+        t_oq_mh_b,
+        t_od_mh_b,
+        t_gq_mh_b,
+        t_gd_mh_b,
+        t_uq_mh_b,
+        t_ud_mh_b,
+        t_dq_mh_b,
+        t_dd_mh_b,
+        t_mask_mh_b,
+        t_sinks_mh_b,
+        t_score_mh_b,
     ];
-    // M2.H multi-output: kcache + vcache are APP_READ outputs (KvScatter
-    // claims). The SDK lets them double as graph-internal edges (FA input).
-    let mut exec_outputs = [t_kcache_mh, t_vcache_mh, t_x_out_mh];
+    let mut exec_b_outputs = [t_x_out_mh_b];
+    let t_exec_b = Instant::now();
     let err = unsafe {
         (v.graphExecute.unwrap())(
-            graph,
-            exec_inputs.as_ptr(),
-            exec_inputs.len() as u32,
-            exec_outputs.as_mut_ptr(),
-            exec_outputs.len() as u32,
+            graph_b,
+            exec_b_inputs.as_ptr(),
+            exec_b_inputs.len() as u32,
+            exec_b_outputs.as_mut_ptr(),
+            exec_b_outputs.len() as u32,
             ptr::null_mut(),
             ptr::null_mut(),
         )
     };
-    anyhow::ensure!(err == 0, "graphExecute err=0x{:x}", err);
+    let execute_b_ms = t_exec_b.elapsed().as_secs_f64() * 1000.0;
+    anyhow::ensure!(err == 0, "graphExecute(B) err=0x{:x}", err);
+    println!("[B] graphExecute   -> elapsed={:.2} ms", execute_b_ms);
 
-    // M2.H 5th: KvScatter host-buffer propagation + attn_o ratio diagnostic.
-    {
-        let qnn_xout = unsafe { std::slice::from_raw_parts(rpc_x_out as *const f32, 8) };
-        eprintln!("[diag-base] ref_x_out[0..8] = {:?}", &ref_x_out[..8]);
-        eprintln!("[diag-base] qnn_xout[0..8]  = {:?}", qnn_xout);
-        // Per-element ratio (qnn / ref) for first 8 outputs.
-        eprintln!("[diag-base] qnn_xout / ref_x_out (first 8 elems):");
-        for i in 0..8 {
-            let r = if ref_x_out[i].abs() > 1e-6 {
-                qnn_xout[i] / ref_x_out[i]
-            } else {
-                f32::NAN
-            };
-            eprintln!("  [{}] ratio = {:.4}", i, r);
-        }
-        // KvScatter slot at write_pos: head 0/1, first 8 halves.
-        let qnn_kc = unsafe { std::slice::from_raw_parts(rpc_kcache as *const u16, kv_total) };
-        let kc_to_s = |buf: &[u16], off: usize, n: usize| -> String {
-            (0..n)
-                .map(|i| format!("{:.4} ", f16_bits_to_f32(buf[off + i])))
-                .collect()
-        };
-        let off_h0 = (pos as usize) * head_dim;
-        let off_h1 = kv_capacity * head_dim + (pos as usize) * head_dim;
-        eprintln!(
-            "[diag-base] qnn kcache[h=0,pos][0..8] = {}",
-            kc_to_s(qnn_kc, off_h0, 8)
-        );
-        eprintln!(
-            "[diag-base] ref kcache[h=0,pos][0..8] = {}",
-            kc_to_s(&ref_kcache_full, off_h0, 8)
-        );
-        eprintln!(
-            "[diag-base] qnn kcache[h=1,pos][0..8] = {}",
-            kc_to_s(qnn_kc, off_h1, 8)
-        );
-        eprintln!(
-            "[diag-base] ref kcache[h=1,pos][0..8] = {}",
-            kc_to_s(&ref_kcache_full, off_h1, 8)
-        );
-        // Coverage: how many halves in QNN kcache changed from zero?
-        let nz_qnn = qnn_kc.iter().filter(|&&v| v != 0).count();
-        let nz_ref = ref_kcache_full.iter().filter(|&&v| v != 0).count();
-        eprintln!(
-            "[diag-base] kcache nonzero halves: qnn={} ref={} total={}",
-            nz_qnn, nz_ref, kv_total
-        );
-        let _ = ref_attn_o.len();
-    }
-
-    // ── 9. Compare ──────────────────────────────────────────────────────────
-    let mut max_abs = 0.0f32;
+    // ── 7. Compare final layer output ───────────────────────────────────────
+    let mut max_abs_xout = 0.0f32;
     unsafe {
-        let test = std::slice::from_raw_parts(rpc_x_out as *const f32, dim);
+        let qnn_x_out = std::slice::from_raw_parts(rpc_x_out as *const f32, dim);
+        eprintln!("[diag] ref_x_out[0..8] = {:?}", &ref_x_out[..8]);
+        eprintln!("[diag] qnn_x_out[0..8] = {:?}", &qnn_x_out[..8]);
         for i in 0..dim {
-            let d = (test[i] - ref_x_out[i]).abs();
-            if d > max_abs {
-                max_abs = d;
+            let d = (qnn_x_out[i] - ref_x_out[i]).abs();
+            if d > max_abs_xout {
+                max_abs_xout = d;
             }
         }
     }
 
-    // ── M2.I production-equivalent 28-layer × 32-token TBT measurement ──────
-    //
-    // Loop: for each of N_TOKENS, call graphExecute LAYERS_PER_TOKEN times.
-    // Per-token wall-clock = N consecutive graphExecute calls. TBT median
-    // across N_TOKENS samples. Warm-up runs a full token's worth of layers
-    // (no timing) so JIT / driver caches reach steady state before measure.
-    const LAYERS_PER_TOKEN: usize = 28; // Qwen 2.5-1.5B layer count
-    const N_TOKENS: usize = 32;
-    const WARMUP_TOKENS: usize = 3;
-
-    // Warm-up: WARMUP_TOKENS * LAYERS_PER_TOKEN graphExecute calls.
-    for _ in 0..WARMUP_TOKENS {
-        for _ in 0..LAYERS_PER_TOKEN {
-            let err = unsafe {
-                (v.graphExecute.unwrap())(
-                    graph,
-                    exec_inputs.as_ptr(),
-                    exec_inputs.len() as u32,
-                    exec_outputs.as_mut_ptr(),
-                    exec_outputs.len() as u32,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                )
-            };
-            anyhow::ensure!(err == 0, "graphExecute warmup err=0x{:x}", err);
-        }
-    }
-
-    // Measure: N_TOKENS samples of (LAYERS_PER_TOKEN graphExecute calls).
-    let mut tbt_samples_ms: Vec<f64> = Vec::with_capacity(N_TOKENS);
-    let t_total0 = Instant::now();
-    for _ in 0..N_TOKENS {
-        let t_tok0 = Instant::now();
-        for _ in 0..LAYERS_PER_TOKEN {
-            let err = unsafe {
-                (v.graphExecute.unwrap())(
-                    graph,
-                    exec_inputs.as_ptr(),
-                    exec_inputs.len() as u32,
-                    exec_outputs.as_mut_ptr(),
-                    exec_outputs.len() as u32,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                )
-            };
-            anyhow::ensure!(err == 0, "graphExecute timed err=0x{:x}", err);
-        }
-        tbt_samples_ms.push(t_tok0.elapsed().as_secs_f64() * 1000.0);
-    }
-    let total_ms = t_total0.elapsed().as_secs_f64() * 1000.0;
-
-    // Stats.
-    tbt_samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let tbt_median = tbt_samples_ms[N_TOKENS / 2];
-    let tbt_min = tbt_samples_ms[0];
-    let tbt_max = tbt_samples_ms[N_TOKENS - 1];
-    let tbt_mean = tbt_samples_ms.iter().sum::<f64>() / N_TOKENS as f64;
-    let tbt_avg_total = total_ms / N_TOKENS as f64;
-    let per_layer_median = tbt_median / LAYERS_PER_TOKEN as f64;
-
-    // Production OpenCL TBT baseline (HEAD f3dc4a4, S25, Qwen2.5-1.5B Q4_0).
-    const PROD_TBT_MS: f64 = 29.43;
-    let ratio = tbt_median / PROD_TBT_MS;
-    let verdict = if ratio <= 1.10 {
-        "GREEN"
-    } else if ratio <= 1.20 {
-        "YELLOW"
-    } else {
-        "RED"
-    };
-
-    eprintln!("\n[M2.I-28layer-tbt] === 28-layer × 32-token TBT ===");
-    eprintln!(
-        "  layers/token = {}  N_tokens = {}  warmup_tokens = {}",
-        LAYERS_PER_TOKEN, N_TOKENS, WARMUP_TOKENS
-    );
-    eprintln!(
-        "  TBT (per-token median) = {:.3} ms/tok  min = {:.3}  max = {:.3}  mean = {:.3}",
-        tbt_median, tbt_min, tbt_max, tbt_mean
-    );
-    eprintln!(
-        "  TBT (avg from total)   = {:.3} ms/tok  ({:.2} ms total / {} tokens)",
-        tbt_avg_total, total_ms, N_TOKENS
-    );
-    eprintln!(
-        "  per-layer (median TBT / {}) = {:.3} ms/layer",
-        LAYERS_PER_TOKEN, per_layer_median
-    );
-    eprintln!(
-        "\n  production OpenCL TBT = {:.2} ms/tok (HEAD f3dc4a4, S25, Qwen2.5-1.5B Q4_0)",
-        PROD_TBT_MS
-    );
-    eprintln!("  ratio = QNN / production = {:.3}×", ratio);
-    eprintln!(
-        "\n=== M2.I 28-layer verdict: {} (ratio = {:.3}×) ===",
-        verdict, ratio
-    );
-
     unsafe {
-        let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), mh.len() as u32);
+        let _ = (v.memDeRegister.unwrap())(mh_a.as_ptr(), mh_a.len() as u32);
+        let _ = (v.memDeRegister.unwrap())(mh_b.as_ptr(), mh_b.len() as u32);
     }
 
-    Ok((max_abs, finalize_ms))
+    Ok(LayerMetrics {
+        max_abs_err_q_rope: max_abs_q_rope,
+        max_abs_err_kcache: max_abs_kcache,
+        max_abs_err_vcache: max_abs_vcache,
+        max_abs_err_xout: max_abs_xout,
+        finalize_a_ms,
+        finalize_b_ms,
+        execute_a_ms,
+        execute_b_ms,
+    })
 }
 
 #[cfg(feature = "qnn")]

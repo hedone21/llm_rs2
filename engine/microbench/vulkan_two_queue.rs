@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
 
     const GSIZE: u32 = 1024;
     const LOCAL_X: u32 = 1024;
-    const SPV: &[u8] = include_bytes!("../../shaders/busy.spv");
+    const SPV: &[u8] = include_bytes!("../shaders/busy.spv");
 
     let args: Vec<String> = std::env::args().collect();
     let n_iters: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(30);

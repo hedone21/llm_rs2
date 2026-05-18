@@ -101,10 +101,10 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
 
-    let simple_src = include_str!("../../kernels/simple_ops.cl");
-    let add_src = include_str!("../../kernels/add.cl");
-    let q40_src = include_str!("../../kernels/mul_mv_q4_0_f32_8x_flat.cl");
-    let fa_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
+    let simple_src = include_str!("../kernels/simple_ops.cl");
+    let add_src = include_str!("../kernels/add.cl");
+    let q40_src = include_str!("../kernels/mul_mv_q4_0_f32_8x_flat.cl");
+    let fa_src = include_str!("../kernels/flash_attn_f32_f16.cl");
     let cl_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math";
     let fa_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math -DDK=128 -DDV=128 \
                    -DBLOCK_M=32 -DBLOCK_N=32";

@@ -466,7 +466,7 @@ __kernel void pollute_stride(
         println!("# Build opts: {}", full_opts);
 
         // 우리(llm_rs2) Q1: production source 그대로
-        let our_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
+        let our_src = include_str!("../kernels/flash_attn_f32_f16.cl");
         let our_program = Program::builder()
             .devices(device)
             .src(our_src)
@@ -476,9 +476,8 @@ __kernel void pollute_stride(
 
         // llama.cpp Q1: vendored source (Phase A 재감사 후 cross-run 검증용).
         // SLM tree-reduce + barrier 패턴 (B-4 sub_group_reduce 미적용).
-        let llama_src = include_str!(
-            "../../../.agent/research/microbench_flash_attn/llamacpp_q1_flash_attn.cl"
-        );
+        let llama_src =
+            include_str!("../../.agent/research/microbench_flash_attn/llamacpp_q1_flash_attn.cl");
         let llama_program = Program::builder()
             .devices(device)
             .src(llama_src)
@@ -809,8 +808,8 @@ __kernel void pollute_stride(
         //
         // Note: simple_ops.cl은 subgroup 의존 — Adreno에서는 OK, 호스트 OpenCL 일부는
         // 실패할 수 있음. 실패 시 nosub fallback 사용.
-        let simple_ops_src = include_str!("../../kernels/simple_ops.cl");
-        let simple_ops_fallback_src = include_str!("../../kernels/fallback/simple_ops_nosub.cl");
+        let simple_ops_src = include_str!("../kernels/simple_ops.cl");
+        let simple_ops_fallback_src = include_str!("../kernels/fallback/simple_ops_nosub.cl");
         let simple_ops_program = match Program::builder()
             .devices(device)
             .src(simple_ops_src)
@@ -834,8 +833,8 @@ __kernel void pollute_stride(
             ocl::core::create_kernel(&simple_ops_program, "kernel_silu_mul_simple")?;
 
         // Q4_0 matmul kernel — production `kernel_mul_mat_q4_0_f32`. GEMV (m==1) 경로.
-        let q4_0_src = include_str!("../../kernels/mul_mv_q4_0_f32.cl");
-        let q4_0_fallback_src = include_str!("../../kernels/fallback/mul_mv_q4_0_f32_nosub.cl");
+        let q4_0_src = include_str!("../kernels/mul_mv_q4_0_f32.cl");
+        let q4_0_fallback_src = include_str!("../kernels/fallback/mul_mv_q4_0_f32_nosub.cl");
         let q4_0_program = match Program::builder()
             .devices(device)
             .src(q4_0_src)

@@ -1,35 +1,37 @@
-//! M2.H Qwen 2.5-1.5B 1-layer correctness — production OpPackage vs raw OpenCL.
+//! M2.I production-equivalent 28-layer × N-token TBT microbench.
 //!
-//! Builds a single QNN `Qnn_GraphHandle_t` containing the full 14-node Qwen
-//! decoder layer (RmsNorm → QKV/KV/V → RoPE(Q,K) → KvScatter → FlashAttn → O
-//! → Add → RmsNorm → gate/up → SiluMul → down → Add) and compares the layer
-//! output against an identical 14-stage raw OpenCL chain that drives the same
-//! kernels directly.
+//! Reuses the M2.H 1-layer Qwen 2.5-1.5B graph (14 nodes, full decoder
+//! layer) but executes it 28 times per token to simulate the full Qwen
+//! 2.5-1.5B forward pass at decode. N=32 tokens are decoded back-to-back;
+//! the per-token wall-clock divided by 32 yields TBT directly comparable
+//! to the production OpenCL TBT (29.43 ms/tok at HEAD `f3dc4a4`).
 //!
-//! Reference path keeps it simple: random F32 weights → on-host Q4_0 packed
-//! quantisation → identical SOA `q_buf` / `d_buf` consumed by both paths so
-//! the numerical baseline is bit-stable apart from QNN graph scheduling
-//! drift.
+//! Simplification: a single finalised graph is reused for all 28 "layers"
+//! and across all tokens. Weights and KV cache do NOT advance between
+//! iterations — the goal is purely perf comparison, not correctness, so
+//! deterministic re-execution of identical inputs is fine. graphExecute
+//! cost per call is what matters; weight binding and per-call SDK overhead
+//! accumulate identically whether weights actually differ or not.
 //!
-//! ## Pass-gate (M2.A)
-//! - `max_abs_err < 1e-2` vs the raw 14-stage OpenCL chain.
-//! - `graphFinalize <= 200 ms`. Exceeding the bound is YELLOW (kernel
-//!   compilation amortises across application lifetime).
-//! - 14 `graphAddNode` calls succeed (verified by `LAYER_NODE_COUNT`).
+//! ## Verdict gate
+//! - `ratio = QNN_TBT / 29.43`
+//! - `<= 1.10` → GREEN (production wire-up viable)
+//! - `1.10 ~ 1.20` → YELLOW (microbench overhead remnants)
+//! - `> 1.20` → RED (SDK overhead accumulates at 28-layer scale)
 //!
 //! ## Build / deploy
 //!
 //! ```text
 //! cargo build --release --features qnn,opencl --target aarch64-linux-android \
-//!   --bin microbench_qnn_qwen_layer
+//!   --bin microbench_qnn_28layer_tbt
 //! cargo build --release -p qnn_oppkg --target aarch64-linux-android
 //! adb push target/aarch64-linux-android/release/libqnn_oppkg.so /data/local/tmp/
-//! python scripts/run_device.py -d galaxy_s25 microbench_qnn_qwen_layer
+//! python scripts/run_device.py -d galaxy_s25 microbench_qnn_28layer_tbt
 //! ```
 
 #[cfg(not(feature = "qnn"))]
 fn main() {
-    eprintln!("microbench_qnn_qwen_layer requires --features qnn");
+    eprintln!("microbench_qnn_28layer_tbt requires --features qnn");
     std::process::exit(2);
 }
 
@@ -76,32 +78,12 @@ fn main() -> anyhow::Result<()> {
     let kv_capacity: usize = 2048;
     let q_proj_out: usize = n_head * head_dim;
     let kv_proj_out: usize = n_kv_heads * head_dim;
-    // D-D.6 디버깅: production state inject 시 (pos, n_kv) override.
-    // `LLMRS_MICROBENCH_POS=k`, `LLMRS_MICROBENCH_N_KV=k` 설정 시.
-    let pos: i32 = std::env::var("LLMRS_MICROBENCH_POS")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(0);
-    let n_kv: usize = std::env::var("LLMRS_MICROBENCH_N_KV")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1);
+    let pos: i32 = 0; // KV cache initially empty; this layer writes pos=0.
+    let n_kv: usize = 1; // attention sees the freshly written token only.
     let theta: f32 = 1_000_000.0; // Qwen2.5 RoPE theta.
-    if pos != 0 || n_kv != 1 {
-        eprintln!("[microbench] (pos, n_kv) override: pos={pos}, n_kv={n_kv}");
-    }
 
-    // D-D.6 디버깅: production-style backend ordering inject. OpenCLBackend
-    // secondary 인스턴스를 미리 init하여 cl_context가 GPU에 alloc되어 있는
-    // 상태에서 QNN graph build/execute. `LLMRS_MICROBENCH_OCL_SECONDARY=1` 시 활성.
-    let _ocl_secondary = if std::env::var("LLMRS_MICROBENCH_OCL_SECONDARY").as_deref() == Ok("1") {
-        eprintln!("[microbench] OCL_SECONDARY: initializing OpenCLBackend (production-style)");
-        Some(llm_rs2::backend::opencl::OpenCLBackend::new()?)
-    } else {
-        None
-    };
-
-    println!("=== microbench_qnn_qwen_layer (M2.H) ===\n");
+    println!("=== microbench_qnn_28layer_tbt (M2.I production-eq) ===\n");
+    println!("Layers per token: 28 (Qwen 2.5-1.5B), Tokens decoded: 32\n");
     println!("Op Package:       {}", PKG_PATH);
     println!("Interface symbol: {}", PKG_PROVIDER);
     println!(
@@ -128,12 +110,11 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
 
-    let simple_src = include_str!("../../kernels/simple_ops.cl");
-    let add_src = include_str!("../../kernels/add.cl");
-    let q40_src = include_str!("../../kernels/mul_mv_q4_0_f32_8x_flat.cl");
-    let fa_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
-    // D-D.6: production OpenCLBackend의 build flag와 byte-equal 통일.
-    let cl_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math";
+    let simple_src = include_str!("../kernels/simple_ops.cl");
+    let add_src = include_str!("../kernels/add.cl");
+    let q40_src = include_str!("../kernels/mul_mv_q4_0_f32_8x_flat.cl");
+    let fa_src = include_str!("../kernels/flash_attn_f32_f16.cl");
+    let cl_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math";
     let fa_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math -DDK=128 -DDV=128 \
                    -DBLOCK_M=32 -DBLOCK_N=32";
 
@@ -158,17 +139,13 @@ fn main() -> anyhow::Result<()> {
         .cmplr_opt(fa_opts)
         .build(&cl_ctx)?;
 
-    // D-D.6: graph가 사용하는 새 OOP single-subgroup variant로 raw chain도 통일.
-    // 같은 algorithm 사용 → microbench에서 graph (new) vs raw chain (new)가 byte-equal.
-    let k_rms = ocl::core::create_kernel(&prog_simple, "kernel_rms_norm_oop_subgroup")?;
+    let k_rms = ocl::core::create_kernel(&prog_simple, "kernel_rms_norm_simple")?;
     let k_q40 = ocl::core::create_kernel(&prog_q40, "kernel_mul_mat_q4_0_f32_8x_flat")?;
     let k_rope = ocl::core::create_kernel(&prog_simple, "kernel_rope_simple")?;
     let k_kvs = ocl::core::create_kernel(&prog_simple, "kernel_kv_scatter_f32_to_f16")?;
     let k_fa = ocl::core::create_kernel(&prog_fa, "flash_attn_f32_f16_q1")?;
     let k_silu = ocl::core::create_kernel(&prog_simple, "kernel_silu_mul_simple")?;
     let k_add = ocl::core::create_kernel(&prog_add, "kernel_add_row")?;
-    // D-D.6 Phase A.5: Qwen2.5 QKV bias add (forward_gen와 동일 환경 재현용).
-    let k_bias = ocl::core::create_kernel(&prog_simple, "kernel_add_row_bias")?;
 
     // ── QNN backend + register OpPackage ─────────────────────────────────────
     let gpu_lib = unsafe { Library::new(&backend_lib_path) }?;
@@ -241,7 +218,6 @@ fn main() -> anyhow::Result<()> {
         &k_fa,
         &k_silu,
         &k_add,
-        &k_bias,
         &rpcmem_alloc,
         &rpcmem_to_fd,
         RPCMEM_HEAP_ID_SYSTEM,
@@ -358,7 +334,6 @@ fn run_layer(
     k_fa: &ocl::core::Kernel,
     k_silu: &ocl::core::Kernel,
     k_add: &ocl::core::Kernel,
-    k_bias: &ocl::core::Kernel,
     rpcmem_alloc: &libloading::Symbol<unsafe extern "C" fn(i32, u32, i32) -> *mut std::ffi::c_void>,
     rpcmem_to_fd: &libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_void) -> i32>,
     heap_id: i32,
@@ -389,25 +364,6 @@ fn run_layer(
     for (i, x) in host_x.iter_mut().enumerate() {
         *x = ((i as f32) * 0.0173 + 0.07).rem_euclid(1.0) - 0.5;
     }
-    // D-D.6 디버깅: production이 dump한 x_in bytes를 inject. random input
-    // (well-conditioned)에서 PASS인데 production에서 RED라면 input pattern이
-    // root cause. `LLMRS_MICROBENCH_X_FILE=/path/to/x.bin` 설정 시 활성.
-    if let Ok(p) = std::env::var("LLMRS_MICROBENCH_X_FILE") {
-        let bytes = std::fs::read(&p)?;
-        let expected = dim * 4;
-        anyhow::ensure!(
-            bytes.len() == expected,
-            "x file: bytes={} != expected {expected}",
-            bytes.len()
-        );
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_x.as_mut_ptr() as *mut u8, expected);
-        }
-        eprintln!(
-            "[microbench] x_in injected from {p} — host_x[0..8]={:?}",
-            &host_x[..8]
-        );
-    }
     let mut host_rms_w_pre = vec![0.0f32; dim];
     let mut host_rms_w_post = vec![0.0f32; dim];
     for (i, w) in host_rms_w_pre.iter_mut().enumerate() {
@@ -424,12 +380,6 @@ fn run_layer(
         }
         w
     }
-    // D-D.6 Phase A.5: Qwen2.5 attention QKV bias. random fallback = zeros (no bias).
-    // GGUF inject 시 blk.0.attn_{q,k,v}.bias로 갱신.
-    let mut host_q_bias = vec![0.0f32; q_proj_out];
-    let mut host_k_bias = vec![0.0f32; kv_proj_out];
-    let mut host_v_bias = vec![0.0f32; kv_proj_out];
-
     let w_q = gen_weights(q_proj_out, dim, 0.13);
     let w_k = gen_weights(kv_proj_out, dim, 0.21);
     let w_v = gen_weights(kv_proj_out, dim, 0.29);
@@ -441,90 +391,13 @@ fn run_layer(
     // Pack to Q4_0 SOA on host (so raw OpenCL and OpPackage paths consume
     // identical byte buffers — quantisation error becomes a constant offset
     // shared by both paths).
-    let (mut qq_q, mut qq_d) = pack_q40_soa(&w_q, q_proj_out, dim);
-    let (mut qk_q, mut qk_d) = pack_q40_soa(&w_k, kv_proj_out, dim);
-    let (mut qv_q, mut qv_d) = pack_q40_soa(&w_v, kv_proj_out, dim);
-    let (mut qo_q, mut qo_d) = pack_q40_soa(&w_o, dim, q_proj_out);
-    let (mut qg_q, mut qg_d) = pack_q40_soa(&w_gate, ffn_dim, dim);
-    let (mut qu_q, mut qu_d) = pack_q40_soa(&w_up, ffn_dim, dim);
-    let (mut qd_q, mut qd_d) = pack_q40_soa(&w_down, dim, ffn_dim);
-
-    // D-D.6 디버깅: GGUF에서 layer 0 production weight를 inject하여 random
-    // weight (well-conditioned) vs 실제 weight (specific patterns) 차이 검증.
-    // `LLMRS_MICROBENCH_GGUF=/path/to/qwen.gguf` 설정 시 활성. inject 후 raw
-    // OpenCL chain과 graph 둘 다 GGUF AOS→SOA bytes를 consume하므로
-    // bit-identical (graph kernel이 정상이면 PASS).
-    if let Ok(p) = std::env::var("LLMRS_MICROBENCH_GGUF") {
-        eprintln!("[microbench] GGUF inject: loading layer 0 weights from {p}");
-        use llm_rs2::backend::qnn_oppkg::weight_pack::aos_to_soa_q4_0;
-        use llm_rs2::models::loader::gguf::GgufFile;
-        let gguf = GgufFile::open(std::path::Path::new(&p))?;
-        let load_q4_0 = |name: &str, n: usize, k: usize| -> anyhow::Result<(Vec<u8>, Vec<u16>)> {
-            let info = gguf
-                .find_tensor(name)
-                .ok_or_else(|| anyhow::anyhow!("GGUF: {name} not found"))?;
-            let raw = gguf.tensor_data(info);
-            let num_blocks = n * k / 32;
-            let expected = num_blocks * 18;
-            anyhow::ensure!(
-                raw.len() >= expected,
-                "GGUF {name}: bytes={} < expected {expected}",
-                raw.len()
-            );
-            Ok(aos_to_soa_q4_0(&raw[..expected], n, k))
-        };
-        let load_f32 = |name: &str, n: usize| -> anyhow::Result<Vec<f32>> {
-            let info = gguf
-                .find_tensor(name)
-                .ok_or_else(|| anyhow::anyhow!("GGUF: {name} not found"))?;
-            let raw = gguf.tensor_data(info);
-            let expected = n * 4;
-            anyhow::ensure!(
-                raw.len() >= expected,
-                "GGUF {name}: bytes={} < expected {expected}",
-                raw.len()
-            );
-            let mut out = vec![0.0f32; n];
-            unsafe {
-                std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, expected);
-            }
-            Ok(out)
-        };
-        let (q_q, q_d) = load_q4_0("blk.0.attn_q.weight", q_proj_out, dim)?;
-        qq_q = q_q;
-        qq_d = q_d;
-        let (k_q, k_d) = load_q4_0("blk.0.attn_k.weight", kv_proj_out, dim)?;
-        qk_q = k_q;
-        qk_d = k_d;
-        let (v_q, v_d) = load_q4_0("blk.0.attn_v.weight", kv_proj_out, dim)?;
-        qv_q = v_q;
-        qv_d = v_d;
-        let (o_q, o_d) = load_q4_0("blk.0.attn_output.weight", dim, q_proj_out)?;
-        qo_q = o_q;
-        qo_d = o_d;
-        let (g_q, g_d) = load_q4_0("blk.0.ffn_gate.weight", ffn_dim, dim)?;
-        qg_q = g_q;
-        qg_d = g_d;
-        let (u_q, u_d) = load_q4_0("blk.0.ffn_up.weight", ffn_dim, dim)?;
-        qu_q = u_q;
-        qu_d = u_d;
-        let (d_q, d_d) = load_q4_0("blk.0.ffn_down.weight", dim, ffn_dim)?;
-        qd_q = d_q;
-        qd_d = d_d;
-        host_rms_w_pre = load_f32("blk.0.attn_norm.weight", dim)?;
-        host_rms_w_post = load_f32("blk.0.ffn_norm.weight", dim)?;
-        // D-D.6 Phase A.5: Qwen2.5 QKV bias load (forward_gen와 동일 환경).
-        host_q_bias = load_f32("blk.0.attn_q.bias", q_proj_out)?;
-        host_k_bias = load_f32("blk.0.attn_k.bias", kv_proj_out)?;
-        host_v_bias = load_f32("blk.0.attn_v.bias", kv_proj_out)?;
-        eprintln!(
-            "[microbench] GGUF inject done — qq_q.len={} qq_d[0..4]={:?} rms_pre[0..4]={:?} q_bias[0..4]={:?}",
-            qq_q.len(),
-            &qq_d[..4.min(qq_d.len())],
-            &host_rms_w_pre[..4.min(host_rms_w_pre.len())],
-            &host_q_bias[..4.min(host_q_bias.len())]
-        );
-    }
+    let (qq_q, qq_d) = pack_q40_soa(&w_q, q_proj_out, dim);
+    let (qk_q, qk_d) = pack_q40_soa(&w_k, kv_proj_out, dim);
+    let (qv_q, qv_d) = pack_q40_soa(&w_v, kv_proj_out, dim);
+    let (qo_q, qo_d) = pack_q40_soa(&w_o, dim, q_proj_out);
+    let (qg_q, qg_d) = pack_q40_soa(&w_gate, ffn_dim, dim);
+    let (qu_q, qu_d) = pack_q40_soa(&w_up, ffn_dim, dim);
+    let (qd_q, qd_d) = pack_q40_soa(&w_down, dim, ffn_dim);
 
     // ── 2. Path A: raw OpenCL — 14-stage chain ──────────────────────────────
     // Buffers: x, rms_w_pre, q4_0 (q+d) per weight, intermediates, kv cache.
@@ -566,10 +439,6 @@ fn run_layer(
     let buf_q = mk_buf_f32_rw(q_proj_out)?;
     let buf_k = mk_buf_f32_rw(kv_proj_out)?;
     let buf_v = mk_buf_f32_rw(kv_proj_out)?;
-    // D-D.6 Phase A.5: Qwen2.5 QKV bias buffers.
-    let buf_q_bias = mk_buf_f32_ro(q_proj_out)?;
-    let buf_k_bias = mk_buf_f32_ro(kv_proj_out)?;
-    let buf_v_bias = mk_buf_f32_ro(kv_proj_out)?;
     let buf_kcache = mk_buf_u16_rw(kv_total)?;
     let buf_vcache = mk_buf_u16_rw(kv_total)?;
     let buf_attn_o = mk_buf_f32_rw(q_proj_out)?;
@@ -645,50 +514,8 @@ fn run_layer(
     up_u16!(&buf_ud, &qu_d);
     up_u8!(&buf_dq, &qd_q);
     up_u16!(&buf_dd, &qd_d);
-    up_f32!(&buf_q_bias, &host_q_bias);
-    up_f32!(&buf_k_bias, &host_k_bias);
-    up_f32!(&buf_v_bias, &host_v_bias);
-    // D-D.6 디버깅: KV K/V file inject — production state inject 시. 미설정이면
-    // host_kv_zero (default). raw OpenCL chain의 buf_kcache/vcache + graph rpcmem
-    // KV slot 양쪽 모두 동일 bytes로 초기화 (둘이 동일 input 갖도록 byte-equal 비교).
-    let host_kv_k: Vec<u16> = match std::env::var("LLMRS_MICROBENCH_KV_K_FILE") {
-        Ok(p) => {
-            let raw = std::fs::read(&p)?;
-            let expected = kv_total * 2;
-            anyhow::ensure!(
-                raw.len() == expected,
-                "kv_k file: bytes={} != expected {expected}",
-                raw.len()
-            );
-            let mut out = vec![0u16; kv_total];
-            unsafe {
-                std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, expected);
-            }
-            eprintln!("[microbench] KV K injected from {p}");
-            out
-        }
-        Err(_) => host_kv_zero.clone(),
-    };
-    let host_kv_v: Vec<u16> = match std::env::var("LLMRS_MICROBENCH_KV_V_FILE") {
-        Ok(p) => {
-            let raw = std::fs::read(&p)?;
-            let expected = kv_total * 2;
-            anyhow::ensure!(
-                raw.len() == expected,
-                "kv_v file: bytes={} != expected {expected}",
-                raw.len()
-            );
-            let mut out = vec![0u16; kv_total];
-            unsafe {
-                std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr() as *mut u8, expected);
-            }
-            eprintln!("[microbench] KV V injected from {p}");
-            out
-        }
-        Err(_) => host_kv_zero.clone(),
-    };
-    up_u16!(&buf_kcache, &host_kv_k);
-    up_u16!(&buf_vcache, &host_kv_v);
+    up_u16!(&buf_kcache, &host_kv_zero);
+    up_u16!(&buf_vcache, &host_kv_zero);
     ocl::core::finish(cl_q)?;
 
     // ── M2.I breakdown timing — raw OpenCL chain wall-clock ─────────────────
@@ -707,71 +534,20 @@ fn run_layer(
     ocl::core::set_kernel_arg(k_rms, 2, ArgVal::mem(&buf_y1))?;
     ocl::core::set_kernel_arg(k_rms, 3, ArgVal::scalar(&dim_i))?;
     ocl::core::set_kernel_arg(k_rms, 4, ArgVal::scalar(&RMS_EPS))?;
-    // D-D.6: kernel_rms_norm_oop_subgroup contract — global=[rows*64], local=[64].
-    let rms_global = [1usize * 64, 1, 1];
-    let rms_local = [64usize, 1, 1];
+    let one3 = [1usize, 1, 1];
     unsafe {
         ocl::core::enqueue_kernel(
             cl_q,
             k_rms,
             1,
             None,
-            &rms_global,
-            Some(rms_local),
+            &one3,
+            None,
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
     }
     ocl::core::finish(cl_q)?;
-
-    // D-D.6 디버깅: raw chain RMS output (buf_y1) dump.
-    if let Ok(p) = std::env::var("LLMRS_MICROBENCH_DUMP_RMS_OUT") {
-        let mut bytes = vec![0u8; dim * 4];
-        unsafe {
-            ocl::core::enqueue_read_buffer(
-                cl_q,
-                &buf_y1,
-                true,
-                0,
-                &mut bytes,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
-        }
-        std::fs::write(&p, &bytes)?;
-        eprintln!("[microbench-dump-rms] wrote {} bytes to {p}", bytes.len());
-    }
-
-    // Microbench stage-by-stage dump (LLMRS_MICROBENCH_DUMP_PREFIX=path).
-    // 각 stage 결과를 `path.stageN`에 binary로 저장. graph build/execute
-    // 디버깅용 standalone tool.
-    macro_rules! dump_stage_mb {
-        ($stage:literal, $buf:expr, $nbytes:expr) => {
-            if let Ok(prefix) = std::env::var("LLMRS_MICROBENCH_DUMP_PREFIX") {
-                let mut bytes = vec![0u8; $nbytes];
-                unsafe {
-                    ocl::core::enqueue_read_buffer(
-                        cl_q,
-                        $buf,
-                        true,
-                        0,
-                        &mut bytes,
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    )?;
-                }
-                let path = format!("{}.stage{}", prefix, $stage);
-                std::fs::write(&path, &bytes)?;
-                eprintln!(
-                    "[microbench-dump-s{}] {} bytes -> {}",
-                    $stage,
-                    bytes.len(),
-                    path
-                );
-            }
-        };
-    }
-    dump_stage_mb!(1, &buf_y1, dim * 4);
 
     // Helper for Q4_0 matmul stage. Mirrors microbench_qnn_oppkg_matmul_q40.
     let dispatch_q40 = |k_q40: &ocl::core::Kernel,
@@ -828,35 +604,7 @@ fn run_layer(
     };
 
     // Stages 2-4: Q/K/V projection (M=1).
-    // D-D.6 Phase A.5: Q/K/V matmul 직후 bias add (Qwen2.5 attention bias).
-    // dump_stage_mb!(N) 위치는 forward_gen와 동일하게 pre-bias로 유지.
-    let dispatch_bias =
-        |bias_buf: &ocl::core::Mem, x_buf: &ocl::core::Mem, total: usize| -> anyhow::Result<()> {
-            let total_i = total as i32;
-            let dim_i = total as i32;
-            ocl::core::set_kernel_arg(k_bias, 0, ArgVal::mem(x_buf))?;
-            ocl::core::set_kernel_arg(k_bias, 1, ArgVal::mem(bias_buf))?;
-            ocl::core::set_kernel_arg(k_bias, 2, ArgVal::scalar(&dim_i))?;
-            ocl::core::set_kernel_arg(k_bias, 3, ArgVal::scalar(&total_i))?;
-            let global = [total, 1, 1];
-            unsafe {
-                ocl::core::enqueue_kernel(
-                    cl_q,
-                    k_bias,
-                    1,
-                    None,
-                    &global,
-                    None,
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-            ocl::core::finish(cl_q)?;
-            Ok(())
-        };
     dispatch_q40(k_q40, &buf_qq, &buf_qd, &buf_y1, &buf_q, 1, q_proj_out, dim)?;
-    dump_stage_mb!(2, &buf_q, q_proj_out * 4);
-    dispatch_bias(&buf_q_bias, &buf_q, q_proj_out)?;
     dispatch_q40(
         k_q40,
         &buf_kq,
@@ -867,8 +615,6 @@ fn run_layer(
         kv_proj_out,
         dim,
     )?;
-    dump_stage_mb!(3, &buf_k, kv_proj_out * 4);
-    dispatch_bias(&buf_k_bias, &buf_k, kv_proj_out)?;
     dispatch_q40(
         k_q40,
         &buf_vq,
@@ -879,8 +625,6 @@ fn run_layer(
         kv_proj_out,
         dim,
     )?;
-    dump_stage_mb!(4, &buf_v, kv_proj_out * 4);
-    dispatch_bias(&buf_v_bias, &buf_v, kv_proj_out)?;
 
     // Stage 5: RoPE(Q) — kernel_rope_simple(x, head_dim, num_heads, seq_len, start_pos, theta)
     let head_dim_i: i32 = head_dim as i32;
@@ -908,7 +652,6 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
-    dump_stage_mb!(5, &buf_q, q_proj_out * 4);
 
     // Stage 6: RoPE(K)
     ocl::core::set_kernel_arg(k_rope, 0, ArgVal::mem(&buf_k))?;
@@ -932,7 +675,6 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
-    dump_stage_mb!(6, &buf_k, kv_proj_out * 4);
 
     // Stage 7: KvScatter — kernel_kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
     let capacity_i: i32 = kv_capacity as i32;
@@ -1039,8 +781,6 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
-    // microbench stage 8 (FlashAttn) == forward_gen stage 9 (Attention)
-    dump_stage_mb!(9, &buf_attn_o, q_proj_out * 4);
 
     // Stage 9: O proj — Q4_0 matmul (M=1, N=dim, K=q_proj_out)
     dispatch_q40(
@@ -1053,8 +793,6 @@ fn run_layer(
         dim,
         q_proj_out,
     )?;
-    // microbench stage 9 (O proj) == forward_gen stage 10 (post O-proj attn_out)
-    dump_stage_mb!(10, &buf_o, dim * 4);
 
     // Stage 10: Add (residual #1) — kernel_add_row(o, x, x_attn, n4)
     let n4_dim: i32 = (dim / 4) as i32;
@@ -1088,27 +826,23 @@ fn run_layer(
     ocl::core::set_kernel_arg(k_rms, 2, ArgVal::mem(&buf_y2))?;
     ocl::core::set_kernel_arg(k_rms, 3, ArgVal::scalar(&dim_i))?;
     ocl::core::set_kernel_arg(k_rms, 4, ArgVal::scalar(&RMS_EPS))?;
-    // D-D.6: kernel_rms_norm_oop_subgroup contract — global=[rows*64], local=[64].
     unsafe {
         ocl::core::enqueue_kernel(
             cl_q,
             k_rms,
             1,
             None,
-            &rms_global,
-            Some(rms_local),
+            &one3,
+            None,
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
     }
     ocl::core::finish(cl_q)?;
-    dump_stage_mb!(11, &buf_y2, dim * 4);
 
     // Stages 12-13: gate / up — Q4_0 matmul (M=1, N=ffn_dim, K=dim)
     dispatch_q40(k_q40, &buf_gq, &buf_gd, &buf_y2, &buf_gate, 1, ffn_dim, dim)?;
-    dump_stage_mb!(12, &buf_gate, ffn_dim * 4);
     dispatch_q40(k_q40, &buf_uq, &buf_ud, &buf_y2, &buf_up, 1, ffn_dim, dim)?;
-    dump_stage_mb!(13, &buf_up, ffn_dim * 4);
 
     // Stage 14: SiluMul — kernel_silu_mul_simple(gate, up, ffn_dim/4) [in-place on gate]
     ocl::core::set_kernel_arg(k_silu, 0, ArgVal::mem(&buf_gate))?;
@@ -1128,14 +862,12 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
-    dump_stage_mb!(14, &buf_gate, ffn_dim * 4);
 
     // Stage 15: down proj — Q4_0 matmul (M=1, N=dim, K=ffn_dim)
     let _ = ffn_dim_i; // referenced symbol, used implicitly via cfg
     dispatch_q40(
         k_q40, &buf_dq, &buf_dd, &buf_gate, &buf_down, 1, dim, ffn_dim,
     )?;
-    dump_stage_mb!(15, &buf_down, dim * 4);
 
     // Stage 16: Add (residual #2)
     ocl::core::set_kernel_arg(k_add, 0, ArgVal::mem(&buf_down))?;
@@ -1158,7 +890,6 @@ fn run_layer(
         )?;
     }
     ocl::core::finish(cl_q)?;
-    dump_stage_mb!(16, &buf_x_out, dim * 4);
     let raw_chain_per_stage_ms = t_raw_chain_start.elapsed().as_secs_f64() * 1000.0;
 
     // ── Raw OpenCL chain — chain-only sync mode (production-style) ──────────
@@ -1179,8 +910,8 @@ fn run_layer(
             k_rms,
             1,
             None,
-            &rms_global,
-            Some(rms_local),
+            &one3,
+            None,
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
@@ -1231,36 +962,9 @@ fn run_layer(
             }
         }};
     }
-    // D-D.6 Phase A.5: chain-only QKV bias (no finish).
-    macro_rules! bias_no_finish {
-        ($bias:expr, $x:expr, $total:expr) => {{
-            let total_i = $total as i32;
-            let dim_i = $total as i32;
-            ocl::core::set_kernel_arg(k_bias, 0, ArgVal::mem($x))?;
-            ocl::core::set_kernel_arg(k_bias, 1, ArgVal::mem($bias))?;
-            ocl::core::set_kernel_arg(k_bias, 2, ArgVal::scalar(&dim_i))?;
-            ocl::core::set_kernel_arg(k_bias, 3, ArgVal::scalar(&total_i))?;
-            let global = [$total as usize, 1, 1];
-            unsafe {
-                ocl::core::enqueue_kernel(
-                    cl_q,
-                    k_bias,
-                    1,
-                    None,
-                    &global,
-                    None,
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-        }};
-    }
     q40_no_finish!(&buf_qq, &buf_qd, &buf_y1, &buf_q, 1usize, q_proj_out, dim);
-    bias_no_finish!(&buf_q_bias, &buf_q, q_proj_out);
     q40_no_finish!(&buf_kq, &buf_kd, &buf_y1, &buf_k, 1usize, kv_proj_out, dim);
-    bias_no_finish!(&buf_k_bias, &buf_k, kv_proj_out);
     q40_no_finish!(&buf_vq, &buf_vd, &buf_y1, &buf_v, 1usize, kv_proj_out, dim);
-    bias_no_finish!(&buf_v_bias, &buf_v, kv_proj_out);
     // Stage 5: RoPE(Q)
     ocl::core::set_kernel_arg(k_rope, 0, ArgVal::mem(&buf_q))?;
     ocl::core::set_kernel_arg(k_rope, 1, ArgVal::scalar(&head_dim_i))?;
@@ -1374,8 +1078,8 @@ fn run_layer(
             k_rms,
             1,
             None,
-            &rms_global,
-            Some(rms_local),
+            &one3,
+            None,
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
@@ -1481,8 +1185,7 @@ fn run_layer(
     let bytes_x_out = (dim * 4) as i32;
     let bytes_q40 = |q: &[u8]| q.len() as i32;
     let bytes_q40d = |d: &[u16]| (d.len() * 2) as i32;
-    // D-D.6: mask sized to kv_capacity (F16) — n_kv는 input tensor로 동적 처리.
-    let bytes_mask = (kv_capacity * 2) as i32;
+    let bytes_mask = 2_i32;
     let bytes_dummy = 4_i32;
     // FlashAttn sinks: kernel reads `sinks_ptr[head_idx]` for head_idx ∈
     // [0, n_head). The OpPackage path always binds a non-null mem object for
@@ -1517,10 +1220,6 @@ fn run_layer(
     let rpc_mask = unsafe { rpcmem_alloc(heap_id, flags, bytes_mask) };
     let rpc_sinks = unsafe { rpcmem_alloc(heap_id, flags, bytes_sinks) };
     let rpc_score = unsafe { rpcmem_alloc(heap_id, flags, bytes_dummy) };
-    // M3.4 D-D.1: pos_buf — INT_32 [1].
-    let rpc_pos = unsafe { rpcmem_alloc(heap_id, flags, 4) };
-    // M3.4 D-D.6: n_kv_buf — INT_32 [1]. FlashAttn input tensor.
-    let rpc_n_kv = unsafe { rpcmem_alloc(heap_id, flags, 4) };
     anyhow::ensure!(
         !rpc_x.is_null()
             && !rpc_rms_pre.is_null()
@@ -1544,9 +1243,7 @@ fn run_layer(
             && !rpc_dd.is_null()
             && !rpc_mask.is_null()
             && !rpc_sinks.is_null()
-            && !rpc_score.is_null()
-            && !rpc_pos.is_null()
-            && !rpc_n_kv.is_null(),
+            && !rpc_score.is_null(),
         "rpcmem_alloc failed"
     );
 
@@ -1567,18 +1264,8 @@ fn run_layer(
             rpc_rms_post as *mut u8,
             bytes_rms as usize,
         );
-        // D-D.6 디버깅: KV inject가 활성이면 host_kv_k/v 사용 (raw OpenCL과 동일).
-        // 미활성이면 zero init (default).
-        std::ptr::copy_nonoverlapping(
-            host_kv_k.as_ptr() as *const u8,
-            rpc_kcache as *mut u8,
-            bytes_kv as usize,
-        );
-        std::ptr::copy_nonoverlapping(
-            host_kv_v.as_ptr() as *const u8,
-            rpc_vcache as *mut u8,
-            bytes_kv as usize,
-        );
+        std::ptr::write_bytes(rpc_kcache as *mut u8, 0, bytes_kv as usize);
+        std::ptr::write_bytes(rpc_vcache as *mut u8, 0, bytes_kv as usize);
         std::ptr::copy_nonoverlapping(qq_q.as_ptr(), rpc_qq as *mut u8, qq_q.len());
         std::ptr::copy_nonoverlapping(
             qq_d.as_ptr() as *const u8,
@@ -1629,10 +1316,6 @@ fn run_layer(
             std::ptr::write_unaligned((rpc_sinks as *mut u8).add(i * 4) as *mut f32, neg_huge);
         }
         std::ptr::write_bytes(rpc_score as *mut u8, 0, bytes_dummy as usize);
-        // M3.4 D-D.1: initial pos value = `pos` (matches raw-OpenCL reference).
-        *(rpc_pos as *mut i32) = pos;
-        // M3.4 D-D.6: initial n_kv value (FlashAttn dynkv kernel reads this slot).
-        *(rpc_n_kv as *mut i32) = n_kv as i32;
     }
 
     let fd_x = unsafe { rpcmem_to_fd(rpc_x) };
@@ -1658,8 +1341,6 @@ fn run_layer(
     let fd_mask = unsafe { rpcmem_to_fd(rpc_mask) };
     let fd_sinks = unsafe { rpcmem_to_fd(rpc_sinks) };
     let fd_score = unsafe { rpcmem_to_fd(rpc_score) };
-    let fd_pos = unsafe { rpcmem_to_fd(rpc_pos) };
-    let fd_n_kv = unsafe { rpcmem_to_fd(rpc_n_kv) };
 
     // ── 4. Build graph: declare tensors then 14 nodes ───────────────────────
     let qp = Qnn_QuantizeParams_t {
@@ -1735,14 +1416,9 @@ fn run_layer(
     let mut dims_down = vec![1u32, dim as u32];
     // M2.H 5th: x_out follows x_in rank to keep Add(residual2) shapes consistent.
     let mut dims_x_out = vec![1u32, dim as u32];
-    // D-D.6: mask sized to kv_capacity (n_kv now dynamic).
-    let mut dims_mask = vec![kv_capacity as u32];
+    let mut dims_mask = vec![n_kv as u32];
     let mut dims_sinks = vec![n_head as u32];
     let mut dims_score = vec![1u32];
-    // M3.4 D-D.1: pos_buf is INT_32 [1] shared across RoPE Q/K and KvScatter.
-    let mut dims_pos = vec![1u32];
-    // M3.4 D-D.6: n_kv_buf is INT_32 [1] consumed by FlashAttn input.
-    let mut dims_n_kv = vec![1u32];
 
     // Tensor names (CStrings must outlive graph build).
     let nm_x = CString::new("x").unwrap();
@@ -1782,10 +1458,6 @@ fn run_layer(
     let nm_mask = CString::new("mask").unwrap();
     let nm_sinks = CString::new("sinks").unwrap();
     let nm_score = CString::new("score").unwrap();
-    // M3.4 D-D.1: pos_buf is APP_WRITE so the host can update pos per execute.
-    let nm_pos = CString::new("pos").unwrap();
-    // M3.4 D-D.6: n_kv_buf — APP_WRITE INT_32 [1]; FlashAttn dynkv input.
-    let nm_n_kv = CString::new("n_kv_buf").unwrap();
 
     // Helper: build tensor with given type/dtype/rank/dims.
     let build_tensor = |ttype, dtype, rank: u32, dims_ptr: *mut u32, name: *const c_char| {
@@ -1870,11 +1542,6 @@ fn run_layer(
     let mut t_mask = build_tensor(app_w, f16_t, 1, dims_mask.as_mut_ptr(), nm_mask.as_ptr());
     let mut t_sinks = build_tensor(app_w, f32_t, 1, dims_sinks.as_mut_ptr(), nm_sinks.as_ptr());
     let mut t_score = build_tensor(app_w, f32_t, 1, dims_score.as_mut_ptr(), nm_score.as_ptr());
-    // M3.4 D-D.1: pos_buf — INT_32 [1] APP_WRITE; updated per execute by host.
-    let i32_t = Qnn_DataType_t_QNN_DATATYPE_INT_32;
-    let mut t_pos = build_tensor(app_w, i32_t, 1, dims_pos.as_mut_ptr(), nm_pos.as_ptr());
-    // M3.4 D-D.6: n_kv_buf — INT_32 [1] APP_WRITE; FlashAttn dynkv input.
-    let mut t_n_kv = build_tensor(app_w, i32_t, 1, dims_n_kv.as_mut_ptr(), nm_n_kv.as_ptr());
     // Output of layer.
     // M2.H 5th: rank 2 [1, dim] to match x_in shape (Add(residual2) needs same rank).
     let mut t_x_out = build_tensor(app_r, f32_t, 2, dims_x_out.as_mut_ptr(), nm_x_out.as_ptr());
@@ -1991,8 +1658,6 @@ fn run_layer(
         ("mask", &mut t_mask),
         ("sinks", &mut t_sinks),
         ("score", &mut t_score),
-        ("pos", &mut t_pos),
-        ("n_kv_buf", &mut t_n_kv),
         ("x_out", &mut t_x_out),
         ("y1", &mut t_y1),
         ("q", &mut t_q),
@@ -2055,29 +1720,34 @@ fn run_layer(
     let pn_kv_capacity = CString::new("kv_capacity").unwrap();
     let pn_head_dim_fa = CString::new("head_dim").unwrap();
 
-    // RoPE params (separate copies — Q/K share theta).
-    // M3.4 D-D.1: `start_pos` is no longer a SCALAR param; it's supplied via
-    // pos_buf input tensor at execute time.
-    let mk_rope_params = |th: f32| {
-        [Qnn_Param_t {
-            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
-            name: pn_theta.as_ptr(),
-            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
-                scalarParam: Qnn_Scalar_t {
-                    dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
-                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { floatValue: th },
+    // RoPE params (separate copies — Q/K share but we keep independent storage).
+    let mk_rope_params = |start: i32, th: f32| {
+        [
+            Qnn_Param_t {
+                paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+                name: pn_start_pos.as_ptr(),
+                __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
+                    scalarParam: Qnn_Scalar_t {
+                        dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                        __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { int32Value: start },
+                    },
                 },
             },
-        }]
+            Qnn_Param_t {
+                paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+                name: pn_theta.as_ptr(),
+                __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
+                    scalarParam: Qnn_Scalar_t {
+                        dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                        __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { floatValue: th },
+                    },
+                },
+            },
+        ]
     };
-    let mut rope_q_params = mk_rope_params(theta);
-    let mut rope_k_params = mk_rope_params(theta);
-    // Suppress unused-warning for the kept `start_pos` / `write_pos` CString:
-    let _ = &pn_start_pos;
-    let _ = &pn_write_pos;
+    let mut rope_q_params = mk_rope_params(pos, theta);
+    let mut rope_k_params = mk_rope_params(pos, theta);
 
-    // M3.4 D-D.1: KvScatter `write_pos` is now in pos_buf. Only head_dim and
-    // capacity remain as SCALAR params.
     let mut kvs_params = [
         Qnn_Param_t {
             paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
@@ -2103,11 +1773,31 @@ fn run_layer(
                 },
             },
         },
+        Qnn_Param_t {
+            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+            name: pn_write_pos.as_ptr(),
+            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
+                scalarParam: Qnn_Scalar_t {
+                    dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { int32Value: pos },
+                },
+            },
+        },
     ];
 
-    // D-D.6: n_kv SCALAR 제거 — n_kv는 input tensor (n_kv_buf)로 동적 처리.
-    let _ = &pn_n_kv;
     let mut fa_params = [
+        Qnn_Param_t {
+            paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+            name: pn_n_kv.as_ptr(),
+            __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
+                scalarParam: Qnn_Scalar_t {
+                    dataType: Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                    __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 {
+                        int32Value: n_kv as i32,
+                    },
+                },
+            },
+        },
         Qnn_Param_t {
             paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
             name: pn_n_head.as_ptr(),
@@ -2197,21 +1887,16 @@ fn run_layer(
     let mut out_k_proj = [t_k];
     let mut in_v_proj = [t_vq, t_vd, t_y1];
     let mut out_v_proj = [t_v];
-    // M3.4 D-D.1: RoPE Q/K and KvScatter all consume the same pos_buf as a
-    // runtime input so the host can update pos per graphExecute.
-    let mut in_rope_q = [t_q, t_pos];
+    let mut in_rope_q = [t_q];
     let mut out_rope_q = [t_q_rope];
-    let mut in_rope_k = [t_k, t_pos];
+    let mut in_rope_k = [t_k];
     let mut out_rope_k = [t_k_rope];
-    // M2.H multi-output: KvScatter declares 3 inputs (k_rope, v, pos) and 2
+    // M2.H multi-output: KvScatter declares 2 inputs (k_rope, v) and 2
     // outputs (kcache, vcache). Earlier revisions routed kcache through
     // inputs[2] (InOutTensor) to fit the single-claim abstraction.
-    let mut in_kvs = [t_k_rope, t_v, t_pos];
+    let mut in_kvs = [t_k_rope, t_v];
     let mut out_kvs = [t_kcache, t_vcache];
-    // D-D.6: FlashAttn input은 (q, k, v, mask, sinks, score, n_kv_buf) 7개.
-    let mut in_fa = [
-        t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score, t_n_kv,
-    ];
+    let mut in_fa = [t_q_rope, t_kcache, t_vcache, t_mask, t_sinks, t_score];
     let mut out_fa = [t_attn_o];
     let mut in_o_proj = [t_oq, t_od, t_attn_o];
     let mut out_o_proj = [t_o];
@@ -2291,44 +1976,44 @@ fn run_layer(
             on_rope_q.as_ptr(),
             ot_rope.as_ptr(),
             in_rope_q.as_mut_ptr(),
-            2, // M3.4 D-D.1: x_in + pos_buf
+            1,
             out_rope_q.as_mut_ptr(),
             1,
             rope_q_params.as_mut_ptr(),
-            1, // theta only
+            2,
             "RoPE Q",
         ),
         (
             on_rope_k.as_ptr(),
             ot_rope.as_ptr(),
             in_rope_k.as_mut_ptr(),
-            2, // M3.4 D-D.1: x_in + pos_buf
+            1,
             out_rope_k.as_mut_ptr(),
             1,
             rope_k_params.as_mut_ptr(),
-            1, // theta only
+            2,
             "RoPE K",
         ),
         (
             on_kvs.as_ptr(),
             ot_kvs.as_ptr(),
             in_kvs.as_mut_ptr(),
-            3, // M3.4 D-D.1: k_src + v_src + pos_buf
+            2,
             out_kvs.as_mut_ptr(),
             2,
             kvs_params.as_mut_ptr(),
-            2, // head_dim + capacity (write_pos via pos_buf)
+            3,
             "KvScatter",
         ),
         (
             on_fa.as_ptr(),
             ot_fa.as_ptr(),
             in_fa.as_mut_ptr(),
-            7, // D-D.6: q + k + v + mask + sinks + score + n_kv_buf
+            6,
             out_fa.as_mut_ptr(),
             1,
             fa_params.as_mut_ptr(),
-            4, // D-D.6: n_head + n_head_kv + kv_capacity + head_dim (n_kv 제거)
+            5,
             "FlashAttn",
         ),
         (
@@ -2551,11 +2236,9 @@ fn run_layer(
         mk_desc(fd_mask, rpc_mask, f16_t, &dims_mask),
         mk_desc(fd_sinks, rpc_sinks, f32_t, &dims_sinks),
         mk_desc(fd_score, rpc_score, f32_t, &dims_score),
-        mk_desc(fd_pos, rpc_pos, i32_t, &dims_pos), // M3.4 D-D.1
-        mk_desc(fd_n_kv, rpc_n_kv, i32_t, &dims_n_kv), // M3.4 D-D.6
         mk_desc(fd_x_out, rpc_x_out, f32_t, &dims_x_out),
     ];
-    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 25];
+    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 23];
     let err = unsafe {
         (v.memRegister.unwrap())(ctx, descs.as_ptr(), descs.len() as u32, mh.as_mut_ptr())
     };
@@ -2611,14 +2294,8 @@ fn run_layer(
     set_mh(&mut t_sinks_mh, mh[20]);
     let mut t_score_mh = t_score;
     set_mh(&mut t_score_mh, mh[21]);
-    // M3.4 D-D.1: pos_buf at index 22 (descs order).
-    let mut t_pos_mh = t_pos;
-    set_mh(&mut t_pos_mh, mh[22]);
-    // M3.4 D-D.6: n_kv_buf at index 23 (after pos, before x_out).
-    let mut t_n_kv_mh = t_n_kv;
-    set_mh(&mut t_n_kv_mh, mh[23]);
     let mut t_x_out_mh = t_x_out;
-    set_mh(&mut t_x_out_mh, mh[24]);
+    set_mh(&mut t_x_out_mh, mh[22]);
 
     // ── 8. graphExecute ────────────────────────────────────────────────────
     // exec_inputs: every APP_WRITE tensor; exec_outputs: APP_READ (x_out).
@@ -2646,8 +2323,6 @@ fn run_layer(
         t_mask_mh,
         t_sinks_mh,
         t_score_mh,
-        t_pos_mh,  // M3.4 D-D.1
-        t_n_kv_mh, // M3.4 D-D.6
     ];
     // M2.H multi-output: kcache + vcache are APP_READ outputs (KvScatter
     // claims). The SDK lets them double as graph-internal edges (FA input).
@@ -2727,123 +2402,102 @@ fn run_layer(
         }
     }
 
-    // ── M2.I breakdown timing — QNN graphExecute wall-clock ─────────────────
-    // We separately report:
-    //   (1) first-call latency  — captures any deferred graph compilation /
-    //       JIT cost paid at the first execute (suspected cause of the 1차 8.7
-    //       ms anomaly when the prior measurement skipped warmup)
-    //   (2) steady-state median — 3 warmup + 10 measure. KV cache writes the
-    //       same pos with deterministic data → outputs match across runs.
+    // ── M2.I production-equivalent 28-layer × 32-token TBT measurement ──────
     //
-    // Note: the very first graphExecute right after graphFinalize was already
-    // performed for correctness comparison above. So this "first-call" sample
-    // here is actually the SECOND graphExecute, i.e. already partially warm.
-    // To get a true cold first-call we'd need to skip the correctness exec —
-    // out of scope; we keep correctness as gating.
-    const QNN_WARMUP: usize = 3;
-    const QNN_RUNS: usize = 10;
-    // Sample 1 cold-ish first-call (= 2nd execute overall; correctness was 1st).
-    let t_first = Instant::now();
-    let err = unsafe {
-        (v.graphExecute.unwrap())(
-            graph,
-            exec_inputs.as_ptr(),
-            exec_inputs.len() as u32,
-            exec_outputs.as_mut_ptr(),
-            exec_outputs.len() as u32,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
+    // Loop: for each of N_TOKENS, call graphExecute LAYERS_PER_TOKEN times.
+    // Per-token wall-clock = N consecutive graphExecute calls. TBT median
+    // across N_TOKENS samples. Warm-up runs a full token's worth of layers
+    // (no timing) so JIT / driver caches reach steady state before measure.
+    const LAYERS_PER_TOKEN: usize = 28; // Qwen 2.5-1.5B layer count
+    const N_TOKENS: usize = 32;
+    const WARMUP_TOKENS: usize = 3;
+
+    // Warm-up: WARMUP_TOKENS * LAYERS_PER_TOKEN graphExecute calls.
+    for _ in 0..WARMUP_TOKENS {
+        for _ in 0..LAYERS_PER_TOKEN {
+            let err = unsafe {
+                (v.graphExecute.unwrap())(
+                    graph,
+                    exec_inputs.as_ptr(),
+                    exec_inputs.len() as u32,
+                    exec_outputs.as_mut_ptr(),
+                    exec_outputs.len() as u32,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            anyhow::ensure!(err == 0, "graphExecute warmup err=0x{:x}", err);
+        }
+    }
+
+    // Measure: N_TOKENS samples of (LAYERS_PER_TOKEN graphExecute calls).
+    let mut tbt_samples_ms: Vec<f64> = Vec::with_capacity(N_TOKENS);
+    let t_total0 = Instant::now();
+    for _ in 0..N_TOKENS {
+        let t_tok0 = Instant::now();
+        for _ in 0..LAYERS_PER_TOKEN {
+            let err = unsafe {
+                (v.graphExecute.unwrap())(
+                    graph,
+                    exec_inputs.as_ptr(),
+                    exec_inputs.len() as u32,
+                    exec_outputs.as_mut_ptr(),
+                    exec_outputs.len() as u32,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            anyhow::ensure!(err == 0, "graphExecute timed err=0x{:x}", err);
+        }
+        tbt_samples_ms.push(t_tok0.elapsed().as_secs_f64() * 1000.0);
+    }
+    let total_ms = t_total0.elapsed().as_secs_f64() * 1000.0;
+
+    // Stats.
+    tbt_samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let tbt_median = tbt_samples_ms[N_TOKENS / 2];
+    let tbt_min = tbt_samples_ms[0];
+    let tbt_max = tbt_samples_ms[N_TOKENS - 1];
+    let tbt_mean = tbt_samples_ms.iter().sum::<f64>() / N_TOKENS as f64;
+    let tbt_avg_total = total_ms / N_TOKENS as f64;
+    let per_layer_median = tbt_median / LAYERS_PER_TOKEN as f64;
+
+    // Production OpenCL TBT baseline (HEAD f3dc4a4, S25, Qwen2.5-1.5B Q4_0).
+    const PROD_TBT_MS: f64 = 29.43;
+    let ratio = tbt_median / PROD_TBT_MS;
+    let verdict = if ratio <= 1.10 {
+        "GREEN"
+    } else if ratio <= 1.20 {
+        "YELLOW"
+    } else {
+        "RED"
     };
-    anyhow::ensure!(err == 0, "graphExecute (2nd cold) err=0x{:x}", err);
-    let qnn_second_cold_ms = t_first.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(
-        "[M2.I-breakdown] qnn_graph_execute_2nd_cold = {:.3} ms (no warmup, after correctness exec)",
-        qnn_second_cold_ms
-    );
 
-    for _ in 0..QNN_WARMUP {
-        let err = unsafe {
-            (v.graphExecute.unwrap())(
-                graph,
-                exec_inputs.as_ptr(),
-                exec_inputs.len() as u32,
-                exec_outputs.as_mut_ptr(),
-                exec_outputs.len() as u32,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        anyhow::ensure!(err == 0, "graphExecute warmup err=0x{:x}", err);
-    }
-    let mut qnn_runs_ms = Vec::with_capacity(QNN_RUNS);
-    for _ in 0..QNN_RUNS {
-        let t0 = Instant::now();
-        let err = unsafe {
-            (v.graphExecute.unwrap())(
-                graph,
-                exec_inputs.as_ptr(),
-                exec_inputs.len() as u32,
-                exec_outputs.as_mut_ptr(),
-                exec_outputs.len() as u32,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        anyhow::ensure!(err == 0, "graphExecute timed err=0x{:x}", err);
-        qnn_runs_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-    }
-    qnn_runs_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let qnn_median_ms = qnn_runs_ms[QNN_RUNS / 2];
-    let qnn_min_ms = qnn_runs_ms[0];
-    let qnn_max_ms = qnn_runs_ms[QNN_RUNS - 1];
-    let qnn_mean_ms = qnn_runs_ms.iter().sum::<f64>() / QNN_RUNS as f64;
+    eprintln!("\n[M2.I-28layer-tbt] === 28-layer × 32-token TBT ===");
     eprintln!(
-        "[M2.I-breakdown] qnn_graph_execute: median={:.3} ms  min={:.3}  max={:.3}  mean={:.3}  (N={}, warmup={})",
-        qnn_median_ms, qnn_min_ms, qnn_max_ms, qnn_mean_ms, QNN_RUNS, QNN_WARMUP
-    );
-
-    // ── M2.I breakdown analysis — SDK overhead separation ───────────────────
-    // Production engine baseline: Qwen2.5-1.5B Q4_0 generate -n 32 = 29.43
-    // ms/tok, 28 layers → 1.05 ms/layer (fused dispatch + minimal sync).
-    let prod_layer_ms = 29.43_f64 / 28.0;
-    let sdk_overhead_vs_chain_only = qnn_median_ms - raw_chain_only_ms;
-    let sdk_overhead_vs_per_stage = qnn_median_ms - raw_chain_per_stage_ms;
-    let sdk_overhead_vs_prod = qnn_median_ms - prod_layer_ms;
-    eprintln!("\n[M2.I-breakdown] === Comparison ===");
-    eprintln!(
-        "  production engine layer wall-clock (estimated, 29.43/28) = {:.3} ms",
-        prod_layer_ms
+        "  layers/token = {}  N_tokens = {}  warmup_tokens = {}",
+        LAYERS_PER_TOKEN, N_TOKENS, WARMUP_TOKENS
     );
     eprintln!(
-        "  raw OpenCL chain-only sync (1 cl_finish, production-like) = {:.3} ms",
-        raw_chain_only_ms
+        "  TBT (per-token median) = {:.3} ms/tok  min = {:.3}  max = {:.3}  mean = {:.3}",
+        tbt_median, tbt_min, tbt_max, tbt_mean
     );
     eprintln!(
-        "  raw OpenCL per-stage sync  (14 cl_finish, raw individual) = {:.3} ms",
-        raw_chain_per_stage_ms
+        "  TBT (avg from total)   = {:.3} ms/tok  ({:.2} ms total / {} tokens)",
+        tbt_avg_total, total_ms, N_TOKENS
     );
     eprintln!(
-        "  qnn graphExecute median                                    = {:.3} ms",
-        qnn_median_ms
-    );
-    eprintln!("  --------------------------------------------------------------------");
-    eprintln!(
-        "  qnn − chain-only          = {:+.3} ms  (SDK validate + bind + submit)",
-        sdk_overhead_vs_chain_only
+        "  per-layer (median TBT / {}) = {:.3} ms/layer",
+        LAYERS_PER_TOKEN, per_layer_median
     );
     eprintln!(
-        "  qnn − per-stage           = {:+.3} ms  (vs raw individual dispatch)",
-        sdk_overhead_vs_per_stage
+        "\n  production OpenCL TBT = {:.2} ms/tok (HEAD f3dc4a4, S25, Qwen2.5-1.5B Q4_0)",
+        PROD_TBT_MS
     );
+    eprintln!("  ratio = QNN / production = {:.3}×", ratio);
     eprintln!(
-        "  qnn − production          = {:+.3} ms  (TBT-relevant: × {:.2})",
-        sdk_overhead_vs_prod,
-        qnn_median_ms / prod_layer_ms
-    );
-    eprintln!(
-        "  per-op SDK overhead (qnn − chain-only) / 14 = {:+.4} ms/op",
-        sdk_overhead_vs_chain_only / 14.0
+        "\n=== M2.I 28-layer verdict: {} (ratio = {:.3}×) ===",
+        verdict, ratio
     );
 
     unsafe {

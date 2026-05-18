@@ -68,7 +68,7 @@ fn main() -> Result<()> {
 
 // Shared Direction A helpers (no duplicate definitions; see plan ref below).
 #[cfg(feature = "opencl")]
-#[path = "../bin_helpers/stage_host_ptr_helpers.rs"]
+#[path = "../src/bin_helpers/stage_host_ptr_helpers.rs"]
 mod helpers;
 
 #[cfg(feature = "opencl")]

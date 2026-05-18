@@ -1,70 +1,35 @@
-//! M1.9 chain correctness — production OpPackage multi-node graph vs raw OpenCL.
+//! M2.G chain5 correctness — production OpPackage 5-node graph including
+//! `CustomSiluMul` as the final node, validating the M2.G `OutputTensorAliased`
+//! abstraction (INV-164).
 //!
-//! Chains the four out-of-place ops in a single QNN graph and compares against
-//! four raw OpenCL kernel invocations (the same kernels the OpPackage embeds):
+//! Builds on M1.9's 4-op chain by appending one more node:
 //!
-//!   x ── RmsNorm ── y1 ── MatMul ── y2 ── Add ── y3 ── Softmax ── y4
-//!         ▲                  ▲             ▲
-//!       rms_w            W_matmul         bias
+//!   x ─ RmsNorm ─ y1 ─ MatMul ─ y2 ─ Add ─ y3 ─ Softmax ─ y4 ─ SiluMul ─ y5
+//!         ▲              ▲             ▲                    ▲
+//!       rms_w        W_matmul        bias                 silu_y
 //!
-//! Why **four** ops, not five:
+//! Why this is the M2.G regression case:
+//!   M1.9's `microbench_qnn_oppkg_chain_correct` stops at Softmax precisely
+//!   because pre-M2.G `CustomSiluMul` exposed a NATIVE output that the kernel
+//!   never wrote (the kernel mutates inputs[0] in-place via OP_INPUT_READWRITE).
+//!   Placing it last forced inputs[0] to APP_WRITE → driver rejected
+//!   (`GPU_ERROR_INVALID_TYPE` for chain_y4). Placing it mid-chain produced
+//!   garbage downstream because outputs[0] was never written.
 //!
-//! `CustomSiluMul` is **in-place** — its kernel mutates `inputs[0]` via
-//! `OP_INPUT_READWRITE` and never writes to `outputs[0]`. The output tensor
-//! exists only to satisfy the OpPackage's "claim the last mem_object" contract
-//! (`build_op_state` lines 211-214). At graph level this means SiluMul's
-//! `outputs[0]` slot carries no kernel-produced data; M1.7 reads its result by
-//! aliasing `inputs[0]` and `outputs[0]` to the same fd at host-visible
-//! `APP_READ`/`APP_WRITE` registration time.
+//!   M2.G replaces the dummy `x_alias` mem_object with a graph-level
+//!   `OutputTensorAliased(0)` arg. `build_op_state` points
+//!   `out_claim.memoryObject` at `mem_objects[0]` — the SDK is told that
+//!   `outputs[0]` shares a backing buffer with `inputs[0]`. Chain composition
+//!   becomes safe: downstream consumers of `outputs[0]` see the mutated x.
 //!
-//! That trick only works when SiluMul is the **only** node — a single-graph
-//! integration is impossible without driver-side support:
-//!
-//! * Placing SiluMul as the chain's last node forces its input (e.g.
-//!   `Softmax`'s output, `chain_y4`) to be `APP_WRITE` (host-visible) so
-//!   SiluMul's host-side fd alias works. But `APP_WRITE` is the input role;
-//!   QNN-GPU rejects it as an output slot:
-//!   `GPU_ERROR_INVALID_TYPE(10012) - Invalid OpConfig output tensor type for
-//!   tensor: chain_y4` (logcat-confirmed).
-//! * Placing SiluMul mid-chain leaves its `outputs[0]` driver-managed
-//!   (`NATIVE`); the next node would then read garbage because the kernel
-//!   never writes that slot.
-//!
-//! Either way, integrating an in-place op into a multi-node QNN graph requires
-//! either (a) a host-side post-pass to copy `inputs[0]` → `outputs[0]`, or
-//! (b) refactoring the OpPackage to be out-of-place. Both touch production
-//! code and are out of scope for M1.9.
-//!
-//! M1.9 therefore validates compounded correctness on the four out-of-place
-//! ops as a single graph; SiluMul's correctness is already covered by M1.7
-//! (max_abs_err = 0 standalone).
-//!
-//! Shapes (rank-2 throughout to satisfy MatMul's `rank>=2` constraint):
-//!   x          [1, dim]   FLOAT_32  (graph input, APP_WRITE)
-//!   rms_w      [1, dim]   FLOAT_32  (graph input, APP_WRITE; rank-2 broadcast)
-//!   W_matmul   [dim, dim] FLOAT_16  (graph input, APP_WRITE)
-//!   bias       [1, dim]   FLOAT_32  (graph input, APP_WRITE)
-//!   y1, y2, y3 [1, dim]   FLOAT_32  (NATIVE intermediates)
-//!   y4         [1, dim]   FLOAT_32  (graph output, APP_READ)
-//!
-//! `dim = 256` mirrors M1.4's first matmul case (M=1, N=256, K=256). All
-//! tensors keep the same flat element count, satisfying the float4
-//! vectorisation constraint (`total % 4 == 0`) for every op.
-//!
-//! Reference path (raw OpenCL, identical kernel sources):
-//!   1. kernel_rms_norm_simple(x, rms_w, t1, dim, eps)
-//!   2. kernel_mul_mat_f16_f32(W_matmul, t1, t2, ...)
-//!   3. kernel_add_row(t2, bias, t3, n4)
-//!   4. kernel_softmax_simple(t3, t4, dim)
-//!
-//! Pass criterion: max_abs_err < 1e-3 (compounded tolerance). Bands:
+//! Verdict bands (5-op compounded):
 //!   `< 1e-5`            — accumulated FP rounding only         → GREEN
-//!   `[1e-5, 1e-3)`      — possible graph topology drift        → YELLOW
-//!   `>= 1e-3`           — chain mapping bug                    → RED
+//!   `[1e-5, 1e-3)`      — graph topology drift                 → YELLOW
+//!   `>= 1e-3`           — chain mapping bug or alias rejected  → RED
 //!
 //! Build (Android cross):
 //!   cargo build --release --features qnn,opencl --target aarch64-linux-android \
-//!     --bin microbench_qnn_oppkg_chain_correct
+//!     --bin microbench_qnn_oppkg_chain5_correct
 //!
 //! Pre-deploy:
 //!   cargo build --release -p qnn_oppkg --target aarch64-linux-android
@@ -72,11 +37,11 @@
 //!
 //! Run on device:
 //!   adb shell "LD_LIBRARY_PATH=/data/local/tmp:/data/local/tmp/qnn:/vendor/lib64 \
-//!              /data/local/tmp/microbench_qnn_oppkg_chain_correct"
+//!              /data/local/tmp/microbench_qnn_oppkg_chain5_correct"
 
 #[cfg(not(feature = "qnn"))]
 fn main() {
-    eprintln!("microbench_qnn_oppkg_chain_correct requires --features qnn");
+    eprintln!("microbench_qnn_oppkg_chain5_correct requires --features qnn");
     std::process::exit(2);
 }
 
@@ -107,20 +72,19 @@ fn main() -> anyhow::Result<()> {
     const PKG_PROVIDER: &str = "QnnOpPackage_InitInterface";
     const PKG_TARGET: &str = "GPU_QTI_AISW";
 
-    println!("=== microbench_qnn_oppkg_chain_correct (M1.9) ===\n");
+    println!("=== microbench_qnn_oppkg_chain5_correct (M2.G) ===\n");
     println!("Op Package:       {}", PKG_PATH);
     println!("Interface symbol: {}", PKG_PROVIDER);
-    println!("Chain topology:   RmsNorm -> MatMulF16F32 -> Add -> Softmax (single graph)");
     println!(
-        "Note:             SiluMul (in-place, M1.7) cannot be chained without graph-level\n\
-         \x20                 alias support. Validated standalone in M1.7 (max_abs_err = 0).\n"
+        "Chain topology:   RmsNorm -> MatMulF16F32 -> Add -> Softmax -> SiluMul (single graph)"
     );
+    println!("Tests:            M2.G OutputTensorAliased — chain-safe in-place SiluMul.\n");
 
     let backend_lib_path = std::env::var("QNN_BACKEND_LIB")
         .unwrap_or_else(|_| "/data/local/tmp/qnn/libQnnGpu.so".to_string());
     println!("Backend lib: {}\n", backend_lib_path);
 
-    // ── Build raw-OpenCL reference toolchain (4 separate kernels) ─────────────
+    // ── Build raw-OpenCL reference toolchain (5 separate kernels) ─────────────
     use ocl::{Context, Device, Platform, Program, Queue};
 
     let platform = Platform::default();
@@ -131,9 +95,9 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
 
-    let simple_src = include_str!("../../kernels/simple_ops.cl");
-    let add_src = include_str!("../../kernels/add.cl");
-    let matmul_src = include_str!("../../kernels/mul_mv_f16_f32.cl");
+    let simple_src = include_str!("../kernels/simple_ops.cl");
+    let add_src = include_str!("../kernels/add.cl");
+    let matmul_src = include_str!("../kernels/mul_mv_f16_f32.cl");
     let cl_opts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math";
 
     let prog_simple = Program::builder()
@@ -156,6 +120,7 @@ fn main() -> anyhow::Result<()> {
     let k_matmul = ocl::core::create_kernel(&prog_matmul, "kernel_mul_mat_f16_f32")?;
     let k_add = ocl::core::create_kernel(&prog_add, "kernel_add_row")?;
     let k_softmax = ocl::core::create_kernel(&prog_simple, "kernel_softmax_simple")?;
+    let k_silumul = ocl::core::create_kernel(&prog_simple, "kernel_silu_mul_simple")?;
 
     // ── QNN-GPU backend + register OpPackage ──────────────────────────────────
     let gpu_lib = unsafe { Library::new(&backend_lib_path) }?;
@@ -225,6 +190,7 @@ fn main() -> anyhow::Result<()> {
         &k_matmul,
         &k_add,
         &k_softmax,
+        &k_silumul,
         &rpcmem_alloc,
         &rpcmem_to_fd,
         RPCMEM_HEAP_ID_SYSTEM,
@@ -259,7 +225,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     println!(
-        "\n=== M1.9 verdict: {} ===",
+        "\n=== M2.G verdict: {} ===",
         if pass { "GREEN" } else { "RED" }
     );
 
@@ -282,6 +248,7 @@ fn run_chain(
     k_matmul: &ocl::core::Kernel,
     k_add: &ocl::core::Kernel,
     k_softmax: &ocl::core::Kernel,
+    k_silumul: &ocl::core::Kernel,
     rpcmem_alloc: &libloading::Symbol<unsafe extern "C" fn(i32, u32, i32) -> *mut std::ffi::c_void>,
     rpcmem_to_fd: &libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_void) -> i32>,
     heap_id: i32,
@@ -298,14 +265,17 @@ fn run_chain(
     let total = dim;
     anyhow::ensure!(total % 4 == 0, "dim must be multiple of 4");
     let n4: i32 = (total / 4) as i32;
+    let size4_i: i32 = n4;
 
     let mut host_x = vec![0.0f32; total];
     let mut host_rms_w = vec![0.0f32; dim];
     let mut host_w_f16 = vec![0u16; dim * dim];
     let mut host_bias = vec![0.0f32; total];
+    let mut host_silu_y = vec![0.0f32; total];
     for i in 0..total {
         host_x[i] = ((i as f32) * 0.0173 + 0.07).rem_euclid(1.0) - 0.5;
         host_bias[i] = ((i as f32) * 0.0061 + 0.21).rem_euclid(1.0) * 0.2 - 0.1;
+        host_silu_y[i] = ((i as f32) * 0.0319 + 0.41).rem_euclid(1.0) * 0.5 + 0.1;
     }
     for (i, w) in host_rms_w.iter_mut().enumerate() {
         *w = ((i as f32) * 0.0091 + 0.13).rem_euclid(1.0) * 0.5 + 0.5;
@@ -315,7 +285,7 @@ fn run_chain(
         *w = f32_to_f16_bits(val);
     }
 
-    // ── Path A: raw OpenCL — 4 sequential kernel launches ─────────────────────
+    // ── Path A: raw OpenCL — 5 sequential kernel launches ─────────────────────
     let buf_x = unsafe {
         ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, total, None)?
     };
@@ -331,6 +301,9 @@ fn run_chain(
         )?
     };
     let buf_bias = unsafe {
+        ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, total, None)?
+    };
+    let buf_silu_y = unsafe {
         ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, total, None)?
     };
     let buf_t1 = unsafe {
@@ -357,6 +330,7 @@ fn run_chain(
             None,
         )?
     };
+    // t4 doubles as silu input (mutated in-place by silu_mul kernel).
     let buf_t4 = unsafe {
         ocl::core::create_buffer::<_, f32>(
             cl_ctx.as_core(),
@@ -403,10 +377,19 @@ fn run_chain(
             None::<ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
+        ocl::core::enqueue_write_buffer(
+            cl_q,
+            &buf_silu_y,
+            true,
+            0,
+            &host_silu_y,
+            None::<ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
     }
     ocl::core::finish(cl_q)?;
 
-    // Stage 1: RmsNorm — kernel_rms_norm_simple(x, weight, output, dim, eps)
+    // Stage 1: RmsNorm
     let dim_i: i32 = dim as i32;
     ocl::core::set_kernel_arg(k_rms, 0, ArgVal::mem(&buf_x))?;
     ocl::core::set_kernel_arg(k_rms, 1, ArgVal::mem(&buf_rms_w))?;
@@ -428,7 +411,7 @@ fn run_chain(
     }
     ocl::core::finish(cl_q)?;
 
-    // Stage 2: MatMul — kernel_mul_mat_f16_f32; M=1, N=dim, K=dim.
+    // Stage 2: MatMul (M=1, N=dim, K=dim)
     let m: usize = 1;
     let n: usize = dim;
     let k_: usize = dim;
@@ -476,7 +459,7 @@ fn run_chain(
     }
     ocl::core::finish(cl_q)?;
 
-    // Stage 3: Add — kernel_add_row(t2, 0, bias, 0, t3, 0, n4)
+    // Stage 3: Add
     ocl::core::set_kernel_arg(k_add, 0, ArgVal::mem(&buf_t2))?;
     ocl::core::set_kernel_arg(k_add, 1, ArgVal::scalar(&off0))?;
     ocl::core::set_kernel_arg(k_add, 2, ArgVal::mem(&buf_bias))?;
@@ -499,7 +482,7 @@ fn run_chain(
     }
     ocl::core::finish(cl_q)?;
 
-    // Stage 4: Softmax — kernel_softmax_simple(t3, t4, dim); rows = 1.
+    // Stage 4: Softmax — t3 → t4
     ocl::core::set_kernel_arg(k_softmax, 0, ArgVal::mem(&buf_t3))?;
     ocl::core::set_kernel_arg(k_softmax, 1, ArgVal::mem(&buf_t4))?;
     ocl::core::set_kernel_arg(k_softmax, 2, ArgVal::scalar(&dim_i))?;
@@ -511,6 +494,25 @@ fn run_chain(
             1,
             None,
             &global_sm,
+            None,
+            None::<&ocl::core::Event>,
+            None::<&mut ocl::core::Event>,
+        )?;
+    }
+    ocl::core::finish(cl_q)?;
+
+    // Stage 5: SiluMul — t4 mutated in-place: t4[i] = silu(t4[i]) * silu_y[i]
+    ocl::core::set_kernel_arg(k_silumul, 0, ArgVal::mem(&buf_t4))?;
+    ocl::core::set_kernel_arg(k_silumul, 1, ArgVal::mem(&buf_silu_y))?;
+    ocl::core::set_kernel_arg(k_silumul, 2, ArgVal::scalar(&size4_i))?;
+    let global_silu = [n4 as usize, 1, 1];
+    unsafe {
+        ocl::core::enqueue_kernel(
+            cl_q,
+            k_silumul,
+            1,
+            None,
+            &global_silu,
             None,
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
@@ -532,24 +534,27 @@ fn run_chain(
     }
     ocl::core::finish(cl_q)?;
 
-    // ── Path B: QNN single graph with 4 chained ops ───────────────────────────
+    // ── Path B: QNN single graph with 5 chained ops ───────────────────────────
     let bytes_x = (total * 4) as i32;
     let bytes_rms_w = (dim * 4) as i32;
     let bytes_w = (dim * dim * 2) as i32;
     let bytes_bias = (total * 4) as i32;
-    let bytes_y4 = (total * 4) as i32;
+    let bytes_silu_y = (total * 4) as i32;
+    let bytes_y5 = (total * 4) as i32;
 
     let rpc_x = unsafe { rpcmem_alloc(heap_id, flags, bytes_x) };
     let rpc_rms_w = unsafe { rpcmem_alloc(heap_id, flags, bytes_rms_w) };
     let rpc_w = unsafe { rpcmem_alloc(heap_id, flags, bytes_w) };
     let rpc_bias = unsafe { rpcmem_alloc(heap_id, flags, bytes_bias) };
-    let rpc_y4 = unsafe { rpcmem_alloc(heap_id, flags, bytes_y4) };
+    let rpc_silu_y = unsafe { rpcmem_alloc(heap_id, flags, bytes_silu_y) };
+    let rpc_y5 = unsafe { rpcmem_alloc(heap_id, flags, bytes_y5) };
     anyhow::ensure!(
         !rpc_x.is_null()
             && !rpc_rms_w.is_null()
             && !rpc_w.is_null()
             && !rpc_bias.is_null()
-            && !rpc_y4.is_null(),
+            && !rpc_silu_y.is_null()
+            && !rpc_y5.is_null(),
         "rpcmem_alloc failed"
     );
 
@@ -574,22 +579,30 @@ fn run_chain(
             rpc_bias as *mut u8,
             bytes_bias as usize,
         );
+        std::ptr::copy_nonoverlapping(
+            host_silu_y.as_ptr() as *const u8,
+            rpc_silu_y as *mut u8,
+            bytes_silu_y as usize,
+        );
     }
 
     let fd_x = unsafe { rpcmem_to_fd(rpc_x) };
     let fd_rms_w = unsafe { rpcmem_to_fd(rpc_rms_w) };
     let fd_w = unsafe { rpcmem_to_fd(rpc_w) };
     let fd_bias = unsafe { rpcmem_to_fd(rpc_bias) };
-    let fd_y4 = unsafe { rpcmem_to_fd(rpc_y4) };
+    let fd_silu_y = unsafe { rpcmem_to_fd(rpc_silu_y) };
+    let fd_y5 = unsafe { rpcmem_to_fd(rpc_y5) };
 
     let mut dims_x: Vec<u32> = vec![1, dim as u32];
     let mut dims_rms_w: Vec<u32> = vec![1, dim as u32];
     let mut dims_w: Vec<u32> = vec![dim as u32, dim as u32];
     let mut dims_bias: Vec<u32> = vec![1, dim as u32];
+    let mut dims_silu_y: Vec<u32> = vec![1, dim as u32];
     let mut dims_y1: Vec<u32> = vec![1, dim as u32];
     let mut dims_y2: Vec<u32> = vec![1, dim as u32];
     let mut dims_y3: Vec<u32> = vec![1, dim as u32];
     let mut dims_y4: Vec<u32> = vec![1, dim as u32];
+    let mut dims_y5: Vec<u32> = vec![1, dim as u32];
 
     let qp = Qnn_QuantizeParams_t {
         encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
@@ -620,14 +633,16 @@ fn run_chain(
         },
     };
 
-    let n_x = CString::new("chain_x").unwrap();
-    let n_rms_w = CString::new("chain_rms_w").unwrap();
-    let n_w = CString::new("chain_W").unwrap();
-    let n_bias = CString::new("chain_bias").unwrap();
-    let n_y1 = CString::new("chain_y1").unwrap();
-    let n_y2 = CString::new("chain_y2").unwrap();
-    let n_y3 = CString::new("chain_y3").unwrap();
-    let n_y4 = CString::new("chain_y4").unwrap();
+    let n_x = CString::new("c5_x").unwrap();
+    let n_rms_w = CString::new("c5_rms_w").unwrap();
+    let n_w = CString::new("c5_W").unwrap();
+    let n_bias = CString::new("c5_bias").unwrap();
+    let n_silu_y = CString::new("c5_silu_y").unwrap();
+    let n_y1 = CString::new("c5_y1").unwrap();
+    let n_y2 = CString::new("c5_y2").unwrap();
+    let n_y3 = CString::new("c5_y3").unwrap();
+    let n_y4 = CString::new("c5_y4").unwrap();
+    let n_y5 = CString::new("c5_y5").unwrap();
 
     let mut t_x = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
@@ -677,6 +692,18 @@ fn run_chain(
         },
     };
     t_bias.__bindgen_anon_1.v1.name = n_bias.as_ptr();
+    let mut t_silu_y = Qnn_Tensor_t {
+        version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+        __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+            v1: mk_tv1(
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                dims_silu_y.as_mut_ptr(),
+                2,
+            ),
+        },
+    };
+    t_silu_y.__bindgen_anon_1.v1.name = n_silu_y.as_ptr();
 
     let mut t_y1 = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
@@ -714,11 +741,15 @@ fn run_chain(
         },
     };
     t_y3.__bindgen_anon_1.v1.name = n_y3.as_ptr();
+    // y4 is now NATIVE (intermediate). With M2.G OutputTensorAliased the SDK
+    // sees SiluMul.outputs[0] = SiluMul.inputs[0] = y4, so y4's buffer is
+    // mutated in-place. y5 is the graph endpoint (APP_READ) registered against
+    // the same fd as y4 to read back the mutated data.
     let mut t_y4 = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
             v1: mk_tv1(
-                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ,
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_NATIVE,
                 Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
                 dims_y4.as_mut_ptr(),
                 2,
@@ -726,9 +757,21 @@ fn run_chain(
         },
     };
     t_y4.__bindgen_anon_1.v1.name = n_y4.as_ptr();
+    let mut t_y5 = Qnn_Tensor_t {
+        version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+        __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+            v1: mk_tv1(
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ,
+                Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                dims_y5.as_mut_ptr(),
+                2,
+            ),
+        },
+    };
+    t_y5.__bindgen_anon_1.v1.name = n_y5.as_ptr();
 
     // ── Build graph ───────────────────────────────────────────────────────────
-    let g_name = CString::new("chain_graph_4op").unwrap();
+    let g_name = CString::new("chain_graph_5op").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
     let err =
         unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
@@ -739,10 +782,12 @@ fn run_chain(
         ("rms_w", &mut t_rms_w),
         ("W", &mut t_w),
         ("bias", &mut t_bias),
+        ("silu_y", &mut t_silu_y),
         ("y1", &mut t_y1),
         ("y2", &mut t_y2),
         ("y3", &mut t_y3),
         ("y4", &mut t_y4),
+        ("y5", &mut t_y5),
     ] {
         let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, t) };
         anyhow::ensure!(err == 0, "tensorCreate({}) err=0x{:x}", label, err);
@@ -753,10 +798,12 @@ fn run_chain(
     let op_name_mm = CString::new("mm0").unwrap();
     let op_name_add = CString::new("add0").unwrap();
     let op_name_sm = CString::new("sm0").unwrap();
+    let op_name_silu = CString::new("silu0").unwrap();
     let ot_rms = CString::new("CustomRmsNorm").unwrap();
     let ot_mm = CString::new("CustomMatMulF16F32").unwrap();
     let ot_add = CString::new("CustomAdd").unwrap();
     let ot_sm = CString::new("CustomSoftmax").unwrap();
+    let ot_silu = CString::new("CustomSiluMul").unwrap();
 
     let mut in_rms = [t_x, t_rms_w];
     let mut out_rms = [t_y1];
@@ -766,6 +813,8 @@ fn run_chain(
     let mut out_add = [t_y3];
     let mut in_sm = [t_y3];
     let mut out_sm = [t_y4];
+    let mut in_silu = [t_y4, t_silu_y];
+    let mut out_silu = [t_y5];
 
     let make_op = |name: *const c_char,
                    typ: *const c_char,
@@ -829,6 +878,15 @@ fn run_chain(
             1u32,
             "Softmax",
         ),
+        (
+            op_name_silu.as_ptr(),
+            ot_silu.as_ptr(),
+            in_silu.as_mut_ptr(),
+            2u32,
+            out_silu.as_mut_ptr(),
+            1u32,
+            "SiluMul",
+        ),
     ];
     for (nm, ty, ins, n_in, outs, n_out, label) in nodes {
         let op = make_op(nm, ty, ins, n_in, outs, n_out);
@@ -837,9 +895,17 @@ fn run_chain(
     }
 
     let err = unsafe { (v.graphFinalize.unwrap())(graph, ptr::null_mut(), ptr::null_mut()) };
-    anyhow::ensure!(err == 0, "graphFinalize err=0x{:x}", err);
+    anyhow::ensure!(
+        err == 0,
+        "graphFinalize err=0x{:x} — likely SDK rejected OutputTensorAliased; \
+         consider Tier 2 fallback (silu+mul split)",
+        err
+    );
 
-    // ── memRegister: 5 host-backed tensors (4 inputs + y4 output) ─────────────
+    // ── memRegister: 6 host-backed tensors ─────────────────────────────────────
+    // Inputs: x, rms_w, W, bias, silu_y. Output: y5 (registered against rpc_y5;
+    // the SDK is told via OutputTensorAliased that y5's backing buffer aliases
+    // SiluMul.inputs[0] = y4, but y4 itself is NATIVE so we read y5's fd).
     let mk_desc = |fd: i32,
                    host_data: *mut std::ffi::c_void,
                    dtype: Qnn_DataType_t,
@@ -877,14 +943,20 @@ fn run_chain(
             &dims_bias,
         ),
         mk_desc(
-            fd_y4,
-            rpc_y4,
+            fd_silu_y,
+            rpc_silu_y,
             Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
-            &dims_y4,
+            &dims_silu_y,
+        ),
+        mk_desc(
+            fd_y5,
+            rpc_y5,
+            Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+            &dims_y5,
         ),
     ];
-    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 5];
-    let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 5, mh.as_mut_ptr()) };
+    let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 6];
+    let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 6, mh.as_mut_ptr()) };
     anyhow::ensure!(err == 0, "memRegister err=0x{:x}", err);
 
     let set_mh = |t: &mut Qnn_Tensor_t, h: *mut std::ffi::c_void| {
@@ -899,11 +971,13 @@ fn run_chain(
     set_mh(&mut t_w_mh, mh[2]);
     let mut t_bias_mh = t_bias;
     set_mh(&mut t_bias_mh, mh[3]);
-    let mut t_y4_mh = t_y4;
-    set_mh(&mut t_y4_mh, mh[4]);
+    let mut t_silu_y_mh = t_silu_y;
+    set_mh(&mut t_silu_y_mh, mh[4]);
+    let mut t_y5_mh = t_y5;
+    set_mh(&mut t_y5_mh, mh[5]);
 
-    let exec_inputs = [t_x_mh, t_rms_w_mh, t_w_mh, t_bias_mh];
-    let mut exec_outputs = [t_y4_mh];
+    let exec_inputs = [t_x_mh, t_rms_w_mh, t_w_mh, t_bias_mh, t_silu_y_mh];
+    let mut exec_outputs = [t_y5_mh];
 
     let err = unsafe {
         (v.graphExecute.unwrap())(
@@ -920,7 +994,7 @@ fn run_chain(
 
     let mut max_abs = 0.0f32;
     unsafe {
-        let test_y = std::slice::from_raw_parts(rpc_y4 as *const f32, total);
+        let test_y = std::slice::from_raw_parts(rpc_y5 as *const f32, total);
         for i in 0..total {
             let d = (test_y[i] - ref_y[i]).abs();
             if d > max_abs {
@@ -930,7 +1004,7 @@ fn run_chain(
     }
 
     unsafe {
-        let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), 5);
+        let _ = (v.memDeRegister.unwrap())(mh.as_ptr(), 6);
     }
 
     Ok(max_abs)

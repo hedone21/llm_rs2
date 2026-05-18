@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         .devices(device)
         .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
-    let kernel_src = include_str!("../../kernels/simple_ops.cl");
+    let kernel_src = include_str!("../kernels/simple_ops.cl");
     let cl_program = Program::builder()
         .devices(device)
         .src(kernel_src)

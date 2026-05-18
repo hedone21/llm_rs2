@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
         .devices(device)
         .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
-    let kernel_src = include_str!("../../kernels/mul_mv_f16_f32.cl");
+    let kernel_src = include_str!("../kernels/mul_mv_f16_f32.cl");
     let cl_program = Program::builder()
         .devices(device)
         .src(kernel_src)

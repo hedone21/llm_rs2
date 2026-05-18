@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
         .devices(device)
         .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
-    let kernel_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
+    let kernel_src = include_str!("../kernels/flash_attn_f32_f16.cl");
     // head_dim=128 build options must match the OpPackage descriptor.
     let cl_program = Program::builder()
         .devices(device)

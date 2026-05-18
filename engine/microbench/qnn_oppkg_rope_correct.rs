@@ -1,27 +1,28 @@
-//! M1.4 CustomMatMulF16F32 correctness — production OpPackage vs raw OpenCL.
+//! M2.B + M3.4 D-D.2 CustomRope correctness — production OpPackage vs raw OpenCL.
 //!
-//! Reference: raw OpenCL `kernel_mul_mat_f16_f32` invoked directly on the same
-//! kernel source the OpPackage embeds. Test: QNN backend registers
-//! `libqnn_oppkg.so` and executes a graph with one `CustomMatMulF16F32` node.
+//! Reference: raw OpenCL `kernel_rope_simple` invoked directly (in-place,
+//! reads `start_pos` as a scalar kernel arg). The OpPackage uses the **OOP**
+//! variant `kernel_rope_simple_oop` which now reads `start_pos` from
+//! `pos_buf[0]` (M3.4 D-D.1: SCALAR op params get baked at graph finalize and
+//! prevent multi-token decode). Numerically the two paths are identical: the
+//! rotation formula and `start_pos` value match per case.
 //!
-//! Cases (M, N, K) ∈ {(1, 512, 256), (4, 1536, 1536), (1, 8960, 1536)}.
-//! Pass criterion: max_abs_err < 1e-2 (F16 weight × F32 x → F32 y).
+//! Mapping (M3.4):
+//!   inputs:  [0]=x_in F32 [seq_len, num_heads, head_dim]
+//!            [1]=pos_buf I32 [1] — pos_buf[0] supplies start_pos at execute
+//!   outputs: [0]=x_out F32 (claimed)
+//!   params:  "theta" FLOAT_32 (build-time const)
 //!
-//! Build (Android cross):
-//!   cargo build --release --features qnn,opencl --target aarch64-linux-android \
-//!     --bin microbench_qnn_oppkg_matmul_correct
+//! Cases (seq_len=1, num_heads=32, head_dim=128, theta=10000.0)
+//!         × start_pos ∈ {0, 10, 100, 1000}. pos=0 reproduces M2.B GREEN
+//! baseline; pos != 0 cases prove the runtime pos buffer drives RoPE rotation.
 //!
-//! Pre-deploy:
-//!   cargo build --release -p qnn_oppkg --target aarch64-linux-android
-//!   adb push target/aarch64-linux-android/release/libqnn_oppkg.so /data/local/tmp/
-//!
-//! Run on device:
-//!   adb shell "LD_LIBRARY_PATH=/data/local/tmp:/data/local/tmp/qnn:/vendor/lib64 \
-//!              /data/local/tmp/microbench_qnn_oppkg_matmul_correct"
+//! Pass criterion: max_abs_err < 1e-4 (identical kernels → bit-equal output
+//! is expected; threshold is loose to absorb potential -ffast-math reorder).
 
 #[cfg(not(feature = "qnn"))]
 fn main() {
-    eprintln!("microbench_qnn_oppkg_matmul_correct requires --features qnn");
+    eprintln!("microbench_qnn_oppkg_rope_correct requires --features qnn");
     std::process::exit(2);
 }
 
@@ -49,7 +50,7 @@ fn main() -> anyhow::Result<()> {
     const PKG_PROVIDER: &str = "QnnOpPackage_InitInterface";
     const PKG_TARGET: &str = "GPU_QTI_AISW";
 
-    println!("=== microbench_qnn_oppkg_matmul_correct (M1.4) ===\n");
+    println!("=== microbench_qnn_oppkg_rope_correct (M2.B + M3.4 D-D.2) ===\n");
     println!("Op Package: {}", PKG_PATH);
     println!("Interface symbol: {}", PKG_PROVIDER);
 
@@ -67,13 +68,13 @@ fn main() -> anyhow::Result<()> {
         .devices(device)
         .build()?;
     let cl_q = Queue::new(&cl_ctx, device, None)?;
-    let kernel_src = include_str!("../../kernels/mul_mv_f16_f32.cl");
+    let kernel_src = include_str!("../kernels/simple_ops.cl");
     let cl_program = Program::builder()
         .devices(device)
         .src(kernel_src)
         .cmplr_opt("-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math")
         .build(&cl_ctx)?;
-    let cl_kernel = ocl::core::create_kernel(&cl_program, "kernel_mul_mat_f16_f32")?;
+    let cl_kernel = ocl::core::create_kernel(&cl_program, "kernel_rope_simple")?;
 
     // ── Path B: QNN-GPU backend + register OpPackage ──────────────────────────
     let gpu_lib = unsafe { Library::new(&backend_lib_path) }?;
@@ -85,8 +86,17 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(err == 0 && np > 0, "GPU getProviders err=0x{:x}", err);
     let v = unsafe { (**provs).__bindgen_anon_1.v2_25 };
 
+    let mut logger: Qnn_LogHandle_t = ptr::null_mut();
+    if let Some(log_create) = v.logCreate {
+        let err = unsafe { log_create(None, QnnLog_Level_t_QNN_LOG_LEVEL_ERROR, &mut logger) };
+        if err != 0 {
+            eprintln!("logCreate err=0x{:x} (proceeding without logger)", err);
+            logger = ptr::null_mut();
+        }
+    }
+
     let mut be: Qnn_BackendHandle_t = ptr::null_mut();
-    let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut be) };
+    let err = unsafe { (v.backendCreate.unwrap())(logger, ptr::null_mut(), &mut be) };
     anyhow::ensure!(err == 0, "backendCreate err=0x{:x}", err);
     println!("backend: OK");
 
@@ -123,11 +133,22 @@ fn main() -> anyhow::Result<()> {
     let _rpcmem_free: Symbol<RpcmemFreeFn> = unsafe { rpc_lib.get(b"rpcmem_free\0")? };
     let rpcmem_to_fd: Symbol<RpcmemToFdFn> = unsafe { rpc_lib.get(b"rpcmem_to_fd\0")? };
 
-    let cases: &[(usize, usize, usize)] = &[(1, 512, 256), (4, 1536, 1536), (1, 8960, 1536)];
+    // Llama 3.2 1B q-projection: seq_len=1, num_heads=32, head_dim=128 is too
+    // wide; Llama 1B uses head_dim=64. For broader coverage we exercise a
+    // Qwen-like (32, 128) shape since head_dim is the only RoPE-specific
+    // dimension and the kernel handles both.
+    let seq_len: usize = 1;
+    let num_heads: usize = 32;
+    let head_dim: usize = 128;
+    let theta: f32 = 10000.0;
+    let start_positions: &[i32] = &[0, 10, 100, 1000];
     let mut all_pass = true;
 
-    for &(m, n, k) in cases {
-        println!("--- (M, N, K) = ({}, {}, {}) ---", m, n, k);
+    for &start_pos in start_positions {
+        println!(
+            "--- (seq_len, num_heads, head_dim) = ({}, {}, {}), start_pos = {}, theta = {} ---",
+            seq_len, num_heads, head_dim, start_pos, theta
+        );
         let result = run_case(
             &v,
             ctx,
@@ -138,13 +159,15 @@ fn main() -> anyhow::Result<()> {
             &rpcmem_to_fd,
             RPCMEM_HEAP_ID_SYSTEM,
             RPCMEM_DEFAULT_FLAGS,
-            m,
-            n,
-            k,
+            seq_len,
+            num_heads,
+            head_dim,
+            start_pos,
+            theta,
         );
         match result {
             Ok(max_err) => {
-                let pass = max_err < 1e-2;
+                let pass = max_err < 1e-4;
                 println!(
                     "  max_abs_err = {:.6e}  {}",
                     max_err,
@@ -162,7 +185,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!(
-        "\n=== M1.4 verdict: {} ===",
+        "\n=== M3.4 D-D.2 verdict: {} ===",
         if all_pass { "GREEN" } else { "RED" }
     );
 
@@ -190,159 +213,121 @@ fn run_case(
     rpcmem_to_fd: &libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_void) -> i32>,
     heap_id: i32,
     flags: u32,
-    m: usize,
-    n: usize,
-    k: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    start_pos: i32,
+    theta: f32,
 ) -> anyhow::Result<f32> {
     use ocl::core::ArgVal;
     use qnn::*;
     use std::ffi::CString;
     use std::ptr;
 
-    // ── Generate identical inputs for both paths ───────────────────────────────
-    // Same recipe as microbench_qnngpu_matmul_tbt to keep paths apple-to-apple.
-    let mut host_w_f16 = vec![0u16; n * k];
-    let mut host_x_f32 = vec![0.0f32; m * k];
-    for (i, w) in host_w_f16.iter_mut().enumerate() {
-        let v = ((i as f32) * 0.0007 + 0.13).rem_euclid(1.0) - 0.5;
-        *w = f32_to_f16_bits(v);
-    }
-    for (i, x) in host_x_f32.iter_mut().enumerate() {
-        *x = ((i as f32) * 0.011).rem_euclid(1.0) - 0.5;
+    // ── Generate identical inputs for both paths ──────────────────────────────
+    anyhow::ensure!(head_dim % 2 == 0, "head_dim ({}) must be even", head_dim);
+    let total = seq_len * num_heads * head_dim;
+    let pairs = seq_len * num_heads * (head_dim / 2);
+    let mut host_x = vec![0.0f32; total];
+    for i in 0..total {
+        host_x[i] = (((i as f32) * 0.0173 + 0.07).rem_euclid(1.0) - 0.5) * 4.0;
     }
 
-    // ── Path A: raw OpenCL reference ──────────────────────────────────────────
-    let buf_w = unsafe {
-        ocl::core::create_buffer::<_, u16>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, n * k, None)?
-    };
+    // ── Path A: raw OpenCL reference (in-place; buf_x is mutated) ─────────────
     let buf_x = unsafe {
-        ocl::core::create_buffer::<_, f32>(cl_ctx.as_core(), ocl::core::MEM_READ_ONLY, m * k, None)?
-    };
-    let buf_y = unsafe {
         ocl::core::create_buffer::<_, f32>(
             cl_ctx.as_core(),
             ocl::core::MEM_READ_WRITE,
-            m * n,
+            total,
             None,
         )?
     };
     unsafe {
         ocl::core::enqueue_write_buffer(
             cl_q,
-            &buf_w,
-            true,
-            0,
-            &host_w_f16,
-            None::<ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )?;
-        ocl::core::enqueue_write_buffer(
-            cl_q,
             &buf_x,
             true,
             0,
-            &host_x_f32,
+            &host_x,
             None::<ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
     }
     ocl::core::finish(cl_q)?;
 
-    let ne00 = k as i32;
-    let ne01 = n as i32;
-    let ne02: i32 = 1;
-    let ne10 = k as i32;
-    let ne12: i32 = 1;
-    let ne0 = n as i32;
-    let ne1 = m as i32;
-    let r2: i32 = 1;
-    let r3: i32 = 1;
-    let off0: u64 = 0;
-    let off1: u64 = 0;
-    let offd: u64 = 0;
-    ocl::core::set_kernel_arg(cl_kernel, 0, ArgVal::mem(&buf_w))?;
-    ocl::core::set_kernel_arg(cl_kernel, 1, ArgVal::scalar(&off0))?;
-    ocl::core::set_kernel_arg(cl_kernel, 2, ArgVal::mem(&buf_x))?;
-    ocl::core::set_kernel_arg(cl_kernel, 3, ArgVal::scalar(&off1))?;
-    ocl::core::set_kernel_arg(cl_kernel, 4, ArgVal::mem(&buf_y))?;
-    ocl::core::set_kernel_arg(cl_kernel, 5, ArgVal::scalar(&offd))?;
-    ocl::core::set_kernel_arg(cl_kernel, 6, ArgVal::scalar(&ne00))?;
-    ocl::core::set_kernel_arg(cl_kernel, 7, ArgVal::scalar(&ne01))?;
-    ocl::core::set_kernel_arg(cl_kernel, 8, ArgVal::scalar(&ne02))?;
-    ocl::core::set_kernel_arg(cl_kernel, 9, ArgVal::scalar(&ne10))?;
-    ocl::core::set_kernel_arg(cl_kernel, 10, ArgVal::scalar(&ne12))?;
-    ocl::core::set_kernel_arg(cl_kernel, 11, ArgVal::scalar(&ne0))?;
-    ocl::core::set_kernel_arg(cl_kernel, 12, ArgVal::scalar(&ne1))?;
-    ocl::core::set_kernel_arg(cl_kernel, 13, ArgVal::scalar(&r2))?;
-    ocl::core::set_kernel_arg(cl_kernel, 14, ArgVal::scalar(&r3))?;
+    let head_dim_i: i32 = head_dim as i32;
+    let num_heads_i: i32 = num_heads as i32;
+    let seq_len_i: i32 = seq_len as i32;
+    // kernel_rope_simple signature: (x, head_dim, num_heads, seq_len, start_pos, theta)
+    ocl::core::set_kernel_arg(cl_kernel, 0, ArgVal::mem(&buf_x))?;
+    ocl::core::set_kernel_arg(cl_kernel, 1, ArgVal::scalar(&head_dim_i))?;
+    ocl::core::set_kernel_arg(cl_kernel, 2, ArgVal::scalar(&num_heads_i))?;
+    ocl::core::set_kernel_arg(cl_kernel, 3, ArgVal::scalar(&seq_len_i))?;
+    ocl::core::set_kernel_arg(cl_kernel, 4, ArgVal::scalar(&start_pos))?;
+    ocl::core::set_kernel_arg(cl_kernel, 5, ArgVal::scalar(&theta))?;
 
-    let n_dst: usize = 2;
-    let global = [n.div_ceil(n_dst) * 64, m * 4, 1];
-    let local = [64usize, 4, 1];
+    let global = [pairs, 1, 1];
     unsafe {
         ocl::core::enqueue_kernel(
             cl_q,
             cl_kernel,
-            3,
+            1,
             None,
             &global,
-            Some(local),
+            None,
             None::<&ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
     }
     ocl::core::finish(cl_q)?;
 
-    let mut ref_y = vec![0.0f32; m * n];
+    let mut ref_x = vec![0.0f32; total];
     unsafe {
         ocl::core::enqueue_read_buffer(
             cl_q,
-            &buf_y,
+            &buf_x,
             true,
             0,
-            &mut ref_y,
+            &mut ref_x,
             None::<ocl::core::Event>,
             None::<&mut ocl::core::Event>,
         )?;
     }
     ocl::core::finish(cl_q)?;
 
-    // ── Path B: QNN graph with CustomMatMulF16F32 ─────────────────────────────
-    let bytes_w = (n * k * 2) as i32; // F16
-    let bytes_x = (m * k * 4) as i32; // F32
-    let bytes_y = (m * n * 4) as i32; // F32
-    let rpc_w = unsafe { rpcmem_alloc(heap_id, flags, bytes_w) };
-    let rpc_x = unsafe { rpcmem_alloc(heap_id, flags, bytes_x) };
-    let rpc_y = unsafe { rpcmem_alloc(heap_id, flags, bytes_y) };
+    // ── Path B: QNN graph with CustomRope ─────────────────────────────────────
+    // OOP variant + pos buffer: distinct rpcmem allocations for input (x_in),
+    // pos_buf (M3.4 D-D.1), and output (x_out).
+    let bytes = (total * 4) as i32;
+    let pos_bytes: i32 = 4; // INT_32 [1]
+    let rpc_x = unsafe { rpcmem_alloc(heap_id, flags, bytes) };
+    let rpc_pos = unsafe { rpcmem_alloc(heap_id, flags, pos_bytes) };
+    let rpc_xout = unsafe { rpcmem_alloc(heap_id, flags, bytes) };
     anyhow::ensure!(
-        !rpc_w.is_null() && !rpc_x.is_null() && !rpc_y.is_null(),
-        "rpcmem_alloc failed for (M,N,K)=({},{},{})",
-        m,
-        n,
-        k
+        !rpc_x.is_null() && !rpc_pos.is_null() && !rpc_xout.is_null(),
+        "rpcmem_alloc failed for total={}",
+        total
     );
 
     unsafe {
         std::ptr::copy_nonoverlapping(
-            host_w_f16.as_ptr() as *const u8,
-            rpc_w as *mut u8,
-            bytes_w as usize,
-        );
-        std::ptr::copy_nonoverlapping(
-            host_x_f32.as_ptr() as *const u8,
+            host_x.as_ptr() as *const u8,
             rpc_x as *mut u8,
-            bytes_x as usize,
+            bytes as usize,
         );
+        // Write the runtime pos value into pos_buf[0] (M3.4 D-D.1).
+        *(rpc_pos as *mut i32) = start_pos;
+        // Zero-init x_out so any unwritten elements would be obvious.
+        std::ptr::write_bytes(rpc_xout as *mut u8, 0, bytes as usize);
     }
 
-    let fd_w = unsafe { rpcmem_to_fd(rpc_w) };
     let fd_x = unsafe { rpcmem_to_fd(rpc_x) };
-    let fd_y = unsafe { rpcmem_to_fd(rpc_y) };
+    let fd_pos = unsafe { rpcmem_to_fd(rpc_pos) };
+    let fd_xout = unsafe { rpcmem_to_fd(rpc_xout) };
 
-    // weight [N, K] FLOAT_16, x [M, K] FLOAT_32, y [M, N] FLOAT_32.
-    let mut dims_w: Vec<u32> = vec![n as u32, k as u32];
-    let mut dims_x: Vec<u32> = vec![m as u32, k as u32];
-    let mut dims_y: Vec<u32> = vec![m as u32, n as u32];
+    let mut dims_x: Vec<u32> = vec![seq_len as u32, num_heads as u32, head_dim as u32];
+    let mut dims_pos: Vec<u32> = vec![1u32];
+    let mut dims_xout: Vec<u32> = vec![seq_len as u32, num_heads as u32, head_dim as u32];
 
     let qp = Qnn_QuantizeParams_t {
         encodingDefinition: Qnn_Definition_t_QNN_DEFINITION_UNDEFINED,
@@ -354,14 +339,14 @@ fn run_case(
             },
         },
     };
-    let mk_tv1 = |ttype, dtype, dims_ptr: *mut u32| Qnn_TensorV1_t {
+    let mk_tv1 = |ttype, dtype: Qnn_DataType_t, rank: u32, dims_ptr: *mut u32| Qnn_TensorV1_t {
         id: 0,
         name: ptr::null(),
         type_: ttype,
         dataFormat: QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,
         dataType: dtype,
         quantizeParams: qp,
-        rank: 2,
+        rank,
         dimensions: dims_ptr,
         memType: Qnn_TensorMemType_t_QNN_TENSORMEMTYPE_RAW,
         __bindgen_anon_1: Qnn_TensorV1_t__bindgen_ty_1 {
@@ -372,60 +357,82 @@ fn run_case(
         },
     };
 
-    let name_w = CString::new(format!("w_{}_{}", n, k)).unwrap();
-    let name_x = CString::new(format!("x_{}_{}", m, k)).unwrap();
-    let name_y = CString::new(format!("y_{}_{}", m, n)).unwrap();
+    let name_x = CString::new(format!("rope_x_{}_{}_{}", num_heads, head_dim, start_pos)).unwrap();
+    let name_pos =
+        CString::new(format!("rope_pos_{}_{}_{}", num_heads, head_dim, start_pos)).unwrap();
+    let name_xout = CString::new(format!(
+        "rope_xout_{}_{}_{}",
+        num_heads, head_dim, start_pos
+    ))
+    .unwrap();
 
-    let mut t_w = Qnn_Tensor_t {
-        version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
-        __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
-            v1: mk_tv1(
-                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
-                Qnn_DataType_t_QNN_DATATYPE_FLOAT_16,
-                dims_w.as_mut_ptr(),
-            ),
-        },
-    };
-    t_w.__bindgen_anon_1.v1.name = name_w.as_ptr();
     let mut t_x = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
             v1: mk_tv1(
                 Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
                 Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                3,
                 dims_x.as_mut_ptr(),
             ),
         },
     };
     t_x.__bindgen_anon_1.v1.name = name_x.as_ptr();
-    let mut t_y = Qnn_Tensor_t {
+    let mut t_pos = Qnn_Tensor_t {
+        version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
+        __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
+            v1: mk_tv1(
+                Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_WRITE,
+                Qnn_DataType_t_QNN_DATATYPE_INT_32,
+                1,
+                dims_pos.as_mut_ptr(),
+            ),
+        },
+    };
+    t_pos.__bindgen_anon_1.v1.name = name_pos.as_ptr();
+    let mut t_xout = Qnn_Tensor_t {
         version: Qnn_TensorVersion_t_QNN_TENSOR_VERSION_1,
         __bindgen_anon_1: Qnn_Tensor_t__bindgen_ty_1 {
             v1: mk_tv1(
                 Qnn_TensorType_t_QNN_TENSOR_TYPE_APP_READ,
                 Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
-                dims_y.as_mut_ptr(),
+                3,
+                dims_xout.as_mut_ptr(),
             ),
         },
     };
-    t_y.__bindgen_anon_1.v1.name = name_y.as_ptr();
+    t_xout.__bindgen_anon_1.v1.name = name_xout.as_ptr();
 
-    let g_name = CString::new(format!("matmul_graph_{}_{}_{}", m, n, k)).unwrap();
+    let g_name = CString::new(format!("rope_graph_{}", start_pos)).unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
     let err =
         unsafe { (v.graphCreate.unwrap())(ctx, g_name.as_ptr(), ptr::null_mut(), &mut graph) };
     anyhow::ensure!(err == 0, "graphCreate err=0x{:x}", err);
 
-    for (label, t) in [("w", &mut t_w), ("x", &mut t_x), ("y", &mut t_y)] {
+    for (label, t) in [("x", &mut t_x), ("pos", &mut t_pos), ("xout", &mut t_xout)] {
         let err = unsafe { (v.tensorCreateGraphTensor.unwrap())(graph, t) };
         anyhow::ensure!(err == 0, "tensorCreate({}) err=0x{:x}", label, err);
     }
 
-    let op_name = CString::new(format!("matmul0_{}_{}_{}", m, n, k)).unwrap();
+    // Op params: scalar FLOAT_32 "theta" only. `start_pos` is now supplied via
+    // the pos_buf input tensor at execute time (M3.4 D-D.1).
+    let pname_theta = CString::new("theta").unwrap();
+    let mut params = [Qnn_Param_t {
+        paramType: Qnn_ParamType_t_QNN_PARAMTYPE_SCALAR,
+        name: pname_theta.as_ptr(),
+        __bindgen_anon_1: Qnn_Param_t__bindgen_ty_1 {
+            scalarParam: Qnn_Scalar_t {
+                dataType: Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+                __bindgen_anon_1: Qnn_Scalar_t__bindgen_ty_1 { floatValue: theta },
+            },
+        },
+    }];
+
+    let op_name = CString::new(format!("rope0_{}", start_pos)).unwrap();
     let pkg = CString::new("qnn_oppkg").unwrap();
-    let op_type = CString::new("CustomMatMulF16F32").unwrap();
-    let mut inputs = [t_w, t_x];
-    let mut outputs = [t_y];
+    let op_type = CString::new("CustomRope").unwrap();
+    let mut inputs = [t_x, t_pos];
+    let mut outputs = [t_xout];
     let op = Qnn_OpConfig_t {
         version: Qnn_OpConfigVersion_t_QNN_OPCONFIG_VERSION_1,
         __bindgen_anon_1: Qnn_OpConfig_t__bindgen_ty_1 {
@@ -433,8 +440,8 @@ fn run_case(
                 name: op_name.as_ptr(),
                 packageName: pkg.as_ptr(),
                 typeName: op_type.as_ptr(),
-                numOfParams: 0,
-                params: ptr::null_mut(),
+                numOfParams: 1,
+                params: params.as_mut_ptr(),
                 numOfInputs: 2,
                 inputTensors: inputs.as_mut_ptr(),
                 numOfOutputs: 1,
@@ -469,10 +476,21 @@ fn run_case(
             },
         }
     };
+    // OOP: input, pos_buf, and output are distinct rpcmem buffers.
     let descs = [
-        mk_desc(fd_w, rpc_w, Qnn_DataType_t_QNN_DATATYPE_FLOAT_16, &dims_w),
         mk_desc(fd_x, rpc_x, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_x),
-        mk_desc(fd_y, rpc_y, Qnn_DataType_t_QNN_DATATYPE_FLOAT_32, &dims_y),
+        mk_desc(
+            fd_pos,
+            rpc_pos,
+            Qnn_DataType_t_QNN_DATATYPE_INT_32,
+            &dims_pos,
+        ),
+        mk_desc(
+            fd_xout,
+            rpc_xout,
+            Qnn_DataType_t_QNN_DATATYPE_FLOAT_32,
+            &dims_xout,
+        ),
     ];
     let mut mh = [ptr::null_mut::<std::ffi::c_void>(); 3];
     let err = unsafe { (v.memRegister.unwrap())(ctx, descs.as_ptr(), 3, mh.as_mut_ptr()) };
@@ -498,11 +516,13 @@ fn run_case(
     };
     anyhow::ensure!(err == 0, "graphExecute err=0x{:x}", err);
 
+    // Read back the OOP result from rpc_xout. The kernel wrote rope(host_x)
+    // into x_out (a distinct buffer from x_in / rpc_x).
     let mut max_abs = 0.0f32;
     unsafe {
-        let test_y = std::slice::from_raw_parts(rpc_y as *const f32, m * n);
-        for i in 0..(m * n) {
-            let d = (test_y[i] - ref_y[i]).abs();
+        let test_x = std::slice::from_raw_parts(rpc_xout as *const f32, total);
+        for i in 0..total {
+            let d = (test_x[i] - ref_x[i]).abs();
             if d > max_abs {
                 max_abs = d;
             }
@@ -514,24 +534,4 @@ fn run_case(
     }
 
     Ok(max_abs)
-}
-
-#[cfg(feature = "qnn")]
-fn f32_to_f16_bits(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 31) & 0x1) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = bits & 0x7f_ffff;
-    if exp == 0 {
-        return sign << 15;
-    }
-    let new_exp = exp - 127 + 15;
-    if new_exp <= 0 {
-        return sign << 15;
-    }
-    if new_exp >= 31 {
-        return (sign << 15) | (0x1f << 10);
-    }
-    let new_mant = (mant >> 13) as u16;
-    (sign << 15) | ((new_exp as u16) << 10) | new_mant
 }

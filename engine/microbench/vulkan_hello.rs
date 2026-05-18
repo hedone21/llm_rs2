@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
 
     const N_FLOATS: usize = 1024;
     const LOCAL_X: u32 = 256;
-    const SPV: &[u8] = include_bytes!("../../shaders/simple_add.spv");
+    const SPV: &[u8] = include_bytes!("../shaders/simple_add.spv");
 
     println!("=== microbench_vulkan_hello ===\n");
 
