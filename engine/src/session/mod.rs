@@ -8,6 +8,7 @@ pub mod defaults;
 pub mod eval;
 pub mod forward;
 pub mod init;
+pub mod ppl;
 pub mod qcf_runtime;
 pub mod samplers;
 pub mod traits;
