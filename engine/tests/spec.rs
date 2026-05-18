@@ -354,3 +354,8 @@ mod test_chat_session_multi_turn;
 // G2-REPL-3: reset 후 pos=0에서 재시작
 #[path = "spec/test_chat_repl_v2_multi_turn.rs"]
 mod test_chat_repl_v2_multi_turn;
+
+// ── Phase 4-A: session/batch/helpers 단위 테스트 ──
+// JSONL 파싱, prompt resolution. batch runner 본문은 디바이스 G2 게이트 (2-entry baseline diff).
+#[path = "spec/test_batch_helpers.rs"]
+mod test_batch_helpers;
