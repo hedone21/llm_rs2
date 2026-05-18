@@ -214,6 +214,13 @@ impl Forward for KiviForward {
         // D4: Phase 4-5 KIVI는 eviction 미지원.
         // Phase 4-6+에서 KiviCache position sync 구현 예정.
     }
+
+    fn reset_kv(&mut self) -> anyhow::Result<()> {
+        for cache in &mut self.kv_caches {
+            cache.reset();
+        }
+        Ok(())
+    }
 }
 
 fn workspace_config_for(model: &TransformerModel, max_seq_len: usize) -> WorkspaceConfig {

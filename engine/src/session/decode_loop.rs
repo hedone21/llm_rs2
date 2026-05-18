@@ -369,6 +369,11 @@ impl DecodeLoop {
         &mut *self.forward
     }
 
+    /// Phase 4-5-d: 현재 KV pos 읽기 (ChatSession 외부 캐시 동기화용).
+    pub fn pos_snapshot(&self) -> usize {
+        self.pos
+    }
+
     /// Borrow the stop flag handle (caller can install a signal handler).
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop_flag)

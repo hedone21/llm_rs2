@@ -439,6 +439,13 @@ impl Forward for ModelForward {
         // in Phase 4-4, this default no-op is overridden to keep the KV cache
         // `current_pos` in sync with the loop counter.
     }
+
+    fn reset_kv(&mut self) -> anyhow::Result<()> {
+        for cache in &mut self.kv_caches {
+            cache.current_pos = 0;
+        }
+        Ok(())
+    }
 }
 
 fn workspace_config_for(model: &TransformerModel, max_seq_len: usize) -> WorkspaceConfig {

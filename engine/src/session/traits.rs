@@ -78,6 +78,14 @@ pub trait Forward {
 
     /// Notified after an [`EvictionStage`] pruned KV state.
     fn on_kv_prune(&mut self, _new_pos: usize) {}
+
+    /// Phase 4-5-d: chat `/reset` 처리용. KV cache를 초기 상태로 reset한다.
+    ///
+    /// Default no-op — generate 모드는 호출하지 않는다. chat 모드의 각 Forward
+    /// 구현체가 override하여 KV-type별 reset 로직을 수행한다.
+    fn reset_kv(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Eviction stage invoked before each forward step.
