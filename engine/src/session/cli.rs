@@ -211,10 +211,6 @@ pub struct Args {
     #[arg(long, default_value_t = 0.0)]
     pub tensor_partition: f32,
 
-    /// Disable PrefillWorkspace (fallback to per-layer alloc during prefill)
-    #[arg(long, default_value_t = false)]
-    pub no_prefill_ws: bool,
-
     /// Chunked prefill: split long prompts into chunks to limit peak memory.
     /// 0 = auto (default): GPU backend derives a safe size from max_single_alloc()
     ///     to avoid CL_INVALID_BUFFER_SIZE; CPU backend processes entire prompt as one batch.
@@ -918,22 +914,6 @@ pub struct Args {
     /// "0,8,16,24,31" (explicit indices).
     #[arg(long, default_value = "all")]
     pub qcf_sample_layers: String,
-
-    /// β values for β-amplified CAOTE (ARGUS #6 option B).
-    /// Comma-separated, e.g., "1.0,1.5,2.0". Note: only β=1.0/1.5/2.0 are
-    /// dumped to fixed JSON keys. This flag is currently a placeholder for
-    /// future flexibility — the dumped values follow the fixed keys regardless.
-    #[arg(long, value_delimiter = ',', default_value = "1.0,1.5,2.0")]
-    pub qcf_betas: Vec<f32>,
-
-    /// K values for top-K retention (ARGUS #5).
-    /// Currently fixed [10, 20, 50] in dump; flag accepted for future use.
-    #[arg(long, value_delimiter = ',', default_value = "10,20,50")]
-    pub qcf_topk_values: Vec<usize>,
-
-    /// τ values for defensive aggregation. Fixed [0.1, 0.5] in dump.
-    #[arg(long, value_delimiter = ',', default_value = "0.1,0.5")]
-    pub qcf_defensive_taus: Vec<f32>,
 
     /// Eagerly prefault the secondary weight file at model load to remove
     /// per-swap prefault stage cost. Memory commit ≈ AUF size (e.g. 1.2 GB
