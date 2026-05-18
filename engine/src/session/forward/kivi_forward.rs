@@ -302,11 +302,14 @@ mod tests {
             128, // max_seq_len
             32,  // residual_size (QKKV=32의 배수)
             2,   // bits
-            &backend,
-            &memory,
+            &backend, &memory,
         );
 
-        assert_eq!(caches.len(), 4, "num_layers개의 KiviCache가 생성되어야 한다");
+        assert_eq!(
+            caches.len(),
+            4,
+            "num_layers개의 KiviCache가 생성되어야 한다"
+        );
     }
 
     /// 각 KiviCache의 bits 설정이 요청한 값과 일치하는지 검증한다.
