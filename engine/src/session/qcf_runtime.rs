@@ -638,3 +638,239 @@ pub fn run_qcf_warmup_workflow(
         direct_attn_f5_prefill_decode,
     })
 }
+
+// ─── Phase 4-C-1: PPL/standard generate 분기와 공유하는 swap dispatch + ─────
+//  weight dump helpers. 본문 변경 없음.
+
+pub fn dispatch_swap_weights(
+    model: &crate::models::transformer::TransformerModel,
+    ratio: f32,
+    target_dtype: llm_shared::DtypeTag,
+    importance_table: Option<&crate::core::qcf::ImportanceTable>,
+    decode_token_index: usize,
+    swap_plan_out: &mut Option<crate::models::weights::IncrementalSwapPlan>,
+    manager_report_out: &mut Option<(f32, usize, std::time::Instant, f32)>,
+) {
+    use crate::models::weights::{
+        IncrementalSwapPlan, SwapDecision, WeightSwapDecider, compute_qcf_swap,
+    };
+    use llm_shared::DtypeTag;
+
+    // ── 1. Validation ──────────────────────────────────────────────────────
+    if model.secondary_mmap.is_none() {
+        eprintln!("[WeightSwap] Rejected: no_secondary (ENG-DAT-C09)");
+        return;
+    }
+    if ratio <= 0.0 || ratio > 1.0 {
+        eprintln!("[WeightSwap] Rejected: invalid_ratio ({:.4})", ratio);
+        return;
+    }
+    if target_dtype != DtypeTag::Q4_0 {
+        eprintln!(
+            "[WeightSwap] Rejected: unsupported_dtype ({:?}) (INV-126)",
+            target_dtype
+        );
+        return;
+    }
+
+    // ── 1b. In-flight plan check ───────────────────────────────────────────
+    // Reject if a plan is already in flight (CLI or manager). Prevents
+    // concurrent plan conflict (spec: manager signal accept only when no plan).
+    if swap_plan_out.is_some() {
+        eprintln!(
+            "[WeightSwap] Rejected: incremental plan already in-flight (ratio={:.2}). \
+             Wait for current plan to complete before sending a new SwapWeights signal.",
+            ratio
+        );
+        return;
+    }
+
+    // ── 2. Collect currently-swapped layers ────────────────────────────────
+    let n_layers = model.layers.len();
+    let currently_swapped: Vec<usize> = (0..n_layers)
+        .filter(|&i| model.layers[i].current_dtype() == DType::Q4_0)
+        .collect();
+
+    // ── 3. Decider ─────────────────────────────────────────────────────────
+    let allow_boundary = read_allow_boundary_env();
+    eprintln!(
+        "[Decider] allow_boundary_layers={} (ratio={:.4})",
+        allow_boundary, ratio
+    );
+    let decider = WeightSwapDecider {
+        importance: importance_table,
+        noise: Some(&model.quant_noise),
+        n_decoder_layers: n_layers,
+        currently_swapped: &currently_swapped,
+        allow_boundary_layers: allow_boundary,
+        algorithm: crate::models::weights::SwapAlgorithm::ImportanceAware,
+    };
+    let decision: SwapDecision = decider.decide(ratio);
+
+    if decision.selected_layers.is_empty() {
+        eprintln!(
+            "[WeightSwap] No layers to swap (ratio={:.2}, already_swapped={})",
+            ratio,
+            currently_swapped.len()
+        );
+        // Empty swap is Ok per spec (already fully swapped); no plan committed.
+        return;
+    }
+
+    // ── 4. Compute QCF estimate for the planned layers ─────────────────────
+    let qcf_swap_estimated = compute_qcf_swap(
+        &decision.selected_layers,
+        &model.quant_noise,
+        importance_table,
+        n_layers,
+    );
+
+    // ── 5. Commit incremental plan (K=2, same as CLI --swap-incremental-per-tick 2) ──
+    let n_planned = decision.selected_layers.len();
+    let per_tick = 2usize; // LISWAP-6: K=2 hard upper cap for manager path
+    let ticks_est = n_planned.div_ceil(per_tick);
+    eprintln!(
+        "[WeightSwap] manager path: ratio={:.2}, {} target layers, per_tick={} ({} ticks estimated), qcf_estimated={:.4}",
+        ratio, n_planned, per_tick, ticks_est, qcf_swap_estimated,
+    );
+
+    *swap_plan_out = Some(IncrementalSwapPlan::new(
+        decision.selected_layers,
+        per_tick,
+        decode_token_index,
+    ));
+    *manager_report_out = Some((
+        ratio,
+        n_planned,
+        std::time::Instant::now(),
+        qcf_swap_estimated,
+    ));
+}
+
+/// LISWAP-PPL diagnostic: dump every layer's weight tensors (wq/wk/wv/wo/
+/// w_gate/w_up/w_down) to raw bin files under `out_dir`. File naming:
+/// `layer{NN}_{tensor}_{dtype}.bin` (e.g. `layer00_wq_Q4_0.bin`). Each file
+/// holds the raw GPU buffer bytes for that tensor at the moment of the call.
+///
+/// Two such dumps (one from a Q4-native model load, one from an F16 model
+/// after swap completion) can be byte-compared on the host to determine
+/// whether the swap path produces bit-identical Q4 weights.
+pub fn dump_layer_weights_to_dir(
+    model: &crate::models::transformer::TransformerModel,
+    backend: &Arc<dyn Backend>,
+    out_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let n = model.layers.len();
+    eprintln!(
+        "[Q4-DUMP] dumping {} layer weights to {}",
+        n,
+        out_dir.display()
+    );
+    for (i, slot) in model.layers.iter().enumerate() {
+        let weights = slot.load_weights();
+        let dtype = slot.current_dtype();
+        let tensors: [(&str, &crate::core::tensor::Tensor); 7] = [
+            ("wq", &weights.wq),
+            ("wk", &weights.wk),
+            ("wv", &weights.wv),
+            ("wo", &weights.wo),
+            ("w_gate", &weights.w_gate),
+            ("w_up", &weights.w_up),
+            ("w_down", &weights.w_down),
+        ];
+        for (name, t) in tensors {
+            let nbytes = t.buffer().size();
+            if nbytes == 0 {
+                eprintln!(
+                    "[Q4-DUMP] layer{:02} {} dtype={:?} SKIP (size=0)",
+                    i, name, dtype
+                );
+                continue;
+            }
+            let mut bytes = vec![0u8; nbytes];
+            // For OpenCL/CUDA tensors `buffer().as_ptr()` is the cl_mem/cu_ptr
+            // handle and may look like a host nullptr — backend.read_buffer
+            // does the device→host copy via the backend-specific path, so we
+            // rely on its return value rather than pre-checking as_ptr.
+            match backend.read_buffer(t, &mut bytes) {
+                Ok(()) => {
+                    let fname = format!("layer{:02}_{}_{:?}.bin", i, name, dtype);
+                    let path = out_dir.join(&fname);
+                    std::fs::write(&path, &bytes)?;
+                    eprintln!(
+                        "[Q4-DUMP] layer{:02} {:8} dtype={:>5?} bytes={:8} → {}",
+                        i, name, dtype, nbytes, fname
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[Q4-DUMP] layer{:02} {} dtype={:?} SKIP (read_buffer failed: {})",
+                        i, name, dtype, e
+                    );
+                }
+            }
+        }
+    }
+    // Also dump model-level tensors that are NOT inside per-layer slots and
+    // therefore are NOT touched by weight swap: embed_tokens, final norm, and
+    // lm_head. These three are the most likely sources of E ≠ D NLL drift
+    // because (a) the F16 model's lm_head is typically tied to embed_tokens
+    // and (b) any missing lm_head is derived via F16→Q4_0 quantization at
+    // load time, whose result may not match a standalone Q4_0 GGUF's lm_head
+    // byte-for-byte.
+    let model_tensors: [(&str, &crate::core::tensor::Tensor); 3] = [
+        ("embed_tokens", &model.embed_tokens),
+        ("norm", &model.norm),
+        ("lm_head", &model.lm_head),
+    ];
+    for (name, t) in model_tensors {
+        let nbytes = t.buffer().size();
+        if nbytes == 0 {
+            eprintln!("[Q4-DUMP] model.{} SKIP (size=0)", name);
+            continue;
+        }
+        let dt = t.dtype();
+        let mut bytes = vec![0u8; nbytes];
+        match backend.read_buffer(t, &mut bytes) {
+            Ok(()) => {
+                let fname = format!("model_{}_{:?}.bin", name, dt);
+                let path = out_dir.join(&fname);
+                std::fs::write(&path, &bytes)?;
+                eprintln!(
+                    "[Q4-DUMP] model.{:14} dtype={:>5?} bytes={:8} → {}",
+                    name, dt, nbytes, fname
+                );
+            }
+            Err(e) => {
+                // The lm_head can live on a CPU backend even when the main
+                // backend is GPU (`lm_head_on_cpu`) — fall back to CpuBackend
+                // for that case so we still get a dump file out.
+                let cpu_be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+                match cpu_be.read_buffer(t, &mut bytes) {
+                    Ok(()) => {
+                        let fname = format!("model_{}_{:?}.bin", name, dt);
+                        let path = out_dir.join(&fname);
+                        std::fs::write(&path, &bytes)?;
+                        eprintln!(
+                            "[Q4-DUMP] model.{:14} dtype={:>5?} bytes={:8} → {} (via CPU fallback)",
+                            name, dt, nbytes, fname
+                        );
+                    }
+                    Err(e2) => {
+                        eprintln!(
+                            "[Q4-DUMP] model.{} SKIP (read_buffer failed: gpu={}, cpu={})",
+                            name, e, e2
+                        );
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[Q4-DUMP] complete: {} layers + 3 model tensors dumped to {}",
+        n,
+        out_dir.display()
+    );
+    Ok(())
+}
