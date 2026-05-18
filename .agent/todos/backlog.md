@@ -31,16 +31,18 @@
 - **Status**: TODO (호스트 측정 환경 한계)
 - **상세**: `cargo test --workspace --features opencl --tests`에서 host에 OpenCL device 없을 때 24 fail (gpu_buffer_shift, kv_scatter_batch, noshuffle, plan tests). Galaxy S25 디바이스 빌드에선 정상. 호스트 회귀 게이트에선 본 모듈 제외 권장 — sanity-check skill에 `--exclude-tests backend::opencl` 패턴 추가 검토.
 
-## [P2] Adreno noshuffle GEMV cross-run tuning (Phase 4-4.9 Path B) — 2026-05-18 등록
-- **Status**: TODO (Senior Implementer 위임 대기). Phase 4-4.9 Path A로 env gate(`LLMRS_DISABLE_NOSHUFFLE_DECODE=1`) 우회 production 가능 상태, Path B는 noshuffle 활용 잠재력 회수가 목표.
-- **상세**: Phase 4-4.8 G7' 회귀(+13.4%)의 근본은 `kernel_gemv_noshuffle_q4_0` (plan path가 직접 dispatch). Adreno 830에서 standard Q4_0 GEMV(`kernel_mul_mat_q4_0_f32`) 대비 m==1 디코드에서 ~4 ms/tok 느림. 회수하려면 `.cl` 커널 변형 + cross-run profile (LWS/SIMD 폭, image1d_buffer_t vs r32ui buffer, sub_group_reduce vs SLM tree-reduce — `feedback_adreno_subgroup_reduce.md` 원칙 준수). `feedback_cl_modification.md` 허용 범위.
-- **측정 지표**: G7' Δ ≤ 5% (4-4.7 post 32.06 ms baseline) 유지하면서 unset 시 noshuffle conversion 활성 — 즉 SOA 메모리 절약(≈702.8 MiB 추가 회수)도 같이.
+## [P2] Adreno noshuffle GEMV cross-run tuning (Phase 4-4.9/10 Path B) — 2026-05-18 등록 / 2026-05-18 갱신
+- **Status**: TODO (Senior Implementer 위임 대기). Phase 4-4.10에서 default를 AOS로 invert하여 production은 회귀 없이 동작. Path B는 noshuffle SOA의 메모리 절약(≈702.8 MiB)을 회수하는 게 목표 (default를 다시 SOA로 되돌릴 수 있게).
+- **재현 방법**: `LLMRS_ENABLE_NOSHUFFLE_SOA=1`로 SOA path 명시적 활성화 → G7' n=5 측정 → 4-4.7 baseline 32.06 ms 대비 Δ ≤ 5% 합격 시 default 재invert 후보.
+- **상세**: 회귀 origin은 `kernel_gemv_noshuffle_q4_0` (plan path가 `make_q4_0_noshuffle_matmul_step`으로 직접 dispatch). Adreno 830에서 standard Q4_0 GEMV(`kernel_mul_mat_q4_0_f32`) 대비 m==1 디코드에서 ~4 ms/tok 느림 (4-4.10 measurement: 32.06 vs 36.44 median). 회수 후보 변형: LWS/SIMD 폭, image1d_buffer_t vs r32ui buffer, sub_group_reduce vs SLM tree-reduce — `feedback_adreno_subgroup_reduce.md` 원칙 준수. `feedback_cl_modification.md` 허용.
+- **측정 지표**: G7' Δ ≤ 5% (4-4.7 post 32.06 ms baseline). G6' bit-identical 32 토큰.
 - **참고 파일**:
-  - `engine/kernels/noshuffle_q4_0.cl` (가정 — 실제 파일명은 grep `kernel_gemv_noshuffle_q4_0`)
-  - `engine/src/backend/opencl/plan.rs::make_q4_0_noshuffle_matmul_step` (dispatch 코드)
+  - `engine/kernels/` 하위 `kernel_gemv_noshuffle_q4_0` 정의 위치 (grep 필요)
+  - `engine/src/backend/opencl/plan.rs::make_q4_0_noshuffle_matmul_step` (plan dispatch)
   - `engine/src/backend/opencl/mod.rs::matmul_q4_0_noshuffle` (non-plan fallback)
-  - `papers/eurosys2027/_workspace/experiment/phase4_4_9_device_2026_05_18/measurement.md` (Path A 측정 + 분석)
-- **참고 handoff**: `.agent/todos/handoff_phase4_4_entry_2026_05_17.md` Phase 4-4.9 종결 (Path A 완료 후 갱신 예정).
+  - `papers/eurosys2027/_workspace/experiment/phase4_4_10_device_2026_05_18/measurement.md` (default invert 측정)
+  - `papers/eurosys2027/_workspace/experiment/phase4_4_9_device_2026_05_18/measurement.md` (Path A env gate 측정)
+- **참고 handoff**: `.agent/todos/handoff_phase4_4_entry_2026_05_17.md` Phase 4-4.10 종결.
 
 ---
 

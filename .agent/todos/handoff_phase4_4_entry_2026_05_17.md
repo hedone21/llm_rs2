@@ -1,13 +1,29 @@
-# Handoff: Phase 4-4.9 noshuffle decode env gate 종결 → 4-5 chat 진입
+# Handoff: Phase 4-4.10 default AOS invert 종결 → 4-5 chat 진입
 
 **작성**: 2026-05-17
-**갱신**: 2026-05-18 (Phase 4-4.9 Path A 완료 — G7' PASS Δ+0.16%)
-**HEAD**: Phase 4-4.9 C1~C3 (pending commit, 4-4.8 `5e7e0015` 기준)
+**갱신**: 2026-05-18 (Phase 4-4.10 default invert — default PASS Δ 0.00%)
+**HEAD**: Phase 4-4.10 D1~D2 (pending commit, 4-4.9 `fefeb82e` 기준)
 **다음 세션 진입 문장 (사용자)**: "Phase 4-5 chat 진입"
 
 ---
 
-## TL;DR — Phase 4-4.9 종결 결과 (Path A — env gate)
+## TL;DR — Phase 4-4.10 종결 결과 (default invert)
+
+| Gate | 결과 |
+|---|---|
+| **G6' bit-identical 32 tok** | **PASS** (default/ENABLE 양쪽 32 토큰 완전 일치) |
+| **G7' avg_tbt n=5 (default = AOS)** | **PASS Δ 0.00%** (4-4.7 baseline 32.06 ms = 4-4.10 32.06 ms median) |
+| **G7' avg_tbt n=5 (ENABLE = SOA opt-in)** | +13.7% (회귀 보존, Path B 측정용) |
+
+**핵심 변경**: noshuffle SOA active weight 변환의 default를 **opt-out → opt-in**으로 invert. CPU fallback path (`switch_hw cpu`, `--tensor-partition`, prefill CPU chunk)가 GPU-only 가정에서 자유로워짐. Adreno GEMV 회귀도 default에서 발생하지 않음. 메모리 비용 +702 MiB는 모델 크기 대비 감수 가능한 trade-off.
+
+| env | 동작 |
+|---|---|
+| (unset, default) | **AOS** 유지, standard Q4_0 GEMV, CPU fallback 안전 |
+| `LLMRS_ENABLE_NOSHUFFLE_SOA=1` | SOA opt-in (메모리 절약, Path B 측정용) |
+| `LLMRS_SKIP_NOSHUFFLE_SOA=1` | legacy override, 항상 skip |
+
+## TL;DR — Phase 4-4.9 종결 결과 (참고, 4-4.10에 의해 superseded)
 
 | Gate | 결과 |
 |---|---|
@@ -16,8 +32,8 @@
 | **G7' avg_tbt n=5 (env unset, regression repro)** | FAIL +13.4% (4-4.8과 동일, 회귀 재현) |
 
 `LLMRS_DISABLE_NOSHUFFLE_DECODE=1`로 noshuffle conversion 자체 short-circuit.
-SOA 메모리 절약 ≈702.8 MiB 포기 trade-off로 G7' 회귀 해소. unset 시 syscall 1회 +
-OnceLock 캐시 (hot path overhead 0).
+SOA 메모리 절약 ≈702.8 MiB 포기 trade-off로 G7' 회귀 해소. **4-4.10에서 default가
+뒤집혀 이 env는 제거됨.**
 
 ## TL;DR — Phase 4-4.8 종결 결과 (참고용)
 
@@ -114,15 +130,18 @@ stale 버퍼 읽음). 최종 해법은 **conversion 단계 자체 short-circuit*
 `papers/eurosys2027/_workspace/experiment/phase4_4_9_device_2026_05_18/measurement.md`
 + `g7_unset_final_n5.txt` / `g7_set_final_n5.txt` / `g6_*.txt`.
 
-### 진단 trace 환경변수 (production code 유지)
+### 진단/제어 환경변수 (production code 유지)
 
 | flag | 동작 |
 |---|---|
-| `LLMRS_DISABLE_NOSHUFFLE_DECODE=1` | noshuffle pipeline 전체 short-circuit (production escape hatch + ablation 도구) |
+| `LLMRS_ENABLE_NOSHUFFLE_SOA=1` | **(4-4.10 신규)** noshuffle SOA opt-in. unset 시 default AOS. |
+| `LLMRS_SKIP_NOSHUFFLE_SOA=1` | (legacy) SOA conversion override skip. ENABLE보다 우선. |
+| `LLMRS_KEEP_Q4_ORIGINAL=1` | noshuffle SOA 변환 후 원본 AOS cl_mem 유지 (메모리 비교용) |
 | `LLMRS_BUILD_PLAN_TRACE=1` | build_plan 10개 None-return 경로 line:file 출력 |
 | `LLMRS_NOSHUFFLE_SOA_TRACE=1` | lookup miss key + registry sample 출력 |
 | `LLMRS_FWD_TRACE=1` | ModelForward.try_build_plan 진입/거부/SUCCESS 출력 |
-| `LLMRS_KEEP_Q4_ORIGINAL=1` | (기존) noshuffle SOA 변환 후 원본 AOS cl_mem 유지 (메모리 비교용) |
+
+`LLMRS_DISABLE_NOSHUFFLE_DECODE`는 4-4.9에서 도입했으나 4-4.10 default invert로 의미 없어져 제거됨.
 
 unset 시 모두 syscall 1회 + OnceLock 캐시 (hot path overhead 0).
 
@@ -157,6 +176,7 @@ unset 시 모두 syscall 1회 + OnceLock 캐시 (hot path overhead 0).
 | #36 | ✅ | Phase 4-4.8 C2 — S25 device trace 측정 + root cause 식별 (RCU publish 누락) |
 | #37 | ✅ (G6' PASS, G7' FAIL 종결) | Phase 4-4.8 C3 — RCU publish fix + G7' 재측정 (회귀 origin = noshuffle GEMV) |
 | #38 | ✅ (G6'/G7' PASS) | Phase 4-4.9 — `LLMRS_DISABLE_NOSHUFFLE_DECODE` env gate (Path A) + Path B는 backlog 분리 |
+| #39 | ✅ (default Δ 0.00%) | Phase 4-4.10 — default invert AOS + `LLMRS_ENABLE_NOSHUFFLE_SOA` opt-in. CPU fallback story 복구. |
 
 ### Phase 4 sub-phase 진행도
 
@@ -170,7 +190,8 @@ unset 시 모두 syscall 1회 + OnceLock 캐시 (hot path overhead 0).
 | 4-4.6 paradigm equivalence | ✅ G6 PASS / G7 fair FAIL | sampler 정책 차이 확정, rep_penalty==1.0 가드 |
 | **4-4.7 plan-aware ModelForward + sampler 확장** | ✅ **G6' PASS** / **G7' FAIL** | sampler trait 확장 + plan-aware step + LLMRS_FWD_TRACE 진단 |
 | **4-4.8 plan-path 진단** | ✅ **G6' PASS** / **G7' FAIL +13.7%** | build_plan None-return trace 추가 + RCU publish 누락 fix. G7' 회귀 origin = plan-resident noshuffle GEMV (4-4.9에서 정정) |
-| **4-4.9 noshuffle decode env gate** | ✅ **G6' PASS** / **G7' PASS Δ+0.16%** | `LLMRS_DISABLE_NOSHUFFLE_DECODE` Path A 완료. Path B(.cl tuning)는 backlog 분리 |
+| **4-4.9 noshuffle decode env gate** | ✅ **G6' PASS** / **G7' PASS Δ+0.16%** | `LLMRS_DISABLE_NOSHUFFLE_DECODE` Path A 완료. 4-4.10에 의해 superseded. |
+| **4-4.10 default AOS invert** | ✅ **G6' PASS** / **G7' PASS Δ 0.00%** | noshuffle SOA opt-out → opt-in. default=AOS, `LLMRS_ENABLE_NOSHUFFLE_SOA=1` opt-in. CPU fallback path 복구. |
 | **4-5 chat 전면 재작성** | ⏳ **next entry** | ChatTurnExec 폐기 — main() 6,122 LOC chat 분기를 session/chat/* 모듈로 |
 
 ---
