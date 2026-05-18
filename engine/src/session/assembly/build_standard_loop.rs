@@ -79,6 +79,7 @@ pub fn is_standard_happy_path(args: &Args) -> bool {
 ///
 /// - `max_seq_len`: KV cache 용량 + lazy `PrefillWorkspace` cap
 /// - `kv_dtype`: KV cache element type (F32/F16/Q4_0). 호출자가 args에서 결정
+#[allow(clippy::too_many_arguments)]
 pub fn build_standard_loop(
     backend: Arc<dyn Backend>,
     memory: Arc<dyn Memory>,

@@ -1941,13 +1941,31 @@ impl TransformerModel {
         use crate::backend::opencl::plan::*;
         use crate::core::kv_cache::KVLayout;
 
+        // Phase 4-4.8 diagnostic: env-gated line-by-line trace to identify
+        // which None-return path fires when the happy-path ModelForward
+        // sticky-locks. Costs 1 syscall per build_plan call when unset.
+        let trace = std::env::var_os("LLMRS_BUILD_PLAN_TRACE").is_some();
+        macro_rules! trace_none {
+            ($tag:expr) => {{
+                if trace {
+                    eprintln!(
+                        "[build_plan-trace] None at {} ({}:{})",
+                        $tag,
+                        file!(),
+                        line!()
+                    );
+                }
+                return None;
+            }};
+        }
+
         // Snapshot every layer's weights once and keep the Arcs alive for the
         // duration of plan construction. The cl_mem references captured below
         // rely on these Arcs remaining in scope (INV-123 snapshot semantics).
         let layer_snaps: Vec<Arc<TransformerLayer>> =
             self.layers.iter().map(|s| s.load_weights()).collect();
         if layer_snaps.is_empty() {
-            return None;
+            trace_none!("layer_snaps.is_empty");
         }
         // ENG-ALG-219 / weight-swap: per-layer dtype tracking. A weight swap
         // batch may leave the model in a *mixed* state (some layers F16, some
@@ -1965,7 +1983,7 @@ impl TransformerModel {
             let d = l.wq.dtype();
             d != crate::core::buffer::DType::F16 && d != crate::core::buffer::DType::Q4_0
         }) {
-            return None;
+            trace_none!("wq dtype not F16/Q4_0");
         }
         let any_q4_0 = layer_snaps
             .iter()
@@ -1980,21 +1998,33 @@ impl TransformerModel {
                         || bias.bk.dtype() != crate::core::buffer::DType::F32
                         || bias.bv.dtype() != crate::core::buffer::DType::F32
                 }) {
-                    return None;
+                    trace_none!("qkv_bias dtype not F32");
                 }
             }
         }
 
         if backend.name() != "OpenCL" || kv_caches.is_empty() {
-            return None;
+            trace_none!("backend not OpenCL or kv_caches empty");
         }
 
-        // Helper macro to extract cl_mem from tensor (avoids closure lifetime issues)
+        // Helper macro to extract cl_mem from tensor. Diagnostic-aware: emits
+        // a trace tag identifying which tensor lookup failed.
         macro_rules! cl {
             ($t:expr) => {
                 match get_cl_mem($t.buffer().as_ref()) {
                     Ok(m) => m,
-                    Err(_) => return None,
+                    Err(_) => {
+                        if trace {
+                            eprintln!(
+                                "[build_plan-trace] None at cl!(...) get_cl_mem failed: \
+                                 expr={} ({}:{})",
+                                stringify!($t),
+                                file!(),
+                                line!()
+                            );
+                        }
+                        return None;
+                    }
                 }
             };
         }
@@ -2019,14 +2049,37 @@ impl TransformerModel {
         // the layer 0-only check that lived here previously was insufficient
         // — if layer 0 stays F16 and layer 1 is freshly Q4_0, missing layer 1
         // SOA must still abort the GPU plan and force the legacy path.
-        for layer in &layer_snaps {
+        for (li, layer) in layer_snaps.iter().enumerate() {
             if layer.wq.dtype() != crate::core::buffer::DType::Q4_0 {
                 continue;
             }
             let wq_key = cl!(layer.wq).as_ptr() as usize;
             match ocl_backend.lookup_noshuffle_soa(wq_key) {
                 Some(e) if e.q_img.is_some() => {}
-                _ => return None,
+                Some(_) => {
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at Q4_0 SOA q_img missing layer={} \
+                             ({}:{})",
+                            li,
+                            file!(),
+                            line!()
+                        );
+                    }
+                    return None;
+                }
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at Q4_0 SOA entry missing layer={} \
+                             ({}:{})",
+                            li,
+                            file!(),
+                            line!()
+                        );
+                    }
+                    return None;
+                }
             }
         }
 
@@ -2148,6 +2201,15 @@ impl TransformerModel {
                 Ok(progs) => Some(progs),
                 Err(e) => {
                     log::warn!("Failed to build noshuffle programs for plan: {}", e);
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at build_noshuffle_programs err={} \
+                             ({}:{})",
+                            e,
+                            file!(),
+                            line!()
+                        );
+                    }
                     return None;
                 }
             }
@@ -2334,6 +2396,14 @@ impl TransformerModel {
                     log::info!("GPU kernel plan skipped: {}", chain);
                 } else {
                     log::warn!("Failed to build GPU kernel plan: {}", chain);
+                }
+                if trace {
+                    eprintln!(
+                        "[build_plan-trace] None at build_full_plan err chain={} ({}:{})",
+                        chain,
+                        file!(),
+                        line!()
+                    );
                 }
                 None
             }
