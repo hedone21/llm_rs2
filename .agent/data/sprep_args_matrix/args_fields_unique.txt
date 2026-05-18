@@ -8,8 +8,15 @@ cuda_graph
 cuda_profile
 cuda_sync_policy
 cuda_weights_device
+d2o_ema_beta
+d2o_keep_ratio
+d2o_layer_alloc
+d2o_merge_e
+d2o_protected_layers
 decode_x_steps
 dump_importance
+dump_q4_after_load
+dump_q4_after_swap
 eager_prefault_secondary
 enable_qcf_experimental
 enable_resilience
@@ -29,6 +36,11 @@ gpu_priority
 gpu_yield_every_layer
 gpu_yield_us
 greedy
+h2o_debug
+h2o_decay
+h2o_keep_ratio
+h2o_raw_scores
+h2o_tracked_layers
 heartbeat_gpu_profile
 ignore_eos
 importance_formula

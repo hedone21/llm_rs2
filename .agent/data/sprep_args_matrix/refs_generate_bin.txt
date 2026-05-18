@@ -6,7 +6,11 @@ chat_tcp
 clone
 cuda_graph
 cuda_profile
-d
+d2o_ema_beta
+d2o_keep_ratio
+d2o_layer_alloc
+d2o_merge_e
+d2o_protected_layers
 decode_x_steps
 dump_importance
 enable_qcf_experimental
@@ -22,7 +26,11 @@ experiment_sample_interval
 experiment_schedule
 force_swap_ratio
 greedy
-h
+h2o_debug
+h2o_decay
+h2o_keep_ratio
+h2o_raw_scores
+h2o_tracked_layers
 heartbeat_gpu_profile
 ignore_eos
 initial_kv_capacity

@@ -1,14 +1,21 @@
 # S-prep — `cli.rs::Args` 사용 매트릭스 + Binary 분리 그룹화 (2026-05-18)
 
-**Base HEAD**: `9527c3f9` (Phase 4-D/A/B/C 종결 직후)
+**Base HEAD**: `30320225` (S-prep 초안 commit, 본 doc 갱신은 그 위에 누적)
 **선행 handoff**: `handoff_phase4_DABC_complete_2026_05_18.md`
-**다음 sprint**: S-1 (BaseArgs + sub-struct 추출)
+**다음 sprint**: S-cleanup (불필요 field 삭제 + 측정 전용 field binary 분리) → S-1 (BaseArgs 추출)
 
 ---
 
+## 갱신 이력
+
+| 일자 | 갱신 사항 |
+|---|---|
+| 2026-05-18 (초안) | 17 sub-struct 그룹화, 130 field 매트릭스 |
+| 2026-05-18 (정정) | grep 정규식 누락 12개 추가 → **142 field 확정**, 사용자 분류 동의 → 사양 확정, S-cleanup 진입점 추가 |
+
 ## 목적
 
-Phase 4 종결 후 `bin/generate.rs::main()` dispatch가 5분기 + legacy로 정착됨. 다음 sprint(S-1~S-4)에서 chat/ppl/batch/eval-ll 별도 binary를 만들기 전, **`cli.rs::Args` 130 field가 어느 분기에서 실제 참조되는지** 데이터로 확정한다. 이 매트릭스가 BaseArgs 추출 라인 + sub-struct 그룹화의 근거다.
+Phase 4 종결 후 `bin/generate.rs::main()` dispatch가 5분기 + legacy로 정착됨. 다음 sprint(S-1~S-4)에서 chat/ppl/batch/eval-ll 별도 binary를 만들기 전, **`cli.rs::Args` 142 field가 어느 분기에서 실제 참조되는지** 데이터로 확정한다. 이 매트릭스가 BaseArgs 추출 라인 + sub-struct 그룹화의 근거다.
 
 ---
 
@@ -27,17 +34,17 @@ Phase 4 종결 후 `bin/generate.rs::main()` dispatch가 5분기 + legacy로 정
   | `gen_bin` | `bin/generate.rs` | main dispatch + legacy fallback |
   | `qcf` | `session/qcf_runtime.rs` | shared swap/QCF helpers |
 
-## 분기별 ref 카운트
+## 분기별 ref 카운트 (v2, 142 field 정정 후)
 
 | bucket | unique field refs |
 |---|---|
 | init | 54 |
 | assembly | 11 |
-| chat | 35 |
-| ppl | 26 |
+| chat | **42** (h2o/d2o 5+ 추가 발견) |
+| ppl | **27** |
 | batch | 18 |
-| eval | 21 |
-| generate_bin (legacy + dispatch) | 96 |
+| eval | **23** |
+| generate_bin (legacy + dispatch) | **104** |
 | qcf_runtime | **0** ✓ |
 
 `qcf_runtime`이 args 의존성 0이라 lib boundary로 깨끗 (Phase 4-B-1/4-C-1 산출물).
@@ -116,7 +123,9 @@ main()의 dispatch는 5분기 + legacy fallback 4,700 LOC. legacy가 weight swap
 | **`TensorPartitionArgs`** | 1 | (BaseArgs 안에 flatten) | tensor_partition |
 | **`BackendBehaviorArgs`** | 8 | (ProfileArgs와 통합 검토) | switch_threshold/zero_copy/threads/weight_dtype/qnn_graph_cache_prebuild/qnn_allow_fallback |
 
-**총합**: 약 130 field → 17개 sub-struct로 그룹화 (`BaseArgs` 자체가 9 sub-struct flatten 컨테이너).
+**총합**: 약 142 field → 17개 sub-struct로 그룹화 (`BaseArgs` 자체가 9 sub-struct flatten 컨테이너).
+
+**2026-05-18 확정**: 사용자 review 후 분류 동의. S-cleanup에서 측정용 / 미사용 field 삭제 또는 binary 분리 진행 (아래 §S-cleanup).
 
 ---
 
@@ -240,17 +249,84 @@ S-1 PR 단일, S-2~S-4 (binary 추가)는 별도 PR.
 
 ## 데이터 아티팩트
 
-- `$CLAUDE_JOB_DIR/args_fields_unique.txt` — 130 unique field
-- `$CLAUDE_JOB_DIR/args_matrix.tsv` — 8 bucket × 130 field 매트릭스
-- `$CLAUDE_JOB_DIR/refs_<bucket>.txt` — 분기별 refs
+- `.agent/data/sprep_args_matrix/args_fields_unique.txt` — **142** unique field (v2, 숫자 포함 정규식)
+- `.agent/data/sprep_args_matrix/args_matrix.tsv` — 8 bucket × 142 field 매트릭스
+- `.agent/data/sprep_args_matrix/refs_<bucket>.txt` — 분기별 refs
+- `.agent/data/sprep_args_matrix/args_matrix.txt` — 사람이 읽기 좋은 padded 매트릭스
 
-worktree: `.claude/worktrees/sprep_args_matrix` (branch `worktree-sprep_args_matrix`).
+---
+
+## §S-cleanup — 그룹별 field 정리 (S-1 진입 전)
+
+사용자 결정 (2026-05-18): "필요없는 field 많이 삭제하자. 한 그룹씩 살펴보면서 진행. 기능 많이 차이나면 binary 구분으로 처리하자(e.g. eval-ll)."
+
+### Cleanup 분류 정책
+
+| 분류 | 처리 |
+|---|---|
+| **즉시 삭제** | 모든 bucket 0건 + cli.rs 정의 자체가 placeholder/dead |
+| **측정 종결 시 삭제** | ARGUS/EuroSys'27 측정 끝난 ablation flag |
+| **별도 binary로 분리** | production 분기와 기능적으로 무관한 측정/실험 모드 (e.g. experiment_*, swap ablation) |
+| **production 유지** | secondary_gguf 등 production swap path |
+
+### 즉시 삭제 후보 (확정 — group review 무관)
+
+| field | 근거 |
+|---|---|
+| `no_prefill_ws` | 142 field 중 유일하게 **모든 bucket 0건**. cli.rs에 정의만 있고 사용처 0 |
+| `qcf_betas` | placeholder ("currently fixed in dump"). 0건 |
+| `qcf_topk_values` | placeholder. 0건 |
+| `qcf_defensive_taus` | placeholder. 0건 |
+
+총 4 field 확정 삭제 → 142 → **138**.
+
+### 그룹별 review 순서 (실제 진행)
+
+| 순서 | 그룹 | review 포인트 |
+|---|---|---|
+| 1 | ModelLoadArgs (4) | 모두 production. 삭제 후보 0 예상 |
+| 2 | BackendArgs (13) | `switch_threshold` legacy-only, `use_rayon`/`gpu_yield_*`/`cuda_defer_sync` 측정용 → 삭제 검토 |
+| 3 | SamplingArgs (5) | 모두 production. 삭제 후보 0 예상 |
+| 4 | ProfileArgs (11) | `dump_importance`는 QcfArgs 재분류, 나머지 measure infra |
+| 5 | KiviArgs (5) | `awqe` 사용처 매트릭스 gen만 — KIVI metric 활용 끝났으면 삭제 |
+| 6 | OffloadArgs (3) | 모두 production |
+| 7 | EvictionArgs (14) | `h2o_debug` gen-only — 삭제 검토 |
+| 8 | PrefillArgs (5) | `no_prefill_ws` 확정 삭제 (위) |
+| 9 | ResilienceArgs (3) | 모두 production |
+| 10 | TensorPartitionArgs (1) | production |
+| 11 | SwapArgs (24) | **대대적 cleanup 대상** — production 5개 외 19개 ablation. 별도 binary(`swap_bench`) 분리 검토 |
+| 12 | QcfArgs (13) | `qcf_betas`/`qcf_topk_values`/`qcf_defensive_taus` 확정 삭제. `qcf_trajectory`/`decode_x_steps`/`importance_formula` 측정용 — 별도 binary(`argus_bench`) 분리 검토 |
+| 13 | ExperimentArgs (5) | **전체 binary 분리** — `bin/experiment_runner` 신설. legacy main에서 제거 |
+| 14 | ChatArgs (4) | `chat` flag 자체는 bin/chat.rs에서 제거 (binary가 곧 chat 모드) |
+| 15 | PplArgs (10) | `dump_q4_*` / `ppl_warmup_swap` / `ppl_measure_prefill_tokens` 측정 종결 시 삭제 |
+| 16 | BatchArgs (3) | production |
+| 17 | EvalLlArgs (3) | `eval_ll` flag 자체는 bin/eval-ll.rs에서 제거 |
+
+### Binary 분리 후보 (사용자 "기능 차이 크면 binary 구분" 지시 적용)
+
+| 신규 binary | 흡수 field | 용도 |
+|---|---|---|
+| `bin/experiment_runner` (신설) | ExperimentArgs 5개 + 일부 BaseArgs flatten | experiment_schedule JSON 기반 측정 모드. 현재 main legacy fallback의 일부 |
+| `bin/swap_bench` (신설, 선택) | SwapArgs 측정 ablation 15+ field | 모든 LISWAP-* / Probing-K / Phase-aware ablation. ARGUS/EuroSys'27 측정 종결 후 archive 또는 별도 brunch 유지 |
+| `bin/argus_bench` (신설, 선택) | QcfArgs 측정 ablation 6+ field | qcf_trajectory / decode_x_steps / importance_formula |
+
+분리 결정 정책:
+- production 4 binary (chat/ppl/batch/eval-ll)는 **측정 옵션 노출 안 함**
+- 측정 binary들은 ARGUS 종결 후 별도 retire 시점 결정 가능
+
+### 진입 명령
+
+다음 session에서 `"그룹 1 진행"` (ModelLoadArgs부터 cleanup) 또는 `"즉시 삭제 4개 진행"` (no_prefill_ws + qcf placeholder 3) 으로 시작.
 
 ---
 
 ## 게이트
 
-본 sprint(S-prep)는 **문서 only**, 코드 변경 0. cargo build / test 게이트 불필요. S-1 진입 시 게이트:
-- 호스트: `cargo build --workspace --bins --release` PASS
-- 호스트: `cargo test --workspace` 회귀 ≤ master (master flaky 18~21 backend::opencl)
-- 디바이스: Galaxy S25 generate 32 tok smoke (지연 가능 — S-1 lift-only라 perf-neutral 예상)
+본 sprint(S-prep) 문서 갱신은 **코드 변경 0**, cargo build / test 게이트 불필요.
+S-cleanup 그룹별 진행 시:
+- 호스트: `cargo build --workspace --bins` PASS
+- 호스트: `cargo test --workspace` 회귀 ≤ master
+- 각 그룹 cleanup PR 단위로 commit
+
+S-1 (BaseArgs 추출) 진입 시 추가 게이트:
+- 디바이스: Galaxy S25 generate 32 tok smoke (S-1 lift-only라 perf-neutral 예상)

@@ -1,11 +1,12 @@
 backend
 clone
-dump_q
+dump_q4_after_load
+dump_q4_after_swap
 eviction_policy
 eviction_target_ratio
 eviction_window
 force_swap_ratio
-h
+h2o_keep_ratio
 kv_budget
 kv_budget_ratio
 kv_type

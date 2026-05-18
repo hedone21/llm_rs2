@@ -1,4 +1,4 @@
-field	init	asm	chat	ppl	batch	eval	gen_bin	qcf
+field	init	assembly	chat	ppl	batch	eval	generate_bin	qcf_runtime
 awqe							x	
 backend	x		x	x		x	x	
 chat	x						x	
@@ -9,8 +9,15 @@ cuda_graph	x						x
 cuda_profile	x						x	
 cuda_sync_policy	x							
 cuda_weights_device	x							
+d2o_ema_beta			x				x	
+d2o_keep_ratio			x				x	
+d2o_layer_alloc		x	x				x	
+d2o_merge_e			x				x	
+d2o_protected_layers			x				x	
 decode_x_steps						x	x	
 dump_importance	x						x	
+dump_q4_after_load				x				
+dump_q4_after_swap				x				
 eager_prefault_secondary	x							
 enable_qcf_experimental					x	x	x	
 enable_resilience	x				x		x	
@@ -30,6 +37,11 @@ gpu_priority	x
 gpu_yield_every_layer	x							
 gpu_yield_us	x							
 greedy	x					x	x	
+h2o_debug							x	
+h2o_decay			x			x	x	
+h2o_keep_ratio			x	x	x	x	x	
+h2o_raw_scores			x			x	x	
+h2o_tracked_layers			x				x	
 heartbeat_gpu_profile	x						x	
 ignore_eos					x		x	
 importance_formula	x							

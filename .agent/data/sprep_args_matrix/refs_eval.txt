@@ -6,7 +6,9 @@ eval_continuation
 eviction_policy
 force_swap_ratio
 greedy
-h
+h2o_decay
+h2o_keep_ratio
+h2o_raw_scores
 kv_budget
 kv_budget_ratio
 kv_type

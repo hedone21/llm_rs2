@@ -1,7 +1,7 @@
 enable_qcf_experimental
 enable_resilience
 eviction_policy
-h
+h2o_keep_ratio
 ignore_eos
 kv_budget
 kv_budget_ratio
