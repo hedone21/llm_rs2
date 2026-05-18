@@ -220,6 +220,155 @@ impl DecodeLoop {
         })
     }
 
+    /// Phase 4-5-c. Chat 모드 inner decode loop.
+    ///
+    /// `stop.should_stop(sampled, pos)`가 true를 반환할 때까지 step을 반복한다.
+    /// stop token은 sampled 직후 체크하며, true이면 즉시 break — stop token은
+    /// KV에 baking되지 않는다 (chat REPL에서 EOT baking은 4-5-e에서 처리).
+    ///
+    /// **finalize는 호출하지 않는다.** chat 세션은 여러 turn에 걸쳐 같은
+    /// DecodeLoop를 재사용하므로 finalize는 전체 세션 종료 시 1회만 호출해야 한다.
+    pub fn run_until_stop(
+        &mut self,
+        first_token: u32,
+        stop: &dyn crate::session::chat::stop_condition::StopCondition,
+    ) -> anyhow::Result<DecodeResult> {
+        self.prev_token = first_token;
+        self.sampler.observe_token(first_token);
+        let atomic_stop = Arc::clone(&self.stop_flag);
+        let mut generated = Vec::new();
+        let mut stopped_by = StopReason::StopConditionMet;
+
+        loop {
+            if atomic_stop.load(Ordering::Acquire) {
+                stopped_by = StopReason::StopFlag;
+                break;
+            }
+
+            // (a) command poll
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            let _cmd = self.cmd_source.poll(&ctx)?;
+
+            // (b) eviction
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            let outcome = self.eviction.before_step(&ctx)?;
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            for obs in &mut self.observers {
+                obs.on_eviction(&ctx, &outcome);
+            }
+            if let EvictionOutcome::Pruned { new_pos, .. } = outcome {
+                self.pos = new_pos;
+                self.forward.on_kv_prune(new_pos);
+            }
+
+            // (c) swap before
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            self.swap.before_step(&ctx)?;
+
+            // (d) forward
+            let t0 = Instant::now();
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            let logits = self.forward.step(&ctx, self.prev_token)?;
+            let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            // (e) swap after
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            self.swap.after_step(&ctx)?;
+
+            // (f) sample
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            let sampled = self.sampler.sample(&ctx, &logits);
+            self.sampler.observe_token(sampled);
+
+            // (g) observers
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            for obs in &mut self.observers {
+                obs.on_step_end(&ctx, sampled, step_ms);
+            }
+
+            self.prev_token = sampled;
+            self.pos += 1;
+            self.decode_step += 1;
+
+            // stop 체크: pos 증가 후 현재 pos 기준으로 판단
+            if stop.should_stop(sampled, self.pos) {
+                break;
+            }
+
+            generated.push(sampled);
+        }
+
+        Ok(DecodeResult {
+            tokens_generated: generated,
+            final_pos: self.pos,
+            stopped_by,
+        })
+    }
+
+    /// Phase 4-5-c. Chat /reset 명령 처리용.
+    ///
+    /// pos, decode_step, prev_token을 0으로 reset한다.
+    /// KV cache 자체는 caller (ChatSession::reset)가 `forward_mut()`으로
+    /// 접근하여 reset한다.
+    pub fn reset_pos(&mut self) {
+        self.pos = 0;
+        self.decode_step = 0;
+        self.prev_token = 0;
+    }
+
+    /// Phase 4-5-c. ChatSession::reset이 forward의 KV cache에 접근하기 위한 accessor.
+    pub fn forward_mut(&mut self) -> &mut dyn Forward {
+        &mut *self.forward
+    }
+
     /// Borrow the stop flag handle (caller can install a signal handler).
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop_flag)
@@ -494,5 +643,75 @@ mod tests {
         let _ = loop_.prefill(&[5, 6, 7]).unwrap();
         let result = loop_.run(2, 0).unwrap();
         assert_eq!(result.tokens_generated.len(), 2);
+    }
+
+    // Phase 4-5-c: run_until_stop 테스트.
+
+    /// StopCondition이 특정 token에서 true를 반환하면 loop가 종료된다.
+    /// MockForward (vocab=16): step_count=1 → token 1, step_count=2 → token 2, ...
+    /// stop_id=3으로 설정하면 3번째 step에서 token 3 sample 후 종료.
+    /// generated에는 stop token이 포함되지 않는다 (1, 2만).
+    #[test]
+    fn run_until_stop_terminates_on_stop_token() {
+        use crate::session::chat::stop_condition::{ChatStopCondition, StopCondition};
+
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .build();
+        let _ = loop_.prefill(&[0]).unwrap();
+        // step_count=1→token1, 2→token2, 3→token3(stop)
+        let cond = ChatStopCondition::new(vec![3], 2048);
+        let result = loop_
+            .run_until_stop(0, &cond as &dyn StopCondition)
+            .unwrap();
+        // token 3은 stop이므로 generated에 미포함 → [1, 2]
+        assert_eq!(result.tokens_generated, vec![1, 2]);
+        assert_eq!(result.stopped_by, StopReason::StopConditionMet);
+    }
+
+    /// max_pos overflow 안전망: pos >= max_pos이면 loop 종료.
+    #[test]
+    fn run_until_stop_terminates_on_max_pos() {
+        use crate::session::chat::stop_condition::{ChatStopCondition, StopCondition};
+
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .build();
+        // prefill 1 token → pos=1
+        let _ = loop_.prefill(&[0]).unwrap();
+        // max_pos=3 → pos≥3이면 stop. 1+2 steps → pos=3 → break (step 2 token not pushed)
+        let cond = ChatStopCondition::new(vec![], 3);
+        let result = loop_
+            .run_until_stop(0, &cond as &dyn StopCondition)
+            .unwrap();
+        // step1: sampled=1, pos→2, stop?(pos=2<3)→no → push. step2: sampled=2, pos→3, stop?(pos=3>=3)→yes
+        assert_eq!(result.tokens_generated, vec![1]);
+        assert_eq!(result.final_pos, 3);
+    }
+
+    /// reset_pos가 pos, decode_step, prev_token을 0으로 초기화한다.
+    #[test]
+    fn reset_pos_clears_loop_state() {
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 8,
+                step_count: 0,
+            })
+            .build();
+        let _ = loop_.prefill(&[1, 2, 3]).unwrap();
+        let _ = loop_.run(2, 0).unwrap();
+        // run 후 pos=5, decode_step=2, prev_token=?
+        loop_.reset_pos();
+        // reset 후 pos=0
+        // forward_mut으로 Forward에 접근 가능함을 컴파일로 검증
+        let _fwd: &mut dyn Forward = loop_.forward_mut();
     }
 }

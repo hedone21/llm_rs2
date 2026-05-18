@@ -48,6 +48,8 @@ pub enum StopReason {
     StopFlag,
     EosToken,
     CommandRequested,
+    /// Phase 4-5-c: [`super::DecodeLoop::run_until_stop`]에서 StopCondition이 true를 반환.
+    StopConditionMet,
 }
 
 /// Decode result returned by [`super::DecodeLoop::run`].

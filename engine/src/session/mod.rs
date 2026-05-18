@@ -1,4 +1,5 @@
 pub mod assembly;
+pub mod chat;
 pub mod cli;
 pub mod decode_loop;
 pub mod defaults;
