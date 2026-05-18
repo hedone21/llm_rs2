@@ -937,10 +937,34 @@ impl SessionInitCtx {
                     .first()
                     .is_some_and(|l| l.load_weights().wq.dtype() == DType::Q4_0);
             if actual_q4 {
-                if std::env::var("LLMRS_SKIP_NOSHUFFLE_SOA").is_ok() {
+                // Phase 4-4.10: noshuffle SOA conversion is now opt-in.
+                //
+                // Background: noshuffle SOA reclaims ≈702.8 MiB on Qwen 2.5-1.5B
+                // Q4_0 but assumes GPU-only inference. Active weights converted to
+                // SOA cannot back CPU fallback paths (switch_hw cpu, tensor
+                // partition CPU split, prefill CPU chunking) without silent garbage.
+                // It also relies on `kernel_gemv_noshuffle_q4_0` which currently
+                // regresses Adreno decode TBT by +13% vs the standard Q4_0 GEMV
+                // (Phase 4-4.8 measurement).
+                //
+                // Defaulting to AOS keeps the CPU fallback story intact and avoids
+                // the noshuffle GEMV regression. Memory savings can be opted back
+                // in once the `.cl` kernel is tuned for Adreno (backlog Path B).
+                //
+                // Env flags:
+                //   LLMRS_ENABLE_NOSHUFFLE_SOA=1 → opt in to SOA conversion
+                //   LLMRS_SKIP_NOSHUFFLE_SOA=1   → legacy override, always skip
+                let soa_opt_in = std::env::var_os("LLMRS_ENABLE_NOSHUFFLE_SOA").is_some();
+                let soa_skip = std::env::var_os("LLMRS_SKIP_NOSHUFFLE_SOA").is_some();
+                if !soa_opt_in || soa_skip {
+                    let reason = if soa_skip {
+                        "LLMRS_SKIP_NOSHUFFLE_SOA set"
+                    } else {
+                        "default AOS (set LLMRS_ENABLE_NOSHUFFLE_SOA=1 to opt in)"
+                    };
                     eprintln!(
-                        "[RSS-diag] LLMRS_SKIP_NOSHUFFLE_SOA set: skipping noshuffle SOA conversion \
-                         (decode uses standard Q4_0 GEMV fallback — correct but slower)"
+                        "[NoShuffle] Skipped: {} — decode uses standard Q4_0 GEMV",
+                        reason
                     );
                 } else {
                     // Keep the AOS cl_mem alive when any runtime path still needs

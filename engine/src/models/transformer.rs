@@ -1023,19 +1023,6 @@ impl TransformerModel {
         let env_keep = std::env::var("LLMRS_KEEP_Q4_ORIGINAL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-
-        // Phase 4-4.9: `LLMRS_DISABLE_NOSHUFFLE_DECODE=1` short-circuits the
-        // entire noshuffle pipeline — no SOA conversion, no registry entries,
-        // no AOS release. Forward dispatch falls back to the standard Q4_0
-        // GEMV path which avoids the Adreno regression observed in Phase
-        // 4-4.8. Trades the noshuffle memory savings for predictable decode TBT.
-        if std::env::var_os("LLMRS_DISABLE_NOSHUFFLE_DECODE").is_some() {
-            eprintln!(
-                "[NoShuffle] Skipped: LLMRS_DISABLE_NOSHUFFLE_DECODE=1 (standard Q4_0 GEMV path)"
-            );
-            return Ok(0);
-        }
-
         let swap_to_placeholder = !(keep_original || env_keep);
 
         let mut count = 0usize;

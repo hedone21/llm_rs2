@@ -100,22 +100,6 @@ fn try_apply_queue_priority(
     Ok(())
 }
 
-/// Phase 4-4.9 env gate: when set, the `matmul_q4_0` m==1 noshuffle GEMV
-/// dispatch is bypassed and decode falls through to the standard Q4_0 GEMV.
-/// Cached on first read so the hot path costs a single relaxed load per call.
-/// Emits a one-shot stderr marker only when the gate is engaged so unset
-/// runs stay silent.
-fn noshuffle_decode_disabled() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        let v = std::env::var_os("LLMRS_DISABLE_NOSHUFFLE_DECODE").is_some();
-        if v {
-            eprintln!("[noshuffle-decode] LLMRS_DISABLE_NOSHUFFLE_DECODE=1 (gate engaged)");
-        }
-        v
-    })
-}
-
 /// Emit a one-time diagnostic to stderr when the prefill flash attention
 /// dispatcher routes a head_dim=128 / F16 KV workload through the new
 /// `flash_attn_f32_f16` DK=128 kernel. Matches the [GQA-Attn] style
@@ -2270,10 +2254,9 @@ impl OpenCLBackend {
         // Auto-dispatch to noshuffle GEMV for decode (m==1) when image1d_buffer_t is available.
         // The noshuffle kernel uses Adreno TP cache via image reads (R32UI weight, RGBA32F act).
         // Only dispatches when q_img is Some (image creation succeeded at load time).
-        // When q_img is None (image unsupported), falls through to standard Q4_0 GEMV.
-        // Phase 4-4.9: `LLMRS_DISABLE_NOSHUFFLE_DECODE=1` forces the standard GEMV path
-        // for decode on Adreno where the noshuffle GEMV variant regresses TBT.
-        if m == 1 && !noshuffle_decode_disabled() {
+        // When q_img is None (image unsupported) or the registry is empty
+        // (e.g. Phase 4-4.10 default AOS path), falls through to standard Q4_0 GEMV.
+        if m == 1 {
             let b_key = b_buf.as_ptr() as usize;
             if let Some(entry) = self.lookup_noshuffle_soa(b_key)
                 && let Some(ref q_img) = entry.q_img
@@ -2396,15 +2379,9 @@ impl OpenCLBackend {
     /// Lookup a pre-converted noshuffle SOA entry by the original weight cl_mem pointer.
     ///
     /// Returns None if the weight was not pre-converted (fallback to standard Q4_0 GEMV).
-    ///
-    /// Phase 4-4.9: when `LLMRS_DISABLE_NOSHUFFLE_DECODE=1` is set, this returns
-    /// None regardless of registry contents. This forces `matmul_q4_0` to fall
-    /// through to the standard Q4_0 GEMV path AND aborts `build_plan` at the
-    /// per-layer Q4_0 SOA pre-check so the plan path is bypassed as well.
+    /// In the Phase 4-4.10 default AOS path the registry is empty so all lookups
+    /// return None and callers transparently fall through.
     pub fn lookup_noshuffle_soa(&self, key: usize) -> Option<&NoshuffleSoaEntry> {
-        if noshuffle_decode_disabled() {
-            return None;
-        }
         // SAFETY: single-threaded inference access
         let registry = unsafe { &*self.noshuffle_soa_registry.get() };
         let r = registry.get(&key);
