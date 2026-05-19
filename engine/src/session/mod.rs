@@ -14,6 +14,7 @@ pub mod qcf_runtime;
 pub mod samplers;
 pub mod standard_happy;
 pub mod traits;
+pub mod warmup;
 
 pub use assembly::{build_standard_loop, is_standard_happy_path};
 pub use decode_loop::{DecodeLoop, DecodeLoopBuilder, HasForward, NoForward};
