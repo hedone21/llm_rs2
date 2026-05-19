@@ -1084,6 +1084,36 @@ impl Args {
         }
     }
 
+    /// KIVI quantization bits. `--kv-mode kivi`가 명시되면 신규 `--kv-kivi-bits`,
+    /// 아니면 legacy `--kivi-bits`.
+    pub fn effective_kivi_bits(&self) -> u8 {
+        if self.kv_mode_args.kv_mode == KvMode::Kivi {
+            self.kv_mode_args.kv_kivi_bits
+        } else {
+            self.kivi_bits
+        }
+    }
+
+    /// KIVI residual buffer size. `--kv-mode kivi`가 명시되면 신규 필드,
+    /// 아니면 legacy `--kivi-residual-size`.
+    pub fn effective_kivi_residual_size(&self) -> usize {
+        if self.kv_mode_args.kv_mode == KvMode::Kivi {
+            self.kv_mode_args.kv_kivi_residual_len
+        } else {
+            self.kivi_residual_size
+        }
+    }
+
+    /// Offload storage backend. `--kv-mode offload`가 명시되면 신규
+    /// `--kv-offload-storage`, 아니면 legacy `--kv-offload` 의 mode 문자열
+    /// ("none" 가 아닌 값). standard 모드에서 호출 시 `"none"` 반환.
+    pub fn effective_kv_offload_storage(&self) -> String {
+        match self.kv_mode_args.kv_mode {
+            KvMode::Offload => self.kv_mode_args.kv_offload_storage.clone(),
+            _ => self.kv_offload.clone(),
+        }
+    }
+
     /// Returns the nested `EvictionCmd` policy, unwrapping the
     /// `TopLevelCmd::Eviction` wrapper. `None` if no subcommand given.
     fn current_policy(&self) -> Option<&EvictionCmd> {

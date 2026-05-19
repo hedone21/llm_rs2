@@ -90,3 +90,91 @@ fn new_flag_wins_over_legacy() {
     ]);
     assert_eq!(args.effective_kv_mode(), KvMode::Offload);
 }
+
+// ── shim sub-args (C4-4b) ────────────────────────────────────────────────────
+
+#[test]
+fn effective_kivi_bits_uses_new_when_kv_mode_kivi() {
+    let args = parse(&[
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kv-mode",
+        "kivi",
+        "--kv-kivi-bits",
+        "4",
+    ]);
+    assert_eq!(args.effective_kivi_bits(), 4);
+}
+
+#[test]
+fn effective_kivi_bits_uses_legacy_when_kivi_flag() {
+    let args = parse(&[
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kivi",
+        "--kivi-bits",
+        "3",
+    ]);
+    assert_eq!(args.effective_kivi_bits(), 3);
+}
+
+#[test]
+fn effective_kivi_residual_size_uses_new_when_kv_mode_kivi() {
+    let args = parse(&[
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kv-mode",
+        "kivi",
+        "--kv-kivi-residual-len",
+        "64",
+    ]);
+    assert_eq!(args.effective_kivi_residual_size(), 64);
+}
+
+#[test]
+fn effective_kivi_residual_size_uses_legacy_when_kivi_flag() {
+    let args = parse(&[
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kivi",
+        "--kivi-residual-size",
+        "96",
+    ]);
+    assert_eq!(args.effective_kivi_residual_size(), 96);
+}
+
+#[test]
+fn effective_kv_offload_storage_uses_new_when_kv_mode_offload() {
+    let args = parse(&[
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kv-mode",
+        "offload",
+        "--kv-offload-storage",
+        "tmpfs",
+    ]);
+    assert_eq!(args.effective_kv_offload_storage(), "tmpfs");
+}
+
+#[test]
+fn effective_kv_offload_storage_uses_legacy_when_kv_offload_string() {
+    let args = parse(&[
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kv-offload",
+        "mmap",
+    ]);
+    assert_eq!(args.effective_kv_offload_storage(), "mmap");
+}

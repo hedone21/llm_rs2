@@ -256,20 +256,20 @@ fn main() -> anyhow::Result<()> {
             effective_budget: 0,
             kv_budget_ratio: 0.0,
             greedy: args.greedy,
-            kv_type: format!("q{}+f32_residual", args.kivi_bits),
+            kv_type: format!("q{}+f32_residual", args.effective_kivi_bits()),
             qcf_mode: args.qcf_mode.clone(),
             vocab_size,
             hidden_size,
         };
         let qcf_config = llm_rs2::core::qcf::QcfConfig::default();
-        let kivi_bits = args.kivi_bits;
+        let kivi_bits = args.effective_kivi_bits();
         let mut kv_caches: Vec<KiviCache> = (0..num_layers)
             .map(|_| {
                 KiviCache::new_gpu(
                     kv_heads,
                     head_dim,
                     max_seq_len,
-                    args.kivi_residual_size,
+                    args.effective_kivi_residual_size(),
                     kivi_bits,
                     backend.clone(),
                     memory.clone(),
@@ -331,10 +331,10 @@ fn main() -> anyhow::Result<()> {
         json_val["config"] = serde_json::json!({
             "model": args.model_path,
             "eviction_policy": "kivi",
-            "kivi_bits": args.kivi_bits,
-            "kivi_residual_size": args.kivi_residual_size,
+            "kivi_bits": args.effective_kivi_bits(),
+            "kivi_residual_size": args.effective_kivi_residual_size(),
             "max_seq_len": max_seq_len,
-            "kv_type": format!("q{}+f32_residual", args.kivi_bits),
+            "kv_type": format!("q{}+f32_residual", args.effective_kivi_bits()),
         });
         println!("{}", serde_json::to_string_pretty(&json_val)?);
         return Ok(());
@@ -354,7 +354,7 @@ fn main() -> anyhow::Result<()> {
             head_dim,
             num_layers,
             max_seq_len,
-            args.kivi_residual_size,
+            args.effective_kivi_residual_size(),
             ppl_path,
         );
     }
@@ -472,8 +472,8 @@ fn main() -> anyhow::Result<()> {
                 head_dim,
                 num_layers,
                 max_seq_len,
-                bits: args.kivi_bits,
-                residual_size: args.kivi_residual_size,
+                bits: args.effective_kivi_bits(),
+                residual_size: args.effective_kivi_residual_size(),
             })?
         } else if kv_offload_active {
             let offload_kv_dtype = match args.kv_type.as_str() {
@@ -498,7 +498,7 @@ fn main() -> anyhow::Result<()> {
                 num_layers,
                 max_seq_len,
                 kv_dtype: offload_kv_dtype,
-                offload_mode: args.kv_offload.clone(),
+                offload_mode: args.effective_kv_offload_storage(),
                 disk_dir,
                 max_prefetch_depth: args.max_prefetch_depth,
             })?
@@ -711,7 +711,7 @@ fn main() -> anyhow::Result<()> {
         // (F16-equivalent) and allows runtime transition via kv_quant_dynamic.
         // Note: --enable-resilience alone stays on main path (F16 KVCache + eviction).
         let initial_bits: u8 = if matches!(args.effective_kv_mode(), KvMode::Kivi) {
-            args.kivi_bits
+            args.effective_kivi_bits()
         } else {
             16
         };
@@ -720,7 +720,7 @@ fn main() -> anyhow::Result<()> {
             // Round down to QKKV (32) multiple for KiviCache alignment
             (max_seq_len / 32) * 32
         } else {
-            args.kivi_residual_size
+            args.effective_kivi_residual_size()
         };
         return run_kivi(
             &model,
@@ -753,6 +753,7 @@ fn main() -> anyhow::Result<()> {
     // ── Offload mode: separate path with OffloadKVCache ──
     // Placed after executor creation so resilience is available in the decode loop.
     if matches!(args.effective_kv_mode(), KvMode::Offload) {
+        let kv_offload_storage = args.effective_kv_offload_storage();
         return run_offload(
             &model,
             &tokenizer,
@@ -767,7 +768,7 @@ fn main() -> anyhow::Result<()> {
             args.num_tokens,
             &prompt,
             &args.backend,
-            &args.kv_offload,
+            &kv_offload_storage,
             &args.kv_type,
             args.max_prefetch_depth,
             &args.offload_path,
