@@ -118,7 +118,7 @@ impl SessionInitCtx {
         // modes and advanced GPU features remain incompatible.
         if args.chat {
             let kv_offload_active = !args.kv_offload.is_empty() && args.kv_offload != "none";
-            let has_eviction = args.eviction_policy != "none";
+            let has_eviction = args.eviction_policy() != "none";
             if args.kivi && kv_offload_active {
                 anyhow::bail!("--chat: --kivi and --kv-offload are mutually exclusive");
             }

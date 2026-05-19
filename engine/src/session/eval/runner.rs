@@ -102,19 +102,19 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         }
     }
 
-    let ratio_mode = args.kv_budget_ratio > 0.0;
-    let budget_mode = args.kv_budget > 0 || ratio_mode;
+    let ratio_mode = args.kv_budget_ratio() > 0.0;
+    let budget_mode = args.kv_budget() > 0 || ratio_mode;
 
     // For ratio mode, effective_budget is computed per-question inside eval_loop.
     // Pass 0 here; the loop will use kv_budget_ratio × prompt_len.
-    let effective_budget = if ratio_mode { 0 } else { args.kv_budget };
+    let effective_budget = if ratio_mode { 0 } else { args.kv_budget() };
 
     eprintln!(
         "[Eval-LL] {} questions, policy={}, kv_budget={}, kv_budget_ratio={}, mode={}",
         questions.len(),
-        args.eviction_policy,
-        args.kv_budget,
-        args.kv_budget_ratio,
+        args.eviction_policy(),
+        args.kv_budget(),
+        args.kv_budget_ratio(),
         if budget_mode {
             if ratio_mode {
                 "ratio-per-question"
@@ -139,7 +139,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     let eval_config = crate::eval::EvalConfig {
         max_seq_len,
         effective_budget,
-        kv_budget_ratio: args.kv_budget_ratio,
+        kv_budget_ratio: args.kv_budget_ratio(),
         greedy: args.greedy,
         kv_type: args.kv_type.clone(),
         qcf_mode: args.qcf_mode.clone(),
@@ -149,7 +149,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
 
     // For ratio mode, hook starts with budget=0; eval_loop updates it per-question.
     let hook_budget = if ratio_mode { 0 } else { effective_budget };
-    let is_d2o = args.eviction_policy == "d2o";
+    let is_d2o = args.eviction_policy() == "d2o";
 
     // ARGUS Step 6: resolve --qcf-sample-layers from CLI.
     // When --enable-qcf-experimental is off, always use [0] (legacy, no overhead).
@@ -167,7 +167,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         hook_budget,
         actual_protected_prefix,
         score_based_eviction,
-        args.h2o_keep_ratio,
+        args.h2o_keep_ratio(),
         is_d2o,
         args.kv_type.clone(),
         backend.clone(),
@@ -371,14 +371,14 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     let mut json_val = serde_json::from_str::<serde_json::Value>(&output.to_json()?)?;
     json_val["config"] = serde_json::json!({
         "model": args.model_path,
-        "eviction_policy": args.eviction_policy,
-        "kv_budget": args.kv_budget,
-        "kv_budget_ratio": args.kv_budget_ratio,
+        "eviction_policy": args.eviction_policy(),
+        "kv_budget": args.kv_budget(),
+        "kv_budget_ratio": args.kv_budget_ratio(),
         "max_seq_len": max_seq_len,
         "kv_type": args.kv_type,
-        "h2o_keep_ratio": args.h2o_keep_ratio,
-        "h2o_decay": args.h2o_decay,
-        "time_normalized": !args.h2o_raw_scores,
+        "h2o_keep_ratio": args.h2o_keep_ratio(),
+        "h2o_decay": args.h2o_decay(),
+        "time_normalized": !args.h2o_raw_scores(),
         "skip_layers": args.skip_layers,
         "skip_ratio": args.skip_ratio,
     });

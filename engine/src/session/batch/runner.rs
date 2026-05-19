@@ -89,9 +89,9 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
         mode: pb_qcf_mode_enum,
         ..crate::core::qcf::QcfConfig::default()
     };
-    let pb_ratio_mode = args.kv_budget_ratio > 0.0;
-    let pb_hook_budget = if pb_ratio_mode { 0 } else { args.kv_budget };
-    let pb_is_d2o = args.eviction_policy == "d2o";
+    let pb_ratio_mode = args.kv_budget_ratio() > 0.0;
+    let pb_hook_budget = if pb_ratio_mode { 0 } else { args.kv_budget() };
+    let pb_is_d2o = args.eviction_policy() == "d2o";
     let pb_num_layers = model.config.num_hidden_layers;
     let pb_sample_layers = if args.enable_qcf_experimental {
         parse_qcf_sample_layers(&args.qcf_sample_layers, pb_num_layers)
@@ -106,7 +106,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
         pb_hook_budget,
         actual_protected_prefix,
         score_based_eviction,
-        args.h2o_keep_ratio,
+        args.h2o_keep_ratio(),
         pb_is_d2o,
         args.kv_type.clone(),
         backend.clone(),
@@ -234,7 +234,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
             // sees effective_budget=0 and post_prefill early-returns,
             // suppressing eviction and ARGUS metric collection.
             if pb_ratio_mode {
-                let dynamic_budget = ((prompt_tokens as f32) * args.kv_budget_ratio) as usize;
+                let dynamic_budget = ((prompt_tokens as f32) * args.kv_budget_ratio()) as usize;
                 hook.set_effective_budget(dynamic_budget.max(1));
             }
 
@@ -473,7 +473,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                         capacity: kv_caches[0].capacity(),
                         protected_prefix: actual_protected_prefix,
                         kv_dtype: args.kv_type.clone(),
-                        eviction_policy: args.eviction_policy.clone(),
+                        eviction_policy: args.eviction_policy().to_string(),
                         skip_ratio: 0.0,
                     };
                     let plan = executor.poll(&kv_snap);

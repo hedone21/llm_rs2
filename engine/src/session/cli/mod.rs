@@ -385,75 +385,14 @@ pub struct Args {
     #[arg(long, default_value = "f16")]
     pub kv_type: String,
 
-    /// Eviction policy for KV cache management (none, sliding, streaming, h2o, h2o_plus, d2o)
-    #[arg(long, default_value = "none")]
-    pub eviction_policy: String,
-
-    /// Window size for sliding window / streaming eviction (tokens).
-    /// Default: 1024 for sliding, 2000 for streaming.
-    #[arg(long, default_value_t = 1024)]
-    pub eviction_window: usize,
-
-    /// Number of attention sink tokens to preserve (StreamingLLM).
-    /// Only used with --eviction-policy streaming.
-    #[arg(long, default_value_t = 4)]
-    pub sink_size: usize,
-
-    /// StreamingLLM recent window size. 0 = auto (kv_budget - sink_size).
-    /// Only used with --eviction-policy streaming.
-    #[arg(long, default_value_t = 0)]
-    pub streaming_window: usize,
-
-    /// Fraction of tokens to keep as heavy hitters (0.0 to 1.0)
-    #[arg(long, default_value_t = 0.5)]
-    pub h2o_keep_ratio: f32,
-
-    /// Number of final transformer layers to track for H2O importance scores (0 = all layers)
-    #[arg(long, default_value_t = 0)]
-    pub h2o_tracked_layers: usize,
-
-    /// Exponential decay factor for H2O importance scores per step (0.0 = no decay)
-    #[arg(long, default_value_t = 0.0)]
-    pub h2o_decay: f32,
-
-    /// D2O heavy-hitter keep ratio (0.0–1.0, paper default 0.75 = 3:1 ratio)
-    #[arg(long, default_value_t = 0.75)]
-    pub d2o_keep_ratio: f32,
-
-    /// D2O EMA smoothing factor β for threshold update (paper Eq.10, default 0.7).
-    /// τ_t = β · max U_t + (1−β) · τ_{t−1}.
-    #[arg(long, default_value_t = 0.7)]
-    pub d2o_ema_beta: f32,
-
-    /// D2O Eq.11 normalisation constant `e` (paper default 0.1).
-    /// Controls retained token's self-weight: w_c = e / (Σ exp(u_i) + e).
-    #[arg(long, default_value_t = 0.1)]
-    pub d2o_merge_e: f32,
-
-    /// Enable D2O layer-level dynamic allocation (uses per-layer attention variance from prefill)
-    #[arg(long, default_value_t = false)]
-    pub d2o_layer_alloc: bool,
-
-    /// Protected layers for D2O layer allocation (comma-separated layer indices, e.g. 0,1,2)
-    #[arg(long, value_delimiter = ',')]
-    pub d2o_protected_layers: Option<Vec<usize>>,
-
-    /// Number of prefix tokens to protect from eviction.
-    /// Defaults to 4 for score-based policies (h2o, h2o_plus, d2o) and prompt length for sliding.
-    #[arg(long)]
-    pub protected_prefix: Option<usize>,
-
-    /// Initial KV cache capacity in tokens (0 = auto: prompt length rounded up to power of 2, min 128)
-    #[arg(long, default_value_t = 0)]
-    pub initial_kv_capacity: usize,
-
-    /// Memory threshold in MB below which eviction triggers
-    #[arg(long, default_value_t = 256)]
-    pub memory_threshold_mb: usize,
-
-    /// Target ratio of cache to keep when evicting (0.1 to 0.99)
-    #[arg(long, default_value_t = 0.75)]
-    pub eviction_target_ratio: f32,
+    // ── Eviction (S-subcmd C2): policy/h2o/d2o/sink/streaming + common
+    // 7 params (kv_budget, protected_prefix, memory_threshold_mb,
+    // eviction_target_ratio, initial_kv_capacity, min_kv_cache,
+    // kv_budget_ratio) moved to EvictionCmd subcommand + EvictionCommonArgs.
+    // Existing call sites continue to read via shim accessors on `Args`
+    // (see `impl Args` below). ──
+    #[clap(flatten)]
+    pub eviction_common: EvictionCommonArgs,
 
     /// Enable resilience manager for adaptive inference
     #[arg(long, default_value_t = false)]
@@ -524,23 +463,10 @@ pub struct Args {
     #[arg(long, default_value = "head")]
     pub kv_layout: String,
 
-    /// Minimum KV cache size in tokens. Eviction will not reduce cache below this.
-    #[arg(long, default_value_t = 256)]
-    pub min_kv_cache: usize,
-
     /// Override eviction target_ratio from resilience signals (experiment mode).
     /// When set, all Evict actions will use this ratio instead of the strategy default.
     #[arg(long)]
     pub experiment_eviction_ratio: Option<f32>,
-
-    /// Enable verbose H2O debug output (per-step scores, softmax validation, eviction details)
-    #[arg(long, default_value_t = false)]
-    pub h2o_debug: bool,
-
-    /// Disable time-normalized scoring (use raw cumulative SUM).
-    /// By default, H2O/H2O+ use time-normalized scores to remove cumulative bias.
-    #[arg(long, default_value_t = false)]
-    pub h2o_raw_scores: bool,
 
     /// QCF variant to compute: "attn" (default), "caote", or "both".
     #[arg(long, default_value = "attn")]
@@ -558,17 +484,6 @@ pub struct Args {
     /// Path to evaluation batch JSON file: [{"id","prompt","continuation"}, ...]
     #[arg(long)]
     pub eval_batch: Option<String>,
-
-    /// Maximum KV cache budget in tokens. Evicts when cache_pos exceeds this.
-    /// 0 = no budget limit (default).
-    #[arg(long, default_value_t = 0)]
-    pub kv_budget: usize,
-
-    /// KV cache budget as a ratio of prompt length (0.0–1.0).
-    /// When set (> 0), overrides --kv-budget per question: budget = prompt_len * ratio.
-    /// Matches H2O paper evaluation methodology.
-    #[arg(long, default_value_t = 0.0)]
-    pub kv_budget_ratio: f32,
 
     /// Enable KIVI-style Q2 KV cache compression (ICML 2024).
     /// Mutually exclusive with eviction policies; uses FP32 residual buffer
@@ -1123,4 +1038,138 @@ pub struct Args {
     /// fallback. production 측정에서는 OFF 유지.
     #[arg(long, default_value_t = false)]
     pub qnn_allow_fallback: bool,
+
+    /// Eviction policy subcommand (S-subcmd C1, 2026-05-19).
+    ///
+    /// Omitting the subcommand ≡ `EvictionCmd::None` (no eviction).
+    /// See `cli::eviction::EvictionCmd` for variants and per-variant args.
+    #[command(subcommand)]
+    pub eviction: Option<EvictionCmd>,
+}
+
+/// Shim accessors for the eviction subcommand + flatten common args.
+///
+/// Existing 175+ call sites (`args.eviction_policy`, `args.h2o_keep_ratio`,
+/// `args.kv_budget`, ...) read through these methods so the C2 commit
+/// changes only `cli/mod.rs`. Call sites migrate to direct enum match in C3.
+impl Args {
+    pub fn eviction_policy(&self) -> &'static str {
+        self.eviction
+            .as_ref()
+            .map(|e| e.policy_name())
+            .unwrap_or("none")
+    }
+
+    pub fn eviction_window(&self) -> usize {
+        match &self.eviction {
+            Some(EvictionCmd::Sliding(s)) => s.window,
+            _ => 1024,
+        }
+    }
+
+    pub fn sink_size(&self) -> usize {
+        match &self.eviction {
+            Some(EvictionCmd::Streaming(s)) => s.sink,
+            _ => 4,
+        }
+    }
+
+    pub fn streaming_window(&self) -> usize {
+        match &self.eviction {
+            Some(EvictionCmd::Streaming(s)) => s.recent_window,
+            _ => 0,
+        }
+    }
+
+    pub fn h2o_keep_ratio(&self) -> f32 {
+        match &self.eviction {
+            Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.keep_ratio,
+            _ => 0.5,
+        }
+    }
+
+    pub fn h2o_tracked_layers(&self) -> usize {
+        match &self.eviction {
+            Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.tracked_layers,
+            _ => 0,
+        }
+    }
+
+    pub fn h2o_decay(&self) -> f32 {
+        match &self.eviction {
+            Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.decay,
+            _ => 0.0,
+        }
+    }
+
+    pub fn h2o_raw_scores(&self) -> bool {
+        match &self.eviction {
+            Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.raw_scores,
+            _ => false,
+        }
+    }
+
+    /// H2O verbose debug output — moved to env var `LLMRS_H2O_DEBUG`
+    /// (no longer a CLI flag).
+    pub fn h2o_debug(&self) -> bool {
+        std::env::var("LLMRS_H2O_DEBUG").is_ok()
+    }
+
+    pub fn d2o_keep_ratio(&self) -> f32 {
+        match &self.eviction {
+            Some(EvictionCmd::D2o(d)) => d.keep_ratio,
+            _ => 0.75,
+        }
+    }
+
+    pub fn d2o_ema_beta(&self) -> f32 {
+        match &self.eviction {
+            Some(EvictionCmd::D2o(d)) => d.ema_beta,
+            _ => 0.7,
+        }
+    }
+
+    pub fn d2o_merge_e(&self) -> f32 {
+        match &self.eviction {
+            Some(EvictionCmd::D2o(d)) => d.merge_e,
+            _ => 0.1,
+        }
+    }
+
+    pub fn d2o_layer_alloc(&self) -> bool {
+        match &self.eviction {
+            Some(EvictionCmd::D2o(d)) => d.layer_alloc,
+            _ => false,
+        }
+    }
+
+    pub fn d2o_protected_layers(&self) -> Option<Vec<usize>> {
+        match &self.eviction {
+            Some(EvictionCmd::D2o(d)) => d.protected_layers.clone(),
+            _ => None,
+        }
+    }
+
+    // ── EvictionCommonArgs shim (flatten field 호출처 호환) ──
+    pub fn kv_budget(&self) -> usize {
+        self.eviction_common.kv_budget
+    }
+    pub fn kv_budget_ratio(&self) -> f32 {
+        self.eviction_common.kv_budget_ratio
+    }
+    pub fn protected_prefix(&self) -> Option<usize> {
+        self.eviction_common.protected_prefix
+    }
+    pub fn memory_threshold_mb(&self) -> usize {
+        self.eviction_common.memory_threshold_mb
+    }
+    pub fn eviction_target_ratio(&self) -> f32 {
+        self.eviction_common.eviction_target_ratio
+    }
+    pub fn initial_kv_capacity(&self) -> usize {
+        self.eviction_common.initial_kv_capacity
+    }
+    pub fn min_kv_cache(&self) -> usize {
+        self.eviction_common.min_kv_cache
+    }
 }

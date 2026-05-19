@@ -379,8 +379,8 @@ fn main() -> anyhow::Result<()> {
     let initial_kv_capacity = if args.eval_ll || args.ppl.is_some() {
         // Eval modes: pre-allocate full capacity to avoid re-allocation
         max_seq_len
-    } else if args.initial_kv_capacity > 0 {
-        args.initial_kv_capacity.min(max_seq_len)
+    } else if args.initial_kv_capacity() > 0 {
+        args.initial_kv_capacity().min(max_seq_len)
     } else {
         input_ids
             .len()
@@ -512,23 +512,23 @@ fn main() -> anyhow::Result<()> {
                 initial_kv_capacity,
                 max_seq_len,
                 kv_dtype: kv_type,
-                eviction_policy: args.eviction_policy.clone(),
-                eviction_target_ratio: args.eviction_target_ratio,
-                eviction_window: args.eviction_window,
-                protected_prefix: args.protected_prefix,
-                sink_size: args.sink_size,
-                streaming_window: args.streaming_window,
-                kv_budget: args.kv_budget,
-                h2o_keep_ratio: args.h2o_keep_ratio,
-                h2o_tracked_layers: args.h2o_tracked_layers,
-                h2o_decay: args.h2o_decay,
-                h2o_raw_scores: args.h2o_raw_scores,
-                d2o_keep_ratio: args.d2o_keep_ratio,
-                d2o_ema_beta: args.d2o_ema_beta,
-                d2o_merge_e: args.d2o_merge_e,
-                d2o_layer_alloc: args.d2o_layer_alloc,
-                d2o_protected_layers: args.d2o_protected_layers.clone().unwrap_or_default(),
-                memory_threshold_mb: args.memory_threshold_mb as u64,
+                eviction_policy: args.eviction_policy().to_string(),
+                eviction_target_ratio: args.eviction_target_ratio(),
+                eviction_window: args.eviction_window(),
+                protected_prefix: args.protected_prefix(),
+                sink_size: args.sink_size(),
+                streaming_window: args.streaming_window(),
+                kv_budget: args.kv_budget(),
+                h2o_keep_ratio: args.h2o_keep_ratio(),
+                h2o_tracked_layers: args.h2o_tracked_layers(),
+                h2o_decay: args.h2o_decay(),
+                h2o_raw_scores: args.h2o_raw_scores(),
+                d2o_keep_ratio: args.d2o_keep_ratio(),
+                d2o_ema_beta: args.d2o_ema_beta(),
+                d2o_merge_e: args.d2o_merge_e(),
+                d2o_layer_alloc: args.d2o_layer_alloc(),
+                d2o_protected_layers: args.d2o_protected_layers().clone().unwrap_or_default(),
+                memory_threshold_mb: args.memory_threshold_mb() as u64,
             })?
         };
 
@@ -649,7 +649,7 @@ fn main() -> anyhow::Result<()> {
                 "switch_hw".to_string(),
                 "layer_skip".to_string(),
             ];
-            if args.eviction_policy != "none" {
+            if args.eviction_policy() != "none" {
                 a.push("kv_evict_h2o".to_string());
                 a.push("kv_evict_sliding".to_string());
                 a.push("kv_evict_streaming".to_string());
@@ -805,18 +805,18 @@ fn main() -> anyhow::Result<()> {
     let mut tbt_values = Vec::new();
 
     // 4.5 Setup CacheManager
-    let actual_protected_prefix =
-        args.protected_prefix
-            .unwrap_or(match args.eviction_policy.as_str() {
-                // Score-based policies: default to 4 (attention sinks only).
-                // Protecting the entire prompt makes score-based eviction meaningless
-                // because only generated tokens would be evictable.
-                "h2o" | "h2o_plus" | "d2o" => 4,
-                // StreamingLLM: use explicit sink_size parameter
-                "streaming" => args.sink_size,
-                // Sliding window / none: protect entire prompt (legacy behavior)
-                _ => input_ids.len(),
-            });
+    let actual_protected_prefix = args
+        .protected_prefix()
+        .unwrap_or(match args.eviction_policy() {
+            // Score-based policies: default to 4 (attention sinks only).
+            // Protecting the entire prompt makes score-based eviction meaningless
+            // because only generated tokens would be evictable.
+            "h2o" | "h2o_plus" | "d2o" => 4,
+            // StreamingLLM: use explicit sink_size parameter
+            "streaming" => args.sink_size(),
+            // Sliding window / none: protect entire prompt (legacy behavior)
+            _ => input_ids.len(),
+        });
 
     let mut cache_manager = {
         // CUDA discrete GPU: managed memory (cuMemAllocManaged) reserves system RAM
@@ -828,18 +828,18 @@ fn main() -> anyhow::Result<()> {
             } else {
                 Box::new(LinuxSystemMonitor)
             };
-        let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
+        let threshold_bytes = args.memory_threshold_mb() * 1024 * 1024;
 
-        if args.eviction_policy == "d2o" {
+        if args.eviction_policy() == "d2o" {
             // D2O uses CachePressureHandler (Pipeline mode), not EvictionPolicy (Legacy mode)
             let d2o_handler = D2OHandler::new(D2OConfig {
-                keep_ratio: args.d2o_keep_ratio,
+                keep_ratio: args.d2o_keep_ratio(),
                 protected_prefix: actual_protected_prefix,
-                target_ratio: args.eviction_target_ratio,
-                ema_beta: args.d2o_ema_beta,
-                merge_e: args.d2o_merge_e,
-                use_layer_allocation: args.d2o_layer_alloc,
-                protected_layers: args.d2o_protected_layers.clone().unwrap_or_default(),
+                target_ratio: args.eviction_target_ratio(),
+                ema_beta: args.d2o_ema_beta(),
+                merge_e: args.d2o_merge_e(),
+                use_layer_allocation: args.d2o_layer_alloc(),
+                protected_layers: args.d2o_protected_layers().clone().unwrap_or_default(),
             });
             let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
                 min_level: PressureLevel::Warning,
@@ -848,28 +848,30 @@ fn main() -> anyhow::Result<()> {
             CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
         } else {
             let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> = match args
-                .eviction_policy
-                .as_str()
+                .eviction_policy()
             {
                 "none" => Box::new(NoEvictionPolicy::new()),
                 "sliding" => Box::new(SlidingWindowPolicy::new(
-                    args.eviction_window,
+                    args.eviction_window(),
                     actual_protected_prefix,
                 )),
                 "streaming" => {
                     use llm_rs2::core::eviction::StreamingLLMPolicy;
-                    let window = if args.streaming_window > 0 {
-                        args.streaming_window
-                    } else if args.kv_budget > 0 {
-                        args.kv_budget.saturating_sub(args.sink_size)
+                    let window = if args.streaming_window() > 0 {
+                        args.streaming_window()
+                    } else if args.kv_budget() > 0 {
+                        args.kv_budget().saturating_sub(args.sink_size())
                     } else {
-                        args.eviction_window
+                        args.eviction_window()
                     };
-                    Box::new(StreamingLLMPolicy::new(args.sink_size, window))
+                    Box::new(StreamingLLMPolicy::new(args.sink_size(), window))
                 }
-                "h2o" => Box::new(H2OPolicy::new(args.h2o_keep_ratio, actual_protected_prefix)),
+                "h2o" => Box::new(H2OPolicy::new(
+                    args.h2o_keep_ratio(),
+                    actual_protected_prefix,
+                )),
                 "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                    args.h2o_keep_ratio,
+                    args.h2o_keep_ratio(),
                     actual_protected_prefix,
                 )),
                 other => anyhow::bail!(
@@ -877,7 +879,12 @@ fn main() -> anyhow::Result<()> {
                     other
                 ),
             };
-            CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
+            CacheManager::new(
+                policy,
+                monitor,
+                threshold_bytes,
+                args.eviction_target_ratio(),
+            )
         }
     };
 
@@ -900,14 +907,14 @@ fn main() -> anyhow::Result<()> {
     cache_manager.register_policy(
         llm_rs2::resilience::EvictMethod::H2o,
         Box::new(H2OPolicy::new(
-            args.h2o_keep_ratio,
+            args.h2o_keep_ratio(),
             resilience_protected_prefix,
         )),
     );
     cache_manager.register_policy(
         llm_rs2::resilience::EvictMethod::Sliding,
         Box::new(SlidingWindowPolicy::new(
-            args.eviction_window,
+            args.eviction_window(),
             resilience_protected_prefix,
         )),
     );
@@ -925,12 +932,12 @@ fn main() -> anyhow::Result<()> {
 
     // Setup AttentionScoreAccumulator for H2O / H2O+ / D2O / CAOTE
     // When CAOTE is requested, always use GQA-aware accumulator (for per-KV-head attention).
-    let needs_score_based = args.eviction_policy == "h2o"
-        || args.eviction_policy == "d2o"
-        || args.eviction_policy == "h2o_plus";
+    let needs_score_based = args.eviction_policy() == "h2o"
+        || args.eviction_policy() == "d2o"
+        || args.eviction_policy() == "h2o_plus";
     // Always build accumulator for eval-ll when any eviction policy is active:
     // sliding mode needs it to populate last_step_head_attn for QCF-ATTN v2.
-    let has_eviction_policy = args.eviction_policy != "none";
+    let has_eviction_policy = args.eviction_policy() != "none";
     // --enable-resilience forces accumulator on: the manager can request Evict
     // at any runtime moment, and `compute_qcf_estimates` (~line 4882) falls back
     // to uniform weights without scores, which corrupts action-cost ranks
@@ -943,7 +950,7 @@ fn main() -> anyhow::Result<()> {
     let needs_accumulator =
         needs_score_based || needs_caote || args.enable_resilience || has_eviction_policy;
     // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE).
-    let use_gqa = args.eviction_policy == "h2o_plus" || needs_caote || has_eviction_policy;
+    let use_gqa = args.eviction_policy() == "h2o_plus" || needs_caote || has_eviction_policy;
 
     let mut score_accumulator = if needs_accumulator {
         let acc = if use_gqa {
@@ -952,16 +959,16 @@ fn main() -> anyhow::Result<()> {
                 model.config.num_attention_heads,
                 model.config.num_key_value_heads,
                 model.config.num_hidden_layers,
-                args.h2o_tracked_layers,
-                args.h2o_decay,
+                args.h2o_tracked_layers(),
+                args.h2o_decay(),
             )
         } else {
             AttentionScoreAccumulator::new(
                 max_seq_len,
                 model.config.num_attention_heads,
                 model.config.num_hidden_layers,
-                args.h2o_tracked_layers,
-                args.h2o_decay,
+                args.h2o_tracked_layers(),
+                args.h2o_decay(),
             )
         };
         let mut acc = acc;
@@ -969,7 +976,7 @@ fn main() -> anyhow::Result<()> {
         // CPU NEON acc overhead is ~0.66ms/token (1.1%).
         // This ensures first RequestQcf returns accurate H2O/D2O estimates.
         acc.set_active(true);
-        acc.set_time_normalize(!args.h2o_raw_scores);
+        acc.set_time_normalize(!args.h2o_raw_scores());
         Some(acc)
     } else {
         None
@@ -989,7 +996,7 @@ fn main() -> anyhow::Result<()> {
             model.config.num_attention_heads,
             model.config.num_key_value_heads,
             max_seq_len,
-            args.h2o_decay,
+            args.h2o_decay(),
         ) {
             Ok(()) => {
                 if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
@@ -1006,14 +1013,14 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    if args.eviction_policy != "none" {
+    if args.eviction_policy() != "none" {
         eprintln!(
             "Eviction: policy={}, window={}, prefix={}, ratio={}, threshold={}MB",
-            args.eviction_policy,
-            args.eviction_window,
+            args.eviction_policy(),
+            args.eviction_window(),
             actual_protected_prefix,
-            args.eviction_target_ratio,
-            args.memory_threshold_mb
+            args.eviction_target_ratio(),
+            args.memory_threshold_mb()
         );
     }
 
@@ -1056,8 +1063,8 @@ fn main() -> anyhow::Result<()> {
     // - Sliding window: triggers on memory pressure after each forward pass.
     // - Score-based (H2O/H2O+/D2O): triggers when cache utilization >= 90% capacity,
     //   using force_evict_with_scores to bypass memory pressure checks.
-    let auto_eviction = args.eviction_policy != "none" && experiment_schedule.is_none();
-    let score_based_eviction = matches!(args.eviction_policy.as_str(), "h2o" | "h2o_plus" | "d2o");
+    let auto_eviction = args.eviction_policy() != "none" && experiment_schedule.is_none();
+    let score_based_eviction = matches!(args.eviction_policy(), "h2o" | "h2o_plus" | "d2o");
 
     // ── Weight swap: --force-swap-ratio manual trigger ──────────────────────
     // Applied once before generation starts (prefill + decode).
@@ -2016,7 +2023,7 @@ fn main() -> anyhow::Result<()> {
 
     // D2O layer-level allocation: create variance collector before prefill.
     // Only active when --eviction-policy d2o and --d2o-layer-alloc are both set.
-    let mut variance_collector = if args.d2o_layer_alloc && args.eviction_policy == "d2o" {
+    let mut variance_collector = if args.d2o_layer_alloc() && args.eviction_policy() == "d2o" {
         Some(
             llm_rs2::core::pressure::d2o_layer_alloc::D2OVarianceCollector::new(
                 model.config.num_hidden_layers,
@@ -2316,7 +2323,7 @@ fn main() -> anyhow::Result<()> {
                     capacity: kv_caches[0].capacity(),
                     protected_prefix: actual_protected_prefix,
                     kv_dtype: args.kv_type.clone(),
-                    eviction_policy: args.eviction_policy.clone(),
+                    eviction_policy: args.eviction_policy().to_string(),
                     skip_ratio: 0.0,
                 };
                 let plan = executor.poll(&kv_snap);
@@ -2444,7 +2451,7 @@ fn main() -> anyhow::Result<()> {
                 capacity: kv_caches[0].capacity(),
                 protected_prefix: actual_protected_prefix,
                 kv_dtype: "f16".to_string(),
-                eviction_policy: args.eviction_policy.clone(),
+                eviction_policy: args.eviction_policy().to_string(),
                 skip_ratio: 0.0,
             };
             let plan = exec.poll(&kv_snap);
@@ -2454,7 +2461,7 @@ fn main() -> anyhow::Result<()> {
                     let current_pos = kv_caches[0].current_pos;
                     // Use current_pos as ceiling (first and only boundary eviction).
                     let tgt_raw = (current_pos as f32 * effective_ratio).max(1.0) as usize;
-                    let target_pos = tgt_raw.max(args.min_kv_cache);
+                    let target_pos = tgt_raw.max(args.min_kv_cache());
                     if current_pos > target_pos {
                         // adjusted_ratio so force_evict(current_pos * adjusted) == target_pos.
                         let adjusted_ratio = target_pos as f32 / current_pos as f32;
@@ -2611,8 +2618,8 @@ fn main() -> anyhow::Result<()> {
     let d2o_layer_ratios: Option<Vec<(f32, f32)>> = if let Some(ref collector) = variance_collector
     {
         let budgets = collector.compute_budgets(
-            args.d2o_keep_ratio * args.eviction_target_ratio,
-            (1.0 - args.d2o_keep_ratio) * args.eviction_target_ratio,
+            args.d2o_keep_ratio() * args.eviction_target_ratio(),
+            (1.0 - args.d2o_keep_ratio()) * args.eviction_target_ratio(),
         );
         log::info!(
             "[D2O] Layer budgets computed: {:?}",
@@ -2841,7 +2848,7 @@ fn main() -> anyhow::Result<()> {
                     let partition_off =
                         args.tensor_partition <= 0.0 || args.tensor_partition >= 1.0;
                     let eviction_compatible =
-                        args.eviction_policy != "kivi" && args.eviction_policy != "qcf";
+                        args.eviction_policy() != "kivi" && args.eviction_policy() != "qcf";
                     let layout_ok = kv_caches
                         .first()
                         .map(|c| c.layout() == KVLayout::HeadMajor)
@@ -3602,7 +3609,7 @@ fn main() -> anyhow::Result<()> {
             // ── End LISWAP-5 retire ────────────────────────────────────────────
 
             // ── H2O Debug: per-step diagnostics ──
-            if args.h2o_debug {
+            if args.h2o_debug() {
                 // 1. Verify ws.scores is post-softmax (sample first 4 heads)
                 let n_heads_q = model.config.num_attention_heads;
                 let stride = gen_ws.scores.len() / n_heads_q;
@@ -3689,22 +3696,23 @@ fn main() -> anyhow::Result<()> {
                             if let Some(ref ratios) = d2o_layer_ratios {
                                 cache_manager.force_evict_with_scores_and_budgets(
                                     &mut kv_caches,
-                                    args.eviction_target_ratio,
+                                    args.eviction_target_ratio(),
                                     acc.importance_scores(),
                                     ratios,
                                 )?
                             } else {
                                 cache_manager.force_evict_with_scores(
                                     &mut kv_caches,
-                                    args.eviction_target_ratio,
+                                    args.eviction_target_ratio(),
                                     acc.importance_scores(),
                                 )?
                             }
                         } else {
-                            cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio)?
+                            cache_manager
+                                .force_evict(&mut kv_caches, args.eviction_target_ratio())?
                         }
                     } else {
-                        cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio)?
+                        cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio())?
                     }
                 } else if let Some(acc) = score_accumulator.as_ref() {
                     if acc.is_active() {
@@ -3718,13 +3726,13 @@ fn main() -> anyhow::Result<()> {
                 };
                 if result.evicted {
                     // Compute evicted indices from pre-eviction state
-                    let target_len = ((before_len as f32) * args.eviction_target_ratio) as usize;
+                    let target_len = ((before_len as f32) * args.eviction_target_ratio()) as usize;
                     let evicted_indices = if !pre_eviction_scores.is_empty() {
                         llm_rs2::profile::compute_h2o_evicted_indices(
                             before_len,
                             target_len,
                             actual_protected_prefix,
-                            args.h2o_keep_ratio,
+                            args.h2o_keep_ratio(),
                             &pre_eviction_scores,
                         )
                     } else {
@@ -3743,7 +3751,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         p.on_eviction(llm_rs2::profile::EvictionEvent {
                             step: decode_token_index,
-                            policy: args.eviction_policy.clone(),
+                            policy: args.eviction_policy().to_string(),
                             before_len,
                             after_len: result.new_pos,
                             evicted_count: result.tokens_removed,
@@ -3816,7 +3824,7 @@ fn main() -> anyhow::Result<()> {
                     protected_prefix: actual_protected_prefix,
                     // Phase 3에서 실제 정책/dtype/skip 정보로 채울 예정
                     kv_dtype: "f16".to_string(),
-                    eviction_policy: args.eviction_policy.clone(),
+                    eviction_policy: args.eviction_policy().to_string(),
                     skip_ratio: 0.0,
                 };
 
@@ -3852,12 +3860,12 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     // Derive streaming window: same logic as policy construction
-                    let streaming_window_size = if args.streaming_window > 0 {
-                        args.streaming_window
-                    } else if args.kv_budget > 0 {
-                        args.kv_budget.saturating_sub(args.sink_size)
+                    let streaming_window_size = if args.streaming_window() > 0 {
+                        args.streaming_window()
+                    } else if args.kv_budget() > 0 {
+                        args.kv_budget().saturating_sub(args.sink_size())
                     } else {
-                        args.eviction_window
+                        args.eviction_window()
                     };
 
                     // ISSUE-9 fix: On OpenCL with zero-copy memory, KV V
@@ -3887,7 +3895,7 @@ fn main() -> anyhow::Result<()> {
                     let ctx = QcfEstimateContext {
                         kv_caches: &kv_caches,
                         score_accumulator: score_accumulator.as_ref(),
-                        streaming_config: Some((args.sink_size, streaming_window_size)),
+                        streaming_config: Some((args.sink_size(), streaming_window_size)),
                         importance_table: importance_table_for_swap.as_ref(),
                         num_layers: model.config.num_hidden_layers,
                         kivi_caches: None,
@@ -3958,15 +3966,16 @@ fn main() -> anyhow::Result<()> {
                     let (skip_eviction, target_pos) = if effective_ratio > 0.0 {
                         let ceiling = evict_ceiling.get_or_insert(current_pos);
                         let tgt_raw = (*ceiling as f32 * effective_ratio).max(1.0) as usize;
-                        let tgt = if tgt_raw < args.min_kv_cache {
+                        let tgt = if tgt_raw < args.min_kv_cache() {
                             if evict_floor_logged.is_none() {
                                 eprintln!(
                                     "[Eviction] target_pos {} clamped to min_kv_cache {}",
-                                    tgt_raw, args.min_kv_cache
+                                    tgt_raw,
+                                    args.min_kv_cache()
                                 );
                                 evict_floor_logged = Some(true);
                             }
-                            args.min_kv_cache
+                            args.min_kv_cache()
                         } else {
                             tgt_raw
                         };
@@ -4103,7 +4112,7 @@ fn main() -> anyhow::Result<()> {
                                     r.new_pos + r.tokens_removed,
                                     r.new_pos
                                 );
-                                if args.h2o_debug {
+                                if args.h2o_debug() {
                                     if let Some(acc) = score_accumulator.as_ref() {
                                         let scores = acc.importance_scores();
                                         let pre_pos = r.new_pos + r.tokens_removed;
@@ -4134,7 +4143,7 @@ fn main() -> anyhow::Result<()> {
                                 if let Some(ref mut p) = profiler {
                                     p.on_eviction(llm_rs2::profile::EvictionEvent {
                                         step: decode_token_index,
-                                        policy: args.eviction_policy.clone(),
+                                        policy: args.eviction_policy().to_string(),
                                         before_len: r.new_pos + r.tokens_removed,
                                         after_len: r.new_pos,
                                         evicted_count: r.tokens_removed,
@@ -4844,7 +4853,7 @@ fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| "baseline".to_string()),
-            eviction_policy: args.eviction_policy.clone(),
+            eviction_policy: args.eviction_policy().to_string(),
             backend: args.backend.clone(),
             sample_interval: args.experiment_sample_interval,
             sys_start,
@@ -4865,7 +4874,7 @@ fn main() -> anyhow::Result<()> {
         let metadata = llm_rs2::profile::ProfileMetadata {
             model: args.model_path.clone(),
             backend: args.backend.clone(),
-            eviction_policy: args.eviction_policy.clone(),
+            eviction_policy: args.eviction_policy().to_string(),
             max_seq_len: args.max_seq_len,
             prompt_len: prompt.len(),
             generated_tokens: tbt_values.len(),

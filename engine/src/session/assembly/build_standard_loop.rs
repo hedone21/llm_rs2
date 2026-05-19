@@ -38,9 +38,9 @@ use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPen
 ///
 /// - `args.qcf_dump.is_none()`               — `--qcf-dump` 비활성 (importance_collector 미장착)
 /// - `args.skip_ratio.unwrap_or(0.0) == 0.0` — `--skip-ratio=0` (skip_config 미장착)
-/// - `!args.d2o_layer_alloc`                 — `--d2o-layer-alloc` 비활성 (variance_collector 미장착)
+/// - `!args.d2o_layer_alloc()`                 — `--d2o-layer-alloc` 비활성 (variance_collector 미장착)
 /// - `!args.profile && !args.profile_events` — profile 비활성 (profiler 미장착)
-/// - `args.eviction_policy == "none"`        — eviction 비활성 (score_accumulator 미장착)
+/// - `args.eviction_policy() == "none"`        — eviction 비활성 (score_accumulator 미장착)
 /// - `args.tensor_partition == 0.0`          — Phase 4-4.7: tensor_partition 활성 시
 ///   plan path가 build_plan에서 None을 반환 → sticky_disabled lock-out → 매 step
 ///   forward_into fallback이라 성능 저하. happy path에서는 partition 차단.
@@ -59,10 +59,10 @@ use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPen
 pub fn is_standard_happy_path(args: &Args) -> bool {
     args.qcf_dump.is_none()
         && args.skip_ratio.unwrap_or(0.0) == 0.0
-        && !args.d2o_layer_alloc
+        && !args.d2o_layer_alloc()
         && !args.profile
         && !args.profile_events
-        && args.eviction_policy == "none"
+        && args.eviction_policy() == "none"
         && args.tensor_partition == 0.0
         && !args.swap_intra_forward
         && !args.swap_layer_immediate
@@ -182,14 +182,24 @@ mod tests {
     #[test]
     fn rejects_d2o_layer_alloc() {
         let mut args = default_args();
-        args.d2o_layer_alloc = true;
+        args.eviction = Some(crate::session::cli::EvictionCmd::D2o(
+            crate::session::cli::D2oArgs {
+                keep_ratio: 0.75,
+                ema_beta: 0.7,
+                merge_e: 0.1,
+                layer_alloc: true,
+                protected_layers: None,
+            },
+        ));
         assert!(!is_standard_happy_path(&args));
     }
 
     #[test]
     fn rejects_non_none_eviction() {
         let mut args = default_args();
-        args.eviction_policy = "sliding".to_string();
+        args.eviction = Some(crate::session::cli::EvictionCmd::Sliding(
+            crate::session::cli::SlidingArgs { window: 1024 },
+        ));
         assert!(!is_standard_happy_path(&args));
     }
 

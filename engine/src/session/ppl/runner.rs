@@ -628,7 +628,10 @@ pub fn run_ppl(
 
     eprintln!(
         "[PPL] {} tokens, policy={}, kv_budget={}, kv_type={}",
-        eval_tokens, args.eviction_policy, args.kv_budget, args.kv_type
+        eval_tokens,
+        args.eviction_policy(),
+        args.kv_budget(),
+        args.kv_type
     );
 
     // ── 2. Pre-allocate decode buffers ──
@@ -667,7 +670,7 @@ pub fn run_ppl(
     let mut logits_cpu = vec![0.0f32; vocab_size];
 
     // ── 3. Determine prefill chunk size ──
-    let has_budget = args.kv_budget > 0 || args.kv_budget_ratio > 0.0;
+    let has_budget = args.kv_budget() > 0 || args.kv_budget_ratio() > 0.0;
     if auto_eviction && !has_budget {
         eprintln!(
             "[PPL] Warning: eviction enabled without --kv-budget. \
@@ -679,22 +682,22 @@ pub fn run_ppl(
         // 충분히 돌리기 위함. budget 로직보다 우선.
         forced.clamp(2, eval_tokens)
     } else if has_budget {
-        let budget = if args.kv_budget_ratio > 0.0 {
-            ((eval_tokens as f32) * args.kv_budget_ratio) as usize
+        let budget = if args.kv_budget_ratio() > 0.0 {
+            ((eval_tokens as f32) * args.kv_budget_ratio()) as usize
         } else {
-            args.kv_budget
+            args.kv_budget()
         };
         budget.min(eval_tokens).max(2)
-    } else if auto_eviction && args.eviction_policy == "sliding" {
-        args.eviction_window.min(eval_tokens)
+    } else if auto_eviction && args.eviction_policy() == "sliding" {
+        args.eviction_window().min(eval_tokens)
     } else {
         eval_tokens
     };
 
-    let effective_budget = if args.kv_budget_ratio > 0.0 {
-        ((eval_tokens as f32) * args.kv_budget_ratio) as usize
-    } else if args.kv_budget > 0 {
-        args.kv_budget
+    let effective_budget = if args.kv_budget_ratio() > 0.0 {
+        ((eval_tokens as f32) * args.kv_budget_ratio()) as usize
+    } else if args.kv_budget() > 0 {
+        args.kv_budget()
     } else {
         max_seq_len // No budget → no eviction trigger
     };
@@ -1039,7 +1042,7 @@ pub fn run_ppl(
                         let action = if score_based_eviction {
                             QcfActionType::EvictH2o {
                                 target_len,
-                                keep_ratio: args.h2o_keep_ratio,
+                                keep_ratio: args.h2o_keep_ratio(),
                                 protected_prefix,
                             }
                         } else {
@@ -1142,12 +1145,12 @@ pub fn run_ppl(
         "config": {
             "model": args.model_path,
             "text_file": text_file,
-            "eviction_policy": args.eviction_policy,
-            "kv_budget": args.kv_budget,
+            "eviction_policy": args.eviction_policy(),
+            "kv_budget": args.kv_budget(),
             "kv_type": args.kv_type,
             "max_seq_len": max_seq_len,
-            "eviction_target_ratio": args.eviction_target_ratio,
-            "h2o_keep_ratio": args.h2o_keep_ratio,
+            "eviction_target_ratio": args.eviction_target_ratio(),
+            "h2o_keep_ratio": args.h2o_keep_ratio(),
             "protected_prefix": protected_prefix,
             "skip_layers": args.skip_layers,
             "skip_ratio": args.skip_ratio,
