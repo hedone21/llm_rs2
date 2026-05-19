@@ -1,10 +1,12 @@
 use clap::Parser;
 
 pub mod eviction;
+pub mod kv_mode;
 
 pub use eviction::{
     D2oArgs, EvictionCmd, EvictionCommonArgs, H2oArgs, SlidingArgs, StreamingArgs, TopLevelCmd,
 };
+pub use kv_mode::{KvMode, KvModeArgs};
 
 /// `--secondary-dtype` CLI 인수 값 (D-3, ENG-ALG-225).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1049,6 +1051,10 @@ pub struct Args {
     /// [`crate::session::cli::EvictionCmd`].
     #[command(subcommand)]
     pub eviction: Option<TopLevelCmd>,
+
+    // ── KV mode subcommand (S-subcmd C4) ─────────────────────────────────
+    #[clap(flatten)]
+    pub kv_mode_args: KvModeArgs,
 }
 
 /// Shim accessors for the eviction subcommand + flatten common args.
@@ -1057,6 +1063,27 @@ pub struct Args {
 /// `args.kv_budget`, ...) read through these methods so the C2 commit
 /// changes only `cli/mod.rs`. Call sites migrate to direct enum match in C3.
 impl Args {
+    /// Resolve effective KV mode (kv_mode_args.kv_mode 우선, legacy flag fallback).
+    ///
+    /// - `--kv-mode kivi/offload` → 해당 모드
+    /// - `--kv-mode standard` + legacy `--kivi` → Kivi
+    /// - `--kv-mode standard` + legacy `--kv-offload <non-none>` → Offload
+    /// - 그 외 → Standard
+    pub fn effective_kv_mode(&self) -> KvMode {
+        match self.kv_mode_args.kv_mode {
+            KvMode::Standard => {
+                if self.kivi {
+                    KvMode::Kivi
+                } else if self.kv_offload != "none" {
+                    KvMode::Offload
+                } else {
+                    KvMode::Standard
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Returns the nested `EvictionCmd` policy, unwrapping the
     /// `TopLevelCmd::Eviction` wrapper. `None` if no subcommand given.
     fn current_policy(&self) -> Option<&EvictionCmd> {
