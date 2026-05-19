@@ -17,11 +17,11 @@
 /// - `spec/32-engine-algorithms.md` §3.12.18 (ENG-ALG-224)
 /// - `spec/33-engine-data.md` §3.22.14~16 (ENG-DAT-097/098/099)
 /// - `spec/41-invariants.md` §3.18 (INV-137~139)
-use crate::auf::error::{AufError, AufResult};
-use crate::auf::tensor_index::TensorDType;
 use crate::core::quant::{BlockQ4_0, QK4_0};
 use crate::models::loader::convert::{f16_to_f32, quantize_q4_0};
 use half::f16;
+use llm_shared::auf::error::{AufError, AufResult};
+use llm_shared::auf::tensor_index::TensorDType;
 
 /// `src_dtype`로 인코딩된 `src_bytes`를 `dst_dtype` 바이트로 변환한다.
 ///

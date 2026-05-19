@@ -1,3 +1,5 @@
+pub mod auf;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

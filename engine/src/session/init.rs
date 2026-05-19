@@ -745,7 +745,7 @@ impl SessionInitCtx {
                         /// AUF present but no lm_head entry (bit 2 = 0).
                         AbsentFallback,
                         /// INV-135 violation.
-                        Error(crate::auf::AufError),
+                        Error(llm_shared::auf::AufError),
                         /// Non-AUF secondary or no secondary.
                         NotAuf,
                     }
@@ -778,10 +778,10 @@ impl SessionInitCtx {
                                 "[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant={variant_tag})"
                             );
                             // Build a synthetic LmHeadPayload with owned bytes.
-                            let payload = crate::auf::LmHeadPayload {
+                            let payload = llm_shared::auf::LmHeadPayload {
                                 bytes: &bytes,
                                 shape,
-                                dtype: crate::auf::TensorDType::Q4_0,
+                                dtype: llm_shared::auf::TensorDType::Q4_0,
                                 alignment: 65536,
                                 variant_tag,
                             };

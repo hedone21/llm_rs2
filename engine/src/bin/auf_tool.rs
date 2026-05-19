@@ -12,15 +12,15 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 
-use llm_rs2::auf::stripper::strip;
-use llm_rs2::auf::tensor_index::{
+use llm_rs2::auf_dtype_convert::{build_dtype_candidates, convert_tensor_dtype};
+use llm_shared::auf::stripper::strip;
+use llm_shared::auf::tensor_index::{
     LAYER_IDX_CROSS, TensorDType, TensorEntry, TensorIndex, TensorKind,
 };
-use llm_rs2::auf::{
+use llm_shared::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, SECTION_STRIPPABLE,
     TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS, TOKENIZER_KIND_BPE,
-    build_dtype_candidates, compute_source_hash, convert_tensor_dtype, open,
-    q4_0_aos_to_adreno_soa,
+    compute_source_hash, open, q4_0_aos_to_adreno_soa,
 };
 
 // ---------------------------------------------------------------------------
@@ -431,7 +431,7 @@ fn build_meta_from_gguf(gguf: &llm_rs2::models::loader::gguf::GgufFile) -> Resul
 }
 
 /// 레거시 호환을 위한 단순 분리 (transpose / unshuffle 없음). 새 코드에서는
-/// `llm_rs2::auf::q4_0_aos_to_adreno_soa`를 사용하라. 일부 단위 테스트가 이
+/// `llm_shared::auf::q4_0_aos_to_adreno_soa`를 사용하라. 일부 단위 테스트가 이
 /// 헬퍼의 경계 동작을 그대로 사용하므로 보존한다.
 #[allow(dead_code)]
 fn q4_0_aos_to_soa(blocks: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -1048,7 +1048,7 @@ fn ggml_type_to_tensor_dtype(ggml_type: u32) -> TensorDType {
     }
 }
 
-// `build_dtype_candidates`는 `llm_rs2::auf::dtype_convert`에서 export된 라이브러리
+// `build_dtype_candidates`는 `llm_shared::auf::dtype_convert`에서 export된 라이브러리
 // 함수를 사용한다 (Sprint F ISSUE-E-1 fix로 외부 lib로 이동, spec 테스트 가능).
 
 /// GGUF lm_head (F16 or F32) → F32 dequantize → Q4_0 quantize → 18B/block bytes.
@@ -1647,7 +1647,7 @@ fn cmd_info(args: InfoArgs) -> Result<()> {
 }
 
 fn build_flags_str(flags: u32) -> String {
-    use llm_rs2::auf::{SECTION_COMPRESSED, SECTION_REQUIRED, SECTION_STRIPPABLE};
+    use llm_shared::auf::{SECTION_COMPRESSED, SECTION_REQUIRED, SECTION_STRIPPABLE};
     let mut parts = Vec::new();
     if flags & SECTION_REQUIRED != 0 {
         parts.push("REQUIRED");
@@ -2275,8 +2275,8 @@ mod tests {
 
     #[test]
     fn writer_with_lm_head_q4_0_sets_bit2_and_patch() {
-        use llm_rs2::auf::header::CAPABILITY_BIT_LM_HEAD_Q4_0;
-        use llm_rs2::auf::{AufHeader, AufMeta, AufTokenizer, AufWriter};
+        use llm_shared::auf::header::CAPABILITY_BIT_LM_HEAD_Q4_0;
+        use llm_shared::auf::{AufHeader, AufMeta, AufTokenizer, AufWriter};
 
         let meta = AufMeta {
             architecture: "llama".to_owned(),
@@ -2335,7 +2335,7 @@ mod tests {
     fn writer_off_byte_level_compatible_with_v0_1_0() {
         // INV-136 회귀 방지: Off 모드 (capability bit 2 = 0)에서 작성된 AUF 헤더는
         // v0.1.0 출력과 동일한 format 필드를 가져야 한다 (format_patch=0, capability=0).
-        use llm_rs2::auf::{AufHeader, AufMeta, AufTokenizer, AufWriter};
+        use llm_shared::auf::{AufHeader, AufMeta, AufTokenizer, AufWriter};
 
         let meta = AufMeta {
             architecture: "llama".to_owned(),
@@ -2473,8 +2473,8 @@ mod tests {
     /// 다른 layer weight는 SOA 변환을 그대로 적용.
     #[test]
     fn build_variant_payload_skips_soa_for_lm_head() {
-        use llm_rs2::auf::q4_0_aos_to_adreno_soa;
-        use llm_rs2::auf::section::TAG_WEIGHTS_ADRENO_SOA;
+        use llm_shared::auf::q4_0_aos_to_adreno_soa;
+        use llm_shared::auf::section::TAG_WEIGHTS_ADRENO_SOA;
 
         // VOCAB=64, HIDDEN=128 → 64*128/32 = 256 blocks * 18B = 4608B.
         const VOCAB: usize = 64;
@@ -2537,8 +2537,8 @@ mod tests {
     /// 그대로 적용. 이는 G-1-F fix가 lm_head 한정 예외임을 검증.
     #[test]
     fn build_variant_payload_applies_soa_for_layer_weights() {
-        use llm_rs2::auf::q4_0_aos_to_adreno_soa;
-        use llm_rs2::auf::section::TAG_WEIGHTS_ADRENO_SOA;
+        use llm_shared::auf::q4_0_aos_to_adreno_soa;
+        use llm_shared::auf::section::TAG_WEIGHTS_ADRENO_SOA;
 
         const ROWS: usize = 32;
         const COLS: usize = 64;
@@ -2565,7 +2565,7 @@ mod tests {
 
     #[test]
     fn round_trip_strip_via_auf_api() {
-        use llm_rs2::auf::{AufMeta, AufTokenizer, AufWriter, strip_bytes};
+        use llm_shared::auf::{AufMeta, AufTokenizer, AufWriter, strip_bytes};
 
         let meta = AufMeta {
             architecture: "llama".to_owned(),
@@ -2603,8 +2603,8 @@ mod tests {
         let stripped = strip_bytes(&original, &[TAG_WEIGHTS_ADRENO_SOA]).unwrap();
 
         // stripped에서 CPU_AOS section이 없어야 함
-        use llm_rs2::auf::header::AufHeader;
-        use llm_rs2::auf::section::SectionTable;
+        use llm_shared::auf::header::AufHeader;
+        use llm_shared::auf::section::SectionTable;
         let hdr = AufHeader::from_bytes(&stripped).unwrap();
         let tbl = SectionTable::from_bytes(
             &stripped[hdr.section_table_offset as usize..],

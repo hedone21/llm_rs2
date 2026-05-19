@@ -641,7 +641,7 @@ impl TransformerModel {
     /// state is unchanged (install is the last step).
     pub fn load_lm_head_from_auf(
         &mut self,
-        payload: &crate::auf::reader::LmHeadPayload<'_>,
+        payload: &llm_shared::auf::reader::LmHeadPayload<'_>,
         runtime_backend: &Arc<dyn Backend>,
     ) -> Result<()> {
         use crate::buffer::shared_buffer::SharedBuffer;
@@ -3649,9 +3649,9 @@ mod tests {
     /// G-1-E: load_lm_head_from_auf — CPU_AOS payload → dtype becomes Q4_0.
     #[test]
     fn load_lm_head_from_auf_cpu_aos_sets_q4_0_dtype() {
-        use crate::auf::reader::LmHeadPayload;
-        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
-        use crate::auf::tensor_index::TensorDType;
+        use llm_shared::auf::reader::LmHeadPayload;
+        use llm_shared::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use llm_shared::auf::tensor_index::TensorDType;
 
         const VOCAB: usize = 64;
         const HIDDEN: usize = 128;
@@ -3679,9 +3679,9 @@ mod tests {
     /// G-1-E: load_lm_head_from_auf — size mismatch → Err.
     #[test]
     fn load_lm_head_from_auf_size_mismatch_err() {
-        use crate::auf::reader::LmHeadPayload;
-        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
-        use crate::auf::tensor_index::TensorDType;
+        use llm_shared::auf::reader::LmHeadPayload;
+        use llm_shared::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use llm_shared::auf::tensor_index::TensorDType;
 
         const VOCAB: usize = 64;
         const HIDDEN: usize = 128;
@@ -3708,9 +3708,9 @@ mod tests {
     /// G-1-E: load_lm_head_from_auf — bytes are preserved (CPU path).
     #[test]
     fn load_lm_head_from_auf_cpu_aos_bytes_preserved() {
-        use crate::auf::reader::LmHeadPayload;
-        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
-        use crate::auf::tensor_index::TensorDType;
+        use llm_shared::auf::reader::LmHeadPayload;
+        use llm_shared::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use llm_shared::auf::tensor_index::TensorDType;
 
         const VOCAB: usize = 32;
         const HIDDEN: usize = 64;

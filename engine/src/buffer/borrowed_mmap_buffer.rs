@@ -117,7 +117,7 @@ impl Buffer for BorrowedMmapBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auf::{
+    use llm_shared::auf::{
         AufMeta, BackendTag,
         section::TAG_WEIGHTS_CPU_AOS,
         tensor_index::TensorIndex,
@@ -213,7 +213,7 @@ mod tests {
     /// Build a stub `Arc<SecondaryMmap>` for lifetime tests.
     fn make_secondary() -> Arc<SecondaryMmap> {
         let auf_bytes = build_minimal_auf();
-        let view = crate::auf::reader::open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
+        let view = llm_shared::auf::reader::open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
         let config = model_config();
         let secondary = build_auf_secondary_from_view(
             view,

@@ -77,9 +77,9 @@ fn main() -> Result<()> {
         build_buffer_alloc_host_ptr_empty, build_buffer_staging, build_q4_0_kernel,
         fill_alloc_host_ptr_via_map, run_matmul_q4_0,
     };
-    use llm_rs2::auf::BackendTag;
-    use llm_rs2::auf::reader::open;
-    use llm_rs2::auf::tensor_index::{TensorDType, TensorKind};
+    use llm_shared::auf::BackendTag;
+    use llm_shared::auf::reader::open;
+    use llm_shared::auf::tensor_index::{TensorDType, TensorKind};
 
     let args = Args::parse();
 

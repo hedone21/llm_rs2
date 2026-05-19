@@ -107,9 +107,9 @@ fn main() -> Result<()> {
         build_buffer_alloc_host_ptr_empty, build_buffer_staging, build_q4_0_kernel,
         fill_alloc_host_ptr_via_map, run_matmul_q4_0,
     };
-    use llm_rs2::auf::BackendTag;
-    use llm_rs2::auf::reader::open;
-    use llm_rs2::auf::tensor_index::{TensorDType, TensorKind};
+    use llm_shared::auf::BackendTag;
+    use llm_shared::auf::reader::open;
+    use llm_shared::auf::tensor_index::{TensorDType, TensorKind};
 
     let args = Args::parse();
     let dbg = args.debug || std::env::var("LLMRS_STAGE2_DEBUG").is_ok();
@@ -203,7 +203,7 @@ fn main() -> Result<()> {
     // Determine layer_count present in the AUF.
     // `layer_idx == u32::MAX` is the LAYER_IDX_CROSS sentinel (embedding /
     // lm_head / final_norm) and must be excluded from the layer count.
-    use llm_rs2::auf::tensor_index::LAYER_IDX_CROSS;
+    use llm_shared::auf::tensor_index::LAYER_IDX_CROSS;
     let mut max_layer: i64 = -1;
     for entry in &view.tensor_index.entries {
         if entry.layer_idx == LAYER_IDX_CROSS {
@@ -649,7 +649,7 @@ fn main() -> Result<()> {
         // Then drop cl_mem; the last Arc goes away → mmap unmapped.
         struct PinnedSlot {
             mem: ocl::core::Mem,
-            _view_keepalive: Arc<llm_rs2::auf::reader::AufView>,
+            _view_keepalive: Arc<llm_shared::auf::reader::AufView>,
         }
 
         let mut pinned: Vec<PinnedSlot> = Vec::with_capacity(l0.len());

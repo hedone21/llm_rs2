@@ -12,7 +12,7 @@
 //! reported on stderr.
 
 use clap::Parser;
-use llm_rs2::auf::q4_0_soa::q4_0_aos_to_adreno_soa;
+use llm_shared::auf::q4_0_soa::q4_0_aos_to_adreno_soa;
 #[cfg(feature = "opencl")]
 use llm_rs2::backend::opencl::{OpenCLBackend, get_cl_mem};
 use llm_rs2::core::backend::Backend;

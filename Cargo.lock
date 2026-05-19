@@ -1180,8 +1180,11 @@ dependencies = [
 name = "llm_shared"
 version = "0.1.0"
 dependencies = [
+ "log",
+ "memmap2",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

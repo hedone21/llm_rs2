@@ -19,14 +19,14 @@
 //!
 //! Spec: INV-135 v2, INV-136, G-1-F fix.
 
-use llm_rs2::auf::reader::{BackendTag, open_from_bytes};
-use llm_rs2::auf::section::{TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS};
-use llm_rs2::auf::tensor_index::{
+use llm_shared::auf::reader::{BackendTag, open_from_bytes};
+use llm_shared::auf::section::{TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS};
+use llm_shared::auf::tensor_index::{
     LAYER_IDX_CROSS, TensorDType, TensorEntry, TensorIndex, TensorKind,
 };
-use llm_rs2::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
-use llm_rs2::auf::writer::AufWriter;
-use llm_rs2::auf::{AufMeta, q4_0_aos_to_adreno_soa};
+use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+use llm_shared::auf::writer::AufWriter;
+use llm_shared::auf::{AufMeta, q4_0_aos_to_adreno_soa};
 
 // ── Fixture constants ─────────────────────────────────────────────────────────
 
@@ -392,7 +392,7 @@ fn lm_head_payload_accessors_adreno_soa() {
 /// lm_head_q4_0_payload: vocab_size mismatch → Err(LmHeadShapeMismatch).
 #[test]
 fn shape_mismatch_vocab_returns_err() {
-    use llm_rs2::auf::error::AufError;
+    use llm_shared::auf::error::AufError;
     let aos = make_aos_q4_0_bytes();
     let auf_bytes = build_auf_cpu_aos_with_lm_head(&aos);
     let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
@@ -408,7 +408,7 @@ fn shape_mismatch_vocab_returns_err() {
 /// lm_head_q4_0_payload: hidden_dim mismatch → Err(LmHeadShapeMismatch).
 #[test]
 fn shape_mismatch_hidden_returns_err() {
-    use llm_rs2::auf::error::AufError;
+    use llm_shared::auf::error::AufError;
     let aos = make_aos_q4_0_bytes();
     let auf_bytes = build_auf_cpu_aos_with_lm_head(&aos);
     let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();

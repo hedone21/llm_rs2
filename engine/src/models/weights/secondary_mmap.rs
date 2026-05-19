@@ -23,7 +23,7 @@ use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{GgufFile, ggml_type_to_dtype, tensor_byte_size};
 
 // ── AUF crate imports ──────────────────────────────────────────────────────
-use crate::auf::{
+use llm_shared::auf::{
     AufView, BackendTag,
     section::TAG_WEIGHTS_ADRENO_SOA,
     tensor_index::{LAYER_IDX_CROSS, TensorDType, TensorKind},
@@ -778,7 +778,7 @@ fn is_auf_path(path: &Path) -> bool {
     if let Ok(mut f) = std::fs::File::open(path) {
         use std::io::Read;
         let mut magic = [0u8; 8];
-        if f.read_exact(&mut magic).is_ok() && &magic == crate::auf::header::AUF_MAGIC {
+        if f.read_exact(&mut magic).is_ok() && &magic == llm_shared::auf::header::AUF_MAGIC {
             return true;
         }
     }
@@ -937,16 +937,16 @@ pub fn open_secondary_auf(
 
     // Try each candidate in order. On `WeightsSectionMissing`, fall through to
     // the next candidate. Any other error short-circuits.
-    let mut last_missing: Option<crate::auf::AufError> = None;
+    let mut last_missing: Option<llm_shared::auf::AufError> = None;
     let backend_tag = {
         let mut chosen: Option<BackendTag> = None;
         for tag in &candidates {
-            match crate::auf::reader::open(path, *tag) {
+            match llm_shared::auf::reader::open(path, *tag) {
                 Ok(_view) => {
                     chosen = Some(*tag);
                     break;
                 }
-                Err(e @ crate::auf::AufError::WeightsSectionMissing { .. }) => {
+                Err(e @ llm_shared::auf::AufError::WeightsSectionMissing { .. }) => {
                     last_missing = Some(e);
                     continue;
                 }
@@ -985,7 +985,7 @@ pub fn open_secondary_auf(
     }
 
     // AUF open: full invariant pipeline (INV-132, INV-133, INV-134).
-    let view = crate::auf::reader::open(path, backend_tag).map_err(|e| {
+    let view = llm_shared::auf::reader::open(path, backend_tag).map_err(|e| {
         LoadError::AufInvariantViolation {
             detail: format!("{}  (file: {})", e, path.display()),
         }
@@ -1035,10 +1035,10 @@ pub fn open_secondary_auf(
 /// directly into `SecondaryTensorInfo::offset` — we must **not** add
 /// `weights_section_offset` again (that would cause a double-base OOB panic).
 pub fn build_auf_secondary_from_view(
-    view: crate::auf::AufView,
+    view: llm_shared::auf::AufView,
     primary_config: &ModelConfig,
     path: &Path,
-    backend_tag: crate::auf::BackendTag,
+    backend_tag: llm_shared::auf::BackendTag,
     secondary_dtype_choice: SecondaryDtypeChoice,
 ) -> Result<SecondaryMmap, LoadError> {
     // Determine variant index for the selected backend.
@@ -1296,7 +1296,7 @@ fn check_metadata(primary: &ModelConfig, secondary: &ModelConfig) -> Result<(), 
 /// Validate AUF META against primary `ModelConfig`.
 fn check_auf_metadata(
     primary: &ModelConfig,
-    meta: &crate::auf::AufMeta,
+    meta: &llm_shared::auf::AufMeta,
     path: &Path,
 ) -> Result<(), LoadError> {
     macro_rules! check {
@@ -1516,7 +1516,7 @@ mod tests {
     #[test]
     fn tensor_kind_to_subname_all_variants() {
         use super::tensor_kind_to_subname;
-        use crate::auf::tensor_index::TensorKind;
+        use llm_shared::auf::tensor_index::TensorKind;
         // Layer tensors should map to non-None.
         assert_eq!(
             tensor_kind_to_subname(TensorKind::AttnQ.as_u32()),
@@ -1534,7 +1534,7 @@ mod tests {
     #[test]
     fn auf_dtype_to_engine_round_trip() {
         use super::auf_dtype_to_engine;
-        use crate::auf::tensor_index::TensorDType;
+        use llm_shared::auf::tensor_index::TensorDType;
         use crate::core::buffer::DType;
         assert_eq!(
             auf_dtype_to_engine(TensorDType::Q4_0.as_u32()),
@@ -1555,7 +1555,7 @@ mod tests {
         // The AUF path is tested via open_secondary_auf with a real AufView fixture.
         // This test just exercises the logic branch.
         use super::tensor_kind_to_subname;
-        use crate::auf::tensor_index::TensorKind;
+        use llm_shared::auf::tensor_index::TensorKind;
         // AttnO subname.
         assert_eq!(
             tensor_kind_to_subname(TensorKind::AttnO.as_u32()),
@@ -1571,12 +1571,12 @@ mod tests {
     /// leaves the backing buffer unchanged (read-only semantics).
     #[test]
     fn prefault_layers_auf_subset_no_panic() {
-        use crate::auf::reader::open_from_bytes;
-        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
-        use crate::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
-        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
-        use crate::auf::writer::AufWriter;
-        use crate::auf::{AufMeta, BackendTag};
+        use llm_shared::auf::reader::open_from_bytes;
+        use llm_shared::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use llm_shared::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+        use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use llm_shared::auf::writer::AufWriter;
+        use llm_shared::auf::{AufMeta, BackendTag};
         use crate::models::config::{ModelArch, ModelConfig};
         use crate::models::weights::SecondaryDtypeChoice;
         use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
@@ -1720,12 +1720,12 @@ mod tests {
     /// correctly maps each layer to its own tensor offsets.
     #[test]
     fn prefault_layers_layer_index_byte_ranges_are_disjoint() {
-        use crate::auf::reader::open_from_bytes;
-        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
-        use crate::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
-        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
-        use crate::auf::writer::AufWriter;
-        use crate::auf::{AufMeta, BackendTag};
+        use llm_shared::auf::reader::open_from_bytes;
+        use llm_shared::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use llm_shared::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+        use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use llm_shared::auf::writer::AufWriter;
+        use llm_shared::auf::{AufMeta, BackendTag};
         use crate::models::config::{ModelArch, ModelConfig};
         use crate::models::weights::SecondaryDtypeChoice;
         use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
