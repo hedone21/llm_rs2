@@ -4,6 +4,21 @@
 
 ---
 
+## [P1] Phase 4-4-2.3 — decode_fallback 추출 (~2,260 LOC) — 2026-05-19 backlog 이동
+- **Status**: TODO (4-4-2.1 완료 후 sprint 종료 결정, 본 추출은 backlog로 미룸)
+- **Handoff**: `.agent/todos/handoff_phase4_4_2_sprint_exit_2026_05_19.md` §5
+- **상세**: `bin/generate.rs` L1841~4099 (~2,259 LOC, 4-4-2.2 transition 흡수 포함). 단일 sprint 위험 큼 — 추가 분해 권장: decode prologue / eviction trigger / swap dispatcher / experiment writer.
+- **방향**: G3 LOC-only mechanical move (handoff §2.5 참조). trait 추상화 scope 외.
+- **게이트**: bit-identical 32 tok + avg_tbt n=5 ≤5%.
+- **HEAD**: `1b674bd7` (4-4-2.1 prefill 추출 완료 상태)
+
+## [P2] Phase 4-4-2.4 — post-process 추출 (~206 LOC) — 2026-05-19 backlog 이동
+- **Status**: TODO (4-4-2.3 완료 후 진입)
+- **상세**: `bin/generate.rs` L4101~4307. token decode + final stats + qcf-dump JSON.
+- **Dependencies**: Phase 4-4-2.3
+
+---
+
 ## [P2] llm_rs2 lib clippy 회귀 — doc_lazy_continuation 29건 + unsafe pointer 1건 — 2026-05-18 등록 (Phase 4-D 게이트 도중 발견)
 - **Status**: TODO (Phase 4-D scope 외, 게이트 통과 위해 일시 우회)
 - **증상**: `cargo clippy -p llm_rs2 --lib -- -D warnings` 실패. 30개 deny 처리됨.
