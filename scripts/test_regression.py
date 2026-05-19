@@ -105,7 +105,7 @@ def test_kivi_monotonicity(model_path):
     nlls = {}
     for bits in [2, 4, 8]:
         result, err = run_generate(model_path, [
-            "--kivi", "--kivi-bits", str(bits), "--kivi-residual-size", "32"])
+            "--kv-mode", "kivi", "--kv-kivi-bits", str(bits), "--kv-kivi-residual-len", "32"])
         if not result:
             print(f"  SKIP: Q{bits} failed — {err}")
             return None

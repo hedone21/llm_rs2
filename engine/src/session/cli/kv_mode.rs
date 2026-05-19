@@ -22,11 +22,16 @@ pub struct KvModeArgs {
     #[arg(long = "kv-kivi-residual-len", default_value_t = 128)]
     pub kv_kivi_residual_len: usize,
 
-    /// Offload storage backend: mmap | tmpfs | ... (kv-mode=offload 한정)
+    /// Offload storage backend: raw | disk | mmap | tmpfs | ... (kv-mode=offload 한정)
     #[arg(long = "kv-offload-storage", default_value = "mmap")]
     pub kv_offload_storage: String,
 
-    /// Max prefetch depth for offload (kv-mode=offload 한정)
-    #[arg(long = "kv-max-prefetch-depth", default_value_t = 2)]
+    /// Directory for disk offload files (kv-mode=offload, storage=disk 한정).
+    /// 빈 문자열은 system temp dir 사용.
+    #[arg(long = "kv-offload-path", default_value = "")]
+    pub kv_offload_path: String,
+
+    /// Max adaptive prefetch depth for offload (kv-mode=offload 한정).
+    #[arg(long = "kv-max-prefetch-depth", default_value_t = 128)]
     pub kv_max_prefetch_depth: usize,
 }

@@ -1,4 +1,4 @@
-//! INV-LAYER spec test for KvMode subcommand (S-subcmd C4)
+//! Spec test for KvMode subcommand (S-subcmd C4 / 옵션 C 완료 후).
 
 use clap::Parser;
 use llm_rs2::session::cli::{Args, KvMode};
@@ -46,55 +46,19 @@ fn explicit_offload_parses() {
         "offload",
         "--kv-offload-storage",
         "tmpfs",
+        "--kv-offload-path",
+        "/tmp/kv",
         "--kv-max-prefetch-depth",
         "4",
     ]);
     assert_eq!(args.effective_kv_mode(), KvMode::Offload);
     assert_eq!(args.kv_mode_args.kv_offload_storage, "tmpfs");
+    assert_eq!(args.kv_mode_args.kv_offload_path, "/tmp/kv");
     assert_eq!(args.kv_mode_args.kv_max_prefetch_depth, 4);
 }
 
 #[test]
-fn legacy_kivi_flag_falls_back_to_kivi_mode() {
-    // 기존 --kivi bool flag가 true이면 effective_kv_mode() = Kivi
-    let args = parse(&["--model-path", "/tmp/x.gguf", "--prompt", "hi", "--kivi"]);
-    assert_eq!(args.kv_mode_args.kv_mode, KvMode::Standard);
-    assert_eq!(args.effective_kv_mode(), KvMode::Kivi);
-}
-
-#[test]
-fn legacy_kv_offload_string_falls_back_to_offload_mode() {
-    // 기존 --kv-offload <mode> 가 "none" 이 아니면 effective_kv_mode() = Offload
-    let args = parse(&[
-        "--model-path",
-        "/tmp/x.gguf",
-        "--prompt",
-        "hi",
-        "--kv-offload",
-        "raw",
-    ]);
-    assert_eq!(args.effective_kv_mode(), KvMode::Offload);
-}
-
-#[test]
-fn new_flag_wins_over_legacy() {
-    // --kv-mode offload 가 명시되면 legacy --kivi bool과 무관하게 Offload
-    let args = parse(&[
-        "--model-path",
-        "/tmp/x.gguf",
-        "--prompt",
-        "hi",
-        "--kv-mode",
-        "offload",
-        "--kivi",
-    ]);
-    assert_eq!(args.effective_kv_mode(), KvMode::Offload);
-}
-
-// ── shim sub-args (C4-4b) ────────────────────────────────────────────────────
-
-#[test]
-fn effective_kivi_bits_uses_new_when_kv_mode_kivi() {
+fn effective_kivi_bits_reads_new_field() {
     let args = parse(&[
         "--model-path",
         "/tmp/x.gguf",
@@ -109,21 +73,7 @@ fn effective_kivi_bits_uses_new_when_kv_mode_kivi() {
 }
 
 #[test]
-fn effective_kivi_bits_uses_legacy_when_kivi_flag() {
-    let args = parse(&[
-        "--model-path",
-        "/tmp/x.gguf",
-        "--prompt",
-        "hi",
-        "--kivi",
-        "--kivi-bits",
-        "3",
-    ]);
-    assert_eq!(args.effective_kivi_bits(), 3);
-}
-
-#[test]
-fn effective_kivi_residual_size_uses_new_when_kv_mode_kivi() {
+fn effective_kivi_residual_size_reads_new_field() {
     let args = parse(&[
         "--model-path",
         "/tmp/x.gguf",
@@ -138,21 +88,7 @@ fn effective_kivi_residual_size_uses_new_when_kv_mode_kivi() {
 }
 
 #[test]
-fn effective_kivi_residual_size_uses_legacy_when_kivi_flag() {
-    let args = parse(&[
-        "--model-path",
-        "/tmp/x.gguf",
-        "--prompt",
-        "hi",
-        "--kivi",
-        "--kivi-residual-size",
-        "96",
-    ]);
-    assert_eq!(args.effective_kivi_residual_size(), 96);
-}
-
-#[test]
-fn effective_kv_offload_storage_uses_new_when_kv_mode_offload() {
+fn effective_kv_offload_storage_reads_new_field_when_offload() {
     let args = parse(&[
         "--model-path",
         "/tmp/x.gguf",
@@ -167,38 +103,29 @@ fn effective_kv_offload_storage_uses_new_when_kv_mode_offload() {
 }
 
 #[test]
-fn effective_kv_offload_storage_uses_legacy_when_kv_offload_string() {
-    let args = parse(&[
-        "--model-path",
-        "/tmp/x.gguf",
-        "--prompt",
-        "hi",
-        "--kv-offload",
-        "mmap",
-    ]);
-    assert_eq!(args.effective_kv_offload_storage(), "mmap");
-}
-
-// ── deprecation_warnings (C5/C6 옵션 B) ──────────────────────────────────────
-
-#[test]
-fn deprecation_warnings_empty_when_no_legacy_flag() {
+fn effective_kv_offload_storage_empty_when_not_offload() {
     let args = parse(&["--model-path", "/tmp/x.gguf", "--prompt", "hi"]);
-    assert!(args.deprecation_warnings().is_empty());
+    assert_eq!(args.effective_kv_offload_storage(), "");
 }
 
 #[test]
-fn deprecation_warnings_emitted_when_kivi_legacy_flag_set() {
-    let args = parse(&["--model-path", "/tmp/x.gguf", "--prompt", "hi", "--kivi"]);
-    let warnings = args.deprecation_warnings();
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("--kivi is deprecated"));
-    assert!(warnings[0].contains("--kv-mode kivi"));
+fn legacy_kivi_flag_no_longer_parses() {
+    // 옵션 C 후: `--kivi` 같은 legacy flag는 clap parse error.
+    let result = Args::try_parse_from([
+        "generate",
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kivi",
+    ]);
+    assert!(result.is_err(), "legacy --kivi must error after 옵션 C");
 }
 
 #[test]
-fn deprecation_warnings_emitted_when_kv_offload_legacy_used() {
-    let args = parse(&[
+fn legacy_kv_offload_flag_no_longer_parses() {
+    let result = Args::try_parse_from([
+        "generate",
         "--model-path",
         "/tmp/x.gguf",
         "--prompt",
@@ -206,22 +133,8 @@ fn deprecation_warnings_emitted_when_kv_offload_legacy_used() {
         "--kv-offload",
         "mmap",
     ]);
-    let warnings = args.deprecation_warnings();
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("--kv-offload is deprecated"));
-    assert!(warnings[0].contains("--kv-offload-storage mmap"));
-}
-
-#[test]
-fn deprecation_warnings_silent_when_new_kv_mode_offload_used() {
-    // --kv-mode offload만 명시. legacy `--kv-offload`는 기본값 "none" → 경고 없음.
-    let args = parse(&[
-        "--model-path",
-        "/tmp/x.gguf",
-        "--prompt",
-        "hi",
-        "--kv-mode",
-        "offload",
-    ]);
-    assert!(args.deprecation_warnings().is_empty());
+    assert!(
+        result.is_err(),
+        "legacy --kv-offload must error after 옵션 C"
+    );
 }

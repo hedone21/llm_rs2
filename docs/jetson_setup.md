@@ -165,6 +165,6 @@ ssh -p 4121 nvidia@<host> 'pkill -f llm_manager; rm -f /tmp/llm_resilience.sock'
   - CUDA: Decode 26.0 tok/s, Prefill 140.6 tok/s
 - 추가 검증된 기능 (CUDA):
   - Eviction (`eviction h2o` / `streaming`): 23.5–23.7 tok/s
-  - KIVI Q2 (`--kivi`): 23.5 tok/s, **6.8× KV 압축**
+  - KIVI Q2 (`--kv-mode kivi`): 23.5 tok/s, **6.8× KV 압축**
   - Tensor Partition (`--tensor-partition 0.5 --zero-copy`): 21.7 tok/s, 32 weights split
   - Resilience (`--enable-resilience` + manager unix socket): 24.0 tok/s, Throttle directive 양방향 통신 확인

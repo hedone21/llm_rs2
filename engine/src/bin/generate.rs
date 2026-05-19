@@ -93,10 +93,6 @@ fn main() -> anyhow::Result<()> {
     #[allow(unused_mut)]
     let mut args = Args::parse();
 
-    for warning in args.deprecation_warnings() {
-        eprintln!("{}", warning);
-    }
-
     let ctx = llm_rs2::session::init::SessionInitCtx::build(&args)?;
 
     // Unpack ctx fields for use in the rest of main()
@@ -488,10 +484,10 @@ fn main() -> anyhow::Result<()> {
                     other
                 ),
             };
-            let disk_dir = if args.offload_path.is_empty() {
+            let disk_dir = if args.kv_mode_args.kv_offload_path.is_empty() {
                 None
             } else {
-                Some(std::path::PathBuf::from(&args.offload_path))
+                Some(std::path::PathBuf::from(&args.kv_mode_args.kv_offload_path))
             };
             build_chat_offload(ChatOffloadArgs {
                 backend: backend.clone(),
@@ -504,7 +500,7 @@ fn main() -> anyhow::Result<()> {
                 kv_dtype: offload_kv_dtype,
                 offload_mode: args.effective_kv_offload_storage(),
                 disk_dir,
-                max_prefetch_depth: args.max_prefetch_depth,
+                max_prefetch_depth: args.kv_mode_args.kv_max_prefetch_depth,
             })?
         } else {
             build_chat_standard(ChatStandardArgs {
@@ -774,8 +770,8 @@ fn main() -> anyhow::Result<()> {
             &args.backend,
             &kv_offload_storage,
             &args.kv_type,
-            args.max_prefetch_depth,
-            &args.offload_path,
+            args.kv_mode_args.kv_max_prefetch_depth,
+            &args.kv_mode_args.kv_offload_path,
             &mut command_executor,
             args.throttle_delay_ms,
         );

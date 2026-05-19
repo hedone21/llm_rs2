@@ -379,9 +379,9 @@ KV 캐시를 Q2/Q4/Q8로 양자화하여 메모리를 절약한다. eviction 정
 ```bash
 ./target/release/generate\
   -m models/qwen2.5-1.5b\
-  --kivi\
-  --kivi-bits 2\
-  --kivi-residual-size 32\
+  --kv-mode kivi\
+  --kv-kivi-bits 2\
+  --kv-kivi-residual-len 32\
   --prompt "Once upon a time"\
   -n 200
 ```
@@ -391,9 +391,9 @@ KV 캐시를 Q2/Q4/Q8로 양자화하여 메모리를 절약한다. eviction 정
 ```bash
 ./target/release/generate\
   -m models/qwen2.5-1.5b\
-  --kivi\
-  --kivi-bits 4\
-  --kivi-residual-size 64\
+  --kv-mode kivi\
+  --kv-kivi-bits 4\
+  --kv-kivi-residual-len 64\
   --prompt "Once upon a time"\
   -n 200
 ```
@@ -403,8 +403,8 @@ KV 캐시를 Q2/Q4/Q8로 양자화하여 메모리를 절약한다. eviction 정
 ```bash
 ./target/release/generate\
   -m models/qwen2.5-1.5b\
-  --kivi\
-  --kivi-bits 2\
+  --kv-mode kivi\
+  --kv-kivi-bits 2\
   --eval-ll\
   --eval-batch data.json\
   --greedy
@@ -415,8 +415,8 @@ KV 캐시를 Q2/Q4/Q8로 양자화하여 메모리를 절약한다. eviction 정
 ```bash
 ./target/release/generate\
   -m models/qwen2.5-1.5b\
-  --kivi\
-  --kivi-bits 2\
+  --kv-mode kivi\
+  --kv-kivi-bits 2\
   --ppl experiments/prompts/prefill_1024.txt
 ```
 
@@ -429,8 +429,8 @@ PPL 평가나 eval-ll과 함께 사용하여 양자화 품질을 정량화한다
 ```bash
 ./target/release/generate\
   -m models/qwen2.5-1.5b\
-  --kivi\
-  --kivi-bits 2\
+  --kv-mode kivi\
+  --kv-kivi-bits 2\
   --awqe\
   --ppl experiments/prompts/prefill_1024.txt
 ```
@@ -881,11 +881,11 @@ KV cache를 디스크 또는 인메모리 raw 모드로 오프로드하여 DRAM 
 |------|------|
 | `none` | 오프로드 없음 (기본값) |
 | `raw` | 인메모리 raw 버퍼로 오프로드 |
-| `disk` | 파일 기반 오프로드 (`--offload-path` 디렉토리 사용) |
+| `disk` | 파일 기반 오프로드 (`--kv-offload-path` 디렉토리 사용) |
 
 **전제조건**
 
-`--kv-offload`는 `--kv-layout seq`와 `--kv-type f16` 또는 `--kv-type f32` 조합이 필요하다.
+`--kv-mode offload`는 `--kv-layout seq`와 `--kv-type f16` 또는 `--kv-type f32` 조합이 필요하다.
 
 **디스크 오프로드 예제**
 
@@ -895,18 +895,18 @@ generate\
   --backend opencl\
   --kv-layout seq\
   --kv-type f16\
-  --kv-offload disk\
-  --offload-path /tmp/kv_cache\
+  --kv-mode offload --kv-offload-storage disk\
+  --kv-offload-path /tmp/kv_cache\
   --prompt "Long context prompt..."\
   -n 256
 ```
 
-`--offload-path`를 생략하면 시스템 임시 디렉토리(`/tmp/llm_rs2_kv_offload`)를 사용한다.
+`--kv-offload-path`를 생략하면 시스템 임시 디렉토리(`/tmp/llm_rs2_kv_offload`)를 사용한다.
 
 **prefetch 깊이 조정**
 
 ```bash
---max-prefetch-depth 8
+--kv-max-prefetch-depth 8
 ```
 
 기본값은 `4`다. 값이 클수록 더 많은 레이어를 미리 로드하여 latency를 숨기지만
@@ -917,7 +917,7 @@ generate\
 | 값 | 설명 |
 |----|------|
 | `head` | Head-major 레이아웃 (기본값). 일반 추론 권장. |
-| `seq` | Seq-major 레이아웃. `--kv-offload` 사용 시 필수. |
+| `seq` | Seq-major 레이아웃. `--kv-mode offload` 사용 시 필수. |
 
 ---
 
@@ -1034,7 +1034,7 @@ socket / TCP listener를 병행해 외부 프로세스에서 프롬프트를 주
 **지원 아키텍처**: Llama 3.2 Instruct (`<|begin_of_text|>`, `<|eot_id|>`),
 Qwen2 (`<|im_start|>...<|im_end|>`). Gemma3는 현재 미지원 — 템플릿 준비되지 않음.
 
-**호환 경로**: standard (기본 KVCache) / `--kivi` / `--kv-offload` / `eviction <policy>` subcommand
+**호환 경로**: standard (기본 KVCache) / `--kv-mode kivi` / `--kv-mode offload` / `eviction <policy>` subcommand
 중 하나. 상호 배타이며, 아래와는 같이 쓸 수 없다:
 `--eval-ll`, `--ppl`, `--prompt-batch`, `--eval-batch`, `--tensor-partition`,
 `--cuda-graph`, `--dump-importance`, `--experiment-schedule`.
@@ -1182,7 +1182,7 @@ print(reply.decode("utf-8", errors="replace"))
 
 ```bash
 # KIVI 양자화 KV + 소켓
-generate ... --chat --kivi --kv-quant-bits 4 --chat-socket /tmp/llm_chat.sock -n 256
+generate ... --chat --kv-mode kivi --kv-kivi-bits 4 --chat-socket /tmp/llm_chat.sock -n 256
 
 # Sliding window eviction + TCP
 generate ... --chat\
@@ -1200,7 +1200,7 @@ generate ... --chat\
 
 - **`--chat is incompatible with --X`**: v1 호환 경로만 허용. `--tensor-partition`,
   `--cuda-graph`, `--dump-importance`, 실험/배치 모드는 모두 제외된다.
-- **`--chat: --kivi and --kv-offload are mutually exclusive`**: 둘 중 하나만.
+- **`--chat: --kv-mode kivi and offload are mutually exclusive`**: 둘 중 하나만.
 - **소켓이 안 열림**: `/tmp/llm_chat.sock`이 다른 프로세스에 의해 잡혀 있거나
   권한 문제. 엔진은 바인드 전에 `remove_file`을 시도한다.
 - **TCP 바인드 실패**: 포트 점유. `127.0.0.1:0`으로 자동 할당을 쓰고 stderr 로그로
@@ -2346,9 +2346,9 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 | `--max-seq-len` | 2048 | 최대 시퀀스 길이 |
 | `--initial-kv-capacity` | 0 | 초기 KV 캐시 용량 토큰 수 (0=auto: prompt 길이 2의 거듭제곱, min 128) |
 | `--memory-threshold-mb` | 256 | eviction 트리거 메모리 임계값 (MB) |
-| `--kv-offload` | `none` | KV 캐시 오프로드 모드: `none`, `raw`, `disk` |
-| `--offload-path` | 시스템 임시 디렉토리 | disk offload 파일 디렉토리 (`--kv-offload disk` 시 사용) |
-| `--max-prefetch-depth` | 4 | offload KV 캐시 적응형 prefetch 깊이 (높을수록 latency 감소, 메모리 증가) |
+| `--kv-mode offload --kv-offload-storage <mode>` | (offload 비활성) | KV 캐시 오프로드 storage: `raw`, `disk`, `mmap`, `tmpfs` |
+| `--kv-offload-path` | 시스템 임시 디렉토리 | disk offload 파일 디렉토리 (`--kv-mode offload --kv-offload-storage disk` 시 사용) |
+| `--kv-max-prefetch-depth` | 128 | offload KV 캐시 적응형 prefetch 깊이 (높을수록 latency 감소, 메모리 증가) |
 
 ### Eviction 정책
 
@@ -2384,9 +2384,9 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--kivi` | false | Q2 KV 압축 활성화 (eviction과 상호배타) |
-| `--kivi-bits` | 2 | 양자화 비트폭 (2, 4, 8) |
-| `--kivi-residual-size` | 32 | 잔여 버퍼 크기 (32의 배수) |
+| `--kv-mode kivi` | (kivi 비활성) | KIVI Q2/Q4/Q8 KV 압축 활성화 (eviction과 상호배타) |
+| `--kv-kivi-bits` | 2 | 양자화 비트폭 (2, 4, 8) |
+| `--kv-kivi-residual-len` | 128 | 잔여 버퍼 크기 (32의 배수) |
 | `--kv-dynamic-quant` | false | 동적 KV 양자화 (Resilience 연동) |
 | `--awqe` | false | AWQE + AW-VOPR 품질 메트릭 활성화 |
 
@@ -2440,7 +2440,7 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--chat` | false | 멀티턴 REPL 진입. Llama Instruct / Qwen2 전용. standard / `--kivi` / `--kv-offload` / `eviction <policy>` subcommand 중 하나와만 호환 |
+| `--chat` | false | 멀티턴 REPL 진입. Llama Instruct / Qwen2 전용. standard / `--kv-mode kivi` / `--kv-mode offload` / `eviction <policy>` subcommand 중 하나와만 호환 |
 | `--system-prompt` | — | 세션 시작 시 프리필되는 system 턴 문자열 |
 | `--chat-socket` | — | Unix domain socket 경로. newline-delimited 입력, 응답 바이트 스트리밍 + `0x04` EOT 종결 (Unix 전용) |
 | `--chat-tcp` | — | TCP listen 주소(예: `127.0.0.1:7878`, `127.0.0.1:0`). `--chat-socket`과 동시 사용 가능 |

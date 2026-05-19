@@ -319,7 +319,7 @@ classDiagram
 
 ```mermaid
 flowchart TD
-    A[generate.rs main\n--eval-ll or --kivi-eval-ll] --> B{캐시 타입?}
+    A[generate.rs main\n--eval-ll] --> B{캐시 타입?}
     B -->|KVCache| C[EvictionHook 생성\nCacheManager + ScoreAccumulator]
     B -->|KiviCache| D[KiviHook 생성\nflush_count=0]
     C --> E[run_eval_ll_generic&lt;KVCache&gt;]

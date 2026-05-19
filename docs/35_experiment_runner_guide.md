@@ -334,8 +334,8 @@ generate --model-path <path> --prompt "..." -n 128\
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--kivi` | false | Q2 KV 압축 활성화. eviction과 상호배타 |
-| `--kivi-residual-size` | 32 | 잔여 버퍼 크기 (32의 배수) |
+| `--kv-mode kivi` | (kivi 비활성) | KIVI Q2/Q4/Q8 KV 압축 활성화. eviction과 상호배타 |
+| `--kv-kivi-residual-len` | 128 | 잔여 버퍼 크기 (32의 배수) |
 
 ### QCF
 
