@@ -34,7 +34,7 @@
 - greedy off (sampling on) → 정상 (D, noise로 일부 탈출)
 - rep_penalty/system_prompt 단독 영향 없음
 
-**해결책**: `Qwen2.5-1.5B-Instruct` variant 사용 (HuggingFace `Qwen/Qwen2.5-1.5B-Instruct`). Task #29에서 다운로드/변환/검증 진행 중.
+**해결책**: `Qwen2.5-1.5B-Instruct` variant 사용 (HuggingFace `Qwen/Qwen2.5-1.5B-Instruct`). **2026-05-19 S25 검증 PASS**: 같은 baseline binary + 같은 OpenCL path + 모델만 교체 → chat 1턴 "Paris is the capital of France." 정상 응답. non-chat sanity 30.36 ms/tok. GGUF: `models/qwen2.5-1.5b-instruct/qwen2.5-1.5b-instruct-q4_0.gguf` (1154.8 MB).
 
 **config 차이 (base vs Instruct)**:
 - base: `eos_token_id: 151643` (`<|endoftext|>`)
