@@ -24,7 +24,7 @@ use llm_rs2::layers::workspace::{
 };
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
-use llm_rs2::session::cli::{Args, parse_qcf_sample_layers};
+use llm_rs2::session::cli::{Args, KvMode, parse_qcf_sample_layers};
 use llm_rs2::session::eval::load_eval_questions;
 use llm_rs2::session::ppl::run_kivi_ppl;
 use llm_rs2::session::qcf_runtime::{
@@ -247,7 +247,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // ── KIVI + eval-ll mode: KiviCache with log-likelihood evaluation ──
-    if args.kivi && args.eval_ll {
+    if matches!(args.effective_kv_mode(), KvMode::Kivi) && args.eval_ll {
         let questions = load_eval_questions(&args, &prompt)?;
         let vocab_size = model.config.vocab_size;
         let hidden_size = model.config.hidden_size;
@@ -341,7 +341,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── KIVI + PPL mode: KiviCache with perplexity evaluation ──
-    if args.kivi
+    if matches!(args.effective_kv_mode(), KvMode::Kivi)
         && let Some(ref ppl_path) = args.ppl
     {
         return run_kivi_ppl(
@@ -455,7 +455,7 @@ fn main() -> anyhow::Result<()> {
             repetition_penalty: args.repetition_penalty,
             repetition_window: args.repetition_window,
         };
-        let kv_offload_active = !args.kv_offload.is_empty() && args.kv_offload != "none";
+        let kv_offload_active = matches!(args.effective_kv_mode(), KvMode::Offload);
 
         // config 값을 Arc::new(model) 전에 추출 (move 후 접근 불가).
         let model_arch = model.config.arch;
@@ -463,7 +463,7 @@ fn main() -> anyhow::Result<()> {
         let vocab_size = model.config.vocab_size;
         let model_arc = Arc::new(model);
 
-        let mut session = if args.kivi {
+        let mut session = if matches!(args.effective_kv_mode(), KvMode::Kivi) {
             build_chat_kivi(ChatKiviArgs {
                 backend: backend.clone(),
                 memory: memory.clone(),
@@ -706,11 +706,15 @@ fn main() -> anyhow::Result<()> {
 
     // ── KIVI mode: separate path with KiviCache ──
     // Placed after executor creation so resilience is available in the token loop.
-    if args.kivi || args.kv_dynamic_quant {
+    if matches!(args.effective_kv_mode(), KvMode::Kivi) || args.kv_dynamic_quant {
         // KIVI mode: --kivi starts at Q2, --kv-dynamic-quant starts at bits=16
         // (F16-equivalent) and allows runtime transition via kv_quant_dynamic.
         // Note: --enable-resilience alone stays on main path (F16 KVCache + eviction).
-        let initial_bits: u8 = if args.kivi { args.kivi_bits } else { 16 };
+        let initial_bits: u8 = if matches!(args.effective_kv_mode(), KvMode::Kivi) {
+            args.kivi_bits
+        } else {
+            16
+        };
         let residual_size = if initial_bits == 16 {
             // bits=16: all tokens stay in residual (no quantization flush)
             // Round down to QKKV (32) multiple for KiviCache alignment
@@ -748,7 +752,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Offload mode: separate path with OffloadKVCache ──
     // Placed after executor creation so resilience is available in the decode loop.
-    if args.kv_offload != "none" {
+    if matches!(args.effective_kv_mode(), KvMode::Offload) {
         return run_offload(
             &model,
             &tokenizer,

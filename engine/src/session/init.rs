@@ -8,7 +8,7 @@ use crate::core::rss_trace::{dump_smaps, io_trace, rss_trace};
 use crate::core::sampling::SamplingConfig;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
-use crate::session::cli::Args;
+use crate::session::cli::{Args, KvMode};
 
 /// Session 초기화 컨텍스트 (Phase 4-1 외곽 추출).
 ///
@@ -117,12 +117,12 @@ impl SessionInitCtx {
         // Standard / kivi / offload paths are each supported; experiment/eval
         // modes and advanced GPU features remain incompatible.
         if args.chat {
-            let kv_offload_active = !args.kv_offload.is_empty() && args.kv_offload != "none";
+            let kv_offload_active = matches!(args.effective_kv_mode(), KvMode::Offload);
             let has_eviction = args.eviction_policy() != "none";
-            if args.kivi && kv_offload_active {
+            if matches!(args.effective_kv_mode(), KvMode::Kivi) && kv_offload_active {
                 anyhow::bail!("--chat: --kivi and --kv-offload are mutually exclusive");
             }
-            if args.kivi && has_eviction {
+            if matches!(args.effective_kv_mode(), KvMode::Kivi) && has_eviction {
                 anyhow::bail!(
                     "--chat: --kivi cannot combine with --eviction-policy in v1 (pick one)"
                 );
