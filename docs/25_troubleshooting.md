@@ -331,9 +331,9 @@ Llama 3.2 1B 모델 기준 대략적인 메모리 사용량:
 1. **KV cache eviction 활성화**: 긴 시퀀스를 생성할 때는 sliding window eviction을 사용하여 KV cache 크기를 제한합니다:
 
 ```bash
-./generate --model-path models/llama3.2-1b \
-  --prompt "Hello" -n 500 \
-  --eviction-policy sliding --eviction-window 256
+./generate --model-path models/llama3.2-1b\
+  --prompt "Hello" -n 500\
+  eviction sliding --window 256
 ```
 
 2. **Resilience Manager 활용**: `--enable-resilience` 플래그로 D-Bus 메모리 압박 신호에 따른 자동 eviction을 활성화합니다 (feature: `resilience` 필요).
@@ -430,7 +430,7 @@ D-Bus System Bus에 접근할 수 없는 주된 이유:
 systemctl status dbus
 
 # System Bus 접근 테스트
-dbus-send --system --dest=org.freedesktop.DBus \
+dbus-send --system --dest=org.freedesktop.DBus\
   /org/freedesktop/DBus org.freedesktop.DBus.ListNames
 ```
 
@@ -527,13 +527,13 @@ assert_eq!(Level::from_dbus_str("Normal"), None); // case-sensitive
 
 ```bash
 # 올바른 예
-dbus-send --system --type=signal \
-  /org/llm/Manager1 org.llm.Manager1.MemoryPressure \
+dbus-send --system --type=signal\
+  /org/llm/Manager1 org.llm.Manager1.MemoryPressure\
   string:"critical" uint64:1073741824 uint64:536870912
 
 # 잘못된 예 - "Critical"은 파싱 실패
-dbus-send --system --type=signal \
-  /org/llm/Manager1 org.llm.Manager1.MemoryPressure \
+dbus-send --system --type=signal\
+  /org/llm/Manager1 org.llm.Manager1.MemoryPressure\
   string:"Critical" uint64:1073741824 uint64:536870912
 ```
 

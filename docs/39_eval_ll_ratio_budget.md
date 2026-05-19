@@ -68,8 +68,8 @@ prompt 800 토큰에 ratio=0.4이면 first_chunk=320, 나머지 480 토큰은 1-
 
 ```
 # 모든 question에서 prompt의 40%만 KV cache에 유지
-generate --eval-ll --eval-batch batch.json \
-  --eviction-policy h2o --kv-budget-ratio 0.4
+generate --eval-ll --eval-batch batch.json\
+  --kv-budget-ratio 0.4 eviction h2o
 
 # question A (prompt 800 tok) → effective_budget = 320
 # question B (prompt 1600 tok) → effective_budget = 640
@@ -82,7 +82,7 @@ generate --eval-ll --eval-batch batch.json \
 
 ## 수용 기준
 
-- [x] `--kv-budget-ratio 0.4 --eviction-policy h2o`로 eval-ll 실행 시, prompt 길이에 비례한 eviction 발생
+- [x] `--kv-budget-ratio 0.4 eviction h2o`로 eval-ll 실행 시, prompt 길이에 비례한 eviction 발생 (마이그레이션 후 표준 형태)
 - [x] 동일 ratio에서 prompt 길이가 다른 question들의 유지율이 일정 (±1 token 허용)
 - [x] per-question JSON에 `effective_budget` 필드가 실제 적용값을 반영
 - [x] `--kv-budget` (절대값) 모드의 기존 동작에 영향 없음

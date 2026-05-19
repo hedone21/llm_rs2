@@ -50,10 +50,10 @@ def generate_prompt_file(filename, approx_tokens):
     chars_needed = approx_tokens * 4
     repeats = int(chars_needed / len(seed)) + 1
     content = seed * repeats
-    
+
     # Trim to approx size to be safe (though tokenizer varies)
     content = content[:chars_needed]
-    
+
     with open(filename, 'w') as f:
         f.write(content)
     print(f"[Gen] Created {filename} (~{approx_tokens} tokens)")
@@ -64,14 +64,14 @@ def build_project(dry_run=False):
 
 def push_artifacts(dry_run=False):
     print("[Push] Pushing artifacts to device...")
-    
+
     # Push binary
     run_command(f"adb push {GENERATE_BIN_LOCAL} {GENERATE_BIN_REMOTE}", dry_run=dry_run)
     run_command(f"adb shell chmod +x {GENERATE_BIN_REMOTE}", dry_run=dry_run)
-    
+
     # Create remote eval dir
     run_command(f"adb shell mkdir -p {EVAL_DIR}", dry_run=dry_run)
-    
+
     # Push all locally generated prompt files
     run_command(f"adb push experiments/prompts/prefill_*.txt {EVAL_DIR}/", dry_run=dry_run)
     run_command(f"adb push experiments/prompts/short_len.txt {EVAL_DIR}/", dry_run=dry_run)
@@ -82,8 +82,8 @@ def run_suite(args):
     # Synthetic prefill lengths
     synthetic_prefills = [128, 512, 1024]
     # Existing prompt files
-    existing_prompts = ["short_len"] 
-    
+    existing_prompts = ["short_len"]
+
     decode_lengths = [128, 256]
 
     # Eviction policies to test
@@ -91,7 +91,7 @@ def run_suite(args):
         eviction_policies = ["none"]
     else:
         eviction_policies = ["none", "sliding"]
-    
+
     total_runs = len(backends) * (len(synthetic_prefills) + len(existing_prompts)) * len(decode_lengths) * len(eviction_policies)
     current_run = 0
 
@@ -102,22 +102,26 @@ def run_suite(args):
         # 1. Run Synthetic
         for prefill in synthetic_prefills:
             prompt_file_remote = f"{EVAL_DIR}/prefill_{prefill}.txt"
-            
+
             for decode in decode_lengths:
               for eviction in eviction_policies:
                 current_run += 1
                 eviction_label = f", Eviction={eviction}" if eviction != "none" else ""
                 print(f"\n[Suite] Run {current_run}/{total_runs}: Backend={backend}, Prefill={prefill}, Decode={decode}{eviction_label}")
-                
+
                 eviction_flags = ""
                 if eviction != "none":
-                    eviction_flags = (
-                        f" --eviction-policy {eviction}"
-                        f" --eviction-window {args.eviction_window}"
-                        f" --memory-threshold-mb {args.memory_threshold}"
-                    )
+                    # EvictionCommonArgs (`--memory-threshold-mb`, `--protected-prefix`)
+                    # must precede the `eviction <policy>` subcommand; `--window` is
+                    # sliding-only (S-subcmd C8, 2026-05-19).
+                    subcmd = eviction.replace("_", "-")  # h2o_plus → h2o-plus
+                    prefix = f" --memory-threshold-mb {args.memory_threshold}"
                     if args.protected_prefix > 0:
-                        eviction_flags += f" --protected-prefix {args.protected_prefix}"
+                        prefix += f" --protected-prefix {args.protected_prefix}"
+                    suffix = f" eviction {subcmd}"
+                    if eviction == "sliding":
+                        suffix += f" --window {args.eviction_window}"
+                    eviction_flags = prefix + suffix
 
                 device_cmd = (
                     f"{GENERATE_BIN_REMOTE} "
@@ -127,13 +131,13 @@ def run_suite(args):
                     f"-b {backend}"
                     f"{eviction_flags}"
                 )
-                
+
                 profile_cmd = (
                     f"python3 scripts/android_profile.py "
                     f"--cmd '{device_cmd}' "
                     f"--output-dir {results_dir} "
                 )
-                
+
                 run_command(profile_cmd, check=False, dry_run=args.dry_run)
                 if not args.dry_run:
                      time.sleep(2)
@@ -141,22 +145,26 @@ def run_suite(args):
         # 2. Run Existing Prompts
         for prompt_name in existing_prompts:
             prompt_file_remote = f"{EVAL_DIR}/{prompt_name}.txt"
-            
+
             for decode in decode_lengths:
               for eviction in eviction_policies:
                 current_run += 1
                 eviction_label = f", Eviction={eviction}" if eviction != "none" else ""
                 print(f"\n[Suite] Run {current_run}/{total_runs}: Backend={backend}, Prefill={prompt_name}, Decode={decode}{eviction_label}")
-                
+
                 eviction_flags = ""
                 if eviction != "none":
-                    eviction_flags = (
-                        f" --eviction-policy {eviction}"
-                        f" --eviction-window {args.eviction_window}"
-                        f" --memory-threshold-mb {args.memory_threshold}"
-                    )
+                    # EvictionCommonArgs (`--memory-threshold-mb`, `--protected-prefix`)
+                    # must precede the `eviction <policy>` subcommand; `--window` is
+                    # sliding-only (S-subcmd C8, 2026-05-19).
+                    subcmd = eviction.replace("_", "-")  # h2o_plus → h2o-plus
+                    prefix = f" --memory-threshold-mb {args.memory_threshold}"
                     if args.protected_prefix > 0:
-                        eviction_flags += f" --protected-prefix {args.protected_prefix}"
+                        prefix += f" --protected-prefix {args.protected_prefix}"
+                    suffix = f" eviction {subcmd}"
+                    if eviction == "sliding":
+                        suffix += f" --window {args.eviction_window}"
+                    eviction_flags = prefix + suffix
 
                 device_cmd = (
                     f"{GENERATE_BIN_REMOTE} "
@@ -166,13 +174,13 @@ def run_suite(args):
                     f"-b {backend}"
                     f"{eviction_flags}"
                 )
-                
+
                 profile_cmd = (
                     f"python3 scripts/android_profile.py "
                     f"--cmd '{device_cmd}' "
                     f"--output-dir {results_dir} "
                 )
-                
+
                 run_command(profile_cmd, check=False, dry_run=args.dry_run)
                 if not args.dry_run:
                      time.sleep(2)
@@ -184,7 +192,7 @@ def main():
     parser.add_argument("--skip-push", action="store_true", help="Skip adb push")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running")
     parser.add_argument("--skip-eviction", action="store_true", help="Skip eviction policy runs (only test none)")
-    parser.add_argument("--eviction-window", type=int, default=1024, help="Eviction window size (tokens)")
+    parser.add_argument("--window", type=int, default=1024, help="Eviction window size (tokens)")
     parser.add_argument("--protected-prefix", type=int, default=0, help="Protected prefix tokens")
     parser.add_argument("--memory-threshold", type=int, default=256, help="Memory threshold (MB)")
     args = parser.parse_args()

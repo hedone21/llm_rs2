@@ -647,11 +647,13 @@ def phase_memory(monitor, args, timestamp):
 
         eviction_flags = ""
         if t["eviction"] != "none":
-            eviction_flags = (
-                f" --eviction-policy {t['eviction']}"
-                f" --eviction-window {t['window']}"
-                f" --memory-threshold-mb 256"
-            )
+            # S-subcmd C8 (2026-05-19): EvictionCommonArgs precedes the
+            # `eviction <policy>` subcommand; `--window` is sliding-only.
+            subcmd = t["eviction"].replace("_", "-")
+            eviction_flags = " --memory-threshold-mb 256"
+            eviction_flags += f" eviction {subcmd}"
+            if t["eviction"] == "sliding":
+                eviction_flags += f" --window {t['window']}"
 
         device_cmd = (
             f"{GENERATE_BIN_REMOTE} --model-path {MODEL_PATH} "
@@ -883,13 +885,15 @@ def phase_quality(monitor, args, timestamp):
 
         eviction_flags = ""
         if t["eviction"] != "none":
-            eviction_flags = (
-                f" --eviction-policy {t['eviction']}"
-                f" --eviction-window {t['window']}"
-                f" --memory-threshold-mb 256"
-            )
+            # S-subcmd C8 (2026-05-19): EvictionCommonArgs precedes the
+            # `eviction <policy>` subcommand; `--window` is sliding-only.
+            subcmd = t["eviction"].replace("_", "-")
+            eviction_flags = " --memory-threshold-mb 256"
             if t["prefix"] is not None:
                 eviction_flags += f" --protected-prefix {t['prefix']}"
+            eviction_flags += f" eviction {subcmd}"
+            if t["eviction"] == "sliding":
+                eviction_flags += f" --window {t['window']}"
 
         device_cmd = (
             f"{GENERATE_BIN_REMOTE} --model-path {MODEL_PATH} "
@@ -1087,7 +1091,7 @@ def phase_resilience(monitor, args, timestamp):
             "generate_flags": (
                 f"--prompt-file {EVAL_DIR}/prefill_512.txt "
                 "-n 512 -b opencl --max-seq-len 2048 "
-                "--eviction-policy h2o --h2o-recent-window 128 --h2o-keep-ratio 0.5"
+                "eviction h2o --keep-ratio 0.5"
             ),
             "timeout": 180,
             "expect_evictions": True,
@@ -1124,7 +1128,7 @@ def phase_resilience(monitor, args, timestamp):
             "generate_flags": (
                 f"--prompt-file {EVAL_DIR}/prefill_512.txt "
                 "-n 1024 -b opencl --max-seq-len 2048 "
-                "--eviction-policy h2o --h2o-recent-window 128 --h2o-keep-ratio 0.5"
+                "eviction h2o --keep-ratio 0.5"
             ),
             "timeout": 300,
             "expect_evictions": True,

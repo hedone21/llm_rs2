@@ -99,13 +99,13 @@ python scripts/run_device.py -d jetson --skip-build --skip-exec generate
 
 ```bash
 # 호스트에서 manager 크로스 빌드 (default features = dbus + lua)
-PATH="$HOME/.cargo/bin:$PATH" cargo zigbuild --release \
+PATH="$HOME/.cargo/bin:$PATH" cargo zigbuild --release\
     --target aarch64-unknown-linux-gnu.2.31 --bin llm_manager
 
 # 바이너리 + lua policy 보드로 전송
-scp -P 4121 target/aarch64-unknown-linux-gnu/release/llm_manager \
+scp -P 4121 target/aarch64-unknown-linux-gnu/release/llm_manager\
     nvidia@<host>:/home/nvidia/llm_rs2/llm_manager
-scp -P 4121 manager/scripts/policy_default.lua \
+scp -P 4121 manager/scripts/policy_default.lua\
     nvidia@<host>:/home/nvidia/llm_rs2/policy_default.lua
 ```
 
@@ -114,19 +114,19 @@ scp -P 4121 manager/scripts/policy_default.lua \
 ### 2) Manager 백그라운드 실행
 
 ```bash
-ssh -p 4121 nvidia@<host> 'pkill -f llm_manager; rm -f /tmp/llm_resilience.sock /tmp/manager.log; \
-    nohup env LD_LIBRARY_PATH=/usr/local/cuda/lib64 RUST_LOG=info \
-    /home/nvidia/llm_rs2/llm_manager \
-    -t unix:/tmp/llm_resilience.sock --client-timeout 120 \
-    --policy-script /home/nvidia/llm_rs2/policy_default.lua \
+ssh -p 4121 nvidia@<host> 'pkill -f llm_manager; rm -f /tmp/llm_resilience.sock /tmp/manager.log;\
+    nohup env LD_LIBRARY_PATH=/usr/local/cuda/lib64 RUST_LOG=info\
+    /home/nvidia/llm_rs2/llm_manager\
+    -t unix:/tmp/llm_resilience.sock --client-timeout 120\
+    --policy-script /home/nvidia/llm_rs2/policy_default.lua\
     >/tmp/manager.log 2>&1 </dev/null & disown'
 ```
 
 ### 3) Resilience 활성화 추론
 
 ```bash
-python scripts/run_device.py -d jetson --skip-build --skip-deploy generate \
-    -b cuda --prompt "'Hello'" -n 50 \
+python scripts/run_device.py -d jetson --skip-build --skip-deploy generate\
+    -b cuda --prompt "'Hello'" -n 50\
     --enable-resilience --resilience-transport unix:/tmp/llm_resilience.sock
 ```
 
@@ -164,7 +164,7 @@ ssh -p 4121 nvidia@<host> 'pkill -f llm_manager; rm -f /tmp/llm_resilience.sock'
   - CPU: Decode 16.7 tok/s, Prefill 39.5 tok/s
   - CUDA: Decode 26.0 tok/s, Prefill 140.6 tok/s
 - 추가 검증된 기능 (CUDA):
-  - Eviction (`--eviction-policy h2o` / `streaming`): 23.5–23.7 tok/s
+  - Eviction (`eviction h2o` / `streaming`): 23.5–23.7 tok/s
   - KIVI Q2 (`--kivi`): 23.5 tok/s, **6.8× KV 압축**
   - Tensor Partition (`--tensor-partition 0.5 --zero-copy`): 21.7 tok/s, 32 weights split
   - Resilience (`--enable-resilience` + manager unix socket): 24.0 tok/s, Throttle directive 양방향 통신 확인

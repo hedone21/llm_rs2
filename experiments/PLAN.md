@@ -420,9 +420,9 @@ Memory Critical at token 256 고정, 512 토큰 생성. h2o 파라미터 3축 �
 ### 6.1 compare.py — 개별 실험 비교
 
 ```bash
-python experiments/analysis/compare.py \
-  --baseline experiments/results/B-512.jsonl \
-  --experiment experiments/results/M-C-256-h2o.jsonl \
+python experiments/analysis/compare.py\
+  --baseline experiments/results/B-512.jsonl\
+  --experiment experiments/results/M-C-256-h2o.jsonl\
   --output experiments/reports/M-C-256-h2o_report.md
 ```
 
@@ -509,9 +509,9 @@ Key Observations:
 ### 6.3 plot_tbt_timeline.py — TBT 시계열 그래프
 
 ```bash
-python experiments/analysis/plot_tbt_timeline.py \
-  --baseline experiments/results/B-01.jsonl \
-  --experiments experiments/results/T-02.jsonl experiments/results/M-03.jsonl \
+python experiments/analysis/plot_tbt_timeline.py\
+  --baseline experiments/results/B-01.jsonl\
+  --experiments experiments/results/T-02.jsonl experiments/results/M-03.jsonl\
   --output experiments/reports/plots/round1_tbt.png
 ```
 
@@ -539,60 +539,60 @@ def compute_topk_overlap(baseline_logits, experiment_logits, k=10) -> list[float
 cargo build --release --bin generate
 
 # 1. Baseline (토큰 수별)
-cargo run --release --bin generate -- \
-  --model-path /home/go/Workspace/models/llama3.2-1b \
-  --prompt "The history of artificial intelligence began in" \
-  -n 512 --backend cpu --greedy \
+cargo run --release --bin generate --\
+  --model-path /home/go/Workspace/models/llama3.2-1b\
+  --prompt "The history of artificial intelligence began in"\
+  -n 512 --backend cpu --greedy\
   --experiment-output experiments/results/B-512.jsonl
 
-cargo run --release --bin generate -- \
-  --model-path /home/go/Workspace/models/llama3.2-1b \
-  --prompt "The history of artificial intelligence began in" \
-  -n 1024 --backend cpu --greedy \
+cargo run --release --bin generate --\
+  --model-path /home/go/Workspace/models/llama3.2-1b\
+  --prompt "The history of artificial intelligence began in"\
+  -n 1024 --backend cpu --greedy\
   --experiment-output experiments/results/B-1024.jsonl
 
 # 2. 품질 실험 (512 토큰, eviction at 256)
-cargo run --release --bin generate -- \
-  --model-path /home/go/Workspace/models/llama3.2-1b \
-  --prompt "The history of artificial intelligence began in" \
-  -n 512 --backend cpu --greedy \
-  --eviction-policy h2o --h2o-keep-ratio 0.5 --h2o-recent-window 128 \
-  --experiment-schedule experiments/configs/memory_critical_at_256.json \
-  --experiment-output experiments/results/M-C-256-h2o.jsonl
+cargo run --release --bin generate --\
+  --model-path /home/go/Workspace/models/llama3.2-1b\
+  --prompt "The history of artificial intelligence began in"\
+  -n 512 --backend cpu --greedy\
+  --experiment-schedule experiments/configs/memory_critical_at_256.json\
+  --experiment-output experiments/results/M-C-256-h2o.jsonl\
+  eviction h2o --keep-ratio 0.5
 
 # 3. 메모리 실험 (1024 토큰, eviction at 512)
-cargo run --release --bin generate -- \
-  --model-path /home/go/Workspace/models/llama3.2-1b \
-  --prompt "The history of artificial intelligence began in" \
-  -n 1024 --backend cpu --greedy \
-  --eviction-policy h2o --h2o-keep-ratio 0.5 --h2o-recent-window 128 \
-  --experiment-schedule experiments/configs/memory_critical_at_512.json \
-  --experiment-output experiments/results/R-C-512-h2o.jsonl
+cargo run --release --bin generate --\
+  --model-path /home/go/Workspace/models/llama3.2-1b\
+  --prompt "The history of artificial intelligence began in"\
+  -n 1024 --backend cpu --greedy\
+  --experiment-schedule experiments/configs/memory_critical_at_512.json\
+  --experiment-output experiments/results/R-C-512-h2o.jsonl\
+  eviction h2o --keep-ratio 0.5
 
 # 4. 개별 비교 (품질)
-python experiments/analysis/compare.py \
-  --baseline experiments/results/B-512.jsonl \
-  --experiment experiments/results/M-C-256-h2o.jsonl \
+python experiments/analysis/compare.py\
+  --baseline experiments/results/B-512.jsonl\
+  --experiment experiments/results/M-C-256-h2o.jsonl\
   --output experiments/reports/M-C-256-h2o_report.md
 
 # 5. 개별 비교 (메모리)
-python experiments/analysis/compare.py \
-  --baseline experiments/results/B-1024.jsonl \
-  --experiment experiments/results/R-C-512-h2o.jsonl \
+python experiments/analysis/compare.py\
+  --baseline experiments/results/B-1024.jsonl\
+  --experiment experiments/results/R-C-512-h2o.jsonl\
   --output experiments/reports/R-C-512-h2o_report.md
 
 # 6. Round 전체 분석
 python experiments/analysis/round_report.py --round 2
 
 # 7. 시각화
-python experiments/analysis/plot_tbt_timeline.py \
-  --baseline experiments/results/B-512.jsonl \
-  --experiments experiments/results/M-C-256-h2o.jsonl experiments/results/M-C-256-sl.jsonl \
+python experiments/analysis/plot_tbt_timeline.py\
+  --baseline experiments/results/B-512.jsonl\
+  --experiments experiments/results/M-C-256-h2o.jsonl experiments/results/M-C-256-sl.jsonl\
   --output experiments/reports/plots/round2_quality_tbt.png
 
-python experiments/analysis/plot_tbt_timeline.py \
-  --baseline experiments/results/B-1024.jsonl \
-  --experiments experiments/results/R-C-512-h2o.jsonl experiments/results/R-C-512-sl.jsonl \
+python experiments/analysis/plot_tbt_timeline.py\
+  --baseline experiments/results/B-1024.jsonl\
+  --experiments experiments/results/R-C-512-h2o.jsonl experiments/results/R-C-512-sl.jsonl\
   --output experiments/reports/plots/round2_memory_tbt.png
 ```
 

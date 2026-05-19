@@ -54,19 +54,21 @@ def test_nll_monotonicity(model_path):
     print("\n[Test 1] NLL Monotonicity (r75 <= r25)")
     print("-" * 50)
 
-    bl, err = run_generate(model_path, ["--eviction-policy", "none"])
+    bl, err = run_generate(model_path, ["eviction", "none"])
     if not bl:
         print(f"  SKIP: baseline failed — {err}")
         return None
 
+    # EvictionCommonArgs (`--kv-budget-ratio`) precedes the `eviction` subcommand;
+    # clap derive scopes post-subcommand flags to per-policy args struct.
     r75, err = run_generate(model_path, [
-        "--eviction-policy", "sliding", "--kv-budget-ratio", "0.75"])
+        "--kv-budget-ratio", "0.75", "eviction", "sliding"])
     if not r75:
         print(f"  SKIP: r75 failed — {err}")
         return None
 
     r25, err = run_generate(model_path, [
-        "--eviction-policy", "sliding", "--kv-budget-ratio", "0.25"])
+        "--kv-budget-ratio", "0.25", "eviction", "sliding"])
     if not r25:
         print(f"  SKIP: r25 failed — {err}")
         return None

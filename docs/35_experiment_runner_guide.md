@@ -170,8 +170,8 @@ stdout에 생성된 텍스트 출력 (`\r` 스트리밍).
 ### (B) PPL 평가 — `--ppl`
 
 ```bash
-generate --model-path <path> --ppl <text_file> -b cpu --kv-type f32 --temperature 0 \
-  --eviction-policy sliding --kv-budget 900 --protected-prefix 4
+generate --model-path <path> --ppl <text_file> -b cpu --kv-type f32 --temperature 0\
+  --kv-budget 900 --protected-prefix 4 eviction sliding
 ```
 
 stdout에 JSON 출력:
@@ -193,8 +193,8 @@ stdout에 JSON 출력:
 다지선다 NLL 평가 (MMLU 등).
 
 ```bash
-generate --model-path <path> --eval-ll --eval-batch batch.json -b cpu --kv-type f32 \
-  --eviction-policy sliding --kv-budget 900 --protected-prefix 4
+generate --model-path <path> --eval-ll --eval-batch batch.json -b cpu --kv-type f32\
+  --kv-budget 900 --protected-prefix 4 eviction sliding
 ```
 
 입력 (`batch.json`):
@@ -216,9 +216,9 @@ generate --model-path <path> --eval-ll --eval-batch batch.json -b cpu --kv-type 
 토큰별 상세 기록 (JSONL).
 
 ```bash
-generate --model-path <path> --prompt "..." -n 128 -b opencl \
-  --experiment-output results.jsonl \
-  --experiment-logits-topk 10 \
+generate --model-path <path> --prompt "..." -n 128 -b opencl\
+  --experiment-output results.jsonl\
+  --experiment-logits-topk 10\
   --experiment-sample-interval 1
 ```
 
@@ -237,9 +237,9 @@ generate --model-path <path> --prompt "..." -n 128 -b opencl \
 Resilience 신호를 토큰 위치 기반으로 주입.
 
 ```bash
-generate --model-path <path> --prompt "..." -n 2048 -b opencl \
-  --experiment-output results.jsonl \
-  --experiment-schedule schedule.json \
+generate --model-path <path> --prompt "..." -n 2048 -b opencl\
+  --experiment-output results.jsonl\
+  --experiment-schedule schedule.json\
   --enable-resilience --resilience-transport unix:/data/local/tmp/resilience.sock
 ```
 
@@ -255,9 +255,9 @@ generate --model-path <path> --prompt "..." -n 2048 -b opencl \
 ### (F) 프로파일링 — `--profile`
 
 ```bash
-generate --model-path <path> --prompt "..." -n 128 \
-  --profile --profile-dir results/profile \
-  --profile-probes ops,latency,scores,cache \
+generate --model-path <path> --prompt "..." -n 128\
+  --profile --profile-dir results/profile\
+  --profile-probes ops,latency,scores,cache\
   --profile-interval 1
 ```
 
@@ -304,29 +304,31 @@ generate --model-path <path> --prompt "..." -n 128 \
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--eviction-policy` | `none` | `none`, `sliding`, `streaming`, `h2o`, `h2o_plus`, `d2o` |
-| `--protected-prefix` | 자동 | score-based→4, sliding→prompt길이. **실험 시 명시 필수** |
-| `--eviction-window` | 1024 | sliding window 크기 |
-| `--eviction-target-ratio` | 0.75 | eviction 시 유지 비율 |
-| `--sink-size` | 4 | StreamingLLM attention sink tokens |
-| `--streaming-window` | 0 (자동) | StreamingLLM recent window 크기. 0이면 `kv_budget - sink_size` |
+| `eviction <policy>` | (생략 = `none`) | clap subcommand. `none`, `sliding`, `streaming`, `h2o`, `h2o-plus`, `d2o` |
+| `--protected-prefix` | 자동 | (parent) score-based→4, sliding→prompt길이. **실험 시 명시 필수** |
+| `--eviction-target-ratio` | 0.75 | (parent) eviction 시 유지 비율 |
+| `--window` | 1024 | sliding sub-arg — `eviction sliding --window N` |
+| `--sink` | 4 | streaming sub-arg — `eviction streaming --sink N` |
+| `--recent-window` | 0 (자동) | streaming sub-arg — 0이면 `kv_budget - sink` |
 
 ### H2O 전용
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--h2o-keep-ratio` | 0.5 | Heavy-hitter 유지 비율 |
-| `--h2o-decay` | 0.0 | 중요도 점수 지수 감소 |
-| `--h2o-tracked-layers` | 0 (전체) | score 추적 레이어 수 |
-| `--h2o-raw-scores` | false | 시간 정규화 비활성화 |
+| `--keep-ratio` | 0.5 | Heavy-hitter 유지 비율 |
+| `--decay` | 0.0 | 중요도 점수 지수 감소 |
+| `--tracked-layers` | 0 (전체) | score 추적 레이어 수 |
+| `--raw-scores` | false | 시간 정규화 비활성화 |
 
 ### D2O 전용
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--d2o-keep-ratio` | 0.75 | 유지 비율 |
-| `--d2o-beta` | 0.7 | EMA 임계값 |
-| `--d2o-merge-e` | 1.0 | 병합 안정성 상수 |
+| `--keep-ratio` | 0.75 | 유지 비율 |
+| `--ema-beta` | 0.7 | EMA smoothing β (paper Eq.10) |
+| `--merge-e` | 0.1 | 병합 정규화 상수 e (paper Eq.11) |
+| `--layer-alloc` | false | 레이어별 동적 할당 (prefill variance) |
+| `--protected-layers` | — | 보호 레이어 인덱스 (콤마 구분) |
 
 ### KIVI
 
@@ -400,9 +402,9 @@ python scripts/run_comparison_benchmark.py --device pixel --backend cpu
 추론 중 온디바이스 모니터링 (온도, CPU/GPU 주파수, RSS).
 
 ```bash
-python scripts/android_profile.py \
-  --cmd "/data/local/tmp/generate --model-path /data/local/tmp/models/llama3.2-1b \
-         --prompt 'Hello' -n 128 -b opencl" \
+python scripts/android_profile.py\
+  --cmd "/data/local/tmp/generate --model-path /data/local/tmp/models/llama3.2-1b\
+         --prompt 'Hello' -n 128 -b opencl"\
   --output-dir results/data
 ```
 
@@ -449,12 +451,12 @@ huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama3.2-1b
 
 | 정책 | CLI | 동작 | QCF 수집 |
 |------|-----|------|---------|
-| `none` | `--eviction-policy none` | eviction 없음 | — |
-| `sliding` | `--eviction-policy sliding --kv-budget N` | budget 초과 시 prefix 뒤 oldest부터 제거 | `sliding_attn` / `sliding_caote` |
-| `streaming` | `--eviction-policy streaming --sink-size 4` | **StreamingLLM**: sink(S) + recent(W) 고정 구조. target_len 무시, 항상 S+W로 compact | `sliding_attn` / `sliding_caote` |
-| `h2o` | `--eviction-policy h2o --h2o-keep-ratio 0.5` | 3-partition: prefix+HH+recent | `eviction_attn` / `eviction_caote` |
-| `h2o_plus` | `--eviction-policy h2o_plus` | per-head GQA-aware H2O | `eviction_attn` / `eviction_caote` |
-| `d2o` | `--eviction-policy d2o --d2o-keep-ratio 0.75` | H2O + cosine merge | D2OHandler |
+| `none` | `eviction none` | eviction 없음 | — |
+| `sliding` | `--kv-budget N eviction sliding` | budget 초과 시 prefix 뒤 oldest부터 제거 | `sliding_attn` / `sliding_caote` |
+| `streaming` | `eviction streaming --sink 4` | **StreamingLLM**: sink(S) + recent(W) 고정 구조. target_len 무시, 항상 S+W로 compact | `sliding_attn` / `sliding_caote` |
+| `h2o` | `eviction h2o --keep-ratio 0.5` | 3-partition: prefix+HH+recent | `eviction_attn` / `eviction_caote` |
+| `h2o_plus` | `eviction h2o-plus` | per-head GQA-aware H2O | `eviction_attn` / `eviction_caote` |
+| `d2o` | `eviction d2o --keep-ratio 0.75` | H2O + cosine merge | D2OHandler |
 
 **Streaming vs Sliding 차이**: Sliding은 `target_len`에 따라 유연하게 제거량 조절. Streaming은 `target_len`을 무시하고 항상 `sink_size + streaming_window` 크기로 압축. 긴 프롬프트에서 중간부를 과감히 제거.
 
