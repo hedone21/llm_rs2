@@ -182,24 +182,26 @@ mod tests {
     #[test]
     fn rejects_d2o_layer_alloc() {
         let mut args = default_args();
-        args.eviction = Some(crate::session::cli::EvictionCmd::D2o(
-            crate::session::cli::D2oArgs {
+        args.eviction = Some(crate::session::cli::TopLevelCmd::Eviction {
+            policy: crate::session::cli::EvictionCmd::D2o(crate::session::cli::D2oArgs {
                 keep_ratio: 0.75,
                 ema_beta: 0.7,
                 merge_e: 0.1,
                 layer_alloc: true,
                 protected_layers: None,
-            },
-        ));
+            }),
+        });
         assert!(!is_standard_happy_path(&args));
     }
 
     #[test]
     fn rejects_non_none_eviction() {
         let mut args = default_args();
-        args.eviction = Some(crate::session::cli::EvictionCmd::Sliding(
-            crate::session::cli::SlidingArgs { window: 1024 },
-        ));
+        args.eviction = Some(crate::session::cli::TopLevelCmd::Eviction {
+            policy: crate::session::cli::EvictionCmd::Sliding(crate::session::cli::SlidingArgs {
+                window: 1024,
+            }),
+        });
         assert!(!is_standard_happy_path(&args));
     }
 

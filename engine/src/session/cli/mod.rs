@@ -2,7 +2,9 @@ use clap::Parser;
 
 pub mod eviction;
 
-pub use eviction::{D2oArgs, EvictionCmd, EvictionCommonArgs, H2oArgs, SlidingArgs, StreamingArgs};
+pub use eviction::{
+    D2oArgs, EvictionCmd, EvictionCommonArgs, H2oArgs, SlidingArgs, StreamingArgs, TopLevelCmd,
+};
 
 /// `--secondary-dtype` CLI 인수 값 (D-3, ENG-ALG-225).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1039,12 +1041,14 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub qnn_allow_fallback: bool,
 
-    /// Eviction policy subcommand (S-subcmd C1, 2026-05-19).
+    /// Top-level subcommand wrapper.
     ///
-    /// Omitting the subcommand ≡ `EvictionCmd::None` (no eviction).
-    /// See `cli::eviction::EvictionCmd` for variants and per-variant args.
+    /// `eviction <policy>` form is the only currently registered
+    /// subcommand. Omitting the subcommand ≡ `EvictionCmd::None`
+    /// (no eviction). See [`crate::session::cli::TopLevelCmd`] and
+    /// [`crate::session::cli::EvictionCmd`].
     #[command(subcommand)]
-    pub eviction: Option<EvictionCmd>,
+    pub eviction: Option<TopLevelCmd>,
 }
 
 /// Shim accessors for the eviction subcommand + flatten common args.
@@ -1053,57 +1057,65 @@ pub struct Args {
 /// `args.kv_budget`, ...) read through these methods so the C2 commit
 /// changes only `cli/mod.rs`. Call sites migrate to direct enum match in C3.
 impl Args {
+    /// Returns the nested `EvictionCmd` policy, unwrapping the
+    /// `TopLevelCmd::Eviction` wrapper. `None` if no subcommand given.
+    fn current_policy(&self) -> Option<&EvictionCmd> {
+        match &self.eviction {
+            Some(TopLevelCmd::Eviction { policy }) => Some(policy),
+            None => None,
+        }
+    }
+
     pub fn eviction_policy(&self) -> &'static str {
-        self.eviction
-            .as_ref()
+        self.current_policy()
             .map(|e| e.policy_name())
             .unwrap_or("none")
     }
 
     pub fn eviction_window(&self) -> usize {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::Sliding(s)) => s.window,
             _ => 1024,
         }
     }
 
     pub fn sink_size(&self) -> usize {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::Streaming(s)) => s.sink,
             _ => 4,
         }
     }
 
     pub fn streaming_window(&self) -> usize {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::Streaming(s)) => s.recent_window,
             _ => 0,
         }
     }
 
     pub fn h2o_keep_ratio(&self) -> f32 {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.keep_ratio,
             _ => 0.5,
         }
     }
 
     pub fn h2o_tracked_layers(&self) -> usize {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.tracked_layers,
             _ => 0,
         }
     }
 
     pub fn h2o_decay(&self) -> f32 {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.decay,
             _ => 0.0,
         }
     }
 
     pub fn h2o_raw_scores(&self) -> bool {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.raw_scores,
             _ => false,
         }
@@ -1116,35 +1128,35 @@ impl Args {
     }
 
     pub fn d2o_keep_ratio(&self) -> f32 {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::D2o(d)) => d.keep_ratio,
             _ => 0.75,
         }
     }
 
     pub fn d2o_ema_beta(&self) -> f32 {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::D2o(d)) => d.ema_beta,
             _ => 0.7,
         }
     }
 
     pub fn d2o_merge_e(&self) -> f32 {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::D2o(d)) => d.merge_e,
             _ => 0.1,
         }
     }
 
     pub fn d2o_layer_alloc(&self) -> bool {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::D2o(d)) => d.layer_alloc,
             _ => false,
         }
     }
 
     pub fn d2o_protected_layers(&self) -> Option<Vec<usize>> {
-        match &self.eviction {
+        match self.current_policy() {
             Some(EvictionCmd::D2o(d)) => d.protected_layers.clone(),
             _ => None,
         }

@@ -15,7 +15,22 @@
 
 use clap::{Args, Subcommand};
 
-/// Eviction policy selection (clap subcommand).
+/// Top-level wrapper exposing `eviction <policy>` as a single clap
+/// subcommand group. clap derive registers each [`EvictionCmd`] variant
+/// directly as a subcommand, so without this wrapper the CLI would be
+/// `generate ... h2o --keep-ratio 0.5`. The wrapper produces the
+/// `generate ... eviction h2o --keep-ratio 0.5` form documented in
+/// `docs/USAGE.md` and `docs/35_experiment_runner_guide.md`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum TopLevelCmd {
+    /// KV cache eviction policy (variant chosen via nested subcommand).
+    Eviction {
+        #[command(subcommand)]
+        policy: EvictionCmd,
+    },
+}
+
+/// Eviction policy selection (nested under [`TopLevelCmd::Eviction`]).
 ///
 /// CLI usage:
 /// ```text
