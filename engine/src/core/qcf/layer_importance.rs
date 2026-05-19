@@ -71,7 +71,7 @@ impl ImportanceTable {
     ///
     /// `skip_set`: list of `(layer_id, SubLayer)` pairs being skipped.
     /// Returns `Σ importance(skipped) / Σ importance(all)`, in [0, 1].
-    pub fn compute_qcf(&self, skip_set: &[(usize, SubLayer)]) -> f32 {
+    pub fn compute_qcf_weight(&self, skip_set: &[(usize, SubLayer)]) -> f32 {
         let _t = crate::profile::quality_metrics::Timer::start(
             &crate::profile::quality_metrics::QCF_LAYER_SKIP,
         );
@@ -121,7 +121,7 @@ impl ImportanceTable {
             .map(|e| (e.layer_id, e.sublayer))
             .collect();
 
-        let qcf = self.compute_qcf(&skip_set);
+        let qcf = self.compute_qcf_weight(&skip_set);
         (qcf, skip_set)
     }
 
@@ -516,7 +516,7 @@ mod tests {
             },
         ];
         let table = ImportanceTable::from_entries(entries);
-        assert_eq!(table.compute_qcf(&[]), 0.0);
+        assert_eq!(table.compute_qcf_weight(&[]), 0.0);
     }
 
     #[test]
@@ -540,7 +540,7 @@ mod tests {
             },
         ];
         let table = ImportanceTable::from_entries(entries);
-        let qcf = table.compute_qcf(&[(0, SubLayer::Full), (1, SubLayer::Full)]);
+        let qcf = table.compute_qcf_weight(&[(0, SubLayer::Full), (1, SubLayer::Full)]);
         assert!((qcf - 1.0).abs() < 1e-6, "full skip: qcf={qcf}");
     }
 
@@ -584,7 +584,7 @@ mod tests {
         let table = ImportanceTable::from_entries(entries);
         // total = 0.86
         // skip layers 1 and 3 (low importance): 0.08 + 0.05 = 0.13
-        let qcf = table.compute_qcf(&[(1, SubLayer::Full), (3, SubLayer::Full)]);
+        let qcf = table.compute_qcf_weight(&[(1, SubLayer::Full), (3, SubLayer::Full)]);
         let expected = 0.13 / 0.86;
         assert!(
             (qcf - expected).abs() < 0.01,
@@ -776,7 +776,7 @@ mod tests {
         let table = ImportanceTable::from_entries(entries);
         // total = 1.0
         // Skip only MLP of layer 0 and attention of layer 1
-        let qcf = table.compute_qcf(&[(0, SubLayer::Mlp), (1, SubLayer::Attention)]);
+        let qcf = table.compute_qcf_weight(&[(0, SubLayer::Mlp), (1, SubLayer::Attention)]);
         // (0.1 + 0.3) / 1.0 = 0.4
         assert!((qcf - 0.4).abs() < 1e-6, "sublayer qcf={qcf}");
     }

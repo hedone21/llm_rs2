@@ -9,10 +9,10 @@ pub mod entropy;
 pub mod estimator;
 pub mod layer_aggregation;
 pub mod layer_importance;
+pub mod qcf_kv;
 pub mod quant_qcf;
 pub mod skip_qcf;
 pub mod topk_retention;
-pub mod unified_qcf;
 
 pub use entropy::{EntropyResult, compute_normalized_entropy};
 pub use estimator::DegradationEstimator;
@@ -77,16 +77,16 @@ impl ImportanceFormula {
         }
     }
 }
+pub use qcf_kv::{
+    QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv, identify_retained_for_action,
+    identify_retained_h2o, identify_retained_sliding,
+};
 pub use quant_qcf::{
     FlushAttentionParams, KiviFlushParams, compute_flush_aw_vopr, compute_flush_awqe,
     compute_flush_nmse, compute_flush_opr,
 };
 pub use skip_qcf::SkipQcfTracker;
 pub use topk_retention::{TopKRetentionResult, compute_topk_retention};
-pub use unified_qcf::{
-    QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf,
-    identify_retained_for_action, identify_retained_h2o, identify_retained_sliding,
-};
 
 /// A QCF metric collected from a single lossy action execution.
 #[derive(Debug, Clone)]

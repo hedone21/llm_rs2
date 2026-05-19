@@ -27,7 +27,7 @@ use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::{
-    LayerSlot, QuantNoiseTable, SwapAlgorithm, WeightSwapDecider, compute_qcf_swap,
+    LayerSlot, QuantNoiseTable, SwapAlgorithm, WeightSwapDecider, compute_qcf_weight_swap,
 };
 use llm_shared::DtypeTag;
 
@@ -291,9 +291,9 @@ fn e2e_dry_run_zero_ratio_is_empty() {
     assert_eq!(qcf, 0.0, "ratio=0 must give qcf=0.0");
 }
 
-// ── E2E: QCF_swap actual matches compute_qcf_swap ───────────────────────────
+// ── E2E: QCF_swap actual matches compute_qcf_weight_swap ───────────────────────────
 
-/// `compute_qcf_swap` for the actually swapped layers must equal the
+/// `compute_qcf_weight_swap` for the actually swapped layers must equal the
 /// `qcf_swap_estimate` from the decider (same inputs, same algorithm).
 #[test]
 fn e2e_qcf_swap_actual_matches_estimate() {
@@ -311,8 +311,8 @@ fn e2e_qcf_swap_actual_matches_estimate() {
     };
 
     let decision = decider.decide(0.5);
-    // Recompute qcf_swap using the public compute_qcf_swap function
-    let qcf_actual = compute_qcf_swap(
+    // Recompute qcf_swap using the public compute_qcf_weight_swap function
+    let qcf_actual = compute_qcf_weight_swap(
         &decision.selected_layers,
         &noise,
         Some(&importance),
@@ -321,7 +321,7 @@ fn e2e_qcf_swap_actual_matches_estimate() {
 
     assert!(
         (qcf_actual - decision.qcf_swap_estimate).abs() < 1e-5,
-        "compute_qcf_swap actual={qcf_actual:.6} must match decider estimate={:.6}",
+        "compute_qcf_weight_swap actual={qcf_actual:.6} must match decider estimate={:.6}",
         decision.qcf_swap_estimate
     );
 }

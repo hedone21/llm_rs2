@@ -3269,7 +3269,7 @@ fn main() -> anyhow::Result<()> {
                     if let Some((ratio, n_planned, plan_start, qcf_estimated)) =
                         manager_swap_report_pending.take()
                     {
-                        use llm_rs2::models::weights::compute_qcf_swap;
+                        use llm_rs2::models::weights::compute_qcf_weight_swap;
                         let latency_ms = plan_start.elapsed().as_millis() as u64;
                         let n_layers = model.layers.len();
                         let actually_swapped_now: Vec<usize> = (0..n_layers)
@@ -3278,7 +3278,7 @@ fn main() -> anyhow::Result<()> {
                         let qcf_swap_actual = if actually_swapped_now.is_empty() {
                             qcf_estimated
                         } else {
-                            compute_qcf_swap(
+                            compute_qcf_weight_swap(
                                 &actually_swapped_now,
                                 &model.quant_noise,
                                 importance_table_for_swap.as_ref(),
@@ -4987,7 +4987,7 @@ struct QcfEstimateContext<'a> {
 /// - `layer_skip`        : LayerSkip importance-based QCF (needs importance_table)
 fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::HashMap<String, f32> {
     use llm_rs2::core::qcf::{
-        AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf,
+        AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv,
     };
     use std::collections::HashMap;
     let mut estimates = HashMap::new();
@@ -5085,7 +5085,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                 } else {
                     None
                 };
-                let params = UnifiedQcfParams {
+                let params = QcfKvParams {
                     action,
                     v_source,
                     k_source,
@@ -5099,7 +5099,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                     aggregation: AggregationMode::Mean,
                     beta: 1.0,
                 };
-                let (qcf, _) = compute_unified_qcf(&params);
+                let (qcf, _) = compute_qcf_kv(&params);
                 estimates.insert(id.to_string(), qcf);
             }
         }

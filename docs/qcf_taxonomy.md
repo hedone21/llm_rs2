@@ -104,7 +104,7 @@ QCF는 **손실성(lossy) 액션이 모델 품질에 미치는 비용**을 [0, 1
 | `x̄_in` 캡처 (Attention block 진입 직전) | `engine/src/models/transformer.rs:1508~1511` (`snapshot_before` 호출이 `layer.forward()` 직전) |
 | `x̄_out` 캡처 (FFN block 출력 후) | `engine/src/models/transformer.rs:1593~1601` (`record_after` 호출이 `layer.forward()` 직후) |
 | `importance_i = max(0, 1 − cos)` | `engine/src/core/qcf/layer_importance.rs:219~220` |
-| `O = Σα·V`, per-head | `engine/src/core/qcf/unified_qcf.rs:92, 134~149` |
+| `O = Σα·V`, per-head | `engine/src/core/qcf/qcf_kv.rs:92, 134~149` |
 | Head aggregation | `engine/src/core/qcf/mod.rs::aggregate_heads:108` |
 | `ε_t = ‖W_pri − W_sec‖²_F / ‖W_pri‖²_F` | `engine/src/models/weights/noise_table.rs:307~318` |
 | `ε_i = mean over 7 tensors` | `engine/src/models/weights/noise_table.rs:87~95, 109~134` |
@@ -201,7 +201,7 @@ O_h \;=\; \sum_{t=0}^{T-1} \alpha_h(t)\, V(h, t) \;\in\; \mathbb{R}^{d_{\text{he
 ```
 
 코드 위치:
-- 통합 함수: `engine/src/core/qcf/unified_qcf.rs::compute_unified_qcf` (line 80)
+- 통합 함수: `engine/src/core/qcf/qcf_kv.rs::compute_qcf_kv` (line 80)
 - aggregation: `engine/src/core/qcf/mod.rs::aggregate_heads` (line 108)
 
 ### 2.2 액션별 `O^after` 구성
@@ -218,7 +218,7 @@ O_h^{\text{after}} = \sum_{t \in \mathcal{R}} \frac{\alpha_h(t)}{\sum_{t' \in \m
 
 여기서 `ℛ = [T - target_len, T)`.
 
-코드: `unified_qcf.rs:153~172`, `compute_o_eviction()` line 360.
+코드: `qcf_kv.rs:153~172`, `compute_o_eviction()` line 360.
 
 #### 2.2.2 H2O Eviction
 
@@ -232,7 +232,7 @@ Heavy-hitters + recent window + protected prefix의 3-파티션 잔존 정책:
 
 `O^after`는 §2.2.1과 같은 재정규화 공식.
 
-코드: `unified_qcf.rs:173~199`, `identify_retained_h2o()` line 479.
+코드: `qcf_kv.rs:173~199`, `identify_retained_h2o()` line 479.
 
 #### 2.2.3 StreamingLLM Eviction
 
@@ -244,7 +244,7 @@ Sink + recent window:
 
 (`s`: `sink_size`, `w`: `window_size`). `O^after`는 재정규화 공식.
 
-코드: `unified_qcf.rs:200~222`.
+코드: `qcf_kv.rs:200~222`.
 
 #### 2.2.4 D2O Merge (Eviction with Compensation)
 
@@ -270,7 +270,7 @@ D_r = \sum_{e \in G_r} \exp(u_{e,r}) + \mathrm{e}, \qquad w_{r \leftarrow r} = \
 O_h^{\text{after}} = \sum_{r \in \mathcal{R}} \frac{\alpha_h(r)}{\sum_{r' \in \mathcal{R}} \alpha_h(r')} \, \tilde V(h, r)
 ```
 
-코드: `unified_qcf.rs::compute_o_d2o_merge`. 동일 식이 실제 KV 캐시 머지에도 적용됨: `core/pressure/d2o_handler.rs::scatter_reduce_*` (F32/F16/Q4_0). estimator(QCF)와 actuator(handler) 가중치 식 일치.
+코드: `qcf_kv.rs::compute_o_d2o_merge`. 동일 식이 실제 KV 캐시 머지에도 적용됨: `core/pressure/d2o_handler.rs::scatter_reduce_*` (F32/F16/Q4_0). estimator(QCF)와 actuator(handler) 가중치 식 일치.
 
 #### 2.2.5 KIVI Quantization
 
@@ -282,12 +282,12 @@ O_h^{\text{after}} = \sum_{t=0}^{T-1} \alpha_h(t) \, Q^{-1}\bigl(Q(V(h, t); b)\b
 
 `Q(·; b)`: `b`-bit 양자화기. 지원 비트수 = {2, 4, 8}, block size `QKKV`. block-wise quantize: `BlockQ2_0`, `BlockKVQ4`, `BlockKVQ8`.
 
-코드: `unified_qcf.rs:251~270`, `quantize_dequantize_f32()` line 524.
+코드: `qcf_kv.rs:251~270`, `quantize_dequantize_f32()` line 524.
 
 ### 2.3 측정 시점과 데이터
 
 - **측정 시점**: 매 lossy 액션 실행 시점(decode 도중 반복).
-- **`α_h(t)`**: 해당 시점의 실제 attention scores. per-head slice가 사용 가능하면 사용, 그렇지 않으면 flat scores fallback (`unified_qcf.rs:99~129`).
+- **`α_h(t)`**: 해당 시점의 실제 attention scores. per-head slice가 사용 가능하면 사용, 그렇지 않으면 flat scores fallback (`qcf_kv.rs:99~129`).
 - **`V(h, t)`**: KV cache의 V 버퍼. F32/F16/Q4_0 모두 지원 (`VDataSource` enum, line 46).
 - **layout**: `KVLayout::HeadMajor` (production 고정). offset = `h · capacity · d_head + t · d_head` (`compute_v_offset` 헬퍼).
 - **Layer 차원 처리** (액션마다 다름):
@@ -296,8 +296,8 @@ O_h^{\text{after}} = \sum_{t=0}^{T-1} \alpha_h(t) \, Q^{-1}\bigl(Q(V(h, t); b)\b
 |---|---|---|
 | sliding/H2O/streaming/D2O eviction (4종) | **layer 0 ad-hoc proxy** (`generate.rs:6485` `kv_caches[0]`) | dry-run estimate의 상대 ordering이 매니저 정책 입력으로 충분. 모든 layer 측정 시 비용 ×N_layer ∈ signal path 응답 지연. 실효성 검증 후 의도적 단순화로 유지 (2026-04-27). |
 | KIVI quant | **모든 layer 평균** (`generate.rs:6625~6634`) | `KiviCache`가 layer-aware estimator(`estimate_dryrun_qcf`, `kivi_cache.rs:824`) 캡슐화. 외부 호출자 입장에서 평균이 추가 비용 거의 0. |
-| layer skip | **모든 layer entry sum 정규화** | `ImportanceTable::compute_qcf`(`layer_importance.rs:68`)가 정의상 모든 layer entry 사용. |
-| swap (참고: QCF_weight) | **모든 layer imp·ε 가중 sum** | `compute_qcf_swap`(`decider.rs:212~219`)가 정의상 전체 layer iterate. NaN ε layer만 제외. |
+| layer skip | **모든 layer entry sum 정규화** | `ImportanceTable::compute_qcf_weight`(`layer_importance.rs:68`)가 정의상 모든 layer entry 사용. |
+| swap (참고: QCF_weight) | **모든 layer imp·ε 가중 sum** | `compute_qcf_weight_swap`(`decider.rs:212~219`)가 정의상 전체 layer iterate. NaN ε layer만 제외. |
 
 KV eviction 4종의 layer 0 proxy는 prototype 잔재가 아니라 **의도된 ad-hoc 경량 proxy**로 결정됨. 매니저 정책의 상대 ordering이 보존되며 비용 ×N_layer를 회피. 자세한 결정 사유와 후속 검토 옵션은 `.agent/todos/backlog.md` `[P1] QCF_kv 측정의 layer-0 단일 proxy → 모든 layer aggregate` (CANCELLED) 참조.
 
@@ -367,7 +367,7 @@ per-tensor relative Frobenius squared error:
 - `𝒱 = {j : ε_j 가 finite}`: 유효 layer 전체. NaN ε layer는 분자/분모 모두에서 제외.
 - 결과 ∈ [0, 1] (clamp 적용).
 
-코드: `engine/src/models/weights/decider.rs::compute_qcf_swap` (line 172), 내부 line 212~225.
+코드: `engine/src/models/weights/decider.rs::compute_qcf_weight_swap` (line 172), 내부 line 212~225.
 
 #### 3.2.4 Swap Set 결정 (Decider)
 
@@ -395,7 +395,7 @@ skip 대상 sub-layer 집합 `𝒮_skip ⊂ {(i, sl) : i ∈ layers, sl ∈ {Ful
 
 분자/분모 모두 단순 importance의 sum (ε 가중 없음, swap과 차이).
 
-코드: `engine/src/core/qcf/layer_importance.rs::ImportanceTable::compute_qcf` (line 68).
+코드: `engine/src/core/qcf/layer_importance.rs::ImportanceTable::compute_qcf_weight` (line 68).
 
 #### 3.3.2 OPR (Output-to-input Perturbation Ratio) — 보조 지표
 
@@ -469,7 +469,7 @@ pub struct QcfEstimate {
 \varepsilon_i^{\text{output}} \;=\; \frac{\bigl\| W_i^{\text{primary}} \cdot x_i - W_i^{\text{secondary}} \cdot x_i \bigr\|_2}{\bigl\| W_i^{\text{primary}} \cdot x_i \bigr\|_2}
 ```
 
-여기서 `x_i`는 warmup prefill의 layer i 입력 hidden state. 이렇게 정의하면 ε_i가 `QCF_kv`의 `‖ΔO‖/‖O‖`와 같은 분자/분모 형태(출력 공간 상대 L2 오차)가 된다. `compute_qcf_swap`의 sum도 RMS 누적(`√Σ(imp·ε)²`)으로 변경하면 unified의 `‖ΔO‖` 합성과 동형이 된다.
+여기서 `x_i`는 warmup prefill의 layer i 입력 hidden state. 이렇게 정의하면 ε_i가 `QCF_kv`의 `‖ΔO‖/‖O‖`와 같은 분자/분모 형태(출력 공간 상대 L2 오차)가 된다. `compute_qcf_weight_swap`의 sum도 RMS 누적(`√Σ(imp·ε)²`)으로 변경하면 unified의 `‖ΔO‖` 합성과 동형이 된다.
 
 본 변경은 cross-family raw 비교를 가능하게 하지만 의미론적으로는 여전히 다른 양을 측정하므로, 매니저 정책은 `DegradationEstimator` 경유 ΔPPL 환산을 권장한다.
 
@@ -479,22 +479,22 @@ pub struct QcfEstimate {
 
 | 항목 | 파일 | 함수/타입 | 위치 |
 |---|---|---|---|
-| QCF_kv 통합 함수 | `engine/src/core/qcf/unified_qcf.rs` | `compute_unified_qcf` | line 80 |
-| KV 액션 enum | `engine/src/core/qcf/unified_qcf.rs` | `QcfActionType` | line 18 |
-| Eviction `O^after` | `engine/src/core/qcf/unified_qcf.rs` | `compute_o_eviction` | line 360 |
-| D2O merge `O^after` | `engine/src/core/qcf/unified_qcf.rs` | `compute_o_d2o_merge` | line 393 |
-| KIVI quant round-trip | `engine/src/core/qcf/unified_qcf.rs` | `quantize_dequantize_f32` | line 524 |
-| H2O retained 식별 | `engine/src/core/qcf/unified_qcf.rs` | `identify_retained_h2o` | line 479 |
+| QCF_kv 통합 함수 | `engine/src/core/qcf/qcf_kv.rs` | `compute_qcf_kv` | line 80 |
+| KV 액션 enum | `engine/src/core/qcf/qcf_kv.rs` | `QcfActionType` | line 18 |
+| Eviction `O^after` | `engine/src/core/qcf/qcf_kv.rs` | `compute_o_eviction` | line 360 |
+| D2O merge `O^after` | `engine/src/core/qcf/qcf_kv.rs` | `compute_o_d2o_merge` | line 393 |
+| KIVI quant round-trip | `engine/src/core/qcf/qcf_kv.rs` | `quantize_dequantize_f32` | line 524 |
+| H2O retained 식별 | `engine/src/core/qcf/qcf_kv.rs` | `identify_retained_h2o` | line 479 |
 | Head aggregation | `engine/src/core/qcf/mod.rs` | `aggregate_heads` | line 108 |
 | QcfMetric 구조체 | `engine/src/core/qcf/mod.rs` | `QcfMetric` | line 30 |
 | ImportanceTable | `engine/src/core/qcf/layer_importance.rs` | `ImportanceTable` | line 37 |
 | Importance 측정 | `engine/src/core/qcf/layer_importance.rs` | `ImportanceCollector::record_after` | line 194 |
-| Skip QCF | `engine/src/core/qcf/layer_importance.rs` | `ImportanceTable::compute_qcf` | line 68 |
+| Skip QCF | `engine/src/core/qcf/layer_importance.rs` | `ImportanceTable::compute_qcf_weight` | line 68 |
 | OPR | `engine/src/core/qcf/layer_importance.rs` | `residual_norm_ratio` | line 246 |
 | QuantNoiseTable | `engine/src/models/weights/noise_table.rs` | `QuantNoiseTable` | line 30 |
 | ε_t 계산 | `engine/src/models/weights/noise_table.rs` | `compute_tensor_epsilon` | line 218 |
 | ε_i 집계 | `engine/src/models/weights/noise_table.rs` | `new_from_frobenius` | line 73 |
-| QCF_swap 본체 | `engine/src/models/weights/decider.rs` | `compute_qcf_swap` | line 172 |
+| QCF_swap 본체 | `engine/src/models/weights/decider.rs` | `compute_qcf_weight_swap` | line 172 |
 | Swap 결정 | `engine/src/models/weights/decider.rs` | `WeightSwapDecider::decide` | line 57 |
 | ΔPPL estimator | `engine/src/core/qcf/estimator.rs` | `DegradationEstimator::estimate` | line 136 |
 | IPC 메시지 | `shared/src/lib.rs` | `QcfEstimate`, `LayerSwapEstimate` | line 415, 401 |

@@ -7,12 +7,12 @@
 //! Divergence from β=1.5 on a peaked distribution confirms that the amplification
 //! exponent is applied correctly.
 //!
-//! Regression gate: if compute_unified_qcf collapses β back to a uniform
+//! Regression gate: if compute_qcf_kv collapses β back to a uniform
 //! formula, β=1.0 and β=1.5 would become identical — caught here.
 
 use llm_rs2::core::kv_cache::KVLayout;
 use llm_rs2::core::qcf::{
-    AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf,
+    AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv,
 };
 
 /// Build test params with the given β.
@@ -20,12 +20,12 @@ use llm_rs2::core::qcf::{
 /// Setup: n_kv_heads=1, head_dim=2, current_pos=3, capacity=3.
 /// V data: 3 tokens × head_dim=2 = 6 floats.
 /// Attention: [0.1, 0.1, 0.8] (strongly peaked at token 2 → non-uniform).
-fn make_params(beta: f32) -> UnifiedQcfParams<'static> {
+fn make_params(beta: f32) -> QcfKvParams<'static> {
     // Static slices so the lifetime is 'static.
     static V_DATA: &[f32] = &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     static ATTENTION: &[f32] = &[0.1, 0.1, 0.8]; // peaked, non-uniform → β matters
 
-    UnifiedQcfParams {
+    QcfKvParams {
         action: QcfActionType::EvictSliding { target_len: 2 },
         v_source: VDataSource::F32(V_DATA),
         k_source: None,
@@ -43,7 +43,7 @@ fn make_params(beta: f32) -> UnifiedQcfParams<'static> {
 
 #[test]
 fn spec_beta_one_result_is_finite_non_negative() {
-    let (qcf, per_head) = compute_unified_qcf(&make_params(1.0));
+    let (qcf, per_head) = compute_qcf_kv(&make_params(1.0));
     assert!(qcf.is_finite(), "β=1.0 QCF must be finite, got {qcf}");
     assert!(qcf >= 0.0, "β=1.0 QCF must be non-negative, got {qcf}");
     assert_eq!(per_head.len(), 1, "single KV head → per_head len=1");
@@ -51,14 +51,14 @@ fn spec_beta_one_result_is_finite_non_negative() {
 
 #[test]
 fn spec_beta_one_five_result_is_finite_non_negative() {
-    let (qcf, _) = compute_unified_qcf(&make_params(1.5));
+    let (qcf, _) = compute_qcf_kv(&make_params(1.5));
     assert!(qcf.is_finite(), "β=1.5 QCF must be finite, got {qcf}");
     assert!(qcf >= 0.0, "β=1.5 QCF must be non-negative, got {qcf}");
 }
 
 #[test]
 fn spec_beta_two_result_is_finite_non_negative() {
-    let (qcf, _) = compute_unified_qcf(&make_params(2.0));
+    let (qcf, _) = compute_qcf_kv(&make_params(2.0));
     assert!(qcf.is_finite(), "β=2.0 QCF must be finite, got {qcf}");
     assert!(qcf >= 0.0, "β=2.0 QCF must be non-negative, got {qcf}");
 }
@@ -66,8 +66,8 @@ fn spec_beta_two_result_is_finite_non_negative() {
 #[test]
 fn spec_beta_one_vs_one_five_differ_on_peaked_distribution() {
     // Non-uniform [0.1, 0.1, 0.8] → β amplification changes the weight distribution.
-    let (qcf1, _) = compute_unified_qcf(&make_params(1.0));
-    let (qcf15, _) = compute_unified_qcf(&make_params(1.5));
+    let (qcf1, _) = compute_qcf_kv(&make_params(1.0));
+    let (qcf15, _) = compute_qcf_kv(&make_params(1.5));
     assert!(
         (qcf1 - qcf15).abs() > 1e-6,
         "β=1.0 ({qcf1}) and β=1.5 ({qcf15}) must differ on a peaked distribution"
@@ -80,9 +80,9 @@ fn spec_beta_increases_monotonically_on_peaked_distribution() {
     // further, pushing QCF higher (more of the "signal" is attributed to the
     // high-attention token being evicted or retained).
     // This is a direction test, not an exact-value test.
-    let (qcf1, _) = compute_unified_qcf(&make_params(1.0));
-    let (qcf15, _) = compute_unified_qcf(&make_params(1.5));
-    let (qcf2, _) = compute_unified_qcf(&make_params(2.0));
+    let (qcf1, _) = compute_qcf_kv(&make_params(1.0));
+    let (qcf15, _) = compute_qcf_kv(&make_params(1.5));
+    let (qcf2, _) = compute_qcf_kv(&make_params(2.0));
 
     // All three must be distinct for a peaked distribution.
     let distinct_12 = (qcf1 - qcf15).abs() > 1e-6;

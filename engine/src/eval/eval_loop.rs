@@ -600,7 +600,7 @@ fn run_importance_pass<C: KVCacheOps>(
         .union(&sc.mlp_skip)
         .map(|&l| (l, SubLayer::Full))
         .collect();
-    let qcf = table.compute_qcf(&skip_set);
+    let qcf = table.compute_qcf_weight(&skip_set);
     let opr_skip = table.compute_opr_skip(&skip_set);
     let skip_set_len = skip_set.len();
 

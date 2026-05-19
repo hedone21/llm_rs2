@@ -114,7 +114,7 @@ fn test_eng_alg_032_importance_table_full_skip() {
         (1, SubLayer::Full),
         (2, SubLayer::Full),
     ];
-    let qcf = table.compute_qcf(&skip_set);
+    let qcf = table.compute_qcf_weight(&skip_set);
     assert!((qcf - 1.0).abs() < 1e-6);
 }
 
@@ -150,7 +150,7 @@ fn test_eng_alg_032_importance_table_partial_skip() {
 
     // layer 2만 skip → QCF = 0.2 / 1.0 = 0.2
     let skip_set = vec![(2, SubLayer::Full)];
-    let qcf = table.compute_qcf(&skip_set);
+    let qcf = table.compute_qcf_weight(&skip_set);
     assert!((qcf - 0.2).abs() < 1e-6);
 }
 
@@ -165,7 +165,7 @@ fn test_eng_alg_032_importance_table_empty_skip() {
         importance_shortgpt_bi: None,
     }];
     let table = ImportanceTable::from_entries(entries);
-    let qcf = table.compute_qcf(&[]);
+    let qcf = table.compute_qcf_weight(&[]);
     assert_eq!(qcf, 0.0);
 }
 

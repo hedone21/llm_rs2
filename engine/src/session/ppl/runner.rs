@@ -1025,8 +1025,8 @@ pub fn run_ppl(
                         && let Some(head_attn) = acc.last_step_head_attn()
                     {
                         use crate::core::qcf::{
-                            AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource,
-                            compute_unified_qcf,
+                            AggregationMode, QcfActionType, QcfKvParams, VDataSource,
+                            compute_qcf_kv,
                         };
                         let target_len = ((before_len as f32) * ratio) as usize;
                         let cache = &kv_caches[0];
@@ -1050,7 +1050,7 @@ pub fn run_ppl(
                         };
                         match VDataSource::from_kv_cache(cache, v_cpu_bytes) {
                             Some(v_source) => {
-                                let params = UnifiedQcfParams {
+                                let params = QcfKvParams {
                                     action,
                                     v_source,
                                     // PPL eval site only triggers Sliding/H2O,
@@ -1066,7 +1066,7 @@ pub fn run_ppl(
                                     aggregation: AggregationMode::Mean,
                                     beta: 1.0,
                                 };
-                                let (qcf, _) = compute_unified_qcf(&params);
+                                let (qcf, _) = compute_qcf_kv(&params);
                                 qcf as f64
                             }
                             None => 0.0,

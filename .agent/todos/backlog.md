@@ -322,27 +322,25 @@
 ---
 
 ## [P2] QCF 명명 컨벤션 정리 — `QCF_kv` / `QCF_weight` 2-tier rename
-- **Status**: TODO (결정만 완료, 코드 미적용)
-- **Sprint**: backlog
-- **Dependencies**: 없음 (rename 단순 작업이지만 IPC schema 영향 검토 필요)
-- **Description**: 현재 `unified_qcf`(KV 액션 5종)와 `compute_qcf_swap`(weight)이 이름상 같은 QCF지만 측정 공간이 다르다(`‖ΔO‖/‖O‖` vs `Σ imp×ε / Σ`). 통일이 불가하다고 판단되어 **이름으로 패밀리를 분리**. CLAUDE.md "QCF 명명 컨벤션" 섹션에 결정 기록됨 (2026-04-27).
-- **결정 사항**:
-  - **QCF_kv**: sliding/H2O/streaming eviction, KIVI quant, D2O merge (구 `unified_qcf`)
-  - **QCF_weight**: weight swap (F16→Q4), layer skip (SWIFT)
-  - 두 패밀리는 직접 비교 불가, cross-action 비교는 `DegradationEstimator` ΔPPL 환산 경유
-- **Acceptance Criteria**:
-  - `core/qcf/unified_qcf.rs` → `kv_qcf.rs`로 rename
-  - 함수/타입 rename: `compute_unified_qcf` → `compute_kv_qcf`, `UnifiedQcfParams` → `KvQcfParams`, `QcfActionType` → `KvQcfAction`
-  - swap/skip 함수에 `weight_` 접두 추가: `compute_weight_swap_qcf`, `compute_weight_skip_qcf`
-  - `DegradationEstimator` action key 컨벤션 정리: `kv.evict_h2o`, `kv.quant_kivi_q4`, `weight.swap_q4`, `weight.skip` 등 `family.action` 2단계
-  - `shared/src/lib.rs::QcfEstimate.estimates` HashMap key prefix 통일 (구조체 이름·필드는 IPC 호환성 위해 유지)
-  - `docs/USAGE.md`, `docs/layer_swap_qcf_measurement.md`, `arch/`, spec 테스트의 용어 갱신
-  - 기존 spec 테스트 PASS 유지 (rename만이라 동작 변경 없음)
-- **담당 권장**: Architect(spec key 정규화) + Implementer(rename + 테스트)
-- **Notes**:
-  - layer skip 자체의 QCF는 이미 `layer_importance.rs::compute_qcf`에 존재. weight 패밀리로 묶기.
-  - 별도 후속 검토(별 backlog): swap의 ε_i를 `‖W_F16·x − W_Q4·x‖ / ‖W_F16·x‖`로 재정의하면 QCF_kv와 같은 분자/분모 모양이 됨 → cross-family raw 비교 가능. 본 rename과는 독립.
+- **Status**: RESOLVED (2026-05-19, Sprint 2 완료)
+- **Sprint**: completed
+- **Dependencies**: 없음
+- **Description**: 현재 `unified_qcf`(KV 액션 5종)와 `compute_qcf_swap`(weight)이 이름상 같은 QCF지만 측정 공간이 다르다(`‖ΔO‖/‖O‖` vs `Σ imp×ε / Σ`). 통일이 불가하다고 판단되어 **이름으로 패밀리를 분리**.
+- **적용 결과 (2026-05-19, Sprint 2 commit)**:
+  - `core/qcf/unified_qcf.rs` → `core/qcf/qcf_kv.rs` rename
+  - `UnifiedQcfParams` → `QcfKvParams`, `compute_unified_qcf` → `compute_qcf_kv`
+  - `ImportanceTable::compute_qcf` → `compute_qcf_weight` (skip 패밀리)
+  - `decider::compute_qcf_swap` → `compute_qcf_weight_swap` (swap 패밀리, internal helper 포함)
+  - `docs/qcf_taxonomy.md` 갱신 (파일 경로 + 함수명 모두 신규명 반영)
+  - `engine/tests/spec/inv_layer_baseline.json` 의 unified_qcf.rs → qcf_kv.rs, compute_qcf_swap → compute_qcf_weight_swap 동기화
+  - 호출처 일괄 sed: `eval/eviction_hook.rs`, `eval/eval_loop.rs`, `bin/generate.rs`, `session/{ppl/runner,qcf_runtime}.rs`, `models/weights/{decider,mod}.rs`, `profile/quality_metrics.rs`, spec test 5개 파일
+- **Deferred (별 backlog)**:
+  - `DegradationEstimator` action key prefix 정규화 (`kv.*` / `weight.*`) — 호출처 string literal이 다수, ablation/eval 결과 호환성과 별도로 진행
+  - `shared::QcfEstimate.estimates` HashMap key — IPC 메시지라 manager 동시 갱신 필요
+  - 위 두 항목은 본 sprint 범위 밖. 별 backlog 항목으로 분리 권장.
+- **검증**: `cargo build --release -p llm_rs2` PASS, lib 160 qcf-related test PASS, spec 660/663 PASS (3 fail = 사전 device-required).
 - **작성일**: 2026-04-27
+- **종결일**: 2026-05-19
 
 ---
 

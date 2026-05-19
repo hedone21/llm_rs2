@@ -9,8 +9,8 @@ use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::{
-    AggregationMode, QcfActionType, QcfConfig, UnifiedQcfParams, VDataSource, aggregate_heads,
-    compute_c1, compute_d7, compute_unified_qcf, identify_retained_for_action,
+    AggregationMode, QcfActionType, QcfConfig, QcfKvParams, VDataSource, aggregate_heads,
+    compute_c1, compute_d7, compute_qcf_kv, identify_retained_for_action,
 };
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
@@ -388,7 +388,7 @@ impl StepHook<KVCache> for EvictionHook {
             } else {
                 None
             };
-            let params = UnifiedQcfParams {
+            let params = QcfKvParams {
                 action,
                 v_source,
                 k_source,
@@ -402,7 +402,7 @@ impl StepHook<KVCache> for EvictionHook {
                 aggregation: AggregationMode::Mean,
                 beta: 1.0,
             };
-            let (qcf, per_head) = compute_unified_qcf(&params);
+            let (qcf, per_head) = compute_qcf_kv(&params);
 
             if self.experimental_enabled {
                 // Schema v3: per-layer worst-head + mean-head over the sample layers.
@@ -478,7 +478,7 @@ impl StepHook<KVCache> for EvictionHook {
                                 target_len: target_len_l,
                             }
                         };
-                        let params_l = UnifiedQcfParams {
+                        let params_l = QcfKvParams {
                             action: action_l,
                             v_source: v_source_l,
                             k_source: k_source_l,
@@ -492,7 +492,7 @@ impl StepHook<KVCache> for EvictionHook {
                             aggregation: AggregationMode::Mean,
                             beta: 1.0,
                         };
-                        let (_qcf_l, ph_l) = compute_unified_qcf(&params_l);
+                        let (_qcf_l, ph_l) = compute_qcf_kv(&params_l);
                         ph_l
                     };
 

@@ -474,7 +474,7 @@
     },
     {
       "id": "V-14",
-      "file": "core/qcf/unified_qcf.rs",
+      "file": "core/qcf/qcf_kv.rs",
       "line": 178,
       "import": "crate::profile::quality_metrics::Timer::start",
       "rule": "INV-LAYER-003",
@@ -483,7 +483,7 @@
     },
     {
       "id": "V-14",
-      "file": "core/qcf/unified_qcf.rs",
+      "file": "core/qcf/qcf_kv.rs",
       "line": 179,
       "import": "crate::profile::quality_metrics::QCF_KV_UNIFIED",
       "rule": "INV-LAYER-003",
@@ -1629,7 +1629,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 6725,
-      "import": "crate::models::weights::compute_qcf_swap",
+      "import": "crate::models::weights::compute_qcf_weight_swap",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
       "note": "ARCHITECTURE.md §13.5"
@@ -2182,7 +2182,7 @@
     },
     {
       "id": "V-??",
-      "file": "core/qcf/unified_qcf.rs",
+      "file": "core/qcf/qcf_kv.rs",
       "line": 37,
       "import": "crate::core::kv_cache::",
       "rule": "INV-LAYER-003",

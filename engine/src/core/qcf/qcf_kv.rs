@@ -144,7 +144,7 @@ impl<'a> VDataSource<'a> {
 // ── Parameters ──────────────────────────────────────────────────
 
 /// All inputs needed to compute the unified QCF metric.
-pub struct UnifiedQcfParams<'a> {
+pub struct QcfKvParams<'a> {
     /// The action to simulate.
     pub action: QcfActionType,
     /// V buffer data (F32, F16, or Q4_0).
@@ -174,7 +174,7 @@ pub struct UnifiedQcfParams<'a> {
 /// Compute unified QCF for the given action.
 ///
 /// Returns `(aggregated_qcf, per_head_qcf)`.
-pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
+pub fn compute_qcf_kv(params: &QcfKvParams) -> (f32, Vec<f32>) {
     let _t = crate::profile::quality_metrics::Timer::start(
         &crate::profile::quality_metrics::QCF_KV_UNIFIED,
     );
@@ -802,7 +802,7 @@ mod tests {
         let v_data = make_v_data(n_kv_heads, capacity, head_dim);
         let scores = uniform_scores(current_pos);
 
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::EvictSliding {
                 target_len: current_pos,
             },
@@ -819,7 +819,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf, per_head) = compute_unified_qcf(&params);
+        let (qcf, per_head) = compute_qcf_kv(&params);
         assert!(
             qcf.abs() < 1e-6,
             "expected QCF=0 when nothing evicted, got {qcf}"
@@ -839,7 +839,7 @@ mod tests {
         let v_data = make_v_data(n_kv_heads, capacity, head_dim);
         let scores = uniform_scores(current_pos);
 
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 0 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -854,7 +854,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf, _) = compute_unified_qcf(&params);
+        let (qcf, _) = compute_qcf_kv(&params);
         // With 0 retained tokens, O_after = 0, so QCF = ||O_before|| / ||O_before|| = 1.0
         assert!(
             (qcf - 1.0).abs() < 1e-5,
@@ -872,7 +872,7 @@ mod tests {
         let v_data = make_v_data(n_kv_heads, capacity, head_dim);
         let scores = uniform_scores(current_pos);
 
-        let make_params = |target_len: usize| UnifiedQcfParams {
+        let make_params = |target_len: usize| QcfKvParams {
             action: QcfActionType::EvictSliding { target_len },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -887,9 +887,9 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf_keep_12, _) = compute_unified_qcf(&make_params(12));
-        let (qcf_keep_8, _) = compute_unified_qcf(&make_params(8));
-        let (qcf_keep_4, _) = compute_unified_qcf(&make_params(4));
+        let (qcf_keep_12, _) = compute_qcf_kv(&make_params(12));
+        let (qcf_keep_8, _) = compute_qcf_kv(&make_params(8));
+        let (qcf_keep_4, _) = compute_qcf_kv(&make_params(4));
 
         assert!(
             qcf_keep_4 > qcf_keep_8,
@@ -911,7 +911,7 @@ mod tests {
         let v_data = make_v_data(n_kv_heads, capacity, head_dim);
         let scores = uniform_scores(current_pos);
 
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::EvictStreaming {
                 sink_size: 4,
                 window_size: 4,
@@ -929,7 +929,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf, _) = compute_unified_qcf(&params);
+        let (qcf, _) = compute_qcf_kv(&params);
         assert!(
             qcf.abs() < 1e-6,
             "expected QCF=0 when sink+window covers all tokens, got {qcf}"
@@ -966,7 +966,7 @@ mod tests {
 
         let target_len = 8;
 
-        let sliding_params = UnifiedQcfParams {
+        let sliding_params = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -981,7 +981,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let h2o_params = UnifiedQcfParams {
+        let h2o_params = QcfKvParams {
             action: QcfActionType::EvictH2o {
                 target_len,
                 keep_ratio: 0.5,
@@ -1000,8 +1000,8 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf_sliding, _) = compute_unified_qcf(&sliding_params);
-        let (qcf_h2o, _) = compute_unified_qcf(&h2o_params);
+        let (qcf_sliding, _) = compute_qcf_kv(&sliding_params);
+        let (qcf_h2o, _) = compute_qcf_kv(&h2o_params);
 
         assert!(
             qcf_h2o <= qcf_sliding + 1e-6,
@@ -1026,7 +1026,7 @@ mod tests {
             .collect();
         let scores = uniform_scores(current_pos);
 
-        let params_f32 = UnifiedQcfParams {
+        let params_f32 = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 2 },
             v_source: VDataSource::F32(&v_f32),
             k_source: None,
@@ -1041,7 +1041,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let params_f16 = UnifiedQcfParams {
+        let params_f16 = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 2 },
             v_source: VDataSource::F16(&v_f16),
             k_source: None,
@@ -1056,8 +1056,8 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf_f32, _) = compute_unified_qcf(&params_f32);
-        let (qcf_f16, _) = compute_unified_qcf(&params_f16);
+        let (qcf_f32, _) = compute_qcf_kv(&params_f32);
+        let (qcf_f16, _) = compute_qcf_kv(&params_f16);
 
         // F16 introduces small rounding but QCF should be very close
         assert!(
@@ -1076,7 +1076,7 @@ mod tests {
         let v_data = make_v_data(n_kv_heads, capacity, head_dim);
         let scores = uniform_scores(current_pos);
 
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::EvictStreaming {
                 sink_size: 2,
                 window_size: 4,
@@ -1094,7 +1094,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf, _) = compute_unified_qcf(&params);
+        let (qcf, _) = compute_qcf_kv(&params);
         // 10 out of 16 tokens evicted, QCF should be significant
         assert!(
             qcf > 0.0,
@@ -1123,7 +1123,7 @@ mod tests {
             head_attn[current_pos + t] = (t + 1) as f32;
         }
 
-        let params_flat = UnifiedQcfParams {
+        let params_flat = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 4 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -1138,7 +1138,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let params_head = UnifiedQcfParams {
+        let params_head = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 4 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -1153,8 +1153,8 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf_flat, _ph_flat) = compute_unified_qcf(&params_flat);
-        let (qcf_head, ph_head) = compute_unified_qcf(&params_head);
+        let (qcf_flat, _ph_flat) = compute_qcf_kv(&params_flat);
+        let (qcf_head, ph_head) = compute_qcf_kv(&params_head);
 
         // Per-head should yield different per-head values
         assert!(
@@ -1189,7 +1189,7 @@ mod tests {
         let keep_ratio = 0.5;
         let protected_prefix = 2;
 
-        let h2o_params = UnifiedQcfParams {
+        let h2o_params = QcfKvParams {
             action: QcfActionType::EvictH2o {
                 target_len,
                 keep_ratio,
@@ -1208,7 +1208,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let d2o_params = UnifiedQcfParams {
+        let d2o_params = QcfKvParams {
             action: QcfActionType::MergeD2o {
                 target_len,
                 keep_ratio,
@@ -1227,8 +1227,8 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf_h2o, ph_h2o) = compute_unified_qcf(&h2o_params);
-        let (qcf_d2o, ph_d2o) = compute_unified_qcf(&d2o_params);
+        let (qcf_h2o, ph_h2o) = compute_qcf_kv(&h2o_params);
+        let (qcf_d2o, ph_d2o) = compute_qcf_kv(&d2o_params);
 
         // D2O should produce lower QCF than H2O (merge preserves info)
         assert!(
@@ -1265,7 +1265,7 @@ mod tests {
         let v_data = make_v_data(n_kv_heads, capacity, head_dim);
         let scores = uniform_scores(current_pos);
 
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::MergeD2o {
                 target_len: current_pos,
                 keep_ratio: 0.5,
@@ -1284,7 +1284,7 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf, _) = compute_unified_qcf(&params);
+        let (qcf, _) = compute_qcf_kv(&params);
         assert!(
             qcf.abs() < 1e-6,
             "D2O with no eviction should give QCF=0, got {qcf}"
@@ -1324,7 +1324,7 @@ mod tests {
         let keep_ratio = 0.5;
         let protected_prefix = 1;
 
-        let params_v = UnifiedQcfParams {
+        let params_v = QcfKvParams {
             action: QcfActionType::MergeD2o {
                 target_len,
                 keep_ratio,
@@ -1342,7 +1342,7 @@ mod tests {
             aggregation: AggregationMode::Mean,
             beta: 1.0,
         };
-        let params_k = UnifiedQcfParams {
+        let params_k = QcfKvParams {
             action: QcfActionType::MergeD2o {
                 target_len,
                 keep_ratio,
@@ -1361,8 +1361,8 @@ mod tests {
             beta: 1.0,
         };
 
-        let (qcf_v, _) = compute_unified_qcf(&params_v);
-        let (qcf_k, _) = compute_unified_qcf(&params_k);
+        let (qcf_v, _) = compute_qcf_kv(&params_v);
+        let (qcf_k, _) = compute_qcf_kv(&params_k);
 
         assert!(
             (qcf_v - qcf_k).abs() > 1e-6,
@@ -1403,7 +1403,7 @@ mod tests {
         // target_len = 1, keep_ratio = 1.0, protected_prefix = 0
         // ⇒ retained = {0}. All other 7 tokens evicted, all map to t=0.
         let scores = uniform_scores(current_pos);
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::MergeD2o {
                 target_len: 1,
                 keep_ratio: 1.0,
@@ -1425,7 +1425,7 @@ mod tests {
         // Re-derive O_after = w · V_merged[0] where w = alpha[0]/Σα = 1
         // (only retained token), so ‖O_after‖ = ‖V_merged[0]‖.
         // Run the QCF and reconstruct ‖V_merged[0]‖ from QCF + ‖O_before‖.
-        let (qcf, _) = compute_unified_qcf(&params);
+        let (qcf, _) = compute_qcf_kv(&params);
 
         // O_before for head 0 with uniform alpha=1/8.
         let mut o_before = vec![0.0f32; head_dim];
@@ -1474,7 +1474,7 @@ mod tests {
         let scores = vec![1.0f32; 8];
 
         // Zero heads
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 4 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -1488,12 +1488,12 @@ mod tests {
             aggregation: AggregationMode::Mean,
             beta: 1.0,
         };
-        let (qcf, per_head) = compute_unified_qcf(&params);
+        let (qcf, per_head) = compute_qcf_kv(&params);
         assert_eq!(qcf, 0.0);
         assert!(per_head.is_empty());
 
         // Zero current_pos
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 4 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -1507,7 +1507,7 @@ mod tests {
             aggregation: AggregationMode::Mean,
             beta: 1.0,
         };
-        let (qcf, _) = compute_unified_qcf(&params);
+        let (qcf, _) = compute_qcf_kv(&params);
         assert_eq!(qcf, 0.0);
     }
 
@@ -1757,7 +1757,7 @@ mod tests {
     ///   w[1] = w[2] = 0.5  (same as β=1 for uniform scores!)
     ///   So QCF_β2 == QCF_β1 for uniform scores (confirmed by test).
     #[test]
-    fn test_compute_unified_qcf_beta_one_matches_hand_computed() {
+    fn test_compute_qcf_kv_beta_one_matches_hand_computed() {
         let n_kv_heads = 1;
         let head_dim = 2;
         let capacity = 8;
@@ -1773,7 +1773,7 @@ mod tests {
         }
         let scores = uniform_scores(current_pos); // [1/3, 1/3, 1/3]
 
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 2 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -1787,7 +1787,7 @@ mod tests {
             aggregation: AggregationMode::Mean,
             beta: 1.0,
         };
-        let (qcf, _) = compute_unified_qcf(&params);
+        let (qcf, _) = compute_qcf_kv(&params);
         // expected ≈ 0.25 (see above derivation)
         assert!(
             (qcf - 0.25).abs() < 1e-5,
@@ -1796,7 +1796,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_unified_qcf_beta_amplifies_non_uniform() {
+    fn test_compute_qcf_kv_beta_amplifies_non_uniform() {
         // For non-uniform scores β=2 should differ from β=1.
         // Setup: n_kv_heads=1, head_dim=2, current_pos=3, target_len=2
         // scores = [0.1, 0.9, 0.9]  (non-uniform, heavy on tokens 1 and 2)
@@ -1824,7 +1824,7 @@ mod tests {
         // Non-uniform: token 1 weight 0.3, token 2 weight 0.6
         let scores = vec![0.1f32, 0.3, 0.6];
 
-        let params_b1 = UnifiedQcfParams {
+        let params_b1 = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 2 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -1838,7 +1838,7 @@ mod tests {
             aggregation: AggregationMode::Mean,
             beta: 1.0,
         };
-        let params_b2 = UnifiedQcfParams {
+        let params_b2 = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 2 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -1853,8 +1853,8 @@ mod tests {
             beta: 2.0,
         };
 
-        let (qcf_b1, _) = compute_unified_qcf(&params_b1);
-        let (qcf_b2, _) = compute_unified_qcf(&params_b2);
+        let (qcf_b1, _) = compute_qcf_kv(&params_b1);
+        let (qcf_b2, _) = compute_qcf_kv(&params_b2);
 
         assert!(
             (qcf_b1 - qcf_b2).abs() > 1e-5,
@@ -1880,7 +1880,7 @@ mod tests {
         // Non-uniform scores, but β=0 should equalise weights
         let scores = vec![0.1f32, 5.0, 2.0, 0.5];
 
-        let params = UnifiedQcfParams {
+        let params = QcfKvParams {
             action: QcfActionType::EvictSliding { target_len: 3 },
             v_source: VDataSource::F32(&v_data),
             k_source: None,
@@ -1905,7 +1905,7 @@ mod tests {
             .map(|d| (expected_v1[d] + expected_v2[d] + expected_v3[d]) / 3.0)
             .collect();
 
-        let (qcf_b0, _) = compute_unified_qcf(&params);
+        let (qcf_b0, _) = compute_qcf_kv(&params);
 
         // Compute what QCF would be with that expected_o
         // O_before = (1/current_pos) * sum of all V[t]  (no: scores aren't uniform, but we just

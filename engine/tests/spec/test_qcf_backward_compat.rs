@@ -6,22 +6,22 @@
 //! β=1.0 case, these tests will catch it.
 //!
 //! Contract:
-//! - `compute_unified_qcf` with β=1.0 must return (finite, ≥0) for all action types.
+//! - `compute_qcf_kv` with β=1.0 must return (finite, ≥0) for all action types.
 //! - `per_head.len()` must equal `n_kv_heads`.
 //! - When attention is uniform, QCF must be finite and well-defined (no NaN/inf).
 
 use llm_rs2::core::kv_cache::KVLayout;
 use llm_rs2::core::qcf::{
-    AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf,
+    AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv,
 };
 
 // ── Shared fixture ──────────────────────────────────────────────────────────
 
 /// Simple 2-token, 1-head, head_dim=2 setup with uniform attention.
-fn make_uniform_params(action: QcfActionType) -> UnifiedQcfParams<'static> {
+fn make_uniform_params(action: QcfActionType) -> QcfKvParams<'static> {
     static V: &[f32] = &[1.0, 2.0, 3.0, 4.0];
     static ATTN: &[f32] = &[0.5, 0.5]; // uniform → β=1.0 safe default
-    UnifiedQcfParams {
+    QcfKvParams {
         action,
         v_source: VDataSource::F32(V),
         k_source: None,
@@ -41,7 +41,7 @@ fn make_uniform_params(action: QcfActionType) -> UnifiedQcfParams<'static> {
 
 #[test]
 fn spec_beta_one_sliding_fast_path() {
-    let (q, ph) = compute_unified_qcf(&make_uniform_params(QcfActionType::EvictSliding {
+    let (q, ph) = compute_qcf_kv(&make_uniform_params(QcfActionType::EvictSliding {
         target_len: 1,
     }));
     assert!(q.is_finite(), "sliding β=1.0 QCF must be finite: {q}");
@@ -53,7 +53,7 @@ fn spec_beta_one_sliding_fast_path() {
 
 #[test]
 fn spec_beta_one_h2o_fast_path() {
-    let (q, ph) = compute_unified_qcf(&make_uniform_params(QcfActionType::EvictH2o {
+    let (q, ph) = compute_qcf_kv(&make_uniform_params(QcfActionType::EvictH2o {
         target_len: 1,
         keep_ratio: 0.5,
         protected_prefix: 0,
@@ -67,7 +67,7 @@ fn spec_beta_one_h2o_fast_path() {
 
 #[test]
 fn spec_beta_one_streaming_fast_path() {
-    let (q, ph) = compute_unified_qcf(&make_uniform_params(QcfActionType::EvictStreaming {
+    let (q, ph) = compute_qcf_kv(&make_uniform_params(QcfActionType::EvictStreaming {
         sink_size: 1,
         window_size: 1,
     }));
@@ -80,7 +80,7 @@ fn spec_beta_one_streaming_fast_path() {
 
 #[test]
 fn spec_beta_one_d2o_fast_path() {
-    let (q, ph) = compute_unified_qcf(&make_uniform_params(QcfActionType::MergeD2o {
+    let (q, ph) = compute_qcf_kv(&make_uniform_params(QcfActionType::MergeD2o {
         target_len: 1,
         keep_ratio: 0.5,
         protected_prefix: 0,
@@ -97,7 +97,7 @@ fn spec_per_head_len_matches_n_kv_heads() {
     // 2 KV heads, head_dim=4, 3 tokens.
     let v: Vec<f32> = (0..24).map(|x| x as f32).collect(); // 2 heads × 3 tokens × head_dim=4
     let attn: Vec<f32> = vec![0.2, 0.3, 0.5];
-    let p = UnifiedQcfParams {
+    let p = QcfKvParams {
         action: QcfActionType::EvictSliding { target_len: 2 },
         v_source: VDataSource::F32(&v),
         k_source: None,
@@ -111,7 +111,7 @@ fn spec_per_head_len_matches_n_kv_heads() {
         aggregation: AggregationMode::Mean,
         beta: 1.0,
     };
-    let (q, ph) = compute_unified_qcf(&p);
+    let (q, ph) = compute_qcf_kv(&p);
     assert!(q.is_finite(), "2-head β=1.0 QCF must be finite: {q}");
     assert_eq!(
         ph.len(),
@@ -126,7 +126,7 @@ fn spec_per_head_len_matches_n_kv_heads() {
 #[test]
 fn spec_uniform_attention_gives_finite_qcf() {
     // Uniform attention → evicted token has average importance → non-zero QCF.
-    let (q, _) = compute_unified_qcf(&make_uniform_params(QcfActionType::EvictSliding {
+    let (q, _) = compute_qcf_kv(&make_uniform_params(QcfActionType::EvictSliding {
         target_len: 1,
     }));
     assert!(q.is_finite() && q >= 0.0, "uniform attention: q={q}");
@@ -137,7 +137,7 @@ fn spec_single_token_cache_ok() {
     // Edge case: target_len=1, current_pos=1 → evict 0 tokens → QCF should be 0.
     static V: &[f32] = &[1.0, 2.0];
     static ATTN: &[f32] = &[1.0];
-    let p = UnifiedQcfParams {
+    let p = QcfKvParams {
         action: QcfActionType::EvictSliding { target_len: 1 },
         v_source: VDataSource::F32(V),
         k_source: None,
@@ -151,7 +151,7 @@ fn spec_single_token_cache_ok() {
         aggregation: AggregationMode::Mean,
         beta: 1.0,
     };
-    let (q, ph) = compute_unified_qcf(&p);
+    let (q, ph) = compute_qcf_kv(&p);
     assert!(q.is_finite(), "single-token edge case: q={q}");
     assert_eq!(ph.len(), 1);
 }

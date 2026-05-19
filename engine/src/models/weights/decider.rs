@@ -221,7 +221,7 @@ impl<'a> WeightSwapDecider<'a> {
             }
         };
 
-        let qcf = compute_qcf_swap_internal(&selected, n, self.importance, self.noise);
+        let qcf = compute_qcf_weight_swap_internal(&selected, n, self.importance, self.noise);
 
         SwapDecision {
             selected_layers: selected,
@@ -253,7 +253,7 @@ impl<'a> WeightSwapDecider<'a> {
 /// - Layers with NaN ε are excluded from both numerator and denominator.
 /// - Missing importance entries (table absent) default to `1.0`.
 /// - Returns `0.0` when `swap_set` is empty or denominator ≈ 0.
-pub fn compute_qcf_swap(
+pub fn compute_qcf_weight_swap(
     swap_set: &[usize],
     noise: &QuantNoiseTable,
     importance: Option<&ImportanceTable>,
@@ -262,11 +262,11 @@ pub fn compute_qcf_swap(
     let _t = crate::profile::quality_metrics::Timer::start(
         &crate::profile::quality_metrics::QCF_WEIGHT_SWAP,
     );
-    compute_qcf_swap_internal(swap_set, n_decoder_layers, importance, Some(noise))
+    compute_qcf_weight_swap_internal(swap_set, n_decoder_layers, importance, Some(noise))
 }
 
 /// Internal implementation used by both the public function and the decider.
-fn compute_qcf_swap_internal(
+fn compute_qcf_weight_swap_internal(
     swap_set: &[usize],
     n_decoder_layers: usize,
     importance: Option<&ImportanceTable>,
@@ -588,13 +588,13 @@ mod tests {
         assert!(decision.selected_layers.contains(&3));
     }
 
-    // ── compute_qcf_swap tests (ENG-ALG-217) ─────────────────────────────────
+    // ── compute_qcf_weight_swap tests (ENG-ALG-217) ─────────────────────────────────
 
     /// Empty swap set → QCF_swap = 0.0.
     #[test]
     fn qcf_swap_empty_set_is_zero() {
         let noise = make_noise(vec![0.2, 0.1, 0.3, 0.05]);
-        let result = compute_qcf_swap(&[], &noise, None, 4);
+        let result = compute_qcf_weight_swap(&[], &noise, None, 4);
         assert_eq!(result, 0.0);
     }
 
@@ -603,7 +603,7 @@ mod tests {
     fn qcf_swap_full_set_approx_one() {
         let noise = make_noise(vec![0.2, 0.1, 0.3, 0.05]);
         // All layers in the "valid" set (no NaN)
-        let result = compute_qcf_swap(&[0, 1, 2, 3], &noise, None, 4);
+        let result = compute_qcf_weight_swap(&[0, 1, 2, 3], &noise, None, 4);
         assert!(
             (result - 1.0).abs() < 1e-6,
             "full set should give QCF_swap ≈ 1.0, got {result}"
@@ -614,9 +614,9 @@ mod tests {
     #[test]
     fn qcf_swap_monotonic() {
         let noise = make_noise(vec![0.2, 0.1, 0.3, 0.05]);
-        let q1 = compute_qcf_swap(&[1], &noise, None, 4);
-        let q2 = compute_qcf_swap(&[1, 2], &noise, None, 4);
-        let q3 = compute_qcf_swap(&[0, 1, 2], &noise, None, 4);
+        let q1 = compute_qcf_weight_swap(&[1], &noise, None, 4);
+        let q2 = compute_qcf_weight_swap(&[1, 2], &noise, None, 4);
+        let q3 = compute_qcf_weight_swap(&[0, 1, 2], &noise, None, 4);
         assert!(q1 <= q2, "monotonic: q({{1}})={q1} <= q({{1,2}})={q2}");
         assert!(q2 <= q3, "monotonic: q({{1,2}})={q2} <= q({{0,1,2}})={q3}");
     }
@@ -627,8 +627,8 @@ mod tests {
         let noise = QuantNoiseTable::new_test(vec![0.2, f32::NAN, 0.3, 0.05]);
         // Layer 1 has NaN ε — should contribute 0 to numerator and denominator.
         // Including it in swap_set should not change result vs. excluding it.
-        let without_nan = compute_qcf_swap(&[0, 2, 3], &noise, None, 4);
-        let with_nan = compute_qcf_swap(&[0, 1, 2, 3], &noise, None, 4);
+        let without_nan = compute_qcf_weight_swap(&[0, 2, 3], &noise, None, 4);
+        let with_nan = compute_qcf_weight_swap(&[0, 1, 2, 3], &noise, None, 4);
         assert!(
             (without_nan - with_nan).abs() < 1e-6,
             "NaN layer should not affect QCF_swap: without={without_nan}, with={with_nan}"
