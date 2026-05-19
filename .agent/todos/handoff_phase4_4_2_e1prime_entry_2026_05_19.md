@@ -48,6 +48,24 @@ ctx 필드 70+ 개와 fallback 진입 직전 mut state 다수(`incremental_force
 
 각 단계가 **즉시 commit/ff-merge** 후 다음 단계 진입 → main HEAD 항상 안정.
 
+### 2.5 방향 결정: G3 (LOC 감소) only — 2026-05-19 추가 논의 확정
+
+`arch/inference_pipeline.md` + `ARCHITECTURE.md §13` 기준 main() split 목적 3가지:
+
+| # | 목적 | 출처 |
+|---|---|---|
+| G1 | 6 trait SOLID 분해 (Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver) | `inference_pipeline.md §1` |
+| G2 | 외부 공개 plugin point (INV-LAYER-006, L4 필드 = `Box<dyn Trait>` only) | `ARCHITECTURE.md §13.6` |
+| G3 | main() ~400 LOC assembler (CLI parse → init → build_*_loop → prefill+run+finalize) | `inference_pipeline.md §5` |
+
+**Phase 4-4-2 E1' (PrefillCtx 35필드 cut/paste 패턴)은 G3에만 기여, G1/G2 가치 0**. 사용자 확정:
+
+- **방향 A 채택**: fallback은 영구 자산이 아닌 임시 자산 — 단순 cut/paste로 main()의 contour를 먼저 드러낸다
+- **방향 B 거부**: ModelForward trait에 `prefill_chunked + collector 주입` 흡수는 D2O variance collector + ENG-ALG-218 last-chunk arm + resilience checkpoint mid-prefill mutation 등 **정확성 회귀 위험 과대**
+- **후속 결정 gate**: A 4 sub-sprint 완료 후 `session::prefill` / `session::decode_fallback` 격리체가 드러나면, happy path가 흡수 가능한 부분 / 영구 잔존 부분을 재평가. 그 시점에 ModelForward 확장 여부 결정
+
+**즉, 본 4 sub-sprint는 의도된 mechanical move이며 trait 추상화는 차후 별도 작업**. PrefillCtx 35필드가 God Ctx로 보이더라도 sub-sprint 내에서 trait 분해 시도 금지 — scope creep 방지.
+
 ---
 
 ## 3. Sub-sprint 1: Phase 4-4-2.1 — Prefill block 추출
