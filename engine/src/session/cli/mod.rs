@@ -492,7 +492,9 @@ pub struct Args {
     /// Enable KIVI-style Q2 KV cache compression (ICML 2024).
     /// Mutually exclusive with eviction policies; uses FP32 residual buffer
     /// that batch-quantizes to 2-bit when full.
-    #[arg(long, default_value_t = false)]
+    ///
+    /// DEPRECATED: use `--kv-mode kivi` instead.
+    #[arg(long, default_value_t = false, hide = true)]
     pub kivi: bool,
 
     /// Enable dynamic KV cache quantization for resilience.
@@ -502,12 +504,16 @@ pub struct Args {
     pub kv_dynamic_quant: bool,
 
     /// KIVI quantization bit-width (2, 4, or 8). Default: 2.
-    #[arg(long, default_value_t = 2)]
+    ///
+    /// DEPRECATED: use `--kv-kivi-bits` (with `--kv-mode kivi`) instead.
+    #[arg(long, default_value_t = 2, hide = true)]
     pub kivi_bits: u8,
 
     /// KIVI residual buffer size in tokens (must be multiple of 32).
     /// Default: 32. Larger values improve quality but use more memory.
-    #[arg(long, default_value_t = 32)]
+    ///
+    /// DEPRECATED: use `--kv-kivi-residual-len` (with `--kv-mode kivi`) instead.
+    #[arg(long, default_value_t = 32, hide = true)]
     pub kivi_residual_size: usize,
 
     /// Number of threads for parallel computation.
@@ -517,12 +523,16 @@ pub struct Args {
 
     /// KV cache offload mode: none, raw (in-memory), or disk (file-based).
     /// Requires --kv-layout seq and --kv-type f16 or f32.
-    #[arg(long, default_value = "none")]
+    ///
+    /// DEPRECATED: use `--kv-mode offload --kv-offload-storage <mode>` instead.
+    #[arg(long, default_value = "none", hide = true)]
     pub kv_offload: String,
 
     /// Directory for disk offload files (used with --kv-offload disk).
     /// Defaults to system temp dir if not specified.
-    #[arg(long, default_value = "")]
+    ///
+    /// DEPRECATED: kept for legacy `--kv-offload disk` invocations.
+    #[arg(long, default_value = "", hide = true)]
     pub offload_path: String,
 
     /// Maximum adaptive prefetch depth for offload KV cache pipeline.
@@ -531,7 +541,9 @@ pub struct Args {
     /// adaptive loop can spend essentially the entire decode trajectory
     /// on increasing/decreasing depth without hitting the ceiling on
     /// typical on-device workloads.
-    #[arg(long, default_value_t = 128)]
+    ///
+    /// DEPRECATED: use `--kv-max-prefetch-depth` (with `--kv-mode offload`) instead.
+    #[arg(long, default_value_t = 128, hide = true)]
     pub max_prefetch_depth: usize,
 
     /// Path to reference text file for perplexity evaluation (teacher-forcing).
@@ -1112,6 +1124,31 @@ impl Args {
             KvMode::Offload => self.kv_mode_args.kv_offload_storage.clone(),
             _ => self.kv_offload.clone(),
         }
+    }
+
+    /// Deprecation 경고 메시지 목록. legacy flag (`--kivi`, `--kv-offload`)가
+    /// 명시되어 실제 KvMode fallback path를 trigger한 경우에만 반환한다.
+    /// sub-args(`--kivi-bits` 등)는 trigger와 함께 사용해야만 의미가 있으므로
+    /// 상위 trigger 경고로 충분 (중복 노이즈 방지).
+    ///
+    /// `main()` 진입 직후 호출하여 stderr로 emit한다.
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.kivi {
+            warnings.push(
+                "warning: --kivi is deprecated, use `--kv-mode kivi` instead. \
+                 See docs/USAGE.md for the migration matrix."
+                    .to_string(),
+            );
+        }
+        if self.kv_offload != "none" && self.kv_mode_args.kv_mode != KvMode::Offload {
+            warnings.push(format!(
+                "warning: --kv-offload is deprecated, use `--kv-mode offload \
+                 --kv-offload-storage {}` instead.",
+                self.kv_offload
+            ));
+        }
+        warnings
     }
 
     /// Returns the nested `EvictionCmd` policy, unwrapping the

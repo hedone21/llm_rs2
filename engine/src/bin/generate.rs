@@ -93,6 +93,10 @@ fn main() -> anyhow::Result<()> {
     #[allow(unused_mut)]
     let mut args = Args::parse();
 
+    for warning in args.deprecation_warnings() {
+        eprintln!("{}", warning);
+    }
+
     let ctx = llm_rs2::session::init::SessionInitCtx::build(&args)?;
 
     // Unpack ctx fields for use in the rest of main()

@@ -178,3 +178,50 @@ fn effective_kv_offload_storage_uses_legacy_when_kv_offload_string() {
     ]);
     assert_eq!(args.effective_kv_offload_storage(), "mmap");
 }
+
+// ── deprecation_warnings (C5/C6 옵션 B) ──────────────────────────────────────
+
+#[test]
+fn deprecation_warnings_empty_when_no_legacy_flag() {
+    let args = parse(&["--model-path", "/tmp/x.gguf", "--prompt", "hi"]);
+    assert!(args.deprecation_warnings().is_empty());
+}
+
+#[test]
+fn deprecation_warnings_emitted_when_kivi_legacy_flag_set() {
+    let args = parse(&["--model-path", "/tmp/x.gguf", "--prompt", "hi", "--kivi"]);
+    let warnings = args.deprecation_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("--kivi is deprecated"));
+    assert!(warnings[0].contains("--kv-mode kivi"));
+}
+
+#[test]
+fn deprecation_warnings_emitted_when_kv_offload_legacy_used() {
+    let args = parse(&[
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kv-offload",
+        "mmap",
+    ]);
+    let warnings = args.deprecation_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("--kv-offload is deprecated"));
+    assert!(warnings[0].contains("--kv-offload-storage mmap"));
+}
+
+#[test]
+fn deprecation_warnings_silent_when_new_kv_mode_offload_used() {
+    // --kv-mode offload만 명시. legacy `--kv-offload`는 기본값 "none" → 경고 없음.
+    let args = parse(&[
+        "--model-path",
+        "/tmp/x.gguf",
+        "--prompt",
+        "hi",
+        "--kv-mode",
+        "offload",
+    ]);
+    assert!(args.deprecation_warnings().is_empty());
+}
