@@ -1,5 +1,9 @@
 use clap::Parser;
 
+pub mod eviction;
+
+pub use eviction::{D2oArgs, EvictionCmd, EvictionCommonArgs, H2oArgs, SlidingArgs, StreamingArgs};
+
 /// `--secondary-dtype` CLI 인수 값 (D-3, ENG-ALG-225).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecondaryDtypeArg {
