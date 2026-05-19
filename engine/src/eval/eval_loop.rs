@@ -150,7 +150,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         #[cfg(feature = "opencl")]
         {
             let (live, bytes, allocs, releases) =
-                crate::backend::opencl::buffer::snapshot_alloc_counters();
+                crate::memory::opencl::device::snapshot_alloc_counters();
             eprintln!(
                 "[OCL-Trace] pre-loop live={} bytes={:.1}MB total_allocs={} total_releases={}",
                 live,
@@ -174,7 +174,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             #[cfg(feature = "opencl")]
             {
                 let (live, bytes, allocs, releases) =
-                    crate::backend::opencl::buffer::snapshot_alloc_counters();
+                    crate::memory::opencl::device::snapshot_alloc_counters();
                 eprintln!(
                     "[OCL-Trace] Q{} begin id={} live={} bytes={:.1}MB total_allocs={} total_releases={}",
                     q_idx + 1,

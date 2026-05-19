@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::cpu::CpuBackend;
-use crate::buffer::mmap_buffer::MmapBuffer;
+use crate::memory::host::mmap::MmapBuffer;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
 use crate::core::memory::Memory;
@@ -20,7 +20,7 @@ use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::models::config::ModelConfig;
 
-use crate::buffer::shared_buffer::SharedBuffer;
+use crate::memory::host::shared::SharedBuffer;
 
 use super::convert::{dequant_q4_1, dequant_q4_k};
 use super::{LayerBiasKind, LayerWeightKind, TensorId, TensorSource};

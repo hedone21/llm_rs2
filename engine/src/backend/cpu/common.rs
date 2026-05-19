@@ -258,7 +258,7 @@ impl Backend for CpuBackendCommon {
     }
 
     fn copy_from(&self, t: &Tensor) -> Result<Tensor> {
-        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::host::shared::SharedBuffer;
         use std::sync::Arc;
 
         let new_buf = SharedBuffer::new(t.size(), t.dtype());

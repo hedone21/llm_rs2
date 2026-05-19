@@ -826,7 +826,7 @@ fn scatter_reduce_q4(
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::core::buffer::DType;
     use crate::core::kv_cache::KVLayout;
     use crate::core::pressure::PressureLevel;

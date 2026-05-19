@@ -32,7 +32,7 @@ use llm_rs2::backend::opencl::host_ptr_pool::{
     HostPtrPool, HostPtrPoolConfig, host_ptr_pool_env_enabled,
 };
 use llm_rs2::backend::opencl::{buffer_kind_label, get_cl_mem};
-use llm_rs2::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer;
+use llm_rs2::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer;
 use llm_rs2::core::buffer::DType;
 
 /// Try to bring up an OpenCL backend, returning `None` if the driver is

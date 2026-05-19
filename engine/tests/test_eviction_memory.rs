@@ -8,7 +8,7 @@
 #[cfg(feature = "resilience")]
 mod eviction_memory_test {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::buffer::{Buffer, DType};
     use llm_rs2::core::cache_manager::CacheManager;
     use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;

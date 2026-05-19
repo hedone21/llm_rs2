@@ -348,7 +348,7 @@ impl TransformerModel {
             }
             // Create ALLOC_HOST_PTR buffer, map, copy data from CPU buffer.
             let ub =
-                crate::buffer::unified_buffer::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
+                crate::memory::opencl::unified::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
             ub.map()?; // clEnqueueMapBuffer → host pointer
             // SAFETY: src_ptr is non-null (checked above), ub.as_mut_ptr() is valid after map().
             unsafe {
@@ -470,7 +470,7 @@ impl TransformerModel {
     /// point at the CPU loader because `copy_weight_from` preserves the
     /// source tensor's backend reference.
     pub fn quantize_lm_head_to_q4_0(&mut self, runtime_backend: &Arc<dyn Backend>) -> Result<bool> {
-        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::host::shared::SharedBuffer;
         use crate::models::loader::convert::quantize_q4_0;
         use half::f16;
 
@@ -644,7 +644,7 @@ impl TransformerModel {
         payload: &llm_shared::auf::reader::LmHeadPayload<'_>,
         runtime_backend: &Arc<dyn Backend>,
     ) -> Result<()> {
-        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::host::shared::SharedBuffer;
 
         let backend = runtime_backend.clone();
         // Use `is_gpu()` trait method — legacy `name()` comparison silently
@@ -810,7 +810,7 @@ impl TransformerModel {
             // Device-only buffer (OpenCLBuffer): read to new UnifiedBuffer.
             let size = t.size();
             let ub =
-                crate::buffer::unified_buffer::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
+                crate::memory::opencl::unified::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
             ub.map()?;
             // SAFETY: ub.as_mut_ptr() is valid after map(). read_buffer copies from GPU.
             let dst = unsafe { std::slice::from_raw_parts_mut(ub.as_mut_ptr(), size) };
@@ -1010,7 +1010,7 @@ impl TransformerModel {
         keep_original: bool,
     ) -> Result<usize> {
         use crate::backend::opencl::{NoshuffleSoaEntry, OpenCLBackend, get_cl_mem};
-        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
+        use crate::memory::opencl::noshuffle::NoshuffleWeightBuffer;
 
         let ocl_be = backend
             .as_any()
@@ -1583,7 +1583,7 @@ impl TransformerModel {
                 if let Some(ub) = x
                     .buffer()
                     .as_any()
-                    .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+                    .downcast_ref::<crate::memory::opencl::unified::UnifiedBuffer>()
                 {
                     let _ = ub.map();
                 }
@@ -2073,7 +2073,7 @@ impl TransformerModel {
                     .wq
                     .buffer()
                     .as_any()
-                    .downcast_ref::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>()
+                    .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>()
                     .is_some();
                 eprintln!(
                     "[build_plan-trace] layer0 wq key=0x{:x} is_NoshuffleWeightBuffer={}",
@@ -2970,7 +2970,7 @@ impl TransformerModel {
 
         // 2. Read x from GPU into a CPU-backed tensor.
         let x_size = x.size(); // F32 bytes
-        let x_cpu_buf = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+        let x_cpu_buf = Arc::new(crate::memory::host::shared::SharedBuffer::new(
             x_size,
             DType::F32,
         ));
@@ -2985,7 +2985,7 @@ impl TransformerModel {
 
         // 3. Allocate CPU logits buffer and run matmul.
         let logits_size = logits_out.size();
-        let logits_cpu_buf = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+        let logits_cpu_buf = Arc::new(crate::memory::host::shared::SharedBuffer::new(
             logits_size,
             DType::F32,
         ));
@@ -3587,7 +3587,7 @@ mod tests {
     /// Build a minimal TransformerModel with F16 lm_head (VOCAB×HIDDEN),
     /// CPU backend only.
     fn make_cpu_model_lm_head(vocab: usize, hidden: usize) -> (TransformerModel, Arc<dyn Backend>) {
-        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::host::shared::SharedBuffer;
         use crate::memory::galloc::Galloc;
         let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let mem = Galloc::new();

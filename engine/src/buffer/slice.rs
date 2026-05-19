@@ -115,7 +115,7 @@ impl Buffer for SliceBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
 
     fn make_buffer(size: usize, dtype: DType) -> Arc<dyn Buffer> {
         Arc::new(SharedBuffer::new(size, dtype))

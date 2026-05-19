@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::buffer::shared_buffer::SharedBuffer;
+use llm_rs2::memory::host::shared::SharedBuffer;
 use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::DType;
 use llm_rs2::core::kv_cache::KVCache;

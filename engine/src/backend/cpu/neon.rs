@@ -5336,7 +5336,7 @@ mod hybrid_partial_tests {
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::core::shape::Shape;
     use std::sync::Arc;
 

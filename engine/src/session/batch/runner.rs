@@ -172,7 +172,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 .residual
                 .buffer()
                 .as_any()
-                .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+                .downcast_ref::<crate::memory::opencl::unified::UnifiedBuffer>()
             {
                 ub.map()?;
                 eprintln!("[Partition] Residual UnifiedBuffer permanent-mapped for zero-copy");

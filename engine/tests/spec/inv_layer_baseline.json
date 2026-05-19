@@ -194,7 +194,7 @@
     },
     {
       "id": "V-07",
-      "file": "buffer/host_ptr_pool_buffer.rs",
+      "file": "memory/opencl/host_ptr_pool_buffer.rs",
       "line": 25,
       "import": "crate::backend::opencl::host_ptr_pool::HostPtrPoolGuard",
       "rule": "INV-LAYER-002",
@@ -203,7 +203,7 @@
     },
     {
       "id": "V-08",
-      "file": "buffer/cuda_mmap_alias_buffer.rs",
+      "file": "memory/cuda/mmap.rs",
       "line": 22,
       "import": "crate::models::weights::SecondaryMmap",
       "rule": "INV-LAYER-002",
@@ -212,7 +212,7 @@
     },
     {
       "id": "V-08",
-      "file": "buffer/rpcmem_alias_buffer.rs",
+      "file": "memory/rpcmem/opencl_alias.rs",
       "line": 25,
       "import": "crate::models::weights::SecondaryMmap",
       "rule": "INV-LAYER-002",
@@ -221,7 +221,7 @@
     },
     {
       "id": "V-08",
-      "file": "buffer/rpcmem_alias_buffer.rs",
+      "file": "memory/rpcmem/opencl_alias.rs",
       "line": 57,
       "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
       "rule": "INV-LAYER-002",
@@ -230,7 +230,7 @@
     },
     {
       "id": "V-08",
-      "file": "buffer/rpcmem_alias_buffer.rs",
+      "file": "memory/rpcmem/opencl_alias.rs",
       "line": 86,
       "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
       "rule": "INV-LAYER-002",
@@ -239,7 +239,7 @@
     },
     {
       "id": "V-09",
-      "file": "buffer/host_ptr_pool_buffer.rs",
+      "file": "memory/opencl/host_ptr_pool_buffer.rs",
       "line": 27,
       "import": "crate::models::weights::SecondaryMmap",
       "rule": "INV-LAYER-002",

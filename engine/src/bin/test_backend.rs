@@ -522,7 +522,7 @@ fn perform_matmul_test(
             let buf = c_gpu.buffer();
             if let Some(cl_buf) = buf
                 .as_any()
-                .downcast_ref::<llm_rs2::backend::opencl::buffer::OpenCLBuffer>()
+                .downcast_ref::<llm_rs2::memory::opencl::device::OpenCLBuffer>()
             {
                 let mut data = vec![0u8; m * n * 4];
                 cl_buf.buffer.read(&mut data).enq()?;
@@ -824,11 +824,11 @@ fn perform_kivi_attention_test(
             }
 
             // CPU tensor (for CPU cache update)
-            let cpu_k_buf = Arc::new(llm_rs2::buffer::shared_buffer::SharedBuffer::new(
+            let cpu_k_buf = Arc::new(llm_rs2::memory::host::shared::SharedBuffer::new(
                 n_elems * 4,
                 DType::F32,
             ));
-            let cpu_v_buf = Arc::new(llm_rs2::buffer::shared_buffer::SharedBuffer::new(
+            let cpu_v_buf = Arc::new(llm_rs2::memory::host::shared::SharedBuffer::new(
                 n_elems * 4,
                 DType::F32,
             ));

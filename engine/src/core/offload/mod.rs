@@ -14,7 +14,7 @@ pub mod raw_store;
 pub mod store;
 
 use crate::backend::cpu::CpuBackend;
-use crate::buffer::shared_buffer::SharedBuffer;
+use crate::memory::host::shared::SharedBuffer;
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCacheOps, KVLayout};

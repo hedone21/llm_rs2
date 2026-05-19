@@ -1213,7 +1213,7 @@ pub fn max_cache_pos(caches: &[KVCache]) -> usize {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::core::buffer::{Buffer, DType};
     use crate::core::shape::Shape;
     use crate::memory::galloc::Galloc;

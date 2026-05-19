@@ -381,7 +381,7 @@ mod android {
         if let Some(ub) = t
             .buffer()
             .as_any()
-            .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+            .downcast_ref::<crate::memory::opencl::unified::UnifiedBuffer>()
         {
             let mapped = ub.map()?;
             ensure!(

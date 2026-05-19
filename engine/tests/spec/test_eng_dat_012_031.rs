@@ -4,7 +4,7 @@
 //! Buffer trait default impls, DType size, Tensor creation/reshape/clone/slice.
 
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::buffer::shared_buffer::SharedBuffer;
+use llm_rs2::memory::host::shared::SharedBuffer;
 use llm_rs2::core::buffer::{Buffer, DType};
 use llm_rs2::core::kv_cache::{KVCache, KVCacheOps};
 use llm_rs2::core::shape::Shape;

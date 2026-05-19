@@ -1,5 +1,5 @@
-use super::buffer::OpenCLBuffer;
-use crate::buffer::unified_buffer::UnifiedBuffer;
+use crate::memory::opencl::device::OpenCLBuffer;
+use crate::memory::opencl::unified::UnifiedBuffer;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
 use anyhow::Result;

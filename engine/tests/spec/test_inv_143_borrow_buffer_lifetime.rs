@@ -34,7 +34,7 @@ use llm_shared::auf::{
     tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE},
     writer::AufWriter,
 };
-use llm_rs2::buffer::mmap_buffer::MmapBuffer;
+use llm_rs2::memory::host::mmap::MmapBuffer;
 use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::{Buffer, DType};
 use llm_rs2::core::shape::Shape;

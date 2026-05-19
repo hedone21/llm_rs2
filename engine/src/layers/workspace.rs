@@ -497,7 +497,7 @@ impl PartitionWorkspace {
             && let Some(ub) = cpu_merge_staging
                 .buffer()
                 .as_any()
-                .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+                .downcast_ref::<crate::memory::opencl::unified::UnifiedBuffer>()
         {
             let _ = ub.map();
         }
@@ -523,7 +523,7 @@ impl PartitionWorkspace {
         if let Some(ub) = ready_flag
             .buffer()
             .as_any()
-            .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+            .downcast_ref::<crate::memory::opencl::unified::UnifiedBuffer>()
         {
             let _ = ub.map();
         }

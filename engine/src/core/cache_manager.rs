@@ -667,7 +667,7 @@ impl CacheManager {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::core::buffer::DType;
     use crate::core::eviction::no_eviction::NoEvictionPolicy;
     use crate::core::eviction::sliding_window::SlidingWindowPolicy;

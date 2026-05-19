@@ -14,7 +14,7 @@ use llm_rs2::core::skip_config::SkipConfig;
 use llm_rs2::core::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
 
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::buffer::shared_buffer::SharedBuffer;
+use llm_rs2::memory::host::shared::SharedBuffer;
 use llm_rs2::core::buffer::{Buffer, DType};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::tensor::Tensor;

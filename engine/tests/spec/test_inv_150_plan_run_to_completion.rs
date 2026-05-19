@@ -24,7 +24,7 @@ use llm_rs2::models::config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::async_swap::AsyncSwapDispatcher;
 use llm_rs2::models::weights::{IntraForwardSwapHook, LayerSlot};
 
-use llm_rs2::buffer::shared_buffer::SharedBuffer;
+use llm_rs2::memory::host::shared::SharedBuffer;
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::transformer_layer::TransformerLayer;

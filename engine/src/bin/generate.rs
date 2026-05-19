@@ -71,7 +71,7 @@ fn make_partition_gpu_alloc<'a>(
     move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> {
         #[cfg(feature = "opencl")]
         if let Some(ref q) = ocl_queue {
-            let buf = llm_rs2::buffer::unified_buffer::UnifiedBuffer::new(q.clone(), size, dtype)?;
+            let buf = llm_rs2::memory::opencl::unified::UnifiedBuffer::new(q.clone(), size, dtype)?;
             buf.map()?; // Permanent map for dual CPU/GPU access
             return Ok(Arc::new(buf));
         }
@@ -1288,7 +1288,7 @@ fn main() -> anyhow::Result<()> {
     // env: LLMRS_SWAP_MMAP_ALIAS=1
     #[cfg(feature = "cuda-embedded")]
     let mmap_registration: Option<
-        Arc<llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+        Arc<llm_rs2::memory::cuda::mmap::CudaMmapRegistration>,
     > = {
         let enabled = std::env::var("LLMRS_SWAP_MMAP_ALIAS")
             .map(|v| v == "1")
@@ -1296,7 +1296,7 @@ fn main() -> anyhow::Result<()> {
         if !enabled {
             None
         } else if let Some(secondary) = model.secondary_mmap.clone() {
-            match llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration::register(secondary)
+            match llm_rs2::memory::cuda::mmap::CudaMmapRegistration::register(secondary)
             {
                 Ok(reg) => {
                     eprintln!(
@@ -2012,7 +2012,7 @@ fn main() -> anyhow::Result<()> {
                     .residual
                     .buffer()
                     .as_any()
-                    .downcast_ref::<llm_rs2::buffer::unified_buffer::UnifiedBuffer>()
+                    .downcast_ref::<llm_rs2::memory::opencl::unified::UnifiedBuffer>()
                 {
                     ub.map()?;
                     eprintln!("[Partition] Residual UnifiedBuffer permanent-mapped for zero-copy");

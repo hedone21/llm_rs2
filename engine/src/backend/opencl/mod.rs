@@ -1,5 +1,5 @@
 #![allow(unused_unsafe)]
-use crate::buffer::unified_buffer::UnifiedBuffer;
+use crate::memory::opencl::unified::UnifiedBuffer;
 use crate::core::backend::Backend;
 use crate::core::buffer::Buffer;
 use crate::core::buffer::DType;
@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use crate::resilience::gpu_self_meter::OpenClEventGpuMeter;
 
-pub mod buffer;
 pub mod gpu_score;
 pub mod host_ptr_pool;
 pub mod memory;
@@ -124,14 +123,14 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // Then try legacy OpenCLBuffer
     if let Some(ocl_buf) = buf
         .as_any()
-        .downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
+        .downcast_ref::<crate::memory::opencl::device::OpenCLBuffer>()
     {
         return Ok(ocl_buf.buffer.as_core());
     }
     // ClSubBuffer (zero-copy sub-region of a parent CL buffer via clCreateSubBuffer)
     if let Some(sb) = buf
         .as_any()
-        .downcast_ref::<crate::buffer::cl_sub_buffer::ClSubBuffer>()
+        .downcast_ref::<crate::memory::opencl::sub::ClSubBuffer>()
     {
         return Ok(sb.cl_mem_ref());
     }
@@ -140,7 +139,7 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // the same address doubles as the noshuffle SOA registry key.
     if let Some(ns) = buf
         .as_any()
-        .downcast_ref::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>()
+        .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>()
     {
         return Ok(ns.d_buf());
     }
@@ -148,7 +147,7 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // CL_MEM_ALLOC_HOST_PTR, filled via map/memcpy/unmap before use).
     if let Some(pp) = buf
         .as_any()
-        .downcast_ref::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>()
+        .downcast_ref::<crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>()
     {
         return pp
             .cl_mem()
@@ -172,21 +171,21 @@ pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
     let any = buf.as_any();
     if any.is::<UnifiedBuffer>() {
         "UnifiedBuffer"
-    } else if any.is::<crate::backend::opencl::buffer::OpenCLBuffer>() {
+    } else if any.is::<crate::memory::opencl::device::OpenCLBuffer>() {
         "OpenCLBuffer"
-    } else if any.is::<crate::buffer::cl_sub_buffer::ClSubBuffer>() {
+    } else if any.is::<crate::memory::opencl::sub::ClSubBuffer>() {
         "ClSubBuffer"
-    } else if any.is::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>() {
+    } else if any.is::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>() {
         "NoshuffleWeightBuffer"
-    } else if any.is::<crate::buffer::shared_buffer::SharedBuffer>() {
+    } else if any.is::<crate::memory::host::shared::SharedBuffer>() {
         "SharedBuffer"
-    } else if any.is::<crate::buffer::shared_buffer::SharedBufferView>() {
+    } else if any.is::<crate::memory::host::shared::SharedBufferView>() {
         "SharedBufferView"
-    } else if any.is::<crate::buffer::slice_buffer::SliceBuffer>() {
+    } else if any.is::<crate::buffer::slice::SliceBuffer>() {
         "SliceBuffer"
-    } else if any.is::<crate::buffer::mmap_buffer::MmapBuffer>() {
+    } else if any.is::<crate::memory::host::mmap::MmapBuffer>() {
         "MmapBuffer"
-    } else if any.is::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
+    } else if any.is::<crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
         "HostPtrPool"
     } else {
         "Unknown"
@@ -5201,7 +5200,7 @@ impl Backend for OpenCLBackend {
         // so consumers that inspect `Tensor::size()` see the weight footprint.
         let logical_bytes = num_blocks * 18;
         let placeholder = Arc::new(
-            crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer::new(
+            crate::memory::opencl::noshuffle::NoshuffleWeightBuffer::new(
                 q_buf,
                 d_buf,
                 q_img,
@@ -5247,7 +5246,7 @@ impl Backend for OpenCLBackend {
         if let Some(nb) = tensor
             .buffer()
             .as_any()
-            .downcast_ref::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>(
+            .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>(
         ) {
             // SOA-backed: re-insert against the d_buf key (`cl_mem()` on
             // `NoshuffleWeightBuffer` returns d_buf, so the registry key
@@ -5311,7 +5310,7 @@ impl Backend for OpenCLBackend {
             )
         })?;
 
-        let alias = crate::buffer::rpcmem_alias_buffer::RpcmemAliasBuffer::new(
+        let alias = crate::memory::rpcmem::opencl_alias::RpcmemAliasBuffer::new(
             cl_buffer,
             aliased_ptr,
             size,
@@ -7200,14 +7199,14 @@ mod gpu_buffer_shift_tests {
         let mut cache = KVCache::new(k, v, max_seq);
 
         // Fill 8 positions: pos i → all values = (i+1) as f32
-        let cpu_mem = crate::buffer::shared_buffer::SharedBuffer::new(heads * dim * 4, DType::F32);
+        let cpu_mem = crate::memory::host::shared::SharedBuffer::new(heads * dim * 4, DType::F32);
         for i in 0..8 {
             let val = (i + 1) as f32;
-            let kb = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+            let kb = Arc::new(crate::memory::host::shared::SharedBuffer::new(
                 heads * dim * 4,
                 DType::F32,
             ));
-            let vb = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+            let vb = Arc::new(crate::memory::host::shared::SharedBuffer::new(
                 heads * dim * 4,
                 DType::F32,
             ));
@@ -8448,7 +8447,7 @@ mod noshuffle_tests {
     /// when registering the entry.
     #[test]
     fn test_noshuffle_weight_buffer_key_stability() {
-        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
+        use crate::memory::opencl::noshuffle::NoshuffleWeightBuffer;
 
         let backend = match try_create_backend() {
             Some(b) => b,
@@ -8662,7 +8661,7 @@ mod noshuffle_tests {
     /// allocate any AOS placeholder cl_mem.
     #[test]
     fn test_alloc_pre_converted_soa_tensor_no_placeholder() {
-        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
+        use crate::memory::opencl::noshuffle::NoshuffleWeightBuffer;
 
         let backend = match try_create_backend() {
             Some(b) => b,

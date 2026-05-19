@@ -13,7 +13,7 @@ pub mod kernels;
 pub mod memory;
 pub mod profiler;
 
-use crate::buffer::cuda_buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
+use crate::memory::cuda::buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::tensor::Tensor;
@@ -1067,7 +1067,7 @@ impl CudaBackend {
             })
             .or_else(|| {
                 buf.as_any()
-                    .downcast_ref::<crate::buffer::cuda_mmap_alias_buffer::CudaMmapAliasBuffer>()
+                    .downcast_ref::<crate::memory::cuda::mmap::CudaMmapAliasBuffer>()
                     .map(|mb| mb.device_ptr())
             })
     }
@@ -1082,7 +1082,7 @@ impl CudaBackend {
     /// Run a basic self-test to verify kernel launch + arg passing works.
     /// Tests add_assign, scale, rms_norm with known data.
     pub fn self_test(&self) -> Result<()> {
-        use crate::buffer::cuda_buffer::CudaHostBuffer;
+        use crate::memory::cuda::buffer::CudaHostBuffer;
         use crate::core::buffer::DType;
 
         // === Test 1: add_assign [1,2,3] + [4,5,6] = [5,7,9] ===
@@ -2977,7 +2977,7 @@ impl Backend for CudaBackend {
         let buf = dst.buffer();
         let cuda_buf = buf
             .as_any()
-            .downcast_ref::<crate::buffer::cuda_buffer::CudaDeviceBuffer>()
+            .downcast_ref::<crate::memory::cuda::buffer::CudaDeviceBuffer>()
             .ok_or_else(|| {
                 anyhow!(
                     "enqueue_write_into_async requires CudaDeviceBuffer dst (got dtype={:?}, size={})",

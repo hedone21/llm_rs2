@@ -1,17 +1,7 @@
-#[cfg(feature = "opencl")]
-pub mod cl_sub_buffer;
-#[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
-pub mod cuda_buffer;
-#[cfg(feature = "cuda-embedded")]
-pub mod cuda_mmap_alias_buffer;
-#[cfg(feature = "opencl")]
-pub mod host_ptr_pool_buffer;
-pub mod mmap_buffer;
-#[cfg(feature = "opencl")]
-pub mod noshuffle_weight_buffer;
-#[cfg(feature = "opencl")]
-pub mod rpcmem_alias_buffer;
-pub mod shared_buffer;
-pub mod slice_buffer;
-#[cfg(feature = "opencl")]
-pub mod unified_buffer;
+//! Generic L2 buffer views.
+//!
+//! - [`slice`]: `SliceBuffer` — typed offset view over any parent `Arc<dyn Buffer>`.
+//!
+//! Memory-resource-specific allocators and view adapters live in
+//! `crate::memory::<resource>/`. See ARCHITECTURE.md §13.8-D.
+pub mod slice;

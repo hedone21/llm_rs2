@@ -62,7 +62,7 @@ pub fn run_layer_swap(
         Arc<crate::models::weights::layer_object_pool::LayerObjectPool>,
     >,
     #[cfg(feature = "cuda-embedded")] mmap_registration: Option<
-        Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+        Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,
     >,
 ) -> Result<crate::models::weights::SwapReport, crate::models::weights::SwapError> {
     let swap_memory = Galloc::new();

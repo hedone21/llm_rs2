@@ -1,4 +1,4 @@
-use crate::buffer::shared_buffer::SharedBuffer;
+use crate::memory::host::shared::SharedBuffer;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
 use anyhow::Result;

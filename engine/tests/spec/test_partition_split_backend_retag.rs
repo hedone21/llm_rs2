@@ -22,7 +22,7 @@ use llm_rs2::core::tensor::Tensor;
 #[test]
 fn tensor_backend_returns_construction_backend() {
     use llm_rs2::backend::cpu::common::CpuBackendCommon;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::shape::Shape;
 
     let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackendCommon);
@@ -49,7 +49,7 @@ fn tensor_backend_returns_construction_backend() {
 fn map_weights_for_cpu_retags_loader_backend_to_gpu_after_in_place_map() {
     use llm_rs2::backend::cpu::common::CpuBackendCommon;
     use llm_rs2::backend::opencl::OpenCLBackend;
-    use llm_rs2::buffer::unified_buffer::UnifiedBuffer;
+    use llm_rs2::memory::opencl::unified::UnifiedBuffer;
     use llm_rs2::core::shape::Shape;
 
     let opencl = match OpenCLBackend::new() {
@@ -118,7 +118,7 @@ fn map_weights_for_cpu_retags_loader_backend_to_gpu_after_in_place_map() {
 #[test]
 fn cpu_loaded_tensor_keeps_cpu_backend_against_same_backend_check() {
     use llm_rs2::backend::cpu::common::CpuBackendCommon;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::shape::Shape;
 
     let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackendCommon);

@@ -47,7 +47,7 @@ fn force_every_tick_enabled() -> bool {
 use anyhow::Result;
 use llm_shared::DtypeTag;
 
-use crate::buffer::shared_buffer::SharedBuffer;
+use crate::memory::host::shared::SharedBuffer;
 use crate::core::backend::{Backend, GpuEvent};
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
@@ -299,7 +299,7 @@ pub struct SwapExecutor<'a> {
     /// tensors that need runtime unpermute fall back to the bg_fetch
     /// build path.
     #[cfg(feature = "cuda-embedded")]
-    pub mmap_registration: Option<Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>>,
+    pub mmap_registration: Option<Arc<crate::memory::cuda::mmap::CudaMmapRegistration>>,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -386,7 +386,7 @@ impl<'a> SwapExecutor<'a> {
     #[cfg(feature = "cuda-embedded")]
     pub fn with_mmap_registration(
         mut self,
-        registration: Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+        registration: Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,
     ) -> Self {
         self.mmap_registration = Some(registration);
         self
@@ -802,7 +802,7 @@ impl<'a> SwapExecutor<'a> {
                 // registration is attached and the env is set.
                 #[cfg(feature = "cuda-embedded")]
                 let mmap_reg: Option<
-                    Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+                    Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,
                 > = if mmap_alias_active {
                     self.mmap_registration.clone()
                 } else {
@@ -1639,7 +1639,7 @@ impl<'a> SwapExecutor<'a> {
         let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
             Arc::new(SharedBuffer::from_vec(owned, info.dtype))
         } else {
-            Arc::new(crate::buffer::mmap_buffer::MmapBuffer::borrow(
+            Arc::new(crate::memory::host::mmap::MmapBuffer::borrow(
                 data,
                 info.dtype,
                 secondary.clone(),
@@ -1992,7 +1992,7 @@ impl<'a> SwapExecutor<'a> {
             Arc::new(SharedBuffer::from_vec(owned, info.dtype))
         } else {
             // Borrow path (AUF AOS / no permutation): zero-copy mmap borrow.
-            Arc::new(crate::buffer::mmap_buffer::MmapBuffer::borrow(
+            Arc::new(crate::memory::host::mmap::MmapBuffer::borrow(
                 data,
                 info.dtype,
                 secondary.clone(),
@@ -2215,7 +2215,7 @@ impl<'a> SwapExecutor<'a> {
         }
         let dtype = cpu_tensor.dtype();
         let buf: Arc<dyn crate::core::buffer::Buffer> =
-            Arc::new(crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
+            Arc::new(crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
                 guard,
                 size,
                 dtype,
@@ -2543,9 +2543,9 @@ pub(crate) fn build_layer_via_mmap_alias_standalone(
     slot: &LayerSlot,
     layer_idx: usize,
     backend: &Arc<dyn Backend>,
-    registration: &Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+    registration: &Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,
 ) -> Result<(TransformerLayer, GpuEvent), SwapError> {
-    use crate::buffer::cuda_mmap_alias_buffer::CudaMmapAliasBuffer;
+    use crate::memory::cuda::mmap::CudaMmapAliasBuffer;
 
     let old = slot.load_weights();
 
@@ -2796,7 +2796,7 @@ fn materialise_cpu_tensor_standalone(
     let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
         Arc::new(SharedBuffer::from_vec(owned, info.dtype))
     } else {
-        Arc::new(crate::buffer::mmap_buffer::MmapBuffer::borrow(
+        Arc::new(crate::memory::host::mmap::MmapBuffer::borrow(
             data,
             info.dtype,
             secondary.clone(),
@@ -2986,7 +2986,7 @@ mod tests {
     // implies every backing buffer is uniquely owned by the dispatcher and
     // its destructor will run on `drop(layer)`.
 
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::core::backend::Backend;
     use crate::core::shape::Shape;
     use crate::layers::transformer_layer::TransformerLayer;

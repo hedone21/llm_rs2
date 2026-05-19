@@ -394,7 +394,7 @@ impl CachePressureHandler for SwapHandler {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::core::buffer::DType;
     use crate::core::kv_cache::{KVCache, KVLayout};
     use crate::core::pressure::PressureLevel;

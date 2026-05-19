@@ -17,7 +17,7 @@
 //! CPU-only mode is fully preserved for backward compatibility.
 
 use crate::backend::cpu::CpuBackend;
-use crate::buffer::shared_buffer::{SharedBuffer, SharedBufferView};
+use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCacheOps, KVLayout, KiviRawBuffers};
@@ -2436,7 +2436,7 @@ impl KVCacheOps for KiviCache {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::core::buffer::Buffer;
 
     fn make_input_tensor(

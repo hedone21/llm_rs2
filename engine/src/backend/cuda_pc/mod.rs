@@ -12,7 +12,7 @@
 pub mod kernels;
 pub mod memory;
 
-use crate::buffer::cuda_buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
+use crate::memory::cuda::buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::tensor::Tensor;
@@ -455,7 +455,7 @@ impl CudaBackend {
     /// Run a basic self-test to verify kernel launch + arg passing works.
     /// Tests add_assign, scale, rms_norm with known data.
     pub fn self_test(&self) -> Result<()> {
-        use crate::buffer::cuda_buffer::CudaHostBuffer;
+        use crate::memory::cuda::buffer::CudaHostBuffer;
         use crate::core::buffer::DType;
 
         // === Test 1: add_assign [1,2,3] + [4,5,6] = [5,7,9] ===

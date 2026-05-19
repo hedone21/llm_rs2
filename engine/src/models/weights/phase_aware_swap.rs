@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn test_partial_layer_falls_back_for_missing_norms() {
         use crate::backend::cpu::CpuBackend;
-        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::host::shared::SharedBuffer;
         use crate::core::buffer::Buffer;
         use crate::core::shape::Shape;
         use crate::layers::transformer_layer::TransformerLayer;
@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn test_partial_layer_errors_on_missing_weight() {
         use crate::backend::cpu::CpuBackend;
-        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::host::shared::SharedBuffer;
         use crate::core::buffer::Buffer;
         use crate::core::shape::Shape;
         use crate::layers::transformer_layer::TransformerLayer;

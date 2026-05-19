@@ -133,7 +133,7 @@ fn test_eng_alg_060_ema_no_update_when_alpha_zero() {
 #[test]
 fn test_eng_alg_091_pipeline_executes_matching_stages() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::buffer::DType;
     use llm_rs2::core::kv_cache::KVCache;
     use llm_rs2::core::pressure::{
@@ -225,7 +225,7 @@ fn test_eng_alg_091_pipeline_executes_matching_stages() {
 #[test]
 fn test_eng_alg_091_pipeline_skips_all_at_normal() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::buffer::DType;
     use llm_rs2::core::kv_cache::KVCache;
     use llm_rs2::core::pressure::{
@@ -368,7 +368,7 @@ fn test_eng_alg_092_target_bits_emergency() {
 #[test]
 fn test_eng_alg_092_swap_warning_offloads() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::buffer::DType;
     use llm_rs2::core::kv_cache::KVCache;
     use llm_rs2::core::pressure::{CachePressureHandler, HandlerContext, SwapHandler};
@@ -413,7 +413,7 @@ fn test_eng_alg_092_swap_warning_offloads() {
 #[test]
 fn test_eng_alg_092_swap_emergency_offloads() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::buffer::DType;
     use llm_rs2::core::kv_cache::KVCache;
     use llm_rs2::core::pressure::{CachePressureHandler, HandlerContext, SwapHandler};
@@ -462,7 +462,7 @@ fn test_eng_alg_092_swap_emergency_offloads() {
 #[test]
 fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::buffer::DType;
     use llm_rs2::core::eviction::SlidingWindowPolicy;
     use llm_rs2::core::kv_cache::KVCache;
@@ -526,7 +526,7 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
 #[test]
 fn test_eng_alg_092_eviction_handler_wraps_h2o() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::buffer::DType;
     use llm_rs2::core::eviction::H2OPolicy;
     use llm_rs2::core::kv_cache::KVCache;
@@ -598,7 +598,7 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
 #[test]
 fn test_eng_alg_091_c08_context_updated_after_eviction() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
+    use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::core::buffer::DType;
     use llm_rs2::core::kv_cache::KVCache;
     use llm_rs2::core::pressure::{

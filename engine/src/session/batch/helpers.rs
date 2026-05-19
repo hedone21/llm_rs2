@@ -81,7 +81,7 @@ pub fn make_partition_gpu_alloc<'a>(
     move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn crate::core::buffer::Buffer>> {
         #[cfg(feature = "opencl")]
         if let Some(ref q) = ocl_queue {
-            let buf = crate::buffer::unified_buffer::UnifiedBuffer::new(q.clone(), size, dtype)?;
+            let buf = crate::memory::opencl::unified::UnifiedBuffer::new(q.clone(), size, dtype)?;
             buf.map()?;
             return Ok(Arc::new(buf));
         }

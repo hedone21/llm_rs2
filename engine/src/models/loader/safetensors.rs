@@ -221,7 +221,7 @@ impl SafetensorsSource {
         if target_dtype == DType::F16 {
             // Fast path: safetensors stores F16 -> reference mmap directly (0 copies)
             if tensor_view.dtype() == safetensors::Dtype::F16 && is_cpu {
-                use crate::buffer::mmap_buffer::MmapBuffer;
+                use crate::memory::host::mmap::MmapBuffer;
                 let data = tensor_view.data();
                 let data_offset =
                     data.as_ptr() as usize - self.shard_mmaps[shard_idx].as_ptr() as usize;
@@ -373,7 +373,7 @@ impl SafetensorsSource {
         // F16 weight path: prefer MmapBuffer for zero-copy on CPU
         if target_dtype == DType::F16 {
             if tensor_view.dtype() == safetensors::Dtype::F16 {
-                use crate::buffer::mmap_buffer::MmapBuffer;
+                use crate::memory::host::mmap::MmapBuffer;
                 let data = tensor_view.data();
                 let data_offset =
                     data.as_ptr() as usize - self.shard_mmaps[shard_idx].as_ptr() as usize;

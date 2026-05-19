@@ -29,7 +29,7 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{Result, anyhow};
 
-use crate::buffer::cuda_buffer::{CudaDeviceBuffer, CudaHostBuffer};
+use crate::memory::cuda::buffer::{CudaDeviceBuffer, CudaHostBuffer};
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::shape::Shape;

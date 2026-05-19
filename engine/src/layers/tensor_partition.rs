@@ -1,4 +1,4 @@
-use crate::buffer::slice_buffer::SliceBuffer;
+use crate::buffer::slice::SliceBuffer;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
 use crate::core::shape::Shape;
@@ -193,7 +193,7 @@ pub fn split_weight(
     // GPU slice: zero-copy sub-buffer if parent has cl_mem, else fallback to copy.
     #[cfg(feature = "opencl")]
     let gpu_tensor = {
-        use crate::buffer::cl_sub_buffer::ClSubBuffer;
+        use crate::memory::opencl::sub::ClSubBuffer;
         match ClSubBuffer::new(parent_buf.clone(), 0, gpu_bytes, dtype) {
             Ok(sub_buf) => Tensor::new(
                 Shape::new(vec![split_row, in_dim]),
