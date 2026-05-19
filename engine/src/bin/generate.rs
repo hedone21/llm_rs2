@@ -1577,79 +1577,18 @@ fn main() -> anyhow::Result<()> {
     //  DUMP-IMPORTANCE MODE: Measure per-layer importance and exit
     // ════════════════════════════════════════════════════════════
     if args.dump_importance {
-        use llm_rs2::core::qcf::ImportanceCollector;
-
-        let mut collector = ImportanceCollector::new();
-
-        let prompt_enc = tokenizer
-            .encode(prompt.as_str(), true)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let prompt_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
-        let prompt_len = prompt_ids.len();
-        eprintln!("[Importance] Prefill {} tokens...", prompt_len);
-
-        let cpu_buf = Galloc::new().alloc(prompt_len * 4, DType::U8)?;
-        unsafe {
-            let ptr = cpu_buf.as_mut_ptr() as *mut u32;
-            std::ptr::copy_nonoverlapping(prompt_ids.as_ptr(), ptr, prompt_len);
-        }
-        let cpu_input = Tensor::new(
-            Shape::new(vec![1, prompt_len]),
-            cpu_buf,
-            Arc::new(CpuBackend::new()),
+        return llm_rs2::session::dump_importance::run_dump_importance(
+            llm_rs2::session::dump_importance::DumpImportanceCtx {
+                backend: backend.clone(),
+                memory: memory.clone(),
+                model,
+                tokenizer,
+                kv_caches,
+                prompt,
+                vocab_size,
+                model_path: args.model_path.clone(),
+            },
         );
-        let input_tensor = backend.copy_from(&cpu_input)?;
-
-        let logits_buf = memory.alloc(prompt_len * vocab_size * 4, DType::F32)?;
-        let mut logits = Tensor::new(
-            Shape::new(vec![1, prompt_len, vocab_size]),
-            logits_buf,
-            backend.clone(),
-        );
-
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos: 0,
-            kv_caches: &mut kv_caches,
-            backend: &backend,
-            memory: &*memory,
-            logits_out: &mut logits,
-            x_gen: None,
-            workspace: None,
-            score_accumulator: None,
-            profiler: None,
-            skip_config: None,
-            importance_collector: Some(&mut collector),
-            logits_last_only: false,
-            variance_collector: None,
-            prefill_workspace: None,
-
-            layer_boundary_hook: None,
-        })?;
-
-        let table = collector.build();
-
-        let importance_entries: Vec<serde_json::Value> = table
-            .entries()
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "layer": e.layer_id,
-                    "sublayer": format!("{:?}", e.sublayer),
-                    "importance": e.importance,
-                    "opr": e.opr,
-                })
-            })
-            .collect();
-
-        let output = serde_json::json!({
-            "model": args.model_path,
-            "num_layers": model.config.num_hidden_layers,
-            "prompt_tokens": prompt_len,
-            "importance": importance_entries,
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(());
     }
 
     // ════════════════════════════════════════════════════════════
