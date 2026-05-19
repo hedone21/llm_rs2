@@ -12,6 +12,7 @@ pub mod init;
 pub mod ppl;
 pub mod qcf_runtime;
 pub mod samplers;
+pub mod standard_happy;
 pub mod traits;
 
 pub use assembly::{build_standard_loop, is_standard_happy_path};
