@@ -34,7 +34,7 @@ use llm_shared::auf::{
     tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE},
     writer::AufWriter,
 };
-use llm_rs2::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer;
+use llm_rs2::buffer::mmap_buffer::MmapBuffer;
 use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::{Buffer, DType};
 use llm_rs2::core::shape::Shape;
@@ -154,7 +154,7 @@ fn s1_arc_refcount_incremented_while_buffer_alive() {
     let count_before = Arc::strong_count(&secondary);
     assert_eq!(count_before, 1, "baseline strong_count should be 1");
 
-    let buf = BorrowedMmapBuffer::new(&secondary, &data, DType::F16);
+    let buf = MmapBuffer::borrow(&data, DType::F16, secondary.clone());
 
     // After construction, BorrowedMmapBuffer clones the Arc → count >= 2.
     let count_during = Arc::strong_count(&secondary);
@@ -176,7 +176,7 @@ fn s2_arc_refcount_decremented_on_drop() {
 
     let count_before = Arc::strong_count(&secondary);
 
-    let buf = BorrowedMmapBuffer::new(&secondary, &data, DType::F32);
+    let buf = MmapBuffer::borrow(&data, DType::F32, secondary.clone());
     let count_during = Arc::strong_count(&secondary);
     assert!(
         count_during > count_before,
@@ -199,7 +199,7 @@ fn s3_getter_accuracy() {
     let data: Vec<u8> = (0u8..16).collect();
     let secondary = make_secondary(1);
 
-    let buf = BorrowedMmapBuffer::new(&secondary, &data, DType::Q4_0);
+    let buf = MmapBuffer::borrow(&data, DType::Q4_0, secondary.clone());
 
     assert_eq!(
         buf.as_ptr(),
@@ -212,9 +212,15 @@ fn s3_getter_accuracy() {
         DType::Q4_0,
         "dtype() must equal the stored dtype"
     );
-    assert!(
-        buf.as_mut_ptr().is_null(),
-        "as_mut_ptr() must be null for a read-only borrow buffer"
+    // MmapBuffer (post-unification) returns the underlying ptr from `as_mut_ptr()`
+    // matching the original safetensors/GGUF loader contract — read-only via
+    // mmap pages; mutation would segfault. The previous `BorrowedMmapBuffer`
+    // returned null_mut(); the new unified contract trusts callers (backend
+    // `copy_weight_from`/`copy_from`) to use only `as_ptr()`.
+    assert_eq!(
+        buf.as_mut_ptr() as *const u8,
+        data.as_ptr(),
+        "as_mut_ptr() must point to the same address as as_ptr() (matches MmapBuffer contract)"
     );
     assert!(buf.cl_mem().is_none(), "cl_mem() must be None");
     assert!(buf.sync_device().is_ok(), "sync_device() must be Ok(())");
@@ -241,7 +247,7 @@ fn s4_cpu_copy_from_borrow_buffer_byte_equal() {
     let secondary = make_secondary(1);
 
     let borrow_buf: Arc<dyn Buffer> =
-        Arc::new(BorrowedMmapBuffer::new(&secondary, &data, DType::F32));
+        Arc::new(MmapBuffer::borrow(&data, DType::F32, secondary.clone()));
 
     let cpu_backend = Arc::new(CpuBackend::new()) as Arc<dyn Backend>;
     let shape = Shape::new(vec![8, 1]); // 8 × f32 = 32 bytes
@@ -277,7 +283,7 @@ fn arc_is_sole_keeper_after_outer_drop() {
     let data = [0xFFu8; 4];
     let secondary = make_secondary(1);
 
-    let buf: Arc<dyn Buffer> = Arc::new(BorrowedMmapBuffer::new(&secondary, &data, DType::U8));
+    let buf: Arc<dyn Buffer> = Arc::new(MmapBuffer::borrow(&data, DType::U8, secondary.clone()));
 
     let weak = Arc::downgrade(&secondary);
     drop(secondary);

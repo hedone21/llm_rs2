@@ -425,6 +425,10 @@ impl std::fmt::Debug for SecondaryMmap {
     }
 }
 
+// INV-143: SecondaryMmap can act as the lifetime anchor for MmapBuffer borrows
+// against its underlying mmap pages.
+impl crate::buffer::mmap_buffer::MmapKeepAlive for SecondaryMmap {}
+
 impl SecondaryMmap {
     /// Fetch a layer's tensor descriptor by subname (e.g. "attn_q.weight").
     /// Returns `None` if the layer is out of range or the tensor is missing.

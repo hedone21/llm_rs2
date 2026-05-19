@@ -239,15 +239,6 @@
     },
     {
       "id": "V-09",
-      "file": "buffer/borrowed_mmap_buffer.rs",
-      "line": 19,
-      "import": "crate::models::weights::SecondaryMmap",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-09",
       "file": "buffer/host_ptr_pool_buffer.rs",
       "line": 27,
       "import": "crate::models::weights::SecondaryMmap",
@@ -1868,26 +1859,6 @@
       "rule": "INV-LAYER-001",
       "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
       "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-??",
-      "file": "buffer/borrowed_mmap_buffer.rs",
-      "line": 127,
-      "import": "crate::models::config::",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "note": "ARCHITECTURE.md §13.5",
-      "is_test_block": true
-    },
-    {
-      "id": "V-??",
-      "file": "buffer/borrowed_mmap_buffer.rs",
-      "line": 128,
-      "import": "crate::models::weights::secondary_mmap::",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "note": "ARCHITECTURE.md §13.5",
-      "is_test_block": true
     },
     {
       "id": "V-??",

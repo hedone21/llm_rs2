@@ -1639,11 +1639,11 @@ impl<'a> SwapExecutor<'a> {
         let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
             Arc::new(SharedBuffer::from_vec(owned, info.dtype))
         } else {
-            Arc::new(
-                crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
-                    secondary, data, info.dtype,
-                ),
-            )
+            Arc::new(crate::buffer::mmap_buffer::MmapBuffer::borrow(
+                data,
+                info.dtype,
+                secondary.clone(),
+            ))
         };
 
         let cpu_backend: Arc<dyn Backend> =
@@ -1992,11 +1992,11 @@ impl<'a> SwapExecutor<'a> {
             Arc::new(SharedBuffer::from_vec(owned, info.dtype))
         } else {
             // Borrow path (AUF AOS / no permutation): zero-copy mmap borrow.
-            Arc::new(
-                crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
-                    secondary, data, info.dtype,
-                ),
-            )
+            Arc::new(crate::buffer::mmap_buffer::MmapBuffer::borrow(
+                data,
+                info.dtype,
+                secondary.clone(),
+            ))
         };
         let us_wrap = t_wrap.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
@@ -2796,11 +2796,11 @@ fn materialise_cpu_tensor_standalone(
     let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
         Arc::new(SharedBuffer::from_vec(owned, info.dtype))
     } else {
-        Arc::new(
-            crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
-                secondary, data, info.dtype,
-            ),
-        )
+        Arc::new(crate::buffer::mmap_buffer::MmapBuffer::borrow(
+            data,
+            info.dtype,
+            secondary.clone(),
+        ))
     };
 
     let cpu_backend: Arc<dyn Backend> =

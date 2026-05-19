@@ -128,20 +128,6 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     {
         return Ok(ocl_buf.buffer.as_core());
     }
-    // MadviseableGPUBuffer (CL_MEM_USE_HOST_PTR — legacy, retained for compatibility)
-    if let Some(m) = buf
-        .as_any()
-        .downcast_ref::<crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer>()
-    {
-        return Ok(m.cl_mem_ref());
-    }
-    // ClWrappedBuffer (CL_MEM_USE_HOST_PTR wrapper around existing CPU buffer)
-    if let Some(m) = buf
-        .as_any()
-        .downcast_ref::<crate::buffer::cl_wrapped_buffer::ClWrappedBuffer>()
-    {
-        return Ok(m.cl_mem_ref());
-    }
     // ClSubBuffer (zero-copy sub-region of a parent CL buffer via clCreateSubBuffer)
     if let Some(sb) = buf
         .as_any()
@@ -188,10 +174,6 @@ pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
         "UnifiedBuffer"
     } else if any.is::<crate::backend::opencl::buffer::OpenCLBuffer>() {
         "OpenCLBuffer"
-    } else if any.is::<crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer>() {
-        "MadviseableGPUBuffer"
-    } else if any.is::<crate::buffer::cl_wrapped_buffer::ClWrappedBuffer>() {
-        "ClWrappedBuffer"
     } else if any.is::<crate::buffer::cl_sub_buffer::ClSubBuffer>() {
         "ClSubBuffer"
     } else if any.is::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>() {
@@ -204,8 +186,6 @@ pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
         "SliceBuffer"
     } else if any.is::<crate::buffer::mmap_buffer::MmapBuffer>() {
         "MmapBuffer"
-    } else if any.is::<crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer>() {
-        "BorrowedMmapBuffer"
     } else if any.is::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
         "HostPtrPool"
     } else {

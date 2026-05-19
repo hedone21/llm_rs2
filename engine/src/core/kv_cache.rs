@@ -924,7 +924,7 @@ impl KVCache {
             });
         }
 
-        // madvise path: only for host-managed buffers (SharedBuffer, MadviseableGPUBuffer).
+        // madvise path: only for host-managed buffers (SharedBuffer, MmapBuffer).
         // GPU-managed buffers (UnifiedBuffer with CL_MEM_ALLOC_HOST_PTR) are driver-pinned.
         if !self.k_buffer.buffer().is_host_managed() {
             return 0;

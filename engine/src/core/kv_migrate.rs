@@ -52,7 +52,7 @@ pub fn migrate_kv_caches(
         && !src_backend.is_discrete_gpu()
         && !dst_backend.is_discrete_gpu();
 
-    // Check if buffers have cl_mem (UnifiedBuffer or MadviseableGPUBuffer).
+    // Check if buffers have cl_mem (UnifiedBuffer or other cl_mem-bearing types).
     let has_cl_mem = is_uma
         && kv_caches
             .first()
@@ -61,7 +61,7 @@ pub fn migrate_kv_caches(
     // UMA path: map UnifiedBuffers for CPU access and flush GPU caches.
     // UnifiedBuffer (ALLOC_HOST_PTR) starts unmapped — map_for_cpu() calls
     // clEnqueueMapBuffer which flushes GPU caches and returns a coherent pointer.
-    // MadviseableGPUBuffer (USE_HOST_PTR) is always mapped — map_for_cpu() is a no-op.
+    // USE_HOST_PTR buffers are always mapped — map_for_cpu() is a no-op.
     if has_cl_mem {
         src_backend.synchronize()?;
         for kv in kv_caches.iter_mut() {
