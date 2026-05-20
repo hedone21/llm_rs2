@@ -18,8 +18,9 @@
 - AUF는 빌드 시점에 한 번만 변환하고 디바이스에서는 zero-copy mmap으로 직접 사용.
 
 **언제 쓰는가**:
-- `--secondary-gguf <path>.auf`로 Engine에 전달. `.gguf`와 `.auf`는 확장자로 자동 분기 (플래그 이름은 GGUF 시절의 호환을 위해 유지).
-- Phase 3.7b 시점에는 secondary weight 자산용. v0.1.1부터 lm_head Q4_0 entry도 보관. 향후 primary 모델 전체를 AUF로 대체 가능 (v0.2+).
+- **W-AUF-1 (Sprint 1, 2026-05-19) 정식 경로**: `generate --model-path foo.auf` 단일 진입. AUF가 self-contained (META + TOKENIZER + TENSOR_INDEX + WEIGHTS)이므로 별도 tokenizer/secondary 지정 불필요.
+- `--secondary-gguf <path>.auf`는 **deprecated alias** (stderr 경고 1회, `.gguf`/`.auf` 양쪽 수용). 향후 제거.
+- v0.1.1부터 lm_head Q4_0 entry, v0.2부터 multi-dtype variant 보관. W-AUF-2에서 self-secondary 자동 활성 예고 (`--no-self-secondary`로 끄기 가능, 현재 stub).
 
 **v0.1.1 (Sprint G-1) 신기능 요약**:
 - **lm_head Q4_0 entry**: 별도 capability bit (`LM_HEAD_PRECOMPUTED_Q4_0` = bit 2)로 표시. F16 GGUF에서도 build 시 사전 양자화하여 동봉 → swap 시 dequant→quant 비용 제거.
@@ -40,6 +41,9 @@ auf_tool build \
     --tokenizer <path>/tokenizer.json \
     --output    <path>.auf \
     --variants  <list> \
+    [--tokenizer-config <path>/tokenizer_config.json] \
+    [--bos-token-id <U32>] \
+    [--eos-token-id <U32>] \
     [--include-lm-head <auto|on|off>] \
     [--created-by "<custom string>"] \
     [--quiet]
@@ -53,9 +57,14 @@ auf_tool build \
 | `--variants` | ✓ | 포함할 backend variant. comma-separated 또는 `all`. 예: `adreno_soa,cpu_aos`, `WEIGHTS_ADRENO_SOA,WEIGHTS_CPU_AOS`, `all`. (lower / upper / FULL_TAG 모두 허용) |
 | `--dtypes` | — | v0.2 multi-quant: 동봉할 dtype 목록 (comma-separated). 예: `q4_0,f16`. 미지정 시 source GGUF의 dtype 1개(single-dtype, v0.1.x 호환). 2개 이상 지정 시 `capability_optional` bit 3 (`MULTI_DTYPE_VARIANTS`) 자동 set + `format_minor=2` 자동. |
 | `--default-dtype` | — | v0.2 multi-quant 모드에서 `META.default_dtype` 명시. `--dtypes`에 포함된 값이어야 한다. 미지정 시 `--dtypes` 첫 번째 값. |
+| `--tokenizer-config` | — | (W-AUF-1) `tokenizer_config.json` 경로. 미지정 시 `tokenizer.json` sibling을 자동 탐색. AUF TOKENIZER section의 `bos_id`/`eos_id` 슬롯을 채우는 데 사용된다. |
+| `--bos-token-id` | — | (W-AUF-1) AUF TOKENIZER `bos_id` 슬롯 명시 override (U32). 우선순위: **CLI override → `tokenizer_config.json` → `tokenizer.json` 키워드 fallback**. |
+| `--eos-token-id` | — | (W-AUF-1) AUF TOKENIZER `eos_id` 슬롯 명시 override (U32). 우선순위는 BOS와 동일. |
 | `--include-lm-head` | — | v0.1.1 lm_head Q4_0 entry 정책. `auto` (기본) / `on` / `off`. 아래 §2.1.1 참조. |
 | `--created-by` | — | 헤더 `created_by` (32B UTF-8). 기본 `"llm_rs2 auf-tool v{VERSION}"`. |
 | `--quiet` | — | 진행 로그 출력 억제. |
+
+> **BOS/EOS 슬롯 우선순위 (W-AUF-1)**: `--bos-token-id` / `--eos-token-id` (CLI override) > `tokenizer_config.json`의 `bos_token`/`eos_token` 매핑 > `tokenizer.json`의 added_tokens 키워드 fallback. 셋 다 비면 슬롯이 0으로 남으며 런타임에서 `generate --eos-token-id` 등으로 override 권장 (INV-136).
 
 **동작**:
 1. GGUF parse → metadata, layer tensor 추출.
@@ -306,7 +315,12 @@ auf_tool strip --keep adreno_soa models/llama-3.2-1b.auf
 adb push models/llama-3.2-1b.auf /data/local/tmp/
 adb push models/llama-3.2-1b-f16.gguf /data/local/tmp/  # primary (선택)
 
-# Engine 실행 (AUF를 secondary로 지정 — `--secondary-gguf` 플래그가 .auf도 받음)
+# Engine 실행 (W-AUF-1 정식 경로: AUF single-file primary)
+adb shell '/data/local/tmp/generate \
+    -m /data/local/tmp/llama-3.2-1b.auf \
+    -b opencl --prompt "Hello" -n 50'
+
+# Engine 실행 (legacy dual-file — `--secondary-gguf` deprecated alias, 그대로 동작)
 adb shell '/data/local/tmp/generate \
     -m /data/local/tmp/llama-3.2-1b-f16.gguf \
     --secondary-gguf /data/local/tmp/llama-3.2-1b.auf \

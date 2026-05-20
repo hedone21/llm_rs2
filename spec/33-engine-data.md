@@ -636,6 +636,8 @@
 
 **[ENG-DAT-090]** `LoadConfig`는 가중치 로딩의 런타임 설정이다. 초기 로딩은 단일 `default_dtype`을 사용하고, `secondary_source`가 제공되면 런타임 swap 대상 파일로 예약한다. *(MUST)*
 
+> **Sprint 1 W-AUF-1 확장 (2026-05-19)**: `LoadConfig`에 5개 필드 추가 — `primary_format: PrimaryFormat` (AUF/Safetensors 분기), `primary_variant_choice: PrimaryVariantChoice` (`auto`/`adreno_soa`/`cpu_aos`/`cuda_aos`), `primary_dtype_choice: PrimaryDtypeChoice` (`auto`/`f16`/`q4_0`/`q8_0`/`bf16`/`f32`/`q4_1`), `primary_eos_override: Option<u32>` (BOS는 동일 패턴), `disable_self_secondary: bool` (현재 stub, W-AUF-2에서 활성). 기존 호출처는 `..Default::default()`만 추가하여 무영향 유지. AUF self-secondary 자동 활성 정책(W-AUF-2)에서 `disable_self_secondary == true`이면 explicit `secondary_source` 우선 + 자동 활성 비활성으로 동작 예정.
+
 **필수 필드**:
 
 | 필드 | 타입 | 설명 |

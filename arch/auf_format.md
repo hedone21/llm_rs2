@@ -32,6 +32,8 @@ Phase 3.6 디바이스 실측에서 Q4_0 weight swap 후 첫 토큰("Paris")은 
 
 AUF는 GGUF의 **derived but independent self-contained 자산**이다. 다음 3가지 운영 모드 중 본 v0.1 spec은 **Mode B (self-contained)** 단일을 채택한다.
 
+> **W-AUF-1 (Sprint 1, 2026-05-19) primary loader 도입**: AUF는 더 이상 secondary 전용이 아니다. `--model-path foo.auf` 단일 경로가 정식 진입점이며 `TransformerModel::load_from_config`가 `PrimaryFormat` enum match로 분기(AUF / Safetensors / GGUF). 진입 컴포넌트는 `engine/src/models/loader/auf/source.rs::AufSource` (TensorSource impl, mmap zero-copy). v0.2 multi-dtype AUF에서 self-secondary 자동 활성(W-AUF-2)이 후속 단계로 예고됨 — `disable_self_secondary` 플래그(ENG-DAT-090 Sprint 1 확장)로 끄거나 explicit `secondary_source`를 우선으로 둘 수 있다.
+
 | Mode | 설명 | v0.1 채택 여부 |
 |------|------|---------------|
 | Mode A | AUF는 GGUF 옆에 있는 cache. AUF 부재/stale 시 GGUF에서 자동 재생성 | 미채택 |
@@ -207,6 +209,8 @@ impl SectionTable {
 ### 2.3 AufReader
 
 **역할**: AUF 파일을 mmap하고, 자기 backend variant 한정으로 lazy access를 제공.
+
+> **W-AUF-1 코드 매핑**: primary loader 진입은 `engine/src/models/loader/auf/source.rs::AufSource` (TensorSource impl). secondary loader 헬퍼는 `engine/src/models/loader/auf/secondary.rs`로 이동되었으며(`is_auf_path`, `auf_dtype_to_engine`, `open_secondary_auf`, `build_auf_secondary_from_view`, `check_auf_metadata`, `resolve_backend_tag_candidates`) 호출처는 `pub use` re-export로 무변경. `engine/src/models/weights/secondary_mmap.rs`는 SecondaryMmap struct + 공통 헬퍼 위치로 잔존.
 
 **책임**:
 - `path` + `backend_tag` 입력 → `AufView` 출력.

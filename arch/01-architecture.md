@@ -43,6 +43,7 @@ graph TD
 | 서브시스템 | 주요 모듈 | 책임 |
 |-----------|----------|------|
 | **Model** | `engine/src/models/llama/llama_model.rs` | Safetensors 로딩, forward pass 오케스트레이션 |
+| **Loader** | `engine/src/models/loader/` (`auf/source.rs::AufSource`, `auf/secondary.rs`, `mod.rs::resolve_secondary`) | Primary format dispatch (AUF/Safetensors/GGUF), AUF mmap zero-copy 로드, secondary 해석. W-AUF-1 (2026-05-19) 도입. |
 | **Core** | `engine/src/core/` (tensor, buffer, math_utils, sampling, shape) | 트레이트 정의, 기초 타입 |
 | **Backend** | `engine/src/backend/cpu/`, `engine/src/backend/opencl/` | Backend trait 구현 (matmul, softmax, RoPE 등 17+ ops) |
 | **KV Cache** | `engine/src/core/kv_cache.rs` | KVCacheOps trait + 3개 구현체 |

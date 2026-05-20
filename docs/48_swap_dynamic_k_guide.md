@@ -14,6 +14,8 @@ LISWAP-6 weight swap 의 production 사용법. spike 회피 hard constraint 를 
   -p "<prompt>" -n 30
 ```
 
+> `--secondary-gguf`는 W-AUF-1(Sprint 1, 2026-05-19) 도입 후 **deprecated alias**로 stderr 경고 1회 후 그대로 동작. 향후 AUF single-file (`--model-path foo.auf`)로 통일 예정.
+
 `--swap-async-dispatch`, `--swap-dynamic-k` 는 **CLI default ON** (2026-05-12). 사용자는 `--swap-incremental-per-tick 2` 만 추가하면 production winner mode.
 
 ## 배경 — Weight Swap 의 메모리 spike 위험

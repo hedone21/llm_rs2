@@ -68,6 +68,8 @@ AUF v0.2 multi-quant 기반 layer-swap의 **QCF_swap 예측치 vs 실제 NLL/품
 ```
 - secondary, force-swap-ratio 모두 미지정. dump JSON에 `swap_count=0, qcf_swap_predicted=0, fallback_used=false, force_swap_ratio=null`.
 
+> 본 가이드의 `--secondary-gguf` 인용은 W-AUF-1(Sprint 1, 2026-05-19) 도입 후 **deprecated alias** (stderr 경고 1회). 측정 스크립트는 그대로 동작하지만 향후 AUF single-file로 통일 예정.
+
 **Mid-ratio** (`r=0.33`, F16 + 33% Q4 swap):
 ```bash
 ./target/release/generate \

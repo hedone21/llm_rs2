@@ -97,6 +97,8 @@ flowchart TB
     style RES fill:#e1bee7
 ```
 
+> **Sprint 1 W-AUF-1 — secondary 진입 정책 갱신 (2026-05-19)**: AUF가 primary loader로 승격되면서(`arch/auf_format.md` §1.1) 위 다이어그램의 `Arc<SecondaryMmap>` 경로는 두 입력원을 받는다 — (1) **legacy dual-file**: `--model-path X.gguf` + `--secondary-gguf Y.auf|.gguf` (현재까지의 정식 경로), (2) **W-AUF-1**: `--model-path foo.auf` 단일 (현재는 self-secondary stub None, 기존 dual-file과 동등). `--secondary-gguf`는 **deprecated alias**로 stderr 경고 1회 후 그대로 동작하며 `.gguf`/`.auf` 양쪽 입력을 계속 수용한다 (INV-136 갱신). **W-AUF-2 예고**: `CAPABILITY_BIT_MULTI_DTYPE` ON 또는 multi-variant AUF는 explicit `secondary_source`가 없을 때 self-secondary를 자동 활성하도록 확장 예정 (`LoadConfig::disable_self_secondary` 플래그로 끌 수 있음). 향후 dual-file 경로는 legacy로 라벨되며 W-AUF-2 + N 시점에 `--secondary-gguf` 최종 제거.
+
 ### 1.2 시그널 → Swap 완료 Sequence
 
 ```mermaid

@@ -2,6 +2,7 @@
 
 > **상세 구현 가이드**: 이 프로젝트를 처음부터 구현하려면 [`docs/00_build_guide.md`](docs/00_build_guide.md)를 참조하세요. 설계 결정의 근거는 [`docs/01_design_rationale.md`](docs/01_design_rationale.md)에 있습니다.
 > **Weight Swap**: 동적 layer dtype 교체 (`arch/weight_swap.md`). Phase 3.7에서 AUF (Argus Unified Format, `.auf`) self-contained 자산 도입 — `arch/auf_format.md`, `docs/auf_tool_guide.md`. Phase 6.5(2026-05-07)에서 Galaxy S25 1564.6 ms swap stall 감축 작업 시작 — `arch/weight_swap.md` §7 (ENG-ALG-226~231, INV-140~143, ENG-DAT-100). 측정 보고서: `papers/eurosys2027/_workspace/experiment/swap_overhead_s25.md`.
+> **AUF Primary Loader (W-AUF-1, Sprint 1, 2026-05-19)**: `--model-path foo.auf` 단일 경로가 정식 진입점으로 승격. `engine/src/models/loader/auf/source.rs::AufSource` (TensorSource impl, mmap zero-copy)가 `TransformerModel::load_from_config`의 `PrimaryFormat::Auf` 분기에서 사용된다. `--secondary-gguf`는 deprecated alias (stderr 경고 1회, `.gguf`/`.auf` 양쪽 수용). AUF self-secondary 자동 활성(W-AUF-2)이 후속 단계로 예고 — `--no-self-secondary`로 끌 수 있음(현재 stub).
 
 ## Overview
 
