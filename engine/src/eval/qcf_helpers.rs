@@ -5,8 +5,8 @@
 //! `qcf_swap_predicted` with actual NLL/quality metrics.
 
 use super::output::EvalOutput;
-use crate::core::qcf::layer_importance::ImportanceTable;
 use crate::models::weights::QuantNoiseTable;
+use crate::qcf::layer_importance::ImportanceTable;
 
 /// Context for one layer-swap QCF measurement run.
 pub struct QcfSwapDumpContext<'a> {

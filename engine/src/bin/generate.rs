@@ -261,7 +261,7 @@ fn main() -> anyhow::Result<()> {
             vocab_size,
             hidden_size,
         };
-        let qcf_config = llm_rs2::core::qcf::QcfConfig::default();
+        let qcf_config = llm_rs2::qcf::QcfConfig::default();
         let kivi_bits = args.effective_kivi_bits();
         let mut kv_caches: Vec<KiviCache> = (0..num_layers)
             .map(|_| {
@@ -929,9 +929,9 @@ fn main() -> anyhow::Result<()> {
 
     // Parse QCF mode
     let qcf_mode = match args.qcf_mode.as_str() {
-        "caote" => llm_rs2::core::qcf::QcfMode::Caote,
-        "both" => llm_rs2::core::qcf::QcfMode::Both,
-        _ => llm_rs2::core::qcf::QcfMode::Attn,
+        "caote" => llm_rs2::qcf::QcfMode::Caote,
+        "both" => llm_rs2::qcf::QcfMode::Both,
+        _ => llm_rs2::qcf::QcfMode::Attn,
     };
     let needs_caote = qcf_mode.has_caote();
 
@@ -1632,7 +1632,7 @@ fn main() -> anyhow::Result<()> {
 
     // Accumulated state produced by the QCF dump workflow.
     // Only populated when args.qcf_dump.is_some().
-    let mut qcf_warmup_importance: Option<llm_rs2::core::qcf::ImportanceTable> = None;
+    let mut qcf_warmup_importance: Option<llm_rs2::qcf::ImportanceTable> = None;
     let mut qcf_swap_decision: Option<llm_rs2::models::weights::decider::SwapDecision> = None;
     let qcf_workflow_start = std::time::Instant::now();
 
@@ -4425,7 +4425,7 @@ struct QcfEstimateContext<'a> {
     /// (sink_size, window_size) for StreamingLLM dry-run. None = skip.
     streaming_config: Option<(usize, usize)>,
     /// Pre-built importance table for LayerSkip dry-run. None = skip.
-    importance_table: Option<&'a llm_rs2::core::qcf::ImportanceTable>,
+    importance_table: Option<&'a llm_rs2::qcf::ImportanceTable>,
     /// Total number of transformer layers (needed for LayerSkip).
     num_layers: usize,
     /// KIVI caches for dynamic quantization QCF dry-run. None = skip.
@@ -4446,9 +4446,7 @@ struct QcfEstimateContext<'a> {
 /// - `kv_quant_dynamic`  : KIVI dynamic quantization (skipped for non-KiviCache path)
 /// - `layer_skip`        : LayerSkip importance-based QCF (needs importance_table)
 fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::HashMap<String, f32> {
-    use llm_rs2::core::qcf::{
-        AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv,
-    };
+    use llm_rs2::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
     use std::collections::HashMap;
     let mut estimates = HashMap::new();
 
@@ -4628,7 +4626,7 @@ fn remap_weights_for_cpu_after_swap(
 /// collected yet (i.e., on the very first `RequestQcf` before any prefill).
 fn build_layer_swap_estimate(
     model: &llm_rs2::models::transformer::TransformerModel,
-    importance_table: Option<&llm_rs2::core::qcf::ImportanceTable>,
+    importance_table: Option<&llm_rs2::qcf::ImportanceTable>,
 ) -> Option<llm_shared::LayerSwapEstimate> {
     // secondary must be present for weight swap to make sense
     model.secondary_mmap.as_ref()?;
@@ -4644,8 +4642,7 @@ fn build_layer_swap_estimate(
             imp.entries()
                 .iter()
                 .find(|e| {
-                    e.layer_id == i
-                        && e.sublayer == llm_rs2::core::qcf::layer_importance::SubLayer::Full
+                    e.layer_id == i && e.sublayer == llm_rs2::qcf::layer_importance::SubLayer::Full
                 })
                 .map(|e| e.importance)
                 .unwrap_or(0.0)

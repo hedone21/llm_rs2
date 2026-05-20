@@ -61,7 +61,8 @@ LAYER_RULES = [
     ("core/skip_config",        "L3-inference"),
     ("core/chat_template",      "L3-inference"),
     ("core/chat_ipc",           "L3-inference"),
-    ("core/qcf",                "L3-inference"),  # QCF는 inference-side 메트릭
+    # Step 4-B: qcf promoted from core/qcf to engine/src/qcf (top-level L3-inference)
+    ("qcf",                     "L3-inference"),  # QCF는 inference-side 메트릭
     ("layers",                  "L3-inference"),
     ("models",                  "L3-inference"),  # models/weights/* 포함
 
@@ -405,12 +406,16 @@ KNOWN_V_MAP = [
     (r"core/cache_manager\.rs",          r"resilience::EvictMethod",    "V-10"),
     # V-11: core/chat_template.rs → models::config::ModelArch
     (r"core/chat_template\.rs",          r"models::config::ModelArch",  "V-11"),
-    # V-12: core/events.rs → core::pressure (의도된 의존)
+    # V-12: core/events.rs → core::pressure (의도된 의존), qcf:: (Step 4-B 후)
     (r"core/events\.rs",                 r"core::pressure",             "V-12"),
-    # V-13: core/kivi_cache.rs → backend::cpu/opencl (L3→L1)
+    (r"core/events\.rs",                 r"qcf::",                      "V-12"),
+    # V-13: core/kivi_cache.rs → backend::cpu/opencl (L3→L1), qcf:: (Step 4-B path)
     (r"core/kivi_cache\.rs",             r"backend::",                  "V-13"),
-    # V-14: core/qcf/, core/kivi_cache, core/sampling → profile:: (L3→observability concrete)
-    (r"core/(qcf/unified_qcf|kivi_cache|sampling|qcf/layer_importance)", r"profile::", "V-14"),
+    (r"core/kivi_cache\.rs",             r"qcf::",                      "V-13"),
+    # V-13(b): core/pressure/mod.rs → qcf:: (L3-pressure→L3-inference)
+    (r"core/pressure/mod\.rs",           r"qcf::",                      "V-13"),
+    # V-14: qcf/, core/kivi_cache, core/sampling → profile:: (L3→observability concrete)
+    (r"(qcf/(unified_qcf|layer_importance|qcf_kv)|core/(kivi_cache|sampling))", r"profile::", "V-14"),
     # V-15: core/cache_manager.rs, core/eviction/* (테스트 블록) → backend::cpu (grandfathered)
     (r"core/(cache_manager|eviction/)",  r"backend::cpu::CpuBackend",   "V-15"),
     # V-16: eval/eval_loop.rs → backend:: (cross-cutting→L1)
@@ -443,8 +448,8 @@ KNOWN_V_MAP = [
     (r"models/weights/swap_executor\.rs", r"backend::opencl::host_ptr_pool", "V-25"),
     # V-25(d): models/weights/swap_executor.rs → profile::
     (r"models/weights/swap_executor\.rs", r"profile::",                 "V-25"),
-    # V-26: models/weights/decider.rs → core::qcf::layer_importance (현재 구조 내 cross)
-    (r"models/weights/decider\.rs",      r"core::qcf::layer_importance","V-26"),
+    # V-26: models/weights/decider.rs → qcf::layer_importance (현재 구조 내 cross)
+    (r"models/weights/decider\.rs",      r"qcf::layer_importance",      "V-26"),
     # V-26(b): models/weights/decider.rs → profile:: (L3→observability concrete)
     (r"models/weights/decider\.rs",      r"profile::",                  "V-26"),
     # V-27: models/weights/layer_object_pool.rs → buffer::cuda_buffer (L3→L2 backend-specific)
@@ -453,9 +458,10 @@ KNOWN_V_MAP = [
     (r"models/weights/layer_object_pool\.rs", r"layers::transformer_layer", "V-27"),
     # V-27(c): models/weights/layer_object_pool.rs → backend::cuda_embedded (downcast)
     (r"models/weights/layer_object_pool\.rs", r"backend::cuda_embedded","V-27"),
-    # V-28: eval/ → models::, core:: (cross-cutting→L3 다수)
-    (r"eval/(qcf_helpers|eval_loop|eviction_hook)", r"models::",        "V-28"),
-    (r"eval/(eval_loop|eviction_hook)",  r"core::(cache_manager|kv_cache|kivi_cache|qcf)", "V-28"),
+    # V-28: eval/ → models::, core::, qcf:: (cross-cutting→L3 다수)
+    (r"eval/(qcf_helpers|eval_loop|eviction_hook|kivi_hook)", r"models::",        "V-28"),
+    (r"eval/(eval_loop|eviction_hook|kivi_hook)",  r"(core::(cache_manager|kv_cache|kivi_cache)|qcf::)", "V-28"),
+    (r"eval/(qcf_helpers|kivi_hook)",    r"qcf::",                       "V-28"),
     # V-29: eval/eviction_hook.rs → backend::opencl::OpenCLBackend (cross-cutting→L1 downcast)
     (r"eval/eviction_hook\.rs",          r"backend::opencl::OpenCLBackend", "V-29"),
     # V-30: bin/generate.rs → 모든 레이어 직접 import (L5 monolith)

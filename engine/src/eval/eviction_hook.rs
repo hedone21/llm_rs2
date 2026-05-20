@@ -8,7 +8,7 @@ use super::hook::{CacheSnapshot, PostStepResult, StepHook};
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
-use crate::core::qcf::{
+use crate::qcf::{
     AggregationMode, QcfActionType, QcfConfig, QcfKvParams, VDataSource, aggregate_heads,
     compute_c1, compute_d7, compute_qcf_kv, identify_retained_for_action,
 };
@@ -705,8 +705,8 @@ mod tests {
     use super::*;
     use crate::core::cache_manager::CacheManager;
     use crate::core::eviction::no_eviction::NoEvictionPolicy;
-    use crate::core::qcf::{QcfConfig, QcfMode};
     use crate::core::sys_monitor::{MemoryStats, SystemMonitor};
+    use crate::qcf::{QcfConfig, QcfMode};
     use anyhow::Result as AResult;
 
     struct AlwaysOkMonitor;

@@ -11,9 +11,7 @@
 //! - When attention is uniform, QCF must be finite and well-defined (no NaN/inf).
 
 use llm_rs2::core::kv_cache::KVLayout;
-use llm_rs2::core::qcf::{
-    AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv,
-};
+use llm_rs2::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
 
 // ── Shared fixture ──────────────────────────────────────────────────────────
 

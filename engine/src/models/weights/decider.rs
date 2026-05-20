@@ -17,8 +17,8 @@
 
 use std::collections::HashSet;
 
-use crate::core::qcf::layer_importance::{ImportanceTable, SubLayer};
 use crate::models::weights::QuantNoiseTable;
+use crate::qcf::layer_importance::{ImportanceTable, SubLayer};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -344,7 +344,7 @@ fn uniform_select_by_index(needed: usize, candidates: &[usize]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::qcf::layer_importance::{ImportanceEntry, SubLayer};
+    use crate::qcf::layer_importance::{ImportanceEntry, SubLayer};
 
     // ── Helper builders ──
 

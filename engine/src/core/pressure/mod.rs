@@ -50,7 +50,7 @@ pub struct HandlerContext<'a> {
     pub target_ratio: Option<f32>,
     /// Optional sink for proxy metrics collected during handler execution.
     /// When `Some`, handlers push `QcfMetric` values for degradation estimation.
-    pub qcf_sink: Option<&'a mut Vec<crate::core::qcf::QcfMetric>>,
+    pub qcf_sink: Option<&'a mut Vec<crate::qcf::QcfMetric>>,
     /// Optional per-layer budget ratios from D2O layer-level allocation.
     /// When Some, D2OHandler uses per-layer target_len instead of uniform.
     /// Length must equal caches.len().

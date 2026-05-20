@@ -7,8 +7,8 @@
 //!
 //! Spec: INV-127, ENG-DAT-095, ENG-ALG-215.
 
-use llm_rs2::core::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 use llm_rs2::models::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
+use llm_rs2::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

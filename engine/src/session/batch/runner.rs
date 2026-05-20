@@ -81,13 +81,13 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
     // forward calls in this branch route score_accumulator through the hook.
     use crate::eval::StepHook;
     let pb_qcf_mode_enum = match args.qcf_mode.as_str() {
-        "caote" => crate::core::qcf::QcfMode::Caote,
-        "both" => crate::core::qcf::QcfMode::Both,
-        _ => crate::core::qcf::QcfMode::Attn,
+        "caote" => crate::qcf::QcfMode::Caote,
+        "both" => crate::qcf::QcfMode::Both,
+        _ => crate::qcf::QcfMode::Attn,
     };
-    let pb_qcf_config = crate::core::qcf::QcfConfig {
+    let pb_qcf_config = crate::qcf::QcfConfig {
         mode: pb_qcf_mode_enum,
-        ..crate::core::qcf::QcfConfig::default()
+        ..crate::qcf::QcfConfig::default()
     };
     let pb_ratio_mode = args.kv_budget_ratio() > 0.0;
     let pb_hook_budget = if pb_ratio_mode { 0 } else { args.kv_budget() };

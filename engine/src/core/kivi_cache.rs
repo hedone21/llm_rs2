@@ -236,7 +236,7 @@ pub struct KiviCache {
     group_size: usize,
 
     /// Accumulated flush proxy metrics (NMSE). Pushed during `flush_residual()`.
-    flush_proxies: Vec<crate::core::qcf::QcfMetric>,
+    flush_proxies: Vec<crate::qcf::QcfMetric>,
 
     /// Whether AWQE computation is enabled (set via set_awqe_enabled()).
     awqe_enabled: bool,
@@ -389,7 +389,7 @@ impl KiviCache {
     }
 
     /// Take all accumulated flush proxy metrics (NMSE), draining the internal buffer.
-    pub fn take_flush_proxies(&mut self) -> Vec<crate::core::qcf::QcfMetric> {
+    pub fn take_flush_proxies(&mut self) -> Vec<crate::qcf::QcfMetric> {
         std::mem::take(&mut self.flush_proxies)
     }
 
@@ -814,8 +814,8 @@ impl KiviCache {
             let n_groups = self.res_pos / gs;
             let flush_tokens = n_groups * gs;
             if flush_tokens > 0 {
-                let config = crate::core::qcf::QcfConfig::default();
-                let params = crate::core::qcf::KiviFlushParams {
+                let config = crate::qcf::QcfConfig::default();
+                let params = crate::qcf::KiviFlushParams {
                     res_k: &self.res_k,
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
@@ -824,7 +824,7 @@ impl KiviCache {
                     res_cap: self.res_cap,
                     bits: self.bits,
                 };
-                let metric = crate::core::qcf::compute_flush_nmse(&params, &config);
+                let metric = crate::qcf::compute_flush_nmse(&params, &config);
                 return metric.normalized_value.clamp(0.0, 1.0);
             }
         }
@@ -892,8 +892,8 @@ impl KiviCache {
         let flush_tokens = n_groups * gs;
 
         // Compute NMSE proxy before quantization (FP32 originals still available)
-        let qcf_config = crate::core::qcf::QcfConfig::default();
-        let proxy_params = crate::core::qcf::KiviFlushParams {
+        let qcf_config = crate::qcf::QcfConfig::default();
+        let proxy_params = crate::qcf::KiviFlushParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,
@@ -903,14 +903,9 @@ impl KiviCache {
             bits: self.bits,
         };
         self.flush_proxies
-            .push(crate::core::qcf::compute_flush_nmse(
-                &proxy_params,
-                &qcf_config,
-            ));
-        self.flush_proxies.push(crate::core::qcf::compute_flush_opr(
-            &proxy_params,
-            &qcf_config,
-        ));
+            .push(crate::qcf::compute_flush_nmse(&proxy_params, &qcf_config));
+        self.flush_proxies
+            .push(crate::qcf::compute_flush_opr(&proxy_params, &qcf_config));
 
         // AWQE: attention-weighted quantization error (V-only)
         if let Some(ref attn) = self.last_attn_scores {
@@ -920,7 +915,7 @@ impl KiviCache {
                 0
             };
             if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
-                let awqe_params = crate::core::qcf::FlushAttentionParams {
+                let awqe_params = crate::qcf::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -935,13 +930,10 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::core::qcf::compute_flush_awqe(
-                        &awqe_params,
-                        &qcf_config,
-                    ));
+                    .push(crate::qcf::compute_flush_awqe(&awqe_params, &qcf_config));
 
                 // AW-VOPR: attention-weighted vector output perturbation ratio
-                let vopr_params = crate::core::qcf::FlushAttentionParams {
+                let vopr_params = crate::qcf::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -956,10 +948,7 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::core::qcf::compute_flush_aw_vopr(
-                        &vopr_params,
-                        &qcf_config,
-                    ));
+                    .push(crate::qcf::compute_flush_aw_vopr(&vopr_params, &qcf_config));
             }
         }
 
@@ -1669,8 +1658,8 @@ impl KiviCache {
         }
 
         // 2. Compute QCF proxy metrics (same as CPU path)
-        let qcf_config = crate::core::qcf::QcfConfig::default();
-        let proxy_params = crate::core::qcf::KiviFlushParams {
+        let qcf_config = crate::qcf::QcfConfig::default();
+        let proxy_params = crate::qcf::KiviFlushParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,
@@ -1680,14 +1669,9 @@ impl KiviCache {
             bits: self.bits,
         };
         self.flush_proxies
-            .push(crate::core::qcf::compute_flush_nmse(
-                &proxy_params,
-                &qcf_config,
-            ));
-        self.flush_proxies.push(crate::core::qcf::compute_flush_opr(
-            &proxy_params,
-            &qcf_config,
-        ));
+            .push(crate::qcf::compute_flush_nmse(&proxy_params, &qcf_config));
+        self.flush_proxies
+            .push(crate::qcf::compute_flush_opr(&proxy_params, &qcf_config));
 
         // AWQE (same logic as CPU flush_residual)
         if let Some(ref attn) = self.last_attn_scores {
@@ -1697,7 +1681,7 @@ impl KiviCache {
                 0
             };
             if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
-                let awqe_params = crate::core::qcf::FlushAttentionParams {
+                let awqe_params = crate::qcf::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -1712,13 +1696,10 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::core::qcf::compute_flush_awqe(
-                        &awqe_params,
-                        &qcf_config,
-                    ));
+                    .push(crate::qcf::compute_flush_awqe(&awqe_params, &qcf_config));
 
                 // AW-VOPR: attention-weighted vector output perturbation ratio
-                let vopr_params = crate::core::qcf::FlushAttentionParams {
+                let vopr_params = crate::qcf::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -1733,10 +1714,7 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::core::qcf::compute_flush_aw_vopr(
-                        &vopr_params,
-                        &qcf_config,
-                    ));
+                    .push(crate::qcf::compute_flush_aw_vopr(&vopr_params, &qcf_config));
             }
         }
 

@@ -12,13 +12,13 @@ use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::core::kv_cache::KVCacheOps;
-use crate::core::qcf::{ImportanceCollector, SubLayer};
 use crate::core::sampling;
 use crate::core::skip_config::SkipConfig;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::qcf::{ImportanceCollector, SubLayer};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -515,7 +515,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
 /// Returns `(importance_table, layer_skip_qcf, layer_skip_opr, skip_set_len)`.
 /// All fields are `None` / `0` when `skip_config` is `None` or questions is empty.
 type ImportancePassResult = (
-    Option<crate::core::qcf::ImportanceTable>,
+    Option<crate::qcf::ImportanceTable>,
     Option<f32>,
     Option<f32>,
     usize,

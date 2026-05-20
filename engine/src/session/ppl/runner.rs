@@ -1024,7 +1024,7 @@ pub fn run_ppl(
                         && let Some(acc) = score_accumulator.as_ref()
                         && let Some(head_attn) = acc.last_step_head_attn()
                     {
-                        use crate::core::qcf::{
+                        use crate::qcf::{
                             AggregationMode, QcfActionType, QcfKvParams, VDataSource,
                             compute_qcf_kv,
                         };

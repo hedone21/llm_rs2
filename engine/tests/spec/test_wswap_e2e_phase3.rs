@@ -19,7 +19,6 @@ use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::core::pressure::ActionResult;
 use llm_rs2::core::pressure::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
-use llm_rs2::core::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
@@ -27,6 +26,7 @@ use llm_rs2::models::config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::{
     LayerSlot, QuantNoiseTable, SwapAlgorithm, WeightSwapDecider, compute_qcf_weight_swap,
 };
+use llm_rs2::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
 use llm_shared::DtypeTag;

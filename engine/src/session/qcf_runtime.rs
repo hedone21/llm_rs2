@@ -21,7 +21,7 @@ use crate::shape::Shape;
 use crate::tensor::Tensor;
 
 pub struct QcfWarmupResult {
-    pub importance: crate::core::qcf::ImportanceTable,
+    pub importance: crate::qcf::ImportanceTable,
     pub decision: Option<crate::models::weights::SwapDecision>,
     /// Per-layer DP-LLM proxy ε (single-tensor relative `attn_output`).
     /// `Some` only in compare mode.
@@ -134,13 +134,13 @@ pub fn run_qcf_warmup_workflow(
     log_prefix: &str,
     swap_algorithm: crate::models::weights::SwapAlgorithm,
     execute_swap: bool,
-    importance_formula: crate::core::qcf::ImportanceFormula,
+    importance_formula: crate::qcf::ImportanceFormula,
     importance_three_way: bool,
     swap_only_layers: Option<&[usize]>,
     decode_x_steps: usize,
 ) -> anyhow::Result<QcfWarmupResult> {
-    use crate::core::qcf::ImportanceCollector;
     use crate::models::weights::WeightSwapDecider;
+    use crate::qcf::ImportanceCollector;
 
     let actual_warmup_len = warmup_ids.len();
     eprintln!(
@@ -244,7 +244,7 @@ pub fn run_qcf_warmup_workflow(
             );
 
             let mut collector_decode = ImportanceCollector::new_with_formula(
-                crate::core::qcf::ImportanceFormula::DirectAttn,
+                crate::qcf::ImportanceFormula::DirectAttn,
                 false,
             );
 
@@ -355,7 +355,7 @@ pub fn run_qcf_warmup_workflow(
     // ── Build ImportanceTable (+ optional DP-LLM ε variants) + reset KV cache ────
     let direct_attn_primary = matches!(
         importance_formula,
-        crate::core::qcf::ImportanceFormula::DirectAttn
+        crate::qcf::ImportanceFormula::DirectAttn
     );
     let cache_raw = importance_three_way || direct_attn_primary;
     let mut direct_attn_f5_decode_only: Option<Vec<f32>> = None;
@@ -646,7 +646,7 @@ pub fn dispatch_swap_weights(
     model: &crate::models::transformer::TransformerModel,
     ratio: f32,
     target_dtype: llm_shared::DtypeTag,
-    importance_table: Option<&crate::core::qcf::ImportanceTable>,
+    importance_table: Option<&crate::qcf::ImportanceTable>,
     decode_token_index: usize,
     swap_plan_out: &mut Option<crate::models::weights::IncrementalSwapPlan>,
     manager_report_out: &mut Option<(f32, usize, std::time::Instant, f32)>,

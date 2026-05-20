@@ -9,7 +9,6 @@ pub mod kv_cache;
 pub mod kv_migrate;
 pub mod offload;
 pub mod pressure;
-pub mod qcf;
 pub mod rss_trace;
 pub mod sampling;
 pub mod skip_config;

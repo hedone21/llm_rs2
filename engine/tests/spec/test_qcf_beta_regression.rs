@@ -11,9 +11,7 @@
 //! formula, β=1.0 and β=1.5 would become identical — caught here.
 
 use llm_rs2::core::kv_cache::KVLayout;
-use llm_rs2::core::qcf::{
-    AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv,
-};
+use llm_rs2::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
 
 /// Build test params with the given β.
 ///

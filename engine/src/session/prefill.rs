@@ -33,7 +33,7 @@ use crate::tensor::Tensor;
 pub type LayerSwapEstimator<'a> = Box<
     dyn FnMut(
             &TransformerModel,
-            Option<&crate::core::qcf::ImportanceTable>,
+            Option<&crate::qcf::ImportanceTable>,
         ) -> Option<llm_shared::LayerSwapEstimate>
         + 'a,
 >;
@@ -79,7 +79,7 @@ pub struct PrefillOutput {
     pub start_pos: usize,
     pub profiler: Option<crate::profile::InferenceProfiler>,
     pub variance_collector: Option<crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector>,
-    pub importance_table_for_swap: Option<crate::core::qcf::ImportanceTable>,
+    pub importance_table_for_swap: Option<crate::qcf::ImportanceTable>,
     pub collector_armed: bool,
     pub deferred_switch: Option<String>,
     pub skip_config: Option<SkipConfig>,
@@ -192,7 +192,7 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
     // we are waiting for the next prefill to inject `ImportanceCollector`.
     // This is a lightweight bool; the actual collector lives on the stack
     // during prefill (not stored here).
-    let mut importance_table_for_swap: Option<crate::core::qcf::ImportanceTable> = None;
+    let mut importance_table_for_swap: Option<crate::qcf::ImportanceTable> = None;
     let mut collector_armed = false;
 
     // === PREFILL PHASE ===
@@ -291,12 +291,11 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
         // ENG-ALG-218: if collector is armed, prepare a collector for this prefill.
         // Armed by `RequestQcf` handler in decode loop; collector is injected into
         // the last prefill chunk so it captures the final contextual activation state.
-        let mut on_demand_collector: Option<crate::core::qcf::ImportanceCollector> =
-            if collector_armed {
-                Some(crate::core::qcf::ImportanceCollector::new())
-            } else {
-                None
-            };
+        let mut on_demand_collector: Option<crate::qcf::ImportanceCollector> = if collector_armed {
+            Some(crate::qcf::ImportanceCollector::new())
+        } else {
+            None
+        };
         if collector_armed {
             collector_armed = false; // consume the flag; armed at most once per prefill
         }
@@ -560,7 +559,7 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
         // so QcfEstimate is guaranteed to be sent when the prefill completes successfully.
         // For panics/early-return paths the caller-side Drop guard is the safety net.
         if let Some(collector) = on_demand_collector.take() {
-            let table: crate::core::qcf::ImportanceTable = collector.build();
+            let table: crate::qcf::ImportanceTable = collector.build();
             let layer_swap = (layer_swap_estimator)(model, Some(&table));
             if let Some(executor) = &mut command_executor {
                 executor.send_qcf_estimate(llm_shared::QcfEstimate {

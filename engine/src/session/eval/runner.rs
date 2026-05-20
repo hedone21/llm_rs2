@@ -46,7 +46,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     // the PPL/generation QCF-dump workflow (line ~2417) but uses the eval
     // questions' prompt text instead of a corpus file for the warmup input.
     let eval_ll_qcf_start = std::time::Instant::now();
-    let mut eval_ll_qcf_importance: Option<crate::core::qcf::ImportanceTable> = None;
+    let mut eval_ll_qcf_importance: Option<crate::qcf::ImportanceTable> = None;
     let mut eval_ll_qcf_decision: Option<crate::models::weights::decider::SwapDecision> = None;
     let mut eval_ll_qcf_dpllm_epsilon: Option<Vec<f32>> = None;
     let mut eval_ll_qcf_dpllm_epsilon_multi: Option<Vec<f32>> = None;
@@ -127,13 +127,13 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     );
 
     let qcf_mode_enum = match args.qcf_mode.as_str() {
-        "caote" => crate::core::qcf::QcfMode::Caote,
-        "both" => crate::core::qcf::QcfMode::Both,
-        _ => crate::core::qcf::QcfMode::Attn,
+        "caote" => crate::qcf::QcfMode::Caote,
+        "both" => crate::qcf::QcfMode::Both,
+        _ => crate::qcf::QcfMode::Attn,
     };
-    let qcf_config = crate::core::qcf::QcfConfig {
+    let qcf_config = crate::qcf::QcfConfig {
         mode: qcf_mode_enum,
-        ..crate::core::qcf::QcfConfig::default()
+        ..crate::qcf::QcfConfig::default()
     };
 
     let eval_config = crate::eval::EvalConfig {

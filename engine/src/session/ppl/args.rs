@@ -10,11 +10,11 @@ use crate::backend::Backend;
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::KVCache;
-use crate::core::qcf::ImportanceTable;
 use crate::core::skip_config::SkipConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::decider::SwapDecision;
+use crate::qcf::ImportanceTable;
 use crate::session::cli::Args;
 
 pub struct PplRunCtx {

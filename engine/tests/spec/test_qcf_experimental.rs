@@ -7,7 +7,7 @@
 //! infrastructure introduced in Steps 1–6. The tests do not require a model
 //! file and run on every `cargo test` invocation.
 
-use llm_rs2::core::qcf::{
+use llm_rs2::qcf::{
     AggregationMode, LayerAggregationMode, aggregate_heads, aggregate_layers,
     compute_auto_sample_layers, compute_normalized_entropy, compute_topk_retention,
 };

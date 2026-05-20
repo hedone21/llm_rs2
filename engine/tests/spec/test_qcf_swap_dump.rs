@@ -10,9 +10,9 @@
 //!
 //! Spec: Phase 1 (zazzy-herding-bonbon), ENG-ALG-215, ENG-ALG-217.
 
-use llm_rs2::core::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 use llm_rs2::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
 use llm_rs2::models::weights::QuantNoiseTable;
+use llm_rs2::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 

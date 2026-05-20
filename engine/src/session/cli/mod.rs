@@ -85,7 +85,7 @@ impl From<SecondaryLayoutArg> for crate::models::weights::SecondaryLayoutChoice 
 pub fn parse_qcf_sample_layers(spec: &str, n_layers: usize) -> Result<Vec<usize>, String> {
     let s = spec.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("auto") {
-        return Ok(crate::core::qcf::compute_auto_sample_layers(n_layers));
+        return Ok(crate::qcf::compute_auto_sample_layers(n_layers));
     }
     if s.eq_ignore_ascii_case("all") {
         return Ok((0..n_layers).collect());

@@ -160,7 +160,7 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub skip_config: Option<&'a crate::core::skip_config::SkipConfig>,
     /// Optional importance collector for Layer Skip QCF.
     /// When provided during prefill, captures per-layer cosine similarity.
-    pub importance_collector: Option<&'a mut crate::core::qcf::ImportanceCollector>,
+    pub importance_collector: Option<&'a mut crate::qcf::ImportanceCollector>,
     /// When true, only compute logits for the last sequence position.
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
@@ -1810,13 +1810,7 @@ impl TransformerModel {
             // Record importance after layer forward
             if let Some(ref mut coll) = importance_collector {
                 let x_data = x.as_slice::<f32>();
-                coll.record_after(
-                    x_data,
-                    seq_len,
-                    hidden_size,
-                    i,
-                    crate::core::qcf::SubLayer::Full,
-                );
+                coll.record_after(x_data, seq_len, hidden_size, i, crate::qcf::SubLayer::Full);
             }
 
             // Capture attention scores for H2O/H2O+ accumulator

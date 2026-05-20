@@ -8,8 +8,8 @@
 #![allow(clippy::identity_op)]
 
 use llm_rs2::core::pressure::quantize_handler::QuantizeHandler;
-use llm_rs2::core::qcf::QcfMetric;
-use llm_rs2::core::qcf::estimator::{DegradationEstimator, PiecewiseLinear};
+use llm_rs2::qcf::QcfMetric;
+use llm_rs2::qcf::estimator::{DegradationEstimator, PiecewiseLinear};
 use llm_shared::Level as PressureLevel;
 use std::collections::HashMap;
 
