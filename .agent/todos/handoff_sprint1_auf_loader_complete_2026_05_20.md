@@ -22,26 +22,46 @@
 - `cargo fmt` clean, 호출처 동작 변화 0건 (re-export로 import path 보존)
 - OpenCL feature 켠 1163/1181 (병렬 race로 인한 18건 flaky는 본 sprint와 무관, 단독 실행 시 PASS)
 
-## 남은 작업 — W-AUF-1B (auf_tool multi-dtype mode)
+## W-AUF-1B (auf_tool multi-dtype mode) — 완료 ✅ (2026-05-20)
 
-**진입 문장**: "W-AUF-1B 진행"
-**전제**: 본 sprint 종결 후
-**위험**: L (auf_tool 단일 도구 확장)
-**LOC**: +200~300 + 새 AUF 파일 1~3개 빌드
+**Retrospective**: auf_tool multi-dtype 인프라는 본 sprint 시작 전에 이미 master에
+존재했음. W-AUF-0 inspection 결과 (모든 AUF에 `CAPABILITY_BIT_MULTI_DTYPE=0`)는
+누구도 `--dtypes`로 빌드하지 않았기 때문이며, 코드/spec 부재가 아니다. 관련 commits:
 
-내용:
-1. `auf_tool build`에 `--multi-dtype <DTYPES>` (comma-separated) 옵션 추가. 예: `--multi-dtype q4_0,f16`
-2. 각 (layer, kind)에 대해 N개 dtype variant를 TENSOR_INDEX에 등록
-3. `CAPABILITY_BIT_MULTI_DTYPE` ON
-4. `auf_dtype_convert::convert_tensor_dtype` 활용 (Q4_0→F16 dequant 또는 F16→Q4_0 quant)
-5. Qwen 2.5-1.5B multi-dtype AUF 빌드 → W-AUF-2 검증 인프라 확보
+- `a87e8b64 feat(auf): introduce v0.2 multi-dtype capability bit + META default_dtype`
+- `8b35a911 feat(auf): writer dtype-aware payload + auf_tool --dtypes/--default-dtype`
+- `97457f2f fix(auf): correct multi-dtype 1-D tensor handling (ISSUE-E-1)`
 
-자세한 spec: `/home/go/.claude/plans/proud-strolling-whale.md` § "W-AUF-1B 신규 sub-sprint"
+CLI 옵션 매핑:
+- plan의 `--multi-dtype` ↔ 실제 `--dtypes` (이미 구현)
+- plan의 `--default-dtype` ↔ 동일 (이미 구현)
+- `CAPABILITY_BIT_MULTI_DTYPE` set + `format_minor = 2`: 자동 (multi_dtype_enabled flag)
+
+**실측 빌드 결과** (commit이 첨부할 수 없는 4.2 GiB 산출물):
+
+```bash
+target/release/auf_tool build \
+  --input  models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf \
+  --tokenizer        models/qwen2.5-1.5b/tokenizer.json \
+  --tokenizer-config models/qwen2.5-1.5b/tokenizer_config.json \
+  --output models/qwen2.5-1.5b/qwen2.5-1.5b-multi-dtype.auf \
+  --variants cpu_aos \
+  --dtypes   q4_0,f16
+```
+
+- 출력 파일: `models/qwen2.5-1.5b/qwen2.5-1.5b-multi-dtype.auf` (4.24 GiB)
+- format: **v0.2.1**, `capability_opt = 0x0c` (LM_HEAD_PRECOMPUTED_Q4_0 + MULTI_DTYPE_VARIANTS)
+- TENSOR_INDEX: 453 dtype entries (255 base tensor × 평균 ~1.78 dtype)
+- META.default_dtype = Q4_0
+- TOKENIZER: eos=151643 (W-AUF-1 C5의 `--tokenizer-config` 효과로 자동 채움), bos=-1 (Qwen2.5 tokenizer_config에 bos_token=null)
+- `auf_tool verify`: 19/19 게이트 PASS (INV-137 shape consistency + INV-138 default_dtype 포함)
+
+본 파일은 **W-AUF-2 self-secondary 자동 활성 검증의 1순위 인프라**.
 
 ## 남은 작업 — W-AUF-2 (self-secondary 자동 활성)
 
 **진입 문장**: "W-AUF-2 진행"
-**전제**: W-AUF-1B 완료 (multi-dtype AUF 빌드 인프라 필요)
+**전제**: W-AUF-1B 완료 (multi-dtype AUF 빌드 + 실측 산출물 확보 ✅)
 **위험**: M (resolve_secondary stub → 본격 구현 + RpcMem alias 호환)
 
 내용:
