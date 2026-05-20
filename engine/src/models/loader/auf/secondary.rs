@@ -662,4 +662,335 @@ mod tests {
         let v = resolve_backend_tag_candidates(SecondaryLayoutChoice::Soa);
         assert_eq!(v, vec![BackendTag::AdrenoSoa]);
     }
+
+    // ── W-AUF-2 C4: AUF self-secondary 통합 테스트 ───────────────────────────
+
+    /// Helper: in-memory multi-dtype AUF bytes (CPU_AOS variant, Q4_0 + F16).
+    ///
+    /// 1-layer 1-tensor 구조로 최소화:
+    /// - layer 0, AttnQ, Q4_0 (32 bytes payload)
+    /// - layer 0, AttnQ, F16 (32 bytes payload)
+    ///
+    /// section offset 검증을 위해 두 dtype variant 모두 같은 `variant_offsets[0]`
+    /// (= CPU_AOS variant slot)를 사용한다.
+    fn build_multi_dtype_auf_bytes() -> Vec<u8> {
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::{TensorEntry, TensorIndex};
+        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use crate::auf::writer::AufWriter;
+        use crate::auf::{AufMeta, BackendTag, TensorKind};
+
+        let _ = BackendTag::CpuAos; // import keeper
+
+        let payload_q4_0: Vec<u8> = (0..32).map(|i| (i & 0xFF) as u8).collect();
+        let payload_f16: Vec<u8> = (0..32).map(|i| ((i + 100) & 0xFF) as u8).collect();
+        // CPU_AOS section payload: q4_0 (offset 0) followed by f16 (offset 32).
+        let mut weights_payload = payload_q4_0.clone();
+        weights_payload.extend_from_slice(&payload_f16);
+
+        let mut tag_buf = [0u8; 24];
+        tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+
+        let entries = vec![
+            TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::Q4_0.as_u32(),
+                shape: vec![1, 32],
+                alignment: 32,
+                variant_offsets: vec![0],
+                variant_sizes: vec![32],
+            },
+            TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::F16.as_u32(),
+                shape: vec![1, 16],
+                alignment: 32,
+                variant_offsets: vec![32],
+                variant_sizes: vec![32],
+            },
+        ];
+        let tensor_index = TensorIndex {
+            variant_tags: vec![tag_buf],
+            entries,
+        };
+
+        AufWriter::new(
+            AufMeta {
+                architecture: "llama".to_owned(),
+                n_layers: 1,
+                n_heads_q: 1,
+                n_kv_heads: 1,
+                head_dim: 64,
+                hidden_dim: 64,
+                ffn_dim: 128,
+                vocab_size: 2,
+                max_seq_len: 32,
+                rope_theta: 10000.0,
+                rotary_dim: 64,
+                rope_scaling: 1.0,
+                rms_norm_epsilon: 1e-5,
+                default_dtype: Some("Q4_0".to_owned()),
+            },
+            AufTokenizer {
+                kind: TOKENIZER_KIND_BPE,
+                tokens: vec![b"a".to_vec()],
+                merges: vec![],
+                bos_id: 1,
+                eos_id: 2,
+                pad_id: -1,
+                unk_id: 0,
+                chat_template: None,
+            },
+            [0u8; 32],
+            0,
+            0,
+        )
+        .with_multi_dtype(true)
+        .with_tensor_index(tensor_index)
+        .add_weights_section(TAG_WEIGHTS_CPU_AOS, weights_payload)
+        .build()
+        .unwrap()
+    }
+
+    fn make_test_config() -> ModelConfig {
+        use crate::models::config::ModelArch;
+        ModelConfig {
+            arch: ModelArch::Llama,
+            hidden_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 64,
+            intermediate_size: 128,
+            vocab_size: 2,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 2,
+            weight_prefix: String::new(),
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+        }
+    }
+
+    #[test]
+    fn from_auf_self_secondary_selects_other_dtype() {
+        use crate::auf::reader::open_from_bytes;
+        use crate::auf::{BackendTag, TensorDType};
+
+        let bytes = build_multi_dtype_auf_bytes();
+        let view = std::sync::Arc::new(open_from_bytes(bytes, BackendTag::CpuAos).unwrap());
+        let cfg = make_test_config();
+
+        // primary_dtype = F16 → secondary가 Q4_0을 골라야 한다 (정합 swap 방향 F16→Q4_0).
+        let mmap = super::from_auf_self_secondary(
+            std::sync::Arc::clone(&view),
+            BackendTag::CpuAos,
+            TensorDType::F16,
+            &cfg,
+        )
+        .expect("self-secondary should auto-select Q4_0 (other dtype)");
+
+        // layer 0, attn_q.weight가 Q4_0 dtype + 32 bytes로 가용.
+        let info = mmap
+            .layer_tensor(0, "attn_q.weight")
+            .expect("layer_tensor must find attn_q.weight from Q4_0 entry");
+        assert_eq!(info.dtype, DType::Q4_0, "self-secondary must pick Q4_0");
+        assert_eq!(info.len, 32, "Q4_0 entry size");
+        // Q4_0 payload는 weights section offset 0부터 시작 → bytes의 첫 byte는 0.
+        let bytes_view = mmap.tensor_bytes(info);
+        assert_eq!(bytes_view[0], 0, "Q4_0 payload starts with byte 0");
+    }
+
+    #[test]
+    fn from_auf_self_secondary_rejects_reverse_swap_q4_to_f16() {
+        use crate::auf::reader::open_from_bytes;
+        use crate::auf::{BackendTag, TensorDType};
+
+        let bytes = build_multi_dtype_auf_bytes();
+        let view = std::sync::Arc::new(open_from_bytes(bytes, BackendTag::CpuAos).unwrap());
+        let cfg = make_test_config();
+
+        // primary_dtype = Q4_0 + secondary candidate = F16 → reject (정책: F16→Q4_0 단방향만).
+        let err = super::from_auf_self_secondary(
+            view,
+            BackendTag::CpuAos,
+            TensorDType::Q4_0,
+            &cfg,
+        )
+        .expect_err("Q4_0 primary + F16 secondary must be ReverseSwapRejected");
+        assert!(
+            matches!(err, LoadError::ReverseSwapRejected { .. }),
+            "expected ReverseSwapRejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_auf_self_secondary_errors_when_only_primary_dtype() {
+        use crate::auf::reader::open_from_bytes;
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::{TensorEntry, TensorIndex};
+        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use crate::auf::writer::AufWriter;
+        use crate::auf::{AufMeta, BackendTag, TensorDType, TensorKind};
+
+        // single-dtype AUF (Q4_0 only) — multi-dtype bit OFF.
+        let payload: Vec<u8> = vec![0u8; 32];
+        let mut tag_buf = [0u8; 24];
+        tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+        let bytes = AufWriter::new(
+            AufMeta {
+                architecture: "llama".to_owned(),
+                n_layers: 1,
+                n_heads_q: 1,
+                n_kv_heads: 1,
+                head_dim: 64,
+                hidden_dim: 64,
+                ffn_dim: 128,
+                vocab_size: 2,
+                max_seq_len: 32,
+                rope_theta: 10000.0,
+                rotary_dim: 64,
+                rope_scaling: 1.0,
+                rms_norm_epsilon: 1e-5,
+                default_dtype: Some("Q4_0".to_owned()),
+            },
+            AufTokenizer {
+                kind: TOKENIZER_KIND_BPE,
+                tokens: vec![b"a".to_vec()],
+                merges: vec![],
+                bos_id: 1,
+                eos_id: 2,
+                pad_id: -1,
+                unk_id: 0,
+                chat_template: None,
+            },
+            [0u8; 32],
+            0,
+            0,
+        )
+        .with_tensor_index(TensorIndex {
+            variant_tags: vec![tag_buf],
+            entries: vec![TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::Q4_0.as_u32(),
+                shape: vec![1, 32],
+                alignment: 32,
+                variant_offsets: vec![0],
+                variant_sizes: vec![32],
+            }],
+        })
+        .add_weights_section(TAG_WEIGHTS_CPU_AOS, payload)
+        .build()
+        .unwrap();
+
+        let view = std::sync::Arc::new(open_from_bytes(bytes, BackendTag::CpuAos).unwrap());
+        let cfg = make_test_config();
+        let err = super::from_auf_self_secondary(
+            view,
+            BackendTag::CpuAos,
+            TensorDType::Q4_0,
+            &cfg,
+        )
+        .expect_err("single-dtype self-secondary must fail (no swap candidate)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no swap candidates") || msg.contains("auf_tool build --dtypes"),
+            "error should mention missing swap candidates, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_auf_self_secondary_rejects_adreno_soa_with_only_f16() {
+        // primary=AdrenoSoa, only non-primary dtype = F16 → AdrenoSoaF16Rejected.
+        use crate::auf::reader::open_from_bytes;
+        use crate::auf::section::TAG_WEIGHTS_ADRENO_SOA;
+        use crate::auf::tensor_index::{TensorEntry, TensorIndex};
+        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use crate::auf::writer::AufWriter;
+        use crate::auf::{AufMeta, BackendTag, TensorDType, TensorKind};
+
+        let payload: Vec<u8> = vec![0u8; 64];
+        let mut tag_buf = [0u8; 24];
+        tag_buf[..TAG_WEIGHTS_ADRENO_SOA.len()].copy_from_slice(TAG_WEIGHTS_ADRENO_SOA.as_bytes());
+        let bytes = AufWriter::new(
+            AufMeta {
+                architecture: "llama".to_owned(),
+                n_layers: 1,
+                n_heads_q: 1,
+                n_kv_heads: 1,
+                head_dim: 64,
+                hidden_dim: 64,
+                ffn_dim: 128,
+                vocab_size: 2,
+                max_seq_len: 32,
+                rope_theta: 10000.0,
+                rotary_dim: 64,
+                rope_scaling: 1.0,
+                rms_norm_epsilon: 1e-5,
+                default_dtype: Some("Q4_0".to_owned()),
+            },
+            AufTokenizer {
+                kind: TOKENIZER_KIND_BPE,
+                tokens: vec![b"a".to_vec()],
+                merges: vec![],
+                bos_id: 1,
+                eos_id: 2,
+                pad_id: -1,
+                unk_id: 0,
+                chat_template: None,
+            },
+            [0u8; 32],
+            0,
+            0,
+        )
+        .with_multi_dtype(true)
+        .with_tensor_index(TensorIndex {
+            variant_tags: vec![tag_buf],
+            entries: vec![
+                TensorEntry {
+                    layer_idx: 0,
+                    kind: TensorKind::AttnQ.as_u32(),
+                    dtype: TensorDType::Q4_0.as_u32(),
+                    shape: vec![1, 32],
+                    alignment: 32,
+                    variant_offsets: vec![0],
+                    variant_sizes: vec![32],
+                },
+                TensorEntry {
+                    layer_idx: 0,
+                    kind: TensorKind::AttnQ.as_u32(),
+                    dtype: TensorDType::F16.as_u32(),
+                    shape: vec![1, 16],
+                    alignment: 32,
+                    variant_offsets: vec![32],
+                    variant_sizes: vec![32],
+                },
+            ],
+        })
+        .add_weights_section(TAG_WEIGHTS_ADRENO_SOA, payload)
+        .build()
+        .unwrap();
+
+        let view = std::sync::Arc::new(open_from_bytes(bytes, BackendTag::AdrenoSoa).unwrap());
+        let cfg = make_test_config();
+        let err = super::from_auf_self_secondary(
+            view,
+            BackendTag::AdrenoSoa,
+            TensorDType::Q4_0,
+            &cfg,
+        )
+        .expect_err("AdrenoSoa primary + F16 secondary must be rejected");
+        assert!(
+            matches!(err, LoadError::AdrenoSoaF16Rejected),
+            "expected AdrenoSoaF16Rejected, got {err:?}"
+        );
+    }
 }
