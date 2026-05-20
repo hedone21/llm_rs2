@@ -1,7 +1,7 @@
 {
   "description": "INV-LAYER-001~005 현재 위반 baseline (ARCHITECTURE.md §13.5). 마이그레이션 PR마다 줄어들 예정.",
-  "generated": "2026-05-16",
-  "total": 309,
+  "generated": "2026-05-20",
+  "total": 286,
   "violations": [
     {
       "id": "V-01",
@@ -190,60 +190,6 @@
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-001",
       "kind": "L1(cuda_pc)→L1(cpu) (cross-backend import)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-07",
-      "file": "memory/opencl/host_ptr_pool_buffer.rs",
-      "line": 25,
-      "import": "crate::backend::opencl::host_ptr_pool::HostPtrPoolGuard",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L1 (backend-specific impl 직접 의존)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-08",
-      "file": "memory/cuda/mmap.rs",
-      "line": 22,
-      "import": "crate::models::weights::SecondaryMmap",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-08",
-      "file": "memory/rpcmem/opencl_alias.rs",
-      "line": 25,
-      "import": "crate::models::weights::SecondaryMmap",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-08",
-      "file": "memory/rpcmem/opencl_alias.rs",
-      "line": 57,
-      "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-08",
-      "file": "memory/rpcmem/opencl_alias.rs",
-      "line": 86,
-      "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-09",
-      "file": "memory/opencl/host_ptr_pool_buffer.rs",
-      "line": 27,
-      "import": "crate::models::weights::SecondaryMmap",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
       "note": "ARCHITECTURE.md §13.5"
     },
     {
@@ -465,26 +411,8 @@
     },
     {
       "id": "V-14",
-      "file": "core/qcf/qcf_kv.rs",
-      "line": 178,
-      "import": "crate::profile::quality_metrics::Timer::start",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-14",
-      "file": "core/qcf/qcf_kv.rs",
-      "line": 179,
-      "import": "crate::profile::quality_metrics::QCF_KV_UNIFIED",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-14",
       "file": "core/sampling.rs",
-      "line": 131,
+      "line": 132,
       "import": "crate::profile::quality_metrics::Timer::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -493,7 +421,7 @@
     {
       "id": "V-14",
       "file": "core/sampling.rs",
-      "line": 131,
+      "line": 132,
       "import": "crate::profile::quality_metrics::NLL",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -561,24 +489,6 @@
       "file": "eval/eval_loop.rs",
       "line": 11,
       "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L1 (trait inversion 필요)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-16",
-      "file": "eval/eval_loop.rs",
-      "line": 153,
-      "import": "crate::backend::opencl::buffer::snapshot_alloc_counters",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L1 (trait inversion 필요)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-16",
-      "file": "eval/eval_loop.rs",
-      "line": 177,
-      "import": "crate::backend::opencl::buffer::snapshot_alloc_counters",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L1 (trait inversion 필요)",
       "note": "ARCHITECTURE.md §13.5"
@@ -993,7 +903,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 1586,
+      "line": 1600,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1002,7 +912,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 1851,
+      "line": 1865,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1011,7 +921,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 1940,
+      "line": 1954,
       "import": "crate::backend::opencl::get_cl_mem",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1020,7 +930,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 1941,
+      "line": 1955,
       "import": "crate::backend::opencl::plan::*",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1029,7 +939,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2015,
+      "line": 2059,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1038,7 +948,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2363,
+      "line": 2459,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1047,7 +957,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2425,
+      "line": 2521,
       "import": "crate::backend::opencl::get_cl_mem",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1056,7 +966,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2426,
+      "line": 2522,
       "import": "crate::backend::opencl::plan::*",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1065,7 +975,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2472,
+      "line": 2568,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1074,7 +984,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2606,
+      "line": 2702,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1101,7 +1011,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1447,
+      "line": 1461,
       "import": "crate::profile::op_trace::note_forward_call",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1110,7 +1020,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1478,
+      "line": 1492,
       "import": "crate::profile::op_trace::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1119,7 +1029,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1489,
+      "line": 1503,
       "import": "crate::profile::op_trace::record",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1128,7 +1038,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1491,
+      "line": 1505,
       "import": "crate::profile::op_trace::OpKind::Embedding",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1137,7 +1047,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1860,
+      "line": 1874,
       "import": "crate::profile::op_trace::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1146,7 +1056,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1871,
+      "line": 1885,
       "import": "crate::profile::op_trace::record",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1155,7 +1065,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1873,
+      "line": 1887,
       "import": "crate::profile::op_trace::OpKind::FinalNorm",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1164,7 +1074,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1881,
+      "line": 1895,
       "import": "crate::profile::op_trace::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1173,7 +1083,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1911,
+      "line": 1925,
       "import": "crate::profile::op_trace::record",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1182,7 +1092,7 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1913,
+      "line": 1927,
       "import": "crate::profile::op_trace::OpKind::LmHead",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1257,7 +1167,7 @@
     {
       "id": "V-25",
       "file": "models/weights/swap_executor.rs",
-      "line": 365,
+      "line": 367,
       "import": "crate::backend::opencl::host_ptr_pool::HostPtrPool",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1266,7 +1176,7 @@
     {
       "id": "V-25",
       "file": "models/weights/swap_executor.rs",
-      "line": 2139,
+      "line": 2141,
       "import": "crate::backend::opencl::host_ptr_pool::HostPtrPool",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1520,7 +1430,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 35,
+      "line": 41,
       "import": "crate::resilience::DbusTransport",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→resilience (L4 session/ 우회)",
@@ -1529,7 +1439,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 36,
+      "line": 42,
       "import": "crate::resilience::TcpTransport",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→resilience (L4 session/ 우회)",
@@ -1538,7 +1448,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 38,
+      "line": 44,
       "import": "crate::resilience::UnixSocketTransport",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→resilience (L4 session/ 우회)",
@@ -1547,16 +1457,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 1552,
-      "import": "crate::backend::cuda::SyncPolicy",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L1 (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 2871,
+      "line": 864,
       "import": "crate::core::eviction::StreamingLLMPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1565,7 +1466,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 3032,
+      "line": 1033,
       "import": "crate::core::skip_config::SkipConfig",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
@@ -1574,34 +1475,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 3579,
-      "import": "crate::core::qcf::ImportanceCollector",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 4269,
-      "import": "crate::eval::StepHook",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→observability (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 4909,
-      "import": "crate::core::kv_cache::KVCacheOps",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 5876,
+      "line": 1945,
       "import": "crate::resilience::GpuSelfMeter",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→resilience (L4 session/ 우회)",
@@ -1610,7 +1484,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 6725,
+      "line": 2735,
       "import": "crate::models::weights::compute_qcf_weight_swap",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
@@ -1619,7 +1493,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 7346,
+      "line": 3358,
       "import": "crate::core::eviction::StreamingLLMPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1628,7 +1502,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 7559,
+      "line": 3571,
       "import": "crate::backend::opencl::buffer_kind_label",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L1 (L4 session/ 우회)",
@@ -1637,16 +1511,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 8750,
-      "import": "crate::core::qcf::ImportanceCollector",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 8751,
+      "line": 4662,
       "import": "crate::models::weights::WeightSwapDecider",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
@@ -1655,16 +1520,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 9413,
-      "import": "crate::models::weights::WeightSwapDecider",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 9688,
+      "line": 4798,
       "import": "crate::core::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1673,16 +1529,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 10050,
-      "import": "crate::core::kv_cache::KVCacheOps",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 10242,
+      "line": 4990,
       "import": "crate::core::skip_config::SkipConfig",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
@@ -1691,7 +1538,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 10650,
+      "line": 5398,
       "import": "crate::core::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1700,7 +1547,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 10651,
+      "line": 5399,
       "import": "crate::core::offload::OffloadKVCache",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1709,61 +1556,16 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 10652,
+      "line": 5400,
       "import": "crate::core::offload::raw_store::RawStore",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 11850,
-      "import": "crate::core::chat_template::ChatTemplate",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 12359,
-      "import": "crate::core::eviction::StreamingLLMPolicy",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 12904,
-      "import": "crate::core::offload::OffloadKVCache",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-30",
-      "file": "bin/generate.rs",
-      "line": 12905,
-      "import": "crate::core::offload::raw_store::RawStore",
-      "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
-      "id": "V-??",
-      "file": "auf/dtype_convert.rs",
-      "line": 23,
-      "import": "crate::models::loader::convert::",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
       "note": "ARCHITECTURE.md §13.5"
     },
     {
       "id": "V-??",
       "file": "backend/opencl/mod.rs",
-      "line": 5239,
+      "line": 5232,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
@@ -1772,7 +1574,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/mod.rs",
-      "line": 5294,
+      "line": 5287,
       "import": "crate::models::weights::SecondaryMmap",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-inference (역방향 import)",
@@ -1781,7 +1583,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/mod.rs",
-      "line": 5295,
+      "line": 5288,
       "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-inference (역방향 import)",
@@ -1790,7 +1592,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/mod.rs",
-      "line": 7179,
+      "line": 7172,
       "import": "crate::core::kv_cache::KVCache",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-pressure (역방향 import)",
@@ -2149,6 +1951,24 @@
       "import": "crate::core::kv_cache::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
+      "note": "ARCHITECTURE.md §13.5"
+    },
+    {
+      "id": "V-??",
+      "file": "core/qcf/qcf_kv.rs",
+      "line": 178,
+      "import": "crate::profile::quality_metrics::Timer::start",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
+      "note": "ARCHITECTURE.md §13.5"
+    },
+    {
+      "id": "V-??",
+      "file": "core/qcf/qcf_kv.rs",
+      "line": 179,
+      "import": "crate::profile::quality_metrics::QCF_KV_UNIFIED",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "note": "ARCHITECTURE.md §13.5"
     },
     {
@@ -2520,6 +2340,15 @@
     },
     {
       "id": "V-??",
+      "file": "memory/opencl/host_ptr_pool_buffer.rs",
+      "line": 26,
+      "import": "crate::backend::opencl::host_ptr_pool::HostPtrPoolGuard",
+      "rule": "INV-LAYER-002",
+      "kind": "L2→L1 (backend-specific impl 직접 의존)",
+      "note": "ARCHITECTURE.md §13.5"
+    },
+    {
+      "id": "V-??",
       "file": "models/loader/gguf.rs",
       "line": 14,
       "import": "crate::backend::cpu::CpuBackend",
@@ -2584,7 +2413,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 1284,
+      "line": 1298,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2593,7 +2422,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 1787,
+      "line": 1801,
       "import": "crate::core::gpu_yield::maybe_yield_after_layer",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
@@ -2602,7 +2431,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 1942,
+      "line": 1956,
       "import": "crate::core::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -2611,7 +2440,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 2422,
+      "line": 2518,
       "import": "crate::core::kivi_cache::KiviCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -2620,7 +2449,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 2598,
+      "line": 2694,
       "import": "crate::core::kivi_cache::KiviCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -2629,7 +2458,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 2639,
+      "line": 2735,
       "import": "crate::core::kv_cache::PrefetchableCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -2638,7 +2467,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 2642,
+      "line": 2738,
       "import": "crate::core::offload::prefetch::PrefetchController",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -2647,7 +2476,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 3022,
+      "line": 3118,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2657,7 +2486,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 3184,
+      "line": 3280,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2716,7 +2545,7 @@
     {
       "id": "V-??",
       "file": "models/weights/secondary_mmap.rs",
-      "line": 729,
+      "line": 748,
       "import": "crate::backend::qnn_oppkg::QnnOppkgBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2725,7 +2554,7 @@
     {
       "id": "V-??",
       "file": "models/weights/swap_executor.rs",
-      "line": 1650,
+      "line": 1652,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2734,7 +2563,7 @@
     {
       "id": "V-??",
       "file": "models/weights/swap_executor.rs",
-      "line": 2006,
+      "line": 2008,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2743,7 +2572,7 @@
     {
       "id": "V-??",
       "file": "models/weights/swap_executor.rs",
-      "line": 2146,
+      "line": 2148,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2752,7 +2581,7 @@
     {
       "id": "V-??",
       "file": "models/weights/swap_executor.rs",
-      "line": 2410,
+      "line": 2413,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2761,7 +2590,7 @@
     {
       "id": "V-??",
       "file": "models/weights/swap_executor.rs",
-      "line": 2807,
+      "line": 2810,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2770,7 +2599,7 @@
     {
       "id": "V-??",
       "file": "models/weights/swap_executor.rs",
-      "line": 3031,
+      "line": 3034,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -2780,7 +2609,7 @@
     {
       "id": "V-??",
       "file": "models/weights/swap_executor.rs",
-      "line": 3093,
+      "line": 3096,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",

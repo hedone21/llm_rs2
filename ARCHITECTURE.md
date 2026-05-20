@@ -1341,6 +1341,21 @@ session/
 - V-23 (AUF가 일반 모델 로딩에 사용) — `auf/` 위치 합의(`resilience/auf/`) 재검토 필요
 - V-27 (layer_object_pool이 CudaBackend downcast)
 
+**Resolution Log** (Migration Step 3 진행 결과, 2026-05-20 기준):
+
+| V-?? | HEAD | 해소 방법 | 잔존 |
+|---|---|---|---|
+| **V-23** | `5ddc66bf` (Step 3-A) | `auf/` → `shared/auf/` 이동, `dtype_convert.rs`는 engine 의존성 보존 위해 `auf_dtype_convert.rs`로 분리 | 없음 |
+| **V-07** | `c2cb436f` (Step 3-D-b) | `buffer/host_ptr_pool_buffer.rs` → `memory/opencl/host_ptr_pool_buffer.rs`. 단 `HostPtrPoolGuard` import 1건은 L2→L1 잔존 | 1건 (backlog: backend trait 추출 필요) |
+| **V-08** | `c2cb436f` (Step 3-D-b) | backend-specific buffer를 `memory/<resource>/`로 일괄 이동 (`memory/opencl/`, `memory/cuda/`, `memory/rpcmem/`). 위치는 L2 유지하되 grouping이 물리 메모리 자원 기준이 됨 | 없음 (path-only 갱신) |
+| **V-09** | `fc6baee8` (Step 3-E) | `memory/secondary.rs`에 `SecondaryMmapBytes` (1 method) + `RpcmemRegionGuard` (marker) trait 신설. 4개 lifetime-guard 호출처는 `Arc<dyn MmapKeepAlive>`로 erasure, cuda/mmap.rs는 `SecondaryMmapBytes::raw_bytes()` 호출. **5건 해소** | 없음 |
+| **V-19** | `c2cb436f` (Step 3-D-b 부분) | `tensor_partition.rs`의 `SliceBuffer`/`ClSubBuffer` import path 갱신 (`memory/opencl/sub::ClSubBuffer`). 단 L3→L1 본질(tensor_partition을 L2로 옮기는 본 변경)은 보류 | 본질 잔존 (backlog) |
+| **V-27** | `56074264` (Step 3-B) | `Backend::bind_current_thread()` default no-op + CudaBackend override 추가. `LayerObjectPool::new`의 `CudaBackend` downcast 6줄 제거. 별도로 `WeightStagingPool` trait을 `engine/src/layers/staging_pool.rs`에 신설하여 `swap_executor`/`qcf_runtime`/`generate.rs`의 concrete `LayerObjectPool` 의존도 trait 의존으로 전환 | 없음 |
+
+**INV-LAYER-002 위반 추이**: 9 (Step 3-A 진입 시) → 6 (Step 3-D-b 후) → **1** (Step 3-E 후, V-07 `HostPtrPoolGuard` 잔존만).
+
+**baseline JSON 추이**: 309 (Step 1 문서화 시) → 297 (3-A) → 294 (3-D-a) → 294 (3-D-b, path 갱신) → 286 (3-E + 자연 해소).
+
 ### 13.6 External Contributor Entry Points
 
 "X를 추가하려면 Y만 보면 된다"는 명확한 진입점:
@@ -1385,13 +1400,18 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 검증 게이트: G1(/stats 라인 동치) + G2(multi-turn KV bit-identical) + G3(/reset 동작) + G4(chat-specific eviction 동치) + G5(`core/chat_ipc.rs` import zero).
 
 **Step 3: L1/L2 경계 정리** (backend impl이 `shared/` 외 import 제거 + backend-specific buffer/pool/포맷 재배치)
-- V-01 (opencl→gpu_self_meter): trait inversion (`GpuEventMeter` trait 신설)
-- V-02 (opencl→layers): tensor_partition을 `shared/`로 이동 (먼저 위치만, 로직은 그대로)
-- V-03 (qnn_oppkg→models): LayerSlot을 trait 기반 handle로 변환
-- V-04 (qnn_oppkg→opencl), V-05 (cpu_fallback): `shared/`에 `GpuInteropTrait`/`CpuFallback` 도입 또는 명시적 cross-backend 허용 zone 정의
-- **§13.8-D**: backend-specific buffer 일괄 이동 — `buffer/cl_*`, `buffer/cuda_*`, `buffer/rpcmem_*`, `buffer/host_ptr_pool_buffer.rs` → `backend/<be>/buffer/`. generic buffer만 `shared/buffer/`에 유지. V-07, V-08, V-19 해소
-- **§13.8-B**: `models/weights/layer_object_pool.rs` → `backend/cuda_embedded/pool.rs`. `WeightStagingPool` trait을 `shared/`에 신설하여 pressure handler가 trait 경유 접근. V-27 해소
-- **§13.8-A**: `auf/` → `shared/auf/` 이동. V-23 해소 (이전엔 Step 5에 있었으나 L2 자산이므로 Step 3으로 앞당김)
+
+**진행 현황 (2026-05-20 기준)**: 본 Step은 plan 재설계(B안, `/home/go/.claude/plans/proud-strolling-whale.md`)를 거쳐 6 sub-sprint(3-A → 3-D-a → 3-D-b → 3-D-c → 3-B + 3-E → 3-F)로 분할 진행. 5개 sub-sprint 완료, baseline 309 → 286(-23). INV-LAYER-002 9건 → 1건. 잔존: V-07(`HostPtrPoolGuard` import), V-19 본질(tensor_partition L3→L1), V-25(HostPtrPool downcast) — backlog 등록.
+
+- V-01 (opencl→gpu_self_meter): trait inversion (`GpuEventMeter` trait 신설) — **TODO** (backlog)
+- V-02 (opencl→layers): tensor_partition을 `shared/`로 이동 (먼저 위치만, 로직은 그대로) — **TODO** (V-19와 함께 backlog)
+- V-03 (qnn_oppkg→models): LayerSlot을 trait 기반 handle로 변환 — **TODO** (backlog)
+- V-04 (qnn_oppkg→opencl), V-05 (cpu_fallback): `shared/`에 `GpuInteropTrait`/`CpuFallback` 도입 또는 명시적 cross-backend 허용 zone 정의 — **TODO** (backlog)
+- **§13.8-D**: backend-specific buffer 일괄 이동 — **RESOLVED** (3-D-a `3afafa06` dead code 삭제 + MmapBuffer 통합, 3-D-b `c2cb436f` `memory/<resource>/` 신설로 backend → memory 이전. B안 적용: `backend/<be>/buffer/` 대신 `memory/<resource>/` 사용, 의미적으로 더 적합 — rpcmem은 OpenCL/QNN 공유 자원이고 CUDA buffer는 cuda_embedded/cuda_pc 공유). V-08 path 갱신, V-19 일부(import path)
+- **§13.8-B**: `WeightStagingPool` trait — **RESOLVED** (3-B `56074264`). 단 `layer_object_pool.rs`는 위치 유지(파일 이동 시 신규 L1→L3 import 위반 발생), `Backend::bind_current_thread()` default method + CudaBackend override + `engine/src/layers/staging_pool.rs` 신설로 downcast 제거. V-27 해소
+- **§13.8-A**: `auf/` → `shared/auf/` — **RESOLVED** (3-A `5ddc66bf`). V-23 해소
+- **§3-E (V-09 추가)**: `memory/secondary.rs` 신설 (`SecondaryMmapBytes` + `RpcmemRegionGuard` trait) — **RESOLVED** (3-E `fc6baee8`). 4 lifetime-guard 호출처를 `Arc<dyn MmapKeepAlive>`로 erasure. V-09 5건 해소
+- **§3-F (검증·문서)**: baseline JSON 전면 갱신 (305→286 entries) + ARCHITECTURE.md §13.5 Resolution Log 추가 + §13.7 진행 현황 갱신 — **RESOLVED** (3-F, 본 commit)
 
 **Step 4: L3 재배치** (`core/` → `pressure/`, `inference/` rename only)
 - `core/{kv_cache, kivi_cache, kv_migrate, cache_manager, eviction, pressure, offload}` → `pressure/`
