@@ -43,6 +43,9 @@ use crate::models::loader::gguf::GgufFile;
 #[cfg(target_os = "android")]
 use crate::models::loader::gguf::{ggml_type_to_dtype, tensor_byte_size};
 use crate::models::weights::SecondaryMmap;
+use crate::models::weights::backing::WeightSectionView;
+#[cfg(target_os = "android")]
+use crate::models::weights::backing::{AufBacking, GgufBacking};
 #[cfg(target_os = "android")]
 use crate::models::weights::secondary_mmap::parse_block_tensor_name;
 use crate::models::weights::secondary_mmap::{LayerTensorSlice, SecondaryTensorInfo};
@@ -119,8 +122,12 @@ impl Drop for RpcmemLayerRegion {
 /// plus a `Mutex<HashMap>` of allocated per-layer regions. The store itself
 /// does not allocate any rpcmem at construction time.
 pub struct RpcmemSecondaryStore {
-    /// Secondary GGUF mmap — kept alive for layout parsing and lazy memcpy.
-    backing_mmap: Arc<GgufFile>,
+    /// Secondary weight backing — `WeightSectionView` trait object so the
+    /// store can host either a GGUF mmap (`GgufBacking`) or an AUF self-secondary
+    /// (`AufBacking`, shared `Arc<AufView>` with primary). `info.offset`은
+    /// `backing.weights_bytes()`의 슬라이스 base 기준이라 두 경우 모두 같은
+    /// 인덱싱 식 `bytes[info.offset..]`으로 통일된다.
+    backing: Arc<dyn WeightSectionView>,
     /// Source path for diagnostics.
     source_path: PathBuf,
     /// Pre-parsed per-layer tensor index (subname → SecondaryTensorInfo).
@@ -263,10 +270,59 @@ impl RpcmemSecondaryStore {
             }
 
             let (rpcmem_alloc, rpcmem_free) = qnn_runtime_rpcmem_fns;
+            let backing: Arc<dyn WeightSectionView> = Arc::new(GgufBacking {
+                gguf: Arc::new(gguf),
+                source_path: path.to_path_buf(),
+            });
 
             Ok(Self {
-                backing_mmap: Arc::new(gguf),
+                backing,
                 source_path: path.to_path_buf(),
+                layer_index,
+                layer_regions: Mutex::new(HashMap::new()),
+                alias_cache: Mutex::new(HashMap::new()),
+                backend_weak: Mutex::new(Some(Arc::downgrade(&backend))),
+                self_weak: OnceLock::new(),
+                rpcmem_alloc,
+                rpcmem_free,
+            })
+        }
+    }
+
+    /// W-AUF-2.3 — AUF self-secondary 진입.
+    ///
+    /// 이미 `from_auf_self_secondary` (loader)로 빌드된 `(layer_index, Arc<AufView>)`를
+    /// rpcmem alias 백킹으로 재포장한다. mmap 1회 + RpcMem 경로 동시 활성을 보장한다.
+    ///
+    /// 호스트 빌드에서는 에러 반환 (Android-only) — 호출자는 `SecondaryMmap::Auf`
+    /// 일반 variant로 fallback해야 한다.
+    pub fn from_auf_self_secondary(
+        view: Arc<crate::auf::AufView>,
+        layer_index: Vec<LayerTensorSlice>,
+        diag_source_path: PathBuf,
+        backend: Arc<dyn Backend>,
+        #[cfg(target_os = "android")] qnn_runtime_rpcmem_fns: (RpcmemAllocFn, RpcmemFreeFn),
+    ) -> Result<Self> {
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (view, layer_index, diag_source_path, backend);
+            Err(anyhow!(
+                "RpcmemSecondaryStore::from_auf_self_secondary is Android-only \
+                 (rpcmem heap unavailable on host targets); caller must fall back \
+                 to SecondaryMmap::Auf"
+            ))
+        }
+
+        #[cfg(target_os = "android")]
+        {
+            let (rpcmem_alloc, rpcmem_free) = qnn_runtime_rpcmem_fns;
+            let backing: Arc<dyn WeightSectionView> = Arc::new(AufBacking {
+                view,
+                source_path: diag_source_path.clone(),
+            });
+            Ok(Self {
+                backing,
+                source_path: diag_source_path,
                 layer_index,
                 layer_regions: Mutex::new(HashMap::new()),
                 alias_cache: Mutex::new(HashMap::new()),
@@ -395,11 +451,11 @@ impl RpcmemSecondaryStore {
             .and_then(|slice| slice.tensors.get(subname))
     }
 
-    /// Zero-copy byte slice from the underlying mmap. Used by fallback paths
-    /// (qk-unpermute, GGUF source-of-truth) when the alias path is not viable.
+    /// Zero-copy byte slice from the underlying backing. Used by fallback paths
+    /// (qk-unpermute, GGUF/AUF source-of-truth) when the alias path is not viable.
     pub fn tensor_bytes(&self, info: &SecondaryTensorInfo) -> &[u8] {
         let end = info.offset + info.len;
-        &self.backing_mmap.mmap_data()[info.offset..end]
+        &self.backing.weights_bytes()[info.offset..end]
     }
 
     /// Ensure the rpcmem region for `layer_idx` is allocated and populated.
@@ -527,10 +583,10 @@ impl RpcmemSecondaryStore {
         }
         let host_ptr = host_ptr as *mut u8;
 
-        // 2. memcpy each tensor from the mmap into the region. Best-effort:
-        // if any copy fails (would only happen on a corrupt mmap range), free
-        // the region and bubble up.
-        let mmap_bytes = self.backing_mmap.mmap_data();
+        // 2. memcpy each tensor from the backing weights section into the region.
+        // Best-effort: if any copy fails (would only happen on a corrupt range),
+        // free the region and bubble up.
+        let mmap_bytes = self.backing.weights_bytes();
         for (subname, info) in &entries {
             let Some((dst_offset, len, _dt)) = tensor_map.get(*subname).copied() else {
                 continue; // unreachable — we just inserted it

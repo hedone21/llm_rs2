@@ -10,6 +10,7 @@
 //! Spec: ENG-DAT-090/092/094/095, ENG-ALG-210/211/216, INV-123/124/125/127.
 
 pub mod async_swap;
+pub mod backing;
 pub mod decider;
 pub mod dynamic_k;
 pub mod incremental_plan;
@@ -26,6 +27,7 @@ pub mod slot;
 pub mod swap_executor;
 
 pub use async_swap::{AsyncSwapDispatcher, SwapCommitJob, SwapJob};
+pub use backing::{AufBacking, GgufBacking, WeightSectionView};
 pub use decider::{SwapAlgorithm, SwapDecision, WeightSwapDecider, compute_qcf_swap};
 pub use dynamic_k::DynamicKController;
 pub use incremental_plan::IncrementalSwapPlan;
