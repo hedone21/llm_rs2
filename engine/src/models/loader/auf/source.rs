@@ -243,7 +243,7 @@ fn from_auf_meta(view: &AufView, eos_override: Option<u32>) -> Result<ModelConfi
     let m = &view.meta;
     let arch = parse_arch_str(&m.architecture)?;
     let has_qkv_bias = matches!(arch, ModelArch::Qwen2);
-    let tie_word_embeddings = view.tensor_index.find_lm_head_entry().is_none();
+    let tie_word_embeddings = infer_tie_word_embeddings(view);
     let eos_token_id = resolve_eos(view, eos_override);
 
     Ok(ModelConfig {
@@ -268,6 +268,33 @@ fn from_auf_meta(view: &AufView, eos_override: Option<u32>) -> Result<ModelConfi
         query_pre_attn_scalar: None,
         embed_scale: None,
     })
+}
+
+/// AUF의 `tie_word_embeddings` 추론.
+///
+/// **배경**: Sprint G-1-B 이후 AUF builder는 tied 모델에서도 `token_embd.weight`를
+/// source로 사용해 `LmHead` Q4_0 entry를 별도 precompute한다. 따라서 단순히
+/// "LmHead entry 존재 여부"로 tied/separate를 판정할 수 없다 (예전 추론 버그).
+///
+/// **정확한 추론**: GGUF는 `find_tensor("output.weight").is_none()`을 신호로 사용.
+/// AUF에서는 `token_embd.weight`의 shape와 `LmHead` entry의 shape를 비교하여
+/// 같으면 tied로 추론한다. tied 모델의 lm_head는 token_embd와 동일한
+/// `[vocab_size, hidden_dim]` shape를 갖는다.
+///
+/// **fallback**: token_embd 또는 LmHead entry가 없으면 tied=false 보수 추론.
+fn infer_tie_word_embeddings(view: &AufView) -> bool {
+    let lm_head = match view.tensor_index.find_lm_head_entry() {
+        Some(e) => e,
+        None => return true, // LmHead entry 없으면 항상 tied
+    };
+    // token_embd.weight entry (kind=Embedding, layer_idx=LAYER_IDX_CROSS).
+    let embed = view.tensor_index.entries.iter().find(|e| {
+        e.kind == crate::auf::TensorKind::Embedding.as_u32() && e.layer_idx == LAYER_IDX_CROSS
+    });
+    let Some(embed) = embed else {
+        return false; // token_embd 없으면 lm_head를 별도 source로 가정 (separate)
+    };
+    embed.shape == lm_head.shape
 }
 
 fn parse_arch_str(s: &str) -> Result<ModelArch> {
@@ -328,6 +355,13 @@ impl TensorSource for AufSource {
     }
 
     fn has_tensor(&self, id: &TensorId) -> bool {
+        // tied 모델: AUF가 LmHead Q4_0 entry를 별도 precompute(Sprint G-1-B)했어도
+        // forward는 GGUF tied path (lm_head = embed_tokens.clone())와 동일하게 동작해야
+        // 한다. has_tensor(LmHead) = false를 반환하여 load_model이 tied 분기로 가게 한다.
+        // AUF의 LmHead precompute는 향후 별도 wire-up sprint에서 활성화 예정.
+        if matches!(id, TensorId::LmHead) && self.config.tie_word_embeddings {
+            return false;
+        }
         let Some((layer_idx, kind)) = tensor_id_to_auf(id) else {
             return false;
         };
