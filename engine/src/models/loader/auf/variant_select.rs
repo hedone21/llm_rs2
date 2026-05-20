@@ -8,7 +8,15 @@ use crate::auf::{BackendTag, TensorDType};
 /// AUF primary backend variant 선택.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AufVariantChoice {
-    /// build feature 기반 자동 선택 (opencl→AdrenoSoa, cuda*→CudaAos, CPU→CpuAos).
+    /// build feature 기반 자동 선택 (cuda*→CudaAos, 그 외 (CPU/opencl)→CpuAos).
+    ///
+    /// **2026-05-20 정책 변경**: Adreno도 AOS primary가 기본이다. SOA는 명시
+    /// `--primary-variant adreno-soa` 시에만 사용. 이유:
+    /// - SOA primary path는 `backend.copy_weight_from`이 layout 정보를 잃어
+    ///   forward GEMV가 SOA bytes를 AOS로 잘못 해석 (W-AUF-1 device garbage 원인).
+    /// - AOS primary + AOS GEMV가 GGUF primary와 byte-equivalent 경로.
+    /// - SOA는 weight swap secondary 전용 path에서 별도 등록(`alloc_pre_converted_soa_tensor`)
+    ///   을 거치므로 layout 정보 보존.
     #[default]
     Auto,
     AdrenoSoa,
@@ -18,11 +26,10 @@ pub enum AufVariantChoice {
 
 impl AufVariantChoice {
     /// build feature 기반 default backend tag.
+    ///
+    /// 2026-05-20부터 opencl feature도 `CpuAos`를 default로 반환. SOA primary는
+    /// 명시 선택 시에만.
     pub fn default_tag() -> BackendTag {
-        #[cfg(feature = "opencl")]
-        {
-            return BackendTag::AdrenoSoa;
-        }
         #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
         {
             return BackendTag::CudaAos;

@@ -60,9 +60,21 @@ impl AufSource {
         dtype_choice: AufDtypeChoice,
         eos_override: Option<u32>,
     ) -> Result<Self> {
-        let variant_tag = variant_choice.to_backend_tag();
-        let view = auf_open(path, variant_tag)
-            .map_err(|e| anyhow!("AUF open failed for '{}': {}", path.display(), e))?;
+        // Auto일 때만 fallback 후보 chain 시도. 명시 선택은 단발 (실패 시 명시 에러).
+        let (view, variant_tag) = if matches!(variant_choice, AufVariantChoice::Auto) {
+            open_with_auto_fallback(path)?
+        } else {
+            let tag = variant_choice.to_backend_tag();
+            let v = auf_open(path, tag).map_err(|e| {
+                anyhow!(
+                    "AUF open failed for '{}' with explicit variant {:?}: {}",
+                    path.display(),
+                    tag,
+                    e
+                )
+            })?;
+            (v, tag)
+        };
         let view = Arc::new(view);
 
         let primary_dtype = dtype_choice.to_tensor_dtype();
@@ -124,6 +136,46 @@ impl AufSource {
     pub fn source_path(&self) -> &Path {
         &self.source_path
     }
+}
+
+/// AUF primary `Auto` variant 자동 fallback chain.
+///
+/// 2026-05-20 정책 — `default_tag()`가 CpuAos이지만 AUF에 CpuAos variant가 없을 수도
+/// 있으므로 (예: `qwen2.5-1.5b-q4_0.auf` ADRENO_SOA only) 후보 chain을 순회한다.
+/// 순서: `default_tag()` → 그 외 변종 (AdrenoSoa, CudaAos) → 첫 성공 반환. 모두 실패 시
+/// 마지막 에러 그대로 반환.
+fn open_with_auto_fallback(path: &Path) -> Result<(crate::auf::AufView, BackendTag)> {
+    let primary = AufVariantChoice::default_tag();
+    let mut chain: Vec<BackendTag> = vec![primary];
+    for tag in [BackendTag::CpuAos, BackendTag::AdrenoSoa, BackendTag::CudaAos] {
+        if !chain.contains(&tag) {
+            chain.push(tag);
+        }
+    }
+
+    let mut last_err: Option<crate::auf::AufError> = None;
+    for tag in &chain {
+        match auf_open(path, *tag) {
+            Ok(view) => {
+                if *tag != primary {
+                    eprintln!(
+                        "[AUF] Auto: primary variant {:?} 부재 → {:?}로 fallback (path={})",
+                        primary,
+                        tag,
+                        path.display()
+                    );
+                }
+                return Ok((view, *tag));
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(anyhow!(
+        "AUF open failed for '{}' (Auto): tried {:?}, last error: {}",
+        path.display(),
+        chain,
+        last_err.map(|e| e.to_string()).unwrap_or_else(|| "(none)".to_owned())
+    ))
 }
 
 /// `TensorId` → AUF `(layer_idx, kind)` 매핑.
