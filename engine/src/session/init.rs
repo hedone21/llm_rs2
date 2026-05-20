@@ -4,7 +4,7 @@ use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::core::rss_trace::{dump_smaps, io_trace, rss_trace};
-use crate::core::sampling::SamplingConfig;
+use crate::inference::sampling::SamplingConfig;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;

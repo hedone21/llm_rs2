@@ -55,10 +55,8 @@ LAYER_RULES = [
     ("core/offload",            "L3-pressure"),
 
     # L3-inference: 추론 연산 도메인
-    ("core/sampling",           "L3-inference"),
-    ("core/attention_scores",   "L3-inference"),
-    ("core/speculative",        "L3-inference"),
-    ("core/skip_config",        "L3-inference"),
+    # Step 4-C: sampling/skip_config/speculative/attention_scores promoted to engine/src/inference/
+    ("inference",               "L3-inference"),
     ("core/chat_template",      "L3-inference"),
     ("core/chat_ipc",           "L3-inference"),
     # Step 4-B: qcf promoted from core/qcf to engine/src/qcf (top-level L3-inference)
@@ -414,8 +412,8 @@ KNOWN_V_MAP = [
     (r"core/kivi_cache\.rs",             r"qcf::",                      "V-13"),
     # V-13(b): core/pressure/mod.rs → qcf:: (L3-pressure→L3-inference)
     (r"core/pressure/mod\.rs",           r"qcf::",                      "V-13"),
-    # V-14: qcf/, core/kivi_cache, core/sampling → profile:: (L3→observability concrete)
-    (r"(qcf/(unified_qcf|layer_importance|qcf_kv)|core/(kivi_cache|sampling))", r"profile::", "V-14"),
+    # V-14: qcf/, core/kivi_cache, inference/sampling → profile:: (L3→observability concrete)
+    (r"(qcf/(unified_qcf|layer_importance|qcf_kv)|core/kivi_cache|inference/sampling)", r"profile::", "V-14"),
     # V-15: core/cache_manager.rs, core/eviction/* (테스트 블록) → backend::cpu (grandfathered)
     (r"core/(cache_manager|eviction/)",  r"backend::cpu::CpuBackend",   "V-15"),
     # V-16: eval/eval_loop.rs → backend:: (cross-cutting→L1)
@@ -458,10 +456,12 @@ KNOWN_V_MAP = [
     (r"models/weights/layer_object_pool\.rs", r"layers::transformer_layer", "V-27"),
     # V-27(c): models/weights/layer_object_pool.rs → backend::cuda_embedded (downcast)
     (r"models/weights/layer_object_pool\.rs", r"backend::cuda_embedded","V-27"),
-    # V-28: eval/ → models::, core::, qcf:: (cross-cutting→L3 다수)
-    (r"eval/(qcf_helpers|eval_loop|eviction_hook|kivi_hook)", r"models::",        "V-28"),
-    (r"eval/(eval_loop|eviction_hook|kivi_hook)",  r"(core::(cache_manager|kv_cache|kivi_cache)|qcf::)", "V-28"),
+    # V-28: eval/ → models::, core::, qcf::, inference:: (cross-cutting→L3 다수)
+    (r"eval/(qcf_helpers|eval_loop|eviction_hook|kivi_hook|hook)", r"models::",        "V-28"),
+    (r"eval/(eval_loop|eviction_hook|kivi_hook|hook)",  r"(core::(cache_manager|kv_cache|kivi_cache)|qcf::)", "V-28"),
     (r"eval/(qcf_helpers|kivi_hook)",    r"qcf::",                       "V-28"),
+    # Step 4-C: eval/ → inference:: (sampling/skip_config/attention_scores 이동 후)
+    (r"eval/(eval_loop|eviction_hook|kivi_hook|hook)", r"inference::",  "V-28"),
     # V-29: eval/eviction_hook.rs → backend::opencl::OpenCLBackend (cross-cutting→L1 downcast)
     (r"eval/eviction_hook\.rs",          r"backend::opencl::OpenCLBackend", "V-29"),
     # V-30: bin/generate.rs → 모든 레이어 직접 import (L5 monolith)

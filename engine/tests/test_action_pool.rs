@@ -9,8 +9,8 @@ use llm_rs2::core::math_utils::{avg_pool_1d, topk_indices_per_head};
 use llm_rs2::core::offload::store::OffloadStore;
 use llm_rs2::core::pressure::quantize_handler::QuantizeHandler;
 use llm_rs2::core::pressure::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
-use llm_rs2::core::skip_config::SkipConfig;
-use llm_rs2::core::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
+use llm_rs2::inference::skip_config::SkipConfig;
+use llm_rs2::inference::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
 use llm_rs2::quant::{BlockKVQ4, BlockKVQ8, QKKV};
 
 use llm_rs2::backend::cpu::CpuBackend;
@@ -305,7 +305,7 @@ fn test_all_actions_data_flow() {
     // C1: SkipConfig + Speculative
     let skip = SkipConfig::uniform_init(16, 0.3);
     assert!(skip.validate(16));
-    let _spec = llm_rs2::core::speculative::SpeculativeConfig::new(skip, 25, 0.8);
+    let _spec = llm_rs2::inference::speculative::SpeculativeConfig::new(skip, 25, 0.8);
 
     // C8: QuantizeHandler pressure mapping
     assert_eq!(

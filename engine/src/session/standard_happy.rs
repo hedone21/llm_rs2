@@ -11,7 +11,7 @@ use tokenizers::Tokenizer;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::core::kv_cache::KVCache;
-use crate::core::sampling::{self, SamplingConfig};
+use crate::inference::sampling::{self, SamplingConfig};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::session::assembly::build_standard_loop;

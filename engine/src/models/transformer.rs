@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::buffer::{Buffer, DType};
-use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::kv_cache::{KVCache, KVCacheOps};
 use crate::core::offload::preload_pool::{self, PreloadPool};
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
@@ -157,7 +157,7 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// Optional per-op profiler.
     pub profiler: Option<&'a mut crate::profile::ops::OpProfiler>,
     /// Optional SWIFT skip configuration for layer skipping.
-    pub skip_config: Option<&'a crate::core::skip_config::SkipConfig>,
+    pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Optional importance collector for Layer Skip QCF.
     /// When provided during prefill, captures per-layer cosine similarity.
     pub importance_collector: Option<&'a mut crate::qcf::ImportanceCollector>,

@@ -11,8 +11,8 @@ use anyhow::Result;
 
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::core::sampling;
-use crate::core::skip_config::SkipConfig;
+use crate::inference::sampling;
+use crate::inference::skip_config::SkipConfig;
 use crate::layers::workspace::{
     LayerWorkspace, PartitionWorkspace, PartitionWsCell, WorkspaceConfig,
 };

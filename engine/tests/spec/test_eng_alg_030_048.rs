@@ -3,7 +3,7 @@
 //! SkipConfig uniform_init, validate, layer_importance QCF,
 //! eviction_qcf proxy, quant_qcf NMSE/OPR, skip_qcf acceptance tracker.
 
-use llm_rs2::core::skip_config::SkipConfig;
+use llm_rs2::inference::skip_config::SkipConfig;
 use llm_rs2::qcf::layer_importance::{ImportanceEntry, SubLayer};
 use llm_rs2::qcf::quant_qcf::compute_nmse_block;
 use llm_rs2::qcf::{ImportanceTable, SkipQcfTracker};
@@ -61,7 +61,7 @@ fn test_eng_alg_030_c03_validate_last_layer_skip() {
 
 #[test]
 fn test_eng_alg_030_perturb_respects_boundaries() {
-    use llm_rs2::core::speculative::SkipOptimizer;
+    use llm_rs2::inference::speculative::SkipOptimizer;
 
     let base = SkipConfig::uniform_init(16, 0.3);
     let perturbed = SkipOptimizer::perturb(&base, 16, 42);

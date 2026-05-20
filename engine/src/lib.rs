@@ -7,6 +7,7 @@ pub mod auf_dtype_convert;
 pub mod backend;
 pub mod buffer;
 pub mod core;
+pub mod inference;
 pub mod layers;
 pub mod memory;
 pub mod models;

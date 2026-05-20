@@ -9,8 +9,8 @@
 //! each prefill and decode step.
 
 use super::hook::{CacheSnapshot, PostStepResult, StepHook};
-use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::kivi_cache::KiviCache;
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 
 /// KiviCache snapshot for choice-level restore.
 ///
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_score_accumulator_returns_some_when_provided() {
-        use crate::core::attention_scores::AttentionScoreAccumulator;
+        use crate::inference::attention_scores::AttentionScoreAccumulator;
         // new(max_seq_len, n_heads, total_layers, last_n_layers, decay)
         let acc = AttentionScoreAccumulator::new(512, 32, 16, 0, 1.0);
         let mut hook = KiviHook::new(QcfConfig::default(), false, vec![0], Some(acc));

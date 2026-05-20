@@ -17,7 +17,6 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::events::StderrDiagnosticSink;
 use crate::core::eviction::h2o::H2OPolicy;
@@ -27,6 +26,7 @@ use crate::core::kv_cache::KVCache;
 use crate::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use crate::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::session::DecodeLoopBuilder;

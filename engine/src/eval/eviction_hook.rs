@@ -5,9 +5,9 @@
 //! and collects QCF/CAOTE metrics at each eviction event.
 
 use super::hook::{CacheSnapshot, PostStepResult, StepHook};
-use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::qcf::{
     AggregationMode, QcfActionType, QcfConfig, QcfKvParams, VDataSource, aggregate_heads,
     compute_c1, compute_d7, compute_qcf_kv, identify_retained_for_action,

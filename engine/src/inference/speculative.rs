@@ -6,7 +6,7 @@
 //!
 //! Reference: SWIFT (arXiv 2024)
 
-use crate::core::skip_config::SkipConfig;
+use crate::inference::skip_config::SkipConfig;
 
 /// Result of a draft generation phase.
 #[derive(Debug, Clone)]

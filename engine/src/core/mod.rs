@@ -1,4 +1,3 @@
-pub mod attention_scores;
 pub mod cache_manager;
 pub mod chat_template;
 pub mod events;
@@ -10,7 +9,4 @@ pub mod kv_migrate;
 pub mod offload;
 pub mod pressure;
 pub mod rss_trace;
-pub mod sampling;
-pub mod skip_config;
-pub mod speculative;
 pub mod sys_monitor;

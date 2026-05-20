@@ -2,7 +2,6 @@ use clap::Parser;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
-use llm_rs2::core::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::core::cache_manager::CacheManager;
 use llm_rs2::core::events::{self, CacheEvent, StderrDiagnosticSink};
 use llm_rs2::core::eviction::h2o::H2OPolicy;
@@ -14,8 +13,9 @@ use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use llm_rs2::core::rss_trace::{io_trace, read_bytes_now, rss_trace};
-use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
+use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;
+use llm_rs2::inference::sampling::{self, SamplingConfig};
 use llm_rs2::layers::workspace::{
     LayerWorkspace, PartitionWorkspace, PartitionWsCell, WorkspaceConfig,
 };
@@ -297,7 +297,7 @@ fn main() -> anyhow::Result<()> {
         // so LlamaLayer will push attention probabilities into it during forward_into().
         // entropy_computed flag is set in post_prefill when acc.is_active() + scores non-empty.
         let kivi_score_acc = if args.enable_qcf_experimental {
-            let mut acc = llm_rs2::core::attention_scores::AttentionScoreAccumulator::new_gqa(
+            let mut acc = llm_rs2::inference::attention_scores::AttentionScoreAccumulator::new_gqa(
                 max_seq_len,
                 model.config.num_attention_heads,
                 model.config.num_key_value_heads,
@@ -1030,7 +1030,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Build SkipConfig from CLI options
-    use llm_rs2::core::skip_config::SkipConfig;
+    use llm_rs2::inference::skip_config::SkipConfig;
     let skip_config = if let Some(ref layers) = args.skip_layers {
         let mut sc = SkipConfig::new();
         for &l in layers {
@@ -4981,7 +4981,7 @@ fn run_kivi(
     let mut last_token_time = std::time::Instant::now();
 
     // Dynamic skip_config for KIVI resilience path
-    use llm_rs2::core::skip_config::SkipConfig;
+    use llm_rs2::inference::skip_config::SkipConfig;
     let mut kivi_skip_config: Option<SkipConfig> = None;
     let mut kivi_last_skip_ratio: Option<f32> = None;
     // Track last applied quant bits to avoid redundant transition_bits calls (sticky guard)

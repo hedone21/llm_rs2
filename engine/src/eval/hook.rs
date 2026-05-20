@@ -4,8 +4,8 @@
 //! policy. Each implementation encapsulates its own eviction/flush logic and
 //! QCF metric collection.
 
-use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::kv_cache::KVCacheOps;
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 
 /// Result of a post-decode-step hook invocation.
 #[derive(Debug, Default)]

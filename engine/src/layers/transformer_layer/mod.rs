@@ -570,7 +570,7 @@ mod tests {
     /// Simulate the full pipeline: compute scores → accumulate → verify.
     #[test]
     fn test_accumulator_receives_post_softmax_scores() {
-        use crate::core::attention_scores::AttentionScoreAccumulator;
+        use crate::inference::attention_scores::AttentionScoreAccumulator;
 
         let n_heads_q = 4;
         let cache_seq_len = 8;

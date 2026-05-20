@@ -3,7 +3,7 @@
 //!
 //! [`observe_token`]을 통해 최근 토큰을 [`VecDeque`] ring buffer로 보유하고,
 //! [`sample`] 호출 시 logits을 scratch 버퍼에 복사한 뒤
-//! [`crate::core::sampling::sample`]에 위임한다. logits in-place 수정으로부터
+//! [`crate::inference::sampling::sample`]에 위임한다. logits in-place 수정으로부터
 //! 외부 호출자(`DecodeLoop`)가 받은 슬라이스를 보호하기 위해 clone 필수.
 //!
 //! **호출 규약**: caller는 prefill 직후 prompt history seed (또는 첫 토큰
@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 
-use crate::core::sampling::{SamplingConfig, sample};
+use crate::inference::sampling::{SamplingConfig, sample};
 use crate::session::traits::{StepCtx, TokenSampler};
 
 /// Production `sampling::sample` 호출과 동치 결과를 내는 stateful sampler.

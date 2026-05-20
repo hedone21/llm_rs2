@@ -10,10 +10,10 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
-use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::KVCache;
-use crate::core::skip_config::SkipConfig;
+use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::skip_config::SkipConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::resilience::CommandExecutor;
@@ -53,5 +53,5 @@ pub struct BatchRunCtx {
     pub score_based_eviction: bool,
     pub throttle_delay_ms: u64,
     pub last_skip_ratio: Option<f32>,
-    pub sampling_config: crate::core::sampling::SamplingConfig,
+    pub sampling_config: crate::inference::sampling::SamplingConfig,
 }

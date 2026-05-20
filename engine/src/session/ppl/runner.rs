@@ -9,11 +9,11 @@ use tokenizers::Tokenizer;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kivi_cache::KiviCache;
 use crate::core::kv_cache::KVCache;
-use crate::core::sampling::{self};
+use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::sampling::{self};
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
@@ -598,7 +598,7 @@ pub fn run_ppl(
     auto_eviction: bool,
     score_based_eviction: bool,
     protected_prefix: usize,
-    skip_config: Option<&crate::core::skip_config::SkipConfig>,
+    skip_config: Option<&crate::inference::skip_config::SkipConfig>,
     // LISWAP-PPL Scenario E: when true, return early as soon as the swap plan
     // completes. NLL/CSV/JSON outputs are suppressed. Used by `--ppl-warmup-swap`
     // to drive the swap to completion before the actual measurement pass.

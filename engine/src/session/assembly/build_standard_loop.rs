@@ -25,7 +25,7 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::core::sampling::SamplingConfig;
+use crate::inference::sampling::SamplingConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::session::cli::Args;
