@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::core::buffer::DType;
 use crate::models::config::ModelConfig;
@@ -309,7 +310,11 @@ pub(crate) fn tensor_kind_to_subname(kind: u32) -> Option<&'static str> {
 /// `SwapExecutor` (Phase 3.7a bypass).
 pub struct AufSecondaryMmap {
     /// AUF mmap view (keeps mmap alive).
-    pub view: AufView,
+    ///
+    /// `Arc<AufView>` since W-AUF-2 — primary `AufSource`와 같은 view를
+    /// secondary로도 재포장(`from_auf_self_secondary`)할 수 있어야 한다.
+    /// `weights_bytes()` 등 모든 메서드는 `Arc::Deref`로 그대로 호출된다.
+    pub view: Arc<AufView>,
     /// Indexed by `layer_idx`. Length = num decoder layers.
     pub layer_index: Vec<LayerTensorSlice>,
     /// Source path, preserved for diagnostic messages.
@@ -980,7 +985,7 @@ impl SecondaryMmap {
     pub fn as_auf_view(&self) -> Option<&AufView> {
         match self {
             SecondaryMmap::Gguf(_) => None,
-            SecondaryMmap::Auf(a) => Some(&a.view),
+            SecondaryMmap::Auf(a) => Some(a.view.as_ref()),
             SecondaryMmap::Rpcmem(_) => None,
         }
     }

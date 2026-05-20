@@ -383,7 +383,7 @@ pub fn build_auf_secondary_from_view(
     let is_pre_converted_soa = weights_tag == TAG_WEIGHTS_ADRENO_SOA;
 
     Ok(SecondaryMmap::Auf(AufSecondaryMmap {
-        view,
+        view: std::sync::Arc::new(view),
         layer_index,
         source_path: path.to_path_buf(),
         is_pre_converted_soa,
