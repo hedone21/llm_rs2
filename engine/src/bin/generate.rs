@@ -1056,6 +1056,23 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_self_secondary: bool,
 
+    /// AUF TOKENIZER section의 `eos_id`가 N/A인 경우의 runtime fallback (W-AUF-1 C5).
+    ///
+    /// AUF 빌드 시 `auf_tool build --eos-token-id`로 채우지 못한 파일을 사용할
+    /// 때 이 flag로 EOS 정지 조건을 명시한다. AUF TOKENIZER section의 값이
+    /// 0 이상이면 무시되며, N/A(-1)일 때만 적용된다. GGUF/Safetensors primary
+    /// 에서는 무시.
+    #[arg(long, value_name = "ID")]
+    eos_token_id: Option<u32>,
+
+    /// AUF TOKENIZER section의 `bos_id` runtime fallback (W-AUF-1 C5).
+    ///
+    /// 현재 ModelConfig에 `bos_token_id` 필드가 없어 inference 경로에서는
+    /// 사용되지 않는다 (chat mode 도입 후 활성). 본 sprint에서는 forward-compat
+    /// 용도로만 추가.
+    #[arg(long, value_name = "ID")]
+    bos_token_id: Option<u32>,
+
     /// Explicit path to tokenizer.json. When omitted, the tokenizer is
     /// resolved automatically via the GGUF basename (e.g.
     /// `<dir>/<stem>.tokenizer.json`, then `<dir>/<stem-without-quant>.tokenizer.json`,
@@ -2022,6 +2039,7 @@ fn main() -> anyhow::Result<()> {
             primary_format,
             primary_variant_choice: args.primary_variant.into(),
             primary_dtype_choice: args.primary_dtype.into(),
+            primary_eos_override: args.eos_token_id,
             disable_self_secondary: args.no_self_secondary,
             default_dtype: w_dtype,
             secondary_source: args.secondary_gguf.clone(),
