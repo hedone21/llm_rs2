@@ -209,11 +209,7 @@ impl ImportanceCollector {
     /// Whether per-layer raw `[T × d]` snapshots should be cached.
     /// True for 3-way compare mode or `DirectAttn` primary; false otherwise.
     fn cache_raw_per_layer(&self) -> bool {
-        self.three_way
-            || matches!(
-                self.primary_formula,
-                super::ImportanceFormula::DirectAttn
-            )
+        self.three_way || matches!(self.primary_formula, super::ImportanceFormula::DirectAttn)
     }
 
     /// Snapshot the hidden state before a layer processes it.

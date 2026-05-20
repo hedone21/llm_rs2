@@ -17,17 +17,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::core::buffer::DType;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{GgufFile, ggml_type_to_dtype, tensor_byte_size};
 
 // ── AUF crate imports ──────────────────────────────────────────────────────
-use crate::auf::{
-    AufView, BackendTag,
-    section::TAG_WEIGHTS_ADRENO_SOA,
-    tensor_index::{LAYER_IDX_CROSS, TensorDType, TensorKind},
-};
+// AUF helper logic lives in `crate::models::loader::auf::secondary` (W-AUF-1
+// C2). Only the types still referenced by `SecondaryMmap::Auf` / the
+// tensor-kind subname helper are imported here.
+use crate::auf::{AufView, tensor_index::TensorKind};
 
 /// CLI `--secondary-dtype` 값.
 ///
@@ -285,7 +285,7 @@ impl GgufSecondaryMmap {
 ///
 /// Returns `None` for cross-layer tensors (embedding, final_norm, lm_head)
 /// that are not swapped.
-fn tensor_kind_to_subname(kind: u32) -> Option<&'static str> {
+pub(crate) fn tensor_kind_to_subname(kind: u32) -> Option<&'static str> {
     match TensorKind::from_u32(kind)? {
         TensorKind::AttnQ => Some("attn_q.weight"),
         TensorKind::AttnK => Some("attn_k.weight"),
@@ -297,19 +297,8 @@ fn tensor_kind_to_subname(kind: u32) -> Option<&'static str> {
         TensorKind::AttnNorm => Some("attn_norm.weight"),
         TensorKind::FfnNorm => Some("ffn_norm.weight"),
         TensorKind::Embedding | TensorKind::FinalNorm | TensorKind::LmHead => None,
-    }
-}
-
-/// Map `TensorDType` to engine `DType`. Returns `None` for unrecognised codes.
-fn auf_dtype_to_engine(dtype: u32) -> Option<DType> {
-    match TensorDType::from_u32(dtype)? {
-        TensorDType::F32 => Some(DType::F32),
-        TensorDType::F16 => Some(DType::F16),
-        TensorDType::BF16 => Some(DType::BF16),
-        TensorDType::Q4_0 => Some(DType::Q4_0),
-        TensorDType::Q4_1 => Some(DType::Q4_1),
-        TensorDType::Q8_0 => Some(DType::Q8_0),
-        TensorDType::U8 => Some(DType::U8),
+        // qkv bias는 swap 대상 아님 (1-D F32 vector, swap quality 의미 없음).
+        TensorKind::AttnQBias | TensorKind::AttnKBias | TensorKind::AttnVBias => None,
     }
 }
 
@@ -323,7 +312,11 @@ fn auf_dtype_to_engine(dtype: u32) -> Option<DType> {
 /// `SwapExecutor` (Phase 3.7a bypass).
 pub struct AufSecondaryMmap {
     /// AUF mmap view (keeps mmap alive).
-    pub view: AufView,
+    ///
+    /// `Arc<AufView>` since W-AUF-2 — primary `AufSource`와 같은 view를
+    /// secondary로도 재포장(`from_auf_self_secondary`)할 수 있어야 한다.
+    /// `weights_bytes()` 등 모든 메서드는 `Arc::Deref`로 그대로 호출된다.
+    pub view: Arc<AufView>,
     /// Indexed by `layer_idx`. Length = num decoder layers.
     pub layer_index: Vec<LayerTensorSlice>,
     /// Source path, preserved for diagnostic messages.
@@ -706,11 +699,64 @@ pub fn open_secondary_with_backend(
 /// — the only backend that exposes the rpcmem heap required for the alias
 /// path. Detected via `Backend::name()` to avoid feature-gate gymnastics on
 /// the trait object.
-fn backend_supports_rpcmem_secondary(
+///
+/// `pub(crate)` since W-AUF-2 — `resolve_secondary` consults the same predicate
+/// when deciding whether to promote an AUF self-secondary to the RpcMem variant.
+pub(crate) fn backend_supports_rpcmem_secondary(
     backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
 ) -> bool {
     let name = backend.name();
     name.contains("QNN OpPackage") || name.contains("qnn_oppkg")
+}
+
+/// W-AUF-2.3 — Promote a `SecondaryMmap::Auf` self-secondary to the
+/// `SecondaryMmap::Rpcmem` variant when the backend is `qnn_oppkg`.
+///
+/// `Some(rpc)` 반환 시 호출자는 그 핸들을 사용한다. `None`이면 promote를
+/// 시도하지 않은 것 (호스트 빌드 / 다른 backend). promote 시도가 실패한 경우
+/// stderr 경고 + 원본 `SecondaryMmap::Auf` 유지를 위해 `None`을 돌려보낸다.
+///
+/// `view`와 `layer_index`는 promote 성공 시 `RpcmemSecondaryStore`가 소유한다.
+pub(crate) fn try_promote_auf_self_secondary_to_rpcmem(
+    view: std::sync::Arc<AufView>,
+    layer_index: Vec<LayerTensorSlice>,
+    diag_source_path: PathBuf,
+    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+) -> Option<SecondaryMmap> {
+    if !backend_supports_rpcmem_secondary(backend) {
+        return None;
+    }
+
+    #[cfg(all(feature = "qnn", target_os = "android"))]
+    {
+        let qnn = backend
+            .as_any()
+            .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>()?;
+        let runtime = qnn.runtime_arc();
+        let rpcmem_fns = runtime.rpcmem_fns();
+        match crate::models::weights::rpcmem_secondary::RpcmemSecondaryStore::from_auf_self_secondary(
+            view,
+            layer_index,
+            diag_source_path,
+            std::sync::Arc::clone(backend),
+            (rpcmem_fns.0, rpcmem_fns.1),
+        ) {
+            Ok(store) => Some(SecondaryMmap::Rpcmem(store)),
+            Err(e) => {
+                eprintln!(
+                    "[AUF self-secondary] rpcmem promote 실패, standard AUF path 유지: {e}"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(all(feature = "qnn", target_os = "android")))]
+    {
+        let _ = (view, layer_index, diag_source_path);
+        // 호스트/non-Android에서는 rpcmem feature 자체가 없어 promote 불가.
+        // backend.name()이 qnn_oppkg를 거짓으로 자처해도 None을 돌려보내 fallback 유지.
+        None
+    }
 }
 
 /// Try to construct a `SecondaryMmap::Rpcmem` for `qnn_oppkg`. Errors
@@ -758,31 +804,6 @@ fn try_open_rpcmem_secondary(
             ),
         })
     }
-}
-
-/// Returns `true` if `path` should be opened as AUF.
-///
-/// Detection order:
-/// 1. Extension `.auf` (case-sensitive).
-/// 2. Magic bytes `b"ARGUS_W\0"` in the first 8 bytes of the file.
-fn is_auf_path(path: &Path) -> bool {
-    if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e == "auf")
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    // Probe magic bytes (read-only, no mmap required).
-    if let Ok(mut f) = std::fs::File::open(path) {
-        use std::io::Read;
-        let mut magic = [0u8; 8];
-        if f.read_exact(&mut magic).is_ok() && &magic == crate::auf::header::AUF_MAGIC {
-            return true;
-        }
-    }
-    false
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -867,405 +888,16 @@ fn open_secondary_gguf(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// AUF open path
+// AUF open path — moved to `crate::models::loader::auf::secondary` (W-AUF-1 C2).
+// Re-exports below preserve the original call-site signature so external
+// callers (`weights::mod`, `borrowed_mmap_buffer`, etc.) continue to compile
+// without import changes.
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Select the `BackendTag` for the AUF open call based on the runtime
-/// environment (feature flags).
-///
-/// Priority:
-/// 1. `opencl` feature active → `BackendTag::AdrenoSoa` (Adreno target).
-/// 2. `cuda` or `cuda-embedded` feature active → `BackendTag::CudaAos`.
-/// 3. Fallback → `BackendTag::CpuAos`.
-fn detect_backend_tag() -> BackendTag {
-    #[cfg(feature = "opencl")]
-    return BackendTag::AdrenoSoa;
-    #[cfg(all(
-        not(feature = "opencl"),
-        any(feature = "cuda", feature = "cuda-embedded")
-    ))]
-    return BackendTag::CudaAos;
-    #[cfg(not(any(feature = "opencl", feature = "cuda", feature = "cuda-embedded")))]
-    return BackendTag::CpuAos;
-}
-
-/// Resolve the candidate `BackendTag` list to try in order, given the
-/// `SecondaryLayoutChoice`. For `Auto`, falls back to `CpuAos` if the
-/// preferred variant is missing from the AUF file.
-fn resolve_backend_tag_candidates(layout: SecondaryLayoutChoice) -> Vec<BackendTag> {
-    match layout {
-        SecondaryLayoutChoice::Auto => {
-            let preferred = detect_backend_tag();
-            if preferred == BackendTag::CpuAos {
-                vec![BackendTag::CpuAos]
-            } else {
-                // Try preferred first, fall back to CpuAos for AUFs that only
-                // bundle the AOS variant (built with `--variants cpu_aos`).
-                vec![preferred, BackendTag::CpuAos]
-            }
-        }
-        SecondaryLayoutChoice::Aos => {
-            // Force AOS. Prefer CudaAos on CUDA builds, CpuAos otherwise.
-            #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
-            return vec![BackendTag::CudaAos, BackendTag::CpuAos];
-            #[cfg(not(any(feature = "cuda", feature = "cuda-embedded")))]
-            vec![BackendTag::CpuAos]
-        }
-        SecondaryLayoutChoice::Soa => {
-            // Force SOA — only meaningful on OpenCL.
-            vec![BackendTag::AdrenoSoa]
-        }
-    }
-}
-
-/// Open an AUF-format secondary weight file directly (skips GGUF detection).
-///
-/// Public so integration tests can exercise the layout-fallback path without
-/// constructing a `GgufFile` placeholder. Production callers should use
-/// `open_secondary_with_options`, which dispatches GGUF vs AUF on extension.
-pub fn open_secondary_auf(
-    path: &Path,
-    primary_config: &ModelConfig,
-    secondary_dtype_choice: SecondaryDtypeChoice,
-    secondary_layout_choice: SecondaryLayoutChoice,
-) -> Result<SecondaryMmap, LoadError> {
-    let candidates = resolve_backend_tag_candidates(secondary_layout_choice);
-    debug_assert!(
-        !candidates.is_empty(),
-        "resolve_backend_tag_candidates must return at least one tag"
-    );
-
-    // Try each candidate in order. On `WeightsSectionMissing`, fall through to
-    // the next candidate. Any other error short-circuits.
-    let mut last_missing: Option<crate::auf::AufError> = None;
-    let backend_tag = {
-        let mut chosen: Option<BackendTag> = None;
-        for tag in &candidates {
-            match crate::auf::reader::open(path, *tag) {
-                Ok(_view) => {
-                    chosen = Some(*tag);
-                    break;
-                }
-                Err(e @ crate::auf::AufError::WeightsSectionMissing { .. }) => {
-                    last_missing = Some(e);
-                    continue;
-                }
-                Err(e) => {
-                    return Err(LoadError::AufInvariantViolation {
-                        detail: format!("open AUF {}: {e}", path.display()),
-                    });
-                }
-            }
-        }
-        match chosen {
-            Some(t) => t,
-            None => {
-                let detail = match last_missing {
-                    Some(e) => format!(
-                        "AUF {} has none of the candidate variants {:?}: {e}",
-                        path.display(),
-                        candidates,
-                    ),
-                    None => format!("AUF {} variant probe yielded no result", path.display()),
-                };
-                return Err(LoadError::AufInvariantViolation { detail });
-            }
-        }
-    };
-
-    if backend_tag != detect_backend_tag()
-        && matches!(secondary_layout_choice, SecondaryLayoutChoice::Auto)
-    {
-        eprintln!(
-            "[Secondary] AUF lacks preferred variant {:?}; using {:?} (swap will use AOS path — \
-             switch_hw / partition compatible, GPU TBT may regress vs SOA)",
-            detect_backend_tag(),
-            backend_tag,
-        );
-    }
-
-    // AUF open: full invariant pipeline (INV-132, INV-133, INV-134).
-    let view = crate::auf::reader::open(path, backend_tag).map_err(|e| {
-        LoadError::AufInvariantViolation {
-            detail: format!("{}  (file: {})", e, path.display()),
-        }
-    })?;
-
-    // Validate AUF metadata against primary model config (ENG-DAT-C10).
-    check_auf_metadata(primary_config, &view.meta, path)?;
-
-    build_auf_secondary_from_view(
-        view,
-        primary_config,
-        path,
-        backend_tag,
-        secondary_dtype_choice,
-    )
-}
-
-/// Core logic for building an `AufSecondaryMmap` from a pre-parsed `AufView`.
-///
-/// Extracted for testability: callers (e.g. unit tests) can supply an
-/// `AufView` constructed directly from bytes via `open_from_bytes`, bypassing
-/// file I/O, while still exercising the full tensor-index → layer-index →
-/// tensor_bytes round-trip.
-///
-/// # Dtype 선택 정책 (ENG-ALG-225, Sprint D)
-///
-/// `secondary_dtype_choice`는 layer-index 구성 시 어느 dtype entry를 사용할지 결정한다:
-///
-/// 1. `SecondaryDtypeChoice::Auto` — primary와 다른 dtype candidate를 자동 선택.
-///    후보가 여럿이면 META.default_dtype을 우선 사용하고, 그래도 모호하면 첫 번째 candidate.
-/// 2. 명시 dtype (`F16`, `Q4_0`, `F32`) — 해당 dtype의 entry만 사용.
-///
-/// # Adreno SOA × F16 reject (Sprint D 함정 3)
-///
-/// `backend_tag = AdrenoSoa`인데 선택된 dtype이 F16이면 `LoadError::AdrenoSoaF16Rejected`를
-/// 반환한다. SOA layout은 Q4_0 전용이므로 F16 secondary는 지원되지 않는다.
-///
-/// # 단방향 swap 정합성 (Sprint D)
-///
-/// primary dtype이 Q4_0인데 secondary dtype이 F16이면 `LoadError::ReverseSwapRejected`를
-/// 반환한다. weight swap은 F16→Q4_0 단방향만 지원한다.
-///
-/// # Offset contract
-/// `TensorIndex::variant_offsets` entries are **section-local** (relative to the
-/// start of the WEIGHTS payload).  `AufView::weights_bytes()` already returns a
-/// slice that starts at the WEIGHTS section offset, so we store `var_offset`
-/// directly into `SecondaryTensorInfo::offset` — we must **not** add
-/// `weights_section_offset` again (that would cause a double-base OOB panic).
-pub fn build_auf_secondary_from_view(
-    view: crate::auf::AufView,
-    primary_config: &ModelConfig,
-    path: &Path,
-    backend_tag: crate::auf::BackendTag,
-    secondary_dtype_choice: SecondaryDtypeChoice,
-) -> Result<SecondaryMmap, LoadError> {
-    // Determine variant index for the selected backend.
-    let weights_tag = backend_tag
-        .weights_section_tag()
-        .expect("detect_backend_tag returns a concrete tag");
-    let variant_idx = view
-        .tensor_index
-        .variant_index_for_tag(weights_tag)
-        .ok_or_else(|| LoadError::AufInvariantViolation {
-            detail: format!(
-                "TENSOR_INDEX does not list variant '{}' (file: {})",
-                weights_tag,
-                path.display()
-            ),
-        })?;
-
-    // WEIGHTS payload start within the mmap.
-    // We only need to confirm weights_range is Some (invariant); the offset itself
-    // is NOT used for indexing — tensor_bytes() uses weights_bytes() which already
-    // slices from that offset.  variant_offsets in TensorIndex are section-local.
-    let (_weights_section_offset, _weights_section_size) = view
-        .weights_range
-        .expect("AufView::weights_range must be Some after open() with concrete backend_tag");
-
-    // ── dtype 선택 정책 (ENG-ALG-225) ─────────────────────────────────────
-    // AUF TENSOR_INDEX에서 사용 가능한 dtype 집합을 수집한다.
-    // (layer_idx != LAYER_IDX_CROSS이고 해당 variant payload가 있는 entry 기준)
-    let available_dtypes: std::collections::BTreeSet<u32> = view
-        .tensor_index
-        .entries
-        .iter()
-        .filter(|e| {
-            if e.layer_idx == LAYER_IDX_CROSS {
-                return false;
-            }
-            let var_offset = e
-                .variant_offsets
-                .get(variant_idx)
-                .copied()
-                .unwrap_or(u64::MAX);
-            let var_size = e.variant_sizes.get(variant_idx).copied().unwrap_or(0);
-            var_offset != u64::MAX && var_size != 0
-        })
-        .map(|e| e.dtype)
-        .collect();
-
-    // 선택된 secondary dtype (TensorDType로 표현).
-    let selected_dtype: Option<TensorDType> = match secondary_dtype_choice {
-        SecondaryDtypeChoice::Auto => {
-            // primary dtype 결정 (ModelConfig에서는 직접 dtype을 노출하지 않으므로
-            // available_dtypes에서 primary가 아닌 candidate 자동 선택).
-            // primary는 일반적으로 F16이고 secondary는 Q4_0이지만,
-            // 명시적인 primary dtype이 없으므로 AUF 파일 내 후보 중
-            // META.default_dtype을 우선 사용한다.
-            let default_from_meta: Option<TensorDType> = view
-                .meta
-                .default_dtype
-                .as_deref()
-                .and_then(dtype_str_to_tensor_dtype_local);
-
-            // weight-dtype 우선순위: Q4_0 → F16 → BF16 → Q4_1 → Q8_0 → F32.
-            // F32는 일반적으로 norm 전용 dtype이므로 Auto 선택에서는 마지막으로
-            // 떨어뜨려야 한다. BTreeSet의 자연 정렬(F32=0이 최소)을 그대로 쓰면
-            // Q4_0 weight + F32 norm이 섞인 일반 single-dtype AUF에서 F32를
-            // 선택해 weight 텐서가 모두 필터링된다.
-            let weight_preference = [
-                TensorDType::Q4_0,
-                TensorDType::F16,
-                TensorDType::BF16,
-                TensorDType::Q4_1,
-                TensorDType::Q8_0,
-                TensorDType::F32,
-            ];
-            let pick_by_preference = || -> Option<TensorDType> {
-                weight_preference
-                    .iter()
-                    .copied()
-                    .find(|d| available_dtypes.contains(&d.as_u32()))
-            };
-
-            if let Some(d) = default_from_meta {
-                if available_dtypes.contains(&d.as_u32()) {
-                    Some(d)
-                } else {
-                    // META.default_dtype이 available에 없으면 weight 우선 후보.
-                    pick_by_preference()
-                }
-            } else {
-                // META.default_dtype 없음 → weight 우선 후보.
-                pick_by_preference()
-            }
-        }
-        SecondaryDtypeChoice::F16 => {
-            if available_dtypes.contains(&TensorDType::F16.as_u32()) {
-                Some(TensorDType::F16)
-            } else {
-                return Err(LoadError::DtypeNotFound {
-                    dtype: "F16".to_string(),
-                });
-            }
-        }
-        SecondaryDtypeChoice::Q4_0 => {
-            if available_dtypes.contains(&TensorDType::Q4_0.as_u32()) {
-                Some(TensorDType::Q4_0)
-            } else {
-                return Err(LoadError::DtypeNotFound {
-                    dtype: "Q4_0".to_string(),
-                });
-            }
-        }
-        SecondaryDtypeChoice::F32 => {
-            if available_dtypes.contains(&TensorDType::F32.as_u32()) {
-                Some(TensorDType::F32)
-            } else {
-                return Err(LoadError::DtypeNotFound {
-                    dtype: "F32".to_string(),
-                });
-            }
-        }
-    };
-
-    // ── Adreno SOA × F16 reject (Sprint D 함정 3) ──────────────────────────
-    if backend_tag == BackendTag::AdrenoSoa && matches!(selected_dtype, Some(TensorDType::F16)) {
-        return Err(LoadError::AdrenoSoaF16Rejected);
-    }
-
-    // ── 단방향 swap 정합성 검증 (primary=Q4_0이면 secondary=F16 reject) ─────
-    // primary_config에는 dtype이 직접 없으므로 META.default_dtype이 Q4_0인 경우를 primary로 간주한다.
-    // 좀 더 정확한 방법: AUF의 모든 entry dtype 중 Q4_0만 있으면 primary=Q4_0 파일로 판단.
-    // 실용적으로는 available_dtypes에서 primary가 Q4_0 single이면서 secondary=F16이면 reject.
-    // (Sprint D spec: primary=Q4_0이면 secondary=F16 reject)
-    if let Some(TensorDType::F16) = selected_dtype {
-        // available_dtypes가 {Q4_0}만 있다면 primary=Q4_0 전용 파일 → 역방향 차단.
-        let only_q4_0 =
-            available_dtypes.len() == 1 && available_dtypes.contains(&TensorDType::Q4_0.as_u32());
-        if only_q4_0 {
-            return Err(LoadError::ReverseSwapRejected {
-                primary_dtype: "Q4_0".to_string(),
-                secondary_dtype: "F16".to_string(),
-            });
-        }
-    }
-
-    // ── TENSOR_INDEX → per-layer slice index 구성 ─────────────────────────
-    let num_layers = primary_config.num_hidden_layers;
-    let mut layer_index: Vec<LayerTensorSlice> = vec![LayerTensorSlice::default(); num_layers];
-
-    for entry in &view.tensor_index.entries {
-        // Skip cross-layer tensors (embedding, final_norm, lm_head).
-        if entry.layer_idx == LAYER_IDX_CROSS {
-            continue;
-        }
-        let layer_idx = entry.layer_idx as usize;
-        if layer_idx >= num_layers {
-            continue;
-        }
-
-        // dtype 필터: selected_dtype이 Some인 경우 해당 dtype만 허용.
-        if let Some(sel) = selected_dtype
-            && entry.dtype != sel.as_u32()
-        {
-            continue;
-        }
-
-        // Skip entries without a payload for this variant.
-        let var_offset = entry
-            .variant_offsets
-            .get(variant_idx)
-            .copied()
-            .unwrap_or(u64::MAX);
-        let var_size = entry.variant_sizes.get(variant_idx).copied().unwrap_or(0);
-        if var_offset == u64::MAX || var_size == 0 {
-            continue;
-        }
-
-        let Some(subname) = tensor_kind_to_subname(entry.kind) else {
-            continue;
-        };
-        let Some(dtype) = auf_dtype_to_engine(entry.dtype) else {
-            continue;
-        };
-
-        // var_offset is section-local (relative to WEIGHTS payload start).
-        // weights_bytes() already returns a slice starting at weights_section_offset,
-        // so we store the section-local offset directly — do NOT add weights_section_offset
-        // again (that would cause a double-base panic on tensor_bytes()).
-        let slice_info = SecondaryTensorInfo {
-            offset: var_offset as usize,
-            len: var_size as usize,
-            dtype,
-            // AUF shape is stored in logical order (outermost first).
-            // `swap_executor.rs` expects GGUF order (innermost first), so reverse.
-            dims: entry.shape.iter().rev().copied().collect(),
-        };
-
-        layer_index[layer_idx]
-            .tensors
-            .insert(subname.to_string(), slice_info);
-    }
-
-    let is_pre_converted_soa = weights_tag == TAG_WEIGHTS_ADRENO_SOA;
-
-    Ok(SecondaryMmap::Auf(AufSecondaryMmap {
-        view,
-        layer_index,
-        source_path: path.to_path_buf(),
-        is_pre_converted_soa,
-    }))
-}
-
-/// META.default_dtype / CLI dtype 문자열을 `TensorDType`으로 변환 (로컬 복사).
-///
-/// `reader.rs`의 `dtype_str_to_tensor_dtype`와 동일 로직이지만
-/// cross-crate 공유를 피하기 위해 module-local으로 유지한다.
-fn dtype_str_to_tensor_dtype_local(s: &str) -> Option<TensorDType> {
-    match s {
-        "F32" => Some(TensorDType::F32),
-        "F16" => Some(TensorDType::F16),
-        "BF16" => Some(TensorDType::BF16),
-        "Q4_0" => Some(TensorDType::Q4_0),
-        "Q4_1" => Some(TensorDType::Q4_1),
-        "Q8_0" => Some(TensorDType::Q8_0),
-        "U8" => Some(TensorDType::U8),
-        _ => None,
-    }
-}
+pub use crate::models::loader::auf::secondary::{
+    auf_dtype_to_engine, build_auf_secondary_from_view, check_auf_metadata, is_auf_path,
+    open_secondary_auf,
+};
 
 // ──────────────────────────────────────────────────────────────────────────
 // Metadata helpers
@@ -1290,45 +922,6 @@ fn check_metadata(primary: &ModelConfig, secondary: &ModelConfig) -> Result<(), 
     check_field!(head_dim);
     check_field!(intermediate_size);
     check_field!(vocab_size);
-    Ok(())
-}
-
-/// Validate AUF META against primary `ModelConfig`.
-fn check_auf_metadata(
-    primary: &ModelConfig,
-    meta: &crate::auf::AufMeta,
-    path: &Path,
-) -> Result<(), LoadError> {
-    macro_rules! check {
-        ($primary_field:expr, $auf_field:expr, $name:literal) => {
-            if $primary_field as u64 != $auf_field as u64 {
-                return Err(LoadError::MetadataMismatch {
-                    field: $name,
-                    primary: format!("{}", $primary_field),
-                    secondary: format!("{} (AUF: {})", $auf_field, path.display()),
-                });
-            }
-        };
-    }
-    check!(primary.hidden_size, meta.hidden_dim, "hidden_size");
-    check!(
-        primary.num_hidden_layers,
-        meta.n_layers,
-        "num_hidden_layers"
-    );
-    check!(
-        primary.num_attention_heads,
-        meta.n_heads_q,
-        "num_attention_heads"
-    );
-    check!(
-        primary.num_key_value_heads,
-        meta.n_kv_heads,
-        "num_key_value_heads"
-    );
-    check!(primary.head_dim, meta.head_dim, "head_dim");
-    check!(primary.intermediate_size, meta.ffn_dim, "intermediate_size");
-    check!(primary.vocab_size, meta.vocab_size, "vocab_size");
     Ok(())
 }
 
@@ -1447,7 +1040,7 @@ impl SecondaryMmap {
     pub fn as_auf_view(&self) -> Option<&AufView> {
         match self {
             SecondaryMmap::Gguf(_) => None,
-            SecondaryMmap::Auf(a) => Some(&a.view),
+            SecondaryMmap::Auf(a) => Some(a.view.as_ref()),
             SecondaryMmap::Rpcmem(_) => None,
         }
     }

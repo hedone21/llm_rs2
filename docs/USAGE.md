@@ -1213,6 +1213,8 @@ generate ... --chat \
 
 ### 2.13 Weight Swap (AUF / Secondary GGUF)
 
+> **정식 경로 (W-AUF-1, Sprint 1, 2026-05-19)**: `--model-path foo.auf` 단일 파일 진입. AUF가 self-contained (META + TOKENIZER + TENSOR_INDEX + WEIGHTS)이므로 별도 tokenizer/secondary 지정이 불필요하다. `--secondary-gguf`는 **deprecated alias** (stderr 경고 1회 후 그대로 동작, `.gguf`/`.auf` 양쪽 수용). 기존 dual-file 사용자는 `auf_tool build`로 AUF single-file 마이그레이션 권장. AUF self-secondary 자동 활성(W-AUF-2)이 후속 단계로 예고됨 — `--no-self-secondary`로 끌 수 있다(현재 stub 단계라 동작 변화 없음).
+
 런타임에 decoder layer weight를 secondary 자산(다른 dtype)으로 교체하는 기능. Phase 2~Phase 6에서 단계적으로 도입되었다. **Sprint G-1 (2026-04-26) 종결** 기준으로 v0.1.1 AUF 포맷 + lm_head Q4_0 사전 변환을 지원한다.
 
 #### 2.13.1 무엇이고 언제 쓰는가
@@ -1233,7 +1235,7 @@ generate ... --chat \
 
 | 플래그 | 설명 |
 |--------|------|
-| `--secondary-gguf <PATH>` | secondary 자산 (`.gguf` 또는 `.auf`). 미지정 시 weight swap 경로 비활성. |
+| `--secondary-gguf <PATH>` | **(Deprecated, W-AUF-1)** secondary 자산 (`.gguf` 또는 `.auf`). 호출 시 stderr 경고 1회 출력 후 그대로 동작. 향후 제거 예정. AUF single-file (`--model-path foo.auf`)로 마이그레이션 권장. |
 | `--force-swap-ratio <FLOAT>` | 0.0–1.0. 추론 시작 직전에 decoder layer의 X 비율을 secondary로 교체. `--secondary-gguf` 필수. |
 | `--secondary-dtype <auto\|q4_0\|f16>` | v0.2 multi-quant AUF에서 swap 시 선택할 dtype. 기본 `auto` — AUF META `default_dtype` 우선, 없으면 TENSOR_INDEX first-match. 단일 dtype AUF (v0.1.x)에서는 무시됨. |
 | `--secondary-layout <auto\|aos\|soa>` | AUF backend variant 선택. 기본 `auto` (preferred → CpuAos 폴백). `aos`는 swap 후 `switch_hw cpu` / `set_partition_ratio` 호환 (host pointer 보존), `soa`는 GPU 디코드 가장 빠르지만 swap 후 backend 전환 부적합. GGUF secondary에선 무시. |
@@ -1242,6 +1244,16 @@ generate ... --chat \
 | `--tokenizer-path <PATH>` | tokenizer.json 경로. 같은 디렉토리에 sibling 모델이 있을 때 명시 권장 (자동 감지가 다른 tokenizer를 잡으면 garbage 출력). |
 | `--qcf-dump <PATH>` | run 종료 시 QCF_swap / NLL / swap_set / importance·noise table을 단일 JSON으로 dump. 활성화 시 자동 워밍업 prefill (importance 기반 swap 결정) 흐름 진입. |
 | `--qcf-warmup-tokens <N>` | warmup prefill 길이. 기본 256. `--qcf-dump` 활성 시에만 사용. |
+
+**W-AUF-1 신규 플래그** (AUF primary loader 도입, Sprint 1, 2026-05-19):
+
+| 플래그 | 기본값 | 설명 |
+|--------|--------|------|
+| `--primary-variant <auto\|adreno-soa\|cpu-aos\|cuda-aos>` | `auto` | AUF primary 로드 시 사용할 backend variant. `auto`는 빌드 backend(opencl/cuda/cpu)에서 추론. AUF가 해당 variant를 포함하지 않으면 명시 에러. |
+| `--primary-dtype <auto\|f16\|q4_0\|q8_0\|bf16\|f32\|q4_1>` | `auto` | v0.2 multi-dtype AUF에서 primary 로드 dtype 선택. `auto`는 META `default_dtype`. 단일 dtype AUF에서는 무시. |
+| `--no-self-secondary` | off | AUF self-secondary 자동 활성(W-AUF-2)을 끈다. 현재 W-AUF-1 단계에서는 stub이라 동작 변화 없음. |
+| `--eos-token-id <U32>` | — | 런타임 EOS override. 기존 AUF가 TOKENIZER `eos_id` 슬롯이 비어 있을 때 권장. `auf_tool build --eos-token-id`로 미리 채워 두면 불필요. |
+| `--bos-token-id <U32>` | — | 런타임 BOS override. EOS와 동일 패턴. |
 
 #### 2.13.3 GGUF secondary 시나리오 (가장 단순)
 
@@ -1334,6 +1346,21 @@ adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
   --force-swap-ratio 1.0 \
   -b opencl --enable-resilience --resilience-prealloc-switch \
   --prompt 'Hello' -n 50"
+```
+
+**AUF single-file primary (W-AUF-1, 권장 정식 경로)**:
+
+```bash
+# AUF 한 파일로 끝. tokenizer 별도 지정 불필요 (TOKENIZER section 동봉).
+./target/release/generate \
+  -m models/llama3.2-1b.auf \
+  -b opencl --prompt 'Hello' -n 50
+
+# variant/dtype 명시 (auto가 잘못 잡을 때)
+./target/release/generate \
+  -m models/mixed.auf \
+  --primary-variant adreno-soa --primary-dtype q4_0 \
+  -b opencl --prompt 'Hello' -n 50
 ```
 
 상세 옵션 (`info`, `verify`, lm_head AOS 예외, 트러블슈팅): `docs/auf_tool_guide.md` 참조.
@@ -2448,10 +2475,15 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--secondary-gguf` | — | secondary 자산 경로 (`.gguf` 또는 `.auf`). 미지정 시 weight swap 비활성 |
+| `--secondary-gguf` | — | **(Deprecated, W-AUF-1)** secondary 자산 경로 (`.gguf` 또는 `.auf`). stderr 경고 1회 후 그대로 동작. AUF single-file (`--model-path foo.auf`)로 마이그레이션 권장 |
 | `--force-swap-ratio` | — | 0.0–1.0. 추론 시작 직전 swap할 decoder layer 비율. `--secondary-gguf` 필수 |
 | `--secondary-dtype` | `auto` | v0.2 multi-quant AUF에서 swap 시 선택할 dtype (`auto` / `q4_0` / `f16`). `auto`는 AUF META `default_dtype` 우선 → first-match. 단일 dtype AUF (v0.1.x)에서는 무시됨 |
 | `--secondary-layout` | `auto` | AUF backend variant (`auto` / `aos` / `soa`). `aos`는 swap 후 `switch_hw cpu` / `set_partition_ratio` 호환. PACT/Resilience 시나리오에서는 `aos` 명시 권장. GGUF secondary에선 무시 |
 | `--swap-dir` | — | swap mmap에 사용할 디렉토리 (미지정 시 OS 기본) |
 | `--quantize-lm-head` | `auto` | `auto` / `q4_0` / `none`. `auto`는 `--secondary-gguf` 지정 + lm_head F16/F32일 때만 Q4_0 변환 |
 | `--tokenizer-path` | 자동 감지 | tokenizer.json 경로. 디렉토리에 sibling 모델이 있으면 명시 권장 |
+| `--primary-variant` | `auto` | (W-AUF-1) AUF primary backend variant (`auto` / `adreno-soa` / `cpu-aos` / `cuda-aos`). `auto`는 빌드 backend에서 추론 |
+| `--primary-dtype` | `auto` | (W-AUF-1) v0.2 multi-dtype AUF primary 로드 dtype (`auto` / `f16` / `q4_0` / `q8_0` / `bf16` / `f32` / `q4_1`). `auto`는 META `default_dtype` |
+| `--no-self-secondary` | off | (W-AUF-1) AUF self-secondary 자동 활성(W-AUF-2 예고)을 끈다. 현재 stub |
+| `--eos-token-id` | — | (W-AUF-1) 런타임 EOS override (TOKENIZER 슬롯 비어 있을 때) |
+| `--bos-token-id` | — | (W-AUF-1) 런타임 BOS override |

@@ -210,6 +210,13 @@ python scripts/run_device.py -d pixel generate
 | TODO 관리 | `.agent/todos/` — 형식: `.agent/todos/README.md` |
 | 설계 문서 | `ARCHITECTURE.md`, `spec/`, `docs/` |
 
+## Weight asset 경로 정책 (Sprint 1 W-AUF-1, 2026-05-20)
+
+- **정식**: `--model-path foo.auf` (AUF single-file). multi-dtype/variant capability bit ON이면 W-AUF-2에서 self-secondary 자동 활성 예정.
+- **CLI flags (AUF primary)**: `--primary-variant {auto,adreno-soa,cpu-aos,cuda-aos}`, `--primary-dtype {auto,f16,q4_0,q8_0,bf16,f32,q4_1}`, `--eos-token-id <ID>` / `--bos-token-id <ID>` (TOKENIZER section eos/bos가 N/A일 때 fallback), `--no-self-secondary` (W-AUF-2 자동 활성 끄기).
+- **AUF 빌드 (`auf_tool build`)**: `--tokenizer-config tokenizer_config.json` + `--bos-token-id` / `--eos-token-id`로 TOKENIZER section 슬롯을 채운다. 미지정 시 sibling `tokenizer_config.json` 자동 탐색.
+- **Deprecated**: `--secondary-gguf <PATH>`는 stderr 1회 경고 후 그대로 동작 (`.gguf`/`.auf` 둘 다 수용). 향후 제거 예정 — 기존 호출은 AUF single-file로 마이그레이션 권장.
+
 ## Resilience 검증 하네스 요약
 
 `verify/` — SystemSignal → Policy → EngineCommand → Engine 전 경로를 실제 바이너리로 돌려 4층(functional / crash+progress / performance / accuracy) 판정하는 자동화 매트릭스. 엔트리는 `python verify/verify.py --device <key> --model <f16,q4> [--scenario-filter ...]`. 시나리오 YAML은 `verify/scenarios/`. 사용법 상세: `verify/USAGE.md`.

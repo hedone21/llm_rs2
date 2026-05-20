@@ -108,6 +108,83 @@ impl From<SecondaryLayoutArg> for llm_rs2::models::weights::SecondaryLayoutChoic
     }
 }
 
+// ── AUF primary CLI args (W-AUF-1 C4) ──────────────────────────────────────
+
+/// `--primary-variant` CLI 인수 값. AUF primary backend variant 선택.
+/// GGUF/Safetensors primary에서는 무시.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryVariantArg {
+    Auto,
+    AdrenoSoa,
+    CpuAos,
+    CudaAos,
+}
+
+fn parse_primary_variant(s: &str) -> Result<PrimaryVariantArg, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(PrimaryVariantArg::Auto),
+        "adreno-soa" | "adreno_soa" | "soa" => Ok(PrimaryVariantArg::AdrenoSoa),
+        "cpu-aos" | "cpu_aos" => Ok(PrimaryVariantArg::CpuAos),
+        "cuda-aos" | "cuda_aos" => Ok(PrimaryVariantArg::CudaAos),
+        other => Err(format!(
+            "unknown primary-variant '{other}'. Valid: auto, adreno-soa, cpu-aos, cuda-aos"
+        )),
+    }
+}
+
+impl From<PrimaryVariantArg> for llm_rs2::models::loader::AufVariantChoice {
+    fn from(arg: PrimaryVariantArg) -> Self {
+        match arg {
+            PrimaryVariantArg::Auto => Self::Auto,
+            PrimaryVariantArg::AdrenoSoa => Self::AdrenoSoa,
+            PrimaryVariantArg::CpuAos => Self::CpuAos,
+            PrimaryVariantArg::CudaAos => Self::CudaAos,
+        }
+    }
+}
+
+/// `--primary-dtype` CLI 인수 값. AUF primary dtype 선택.
+/// GGUF/Safetensors primary에서는 무시.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryDtypeArg {
+    Auto,
+    F16,
+    F32,
+    BF16,
+    Q4_0,
+    Q4_1,
+    Q8_0,
+}
+
+fn parse_primary_dtype(s: &str) -> Result<PrimaryDtypeArg, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(PrimaryDtypeArg::Auto),
+        "f16" => Ok(PrimaryDtypeArg::F16),
+        "f32" => Ok(PrimaryDtypeArg::F32),
+        "bf16" => Ok(PrimaryDtypeArg::BF16),
+        "q4_0" | "q4" => Ok(PrimaryDtypeArg::Q4_0),
+        "q4_1" => Ok(PrimaryDtypeArg::Q4_1),
+        "q8_0" | "q8" => Ok(PrimaryDtypeArg::Q8_0),
+        other => Err(format!(
+            "unknown primary-dtype '{other}'. Valid: auto, f16, f32, bf16, q4_0, q4_1, q8_0"
+        )),
+    }
+}
+
+impl From<PrimaryDtypeArg> for llm_rs2::models::loader::AufDtypeChoice {
+    fn from(arg: PrimaryDtypeArg) -> Self {
+        match arg {
+            PrimaryDtypeArg::Auto => Self::Auto,
+            PrimaryDtypeArg::F16 => Self::F16,
+            PrimaryDtypeArg::F32 => Self::F32,
+            PrimaryDtypeArg::BF16 => Self::BF16,
+            PrimaryDtypeArg::Q4_0 => Self::Q4_0,
+            PrimaryDtypeArg::Q4_1 => Self::Q4_1,
+            PrimaryDtypeArg::Q8_0 => Self::Q8_0,
+        }
+    }
+}
+
 /// Parse `--qcf-sample-layers` argument into a list of layer indices.
 ///
 /// Accepts:
@@ -183,6 +260,94 @@ mod parse_qcf_sample_layers_tests {
     #[test]
     fn empty_after_trim() {
         assert!(parse_qcf_sample_layers(",", 4).is_err());
+    }
+}
+
+#[cfg(test)]
+mod auf_cli_parsers_tests {
+    use super::*;
+
+    #[test]
+    fn primary_variant_accepts_aliases() {
+        assert_eq!(
+            parse_primary_variant("auto").unwrap(),
+            PrimaryVariantArg::Auto
+        );
+        assert_eq!(
+            parse_primary_variant("Adreno-SOA").unwrap(),
+            PrimaryVariantArg::AdrenoSoa
+        );
+        assert_eq!(
+            parse_primary_variant("adreno_soa").unwrap(),
+            PrimaryVariantArg::AdrenoSoa
+        );
+        assert_eq!(
+            parse_primary_variant("soa").unwrap(),
+            PrimaryVariantArg::AdrenoSoa
+        );
+        assert_eq!(
+            parse_primary_variant("cpu-aos").unwrap(),
+            PrimaryVariantArg::CpuAos
+        );
+        assert_eq!(
+            parse_primary_variant("cuda_aos").unwrap(),
+            PrimaryVariantArg::CudaAos
+        );
+        assert!(parse_primary_variant("garbage").is_err());
+    }
+
+    #[test]
+    fn primary_dtype_accepts_aliases() {
+        assert_eq!(parse_primary_dtype("auto").unwrap(), PrimaryDtypeArg::Auto);
+        assert_eq!(parse_primary_dtype("F16").unwrap(), PrimaryDtypeArg::F16);
+        assert_eq!(parse_primary_dtype("Q4_0").unwrap(), PrimaryDtypeArg::Q4_0);
+        assert_eq!(parse_primary_dtype("q4").unwrap(), PrimaryDtypeArg::Q4_0);
+        assert_eq!(parse_primary_dtype("q8").unwrap(), PrimaryDtypeArg::Q8_0);
+        assert_eq!(parse_primary_dtype("bf16").unwrap(), PrimaryDtypeArg::BF16);
+        assert!(parse_primary_dtype("garbage").is_err());
+    }
+
+    #[test]
+    fn primary_variant_into_loader_choice() {
+        let c: llm_rs2::models::loader::AufVariantChoice = PrimaryVariantArg::Auto.into();
+        assert_eq!(c, llm_rs2::models::loader::AufVariantChoice::Auto);
+        let c: llm_rs2::models::loader::AufVariantChoice = PrimaryVariantArg::AdrenoSoa.into();
+        assert_eq!(c, llm_rs2::models::loader::AufVariantChoice::AdrenoSoa);
+    }
+
+    #[test]
+    fn primary_dtype_into_loader_choice() {
+        let c: llm_rs2::models::loader::AufDtypeChoice = PrimaryDtypeArg::Auto.into();
+        assert_eq!(c, llm_rs2::models::loader::AufDtypeChoice::Auto);
+        let c: llm_rs2::models::loader::AufDtypeChoice = PrimaryDtypeArg::Q4_0.into();
+        assert_eq!(c, llm_rs2::models::loader::AufDtypeChoice::Q4_0);
+    }
+
+    #[test]
+    fn args_default_for_auf_flags() {
+        // clap parser smoke test: default values when only --model-path provided.
+        let args = Args::try_parse_from(["generate", "--model-path", "/tmp/foo"]).unwrap();
+        assert_eq!(args.primary_variant, PrimaryVariantArg::Auto);
+        assert_eq!(args.primary_dtype, PrimaryDtypeArg::Auto);
+        assert!(!args.no_self_secondary);
+    }
+
+    #[test]
+    fn args_explicit_auf_flags() {
+        let args = Args::try_parse_from([
+            "generate",
+            "--model-path",
+            "/tmp/foo.auf",
+            "--primary-variant",
+            "cpu-aos",
+            "--primary-dtype",
+            "q4_0",
+            "--no-self-secondary",
+        ])
+        .unwrap();
+        assert_eq!(args.primary_variant, PrimaryVariantArg::CpuAos);
+        assert_eq!(args.primary_dtype, PrimaryDtypeArg::Q4_0);
+        assert!(args.no_self_secondary);
     }
 }
 
@@ -808,11 +973,13 @@ struct Args {
     #[arg(long)]
     swap_dir: Option<std::path::PathBuf>,
 
-    /// Optional secondary GGUF path for runtime weight swap (Phase 2).
-    /// When specified together with `--force-swap-ratio`, the engine swaps
-    /// decoder layer weights from the primary dtype to the secondary dtype
-    /// immediately before generation starts.
-    /// When omitted, the weight swap path is disabled (ENG-DAT-C09).
+    /// **[Deprecated, W-AUF-1 C4]** AUF self-secondary 자동 활성(W-AUF-2)
+    /// 도입 후 제거될 예정. `--model-path foo.auf` 단일 경로가 정식 입구다.
+    ///
+    /// (legacy) 별도 secondary weight 파일 경로 (`.gguf` 또는 `.auf`).
+    /// `--force-swap-ratio`와 함께 쓰면 generation 직전에 layer weight를
+    /// secondary dtype으로 swap한다. 호출 시 stderr에 1회 deprecation 경고가
+    /// 출력된다.
     #[arg(long)]
     secondary_gguf: Option<std::path::PathBuf>,
 
@@ -855,6 +1022,56 @@ struct Args {
     /// GGUF secondary에선 무시됨.
     #[arg(long, default_value = "auto", value_parser = parse_secondary_layout)]
     secondary_layout: SecondaryLayoutArg,
+
+    // ── AUF primary CLI flags (W-AUF-1 C4) ────────────────────────────────
+    /// AUF primary backend variant 선택 (W-AUF-1 C4).
+    ///
+    /// `auto` (기본): build feature 기반 default — OpenCL→adreno-soa,
+    /// CUDA→cuda-aos, 그 외→cpu-aos.
+    /// 명시값 `adreno-soa` / `cpu-aos` / `cuda-aos`는 AUF에 해당 variant가
+    /// 동봉되어 있어야 한다.
+    ///
+    /// GGUF/Safetensors primary에서는 무시.
+    #[arg(long, default_value = "auto", value_parser = parse_primary_variant)]
+    primary_variant: PrimaryVariantArg,
+
+    /// AUF primary dtype 선택 (W-AUF-1 C4).
+    ///
+    /// `auto` (기본): `META.default_dtype`을 사용하고, 없으면 entry first-match.
+    /// 명시값(`f16` / `q4_0` / `q8_0` / `bf16` / `f32` / `q4_1`)은 해당 dtype의
+    /// entry가 AUF에 있어야 한다.
+    ///
+    /// GGUF/Safetensors primary에서는 무시 (대신 `--weight-dtype` 사용).
+    #[arg(long, default_value = "auto", value_parser = parse_primary_dtype)]
+    primary_dtype: PrimaryDtypeArg,
+
+    /// AUF self-secondary 자동 활성을 강제로 끈다 (W-AUF-1 C4 stub).
+    ///
+    /// W-AUF-2부터 AUF primary가 multi-dtype/variant capability를 가지면
+    /// 같은 파일에서 secondary weight set이 자동 활성된다. 디버그/벤치마크
+    /// 목적으로 이를 비활성화하려면 본 flag를 명시한다.
+    ///
+    /// 현재 stub 단계에서는 `resolve_secondary`가 항상 None을 반환하므로
+    /// 본 flag는 LoadConfig에 전달만 되며 동작 변화 없다.
+    #[arg(long, default_value_t = false)]
+    no_self_secondary: bool,
+
+    /// AUF TOKENIZER section의 `eos_id`가 N/A인 경우의 runtime fallback (W-AUF-1 C5).
+    ///
+    /// AUF 빌드 시 `auf_tool build --eos-token-id`로 채우지 못한 파일을 사용할
+    /// 때 이 flag로 EOS 정지 조건을 명시한다. AUF TOKENIZER section의 값이
+    /// 0 이상이면 무시되며, N/A(-1)일 때만 적용된다. GGUF/Safetensors primary
+    /// 에서는 무시.
+    #[arg(long, value_name = "ID")]
+    eos_token_id: Option<u32>,
+
+    /// AUF TOKENIZER section의 `bos_id` runtime fallback (W-AUF-1 C5).
+    ///
+    /// 현재 ModelConfig에 `bos_token_id` 필드가 없어 inference 경로에서는
+    /// 사용되지 않는다 (chat mode 도입 후 활성). 본 sprint에서는 forward-compat
+    /// 용도로만 추가.
+    #[arg(long, value_name = "ID")]
+    bos_token_id: Option<u32>,
 
     /// Explicit path to tokenizer.json. When omitted, the tokenizer is
     /// resolved automatically via the GGUF basename (e.g.
@@ -1788,19 +2005,47 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let is_gguf = model_path.ends_with(".gguf");
-    let mut model = if is_gguf {
-        if args.weight_dtype != "f16" {
+    // W-AUF-1 C3: 3-way primary format dispatch.
+    // Gguf/Auf → LoadConfig single-entry path. Safetensors → 기존 `load_with_dtype`.
+    let primary_path_buf = std::path::PathBuf::from(model_path);
+    let primary_format = llm_rs2::models::loader::detect_primary_format(&primary_path_buf)?;
+    let is_gguf = matches!(primary_format, llm_rs2::models::loader::PrimaryFormat::Gguf);
+    let is_auf = matches!(primary_format, llm_rs2::models::loader::PrimaryFormat::Auf);
+
+    // W-AUF-1 C4: `--secondary-gguf` deprecation warning (1회만 출력).
+    if args.secondary_gguf.is_some() {
+        eprintln!(
+            "[Deprecated] --secondary-gguf는 향후 제거됩니다. \
+             AUF single-file (--model-path foo.auf)로 전환하세요. \
+             기존 호출은 그대로 동작합니다."
+        );
+    }
+
+    let mut model = if is_gguf || is_auf {
+        if is_gguf && args.weight_dtype != "f16" {
             eprintln!("[Warning] --weight-dtype ignored for GGUF models (dtype from file)");
         }
+        if is_auf && args.weight_dtype != "f16" {
+            eprintln!(
+                "[Warning] --weight-dtype ignored for AUF models; \
+                 use --primary-dtype <auto|f16|q4_0|...> instead"
+            );
+        }
         // Use LoadConfig single-entry path (ENG-DAT-090) so --secondary-gguf
-        // is wired in automatically.
+        // is wired in automatically. W-AUF-1 C4: AUF primary fields
+        // (variant/dtype/no-self-secondary) are now CLI-driven.
         let load_cfg = llm_rs2::models::loader::LoadConfig {
-            primary_source: std::path::PathBuf::from(model_path),
+            primary_source: primary_path_buf,
+            primary_format,
+            primary_variant_choice: args.primary_variant.into(),
+            primary_dtype_choice: args.primary_dtype.into(),
+            primary_eos_override: args.eos_token_id,
+            disable_self_secondary: args.no_self_secondary,
             default_dtype: w_dtype,
             secondary_source: args.secondary_gguf.clone(),
             secondary_dtype_choice: args.secondary_dtype.into(),
             secondary_layout_choice: args.secondary_layout.into(),
+            ..Default::default()
         };
         TransformerModel::load_from_config(&load_cfg, backend.clone(), &*memory)?
     } else {
@@ -3170,11 +3415,8 @@ fn main() -> anyhow::Result<()> {
                     "--swap-probing-growth must be 'linear' or 'binary', got '{other}'"
                 ),
             };
-            let mut c = llm_rs2::models::weights::ProbingKController::with_options(
-                1,
-                usize::MAX,
-                growth,
-            );
+            let mut c =
+                llm_rs2::models::weights::ProbingKController::with_options(1, usize::MAX, growth);
             c.set_stability_window(args.swap_probing_window.max(1));
             Some(c)
         } else {
@@ -3254,16 +3496,15 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2);
             let sample = model.layers[0].load_weights();
-            let spec =
-                llm_rs2::models::weights::layer_object_pool::LayerSpec::from_sample(
-                    &sample,
-                    DType::Q4_0,
-                )
-                .with_zero_copy(
-                    std::env::var("LLMRS_SWAP_LAYER_POOL_ZERO_COPY")
-                        .map(|v| v == "1")
-                        .unwrap_or(false),
-                );
+            let spec = llm_rs2::models::weights::layer_object_pool::LayerSpec::from_sample(
+                &sample,
+                DType::Q4_0,
+            )
+            .with_zero_copy(
+                std::env::var("LLMRS_SWAP_LAYER_POOL_ZERO_COPY")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+            );
             let zc = spec.zero_copy;
             match llm_rs2::models::weights::layer_object_pool::LayerObjectPool::new(
                 Arc::clone(gpu_be),
@@ -3299,9 +3540,8 @@ fn main() -> anyhow::Result<()> {
         if !enabled {
             None
         } else if let Some(secondary) = model.secondary_mmap.clone() {
-            match llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration::register(
-                secondary,
-            ) {
+            match llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration::register(secondary)
+            {
                 Ok(reg) => {
                     eprintln!(
                         "[LISWAP-8] mmap registration active: size={} MB",

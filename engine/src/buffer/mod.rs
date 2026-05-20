@@ -1,3 +1,4 @@
+pub mod auf_view_buffer;
 pub mod borrowed_mmap_buffer;
 #[cfg(feature = "opencl")]
 pub mod cl_sub_buffer;

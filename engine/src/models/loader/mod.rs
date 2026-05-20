@@ -7,9 +7,12 @@
 //! Current implementations:
 //! - `SafetensorsSource` — HuggingFace safetensors format
 
+pub mod auf;
 pub mod convert;
 pub mod gguf;
 pub mod safetensors;
+
+pub use auf::{AufDtypeChoice, AufSource, AufVariantChoice, PrimaryFormat, detect_primary_format};
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -25,11 +28,9 @@ use crate::models::transformer::TransformerModel;
 
 /// Runtime weight-load configuration.
 ///
-/// Phase 1 shape: primary file path + a discovered default dtype, plus an
-/// optional secondary GGUF path reserved for runtime dynamic swap
-/// (`SwapExecutor`, Phase 2). The secondary file is not consulted during
-/// initial forward — `TransformerWeights::secondary_mmap` merely keeps the
-/// mmap handle alive so Phase 2 can index into it in O(1) per tensor.
+/// Sprint 1 (W-AUF-1) 확장: AUF primary 진입을 위한 `primary_format` +
+/// `primary_*_choice` 필드 추가. 기존 GGUF/Safetensors 호출처는 `..Default::default()`
+/// 만 추가하여 무영향 유지.
 ///
 /// Spec: ENG-DAT-090.
 #[derive(Debug, Clone)]
@@ -37,6 +38,16 @@ pub struct LoadConfig {
     /// Path to the primary weight file (typically the higher-precision one,
     /// e.g. F16 GGUF). The existing `--model-path` CLI flag binds here.
     pub primary_source: PathBuf,
+    /// Primary file format (Sprint 1 W-AUF-1). `Gguf`가 기본값으로 기존 호출처 보존.
+    /// `Auf`는 `--model-path foo.auf` 진입 경로.
+    pub primary_format: PrimaryFormat,
+    /// AUF primary backend variant 선택 (Sprint 1 W-AUF-1). GGUF/Safetensors에서 무시.
+    pub primary_variant_choice: AufVariantChoice,
+    /// AUF primary dtype 선택 (Sprint 1 W-AUF-1). GGUF/Safetensors에서 무시.
+    pub primary_dtype_choice: AufDtypeChoice,
+    /// AUF TOKENIZER에 `eos_id`가 비어있을 때 CLI fallback (Sprint 1 F1).
+    /// GGUF/Safetensors에서 무시.
+    pub primary_eos_override: Option<u32>,
     /// Dtype supplied by the primary file. Loader infers it from the GGUF
     /// header; this becomes the initial `LayerSlot::current_dtype` for every
     /// decoder layer.
@@ -46,6 +57,9 @@ pub struct LoadConfig {
     /// identical to the legacy behaviour and `SwapWeights` actions are
     /// no-ops. See ENG-DAT-C09.
     pub secondary_source: Option<PathBuf>,
+    /// AUF self-secondary 자동 활성을 의도적으로 비활성화 (Sprint 1 W-AUF-2 사용 예정).
+    /// `--no-self-secondary` CLI flag로 설정. 디버그/벤치마크 용도.
+    pub disable_self_secondary: bool,
     /// Dtype selection for AUF-backed secondary files (ENG-ALG-225, Sprint D).
     ///
     /// Controls which dtype is selected from a multi-dtype AUF TENSOR_INDEX.
@@ -58,6 +72,23 @@ pub struct LoadConfig {
     /// 그게 AUF에 없으면 `CpuAos`로 폴백한다. `Aos`/`Soa`는 명시 강제.
     /// switch_hw cpu / partition lazy-map과 함께 쓰려면 `Aos`가 필요하다.
     pub secondary_layout_choice: crate::models::weights::SecondaryLayoutChoice,
+}
+
+impl Default for LoadConfig {
+    fn default() -> Self {
+        Self {
+            primary_source: PathBuf::new(),
+            primary_format: PrimaryFormat::Gguf,
+            primary_variant_choice: AufVariantChoice::Auto,
+            primary_dtype_choice: AufDtypeChoice::Auto,
+            primary_eos_override: None,
+            default_dtype: DType::F16,
+            secondary_source: None,
+            disable_self_secondary: false,
+            secondary_dtype_choice: crate::models::weights::SecondaryDtypeChoice::Auto,
+            secondary_layout_choice: crate::models::weights::SecondaryLayoutChoice::Auto,
+        }
+    }
 }
 
 /// Internal standard tensor identifier (format-agnostic).
@@ -130,6 +161,105 @@ pub trait TensorSource {
 
     /// CPU backend reference (for gather_embed fallback paths).
     fn cpu_backend(&self) -> Arc<dyn Backend>;
+
+    /// AUF downcast hook. Default `None`; only [`AufSource`] overrides with `Some(self)`.
+    ///
+    /// `resolve_secondary`가 `&dyn TensorSource`에서 `AufSource` 핸들을 얻어
+    /// `view_arc()` / `primary_variant_tag()` / `has_swap_candidate()` 등에 접근하기 위한
+    /// trait-level downcast. `Any`/`downcast_ref` 대신 default method를 사용해
+    /// LSP를 보존하고 `Box<dyn TensorSource>` 환경에서도 안정 동작한다 (W-AUF-2.2).
+    ///
+    /// [`AufSource`]: crate::models::loader::auf::AufSource
+    fn as_auf(&self) -> Option<&crate::models::loader::auf::AufSource> {
+        None
+    }
+}
+
+/// Resolve the secondary mmap handle for an **AUF primary** source.
+///
+/// Sprint 1 W-AUF-2 본격 구현. GGUF primary는 `TransformerModel::load_gguf_from_config`
+/// 가 `open_secondary_with_backend`를 직접 호출하므로 본 함수는 **AUF primary 경로 전용**.
+///
+/// 결정 순서:
+/// 1. `cfg.secondary_source`가 Some (explicit `--secondary-gguf`)이면서 primary가 AUF인 경우
+///    명시 에러 — AUF primary는 self-secondary가 정식 경로이므로 외부 secondary 지정은 충돌.
+/// 2. AUF primary + multi-dtype capability + `!disable_self_secondary` + primary_dtype 확정 →
+///    [`from_auf_self_secondary`] 자동 활성.
+/// 3. 그 외 → `Ok(None)` (swap 비활성).
+///
+/// GGUF primary는 본 함수를 호출하지 않고 자체 dispatch를 유지한다.
+pub fn resolve_secondary(
+    cfg: &LoadConfig,
+    source: &dyn TensorSource,
+    backend: &Arc<dyn Backend>,
+) -> Result<Option<Arc<crate::models::weights::SecondaryMmap>>> {
+    // 본 함수는 AUF primary 진입에서만 의미가 있다. GGUF/Safetensors는 즉시 None.
+    if cfg.primary_format != PrimaryFormat::Auf {
+        return Ok(None);
+    }
+
+    // R10: AUF primary + explicit --secondary-gguf 조합은 정책상 금지.
+    if cfg.secondary_source.is_some() {
+        anyhow::bail!(
+            "AUF primary와 --secondary-gguf는 함께 쓸 수 없습니다. \
+             AUF는 self-secondary가 정식 경로이므로 --secondary-gguf를 빼거나 \
+             --no-self-secondary로 swap 자체를 비활성화하세요."
+        );
+    }
+
+    if cfg.disable_self_secondary {
+        eprintln!("[AUF] self-secondary disabled by --no-self-secondary");
+        return Ok(None);
+    }
+
+    let Some(auf_src) = source.as_auf() else {
+        // primary_format == Auf인데 source가 AUF가 아니면 dispatch 버그.
+        anyhow::bail!(
+            "resolve_secondary: primary_format=Auf but source is not AufSource (dispatch bug)"
+        );
+    };
+    if !auf_src.has_swap_candidate() {
+        // multi-dtype capability bit OFF → swap 후보 없음. 정상 정지.
+        return Ok(None);
+    }
+
+    let primary_dtype = auf_src.primary_dtype_tensor().ok_or_else(|| {
+        anyhow::anyhow!(
+            "AUF self-secondary: primary_dtype 미해결 (META.default_dtype 없음 + --primary-dtype 미지정)"
+        )
+    })?;
+    let primary_tag = auf_src.primary_variant_tag();
+    let view = auf_src.view_arc();
+
+    let mmap = crate::models::loader::auf::from_auf_self_secondary(
+        Arc::clone(&view),
+        primary_tag,
+        primary_dtype,
+        source.config(),
+    )?;
+
+    // R8: backend가 qnn_oppkg면 RpcMem alias 경로로 promote 시도.
+    // 실패 / 다른 backend / 호스트 → 그대로 SecondaryMmap::Auf 유지.
+    if crate::models::weights::secondary_mmap::backend_supports_rpcmem_secondary(backend) {
+        let crate::models::weights::SecondaryMmap::Auf(auf_sec) = mmap.as_ref() else {
+            // from_auf_self_secondary는 항상 SecondaryMmap::Auf를 반환 — defensive.
+            return Ok(Some(mmap));
+        };
+        let layer_index = auf_sec.layer_index.clone();
+        let diag_path = auf_sec.source_path.clone();
+        if let Some(promoted) =
+            crate::models::weights::secondary_mmap::try_promote_auf_self_secondary_to_rpcmem(
+                Arc::clone(&auf_sec.view),
+                layer_index,
+                diag_path,
+                backend,
+            )
+        {
+            return Ok(Some(Arc::new(promoted)));
+        }
+    }
+
+    Ok(Some(mmap))
 }
 
 /// Assemble a `TransformerModel` from a `TensorSource`.

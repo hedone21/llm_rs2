@@ -62,6 +62,27 @@ struct BuildArgs {
     #[arg(long, value_name = "FILE")]
     tokenizer: PathBuf,
 
+    /// (W-AUF-1 C5) HuggingFace `tokenizer_config.json` 경로. AUF TOKENIZER
+    /// section의 `bos_id`/`eos_id` 슬롯을 채우는 데 사용한다.
+    ///
+    /// 미지정 시 `tokenizer.json`와 같은 디렉토리에서 `tokenizer_config.json`을
+    /// 자동 탐색한다. 발견되면 거기서 `bos_token`/`eos_token` 또는
+    /// `bos_token_id`/`eos_token_id`를 읽고, 못 찾으면 기존 키워드 fallback을
+    /// 사용한다. CLI override (`--bos-token-id`/`--eos-token-id`)는 본 파일보다
+    /// 우선한다.
+    #[arg(long, value_name = "FILE")]
+    tokenizer_config: Option<PathBuf>,
+
+    /// (W-AUF-1 C5) bos_token_id 명시 override. tokenizer_config.json 및 기존
+    /// 키워드 fallback보다 우선한다.
+    #[arg(long, value_name = "ID")]
+    bos_token_id: Option<u32>,
+
+    /// (W-AUF-1 C5) eos_token_id 명시 override. tokenizer_config.json 및 기존
+    /// 키워드 fallback보다 우선한다.
+    #[arg(long, value_name = "ID")]
+    eos_token_id: Option<u32>,
+
     /// 출력 AUF 파일 경로 (atomic rename으로 부분 write 방지)
     #[arg(long, value_name = "FILE")]
     output: PathBuf,
@@ -281,11 +302,82 @@ fn parse_dtypes(dtypes_str: &str) -> Result<Vec<TensorDType>> {
     Ok(out)
 }
 
+/// tokenizer_config.json 또는 generation_config.json에서 bos/eos id를
+/// 추출한다 (W-AUF-1 C5).
+///
+/// HuggingFace 표준 필드 변형 처리:
+/// - `bos_token_id` / `eos_token_id` (integer): 그대로 사용
+/// - `bos_token` / `eos_token` (string): `vocab_lookup`을 통해 token → id 변환
+/// - `bos_token` / `eos_token` (object `{ "content": "...", "id": ... }`):
+///   content/id 둘 다 시도
+fn parse_special_ids_from_tokenizer_config(
+    path: &std::path::Path,
+    vocab_lookup: &dyn Fn(&str) -> Option<i32>,
+) -> Result<(Option<i32>, Option<i32>)> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        anyhow!(
+            "Cannot open tokenizer_config.json {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)
+        .map_err(|e| anyhow!("Cannot read tokenizer_config.json: {}", e))?;
+    let json: serde_json::Value = serde_json::from_str(&buf)
+        .map_err(|e| anyhow!("Invalid tokenizer_config.json JSON: {}", e))?;
+    Ok(resolve_special_ids_from_value(&json, vocab_lookup))
+}
+
+/// Pure helper extracted for unit tests: `parse_special_ids_from_tokenizer_config`의
+/// 파일 I/O 분리 버전. JSON value와 vocab_lookup만 받아 (bos, eos)를 반환한다.
+fn resolve_special_ids_from_value(
+    json: &serde_json::Value,
+    vocab_lookup: &dyn Fn(&str) -> Option<i32>,
+) -> (Option<i32>, Option<i32>) {
+    let resolve = |field_id: &str, field_str: &str| -> Option<i32> {
+        if let Some(v) = json.get(field_id).and_then(|v| v.as_i64()) {
+            return Some(v as i32);
+        }
+        let token_node = json.get(field_str)?;
+        if let Some(s) = token_node.as_str() {
+            return vocab_lookup(s);
+        }
+        if let Some(obj) = token_node.as_object() {
+            if let Some(id) = obj.get("id").and_then(|v| v.as_i64()) {
+                return Some(id as i32);
+            }
+            if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
+                return vocab_lookup(content);
+            }
+        }
+        None
+    };
+    let bos = resolve("bos_token_id", "bos_token");
+    let eos = resolve("eos_token_id", "eos_token");
+    (bos, eos)
+}
+
 /// tokenizer.json에서 AufTokenizer를 구성한다.
 ///
 /// tokenizers crate의 Tokenizer::from_file은 내부 vocab/merges 직접 접근이
 /// 어려우므로 JSON을 직접 파싱하여 필드를 추출한다.
-fn load_tokenizer_from_json(path: &std::path::Path) -> Result<AufTokenizer> {
+///
+/// `bos_id` / `eos_id` 결정 우선순위 (W-AUF-1 C5):
+/// 1. `bos_override` / `eos_override` — CLI 명시 (`--bos-token-id` /
+///    `--eos-token-id`).
+/// 2. `tokenizer_config_path`로 지정된 (또는 sibling 자동 탐색된)
+///    `tokenizer_config.json`의 `bos_token_id` / `eos_token_id` 정수 또는
+///    `bos_token` / `eos_token` 문자열 (후자는 vocab/added_tokens lookup).
+/// 3. 기존 키워드 fallback (`begin_of_text`, `eos`, `<|eot_id|>` 등).
+fn load_tokenizer_from_json(
+    path: &std::path::Path,
+    tokenizer_config_path: Option<&std::path::Path>,
+    bos_override: Option<u32>,
+    eos_override: Option<u32>,
+) -> Result<AufTokenizer> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)
@@ -366,8 +458,67 @@ fn load_tokenizer_from_json(path: &std::path::Path) -> Result<AufTokenizer> {
             .unwrap_or(-1)
     };
 
-    let bos_id = find_special_id(&["begin_of_text", "bos", "<s>", "[BOS]"]);
-    let eos_id = find_special_id(&["end_of_text", "eos", "</s>", "<|eot_id|>", "[EOS]"]);
+    // W-AUF-1 C5: tokenizer_config.json + CLI override 처리.
+    //
+    // 1. vocab_lookup: token string → id 매핑 (tokenizer.json vocab + added_tokens).
+    let vocab_obj_ref = vocab_obj.clone();
+    let added_tokens_arr = json
+        .get("added_tokens")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let vocab_lookup = move |s: &str| -> Option<i32> {
+        if let Some(id) = vocab_obj_ref.get(s).and_then(|v| v.as_i64()) {
+            return Some(id as i32);
+        }
+        for tok in &added_tokens_arr {
+            if tok.get("content").and_then(|v| v.as_str()) == Some(s)
+                && let Some(id) = tok.get("id").and_then(|v| v.as_i64())
+            {
+                return Some(id as i32);
+            }
+        }
+        None
+    };
+
+    // 2. tokenizer_config.json 자동 탐색 또는 명시 경로 사용.
+    let auto_config_path = path.parent().map(|p| p.join("tokenizer_config.json"));
+    let config_path_used = tokenizer_config_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| auto_config_path.filter(|p| p.exists()));
+
+    let (cfg_bos, cfg_eos) = if let Some(ref cfg) = config_path_used {
+        match parse_special_ids_from_tokenizer_config(cfg, &vocab_lookup) {
+            Ok(pair) => {
+                eprintln!(
+                    "[auf-tool] tokenizer_config.json: {} → bos={:?}, eos={:?}",
+                    cfg.display(),
+                    pair.0,
+                    pair.1,
+                );
+                pair
+            }
+            Err(e) => {
+                eprintln!(
+                    "[auf-tool] Warning: tokenizer_config.json 파싱 실패 ({}), fallback 사용",
+                    e
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    // 3. 우선순위 적용: CLI override → tokenizer_config.json → 키워드 fallback.
+    let bos_id = bos_override
+        .map(|v| v as i32)
+        .or(cfg_bos)
+        .unwrap_or_else(|| find_special_id(&["begin_of_text", "bos", "<s>", "[BOS]"]));
+    let eos_id = eos_override
+        .map(|v| v as i32)
+        .or(cfg_eos)
+        .unwrap_or_else(|| find_special_id(&["end_of_text", "eos", "</s>", "<|eot_id|>", "[EOS]"]));
     let pad_id = find_special_id(&["pad", "[PAD]", "<pad>"]);
     let unk_id = find_special_id(&["unk", "<unk>", "[UNK]"]);
 
@@ -557,8 +708,13 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         );
     }
 
-    // 6) Tokenizer 구성
-    let tokenizer = load_tokenizer_from_json(&args.tokenizer)?;
+    // 6) Tokenizer 구성 (W-AUF-1 C5: tokenizer_config.json + CLI override 통합)
+    let tokenizer = load_tokenizer_from_json(
+        &args.tokenizer,
+        args.tokenizer_config.as_deref(),
+        args.bos_token_id,
+        args.eos_token_id,
+    )?;
 
     // 7) ModelConfig (Q/K permute shape 결정용)
     let config = llm_rs2::models::config::ModelConfig::from_gguf_metadata(&gguf)
@@ -989,6 +1145,10 @@ fn extract_weight_blobs(
         "ffn_down.weight",
         "attn_norm.weight",
         "ffn_norm.weight",
+        // Qwen2 등 qkv bias 모델용 — GGUF에 없으면 자동 skip.
+        "attn_q.bias",
+        "attn_k.bias",
+        "attn_v.bias",
     ];
 
     for layer in 0..n_layers {
@@ -1025,7 +1185,7 @@ fn extract_weight_blobs(
                     dtype_bytes,
                 });
             } else if !quiet && kind.ends_with(".weight") && !kind.contains("norm") {
-                // weight tensor 누락 경고 (norm은 없을 수 있음)
+                // weight tensor 누락 경고 (norm/bias는 모델별로 없을 수 있음)
                 eprintln!("[auf-tool] Warning: tensor '{}' not found in GGUF", name);
             }
         }
@@ -1292,6 +1452,9 @@ fn tensor_name_to_layer_kind(name: &str) -> Option<(u32, TensorKind)> {
         "ffn_down.weight" => TensorKind::FfnDown,
         "attn_norm.weight" => TensorKind::AttnNorm,
         "ffn_norm.weight" => TensorKind::FfnNorm,
+        "attn_q.bias" => TensorKind::AttnQBias,
+        "attn_k.bias" => TensorKind::AttnKBias,
+        "attn_v.bias" => TensorKind::AttnVBias,
         _ => return None,
     };
 
@@ -2615,5 +2778,79 @@ mod tests {
         assert!(tags.contains(&"WEIGHTS_ADRENO_SOA".to_owned()));
         assert!(!tags.contains(&"WEIGHTS_CPU_AOS".to_owned()));
         assert_eq!(hdr.section_count, 4); // META + TOKENIZER + TENSOR_INDEX + ADRENO_SOA
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_config_tests {
+    //! W-AUF-1 C5: `resolve_special_ids_from_value` 단위 검증.
+    use super::resolve_special_ids_from_value;
+    use serde_json::json;
+
+    fn vocab_with(pairs: &[(&'static str, i32)]) -> impl Fn(&str) -> Option<i32> {
+        let owned: Vec<(String, i32)> = pairs.iter().map(|(s, i)| ((*s).to_owned(), *i)).collect();
+        move |needle: &str| owned.iter().find(|(s, _)| s == needle).map(|(_, id)| *id)
+    }
+
+    #[test]
+    fn integer_fields_take_precedence() {
+        let v = json!({
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "bos_token": "<bos-str>",  // ignored when *_id present
+        });
+        let lookup = vocab_with(&[("<bos-str>", 999)]);
+        let (bos, eos) = resolve_special_ids_from_value(&v, &lookup);
+        assert_eq!(bos, Some(1));
+        assert_eq!(eos, Some(2));
+    }
+
+    #[test]
+    fn string_token_resolved_via_vocab() {
+        let v = json!({
+            "bos_token": "<|begin_of_text|>",
+            "eos_token": "<|eot_id|>",
+        });
+        let lookup = vocab_with(&[("<|begin_of_text|>", 128000), ("<|eot_id|>", 128009)]);
+        let (bos, eos) = resolve_special_ids_from_value(&v, &lookup);
+        assert_eq!(bos, Some(128000));
+        assert_eq!(eos, Some(128009));
+    }
+
+    #[test]
+    fn object_token_prefers_inline_id() {
+        let v = json!({
+            "eos_token": { "content": "<|im_end|>", "id": 151643 },
+        });
+        // inline id가 있으면 vocab_lookup 없이도 해석돼야 한다.
+        let lookup = vocab_with(&[]);
+        let (_bos, eos) = resolve_special_ids_from_value(&v, &lookup);
+        assert_eq!(eos, Some(151643));
+    }
+
+    #[test]
+    fn object_token_falls_back_to_content_lookup() {
+        let v = json!({
+            "eos_token": { "content": "<|im_end|>" },
+        });
+        let lookup = vocab_with(&[("<|im_end|>", 151645)]);
+        let (_bos, eos) = resolve_special_ids_from_value(&v, &lookup);
+        assert_eq!(eos, Some(151645));
+    }
+
+    #[test]
+    fn missing_fields_return_none() {
+        let v = json!({});
+        let lookup = vocab_with(&[]);
+        let (bos, eos) = resolve_special_ids_from_value(&v, &lookup);
+        assert!(bos.is_none() && eos.is_none());
+    }
+
+    #[test]
+    fn unknown_string_token_returns_none() {
+        let v = json!({ "eos_token": "<not-in-vocab>" });
+        let lookup = vocab_with(&[("<|im_end|>", 1)]);
+        let (_bos, eos) = resolve_special_ids_from_value(&v, &lookup);
+        assert!(eos.is_none());
     }
 }
