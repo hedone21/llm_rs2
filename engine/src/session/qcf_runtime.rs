@@ -59,7 +59,7 @@ pub fn run_layer_swap(
         Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>,
     >,
     #[cfg(feature = "cuda-embedded")] layer_pool: Option<
-        Arc<crate::models::weights::layer_object_pool::LayerObjectPool>,
+        Arc<dyn crate::layers::staging_pool::WeightStagingPool>,
     >,
     #[cfg(feature = "cuda-embedded")] mmap_registration: Option<
         Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,

@@ -1291,15 +1291,6 @@
       "note": "ARCHITECTURE.md §13.5"
     },
     {
-      "id": "V-27",
-      "file": "models/weights/layer_object_pool.rs",
-      "line": 124,
-      "import": "crate::backend::cuda_embedded::CudaBackend",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "note": "ARCHITECTURE.md §13.5"
-    },
-    {
       "id": "V-28",
       "file": "eval/eval_loop.rs",
       "line": 14,

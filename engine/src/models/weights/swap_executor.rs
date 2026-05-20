@@ -289,8 +289,10 @@ pub struct SwapExecutor<'a> {
     /// calling `cuMemAlloc` for each weight buffer. The background
     /// allocator thread refills the pool to keep the depth stable.
     /// Falls back to the regular bg_fetch path if the pool is exhausted.
+    ///
+    /// Stored as `Arc<dyn WeightStagingPool>` (Migration Step 3-B DIP).
     #[cfg(feature = "cuda-embedded")]
-    pub layer_pool: Option<Arc<crate::models::weights::layer_object_pool::LayerObjectPool>>,
+    pub layer_pool: Option<Arc<dyn crate::layers::staging_pool::WeightStagingPool>>,
 
     /// LISWAP-8 Hammer D: registered mmap region for alias-only swap.
     /// When `Some` and `LLMRS_SWAP_MMAP_ALIAS=1` is set, weights are
@@ -368,13 +370,13 @@ impl<'a> SwapExecutor<'a> {
         self
     }
 
-    /// LISWAP-8 Phase B: attach a `LayerObjectPool` so the BG fetch path
+    /// LISWAP-8 Phase B: attach a `WeightStagingPool` so the BG fetch path
     /// reuses pre-allocated layer buffers instead of calling `cuMemAlloc`
     /// on the dispatch thread. Activated by `LLMRS_SWAP_LAYER_POOL=1` env.
     #[cfg(feature = "cuda-embedded")]
     pub fn with_layer_pool(
         mut self,
-        pool: Arc<crate::models::weights::layer_object_pool::LayerObjectPool>,
+        pool: Arc<dyn crate::layers::staging_pool::WeightStagingPool>,
     ) -> Self {
         self.layer_pool = Some(pool);
         self

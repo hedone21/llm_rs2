@@ -1041,6 +1041,19 @@ pub trait Backend: Send + Sync {
         }
         Ok(())
     }
+
+    /// Bind the backend's hardware context to the calling thread.
+    ///
+    /// Required before any allocation / kernel launch on a background thread
+    /// for backends that use a thread-local hardware context (CUDA driver).
+    /// CPU and OpenCL backends embed the context in their queue/handle clones
+    /// and do not require explicit binding — default is a no-op.
+    ///
+    /// Introduced to remove the L3→L1 `CudaBackend` downcast in
+    /// `LayerObjectPool::new` (Migration Step 3-B, V-27).
+    fn bind_current_thread(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

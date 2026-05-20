@@ -1238,9 +1238,7 @@ fn main() -> anyhow::Result<()> {
     // driver context lock contention observed in the K-sweep
     // active-window forward regression.
     #[cfg(feature = "cuda-embedded")]
-    let layer_swap_pool: Option<
-        Arc<llm_rs2::models::weights::layer_object_pool::LayerObjectPool>,
-    > = {
+    let layer_swap_pool: Option<Arc<dyn llm_rs2::layers::staging_pool::WeightStagingPool>> = {
         let enabled = std::env::var("LLMRS_SWAP_LAYER_POOL")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -1271,7 +1269,8 @@ fn main() -> anyhow::Result<()> {
                     eprintln!(
                         "[LISWAP-8] layer_pool active: target_depth={target_depth} zero_copy={zc}"
                     );
-                    Some(pool)
+                    // Unsized coercion Arc<LayerObjectPool> → Arc<dyn WeightStagingPool>.
+                    Some(pool as Arc<dyn llm_rs2::layers::staging_pool::WeightStagingPool>)
                 }
                 Err(e) => {
                     eprintln!("[LISWAP-8] layer_pool init failed: {e}");

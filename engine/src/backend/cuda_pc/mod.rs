@@ -619,6 +619,12 @@ impl Backend for CudaBackend {
         !self.is_uma
     }
 
+    fn bind_current_thread(&self) -> Result<()> {
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow!("CUDA bind_to_thread failed: {e}"))
+    }
+
     fn flash_attention_prefill(
         &self,
         q: &Tensor,
