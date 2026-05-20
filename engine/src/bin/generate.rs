@@ -1801,6 +1801,7 @@ fn main() -> anyhow::Result<()> {
             secondary_source: args.secondary_gguf.clone(),
             secondary_dtype_choice: args.secondary_dtype.into(),
             secondary_layout_choice: args.secondary_layout.into(),
+            ..Default::default()
         };
         TransformerModel::load_from_config(&load_cfg, backend.clone(), &*memory)?
     } else {

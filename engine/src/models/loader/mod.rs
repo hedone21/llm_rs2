@@ -7,9 +7,12 @@
 //! Current implementations:
 //! - `SafetensorsSource` — HuggingFace safetensors format
 
+pub mod auf;
 pub mod convert;
 pub mod gguf;
 pub mod safetensors;
+
+pub use auf::{AufDtypeChoice, AufSource, AufVariantChoice, PrimaryFormat, detect_primary_format};
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -25,11 +28,9 @@ use crate::models::transformer::TransformerModel;
 
 /// Runtime weight-load configuration.
 ///
-/// Phase 1 shape: primary file path + a discovered default dtype, plus an
-/// optional secondary GGUF path reserved for runtime dynamic swap
-/// (`SwapExecutor`, Phase 2). The secondary file is not consulted during
-/// initial forward — `TransformerWeights::secondary_mmap` merely keeps the
-/// mmap handle alive so Phase 2 can index into it in O(1) per tensor.
+/// Sprint 1 (W-AUF-1) 확장: AUF primary 진입을 위한 `primary_format` +
+/// `primary_*_choice` 필드 추가. 기존 GGUF/Safetensors 호출처는 `..Default::default()`
+/// 만 추가하여 무영향 유지.
 ///
 /// Spec: ENG-DAT-090.
 #[derive(Debug, Clone)]
@@ -37,6 +38,16 @@ pub struct LoadConfig {
     /// Path to the primary weight file (typically the higher-precision one,
     /// e.g. F16 GGUF). The existing `--model-path` CLI flag binds here.
     pub primary_source: PathBuf,
+    /// Primary file format (Sprint 1 W-AUF-1). `Gguf`가 기본값으로 기존 호출처 보존.
+    /// `Auf`는 `--model-path foo.auf` 진입 경로.
+    pub primary_format: PrimaryFormat,
+    /// AUF primary backend variant 선택 (Sprint 1 W-AUF-1). GGUF/Safetensors에서 무시.
+    pub primary_variant_choice: AufVariantChoice,
+    /// AUF primary dtype 선택 (Sprint 1 W-AUF-1). GGUF/Safetensors에서 무시.
+    pub primary_dtype_choice: AufDtypeChoice,
+    /// AUF TOKENIZER에 `eos_id`가 비어있을 때 CLI fallback (Sprint 1 F1).
+    /// GGUF/Safetensors에서 무시.
+    pub primary_eos_override: Option<u32>,
     /// Dtype supplied by the primary file. Loader infers it from the GGUF
     /// header; this becomes the initial `LayerSlot::current_dtype` for every
     /// decoder layer.
@@ -46,6 +57,9 @@ pub struct LoadConfig {
     /// identical to the legacy behaviour and `SwapWeights` actions are
     /// no-ops. See ENG-DAT-C09.
     pub secondary_source: Option<PathBuf>,
+    /// AUF self-secondary 자동 활성을 의도적으로 비활성화 (Sprint 1 W-AUF-2 사용 예정).
+    /// `--no-self-secondary` CLI flag로 설정. 디버그/벤치마크 용도.
+    pub disable_self_secondary: bool,
     /// Dtype selection for AUF-backed secondary files (ENG-ALG-225, Sprint D).
     ///
     /// Controls which dtype is selected from a multi-dtype AUF TENSOR_INDEX.
@@ -58,6 +72,23 @@ pub struct LoadConfig {
     /// 그게 AUF에 없으면 `CpuAos`로 폴백한다. `Aos`/`Soa`는 명시 강제.
     /// switch_hw cpu / partition lazy-map과 함께 쓰려면 `Aos`가 필요하다.
     pub secondary_layout_choice: crate::models::weights::SecondaryLayoutChoice,
+}
+
+impl Default for LoadConfig {
+    fn default() -> Self {
+        Self {
+            primary_source: PathBuf::new(),
+            primary_format: PrimaryFormat::Gguf,
+            primary_variant_choice: AufVariantChoice::Auto,
+            primary_dtype_choice: AufDtypeChoice::Auto,
+            primary_eos_override: None,
+            default_dtype: DType::F16,
+            secondary_source: None,
+            disable_self_secondary: false,
+            secondary_dtype_choice: crate::models::weights::SecondaryDtypeChoice::Auto,
+            secondary_layout_choice: crate::models::weights::SecondaryLayoutChoice::Auto,
+        }
+    }
 }
 
 /// Internal standard tensor identifier (format-agnostic).
