@@ -22,7 +22,8 @@
 #![cfg(feature = "opencl")]
 
 use crate::core::buffer::{Buffer, DType};
-use crate::models::weights::SecondaryMmap;
+use crate::memory::host::mmap::MmapKeepAlive;
+use crate::memory::secondary::RpcmemRegionGuard;
 use anyhow::Result;
 use ocl::core::Mem;
 use std::any::Any;
@@ -46,15 +47,18 @@ pub struct RpcmemAliasBuffer {
     dtype: DType,
     /// Lifetime guard 1 (weak): observe the secondary store without closing
     /// the alias-cache self-cycle (see module docs). The store owns the
-    /// layer-region map; if the model has released its `Arc<SecondaryMmap>`
-    /// the upgrade fails — which is fine, because the cache is dropping with
-    /// the store.
-    _secondary_weak: Weak<SecondaryMmap>,
+    /// layer-region map; if the model has released the secondary the upgrade
+    /// fails — which is fine, because the cache is dropping with the store.
+    /// Migration Step 3-E (V-09): erased from concrete `Weak<SecondaryMmap>`
+    /// to `Weak<dyn MmapKeepAlive>`.
+    _secondary_weak: Weak<dyn MmapKeepAlive>,
     /// Lifetime guard 2 (strong): keep this layer's rpcmem region alive even
     /// if the secondary store evicts the entry from its HashMap (defensive —
     /// current implementation never evicts). This is the only ref that *must*
     /// outlive the cl_mem; the rpcmem free runs from this Arc's Drop.
-    _layer_region: Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+    /// Migration Step 3-E (V-09): erased from concrete `Arc<RpcmemLayerRegion>`
+    /// to `Arc<dyn RpcmemRegionGuard>`.
+    _layer_region: Arc<dyn RpcmemRegionGuard>,
 }
 
 // SAFETY:
@@ -82,8 +86,8 @@ impl RpcmemAliasBuffer {
         host_ptr: *mut u8,
         size: usize,
         dtype: DType,
-        secondary: Arc<SecondaryMmap>,
-        layer_region: Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+        secondary: Arc<dyn MmapKeepAlive>,
+        layer_region: Arc<dyn RpcmemRegionGuard>,
     ) -> Self {
         Self {
             cl_buffer,

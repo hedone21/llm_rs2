@@ -14,18 +14,17 @@
 #![cfg(feature = "cuda-embedded")]
 
 use crate::core::buffer::{Buffer, DType};
+use crate::memory::secondary::SecondaryMmapBytes;
 use anyhow::{Result, anyhow};
 use cudarc::driver::sys as cuda_sys;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::models::weights::SecondaryMmap;
-
 /// Owning handle for a CUDA-registered mmap range. Drop unregisters.
 pub struct CudaMmapRegistration {
     /// Kept alive so the underlying mmap pages stay valid for the
     /// duration of every `CudaMmapAliasBuffer` we hand out.
-    _secondary: Arc<SecondaryMmap>,
+    _secondary: Arc<dyn SecondaryMmapBytes>,
     host_base: *const u8,
     dev_base: cuda_sys::CUdeviceptr,
     size: usize,
@@ -41,16 +40,10 @@ impl CudaMmapRegistration {
     /// Register the full mmap range of `secondary` (GGUF only for the
     /// PoC) with CUDA. Returns an Arc so each alias buffer can keep the
     /// registration alive.
-    pub fn register(secondary: Arc<SecondaryMmap>) -> Result<Arc<Self>> {
-        let bytes = match secondary.as_ref() {
-            SecondaryMmap::Gguf(g) => g.gguf.mmap_data(),
-            SecondaryMmap::Auf(a) => a.view.raw_bytes(),
-            SecondaryMmap::Rpcmem(_) => {
-                return Err(anyhow!(
-                    "CudaMmapRegistration: Rpcmem secondary not supported (use existing alias path)"
-                ));
-            }
-        };
+    pub fn register(secondary: Arc<dyn SecondaryMmapBytes>) -> Result<Arc<Self>> {
+        let bytes = secondary.raw_bytes().map_err(|e| {
+            anyhow!("CudaMmapRegistration: secondary does not expose raw mmap bytes: {e}")
+        })?;
         if bytes.is_empty() {
             return Err(anyhow!("CudaMmapRegistration: empty mmap"));
         }

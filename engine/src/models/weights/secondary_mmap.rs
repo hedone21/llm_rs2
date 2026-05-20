@@ -429,6 +429,21 @@ impl std::fmt::Debug for SecondaryMmap {
 // against its underlying mmap pages.
 impl crate::memory::host::mmap::MmapKeepAlive for SecondaryMmap {}
 
+// Step 3-E (V-09): L2 memory adapters consume the secondary as
+// `Arc<dyn SecondaryMmapBytes>` rather than the concrete `SecondaryMmap`.
+// The enum dispatch + Rpcmem rejection lives here so L2 stays agnostic.
+impl crate::memory::secondary::SecondaryMmapBytes for SecondaryMmap {
+    fn raw_bytes(&self) -> anyhow::Result<&[u8]> {
+        match self {
+            SecondaryMmap::Gguf(g) => Ok(g.gguf.mmap_data()),
+            SecondaryMmap::Auf(a) => Ok(a.view.raw_bytes()),
+            SecondaryMmap::Rpcmem(_) => Err(anyhow::anyhow!(
+                "SecondaryMmap::Rpcmem does not back a single contiguous mmap region"
+            )),
+        }
+    }
+}
+
 impl SecondaryMmap {
     /// Fetch a layer's tensor descriptor by subname (e.g. "attn_q.weight").
     /// Returns `None` if the layer is out of range or the tensor is missing.

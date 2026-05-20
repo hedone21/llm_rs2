@@ -4,9 +4,10 @@
 //! LISWAP-3 prototype (plan: `compiled-chasing-hopper`, Direction A track,
 //! Stage 3). The buffer holds:
 //! - the `HostPtrPoolGuard` — releases the slot back to the pool on drop;
-//! - an optional `Arc<SecondaryMmap>` — keeps the source mmap alive for
-//!   the duration of the slot's use, mirroring `BorrowedMmapBuffer`'s
-//!   INV-143 contract.
+//! - an optional `Arc<dyn MmapKeepAlive>` — keeps the source mmap alive for
+//!   the duration of the slot's use, mirroring `MmapBuffer::borrow`'s
+//!   INV-143 contract. Migration Step 3-E (V-09) erased the previous
+//!   concrete `Arc<SecondaryMmap>` to this marker-trait Arc.
 //!
 //! The buffer reports the *requested* tensor size (not the slot capacity)
 //! so kernels see the correct logical size. `cl_mem()` returns the slot's
@@ -24,7 +25,7 @@ use ocl::core::Mem;
 
 use crate::backend::opencl::host_ptr_pool::HostPtrPoolGuard;
 use crate::core::buffer::{Buffer, DType};
-use crate::models::weights::SecondaryMmap;
+use crate::memory::host::mmap::MmapKeepAlive;
 
 /// Buffer that wraps a `HostPtrPoolGuard`. See module docs.
 pub struct HostPtrPoolBuffer {
@@ -35,16 +36,16 @@ pub struct HostPtrPoolBuffer {
     /// Tensor dtype.
     dtype: DType,
     /// Optional Arc keeping the mmap region alive while we still reference
-    /// it — same INV-143 lifetime contract as `BorrowedMmapBuffer`. The
+    /// it — same INV-143 lifetime contract as `MmapBuffer::borrow`. The
     /// fill path memcpy's into the slot synchronously, so once the slot is
     /// filled the mmap region is no longer required for correctness; the
     /// Arc is retained as a defence-in-depth guard until the buffer drops.
-    _mmap_guard: Option<Arc<SecondaryMmap>>,
+    _mmap_guard: Option<Arc<dyn MmapKeepAlive>>,
 }
 
 // SAFETY: `ocl::core::Mem` is `Send + Sync`; `HostPtrPoolGuard` carries an
-// `Arc<HostPtrPool>` which is `Send + Sync`; the optional `Arc<SecondaryMmap>`
-// is `Send + Sync` by the `Arc` contract.
+// `Arc<HostPtrPool>` which is `Send + Sync`; the optional `Arc<dyn MmapKeepAlive>`
+// is `Send + Sync` by the `MmapKeepAlive` super-trait bounds.
 unsafe impl Send for HostPtrPoolBuffer {}
 unsafe impl Sync for HostPtrPoolBuffer {}
 
@@ -55,7 +56,7 @@ impl HostPtrPoolBuffer {
         guard: HostPtrPoolGuard,
         size: usize,
         dtype: DType,
-        mmap_guard: Option<Arc<SecondaryMmap>>,
+        mmap_guard: Option<Arc<dyn MmapKeepAlive>>,
     ) -> Self {
         debug_assert!(
             size <= guard.capacity(),

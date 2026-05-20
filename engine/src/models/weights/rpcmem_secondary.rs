@@ -79,6 +79,12 @@ pub struct RpcmemLayerRegion {
 unsafe impl Send for RpcmemLayerRegion {}
 unsafe impl Sync for RpcmemLayerRegion {}
 
+// Step 3-E (V-09): L2 `memory/rpcmem/opencl_alias.rs::RpcmemAliasBuffer`
+// holds an `Arc<dyn RpcmemRegionGuard>` purely as a drop-ordering anchor so
+// that `rpcmem_free` runs only after the cl_mem alias is dropped (INV-143).
+// Marker trait — no methods are invoked through the trait object.
+impl crate::memory::secondary::RpcmemRegionGuard for RpcmemLayerRegion {}
+
 impl RpcmemLayerRegion {
     /// Resolve a tensor's host pointer + length within this region.
     ///

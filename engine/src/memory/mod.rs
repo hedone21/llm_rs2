@@ -15,3 +15,4 @@ pub mod opencl;
 pub mod cuda;
 #[cfg(feature = "opencl")]
 pub mod rpcmem;
+pub mod secondary;

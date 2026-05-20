@@ -2216,12 +2216,13 @@ impl<'a> SwapExecutor<'a> {
             })?;
         }
         let dtype = cpu_tensor.dtype();
+        let mmap_guard: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
         let buf: Arc<dyn crate::core::buffer::Buffer> =
             Arc::new(crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
                 guard,
                 size,
                 dtype,
-                Some(Arc::clone(secondary)),
+                Some(mmap_guard),
             ));
         let tensor = Tensor::new(cpu_tensor.shape().clone(), buf, Arc::clone(&self.backend));
         Ok(Some(tensor))
