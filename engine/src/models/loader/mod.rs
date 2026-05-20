@@ -161,6 +161,18 @@ pub trait TensorSource {
 
     /// CPU backend reference (for gather_embed fallback paths).
     fn cpu_backend(&self) -> Arc<dyn Backend>;
+
+    /// AUF downcast hook. Default `None`; only [`AufSource`] overrides with `Some(self)`.
+    ///
+    /// `resolve_secondary`가 `&dyn TensorSource`에서 `AufSource` 핸들을 얻어
+    /// `view_arc()` / `primary_variant_tag()` / `has_swap_candidate()` 등에 접근하기 위한
+    /// trait-level downcast. `Any`/`downcast_ref` 대신 default method를 사용해
+    /// LSP를 보존하고 `Box<dyn TensorSource>` 환경에서도 안정 동작한다 (W-AUF-2.2).
+    ///
+    /// [`AufSource`]: crate::models::loader::auf::AufSource
+    fn as_auf(&self) -> Option<&crate::models::loader::auf::AufSource> {
+        None
+    }
 }
 
 /// Resolve the secondary mmap handle for a given `LoadConfig` + primary source.

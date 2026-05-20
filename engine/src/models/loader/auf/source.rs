@@ -269,6 +269,10 @@ impl TensorSource for AufSource {
     ) -> Result<Tensor> {
         self.materialise_cpu_tensor(id)
     }
+
+    fn as_auf(&self) -> Option<&AufSource> {
+        Some(self)
+    }
 }
 
 impl AufSource {
