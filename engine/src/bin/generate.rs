@@ -1788,15 +1788,29 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let is_gguf = model_path.ends_with(".gguf");
-    let mut model = if is_gguf {
-        if args.weight_dtype != "f16" {
+    // W-AUF-1 C3: 3-way primary format dispatch.
+    // Gguf/Auf → LoadConfig single-entry path. Safetensors → 기존 `load_with_dtype`.
+    let primary_path_buf = std::path::PathBuf::from(model_path);
+    let primary_format = llm_rs2::models::loader::detect_primary_format(&primary_path_buf)?;
+    let is_gguf = matches!(primary_format, llm_rs2::models::loader::PrimaryFormat::Gguf);
+    let is_auf = matches!(primary_format, llm_rs2::models::loader::PrimaryFormat::Auf);
+
+    let mut model = if is_gguf || is_auf {
+        if is_gguf && args.weight_dtype != "f16" {
             eprintln!("[Warning] --weight-dtype ignored for GGUF models (dtype from file)");
         }
+        if is_auf && args.weight_dtype != "f16" {
+            eprintln!(
+                "[Warning] --weight-dtype ignored for AUF models; \
+                 use --primary-dtype (W-AUF-1 C4 도입 예정)"
+            );
+        }
         // Use LoadConfig single-entry path (ENG-DAT-090) so --secondary-gguf
-        // is wired in automatically.
+        // is wired in automatically. AUF primary-related fields (variant/dtype/eos)
+        // remain at Default (Auto/Auto/None) until C4 CLI flags arrive.
         let load_cfg = llm_rs2::models::loader::LoadConfig {
-            primary_source: std::path::PathBuf::from(model_path),
+            primary_source: primary_path_buf,
+            primary_format,
             default_dtype: w_dtype,
             secondary_source: args.secondary_gguf.clone(),
             secondary_dtype_choice: args.secondary_dtype.into(),

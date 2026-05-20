@@ -209,14 +209,27 @@ impl TransformerModel {
 
     /// Load a model from a `LoadConfig` (ENG-DAT-090).
     ///
-    /// This is the canonical single-entry loader that supersedes the
-    /// individual `load_gguf` / `load_gguf_with_secondary` calls. The
-    /// `LoadConfig` bundles primary path, default dtype, and optional
-    /// secondary path so the caller never passes them as loose parameters.
-    ///
-    /// Only GGUF primary sources are supported; Safetensors callers continue
-    /// to use `load_with_dtype` directly.
+    /// Sprint 1 W-AUF-1 C3: 3-way primary format dispatch — GGUF/AUF/Safetensors.
+    /// AUF self-secondary 자동 활성은 W-AUF-2에서 본격화 (현 stub: explicit
+    /// `secondary_source`는 AUF primary에서 warning 후 무시).
     pub fn load_from_config(
+        config: &crate::models::loader::LoadConfig,
+        backend: Arc<dyn Backend>,
+        memory: &dyn Memory,
+    ) -> Result<Self> {
+        use crate::models::loader::PrimaryFormat;
+        match config.primary_format {
+            PrimaryFormat::Gguf => Self::load_gguf_from_config(config, backend, memory),
+            PrimaryFormat::Auf => Self::load_auf_from_config(config, backend, memory),
+            PrimaryFormat::Safetensors => Err(anyhow!(
+                "load_from_config: Safetensors primary는 본 진입점에서 미지원. \
+                 `TransformerModel::load_with_dtype`를 직접 호출하라."
+            )),
+        }
+    }
+
+    /// GGUF primary 전용 `load_from_config` 구현 (기존 로직).
+    fn load_gguf_from_config(
         config: &crate::models::loader::LoadConfig,
         backend: Arc<dyn Backend>,
         memory: &dyn Memory,
@@ -269,6 +282,38 @@ impl TransformerModel {
             source.madvise_dontneed();
         }
 
+        Ok(model)
+    }
+
+    /// AUF primary 전용 `load_from_config` 구현 (W-AUF-1 C3).
+    ///
+    /// 본 sprint stub: explicit `secondary_source`는 deprecation 안내 후 무시한다.
+    /// AUF self-secondary 자동 활성(W-AUF-2)이 도입되면 `resolve_secondary` helper
+    /// (loader/mod.rs)가 같은 AUF view를 `SecondaryMmap`으로 재포장한다.
+    fn load_auf_from_config(
+        config: &crate::models::loader::LoadConfig,
+        backend: Arc<dyn Backend>,
+        memory: &dyn Memory,
+    ) -> Result<Self> {
+        use crate::models::loader::AufSource;
+        let source = AufSource::open(
+            &config.primary_source,
+            config.primary_variant_choice,
+            config.primary_dtype_choice,
+            config.primary_eos_override,
+        )?;
+        if config.secondary_source.is_some() {
+            eprintln!(
+                "[Deprecated] AUF primary + explicit secondary는 W-AUF-2 self-secondary 도입 시 \
+                 제거 예정입니다. 현재는 무시합니다 (--model-path foo.auf 단일 경로 권장)."
+            );
+        }
+        // W-AUF-1 C3 stub — W-AUF-2에서 resolve_secondary로 자동 활성.
+        let secondary_mmap: Option<Arc<crate::models::weights::SecondaryMmap>> = None;
+
+        let mut model =
+            crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
+        model.quant_noise = compute_quant_noise_for_model(&model);
         Ok(model)
     }
 
@@ -3643,5 +3688,80 @@ mod tests {
             &aos_bytes[..],
             "CPU_AOS: loaded bytes must match original AOS payload"
         );
+    }
+
+    /// W-AUF-1 C3: `load_from_config`이 `PrimaryFormat::Safetensors`에 대해
+    /// 명시 에러를 반환하는지 확인 (Safetensors는 `load_with_dtype`을 직접 호출).
+    #[test]
+    fn load_from_config_rejects_safetensors_primary() {
+        use crate::backend::cpu::CpuBackend;
+        use crate::memory::galloc::Galloc;
+        use crate::models::loader::{LoadConfig, PrimaryFormat};
+
+        let cfg = LoadConfig {
+            primary_source: std::path::PathBuf::from("/nonexistent.safetensors"),
+            primary_format: PrimaryFormat::Safetensors,
+            ..Default::default()
+        };
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+        let res = TransformerModel::load_from_config(&cfg, backend, &mem);
+        let err = res
+            .err()
+            .expect("Safetensors via load_from_config must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Safetensors") && msg.contains("load_with_dtype"),
+            "error must steer caller to load_with_dtype, got: {msg}"
+        );
+    }
+
+    /// W-AUF-1 C3: `resolve_secondary` stub은 W-AUF-2 도입 전까지 `None`만 반환한다.
+    #[test]
+    fn resolve_secondary_stub_returns_none() {
+        use crate::backend::cpu::CpuBackend;
+        use crate::models::loader::{LoadConfig, PrimaryFormat, TensorId, TensorSource};
+
+        struct DummySource;
+        impl TensorSource for DummySource {
+            fn config(&self) -> &crate::models::config::ModelConfig {
+                unimplemented!("not exercised by resolve_secondary stub")
+            }
+            fn load_tensor(
+                &self,
+                _id: &TensorId,
+                _is_weight: bool,
+                _backend: &Arc<dyn Backend>,
+                _memory: &dyn crate::core::memory::Memory,
+            ) -> Result<crate::core::tensor::Tensor> {
+                unimplemented!()
+            }
+            fn load_tensor_cpu(
+                &self,
+                _id: &TensorId,
+                _is_weight: bool,
+                _memory: &dyn crate::core::memory::Memory,
+            ) -> Result<crate::core::tensor::Tensor> {
+                unimplemented!()
+            }
+            fn has_tensor(&self, _id: &TensorId) -> bool {
+                false
+            }
+            fn weight_dtype(&self) -> DType {
+                DType::F16
+            }
+            fn cpu_backend(&self) -> Arc<dyn Backend> {
+                Arc::new(CpuBackend::new()) as Arc<dyn Backend>
+            }
+        }
+
+        let cfg = LoadConfig {
+            primary_format: PrimaryFormat::Auf,
+            ..Default::default()
+        };
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let src = DummySource;
+        let out = crate::models::loader::resolve_secondary(&cfg, &src, &backend).unwrap();
+        assert!(out.is_none(), "W-AUF-1 C3 stub must return None");
     }
 }

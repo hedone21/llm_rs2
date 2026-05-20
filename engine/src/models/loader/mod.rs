@@ -163,6 +163,28 @@ pub trait TensorSource {
     fn cpu_backend(&self) -> Arc<dyn Backend>;
 }
 
+/// Resolve the secondary mmap handle for a given `LoadConfig` + primary source.
+///
+/// Sprint 1 W-AUF-1 C3 stub: returns `None` unconditionally. The W-AUF-2
+/// rollout will:
+/// - prefer `cfg.secondary_source` (explicit override) when set,
+/// - otherwise auto-activate AUF self-secondary if the primary is AUF and
+///   carries a multi-dtype or multi-variant capability bit (and
+///   `!cfg.disable_self_secondary`),
+/// - otherwise return `None`.
+///
+/// The function is exposed so callers can centralise secondary policy without
+/// duplicating dispatch logic. The current GGUF path keeps its inline
+/// `open_secondary_with_backend` call inside `TransformerModel::load_gguf_from_config`
+/// because it needs the live `GgufFile` metadata reference.
+pub fn resolve_secondary(
+    _cfg: &LoadConfig,
+    _source: &dyn TensorSource,
+    _backend: &Arc<dyn Backend>,
+) -> Result<Option<Arc<crate::models::weights::SecondaryMmap>>> {
+    Ok(None)
+}
+
 /// Assemble a `TransformerModel` from a `TensorSource`.
 ///
 /// This function contains the layer-building loop and lm_head/embed logic
