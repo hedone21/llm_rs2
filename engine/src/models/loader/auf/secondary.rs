@@ -818,13 +818,8 @@ mod tests {
         let cfg = make_test_config();
 
         // primary_dtype = Q4_0 + secondary candidate = F16 → reject (정책: F16→Q4_0 단방향만).
-        let err = super::from_auf_self_secondary(
-            view,
-            BackendTag::CpuAos,
-            TensorDType::Q4_0,
-            &cfg,
-        )
-        .expect_err("Q4_0 primary + F16 secondary must be ReverseSwapRejected");
+        let err = super::from_auf_self_secondary(view, BackendTag::CpuAos, TensorDType::Q4_0, &cfg)
+            .expect_err("Q4_0 primary + F16 secondary must be ReverseSwapRejected");
         assert!(
             matches!(err, LoadError::ReverseSwapRejected { .. }),
             "expected ReverseSwapRejected, got {err:?}"
@@ -893,13 +888,8 @@ mod tests {
 
         let view = std::sync::Arc::new(open_from_bytes(bytes, BackendTag::CpuAos).unwrap());
         let cfg = make_test_config();
-        let err = super::from_auf_self_secondary(
-            view,
-            BackendTag::CpuAos,
-            TensorDType::Q4_0,
-            &cfg,
-        )
-        .expect_err("single-dtype self-secondary must fail (no swap candidate)");
+        let err = super::from_auf_self_secondary(view, BackendTag::CpuAos, TensorDType::Q4_0, &cfg)
+            .expect_err("single-dtype self-secondary must fail (no swap candidate)");
         let msg = format!("{err}");
         assert!(
             msg.contains("no swap candidates") || msg.contains("auf_tool build --dtypes"),
@@ -981,13 +971,9 @@ mod tests {
 
         let view = std::sync::Arc::new(open_from_bytes(bytes, BackendTag::AdrenoSoa).unwrap());
         let cfg = make_test_config();
-        let err = super::from_auf_self_secondary(
-            view,
-            BackendTag::AdrenoSoa,
-            TensorDType::Q4_0,
-            &cfg,
-        )
-        .expect_err("AdrenoSoa primary + F16 secondary must be rejected");
+        let err =
+            super::from_auf_self_secondary(view, BackendTag::AdrenoSoa, TensorDType::Q4_0, &cfg)
+                .expect_err("AdrenoSoa primary + F16 secondary must be rejected");
         assert!(
             matches!(err, LoadError::AdrenoSoaF16Rejected),
             "expected AdrenoSoaF16Rejected, got {err:?}"

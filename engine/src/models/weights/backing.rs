@@ -67,9 +67,9 @@ impl std::fmt::Debug for AufBacking {
 impl WeightSectionView for AufBacking {
     fn weights_bytes(&self) -> &[u8] {
         // `weights_range`가 Some이라는 invariant는 `AufView::open(_, concrete_tag)` 단계에서 검증된다.
-        self.view
-            .weights_bytes()
-            .expect("AufBacking: weights_bytes() must be Some (view opened with concrete BackendTag)")
+        self.view.weights_bytes().expect(
+            "AufBacking: weights_bytes() must be Some (view opened with concrete BackendTag)",
+        )
     }
     fn source_path(&self) -> &Path {
         &self.source_path

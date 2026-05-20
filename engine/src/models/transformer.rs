@@ -305,8 +305,7 @@ impl TransformerModel {
 
         // W-AUF-2 C3: resolve_secondary가 AUF self-secondary 자동 활성을 처리.
         // explicit secondary + AUF 조합은 함수 내부에서 명시 에러로 거부된다.
-        let secondary_mmap =
-            crate::models::loader::resolve_secondary(config, &source, &backend)?;
+        let secondary_mmap = crate::models::loader::resolve_secondary(config, &source, &backend)?;
 
         let mut model =
             crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
