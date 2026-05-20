@@ -66,8 +66,8 @@ impl CachePressureHandler for QuantizeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::kv_cache::KVCache;
-    use crate::core::pressure::PressureLevel;
+    use crate::pressure::PressureLevel;
+    use crate::pressure::kv_cache::KVCache;
 
     #[test]
     fn test_quantize_returns_noop() {

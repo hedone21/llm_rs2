@@ -14,14 +14,14 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::core::cache_manager::CacheManager;
-use crate::core::kv_cache::KVCache;
 use crate::core::rss_trace::{io_trace, rss_trace};
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::inference::skip_config::SkipConfig;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::pressure::cache_manager::CacheManager;
+use crate::pressure::kv_cache::KVCache;
 use crate::resilience::{CommandExecutor, KVSnapshot};
 use crate::session::cli::Args;
 use crate::shape::Shape;
@@ -78,7 +78,7 @@ pub struct PrefillOutput {
     pub tokens: Vec<u32>,
     pub start_pos: usize,
     pub profiler: Option<crate::profile::InferenceProfiler>,
-    pub variance_collector: Option<crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector>,
+    pub variance_collector: Option<crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
     pub importance_table_for_swap: Option<crate::qcf::ImportanceTable>,
     pub collector_armed: bool,
     pub deferred_switch: Option<String>,
@@ -169,15 +169,13 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
     // D2O layer-level allocation: create variance collector before prefill.
     // Only active when --eviction-policy d2o and --d2o-layer-alloc are both set.
     let mut variance_collector = if args.d2o_layer_alloc() && args.eviction_policy() == "d2o" {
-        Some(
-            crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector::new(
-                model.config.num_hidden_layers,
-                model.config.num_key_value_heads,
-                model.config.num_attention_heads,
-                model.config.head_dim,
-                tokens.len(),
-            ),
-        )
+        Some(crate::pressure::d2o_layer_alloc::D2OVarianceCollector::new(
+            model.config.num_hidden_layers,
+            model.config.num_key_value_heads,
+            model.config.num_attention_heads,
+            model.config.head_dim,
+            tokens.len(),
+        ))
     } else {
         None
     };
@@ -618,7 +616,7 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
                         let result = if evict.method == crate::resilience::EvictMethod::Streaming {
                             if let Some(ref sp) = evict.streaming_params {
                                 let policy =
-                                    crate::core::eviction::streaming_llm::StreamingLLMPolicy::new(
+                                    crate::pressure::eviction::streaming_llm::StreamingLLMPolicy::new(
                                         sp.sink_size,
                                         sp.window_size,
                                     );
@@ -626,7 +624,7 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
                                     &policy,
                                     &mut kv_caches,
                                     adjusted_ratio,
-                                    crate::core::cache_manager::ScoreContext::None,
+                                    crate::pressure::cache_manager::ScoreContext::None,
                                 )
                             } else {
                                 cache_manager.force_evict(&mut kv_caches, adjusted_ratio)
@@ -636,7 +634,7 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
                                 evict.method,
                                 &mut kv_caches,
                                 adjusted_ratio,
-                                crate::core::cache_manager::ScoreContext::None,
+                                crate::pressure::cache_manager::ScoreContext::None,
                             )
                         };
                         match result {

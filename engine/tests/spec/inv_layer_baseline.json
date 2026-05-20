@@ -1,5 +1,5 @@
 {
-  "description": "INV-LAYER-001~005 현재 위반 baseline (ARCHITECTURE.md §13.5). 마이그레이션 PR마다 줄어들 예정. Step 4-C: core/{sampling,skip_config,speculative,attention_scores} → inference/ top-level path rename. V-14/V-28 패턴에 inference:: 참조 추가.",
+  "description": "INV-LAYER-001~005 현재 위반 baseline (ARCHITECTURE.md §13.5). 마이그레이션 PR마다 줄어들 예정. Step 4-D: core/{cache_manager,kv_cache,kivi_cache,kv_migrate,eviction,pressure,offload} → pressure/ top-level path rename. V-10/V-12/V-13/V-14/V-15/V-21/V-24/V-28 패턴에 pressure:: 참조 갱신.",
   "generated": "2026-05-20",
   "total": 292,
   "violations": [
@@ -195,7 +195,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 14,
       "import": "crate::resilience::EvictMethod",
       "rule": "INV-LAYER-003",
@@ -204,7 +204,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1339,
       "import": "crate::resilience::EvictMethod::Sliding",
       "rule": "INV-LAYER-003",
@@ -213,7 +213,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1344,
       "import": "crate::resilience::EvictMethod::Sliding",
       "rule": "INV-LAYER-003",
@@ -222,7 +222,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1378,
       "import": "crate::resilience::EvictMethod::Sliding",
       "rule": "INV-LAYER-003",
@@ -231,7 +231,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1383,
       "import": "crate::resilience::EvictMethod::Sliding",
       "rule": "INV-LAYER-003",
@@ -240,7 +240,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1441,
       "import": "crate::resilience::EvictMethod::Sliding",
       "rule": "INV-LAYER-003",
@@ -249,7 +249,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1446,
       "import": "crate::resilience::EvictMethod::Sliding",
       "rule": "INV-LAYER-003",
@@ -258,7 +258,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1475,
       "import": "crate::resilience::EvictMethod::Sliding",
       "rule": "INV-LAYER-003",
@@ -267,7 +267,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1480,
       "import": "crate::resilience::EvictMethod::Sliding",
       "rule": "INV-LAYER-003",
@@ -276,7 +276,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1509,
       "import": "crate::resilience::EvictMethod::H2o",
       "rule": "INV-LAYER-003",
@@ -285,7 +285,7 @@
     },
     {
       "id": "V-10",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 1514,
       "import": "crate::resilience::EvictMethod::H2o",
       "rule": "INV-LAYER-003",
@@ -296,7 +296,7 @@
       "id": "V-12",
       "file": "core/events.rs",
       "line": 7,
-      "import": "crate::core::pressure::",
+      "import": "crate::pressure::",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
       "is_test_block": false
@@ -312,7 +312,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 20,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
@@ -322,7 +322,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 239,
       "import": "crate::qcf::QcfMetric",
       "rule": "INV-LAYER-003",
@@ -331,7 +331,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 392,
       "import": "crate::qcf::QcfMetric",
       "rule": "INV-LAYER-003",
@@ -340,7 +340,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 817,
       "import": "crate::qcf::QcfConfig::default",
       "rule": "INV-LAYER-003",
@@ -349,7 +349,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 818,
       "import": "crate::qcf::KiviFlushParams",
       "rule": "INV-LAYER-003",
@@ -358,7 +358,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 827,
       "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
@@ -367,7 +367,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 895,
       "import": "crate::qcf::QcfConfig::default",
       "rule": "INV-LAYER-003",
@@ -376,7 +376,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 896,
       "import": "crate::qcf::KiviFlushParams",
       "rule": "INV-LAYER-003",
@@ -385,7 +385,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 906,
       "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
@@ -394,7 +394,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 908,
       "import": "crate::qcf::compute_flush_opr",
       "rule": "INV-LAYER-003",
@@ -403,7 +403,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 918,
       "import": "crate::qcf::FlushAttentionParams",
       "rule": "INV-LAYER-003",
@@ -412,7 +412,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 933,
       "import": "crate::qcf::compute_flush_awqe",
       "rule": "INV-LAYER-003",
@@ -421,7 +421,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 936,
       "import": "crate::qcf::FlushAttentionParams",
       "rule": "INV-LAYER-003",
@@ -430,7 +430,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 951,
       "import": "crate::qcf::compute_flush_aw_vopr",
       "rule": "INV-LAYER-003",
@@ -439,7 +439,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1557,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
@@ -449,7 +449,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1661,
       "import": "crate::qcf::QcfConfig::default",
       "rule": "INV-LAYER-003",
@@ -458,7 +458,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1662,
       "import": "crate::qcf::KiviFlushParams",
       "rule": "INV-LAYER-003",
@@ -467,7 +467,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1672,
       "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
@@ -476,7 +476,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1674,
       "import": "crate::qcf::compute_flush_opr",
       "rule": "INV-LAYER-003",
@@ -485,7 +485,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1684,
       "import": "crate::qcf::FlushAttentionParams",
       "rule": "INV-LAYER-003",
@@ -494,7 +494,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1699,
       "import": "crate::qcf::compute_flush_awqe",
       "rule": "INV-LAYER-003",
@@ -503,7 +503,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1702,
       "import": "crate::qcf::FlushAttentionParams",
       "rule": "INV-LAYER-003",
@@ -512,7 +512,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1717,
       "import": "crate::qcf::compute_flush_aw_vopr",
       "rule": "INV-LAYER-003",
@@ -521,7 +521,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 1841,
       "import": "crate::backend::opencl::",
       "rule": "INV-LAYER-003",
@@ -531,7 +531,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 2106,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
@@ -541,7 +541,7 @@
     },
     {
       "id": "V-13",
-      "file": "core/kivi_cache.rs",
+      "file": "pressure/kivi_cache.rs",
       "line": 2416,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
@@ -551,29 +551,11 @@
     },
     {
       "id": "V-13",
-      "file": "core/pressure/mod.rs",
-      "line": 53,
+      "file": "pressure/mod.rs",
+      "line": 65,
       "import": "crate::qcf::QcfMetric",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "core/kivi_cache.rs",
-      "line": 803,
-      "import": "crate::profile::quality_metrics::Timer::start",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "core/kivi_cache.rs",
-      "line": 804,
-      "import": "crate::profile::quality_metrics::QCF_KV_DRYRUN",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
     },
     {
@@ -592,6 +574,24 @@
       "import": "crate::profile::quality_metrics::NLL",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-14",
+      "file": "pressure/kivi_cache.rs",
+      "line": 803,
+      "import": "crate::profile::quality_metrics::Timer::start",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-14",
+      "file": "pressure/kivi_cache.rs",
+      "line": 804,
+      "import": "crate::profile::quality_metrics::QCF_KV_DRYRUN",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
     },
     {
@@ -650,7 +650,7 @@
     },
     {
       "id": "V-15",
-      "file": "core/cache_manager.rs",
+      "file": "pressure/cache_manager.rs",
       "line": 669,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
@@ -660,7 +660,7 @@
     },
     {
       "id": "V-15",
-      "file": "core/eviction/h2o.rs",
+      "file": "pressure/eviction/h2o.rs",
       "line": 187,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
@@ -670,7 +670,7 @@
     },
     {
       "id": "V-15",
-      "file": "core/eviction/h2o_plus.rs",
+      "file": "pressure/eviction/h2o_plus.rs",
       "line": 177,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
@@ -680,7 +680,7 @@
     },
     {
       "id": "V-15",
-      "file": "core/eviction/no_eviction.rs",
+      "file": "pressure/eviction/no_eviction.rs",
       "line": 38,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
@@ -690,7 +690,7 @@
     },
     {
       "id": "V-15",
-      "file": "core/eviction/sliding_window.rs",
+      "file": "pressure/eviction/sliding_window.rs",
       "line": 98,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
@@ -700,7 +700,7 @@
     },
     {
       "id": "V-15",
-      "file": "core/eviction/streaming_llm.rs",
+      "file": "pressure/eviction/streaming_llm.rs",
       "line": 89,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
@@ -1259,8 +1259,8 @@
     {
       "id": "V-21",
       "file": "models/transformer.rs",
-      "line": 8,
-      "import": "crate::core::offload::preload_pool::",
+      "line": 7,
+      "import": "crate::pressure::offload::preload_pool::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -1366,7 +1366,7 @@
     },
     {
       "id": "V-24",
-      "file": "core/pressure/weight_swap_handler.rs",
+      "file": "pressure/weight_swap_handler.rs",
       "line": 21,
       "import": "crate::models::config::ModelConfig",
       "rule": "INV-LAYER-003",
@@ -1375,7 +1375,7 @@
     },
     {
       "id": "V-24",
-      "file": "core/pressure/weight_swap_handler.rs",
+      "file": "pressure/weight_swap_handler.rs",
       "line": 22,
       "import": "crate::models::weights::swap_executor::SwapExecutor",
       "rule": "INV-LAYER-003",
@@ -1384,7 +1384,7 @@
     },
     {
       "id": "V-24",
-      "file": "core/pressure/weight_swap_handler.rs",
+      "file": "pressure/weight_swap_handler.rs",
       "line": 23,
       "import": "crate::models::weights::",
       "rule": "INV-LAYER-003",
@@ -1393,7 +1393,7 @@
     },
     {
       "id": "V-24",
-      "file": "core/pressure/weight_swap_handler.rs",
+      "file": "pressure/weight_swap_handler.rs",
       "line": 136,
       "import": "crate::models::config::ModelConfig",
       "rule": "INV-LAYER-003",
@@ -1402,7 +1402,7 @@
     },
     {
       "id": "V-24",
-      "file": "core/pressure/weight_swap_handler.rs",
+      "file": "pressure/weight_swap_handler.rs",
       "line": 175,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
@@ -1412,7 +1412,7 @@
     },
     {
       "id": "V-24",
-      "file": "core/pressure/weight_swap_handler.rs",
+      "file": "pressure/weight_swap_handler.rs",
       "line": 192,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
@@ -1472,7 +1472,7 @@
       "id": "V-28",
       "file": "eval/eval_loop.rs",
       "line": 14,
-      "import": "crate::core::kv_cache::KVCacheOps",
+      "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
       "is_test_block": false
@@ -1526,16 +1526,16 @@
       "id": "V-28",
       "file": "eval/eviction_hook.rs",
       "line": 8,
-      "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
+      "import": "crate::pressure::cache_manager::CacheManager",
       "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
+      "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
       "is_test_block": false
     },
     {
       "id": "V-28",
       "file": "eval/eviction_hook.rs",
       "line": 9,
-      "import": "crate::core::cache_manager::CacheManager",
+      "import": "crate::pressure::kv_cache::",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
       "is_test_block": false
@@ -1544,9 +1544,9 @@
       "id": "V-28",
       "file": "eval/eviction_hook.rs",
       "line": 10,
-      "import": "crate::core::kv_cache::",
+      "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
       "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
+      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
       "is_test_block": false
     },
     {
@@ -1562,7 +1562,16 @@
       "id": "V-28",
       "file": "eval/eviction_hook.rs",
       "line": 706,
-      "import": "crate::core::cache_manager::CacheManager",
+      "import": "crate::pressure::cache_manager::CacheManager",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
+      "is_test_block": true
+    },
+    {
+      "id": "V-28",
+      "file": "eval/eviction_hook.rs",
+      "line": 707,
+      "import": "crate::pressure::eviction::no_eviction::NoEvictionPolicy",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
       "is_test_block": true
@@ -1580,24 +1589,15 @@
       "id": "V-28",
       "file": "eval/hook.rs",
       "line": 7,
-      "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
+      "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
+      "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
       "is_test_block": false
     },
     {
       "id": "V-28",
       "file": "eval/hook.rs",
       "line": 8,
-      "import": "crate::core::kv_cache::KVCacheOps",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-28",
-      "file": "eval/kivi_hook.rs",
-      "line": 12,
       "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
@@ -1606,10 +1606,19 @@
     {
       "id": "V-28",
       "file": "eval/kivi_hook.rs",
-      "line": 13,
-      "import": "crate::core::kivi_cache::KiviCache",
+      "line": 12,
+      "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-28",
+      "file": "eval/kivi_hook.rs",
+      "line": 13,
+      "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
       "is_test_block": false
     },
     {
@@ -1643,7 +1652,7 @@
       "id": "V-28",
       "file": "eval/kivi_hook.rs",
       "line": 246,
-      "import": "crate::core::kivi_cache::KiviCache",
+      "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
       "is_test_block": true
@@ -1724,16 +1733,16 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 5,
-      "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
+      "import": "crate::pressure::cache_manager::CacheManager",
       "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
+      "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
     },
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 6,
-      "import": "crate::core::cache_manager::CacheManager",
+      "line": 7,
+      "import": "crate::pressure::eviction::h2o::H2OPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1742,7 +1751,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 8,
-      "import": "crate::core::eviction::h2o::H2OPolicy",
+      "import": "crate::pressure::eviction::h2o_plus::H2OPlusPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1751,7 +1760,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 9,
-      "import": "crate::core::eviction::h2o_plus::H2OPlusPolicy",
+      "import": "crate::pressure::eviction::no_eviction::NoEvictionPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1760,7 +1769,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 10,
-      "import": "crate::core::eviction::no_eviction::NoEvictionPolicy",
+      "import": "crate::pressure::eviction::sliding_window::SlidingWindowPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1769,7 +1778,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 11,
-      "import": "crate::core::eviction::sliding_window::SlidingWindowPolicy",
+      "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1777,10 +1786,10 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 12,
-      "import": "crate::core::kivi_cache::KiviCache",
+      "line": 17,
+      "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
       "rule": "INV-LAYER-005",
-      "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
+      "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
       "is_test_block": false
     },
     {
@@ -1850,7 +1859,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 864,
-      "import": "crate::core::eviction::StreamingLLMPolicy",
+      "import": "crate::pressure::eviction::StreamingLLMPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1886,7 +1895,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 3355,
-      "import": "crate::core::eviction::StreamingLLMPolicy",
+      "import": "crate::pressure::eviction::StreamingLLMPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1913,7 +1922,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 4792,
-      "import": "crate::core::kv_cache::KVCacheOps",
+      "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1931,7 +1940,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 5392,
-      "import": "crate::core::kv_cache::KVCacheOps",
+      "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1940,7 +1949,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 5393,
-      "import": "crate::core::offload::OffloadKVCache",
+      "import": "crate::pressure::offload::OffloadKVCache",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -1949,7 +1958,7 @@
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 5394,
-      "import": "crate::core::offload::raw_store::RawStore",
+      "import": "crate::pressure::offload::raw_store::RawStore",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
@@ -2041,7 +2050,7 @@
       "id": "V-??",
       "file": "backend/opencl/mod.rs",
       "line": 7169,
-      "import": "crate::core::kv_cache::KVCache",
+      "import": "crate::pressure::kv_cache::KVCache",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-pressure (역방향 import)",
       "is_test_block": true
@@ -2068,7 +2077,7 @@
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
       "line": 1235,
-      "import": "crate::core::kv_cache::KVCacheOps",
+      "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-pressure (역방향 import)",
       "is_test_block": false
@@ -2100,93 +2109,6 @@
       "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
       "is_test_block": false,
       "note": "V-01 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "core/cache_manager.rs",
-      "line": 6,
-      "import": "crate::core::events::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "core/cache_manager.rs",
-      "line": 13,
-      "import": "crate::core::sys_monitor::SystemMonitor",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "core/cache_manager.rs",
-      "line": 673,
-      "import": "crate::core::sys_monitor::MemoryStats",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "core/kv_cache.rs",
-      "line": 1212,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
-      "is_test_block": true,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "core/offload/mod.rs",
-      "line": 17,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "core/pressure/d2o_handler.rs",
-      "line": 828,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "core/pressure/eviction_handler.rs",
-      "line": 115,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "core/pressure/mod.rs",
-      "line": 211,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
-      "is_test_block": true,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "core/pressure/swap_handler.rs",
-      "line": 396,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
-      "is_test_block": true,
-      "note": "downcast 패턴"
     },
     {
       "id": "V-??",
@@ -2236,15 +2158,6 @@
     {
       "id": "V-??",
       "file": "eval/eviction_hook.rs",
-      "line": 707,
-      "import": "crate::core::eviction::no_eviction::NoEvictionPolicy",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
-      "is_test_block": true
-    },
-    {
-      "id": "V-??",
-      "file": "eval/eviction_hook.rs",
       "line": 745,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-004",
@@ -2264,7 +2177,7 @@
       "id": "V-??",
       "file": "layers/llama_layer.rs",
       "line": 14,
-      "import": "crate::core::kv_cache::KVCache",
+      "import": "crate::pressure::kv_cache::KVCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2273,7 +2186,7 @@
       "id": "V-??",
       "file": "layers/llama_layer.rs",
       "line": 17,
-      "import": "crate::core::kv_cache::KVCache",
+      "import": "crate::pressure::kv_cache::KVCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2292,7 +2205,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 63,
-      "import": "crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector",
+      "import": "crate::pressure::d2o_layer_alloc::D2OVarianceCollector",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2301,7 +2214,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 187,
-      "import": "crate::core::kv_cache::KVLayout",
+      "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2310,7 +2223,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 277,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2319,7 +2232,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 380,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2328,7 +2241,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 416,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2337,7 +2250,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 471,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2346,7 +2259,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 875,
-      "import": "crate::core::kv_cache::KVLayout",
+      "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2355,7 +2268,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 940,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2364,7 +2277,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 1047,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2373,7 +2286,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 1077,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2382,7 +2295,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward.rs",
       "line": 1129,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2391,7 +2304,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
       "line": 371,
-      "import": "crate::core::kv_cache::KVLayout",
+      "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2400,7 +2313,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
       "line": 1775,
-      "import": "crate::core::kv_cache::KVLayout",
+      "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2409,7 +2322,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
       "line": 1789,
-      "import": "crate::core::kv_cache::KVLayout::HeadMajor",
+      "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2418,7 +2331,7 @@
       "id": "V-??",
       "file": "layers/transformer_layer/mod.rs",
       "line": 8,
-      "import": "crate::core::kv_cache::",
+      "import": "crate::pressure::kv_cache::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2456,8 +2369,8 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 7,
-      "import": "crate::core::kv_cache::",
+      "line": 6,
+      "import": "crate::pressure::kv_cache::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2466,7 +2379,7 @@
       "id": "V-??",
       "file": "models/transformer.rs",
       "line": 171,
-      "import": "crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector",
+      "import": "crate::pressure::d2o_layer_alloc::D2OVarianceCollector",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2524,7 +2437,7 @@
       "id": "V-??",
       "file": "models/transformer.rs",
       "line": 1950,
-      "import": "crate::core::kv_cache::KVLayout",
+      "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2533,7 +2446,7 @@
       "id": "V-??",
       "file": "models/transformer.rs",
       "line": 2512,
-      "import": "crate::core::kivi_cache::KiviCache",
+      "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2542,7 +2455,7 @@
       "id": "V-??",
       "file": "models/transformer.rs",
       "line": 2688,
-      "import": "crate::core::kivi_cache::KiviCache",
+      "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2551,7 +2464,7 @@
       "id": "V-??",
       "file": "models/transformer.rs",
       "line": 2729,
-      "import": "crate::core::kv_cache::PrefetchableCache",
+      "import": "crate::pressure::kv_cache::PrefetchableCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2560,7 +2473,7 @@
       "id": "V-??",
       "file": "models/transformer.rs",
       "line": 2732,
-      "import": "crate::core::offload::prefetch::PrefetchController",
+      "import": "crate::pressure::offload::prefetch::PrefetchController",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -2716,9 +2629,96 @@
     },
     {
       "id": "V-??",
+      "file": "pressure/cache_manager.rs",
+      "line": 6,
+      "import": "crate::core::events::",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "pressure/cache_manager.rs",
+      "line": 13,
+      "import": "crate::core::sys_monitor::SystemMonitor",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "pressure/cache_manager.rs",
+      "line": 673,
+      "import": "crate::core::sys_monitor::MemoryStats",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "pressure/d2o_handler.rs",
+      "line": 828,
+      "import": "crate::backend::cpu::CpuBackend",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
+      "is_test_block": false,
+      "note": "downcast 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "pressure/eviction_handler.rs",
+      "line": 115,
+      "import": "crate::backend::cpu::CpuBackend",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
+      "is_test_block": false,
+      "note": "downcast 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "pressure/kv_cache.rs",
+      "line": 1212,
+      "import": "crate::backend::cpu::CpuBackend",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
+      "is_test_block": true,
+      "note": "downcast 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "pressure/mod.rs",
+      "line": 223,
+      "import": "crate::backend::cpu::CpuBackend",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
+      "is_test_block": true,
+      "note": "downcast 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "pressure/offload/mod.rs",
+      "line": 17,
+      "import": "crate::backend::cpu::CpuBackend",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
+      "is_test_block": false,
+      "note": "downcast 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "pressure/swap_handler.rs",
+      "line": 396,
+      "import": "crate::backend::cpu::CpuBackend",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→L1 (backend impl 직접 의존)",
+      "is_test_block": true,
+      "note": "downcast 패턴"
+    },
+    {
+      "id": "V-??",
       "file": "qcf/qcf_kv.rs",
       "line": 37,
-      "import": "crate::core::kv_cache::",
+      "import": "crate::pressure::kv_cache::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false

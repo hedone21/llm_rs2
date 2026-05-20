@@ -9,9 +9,6 @@ use tokenizers::Tokenizer;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::core::cache_manager::CacheManager;
-use crate::core::kivi_cache::KiviCache;
-use crate::core::kv_cache::KVCache;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::{self};
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
@@ -19,6 +16,9 @@ use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
 use crate::models::transformer::TransformerModelForwardArgs;
+use crate::pressure::cache_manager::CacheManager;
+use crate::pressure::kivi_cache::KiviCache;
+use crate::pressure::kv_cache::KVCache;
 use crate::session::cli::Args;
 use crate::session::ppl::args::PplResult;
 use crate::session::ppl::args::PplRunCtx;
@@ -248,7 +248,7 @@ pub fn run_kivi_ppl(
     residual_size: usize,
     text_file: &str,
 ) -> anyhow::Result<()> {
-    use crate::core::kv_cache::KVCacheOps;
+    use crate::pressure::kv_cache::KVCacheOps;
 
     let hidden_size = model.config.hidden_size;
     let vocab_size = model.config.vocab_size;

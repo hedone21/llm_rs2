@@ -1,5 +1,5 @@
 use super::EvictionPolicy;
-use crate::core::kv_cache::KVCache;
+use crate::pressure::kv_cache::KVCache;
 use anyhow::Result;
 
 /// StreamingLLM eviction policy (Xiao et al., ICLR 2024).
@@ -259,7 +259,7 @@ mod tests {
         // target_len=15 >= keep_size=10, so default behavior: compacts to 10
         assert_eq!(cache_s.current_pos, 10);
 
-        use crate::core::eviction::SlidingWindowPolicy;
+        use crate::pressure::eviction::SlidingWindowPolicy;
         let sliding = SlidingWindowPolicy::new(6, 4);
         let mut cache_sl = make_cache_with_data(20);
         sliding.evict(&mut cache_sl, 15).unwrap();

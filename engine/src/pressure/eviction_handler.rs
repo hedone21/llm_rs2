@@ -4,7 +4,7 @@
 //! work seamlessly inside a `CachePressurePipeline`.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
-use crate::core::eviction::EvictionPolicy;
+use crate::pressure::eviction::EvictionPolicy;
 use anyhow::Result;
 
 /// Minimum number of tokens that must be evicted to justify compaction overhead.
@@ -114,12 +114,12 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
-    use crate::core::eviction::h2o::H2OPolicy;
-    use crate::core::eviction::no_eviction::NoEvictionPolicy;
-    use crate::core::eviction::sliding_window::SlidingWindowPolicy;
-    use crate::core::kv_cache::KVCache;
-    use crate::core::pressure::PressureLevel;
     use crate::memory::host::shared::SharedBuffer;
+    use crate::pressure::PressureLevel;
+    use crate::pressure::eviction::h2o::H2OPolicy;
+    use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
+    use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
+    use crate::pressure::kv_cache::KVCache;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;

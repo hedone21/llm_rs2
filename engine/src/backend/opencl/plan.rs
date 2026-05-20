@@ -1232,7 +1232,7 @@ impl FullKernelPlan {
     /// Returns `Err(PlanInvalidated)` if KV cache capacity changed or if
     /// `TransformerModel::ratio_generation` has advanced since plan build
     /// (ENG-ALG-219 global weight-swap invalidation, INV-129).
-    pub fn execute<C: crate::core::kv_cache::KVCacheOps>(
+    pub fn execute<C: crate::pressure::kv_cache::KVCacheOps>(
         &self,
         backend: &crate::backend::opencl::OpenCLBackend,
         start_pos: usize,

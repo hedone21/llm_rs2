@@ -132,7 +132,7 @@ impl Drop for PreloadPool {
 ///
 /// # Safety
 /// `ptr` must point to a valid, properly aligned `C: PrefetchableCache`.
-pub unsafe fn preload_erased<C: crate::core::kv_cache::PrefetchableCache>(
+pub unsafe fn preload_erased<C: crate::pressure::kv_cache::PrefetchableCache>(
     ptr: *mut (),
 ) -> Result<()> {
     unsafe { (*(ptr as *mut C)).preload() }

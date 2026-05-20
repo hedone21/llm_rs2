@@ -1,4 +1,4 @@
-use crate::core::kv_cache::KVCache;
+use crate::pressure::kv_cache::KVCache;
 use anyhow::Result;
 
 /// Trait for KV cache eviction strategies.

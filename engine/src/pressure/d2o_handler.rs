@@ -13,7 +13,7 @@
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
 use crate::buffer::DType;
-use crate::core::kv_cache::{KVCache, max_cache_pos};
+use crate::pressure::kv_cache::{KVCache, max_cache_pos};
 use crate::quant::{BlockQ4_0, QK4_0};
 use anyhow::Result;
 use half::f16;
@@ -827,9 +827,9 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
-    use crate::core::kv_cache::KVLayout;
-    use crate::core::pressure::PressureLevel;
     use crate::memory::host::shared::SharedBuffer;
+    use crate::pressure::PressureLevel;
+    use crate::pressure::kv_cache::KVLayout;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;

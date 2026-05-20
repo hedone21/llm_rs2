@@ -4,7 +4,7 @@
 //! eviction triggers, score snapshots) and an `EventSink` trait for consumers.
 //! Default `NoOpSink` is zero-cost when observability is not needed.
 
-use crate::core::pressure::{ActionResult, PressureLevel};
+use crate::pressure::{ActionResult, PressureLevel};
 
 // ── Event types ──────────────────────────────────────────────
 

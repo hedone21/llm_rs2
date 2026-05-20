@@ -1,5 +1,5 @@
 use super::EvictionPolicy;
-use crate::core::kv_cache::KVCache;
+use crate::pressure::kv_cache::KVCache;
 use anyhow::Result;
 
 /// H2O+ (GQA-Aware Per-Head Eviction) — extends H2O with per-KV-head token selection.
@@ -176,8 +176,8 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
-    use crate::core::kv_cache::KVLayout;
     use crate::memory::host::shared::SharedBuffer;
+    use crate::pressure::kv_cache::KVLayout;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;

@@ -9,8 +9,8 @@
 //! each prefill and decode step.
 
 use super::hook::{CacheSnapshot, PostStepResult, StepHook};
-use crate::core::kivi_cache::KiviCache;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::pressure::kivi_cache::KiviCache;
 
 /// KiviCache snapshot for choice-level restore.
 ///
@@ -243,7 +243,7 @@ impl StepHook<KiviCache> for KiviHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::kivi_cache::KiviCache;
+    use crate::pressure::kivi_cache::KiviCache;
     use crate::qcf::QcfConfig;
 
     fn make_hook() -> KiviHook {

@@ -368,7 +368,7 @@ impl TransformerLayer {
         let t = prof_start!();
         let tr = tr_start!(KvUpdate);
         let kv_dtype = kv_cache.kv_dtype();
-        use crate::core::kv_cache::KVLayout;
+        use crate::pressure::kv_cache::KVLayout;
         if kv_dtype == DType::F16 && is_gpu && is_decode && kv_cache.layout() == KVLayout::HeadMajor
         {
             // GPU F16 HeadMajor: fused cast+scatter kernel (1 dispatch instead of 2+16)
@@ -1772,7 +1772,7 @@ impl TransformerLayer {
         head_dim: usize,
         cache_seq_len: usize,
         kv_start_pos: usize,
-        layout: crate::core::kv_cache::KVLayout,
+        layout: crate::pressure::kv_cache::KVLayout,
         capacity: usize,
         need_scores: bool,
         backend: &Arc<dyn Backend>,
@@ -1786,7 +1786,7 @@ impl TransformerLayer {
         let blocks_per_row = head_dim / QK4_0;
         let scale = 1.0 / (head_dim as f32).sqrt();
         let n_rep = n_heads_q / n_heads_kv;
-        let is_head_major = layout == crate::core::kv_cache::KVLayout::HeadMajor;
+        let is_head_major = layout == crate::pressure::kv_cache::KVLayout::HeadMajor;
 
         // 1. Read Q (F32) from GPU
         let mut q_data = vec![0.0f32; q.size() / 4];

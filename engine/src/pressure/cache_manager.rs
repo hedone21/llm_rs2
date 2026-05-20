@@ -4,13 +4,13 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::core::events::{CacheEvent, EventSink, NoOpSink};
-use crate::core::eviction::EvictionPolicy;
-use crate::core::kv_cache::{KVCache, max_cache_pos};
-use crate::core::pressure::{
+use crate::core::sys_monitor::SystemMonitor;
+use crate::pressure::eviction::EvictionPolicy;
+use crate::pressure::kv_cache::{KVCache, max_cache_pos};
+use crate::pressure::{
     ActionResult, CachePressurePipeline, EvictionHandler, HandlerContext, MIN_EVICT_TOKENS,
     PressureLevel, PressureStageConfig, SwapHandler,
 };
-use crate::core::sys_monitor::SystemMonitor;
 use crate::resilience::EvictMethod;
 use std::path::PathBuf;
 
@@ -668,10 +668,10 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
-    use crate::core::eviction::no_eviction::NoEvictionPolicy;
-    use crate::core::eviction::sliding_window::SlidingWindowPolicy;
     use crate::core::sys_monitor::MemoryStats;
     use crate::memory::host::shared::SharedBuffer;
+    use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
+    use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;
@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn test_maybe_evict_with_scores_triggers() {
-        use crate::core::eviction::h2o::H2OPolicy;
+        use crate::pressure::eviction::h2o::H2OPolicy;
 
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let cm = CacheManager::new(
@@ -876,7 +876,7 @@ mod tests {
     fn test_force_evict_bypasses_should_evict() {
         // H2O's should_evict() always returns false, but force_evict must still work.
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::core::eviction::h2o::H2OPolicy;
+        use crate::pressure::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
             Box::new(H2OPolicy::new(0.3, 0)),
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn test_force_evict_with_scores_bypasses_checks() {
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::core::eviction::h2o::H2OPolicy;
+        use crate::pressure::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
             Box::new(H2OPolicy::new(0.3, 0)),
@@ -946,7 +946,7 @@ mod tests {
     fn test_force_evict_ratio_clamping() {
         // target_ratio=0.0 clamps to 0.1 inside EvictionHandler.
         // pos=100, target_len=100*0.1=10, tokens_to_remove=90 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::core::eviction::h2o::H2OPolicy;
+        use crate::pressure::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
             Box::new(H2OPolicy::new(0.5, 0)),
@@ -998,7 +998,7 @@ mod tests {
     #[test]
     fn test_pipeline_manager_evicts_at_pressure() {
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::core::pressure::{
+        use crate::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_manager_no_action_at_normal() {
-        use crate::core::pressure::{
+        use crate::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn test_pipeline_manager_force_evict() {
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::core::pressure::{
+        use crate::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
@@ -1092,8 +1092,8 @@ mod tests {
     #[test]
     fn test_pipeline_manager_force_evict_with_scores() {
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::core::eviction::h2o::H2OPolicy;
-        use crate::core::pressure::{
+        use crate::pressure::eviction::h2o::H2OPolicy;
+        use crate::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
@@ -1125,8 +1125,8 @@ mod tests {
     #[test]
     fn test_pipeline_manager_with_scores() {
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::core::eviction::h2o::H2OPolicy;
-        use crate::core::pressure::{
+        use crate::pressure::eviction::h2o::H2OPolicy;
+        use crate::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_manager_policy_name() {
-        use crate::core::pressure::{
+        use crate::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
@@ -1202,7 +1202,7 @@ mod tests {
     fn test_pipeline_manager_multi_level_graduated_response() {
         // Use pos=100 and ratios that produce tokens_to_remove >= MIN_EVICT_TOKENS(64).
         // Warning: ratio=0.3 → remove 70. Critical: additional ratio=0.1 → further removal.
-        use crate::core::pressure::{
+        use crate::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
@@ -1280,7 +1280,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_manager_empty_pipeline() {
-        use crate::core::pressure::CachePressurePipeline;
+        use crate::pressure::CachePressurePipeline;
 
         let pipeline = CachePressurePipeline::new(vec![]);
         let cm = CacheManager::with_pipeline(
@@ -1297,7 +1297,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_manager_monitor_error_skips() {
-        use crate::core::pressure::{
+        use crate::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
@@ -1398,7 +1398,7 @@ mod tests {
 
     #[test]
     fn test_resilience_streaming_keeps_sink_plus_window() {
-        use crate::core::eviction::StreamingLLMPolicy;
+        use crate::pressure::eviction::StreamingLLMPolicy;
 
         // Streaming with sink=4, window=20 should keep exactly 24 tokens.
         let policy = StreamingLLMPolicy::new(4, 20);
@@ -1493,7 +1493,7 @@ mod tests {
 
     #[test]
     fn test_resilience_h2o_eviction_respects_keep_ratio() {
-        use crate::core::eviction::h2o::H2OPolicy;
+        use crate::pressure::eviction::h2o::H2OPolicy;
 
         // H2O with protected_prefix=4, keep_ratio=0.5 on 80 tokens.
         // target_ratio=0.2 → target_len=16, tokens_to_remove=64 == MIN_EVICT_TOKENS → guard does not fire.

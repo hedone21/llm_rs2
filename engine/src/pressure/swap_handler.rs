@@ -16,7 +16,7 @@
 
 use super::{ActionResult, CachePressureHandler, HandlerContext, PressureLevel};
 use crate::buffer::DType;
-use crate::core::kv_cache::{KVCache, KVLayout};
+use crate::pressure::kv_cache::{KVCache, KVLayout};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -297,7 +297,7 @@ impl SwapHandler {
             // cache had grown just enough to fit decode after offload but
             // not enough to hold offloaded + current (e.g. offload 20, then
             // decode 49 tokens → capacity=64 < 49 + 20 = 69).
-            use crate::core::kv_cache::KVCacheOps;
+            use crate::pressure::kv_cache::KVCacheOps;
             if let Err(e) = cache.ensure_capacity(existing + count) {
                 eprintln!(
                     "[SwapHandler] recall for layer {}: grow to {} failed: {}; skipping",
@@ -395,9 +395,9 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
-    use crate::core::kv_cache::{KVCache, KVLayout};
-    use crate::core::pressure::PressureLevel;
     use crate::memory::host::shared::SharedBuffer;
+    use crate::pressure::PressureLevel;
+    use crate::pressure::kv_cache::{KVCache, KVLayout};
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;

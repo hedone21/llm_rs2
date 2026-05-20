@@ -59,9 +59,7 @@ impl TransformerLayer {
         local_attn_window: Option<usize>,
         prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
         layer_idx: usize,
-        mut variance_collector: Option<
-            &mut crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector,
-        >,
+        mut variance_collector: Option<&mut crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
         mut profiler: Option<&mut crate::profile::ops::PrefillOpProfiler>,
     ) -> Result<()> {
         let q_dim = self.wq.shape().dims()[0];
@@ -184,7 +182,7 @@ impl TransformerLayer {
             let kv_dtype = kv_cache.kv_dtype();
             {
                 let t = pf_start!();
-                use crate::core::kv_cache::KVLayout;
+                use crate::pressure::kv_cache::KVLayout;
                 if kv_dtype == DType::F16
                     && is_gpu
                     && kv_cache.layout() == KVLayout::HeadMajor
@@ -274,7 +272,7 @@ impl TransformerLayer {
                     head_dim,
                     kv_capacity,
                     batch_size,
-                    kv_layout == crate::core::kv_cache::KVLayout::HeadMajor,
+                    kv_layout == crate::pressure::kv_cache::KVLayout::HeadMajor,
                 )?;
                 if dispatched {
                     pf_record!(t, flash_prefill_gpu);
@@ -377,7 +375,8 @@ impl TransformerLayer {
                         (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
                     } else if k_cache.dtype() == DType::Q4_0 {
                         use crate::quant::{BlockQ4_0, QK4_0};
-                        let n_elems = if kv_layout == crate::core::kv_cache::KVLayout::HeadMajor {
+                        let n_elems = if kv_layout == crate::pressure::kv_cache::KVLayout::HeadMajor
+                        {
                             n_heads_kv * kv_capacity * head_dim
                         } else {
                             cache_seq_len * n_heads_kv * head_dim
@@ -413,7 +412,8 @@ impl TransformerLayer {
                             ws.out_attn.as_mut_slice::<f32>(),
                         )
                     } else if k_cache.dtype() == DType::F16 {
-                        let n_elems = if kv_layout == crate::core::kv_cache::KVLayout::HeadMajor {
+                        let n_elems = if kv_layout == crate::pressure::kv_cache::KVLayout::HeadMajor
+                        {
                             n_heads_kv * kv_capacity * head_dim
                         } else {
                             cache_seq_len * n_heads_kv * head_dim
@@ -468,7 +468,8 @@ impl TransformerLayer {
                     }
 
                     use crate::layers::attention::flash_attention_forward_strided;
-                    let is_head_major_pf = kv_layout == crate::core::kv_cache::KVLayout::HeadMajor;
+                    let is_head_major_pf =
+                        kv_layout == crate::pressure::kv_cache::KVLayout::HeadMajor;
                     let chunk_q_stride = seq_len * n_heads_q * head_dim;
                     let chunk_out_stride = seq_len * n_heads_q * head_dim;
                     let chunk_k_stride = kv_capacity * n_heads_kv * head_dim;
@@ -872,7 +873,7 @@ impl TransformerLayer {
         let kv_dtype = kv_cache.kv_dtype();
         {
             let t = pf_start!();
-            use crate::core::kv_cache::KVLayout;
+            use crate::pressure::kv_cache::KVLayout;
             if kv_dtype == DType::F16
                 && is_gpu
                 && kv_cache.layout() == KVLayout::HeadMajor
@@ -937,7 +938,7 @@ impl TransformerLayer {
                 head_dim,
                 kv_capacity,
                 batch_size,
-                kv_layout == crate::core::kv_cache::KVLayout::HeadMajor,
+                kv_layout == crate::pressure::kv_cache::KVLayout::HeadMajor,
             )?;
             if dispatched {
                 pf_record!(t, flash_prefill_gpu);
@@ -1044,7 +1045,7 @@ impl TransformerLayer {
                     // Q4_0: dequantize KV cache to F32 temp buffers
                     use crate::quant::{BlockQ4_0, QK4_0};
                     // HeadMajor: need full buffer (heads are non-contiguous)
-                    let n_elems = if kv_layout == crate::core::kv_cache::KVLayout::HeadMajor {
+                    let n_elems = if kv_layout == crate::pressure::kv_cache::KVLayout::HeadMajor {
                         n_heads_kv * kv_capacity * head_dim
                     } else {
                         cache_seq_len * n_heads_kv * head_dim
@@ -1074,7 +1075,7 @@ impl TransformerLayer {
                 } else if k_cache.dtype() == DType::F16 {
                     // F16: convert KV cache to F32 temp buffers using NEON bulk conversion
                     // HeadMajor: need full buffer (heads are non-contiguous)
-                    let n_elems = if kv_layout == crate::core::kv_cache::KVLayout::HeadMajor {
+                    let n_elems = if kv_layout == crate::pressure::kv_cache::KVLayout::HeadMajor {
                         n_heads_kv * kv_capacity * head_dim
                     } else {
                         cache_seq_len * n_heads_kv * head_dim
@@ -1126,7 +1127,7 @@ impl TransformerLayer {
 
                 use crate::layers::attention::flash_attention_forward_strided;
 
-                let is_head_major_pf = kv_layout == crate::core::kv_cache::KVLayout::HeadMajor;
+                let is_head_major_pf = kv_layout == crate::pressure::kv_cache::KVLayout::HeadMajor;
 
                 let chunk_q_stride = seq_len * n_heads_q * head_dim;
                 let chunk_out_stride = seq_len * n_heads_q * head_dim;

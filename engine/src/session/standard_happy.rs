@@ -10,10 +10,10 @@ use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::core::kv_cache::KVCache;
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
+use crate::pressure::kv_cache::KVCache;
 use crate::session::assembly::build_standard_loop;
 use crate::session::cli::Args;
 

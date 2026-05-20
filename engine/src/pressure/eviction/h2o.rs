@@ -1,5 +1,5 @@
 use super::EvictionPolicy;
-use crate::core::kv_cache::KVCache;
+use crate::pressure::kv_cache::KVCache;
 use anyhow::Result;
 
 /// H2O (Heavy-Hitter Oracle) eviction policy — attention score-based KV cache eviction.

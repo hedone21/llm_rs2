@@ -9,9 +9,9 @@
 
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::{Buffer, DType};
-use llm_rs2::core::eviction::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy};
-use llm_rs2::core::kv_cache::KVCache;
 use llm_rs2::memory::host::shared::SharedBuffer;
+use llm_rs2::pressure::eviction::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy};
+use llm_rs2::pressure::kv_cache::KVCache;
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
 use std::sync::Arc;
@@ -169,7 +169,7 @@ fn test_eng_alg_011_minimum_protected_prefix_enforced() {
 
 #[test]
 fn test_eng_alg_012_d2o_variance_uniform_attention() {
-    use llm_rs2::core::pressure::d2o_layer_alloc::D2OVarianceCollector;
+    use llm_rs2::pressure::d2o_layer_alloc::D2OVarianceCollector;
 
     let n_layers = 4;
     let collector = D2OVarianceCollector::new(
@@ -195,7 +195,7 @@ fn test_eng_alg_012_d2o_variance_uniform_attention() {
 
 #[test]
 fn test_eng_alg_012_d2o_budget_softmax_clamp() {
-    use llm_rs2::core::pressure::d2o_layer_alloc::D2OVarianceCollector;
+    use llm_rs2::pressure::d2o_layer_alloc::D2OVarianceCollector;
 
     let collector = D2OVarianceCollector::new(2, 1, 1, 4, 4);
     let budgets = collector.compute_budgets(0.6, 0.2);

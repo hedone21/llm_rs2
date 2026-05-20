@@ -105,7 +105,7 @@ pub trait Forward {
     /// Returns (removed_count, new_pos). removed_count == 0이면 eviction 미발생.
     fn try_evict(
         &mut self,
-        cache_manager: &crate::core::cache_manager::CacheManager,
+        cache_manager: &crate::pressure::cache_manager::CacheManager,
         scores: Option<&[f32]>,
         force: bool,
         target_ratio: f32,

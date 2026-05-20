@@ -1,5 +1,5 @@
 use super::EvictionPolicy;
-use crate::core::kv_cache::KVCache;
+use crate::pressure::kv_cache::KVCache;
 use anyhow::Result;
 
 /// Sliding window eviction policy.

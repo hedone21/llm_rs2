@@ -2,16 +2,7 @@ use clap::Parser;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
-use llm_rs2::core::cache_manager::CacheManager;
 use llm_rs2::core::events::{self, CacheEvent, StderrDiagnosticSink};
-use llm_rs2::core::eviction::h2o::H2OPolicy;
-use llm_rs2::core::eviction::h2o_plus::H2OPlusPolicy;
-use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
-use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
-use llm_rs2::core::kivi_cache::KiviCache;
-use llm_rs2::core::kv_cache::{KVCache, KVLayout};
-use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
-use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use llm_rs2::core::rss_trace::{io_trace, read_bytes_now, rss_trace};
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;
@@ -22,6 +13,15 @@ use llm_rs2::layers::workspace::{
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use llm_rs2::pressure::cache_manager::CacheManager;
+use llm_rs2::pressure::d2o_handler::{D2OConfig, D2OHandler};
+use llm_rs2::pressure::eviction::h2o::H2OPolicy;
+use llm_rs2::pressure::eviction::h2o_plus::H2OPlusPolicy;
+use llm_rs2::pressure::eviction::no_eviction::NoEvictionPolicy;
+use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
+use llm_rs2::pressure::kivi_cache::KiviCache;
+use llm_rs2::pressure::kv_cache::{KVCache, KVLayout};
+use llm_rs2::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use llm_rs2::session::cli::{Args, KvMode, parse_qcf_sample_layers};
 use llm_rs2::session::eval::load_eval_questions;
 use llm_rs2::session::ppl::run_kivi_ppl;
@@ -852,7 +852,7 @@ fn main() -> anyhow::Result<()> {
             }]);
             CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
         } else {
-            let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> = match args
+            let policy: Box<dyn llm_rs2::pressure::eviction::EvictionPolicy> = match args
                 .eviction_policy()
             {
                 "none" => Box::new(NoEvictionPolicy::new()),
@@ -861,7 +861,7 @@ fn main() -> anyhow::Result<()> {
                     actual_protected_prefix,
                 )),
                 "streaming" => {
-                    use llm_rs2::core::eviction::StreamingLLMPolicy;
+                    use llm_rs2::pressure::eviction::StreamingLLMPolicy;
                     let window = if args.streaming_window() > 0 {
                         args.streaming_window()
                     } else if args.kv_budget() > 0 {
@@ -1844,7 +1844,7 @@ fn main() -> anyhow::Result<()> {
         match device.as_str() {
             "cpu" if is_gpu => {
                 eprintln!("[Prefill->Decode] Executing deferred SwitchHw: GPU->CPU");
-                llm_rs2::core::kv_migrate::migrate_kv_caches(
+                llm_rs2::pressure::kv_migrate::migrate_kv_caches(
                     &mut kv_caches,
                     &backend,
                     &cpu_backend_arc,
@@ -1864,7 +1864,7 @@ fn main() -> anyhow::Result<()> {
             }
             "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
                 eprintln!("[Prefill->Decode] Executing deferred SwitchHw: CPU->GPU");
-                llm_rs2::core::kv_migrate::migrate_kv_caches(
+                llm_rs2::pressure::kv_migrate::migrate_kv_caches(
                     &mut kv_caches,
                     &backend,
                     gpu_be,
@@ -3307,20 +3307,20 @@ fn main() -> anyhow::Result<()> {
                         // Build ScoreContext from accumulator for policy-directed eviction
                         let scores = if let Some(acc) = score_accumulator.as_ref() {
                             if let Some(head_imp) = acc.head_importance_scores() {
-                                llm_rs2::core::cache_manager::ScoreContext::PerHead {
+                                llm_rs2::pressure::cache_manager::ScoreContext::PerHead {
                                     flat: acc.importance_scores(),
                                     head: head_imp,
                                     n_kv_heads: acc.n_kv_heads(),
                                 }
                             } else if acc.is_active() {
-                                llm_rs2::core::cache_manager::ScoreContext::Flat {
+                                llm_rs2::pressure::cache_manager::ScoreContext::Flat {
                                     importance: acc.importance_scores(),
                                 }
                             } else {
-                                llm_rs2::core::cache_manager::ScoreContext::None
+                                llm_rs2::pressure::cache_manager::ScoreContext::None
                             }
                         } else {
-                            llm_rs2::core::cache_manager::ScoreContext::None
+                            llm_rs2::pressure::cache_manager::ScoreContext::None
                         };
 
                         // Manager already decided to evict — execute via named policy
@@ -3352,7 +3352,7 @@ fn main() -> anyhow::Result<()> {
                                 )
                             }
                         } else if evict.method == llm_rs2::resilience::EvictMethod::Streaming {
-                            use llm_rs2::core::eviction::StreamingLLMPolicy;
+                            use llm_rs2::pressure::eviction::StreamingLLMPolicy;
                             if let Some(ref sp) = evict.streaming_params {
                                 let policy = StreamingLLMPolicy::new(sp.sink_size, sp.window_size);
                                 cache_manager.force_evict_by_policy_ref(
@@ -3715,7 +3715,7 @@ fn main() -> anyhow::Result<()> {
                                         "[Switch] Resilience: GPU→CPU at token {}",
                                         kv_caches[0].current_pos
                                     );
-                                    llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                    llm_rs2::pressure::kv_migrate::migrate_kv_caches(
                                         &mut kv_caches,
                                         &backend,
                                         &cpu_backend_arc,
@@ -3761,7 +3761,7 @@ fn main() -> anyhow::Result<()> {
                                         "[Switch] Resilience: CPU→GPU at token {}",
                                         kv_caches[0].current_pos
                                     );
-                                    llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                    llm_rs2::pressure::kv_migrate::migrate_kv_caches(
                                         &mut kv_caches,
                                         &backend,
                                         gpu_be,
@@ -4789,7 +4789,7 @@ fn run_kivi(
     ignore_eos: bool,
     cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
-    use llm_rs2::core::kv_cache::KVCacheOps;
+    use llm_rs2::pressure::kv_cache::KVCacheOps;
 
     println!(
         "[KIVI] KV cache enabled — bits={}, residual_size={}, max_seq_len={}",
@@ -5389,9 +5389,9 @@ fn run_offload(
     command_executor: &mut Option<CommandExecutor>,
     cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
-    use llm_rs2::core::kv_cache::KVCacheOps;
-    use llm_rs2::core::offload::OffloadKVCache;
-    use llm_rs2::core::offload::raw_store::RawStore;
+    use llm_rs2::pressure::kv_cache::KVCacheOps;
+    use llm_rs2::pressure::offload::OffloadKVCache;
+    use llm_rs2::pressure::offload::raw_store::RawStore;
 
     // Validate constraints
     let kv_dtype = match kv_type_str {
@@ -5436,10 +5436,11 @@ fn run_offload(
     let is_gpu_backend = backend.as_ref().is_gpu();
     let mut kv_caches: Vec<OffloadKVCache> = (0..num_layers)
         .map(|layer_id| {
-            let store: Box<dyn llm_rs2::core::offload::store::OffloadStore> = match offload_mode {
+            let store: Box<dyn llm_rs2::pressure::offload::store::OffloadStore> = match offload_mode
+            {
                 "raw" => Box::new(RawStore::new(token_bytes)),
                 "disk" => Box::new(
-                    llm_rs2::core::offload::disk_store::DiskStore::new(
+                    llm_rs2::pressure::offload::disk_store::DiskStore::new(
                         disk_dir.clone(),
                         layer_id,
                         token_bytes,
@@ -5600,8 +5601,10 @@ fn run_offload(
 
     let eos_id = model.config.eos_token_id;
 
-    let mut prefetch =
-        llm_rs2::core::offload::prefetch::PrefetchController::new(max_prefetch_depth, num_layers);
+    let mut prefetch = llm_rs2::pressure::offload::prefetch::PrefetchController::new(
+        max_prefetch_depth,
+        num_layers,
+    );
 
     let decode_start = std::time::Instant::now();
     let mut generated_count = 0usize;

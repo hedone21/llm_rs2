@@ -3,8 +3,6 @@ use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::buffer::{Buffer, DType};
-use crate::core::kv_cache::{KVCache, KVCacheOps};
-use crate::core::offload::preload_pool::{self, PreloadPool};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
@@ -12,6 +10,8 @@ use crate::layers::workspace::LayerWorkspace;
 use crate::memory::Memory;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
+use crate::pressure::kv_cache::{KVCache, KVCacheOps};
+use crate::pressure::offload::preload_pool::{self, PreloadPool};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -167,8 +167,7 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub logits_last_only: bool,
     /// Optional D2O variance collector for layer-level allocation.
     /// When provided during prefill, captures per-layer attention column-sums.
-    pub variance_collector:
-        Option<&'a mut crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector>,
+    pub variance_collector: Option<&'a mut crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
     /// Optional layer boundary hook (LISWAP-4 / ENG-ALG-235).
     ///
     /// When `Some`, `forward_into` calls `hook.on_layer_boundary(idx, seq_len)`
@@ -1947,7 +1946,7 @@ impl TransformerModel {
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
         use crate::backend::opencl::plan::*;
-        use crate::core::kv_cache::KVLayout;
+        use crate::pressure::kv_cache::KVLayout;
 
         // Phase 4-4.8 diagnostic: env-gated line-by-line trace to identify
         // which None-return path fires when the happy-path ModelForward
@@ -2509,7 +2508,7 @@ impl TransformerModel {
         x: &Tensor,
         logits: &Tensor,
         ws: &LayerWorkspace,
-        kv_caches: &[crate::core::kivi_cache::KiviCache],
+        kv_caches: &[crate::pressure::kivi_cache::KiviCache],
         backend: &Arc<dyn Backend>,
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
@@ -2685,7 +2684,7 @@ impl TransformerModel {
         input_tokens: &Tensor,
         start_pos: usize,
         x_gen: &mut Tensor,
-        kv_caches: &mut [crate::core::kivi_cache::KiviCache],
+        kv_caches: &mut [crate::pressure::kivi_cache::KiviCache],
         logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
@@ -2726,10 +2725,10 @@ impl TransformerModel {
     /// thread accesses any given `kv_caches[j]` at a time.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
-    pub fn forward_into_offload<C: crate::core::kv_cache::PrefetchableCache>(
+    pub fn forward_into_offload<C: crate::pressure::kv_cache::PrefetchableCache>(
         &self,
         args: TransformerModelForwardArgs<'_, C>,
-        prefetch: &mut crate::core::offload::prefetch::PrefetchController,
+        prefetch: &mut crate::pressure::offload::prefetch::PrefetchController,
     ) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;

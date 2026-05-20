@@ -16,9 +16,9 @@ pub mod store;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
-use crate::core::kv_cache::{KVCacheOps, KVLayout};
 use crate::memory::Memory;
 use crate::memory::host::shared::SharedBuffer;
+use crate::pressure::kv_cache::{KVCacheOps, KVLayout};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 use anyhow::Result;
@@ -498,7 +498,7 @@ impl KVCacheOps for OffloadKVCache {
     }
 }
 
-impl crate::core::kv_cache::PrefetchableCache for OffloadKVCache {
+impl crate::pressure::kv_cache::PrefetchableCache for OffloadKVCache {
     fn preload(&mut self) -> Result<()> {
         self.preload()
     }
@@ -520,7 +520,7 @@ impl crate::core::kv_cache::PrefetchableCache for OffloadKVCache {
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 mod tests {
     use super::*;
-    use crate::core::kv_cache::KVCacheOps;
+    use crate::pressure::kv_cache::KVCacheOps;
 
     fn make_test_tensor(
         seq_len: usize,
@@ -630,9 +630,9 @@ mod tests {
     //  Integration Tests: BASE (KVCache) vs OffloadKVCache comparison
     // ════════════════════════════════════════════════════════════════════════
 
-    use crate::core::kv_cache::KVCache;
     use crate::memory::Memory;
     use crate::memory::galloc::Galloc;
+    use crate::pressure::kv_cache::KVCache;
 
     /// Create a standard KVCache (BASE) for comparison.
     fn make_base_kvcache(
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn test_bench_adaptive_prefetch() {
-        use crate::core::offload::prefetch::PrefetchController;
+        use crate::pressure::offload::prefetch::PrefetchController;
 
         let kv_heads = 8;
         let head_dim = 64;
@@ -1391,7 +1391,7 @@ mod tests {
     fn test_bench_deferred_store_write() {
         // Measures the performance impact of deferred store writes.
         // No artificial delays — isolates pure store.append_token() cost.
-        use crate::core::offload::prefetch::PrefetchController;
+        use crate::pressure::offload::prefetch::PrefetchController;
 
         let kv_heads = 8;
         let head_dim = 64;
@@ -1604,8 +1604,8 @@ mod tests {
     fn test_bench_pool_vs_scope() {
         // Compare thread::scope (spawn per layer) vs PreloadPool (persistent workers).
         // Measures real preload cost without artificial delays — isolates threading overhead.
-        use crate::core::offload::prefetch::PrefetchController;
-        use crate::core::offload::preload_pool::{self, PreloadPool};
+        use crate::pressure::offload::prefetch::PrefetchController;
+        use crate::pressure::offload::preload_pool::{self, PreloadPool};
 
         let kv_heads = 8;
         let head_dim = 64;

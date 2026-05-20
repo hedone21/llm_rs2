@@ -600,7 +600,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 match device.as_str() {
                     "cpu" if is_gpu => {
                         eprintln!("[Prefill->Decode] Executing deferred SwitchHw: GPU->CPU");
-                        crate::core::kv_migrate::migrate_kv_caches(
+                        crate::pressure::kv_migrate::migrate_kv_caches(
                             &mut kv_caches,
                             &backend,
                             &cpu_backend_arc,
@@ -642,7 +642,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                     }
                     "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
                         eprintln!("[Prefill->Decode] Executing deferred SwitchHw: CPU->GPU");
-                        crate::core::kv_migrate::migrate_kv_caches(
+                        crate::pressure::kv_migrate::migrate_kv_caches(
                             &mut kv_caches,
                             &backend,
                             gpu_be,
@@ -704,7 +704,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
             // attention scores, then restore current_pos so cache state
             // matches prompt_tokens (probe entry beyond current_pos is
             // invisible to subsequent forward calls).
-            use crate::core::kv_cache::KVCacheOps;
+            use crate::pressure::kv_cache::KVCacheOps;
             if hook.needs_score_probe(&kv_caches) {
                 let saved_positions: Vec<usize> =
                     kv_caches.iter().map(|c| c.current_pos()).collect();

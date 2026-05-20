@@ -17,18 +17,18 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::core::cache_manager::CacheManager;
 use crate::core::events::StderrDiagnosticSink;
-use crate::core::eviction::h2o::H2OPolicy;
-use crate::core::eviction::h2o_plus::H2OPlusPolicy;
-use crate::core::eviction::sliding_window::SlidingWindowPolicy;
-use crate::core::kv_cache::KVCache;
-use crate::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
-use crate::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
+use crate::pressure::cache_manager::CacheManager;
+use crate::pressure::d2o_handler::{D2OConfig, D2OHandler};
+use crate::pressure::eviction::h2o::H2OPolicy;
+use crate::pressure::eviction::h2o_plus::H2OPlusPolicy;
+use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
+use crate::pressure::kv_cache::KVCache;
+use crate::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::session::DecodeLoopBuilder;
 use crate::session::chat::stop_condition::StopCondition;
 use crate::session::decode_loop::DecodeLoop;
@@ -558,7 +558,7 @@ pub fn build_chat_offload(args: ChatOffloadArgs) -> Result<ChatSession> {
         &args.memory,
     )?;
 
-    let prefetch = crate::core::offload::prefetch::PrefetchController::new(
+    let prefetch = crate::pressure::offload::prefetch::PrefetchController::new(
         max_prefetch_depth,
         args.num_layers,
     );
@@ -638,7 +638,7 @@ fn build_chat_eviction_internal(
         }]);
         CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
     } else {
-        let policy: Box<dyn crate::core::eviction::EvictionPolicy> = match args
+        let policy: Box<dyn crate::pressure::eviction::EvictionPolicy> = match args
             .eviction_policy
             .as_str()
         {
@@ -654,7 +654,7 @@ fn build_chat_eviction_internal(
                 } else {
                     args.eviction_window
                 };
-                Box::new(crate::core::eviction::StreamingLLMPolicy::new(
+                Box::new(crate::pressure::eviction::StreamingLLMPolicy::new(
                     args.sink_size,
                     window,
                 ))

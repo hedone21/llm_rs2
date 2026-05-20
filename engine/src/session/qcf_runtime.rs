@@ -13,10 +13,10 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::core::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModelForwardArgs;
+use crate::pressure::kv_cache::KVCache;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 

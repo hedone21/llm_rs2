@@ -34,7 +34,7 @@
 
 use super::{AggregationMode, aggregate_heads};
 use crate::buffer::DType;
-use crate::core::kv_cache::{KVCache, KVLayout};
+use crate::pressure::kv_cache::{KVCache, KVLayout};
 use crate::quant::{BlockQ4_0, QK4_0};
 
 // ── Action types ────────────────────────────────────────────────

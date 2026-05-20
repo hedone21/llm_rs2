@@ -4,16 +4,28 @@
 //! compress, sparse attention, and future techniques share a common
 //! `CachePressureHandler` trait and are orchestrated by
 //! `CachePressurePipeline` according to memory pressure level.
+//!
+//! Step 4-D: L3-pressure 도메인 모듈 — `core/`에서 promote.
+//! KV 캐시 상태(state) + eviction 정책 + 압력 핸들러를 한 디렉토리에 응집.
 
-use crate::core::kv_cache::KVCache;
-use anyhow::Result;
+// State + manager + I/O
+pub mod cache_manager;
+pub mod eviction;
+pub mod kivi_cache;
+pub mod kv_cache;
+pub mod kv_migrate;
+pub mod offload;
 
+// Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)
 pub mod d2o_handler;
 pub mod d2o_layer_alloc;
 pub mod eviction_handler;
 pub mod quantize_handler;
 pub mod swap_handler;
 pub mod weight_swap_handler;
+
+use crate::pressure::kv_cache::KVCache;
+use anyhow::Result;
 
 pub use d2o_handler::D2OHandler;
 pub use eviction_handler::{EvictionHandler, MIN_EVICT_TOKENS};

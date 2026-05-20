@@ -9,13 +9,13 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
-use crate::core::cache_manager::CacheManager;
-use crate::core::kv_cache::KVCache;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::SwapAlgorithm;
+use crate::pressure::cache_manager::CacheManager;
+use crate::pressure::kv_cache::KVCache;
 use crate::qcf::ImportanceFormula;
 use crate::session::cli::Args;
 
