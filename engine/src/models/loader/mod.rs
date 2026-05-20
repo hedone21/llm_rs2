@@ -175,26 +175,69 @@ pub trait TensorSource {
     }
 }
 
-/// Resolve the secondary mmap handle for a given `LoadConfig` + primary source.
+/// Resolve the secondary mmap handle for an **AUF primary** source.
 ///
-/// Sprint 1 W-AUF-1 C3 stub: returns `None` unconditionally. The W-AUF-2
-/// rollout will:
-/// - prefer `cfg.secondary_source` (explicit override) when set,
-/// - otherwise auto-activate AUF self-secondary if the primary is AUF and
-///   carries a multi-dtype or multi-variant capability bit (and
-///   `!cfg.disable_self_secondary`),
-/// - otherwise return `None`.
+/// Sprint 1 W-AUF-2 본격 구현. GGUF primary는 `TransformerModel::load_gguf_from_config`
+/// 가 `open_secondary_with_backend`를 직접 호출하므로 본 함수는 **AUF primary 경로 전용**.
 ///
-/// The function is exposed so callers can centralise secondary policy without
-/// duplicating dispatch logic. The current GGUF path keeps its inline
-/// `open_secondary_with_backend` call inside `TransformerModel::load_gguf_from_config`
-/// because it needs the live `GgufFile` metadata reference.
+/// 결정 순서:
+/// 1. `cfg.secondary_source`가 Some (explicit `--secondary-gguf`)이면서 primary가 AUF인 경우
+///    명시 에러 — AUF primary는 self-secondary가 정식 경로이므로 외부 secondary 지정은 충돌.
+/// 2. AUF primary + multi-dtype capability + `!disable_self_secondary` + primary_dtype 확정 →
+///    [`from_auf_self_secondary`] 자동 활성.
+/// 3. 그 외 → `Ok(None)` (swap 비활성).
+///
+/// GGUF primary는 본 함수를 호출하지 않고 자체 dispatch를 유지한다.
 pub fn resolve_secondary(
-    _cfg: &LoadConfig,
-    _source: &dyn TensorSource,
+    cfg: &LoadConfig,
+    source: &dyn TensorSource,
     _backend: &Arc<dyn Backend>,
 ) -> Result<Option<Arc<crate::models::weights::SecondaryMmap>>> {
-    Ok(None)
+    // 본 함수는 AUF primary 진입에서만 의미가 있다. GGUF/Safetensors는 즉시 None.
+    if cfg.primary_format != PrimaryFormat::Auf {
+        return Ok(None);
+    }
+
+    // R10: AUF primary + explicit --secondary-gguf 조합은 정책상 금지.
+    if cfg.secondary_source.is_some() {
+        anyhow::bail!(
+            "AUF primary와 --secondary-gguf는 함께 쓸 수 없습니다. \
+             AUF는 self-secondary가 정식 경로이므로 --secondary-gguf를 빼거나 \
+             --no-self-secondary로 swap 자체를 비활성화하세요."
+        );
+    }
+
+    if cfg.disable_self_secondary {
+        eprintln!("[AUF] self-secondary disabled by --no-self-secondary");
+        return Ok(None);
+    }
+
+    let Some(auf_src) = source.as_auf() else {
+        // primary_format == Auf인데 source가 AUF가 아니면 dispatch 버그.
+        anyhow::bail!(
+            "resolve_secondary: primary_format=Auf but source is not AufSource (dispatch bug)"
+        );
+    };
+    if !auf_src.has_swap_candidate() {
+        // multi-dtype capability bit OFF → swap 후보 없음. 정상 정지.
+        return Ok(None);
+    }
+
+    let primary_dtype = auf_src.primary_dtype_tensor().ok_or_else(|| {
+        anyhow::anyhow!(
+            "AUF self-secondary: primary_dtype 미해결 (META.default_dtype 없음 + --primary-dtype 미지정)"
+        )
+    })?;
+    let primary_tag = auf_src.primary_variant_tag();
+    let view = auf_src.view_arc();
+
+    let mmap = crate::models::loader::auf::from_auf_self_secondary(
+        view,
+        primary_tag,
+        primary_dtype,
+        source.config(),
+    )?;
+    Ok(Some(mmap))
 }
 
 /// Assemble a `TransformerModel` from a `TensorSource`.

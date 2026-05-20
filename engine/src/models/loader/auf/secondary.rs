@@ -390,6 +390,180 @@ pub fn build_auf_secondary_from_view(
     }))
 }
 
+/// Build a `SecondaryMmap::Auf` that **shares the primary `AufView` mmap**.
+///
+/// W-AUF-2.1 — `--model-path foo.auf`로 primary가 AUF일 때, 같은 mmap을
+/// secondary로 재포장하여 swap 후보를 자기 자신에서 추출한다. 두 번째 mmap을
+/// 만들지 않으므로 R6 (이중 mmap) 위험이 해결된다.
+///
+/// 동작:
+/// 1. **primary 자기 제외**: `primary_variant_tag` + `primary_dtype` 조합은
+///    swap 후보에서 명시 제외. AUF가 multi-dtype이면 자동으로 다른 dtype 후보를
+///    선택한다.
+/// 2. 나머지는 `build_auf_secondary_from_view`와 동일 — layer_index 구성, AdrenoSoa F16
+///    reject, ReverseSwapRejected 등.
+///
+/// # 에러
+/// - `LoadError::AufInvariantViolation` — primary 외 swap 후보가 없을 때 (즉 multi-dtype 아님)
+/// - 기타 `build_auf_secondary_from_view`와 동일 게이트
+pub fn from_auf_self_secondary(
+    view: std::sync::Arc<AufView>,
+    primary_variant_tag: BackendTag,
+    primary_dtype: TensorDType,
+    primary_config: &ModelConfig,
+) -> Result<std::sync::Arc<SecondaryMmap>, LoadError> {
+    // primary와 같은 variant_tag에 대해 layer_index를 구성하되, dtype은 primary가
+    // 아닌 후보로 선택한다. variant slot은 primary와 같지만 entry.dtype 필터만
+    // 다르게 적용.
+    let weights_tag = primary_variant_tag
+        .weights_section_tag()
+        .ok_or_else(|| LoadError::AufInvariantViolation {
+            detail: format!(
+                "AUF self-secondary: BackendTag::Any cannot host tensors (primary_variant_tag invariant)"
+            ),
+        })?;
+
+    let variant_idx = view
+        .tensor_index
+        .variant_index_for_tag(weights_tag)
+        .ok_or_else(|| LoadError::AufInvariantViolation {
+            detail: format!(
+                "AUF self-secondary: TENSOR_INDEX missing primary variant '{weights_tag}'"
+            ),
+        })?;
+
+    let _ = view
+        .weights_range
+        .ok_or_else(|| LoadError::AufInvariantViolation {
+            detail: "AUF self-secondary: weights_range None (BackendTag::Any opened?)".to_string(),
+        })?;
+
+    // primary 외 dtype 후보 수집.
+    let primary_dtype_u32 = primary_dtype.as_u32();
+    let available_dtypes: std::collections::BTreeSet<u32> = view
+        .tensor_index
+        .entries
+        .iter()
+        .filter(|e| {
+            if e.layer_idx == LAYER_IDX_CROSS {
+                return false;
+            }
+            if e.dtype == primary_dtype_u32 {
+                return false; // self-exclude
+            }
+            let var_offset = e
+                .variant_offsets
+                .get(variant_idx)
+                .copied()
+                .unwrap_or(u64::MAX);
+            let var_size = e.variant_sizes.get(variant_idx).copied().unwrap_or(0);
+            var_offset != u64::MAX && var_size != 0
+        })
+        .map(|e| e.dtype)
+        .collect();
+
+    if available_dtypes.is_empty() {
+        return Err(LoadError::AufInvariantViolation {
+            detail: format!(
+                "AUF self-secondary: no swap candidates (primary dtype={primary_dtype:?} \
+                 is the only dtype present for variant '{weights_tag}'). \
+                 Build multi-dtype AUF with `auf_tool build --dtypes` to enable swap."
+            ),
+        });
+    }
+
+    // 후보 dtype 선택 — weight 우선순위 (Q4_0 → F16 → BF16 → Q4_1 → Q8_0 → F32).
+    let weight_preference = [
+        TensorDType::Q4_0,
+        TensorDType::F16,
+        TensorDType::BF16,
+        TensorDType::Q4_1,
+        TensorDType::Q8_0,
+        TensorDType::F32,
+    ];
+    let selected_dtype = weight_preference
+        .iter()
+        .copied()
+        .find(|d| available_dtypes.contains(&d.as_u32()))
+        .ok_or_else(|| LoadError::AufInvariantViolation {
+            detail: format!(
+                "AUF self-secondary: no recognised dtype among candidates {:?}",
+                available_dtypes
+            ),
+        })?;
+
+    // AdrenoSoa × F16 reject (Sprint D 함정 3 — SOA layout은 Q4_0 전용).
+    if primary_variant_tag == BackendTag::AdrenoSoa && selected_dtype == TensorDType::F16 {
+        return Err(LoadError::AdrenoSoaF16Rejected);
+    }
+
+    // 단방향 swap 정합성: primary=Q4_0 + secondary=F16 reject.
+    if primary_dtype == TensorDType::Q4_0 && selected_dtype == TensorDType::F16 {
+        return Err(LoadError::ReverseSwapRejected {
+            primary_dtype: "Q4_0".to_string(),
+            secondary_dtype: "F16".to_string(),
+        });
+    }
+
+    let num_layers = primary_config.num_hidden_layers;
+    let mut layer_index: Vec<LayerTensorSlice> = vec![LayerTensorSlice::default(); num_layers];
+
+    for entry in &view.tensor_index.entries {
+        if entry.layer_idx == LAYER_IDX_CROSS {
+            continue;
+        }
+        let layer_idx = entry.layer_idx as usize;
+        if layer_idx >= num_layers {
+            continue;
+        }
+        if entry.dtype != selected_dtype.as_u32() {
+            continue;
+        }
+        let var_offset = entry
+            .variant_offsets
+            .get(variant_idx)
+            .copied()
+            .unwrap_or(u64::MAX);
+        let var_size = entry.variant_sizes.get(variant_idx).copied().unwrap_or(0);
+        if var_offset == u64::MAX || var_size == 0 {
+            continue;
+        }
+        let Some(subname) = tensor_kind_to_subname(entry.kind) else {
+            continue;
+        };
+        let Some(dtype) = auf_dtype_to_engine(entry.dtype) else {
+            continue;
+        };
+        let slice_info = SecondaryTensorInfo {
+            offset: var_offset as usize,
+            len: var_size as usize,
+            dtype,
+            // AUF outermost-first → swap_executor expects innermost-first.
+            dims: entry.shape.iter().rev().copied().collect(),
+        };
+        layer_index[layer_idx]
+            .tensors
+            .insert(subname.to_string(), slice_info);
+    }
+
+    let is_pre_converted_soa = weights_tag == TAG_WEIGHTS_ADRENO_SOA;
+    let source_path = std::path::PathBuf::from(format!(
+        "<self-secondary of primary AUF, variant={weights_tag}, dtype={selected_dtype:?}>"
+    ));
+
+    eprintln!(
+        "[AUF self-secondary] auto-activated: variant={} primary_dtype={:?} secondary_dtype={:?} layers={}",
+        weights_tag, primary_dtype, selected_dtype, num_layers,
+    );
+
+    Ok(std::sync::Arc::new(SecondaryMmap::Auf(AufSecondaryMmap {
+        view,
+        layer_index,
+        source_path,
+        is_pre_converted_soa,
+    })))
+}
+
 /// META.default_dtype / CLI dtype 문자열을 `TensorDType`으로 변환.
 ///
 /// `reader.rs`의 `dtype_str_to_tensor_dtype`와 동일 로직이지만 cross-crate

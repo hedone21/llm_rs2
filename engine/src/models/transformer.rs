@@ -285,11 +285,11 @@ impl TransformerModel {
         Ok(model)
     }
 
-    /// AUF primary 전용 `load_from_config` 구현 (W-AUF-1 C3).
+    /// AUF primary 전용 `load_from_config` 구현 (W-AUF-1 C3 + W-AUF-2 C3).
     ///
-    /// 본 sprint stub: explicit `secondary_source`는 deprecation 안내 후 무시한다.
-    /// AUF self-secondary 자동 활성(W-AUF-2)이 도입되면 `resolve_secondary` helper
-    /// (loader/mod.rs)가 같은 AUF view를 `SecondaryMmap`으로 재포장한다.
+    /// `resolve_secondary` (loader/mod.rs)가 AUF self-secondary 자동 활성을 담당한다.
+    /// multi-dtype capability bit이 켜져 있고 `--no-self-secondary`가 꺼져 있으면
+    /// 같은 mmap을 secondary로 재포장하여 swap 후보로 노출한다.
     fn load_auf_from_config(
         config: &crate::models::loader::LoadConfig,
         backend: Arc<dyn Backend>,
@@ -302,14 +302,11 @@ impl TransformerModel {
             config.primary_dtype_choice,
             config.primary_eos_override,
         )?;
-        if config.secondary_source.is_some() {
-            eprintln!(
-                "[Deprecated] AUF primary + explicit secondary는 W-AUF-2 self-secondary 도입 시 \
-                 제거 예정입니다. 현재는 무시합니다 (--model-path foo.auf 단일 경로 권장)."
-            );
-        }
-        // W-AUF-1 C3 stub — W-AUF-2에서 resolve_secondary로 자동 활성.
-        let secondary_mmap: Option<Arc<crate::models::weights::SecondaryMmap>> = None;
+
+        // W-AUF-2 C3: resolve_secondary가 AUF self-secondary 자동 활성을 처리.
+        // explicit secondary + AUF 조합은 함수 내부에서 명시 에러로 거부된다.
+        let secondary_mmap =
+            crate::models::loader::resolve_secondary(config, &source, &backend)?;
 
         let mut model =
             crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
@@ -3716,16 +3713,71 @@ mod tests {
         );
     }
 
-    /// W-AUF-1 C3: `resolve_secondary` stub은 W-AUF-2 도입 전까지 `None`만 반환한다.
+    /// W-AUF-2 C3: `resolve_secondary`는 GGUF/Safetensors primary에서 `None`만 반환한다
+    /// (GGUF는 자체 dispatch가 `open_secondary_with_backend`를 호출하므로 본 helper는 no-op).
     #[test]
-    fn resolve_secondary_stub_returns_none() {
+    fn resolve_secondary_non_auf_returns_none() {
         use crate::backend::cpu::CpuBackend;
         use crate::models::loader::{LoadConfig, PrimaryFormat, TensorId, TensorSource};
 
         struct DummySource;
         impl TensorSource for DummySource {
             fn config(&self) -> &crate::models::config::ModelConfig {
-                unimplemented!("not exercised by resolve_secondary stub")
+                unimplemented!("not exercised by resolve_secondary non-AUF path")
+            }
+            fn load_tensor(
+                &self,
+                _id: &TensorId,
+                _is_weight: bool,
+                _backend: &Arc<dyn Backend>,
+                _memory: &dyn crate::core::memory::Memory,
+            ) -> Result<crate::core::tensor::Tensor> {
+                unimplemented!()
+            }
+            fn load_tensor_cpu(
+                &self,
+                _id: &TensorId,
+                _is_weight: bool,
+                _memory: &dyn crate::core::memory::Memory,
+            ) -> Result<crate::core::tensor::Tensor> {
+                unimplemented!()
+            }
+            fn has_tensor(&self, _id: &TensorId) -> bool {
+                false
+            }
+            fn weight_dtype(&self) -> DType {
+                DType::F16
+            }
+            fn cpu_backend(&self) -> Arc<dyn Backend> {
+                Arc::new(CpuBackend::new()) as Arc<dyn Backend>
+            }
+        }
+
+        for fmt in [PrimaryFormat::Gguf, PrimaryFormat::Safetensors] {
+            let cfg = LoadConfig {
+                primary_format: fmt,
+                ..Default::default()
+            };
+            let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+            let src = DummySource;
+            let out = crate::models::loader::resolve_secondary(&cfg, &src, &backend).unwrap();
+            assert!(
+                out.is_none(),
+                "non-AUF primary must produce None from resolve_secondary, got Some for {fmt:?}"
+            );
+        }
+    }
+
+    /// W-AUF-2 C3: AUF primary + explicit `--secondary-gguf`는 정책상 금지 (R10).
+    #[test]
+    fn resolve_secondary_rejects_explicit_for_auf_primary() {
+        use crate::backend::cpu::CpuBackend;
+        use crate::models::loader::{LoadConfig, PrimaryFormat, TensorId, TensorSource};
+
+        struct DummySource;
+        impl TensorSource for DummySource {
+            fn config(&self) -> &crate::models::config::ModelConfig {
+                unimplemented!()
             }
             fn load_tensor(
                 &self,
@@ -3757,11 +3809,19 @@ mod tests {
 
         let cfg = LoadConfig {
             primary_format: PrimaryFormat::Auf,
+            secondary_source: Some(std::path::PathBuf::from("/tmp/legacy.gguf")),
             ..Default::default()
         };
         let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let src = DummySource;
-        let out = crate::models::loader::resolve_secondary(&cfg, &src, &backend).unwrap();
-        assert!(out.is_none(), "W-AUF-1 C3 stub must return None");
+        let err = match crate::models::loader::resolve_secondary(&cfg, &src, &backend) {
+            Ok(_) => panic!("expected AUF primary + --secondary-gguf to error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("AUF") && msg.contains("--secondary-gguf"),
+            "error must mention AUF primary + --secondary-gguf conflict, got: {msg}"
+        );
     }
 }

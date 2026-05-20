@@ -17,8 +17,8 @@ pub mod source;
 pub mod variant_select;
 
 pub use secondary::{
-    auf_dtype_to_engine, build_auf_secondary_from_view, check_auf_metadata, is_auf_path,
-    open_secondary_auf,
+    auf_dtype_to_engine, build_auf_secondary_from_view, check_auf_metadata,
+    from_auf_self_secondary, is_auf_path, open_secondary_auf,
 };
 pub use source::AufSource;
 pub use variant_select::{AufDtypeChoice, AufVariantChoice};

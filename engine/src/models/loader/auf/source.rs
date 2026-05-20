@@ -104,6 +104,22 @@ impl AufSource {
         self.variant_tag
     }
 
+    /// Primary dtype (W-AUF-2 self-secondary에서 자기 제외용).
+    ///
+    /// 우선순위:
+    /// 1. 생성 시 명시된 `primary_dtype` (`Some` when `--primary-dtype` ≠ Auto)
+    /// 2. `META.default_dtype`
+    /// 3. `None` (resolve 실패 — self-secondary 진입 차단)
+    pub fn primary_dtype_tensor(&self) -> Option<TensorDType> {
+        self.primary_dtype.or_else(|| {
+            self.view
+                .meta
+                .default_dtype
+                .as_deref()
+                .and_then(parse_meta_dtype_str)
+        })
+    }
+
     /// 진단용 source path 반환.
     pub fn source_path(&self) -> &Path {
         &self.source_path
