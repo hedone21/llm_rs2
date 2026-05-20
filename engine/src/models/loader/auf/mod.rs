@@ -12,9 +12,14 @@
 //!
 //! [`detect_primary_format`]은 확장자 + AUF magic byte로 결정한다.
 
+pub mod secondary;
 pub mod source;
 pub mod variant_select;
 
+pub use secondary::{
+    auf_dtype_to_engine, build_auf_secondary_from_view, check_auf_metadata, is_auf_path,
+    open_secondary_auf,
+};
 pub use source::AufSource;
 pub use variant_select::{AufDtypeChoice, AufVariantChoice};
 
@@ -32,13 +37,11 @@ pub enum PrimaryFormat {
     Safetensors,
 }
 
-/// AUF magic 헤더 (첫 8 바이트).
-const AUF_MAGIC: &[u8; 8] = b"ARGUS_UF";
-
 /// `--model-path` 경로의 포맷을 식별한다.
 ///
 /// 결정 순서:
-/// 1. 확장자가 `.auf` → magic byte로 추가 검증. 실패 시 명시적 에러.
+/// 1. 확장자가 `.auf` → magic byte (`crate::auf::header::AUF_MAGIC`)로 추가 검증.
+///    실패 시 명시적 에러.
 /// 2. 확장자가 `.gguf` → `PrimaryFormat::Gguf`.
 /// 3. 그 외 → `PrimaryFormat::Safetensors` (디렉토리, `.safetensors` 등).
 pub fn detect_primary_format(path: &Path) -> Result<PrimaryFormat> {
@@ -63,7 +66,7 @@ pub fn detect_primary_format(path: &Path) -> Result<PrimaryFormat> {
     }
 }
 
-/// AUF magic byte 검증 (첫 8 바이트 = "ARGUS_UF").
+/// AUF magic byte 검증 (첫 8 바이트 = `crate::auf::header::AUF_MAGIC`).
 fn has_auf_magic(path: &Path) -> Result<bool> {
     use std::fs::File;
     use std::io::Read;
@@ -72,7 +75,7 @@ fn has_auf_magic(path: &Path) -> Result<bool> {
         .map_err(|e| anyhow!("primary loader: cannot open '{}': {}", path.display(), e))?;
     let mut buf = [0u8; 8];
     match f.read_exact(&mut buf) {
-        Ok(()) => Ok(&buf == AUF_MAGIC),
+        Ok(()) => Ok(&buf == crate::auf::header::AUF_MAGIC),
         Err(_) => Ok(false),
     }
 }

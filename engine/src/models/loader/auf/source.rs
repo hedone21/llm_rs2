@@ -6,27 +6,26 @@
 //!   생성 시점에 고정 (LSP 안정성).
 //! - `META` JSON에서 [`ModelConfig`] 구축 (`from_auf_meta`).
 //! - `TensorId` ↔ `TensorEntry` 매핑 (`tensor_id_to_auf`).
+//! - `load_tensor` / `load_tensor_cpu`는 [`AufViewBuffer`]로 zero-copy 로드한다.
 //!
-//! ## 본 sprint 범위
-//! - **C1 (현 commit)**: 골격 + ModelConfig 구축 + has_tensor/cpu_backend/weight_dtype/config 등
-//!   non-load 메서드 정상화. `load_tensor` / `load_tensor_cpu`는 `todo!()` placeholder.
-//! - **C2 (다음 commit)**: secondary_mmap의 AUF 로직을 `loader/auf/secondary.rs`로 이동하면서
-//!   primary용 zero-copy buffer (`AufViewBuffer` 예정) 추가 + load_tensor 본격 구현.
+//! AUF는 빌드 시점에 (1) Q/K unpermute, (2) dtype, (3) backend variant SOA/AOS
+//! 가 모두 확정되므로 `load_tensor`는 GGUF 대비 단순하다 (재변환 없음).
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 
-use crate::auf::{
-    AufView, BackendTag, LAYER_IDX_CROSS, TensorDType, TensorKind, open as auf_open,
-};
+use crate::auf::{AufView, BackendTag, LAYER_IDX_CROSS, TensorDType, TensorKind, open as auf_open};
 use crate::backend::cpu::CpuBackend;
+use crate::buffer::auf_view_buffer::AufViewBuffer;
 use crate::core::backend::Backend;
-use crate::core::buffer::DType;
+use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
+use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::models::config::{ModelArch, ModelConfig};
+use crate::models::loader::auf::secondary::auf_dtype_to_engine;
 use crate::models::loader::{LayerWeightKind, TensorId, TensorSource};
 
 use super::{AufDtypeChoice, AufVariantChoice};
@@ -246,22 +245,130 @@ impl TensorSource for AufSource {
 
     fn load_tensor(
         &self,
-        _id: &TensorId,
-        _is_weight: bool,
-        _backend: &Arc<dyn Backend>,
+        id: &TensorId,
+        is_weight: bool,
+        backend: &Arc<dyn Backend>,
         _memory: &dyn Memory,
     ) -> Result<Tensor> {
-        // C2에서 secondary_mmap의 AUF 로직과 함께 zero-copy buffer 구현.
-        todo!("AufSource::load_tensor — implement in W-AUF-1 C2 (with AufViewBuffer)")
+        let cpu_tensor = self.materialise_cpu_tensor(id)?;
+        let is_cpu = backend.name().contains("CPU");
+        if is_cpu {
+            Ok(cpu_tensor)
+        } else if is_weight {
+            backend.copy_weight_from(&cpu_tensor)
+        } else {
+            backend.copy_from(&cpu_tensor)
+        }
     }
 
     fn load_tensor_cpu(
         &self,
-        _id: &TensorId,
+        id: &TensorId,
         _is_weight: bool,
         _memory: &dyn Memory,
     ) -> Result<Tensor> {
-        todo!("AufSource::load_tensor_cpu — implement in W-AUF-1 C2")
+        self.materialise_cpu_tensor(id)
+    }
+}
+
+impl AufSource {
+    /// `TensorId` → CPU `Tensor` (zero-copy via [`AufViewBuffer`]).
+    ///
+    /// AUF는 빌드 시점에 dtype/variant/unpermute가 모두 확정되므로 GGUF처럼
+    /// 런타임 변환이 필요하지 않다. lookup → variant slice → AufViewBuffer 한 줄.
+    fn materialise_cpu_tensor(&self, id: &TensorId) -> Result<Tensor> {
+        let (layer_idx, kind) = tensor_id_to_auf(id).ok_or_else(|| {
+            anyhow!(
+                "AUF v0.1: TensorId {:?} unsupported (bias variants not encoded; \
+                 use a Llama-family AUF or rebuild with bias support)",
+                id
+            )
+        })?;
+
+        // dtype 우선순위: AufSource::primary_dtype (Some이면 명시) →
+        // META.default_dtype → entry first-match (AufView::lookup_tensor가 처리).
+        let entry = self
+            .view
+            .lookup_tensor(layer_idx, kind.as_u32(), self.primary_dtype)
+            .map_err(|e| {
+                anyhow!(
+                    "AUF lookup failed (layer={}, kind={:?}, dtype={:?}): {}",
+                    layer_idx,
+                    kind,
+                    self.primary_dtype,
+                    e
+                )
+            })?;
+
+        let weights_tag = self.variant_tag.weights_section_tag().ok_or_else(|| {
+            anyhow!("AUF primary: BackendTag::Any cannot host tensors (variant_tag invariant)")
+        })?;
+        let var_idx = self
+            .view
+            .tensor_index
+            .variant_index_for_tag(weights_tag)
+            .ok_or_else(|| {
+                anyhow!(
+                    "AUF '{}' lacks WEIGHTS variant '{}'",
+                    self.source_path.display(),
+                    weights_tag,
+                )
+            })?;
+
+        let var_offset = entry.variant_offsets.get(var_idx).copied().ok_or_else(|| {
+            anyhow!(
+                "AUF: variant_offsets[{}] missing for (layer={}, kind={:?})",
+                var_idx,
+                layer_idx,
+                kind,
+            )
+        })?;
+        let var_size = entry.variant_sizes.get(var_idx).copied().ok_or_else(|| {
+            anyhow!(
+                "AUF: variant_sizes[{}] missing for (layer={}, kind={:?})",
+                var_idx,
+                layer_idx,
+                kind,
+            )
+        })?;
+        if var_offset == u64::MAX || var_size == 0 {
+            return Err(anyhow!(
+                "AUF: variant '{}' has no payload for (layer={}, kind={:?})",
+                weights_tag,
+                layer_idx,
+                kind,
+            ));
+        }
+
+        // Shape: AUF stores outermost-first → 그대로 사용 (GGUF의 `.rev()` 미적용).
+        let shape = Shape::new(entry.shape.iter().map(|&d| d as usize).collect());
+
+        let dtype = auf_dtype_to_engine(entry.dtype).ok_or_else(|| {
+            anyhow!(
+                "AUF: unsupported dtype code {} for (layer={}, kind={:?})",
+                entry.dtype,
+                layer_idx,
+                kind,
+            )
+        })?;
+
+        // abs_offset = WEIGHTS section file offset + section-local var_offset.
+        let (weights_section_offset, _) = self
+            .view
+            .weights_range
+            .ok_or_else(|| anyhow!("AUF: weights_range None (BackendTag::Any opened?)"))?;
+        let abs_offset = weights_section_offset as usize + var_offset as usize;
+
+        // Safety: abs_offset + var_size ≤ raw_bytes().len() (TensorEntry invariant
+        // enforced by AufView::open).
+        let buffer: Arc<dyn Buffer> = Arc::new(unsafe {
+            AufViewBuffer::new(Arc::clone(&self.view), abs_offset, var_size as usize, dtype)
+        });
+        Ok(Tensor::new(
+            shape,
+            buffer,
+            self.cpu_backend.clone() as Arc<dyn Backend>,
+        ))
     }
 }
 
@@ -325,5 +432,229 @@ mod tests {
         assert_eq!(parse_arch_str("qwen2").unwrap(), ModelArch::Qwen2);
         assert_eq!(parse_arch_str("Qwen2.5").unwrap(), ModelArch::Qwen2);
         assert!(parse_arch_str("unknown_arch").is_err());
+    }
+
+    /// `materialise_cpu_tensor` zero-copy round-trip — builds a 1-layer AUF in
+    /// memory, opens via `AufSource`, then loads a tensor and verifies bytes
+    /// match the original payload.
+    #[test]
+    fn load_tensor_cpu_zero_copy_round_trip() {
+        use crate::auf::reader::open_from_bytes;
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::{TensorEntry, TensorIndex};
+        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use crate::auf::writer::AufWriter;
+        use crate::auf::{AufMeta, BackendTag};
+
+        const TENSOR_BYTES: usize = 256;
+        // Deterministic byte pattern.
+        let payload: Vec<u8> = (0..TENSOR_BYTES).map(|i| (i & 0xFF) as u8).collect();
+        let payload_clone = payload.clone();
+
+        let mut tag_buf = [0u8; 24];
+        tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+
+        let entries = vec![TensorEntry {
+            layer_idx: 0,
+            kind: TensorKind::AttnQ.as_u32(),
+            dtype: TensorDType::F32.as_u32(),
+            shape: vec![1, 64],
+            alignment: 64,
+            variant_offsets: vec![0],
+            variant_sizes: vec![TENSOR_BYTES as u64],
+        }];
+        let tensor_index = TensorIndex {
+            variant_tags: vec![tag_buf],
+            entries,
+        };
+
+        let meta = AufMeta {
+            architecture: "llama".to_owned(),
+            n_layers: 1,
+            n_heads_q: 1,
+            n_kv_heads: 1,
+            head_dim: 64,
+            hidden_dim: 64,
+            ffn_dim: 128,
+            vocab_size: 2,
+            max_seq_len: 32,
+            rope_theta: 10000.0,
+            rotary_dim: 64,
+            rope_scaling: 1.0,
+            rms_norm_epsilon: 1e-5,
+            default_dtype: None,
+        };
+        let tok = AufTokenizer {
+            kind: TOKENIZER_KIND_BPE,
+            tokens: vec![b"a".to_vec()],
+            merges: vec![],
+            bos_id: 1,
+            eos_id: 2,
+            pad_id: -1,
+            unk_id: 0,
+            chat_template: None,
+        };
+
+        let auf_bytes = AufWriter::new(meta, tok, [0u8; 32], 0, 0)
+            .with_tensor_index(tensor_index)
+            .add_weights_section(TAG_WEIGHTS_CPU_AOS, payload_clone)
+            .build()
+            .unwrap();
+
+        let view = Arc::new(open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap());
+        let config = ModelConfig {
+            arch: ModelArch::Llama,
+            hidden_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 64,
+            intermediate_size: 128,
+            vocab_size: 2,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 2,
+            weight_prefix: String::new(),
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+        };
+
+        // 직접 AufSource 구성 (open()은 file path 기반이므로 in-memory bytes 시나리오용 우회).
+        let src = AufSource {
+            view,
+            variant_tag: BackendTag::CpuAos,
+            primary_dtype: None,
+            config,
+            cpu_backend: Arc::new(CpuBackend::new()),
+            source_path: std::path::PathBuf::from("/fake/test.auf"),
+        };
+
+        // has_tensor 동작 검증.
+        let id = TensorId::LayerWeight {
+            layer: 0,
+            kind: LayerWeightKind::Wq,
+        };
+        assert!(src.has_tensor(&id));
+
+        // load_tensor_cpu가 zero-copy로 원본 payload를 그대로 노출하는지 검증.
+        let mem = crate::memory::galloc::Galloc::new();
+        let tensor = src.load_tensor_cpu(&id, true, &mem).unwrap();
+        let buf = tensor.buffer();
+        assert_eq!(buf.size(), TENSOR_BYTES);
+        assert_eq!(buf.dtype(), DType::F32);
+        let loaded = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.size()) };
+        assert_eq!(loaded, &payload[..], "loaded bytes must equal payload");
+    }
+
+    /// `LayerBias` TensorId는 명시 에러를 던져야 한다 (AUF v0.1 미지원).
+    #[test]
+    fn load_tensor_layer_bias_errors_out() {
+        use crate::auf::reader::open_from_bytes;
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::{TensorEntry, TensorIndex};
+        use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+        use crate::auf::writer::AufWriter;
+        use crate::auf::{AufMeta, BackendTag};
+
+        let mut tag_buf = [0u8; 24];
+        tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+
+        let auf_bytes = AufWriter::new(
+            AufMeta {
+                architecture: "llama".to_owned(),
+                n_layers: 1,
+                n_heads_q: 1,
+                n_kv_heads: 1,
+                head_dim: 64,
+                hidden_dim: 64,
+                ffn_dim: 128,
+                vocab_size: 2,
+                max_seq_len: 32,
+                rope_theta: 10000.0,
+                rotary_dim: 64,
+                rope_scaling: 1.0,
+                rms_norm_epsilon: 1e-5,
+                default_dtype: None,
+            },
+            AufTokenizer {
+                kind: TOKENIZER_KIND_BPE,
+                tokens: vec![b"a".to_vec()],
+                merges: vec![],
+                bos_id: 1,
+                eos_id: 2,
+                pad_id: -1,
+                unk_id: 0,
+                chat_template: None,
+            },
+            [0u8; 32],
+            0,
+            0,
+        )
+        .with_tensor_index(TensorIndex {
+            variant_tags: vec![tag_buf],
+            entries: vec![TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::F32.as_u32(),
+                shape: vec![1, 64],
+                alignment: 64,
+                variant_offsets: vec![0],
+                variant_sizes: vec![256],
+            }],
+        })
+        .add_weights_section(TAG_WEIGHTS_CPU_AOS, vec![0u8; 256])
+        .build()
+        .unwrap();
+
+        let view = Arc::new(open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap());
+        let src = AufSource {
+            view,
+            variant_tag: BackendTag::CpuAos,
+            primary_dtype: None,
+            config: ModelConfig {
+                arch: ModelArch::Qwen2,
+                hidden_size: 64,
+                num_hidden_layers: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 64,
+                intermediate_size: 128,
+                vocab_size: 2,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                has_qkv_bias: true,
+                tie_word_embeddings: false,
+                eos_token_id: 2,
+                weight_prefix: String::new(),
+                rope_local_theta: None,
+                sliding_window: None,
+                sliding_window_pattern: None,
+                query_pre_attn_scalar: None,
+                embed_scale: None,
+            },
+            cpu_backend: Arc::new(CpuBackend::new()),
+            source_path: std::path::PathBuf::from("/fake/test.auf"),
+        };
+
+        let id = TensorId::LayerBias {
+            layer: 0,
+            kind: crate::models::loader::LayerBiasKind::Bq,
+        };
+        assert!(!src.has_tensor(&id));
+        let mem = crate::memory::galloc::Galloc::new();
+        let err = match src.load_tensor_cpu(&id, false, &mem) {
+            Ok(_) => panic!("expected LayerBias to error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("AUF v0.1") && msg.contains("bias"),
+            "error should mention AUF v0.1 + bias, got: {msg}"
+        );
     }
 }
