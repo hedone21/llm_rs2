@@ -143,6 +143,30 @@ fn tensor_id_to_auf(id: &TensorId) -> Option<(u32, TensorKind)> {
     }
 }
 
+/// `TensorId`가 dtype-strict lookup을 요구하는지 결정한다.
+///
+/// - **strict (true)** — weight matmul (Wq..WDown). multi-dtype AUF의 핵심 분기로,
+///   primary_dtype에 따라 정확한 entry를 골라야 한다.
+/// - **lenient (false)** — norm 텐서 (AttentionNorm, FfnNorm 등) + cross-layer
+///   (Embed, FinalNorm, LmHead). 보통 F32/F16 단일 dtype으로만 빌드되므로 strict
+///   매칭 시 lookup 실패. `META.default_dtype` + first-match fallback 사용.
+fn is_dtype_strict_kind(id: &TensorId) -> bool {
+    match id {
+        TensorId::LayerWeight { kind, .. } => matches!(
+            kind,
+            LayerWeightKind::Wq
+                | LayerWeightKind::Wk
+                | LayerWeightKind::Wv
+                | LayerWeightKind::Wo
+                | LayerWeightKind::WGate
+                | LayerWeightKind::WUp
+                | LayerWeightKind::WDown
+        ),
+        // norm 텐서 + cross-layer + bias — dtype lenient.
+        _ => false,
+    }
+}
+
 fn layer_weight_kind_to_tensor_kind(kind: LayerWeightKind) -> Option<TensorKind> {
     Some(match kind {
         LayerWeightKind::Wq => TensorKind::AttnQ,
@@ -305,17 +329,25 @@ impl AufSource {
             )
         })?;
 
-        // dtype 우선순위: AufSource::primary_dtype (Some이면 명시) →
-        // META.default_dtype → entry first-match (AufView::lookup_tensor가 처리).
+        // dtype 우선순위:
+        // 1. Weight matmul (Wq..WDown) — primary_dtype을 lookup에 강제 (multi-dtype 분기 핵심).
+        // 2. Norm / cross-layer (Embed/FinalNorm/LmHead 등) — primary_dtype을 무시하고
+        //    AUF의 META.default_dtype + first-match (lookup_tensor 내부 fallback).
+        //    이유: norm 텐서는 보통 F32 단일이라 multi-dtype 강제 시 lookup 실패.
+        let lookup_dtype = if is_dtype_strict_kind(id) {
+            self.primary_dtype
+        } else {
+            None
+        };
         let entry = self
             .view
-            .lookup_tensor(layer_idx, kind.as_u32(), self.primary_dtype)
+            .lookup_tensor(layer_idx, kind.as_u32(), lookup_dtype)
             .map_err(|e| {
                 anyhow!(
-                    "AUF lookup failed (layer={}, kind={:?}, dtype={:?}): {}",
+                    "AUF lookup failed (layer={}, kind={:?}, lookup_dtype={:?}): {}",
                     layer_idx,
                     kind,
-                    self.primary_dtype,
+                    lookup_dtype,
                     e
                 )
             })?;
