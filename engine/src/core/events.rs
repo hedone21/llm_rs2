@@ -4,7 +4,7 @@
 //! eviction triggers, score snapshots) and an `EventSink` trait for consumers.
 //! Default `NoOpSink` is zero-cost when observability is not needed.
 
-use crate::core::pressure::{ActionResult, PressureLevel};
+use crate::pressure::{ActionResult, PressureLevel};
 
 // ── Event types ──────────────────────────────────────────────
 
@@ -63,7 +63,7 @@ pub enum CacheEvent {
     /// Score distribution snapshot taken at eviction time.
     ScoreDiagnostic(ScoreSnapshot),
     /// Proxy metric computed during a lossy cache action.
-    ProxyComputed(crate::core::qcf::QcfMetric),
+    ProxyComputed(crate::qcf::QcfMetric),
 }
 
 // ── Sink trait ────────────────────────────────────────────────

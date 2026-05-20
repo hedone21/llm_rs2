@@ -97,7 +97,7 @@ fn gemma3_4b_safetensors_resolves_layer0_qproj() {
 
     let src = llm_rs2::models::loader::safetensors::SafetensorsSource::open(
         dir.to_str().expect("non-UTF8 path"),
-        llm_rs2::core::buffer::DType::F16,
+        llm_rs2::buffer::DType::F16,
     )
     .expect("SafetensorsSource::open failed");
 

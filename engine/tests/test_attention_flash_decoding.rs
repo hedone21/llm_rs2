@@ -27,13 +27,13 @@
 
 #![cfg(target_arch = "aarch64")]
 
+use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::neon::CpuBackendNeon;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
-use llm_rs2::core::memory::Memory;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::DType;
+use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------

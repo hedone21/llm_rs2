@@ -1,9 +1,9 @@
 #![allow(unused_unsafe, unused_variables)]
+use crate::backend::Backend;
 use crate::backend::cpu::common::CpuBackendCommon;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::quant::{BlockQ4_0, BlockQ8_0, QK4_0, QK8_0};
-use crate::core::tensor::Tensor;
+use crate::buffer::DType;
+use crate::quant::{BlockQ4_0, BlockQ8_0, QK4_0, QK8_0};
+use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 #[cfg(target_arch = "x86_64")]
@@ -1581,13 +1581,13 @@ impl CpuBackendAVX2 {
 #[allow(unused_imports)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use crate::backend::cpu::CpuBackendCommon;
-    use crate::core::backend::Backend;
-    use crate::core::buffer::{Buffer, DType};
-    use crate::core::memory::Memory;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::buffer::{Buffer, DType};
+    use crate::memory::Memory;
     use crate::memory::galloc::Galloc;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     fn gen_data(n: usize, seed: u32) -> Vec<f32> {

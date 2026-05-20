@@ -1,8 +1,8 @@
-use crate::buffer::slice_buffer::SliceBuffer;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::DType;
+use crate::buffer::slice::SliceBuffer;
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 use anyhow::{Result, ensure};
 use log::debug;
 use std::sync::Arc;
@@ -193,7 +193,7 @@ pub fn split_weight(
     // GPU slice: zero-copy sub-buffer if parent has cl_mem, else fallback to copy.
     #[cfg(feature = "opencl")]
     let gpu_tensor = {
-        use crate::buffer::cl_sub_buffer::ClSubBuffer;
+        use crate::memory::opencl::sub::ClSubBuffer;
         match ClSubBuffer::new(parent_buf.clone(), 0, gpu_bytes, dtype) {
             Ok(sub_buf) => Tensor::new(
                 Shape::new(vec![split_row, in_dim]),
@@ -330,7 +330,7 @@ pub fn split_weight_col(
     // Allocate fresh CPU-owned host buffers via cpu_backend's memory arena.
     // We go through `Galloc` (host RAM) so `as_ptr()` works for the CPU path
     // and the GPU backend can later adopt these bytes via `backend.copy_from`.
-    use crate::core::memory::Memory;
+    use crate::memory::Memory;
     use crate::memory::galloc::Galloc;
 
     let galloc = Galloc::new();
@@ -724,9 +724,9 @@ pub fn print_partition_trace_summary(count: u64) {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::core::memory::Memory;
-    use crate::core::quant::{BlockQ4_0, QK4_0};
+    use crate::memory::Memory;
     use crate::memory::galloc::Galloc;
+    use crate::quant::{BlockQ4_0, QK4_0};
 
     /// Helper: create a CPU backend Arc.
     fn cpu_backend() -> Arc<dyn Backend> {

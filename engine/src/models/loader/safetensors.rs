@@ -13,15 +13,15 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::buffer::DType;
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::config::ModelConfig;
 use crate::models::mappers::{WeightMapper, create_mapper_with_prefix};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 use super::TensorId;
 use super::convert;
@@ -185,7 +185,7 @@ impl SafetensorsSource {
         let is_cpu = backend.name().contains("CPU");
 
         let finalize_tensor =
-            |shape: Shape, buffer: Arc<dyn crate::core::buffer::Buffer>| -> Result<Tensor> {
+            |shape: Shape, buffer: Arc<dyn crate::buffer::Buffer>| -> Result<Tensor> {
                 if is_cpu {
                     Ok(Tensor::new(shape, buffer, backend.clone()))
                 } else {
@@ -221,12 +221,12 @@ impl SafetensorsSource {
         if target_dtype == DType::F16 {
             // Fast path: safetensors stores F16 -> reference mmap directly (0 copies)
             if tensor_view.dtype() == safetensors::Dtype::F16 && is_cpu {
-                use crate::buffer::mmap_buffer::MmapBuffer;
+                use crate::memory::host::mmap::MmapBuffer;
                 let data = tensor_view.data();
                 let data_offset =
                     data.as_ptr() as usize - self.shard_mmaps[shard_idx].as_ptr() as usize;
                 let mmap_arc = self.shard_mmaps[shard_idx].clone();
-                let buffer: Arc<dyn crate::core::buffer::Buffer> = Arc::new(unsafe {
+                let buffer: Arc<dyn crate::buffer::Buffer> = Arc::new(unsafe {
                     MmapBuffer::new(mmap_arc, data_offset, data.len(), DType::F16)
                 });
                 return Ok(Tensor::new(shape, buffer, backend.clone()));
@@ -298,7 +298,7 @@ impl SafetensorsSource {
 
             let rows = shape.dims()[0];
             let cols = shape.dims()[1];
-            if !cols.is_multiple_of(crate::core::quant::QK4_0) {
+            if !cols.is_multiple_of(crate::quant::QK4_0) {
                 let buffer = self.cpu_memory.alloc(num_elements * 4, DType::F32)?;
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -312,12 +312,12 @@ impl SafetensorsSource {
 
             let blocks = convert::quantize_q4_0(&f32_data, rows, cols);
 
-            let size_bytes = blocks.len() * std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+            let size_bytes = blocks.len() * std::mem::size_of::<crate::quant::BlockQ4_0>();
             let buffer = self.cpu_memory.alloc(size_bytes, DType::Q4_0)?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     blocks.as_ptr(),
-                    buffer.as_mut_ptr() as *mut crate::core::quant::BlockQ4_0,
+                    buffer.as_mut_ptr() as *mut crate::quant::BlockQ4_0,
                     blocks.len(),
                 );
             }
@@ -373,12 +373,12 @@ impl SafetensorsSource {
         // F16 weight path: prefer MmapBuffer for zero-copy on CPU
         if target_dtype == DType::F16 {
             if tensor_view.dtype() == safetensors::Dtype::F16 {
-                use crate::buffer::mmap_buffer::MmapBuffer;
+                use crate::memory::host::mmap::MmapBuffer;
                 let data = tensor_view.data();
                 let data_offset =
                     data.as_ptr() as usize - self.shard_mmaps[shard_idx].as_ptr() as usize;
                 let mmap_arc = self.shard_mmaps[shard_idx].clone();
-                let buffer: Arc<dyn crate::core::buffer::Buffer> = Arc::new(unsafe {
+                let buffer: Arc<dyn crate::buffer::Buffer> = Arc::new(unsafe {
                     MmapBuffer::new(mmap_arc, data_offset, data.len(), DType::F16)
                 });
                 return Ok(Tensor::new(

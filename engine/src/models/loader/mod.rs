@@ -18,13 +18,13 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::DType;
 use crate::layers::transformer_layer::{QkvBias, TransformerLayer};
+use crate::memory::Memory;
 use crate::models::config::ModelConfig;
 use crate::models::transformer::TransformerModel;
+use crate::tensor::Tensor;
 
 /// Runtime weight-load configuration.
 ///

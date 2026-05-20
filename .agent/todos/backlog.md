@@ -4,6 +4,65 @@
 
 ---
 
+## [P1] Phase 4-4-2.3 — decode_fallback 추출 (~2,260 LOC) — 2026-05-19 backlog 이동
+- **Status**: TODO (4-4-2.1 완료 후 sprint 종료 결정, 본 추출은 backlog로 미룸)
+- **Handoff**: `.agent/todos/handoff_phase4_4_2_sprint_exit_2026_05_19.md` §5
+- **상세**: `bin/generate.rs` L1841~4099 (~2,259 LOC, 4-4-2.2 transition 흡수 포함). 단일 sprint 위험 큼 — 추가 분해 권장: decode prologue / eviction trigger / swap dispatcher / experiment writer.
+- **방향**: G3 LOC-only mechanical move (handoff §2.5 참조). trait 추상화 scope 외.
+- **게이트**: bit-identical 32 tok + avg_tbt n=5 ≤5%.
+- **HEAD**: `1b674bd7` (4-4-2.1 prefill 추출 완료 상태)
+
+## [P2] Phase 4-4-2.4 — post-process 추출 (~206 LOC) — 2026-05-19 backlog 이동
+- **Status**: TODO (4-4-2.3 완료 후 진입)
+- **상세**: `bin/generate.rs` L4101~4307. token decode + final stats + qcf-dump JSON.
+- **Dependencies**: Phase 4-4-2.3
+
+---
+
+## [P2] llm_rs2 lib clippy 회귀 — doc_lazy_continuation 29건 + unsafe pointer 1건 — 2026-05-18 등록 (Phase 4-D 게이트 도중 발견)
+- **Status**: TODO (Phase 4-D scope 외, 게이트 통과 위해 일시 우회)
+- **증상**: `cargo clippy -p llm_rs2 --lib -- -D warnings` 실패. 30개 deny 처리됨.
+- **위치**:
+  - `engine/src/core/qcf/layer_importance.rs:310, 394`
+  - `engine/src/models/weights/async_swap.rs:253`
+  - `engine/src/models/weights/noise_table.rs:627, 750, 754, 784, 939, 954, 962, 966`
+  - `engine/src/models/weights/phase_aware_swap.rs:599`
+  - `engine/src/models/weights/swap_executor.rs:652, 661, 675`
+  - `engine/src/session/chat/repl.rs:156`
+  - `engine/src/session/cli.rs:852, 853, 854, 855, 899, 900, 903, 904, 905`
+  - 1건 `this public function might dereference a raw pointer but is not marked unsafe`
+- **원인**: 최근 PR들이 doc 추가 시 lazy_continuation 회피 미적용. clippy gate가 통과 안 되는 master 상태에서 새 PR 머지가 누적됨.
+- **수정**: `///`의 multi-line continuation을 indent 4-space로 정렬. unsafe pointer는 `unsafe fn` marking 또는 `&self` 변경.
+- **영향**: 4-D 가 sanity gate 일부를 `cargo check --bins`로 좁힘. 본 backlog 해결 후 `cargo clippy --workspace --bins -- -D warnings` 게이트 복원 가능.
+
+## [RESOLVED — model issue, not code regression] Qwen2.5-1.5b chat 모드 garbage 출력 — 2026-05-19 확정
+
+**원래 가설 4 확정**: `qwen2.5-1.5b` 변형이 **base 모델** (Instruct 아님). ChatML markers (`<|im_start|>`/`<|im_end|>`) 학습 없음.
+
+**결정적 증거**:
+- llama.cpp `llama-simple` (검증된 reference impl)에서 같은 q4_0 GGUF + ChatML prompt → 동일 garbage `撙\n撙\n撙...`
+- raw prompt "The capital of France is" → 정상 "Paris. Paris is a very big city..."
+- 즉 우리 코드 회귀 아님. **모델 학습 부족**.
+
+**Ablation (S25 baseline binary)**:
+- chat off → 정상 (E)
+- greedy off (sampling on) → 정상 (D, noise로 일부 탈출)
+- rep_penalty/system_prompt 단독 영향 없음
+
+**해결책**: `Qwen2.5-1.5B-Instruct` variant 사용 (HuggingFace `Qwen/Qwen2.5-1.5B-Instruct`). **2026-05-19 S25 검증 PASS**: 같은 baseline binary + 같은 OpenCL path + 모델만 교체 → chat 1턴 "Paris is the capital of France." 정상 응답. non-chat sanity 30.36 ms/tok. GGUF: `models/qwen2.5-1.5b-instruct/qwen2.5-1.5b-instruct-q4_0.gguf` (1154.8 MB).
+
+**config 차이 (base vs Instruct)**:
+- base: `eos_token_id: 151643` (`<|endoftext|>`)
+- Instruct (예상): `eos_token_id: 151645` (`<|im_end|>`)
+
+**원래 가설 1/2/3 (template/encoding/KV sync)**: 반증.
+- tokenizer.encode `add_special=False`에도 ChatML markers 정확히 single token (151644/151645) 확인 (호스트 python check)
+- Phase 4-5-f chat repl v2 ↔ baseline chat repl 코드 path 동치 (PHB게이트에서 garbage 동등 재현)
+- 4-5-g (`c1a4b481`)가 multi-turn KV pos 보존 fix 완료
+
+**HEAD**: master `619dd655`
+
+
 ## [P0] M3.4 RED — pos baked architectural blocker — 2026-05-10
 - **Status**: 사용자 architectural decision 대기
 - **Handoff**: `.agent/todos/handoff_qnn_oppkg_m3_4_red_pos_baked_20260510.md`
@@ -30,6 +89,19 @@
 ## [P3] backend::opencl::* host test 24개 device-required fail — 2026-05-10 발견
 - **Status**: TODO (호스트 측정 환경 한계)
 - **상세**: `cargo test --workspace --features opencl --tests`에서 host에 OpenCL device 없을 때 24 fail (gpu_buffer_shift, kv_scatter_batch, noshuffle, plan tests). Galaxy S25 디바이스 빌드에선 정상. 호스트 회귀 게이트에선 본 모듈 제외 권장 — sanity-check skill에 `--exclude-tests backend::opencl` 패턴 추가 검토.
+
+## [P2] Adreno noshuffle GEMV cross-run tuning (Phase 4-4.9/10 Path B) — 2026-05-18 등록 / 2026-05-18 갱신
+- **Status**: TODO (Senior Implementer 위임 대기). Phase 4-4.10에서 default를 AOS로 invert하여 production은 회귀 없이 동작. Path B는 noshuffle SOA의 메모리 절약(≈702.8 MiB)을 회수하는 게 목표 (default를 다시 SOA로 되돌릴 수 있게).
+- **재현 방법**: `LLMRS_ENABLE_NOSHUFFLE_SOA=1`로 SOA path 명시적 활성화 → G7' n=5 측정 → 4-4.7 baseline 32.06 ms 대비 Δ ≤ 5% 합격 시 default 재invert 후보.
+- **상세**: 회귀 origin은 `kernel_gemv_noshuffle_q4_0` (plan path가 `make_q4_0_noshuffle_matmul_step`으로 직접 dispatch). Adreno 830에서 standard Q4_0 GEMV(`kernel_mul_mat_q4_0_f32`) 대비 m==1 디코드에서 ~4 ms/tok 느림 (4-4.10 measurement: 32.06 vs 36.44 median). 회수 후보 변형: LWS/SIMD 폭, image1d_buffer_t vs r32ui buffer, sub_group_reduce vs SLM tree-reduce — `feedback_adreno_subgroup_reduce.md` 원칙 준수. `feedback_cl_modification.md` 허용.
+- **측정 지표**: G7' Δ ≤ 5% (4-4.7 post 32.06 ms baseline). G6' bit-identical 32 토큰.
+- **참고 파일**:
+  - `engine/kernels/` 하위 `kernel_gemv_noshuffle_q4_0` 정의 위치 (grep 필요)
+  - `engine/src/backend/opencl/plan.rs::make_q4_0_noshuffle_matmul_step` (plan dispatch)
+  - `engine/src/backend/opencl/mod.rs::matmul_q4_0_noshuffle` (non-plan fallback)
+  - `papers/eurosys2027/_workspace/experiment/phase4_4_10_device_2026_05_18/measurement.md` (default invert 측정)
+  - `papers/eurosys2027/_workspace/experiment/phase4_4_9_device_2026_05_18/measurement.md` (Path A env gate 측정)
+- **참고 handoff**: `.agent/todos/handoff_phase4_4_entry_2026_05_17.md` Phase 4-4.10 종결.
 
 ---
 
@@ -265,27 +337,25 @@
 ---
 
 ## [P2] QCF 명명 컨벤션 정리 — `QCF_kv` / `QCF_weight` 2-tier rename
-- **Status**: TODO (결정만 완료, 코드 미적용)
-- **Sprint**: backlog
-- **Dependencies**: 없음 (rename 단순 작업이지만 IPC schema 영향 검토 필요)
-- **Description**: 현재 `unified_qcf`(KV 액션 5종)와 `compute_qcf_swap`(weight)이 이름상 같은 QCF지만 측정 공간이 다르다(`‖ΔO‖/‖O‖` vs `Σ imp×ε / Σ`). 통일이 불가하다고 판단되어 **이름으로 패밀리를 분리**. CLAUDE.md "QCF 명명 컨벤션" 섹션에 결정 기록됨 (2026-04-27).
-- **결정 사항**:
-  - **QCF_kv**: sliding/H2O/streaming eviction, KIVI quant, D2O merge (구 `unified_qcf`)
-  - **QCF_weight**: weight swap (F16→Q4), layer skip (SWIFT)
-  - 두 패밀리는 직접 비교 불가, cross-action 비교는 `DegradationEstimator` ΔPPL 환산 경유
-- **Acceptance Criteria**:
-  - `core/qcf/unified_qcf.rs` → `kv_qcf.rs`로 rename
-  - 함수/타입 rename: `compute_unified_qcf` → `compute_kv_qcf`, `UnifiedQcfParams` → `KvQcfParams`, `QcfActionType` → `KvQcfAction`
-  - swap/skip 함수에 `weight_` 접두 추가: `compute_weight_swap_qcf`, `compute_weight_skip_qcf`
-  - `DegradationEstimator` action key 컨벤션 정리: `kv.evict_h2o`, `kv.quant_kivi_q4`, `weight.swap_q4`, `weight.skip` 등 `family.action` 2단계
-  - `shared/src/lib.rs::QcfEstimate.estimates` HashMap key prefix 통일 (구조체 이름·필드는 IPC 호환성 위해 유지)
-  - `docs/USAGE.md`, `docs/layer_swap_qcf_measurement.md`, `arch/`, spec 테스트의 용어 갱신
-  - 기존 spec 테스트 PASS 유지 (rename만이라 동작 변경 없음)
-- **담당 권장**: Architect(spec key 정규화) + Implementer(rename + 테스트)
-- **Notes**:
-  - layer skip 자체의 QCF는 이미 `layer_importance.rs::compute_qcf`에 존재. weight 패밀리로 묶기.
-  - 별도 후속 검토(별 backlog): swap의 ε_i를 `‖W_F16·x − W_Q4·x‖ / ‖W_F16·x‖`로 재정의하면 QCF_kv와 같은 분자/분모 모양이 됨 → cross-family raw 비교 가능. 본 rename과는 독립.
+- **Status**: RESOLVED (2026-05-19, Sprint 2 완료)
+- **Sprint**: completed
+- **Dependencies**: 없음
+- **Description**: 현재 `unified_qcf`(KV 액션 5종)와 `compute_qcf_swap`(weight)이 이름상 같은 QCF지만 측정 공간이 다르다(`‖ΔO‖/‖O‖` vs `Σ imp×ε / Σ`). 통일이 불가하다고 판단되어 **이름으로 패밀리를 분리**.
+- **적용 결과 (2026-05-19, Sprint 2 commit)**:
+  - `core/qcf/unified_qcf.rs` → `core/qcf/qcf_kv.rs` rename
+  - `UnifiedQcfParams` → `QcfKvParams`, `compute_unified_qcf` → `compute_qcf_kv`
+  - `ImportanceTable::compute_qcf` → `compute_qcf_weight` (skip 패밀리)
+  - `decider::compute_qcf_swap` → `compute_qcf_weight_swap` (swap 패밀리, internal helper 포함)
+  - `docs/qcf_taxonomy.md` 갱신 (파일 경로 + 함수명 모두 신규명 반영)
+  - `engine/tests/spec/inv_layer_baseline.json` 의 unified_qcf.rs → qcf_kv.rs, compute_qcf_swap → compute_qcf_weight_swap 동기화
+  - 호출처 일괄 sed: `eval/eviction_hook.rs`, `eval/eval_loop.rs`, `bin/generate.rs`, `session/{ppl/runner,qcf_runtime}.rs`, `models/weights/{decider,mod}.rs`, `profile/quality_metrics.rs`, spec test 5개 파일
+- **Deferred (별 backlog)**:
+  - `DegradationEstimator` action key prefix 정규화 (`kv.*` / `weight.*`) — 호출처 string literal이 다수, ablation/eval 결과 호환성과 별도로 진행
+  - `shared::QcfEstimate.estimates` HashMap key — IPC 메시지라 manager 동시 갱신 필요
+  - 위 두 항목은 본 sprint 범위 밖. 별 backlog 항목으로 분리 권장.
+- **검증**: `cargo build --release -p llm_rs2` PASS, lib 160 qcf-related test PASS, spec 660/663 PASS (3 fail = 사전 device-required).
 - **작성일**: 2026-04-27
+- **종결일**: 2026-05-19
 
 ---
 

@@ -13,10 +13,10 @@ pub mod kernels;
 pub mod memory;
 pub mod profiler;
 
-use crate::buffer::cuda_buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
+use crate::memory::cuda::buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
+use crate::tensor::Tensor;
 use anyhow::{Context, Result, anyhow};
 use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cudarc::driver::sys as cuda_sys;
@@ -1067,7 +1067,7 @@ impl CudaBackend {
             })
             .or_else(|| {
                 buf.as_any()
-                    .downcast_ref::<crate::buffer::cuda_mmap_alias_buffer::CudaMmapAliasBuffer>()
+                    .downcast_ref::<crate::memory::cuda::mmap::CudaMmapAliasBuffer>()
                     .map(|mb| mb.device_ptr())
             })
     }
@@ -1082,8 +1082,8 @@ impl CudaBackend {
     /// Run a basic self-test to verify kernel launch + arg passing works.
     /// Tests add_assign, scale, rms_norm with known data.
     pub fn self_test(&self) -> Result<()> {
-        use crate::buffer::cuda_buffer::CudaHostBuffer;
-        use crate::core::buffer::DType;
+        use crate::buffer::DType;
+        use crate::memory::cuda::buffer::CudaHostBuffer;
 
         // === Test 1: add_assign [1,2,3] + [4,5,6] = [5,7,9] ===
         let a_buf = CudaHostBuffer::new(12, DType::F32)?;
@@ -1319,6 +1319,12 @@ impl Backend for CudaBackend {
 
     fn is_discrete_gpu(&self) -> bool {
         !self.is_uma
+    }
+
+    fn bind_current_thread(&self) -> Result<()> {
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow!("CUDA bind_to_thread failed: {e}"))
     }
 
     fn flash_attention_prefill(
@@ -2872,10 +2878,7 @@ impl Backend for CudaBackend {
     /// does its own `synchronize()` and will abort the capture loudly,
     /// which is the desired behaviour. Callers (decode loop) are
     /// expected to dispatch swap work outside the graph window.
-    fn enqueue_write_async(
-        &self,
-        src: &Tensor,
-    ) -> Result<(Tensor, crate::core::backend::GpuEvent)> {
+    fn enqueue_write_async(&self, src: &Tensor) -> Result<(Tensor, crate::backend::GpuEvent)> {
         if self.is_graph_capturing() {
             anyhow::bail!(
                 "enqueue_write_async called during CUDA Graph capture — async swap \
@@ -2884,7 +2887,7 @@ impl Backend for CudaBackend {
         }
         let Some(transfer_stream) = self.transfer_stream_or_init() else {
             let dst = self.copy_weight_from(src)?;
-            return Ok((dst, crate::core::backend::GpuEvent::default()));
+            return Ok((dst, crate::backend::GpuEvent::default()));
         };
 
         let size = src.size();
@@ -2919,7 +2922,7 @@ impl Backend for CudaBackend {
         );
         Ok((
             dst_tensor,
-            crate::core::backend::GpuEvent {
+            crate::backend::GpuEvent {
                 #[cfg(feature = "opencl")]
                 inner_cl: None,
                 inner_cu: Some(event),
@@ -2935,10 +2938,10 @@ impl Backend for CudaBackend {
     /// `src..src+len` alive until the returned event fires.
     fn enqueue_write_into_async(
         &self,
-        dst: &crate::core::tensor::Tensor,
+        dst: &crate::tensor::Tensor,
         src: *const u8,
         len: usize,
-    ) -> Result<crate::core::backend::GpuEvent> {
+    ) -> Result<crate::backend::GpuEvent> {
         if self.is_graph_capturing() {
             anyhow::bail!("enqueue_write_into_async called during CUDA Graph capture");
         }
@@ -2971,13 +2974,13 @@ impl Backend for CudaBackend {
             unsafe {
                 std::ptr::copy_nonoverlapping(src, dst_mut_ptr, len);
             }
-            return Ok(crate::core::backend::GpuEvent::default());
+            return Ok(crate::backend::GpuEvent::default());
         }
 
         let buf = dst.buffer();
         let cuda_buf = buf
             .as_any()
-            .downcast_ref::<crate::buffer::cuda_buffer::CudaDeviceBuffer>()
+            .downcast_ref::<crate::memory::cuda::buffer::CudaDeviceBuffer>()
             .ok_or_else(|| {
                 anyhow!(
                     "enqueue_write_into_async requires CudaDeviceBuffer dst (got dtype={:?}, size={})",
@@ -2997,7 +3000,7 @@ impl Backend for CudaBackend {
             cuda_buf
                 .copy_from_host(src, len)
                 .with_context(|| format!("sync H2D into pool buffer ({len} bytes)"))?;
-            return Ok(crate::core::backend::GpuEvent::default());
+            return Ok(crate::backend::GpuEvent::default());
         };
 
         cuda_buf
@@ -3012,7 +3015,7 @@ impl Backend for CudaBackend {
             .record(&transfer_stream)
             .map_err(|e| anyhow!("cuEventRecord failed: {e}"))?;
 
-        Ok(crate::core::backend::GpuEvent {
+        Ok(crate::backend::GpuEvent {
             #[cfg(feature = "opencl")]
             inner_cl: None,
             inner_cu: Some(event),
@@ -3022,7 +3025,7 @@ impl Backend for CudaBackend {
     /// Block the host thread on a `CudaEvent` recorded by
     /// `enqueue_write_async`. Falls through to a default sync barrier
     /// when no CUDA event is attached (host-only fallback path).
-    fn wait_event_blocking(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+    fn wait_event_blocking(&self, evt: &crate::backend::GpuEvent) -> Result<()> {
         if let Some(e) = evt.inner_cu.as_ref() {
             e.synchronize()
                 .map_err(|err| anyhow!("cuEventSynchronize failed: {err}"))?;

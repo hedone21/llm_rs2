@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 
+use llm_rs2::auf::dtype_convert::{build_dtype_candidates, convert_tensor_dtype};
 use llm_rs2::auf::stripper::strip;
 use llm_rs2::auf::tensor_index::{
     LAYER_IDX_CROSS, TensorDType, TensorEntry, TensorIndex, TensorKind,
@@ -19,8 +20,7 @@ use llm_rs2::auf::tensor_index::{
 use llm_rs2::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, SECTION_STRIPPABLE,
     TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS, TOKENIZER_KIND_BPE,
-    build_dtype_candidates, compute_source_hash, convert_tensor_dtype, open,
-    q4_0_aos_to_adreno_soa,
+    compute_source_hash, open, q4_0_aos_to_adreno_soa,
 };
 
 // ---------------------------------------------------------------------------
@@ -582,7 +582,7 @@ fn build_meta_from_gguf(gguf: &llm_rs2::models::loader::gguf::GgufFile) -> Resul
 }
 
 /// 레거시 호환을 위한 단순 분리 (transpose / unshuffle 없음). 새 코드에서는
-/// `llm_rs2::auf::q4_0_aos_to_adreno_soa`를 사용하라. 일부 단위 테스트가 이
+/// `crate::auf::q4_0_aos_to_adreno_soa`를 사용하라. 일부 단위 테스트가 이
 /// 헬퍼의 경계 동작을 그대로 사용하므로 보존한다.
 #[allow(dead_code)]
 fn q4_0_aos_to_soa(blocks: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -1208,7 +1208,7 @@ fn ggml_type_to_tensor_dtype(ggml_type: u32) -> TensorDType {
     }
 }
 
-// `build_dtype_candidates`는 `llm_rs2::auf::dtype_convert`에서 export된 라이브러리
+// `build_dtype_candidates`는 `crate::auf::dtype_convert`에서 export된 라이브러리
 // 함수를 사용한다 (Sprint F ISSUE-E-1 fix로 외부 lib로 이동, spec 테스트 가능).
 
 /// GGUF lm_head (F16 or F32) → F32 dequantize → Q4_0 quantize → 18B/block bytes.
@@ -1224,8 +1224,8 @@ fn quantize_lm_head_to_q4_0(
     ggml_type: u32,
     quiet: bool,
 ) -> Result<Vec<u8>> {
-    use llm_rs2::core::quant::{BlockQ4_0, QK4_0};
     use llm_rs2::models::loader::convert::{f16_to_f32, quantize_q4_0};
+    use llm_rs2::quant::{BlockQ4_0, QK4_0};
 
     if shape_logical.len() != 2 {
         bail!("lm_head must be 2-D (got shape={:?})", shape_logical);

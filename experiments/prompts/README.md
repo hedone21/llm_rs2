@@ -22,16 +22,16 @@ KV Cache Eviction 평가를 위한 벤치마크 프롬프트.
 **사용법**:
 ```bash
 # Baseline (full cache)
-cargo run --release --bin generate -- \
-  -m $MODEL -p "$PROMPT" -n 512 --greedy \
+cargo run --release --bin generate --\
+  -m $MODEL -p "$PROMPT" -n 512 --greedy\
   --experiment-output results/PPL-01-base.jsonl
 
 # Eviction (signal injection at 50%)
-cargo run --release --bin generate -- \
-  -m $MODEL -p "$PROMPT" -n 512 --greedy \
-  --eviction-policy h2o --h2o-keep-ratio 0.5 --h2o-recent-window 128 \
-  --experiment-schedule configs/memory_critical_256.json \
-  --experiment-output results/PPL-01-h2o.jsonl
+cargo run --release --bin generate --\
+  -m $MODEL -p "$PROMPT" -n 512 --greedy\
+  --experiment-schedule configs/memory_critical_256.json\
+  --experiment-output results/PPL-01-h2o.jsonl\
+  eviction h2o --keep-ratio 0.5
 ```
 
 **메트릭**: EMR, Top-K Overlap, ROUGE-L, BLEU-4
@@ -83,11 +83,11 @@ What is the special access code for the research database? The access code is
 # document + question 을 하나의 prompt로 결합
 PROMPT="$DOCUMENT\n\nQuestion: $QUESTION\nAnswer:"
 
-cargo run --release --bin generate -- \
-  -m $MODEL -p "$PROMPT" -n 128 --greedy \
-  --eviction-policy h2o \
-  --experiment-schedule configs/memory_critical_early.json \
-  --experiment-output results/QA-SD-01-h2o.jsonl
+cargo run --release --bin generate --\
+  -m $MODEL -p "$PROMPT" -n 128 --greedy\
+  --experiment-schedule configs/memory_critical_early.json\
+  --experiment-output results/QA-SD-01-h2o.jsonl\
+  eviction h2o
 ```
 
 ## 기존 프롬프트와의 관계

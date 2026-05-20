@@ -29,12 +29,12 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{Result, anyhow};
 
-use crate::buffer::cuda_buffer::{CudaDeviceBuffer, CudaHostBuffer};
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
 use crate::layers::transformer_layer::TransformerLayer;
+use crate::memory::cuda::buffer::{CudaDeviceBuffer, CudaHostBuffer};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 /// Per-tensor allocation spec — captured once from a sample
 /// `TransformerLayer` so the background allocator thread can rebuild
@@ -115,17 +115,6 @@ impl LayerObjectPool {
             anyhow::bail!("LayerObjectPool: target_depth must be > 0");
         }
 
-        // CUDA context must be bound on the background thread before any
-        // `cuMemAlloc` call there — otherwise we get CUDA_ERROR_INVALID_CONTEXT.
-        // Downcast to the cuda_embedded `CudaBackend` to grab a clone of its
-        // `Arc<CudaContext>` (the only backend type this PoC supports).
-        let cuda_ctx = backend
-            .as_any()
-            .downcast_ref::<crate::backend::cuda_embedded::CudaBackend>()
-            .ok_or_else(|| anyhow!("LayerObjectPool: backend must be CudaBackend"))?
-            .context()
-            .clone();
-
         let mut initial = VecDeque::with_capacity(target_depth);
         for i in 0..target_depth {
             initial.push_back(
@@ -139,16 +128,18 @@ impl LayerObjectPool {
         let ready_for_thread = Arc::clone(&ready);
         let backend_for_thread = Arc::clone(&backend);
         let spec_for_thread = spec.clone();
-        let ctx_for_thread = cuda_ctx;
 
         let alloc_thread = thread::Builder::new()
             .name("llmrs-layer-pool-alloc".into())
             .spawn(move || {
-                // Bind the CUDA context on this thread so cuMemAlloc / cuMemFree
-                // calls resolve to the same context as the main thread (LISWAP-8
-                // Phase B observed: CUDA_ERROR_INVALID_CONTEXT without this).
-                if let Err(e) = ctx_for_thread.bind_to_thread() {
-                    eprintln!("[LayerPool] bind_to_thread failed: {e}");
+                // Bind the backend's hardware context to this thread so
+                // background alloc calls resolve to the same context as the
+                // main thread (LISWAP-8 Phase B observed: CUDA_ERROR_INVALID_CONTEXT
+                // without this). The `Backend` trait method abstracts the
+                // CUDA-specific `bind_to_thread()` call — non-CUDA backends
+                // default to a no-op (Migration Step 3-B, V-27 resolution).
+                if let Err(e) = backend_for_thread.bind_current_thread() {
+                    eprintln!("[LayerPool] bind_current_thread failed: {e}");
                     return;
                 }
                 while alloc_rx.recv().is_ok() {
@@ -211,6 +202,20 @@ impl Drop for LayerObjectPool {
         if let Some(h) = self.alloc_thread.take() {
             let _ = h.join();
         }
+    }
+}
+
+impl crate::layers::staging_pool::WeightStagingPool for LayerObjectPool {
+    fn take(&self) -> Option<TransformerLayer> {
+        LayerObjectPool::take(self)
+    }
+
+    fn depth(&self) -> usize {
+        LayerObjectPool::depth(self)
+    }
+
+    fn target_depth(&self) -> usize {
+        LayerObjectPool::target_depth(self)
     }
 }
 

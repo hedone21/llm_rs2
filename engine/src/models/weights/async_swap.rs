@@ -32,8 +32,8 @@
 //! the commit is skipped (the slot retains the old weights). No sophisticated
 //! retry.
 
-use crate::core::backend::{Backend, GpuEvent};
-use crate::core::buffer::DType;
+use crate::backend::{Backend, GpuEvent};
+use crate::buffer::DType;
 use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
 use anyhow::{Result, anyhow};
@@ -291,11 +291,11 @@ fn process_commit(job: SwapCommitJob, backend: &Arc<dyn Backend>) {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::buffer::shared_buffer::SharedBuffer;
-    use crate::core::buffer::DType;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::buffer::DType;
     use crate::layers::transformer_layer::TransformerLayer;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     // ── helpers ──────────────────────────────────────────────────────────
@@ -305,7 +305,7 @@ mod tests {
     }
 
     fn make_tensor(be: &Arc<dyn Backend>, numel: usize) -> Tensor {
-        let buf: Arc<dyn crate::core::buffer::Buffer> =
+        let buf: Arc<dyn crate::buffer::Buffer> =
             Arc::new(SharedBuffer::new(numel * 4, DType::F32));
         Tensor::new(Shape::new(vec![numel]), buf, be.clone())
     }

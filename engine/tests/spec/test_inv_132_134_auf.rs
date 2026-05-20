@@ -8,7 +8,7 @@
 /// spec: `spec/33-engine-data.md` §3.22 (ENG-DAT-096, ENG-DAT-C13, ENG-DAT-C14)
 ///       `spec/32-engine-algorithms.md` §3.12.17 (ENG-ALG-223)
 ///       `spec/41-invariants.md` §3.16 (INV-132~134)
-use llm_rs2::auf::{
+use llm_shared::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, LAYER_IDX_CROSS, SECTION_REQUIRED,
     SECTION_STRIPPABLE, SectionEntry, SectionTable, TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS,
     TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind,
@@ -55,8 +55,8 @@ fn build_valid_auf(weights_tag: &str) -> Vec<u8> {
         .unwrap()
 }
 
-fn open(bytes: Vec<u8>, backend: BackendTag) -> Result<llm_rs2::auf::AufView, AufError> {
-    llm_rs2::auf::reader::open_from_bytes(bytes, backend)
+fn open(bytes: Vec<u8>, backend: BackendTag) -> Result<llm_shared::auf::AufView, AufError> {
+    llm_shared::auf::reader::open_from_bytes(bytes, backend)
 }
 
 // ── INV-132: magic/format/capability reject ───────────────────────────────
@@ -356,7 +356,7 @@ fn writer_reader_round_trip() {
 /// Writer → Stripper → Reader: strip 후 AUF가 여전히 valid.
 #[test]
 fn writer_stripper_reader_round_trip() {
-    use llm_rs2::auf::strip_bytes;
+    use llm_shared::auf::strip_bytes;
 
     let bytes = AufWriter::new(make_meta(), make_tokenizer(), [7u8; 32], 100, 200)
         .add_weights_section(TAG_WEIGHTS_CPU_AOS, vec![1u8; 64])

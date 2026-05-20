@@ -19,8 +19,8 @@
 /// - `spec/41-invariants.md` §3.18 (INV-137~139)
 use crate::auf::error::{AufError, AufResult};
 use crate::auf::tensor_index::TensorDType;
-use crate::core::quant::{BlockQ4_0, QK4_0};
 use crate::models::loader::convert::{f16_to_f32, quantize_q4_0};
+use crate::quant::{BlockQ4_0, QK4_0};
 use half::f16;
 
 /// `src_dtype`로 인코딩된 `src_bytes`를 `dst_dtype` 바이트로 변환한다.

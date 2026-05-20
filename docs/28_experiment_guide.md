@@ -20,21 +20,21 @@
 
 ```bash
 # Baseline (신호 없음)
-./target/release/generate -m /path/to/model \
-  -p "The history of artificial intelligence began in" \
-  -n 512 --greedy \
-  --experiment-schedule experiments/configs/baseline.json \
-  --experiment-output experiments/results/B-512.jsonl \
+./target/release/generate -m /path/to/model\
+  -p "The history of artificial intelligence began in"\
+  -n 512 --greedy\
+  --experiment-schedule experiments/configs/baseline.json\
+  --experiment-output experiments/results/B-512.jsonl\
   --experiment-sample-interval 1 --experiment-logits-topk 10
 
 # Memory eviction 실험
-./target/release/generate -m /path/to/model \
-  -p "The history of artificial intelligence began in" \
-  -n 512 --greedy \
-  --eviction-policy h2o --h2o-keep-ratio 0.5 --h2o-recent-window 128 --h2o-decay 0.1 \
-  --experiment-schedule experiments/configs/memory_critical_256.json \
-  --experiment-output experiments/results/M-C-256-h2o.jsonl \
-  --experiment-sample-interval 1 --experiment-logits-topk 10
+./target/release/generate -m /path/to/model\
+  -p "The history of artificial intelligence began in"\
+  -n 512 --greedy\
+  --experiment-schedule experiments/configs/memory_critical_256.json\
+  --experiment-output experiments/results/M-C-256-h2o.jsonl\
+  --experiment-sample-interval 1 --experiment-logits-topk 10\
+  eviction h2o --keep-ratio 0.5 --decay 0.1
 ```
 
 ## 스케줄 JSON 포맷
@@ -135,8 +135,8 @@
 ### 개별 비교
 
 ```bash
-python3 experiments/analysis/compare.py \
-  --baseline experiments/results/B-512.jsonl \
+python3 experiments/analysis/compare.py\
+  --baseline experiments/results/B-512.jsonl\
   --experiment experiments/results/M-C-256-h2o.jsonl
 ```
 
@@ -151,14 +151,14 @@ python3 experiments/analysis/round_report.py --round all   # 전체
 
 ```bash
 # TBT 시계열 (baseline 밴드 + 실험 라인 + 신호/eviction 마커)
-python3 experiments/analysis/plot_tbt_timeline.py \
-  --baseline experiments/results/B-512.jsonl \
-  --experiments experiments/results/P-128.jsonl experiments/results/P-256.jsonl \
+python3 experiments/analysis/plot_tbt_timeline.py\
+  --baseline experiments/results/B-512.jsonl\
+  --experiments experiments/results/P-128.jsonl experiments/results/P-256.jsonl\
   --output experiments/reports/plots/comparison.png
 
 # RSS 시계열
-python3 experiments/analysis/plot_rss_timeline.py \
-  --experiments experiments/results/RP-256.jsonl experiments/results/RP-512.jsonl \
+python3 experiments/analysis/plot_rss_timeline.py\
+  --experiments experiments/results/RP-256.jsonl experiments/results/RP-512.jsonl\
   --output experiments/reports/plots/rss.png
 ```
 

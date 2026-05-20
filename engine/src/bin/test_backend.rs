@@ -1,19 +1,19 @@
 use clap::Parser;
 use half::f16;
+use llm_rs2::backend::Backend;
 #[cfg(target_arch = "x86_64")]
 use llm_rs2::backend::cpu::CpuBackendAVX2;
 use llm_rs2::backend::cpu::{CpuBackend, CpuBackendCommon};
 #[cfg(feature = "opencl")]
 use llm_rs2::backend::opencl::OpenCLBackend;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::{Buffer, DType};
-use llm_rs2::core::kivi_cache::KiviCache;
-use llm_rs2::core::kv_cache::KVCacheOps;
-use llm_rs2::core::memory::Memory;
-use llm_rs2::core::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::{Buffer, DType};
+use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
+use llm_rs2::pressure::kivi_cache::KiviCache;
+use llm_rs2::pressure::kv_cache::KVCacheOps;
+use llm_rs2::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -522,7 +522,7 @@ fn perform_matmul_test(
             let buf = c_gpu.buffer();
             if let Some(cl_buf) = buf
                 .as_any()
-                .downcast_ref::<llm_rs2::backend::opencl::buffer::OpenCLBuffer>()
+                .downcast_ref::<llm_rs2::memory::opencl::device::OpenCLBuffer>()
             {
                 let mut data = vec![0u8; m * n * 4];
                 cl_buf.buffer.read(&mut data).enq()?;
@@ -824,11 +824,11 @@ fn perform_kivi_attention_test(
             }
 
             // CPU tensor (for CPU cache update)
-            let cpu_k_buf = Arc::new(llm_rs2::buffer::shared_buffer::SharedBuffer::new(
+            let cpu_k_buf = Arc::new(llm_rs2::memory::host::shared::SharedBuffer::new(
                 n_elems * 4,
                 DType::F32,
             ));
-            let cpu_v_buf = Arc::new(llm_rs2::buffer::shared_buffer::SharedBuffer::new(
+            let cpu_v_buf = Arc::new(llm_rs2::memory::host::shared::SharedBuffer::new(
                 n_elems * 4,
                 DType::F32,
             ));

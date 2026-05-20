@@ -7,7 +7,7 @@
 //! Usage at a measurement site:
 //! ```ignore
 //! use crate::profile::quality_metrics::{Timer, QCF_KV_UNIFIED};
-//! pub fn compute_unified_qcf(...) -> ... {
+//! pub fn compute_qcf_kv(...) -> ... {
 //!     let _t = Timer::start(&QCF_KV_UNIFIED);
 //!     // ... function body ...
 //! }

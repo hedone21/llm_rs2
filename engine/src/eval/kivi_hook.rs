@@ -9,8 +9,8 @@
 //! each prefill and decode step.
 
 use super::hook::{CacheSnapshot, PostStepResult, StepHook};
-use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::kivi_cache::KiviCache;
+use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::pressure::kivi_cache::KiviCache;
 
 /// KiviCache snapshot for choice-level restore.
 ///
@@ -34,7 +34,7 @@ impl CacheSnapshot<KiviCache> for KiviCacheSnapshot {
 /// Does not perform eviction; `PostStepResult` is always the default (no eviction).
 pub struct KiviHook {
     /// QCF metric collection config (used for aggregation strategy).
-    pub qcf_config: crate::core::qcf::QcfConfig,
+    pub qcf_config: crate::qcf::QcfConfig,
     /// Whether to compute and dump experimental QCF metrics (ARGUS Step 5).
     pub experimental_enabled: bool,
     /// Sample layer indices for multi-layer flush proxy (ARGUS Step 5).
@@ -58,7 +58,7 @@ pub struct KiviHook {
 
 impl KiviHook {
     pub fn new(
-        qcf_config: crate::core::qcf::QcfConfig,
+        qcf_config: crate::qcf::QcfConfig,
         experimental_enabled: bool,
         qcf_sample_layers: Vec<usize>,
         score_accumulator: Option<AttentionScoreAccumulator>,
@@ -216,7 +216,7 @@ impl StepHook<KiviCache> for KiviHook {
                 }
             };
 
-            use crate::core::qcf::{compute_c1, compute_d7};
+            use crate::qcf::{compute_c1, compute_d7};
             obj["schema_version"] = serde_json::json!(3);
             obj["action_family"] = serde_json::json!("kivi");
             obj["n_layers"] = serde_json::json!(n);
@@ -243,8 +243,8 @@ impl StepHook<KiviCache> for KiviHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::kivi_cache::KiviCache;
-    use crate::core::qcf::QcfConfig;
+    use crate::pressure::kivi_cache::KiviCache;
+    use crate::qcf::QcfConfig;
 
     fn make_hook() -> KiviHook {
         KiviHook::new(QcfConfig::default(), false, vec![0], None)
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_score_accumulator_returns_some_when_provided() {
-        use crate::core::attention_scores::AttentionScoreAccumulator;
+        use crate::inference::attention_scores::AttentionScoreAccumulator;
         // new(max_seq_len, n_heads, total_layers, last_n_layers, decay)
         let acc = AttentionScoreAccumulator::new(512, 32, 16, 0, 1.0);
         let mut hook = KiviHook::new(QcfConfig::default(), false, vec![0], Some(acc));

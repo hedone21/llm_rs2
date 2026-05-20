@@ -1,0 +1,4 @@
+The capital of France is Paris. It has a population of about 2 million people and covers an area of 104 square kilometers (km2). The city is divided into
+TTFT: 93.55 ms
+Decode: 30.59 ms/tok (32.7 tok/s) [31 tokens]
+Avg TBT: 32.56 ms (30.7 tokens/sec)

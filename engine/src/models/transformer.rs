@@ -1,19 +1,19 @@
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
-use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::kv_cache::{KVCache, KVCacheOps};
-use crate::core::memory::Memory;
-use crate::core::offload::preload_pool::{self, PreloadPool};
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
+use crate::memory::Memory;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
+use crate::pressure::kv_cache::{KVCache, KVCacheOps};
+use crate::pressure::offload::preload_pool::{self, PreloadPool};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
@@ -157,18 +157,17 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// Optional per-op profiler.
     pub profiler: Option<&'a mut crate::profile::ops::OpProfiler>,
     /// Optional SWIFT skip configuration for layer skipping.
-    pub skip_config: Option<&'a crate::core::skip_config::SkipConfig>,
+    pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Optional importance collector for Layer Skip QCF.
     /// When provided during prefill, captures per-layer cosine similarity.
-    pub importance_collector: Option<&'a mut crate::core::qcf::ImportanceCollector>,
+    pub importance_collector: Option<&'a mut crate::qcf::ImportanceCollector>,
     /// When true, only compute logits for the last sequence position.
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
     pub logits_last_only: bool,
     /// Optional D2O variance collector for layer-level allocation.
     /// When provided during prefill, captures per-layer attention column-sums.
-    pub variance_collector:
-        Option<&'a mut crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector>,
+    pub variance_collector: Option<&'a mut crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
     /// Optional layer boundary hook (LISWAP-4 / ENG-ALG-235).
     ///
     /// When `Some`, `forward_into` calls `hook.on_layer_boundary(idx, seq_len)`
@@ -389,7 +388,7 @@ impl TransformerModel {
             }
             // Create ALLOC_HOST_PTR buffer, map, copy data from CPU buffer.
             let ub =
-                crate::buffer::unified_buffer::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
+                crate::memory::opencl::unified::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
             ub.map()?; // clEnqueueMapBuffer → host pointer
             // SAFETY: src_ptr is non-null (checked above), ub.as_mut_ptr() is valid after map().
             unsafe {
@@ -511,7 +510,7 @@ impl TransformerModel {
     /// point at the CPU loader because `copy_weight_from` preserves the
     /// source tensor's backend reference.
     pub fn quantize_lm_head_to_q4_0(&mut self, runtime_backend: &Arc<dyn Backend>) -> Result<bool> {
-        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::host::shared::SharedBuffer;
         use crate::models::loader::convert::quantize_q4_0;
         use half::f16;
 
@@ -529,11 +528,11 @@ impl TransformerModel {
         }
         let cols = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();
-        if !cols.is_multiple_of(crate::core::quant::QK4_0) {
+        if !cols.is_multiple_of(crate::quant::QK4_0) {
             return Err(anyhow!(
                 "quantize_lm_head_to_q4_0: last dim ({}) is not a multiple of {} (Q4_0 block size)",
                 cols,
-                crate::core::quant::QK4_0,
+                crate::quant::QK4_0,
             ));
         }
 
@@ -594,7 +593,7 @@ impl TransformerModel {
 
         // Step 2: quantize to Q4_0 blocks.
         let blocks = quantize_q4_0(&f32_data, rows, cols);
-        let block_bytes = std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+        let block_bytes = std::mem::size_of::<crate::quant::BlockQ4_0>();
         let total_bytes = blocks.len() * block_bytes;
         // Convert Vec<BlockQ4_0> → Vec<u8> without allocating twice.
         let mut bytes_out: Vec<u8> = Vec::with_capacity(total_bytes);
@@ -685,7 +684,7 @@ impl TransformerModel {
         payload: &crate::auf::reader::LmHeadPayload<'_>,
         runtime_backend: &Arc<dyn Backend>,
     ) -> Result<()> {
-        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::host::shared::SharedBuffer;
 
         let backend = runtime_backend.clone();
         // Use `is_gpu()` trait method — legacy `name()` comparison silently
@@ -706,15 +705,15 @@ impl TransformerModel {
         let ne00 = dims[dims.len() - 1]; // cols
         let ne01: usize = dims[..dims.len() - 1].iter().product(); // rows
 
-        if !ne00.is_multiple_of(crate::core::quant::QK4_0) {
+        if !ne00.is_multiple_of(crate::quant::QK4_0) {
             return Err(anyhow!(
                 "load_lm_head_from_auf: last dim ({}) is not a multiple of {} (Q4_0 block size)",
                 ne00,
-                crate::core::quant::QK4_0,
+                crate::quant::QK4_0,
             ));
         }
-        let num_blocks = ne01 * (ne00 / crate::core::quant::QK4_0);
-        let expected_bytes = num_blocks * std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+        let num_blocks = ne01 * (ne00 / crate::quant::QK4_0);
+        let expected_bytes = num_blocks * std::mem::size_of::<crate::quant::BlockQ4_0>();
 
         // payload size must equal N * 18 in all variants (SOA total size = AOS total size).
         if payload.bytes.len() != expected_bytes {
@@ -851,7 +850,7 @@ impl TransformerModel {
             // Device-only buffer (OpenCLBuffer): read to new UnifiedBuffer.
             let size = t.size();
             let ub =
-                crate::buffer::unified_buffer::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
+                crate::memory::opencl::unified::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
             ub.map()?;
             // SAFETY: ub.as_mut_ptr() is valid after map(). read_buffer copies from GPU.
             let dst = unsafe { std::slice::from_raw_parts_mut(ub.as_mut_ptr(), size) };
@@ -1051,7 +1050,7 @@ impl TransformerModel {
         keep_original: bool,
     ) -> Result<usize> {
         use crate::backend::opencl::{NoshuffleSoaEntry, OpenCLBackend, get_cl_mem};
-        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
+        use crate::memory::opencl::noshuffle::NoshuffleWeightBuffer;
 
         let ocl_be = backend
             .as_any()
@@ -1147,6 +1146,7 @@ impl TransformerModel {
             // load picks up the noshuffle-converted ones.
             let snapshot = slot.load_weights();
             let mut layer = (*snapshot).clone();
+            let mut layer_mutated = false;
             for weight in [
                 &mut layer.wq,
                 &mut layer.wk,
@@ -1158,6 +1158,7 @@ impl TransformerModel {
             ] {
                 if process_weight(weight, true)? {
                     count += 1;
+                    layer_mutated = true;
                 }
             }
             // Partition slices: when `--tensor-partition <r>` is active the
@@ -1181,8 +1182,20 @@ impl TransformerModel {
                 ] {
                     if process_weight(weight, false)? {
                         count += 1;
+                        layer_mutated = true;
                     }
                 }
+            }
+            // Phase 4-4.8: RCU publish step. Without this the swapped tensors
+            // live only on the local `layer` clone and slot readers continue
+            // to see the pre-swap AOS buffers, so `lookup_noshuffle_soa` keys
+            // (registered against `d_buf`) never match the post-load cl_mem
+            // (still the original AOS allocation). `build_plan` then aborts
+            // at the "Q4_0 SOA entry missing" guard and the GPU plan path is
+            // disabled for the entire session. Publish only when at least one
+            // weight changed to avoid pointless ArcSwap churn.
+            if layer_mutated {
+                slot.store_weights_same_dtype(Arc::new(layer));
             }
         }
 
@@ -1610,7 +1623,7 @@ impl TransformerModel {
                 if let Some(ub) = x
                     .buffer()
                     .as_any()
-                    .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+                    .downcast_ref::<crate::memory::opencl::unified::UnifiedBuffer>()
                 {
                     let _ = ub.map();
                 }
@@ -1837,13 +1850,7 @@ impl TransformerModel {
             // Record importance after layer forward
             if let Some(ref mut coll) = importance_collector {
                 let x_data = x.as_slice::<f32>();
-                coll.record_after(
-                    x_data,
-                    seq_len,
-                    hidden_size,
-                    i,
-                    crate::core::qcf::SubLayer::Full,
-                );
+                coll.record_after(x_data, seq_len, hidden_size, i, crate::qcf::SubLayer::Full);
             }
 
             // Capture attention scores for H2O/H2O+ accumulator
@@ -1980,7 +1987,25 @@ impl TransformerModel {
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
         use crate::backend::opencl::plan::*;
-        use crate::core::kv_cache::KVLayout;
+        use crate::pressure::kv_cache::KVLayout;
+
+        // Phase 4-4.8 diagnostic: env-gated line-by-line trace to identify
+        // which None-return path fires when the happy-path ModelForward
+        // sticky-locks. Costs 1 syscall per build_plan call when unset.
+        let trace = std::env::var_os("LLMRS_BUILD_PLAN_TRACE").is_some();
+        macro_rules! trace_none {
+            ($tag:expr) => {{
+                if trace {
+                    eprintln!(
+                        "[build_plan-trace] None at {} ({}:{})",
+                        $tag,
+                        file!(),
+                        line!()
+                    );
+                }
+                return None;
+            }};
+        }
 
         // Snapshot every layer's weights once and keep the Arcs alive for the
         // duration of plan construction. The cl_mem references captured below
@@ -1988,7 +2013,7 @@ impl TransformerModel {
         let layer_snaps: Vec<Arc<TransformerLayer>> =
             self.layers.iter().map(|s| s.load_weights()).collect();
         if layer_snaps.is_empty() {
-            return None;
+            trace_none!("layer_snaps.is_empty");
         }
         // ENG-ALG-219 / weight-swap: per-layer dtype tracking. A weight swap
         // batch may leave the model in a *mixed* state (some layers F16, some
@@ -2004,38 +2029,50 @@ impl TransformerModel {
         // Reject the plan only when at least one layer has neither dtype.
         if layer_snaps.iter().any(|l| {
             let d = l.wq.dtype();
-            d != crate::core::buffer::DType::F16 && d != crate::core::buffer::DType::Q4_0
+            d != crate::buffer::DType::F16 && d != crate::buffer::DType::Q4_0
         }) {
-            return None;
+            trace_none!("wq dtype not F16/Q4_0");
         }
         let any_q4_0 = layer_snaps
             .iter()
-            .any(|l| l.wq.dtype() == crate::core::buffer::DType::Q4_0);
+            .any(|l| l.wq.dtype() == crate::buffer::DType::Q4_0);
 
         // kernel_add_row_bias expects F32 bias buffers. If any layer has
         // a QKV bias that isn't F32, fall back to the legacy path.
         if self.config.has_qkv_bias {
             for layer in &layer_snaps {
                 if layer.qkv_bias.as_ref().is_some_and(|bias| {
-                    bias.bq.dtype() != crate::core::buffer::DType::F32
-                        || bias.bk.dtype() != crate::core::buffer::DType::F32
-                        || bias.bv.dtype() != crate::core::buffer::DType::F32
+                    bias.bq.dtype() != crate::buffer::DType::F32
+                        || bias.bk.dtype() != crate::buffer::DType::F32
+                        || bias.bv.dtype() != crate::buffer::DType::F32
                 }) {
-                    return None;
+                    trace_none!("qkv_bias dtype not F32");
                 }
             }
         }
 
         if backend.name() != "OpenCL" || kv_caches.is_empty() {
-            return None;
+            trace_none!("backend not OpenCL or kv_caches empty");
         }
 
-        // Helper macro to extract cl_mem from tensor (avoids closure lifetime issues)
+        // Helper macro to extract cl_mem from tensor. Diagnostic-aware: emits
+        // a trace tag identifying which tensor lookup failed.
         macro_rules! cl {
             ($t:expr) => {
                 match get_cl_mem($t.buffer().as_ref()) {
                     Ok(m) => m,
-                    Err(_) => return None,
+                    Err(_) => {
+                        if trace {
+                            eprintln!(
+                                "[build_plan-trace] None at cl!(...) get_cl_mem failed: \
+                                 expr={} ({}:{})",
+                                stringify!($t),
+                                file!(),
+                                line!()
+                            );
+                        }
+                        return None;
+                    }
                 }
             };
         }
@@ -2060,14 +2097,49 @@ impl TransformerModel {
         // the layer 0-only check that lived here previously was insufficient
         // — if layer 0 stays F16 and layer 1 is freshly Q4_0, missing layer 1
         // SOA must still abort the GPU plan and force the legacy path.
-        for layer in &layer_snaps {
-            if layer.wq.dtype() != crate::core::buffer::DType::Q4_0 {
+        for (li, layer) in layer_snaps.iter().enumerate() {
+            if layer.wq.dtype() != crate::buffer::DType::Q4_0 {
                 continue;
             }
             let wq_key = cl!(layer.wq).as_ptr() as usize;
+            if trace && li == 0 {
+                let is_nb = layer
+                    .wq
+                    .buffer()
+                    .as_any()
+                    .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>()
+                    .is_some();
+                eprintln!(
+                    "[build_plan-trace] layer0 wq key=0x{:x} is_NoshuffleWeightBuffer={}",
+                    wq_key, is_nb
+                );
+            }
             match ocl_backend.lookup_noshuffle_soa(wq_key) {
                 Some(e) if e.q_img.is_some() => {}
-                _ => return None,
+                Some(_) => {
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at Q4_0 SOA q_img missing layer={} \
+                             ({}:{})",
+                            li,
+                            file!(),
+                            line!()
+                        );
+                    }
+                    return None;
+                }
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at Q4_0 SOA entry missing layer={} \
+                             ({}:{})",
+                            li,
+                            file!(),
+                            line!()
+                        );
+                    }
+                    return None;
+                }
             }
         }
 
@@ -2078,7 +2150,7 @@ impl TransformerModel {
         // None, but the per-layer abort above means we never reach this with
         // an unregistered Q4_0 weight in production.
         let ns_entry = |tensor: &Tensor| -> Option<NoshufflePlanEntry<'_>> {
-            if tensor.dtype() != crate::core::buffer::DType::Q4_0 {
+            if tensor.dtype() != crate::buffer::DType::Q4_0 {
                 return None;
             }
             let key = cl!(tensor).as_ptr() as usize;
@@ -2189,6 +2261,15 @@ impl TransformerModel {
                 Ok(progs) => Some(progs),
                 Err(e) => {
                     log::warn!("Failed to build noshuffle programs for plan: {}", e);
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at build_noshuffle_programs err={} \
+                             ({}:{})",
+                            e,
+                            file!(),
+                            line!()
+                        );
+                    }
                     return None;
                 }
             }
@@ -2351,7 +2432,7 @@ impl TransformerModel {
                 // than collapsing to a single boolean.
                 let q4_0_count = layer_snaps
                     .iter()
-                    .filter(|l| l.wq.dtype() == crate::core::buffer::DType::Q4_0)
+                    .filter(|l| l.wq.dtype() == crate::buffer::DType::Q4_0)
                     .count();
                 log::info!(
                     "GPU kernel plan built ({} layers, capacity={}, q4_noshuffle={}/{})",
@@ -2375,6 +2456,14 @@ impl TransformerModel {
                     log::info!("GPU kernel plan skipped: {}", chain);
                 } else {
                     log::warn!("Failed to build GPU kernel plan: {}", chain);
+                }
+                if trace {
+                    eprintln!(
+                        "[build_plan-trace] None at build_full_plan err chain={} ({}:{})",
+                        chain,
+                        file!(),
+                        line!()
+                    );
                 }
                 None
             }
@@ -2460,7 +2549,7 @@ impl TransformerModel {
         x: &Tensor,
         logits: &Tensor,
         ws: &LayerWorkspace,
-        kv_caches: &[crate::core::kivi_cache::KiviCache],
+        kv_caches: &[crate::pressure::kivi_cache::KiviCache],
         backend: &Arc<dyn Backend>,
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
@@ -2482,7 +2571,7 @@ impl TransformerModel {
         // a Q4_0 buffer and produce garbage on the affected layers.
         if layer_snaps
             .iter()
-            .any(|l| l.wq.dtype() != crate::core::buffer::DType::F16)
+            .any(|l| l.wq.dtype() != crate::buffer::DType::F16)
         {
             return None;
         }
@@ -2636,7 +2725,7 @@ impl TransformerModel {
         input_tokens: &Tensor,
         start_pos: usize,
         x_gen: &mut Tensor,
-        kv_caches: &mut [crate::core::kivi_cache::KiviCache],
+        kv_caches: &mut [crate::pressure::kivi_cache::KiviCache],
         logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
@@ -2677,10 +2766,10 @@ impl TransformerModel {
     /// thread accesses any given `kv_caches[j]` at a time.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
-    pub fn forward_into_offload<C: crate::core::kv_cache::PrefetchableCache>(
+    pub fn forward_into_offload<C: crate::pressure::kv_cache::PrefetchableCache>(
         &self,
         args: TransformerModelForwardArgs<'_, C>,
-        prefetch: &mut crate::core::offload::prefetch::PrefetchController,
+        prefetch: &mut crate::pressure::offload::prefetch::PrefetchController,
     ) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
@@ -2915,7 +3004,7 @@ impl TransformerModel {
 
         // 2. Read x from GPU into a CPU-backed tensor.
         let x_size = x.size(); // F32 bytes
-        let x_cpu_buf = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+        let x_cpu_buf = Arc::new(crate::memory::host::shared::SharedBuffer::new(
             x_size,
             DType::F32,
         ));
@@ -2930,7 +3019,7 @@ impl TransformerModel {
 
         // 3. Allocate CPU logits buffer and run matmul.
         let logits_size = logits_out.size();
-        let logits_cpu_buf = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+        let logits_cpu_buf = Arc::new(crate::memory::host::shared::SharedBuffer::new(
             logits_size,
             DType::F32,
         ));
@@ -3061,10 +3150,10 @@ fn compute_quant_noise_for_model(
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::core::buffer::DType;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::buffer::DType;
     use crate::memory::galloc::Galloc;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     /// Build a minimal TransformerModel-like object with CPU backend and
@@ -3532,8 +3621,8 @@ mod tests {
     /// Build a minimal TransformerModel with F16 lm_head (VOCAB×HIDDEN),
     /// CPU backend only.
     fn make_cpu_model_lm_head(vocab: usize, hidden: usize) -> (TransformerModel, Arc<dyn Backend>) {
-        use crate::buffer::shared_buffer::SharedBuffer;
         use crate::memory::galloc::Galloc;
+        use crate::memory::host::shared::SharedBuffer;
         let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let mem = Galloc::new();
 
@@ -3729,16 +3818,16 @@ mod tests {
                 _id: &TensorId,
                 _is_weight: bool,
                 _backend: &Arc<dyn Backend>,
-                _memory: &dyn crate::core::memory::Memory,
-            ) -> Result<crate::core::tensor::Tensor> {
+                _memory: &dyn crate::memory::Memory,
+            ) -> Result<crate::tensor::Tensor> {
                 unimplemented!()
             }
             fn load_tensor_cpu(
                 &self,
                 _id: &TensorId,
                 _is_weight: bool,
-                _memory: &dyn crate::core::memory::Memory,
-            ) -> Result<crate::core::tensor::Tensor> {
+                _memory: &dyn crate::memory::Memory,
+            ) -> Result<crate::tensor::Tensor> {
                 unimplemented!()
             }
             fn has_tensor(&self, _id: &TensorId) -> bool {
@@ -3783,16 +3872,16 @@ mod tests {
                 _id: &TensorId,
                 _is_weight: bool,
                 _backend: &Arc<dyn Backend>,
-                _memory: &dyn crate::core::memory::Memory,
-            ) -> Result<crate::core::tensor::Tensor> {
+                _memory: &dyn crate::memory::Memory,
+            ) -> Result<crate::tensor::Tensor> {
                 unimplemented!()
             }
             fn load_tensor_cpu(
                 &self,
                 _id: &TensorId,
                 _is_weight: bool,
-                _memory: &dyn crate::core::memory::Memory,
-            ) -> Result<crate::core::tensor::Tensor> {
+                _memory: &dyn crate::memory::Memory,
+            ) -> Result<crate::tensor::Tensor> {
                 unimplemented!()
             }
             fn has_tensor(&self, _id: &TensorId) -> bool {

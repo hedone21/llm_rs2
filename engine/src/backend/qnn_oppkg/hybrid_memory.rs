@@ -11,8 +11,8 @@
 //! bridge memcpy를 제거한다.
 
 use crate::backend::qnn_oppkg::QnnOppkgBackend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
+use crate::buffer::{Buffer, DType};
+use crate::memory::Memory;
 use anyhow::Result;
 use std::sync::Arc;
 

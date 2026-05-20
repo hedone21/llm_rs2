@@ -1,0 +1,10 @@
+Decode: 34.37 ms/tok (29.1 tok/s) [31 tokens]
+Avg TBT: 36.44 ms (27.4 tokens/sec)
+Decode: 34.28 ms/tok (29.2 tok/s) [31 tokens]
+Avg TBT: 36.35 ms (27.5 tokens/sec)
+Decode: 34.53 ms/tok (29.0 tok/s) [31 tokens]
+Avg TBT: 36.60 ms (27.3 tokens/sec)
+Decode: 34.63 ms/tok (28.9 tok/s) [31 tokens]
+Avg TBT: 36.69 ms (27.3 tokens/sec)
+Decode: 34.56 ms/tok (28.9 tok/s) [31 tokens]
+Avg TBT: 36.68 ms (27.3 tokens/sec)

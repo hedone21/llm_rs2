@@ -30,9 +30,9 @@ pub mod memory;
 pub mod runtime;
 pub mod weight_pack;
 
-use crate::core::backend::Backend;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
 use crate::models::weights::LayerSlot;
+use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -607,10 +607,10 @@ impl Backend for QnnOppkgBackend {
         host_ptr: *mut u8,
         offset: usize,
         size: usize,
-        dtype: crate::core::buffer::DType,
+        dtype: crate::buffer::DType,
         secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
         layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
-    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+    ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         let res = self.with_opencl_secondary(|ocl| {
             ocl.alloc_alias_weight_buffer(
                 host_ptr,

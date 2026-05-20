@@ -18,24 +18,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::core::backend::{Backend, GpuEvent};
-use llm_rs2::core::buffer::DType;
+use llm_rs2::backend::{Backend, GpuEvent};
+use llm_rs2::buffer::DType;
 use llm_rs2::models::config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::async_swap::{AsyncSwapDispatcher, SwapCommitJob};
 use llm_rs2::models::weights::{IntraForwardSwapHook, LayerSlot};
 
-use llm_rs2::buffer::shared_buffer::SharedBuffer;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::transformer_layer::TransformerLayer;
+use llm_rs2::memory::host::shared::SharedBuffer;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 
 fn cpu_backend() -> Arc<dyn Backend> {
     Arc::new(CpuBackend::new())
 }
 
 fn make_tensor(be: &Arc<dyn Backend>, numel: usize) -> Tensor {
-    let buf: Arc<dyn llm_rs2::core::buffer::Buffer> =
-        Arc::new(SharedBuffer::new(numel * 4, DType::F32));
+    let buf: Arc<dyn llm_rs2::buffer::Buffer> = Arc::new(SharedBuffer::new(numel * 4, DType::F32));
     Tensor::new(Shape::new(vec![numel]), buf, be.clone())
 }
 

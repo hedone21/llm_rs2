@@ -3,21 +3,21 @@
 //! Tests cross-action compatibility, mutual exclusion, and combined behavior
 //! for the 8 action pool algorithms (W1-W3, C1, C4-C6, C8).
 
-use llm_rs2::core::kivi_cache::KiviCache;
-use llm_rs2::core::kv_cache::{KVCache, KVCacheOps, KVLayout};
 use llm_rs2::core::math_utils::{avg_pool_1d, topk_indices_per_head};
-use llm_rs2::core::offload::store::OffloadStore;
-use llm_rs2::core::pressure::quantize_handler::QuantizeHandler;
-use llm_rs2::core::pressure::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
-use llm_rs2::core::quant::{BlockKVQ4, BlockKVQ8, QKKV};
-use llm_rs2::core::skip_config::SkipConfig;
-use llm_rs2::core::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
+use llm_rs2::inference::skip_config::SkipConfig;
+use llm_rs2::inference::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
+use llm_rs2::pressure::kivi_cache::KiviCache;
+use llm_rs2::pressure::kv_cache::{KVCache, KVCacheOps, KVLayout};
+use llm_rs2::pressure::offload::store::OffloadStore;
+use llm_rs2::pressure::quantize_handler::QuantizeHandler;
+use llm_rs2::pressure::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
+use llm_rs2::quant::{BlockKVQ4, BlockKVQ8, QKKV};
 
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::buffer::shared_buffer::SharedBuffer;
-use llm_rs2::core::buffer::{Buffer, DType};
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::{Buffer, DType};
+use llm_rs2::memory::host::shared::SharedBuffer;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use std::sync::Arc;
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
@@ -80,8 +80,8 @@ fn make_headmajor_cache(num_tokens: usize, kv_heads: usize, head_dim: usize) -> 
 fn test_streaming_alias_parameters() {
     // Verify streaming eviction parameters are semantically equivalent to
     // SlidingWindowPolicy with specific prefix/window values.
-    use llm_rs2::core::eviction::EvictionPolicy;
-    use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
+    use llm_rs2::pressure::eviction::EvictionPolicy;
+    use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
 
     let streaming = SlidingWindowPolicy::new(2000, 4);
     let mut cache = make_seqmajor_cache(50, 1, 4);
@@ -160,7 +160,7 @@ fn make_kivi_input(
     base: f32,
 ) -> (Tensor, Tensor) {
     let n = seq_len * kv_heads * head_dim;
-    let backend: Arc<dyn llm_rs2::core::backend::Backend> = Arc::new(CpuBackend::new());
+    let backend: Arc<dyn llm_rs2::backend::Backend> = Arc::new(CpuBackend::new());
 
     let k_buf = Arc::new(SharedBuffer::new(n * 4, DType::F32));
     let v_buf = Arc::new(SharedBuffer::new(n * 4, DType::F32));
@@ -209,8 +209,8 @@ fn test_throttle_plus_eviction_independence() {
     // Eviction modifies cache. They don't interfere.
 
     let mut cache = make_seqmajor_cache(50, 1, 4);
-    use llm_rs2::core::eviction::EvictionPolicy;
-    use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
+    use llm_rs2::pressure::eviction::EvictionPolicy;
+    use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
 
     let sliding = SlidingWindowPolicy::new(10, 4);
     // Evict while "throttled" (simulated — no actual delay needed for correctness test)
@@ -283,7 +283,7 @@ fn test_all_actions_data_flow() {
     // configured, and invoked without crash.
 
     // C6: StreamingLLM (SlidingWindowPolicy with sink)
-    use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
+    use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
     let _streaming = SlidingWindowPolicy::new(2000, 4);
 
     // C8: KIVI multi-bit
@@ -291,7 +291,7 @@ fn test_all_actions_data_flow() {
     assert_eq!(cache.bits(), 4);
 
     // W2: DiskStore
-    use llm_rs2::core::offload::disk_store::DiskStore;
+    use llm_rs2::pressure::offload::disk_store::DiskStore;
     let dir = std::env::temp_dir().join("llm_rs2_test_all_actions");
     let _ = std::fs::remove_dir_all(&dir);
     let mut store = DiskStore::new(dir.clone(), 0, 64).unwrap();
@@ -305,7 +305,7 @@ fn test_all_actions_data_flow() {
     // C1: SkipConfig + Speculative
     let skip = SkipConfig::uniform_init(16, 0.3);
     assert!(skip.validate(16));
-    let _spec = llm_rs2::core::speculative::SpeculativeConfig::new(skip, 25, 0.8);
+    let _spec = llm_rs2::inference::speculative::SpeculativeConfig::new(skip, 25, 0.8);
 
     // C8: QuantizeHandler pressure mapping
     assert_eq!(
@@ -343,8 +343,8 @@ fn test_topk_per_head_consistency() {
 
 #[test]
 fn test_disk_store_integration() {
-    use llm_rs2::core::offload::disk_store::DiskStore;
-    use llm_rs2::core::offload::store::OffloadStore;
+    use llm_rs2::pressure::offload::disk_store::DiskStore;
+    use llm_rs2::pressure::offload::store::OffloadStore;
 
     let dir = std::env::temp_dir().join("llm_rs2_test_disk_integration");
     let _ = std::fs::remove_dir_all(&dir);

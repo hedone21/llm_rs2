@@ -19,14 +19,14 @@
 //!
 //! Spec: INV-135 v2, INV-136, G-1-F fix.
 
-use llm_rs2::auf::reader::{BackendTag, open_from_bytes};
-use llm_rs2::auf::section::{TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS};
-use llm_rs2::auf::tensor_index::{
+use llm_shared::auf::reader::{BackendTag, open_from_bytes};
+use llm_shared::auf::section::{TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS};
+use llm_shared::auf::tensor_index::{
     LAYER_IDX_CROSS, TensorDType, TensorEntry, TensorIndex, TensorKind,
 };
-use llm_rs2::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
-use llm_rs2::auf::writer::AufWriter;
-use llm_rs2::auf::{AufMeta, q4_0_aos_to_adreno_soa};
+use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+use llm_shared::auf::writer::AufWriter;
+use llm_shared::auf::{AufMeta, q4_0_aos_to_adreno_soa};
 
 // ── Fixture constants ─────────────────────────────────────────────────────────
 
@@ -281,8 +281,8 @@ fn backward_compat_bit2_zero_adreno_soa_returns_none() {
 /// G-1-B writer가 동일 GGUF에서 두 번 빌드 시 byte-identical AUF를 만드는 전제 검증.
 #[test]
 fn quantize_q4_0_is_deterministic() {
-    use llm_rs2::core::quant::BlockQ4_0;
     use llm_rs2::models::loader::convert::quantize_q4_0;
+    use llm_rs2::quant::BlockQ4_0;
 
     let f32_data: Vec<f32> = (0..VOCAB * HIDDEN)
         .map(|i| (i as f32) * 0.001 - 4.0)
@@ -303,8 +303,8 @@ fn quantize_q4_0_is_deterministic() {
 /// G-1-B writer path와 직접 quantize 경로의 결과 동일성 검증.
 #[test]
 fn auf_cpu_aos_payload_matches_direct_quantize() {
-    use llm_rs2::core::quant::BlockQ4_0;
     use llm_rs2::models::loader::convert::quantize_q4_0;
+    use llm_rs2::quant::BlockQ4_0;
 
     // Step A: direct quantize → bytes.
     let f32_data: Vec<f32> = (0..VOCAB * HIDDEN)
@@ -392,7 +392,7 @@ fn lm_head_payload_accessors_adreno_soa() {
 /// lm_head_q4_0_payload: vocab_size mismatch → Err(LmHeadShapeMismatch).
 #[test]
 fn shape_mismatch_vocab_returns_err() {
-    use llm_rs2::auf::error::AufError;
+    use llm_shared::auf::error::AufError;
     let aos = make_aos_q4_0_bytes();
     let auf_bytes = build_auf_cpu_aos_with_lm_head(&aos);
     let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
@@ -408,7 +408,7 @@ fn shape_mismatch_vocab_returns_err() {
 /// lm_head_q4_0_payload: hidden_dim mismatch → Err(LmHeadShapeMismatch).
 #[test]
 fn shape_mismatch_hidden_returns_err() {
-    use llm_rs2::auf::error::AufError;
+    use llm_shared::auf::error::AufError;
     let aos = make_aos_q4_0_bytes();
     let auf_bytes = build_auf_cpu_aos_with_lm_head(&aos);
     let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();

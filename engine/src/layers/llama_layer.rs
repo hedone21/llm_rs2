@@ -11,7 +11,8 @@ pub use super::transformer_layer::{
 pub type LlamaLayer = TransformerLayer;
 
 /// Backward-compatible alias for [`LayerForwardArgs`].
-pub type LlamaLayerForwardArgs<'a, C = crate::core::kv_cache::KVCache> = LayerForwardArgs<'a, C>;
+pub type LlamaLayerForwardArgs<'a, C = crate::pressure::kv_cache::KVCache> =
+    LayerForwardArgs<'a, C>;
 
 /// Backward-compatible alias for [`ForwardGenArgs`].
-pub type LlamaForwardGenArgs<'a, C = crate::core::kv_cache::KVCache> = ForwardGenArgs<'a, C>;
+pub type LlamaForwardGenArgs<'a, C = crate::pressure::kv_cache::KVCache> = ForwardGenArgs<'a, C>;

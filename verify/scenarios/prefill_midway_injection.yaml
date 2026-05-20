@@ -11,11 +11,15 @@ baseline:
   backend: auto
   prefill_chunk_size: 64
   extra_args:
-    - "--eviction-policy"
+    # `--sink` / `--recent-window` belong to the streaming policy struct,
+    # so they follow the subcommand. (The mock_manager_commands block
+    # below still uses the legacy `--sink-size` flag — that's the manager
+    # IPC schema, an independent domain from the generate CLI.)
+    - "eviction"
     - "streaming"
-    - "--sink-size"
+    - "--sink"
     - "4"
-    - "--streaming-window"
+    - "--recent-window"
     - "512"
 action:
   enable_resilience: true

@@ -12,7 +12,7 @@
 //!       여기서는 QCF 함수가 올바른 QcfMetric을 반환하는지 확인하여
 //!       "생성 가능성"을 보장한다.
 
-use llm_rs2::core::qcf::{QcfConfig, QcfMetric, QcfMode, SkipQcfTracker};
+use llm_rs2::qcf::{QcfConfig, QcfMetric, QcfMode, SkipQcfTracker};
 
 // ═══════════════════════════════════════════════════════════════
 // INV-004/017: QcfConfig has an `enabled` field to control collection

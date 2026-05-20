@@ -23,14 +23,14 @@
 //!
 //! Spec 참고: ENG-ALG-239~ (B-3 검증 후 Architect 발급 예정).
 
-use crate::core::backend::{Backend, GpuEvent};
-use crate::core::buffer::DType;
-use crate::core::tensor::Tensor;
+use crate::backend::{Backend, GpuEvent};
+use crate::buffer::DType;
 use crate::models::weights::async_swap::{AsyncSwapDispatcher, ChunkDispatchJob, SwapCommitJob};
 use crate::models::weights::secondary_mmap::SecondaryMmap;
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
 use crate::models::weights::swap_executor::SwapExecutor;
 use crate::profile::op_trace::{DdrPhase, OpKind, PhaseHook};
+use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -720,10 +720,10 @@ mod tests {
     #[test]
     fn test_partial_layer_falls_back_for_missing_norms() {
         use crate::backend::cpu::CpuBackend;
-        use crate::buffer::shared_buffer::SharedBuffer;
-        use crate::core::buffer::Buffer;
-        use crate::core::shape::Shape;
+        use crate::buffer::Buffer;
         use crate::layers::transformer_layer::TransformerLayer;
+        use crate::memory::host::shared::SharedBuffer;
+        use crate::shape::Shape;
 
         let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let mk = |numel: usize| -> Tensor {
@@ -776,10 +776,10 @@ mod tests {
     #[test]
     fn test_partial_layer_errors_on_missing_weight() {
         use crate::backend::cpu::CpuBackend;
-        use crate::buffer::shared_buffer::SharedBuffer;
-        use crate::core::buffer::Buffer;
-        use crate::core::shape::Shape;
+        use crate::buffer::Buffer;
         use crate::layers::transformer_layer::TransformerLayer;
+        use crate::memory::host::shared::SharedBuffer;
+        use crate::shape::Shape;
 
         let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let mk = |numel: usize| -> Tensor {

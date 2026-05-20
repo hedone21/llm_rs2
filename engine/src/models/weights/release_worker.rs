@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::core::backend::Backend;
+use crate::backend::Backend;
 use crate::models::weights::LayerWeights;
 use crate::models::weights::swap_executor::record_swap_release_pub;
 
@@ -192,7 +192,7 @@ impl std::error::Error for DrainError {}
 fn tally_layer_bytes(layer: &LayerWeights) -> (usize, usize) {
     let mut bytes = 0usize;
     let mut count = 0usize;
-    let mut tally = |t: &crate::core::tensor::Tensor| {
+    let mut tally = |t: &crate::tensor::Tensor| {
         bytes += t.size();
         count += 1;
     };
@@ -229,11 +229,11 @@ fn tally_layer_bytes(layer: &LayerWeights) -> (usize, usize) {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::buffer::shared_buffer::SharedBuffer;
-    use crate::core::buffer::DType;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::buffer::DType;
     use crate::layers::transformer_layer::TransformerLayer;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     fn cpu_be() -> Arc<dyn Backend> {
@@ -241,7 +241,7 @@ mod tests {
     }
 
     fn make_tensor(be: &Arc<dyn Backend>, numel: usize) -> Tensor {
-        let buf: Arc<dyn crate::core::buffer::Buffer> =
+        let buf: Arc<dyn crate::buffer::Buffer> =
             Arc::new(SharedBuffer::new(numel * 4, DType::F32));
         Tensor::new(Shape::new(vec![numel]), buf, be.clone())
     }

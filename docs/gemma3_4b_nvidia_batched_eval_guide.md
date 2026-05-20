@@ -27,13 +27,13 @@ NVIDIA 호스트 OpenCL에서 Gemma3 4B `--eval-ll`이 10문항 이상 배치에
 ## 사용법
 
 ```bash
-OCL_PLATFORM=NVIDIA python3 scripts/eval_ll_batched.py \
-  --model-path /path/to/gemma3-4b \
-  --eval-batch /path/to/questions.json \
-  --output /tmp/eval_result.json \
-  --chunk-size 4 \
-  --max-retries 3 \
-  -- --backend opencl --kv-type f32 --max-seq-len 4096 \
+OCL_PLATFORM=NVIDIA python3 scripts/eval_ll_batched.py\
+  --model-path /path/to/gemma3-4b\
+  --eval-batch /path/to/questions.json\
+  --output /tmp/eval_result.json\
+  --chunk-size 4\
+  --max-retries 3\
+  -- --backend opencl --kv-type f32 --max-seq-len 4096\
      --qcf-mode both --greedy
 ```
 

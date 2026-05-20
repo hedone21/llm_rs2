@@ -11,10 +11,10 @@ baseline:
   backend: auto
   prefill_chunk_size: 64
   extra_args:
-    - "--eviction-policy"
-    - "h2o"
     - "--protected-prefix"
     - "4"
+    - "eviction"
+    - "h2o"
 action:
   enable_resilience: true
   mock_manager_commands:

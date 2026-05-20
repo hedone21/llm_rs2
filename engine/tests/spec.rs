@@ -310,3 +310,57 @@ mod test_qnn_231;
 // rebind / swap_on_off_diff). 현재는 INV-181~188 ID 매핑만 기록.
 #[path = "spec/test_qnn_301_m4_placeholder.rs"]
 mod test_qnn_301_m4_placeholder;
+
+// ── Engine Internal Layered Architecture (INV-LAYER-001~005, 2026-05-16) ──
+// 외부 공개 대비 레이어드 리팩토링 회귀 가드. scripts/layer_lint.py 로 import
+// 그래프를 분석하고 baseline JSON(inv_layer_baseline.json) 대비 신규 위반만 FAIL.
+// ARCHITECTURE.md §13.5 V-01~V-31이 현재 baseline (207건). 마이그레이션 Step마다
+// baseline 감소 → 최종 0건이 목표 (L5/L4 분리 후 V-30 일괄 해소 등).
+#[path = "spec/test_inv_layer_001.rs"]
+mod test_inv_layer_001;
+#[path = "spec/test_inv_layer_002.rs"]
+mod test_inv_layer_002;
+#[path = "spec/test_inv_layer_003.rs"]
+mod test_inv_layer_003;
+#[path = "spec/test_inv_layer_004.rs"]
+mod test_inv_layer_004;
+#[path = "spec/test_inv_layer_005.rs"]
+mod test_inv_layer_005;
+
+// ── INV-LAYER-006 (DecodeLoop field abstraction) +
+//    INV-LAYER-007 (DecodeLoopBuilder typestate, trybuild) ──
+// Phase 4-2: 6-trait + DecodeLoopBuilder typestate API. INV-LAYER-006 is a
+// source-grep on session/decode_loop.rs; INV-LAYER-007 uses trybuild to assert
+// that `DecodeLoopBuilder::new().build()` fails to compile and that a minimal
+// Forward impl (prefill+step only) compiles.
+#[path = "spec/test_inv_layer_006.rs"]
+mod test_inv_layer_006;
+#[path = "spec/test_inv_layer_007.rs"]
+mod test_inv_layer_007;
+#[path = "spec/test_model_forward_parity.rs"]
+mod test_model_forward_parity;
+
+// ── Phase 4-5-d: ChatSession multi-turn + /reset + ensure_capacity + stats_line ──
+// G2: multi-turn KV pos 누적 보존 (DecodeLoop turn 사이 owned 재사용)
+// G3: /reset — pos=0, evicted_total=0, Forward::reset_kv 호출
+// G4: ensure_capacity — Standard/Kivi/Offload 모드별 overflow bail
+// G1/D5: stats_line 포맷 byte-identical
+#[path = "spec/test_chat_session_multi_turn.rs"]
+mod test_chat_session_multi_turn;
+
+// ── Phase 4-5-e: run_chat_repl_v2 multi-turn pos 누적 + first token bit-identical ──
+// G2-REPL: turn 2 prefill pos 누적 (pos += tokens.len()), bit-identical 검증
+// G2-REPL-2: 결정론적 first token (DetForward + GreedySampler)
+// G2-REPL-3: reset 후 pos=0에서 재시작
+#[path = "spec/test_chat_repl_v2_multi_turn.rs"]
+mod test_chat_repl_v2_multi_turn;
+
+// ── Phase 4-A: session/batch/helpers 단위 테스트 ──
+// JSONL 파싱, prompt resolution. batch runner 본문은 디바이스 G2 게이트 (2-entry baseline diff).
+#[path = "spec/test_batch_helpers.rs"]
+mod test_batch_helpers;
+
+// ── S-subcmd C4: --kv-mode subcommand (KvMode + KvModeArgs + effective_kv_mode) ──
+// KvMode ValueEnum 파싱, KvModeArgs flatten, legacy --kivi/--kv-offload shim.
+#[path = "spec/test_kv_mode_args.rs"]
+mod test_kv_mode_args;

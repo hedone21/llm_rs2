@@ -15,7 +15,7 @@
 //!   rpcmem fd만 보유, OpenCL cl_mem 외부 공유는 R-Y에서 RED 확정)
 //! - rpcmem path는 M3.3에서 본격 (현재 placeholder factory만 노출)
 
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use anyhow::{Result, anyhow};
 use std::alloc::{Layout, alloc, dealloc};
 use std::any::Any;

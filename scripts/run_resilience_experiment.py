@@ -12,8 +12,8 @@ Usage:
     python scripts/run_resilience_experiment.py -d pixel --tokens 1024
 
     # Custom configs
-    python scripts/run_resilience_experiment.py -d pixel \
-        --mode-a experiments/configs/resil_baseline.json \
+    python scripts/run_resilience_experiment.py -d pixel\
+        --mode-a experiments/configs/resil_baseline.json\
         --mode-c experiments/configs/resil_mode_c_repeated.json
 
     # Skip build (reuse existing binary)
@@ -54,7 +54,7 @@ def run_experiment(
     dry_run: bool = False,
 ) -> dict | None:
     """Run a single experiment on the device and return the summary record."""
-    binary = f"{device.paths.work_dir}/generate" if not device.is_local else \
+    binary = f"{device.paths.work_dir}/generate" if not device.is_local else\
              str(PROJECT_ROOT / device.build.binary_dir / "generate")
 
     model_path = device.paths.model_dir
@@ -157,7 +157,7 @@ def main():
 
     # Output directory
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) if args.output_dir else \
+    output_dir = Path(args.output_dir) if args.output_dir else\
                  PROJECT_ROOT / "experiments" / "results" / f"resil_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results dir: {output_dir}")
@@ -189,10 +189,14 @@ def main():
         schedule_c = f"{device.paths.work_dir}/{Path(args.mode_c).name}"
         out_prefix = device.paths.work_dir
 
-    # Extra args for Mode C (eviction enabled)
+    # Extra args for Mode C (eviction enabled). EvictionCommonArgs
+    # (`--kv-budget`) precedes the `eviction <policy>` subcommand
+    # (S-subcmd C8, 2026-05-19). Top-level argparse name still
+    # `--eviction-policy` for backwards compat with existing user scripts.
+    subcmd = args.eviction_policy.replace("_", "-")
     mode_c_extra = [
-        "--eviction-policy", args.eviction_policy,
         "--kv-budget", str(args.kv_budget),
+        "eviction", subcmd,
     ]
 
     # Run experiments

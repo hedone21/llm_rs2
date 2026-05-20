@@ -1,21 +1,21 @@
 mod forward;
 mod forward_gen;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::core::backend::Backend;
-use crate::core::buffer::Buffer;
-use crate::core::buffer::DType;
-use crate::core::kv_cache::{KVCache, KVCacheOps};
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::buffer::Buffer;
+use crate::buffer::DType;
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
+use crate::pressure::kv_cache::{KVCache, KVCacheOps};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 use anyhow::Result;
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use crate::buffer::shared_buffer::SharedBuffer;
 use crate::layers::tensor_partition::PartitionContext;
+use crate::memory::host::shared::SharedBuffer;
 
 // Re-export OpProfiler from its canonical location for backward compatibility.
 pub use crate::profile::ops::OpProfiler;
@@ -397,7 +397,7 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
 #[allow(clippy::needless_range_loop, clippy::unnecessary_literal_unwrap)]
 mod tests {
     use super::*;
-    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::memory::host::shared::SharedBuffer;
 
     /// Replicate the softmax computation used in forward_gen (F32 inline path)
     /// to verify the mathematical property: sum(softmax(Q·K^T / sqrt(d))) ≈ 1.0.
@@ -570,7 +570,7 @@ mod tests {
     /// Simulate the full pipeline: compute scores → accumulate → verify.
     #[test]
     fn test_accumulator_receives_post_softmax_scores() {
-        use crate::core::attention_scores::AttentionScoreAccumulator;
+        use crate::inference::attention_scores::AttentionScoreAccumulator;
 
         let n_heads_q = 4;
         let cache_seq_len = 8;
