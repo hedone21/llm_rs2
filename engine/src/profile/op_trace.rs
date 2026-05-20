@@ -229,7 +229,7 @@ pub fn start_op(kind: OpKind) -> Option<Instant> {
 pub fn record(
     t: Option<Instant>,
     op: OpKind,
-    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
     is_gpu: bool,
 ) {
     // LISWAP-5 PhaseHook은 trace mode 무관하게 fire (PHASE_HOOK 등록 시).

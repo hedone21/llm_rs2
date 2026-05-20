@@ -164,8 +164,8 @@ mod android {
 
     use crate::backend::qnn_oppkg::runtime::{QnnOppkgRuntime, ffi};
     use crate::backend::qnn_oppkg::weight_pack::{Q4_0_BLOCK_BYTES, aos_to_soa_q4_0};
-    use crate::core::tensor::Tensor;
     use crate::layers::transformer_layer::TransformerLayer;
+    use crate::tensor::Tensor;
     use anyhow::{Result, anyhow, ensure};
     use std::ffi::CString;
     use std::os::raw::c_char;

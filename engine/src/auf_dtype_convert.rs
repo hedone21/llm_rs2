@@ -1,3 +1,4 @@
+use crate::models::loader::convert::{f16_to_f32, quantize_q4_0};
 /// AUF v0.2 dtype 변환 파이프라인 (ENG-ALG-224, Sprint C-A).
 ///
 /// AUF Writer가 같은 layer/tensor에 대해 여러 dtype variant를 동봉할 때 사용하는
@@ -17,8 +18,7 @@
 /// - `spec/32-engine-algorithms.md` §3.12.18 (ENG-ALG-224)
 /// - `spec/33-engine-data.md` §3.22.14~16 (ENG-DAT-097/098/099)
 /// - `spec/41-invariants.md` §3.18 (INV-137~139)
-use crate::core::quant::{BlockQ4_0, QK4_0};
-use crate::models::loader::convert::{f16_to_f32, quantize_q4_0};
+use crate::quant::{BlockQ4_0, QK4_0};
 use half::f16;
 use llm_shared::auf::error::{AufError, AufResult};
 use llm_shared::auf::tensor_index::TensorDType;

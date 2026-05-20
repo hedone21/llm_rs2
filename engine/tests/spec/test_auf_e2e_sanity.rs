@@ -13,6 +13,9 @@
 //!    shape mismatch를 재현할 수 있는지.
 //! 4. dtype round-trip (Q4_0, F16, F32).
 
+use llm_rs2::buffer::DType;
+use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::models::weights::build_auf_secondary_from_view;
 use llm_shared::auf::q4_0_aos_to_adreno_soa;
 use llm_shared::auf::reader::open_from_bytes;
 use llm_shared::auf::section::{TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS};
@@ -20,9 +23,6 @@ use llm_shared::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, Tenso
 use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
 use llm_shared::auf::writer::AufWriter;
 use llm_shared::auf::{AufMeta, BackendTag};
-use llm_rs2::core::buffer::DType;
-use llm_rs2::models::config::{ModelArch, ModelConfig};
-use llm_rs2::models::weights::build_auf_secondary_from_view;
 use std::path::Path;
 
 // ── fixture helpers ──────────────────────────────────────────────────────────

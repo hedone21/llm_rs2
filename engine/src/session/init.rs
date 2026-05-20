@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
+use crate::buffer::DType;
 use crate::core::rss_trace::{dump_smaps, io_trace, rss_trace};
 use crate::core::sampling::SamplingConfig;
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
 use crate::session::cli::{Args, KvMode};

@@ -9,15 +9,15 @@ use llm_rs2::core::math_utils::{avg_pool_1d, topk_indices_per_head};
 use llm_rs2::core::offload::store::OffloadStore;
 use llm_rs2::core::pressure::quantize_handler::QuantizeHandler;
 use llm_rs2::core::pressure::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
-use llm_rs2::core::quant::{BlockKVQ4, BlockKVQ8, QKKV};
 use llm_rs2::core::skip_config::SkipConfig;
 use llm_rs2::core::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
+use llm_rs2::quant::{BlockKVQ4, BlockKVQ8, QKKV};
 
 use llm_rs2::backend::cpu::CpuBackend;
+use llm_rs2::buffer::{Buffer, DType};
 use llm_rs2::memory::host::shared::SharedBuffer;
-use llm_rs2::core::buffer::{Buffer, DType};
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use std::sync::Arc;
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
@@ -160,7 +160,7 @@ fn make_kivi_input(
     base: f32,
 ) -> (Tensor, Tensor) {
     let n = seq_len * kv_heads * head_dim;
-    let backend: Arc<dyn llm_rs2::core::backend::Backend> = Arc::new(CpuBackend::new());
+    let backend: Arc<dyn llm_rs2::backend::Backend> = Arc::new(CpuBackend::new());
 
     let k_buf = Arc::new(SharedBuffer::new(n * 4, DType::F32));
     let v_buf = Arc::new(SharedBuffer::new(n * 4, DType::F32));

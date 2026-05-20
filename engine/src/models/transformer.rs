@@ -1,19 +1,19 @@
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
 use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCache, KVCacheOps};
-use crate::core::memory::Memory;
 use crate::core::offload::preload_pool::{self, PreloadPool};
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
 use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
+use crate::memory::Memory;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
@@ -488,11 +488,11 @@ impl TransformerModel {
         }
         let cols = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();
-        if !cols.is_multiple_of(crate::core::quant::QK4_0) {
+        if !cols.is_multiple_of(crate::quant::QK4_0) {
             return Err(anyhow!(
                 "quantize_lm_head_to_q4_0: last dim ({}) is not a multiple of {} (Q4_0 block size)",
                 cols,
-                crate::core::quant::QK4_0,
+                crate::quant::QK4_0,
             ));
         }
 
@@ -553,7 +553,7 @@ impl TransformerModel {
 
         // Step 2: quantize to Q4_0 blocks.
         let blocks = quantize_q4_0(&f32_data, rows, cols);
-        let block_bytes = std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+        let block_bytes = std::mem::size_of::<crate::quant::BlockQ4_0>();
         let total_bytes = blocks.len() * block_bytes;
         // Convert Vec<BlockQ4_0> → Vec<u8> without allocating twice.
         let mut bytes_out: Vec<u8> = Vec::with_capacity(total_bytes);
@@ -665,15 +665,15 @@ impl TransformerModel {
         let ne00 = dims[dims.len() - 1]; // cols
         let ne01: usize = dims[..dims.len() - 1].iter().product(); // rows
 
-        if !ne00.is_multiple_of(crate::core::quant::QK4_0) {
+        if !ne00.is_multiple_of(crate::quant::QK4_0) {
             return Err(anyhow!(
                 "load_lm_head_from_auf: last dim ({}) is not a multiple of {} (Q4_0 block size)",
                 ne00,
-                crate::core::quant::QK4_0,
+                crate::quant::QK4_0,
             ));
         }
-        let num_blocks = ne01 * (ne00 / crate::core::quant::QK4_0);
-        let expected_bytes = num_blocks * std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+        let num_blocks = ne01 * (ne00 / crate::quant::QK4_0);
+        let expected_bytes = num_blocks * std::mem::size_of::<crate::quant::BlockQ4_0>();
 
         // payload size must equal N * 18 in all variants (SOA total size = AOS total size).
         if payload.bytes.len() != expected_bytes {
@@ -1995,22 +1995,22 @@ impl TransformerModel {
         // Reject the plan only when at least one layer has neither dtype.
         if layer_snaps.iter().any(|l| {
             let d = l.wq.dtype();
-            d != crate::core::buffer::DType::F16 && d != crate::core::buffer::DType::Q4_0
+            d != crate::buffer::DType::F16 && d != crate::buffer::DType::Q4_0
         }) {
             trace_none!("wq dtype not F16/Q4_0");
         }
         let any_q4_0 = layer_snaps
             .iter()
-            .any(|l| l.wq.dtype() == crate::core::buffer::DType::Q4_0);
+            .any(|l| l.wq.dtype() == crate::buffer::DType::Q4_0);
 
         // kernel_add_row_bias expects F32 bias buffers. If any layer has
         // a QKV bias that isn't F32, fall back to the legacy path.
         if self.config.has_qkv_bias {
             for layer in &layer_snaps {
                 if layer.qkv_bias.as_ref().is_some_and(|bias| {
-                    bias.bq.dtype() != crate::core::buffer::DType::F32
-                        || bias.bk.dtype() != crate::core::buffer::DType::F32
-                        || bias.bv.dtype() != crate::core::buffer::DType::F32
+                    bias.bq.dtype() != crate::buffer::DType::F32
+                        || bias.bk.dtype() != crate::buffer::DType::F32
+                        || bias.bv.dtype() != crate::buffer::DType::F32
                 }) {
                     trace_none!("qkv_bias dtype not F32");
                 }
@@ -2064,7 +2064,7 @@ impl TransformerModel {
         // — if layer 0 stays F16 and layer 1 is freshly Q4_0, missing layer 1
         // SOA must still abort the GPU plan and force the legacy path.
         for (li, layer) in layer_snaps.iter().enumerate() {
-            if layer.wq.dtype() != crate::core::buffer::DType::Q4_0 {
+            if layer.wq.dtype() != crate::buffer::DType::Q4_0 {
                 continue;
             }
             let wq_key = cl!(layer.wq).as_ptr() as usize;
@@ -2116,7 +2116,7 @@ impl TransformerModel {
         // None, but the per-layer abort above means we never reach this with
         // an unregistered Q4_0 weight in production.
         let ns_entry = |tensor: &Tensor| -> Option<NoshufflePlanEntry<'_>> {
-            if tensor.dtype() != crate::core::buffer::DType::Q4_0 {
+            if tensor.dtype() != crate::buffer::DType::Q4_0 {
                 return None;
             }
             let key = cl!(tensor).as_ptr() as usize;
@@ -2398,7 +2398,7 @@ impl TransformerModel {
                 // than collapsing to a single boolean.
                 let q4_0_count = layer_snaps
                     .iter()
-                    .filter(|l| l.wq.dtype() == crate::core::buffer::DType::Q4_0)
+                    .filter(|l| l.wq.dtype() == crate::buffer::DType::Q4_0)
                     .count();
                 log::info!(
                     "GPU kernel plan built ({} layers, capacity={}, q4_noshuffle={}/{})",
@@ -2537,7 +2537,7 @@ impl TransformerModel {
         // a Q4_0 buffer and produce garbage on the affected layers.
         if layer_snaps
             .iter()
-            .any(|l| l.wq.dtype() != crate::core::buffer::DType::F16)
+            .any(|l| l.wq.dtype() != crate::buffer::DType::F16)
         {
             return None;
         }
@@ -3116,10 +3116,10 @@ fn compute_quant_noise_for_model(
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::core::buffer::DType;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::buffer::DType;
     use crate::memory::galloc::Galloc;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     /// Build a minimal TransformerModel-like object with CPU backend and
@@ -3587,8 +3587,8 @@ mod tests {
     /// Build a minimal TransformerModel with F16 lm_head (VOCAB×HIDDEN),
     /// CPU backend only.
     fn make_cpu_model_lm_head(vocab: usize, hidden: usize) -> (TransformerModel, Arc<dyn Backend>) {
-        use crate::memory::host::shared::SharedBuffer;
         use crate::memory::galloc::Galloc;
+        use crate::memory::host::shared::SharedBuffer;
         let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let mem = Galloc::new();
 

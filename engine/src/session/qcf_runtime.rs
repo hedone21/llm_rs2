@@ -10,15 +10,15 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
+use crate::buffer::DType;
 use crate::core::kv_cache::KVCache;
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModelForwardArgs;
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 pub struct QcfWarmupResult {
     pub importance: crate::core::qcf::ImportanceTable,
@@ -770,7 +770,7 @@ pub fn dump_layer_weights_to_dir(
     for (i, slot) in model.layers.iter().enumerate() {
         let weights = slot.load_weights();
         let dtype = slot.current_dtype();
-        let tensors: [(&str, &crate::core::tensor::Tensor); 7] = [
+        let tensors: [(&str, &crate::tensor::Tensor); 7] = [
             ("wq", &weights.wq),
             ("wk", &weights.wk),
             ("wv", &weights.wv),
@@ -819,7 +819,7 @@ pub fn dump_layer_weights_to_dir(
     // and (b) any missing lm_head is derived via F16→Q4_0 quantization at
     // load time, whose result may not match a standalone Q4_0 GGUF's lm_head
     // byte-for-byte.
-    let model_tensors: [(&str, &crate::core::tensor::Tensor); 3] = [
+    let model_tensors: [(&str, &crate::tensor::Tensor); 3] = [
         ("embed_tokens", &model.embed_tokens),
         ("norm", &model.norm),
         ("lm_head", &model.lm_head),

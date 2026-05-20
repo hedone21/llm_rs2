@@ -10,7 +10,7 @@
 //! - **Zero additional memory allocation** -- only an OpenCL handle is created
 //! - Parent buffer's lifetime is tied via Arc (memory stays valid)
 
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use anyhow::{Result, anyhow};
 use ocl::core::{self, BufferRegion, Mem};
 use std::any::Any;

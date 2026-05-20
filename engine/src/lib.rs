@@ -10,6 +10,10 @@ pub mod core;
 pub mod layers;
 pub mod memory;
 pub mod models;
+pub mod quant;
+pub mod shape;
+pub mod tensor;
+pub mod thread_pool;
 
 pub mod eval;
 pub mod experiment;

@@ -34,8 +34,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwapOption;
 
-use crate::core::backend::{Backend, GpuEvent};
-use crate::core::buffer::DType;
+use crate::backend::{Backend, GpuEvent};
+use crate::buffer::DType;
 use crate::models::weights::async_swap::{AsyncSwapDispatcher, SwapCommitJob};
 use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::secondary_mmap::SecondaryMmap;

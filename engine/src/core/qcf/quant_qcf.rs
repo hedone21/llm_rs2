@@ -4,7 +4,7 @@
 //! Computed inline during residual buffer flush when FP32 originals are available.
 
 use super::{QcfConfig, QcfMetric, aggregate_heads};
-use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
+use crate::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 
 /// Compute NMSE for a single quantization group of QKKV (32) values.
 ///

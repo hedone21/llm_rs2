@@ -10,15 +10,13 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::backend::cpu::CpuBackend;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
+use crate::buffer::DType;
 use crate::core::sampling;
-use crate::core::shape::Shape;
 use crate::core::skip_config::SkipConfig;
-use crate::core::tensor::Tensor;
 use crate::layers::workspace::{
     LayerWorkspace, PartitionWorkspace, PartitionWsCell, WorkspaceConfig,
 };
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModelForwardArgs;
 use crate::resilience::KVSnapshot;
@@ -27,6 +25,8 @@ use crate::session::batch::helpers::{
     load_prompt_batch, make_partition_gpu_alloc, resolve_prompt, unix_ts,
 };
 use crate::session::cli::parse_qcf_sample_layers;
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
     let BatchRunCtx {

@@ -1,7 +1,7 @@
+use crate::buffer::{Buffer, DType};
+use crate::memory::Memory;
 use crate::memory::opencl::device::OpenCLBuffer;
 use crate::memory::opencl::unified::UnifiedBuffer;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
 use anyhow::Result;
 use ocl::flags::MemFlags;
 use ocl::{Context, Queue};

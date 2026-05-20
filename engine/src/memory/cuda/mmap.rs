@@ -13,7 +13,7 @@
 
 #![cfg(feature = "cuda-embedded")]
 
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use crate::memory::secondary::SecondaryMmapBytes;
 use anyhow::{Result, anyhow};
 use cudarc::driver::sys as cuda_sys;

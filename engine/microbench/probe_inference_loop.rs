@@ -40,17 +40,17 @@ use anyhow::Result;
 use clap::Parser;
 use serde_json::json;
 
+use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
-use llm_rs2::core::memory::Memory;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::DType;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
+use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use llm_rs2::session::forward::{ModelForward, alloc_standard_kv_caches};
 use llm_rs2::session::{DecodeLoopBuilder, Forward, GreedySampler, StepCtx};
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]

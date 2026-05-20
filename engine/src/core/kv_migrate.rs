@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::core::backend::Backend;
+use crate::backend::Backend;
 use crate::core::kv_cache::KVCache;
-use crate::core::memory::Memory;
-use crate::core::tensor::Tensor;
+use crate::memory::Memory;
+use crate::tensor::Tensor;
 
 /// Migrate KV caches from one backend to another.
 ///

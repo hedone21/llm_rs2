@@ -1064,8 +1064,8 @@ fn quantize_lm_head_to_q4_0(
     ggml_type: u32,
     quiet: bool,
 ) -> Result<Vec<u8>> {
-    use llm_rs2::core::quant::{BlockQ4_0, QK4_0};
     use llm_rs2::models::loader::convert::{f16_to_f32, quantize_q4_0};
+    use llm_rs2::quant::{BlockQ4_0, QK4_0};
 
     if shape_logical.len() != 2 {
         bail!("lm_head must be 2-D (got shape={:?})", shape_logical);

@@ -47,18 +47,18 @@ fn force_every_tick_enabled() -> bool {
 use anyhow::Result;
 use llm_shared::DtypeTag;
 
-use crate::memory::host::shared::SharedBuffer;
-use crate::core::backend::{Backend, GpuEvent};
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
-use crate::core::tensor::Tensor;
+use crate::backend::{Backend, GpuEvent};
+use crate::buffer::{Buffer, DType};
 use crate::layers::transformer_layer::TransformerLayer;
+use crate::memory::Memory;
+use crate::memory::host::shared::SharedBuffer;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::async_swap::AsyncSwapDispatcher;
 use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
+use crate::tensor::Tensor;
 
 /// Errors surfaced by `SwapExecutor::execute`.
 #[derive(Debug)]
@@ -1664,7 +1664,7 @@ impl<'a> SwapExecutor<'a> {
         layer_idx: usize,
         subname: &str,
         info: &crate::models::weights::secondary_mmap::SecondaryTensorInfo,
-        shape: &crate::core::shape::Shape,
+        shape: &crate::shape::Shape,
     ) -> Result<Option<Tensor>, SwapError> {
         // Only the Rpcmem variant carries a per-layer rpcmem region.
         let SecondaryMmap::Rpcmem(rpc) = secondary.as_ref() else {
@@ -2217,13 +2217,14 @@ impl<'a> SwapExecutor<'a> {
         }
         let dtype = cpu_tensor.dtype();
         let mmap_guard: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
-        let buf: Arc<dyn crate::core::buffer::Buffer> =
-            Arc::new(crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
+        let buf: Arc<dyn crate::buffer::Buffer> = Arc::new(
+            crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
                 guard,
                 size,
                 dtype,
                 Some(mmap_guard),
-            ));
+            ),
+        );
         let tensor = Tensor::new(cpu_tensor.shape().clone(), buf, Arc::clone(&self.backend));
         Ok(Some(tensor))
     }
@@ -2818,7 +2819,7 @@ fn try_alias_materialise_standalone(
     layer_idx: usize,
     subname: &str,
     info: &crate::models::weights::secondary_mmap::SecondaryTensorInfo,
-    shape: &crate::core::shape::Shape,
+    shape: &crate::shape::Shape,
     backend: &Arc<dyn Backend>,
 ) -> Result<Option<Tensor>, SwapError> {
     let SecondaryMmap::Rpcmem(rpc) = secondary.as_ref() else {
@@ -2989,19 +2990,18 @@ mod tests {
     // implies every backing buffer is uniquely owned by the dispatcher and
     // its destructor will run on `drop(layer)`.
 
-    use crate::memory::host::shared::SharedBuffer;
-    use crate::core::backend::Backend;
-    use crate::core::shape::Shape;
+    use crate::backend::Backend;
     use crate::layers::transformer_layer::TransformerLayer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::models::weights::LayerSlot;
+    use crate::shape::Shape;
     use std::sync::Arc;
 
     fn build_test_layer(be: &Arc<dyn Backend>) -> TransformerLayer {
         // Build a minimal `TransformerLayer` whose weight tensors each carry
         // a fresh `Arc<dyn Buffer>` so we can probe refcounts after a swap.
         let make = |sz: usize| -> Tensor {
-            let buf: Arc<dyn crate::core::buffer::Buffer> =
-                Arc::new(SharedBuffer::new(sz, DType::F32));
+            let buf: Arc<dyn crate::buffer::Buffer> = Arc::new(SharedBuffer::new(sz, DType::F32));
             Tensor::new(Shape::new(vec![sz / 4]), buf, be.clone())
         };
         TransformerLayer {
@@ -3096,7 +3096,7 @@ mod tests {
         let be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
         let layer = build_test_layer(&be);
         // Capture weak refs to the 7 weight buffers.
-        let weaks: Vec<Weak<dyn crate::core::buffer::Buffer>> = [
+        let weaks: Vec<Weak<dyn crate::buffer::Buffer>> = [
             &layer.wq,
             &layer.wk,
             &layer.wv,

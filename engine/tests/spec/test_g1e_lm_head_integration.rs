@@ -281,8 +281,8 @@ fn backward_compat_bit2_zero_adreno_soa_returns_none() {
 /// G-1-B writer가 동일 GGUF에서 두 번 빌드 시 byte-identical AUF를 만드는 전제 검증.
 #[test]
 fn quantize_q4_0_is_deterministic() {
-    use llm_rs2::core::quant::BlockQ4_0;
     use llm_rs2::models::loader::convert::quantize_q4_0;
+    use llm_rs2::quant::BlockQ4_0;
 
     let f32_data: Vec<f32> = (0..VOCAB * HIDDEN)
         .map(|i| (i as f32) * 0.001 - 4.0)
@@ -303,8 +303,8 @@ fn quantize_q4_0_is_deterministic() {
 /// G-1-B writer path와 직접 quantize 경로의 결과 동일성 검증.
 #[test]
 fn auf_cpu_aos_payload_matches_direct_quantize() {
-    use llm_rs2::core::quant::BlockQ4_0;
     use llm_rs2::models::loader::convert::quantize_q4_0;
+    use llm_rs2::quant::BlockQ4_0;
 
     // Step A: direct quantize → bytes.
     let f32_data: Vec<f32> = (0..VOCAB * HIDDEN)

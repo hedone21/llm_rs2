@@ -60,7 +60,7 @@ pub struct KVCacheSnapshot {
     /// Per-layer K buffer size at snapshot time (used for K/V split in restore).
     k_sizes: Vec<usize>,
     /// Backend reference for GPU read/write operations.
-    backend: std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: std::sync::Arc<dyn crate::backend::Backend>,
     /// Per-layer `current_pos` values.
     positions: Vec<usize>,
     /// Per-layer capacity at snapshot time.
@@ -158,7 +158,7 @@ pub struct EvictionHook {
     /// KV cache dtype string for QCF gating (only "f32" collects QCF).
     pub kv_type: String,
     /// Backend reference for GPU buffer read/write in snapshot/restore.
-    pub backend: std::sync::Arc<dyn crate::core::backend::Backend>,
+    pub backend: std::sync::Arc<dyn crate::backend::Backend>,
     /// Whether to compute and dump experimental QCF metrics (ARGUS).
     pub experimental_enabled: bool,
     /// Sample layer indices for multi-layer QCF (ARGUS #1).
@@ -188,7 +188,7 @@ impl EvictionHook {
         h2o_keep_ratio: f32,
         is_d2o: bool,
         kv_type: String,
-        backend: std::sync::Arc<dyn crate::core::backend::Backend>,
+        backend: std::sync::Arc<dyn crate::backend::Backend>,
         experimental_enabled: bool,
         qcf_sample_layers: Vec<usize>,
     ) -> Self {

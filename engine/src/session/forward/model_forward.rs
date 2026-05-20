@@ -13,20 +13,20 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::backend::Backend;
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
+use crate::buffer::DType;
 use crate::core::kv_cache::{KVCache, KVLayout};
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
 use crate::layers::workspace::{LayerWorkspace, PrefillWorkspace, WorkspaceConfig};
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
 use crate::models::config::ModelArch;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::session::traits::{Forward, StepCtx};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 /// Standard `Forward` implementation backed by [`TransformerModel::forward_into`]
 /// and a `Vec<KVCache>`.
@@ -526,7 +526,7 @@ pub fn alloc_standard_kv_caches(
     let n_values = initial_capacity * kv_heads * head_dim;
     let kv_buf_size = match dtype {
         DType::Q4_0 => {
-            use crate::core::quant::{BlockQ4_0, QK4_0};
+            use crate::quant::{BlockQ4_0, QK4_0};
             (n_values / QK4_0) * std::mem::size_of::<BlockQ4_0>()
         }
         _ => n_values * dtype.size(),

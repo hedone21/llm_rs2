@@ -8,12 +8,12 @@
 //! 통합 테스트에서 CpuBackend/SharedBuffer로 KVCache를 생성해야 한다.
 
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::memory::host::shared::SharedBuffer;
-use llm_rs2::core::buffer::{Buffer, DType};
+use llm_rs2::buffer::{Buffer, DType};
 use llm_rs2::core::eviction::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy};
 use llm_rs2::core::kv_cache::KVCache;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::memory::host::shared::SharedBuffer;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use std::sync::Arc;
 
 // ── 헬퍼 ──

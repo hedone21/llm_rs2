@@ -21,14 +21,14 @@
 
 #![cfg(feature = "opencl")]
 
+use llm_rs2::backend::Backend;
 use llm_rs2::backend::opencl::OpenCLBackend;
 use llm_rs2::backend::opencl::memory::OpenCLMemory;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
-use llm_rs2::core::memory::Memory;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::DType;
 use llm_rs2::layers::attention::flash_attention_forward_strided;
+use llm_rs2::memory::Memory;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use std::sync::Arc;
 
 fn upload_f32(

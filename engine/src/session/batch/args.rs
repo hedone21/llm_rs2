@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer;
 
+use crate::backend::Backend;
 use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::backend::Backend;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::KVCache;
-use crate::core::memory::Memory;
 use crate::core::skip_config::SkipConfig;
+use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::resilience::CommandExecutor;
 use crate::session::cli::Args;
@@ -48,7 +48,7 @@ pub struct BatchRunCtx {
     pub weights_on_gpu: bool,
     pub kv_heads: usize,
     pub head_dim: usize,
-    pub kv_type: crate::core::buffer::DType,
+    pub kv_type: crate::buffer::DType,
     pub actual_protected_prefix: usize,
     pub score_based_eviction: bool,
     pub throttle_delay_ms: u64,

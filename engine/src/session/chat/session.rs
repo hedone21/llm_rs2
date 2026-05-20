@@ -15,19 +15,19 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::backend::Backend;
+use crate::buffer::DType;
 use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
 use crate::core::cache_manager::CacheManager;
 use crate::core::events::StderrDiagnosticSink;
 use crate::core::eviction::h2o::H2OPolicy;
 use crate::core::eviction::h2o_plus::H2OPlusPolicy;
 use crate::core::eviction::sliding_window::SlidingWindowPolicy;
 use crate::core::kv_cache::KVCache;
-use crate::core::memory::Memory;
 use crate::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use crate::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
+use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::session::DecodeLoopBuilder;
 use crate::session::chat::stop_condition::StopCondition;

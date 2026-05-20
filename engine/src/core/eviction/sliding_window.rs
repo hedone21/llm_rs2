@@ -96,10 +96,10 @@ impl EvictionPolicy for SlidingWindowPolicy {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
+    use crate::buffer::{Buffer, DType};
     use crate::memory::host::shared::SharedBuffer;
-    use crate::core::buffer::{Buffer, DType};
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     fn make_cache_with_data(num_tokens: usize) -> KVCache {

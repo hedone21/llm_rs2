@@ -24,7 +24,7 @@ use anyhow::Result;
 use ocl::core::Mem;
 
 use crate::backend::opencl::host_ptr_pool::HostPtrPoolGuard;
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use crate::memory::host::mmap::MmapKeepAlive;
 
 /// Buffer that wraps a `HostPtrPoolGuard`. See module docs.

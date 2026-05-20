@@ -11,14 +11,14 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
+use crate::buffer::DType;
+use crate::memory::Memory;
 use crate::memory::host::mmap::MmapBuffer;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
 use crate::models::config::ModelConfig;
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 use crate::memory::host::shared::SharedBuffer;
 
@@ -789,7 +789,7 @@ impl GgufSource {
             debug_assert!(data.len().is_multiple_of(total_rows));
             let row_size_bytes = data.len() / total_rows;
             let permuted = unpermute_qk_rows(data, n_head, head_dim, row_size_bytes);
-            let owned_buf: Arc<dyn crate::core::buffer::Buffer> =
+            let owned_buf: Arc<dyn crate::buffer::Buffer> =
                 Arc::new(SharedBuffer::from_vec(permuted, dtype));
             let cpu_tensor = Tensor::new(
                 shape,
@@ -811,7 +811,7 @@ impl GgufSource {
         let abs_offset = self.gguf.tensor_data_offset + info.offset as usize;
 
         // Safety: abs_offset + data.len() <= mmap.len() (guaranteed by tensor_data())
-        let buffer: Arc<dyn crate::core::buffer::Buffer> = Arc::new(unsafe {
+        let buffer: Arc<dyn crate::buffer::Buffer> = Arc::new(unsafe {
             MmapBuffer::new(self.gguf.mmap.clone(), abs_offset, data.len(), dtype)
         });
 
@@ -871,7 +871,7 @@ impl GgufSource {
             debug_assert!(data.len().is_multiple_of(total_rows));
             let row_size_bytes = data.len() / total_rows;
             let permuted = unpermute_qk_rows(data, n_head, head_dim, row_size_bytes);
-            let owned_buf: Arc<dyn crate::core::buffer::Buffer> =
+            let owned_buf: Arc<dyn crate::buffer::Buffer> =
                 Arc::new(SharedBuffer::from_vec(permuted, dtype));
             return Ok(Tensor::new(
                 shape,
@@ -883,7 +883,7 @@ impl GgufSource {
         let abs_offset = self.gguf.tensor_data_offset + info.offset as usize;
 
         // Safety: abs_offset + data.len() <= mmap.len()
-        let buffer: Arc<dyn crate::core::buffer::Buffer> = Arc::new(unsafe {
+        let buffer: Arc<dyn crate::buffer::Buffer> = Arc::new(unsafe {
             MmapBuffer::new(self.gguf.mmap.clone(), abs_offset, data.len(), dtype)
         });
 
@@ -947,7 +947,7 @@ impl GgufSource {
         }
         debug_assert_eq!(bytes.len(), num_elements * 2);
 
-        let buffer: Arc<dyn crate::core::buffer::Buffer> =
+        let buffer: Arc<dyn crate::buffer::Buffer> =
             Arc::new(SharedBuffer::from_vec(bytes, DType::F16));
 
         Ok(Tensor::new(
@@ -1004,7 +1004,7 @@ impl GgufSource {
             }
         };
 
-        let buffer: Arc<dyn crate::core::buffer::Buffer> = match target_dtype {
+        let buffer: Arc<dyn crate::buffer::Buffer> = match target_dtype {
             DType::F32 => {
                 // Zero-copy reinterpret the Vec<f32> as Vec<u8>.
                 let byte_data = f32_vec_to_u8(f32_data);

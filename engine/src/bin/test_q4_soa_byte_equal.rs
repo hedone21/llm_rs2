@@ -12,15 +12,15 @@
 //! reported on stderr.
 
 use clap::Parser;
-use llm_shared::auf::q4_0_soa::q4_0_aos_to_adreno_soa;
+use llm_rs2::backend::Backend;
 #[cfg(feature = "opencl")]
 use llm_rs2::backend::opencl::{OpenCLBackend, get_cl_mem};
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
-use llm_rs2::core::memory::Memory;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::DType;
+use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
+use llm_shared::auf::q4_0_soa::q4_0_aos_to_adreno_soa;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]

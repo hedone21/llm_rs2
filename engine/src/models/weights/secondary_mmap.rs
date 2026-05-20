@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::core::buffer::DType;
+use crate::buffer::DType;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{GgufFile, ggml_type_to_dtype, tensor_byte_size};
 
@@ -696,7 +696,7 @@ pub fn open_secondary_with_backend(
     primary_gguf: &GgufFile,
     secondary_dtype_choice: SecondaryDtypeChoice,
     secondary_layout_choice: SecondaryLayoutChoice,
-    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> Result<SecondaryMmap, LoadError> {
     // AUF or non-rpcmem backend → standard path.
     if is_auf_path(path) || !backend_supports_rpcmem_secondary(backend) {
@@ -726,7 +726,7 @@ pub fn open_secondary_with_backend(
 /// path. Detected via `Backend::name()` to avoid feature-gate gymnastics on
 /// the trait object.
 fn backend_supports_rpcmem_secondary(
-    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> bool {
     let name = backend.name();
     name.contains("QNN OpPackage") || name.contains("qnn_oppkg")
@@ -739,7 +739,7 @@ fn try_open_rpcmem_secondary(
     path: &Path,
     primary_config: &ModelConfig,
     primary_gguf: &GgufFile,
-    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> Result<SecondaryMmap, LoadError> {
     #[cfg(all(feature = "qnn", target_os = "android"))]
     {
@@ -1553,8 +1553,8 @@ mod tests {
     #[test]
     fn auf_dtype_to_engine_round_trip() {
         use super::auf_dtype_to_engine;
+        use crate::buffer::DType;
         use llm_shared::auf::tensor_index::TensorDType;
-        use crate::core::buffer::DType;
         assert_eq!(
             auf_dtype_to_engine(TensorDType::Q4_0.as_u32()),
             Some(DType::Q4_0)
@@ -1590,15 +1590,15 @@ mod tests {
     /// leaves the backing buffer unchanged (read-only semantics).
     #[test]
     fn prefault_layers_auf_subset_no_panic() {
+        use crate::models::config::{ModelArch, ModelConfig};
+        use crate::models::weights::SecondaryDtypeChoice;
+        use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
         use llm_shared::auf::reader::open_from_bytes;
         use llm_shared::auf::section::TAG_WEIGHTS_CPU_AOS;
         use llm_shared::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
         use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
         use llm_shared::auf::writer::AufWriter;
         use llm_shared::auf::{AufMeta, BackendTag};
-        use crate::models::config::{ModelArch, ModelConfig};
-        use crate::models::weights::SecondaryDtypeChoice;
-        use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
 
         const N_LAYERS: usize = 3;
         const BYTES_PER_TENSOR: usize = 128;
@@ -1739,15 +1739,15 @@ mod tests {
     /// correctly maps each layer to its own tensor offsets.
     #[test]
     fn prefault_layers_layer_index_byte_ranges_are_disjoint() {
+        use crate::models::config::{ModelArch, ModelConfig};
+        use crate::models::weights::SecondaryDtypeChoice;
+        use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
         use llm_shared::auf::reader::open_from_bytes;
         use llm_shared::auf::section::TAG_WEIGHTS_CPU_AOS;
         use llm_shared::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
         use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
         use llm_shared::auf::writer::AufWriter;
         use llm_shared::auf::{AufMeta, BackendTag};
-        use crate::models::config::{ModelArch, ModelConfig};
-        use crate::models::weights::SecondaryDtypeChoice;
-        use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
 
         const N_LAYERS: usize = 4;
         const BYTES_PER_TENSOR: usize = 64;

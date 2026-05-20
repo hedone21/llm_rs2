@@ -27,22 +27,22 @@
 
 use std::sync::Arc;
 
+use llm_rs2::backend::Backend;
+use llm_rs2::buffer::{Buffer, DType};
+use llm_rs2::memory::host::mmap::MmapBuffer;
+use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::models::weights::SecondaryMmap;
+use llm_rs2::models::weights::secondary_mmap::{
+    SecondaryDtypeChoice, build_auf_secondary_from_view,
+};
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use llm_shared::auf::{
     AufMeta, BackendTag,
     section::TAG_WEIGHTS_CPU_AOS,
     tensor_index::TensorIndex,
     tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE},
     writer::AufWriter,
-};
-use llm_rs2::memory::host::mmap::MmapBuffer;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::{Buffer, DType};
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
-use llm_rs2::models::config::{ModelArch, ModelConfig};
-use llm_rs2::models::weights::SecondaryMmap;
-use llm_rs2::models::weights::secondary_mmap::{
-    SecondaryDtypeChoice, build_auf_secondary_from_view,
 };
 
 // ── Fixture helpers ──────────────────────────────────────────────────────────

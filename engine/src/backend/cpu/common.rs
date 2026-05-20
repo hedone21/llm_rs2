@@ -1,8 +1,8 @@
-use crate::core::backend::Backend;
-use crate::core::buffer::Buffer;
-use crate::core::buffer::DType;
-use crate::core::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1, QK8_0};
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::Buffer;
+use crate::buffer::DType;
+use crate::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1, QK8_0};
+use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 
@@ -321,7 +321,7 @@ impl Backend for CpuBackendCommon {
                 Ok(())
             }
             (DType::F32, DType::Q4_0) => {
-                use crate::core::quant::{BlockQ4_0, QK4_0};
+                use crate::quant::{BlockQ4_0, QK4_0};
                 let s = src.as_slice::<f32>();
                 let n_elements = s.len();
                 assert!(
@@ -677,7 +677,7 @@ impl Backend for CpuBackendCommon {
                     });
             }
             DType::Q4_0 => {
-                use crate::core::quant::{BlockQ4_0, QK4_0};
+                use crate::quant::{BlockQ4_0, QK4_0};
                 let k_raw = unsafe {
                     std::slice::from_raw_parts(
                         k_cache.as_ptr() as *const BlockQ4_0,
@@ -1028,9 +1028,9 @@ impl CpuBackendCommon {
                 // Ensure divisibility
                 let total_q8_blocks = m * nb_k_q8;
                 let mut a_q8 = vec![
-                    crate::core::quant::BlockQ8_0 {
+                    crate::quant::BlockQ8_0 {
                         d: half::f16::from_f32(0.0),
-                        qs: [0; crate::core::quant::QK8_0]
+                        qs: [0; crate::quant::QK8_0]
                     };
                     total_q8_blocks
                 ];
@@ -1099,8 +1099,8 @@ impl CpuBackendCommon {
     }
 
     #[allow(clippy::needless_range_loop)]
-    pub fn quantize_row_q8_0(&self, x: &[f32], y: &mut [crate::core::quant::BlockQ8_0], k: usize) {
-        use crate::core::quant::QK8_0;
+    pub fn quantize_row_q8_0(&self, x: &[f32], y: &mut [crate::quant::BlockQ8_0], k: usize) {
+        use crate::quant::QK8_0;
         assert!(k.is_multiple_of(QK8_0));
         let nb = k / QK8_0;
 
@@ -1131,9 +1131,9 @@ impl CpuBackendCommon {
         n: usize,
         s: &mut f32,
         vx: *const BlockQ4_0,
-        vy: *const crate::core::quant::BlockQ8_0,
+        vy: *const crate::quant::BlockQ8_0,
     ) {
-        use crate::core::quant::QK8_0;
+        use crate::quant::QK8_0;
         let nb = n / QK8_0;
         let mut sumf = 0.0;
 
@@ -1219,14 +1219,14 @@ impl CpuBackendCommon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use crate::backend::cpu::CpuBackend;
-    use crate::core::backend::Backend;
-    use crate::core::buffer::DType;
-    use crate::core::memory::Memory;
-    use crate::core::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::buffer::DType;
+    use crate::memory::Memory;
     use crate::memory::galloc::Galloc;
+    use crate::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     // ---- Helpers ----

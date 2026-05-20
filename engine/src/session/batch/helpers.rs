@@ -8,9 +8,9 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
+use crate::backend::Backend;
+use crate::buffer::DType;
+use crate::memory::Memory;
 
 /// JSONL `--prompt-batch` 파일의 단일 entry.
 #[derive(serde::Deserialize)]
@@ -68,7 +68,7 @@ pub fn unix_ts() -> f64 {
 pub fn make_partition_gpu_alloc<'a>(
     backend: &'a dyn Backend,
     memory: &'a dyn Memory,
-) -> impl Fn(usize, DType) -> anyhow::Result<Arc<dyn crate::core::buffer::Buffer>> + 'a {
+) -> impl Fn(usize, DType) -> anyhow::Result<Arc<dyn crate::buffer::Buffer>> + 'a {
     #[cfg(feature = "opencl")]
     let ocl_queue: Option<ocl::Queue> = backend
         .as_any()
@@ -78,7 +78,7 @@ pub fn make_partition_gpu_alloc<'a>(
     #[cfg(not(feature = "opencl"))]
     let _ = backend;
 
-    move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn crate::core::buffer::Buffer>> {
+    move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn crate::buffer::Buffer>> {
         #[cfg(feature = "opencl")]
         if let Some(ref q) = ocl_queue {
             let buf = crate::memory::opencl::unified::UnifiedBuffer::new(q.clone(), size, dtype)?;

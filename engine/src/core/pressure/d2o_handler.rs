@@ -12,9 +12,9 @@
 //! Supports F32, F16, and Q4_0 KV cache dtypes.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
-use crate::core::buffer::DType;
+use crate::buffer::DType;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
-use crate::core::quant::{BlockQ4_0, QK4_0};
+use crate::quant::{BlockQ4_0, QK4_0};
 use anyhow::Result;
 use half::f16;
 use std::sync::Mutex;
@@ -826,12 +826,12 @@ fn scatter_reduce_q4(
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::memory::host::shared::SharedBuffer;
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     use crate::core::kv_cache::KVLayout;
     use crate::core::pressure::PressureLevel;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     // ── Test helpers ──

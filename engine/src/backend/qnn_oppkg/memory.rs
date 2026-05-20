@@ -18,8 +18,8 @@
 
 use crate::backend::qnn_oppkg::QnnOppkgBackend;
 use crate::backend::qnn_oppkg::buffer::QnnOppkgBuffer;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
+use crate::buffer::{Buffer, DType};
+use crate::memory::Memory;
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -39,6 +39,11 @@ LAYER_RULES = [
     ("buffer",                  "L2"),
     ("memory",                  "L2"),
     ("auf",                     "L2"),   # §13.8-A 결정: shared/auf/ = L2 자산
+    # Step 4-A: L2 abstractions promoted from core/ to engine/src/ top-level
+    ("tensor",                  "L2"),
+    ("shape",                   "L2"),
+    ("quant",                   "L2"),
+    ("thread_pool",             "L2"),
 
     # L3-pressure: KV cache 관리, eviction, offload, swap handler
     ("core/pressure",           "L3-pressure"),
@@ -100,9 +105,16 @@ def classify_module(rel_path: str) -> str:
     """
     engine/src/ 기준 상대경로로 layer를 반환.
     예: "backend/opencl/mod.rs" → "L1"
+        "backend.rs" → "L2" (Step 4-A: top-level trait file)
     """
     # 경로 구분자를 /로 통일
     norm = rel_path.replace(os.sep, "/")
+    # Step 4-A: top-level abstraction *.rs files take precedence over
+    # directory-prefix rules (Rust 2018+ pattern — trait lives next to impl dir).
+    TOP_LEVEL_L2 = {"backend.rs", "buffer.rs", "memory.rs", "tensor.rs",
+                    "shape.rs", "quant.rs", "thread_pool.rs"}
+    if norm in TOP_LEVEL_L2:
+        return "L2"
     for prefix, layer in LAYER_RULES:
         if norm.startswith(prefix + "/") or norm == prefix or norm.startswith(prefix + "."):
             return layer
@@ -115,14 +127,29 @@ def classify_import(import_path: str) -> str:
     layer로 분류.
     예: "core::pressure::..." → "L3-pressure"
          "backend::opencl::..." → "L1"
+         "backend::Backend"    → "L2" (Step 4-A: top-level trait file)
     """
     # crate:: 제거
     p = import_path.strip()
     if p.startswith("crate::"):
         p = p[len("crate::"):]
-    # :: → / 변환 후 LAYER_RULES 매칭
-    as_path = p.replace("::", "/")
-    return classify_module(as_path)
+    # Step 4-A: leaf identifier가 PascalCase면 module path 추출 (top-level
+    # *.rs 파일에 정의된 trait/struct를 디렉토리 prefix와 분리)
+    segs = [s for s in p.split("::") if s]  # trailing `::` 등 empty segment 제거
+    mod_segs: list[str] = []
+    for s in segs:
+        if s and s[0].isupper():
+            break
+        mod_segs.append(s)
+    if not mod_segs:
+        mod_segs = segs
+    mod_path = "/".join(mod_segs)
+    # Top-level L2 abstraction files (engine/src/*.rs, Rust 2018+ pattern)
+    if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
+                    "quant", "thread_pool"):
+        return "L2"
+    # 기존 경로 기반 매칭으로 fallback
+    return classify_module(mod_path if mod_path else p.replace("::", "/"))
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -242,6 +269,12 @@ def check_cross_backend(src_rel: str, import_path: str) -> tuple[str | None, str
     dst_be = parts[1]
 
     if not src_be or not dst_be:
+        return (None, None)
+
+    # Step 4-A: parts[1]이 PascalCase면 backend.rs (top-level L2 trait file)
+    # 의 item을 가리킴 (예: `crate::backend::Backend`, `crate::backend::GpuEvent`).
+    # 이는 cross-backend import가 아니라 L2 trait import이므로 허용.
+    if dst_be and dst_be[0].isupper():
         return (None, None)
 
     # 동일 backend 내부 (예: backend/cpu/x86.rs → backend/cpu/common.rs) 는 허용

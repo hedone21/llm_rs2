@@ -13,14 +13,14 @@ pub mod preload_pool;
 pub mod raw_store;
 pub mod store;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::memory::host::shared::SharedBuffer;
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCacheOps, KVLayout};
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::memory::Memory;
+use crate::memory::host::shared::SharedBuffer;
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -374,7 +374,7 @@ impl KVCacheOps for OffloadKVCache {
 
     fn get_view(&mut self) -> (Tensor, Tensor) {
         let total = self.current_pos;
-        let cpu_backend: Arc<dyn crate::core::backend::Backend> = self.out_backend.clone();
+        let cpu_backend: Arc<dyn crate::backend::Backend> = self.out_backend.clone();
 
         if total == 0 {
             let buf = Arc::new(SharedBuffer::new(0, self.dtype));
@@ -535,7 +535,7 @@ mod tests {
         unsafe {
             std::ptr::write_bytes(buf.as_mut_ptr(), fill_val, n_bytes);
         }
-        let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
         Tensor::new(
             Shape::new(vec![1, seq_len, kv_heads, head_dim]),
             buf,
@@ -554,7 +554,7 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr() as *mut f32, data.len());
         }
-        let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
         Tensor::new(
             Shape::new(vec![1, seq_len, kv_heads, head_dim]),
             buf,
@@ -631,7 +631,7 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     use crate::core::kv_cache::KVCache;
-    use crate::core::memory::Memory;
+    use crate::memory::Memory;
     use crate::memory::galloc::Galloc;
 
     /// Create a standard KVCache (BASE) for comparison.
@@ -647,7 +647,7 @@ mod tests {
         let k_buf = memory.alloc(buf_bytes, dtype).unwrap();
         let v_buf = memory.alloc(buf_bytes, dtype).unwrap();
         let shape = Shape::new(vec![1, max_seq_len, kv_heads, head_dim]);
-        let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
         let k = Tensor::new(shape.clone(), k_buf, backend.clone());
         let v = Tensor::new(shape, v_buf, backend);
         KVCache::new(k, v, max_seq_len)
@@ -687,7 +687,7 @@ mod tests {
                 *ptr.add(i) = val;
             }
         }
-        let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
         Tensor::new(
             Shape::new(vec![1, seq_len, kv_heads, head_dim]),
             buf,

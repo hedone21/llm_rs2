@@ -11,7 +11,7 @@ static FALLBACK_WARNED: Mutex<Option<HashSet<(String, usize, &'static str)>>> = 
 /// Emit a one-time stderr warning for a GPU prefill → CPU attention fallback.
 /// Always emits the OpProfiler event (if profiler is Some) regardless of dedup state.
 fn warn_gpu_fallback_once(
-    kv_dtype: crate::core::buffer::DType,
+    kv_dtype: crate::buffer::DType,
     head_dim: usize,
     reason: &'static str,
     profiler: Option<&mut crate::profile::ops::PrefillOpProfiler>,
@@ -225,8 +225,8 @@ impl TransformerLayer {
                     let buf_size = match kv_dtype {
                         DType::F16 => n_elem * 2,
                         DType::Q4_0 => {
-                            (n_elem / crate::core::quant::QK4_0)
-                                * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+                            (n_elem / crate::quant::QK4_0)
+                                * std::mem::size_of::<crate::quant::BlockQ4_0>()
                         }
                         _ => n_elem * 4,
                     };
@@ -317,7 +317,7 @@ impl TransformerLayer {
                     let (q_data, k_data, v_data, out_ptr) = if is_device_only {
                         let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
                             if t.dtype() == DType::Q4_0 {
-                                use crate::core::quant::{BlockQ4_0, QK4_0};
+                                use crate::quant::{BlockQ4_0, QK4_0};
                                 let numel = t.numel();
                                 let n_blocks = numel / QK4_0;
                                 let byte_size = n_blocks * std::mem::size_of::<BlockQ4_0>();
@@ -376,7 +376,7 @@ impl TransformerLayer {
 
                         (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
                     } else if k_cache.dtype() == DType::Q4_0 {
-                        use crate::core::quant::{BlockQ4_0, QK4_0};
+                        use crate::quant::{BlockQ4_0, QK4_0};
                         let n_elems = if kv_layout == crate::core::kv_cache::KVLayout::HeadMajor {
                             n_heads_kv * kv_capacity * head_dim
                         } else {
@@ -895,8 +895,8 @@ impl TransformerLayer {
                 let buf_size = match kv_dtype {
                     DType::F16 => n_elem * 2,
                     DType::Q4_0 => {
-                        (n_elem / crate::core::quant::QK4_0)
-                            * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+                        (n_elem / crate::quant::QK4_0)
+                            * std::mem::size_of::<crate::quant::BlockQ4_0>()
                     }
                     _ => n_elem * 4,
                 };
@@ -979,7 +979,7 @@ impl TransformerLayer {
                 let (q_data, k_data, v_data, out_ptr) = if is_device_only2 {
                     let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
                         if t.dtype() == DType::Q4_0 {
-                            use crate::core::quant::{BlockQ4_0, QK4_0};
+                            use crate::quant::{BlockQ4_0, QK4_0};
                             let numel = t.numel();
                             let n_blocks = numel / QK4_0;
                             let byte_size = n_blocks * std::mem::size_of::<BlockQ4_0>();
@@ -1042,7 +1042,7 @@ impl TransformerLayer {
                     (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
                 } else if k_cache.dtype() == DType::Q4_0 {
                     // Q4_0: dequantize KV cache to F32 temp buffers
-                    use crate::core::quant::{BlockQ4_0, QK4_0};
+                    use crate::quant::{BlockQ4_0, QK4_0};
                     // HeadMajor: need full buffer (heads are non-contiguous)
                     let n_elems = if kv_layout == crate::core::kv_cache::KVLayout::HeadMajor {
                         n_heads_kv * kv_capacity * head_dim
@@ -1299,7 +1299,7 @@ impl TransformerLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     use crate::profile::ops::PrefillOpProfiler;
 
     /// Verify that warn_gpu_fallback_once increments cpu_fallback_count every call

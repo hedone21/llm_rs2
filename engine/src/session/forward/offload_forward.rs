@@ -12,19 +12,19 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
+use crate::buffer::DType;
 use crate::core::offload::OffloadKVCache;
 use crate::core::offload::prefetch::PrefetchController;
 use crate::core::offload::raw_store::RawStore;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::session::traits::{Forward, StepCtx};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 /// KV offload 경로의 Forward 구현체.
 ///

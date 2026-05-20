@@ -29,12 +29,12 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{Result, anyhow};
 
-use crate::memory::cuda::buffer::{CudaDeviceBuffer, CudaHostBuffer};
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
 use crate::layers::transformer_layer::TransformerLayer;
+use crate::memory::cuda::buffer::{CudaDeviceBuffer, CudaHostBuffer};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 /// Per-tensor allocation spec — captured once from a sample
 /// `TransformerLayer` so the background allocator thread can rebuild

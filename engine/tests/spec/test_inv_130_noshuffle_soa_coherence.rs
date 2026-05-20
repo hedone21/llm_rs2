@@ -41,14 +41,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::Result;
 
+use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
-use llm_rs2::core::memory::Memory;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::DType;
+use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::{LayerSlot, SwapExecutor};
+use llm_rs2::tensor::Tensor;
 
 // ── INV-130-A: trait default is no-op ────────────────────────────────────────
 
@@ -180,11 +180,7 @@ fn minimal_model_config() -> ModelConfig {
 fn dummy_tensor(be: &Arc<dyn Backend>, numel: usize) -> Tensor {
     let mem = Galloc::new();
     let buf = mem.alloc(numel * 4, DType::F32).unwrap();
-    Tensor::new(
-        llm_rs2::core::shape::Shape::new(vec![numel]),
-        buf,
-        be.clone(),
-    )
+    Tensor::new(llm_rs2::shape::Shape::new(vec![numel]), buf, be.clone())
 }
 
 fn dummy_layer(be: &Arc<dyn Backend>) -> llm_rs2::layers::transformer_layer::TransformerLayer {
@@ -269,8 +265,8 @@ fn empty_swap_batch_does_not_invalidate() {
 #[cfg(feature = "opencl")]
 #[test]
 fn opencl_invalidate_trait_override_drops_entries() {
+    use llm_rs2::backend::Backend as BackendTrait;
     use llm_rs2::backend::opencl::OpenCLBackend;
-    use llm_rs2::core::backend::Backend as BackendTrait;
 
     // try_create_backend is pub(crate) internal; fall back to public `new`
     // and bail out if no OpenCL platform exists in the CI host.

@@ -21,7 +21,7 @@
 
 #![cfg(feature = "opencl")]
 
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use crate::memory::host::mmap::MmapKeepAlive;
 use crate::memory::secondary::RpcmemRegionGuard;
 use anyhow::Result;

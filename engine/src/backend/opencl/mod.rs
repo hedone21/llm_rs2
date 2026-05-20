@@ -1,10 +1,10 @@
 #![allow(unused_unsafe)]
+use crate::backend::Backend;
+use crate::buffer::Buffer;
+use crate::buffer::DType;
+use crate::memory::Memory;
 use crate::memory::opencl::unified::UnifiedBuffer;
-use crate::core::backend::Backend;
-use crate::core::buffer::Buffer;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
-use crate::core::tensor::Tensor;
+use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use ocl::core::Kernel as CoreKernel;
 use ocl::core::{ClContextPtr, ClDeviceIdPtr};
@@ -4673,7 +4673,7 @@ impl Backend for OpenCLBackend {
         &self,
         t: &Tensor,
         dst: &mut [u8],
-    ) -> Result<crate::core::backend::GpuEvent> {
+    ) -> Result<crate::backend::GpuEvent> {
         let buf =
             get_cl_mem(t.buffer().as_ref()).map_err(|_| anyhow::anyhow!("Not OpenCL buffer"))?;
         let mut event: ocl::core::Event = ocl::core::Event::null();
@@ -4691,14 +4691,14 @@ impl Backend for OpenCLBackend {
                 Some(&mut event),
             )?;
         }
-        Ok(crate::core::backend::GpuEvent {
+        Ok(crate::backend::GpuEvent {
             inner_cl: Some(event),
             #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
             inner_cu: None,
         })
     }
 
-    fn wait_event(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+    fn wait_event(&self, evt: &crate::backend::GpuEvent) -> Result<()> {
         if let Some(e) = evt.inner_cl.as_ref() {
             ocl::core::wait_for_event(e)?;
         }
@@ -4713,14 +4713,11 @@ impl Backend for OpenCLBackend {
     /// Falls back to the synchronous default impl when the transfer
     /// queue is disabled (env-gate or creation failure) or when the
     /// destination has no `cl_mem` handle (host-only fallback).
-    fn enqueue_write_async(
-        &self,
-        src: &Tensor,
-    ) -> Result<(Tensor, crate::core::backend::GpuEvent)> {
+    fn enqueue_write_async(&self, src: &Tensor) -> Result<(Tensor, crate::backend::GpuEvent)> {
         let Some(transfer_queue) = self.transfer_queue_or_init() else {
             // Default: sync via copy_weight_from + dummy event.
             let dst = self.copy_weight_from(src)?;
-            return Ok((dst, crate::core::backend::GpuEvent::default()));
+            return Ok((dst, crate::backend::GpuEvent::default()));
         };
 
         // Allocate the destination buffer through the regular memory
@@ -4761,7 +4758,7 @@ impl Backend for OpenCLBackend {
                 // Buffer doesn't expose cl_mem (mapped host-only). Fall
                 // back to sync copy.
                 let dst = self.copy_weight_from(src)?;
-                return Ok((dst, crate::core::backend::GpuEvent::default()));
+                return Ok((dst, crate::backend::GpuEvent::default()));
             }
         };
         let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, size) };
@@ -4791,7 +4788,7 @@ impl Backend for OpenCLBackend {
 
         Ok((
             new_tensor,
-            crate::core::backend::GpuEvent {
+            crate::backend::GpuEvent {
                 inner_cl: Some(event),
                 #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
                 inner_cu: None,
@@ -4804,7 +4801,7 @@ impl Backend for OpenCLBackend {
     /// `clWaitForEvents` blocks the *host* thread but not the device,
     /// which is exactly what the swap dispatcher's worker thread needs
     /// before flipping ArcSwap.
-    fn wait_event_blocking(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+    fn wait_event_blocking(&self, evt: &crate::backend::GpuEvent) -> Result<()> {
         if let Some(e) = evt.inner_cl.as_ref() {
             ocl::core::wait_for_event(e)?;
             return Ok(());
@@ -5148,7 +5145,7 @@ impl Backend for OpenCLBackend {
     /// drag (Llama 3.2 1B ratio=1.0 mixed measured by `ClMemDiagBucket`).
     fn alloc_pre_converted_soa_tensor(
         &self,
-        shape: crate::core::shape::Shape,
+        shape: crate::shape::Shape,
         q_bytes: &[u8],
         d_bytes: &[u8],
         ne00: usize,
@@ -5246,8 +5243,8 @@ impl Backend for OpenCLBackend {
         if let Some(nb) = tensor
             .buffer()
             .as_any()
-            .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>(
-        ) {
+            .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>()
+        {
             // SOA-backed: re-insert against the d_buf key (`cl_mem()` on
             // `NoshuffleWeightBuffer` returns d_buf, so the registry key
             // matches `b_buf.as_ptr() as usize` lookups in `matmul_q4_0`).
@@ -5286,7 +5283,7 @@ impl Backend for OpenCLBackend {
         dtype: DType,
         secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
         layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
-    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+    ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         if size == 0 || host_ptr.is_null() {
             return Ok(None);
         }
@@ -6346,7 +6343,7 @@ impl Backend for OpenCLBackend {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U8 => 1,
-            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+            DType::Q4_0 => std::mem::size_of::<crate::quant::BlockQ4_0>(),
             _ => {
                 return Err(anyhow!(
                     "Unsupported dtype for buffer_shift: {:?}",
@@ -6474,7 +6471,7 @@ impl Backend for OpenCLBackend {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U8 => 1,
-            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+            DType::Q4_0 => std::mem::size_of::<crate::quant::BlockQ4_0>(),
             _ => {
                 return Err(anyhow!(
                     "Unsupported dtype for copy_slice: {:?}",
@@ -7030,7 +7027,7 @@ impl OpenCLBackend {
 #[cfg(test)]
 mod gpu_buffer_shift_tests {
     use super::*;
-    use crate::core::shape::Shape;
+    use crate::shape::Shape;
 
     fn try_create_backend() -> Option<Arc<OpenCLBackend>> {
         OpenCLBackend::new().ok().map(Arc::new)
@@ -7271,7 +7268,7 @@ mod gpu_buffer_shift_tests {
 #[allow(clippy::needless_range_loop)]
 mod noshuffle_tests {
     use super::*;
-    use crate::core::shape::Shape;
+    use crate::shape::Shape;
 
     fn try_create_backend() -> Option<Arc<OpenCLBackend>> {
         OpenCLBackend::new().ok().map(Arc::new)
@@ -8849,7 +8846,7 @@ mod noshuffle_tests {
 #[cfg(test)]
 mod kv_scatter_batch_tests {
     use super::*;
-    use crate::core::shape::Shape;
+    use crate::shape::Shape;
     use half::f16;
 
     fn try_create_backend() -> Option<Arc<OpenCLBackend>> {

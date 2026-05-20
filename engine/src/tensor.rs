@@ -1,6 +1,6 @@
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::shape::Shape;
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
+use crate::shape::Shape;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -100,7 +100,7 @@ impl Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::buffer::Buffer;
+    use crate::buffer::Buffer;
     use std::any::Any;
 
     // Dummy Buffer for testing

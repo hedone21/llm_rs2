@@ -113,15 +113,15 @@ impl CachePressureHandler for EvictionHandler {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::memory::host::shared::SharedBuffer;
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     use crate::core::eviction::h2o::H2OPolicy;
     use crate::core::eviction::no_eviction::NoEvictionPolicy;
     use crate::core::eviction::sliding_window::SlidingWindowPolicy;
     use crate::core::kv_cache::KVCache;
     use crate::core::pressure::PressureLevel;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     fn make_caches(n_layers: usize, pos: usize) -> Vec<KVCache> {

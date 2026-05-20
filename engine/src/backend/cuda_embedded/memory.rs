@@ -8,9 +8,9 @@
 //!   CPU access (logit reads, sampling) triggers migration back, but these are
 //!   infrequent compared to the per-token GPU compute.
 
+use crate::buffer::{Buffer, DType};
+use crate::memory::Memory;
 use crate::memory::cuda::buffer::{CudaBuffer, CudaHostBuffer};
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
 use anyhow::Result;
 use std::sync::Arc;
 

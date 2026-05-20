@@ -25,15 +25,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
-use llm_rs2::core::memory::Memory;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::DType;
 use llm_rs2::layers::transformer_layer::TransformerLayer;
+use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::weights::{LayerSlot, LayerWeights};
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 
 fn tagged_tensor(be: &Arc<dyn Backend>, g_id: u64) -> Tensor {
     // We encode the generation id in the first F32 element of `wq` so a

@@ -36,8 +36,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::GgufFile;
 #[cfg(target_os = "android")]

@@ -16,15 +16,15 @@
 //! The cold path (quantize during flush) still runs on CPU since it is infrequent.
 //! CPU-only mode is fully preserved for backward compatibility.
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCacheOps, KVLayout, KiviRawBuffers};
-use crate::core::memory::Memory;
-use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::memory::Memory;
+use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
+use crate::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -2436,8 +2436,8 @@ impl KVCacheOps for KiviCache {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
+    use crate::buffer::Buffer;
     use crate::memory::host::shared::SharedBuffer;
-    use crate::core::buffer::Buffer;
 
     fn make_input_tensor(
         seq_len: usize,
@@ -2454,7 +2454,7 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr() as *mut f32, n);
         }
-        let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
         Tensor::new(
             Shape::new(vec![1, seq_len, kv_heads, head_dim]),
             buf,
@@ -2825,7 +2825,7 @@ mod tests {
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr() as *mut f32, n);
             }
-            let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+            let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
             Tensor::new(
                 Shape::new(vec![1, seq_len, kv_heads, head_dim]),
                 buf,
@@ -2866,9 +2866,8 @@ mod tests {
         let baseline_k: Vec<f32>;
         let baseline_v: Vec<f32>;
         {
-            let memory: Arc<dyn crate::core::memory::Memory> =
-                Arc::new(crate::memory::galloc::Galloc);
-            let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+            let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::galloc::Galloc);
+            let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
             let k_buf = memory
                 .alloc(max_seq * kv_heads * head_dim * 4, DType::F32)
                 .unwrap();
@@ -3265,7 +3264,7 @@ mod tests {
     fn test_new_gpu_non_opencl_falls_back_to_cpu() {
         use crate::memory::galloc::Galloc;
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-        let memory: Arc<dyn crate::core::memory::Memory> = Arc::new(Galloc::new());
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
         let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
         // CpuBackend.name() != "OpenCL" → must fall back to CPU mode
         assert!(
@@ -3706,7 +3705,7 @@ mod tests {
     fn test_get_kivi_raw_buffers_trait_default_none() {
         use crate::core::kv_cache::KVCache;
         // Standard KVCache should return None via trait default
-        let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
         let buf_k = Arc::new(SharedBuffer::new(8 * 2048 * 64 * 4, DType::F32));
         let buf_v = Arc::new(SharedBuffer::new(8 * 2048 * 64 * 4, DType::F32));
         let k = Tensor::new(Shape::new(vec![1, 2048, 8, 64]), buf_k, backend.clone());
@@ -3736,7 +3735,7 @@ mod tests {
     fn test_gpu_mode_cpu_attn_buf_not_allocated() {
         use crate::memory::galloc::Galloc;
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-        let memory: Arc<dyn crate::core::memory::Memory> = Arc::new(Galloc::new());
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
 
         // new_gpu with non-OpenCL backend falls back to CPU mode
         let cache_cpu = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
@@ -3861,7 +3860,7 @@ mod tests {
 
         // new_gpu with non-OpenCL backend: falls back to CPU mode
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-        let memory: Arc<dyn crate::core::memory::Memory> = Arc::new(Galloc::new());
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
         let cache_fallback =
             KiviCache::new_gpu(kv_heads, head_dim, max_seq, res_cap, 2, cpu_backend, memory);
         assert!(!cache_fallback.is_gpu());
@@ -4028,7 +4027,7 @@ mod tests {
     fn test_new_gpu_fallback_no_f16_attn_buffers() {
         use crate::memory::galloc::Galloc;
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-        let memory: Arc<dyn crate::core::memory::Memory> = Arc::new(Galloc::new());
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
         let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
         // CPU fallback: gpu_attn_k/v should be None
         assert!(

@@ -1,8 +1,8 @@
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
+use crate::memory::Memory;
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 use anyhow::Result;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
@@ -78,7 +78,7 @@ pub struct LayerWorkspace {
 
 impl LayerWorkspace {
     /// Extract all buffer Arcs (for keeping GPU buffers alive during switch).
-    pub fn take_buffers(&self) -> Vec<Arc<dyn crate::core::buffer::Buffer>> {
+    pub fn take_buffers(&self) -> Vec<Arc<dyn crate::buffer::Buffer>> {
         let mut bufs = vec![
             self.q.buffer().clone(),
             self.k.buffer().clone(),

@@ -1,10 +1,10 @@
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::memory::host::shared::SharedBuffer;
-use llm_rs2::core::buffer::DType;
+use llm_rs2::buffer::DType;
 use llm_rs2::core::eviction::{EvictionPolicy, SlidingWindowPolicy};
 use llm_rs2::core::kv_cache::KVCache;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::memory::host::shared::SharedBuffer;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use std::sync::Arc;
 
 #[test]

@@ -32,7 +32,7 @@
 //! for the weight, keeping `matmul_transposed()` dispatch unchanged.
 
 #[cfg(feature = "opencl")]
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 #[cfg(feature = "opencl")]
 use anyhow::Result;
 #[cfg(feature = "opencl")]

@@ -12,10 +12,10 @@
 pub mod kernels;
 pub mod memory;
 
+use crate::backend::Backend;
+use crate::buffer::{Buffer, DType};
 use crate::memory::cuda::buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::tensor::Tensor;
+use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cudarc::driver::sys as cuda_sys;
@@ -455,8 +455,8 @@ impl CudaBackend {
     /// Run a basic self-test to verify kernel launch + arg passing works.
     /// Tests add_assign, scale, rms_norm with known data.
     pub fn self_test(&self) -> Result<()> {
+        use crate::buffer::DType;
         use crate::memory::cuda::buffer::CudaHostBuffer;
-        use crate::core::buffer::DType;
 
         // === Test 1: add_assign [1,2,3] + [4,5,6] = [5,7,9] ===
         let a_buf = CudaHostBuffer::new(12, DType::F32)?;
@@ -1632,7 +1632,7 @@ impl Backend for CudaBackend {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U8 => 1,
-            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+            DType::Q4_0 => std::mem::size_of::<crate::quant::BlockQ4_0>(),
             _ => 1,
         };
         let byte_count = count * type_size;
@@ -1738,13 +1738,10 @@ impl Backend for CudaBackend {
     /// device buffer (`CudaDeviceBuffer`). Submits a `cuMemcpyHtoDAsync`
     /// on the secondary transfer stream and records a `CudaEvent` for
     /// the dispatcher's worker to wait on.
-    fn enqueue_write_async(
-        &self,
-        src: &Tensor,
-    ) -> Result<(Tensor, crate::core::backend::GpuEvent)> {
+    fn enqueue_write_async(&self, src: &Tensor) -> Result<(Tensor, crate::backend::GpuEvent)> {
         let Some(transfer_stream) = self.transfer_stream_or_init() else {
             let dst = self.copy_weight_from(src)?;
-            return Ok((dst, crate::core::backend::GpuEvent::default()));
+            return Ok((dst, crate::backend::GpuEvent::default()));
         };
 
         let size = src.size();
@@ -1776,7 +1773,7 @@ impl Backend for CudaBackend {
         );
         Ok((
             dst_tensor,
-            crate::core::backend::GpuEvent {
+            crate::backend::GpuEvent {
                 #[cfg(feature = "opencl")]
                 inner_cl: None,
                 inner_cu: Some(event),
@@ -1784,7 +1781,7 @@ impl Backend for CudaBackend {
         ))
     }
 
-    fn wait_event_blocking(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+    fn wait_event_blocking(&self, evt: &crate::backend::GpuEvent) -> Result<()> {
         if let Some(e) = evt.inner_cu.as_ref() {
             e.synchronize()
                 .map_err(|err| anyhow!("cuEventSynchronize failed: {err}"))?;

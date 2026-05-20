@@ -175,11 +175,11 @@ impl EvictionPolicy for H2OPlusPolicy {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::memory::host::shared::SharedBuffer;
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     use crate::core::kv_cache::KVLayout;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     fn make_cache(pos: usize, n_kv_heads: usize) -> KVCache {

@@ -15,7 +15,7 @@
 //! - `mem_handle`: QnnMem_register 결과. Step 2에서 graph에 주입 예정.
 //! - `Send + Sync`: production OpenCL queue는 단일 스레드 접근 보장.
 
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use anyhow::Result;
 use std::any::Any;
 

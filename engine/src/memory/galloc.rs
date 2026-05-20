@@ -1,6 +1,6 @@
+use crate::buffer::{Buffer, DType};
+use crate::memory::Memory;
 use crate::memory::host::shared::SharedBuffer;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
 use anyhow::Result;
 use std::sync::Arc;
 

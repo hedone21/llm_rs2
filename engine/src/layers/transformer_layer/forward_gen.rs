@@ -271,7 +271,7 @@ impl TransformerLayer {
             // Fused QKV for Q4_0: single Q8 quantization + single Rayon dispatch
             #[cfg(target_arch = "aarch64")]
             {
-                use crate::core::quant::BlockQ4_0;
+                use crate::quant::BlockQ4_0;
                 let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
                 unsafe {
                     crate::backend::cpu::neon::fused_matmul_q4_0(
@@ -299,13 +299,13 @@ impl TransformerLayer {
             }
         } else {
             // Decode QKV: GPU-only (partition not applied to attention in decode).
-            crate::core::thread_pool::get_pool().begin_batch();
+            crate::thread_pool::get_pool().begin_batch();
             set_label("matmul_qkv");
             backend.matmul_transposed(&ws.residual, &self.wq, &mut ws.q)?;
             backend.matmul_transposed(&ws.residual, &self.wk, &mut ws.k)?;
             backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
             clear_label();
-            crate::core::thread_pool::get_pool().end_batch();
+            crate::thread_pool::get_pool().end_batch();
             if is_gpu && std::env::var_os("LLMRS_DISABLE_FLUSH_QKV").is_none() {
                 backend.flush()?;
             }
@@ -402,8 +402,7 @@ impl TransformerLayer {
             let buf_size = match kv_dtype {
                 DType::F16 => n_elem * 2,
                 DType::Q4_0 => {
-                    (n_elem / crate::core::quant::QK4_0)
-                        * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+                    (n_elem / crate::quant::QK4_0) * std::mem::size_of::<crate::quant::BlockQ4_0>()
                 }
                 _ => n_elem * 4,
             };
@@ -1207,7 +1206,7 @@ impl TransformerLayer {
             // consumes the bytes. Enables overlap of the host-side sync-drain
             // with the GPU FFN chain enqueue issued right after.
             let async_read = partition_async_read_enabled() && !zcopy_residual && is_gpu;
-            let mut pending_read_evt: Option<crate::core::backend::GpuEvent> = None;
+            let mut pending_read_evt: Option<crate::backend::GpuEvent> = None;
             let partition_path;
             let residual_cpu_ptr: *const u8 = if zcopy_residual {
                 backend.synchronize()?;
@@ -1316,7 +1315,7 @@ impl TransformerLayer {
                     }
                     true
                 } else if cpu_is_neon && cpu_slice_dtype == DType::Q4_0 {
-                    use crate::core::quant::BlockQ4_0;
+                    use crate::quant::BlockQ4_0;
                     unsafe {
                         crate::backend::cpu::neon::fused_matmul_q4_0(
                             residual_cpu_ptr as *const f32,
@@ -1469,7 +1468,7 @@ impl TransformerLayer {
             // ── Fused Q4_0 dispatch: single Q8 quantization + single Rayon dispatch ──
             #[cfg(target_arch = "aarch64")]
             {
-                use crate::core::quant::BlockQ4_0;
+                use crate::quant::BlockQ4_0;
                 let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
                 unsafe {
                     crate::backend::cpu::neon::fused_matmul_q4_0(
@@ -1492,7 +1491,7 @@ impl TransformerLayer {
             }
         } else {
             // ── Generic path: sequential matmuls on active backend ──
-            crate::core::thread_pool::get_pool().begin_batch();
+            crate::thread_pool::get_pool().begin_batch();
             set_label("matmul_ffn");
             // Backends with a Q4_0 × Q8_1 mmvq fast path (CUDA
             // embedded) fuse gate+up matmul and SiLU gating into one
@@ -1514,7 +1513,7 @@ impl TransformerLayer {
                 backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
             }
             clear_label();
-            crate::core::thread_pool::get_pool().end_batch();
+            crate::thread_pool::get_pool().end_batch();
             if is_gpu && std::env::var_os("LLMRS_DISABLE_FLUSH_FFN").is_none() {
                 backend.flush()?;
             }
@@ -1619,7 +1618,7 @@ impl TransformerLayer {
 
         match k_cache.dtype() {
             DType::Q4_0 => {
-                use crate::core::quant::{BlockQ4_0, QK4_0};
+                use crate::quant::{BlockQ4_0, QK4_0};
                 let blocks_per_row = head_dim / QK4_0;
 
                 // Read K cache to CPU
@@ -1778,7 +1777,7 @@ impl TransformerLayer {
         need_scores: bool,
         backend: &Arc<dyn Backend>,
     ) -> Result<()> {
-        use crate::core::quant::{BlockQ4_0, QK4_0};
+        use crate::quant::{BlockQ4_0, QK4_0};
 
         if cache_seq_len == 0 {
             return Ok(());

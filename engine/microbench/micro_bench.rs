@@ -1,4 +1,4 @@
-use llm_rs2::core::quant::{BlockQ4_0, BlockQ8_0, QK4_0, QK8_0};
+use llm_rs2::quant::{BlockQ4_0, BlockQ8_0, QK4_0, QK8_0};
 use rand::Rng;
 use std::time::Instant;
 

@@ -4,7 +4,7 @@
 //! so the returned pointer is accessible from both CPU and GPU without explicit copies.
 //! This is the CUDA equivalent of OpenCL's `CL_MEM_ALLOC_HOST_PTR` zero-copy on Adreno.
 
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use anyhow::{Result, anyhow};
 use cudarc::driver::{result as cuda_result, sys as cuda_sys};
 use std::any::Any;

@@ -6,18 +6,16 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
+use crate::buffer::DType;
 use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kivi_cache::KiviCache;
 use crate::core::kv_cache::KVCache;
-use crate::core::memory::Memory;
 use crate::core::sampling::{self};
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
 use crate::models::transformer::TransformerModelForwardArgs;
@@ -27,6 +25,8 @@ use crate::session::ppl::args::PplRunCtx;
 use crate::session::qcf_runtime::{
     dispatch_swap_weights, dump_layer_weights_to_dir, run_layer_swap,
 };
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 /// PPL 모드 dispatch entry point. main()에서 호출.
 /// 본문은 원본 ppl_main 분기를 그대로 이동한다.

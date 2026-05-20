@@ -1,8 +1,8 @@
 use clap::Parser;
+use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
+use llm_rs2::buffer::DType;
 use llm_rs2::core::attention_scores::AttentionScoreAccumulator;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
 use llm_rs2::core::cache_manager::CacheManager;
 use llm_rs2::core::events::{self, CacheEvent, StderrDiagnosticSink};
 use llm_rs2::core::eviction::h2o::H2OPolicy;
@@ -11,17 +11,15 @@ use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
 use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
 use llm_rs2::core::kivi_cache::KiviCache;
 use llm_rs2::core::kv_cache::{KVCache, KVLayout};
-use llm_rs2::core::memory::Memory;
 use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use llm_rs2::core::rss_trace::{io_trace, read_bytes_now, rss_trace};
 use llm_rs2::core::sampling::{self, SamplingConfig};
-use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
-use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::workspace::{
     LayerWorkspace, PartitionWorkspace, PartitionWsCell, WorkspaceConfig,
 };
+use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use llm_rs2::session::cli::{Args, KvMode, parse_qcf_sample_layers};
@@ -30,6 +28,8 @@ use llm_rs2::session::ppl::run_kivi_ppl;
 use llm_rs2::session::qcf_runtime::{
     dispatch_swap_weights, read_allow_boundary_env, run_layer_swap, run_qcf_warmup_workflow,
 };
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -57,7 +57,7 @@ use llm_rs2::resilience::{
 fn make_partition_gpu_alloc<'a>(
     backend: &'a dyn Backend,
     memory: &'a dyn Memory,
-) -> impl Fn(usize, DType) -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> + 'a {
+) -> impl Fn(usize, DType) -> anyhow::Result<Arc<dyn llm_rs2::buffer::Buffer>> + 'a {
     // Try to extract OpenCL queue for UnifiedBuffer allocation.
     #[cfg(feature = "opencl")]
     let ocl_queue: Option<ocl::Queue> = backend
@@ -68,7 +68,7 @@ fn make_partition_gpu_alloc<'a>(
     #[cfg(not(feature = "opencl"))]
     let _ = backend; // suppress unused warning
 
-    move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> {
+    move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn llm_rs2::buffer::Buffer>> {
         #[cfg(feature = "opencl")]
         if let Some(ref q) = ocl_queue {
             let buf = llm_rs2::memory::opencl::unified::UnifiedBuffer::new(q.clone(), size, dtype)?;
@@ -394,7 +394,7 @@ fn main() -> anyhow::Result<()> {
     let n_values = initial_kv_capacity * kv_heads * head_dim;
     let kv_buf_size = match kv_type {
         DType::Q4_0 => {
-            use llm_rs2::core::quant::{BlockQ4_0, QK4_0};
+            use llm_rs2::quant::{BlockQ4_0, QK4_0};
             (n_values / QK4_0) * std::mem::size_of::<BlockQ4_0>()
         }
         _ => n_values * kv_type.size(),
@@ -1286,17 +1286,14 @@ fn main() -> anyhow::Result<()> {
     // swap path can install zero-copy `CudaMmapAliasBuffer` weights.
     // env: LLMRS_SWAP_MMAP_ALIAS=1
     #[cfg(feature = "cuda-embedded")]
-    let mmap_registration: Option<
-        Arc<llm_rs2::memory::cuda::mmap::CudaMmapRegistration>,
-    > = {
+    let mmap_registration: Option<Arc<llm_rs2::memory::cuda::mmap::CudaMmapRegistration>> = {
         let enabled = std::env::var("LLMRS_SWAP_MMAP_ALIAS")
             .map(|v| v == "1")
             .unwrap_or(false);
         if !enabled {
             None
         } else if let Some(secondary) = model.secondary_mmap.clone() {
-            match llm_rs2::memory::cuda::mmap::CudaMmapRegistration::register(secondary)
-            {
+            match llm_rs2::memory::cuda::mmap::CudaMmapRegistration::register(secondary) {
                 Ok(reg) => {
                     eprintln!(
                         "[LISWAP-8] mmap registration active: size={} MB",
@@ -3151,7 +3148,7 @@ fn main() -> anyhow::Result<()> {
                     if let Err(e) = backend.synchronize() {
                         eprintln!("[QCF] backend.synchronize() failed: {}", e);
                     }
-                    let mut mapped_bufs: Vec<std::sync::Arc<dyn llm_rs2::core::buffer::Buffer>> =
+                    let mut mapped_bufs: Vec<std::sync::Arc<dyn llm_rs2::buffer::Buffer>> =
                         Vec::new();
                     for cache in &kv_caches {
                         let v_buf = cache.v_buffer.buffer();

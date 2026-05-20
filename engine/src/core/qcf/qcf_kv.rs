@@ -33,9 +33,9 @@
 //!     on the actual QCF).
 
 use super::{AggregationMode, aggregate_heads};
-use crate::core::buffer::DType;
+use crate::buffer::DType;
 use crate::core::kv_cache::{KVCache, KVLayout};
-use crate::core::quant::{BlockQ4_0, QK4_0};
+use crate::quant::{BlockQ4_0, QK4_0};
 
 // ── Action types ────────────────────────────────────────────────
 

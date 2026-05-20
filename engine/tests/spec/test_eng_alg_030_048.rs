@@ -279,7 +279,7 @@ fn test_eng_alg_032_estimate_qcf_selects_least_important() {
 
 #[test]
 fn test_eng_alg_045_nmse_block_q8() {
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::quant::QKKV;
 
     let mut original = [0.0f32; QKKV];
     for (i, slot) in original.iter_mut().enumerate().take(QKKV) {
@@ -293,7 +293,7 @@ fn test_eng_alg_045_nmse_block_q8() {
 
 #[test]
 fn test_eng_alg_045_nmse_block_q2() {
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::quant::QKKV;
 
     let mut original = [0.0f32; QKKV];
     for (i, slot) in original.iter_mut().enumerate().take(QKKV) {
@@ -317,7 +317,7 @@ fn test_eng_alg_045_nmse_block_q2() {
 fn test_eng_alg_046_flush_proxy_basic() {
     use llm_rs2::core::qcf::QcfConfig;
     use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
     let head_dim = QKKV; // = 32
@@ -350,7 +350,7 @@ fn test_eng_alg_046_flush_proxy_basic() {
 fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
     use llm_rs2::core::qcf::QcfConfig;
     use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
     let head_dim = QKKV;
@@ -397,7 +397,7 @@ fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
 fn test_eng_alg_047_flush_opr_basic() {
     use llm_rs2::core::qcf::QcfConfig;
     use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
     let head_dim = QKKV;
@@ -427,7 +427,7 @@ fn test_eng_alg_047_flush_opr_basic() {
 fn test_eng_alg_047_flush_opr_q2_higher() {
     use llm_rs2::core::qcf::QcfConfig;
     use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
     let head_dim = QKKV;

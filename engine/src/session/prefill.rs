@@ -11,21 +11,21 @@
 
 use std::sync::Arc;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
+use crate::buffer::DType;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::KVCache;
-use crate::core::memory::Memory;
 use crate::core::rss_trace::{io_trace, rss_trace};
 use crate::core::sampling::{self, SamplingConfig};
-use crate::core::shape::Shape;
 use crate::core::skip_config::SkipConfig;
-use crate::core::tensor::Tensor;
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::resilience::{CommandExecutor, KVSnapshot};
 use crate::session::cli::Args;
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 /// Closure for building LayerSwapEstimate. Binary owns the impl (uses
 /// `WeightSwapDecider` + `read_allow_boundary_env`). Closure-based DI keeps

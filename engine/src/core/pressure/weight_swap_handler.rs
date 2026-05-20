@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
+use crate::backend::Backend;
+use crate::buffer::DType;
+use crate::memory::Memory;
 use crate::models::config::ModelConfig;
 use crate::models::weights::swap_executor::SwapExecutor;
 use crate::models::weights::{LayerSlot, SecondaryMmap};

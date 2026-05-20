@@ -1,7 +1,7 @@
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::buffer::DType;
+use crate::memory::Memory;
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -321,9 +321,8 @@ impl KVCache {
 
         let n_values = new_cap * self.kv_heads * self.head_dim;
         let buf_size = match dtype {
-            crate::core::buffer::DType::Q4_0 => {
-                (n_values / crate::core::quant::QK4_0)
-                    * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+            crate::buffer::DType::Q4_0 => {
+                (n_values / crate::quant::QK4_0) * std::mem::size_of::<crate::quant::BlockQ4_0>()
             }
             _ => n_values * dtype.size(),
         };
@@ -344,9 +343,8 @@ impl KVCache {
             match self.layout {
                 KVLayout::SeqMajor => {
                     // Contiguous: all positions × heads × dim
-                    let copy_count = if dtype == crate::core::buffer::DType::Q4_0 {
-                        let blocks_per_pos =
-                            self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
+                    let copy_count = if dtype == crate::buffer::DType::Q4_0 {
+                        let blocks_per_pos = self.kv_heads * self.head_dim / crate::quant::QK4_0;
                         self.current_pos * blocks_per_pos
                     } else {
                         self.current_pos * self.kv_heads * self.head_dim
@@ -360,8 +358,8 @@ impl KVCache {
                     let new_head_stride = new_cap * self.head_dim;
                     let copy_per_head = self.current_pos * self.head_dim;
 
-                    if dtype == crate::core::buffer::DType::Q4_0 {
-                        let qk = crate::core::quant::QK4_0;
+                    if dtype == crate::buffer::DType::Q4_0 {
+                        let qk = crate::quant::QK4_0;
                         let old_hs = old_head_stride / qk;
                         let new_hs = new_head_stride / qk;
                         let cph = copy_per_head / qk;
@@ -439,18 +437,17 @@ impl KVCache {
 
         let n_values = new_cap * self.kv_heads * self.head_dim;
         let buf_size = match dtype {
-            crate::core::buffer::DType::Q4_0 => {
-                (n_values / crate::core::quant::QK4_0)
-                    * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+            crate::buffer::DType::Q4_0 => {
+                (n_values / crate::quant::QK4_0) * std::mem::size_of::<crate::quant::BlockQ4_0>()
             }
             _ => n_values * dtype.size(),
         };
 
         let old_n_values = self.capacity * self.kv_heads * self.head_dim;
         let old_buf_size = match dtype {
-            crate::core::buffer::DType::Q4_0 => {
-                (old_n_values / crate::core::quant::QK4_0)
-                    * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+            crate::buffer::DType::Q4_0 => {
+                (old_n_values / crate::quant::QK4_0)
+                    * std::mem::size_of::<crate::quant::BlockQ4_0>()
             }
             _ => old_n_values * dtype.size(),
         };
@@ -527,13 +524,13 @@ impl KVCache {
         }
 
         let backend = self.k_buffer.backend().clone();
-        let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+        let is_q4 = self.k_buffer.dtype() == crate::buffer::DType::Q4_0;
 
         match self.layout {
             KVLayout::SeqMajor => {
                 // Contiguous: single copy per buffer
                 let (offset, count) = if is_q4 {
-                    let bpp = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
+                    let bpp = self.kv_heads * self.head_dim / crate::quant::QK4_0;
                     (self.current_pos * bpp, seq_len * bpp)
                 } else {
                     let row = self.kv_heads * self.head_dim;
@@ -546,7 +543,7 @@ impl KVCache {
                 // Input is seq-major: [batch, seq_len, kv_heads, head_dim]
                 // Scatter to head-major: each head's data at head * capacity * head_dim + pos * head_dim
                 if is_q4 {
-                    let qk = crate::core::quant::QK4_0;
+                    let qk = crate::quant::QK4_0;
                     let src_row = self.kv_heads * self.head_dim / qk;
                     let dst_head_stride = self.capacity * self.head_dim / qk;
                     let blocks_per_head = self.head_dim / qk;
@@ -578,8 +575,8 @@ impl KVCache {
                     // For OpenCL buffers (as_ptr may be null or host-mapped),
                     // fall back to backend.copy_slice which handles GPU↔GPU copy.
                     let type_size = match self.k_buffer.dtype() {
-                        crate::core::buffer::DType::F16 => 2,
-                        crate::core::buffer::DType::F32 => 4,
+                        crate::buffer::DType::F16 => 2,
+                        crate::buffer::DType::F32 => 4,
                         _ => 0,
                     };
 
@@ -691,12 +688,12 @@ impl KVCache {
         }
 
         let backend = self.k_buffer.backend().clone();
-        let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+        let is_q4 = self.k_buffer.dtype() == crate::buffer::DType::Q4_0;
 
         match self.layout {
             KVLayout::SeqMajor => {
                 let (src_offset, move_count) = if is_q4 {
-                    let bpp = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
+                    let bpp = self.kv_heads * self.head_dim / crate::quant::QK4_0;
                     (count * bpp, remaining * bpp)
                 } else {
                     let epp = self.kv_heads * self.head_dim;
@@ -708,7 +705,7 @@ impl KVCache {
             KVLayout::HeadMajor => {
                 // Per-head shift: each head's data is contiguous
                 if is_q4 {
-                    let qk = crate::core::quant::QK4_0;
+                    let qk = crate::quant::QK4_0;
                     let head_stride = self.capacity * self.head_dim / qk;
                     let bph = self.head_dim / qk; // blocks per head per position
                     for h in 0..self.kv_heads {
@@ -754,11 +751,11 @@ impl KVCache {
 
     /// Returns the memory usage in bytes for currently stored KV data.
     pub fn memory_usage_bytes(&self) -> usize {
-        let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+        let is_q4 = self.k_buffer.dtype() == crate::buffer::DType::Q4_0;
 
         let per_buffer = if is_q4 {
-            let blocks_per_pos = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
-            let block_size = std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+            let blocks_per_pos = self.kv_heads * self.head_dim / crate::quant::QK4_0;
+            let block_size = std::mem::size_of::<crate::quant::BlockQ4_0>();
             self.current_pos * blocks_per_pos * block_size
         } else {
             let type_size = self.k_buffer.dtype().size();
@@ -778,12 +775,12 @@ impl KVCache {
         }
 
         let backend = self.k_buffer.backend().clone();
-        let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+        let is_q4 = self.k_buffer.dtype() == crate::buffer::DType::Q4_0;
 
         match self.layout {
             KVLayout::SeqMajor => {
                 let (src_off, dst_off, move_count) = if is_q4 {
-                    let bpp = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
+                    let bpp = self.kv_heads * self.head_dim / crate::quant::QK4_0;
                     (src_pos * bpp, dst_pos * bpp, count * bpp)
                 } else {
                     let epp = self.kv_heads * self.head_dim;
@@ -794,7 +791,7 @@ impl KVCache {
             }
             KVLayout::HeadMajor => {
                 if is_q4 {
-                    let qk = crate::core::quant::QK4_0;
+                    let qk = crate::quant::QK4_0;
                     let head_stride = self.capacity * self.head_dim / qk;
                     let bph = self.head_dim / qk;
                     for h in 0..self.kv_heads {
@@ -863,10 +860,10 @@ impl KVCache {
         }
 
         let backend = self.k_buffer.backend().clone();
-        let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+        let is_q4 = self.k_buffer.dtype() == crate::buffer::DType::Q4_0;
 
         if is_q4 {
-            let qk = crate::core::quant::QK4_0;
+            let qk = crate::quant::QK4_0;
             let head_stride = self.capacity * self.head_dim / qk;
             let bph = self.head_dim / qk;
             let base = head * head_stride;
@@ -1213,10 +1210,10 @@ pub fn max_cache_pos(caches: &[KVCache]) -> usize {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::memory::host::shared::SharedBuffer;
-    use crate::core::buffer::{Buffer, DType};
-    use crate::core::shape::Shape;
+    use crate::buffer::{Buffer, DType};
     use crate::memory::galloc::Galloc;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
     use std::sync::Arc;
 
     fn make_cache(max_seq_len: usize, heads: usize, dim: usize) -> KVCache {
@@ -2440,12 +2437,12 @@ mod tests {
     #[test]
     fn test_release_unused_pages_noop_on_q4_dtype() {
         // Q4_0 dtype should be skipped (returns 0)
-        use crate::core::quant::QK4_0;
+        use crate::quant::QK4_0;
         let heads = 2;
         let dim = 64;
         let max_seq = 1024;
         let blocks_per_pos = heads * dim / QK4_0;
-        let block_size = std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+        let block_size = std::mem::size_of::<crate::quant::BlockQ4_0>();
         let buf_size = max_seq * blocks_per_pos * block_size;
         let k_buf = Arc::new(SharedBuffer::new(buf_size, DType::Q4_0));
         let v_buf = Arc::new(SharedBuffer::new(buf_size, DType::Q4_0));

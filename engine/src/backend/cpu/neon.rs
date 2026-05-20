@@ -1,9 +1,9 @@
+use crate::backend::Backend;
 use crate::backend::cpu::common::CpuBackendCommon;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::quant::{BlockQ4_0, BlockQ4_1, BlockQ8_0, QK4_0, QK4_1, QK8_0};
-use crate::core::tensor::Tensor;
-use crate::core::thread_pool::{self, WorkFn};
+use crate::buffer::DType;
+use crate::quant::{BlockQ4_0, BlockQ4_1, BlockQ8_0, QK4_0, QK4_1, QK8_0};
+use crate::tensor::Tensor;
+use crate::thread_pool::{self, WorkFn};
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 use std::arch::aarch64::*;
@@ -3820,7 +3820,7 @@ pub unsafe fn fused_matmul_f16(
     k: usize,
     matmuls: &[(*const u16, *mut f32, usize)], // (weight_base, out_ptr, n_rows)
 ) {
-    use crate::core::thread_pool;
+    use crate::thread_pool;
     const NR: usize = 4;
 
     let pool = thread_pool::get_pool();
@@ -5337,7 +5337,7 @@ mod hybrid_partial_tests {
 mod tests {
     use super::*;
     use crate::memory::host::shared::SharedBuffer;
-    use crate::core::shape::Shape;
+    use crate::shape::Shape;
     use std::sync::Arc;
 
     /// Scalar F32 reference dot product (ground truth).

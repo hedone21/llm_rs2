@@ -1,5 +1,40 @@
-use crate::core::buffer::DType;
-use crate::core::tensor::Tensor;
+// ============================================================================
+// Backend implementations (sub-modules). Moved from `backend/mod.rs` to the
+// top-level `engine/src/backend.rs` per Step 4-A (Rust 2018+ pattern: trait
+// definition lives next to its implementations, no `mod.rs` needed).
+// ============================================================================
+
+pub mod cpu;
+
+// Optional GPU backends (mutually exclusive)
+#[cfg(all(feature = "cuda", feature = "cuda-embedded"))]
+compile_error!(
+    "Features `cuda` and `cuda-embedded` are mutually exclusive — pick one (cuda = PC/discrete GPU, cuda-embedded = Jetson/UMA)"
+);
+
+#[cfg(feature = "cuda")]
+pub mod cuda_pc;
+#[cfg(feature = "cuda")]
+pub use cuda_pc as cuda;
+
+#[cfg(feature = "cuda-embedded")]
+pub mod cuda_embedded;
+#[cfg(feature = "cuda-embedded")]
+pub use cuda_embedded as cuda;
+
+#[cfg(feature = "opencl")]
+pub mod opencl;
+
+// QNN OpPackage backend (M3.1 skeleton, ENG-QNN-201~210, INV-166~180).
+#[cfg(feature = "qnn")]
+pub mod qnn_oppkg;
+
+// ============================================================================
+// Backend trait + GpuEvent (originally `core/backend.rs`).
+// ============================================================================
+
+use crate::buffer::DType;
+use crate::tensor::Tensor;
 use anyhow::Result;
 
 /// Opaque async GPU event handle.
@@ -218,7 +253,7 @@ pub trait Backend: Send + Sync {
         scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
         // Default CPU implementation — supports F32 and F16 KV cache.
-        use crate::core::buffer::DType;
+        use crate::buffer::DType;
         let q_data = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const f32, q.size() / 4) };
         let out_data =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, out.size() / 4) };
@@ -774,7 +809,7 @@ pub trait Backend: Send + Sync {
     #[allow(unused_variables, clippy::too_many_arguments)]
     fn alloc_pre_converted_soa_tensor(
         &self,
-        shape: crate::core::shape::Shape,
+        shape: crate::shape::Shape,
         q_bytes: &[u8],
         d_bytes: &[u8],
         ne00: usize,
@@ -836,7 +871,7 @@ pub trait Backend: Send + Sync {
         dtype: DType,
         secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
         layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
-    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+    ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         Ok(None)
     }
 
@@ -850,7 +885,7 @@ pub trait Backend: Send + Sync {
         dtype: DType,
         secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
         layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
-    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+    ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         Ok(None)
     }
 
@@ -972,12 +1007,10 @@ pub trait Backend: Send + Sync {
         count: usize,
     ) -> Result<()> {
         let type_size = match tensor.dtype() {
-            crate::core::buffer::DType::F32 => 4,
-            crate::core::buffer::DType::F16 => 2,
-            crate::core::buffer::DType::U8 => 1,
-            crate::core::buffer::DType::Q4_0 => {
-                std::mem::size_of::<crate::core::quant::BlockQ4_0>()
-            }
+            crate::buffer::DType::F32 => 4,
+            crate::buffer::DType::F16 => 2,
+            crate::buffer::DType::U8 => 1,
+            crate::buffer::DType::Q4_0 => std::mem::size_of::<crate::quant::BlockQ4_0>(),
             _ => 1,
         };
 
@@ -1009,12 +1042,10 @@ pub trait Backend: Send + Sync {
         count: usize,
     ) -> Result<()> {
         let type_size = match src.dtype() {
-            crate::core::buffer::DType::F32 => 4,
-            crate::core::buffer::DType::F16 => 2,
-            crate::core::buffer::DType::U8 => 1,
-            crate::core::buffer::DType::Q4_0 => {
-                std::mem::size_of::<crate::core::quant::BlockQ4_0>()
-            }
+            crate::buffer::DType::F32 => 4,
+            crate::buffer::DType::F16 => 2,
+            crate::buffer::DType::U8 => 1,
+            crate::buffer::DType::Q4_0 => std::mem::size_of::<crate::quant::BlockQ4_0>(),
             _ => 1, // Fallback
         };
 
@@ -1060,11 +1091,11 @@ pub trait Backend: Send + Sync {
 mod tests {
     use super::Backend;
     use crate::backend::cpu::common::CpuBackendCommon;
-    use crate::core::buffer::DType;
-    use crate::core::memory::Memory;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::buffer::DType;
+    use crate::memory::Memory;
     use crate::memory::galloc::Galloc;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
 
     fn make_cpu_tensor(data: &[f32]) -> Tensor {

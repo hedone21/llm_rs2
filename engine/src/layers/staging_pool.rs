@@ -12,7 +12,7 @@
 //! `take()` return type is import-natural. The concrete `LayerObjectPool`
 //! impl stays in `models/weights/` (also L3-inference) — no file relocation
 //! was needed to resolve V-27; the downcast to `CudaBackend` was replaced
-//! by [`crate::core::backend::Backend::bind_current_thread`].
+//! by [`crate::backend::Backend::bind_current_thread`].
 
 use crate::layers::transformer_layer::TransformerLayer;
 

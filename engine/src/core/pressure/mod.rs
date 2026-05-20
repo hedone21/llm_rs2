@@ -209,10 +209,10 @@ impl CachePressurePipeline {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
+    use crate::buffer::DType;
     use crate::memory::host::shared::SharedBuffer;
-    use crate::core::buffer::DType;
-    use crate::core::shape::Shape;
-    use crate::core::tensor::Tensor;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -1,4 +1,4 @@
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use anyhow::Result;
 use ocl::core::Mem;
 use ocl::{Buffer as OclBuffer, Queue};

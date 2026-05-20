@@ -12,13 +12,13 @@ use ocl::core::Kernel as CoreKernel;
 use ocl::core::Mem;
 use std::sync::Arc;
 
-use crate::core::backend::Backend;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
 use crate::layers::tensor_partition::{
     PartitionContext, PartitionPath, partition_plan_debug_enabled, partition_plan_enabled,
     partition_trace_enabled, record_partition_timing,
 };
 use crate::layers::workspace::PartitionWsCell;
+use crate::tensor::Tensor;
 
 thread_local! {
     /// LLMRS_OP_TRACE: per-token wall-clock accumulator (label -> microseconds).
@@ -676,7 +676,7 @@ impl PartitionStep {
             let used_fused_gate_up = {
                 let gate_dtype = self.cpu_ctx.gate_cpu.dtype();
                 let k = self.cpu_ctx.gate_cpu.shape().dims()[1];
-                if gate_dtype == crate::core::buffer::DType::F16 {
+                if gate_dtype == crate::buffer::DType::F16 {
                     unsafe {
                         crate::backend::cpu::neon::fused_matmul_f16(
                             pw.residual_cpu.as_ptr() as *const f32,
@@ -696,8 +696,8 @@ impl PartitionStep {
                         );
                     }
                     true
-                } else if gate_dtype == crate::core::buffer::DType::Q4_0 {
-                    use crate::core::quant::BlockQ4_0;
+                } else if gate_dtype == crate::buffer::DType::Q4_0 {
+                    use crate::quant::BlockQ4_0;
                     unsafe {
                         crate::backend::cpu::neon::fused_matmul_q4_0(
                             pw.residual_cpu.as_ptr() as *const f32,
@@ -3512,7 +3512,7 @@ pub fn build_partitioned_layer_plan(
     // to the AOS `kernel_mul_mat_q4_0_f32`. The F16 path forwards the L4
     // program so large slices select the N_DST=4 kernel.
     let gate_dtype = partition_ctx.gate.gpu_slice.dtype();
-    let use_q4_0 = gate_dtype == crate::core::buffer::DType::Q4_0;
+    let use_q4_0 = gate_dtype == crate::buffer::DType::Q4_0;
 
     let build_matmul = |src: &Mem,
                         weight: &Mem,
@@ -3867,7 +3867,7 @@ pub struct FullPlanConfig<'a> {
     /// to the actual dtype of `lm_head_buf` so `build_full_plan` can skip
     /// emitting a broken GPU step and let `execute_plan` fall through to
     /// `lm_head_matmul_cpu`.
-    pub lm_head_dtype: crate::core::buffer::DType,
+    pub lm_head_dtype: crate::buffer::DType,
     /// Optional UMA hybrid attention configuration. When `Some`, the plan
     /// builder tries to select `AttentionVariant::HybridKvSplit` for each
     /// layer (subject to per-layer gating in `build_layer_plan`). See
@@ -4186,7 +4186,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
     // limit) OR when the weight dtype has no matching GPU GEMV variant — see
     // `lm_head_dtype` on FullPlanConfig for why an F32 lm_head must fall
     // through to CPU even though the buffer is uploaded to GPU.
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     let lm_head = if let Some(lm_head_buf) = config.lm_head_buf {
         if let (Some(ns), Some(progs)) = (&config.lm_head_noshuffle, &config.noshuffle_programs) {
             let prog = progs
@@ -4322,7 +4322,7 @@ pub struct KiviFullPlanConfig<'a> {
     /// Whether the device lacks subgroup support (nosub fallback path).
     pub is_nosub: bool,
     /// dtype of the lm_head weight — see doc on `FullPlanConfig::lm_head_dtype`.
-    pub lm_head_dtype: crate::core::buffer::DType,
+    pub lm_head_dtype: crate::buffer::DType,
     /// ENG-ALG-219: `TransformerModel::ratio_generation` Arc clone. Captured
     /// at build time; stored in the resulting `FullKernelPlan` for global
     /// weight-swap invalidation checks in `execute()` (INV-129).
@@ -4803,7 +4803,7 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
     // lm_head (None when kept on CPU or dtype has no GPU GEMV — see
     // FullPlanConfig::lm_head_dtype for the F32 tied-embedding rationale).
     let lm_head = if let Some(lm_head_buf) = config.lm_head_buf {
-        if config.lm_head_dtype == crate::core::buffer::DType::F16 {
+        if config.lm_head_dtype == crate::buffer::DType::F16 {
             Some(
                 make_f16_matmul_step(
                     config.f16_program,

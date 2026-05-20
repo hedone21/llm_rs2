@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer;
 
+use crate::backend::Backend;
 use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::backend::Backend;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::KVCache;
-use crate::core::memory::Memory;
 use crate::core::qcf::ImportanceFormula;
 use crate::core::skip_config::SkipConfig;
+use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::SwapAlgorithm;
 use crate::session::cli::Args;
@@ -42,7 +42,7 @@ pub struct EvalLlRunCtx {
     pub vocab_size: usize,
     pub max_seq_len: usize,
     pub num_layers: usize,
-    pub kv_type: crate::core::buffer::DType,
+    pub kv_type: crate::buffer::DType,
     pub actual_protected_prefix: usize,
     pub score_based_eviction: bool,
 

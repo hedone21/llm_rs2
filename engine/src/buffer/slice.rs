@@ -1,4 +1,4 @@
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use anyhow::{Result, ensure};
 #[cfg(feature = "opencl")]
 use ocl::core::Mem;
