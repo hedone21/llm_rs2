@@ -299,9 +299,7 @@ pub struct SwapExecutor<'a> {
     /// tensors that need runtime unpermute fall back to the bg_fetch
     /// build path.
     #[cfg(feature = "cuda-embedded")]
-    pub mmap_registration: Option<
-        Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
-    >,
+    pub mmap_registration: Option<Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>>,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -788,15 +786,17 @@ impl<'a> SwapExecutor<'a> {
                 // back to the Phase A path (`build_layer_async_standalone`)
                 // which allocates fresh device buffers.
                 #[cfg(feature = "cuda-embedded")]
-                let pool_entry: Option<crate::layers::transformer_layer::TransformerLayer> =
-                    if layer_pool_active {
-                        self.layer_pool.as_ref().and_then(|p| p.take())
-                    } else {
-                        None
-                    };
+                let pool_entry: Option<
+                    crate::layers::transformer_layer::TransformerLayer,
+                > = if layer_pool_active {
+                    self.layer_pool.as_ref().and_then(|p| p.take())
+                } else {
+                    None
+                };
                 #[cfg(not(feature = "cuda-embedded"))]
-                let pool_entry: Option<crate::layers::transformer_layer::TransformerLayer> =
-                    None;
+                let pool_entry: Option<
+                    crate::layers::transformer_layer::TransformerLayer,
+                > = None;
 
                 // Hammer D: mmap alias path takes highest priority when
                 // registration is attached and the env is set.
@@ -2567,16 +2567,12 @@ pub(crate) fn build_layer_via_mmap_alias_standalone(
                 secondary: info.dims.clone(),
             });
         }
-        let alias = CudaMmapAliasBuffer::new(
-            Arc::clone(registration),
-            info.offset,
-            info.len,
-            info.dtype,
-        )
-        .map_err(|e| SwapError::BufferAllocationFailed {
-            layer: layer_idx,
-            source: e,
-        })?;
+        let alias =
+            CudaMmapAliasBuffer::new(Arc::clone(registration), info.offset, info.len, info.dtype)
+                .map_err(|e| SwapError::BufferAllocationFailed {
+                layer: layer_idx,
+                source: e,
+            })?;
         Ok(Tensor::new(
             shape,
             Arc::new(alias) as Arc<dyn Buffer>,
@@ -2600,7 +2596,10 @@ pub(crate) fn build_layer_via_mmap_alias_standalone(
     } else {
         old.attention_norm.clone()
     };
-    let ffn_norm = if secondary.layer_tensor(layer_idx, "ffn_norm.weight").is_some() {
+    let ffn_norm = if secondary
+        .layer_tensor(layer_idx, "ffn_norm.weight")
+        .is_some()
+    {
         alias_tensor("ffn_norm.weight", &old.ffn_norm)?
     } else {
         old.ffn_norm.clone()
@@ -2700,7 +2699,10 @@ pub(crate) fn build_layer_via_pool_standalone(
     } else {
         old.attention_norm.clone()
     };
-    let ffn_norm = if secondary.layer_tensor(layer_idx, "ffn_norm.weight").is_some() {
+    let ffn_norm = if secondary
+        .layer_tensor(layer_idx, "ffn_norm.weight")
+        .is_some()
+    {
         write_into(&pool_entry.ffn_norm, "ffn_norm.weight", &old.ffn_norm)?;
         pool_entry.ffn_norm.clone()
     } else {

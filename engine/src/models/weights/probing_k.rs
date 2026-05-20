@@ -188,11 +188,17 @@ mod tests {
     fn binary_growth_doubles_k() {
         let mut c = ProbingKController::with_options(1, 32, GrowthMode::Binary);
         c.set_stability_window(2);
-        for _ in 0..2 { c.observe(10.0, 0); }
+        for _ in 0..2 {
+            c.observe(10.0, 0);
+        }
         assert_eq!(c.current_k(), 2);
-        for _ in 0..2 { c.observe(10.0, 0); }
+        for _ in 0..2 {
+            c.observe(10.0, 0);
+        }
         assert_eq!(c.current_k(), 4);
-        for _ in 0..2 { c.observe(10.0, 0); }
+        for _ in 0..2 {
+            c.observe(10.0, 0);
+        }
         assert_eq!(c.current_k(), 8);
     }
 
@@ -200,8 +206,12 @@ mod tests {
     fn spike_drops_k_and_resets_window() {
         let mut c = ProbingKController::with_options(1, 32, GrowthMode::Linear);
         c.set_stability_window(3);
-        for _ in 0..3 { c.observe(10.0, 0); } // K = 2
-        for _ in 0..3 { c.observe(10.0, 2); } // pending == K → no spike, K=3
+        for _ in 0..3 {
+            c.observe(10.0, 0);
+        } // K = 2
+        for _ in 0..3 {
+            c.observe(10.0, 2);
+        } // pending == K → no spike, K=3
         assert_eq!(c.current_k(), 3);
         c.observe(10.0, 5); // pending=5 > K=3 → spike
         assert_eq!(c.current_k(), 2);
@@ -212,7 +222,9 @@ mod tests {
         let mut c = ProbingKController::with_options(2, 32, GrowthMode::Linear);
         c.set_stability_window(3);
         // Steady-state: after a clean K=2 dispatch, pending typically == 2.
-        for _ in 0..3 { c.observe(10.0, 2); }
+        for _ in 0..3 {
+            c.observe(10.0, 2);
+        }
         assert_eq!(c.current_k(), 3);
     }
 
@@ -227,7 +239,9 @@ mod tests {
     fn never_exceeds_max_k() {
         let mut c = ProbingKController::with_options(1, 4, GrowthMode::Binary);
         c.set_stability_window(1);
-        for _ in 0..20 { c.observe(10.0, 0); }
+        for _ in 0..20 {
+            c.observe(10.0, 0);
+        }
         assert_eq!(c.current_k(), 4);
     }
 

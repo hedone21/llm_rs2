@@ -2940,9 +2940,7 @@ impl Backend for CudaBackend {
         len: usize,
     ) -> Result<crate::core::backend::GpuEvent> {
         if self.is_graph_capturing() {
-            anyhow::bail!(
-                "enqueue_write_into_async called during CUDA Graph capture"
-            );
+            anyhow::bail!("enqueue_write_into_async called during CUDA Graph capture");
         }
         if src.is_null() {
             anyhow::bail!(

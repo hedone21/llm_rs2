@@ -79,13 +79,11 @@ impl CudaMmapRegistration {
         //   3) DEVICEMAP only         -- last resort.
         let flag_attempts = [
             (
-                cuda_sys::CU_MEMHOSTREGISTER_DEVICEMAP
-                    | cuda_sys::CU_MEMHOSTREGISTER_READ_ONLY,
+                cuda_sys::CU_MEMHOSTREGISTER_DEVICEMAP | cuda_sys::CU_MEMHOSTREGISTER_READ_ONLY,
                 "DEVICEMAP|READ_ONLY",
             ),
             (
-                cuda_sys::CU_MEMHOSTREGISTER_DEVICEMAP
-                    | cuda_sys::CU_MEMHOSTREGISTER_PORTABLE,
+                cuda_sys::CU_MEMHOSTREGISTER_DEVICEMAP | cuda_sys::CU_MEMHOSTREGISTER_PORTABLE,
                 "DEVICEMAP|PORTABLE",
             ),
             (cuda_sys::CU_MEMHOSTREGISTER_DEVICEMAP, "DEVICEMAP"),
@@ -94,8 +92,7 @@ impl CudaMmapRegistration {
         let mut registered = false;
         for (flags, name) in flag_attempts.iter() {
             unsafe {
-                let res =
-                    cuda_sys::cuMemHostRegister_v2(host_base as *mut _, size, *flags);
+                let res = cuda_sys::cuMemHostRegister_v2(host_base as *mut _, size, *flags);
                 if res == cuda_sys::CUresult::CUDA_SUCCESS {
                     eprintln!(
                         "[CudaMmapRegistration] registered {} MB with flags={}",
@@ -117,18 +114,11 @@ impl CudaMmapRegistration {
 
         let dev_base = unsafe {
             let mut dptr: cuda_sys::CUdeviceptr = 0;
-            let res = cuda_sys::cuMemHostGetDevicePointer_v2(
-                &mut dptr,
-                host_base as *mut _,
-                0,
-            );
+            let res = cuda_sys::cuMemHostGetDevicePointer_v2(&mut dptr, host_base as *mut _, 0);
             if res != cuda_sys::CUresult::CUDA_SUCCESS {
                 // Best-effort: unregister before returning the error.
                 let _ = cuda_sys::cuMemHostUnregister(host_base as *mut _);
-                return Err(anyhow!(
-                    "cuMemHostGetDevicePointer_v2 failed: {:?}",
-                    res
-                ));
+                return Err(anyhow!("cuMemHostGetDevicePointer_v2 failed: {:?}", res));
             }
             dptr
         };

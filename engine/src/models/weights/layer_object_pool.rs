@@ -223,9 +223,8 @@ fn create_empty_layer(backend: &Arc<dyn Backend>, spec: &LayerSpec) -> Result<Tr
             // host pointer and device pointer alias the same physical
             // DRAM page — CPU writes are immediately GPU-readable, so the
             // swap path can skip cuMemcpyHtoDAsync entirely.
-            let b = CudaHostBuffer::new(size, dtype).map_err(|e| {
-                anyhow!("CudaHostBuffer::new({size} bytes, {dtype:?}) failed: {e}")
-            })?;
+            let b = CudaHostBuffer::new(size, dtype)
+                .map_err(|e| anyhow!("CudaHostBuffer::new({size} bytes, {dtype:?}) failed: {e}"))?;
             Arc::new(b)
         } else {
             let b = CudaDeviceBuffer::new(size, dtype).map_err(|e| {

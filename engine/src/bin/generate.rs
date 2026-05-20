@@ -3171,11 +3171,8 @@ fn main() -> anyhow::Result<()> {
                     "--swap-probing-growth must be 'linear' or 'binary', got '{other}'"
                 ),
             };
-            let mut c = llm_rs2::models::weights::ProbingKController::with_options(
-                1,
-                usize::MAX,
-                growth,
-            );
+            let mut c =
+                llm_rs2::models::weights::ProbingKController::with_options(1, usize::MAX, growth);
             c.set_stability_window(args.swap_probing_window.max(1));
             Some(c)
         } else {
@@ -3255,16 +3252,15 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2);
             let sample = model.layers[0].load_weights();
-            let spec =
-                llm_rs2::models::weights::layer_object_pool::LayerSpec::from_sample(
-                    &sample,
-                    DType::Q4_0,
-                )
-                .with_zero_copy(
-                    std::env::var("LLMRS_SWAP_LAYER_POOL_ZERO_COPY")
-                        .map(|v| v == "1")
-                        .unwrap_or(false),
-                );
+            let spec = llm_rs2::models::weights::layer_object_pool::LayerSpec::from_sample(
+                &sample,
+                DType::Q4_0,
+            )
+            .with_zero_copy(
+                std::env::var("LLMRS_SWAP_LAYER_POOL_ZERO_COPY")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+            );
             let zc = spec.zero_copy;
             match llm_rs2::models::weights::layer_object_pool::LayerObjectPool::new(
                 Arc::clone(gpu_be),
@@ -3300,9 +3296,8 @@ fn main() -> anyhow::Result<()> {
         if !enabled {
             None
         } else if let Some(secondary) = model.secondary_mmap.clone() {
-            match llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration::register(
-                secondary,
-            ) {
+            match llm_rs2::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration::register(secondary)
+            {
                 Ok(reg) => {
                     eprintln!(
                         "[LISWAP-8] mmap registration active: size={} MB",
