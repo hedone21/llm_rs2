@@ -191,7 +191,7 @@ pub trait TensorSource {
 pub fn resolve_secondary(
     cfg: &LoadConfig,
     source: &dyn TensorSource,
-    _backend: &Arc<dyn Backend>,
+    backend: &Arc<dyn Backend>,
 ) -> Result<Option<Arc<crate::models::weights::SecondaryMmap>>> {
     // 본 함수는 AUF primary 진입에서만 의미가 있다. GGUF/Safetensors는 즉시 None.
     if cfg.primary_format != PrimaryFormat::Auf {
@@ -232,11 +232,33 @@ pub fn resolve_secondary(
     let view = auf_src.view_arc();
 
     let mmap = crate::models::loader::auf::from_auf_self_secondary(
-        view,
+        Arc::clone(&view),
         primary_tag,
         primary_dtype,
         source.config(),
     )?;
+
+    // R8: backend가 qnn_oppkg면 RpcMem alias 경로로 promote 시도.
+    // 실패 / 다른 backend / 호스트 → 그대로 SecondaryMmap::Auf 유지.
+    if crate::models::weights::secondary_mmap::backend_supports_rpcmem_secondary(backend) {
+        let crate::models::weights::SecondaryMmap::Auf(auf_sec) = mmap.as_ref() else {
+            // from_auf_self_secondary는 항상 SecondaryMmap::Auf를 반환 — defensive.
+            return Ok(Some(mmap));
+        };
+        let layer_index = auf_sec.layer_index.clone();
+        let diag_path = auf_sec.source_path.clone();
+        if let Some(promoted) =
+            crate::models::weights::secondary_mmap::try_promote_auf_self_secondary_to_rpcmem(
+                Arc::clone(&auf_sec.view),
+                layer_index,
+                diag_path,
+                backend,
+            )
+        {
+            return Ok(Some(Arc::new(promoted)));
+        }
+    }
+
     Ok(Some(mmap))
 }
 

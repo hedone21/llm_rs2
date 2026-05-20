@@ -697,11 +697,64 @@ pub fn open_secondary_with_backend(
 /// — the only backend that exposes the rpcmem heap required for the alias
 /// path. Detected via `Backend::name()` to avoid feature-gate gymnastics on
 /// the trait object.
-fn backend_supports_rpcmem_secondary(
+///
+/// `pub(crate)` since W-AUF-2 — `resolve_secondary` consults the same predicate
+/// when deciding whether to promote an AUF self-secondary to the RpcMem variant.
+pub(crate) fn backend_supports_rpcmem_secondary(
     backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
 ) -> bool {
     let name = backend.name();
     name.contains("QNN OpPackage") || name.contains("qnn_oppkg")
+}
+
+/// W-AUF-2.3 — Promote a `SecondaryMmap::Auf` self-secondary to the
+/// `SecondaryMmap::Rpcmem` variant when the backend is `qnn_oppkg`.
+///
+/// `Some(rpc)` 반환 시 호출자는 그 핸들을 사용한다. `None`이면 promote를
+/// 시도하지 않은 것 (호스트 빌드 / 다른 backend). promote 시도가 실패한 경우
+/// stderr 경고 + 원본 `SecondaryMmap::Auf` 유지를 위해 `None`을 돌려보낸다.
+///
+/// `view`와 `layer_index`는 promote 성공 시 `RpcmemSecondaryStore`가 소유한다.
+pub(crate) fn try_promote_auf_self_secondary_to_rpcmem(
+    view: std::sync::Arc<AufView>,
+    layer_index: Vec<LayerTensorSlice>,
+    diag_source_path: PathBuf,
+    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+) -> Option<SecondaryMmap> {
+    if !backend_supports_rpcmem_secondary(backend) {
+        return None;
+    }
+
+    #[cfg(all(feature = "qnn", target_os = "android"))]
+    {
+        let qnn = backend
+            .as_any()
+            .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>()?;
+        let runtime = qnn.runtime_arc();
+        let rpcmem_fns = runtime.rpcmem_fns();
+        match crate::models::weights::rpcmem_secondary::RpcmemSecondaryStore::from_auf_self_secondary(
+            view,
+            layer_index,
+            diag_source_path,
+            std::sync::Arc::clone(backend),
+            (rpcmem_fns.0, rpcmem_fns.1),
+        ) {
+            Ok(store) => Some(SecondaryMmap::Rpcmem(store)),
+            Err(e) => {
+                eprintln!(
+                    "[AUF self-secondary] rpcmem promote 실패, standard AUF path 유지: {e}"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(all(feature = "qnn", target_os = "android")))]
+    {
+        let _ = (view, layer_index, diag_source_path);
+        // 호스트/non-Android에서는 rpcmem feature 자체가 없어 promote 불가.
+        // backend.name()이 qnn_oppkg를 거짓으로 자처해도 None을 돌려보내 fallback 유지.
+        None
+    }
 }
 
 /// Try to construct a `SecondaryMmap::Rpcmem` for `qnn_oppkg`. Errors
