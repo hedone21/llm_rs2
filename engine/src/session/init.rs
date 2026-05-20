@@ -556,22 +556,44 @@ impl SessionInitCtx {
             }
         };
 
-        let is_gguf = model_path.ends_with(".gguf");
-        let mut model = if is_gguf {
-            if args.weight_dtype != "f16" {
+        let primary_path_buf = std::path::PathBuf::from(model_path);
+        let primary_format = crate::models::loader::detect_primary_format(&primary_path_buf)?;
+        let is_gguf = matches!(
+            primary_format,
+            crate::models::loader::PrimaryFormat::Gguf
+        );
+        let is_auf = matches!(
+            primary_format,
+            crate::models::loader::PrimaryFormat::Auf
+        );
+
+        if args.secondary_gguf.is_some() {
+            eprintln!(
+                "[Deprecated] --secondary-gguf는 향후 제거됩니다. \
+                 AUF single-file (--model-path foo.auf)로 전환하세요. \
+                 기존 호출은 그대로 동작합니다."
+            );
+        }
+
+        let mut model = if is_gguf || is_auf {
+            if is_gguf && args.weight_dtype != "f16" {
                 eprintln!("[Warning] --weight-dtype ignored for GGUF models (dtype from file)");
             }
-            // Use LoadConfig single-entry path (ENG-DAT-090) so --secondary-gguf
-            // is wired in automatically.
+            if is_auf && args.weight_dtype != "f16" {
+                eprintln!(
+                    "[Warning] --weight-dtype ignored for AUF models; \
+                     use --primary-dtype <auto|f16|q4_0|...> instead"
+                );
+            }
             let load_cfg = crate::models::loader::LoadConfig {
-                primary_source: std::path::PathBuf::from(model_path),
-                primary_format: crate::models::loader::PrimaryFormat::Gguf,
-                primary_variant_choice: crate::models::loader::AufVariantChoice::Auto,
-                primary_dtype_choice: crate::models::loader::AufDtypeChoice::Auto,
-                primary_eos_override: None,
+                primary_source: primary_path_buf,
+                primary_format,
+                primary_variant_choice: args.primary_variant.into(),
+                primary_dtype_choice: args.primary_dtype.into(),
+                primary_eos_override: args.eos_token_id,
                 default_dtype: w_dtype,
                 secondary_source: args.secondary_gguf.clone(),
-                disable_self_secondary: false,
+                disable_self_secondary: args.no_self_secondary,
                 secondary_dtype_choice: args.secondary_dtype.into(),
                 secondary_layout_choice: args.secondary_layout.into(),
             };

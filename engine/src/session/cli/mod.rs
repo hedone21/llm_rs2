@@ -76,6 +76,79 @@ impl From<SecondaryLayoutArg> for crate::models::weights::SecondaryLayoutChoice 
     }
 }
 
+/// `--primary-variant` CLI 인수 값 (W-AUF-1 C4). AUF primary backend variant 선택.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryVariantArg {
+    Auto,
+    AdrenoSoa,
+    CpuAos,
+    CudaAos,
+}
+
+pub fn parse_primary_variant(s: &str) -> Result<PrimaryVariantArg, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(PrimaryVariantArg::Auto),
+        "adreno-soa" | "adreno_soa" => Ok(PrimaryVariantArg::AdrenoSoa),
+        "cpu-aos" | "cpu_aos" => Ok(PrimaryVariantArg::CpuAos),
+        "cuda-aos" | "cuda_aos" => Ok(PrimaryVariantArg::CudaAos),
+        other => Err(format!(
+            "unknown primary-variant '{other}'. Valid: auto, adreno-soa, cpu-aos, cuda-aos"
+        )),
+    }
+}
+
+impl From<PrimaryVariantArg> for crate::models::loader::AufVariantChoice {
+    fn from(arg: PrimaryVariantArg) -> Self {
+        match arg {
+            PrimaryVariantArg::Auto => Self::Auto,
+            PrimaryVariantArg::AdrenoSoa => Self::AdrenoSoa,
+            PrimaryVariantArg::CpuAos => Self::CpuAos,
+            PrimaryVariantArg::CudaAos => Self::CudaAos,
+        }
+    }
+}
+
+/// `--primary-dtype` CLI 인수 값 (W-AUF-1 C4). AUF primary dtype 선택.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryDtypeArg {
+    Auto,
+    F16,
+    Q4_0,
+    Q8_0,
+    Bf16,
+    F32,
+    Q4_1,
+}
+
+pub fn parse_primary_dtype(s: &str) -> Result<PrimaryDtypeArg, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(PrimaryDtypeArg::Auto),
+        "f16" => Ok(PrimaryDtypeArg::F16),
+        "q4_0" | "q4" => Ok(PrimaryDtypeArg::Q4_0),
+        "q8_0" | "q8" => Ok(PrimaryDtypeArg::Q8_0),
+        "bf16" => Ok(PrimaryDtypeArg::Bf16),
+        "f32" => Ok(PrimaryDtypeArg::F32),
+        "q4_1" => Ok(PrimaryDtypeArg::Q4_1),
+        other => Err(format!(
+            "unknown primary-dtype '{other}'. Valid: auto, f16, q4_0, q8_0, bf16, f32, q4_1"
+        )),
+    }
+}
+
+impl From<PrimaryDtypeArg> for crate::models::loader::AufDtypeChoice {
+    fn from(arg: PrimaryDtypeArg) -> Self {
+        match arg {
+            PrimaryDtypeArg::Auto => Self::Auto,
+            PrimaryDtypeArg::F16 => Self::F16,
+            PrimaryDtypeArg::Q4_0 => Self::Q4_0,
+            PrimaryDtypeArg::Q8_0 => Self::Q8_0,
+            PrimaryDtypeArg::Bf16 => Self::BF16,
+            PrimaryDtypeArg::F32 => Self::F32,
+            PrimaryDtypeArg::Q4_1 => Self::Q4_1,
+        }
+    }
+}
+
 /// Parse `--qcf-sample-layers` argument into a list of layer indices.
 ///
 /// Accepts:
@@ -628,6 +701,28 @@ pub struct Args {
     /// When omitted, the weight swap path is disabled (ENG-DAT-C09).
     #[arg(long)]
     pub secondary_gguf: Option<std::path::PathBuf>,
+
+    /// AUF primary backend variant 선택 (W-AUF-1 C4).
+    /// AUF primary가 아닐 때 무시됨. default: auto.
+    #[arg(long, default_value = "auto", value_parser = parse_primary_variant)]
+    pub primary_variant: PrimaryVariantArg,
+
+    /// AUF primary dtype 선택 (W-AUF-1 C4).
+    /// AUF primary가 아닐 때 무시됨. default: auto (META.default_dtype 우선).
+    #[arg(long, default_value = "auto", value_parser = parse_primary_dtype)]
+    pub primary_dtype: PrimaryDtypeArg,
+
+    /// AUF TOKENIZER에 eos_id가 비어있을 때 fallback override (W-AUF-1 C5).
+    #[arg(long)]
+    pub eos_token_id: Option<u32>,
+
+    /// AUF TOKENIZER에 bos_id가 비어있을 때 fallback override (W-AUF-1 C5).
+    #[arg(long)]
+    pub bos_token_id: Option<u32>,
+
+    /// AUF self-secondary 자동 활성 비활성 (W-AUF-2). 디버그/벤치마크용.
+    #[arg(long, default_value_t = false)]
+    pub no_self_secondary: bool,
 
     /// Manually trigger a weight swap before generation starts.
     /// Value: fraction of decoder layers to swap (0.0–1.0).
