@@ -297,6 +297,8 @@ pub(crate) fn tensor_kind_to_subname(kind: u32) -> Option<&'static str> {
         TensorKind::AttnNorm => Some("attn_norm.weight"),
         TensorKind::FfnNorm => Some("ffn_norm.weight"),
         TensorKind::Embedding | TensorKind::FinalNorm | TensorKind::LmHead => None,
+        // qkv bias는 swap 대상 아님 (1-D F32 vector, swap quality 의미 없음).
+        TensorKind::AttnQBias | TensorKind::AttnKBias | TensorKind::AttnVBias => None,
     }
 }
 

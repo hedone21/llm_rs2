@@ -26,7 +26,7 @@ use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::loader::auf::secondary::auf_dtype_to_engine;
-use crate::models::loader::{LayerWeightKind, TensorId, TensorSource};
+use crate::models::loader::{LayerBiasKind, LayerWeightKind, TensorId, TensorSource};
 
 use super::{AufDtypeChoice, AufVariantChoice};
 
@@ -147,7 +147,11 @@ impl AufSource {
 fn open_with_auto_fallback(path: &Path) -> Result<(crate::auf::AufView, BackendTag)> {
     let primary = AufVariantChoice::default_tag();
     let mut chain: Vec<BackendTag> = vec![primary];
-    for tag in [BackendTag::CpuAos, BackendTag::AdrenoSoa, BackendTag::CudaAos] {
+    for tag in [
+        BackendTag::CpuAos,
+        BackendTag::AdrenoSoa,
+        BackendTag::CudaAos,
+    ] {
         if !chain.contains(&tag) {
             chain.push(tag);
         }
@@ -174,14 +178,16 @@ fn open_with_auto_fallback(path: &Path) -> Result<(crate::auf::AufView, BackendT
         "AUF open failed for '{}' (Auto): tried {:?}, last error: {}",
         path.display(),
         chain,
-        last_err.map(|e| e.to_string()).unwrap_or_else(|| "(none)".to_owned())
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "(none)".to_owned())
     ))
 }
 
 /// `TensorId` → AUF `(layer_idx, kind)` 매핑.
 ///
-/// `LayerBias`는 본 sprint에서 미지원 — AUF v0.1 `TensorKind`에 bias variant가 없다.
-/// `has_tensor`에서 false를 반환하여 GGUF/Safetensors와의 동작 격차를 막는다.
+/// `LayerBias`는 Qwen2 qkv bias만 지원 (AUF TensorKind::Attn{Q,K,V}Bias). 그 외 모델/kind는
+/// `None`을 반환하여 `has_tensor=false`로 GGUF/Safetensors와의 동작 격차를 막는다.
 fn tensor_id_to_auf(id: &TensorId) -> Option<(u32, TensorKind)> {
     match id {
         TensorId::Embed => Some((LAYER_IDX_CROSS, TensorKind::Embedding)),
@@ -191,7 +197,14 @@ fn tensor_id_to_auf(id: &TensorId) -> Option<(u32, TensorKind)> {
             let k = layer_weight_kind_to_tensor_kind(*kind)?;
             Some((*layer as u32, k))
         }
-        TensorId::LayerBias { .. } => None,
+        TensorId::LayerBias { layer, kind } => {
+            let k = match kind {
+                LayerBiasKind::Bq => TensorKind::AttnQBias,
+                LayerBiasKind::Bk => TensorKind::AttnKBias,
+                LayerBiasKind::Bv => TensorKind::AttnVBias,
+            };
+            Some((*layer as u32, k))
+        }
     }
 }
 
@@ -409,8 +422,7 @@ impl AufSource {
     fn materialise_cpu_tensor(&self, id: &TensorId) -> Result<Tensor> {
         let (layer_idx, kind) = tensor_id_to_auf(id).ok_or_else(|| {
             anyhow!(
-                "AUF v0.1: TensorId {:?} unsupported (bias variants not encoded; \
-                 use a Llama-family AUF or rebuild with bias support)",
+                "AUF: TensorId {:?} unsupported (e.g. Gemma3 PreFfnNorm/QNorm/KNorm)",
                 id
             )
         })?;
@@ -556,12 +568,31 @@ mod tests {
     }
 
     #[test]
-    fn tensor_id_bias_unsupported() {
-        let id = TensorId::LayerBias {
-            layer: 0,
-            kind: crate::models::loader::LayerBiasKind::Bq,
-        };
-        assert!(tensor_id_to_auf(&id).is_none());
+    fn tensor_id_bias_maps_to_qkv_bias() {
+        assert_eq!(
+            tensor_id_to_auf(&TensorId::LayerBias {
+                layer: 0,
+                kind: crate::models::loader::LayerBiasKind::Bq,
+            })
+            .unwrap(),
+            (0, TensorKind::AttnQBias)
+        );
+        assert_eq!(
+            tensor_id_to_auf(&TensorId::LayerBias {
+                layer: 5,
+                kind: crate::models::loader::LayerBiasKind::Bk,
+            })
+            .unwrap(),
+            (5, TensorKind::AttnKBias)
+        );
+        assert_eq!(
+            tensor_id_to_auf(&TensorId::LayerBias {
+                layer: 10,
+                kind: crate::models::loader::LayerBiasKind::Bv,
+            })
+            .unwrap(),
+            (10, TensorKind::AttnVBias)
+        );
     }
 
     #[test]
@@ -689,9 +720,10 @@ mod tests {
         assert_eq!(loaded, &payload[..], "loaded bytes must equal payload");
     }
 
-    /// `LayerBias` TensorId는 명시 에러를 던져야 한다 (AUF v0.1 미지원).
+    /// AUF에 bias entry가 없는 경우 (예: Llama, 또는 bias 미포함 Qwen2 빌드)
+    /// `has_tensor=false` + `load_tensor_cpu=Err` 가 일관되게 동작해야 한다.
     #[test]
-    fn load_tensor_layer_bias_errors_out() {
+    fn load_tensor_layer_bias_missing_entry_errors_out() {
         use crate::auf::reader::open_from_bytes;
         use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
         use crate::auf::tensor_index::{TensorEntry, TensorIndex};
@@ -779,20 +811,19 @@ mod tests {
             source_path: std::path::PathBuf::from("/fake/test.auf"),
         };
 
+        // 위 fixture는 AttnQ entry만 등록 — bias entry는 없음.
         let id = TensorId::LayerBias {
             layer: 0,
             kind: crate::models::loader::LayerBiasKind::Bq,
         };
-        assert!(!src.has_tensor(&id));
-        let mem = crate::memory::galloc::Galloc::new();
-        let err = match src.load_tensor_cpu(&id, false, &mem) {
-            Ok(_) => panic!("expected LayerBias to error"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
         assert!(
-            msg.contains("AUF v0.1") && msg.contains("bias"),
-            "error should mention AUF v0.1 + bias, got: {msg}"
+            !src.has_tensor(&id),
+            "bias entry가 없으므로 has_tensor=false 여야 한다"
+        );
+        let mem = crate::memory::galloc::Galloc::new();
+        assert!(
+            src.load_tensor_cpu(&id, false, &mem).is_err(),
+            "bias entry가 없을 때 load_tensor_cpu는 Err를 반환해야 한다"
         );
     }
 }

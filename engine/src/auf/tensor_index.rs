@@ -69,6 +69,9 @@ pub enum TensorKind {
     Embedding = 9,
     FinalNorm = 10,
     LmHead = 11,
+    AttnQBias = 12,
+    AttnKBias = 13,
+    AttnVBias = 14,
 }
 
 impl TensorKind {
@@ -86,6 +89,9 @@ impl TensorKind {
             9 => Some(Self::Embedding),
             10 => Some(Self::FinalNorm),
             11 => Some(Self::LmHead),
+            12 => Some(Self::AttnQBias),
+            13 => Some(Self::AttnKBias),
+            14 => Some(Self::AttnVBias),
             _ => None,
         }
     }

@@ -1145,6 +1145,10 @@ fn extract_weight_blobs(
         "ffn_down.weight",
         "attn_norm.weight",
         "ffn_norm.weight",
+        // Qwen2 등 qkv bias 모델용 — GGUF에 없으면 자동 skip.
+        "attn_q.bias",
+        "attn_k.bias",
+        "attn_v.bias",
     ];
 
     for layer in 0..n_layers {
@@ -1181,7 +1185,7 @@ fn extract_weight_blobs(
                     dtype_bytes,
                 });
             } else if !quiet && kind.ends_with(".weight") && !kind.contains("norm") {
-                // weight tensor 누락 경고 (norm은 없을 수 있음)
+                // weight tensor 누락 경고 (norm/bias는 모델별로 없을 수 있음)
                 eprintln!("[auf-tool] Warning: tensor '{}' not found in GGUF", name);
             }
         }
@@ -1448,6 +1452,9 @@ fn tensor_name_to_layer_kind(name: &str) -> Option<(u32, TensorKind)> {
         "ffn_down.weight" => TensorKind::FfnDown,
         "attn_norm.weight" => TensorKind::AttnNorm,
         "ffn_norm.weight" => TensorKind::FfnNorm,
+        "attn_q.bias" => TensorKind::AttnQBias,
+        "attn_k.bias" => TensorKind::AttnKBias,
+        "attn_v.bias" => TensorKind::AttnVBias,
         _ => return None,
     };
 
