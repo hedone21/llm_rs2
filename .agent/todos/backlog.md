@@ -4,18 +4,53 @@
 
 ---
 
-## [P1] Phase 4-4-2.3 — decode_fallback 추출 (~2,260 LOC) — 2026-05-19 backlog 이동
-- **Status**: TODO (4-4-2.1 완료 후 sprint 종료 결정, 본 추출은 backlog로 미룸)
-- **Handoff**: `.agent/todos/handoff_phase4_4_2_sprint_exit_2026_05_19.md` §5
-- **상세**: `bin/generate.rs` L1841~4099 (~2,259 LOC, 4-4-2.2 transition 흡수 포함). 단일 sprint 위험 큼 — 추가 분해 권장: decode prologue / eviction trigger / swap dispatcher / experiment writer.
-- **방향**: G3 LOC-only mechanical move (handoff §2.5 참조). trait 추상화 scope 외.
-- **게이트**: bit-identical 32 tok + avg_tbt n=5 ≤5%.
-- **HEAD**: `1b674bd7` (4-4-2.1 prefill 추출 완료 상태)
+## [PARTIAL → CANCELLED] Phase 4-4-2.3 — decode_fallback 추출 — 2026-05-21 부분 완료 + 잔여 취소
+- **Status**: 3a/3c/3b **완료** (master `02cb7106`). 3d/3e는 **취소** — 사용자 결정 (2026-05-21).
+- **결정 사유**: generate.rs를 더 줄이지 않고 legacy로 보존, 새로운 다수 바이너리로 기능 분할하는 방향 전환. 잔여 3d/3e/4-4-2.4 추출은 새 바이너리 설계 안에서 자연 해소.
+- **완료된 sub-sprint**:
+  - 3a decode prologue (655 LOC, `session::decode_fallback::prologue`, commit `9313670b`)
+  - 3c eviction trigger (200 LOC, `session::decode_fallback::eviction_trigger`, commit `bcb221e2`)
+  - 3b swap dispatcher (452 LOC, `session::decode_fallback::swap_dispatch`, commit `02cb7106`)
+- **취소된 sub-sprint**:
+  - 3d Resilience checkpoint (~852 LOC)
+  - 3e decode loop assembler (~447 LOC)
+- **참고**: 분해 설계 `arch/decode_fallback_decomposition.md` (503 LOC, commit `391aa3f7`)은 향후 새 바이너리 분할 시 참고용으로 보존.
+- **후속**: `[P2] generate 바이너리 분할 + Manager 통합` 항목으로 흡수.
 
-## [P2] Phase 4-4-2.4 — post-process 추출 (~206 LOC) — 2026-05-19 backlog 이동
-- **Status**: TODO (4-4-2.3 완료 후 진입)
-- **상세**: `bin/generate.rs` L4101~4307. token decode + final stats + qcf-dump JSON.
-- **Dependencies**: Phase 4-4-2.3
+## [CANCELLED] Phase 4-4-2.4 — post-process 추출 (~206 LOC) — 2026-05-21 취소
+- **Status**: CANCELLED — 사용자 결정 (2026-05-21). Phase 4-4-2.3 잔여 취소와 함께 폐기.
+- **사유**: generate.rs legacy 보존 방향 전환. 새 바이너리 분할 작업에서 자연 흡수.
+
+## [P2] generate 바이너리 분할 + Manager 통합 — 2026-05-21 등록
+- **Status**: TODO (사용자 결정 대기 — 분할 단위 + 진입 시점)
+- **결정 (2026-05-21)**: 현 `engine/src/bin/generate.rs` (master `02cb7106`, 4,953 LOC)를 **legacy로 보존**하고, 새로운 다수 바이너리로 기능 분할. Manager IPC 통합도 새 바이너리에서 다룸.
+- **배경**:
+  - Phase 4-4-2.3 5 sub-sub-sprint 중 3a/3c/3b 추출 완료 — `session::decode_fallback::{prologue,eviction_trigger,swap_dispatch}` 모듈 자산 확보.
+  - 단일 generate를 ≤400 LOC까지 줄이는 직선 추출 경로 대신, 기능별로 분할된 새 바이너리들이 공유 모듈을 사용하는 구조로 전환.
+- **방향 (TBD)**: 추후 설계 라운드 필요. 잠정 후보 (사용자 결정 대기):
+  - `gen-cli` — 단일 추론 (기본 모드, manager-free)
+  - `gen-chat` — REPL 대화 모드
+  - `gen-experiment` — 실험 측정 모드 (experiment_writer / schedule)
+  - `gen-resilience` — Manager-integrated 모드 (CommandExecutor + Resilience checkpoint + 12+ plan dispatch)
+- **선행**: 없음 (현 master에서 즉시 시작 가능)
+- **영향 범위**:
+  - `engine/src/bin/` — 신규 바이너리 N개 추가, legacy `generate` 보존
+  - `engine/src/session/` — 공유 모듈 확장 (현재 init/cli/prefill/decode_fallback 활용)
+  - `manager/` — IPC protocol + mock 시나리오 (gen-resilience 한정)
+  - `Cargo.toml` — bin entry 추가
+  - `scripts/run_device.py` — 다수 바이너리 배포 지원
+- **재사용 가능 자산** (이미 분리됨):
+  - `engine/src/session/init.rs` (Phase 4-1)
+  - `engine/src/session/cli.rs` (Phase 4-1)
+  - `engine/src/session/prefill.rs` (Phase 4-4-2.1)
+  - `engine/src/session/decode_fallback/prologue.rs` (Sprint 3a)
+  - `engine/src/session/decode_fallback/eviction_trigger.rs` (Sprint 3c)
+  - `engine/src/session/decode_fallback/swap_dispatch.rs` (Sprint 3b)
+  - `arch/inference_pipeline.md` (Phase 4 6 trait 설계)
+  - `arch/decode_fallback_decomposition.md` (잔여 영역 참고용)
+- **게이트 (예상)**: 각 신규 바이너리 bit-identical (legacy generate 동일 모드 대비) + avg_tbt 회귀 0
+- **담당 권장**: Architect (설계) → Implementer (바이너리별 cut/paste) → Tester (디바이스 게이트)
+- **상세 설계**: 진입 결정 시 별도 handoff 작성
 
 ---
 
