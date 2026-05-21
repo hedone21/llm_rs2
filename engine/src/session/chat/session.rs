@@ -37,22 +37,27 @@ use crate::session::forward::{
 };
 use crate::session::traits::DecodeResult;
 
+/// `ChatKvMode::Standard` variant inner payload.
+///
+/// `CacheManager` + `AttentionScoreAccumulator`로 인해 ~376 bytes로 enum 전체가
+/// 비대해지는 것을 막기 위해 별도 struct로 추출하고 `Box`로 wrap한다.
+pub struct ChatKvModeStandard {
+    pub cache_manager: Option<CacheManager>,
+    pub score_accumulator: Option<AttentionScoreAccumulator>,
+    /// score-based policy (h2o, h2o_plus, d2o)인지 여부.
+    pub score_based: bool,
+    pub policy_name: String,
+    pub target_ratio: f32,
+    pub evicted_total: usize,
+}
+
 /// chat 모드의 KV-type 분기.
 ///
 /// stats_line 포맷 + ensure_capacity 동작이 분기된다.
 /// Standard만 eviction(CacheManager)을 자체 관리한다.
 /// Kivi/Offload는 overflow 시 bail (eviction 미지원).
-#[allow(clippy::large_enum_variant)]
 pub enum ChatKvMode {
-    Standard {
-        cache_manager: Option<CacheManager>,
-        score_accumulator: Option<AttentionScoreAccumulator>,
-        /// score-based policy (h2o, h2o_plus, d2o)인지 여부.
-        score_based: bool,
-        policy_name: String,
-        target_ratio: f32,
-        evicted_total: usize,
-    },
+    Standard(Box<ChatKvModeStandard>),
     Kivi {
         bits: u8,
         residual_size: usize,
@@ -119,16 +124,11 @@ impl ChatSession {
         self.decode_loop.forward_mut().reset_kv()?;
 
         // 2. score_accumulator + evicted_total reset (Standard 모드만)
-        if let ChatKvMode::Standard {
-            score_accumulator,
-            evicted_total,
-            ..
-        } = &mut self.kv_mode
-        {
-            if let Some(acc) = score_accumulator {
+        if let ChatKvMode::Standard(s) = &mut self.kv_mode {
+            if let Some(acc) = s.score_accumulator.as_mut() {
                 acc.reset();
             }
-            *evicted_total = 0;
+            s.evicted_total = 0;
         }
 
         // 3. decode_loop pos reset
@@ -146,11 +146,11 @@ impl ChatSession {
     /// - Kivi/Offload: pos + additional > max_seq_len이면 bail (eviction 미지원).
     pub fn ensure_capacity(&mut self, additional: usize) -> Result<()> {
         match &self.kv_mode {
-            ChatKvMode::Standard { cache_manager, .. } => {
+            ChatKvMode::Standard(s) => {
                 if self.pos + additional <= self.max_seq_len {
                     return Ok(());
                 }
-                if cache_manager.is_none() {
+                if s.cache_manager.is_none() {
                     anyhow::bail!(
                         "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
                          Use /reset or increase --max-seq-len.",
@@ -161,44 +161,33 @@ impl ChatSession {
                 }
                 // force_evict 실행.
                 // Borrow 분리: ChatKvMode 필드를 먼저 복사한 뒤 forward에 접근한다.
-                let (target_ratio, score_based) = if let ChatKvMode::Standard {
-                    target_ratio,
-                    score_based,
-                    ..
-                } = &self.kv_mode
-                {
-                    (*target_ratio, *score_based)
+                let (target_ratio, score_based) = if let ChatKvMode::Standard(s) = &self.kv_mode {
+                    (s.target_ratio, s.score_based)
                 } else {
                     unreachable!()
                 };
 
                 let (removed, new_pos) = {
-                    let scores_vec: Option<Vec<f32>> = if let ChatKvMode::Standard {
-                        score_accumulator,
-                        ..
-                    } = &self.kv_mode
-                    {
-                        if score_based {
-                            score_accumulator
-                                .as_ref()
-                                .filter(|a| a.is_active())
-                                .map(|a| a.importance_scores().to_vec())
+                    let scores_vec: Option<Vec<f32>> =
+                        if let ChatKvMode::Standard(s) = &self.kv_mode {
+                            if score_based {
+                                s.score_accumulator
+                                    .as_ref()
+                                    .filter(|a| a.is_active())
+                                    .map(|a| a.importance_scores().to_vec())
+                            } else {
+                                None
+                            }
                         } else {
                             None
-                        }
-                    } else {
-                        None
-                    };
-                    let cm = if let ChatKvMode::Standard {
-                        cache_manager: Some(cm),
-                        ..
-                    } = &self.kv_mode
-                    {
-                        // SAFETY: cm는 self.kv_mode 안에 있고, forward_mut()은
+                        };
+                    let cm = if let ChatKvMode::Standard(s) = &self.kv_mode {
+                        let cm_ref = s.cache_manager.as_ref().expect("checked above");
+                        // SAFETY: cm_ref는 self.kv_mode 안에 있고, forward_mut()은
                         // self.decode_loop을 빌린다 (kv_mode와 서로 다른 필드).
                         // 두 필드가 disjoint임이 구조적으로 보장되지만 borrow
                         // checker는 self를 전체로 봄 — 포인터로 우회한다.
-                        let cm_ptr: *const CacheManager = cm;
+                        let cm_ptr: *const CacheManager = cm_ref;
                         unsafe { &*cm_ptr }
                     } else {
                         unreachable!()
@@ -212,8 +201,8 @@ impl ChatSession {
                 };
 
                 if removed > 0 {
-                    if let ChatKvMode::Standard { evicted_total, .. } = &mut self.kv_mode {
-                        *evicted_total += removed;
+                    if let ChatKvMode::Standard(s) = &mut self.kv_mode {
+                        s.evicted_total += removed;
                     }
                     self.pos = new_pos;
                 }
@@ -253,10 +242,7 @@ impl ChatSession {
     pub fn on_turn_end(&mut self) -> Result<()> {
         let has_cm = matches!(
             &self.kv_mode,
-            ChatKvMode::Standard {
-                cache_manager: Some(_),
-                ..
-            }
+            ChatKvMode::Standard(s) if s.cache_manager.is_some()
         );
         if !has_cm {
             return Ok(());
@@ -266,23 +252,15 @@ impl ChatSession {
         // 직접 읽는 대신 max_seq_len을 proxy로 사용 — 할당 크기와 동일).
         let at_pressure = self.pos >= self.max_seq_len.saturating_mul(9) / 10;
 
-        let (target_ratio, score_based) = if let ChatKvMode::Standard {
-            target_ratio,
-            score_based,
-            ..
-        } = &self.kv_mode
-        {
-            (*target_ratio, *score_based)
+        let (target_ratio, score_based) = if let ChatKvMode::Standard(s) = &self.kv_mode {
+            (s.target_ratio, s.score_based)
         } else {
             return Ok(());
         };
 
-        let scores_vec: Option<Vec<f32>> = if let ChatKvMode::Standard {
-            score_accumulator, ..
-        } = &self.kv_mode
-        {
+        let scores_vec: Option<Vec<f32>> = if let ChatKvMode::Standard(s) = &self.kv_mode {
             if score_based {
-                score_accumulator
+                s.score_accumulator
                     .as_ref()
                     .filter(|a| a.is_active())
                     .map(|a| a.importance_scores().to_vec())
@@ -293,12 +271,11 @@ impl ChatSession {
             None
         };
 
-        let cm_ptr: *const CacheManager = if let ChatKvMode::Standard {
-            cache_manager: Some(cm),
-            ..
-        } = &self.kv_mode
-        {
-            cm as *const CacheManager
+        let cm_ptr: *const CacheManager = if let ChatKvMode::Standard(s) = &self.kv_mode {
+            match s.cache_manager.as_ref() {
+                Some(cm) => cm as *const CacheManager,
+                None => return Ok(()),
+            }
         } else {
             return Ok(());
         };
@@ -315,8 +292,8 @@ impl ChatSession {
         )?;
 
         if removed > 0 {
-            if let ChatKvMode::Standard { evicted_total, .. } = &mut self.kv_mode {
-                *evicted_total += removed;
+            if let ChatKvMode::Standard(s) = &mut self.kv_mode {
+                s.evicted_total += removed;
             }
             self.pos = new_pos;
             eprintln!(
@@ -330,14 +307,10 @@ impl ChatSession {
     /// `/stats` 출력용 stats_line (D5, G1 enforce — 라인 포맷 원본 보존).
     pub fn stats_line(&self) -> String {
         match &self.kv_mode {
-            ChatKvMode::Standard {
-                policy_name,
-                evicted_total,
-                ..
-            } => {
+            ChatKvMode::Standard(s) => {
                 format!(
                     "kv_pos={}/{} policy={} evicted_total={}",
-                    self.pos, self.max_seq_len, policy_name, evicted_total
+                    self.pos, self.max_seq_len, s.policy_name, s.evicted_total
                 )
             }
             ChatKvMode::Kivi {
@@ -467,14 +440,14 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
 
     Ok(ChatSession {
         decode_loop,
-        kv_mode: ChatKvMode::Standard {
+        kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
             cache_manager,
             score_accumulator,
             score_based,
             policy_name,
             target_ratio,
             evicted_total: 0,
-        },
+        })),
         pos: 0,
         max_seq_len,
     })
@@ -780,14 +753,14 @@ mod tests {
             .build();
         ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::Standard {
+            kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
                 cache_manager: None,
                 score_accumulator: None,
                 score_based: false,
                 policy_name: "none".to_string(),
                 target_ratio: 1.0,
                 evicted_total: 0,
-            },
+            })),
             pos: 0,
             max_seq_len,
         }
@@ -848,16 +821,16 @@ mod tests {
         assert!(session.pos() > 0);
 
         // evicted_total을 수동으로 설정하여 reset 후 0이 되는지 검증
-        if let ChatKvMode::Standard { evicted_total, .. } = &mut session.kv_mode {
-            *evicted_total = 42;
+        if let ChatKvMode::Standard(s) = &mut session.kv_mode {
+            s.evicted_total = 42;
         }
 
         session.reset().unwrap();
         assert_eq!(session.pos(), 0, "reset 후 pos == 0");
 
         // evicted_total도 0
-        if let ChatKvMode::Standard { evicted_total, .. } = &session.kv_mode {
-            assert_eq!(*evicted_total, 0, "reset 후 evicted_total == 0");
+        if let ChatKvMode::Standard(s) = &session.kv_mode {
+            assert_eq!(s.evicted_total, 0, "reset 후 evicted_total == 0");
         }
     }
 
@@ -968,14 +941,9 @@ mod tests {
         let mut session = make_mock_session(2048);
         session.pos = 42;
         // evicted_total 수동 설정
-        if let ChatKvMode::Standard {
-            evicted_total,
-            policy_name,
-            ..
-        } = &mut session.kv_mode
-        {
-            *evicted_total = 10;
-            *policy_name = "sliding".to_string();
+        if let ChatKvMode::Standard(s) = &mut session.kv_mode {
+            s.evicted_total = 10;
+            s.policy_name = "sliding".to_string();
         }
         let line = session.stats_line();
         assert_eq!(line, "kv_pos=42/2048 policy=sliding evicted_total=10");

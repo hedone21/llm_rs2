@@ -13,7 +13,7 @@
 //!
 //! 실제 모델 없이 mock Forward로 모든 게이트를 검증한다.
 
-use llm_rs2::session::chat::session::{ChatKvMode, ChatSession};
+use llm_rs2::session::chat::session::{ChatKvMode, ChatKvModeStandard, ChatSession};
 use llm_rs2::session::chat::stop_condition::StopCondition;
 use llm_rs2::session::traits::{Forward, StepCtx, StopReason};
 use llm_rs2::session::{DecodeLoopBuilder, GreedySampler};
@@ -79,14 +79,14 @@ fn make_standard_session(max_seq_len: usize) -> ChatSession {
         .build();
     ChatSession::new_for_test(
         decode_loop,
-        ChatKvMode::Standard {
+        ChatKvMode::Standard(Box::new(ChatKvModeStandard {
             cache_manager: None,
             score_accumulator: None,
             score_based: false,
             policy_name: "none".to_string(),
             target_ratio: 1.0,
             evicted_total: 0,
-        },
+        })),
         max_seq_len,
     )
 }
@@ -240,14 +240,14 @@ fn g3b_reset_clears_evicted_total() {
     let mut session = make_standard_session(2048);
 
     // evicted_total 수동 설정
-    if let ChatKvMode::Standard { evicted_total, .. } = &mut session.kv_mode {
-        *evicted_total = 99;
+    if let ChatKvMode::Standard(s) = &mut session.kv_mode {
+        s.evicted_total = 99;
     }
 
     session.reset().unwrap();
 
-    if let ChatKvMode::Standard { evicted_total, .. } = &session.kv_mode {
-        assert_eq!(*evicted_total, 0, "reset 후 evicted_total == 0");
+    if let ChatKvMode::Standard(s) = &session.kv_mode {
+        assert_eq!(s.evicted_total, 0, "reset 후 evicted_total == 0");
     } else {
         panic!("expected Standard mode");
     }
@@ -345,14 +345,9 @@ fn g4f_offload_exact_boundary_is_ok() {
 fn g1a_standard_stats_line_format() {
     let mut session = make_standard_session(2048);
     session.pos = 42;
-    if let ChatKvMode::Standard {
-        evicted_total,
-        policy_name,
-        ..
-    } = &mut session.kv_mode
-    {
-        *evicted_total = 10;
-        *policy_name = "sliding".to_string();
+    if let ChatKvMode::Standard(s) = &mut session.kv_mode {
+        s.evicted_total = 10;
+        s.policy_name = "sliding".to_string();
     }
     assert_eq!(
         session.stats_line(),

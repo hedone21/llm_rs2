@@ -7,7 +7,7 @@
 //! run_chat_repl_v2는 I/O 주도 함수라 직접 호출 대신, 핵심 동작인
 //! ChatSession::prefill + run_turn multi-turn pos 누적을 spec 수준에서 검증한다.
 
-use llm_rs2::session::chat::session::{ChatKvMode, ChatSession};
+use llm_rs2::session::chat::session::{ChatKvMode, ChatKvModeStandard, ChatSession};
 use llm_rs2::session::chat::stop_condition::ChatStopCondition;
 use llm_rs2::session::traits::{Forward, StepCtx, StopReason};
 use llm_rs2::session::{DecodeLoopBuilder, GreedySampler};
@@ -54,14 +54,14 @@ fn make_det_session(max_seq_len: usize) -> ChatSession {
         .build();
     ChatSession::new_for_test(
         decode_loop,
-        ChatKvMode::Standard {
+        ChatKvMode::Standard(Box::new(ChatKvModeStandard {
             cache_manager: None,
             score_accumulator: None,
             score_based: false,
             policy_name: "none".to_string(),
             target_ratio: 1.0,
             evicted_total: 0,
-        },
+        })),
         max_seq_len,
     )
 }
