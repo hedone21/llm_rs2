@@ -2,7 +2,7 @@ use clap::Parser;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
-use llm_rs2::core::events::{self, CacheEvent, StderrDiagnosticSink};
+use llm_rs2::observability::events::{self, CacheEvent, StderrDiagnosticSink};
 use llm_rs2::core::rss_trace::{io_trace, rss_trace};
 use llm_rs2::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;

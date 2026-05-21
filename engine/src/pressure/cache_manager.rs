@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::core::events::{CacheEvent, EventSink, NoOpSink};
+use crate::observability::events::{CacheEvent, EventSink, NoOpSink};
 use crate::resilience::sys_monitor::SystemMonitor;
 use crate::pressure::eviction::EvictionPolicy;
 use crate::pressure::kv_cache::{KVCache, max_cache_pos};

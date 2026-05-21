@@ -17,7 +17,7 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::core::events::StderrDiagnosticSink;
+use crate::observability::events::StderrDiagnosticSink;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::memory::Memory;
