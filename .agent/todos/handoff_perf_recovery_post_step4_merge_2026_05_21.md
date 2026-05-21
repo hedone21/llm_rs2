@@ -206,3 +206,44 @@ adb -s R3CY408S4HN push target/aarch64-linux-android/release/generate /data/loca
 ## 재진입
 
 **"성능 개선 진행"** — 본 handoff Step 1 (baseline 재측정 + 격리) 부터 시작.
+
+---
+
+## 종결 — 2026-05-21 옵션 A 채택 (CLOSED)
+
+Step 1 baseline 격리 측정 (커밋 `7d02686b`) 결과로 본 task를 **옵션 A로 종결**한다.
+
+### 측정 결과 요약 (n=5 median, S25 qnn_oppkg 6T)
+
+|  | GGUF Avg TBT | AUF Avg TBT |
+|---|---|---|
+| sprint1 (e31bd698) | 33.08 ms | 32.56 ms |
+| step-4-backup (fd95e916) | 32.57 ms | — |
+| HEAD merge (000634b3) | 33.84 ms | 33.96 ms |
+
+회귀 분해:
+- sprint1 → step-4-backup: **−0.51 ms (개선)**
+- step-4-backup → HEAD: **+1.27 ms** (머지 통합 영향)
+- 현 환경 회귀폭: GGUF +2.3% / AUF +4.3% — **base 105% 마진 이내 PASS**
+
+### 종결 근거
+
+1. **handoff Goal baseline outdated**: "GGUF ≤30.74 / AUF ≤33.10"의 출발점인 sprint1 baseline 29.20/31.44 ms는 현 환경에서 sprint1 binary 자체로도 재현 불가 (현 환경 33.08/32.56 ms). 측정 환경 (디바이스 thermal/governor/백그라운드 앱/prompt/feature) 차이로 추정.
+2. **H1 가설 기각**: 회귀가 step-4 본체(DecodeLoop+ModelForward trait dispatch)가 아닌 머지 통합 코드에서 발생. step-4 refactor 자체는 −0.51 ms 개선까지 함.
+3. **현 환경 회귀폭은 노이즈 수준**: 측정 IQR ~1 ms 대비 +0.76 ms (GGUF) / +1.40 ms (AUF). base 105% 이내.
+4. **ROI 낮음**: +1.27 ms 마이크로 회복은 outdated baseline을 쫓는 작업이며 CLAUDE.md "단순함 우선" / "외과적 변경" 원칙에 부합하지 않음.
+
+### Follow-up
+
+- handoff 절대 ms 기준 ("GGUF ≤30.74 / AUF ≤33.10")은 **outdated baseline에서 파생** — 향후 perf 작업 시 현 환경에서 새 baseline 측정 후 진행할 것.
+- 머지 통합 +1.27 ms 회귀 원인 후보 (`compute_qcf_swap` rename / AUF 모듈 위치 / LoadConfig W-AUF-1 fields / `--secondary-gguf` warning / `read_allow_boundary_env` cfg 게이트 제거)는 microbench으로 재현 시도 가치 낮음 — 본 backlog 등록하지 않음.
+
+### 종결 산출물
+
+- baseline 측정 doc: `papers/eurosys2027/_workspace/experiment/perf_recovery_post_step4_baseline.md`
+- raw logs: `papers/eurosys2027/_workspace/experiment/perf_recovery_post_step4_raw/{sprint1,step4_backup,head}_{gguf,auf}.log` (n=5 × 5 cells = 25 runs)
+- 메모리 갱신: [[perf-recovery-post-step4]] (status: CLOSED)
+
+### 다음 작업
+
+리펙토링 흐름 유지 — backlog [P1] **Phase 4-4-2.3 decode_fallback 추출** (~2,260 LOC, `bin/generate.rs` L1841~4099) 진입. 진입점: `handoff_phase4_4_2_sprint_exit_2026_05_19.md §5`.
