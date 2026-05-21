@@ -591,12 +591,10 @@ impl PhaseAwareSwapDispatcher {
         if !in_flight_empty {
             return false;
         }
-        let pending_empty = self
-            .pending_layers
+        self.pending_layers
             .lock()
             .map(|p| p.is_empty())
-            .unwrap_or(false);
-        pending_empty
+            .unwrap_or(false)
     }
 
     /// Diagnostic snapshot — (queue, in_flight_some, pending_count,

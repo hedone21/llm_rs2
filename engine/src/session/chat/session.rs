@@ -42,6 +42,7 @@ use crate::session::traits::DecodeResult;
 /// stats_line 포맷 + ensure_capacity 동작이 분기된다.
 /// Standard만 eviction(CacheManager)을 자체 관리한다.
 /// Kivi/Offload는 overflow 시 bail (eviction 미지원).
+#[allow(clippy::large_enum_variant)]
 pub enum ChatKvMode {
     Standard {
         cache_manager: Option<CacheManager>,

@@ -797,6 +797,7 @@ pub struct Args {
     /// a fresh collector. Two extra F5 vectors land in the dump JSON:
     /// - `direct_attn_f5_decode_only`: X = decode-only raws (T = N).
     /// - `direct_attn_f5_prefill_decode`: X = concat(prefill raws, decode raws) (T = 256 + N).
+    ///
     /// The regular `direct_attn_f5` (prefill X, T = 256) is always written.
     /// Decode token 0 = argmax of prefill's final logits; subsequent decode
     /// tokens = argmax of each previous decode-step logits (greedy).
@@ -844,10 +845,11 @@ pub struct Args {
     ///   2. WeightSwapDecider.decide(ratio, algorithm) → ordered layer list
     ///      of length K = floor(ratio × num_layers).
     ///   3. for t = 0..=K:
-    ///       a. run eval-ll on the eval batch → record EvalOutput_t.
-    ///       b. if t < K: SwapExecutor.execute_on_slots(&[selected_layers[t]]).
+    ///      a. run eval-ll on the eval batch → record EvalOutput_t.
+    ///      b. if t < K: SwapExecutor.execute_on_slots(&[selected_layers[t]]).
     ///   4. dump JSON with trajectory: array of K+1 (step, swapped_layers,
     ///      layer_added, eval_ll_output).
+    ///
     /// The cumulative swap state at step t mirrors ARGUS's production
     /// incremental swap (one layer per token), letting external analysis
     /// observe the mid-swap NLL trajectory rather than only the final state.

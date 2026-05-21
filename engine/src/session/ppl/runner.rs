@@ -229,7 +229,7 @@ pub fn run_ppl_dispatch(ctx: PplRunCtx) -> Result<()> {
         eprintln!("[QCF-dump] JSON written to {}", dump_path.display());
     }
 
-    return Ok(());
+    Ok(())
 }
 
 // ─── Phase 4-C-2: PPL evaluation free fns (lift from bin/generate.rs) ───

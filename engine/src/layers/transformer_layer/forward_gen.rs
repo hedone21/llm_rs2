@@ -1519,11 +1519,6 @@ impl TransformerLayer {
             }
         }
         prof_record!(t, matmul_ffn);
-        // Stage 12/13/14: gate/up/silu_mul output. Note matmul_ffn_gate_up_silu
-        // (SiLU path) fuses silu(gate)*up into ws.gate, so stage 12 == 14 in
-        // the fused branch. GELU path keeps them separated and stage 14 is
-        // taken after the explicit gelu_tanh_mul below.
-        if !use_gelu_tanh {}
         tr_record!(tr, MatmulFfnGateUp);
 
         // silu_mul (GELU path) + down matmul: skipped when partition is active

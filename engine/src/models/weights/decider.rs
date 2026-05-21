@@ -27,9 +27,10 @@ use crate::qcf::layer_importance::{ImportanceTable, SubLayer};
 /// The default `ImportanceAware` matches production ARGUS behavior; the others
 /// exist for the U5 "Layer-swap algorithm comparison" table that shows the
 /// quality cost of *not* using importance-aware ranking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SwapAlgorithm {
     /// `importance × ε` ascending bottom-k (current production default).
+    #[default]
     ImportanceAware,
     /// Layer index ascending (0 → N-1).
     Sequential,
@@ -64,12 +65,6 @@ impl SwapAlgorithm {
             Self::Uniform => "uni",
             Self::AntiImportance => "anti",
         }
-    }
-}
-
-impl Default for SwapAlgorithm {
-    fn default() -> Self {
-        Self::ImportanceAware
     }
 }
 

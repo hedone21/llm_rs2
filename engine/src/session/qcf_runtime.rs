@@ -119,6 +119,7 @@ pub fn read_allow_boundary_env() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_qcf_warmup_workflow(
     model: &crate::models::transformer::TransformerModel,
     backend: &Arc<dyn Backend>,

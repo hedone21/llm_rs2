@@ -307,8 +307,8 @@ impl ImportanceCollector {
                     let before_tok = &self.before_snapshot_raw[off..be];
                     let after_tok = &x_data[off..be];
                     let mut bm = 0.0f32;
-                    for k in 0..d {
-                        bm += before_tok[k] * before_tok[k];
+                    for &b in before_tok.iter().take(d) {
+                        bm += b * b;
                     }
                     if bm > 1e-24 {
                         sum_cos += cosine_similarity(before_tok, after_tok);
@@ -389,6 +389,7 @@ impl ImportanceCollector {
     /// Consume the collector and return `(ImportanceTable, x_means, raws_per_layer)`.
     /// Use this in DirectAttn mode to feed
     /// `noise_table::compute_cascade_attn_perturbation`.
+    #[allow(clippy::type_complexity)]
     pub fn build_with_raws(
         self,
     ) -> (

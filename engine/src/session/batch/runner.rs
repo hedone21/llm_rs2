@@ -906,5 +906,5 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
     }
 
     eprintln!("[Batch] Complete: {} iterations", iteration);
-    return Ok(());
+    Ok(())
 }

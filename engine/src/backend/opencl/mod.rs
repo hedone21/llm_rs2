@@ -5275,6 +5275,7 @@ impl Backend for OpenCLBackend {
     /// cl_mem → Arc<SecondaryMmap> → Arc<RpcmemLayerRegion> → rpcmem_free).
     ///
     /// Rejects `size == 0` (invalid alias); rejects null `host_ptr`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn alloc_alias_weight_buffer(
         &self,
         host_ptr: *mut u8,

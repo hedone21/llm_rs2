@@ -383,5 +383,5 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         "skip_ratio": args.skip_ratio,
     });
     println!("{}", serde_json::to_string_pretty(&json_val)?);
-    return Ok(());
+    Ok(())
 }

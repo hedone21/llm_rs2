@@ -418,9 +418,7 @@ pub fn from_auf_self_secondary(
     let weights_tag = primary_variant_tag
         .weights_section_tag()
         .ok_or_else(|| LoadError::AufInvariantViolation {
-            detail: format!(
-                "AUF self-secondary: BackendTag::Any cannot host tensors (primary_variant_tag invariant)"
-            ),
+            detail: "AUF self-secondary: BackendTag::Any cannot host tensors (primary_variant_tag invariant)".to_string(),
         })?;
 
     let variant_idx = view

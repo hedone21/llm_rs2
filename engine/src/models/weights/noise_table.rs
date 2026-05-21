@@ -626,11 +626,10 @@ pub fn compute_input_aware_epsilon_multitensor(
         for (subname, primary_tensor) in SUBNAMES.iter().zip(tensors.iter()) {
             if let Some(eps_rel) =
                 input_aware_relative_epsilon(i, subname, primary_tensor, secondary, x_mean)
+                && eps_rel.is_finite()
             {
-                if eps_rel.is_finite() {
-                    acc += eps_rel as f64;
-                    valid += 1;
-                }
+                acc += eps_rel as f64;
+                valid += 1;
             }
         }
 
@@ -747,11 +746,11 @@ fn primary_tensor_to_f32(tensor: &crate::tensor::Tensor) -> Option<Vec<f32>> {
 /// the Q4 secondary — and report two scalar perturbation measures:
 ///
 /// - **F4** (cascade-aware single output projection):
-///     `ε_o(V_out^F16) = ‖(W_o^F16 − W_o^Q4) · V_out^F16‖_F / ‖W_o^F16 · V_out^F16‖_F`
+///   `ε_o(V_out^F16) = ‖(W_o^F16 − W_o^Q4) · V_out^F16‖_F / ‖W_o^F16 · V_out^F16‖_F`
 ///   where `V_out^F16 = softmax(QK^T / √d_h) · V` is computed with F16 weights.
 ///
 /// - **F5** (direct attention output):
-///     `‖O^F16 − O^Q4‖_F / ‖O^F16‖_F`
+///   `‖O^F16 − O^Q4‖_F / ‖O^F16‖_F`
 ///   where `O = W_o · softmax(QK^T / √d_h) · V` is the full attention head
 ///   output, evaluated independently with F16 and Q4 weights.
 ///
@@ -781,7 +780,7 @@ pub fn compute_cascade_attn_perturbation(
         );
         return out;
     }
-    if n_heads % n_kv_heads != 0 {
+    if !n_heads.is_multiple_of(n_kv_heads) {
         log::warn!(
             "compute_cascade_attn_perturbation: n_heads ({}) not divisible by n_kv_heads ({})",
             n_heads,
@@ -915,6 +914,7 @@ fn matmul_x_wt(x: &[f32], w: &[f32], t: usize, in_dim: usize, out_dim: usize) ->
 /// (row-major). Each query head `h` reads from KV head `h / (n_heads/n_kv_heads)`.
 /// Softmax is applied row-wise over the causal-masked logits scaled by
 /// `1/√d_head`. Returns `V_out ∈ R^{T × (n_heads · d_head)}` row-major.
+#[allow(clippy::needless_range_loop)]
 fn attention_mix_causal(
     q: &[f32],
     k: &[f32],

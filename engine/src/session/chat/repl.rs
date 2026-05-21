@@ -153,10 +153,10 @@ pub fn run_chat_repl_v2(args: &ChatReplArgs<'_>, session: &mut ChatSession) -> R
             .to_vec();
 
         // BOS: system prompt가 없고 첫 user turn이면 prepend.
-        if session.pos() == 0 {
-            if let Some(b) = bos_id {
-                turn_ids.insert(0, b);
-            }
+        if session.pos() == 0
+            && let Some(b) = bos_id
+        {
+            turn_ids.insert(0, b);
         }
 
         // ── capacity check + prefill ───────────────────────────────────────

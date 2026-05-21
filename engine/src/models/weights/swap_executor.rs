@@ -461,6 +461,7 @@ impl<'a> SwapExecutor<'a> {
     ///
     /// When `None` (or `supports_async_transfer()` returns `false`), the
     /// original synchronous path runs unchanged (backward-compatible).
+    #[allow(clippy::type_complexity)]
     pub fn execute_on_slots(
         &self,
         layers: &[Arc<LayerSlot>],
@@ -660,9 +661,7 @@ impl<'a> SwapExecutor<'a> {
                             if slot.current_dtype() == self.target_dtype {
                                 return None;
                             }
-                            if slot.secondary_mmap_handle().is_none() {
-                                return None;
-                            }
+                            slot.secondary_mmap_handle()?;
                             Some((idx, self.build_layer_from_mmap_async(secondary, slot, idx)))
                         })
                         .collect()
@@ -674,9 +673,7 @@ impl<'a> SwapExecutor<'a> {
                             if slot.current_dtype() == self.target_dtype {
                                 return None;
                             }
-                            if slot.secondary_mmap_handle().is_none() {
-                                return None;
-                            }
+                            slot.secondary_mmap_handle()?;
                             Some((idx, self.build_layer_from_mmap_async(secondary, slot, idx)))
                         })
                         .collect()
