@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::core::rss_trace::read_bytes_now;
+use crate::observability::rss_trace::read_bytes_now;
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::{
     AsyncSwapDispatcher, DynamicKController, IncrementalSwapPlan, IntraForwardSwapHook,

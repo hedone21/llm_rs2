@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::core::rss_trace::{io_trace, rss_trace};
+use crate::observability::rss_trace::{io_trace, rss_trace};
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::inference::skip_config::SkipConfig;
 use crate::memory::Memory;
