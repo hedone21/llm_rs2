@@ -62,9 +62,8 @@ LAYER_RULES = [
     ("session",                 "L4"),
 
     # cross-cutting: observability (Step 5-D/5-E: events/rss_trace promoted from core/ to observability/)
+    # Step 5b-A/B: profile/eval physically relocated to observability/, redundant rules removed.
     ("observability",           "observability"),
-    ("profile",                 "observability"),
-    ("eval",                    "observability"),
 
     # cross-cutting: resilience (Step 5-B/5-C: sys_monitor/gpu_yield promoted from core/ to resilience/)
     ("resilience",              "resilience"),

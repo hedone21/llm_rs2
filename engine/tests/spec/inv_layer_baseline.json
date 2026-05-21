@@ -1,7 +1,4 @@
 {
-  "description": "INV-LAYER-001~005 위반 baseline. layer_lint.py가 baseline 대비 새 위반만 FAIL로 처리. 마이그레이션 PR마다 줄여가는 것이 목표.",
-  "generated": "2026-05-21",
-  "total": 296,
   "violations": [
     {
       "id": "V-01",
@@ -196,7 +193,7 @@
     {
       "id": "V-10",
       "file": "pressure/cache_manager.rs",
-      "line": 14,
+      "line": 13,
       "import": "crate::resilience::EvictMethod",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
@@ -544,7 +541,7 @@
       "id": "V-14",
       "file": "inference/sampling.rs",
       "line": 132,
-      "import": "crate::profile::quality_metrics::Timer::start",
+      "import": "crate::observability::profile::quality_metrics::Timer::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -553,7 +550,7 @@
       "id": "V-14",
       "file": "inference/sampling.rs",
       "line": 132,
-      "import": "crate::profile::quality_metrics::NLL",
+      "import": "crate::observability::profile::quality_metrics::NLL",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -562,7 +559,7 @@
       "id": "V-14",
       "file": "pressure/kivi_cache.rs",
       "line": 803,
-      "import": "crate::profile::quality_metrics::Timer::start",
+      "import": "crate::observability::profile::quality_metrics::Timer::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -571,7 +568,7 @@
       "id": "V-14",
       "file": "pressure/kivi_cache.rs",
       "line": 804,
-      "import": "crate::profile::quality_metrics::QCF_KV_DRYRUN",
+      "import": "crate::observability::profile::quality_metrics::QCF_KV_DRYRUN",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -580,7 +577,7 @@
       "id": "V-14",
       "file": "qcf/layer_importance.rs",
       "line": 83,
-      "import": "crate::profile::quality_metrics::Timer::start",
+      "import": "crate::observability::profile::quality_metrics::Timer::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -589,7 +586,7 @@
       "id": "V-14",
       "file": "qcf/layer_importance.rs",
       "line": 84,
-      "import": "crate::profile::quality_metrics::QCF_LAYER_SKIP",
+      "import": "crate::observability::profile::quality_metrics::QCF_LAYER_SKIP",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -598,7 +595,7 @@
       "id": "V-14",
       "file": "qcf/layer_importance.rs",
       "line": 109,
-      "import": "crate::profile::quality_metrics::Timer::start",
+      "import": "crate::observability::profile::quality_metrics::Timer::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -607,7 +604,7 @@
       "id": "V-14",
       "file": "qcf/layer_importance.rs",
       "line": 110,
-      "import": "crate::profile::quality_metrics::QCF_LAYER_SKIP",
+      "import": "crate::observability::profile::quality_metrics::QCF_LAYER_SKIP",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -616,7 +613,7 @@
       "id": "V-14",
       "file": "qcf/qcf_kv.rs",
       "line": 178,
-      "import": "crate::profile::quality_metrics::Timer::start",
+      "import": "crate::observability::profile::quality_metrics::Timer::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -625,7 +622,7 @@
       "id": "V-14",
       "file": "qcf/qcf_kv.rs",
       "line": 179,
-      "import": "crate::profile::quality_metrics::QCF_KV_UNIFIED",
+      "import": "crate::observability::profile::quality_metrics::QCF_KV_UNIFIED",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -692,7 +689,7 @@
     },
     {
       "id": "V-16",
-      "file": "eval/eval_loop.rs",
+      "file": "observability/eval/eval_loop.rs",
       "line": 12,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-004",
@@ -983,7 +980,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/forward.rs",
       "line": 17,
-      "import": "crate::profile::ops::PrefillOpProfiler",
+      "import": "crate::observability::profile::ops::PrefillOpProfiler",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -992,7 +989,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/forward.rs",
       "line": 63,
-      "import": "crate::profile::ops::PrefillOpProfiler",
+      "import": "crate::observability::profile::ops::PrefillOpProfiler",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1001,7 +998,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/forward.rs",
       "line": 76,
-      "import": "crate::profile::ops::PrefillOpProfiler",
+      "import": "crate::observability::profile::ops::PrefillOpProfiler",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1010,7 +1007,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/forward.rs",
       "line": 1304,
-      "import": "crate::profile::ops::PrefillOpProfiler",
+      "import": "crate::observability::profile::ops::PrefillOpProfiler",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": true
@@ -1019,7 +1016,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/forward_gen.rs",
       "line": 140,
-      "import": "crate::profile::op_trace::start_op",
+      "import": "crate::observability::profile::op_trace::start_op",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1028,7 +1025,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/forward_gen.rs",
       "line": 140,
-      "import": "crate::profile::op_trace::OpKind::",
+      "import": "crate::observability::profile::op_trace::OpKind::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1037,7 +1034,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/forward_gen.rs",
       "line": 145,
-      "import": "crate::profile::op_trace::record",
+      "import": "crate::observability::profile::op_trace::record",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1046,7 +1043,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/forward_gen.rs",
       "line": 147,
-      "import": "crate::profile::op_trace::OpKind::",
+      "import": "crate::observability::profile::op_trace::OpKind::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1055,7 +1052,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/mod.rs",
       "line": 21,
-      "import": "crate::profile::ops::OpProfiler",
+      "import": "crate::observability::profile::ops::OpProfiler",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1064,7 +1061,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/mod.rs",
       "line": 390,
-      "import": "crate::profile::ops",
+      "import": "crate::observability::profile::ops",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1073,7 +1070,7 @@
       "id": "V-18",
       "file": "layers/transformer_layer/mod.rs",
       "line": 391,
-      "import": "crate::profile::ops::OpProfiler",
+      "import": "crate::observability::profile::ops::OpProfiler",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1251,7 +1248,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 158,
-      "import": "crate::profile::ops::OpProfiler",
+      "import": "crate::observability::profile::ops::OpProfiler",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1260,7 +1257,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1501,
-      "import": "crate::profile::op_trace::note_forward_call",
+      "import": "crate::observability::profile::op_trace::note_forward_call",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1269,7 +1266,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1532,
-      "import": "crate::profile::op_trace::start",
+      "import": "crate::observability::profile::op_trace::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1278,7 +1275,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1543,
-      "import": "crate::profile::op_trace::record",
+      "import": "crate::observability::profile::op_trace::record",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1287,7 +1284,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1545,
-      "import": "crate::profile::op_trace::OpKind::Embedding",
+      "import": "crate::observability::profile::op_trace::OpKind::Embedding",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1296,7 +1293,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1908,
-      "import": "crate::profile::op_trace::start",
+      "import": "crate::observability::profile::op_trace::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1305,7 +1302,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1919,
-      "import": "crate::profile::op_trace::record",
+      "import": "crate::observability::profile::op_trace::record",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1314,7 +1311,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1921,
-      "import": "crate::profile::op_trace::OpKind::FinalNorm",
+      "import": "crate::observability::profile::op_trace::OpKind::FinalNorm",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1323,7 +1320,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1929,
-      "import": "crate::profile::op_trace::start",
+      "import": "crate::observability::profile::op_trace::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1332,7 +1329,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1959,
-      "import": "crate::profile::op_trace::record",
+      "import": "crate::observability::profile::op_trace::record",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1341,7 +1338,7 @@
       "id": "V-22",
       "file": "models/transformer.rs",
       "line": 1961,
-      "import": "crate::profile::op_trace::OpKind::LmHead",
+      "import": "crate::observability::profile::op_trace::OpKind::LmHead",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1436,7 +1433,7 @@
       "id": "V-26",
       "file": "models/weights/decider.rs",
       "line": 257,
-      "import": "crate::profile::quality_metrics::Timer::start",
+      "import": "crate::observability::profile::quality_metrics::Timer::start",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1445,14 +1442,14 @@
       "id": "V-26",
       "file": "models/weights/decider.rs",
       "line": 258,
-      "import": "crate::profile::quality_metrics::QCF_WEIGHT_SWAP",
+      "import": "crate::observability::profile::quality_metrics::QCF_WEIGHT_SWAP",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
     },
     {
       "id": "V-28",
-      "file": "eval/eval_loop.rs",
+      "file": "observability/eval/eval_loop.rs",
       "line": 14,
       "import": "crate::inference::sampling",
       "rule": "INV-LAYER-004",
@@ -1461,7 +1458,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eval_loop.rs",
+      "file": "observability/eval/eval_loop.rs",
       "line": 15,
       "import": "crate::inference::skip_config::SkipConfig",
       "rule": "INV-LAYER-004",
@@ -1470,7 +1467,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eval_loop.rs",
+      "file": "observability/eval/eval_loop.rs",
       "line": 19,
       "import": "crate::models::transformer::",
       "rule": "INV-LAYER-004",
@@ -1479,7 +1476,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eval_loop.rs",
+      "file": "observability/eval/eval_loop.rs",
       "line": 20,
       "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-004",
@@ -1488,7 +1485,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eval_loop.rs",
+      "file": "observability/eval/eval_loop.rs",
       "line": 21,
       "import": "crate::qcf::",
       "rule": "INV-LAYER-004",
@@ -1497,7 +1494,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eval_loop.rs",
+      "file": "observability/eval/eval_loop.rs",
       "line": 518,
       "import": "crate::qcf::ImportanceTable",
       "rule": "INV-LAYER-004",
@@ -1506,7 +1503,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eviction_hook.rs",
+      "file": "observability/eval/eviction_hook.rs",
       "line": 8,
       "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
       "rule": "INV-LAYER-004",
@@ -1515,7 +1512,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eviction_hook.rs",
+      "file": "observability/eval/eviction_hook.rs",
       "line": 9,
       "import": "crate::pressure::cache_manager::CacheManager",
       "rule": "INV-LAYER-004",
@@ -1524,7 +1521,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eviction_hook.rs",
+      "file": "observability/eval/eviction_hook.rs",
       "line": 10,
       "import": "crate::pressure::kv_cache::",
       "rule": "INV-LAYER-004",
@@ -1533,7 +1530,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eviction_hook.rs",
+      "file": "observability/eval/eviction_hook.rs",
       "line": 11,
       "import": "crate::qcf::",
       "rule": "INV-LAYER-004",
@@ -1542,8 +1539,8 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eviction_hook.rs",
-      "line": 707,
+      "file": "observability/eval/eviction_hook.rs",
+      "line": 706,
       "import": "crate::pressure::cache_manager::CacheManager",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
@@ -1551,8 +1548,8 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eviction_hook.rs",
-      "line": 708,
+      "file": "observability/eval/eviction_hook.rs",
+      "line": 707,
       "import": "crate::pressure::eviction::no_eviction::NoEvictionPolicy",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
@@ -1560,8 +1557,8 @@
     },
     {
       "id": "V-28",
-      "file": "eval/eviction_hook.rs",
-      "line": 709,
+      "file": "observability/eval/eviction_hook.rs",
+      "line": 708,
       "import": "crate::qcf::",
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
@@ -1569,7 +1566,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/hook.rs",
+      "file": "observability/eval/hook.rs",
       "line": 7,
       "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
       "rule": "INV-LAYER-004",
@@ -1578,7 +1575,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/hook.rs",
+      "file": "observability/eval/hook.rs",
       "line": 8,
       "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-004",
@@ -1587,7 +1584,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/kivi_hook.rs",
+      "file": "observability/eval/kivi_hook.rs",
       "line": 12,
       "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
       "rule": "INV-LAYER-004",
@@ -1596,7 +1593,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/kivi_hook.rs",
+      "file": "observability/eval/kivi_hook.rs",
       "line": 13,
       "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-004",
@@ -1605,7 +1602,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/kivi_hook.rs",
+      "file": "observability/eval/kivi_hook.rs",
       "line": 37,
       "import": "crate::qcf::QcfConfig",
       "rule": "INV-LAYER-004",
@@ -1614,7 +1611,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/kivi_hook.rs",
+      "file": "observability/eval/kivi_hook.rs",
       "line": 61,
       "import": "crate::qcf::QcfConfig",
       "rule": "INV-LAYER-004",
@@ -1623,7 +1620,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/kivi_hook.rs",
+      "file": "observability/eval/kivi_hook.rs",
       "line": 219,
       "import": "crate::qcf::",
       "rule": "INV-LAYER-004",
@@ -1632,7 +1629,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/kivi_hook.rs",
+      "file": "observability/eval/kivi_hook.rs",
       "line": 246,
       "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-004",
@@ -1641,7 +1638,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/kivi_hook.rs",
+      "file": "observability/eval/kivi_hook.rs",
       "line": 247,
       "import": "crate::qcf::QcfConfig",
       "rule": "INV-LAYER-004",
@@ -1650,7 +1647,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/kivi_hook.rs",
+      "file": "observability/eval/kivi_hook.rs",
       "line": 307,
       "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
       "rule": "INV-LAYER-004",
@@ -1659,7 +1656,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/qcf_helpers.rs",
+      "file": "observability/eval/qcf_helpers.rs",
       "line": 8,
       "import": "crate::models::weights::QuantNoiseTable",
       "rule": "INV-LAYER-004",
@@ -1668,7 +1665,7 @@
     },
     {
       "id": "V-28",
-      "file": "eval/qcf_helpers.rs",
+      "file": "observability/eval/qcf_helpers.rs",
       "line": 9,
       "import": "crate::qcf::layer_importance::ImportanceTable",
       "rule": "INV-LAYER-004",
@@ -1677,7 +1674,7 @@
     },
     {
       "id": "V-29",
-      "file": "eval/eviction_hook.rs",
+      "file": "observability/eval/eviction_hook.rs",
       "line": 319,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-004",
@@ -1714,7 +1711,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 8,
+      "line": 5,
       "import": "crate::inference::attention_scores::AttentionScoreAccumulator",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
@@ -1723,7 +1720,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 13,
+      "line": 10,
       "import": "crate::memory::Memory",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L2 (L4 session/ 우회)",
@@ -1732,7 +1729,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 14,
+      "line": 11,
       "import": "crate::memory::galloc::Galloc",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L2 (L4 session/ 우회)",
@@ -1741,7 +1738,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 16,
+      "line": 15,
       "import": "crate::pressure::cache_manager::CacheManager",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1750,7 +1747,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 18,
+      "line": 17,
       "import": "crate::pressure::eviction::h2o::H2OPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1759,7 +1756,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 19,
+      "line": 18,
       "import": "crate::pressure::eviction::h2o_plus::H2OPlusPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1768,7 +1765,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 20,
+      "line": 19,
       "import": "crate::pressure::eviction::no_eviction::NoEvictionPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1777,7 +1774,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 21,
+      "line": 20,
       "import": "crate::pressure::eviction::sliding_window::SlidingWindowPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1786,7 +1783,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 22,
+      "line": 21,
       "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -2082,69 +2079,6 @@
       "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
       "is_test_block": false,
       "note": "V-01 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "eval/eval_loop.rs",
-      "line": 16,
-      "import": "crate::layers::workspace::",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "eval/eval_loop.rs",
-      "line": 89,
-      "import": "crate::layers::workspace::PrefillWorkspace",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "eval/eval_loop.rs",
-      "line": 639,
-      "import": "crate::layers::workspace::PrefillWorkspace",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "eval/eval_loop.rs",
-      "line": 757,
-      "import": "crate::layers::workspace::PrefillWorkspace",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "eval/eval_loop.rs",
-      "line": 839,
-      "import": "crate::layers::workspace::PrefillWorkspace",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "eval/eviction_hook.rs",
-      "line": 745,
-      "import": "crate::backend::cpu::CpuBackend::new",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L1 (trait inversion 필요)",
-      "is_test_block": true
-    },
-    {
-      "id": "V-??",
-      "file": "eval/eviction_hook.rs",
-      "line": 866,
-      "import": "crate::backend::cpu::CpuBackend::new",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L1 (trait inversion 필요)",
-      "is_test_block": true
     },
     {
       "id": "V-??",
@@ -2525,7 +2459,7 @@
       "id": "V-??",
       "file": "models/weights/phase_aware_swap.rs",
       "line": 32,
-      "import": "crate::profile::op_trace::",
+      "import": "crate::observability::profile::op_trace::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -2652,6 +2586,69 @@
     },
     {
       "id": "V-??",
+      "file": "observability/eval/eval_loop.rs",
+      "line": 16,
+      "import": "crate::layers::workspace::",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "observability/eval/eval_loop.rs",
+      "line": 89,
+      "import": "crate::layers::workspace::PrefillWorkspace",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "observability/eval/eval_loop.rs",
+      "line": 639,
+      "import": "crate::layers::workspace::PrefillWorkspace",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "observability/eval/eval_loop.rs",
+      "line": 757,
+      "import": "crate::layers::workspace::PrefillWorkspace",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "observability/eval/eval_loop.rs",
+      "line": 839,
+      "import": "crate::layers::workspace::PrefillWorkspace",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L3-inference (trait inversion 필요)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "observability/eval/eviction_hook.rs",
+      "line": 745,
+      "import": "crate::backend::cpu::CpuBackend::new",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L1 (trait inversion 필요)",
+      "is_test_block": true
+    },
+    {
+      "id": "V-??",
+      "file": "observability/eval/eviction_hook.rs",
+      "line": 866,
+      "import": "crate::backend::cpu::CpuBackend::new",
+      "rule": "INV-LAYER-004",
+      "kind": "cross-cutting(observability)→L1 (trait inversion 필요)",
+      "is_test_block": true
+    },
+    {
+      "id": "V-??",
       "file": "observability/events.rs",
       "line": 7,
       "import": "crate::pressure::",
@@ -2680,7 +2677,7 @@
     {
       "id": "V-??",
       "file": "pressure/cache_manager.rs",
-      "line": 7,
+      "line": 14,
       "import": "crate::resilience::sys_monitor::SystemMonitor",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
@@ -2689,7 +2686,7 @@
     {
       "id": "V-??",
       "file": "pressure/cache_manager.rs",
-      "line": 671,
+      "line": 674,
       "import": "crate::resilience::sys_monitor::MemoryStats",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
