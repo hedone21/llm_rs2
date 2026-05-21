@@ -69,10 +69,10 @@ impl DegradationEstimator {
     /// Default slopes: all actions map 1:1 (slope=1.0).
     pub fn with_defaults(d_max: f32) -> Self {
         let mut curves = HashMap::new();
-        curves.insert("eviction".to_string(), PiecewiseLinear::linear(1.0));
-        curves.insert("sliding".to_string(), PiecewiseLinear::linear(1.0));
-        curves.insert("kivi".to_string(), PiecewiseLinear::linear(1.0));
-        curves.insert("swift".to_string(), PiecewiseLinear::linear(1.0));
+        curves.insert("kv.eviction".to_string(), PiecewiseLinear::linear(1.0));
+        curves.insert("kv.sliding".to_string(), PiecewiseLinear::linear(1.0));
+        curves.insert("kv.kivi".to_string(), PiecewiseLinear::linear(1.0));
+        curves.insert("weight.skip".to_string(), PiecewiseLinear::linear(1.0));
 
         Self {
             curves,
@@ -100,8 +100,8 @@ impl DegradationEstimator {
     ///   "d_max": 5.0,
     ///   "ema_alpha": 0.1,
     ///   "actions": {
-    ///     "eviction": { "breakpoint": 0.3, "slope_low": 2.0, "slope_high": 8.0 },
-    ///     "kivi": { "breakpoint": 0.05, "slope_low": 10.0, "slope_high": 50.0 }
+    ///     "kv.eviction": { "breakpoint": 0.3, "slope_low": 2.0, "slope_high": 8.0 },
+    ///     "kv.kivi": { "breakpoint": 0.05, "slope_low": 10.0, "slope_high": 50.0 }
     ///   }
     /// }
     /// ```
@@ -219,7 +219,7 @@ mod tests {
     fn test_estimator_defaults() {
         let est = DegradationEstimator::with_defaults(5.0);
         let metric = QcfMetric {
-            action: "eviction".to_string(),
+            action: "kv.eviction".to_string(),
             raw_value: 0.3,
             normalized_value: 0.3,
             per_head: None,
@@ -233,7 +233,7 @@ mod tests {
     fn test_estimator_d_max_clamp() {
         let est = DegradationEstimator::with_defaults(2.0);
         let metric = QcfMetric {
-            action: "eviction".to_string(),
+            action: "kv.eviction".to_string(),
             raw_value: 5.0, // Would give d=5.0 but clamped to 2.0
             normalized_value: 5.0,
             per_head: None,
@@ -261,11 +261,11 @@ mod tests {
     #[test]
     fn test_estimator_custom_curves() {
         let mut curves = HashMap::new();
-        curves.insert("eviction".to_string(), PiecewiseLinear::new(0.3, 2.0, 10.0));
+        curves.insert("kv.eviction".to_string(), PiecewiseLinear::new(0.3, 2.0, 10.0));
 
         let est = DegradationEstimator::new(curves, 5.0, 0.0);
         let metric = QcfMetric {
-            action: "eviction".to_string(),
+            action: "kv.eviction".to_string(),
             raw_value: 0.1, // Below breakpoint: 2.0 * 0.1 = 0.2
             normalized_value: 0.1,
             per_head: None,
@@ -279,7 +279,7 @@ mod tests {
         let mut est = DegradationEstimator::new(
             {
                 let mut m = HashMap::new();
-                m.insert("eviction".to_string(), PiecewiseLinear::linear(2.0));
+                m.insert("kv.eviction".to_string(), PiecewiseLinear::linear(2.0));
                 m
             },
             10.0,
@@ -288,14 +288,14 @@ mod tests {
 
         // Predicted: 2.0 * 0.3 = 0.6
         // Actual: 1.2 → ratio = 1.2/0.6 = 2.0
-        est.update_ema("eviction", 0.3, 1.2);
-        let correction = est.ema_correction("eviction");
+        est.update_ema("kv.eviction", 0.3, 1.2);
+        let correction = est.ema_correction("kv.eviction");
         // EMA: 0.5 * 1.0 + 0.5 * 2.0 = 1.5
         assert!((correction - 1.5).abs() < 1e-5);
 
         // Now estimate with correction
         let metric = QcfMetric {
-            action: "eviction".to_string(),
+            action: "kv.eviction".to_string(),
             raw_value: 0.3,
             normalized_value: 0.3,
             per_head: None,
@@ -311,15 +311,15 @@ mod tests {
         let mut est = DegradationEstimator::new(
             {
                 let mut m = HashMap::new();
-                m.insert("eviction".to_string(), PiecewiseLinear::linear(1.0));
+                m.insert("kv.eviction".to_string(), PiecewiseLinear::linear(1.0));
                 m
             },
             5.0,
             0.0, // No EMA
         );
 
-        est.update_ema("eviction", 0.3, 1.2);
-        assert_eq!(est.ema_correction("eviction"), 1.0); // Unchanged
+        est.update_ema("kv.eviction", 0.3, 1.2);
+        assert_eq!(est.ema_correction("kv.eviction"), 1.0); // Unchanged
     }
 
     #[test]
@@ -332,15 +332,15 @@ mod tests {
             "d_max": 3.0,
             "ema_alpha": 0.2,
             "actions": {
-                "eviction": { "breakpoint": 0.5, "slope_low": 1.5, "slope_high": 5.0 },
-                "kivi": { "breakpoint": 0.1, "slope_low": 10.0, "slope_high": 30.0 }
+                "kv.eviction": { "breakpoint": 0.5, "slope_low": 1.5, "slope_high": 5.0 },
+                "kv.kivi": { "breakpoint": 0.1, "slope_low": 10.0, "slope_high": 30.0 }
             }
         }"#;
         std::fs::write(&path, json).unwrap();
 
         let est = DegradationEstimator::load(path.to_str().unwrap()).unwrap();
         let metric = QcfMetric {
-            action: "eviction".to_string(),
+            action: "kv.eviction".to_string(),
             raw_value: 0.2,
             normalized_value: 0.2,
             per_head: None,
