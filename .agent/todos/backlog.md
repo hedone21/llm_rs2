@@ -54,21 +54,11 @@
 
 ---
 
-## [P2] llm_rs2 lib clippy 회귀 — doc_lazy_continuation 29건 + unsafe pointer 1건 — 2026-05-18 등록 (Phase 4-D 게이트 도중 발견)
-- **Status**: TODO (Phase 4-D scope 외, 게이트 통과 위해 일시 우회)
-- **증상**: `cargo clippy -p llm_rs2 --lib -- -D warnings` 실패. 30개 deny 처리됨.
-- **위치**:
-  - `engine/src/core/qcf/layer_importance.rs:310, 394`
-  - `engine/src/models/weights/async_swap.rs:253`
-  - `engine/src/models/weights/noise_table.rs:627, 750, 754, 784, 939, 954, 962, 966`
-  - `engine/src/models/weights/phase_aware_swap.rs:599`
-  - `engine/src/models/weights/swap_executor.rs:652, 661, 675`
-  - `engine/src/session/chat/repl.rs:156`
-  - `engine/src/session/cli.rs:852, 853, 854, 855, 899, 900, 903, 904, 905`
-  - 1건 `this public function might dereference a raw pointer but is not marked unsafe`
-- **원인**: 최근 PR들이 doc 추가 시 lazy_continuation 회피 미적용. clippy gate가 통과 안 되는 master 상태에서 새 PR 머지가 누적됨.
-- **수정**: `///`의 multi-line continuation을 indent 4-space로 정렬. unsafe pointer는 `unsafe fn` marking 또는 `&self` 변경.
-- **영향**: 4-D 가 sanity gate 일부를 `cargo check --bins`로 좁힘. 본 backlog 해결 후 `cargo clippy --workspace --bins -- -D warnings` 게이트 복원 가능.
+## [RESOLVED] llm_rs2 lib clippy 회귀 — 2026-05-21 종결
+- **Status**: RESOLVED — commit `0e406abc` (2026-05-21)
+- **결과**: `cargo clippy -p llm_rs2 --lib -- -D warnings` 34건 → 0건. 게이트 PASS.
+- **Mechanical 30건**: doc_list_item indent (12), needless_return (3), collapsible_if (3), needless_range_loop (1, cross-array index 본질적이라 함수 단위 #[allow]), useless_format (1), derivable_impls (1), is_multiple_of (1), let_chain (1), let_and_return (1), question_mark (2).
+- **Design 4건**: `#[allow(...)]` silence (구조적 변경 필요) — not_unsafe_ptr_arg_deref (opencl::alloc_alias_weight_buffer), type_complexity (swap_executor::execute_on_slots, layer_importance::build_with_raws), large_enum_variant (ChatKvMode), too_many_arguments (run_qcf_warmup_workflow). 구조적 정리는 별도 sprint에서 검토.
 
 ## [RESOLVED — model issue, not code regression] Qwen2.5-1.5b chat 모드 garbage 출력 — 2026-05-19 확정
 
@@ -385,12 +375,11 @@
   - `engine/tests/spec/inv_layer_baseline.json` 의 unified_qcf.rs → qcf_kv.rs, compute_qcf_swap → compute_qcf_weight_swap 동기화
   - 호출처 일괄 sed: `eval/eviction_hook.rs`, `eval/eval_loop.rs`, `bin/generate.rs`, `session/{ppl/runner,qcf_runtime}.rs`, `models/weights/{decider,mod}.rs`, `profile/quality_metrics.rs`, spec test 5개 파일
 - **Deferred (별 backlog)**:
-  - `DegradationEstimator` action key prefix 정규화 (`kv.*` / `weight.*`) — 호출처 string literal이 다수, ablation/eval 결과 호환성과 별도로 진행
-  - `shared::QcfEstimate.estimates` HashMap key — IPC 메시지라 manager 동시 갱신 필요
-  - 위 두 항목은 본 sprint 범위 밖. 별 backlog 항목으로 분리 권장.
+  - ~~`shared::QcfEstimate.estimates` HashMap key — IPC 메시지라 manager 동시 갱신 필요~~ — **2026-05-21 완료** (commit `3d4e1a09`, action name + IPC wire format 모두 dot prefix 통일).
+  - `DegradationEstimator` default curves key (`eviction`, `sliding`, `kivi`, `swift` — `engine/src/qcf/estimator.rs:71-75`) → `kv.eviction` / `kv.sliding` / `kv.kivi` / `weight.skip` — 추상 카테고리 명명, 다른 의미 layer라 별도 정리. 본 sprint 범위 밖.
 - **검증**: `cargo build --release -p llm_rs2` PASS, lib 160 qcf-related test PASS, spec 660/663 PASS (3 fail = 사전 device-required).
 - **작성일**: 2026-04-27
-- **종결일**: 2026-05-19
+- **종결일**: 2026-05-19 (taxonomy rename) / 2026-05-21 (IPC dot prefix 후속)
 
 ---
 
@@ -575,44 +564,17 @@
 
 > spec/에 정의되어 있지만 코드에 구현되지 않은 항목. 우선순위 순.
 
-## [P1] QcfEstimate 메시지 + RequestQcf 커맨드 구현
-- **Status**: TODO
-- **Sprint**: next
-- **Dependencies**: 없음
-- **Description**: |
-  MSG-014: EngineMessage에 QcfEstimate variant 없음.
-  MSG-036b: EngineCommand에 RequestQcf variant 없음.
-  Manager가 Critical 모드에서 QCF 비용 기반 액션 선택을 못 함.
+## [RESOLVED] QcfEstimate 메시지 + RequestQcf 커맨드 구현 — 2026-05-21 종결
+- **Status**: RESOLVED — 코드 검증 결과 이미 구현됨 (sprint 2026-05-21에서 stale 확인).
+- **Notes**: `shared/src/lib.rs:229,453` (EngineCommand::RequestQcf, EngineMessage::QcfEstimate), `engine/src/resilience/executor.rs:531,1346` (handler 구현). Spec `32-engine-algorithms.md:656`에서도 "구현 완료" 명시.
 
-  필요 구현:
-  1. shared/src/lib.rs — QcfEstimate 구조체 + EngineMessage variant 추가
-  2. shared/src/lib.rs — EngineCommand::RequestQcf variant 추가
-  3. Engine — QCF 계산 후 QcfEstimate 전송 로직
-  4. Manager — Critical 진입 시 RequestQcf Directive 발행 + 1초 타임아웃 수신
-- **Acceptance Criteria**: Manager가 Critical 모드에서 RequestQcf → QcfEstimate 수신 → Lossy 액션 cost 반영
-- **Notes**: 프로토콜 레벨 변경이므로 Architect spec 검토 필요. SEQ-090~098 참조.
+## [RESOLVED] Manager 페이로드 크기 가드 추가 — 2026-05-21 종결 (PROTO-012)
+- **Status**: RESOLVED — commit `1e6e80f6` (2026-05-21)
+- **결과**: `manager/src/channel/{unix_socket,tcp}.rs::read_engine_message()`에 MAX_PAYLOAD_SIZE=64KB 검증 추가. 초과 시 anyhow::bail!로 에러 + 연결 유지.
 
-## [P2] Manager 페이로드 크기 가드 추가
-- **Status**: TODO
-- **Sprint**: next
-- **Dependencies**: 없음
-- **Description**: |
-  PROTO-012: Engine측은 64KB MAX_PAYLOAD 검증 구현 완료.
-  Manager측(unix_socket.rs, tcp.rs)의 read_engine_message()에 페이로드 크기 검증 없음.
-  악의적/버그 Engine이 거대 페이로드를 보내면 OOM 위험.
-- **Acceptance Criteria**: Manager가 64KB 초과 메시지를 거부하고 연결 유지
-- **Notes**: 소규모 변경. manager/src/channel/unix_socket.rs:311, tcp.rs:299.
-
-## [P2] Heartbeat/Response 타임아웃 구현
-- **Status**: TODO
-- **Sprint**: next
-- **Dependencies**: 없음
-- **Description**: |
-  SEQ-087: Manager가 Engine Heartbeat 부재를 감지하지 못함 (권장 3초).
-  SEQ-088: Directive 후 Response 무한 대기 가능 (권장 500ms).
-  Engine 장애 시 Manager가 대응 불가.
-- **Acceptance Criteria**: Heartbeat 3초 미수신 시 Disconnected 전이. Response 500ms 초과 시 타임아웃 처리.
-- **Notes**: 타이밍 상수는 Config로 설정 가능하게.
+## [CANCELLED] Heartbeat/Response 타임아웃 구현 — 2026-05-21 종결 (spec과 backlog 충돌)
+- **Status**: CANCELLED — spec이 "현재 적용하지 않음" 정의와 backlog 충돌. 2026-05-21 stale 확인.
+- **Notes**: `spec/12-protocol-sequences.md:371,375` SEQ-087/088: "Manager는 특정 Heartbeat 주기를 가정하지 않는다" + "현재 Response 타임아웃을 적용하지 않는다" *(MUST)*. spec이 미적용을 정상 동작으로 정의. 구현 필요성 자체가 spec과 모순. 향후 spec 갱신이 선행돼야 backlog 재등록 가능.
 
 ## [P2] KvStreaming 커맨드 정상 구현
 - **Status**: DONE (2026-03-31)
