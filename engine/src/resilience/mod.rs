@@ -1,5 +1,6 @@
 pub mod executor;
 pub mod gpu_self_meter;
+pub mod gpu_yield;
 pub mod manager;
 pub mod proc_self_meter;
 pub mod signal;
