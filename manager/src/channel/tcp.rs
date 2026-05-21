@@ -290,15 +290,27 @@ fn spawn_reader(mut stream: TcpStream, inbox_tx: mpsc::SyncSender<EngineMessage>
     }
 }
 
+/// PROTO-012: spec-defined 64KB cap on a single framed payload. Reject
+/// oversize frames before allocating to keep faulty/malicious peers from
+/// triggering large heap reservations.
+const MAX_PAYLOAD_SIZE: u32 = 64 * 1024;
+
 /// stream에서 length-prefixed JSON으로 `EngineMessage`를 하나 읽는다.
 ///
 /// Wire format: `[4-byte BE u32 length][UTF-8 JSON]`
 fn read_engine_message(stream: &mut TcpStream) -> anyhow::Result<EngineMessage> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
-    let payload_len = u32::from_be_bytes(len_buf) as usize;
+    let payload_len = u32::from_be_bytes(len_buf);
+    if payload_len > MAX_PAYLOAD_SIZE {
+        anyhow::bail!(
+            "payload length {} exceeds MAX_PAYLOAD_SIZE {} (PROTO-012)",
+            payload_len,
+            MAX_PAYLOAD_SIZE
+        );
+    }
 
-    let mut json_buf = vec![0u8; payload_len];
+    let mut json_buf = vec![0u8; payload_len as usize];
     stream.read_exact(&mut json_buf)?;
 
     let msg: EngineMessage = serde_json::from_slice(&json_buf)?;
