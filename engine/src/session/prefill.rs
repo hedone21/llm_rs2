@@ -77,7 +77,7 @@ pub struct PrefillOutput {
     pub kv_caches: Vec<KVCache>,
     pub tokens: Vec<u32>,
     pub start_pos: usize,
-    pub profiler: Option<crate::profile::InferenceProfiler>,
+    pub profiler: Option<crate::observability::profile::InferenceProfiler>,
     pub variance_collector: Option<crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
     pub importance_table_for_swap: Option<crate::qcf::ImportanceTable>,
     pub collector_armed: bool,
@@ -131,8 +131,8 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
     // export) but feeds it via OpProfiler::merge_from_events() instead of
     // the legacy per-op synchronize+wall-clock path.
     let mut profiler = if args.profile || args.profile_events {
-        Some(crate::profile::InferenceProfiler::new(
-            crate::profile::ProfileConfig {
+        Some(crate::observability::profile::InferenceProfiler::new(
+            crate::observability::profile::ProfileConfig {
                 score_snapshot_interval: args.profile_interval,
                 track_per_head: args.profile_per_head,
                 enabled_probes: args.profile_probes.split(',').map(String::from).collect(),

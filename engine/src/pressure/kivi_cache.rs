@@ -800,8 +800,8 @@ impl KiviCache {
     /// - **GPU mode** or empty residual: returns a bits-based proxy
     ///   (Q2=0.30, Q4=0.10, Q8=0.03, F16=0.0).
     pub fn estimate_dryrun_qcf(&self) -> f32 {
-        let _t = crate::profile::quality_metrics::Timer::start(
-            &crate::profile::quality_metrics::QCF_KV_DRYRUN,
+        let _t = crate::observability::profile::quality_metrics::Timer::start(
+            &crate::observability::profile::quality_metrics::QCF_KV_DRYRUN,
         );
         // bits=16 means unquantized, no degradation
         if self.bits == 16 {

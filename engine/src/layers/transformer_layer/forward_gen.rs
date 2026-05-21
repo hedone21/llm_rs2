@@ -137,14 +137,14 @@ impl TransformerLayer {
         // hook 미등록 시 zero-overhead (atomic load 1회).
         macro_rules! tr_start {
             ($kind:ident) => {
-                crate::profile::op_trace::start_op(crate::profile::op_trace::OpKind::$kind)
+                crate::observability::profile::op_trace::start_op(crate::observability::profile::op_trace::OpKind::$kind)
             };
         }
         macro_rules! tr_record {
             ($t:expr, $kind:ident) => {
-                crate::profile::op_trace::record(
+                crate::observability::profile::op_trace::record(
                     $t,
-                    crate::profile::op_trace::OpKind::$kind,
+                    crate::observability::profile::op_trace::OpKind::$kind,
                     backend,
                     is_gpu,
                 )

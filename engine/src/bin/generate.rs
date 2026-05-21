@@ -84,9 +84,9 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     // Sprint E forward_gen op-tracer: install atexit hook so the trace
     // dumps even on Ctrl+C / early-return paths. No-op when env unset.
-    llm_rs2::profile::op_trace::install_atexit_once();
+    llm_rs2::observability::profile::op_trace::install_atexit_once();
     // Quality-cost profiler: gated by LLM_RS2_PROFILE_QUALITY=1.
-    llm_rs2::profile::quality_metrics::install_atexit_once();
+    llm_rs2::observability::profile::quality_metrics::install_atexit_once();
     // T0: process start, before CLI parsing or any allocation.
     rss_trace("start");
     io_trace("start");
@@ -1382,8 +1382,8 @@ fn main() -> anyhow::Result<()> {
                         args.swap_phase_aware_max_chunks_per_token
                     );
                 }
-                llm_rs2::profile::op_trace::set_phase_hook(
-                    phase_dispatcher.clone() as Arc<dyn llm_rs2::profile::op_trace::PhaseHook>
+                llm_rs2::observability::profile::op_trace::set_phase_hook(
+                    phase_dispatcher.clone() as Arc<dyn llm_rs2::observability::profile::op_trace::PhaseHook>
                 );
                 phase_aware_swap_dispatcher = Some(phase_dispatcher);
             } else if args.swap_intra_forward || args.swap_layer_immediate {
@@ -1921,8 +1921,8 @@ fn main() -> anyhow::Result<()> {
 
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
-            let _decode_t = llm_rs2::profile::quality_metrics::Timer::start(
-                &llm_rs2::profile::quality_metrics::DECODE_TOTAL,
+            let _decode_t = llm_rs2::observability::profile::quality_metrics::Timer::start(
+                &llm_rs2::observability::profile::quality_metrics::DECODE_TOTAL,
             );
 
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
@@ -2591,13 +2591,13 @@ fn main() -> anyhow::Result<()> {
                                     );
                                 }
                                 if let Some(ref mut p) = profiler {
-                                    p.on_eviction(llm_rs2::profile::EvictionEvent {
+                                    p.on_eviction(llm_rs2::observability::profile::EvictionEvent {
                                         step: decode_token_index,
                                         policy: args.eviction_policy().to_string(),
                                         before_len: r.new_pos + r.tokens_removed,
                                         after_len: r.new_pos,
                                         evicted_count: r.tokens_removed,
-                                        partition: llm_rs2::profile::PartitionInfo {
+                                        partition: llm_rs2::observability::profile::PartitionInfo {
                                             prefix_end: actual_protected_prefix,
                                             hh_count: 0,
                                             recent_start: r.new_pos,
@@ -3321,7 +3321,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(ref profiler) = profiler {
         profiler.ops.print_report();
 
-        let metadata = llm_rs2::profile::ProfileMetadata {
+        let metadata = llm_rs2::observability::profile::ProfileMetadata {
             model: args.model_path.clone(),
             backend: args.backend.clone(),
             eviction_policy: args.eviction_policy().to_string(),
@@ -3337,7 +3337,7 @@ fn main() -> anyhow::Result<()> {
 
     // 6.6. Export --cuda-profile aggregate if enabled.
     // Independent of the generic `profiler` above (which lives in
-    // `llm_rs2::profile::ops::OpProfiler` and targets OpenCL events).
+    // `llm_rs2::observability::profile::ops::OpProfiler` and targets OpenCL events).
     #[cfg(feature = "cuda-embedded")]
     if args.cuda_profile
         && let Some(cuda_be) = backend
@@ -3392,7 +3392,7 @@ fn main() -> anyhow::Result<()> {
         // Sprint E: flush the forward_gen op-tracer right after the Decode
         // summary so the per-op breakdown sits next to the headline TBT in
         // the log (atexit will fire too, but is moot once we already dumped).
-        llm_rs2::profile::op_trace::dump_and_reset();
+        llm_rs2::observability::profile::op_trace::dump_and_reset();
         if forward_ms_values.len() >= 2 {
             let tail = &forward_ms_values[1..];
             let avg_tail: f64 = tail.iter().sum::<f64>() / tail.len() as f64;

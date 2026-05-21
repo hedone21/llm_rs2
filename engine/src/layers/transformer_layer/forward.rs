@@ -14,7 +14,7 @@ fn warn_gpu_fallback_once(
     kv_dtype: crate::buffer::DType,
     head_dim: usize,
     reason: &'static str,
-    profiler: Option<&mut crate::profile::ops::PrefillOpProfiler>,
+    profiler: Option<&mut crate::observability::profile::ops::PrefillOpProfiler>,
 ) {
     let dtype_str = format!("{:?}", kv_dtype);
     let key = (dtype_str.clone(), head_dim, reason);
@@ -60,7 +60,7 @@ impl TransformerLayer {
         prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
         layer_idx: usize,
         mut variance_collector: Option<&mut crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
-        mut profiler: Option<&mut crate::profile::ops::PrefillOpProfiler>,
+        mut profiler: Option<&mut crate::observability::profile::ops::PrefillOpProfiler>,
     ) -> Result<()> {
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
@@ -73,7 +73,7 @@ impl TransformerLayer {
         // Safety: `profiler` outlives this function and is never aliased concurrently.
         let profiler_ptr = profiler
             .as_mut()
-            .map(|p| *p as *mut crate::profile::ops::PrefillOpProfiler);
+            .map(|p| *p as *mut crate::observability::profile::ops::PrefillOpProfiler);
 
         // SAFETY: single-threaded forward pass; pointer is valid for function lifetime.
         macro_rules! pf {
@@ -1301,7 +1301,7 @@ impl TransformerLayer {
 mod tests {
     use super::*;
     use crate::buffer::DType;
-    use crate::profile::ops::PrefillOpProfiler;
+    use crate::observability::profile::ops::PrefillOpProfiler;
 
     /// Verify that warn_gpu_fallback_once increments cpu_fallback_count every call
     /// (the dedupe is only for stderr, not for the profiler counter).

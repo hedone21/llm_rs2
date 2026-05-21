@@ -29,7 +29,7 @@ use crate::models::weights::async_swap::{AsyncSwapDispatcher, ChunkDispatchJob, 
 use crate::models::weights::secondary_mmap::SecondaryMmap;
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
 use crate::models::weights::swap_executor::SwapExecutor;
-use crate::profile::op_trace::{DdrPhase, OpKind, PhaseHook};
+use crate::observability::profile::op_trace::{DdrPhase, OpKind, PhaseHook};
 use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, VecDeque};

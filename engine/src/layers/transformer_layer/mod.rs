@@ -18,7 +18,7 @@ use crate::layers::tensor_partition::PartitionContext;
 use crate::memory::host::shared::SharedBuffer;
 
 // Re-export OpProfiler from its canonical location for backward compatibility.
-pub use crate::profile::ops::OpProfiler;
+pub use crate::observability::profile::ops::OpProfiler;
 
 /// Update KV cache with K/V tensors, handling GPU→CPU readback when needed.
 ///
@@ -387,8 +387,8 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub is_last_layer: bool,
 }
 
-// OpProfiler has been moved to crate::profile::ops.
-// Re-exported via `pub use crate::profile::ops::OpProfiler;` at the top of this file.
+// OpProfiler has been moved to crate::observability::profile::ops.
+// Re-exported via `pub use crate::observability::profile::ops::OpProfiler;` at the top of this file.
 
 // ═══════════════════════════════════════════════════════════════════
 // Phase 1: Verify attention scores are post-softmax probabilities

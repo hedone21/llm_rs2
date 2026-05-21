@@ -155,7 +155,7 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
     /// Optional per-op profiler.
-    pub profiler: Option<&'a mut crate::profile::ops::OpProfiler>,
+    pub profiler: Option<&'a mut crate::observability::profile::ops::OpProfiler>,
     /// Optional SWIFT skip configuration for layer skipping.
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Optional importance collector for Layer Skip QCF.
@@ -1498,7 +1498,7 @@ impl TransformerModel {
         // routed through `forward_prefill` and is not instrumented by the
         // tracer, so we skip it here. No-op when the env gate is off.
         if seq_len == 1 {
-            crate::profile::op_trace::note_forward_call();
+            crate::observability::profile::op_trace::note_forward_call();
         }
 
         // 1. Embedding lookup
@@ -1529,7 +1529,7 @@ impl TransformerModel {
         // tracer macros are no-ops when the env gate is off.
         let is_gpu_for_trace = backend.is_gpu();
         let tr_emb = if seq_len == 1 {
-            crate::profile::op_trace::start()
+            crate::observability::profile::op_trace::start()
         } else {
             None
         };
@@ -1540,9 +1540,9 @@ impl TransformerModel {
             backend.scale(&mut x, scale)?;
         }
         if seq_len == 1 {
-            crate::profile::op_trace::record(
+            crate::observability::profile::op_trace::record(
                 tr_emb,
-                crate::profile::op_trace::OpKind::Embedding,
+                crate::observability::profile::op_trace::OpKind::Embedding,
                 backend,
                 is_gpu_for_trace,
             );
@@ -1905,7 +1905,7 @@ impl TransformerModel {
 
         // 3. Final Norm
         let tr_fn = if seq_len == 1 {
-            crate::profile::op_trace::start()
+            crate::observability::profile::op_trace::start()
         } else {
             None
         };
@@ -1916,9 +1916,9 @@ impl TransformerModel {
             is_gemma3,
         )?;
         if seq_len == 1 {
-            crate::profile::op_trace::record(
+            crate::observability::profile::op_trace::record(
                 tr_fn,
-                crate::profile::op_trace::OpKind::FinalNorm,
+                crate::observability::profile::op_trace::OpKind::FinalNorm,
                 backend,
                 is_gpu_for_trace,
             );
@@ -1926,7 +1926,7 @@ impl TransformerModel {
 
         // 4. Head — optionally only compute last position's logits to save VRAM
         let tr_lh = if seq_len == 1 {
-            crate::profile::op_trace::start()
+            crate::observability::profile::op_trace::start()
         } else {
             None
         };
@@ -1956,9 +1956,9 @@ impl TransformerModel {
             })?;
         }
         if seq_len == 1 {
-            crate::profile::op_trace::record(
+            crate::observability::profile::op_trace::record(
                 tr_lh,
-                crate::profile::op_trace::OpKind::LmHead,
+                crate::observability::profile::op_trace::OpKind::LmHead,
                 backend,
                 is_gpu_for_trace,
             );

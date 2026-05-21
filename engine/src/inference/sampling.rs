@@ -129,7 +129,7 @@ pub fn sample(
 /// Uses f64 arithmetic to avoid precision loss when accumulating over many tokens.
 /// Formula: log_softmax(x)_i = (x_i - max) - log(sum(exp(x_j - max)))
 pub fn compute_log_prob(logits: &[f32], token_id: u32, vocab_size: usize) -> f64 {
-    let _t = crate::profile::quality_metrics::Timer::start(&crate::profile::quality_metrics::NLL);
+    let _t = crate::observability::profile::quality_metrics::Timer::start(&crate::observability::profile::quality_metrics::NLL);
     let logits = &logits[..vocab_size];
     let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let log_sum_exp: f64 = logits

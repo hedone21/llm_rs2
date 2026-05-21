@@ -19,7 +19,7 @@ use crate::backend::Backend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kv_cache::KVCache;
-use crate::profile::{self, EvictionEvent, PartitionInfo};
+use crate::observability::profile::{self, EvictionEvent, PartitionInfo};
 use crate::session::cli::Args;
 
 pub struct AutoEvictionCtx<'a> {
@@ -31,7 +31,7 @@ pub struct AutoEvictionCtx<'a> {
     pub score_accumulator: &'a mut Option<AttentionScoreAccumulator>,
     pub d2o_layer_ratios: &'a Option<Vec<(f32, f32)>>,
     pub backend: &'a Arc<dyn Backend>,
-    pub profiler: &'a mut Option<crate::profile::InferenceProfiler>,
+    pub profiler: &'a mut Option<crate::observability::profile::InferenceProfiler>,
     pub position_birth_step: &'a mut Vec<usize>,
     pub actual_protected_prefix: usize,
     pub decode_token_index: usize,
