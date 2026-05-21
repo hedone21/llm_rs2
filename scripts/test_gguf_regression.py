@@ -113,7 +113,7 @@ def run_regression():
 
     features = [
         ("Baseline", lambda m: f"-m {m} -b opencl", None),
-        ("KIVI-Q2", lambda m: f"-m {m} -b opencl --kivi --kivi-bits 2", None),
+        ("KIVI-Q2", lambda m: f"-m {m} -b opencl --kv-mode kivi --kv-kivi-bits 2", None),
         ("SwitchHW", lambda m: f"-m {m} -b opencl --resilience-prealloc-switch --enable-resilience --resilience-transport tcp:{TCP}",
          "--command SwitchHw --device cpu"),
         ("TensPart", lambda m: f"-m {m} -b opencl --tensor-partition 0.5", None),

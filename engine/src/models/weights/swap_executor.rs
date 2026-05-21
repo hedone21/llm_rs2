@@ -47,18 +47,18 @@ fn force_every_tick_enabled() -> bool {
 use anyhow::Result;
 use llm_shared::DtypeTag;
 
-use crate::buffer::shared_buffer::SharedBuffer;
-use crate::core::backend::{Backend, GpuEvent};
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
-use crate::core::tensor::Tensor;
+use crate::backend::{Backend, GpuEvent};
+use crate::buffer::{Buffer, DType};
 use crate::layers::transformer_layer::TransformerLayer;
+use crate::memory::Memory;
+use crate::memory::host::shared::SharedBuffer;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::async_swap::AsyncSwapDispatcher;
 use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
+use crate::tensor::Tensor;
 
 /// Errors surfaced by `SwapExecutor::execute`.
 #[derive(Debug)]
@@ -289,8 +289,10 @@ pub struct SwapExecutor<'a> {
     /// calling `cuMemAlloc` for each weight buffer. The background
     /// allocator thread refills the pool to keep the depth stable.
     /// Falls back to the regular bg_fetch path if the pool is exhausted.
+    ///
+    /// Stored as `Arc<dyn WeightStagingPool>` (Migration Step 3-B DIP).
     #[cfg(feature = "cuda-embedded")]
-    pub layer_pool: Option<Arc<crate::models::weights::layer_object_pool::LayerObjectPool>>,
+    pub layer_pool: Option<Arc<dyn crate::layers::staging_pool::WeightStagingPool>>,
 
     /// LISWAP-8 Hammer D: registered mmap region for alias-only swap.
     /// When `Some` and `LLMRS_SWAP_MMAP_ALIAS=1` is set, weights are
@@ -368,13 +370,13 @@ impl<'a> SwapExecutor<'a> {
         self
     }
 
-    /// LISWAP-8 Phase B: attach a `LayerObjectPool` so the BG fetch path
+    /// LISWAP-8 Phase B: attach a `WeightStagingPool` so the BG fetch path
     /// reuses pre-allocated layer buffers instead of calling `cuMemAlloc`
     /// on the dispatch thread. Activated by `LLMRS_SWAP_LAYER_POOL=1` env.
     #[cfg(feature = "cuda-embedded")]
     pub fn with_layer_pool(
         mut self,
-        pool: Arc<crate::models::weights::layer_object_pool::LayerObjectPool>,
+        pool: Arc<dyn crate::layers::staging_pool::WeightStagingPool>,
     ) -> Self {
         self.layer_pool = Some(pool);
         self
@@ -386,7 +388,7 @@ impl<'a> SwapExecutor<'a> {
     #[cfg(feature = "cuda-embedded")]
     pub fn with_mmap_registration(
         mut self,
-        registration: Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+        registration: Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,
     ) -> Self {
         self.mmap_registration = Some(registration);
         self
@@ -802,7 +804,7 @@ impl<'a> SwapExecutor<'a> {
                 // registration is attached and the env is set.
                 #[cfg(feature = "cuda-embedded")]
                 let mmap_reg: Option<
-                    Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+                    Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,
                 > = if mmap_alias_active {
                     self.mmap_registration.clone()
                 } else {
@@ -1639,11 +1641,11 @@ impl<'a> SwapExecutor<'a> {
         let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
             Arc::new(SharedBuffer::from_vec(owned, info.dtype))
         } else {
-            Arc::new(
-                crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
-                    secondary, data, info.dtype,
-                ),
-            )
+            Arc::new(crate::memory::host::mmap::MmapBuffer::borrow(
+                data,
+                info.dtype,
+                secondary.clone(),
+            ))
         };
 
         let cpu_backend: Arc<dyn Backend> =
@@ -1662,7 +1664,7 @@ impl<'a> SwapExecutor<'a> {
         layer_idx: usize,
         subname: &str,
         info: &crate::models::weights::secondary_mmap::SecondaryTensorInfo,
-        shape: &crate::core::shape::Shape,
+        shape: &crate::shape::Shape,
     ) -> Result<Option<Tensor>, SwapError> {
         // Only the Rpcmem variant carries a per-layer rpcmem region.
         let SecondaryMmap::Rpcmem(rpc) = secondary.as_ref() else {
@@ -1992,11 +1994,11 @@ impl<'a> SwapExecutor<'a> {
             Arc::new(SharedBuffer::from_vec(owned, info.dtype))
         } else {
             // Borrow path (AUF AOS / no permutation): zero-copy mmap borrow.
-            Arc::new(
-                crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
-                    secondary, data, info.dtype,
-                ),
-            )
+            Arc::new(crate::memory::host::mmap::MmapBuffer::borrow(
+                data,
+                info.dtype,
+                secondary.clone(),
+            ))
         };
         let us_wrap = t_wrap.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
@@ -2214,13 +2216,15 @@ impl<'a> SwapExecutor<'a> {
             })?;
         }
         let dtype = cpu_tensor.dtype();
-        let buf: Arc<dyn crate::core::buffer::Buffer> =
-            Arc::new(crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
+        let mmap_guard: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
+        let buf: Arc<dyn crate::buffer::Buffer> = Arc::new(
+            crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
                 guard,
                 size,
                 dtype,
-                Some(Arc::clone(secondary)),
-            ));
+                Some(mmap_guard),
+            ),
+        );
         let tensor = Tensor::new(cpu_tensor.shape().clone(), buf, Arc::clone(&self.backend));
         Ok(Some(tensor))
     }
@@ -2543,9 +2547,9 @@ pub(crate) fn build_layer_via_mmap_alias_standalone(
     slot: &LayerSlot,
     layer_idx: usize,
     backend: &Arc<dyn Backend>,
-    registration: &Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>,
+    registration: &Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,
 ) -> Result<(TransformerLayer, GpuEvent), SwapError> {
-    use crate::buffer::cuda_mmap_alias_buffer::CudaMmapAliasBuffer;
+    use crate::memory::cuda::mmap::CudaMmapAliasBuffer;
 
     let old = slot.load_weights();
 
@@ -2796,11 +2800,11 @@ fn materialise_cpu_tensor_standalone(
     let cpu_buf: Arc<dyn Buffer> = if let Some(owned) = permuted_bytes {
         Arc::new(SharedBuffer::from_vec(owned, info.dtype))
     } else {
-        Arc::new(
-            crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer::new(
-                secondary, data, info.dtype,
-            ),
-        )
+        Arc::new(crate::memory::host::mmap::MmapBuffer::borrow(
+            data,
+            info.dtype,
+            secondary.clone(),
+        ))
     };
 
     let cpu_backend: Arc<dyn Backend> =
@@ -2815,7 +2819,7 @@ fn try_alias_materialise_standalone(
     layer_idx: usize,
     subname: &str,
     info: &crate::models::weights::secondary_mmap::SecondaryTensorInfo,
-    shape: &crate::core::shape::Shape,
+    shape: &crate::shape::Shape,
     backend: &Arc<dyn Backend>,
 ) -> Result<Option<Tensor>, SwapError> {
     let SecondaryMmap::Rpcmem(rpc) = secondary.as_ref() else {
@@ -2986,19 +2990,18 @@ mod tests {
     // implies every backing buffer is uniquely owned by the dispatcher and
     // its destructor will run on `drop(layer)`.
 
-    use crate::buffer::shared_buffer::SharedBuffer;
-    use crate::core::backend::Backend;
-    use crate::core::shape::Shape;
+    use crate::backend::Backend;
     use crate::layers::transformer_layer::TransformerLayer;
+    use crate::memory::host::shared::SharedBuffer;
     use crate::models::weights::LayerSlot;
+    use crate::shape::Shape;
     use std::sync::Arc;
 
     fn build_test_layer(be: &Arc<dyn Backend>) -> TransformerLayer {
         // Build a minimal `TransformerLayer` whose weight tensors each carry
         // a fresh `Arc<dyn Buffer>` so we can probe refcounts after a swap.
         let make = |sz: usize| -> Tensor {
-            let buf: Arc<dyn crate::core::buffer::Buffer> =
-                Arc::new(SharedBuffer::new(sz, DType::F32));
+            let buf: Arc<dyn crate::buffer::Buffer> = Arc::new(SharedBuffer::new(sz, DType::F32));
             Tensor::new(Shape::new(vec![sz / 4]), buf, be.clone())
         };
         TransformerLayer {
@@ -3093,7 +3096,7 @@ mod tests {
         let be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
         let layer = build_test_layer(&be);
         // Capture weak refs to the 7 weight buffers.
-        let weaks: Vec<Weak<dyn crate::core::buffer::Buffer>> = [
+        let weaks: Vec<Weak<dyn crate::buffer::Buffer>> = [
             &layer.wq,
             &layer.wk,
             &layer.wv,

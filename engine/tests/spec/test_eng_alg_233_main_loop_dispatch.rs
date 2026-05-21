@@ -15,15 +15,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
-use llm_rs2::core::memory::Memory;
-use llm_rs2::core::shape::Shape;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::buffer::DType;
 use llm_rs2::layers::transformer_layer::TransformerLayer;
+use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::weights::{IncrementalSwapPlan, LayerSlot};
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
 
 fn cpu_be() -> Arc<dyn Backend> {
     Arc::new(CpuBackend::new())

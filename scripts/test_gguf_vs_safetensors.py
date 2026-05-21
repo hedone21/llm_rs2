@@ -87,7 +87,7 @@ TESTS = []
 st_base = f"--model-path {ST_MODEL} -b opencl"
 TESTS += [
     ("ST-F16 | Baseline",       f"{st_base}",                                          None),
-    ("ST-F16 | KIVI Q2",        f"{st_base} --kivi --kivi-bits 2",                     None),
+    ("ST-F16 | KIVI Q2",        f"{st_base} --kv-mode kivi --kv-kivi-bits 2",          None),
     ("ST-F16 | SwitchHW→CPU",   f"{st_base} --resilience-prealloc-switch --enable-resilience --resilience-transport tcp:{TCP}",
                                  "--command SwitchHw --device cpu"),
     ("ST-F16 | TensorPart 0.5", f"{st_base} --tensor-partition 0.5",                   None),
@@ -97,7 +97,7 @@ TESTS += [
 gguf_base = f"--model-path {GGUF_MODEL} -b opencl"
 TESTS += [
     ("GGUF-Q4 | Baseline",       f"{gguf_base}",                                        None),
-    ("GGUF-Q4 | KIVI Q2",        f"{gguf_base} --kivi --kivi-bits 2",                   None),
+    ("GGUF-Q4 | KIVI Q2",        f"{gguf_base} --kv-mode kivi --kv-kivi-bits 2",        None),
     ("GGUF-Q4 | SwitchHW→CPU",   f"{gguf_base} --resilience-prealloc-switch --enable-resilience --resilience-transport tcp:{TCP}",
                                    "--command SwitchHw --device cpu"),
     ("GGUF-Q4 | TensorPart 0.5", f"{gguf_base} --tensor-partition 0.5",                 None),

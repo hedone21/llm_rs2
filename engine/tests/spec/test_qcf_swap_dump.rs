@@ -10,9 +10,9 @@
 //!
 //! Spec: Phase 1 (zazzy-herding-bonbon), ENG-ALG-215, ENG-ALG-217.
 
-use llm_rs2::core::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 use llm_rs2::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
 use llm_rs2::models::weights::QuantNoiseTable;
+use llm_rs2::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -24,6 +24,8 @@ fn make_importance(entries: Vec<(usize, f32, f32)>) -> ImportanceTable {
             sublayer: SubLayer::Full,
             importance: imp,
             opr,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         })
         .collect();
     ImportanceTable::from_entries(entries)
@@ -79,6 +81,10 @@ fn test_dump_schema_round_trip() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -163,6 +169,10 @@ fn test_ratio_zero_swap_count_zero() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -244,6 +254,10 @@ fn test_ratio_033_skip_count_5_for_16l() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -326,6 +340,10 @@ fn test_ratio_one_caps_at_n_minus_2() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -370,6 +388,10 @@ fn test_nan_epsilon_excluded() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -431,6 +453,10 @@ fn test_importance_noise_in_dump() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -530,6 +556,10 @@ fn test_ppl_none_serializes_as_null() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -631,6 +661,10 @@ fn test_eval_ll_output_some_included_in_json() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -720,6 +754,10 @@ fn test_eval_ll_output_none_serializes_as_null() {
         dpllm_epsilon_multi: None,
         dpllm_epsilon_abs: None,
         dpllm_epsilon_qcf: None,
+        direct_attn_f4: None,
+        direct_attn_f5: None,
+        direct_attn_f5_decode_only: None,
+        direct_attn_f5_prefill_decode: None,
     };
 
     let v = dump_and_parse(&ctx);

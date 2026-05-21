@@ -23,7 +23,7 @@
 /// 동작 (false / Err)으로 trait bound를 만족하므로 변경 없이 컴파일된다.
 #[test]
 fn qnn_211_backend_trait_has_layer_graph_methods() {
-    use llm_rs2::core::backend::Backend;
+    use llm_rs2::backend::Backend;
 
     fn assert_has_methods<B: Backend>() {}
     // CPU backend has trait default impl.
@@ -35,7 +35,7 @@ fn qnn_211_backend_trait_has_layer_graph_methods() {
 /// - `execute_layer_graph(...)` → Err.
 #[test]
 fn qnn_211_default_impl_negative() {
-    use llm_rs2::core::backend::Backend;
+    use llm_rs2::backend::Backend;
 
     let cpu = llm_rs2::backend::cpu::CpuBackend::new();
     assert!(
@@ -52,7 +52,7 @@ fn qnn_211_default_impl_negative() {
 #[cfg(feature = "qnn")]
 #[test]
 fn qnn_212_supports_layer_graph_idempotent() {
-    use llm_rs2::core::backend::Backend;
+    use llm_rs2::backend::Backend;
 
     let be = match llm_rs2::backend::qnn_oppkg::QnnOppkgBackend::new() {
         Ok(b) => b,

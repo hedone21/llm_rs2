@@ -31,7 +31,7 @@
 #[test]
 fn compile_check_qnn_backend_trait_bound() {
     // 제네릭 함수 — `B: Backend` bound가 컴파일 타임에 강제된다.
-    fn assert_backend_bound<B: llm_rs2::core::backend::Backend>() {}
+    fn assert_backend_bound<B: llm_rs2::backend::Backend>() {}
     assert_backend_bound::<llm_rs2::backend::qnn_oppkg::QnnOppkgBackend>();
 }
 
@@ -42,7 +42,7 @@ fn compile_check_qnn_backend_trait_bound() {
 #[cfg(feature = "qnn")]
 #[test]
 fn supports_layer_graph_idempotent() {
-    use llm_rs2::core::backend::Backend;
+    use llm_rs2::backend::Backend;
 
     let be = match llm_rs2::backend::qnn_oppkg::QnnOppkgBackend::new() {
         Ok(b) => b,

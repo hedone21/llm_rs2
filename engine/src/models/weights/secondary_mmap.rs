@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::buffer::DType;
+use crate::buffer::DType;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::{GgufFile, ggml_type_to_dtype, tensor_byte_size};
 
@@ -418,6 +418,25 @@ impl std::fmt::Debug for SecondaryMmap {
     }
 }
 
+// INV-143: SecondaryMmap can act as the lifetime anchor for MmapBuffer borrows
+// against its underlying mmap pages.
+impl crate::memory::host::mmap::MmapKeepAlive for SecondaryMmap {}
+
+// Step 3-E (V-09): L2 memory adapters consume the secondary as
+// `Arc<dyn SecondaryMmapBytes>` rather than the concrete `SecondaryMmap`.
+// The enum dispatch + Rpcmem rejection lives here so L2 stays agnostic.
+impl crate::memory::secondary::SecondaryMmapBytes for SecondaryMmap {
+    fn raw_bytes(&self) -> anyhow::Result<&[u8]> {
+        match self {
+            SecondaryMmap::Gguf(g) => Ok(g.gguf.mmap_data()),
+            SecondaryMmap::Auf(a) => Ok(a.view.raw_bytes()),
+            SecondaryMmap::Rpcmem(_) => Err(anyhow::anyhow!(
+                "SecondaryMmap::Rpcmem does not back a single contiguous mmap region"
+            )),
+        }
+    }
+}
+
 impl SecondaryMmap {
     /// Fetch a layer's tensor descriptor by subname (e.g. "attn_q.weight").
     /// Returns `None` if the layer is out of range or the tensor is missing.
@@ -670,7 +689,7 @@ pub fn open_secondary_with_backend(
     primary_gguf: &GgufFile,
     secondary_dtype_choice: SecondaryDtypeChoice,
     secondary_layout_choice: SecondaryLayoutChoice,
-    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> Result<SecondaryMmap, LoadError> {
     // AUF or non-rpcmem backend → standard path.
     if is_auf_path(path) || !backend_supports_rpcmem_secondary(backend) {
@@ -703,7 +722,7 @@ pub fn open_secondary_with_backend(
 /// `pub(crate)` since W-AUF-2 — `resolve_secondary` consults the same predicate
 /// when deciding whether to promote an AUF self-secondary to the RpcMem variant.
 pub(crate) fn backend_supports_rpcmem_secondary(
-    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> bool {
     let name = backend.name();
     name.contains("QNN OpPackage") || name.contains("qnn_oppkg")
@@ -721,7 +740,7 @@ pub(crate) fn try_promote_auf_self_secondary_to_rpcmem(
     view: std::sync::Arc<AufView>,
     layer_index: Vec<LayerTensorSlice>,
     diag_source_path: PathBuf,
-    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> Option<SecondaryMmap> {
     if !backend_supports_rpcmem_secondary(backend) {
         return None;
@@ -766,7 +785,7 @@ fn try_open_rpcmem_secondary(
     path: &Path,
     primary_config: &ModelConfig,
     primary_gguf: &GgufFile,
-    backend: &std::sync::Arc<dyn crate::core::backend::Backend>,
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> Result<SecondaryMmap, LoadError> {
     #[cfg(all(feature = "qnn", target_os = "android"))]
     {
@@ -1128,7 +1147,7 @@ mod tests {
     fn auf_dtype_to_engine_round_trip() {
         use super::auf_dtype_to_engine;
         use crate::auf::tensor_index::TensorDType;
-        use crate::core::buffer::DType;
+        use crate::buffer::DType;
         assert_eq!(
             auf_dtype_to_engine(TensorDType::Q4_0.as_u32()),
             Some(DType::Q4_0)

@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::DType;
-use llm_rs2::core::tensor::Tensor;
+use llm_rs2::backend::Backend;
+use llm_rs2::buffer::DType;
+use llm_rs2::tensor::Tensor;
 
 /// `Tensor::backend()` must return the same `Arc<dyn Backend>` that was
 /// passed at construction. This is the contract `tensor_partition.rs` relies
@@ -22,11 +22,11 @@ use llm_rs2::core::tensor::Tensor;
 #[test]
 fn tensor_backend_returns_construction_backend() {
     use llm_rs2::backend::cpu::common::CpuBackendCommon;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::shape::Shape;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::shape::Shape;
 
     let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackendCommon);
-    let buf: Arc<dyn llm_rs2::core::buffer::Buffer> = Arc::new(SharedBuffer::new(64, DType::F32));
+    let buf: Arc<dyn llm_rs2::buffer::Buffer> = Arc::new(SharedBuffer::new(64, DType::F32));
     let t = Tensor::new(Shape::new(vec![16]), buf, cpu_be.clone());
 
     assert!(
@@ -49,8 +49,8 @@ fn tensor_backend_returns_construction_backend() {
 fn map_weights_for_cpu_retags_loader_backend_to_gpu_after_in_place_map() {
     use llm_rs2::backend::cpu::common::CpuBackendCommon;
     use llm_rs2::backend::opencl::OpenCLBackend;
-    use llm_rs2::buffer::unified_buffer::UnifiedBuffer;
-    use llm_rs2::core::shape::Shape;
+    use llm_rs2::memory::opencl::unified::UnifiedBuffer;
+    use llm_rs2::shape::Shape;
 
     let opencl = match OpenCLBackend::new() {
         Ok(b) => b,
@@ -68,7 +68,7 @@ fn map_weights_for_cpu_retags_loader_backend_to_gpu_after_in_place_map() {
     // tensor was tagged with the CPU loader backend (because `OpenCLBackend
     // ::copy_from` returns `Tensor::new(... src.backend().clone())`).
     let ub = UnifiedBuffer::new(queue, 4096, DType::F32).expect("UnifiedBuffer::new");
-    let buf: Arc<dyn llm_rs2::core::buffer::Buffer> = Arc::new(ub);
+    let buf: Arc<dyn llm_rs2::buffer::Buffer> = Arc::new(ub);
     let cpu_tagged = Tensor::new(Shape::new(vec![1024]), buf.clone(), cpu_be.clone());
 
     // Sanity: the tensor's buffer is GPU-resident (has `cl_mem`) but its
@@ -118,11 +118,11 @@ fn map_weights_for_cpu_retags_loader_backend_to_gpu_after_in_place_map() {
 #[test]
 fn cpu_loaded_tensor_keeps_cpu_backend_against_same_backend_check() {
     use llm_rs2::backend::cpu::common::CpuBackendCommon;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::shape::Shape;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::shape::Shape;
 
     let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackendCommon);
-    let buf: Arc<dyn llm_rs2::core::buffer::Buffer> = Arc::new(SharedBuffer::new(64, DType::F32));
+    let buf: Arc<dyn llm_rs2::buffer::Buffer> = Arc::new(SharedBuffer::new(64, DType::F32));
     let t = Tensor::new(Shape::new(vec![16]), buf, cpu_be.clone());
 
     // Same-backend check: when the desired backend is already the loader

@@ -544,6 +544,61 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 (선택적) ReliefEstimator 관측 업데이트
 ```
 
+### 3.8 Engine Internal Layered Architecture [SYS-100 ~ SYS-105]
+
+> **도입**: 2026-05-16 외부 공개(open-sourcing) 준비를 위해 Engine 내부 모듈 의존 그래프를 5개 레이어 + 2개 cross-cutting으로 정규화한다. 본 절은 Engine 내부 구조만 규정하며, 시스템 전체 2-프로세스 분리(INV-001, INV-010, INV-011)나 Cargo workspace edge(SYS-070~)는 영향받지 않는다.
+>
+> 본 절의 모든 요구사항은 **Engine crate(`llm_rs2`) 내부**에만 적용된다. Manager/Shared는 본 절의 적용 범위 밖이다.
+
+**[SYS-100]** Engine 내부 모듈은 다음 5개 레이어로 분류된다. *(MUST)*
+
+| Layer | 책임 | 모듈 (post-migration) |
+|-------|------|---------------------|
+| **L1 Backend** | 하드웨어별 연산 구현 | `backend/{cpu,opencl,cuda_embedded,cuda_pc,qnn_oppkg}/` |
+| **L2 Abstraction** | 백엔드-독립 trait, Tensor/Buffer/DType, 공용 utility | `shared/` (engine 내부) |
+| **L3 Domain** | KV pressure 응답 / Inference forward path | `pressure/`, `inference/` |
+| **L4 Orchestration** | Decode loop, eviction/swap 트리거, IPC dispatch | `session/` |
+| **L5 Adapter** | CLI, binary entry, signal injection | `bin/` |
+
+**[SYS-101]** L3 도메인은 *Pressure*와 *Inference* 두 부분으로 분해된다. *(MUST)*
+
+- **Pressure 도메인**: 메모리 압박에 응답하여 캐시/가중치 상태를 변경하는 모든 정책 — KV eviction, KV quantization, KV compress, KV swap, weight swap을 모두 포함한다. `CachePressurePipeline`을 단일 진입점으로 가진다.
+- **Inference 도메인**: 단일 토큰의 forward pass — 모델 구조, layer, attention, sampling, speculative decoding.
+
+> **Rationale**: 이전 분류 "Cache vs Inference"는 weight swap이 KV eviction과 동일한 pipeline에 등록되는 현재 구조(`pressure/weight_swap_handler.rs`)를 설명하지 못한다. "Pressure vs Inference"는 *압박-반응형 변형*과 *forward 계산*을 분리하여 일반화된다.
+
+**[SYS-102]** 두 종류의 cross-cutting 모듈이 존재한다. *(MUST)*
+
+- **Observability**: events, profile, eval, experiment, rss_trace. 모든 레이어에서 import 가능.
+- **Resilience**: signal/strategy/manager, sys_monitor, gpu_yield. L5에서 L1까지 import 가능.
+
+> **AUF 위치 결정 (2026-05-16)**: AUF(Argus Unified Format)는 cross-cutting Resilience에 속하지 않고 **L2(`shared/auf/`)**에 둔다. AUF는 GGUF/Safetensors와 동급의 가중치 포맷이며, inference 측 모델 로더와 resilience 측 weight swap이 모두 사용하는 공용 자산이기 때문이다. 상세 근거: `ARCHITECTURE.md` §13.8-A (실측 V-23).
+
+**[SYS-103]** 의존 방향은 L5 → L4 → L3 → L2 → L1 한 방향만 허용한다. 동일 레이어 내 cross-import는 모듈 간 사이클이 없는 한 허용된다. *(MUST)*
+
+**[SYS-104]** Cross-cutting 모듈이 L3 도메인의 concrete type을 직접 import할 때는 trait 경유로 inversion한다. *(SHOULD)*
+
+- 예: `observability/events.rs::EventSink` trait — Pressure 도메인이 emit하지만 events 모듈은 trait만 알면 됨.
+- 예외: 진단/평가(`observability/eval/`)는 L3 concrete에 의존이 불가피한 면이 있어 L4(`session/eval/`)로 격상하여 inversion한다.
+
+**[SYS-105]** `bin/` 안의 entrypoint(L5)는 `session/` (L4)만 직접 import한다. 그 외 모듈에 대한 직접 import는 binary가 단순 wrapper인 경우(`test_backend`, `signal_injector` 등)에 한해 허용된다. *(SHOULD)*
+
+#### Layer Invariants
+
+| ID | 한줄 요약 |
+|----|----------|
+| INV-LAYER-001 | L1 backend는 L2(`shared/`)와 cross-cutting(`observability/`, `resilience/`) 외 import 금지. backend 사이의 cross-import는 명시적 허용 zone(예: `cpu_fallback()`)에 한해 인정. backend-aware staging pool(CUDA `layer_object_pool`, OpenCL `host_ptr_pool`)은 backend가 소유하고, pressure handler는 `WeightStagingPool` trait(L2)으로 접근한다. |
+| INV-LAYER-002 | L2 `shared/`는 L3(`pressure/`, `inference/`), L4(`session/`), L5(`bin/`) 어떤 모듈도 import 금지. backend-specific buffer/memory는 `shared/`가 아닌 `backend/<be>/buffer/`에 위치한다 (`cl_*`, `cuda_*`, `rpcmem_*`). AUF(가중치 포맷)는 `shared/auf/`에 위치한다 — backend-specific이 아닌 공용 자산이므로 L2가 적합. |
+| INV-LAYER-003 | L3 `inference/`는 L3 `pressure/`의 내부 구현 import 금지. 단 `pressure/` 가 노출하는 trait(`CachePressureHandler`, `EvictionPolicy`, `KVCacheOps`, `WeightStagingPool` 등)은 import 가능. 역방향(`pressure/` → `inference/`)도 동일 규칙. chat template의 모델별 구현체(`inference/models/<arch>/chat_template.rs`)와 generic 부분(`inference/chat_template.rs`)은 동일 도메인 내부이므로 cross-import 자유. |
+| INV-LAYER-004 | Cross-cutting 모듈(`observability/`, `resilience/`)이 L3 도메인의 concrete type을 import할 때는 trait/Sink 경유로 한정한다. 예외는 본 절에 명시적으로 기재된 케이스(예: `events::CacheEvent` enum이 pressure 결과를 표현)에 한정. |
+| INV-LAYER-005 | L5 `bin/` 안의 production entrypoint(`generate`)는 L4 `session/`만 직접 import한다. test/microbench binary는 본 규칙 밖. `chat_ipc`는 L4(`session/chat_ipc.rs`) 책임이며 외부 IPC adapter로서 production binary가 직접 import하지 않는다. |
+| INV-LAYER-006 | L4 `DecodeLoop` struct는 L1 backend/L3 concrete struct를 필드로 직접 보유하지 않는다 — 6개 추상화 trait(`Forward`, `EvictionStage`, `SwapStage`, `CommandSource`, `TokenSampler`, `DecodeObserver`)만 보유한다. SYS-100/103과 직교한 *L4 내부 결합도* 제약(DIP 강화). 상세 trait API는 `arch/inference_pipeline.md` §2 참조. |
+| INV-LAYER-007 | `DecodeLoopBuilder`의 필수 컴포넌트(`Forward`)는 typestate 패턴으로 컴파일 타임에 강제된다. 선택적 컴포넌트(eviction/swap/command/observer)는 no-op 기본값이 자동 적용된다. 빌더 API와 typestate 시그니처는 `arch/inference_pipeline.md` §4 참조. |
+
+**NOTE (테스트 코드 정책, §13.8-E)**: lib 내부 inline `#[cfg(test)]` 블록의 backend instantiation(예: `core/eviction/*`, `core/pressure/*`에서 `CpuBackend::new()`)은 **grandfathered exception**으로 baseline에 등재된 채 유지된다. 신규로 추가하는 spec/단위 테스트는 모두 `engine/tests/spec/` 아래에 작성해야 하며, 본 위치에서만 backend instantiation을 허용한다. feedback `spec_tests_required`와 정합 — INV-LAYER 관련 spec 테스트는 `tests/spec/test_inv_layer_{001..005}.rs`에 위치한다. baseline에 등재된 lib 내부 테스트는 마이그레이션 마지막 단계(Step 5 이후)에 0으로 수렴시킨다.
+
+상세 INV 카탈로그 항목은 `spec/41-invariants.md` §3.26 참조. 코드 매핑은 `arch/01-architecture.md` §6 참조. 위반 현황(실측)과 마이그레이션 계획은 `ARCHITECTURE.md` §13 참조. L4 내부 `DecodeLoop` SOLID 분해 + 빌더 설계(INV-LAYER-006/007)는 `arch/inference_pipeline.md` 참조.
+
 ## 4. Alternative Behavior
 
 ### D-Bus Transport

@@ -1,10 +1,10 @@
 #![allow(unused_unsafe)]
-use crate::buffer::unified_buffer::UnifiedBuffer;
-use crate::core::backend::Backend;
-use crate::core::buffer::Buffer;
-use crate::core::buffer::DType;
-use crate::core::memory::Memory;
-use crate::core::tensor::Tensor;
+use crate::backend::Backend;
+use crate::buffer::Buffer;
+use crate::buffer::DType;
+use crate::memory::Memory;
+use crate::memory::opencl::unified::UnifiedBuffer;
+use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use ocl::core::Kernel as CoreKernel;
 use ocl::core::{ClContextPtr, ClDeviceIdPtr};
@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use crate::resilience::gpu_self_meter::OpenClEventGpuMeter;
 
-pub mod buffer;
 pub mod gpu_score;
 pub mod host_ptr_pool;
 pub mod memory;
@@ -124,28 +123,14 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // Then try legacy OpenCLBuffer
     if let Some(ocl_buf) = buf
         .as_any()
-        .downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
+        .downcast_ref::<crate::memory::opencl::device::OpenCLBuffer>()
     {
         return Ok(ocl_buf.buffer.as_core());
-    }
-    // MadviseableGPUBuffer (CL_MEM_USE_HOST_PTR — legacy, retained for compatibility)
-    if let Some(m) = buf
-        .as_any()
-        .downcast_ref::<crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer>()
-    {
-        return Ok(m.cl_mem_ref());
-    }
-    // ClWrappedBuffer (CL_MEM_USE_HOST_PTR wrapper around existing CPU buffer)
-    if let Some(m) = buf
-        .as_any()
-        .downcast_ref::<crate::buffer::cl_wrapped_buffer::ClWrappedBuffer>()
-    {
-        return Ok(m.cl_mem_ref());
     }
     // ClSubBuffer (zero-copy sub-region of a parent CL buffer via clCreateSubBuffer)
     if let Some(sb) = buf
         .as_any()
-        .downcast_ref::<crate::buffer::cl_sub_buffer::ClSubBuffer>()
+        .downcast_ref::<crate::memory::opencl::sub::ClSubBuffer>()
     {
         return Ok(sb.cl_mem_ref());
     }
@@ -154,7 +139,7 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // the same address doubles as the noshuffle SOA registry key.
     if let Some(ns) = buf
         .as_any()
-        .downcast_ref::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>()
+        .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>()
     {
         return Ok(ns.d_buf());
     }
@@ -162,7 +147,7 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // CL_MEM_ALLOC_HOST_PTR, filled via map/memcpy/unmap before use).
     if let Some(pp) = buf
         .as_any()
-        .downcast_ref::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>()
+        .downcast_ref::<crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>()
     {
         return pp
             .cl_mem()
@@ -186,27 +171,21 @@ pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
     let any = buf.as_any();
     if any.is::<UnifiedBuffer>() {
         "UnifiedBuffer"
-    } else if any.is::<crate::backend::opencl::buffer::OpenCLBuffer>() {
+    } else if any.is::<crate::memory::opencl::device::OpenCLBuffer>() {
         "OpenCLBuffer"
-    } else if any.is::<crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer>() {
-        "MadviseableGPUBuffer"
-    } else if any.is::<crate::buffer::cl_wrapped_buffer::ClWrappedBuffer>() {
-        "ClWrappedBuffer"
-    } else if any.is::<crate::buffer::cl_sub_buffer::ClSubBuffer>() {
+    } else if any.is::<crate::memory::opencl::sub::ClSubBuffer>() {
         "ClSubBuffer"
-    } else if any.is::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>() {
+    } else if any.is::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>() {
         "NoshuffleWeightBuffer"
-    } else if any.is::<crate::buffer::shared_buffer::SharedBuffer>() {
+    } else if any.is::<crate::memory::host::shared::SharedBuffer>() {
         "SharedBuffer"
-    } else if any.is::<crate::buffer::shared_buffer::SharedBufferView>() {
+    } else if any.is::<crate::memory::host::shared::SharedBufferView>() {
         "SharedBufferView"
-    } else if any.is::<crate::buffer::slice_buffer::SliceBuffer>() {
+    } else if any.is::<crate::buffer::slice::SliceBuffer>() {
         "SliceBuffer"
-    } else if any.is::<crate::buffer::mmap_buffer::MmapBuffer>() {
+    } else if any.is::<crate::memory::host::mmap::MmapBuffer>() {
         "MmapBuffer"
-    } else if any.is::<crate::buffer::borrowed_mmap_buffer::BorrowedMmapBuffer>() {
-        "BorrowedMmapBuffer"
-    } else if any.is::<crate::buffer::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
+    } else if any.is::<crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
         "HostPtrPool"
     } else {
         "Unknown"
@@ -2254,7 +2233,8 @@ impl OpenCLBackend {
         // Auto-dispatch to noshuffle GEMV for decode (m==1) when image1d_buffer_t is available.
         // The noshuffle kernel uses Adreno TP cache via image reads (R32UI weight, RGBA32F act).
         // Only dispatches when q_img is Some (image creation succeeded at load time).
-        // When q_img is None (image unsupported), falls through to standard Q4_0 GEMV.
+        // When q_img is None (image unsupported) or the registry is empty
+        // (e.g. Phase 4-4.10 default AOS path), falls through to standard Q4_0 GEMV.
         if m == 1 {
             let b_key = b_buf.as_ptr() as usize;
             if let Some(entry) = self.lookup_noshuffle_soa(b_key)
@@ -2378,10 +2358,23 @@ impl OpenCLBackend {
     /// Lookup a pre-converted noshuffle SOA entry by the original weight cl_mem pointer.
     ///
     /// Returns None if the weight was not pre-converted (fallback to standard Q4_0 GEMV).
+    /// In the Phase 4-4.10 default AOS path the registry is empty so all lookups
+    /// return None and callers transparently fall through.
     pub fn lookup_noshuffle_soa(&self, key: usize) -> Option<&NoshuffleSoaEntry> {
         // SAFETY: single-threaded inference access
         let registry = unsafe { &*self.noshuffle_soa_registry.get() };
-        registry.get(&key)
+        let r = registry.get(&key);
+        if r.is_none() && std::env::var_os("LLMRS_NOSHUFFLE_SOA_TRACE").is_some() {
+            // Phase 4-4.8 diagnostic: dump miss key + registry size + sample keys
+            let sample: Vec<usize> = registry.keys().take(4).copied().collect();
+            eprintln!(
+                "[noshuffle-soa-trace] MISS key=0x{:x} registry_size={} sample_keys={:x?}",
+                key,
+                registry.len(),
+                sample
+            );
+        }
+        r
     }
 
     /// Clear the entire noshuffle SOA registry.
@@ -4680,7 +4673,7 @@ impl Backend for OpenCLBackend {
         &self,
         t: &Tensor,
         dst: &mut [u8],
-    ) -> Result<crate::core::backend::GpuEvent> {
+    ) -> Result<crate::backend::GpuEvent> {
         let buf =
             get_cl_mem(t.buffer().as_ref()).map_err(|_| anyhow::anyhow!("Not OpenCL buffer"))?;
         let mut event: ocl::core::Event = ocl::core::Event::null();
@@ -4698,14 +4691,14 @@ impl Backend for OpenCLBackend {
                 Some(&mut event),
             )?;
         }
-        Ok(crate::core::backend::GpuEvent {
+        Ok(crate::backend::GpuEvent {
             inner_cl: Some(event),
             #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
             inner_cu: None,
         })
     }
 
-    fn wait_event(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+    fn wait_event(&self, evt: &crate::backend::GpuEvent) -> Result<()> {
         if let Some(e) = evt.inner_cl.as_ref() {
             ocl::core::wait_for_event(e)?;
         }
@@ -4720,14 +4713,11 @@ impl Backend for OpenCLBackend {
     /// Falls back to the synchronous default impl when the transfer
     /// queue is disabled (env-gate or creation failure) or when the
     /// destination has no `cl_mem` handle (host-only fallback).
-    fn enqueue_write_async(
-        &self,
-        src: &Tensor,
-    ) -> Result<(Tensor, crate::core::backend::GpuEvent)> {
+    fn enqueue_write_async(&self, src: &Tensor) -> Result<(Tensor, crate::backend::GpuEvent)> {
         let Some(transfer_queue) = self.transfer_queue_or_init() else {
             // Default: sync via copy_weight_from + dummy event.
             let dst = self.copy_weight_from(src)?;
-            return Ok((dst, crate::core::backend::GpuEvent::default()));
+            return Ok((dst, crate::backend::GpuEvent::default()));
         };
 
         // Allocate the destination buffer through the regular memory
@@ -4768,7 +4758,7 @@ impl Backend for OpenCLBackend {
                 // Buffer doesn't expose cl_mem (mapped host-only). Fall
                 // back to sync copy.
                 let dst = self.copy_weight_from(src)?;
-                return Ok((dst, crate::core::backend::GpuEvent::default()));
+                return Ok((dst, crate::backend::GpuEvent::default()));
             }
         };
         let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, size) };
@@ -4798,7 +4788,7 @@ impl Backend for OpenCLBackend {
 
         Ok((
             new_tensor,
-            crate::core::backend::GpuEvent {
+            crate::backend::GpuEvent {
                 inner_cl: Some(event),
                 #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
                 inner_cu: None,
@@ -4811,7 +4801,7 @@ impl Backend for OpenCLBackend {
     /// `clWaitForEvents` blocks the *host* thread but not the device,
     /// which is exactly what the swap dispatcher's worker thread needs
     /// before flipping ArcSwap.
-    fn wait_event_blocking(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+    fn wait_event_blocking(&self, evt: &crate::backend::GpuEvent) -> Result<()> {
         if let Some(e) = evt.inner_cl.as_ref() {
             ocl::core::wait_for_event(e)?;
             return Ok(());
@@ -5155,7 +5145,7 @@ impl Backend for OpenCLBackend {
     /// drag (Llama 3.2 1B ratio=1.0 mixed measured by `ClMemDiagBucket`).
     fn alloc_pre_converted_soa_tensor(
         &self,
-        shape: crate::core::shape::Shape,
+        shape: crate::shape::Shape,
         q_bytes: &[u8],
         d_bytes: &[u8],
         ne00: usize,
@@ -5207,7 +5197,7 @@ impl Backend for OpenCLBackend {
         // so consumers that inspect `Tensor::size()` see the weight footprint.
         let logical_bytes = num_blocks * 18;
         let placeholder = Arc::new(
-            crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer::new(
+            crate::memory::opencl::noshuffle::NoshuffleWeightBuffer::new(
                 q_buf,
                 d_buf,
                 q_img,
@@ -5253,8 +5243,8 @@ impl Backend for OpenCLBackend {
         if let Some(nb) = tensor
             .buffer()
             .as_any()
-            .downcast_ref::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>(
-        ) {
+            .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>()
+        {
             // SOA-backed: re-insert against the d_buf key (`cl_mem()` on
             // `NoshuffleWeightBuffer` returns d_buf, so the registry key
             // matches `b_buf.as_ptr() as usize` lookups in `matmul_q4_0`).
@@ -5293,7 +5283,7 @@ impl Backend for OpenCLBackend {
         dtype: DType,
         secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
         layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
-    ) -> Result<Option<std::sync::Arc<dyn crate::core::buffer::Buffer>>> {
+    ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         if size == 0 || host_ptr.is_null() {
             return Ok(None);
         }
@@ -5317,7 +5307,7 @@ impl Backend for OpenCLBackend {
             )
         })?;
 
-        let alias = crate::buffer::rpcmem_alias_buffer::RpcmemAliasBuffer::new(
+        let alias = crate::memory::rpcmem::opencl_alias::RpcmemAliasBuffer::new(
             cl_buffer,
             aliased_ptr,
             size,
@@ -6353,7 +6343,7 @@ impl Backend for OpenCLBackend {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U8 => 1,
-            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+            DType::Q4_0 => std::mem::size_of::<crate::quant::BlockQ4_0>(),
             _ => {
                 return Err(anyhow!(
                     "Unsupported dtype for buffer_shift: {:?}",
@@ -6481,7 +6471,7 @@ impl Backend for OpenCLBackend {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U8 => 1,
-            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+            DType::Q4_0 => std::mem::size_of::<crate::quant::BlockQ4_0>(),
             _ => {
                 return Err(anyhow!(
                     "Unsupported dtype for copy_slice: {:?}",
@@ -7037,7 +7027,7 @@ impl OpenCLBackend {
 #[cfg(test)]
 mod gpu_buffer_shift_tests {
     use super::*;
-    use crate::core::shape::Shape;
+    use crate::shape::Shape;
 
     fn try_create_backend() -> Option<Arc<OpenCLBackend>> {
         OpenCLBackend::new().ok().map(Arc::new)
@@ -7176,7 +7166,7 @@ mod gpu_buffer_shift_tests {
 
     #[test]
     fn test_prune_prefix_opencl_buffer() {
-        use crate::core::kv_cache::KVCache;
+        use crate::pressure::kv_cache::KVCache;
 
         let backend = match try_create_backend() {
             Some(b) => b,
@@ -7206,14 +7196,14 @@ mod gpu_buffer_shift_tests {
         let mut cache = KVCache::new(k, v, max_seq);
 
         // Fill 8 positions: pos i → all values = (i+1) as f32
-        let cpu_mem = crate::buffer::shared_buffer::SharedBuffer::new(heads * dim * 4, DType::F32);
+        let cpu_mem = crate::memory::host::shared::SharedBuffer::new(heads * dim * 4, DType::F32);
         for i in 0..8 {
             let val = (i + 1) as f32;
-            let kb = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+            let kb = Arc::new(crate::memory::host::shared::SharedBuffer::new(
                 heads * dim * 4,
                 DType::F32,
             ));
-            let vb = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+            let vb = Arc::new(crate::memory::host::shared::SharedBuffer::new(
                 heads * dim * 4,
                 DType::F32,
             ));
@@ -7278,7 +7268,7 @@ mod gpu_buffer_shift_tests {
 #[allow(clippy::needless_range_loop)]
 mod noshuffle_tests {
     use super::*;
-    use crate::core::shape::Shape;
+    use crate::shape::Shape;
 
     fn try_create_backend() -> Option<Arc<OpenCLBackend>> {
         OpenCLBackend::new().ok().map(Arc::new)
@@ -8454,7 +8444,7 @@ mod noshuffle_tests {
     /// when registering the entry.
     #[test]
     fn test_noshuffle_weight_buffer_key_stability() {
-        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
+        use crate::memory::opencl::noshuffle::NoshuffleWeightBuffer;
 
         let backend = match try_create_backend() {
             Some(b) => b,
@@ -8668,7 +8658,7 @@ mod noshuffle_tests {
     /// allocate any AOS placeholder cl_mem.
     #[test]
     fn test_alloc_pre_converted_soa_tensor_no_placeholder() {
-        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
+        use crate::memory::opencl::noshuffle::NoshuffleWeightBuffer;
 
         let backend = match try_create_backend() {
             Some(b) => b,
@@ -8856,7 +8846,7 @@ mod noshuffle_tests {
 #[cfg(test)]
 mod kv_scatter_batch_tests {
     use super::*;
-    use crate::core::shape::Shape;
+    use crate::shape::Shape;
     use half::f16;
 
     fn try_create_backend() -> Option<Arc<OpenCLBackend>> {

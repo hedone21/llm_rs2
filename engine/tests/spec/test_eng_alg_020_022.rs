@@ -3,8 +3,8 @@
 //! KiviCache 기본 동작, bits 전이(transition), 점진적 역양자화(incremental deq).
 //! KiviCache는 FP32 residual buffer + quantized compressed storage 구조.
 
-use llm_rs2::core::kivi_cache::KiviCache;
-use llm_rs2::core::kv_cache::KVCacheOps;
+use llm_rs2::pressure::kivi_cache::KiviCache;
+use llm_rs2::pressure::kv_cache::KVCacheOps;
 
 // ══════════════════════════════════════════════════════════════
 // ENG-ALG-020: KiviCache 기본 동작
@@ -100,7 +100,7 @@ fn test_eng_alg_022_kivi_cache_reset_clears_state() {
 #[test]
 fn test_eng_alg_022_kivi_cache_kv_dtype_is_f32() {
     // KiviCache는 호출자에게 F32를 요구 (내부적으로 양자화 처리)
-    use llm_rs2::core::buffer::DType;
+    use llm_rs2::buffer::DType;
     let cache = KiviCache::new(2, 32, 256, 32);
     assert_eq!(cache.kv_dtype(), DType::F32);
 }

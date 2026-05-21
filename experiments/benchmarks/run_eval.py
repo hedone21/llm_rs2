@@ -6,16 +6,16 @@ then computes accuracy by comparing log-likelihoods across choices.
 
 Usage:
     # H2O paper reproduction (ratio-based budget)
-    python experiments/benchmarks/run_eval.py \
-        --model models/llama3.2-1b \
-        --tasks copa,piqa,winogrande,openbookqa,rte,mathqa \
-        --policies none,sliding,h2o,h2o_plus \
-        --kv-budget-ratio 0.2 \
+    python experiments/benchmarks/run_eval.py\
+        --model models/llama3.2-1b\
+        --tasks copa,piqa,winogrande,openbookqa,rte,mathqa\
+        --policies none,sliding,h2o,h2o_plus\
+        --kv-budget-ratio 0.2\
         --kv-type f16
 
     # Absolute budget (legacy)
-    python experiments/benchmarks/run_eval.py \
-        --model models/llama3.2-1b \
+    python experiments/benchmarks/run_eval.py\
+        --model models/llama3.2-1b\
         --tasks boolq --policies none --kv-budget 256
 """
 
@@ -95,7 +95,6 @@ def run_eval_batch(tasks, model, policy, kv_budget, kv_budget_ratio, max_seq_len
             "--eval-ll",
             "--eval-batch", batch_path,
             "--max-seq-len", str(max_seq_len),
-            "--eviction-policy", policy,
             "--kv-type", kv_type,
             "--greedy",
         ]
@@ -108,13 +107,17 @@ def run_eval_batch(tasks, model, policy, kv_budget, kv_budget_ratio, max_seq_len
         elif kv_budget > 0:
             cmd.extend(["--kv-budget", str(kv_budget)])
 
-        if policy in ("h2o", "h2o_plus"):
-            cmd.extend(["--h2o-keep-ratio", "0.5", "--h2o-decay", "0.0"])
-
         if skip_layers:
             cmd.extend(["--skip-layers", skip_layers])
         elif skip_ratio is not None:
             cmd.extend(["--skip-ratio", str(skip_ratio)])
+
+        # EvictionCommonArgs precede the `eviction <policy>` subcommand
+        # (S-subcmd C8, 2026-05-19). Per-policy args follow.
+        subcmd = policy.replace("_", "-")
+        cmd.extend(["eviction", subcmd])
+        if policy in ("h2o", "h2o_plus"):
+            cmd.extend(["--keep-ratio", "0.5", "--decay", "0.0"])
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
 

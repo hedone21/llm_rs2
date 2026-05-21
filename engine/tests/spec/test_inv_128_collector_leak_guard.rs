@@ -16,9 +16,9 @@
 //!
 //! Spec: INV-128, ENG-ALG-218.
 
-use llm_rs2::core::qcf::layer_importance::ImportanceCollector;
-use llm_rs2::core::qcf::layer_importance::ImportanceTable;
 use llm_rs2::models::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
+use llm_rs2::qcf::layer_importance::ImportanceCollector;
+use llm_rs2::qcf::layer_importance::ImportanceTable;
 
 // ── INV-128.1: collector_armed consumption pattern ────────────────────────────
 
@@ -107,7 +107,7 @@ fn inv_128_populated_collector_drop_without_build_no_panic() {
     let data: Vec<f32> = (0..dim).map(|i| i as f32 * 0.1).collect();
     collector.snapshot_before(&data, 1, dim);
     let data2: Vec<f32> = (0..dim).map(|i| i as f32 * 0.11).collect();
-    use llm_rs2::core::qcf::layer_importance::SubLayer;
+    use llm_rs2::qcf::layer_importance::SubLayer;
     collector.record_after(&data2, 1, dim, 0, SubLayer::Full);
 
     // Abort — drop without build()

@@ -13,12 +13,12 @@
 //!
 //! INV-225: reader dtype dispatch precedence 보존.
 
-use llm_rs2::auf::{
+use llm_rs2::models::weights::{LoadError, SecondaryDtypeChoice, build_auf_secondary_from_view};
+use llm_shared::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, TAG_WEIGHTS_ADRENO_SOA,
     TAG_WEIGHTS_CPU_AOS, TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind,
     open_from_bytes,
 };
-use llm_rs2::models::weights::{LoadError, SecondaryDtypeChoice, build_auf_secondary_from_view};
 
 // ── 공통 헬퍼 ────────────────────────────────────────────────────────────────
 
@@ -63,7 +63,7 @@ fn make_variant_tag_buf(s: &str) -> [u8; 24] {
 
 /// 단순한 f32 → Q4_0 bytes (32 elements = 1 block = 18 bytes)
 fn q4_0_bytes_32() -> Vec<u8> {
-    use llm_rs2::auf::convert_tensor_dtype;
+    use llm_rs2::auf_dtype_convert::convert_tensor_dtype;
     let f32_data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
     let f32_bytes: Vec<u8> = unsafe {
         std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4).to_vec()
@@ -73,7 +73,7 @@ fn q4_0_bytes_32() -> Vec<u8> {
 
 /// 단순한 f32 → F16 bytes (32 elements = 64 bytes)
 fn f16_bytes_32() -> Vec<u8> {
-    use llm_rs2::auf::convert_tensor_dtype;
+    use llm_rs2::auf_dtype_convert::convert_tensor_dtype;
     let f32_data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
     let f32_bytes: Vec<u8> = unsafe {
         std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4).to_vec()
@@ -475,7 +475,7 @@ fn sprint_d_auto_q4_0_only_auf_selects_q4_0() {
 /// 이 테스트가 컴파일되면 SwapExecutor 시그니처가 unchanged임이 증명된다.
 #[test]
 fn d4_swap_executor_signature_unchanged() {
-    use llm_rs2::core::buffer::DType;
+    use llm_rs2::buffer::DType;
     use llm_rs2::models::weights::SwapExecutor;
 
     // SwapExecutor::new 시그니처 컴파일타임 체크:
@@ -485,8 +485,8 @@ fn d4_swap_executor_signature_unchanged() {
     fn _assert_swap_executor_signature<'a>(
         dtype: DType,
         config: &'a llm_rs2::models::config::ModelConfig,
-        backend: std::sync::Arc<dyn llm_rs2::core::backend::Backend>,
-        mem: &'a dyn llm_rs2::core::memory::Memory,
+        backend: std::sync::Arc<dyn llm_rs2::backend::Backend>,
+        mem: &'a dyn llm_rs2::memory::Memory,
     ) -> SwapExecutor<'a> {
         SwapExecutor::new(dtype, config, backend, mem)
     }

@@ -7,9 +7,9 @@
 // kv_heads=1, head_dim=4, bytes_per_elem=4 항목을 명시적으로 표기함.
 #![allow(clippy::identity_op)]
 
-use llm_rs2::core::pressure::quantize_handler::QuantizeHandler;
-use llm_rs2::core::qcf::QcfMetric;
-use llm_rs2::core::qcf::estimator::{DegradationEstimator, PiecewiseLinear};
+use llm_rs2::pressure::quantize_handler::QuantizeHandler;
+use llm_rs2::qcf::QcfMetric;
+use llm_rs2::qcf::estimator::{DegradationEstimator, PiecewiseLinear};
 use llm_shared::Level as PressureLevel;
 use std::collections::HashMap;
 
@@ -133,15 +133,15 @@ fn test_eng_alg_060_ema_no_update_when_alpha_zero() {
 #[test]
 fn test_eng_alg_091_pipeline_executes_matching_stages() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::core::kv_cache::KVCache;
-    use llm_rs2::core::pressure::{
+    use llm_rs2::buffer::DType;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::pressure::kv_cache::KVCache;
+    use llm_rs2::pressure::{
         ActionResult, CachePressureHandler, CachePressurePipeline, HandlerContext,
         PressureStageConfig,
     };
-    use llm_rs2::core::shape::Shape;
-    use llm_rs2::core::tensor::Tensor;
+    use llm_rs2::shape::Shape;
+    use llm_rs2::tensor::Tensor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -225,15 +225,15 @@ fn test_eng_alg_091_pipeline_executes_matching_stages() {
 #[test]
 fn test_eng_alg_091_pipeline_skips_all_at_normal() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::core::kv_cache::KVCache;
-    use llm_rs2::core::pressure::{
+    use llm_rs2::buffer::DType;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::pressure::kv_cache::KVCache;
+    use llm_rs2::pressure::{
         ActionResult, CachePressureHandler, CachePressurePipeline, HandlerContext,
         PressureStageConfig,
     };
-    use llm_rs2::core::shape::Shape;
-    use llm_rs2::core::tensor::Tensor;
+    use llm_rs2::shape::Shape;
+    use llm_rs2::tensor::Tensor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -295,7 +295,7 @@ fn test_eng_alg_091_pipeline_skips_all_at_normal() {
 
 #[test]
 fn test_eng_alg_091_c08_pipeline_ordering_sorts_by_level() {
-    use llm_rs2::core::pressure::{
+    use llm_rs2::pressure::{
         ActionResult, CachePressureHandler, CachePressurePipeline, HandlerContext,
         PressureStageConfig,
     };
@@ -368,12 +368,12 @@ fn test_eng_alg_092_target_bits_emergency() {
 #[test]
 fn test_eng_alg_092_swap_warning_offloads() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::core::kv_cache::KVCache;
-    use llm_rs2::core::pressure::{CachePressureHandler, HandlerContext, SwapHandler};
-    use llm_rs2::core::shape::Shape;
-    use llm_rs2::core::tensor::Tensor;
+    use llm_rs2::buffer::DType;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::pressure::kv_cache::KVCache;
+    use llm_rs2::pressure::{CachePressureHandler, HandlerContext, SwapHandler};
+    use llm_rs2::shape::Shape;
+    use llm_rs2::tensor::Tensor;
     use std::sync::Arc;
 
     let backend = Arc::new(CpuBackend::new());
@@ -413,12 +413,12 @@ fn test_eng_alg_092_swap_warning_offloads() {
 #[test]
 fn test_eng_alg_092_swap_emergency_offloads() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::core::kv_cache::KVCache;
-    use llm_rs2::core::pressure::{CachePressureHandler, HandlerContext, SwapHandler};
-    use llm_rs2::core::shape::Shape;
-    use llm_rs2::core::tensor::Tensor;
+    use llm_rs2::buffer::DType;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::pressure::kv_cache::KVCache;
+    use llm_rs2::pressure::{CachePressureHandler, HandlerContext, SwapHandler};
+    use llm_rs2::shape::Shape;
+    use llm_rs2::tensor::Tensor;
     use std::sync::Arc;
 
     let backend = Arc::new(CpuBackend::new());
@@ -462,15 +462,13 @@ fn test_eng_alg_092_swap_emergency_offloads() {
 #[test]
 fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::core::eviction::SlidingWindowPolicy;
-    use llm_rs2::core::kv_cache::KVCache;
-    use llm_rs2::core::pressure::{
-        ActionResult, CachePressureHandler, EvictionHandler, HandlerContext,
-    };
-    use llm_rs2::core::shape::Shape;
-    use llm_rs2::core::tensor::Tensor;
+    use llm_rs2::buffer::DType;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::pressure::eviction::SlidingWindowPolicy;
+    use llm_rs2::pressure::kv_cache::KVCache;
+    use llm_rs2::pressure::{ActionResult, CachePressureHandler, EvictionHandler, HandlerContext};
+    use llm_rs2::shape::Shape;
+    use llm_rs2::tensor::Tensor;
     use std::sync::Arc;
 
     let backend = Arc::new(CpuBackend::new());
@@ -526,15 +524,13 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
 #[test]
 fn test_eng_alg_092_eviction_handler_wraps_h2o() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::core::eviction::H2OPolicy;
-    use llm_rs2::core::kv_cache::KVCache;
-    use llm_rs2::core::pressure::{
-        ActionResult, CachePressureHandler, EvictionHandler, HandlerContext,
-    };
-    use llm_rs2::core::shape::Shape;
-    use llm_rs2::core::tensor::Tensor;
+    use llm_rs2::buffer::DType;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::pressure::eviction::H2OPolicy;
+    use llm_rs2::pressure::kv_cache::KVCache;
+    use llm_rs2::pressure::{ActionResult, CachePressureHandler, EvictionHandler, HandlerContext};
+    use llm_rs2::shape::Shape;
+    use llm_rs2::tensor::Tensor;
     use std::sync::Arc;
 
     let backend = Arc::new(CpuBackend::new());
@@ -598,15 +594,15 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
 #[test]
 fn test_eng_alg_091_c08_context_updated_after_eviction() {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::buffer::DType;
-    use llm_rs2::core::kv_cache::KVCache;
-    use llm_rs2::core::pressure::{
+    use llm_rs2::buffer::DType;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::pressure::kv_cache::KVCache;
+    use llm_rs2::pressure::{
         ActionResult, CachePressureHandler, CachePressurePipeline, HandlerContext,
         PressureStageConfig,
     };
-    use llm_rs2::core::shape::Shape;
-    use llm_rs2::core::tensor::Tensor;
+    use llm_rs2::shape::Shape;
+    use llm_rs2::tensor::Tensor;
     use std::sync::Arc;
 
     // HalvingHandler: current_pos를 절반으로 줄임

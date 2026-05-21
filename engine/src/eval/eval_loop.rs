@@ -8,19 +8,19 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::core::backend::Backend;
-use crate::core::buffer::DType;
-use crate::core::kv_cache::KVCacheOps;
-use crate::core::memory::Memory;
-use crate::core::qcf::{ImportanceCollector, SubLayer};
-use crate::core::sampling;
-use crate::core::shape::Shape;
-use crate::core::skip_config::SkipConfig;
-use crate::core::tensor::Tensor;
+use crate::buffer::DType;
+use crate::inference::sampling;
+use crate::inference::skip_config::SkipConfig;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
+use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::pressure::kv_cache::KVCacheOps;
+use crate::qcf::{ImportanceCollector, SubLayer};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 use super::hook::StepHook;
 use super::output::{EvalConfig, EvalOutput, EvalQuestion};
@@ -150,7 +150,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         #[cfg(feature = "opencl")]
         {
             let (live, bytes, allocs, releases) =
-                crate::backend::opencl::buffer::snapshot_alloc_counters();
+                crate::memory::opencl::device::snapshot_alloc_counters();
             eprintln!(
                 "[OCL-Trace] pre-loop live={} bytes={:.1}MB total_allocs={} total_releases={}",
                 live,
@@ -174,7 +174,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             #[cfg(feature = "opencl")]
             {
                 let (live, bytes, allocs, releases) =
-                    crate::backend::opencl::buffer::snapshot_alloc_counters();
+                    crate::memory::opencl::device::snapshot_alloc_counters();
                 eprintln!(
                     "[OCL-Trace] Q{} begin id={} live={} bytes={:.1}MB total_allocs={} total_releases={}",
                     q_idx + 1,
@@ -515,7 +515,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
 /// Returns `(importance_table, layer_skip_qcf, layer_skip_opr, skip_set_len)`.
 /// All fields are `None` / `0` when `skip_config` is `None` or questions is empty.
 type ImportancePassResult = (
-    Option<crate::core::qcf::ImportanceTable>,
+    Option<crate::qcf::ImportanceTable>,
     Option<f32>,
     Option<f32>,
     usize,
@@ -600,7 +600,7 @@ fn run_importance_pass<C: KVCacheOps>(
         .union(&sc.mlp_skip)
         .map(|&l| (l, SubLayer::Full))
         .collect();
-    let qcf = table.compute_qcf(&skip_set);
+    let qcf = table.compute_qcf_weight(&skip_set);
     let opr_skip = table.compute_opr_skip(&skip_set);
     let skip_set_len = skip_set.len();
 

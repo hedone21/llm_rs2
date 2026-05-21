@@ -14,7 +14,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::core::backend::Backend;
+use crate::backend::Backend;
 
 static YIELD_EVERY: OnceLock<usize> = OnceLock::new();
 static YIELD_US: OnceLock<u64> = OnceLock::new();

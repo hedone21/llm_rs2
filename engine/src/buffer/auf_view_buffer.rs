@@ -9,7 +9,7 @@
 //! read-only; `as_mut_ptr()` returns `null_mut()`.
 
 use crate::auf::AufView;
-use crate::core::buffer::{Buffer, DType};
+use crate::buffer::{Buffer, DType};
 use anyhow::Result;
 #[cfg(feature = "opencl")]
 use ocl::core::Mem;

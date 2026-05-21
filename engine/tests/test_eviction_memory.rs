@@ -8,16 +8,16 @@
 #[cfg(feature = "resilience")]
 mod eviction_memory_test {
     use llm_rs2::backend::cpu::CpuBackend;
-    use llm_rs2::buffer::shared_buffer::SharedBuffer;
-    use llm_rs2::core::buffer::{Buffer, DType};
-    use llm_rs2::core::cache_manager::CacheManager;
-    use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
-    use llm_rs2::core::kv_cache::KVCache;
-    use llm_rs2::core::shape::Shape;
+    use llm_rs2::buffer::{Buffer, DType};
     use llm_rs2::core::sys_monitor::{MemoryStats, SystemMonitor};
-    use llm_rs2::core::tensor::Tensor;
+    use llm_rs2::memory::host::shared::SharedBuffer;
+    use llm_rs2::pressure::cache_manager::CacheManager;
+    use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
+    use llm_rs2::pressure::kv_cache::KVCache;
     use llm_rs2::resilience::signal::{Level, SystemSignal};
     use llm_rs2::resilience::strategy::ResilienceAction;
+    use llm_rs2::shape::Shape;
+    use llm_rs2::tensor::Tensor;
 
     use std::sync::Arc;
     use std::sync::mpsc;

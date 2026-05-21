@@ -80,7 +80,7 @@ cargo build --release
 
 ```bash
 # HuggingFace에서 Q4_0 GGUF 다운로드
-hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF\
   --include "Llama-3.2-1B-Instruct-Q4_0.gguf" --local-dir models/
 
 # 또는 기존 safetensors에서 순수 Q4_0 GGUF 생성
@@ -100,15 +100,15 @@ python scripts/run_device.py -d pixel --skip-exec generate
 adb push -r models/qwen2.5-1.5b /data/local/tmp/models/qwen2.5-1.5b
 
 # 실행 (Safetensors + GPU + Q4)
-adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
-  -m /data/local/tmp/models/qwen2.5-1.5b -b opencl --weight-dtype q4 -n 50 \
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate\
+  -m /data/local/tmp/models/qwen2.5-1.5b -b opencl --weight-dtype q4 -n 50\
   --prompt 'Hello'"
 
 # 실행 (GGUF + GPU)
 adb push models/llama3.2-1b-q4_0.gguf /data/local/tmp/models/
 adb push models/llama3.2-1b/tokenizer.json /data/local/tmp/models/
-adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
-  -m /data/local/tmp/models/llama3.2-1b-q4_0.gguf -b opencl -n 50 \
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate\
+  -m /data/local/tmp/models/llama3.2-1b-q4_0.gguf -b opencl -n 50\
   --prompt 'Hello'"
 ```
 
@@ -153,19 +153,19 @@ python scripts/run_device.py -d jetson generate -b cuda --prompt "'Hello'" -n 50
 **CPU 추론 (기본)**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --prompt "Explain quantum computing" \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --prompt "Explain quantum computing"\
   -n 200
 ```
 
 **Q4 weight로 메모리 절약 — Safetensors (로드 시 F16→Q4 변환)**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --weight-dtype q4 \
-  --prompt "Explain quantum computing" \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --weight-dtype q4\
+  --prompt "Explain quantum computing"\
   -n 200
 ```
 
@@ -173,9 +173,9 @@ python scripts/run_device.py -d jetson generate -b cuda --prompt "'Hello'" -n 50
 
 ```bash
 # GGUF Q4_0 모델을 직접 로드 — 로딩 시간 단축, peak RSS 감소
-./target/release/generate \
-  -m models/llama3.2-1b-q4_0.gguf \
-  --prompt "Explain quantum computing" \
+./target/release/generate\
+  -m models/llama3.2-1b-q4_0.gguf\
+  --prompt "Explain quantum computing"\
   -n 200
 ```
 
@@ -185,15 +185,15 @@ python scripts/run_device.py -d jetson generate -b cuda --prompt "'Hello'" -n 50
 
 ```bash
 # Safetensors
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  -b opencl --weight-dtype q4 \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  -b opencl --weight-dtype q4\
   --prompt "Explain quantum computing" -n 200
 
 # GGUF
-./target/release/generate \
-  -m models/llama3.2-1b-q4_0.gguf \
-  -b opencl \
+./target/release/generate\
+  -m models/llama3.2-1b-q4_0.gguf\
+  -b opencl\
   --prompt "Explain quantum computing" -n 200
 ```
 
@@ -203,41 +203,41 @@ prefill은 CPU, decode는 GPU로 자동 전환. `--switch-threshold N` 토큰에
 GPU가 사용 가능하면 보조 백엔드로 자동 초기화되어 SwitchHw 명령도 동작.
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  -b cpu \
-  --switch-threshold 50 \
-  --weight-dtype q4 \
-  --prompt "Explain quantum computing" \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  -b cpu\
+  --switch-threshold 50\
+  --weight-dtype q4\
+  --prompt "Explain quantum computing"\
   -n 200
 ```
 
 **재현 가능한 greedy 생성**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --greedy \
-  --prompt "The capital of France is" \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --greedy\
+  --prompt "The capital of France is"\
   -n 20
 ```
 
 **프롬프트 파일 사용 (긴 프롬프트)**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --prompt-file experiments/prompts/prefill_1024.txt \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --prompt-file experiments/prompts/prefill_1024.txt\
   -n 100
 ```
 
 **긴 프롬프트에서 피크 메모리 제한 (chunked prefill)**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  --prefill-chunk-size 256 \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  --prefill-chunk-size 256\
   -n 100
 ```
 
@@ -263,11 +263,11 @@ GPU가 사용 가능하면 보조 백엔드로 자동 초기화되어 SwitchHw �
 **기본 eval-ll (eviction 없음)**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eval-ll \
-  --eval-batch data.json \
-  --kv-type f32 \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --eval-ll\
+  --eval-batch data.json\
+  --kv-type f32\
   --greedy
 ```
 
@@ -276,30 +276,30 @@ GPU가 사용 가능하면 보조 백엔드로 자동 초기화되어 SwitchHw �
 prompt 길이의 75%만 KV 캐시에 유지. 벤치마크 간 공정 비교에 권장.
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eval-ll \
-  --eval-batch data.json \
-  --kv-type f32 \
-  --eviction-policy sliding \
-  --kv-budget-ratio 0.75 \
-  --protected-prefix 4 \
-  --greedy
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --eval-ll\
+  --eval-batch data.json\
+  --kv-type f32\
+  --kv-budget-ratio 0.75\
+  --protected-prefix 4\
+  --greedy\
+  eviction sliding
 ```
 
 **H2O eviction + QCF 메트릭**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eval-ll \
-  --eval-batch data.json \
-  --kv-type f32 \
-  --eviction-policy h2o \
-  --kv-budget-ratio 0.5 \
-  --protected-prefix 4 \
-  --greedy \
-  --qcf-mode both
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --eval-ll\
+  --eval-batch data.json\
+  --kv-type f32\
+  --kv-budget-ratio 0.5\
+  --protected-prefix 4\
+  --greedy\
+  --qcf-mode both\
+  eviction h2o
 ```
 
 **출력 예시 (stdout JSON)**
@@ -333,22 +333,22 @@ teacher-forcing 방식으로 참조 텍스트 전체의 perplexity를 평가한�
 **기본 PPL 평가**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --ppl experiments/prompts/prefill_1024.txt \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --ppl experiments/prompts/prefill_1024.txt\
   --kv-type f32
 ```
 
 **Sliding window eviction + 고정 KV 버짓**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --ppl experiments/prompts/prefill_1024.txt \
-  --kv-type f32 \
-  --eviction-policy sliding \
-  --kv-budget 512 \
-  --protected-prefix 4
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --ppl experiments/prompts/prefill_1024.txt\
+  --kv-type f32\
+  --kv-budget 512\
+  --protected-prefix 4\
+  eviction sliding
 ```
 
 **출력 예시 (stdout JSON)**
@@ -377,46 +377,46 @@ KV 캐시를 Q2/Q4/Q8로 양자화하여 메모리를 절약한다. eviction 정
 **정적 KIVI (Q2, residual=32)**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --kivi \
-  --kivi-bits 2 \
-  --kivi-residual-size 32 \
-  --prompt "Once upon a time" \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-mode kivi\
+  --kv-kivi-bits 2\
+  --kv-kivi-residual-len 32\
+  --prompt "Once upon a time"\
   -n 200
 ```
 
 **KIVI Q4 (품질과 메모리 균형)**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --kivi \
-  --kivi-bits 4 \
-  --kivi-residual-size 64 \
-  --prompt "Once upon a time" \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-mode kivi\
+  --kv-kivi-bits 4\
+  --kv-kivi-residual-len 64\
+  --prompt "Once upon a time"\
   -n 200
 ```
 
 **KIVI + eval-ll**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --kivi \
-  --kivi-bits 2 \
-  --eval-ll \
-  --eval-batch data.json \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-mode kivi\
+  --kv-kivi-bits 2\
+  --eval-ll\
+  --eval-batch data.json\
   --greedy
 ```
 
 **KIVI + PPL**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --kivi \
-  --kivi-bits 2 \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-mode kivi\
+  --kv-kivi-bits 2\
   --ppl experiments/prompts/prefill_1024.txt
 ```
 
@@ -427,11 +427,11 @@ AW-VOPR(Attention Weight Variance Over Precision Ratio) 메트릭을 활성화�
 PPL 평가나 eval-ll과 함께 사용하여 양자화 품질을 정량화한다.
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --kivi \
-  --kivi-bits 2 \
-  --awqe \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-mode kivi\
+  --kv-kivi-bits 2\
+  --awqe\
   --ppl experiments/prompts/prefill_1024.txt
 ```
 
@@ -441,19 +441,19 @@ F16으로 시작하고 Manager 신호에 따라 Q2/Q4/Q8로 전환.
 
 ```bash
 # Terminal 1: mock_manager로 KvQuantDynamic 명령 전송
-./target/release/mock_manager \
-  --tcp 127.0.0.1:19999 \
-  --command KvQuantDynamic \
-  --target-bits 2 \
+./target/release/mock_manager\
+  --tcp 127.0.0.1:19999\
+  --command KvQuantDynamic\
+  --target-bits 2\
   --wait-secs 30
 
 # Terminal 2: generate (kv-dynamic-quant 활성화)
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --kv-dynamic-quant \
-  --enable-resilience \
-  --resilience-transport tcp:127.0.0.1:19999 \
-  --prompt "Once upon a time" \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-dynamic-quant\
+  --enable-resilience\
+  --resilience-transport tcp:127.0.0.1:19999\
+  --prompt "Once upon a time"\
   -n 200
 ```
 
@@ -466,53 +466,53 @@ KV 캐시가 버짓을 초과할 때 오래된 토큰을 제거하여 메모리�
 **Sliding window** — 가장 최근 N 토큰만 유지. Llama 3.2 1B에서 품질 최고.
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eviction-policy sliding \
-  --kv-budget 512 \
-  --protected-prefix 4 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  -n 200
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-budget 512\
+  --protected-prefix 4\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  -n 200\
+  eviction sliding
 ```
 
 **StreamingLLM (streaming)** — attention sink + recent window 구조.
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eviction-policy streaming \
-  --sink-size 4 \
-  --kv-budget 512 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  -n 200
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-budget 512\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  -n 200\
+  eviction streaming\
+  --sink 4
 ```
 
 **H2O** — Heavy Hitters Oracle (3-partition: prefix + heavy hitters + recent).
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eviction-policy h2o \
-  --kv-budget 512 \
-  --h2o-keep-ratio 0.5 \
-  --protected-prefix 4 \
-  --kv-type f32 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  -n 200
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-budget 512\
+  --protected-prefix 4\
+  --kv-type f32\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  -n 200\
+  eviction h2o\
+  --keep-ratio 0.5
 ```
 
 **D2O** — H2O + cosine merge compensation (evicted 토큰 정보를 retained에 병합).
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eviction-policy d2o \
-  --kv-budget 512 \
-  --d2o-keep-ratio 0.75 \
-  --protected-prefix 4 \
-  --kv-type f32 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  -n 200
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-budget 512\
+  --protected-prefix 4\
+  --kv-type f32\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  -n 200\
+  eviction d2o\
+  --keep-ratio 0.75
 ```
 
 > **주의**: H2O, H2O+, D2O는 attention score가 필요하므로 `--kv-type f32`를 권장한다.
@@ -521,14 +521,14 @@ KV 캐시가 버짓을 초과할 때 오래된 토큰을 제거하여 메모리�
 **초기 KV 캐시 용량 및 메모리 임계값 제어**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eviction-policy sliding \
-  --kv-budget 1024 \
-  --initial-kv-capacity 256 \
-  --memory-threshold-mb 512 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  -n 200
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-budget 1024\
+  --initial-kv-capacity 256\
+  --memory-threshold-mb 512\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  -n 200\
+  eviction sliding
 ```
 
 - `--initial-kv-capacity 0` (기본값): 프롬프트 길이를 2의 거듭제곱으로 올림, 최소 128 토큰
@@ -537,18 +537,18 @@ KV 캐시가 버짓을 초과할 때 오래된 토큰을 제거하여 메모리�
 **H2O raw scores (시간 정규화 없이 누적 합산)**
 
 기본적으로 H2O/H2O+는 시간 정규화(time-normalized) 점수를 사용한다.
-`--h2o-raw-scores`를 지정하면 정규화 없이 raw 누적 합산 점수를 사용한다.
+`--raw-scores`를 지정하면 정규화 없이 raw 누적 합산 점수를 사용한다.
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --eviction-policy h2o \
-  --kv-budget 512 \
-  --h2o-keep-ratio 0.5 \
-  --h2o-raw-scores \
-  --kv-type f32 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  -n 200
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-budget 512\
+  --kv-type f32\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  -n 200\
+  eviction h2o\
+  --keep-ratio 0.5\
+  --raw-scores
 ```
 
 **Sticky eviction 동작 (Manager 신호)**
@@ -556,7 +556,7 @@ KV 캐시가 버짓을 초과할 때 오래된 토큰을 제거하여 메모리�
 Manager를 통해 eviction 요청(`KvEvictH2o`, `KvEvictSliding`, `KvMergeD2o`) 또는
 KV 양자화 요청(`KvQuantDynamic`)이 수신되면 해당 상태가 **sticky**하게 유지된다.
 즉, `RestoreDefaults` 커맨드가 올 때까지 매 decode step마다 해당 eviction/양자화 정책이 적용된다.
-CLI의 `--eviction-policy`와 달리 Manager 신호 기반 eviction은 일회성이 아닌 지속적 제약이다.
+CLI의 `eviction <policy>` subcommand와 달리 Manager 신호 기반 eviction은 일회성이 아닌 지속적 제약이다.
 
 ---
 
@@ -568,18 +568,18 @@ Manager 서비스(또는 mock_manager)로부터 런타임 명령을 받아 추�
 
 ```bash
 # Terminal 1: mock_manager 시작 (30초 후 H2O eviction 명령 전송)
-./target/release/mock_manager \
-  --tcp 127.0.0.1:19999 \
-  --command KvEvictH2o \
-  --keep-ratio 0.5 \
+./target/release/mock_manager\
+  --tcp 127.0.0.1:19999\
+  --command KvEvictH2o\
+  --keep-ratio 0.5\
   --wait-secs 30
 
 # Terminal 2: generate (resilience 활성화)
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --enable-resilience \
-  --resilience-transport tcp:127.0.0.1:19999 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --enable-resilience\
+  --resilience-transport tcp:127.0.0.1:19999\
+  --prompt-file experiments/prompts/prefill_1024.txt\
   -n 500
 ```
 
@@ -591,38 +591,38 @@ Manager 서비스(또는 mock_manager)로부터 런타임 명령을 받아 추�
 
 ```bash
 # Terminal 1
-./target/release/mock_manager \
-  --socket /tmp/llm_manager.sock \
-  --command KvEvictSliding \
-  --keep-ratio 0.7 \
+./target/release/mock_manager\
+  --socket /tmp/llm_manager.sock\
+  --command KvEvictSliding\
+  --keep-ratio 0.7\
   --wait-secs 20
 
 # Terminal 2
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --enable-resilience \
-  --resilience-transport unix:/tmp/llm_manager.sock \
-  --prompt "Hello" \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --enable-resilience\
+  --resilience-transport unix:/tmp/llm_manager.sock\
+  --prompt "Hello"\
   -n 300
 ```
 
 **Throttle 명령 (TBT 패딩)**
 
 ```bash
-./target/release/mock_manager \
-  --tcp 127.0.0.1:19999 \
-  --command Throttle \
-  --delay-ms 100 \
+./target/release/mock_manager\
+  --tcp 127.0.0.1:19999\
+  --command Throttle\
+  --delay-ms 100\
   --wait-secs 15
 ```
 
 **LayerSkip 명령 (레이어 건너뛰기)**
 
 ```bash
-./target/release/mock_manager \
-  --tcp 127.0.0.1:19999 \
-  --command LayerSkip \
-  --skip-ratio 0.3 \
+./target/release/mock_manager\
+  --tcp 127.0.0.1:19999\
+  --command LayerSkip\
+  --skip-ratio 0.3\
   --wait-secs 10
 ```
 
@@ -654,13 +654,13 @@ zero-alloc SwitchHw를 위해 CPU/GPU 듀얼 버퍼를 미리 할당한다.
 활성화 시 RSS가 모델 크기만큼 증가한다 (zero-copy KV 메모리 + weight dual-access rewrap).
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  -b cpu \
-  --resilience-prealloc-switch \
-  --enable-resilience \
-  --resilience-transport tcp:127.0.0.1:19999 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  -b cpu\
+  --resilience-prealloc-switch\
+  --enable-resilience\
+  --resilience-transport tcp:127.0.0.1:19999\
+  --prompt-file experiments/prompts/prefill_1024.txt\
   -n 500
 ```
 
@@ -679,7 +679,7 @@ end
 
 ```bash
 # mock_manager CLI: partition 비율 50%로 설정
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command SetPartitionRatio --ratio 0.5 --wait-secs 10
 ```
 
@@ -698,7 +698,7 @@ end
 ```
 
 ```bash
-./target/release/mock_manager \
+./target/release/mock_manager\
   --scenario scenario.json
 ```
 
@@ -719,27 +719,27 @@ end
 
 ```bash
 # chunk만 축소 (가장 단순)
-./target/release/generate \
-  -m models/qwen2.5-1.5b -b opencl \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  --prefill-chunk-size 64 \
+./target/release/generate\
+  -m models/qwen2.5-1.5b -b opencl\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  --prefill-chunk-size 64\
   -n 100
 
 # chunk + yield (chunk 사이에 16ms GPU 양보)
-./target/release/generate \
-  -m models/qwen2.5-1.5b -b opencl \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  --prefill-chunk-size 64 \
-  --prefill-yield-ms 16 \
+./target/release/generate\
+  -m models/qwen2.5-1.5b -b opencl\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  --prefill-chunk-size 64\
+  --prefill-yield-ms 16\
   -n 100
 
 # chunk + yield + CPU interleave (GPU chunk 48tok → yield → CPU chunk 16tok → 반복)
-./target/release/generate \
-  -m models/qwen2.5-1.5b -b opencl \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  --prefill-chunk-size 48 \
-  --prefill-yield-ms 10 \
-  --prefill-cpu-chunk-size 16 \
+./target/release/generate\
+  -m models/qwen2.5-1.5b -b opencl\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  --prefill-chunk-size 48\
+  --prefill-yield-ms 10\
+  --prefill-cpu-chunk-size 16\
   -n 100
 ```
 
@@ -833,11 +833,11 @@ decode 단계(seq_len=1)의 TBT(Time Between Tokens)를 단축할 수 있다.
 **기본 사용법 (GPU 70%, CPU 30%)**
 
 ```bash
-generate \
-  --model-path /data/local/tmp/models/llama3.2-1b \
-  --backend opencl \
-  --tensor-partition 0.7 \
-  --prompt "Hello" \
+generate\
+  --model-path /data/local/tmp/models/llama3.2-1b\
+  --backend opencl\
+  --tensor-partition 0.7\
+  --prompt "Hello"\
   -n 128
 ```
 
@@ -850,7 +850,7 @@ Manager가 런타임에 비율을 조정할 수 있다.
 
 ```bash
 # mock_manager CLI
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command SetPartitionRatio --ratio 0.5 --wait-secs 10
 ```
 
@@ -881,32 +881,32 @@ KV cache를 디스크 또는 인메모리 raw 모드로 오프로드하여 DRAM 
 |------|------|
 | `none` | 오프로드 없음 (기본값) |
 | `raw` | 인메모리 raw 버퍼로 오프로드 |
-| `disk` | 파일 기반 오프로드 (`--offload-path` 디렉토리 사용) |
+| `disk` | 파일 기반 오프로드 (`--kv-offload-path` 디렉토리 사용) |
 
 **전제조건**
 
-`--kv-offload`는 `--kv-layout seq`와 `--kv-type f16` 또는 `--kv-type f32` 조합이 필요하다.
+`--kv-mode offload`는 `--kv-layout seq`와 `--kv-type f16` 또는 `--kv-type f32` 조합이 필요하다.
 
 **디스크 오프로드 예제**
 
 ```bash
-generate \
-  --model-path /data/local/tmp/models/llama3.2-1b \
-  --backend opencl \
-  --kv-layout seq \
-  --kv-type f16 \
-  --kv-offload disk \
-  --offload-path /tmp/kv_cache \
-  --prompt "Long context prompt..." \
+generate\
+  --model-path /data/local/tmp/models/llama3.2-1b\
+  --backend opencl\
+  --kv-layout seq\
+  --kv-type f16\
+  --kv-mode offload --kv-offload-storage disk\
+  --kv-offload-path /tmp/kv_cache\
+  --prompt "Long context prompt..."\
   -n 256
 ```
 
-`--offload-path`를 생략하면 시스템 임시 디렉토리(`/tmp/llm_rs2_kv_offload`)를 사용한다.
+`--kv-offload-path`를 생략하면 시스템 임시 디렉토리(`/tmp/llm_rs2_kv_offload`)를 사용한다.
 
 **prefetch 깊이 조정**
 
 ```bash
---max-prefetch-depth 8
+--kv-max-prefetch-depth 8
 ```
 
 기본값은 `4`다. 값이 클수록 더 많은 레이어를 미리 로드하여 latency를 숨기지만
@@ -917,7 +917,7 @@ generate \
 | 값 | 설명 |
 |----|------|
 | `head` | Head-major 레이아웃 (기본값). 일반 추론 권장. |
-| `seq` | Seq-major 레이아웃. `--kv-offload` 사용 시 필수. |
+| `seq` | Seq-major 레이아웃. `--kv-mode offload` 사용 시 필수. |
 
 ---
 
@@ -943,22 +943,22 @@ JSONL 파일로 여러 프롬프트를 순차 처리한다. 각 프롬프트마�
 **기본 사용법**
 
 ```bash
-generate \
-  --model-path /data/local/tmp/models/llama3.2-1b \
-  --backend opencl \
-  --prompt-batch prompts.jsonl \
+generate\
+  --model-path /data/local/tmp/models/llama3.2-1b\
+  --backend opencl\
+  --prompt-batch prompts.jsonl\
   -n 128
 ```
 
 **루프 모드 (연속 처리)**
 
 ```bash
-generate \
-  --model-path /data/local/tmp/models/llama3.2-1b \
-  --backend opencl \
-  --prompt-batch prompts.jsonl \
-  --prompt-batch-loop \
-  --max-iterations 100 \
+generate\
+  --model-path /data/local/tmp/models/llama3.2-1b\
+  --backend opencl\
+  --prompt-batch prompts.jsonl\
+  --prompt-batch-loop\
+  --max-iterations 100\
   -n 128
 ```
 
@@ -977,11 +977,11 @@ generate \
 **레이어 지정 방식 — 명시적 인덱스**
 
 ```bash
-generate \
-  --model-path /data/local/tmp/models/llama3.2-1b \
-  --backend opencl \
-  --skip-layers 1,3,5,7 \
-  --prompt "Hello" \
+generate\
+  --model-path /data/local/tmp/models/llama3.2-1b\
+  --backend opencl\
+  --skip-layers 1,3,5,7\
+  --prompt "Hello"\
   -n 128
 ```
 
@@ -991,10 +991,10 @@ generate \
 
 ```bash
 # 전체 레이어의 25%를 균등하게 skip
-generate \
-  --model-path /data/local/tmp/models/llama3.2-1b \
-  --skip-ratio 0.25 \
-  --prompt "Hello" \
+generate\
+  --model-path /data/local/tmp/models/llama3.2-1b\
+  --skip-ratio 0.25\
+  --prompt "Hello"\
   -n 128
 ```
 
@@ -1006,10 +1006,10 @@ generate \
 어떤 레이어를 skip할지 결정하는 데 활용할 수 있다.
 
 ```bash
-generate \
-  --model-path /data/local/tmp/models/llama3.2-1b \
-  --backend opencl \
-  --dump-importance \
+generate\
+  --model-path /data/local/tmp/models/llama3.2-1b\
+  --backend opencl\
+  --dump-importance\
   --prompt "Representative prompt text here"
 ```
 
@@ -1034,7 +1034,7 @@ socket / TCP listener를 병행해 외부 프로세스에서 프롬프트를 주
 **지원 아키텍처**: Llama 3.2 Instruct (`<|begin_of_text|>`, `<|eot_id|>`),
 Qwen2 (`<|im_start|>...<|im_end|>`). Gemma3는 현재 미지원 — 템플릿 준비되지 않음.
 
-**호환 경로**: standard (기본 KVCache) / `--kivi` / `--kv-offload` / `--eviction-policy`
+**호환 경로**: standard (기본 KVCache) / `--kv-mode kivi` / `--kv-mode offload` / `eviction <policy>` subcommand
 중 하나. 상호 배타이며, 아래와는 같이 쓸 수 없다:
 `--eval-ll`, `--ppl`, `--prompt-batch`, `--eval-batch`, `--tensor-partition`,
 `--cuda-graph`, `--dump-importance`, `--experiment-schedule`.
@@ -1042,12 +1042,12 @@ Qwen2 (`<|im_start|>...<|im_end|>`). Gemma3는 현재 미지원 — 템플릿 �
 #### 기본 사용법 (stdin REPL)
 
 ```bash
-generate \
-  --model-path models/llama3.2-1b/llama3.2-1b-instruct-q4_0.gguf \
-  --backend opencl \
-  --chat \
-  --system-prompt "You are a concise assistant." \
-  -n 256 \
+generate\
+  --model-path models/llama3.2-1b/llama3.2-1b-instruct-q4_0.gguf\
+  --backend opencl\
+  --chat\
+  --system-prompt "You are a concise assistant."\
+  -n 256\
   --temperature 0.7 --top-p 0.9
 ```
 
@@ -1070,7 +1070,7 @@ generate \
 (대화 시작 자동화용).
 
 첫 턴에서 `--max-seq-len`을 초과하는 입력+출력이 예상되면 `ensure_capacity()`가
-동작해 eviction-capable exec(`--eviction-policy` 활성 시)은 공간을 회수하고,
+동작해 eviction-capable exec(`eviction <policy>` subcommand 활성 시)은 공간을 회수하고,
 비-eviction exec는 `context overflow` 에러로 턴을 중단한다(REPL은 종료).
 
 #### 소켓 IPC로 테스트하기
@@ -1089,11 +1089,11 @@ REPL 루프로 머지되며, 동시에 활성화 가능하다.
 ##### (A) Unix domain socket — `--chat-socket`
 
 ```bash
-generate \
-  --model-path models/llama3.2-1b/llama3.2-1b-instruct-q4_0.gguf \
-  --backend opencl \
-  --chat \
-  --chat-socket /tmp/llm_chat.sock \
+generate\
+  --model-path models/llama3.2-1b/llama3.2-1b-instruct-q4_0.gguf\
+  --backend opencl\
+  --chat\
+  --chat-socket /tmp/llm_chat.sock\
   -n 256
 ```
 
@@ -1146,9 +1146,9 @@ ncat 127.0.0.1 7878
 총 3개 채널이 같은 루프에 merge된다.
 
 ```bash
-generate ... --chat \
-  --chat-socket /tmp/llm_chat.sock \
-  --chat-tcp 127.0.0.1:7878 \
+generate ... --chat\
+  --chat-socket /tmp/llm_chat.sock\
+  --chat-tcp 127.0.0.1:7878\
   -n 256
 ```
 
@@ -1182,30 +1182,31 @@ print(reply.decode("utf-8", errors="replace"))
 
 ```bash
 # KIVI 양자화 KV + 소켓
-generate ... --chat --kivi --kv-quant-bits 4 --chat-socket /tmp/llm_chat.sock -n 256
+generate ... --chat --kv-mode kivi --kv-kivi-bits 4 --chat-socket /tmp/llm_chat.sock -n 256
 
 # Sliding window eviction + TCP
-generate ... --chat \
-  --eviction-policy sliding --eviction-window 1024 --protected-prefix 4 \
-  --chat-tcp 127.0.0.1:7878 -n 256
+generate ... --chat\
+  --chat-tcp 127.0.0.1:7878 -n 256\
+  --protected-prefix 4\
+  eviction sliding --window 1024
 
 # D2O + 시스템 프롬프트 + stdin
-generate ... --chat \
-  --eviction-policy d2o --d2o-keep-ratio 0.75 \
-  --system-prompt "Respond in Korean." -n 256
+generate ... --chat\
+  --system-prompt "Respond in Korean." -n 256\
+  eviction d2o --keep-ratio 0.75
 ```
 
 #### 트러블슈팅
 
 - **`--chat is incompatible with --X`**: v1 호환 경로만 허용. `--tensor-partition`,
   `--cuda-graph`, `--dump-importance`, 실험/배치 모드는 모두 제외된다.
-- **`--chat: --kivi and --kv-offload are mutually exclusive`**: 둘 중 하나만.
+- **`--chat: --kv-mode kivi and offload are mutually exclusive`**: 둘 중 하나만.
 - **소켓이 안 열림**: `/tmp/llm_chat.sock`이 다른 프로세스에 의해 잡혀 있거나
   권한 문제. 엔진은 바인드 전에 `remove_file`을 시도한다.
 - **TCP 바인드 실패**: 포트 점유. `127.0.0.1:0`으로 자동 할당을 쓰고 stderr 로그로
   실제 포트 확인.
 - **컨텍스트 오버플로**: 턴 중 `context overflow: ...` 출력 후 REPL 종료.
-  `--eviction-policy sliding --eviction-window <N>`을 같이 붙이면 자동 회수.
+  `eviction sliding --window <N>`을 같이 붙이면 자동 회수.
 - **Gemma3에서 실패**: 챗 템플릿 미구현. Llama/Qwen2만 사용.
 - **Windows**: `--chat-socket`은 Unix 전용. 윈도우에서는 `--chat-tcp`만 동작.
 
@@ -1259,18 +1260,18 @@ generate ... --chat \
 
 ```bash
 # F16 primary + Q4_0 secondary, 50% layer swap
-./target/release/generate \
-  -m models/llama3.2-1b-f16.gguf \
-  --secondary-gguf models/llama3.2-1b-q4_0.gguf \
-  --force-swap-ratio 0.5 \
+./target/release/generate\
+  -m models/llama3.2-1b-f16.gguf\
+  --secondary-gguf models/llama3.2-1b-q4_0.gguf\
+  --force-swap-ratio 0.5\
   -b opencl --prompt "Hello" -n 50
 
 # 100% swap (mixed-mode baseline)
-./target/release/generate \
-  -m models/llama3.2-1b-f16.gguf \
-  --secondary-gguf models/llama3.2-1b-q4_0.gguf \
-  --force-swap-ratio 1.0 \
-  --quantize-lm-head q4_0 \
+./target/release/generate\
+  -m models/llama3.2-1b-f16.gguf\
+  --secondary-gguf models/llama3.2-1b-q4_0.gguf\
+  --force-swap-ratio 1.0\
+  --quantize-lm-head q4_0\
   -b opencl --prompt "Hello" -n 50
 ```
 
@@ -1287,29 +1288,29 @@ GGUF 두 개를 들고 다니는 대신 AUF 한 개로 통합. **권장 경로�
 
 ```bash
 # Safetensors → AUF (한 번에, AOS+SOA 양쪽 동봉)
-scripts/convert_to_auf.sh \
-    --input  models/llama3.2-1b/ \
-    --output models/llama3.2-1b.auf \
+scripts/convert_to_auf.sh\
+    --input  models/llama3.2-1b/\
+    --output models/llama3.2-1b.auf\
     --variants all
 
 # 이미 GGUF가 있으면 단계 1 건너뜀
-scripts/convert_to_auf.sh \
-    --input  models/llama3.2-1b-q4_0.gguf \
-    --output models/llama3.2-1b.auf \
+scripts/convert_to_auf.sh\
+    --input  models/llama3.2-1b-q4_0.gguf\
+    --output models/llama3.2-1b.auf\
     --variants all
 
 # switch_hw cpu / partition 호환 전용 (AOS만 동봉, 약간 작음)
-scripts/convert_to_auf.sh \
-    --input  models/llama3.2-1b-q4_0.gguf \
-    --output models/llama3.2-1b-aos.auf \
+scripts/convert_to_auf.sh\
+    --input  models/llama3.2-1b-q4_0.gguf\
+    --output models/llama3.2-1b-aos.auf\
     --variants cpu_aos
 
 # v0.2 multi-quant: Q4_0 + F16 동시 보관 (default = Q4_0)
-scripts/convert_to_auf.sh \
-    --input  models/llama3.2-1b-q4_0.gguf \
-    --output models/mixed.auf \
-    --variants all \
-    --dtypes q4_0,f16 \
+scripts/convert_to_auf.sh\
+    --input  models/llama3.2-1b-q4_0.gguf\
+    --output models/mixed.auf\
+    --variants all\
+    --dtypes q4_0,f16\
     --default-dtype q4_0
 ```
 
@@ -1318,33 +1319,33 @@ scripts/convert_to_auf.sh \
 ```bash
 # 워크스테이션에서 1회 (수동 경로)
 cargo build --release -p llm_rs2 --bin auf_tool
-./target/release/auf_tool build \
-    --input     models/llama3.2-1b-q4_0.gguf \
-    --tokenizer models/llama3.2-1b/tokenizer.json \
-    --output    models/llama3.2-1b.auf \
-    --variants  all \
+./target/release/auf_tool build\
+    --input     models/llama3.2-1b-q4_0.gguf\
+    --tokenizer models/llama3.2-1b/tokenizer.json\
+    --output    models/llama3.2-1b.auf\
+    --variants  all\
     --include-lm-head auto
 
 # 디바이스에 push (디바이스 backend variant만 남기고 strip)
-./target/release/auf_tool strip \
-    --keep META,TOKENIZER,TENSOR_INDEX,WEIGHTS_ADRENO_SOA \
+./target/release/auf_tool strip\
+    --keep META,TOKENIZER,TENSOR_INDEX,WEIGHTS_ADRENO_SOA\
     models/llama3.2-1b.auf
 adb push models/llama3.2-1b.auf /data/local/tmp/
 
 # 디바이스 추론 — AUF는 zero-copy mmap, GGUF 부재 환경에서도 동작
-adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
-  -m /data/local/tmp/models/llama3.2-1b-f16.gguf \
-  --secondary-gguf /data/local/tmp/llama3.2-1b.auf \
-  --force-swap-ratio 1.0 \
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate\
+  -m /data/local/tmp/models/llama3.2-1b-f16.gguf\
+  --secondary-gguf /data/local/tmp/llama3.2-1b.auf\
+  --force-swap-ratio 1.0\
   -b opencl --prompt 'Hello' -n 50"
 
 # switch_hw cpu / partition 정책이 들어가는 PACT 시나리오 — AOS 명시 필수
-adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
-  -m /data/local/tmp/models/llama3.2-1b-f16.gguf \
-  --secondary-gguf /data/local/tmp/llama3.2-1b.auf \
-  --secondary-layout aos \
-  --force-swap-ratio 1.0 \
-  -b opencl --enable-resilience --resilience-prealloc-switch \
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate\
+  -m /data/local/tmp/models/llama3.2-1b-f16.gguf\
+  --secondary-gguf /data/local/tmp/llama3.2-1b.auf\
+  --secondary-layout aos\
+  --force-swap-ratio 1.0\
+  -b opencl --enable-resilience --resilience-prealloc-switch\
   --prompt 'Hello' -n 50"
 ```
 
@@ -1376,22 +1377,22 @@ adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
 
 ```bash
 # PPL 모드 (LongBench 같은 corpus)
-./target/release/generate \
-  -m models/qwen2.5-1.5b-f16.gguf \
-  --secondary-gguf models/qwen2.5-1.5b-mixed.auf \
-  --secondary-dtype q4_0 --force-swap-ratio 0.33 \
-  -b cuda --kv-type f16 --max-seq-len 4096 \
-  --ppl experiments/prompts/prefill_4096.txt \
+./target/release/generate\
+  -m models/qwen2.5-1.5b-f16.gguf\
+  --secondary-gguf models/qwen2.5-1.5b-mixed.auf\
+  --secondary-dtype q4_0 --force-swap-ratio 0.33\
+  -b cuda --kv-type f16 --max-seq-len 4096\
+  --ppl experiments/prompts/prefill_4096.txt\
   --qcf-dump results/qwen1_5b_r0.33_ppl.json
 
 # eval-ll 모드 (RACE-h / NIAH per-question NLL)
-./target/release/generate \
-  -m models/qwen2.5-1.5b-f16.gguf \
-  --secondary-gguf models/qwen2.5-1.5b-mixed.auf \
-  --secondary-dtype q4_0 --force-swap-ratio 0.33 \
-  -b cuda --kv-type f16 --max-seq-len 4096 \
-  --eval-ll --eval-batch data/race_h_300q.jsonl \
-  --greedy --qcf-mode both \
+./target/release/generate\
+  -m models/qwen2.5-1.5b-f16.gguf\
+  --secondary-gguf models/qwen2.5-1.5b-mixed.auf\
+  --secondary-dtype q4_0 --force-swap-ratio 0.33\
+  -b cuda --kv-type f16 --max-seq-len 4096\
+  --eval-ll --eval-batch data/race_h_300q.jsonl\
+  --greedy --qcf-mode both\
   --qcf-dump results/qwen1_5b_r0.33_race_h.json
 ```
 
@@ -1422,17 +1423,17 @@ LLM 엔진에 지시를 자동으로 전송하는 데몬이다.
 **TCP으로 시작 (기본 정책 스크립트 사용)**
 
 ```bash
-./target/release/llm_manager \
-  --policy-script manager/scripts/policy_example.lua \
+./target/release/llm_manager\
+  --policy-script manager/scripts/policy_example.lua\
   --transport tcp:127.0.0.1:19999
 ```
 
 **설정 파일 + Unix socket**
 
 ```bash
-./target/release/llm_manager \
-  --policy-script manager/scripts/policy_example.lua \
-  --config manager/policy_config.toml \
+./target/release/llm_manager\
+  --policy-script manager/scripts/policy_example.lua\
+  --config manager/policy_config.toml\
   --transport unix:/tmp/llm.sock
 ```
 
@@ -1440,16 +1441,16 @@ LLM 엔진에 지시를 자동으로 전송하는 데몬이다.
 
 ```bash
 # Terminal 1: Manager 시작
-./target/release/llm_manager \
-  --policy-script manager/scripts/policy_example.lua \
+./target/release/llm_manager\
+  --policy-script manager/scripts/policy_example.lua\
   --transport unix:/tmp/llm.sock
 
 # Terminal 2: generate (resilience 활성화)
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --enable-resilience \
-  --resilience-transport unix:/tmp/llm.sock \
-  --prompt-file experiments/prompts/prefill_1024.txt \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --enable-resilience\
+  --resilience-transport unix:/tmp/llm.sock\
+  --prompt-file experiments/prompts/prefill_1024.txt\
   -n 500
 ```
 
@@ -1466,17 +1467,17 @@ Lua 스크립트로 커스텀 정책을 정의한다. **기본 정책 모드**�
 # 기본 빌드 (lua feature 포함)
 cargo build --release -p llm_manager
 
-./target/release/llm_manager \
-  --policy-script manager/scripts/policy_example.lua \
+./target/release/llm_manager\
+  --policy-script manager/scripts/policy_example.lua\
   --transport tcp:127.0.0.1:19999
 ```
 
 **policy_config.toml로 초기 relief 값 + trigger 임계값 설정**
 
 ```bash
-./target/release/llm_manager \
-  --policy-script manager/scripts/policy_example.lua \
-  --config manager/policy_config.toml \
+./target/release/llm_manager\
+  --policy-script manager/scripts/policy_example.lua\
+  --config manager/policy_config.toml\
   --transport tcp:127.0.0.1:19999
 ```
 
@@ -1709,40 +1710,40 @@ cargo build --release --bin mock_manager
 
 ```bash
 # KV 캐시 70% 유지 (Sliding)
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command KvEvictSliding --keep-ratio 0.7 --wait-secs 10
 
 # StreamingLLM으로 전환 (sink=4, window=500)
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command KvStreaming --sink-size 4 --window-size 500 --wait-secs 10
 
 # decode 100ms 지연
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command Throttle --delay-ms 100 --wait-secs 5
 
 # CPU로 백엔드 전환
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command SwitchHw --device cpu --wait-secs 5
 
 # KV 캐시를 Q4로 양자화
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command KvQuantDynamic --target-bits 4 --wait-secs 10
 
 # TBT 목표 150ms 설정
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command SetTargetTbt --target-ms 150 --wait-secs 5
 
 # Tensor partition GPU 비율 50%로 설정
 # (engine을 --tensor-partition 0.001 이상으로 기동해야 zero-copy 활성화됨)
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command SetPartitionRatio --ratio 0.5 --wait-secs 10
 
 # Prefill 정책 변경 (chunk + yield + CPU interleave)
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command SetPrefillPolicy --chunk-size 48 --yield-ms 10 --cpu-chunk-size 16 --wait-secs 10
 
 # Prefill chunk 크기만 변경 (나머지는 현재 값 유지)
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --command SetPrefillPolicy --chunk-size 64 --wait-secs 5
 ```
 
@@ -1827,7 +1828,7 @@ mock_manager는 `--scenario` 옵션으로 JSON 파일을 입력받아 여러 com
 실행:
 
 ```bash
-./target/release/mock_manager --tcp 127.0.0.1:19999 \
+./target/release/mock_manager --tcp 127.0.0.1:19999\
   --scenario scenario.json --wait-secs 5
 ```
 
@@ -1861,22 +1862,22 @@ command 검증 시 아래 4종 설정을 조합한다. 모든 설정에 `--ignor
 
 ```bash
 # C1: 기본 — KV eviction, Throttle, Suspend/Resume, SetTargetTbt, RequestQcf 등
-./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos \
+./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos\
   --enable-resilience --resilience-transport tcp:127.0.0.1:19999
 
 # C2: GPU + prealloc — SwitchHw 테스트용
-./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos \
-  -b opencl --resilience-prealloc-switch \
+./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos\
+  -b opencl --resilience-prealloc-switch\
   --enable-resilience --resilience-transport tcp:127.0.0.1:19999
 
 # C3: GPU + partition — SetPartitionRatio, SetPrefillPolicy(cpu_chunk) 테스트용
-./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos \
-  -b opencl --resilience-prealloc-switch --tensor-partition 0.001 \
+./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos\
+  -b opencl --resilience-prealloc-switch --tensor-partition 0.001\
   --enable-resilience --resilience-transport tcp:127.0.0.1:19999
 
 # C4: KIVI — KvQuantDynamic 테스트용
-./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos \
-  --kv-dynamic-quant \
+./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos\
+  --kv-dynamic-quant\
   --enable-resilience --resilience-transport tcp:127.0.0.1:19999
 ```
 
@@ -1917,11 +1918,11 @@ python scripts/test_mock_commands.py --skip-build --test 3-07 -v
 **Baseline (액션 없음)**
 
 ```bash
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  -n 200 \
-  --greedy \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  -n 200\
+  --greedy\
   --tbt-log results/baseline.jsonl
 ```
 
@@ -1929,22 +1930,22 @@ python scripts/test_mock_commands.py --skip-build --test 3-07 -v
 
 ```bash
 # Terminal 1
-./target/release/mock_manager \
-  --tcp 127.0.0.1:19999 \
-  --command KvEvictH2o \
-  --keep-ratio 0.5 \
+./target/release/mock_manager\
+  --tcp 127.0.0.1:19999\
+  --command KvEvictH2o\
+  --keep-ratio 0.5\
   --wait-secs 30 &
 
 # Terminal 2
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --kv-type f32 \
-  --protected-prefix 4 \
-  --enable-resilience \
-  --resilience-transport tcp:127.0.0.1:19999 \
-  --prompt-file experiments/prompts/prefill_1024.txt \
-  -n 200 \
-  --greedy \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --kv-type f32\
+  --protected-prefix 4\
+  --enable-resilience\
+  --resilience-transport tcp:127.0.0.1:19999\
+  --prompt-file experiments/prompts/prefill_1024.txt\
+  -n 200\
+  --greedy\
   --tbt-log results/h2o_evict.jsonl
 ```
 
@@ -1954,17 +1955,17 @@ python scripts/test_mock_commands.py --skip-build --test 3-07 -v
 
 ```bash
 for POLICY in none sliding h2o; do
-  ./target/release/generate \
-    -m models/qwen2.5-1.5b \
-    --eviction-policy $POLICY \
-    --kv-budget 512 \
-    --protected-prefix 4 \
-    --kv-type f32 \
-    --target-tbt 150 \
-    --prompt-file experiments/prompts/prefill_1024.txt \
-    -n 200 \
-    --greedy \
-    --tbt-log results/tbt_${POLICY}.jsonl
+  ./target/release/generate\
+    -m models/qwen2.5-1.5b\
+    --kv-budget 512\
+    --protected-prefix 4\
+    --kv-type f32\
+    --target-tbt 150\
+    --prompt-file experiments/prompts/prefill_1024.txt\
+    -n 200\
+    --greedy\
+    --tbt-log results/tbt_${POLICY}.jsonl\
+    eviction $POLICY
 done
 ```
 
@@ -1988,16 +1989,16 @@ RATIO=0.5
 
 for POLICY in none sliding h2o d2o; do
   echo "=== Policy: $POLICY ==="
-  ./target/release/generate \
-    -m $MODEL \
-    --eval-ll \
-    --eval-batch $DATA \
-    --kv-type f32 \
-    --eviction-policy $POLICY \
-    --kv-budget-ratio $RATIO \
-    --protected-prefix 4 \
-    --greedy \
-    --qcf-mode both \
+  ./target/release/generate\
+    -m $MODEL\
+    --eval-ll\
+    --eval-batch $DATA\
+    --kv-type f32\
+    --kv-budget-ratio $RATIO\
+    --protected-prefix 4\
+    --greedy\
+    --qcf-mode both\
+    eviction $POLICY\
     > results/eval_${POLICY}_r${RATIO}.json
 done
 
@@ -2015,20 +2016,20 @@ done
 
 ```bash
 # CPU Q4
-./target/release/generate \
-  -m models/qwen2.5-1.5b \
-  --weight-dtype q4 \
-  --prompt "tell me a short story" \
-  -n 128 \
-  --greedy \
+./target/release/generate\
+  -m models/qwen2.5-1.5b\
+  --weight-dtype q4\
+  --prompt "tell me a short story"\
+  -n 128\
+  --greedy\
   --experiment-output results/bench_cpu_q4.jsonl
 
 # OpenCL Q4 (Android)
-adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
-  -m /data/local/tmp/models/qwen2.5-1.5b \
-  -b opencl --weight-dtype q4 \
-  --prompt 'tell me a short story' \
-  -n 128 --greedy \
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate\
+  -m /data/local/tmp/models/qwen2.5-1.5b\
+  -b opencl --weight-dtype q4\
+  --prompt 'tell me a short story'\
+  -n 128 --greedy\
   --experiment-output /data/local/tmp/bench_opencl_q4.jsonl"
 adb pull /data/local/tmp/bench_opencl_q4.jsonl results/
 ```
@@ -2153,18 +2154,18 @@ adb push target/aarch64-linux-android/release/mock_manager /data/local/tmp/llm_r
 
 ```bash
 # Terminal 1: mock_manager를 TCP로 시작
-adb shell "/data/local/tmp/llm_rs2/mock_manager \
-  --tcp 127.0.0.1:9999 \
-  --command KvEvictSliding \
-  --keep-ratio 0.7 \
+adb shell "/data/local/tmp/llm_rs2/mock_manager\
+  --tcp 127.0.0.1:9999\
+  --command KvEvictSliding\
+  --keep-ratio 0.7\
   --wait-secs 30"
 
 # Terminal 2: generate를 TCP resilience로 연결
-adb shell "/data/local/tmp/llm_rs2/generate \
-  --model-path /data/local/tmp/models/llama3.2-1b \
-  --prompt-file /data/local/tmp/llm_rs2/prompt.txt \
-  -n 512 --backend cpu --threads 6 \
-  --enable-resilience \
+adb shell "/data/local/tmp/llm_rs2/generate\
+  --model-path /data/local/tmp/models/llama3.2-1b\
+  --prompt-file /data/local/tmp/llm_rs2/prompt.txt\
+  -n 512 --backend cpu --threads 6\
+  --enable-resilience\
   --resilience-transport tcp:127.0.0.1:9999"
 ```
 
@@ -2178,11 +2179,11 @@ adb shell "/data/local/tmp/llm_rs2/generate \
 
 ```bash
 # Llama 3.2 1B (모델 접근 권한 필요)
-huggingface-cli download meta-llama/Llama-3.2-1B \
+huggingface-cli download meta-llama/Llama-3.2-1B\
   --local-dir models/llama3.2-1b
 
 # Qwen 2.5 1.5B
-huggingface-cli download Qwen/Qwen2.5-1.5B \
+huggingface-cli download Qwen/Qwen2.5-1.5B\
   --local-dir models/qwen2.5-1.5b
 ```
 
@@ -2207,8 +2208,8 @@ adb push models/qwen2.5-1.5b/. /data/local/tmp/models/qwen2.5-1.5b/
 
 ```bash
 # Llama 3.2 1B Q4_0 GGUF
-hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
-  --include "Llama-3.2-1B-Instruct-Q4_0.gguf" \
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF\
+  --include "Llama-3.2-1B-Instruct-Q4_0.gguf"\
   --local-dir models/llama3.2-1b-gguf
 ```
 
@@ -2219,8 +2220,8 @@ hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
 **Safetensors에서 순수 Q4_0 GGUF 생성 (권장):**
 
 ```bash
-python scripts/convert_safetensors_to_gguf.py \
-  models/llama3.2-1b \
+python scripts/convert_safetensors_to_gguf.py\
+  models/llama3.2-1b\
   models/llama3.2-1b-q4_0.gguf
 ```
 
@@ -2302,10 +2303,10 @@ adb shell cat /proc/meminfo | head -5
 adb shell cat /sys/class/thermal/thermal_zone*/temp
 
 # 온디바이스 추론 실행 (OpenCL 라이브러리 경로 포함)
-adb shell "LD_LIBRARY_PATH=/data/local/tmp \
-  /data/local/tmp/generate \
-  -m /data/local/tmp/models/qwen2.5-1.5b \
-  -b opencl --weight-dtype q4 \
+adb shell "LD_LIBRARY_PATH=/data/local/tmp\
+  /data/local/tmp/generate\
+  -m /data/local/tmp/models/qwen2.5-1.5b\
+  -b opencl --weight-dtype q4\
   --prompt 'Hello' -n 50"
 
 # 결과 파일 pull
@@ -2372,47 +2373,47 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 | `--max-seq-len` | 2048 | 최대 시퀀스 길이 |
 | `--initial-kv-capacity` | 0 | 초기 KV 캐시 용량 토큰 수 (0=auto: prompt 길이 2의 거듭제곱, min 128) |
 | `--memory-threshold-mb` | 256 | eviction 트리거 메모리 임계값 (MB) |
-| `--kv-offload` | `none` | KV 캐시 오프로드 모드: `none`, `raw`, `disk` |
-| `--offload-path` | 시스템 임시 디렉토리 | disk offload 파일 디렉토리 (`--kv-offload disk` 시 사용) |
-| `--max-prefetch-depth` | 4 | offload KV 캐시 적응형 prefetch 깊이 (높을수록 latency 감소, 메모리 증가) |
+| `--kv-mode offload --kv-offload-storage <mode>` | (offload 비활성) | KV 캐시 오프로드 storage: `raw`, `disk`, `mmap`, `tmpfs` |
+| `--kv-offload-path` | 시스템 임시 디렉토리 | disk offload 파일 디렉토리 (`--kv-mode offload --kv-offload-storage disk` 시 사용) |
+| `--kv-max-prefetch-depth` | 128 | offload KV 캐시 적응형 prefetch 깊이 (높을수록 latency 감소, 메모리 증가) |
 
 ### Eviction 정책
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--eviction-policy` | `none` | `none`, `sliding`, `streaming`, `h2o`, `h2o_plus`, `d2o` |
-| `--protected-prefix` | 자동 | eviction에서 보호할 prefix 토큰 수 (score 기반→4, sliding→prompt 길이) |
-| `--eviction-window` | 1024 | sliding window 크기 |
-| `--eviction-target-ratio` | 0.75 | eviction 시 유지 비율 |
-| `--sink-size` | 4 | StreamingLLM attention sink 토큰 수 |
-| `--streaming-window` | 0 | StreamingLLM recent window (0=auto: `kv_budget - sink_size`) |
+| `eviction <policy>` | (생략 = `none`) | clap subcommand. `none`, `sliding`, `streaming`, `h2o`, `h2o-plus`, `d2o` |
+| `--protected-prefix` | 자동 | (parent) eviction에서 보호할 prefix 토큰 수 (score 기반→4, sliding→prompt 길이) |
+| `--eviction-target-ratio` | 0.75 | (parent) eviction 시 유지 비율 |
+| `--window` | 1024 | sliding sub-arg — `eviction sliding --window N` |
+| `--sink` | 4 | streaming sub-arg — `eviction streaming --sink N` |
+| `--recent-window` | 0 | streaming sub-arg — auto = `kv_budget - sink` |
 
 ### H2O 전용
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--h2o-keep-ratio` | 0.5 | Heavy Hitter 유지 비율 |
-| `--h2o-decay` | 0.0 | 중요도 점수 지수 감소 |
-| `--h2o-tracked-layers` | 0 | score 추적 레이어 수 (0=전체) |
-| `--h2o-raw-scores` | false | 시간 정규화 없이 raw 누적 합산 점수 사용 |
+| `--keep-ratio` | 0.5 | Heavy Hitter 유지 비율 |
+| `--decay` | 0.0 | 중요도 점수 지수 감소 |
+| `--tracked-layers` | 0 | score 추적 레이어 수 (0=전체) |
+| `--raw-scores` | false | 시간 정규화 없이 raw 누적 합산 점수 사용 |
 
 ### D2O 전용
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--d2o-keep-ratio` | 0.75 | 유지 비율 (논문 기본값) |
-| `--d2o-ema-alpha` | 0.5 | EMA old-threshold 가중치 |
-| `--d2o-ema-beta` | 0.5 | EMA new-mean 가중치 |
-| `--d2o-layer-alloc` | false | 레이어별 동적 할당 활성화 (prefill attention variance 기반) |
-| `--d2o-protected-layers` | — | D2O 레이어 할당 시 보호할 레이어 인덱스 (콤마 구분, 예: `0,1,2`) |
+| `--keep-ratio` | 0.75 | 유지 비율 (논문 기본값) |
+| `--ema-beta` | 0.7 | EMA smoothing β (paper Eq.10) |
+| `--merge-e` | 0.1 | 병합 정규화 상수 e (paper Eq.11) |
+| `--layer-alloc` | false | 레이어별 동적 할당 활성화 (prefill attention variance 기반) |
+| `--protected-layers` | — | D2O 레이어 할당 시 보호할 레이어 인덱스 (콤마 구분, 예: `0,1,2`) |
 
 ### KIVI
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--kivi` | false | Q2 KV 압축 활성화 (eviction과 상호배타) |
-| `--kivi-bits` | 2 | 양자화 비트폭 (2, 4, 8) |
-| `--kivi-residual-size` | 32 | 잔여 버퍼 크기 (32의 배수) |
+| `--kv-mode kivi` | (kivi 비활성) | KIVI Q2/Q4/Q8 KV 압축 활성화 (eviction과 상호배타) |
+| `--kv-kivi-bits` | 2 | 양자화 비트폭 (2, 4, 8) |
+| `--kv-kivi-residual-len` | 128 | 잔여 버퍼 크기 (32의 배수) |
 | `--kv-dynamic-quant` | false | 동적 KV 양자화 (Resilience 연동) |
 | `--awqe` | false | AWQE + AW-VOPR 품질 메트릭 활성화 |
 
@@ -2466,7 +2467,7 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `--chat` | false | 멀티턴 REPL 진입. Llama Instruct / Qwen2 전용. standard / `--kivi` / `--kv-offload` / `--eviction-policy` 중 하나와만 호환 |
+| `--chat` | false | 멀티턴 REPL 진입. Llama Instruct / Qwen2 전용. standard / `--kv-mode kivi` / `--kv-mode offload` / `eviction <policy>` subcommand 중 하나와만 호환 |
 | `--system-prompt` | — | 세션 시작 시 프리필되는 system 턴 문자열 |
 | `--chat-socket` | — | Unix domain socket 경로. newline-delimited 입력, 응답 바이트 스트리밍 + `0x04` EOT 종결 (Unix 전용) |
 | `--chat-tcp` | — | TCP listen 주소(예: `127.0.0.1:7878`, `127.0.0.1:0`). `--chat-socket`과 동시 사용 가능 |

@@ -11,8 +11,9 @@ baseline:
   backend: auto
   prefill_chunk_size: 64
   extra_args:
-    - "--eviction-policy"
-    - "h2o"
+    # EvictionCommonArgs (`--protected-prefix`, `--min-kv-cache`) must precede
+    # the `eviction` subcommand — clap derive scopes everything after the
+    # subcommand to the per-policy args struct.
     - "--protected-prefix"
     - "4"
     # min_kv_cache 기본값 256 은 short_smoke 프롬프트(≈28 토큰) 에서 eviction 이
@@ -20,6 +21,8 @@ baseline:
     # 정합성만 검증하므로 하한을 내려 directive 가 실제 eviction 을 수행하도록 한다.
     - "--min-kv-cache"
     - "8"
+    - "eviction"
+    - "h2o"
 action:
   enable_resilience: true
   injection_schedule:

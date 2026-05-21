@@ -4,7 +4,7 @@
 //! (F16, F32, Q4_0). Extracted from `transformer.rs::load_with_dtype` so they
 //! can be reused by any `TensorSource` implementation.
 
-use crate::core::quant::{BlockQ4_0, QK4_0};
+use crate::quant::{BlockQ4_0, QK4_0};
 use half::f16;
 
 /// Convert BF16 raw bytes to F16 values in a pre-allocated destination buffer.

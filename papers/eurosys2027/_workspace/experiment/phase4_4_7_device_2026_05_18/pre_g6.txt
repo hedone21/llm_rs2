@@ -1,0 +1,9 @@
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The capital of France is Paris. It has a population of about 2 million people and covers an area of 104 square kilometers (km2). The city is divided into
+Done.
+[Profile] Event: End
+TTFT: 220.54 ms
+Decode: 28.06 ms/tok (35.6 tok/s) [31 tokens, forward only]
+Decode(excl tok[0]): 28.04 ms/tok (35.7 tok/s) [30 tokens] | tok[0]=28.74 ms
+Avg TBT: 29.81 ms (33.5 tokens/sec)

@@ -7,8 +7,8 @@
 //!
 //! Spec: INV-127, ENG-DAT-095, ENG-ALG-215.
 
-use llm_rs2::core::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 use llm_rs2::models::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
+use llm_rs2::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -20,6 +20,8 @@ fn make_importance(entries: Vec<(usize, f32)>) -> ImportanceTable {
             sublayer: SubLayer::Full,
             importance: imp,
             opr: 0.0,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         })
         .collect();
     ImportanceTable::from_entries(entries)
@@ -137,18 +139,18 @@ fn inv_127_nan_layer_not_re_selected_even_if_currently_swapped() {
     );
 }
 
-/// NaN propagation check: compute_qcf_swap with a NaN layer in the swap_set
+/// NaN propagation check: compute_qcf_weight_swap with a NaN layer in the swap_set
 /// must still produce a finite value (NaN layer contributes 0 to both parts).
 #[test]
-fn inv_127_compute_qcf_swap_nan_layer_contributes_zero() {
-    use llm_rs2::models::weights::compute_qcf_swap;
+fn inv_127_compute_qcf_weight_swap_nan_layer_contributes_zero() {
+    use llm_rs2::models::weights::compute_qcf_weight_swap;
 
     let noise = QuantNoiseTable::from_values(vec![0.2, f32::NAN, 0.3, 0.05]);
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
 
     // Include layer 1 (NaN ε) in the swap set explicitly
-    let qcf_with_nan = compute_qcf_swap(&[0, 1, 2], &noise, Some(&importance), 4);
-    let qcf_without_nan = compute_qcf_swap(&[0, 2], &noise, Some(&importance), 4);
+    let qcf_with_nan = compute_qcf_weight_swap(&[0, 1, 2], &noise, Some(&importance), 4);
+    let qcf_without_nan = compute_qcf_weight_swap(&[0, 2], &noise, Some(&importance), 4);
 
     assert!(
         qcf_with_nan.is_finite(),

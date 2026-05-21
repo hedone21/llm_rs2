@@ -17,16 +17,16 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use crate::auf::{AufView, BackendTag, LAYER_IDX_CROSS, TensorDType, TensorKind, open as auf_open};
+use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::auf_view_buffer::AufViewBuffer;
-use crate::core::backend::Backend;
-use crate::core::buffer::{Buffer, DType};
-use crate::core::memory::Memory;
-use crate::core::shape::Shape;
-use crate::core::tensor::Tensor;
+use crate::buffer::{Buffer, DType};
+use crate::memory::Memory;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::loader::auf::secondary::auf_dtype_to_engine;
 use crate::models::loader::{LayerBiasKind, LayerWeightKind, TensorId, TensorSource};
+use crate::shape::Shape;
+use crate::tensor::Tensor;
 
 use super::{AufDtypeChoice, AufVariantChoice};
 

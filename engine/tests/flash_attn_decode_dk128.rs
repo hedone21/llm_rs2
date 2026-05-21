@@ -16,9 +16,9 @@ use llm_rs2::backend::opencl::OpenCLBackend;
 /// lives on device in Task 5.
 #[test]
 fn flash_attn_decode_dk128_self_consistent() {
+    use llm_rs2::backend::Backend;
     use llm_rs2::backend::opencl::memory::OpenCLMemory;
-    use llm_rs2::core::backend::Backend;
-    use llm_rs2::core::memory::Memory;
+    use llm_rs2::memory::Memory;
     use std::sync::Arc;
 
     let backend = match OpenCLBackend::new() {
@@ -149,38 +149,32 @@ fn flash_attn_decode_dk128_self_consistent() {
 }
 
 fn upload_f32(
-    backend: &std::sync::Arc<dyn llm_rs2::core::backend::Backend>,
-    memory: &dyn llm_rs2::core::memory::Memory,
+    backend: &std::sync::Arc<dyn llm_rs2::backend::Backend>,
+    memory: &dyn llm_rs2::memory::Memory,
     data: &[f32],
     shape: Vec<usize>,
-) -> llm_rs2::core::tensor::Tensor {
+) -> llm_rs2::tensor::Tensor {
     let buf = memory
-        .alloc(data.len() * 4, llm_rs2::core::buffer::DType::F32)
+        .alloc(data.len() * 4, llm_rs2::buffer::DType::F32)
         .unwrap();
-    let mut t = llm_rs2::core::tensor::Tensor::new(
-        llm_rs2::core::shape::Shape::new(shape),
-        buf,
-        backend.clone(),
-    );
+    let mut t =
+        llm_rs2::tensor::Tensor::new(llm_rs2::shape::Shape::new(shape), buf, backend.clone());
     let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     backend.write_buffer(&mut t, bytes).unwrap();
     t
 }
 
 fn upload_f16(
-    backend: &std::sync::Arc<dyn llm_rs2::core::backend::Backend>,
-    memory: &dyn llm_rs2::core::memory::Memory,
+    backend: &std::sync::Arc<dyn llm_rs2::backend::Backend>,
+    memory: &dyn llm_rs2::memory::Memory,
     data: &[u16],
     shape: Vec<usize>,
-) -> llm_rs2::core::tensor::Tensor {
+) -> llm_rs2::tensor::Tensor {
     let buf = memory
-        .alloc(data.len() * 2, llm_rs2::core::buffer::DType::F16)
+        .alloc(data.len() * 2, llm_rs2::buffer::DType::F16)
         .unwrap();
-    let mut t = llm_rs2::core::tensor::Tensor::new(
-        llm_rs2::core::shape::Shape::new(shape),
-        buf,
-        backend.clone(),
-    );
+    let mut t =
+        llm_rs2::tensor::Tensor::new(llm_rs2::shape::Shape::new(shape), buf, backend.clone());
     let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
     backend.write_buffer(&mut t, bytes).unwrap();
     t

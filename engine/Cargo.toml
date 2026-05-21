@@ -66,6 +66,8 @@ zbus = { version = "5", optional = true, default-features = false, features = ["
 tempfile = "3.0"
 
 [dev-dependencies]
+# compile-fail / compile-pass tests for session typestate (INV-LAYER-007).
+trybuild = "1.0"
 
 [build-dependencies]
 bindgen = { version = "0.71", optional = true }
@@ -78,3 +80,254 @@ qnn = ["libloading", "bindgen", "dep:qnn_oppkg"]  # QNN HTP PoC + M3 backend wir
 cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)
 cuda-embedded = ["cudarc"]      # Embedded UMA version, e.g. Jetson Xavier (cuda_embedded/)
 resilience = ["zbus"]
+
+# ─── Microbench / probe binaries (Phase 4-D: moved from src/bin/) ───
+# Cargo는 src/bin/*.rs만 자동 binary로 인식하므로 src/ 밖 path는 [[bin]] 명시 필요.
+[[bin]]
+name = "microbench_ahb_iocoherent"
+path = "microbench/ahb_iocoherent.rs"
+
+[[bin]]
+name = "microbench_async_write"
+path = "microbench/async_write.rs"
+
+[[bin]]
+name = "microbench_flash_attn"
+path = "microbench/flash_attn.rs"
+
+[[bin]]
+name = "microbench_h2d_baseline"
+path = "microbench/h2d_baseline.rs"
+
+[[bin]]
+name = "microbench_host_flags"
+path = "microbench/host_flags.rs"
+
+[[bin]]
+name = "microbench_htp_correctness"
+path = "microbench/htp_correctness.rs"
+
+[[bin]]
+name = "microbench_htp_gpu_matmul_concurrent"
+path = "microbench/htp_gpu_matmul_concurrent.rs"
+
+[[bin]]
+name = "microbench_htp_gpu_parallel"
+path = "microbench/htp_gpu_parallel.rs"
+
+[[bin]]
+name = "microbench_htp_graph_reuse"
+path = "microbench/htp_graph_reuse.rs"
+
+[[bin]]
+name = "microbench_htp_matmul_correctness"
+path = "microbench/htp_matmul_correctness.rs"
+
+[[bin]]
+name = "microbench_htp_opencl_interop"
+path = "microbench/htp_opencl_interop.rs"
+
+[[bin]]
+name = "microbench_htp_qnngpu_share"
+path = "microbench/htp_qnngpu_share.rs"
+
+[[bin]]
+name = "microbench_htp_rpcmem_throughput"
+path = "microbench/htp_rpcmem_throughput.rs"
+
+[[bin]]
+name = "microbench_htp_throughput"
+path = "microbench/htp_throughput.rs"
+
+[[bin]]
+name = "microbench_launch"
+path = "microbench/launch.rs"
+
+[[bin]]
+name = "micro_bench"
+path = "microbench/micro_bench.rs"
+
+[[bin]]
+name = "microbench_migrate_prewarm"
+path = "microbench/migrate_prewarm.rs"
+
+[[bin]]
+name = "microbench_oppkg_async_swap"
+path = "microbench/oppkg_async_swap.rs"
+
+[[bin]]
+name = "microbench_oppkg_chain_amortize"
+path = "microbench/oppkg_chain_amortize.rs"
+
+[[bin]]
+name = "microbench_oppkg_dynamic_shape"
+path = "microbench/oppkg_dynamic_shape.rs"
+
+[[bin]]
+name = "microbench_oppkg_gemv_vs_baseline"
+path = "microbench/oppkg_gemv_vs_baseline.rs"
+
+[[bin]]
+name = "microbench_oppkg_mixed_layer"
+path = "microbench/oppkg_mixed_layer.rs"
+
+[[bin]]
+name = "microbench_ops"
+path = "microbench/ops.rs"
+
+[[bin]]
+name = "probe_cl_extensions"
+path = "microbench/probe_cl_extensions.rs"
+
+[[bin]]
+name = "probe_inference_loop"
+path = "microbench/probe_inference_loop.rs"
+
+[[bin]]
+name = "probe_qcom_alloc"
+path = "microbench/probe_qcom_alloc.rs"
+
+[[bin]]
+name = "microbench_qnn_28layer_tbt"
+path = "microbench/qnn_28layer_tbt.rs"
+
+[[bin]]
+name = "microbench_qnngpu_clmem_share"
+path = "microbench/qnngpu_clmem_share.rs"
+
+[[bin]]
+name = "microbench_qnngpu_htp_concurrent"
+path = "microbench/qnngpu_htp_concurrent.rs"
+
+[[bin]]
+name = "microbench_qnngpu_matmul_tbt"
+path = "microbench/qnngpu_matmul_tbt.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_add_correct"
+path = "microbench/qnn_oppkg_add_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_chain5_correct"
+path = "microbench/qnn_oppkg_chain5_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_chain_correct"
+path = "microbench/qnn_oppkg_chain_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_deq_q40_correct"
+path = "microbench/qnn_oppkg_deq_q40_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_flash_attn_correct"
+path = "microbench/qnn_oppkg_flash_attn_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_flash_attn_qwen"
+path = "microbench/qnn_oppkg_flash_attn_qwen.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_kv_scatter_correct"
+path = "microbench/qnn_oppkg_kv_scatter_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_leak"
+path = "microbench/qnn_oppkg_leak.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_matmul_correct"
+path = "microbench/qnn_oppkg_matmul_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_matmul_q40_correct"
+path = "microbench/qnn_oppkg_matmul_q40_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_oop_chain_correct"
+path = "microbench/qnn_oppkg_oop_chain_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_reduced3_correct"
+path = "microbench/qnn_oppkg_reduced3_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_rmsnorm_correct"
+path = "microbench/qnn_oppkg_rmsnorm_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_rope_correct"
+path = "microbench/qnn_oppkg_rope_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_silu_mul_correct"
+path = "microbench/qnn_oppkg_silu_mul_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_softmax_correct"
+path = "microbench/qnn_oppkg_softmax_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_oppkg_test"
+path = "microbench/qnn_oppkg_test.rs"
+
+[[bin]]
+name = "microbench_qnn_prebuilt_chain_correct"
+path = "microbench/qnn_prebuilt_chain_correct.rs"
+
+[[bin]]
+name = "microbench_qnn_probe"
+path = "microbench/qnn_probe.rs"
+
+[[bin]]
+name = "microbench_qnn_qwen_layer_2graph"
+path = "microbench/qnn_qwen_layer_2graph.rs"
+
+[[bin]]
+name = "microbench_qnn_qwen_layer_bisect2"
+path = "microbench/qnn_qwen_layer_bisect2.rs"
+
+[[bin]]
+name = "microbench_qnn_qwen_layer_bisect"
+path = "microbench/qnn_qwen_layer_bisect.rs"
+
+[[bin]]
+name = "microbench_qnn_qwen_layer"
+path = "microbench/qnn_qwen_layer.rs"
+
+[[bin]]
+name = "microbench_qnn_weight_mutability_poc"
+path = "microbench/qnn_weight_mutability_poc.rs"
+
+[[bin]]
+name = "microbench_recordable_queues"
+path = "microbench/recordable_queues.rs"
+
+[[bin]]
+name = "stage1_host_ptr_microbench"
+path = "microbench/stage1_host_ptr_microbench.rs"
+
+[[bin]]
+name = "stage2_pool_stability"
+path = "microbench/stage2_pool_stability.rs"
+
+[[bin]]
+name = "microbench_svm_throughput"
+path = "microbench/svm_throughput.rs"
+
+[[bin]]
+name = "microbench_two_queue_concurrent"
+path = "microbench/two_queue_concurrent.rs"
+
+[[bin]]
+name = "microbench_vulkan_h2d_baseline"
+path = "microbench/vulkan_h2d_baseline.rs"
+
+[[bin]]
+name = "microbench_vulkan_hello"
+path = "microbench/vulkan_hello.rs"
+
+[[bin]]
+name = "microbench_vulkan_two_queue"
+path = "microbench/vulkan_two_queue.rs"
+

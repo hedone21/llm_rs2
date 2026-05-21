@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-use llm_rs2::core::chat_ipc::{
+use llm_rs2::session::chat_ipc::{
     ChatInput, finish_reply_stream, spawn_socket_listener, spawn_tcp_listener, write_reply_bytes,
 };
 use std::io::{Read, Write};

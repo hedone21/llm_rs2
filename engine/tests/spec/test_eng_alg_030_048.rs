@@ -3,10 +3,10 @@
 //! SkipConfig uniform_init, validate, layer_importance QCF,
 //! eviction_qcf proxy, quant_qcf NMSE/OPR, skip_qcf acceptance tracker.
 
-use llm_rs2::core::qcf::layer_importance::{ImportanceEntry, SubLayer};
-use llm_rs2::core::qcf::quant_qcf::compute_nmse_block;
-use llm_rs2::core::qcf::{ImportanceTable, SkipQcfTracker};
-use llm_rs2::core::skip_config::SkipConfig;
+use llm_rs2::inference::skip_config::SkipConfig;
+use llm_rs2::qcf::layer_importance::{ImportanceEntry, SubLayer};
+use llm_rs2::qcf::quant_qcf::compute_nmse_block;
+use llm_rs2::qcf::{ImportanceTable, SkipQcfTracker};
 
 // ══════════════════════════════════════════════════════════════
 // ENG-ALG-030: SkipConfig uniform_init
@@ -61,7 +61,7 @@ fn test_eng_alg_030_c03_validate_last_layer_skip() {
 
 #[test]
 fn test_eng_alg_030_perturb_respects_boundaries() {
-    use llm_rs2::core::speculative::SkipOptimizer;
+    use llm_rs2::inference::speculative::SkipOptimizer;
 
     let base = SkipConfig::uniform_init(16, 0.3);
     let perturbed = SkipOptimizer::perturb(&base, 16, 42);
@@ -86,18 +86,24 @@ fn test_eng_alg_032_importance_table_full_skip() {
             sublayer: SubLayer::Full,
             importance: 0.5,
             opr: 0.1,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 1,
             sublayer: SubLayer::Full,
             importance: 0.3,
             opr: 0.2,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 2,
             sublayer: SubLayer::Full,
             importance: 0.2,
             opr: 0.3,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
     ];
     let table = ImportanceTable::from_entries(entries);
@@ -108,7 +114,7 @@ fn test_eng_alg_032_importance_table_full_skip() {
         (1, SubLayer::Full),
         (2, SubLayer::Full),
     ];
-    let qcf = table.compute_qcf(&skip_set);
+    let qcf = table.compute_qcf_weight(&skip_set);
     assert!((qcf - 1.0).abs() < 1e-6);
 }
 
@@ -120,25 +126,31 @@ fn test_eng_alg_032_importance_table_partial_skip() {
             sublayer: SubLayer::Full,
             importance: 0.5,
             opr: 0.1,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 1,
             sublayer: SubLayer::Full,
             importance: 0.3,
             opr: 0.2,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 2,
             sublayer: SubLayer::Full,
             importance: 0.2,
             opr: 0.3,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
     ];
     let table = ImportanceTable::from_entries(entries);
 
     // layer 2만 skip → QCF = 0.2 / 1.0 = 0.2
     let skip_set = vec![(2, SubLayer::Full)];
-    let qcf = table.compute_qcf(&skip_set);
+    let qcf = table.compute_qcf_weight(&skip_set);
     assert!((qcf - 0.2).abs() < 1e-6);
 }
 
@@ -149,9 +161,11 @@ fn test_eng_alg_032_importance_table_empty_skip() {
         sublayer: SubLayer::Full,
         importance: 0.5,
         opr: 0.1,
+        importance_mean_pool: None,
+        importance_shortgpt_bi: None,
     }];
     let table = ImportanceTable::from_entries(entries);
-    let qcf = table.compute_qcf(&[]);
+    let qcf = table.compute_qcf_weight(&[]);
     assert_eq!(qcf, 0.0);
 }
 
@@ -163,24 +177,32 @@ fn test_eng_alg_032_estimate_qcf_protects_first_last() {
             sublayer: SubLayer::Full,
             importance: 0.1,
             opr: 0.05,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 1,
             sublayer: SubLayer::Full,
             importance: 0.3,
             opr: 0.1,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 2,
             sublayer: SubLayer::Full,
             importance: 0.5,
             opr: 0.2,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 3,
             sublayer: SubLayer::Full,
             importance: 0.1,
             opr: 0.05,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
     ];
     let table = ImportanceTable::from_entries(entries);
@@ -204,30 +226,40 @@ fn test_eng_alg_032_estimate_qcf_selects_least_important() {
             sublayer: SubLayer::Full,
             importance: 0.9,
             opr: 0.5,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 1,
             sublayer: SubLayer::Full,
             importance: 0.1,
             opr: 0.02,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 2,
             sublayer: SubLayer::Full,
             importance: 0.8,
             opr: 0.4,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 3,
             sublayer: SubLayer::Full,
             importance: 0.2,
             opr: 0.05,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
         ImportanceEntry {
             layer_id: 4,
             sublayer: SubLayer::Full,
             importance: 0.7,
             opr: 0.3,
+            importance_mean_pool: None,
+            importance_shortgpt_bi: None,
         },
     ];
     let table = ImportanceTable::from_entries(entries);
@@ -247,7 +279,7 @@ fn test_eng_alg_032_estimate_qcf_selects_least_important() {
 
 #[test]
 fn test_eng_alg_045_nmse_block_q8() {
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::quant::QKKV;
 
     let mut original = [0.0f32; QKKV];
     for (i, slot) in original.iter_mut().enumerate().take(QKKV) {
@@ -261,7 +293,7 @@ fn test_eng_alg_045_nmse_block_q8() {
 
 #[test]
 fn test_eng_alg_045_nmse_block_q2() {
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::quant::QKKV;
 
     let mut original = [0.0f32; QKKV];
     for (i, slot) in original.iter_mut().enumerate().take(QKKV) {
@@ -283,9 +315,9 @@ fn test_eng_alg_045_nmse_block_q2() {
 
 #[test]
 fn test_eng_alg_046_flush_proxy_basic() {
-    use llm_rs2::core::qcf::QcfConfig;
-    use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::qcf::QcfConfig;
+    use llm_rs2::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
+    use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
     let head_dim = QKKV; // = 32
@@ -316,9 +348,9 @@ fn test_eng_alg_046_flush_proxy_basic() {
 
 #[test]
 fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
-    use llm_rs2::core::qcf::QcfConfig;
-    use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::qcf::QcfConfig;
+    use llm_rs2::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
+    use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
     let head_dim = QKKV;
@@ -363,9 +395,9 @@ fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
 
 #[test]
 fn test_eng_alg_047_flush_opr_basic() {
-    use llm_rs2::core::qcf::QcfConfig;
-    use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::qcf::QcfConfig;
+    use llm_rs2::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
+    use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
     let head_dim = QKKV;
@@ -393,9 +425,9 @@ fn test_eng_alg_047_flush_opr_basic() {
 
 #[test]
 fn test_eng_alg_047_flush_opr_q2_higher() {
-    use llm_rs2::core::qcf::QcfConfig;
-    use llm_rs2::core::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
-    use llm_rs2::core::quant::QKKV;
+    use llm_rs2::qcf::QcfConfig;
+    use llm_rs2::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
+    use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
     let head_dim = QKKV;

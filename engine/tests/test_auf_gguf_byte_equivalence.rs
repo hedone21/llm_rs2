@@ -11,13 +11,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::tensor::Tensor;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::loader::auf::{AufDtypeChoice, AufSource, AufVariantChoice};
 use llm_rs2::models::loader::gguf::GgufSource;
 use llm_rs2::models::loader::{LayerBiasKind, LayerWeightKind, TensorId, TensorSource};
+use llm_rs2::tensor::Tensor;
 
 const GGUF_REL: &str = "models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf";
 const AUF_REL: &str = "models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-aos.auf";

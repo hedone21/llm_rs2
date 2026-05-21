@@ -11,8 +11,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::core::quant::{BlockQ4_0, QK4_0};
 use crate::models::weights::secondary_mmap::SecondaryMmap;
+use crate::quant::{BlockQ4_0, QK4_0};
 
 // ── QuantNoiseTable ───────────────────────────────────────────────────────────
 
@@ -218,13 +218,13 @@ impl QuantNoiseTable {
 fn compute_tensor_epsilon(
     layer_idx: usize,
     subname: &str,
-    primary: &crate::core::tensor::Tensor,
+    primary: &crate::tensor::Tensor,
     secondary: &SecondaryMmap,
 ) -> Option<f32> {
     let info = secondary.layer_tensor(layer_idx, subname)?;
 
     // Verify that the secondary dtype is Q4_0 before dequantizing.
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     if info.dtype != DType::Q4_0 {
         log::warn!(
             "ε calc: layer {} '{}' secondary dtype is {:?}, not Q4_0 — skipping",
@@ -347,7 +347,7 @@ pub fn compute_input_aware_epsilon(
     secondary: &Arc<SecondaryMmap>,
     x_means: &[Vec<f32>],
 ) -> Vec<f32> {
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     let n = primary_slots.len();
     let mut result = vec![f32::NAN; n];
     if x_means.len() != n {
@@ -451,7 +451,7 @@ pub fn compute_input_aware_epsilon_absolute(
     secondary: &Arc<SecondaryMmap>,
     x_means: &[Vec<f32>],
 ) -> Vec<f32> {
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     let n = primary_slots.len();
     let mut result = vec![f32::NAN; n];
     if x_means.len() != n {
@@ -612,7 +612,7 @@ pub fn compute_input_aware_epsilon_multitensor(
 
     for (i, (slot, x_mean)) in primary_slots.iter().zip(x_means.iter()).enumerate() {
         let weights = slot.load_weights();
-        let tensors: [&crate::core::tensor::Tensor; 6] = [
+        let tensors: [&crate::tensor::Tensor; 6] = [
             &weights.wq,
             &weights.wk,
             &weights.wv,
@@ -647,11 +647,11 @@ pub fn compute_input_aware_epsilon_multitensor(
 fn input_aware_relative_epsilon(
     layer_idx: usize,
     subname: &str,
-    primary_tensor: &crate::core::tensor::Tensor,
+    primary_tensor: &crate::tensor::Tensor,
     secondary: &Arc<SecondaryMmap>,
     x_mean: &[f32],
 ) -> Option<f32> {
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     const EPS: f64 = 1e-12;
 
     let dims = primary_tensor.shape().dims();
@@ -705,8 +705,8 @@ fn input_aware_relative_epsilon(
 ///
 /// Supports F32 and F16 dtype buffers.  Returns `None` for Q4_0 primaries
 /// (should not occur for the ε calculation path) or on access failure.
-fn primary_tensor_to_f32(tensor: &crate::core::tensor::Tensor) -> Option<Vec<f32>> {
-    use crate::core::buffer::DType;
+fn primary_tensor_to_f32(tensor: &crate::tensor::Tensor) -> Option<Vec<f32>> {
+    use crate::buffer::DType;
     use half::f16;
 
     let numel = tensor.shape().numel();
@@ -872,7 +872,7 @@ fn load_q4_dequant(
     out_dim: usize,
     in_dim: usize,
 ) -> Option<Vec<f32>> {
-    use crate::core::buffer::DType;
+    use crate::buffer::DType;
     let info = secondary.layer_tensor(layer_idx, subname)?;
     if info.dtype != DType::Q4_0 {
         return None;

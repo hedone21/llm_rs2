@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 
-use crate::core::buffer::DType;
+use crate::buffer::DType;
 use crate::layers::transformer_layer::TransformerLayer;
 
 use super::secondary_mmap::SecondaryMmap;
