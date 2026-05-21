@@ -2,9 +2,6 @@ use clap::Parser;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
-use llm_rs2::observability::events::{self, CacheEvent, StderrDiagnosticSink};
-use llm_rs2::observability::rss_trace::{io_trace, rss_trace};
-use llm_rs2::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::inference::sampling::{self, SamplingConfig};
 use llm_rs2::layers::workspace::{
@@ -13,6 +10,8 @@ use llm_rs2::layers::workspace::{
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use llm_rs2::observability::events::{self, CacheEvent, StderrDiagnosticSink};
+use llm_rs2::observability::rss_trace::{io_trace, rss_trace};
 use llm_rs2::pressure::cache_manager::CacheManager;
 use llm_rs2::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::pressure::eviction::h2o::H2OPolicy;
@@ -22,6 +21,7 @@ use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
 use llm_rs2::pressure::kivi_cache::KiviCache;
 use llm_rs2::pressure::kv_cache::{KVCache, KVLayout};
 use llm_rs2::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
+use llm_rs2::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::session::cli::{Args, KvMode, parse_qcf_sample_layers};
 use llm_rs2::session::eval::load_eval_questions;
 use llm_rs2::session::ppl::run_kivi_ppl;
@@ -1807,7 +1807,7 @@ fn main() -> anyhow::Result<()> {
             actual_protected_prefix,
             auto_eviction,
             start_time,
-            layer_swap_estimator: Box::new(|model, table| build_layer_swap_estimate(model, table)),
+            layer_swap_estimator: Box::new(build_layer_swap_estimate),
             kv_caches,
             tokens,
             start_pos,

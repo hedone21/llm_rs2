@@ -14,7 +14,6 @@ use std::io::Write as _;
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-use crate::session::chat_template::ChatTemplate;
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::models::config::ModelArch;
 use crate::session::chat::session::ChatSession;
@@ -22,6 +21,7 @@ use crate::session::chat::stop_condition::{ChatStopCondition, build_chat_stop_id
 use crate::session::chat_ipc::{
     ChatInput, finish_reply_stream, spawn_chat_input_sources, write_reply_bytes,
 };
+use crate::session::chat_template::ChatTemplate;
 
 /// [`run_chat_repl_v2`]에 전달하는 인자 struct.
 ///

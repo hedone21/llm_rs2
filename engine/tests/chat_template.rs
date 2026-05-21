@@ -1,7 +1,7 @@
 //! Integration tests for the chat template module — byte-exact goldens.
 
-use llm_rs2::session::chat_template::ChatTemplate;
 use llm_rs2::models::config::ModelArch;
+use llm_rs2::session::chat_template::ChatTemplate;
 
 #[test]
 fn llama_system_golden() {

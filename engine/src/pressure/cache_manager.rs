@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::observability::events::{CacheEvent, EventSink, NoOpSink};
-use crate::resilience::sys_monitor::SystemMonitor;
 use crate::pressure::eviction::EvictionPolicy;
 use crate::pressure::kv_cache::{KVCache, max_cache_pos};
 use crate::pressure::{
@@ -12,6 +11,7 @@ use crate::pressure::{
     PressureLevel, PressureStageConfig, SwapHandler,
 };
 use crate::resilience::EvictMethod;
+use crate::resilience::sys_monitor::SystemMonitor;
 use std::path::PathBuf;
 
 /// Result of an eviction attempt.
@@ -668,10 +668,10 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
-    use crate::resilience::sys_monitor::MemoryStats;
     use crate::memory::host::shared::SharedBuffer;
     use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
     use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
+    use crate::resilience::sys_monitor::MemoryStats;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;
