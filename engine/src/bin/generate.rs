@@ -99,11 +99,11 @@ fn main() -> anyhow::Result<()> {
     let sampling_config = ctx.sampling_config;
     let model_path = &ctx.model_path;
     let is_gguf = ctx.is_gguf;
-    let mut backend = ctx.backend;
+    let backend = ctx.backend;
     let memory = ctx.memory;
     let gpu_backend_arc = ctx.gpu_backend_arc;
     let gpu_memory_arc = ctx.gpu_memory_arc;
-    let mut is_gpu = ctx.is_gpu;
+    let is_gpu = ctx.is_gpu;
     let weights_on_gpu = ctx.weights_on_gpu;
     let cpu_backend_arc = ctx.cpu_backend_arc;
     let cpu_memory_arc = ctx.cpu_memory_arc;
@@ -957,7 +957,7 @@ fn main() -> anyhow::Result<()> {
     // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE).
     let use_gqa = args.eviction_policy() == "h2o_plus" || needs_caote || has_eviction_policy;
 
-    let mut score_accumulator = if needs_accumulator {
+    let score_accumulator = if needs_accumulator {
         let acc = if use_gqa {
             AttentionScoreAccumulator::new_gqa(
                 max_seq_len,
@@ -1812,10 +1812,10 @@ fn main() -> anyhow::Result<()> {
             command_executor,
         })?;
     let llm_rs2::session::prefill::PrefillOutput {
-        mut kv_caches,
-        mut tokens,
+        kv_caches,
+        tokens,
         mut start_pos,
-        mut profiler,
+        profiler,
         variance_collector,
         importance_table_for_swap,
         mut collector_armed,
@@ -1824,7 +1824,7 @@ fn main() -> anyhow::Result<()> {
         mut last_skip_ratio,
         mut throttle_delay_ms,
         mut command_executor,
-        mut logits,
+        logits,
         eos_id,
         ttft_ms: _ttft_ms_out,
         last_token_time,
