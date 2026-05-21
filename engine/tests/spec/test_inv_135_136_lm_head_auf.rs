@@ -11,14 +11,14 @@
 //!
 //! Spec: INV-135, INV-136, ENG-ALG-223 §2.5b, Sprint G-1-A/D decisions.
 
-use llm_shared::auf::error::AufError;
-use llm_shared::auf::reader::{BackendTag, open_from_bytes};
-use llm_shared::auf::tensor_index::{
+use llm_rs2::auf::error::AufError;
+use llm_rs2::auf::reader::{BackendTag, open_from_bytes};
+use llm_rs2::auf::tensor_index::{
     LAYER_IDX_CROSS, TensorDType, TensorEntry, TensorIndex, TensorKind,
 };
-use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
-use llm_shared::auf::writer::AufWriter;
-use llm_shared::auf::{AufMeta, section::TAG_WEIGHTS_CPU_AOS};
+use llm_rs2::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+use llm_rs2::auf::writer::AufWriter;
+use llm_rs2::auf::{AufMeta, section::TAG_WEIGHTS_CPU_AOS};
 
 // ── Fixture helpers ──────────────────────────────────────────────────────────
 

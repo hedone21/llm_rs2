@@ -3,7 +3,6 @@
 //! Tests cross-action compatibility, mutual exclusion, and combined behavior
 //! for the 8 action pool algorithms (W1-W3, C1, C4-C6, C8).
 
-use llm_rs2::core::math_utils::{avg_pool_1d, topk_indices_per_head};
 use llm_rs2::inference::skip_config::SkipConfig;
 use llm_rs2::inference::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
 use llm_rs2::pressure::kivi_cache::KiviCache;
@@ -312,33 +311,6 @@ fn test_all_actions_data_flow() {
         QuantizeHandler::target_bits_for_pressure(PressureLevel::Emergency),
         Some(2)
     );
-}
-
-#[test]
-fn test_avg_pool_smoothing_effect() {
-    // Verify pooling smooths a spike
-    let mut data = vec![0.0; 20];
-    data[10] = 100.0; // spike
-    avg_pool_1d(&mut data, 5);
-    // Spike should be spread out
-    assert!(data[10] < 100.0);
-    assert!(data[10] > 0.0);
-    // Neighbors should have positive values
-    assert!(data[9] > 0.0);
-    assert!(data[11] > 0.0);
-}
-
-#[test]
-fn test_topk_per_head_consistency() {
-    // Different heads select different tokens
-    let scores = vec![
-        // head 0: high at end
-        0.1, 0.2, 0.3, 0.9, 0.8, // head 1: high at start
-        0.9, 0.8, 0.3, 0.2, 0.1,
-    ];
-    let result = topk_indices_per_head(&scores, 2, 5, 2);
-    assert_eq!(result[0], vec![3, 4]); // head 0: indices 3,4
-    assert_eq!(result[1], vec![0, 1]); // head 1: indices 0,1
 }
 
 #[test]

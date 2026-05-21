@@ -266,7 +266,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
             if let Some((ratio, n_planned, plan_start, qcf_estimated)) =
                 ctx.manager_swap_report_pending.take()
             {
-                use crate::models::weights::compute_qcf_swap;
+                use crate::models::weights::compute_qcf_weight_swap;
                 let latency_ms = plan_start.elapsed().as_millis() as u64;
                 let n_layers = ctx.model.layers.len();
                 let actually_swapped_now: Vec<usize> = (0..n_layers)
@@ -275,7 +275,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                 let qcf_swap_actual = if actually_swapped_now.is_empty() {
                     qcf_estimated
                 } else {
-                    compute_qcf_swap(
+                    compute_qcf_weight_swap(
                         &actually_swapped_now,
                         &ctx.model.quant_noise,
                         ctx.importance_table_for_swap.as_ref(),

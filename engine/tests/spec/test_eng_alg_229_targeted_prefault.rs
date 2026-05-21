@@ -15,12 +15,12 @@
 
 use llm_rs2::models::config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::{SecondaryDtypeChoice, build_auf_secondary_from_view};
-use llm_shared::auf::reader::open_from_bytes;
-use llm_shared::auf::section::TAG_WEIGHTS_CPU_AOS;
-use llm_shared::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
-use llm_shared::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
-use llm_shared::auf::writer::AufWriter;
-use llm_shared::auf::{AufMeta, BackendTag};
+use llm_rs2::auf::reader::open_from_bytes;
+use llm_rs2::auf::section::TAG_WEIGHTS_CPU_AOS;
+use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+use llm_rs2::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
+use llm_rs2::auf::writer::AufWriter;
+use llm_rs2::auf::{AufMeta, BackendTag};
 
 // ── Common fixture builder ───────────────────────────────────────────────────
 

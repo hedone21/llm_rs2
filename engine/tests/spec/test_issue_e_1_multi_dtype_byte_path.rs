@@ -25,8 +25,8 @@
 //! - Sprint F (2026-04-27) ISSUE-E-1 hotfix
 //! - `results/data/weight_swap/v0_2_multi_quant_validation.md` §5
 
-use llm_rs2::auf_dtype_convert::build_dtype_candidates;
-use llm_shared::auf::TensorDType;
+use llm_rs2::auf::dtype_convert::build_dtype_candidates;
+use llm_rs2::auf::TensorDType;
 
 /// (R-1) RMSNorm-style 1-D F16 tensor: multi-dtype 모드 [Q4_0, F16] 명시 시에도
 /// **Q4_0 entry는 생성되지 않아야 한다** (src_dtype F16 1개만 반환).

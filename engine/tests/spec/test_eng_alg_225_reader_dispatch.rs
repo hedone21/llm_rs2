@@ -14,7 +14,7 @@
 //! INV-225: reader dtype dispatch precedence 보존.
 
 use llm_rs2::models::weights::{LoadError, SecondaryDtypeChoice, build_auf_secondary_from_view};
-use llm_shared::auf::{
+use llm_rs2::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, TAG_WEIGHTS_ADRENO_SOA,
     TAG_WEIGHTS_CPU_AOS, TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind,
     open_from_bytes,
@@ -63,7 +63,7 @@ fn make_variant_tag_buf(s: &str) -> [u8; 24] {
 
 /// 단순한 f32 → Q4_0 bytes (32 elements = 1 block = 18 bytes)
 fn q4_0_bytes_32() -> Vec<u8> {
-    use llm_rs2::auf_dtype_convert::convert_tensor_dtype;
+    use llm_rs2::auf::dtype_convert::convert_tensor_dtype;
     let f32_data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
     let f32_bytes: Vec<u8> = unsafe {
         std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4).to_vec()
@@ -73,7 +73,7 @@ fn q4_0_bytes_32() -> Vec<u8> {
 
 /// 단순한 f32 → F16 bytes (32 elements = 64 bytes)
 fn f16_bytes_32() -> Vec<u8> {
-    use llm_rs2::auf_dtype_convert::convert_tensor_dtype;
+    use llm_rs2::auf::dtype_convert::convert_tensor_dtype;
     let f32_data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
     let f32_bytes: Vec<u8> = unsafe {
         std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4).to_vec()

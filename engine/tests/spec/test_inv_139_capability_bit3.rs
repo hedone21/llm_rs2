@@ -9,7 +9,7 @@
 ///
 /// spec: `spec/41-invariants.md` §3.18 (INV-139)
 ///       `spec/33-engine-data.md` §3.22.14 (ENG-DAT-097)
-use llm_shared::auf::{
+use llm_rs2::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, CAPABILITY_BIT_LM_HEAD_Q4_0,
     CAPABILITY_BIT_MULTI_DTYPE, READER_KNOWN_CAPABILITIES, TAG_WEIGHTS_CPU_AOS, TOKENIZER_KIND_BPE,
     open_from_bytes,
@@ -191,7 +191,7 @@ fn inv139_unknown_optional_bit_not_rejected() {
 /// set_multi_dtype_capability(true)가 format_minor를 2로 설정함을 header 레벨에서 검증.
 #[test]
 fn inv139_bit3_set_implies_format_minor_2() {
-    use llm_shared::auf::AufHeader;
+    use llm_rs2::auf::AufHeader;
     let mut h = AufHeader::new_v01("test", [0u8; 32], 0, 0, 0, 256, 65536);
     assert_eq!(h.format_minor, 1);
     h.set_multi_dtype_capability(true);

@@ -1031,7 +1031,7 @@ sequenceDiagram
 
     Note over EIPC,MIPC: 단계 C — QcfEstimate 송출
     EIPC->>QNT: read ε_i
-    EIPC->>EIPC: compute_qcf_swap at 0.25/0.5/1.0 (ENG-ALG-217)
+    EIPC->>EIPC: compute_qcf_weight_swap at 0.25/0.5/1.0 (ENG-ALG-217)
     EIPC->>MIPC: EngineMessage::QcfEstimate<br/>{estimates, layer_swap: Some(...)}
     MIPC-->>MLUA: ctx.qcf.layer_swap
 
@@ -1051,7 +1051,7 @@ sequenceDiagram
 
     Note over EIPC,MIPC: 단계 F — 응답 2개
     EIPC-->>MIPC: CommandResponse{Ok}
-    EIPC->>EIPC: compute_qcf_swap(layer_set) (ENG-ALG-217)
+    EIPC->>EIPC: compute_qcf_weight_swap(layer_set) (ENG-ALG-217)
     EIPC->>MIPC: EngineMessage::WeightSwapReport<br/>{..., qcf_swap_actual}
     MIPC-->>MLUA: ctx.engine.last_swap
 ```

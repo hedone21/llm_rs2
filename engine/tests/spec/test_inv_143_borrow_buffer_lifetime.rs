@@ -37,7 +37,7 @@ use llm_rs2::models::weights::secondary_mmap::{
 };
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
-use llm_shared::auf::{
+use llm_rs2::auf::{
     AufMeta, BackendTag,
     section::TAG_WEIGHTS_CPU_AOS,
     tensor_index::TensorIndex,
@@ -130,7 +130,7 @@ fn build_auf_bytes(n_layers: u32) -> Vec<u8> {
 /// Build an `Arc<SecondaryMmap>` backed by an in-memory AUF payload.
 fn make_secondary(n_layers: usize) -> Arc<SecondaryMmap> {
     let auf_bytes = build_auf_bytes(n_layers as u32);
-    let view = llm_shared::auf::reader::open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
+    let view = llm_rs2::auf::reader::open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
     let config = make_model_config(n_layers);
     let secondary = build_auf_secondary_from_view(
         view,

@@ -6,7 +6,7 @@
 ///
 /// spec: `spec/41-invariants.md` §3.18 (INV-137)
 ///       `spec/33-engine-data.md` §3.22.14 (ENG-DAT-097)
-use llm_shared::auf::{
+use llm_rs2::auf::{
     AufMeta, AufTokenizer, AufWriter, BackendTag, CAPABILITY_BIT_MULTI_DTYPE, LAYER_IDX_CROSS,
     TAG_WEIGHTS_CPU_AOS, TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind,
     open_from_bytes,

@@ -1647,7 +1647,7 @@ for each tensor t in tensor_set_i:
 
 #### 3.12.11 QCF_swap Formula [ENG-ALG-217]
 
-**[ENG-ALG-217]** `compute_qcf_swap(swap_set, noise, importance)`는 주어진 layer swap 집합의 품질 비용을 `[0, 1]` 스칼라로 추정한다. Importance와 ε를 함께 가중한 분자/분모 정규화를 사용한다. *(MUST)*
+**[ENG-ALG-217]** `compute_qcf_weight_swap(swap_set, noise, importance)`는 주어진 layer swap 집합의 품질 비용을 `[0, 1]` 스칼라로 추정한다. Importance와 ε를 함께 가중한 분자/분모 정규화를 사용한다. *(MUST)*
 
 **수식**:
 
@@ -1678,7 +1678,7 @@ QCF_swap(swap_set)
 - `engine/src/core/qcf/` 디렉토리에 신규 파일 `quant_qcf.rs` 추가, 또는 `ImportanceTable`의 impl block에 추가.
 - 공개 함수 시그니처:
   ```
-  pub fn compute_qcf_swap(
+  pub fn compute_qcf_weight_swap(
       swap_set: &[usize],
       noise: &QuantNoiseTable,
       importance: Option<&ImportanceTable>,

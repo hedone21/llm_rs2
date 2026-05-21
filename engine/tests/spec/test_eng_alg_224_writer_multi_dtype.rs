@@ -15,8 +15,8 @@
 //!
 //! INV-137 (multi-dtype shape 일치)도 함께 검증한다.
 
-use llm_rs2::auf_dtype_convert::convert_tensor_dtype;
-use llm_shared::auf::{
+use llm_rs2::auf::dtype_convert::convert_tensor_dtype;
+use llm_rs2::auf::{
     AufMeta, AufTokenizer, AufWriter, BackendTag, CAPABILITY_BIT_MULTI_DTYPE, TAG_WEIGHTS_CPU_AOS,
     TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind, open_from_bytes,
 };

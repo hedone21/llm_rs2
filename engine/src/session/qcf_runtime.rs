@@ -548,7 +548,7 @@ pub fn run_qcf_warmup_workflow(
                 .copied()
                 .filter(|i| *i < model.layers.len())
                 .collect();
-            let qcf_override = crate::models::weights::compute_qcf_swap(
+            let qcf_override = crate::models::weights::compute_qcf_weight_swap(
                 &override_layers,
                 model.quant_noise.as_ref(),
                 Some(&imp_table),
@@ -651,7 +651,7 @@ pub fn dispatch_swap_weights(
     manager_report_out: &mut Option<(f32, usize, std::time::Instant, f32)>,
 ) {
     use crate::models::weights::{
-        IncrementalSwapPlan, SwapDecision, WeightSwapDecider, compute_qcf_swap,
+        IncrementalSwapPlan, SwapDecision, WeightSwapDecider, compute_qcf_weight_swap,
     };
     use llm_shared::DtypeTag;
 
@@ -717,7 +717,7 @@ pub fn dispatch_swap_weights(
     }
 
     // ── 4. Compute QCF estimate for the planned layers ─────────────────────
-    let qcf_swap_estimated = compute_qcf_swap(
+    let qcf_swap_estimated = compute_qcf_weight_swap(
         &decision.selected_layers,
         &model.quant_noise,
         importance_table,
