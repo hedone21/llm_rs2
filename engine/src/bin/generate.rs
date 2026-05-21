@@ -3,7 +3,7 @@ use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::core::events::{self, CacheEvent, StderrDiagnosticSink};
-use llm_rs2::core::rss_trace::{io_trace, read_bytes_now, rss_trace};
+use llm_rs2::core::rss_trace::{io_trace, rss_trace};
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::inference::sampling::{self, SamplingConfig};
@@ -2141,362 +2141,47 @@ fn main() -> anyhow::Result<()> {
 
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
-            // ── Layer-Incremental Swap dispatch (ENG-ALG-233) ──────────────────
-            // Runs after forward, before sampling. Per-tick: drain up to N layers
-            // and call SwapExecutor::execute_on_slots with the chunk.
-            // ENG-ALG-234: plan committed with force-swap-ratio + per_tick > 0;
-            //   new signals during flight are ignored (plan runs to completion).
-            // INV-145: empty chunk is never passed to execute_on_slots.
-            if let Some(ref mut inc_plan) = incremental_force_swap_plan {
-                // LISWAP-6 Dynamic-K: reactive pause + per-tick override.
-                //
-                // - Pause: release queue non-empty → skip swap this tick (K
-                //   stays unchanged). Calibration tick is exempt because it
-                //   has to dispatch K=1 to measure drop cost.
-                // - Pre-drain: inject controller's current K into the plan.
-                let mut dyn_k_pause = false;
-                if let Some(ref ctrl) = dynamic_k_controller {
-                    let pending = model.release_worker.pending_count();
-                    if ctrl.is_calibrated() && ctrl.should_pause(pending) {
-                        dyn_k_pause = true;
-                        if dynamic_k_diag {
-                            eprintln!(
-                                "[DynamicK] pause t={} pending={} k={}",
-                                decode_token_index,
-                                pending,
-                                ctrl.current_k()
-                            );
-                        }
-                    } else {
-                        // Calibration tick forces K=1 (sync measurement);
-                        // subsequent ticks use the controller's current K.
-                        let k = if ctrl.is_calibrated() {
-                            ctrl.current_k()
-                        } else {
-                            1
-                        };
-                        inc_plan.set_per_tick(k);
-                    }
-                } else if let Some(ref ctrl) = probing_k_controller {
-                    let pending = model.release_worker.pending_count();
-                    if ctrl.should_pause(pending) {
-                        dyn_k_pause = true;
-                        if probing_k_diag {
-                            eprintln!(
-                                "[ProbingK] pause t={} pending={} k={}",
-                                decode_token_index,
-                                pending,
-                                ctrl.current_k()
-                            );
-                        }
-                    } else {
-                        inc_plan.set_per_tick(ctrl.current_k());
-                    }
-                }
-                let chunk = if dyn_k_pause {
-                    Vec::new()
-                } else {
-                    inc_plan.drain_chunk()
-                };
-                if !chunk.is_empty() {
-                    let t_swap = std::time::Instant::now();
-                    let io_before = read_bytes_now();
-                    match run_layer_swap(
-                        &model,
-                        &chunk,
-                        gpu_backend_arc.as_ref(),
-                        &cpu_backend_arc,
-                        async_swap_dispatcher.as_ref(),
-                        #[cfg(feature = "opencl")]
-                        host_ptr_swap_pool.clone(),
-                        #[cfg(feature = "cuda-embedded")]
-                        layer_swap_pool.clone(),
-                        #[cfg(feature = "cuda-embedded")]
-                        mmap_registration.clone(),
-                    ) {
-                        Ok(report) => {
-                            let io_after = read_bytes_now();
-                            eprintln!(
-                                "[IncrementalSwap] tick={} chunk={:?} swapped={} remaining={} latency={:.1}ms read_bytes_delta={}",
-                                decode_token_index,
-                                &chunk,
-                                report.swapped.len(),
-                                inc_plan.remaining_count(),
-                                t_swap.elapsed().as_secs_f64() * 1000.0,
-                                io_after.saturating_sub(io_before),
-                            );
-                            if let Some(ref stages) = report.stage_breakdown {
-                                eprintln!("[IncrementalSwap] stages: {}", stages.to_log_line());
-                            }
-                            #[cfg(feature = "opencl")]
-                            remap_weights_for_cpu_after_swap(
-                                &mut model,
-                                &backend,
-                                is_gpu,
-                                args.resilience_prealloc_switch,
-                                "incremental-swap",
-                            );
-
-                            // LISWAP-6 Dynamic-K Phase 0 calibration. Runs only on
-                            // the first successfully-dispatched chunk. Uses the
-                            // dispatch wall (`t_swap.elapsed()`) divided by
-                            // `chunk.len()` as `drop_ms_per_layer` — the main-thread
-                            // blocking time per layer (mmap_permute + dispatcher
-                            // submit). The prior release_worker spin was unreliable
-                            // on async path: dispatcher worker chains release enqueue
-                            // independently and sub-ms release time collapsed
-                            // drop_ms to 0 → safe_k exploded. Main-thread blocking
-                            // time is a meaningful budget item that scales with
-                            // cold/warm mmap state and chunk size (2026-05-13).
-                            if let Some(ref mut ctrl) = dynamic_k_controller
-                                && !ctrl.is_calibrated()
-                                && !chunk.is_empty()
-                            {
-                                let blocking_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
-                                let drop_ms_per_layer = (blocking_ms / chunk.len() as f64) as f32;
-                                ctrl.calibrate(drop_ms_per_layer, forward_ms as f32);
-                                if dynamic_k_diag {
-                                    eprintln!(
-                                        "[DynamicK] calibrated t={} blocking_ms={:.3}/layer fwd_ms={:.2} safe_k={}",
-                                        decode_token_index,
-                                        drop_ms_per_layer,
-                                        forward_ms,
-                                        ctrl.current_k()
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[IncrementalSwap] swap error on tick={}: {}",
-                                decode_token_index, e
-                            );
-                        }
-                    }
-                }
-
-                // LISWAP-6 Dynamic-K Phase 1+: observe forward wall, shrink K
-                // if the forward got tighter than anything seen so far.
-                if let Some(ref mut ctrl) = dynamic_k_controller
-                    && ctrl.is_calibrated()
-                {
-                    let prev_k = ctrl.current_k();
-                    ctrl.observe_forward(forward_ms as f32);
-                    if dynamic_k_diag && ctrl.current_k() != prev_k {
-                        eprintln!(
-                            "[DynamicK] k_decrease t={} fwd_ms={:.2} new_k={}",
-                            decode_token_index,
-                            forward_ms,
-                            ctrl.current_k()
-                        );
-                    }
-                }
-
-                // Probing-K observation: every decode token feeds the EWMA and
-                // counts toward the stability window. release_pending samples
-                // *after* the dispatch above — if any spike landed it will
-                // decrement K symmetric to ARGUS's monotonic shrink.
-                if let Some(ref mut ctrl) = probing_k_controller {
-                    let prev_k = ctrl.current_k();
-                    let pending_after = model.release_worker.pending_count();
-                    ctrl.observe(forward_ms as f32, pending_after);
-                    if probing_k_diag {
-                        let arrow = if ctrl.current_k() > prev_k {
-                            "↑"
-                        } else if ctrl.current_k() < prev_k {
-                            "↓"
-                        } else {
-                            "·"
-                        };
-                        eprintln!(
-                            "[ProbingK] t={} fwd_ms={:.2} pending={} k={}->{} {}",
-                            decode_token_index,
-                            forward_ms,
-                            pending_after,
-                            prev_k,
-                            ctrl.current_k(),
-                            arrow,
-                        );
-                    }
-                }
-                // ENG-ALG-233: retire plan when all layers have been drained (INV-145).
-                if inc_plan.is_done() {
-                    eprintln!(
-                        "[IncrementalSwap] plan complete (started_at_token={}, finished_at_token={})",
-                        inc_plan.started_at_token(),
+            // ── Swap dispatch (J3+J4+J5: incremental / intra-forward / phase-aware) ─
+            {
+                let mut swap_ctx =
+                    llm_rs2::session::decode_fallback::swap_dispatch::SwapDispatchCtx {
+                        model: &mut model,
+                        args: &args,
                         decode_token_index,
-                    );
-                    // LISWAP-2: drain async dispatcher to ensure all in-flight commits land
-                    // before the plan is retired. drain failure is non-fatal — prototype
-                    // robustness is secondary to measurement.
-                    if let Some(ref dispatcher) = async_swap_dispatcher {
-                        let drain_t = std::time::Instant::now();
-                        if let Err(e) = dispatcher.drain(std::time::Duration::from_secs(2)) {
-                            eprintln!("[LISWAP-2] drain failed: {e}");
-                        } else {
-                            eprintln!(
-                                "[LISWAP-2] dispatcher drained: {:.1}ms",
-                                drain_t.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
-                    }
-                    incremental_force_swap_plan = None;
-
-                    // LISWAP-6 manager path: build WeightSwapReport when the plan
-                    // was committed by dispatch_swap_weights (manager signal).
-                    // Stored in `ready_weight_swap_report`; sent by executor block
-                    // later this token tick (executor scope is separate).
-                    if let Some((ratio, n_planned, plan_start, qcf_estimated)) =
-                        manager_swap_report_pending.take()
-                    {
-                        use llm_rs2::models::weights::compute_qcf_swap;
-                        let latency_ms = plan_start.elapsed().as_millis() as u64;
-                        let n_layers = model.layers.len();
-                        let actually_swapped_now: Vec<usize> = (0..n_layers)
-                            .filter(|&i| model.layers[i].current_dtype() == DType::Q4_0)
-                            .collect();
-                        let qcf_swap_actual = if actually_swapped_now.is_empty() {
-                            qcf_estimated
-                        } else {
-                            compute_qcf_swap(
-                                &actually_swapped_now,
-                                &model.quant_noise,
-                                importance_table_for_swap.as_ref(),
-                                n_layers,
-                            )
-                        };
-                        let layers_swapped: Vec<llm_shared::LayerSwapEntry> = actually_swapped_now
-                            .iter()
-                            .map(|&idx| llm_shared::LayerSwapEntry {
-                                layer_idx: idx as u32,
-                                from_dtype: llm_shared::DtypeTag::F16,
-                                to_dtype: llm_shared::DtypeTag::Q4_0,
-                            })
-                            .collect();
-                        eprintln!(
-                            "[WeightSwap] manager plan complete: ratio={:.2}, planned={}, \
-                             actually_q4={}, qcf_swap={:.4}, latency={}ms",
-                            ratio,
-                            n_planned,
-                            layers_swapped.len(),
-                            qcf_swap_actual,
-                            latency_ms,
-                        );
-                        ready_weight_swap_report = Some(llm_shared::WeightSwapReport {
-                            layers_swapped,
-                            freed_bytes: 0,
-                            latency_ms,
-                            qcf_swap_actual,
-                        });
-                    }
-                }
-            }
-            // ── End Layer-Incremental Swap dispatch ────────────────────────────
-
-            // ── LISWAP-4 Intra-forward Swap retire (INV-150) ──────────────────
-            // After every decode token, check whether the in-flight plan is
-            // complete. If so, drain dispatcher, synchronize backend, bump
-            // ratio_generation, invalidate noshuffle SOA registry, and retire
-            // the hook to None.
-            if let Some(hook) = intra_forward_swap_hook.clone()
-                && hook.plan_is_complete()
-            {
-                let drain_t = std::time::Instant::now();
-                let backend_for_invalidate: Arc<dyn Backend> = gpu_backend_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| Arc::clone(&backend));
-                let invalidate = move || {
-                    backend_for_invalidate.invalidate_noshuffle_soa_registry();
-                };
-                match hook.finalize(
-                    &model.ratio_generation,
-                    invalidate,
-                    std::time::Duration::from_secs(10),
-                ) {
-                    Ok(()) => {
-                        eprintln!(
-                            "[IntraForwardSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms)",
-                            decode_token_index,
-                            drain_t.elapsed().as_secs_f64() * 1000.0,
-                        );
+                        forward_ms,
+                        backend: &backend,
+                        gpu_backend_arc: &gpu_backend_arc,
+                        cpu_backend_arc: &cpu_backend_arc,
+                        is_gpu,
+                        async_swap_dispatcher: &async_swap_dispatcher,
                         #[cfg(feature = "opencl")]
-                        remap_weights_for_cpu_after_swap(
-                            &mut model,
-                            &backend,
-                            is_gpu,
-                            args.resilience_prealloc_switch,
-                            "intra-forward-swap",
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[IntraForwardSwap] finalize failed at token={}: {}",
-                            decode_token_index, e
-                        );
-                    }
-                }
-                intra_forward_swap_hook = None; // retire
+                        host_ptr_swap_pool: &host_ptr_swap_pool,
+                        #[cfg(feature = "cuda-embedded")]
+                        layer_swap_pool: &layer_swap_pool,
+                        #[cfg(feature = "cuda-embedded")]
+                        mmap_registration: &mmap_registration,
+                        importance_table_for_swap: &importance_table_for_swap,
+                        dynamic_k_diag,
+                        probing_k_diag,
+                        incremental_force_swap_plan: &mut incremental_force_swap_plan,
+                        intra_forward_swap_hook: &mut intra_forward_swap_hook,
+                        phase_aware_swap_dispatcher: &mut phase_aware_swap_dispatcher,
+                        dynamic_k_controller: &mut dynamic_k_controller,
+                        probing_k_controller: &mut probing_k_controller,
+                        manager_swap_report_pending: &mut manager_swap_report_pending,
+                        ready_weight_swap_report: &mut ready_weight_swap_report,
+                    };
+                llm_rs2::session::decode_fallback::swap_dispatch::run_incremental_dispatch(
+                    &mut swap_ctx,
+                )?;
+                llm_rs2::session::decode_fallback::swap_dispatch::retire_intra_forward(
+                    &mut swap_ctx,
+                )?;
+                llm_rs2::session::decode_fallback::swap_dispatch::retire_phase_aware(
+                    &mut swap_ctx,
+                )?;
             }
-            // ── End LISWAP-4 retire ────────────────────────────────────────────
-
-            // ── LISWAP-5 Phase-aware Swap retire ──────────────────────────────
-            // chunk_queue가 비고 in_flight도 None이면 dispatcher 종료. finalize는
-            // 마지막 ratio_generation bump + invalidate 수행. PHASE_HOOK은
-            // OnceLock이라 unset 불가능하지만 finalize() 후 모든 hook fire가
-            // noop이 됨 (dispatcher 내부 finalized atomic).
-            if let Some(disp) = phase_aware_swap_dispatcher.as_ref()
-                && std::env::var("LLMRS_PHASE_AWARE_DEBUG").as_deref() == Ok("1")
-                && decode_token_index < 5
-            {
-                let (q, inf, p, d, hs, he, ce) = disp.debug_snapshot();
-                eprintln!(
-                    "[PhaseAwareSwap-DBG] tok={} queue={} in_flight={} pending={} dispatched={} hook_start={} hook_end={} cachefit_end={}",
-                    decode_token_index, q, inf, p, d, hs, he, ce
-                );
-            }
-            if let Some(disp) = phase_aware_swap_dispatcher.as_ref()
-                && disp.is_complete()
-            {
-                let drain_t = std::time::Instant::now();
-                let backend_for_invalidate: Arc<dyn Backend> = gpu_backend_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| Arc::clone(&backend));
-                let invalidate = move || {
-                    backend_for_invalidate.invalidate_noshuffle_soa_registry();
-                };
-                match disp.finalize(
-                    &model.ratio_generation,
-                    invalidate,
-                    std::time::Duration::from_secs(10),
-                ) {
-                    Ok(()) => {
-                        eprintln!(
-                            "[PhaseAwareSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms, chunks={})",
-                            decode_token_index,
-                            drain_t.elapsed().as_secs_f64() * 1000.0,
-                            disp.dispatched_count(),
-                        );
-                        #[cfg(feature = "opencl")]
-                        remap_weights_for_cpu_after_swap(
-                            &mut model,
-                            &backend,
-                            is_gpu,
-                            args.resilience_prealloc_switch,
-                            "phase-aware-swap",
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[PhaseAwareSwap] finalize failed at token={}: {}",
-                            decode_token_index, e
-                        );
-                    }
-                }
-                phase_aware_swap_dispatcher = None;
-            }
-            // ── End LISWAP-5 retire ────────────────────────────────────────────
+            // ── End swap dispatch ──────────────────────────────────────────────
 
             // ── H2O Debug: per-step diagnostics ──
             if args.h2o_debug() {
