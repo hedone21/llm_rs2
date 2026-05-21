@@ -1,0 +1,25 @@
+TTFT: 173.55 ms
+Decode: 12.42 ms/tok (80.5 tok/s) [31 tokens, forward only]
+Decode(excl tok[0]): 12.55 ms/tok (79.7 tok/s) [30 tokens] | tok[0]=8.41 ms
+Avg TBT: 33.34 ms (30.0 tokens/sec)
+---
+TTFT: 179.58 ms
+Decode: 12.09 ms/tok (82.7 tok/s) [31 tokens, forward only]
+Decode(excl tok[0]): 12.06 ms/tok (82.9 tok/s) [30 tokens] | tok[0]=13.03 ms
+Avg TBT: 33.43 ms (29.9 tokens/sec)
+---
+TTFT: 173.61 ms
+Decode: 11.20 ms/tok (89.3 tok/s) [31 tokens, forward only]
+Decode(excl tok[0]): 11.26 ms/tok (88.8 tok/s) [30 tokens] | tok[0]=9.32 ms
+Avg TBT: 32.93 ms (30.4 tokens/sec)
+---
+TTFT: 174.28 ms
+Decode: 12.44 ms/tok (80.4 tok/s) [31 tokens, forward only]
+Decode(excl tok[0]): 12.36 ms/tok (80.9 tok/s) [30 tokens] | tok[0]=14.83 ms
+Avg TBT: 33.08 ms (30.2 tokens/sec)
+---
+TTFT: 173.95 ms
+Decode: 12.54 ms/tok (79.8 tok/s) [31 tokens, forward only]
+Decode(excl tok[0]): 12.57 ms/tok (79.5 tok/s) [30 tokens] | tok[0]=11.41 ms
+Avg TBT: 32.58 ms (30.7 tokens/sec)
+---

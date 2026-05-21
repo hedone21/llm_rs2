@@ -1,0 +1,20 @@
+TTFT: 62.71 ms
+Decode: 32.20 ms/tok (31.1 tok/s) [31 tokens]
+Avg TBT: 33.15 ms (30.2 tokens/sec)
+---
+TTFT: 61.87 ms
+Decode: 28.82 ms/tok (34.7 tok/s) [31 tokens]
+Avg TBT: 29.85 ms (33.5 tokens/sec)
+---
+TTFT: 64.66 ms
+Decode: 33.25 ms/tok (30.1 tok/s) [31 tokens]
+Avg TBT: 34.23 ms (29.2 tokens/sec)
+---
+TTFT: 68.41 ms
+Decode: 32.85 ms/tok (30.4 tok/s) [31 tokens]
+Avg TBT: 33.96 ms (29.4 tokens/sec)
+---
+TTFT: 65.02 ms
+Decode: 33.20 ms/tok (30.1 tok/s) [31 tokens]
+Avg TBT: 34.19 ms (29.2 tokens/sec)
+---

@@ -3,7 +3,7 @@ use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::core::events::{self, CacheEvent, StderrDiagnosticSink};
-use llm_rs2::core::rss_trace::{io_trace, read_bytes_now, rss_trace};
+use llm_rs2::core::rss_trace::{io_trace, rss_trace};
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::inference::sampling::{self, SamplingConfig};
@@ -99,11 +99,11 @@ fn main() -> anyhow::Result<()> {
     let sampling_config = ctx.sampling_config;
     let model_path = &ctx.model_path;
     let is_gguf = ctx.is_gguf;
-    let mut backend = ctx.backend;
+    let backend = ctx.backend;
     let memory = ctx.memory;
     let gpu_backend_arc = ctx.gpu_backend_arc;
     let gpu_memory_arc = ctx.gpu_memory_arc;
-    let mut is_gpu = ctx.is_gpu;
+    let is_gpu = ctx.is_gpu;
     let weights_on_gpu = ctx.weights_on_gpu;
     let cpu_backend_arc = ctx.cpu_backend_arc;
     let cpu_memory_arc = ctx.cpu_memory_arc;
@@ -957,7 +957,7 @@ fn main() -> anyhow::Result<()> {
     // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE).
     let use_gqa = args.eviction_policy() == "h2o_plus" || needs_caote || has_eviction_policy;
 
-    let mut score_accumulator = if needs_accumulator {
+    let score_accumulator = if needs_accumulator {
         let acc = if use_gqa {
             AttentionScoreAccumulator::new_gqa(
                 max_seq_len,
@@ -1812,10 +1812,10 @@ fn main() -> anyhow::Result<()> {
             command_executor,
         })?;
     let llm_rs2::session::prefill::PrefillOutput {
-        mut kv_caches,
-        mut tokens,
+        kv_caches,
+        tokens,
         mut start_pos,
-        mut profiler,
+        profiler,
         variance_collector,
         importance_table_for_swap,
         mut collector_armed,
@@ -1824,7 +1824,7 @@ fn main() -> anyhow::Result<()> {
         mut last_skip_ratio,
         mut throttle_delay_ms,
         mut command_executor,
-        mut logits,
+        logits,
         eos_id,
         ttft_ms: _ttft_ms_out,
         last_token_time,
@@ -1834,465 +1834,85 @@ fn main() -> anyhow::Result<()> {
     _ttft_ms = _ttft_ms_out;
     _last_token_time = last_token_time;
 
-    // Execute deferred SwitchHw (from prefill checkpoint).
-    // Now safe: prefill is done, logits read, all workspace released.
-    // Decode buffers are allocated *after* this point, so only KV migrate
-    // and backend/is_gpu update are needed here.
-    if let Some(ref device) = deferred_switch
-        && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc)
-    {
-        match device.as_str() {
-            "cpu" if is_gpu => {
-                eprintln!("[Prefill->Decode] Executing deferred SwitchHw: GPU->CPU");
-                llm_rs2::pressure::kv_migrate::migrate_kv_caches(
-                    &mut kv_caches,
-                    &backend,
-                    &cpu_backend_arc,
-                    &cpu_backend_arc,
-                    &cpu_memory_arc,
-                    &cpu_memory_arc,
-                    kv_heads,
-                    head_dim,
-                    max_seq_len,
-                    false,
-                )?;
-                backend = cpu_backend_arc.clone();
-                is_gpu = false;
-                // Re-tag weight tensors with CPU backend.
-                // UnifiedBuffer (ALLOC_HOST_PTR, mapped) stays valid for CPU.
-                eprintln!("[Prefill->Decode] SwitchHw: Switched to CPU.");
-            }
-            "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
-                eprintln!("[Prefill->Decode] Executing deferred SwitchHw: CPU->GPU");
-                llm_rs2::pressure::kv_migrate::migrate_kv_caches(
-                    &mut kv_caches,
-                    &backend,
-                    gpu_be,
-                    &cpu_backend_arc,
-                    &cpu_memory_arc,
-                    gpu_mem,
-                    kv_heads,
-                    head_dim,
-                    max_seq_len,
-                    true,
-                )?;
-                backend = gpu_be.clone();
-                is_gpu = true;
-                eprintln!("[Prefill->Decode] SwitchHw: Switched to GPU.");
-            }
-            _ => {}
-        }
-    }
-
-    // D2O: compute per-layer budgets from prefill attention variance.
-    let d2o_layer_ratios: Option<Vec<(f32, f32)>> = if let Some(ref collector) = variance_collector
-    {
-        let budgets = collector.compute_budgets(
-            args.d2o_keep_ratio() * args.eviction_target_ratio(),
-            (1.0 - args.d2o_keep_ratio()) * args.eviction_target_ratio(),
-        );
-        log::info!(
-            "[D2O] Layer budgets computed: {:?}",
-            budgets.iter().map(|(h, r)| h + r).collect::<Vec<_>>()
-        );
-        Some(budgets)
-    } else {
-        None
-    };
-
-    // Position → birth step mapping for profiling (token identity tracking)
-    let mut position_birth_step: Vec<usize> = if profiler.is_some() {
-        // All prefill tokens have birth_step = 0 (prompt)
-        let prompt_len = tokens.len();
-        let map = vec![0usize; prompt_len];
-        // Register prompt token births + first generated token
-        if let Some(ref mut p) = profiler {
-            p.scores
-                .record_token_births(0, prompt_len, actual_protected_prefix);
-        }
-        map
-    } else {
-        Vec::new()
-    };
+    // ── Phase 4-4-2.3a: decode prologue 추출 ──────────────────────────────
+    // (session::decode_fallback::prologue::run_decode_prologue)
+    // A: Deferred SwitchHw, B: D2O budgets, C: position_birth_step,
+    // D: DecodingStart + drain, E: decode workspace, F: partition_ws,
+    // G: spare bufs + streaming, H: Hybrid Attn, I: GPU plan
+    let prologue_out = llm_rs2::session::decode_fallback::prologue::run_decode_prologue(
+        llm_rs2::session::decode_fallback::prologue::DecodePrologueCtx {
+            args: &args,
+            model: &mut model,
+            backend: backend.clone(),
+            is_gpu,
+            memory: memory.clone(),
+            cpu_backend_arc: cpu_backend_arc.clone(),
+            cpu_memory_arc: cpu_memory_arc.clone(),
+            gpu_backend_arc: gpu_backend_arc.clone(),
+            gpu_memory_arc: gpu_memory_arc.clone(),
+            kv_caches,
+            logits,
+            deferred_switch,
+            variance_collector,
+            tokens,
+            profiler,
+            tokenizer: &tokenizer,
+            actual_protected_prefix,
+            vocab_size,
+            hidden_size,
+            kv_heads,
+            head_dim,
+            max_seq_len,
+            weights_on_gpu,
+            score_accumulator,
+        },
+    )?;
+    let llm_rs2::session::decode_fallback::prologue::DecodePrologueOutput {
+        mut backend,
+        mut is_gpu,
+        mut kv_caches,
+        mut logits,
+        mut x_gen,
+        mut gen_ws,
+        mut gen_input_tensor,
+        cpu_gen_input,
+        mut spare_logits,
+        mut spare_xgen,
+        mut spare_gen_ws,
+        mut spare_gen_input,
+        #[cfg(feature = "opencl")]
+        mut gpu_plan,
+        #[cfg(feature = "opencl")]
+        mut gpu_plan_sticky_disabled,
+        #[cfg(feature = "opencl")]
+        partition_active_any,
+        mut logits_cpu,
+        mut sampling_indices,
+        mut evict_ceiling,
+        mut evict_floor_logged,
+        mut last_applied_partition_ratio,
+        d2o_layer_ratios,
+        mut position_birth_step,
+        mut profiler,
+        printed_len: mut _printed_len,
+        mut stdout,
+        mut score_accumulator,
+        mut tokens,
+        #[cfg(feature = "opencl")]
+            hybrid_scope: _hybrid_scope,
+    } = prologue_out;
 
     // === GENERATION PHASE ===
     {
-        println!("[Profile] Event: DecodingStart");
+        use std::io::Write;
 
-        // --profile-events / --heartbeat-gpu-profile: drop any events captured
-        // during prefill/warmup so the decode-only aggregate is not polluted.
-        // Prefill uses the generic `forward` path (no label hints), so without
-        // this step all matmul dispatches from prefill would spill into the
-        // decode "matmul" bucket and inflate the GPU self-util meter's first
-        // heartbeat sample.
-        #[cfg(feature = "opencl")]
-        if (args.profile_events || args.heartbeat_gpu_profile)
-            && let Some(ocl_be) = backend
-                .as_any()
-                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-            && ocl_be.profile_events_enabled
-        {
-            backend.synchronize()?;
-            ocl_be.flush_and_aggregate_profile()?;
-            let _ = ocl_be.take_profile_accum();
-            // Prefill-phase GPU busy ns were also fed into the self-util
-            // meter via flush_and_aggregate_profile(); drain them so the
-            // first heartbeat only reflects decode-phase usage.
-            if let Some(m) = ocl_be.gpu_self_meter() {
-                use llm_rs2::resilience::GpuSelfMeter;
-                let _ = m.sample(std::time::Duration::from_secs(1));
-            }
-            eprintln!("[Profile] prefill/warmup events dropped (decode-only accumulator)");
-        }
-        // Pre-allocate workspace for generation
-        let q_dim = model.config.num_attention_heads * model.config.head_dim;
-        let k_dim = model.config.num_key_value_heads * model.config.head_dim;
-        let v_dim = k_dim;
+        // Re-declare prologue-computed locals needed by the decode loop body.
         let ffn_hidden = model.config.intermediate_size;
-
-        // After SwitchHw GPU->CPU, `memory` is still OpenCL memory whose
-        // alloc() creates OpenCLBuffer (null as_ptr). Use cpu_memory_arc when on CPU.
         let decode_mem: &dyn Memory = if is_gpu {
             memory.as_ref()
         } else {
             cpu_memory_arc.as_ref()
         };
-
-        // Re-allocate logits on the correct backend after deferred SwitchHw.
-        // The outer `logits` was allocated with `memory` (GPU) before the
-        // deferred switch. After GPU→CPU, the unmapped UnifiedBuffer has
-        // as_ptr() == null → segfault when CPU forward writes logits.
-        if !is_gpu && logits.as_ptr().is_null() {
-            let new_logits_buf = decode_mem.alloc(vocab_size * 4, DType::F32)?;
-            logits = Tensor::new(
-                Shape::new(vec![1, 1, vocab_size]),
-                new_logits_buf,
-                backend.clone(),
-            );
-        }
-
-        let x_gen_buf = decode_mem.alloc(hidden_size * 4, DType::F32)?;
-        let mut x_gen = Tensor::new(
-            Shape::new(vec![1, 1, hidden_size]),
-            x_gen_buf,
-            backend.clone(),
-        );
-
-        let mut gen_ws = LayerWorkspace::new(
-            WorkspaceConfig {
-                batch_size: 1,
-                dim: model.config.hidden_size,
-                q_dim,
-                k_dim,
-                v_dim,
-                ffn_hidden,
-                n_heads: model.config.num_attention_heads,
-                max_seq_len: args.max_seq_len, // Use context window size
-            },
-            decode_mem,
-            backend.clone(),
-        )?;
-
-        // Attach partition workspace if tensor partition is active.
-        // Use UnifiedBuffer (ALLOC_HOST_PTR) for zero-copy merge (see batch path above).
-        let layer0_partition_probe = model.layers[0].load_weights();
-        if let Some(ref ctx) = layer0_partition_probe.partition_ctx {
-            let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
-
-            // Zero-copy residual (see line 1807 block for rationale).
-            #[cfg(feature = "opencl")]
-            if std::env::var_os("LLMRS_PARTITION_ZCOPY_RESIDUAL").is_some()
-                || llm_rs2::layers::tensor_partition::partition_poll_flag_enabled()
-            {
-                if let Some(ub) = gen_ws
-                    .residual
-                    .buffer()
-                    .as_any()
-                    .downcast_ref::<llm_rs2::memory::opencl::unified::UnifiedBuffer>()
-                {
-                    ub.map()?;
-                    eprintln!("[Partition] Residual UnifiedBuffer permanent-mapped for zero-copy");
-                } else {
-                    eprintln!(
-                        "[Partition] WARN: residual buffer is not UnifiedBuffer (zero-copy skipped)"
-                    );
-                }
-            }
-
-            gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(PartitionWorkspace::new(
-                ctx,
-                ffn_hidden,
-                hidden_size,
-                &gpu_alloc,
-                backend.clone(),
-                cpu_backend_arc.clone(),
-            )?)));
-        }
-
-        // Single token CPU tensor for generation loop
-        let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
-        let cpu_gen_input = Tensor::new(
-            Shape::new(vec![1, 1]),
-            cpu_gen_indices_buf,
-            Arc::new(CpuBackend::new()),
-        );
-
-        // Pre-allocate input tensor for decode loop (avoids per-token alloc)
-        let gpu_gen_input_buf = decode_mem.alloc(4, DType::U8)?;
-        let mut gen_input_tensor =
-            Tensor::new(Shape::new(vec![1, 1]), gpu_gen_input_buf, backend.clone());
-
-        // Pre-allocate CPU spare decode buffers for zero-alloc GPU→CPU SwitchHw.
-        // Both sets (GPU active + CPU spare) stay alive for the process lifetime,
-        // enabling instant swap without allocation/deallocation during switch.
-        // This prevents Samsung LMKD from killing the process due to RSS spike.
-        let (mut spare_logits, mut spare_xgen, mut spare_gen_ws, mut spare_gen_input) =
-            if is_gpu && args.resilience_prealloc_switch {
-                let cpu_lb = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
-                let cpu_xb = cpu_memory_arc.alloc(hidden_size * 4, DType::F32)?;
-                let cpu_gi = cpu_memory_arc.alloc(4, DType::U8)?;
-                eprintln!("[Switch] Pre-allocated CPU spare buffers for zero-alloc SwitchHw");
-                (
-                    Some(Tensor::new(
-                        Shape::new(vec![1, 1, vocab_size]),
-                        cpu_lb,
-                        cpu_backend_arc.clone(),
-                    )),
-                    Some(Tensor::new(
-                        Shape::new(vec![1, 1, hidden_size]),
-                        cpu_xb,
-                        cpu_backend_arc.clone(),
-                    )),
-                    Some(LayerWorkspace::new(
-                        WorkspaceConfig {
-                            batch_size: 1,
-                            dim: model.config.hidden_size,
-                            q_dim,
-                            k_dim,
-                            v_dim,
-                            ffn_hidden,
-                            n_heads: model.config.num_attention_heads,
-                            max_seq_len: args.max_seq_len,
-                        },
-                        cpu_memory_arc.as_ref(),
-                        cpu_backend_arc.clone(),
-                    )?),
-                    Some(Tensor::new(
-                        Shape::new(vec![1, 1]),
-                        cpu_gi,
-                        cpu_backend_arc.clone(),
-                    )),
-                )
-            } else {
-                (None, None, None, None)
-            };
-
-        // Streaming setup
-        use std::io::Write;
-        let mut stdout = std::io::stdout();
-        let mut _printed_len = 0;
-
-        // Print initial tokens (prompt + first generated)
-        let initial_text = tokenizer.decode(&tokens, true).unwrap_or_default();
-        print!("{}", initial_text);
-        _printed_len = initial_text.len();
-        stdout.flush().ok();
-
-        // ─── UMA Hybrid Attention setup (Stage C) ─────────────────────
-        // LLMRS_ATTN_HYBRID_KV_FRAC=X 가 설정되고 gating 조건이 모두 충족되면
-        // 공용 GPU 스크래치 버퍼를 할당하고 HybridScope를 install한다. 스코프
-        // 객체는 decode 루프 종료까지 살아있어야 하므로 `_hybrid_scope`로 바인드.
-        // Gating 실패 시 reason을 stderr로 한 번 찍고 스킵.
-        #[cfg(feature = "opencl")]
-        let _hybrid_scope = {
-            use llm_rs2::layers::hybrid_attention::{self, HybridAttnSetup};
-            match HybridAttnSetup::from_env() {
-                Some(kv_frac) => {
-                    let backend_is_opencl = backend.name() == "OpenCL";
-                    let kv_is_f16 = args.kv_type == "f16";
-                    let head_dim_val = model.config.head_dim;
-                    let head_dim_ok = head_dim_val == 64 || head_dim_val == 128;
-                    let n_heads_q = model.config.num_attention_heads;
-                    let n_kv_heads = model.config.num_key_value_heads;
-                    let is_gqa = n_kv_heads < n_heads_q;
-                    let partition_off =
-                        args.tensor_partition <= 0.0 || args.tensor_partition >= 1.0;
-                    let eviction_compatible =
-                        args.eviction_policy() != "kivi" && args.eviction_policy() != "qcf";
-                    let layout_ok = kv_caches
-                        .first()
-                        .map(|c| c.layout() == KVLayout::HeadMajor)
-                        .unwrap_or(false);
-
-                    let gate_ok = backend_is_opencl
-                        && kv_is_f16
-                        && head_dim_ok
-                        && is_gqa
-                        && partition_off
-                        && eviction_compatible
-                        && layout_ok;
-
-                    if !gate_ok {
-                        let reason = if !backend_is_opencl {
-                            "backend is not OpenCL"
-                        } else if !kv_is_f16 {
-                            "kv dtype must be f16"
-                        } else if !head_dim_ok {
-                            "head_dim must be 64 or 128"
-                        } else if !is_gqa {
-                            "requires GQA (n_kv_heads < n_heads_q)"
-                        } else if !partition_off {
-                            "FFN tensor partition is active"
-                        } else if !eviction_compatible {
-                            "incompatible eviction policy (kivi/qcf)"
-                        } else {
-                            "KV layout must be HeadMajor"
-                        };
-                        eprintln!(
-                            "[hybrid-attn] LLMRS_ATTN_HYBRID_KV_FRAC={} ignored: {}",
-                            kv_frac, reason
-                        );
-                        None
-                    } else {
-                        // Map KV/Q/out_attn/residual UnifiedBuffer들을 CPU가 접근
-                        // 가능하도록 전부 매핑한다. UMA 특성상 map은 주소만
-                        // 고정하고 추가 복사는 하지 않는다. Plan execution에
-                        // 들어가기 전에 한 번만 호출되면 충분.
-                        let mut map_err: Option<anyhow::Error> = None;
-                        for c in kv_caches.iter() {
-                            if let Err(e) = c.k_buffer.buffer().map_for_cpu() {
-                                map_err = Some(e);
-                                break;
-                            }
-                            if let Err(e) = c.v_buffer.buffer().map_for_cpu() {
-                                map_err = Some(e);
-                                break;
-                            }
-                        }
-                        if map_err.is_none() {
-                            if let Err(e) = gen_ws.q.buffer().map_for_cpu() {
-                                map_err = Some(e);
-                            } else if let Err(e) = gen_ws.out_attn.buffer().map_for_cpu() {
-                                map_err = Some(e);
-                            }
-                        }
-                        if let Some(e) = map_err {
-                            eprintln!("[hybrid-attn] failed to map UMA buffers: {} — skipping", e);
-                            None
-                        } else {
-                            let ocl_be = backend
-                                .as_any()
-                                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>();
-                            match ocl_be {
-                                Some(ob) => match HybridAttnSetup::new_for_decode(
-                                    &ob.queue,
-                                    kv_frac,
-                                    n_heads_q,
-                                    head_dim_val,
-                                ) {
-                                    Ok(setup) => {
-                                        eprintln!(
-                                            "[hybrid-attn] enabled: kv_frac={} n_heads_q={} head_dim={}",
-                                            kv_frac, n_heads_q, head_dim_val
-                                        );
-                                        Some(hybrid_attention::install(Arc::new(setup)))
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[hybrid-attn] setup allocation failed: {} — skipping",
-                                            e
-                                        );
-                                        None
-                                    }
-                                },
-                                None => None,
-                            }
-                        }
-                    }
-                }
-                None => None,
-            }
-        };
-
-        // Build GPU kernel plan for decode (OpenCL only, lazy rebuild on invalidation)
-        // Disable for Gemma3: plan doesn't include QK-norm, post-norm, gelu_tanh_mul
-        // Disable when tensor partition is active: plan bypasses forward_gen's
-        // partition path entirely (plan = pure GPU chain, no CPU co-execution).
-        //
-        // Score accumulator coexistence: when a CPU `score_accumulator` is
-        // active (H2O/D2O/Sliding/CAOTE eviction), the plan may still be used
-        // as long as the paired GPU `gpu_score_acc` is active.  `build_plan`
-        // then selects the legacy attention kernel (flash attn has no score
-        // output) and pre-binds the GPU score buffer into arg 4. Per-layer
-        // `reduce_layer` + post-pass `end_step` are driven by
-        // `FullKernelPlan::execute` so CPU readback happens only at eviction
-        // time (see `sync_to_cpu` further down).
-        #[cfg(feature = "opencl")]
-        let accumulator_compatible_with_plan = {
-            let has_cpu_acc = score_accumulator.is_some();
-            let gpu_acc_active = backend
-                .as_any()
-                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-                .and_then(|ob| ob.gpu_score_acc())
-                .is_some_and(|acc| acc.is_active());
-            !has_cpu_acc || gpu_acc_active
-        };
-        // Partition is now routed through `build_partitioned_layer_plan` inside
-        // `build_plan`, so the old `partition_ctx.is_none()` gate has been
-        // removed (see ENG-ALG-200 / arch A.6.1). When partition + plan are
-        // both unavailable for a layer (e.g. `LLMRS_PARTITION_PLAN=0`), the
-        // builder returns `Err` and the caller falls back to forward_gen.
-        #[cfg(feature = "opencl")]
-        let mut gpu_plan = if backend.name() == "OpenCL"
-            && !args.profile
-            && !args.no_gpu_plan
-            && accumulator_compatible_with_plan
-            && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
-            && !args.swap_intra_forward
-            && !args.swap_layer_immediate
-            && !args.swap_phase_aware
-        {
-            model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
-        } else {
-            None
-        };
-        // Sticky disable: when the initial `build_plan` returns `None` and
-        // partition is active, the cause is almost always the opt-in gate
-        // (`LLMRS_PARTITION_PLAN=0` default on Adreno, 2026-04-21). Retrying
-        // every token spams `build_plan` (~100 ms/token overhead) for no
-        // benefit. Lock the disable on the first miss and keep forward_gen.
-        // `execute_plan` resetting `gpu_plan = None` for KV-resize
-        // invalidation still takes the rebuild path on the next token.
-        #[cfg(feature = "opencl")]
-        let partition_active_any = model
-            .layers
-            .iter()
-            .any(|s| s.load_weights().partition_ctx.is_some());
-        #[cfg(feature = "opencl")]
-        let mut gpu_plan_sticky_disabled = partition_active_any && gpu_plan.is_none();
-
-        // Pre-allocate decode buffers (reused across tokens)
-        let mut logits_cpu = vec![0.0f32; vocab_size];
-        let mut sampling_indices: Vec<usize> = (0..vocab_size).collect();
-
-        // Ceiling for sticky eviction: records current_pos at first eviction trigger.
-        // Subsequent evictions use ceiling * ratio as a fixed target to prevent cascade
-        // (e.g. cache 33 → 16 → 8 → ... when target_ratio is applied to ever-shrinking pos).
-        let mut evict_ceiling: Option<usize> = None;
-        let mut evict_floor_logged: Option<bool> = None;
-
-        // Sticky cache for last-applied partition ratio. The executor re-delivers
-        // `plan.partition_ratio = Some(sticky)` on every poll (ISSUE-5 fix), so
-        // without this guard the consumer below would re-split 84 weights and
-        // rebuild the GPU plan on every decode tick (verify v2 REGRESSION-A:
-        // q4 enable +102% → +3859% TBT). Seeded from CLI-time partition so the
-        // first sticky re-delivery is a no-op when nothing changed.
-        let mut last_applied_partition_ratio: Option<f32> =
-            if args.tensor_partition > 0.0 && args.tensor_partition < 1.0 {
-                Some(args.tensor_partition)
-            } else {
-                None
-            };
 
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
@@ -2521,362 +2141,47 @@ fn main() -> anyhow::Result<()> {
 
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
-            // ── Layer-Incremental Swap dispatch (ENG-ALG-233) ──────────────────
-            // Runs after forward, before sampling. Per-tick: drain up to N layers
-            // and call SwapExecutor::execute_on_slots with the chunk.
-            // ENG-ALG-234: plan committed with force-swap-ratio + per_tick > 0;
-            //   new signals during flight are ignored (plan runs to completion).
-            // INV-145: empty chunk is never passed to execute_on_slots.
-            if let Some(ref mut inc_plan) = incremental_force_swap_plan {
-                // LISWAP-6 Dynamic-K: reactive pause + per-tick override.
-                //
-                // - Pause: release queue non-empty → skip swap this tick (K
-                //   stays unchanged). Calibration tick is exempt because it
-                //   has to dispatch K=1 to measure drop cost.
-                // - Pre-drain: inject controller's current K into the plan.
-                let mut dyn_k_pause = false;
-                if let Some(ref ctrl) = dynamic_k_controller {
-                    let pending = model.release_worker.pending_count();
-                    if ctrl.is_calibrated() && ctrl.should_pause(pending) {
-                        dyn_k_pause = true;
-                        if dynamic_k_diag {
-                            eprintln!(
-                                "[DynamicK] pause t={} pending={} k={}",
-                                decode_token_index,
-                                pending,
-                                ctrl.current_k()
-                            );
-                        }
-                    } else {
-                        // Calibration tick forces K=1 (sync measurement);
-                        // subsequent ticks use the controller's current K.
-                        let k = if ctrl.is_calibrated() {
-                            ctrl.current_k()
-                        } else {
-                            1
-                        };
-                        inc_plan.set_per_tick(k);
-                    }
-                } else if let Some(ref ctrl) = probing_k_controller {
-                    let pending = model.release_worker.pending_count();
-                    if ctrl.should_pause(pending) {
-                        dyn_k_pause = true;
-                        if probing_k_diag {
-                            eprintln!(
-                                "[ProbingK] pause t={} pending={} k={}",
-                                decode_token_index,
-                                pending,
-                                ctrl.current_k()
-                            );
-                        }
-                    } else {
-                        inc_plan.set_per_tick(ctrl.current_k());
-                    }
-                }
-                let chunk = if dyn_k_pause {
-                    Vec::new()
-                } else {
-                    inc_plan.drain_chunk()
-                };
-                if !chunk.is_empty() {
-                    let t_swap = std::time::Instant::now();
-                    let io_before = read_bytes_now();
-                    match run_layer_swap(
-                        &model,
-                        &chunk,
-                        gpu_backend_arc.as_ref(),
-                        &cpu_backend_arc,
-                        async_swap_dispatcher.as_ref(),
-                        #[cfg(feature = "opencl")]
-                        host_ptr_swap_pool.clone(),
-                        #[cfg(feature = "cuda-embedded")]
-                        layer_swap_pool.clone(),
-                        #[cfg(feature = "cuda-embedded")]
-                        mmap_registration.clone(),
-                    ) {
-                        Ok(report) => {
-                            let io_after = read_bytes_now();
-                            eprintln!(
-                                "[IncrementalSwap] tick={} chunk={:?} swapped={} remaining={} latency={:.1}ms read_bytes_delta={}",
-                                decode_token_index,
-                                &chunk,
-                                report.swapped.len(),
-                                inc_plan.remaining_count(),
-                                t_swap.elapsed().as_secs_f64() * 1000.0,
-                                io_after.saturating_sub(io_before),
-                            );
-                            if let Some(ref stages) = report.stage_breakdown {
-                                eprintln!("[IncrementalSwap] stages: {}", stages.to_log_line());
-                            }
-                            #[cfg(feature = "opencl")]
-                            remap_weights_for_cpu_after_swap(
-                                &mut model,
-                                &backend,
-                                is_gpu,
-                                args.resilience_prealloc_switch,
-                                "incremental-swap",
-                            );
-
-                            // LISWAP-6 Dynamic-K Phase 0 calibration. Runs only on
-                            // the first successfully-dispatched chunk. Uses the
-                            // dispatch wall (`t_swap.elapsed()`) divided by
-                            // `chunk.len()` as `drop_ms_per_layer` — the main-thread
-                            // blocking time per layer (mmap_permute + dispatcher
-                            // submit). The prior release_worker spin was unreliable
-                            // on async path: dispatcher worker chains release enqueue
-                            // independently and sub-ms release time collapsed
-                            // drop_ms to 0 → safe_k exploded. Main-thread blocking
-                            // time is a meaningful budget item that scales with
-                            // cold/warm mmap state and chunk size (2026-05-13).
-                            if let Some(ref mut ctrl) = dynamic_k_controller
-                                && !ctrl.is_calibrated()
-                                && !chunk.is_empty()
-                            {
-                                let blocking_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
-                                let drop_ms_per_layer = (blocking_ms / chunk.len() as f64) as f32;
-                                ctrl.calibrate(drop_ms_per_layer, forward_ms as f32);
-                                if dynamic_k_diag {
-                                    eprintln!(
-                                        "[DynamicK] calibrated t={} blocking_ms={:.3}/layer fwd_ms={:.2} safe_k={}",
-                                        decode_token_index,
-                                        drop_ms_per_layer,
-                                        forward_ms,
-                                        ctrl.current_k()
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[IncrementalSwap] swap error on tick={}: {}",
-                                decode_token_index, e
-                            );
-                        }
-                    }
-                }
-
-                // LISWAP-6 Dynamic-K Phase 1+: observe forward wall, shrink K
-                // if the forward got tighter than anything seen so far.
-                if let Some(ref mut ctrl) = dynamic_k_controller
-                    && ctrl.is_calibrated()
-                {
-                    let prev_k = ctrl.current_k();
-                    ctrl.observe_forward(forward_ms as f32);
-                    if dynamic_k_diag && ctrl.current_k() != prev_k {
-                        eprintln!(
-                            "[DynamicK] k_decrease t={} fwd_ms={:.2} new_k={}",
-                            decode_token_index,
-                            forward_ms,
-                            ctrl.current_k()
-                        );
-                    }
-                }
-
-                // Probing-K observation: every decode token feeds the EWMA and
-                // counts toward the stability window. release_pending samples
-                // *after* the dispatch above — if any spike landed it will
-                // decrement K symmetric to ARGUS's monotonic shrink.
-                if let Some(ref mut ctrl) = probing_k_controller {
-                    let prev_k = ctrl.current_k();
-                    let pending_after = model.release_worker.pending_count();
-                    ctrl.observe(forward_ms as f32, pending_after);
-                    if probing_k_diag {
-                        let arrow = if ctrl.current_k() > prev_k {
-                            "↑"
-                        } else if ctrl.current_k() < prev_k {
-                            "↓"
-                        } else {
-                            "·"
-                        };
-                        eprintln!(
-                            "[ProbingK] t={} fwd_ms={:.2} pending={} k={}->{} {}",
-                            decode_token_index,
-                            forward_ms,
-                            pending_after,
-                            prev_k,
-                            ctrl.current_k(),
-                            arrow,
-                        );
-                    }
-                }
-                // ENG-ALG-233: retire plan when all layers have been drained (INV-145).
-                if inc_plan.is_done() {
-                    eprintln!(
-                        "[IncrementalSwap] plan complete (started_at_token={}, finished_at_token={})",
-                        inc_plan.started_at_token(),
+            // ── Swap dispatch (J3+J4+J5: incremental / intra-forward / phase-aware) ─
+            {
+                let mut swap_ctx =
+                    llm_rs2::session::decode_fallback::swap_dispatch::SwapDispatchCtx {
+                        model: &mut model,
+                        args: &args,
                         decode_token_index,
-                    );
-                    // LISWAP-2: drain async dispatcher to ensure all in-flight commits land
-                    // before the plan is retired. drain failure is non-fatal — prototype
-                    // robustness is secondary to measurement.
-                    if let Some(ref dispatcher) = async_swap_dispatcher {
-                        let drain_t = std::time::Instant::now();
-                        if let Err(e) = dispatcher.drain(std::time::Duration::from_secs(2)) {
-                            eprintln!("[LISWAP-2] drain failed: {e}");
-                        } else {
-                            eprintln!(
-                                "[LISWAP-2] dispatcher drained: {:.1}ms",
-                                drain_t.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
-                    }
-                    incremental_force_swap_plan = None;
-
-                    // LISWAP-6 manager path: build WeightSwapReport when the plan
-                    // was committed by dispatch_swap_weights (manager signal).
-                    // Stored in `ready_weight_swap_report`; sent by executor block
-                    // later this token tick (executor scope is separate).
-                    if let Some((ratio, n_planned, plan_start, qcf_estimated)) =
-                        manager_swap_report_pending.take()
-                    {
-                        use llm_rs2::models::weights::compute_qcf_swap;
-                        let latency_ms = plan_start.elapsed().as_millis() as u64;
-                        let n_layers = model.layers.len();
-                        let actually_swapped_now: Vec<usize> = (0..n_layers)
-                            .filter(|&i| model.layers[i].current_dtype() == DType::Q4_0)
-                            .collect();
-                        let qcf_swap_actual = if actually_swapped_now.is_empty() {
-                            qcf_estimated
-                        } else {
-                            compute_qcf_swap(
-                                &actually_swapped_now,
-                                &model.quant_noise,
-                                importance_table_for_swap.as_ref(),
-                                n_layers,
-                            )
-                        };
-                        let layers_swapped: Vec<llm_shared::LayerSwapEntry> = actually_swapped_now
-                            .iter()
-                            .map(|&idx| llm_shared::LayerSwapEntry {
-                                layer_idx: idx as u32,
-                                from_dtype: llm_shared::DtypeTag::F16,
-                                to_dtype: llm_shared::DtypeTag::Q4_0,
-                            })
-                            .collect();
-                        eprintln!(
-                            "[WeightSwap] manager plan complete: ratio={:.2}, planned={}, \
-                             actually_q4={}, qcf_swap={:.4}, latency={}ms",
-                            ratio,
-                            n_planned,
-                            layers_swapped.len(),
-                            qcf_swap_actual,
-                            latency_ms,
-                        );
-                        ready_weight_swap_report = Some(llm_shared::WeightSwapReport {
-                            layers_swapped,
-                            freed_bytes: 0,
-                            latency_ms,
-                            qcf_swap_actual,
-                        });
-                    }
-                }
-            }
-            // ── End Layer-Incremental Swap dispatch ────────────────────────────
-
-            // ── LISWAP-4 Intra-forward Swap retire (INV-150) ──────────────────
-            // After every decode token, check whether the in-flight plan is
-            // complete. If so, drain dispatcher, synchronize backend, bump
-            // ratio_generation, invalidate noshuffle SOA registry, and retire
-            // the hook to None.
-            if let Some(hook) = intra_forward_swap_hook.clone()
-                && hook.plan_is_complete()
-            {
-                let drain_t = std::time::Instant::now();
-                let backend_for_invalidate: Arc<dyn Backend> = gpu_backend_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| Arc::clone(&backend));
-                let invalidate = move || {
-                    backend_for_invalidate.invalidate_noshuffle_soa_registry();
-                };
-                match hook.finalize(
-                    &model.ratio_generation,
-                    invalidate,
-                    std::time::Duration::from_secs(10),
-                ) {
-                    Ok(()) => {
-                        eprintln!(
-                            "[IntraForwardSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms)",
-                            decode_token_index,
-                            drain_t.elapsed().as_secs_f64() * 1000.0,
-                        );
+                        forward_ms,
+                        backend: &backend,
+                        gpu_backend_arc: &gpu_backend_arc,
+                        cpu_backend_arc: &cpu_backend_arc,
+                        is_gpu,
+                        async_swap_dispatcher: &async_swap_dispatcher,
                         #[cfg(feature = "opencl")]
-                        remap_weights_for_cpu_after_swap(
-                            &mut model,
-                            &backend,
-                            is_gpu,
-                            args.resilience_prealloc_switch,
-                            "intra-forward-swap",
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[IntraForwardSwap] finalize failed at token={}: {}",
-                            decode_token_index, e
-                        );
-                    }
-                }
-                intra_forward_swap_hook = None; // retire
+                        host_ptr_swap_pool: &host_ptr_swap_pool,
+                        #[cfg(feature = "cuda-embedded")]
+                        layer_swap_pool: &layer_swap_pool,
+                        #[cfg(feature = "cuda-embedded")]
+                        mmap_registration: &mmap_registration,
+                        importance_table_for_swap: &importance_table_for_swap,
+                        dynamic_k_diag,
+                        probing_k_diag,
+                        incremental_force_swap_plan: &mut incremental_force_swap_plan,
+                        intra_forward_swap_hook: &mut intra_forward_swap_hook,
+                        phase_aware_swap_dispatcher: &mut phase_aware_swap_dispatcher,
+                        dynamic_k_controller: &mut dynamic_k_controller,
+                        probing_k_controller: &mut probing_k_controller,
+                        manager_swap_report_pending: &mut manager_swap_report_pending,
+                        ready_weight_swap_report: &mut ready_weight_swap_report,
+                    };
+                llm_rs2::session::decode_fallback::swap_dispatch::run_incremental_dispatch(
+                    &mut swap_ctx,
+                )?;
+                llm_rs2::session::decode_fallback::swap_dispatch::retire_intra_forward(
+                    &mut swap_ctx,
+                )?;
+                llm_rs2::session::decode_fallback::swap_dispatch::retire_phase_aware(
+                    &mut swap_ctx,
+                )?;
             }
-            // ── End LISWAP-4 retire ────────────────────────────────────────────
-
-            // ── LISWAP-5 Phase-aware Swap retire ──────────────────────────────
-            // chunk_queue가 비고 in_flight도 None이면 dispatcher 종료. finalize는
-            // 마지막 ratio_generation bump + invalidate 수행. PHASE_HOOK은
-            // OnceLock이라 unset 불가능하지만 finalize() 후 모든 hook fire가
-            // noop이 됨 (dispatcher 내부 finalized atomic).
-            if let Some(disp) = phase_aware_swap_dispatcher.as_ref()
-                && std::env::var("LLMRS_PHASE_AWARE_DEBUG").as_deref() == Ok("1")
-                && decode_token_index < 5
-            {
-                let (q, inf, p, d, hs, he, ce) = disp.debug_snapshot();
-                eprintln!(
-                    "[PhaseAwareSwap-DBG] tok={} queue={} in_flight={} pending={} dispatched={} hook_start={} hook_end={} cachefit_end={}",
-                    decode_token_index, q, inf, p, d, hs, he, ce
-                );
-            }
-            if let Some(disp) = phase_aware_swap_dispatcher.as_ref()
-                && disp.is_complete()
-            {
-                let drain_t = std::time::Instant::now();
-                let backend_for_invalidate: Arc<dyn Backend> = gpu_backend_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| Arc::clone(&backend));
-                let invalidate = move || {
-                    backend_for_invalidate.invalidate_noshuffle_soa_registry();
-                };
-                match disp.finalize(
-                    &model.ratio_generation,
-                    invalidate,
-                    std::time::Duration::from_secs(10),
-                ) {
-                    Ok(()) => {
-                        eprintln!(
-                            "[PhaseAwareSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms, chunks={})",
-                            decode_token_index,
-                            drain_t.elapsed().as_secs_f64() * 1000.0,
-                            disp.dispatched_count(),
-                        );
-                        #[cfg(feature = "opencl")]
-                        remap_weights_for_cpu_after_swap(
-                            &mut model,
-                            &backend,
-                            is_gpu,
-                            args.resilience_prealloc_switch,
-                            "phase-aware-swap",
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[PhaseAwareSwap] finalize failed at token={}: {}",
-                            decode_token_index, e
-                        );
-                    }
-                }
-                phase_aware_swap_dispatcher = None;
-            }
-            // ── End LISWAP-5 retire ────────────────────────────────────────────
+            // ── End swap dispatch ──────────────────────────────────────────────
 
             // ── H2O Debug: per-step diagnostics ──
             if args.h2o_debug() {
@@ -2917,152 +2222,22 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Auto-eviction after forward pass (non-experiment mode)
-            if auto_eviction {
-                let before_len = kv_caches[0].current_pos;
-                let capacity = kv_caches[0].capacity();
-
-                // GPU score sync: transfer GPU-accumulated scores to CPU accumulator
-                // before any score-based eviction decision. Only syncs when:
-                // 1. GPU score acc is active AND
-                // 2. Eviction is imminent (score-based at 90% capacity) OR non-score-based with acc
-                #[cfg(feature = "opencl")]
-                if (score_based_eviction && before_len >= capacity * 9 / 10
-                    || score_accumulator.as_ref().is_some_and(|a| a.is_active()))
-                    && let Some(ocl_be) = backend
-                        .as_any()
-                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-                    && let Some(gpu_acc) = ocl_be.gpu_score_acc()
-                    && gpu_acc.is_active()
-                {
-                    let (flat, head) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())?;
-                    if let Some(ref mut acc) = score_accumulator {
-                        acc.import_gpu_scores(&flat, &head);
-                    }
-                }
-
-                // Capture pre-eviction scores for profiling (before eviction mutates state)
-                let pre_eviction_scores: Vec<f32> = if profiler.is_some()
-                    && score_based_eviction
-                    && before_len >= capacity * 9 / 10
-                {
-                    score_accumulator
-                        .as_ref()
-                        .filter(|acc| acc.is_active())
-                        .map(|acc| {
-                            acc.importance_scores()[..before_len.min(acc.importance_scores().len())]
-                                .to_vec()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                let result = if score_based_eviction && before_len >= capacity * 9 / 10 {
-                    // Score-based policies: force evict when cache >= 90% full
-                    if let Some(acc) = score_accumulator.as_ref() {
-                        if acc.is_active() {
-                            // D2O layer-level allocation: use per-layer budgets if available
-                            if let Some(ref ratios) = d2o_layer_ratios {
-                                cache_manager.force_evict_with_scores_and_budgets(
-                                    &mut kv_caches,
-                                    args.eviction_target_ratio(),
-                                    acc.importance_scores(),
-                                    ratios,
-                                )?
-                            } else {
-                                cache_manager.force_evict_with_scores(
-                                    &mut kv_caches,
-                                    args.eviction_target_ratio(),
-                                    acc.importance_scores(),
-                                )?
-                            }
-                        } else {
-                            cache_manager
-                                .force_evict(&mut kv_caches, args.eviction_target_ratio())?
-                        }
-                    } else {
-                        cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio())?
-                    }
-                } else if let Some(acc) = score_accumulator.as_ref() {
-                    if acc.is_active() {
-                        cache_manager
-                            .maybe_evict_with_scores(&mut kv_caches, acc.importance_scores())?
-                    } else {
-                        cache_manager.maybe_evict(&mut kv_caches)?
-                    }
-                } else {
-                    cache_manager.maybe_evict(&mut kv_caches)?
-                };
-                if result.evicted {
-                    // Compute evicted indices from pre-eviction state
-                    let target_len = ((before_len as f32) * args.eviction_target_ratio()) as usize;
-                    let evicted_indices = if !pre_eviction_scores.is_empty() {
-                        llm_rs2::profile::compute_h2o_evicted_indices(
-                            before_len,
-                            target_len,
-                            actual_protected_prefix,
-                            args.h2o_keep_ratio(),
-                            &pre_eviction_scores,
-                        )
-                    } else {
-                        Vec::new()
-                    };
-
-                    if let Some(ref mut p) = profiler {
-                        // Record token deaths before the EvictionEvent
-                        if !evicted_indices.is_empty() {
-                            p.scores.record_token_deaths(
-                                decode_token_index,
-                                &evicted_indices,
-                                &position_birth_step,
-                                &pre_eviction_scores,
-                            );
-                        }
-                        p.on_eviction(llm_rs2::profile::EvictionEvent {
-                            step: decode_token_index,
-                            policy: args.eviction_policy().to_string(),
-                            before_len,
-                            after_len: result.new_pos,
-                            evicted_count: result.tokens_removed,
-                            partition: llm_rs2::profile::PartitionInfo {
-                                prefix_end: actual_protected_prefix,
-                                hh_count: 0,
-                                recent_start: result.new_pos,
-                            },
-                            evicted_indices: evicted_indices.clone(),
-                            pre_eviction_scores,
-                        });
-                    }
-
-                    // Update position_birth_step mapping after eviction (compact)
-                    if !position_birth_step.is_empty() {
-                        let evicted_set: std::collections::HashSet<usize> =
-                            evicted_indices.iter().copied().collect();
-                        let mut kept = Vec::new();
-                        for (pos, &birth) in position_birth_step.iter().enumerate() {
-                            if pos < before_len && !evicted_set.contains(&pos) {
-                                kept.push(birth);
-                            }
-                        }
-                        position_birth_step = kept;
-                    }
-
-                    if let Some(acc) = score_accumulator.as_mut() {
-                        acc.reset();
-                    }
-                    // Reset GPU score accumulator after eviction
-                    #[cfg(feature = "opencl")]
-                    if let Some(ocl_be) = backend
-                        .as_any()
-                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-                        && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
-                        && gpu_acc.is_active()
-                    {
-                        gpu_acc.reset(ocl_be.queue.as_core())?;
-                    }
-                }
-            }
+            llm_rs2::session::decode_fallback::eviction_trigger::run_auto_eviction(
+                llm_rs2::session::decode_fallback::eviction_trigger::AutoEvictionCtx {
+                    args: &args,
+                    cache_manager: &cache_manager,
+                    kv_caches: &mut kv_caches,
+                    auto_eviction,
+                    score_based_eviction,
+                    score_accumulator: &mut score_accumulator,
+                    d2o_layer_ratios: &d2o_layer_ratios,
+                    backend: &backend,
+                    profiler: &mut profiler,
+                    position_birth_step: &mut position_birth_step,
+                    actual_protected_prefix,
+                    decode_token_index,
+                },
+            )?;
             forward_ms_values.push(forward_ms);
             if std::env::var("LLMRS_PER_TOKEN_MS").is_ok() {
                 eprintln!(
