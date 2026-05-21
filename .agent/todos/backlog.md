@@ -194,12 +194,12 @@
 
 ---
 
-# Weight Swap Overhead 감축 (EuroSys 2027 critical path) — 2026-05-07 신규
+# Weight Swap Overhead 감축 — 2026-05-07 신규 / 2026-05-21 post-paper 재분류
 
 > 측정 보고: `/home/go/Workspace/papers/eurosys2027/_workspace/experiment/swap_overhead_s25.md`
 > Galaxy S25 단발성 stall 1564.6 ms → 목표 ~70 ms (95.5% 감축).
 > 6개 finding (A~F) + 보조 1개 (eager prefault). spec-manage가 부여할 ID 컨벤션: `WSWAP-6-A` ~ `WSWAP-6-F`, `WSWAP-6-PREFAULT`.
-> EuroSys 2027 paper critical path이므로 기존 backlog의 [P2] QCF rename / [P0] Weight Swap Phase B 스프린트 항목보다 **Sprint 우선권 상위**에 배치 (P0/P1).
+> **2026-05-21 갱신**: EuroSys 2027 paper 사이클 종결. paper deadline 압박 없음. 우선순위는 기술 부채 정리 가치로만 재판정 필요 (현재 P0/P1 표기는 paper-driven 잔여, 사후 컨텍스트에서 재평가 대상).
 > 의존성: Finding E(stage label rename)는 다른 모든 작업 후 batch rename으로 처리.
 
 ## [P0] WSWAP-6-A: Fused SOA convert kernel (.cl `cvt_q4_0_noshuffle` 6 round-trip → 1 dispatch)
