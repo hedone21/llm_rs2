@@ -10,11 +10,11 @@
 //!
 //! Spec: ENG-DAT-096, ENG-ALG-223, INV-132~134.
 
-use llm_rs2::models::weights::LoadError;
 use llm_rs2::auf::reader::open_from_bytes;
 use llm_rs2::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
 use llm_rs2::auf::writer::AufWriter;
 use llm_rs2::auf::{AufMeta, BackendTag, section::TAG_WEIGHTS_CPU_AOS};
+use llm_rs2::models::weights::LoadError;
 
 // ── Fixture helpers ──────────────────────────────────────────────────────────
 
@@ -195,8 +195,8 @@ fn auf_cpu_aos_is_not_pre_converted_soa() {
 
 #[test]
 fn auf_dtype_q4_0_maps_to_engine_q4_0() {
-    use llm_rs2::buffer::DType;
     use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+    use llm_rs2::buffer::DType;
 
     // Build a TensorIndex with Q4_0 entries.
     let mut tag = [0u8; 24];
@@ -249,10 +249,10 @@ fn len_of(s: &str) -> usize {
 /// weights_section_offset again), this test panics with an OOB slice index.
 #[test]
 fn auf_secondary_tensor_bytes_base_offset_round_trip() {
-    use llm_rs2::models::config::{ModelArch, ModelConfig};
-    use llm_rs2::models::weights::build_auf_secondary_from_view;
     use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
     use llm_rs2::auf::{AufMeta, BackendTag};
+    use llm_rs2::models::config::{ModelArch, ModelConfig};
+    use llm_rs2::models::weights::build_auf_secondary_from_view;
     use std::path::Path;
 
     // Two fake tensor payloads: distinct bytes so we can verify identity.
@@ -419,13 +419,13 @@ fn auf_secondary_tensor_bytes_base_offset_round_trip() {
 /// UnifiedBuffer → switch_hw cpu / partition compatible).
 #[test]
 fn auf_secondary_layout_auto_falls_back_to_cpu_aos() {
+    use llm_rs2::auf::AufMeta;
+    use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
     use llm_rs2::buffer::DType;
     use llm_rs2::models::config::{ModelArch, ModelConfig};
     use llm_rs2::models::weights::{
         SecondaryDtypeChoice, SecondaryLayoutChoice, open_secondary_auf,
     };
-    use llm_rs2::auf::AufMeta;
-    use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
 
     // Build minimal AUF with only WEIGHTS_CPU_AOS — no ADRENO_SOA section.
     let q4_payload: Vec<u8> = (0u8..18).collect();
@@ -536,11 +536,11 @@ fn auf_secondary_layout_auto_falls_back_to_cpu_aos() {
 /// Fix: explicit weight-preference order Q4_0 → F16 → BF16 → Q4_1 → Q8_0 → F32.
 #[test]
 fn auf_secondary_auto_prefers_weight_dtype_over_norm_f32() {
+    use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+    use llm_rs2::auf::{AufMeta, BackendTag};
     use llm_rs2::buffer::DType;
     use llm_rs2::models::config::{ModelArch, ModelConfig};
     use llm_rs2::models::weights::{SecondaryDtypeChoice, build_auf_secondary_from_view};
-    use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
-    use llm_rs2::auf::{AufMeta, BackendTag};
     use std::path::Path;
 
     // Mixed-dtype AUF: layer 0 has a Q4_0 weight + an F32 norm. Auto must

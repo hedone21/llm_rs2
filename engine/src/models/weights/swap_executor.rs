@@ -160,6 +160,14 @@ pub fn dtype_tag_to_dtype(tag: DtypeTag) -> Result<DType, SwapError> {
     }
 }
 
+/// `Result` returned by an async build of one target layer:
+/// `(materialised TransformerLayer, fence GPU event)` on success.
+type AsyncLayerBuild = Result<(TransformerLayer, GpuEvent), SwapError>;
+
+/// One element of the per-batch async build collection: layer index paired
+/// with its build result.
+type AsyncLayerBuildPair = (usize, AsyncLayerBuild);
+
 /// Outcome of a single layer swap inside one batch.
 #[derive(Debug, Clone)]
 pub struct SwappedLayer {
@@ -461,7 +469,6 @@ impl<'a> SwapExecutor<'a> {
     ///
     /// When `None` (or `supports_async_transfer()` returns `false`), the
     /// original synchronous path runs unchanged (backward-compatible).
-    #[allow(clippy::type_complexity)]
     pub fn execute_on_slots(
         &self,
         layers: &[Arc<LayerSlot>],
@@ -652,32 +659,31 @@ impl<'a> SwapExecutor<'a> {
                 .map(|v| v == "1")
                 .unwrap_or(false);
             let t_par0 = Instant::now();
-            let pairs: Vec<(usize, Result<(TransformerLayer, GpuEvent), SwapError>)> =
-                if par_seq_mode {
-                    target_layers
-                        .iter()
-                        .filter_map(|&idx| {
-                            let slot = layers.get(idx)?;
-                            if slot.current_dtype() == self.target_dtype {
-                                return None;
-                            }
-                            slot.secondary_mmap_handle()?;
-                            Some((idx, self.build_layer_from_mmap_async(secondary, slot, idx)))
-                        })
-                        .collect()
-                } else {
-                    target_layers
-                        .par_iter()
-                        .filter_map(|&idx| {
-                            let slot = layers.get(idx)?;
-                            if slot.current_dtype() == self.target_dtype {
-                                return None;
-                            }
-                            slot.secondary_mmap_handle()?;
-                            Some((idx, self.build_layer_from_mmap_async(secondary, slot, idx)))
-                        })
-                        .collect()
-                };
+            let pairs: Vec<AsyncLayerBuildPair> = if par_seq_mode {
+                target_layers
+                    .iter()
+                    .filter_map(|&idx| {
+                        let slot = layers.get(idx)?;
+                        if slot.current_dtype() == self.target_dtype {
+                            return None;
+                        }
+                        slot.secondary_mmap_handle()?;
+                        Some((idx, self.build_layer_from_mmap_async(secondary, slot, idx)))
+                    })
+                    .collect()
+            } else {
+                target_layers
+                    .par_iter()
+                    .filter_map(|&idx| {
+                        let slot = layers.get(idx)?;
+                        if slot.current_dtype() == self.target_dtype {
+                            return None;
+                        }
+                        slot.secondary_mmap_handle()?;
+                        Some((idx, self.build_layer_from_mmap_async(secondary, slot, idx)))
+                    })
+                    .collect()
+            };
             stages.mmap_permute_ms += t_par0.elapsed().as_secs_f64() * 1e3;
             built_cache = pairs.into_iter().collect();
         }

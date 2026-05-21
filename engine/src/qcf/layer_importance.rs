@@ -7,6 +7,14 @@
 //!
 //! Built during prefill (1 pass), reused for all decode steps.
 
+/// Output of `ImportanceCollector::build_with_raws()`:
+/// `(table, x_means_per_layer, before_snapshots(snapshot, dim, count))`.
+pub type ImportanceWithRaws = (
+    ImportanceTable,
+    Vec<Vec<f32>>,
+    Vec<(Vec<f32>, usize, usize)>,
+);
+
 /// Sub-layer type for fine-grained importance tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubLayer {
@@ -389,14 +397,7 @@ impl ImportanceCollector {
     /// Consume the collector and return `(ImportanceTable, x_means, raws_per_layer)`.
     /// Use this in DirectAttn mode to feed
     /// `noise_table::compute_cascade_attn_perturbation`.
-    #[allow(clippy::type_complexity)]
-    pub fn build_with_raws(
-        self,
-    ) -> (
-        ImportanceTable,
-        Vec<Vec<f32>>,
-        Vec<(Vec<f32>, usize, usize)>,
-    ) {
+    pub fn build_with_raws(self) -> ImportanceWithRaws {
         (
             ImportanceTable::from_entries(self.entries),
             self.x_means,

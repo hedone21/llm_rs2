@@ -261,7 +261,10 @@ mod tests {
     #[test]
     fn test_estimator_custom_curves() {
         let mut curves = HashMap::new();
-        curves.insert("kv.eviction".to_string(), PiecewiseLinear::new(0.3, 2.0, 10.0));
+        curves.insert(
+            "kv.eviction".to_string(),
+            PiecewiseLinear::new(0.3, 2.0, 10.0),
+        );
 
         let est = DegradationEstimator::new(curves, 5.0, 0.0);
         let metric = QcfMetric {

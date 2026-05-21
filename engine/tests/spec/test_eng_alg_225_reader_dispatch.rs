@@ -13,12 +13,12 @@
 //!
 //! INV-225: reader dtype dispatch precedence 보존.
 
-use llm_rs2::models::weights::{LoadError, SecondaryDtypeChoice, build_auf_secondary_from_view};
 use llm_rs2::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, TAG_WEIGHTS_ADRENO_SOA,
     TAG_WEIGHTS_CPU_AOS, TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind,
     open_from_bytes,
 };
+use llm_rs2::models::weights::{LoadError, SecondaryDtypeChoice, build_auf_secondary_from_view};
 
 // ── 공통 헬퍼 ────────────────────────────────────────────────────────────────
 

@@ -27,6 +27,13 @@
 
 use std::sync::Arc;
 
+use llm_rs2::auf::{
+    AufMeta, BackendTag,
+    section::TAG_WEIGHTS_CPU_AOS,
+    tensor_index::TensorIndex,
+    tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE},
+    writer::AufWriter,
+};
 use llm_rs2::backend::Backend;
 use llm_rs2::buffer::{Buffer, DType};
 use llm_rs2::memory::host::mmap::MmapBuffer;
@@ -37,13 +44,6 @@ use llm_rs2::models::weights::secondary_mmap::{
 };
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
-use llm_rs2::auf::{
-    AufMeta, BackendTag,
-    section::TAG_WEIGHTS_CPU_AOS,
-    tensor_index::TensorIndex,
-    tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE},
-    writer::AufWriter,
-};
 
 // ── Fixture helpers ──────────────────────────────────────────────────────────
 

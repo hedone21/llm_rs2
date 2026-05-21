@@ -221,7 +221,7 @@ mod tests {
                 ("kv.evict_sliding", true, false), // Lossy
                 ("kv.evict_h2o", true, false),     // Lossy
                 ("kv.quant_dynamic", true, false), // Lossy
-                ("weight.skip", true, true),        // Lossy
+                ("weight.skip", true, true),       // Lossy
             ],
             &[],
         );
