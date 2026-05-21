@@ -17,7 +17,6 @@ pub mod shape;
 pub mod tensor;
 pub mod thread_pool;
 
-pub mod eval;
 pub mod experiment;
 pub mod observability;
 pub mod resilience;

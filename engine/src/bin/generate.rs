@@ -252,7 +252,7 @@ fn main() -> anyhow::Result<()> {
         let questions = load_eval_questions(&args, &prompt)?;
         let vocab_size = model.config.vocab_size;
         let hidden_size = model.config.hidden_size;
-        let eval_config = llm_rs2::eval::EvalConfig {
+        let eval_config = llm_rs2::observability::eval::EvalConfig {
             max_seq_len,
             effective_budget: 0,
             kv_budget_ratio: 0.0,
@@ -311,13 +311,13 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        let mut hook = llm_rs2::eval::KiviHook::new(
+        let mut hook = llm_rs2::observability::eval::KiviHook::new(
             qcf_config,
             args.enable_qcf_experimental,
             kivi_sample_layers,
             kivi_score_acc,
         );
-        let output = llm_rs2::eval::run_eval_ll_generic(
+        let output = llm_rs2::observability::eval::run_eval_ll_generic(
             &model,
             &tokenizer,
             &backend,
@@ -3417,7 +3417,7 @@ fn main() -> anyhow::Result<()> {
 
     // --qcf-dump: write JSON for generation mode (ppl=null, avg_nll=null).
     if let Some(ref dump_path) = args.qcf_dump {
-        use llm_rs2::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
+        use llm_rs2::observability::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
 
         let empty_swap: Vec<usize> = Vec::new();
         let (swap_set, qcf_predicted, fallback_used) = if let Some(ref dec) = qcf_swap_decision {
