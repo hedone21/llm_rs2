@@ -42,7 +42,7 @@ fn test_policy_config() -> PolicyConfig {
         },
     );
     actions.insert(
-        "kv_evict_sliding".to_string(),
+        "kv.evict_sliding".to_string(),
         ActionConfig {
             lossy: true,
             reversible: false,
@@ -50,7 +50,7 @@ fn test_policy_config() -> PolicyConfig {
         },
     );
     actions.insert(
-        "kv_evict_h2o".to_string(),
+        "kv.evict_h2o".to_string(),
         ActionConfig {
             lossy: true,
             reversible: false,
@@ -58,7 +58,7 @@ fn test_policy_config() -> PolicyConfig {
         },
     );
     actions.insert(
-        "layer_skip".to_string(),
+        "weight.skip".to_string(),
         ActionConfig {
             lossy: true,
             reversible: true,
@@ -69,7 +69,7 @@ fn test_policy_config() -> PolicyConfig {
     let mut exclusion_groups = HashMap::new();
     exclusion_groups.insert(
         "eviction".to_string(),
-        vec!["kv_evict_sliding".into(), "kv_evict_h2o".into()],
+        vec!["kv.evict_sliding".into(), "kv.evict_h2o".into()],
     );
 
     PolicyConfig {
@@ -231,8 +231,8 @@ fn test_seq_095_critical_steady_no_request_qcf() {
     // QCF pending을 complete해서 pending 상태를 해소한다
     let qcf = QcfEstimate {
         estimates: HashMap::from([
-            ("kv_evict_sliding".to_string(), 0.3),
-            ("kv_evict_h2o".to_string(), 0.4),
+            ("kv.evict_sliding".to_string(), 0.3),
+            ("kv.evict_h2o".to_string(), 0.4),
         ]),
         layer_swap: None,
     };
@@ -271,9 +271,9 @@ fn test_seq_097_complete_with_qcf_estimate() {
     // Engine이 QcfEstimate를 보낸다
     let qcf = QcfEstimate {
         estimates: HashMap::from([
-            ("kv_evict_sliding".to_string(), 0.2),
-            ("kv_evict_h2o".to_string(), 0.3),
-            ("layer_skip".to_string(), 0.8),
+            ("kv.evict_sliding".to_string(), 0.2),
+            ("kv.evict_h2o".to_string(), 0.3),
+            ("weight.skip".to_string(), 0.8),
         ]),
         layer_swap: None,
     };
@@ -307,7 +307,7 @@ fn test_seq_097_complete_without_pending_returns_none() {
 
     // pending 없이 바로 호출
     let qcf = QcfEstimate {
-        estimates: HashMap::from([("kv_evict_sliding".to_string(), 0.3)]),
+        estimates: HashMap::from([("kv.evict_sliding".to_string(), 0.3)]),
         layer_swap: None,
     };
 
@@ -333,9 +333,9 @@ fn test_seq_097_qcf_values_override_default_cost() {
     // 매우 낮은 비용으로 QcfEstimate 전달 — 액션 선택이 더 적극적이어야 한다
     let qcf_low_cost = QcfEstimate {
         estimates: HashMap::from([
-            ("kv_evict_sliding".to_string(), 0.01),
-            ("kv_evict_h2o".to_string(), 0.01),
-            ("layer_skip".to_string(), 0.01),
+            ("kv.evict_sliding".to_string(), 0.01),
+            ("kv.evict_h2o".to_string(), 0.01),
+            ("weight.skip".to_string(), 0.01),
         ]),
         layer_swap: None,
     };

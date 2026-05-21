@@ -23,7 +23,7 @@ fn make_test_status() -> EngineStatus {
         memory_lossy_min: 0.01,
         state: EngineState::Running,
         tokens_generated: 100,
-        available_actions: vec!["throttle".into(), "kv_evict_h2o".into()],
+        available_actions: vec!["throttle".into(), "kv.evict_h2o".into()],
         active_actions: vec!["throttle".into()],
         eviction_policy: "none".into(),
         kv_dtype: "f16".into(),
@@ -92,7 +92,7 @@ fn test_msg_011_engine_message_serde_variants() {
     let msg = EngineMessage::QcfEstimate(QcfEstimate {
         estimates: {
             let mut m = std::collections::HashMap::new();
-            m.insert("kv_evict_h2o".to_string(), 0.1);
+            m.insert("kv.evict_h2o".to_string(), 0.1);
             m
         },
         layer_swap: None,
@@ -138,7 +138,7 @@ fn test_msg_021_engine_command_serde_throttle() {
 fn test_msg_021_engine_command_serde_layer_skip() {
     let cmd = EngineCommand::LayerSkip { skip_ratio: 0.25 };
     let json = serde_json::to_string(&cmd).unwrap();
-    assert!(json.contains("\"type\":\"layer_skip\""));
+    assert!(json.contains("\"type\":\"weight.skip\""));
     let back: EngineCommand = serde_json::from_str(&json).unwrap();
     match back {
         EngineCommand::LayerSkip { skip_ratio } => {
@@ -152,14 +152,14 @@ fn test_msg_021_engine_command_serde_layer_skip() {
 fn test_msg_021_engine_command_serde_kv_evict_h2o() {
     let cmd = EngineCommand::KvEvictH2o { keep_ratio: 0.48 };
     let json = serde_json::to_string(&cmd).unwrap();
-    assert!(json.contains("\"type\":\"kv_evict_h2o\""));
+    assert!(json.contains("\"type\":\"kv.evict_h2o\""));
 }
 
 #[test]
 fn test_msg_021_engine_command_serde_kv_evict_sliding() {
     let cmd = EngineCommand::KvEvictSliding { keep_ratio: 0.6 };
     let json = serde_json::to_string(&cmd).unwrap();
-    assert!(json.contains("\"type\":\"kv_evict_sliding\""));
+    assert!(json.contains("\"type\":\"kv.evict_sliding\""));
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn test_msg_021_engine_command_serde_kv_streaming() {
         window_size: 256,
     };
     let json = serde_json::to_string(&cmd).unwrap();
-    assert!(json.contains("\"type\":\"kv_streaming\""));
+    assert!(json.contains("\"type\":\"kv.evict_streaming\""));
     let back: EngineCommand = serde_json::from_str(&json).unwrap();
     match back {
         EngineCommand::KvStreaming {
@@ -187,7 +187,7 @@ fn test_msg_021_engine_command_serde_kv_streaming() {
 fn test_msg_021_engine_command_serde_kv_merge_d2o() {
     let cmd = EngineCommand::KvMergeD2o { keep_ratio: 0.75 };
     let json = serde_json::to_string(&cmd).unwrap();
-    assert!(json.contains("\"type\":\"kv_merge_d2o\""));
+    assert!(json.contains("\"type\":\"kv.merge_d2o\""));
     let back: EngineCommand = serde_json::from_str(&json).unwrap();
     match back {
         EngineCommand::KvMergeD2o { keep_ratio } => {
@@ -201,7 +201,7 @@ fn test_msg_021_engine_command_serde_kv_merge_d2o() {
 fn test_msg_021_engine_command_serde_kv_quant_dynamic() {
     let cmd = EngineCommand::KvQuantDynamic { target_bits: 4 };
     let json = serde_json::to_string(&cmd).unwrap();
-    assert!(json.contains("\"type\":\"kv_quant_dynamic\""));
+    assert!(json.contains("\"type\":\"kv.quant_dynamic\""));
 }
 
 #[test]
@@ -282,7 +282,7 @@ fn test_msg_060_engine_status_serde() {
     assert_eq!(back.state, EngineState::Running);
     assert!((back.actual_throughput - 15.0).abs() < f32::EPSILON);
     assert_eq!(back.kv_cache_tokens, 512);
-    assert_eq!(back.available_actions, vec!["throttle", "kv_evict_h2o"]);
+    assert_eq!(back.available_actions, vec!["throttle", "kv.evict_h2o"]);
     assert_eq!(back.active_actions, vec!["throttle"]);
     assert_eq!(back.eviction_policy, "none");
     assert_eq!(back.kv_dtype, "f16");
@@ -455,9 +455,9 @@ fn test_msg_100_system_signal_serde_roundtrip() {
 fn test_msg_085_qcf_estimate_serde_roundtrip() {
     use std::collections::HashMap;
     let mut estimates = HashMap::new();
-    estimates.insert("kv_evict_h2o".to_string(), 0.12f32);
-    estimates.insert("kv_evict_sliding".to_string(), 0.18f32);
-    estimates.insert("layer_skip".to_string(), 0.35f32);
+    estimates.insert("kv.evict_h2o".to_string(), 0.12f32);
+    estimates.insert("kv.evict_sliding".to_string(), 0.18f32);
+    estimates.insert("weight.skip".to_string(), 0.35f32);
 
     let qcf = QcfEstimate {
         estimates,
@@ -472,9 +472,9 @@ fn test_msg_085_qcf_estimate_serde_roundtrip() {
     match back {
         EngineMessage::QcfEstimate(q) => {
             assert_eq!(q.estimates.len(), 3);
-            assert!((q.estimates["kv_evict_h2o"] - 0.12).abs() < f32::EPSILON);
-            assert!((q.estimates["kv_evict_sliding"] - 0.18).abs() < f32::EPSILON);
-            assert!((q.estimates["layer_skip"] - 0.35).abs() < f32::EPSILON);
+            assert!((q.estimates["kv.evict_h2o"] - 0.12).abs() < f32::EPSILON);
+            assert!((q.estimates["kv.evict_sliding"] - 0.18).abs() < f32::EPSILON);
+            assert!((q.estimates["weight.skip"] - 0.35).abs() < f32::EPSILON);
         }
         _ => panic!("Expected QcfEstimate"),
     }
@@ -504,8 +504,8 @@ fn test_msg_087_qcf_values_non_negative() {
     // MSG-087: QCF 값은 >= 0.0, 0.0 = 저하 없음
     use std::collections::HashMap;
     let mut estimates = HashMap::new();
-    estimates.insert("kv_evict_h2o".to_string(), 0.0f32);
-    estimates.insert("layer_skip".to_string(), 1.5f32);
+    estimates.insert("kv.evict_h2o".to_string(), 0.0f32);
+    estimates.insert("weight.skip".to_string(), 1.5f32);
 
     let qcf = QcfEstimate {
         estimates,

@@ -254,7 +254,7 @@ ctx = {
     -- ...
   },
 
-  active = {"kv_evict_h2o"},    -- 활성 액션 (기존 유지)
+  active = {"kv.evict_h2o"},    -- 활성 액션 (기존 유지)
 
   signal = {                    -- SystemSignal 원시값 (신규)
     memory = { available = 1048576, total = 8388608 },

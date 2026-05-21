@@ -52,7 +52,7 @@ fn test_policy_config() -> PolicyConfig {
         },
     );
     actions.insert(
-        "kv_evict_sliding".to_string(),
+        "kv.evict_sliding".to_string(),
         ActionConfig {
             lossy: true,
             reversible: false,
@@ -60,7 +60,7 @@ fn test_policy_config() -> PolicyConfig {
         },
     );
     actions.insert(
-        "kv_evict_h2o".to_string(),
+        "kv.evict_h2o".to_string(),
         ActionConfig {
             lossy: true,
             reversible: false,
@@ -68,7 +68,7 @@ fn test_policy_config() -> PolicyConfig {
         },
     );
     actions.insert(
-        "layer_skip".to_string(),
+        "weight.skip".to_string(),
         ActionConfig {
             lossy: true,
             reversible: true,
@@ -79,7 +79,7 @@ fn test_policy_config() -> PolicyConfig {
     let mut exclusion_groups = HashMap::new();
     exclusion_groups.insert(
         "eviction".to_string(),
-        vec!["kv_evict_sliding".into(), "kv_evict_h2o".into()],
+        vec!["kv.evict_sliding".into(), "kv.evict_h2o".into()],
     );
 
     PolicyConfig {

@@ -324,7 +324,7 @@ gain_zones는 `above` 기준 오름차순 정렬되어야 한다 (MUST). 현재 
 
 ```toml
 [policy.exclusion_groups]
-eviction = ["kv_evict_sliding", "kv_evict_h2o", "kv_evict_streaming", "kv_merge_d2o"]
+eviction = ["kv.evict_sliding", "kv.evict_h2o", "kv.evict_streaming", "kv.merge_d2o"]
 ```
 
 동일 배타 그룹의 액션은 동시에 선택되지 않는다 (MGR-ALG-033). 알 수 없는 action_name은 무시된다.
@@ -844,7 +844,7 @@ reversible = false
 default_cost = 1.0
 
 [policy.exclusion_groups]
-eviction = ["kv_evict_sliding", "kv_evict_h2o", "kv_evict_streaming", "kv_merge_d2o"]
+eviction = ["kv.evict_sliding", "kv.evict_h2o", "kv.evict_streaming", "kv.merge_d2o"]
 ```
 
 ### 6.2 최소 설정 (모든 default 사용)

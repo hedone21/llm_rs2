@@ -228,7 +228,7 @@ fn test_directive_triggers_observation_due_schedule() {
 
     let obs_count = sim
         .trajectory()
-        .observation_due_count_for("kv_evict_sliding");
+        .observation_due_count_for("kv.evict_sliding");
     assert!(
         obs_count >= 1,
         "kv_evict_sliding ObservationDue가 1회 이상 기록되어야 함, actual={}",
@@ -360,9 +360,9 @@ function decide(ctx)
   if ctx.signal and ctx.signal.memory then
     local level = ctx.signal.memory.level
     if level == "Warning" then
-      table.insert(cmds, {type = "kv_evict_sliding", keep_ratio = 0.8})
+      table.insert(cmds, {type = "kv.evict_sliding", keep_ratio = 0.8})
     elseif level == "Critical" or level == "Emergency" then
-      table.insert(cmds, {type = "kv_evict_sliding", keep_ratio = 0.5})
+      table.insert(cmds, {type = "kv.evict_sliding", keep_ratio = 0.5})
     end
   end
   return cmds

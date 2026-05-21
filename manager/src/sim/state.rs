@@ -303,7 +303,7 @@ impl EngineStateModel {
             }
             EngineCommand::LayerSkip { skip_ratio } => {
                 self.skip_ratio = *skip_ratio as f64;
-                add_action(&mut self.active_actions, "layer_skip");
+                add_action(&mut self.active_actions, "weight.skip");
             }
             EngineCommand::SetTargetTbt { target_ms } => {
                 self.tbt_target_ms = *target_ms as f64;

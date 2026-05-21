@@ -58,8 +58,8 @@ fn test_seq_096_send_qcf_estimate_after_response() {
 
     // Simulate QCF computation and send (as generate.rs would do)
     let mut estimates = HashMap::new();
-    estimates.insert("kv_evict_sliding".to_string(), 0.15);
-    estimates.insert("kv_evict_h2o".to_string(), 0.22);
+    estimates.insert("kv.evict_sliding".to_string(), 0.15);
+    estimates.insert("kv.evict_h2o".to_string(), 0.22);
     executor.send_qcf_estimate(QcfEstimate {
         estimates: estimates.clone(),
         layer_swap: None,
@@ -70,8 +70,8 @@ fn test_seq_096_send_qcf_estimate_after_response() {
     match msg2 {
         EngineMessage::QcfEstimate(qcf) => {
             assert_eq!(qcf.estimates.len(), 2);
-            assert!((qcf.estimates["kv_evict_sliding"] - 0.15).abs() < f32::EPSILON);
-            assert!((qcf.estimates["kv_evict_h2o"] - 0.22).abs() < f32::EPSILON);
+            assert!((qcf.estimates["kv.evict_sliding"] - 0.15).abs() < f32::EPSILON);
+            assert!((qcf.estimates["kv.evict_h2o"] - 0.22).abs() < f32::EPSILON);
         }
         _ => panic!("Expected QcfEstimate, got {:?}", msg2),
     }
@@ -146,7 +146,7 @@ fn test_seq_096_message_ordering_response_before_estimate() {
 
     // Send QcfEstimate (simulating generate.rs behavior after poll)
     let mut estimates = HashMap::new();
-    estimates.insert("kv_evict_sliding".to_string(), 0.1);
+    estimates.insert("kv.evict_sliding".to_string(), 0.1);
     executor.send_qcf_estimate(QcfEstimate {
         estimates,
         layer_swap: None,

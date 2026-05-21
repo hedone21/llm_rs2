@@ -13,8 +13,8 @@ fn make_registry_with_swap_and_evict() -> ActionRegistry {
     let mut actions = HashMap::new();
     for (name, lossy, reversible) in &[
         ("swap_weights", true, false),
-        ("kv_evict_sliding", true, false),
-        ("kv_evict_h2o", true, false),
+        ("kv.evict_sliding", true, false),
+        ("kv.evict_h2o", true, false),
         ("throttle", false, true),
     ] {
         actions.insert(
@@ -31,7 +31,7 @@ fn make_registry_with_swap_and_evict() -> ActionRegistry {
     let mut exclusion_groups: HashMap<String, Vec<String>> = HashMap::new();
     exclusion_groups.insert(
         "eviction".to_string(),
-        vec!["kv_evict_sliding".to_string(), "kv_evict_h2o".to_string()],
+        vec!["kv.evict_sliding".to_string(), "kv.evict_h2o".to_string()],
     );
     let config = PolicyConfig {
         actions,

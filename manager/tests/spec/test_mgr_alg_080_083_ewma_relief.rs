@@ -185,7 +185,7 @@ mod ewma_tests {
         let script = r#"
             function decide(ctx)
                 return {
-                    { type = "kv_evict_sliding", keep_ratio = 0.7 },
+                    { type = "kv.evict_sliding", keep_ratio = 0.7 },
                     { type = "throttle", delay_ms = 100 }
                 }
             end
@@ -385,7 +385,7 @@ mod ewma_tests {
 
         let script = r#"
             function decide(ctx)
-                return {{ type = "kv_evict_sliding", keep_ratio = 0.7 }}
+                return {{ type = "kv.evict_sliding", keep_ratio = 0.7 }}
             end
         "#;
         let dir = tempfile::tempdir().unwrap();
@@ -432,7 +432,7 @@ mod ewma_tests {
             "3.002초 경과 시점에서 relief에 학습된 값이 있어야 함 (MGR-ALG-083)"
         );
         assert!(
-            snapshot_after.contains_key("kv_evict_sliding"),
+            snapshot_after.contains_key("kv.evict_sliding"),
             "kv_evict_sliding 액션이 학습되어야 함"
         );
     }
@@ -700,7 +700,7 @@ mod ewma_tests {
         for i in 0..5u32 {
             let val = i as f32 * 0.1;
             let obs: [f32; 6] = [val; 6];
-            table.observe("kv_evict_sliding", &obs);
+            table.observe("kv.evict_sliding", &obs);
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -710,7 +710,7 @@ mod ewma_tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-        let entry_val = &parsed["kv_evict_sliding"];
+        let entry_val = &parsed["kv.evict_sliding"];
         assert!(!entry_val.is_null(), "kv_evict_sliding entry가 존재해야 함");
 
         // observation_count와 relief만 있어야 함 (raw history 없음)
@@ -871,17 +871,17 @@ mod ewma_tests {
         let mut table1 = EwmaReliefTable::new(0.875, HashMap::new());
         let obs1: [f32; 6] = [0.3, 0.1, 0.5, 0.2, 0.0, 0.4];
         let obs2: [f32; 6] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
-        table1.observe("kv_evict_sliding", &obs1);
-        table1.observe("kv_evict_sliding", &obs2);
+        table1.observe("kv.evict_sliding", &obs1);
+        table1.observe("kv.evict_sliding", &obs2);
         table1.save(&path).expect("save 실패");
 
-        let expected_relief = table1.entries["kv_evict_sliding"].relief;
-        let expected_count = table1.entries["kv_evict_sliding"].observation_count;
+        let expected_relief = table1.entries["kv.evict_sliding"].relief;
+        let expected_count = table1.entries["kv.evict_sliding"].observation_count;
 
         // 세션 2: 같은 경로로 load
         let table2 = EwmaReliefTable::load(&path, 0.875, HashMap::new()).expect("load 실패");
 
-        let entry2 = table2.entries.get("kv_evict_sliding").expect("entry 없음");
+        let entry2 = table2.entries.get("kv.evict_sliding").expect("entry 없음");
         assert_eq!(
             entry2.observation_count, expected_count,
             "observation_count 보존 실패"
@@ -912,7 +912,7 @@ mod ewma_tests {
             &script_path,
             r#"
                 function decide(ctx)
-                    return {{ type = "kv_evict_sliding", keep_ratio = 0.7 }}
+                    return {{ type = "kv.evict_sliding", keep_ratio = 0.7 }}
                 end
             "#,
         )

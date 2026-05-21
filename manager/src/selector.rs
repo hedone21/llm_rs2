@@ -391,7 +391,7 @@ mod tests {
         let registry = make_registry(
             &[
                 ("switch_hw", false, true),
-                ("kv_evict_sliding", true, false),
+                ("kv.evict_sliding", true, false),
             ],
             &[],
         );
@@ -439,8 +439,8 @@ mod tests {
         // kv_evict_h2o: qcf=2.0 → cost=2.0
         let registry = make_registry(
             &[
-                ("kv_evict_sliding", true, false),
-                ("kv_evict_h2o", true, false),
+                ("kv.evict_sliding", true, false),
+                ("kv.evict_h2o", true, false),
             ],
             &[], // exclusion group 없음 (이 테스트에서는 동시 선택 가능하게)
         );
@@ -488,7 +488,7 @@ mod tests {
             &[
                 ("switch_hw", false, true),
                 ("throttle", false, true),
-                ("kv_evict_sliding", true, false),
+                ("kv.evict_sliding", true, false),
             ],
             &[],
         );
@@ -536,10 +536,10 @@ mod tests {
     fn test_exclusion_group() {
         let registry = make_registry(
             &[
-                ("kv_evict_sliding", true, false),
-                ("kv_evict_h2o", true, false),
+                ("kv.evict_sliding", true, false),
+                ("kv.evict_h2o", true, false),
             ],
-            &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+            &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
         );
 
         let mut predictions = HashMap::new();
@@ -669,8 +669,8 @@ mod tests {
     fn test_empty_candidates() {
         let registry = make_registry(
             &[
-                ("kv_evict_sliding", true, false),
-                ("layer_skip", true, true),
+                ("kv.evict_sliding", true, false),
+                ("weight.skip", true, true),
             ],
             &[],
         );
@@ -707,7 +707,7 @@ mod tests {
     fn test_parametrize_proportional() {
         // kv_evict_sliding: keep_ratio range [0.3, 0.9]
         // memory pressure = 0.5 → value = 0.9 - 0.5*(0.9-0.3) = 0.9 - 0.3 = 0.6
-        let registry = make_registry(&[("kv_evict_sliding", true, false)], &[]);
+        let registry = make_registry(&[("kv.evict_sliding", true, false)], &[]);
 
         let mut predictions = HashMap::new();
         predictions.insert(ActionId::KvEvictSliding, rv(0.0, 0.9, 0.0, 0.0));
@@ -753,7 +753,7 @@ mod tests {
         let registry = make_registry(
             &[
                 ("switch_hw", false, true),
-                ("kv_evict_sliding", true, false),
+                ("kv.evict_sliding", true, false),
             ],
             &[],
         );
@@ -831,7 +831,7 @@ mod tests {
             &[
                 ("switch_hw", false, true),
                 ("throttle", false, true),
-                ("kv_evict_h2o", true, false),
+                ("kv.evict_h2o", true, false),
             ],
             &[],
         );

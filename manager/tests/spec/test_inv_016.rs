@@ -18,11 +18,11 @@ use crate::helpers;
 fn test_inv_016_same_exclusion_group_is_excluded() {
     let registry = helpers::make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
             ("throttle", false, true),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
 
     // 같은 그룹 내 → excluded
@@ -41,12 +41,12 @@ fn test_inv_016_same_exclusion_group_is_excluded() {
 fn test_inv_016_different_group_not_excluded() {
     let registry = helpers::make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
             ("throttle", false, true),
             ("switch_hw", false, true),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
 
     // 배타 그룹에 속하지 않은 액션 간 → not excluded
@@ -67,10 +67,10 @@ fn test_inv_016_different_group_not_excluded() {
 fn test_inv_016_self_exclusion() {
     let registry = helpers::make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
 
     // 자기 자신은 같은 그룹이므로 excluded
@@ -86,10 +86,10 @@ fn test_inv_016_multiple_exclusion_groups() {
     // 두 개의 배타 그룹을 설정
     let mut action_map = HashMap::new();
     for (name, lossy, reversible) in &[
-        ("kv_evict_sliding", true, false),
-        ("kv_evict_h2o", true, false),
+        ("kv.evict_sliding", true, false),
+        ("kv.evict_h2o", true, false),
         ("throttle", false, true),
-        ("layer_skip", true, true),
+        ("weight.skip", true, true),
     ] {
         action_map.insert(
             name.to_string(),
@@ -103,11 +103,11 @@ fn test_inv_016_multiple_exclusion_groups() {
     let mut group_map: HashMap<String, Vec<String>> = HashMap::new();
     group_map.insert(
         "eviction".into(),
-        vec!["kv_evict_sliding".into(), "kv_evict_h2o".into()],
+        vec!["kv.evict_sliding".into(), "kv.evict_h2o".into()],
     );
     group_map.insert(
         "compute_reduction".into(),
-        vec!["throttle".into(), "layer_skip".into()],
+        vec!["throttle".into(), "weight.skip".into()],
     );
     let config = PolicyConfig {
         actions: action_map,
@@ -132,8 +132,8 @@ fn test_inv_016_multiple_exclusion_groups() {
 fn test_inv_016_no_exclusion_groups() {
     let registry = helpers::make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
             ("throttle", false, true),
         ],
         &[], // 배타 그룹 없음
@@ -150,7 +150,7 @@ fn test_inv_016_no_exclusion_groups() {
 #[test]
 fn test_inv_016_exclusion_group_three_members() {
     let mut action_map = HashMap::new();
-    for name in &["kv_evict_sliding", "kv_evict_h2o", "kv_quant_dynamic"] {
+    for name in &["kv.evict_sliding", "kv.evict_h2o", "kv.quant_dynamic"] {
         action_map.insert(
             name.to_string(),
             ActionConfig {
@@ -164,9 +164,9 @@ fn test_inv_016_exclusion_group_three_members() {
     group_map.insert(
         "cache_ops".into(),
         vec![
-            "kv_evict_sliding".into(),
-            "kv_evict_h2o".into(),
-            "kv_quant_dynamic".into(),
+            "kv.evict_sliding".into(),
+            "kv.evict_h2o".into(),
+            "kv.quant_dynamic".into(),
         ],
     );
     let config = PolicyConfig {
@@ -199,10 +199,10 @@ fn test_inv_016_exclusion_group_three_members() {
 fn test_inv_016_exclusion_groups_accessor() {
     let registry = helpers::make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
 
     let groups = registry.exclusion_groups();
@@ -218,11 +218,11 @@ fn test_inv_016_exclusion_groups_accessor() {
 fn test_inv_016_action_meta_exclusion_group_field() {
     let registry = helpers::make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
             ("throttle", false, true),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
 
     let sliding_meta = registry.get(&ActionId::KvEvictSliding).unwrap();

@@ -426,7 +426,7 @@ fn test_inv_076_restore_defaults_after_sliding_evict() {
     assert!(
         executor
             .active_actions()
-            .contains(&"kv_evict_sliding".to_string())
+            .contains(&"kv.evict_sliding".to_string())
     );
 
     // RestoreDefaults

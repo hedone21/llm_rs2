@@ -188,12 +188,12 @@ impl OnlineLinearEstimator {
             ActionId::SwitchHw => "switch_hw",
             ActionId::Throttle => "throttle",
             ActionId::KvOffloadDisk => "kv_offload_disk",
-            ActionId::KvEvictSliding => "kv_evict_sliding",
-            ActionId::KvEvictH2o => "kv_evict_h2o",
-            ActionId::KvEvictStreaming => "kv_evict_streaming",
-            ActionId::KvMergeD2o => "kv_merge_d2o",
-            ActionId::KvQuantDynamic => "kv_quant_dynamic",
-            ActionId::LayerSkip => "layer_skip",
+            ActionId::KvEvictSliding => "kv.evict_sliding",
+            ActionId::KvEvictH2o => "kv.evict_h2o",
+            ActionId::KvEvictStreaming => "kv.evict_streaming",
+            ActionId::KvMergeD2o => "kv.merge_d2o",
+            ActionId::KvQuantDynamic => "kv.quant_dynamic",
+            ActionId::LayerSkip => "weight.skip",
             ActionId::SwapWeights => "swap_weights",
         }
     }

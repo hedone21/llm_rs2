@@ -23,7 +23,7 @@ fn test_inv_043_full_resolution_preferred_over_partial() {
     let registry = make_registry(
         &[
             ("switch_hw", false, true),        // lossless, compute relief
-            ("kv_evict_sliding", true, false), // lossy, memory relief
+            ("kv.evict_sliding", true, false), // lossy, memory relief
         ],
         &[],
     );
@@ -78,8 +78,8 @@ fn test_inv_043_full_resolution_minimum_cost() {
     // 두 lossy 액션이 모두 단독으로 memory 완전 해소 가능
     let registry = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
         ],
         &[],
     );
@@ -157,7 +157,7 @@ fn test_inv_043_best_effort_when_no_full_resolution() {
 /// keep_ratio 파라미터가 [0.3, 0.9] 범위 내에 있어야 한다.
 #[test]
 fn test_inv_044_keep_ratio_within_range() {
-    let registry = make_registry(&[("kv_evict_sliding", true, false)], &[]);
+    let registry = make_registry(&[("kv.evict_sliding", true, false)], &[]);
 
     let mut predictions = HashMap::new();
     predictions.insert(ActionId::KvEvictSliding, rv(0.0, 0.9, 0.0, 0.0));
@@ -238,7 +238,7 @@ fn test_inv_044_delay_ms_within_range() {
 /// layer_skip skip_layers 파라미터가 [1.0, 8.0] 범위 내에 있어야 한다.
 #[test]
 fn test_inv_044_skip_layers_within_range() {
-    let registry = make_registry(&[("layer_skip", true, true)], &[]);
+    let registry = make_registry(&[("weight.skip", true, true)], &[]);
 
     let mut predictions = HashMap::new();
     predictions.insert(ActionId::LayerSkip, rv(0.8, 0.0, 0.0, -0.2));
@@ -279,7 +279,7 @@ fn test_inv_044_skip_layers_within_range() {
 /// kv_quant_dynamic target_bits 파라미터가 [4.0, 8.0] 범위 내에 있어야 한다.
 #[test]
 fn test_inv_044_target_bits_within_range() {
-    let registry = make_registry(&[("kv_quant_dynamic", true, false)], &[]);
+    let registry = make_registry(&[("kv.quant_dynamic", true, false)], &[]);
 
     let mut predictions = HashMap::new();
     predictions.insert(ActionId::KvQuantDynamic, rv(0.0, 0.8, 0.0, 0.0));
@@ -320,7 +320,7 @@ fn test_inv_044_target_bits_within_range() {
 /// 극단적 pressure 값 (0.0, 1.0, 음수, >1.0)에서도 parametrize가 범위를 벗어나지 않아야 한다.
 #[test]
 fn test_inv_044_extreme_pressure_values_still_in_range() {
-    let registry = make_registry(&[("kv_evict_sliding", true, false)], &[]);
+    let registry = make_registry(&[("kv.evict_sliding", true, false)], &[]);
 
     let mut predictions = HashMap::new();
     predictions.insert(ActionId::KvEvictSliding, rv(0.0, 0.9, 0.0, 0.0));

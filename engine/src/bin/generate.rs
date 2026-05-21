@@ -647,16 +647,16 @@ fn main() -> anyhow::Result<()> {
             let mut a = vec![
                 "throttle".to_string(),
                 "switch_hw".to_string(),
-                "layer_skip".to_string(),
+                "weight.skip".to_string(),
             ];
             if args.eviction_policy() != "none" {
-                a.push("kv_evict_h2o".to_string());
-                a.push("kv_evict_sliding".to_string());
-                a.push("kv_evict_streaming".to_string());
-                a.push("kv_merge_d2o".to_string());
+                a.push("kv.evict_h2o".to_string());
+                a.push("kv.evict_sliding".to_string());
+                a.push("kv.evict_streaming".to_string());
+                a.push("kv.merge_d2o".to_string());
             }
             if args.kv_type.starts_with('q') {
-                a.push("kv_quant_dynamic".to_string());
+                a.push("kv.quant_dynamic".to_string());
             }
             // secondary GGUF/AUF 존재 시 swap_weights 등록 (ENG-ST-032).
             // Heartbeat의 compute_available_actions와 동일 조건을 공유한다.
@@ -3670,12 +3670,12 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
             // Streaming QCF only fires when streaming_config is set.
             let mut actions: Vec<(&'static str, QcfActionType, bool)> = vec![
                 (
-                    "kv_evict_sliding",
+                    "kv.evict_sliding",
                     QcfActionType::EvictSliding { target_len },
                     false,
                 ),
                 (
-                    "kv_evict_h2o",
+                    "kv.evict_h2o",
                     QcfActionType::EvictH2o {
                         target_len,
                         keep_ratio: 0.5,
@@ -3684,7 +3684,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                     true,
                 ),
                 (
-                    "kv_merge_d2o",
+                    "kv.merge_d2o",
                     QcfActionType::MergeD2o {
                         target_len,
                         keep_ratio: 0.5,
@@ -3695,7 +3695,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
             ];
             if let Some((sink_size, window_size)) = ctx.streaming_config {
                 actions.push((
-                    "kv_evict_streaming",
+                    "kv.evict_streaming",
                     QcfActionType::EvictStreaming {
                         sink_size,
                         window_size,
@@ -3753,7 +3753,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
         }
         if count > 0 {
             let avg_qcf = total_qcf / count as f32;
-            estimates.insert("kv_quant_dynamic".to_string(), avg_qcf.min(1.0));
+            estimates.insert("kv.quant_dynamic".to_string(), avg_qcf.min(1.0));
         }
     }
 
@@ -3763,7 +3763,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
         let skip_count = total_sublayers / 4;
         if skip_count > 0 {
             let (qcf_skip, _skip_set) = table.estimate_qcf_for_count(skip_count, ctx.num_layers);
-            estimates.insert("layer_skip".to_string(), qcf_skip);
+            estimates.insert("weight.skip".to_string(), qcf_skip);
         }
     }
 

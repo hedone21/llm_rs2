@@ -195,6 +195,7 @@ pub enum EngineCommand {
     /// 0 = disable pacing. More precise than Throttle for QoS control.
     SetTargetTbt { target_ms: u64 },
     /// Skip transformer layers to reduce compute load.
+    #[serde(rename = "weight.skip")]
     LayerSkip { skip_ratio: f32 },
 
     // ── Memory domain ──
@@ -207,17 +208,22 @@ pub enum EngineCommand {
     /// (INV-126).
     SwapWeights { ratio: f32, target_dtype: DtypeTag },
     /// Evict KV cache entries using H2O (Heavy-Hitter Oracle) policy.
+    #[serde(rename = "kv.evict_h2o")]
     KvEvictH2o { keep_ratio: f32 },
     /// Evict KV cache entries using sliding window policy.
+    #[serde(rename = "kv.evict_sliding")]
     KvEvictSliding { keep_ratio: f32 },
     /// Evict KV cache using StreamingLLM (sink + window) policy.
+    #[serde(rename = "kv.evict_streaming")]
     KvStreaming {
         sink_size: usize,
         window_size: usize,
     },
     /// Evict and merge KV cache entries using D2O (Dynamic Discriminative Operations) policy.
+    #[serde(rename = "kv.merge_d2o")]
     KvMergeD2o { keep_ratio: f32 },
     /// Dynamically transition KV cache quantization bits.
+    #[serde(rename = "kv.quant_dynamic")]
     KvQuantDynamic { target_bits: u8 },
     /// Offload a fraction of KV cache to disk (LRU prefix).
     /// `ratio`: 0.0~1.0, fraction of oldest tokens to swap out.
@@ -330,7 +336,7 @@ pub struct EngineStatus {
     /// Actions the Engine can currently execute (evaluated per heartbeat).
     #[serde(default)]
     pub available_actions: Vec<String>,
-    /// Actions currently applied (e.g., "kv_evict_h2o", "throttle").
+    /// Actions currently applied (e.g., "kv.evict_h2o", "throttle").
     #[serde(default)]
     pub active_actions: Vec<String>,
     /// Current eviction policy name ("none", "h2o", "sliding", etc.).
@@ -415,7 +421,7 @@ pub struct LayerSwapEstimate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QcfEstimate {
     /// Per-lossy-action estimated quality cost.
-    /// Keys: action identifier (e.g., "kv_evict_h2o"). Values: QCF cost >= 0.0 (MSG-087).
+    /// Keys: action identifier (e.g., "kv.evict_h2o"). Values: QCF cost >= 0.0 (MSG-087).
     /// Only actions the Engine can currently compute are included (MSG-086).
     pub estimates: HashMap<String, f32>,
     /// Weight-swap layer estimate (MSG-088 Phase 3 extension).
@@ -547,7 +553,7 @@ mod tests {
     fn test_engine_command_serde_layer_skip() {
         let cmd = EngineCommand::LayerSkip { skip_ratio: 0.25 };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"layer_skip\""));
+        assert!(json.contains("\"type\":\"weight.skip\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
             EngineCommand::LayerSkip { skip_ratio } => {
@@ -561,7 +567,7 @@ mod tests {
     fn test_engine_command_serde_kv_evict_h2o() {
         let cmd = EngineCommand::KvEvictH2o { keep_ratio: 0.48 };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"kv_evict_h2o\""));
+        assert!(json.contains("\"type\":\"kv.evict_h2o\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
             EngineCommand::KvEvictH2o { keep_ratio } => {
@@ -575,7 +581,7 @@ mod tests {
     fn test_engine_command_serde_kv_evict_sliding() {
         let cmd = EngineCommand::KvEvictSliding { keep_ratio: 0.6 };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"kv_evict_sliding\""));
+        assert!(json.contains("\"type\":\"kv.evict_sliding\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
             EngineCommand::KvEvictSliding { keep_ratio } => {
@@ -592,7 +598,7 @@ mod tests {
             window_size: 256,
         };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"kv_streaming\""));
+        assert!(json.contains("\"type\":\"kv.evict_streaming\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
             EngineCommand::KvStreaming {
@@ -610,7 +616,7 @@ mod tests {
     fn test_engine_command_serde_kv_merge_d2o() {
         let cmd = EngineCommand::KvMergeD2o { keep_ratio: 0.75 };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"kv_merge_d2o\""));
+        assert!(json.contains("\"type\":\"kv.merge_d2o\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
             EngineCommand::KvMergeD2o { keep_ratio } => {
@@ -624,7 +630,7 @@ mod tests {
     fn test_engine_command_serde_kv_quant_dynamic() {
         let cmd = EngineCommand::KvQuantDynamic { target_bits: 4 };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"kv_quant_dynamic\""));
+        assert!(json.contains("\"type\":\"kv.quant_dynamic\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
             EngineCommand::KvQuantDynamic { target_bits } => assert_eq!(target_bits, 4),
@@ -846,7 +852,7 @@ mod tests {
             memory_lossy_min: 0.01,
             state: EngineState::Running,
             tokens_generated: 100,
-            available_actions: vec!["throttle".into(), "kv_evict_h2o".into()],
+            available_actions: vec!["throttle".into(), "kv.evict_h2o".into()],
             active_actions: vec!["throttle".into()],
             eviction_policy: "none".into(),
             kv_dtype: "f16".into(),
@@ -868,7 +874,7 @@ mod tests {
         assert_eq!(back.state, EngineState::Running);
         assert!((back.actual_throughput - 15.0).abs() < f32::EPSILON);
         assert_eq!(back.kv_cache_tokens, 512);
-        assert_eq!(back.available_actions, vec!["throttle", "kv_evict_h2o"]);
+        assert_eq!(back.available_actions, vec!["throttle", "kv.evict_h2o"]);
         assert_eq!(back.active_actions, vec!["throttle"]);
         assert_eq!(back.eviction_policy, "none");
         assert_eq!(back.kv_dtype, "f16");
@@ -987,7 +993,7 @@ mod tests {
         let msg = EngineMessage::QcfEstimate(QcfEstimate {
             estimates: {
                 let mut m = HashMap::new();
-                m.insert("kv_evict_h2o".to_string(), 0.1);
+                m.insert("kv.evict_h2o".to_string(), 0.1);
                 m
             },
             layer_swap: None,
@@ -1003,10 +1009,10 @@ mod tests {
     #[test]
     fn test_qcf_estimate_layer_swap_optional_backward_compat() {
         // Old JSON without layer_swap must still deserialize (forward compat).
-        let old_json = r#"{"estimates":{"kv_evict_h2o":0.12}}"#;
+        let old_json = r#"{"estimates":{"kv.evict_h2o":0.12}}"#;
         let back: QcfEstimate = serde_json::from_str(old_json).unwrap();
         assert!(back.layer_swap.is_none());
-        assert!((back.estimates["kv_evict_h2o"] - 0.12).abs() < f32::EPSILON);
+        assert!((back.estimates["kv.evict_h2o"] - 0.12).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1014,7 +1020,7 @@ mod tests {
         let est = QcfEstimate {
             estimates: {
                 let mut m = HashMap::new();
-                m.insert("kv_evict_h2o".to_string(), 0.12);
+                m.insert("kv.evict_h2o".to_string(), 0.12);
                 m
             },
             layer_swap: Some(LayerSwapEstimate {

@@ -1018,7 +1018,7 @@ generate\
 Manager가 런타임에 skip ratio를 조정할 수 있다:
 
 ```json
-{"type": "layer_skip", "skip_ratio": 0.25}
+{"type": "weight.skip", "skip_ratio": 0.25}
 ```
 
 `skip_ratio=0.0`으로 보내면 skip을 비활성화한다.
@@ -1488,7 +1488,7 @@ Lua `decide(ctx)` 함수에 전달되는 `ctx` 테이블:
 | 필드 | 내용 | 예시 |
 |------|------|------|
 | `ctx.engine` | Engine heartbeat 상태 | `ctx.engine.throughput`, `ctx.engine.phase` |
-| `ctx.active` | 현재 활성 액션 목록 | `{"kv_evict_h2o"}` |
+| `ctx.active` | 현재 활성 액션 목록 | `{"kv.evict_h2o"}` |
 | `ctx.signal` | SystemSignal 원시값 | `ctx.signal.memory.available` |
 | `ctx.coef` | 동적 계수 (핵심) | pressure, trigger, relief |
 
@@ -1565,7 +1565,7 @@ function decide(ctx)
     if best and best_val > 0 then
         local cmd = {type = best}
         -- 액션별 기본 파라미터
-        if best == "kv_evict_h2o" or best == "kv_evict_sliding" then
+        if best == "kv.evict_h2o" or best == "kv.evict_sliding" then
             cmd.keep_ratio = 0.5
         elseif best == "throttle" then cmd.delay_ms = 50
         elseif best == "switch_hw" then cmd.device = "cpu"

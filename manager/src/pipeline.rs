@@ -1206,11 +1206,11 @@ mod hierarchical {
                 state: EngineState::Running,
                 tokens_generated: 100,
                 available_actions: vec![
-                    "kv_evict_h2o".to_string(),
-                    "kv_evict_sliding".to_string(),
+                    "kv.evict_h2o".to_string(),
+                    "kv.evict_sliding".to_string(),
                     "throttle".to_string(),
                 ],
-                active_actions: vec!["kv_evict_h2o".to_string()],
+                active_actions: vec!["kv.evict_h2o".to_string()],
                 eviction_policy: "h2o".to_string(),
                 kv_dtype: "f16".to_string(),
                 skip_ratio: 0.0,
@@ -1501,7 +1501,7 @@ mod hierarchical {
             // kv_evict_sliding: cost=0.3, kv_evict_h2o: cost=1.0 으로 설정
             let mut action_map = HashMap::new();
             action_map.insert(
-                "kv_evict_sliding".to_string(),
+                "kv.evict_sliding".to_string(),
                 ActionConfig {
                     lossy: true,
                     reversible: false,
@@ -1509,7 +1509,7 @@ mod hierarchical {
                 },
             );
             action_map.insert(
-                "kv_evict_h2o".to_string(),
+                "kv.evict_h2o".to_string(),
                 ActionConfig {
                     lossy: true,
                     reversible: false,
@@ -1673,8 +1673,8 @@ mod hierarchical {
             let qcf = llm_shared::QcfEstimate {
                 estimates: {
                     let mut m = HashMap::new();
-                    m.insert("kv_evict_sliding".to_string(), 0.2);
-                    m.insert("kv_evict_h2o".to_string(), 0.8);
+                    m.insert("kv.evict_sliding".to_string(), 0.2);
+                    m.insert("kv.evict_h2o".to_string(), 0.8);
                     m
                 },
                 layer_swap: None,
@@ -1794,7 +1794,7 @@ mod hierarchical {
                 estimates: {
                     let mut m = HashMap::new();
                     m.insert("unknown_action".to_string(), 0.5);
-                    m.insert("kv_evict_sliding".to_string(), 0.1);
+                    m.insert("kv.evict_sliding".to_string(), 0.1);
                     m
                 },
                 layer_swap: None,
@@ -1833,7 +1833,7 @@ mod hierarchical {
             use std::collections::HashMap;
 
             let mut actions = HashMap::new();
-            for name in &["kv_evict_sliding", "kv_evict_h2o", "kv_quant_dynamic"] {
+            for name in &["kv.evict_sliding", "kv.evict_h2o", "kv.quant_dynamic"] {
                 actions.insert(
                     name.to_string(),
                     ActionConfig {
@@ -1847,9 +1847,9 @@ mod hierarchical {
             exclusion_groups.insert(
                 "kv_quality".to_string(),
                 vec![
-                    "kv_evict_sliding".to_string(),
-                    "kv_evict_h2o".to_string(),
-                    "kv_quant_dynamic".to_string(),
+                    "kv.evict_sliding".to_string(),
+                    "kv.evict_h2o".to_string(),
+                    "kv.quant_dynamic".to_string(),
                 ],
             );
             let config = PolicyConfig {
@@ -1885,7 +1885,7 @@ mod hierarchical {
             use std::collections::HashMap;
 
             let mut actions = HashMap::new();
-            for name in &["throttle", "layer_skip", "kv_evict_sliding"] {
+            for name in &["throttle", "weight.skip", "kv.evict_sliding"] {
                 actions.insert(
                     name.to_string(),
                     ActionConfig {
@@ -1898,7 +1898,7 @@ mod hierarchical {
             let mut exclusion_groups = HashMap::new();
             exclusion_groups.insert(
                 "kv_quality".to_string(),
-                vec!["kv_evict_sliding".to_string()],
+                vec!["kv.evict_sliding".to_string()],
             );
             let config = PolicyConfig {
                 actions,

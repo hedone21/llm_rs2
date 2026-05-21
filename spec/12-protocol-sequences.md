@@ -529,7 +529,7 @@ t=1000ms  Engine → Manager
   "memory_lossy_min": 0.01,
   "state": "running",
   "tokens_generated": 50,
-  "available_actions": ["throttle", "switch_hw", "layer_skip"],
+  "available_actions": ["throttle", "switch_hw", "weight.skip"],
   "active_actions": [],
   "eviction_policy": "none",
   "kv_dtype": "f16",
@@ -550,7 +550,7 @@ t=2000ms  Engine → Manager
   "memory_lossy_min": 0.01,
   "state": "running",
   "tokens_generated": 100,
-  "available_actions": ["throttle", "switch_hw", "layer_skip"],
+  "available_actions": ["throttle", "switch_hw", "weight.skip"],
   "active_actions": [],
   "eviction_policy": "none",
   "kv_dtype": "f16",
@@ -571,7 +571,7 @@ t=3000ms  Engine → Manager
   "memory_lossy_min": 0.01,
   "state": "running",
   "tokens_generated": 150,
-  "available_actions": ["throttle", "switch_hw", "layer_skip"],
+  "available_actions": ["throttle", "switch_hw", "weight.skip"],
   "active_actions": [],
   "eviction_policy": "none",
   "kv_dtype": "f16",
@@ -610,7 +610,7 @@ t=4000ms  Engine → Manager
   "memory_lossy_min": 0.01,
   "state": "running",
   "tokens_generated": 160,
-  "available_actions": ["throttle", "switch_hw", "layer_skip"],
+  "available_actions": ["throttle", "switch_hw", "weight.skip"],
   "active_actions": ["throttle"],
   "eviction_policy": "none",
   "kv_dtype": "f16",
@@ -689,7 +689,7 @@ t=3000ms  Monitor: ComputeGuidance Critical + MemoryPressure Warning (복합 압
           Engine → Manager
           {
             "type": "qcf_estimate",
-            "estimates": {"kv_evict_h2o": 0.12, "kv_merge_d2o": 0.08, "layer_skip": 0.35}
+            "estimates": {"kv.evict_h2o": 0.12, "kv.merge_d2o": 0.08, "weight.skip": 0.35}
           }
 
           ActionSelector(estimates를 비용으로 사용)
@@ -700,7 +700,7 @@ t=3000ms  Monitor: ComputeGuidance Critical + MemoryPressure Warning (복합 압
           {
             "type": "directive", "seq_id": 3,
             "commands": [
-              {"type": "kv_evict_h2o", "keep_ratio": 0.50},
+              {"type": "kv.evict_h2o", "keep_ratio": 0.50},
               {"type": "throttle", "delay_ms": 50}
             ]
           }
@@ -828,7 +828,7 @@ t=0ms     mode=Warning
 t=50ms    Engine: executor.rs — apply_command(KvStreaming{4, 256})
           → plan.evict = Some(EvictPlan { Streaming, 0.0, Critical,
               streaming_params: Some({sink_size: 4, window_size: 256}) })
-          → active_actions.insert("kv_evict_streaming")
+          → active_actions.insert("kv.evict_streaming")
 
           Engine → Manager
           {

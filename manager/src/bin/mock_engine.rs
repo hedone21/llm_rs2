@@ -122,12 +122,12 @@ fn recv_message(stream: &mut (impl Read + Write)) -> anyhow::Result<Option<Manag
 const ALL_AVAILABLE_ACTIONS: &[&str] = &[
     "switch_hw",
     "throttle",
-    "kv_evict_sliding",
-    "kv_evict_h2o",
-    "kv_evict_streaming",
-    "kv_merge_d2o",
-    "kv_quant_dynamic",
-    "layer_skip",
+    "kv.evict_sliding",
+    "kv.evict_h2o",
+    "kv.evict_streaming",
+    "kv.merge_d2o",
+    "kv.quant_dynamic",
+    "weight.skip",
 ];
 
 /// Mutable engine state that updates in response to received Directives.
@@ -176,7 +176,7 @@ impl EngineState_ {
                 let before = self.kv_occupancy;
                 self.kv_occupancy = (self.kv_occupancy * keep_ratio).clamp(0.01, 1.0);
                 self.eviction_policy = "sliding".to_string();
-                self.activate_action("kv_evict_sliding");
+                self.activate_action("kv.evict_sliding");
                 println!(
                     "  → KvEvictSliding: kv_occupancy {:.3} → {:.3} (keep_ratio={:.2})",
                     before, self.kv_occupancy, keep_ratio
@@ -187,7 +187,7 @@ impl EngineState_ {
                 let before = self.kv_occupancy;
                 self.kv_occupancy = (self.kv_occupancy * keep_ratio).clamp(0.01, 1.0);
                 self.eviction_policy = "h2o".to_string();
-                self.activate_action("kv_evict_h2o");
+                self.activate_action("kv.evict_h2o");
                 println!(
                     "  → KvEvictH2o: kv_occupancy {:.3} → {:.3} (keep_ratio={:.2})",
                     before, self.kv_occupancy, keep_ratio
@@ -199,7 +199,7 @@ impl EngineState_ {
                 window_size,
             } => {
                 self.eviction_policy = "streaming".to_string();
-                self.activate_action("kv_evict_streaming");
+                self.activate_action("kv.evict_streaming");
                 println!(
                     "  → KvStreaming: sink_size={} window_size={}",
                     sink_size, window_size
@@ -210,7 +210,7 @@ impl EngineState_ {
                 let before = self.kv_occupancy;
                 self.kv_occupancy = (self.kv_occupancy * keep_ratio).clamp(0.01, 1.0);
                 self.eviction_policy = "d2o".to_string();
-                self.activate_action("kv_merge_d2o");
+                self.activate_action("kv.merge_d2o");
                 println!(
                     "  → KvMergeD2o: kv_occupancy {:.3} → {:.3} (keep_ratio={:.2})",
                     before, self.kv_occupancy, keep_ratio
@@ -218,7 +218,7 @@ impl EngineState_ {
                 CommandResult::Ok
             }
             EngineCommand::KvQuantDynamic { target_bits } => {
-                self.activate_action("kv_quant_dynamic");
+                self.activate_action("kv.quant_dynamic");
                 println!("  → KvQuantDynamic: target_bits={}", target_bits);
                 CommandResult::Ok
             }
@@ -235,7 +235,7 @@ impl EngineState_ {
             }
             EngineCommand::LayerSkip { skip_ratio } => {
                 self.skip_ratio = *skip_ratio;
-                self.activate_action("layer_skip");
+                self.activate_action("weight.skip");
                 println!("  → LayerSkip: skip_ratio={:.2}", skip_ratio);
                 CommandResult::Ok
             }
@@ -497,11 +497,11 @@ fn handle_directive(
         .any(|c| matches!(c, EngineCommand::RequestQcf));
     if has_request_qcf {
         let mut estimates = HashMap::new();
-        estimates.insert("kv_evict_sliding".to_string(), 0.05_f32);
-        estimates.insert("kv_evict_h2o".to_string(), 0.12);
-        estimates.insert("kv_merge_d2o".to_string(), 0.08);
-        estimates.insert("kv_quant_dynamic".to_string(), 0.15);
-        estimates.insert("layer_skip".to_string(), 0.20);
+        estimates.insert("kv.evict_sliding".to_string(), 0.05_f32);
+        estimates.insert("kv.evict_h2o".to_string(), 0.12);
+        estimates.insert("kv.merge_d2o".to_string(), 0.08);
+        estimates.insert("kv.quant_dynamic".to_string(), 0.15);
+        estimates.insert("weight.skip".to_string(), 0.20);
         let qcf = QcfEstimate {
             estimates,
             layer_swap: None,
@@ -738,7 +738,7 @@ mod tests {
         assert!(s.active_actions.is_empty());
 
         s.apply(&EngineCommand::KvEvictSliding { keep_ratio: 0.8 });
-        assert!(s.active_actions.contains(&"kv_evict_sliding".to_string()));
+        assert!(s.active_actions.contains(&"kv.evict_sliding".to_string()));
 
         s.apply(&EngineCommand::Throttle { delay_ms: 50 });
         assert!(s.active_actions.contains(&"throttle".to_string()));
@@ -780,13 +780,13 @@ mod tests {
             device: "opencl".into(),
         });
 
-        assert!(s.active_actions.contains(&"kv_evict_sliding".to_string()));
-        assert!(s.active_actions.contains(&"kv_evict_h2o".to_string()));
-        assert!(s.active_actions.contains(&"kv_evict_streaming".to_string()));
-        assert!(s.active_actions.contains(&"kv_merge_d2o".to_string()));
-        assert!(s.active_actions.contains(&"kv_quant_dynamic".to_string()));
+        assert!(s.active_actions.contains(&"kv.evict_sliding".to_string()));
+        assert!(s.active_actions.contains(&"kv.evict_h2o".to_string()));
+        assert!(s.active_actions.contains(&"kv.evict_streaming".to_string()));
+        assert!(s.active_actions.contains(&"kv.merge_d2o".to_string()));
+        assert!(s.active_actions.contains(&"kv.quant_dynamic".to_string()));
         assert!(s.active_actions.contains(&"throttle".to_string()));
-        assert!(s.active_actions.contains(&"layer_skip".to_string()));
+        assert!(s.active_actions.contains(&"weight.skip".to_string()));
         assert!(s.active_actions.contains(&"switch_hw".to_string()));
         assert_eq!(s.active_actions.len(), 8);
     }
@@ -828,8 +828,8 @@ mod tests {
         match msg {
             EngineMessage::QcfEstimate(qcf) => {
                 assert!(!qcf.estimates.is_empty());
-                assert!(qcf.estimates.contains_key("kv_evict_h2o"));
-                assert!(qcf.estimates.contains_key("kv_evict_sliding"));
+                assert!(qcf.estimates.contains_key("kv.evict_h2o"));
+                assert!(qcf.estimates.contains_key("kv.evict_sliding"));
             }
             _ => panic!("Expected QcfEstimate"),
         }

@@ -2,7 +2,7 @@
 source: manager/tests/sim/test_scenarios.rs
 expression: formatted
 ---
-kv_evict_sliding:
+kv.evict_sliding:
   - 0
   - 0.003
   - -0.006

@@ -430,7 +430,7 @@ alpha = 0.12
 reversible = false
 
 [exclusion_groups]
-eviction = ["kv_evict_sliding", "kv_evict_h2o"]
+eviction = ["kv.evict_sliding", "kv.evict_h2o"]
 ```
 
 전체 스키마: [36. Policy Design](36_policy_design.md) §7, [37. Protocol Design](37_protocol_design.md) §7

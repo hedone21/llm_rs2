@@ -405,7 +405,7 @@ alpha = 0.10
 reversible = false
 
 [exclusion_groups]
-eviction = ["kv_evict_sliding", "kv_evict_h2o"]
+eviction = ["kv.evict_sliding", "kv.evict_h2o"]
 ```
 
 ### 7-2. Relief Model 저장 포맷
@@ -424,7 +424,7 @@ eviction = ["kv_evict_sliding", "kv_evict_h2o"]
             "p_matrix": [[...]],
             "observation_count": 42
         },
-        "kv_evict_sliding": { "...": "..." }
+        "kv.evict_sliding": { "...": "..." }
     }
 }
 ```

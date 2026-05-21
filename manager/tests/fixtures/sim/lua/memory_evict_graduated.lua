@@ -16,9 +16,9 @@ function decide(ctx)
   local mem_low      = ctx.coef and ctx.coef.trigger   and ctx.coef.trigger.mem_low  or false
 
   if pressure_mem >= 0.7 or mem_low then
-    table.insert(cmds, { type = "kv_evict_sliding", keep_ratio = 0.5 })
+    table.insert(cmds, { type = "kv.evict_sliding", keep_ratio = 0.5 })
   elseif pressure_mem >= 0.4 then
-    table.insert(cmds, { type = "kv_evict_sliding", keep_ratio = 0.8 })
+    table.insert(cmds, { type = "kv.evict_sliding", keep_ratio = 0.8 })
   end
 
   return cmds

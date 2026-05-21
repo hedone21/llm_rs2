@@ -153,7 +153,7 @@ fn test_seq_030_heartbeat_16_fields() {
             assert!(
                 status
                     .available_actions
-                    .contains(&"kv_evict_h2o".to_string())
+                    .contains(&"kv.evict_h2o".to_string())
             );
         }
         other => panic!("Heartbeat 메시지를 기대했으나 {:?} 수신", other),

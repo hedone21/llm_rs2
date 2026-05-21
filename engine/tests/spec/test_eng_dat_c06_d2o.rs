@@ -81,7 +81,7 @@ fn test_eng_dat_c06_04_active_actions_includes_d2o() {
     assert!(
         executor
             .active_actions()
-            .contains(&"kv_merge_d2o".to_string()),
+            .contains(&"kv.merge_d2o".to_string()),
         "active_actions must include kv_merge_d2o after KvMergeD2o command"
     );
 }
@@ -121,7 +121,7 @@ fn test_eng_dat_c06_05_available_actions_includes_d2o() {
             assert!(
                 status
                     .available_actions
-                    .contains(&"kv_merge_d2o".to_string()),
+                    .contains(&"kv.merge_d2o".to_string()),
                 "Heartbeat available_actions must include kv_merge_d2o, got: {:?}",
                 status.available_actions
             );

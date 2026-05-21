@@ -824,9 +824,9 @@ impl LuaPolicy {
                     "switch_hw" => phi[7] = 1.0,
                     "throttle" | "set_target_tbt" => phi[8] = 1.0,
                     "kv_offload_disk" => phi[9] = 1.0,
-                    "kv_evict_h2o" | "kv_evict_sliding" | "kv_merge_d2o" => phi[10] = 1.0,
-                    "layer_skip" => phi[11] = 1.0,
-                    "kv_quant_dynamic" => phi[12] = 1.0,
+                    "kv.evict_h2o" | "kv.evict_sliding" | "kv.merge_d2o" => phi[10] = 1.0,
+                    "weight.skip" => phi[11] = 1.0,
+                    "kv.quant_dynamic" => phi[12] = 1.0,
                     _ => {}
                 }
             }
@@ -970,12 +970,12 @@ impl LuaPolicy {
                 "switch_hw",
                 "throttle",
                 "set_target_tbt",
-                "layer_skip",
-                "kv_evict_h2o",
-                "kv_evict_sliding",
+                "weight.skip",
+                "kv.evict_h2o",
+                "kv.evict_sliding",
                 "kv_streaming",
-                "kv_merge_d2o",
-                "kv_quant_dynamic",
+                "kv.merge_d2o",
+                "kv.quant_dynamic",
                 "set_partition_ratio",
             ];
             for name in &action_names {
@@ -1572,12 +1572,12 @@ fn engine_command_to_action_name(cmd: &EngineCommand) -> String {
     match cmd {
         EngineCommand::Throttle { .. } => "throttle",
         EngineCommand::SetTargetTbt { .. } => "set_target_tbt",
-        EngineCommand::LayerSkip { .. } => "layer_skip",
-        EngineCommand::KvEvictH2o { .. } => "kv_evict_h2o",
-        EngineCommand::KvEvictSliding { .. } => "kv_evict_sliding",
+        EngineCommand::LayerSkip { .. } => "weight.skip",
+        EngineCommand::KvEvictH2o { .. } => "kv.evict_h2o",
+        EngineCommand::KvEvictSliding { .. } => "kv.evict_sliding",
         EngineCommand::KvStreaming { .. } => "kv_streaming",
-        EngineCommand::KvMergeD2o { .. } => "kv_merge_d2o",
-        EngineCommand::KvQuantDynamic { .. } => "kv_quant_dynamic",
+        EngineCommand::KvMergeD2o { .. } => "kv.merge_d2o",
+        EngineCommand::KvQuantDynamic { .. } => "kv.quant_dynamic",
         EngineCommand::KvOffload { .. } => "kv_offload",
         EngineCommand::SwitchHw { .. } => "switch_hw",
         EngineCommand::RestoreDefaults => "restore_defaults",
@@ -1660,15 +1660,15 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
             let target_ms: u64 = entry.get("target_ms")?;
             EngineCommand::SetTargetTbt { target_ms }
         }
-        "layer_skip" => {
+        "weight.skip" => {
             let skip_ratio: f32 = entry.get("skip_ratio")?;
             EngineCommand::LayerSkip { skip_ratio }
         }
-        "kv_evict_h2o" => {
+        "kv.evict_h2o" => {
             let keep_ratio: f32 = entry.get("keep_ratio")?;
             EngineCommand::KvEvictH2o { keep_ratio }
         }
-        "kv_evict_sliding" => {
+        "kv.evict_sliding" => {
             let keep_ratio: f32 = entry.get("keep_ratio")?;
             EngineCommand::KvEvictSliding { keep_ratio }
         }
@@ -1680,11 +1680,11 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
                 window_size,
             }
         }
-        "kv_merge_d2o" => {
+        "kv.merge_d2o" => {
             let keep_ratio: f32 = entry.get("keep_ratio")?;
             EngineCommand::KvMergeD2o { keep_ratio }
         }
-        "kv_quant_dynamic" => {
+        "kv.quant_dynamic" => {
             let target_bits: u8 = entry.get("target_bits")?;
             EngineCommand::KvQuantDynamic { target_bits }
         }
@@ -2048,7 +2048,7 @@ mod tests {
     fn test_layer_skip_action() {
         let script = create_temp_script(
             r#"function decide(ctx)
-                return {{type = "layer_skip", skip_ratio = 0.25}}
+                return {{type = "weight.skip", skip_ratio = 0.25}}
             end"#,
         );
         let mut policy = LuaPolicy::with_system_clock(
@@ -2070,7 +2070,7 @@ mod tests {
     fn test_kv_evict_h2o_action() {
         let script = create_temp_script(
             r#"function decide(ctx)
-                return {{type = "kv_evict_h2o", keep_ratio = 0.5}}
+                return {{type = "kv.evict_h2o", keep_ratio = 0.5}}
             end"#,
         );
         let mut policy = LuaPolicy::with_system_clock(
@@ -2092,7 +2092,7 @@ mod tests {
     fn test_kv_evict_sliding_action() {
         let script = create_temp_script(
             r#"function decide(ctx)
-                return {{type = "kv_evict_sliding", keep_ratio = 0.6}}
+                return {{type = "kv.evict_sliding", keep_ratio = 0.6}}
             end"#,
         );
         let mut policy = LuaPolicy::with_system_clock(
@@ -2140,7 +2140,7 @@ mod tests {
     fn test_kv_merge_d2o_action() {
         let script = create_temp_script(
             r#"function decide(ctx)
-                return {{type = "kv_merge_d2o", keep_ratio = 0.75}}
+                return {{type = "kv.merge_d2o", keep_ratio = 0.75}}
             end"#,
         );
         let mut policy = LuaPolicy::with_system_clock(
@@ -2162,7 +2162,7 @@ mod tests {
     fn test_kv_quant_dynamic_action() {
         let script = create_temp_script(
             r#"function decide(ctx)
-                return {{type = "kv_quant_dynamic", target_bits = 4}}
+                return {{type = "kv.quant_dynamic", target_bits = 4}}
             end"#,
         );
         let mut policy = LuaPolicy::with_system_clock(
@@ -2241,7 +2241,7 @@ mod tests {
         let script = create_temp_script(
             r#"function decide(ctx)
                 return {
-                    {type = "kv_evict_h2o", keep_ratio = 0.5},
+                    {type = "kv.evict_h2o", keep_ratio = 0.5},
                     {type = "set_target_tbt", target_ms = 200},
                 }
             end"#,
@@ -2263,7 +2263,7 @@ mod tests {
         let script = create_temp_script(
             r#"function decide(ctx)
                 if ctx.engine.kv_util > 0.7 then
-                    return {{type = "kv_evict_sliding", keep_ratio = 0.5}}
+                    return {{type = "kv.evict_sliding", keep_ratio = 0.5}}
                 end
                 return {}
             end"#,
@@ -3065,7 +3065,7 @@ mod tests {
         let script = r#"
             function decide(ctx)
                 if ctx.coef.trigger.mem_low then
-                    return {{type = "kv_evict_h2o", keep_ratio = 0.5}}
+                    return {{type = "kv.evict_h2o", keep_ratio = 0.5}}
                 end
                 return {}
             end
@@ -3106,7 +3106,7 @@ mod tests {
         let script = r#"
             function decide(ctx)
                 -- throttle + layer_skip는 배타 그룹에 없으므로 valid
-                assert(ctx.is_joint_valid({"throttle", "layer_skip"}) == true,
+                assert(ctx.is_joint_valid({"throttle", "weight.skip"}) == true,
                     "throttle+layer_skip should be valid")
                 return {}
             end
@@ -3120,10 +3120,10 @@ mod tests {
         groups.insert(
             "kv_quality".to_string(),
             vec![
-                "kv_evict_sliding".to_string(),
-                "kv_evict_h2o".to_string(),
-                "kv_merge_d2o".to_string(),
-                "kv_quant_dynamic".to_string(),
+                "kv.evict_sliding".to_string(),
+                "kv.evict_h2o".to_string(),
+                "kv.merge_d2o".to_string(),
+                "kv.quant_dynamic".to_string(),
             ],
         );
 
@@ -3144,7 +3144,7 @@ mod tests {
         let script = r#"
             function decide(ctx)
                 -- kv_evict_sliding + kv_quant_dynamic은 kv_quality 배타 그룹
-                assert(ctx.is_joint_valid({"kv_evict_sliding", "kv_quant_dynamic"}) == false,
+                assert(ctx.is_joint_valid({"kv.evict_sliding", "kv.quant_dynamic"}) == false,
                     "kv_evict_sliding+kv_quant_dynamic should be invalid")
                 return {}
             end
@@ -3158,10 +3158,10 @@ mod tests {
         groups.insert(
             "kv_quality".to_string(),
             vec![
-                "kv_evict_sliding".to_string(),
-                "kv_evict_h2o".to_string(),
-                "kv_merge_d2o".to_string(),
-                "kv_quant_dynamic".to_string(),
+                "kv.evict_sliding".to_string(),
+                "kv.evict_h2o".to_string(),
+                "kv.merge_d2o".to_string(),
+                "kv.quant_dynamic".to_string(),
             ],
         );
 
@@ -3180,7 +3180,7 @@ mod tests {
     fn ctx_is_joint_valid_single_action_always_valid() {
         let script = r#"
             function decide(ctx)
-                assert(ctx.is_joint_valid({"kv_evict_sliding"}) == true,
+                assert(ctx.is_joint_valid({"kv.evict_sliding"}) == true,
                     "single action should always be valid")
                 assert(ctx.is_joint_valid({}) == true,
                     "empty list should be valid")
@@ -3196,8 +3196,8 @@ mod tests {
         groups.insert(
             "kv_quality".to_string(),
             vec![
-                "kv_evict_sliding".to_string(),
-                "kv_quant_dynamic".to_string(),
+                "kv.evict_sliding".to_string(),
+                "kv.quant_dynamic".to_string(),
             ],
         );
 
@@ -3217,7 +3217,7 @@ mod tests {
         let table = LinUcbTable::new();
         let phi = [1.0f32; LINUCB_FEATURE_DIM];
         // P matrix 없으면 1.0 반환
-        assert_eq!(table.ucb_bonus("kv_evict_sliding", &phi), 1.0);
+        assert_eq!(table.ucb_bonus("kv.evict_sliding", &phi), 1.0);
     }
 
     #[test]
@@ -3254,7 +3254,7 @@ mod tests {
         let phi = [0.3f32; LINUCB_FEATURE_DIM];
         // action A 10회 업데이트
         for _ in 0..10 {
-            table.update("kv_evict_sliding", &phi);
+            table.update("kv.evict_sliding", &phi);
         }
         // action B는 cold-start → 1.0
         assert_eq!(table.ucb_bonus("throttle", &phi), 1.0);
@@ -3280,7 +3280,7 @@ mod tests {
         let mut policy = make_policy_with_system_clock();
         // pending 없으면 cache 갱신도 없이 None 즉시 반환
         let qcf = QcfEstimate {
-            estimates: [("kv_evict_sliding".to_string(), 0.3f32)]
+            estimates: [("kv.evict_sliding".to_string(), 0.3f32)]
                 .into_iter()
                 .collect(),
             layer_swap: None,
@@ -3305,7 +3305,7 @@ mod tests {
             "pending_at이 소비되어야 한다"
         );
         assert_eq!(policy.qcf_cache.len(), 1);
-        let (cost, _) = policy.qcf_cache["kv_evict_sliding"];
+        let (cost, _) = policy.qcf_cache["kv.evict_sliding"];
         assert!((cost - 0.3).abs() < f32::EPSILON);
     }
 
@@ -3321,7 +3321,7 @@ mod tests {
             POLICY_META = { name = "test_2step", version = "1.0" }
             function decide(ctx)
                 if ctx.coef.trigger.mem_low then
-                    return {{ type = "kv_evict_sliding", keep_ratio = 0.5 }}
+                    return {{ type = "kv.evict_sliding", keep_ratio = 0.5 }}
                 end
                 return {}
             end
@@ -3359,7 +3359,7 @@ mod tests {
 
         // (2) 엔진이 QcfEstimate 를 반환 → complete_qcf_selection 이 seq=2 directive 발행
         let qcf = QcfEstimate {
-            estimates: [("kv_evict_sliding".to_string(), 0.25f32)]
+            estimates: [("kv.evict_sliding".to_string(), 0.25f32)]
                 .into_iter()
                 .collect(),
             layer_swap: None,

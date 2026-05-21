@@ -263,9 +263,9 @@ function decide(ctx)
   local mem_pct = ctx.coef and ctx.coef.pressure and ctx.coef.pressure.memory or 0.0
 
   if mem_pct >= 0.7 then
-    table.insert(cmds, { type = "kv_evict_sliding", keep_ratio = 0.5 })
+    table.insert(cmds, { type = "kv.evict_sliding", keep_ratio = 0.5 })
   elseif mem_pct >= 0.4 then
-    table.insert(cmds, { type = "kv_evict_sliding", keep_ratio = 0.8 })
+    table.insert(cmds, { type = "kv.evict_sliding", keep_ratio = 0.8 })
   end
 
   return cmds
@@ -303,13 +303,13 @@ ctx.engine = {
 
 | Lua type 문자열 | EngineCommand variant | 필수 인자 |
 |----------------|----------------------|-----------|
-| `"kv_evict_sliding"` | `KvEvictSliding` | `keep_ratio: f64` |
-| `"kv_evict_h2o"` | `KvEvictH2o` | `keep_ratio: f64` |
-| `"kv_merge_d2o"` | `KvMergeD2o` | `keep_ratio: f64` |
+| `"kv.evict_sliding"` | `KvEvictSliding` | `keep_ratio: f64` |
+| `"kv.evict_h2o"` | `KvEvictH2o` | `keep_ratio: f64` |
+| `"kv.merge_d2o"` | `KvMergeD2o` | `keep_ratio: f64` |
 | `"throttle"` | `Throttle` | `delay_ms: u64` |
 | `"switch_hw"` | `SwitchHw` | `device: String` |
 | `"set_partition_ratio"` | `SetPartitionRatio` | `ratio: f64` |
-| `"layer_skip"` | `LayerSkip` | `ratio: f64` |
+| `"weight.skip"` | `LayerSkip` | `ratio: f64` |
 | `"restore_defaults"` | `RestoreDefaults` | — |
 
 ### 6.4 재사용 Lua fixture
@@ -487,7 +487,7 @@ traj.signal_count()                       // signal 총 개수
 traj.signal_count_by_kind("memory_pressure")  // 종류별
 traj.directive_count()                    // directive 총 개수
 traj.first_directive_at_or_after(5.0)    // t≥5s 첫 directive 시각
-traj.observation_due_count_for("kv_evict_sliding")  // ObservationDue 개수
+traj.observation_due_count_for("kv.evict_sliding")  // ObservationDue 개수
 traj.state_at(|s| s.throughput_tps, 15.0)  // t=15s 근방 처리량
 traj.assert_contains_directive_kind("KvEvict")  // Ok / Err
 
@@ -579,7 +579,7 @@ observation을 FIFO 큐(`VecDeque`, 용량 `MAX_PENDING_OBSERVATIONS=32`)로
 ```rust
 let relief = sim.policy.relief_snapshot().unwrap_or_default();
 // HashMap<String, [f32; 6]>
-// 키: action 이름 (예: "kv_evict_sliding")
+// 키: action 이름 (예: "kv.evict_sliding")
 // 값: [memory, compute, thermal, energy, gpu_pct, cpu_pct] relief 값
 ```
 

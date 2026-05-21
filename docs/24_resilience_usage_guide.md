@@ -296,7 +296,7 @@ alpha = 0.12               # QCF→cost 변환 계수
 reversible = false
 
 [exclusion_groups]
-eviction = ["kv_evict_sliding", "kv_evict_h2o"]
+eviction = ["kv.evict_sliding", "kv.evict_h2o"]
 ```
 
 전체 설정은 `policy_config.toml` 참조. 상세 설계는 `docs/36_policy_design.md` §7, §13 참조.

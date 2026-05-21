@@ -166,7 +166,7 @@ fn test_eng_st_031_kv_evict_h2o_adds_active_action() {
     assert!(
         executor
             .active_actions()
-            .contains(&"kv_evict_h2o".to_string())
+            .contains(&"kv.evict_h2o".to_string())
     );
 }
 
@@ -182,7 +182,7 @@ fn test_eng_st_031_kv_evict_sliding_adds_active_action() {
     assert!(
         executor
             .active_actions()
-            .contains(&"kv_evict_sliding".to_string())
+            .contains(&"kv.evict_sliding".to_string())
     );
 }
 
@@ -194,7 +194,7 @@ fn test_eng_st_031_layer_skip_adds_active_action() {
     assert!(
         executor
             .active_actions()
-            .contains(&"layer_skip".to_string())
+            .contains(&"weight.skip".to_string())
     );
 }
 
@@ -290,7 +290,7 @@ fn test_eng_st_033_kv_streaming_ok() {
     assert!(
         executor
             .active_actions()
-            .contains(&"kv_evict_streaming".to_string())
+            .contains(&"kv.evict_streaming".to_string())
     );
 
     let resp = rx.recv().unwrap();
@@ -315,7 +315,7 @@ fn test_eng_st_033_kv_quant_dynamic() {
     assert!(
         executor
             .active_actions()
-            .contains(&"kv_quant_dynamic".to_string())
+            .contains(&"kv.quant_dynamic".to_string())
     );
 }
 

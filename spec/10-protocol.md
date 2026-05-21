@@ -106,7 +106,7 @@ Offset  Hex                                         ASCII
 
 | 타입 | 태그 속성 | 태그 필드 | rename_all | 변형 (tag value) |
 |------|----------|----------|------------|-----------------|
-| EngineCommand | `tag = "type"` | `"type"` | `snake_case` | `"throttle"`, `"layer_skip"`, `"kv_evict_h2o"`, `"kv_evict_sliding"`, `"kv_merge_d2o"`, `"kv_streaming"`, `"kv_quant_dynamic"`, `"request_qcf"`, `"restore_defaults"`, `"switch_hw"`, `"prepare_compute_unit"`, `"suspend"`, `"resume"` |
+| EngineCommand | `tag = "type"` | `"type"` | `snake_case` | `"throttle"`, `"weight.skip"`, `"kv.evict_h2o"`, `"kv.evict_sliding"`, `"kv.merge_d2o"`, `"kv_streaming"`, `"kv.quant_dynamic"`, `"request_qcf"`, `"restore_defaults"`, `"switch_hw"`, `"prepare_compute_unit"`, `"suspend"`, `"resume"` |
 | ManagerMessage | `tag = "type"` | `"type"` | `snake_case` | `"directive"` |
 | EngineMessage | `tag = "type"` | `"type"` | `snake_case` | `"capability"`, `"heartbeat"`, `"response"`, `"qcf_estimate"` |
 | CommandResult | `tag = "status"` | `"status"` | `snake_case` | `"ok"`, `"partial"`, `"rejected"` |
@@ -310,7 +310,7 @@ Offset  Hex                                         ASCII
 ### 6.1 정상 프레임 바이트 덤프 — Heartbeat
 
 ```json
-{"type":"heartbeat","active_device":"cpu","compute_level":"normal","actual_throughput":15.0,"memory_level":"normal","kv_cache_bytes":1048576,"kv_cache_tokens":512,"kv_cache_utilization":0.25,"memory_lossless_min":1.0,"memory_lossy_min":0.01,"state":"running","tokens_generated":100,"available_actions":["throttle","switch_hw","layer_skip"],"active_actions":["throttle"],"eviction_policy":"none","kv_dtype":"f16","skip_ratio":0.0}
+{"type":"heartbeat","active_device":"cpu","compute_level":"normal","actual_throughput":15.0,"memory_level":"normal","kv_cache_bytes":1048576,"kv_cache_tokens":512,"kv_cache_utilization":0.25,"memory_lossless_min":1.0,"memory_lossy_min":0.01,"state":"running","tokens_generated":100,"available_actions":["throttle","switch_hw","weight.skip"],"active_actions":["throttle"],"eviction_policy":"none","kv_dtype":"f16","skip_ratio":0.0}
 ```
 
 ### 6.2 EngineCommand Internally Tagged 예시
@@ -322,7 +322,7 @@ Offset  Hex                                         ASCII
 
 **KvEvictH2o:**
 ```json
-{"type":"kv_evict_h2o","keep_ratio":0.48}
+{"type":"kv.evict_h2o","keep_ratio":0.48}
 ```
 
 **SwitchHw:**

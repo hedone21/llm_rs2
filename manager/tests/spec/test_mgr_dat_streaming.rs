@@ -13,7 +13,7 @@ use llm_manager::types::{ActionId, ActionKind, Domain};
 
 #[test]
 fn test_kv_evict_streaming_from_str() {
-    let id = ActionId::from_str("kv_evict_streaming");
+    let id = ActionId::from_str("kv.evict_streaming");
     assert_eq!(id, Some(ActionId::KvEvictStreaming));
 }
 
@@ -35,7 +35,7 @@ fn test_kv_evict_streaming_primary_domain_is_memory() {
 fn test_kv_evict_streaming_serde_roundtrip() {
     let id = ActionId::KvEvictStreaming;
     let json = serde_json::to_string(&id).unwrap();
-    assert_eq!(json, r#""kv_evict_streaming""#);
+    assert_eq!(json, r#""kv.evict_streaming""#);
     let back: ActionId = serde_json::from_str(&json).unwrap();
     assert_eq!(back, id);
 }
@@ -46,7 +46,7 @@ fn test_kv_evict_streaming_serde_roundtrip() {
 fn test_registry_kv_evict_streaming_registration() {
     let mut actions = HashMap::new();
     actions.insert(
-        "kv_evict_streaming".to_string(),
+        "kv.evict_streaming".to_string(),
         ActionConfig {
             lossy: true,
             reversible: false,
@@ -70,7 +70,7 @@ fn test_registry_kv_evict_streaming_registration() {
 fn test_registry_kv_evict_streaming_param_range() {
     let mut actions = HashMap::new();
     actions.insert(
-        "kv_evict_streaming".to_string(),
+        "kv.evict_streaming".to_string(),
         ActionConfig {
             lossy: true,
             reversible: false,
@@ -93,7 +93,7 @@ fn test_registry_kv_evict_streaming_param_range() {
 #[test]
 fn test_kv_evict_streaming_exclusion_group() {
     let mut actions = HashMap::new();
-    for name in &["kv_evict_sliding", "kv_evict_h2o", "kv_evict_streaming"] {
+    for name in &["kv.evict_sliding", "kv.evict_h2o", "kv.evict_streaming"] {
         actions.insert(
             name.to_string(),
             ActionConfig {
@@ -107,9 +107,9 @@ fn test_kv_evict_streaming_exclusion_group() {
     exclusion_groups.insert(
         "eviction".to_string(),
         vec![
-            "kv_evict_sliding".to_string(),
-            "kv_evict_h2o".to_string(),
-            "kv_evict_streaming".to_string(),
+            "kv.evict_sliding".to_string(),
+            "kv.evict_h2o".to_string(),
+            "kv.evict_streaming".to_string(),
         ],
     );
     let config = PolicyConfig {

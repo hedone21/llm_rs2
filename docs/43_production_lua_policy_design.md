@@ -209,7 +209,7 @@ local ACTION_BUILDERS = {
         elseif pressure.memory >= 0.80 then keep = 0.50
         elseif pressure.memory >= 0.70 then keep = 0.70
         end
-        return {type = "kv_evict_sliding", keep_ratio = keep}
+        return {type = "kv.evict_sliding", keep_ratio = keep}
     end,
     kv_quant_dynamic = function(pressure)
         local bits = 16
@@ -217,7 +217,7 @@ local ACTION_BUILDERS = {
         elseif pressure.memory >= 0.80 then bits = 4
         elseif pressure.memory >= 0.70 then bits = 8
         end
-        return {type = "kv_quant_dynamic", target_bits = bits}
+        return {type = "kv.quant_dynamic", target_bits = bits}
     end,
     throttle = function(pressure)
         -- CPU 도메인: 압박 * 200ms, 최소 20ms
@@ -733,13 +733,13 @@ let policy: Arc<Mutex<Box<dyn PolicyStrategy>>> = Arc::new(Mutex::new(create_pol
 ```rust
 fn observable_action_name(cmd: &EngineCommand) -> Option<String> {
     match cmd {
-        EngineCommand::KvEvictH2o { .. } => Some("kv_evict_h2o".to_string()),
-        EngineCommand::KvEvictSliding { .. } => Some("kv_evict_sliding".to_string()),
+        EngineCommand::KvEvictH2o { .. } => Some("kv.evict_h2o".to_string()),
+        EngineCommand::KvEvictSliding { .. } => Some("kv.evict_sliding".to_string()),
         EngineCommand::KvMergeD2o { .. } => Some("kv_evict_d2o".to_string()),
         EngineCommand::Throttle { .. } => Some("throttle".to_string()),
         EngineCommand::SwitchHw { .. } => Some("switch_hw".to_string()),
         EngineCommand::SetPartitionRatio { .. } => Some("set_partition_ratio".to_string()),
-        EngineCommand::LayerSkip { .. } => Some("layer_skip".to_string()),
+        EngineCommand::LayerSkip { .. } => Some("weight.skip".to_string()),
         // RestoreDefaults, RequestQcf, SetTargetTbt 등은 관측 불필요
         _ => None,   // ← KvQuantDynamic이 여기로 빠짐
     }
@@ -751,21 +751,21 @@ fn observable_action_name(cmd: &EngineCommand) -> Option<String> {
 ```rust
 fn observable_action_name(cmd: &EngineCommand) -> Option<String> {
     match cmd {
-        EngineCommand::KvEvictH2o { .. } => Some("kv_evict_h2o".to_string()),
-        EngineCommand::KvEvictSliding { .. } => Some("kv_evict_sliding".to_string()),
+        EngineCommand::KvEvictH2o { .. } => Some("kv.evict_h2o".to_string()),
+        EngineCommand::KvEvictSliding { .. } => Some("kv.evict_sliding".to_string()),
         EngineCommand::KvMergeD2o { .. } => Some("kv_evict_d2o".to_string()),
-        EngineCommand::KvQuantDynamic { .. } => Some("kv_quant_dynamic".to_string()), // ★ 추가
+        EngineCommand::KvQuantDynamic { .. } => Some("kv.quant_dynamic".to_string()), // ★ 추가
         EngineCommand::Throttle { .. } => Some("throttle".to_string()),
         EngineCommand::SwitchHw { .. } => Some("switch_hw".to_string()),
         EngineCommand::SetPartitionRatio { .. } => Some("set_partition_ratio".to_string()),
-        EngineCommand::LayerSkip { .. } => Some("layer_skip".to_string()),
+        EngineCommand::LayerSkip { .. } => Some("weight.skip".to_string()),
         _ => None,
     }
 }
 ```
 
 **문자열 일치 검증**:
-- `build_ctx()`의 `action_names` 리스트(L600~611)에 `"kv_quant_dynamic"` 존재. 일치.
+- `build_ctx()`의 `action_names` 리스트(L600~611)에 `"kv.quant_dynamic"` 존재. 일치.
 - `parse_single_action()`이 수락하는 Lua 측 action type 이름과도 일치해야 함 — 기존 §1.2 표에 "parser O, relief O"로 표시되어 있어 이미 정합.
 
 **파급 영향**:
@@ -800,7 +800,7 @@ fn observable_action_name(cmd: &EngineCommand) -> Option<String> {
 tests/spec/ 레벨 테스트 (MGR-POL-110/111, INV-101/102):
 
 1. **P0-5 fallback 진입**: 의도적으로 syntax error Lua 스크립트로 `new()` 후 signal 3회 주입. 3회째부터 `permanent_fallback == true`, fallback action 반환 검증.
-2. **INV-102 학습 격리**: fallback 진입 후 signal N회 주입. `relief_table.predict("kv_evict_sliding")`이 초기값에서 **변하지 않음** 검증.
+2. **INV-102 학습 격리**: fallback 진입 후 signal N회 주입. `relief_table.predict("kv.evict_sliding")`이 초기값에서 **변하지 않음** 검증.
 3. **INV-101 reload 보존**: 정상 스크립트로 `new()` → signal 주입으로 observation 발생 → `observe()` 트리거 → `relief_table.predict()` 값 변화 확인. `reload_script()` 호출 후 동일 predict 값이 유지됨 검증.
 4. **reload rollback**: 올바른 스크립트 → 손상된 스크립트 reload 시도 → Err 반환 + 기존 `self.lua` 동작 유지 (signal 처리 정상) 검증.
 5. **harness 관측**: sim_run에서 `KvQuantDynamic` 발동 후 3초 경과 → `relief_table` 업데이트 이벤트가 trajectory에 기록됨 검증.

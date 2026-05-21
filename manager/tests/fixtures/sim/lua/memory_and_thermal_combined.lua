@@ -23,14 +23,14 @@ function decide(ctx)
       table.insert(cmds, { type = "switch_hw",        device     = "cpu" })
       switched_to_cpu = true
     end
-    table.insert(cmds, { type = "kv_evict_sliding", keep_ratio = 0.5  })
+    table.insert(cmds, { type = "kv.evict_sliding", keep_ratio = 0.5  })
   elseif p_therm >= 0.5 then
     table.insert(cmds, { type = "throttle",         delay_ms   = 150  })
-    table.insert(cmds, { type = "kv_evict_sliding", keep_ratio = 0.7  })
+    table.insert(cmds, { type = "kv.evict_sliding", keep_ratio = 0.7  })
   elseif p_mem >= 0.7 then
-    table.insert(cmds, { type = "kv_evict_sliding", keep_ratio = 0.5  })
+    table.insert(cmds, { type = "kv.evict_sliding", keep_ratio = 0.5  })
   elseif p_mem >= 0.4 then
-    table.insert(cmds, { type = "kv_evict_sliding", keep_ratio = 0.8  })
+    table.insert(cmds, { type = "kv.evict_sliding", keep_ratio = 0.8  })
   elseif p_therm >= 0.2 then
     table.insert(cmds, { type = "throttle",         delay_ms   = 100  })
   end

@@ -339,7 +339,7 @@ mod tests {
         let json = r#"{
             "name": "test",
             "directives": [
-                {"at_token": 10, "directive": {"seq_id": 1, "commands": [{"type": "kv_evict_h2o", "keep_ratio": 0.5}]}},
+                {"at_token": 10, "directive": {"seq_id": 1, "commands": [{"type": "kv.evict_h2o", "keep_ratio": 0.5}]}},
                 {"at_token": 10, "directive": {"seq_id": 2, "commands": [{"type": "throttle", "delay_ms": 30}]}},
                 {"at_token": 20, "directive": {"seq_id": 3, "commands": [{"type": "restore_defaults"}]}}
             ]

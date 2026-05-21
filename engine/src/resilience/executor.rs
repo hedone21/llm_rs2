@@ -123,7 +123,7 @@ pub struct CommandExecutor {
     target_tbt_ms: u64,
     target_tbt_set: bool,
 
-    // Currently active action names (e.g. "kv_evict_h2o", "throttle")
+    // Currently active action names (e.g. "kv.evict_h2o", "throttle")
     active_actions: Vec<String>,
 
     // Sticky eviction plan: retained until RestoreDefaults
@@ -393,8 +393,8 @@ impl CommandExecutor {
             }
             EngineCommand::LayerSkip { skip_ratio } => {
                 plan.layer_skip = Some(*skip_ratio);
-                if !self.active_actions.contains(&"layer_skip".to_string()) {
-                    self.active_actions.push("layer_skip".to_string());
+                if !self.active_actions.contains(&"weight.skip".to_string()) {
+                    self.active_actions.push("weight.skip".to_string());
                 }
                 CommandResult::Ok
             }
@@ -407,8 +407,8 @@ impl CommandExecutor {
                 };
                 self.evict_plan = Some(evict.clone());
                 plan.evict = Some(evict);
-                if !self.active_actions.contains(&"kv_evict_h2o".to_string()) {
-                    self.active_actions.push("kv_evict_h2o".to_string());
+                if !self.active_actions.contains(&"kv.evict_h2o".to_string()) {
+                    self.active_actions.push("kv.evict_h2o".to_string());
                 }
                 CommandResult::Ok
             }
@@ -423,9 +423,9 @@ impl CommandExecutor {
                 plan.evict = Some(evict);
                 if !self
                     .active_actions
-                    .contains(&"kv_evict_sliding".to_string())
+                    .contains(&"kv.evict_sliding".to_string())
                 {
-                    self.active_actions.push("kv_evict_sliding".to_string());
+                    self.active_actions.push("kv.evict_sliding".to_string());
                 }
                 CommandResult::Ok
             }
@@ -446,9 +446,9 @@ impl CommandExecutor {
                 plan.evict = Some(evict);
                 if !self
                     .active_actions
-                    .contains(&"kv_evict_streaming".to_string())
+                    .contains(&"kv.evict_streaming".to_string())
                 {
-                    self.active_actions.push("kv_evict_streaming".to_string());
+                    self.active_actions.push("kv.evict_streaming".to_string());
                 }
                 CommandResult::Ok
             }
@@ -461,8 +461,8 @@ impl CommandExecutor {
                 };
                 self.evict_plan = Some(evict.clone());
                 plan.evict = Some(evict);
-                if !self.active_actions.contains(&"kv_merge_d2o".to_string()) {
-                    self.active_actions.push("kv_merge_d2o".to_string());
+                if !self.active_actions.contains(&"kv.merge_d2o".to_string()) {
+                    self.active_actions.push("kv.merge_d2o".to_string());
                 }
                 CommandResult::Ok
             }
@@ -471,9 +471,9 @@ impl CommandExecutor {
                 plan.kv_quant_bits = Some(*target_bits);
                 if !self
                     .active_actions
-                    .contains(&"kv_quant_dynamic".to_string())
+                    .contains(&"kv.quant_dynamic".to_string())
                 {
-                    self.active_actions.push("kv_quant_dynamic".to_string());
+                    self.active_actions.push("kv.quant_dynamic".to_string());
                 }
                 CommandResult::Ok
             }
@@ -655,18 +655,18 @@ impl CommandExecutor {
         let mut actions = vec![
             "throttle".to_string(),
             "switch_hw".to_string(),
-            "layer_skip".to_string(),
+            "weight.skip".to_string(),
         ];
         // Eviction actions: only if an eviction policy is configured
         if eviction_policy != "none" {
-            actions.push("kv_evict_h2o".to_string());
-            actions.push("kv_evict_sliding".to_string());
-            actions.push("kv_evict_streaming".to_string());
-            actions.push("kv_merge_d2o".to_string());
+            actions.push("kv.evict_h2o".to_string());
+            actions.push("kv.evict_sliding".to_string());
+            actions.push("kv.evict_streaming".to_string());
+            actions.push("kv.merge_d2o".to_string());
         }
         // KV quantization: only available with KIVI cache (q2/q4/q8)
         if kv_dtype.starts_with('q') {
-            actions.push("kv_quant_dynamic".to_string());
+            actions.push("kv.quant_dynamic".to_string());
         }
         // Weight swap: only available when a secondary GGUF/AUF is loaded (ENG-ST-032).
         if has_secondary {
@@ -811,7 +811,7 @@ mod tests {
         assert!(
             executor
                 .active_actions()
-                .contains(&"kv_evict_h2o".to_string())
+                .contains(&"kv.evict_h2o".to_string())
         );
 
         let resp = rx.recv().unwrap();
@@ -842,7 +842,7 @@ mod tests {
         assert!(
             executor
                 .active_actions()
-                .contains(&"kv_evict_sliding".to_string())
+                .contains(&"kv.evict_sliding".to_string())
         );
     }
 
@@ -876,7 +876,7 @@ mod tests {
         assert!(
             executor
                 .active_actions()
-                .contains(&"kv_evict_streaming".to_string())
+                .contains(&"kv.evict_streaming".to_string())
         );
 
         let resp = rx.recv().unwrap();
@@ -904,7 +904,7 @@ mod tests {
         assert!(
             executor
                 .active_actions()
-                .contains(&"kv_quant_dynamic".to_string())
+                .contains(&"kv.quant_dynamic".to_string())
         );
     }
 
@@ -954,7 +954,7 @@ mod tests {
         assert!(
             executor
                 .active_actions()
-                .contains(&"layer_skip".to_string())
+                .contains(&"weight.skip".to_string())
         );
     }
 
@@ -1514,8 +1514,8 @@ mod tests {
     fn test_send_qcf_estimate() {
         let (executor, _tx, rx) = make_executor();
         let mut estimates = std::collections::HashMap::new();
-        estimates.insert("kv_evict_sliding".to_string(), 0.5);
-        estimates.insert("kv_evict_h2o".to_string(), 0.1);
+        estimates.insert("kv.evict_sliding".to_string(), 0.5);
+        estimates.insert("kv.evict_h2o".to_string(), 0.1);
         executor.send_qcf_estimate(QcfEstimate {
             estimates,
             layer_swap: None,
@@ -1525,8 +1525,8 @@ mod tests {
         match msg {
             EngineMessage::QcfEstimate(qcf) => {
                 assert_eq!(qcf.estimates.len(), 2);
-                assert!((qcf.estimates["kv_evict_sliding"] - 0.5).abs() < f32::EPSILON);
-                assert!((qcf.estimates["kv_evict_h2o"] - 0.1).abs() < f32::EPSILON);
+                assert!((qcf.estimates["kv.evict_sliding"] - 0.5).abs() < f32::EPSILON);
+                assert!((qcf.estimates["kv.evict_h2o"] - 0.1).abs() < f32::EPSILON);
             }
             _ => panic!("Expected QcfEstimate"),
         }

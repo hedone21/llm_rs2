@@ -106,7 +106,7 @@ fn test_eng_dat_c05_04_active_actions_includes_streaming() {
     assert!(
         executor
             .active_actions()
-            .contains(&"kv_evict_streaming".to_string()),
+            .contains(&"kv.evict_streaming".to_string()),
         "active_actions must include kv_evict_streaming after KvStreaming command"
     );
 }
@@ -146,7 +146,7 @@ fn test_eng_dat_c05_05_available_actions_includes_streaming() {
             assert!(
                 status
                     .available_actions
-                    .contains(&"kv_evict_streaming".to_string()),
+                    .contains(&"kv.evict_streaming".to_string()),
                 "Heartbeat available_actions must include kv_evict_streaming, got: {:?}",
                 status.available_actions
             );

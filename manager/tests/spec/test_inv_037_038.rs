@@ -22,8 +22,8 @@ fn inv037_warning_mode_excludes_all_lossy_actions() {
     let registry = make_registry(
         &[
             ("switch_hw", false, true),
-            ("kv_evict_sliding", true, false),
-            ("layer_skip", true, true),
+            ("kv.evict_sliding", true, false),
+            ("weight.skip", true, true),
         ],
         &[],
     );
@@ -68,9 +68,9 @@ fn inv037_warning_mode_excludes_all_lossy_actions() {
 fn inv037_warning_mode_all_lossy_returns_empty() {
     let registry = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
-            ("layer_skip", true, true),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
+            ("weight.skip", true, true),
         ],
         &[],
     );
@@ -109,7 +109,7 @@ fn inv037_critical_mode_allows_lossy() {
     let registry = make_registry(
         &[
             ("switch_hw", false, true),
-            ("kv_evict_sliding", true, false),
+            ("kv.evict_sliding", true, false),
         ],
         &[],
     );

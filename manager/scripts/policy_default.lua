@@ -80,7 +80,7 @@ local PRESSURE_KEY = { mem = "memory", cpu = "cpu", gpu = "gpu", therm = "therma
 -- NOTE: kv_evict_sliding + kv_quant_dynamic은 같은 kv_quality 배타 그룹에 속하므로
 --       동시 발행 금지 (정확도 이중 훼손). 해당 조합은 등록하지 않는다.
 local JOINT_ACTIONS = {
-    throttle_plus_layer_skip = { components = { "throttle", "layer_skip" } },
+    throttle_plus_layer_skip = { components = { "throttle", "weight.skip" } },
 }
 
 -- pressure.memory 값에 따른 파라미터 테이블
@@ -130,10 +130,10 @@ local function build_cmd(action, level, cpu_pressure)
     local p = LEVEL_PARAMS[level] or LEVEL_PARAMS.normal
     local cmd = { type = action }
 
-    if action == "kv_evict_h2o" or action == "kv_evict_sliding"
-       or action == "kv_merge_d2o" then
+    if action == "kv.evict_h2o" or action == "kv.evict_sliding"
+       or action == "kv.merge_d2o" then
         cmd.keep_ratio = p.keep_ratio
-    elseif action == "kv_quant_dynamic" then
+    elseif action == "kv.quant_dynamic" then
         cmd.target_bits = p.target_bits
     elseif action == "throttle" then
         -- cpu_pressure에 비례, 최소 20ms, 20ms 단위 양자화
@@ -142,7 +142,7 @@ local function build_cmd(action, level, cpu_pressure)
         cmd.delay_ms = math.max(math.floor(raw / 20) * 20, 20)
     elseif action == "set_target_tbt" then
         cmd.target_ms = 150
-    elseif action == "layer_skip" then
+    elseif action == "weight.skip" then
         cmd.skip_ratio = 0.25
     elseif action == "switch_hw" then
         cmd.device = "cpu"

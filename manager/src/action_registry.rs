@@ -197,7 +197,7 @@ mod tests {
         let config = make_policy_config(
             &[
                 ("switch_hw", false, true),
-                ("kv_evict_sliding", true, false),
+                ("kv.evict_sliding", true, false),
                 ("throttle", false, true),
             ],
             &[],
@@ -218,10 +218,10 @@ mod tests {
             &[
                 ("switch_hw", false, true),        // Lossless
                 ("throttle", false, true),         // Lossless
-                ("kv_evict_sliding", true, false), // Lossy
-                ("kv_evict_h2o", true, false),     // Lossy
-                ("kv_quant_dynamic", true, false), // Lossy
-                ("layer_skip", true, true),        // Lossy
+                ("kv.evict_sliding", true, false), // Lossy
+                ("kv.evict_h2o", true, false),     // Lossy
+                ("kv.quant_dynamic", true, false), // Lossy
+                ("weight.skip", true, true),        // Lossy
             ],
             &[],
         );
@@ -257,11 +257,11 @@ mod tests {
     fn test_exclusion_groups() {
         let config = make_policy_config(
             &[
-                ("kv_evict_sliding", true, false),
-                ("kv_evict_h2o", true, false),
+                ("kv.evict_sliding", true, false),
+                ("kv.evict_h2o", true, false),
                 ("switch_hw", false, true),
             ],
-            &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+            &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
         );
         let registry = ActionRegistry::from_config(&config);
 
@@ -282,11 +282,11 @@ mod tests {
     fn test_is_excluded() {
         let config = make_policy_config(
             &[
-                ("kv_evict_sliding", true, false),
-                ("kv_evict_h2o", true, false),
+                ("kv.evict_sliding", true, false),
+                ("kv.evict_h2o", true, false),
                 ("switch_hw", false, true),
             ],
-            &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+            &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
         );
         let registry = ActionRegistry::from_config(&config);
 
@@ -326,8 +326,8 @@ mod tests {
     fn test_action_meta_fields() {
         let config = make_policy_config(
             &[
-                ("kv_evict_sliding", true, false),
-                ("layer_skip", true, true),
+                ("kv.evict_sliding", true, false),
+                ("weight.skip", true, true),
             ],
             &[],
         );
@@ -347,8 +347,8 @@ mod tests {
     fn test_default_param_ranges() {
         let config = make_policy_config(
             &[
-                ("kv_evict_sliding", true, false),
-                ("kv_quant_dynamic", true, false),
+                ("kv.evict_sliding", true, false),
+                ("kv.quant_dynamic", true, false),
                 ("switch_hw", false, true), // param_range 없음
             ],
             &[],
@@ -381,7 +381,7 @@ mod tests {
     /// default_cost 기본값은 1.0이어야 한다.
     #[test]
     fn test_default_cost_fallback_is_one() {
-        let config = make_policy_config(&[("kv_evict_sliding", true, false)], &[]);
+        let config = make_policy_config(&[("kv.evict_sliding", true, false)], &[]);
         let registry = ActionRegistry::from_config(&config);
         // default_cost 미지정 → 1.0 반환
         assert!((registry.default_cost(&ActionId::KvEvictSliding) - 1.0).abs() < f32::EPSILON);
@@ -394,7 +394,7 @@ mod tests {
     fn test_default_cost_explicit_value() {
         let mut action_map = HashMap::new();
         action_map.insert(
-            "kv_evict_sliding".to_string(),
+            "kv.evict_sliding".to_string(),
             ActionConfig {
                 lossy: true,
                 reversible: false,
@@ -402,7 +402,7 @@ mod tests {
             },
         );
         action_map.insert(
-            "layer_skip".to_string(),
+            "weight.skip".to_string(),
             ActionConfig {
                 lossy: true,
                 reversible: true,

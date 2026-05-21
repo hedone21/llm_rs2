@@ -14,15 +14,22 @@ mod hierarchical_types {
     /// 적응형 액션 식별자
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
+    #[allow(clippy::enum_variant_names)]
     pub enum ActionId {
         SwitchHw,
         Throttle,
         KvOffloadDisk,
+        #[serde(rename = "kv.evict_sliding")]
         KvEvictSliding,
+        #[serde(rename = "kv.evict_h2o")]
         KvEvictH2o,
+        #[serde(rename = "kv.evict_streaming")]
         KvEvictStreaming,
+        #[serde(rename = "kv.merge_d2o")]
         KvMergeD2o,
+        #[serde(rename = "kv.quant_dynamic")]
         KvQuantDynamic,
+        #[serde(rename = "weight.skip")]
         LayerSkip,
         SwapWeights,
     }
@@ -35,12 +42,12 @@ mod hierarchical_types {
                 "switch_hw" => Some(ActionId::SwitchHw),
                 "throttle" => Some(ActionId::Throttle),
                 "kv_offload_disk" => Some(ActionId::KvOffloadDisk),
-                "kv_evict_sliding" => Some(ActionId::KvEvictSliding),
-                "kv_evict_h2o" => Some(ActionId::KvEvictH2o),
-                "kv_evict_streaming" => Some(ActionId::KvEvictStreaming),
-                "kv_merge_d2o" => Some(ActionId::KvMergeD2o),
-                "kv_quant_dynamic" => Some(ActionId::KvQuantDynamic),
-                "layer_skip" => Some(ActionId::LayerSkip),
+                "kv.evict_sliding" => Some(ActionId::KvEvictSliding),
+                "kv.evict_h2o" => Some(ActionId::KvEvictH2o),
+                "kv.evict_streaming" => Some(ActionId::KvEvictStreaming),
+                "kv.merge_d2o" => Some(ActionId::KvMergeD2o),
+                "kv.quant_dynamic" => Some(ActionId::KvQuantDynamic),
+                "weight.skip" => Some(ActionId::LayerSkip),
                 "swap_weights" => Some(ActionId::SwapWeights),
                 _ => None,
             }
@@ -309,7 +316,7 @@ mod tests {
         fn action_id_serialization() {
             let id = ActionId::KvEvictSliding;
             let json = serde_json::to_string(&id).unwrap();
-            assert_eq!(json, r#""kv_evict_sliding""#);
+            assert_eq!(json, r#""kv.evict_sliding""#);
             let back: ActionId = serde_json::from_str(&json).unwrap();
             assert_eq!(back, id);
         }

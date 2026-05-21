@@ -30,7 +30,7 @@ fn test_mgr_alg_030_no_action_when_no_pressure() {
     let registry = make_registry(
         &[
             ("switch_hw", false, true),
-            ("kv_evict_sliding", true, false),
+            ("kv.evict_sliding", true, false),
         ],
         &[],
     );
@@ -67,7 +67,7 @@ fn test_mgr_alg_031_warning_mode_lossless_only() {
     let registry = make_registry(
         &[
             ("switch_hw", false, true),
-            ("kv_evict_sliding", true, false),
+            ("kv.evict_sliding", true, false),
         ],
         &[],
     );
@@ -109,8 +109,8 @@ fn test_mgr_alg_031_warning_mode_lossless_only() {
 fn test_mgr_alg_031_empty_candidates() {
     let registry = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("layer_skip", true, true),
+            ("kv.evict_sliding", true, false),
+            ("weight.skip", true, true),
         ],
         &[],
     );
@@ -190,7 +190,7 @@ fn test_mgr_alg_031_available_actions_filters_candidates() {
         &[
             ("switch_hw", false, true),
             ("throttle", false, true),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_h2o", true, false),
         ],
         &[],
     );
@@ -272,8 +272,8 @@ fn test_mgr_alg_031_empty_available_actions_no_filtering() {
 fn test_mgr_alg_033_critical_mode_minimum_cost() {
     let registry = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
         ],
         &[],
     );
@@ -317,10 +317,10 @@ fn test_mgr_alg_033_critical_mode_minimum_cost() {
 fn test_mgr_alg_033_exclusion_group() {
     let registry = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
 
     let mut predictions = HashMap::new();
@@ -441,7 +441,7 @@ fn test_mgr_alg_033_cross_domain_single_action() {
         &[
             ("switch_hw", false, true),
             ("throttle", false, true),
-            ("kv_evict_sliding", true, false),
+            ("kv.evict_sliding", true, false),
         ],
         &[],
     );
@@ -484,7 +484,7 @@ fn test_mgr_alg_033_cross_domain_single_action() {
 /// MGR-ALG-035: pressure 크기에 따라 파라미터가 선형 보간된다.
 #[test]
 fn test_mgr_alg_035_parametrize_proportional() {
-    let registry = make_registry(&[("kv_evict_sliding", true, false)], &[]);
+    let registry = make_registry(&[("kv.evict_sliding", true, false)], &[]);
 
     let mut predictions = HashMap::new();
     predictions.insert(ActionId::KvEvictSliding, rv(0.0, 0.9, 0.0, 0.0));

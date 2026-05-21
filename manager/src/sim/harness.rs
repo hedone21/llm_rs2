@@ -472,14 +472,14 @@ fn schedule_periodic_from(
 /// EngineCommand가 관측 가능한 action이면 canonical 이름을 반환한다.
 fn observable_action_name(cmd: &EngineCommand) -> Option<String> {
     match cmd {
-        EngineCommand::KvEvictH2o { .. } => Some("kv_evict_h2o".to_string()),
-        EngineCommand::KvEvictSliding { .. } => Some("kv_evict_sliding".to_string()),
+        EngineCommand::KvEvictH2o { .. } => Some("kv.evict_h2o".to_string()),
+        EngineCommand::KvEvictSliding { .. } => Some("kv.evict_sliding".to_string()),
         EngineCommand::KvMergeD2o { .. } => Some("kv_evict_d2o".to_string()),
         EngineCommand::Throttle { .. } => Some("throttle".to_string()),
         EngineCommand::SwitchHw { .. } => Some("switch_hw".to_string()),
         EngineCommand::SetPartitionRatio { .. } => Some("set_partition_ratio".to_string()),
-        EngineCommand::LayerSkip { .. } => Some("layer_skip".to_string()),
-        EngineCommand::KvQuantDynamic { .. } => Some("kv_quant_dynamic".to_string()),
+        EngineCommand::LayerSkip { .. } => Some("weight.skip".to_string()),
+        EngineCommand::KvQuantDynamic { .. } => Some("kv.quant_dynamic".to_string()),
         // RestoreDefaults, RequestQcf, SetTargetTbt 등은 관측 불필요
         _ => None,
     }

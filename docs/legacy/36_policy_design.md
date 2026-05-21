@@ -324,7 +324,7 @@ alpha = 0.25
 reversible = true
 
 [exclusion_groups]
-eviction = ["kv_evict_sliding", "kv_evict_h2o"]
+eviction = ["kv.evict_sliding", "kv.evict_h2o"]
 ```
 
 ---

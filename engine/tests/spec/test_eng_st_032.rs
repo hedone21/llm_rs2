@@ -70,21 +70,21 @@ fn test_eng_st_032_available_actions_initial() {
 
     assert!(actions.contains(&"throttle".to_string()));
     assert!(actions.contains(&"switch_hw".to_string()));
-    assert!(actions.contains(&"layer_skip".to_string()));
+    assert!(actions.contains(&"weight.skip".to_string()));
 
     // eviction 없으면 evict 액션 비포함
     assert!(
-        !actions.contains(&"kv_evict_h2o".to_string()),
+        !actions.contains(&"kv.evict_h2o".to_string()),
         "kv_evict_h2o should not be available without eviction policy"
     );
     assert!(
-        !actions.contains(&"kv_evict_sliding".to_string()),
+        !actions.contains(&"kv.evict_sliding".to_string()),
         "kv_evict_sliding should not be available without eviction policy"
     );
 
     // f16이면 quant 비포함
     assert!(
-        !actions.contains(&"kv_quant_dynamic".to_string()),
+        !actions.contains(&"kv.quant_dynamic".to_string()),
         "kv_quant_dynamic should not be available with f16"
     );
 }
@@ -153,25 +153,25 @@ fn test_eng_st_032_available_device_dependent() {
     // eviction policy가 설정되면 evict 액션 가용
     let actions = get_available_actions("h2o", "f16");
     assert!(
-        actions.contains(&"kv_evict_h2o".to_string()),
+        actions.contains(&"kv.evict_h2o".to_string()),
         "kv_evict_h2o should be available with h2o policy"
     );
     assert!(
-        actions.contains(&"kv_evict_sliding".to_string()),
+        actions.contains(&"kv.evict_sliding".to_string()),
         "kv_evict_sliding should be available with eviction policy"
     );
 
     // KIVI cache (q8)이면 kv_quant_dynamic 가용
     let actions = get_available_actions("none", "q8");
     assert!(
-        actions.contains(&"kv_quant_dynamic".to_string()),
+        actions.contains(&"kv.quant_dynamic".to_string()),
         "kv_quant_dynamic should be available with KIVI cache"
     );
 
     // 둘 다 설정
     let actions = get_available_actions("sliding", "q4");
-    assert!(actions.contains(&"kv_evict_h2o".to_string()));
-    assert!(actions.contains(&"kv_quant_dynamic".to_string()));
+    assert!(actions.contains(&"kv.evict_h2o".to_string()));
+    assert!(actions.contains(&"kv.quant_dynamic".to_string()));
 }
 
 /// secondary 비활성: swap_weights가 available_actions에 포함되지 않아야 한다.
@@ -195,7 +195,7 @@ fn test_eng_st_032_swap_weights_present_with_secondary() {
     // 기본 액션들은 여전히 포함
     assert!(actions.contains(&"throttle".to_string()));
     assert!(actions.contains(&"switch_hw".to_string()));
-    assert!(actions.contains(&"layer_skip".to_string()));
+    assert!(actions.contains(&"weight.skip".to_string()));
 }
 
 /// secondary 활성 + eviction + KIVI 조합: 모든 액션이 동시에 등록되어야 한다.
@@ -203,7 +203,7 @@ fn test_eng_st_032_swap_weights_present_with_secondary() {
 fn test_eng_st_032_swap_weights_combined_with_eviction_and_quant() {
     let actions = get_available_actions_with_secondary("h2o", "q4", true);
     assert!(actions.contains(&"swap_weights".to_string()));
-    assert!(actions.contains(&"kv_evict_h2o".to_string()));
-    assert!(actions.contains(&"kv_quant_dynamic".to_string()));
+    assert!(actions.contains(&"kv.evict_h2o".to_string()));
+    assert!(actions.contains(&"kv.quant_dynamic".to_string()));
     assert!(actions.contains(&"throttle".to_string()));
 }

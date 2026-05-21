@@ -1273,7 +1273,7 @@ function build_safe_set(candidates, has_emergency, pressure_level) -> A_safe:
 
 ```
 joint_actions = {
-    "throttle_plus_layer_skip":  ["throttle", "layer_skip"]
+    "throttle_plus_layer_skip":  ["throttle", "weight.skip"]
 }
 ```
 

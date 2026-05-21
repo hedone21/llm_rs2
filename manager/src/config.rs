@@ -603,12 +603,12 @@ latency_budget = 0.5
 lossy = false
 reversible = true
 
-[policy.actions.kv_evict_sliding]
+[policy.actions."kv.evict_sliding"]
 lossy = true
 reversible = false
 
 [policy.exclusion_groups]
-eviction = ["kv_evict_sliding", "kv_evict_h2o"]
+eviction = ["kv.evict_sliding", "kv.evict_h2o"]
 "#;
             let config: Config = toml::from_str(toml_str).unwrap();
             let policy = config.policy.unwrap();
@@ -617,7 +617,7 @@ eviction = ["kv_evict_sliding", "kv_evict_h2o"]
             let switch = policy.actions.get("switch_hw").unwrap();
             assert!(!switch.lossy);
             assert!(switch.reversible);
-            let kv_evict = policy.actions.get("kv_evict_sliding").unwrap();
+            let kv_evict = policy.actions.get("kv.evict_sliding").unwrap();
             assert!(kv_evict.lossy);
             let eviction = policy.exclusion_groups.get("eviction").unwrap();
             assert_eq!(eviction.len(), 2);
@@ -645,13 +645,13 @@ eviction = ["kv_evict_sliding", "kv_evict_h2o"]
         fn action_config_default_cost_fallback_is_one() {
             // default_cost 필드 없이 파싱 시 1.0으로 폴백되어야 한다
             let toml_str = r#"
-[policy.actions.kv_evict_sliding]
+[policy.actions."kv.evict_sliding"]
 lossy = true
 reversible = false
 "#;
             let config: Config = toml::from_str(toml_str).unwrap();
             let policy = config.policy.unwrap();
-            let action = policy.actions.get("kv_evict_sliding").unwrap();
+            let action = policy.actions.get("kv.evict_sliding").unwrap();
             assert!((action.default_cost - 1.0).abs() < f32::EPSILON);
         }
 
@@ -659,21 +659,21 @@ reversible = false
         fn action_config_explicit_default_cost_loaded() {
             // 명시적 default_cost 값이 정확히 로드되어야 한다
             let toml_str = r#"
-[policy.actions.kv_evict_sliding]
+[policy.actions."kv.evict_sliding"]
 lossy = true
 reversible = false
 default_cost = 0.5
 
-[policy.actions.layer_skip]
+[policy.actions."weight.skip"]
 lossy = true
 reversible = true
 default_cost = 2.0
 "#;
             let config: Config = toml::from_str(toml_str).unwrap();
             let policy = config.policy.unwrap();
-            let evict = policy.actions.get("kv_evict_sliding").unwrap();
+            let evict = policy.actions.get("kv.evict_sliding").unwrap();
             assert!((evict.default_cost - 0.5).abs() < f32::EPSILON);
-            let skip = policy.actions.get("layer_skip").unwrap();
+            let skip = policy.actions.get("weight.skip").unwrap();
             assert!((skip.default_cost - 2.0).abs() < f32::EPSILON);
         }
 

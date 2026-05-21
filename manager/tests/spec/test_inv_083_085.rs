@@ -138,7 +138,7 @@ fn inv085_normal_mode_no_action_zero_pressure() {
         },
     );
     config.actions.insert(
-        "kv_evict_sliding".into(),
+        "kv.evict_sliding".into(),
         llm_manager::config::ActionConfig {
             lossy: true,
             reversible: false,

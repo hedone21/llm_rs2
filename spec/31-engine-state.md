@@ -171,22 +171,22 @@ D-Bus 경로에서 Emergency level signal 수신 시:
 |---------------|-------------------|
 | Throttle { delay_ms > 0 } | "throttle" 추가 (중복 방지) |
 | Throttle { delay_ms = 0 } | "throttle" 제거 |
-| LayerSkip | "layer_skip" 추가 |
-| KvEvictH2o | "kv_evict_h2o" 추가 |
-| KvEvictSliding | "kv_evict_sliding" 추가 |
-| KvQuantDynamic | "kv_quant_dynamic" 추가 |
+| LayerSkip | "weight.skip" 추가 |
+| KvEvictH2o | "kv.evict_h2o" 추가 |
+| KvEvictSliding | "kv.evict_sliding" 추가 |
+| KvQuantDynamic | "kv.quant_dynamic" 추가 |
 | RestoreDefaults | `active_actions.clear()` |
 | Resume | 초기화하지 않음 (compute_level/memory_level만 리셋) |
-| KvStreaming | "kv_evict_streaming" 추가 |
+| KvStreaming | "kv.evict_streaming" 추가 |
 | SwitchHw, PrepareComputeUnit, Suspend | active_actions 변경 없음 |
 
 **[ENG-ST-032]** available_actions 계산 규칙: *(MUST)*
 
 매 Heartbeat 전송 시 `compute_available_actions(eviction_policy, kv_dtype, has_secondary)` 호출:
 
-- 기본: `["throttle", "switch_hw", "layer_skip"]`
-- `eviction_policy != "none"` 이면: `+ ["kv_evict_h2o", "kv_evict_sliding", "kv_evict_streaming"]`
-- `kv_dtype.starts_with('q')` 이면: `+ ["kv_quant_dynamic"]`
+- 기본: `["throttle", "switch_hw", "weight.skip"]`
+- `eviction_policy != "none"` 이면: `+ ["kv.evict_h2o", "kv.evict_sliding", "kv.evict_streaming"]`
+- `kv_dtype.starts_with('q')` 이면: `+ ["kv.quant_dynamic"]`
 - secondary GGUF/AUF 파일이 로드된 경우(`has_secondary == true`) 이면: `+ ["swap_weights"]`
 
 Capability 송출(`send_capability`)과 Heartbeat의 `available_actions`는 같은 조건(`args.secondary_gguf.is_some()`)을 공유해야 한다.

@@ -1175,7 +1175,7 @@ mod tests {
             memory_lossy_min: 0.01,
             state: EngineState::Running,
             tokens_generated: 10,
-            available_actions: vec!["throttle".into(), "kv_evict_sliding".into()],
+            available_actions: vec!["throttle".into(), "kv.evict_sliding".into()],
             active_actions: vec![],
             eviction_policy: "none".into(),
             kv_dtype: "f16".into(),
@@ -1829,7 +1829,7 @@ mod tests {
             &EngineMessage::Heartbeat(make_heartbeat_status()),
         );
         let mut estimates = HashMap::new();
-        estimates.insert("kv_evict_h2o".to_string(), 0.15f32);
+        estimates.insert("kv.evict_h2o".to_string(), 0.15f32);
         engine_send(
             &mut client,
             &EngineMessage::QcfEstimate(llm_shared::QcfEstimate {
@@ -1842,7 +1842,7 @@ mod tests {
             .unwrap()
             .expect("should receive QcfEstimate");
         assert_eq!(qcf.estimates.len(), 1);
-        assert!((qcf.estimates["kv_evict_h2o"] - 0.15).abs() < f32::EPSILON);
+        assert!((qcf.estimates["kv.evict_h2o"] - 0.15).abs() < f32::EPSILON);
     }
 
     #[test]

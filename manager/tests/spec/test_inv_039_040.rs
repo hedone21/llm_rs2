@@ -58,7 +58,7 @@ fn test_inv_039_lossless_preferred_over_lossy_same_relief() {
     let registry = make_registry(
         &[
             ("switch_hw", false, true),        // lossless
-            ("kv_evict_sliding", true, false), // lossy
+            ("kv.evict_sliding", true, false), // lossy
         ],
         &[],
     );
@@ -102,7 +102,7 @@ fn test_inv_040_lossy_without_qcf_not_selected() {
     let registry = make_registry(
         &[
             ("switch_hw", false, true),        // lossless
-            ("kv_evict_sliding", true, false), // lossy
+            ("kv.evict_sliding", true, false), // lossy
         ],
         &[],
     );
@@ -136,8 +136,8 @@ fn test_inv_040_lossy_without_qcf_not_selected() {
     // 완전 해소 시나리오로 재구성: 두 lossy 액션이 동일 relief, 하나만 QCF 있음
     let registry2 = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
         ],
         &[],
     );
@@ -180,7 +180,7 @@ fn test_inv_040_lossy_without_qcf_not_selected() {
 /// INV-040의 핵심은 "cost 비교에서 INFINITY"라는 점.
 #[test]
 fn test_inv_040_all_lossy_no_qcf_still_infinity_cost() {
-    let registry = make_registry(&[("kv_evict_sliding", true, false)], &[]);
+    let registry = make_registry(&[("kv.evict_sliding", true, false)], &[]);
 
     let mut predictions = HashMap::new();
     predictions.insert(ActionId::KvEvictSliding, rv(0.0, 0.9, 0.0, 0.0));

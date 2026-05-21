@@ -20,10 +20,10 @@ use super::helpers::{MockEstimator, make_registry, no_state, pv, rv};
 fn inv041_exclusion_group_prevents_simultaneous_selection() {
     let registry = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
 
     let mut predictions = HashMap::new();
@@ -73,13 +73,13 @@ fn inv041_exclusion_group_prevents_simultaneous_selection() {
 fn inv041_exclusion_group_three_members() {
     let registry = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
-            ("kv_quant_dynamic", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
+            ("kv.quant_dynamic", true, false),
         ],
         &[(
             "memory_ops",
-            &["kv_evict_sliding", "kv_evict_h2o", "kv_quant_dynamic"],
+            &["kv.evict_sliding", "kv.evict_h2o", "kv.quant_dynamic"],
         )],
     );
 
@@ -129,13 +129,13 @@ fn inv041_exclusion_group_three_members() {
 fn inv041_different_groups_can_coexist() {
     let registry = make_registry(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
             ("switch_hw", false, true),
             ("throttle", false, true),
         ],
         &[
-            ("eviction", &["kv_evict_sliding", "kv_evict_h2o"]),
+            ("eviction", &["kv.evict_sliding", "kv.evict_h2o"]),
             ("hw_change", &["switch_hw", "throttle"]),
         ],
     );

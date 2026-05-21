@@ -52,7 +52,7 @@ lossy = true
 reversible = false
 
 [policy.exclusion_groups]
-eviction = ["kv_evict_sliding", "kv_evict_h2o"]
+eviction = ["kv.evict_sliding", "kv.evict_h2o"]
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
     let policy = config.policy.unwrap();
@@ -61,7 +61,7 @@ eviction = ["kv_evict_sliding", "kv_evict_h2o"]
     let switch = policy.actions.get("switch_hw").unwrap();
     assert!(!switch.lossy);
     assert!(switch.reversible);
-    let kv_evict = policy.actions.get("kv_evict_sliding").unwrap();
+    let kv_evict = policy.actions.get("kv.evict_sliding").unwrap();
     assert!(kv_evict.lossy);
     let eviction = policy.exclusion_groups.get("eviction").unwrap();
     assert_eq!(eviction.len(), 2);
@@ -92,7 +92,7 @@ reversible = false
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
     let policy = config.policy.unwrap();
-    let action = policy.actions.get("kv_evict_sliding").unwrap();
+    let action = policy.actions.get("kv.evict_sliding").unwrap();
     assert!((action.default_cost - 1.0).abs() < f32::EPSILON);
 }
 
@@ -112,9 +112,9 @@ default_cost = 2.0
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
     let policy = config.policy.unwrap();
-    let evict = policy.actions.get("kv_evict_sliding").unwrap();
+    let evict = policy.actions.get("kv.evict_sliding").unwrap();
     assert!((evict.default_cost - 0.5).abs() < f32::EPSILON);
-    let skip = policy.actions.get("layer_skip").unwrap();
+    let skip = policy.actions.get("weight.skip").unwrap();
     assert!((skip.default_cost - 2.0).abs() < f32::EPSILON);
 }
 
@@ -162,7 +162,7 @@ fn test_mgr_dat_054_from_config_basic() {
     let config = make_policy_config(
         &[
             ("switch_hw", false, true),
-            ("kv_evict_sliding", true, false),
+            ("kv.evict_sliding", true, false),
             ("throttle", false, true),
         ],
         &[],
@@ -202,10 +202,10 @@ fn test_mgr_dat_055_lossy_lossless_classification() {
         &[
             ("switch_hw", false, true),
             ("throttle", false, true),
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
-            ("kv_quant_dynamic", true, false),
-            ("layer_skip", true, true),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
+            ("kv.quant_dynamic", true, false),
+            ("weight.skip", true, true),
         ],
         &[],
     );
@@ -240,8 +240,8 @@ fn test_mgr_dat_055_lossy_lossless_classification() {
 fn test_mgr_dat_056_default_param_ranges() {
     let config = make_policy_config(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_quant_dynamic", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.quant_dynamic", true, false),
             ("switch_hw", false, true),
         ],
         &[],
@@ -278,11 +278,11 @@ fn test_mgr_dat_056_default_param_ranges() {
 fn test_mgr_dat_036_exclusion_groups() {
     let config = make_policy_config(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
             ("switch_hw", false, true),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
     let registry = ActionRegistry::from_config(&config);
 
@@ -300,11 +300,11 @@ fn test_mgr_dat_036_exclusion_groups() {
 fn test_mgr_dat_036_is_excluded() {
     let config = make_policy_config(
         &[
-            ("kv_evict_sliding", true, false),
-            ("kv_evict_h2o", true, false),
+            ("kv.evict_sliding", true, false),
+            ("kv.evict_h2o", true, false),
             ("switch_hw", false, true),
         ],
-        &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
+        &[("eviction", &["kv.evict_sliding", "kv.evict_h2o"])],
     );
     let registry = ActionRegistry::from_config(&config);
 

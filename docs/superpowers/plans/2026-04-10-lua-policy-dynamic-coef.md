@@ -1043,12 +1043,12 @@ fn engine_command_to_action_name(cmd: &EngineCommand) -> String {
     match cmd {
         EngineCommand::Throttle { .. } => "throttle",
         EngineCommand::SetTargetTbt { .. } => "set_target_tbt",
-        EngineCommand::LayerSkip { .. } => "layer_skip",
-        EngineCommand::KvEvictH2o { .. } => "kv_evict_h2o",
-        EngineCommand::KvEvictSliding { .. } => "kv_evict_sliding",
+        EngineCommand::LayerSkip { .. } => "weight.skip",
+        EngineCommand::KvEvictH2o { .. } => "kv.evict_h2o",
+        EngineCommand::KvEvictSliding { .. } => "kv.evict_sliding",
         EngineCommand::KvStreaming { .. } => "kv_streaming",
-        EngineCommand::KvMergeD2o { .. } => "kv_merge_d2o",
-        EngineCommand::KvQuantDynamic { .. } => "kv_quant_dynamic",
+        EngineCommand::KvMergeD2o { .. } => "kv.merge_d2o",
+        EngineCommand::KvQuantDynamic { .. } => "kv.quant_dynamic",
         EngineCommand::SwitchHw { .. } => "switch_hw",
         EngineCommand::RestoreDefaults => "restore_defaults",
         EngineCommand::Suspend => "suspend",
@@ -1121,9 +1121,9 @@ fn engine_command_to_action_name(cmd: &EngineCommand) -> String {
             // coef.relief
             let r_tbl = lua.create_table()?;
             let action_names = [
-                "switch_hw", "throttle", "set_target_tbt", "layer_skip",
-                "kv_evict_h2o", "kv_evict_sliding", "kv_streaming",
-                "kv_merge_d2o", "kv_quant_dynamic", "set_partition_ratio",
+                "switch_hw", "throttle", "set_target_tbt", "weight.skip",
+                "kv.evict_h2o", "kv.evict_sliding", "kv_streaming",
+                "kv.merge_d2o", "kv.quant_dynamic", "set_partition_ratio",
             ];
             for name in &action_names {
                 let relief = self.relief_table.predict(name);
@@ -1256,18 +1256,18 @@ function decide(ctx)
     if best_action and best_relief > 0 then
         -- Build action with sensible defaults
         local cmd = {type = best_action}
-        if best_action == "kv_evict_h2o" or best_action == "kv_evict_sliding"
-           or best_action == "kv_merge_d2o" then
+        if best_action == "kv.evict_h2o" or best_action == "kv.evict_sliding"
+           or best_action == "kv.merge_d2o" then
             cmd.keep_ratio = 0.5
         elseif best_action == "throttle" then
             cmd.delay_ms = 50
         elseif best_action == "set_target_tbt" then
             cmd.target_ms = 150
-        elseif best_action == "layer_skip" then
+        elseif best_action == "weight.skip" then
             cmd.skip_ratio = 0.25
         elseif best_action == "switch_hw" then
             cmd.device = "cpu"
-        elseif best_action == "kv_quant_dynamic" then
+        elseif best_action == "kv.quant_dynamic" then
             cmd.target_bits = 4
         elseif best_action == "set_partition_ratio" then
             cmd.ratio = 0.5
@@ -1395,7 +1395,7 @@ set_partition_ratio = [0.3, -0.2, 0.0, 0.1, 0.0, 0.0]
         let script = r#"
             function decide(ctx)
                 if ctx.coef.trigger.mem_low then
-                    return {{type = "kv_evict_h2o", keep_ratio = 0.5}}
+                    return {{type = "kv.evict_h2o", keep_ratio = 0.5}}
                 end
                 return {}
             end
