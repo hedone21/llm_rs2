@@ -2,7 +2,7 @@
 //! Phase 4-5-c. chat REPL은 4-5-e에서 ChatStopCondition을 owned 보유하여
 //! DecodeLoop::run_until_stop에 전달.
 
-use crate::core::chat_template::ChatTemplate;
+use crate::session::chat_template::ChatTemplate;
 use tokenizers::Tokenizer;
 
 /// Decode loop 종료 조건. `should_stop`이 true를 반환하면 loop를 즉시 종료한다.

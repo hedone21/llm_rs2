@@ -14,7 +14,7 @@ use std::io::Write as _;
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-use crate::core::chat_template::ChatTemplate;
+use crate::session::chat_template::ChatTemplate;
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::models::config::ModelArch;
 use crate::session::chat::session::ChatSession;
