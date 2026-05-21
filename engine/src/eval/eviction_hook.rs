@@ -703,7 +703,7 @@ impl StepHook<KVCache> for EvictionHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::sys_monitor::{MemoryStats, SystemMonitor};
+    use crate::resilience::sys_monitor::{MemoryStats, SystemMonitor};
     use crate::pressure::cache_manager::CacheManager;
     use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
     use crate::qcf::{QcfConfig, QcfMode};

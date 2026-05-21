@@ -5,6 +5,7 @@ pub mod proc_self_meter;
 pub mod signal;
 pub mod state;
 pub mod strategy;
+pub mod sys_monitor;
 pub mod transport;
 
 #[cfg(feature = "resilience")]

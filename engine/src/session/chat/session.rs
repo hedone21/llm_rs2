@@ -18,7 +18,7 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::core::events::StderrDiagnosticSink;
-use crate::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
+use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
@@ -588,7 +588,7 @@ fn build_chat_eviction_internal(
                 _ => 4,
             });
 
-    let monitor: Box<dyn crate::core::sys_monitor::SystemMonitor> =
+    let monitor: Box<dyn crate::resilience::sys_monitor::SystemMonitor> =
         if args.backend.is_discrete_gpu() {
             Box::new(NoOpMonitor)
         } else {

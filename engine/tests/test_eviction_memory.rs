@@ -9,7 +9,7 @@
 mod eviction_memory_test {
     use llm_rs2::backend::cpu::CpuBackend;
     use llm_rs2::buffer::{Buffer, DType};
-    use llm_rs2::core::sys_monitor::{MemoryStats, SystemMonitor};
+    use llm_rs2::resilience::sys_monitor::{MemoryStats, SystemMonitor};
     use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::pressure::cache_manager::CacheManager;
     use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;

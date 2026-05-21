@@ -4,7 +4,7 @@ use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::core::events::{self, CacheEvent, StderrDiagnosticSink};
 use llm_rs2::core::rss_trace::{io_trace, rss_trace};
-use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
+use llm_rs2::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::inference::sampling::{self, SamplingConfig};
 use llm_rs2::layers::workspace::{
@@ -828,7 +828,7 @@ fn main() -> anyhow::Result<()> {
         // CUDA discrete GPU: managed memory (cuMemAllocManaged) reserves system RAM
         // for virtual address space even though data resides in VRAM. MemAvailable
         // from /proc/meminfo is unreliable — use NoOpMonitor to prevent false pressure.
-        let monitor: Box<dyn llm_rs2::core::sys_monitor::SystemMonitor> =
+        let monitor: Box<dyn llm_rs2::resilience::sys_monitor::SystemMonitor> =
             if backend.is_discrete_gpu() {
                 Box::new(NoOpMonitor)
             } else {
