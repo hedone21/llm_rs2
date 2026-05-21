@@ -3,6 +3,7 @@ pub mod batch;
 pub mod chat;
 pub mod chat_ipc;
 pub mod cli;
+pub mod decode_fallback;
 pub mod decode_loop;
 pub mod defaults;
 pub mod dump_importance;

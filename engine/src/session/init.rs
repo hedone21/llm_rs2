@@ -558,14 +558,8 @@ impl SessionInitCtx {
 
         let primary_path_buf = std::path::PathBuf::from(model_path);
         let primary_format = crate::models::loader::detect_primary_format(&primary_path_buf)?;
-        let is_gguf = matches!(
-            primary_format,
-            crate::models::loader::PrimaryFormat::Gguf
-        );
-        let is_auf = matches!(
-            primary_format,
-            crate::models::loader::PrimaryFormat::Auf
-        );
+        let is_gguf = matches!(primary_format, crate::models::loader::PrimaryFormat::Gguf);
+        let is_auf = matches!(primary_format, crate::models::loader::PrimaryFormat::Auf);
 
         if args.secondary_gguf.is_some() {
             eprintln!(
