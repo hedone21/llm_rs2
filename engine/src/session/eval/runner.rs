@@ -9,7 +9,9 @@ use anyhow::Result;
 use crate::session::cli::parse_qcf_sample_layers;
 use crate::session::eval::args::EvalLlRunCtx;
 use crate::session::eval::helpers::{build_eval_ll_warmup_text, load_eval_questions};
-use crate::session::qcf_runtime::{run_layer_swap, run_qcf_warmup_workflow};
+use crate::session::qcf_runtime::{
+    QcfWarmupConfig, QcfWarmupCtx, run_layer_swap, run_qcf_warmup_workflow,
+};
 
 pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     let EvalLlRunCtx {
@@ -72,22 +74,26 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
             );
         } else {
             let result = run_qcf_warmup_workflow(
-                &model,
-                &backend,
-                memory.as_ref(),
-                &mut kv_caches,
-                vocab_size,
-                &warmup_ids,
-                Some(force_ratio),
-                gpu_backend_arc.as_ref(),
-                &cpu_backend_arc,
-                " eval-ll",
-                swap_algorithm,
-                !args.qcf_trajectory,
-                importance_formula,
-                importance_compare,
-                swap_only_layers.as_deref(),
-                args.decode_x_steps,
+                QcfWarmupCtx {
+                    model: &model,
+                    backend: &backend,
+                    memory: memory.as_ref(),
+                    kv_caches: &mut kv_caches,
+                    vocab_size,
+                    warmup_ids: &warmup_ids,
+                    gpu_backend: gpu_backend_arc.as_ref(),
+                    cpu_backend: &cpu_backend_arc,
+                },
+                QcfWarmupConfig {
+                    force_ratio: Some(force_ratio),
+                    swap_algorithm,
+                    execute_swap: !args.qcf_trajectory,
+                    importance_formula,
+                    importance_three_way: importance_compare,
+                    swap_only_layers: swap_only_layers.as_deref(),
+                    decode_x_steps: args.decode_x_steps,
+                    log_prefix: " eval-ll",
+                },
             )?;
             eval_ll_qcf_decision = result.decision;
             eval_ll_qcf_importance = Some(result.importance);

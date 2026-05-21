@@ -26,7 +26,8 @@ use llm_rs2::session::cli::{Args, KvMode, parse_qcf_sample_layers};
 use llm_rs2::session::eval::load_eval_questions;
 use llm_rs2::session::ppl::run_kivi_ppl;
 use llm_rs2::session::qcf_runtime::{
-    dispatch_swap_weights, read_allow_boundary_env, run_layer_swap, run_qcf_warmup_workflow,
+    QcfWarmupConfig, QcfWarmupCtx, dispatch_swap_weights, read_allow_boundary_env, run_layer_swap,
+    run_qcf_warmup_workflow,
 };
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
@@ -1662,22 +1663,26 @@ fn main() -> anyhow::Result<()> {
         }
 
         let result = run_qcf_warmup_workflow(
-            &model,
-            &backend,
-            memory.as_ref(),
-            &mut kv_caches,
-            vocab_size,
-            &warmup_tokens,
-            args.force_swap_ratio,
-            gpu_backend_arc.as_ref(),
-            &cpu_backend_arc,
-            "",
-            swap_algorithm,
-            true,
-            importance_formula,
-            importance_compare,
-            swap_only_layers.as_deref(),
-            args.decode_x_steps,
+            QcfWarmupCtx {
+                model: &model,
+                backend: &backend,
+                memory: memory.as_ref(),
+                kv_caches: &mut kv_caches,
+                vocab_size,
+                warmup_ids: &warmup_tokens,
+                gpu_backend: gpu_backend_arc.as_ref(),
+                cpu_backend: &cpu_backend_arc,
+            },
+            QcfWarmupConfig {
+                force_ratio: args.force_swap_ratio,
+                swap_algorithm,
+                execute_swap: true,
+                importance_formula,
+                importance_three_way: importance_compare,
+                swap_only_layers: swap_only_layers.as_deref(),
+                decode_x_steps: args.decode_x_steps,
+                log_prefix: "",
+            },
         )?;
         qcf_swap_decision = result.decision;
         qcf_warmup_importance = Some(result.importance);

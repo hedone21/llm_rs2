@@ -119,27 +119,60 @@ pub fn read_allow_boundary_env() -> bool {
         .unwrap_or(false)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Inference-engine references + KV caches + warmup input.
+///
+/// Groups the "where to run + on what data" inputs for
+/// [`run_qcf_warmup_workflow`].
+pub struct QcfWarmupCtx<'a> {
+    pub model: &'a crate::models::transformer::TransformerModel,
+    pub backend: &'a Arc<dyn Backend>,
+    pub memory: &'a dyn Memory,
+    pub kv_caches: &'a mut [KVCache],
+    pub vocab_size: usize,
+    pub warmup_ids: &'a [u32],
+    pub gpu_backend: Option<&'a Arc<dyn Backend>>,
+    pub cpu_backend: &'a Arc<dyn Backend>,
+}
+
+/// Behaviour knobs for [`run_qcf_warmup_workflow`] (scalar/option values).
+pub struct QcfWarmupConfig<'a> {
+    pub force_ratio: Option<f32>,
+    pub swap_algorithm: crate::models::weights::SwapAlgorithm,
+    pub execute_swap: bool,
+    pub importance_formula: crate::qcf::ImportanceFormula,
+    pub importance_three_way: bool,
+    pub swap_only_layers: Option<&'a [usize]>,
+    pub decode_x_steps: usize,
+    pub log_prefix: &'a str,
+}
+
 pub fn run_qcf_warmup_workflow(
-    model: &crate::models::transformer::TransformerModel,
-    backend: &Arc<dyn Backend>,
-    memory: &dyn Memory,
-    kv_caches: &mut [KVCache],
-    vocab_size: usize,
-    warmup_ids: &[u32],
-    force_ratio: Option<f32>,
-    gpu_backend: Option<&Arc<dyn Backend>>,
-    cpu_backend: &Arc<dyn Backend>,
-    log_prefix: &str,
-    swap_algorithm: crate::models::weights::SwapAlgorithm,
-    execute_swap: bool,
-    importance_formula: crate::qcf::ImportanceFormula,
-    importance_three_way: bool,
-    swap_only_layers: Option<&[usize]>,
-    decode_x_steps: usize,
+    ctx: QcfWarmupCtx<'_>,
+    cfg: QcfWarmupConfig<'_>,
 ) -> anyhow::Result<QcfWarmupResult> {
     use crate::models::weights::WeightSwapDecider;
     use crate::qcf::ImportanceCollector;
+
+    let QcfWarmupCtx {
+        model,
+        backend,
+        memory,
+        kv_caches,
+        vocab_size,
+        warmup_ids,
+        gpu_backend,
+        cpu_backend,
+    } = ctx;
+    let QcfWarmupConfig {
+        force_ratio,
+        swap_algorithm,
+        execute_swap,
+        importance_formula,
+        importance_three_way,
+        swap_only_layers,
+        decode_x_steps,
+        log_prefix,
+    } = cfg;
 
     let actual_warmup_len = warmup_ids.len();
     eprintln!(
