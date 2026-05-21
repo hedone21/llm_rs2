@@ -5275,8 +5275,18 @@ impl Backend for OpenCLBackend {
     /// cl_mem → Arc<SecondaryMmap> → Arc<RpcmemLayerRegion> → rpcmem_free).
     ///
     /// Rejects `size == 0` (invalid alias); rejects null `host_ptr`.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    fn alloc_alias_weight_buffer(
+    ///
+    /// # Safety
+    /// Caller must guarantee:
+    /// - `host_ptr.add(offset)` is valid and points to at least `size` bytes
+    ///   of correctly aligned, initialised memory.
+    /// - The region remains live and unmoved for the entire lifetime of the
+    ///   returned alias buffer. Lifetime is pinned by `secondary_arc` +
+    ///   `layer_region`, both of which are moved into the returned
+    ///   `RpcmemAliasBuffer` and dropped after the underlying `cl_mem`.
+    /// - No mutation of the region while alias buffers exist (the secondary
+    ///   mmap is read-only per `SecondaryMmap` contract).
+    unsafe fn alloc_alias_weight_buffer(
         &self,
         host_ptr: *mut u8,
         offset: usize,
@@ -5289,9 +5299,10 @@ impl Backend for OpenCLBackend {
             return Ok(None);
         }
         // SAFETY: `host_ptr + offset .. + size` lies within a region the
-        // caller pins via `layer_region`. The `CL_MEM_USE_HOST_PTR` contract
-        // requires the host memory to remain valid for the cl_mem's lifetime;
-        // the lifetime guards installed in `RpcmemAliasBuffer` enforce this.
+        // caller pins via `layer_region` (enforced by the fn-level safety
+        // contract above). The `CL_MEM_USE_HOST_PTR` contract requires the
+        // host memory to remain valid for the cl_mem's lifetime; the
+        // lifetime guards installed in `RpcmemAliasBuffer` enforce this.
         let aliased_ptr = unsafe { host_ptr.add(offset) };
         let host_slice = unsafe { std::slice::from_raw_parts_mut(aliased_ptr, size) };
         let cl_buffer = unsafe {

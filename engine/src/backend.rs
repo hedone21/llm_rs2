@@ -861,9 +861,20 @@ pub trait Backend: Send + Sync {
     /// - `Ok(None)` (default) — backend does not support alias path; caller
     ///   falls back to the standard mmap+memcpy materialisation.
     /// - `Ok(Some(buf))` — alias `cl_mem` created with both guards installed.
+    ///
+    /// # Safety
+    /// Caller must guarantee:
+    /// - `host_ptr.add(offset)` is valid and points to at least `size` bytes
+    ///   of correctly aligned, initialised memory readable by the GPU driver.
+    /// - The memory region remains live and unmoved for the entire lifetime
+    ///   of any returned alias `Buffer`. `secondary_arc` + `layer_region`
+    ///   are the lifetime guards that ensure this; both must outlive the
+    ///   returned buffer (which is enforced by storing them inside it).
+    /// - No other code mutates the region while alias buffers exist (the
+    ///   secondary mmap is read-only per `SecondaryMmap` contract).
     #[allow(unused_variables)]
     #[cfg(feature = "opencl")]
-    fn alloc_alias_weight_buffer(
+    unsafe fn alloc_alias_weight_buffer(
         &self,
         host_ptr: *mut u8,
         offset: usize,
@@ -875,9 +886,16 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
+    /// See the `opencl`-feature variant above for safety contract.
+    ///
+    /// # Safety
+    /// Same as the `opencl`-feature variant — caller guarantees `host_ptr`
+    /// validity and lifetime via `secondary_arc` + `layer_region` guards.
+    /// This default returns `Ok(None)` and never dereferences `host_ptr`,
+    /// but the signature mirrors the opencl variant for trait uniformity.
     #[allow(unused_variables)]
     #[cfg(not(feature = "opencl"))]
-    fn alloc_alias_weight_buffer(
+    unsafe fn alloc_alias_weight_buffer(
         &self,
         host_ptr: *mut u8,
         offset: usize,

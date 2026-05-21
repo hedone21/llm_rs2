@@ -404,14 +404,22 @@ impl RpcmemSecondaryStore {
         for (subname, host_ptr, offset, len, dtype) in entries {
             #[cfg(feature = "opencl")]
             {
-                let alloc_res = backend.alloc_alias_weight_buffer(
-                    host_ptr,
-                    offset,
-                    len,
-                    dtype,
-                    Arc::clone(&secondary_arc),
-                    Arc::clone(region),
-                );
+                // SAFETY: `host_ptr` is `region.host_ptr` returned by rpcmem
+                // alloc; `offset..offset+len` lies within the layer's region
+                // (built by `tensor_map` at scan time). Lifetime is pinned by
+                // `secondary_arc` (whole store) + `Arc::clone(region)` (this
+                // layer's rpcmem allocation), both moved into the alias
+                // buffer per `Backend::alloc_alias_weight_buffer` contract.
+                let alloc_res = unsafe {
+                    backend.alloc_alias_weight_buffer(
+                        host_ptr,
+                        offset,
+                        len,
+                        dtype,
+                        Arc::clone(&secondary_arc),
+                        Arc::clone(region),
+                    )
+                };
                 match alloc_res {
                     Ok(Some(buf)) => {
                         new_entries.push(((layer_idx, subname), buf));

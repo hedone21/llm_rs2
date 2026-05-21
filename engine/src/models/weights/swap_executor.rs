@@ -1701,9 +1701,14 @@ impl<'a> SwapExecutor<'a> {
         debug_assert_eq!(alias.len, info.len, "rpcmem region length mismatch");
         debug_assert_eq!(alias.dtype, info.dtype, "rpcmem region dtype mismatch");
 
-        let buf = self
-            .backend
-            .alloc_alias_weight_buffer(
+        // SAFETY: `alias.host_ptr` + `alias.offset..+alias.len` is the
+        // rpcmem region returned by `host_ptr_for`, length/dtype validated
+        // by the debug_assert pair above. Lifetime is pinned by
+        // `Arc::clone(secondary)` (whole store) + `alias.region` (this
+        // layer's rpcmem allocation), both moved into the alias buffer per
+        // `Backend::alloc_alias_weight_buffer` contract.
+        let buf = unsafe {
+            self.backend.alloc_alias_weight_buffer(
                 alias.host_ptr,
                 alias.offset,
                 alias.len,
@@ -1711,10 +1716,11 @@ impl<'a> SwapExecutor<'a> {
                 Arc::clone(secondary),
                 alias.region,
             )
-            .map_err(|e| SwapError::BufferAllocationFailed {
-                layer: layer_idx,
-                source: e,
-            })?;
+        }
+        .map_err(|e| SwapError::BufferAllocationFailed {
+            layer: layer_idx,
+            source: e,
+        })?;
         let Some(alias_buf) = buf else {
             return Ok(None);
         };
@@ -2851,8 +2857,14 @@ fn try_alias_materialise_standalone(
     debug_assert_eq!(alias.len, info.len, "rpcmem region length mismatch");
     debug_assert_eq!(alias.dtype, info.dtype, "rpcmem region dtype mismatch");
 
-    let buf = backend
-        .alloc_alias_weight_buffer(
+    // SAFETY: `alias.host_ptr` + `alias.offset..+alias.len` is the rpcmem
+    // region returned by `host_ptr_for`, length/dtype validated by the
+    // debug_assert pair above. Lifetime is pinned by `Arc::clone(secondary)`
+    // (whole store) + `alias.region` (this layer's rpcmem allocation), both
+    // moved into the alias buffer per `Backend::alloc_alias_weight_buffer`
+    // contract.
+    let buf = unsafe {
+        backend.alloc_alias_weight_buffer(
             alias.host_ptr,
             alias.offset,
             alias.len,
@@ -2860,10 +2872,11 @@ fn try_alias_materialise_standalone(
             Arc::clone(secondary),
             alias.region,
         )
-        .map_err(|e| SwapError::BufferAllocationFailed {
-            layer: layer_idx,
-            source: e,
-        })?;
+    }
+    .map_err(|e| SwapError::BufferAllocationFailed {
+        layer: layer_idx,
+        source: e,
+    })?;
     let Some(alias_buf) = buf else {
         return Ok(None);
     };

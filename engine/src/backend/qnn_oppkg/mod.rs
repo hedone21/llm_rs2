@@ -601,8 +601,14 @@ impl Backend for QnnOppkgBackend {
     /// backend. `qnn_oppkg` shares the OpenCL context with its secondary
     /// (`with_opencl_secondary`), so the alias `cl_mem` lives in the same
     /// context the production swap path uses.
+    ///
+    /// # Safety
+    /// Same contract as `Backend::alloc_alias_weight_buffer`: caller
+    /// guarantees `host_ptr.add(offset)..+size` is valid memory pinned by
+    /// `secondary_arc` + `layer_region` for the returned buffer's lifetime.
+    /// This impl forwards directly to the OpenCL secondary's implementation.
     #[cfg(feature = "opencl")]
-    fn alloc_alias_weight_buffer(
+    unsafe fn alloc_alias_weight_buffer(
         &self,
         host_ptr: *mut u8,
         offset: usize,
@@ -612,14 +618,18 @@ impl Backend for QnnOppkgBackend {
         layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
     ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         let res = self.with_opencl_secondary(|ocl| {
-            ocl.alloc_alias_weight_buffer(
-                host_ptr,
-                offset,
-                size,
-                dtype,
-                secondary_arc.clone(),
-                layer_region.clone(),
-            )
+            // SAFETY: forwarded — caller of qnn_oppkg's method already
+            // upholds the same contract the OpenCL impl requires.
+            unsafe {
+                ocl.alloc_alias_weight_buffer(
+                    host_ptr,
+                    offset,
+                    size,
+                    dtype,
+                    secondary_arc.clone(),
+                    layer_region.clone(),
+                )
+            }
         });
         match res {
             Some(r) => r,
