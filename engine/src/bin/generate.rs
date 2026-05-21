@@ -2537,152 +2537,22 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Auto-eviction after forward pass (non-experiment mode)
-            if auto_eviction {
-                let before_len = kv_caches[0].current_pos;
-                let capacity = kv_caches[0].capacity();
-
-                // GPU score sync: transfer GPU-accumulated scores to CPU accumulator
-                // before any score-based eviction decision. Only syncs when:
-                // 1. GPU score acc is active AND
-                // 2. Eviction is imminent (score-based at 90% capacity) OR non-score-based with acc
-                #[cfg(feature = "opencl")]
-                if (score_based_eviction && before_len >= capacity * 9 / 10
-                    || score_accumulator.as_ref().is_some_and(|a| a.is_active()))
-                    && let Some(ocl_be) = backend
-                        .as_any()
-                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-                    && let Some(gpu_acc) = ocl_be.gpu_score_acc()
-                    && gpu_acc.is_active()
-                {
-                    let (flat, head) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())?;
-                    if let Some(ref mut acc) = score_accumulator {
-                        acc.import_gpu_scores(&flat, &head);
-                    }
-                }
-
-                // Capture pre-eviction scores for profiling (before eviction mutates state)
-                let pre_eviction_scores: Vec<f32> = if profiler.is_some()
-                    && score_based_eviction
-                    && before_len >= capacity * 9 / 10
-                {
-                    score_accumulator
-                        .as_ref()
-                        .filter(|acc| acc.is_active())
-                        .map(|acc| {
-                            acc.importance_scores()[..before_len.min(acc.importance_scores().len())]
-                                .to_vec()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                let result = if score_based_eviction && before_len >= capacity * 9 / 10 {
-                    // Score-based policies: force evict when cache >= 90% full
-                    if let Some(acc) = score_accumulator.as_ref() {
-                        if acc.is_active() {
-                            // D2O layer-level allocation: use per-layer budgets if available
-                            if let Some(ref ratios) = d2o_layer_ratios {
-                                cache_manager.force_evict_with_scores_and_budgets(
-                                    &mut kv_caches,
-                                    args.eviction_target_ratio(),
-                                    acc.importance_scores(),
-                                    ratios,
-                                )?
-                            } else {
-                                cache_manager.force_evict_with_scores(
-                                    &mut kv_caches,
-                                    args.eviction_target_ratio(),
-                                    acc.importance_scores(),
-                                )?
-                            }
-                        } else {
-                            cache_manager
-                                .force_evict(&mut kv_caches, args.eviction_target_ratio())?
-                        }
-                    } else {
-                        cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio())?
-                    }
-                } else if let Some(acc) = score_accumulator.as_ref() {
-                    if acc.is_active() {
-                        cache_manager
-                            .maybe_evict_with_scores(&mut kv_caches, acc.importance_scores())?
-                    } else {
-                        cache_manager.maybe_evict(&mut kv_caches)?
-                    }
-                } else {
-                    cache_manager.maybe_evict(&mut kv_caches)?
-                };
-                if result.evicted {
-                    // Compute evicted indices from pre-eviction state
-                    let target_len = ((before_len as f32) * args.eviction_target_ratio()) as usize;
-                    let evicted_indices = if !pre_eviction_scores.is_empty() {
-                        llm_rs2::profile::compute_h2o_evicted_indices(
-                            before_len,
-                            target_len,
-                            actual_protected_prefix,
-                            args.h2o_keep_ratio(),
-                            &pre_eviction_scores,
-                        )
-                    } else {
-                        Vec::new()
-                    };
-
-                    if let Some(ref mut p) = profiler {
-                        // Record token deaths before the EvictionEvent
-                        if !evicted_indices.is_empty() {
-                            p.scores.record_token_deaths(
-                                decode_token_index,
-                                &evicted_indices,
-                                &position_birth_step,
-                                &pre_eviction_scores,
-                            );
-                        }
-                        p.on_eviction(llm_rs2::profile::EvictionEvent {
-                            step: decode_token_index,
-                            policy: args.eviction_policy().to_string(),
-                            before_len,
-                            after_len: result.new_pos,
-                            evicted_count: result.tokens_removed,
-                            partition: llm_rs2::profile::PartitionInfo {
-                                prefix_end: actual_protected_prefix,
-                                hh_count: 0,
-                                recent_start: result.new_pos,
-                            },
-                            evicted_indices: evicted_indices.clone(),
-                            pre_eviction_scores,
-                        });
-                    }
-
-                    // Update position_birth_step mapping after eviction (compact)
-                    if !position_birth_step.is_empty() {
-                        let evicted_set: std::collections::HashSet<usize> =
-                            evicted_indices.iter().copied().collect();
-                        let mut kept = Vec::new();
-                        for (pos, &birth) in position_birth_step.iter().enumerate() {
-                            if pos < before_len && !evicted_set.contains(&pos) {
-                                kept.push(birth);
-                            }
-                        }
-                        position_birth_step = kept;
-                    }
-
-                    if let Some(acc) = score_accumulator.as_mut() {
-                        acc.reset();
-                    }
-                    // Reset GPU score accumulator after eviction
-                    #[cfg(feature = "opencl")]
-                    if let Some(ocl_be) = backend
-                        .as_any()
-                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-                        && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
-                        && gpu_acc.is_active()
-                    {
-                        gpu_acc.reset(ocl_be.queue.as_core())?;
-                    }
-                }
-            }
+            llm_rs2::session::decode_fallback::eviction_trigger::run_auto_eviction(
+                llm_rs2::session::decode_fallback::eviction_trigger::AutoEvictionCtx {
+                    args: &args,
+                    cache_manager: &cache_manager,
+                    kv_caches: &mut kv_caches,
+                    auto_eviction,
+                    score_based_eviction,
+                    score_accumulator: &mut score_accumulator,
+                    d2o_layer_ratios: &d2o_layer_ratios,
+                    backend: &backend,
+                    profiler: &mut profiler,
+                    position_birth_step: &mut position_birth_step,
+                    actual_protected_prefix,
+                    decode_token_index,
+                },
+            )?;
             forward_ms_values.push(forward_ms);
             if std::env::var("LLMRS_PER_TOKEN_MS").is_ok() {
                 eprintln!(
