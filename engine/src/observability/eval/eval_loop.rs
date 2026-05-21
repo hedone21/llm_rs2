@@ -961,7 +961,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
 
 #[cfg(test)]
 mod tests {
-    use crate::eval::output::{EvalConfig, EvalQuestion};
+    use crate::observability::eval::output::{EvalConfig, EvalQuestion};
 
     fn make_config() -> EvalConfig {
         EvalConfig {
