@@ -53,29 +53,24 @@ LAYER_RULES = [
     # L3-inference: 추론 연산 도메인
     # Step 4-C: sampling/skip_config/speculative/attention_scores promoted to engine/src/inference/
     ("inference",               "L3-inference"),
-    ("core/chat_template",      "L3-inference"),
-    ("core/chat_ipc",           "L3-inference"),
     # Step 4-B: qcf promoted from core/qcf to engine/src/qcf (top-level L3-inference)
     ("qcf",                     "L3-inference"),  # QCF는 inference-side 메트릭
     ("layers",                  "L3-inference"),
     ("models",                  "L3-inference"),  # models/weights/* 포함
 
-    # cross-cutting: observability (events, rss_trace, profile, eval)
-    ("core/events",             "observability"),
-    ("core/rss_trace",          "observability"),
+    # L4: orchestration (Step 5-A: chat_template promoted from core/ to session/)
+    ("session",                 "L4"),
+
+    # cross-cutting: observability (Step 5-D/5-E: events/rss_trace promoted from core/ to observability/)
+    ("observability",           "observability"),
     ("profile",                 "observability"),
     ("eval",                    "observability"),
 
-    # cross-cutting: resilience (resilience/, core/sys_monitor, core/gpu_yield)
+    # cross-cutting: resilience (Step 5-B/5-C: sys_monitor/gpu_yield promoted from core/ to resilience/)
     ("resilience",              "resilience"),
-    ("core/sys_monitor",        "resilience"),
-    ("core/gpu_yield",          "resilience"),
 
     # L5: binary entrypoints
     ("bin",                     "L5"),
-
-    # L3 기타 core (정의, 추상화)
-    ("core",                    "L3-core"),
 
     # experiment
     ("experiment",              "L4"),
