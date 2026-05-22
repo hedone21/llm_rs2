@@ -221,7 +221,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 817,
+      "line": 815,
       "import": "crate::qcf::QcfConfig::default",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -230,7 +230,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 818,
+      "line": 816,
       "import": "crate::qcf::KiviFlushParams",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -239,7 +239,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 827,
+      "line": 825,
       "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -248,7 +248,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 895,
+      "line": 893,
       "import": "crate::qcf::QcfConfig::default",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -257,8 +257,17 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 896,
+      "line": 894,
       "import": "crate::qcf::KiviFlushParams",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-13",
+      "file": "pressure/kivi_cache.rs",
+      "line": 904,
+      "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
       "is_test_block": false
@@ -267,15 +276,6 @@
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
       "line": 906,
-      "import": "crate::qcf::compute_flush_nmse",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-13",
-      "file": "pressure/kivi_cache.rs",
-      "line": 908,
       "import": "crate::qcf::compute_flush_opr",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -284,7 +284,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 918,
+      "line": 916,
       "import": "crate::qcf::FlushAttentionParams",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -293,7 +293,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 933,
+      "line": 931,
       "import": "crate::qcf::compute_flush_awqe",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -302,7 +302,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 936,
+      "line": 934,
       "import": "crate::qcf::FlushAttentionParams",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -311,7 +311,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 951,
+      "line": 949,
       "import": "crate::qcf::compute_flush_aw_vopr",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -320,7 +320,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1557,
+      "line": 1555,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L1 (backend impl 직접 의존)",
@@ -330,7 +330,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1661,
+      "line": 1659,
       "import": "crate::qcf::QcfConfig::default",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -339,7 +339,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1662,
+      "line": 1660,
       "import": "crate::qcf::KiviFlushParams",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -348,7 +348,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1672,
+      "line": 1670,
       "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -357,7 +357,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1674,
+      "line": 1672,
       "import": "crate::qcf::compute_flush_opr",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -366,7 +366,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1684,
+      "line": 1682,
       "import": "crate::qcf::FlushAttentionParams",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -375,7 +375,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1699,
+      "line": 1697,
       "import": "crate::qcf::compute_flush_awqe",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -384,7 +384,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1702,
+      "line": 1700,
       "import": "crate::qcf::FlushAttentionParams",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -393,7 +393,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1717,
+      "line": 1715,
       "import": "crate::qcf::compute_flush_aw_vopr",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
@@ -402,7 +402,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 1841,
+      "line": 1839,
       "import": "crate::backend::opencl::",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L1 (backend impl 직접 의존)",
@@ -412,7 +412,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 2106,
+      "line": 2104,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L1 (backend impl 직접 의존)",
@@ -422,7 +422,7 @@
     {
       "id": "V-13",
       "file": "pressure/kivi_cache.rs",
-      "line": 2416,
+      "line": 2414,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L1 (backend impl 직접 의존)",
@@ -436,96 +436,6 @@
       "import": "crate::qcf::QcfMetric",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "inference/sampling.rs",
-      "line": 132,
-      "import": "crate::observability::profile::quality_metrics::Timer::start",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "inference/sampling.rs",
-      "line": 133,
-      "import": "crate::observability::profile::quality_metrics::NLL",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "pressure/kivi_cache.rs",
-      "line": 803,
-      "import": "crate::observability::profile::quality_metrics::Timer::start",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "pressure/kivi_cache.rs",
-      "line": 804,
-      "import": "crate::observability::profile::quality_metrics::QCF_KV_DRYRUN",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "qcf/layer_importance.rs",
-      "line": 83,
-      "import": "crate::observability::profile::quality_metrics::Timer::start",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "qcf/layer_importance.rs",
-      "line": 84,
-      "import": "crate::observability::profile::quality_metrics::QCF_LAYER_SKIP",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "qcf/layer_importance.rs",
-      "line": 109,
-      "import": "crate::observability::profile::quality_metrics::Timer::start",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "qcf/layer_importance.rs",
-      "line": 110,
-      "import": "crate::observability::profile::quality_metrics::QCF_LAYER_SKIP",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "qcf/qcf_kv.rs",
-      "line": 178,
-      "import": "crate::observability::profile::quality_metrics::Timer::start",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-14",
-      "file": "qcf/qcf_kv.rs",
-      "line": 179,
-      "import": "crate::observability::profile::quality_metrics::QCF_KV_UNIFIED",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
     },
     {
@@ -770,7 +680,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 249,
+      "line": 247,
       "import": "crate::backend::cpu::neon::fused_matmul_f16",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -780,7 +690,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 279,
+      "line": 277,
       "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -790,7 +700,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 460,
+      "line": 458,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -800,7 +710,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 549,
+      "line": 547,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -810,7 +720,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1301,
+      "line": 1299,
       "import": "crate::backend::cpu::neon::fused_matmul_f16",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -820,7 +730,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1322,
+      "line": 1320,
       "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -830,7 +740,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1451,
+      "line": 1449,
       "import": "crate::backend::cpu::neon::fused_matmul_f16",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -840,7 +750,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1476,
+      "line": 1474,
       "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -850,7 +760,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1711,
+      "line": 1709,
       "import": "crate::backend::cpu::neon::CpuBackendNeon::vec_dot_f16_f32",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -925,7 +835,7 @@
     {
       "id": "V-18",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 147,
+      "line": 145,
       "import": "crate::observability::profile::op_trace::record",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
@@ -1284,24 +1194,6 @@
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
       "is_test_block": false,
       "note": "downcast 패턴"
-    },
-    {
-      "id": "V-26",
-      "file": "models/weights/decider.rs",
-      "line": 257,
-      "import": "crate::observability::profile::quality_metrics::Timer::start",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-26",
-      "file": "models/weights/decider.rs",
-      "line": 258,
-      "import": "crate::observability::profile::quality_metrics::QCF_WEIGHT_SWAP",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
     },
     {
       "id": "V-28",
@@ -1711,7 +1603,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 2535,
+      "line": 2533,
       "import": "crate::pressure::eviction::StreamingLLMPolicy",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1720,7 +1612,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 2748,
+      "line": 2746,
       "import": "crate::backend::opencl::buffer_kind_label",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L1 (L4 session/ 우회)",
@@ -1729,7 +1621,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 3836,
+      "line": 3834,
       "import": "crate::models::weights::WeightSwapDecider",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
@@ -1738,7 +1630,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 3972,
+      "line": 3970,
       "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1747,7 +1639,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 4164,
+      "line": 4162,
       "import": "crate::inference::skip_config::SkipConfig",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-inference (L4 session/ 우회)",
@@ -1756,7 +1648,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 4572,
+      "line": 4570,
       "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1765,7 +1657,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 4573,
+      "line": 4571,
       "import": "crate::pressure::offload::OffloadKVCache",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -1774,7 +1666,7 @@
     {
       "id": "V-30",
       "file": "bin/generate.rs",
-      "line": 4574,
+      "line": 4572,
       "import": "crate::pressure::offload::raw_store::RawStore",
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
@@ -2066,7 +1958,7 @@
     {
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 373,
+      "line": 371,
       "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -2075,7 +1967,7 @@
     {
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1772,
+      "line": 1770,
       "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -2084,7 +1976,7 @@
     {
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1786,
+      "line": 1784,
       "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",

@@ -73,8 +73,9 @@ trybuild = "1.0"
 bindgen = { version = "0.71", optional = true }
 
 [features]
-default = ["opencl"]
+default = ["opencl", "profile"]
 opencl = ["ocl"]
+profile = []
 vulkan = ["ash"]                # Vulkan PoC (microbench bins only)
 qnn = ["libloading", "bindgen", "dep:qnn_oppkg"]  # QNN HTP PoC + M3 backend wire-up
 cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)

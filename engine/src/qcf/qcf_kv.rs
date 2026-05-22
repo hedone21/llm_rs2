@@ -175,9 +175,7 @@ pub struct QcfKvParams<'a> {
 ///
 /// Returns `(aggregated_qcf, per_head_qcf)`.
 pub fn compute_qcf_kv(params: &QcfKvParams) -> (f32, Vec<f32>) {
-    let _t = crate::observability::profile::quality_metrics::Timer::start(
-        &crate::observability::profile::quality_metrics::QCF_KV_UNIFIED,
-    );
+    let _t = crate::qcf_timer!(QCF_KV_UNIFIED);
     let n_kv_heads = params.n_kv_heads;
     let head_dim = params.head_dim;
     let current_pos = params.current_pos;

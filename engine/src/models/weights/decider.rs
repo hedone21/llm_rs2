@@ -254,9 +254,7 @@ pub fn compute_qcf_weight_swap(
     importance: Option<&ImportanceTable>,
     n_decoder_layers: usize,
 ) -> f32 {
-    let _t = crate::observability::profile::quality_metrics::Timer::start(
-        &crate::observability::profile::quality_metrics::QCF_WEIGHT_SWAP,
-    );
+    let _t = crate::qcf_timer!(QCF_WEIGHT_SWAP);
     compute_qcf_swap_internal(swap_set, n_decoder_layers, importance, Some(noise))
 }
 

@@ -1921,9 +1921,7 @@ fn main() -> anyhow::Result<()> {
 
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
-            let _decode_t = llm_rs2::observability::profile::quality_metrics::Timer::start(
-                &llm_rs2::observability::profile::quality_metrics::DECODE_TOTAL,
-            );
+            let _decode_t = llm_rs2::qcf_timer!(DECODE_TOTAL);
 
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
             if kv_caches[0].current_pos >= max_seq_len {
