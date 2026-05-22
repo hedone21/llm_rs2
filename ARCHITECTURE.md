@@ -1286,7 +1286,7 @@ session/
 | # | 파일 (위반 측) | Import 대상 | 위반 종류 | 해결 방향 |
 |---|--------------|------------|----------|----------|
 | **V-01** | `backend/opencl/mod.rs:16` | `crate::resilience::gpu_self_meter::OpenClEventGpuMeter` | L1→Cross-cutting concrete (역방향 → trait 경유 필요) | `OpenClEventGpuMeter`를 `Backend` trait 외부의 별도 trait(`GpuEventMeter`)로 추출, OpenCL backend가 register 인터페이스 노출 |
-| **V-02** | `backend/opencl/plan.rs:17,21` | `crate::layers::tensor_partition::*`, `crate::layers::workspace::PartitionWsCell` | L1→L3 (Inference 도메인 import) | tensor_partition을 L2(`shared/`)로 이동 (13.4 매핑 완료) + `PartitionWsCell`도 L2로 추출 (현재 layers/workspace 안에 있음) |
+| **V-02** | `backend/opencl/plan.rs:17,21` | `crate::layers::tensor_partition::*`, `crate::layers::workspace::PartitionWsCell` | L1→L3 (Inference 도메인 import) | tensor_partition을 L2(`shared/`)로 이동 (13.4 매핑 완료) + `PartitionWsCell`도 L2로 추출 (현재 layers/workspace 안에 있음). **§13.8-J dispatch orchestrator zone 적용 예정 (B-5a sprint)**: tensor_partition 정책 함수 호출은 `build_partition_plan` zone marker로 baseline 제외. `PartitionWsCell`/`PartitionWorkspace`는 §13.8-G shared identifier promotion으로 `inference/partition_workspace.rs` 이동 (`/* RESOLVED: B-5a, HEAD <TBD> */`). |
 | **V-03** | `backend/qnn_oppkg/graph_cache.rs:17`, `mod.rs:35`, `layer_graph.rs:41` | `crate::models::weights::LayerSlot`, `crate::layers::transformer_layer::TransformerLayer` | L1→L3 (Inference type 직접 의존) | LayerSlot/TransformerLayer를 trait-defined opaque handle로 추상화, backend는 trait만 import |
 | **V-04** | `backend/qnn_oppkg/mod.rs:134,140`, `backend/qnn_oppkg/hybrid_memory.rs:13`, `backend/qnn_oppkg/memory.rs:19` | `crate::backend::opencl::OpenCLBackend` | L1↔L1 cross-backend import | qnn_oppkg가 OpenCL primitive를 빌려쓰는 경로(`with_opencl()`) — L2에 공용 GPU buffer trait/utility 추출 검토 |
 | **V-05** | `backend/cuda_pc/mod.rs:597`, `backend/cuda_embedded/mod.rs:1249` | `crate::backend::cpu::CpuBackend` | L1↔L1 (cpu_fallback path) | 각 backend 안의 `cpu_fallback()`은 동일한 패턴 — L2에 `CpuFallback` 어댑터 trait 추출 |
@@ -1573,5 +1573,40 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - §I는 *cross-cutting → L4 격상*이므로 모듈 caller 인터페이스가 바뀐다. `bin/`/`session/` 의 use path 갱신 필수 (B-4-1 implementer 책임).
   - 향후 동일 패턴(observability/profile/* 등) 발견 시 본 정책 참조. 단 `observability/profile/*`은 forward hot path마다 호출되는 *관측 계층*이며 backend instantiate를 하지 않으므로 §I 대상 아님 — §H(instrument macro)가 적용 패턴이다.
   - 3건 이상 누적 시 §13.4에 *L4 promotion register* 표 신설 검토 (§F/§G allowlist 정책과 동일 운용 원리).
+
+**§J — Dispatch orchestrator zone 정책: RESOLVED (2026-05-22)**
+- **결정**: L1 backend 모듈의 *명시 zone marker* (`// LAYER-EXEMPT: dispatch_orchestrator`)가 표시된 함수 또는 코드 블록 내에서, L3 도메인(`layers/`, `inference/`)의 *정책 query 함수* 호출(no side effect, no instantiation, env flag/feature flag readback에 한정)은 INV-LAYER-001 위반 baseline에서 제외한다. zone 밖에서는 위반이 그대로 적용된다.
+- **판별 기준** (전 조건 충족 시 적용):
+  1. **Marker 위치**: `// LAYER-EXEMPT: dispatch_orchestrator` 주석이 함수 시그니처 *바로 위 줄*(`fn foo(...) -> ... {` 직전) 또는 임의 위치에서 `{`로 여는 블록 시작 *다음 줄*에 위치해야 한다.
+  2. **Zone 범위**: zone은 marker가 함수에 붙은 경우 *함수 본문 전체*, 블록에 붙은 경우 명시적 close marker(`// LAYER-EXEMPT-END`) 또는 블록 종료(`}`) 직전 줄까지.
+  3. **호출 형태 제약**: zone 안의 L3 의존은 *정책 query 함수 호출만* 허용 — struct/enum 인스턴스화나 trait method 호출 금지. struct/enum의 import는 §13.8-G shared identifier promotion 또는 trait inversion으로 별도 처리한다.
+  4. **부수효과 금지**: zone 안의 의존은 *읽기 전용*(read-only)이어야 한다 — env flag 캡쳐, feature flag 검사, partition policy snapshot 생성 등. side effect가 발생하는 호출은 zone 밖 책임이며 본 예외 밖이다.
+- **근거**: L1 backend가 `Plan`(= OpenCL batched command stream)을 build하는 *build-time* 작업은 L3의 *정책*을 한 번 query해야 한다. 예: `partition_*_enabled()`처럼 env flag/feature flag 상태를 읽어 PartitionPolicySnapshot을 build에 캡쳐하는 호출. 이는 forward hot path runtime이 아니라 build-time decision이며, 모든 정책 query에 trait dispatch를 도입(`Box<dyn PartitionPolicy>`)하면 source-level 추상화 비용·가독성 손실이 ROI 음(陰)이다. §13.8-F/G/H/I와 같은 pragmatism — *trait inversion 비용이 본질적 결합 해소 가치보다 큰 영역*은 명시 zone으로 처리한다.
+- **§13.8-G/H/I와의 관계**:
+  - **§G (shared identifier promotion)**: 양 도메인 공유 *식별자*(struct/enum)를 L2로 격상. 대상은 *data identifier*.
+  - **§H (instrument macro helper)**: L2 매크로 expansion 내부의 cross-cutting concrete 참조를 cfg gate로 zero-cost화. 대상은 *매크로 expansion*(per-op hot path).
+  - **§I (observability sub-module L4 promotion)**: cross-cutting sub-module 전체를 L4로 격상. 대상은 *진입점 성격 sub-module 폴더*.
+  - **§J (dispatch orchestrator zone)**: L1 backend의 *build-time L3 정책 query*를 명시 zone에서 허용. 대상은 *함수 또는 코드 블록 zone*.
+  - 4개 모두 *trait inversion의 비용이 더 크다고 spec이 판단한 영역*. 적용 단위(식별자 / 매크로 / 모듈 / zone)가 다르며 mutually exclusive하다.
+- **버린 옵션**:
+  - (a) **`PartitionPolicy` trait + dyn dispatch 도입**: build-time 정책 query가 본질이라 trait dispatch는 source overhead만 누적. 매번 trait object를 instantiate하거나 보관하는 비용은 zero-cost 추상화 원칙과 어긋난다.
+  - (b) **`shared/` 폴더 신설 후 `tensor_partition` 통째 격상**: `tensor_partition`은 backend-aware split_weight 함수를 보유한다(`cpu_backend: &Arc<dyn Backend>`). 격상 시 L2가 backend trait을 import하게 되어 의미상 정상이지만 별도 sprint scope(Step 3)가 필요. B-5 scope에서는 *부분 해소*가 자연 — struct(`PartitionWsCell`/`PartitionWorkspace`)는 §G로, 정책 함수 호출은 §J로.
+  - (c) **`Plan`을 backend-generic으로 재설계**: OpenCL batched command stream 의존이 본질적으로 backend-specific하므로 매우 큰 작업. 본 sprint scope 밖(B-3 sprint 영역).
+- **적용**:
+  - **`backend/opencl/plan.rs::build_partition_plan`** (B-5a sprint 적용): env flag query를 build 시점에 `PartitionPolicySnapshot`으로 캡쳐. zone marker는 `build_partition_plan` 함수 시그니처 위에 부착.
+  - 향후 후보: `backend/opencl/plan.rs::PartitionStep::execute` 내부의 `partition_poll_flag_enabled()` 등은 B-5a에서 모두 `self.policy` 참조(snapshot)로 갱신되어 zone 불필요.
+  - 향후 후보: `backend/opencl/plan.rs:1531,1537`의 `hybrid_attention` setup(C2 카테고리, B-5b sprint) — 동일 패턴 재적용 가능.
+- **layer_lint.py 처리**:
+  - zone parser는 B-5a-0b (implementer) 별도 구현. 본 spec은 *marker 형식 정의만* 한다.
+  - **Marker 형식**: `// LAYER-EXEMPT: dispatch_orchestrator` (정확히 이 텍스트, 대소문자 일치).
+  - **Marker 위치**: 함수 시그니처 바로 위 줄, 또는 임의 위치에서 `{`로 여는 블록 시작 다음 줄.
+  - **Zone close**: 함수에 부착된 경우 함수 종료(`}`)까지, 블록에 부착된 경우 `// LAYER-EXEMPT-END` 또는 블록 종료(`}`) 직전 줄까지.
+  - **검사 제외 대상**: zone 안의 `use crate::layers::*` / `use crate::inference::*` 같은 import, `crate::layers::xxx::yyy()` / `crate::inference::xxx::yyy()` 형태의 함수 호출이 INV-LAYER-001 위반 baseline에서 제외된다.
+  - **검사 적용 대상**: zone 안이라도 struct/enum 인스턴스화(`crate::layers::Foo::new(...)`, `crate::inference::Bar { ... }`), trait method 호출(`Backend::xxx`), RAII guard acquire 등은 본 예외 밖이다. baseline에 등재 유지.
+- **운용 메모**:
+  - 신규 marker 사용 시 PR description에 *해당 함수가 build-time only / runtime hot path 아님* 명시(review 시 confirm 필수).
+  - marker zone 안에서 instantiation 코드를 시도하면 INV-LAYER-001/003 위반이 여전히 발생 — zone은 *정책 query에 한정*. struct/enum 정의 위치 자체가 문제라면 §13.8-G shared identifier promotion으로, trait method 의존이 문제라면 trait inversion으로 처리한다.
+  - 5건 이상 누적 시 §13.4에 *dispatch orchestrator register* 표 신설 검토 (§F/G/I allowlist 정책과 동일 운용 원리).
+  - 본 §J는 §13.8-F(enum-as-data identifier 예외)와 다음과 같이 직교한다 — §F는 *cross-cutting → L3 enum import*를 baseline에 grandfathered로 허용하고, §J는 *L1 → L3 정책 query 호출*을 zone marker 한정으로 허용. 적용 방향과 범위가 다르므로 동시 적용 가능.
 
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.
