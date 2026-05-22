@@ -1298,15 +1298,15 @@ session/
 | **V-11** | `core/chat_template.rs:1` | `crate::models::config::ModelArch` | L3 state→L3 inference (도메인 cross) | `ModelArch` enum을 `shared/` 또는 `session/`(IPC 용)으로 이동 |
 | **V-12** | `core/events.rs:7` | `crate::core::pressure::{ActionResult, PressureLevel}` | Cross-cutting(observability) → L3 (Pressure concrete) | events.rs는 L3 변경 사항을 표현해야 하므로 의존 자체는 허용. 단 events가 L3 trait의 출력 채널이 되도록 EventSink trait을 통한 inversion 강화 |
 | **V-13** | `core/kivi_cache.rs:19,1568,1863,2128` | `crate::backend::cpu::CpuBackend`, `crate::backend::opencl::{OpenCLBackend, get_cl_mem}` | L3→L1 (state가 backend impl 직접 의존) | KiviCache 내부의 `Arc<dyn Backend>` 의존을 trait 기반으로 유지, downcast 경로는 backend 측에 위임하는 helper trait 추가 |
-| **V-14** | `core/kivi_cache.rs:803`, `core/sampling.rs:131`, `core/qcf/layer_importance.rs:75`, `core/qcf/unified_qcf.rs:178`, `models/weights/decider.rs:262` | `crate::profile::quality_metrics::Timer/QCF_*` | L3/L2 → Cross-cutting(observability) concrete | `Timer`는 사실상 macro-level instrumentation — `#[cfg(feature="profile")]` 게이트 + observability trait 경유 |
+| **V-14** | `core/kivi_cache.rs:803`, `core/sampling.rs:131`, `core/qcf/layer_importance.rs:75`, `core/qcf/unified_qcf.rs:178`, `models/weights/decider.rs:262` | `crate::profile::quality_metrics::Timer/QCF_*` | L3/L2 → Cross-cutting(observability) concrete | B-2b sprint에서 `qcf_timer!` 매크로 + cfg gate(`profile` feature)로 해소. §13.8-H instrument macro helper 정책 적용. 매크로는 `engine/src/instrument.rs`(L2)에 정의, 사용처는 매크로만 import. [§13.8-H] |
 | **V-15** | `core/cache_manager.rs:670`, `core/eviction/*` (테스트 블록) | `crate::buffer::shared_buffer::SharedBuffer`, `crate::backend::cpu::CpuBackend` | L3→L1/L2 (테스트 안만) | 테스트 코드는 backend instantiation이 불가피 — 테스트 전용 `tests/spec/` 외부 harness로 추출 검토 |
 | **V-16** | `eval/eval_loop.rs:11,153,177`, `eval/eviction_hook.rs:319,745,866` | `crate::backend::cpu::CpuBackend`, `crate::backend::opencl::buffer::snapshot_alloc_counters`, downcast `OpenCLBackend` | Cross-cutting(observability)→L1 (backend impl) | eval은 L4-equivalent 진입점 — L4에서만 backend instantiate 허용. 또는 `eval`을 L4 `session/eval/`로 격상 |
 | **V-17** | `layers/attention.rs:261` (test), `layers/workspace.rs:548` (test), `layers/transformer_layer/forward*.rs` 다수 | `crate::backend::cpu::neon::*`, `crate::backend::opencl::{OpenCLBackend, get_cl_mem}`, `crate::backend::cuda_embedded::CudaBackend` (downcast) | L3→L1 (Inference가 backend impl 직접 의존) | downcast 경로는 backend 측에서 capability trait 노출 (예: `as_opencl(&self) -> Option<&OpenCLOps>`). NEON 직접 호출은 backend method로 재흡수 (Backend trait에 적절한 method 추가) |
-| **V-18** | `layers/transformer_layer/mod.rs:12,21`, `layers/transformer_layer/forward.rs:17,65,78,1196,1303` | `crate::memory::galloc::Galloc`, `crate::profile::ops::{OpProfiler, PrefillOpProfiler}` | L3→Cross-cutting (Galloc 자체는 L2 Memory impl, OpProfiler는 observability) | Galloc은 `shared/memory_alloc.rs`로 이동(L2) 후 trait 기반으로. OpProfiler는 L3의 가시 의존을 트레이트(`OpInstrument`)로 추상화 |
+| **V-18** | `layers/transformer_layer/mod.rs:12,21`, `layers/transformer_layer/forward.rs:17,65,78,1196,1303` | `crate::memory::galloc::Galloc`, `crate::profile::ops::{OpProfiler, PrefillOpProfiler}` | L3→Cross-cutting (Galloc 자체는 L2 Memory impl, OpProfiler는 observability) | **OpProfiler/PrefillOpProfiler 부분**: B-2d sprint에서 `OpInstrument` trait + trait object로 해소 (정통 trait inversion, §13.8-H 무관 — struct 보유 vs hot-path RAII는 별도 패턴). **Galloc 부분**: 별도 backlog(B-2 scope 외). |
 | **V-19** | `layers/tensor_partition.rs:1,196,196` | `crate::buffer::slice_buffer::SliceBuffer`, `crate::buffer::cl_sub_buffer::ClSubBuffer` | L3→L2 + L1 | tensor_partition을 L2로 이동하면 V-19의 첫번째는 OK, 두번째(ClSubBuffer)는 backend-specific이므로 backend trait의 sub-buffer interface로 추상화 |
 | **V-20** | `models/transformer.rs:19,45,56,337,...,3556~3617` | `crate::backend::opencl::{plan::FullKernelPlan, OpenCLBackend, NoshuffleSoaEntry, get_cl_mem, plan::*}`, `crate::backend::cuda_embedded::CudaBackend`, `crate::auf::{reader::LmHeadPayload, section::*, tensor_index::*}` | L3→L1 다수 + L3→Cross-cutting | `TransformerModel`이 plan 구성과 backend downcast를 직접 수행 — L4(`session/`)에서 plan을 build해서 model에 주입하는 inversion 필요. AUF 의존은 §13.8-A(RESOLVED, `shared/auf/`) 이동 후 L3→L2 정상 의존이 됨 |
 | **V-21** | `models/transformer.rs:9` | `crate::core::offload::preload_pool::{self, PreloadPool}` | L3→L3 (Inference→Pressure State) | preload_pool은 Pressure State에 속함. TransformerModel이 직접 import할 게 아니라 L4에서 inject |
-| **V-22** | `models/transformer.rs:158,1447,1478,1489,1860,1871,1881,1911`, `core/qcf/layer_importance.rs:75-102`, `core/sampling.rs:131` | `crate::profile::ops::OpProfiler`, `crate::profile::op_trace::*`, `crate::profile::quality_metrics::Timer` | L3→Cross-cutting (profiling) | profile은 instrument 측면이므로 trait inversion. observability trait을 L2/L3에 두고 impl은 observability/ |
+| **V-22** | `models/transformer.rs:158,1447,1478,1489,1860,1871,1881,1911`, `core/qcf/layer_importance.rs:75-102`, `core/sampling.rs:131` | `crate::profile::ops::OpProfiler`, `crate::profile::op_trace::*`, `crate::profile::quality_metrics::Timer` | L3→Cross-cutting (profiling) | 3 패턴 혼합 해소. **`op_trace::*` 부분**: B-2c sprint `op_span!` 매크로 + `OpKind` enum L2 격상 (§13.8-G shared identifier promotion + §13.8-H instrument macro helper 적용). **`OpProfiler` 부분**: B-2d sprint `OpInstrument` trait inversion. **`Timer` 부분**: B-2b sprint `qcf_timer!` 매크로 (§13.8-H). [§13.8-G/H] |
 | **V-23** | `models/transformer.rs:644,3556,3586,3615`, `models/weights/secondary_mmap.rs:26,729,940,944,...`, `buffer/borrowed_mmap_buffer.rs:120,216`, `models/weights/rpcmem_secondary.rs:46+` | `crate::auf::{reader::*, section::*, header::*, tensor_index::*, AufError, AufView, AufMeta, BackendTag}` | L3→Cross-cutting / 또는 일반 가중치 포맷 | **AUF가 resilience 전용이 아닌 일반 모델 로딩에 쓰이고 있음** — §13.8-A에서 `shared/auf/`로 이동 결정(RESOLVED). 이동 후 L3→L2 정상 의존이 되어 V-23 해소 |
 | **V-24** | `core/pressure/weight_swap_handler.rs:21,22,23,136,175,192` | `crate::models::config::ModelConfig`, `crate::models::weights::{LayerSlot, SecondaryMmap, swap_executor::SwapExecutor}`, `crate::backend::cpu::CpuBackend`, `crate::memory::galloc::Galloc` | L3 Pressure↔Inference (현재 구조)에서 보면 cross-domain. **재정의(13.2) 후엔 동일 도메인 Pressure 내부 import**이지만 ModelConfig는 inference-side 의존이라 잔존 위반 | ModelConfig를 `shared/config.rs`로 이동 + LayerSlot/SecondaryMmap은 `pressure/state/`로 이동 |
 | **V-25** | `models/weights/swap_executor.rs:55,57,58,2139,2146,2410`, `models/weights/intra_forward_swap.rs:43`, `models/weights/phase_aware_swap.rs:33` | `crate::layers::transformer_layer::TransformerLayer`, `crate::models::loader::gguf::*`, `crate::models::transformer::TransformerModel`, `crate::backend::opencl::host_ptr_pool::HostPtrPool`, `crate::profile::op_trace::*` | L3 Pressure→L3 Inference + L3→L1 + L3→Cross-cutting | swap_executor는 layer/transformer로의 mutation을 trait(`SwapTarget`)으로 추상화 — `TransformerModel`이 trait을 impl, executor는 trait만 알면 됨 |
@@ -1353,6 +1353,9 @@ session/
 | **V-19** | `c2cb436f` (Step 3-D-b 부분) | `tensor_partition.rs`의 `SliceBuffer`/`ClSubBuffer` import path 갱신 (`memory/opencl/sub::ClSubBuffer`). 단 L3→L1 본질(tensor_partition을 L2로 옮기는 본 변경)은 보류 | 본질 잔존 (backlog) |
 | **V-27** | `56074264` (Step 3-B) | `Backend::bind_current_thread()` default no-op + CudaBackend override 추가. `LayerObjectPool::new`의 `CudaBackend` downcast 6줄 제거. 별도로 `WeightStagingPool` trait을 `engine/src/layers/staging_pool.rs`에 신설하여 `swap_executor`/`qcf_runtime`/`generate.rs`의 concrete `LayerObjectPool` 의존도 trait 의존으로 전환 | 없음 |
 | **V-10** | TBD (B-1 sprint) | `EvictMethod` → `pressure/eviction/method.rs` 신규 파일로 이동 (definitional owner = pressure 도메인). `resilience/executor.rs`의 신규 `use crate::pressure::eviction::EvictMethod;`는 §13.8-F enum-as-data identifier 예외로 처리 (resilience가 L3 pressure의 정책 식별자 enum을 `EvictPlan.method` 필드로 보유). baseline 296 → ~285 (-11, test_block 자동 path 갱신 포함) | resilience→pressure import 1건 신규 (§13.8-F 예외로 baseline 미등재) |
+| **V-14** | TBD (B-2b sprint) | `qcf_timer!` 매크로 + cfg gate(`#[cfg(feature = "profile")]`)로 13건의 `Timer`/`QCF_*` 직접 import 제거. 매크로는 `engine/src/instrument.rs`(L2)에 정의, 사용처는 매크로만 import. §13.8-H instrument macro helper 정책 적용. baseline -13 | 없음 |
+| **V-18** | TBD (B-2d sprint) | `OpInstrument` trait + trait object로 `OpProfiler`/`PrefillOpProfiler` 7건 해소. 정통 trait inversion (§13.8-H 무관 — hot-path 매크로 패턴과 별도). Galloc 부분은 별도 backlog(B-2 scope 외) | Galloc 부분 잔존 |
+| **V-22** | TBD (B-2b/c/d sprint) | 3 패턴 혼합 해소: `op_trace::*` 14건은 `op_span!` 매크로(§13.8-H) + `OpKind` L2 격상(§13.8-G), `OpProfiler` 부분은 `OpInstrument` trait, `Timer` 부분은 `qcf_timer!` 매크로(§13.8-H). baseline -27 (production 26 + test 1) | 없음 |
 
 **INV-LAYER-002 위반 추이**: 9 (Step 3-A 진입 시) → 6 (Step 3-D-b 후) → **1** (Step 3-E 후, V-07 `HostPtrPoolGuard` 잔존만).
 
@@ -1501,5 +1504,44 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - **영향**:
   - INV-LAYER-004 비고에 본 예외 명시 (spec/41-invariants.md).
   - layer_lint.py 처리: §F 예외는 자동 검출이 어렵고 패턴 빈도가 낮으므로 baseline JSON에 등재 유지(grandfathered). spec 코멘트와 §13.8-F 본 결정문에서 그라데이션 처리한다. 향후 패턴이 5건 이상 누적되면 layer_lint.py에 명시적 allowlist 도입 검토.
+
+**§G — Shared identifier promotion 패턴: RESOLVED (2026-05-22)**
+- **결정**: cross-cutting 도메인(`observability/`, `resilience/`) 또는 L3 도메인 외부에 정의된 enum/struct이 양쪽 도메인에서 *동등하게* 사용되어 definitional ownership을 단일 도메인에 귀속시키기 어려운 경우, 해당 type을 **L2(`shared/`)로 격상**하는 것을 허용한다.
+- **허용 조건** (3개 모두 만족):
+  1. **Type 종류**: 대상이 enum/struct 등 *data identifier*여야 한다 — trait, concrete 함수, RAII guard 등은 본 정책 밖이다.
+  2. **사용 분포**: 양쪽 도메인이 type을 *동등하게* 사용해야 한다 — 한쪽이 owner이고 다른 쪽이 consumer라면 §F(enum-as-data identifier 예외) 또는 trait inversion이 우선 적용된다.
+  3. **위치 정합성**: 이동 후 L2 위치가 자연스러워야 한다 — `tensor.rs`, `shape.rs`, `quant.rs`와 동급 패턴(도메인 어휘 공유 자산)이어야 한다.
+- **근거**: §F는 enum이 cross-cutting과 L3 사이를 *단방향 message data*로 흐를 때 적용된다(producer/labeler ↔ consumer/dispatcher). 그러나 enum/struct이 양 도메인에서 *대등한 어휘*로 쓰이면 단방향 message 패턴이 성립하지 않는다. 이 경우 한쪽 도메인을 임의로 owner로 지정하는 것은 자의적이며, 다른 쪽이 §F 예외를 매번 적용해야 하는 부담을 만든다. L2로 격상하면 도메인 어휘가 *공유 자산*으로 명시화되어 import 방향 자체가 사라진다.
+- **§F와의 관계**:
+  - **§F (enum-as-data identifier 예외)**: cross-cutting → L3 concrete enum import를 *예외로 허용*한다 (import 위반은 grandfathered, type 위치는 L3 유지). 단방향 message data 패턴 전제.
+  - **§G (shared identifier promotion)**: type을 *L2로 이동*하여 import 위반 자체를 *소거*한다 (위치 재배치). 양방향 공유 어휘 패턴 전제.
+  - 즉 §F는 위반을 *수용*하고, §G는 위반을 *제거*한다. §F는 owner를 단일 도메인에 명확히 둘 수 있을 때, §G는 그렇지 못할 때 적용한다.
+- **선례**: V-10의 `EvictMethod`는 §F로 처리됨 — `pressure/eviction/method.rs`에 definitional owner를 두고 resilience는 §F 예외로 import. 즉 EvictMethod는 pressure 도메인 어휘가 명확하므로 §G 대상이 아니다.
+- **적용 예**: B-2a sprint **`OpKind` enum** — 현재 `observability/profile/op_trace.rs:113`에 정의되어 있으나, L3 inference(`models/transformer.rs`, `layers/transformer_layer/forward.rs` 등)가 `OpKind::Embedding`, `OpKind::RmsNorm` 등을 직접 인자로 전달하며 적극 사용한다. observability(producer, op_trace recorder) 측과 L3(consumer, op 식별 인자) 측이 어휘를 *대등하게* 보유하므로, 어느 한쪽에 owner를 두는 게 자연스럽지 않다. → L2(`engine/src/ops.rs` 또는 `engine/src/op_kind.rs`)로 격상하여 `tensor.rs`/`shape.rs`/`quant.rs`와 동급 도메인 어휘 자산으로 정착시킨다.
+- **버린 옵션**: (a) OpKind를 observability owner로 두고 L3 import는 §F 예외로 처리 — L3가 정의자가 아닌 곳의 어휘를 매 forward op마다 import하게 되어 §F의 *단방향 message data* 전제와 어긋난다. (b) OpKind를 L3 inference로 owner 이전 — observability/profile의 op recorder가 L3 enum을 import하게 되어 INV-LAYER-004 trait inversion 원칙을 우회한다.
+- **영향**:
+  - B-2a sprint에서 OpKind enum을 L2로 이동 (Pattern B 해소의 핵심).
+  - §13.4 directory migration map에 "shared identifier promotion" 항목 추가 (TBD, B-2 완료 후).
+  - 향후 유사 패턴(예: `OpKind`와 같이 양 도메인 공유 어휘) 식별 시 본 정책 참조.
+  - 5건 이상 누적 시 §13.4에 *promotion register* 표 신설 검토 (§F allowlist 정책과 동일 운용 원리).
+
+**§H — Instrument macro helper 정책: RESOLVED (2026-05-22)**
+- **결정**: L2에 정의된 매크로가 expansion 내부에서 cross-cutting concrete(`observability/profile/*` 등)를 참조하는 패턴은 일정 조건을 만족하면 INV-LAYER-003/004를 위반하지 않는 것으로 본다. 매크로는 *기계적 코드 생성 도구*이며 source-level import 그래프와는 별도 차원에서 동작한다.
+- **허용 조건** (3개 모두 만족):
+  1. **위치**: 매크로 정의가 L2(`engine/src/instrument.rs` 또는 그에 준하는 L2 위치)에 있어야 한다. 사용처는 **매크로만** import하며 cross-cutting concrete 직접 import는 금지.
+  2. **Zero-cost 게이트**: cfg gate(`#[cfg(feature = "profile")]`)로 production 빌드 시 매크로 expansion이 *완전히 제거*되어야 한다 — fallback path가 빈 statement(`;`) 또는 식별 함수(no-op) 호출이어야 한다.
+  3. **본문 제약**: 매크로 본문은 zero-cost 추상화만 포함해야 한다 — heap allocation, vtable dispatch, Arc clone, 동적 lookup 등 런타임 비용 발생 코드 금지. RAII guard 또는 free function 호출만 허용.
+- **근거**: cross-cutting `observability/profile/*`은 본질적으로 *instrumentation*(insertion하는 측면 관심사) 역할이다. RAII guard나 timer는 trait object로 추상화하면 vtable dispatch 비용이 forward path hot loop마다 누적된다(per-op overhead). 매크로는 source-level 결합도를 *분리*하면서 컴파일러 inlining으로 zero-cost를 유지한다. INV-LAYER-003/004의 본질은 *L3 코드가 cross-cutting 구현체에 컴파일 단위로 결합되어 swap 불가능*한 상태를 막는 것이므로, 매크로 expansion을 통해 호출이 *코드 변경 없이* cfg gate로 통째 사라질 수 있다면 본질적 결합이 없다.
+- **layer_lint.py 처리**:
+  - 매크로 expansion은 분석 대상 외이다 (layer_lint는 *source token*만 검사하며 `macro_rules!` 본문 또는 procedural macro 출력은 검사하지 않는다).
+  - 사용처가 매크로만 import하면 layer_lint에는 위반으로 잡히지 않는다.
+  - 정신적 위반(expanded code가 cross-cutting concrete를 호출)은 본 §H 정책으로 명시적 허용한다 — baseline 등재 불요.
+- **적용 예**:
+  - B-2b sprint **`qcf_timer!(NLL)` 매크로**: `Timer` RAII guard + `QCF_NLL_*` counter 호출을 매크로로 감싸 13건의 cross-cutting concrete import(V-14)를 제거. `engine/src/instrument.rs`에 정의, `profile` feature OFF일 때 expansion이 빈 블록.
+  - B-2c sprint **`op_span!(Embedding, ...)` 매크로**: `op_trace::record_op_*` 함수 14건의 직접 호출(V-22 일부)을 매크로로 감싸 제거. OpKind는 §G로 L2 격상 후 매크로 인자로 전달.
+- **버린 옵션**: (a) cross-cutting concrete에 의존하는 부분을 trait object로 추상화 — per-op vtable dispatch가 forward hot loop마다 발생, profile feature OFF일 때도 trait object 보유 자체가 register 점유. zero-cost 게이트 불가. (b) 호출처마다 `#[cfg(feature = "profile")]`로 직접 감싸기 — 호출처가 47건이므로 코드 중복이 폭발적이며 매크로 1줄 ≈ cfg-gated 5줄 패턴이 모든 op마다 산재하게 됨.
+- **운용 메모**:
+  - 매크로 helper도 무한 확장 금지 — 5건 누적 시 layer_lint에 명시적 allowlist 도입을 검토한다 (§F와 동일 정책).
+  - **trait inversion이 가능한 경우 우선 적용** — 본 §H는 instrument에 한정된 예외이며 일반적 cross-cutting → L3 의존 해소 패턴이 아니다. observability 일반은 `EventSink` 등 trait inversion이 표준.
 
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.
