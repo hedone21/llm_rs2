@@ -155,7 +155,7 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
     /// Optional per-op profiler.
-    pub profiler: Option<&'a mut crate::observability::profile::ops::OpProfiler>,
+    pub profiler: Option<&'a mut dyn crate::instrument::OpInstrument>,
     /// Optional SWIFT skip configuration for layer skipping.
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Optional importance collector for Layer Skip QCF.
@@ -1470,7 +1470,12 @@ impl TransformerModel {
         let logits_out = args.logits_out;
         let x_gen = args.x_gen;
         let mut workspace = args.workspace;
-        let mut profiler = args.profiler;
+        // Safety: single-threaded forward pass; pointer is valid for the lifetime of this call.
+        // Use a raw pointer to break the 'a lifetime tie that would otherwise prevent reborrowing
+        // alongside other args fields (x, kv_caches) from the same struct.
+        let profiler_ptr: Option<*mut dyn crate::instrument::OpInstrument> = args
+            .profiler
+            .map(|p| p as *mut dyn crate::instrument::OpInstrument);
 
         let mut score_accumulator = args.score_accumulator;
         let skip_config = args.skip_config;
@@ -1728,7 +1733,7 @@ impl TransformerModel {
                         Some(pws),
                         i,
                         variance_collector.as_deref_mut(),
-                        profiler.as_deref_mut().map(|p| &mut p.prefill),
+                        profiler_ptr.map(|p| unsafe { &mut *p }),
                     )?;
                 } else {
                     layer.forward(LayerForwardArgs {
@@ -1742,7 +1747,7 @@ impl TransformerModel {
                         workspace: None,
                         need_scores,
                         head_dim: self.config.head_dim,
-                        profiler: profiler.as_deref_mut(),
+                        profiler: profiler_ptr.map(|p| unsafe { &mut *p }),
                         layer_id: i,
                         skip_attn: s_attn,
                         skip_mlp: s_mlp,
@@ -1821,7 +1826,7 @@ impl TransformerModel {
                         workspace: workspace.as_deref_mut(),
                         need_scores,
                         head_dim: self.config.head_dim,
-                        profiler: profiler.as_deref_mut(),
+                        profiler: profiler_ptr.map(|p| unsafe { &mut *p }),
                         layer_id: i,
                         skip_attn: s_attn,
                         skip_mlp: s_mlp,

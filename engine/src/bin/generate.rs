@@ -4,6 +4,7 @@ use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::inference::sampling::{self, SamplingConfig};
+use llm_rs2::instrument::OpInstrument;
 use llm_rs2::layers::workspace::{
     LayerWorkspace, PartitionWorkspace, PartitionWsCell, WorkspaceConfig,
 };
@@ -2050,7 +2051,9 @@ fn main() -> anyhow::Result<()> {
                     x_gen: Some(&mut x_gen),
                     workspace: Some(&mut gen_ws),
                     score_accumulator: score_accumulator.as_mut(),
-                    profiler: profiler.as_mut().map(|p| &mut p.ops),
+                    profiler: profiler
+                        .as_mut()
+                        .map(|p| &mut p.ops as &mut dyn llm_rs2::instrument::OpInstrument),
                     skip_config: skip_config.as_ref(),
                     importance_collector: None,
                     logits_last_only: false,
@@ -2121,8 +2124,8 @@ fn main() -> anyhow::Result<()> {
                 if args.profile_events {
                     let accum = ocl_be.take_profile_accum();
                     if let Some(ref mut p) = profiler {
-                        p.ops.merge_from_events(&accum);
-                        p.ops.count += 1;
+                        p.ops.merge_events(&accum);
+                        p.ops.note_token();
                     }
                 }
             }

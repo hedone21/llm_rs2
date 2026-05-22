@@ -19,6 +19,8 @@ use crate::memory::host::shared::SharedBuffer;
 
 // Re-export OpProfiler from its canonical location for backward compatibility.
 pub use crate::observability::profile::ops::OpProfiler;
+// Re-export OpInstrument for callers that build trait object references.
+pub use crate::instrument::OpInstrument;
 
 /// Update KV cache with K/V tensors, handling GPU→CPU readback when needed.
 ///
@@ -300,7 +302,7 @@ impl TransformerLayer {
             None, // prefill_ws: passed separately via forward_into dispatch
             0,    // layer_idx: unknown in this path (no variance collector)
             None, // variance_collector: not available here
-            args.profiler.map(|p| &mut p.prefill),
+            args.profiler,
         )
     }
 
@@ -330,7 +332,7 @@ pub struct ForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     pub need_scores: bool,
     pub head_dim: usize,
     /// Optional per-op profiler for timing breakdown.
-    pub profiler: Option<&'a mut OpProfiler>,
+    pub profiler: Option<&'a mut dyn OpInstrument>,
     /// SWIFT: skip attention sub-layer (identity pass).
     pub skip_attn: bool,
     /// SWIFT: skip MLP/FFN sub-layer (identity pass).
@@ -365,7 +367,7 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub need_scores: bool,
     pub head_dim: usize,
     /// Optional per-op profiler for timing breakdown.
-    pub profiler: Option<&'a mut OpProfiler>,
+    pub profiler: Option<&'a mut dyn OpInstrument>,
     /// Layer index (0-based). Used for SWIFT layer skip.
     pub layer_id: usize,
     /// If true, skip the attention sub-layer (identity pass).
@@ -387,8 +389,8 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub is_last_layer: bool,
 }
 
-// OpProfiler has been moved to crate::observability::profile::ops.
-// Re-exported via `pub use crate::observability::profile::ops::OpProfiler;` at the top of this file.
+// OpProfiler/OpInstrument: OpProfiler is re-exported for backward compat (constructor callers).
+// OpInstrument is the trait object type used in LayerForwardArgs/LayerGenForwardArgs.profiler.
 
 // ═══════════════════════════════════════════════════════════════════
 // Phase 1: Verify attention scores are post-softmax probabilities

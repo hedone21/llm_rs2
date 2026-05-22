@@ -115,7 +115,7 @@ impl TransformerLayer {
             };
         }
         macro_rules! prof_record {
-            ($t:expr, $field:ident) => {
+            ($t:expr, $op_name:literal) => {
                 if let Some(ref mut p) = profiler
                     && !event_profiling
                 {
@@ -123,7 +123,7 @@ impl TransformerLayer {
                     if is_gpu {
                         backend.synchronize().ok();
                     }
-                    p.$field += $t.elapsed().as_micros() as u64;
+                    p.record_op_us($op_name, $t.elapsed().as_micros() as u64);
                 }
             };
         }
@@ -193,7 +193,7 @@ impl TransformerLayer {
                 rms_norm_add_unit,
             )?;
         }
-        prof_record!(t, rms_norm);
+        prof_record!(t, "rms_norm");
 
         // Stage 1: post attention-norm (ws.residual = norm(x))
         crate::op_record!(tr, RmsNormAttn, backend, is_gpu);
@@ -297,7 +297,7 @@ impl TransformerLayer {
                 backend.flush()?;
             }
         }
-        prof_record!(t, matmul_qkv);
+        prof_record!(t, "matmul_qkv");
         // Stage 2/3/4: QKV matmul outputs (pre-bias, pre-RoPE)
         crate::op_record!(tr, MatmulQkv, backend, is_gpu);
 
@@ -347,7 +347,7 @@ impl TransformerLayer {
 
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
-        prof_record!(t, rope);
+        prof_record!(t, "rope");
         // Stage 5/6: post-RoPE Q and K (in-place on ws.q / ws.k)
         crate::op_record!(tr, Rope, backend, is_gpu);
 
@@ -411,7 +411,7 @@ impl TransformerLayer {
         } else {
             super::update_kv_cache(kv_cache, &k_rope, &ws.v, backend)?;
         }
-        prof_record!(t, kv_update);
+        prof_record!(t, "kv_update");
         crate::op_record!(tr, KvUpdate, backend, is_gpu);
 
         // 5. Attention - use GPU kernel for OpenCL
@@ -1105,7 +1105,7 @@ impl TransformerLayer {
         }
 
         // 6. Output Projection
-        prof_record!(t, attention);
+        prof_record!(t, "attention");
         // Stage 9: attention output (pre O-proj)
         crate::op_record!(tr, Attention, backend, is_gpu);
 
@@ -1115,7 +1115,7 @@ impl TransformerLayer {
         set_label("matmul_wo");
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
         clear_label();
-        prof_record!(t, matmul_wo);
+        prof_record!(t, "matmul_wo");
         // Stage 10: O proj output (pre residual+norm)
         crate::op_record!(tr, MatmulWo, backend, is_gpu);
 
@@ -1152,7 +1152,7 @@ impl TransformerLayer {
                 false,
             )?;
         }
-        prof_record!(t, rms_norm);
+        prof_record!(t, "rms_norm");
         // Stage 11: post FFN-norm (ws.residual = norm(x + attn_out))
         crate::op_record!(tr, RmsNormFfn, backend, is_gpu);
 
@@ -1505,7 +1505,7 @@ impl TransformerLayer {
                 backend.flush()?;
             }
         }
-        prof_record!(t, matmul_ffn);
+        prof_record!(t, "matmul_ffn");
         crate::op_record!(tr, MatmulFfnGateUp, backend, is_gpu);
 
         // silu_mul (GELU path) + down matmul: skipped when partition is active
@@ -1518,7 +1518,7 @@ impl TransformerLayer {
                 let t = prof_start!();
                 let tr = crate::op_start_kind!(SiluMul);
                 backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
-                prof_record!(t, silu_mul);
+                prof_record!(t, "silu_mul");
                 // Stage 14 (GELU path): gelu_tanh(gate) * up landed in ws.gate
                 crate::op_record!(tr, SiluMul, backend, is_gpu);
             }
@@ -1528,7 +1528,7 @@ impl TransformerLayer {
             set_label("matmul_ffn");
             backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
             clear_label();
-            prof_record!(t, matmul_ffn);
+            prof_record!(t, "matmul_ffn");
             // Stage 15: down matmul output (pre residual add)
             crate::op_record!(tr, MatmulFfnDown, backend, is_gpu);
         }
@@ -1551,14 +1551,14 @@ impl TransformerLayer {
         if !skip_final_add {
             backend.add_assign(x, &ws.down)?;
         }
-        prof_record!(t, add_assign);
+        prof_record!(t, "add_assign");
         // Stage 16: final layer output (x = x + down). Note: when skip_final_add
         // is set (partition_fused on non-last layer), the add is deferred to
         // next layer's fused_norm_merge — Stage 16 captures the deferred state.
         crate::op_record!(tr, AddAssign, backend, is_gpu);
 
         if let Some(ref mut p) = profiler {
-            p.count += 1;
+            p.note_token();
         }
 
         Ok(())

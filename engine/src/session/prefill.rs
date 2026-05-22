@@ -343,7 +343,9 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
                 x_gen: None,
                 workspace: None,
                 score_accumulator: None, // No score tracking during prefill
-                profiler: profiler.as_mut().map(|p| &mut p.ops),
+                profiler: profiler
+                    .as_mut()
+                    .map(|p| &mut p.ops as &mut dyn crate::instrument::OpInstrument),
                 skip_config: None,
                 importance_collector: if inject_collector {
                     on_demand_collector.as_mut()
