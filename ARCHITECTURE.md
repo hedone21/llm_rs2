@@ -1274,7 +1274,7 @@ session/
 | `buffer/rpcmem_alias_buffer.rs` | `backend/qnn_oppkg/buffer/rpcmem_alias_buffer.rs` | V-08 해소 [§13.8-D] |
 | `memory/galloc.rs` | `shared/memory_alloc.rs` (Galloc) | L2 Memory impl |
 | `profile/` | `observability/profile/` | |
-| `eval/` | `observability/eval/` | 단 L3 의존이 많아 `session/eval/`로 격상 검토 (V-28/V-29) |
+| `eval/` | **`session/eval/`** | V-16/V-28/V-29 해소. L3 의존 다수 + backend instantiate 본질 → L4 격상. [§13.8-I] |
 | `experiment.rs` | `observability/experiment.rs` | |
 | `resilience/` | `resilience/` (그대로) | |
 | `auf/` | **`shared/auf/`** | V-23 해소. AUF는 GGUF/Safetensors 동급 가중치 포맷이므로 L2 자산 [§13.8-A] |
@@ -1300,7 +1300,7 @@ session/
 | **V-13** | `core/kivi_cache.rs:19,1568,1863,2128` | `crate::backend::cpu::CpuBackend`, `crate::backend::opencl::{OpenCLBackend, get_cl_mem}` | L3→L1 (state가 backend impl 직접 의존) | KiviCache 내부의 `Arc<dyn Backend>` 의존을 trait 기반으로 유지, downcast 경로는 backend 측에 위임하는 helper trait 추가 |
 | **V-14** | `core/kivi_cache.rs:803`, `core/sampling.rs:131`, `core/qcf/layer_importance.rs:75`, `core/qcf/unified_qcf.rs:178`, `models/weights/decider.rs:262` | `crate::profile::quality_metrics::Timer/QCF_*` | L3/L2 → Cross-cutting(observability) concrete | B-2b sprint에서 `qcf_timer!` 매크로 + cfg gate(`profile` feature)로 해소. §13.8-H instrument macro helper 정책 적용. 매크로는 `engine/src/instrument.rs`(L2)에 정의, 사용처는 매크로만 import. [§13.8-H] |
 | **V-15** | `core/cache_manager.rs:670`, `core/eviction/*` (테스트 블록) | `crate::buffer::shared_buffer::SharedBuffer`, `crate::backend::cpu::CpuBackend` | L3→L1/L2 (테스트 안만) | 테스트 코드는 backend instantiation이 불가피 — 테스트 전용 `tests/spec/` 외부 harness로 추출 검토 |
-| **V-16** | `eval/eval_loop.rs:11,153,177`, `eval/eviction_hook.rs:319,745,866` | `crate::backend::cpu::CpuBackend`, `crate::backend::opencl::buffer::snapshot_alloc_counters`, downcast `OpenCLBackend` | Cross-cutting(observability)→L1 (backend impl) | eval은 L4-equivalent 진입점 — L4에서만 backend instantiate 허용. 또는 `eval`을 L4 `session/eval/`로 격상 |
+| **V-16** | `eval/eval_loop.rs:11,153,177`, `eval/eviction_hook.rs:319,745,866` | `crate::backend::cpu::CpuBackend`, `crate::backend::opencl::buffer::snapshot_alloc_counters`, downcast `OpenCLBackend` | Cross-cutting(observability)→L1 (backend impl) | eval은 L4-equivalent 진입점 — L4에서만 backend instantiate 허용. 또는 `eval`을 L4 `session/eval/`로 격상. **RESOLVED (B-4, HEAD `<TBD>`)** |
 | **V-17** | `layers/attention.rs:261` (test), `layers/workspace.rs:548` (test), `layers/transformer_layer/forward*.rs` 다수 | `crate::backend::cpu::neon::*`, `crate::backend::opencl::{OpenCLBackend, get_cl_mem}`, `crate::backend::cuda_embedded::CudaBackend` (downcast) | L3→L1 (Inference가 backend impl 직접 의존) | downcast 경로는 backend 측에서 capability trait 노출 (예: `as_opencl(&self) -> Option<&OpenCLOps>`). NEON 직접 호출은 backend method로 재흡수 (Backend trait에 적절한 method 추가) |
 | **V-18** | `layers/transformer_layer/mod.rs:12,21`, `layers/transformer_layer/forward.rs:17,65,78,1196,1303` | `crate::memory::galloc::Galloc`, `crate::profile::ops::{OpProfiler, PrefillOpProfiler}` | L3→Cross-cutting (Galloc 자체는 L2 Memory impl, OpProfiler는 observability) | **OpProfiler/PrefillOpProfiler 부분**: B-2d sprint에서 `OpInstrument` trait + trait object로 해소 (정통 trait inversion, §13.8-H 무관 — struct 보유 vs hot-path RAII는 별도 패턴). **Galloc 부분**: 별도 backlog(B-2 scope 외). |
 | **V-19** | `layers/tensor_partition.rs:1,196,196` | `crate::buffer::slice_buffer::SliceBuffer`, `crate::buffer::cl_sub_buffer::ClSubBuffer` | L3→L2 + L1 | tensor_partition을 L2로 이동하면 V-19의 첫번째는 OK, 두번째(ClSubBuffer)는 backend-specific이므로 backend trait의 sub-buffer interface로 추상화 |
@@ -1312,8 +1312,8 @@ session/
 | **V-25** | `models/weights/swap_executor.rs:55,57,58,2139,2146,2410`, `models/weights/intra_forward_swap.rs:43`, `models/weights/phase_aware_swap.rs:33` | `crate::layers::transformer_layer::TransformerLayer`, `crate::models::loader::gguf::*`, `crate::models::transformer::TransformerModel`, `crate::backend::opencl::host_ptr_pool::HostPtrPool`, `crate::profile::op_trace::*` | L3 Pressure→L3 Inference + L3→L1 + L3→Cross-cutting | swap_executor는 layer/transformer로의 mutation을 trait(`SwapTarget`)으로 추상화 — `TransformerModel`이 trait을 impl, executor는 trait만 알면 됨 |
 | **V-26** | `models/weights/decider.rs:20` | `crate::core::qcf::layer_importance::{ImportanceTable, SubLayer}` | L3 Pressure→L2 (QCF) | qcf가 shared/로 이동하면 L2 의존이라 위반 없음. 현 구조에서는 도메인 cross 아님 |
 | **V-27** | `models/weights/layer_object_pool.rs:32,37,124` | `crate::buffer::cuda_buffer::*`, `crate::layers::transformer_layer::TransformerLayer`, downcast `crate::backend::cuda_embedded::CudaBackend` | L3 Pressure→L1 + L3 Pressure→L3 Inference | weight pool은 backend-aware concrete이므로 backend별로 분기된 hook 구조로 재설계 |
-| **V-28** | `eval/qcf_helpers.rs:9`, `eval/eval_loop.rs:23`, `eval/eviction_hook.rs:9,10,11` | `crate::models::weights::QuantNoiseTable`, `crate::models::transformer::{TransformerModel,...}`, `crate::core::cache_manager::CacheManager`, `crate::core::kv_cache::{KVCache, max_cache_pos}`, `crate::core::qcf::*` | Cross-cutting(observability)→L3 (다수) | eval은 L3에 의존할 수밖에 없는 진단/평가 코드 — L4 `session/eval/`로 격상 후 L3 trait만 의존 |
-| **V-29** | `eval/eviction_hook.rs:319` | downcast `crate::backend::opencl::OpenCLBackend` | Cross-cutting→L1 (직접 downcast) | V-16과 동일 |
+| **V-28** | `eval/qcf_helpers.rs:9`, `eval/eval_loop.rs:23`, `eval/eviction_hook.rs:9,10,11` | `crate::models::weights::QuantNoiseTable`, `crate::models::transformer::{TransformerModel,...}`, `crate::core::cache_manager::CacheManager`, `crate::core::kv_cache::{KVCache, max_cache_pos}`, `crate::core::qcf::*` | Cross-cutting(observability)→L3 (다수) | eval은 L3에 의존할 수밖에 없는 진단/평가 코드 — L4 `session/eval/`로 격상 후 L3 trait만 의존. **RESOLVED (B-4, HEAD `<TBD>`)** |
+| **V-29** | `eval/eviction_hook.rs:319` | downcast `crate::backend::opencl::OpenCLBackend` | Cross-cutting→L1 (직접 downcast) | V-16과 동일. **RESOLVED (B-4, HEAD `<TBD>`)** |
 | **V-30** | `bin/generate.rs` 전반 (29건의 `use llm_rs2::*`) | 거의 모든 lib 모듈 직접 import | L5→모든 레이어 직접 의존 (monolith) | L5/L4 분리 (Migration Step 2). bin은 `session/` 외 import 최소화 |
 | **V-31** | `models/transformer.rs:9` (재기재), `core/cache_manager.rs:9 (pressure)` | (이미 V-21, V-10 등에 포함) | — | — |
 
@@ -1324,6 +1324,7 @@ session/
 - L2→L3 (shared가 pressure/inference 의존): V-09 (buffer→pressure state SecondaryMmap) — 1건
 - L3→L1 (domain이 backend impl 직접 의존): V-13, V-17 일부, V-19, V-20, V-25, V-27 — 6건 (가장 큰 카테고리, downcast 위주)
 - L3→Cross-cutting concrete: V-10, V-14, V-18, V-22, V-23, V-25 일부 — 6건
+- Cross-cutting(observability)→L1/L3 (eval): V-16, V-28, V-29 — 3건 (baseline JSON 34건, B-4 sprint §13.8-I로 일괄 RESOLVED, session/eval L4 격상)
 - L3↔L3 (Pressure↔Inference cross): V-11, V-21, V-24, V-25 일부 — 4건
 - L5 monolith: V-30 — 1건 (전체 도메인 직접 의존)
 - 기타: V-12 (events→pressure: 의도된 의존), V-26 (qcf 위치 결정 의존), V-29 (V-16과 동일)
@@ -1333,7 +1334,7 @@ session/
 - 합의 2 "L2→L3 역의존": V-09 (buffer→SecondaryMmap). 추가: V-23 (buffer/auf→models)
 - 합의 3 "Cache→Inference 역의존 (재정의 후 OK)": V-24 (weight_swap_handler→models), V-21 (transformer→preload_pool), V-11 (chat_template→ModelArch)
 - 합의 4 "L3→cross-cutting 직접": V-10, V-14, V-18, V-22 다수
-- 합의 5 "L5 monolith": V-30. 추가: V-28 (eval이 L3 다수 import)
+- 합의 5 "L5 monolith": V-30. 추가: V-28 (eval이 L3 다수 import) — **V-28 RESOLVED (B-4, §13.8-I)**
 
 **신규 발견 핵심 violations** (5종 외):
 - V-04 (qnn_oppkg→opencl cross-backend), V-05 (cpu_fallback 백엔드끼리 의존) — 동일 layer 내 cross 패턴
@@ -1356,6 +1357,11 @@ session/
 | **V-14** | `b1a47e5b` (B-2b sprint) | `qcf_timer!` 매크로 + cfg gate(`#[cfg(feature = "profile")]`)로 12건의 `Timer`/`QCF_*` 직접 import 제거. 매크로는 `engine/src/instrument.rs`(L2)에 정의, 사용처는 매크로만 import. §13.8-H instrument macro helper 정책 적용. baseline 282→270 (-12) | 없음 |
 | **V-18** | `981f7aac` + `2324d695` (B-2d sprint) | `OpInstrument` trait + trait object로 `OpProfiler`/`PrefillOpProfiler` 6건 해소. 정통 trait inversion (§13.8-H 무관 — hot-path 매크로 패턴과 별도). Galloc 부분 + forward.rs:1304 test block(§13.8-E grandfathered) 잔존. baseline 261→255 (-6) | Galloc 부분 + test_block 1건 잔존 |
 | **V-22** | `98fe13f6` + `16ad5473` + `981f7aac` + `2324d695` (B-2a/c/d sprint) | 3 패턴 혼합 해소: `op_trace::*` 9건은 `op_span!` 매크로(§13.8-H) + `OpKind` L2 격상(§13.8-G), `OpProfiler` 부분은 `OpInstrument` trait, `Timer` 부분은 `qcf_timer!` 매크로(§13.8-H). DdrPhase/PhaseHook trait import는 별도 backlog (PhaseHook L2 승격). baseline 287→255 (-32 누적) | DdrPhase/PhaseHook trait 잔존 |
+| **V-16** | `<TBD>` (B-4 sprint) | `observability/eval/*` → `session/eval/` L4 격상으로 자연 해소 (§13.8-I 신설). 격상 후 backend instantiate 및 `OpenCLBackend` downcast가 L4 진입점 책임으로 정상화되며 INV-LAYER-004 적용 대상에서 제외. 본 commit은 B-4-0 단계로 문서·spec만 갱신, 실제 모듈 이동은 후속 B-4-1 implementer가 수행 (mechanical move + path 갱신) | 없음 (B-4-1 적용 시점부터) |
+| **V-28** | `<TBD>` (B-4 sprint) | V-16과 동일 sprint. `eval` sub-module의 L3 import 5건(`QuantNoiseTable`, `TransformerModel`, `CacheManager`, `KVCache`, `core::qcf::*`)이 `session/eval/`로 격상되어 L4→L3 의존이 됨. INV-LAYER-004 적용 대상 자체에서 제거. | 없음 (B-4-1 적용 시점부터) |
+| **V-29** | `<TBD>` (B-4 sprint) | V-16과 동일 sprint(V-16에 병합된 단일 downcast 케이스). `session/eval/`로 격상 후 L4 진입점의 backend downcast는 정상 패턴 (`session/`이 backend 조립 책임 보유). | 없음 (B-4-1 적용 시점부터) |
+
+**B-4 SHA 후속 갱신**: 위 3행의 `<TBD>` 자리는 B-4-1/B-4-2/B-4-3 implementer sprint 완료 후 최종 commit SHA로 교체된다 (B-4-4 단계). 본 문서 갱신(B-4-0)은 spec/arch 분리 원칙에 따라 모듈 이동과 별개 commit으로 처리.
 
 **INV-LAYER-002 위반 추이**: 9 (Step 3-A 진입 시) → 6 (Step 3-D-b 후) → **1** (Step 3-E 후, V-07 `HostPtrPoolGuard` 잔존만).
 
@@ -1543,5 +1549,29 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - **운용 메모**:
   - 매크로 helper도 무한 확장 금지 — 5건 누적 시 layer_lint에 명시적 allowlist 도입을 검토한다 (§F와 동일 정책).
   - **trait inversion이 가능한 경우 우선 적용** — 본 §H는 instrument에 한정된 예외이며 일반적 cross-cutting → L3 의존 해소 패턴이 아니다. observability 일반은 `EventSink` 등 trait inversion이 표준.
+
+**§I — observability sub-module L4 promotion: RESOLVED (2026-05-22)**
+- **결정**: `observability/` 산하 sub-module이 (1) L3 도메인(`inference/`, `pressure/`, `qcf/`, `models/`)에 다수 의존하고 (2) 자체적으로 backend·workspace·KV cache를 instantiate하며 (3) `session/` 또는 `bin/`에서만 호출되는 *진입점* 성격을 띠면, cross-cutting(L4·L5만 의존) 가정과 모순된다. 이 경우 sub-module 자체를 L4(`session/`)로 격상한다 — INV-LAYER-004 적용 대상에서 자연 제거.
+- **판별 기준** (전 조건 충족 시 L4 격상 검토):
+  1. **L3 import 5건 이상** — `grep "use crate::" sub_module/`로 카운트한 L3 도메인 import가 5건 이상.
+  2. **backend instantiation 코드 존재** — `CpuBackend::new`, `OpenCLBackend::new`, `CudaBackend::new` 등 backend impl을 직접 생성하는 코드를 포함.
+  3. **caller가 L4(`session/`) 또는 L5(`bin/`)에 한정** — 다른 L3 도메인이나 cross-cutting 모듈이 본 sub-module을 import하지 않음 (단방향: 진입점 → sub-module).
+- **근거**: cross-cutting(`observability/`, `resilience/`)의 정의는 *모든 L3 도메인이 의존할 수 있는 부수효과·관측 계층*이다(L4·L5만 의존, L3에는 trait inversion 강제). 그러나 sub-module이 L3을 다수 import하고 backend를 직접 instantiate하며 진입점에서만 호출된다면 — 이는 cross-cutting이 아니라 *L4 진입점 어셈블리 코드*의 한 변종이다. `session/`은 이미 backend·workspace·model을 조립하는 L4 책임이며, 동일 패턴의 sub-module이 같은 위치에 있는 것이 자연스럽다. 잘못된 위치를 강제 유지하면서 INV-LAYER-004 baseline에 누적시키는 것은 lint 비용만 증가시키고 본질적 결합도는 해소하지 않는다.
+- **§13.8-H/§G와의 관계**:
+  - **§G (shared identifier promotion)**: L3 도메인의 enum/struct을 L2로 옮겨 양 도메인 어휘 공유 자산화. 대상은 *data identifier*.
+  - **§H (instrument macro helper)**: L2 매크로 expansion 내부의 cross-cutting concrete 참조를 cfg gate로 zero-cost화. 대상은 *매크로* (per-op hot path).
+  - **§I (observability sub-module L4 promotion)**: cross-cutting sub-module 자체를 L4로 격상하여 INV-LAYER-004 적용 대상에서 제외. 대상은 *진입점 성격 sub-module 폴더 전체*.
+  - §G/§H가 *부분적 type-level/macro-level 해소*라면, §I는 *모듈-level 재배치 해소*. 셋 다 trait inversion이 본질적 결합 해소가 아닐 때(또는 비용이 더 큰 때) 우선 적용한다.
+- **버린 옵션**: (a) sub-module의 L3 import를 모두 trait inversion으로 해소 — 진입점이 직접 backend instantiate하면서 동시에 L3 trait만 본다는 것은 모순(trait object를 만들기 위해 결국 concrete impl을 어딘가에서 생성해야 함). (b) sub-module을 그대로 두고 baseline에 누적 — baseline이 본질이 아닌 *위치 오류*로 부풀려져 진짜 위반과 grandfathered exception이 구분되지 않음.
+- **적용**: **`observability/eval/` → `session/eval/`** (B-4 sprint).
+  - L3 import: backend impl 3종 + `models::weights::QuantNoiseTable` + `models::transformer::TransformerModel` + `core::cache_manager::CacheManager` + `core::kv_cache::{KVCache, max_cache_pos}` + `core::qcf::*` (5건 초과).
+  - backend instantiate: `CpuBackend::new`, `OpenCLBackend` downcast.
+  - caller: `bin/generate.rs`의 eval 진입점만.
+  - 격상 결과: V-16, V-28, V-29 일괄 해소. baseline JSON 254 → ~220 (-34).
+- **layer_lint.py 처리**: §I 적용된 sub-module은 격상 commit 시점에 baseline JSON에서 일괄 차감되며, 별도 allowlist는 불요(위치 자체가 L4가 되므로 INV-LAYER-004 검사 대상에서 자연 제거).
+- **운용 메모**:
+  - §I는 *cross-cutting → L4 격상*이므로 모듈 caller 인터페이스가 바뀐다. `bin/`/`session/` 의 use path 갱신 필수 (B-4-1 implementer 책임).
+  - 향후 동일 패턴(observability/profile/* 등) 발견 시 본 정책 참조. 단 `observability/profile/*`은 forward hot path마다 호출되는 *관측 계층*이며 backend instantiate를 하지 않으므로 §I 대상 아님 — §H(instrument macro)가 적용 패턴이다.
+  - 3건 이상 누적 시 §13.4에 *L4 promotion register* 표 신설 검토 (§F/§G allowlist 정책과 동일 운용 원리).
 
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.
