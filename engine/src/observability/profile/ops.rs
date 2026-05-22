@@ -291,6 +291,70 @@ impl OpProfiler {
     }
 }
 
+// ── OpInstrument impls ────────────────────────────────────────────────────────
+
+impl crate::instrument::OpInstrument for OpProfiler {
+    fn record_op_us(&mut self, op_name: &'static str, elapsed_us: u64) {
+        match op_name {
+            "rms_norm" => self.rms_norm += elapsed_us,
+            "matmul_qkv" => self.matmul_qkv += elapsed_us,
+            "rope" => self.rope += elapsed_us,
+            "kv_update" => self.kv_update += elapsed_us,
+            "attention" => self.attention += elapsed_us,
+            "matmul_wo" => self.matmul_wo += elapsed_us,
+            "matmul_ffn" => self.matmul_ffn += elapsed_us,
+            "silu_mul" => self.silu_mul += elapsed_us,
+            "add_assign" => self.add_assign += elapsed_us,
+            "copy_residual" => self.copy_residual += elapsed_us,
+            "cast" => self.cast += elapsed_us,
+            "lm_head" => self.lm_head += elapsed_us,
+            "matmul" => self.matmul += elapsed_us,
+            "gather" => self.gather += elapsed_us,
+            _ => self.other += elapsed_us,
+        }
+    }
+
+    // record_cpu_fallback / record_layer_end: default no-op (decode profiler 불필요)
+
+    fn merge_events(&mut self, events: &std::collections::HashMap<String, u64>) {
+        self.merge_from_events(events);
+    }
+
+    fn note_token(&mut self) {
+        self.count += 1;
+    }
+}
+
+impl crate::instrument::OpInstrument for PrefillOpProfiler {
+    fn record_op_us(&mut self, op_name: &'static str, elapsed_us: u64) {
+        match op_name {
+            "rms_norm" => self.rms_norm += elapsed_us,
+            "matmul_qkv" => self.matmul_qkv += elapsed_us,
+            "rope" => self.rope += elapsed_us,
+            "kv_write" => self.kv_write += elapsed_us,
+            "flash_prefill_gpu" => self.flash_prefill_gpu += elapsed_us,
+            "flash_prefill_cpu" => self.flash_prefill_cpu += elapsed_us,
+            "matmul_wo" => self.matmul_wo += elapsed_us,
+            "ffn_gate" => self.ffn_gate += elapsed_us,
+            "ffn_up" => self.ffn_up += elapsed_us,
+            "ffn_down" => self.ffn_down += elapsed_us,
+            "silu_mul" => self.silu_mul += elapsed_us,
+            "add_assign" => self.add_assign += elapsed_us,
+            _ => {} // prefill profiler는 unknown op 무시
+        }
+    }
+
+    fn record_cpu_fallback(&mut self, _head_dim: usize, _dtype_str: &str, _reason: &'static str) {
+        self.cpu_fallback_count += 1;
+    }
+
+    fn record_layer_end(&mut self) {
+        self.layer_count += 1;
+    }
+
+    // merge_events / note_token: default no-op (prefill profiler 불필요)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

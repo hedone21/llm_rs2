@@ -89,3 +89,47 @@ macro_rules! op_note_forward_call {
         $crate::observability::profile::op_trace::note_forward_call();
     }};
 }
+
+// ── Pattern C: OpInstrument trait ─────────────────────────────────────────────
+//
+// Op-level profiler를 trait object로 erasure. `observability/profile/ops.rs`의
+// `OpProfiler`/`PrefillOpProfiler`가 impl 제공.
+//
+// 설계 원칙:
+//   - 두 struct의 *공통 mutate 경로*만 trait method로 노출.
+//   - 한 쪽만 의미 있는 method는 default no-op으로 처리 (타 struct는 override 불필요).
+//   - B-2d-1: trait + impl 정의만. 사용처(Option<&mut OpProfiler/PrefillOpProfiler>)
+//     를 Option<&mut dyn OpInstrument>로 교체하는 작업은 B-2d-2.
+
+/// Op-level profiler abstraction for decode/prefill forward passes.
+///
+/// `OpProfiler` (decode)와 `PrefillOpProfiler` (prefill) 양쪽이 impl.
+/// `Send` bound: forward pass는 단일 스레드이지만 struct holder 경로에서 스레드
+/// 경계를 넘을 수 있으므로 포함.
+pub trait OpInstrument: Send {
+    /// Named op의 microsecond 값을 누적한다.
+    ///
+    /// `op_name`은 `"rms_norm"`, `"matmul_qkv"` 등 known op label.
+    /// 알 수 없는 label은 구현체 재량으로 무시하거나 `other` 버킷에 추가.
+    fn record_op_us(&mut self, op_name: &'static str, elapsed_us: u64);
+
+    /// GPU→CPU attention fallback 이벤트를 기록한다 (prefill 전용).
+    ///
+    /// `OpProfiler`는 default no-op. `PrefillOpProfiler`만 override.
+    fn record_cpu_fallback(&mut self, _head_dim: usize, _dtype_str: &str, _reason: &'static str) {}
+
+    /// 레이어 종료 시 layer_count를 증가시킨다 (prefill 전용).
+    ///
+    /// `OpProfiler`는 default no-op. `PrefillOpProfiler`만 override.
+    fn record_layer_end(&mut self) {}
+
+    /// GPU 프로파일 이벤트 맵을 merge한다 (decode 전용).
+    ///
+    /// `PrefillOpProfiler`는 default no-op. `OpProfiler`만 override.
+    fn merge_events(&mut self, _events: &std::collections::HashMap<String, u64>) {}
+
+    /// 토큰 1개 처리 완료를 기록한다 (decode 전용, count 증가).
+    ///
+    /// `PrefillOpProfiler`는 default no-op. `OpProfiler`만 override.
+    fn note_token(&mut self) {}
+}
