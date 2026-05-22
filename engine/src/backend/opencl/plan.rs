@@ -13,11 +13,11 @@ use ocl::core::Mem;
 use std::sync::Arc;
 
 use crate::backend::Backend;
-use crate::partition_workspace::PartitionWsCell;
 use crate::layers::tensor_partition::{
     PartitionContext, PartitionPath, partition_plan_debug_enabled, partition_plan_enabled,
     partition_trace_enabled, record_partition_timing,
 };
+use crate::partition_workspace::PartitionWsCell;
 use crate::tensor::Tensor;
 
 thread_local! {
@@ -298,6 +298,21 @@ pub struct PartitionStep {
     /// Whether this is the last transformer layer (fused_norm_merge can't
     /// defer past the final layer because there's no next norm to fold into).
     pub is_last_layer: bool,
+    /// Build-time policy snapshot — env flag readback captured once at
+    /// `build_partition_plan` time. Runtime `execute()` reads this field
+    /// instead of re-querying `layers::tensor_partition::*_enabled()`,
+    /// keeping the runtime path free of L1→L3 imports (§13.8-J).
+    pub policy: PartitionPolicySnapshot,
+}
+
+/// Build-time snapshot of `layers/tensor_partition` env flag policy.
+///
+/// Captured once by `build_partition_plan` and injected into `PartitionStep`,
+/// so the runtime dispatch path never imports `layers/tensor_partition::*`.
+/// All fields are env-gated booleans that are stable across the decode session.
+#[derive(Clone, Copy, Default)]
+pub struct PartitionPolicySnapshot {
+    pub poll_flag: bool,
 }
 
 // SAFETY: Same model as `KernelStep`. `PartitionStep` owns `CoreKernel` / `Mem`
@@ -512,7 +527,7 @@ impl PartitionStep {
         //    in-order sync point (fast because add_rms_norm_oop is already
         //    done) and performs the residual DMA read.
         let queue = backend.queue.as_core();
-        let poll_flag = crate::layers::tensor_partition::partition_poll_flag_enabled();
+        let poll_flag = self.policy.poll_flag;
         // Actual residual transport path used this dispatch — drives the trace
         // counter at the end. Zcopy when the poll-flag fast memcpy from the
         // permanent-mapped `residual_host_ptr` runs; SyncRead otherwise.
@@ -3444,6 +3459,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
 /// Returns `Err` when the plan path is disabled (`LLMRS_PARTITION_PLAN=0`).
 /// The caller falls back to `forward_gen` in that case.
 #[allow(clippy::too_many_arguments)]
+// LAYER-EXEMPT: dispatch_orchestrator
 pub fn build_partitioned_layer_plan(
     config: &LayerPlanConfig,
     partition_ctx: &PartitionContext,
@@ -3749,6 +3765,13 @@ pub fn build_partitioned_layer_plan(
         build_thread_id: std::thread::current().id(),
     });
 
+    // §13.8-J: build-time policy snapshot. Reads `layers/tensor_partition`
+    // env flag state once and freezes it into `PartitionStep::policy`, so the
+    // runtime `execute()` path is free of L1→L3 calls.
+    let partition_policy_snapshot = PartitionPolicySnapshot {
+        poll_flag: crate::layers::tensor_partition::partition_poll_flag_enabled(),
+    };
+
     let partition_step = PartitionStep {
         gpu_gate,
         gpu_up,
@@ -3757,6 +3780,7 @@ pub fn build_partitioned_layer_plan(
         cpu_ctx,
         merge,
         is_last_layer,
+        policy: partition_policy_snapshot,
     };
 
     // Replace FFN with the partition variant; the GpuOnly gate/up/silu/down
@@ -3958,6 +3982,7 @@ pub struct KvBufs<'a> {
 }
 
 /// Build a pre-bound plan for the full model decode pass (all layers + head).
+// LAYER-EXEMPT: dispatch_orchestrator
 pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
     let n_q = config.n_heads_q * config.head_dim;
     let n_k = config.n_kv_heads * config.head_dim;

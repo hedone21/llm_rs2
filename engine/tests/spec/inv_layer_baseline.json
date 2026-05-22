@@ -13,7 +13,7 @@
     {
       "id": "V-02",
       "file": "backend/opencl/plan.rs",
-      "line": 17,
+      "line": 16,
       "import": "crate::layers::tensor_partition::",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-inference (역방향 import)",
@@ -22,16 +22,7 @@
     {
       "id": "V-02",
       "file": "backend/opencl/plan.rs",
-      "line": 515,
-      "import": "crate::layers::tensor_partition::partition_poll_flag_enabled",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-02",
-      "file": "backend/opencl/plan.rs",
-      "line": 1531,
+      "line": 1546,
       "import": "crate::layers::hybrid_attention::compute_kv_split",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-inference (역방향 import)",
@@ -40,17 +31,8 @@
     {
       "id": "V-02",
       "file": "backend/opencl/plan.rs",
-      "line": 1537,
+      "line": 1552,
       "import": "crate::layers::hybrid_attention::current",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-02",
-      "file": "backend/opencl/plan.rs",
-      "line": 3972,
-      "import": "crate::layers::tensor_partition::partition_poll_flag_enabled",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-inference (역방향 import)",
       "is_test_block": false
@@ -693,7 +675,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1288,
+      "line": 1286,
       "import": "crate::backend::cpu::neon::fused_matmul_f16",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -703,7 +685,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1309,
+      "line": 1307,
       "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -713,7 +695,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1438,
+      "line": 1436,
       "import": "crate::backend::cpu::neon::fused_matmul_f16",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -723,7 +705,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1463,
+      "line": 1461,
       "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -733,7 +715,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1698,
+      "line": 1696,
       "import": "crate::backend::cpu::neon::CpuBackendNeon::vec_dot_f16_f32",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1371,7 +1353,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
-      "line": 681,
+      "line": 696,
       "import": "crate::backend::cpu::neon::fused_matmul_f16",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
@@ -1380,7 +1362,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
-      "line": 702,
+      "line": 717,
       "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
@@ -1389,7 +1371,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
-      "line": 1235,
+      "line": 1250,
       "import": "crate::pressure::kv_cache::KVCacheOps",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-pressure (역방향 import)",
@@ -1398,7 +1380,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
-      "line": 1623,
+      "line": 1638,
       "import": "crate::backend::cpu::neon::flash_partial_kv_range_f16",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
@@ -1407,7 +1389,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
-      "line": 1690,
+      "line": 1705,
       "import": "crate::backend::cpu::neon::merge_two_partials_f32",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
@@ -1416,7 +1398,7 @@
     {
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
-      "line": 1819,
+      "line": 1834,
       "import": "crate::resilience::gpu_yield::maybe_yield_after_layer",
       "rule": "INV-LAYER-001",
       "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
@@ -1562,7 +1544,7 @@
     {
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1759,
+      "line": 1757,
       "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -1571,7 +1553,7 @@
     {
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1773,
+      "line": 1771,
       "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",

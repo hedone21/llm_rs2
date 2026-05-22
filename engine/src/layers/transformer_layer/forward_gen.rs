@@ -1170,12 +1170,10 @@ impl TransformerLayer {
         // shared with the OpenCL plan path. Both forward_gen and the plan's
         // `PartitionStep::run` execute on the same dispatch thread, so there
         // is no aliased mutable access (see LayerWorkspace::partition_ws doc).
-        let partition_ws_ptr: Option<
-            *mut crate::partition_workspace::PartitionWorkspace,
-        > = ws.partition_ws.as_ref().map(|arc| arc.get());
+        let partition_ws_ptr: Option<*mut crate::partition_workspace::PartitionWorkspace> =
+            ws.partition_ws.as_ref().map(|arc| arc.get());
         if let (Some(part), Some(pw_ptr)) = (&self.partition_ctx, partition_ws_ptr) {
-            let pw: &mut crate::partition_workspace::PartitionWorkspace =
-                unsafe { &mut *pw_ptr };
+            let pw: &mut crate::partition_workspace::PartitionWorkspace = unsafe { &mut *pw_ptr };
             // ── Partitioned whole-FFN: cooperative GPU + CPU ──
             let part_trace = crate::layers::tensor_partition::partition_trace_enabled();
             let t0 = if part_trace {
