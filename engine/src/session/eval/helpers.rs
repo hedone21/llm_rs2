@@ -12,7 +12,7 @@ use crate::session::cli::Args;
 pub fn load_eval_questions(
     args: &Args,
     default_prompt: &str,
-) -> anyhow::Result<Vec<crate::observability::eval::EvalQuestion>> {
+) -> anyhow::Result<Vec<crate::session::eval::EvalQuestion>> {
     let raw_tasks: Vec<serde_json::Value> = if let Some(ref path) = args.eval_batch {
         let file = std::fs::File::open(path)
             .map_err(|e| anyhow::anyhow!("Failed to open eval batch {}: {}", path, e))?;
@@ -28,10 +28,10 @@ pub fn load_eval_questions(
         })]
     };
 
-    let mut questions: Vec<crate::observability::eval::EvalQuestion> = Vec::new();
+    let mut questions: Vec<crate::session::eval::EvalQuestion> = Vec::new();
     for task in &raw_tasks {
         if let Some(choices) = task["choices"].as_array() {
-            questions.push(crate::observability::eval::EvalQuestion {
+            questions.push(crate::session::eval::EvalQuestion {
                 id: task["id"].as_str().unwrap_or("unknown").to_string(),
                 prompt: task["prompt"]
                     .as_str()
@@ -43,7 +43,7 @@ pub fn load_eval_questions(
                     .collect(),
             });
         } else if let Some(cont) = task["continuation"].as_str() {
-            questions.push(crate::observability::eval::EvalQuestion {
+            questions.push(crate::session::eval::EvalQuestion {
                 id: task["id"].as_str().unwrap_or("unknown").to_string(),
                 prompt: task["prompt"]
                     .as_str()
@@ -65,7 +65,7 @@ pub fn load_eval_questions(
 ///
 /// Returns an empty Vec when tokenization fails entirely (non-fatal).
 pub fn build_eval_ll_warmup_text(
-    questions: &[crate::observability::eval::EvalQuestion],
+    questions: &[crate::session::eval::EvalQuestion],
     max_tokens: usize,
     tokenizer: &tokenizers::Tokenizer,
 ) -> Vec<u32> {

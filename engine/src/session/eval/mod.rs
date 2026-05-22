@@ -8,9 +8,21 @@
 //! (Phase 4-B-1에서 lib 이동).
 
 pub mod args;
+pub mod eval_loop;
+pub mod eviction_hook;
 pub mod helpers;
+pub mod hook;
+pub mod kivi_hook;
+pub mod output;
+pub mod qcf_helpers;
 pub mod runner;
 
 pub use args::EvalLlRunCtx;
+pub use eval_loop::run_eval_ll_generic;
+pub use eviction_hook::EvictionHook;
 pub use helpers::{build_eval_ll_warmup_text, load_eval_questions};
+pub use hook::{CacheSnapshot, PostStepResult, StepHook};
+pub use kivi_hook::KiviHook;
+pub use output::{EvalConfig, EvalOutput, EvalQuestion};
+pub use qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
 pub use runner::run_eval_ll;

@@ -142,7 +142,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         ..crate::qcf::QcfConfig::default()
     };
 
-    let eval_config = crate::observability::eval::EvalConfig {
+    let eval_config = crate::session::eval::EvalConfig {
         max_seq_len,
         effective_budget,
         kv_budget_ratio: args.kv_budget_ratio(),
@@ -166,7 +166,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         vec![0]
     };
 
-    let mut hook = crate::observability::eval::EvictionHook::new(
+    let mut hook = crate::session::eval::EvictionHook::new(
         cache_manager,
         score_accumulator,
         qcf_config,
@@ -209,7 +209,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     } else {
         1
     };
-    let mut trajectory_outputs: Vec<crate::observability::eval::EvalOutput> =
+    let mut trajectory_outputs: Vec<crate::session::eval::EvalOutput> =
         Vec::with_capacity(n_steps);
 
     if trajectory_mode {
@@ -231,7 +231,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
             );
         }
 
-        let step_out = crate::observability::eval::run_eval_ll_generic(
+        let step_out = crate::session::eval::run_eval_ll_generic(
             &model,
             &tokenizer,
             &backend,
@@ -282,7 +282,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
 
     // ── QCF-dump JSON (eval-ll mode) ──────────────────────────────────────
     if let Some(ref dump_path) = args.qcf_dump {
-        use crate::observability::eval::qcf_helpers::{
+        use crate::session::eval::qcf_helpers::{
             QcfSwapDumpContext, TrajectoryStep, dump_qcf_swap_json,
         };
 

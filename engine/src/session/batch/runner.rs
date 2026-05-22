@@ -79,7 +79,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
     // qcf_per_layer*) per record, alongside legacy fields.
     // Hook owns cache_manager + score_accumulator from here; subsequent
     // forward calls in this branch route score_accumulator through the hook.
-    use crate::observability::eval::StepHook;
+    use crate::session::eval::StepHook;
     let pb_qcf_mode_enum = match args.qcf_mode.as_str() {
         "caote" => crate::qcf::QcfMode::Caote,
         "both" => crate::qcf::QcfMode::Both,
@@ -99,7 +99,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
     } else {
         vec![0]
     };
-    let mut hook = crate::observability::eval::EvictionHook::new(
+    let mut hook = crate::session::eval::EvictionHook::new(
         cache_manager,
         score_accumulator.take(),
         pb_qcf_config,

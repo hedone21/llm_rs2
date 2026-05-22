@@ -170,7 +170,7 @@ pub fn run_ppl_dispatch(ctx: PplRunCtx) -> Result<()> {
 
     // --qcf-dump: write JSON after PPL measurement completes.
     if let Some(ref dump_path) = args.qcf_dump {
-        use crate::observability::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
+        use crate::session::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
 
         let empty_swap: Vec<usize> = Vec::new();
         let (swap_set, qcf_predicted, fallback_used) = if let Some(ref dec) = qcf_swap_decision {
