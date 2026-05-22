@@ -338,7 +338,8 @@ pub fn run_decode_prologue(ctx: DecodePrologueCtx<'_>) -> anyhow::Result<DecodeP
             }
 
             gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(PartitionWorkspace::new(
-                partition_ctx,
+                partition_ctx.gate.split_row,
+                partition_ctx.up.split_row,
                 ffn_hidden,
                 hidden_size,
                 &gpu_alloc,

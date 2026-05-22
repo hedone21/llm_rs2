@@ -104,7 +104,8 @@ def classify_module(rel_path: str) -> str:
     # Step 4-A: top-level abstraction *.rs files take precedence over
     # directory-prefix rules (Rust 2018+ pattern — trait lives next to impl dir).
     TOP_LEVEL_L2 = {"backend.rs", "buffer.rs", "memory.rs", "tensor.rs",
-                    "shape.rs", "quant.rs", "thread_pool.rs", "op_kind.rs"}
+                    "shape.rs", "quant.rs", "thread_pool.rs", "op_kind.rs",
+                    "partition_workspace.rs"}
     if norm in TOP_LEVEL_L2:
         return "L2"
     for prefix, layer in LAYER_RULES:
@@ -138,7 +139,7 @@ def classify_import(import_path: str) -> str:
     mod_path = "/".join(mod_segs)
     # Top-level L2 abstraction files (engine/src/*.rs, Rust 2018+ pattern)
     if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
-                    "quant", "thread_pool", "op_kind"):
+                    "quant", "thread_pool", "op_kind", "partition_workspace"):
         return "L2"
     # 기존 경로 기반 매칭으로 fallback
     return classify_module(mod_path if mod_path else p.replace("::", "/"))

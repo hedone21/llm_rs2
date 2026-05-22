@@ -13,11 +13,11 @@ use ocl::core::Mem;
 use std::sync::Arc;
 
 use crate::backend::Backend;
+use crate::partition_workspace::PartitionWsCell;
 use crate::layers::tensor_partition::{
     PartitionContext, PartitionPath, partition_plan_debug_enabled, partition_plan_enabled,
     partition_trace_enabled, record_partition_timing,
 };
-use crate::layers::workspace::PartitionWsCell;
 use crate::tensor::Tensor;
 
 thread_local! {
@@ -424,7 +424,7 @@ unsafe impl Sync for PartitionPlanContext {}
 /// `PartitionWorkspace` buffers. We re-declare as a type alias to the real
 /// `PartitionWorkspace` so callers can share allocations with `forward_gen`
 /// (both paths read/write the same `gate_cpu`, `down_partial_gpu`, etc).
-pub type PartitionPlanWorkspace = crate::layers::workspace::PartitionWorkspace;
+pub type PartitionPlanWorkspace = crate::partition_workspace::PartitionWorkspace;
 
 impl PartitionStep {
     /// INV-120 generation check — separated so tests can exercise staleness

@@ -184,7 +184,8 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
         }
 
         gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(PartitionWorkspace::new(
-            ctx,
+            ctx.gate.split_row,
+            ctx.up.split_row,
             ffn_hidden,
             hidden_size,
             &gpu_alloc,

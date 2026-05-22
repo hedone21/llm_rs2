@@ -12,6 +12,7 @@ pub mod layers;
 pub mod memory;
 pub mod models;
 pub mod op_kind;
+pub mod partition_workspace;
 pub mod pressure;
 pub mod qcf;
 pub mod quant;

@@ -2785,7 +2785,8 @@ fn main() -> anyhow::Result<()> {
                                             make_partition_gpu_alloc(&*backend, decode_mem);
                                         gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(
                                             PartitionWorkspace::new(
-                                                ctx,
+                                                ctx.gate.split_row,
+                                                ctx.up.split_row,
                                                 ffn_hidden,
                                                 hidden_size,
                                                 &gpu_alloc,
@@ -3068,7 +3069,8 @@ fn main() -> anyhow::Result<()> {
                             if let Some(ref ctx) = layer0_probe2.partition_ctx {
                                 let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
                                 if let Ok(ws) = PartitionWorkspace::new(
-                                    ctx,
+                                    ctx.gate.split_row,
+                                    ctx.up.split_row,
                                     ffn_hidden,
                                     hidden_size,
                                     &gpu_alloc,
