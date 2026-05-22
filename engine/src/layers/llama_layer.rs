@@ -3,9 +3,7 @@
 //! All logic has moved to `crate::layers::transformer_layer`.
 //! This module preserves the old type names as aliases.
 
-pub use super::transformer_layer::{
-    ForwardGenArgs, LayerForwardArgs, QkvBias, TransformerLayer,
-};
+pub use super::transformer_layer::{ForwardGenArgs, LayerForwardArgs, QkvBias, TransformerLayer};
 
 /// Backward-compatible alias for [`TransformerLayer`].
 pub type LlamaLayer = TransformerLayer;

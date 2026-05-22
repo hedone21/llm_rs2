@@ -209,8 +209,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     } else {
         1
     };
-    let mut trajectory_outputs: Vec<crate::session::eval::EvalOutput> =
-        Vec::with_capacity(n_steps);
+    let mut trajectory_outputs: Vec<crate::session::eval::EvalOutput> = Vec::with_capacity(n_steps);
 
     if trajectory_mode {
         eprintln!(
