@@ -4,7 +4,7 @@
 //! This module preserves the old type names as aliases.
 
 pub use super::transformer_layer::{
-    ForwardGenArgs, LayerForwardArgs, OpProfiler, QkvBias, TransformerLayer,
+    ForwardGenArgs, LayerForwardArgs, QkvBias, TransformerLayer,
 };
 
 /// Backward-compatible alias for [`TransformerLayer`].

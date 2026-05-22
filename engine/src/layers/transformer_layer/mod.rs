@@ -17,9 +17,8 @@ use std::sync::Arc;
 use crate::layers::tensor_partition::PartitionContext;
 use crate::memory::host::shared::SharedBuffer;
 
-// Re-export OpProfiler from its canonical location for backward compatibility.
-pub use crate::observability::profile::ops::OpProfiler;
-// Re-export OpInstrument for callers that build trait object references.
+// OpInstrument trait object는 LayerForwardArgs/LayerGenForwardArgs.profiler에서 사용.
+// OpProfiler/PrefillOpProfiler concrete는 observability/profile/ops/ 직접 import.
 pub use crate::instrument::OpInstrument;
 
 /// Update KV cache with K/V tensors, handling GPU→CPU readback when needed.
