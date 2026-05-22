@@ -13,9 +13,10 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::resilience::gpu_self_meter::OpenClEventGpuMeter;
+use self::gpu_self_meter::OpenClEventGpuMeter;
 
 pub mod gpu_score;
+pub mod gpu_self_meter;
 pub mod host_ptr_pool;
 pub mod memory;
 pub mod plan;

@@ -14,7 +14,7 @@ pub mod dbus_transport;
 
 pub use crate::pressure::eviction::EvictMethod;
 pub use executor::{CommandExecutor, EvictPlan, ExecutionPlan, KVSnapshot, StreamingParams};
-pub use gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter, OpenClEventGpuMeter};
+pub use gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter};
 pub use manager::{InferenceContext, ResilienceManager, execute_action};
 pub use signal::{
     CommandResponse, CommandResult, EngineCapability, EngineCommand, EngineDirective,
