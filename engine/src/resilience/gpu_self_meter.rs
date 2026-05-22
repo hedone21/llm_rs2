@@ -49,7 +49,6 @@ impl GpuSelfMeter for NoOpGpuMeter {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
