@@ -289,10 +289,11 @@ RE_USE_LIB = re.compile(r'^\s*(?:pub\s+)?use\s+(llm_rs2::\S+)\s*;', re.MULTILINE
 # 인라인 crate:: 참조 (함수 본문 내)
 RE_INLINE_CRATE = re.compile(r'(?<!\w)(crate::[a-zA-Z_][a-zA-Z0-9_:]*)')
 
-def extract_imports(file_path: str) -> list[tuple[int, str, bool]]:
+def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
     """
-    파일에서 (line_number, import_path, is_test_block) 목록 반환.
+    파일에서 (line_number, import_path, is_test_block, in_exempt_zone) 목록 반환.
     is_test_block=True는 #[cfg(test)] 블록 내부.
+    in_exempt_zone=True는 §13.8-J LAYER-EXEMPT: dispatch_orchestrator zone 내부.
     """
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
@@ -302,9 +303,17 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool]]:
 
     # #[cfg(test)] 블록 범위 감지 (간단한 brace 카운팅)
     test_block_ranges = _find_test_block_ranges(lines)
+    # §13.8-J dispatch orchestrator zone 범위 감지
+    exempt_zone_ranges = _find_exempt_zone_ranges(lines)
 
     def in_test_block(lineno: int) -> bool:
         for start, end in test_block_ranges:
+            if start <= lineno <= end:
+                return True
+        return False
+
+    def in_exempt_zone(lineno: int) -> bool:
+        for start, end in exempt_zone_ranges:
             if start <= lineno <= end:
                 return True
         return False
@@ -313,7 +322,7 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool]]:
     for i, line in enumerate(lines, 1):
         m = RE_USE_CRATE.match(line)
         if m:
-            results.append((i, m.group(1), in_test_block(i)))
+            results.append((i, m.group(1), in_test_block(i), in_exempt_zone(i)))
 
     # use llm_rs2:: 문 추출 (bin/ 파일용) — llm_rs2::foo → crate::foo로 정규화
     for i, line in enumerate(lines, 1):
@@ -321,7 +330,7 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool]]:
         if m:
             # llm_rs2:: → crate:: 로 정규화하여 레이어 분류에 사용
             normalized = m.group(1).replace("llm_rs2::", "crate::", 1)
-            results.append((i, normalized, in_test_block(i)))
+            results.append((i, normalized, in_test_block(i), in_exempt_zone(i)))
 
     # 인라인 crate:: 참조 추출 (use 문이 아닌 것)
     for i, line in enumerate(lines, 1):
@@ -333,7 +342,7 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool]]:
             imp = m.group(1)
             # 최소 2단계 이상의 경로만 (crate::foo 이상)
             if imp.count("::") >= 1:
-                results.append((i, imp, in_test_block(i)))
+                results.append((i, imp, in_test_block(i), in_exempt_zone(i)))
 
     return results
 
@@ -363,6 +372,108 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
                 ranges.append((start, i))
                 in_test = False
                 brace_depth = 0
+
+    return ranges
+
+
+# ────────────────────────────────────────────────────────────────────
+# §13.8-J dispatch orchestrator zone parser
+# ARCHITECTURE.md §13.8-J: // LAYER-EXEMPT: dispatch_orchestrator marker로
+# 표시된 함수/블록 내의 L3 정책 query 호출을 INV-LAYER-001 baseline에서 제외.
+# ────────────────────────────────────────────────────────────────────
+
+_EXEMPT_MARKER = "// LAYER-EXEMPT: dispatch_orchestrator"
+_EXEMPT_END_MARKER = "// LAYER-EXEMPT-END"
+
+# fn 시그니처 패턴: `fn name(...) -> ... {` 또는 `fn name(...) {`
+_RE_FN_START = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+\w+')
+
+
+def _find_exempt_zone_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    """
+    `// LAYER-EXEMPT: dispatch_orchestrator` marker가 표시된 zone의
+    (start_line, end_line) 목록을 반환 (1-based 라인 번호, 양 끝 포함).
+
+    두 가지 부착 형태 지원:
+      1. **함수 형태**: marker가 `fn ...` 시그니처 *바로 위 줄*에 위치.
+         zone = 함수 본문 시작 `{` 다음 줄 ~ 함수 본문 종료 `}` 줄.
+      2. **블록 형태**: marker가 임의 `{` 줄의 *다음 줄*에 위치.
+         zone = marker 줄 ~ `// LAYER-EXEMPT-END` 또는 블록 종료 `}` 직전 줄.
+
+    알고리즘:
+    - 라인 순 스캔으로 marker 위치를 감지.
+    - marker 다음 줄이 `fn` 시그니처이면 함수 형태로 처리.
+    - 그 외 marker가 `{` 다음 줄에 위치하면 블록 형태로 처리.
+    - brace stack 카운팅으로 zone 종료 판정 (`// LAYER-EXEMPT-END`도 인식).
+    - 문자열 리터럴 내 brace는 단순 카운팅으로 인식하지 않음
+      (주석/문자열 완전 제거 없이 근사 처리 — 실무 코드에서 충분).
+    """
+    ranges: list[tuple[int, int]] = []
+    n = len(lines)
+    i = 0  # 0-based index
+
+    while i < n:
+        stripped = lines[i].strip()
+
+        if _EXEMPT_MARKER not in stripped:
+            i += 1
+            continue
+
+        marker_lineno = i + 1  # 1-based
+
+        # 다음 줄이 fn 시그니처인지 확인 (함수 형태)
+        next_i = i + 1
+        if next_i < n and _RE_FN_START.match(lines[next_i]):
+            # 함수 형태: fn 시그니처 줄부터 `{`를 찾아 zone 시작 확정
+            zone_start = None
+            brace_depth = 0
+            j = next_i
+            while j < n:
+                seg = lines[j].strip()
+                brace_depth += seg.count("{") - seg.count("}")
+                if "{" in seg and zone_start is None:
+                    zone_start = j + 1  # 1-based, 시그니처 끝 `{` 포함 줄
+                if zone_start is not None and brace_depth <= 0:
+                    # zone = zone_start ~ j+1 (1-based)
+                    ranges.append((zone_start, j + 1))
+                    i = j + 1
+                    break
+                j += 1
+            else:
+                i = next_i
+            continue
+
+        # 블록 형태: 현재 줄(marker) 바로 앞 줄에 `{`가 있는 경우
+        # marker 자신이 zone의 첫 줄이 되어 `// LAYER-EXEMPT-END` 또는
+        # 이전 brace depth 복귀 지점까지 zone으로 처리.
+        # (marker가 `{` 다음 줄에 위치 — 즉 i-1 줄에 `{` 포함)
+        prev_has_brace = (i > 0) and ("{" in lines[i - 1])
+        if prev_has_brace:
+            zone_start = marker_lineno  # marker 줄 자체가 zone 시작
+            # `{`가 열린 depth 를 찾기 위해 이전 줄부터 depth를 정산
+            # 간단화: brace_depth=1 (이전 줄의 `{`가 열었으므로)에서 시작
+            brace_depth = 1
+            j = i  # marker 줄 (0-based)
+            while j < n:
+                seg = lines[j].strip()
+                if _EXEMPT_END_MARKER in seg:
+                    ranges.append((zone_start, j + 1))
+                    i = j + 1
+                    break
+                brace_depth += seg.count("{") - seg.count("}")
+                if brace_depth <= 0:
+                    # 블록 닫힘 — zone은 `}` 직전 줄까지
+                    end = j  # `}` 줄 (1-based = j+1) 직전 = j (1-based)
+                    ranges.append((zone_start, end))
+                    i = j + 1
+                    break
+                j += 1
+            else:
+                i = next_i
+            continue
+
+        # marker가 있지만 위 두 경우에 해당하지 않으면 무시
+        i += 1
 
     return ranges
 
@@ -496,7 +607,7 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
             src_layer = classify_module(rel_path)
             imports = extract_imports(full_path)
 
-            for lineno, imp, is_test in imports:
+            for lineno, imp, is_test, is_exempt in imports:
                 # imp에서 정규화된 경로 추출
                 imp_clean = imp.strip()
                 if imp_clean.startswith("crate::"):
@@ -504,6 +615,12 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 else:
                     dst_raw = imp_clean
                 dst_layer = classify_import(imp_clean)
+
+                # §13.8-J: dispatch_orchestrator zone 안의 L3 import는
+                # INV-LAYER-001 위반에서 제외 (정책 query 함수 호출 한정).
+                # zone 안이면 cross-backend 검사도 건너뜀 (L1→L1 는 zone 범위 밖).
+                if is_exempt and dst_layer in ("L3-pressure", "L3-inference"):
+                    continue
 
                 # cross-backend 검사
                 cb_inv, cb_kind = check_cross_backend(rel_path, imp_clean)
