@@ -172,6 +172,7 @@ Conventional Commits: `type(scope): subject` — 명령형 현재 시제. Types:
 | **spec-manage** | Spec/Arch/Test 3계층 문서 관리 (ID 할당, 동기화) | Architect |
 | **develop** | 개발 파이프라인 오케스트레이터 (워크플로우 조율) | 메인 세션 (오케스트레이터) |
 | **handoff-doc** | 세션·단계 종료 시 handoff 문서 작성 (R1~R6 6요소 + 자기점검) | 모두 (메인 세션, PM, Architect, Implementer) |
+| **review** | 구현 전 Plan/Action/Decision/Design 사전 리뷰 (10섹션 골격: Reviewed Items / Alternatives ≥2 + status quo / Risks(RPN≥100) / Premortem / Devil's Advocate) | 메인 세션 |
 
 ## 워크플로우 규칙
 
