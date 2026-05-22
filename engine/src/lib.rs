@@ -8,6 +8,7 @@ pub mod backend;
 pub mod buffer;
 pub mod inference;
 pub mod instrument;
+pub mod kv_cache_ops;
 pub mod layers;
 pub mod memory;
 pub mod models;
