@@ -8,6 +8,7 @@ pub enum OperatingMode {
 
 #[cfg(feature = "hierarchical")]
 mod hierarchical_types {
+    use llm_shared::EngineCommand;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
@@ -35,6 +36,22 @@ mod hierarchical_types {
     }
 
     impl ActionId {
+        /// 문자열 식별자를 반환
+        pub fn as_str(&self) -> &'static str {
+            match self {
+                ActionId::SwitchHw => "switch_hw",
+                ActionId::Throttle => "throttle",
+                ActionId::KvOffloadDisk => "kv_offload_disk",
+                ActionId::KvEvictSliding => "kv.evict_sliding",
+                ActionId::KvEvictH2o => "kv.evict_h2o",
+                ActionId::KvEvictStreaming => "kv.evict_streaming",
+                ActionId::KvMergeD2o => "kv.merge_d2o",
+                ActionId::KvQuantDynamic => "kv.quant_dynamic",
+                ActionId::LayerSkip => "weight.skip",
+                ActionId::SwapWeights => "swap_weights",
+            }
+        }
+
         /// 문자열 식별자로부터 ActionId 변환
         #[allow(clippy::should_implement_trait)]
         pub fn from_str(s: &str) -> Option<ActionId> {
@@ -82,6 +99,27 @@ mod hierarchical_types {
                 | ActionId::SwapWeights => Domain::Memory,
             }
         }
+
+        /// EngineCommand로부터 ActionId 매핑
+        pub fn from_command(cmd: &EngineCommand) -> Option<ActionId> {
+            match cmd {
+                EngineCommand::SwitchHw { .. } | EngineCommand::PrepareComputeUnit { .. } => {
+                    Some(ActionId::SwitchHw)
+                }
+                EngineCommand::Throttle { .. } | EngineCommand::SetTargetTbt { .. } => {
+                    Some(ActionId::Throttle)
+                }
+                EngineCommand::LayerSkip { .. } => Some(ActionId::LayerSkip),
+                EngineCommand::SwapWeights { .. } => Some(ActionId::SwapWeights),
+                EngineCommand::KvEvictH2o { .. } => Some(ActionId::KvEvictH2o),
+                EngineCommand::KvEvictSliding { .. } => Some(ActionId::KvEvictSliding),
+                EngineCommand::KvStreaming { .. } => Some(ActionId::KvEvictStreaming),
+                EngineCommand::KvMergeD2o { .. } => Some(ActionId::KvMergeD2o),
+                EngineCommand::KvQuantDynamic { .. } => Some(ActionId::KvQuantDynamic),
+                EngineCommand::KvOffload { .. } => Some(ActionId::KvOffloadDisk),
+                _ => None,
+            }
+        }
     }
 
     /// 액션이 lossless인지 lossy인지
@@ -101,7 +139,7 @@ mod hierarchical_types {
     }
 
     /// 3차원 pressure vector (PI Controller 출력)
-    #[derive(Debug, Clone, Copy, Default)]
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
     pub struct PressureVector {
         pub compute: f32,
         pub memory: f32,
@@ -326,6 +364,23 @@ mod tests {
             let fv = FeatureVector::zeros();
             assert_eq!(fv.values.len(), FEATURE_DIM);
             assert!(fv.values.iter().all(|&v| v == 0.0));
+        }
+
+        #[test]
+        fn action_id_from_command() {
+            use llm_shared::EngineCommand;
+            assert_eq!(
+                ActionId::from_command(&EngineCommand::Throttle { delay_ms: 10 }),
+                Some(ActionId::Throttle)
+            );
+            assert_eq!(
+                ActionId::from_command(&EngineCommand::KvEvictSliding { keep_ratio: 0.5 }),
+                Some(ActionId::KvEvictSliding)
+            );
+            assert_eq!(
+                ActionId::from_command(&EngineCommand::RestoreDefaults),
+                None
+            );
         }
     }
 }

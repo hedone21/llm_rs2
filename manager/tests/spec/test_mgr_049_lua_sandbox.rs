@@ -14,7 +14,7 @@ mod sandbox_tests {
 
     use llm_manager::config::AdaptationConfig;
     use llm_manager::lua_policy::LuaPolicy;
-    use llm_manager::pipeline::PolicyStrategy;
+    use llm_manager::pipeline::{PolicyStrategy, ReloadablePolicy};
     use llm_shared::{Level, SystemSignal};
 
     // ─── Helpers ──────────────────────────────────────────────────────────────

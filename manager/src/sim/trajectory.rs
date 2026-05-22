@@ -344,7 +344,7 @@ impl Trajectory {
     pub fn record_relief_update(
         &mut self,
         at: Duration,
-        ev: &crate::lua_policy::ReliefUpdateEvent,
+        ev: &crate::policy::common::state::ReliefUpdateEvent,
     ) {
         self.entries.push(TrajectoryEntry::ReliefUpdate {
             at_s: at.as_secs_f64(),

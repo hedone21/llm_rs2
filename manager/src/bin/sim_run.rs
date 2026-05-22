@@ -61,6 +61,11 @@ fn main() -> anyhow::Result<()> {
 
     sim.run_for(std::time::Duration::from_secs_f64(args.duration))?;
 
+    // Relief Table: initial vs learned
+    let initial = llm_manager::pipeline::get_initial_relief_snapshot(sim.policy.as_mut());
+    let current = llm_manager::pipeline::get_relief_snapshot(sim.policy.as_mut());
+    let _ = (initial, current);
+
     let traj = sim.trajectory();
 
     if args.verbose {
@@ -69,16 +74,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("{}", traj.format_session_summary());
-
-    // Relief Table: initial vs learned
-    if let (Some(initial), Some(current)) = (
-        sim.policy.initial_relief_snapshot(),
-        sim.policy.relief_snapshot(),
-    ) {
-        // format_session_summary 이미 trajectory 기반 테이블 출력
-        // initial_relief_snapshot은 configured 기본값까지 포함하여 보완
-        let _ = (initial, current); // 현재는 trajectory 기반으로 충분
-    }
 
     if let Some(out) = args.output_json {
         traj.dump_json(&out)?;

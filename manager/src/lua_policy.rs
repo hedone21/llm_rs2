@@ -15,323 +15,19 @@ use llm_shared::{
     EngineCommand, EngineDirective, EngineMessage, EngineStatus, QcfEstimate, SystemSignal,
 };
 use mlua::{Lua, Result as LuaResult, StdLib, Table, Value};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::clock::{Clock, LogicalInstant, SystemClock};
-use crate::config::{AdaptationConfig, TriggerConfig};
+use crate::config::AdaptationConfig;
 use crate::monitor::compute::SharedGpuProvider;
 use crate::pipeline::{PolicyStrategy, next_seq_id};
 use crate::types::OperatingMode;
 
-/// 6D relief 벡터 차원 수 (gpu, cpu, memory, thermal, latency, main_app_qos).
-#[doc(hidden)]
-pub const RELIEF_DIMS: usize = 6;
-
-#[derive(Debug, Clone, Default)]
-struct Pressure6D {
-    gpu: f32,
-    cpu: f32,
-    memory: f32,
-    thermal: f32,
-    #[allow(dead_code)]
-    latency: f32,
-    #[allow(dead_code)]
-    main_app: f32,
-}
-
-#[derive(Debug, Default)]
-struct SignalState {
-    cpu_pct: f64,
-    gpu_pct: f64,
-    mem_available: u64,
-    mem_total: u64,
-    temp_mc: i32,
-    throttling: bool,
-}
-
-impl SignalState {
-    fn update_compute(&mut self, cpu_pct: f64, gpu_pct: f64) {
-        self.cpu_pct = cpu_pct;
-        self.gpu_pct = gpu_pct;
-    }
-
-    fn update_memory(&mut self, available: u64, total: u64) {
-        self.mem_available = available;
-        self.mem_total = total;
-    }
-
-    fn update_thermal(&mut self, temp_mc: i32, throttling: bool) {
-        self.temp_mc = temp_mc;
-        self.throttling = throttling;
-    }
-
-    fn pressure_with_thermal(
-        &self,
-        temp_safe_c: f32,
-        temp_critical_c: f32,
-        latency_ratio: Option<f64>,
-    ) -> Pressure6D {
-        let mem_pressure = if self.mem_total > 0 {
-            1.0 - (self.mem_available as f32 / self.mem_total as f32)
-        } else {
-            0.0
-        };
-
-        let temp_c = self.temp_mc as f32 / 1000.0;
-        let temp_range = temp_critical_c - temp_safe_c;
-        let thermal = if temp_range > 0.0 {
-            ((temp_c - temp_safe_c) / temp_range).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        Pressure6D {
-            gpu: (self.gpu_pct as f32 / 100.0).clamp(0.0, 1.0),
-            cpu: (self.cpu_pct as f32 / 100.0).clamp(0.0, 1.0),
-            memory: mem_pressure.clamp(0.0, 1.0),
-            thermal,
-            latency: latency_ratio.unwrap_or(0.0) as f32,
-            main_app: 0.0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct TriggerState {
-    tbt_degraded: bool,
-    mem_low: bool,
-    temp_high: bool,
-}
-
-#[derive(Debug)]
-struct TbtTracker {
-    ewma: f64,
-    baseline: Option<f64>,
-    warmup_count: u32,
-    warmup_target: u32,
-}
-
-impl TbtTracker {
-    fn new(warmup_target: u32) -> Self {
-        Self {
-            ewma: 0.0,
-            baseline: None,
-            warmup_count: 0,
-            warmup_target,
-        }
-    }
-
-    fn observe(&mut self, tbt_ms: f64) {
-        if self.warmup_count == 0 {
-            self.ewma = tbt_ms;
-        } else {
-            self.ewma = 0.875 * self.ewma + 0.125 * tbt_ms;
-        }
-        self.warmup_count += 1;
-
-        if self.baseline.is_none() && self.warmup_count >= self.warmup_target {
-            self.baseline = Some(self.ewma);
-        }
-    }
-
-    fn degradation_ratio(&self) -> Option<f64> {
-        self.baseline
-            .map(|b| if b > 0.0 { (self.ewma - b) / b } else { 0.0 })
-    }
-}
-
-#[derive(Debug)]
-struct TriggerEngine {
-    config: TriggerConfig,
-    tbt: TbtTracker,
-    trigger: TriggerState,
-}
-
-impl TriggerEngine {
-    fn new(config: TriggerConfig) -> Self {
-        Self {
-            tbt: TbtTracker::new(config.tbt_warmup_tokens),
-            config,
-            trigger: TriggerState::default(),
-        }
-    }
-
-    fn update_tbt_from_throughput(&mut self, throughput: f32) {
-        if throughput <= 0.0 {
-            return;
-        }
-        let tbt_ms = 1000.0 / throughput as f64;
-        self.tbt.observe(tbt_ms);
-
-        if let Some(ratio) = self.tbt.degradation_ratio() {
-            if self.trigger.tbt_degraded {
-                if ratio < self.config.tbt_exit {
-                    self.trigger.tbt_degraded = false;
-                }
-            } else if ratio > self.config.tbt_enter {
-                self.trigger.tbt_degraded = true;
-            }
-        }
-    }
-
-    fn update_mem(&mut self, pressure: f64) {
-        if self.trigger.mem_low {
-            if pressure < self.config.mem_exit {
-                self.trigger.mem_low = false;
-            }
-        } else if pressure > self.config.mem_enter {
-            self.trigger.mem_low = true;
-        }
-    }
-
-    fn update_temp(&mut self, normalized: f64) {
-        if self.trigger.temp_high {
-            if normalized < self.config.temp_exit {
-                self.trigger.temp_high = false;
-            }
-        } else if normalized > self.config.temp_enter {
-            self.trigger.temp_high = true;
-        }
-    }
-
-    fn state(&self) -> &TriggerState {
-        &self.trigger
-    }
-
-    #[allow(dead_code)]
-    fn tbt_degradation_ratio(&self) -> Option<f64> {
-        self.tbt.degradation_ratio()
-    }
-}
-
-/// 단일 액션의 학습된 EWMA relief 벡터 + 관측 횟수.
-///
-/// JSON으로 직렬화되어 `relief_table_path`에 저장된다 (MGR-DAT-071).
-/// `relief[i]` 부호 규약 (MGR-DAT-073, INV-089):
-///   - dims 0~4: before – after (양수 = 압박 감소)
-///   - dim 5 (main_app_qos): after – before (양수 = QoS 향상)
-#[doc(hidden)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReliefEntry {
-    pub relief: [f32; RELIEF_DIMS],
-    pub observation_count: u32,
-}
-
-/// EWMA-기반 relief 학습 테이블 (MGR-ALG-080 ~ MGR-ALG-083).
-///
-/// Integration test에서 직접 생성·조작하기 위해 공개된다.
-/// Production 코드는 `LuaPolicy` 내부에서만 사용한다.
-#[doc(hidden)]
-pub struct EwmaReliefTable {
-    pub entries: HashMap<String, ReliefEntry>,
-    pub alpha: f32,
-    pub defaults: HashMap<String, Vec<f32>>,
-}
-
-impl EwmaReliefTable {
-    pub fn new(alpha: f32, defaults: HashMap<String, Vec<f32>>) -> Self {
-        Self {
-            entries: HashMap::new(),
-            alpha,
-            defaults,
-        }
-    }
-
-    pub fn predict(&self, action: &str) -> [f32; RELIEF_DIMS] {
-        if let Some(entry) = self.entries.get(action) {
-            return entry.relief;
-        }
-        if let Some(default) = self.defaults.get(action) {
-            let mut relief = [0.0f32; RELIEF_DIMS];
-            for (i, v) in default.iter().enumerate().take(RELIEF_DIMS) {
-                relief[i] = *v;
-            }
-            return relief;
-        }
-        [0.0; RELIEF_DIMS]
-    }
-
-    pub fn observe(&mut self, action: &str, observed: &[f32; RELIEF_DIMS]) {
-        // 첫 관측도 EWMA로 처리한다. entry 초기값은 default_relief prior로 설정하여
-        // outlier 단일 관측이 prior를 완전히 소실시키는 문제를 방지한다.
-        let default = self
-            .defaults
-            .get(action)
-            .map(|v| {
-                let mut r = [0.0f32; RELIEF_DIMS];
-                for (i, &val) in v.iter().enumerate().take(RELIEF_DIMS) {
-                    r[i] = val;
-                }
-                r
-            })
-            .unwrap_or([0.0f32; RELIEF_DIMS]);
-
-        let entry = self
-            .entries
-            .entry(action.to_string())
-            .or_insert_with(|| ReliefEntry {
-                relief: default,
-                observation_count: 0,
-            });
-
-        // 항상 EWMA 적용 (첫 관측도 동일하게)
-        let a = self.alpha;
-        for (i, &obs_val) in observed.iter().enumerate() {
-            entry.relief[i] = a * entry.relief[i] + (1.0 - a) * obs_val;
-        }
-        entry.observation_count += 1;
-    }
-
-    pub fn observation_count(&self, action: &str) -> u32 {
-        self.entries.get(action).map_or(0, |e| e.observation_count)
-    }
-
-    /// 현재 테이블 상태를 스냅샷으로 반환한다 (테스트/시뮬레이터 관측용).
-    pub fn snapshot(&self) -> HashMap<String, [f32; RELIEF_DIMS]> {
-        self.entries
-            .iter()
-            .map(|(k, v)| (k.clone(), v.relief))
-            .collect()
-    }
-
-    /// defaults에 설정된 초기값 스냅샷을 반환한다 (sim_run 진단용).
-    pub fn initial_snapshot(&self) -> HashMap<String, [f32; RELIEF_DIMS]> {
-        self.defaults
-            .iter()
-            .map(|(k, v)| {
-                let mut arr = [0.0f32; RELIEF_DIMS];
-                for (i, &val) in v.iter().enumerate().take(RELIEF_DIMS) {
-                    arr[i] = val;
-                }
-                (k.clone(), arr)
-            })
-            .collect()
-    }
-
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(&self.entries).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
-    }
-
-    pub fn load(
-        path: &Path,
-        alpha: f32,
-        defaults: HashMap<String, Vec<f32>>,
-    ) -> std::io::Result<Self> {
-        let json = std::fs::read_to_string(path)?;
-        let entries: HashMap<String, ReliefEntry> =
-            serde_json::from_str(&json).map_err(std::io::Error::other)?;
-        Ok(Self {
-            entries,
-            alpha,
-            defaults,
-        })
-    }
-}
+use crate::policy::common::state::{
+    EwmaReliefTable, Pressure6D, RELIEF_DIMS, ReliefUpdateEvent, SignalState, TriggerEngine,
+};
 
 /// LinUCB feature vector 차원 (13).
 ///
@@ -358,14 +54,14 @@ pub const LINUCB_FEATURE_DIM: usize = 13;
 ///
 /// 평균 relief는 EwmaReliefTable이 담당하고,
 /// 이 구조체는 exploration bonus 전용이다.
-struct LinUcbTable {
+pub(crate) struct LinUcbTable {
     /// action_name → D×D P matrix (flat row-major, length = feature_dim²)
-    matrices: HashMap<String, Vec<f32>>,
-    feature_dim: usize,
+    pub(crate) matrices: HashMap<String, Vec<f32>>,
+    pub(crate) feature_dim: usize,
 }
 
 impl LinUcbTable {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             matrices: HashMap::new(),
             feature_dim: LINUCB_FEATURE_DIM,
@@ -373,7 +69,7 @@ impl LinUcbTable {
     }
 
     /// P matrix가 없으면 identity로 초기화 (최대 불확실성 = 최대 탐색).
-    fn ensure_matrix(&mut self, action: &str) {
+    pub(crate) fn ensure_matrix(&mut self, action: &str) {
         if self.matrices.contains_key(action) {
             return;
         }
@@ -387,7 +83,7 @@ impl LinUcbTable {
 
     /// UCB bonus = sqrt(max(0, phi^T · P · phi)).
     /// P matrix가 없으면 1.0 반환 (identity 기대값 ≈ ||phi||, cold-start 탐색 최대).
-    fn ucb_bonus(&self, action: &str, phi: &[f32]) -> f32 {
+    pub(crate) fn ucb_bonus(&self, action: &str, phi: &[f32]) -> f32 {
         let p = match self.matrices.get(action) {
             Some(m) => m,
             None => return 1.0,
@@ -407,7 +103,7 @@ impl LinUcbTable {
     /// P ← P − (P·φ·φᵀ·P) / (1 + φᵀ·P·φ)
     ///
     /// λ=1.0 (망각 없음). 탐색 목적이므로 P는 단조 감소가 맞다.
-    fn update(&mut self, action: &str, phi: &[f32]) {
+    pub(crate) fn update(&mut self, action: &str, phi: &[f32]) {
         self.ensure_matrix(action);
         let p = self.matrices.get_mut(action).unwrap();
         let d = self.feature_dim;
@@ -440,20 +136,17 @@ pub const OBSERVATION_DELAY_SECS: f64 = 3.0;
 /// Lua 스크립트의 POLICY_META 테이블에서 읽어온 이름과 버전.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
-struct PolicyMeta {
-    name: String,
-    version: String,
+pub(crate) struct PolicyMeta {
+    pub(crate) name: String,
+    pub(crate) version: String,
 }
 
 /// 히스토리 링 버퍼에 저장되는 단일 tick 상태 스냅샷.
 #[derive(Debug, Clone)]
-struct HistoryEntry {
-    /// 기록 시각 (단조 시계 기준 초).
-    at_s: f64,
-    /// 6D 압박 벡터 [gpu, cpu, memory, thermal, latency, main_app].
-    pressure: [f32; 6],
-    /// 해당 tick에 엔진에 활성화된 action 이름 목록.
-    active_actions: Vec<String>,
+pub(crate) struct HistoryEntry {
+    pub(crate) at_s: f64,
+    pub(crate) pressure: [f32; 6],
+    pub(crate) active_actions: Vec<String>,
 }
 
 /// Lua 오류가 이 횟수 이상 연속 발생하면 영구 fallback으로 전환한다.
@@ -469,32 +162,11 @@ const FALLBACK_ERROR_THRESHOLD: u32 = 3;
 #[doc(hidden)]
 pub const MAX_PENDING_OBSERVATIONS: usize = 32;
 
-/// Relief 테이블 업데이트 이벤트 (관측성 훅).
-///
-/// 시뮬레이터가 [`LuaPolicy::drain_relief_updates`]로 드레인해 trajectory에
-/// 기록한다. production에서는 로그용으로만 소비된다.
-#[doc(hidden)]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ReliefUpdateEvent {
-    /// observe() 대상 action 이름.
-    pub action: String,
-    /// observe() 호출 전 relief 벡터.
-    pub before: [f32; RELIEF_DIMS],
-    /// observe() 호출 후 relief 벡터 (EWMA 적용 결과).
-    pub after: [f32; RELIEF_DIMS],
-    /// 이번에 관측된 델타 (before_pressure - after_pressure).
-    pub observed: [f32; RELIEF_DIMS],
-    /// 업데이트 후 total observation count.
-    pub observation_count: u32,
-    /// ObservationContext가 기록된 이후 경과 시간 (초).
-    pub age_s: f64,
-}
-
-struct ObservationContext {
-    action: String,
-    before: Pressure6D,
-    timestamp: LogicalInstant,
-    feature_vec: [f32; LINUCB_FEATURE_DIM], // 큐잉 시점의 phi 스냅샷
+pub(crate) struct ObservationContext {
+    pub(crate) action: String,
+    pub(crate) before: Pressure6D,
+    pub(crate) timestamp: LogicalInstant,
+    pub(crate) feature_vec: [f32; LINUCB_FEATURE_DIM], // 큐잉 시점의 phi 스냅샷
 }
 
 /// Lua-based policy strategy.
@@ -502,61 +174,61 @@ struct ObservationContext {
 /// Wraps an `mlua::Lua` VM with a loaded `decide(ctx)` function.
 /// Engine heartbeat state is cached and forwarded as `ctx.engine`.
 pub struct LuaPolicy {
-    lua: Lua,
+    pub(crate) lua: Lua,
     /// Latest engine heartbeat (None until first heartbeat received).
-    engine_state: Option<EngineStatus>,
+    pub(crate) engine_state: Option<EngineStatus>,
     /// 엔진이 Capability 로 보고한 `available_actions` 목록.
     /// Heartbeat 보다 먼저 도착하므로 (그리고 이후 heartbeat 에는 포함되지 않음)
     /// 별도 필드로 보관하여 decide() 의 available 필터에 사용한다.
-    engine_available_actions: Vec<String>,
+    pub(crate) engine_available_actions: Vec<String>,
     // ── 신규 필드 ──
-    signal_state: SignalState,
-    trigger_engine: TriggerEngine,
-    relief_table: EwmaReliefTable,
-    linucb: LinUcbTable,
+    pub(crate) signal_state: SignalState,
+    pub(crate) trigger_engine: TriggerEngine,
+    pub(crate) relief_table: EwmaReliefTable,
+    pub(crate) linucb: LinUcbTable,
     /// 현재 tick의 feature vector. 관측 큐잉 시 스냅샷.
-    feature_state: [f32; LINUCB_FEATURE_DIM],
+    pub(crate) feature_state: [f32; LINUCB_FEATURE_DIM],
     /// LinUCB UCB 탐색 가중치 (config.linucb_alpha).
-    linucb_alpha: f32,
+    pub(crate) linucb_alpha: f32,
     /// QCF cost cache: action_name → (cost, observed_at)
-    qcf_cache: HashMap<String, (f32, LogicalInstant)>,
+    pub(crate) qcf_cache: HashMap<String, (f32, LogicalInstant)>,
     /// RequestQcf 발행 시각. None이면 pending 없음.
-    qcf_pending_at: Option<LogicalInstant>,
+    pub(crate) qcf_pending_at: Option<LogicalInstant>,
     /// RequestQcf 를 유발한 signal. `complete_qcf_selection` 에서 재사용하여
     /// 2-step handshake (QCF 응답 수신 직후 decide() 실행) 를 성사시킨다.
     /// 이 필드가 없으면 QcfEstimate 수신 후 cache만 갱신되고 후속 directive 가
     /// 발행되지 않아 signal 경로가 seq=1 에서 멈춘다.
-    qcf_pending_signal: Option<SystemSignal>,
+    pub(crate) qcf_pending_signal: Option<SystemSignal>,
     /// QCF quality penalty weight (V_Q). config에서 주입.
-    qcf_penalty_weight: f32,
+    pub(crate) qcf_penalty_weight: f32,
     /// QCF cache TTL (초). 초과 시 stale로 판단해 재요청.
-    qcf_stale_secs: f64,
-    observations: VecDeque<ObservationContext>,
-    adaptation_config: AdaptationConfig,
-    clock: Arc<dyn Clock>,
+    pub(crate) qcf_stale_secs: f64,
+    pub(crate) observations: VecDeque<ObservationContext>,
+    pub(crate) adaptation_config: AdaptationConfig,
+    pub(crate) clock: Arc<dyn Clock>,
     /// 최근 발생한 relief 업데이트 이벤트 (시뮬레이터가 drain한다).
-    pending_relief_updates: Vec<ReliefUpdateEvent>,
+    pub(crate) pending_relief_updates: Vec<ReliefUpdateEvent>,
     /// `MAX_PENDING_OBSERVATIONS` 용량 초과로 드롭된 observation 수.
     /// 큐 용량이 충분하면 0이어야 한다 — 값이 계속 증가하면 directive 방출률이
     /// 용량을 초과했다는 뜻이므로 `MAX_PENDING_OBSERVATIONS` 조정을 검토.
-    observation_overrun_count: u64,
+    pub(crate) observation_overrun_count: u64,
     /// 연속 Lua 오류 횟수. FALLBACK_ERROR_THRESHOLD 도달 시 permanent_fallback으로 전환.
-    consecutive_errors: u32,
+    pub(crate) consecutive_errors: u32,
     /// true이면 Lua VM을 호출하지 않고 내장 fallback 로직을 사용한다.
-    permanent_fallback: bool,
+    pub(crate) permanent_fallback: bool,
     /// 로드된 Lua 스크립트 경로 (hot-reload에 사용).
-    script_path: std::path::PathBuf,
+    pub(crate) script_path: std::path::PathBuf,
     /// 로드된 Lua 스크립트의 POLICY_META (없으면 None).
-    policy_meta: Option<PolicyMeta>,
+    pub(crate) policy_meta: Option<PolicyMeta>,
     /// 최근 10 tick의 상태 스냅샷 (오래된 것이 front).
-    history: VecDeque<HistoryEntry>,
+    pub(crate) history: VecDeque<HistoryEntry>,
     /// relief table 마지막 자동 저장 시각.
-    last_persist_at: Option<std::time::Instant>,
+    pub(crate) last_persist_at: Option<std::time::Instant>,
     /// 배타 그룹 맵 — ctx.is_joint_valid()에서 참조한다.
-    exclusion_groups: HashMap<String, Vec<String>>,
+    pub(crate) exclusion_groups: HashMap<String, Vec<String>>,
     /// GPU telemetry provider — `sys.gpu_freq()`, `sys.gpu_busy()` Lua 헬퍼에서 참조한다.
     /// `ComputeMonitor`와 동일 인스턴스를 공유하여 tegrastats child 중복 spawn을 방지한다.
-    gpu_provider: SharedGpuProvider,
+    pub(crate) gpu_provider: SharedGpuProvider,
 }
 
 impl std::fmt::Debug for LuaPolicy {
@@ -795,303 +467,19 @@ impl LuaPolicy {
 
     /// 현재 엔진 상태 + signal_state에서 13차원 feature vector를 빌드.
     fn build_feature_vec(&self) -> [f32; LINUCB_FEATURE_DIM] {
-        let mut phi = [0.0f32; LINUCB_FEATURE_DIM];
-
-        if let Some(ref status) = self.engine_state {
-            // 0: KV_OCCUPANCY
-            phi[0] = status.kv_cache_utilization.clamp(0.0, 1.0);
-            // 1: IS_GPU
-            phi[1] = if status.active_device.to_lowercase().contains("opencl") {
-                1.0
-            } else {
-                0.0
-            };
-            // 2 & 6: TOKEN_PROGRESS / TOKENS_GEN_NORM (같은 값)
-            let tok_norm = (status.tokens_generated as f32 / 2048.0).min(1.0);
-            phi[2] = tok_norm;
-            phi[6] = tok_norm;
-            // 3: IS_PREFILL
-            phi[3] = if status.phase == "prefill" { 1.0 } else { 0.0 };
-            // 4: KV_DTYPE_NORM
-            phi[4] = match status.kv_dtype.as_str() {
-                "f32" => 0.0,
-                "f16" => 0.5,
-                _ => 1.0, // q4_0 등 양자화 포맷
-            };
-            // 7-12: ACTIVE_* flags
-            for action in &status.active_actions {
-                match action.as_str() {
-                    "switch_hw" => phi[7] = 1.0,
-                    "throttle" | "set_target_tbt" => phi[8] = 1.0,
-                    "kv_offload_disk" => phi[9] = 1.0,
-                    "kv.evict_h2o" | "kv.evict_sliding" | "kv.merge_d2o" => phi[10] = 1.0,
-                    "weight.skip" => phi[11] = 1.0,
-                    "kv.quant_dynamic" => phi[12] = 1.0,
-                    _ => {}
-                }
-            }
-        }
-
-        // 5: TBT_RATIO
-        phi[5] = self.trigger_engine.tbt_degradation_ratio().unwrap_or(0.0) as f32;
-
-        phi
+        crate::lua::context::build_feature_vec(self)
     }
 
     /// Build the `ctx` Lua table from current engine state.
     fn build_ctx(&self) -> LuaResult<Table> {
-        let lua = &self.lua;
-        let ctx = lua.create_table()?;
-
-        // ctx.engine
-        let engine_tbl = lua.create_table()?;
-        if let Some(ref status) = self.engine_state {
-            engine_tbl.set("device", status.active_device.as_str())?;
-            engine_tbl.set("throughput", status.actual_throughput)?;
-            engine_tbl.set("kv_util", status.kv_cache_utilization)?;
-            engine_tbl.set("cache_tokens", status.kv_cache_tokens)?;
-            engine_tbl.set("cache_bytes", status.kv_cache_bytes)?;
-            engine_tbl.set("tokens_generated", status.tokens_generated)?;
-            let state_str = match status.state {
-                llm_shared::EngineState::Idle => "idle",
-                llm_shared::EngineState::Running => "running",
-                llm_shared::EngineState::Suspended => "suspended",
-            };
-            engine_tbl.set("state", state_str)?;
-            engine_tbl.set("kv_dtype", status.kv_dtype.as_str())?;
-            engine_tbl.set("skip_ratio", status.skip_ratio)?;
-            engine_tbl.set("phase", status.phase.as_str())?;
-            engine_tbl.set("prefill_pos", status.prefill_pos)?;
-            engine_tbl.set("prefill_total", status.prefill_total)?;
-            engine_tbl.set("partition_ratio", status.partition_ratio)?;
-            // MGR-DAT-075/076, MSG-069: Engine process 자가 사용률 (Phase 1: CPU만 실측, GPU는 0.0 placeholder).
-            engine_tbl.set("cpu_pct", status.self_cpu_pct)?;
-            engine_tbl.set("gpu_pct", status.self_gpu_pct)?;
-        } else {
-            // No heartbeat yet -- provide defaults
-            engine_tbl.set("device", "unknown")?;
-            engine_tbl.set("throughput", 0.0)?;
-            engine_tbl.set("kv_util", 0.0)?;
-            engine_tbl.set("cache_tokens", 0)?;
-            engine_tbl.set("cache_bytes", 0)?;
-            engine_tbl.set("tokens_generated", 0)?;
-            engine_tbl.set("state", "idle")?;
-            engine_tbl.set("kv_dtype", "")?;
-            engine_tbl.set("skip_ratio", 0.0)?;
-            engine_tbl.set("phase", "")?;
-            engine_tbl.set("prefill_pos", 0)?;
-            engine_tbl.set("prefill_total", 0)?;
-            engine_tbl.set("partition_ratio", 0.0)?;
-            // MGR-DAT-075/076, MSG-069: heartbeat 없을 때 0.0 default (INV-092).
-            engine_tbl.set("cpu_pct", 0.0)?;
-            engine_tbl.set("gpu_pct", 0.0)?;
-        }
-        ctx.set("engine", engine_tbl)?;
-
-        // ctx.active -- list of currently active action names
-        let active_tbl = lua.create_table()?;
-        if let Some(ref status) = self.engine_state {
-            for (i, action) in status.active_actions.iter().enumerate() {
-                active_tbl.set(i + 1, action.as_str())?;
-            }
-        }
-        ctx.set("active", active_tbl)?;
-
-        // ctx.available -- 엔진이 실행 가능하다고 보고한 action 이름 목록.
-        // 비어있으면 "엔진이 아직 capability 를 보고하지 않음" 으로 해석 —
-        // 이 경우 Lua 측은 필터링하지 않는다 (backward compat).
-        // Capability 메시지가 heartbeat 보다 먼저 도착하므로 engine_state 가 None
-        // 이어도 engine_available_actions 에서 가져온다.
-        // 엔진이 F16 KV 를 사용하면 kv_quant_dynamic 이 제외되는 등, cache dtype /
-        // eviction_policy 에 따라 동적으로 결정된다
-        // (engine/src/resilience/executor.rs `compute_available_actions`).
-        let avail_tbl = lua.create_table()?;
-        let avail_source: &[String] = if let Some(ref status) = self.engine_state
-            && !status.available_actions.is_empty()
-        {
-            &status.available_actions
-        } else {
-            &self.engine_available_actions
-        };
-        for (i, action) in avail_source.iter().enumerate() {
-            avail_tbl.set(i + 1, action.as_str())?;
-        }
-        ctx.set("available", avail_tbl)?;
-
-        // ctx.signal (신규)
-        let signal_tbl = lua.create_table()?;
-        {
-            let mem = lua.create_table()?;
-            mem.set("available", self.signal_state.mem_available)?;
-            mem.set("total", self.signal_state.mem_total)?;
-            signal_tbl.set("memory", mem)?;
-
-            let compute = lua.create_table()?;
-            compute.set("cpu_pct", self.signal_state.cpu_pct)?;
-            compute.set("gpu_pct", self.signal_state.gpu_pct)?;
-            signal_tbl.set("compute", compute)?;
-
-            let thermal = lua.create_table()?;
-            thermal.set("temp_c", self.signal_state.temp_mc as f64 / 1000.0)?;
-            thermal.set("throttling", self.signal_state.throttling)?;
-            signal_tbl.set("thermal", thermal)?;
-        }
-        ctx.set("signal", signal_tbl)?;
-
-        // ctx.coef (신규)
-        let coef = lua.create_table()?;
-        {
-            // coef.pressure
-            let pressure = self.signal_state.pressure_with_thermal(
-                self.adaptation_config.temp_safe_c,
-                self.adaptation_config.temp_critical_c,
-                self.trigger_engine.tbt_degradation_ratio(),
-            );
-            let p_tbl = lua.create_table()?;
-            p_tbl.set("gpu", pressure.gpu)?;
-            p_tbl.set("cpu", pressure.cpu)?;
-            p_tbl.set("memory", pressure.memory)?;
-            p_tbl.set("thermal", pressure.thermal)?;
-            p_tbl.set("latency", pressure.latency)?;
-            p_tbl.set("main_app", pressure.main_app)?;
-            coef.set("pressure", p_tbl)?;
-
-            // coef.trigger
-            let trigger = self.trigger_engine.state();
-            let t_tbl = lua.create_table()?;
-            t_tbl.set("tbt_degraded", trigger.tbt_degraded)?;
-            t_tbl.set("mem_low", trigger.mem_low)?;
-            t_tbl.set("temp_high", trigger.temp_high)?;
-            coef.set("trigger", t_tbl)?;
-
-            // coef.relief
-            let r_tbl = lua.create_table()?;
-            let action_names = [
-                "switch_hw",
-                "throttle",
-                "set_target_tbt",
-                "weight.skip",
-                "kv.evict_h2o",
-                "kv.evict_sliding",
-                "kv_streaming",
-                "kv.merge_d2o",
-                "kv.quant_dynamic",
-                "set_partition_ratio",
-            ];
-            for name in &action_names {
-                let relief = self.relief_table.predict(name);
-                let ucb = self.linucb.ucb_bonus(name, &self.feature_state) * self.linucb_alpha;
-                let entry = lua.create_table()?;
-                entry.set("gpu", relief[0])?;
-                entry.set("cpu", relief[1])?;
-                entry.set("memory", relief[2])?;
-                entry.set("thermal", relief[3])?;
-                entry.set("lat", relief[4])?;
-                entry.set("qos", relief[5])?;
-                entry.set("ucb_bonus", ucb)?;
-                // QCF cost: cache에서 조회. 미수신 시 0 (penalty 없음), age=MAX
-                let (qcf_cost, qcf_age_s) = match self.qcf_cache.get(*name) {
-                    Some(&(cost, observed_at)) => {
-                        let age = self.clock.elapsed_since(observed_at).as_secs_f64() as f32;
-                        (cost, age)
-                    }
-                    None => (0.0_f32, f32::MAX),
-                };
-                entry.set("qcf_cost", qcf_cost)?;
-                entry.set("qcf_age_s", qcf_age_s)?;
-                r_tbl.set(*name, entry)?;
-            }
-            coef.set("relief", r_tbl)?;
-
-            // coef.qcf_penalty_weight — Lua script가 V_Q를 config 값으로 override할 때 사용
-            coef.set("qcf_penalty_weight", self.qcf_penalty_weight)?;
-        }
-        ctx.set("coef", coef)?;
-
-        // ctx.history — 최근 N tick의 상태 스냅샷 (오래된 것이 index 1)
-        let history_table = self.lua.create_table()?;
-        for (i, entry) in self.history.iter().enumerate() {
-            let h = self.lua.create_table()?;
-            h.set("at_s", entry.at_s)?;
-
-            let p = self.lua.create_table()?;
-            p.set("gpu", entry.pressure[0])?;
-            p.set("cpu", entry.pressure[1])?;
-            p.set("memory", entry.pressure[2])?;
-            p.set("thermal", entry.pressure[3])?;
-            p.set("latency", entry.pressure[4])?;
-            p.set("main_app", entry.pressure[5])?;
-            h.set("pressure", p)?;
-
-            let acts = self.lua.create_table()?;
-            for (j, a) in entry.active_actions.iter().enumerate() {
-                acts.set(j + 1, a.as_str())?;
-            }
-            h.set("active", acts)?;
-
-            history_table.set(i + 1, h)?;
-        }
-        ctx.set("history", history_table)?;
-
-        // ctx.is_joint_valid(action_list) — Lua에서 joint action 검증에 사용
-        // 인자: string 배열 (Lua table). 반환: boolean.
-        // 배타 그룹에 속한 두 액션이 동시에 포함되면 false를 반환한다.
-        {
-            let groups = self.exclusion_groups.clone();
-            let is_joint_valid = self.lua.create_function(move |_, tbl: Table| {
-                let mut names: Vec<String> = Vec::new();
-                for pair in tbl.pairs::<mlua::Value, String>() {
-                    match pair {
-                        Ok((_, v)) => names.push(v),
-                        Err(_) => continue,
-                    }
-                }
-                for members in groups.values() {
-                    let mut count = 0usize;
-                    for name in &names {
-                        if members.contains(name) {
-                            count += 1;
-                        }
-                        if count >= 2 {
-                            return Ok(false);
-                        }
-                    }
-                }
-                Ok(true)
-            })?;
-            ctx.set("is_joint_valid", is_joint_valid)?;
-        }
-
-        Ok(ctx)
+        crate::lua::context::build_ctx(self)
     }
 
     /// 내장 fallback 정책 — Lua VM 없이 신호 레벨만으로 커맨드를 생성한다.
     ///
     /// `permanent_fallback`이 true일 때 또는 Lua 오류 발생 시 대체 경로로 사용된다.
     fn fallback_decide(&self, signal: &SystemSignal) -> Vec<EngineCommand> {
-        use llm_shared::Level;
-        match signal {
-            SystemSignal::MemoryPressure { level, .. } => match level {
-                Level::Normal => vec![EngineCommand::RestoreDefaults],
-                Level::Warning => vec![EngineCommand::KvEvictSliding { keep_ratio: 0.85 }],
-                Level::Critical => vec![EngineCommand::KvEvictSliding { keep_ratio: 0.50 }],
-                Level::Emergency => vec![
-                    EngineCommand::KvEvictSliding { keep_ratio: 0.25 },
-                    EngineCommand::SetTargetTbt { target_ms: 500 },
-                ],
-            },
-            SystemSignal::ThermalAlert { level, .. } => match level {
-                Level::Normal | Level::Warning => vec![],
-                Level::Critical => vec![EngineCommand::Throttle { delay_ms: 100 }],
-                Level::Emergency => vec![EngineCommand::Throttle { delay_ms: 200 }],
-            },
-            SystemSignal::ComputeGuidance { level, .. } => match level {
-                Level::Normal | Level::Warning => vec![],
-                Level::Critical => vec![EngineCommand::Throttle { delay_ms: 50 }],
-                Level::Emergency => vec![EngineCommand::Throttle { delay_ms: 150 }],
-            },
-            SystemSignal::EnergyConstraint { .. } => vec![],
-        }
+        crate::lua::fallback::fallback_decide(signal)
     }
 
     /// Call `decide(ctx)` and parse the returned table into `Vec<EngineCommand>`.
@@ -1457,21 +845,27 @@ impl PolicyStrategy for LuaPolicy {
             }
         }
     }
-
-    fn relief_snapshot(&self) -> Option<std::collections::HashMap<String, [f32; 6]>> {
-        Some(self.relief_table.snapshot())
+    fn inspect_state(&mut self, visitor: &mut dyn crate::pipeline::PolicyVisitor) {
+        for (action, entry) in self.relief_table.entries.iter() {
+            visitor.record_relief_entry(action, &entry.relief, false);
+        }
+        for (action, default) in self.relief_table.defaults.iter() {
+            let mut relief = [0.0f32; RELIEF_DIMS];
+            for (i, v) in default.iter().enumerate().take(RELIEF_DIMS) {
+                relief[i] = *v;
+            }
+            visitor.record_relief_entry(action, &relief, true);
+        }
+        let updates = LuaPolicy::drain_relief_updates(self);
+        for update in updates {
+            visitor.record_relief_update(&update);
+        }
+        let overrun = LuaPolicy::observation_overrun_count(self);
+        visitor.record_u64("observation_overrun_count", overrun);
     }
 
-    fn initial_relief_snapshot(&self) -> Option<std::collections::HashMap<String, [f32; 6]>> {
-        Some(self.relief_table.initial_snapshot())
-    }
-
-    fn drain_relief_updates(&mut self) -> Vec<ReliefUpdateEvent> {
-        LuaPolicy::drain_relief_updates(self)
-    }
-
-    fn observation_overrun_count(&self) -> u64 {
-        LuaPolicy::observation_overrun_count(self)
+    fn as_reloadable(&mut self) -> Option<&mut dyn crate::pipeline::ReloadablePolicy> {
+        Some(self)
     }
 
     fn complete_qcf_selection(&mut self, qcf: &QcfEstimate) -> Option<EngineDirective> {
@@ -1510,11 +904,9 @@ impl PolicyStrategy for LuaPolicy {
         }
         None
     }
+}
 
-    /// Lua 스크립트 핫-리로드.
-    ///
-    /// 새 VM에서 스크립트 로드 + `decide` 함수 존재 검증에 성공한 경우에만
-    /// `self.lua`와 `self.script_path`를 교체한다. 실패 시 `self` 변경 없이 Err.
+impl crate::pipeline::ReloadablePolicy for LuaPolicy {
     fn reload_script(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         // 1. 새 Lua VM 생성 (new()의 초기화 로직 복제)
         // Safety: TABLE | STRING | MATH | IO 로드. OS/PACKAGE/DEBUG 차단 (MGR-049).
@@ -1961,6 +1353,7 @@ fn parse_meminfo_value(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TriggerConfig;
     use std::io::Write;
 
     fn create_temp_script(content: &str) -> tempfile::NamedTempFile {

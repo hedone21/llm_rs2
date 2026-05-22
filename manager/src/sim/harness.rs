@@ -346,10 +346,10 @@ impl Simulator {
 
         // Relief 업데이트 + observation overrun 드레인 — 관측성 훅.
         #[cfg(feature = "lua")]
-        for ev in self.policy.drain_relief_updates() {
+        for ev in crate::pipeline::drain_relief_updates_helper(self.policy.as_mut()) {
             self.trajectory.record_relief_update(tick_end, &ev);
         }
-        let overrun_total = self.policy.observation_overrun_count();
+        let overrun_total = crate::pipeline::get_observation_overrun_count(self.policy.as_mut());
         if overrun_total > self.last_overrun_count {
             self.last_overrun_count = overrun_total;
             self.trajectory

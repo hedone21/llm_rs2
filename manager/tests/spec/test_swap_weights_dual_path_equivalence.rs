@@ -86,11 +86,11 @@ fn test_lua_path_produces_swap_weights_ratio_0_5() {
     }
 }
 
-// ── Lua 경로: ratio>0.9 clamp ──
+// ── Lua 경로: ratio>0.9 clamp 제거 검증 ──
 
-/// Lua 경로: ratio=1.0 → 0.9로 clamp 되어야 한다.
+/// Lua 경로: ratio=1.0 → clamp 되지 않고 1.0이 그대로 전달되어야 한다.
 #[test]
-fn test_lua_path_clamps_ratio_above_0_9() {
+fn test_lua_path_does_not_clamp_ratio_above_0_9() {
     let script = make_temp_lua_script(
         r#"function decide(ctx)
             return {{
@@ -116,8 +116,8 @@ fn test_lua_path_clamps_ratio_above_0_9() {
     match sw {
         EngineCommand::SwapWeights { ratio, .. } => {
             assert!(
-                *ratio <= 0.9 + f32::EPSILON,
-                "Lua path: ratio must be clamped to ≤0.9, got {ratio}"
+                (*ratio - 1.0).abs() < f32::EPSILON,
+                "Lua path: ratio should pass through unchanged, got {ratio}"
             );
         }
         _ => unreachable!(),

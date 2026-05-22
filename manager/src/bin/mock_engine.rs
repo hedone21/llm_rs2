@@ -376,6 +376,10 @@ fn run_protocol(args: &Args, stream: &mut (impl Read + Write)) -> anyhow::Result
         max_kv_tokens: 2048,
         bytes_per_kv_token: 256,
         num_layers: 16,
+        available_actions: ALL_AVAILABLE_ACTIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         ..Default::default()
     };
     send_message(stream, &EngineMessage::Capability(capability)).context("send Capability")?;

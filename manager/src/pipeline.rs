@@ -14,6 +14,21 @@ use llm_shared::{EngineCommand, EngineDirective, EngineMessage, QcfEstimate, Sys
 
 use crate::types::OperatingMode;
 
+/// 정책의 내부 상태를 타입 안전하고 선언적으로 수집하기 위한 인스펙터 인터페이스
+pub trait PolicyVisitor {
+    fn record_f32(&mut self, key: &str, value: f32);
+    fn record_u64(&mut self, key: &str, value: u64);
+    fn record_string(&mut self, key: &str, value: &str);
+    fn record_relief_entry(&mut self, action: &str, relief: &[f32; 6], is_initial: bool);
+    fn record_relief_update(&mut self, event: &crate::policy::common::state::ReliefUpdateEvent);
+}
+
+/// 핫-리로드를 지원하는 정책 대상의 인터페이스
+pub trait ReloadablePolicy {
+    fn reload_script(&mut self, path: &std::path::Path) -> anyhow::Result<()>;
+    fn script_path(&self) -> Option<&std::path::Path>;
+}
+
 /// 정책 판단 계층의 공통 인터페이스.
 ///
 /// Monitor가 수집한 SystemSignal을 처리하여 EngineDirective를 생성한다.
@@ -44,20 +59,8 @@ pub trait PolicyStrategy: Send {
         None
     }
 
-    /// EwmaReliefTable 상태 스냅샷을 반환한다 (테스트/시뮬레이터 관측용).
-    ///
-    /// `action_name → [f32; 6]` 형태. 기본 구현은 None (구현하지 않은 정책).
-    /// LuaPolicy는 Some을 반환하도록 오버라이드한다.
-    fn relief_snapshot(&self) -> Option<HashMap<String, [f32; 6]>> {
-        None
-    }
-
-    /// EwmaReliefTable defaults에 설정된 초기값 스냅샷을 반환한다 (sim_run 진단용).
-    ///
-    /// 기본 구현은 None. LuaPolicy는 Some을 반환하도록 오버라이드한다.
-    fn initial_relief_snapshot(&self) -> Option<HashMap<String, [f32; 6]>> {
-        None
-    }
+    /// 진단 및 시뮬레이션을 위한 상태 노출 인터페이스 (대안 A)
+    fn inspect_state(&mut self, _visitor: &mut dyn PolicyVisitor) {}
 
     /// 직전 process_signal() 호출에서 큐잉된 observation을 취소한다.
     ///
@@ -65,36 +68,113 @@ pub trait PolicyStrategy: Send {
     /// 기본 구현은 no-op (관측 기능 없는 policy에서 그냥 무시).
     fn cancel_last_observation(&mut self) {}
 
-    /// 관측성 훅: 지난 호출 이후 발생한 relief 업데이트 이벤트를 드레인한다.
-    ///
-    /// 시뮬레이터가 매 tick 호출해 Trajectory에 기록한다. 기본은 빈 Vec.
-    fn drain_relief_updates(&mut self) -> Vec<crate::lua_policy::ReliefUpdateEvent> {
-        Vec::new()
-    }
-
-    /// 관측성 훅: 3s 관측 지연 충족 전에 덮어써진 observation 누적 개수.
-    ///
-    /// 빠른 directive 방출로 인한 학습 누락 감지용. 기본은 0.
-    fn observation_overrun_count(&self) -> u64 {
-        0
-    }
-
-    /// Lua 스크립트를 핫-리로드한다.
-    ///
-    /// 새 VM을 생성하고 스크립트를 검증한 뒤 성공 시에만 `self`를 교체한다.
-    /// 실패 시 `self` 변경 없이 `Err`를 반환한다.
-    ///
-    /// 기본 구현은 지원하지 않음을 알리는 에러를 반환한다.
-    fn reload_script(&mut self, _path: &std::path::Path) -> anyhow::Result<()> {
-        anyhow::bail!("reload_script not supported by this policy")
-    }
-
-    /// 현재 로드된 Lua 스크립트 경로를 반환한다.
-    ///
-    /// 기본 구현은 None (Lua 정책이 아닌 경우).
-    fn script_path(&self) -> Option<&std::path::Path> {
+    /// 핫-리로드 기능 접근을 위한 다운캐스트 헬퍼
+    fn as_reloadable(&mut self) -> Option<&mut dyn ReloadablePolicy> {
         None
     }
+}
+
+/// Helper to extract relief snapshot from policy using inspect_state
+pub fn get_relief_snapshot(policy: &mut dyn PolicyStrategy) -> HashMap<String, [f32; 6]> {
+    struct SnapshotCollector {
+        map: HashMap<String, [f32; 6]>,
+    }
+    impl PolicyVisitor for SnapshotCollector {
+        fn record_f32(&mut self, _key: &str, _value: f32) {}
+        fn record_u64(&mut self, _key: &str, _value: u64) {}
+        fn record_string(&mut self, _key: &str, _value: &str) {}
+        fn record_relief_entry(&mut self, action: &str, relief: &[f32; 6], is_initial: bool) {
+            if !is_initial {
+                self.map.insert(action.to_string(), *relief);
+            }
+        }
+        fn record_relief_update(
+            &mut self,
+            _event: &crate::policy::common::state::ReliefUpdateEvent,
+        ) {
+        }
+    }
+    let mut collector = SnapshotCollector {
+        map: HashMap::new(),
+    };
+    policy.inspect_state(&mut collector);
+    collector.map
+}
+
+/// Helper to extract initial relief snapshot from policy using inspect_state
+pub fn get_initial_relief_snapshot(policy: &mut dyn PolicyStrategy) -> HashMap<String, [f32; 6]> {
+    struct InitialSnapshotCollector {
+        map: HashMap<String, [f32; 6]>,
+    }
+    impl PolicyVisitor for InitialSnapshotCollector {
+        fn record_f32(&mut self, _key: &str, _value: f32) {}
+        fn record_u64(&mut self, _key: &str, _value: u64) {}
+        fn record_string(&mut self, _key: &str, _value: &str) {}
+        fn record_relief_entry(&mut self, action: &str, relief: &[f32; 6], is_initial: bool) {
+            if is_initial {
+                self.map.insert(action.to_string(), *relief);
+            }
+        }
+        fn record_relief_update(
+            &mut self,
+            _event: &crate::policy::common::state::ReliefUpdateEvent,
+        ) {
+        }
+    }
+    let mut collector = InitialSnapshotCollector {
+        map: HashMap::new(),
+    };
+    policy.inspect_state(&mut collector);
+    collector.map
+}
+
+/// Helper to drain relief updates using inspect_state
+pub fn drain_relief_updates_helper(
+    policy: &mut dyn PolicyStrategy,
+) -> Vec<crate::policy::common::state::ReliefUpdateEvent> {
+    struct UpdateCollector {
+        events: Vec<crate::policy::common::state::ReliefUpdateEvent>,
+    }
+    impl PolicyVisitor for UpdateCollector {
+        fn record_f32(&mut self, _key: &str, _value: f32) {}
+        fn record_u64(&mut self, _key: &str, _value: u64) {}
+        fn record_string(&mut self, _key: &str, _value: &str) {}
+        fn record_relief_entry(&mut self, _action: &str, _relief: &[f32; 6], _is_initial: bool) {}
+        fn record_relief_update(
+            &mut self,
+            event: &crate::policy::common::state::ReliefUpdateEvent,
+        ) {
+            self.events.push(event.clone());
+        }
+    }
+    let mut collector = UpdateCollector { events: Vec::new() };
+    policy.inspect_state(&mut collector);
+    collector.events
+}
+
+/// Helper to get observation overrun count using inspect_state
+pub fn get_observation_overrun_count(policy: &mut dyn PolicyStrategy) -> u64 {
+    struct OverrunCollector {
+        count: u64,
+    }
+    impl PolicyVisitor for OverrunCollector {
+        fn record_f32(&mut self, _key: &str, _value: f32) {}
+        fn record_u64(&mut self, key: &str, value: u64) {
+            if key == "observation_overrun_count" {
+                self.count = value;
+            }
+        }
+        fn record_string(&mut self, _key: &str, _value: &str) {}
+        fn record_relief_entry(&mut self, _action: &str, _relief: &[f32; 6], _is_initial: bool) {}
+        fn record_relief_update(
+            &mut self,
+            _event: &crate::policy::common::state::ReliefUpdateEvent,
+        ) {
+        }
+    }
+    let mut collector = OverrunCollector { count: 0 };
+    policy.inspect_state(&mut collector);
+    collector.count
 }
 
 /// Seq ID 생성을 위한 단조 증가 카운터.
@@ -126,7 +206,7 @@ mod hierarchical {
         PressureVector, feature,
     };
 
-    use super::{PolicyStrategy, next_seq_id};
+    use super::{PolicyStrategy, PolicyVisitor, next_seq_id};
 
     /// 선택된 커맨드 목록에 joint constraint 위반이 있는지 확인한다.
     ///
@@ -680,6 +760,38 @@ mod hierarchical {
                 } else {
                     log::info!("Saved relief model to {}", path);
                 }
+            }
+        }
+
+        fn inspect_state(&mut self, visitor: &mut dyn PolicyVisitor) {
+            // is_initial = true 인 초기값 기록
+            for action in ActionId::all() {
+                let initial_relief = match action {
+                    ActionId::SwitchHw => [0.0, 0.5, 0.0, 0.3, -0.1, 0.0],
+                    ActionId::Throttle => [0.0, 0.3, 0.0, 0.2, -0.3, 0.0],
+                    ActionId::KvOffloadDisk => [0.0, 0.0, 0.4, 0.0, -0.2, 0.0],
+                    ActionId::KvEvictSliding => [0.0, 0.0, 0.7, 0.0, 0.0, 0.0],
+                    ActionId::KvEvictH2o => [0.0, 0.0, 0.6, 0.0, 0.0, 0.0],
+                    ActionId::KvEvictStreaming => [0.0, 0.0, 0.7, 0.0, 0.0, 0.0],
+                    ActionId::KvMergeD2o => [0.0, 0.0, 0.6, 0.0, 0.0, 0.0],
+                    ActionId::KvQuantDynamic => [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                    ActionId::LayerSkip => [0.0, 0.4, 0.0, 0.2, 0.0, 0.0],
+                    ActionId::SwapWeights => [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                };
+                let action_str = action.as_str();
+                visitor.record_relief_entry(action_str, &initial_relief, true);
+
+                // is_initial = false 인 현재 예측값 기록
+                let relief_vec = self.estimator.predict(action, &self.engine_state);
+                let current_relief = [
+                    0.0,                // gpu
+                    relief_vec.compute, // cpu
+                    relief_vec.memory,  // memory
+                    relief_vec.thermal, // thermal
+                    relief_vec.latency, // latency
+                    0.0,                // main_app
+                ];
+                visitor.record_relief_entry(action_str, &current_relief, false);
             }
         }
     }

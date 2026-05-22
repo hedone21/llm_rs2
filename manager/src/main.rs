@@ -195,19 +195,22 @@ fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // ── SIGHUP: Lua 스크립트 hot-reload ─────────────────────────────────
         #[cfg(unix)]
         if SIGHUP_RELOAD.swap(false, Ordering::Relaxed) {
-            if let Some(path) = policy.script_path() {
-                let path = path.to_path_buf();
-                log::info!(
-                    "SIGHUP received — reloading policy script: {}",
-                    path.display()
-                );
-                if let Err(e) = policy.reload_script(&path) {
-                    log::error!("Policy hot-reload failed: {}", e);
+            if let Some(reloadable) = policy.as_reloadable() {
+                if let Some(path) = reloadable.script_path() {
+                    let path = path.to_path_buf();
+                    log::info!(
+                        "SIGHUP received — reloading policy script: {}",
+                        path.display()
+                    );
+                    if let Err(e) = reloadable.reload_script(&path) {
+                        log::error!("Policy hot-reload failed: {}", e);
+                    } else {
+                        log::info!("Policy hot-reload succeeded");
+                    }
                 } else {
-                    log::info!("Policy hot-reload succeeded");
+                    log::warn!("SIGHUP received but policy does not have a script path");
                 }
             } else {
                 log::warn!("SIGHUP received but policy does not support hot-reload");

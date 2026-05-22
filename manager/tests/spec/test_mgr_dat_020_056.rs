@@ -47,7 +47,7 @@ latency_budget = 0.5
 lossy = false
 reversible = true
 
-[policy.actions.kv_evict_sliding]
+[policy.actions."kv.evict_sliding"]
 lossy = true
 reversible = false
 
@@ -86,7 +86,7 @@ fn test_mgr_dat_031_policy_config_defaults() {
 #[test]
 fn test_mgr_dat_035_action_config_default_cost_fallback() {
     let toml_str = r#"
-[policy.actions.kv_evict_sliding]
+[policy.actions."kv.evict_sliding"]
 lossy = true
 reversible = false
 "#;
@@ -100,12 +100,12 @@ reversible = false
 #[test]
 fn test_mgr_dat_035_action_config_explicit_default_cost() {
     let toml_str = r#"
-[policy.actions.kv_evict_sliding]
+[policy.actions."kv.evict_sliding"]
 lossy = true
 reversible = false
 default_cost = 0.5
 
-[policy.actions.layer_skip]
+[policy.actions."weight.skip"]
 lossy = true
 reversible = true
 default_cost = 2.0

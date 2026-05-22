@@ -219,7 +219,7 @@ mod ewma_tests {
         // 3초 이상 경과 후에도 relief는 비어있어야 함 (관측이 시작되지 않았으므로)
         // → 다시 signal 주입 후 relief_snapshot 확인
         let _ = policy.process_signal(&signal);
-        let snapshot = policy.relief_snapshot().unwrap_or_default();
+        let snapshot = llm_manager::pipeline::get_relief_snapshot(&mut policy);
         // observation이 시작되지 않았으므로 relief는 비어있음
         assert!(
             snapshot.is_empty(),
@@ -298,7 +298,7 @@ mod ewma_tests {
 
         // 아직 3초가 경과하지 않았고, 두 번째 signal에서도 새 observation으로 교체됨.
         // relief_snapshot은 비어있어야 함 (learn 안 됨).
-        let snapshot = policy.relief_snapshot().unwrap_or_default();
+        let snapshot = llm_manager::pipeline::get_relief_snapshot(&mut policy);
         assert!(
             snapshot.is_empty(),
             "3초 미경과 상태에서 새 signal → 기존 observation 폐기, relief 비어있어야 함 (INV-088)"
@@ -342,7 +342,7 @@ mod ewma_tests {
         }
 
         // relief_snapshot은 비어있어야 함 (observation 미생성)
-        let snapshot = policy.relief_snapshot().unwrap_or_default();
+        let snapshot = llm_manager::pipeline::get_relief_snapshot(&mut policy);
         assert!(
             snapshot.is_empty(),
             "빈 커맨드 반환 시 ObservationContext 미생성 → relief 비어있어야 함"
@@ -415,7 +415,7 @@ mod ewma_tests {
         //           그 후 새 directive → observation 교체(timestamp=2.999s)
         *time.lock().unwrap() = Duration::from_millis(2999);
         let _ = policy.process_signal(&mem_signal);
-        let snapshot_before = policy.relief_snapshot().unwrap_or_default();
+        let snapshot_before = llm_manager::pipeline::get_relief_snapshot(&mut policy);
         assert!(
             snapshot_before.is_empty(),
             "2.999초 시점에서 learn이 없어야 함 (elapsed < 3.0s)"
@@ -426,7 +426,7 @@ mod ewma_tests {
         // t=6.001s: elapsed = 6.001 - 2.999 = 3.002s >= 3.0s → learn 발생
         *time.lock().unwrap() = Duration::from_millis(6001);
         let _ = policy.process_signal(&mem_signal);
-        let snapshot_after = policy.relief_snapshot().unwrap_or_default();
+        let snapshot_after = llm_manager::pipeline::get_relief_snapshot(&mut policy);
         assert!(
             !snapshot_after.is_empty(),
             "3.002초 경과 시점에서 relief에 학습된 값이 있어야 함 (MGR-ALG-083)"
@@ -823,10 +823,11 @@ mod ewma_tests {
         };
 
         // 파일 없음 → crash 없이 fresh start
-        let policy = LuaPolicy::with_system_clock(script_path.to_str().unwrap(), config).unwrap();
+        let mut policy =
+            LuaPolicy::with_system_clock(script_path.to_str().unwrap(), config).unwrap();
 
         // 빈 entries로 시작해야 함
-        let snapshot = policy.relief_snapshot().unwrap_or_default();
+        let snapshot = llm_manager::pipeline::get_relief_snapshot(&mut policy);
         assert!(
             snapshot.is_empty(),
             "파일 없을 때 빈 entries로 시작해야 함 (MGR-092)"
@@ -852,9 +853,10 @@ mod ewma_tests {
         };
 
         // 파싱 실패 → crash 없이 fresh start
-        let policy = LuaPolicy::with_system_clock(script_path.to_str().unwrap(), config).unwrap();
+        let mut policy =
+            LuaPolicy::with_system_clock(script_path.to_str().unwrap(), config).unwrap();
 
-        let snapshot = policy.relief_snapshot().unwrap_or_default();
+        let snapshot = llm_manager::pipeline::get_relief_snapshot(&mut policy);
         assert!(
             snapshot.is_empty(),
             "파싱 실패 시 빈 entries로 fresh start해야 함 (MGR-092)"

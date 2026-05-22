@@ -76,7 +76,7 @@ fn scenario_memory_pressure_steady() {
         insta::assert_yaml_snapshot!("memory_pressure_summary", summary);
     });
 
-    let relief = sim.policy.relief_snapshot().unwrap_or_default();
+    let relief = llm_manager::pipeline::get_relief_snapshot(sim.policy.as_mut());
     if !relief.is_empty() {
         let formatted = format_relief(&relief);
         insta::with_settings!({ sort_maps => true, snapshot_suffix => "" }, {
@@ -161,7 +161,7 @@ fn scenario_thermal_ramp_with_decode() {
         insta::assert_yaml_snapshot!("thermal_ramp_summary", summary);
     });
 
-    let relief = sim.policy.relief_snapshot().unwrap_or_default();
+    let relief = llm_manager::pipeline::get_relief_snapshot(sim.policy.as_mut());
     if !relief.is_empty() {
         let formatted = format_relief(&relief);
         insta::with_settings!({ sort_maps => true, snapshot_suffix => "" }, {
@@ -246,7 +246,7 @@ fn scenario_partition_contention() {
         insta::assert_yaml_snapshot!("partition_contention_summary", summary);
     });
 
-    let relief = sim.policy.relief_snapshot().unwrap_or_default();
+    let relief = llm_manager::pipeline::get_relief_snapshot(sim.policy.as_mut());
     if !relief.is_empty() {
         let formatted = format_relief(&relief);
         insta::with_settings!({ sort_maps => true, snapshot_suffix => "" }, {
@@ -339,7 +339,7 @@ fn scenario_memory_and_thermal_combined() {
         insta::assert_yaml_snapshot!("combined_signals_summary", summary);
     });
 
-    let relief = sim.policy.relief_snapshot().unwrap_or_default();
+    let relief = llm_manager::pipeline::get_relief_snapshot(sim.policy.as_mut());
     if !relief.is_empty() {
         let formatted = format_relief(&relief);
         insta::with_settings!({ sort_maps => true, snapshot_suffix => "" }, {
@@ -534,10 +534,7 @@ fn scenario_partition_contention_produces_non_empty_relief() {
         .expect("Simulator::with_lua_policy 생성 실패");
     sim.run_for(Duration::from_secs(30)).expect("30s 실행 실패");
 
-    let relief = sim
-        .policy
-        .relief_snapshot()
-        .expect("LuaPolicy는 Some을 반환해야 함");
+    let relief = llm_manager::pipeline::get_relief_snapshot(sim.policy.as_mut());
     assert!(
         !relief.is_empty(),
         "30s 시뮬 후 relief_snapshot이 비어있지 않아야 함 (VirtualClockHandle이 3s 관측 지연을 충족해야 함)"
@@ -606,6 +603,9 @@ fn scenario_s25_memory_pressure_with_general_policy() {
         .expect("Simulator::with_lua_policy 생성 실패");
     sim.run_for(Duration::from_secs(30)).expect("30s 실행 실패");
 
+    let relief = llm_manager::pipeline::get_relief_snapshot(sim.policy.as_mut());
+    let overrun = llm_manager::pipeline::get_observation_overrun_count(sim.policy.as_mut());
+
     let traj = sim.trajectory();
     traj.print_timeline_if_enabled();
 
@@ -614,7 +614,6 @@ fn scenario_s25_memory_pressure_with_general_policy() {
         insta::assert_yaml_snapshot!("s25_memory_pressure_general_summary", summary);
     });
 
-    let relief = sim.policy.relief_snapshot().unwrap_or_default();
     if !relief.is_empty() {
         let formatted = format_relief(&relief);
         insta::with_settings!({ sort_maps => true, snapshot_suffix => "" }, {
@@ -644,7 +643,6 @@ fn scenario_s25_memory_pressure_with_general_policy() {
     // 4) Multi-slot observation queue는 관측 소실 없이 학습을 누적해야 한다.
     //    30s 시뮬 동안 5~6 Hz directive rate × 3 s 지연 = 동시 in-flight ≤ 20,
     //    MAX_PENDING_OBSERVATIONS=32 용량 안에서 전부 수용되어 overrun=0이어야 함.
-    let overrun = sim.policy.observation_overrun_count();
     assert_eq!(
         overrun, 0,
         "multi-slot 큐는 현재 rate를 수용해야 함 — overrun 발생은 용량 조정 신호: {overrun}"
@@ -653,8 +651,7 @@ fn scenario_s25_memory_pressure_with_general_policy() {
     // 5) relief 테이블 업데이트가 실제로 발생해야 함 (학습 경로 동작 확인).
     //    suppress된 directive의 observation은 취소되므로, relief update 수는
     //    실제로 엔진에 전달된 directive 수와 일치한다 (>= 1 이면 충분).
-    let update_count = sim
-        .trajectory()
+    let update_count = traj
         .entries
         .iter()
         .filter(|e| {

@@ -184,18 +184,7 @@ impl OnlineLinearEstimator {
 
     /// ActionId를 문자열 키로 변환 (저장 시 사용)
     fn action_to_key(action: &ActionId) -> &'static str {
-        match action {
-            ActionId::SwitchHw => "switch_hw",
-            ActionId::Throttle => "throttle",
-            ActionId::KvOffloadDisk => "kv_offload_disk",
-            ActionId::KvEvictSliding => "kv.evict_sliding",
-            ActionId::KvEvictH2o => "kv.evict_h2o",
-            ActionId::KvEvictStreaming => "kv.evict_streaming",
-            ActionId::KvMergeD2o => "kv.merge_d2o",
-            ActionId::KvQuantDynamic => "kv.quant_dynamic",
-            ActionId::LayerSkip => "weight.skip",
-            ActionId::SwapWeights => "swap_weights",
-        }
+        action.as_str()
     }
 
     /// 문자열 키로부터 ActionId 변환 (로드 시 사용)
