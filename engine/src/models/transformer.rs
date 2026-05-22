@@ -1498,7 +1498,7 @@ impl TransformerModel {
         // routed through `forward_prefill` and is not instrumented by the
         // tracer, so we skip it here. No-op when the env gate is off.
         if seq_len == 1 {
-            crate::observability::profile::op_trace::note_forward_call();
+            crate::op_note_forward_call!();
         }
 
         // 1. Embedding lookup
@@ -1529,7 +1529,7 @@ impl TransformerModel {
         // tracer macros are no-ops when the env gate is off.
         let is_gpu_for_trace = backend.is_gpu();
         let tr_emb = if seq_len == 1 {
-            crate::observability::profile::op_trace::start()
+            crate::op_start!()
         } else {
             None
         };
@@ -1540,12 +1540,7 @@ impl TransformerModel {
             backend.scale(&mut x, scale)?;
         }
         if seq_len == 1 {
-            crate::observability::profile::op_trace::record(
-                tr_emb,
-                crate::op_kind::OpKind::Embedding,
-                backend,
-                is_gpu_for_trace,
-            );
+            crate::op_record!(tr_emb, Embedding, backend, is_gpu_for_trace);
         }
 
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
@@ -1905,7 +1900,7 @@ impl TransformerModel {
 
         // 3. Final Norm
         let tr_fn = if seq_len == 1 {
-            crate::observability::profile::op_trace::start()
+            crate::op_start!()
         } else {
             None
         };
@@ -1916,17 +1911,12 @@ impl TransformerModel {
             is_gemma3,
         )?;
         if seq_len == 1 {
-            crate::observability::profile::op_trace::record(
-                tr_fn,
-                crate::op_kind::OpKind::FinalNorm,
-                backend,
-                is_gpu_for_trace,
-            );
+            crate::op_record!(tr_fn, FinalNorm, backend, is_gpu_for_trace);
         }
 
         // 4. Head — optionally only compute last position's logits to save VRAM
         let tr_lh = if seq_len == 1 {
-            crate::observability::profile::op_trace::start()
+            crate::op_start!()
         } else {
             None
         };
@@ -1956,12 +1946,7 @@ impl TransformerModel {
             })?;
         }
         if seq_len == 1 {
-            crate::observability::profile::op_trace::record(
-                tr_lh,
-                crate::op_kind::OpKind::LmHead,
-                backend,
-                is_gpu_for_trace,
-            );
+            crate::op_record!(tr_lh, LmHead, backend, is_gpu_for_trace);
         }
 
         // Synchronize before owned PrefillWorkspace drop — ensures all GPU kernels
