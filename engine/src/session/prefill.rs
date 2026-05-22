@@ -613,7 +613,9 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
                         // Dispatch by evict method (same as decode loop).
                         // Scores are unavailable at prefill→decode boundary, so
                         // D2O and score-based H2O fall back to force_evict.
-                        let result = if evict.method == crate::resilience::EvictMethod::Streaming {
+                        let result = if evict.method
+                            == crate::pressure::eviction::EvictMethod::Streaming
+                        {
                             if let Some(ref sp) = evict.streaming_params {
                                 let policy =
                                     crate::pressure::eviction::streaming_llm::StreamingLLMPolicy::new(

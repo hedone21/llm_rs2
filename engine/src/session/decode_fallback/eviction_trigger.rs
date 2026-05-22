@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::observability::profile::{self, EvictionEvent, PartitionInfo};
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kv_cache::KVCache;
-use crate::observability::profile::{self, EvictionEvent, PartitionInfo};
 use crate::session::cli::Args;
 
 pub struct AutoEvictionCtx<'a> {

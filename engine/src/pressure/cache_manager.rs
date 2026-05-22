@@ -4,13 +4,13 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::observability::events::{CacheEvent, EventSink, NoOpSink};
+use crate::pressure::eviction::EvictMethod;
 use crate::pressure::eviction::EvictionPolicy;
 use crate::pressure::kv_cache::{KVCache, max_cache_pos};
 use crate::pressure::{
     ActionResult, CachePressurePipeline, EvictionHandler, HandlerContext, MIN_EVICT_TOKENS,
     PressureLevel, PressureStageConfig, SwapHandler,
 };
-use crate::resilience::EvictMethod;
 use crate::resilience::sys_monitor::SystemMonitor;
 use std::path::PathBuf;
 
@@ -1336,12 +1336,15 @@ mod tests {
             0,
             1.0,
         );
-        cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
+        cm.register_policy(
+            crate::pressure::eviction::EvictMethod::Sliding,
+            Box::new(policy),
+        );
 
         let mut caches = make_caches(4, 90);
         let result = cm
             .force_evict_by_policy(
-                crate::resilience::EvictMethod::Sliding,
+                crate::pressure::eviction::EvictMethod::Sliding,
                 &mut caches,
                 0.2,
                 ScoreContext::None,
@@ -1375,12 +1378,15 @@ mod tests {
             0,
             1.0,
         );
-        cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
+        cm.register_policy(
+            crate::pressure::eviction::EvictMethod::Sliding,
+            Box::new(policy),
+        );
 
         let mut caches = make_caches(4, 80);
         let result = cm
             .force_evict_by_policy(
-                crate::resilience::EvictMethod::Sliding,
+                crate::pressure::eviction::EvictMethod::Sliding,
                 &mut caches,
                 0.5,
                 ScoreContext::None,
@@ -1438,12 +1444,15 @@ mod tests {
             0,
             1.0,
         );
-        cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
+        cm.register_policy(
+            crate::pressure::eviction::EvictMethod::Sliding,
+            Box::new(policy),
+        );
 
         let mut caches = make_caches(2, 100);
         let result = cm
             .force_evict_by_policy(
-                crate::resilience::EvictMethod::Sliding,
+                crate::pressure::eviction::EvictMethod::Sliding,
                 &mut caches,
                 0.98, // target_len = 98, tokens_to_remove = 2
                 ScoreContext::None,
@@ -1472,12 +1481,15 @@ mod tests {
             0,
             1.0,
         );
-        cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
+        cm.register_policy(
+            crate::pressure::eviction::EvictMethod::Sliding,
+            Box::new(policy),
+        );
 
         let mut caches = make_caches(2, 100);
         let result = cm
             .force_evict_by_policy(
-                crate::resilience::EvictMethod::Sliding,
+                crate::pressure::eviction::EvictMethod::Sliding,
                 &mut caches,
                 0.3, // target_len = 30, tokens_to_remove = 70
                 ScoreContext::None,
@@ -1506,12 +1518,15 @@ mod tests {
             0,
             1.0,
         );
-        cm.register_policy(crate::resilience::EvictMethod::H2o, Box::new(policy));
+        cm.register_policy(
+            crate::pressure::eviction::EvictMethod::H2o,
+            Box::new(policy),
+        );
 
         let mut caches = make_caches(4, 80);
         let result = cm
             .force_evict_by_policy(
-                crate::resilience::EvictMethod::H2o,
+                crate::pressure::eviction::EvictMethod::H2o,
                 &mut caches,
                 0.2,
                 ScoreContext::None,

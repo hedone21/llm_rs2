@@ -7,6 +7,7 @@ use llm_shared::{
     EngineStatus, ManagerMessage, QcfEstimate, ResourceLevel,
 };
 
+use crate::pressure::eviction::EvictMethod;
 use crate::resilience::gpu_self_meter::GpuSelfMeter;
 use crate::resilience::proc_self_meter::ProcSelfMeter;
 
@@ -60,15 +61,6 @@ pub struct ExecutionPlan {
     /// `Some((ratio, target_dtype))` means generate.rs should call
     /// `WeightSwapDecider` + `SwapExecutor`.  `None` = no pending swap.
     pub swap_weights: Option<(f32, llm_shared::DtypeTag)>,
-}
-
-/// Eviction method identifier (engine-internal, not in shared protocol).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EvictMethod {
-    H2o,
-    Sliding,
-    Streaming,
-    D2o,
 }
 
 /// StreamingLLM eviction parameters (sink + window).

@@ -12,9 +12,8 @@ pub mod transport;
 #[cfg(feature = "resilience")]
 pub mod dbus_transport;
 
-pub use executor::{
-    CommandExecutor, EvictMethod, EvictPlan, ExecutionPlan, KVSnapshot, StreamingParams,
-};
+pub use crate::pressure::eviction::EvictMethod;
+pub use executor::{CommandExecutor, EvictPlan, ExecutionPlan, KVSnapshot, StreamingParams};
 pub use gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter, OpenClEventGpuMeter};
 pub use manager::{InferenceContext, ResilienceManager, execute_action};
 pub use signal::{

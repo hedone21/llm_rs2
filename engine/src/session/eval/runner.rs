@@ -209,7 +209,8 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     } else {
         1
     };
-    let mut trajectory_outputs: Vec<crate::observability::eval::EvalOutput> = Vec::with_capacity(n_steps);
+    let mut trajectory_outputs: Vec<crate::observability::eval::EvalOutput> =
+        Vec::with_capacity(n_steps);
 
     if trajectory_mode {
         eprintln!(
@@ -281,7 +282,9 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
 
     // ── QCF-dump JSON (eval-ll mode) ──────────────────────────────────────
     if let Some(ref dump_path) = args.qcf_dump {
-        use crate::observability::eval::qcf_helpers::{QcfSwapDumpContext, TrajectoryStep, dump_qcf_swap_json};
+        use crate::observability::eval::qcf_helpers::{
+            QcfSwapDumpContext, TrajectoryStep, dump_qcf_swap_json,
+        };
 
         let empty_swap: Vec<usize> = Vec::new();
         let (swap_set, qcf_predicted, fallback_used) = if let Some(ref dec) = eval_ll_qcf_decision {
