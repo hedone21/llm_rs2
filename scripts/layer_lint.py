@@ -20,6 +20,24 @@ import re
 import sys
 
 # ────────────────────────────────────────────────────────────────────
+# DATA_CONSUMER_PATTERNS — L1 backend의 L3 weight struct/enum import를
+# data consumer 카테고리로 분류하여 INV-LAYER-001 baseline에서 자동 제외.
+# spec/41-invariants.md INV-LAYER-001 비고 "Data consumer 카테고리" 참조.
+# ────────────────────────────────────────────────────────────────────
+
+DATA_CONSUMER_PATTERNS = [
+    re.compile(r"crate::models::weights::[A-Z]"),                        # struct/enum (UpperCamelCase)
+    re.compile(r"crate::models::weights::[a-z_]+::[A-Z]"),               # sub-module struct/enum (예: rpcmem_secondary::RpcmemLayerRegion)
+    re.compile(r"crate::layers::transformer_layer::TransformerLayer"),
+    re.compile(r"crate::pressure::kv_cache::KVCache$"),                  # struct only, KVCacheOps trait 제외
+]
+
+
+def is_data_consumer(import_path: str) -> bool:
+    """import_path가 data consumer 카테고리에 해당하면 True."""
+    return any(p.search(import_path) for p in DATA_CONSUMER_PATTERNS)
+
+# ────────────────────────────────────────────────────────────────────
 # Layer 매핑 규칙 (ARCHITECTURE.md §13.2, §13.4 기준)
 # ────────────────────────────────────────────────────────────────────
 
@@ -105,7 +123,7 @@ def classify_module(rel_path: str) -> str:
     # directory-prefix rules (Rust 2018+ pattern — trait lives next to impl dir).
     TOP_LEVEL_L2 = {"backend.rs", "buffer.rs", "memory.rs", "tensor.rs",
                     "shape.rs", "quant.rs", "thread_pool.rs", "op_kind.rs",
-                    "partition_workspace.rs"}
+                    "partition_workspace.rs", "kv_cache_ops.rs"}
     if norm in TOP_LEVEL_L2:
         return "L2"
     for prefix, layer in LAYER_RULES:
@@ -139,7 +157,8 @@ def classify_import(import_path: str) -> str:
     mod_path = "/".join(mod_segs)
     # Top-level L2 abstraction files (engine/src/*.rs, Rust 2018+ pattern)
     if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
-                    "quant", "thread_pool", "op_kind", "partition_workspace"):
+                    "quant", "thread_pool", "op_kind", "partition_workspace",
+                    "kv_cache_ops"):
         return "L2"
     # 기존 경로 기반 매칭으로 fallback
     return classify_module(mod_path if mod_path else p.replace("::", "/"))
@@ -486,8 +505,8 @@ def _find_exempt_zone_ranges(lines: list[str]) -> list[tuple[int, int]]:
 # V-번호 할당 — ARCHITECTURE.md §13.5 기준 알려진 위반에 ID 부여
 # (file_path 패턴, import 패턴) → V-XX
 KNOWN_V_MAP = [
-    # V-01: backend/opencl/mod.rs → resilience::gpu_self_meter
-    (r"backend/opencl/mod\.rs",         r"resilience::gpu_self_meter",   "V-01"),
+    # V-01: backend/opencl/ → resilience::gpu_self_meter (trait import)
+    (r"backend/opencl/",                r"resilience::gpu_self_meter",   "V-01"),
     # V-02: backend/opencl/plan.rs → layers::tensor_partition, layers::workspace
     (r"backend/opencl/plan\.rs",         r"layers::",                    "V-02"),
     # V-03: backend/qnn_oppkg/ → models::weights (LayerSlot), layers::transformer_layer
@@ -655,6 +674,12 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 if key in seen:
                     continue
                 seen.add(key)
+
+                # Data consumer 카테고리: L1 backend가 L3 weight struct/enum을
+                # 데이터 소비자로 import하는 경우 INV-LAYER-001 baseline에서 제외.
+                # (spec/41-invariants.md INV-LAYER-001 비고 참조)
+                if inv_id == "INV-LAYER-001" and is_data_consumer(imp_clean):
+                    continue
 
                 v_id = lookup_v_id(rel_path, imp_clean)
                 entry = {

@@ -15,7 +15,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use llm_rs2::resilience::gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter, OpenClEventGpuMeter};
+use llm_rs2::backend::opencl::gpu_self_meter::OpenClEventGpuMeter;
+use llm_rs2::resilience::gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter};
 use llm_rs2::resilience::proc_self_meter::ProcSelfMeter;
 use llm_shared::{EngineState, EngineStatus, ResourceLevel};
 

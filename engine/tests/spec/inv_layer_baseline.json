@@ -2,9 +2,9 @@
   "violations": [
     {
       "id": "V-01",
-      "file": "backend/opencl/mod.rs",
-      "line": 16,
-      "import": "crate::resilience::gpu_self_meter::OpenClEventGpuMeter",
+      "file": "backend/opencl/gpu_self_meter.rs",
+      "line": 10,
+      "import": "crate::resilience::gpu_self_meter::GpuSelfMeter",
       "rule": "INV-LAYER-001",
       "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
       "is_test_block": false,
@@ -33,60 +33,6 @@
       "file": "backend/opencl/plan.rs",
       "line": 1552,
       "import": "crate::layers::hybrid_attention::current",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-03",
-      "file": "backend/qnn_oppkg/graph_cache.rs",
-      "line": 17,
-      "import": "crate::models::weights::LayerSlot",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-03",
-      "file": "backend/qnn_oppkg/layer_graph.rs",
-      "line": 41,
-      "import": "crate::layers::transformer_layer::TransformerLayer",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-03",
-      "file": "backend/qnn_oppkg/layer_graph.rs",
-      "line": 167,
-      "import": "crate::layers::transformer_layer::TransformerLayer",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-03",
-      "file": "backend/qnn_oppkg/mod.rs",
-      "line": 34,
-      "import": "crate::models::weights::LayerSlot",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-03",
-      "file": "backend/qnn_oppkg/mod.rs",
-      "line": 617,
-      "import": "crate::models::weights::SecondaryMmap",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-03",
-      "file": "backend/qnn_oppkg/mod.rs",
-      "line": 618,
-      "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-inference (역방향 import)",
       "is_test_block": false
@@ -1317,38 +1263,11 @@
     {
       "id": "V-??",
       "file": "backend/opencl/mod.rs",
-      "line": 5229,
+      "line": 5230,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
       "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/opencl/mod.rs",
-      "line": 5295,
-      "import": "crate::models::weights::SecondaryMmap",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/opencl/mod.rs",
-      "line": 5296,
-      "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/opencl/mod.rs",
-      "line": 7181,
-      "import": "crate::pressure::kv_cache::KVCache",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-pressure (역방향 import)",
-      "is_test_block": true
     },
     {
       "id": "V-??",
@@ -1366,15 +1285,6 @@
       "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/opencl/plan.rs",
-      "line": 1250,
-      "import": "crate::pressure::kv_cache::KVCacheOps",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-pressure (역방향 import)",
       "is_test_block": false
     },
     {
@@ -1977,7 +1887,7 @@
     {
       "id": "V-??",
       "file": "pressure/kv_cache.rs",
-      "line": 1212,
+      "line": 1067,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→L1 (backend impl 직접 의존)",
