@@ -925,26 +925,8 @@
     {
       "id": "V-18",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 141,
-      "import": "crate::observability::profile::op_trace::OpKind::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-18",
-      "file": "layers/transformer_layer/forward_gen.rs",
       "line": 147,
       "import": "crate::observability::profile::op_trace::record",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-18",
-      "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 149,
-      "import": "crate::observability::profile::op_trace::OpKind::",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false
@@ -1184,15 +1166,6 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1545,
-      "import": "crate::observability::profile::op_trace::OpKind::Embedding",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-22",
-      "file": "models/transformer.rs",
       "line": 1908,
       "import": "crate::observability::profile::op_trace::start",
       "rule": "INV-LAYER-003",
@@ -1211,15 +1184,6 @@
     {
       "id": "V-22",
       "file": "models/transformer.rs",
-      "line": 1921,
-      "import": "crate::observability::profile::op_trace::OpKind::FinalNorm",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-22",
-      "file": "models/transformer.rs",
       "line": 1929,
       "import": "crate::observability::profile::op_trace::start",
       "rule": "INV-LAYER-003",
@@ -1231,15 +1195,6 @@
       "file": "models/transformer.rs",
       "line": 1959,
       "import": "crate::observability::profile::op_trace::record",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-22",
-      "file": "models/transformer.rs",
-      "line": 1961,
-      "import": "crate::observability::profile::op_trace::OpKind::LmHead",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false

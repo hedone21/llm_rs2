@@ -103,32 +103,11 @@ pub fn enabled() -> bool {
     !matches!(mode(), TraceMode::Off)
 }
 
-/// Op buckets tracked by the tracer. Order matches the `forward_gen` flow,
-/// followed by buckets for ops outside `forward_gen` but inside
-/// `forward_into` (embedding, final norm, lm_head). Sprint E observation:
-/// the sync-mode trace captures only ~78% of TBT for the Mixed config,
-/// so the gap must live in non-`forward_gen` regions.
-#[repr(usize)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum OpKind {
-    RmsNormAttn = 0,
-    MatmulQkv = 1,
-    Rope = 2,
-    KvUpdate = 3,
-    Attention = 4,
-    MatmulWo = 5,
-    RmsNormFfn = 6,
-    MatmulFfnGateUp = 7,
-    SiluMul = 8,
-    MatmulFfnDown = 9,
-    AddAssign = 10,
-    /// Token embedding lookup + optional embed scaling (`forward_into`).
-    Embedding = 11,
-    /// Final RMSNorm before `lm_head` (`forward_into`).
-    FinalNorm = 12,
-    /// Final `lm_head` matmul (vocab × hidden). Major suspect in Sprint E.
-    LmHead = 13,
-}
+// OpKind moved to L2 (§13.8-G shared identifier promotion).
+// Source-of-truth: `engine/src/op_kind.rs`.
+// BC re-export: existing `crate::observability::profile::op_trace::OpKind` paths
+// continue to compile without modification.
+pub use crate::op_kind::OpKind;
 
 /// DDR-bandwidth phase classification for phase-aware async swap (LISWAP-5 / B).
 /// Phase R 측정 (qnn_phase_r_summary.md §5)에 따른 분류.

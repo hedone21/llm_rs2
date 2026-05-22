@@ -1542,7 +1542,7 @@ impl TransformerModel {
         if seq_len == 1 {
             crate::observability::profile::op_trace::record(
                 tr_emb,
-                crate::observability::profile::op_trace::OpKind::Embedding,
+                crate::op_kind::OpKind::Embedding,
                 backend,
                 is_gpu_for_trace,
             );
@@ -1918,7 +1918,7 @@ impl TransformerModel {
         if seq_len == 1 {
             crate::observability::profile::op_trace::record(
                 tr_fn,
-                crate::observability::profile::op_trace::OpKind::FinalNorm,
+                crate::op_kind::OpKind::FinalNorm,
                 backend,
                 is_gpu_for_trace,
             );
@@ -1958,7 +1958,7 @@ impl TransformerModel {
         if seq_len == 1 {
             crate::observability::profile::op_trace::record(
                 tr_lh,
-                crate::observability::profile::op_trace::OpKind::LmHead,
+                crate::op_kind::OpKind::LmHead,
                 backend,
                 is_gpu_for_trace,
             );

@@ -44,6 +44,9 @@ LAYER_RULES = [
     ("shape",                   "L2"),
     ("quant",                   "L2"),
     ("thread_pool",             "L2"),
+    # B-2a: §13.8-G shared identifier promotion — op span identifier used by
+    # both observability (producer) and L3 inference (consumer).
+    ("op_kind",                 "L2"),
 
     # L3-pressure: KV cache 관리, eviction, offload, swap handler
     # Step 4-D: core/{cache_manager,kv_cache,kivi_cache,kv_migrate,eviction,
@@ -101,7 +104,7 @@ def classify_module(rel_path: str) -> str:
     # Step 4-A: top-level abstraction *.rs files take precedence over
     # directory-prefix rules (Rust 2018+ pattern — trait lives next to impl dir).
     TOP_LEVEL_L2 = {"backend.rs", "buffer.rs", "memory.rs", "tensor.rs",
-                    "shape.rs", "quant.rs", "thread_pool.rs"}
+                    "shape.rs", "quant.rs", "thread_pool.rs", "op_kind.rs"}
     if norm in TOP_LEVEL_L2:
         return "L2"
     for prefix, layer in LAYER_RULES:
@@ -135,7 +138,7 @@ def classify_import(import_path: str) -> str:
     mod_path = "/".join(mod_segs)
     # Top-level L2 abstraction files (engine/src/*.rs, Rust 2018+ pattern)
     if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
-                    "quant", "thread_pool"):
+                    "quant", "thread_pool", "op_kind"):
         return "L2"
     # 기존 경로 기반 매칭으로 fallback
     return classify_module(mod_path if mod_path else p.replace("::", "/"))

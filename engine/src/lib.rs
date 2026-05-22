@@ -10,6 +10,7 @@ pub mod inference;
 pub mod layers;
 pub mod memory;
 pub mod models;
+pub mod op_kind;
 pub mod pressure;
 pub mod qcf;
 pub mod quant;
