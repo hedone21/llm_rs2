@@ -222,6 +222,20 @@ impl Backend for CpuBackendNeon {
             scores_out,
         )
     }
+
+    // B-5b Phase 2 Stage 1: expose fused NEON kernels via the trait so Stage
+    // 2 callers can reach them through `backend.cpu_kernels()` without the
+    // direct `crate::backend::cpu::neon::fused_matmul_*` path.
+    fn cpu_kernels(&self) -> Option<&'static crate::cpu_kernels::CpuKernelSet> {
+        Some(&crate::cpu_kernels::CPU_KERNEL_SET)
+    }
+
+    // B-5b Phase 2 Stage 1: CPU companion = self (the CpuBackend IS the CPU
+    // companion). See `Backend::cpu_companion` doc for why this is not a
+    // default impl.
+    fn cpu_companion(&self) -> &dyn Backend {
+        self
+    }
 }
 
 /// Size of one KV chunk (in tokens) used by the flash-decoding path.

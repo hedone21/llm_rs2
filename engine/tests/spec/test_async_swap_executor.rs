@@ -150,6 +150,9 @@ impl Backend for AsyncMockBackend {
     fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
         self.inner.cast(src, dst)
     }
+    fn cpu_companion(&self) -> &dyn Backend {
+        self
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

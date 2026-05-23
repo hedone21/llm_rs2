@@ -895,6 +895,11 @@ impl Backend for CpuBackendCommon {
         }
         Ok(())
     }
+
+    // B-5b Phase 2 Stage 1: CPU companion = self.
+    fn cpu_companion(&self) -> &dyn Backend {
+        self
+    }
 }
 
 impl CpuBackendCommon {

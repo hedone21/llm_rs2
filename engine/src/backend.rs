@@ -1103,6 +1103,90 @@ pub trait Backend: Send + Sync {
     fn bind_current_thread(&self) -> Result<()> {
         Ok(())
     }
+
+    // ── B-5b Phase 2 Stage 1: capability extension surface ────────────────
+    //
+    // The four methods below replace four downcast / direct-call patterns
+    // currently scattered across `plan.rs`, `forward_gen.rs`, `transformer.rs`,
+    // and the CUDA backend's `cpu_fallback` path:
+    //
+    // 1. `cpu_companion()` — GPU backends (OpenCL/CUDA/QNN) currently grab a
+    //    fresh `CpuBackend` instance whenever they need a host fallback. Stage
+    //    2 will route those through the GPU backend's owned `cpu_companion`
+    //    so the host fallback shares the same backend state as the rest of
+    //    the inference loop. Default `&self` is correct for `CpuBackend`.
+    //
+    // 2. `cpu_kernels()` — `plan.rs:696,717` and `forward_gen.rs:234,264,
+    //    1286,1307,1436,1461` call the freestanding NEON `fused_matmul_*`
+    //    entry points directly. Stage 2 will replace those with
+    //    `backend.cpu_kernels()?.fused_matmul_*` so the OpenCL plan path can
+    //    pick up the fast path via its `cpu_companion`. Default returns
+    //    `None` (no fused kernels available); the `CpuBackend` NEON impl
+    //    overrides on aarch64.
+    //
+    // 3. `as_opencl_secondary()` — `qnn_oppkg::with_opencl_secondary` (line
+    //    132) currently does `as_any().downcast_ref::<OpenCLBackend>()`.
+    //    Stage 2 will swap that for `backend.as_opencl_secondary()`. Default
+    //    `None`; `OpenCLBackend` overrides.
+    //
+    // 4. `yield_after_layer()` — `plan.rs:1834` and `transformer.rs:1841`
+    //    both call `crate::resilience::gpu_yield::maybe_yield_after_layer`.
+    //    Stage 2 will absorb that helper as a trait method so the resilience
+    //    layer can plug per-backend yield policies via the trait instead of
+    //    the existing free-function dispatch. Default no-op.
+    //
+    // RPN-145~180 hot-path concern (architect pre-survey): the
+    // `yield_after_layer` default impl still incurs one vtable lookup per
+    // layer per token. Stage 2's S25 microbench gate will decide whether to
+    // keep this shape or fall back to a freestanding helper for the yield
+    // method specifically.
+
+    /// CPU companion backend used by GPU backends for host fallback paths.
+    ///
+    /// - `CpuBackend` (NEON / AVX2 / generic): returns `self`.
+    /// - `OpenCLBackend` / `CudaBackend` (PC + embedded): return their owned
+    ///   `cpu_companion` injected at construction time.
+    /// - `QnnOppkgBackend`: returns `self` (routes through its OpenCL
+    ///   secondary slot for actual host fallback at the call site).
+    ///
+    /// No default impl: returning `self` here would coerce `&Self` to
+    /// `&dyn Backend`, which Rust forbids without a `Self: Sized` bound;
+    /// adding that bound, however, would prevent dispatch through
+    /// `&dyn Backend` — the exact call shape Stage 2 needs. Each impl
+    /// therefore writes the one-line override explicitly.
+    fn cpu_companion(&self) -> &dyn Backend;
+
+    /// CPU NEON kernel function pointer set. Only `CpuBackend` (NEON) returns
+    /// `Some` on aarch64; all GPU backends and the AVX2 / generic CPU paths
+    /// return `None`. Stage 2 callers must handle the `None` case by falling
+    /// back to per-matmul `matmul_transposed` dispatches.
+    fn cpu_kernels(&self) -> Option<&'static crate::cpu_kernels::CpuKernelSet> {
+        None
+    }
+
+    /// LISWAP-6 OpenCL secondary capability. `OpenCLBackend` returns
+    /// `Some(self)`; all other backends return `None`. Stage 2 will replace
+    /// `qnn_oppkg::with_opencl_secondary`'s `as_any().downcast_ref()` chain
+    /// with this method.
+    #[cfg(feature = "opencl")]
+    fn as_opencl_secondary(&self) -> Option<&dyn crate::secondary::OpenClSecondary> {
+        None
+    }
+
+    /// Intra-token GPU yield hook. Default no-op.
+    ///
+    /// Called once per layer in the decode loop (and per layer in the OpenCL
+    /// plan path). Stage 2 will fold
+    /// `crate::resilience::gpu_yield::maybe_yield_after_layer` into the
+    /// per-backend trait impl. Until then the freestanding helper still owns
+    /// the dispatch and this default is unused.
+    ///
+    /// Hot path: vtable dispatch happens even for the default no-op. Stage 2
+    /// must validate this on the S25 microbench before committing the call
+    /// site migration; if regression is detected, fall back to keeping
+    /// `gpu_yield::maybe_yield_after_layer` as a freestanding function for
+    /// this one hook specifically.
+    fn yield_after_layer(&self, _layer: usize, _is_decode: bool) {}
 }
 
 #[cfg(test)]

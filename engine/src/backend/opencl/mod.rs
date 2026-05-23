@@ -542,6 +542,13 @@ pub struct OpenCLBackend {
     // Both lazy-init via `swap_context_or_init()` / `swap_queue_or_init()`.
     swap_context: std::sync::OnceLock<Context>,
     swap_queue: std::sync::OnceLock<Queue>,
+
+    // B-5b Phase 2 Stage 1: CPU companion backend injected at construction
+    // time. Stage 2 will use this to remove the "GPU backend constructs a
+    // fresh CpuBackend on the fly" pattern in fallback paths. For Stage 1
+    // the field is owned but unused — Backend::cpu_companion() returns
+    // `&*self.cpu_companion`.
+    cpu_companion: Arc<dyn Backend>,
 }
 
 /// Per-category cl_mem allocation bucket (WSWAP-5-TBT-DIAG).
@@ -1528,6 +1535,10 @@ impl OpenCLBackend {
             // `swap_context_or_init()` / `swap_queue_or_init()`.
             swap_context: std::sync::OnceLock::new(),
             swap_queue: std::sync::OnceLock::new(),
+            // B-5b Phase 2 Stage 1: own a CPU companion for Stage 2 host
+            // fallback routing. `CpuBackend::new()` returns `Self` (not
+            // `Result`) on every target arch, so this is infallible.
+            cpu_companion: Arc::new(crate::backend::cpu::CpuBackend::new()),
         })
     }
 
@@ -6562,6 +6573,28 @@ impl Backend for OpenCLBackend {
             "Unsupported copy_slice combination in OpenCL backend or null pointers"
         ))
     }
+
+    // ── B-5b Phase 2 Stage 1: capability extension overrides ─────────────
+    //
+    // Stage 1 wires the owned `cpu_companion` and the empty
+    // `OpenClSecondary` marker through the trait. Stage 2 will replace
+    // existing `as_any().downcast_ref::<OpenCLBackend>()` and the direct
+    // freestanding `fused_matmul_*` NEON call sites (see `cpu_kernels.rs`)
+    // with these methods.
+
+    fn cpu_companion(&self) -> &dyn Backend {
+        &*self.cpu_companion
+    }
+
+    fn as_opencl_secondary(&self) -> Option<&dyn crate::secondary::OpenClSecondary> {
+        Some(self)
+    }
+}
+
+impl crate::secondary::OpenClSecondary for OpenCLBackend {
+    // Stage 1 placeholder — see `crate::secondary::OpenClSecondary` docs.
+    // Stage 2 will add the closure / method surface needed by
+    // `qnn_oppkg::with_opencl_secondary`.
 }
 
 // ── KIVI Q2 dispatch functions (OpenCLBackend-specific, not part of Backend trait) ──

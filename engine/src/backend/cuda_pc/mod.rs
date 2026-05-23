@@ -230,6 +230,12 @@ pub struct CudaBackend {
     /// gate (default ON). When unset, the async path falls back to the
     /// synchronous `copy_weight_from`.
     transfer_stream: Arc<std::sync::OnceLock<Arc<cudarc::driver::CudaStream>>>,
+
+    /// B-5b Phase 2 Stage 1: CPU companion backend injected at construction
+    /// time. Stage 2 will route the ~13 `cpu_fallback` sites in this module
+    /// through `Backend::cpu_companion()` so they share a single CPU backend
+    /// instance instead of constructing a fresh one per fallback call.
+    cpu_companion: Arc<dyn Backend>,
 }
 
 impl CudaBackend {
@@ -317,6 +323,9 @@ impl CudaBackend {
             // LISWAP-2 prototype (plan: chasing-hopper). Lazy-init in
             // `transfer_stream_or_init`.
             transfer_stream: Arc::new(std::sync::OnceLock::new()),
+            // B-5b Phase 2 Stage 1: CPU companion for Stage 2 host fallback
+            // routing. `CpuBackend::new()` is infallible across target archs.
+            cpu_companion: Arc::new(crate::backend::cpu::CpuBackend::new()),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -1792,6 +1801,12 @@ impl Backend for CudaBackend {
 
     fn supports_async_transfer(&self) -> bool {
         Self::transfer_stream_env_enabled()
+    }
+
+    // B-5b Phase 2 Stage 1: CPU companion override. Stage 2 will route
+    // the ~13 `cpu_fallback` paths in this module through this method.
+    fn cpu_companion(&self) -> &dyn Backend {
+        &*self.cpu_companion
     }
 }
 

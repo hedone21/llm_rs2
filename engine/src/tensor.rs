@@ -219,6 +219,9 @@ mod tests {
         fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
             Ok(())
         }
+        fn cpu_companion(&self) -> &dyn Backend {
+            self
+        }
     }
 
     #[test]
@@ -316,6 +319,9 @@ mod tests {
         // Type casting
         fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
             Ok(())
+        }
+        fn cpu_companion(&self) -> &dyn Backend {
+            self
         }
     }
 
@@ -424,6 +430,9 @@ mod tests {
             }
             fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
                 Ok(())
+            }
+            fn cpu_companion(&self) -> &dyn Backend {
+                self
             }
         }
 

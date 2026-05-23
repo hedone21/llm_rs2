@@ -151,6 +151,9 @@ impl Backend for CountingBackend {
     fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
         self.inner.cast(src, dst)
     }
+    fn cpu_companion(&self) -> &dyn Backend {
+        self
+    }
 }
 
 fn minimal_model_config() -> ModelConfig {

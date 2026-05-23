@@ -353,6 +353,11 @@ impl Backend for CpuBackendAVX2 {
         }
         Ok(())
     }
+
+    // B-5b Phase 2 Stage 1: CPU companion = self.
+    fn cpu_companion(&self) -> &dyn Backend {
+        self
+    }
 }
 
 impl CpuBackendAVX2 {

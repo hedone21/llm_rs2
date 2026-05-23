@@ -348,6 +348,11 @@ pub struct CudaBackend {
     graph_update_ok: Arc<std::sync::atomic::AtomicU64>,
     graph_instantiate_count: Arc<std::sync::atomic::AtomicU64>,
     graph_step_count: Arc<std::sync::atomic::AtomicU64>,
+
+    /// B-5b Phase 2 Stage 1: CPU companion backend injected at construction
+    /// time. Same purpose as in `cuda_pc::CudaBackend` — Stage 2 will route
+    /// fallback paths through `Backend::cpu_companion()`.
+    cpu_companion: Arc<dyn Backend>,
 }
 
 /// Owns a `CUgraphExec` for the decode-loop graph.
@@ -520,6 +525,9 @@ impl CudaBackend {
             graph_update_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             graph_instantiate_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             graph_step_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // B-5b Phase 2 Stage 1: CPU companion for Stage 2 host fallback
+            // routing. `CpuBackend::new()` is infallible across target archs.
+            cpu_companion: Arc::new(crate::backend::cpu::CpuBackend::new()),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -3036,6 +3044,12 @@ impl Backend for CudaBackend {
 
     fn supports_async_transfer(&self) -> bool {
         Self::transfer_stream_env_enabled() && !self.is_graph_capturing()
+    }
+
+    // B-5b Phase 2 Stage 1: CPU companion override. Stage 2 will route the
+    // fallback paths in this module through this method.
+    fn cpu_companion(&self) -> &dyn Backend {
+        &*self.cpu_companion
     }
 }
 

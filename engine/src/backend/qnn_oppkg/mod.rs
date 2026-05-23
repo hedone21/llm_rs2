@@ -811,6 +811,14 @@ impl Backend for QnnOppkgBackend {
     fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
         fallback_or_panic(self, "cast", |be| be.cast(src, dst))
     }
+
+    // B-5b Phase 2 Stage 1: QNN OpPackage routes host fallback through its
+    // OpenCL secondary slot (see `with_opencl_secondary`). Returning `self`
+    // here is the conservative default — Stage 2 may swap this to route the
+    // companion through the slot directly.
+    fn cpu_companion(&self) -> &dyn Backend {
+        self
+    }
 }
 
 #[cfg(test)]
