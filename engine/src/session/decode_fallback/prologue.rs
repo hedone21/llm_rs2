@@ -92,7 +92,7 @@ pub struct DecodePrologueOutput {
     pub tokens: Vec<u32>,
     // RAII guard (must outlive decode loop)
     #[cfg(feature = "opencl")]
-    pub hybrid_scope: Option<crate::layers::hybrid_attention::HybridScope>,
+    pub hybrid_scope: Option<crate::hybrid_attention::HybridScope>,
 }
 
 /// make_partition_gpu_alloc: GPU buffer allocator for tensor partition workspace.
@@ -426,7 +426,7 @@ pub fn run_decode_prologue(ctx: DecodePrologueCtx<'_>) -> anyhow::Result<DecodeP
         // Gating 실패 시 reason을 stderr로 한 번 찍고 스킵.
         #[cfg(feature = "opencl")]
         let _hybrid_scope = {
-            use crate::layers::hybrid_attention::{self, HybridAttnSetup};
+            use crate::hybrid_attention::{self, HybridAttnSetup};
             use crate::pressure::kv_cache::KVLayout;
             match HybridAttnSetup::from_env() {
                 Some(kv_frac) => {

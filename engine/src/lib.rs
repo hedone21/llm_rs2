@@ -7,6 +7,7 @@ pub mod auf;
 pub mod backend;
 pub mod buffer;
 pub mod cpu_kernels;
+pub mod hybrid_attention;
 pub mod inference;
 pub mod instrument;
 pub mod kv_cache_ops;

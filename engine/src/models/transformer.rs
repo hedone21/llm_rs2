@@ -2297,7 +2297,7 @@ impl TransformerModel {
             if partition_active {
                 None
             } else {
-                crate::layers::hybrid_attention::current()
+                crate::hybrid_attention::current()
             }
         };
 

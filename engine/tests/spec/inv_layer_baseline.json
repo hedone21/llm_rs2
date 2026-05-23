@@ -20,24 +20,6 @@
       "is_test_block": false
     },
     {
-      "id": "V-02",
-      "file": "backend/opencl/plan.rs",
-      "line": 1546,
-      "import": "crate::layers::hybrid_attention::compute_kv_split",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-02",
-      "file": "backend/opencl/plan.rs",
-      "line": 1552,
-      "import": "crate::layers::hybrid_attention::current",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
-    },
-    {
       "id": "V-04",
       "file": "backend/qnn_oppkg/mod.rs",
       "line": 134,
@@ -58,25 +40,7 @@
     {
       "id": "V-05",
       "file": "backend/cuda_embedded/mod.rs",
-      "line": 1249,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-001",
-      "kind": "L1(cuda_embedded)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-05",
-      "file": "backend/cuda_embedded/mod.rs",
-      "line": 1253,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-001",
-      "kind": "L1(cuda_embedded)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-05",
-      "file": "backend/cuda_embedded/mod.rs",
-      "line": 1259,
+      "line": 530,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-001",
       "kind": "L1(cuda_embedded)→L1(cpu) (cross-backend import)",
@@ -85,16 +49,7 @@
     {
       "id": "V-05",
       "file": "backend/cuda_pc/mod.rs",
-      "line": 597,
-      "import": "crate::backend::cpu::CpuBackend",
-      "rule": "INV-LAYER-001",
-      "kind": "L1(cuda_pc)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-05",
-      "file": "backend/cuda_pc/mod.rs",
-      "line": 598,
+      "line": 328,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-001",
       "kind": "L1(cuda_pc)→L1(cpu) (cross-backend import)",
@@ -581,27 +536,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 234,
-      "import": "crate::backend::cpu::neon::fused_matmul_f16",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 264,
-      "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 445,
+      "line": 455,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -611,7 +546,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 534,
+      "line": 544,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -621,47 +556,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1286,
-      "import": "crate::backend::cpu::neon::fused_matmul_f16",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1307,
-      "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1436,
-      "import": "crate::backend::cpu::neon::fused_matmul_f16",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1461,
-      "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1696,
+      "line": 1723,
       "import": "crate::backend::cpu::neon::CpuBackendNeon::vec_dot_f16_f32",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1243,7 +1138,7 @@
     {
       "id": "V-??",
       "file": "backend.rs",
-      "line": 1111,
+      "line": 1197,
       "import": "crate::backend::cpu::common::CpuBackendCommon",
       "rule": "INV-LAYER-002",
       "kind": "L2→L1 (backend-specific impl 직접 의존)",
@@ -1253,7 +1148,7 @@
     {
       "id": "V-??",
       "file": "backend.rs",
-      "line": 1216,
+      "line": 1302,
       "import": "crate::backend::opencl::OpenCLBackend::new",
       "rule": "INV-LAYER-002",
       "kind": "L2→L1 (backend-specific impl 직접 의존)",
@@ -1262,8 +1157,28 @@
     },
     {
       "id": "V-??",
+      "file": "backend/cuda_embedded/mod.rs",
+      "line": 3067,
+      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
+      "rule": "INV-LAYER-001",
+      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
+      "is_test_block": false,
+      "note": "V-01 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "backend/cuda_pc/mod.rs",
+      "line": 1808,
+      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
+      "rule": "INV-LAYER-001",
+      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
+      "is_test_block": false,
+      "note": "V-01 패턴"
+    },
+    {
+      "id": "V-??",
       "file": "backend/opencl/mod.rs",
-      "line": 5230,
+      "line": 1541,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
@@ -1271,26 +1186,27 @@
     },
     {
       "id": "V-??",
-      "file": "backend/opencl/plan.rs",
-      "line": 696,
-      "import": "crate::backend::cpu::neon::fused_matmul_f16",
+      "file": "backend/opencl/mod.rs",
+      "line": 5241,
+      "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
       "is_test_block": false
     },
     {
       "id": "V-??",
-      "file": "backend/opencl/plan.rs",
-      "line": 717,
-      "import": "crate::backend::cpu::neon::fused_matmul_q4_0",
+      "file": "backend/opencl/mod.rs",
+      "line": 6595,
+      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
       "rule": "INV-LAYER-001",
-      "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
+      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
+      "is_test_block": false,
+      "note": "V-01 패턴"
     },
     {
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
-      "line": 1638,
+      "line": 1645,
       "import": "crate::backend::cpu::neon::flash_partial_kv_range_f16",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
@@ -1299,11 +1215,21 @@
     {
       "id": "V-??",
       "file": "backend/opencl/plan.rs",
-      "line": 1705,
+      "line": 1712,
       "import": "crate::backend::cpu::neon::merge_two_partials_f32",
       "rule": "INV-LAYER-001",
       "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
       "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "backend/qnn_oppkg/mod.rs",
+      "line": 825,
+      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
+      "rule": "INV-LAYER-001",
+      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
+      "is_test_block": false,
+      "note": "V-01 패턴"
     },
     {
       "id": "V-??",
@@ -1435,7 +1361,7 @@
     {
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 358,
+      "line": 368,
       "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -1444,7 +1370,7 @@
     {
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1757,
+      "line": 1784,
       "import": "crate::pressure::kv_cache::KVLayout",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -1453,7 +1379,7 @@
     {
       "id": "V-??",
       "file": "layers/transformer_layer/forward_gen.rs",
-      "line": 1771,
+      "line": 1798,
       "import": "crate::pressure::kv_cache::KVLayout::HeadMajor",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -1931,46 +1857,6 @@
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(resilience)→L3-pressure (trait inversion 필요)",
       "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/cuda_embedded/mod.rs",
-      "line": 3067,
-      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
-      "is_test_block": false,
-      "note": "V-01 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "backend/cuda_pc/mod.rs",
-      "line": 1808,
-      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
-      "is_test_block": false,
-      "note": "V-01 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "backend/opencl/mod.rs",
-      "line": 6595,
-      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
-      "is_test_block": false,
-      "note": "V-01 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "backend/qnn_oppkg/mod.rs",
-      "line": 825,
-      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
-      "is_test_block": false,
-      "note": "V-01 패턴"
     }
   ]
 }

@@ -1550,13 +1550,10 @@ impl FullKernelPlan {
                         //    kv_start = 0 (고정). CPU는 [kv_end_gpu, attn_seq_len)를 담당.
                         let kv_len = attn_seq_len as usize;
                         let (kv_end_gpu, _kv_end_cpu) =
-                            crate::layers::hybrid_attention::compute_kv_split(
-                                kv_len,
-                                hybrid.kv_frac,
-                            );
+                            crate::hybrid_attention::compute_kv_split(kv_len, hybrid.kv_frac);
 
                         // 현재 설치된 setup 획득 — ready_flags host_ptr 직접 접근용.
-                        let setup = crate::layers::hybrid_attention::current().expect(
+                        let setup = crate::hybrid_attention::current().expect(
                             "HybridKvSplit variant selected but no HybridAttnSetup installed",
                         );
 
