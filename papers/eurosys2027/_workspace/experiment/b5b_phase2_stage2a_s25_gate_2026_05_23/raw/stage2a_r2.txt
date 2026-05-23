@@ -1,0 +1,20 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[NoShuffle] Skipped: default AOS (set LLMRS_ENABLE_NOSHUFFLE_SOA=1 to opt in) — decode uses standard Q4_0 GEMV
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The capital of France is
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=512
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 512)
+Generating (Max: 512, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=32)
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+The capital of France is Paris. It has a population of about 2 million people and covers an area of 104 square kilometers (km2). The city is divided into
+TTFT: 93.68 ms
+Decode: 30.95 ms/tok (32.3 tok/s) [31 tokens]
+Avg TBT: 32.91 ms (30.4 tokens/sec)
+[Phase4-4.5] generated=32 (first=12095 + run=31) stopped_by=BudgetExhausted final_pos=36
