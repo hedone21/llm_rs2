@@ -1164,15 +1164,6 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// LISWAP-6 OpenCL secondary capability. `OpenCLBackend` returns
-    /// `Some(self)`; all other backends return `None`. Stage 2 will replace
-    /// `qnn_oppkg::with_opencl_secondary`'s `as_any().downcast_ref()` chain
-    /// with this method.
-    #[cfg(feature = "opencl")]
-    fn as_opencl_secondary(&self) -> Option<&dyn crate::secondary::OpenClSecondary> {
-        None
-    }
-
     /// Intra-token GPU yield hook. Default no-op (CPU backends).
     ///
     /// Called once per layer in the decode loop (and per layer in the OpenCL

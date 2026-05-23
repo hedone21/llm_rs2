@@ -6586,20 +6586,10 @@ impl Backend for OpenCLBackend {
         &*self.cpu_companion
     }
 
-    fn as_opencl_secondary(&self) -> Option<&dyn crate::secondary::OpenClSecondary> {
-        Some(self)
-    }
-
     // B-5b Phase 2 Stage 2-B: intra-token GPU yield hook routed through trait.
     fn yield_after_layer(&self, layer: usize, is_decode: bool) {
         crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
     }
-}
-
-impl crate::secondary::OpenClSecondary for OpenCLBackend {
-    // Stage 1 placeholder — see `crate::secondary::OpenClSecondary` docs.
-    // Stage 2 will add the closure / method surface needed by
-    // `qnn_oppkg::with_opencl_secondary`.
 }
 
 // ── KIVI Q2 dispatch functions (OpenCLBackend-specific, not part of Backend trait) ──
