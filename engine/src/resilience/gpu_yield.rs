@@ -44,15 +44,20 @@ pub fn intra_token_yield_enabled() -> bool {
     yield_every() > 0
 }
 
-/// Hook to call after a decode-time layer completes.
+/// Backend-agnostic implementation of the intra-token GPU yield hook.
 ///
 /// `layer_idx` is the 0-based index of the layer that just ran. The yield
 /// fires at `(layer_idx + 1) % every == 0`, matching a human-intuitive
 /// "every N layers" reading.
 ///
 /// `is_decode` gates the hook so prefill (bursty by design) is unaffected.
+///
+/// B-5b Phase 2 Stage 2-B: invoked from GPU backends' `yield_after_layer`
+/// trait method override. The freestanding helper (previously
+/// `maybe_yield_after_layer`) was removed; all dispatch flows through the
+/// `Backend` trait now.
 #[inline]
-pub fn maybe_yield_after_layer(backend: &dyn Backend, layer_idx: usize, is_decode: bool) {
+pub fn gpu_yield_impl(backend: &dyn Backend, layer_idx: usize, is_decode: bool) {
     if !is_decode {
         return;
     }

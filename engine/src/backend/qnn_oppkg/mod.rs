@@ -819,6 +819,11 @@ impl Backend for QnnOppkgBackend {
     fn cpu_companion(&self) -> &dyn Backend {
         self
     }
+
+    // B-5b Phase 2 Stage 2-B: intra-token GPU yield hook routed through trait.
+    fn yield_after_layer(&self, layer: usize, is_decode: bool) {
+        crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
+    }
 }
 
 #[cfg(test)]

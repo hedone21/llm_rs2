@@ -1129,11 +1129,11 @@ pub trait Backend: Send + Sync {
     //    Stage 2 will swap that for `backend.as_opencl_secondary()`. Default
     //    `None`; `OpenCLBackend` overrides.
     //
-    // 4. `yield_after_layer()` — `plan.rs:1834` and `transformer.rs:1841`
-    //    both call `crate::resilience::gpu_yield::maybe_yield_after_layer`.
-    //    Stage 2 will absorb that helper as a trait method so the resilience
-    //    layer can plug per-backend yield policies via the trait instead of
-    //    the existing free-function dispatch. Default no-op.
+    // 4. `yield_after_layer()` — Stage 2-B (HEAD this commit) routed
+    //    `plan.rs:1841` and `transformer.rs:1841` through this trait method.
+    //    The freestanding helper was renamed to
+    //    `crate::resilience::gpu_yield::gpu_yield_impl` and is invoked from
+    //    per-backend overrides. Default remains no-op (CPU backends).
     //
     // RPN-145~180 hot-path concern (architect pre-survey): the
     // `yield_after_layer` default impl still incurs one vtable lookup per
@@ -1173,19 +1173,21 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// Intra-token GPU yield hook. Default no-op.
+    /// Intra-token GPU yield hook. Default no-op (CPU backends).
     ///
     /// Called once per layer in the decode loop (and per layer in the OpenCL
-    /// plan path). Stage 2 will fold
-    /// `crate::resilience::gpu_yield::maybe_yield_after_layer` into the
-    /// per-backend trait impl. Until then the freestanding helper still owns
-    /// the dispatch and this default is unused.
+    /// plan path). GPU backends (`OpenCLBackend`, `CudaBackend` (pc + embedded),
+    /// `QnnOppkgBackend`) override this to delegate to
+    /// `crate::resilience::gpu_yield::gpu_yield_impl` which performs
+    /// `synchronize()` + optional `sleep_us()` when configured via
+    /// `LLMRS_DECODE_YIELD_EVERY`/`LLMRS_DECODE_YIELD_US`.
     ///
-    /// Hot path: vtable dispatch happens even for the default no-op. Stage 2
-    /// must validate this on the S25 microbench before committing the call
-    /// site migration; if regression is detected, fall back to keeping
-    /// `gpu_yield::maybe_yield_after_layer` as a freestanding function for
-    /// this one hook specifically.
+    /// B-5b Phase 2 Stage 2-B: call sites
+    /// (`backend/opencl/plan.rs`, `models/transformer.rs`) now invoke this
+    /// trait method instead of the previous freestanding
+    /// `gpu_yield::maybe_yield_after_layer`. Stage 2-A S25 result showed
+    /// vtable cost below measurement noise; Stage 2-B regression re-check
+    /// follows in a separate task.
     fn yield_after_layer(&self, _layer: usize, _is_decode: bool) {}
 }
 

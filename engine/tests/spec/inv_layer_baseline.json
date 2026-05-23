@@ -1307,16 +1307,6 @@
     },
     {
       "id": "V-??",
-      "file": "backend/opencl/plan.rs",
-      "line": 1834,
-      "import": "crate::resilience::gpu_yield::maybe_yield_after_layer",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
-      "is_test_block": false,
-      "note": "V-01 패턴"
-    },
-    {
-      "id": "V-??",
       "file": "layers/llama_layer.rs",
       "line": 12,
       "import": "crate::pressure::kv_cache::KVCache",
@@ -1575,15 +1565,6 @@
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
       "is_test_block": false,
       "note": "downcast 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "models/transformer.rs",
-      "line": 1841,
-      "import": "crate::resilience::gpu_yield::maybe_yield_after_layer",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
     },
     {
       "id": "V-??",
@@ -1950,6 +1931,46 @@
       "rule": "INV-LAYER-004",
       "kind": "cross-cutting(resilience)→L3-pressure (trait inversion 필요)",
       "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "backend/cuda_embedded/mod.rs",
+      "line": 3067,
+      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
+      "rule": "INV-LAYER-001",
+      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
+      "is_test_block": false,
+      "note": "V-01 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "backend/cuda_pc/mod.rs",
+      "line": 1808,
+      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
+      "rule": "INV-LAYER-001",
+      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
+      "is_test_block": false,
+      "note": "V-01 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "backend/opencl/mod.rs",
+      "line": 6595,
+      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
+      "rule": "INV-LAYER-001",
+      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
+      "is_test_block": false,
+      "note": "V-01 패턴"
+    },
+    {
+      "id": "V-??",
+      "file": "backend/qnn_oppkg/mod.rs",
+      "line": 825,
+      "import": "crate::resilience::gpu_yield::gpu_yield_impl",
+      "rule": "INV-LAYER-001",
+      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
+      "is_test_block": false,
+      "note": "V-01 패턴"
     }
   ]
 }

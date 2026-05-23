@@ -1838,7 +1838,7 @@ impl FullKernelPlan {
 
             // Intra-token GPU yield hook. Plan path is decode-only, so
             // `is_decode = true` unconditionally.
-            crate::resilience::gpu_yield::maybe_yield_after_layer(backend, i, true);
+            backend.yield_after_layer(i, true);
         }
 
         // GPU score accumulator: flush step-local scores into cumulative

@@ -1838,7 +1838,7 @@ impl TransformerModel {
                     })?;
                 }
                 // Intra-token GPU yield hook (decode only, seq_len == 1).
-                crate::resilience::gpu_yield::maybe_yield_after_layer(&**backend, i, true);
+                backend.yield_after_layer(i, true);
             }
 
             // LISWAP-4 (ENG-ALG-235): post-layer hook. Called after every
