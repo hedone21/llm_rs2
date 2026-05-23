@@ -1252,19 +1252,18 @@ fn fallback_counter(tag: &str) -> &'static AtomicU64 {
     }
 }
 
-/// Internal helper: get a CPU backend for fallback compute.
-/// Uses the platform-native backend (Neon on aarch64, AVX2 on x86_64).
-fn cpu_fallback() -> crate::backend::cpu::CpuBackend {
-    cpu_fallback_tagged("unknown")
-}
-
-fn cpu_fallback_tagged(tag: &'static str) -> crate::backend::cpu::CpuBackend {
+/// B-5b Phase 2 Stage 2-A: tag counter increment (no dispatch).
+///
+/// Replaces the prior `cpu_fallback_tagged()` helper which both incremented
+/// the tag counter and constructed a fresh `CpuBackend`. Call sites now pair
+/// this with `self.cpu_companion()` so the host fallback shares the backend's
+/// owned CPU companion instead of allocating a throwaway `CpuBackend::new()`.
+fn cpu_fallback_log(tag: &'static str) {
     let c = fallback_counter(tag);
     let n = c.fetch_add(1, Ordering::Relaxed) + 1;
     if std::env::var("LLM_RS_TRACE_FALLBACK").is_ok() && (n <= 3 || n % 500 == 0) {
         eprintln!("[cpu_fallback] {}: count={}", tag, n);
     }
-    crate::backend::cpu::CpuBackend::new()
 }
 
 /// Dump fallback counter totals.
@@ -1430,7 +1429,8 @@ impl Backend for CudaBackend {
     // --- Math ops ---
 
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
-        cpu_fallback_tagged("matmul").matmul(a, b, out)
+        cpu_fallback_log("matmul");
+        self.cpu_companion().matmul(a, b, out)
     }
 
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -1647,7 +1647,8 @@ impl Backend for CudaBackend {
 
         // Q4_0 non-decode (prefill M>1) or missing device ptr: CPU fallback.
         if b_dtype == DType::Q4_0 || a_dtype == DType::Q4_0 {
-            return cpu_fallback_tagged("matmul_transposed_q4_0").matmul_transposed(a, b, out);
+            cpu_fallback_log("matmul_transposed_q4_0");
+            return self.cpu_companion().matmul_transposed(a, b, out);
         }
 
         // Try to get device pointers for cuBLAS
@@ -1861,11 +1862,13 @@ impl Backend for CudaBackend {
                 Ok(())
             } else {
                 // Unsupported dtype combination -> CPU fallback
-                cpu_fallback_tagged("matmul_transposed_other").matmul_transposed(a, b, out)
+                cpu_fallback_log("matmul_transposed_other");
+                self.cpu_companion().matmul_transposed(a, b, out)
             }
         } else {
             // No device pointers available -> CPU fallback
-            cpu_fallback_tagged("matmul_transposed_other").matmul_transposed(a, b, out)
+            cpu_fallback_log("matmul_transposed_other");
+            self.cpu_companion().matmul_transposed(a, b, out)
         }
     }
 
@@ -1877,7 +1880,8 @@ impl Backend for CudaBackend {
         cols: usize,
         out: &mut Tensor,
     ) -> Result<()> {
-        cpu_fallback_tagged("matmul_slice").matmul_slice(a, b, rows, cols, out)
+        cpu_fallback_log("matmul_slice");
+        self.cpu_companion().matmul_slice(a, b, rows, cols, out)
     }
 
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
@@ -2363,7 +2367,8 @@ impl Backend for CudaBackend {
                 // never touch a live GPU write in the decode hot path
                 // — this branch is exercised at load/init, not per token.
                 self.maybe_sync_cat(SyncCat::FallbackPre)?;
-                cpu_fallback_tagged("cast").cast(src, dst)
+                cpu_fallback_log("cast");
+                self.cpu_companion().cast(src, dst)
             }
         }
     }
@@ -2451,7 +2456,8 @@ impl Backend for CudaBackend {
         } else {
             // Missing device ptr: sync then CPU fallback
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback_tagged("kv_scatter")
+            cpu_fallback_log("kv_scatter");
+            self.cpu_companion()
                 .kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
         }
     }
@@ -2511,7 +2517,8 @@ impl Backend for CudaBackend {
             Ok(())
         } else {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback_tagged("kv_scatter").kv_scatter_f32_to_f16_batch(
+            cpu_fallback_log("kv_scatter");
+            self.cpu_companion().kv_scatter_f32_to_f16_batch(
                 k_src,
                 v_src,
                 k_dst,
@@ -2530,7 +2537,8 @@ impl Backend for CudaBackend {
         // For other dtypes, sync and fall back to CPU.
         if src.dtype() != DType::F16 {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            return cpu_fallback_tagged("gather").gather(src, indices, dst);
+            cpu_fallback_log("gather");
+            return self.cpu_companion().gather(src, indices, dst);
         }
 
         let src_ptr = Self::get_device_ptr(src.buffer().as_ref());
@@ -2571,7 +2579,8 @@ impl Backend for CudaBackend {
             Ok(())
         } else {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback_tagged("gather").gather(src, indices, dst)
+            cpu_fallback_log("gather");
+            self.cpu_companion().gather(src, indices, dst)
         }
     }
 
@@ -2600,7 +2609,8 @@ impl Backend for CudaBackend {
         let all_ptrs = q_ptr.is_some() && k_ptr.is_some() && v_ptr.is_some() && out_ptr.is_some();
         if !kv_dtype_ok || !all_ptrs {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            return cpu_fallback_tagged("attention_gen").attention_gen(
+            cpu_fallback_log("attention_gen");
+            return self.cpu_companion().attention_gen(
                 q,
                 k_cache,
                 v_cache,

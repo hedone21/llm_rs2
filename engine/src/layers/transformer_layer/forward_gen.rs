@@ -230,8 +230,13 @@ impl TransformerLayer {
             #[cfg(target_arch = "aarch64")]
             {
                 let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
+                // B-5b Phase 2 Stage 2-A: backend is the NEON CpuBackend here
+                // (is_cpu_f16 && is_decode), so cpu_kernels() returns Some.
+                let kernels = backend.cpu_kernels().expect(
+                    "forward_gen QKV F16: cpu_kernels required on NEON CPU decode fast path",
+                );
                 unsafe {
-                    crate::backend::cpu::neon::fused_matmul_f16(
+                    (kernels.fused_matmul_f16)(
                         ws.residual.as_ptr() as *const f32,
                         k,
                         &[
@@ -260,8 +265,13 @@ impl TransformerLayer {
             {
                 use crate::quant::BlockQ4_0;
                 let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
+                // B-5b Phase 2 Stage 2-A: same NEON CpuBackend gating as F16
+                // QKV path above.
+                let kernels = backend.cpu_kernels().expect(
+                    "forward_gen QKV Q4_0: cpu_kernels required on NEON CPU decode fast path",
+                );
                 unsafe {
-                    crate::backend::cpu::neon::fused_matmul_q4_0(
+                    (kernels.fused_matmul_q4_0)(
                         ws.residual.as_ptr() as *const f32,
                         k,
                         &[
@@ -1282,8 +1292,14 @@ impl TransformerLayer {
                 let cpu_slice_dtype = part.gate.cpu_slice.dtype();
                 let cpu_is_neon = cpu.name().contains("CPU");
                 if cpu_is_neon && cpu_slice_dtype == DType::F16 {
+                    // B-5b Phase 2 Stage 2-A: route through the CPU
+                    // companion's `cpu_kernels()` trait method. The
+                    // `cpu_is_neon` precondition above ensures `Some`.
+                    let kernels = cpu
+                        .cpu_kernels()
+                        .expect("forward_gen partition F16: cpu_kernels required when cpu_is_neon");
                     unsafe {
-                        crate::backend::cpu::neon::fused_matmul_f16(
+                        (kernels.fused_matmul_f16)(
                             residual_cpu_ptr as *const f32,
                             k_cpu,
                             &[
@@ -1303,8 +1319,11 @@ impl TransformerLayer {
                     true
                 } else if cpu_is_neon && cpu_slice_dtype == DType::Q4_0 {
                     use crate::quant::BlockQ4_0;
+                    let kernels = cpu.cpu_kernels().expect(
+                        "forward_gen partition Q4_0: cpu_kernels required when cpu_is_neon",
+                    );
                     unsafe {
-                        crate::backend::cpu::neon::fused_matmul_q4_0(
+                        (kernels.fused_matmul_q4_0)(
                             residual_cpu_ptr as *const f32,
                             k_cpu,
                             &[
@@ -1432,8 +1451,13 @@ impl TransformerLayer {
             #[cfg(target_arch = "aarch64")]
             {
                 let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
+                // B-5b Phase 2 Stage 2-A: backend is the NEON CpuBackend
+                // here (is_cpu_f16 && is_decode), so cpu_kernels() is Some.
+                let kernels = backend.cpu_kernels().expect(
+                    "forward_gen FFN F16: cpu_kernels required on NEON CPU decode fast path",
+                );
                 unsafe {
-                    crate::backend::cpu::neon::fused_matmul_f16(
+                    (kernels.fused_matmul_f16)(
                         ws.residual.as_ptr() as *const f32,
                         k,
                         &[
@@ -1457,8 +1481,11 @@ impl TransformerLayer {
             {
                 use crate::quant::BlockQ4_0;
                 let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
+                let kernels = backend.cpu_kernels().expect(
+                    "forward_gen FFN Q4_0: cpu_kernels required on NEON CPU decode fast path",
+                );
                 unsafe {
-                    crate::backend::cpu::neon::fused_matmul_q4_0(
+                    (kernels.fused_matmul_q4_0)(
                         ws.residual.as_ptr() as *const f32,
                         k,
                         &[

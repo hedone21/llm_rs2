@@ -691,9 +691,16 @@ impl PartitionStep {
             let used_fused_gate_up = {
                 let gate_dtype = self.cpu_ctx.gate_cpu.dtype();
                 let k = self.cpu_ctx.gate_cpu.shape().dims()[1];
+                // B-5b Phase 2 Stage 2-A: route fused NEON kernels through the
+                // GPU backend's CPU companion. `cpu_companion().cpu_kernels()`
+                // is `Some` on aarch64 (NEON CpuBackend) and `None` elsewhere;
+                // this fast path is aarch64-gated so `expect` is sound.
+                let kernels = backend.cpu_companion().cpu_kernels().expect(
+                    "plan.rs: cpu_kernels required for partition fused gate+up matmul fast path",
+                );
                 if gate_dtype == crate::buffer::DType::F16 {
                     unsafe {
-                        crate::backend::cpu::neon::fused_matmul_f16(
+                        (kernels.fused_matmul_f16)(
                             pw.residual_cpu.as_ptr() as *const f32,
                             k,
                             &[
@@ -714,7 +721,7 @@ impl PartitionStep {
                 } else if gate_dtype == crate::buffer::DType::Q4_0 {
                     use crate::quant::BlockQ4_0;
                     unsafe {
-                        crate::backend::cpu::neon::fused_matmul_q4_0(
+                        (kernels.fused_matmul_q4_0)(
                             pw.residual_cpu.as_ptr() as *const f32,
                             k,
                             &[

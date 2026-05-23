@@ -601,12 +601,6 @@ impl CudaBackend {
     }
 }
 
-/// Internal helper: get a CPU backend for fallback compute.
-/// Uses the platform-native backend (Neon on aarch64, AVX2 on x86_64).
-fn cpu_fallback() -> crate::backend::cpu::CpuBackend {
-    crate::backend::cpu::CpuBackend::new()
-}
-
 impl Backend for CudaBackend {
     fn as_any(&self) -> &dyn Any {
         self
@@ -726,7 +720,7 @@ impl Backend for CudaBackend {
     // --- Math ops ---
 
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
-        cpu_fallback().matmul(a, b, out)
+        self.cpu_companion().matmul(a, b, out)
     }
 
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -745,7 +739,7 @@ impl Backend for CudaBackend {
         // 2026-04-27).
         if b_dtype == DType::Q4_0 || a_dtype == DType::Q4_0 {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            return cpu_fallback().matmul_transposed(a, b, out);
+            return self.cpu_companion().matmul_transposed(a, b, out);
         }
 
         // Try to get device pointers for cuBLAS
@@ -887,11 +881,11 @@ impl Backend for CudaBackend {
                 Ok(())
             } else {
                 // Unsupported dtype combination -> CPU fallback
-                cpu_fallback().matmul_transposed(a, b, out)
+                self.cpu_companion().matmul_transposed(a, b, out)
             }
         } else {
             // No device pointers available -> CPU fallback
-            cpu_fallback().matmul_transposed(a, b, out)
+            self.cpu_companion().matmul_transposed(a, b, out)
         }
     }
 
@@ -903,7 +897,7 @@ impl Backend for CudaBackend {
         cols: usize,
         out: &mut Tensor,
     ) -> Result<()> {
-        cpu_fallback().matmul_slice(a, b, rows, cols, out)
+        self.cpu_companion().matmul_slice(a, b, rows, cols, out)
     }
 
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
@@ -1184,7 +1178,7 @@ impl Backend for CudaBackend {
             _ => {
                 // Unsupported dtype or missing device ptr: sync then CPU fallback
                 self.maybe_sync_cat(SyncCat::FallbackPre)?;
-                cpu_fallback().cast(src, dst)
+                self.cpu_companion().cast(src, dst)
             }
         }
     }
@@ -1265,7 +1259,7 @@ impl Backend for CudaBackend {
         } else {
             // Missing device ptr: sync then CPU fallback
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback()
+            self.cpu_companion()
                 .kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
         }
     }
@@ -1322,7 +1316,7 @@ impl Backend for CudaBackend {
             Ok(())
         } else {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback().kv_scatter_f32_to_f16_batch(
+            self.cpu_companion().kv_scatter_f32_to_f16_batch(
                 k_src,
                 v_src,
                 k_dst,
@@ -1388,7 +1382,7 @@ impl Backend for CudaBackend {
             Ok(())
         } else {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback().kv_scatter_f32_to_f32_batch(
+            self.cpu_companion().kv_scatter_f32_to_f32_batch(
                 k_src,
                 v_src,
                 k_dst,
@@ -1407,7 +1401,7 @@ impl Backend for CudaBackend {
         // For other dtypes, sync and fall back to CPU.
         if src.dtype() != DType::F16 {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            return cpu_fallback().gather(src, indices, dst);
+            return self.cpu_companion().gather(src, indices, dst);
         }
 
         let src_ptr = Self::get_device_ptr(src.buffer().as_ref());
@@ -1442,7 +1436,7 @@ impl Backend for CudaBackend {
             Ok(())
         } else {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback().gather(src, indices, dst)
+            self.cpu_companion().gather(src, indices, dst)
         }
     }
 
@@ -1471,7 +1465,7 @@ impl Backend for CudaBackend {
         let all_ptrs = q_ptr.is_some() && k_ptr.is_some() && v_ptr.is_some() && out_ptr.is_some();
         if !kv_dtype_ok || !all_ptrs {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            return cpu_fallback().attention_gen(
+            return self.cpu_companion().attention_gen(
                 q,
                 k_cache,
                 v_cache,
