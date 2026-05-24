@@ -1,5 +1,7 @@
 use half::f16;
 
+pub mod f16_bulk;
+
 pub const QK4_0: usize = 32;
 pub const QK4_1: usize = 32;
 

@@ -339,9 +339,8 @@ impl TransformerLayer {
                                 let mut byte_vec = vec![0u8; byte_size];
                                 backend.read_buffer(t, &mut byte_vec)?;
                                 vec.resize(numel, 0.0);
-                                #[cfg(target_arch = "aarch64")]
                                 unsafe {
-                                    crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                                    crate::quant::f16_bulk::bulk_f16_to_f32(
                                         byte_vec.as_ptr() as *const u16,
                                         vec.as_mut_ptr(),
                                         numel,
@@ -420,14 +419,13 @@ impl TransformerLayer {
                         let v_f16_ptr = v_cache.as_ptr() as *const u16;
                         k_vec.resize(n_elems, 0.0f32);
                         v_vec.resize(n_elems, 0.0f32);
-                        #[cfg(target_arch = "aarch64")]
                         unsafe {
-                            crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                            crate::quant::f16_bulk::bulk_f16_to_f32(
                                 k_f16_ptr,
                                 k_vec.as_mut_ptr(),
                                 n_elems,
                             );
-                            crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                            crate::quant::f16_bulk::bulk_f16_to_f32(
                                 v_f16_ptr,
                                 v_vec.as_mut_ptr(),
                                 n_elems,
@@ -1004,9 +1002,8 @@ impl TransformerLayer {
                             let mut byte_vec = vec![0u8; byte_size];
                             backend.read_buffer(t, &mut byte_vec)?;
                             vec.resize(numel, 0.0);
-                            #[cfg(target_arch = "aarch64")]
                             unsafe {
-                                crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                                crate::quant::f16_bulk::bulk_f16_to_f32(
                                     byte_vec.as_ptr() as *const u16,
                                     vec.as_mut_ptr(),
                                     numel,
@@ -1081,14 +1078,13 @@ impl TransformerLayer {
                     let v_f16_ptr = v_cache.as_ptr() as *const u16;
                     k_vec.resize(n_elems, 0.0f32);
                     v_vec.resize(n_elems, 0.0f32);
-                    #[cfg(target_arch = "aarch64")]
                     unsafe {
-                        crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                        crate::quant::f16_bulk::bulk_f16_to_f32(
                             k_f16_ptr,
                             k_vec.as_mut_ptr(),
                             n_elems,
                         );
-                        crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                        crate::quant::f16_bulk::bulk_f16_to_f32(
                             v_f16_ptr,
                             v_vec.as_mut_ptr(),
                             n_elems,

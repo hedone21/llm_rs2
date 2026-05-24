@@ -2518,48 +2518,6 @@ impl CpuBackendNeon {
         }
     }
 
-    /// NEON bulk F16→F32 conversion using fcvtl.
-    /// 16 elements per iteration (2× vld1q_u16 + 4× fcvtl/fcvtl2 + 4× vst1q_f32).
-    ///
-    /// # Safety
-    /// `src` must point to at least `n` u16 (F16) values,
-    /// `dst` to at least `n` f32 values (write-only).
-    #[target_feature(enable = "neon")]
-    pub unsafe fn bulk_f16_to_f32(src: *const u16, dst: *mut f32, n: usize) {
-        let mut i = 0;
-        while i + 16 <= n {
-            let raw0: uint16x8_t = vld1q_u16(src.add(i));
-            let raw1: uint16x8_t = vld1q_u16(src.add(i + 8));
-            let f0: float32x4_t;
-            let f1: float32x4_t;
-            let f2: float32x4_t;
-            let f3: float32x4_t;
-            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f0, i = in(vreg) raw0);
-            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f1, i = in(vreg) raw0);
-            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f2, i = in(vreg) raw1);
-            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f3, i = in(vreg) raw1);
-            vst1q_f32(dst.add(i), f0);
-            vst1q_f32(dst.add(i + 4), f1);
-            vst1q_f32(dst.add(i + 8), f2);
-            vst1q_f32(dst.add(i + 12), f3);
-            i += 16;
-        }
-        while i + 8 <= n {
-            let raw: uint16x8_t = vld1q_u16(src.add(i));
-            let lo: float32x4_t;
-            let hi: float32x4_t;
-            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) lo, i = in(vreg) raw);
-            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) hi, i = in(vreg) raw);
-            vst1q_f32(dst.add(i), lo);
-            vst1q_f32(dst.add(i + 4), hi);
-            i += 8;
-        }
-        while i < n {
-            *dst.add(i) = half::f16::from_bits(*src.add(i)).to_f32();
-            i += 1;
-        }
-    }
-
     fn matmul_transposed_q4_0(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         let a_shape = a.shape().dims();
         let b_shape = b.shape().dims();

@@ -376,37 +376,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward.rs",
-      "line": 344,
-      "import": "crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward.rs",
-      "line": 425,
-      "import": "crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward.rs",
-      "line": 430,
-      "import": "crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward.rs",
-      "line": 561,
+      "line": 559,
       "import": "crate::backend::opencl::get_cl_mem",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -416,7 +386,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward.rs",
-      "line": 565,
+      "line": 563,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -426,7 +396,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward.rs",
-      "line": 566,
+      "line": 564,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -436,7 +406,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward.rs",
-      "line": 586,
+      "line": 584,
       "import": "crate::backend::qnn_oppkg::QnnOppkgBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -446,37 +416,7 @@
     {
       "id": "V-17",
       "file": "layers/transformer_layer/forward.rs",
-      "line": 1009,
-      "import": "crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward.rs",
-      "line": 1086,
-      "import": "crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward.rs",
-      "line": 1091,
-      "import": "crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L1 (backend impl 직접 의존)",
-      "is_test_block": false,
-      "note": "downcast 패턴"
-    },
-    {
-      "id": "V-17",
-      "file": "layers/transformer_layer/forward.rs",
-      "line": 1205,
+      "line": 1201,
       "import": "crate::backend::cpu::CpuBackend::new",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -586,7 +526,7 @@
     {
       "id": "V-18",
       "file": "layers/transformer_layer/forward.rs",
-      "line": 1301,
+      "line": 1297,
       "import": "crate::observability::profile::ops::PrefillOpProfiler",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",

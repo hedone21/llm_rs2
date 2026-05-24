@@ -299,17 +299,12 @@ impl Backend for CpuBackendCommon {
                 let s = src.as_slice::<half::f16>();
                 let d = dst.as_mut_slice::<f32>();
                 if s.len() < 4096 {
-                    #[cfg(target_arch = "aarch64")]
                     unsafe {
-                        super::neon::CpuBackendNeon::bulk_f16_to_f32(
+                        crate::quant::f16_bulk::bulk_f16_to_f32(
                             s.as_ptr() as *const u16,
                             d.as_mut_ptr(),
                             s.len(),
                         );
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    for (d_val, s_val) in d.iter_mut().zip(s.iter()) {
-                        *d_val = s_val.to_f32();
                     }
                 } else {
                     d.par_iter_mut()
