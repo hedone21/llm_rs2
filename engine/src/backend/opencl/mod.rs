@@ -4686,6 +4686,12 @@ impl Backend for OpenCLBackend {
         Self::gpu_score_acc_mut(self).map(|s| s as &mut dyn crate::backend::GpuScoreAccess)
     }
 
+    // §13.8-L S-L-3: KiviAttentionBackend trait expose — OpenCL backend
+    // 만 활성. 그 외 backend 는 Backend trait default `None`.
+    fn as_kivi_attention(&self) -> Option<&dyn crate::backend::KiviAttentionBackend> {
+        Some(self as &dyn crate::backend::KiviAttentionBackend)
+    }
+
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
         let buf =
             get_cl_mem(t.buffer().as_ref()).map_err(|_| anyhow::anyhow!("Not OpenCL buffer"))?;
@@ -7096,6 +7102,73 @@ impl OpenCLBackend {
             8 => kernels.kernel_attn_gen_kivi_q8.is_some(),
             _ => false,
         }
+    }
+}
+
+// §13.8-L S-L-3: KIVI native attention trait impl — 모두 OpenCLBackend
+// 의 inherent method 로 위임. `as_kivi_attention` 이 `Some(&self as &dyn
+// KiviAttentionBackend)` 를 반환하므로 caller 는 backend trait method 만
+// 사용해 downcast 가 사라진다.
+impl crate::backend::KiviAttentionBackend for OpenCLBackend {
+    fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
+        Self::has_kivi_attn_kernel(self, bits)
+    }
+
+    fn is_nosub_device(&self) -> bool {
+        Self::is_nosub(self)
+    }
+
+    fn attention_gen_kivi(
+        &self,
+        q: &Tensor,
+        qk_buf: &Tensor,
+        qv_buf: &Tensor,
+        res_k: &Tensor,
+        res_v: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        q_tokens: usize,
+        res_tokens: usize,
+        res_cap: usize,
+        scale: f32,
+        scores_out: Option<&mut [f32]>,
+        bits: u8,
+    ) -> Result<()> {
+        Self::attention_gen_kivi(
+            self,
+            q,
+            qk_buf,
+            qv_buf,
+            res_k,
+            res_v,
+            out,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            q_tokens,
+            res_tokens,
+            res_cap,
+            scale,
+            scores_out,
+            bits,
+        )
+    }
+
+    fn kivi_gather_update(
+        &self,
+        input: &Tensor,
+        residual: &mut Tensor,
+        kv_heads: usize,
+        res_cap: usize,
+        head_dim: usize,
+        seq_len: usize,
+        res_pos: usize,
+    ) -> Result<()> {
+        Self::kivi_gather_update(
+            self, input, residual, kv_heads, res_cap, head_dim, seq_len, res_pos,
+        )
     }
 }
 

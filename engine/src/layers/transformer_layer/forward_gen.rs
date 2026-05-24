@@ -16,7 +16,11 @@ fn partition_async_read_enabled() -> bool {
 
 impl TransformerLayer {
     /// Fast path for single token generation using pre-allocated workspace.
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path decode (OpenCL/CUDA dispatch)
+    ///
+    /// §13.8-L S-L-1/2/3 적용 후: backend downcast 가 trait method 호출
+    /// (`profile_events_enabled` / `set_op_label` / `clear_op_label` /
+    /// `gpu_score_acc_mut` / `as_kivi_attention`) 로 통합되어 marker zone
+    /// 불필요.
     pub(super) fn forward_gen<C: KVCacheOps>(&self, mut args: ForwardGenArgs<C>) -> Result<()> {
         // SWIFT: if both sub-layers are skipped, early return (identity)
         if args.skip_attn && args.skip_mlp {
@@ -405,23 +409,23 @@ impl TransformerLayer {
         let need_scores = args.need_scores || kv_cache.needs_attn_scores();
 
         // KIVI native attention: bypass F32 dequant + scatter by fusing dequant
-        // into the attention kernel. Only available for OpenCL GPU + KiviCache.
-        #[cfg(feature = "opencl")]
+        // into the attention kernel. Only available for KIVI-capable GPU backend
+        // (현재는 OpenCL).
+        //
+        // §13.8-L S-L-3: Backend trait `as_kivi_attention()` 로 OpenCLBackend
+        // downcast 제거. 비-KIVI backend 는 `None` → 자연 fallthrough.
         let kivi_native_dispatched = if is_gpu {
             if let Some(raw) = kv_cache.get_kivi_raw_buffers() {
-                if let Some(ocl_be) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-                {
+                if let Some(kivi_be) = backend.as_kivi_attention() {
                     // Only use native KIVI attention on non-subgroup devices (NVIDIA).
                     // On Adreno (subgroups), the F32 dequant + subgroup attention_gen is faster
                     // because the native kernel uses workgroup reduction instead of subgroup ops.
-                    if ocl_be.has_kivi_attn_kernel(raw.bits)
-                        && ocl_be.is_nosub()
+                    if kivi_be.has_kivi_attn_kernel(raw.bits)
+                        && kivi_be.is_nosub_device()
                         && (raw.q_tokens + raw.res_tokens) > 0
                     {
                         let scale = 1.0 / (head_dim as f32).sqrt();
-                        ocl_be.attention_gen_kivi(
+                        kivi_be.attention_gen_kivi(
                             &q_rope,
                             raw.qk_buf,
                             raw.qv_buf,
@@ -455,8 +459,6 @@ impl TransformerLayer {
         } else {
             false
         };
-        #[cfg(not(feature = "opencl"))]
-        let kivi_native_dispatched = false;
 
         if !kivi_native_dispatched {
             let (k_cache, v_cache) = kv_cache.get_view();

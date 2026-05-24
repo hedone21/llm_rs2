@@ -1559,79 +1559,83 @@ impl KiviCache {
 
     /// GPU update path: scatter input tokens into GPU residual buffer using
     /// `kivi_gather_update` kernel, flushing when the residual is full.
-    #[allow(unused_variables)]
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI GPU update
+    // §13.8-L S-L-3: KiviAttentionBackend trait 으로 OpenCLBackend
+    // downcast 제거. fast path 의 `kivi_gather_update` 2건은 trait method,
+    // slow path 의 `copy_slice` 는 Backend trait 의 일반 메서드라 그대로
+    // dyn dispatch — 함수 내 잔존 downcast/import 0 이므로 marker 제거.
     fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
-        #[cfg(feature = "opencl")]
-        {
-            use crate::backend::opencl::OpenCLBackend;
+        let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
+        let kivi_be = backend_arc
+            .as_kivi_attention()
+            .ok_or_else(|| anyhow::anyhow!("GPU mode requires a KIVI-capable backend"))?;
 
-            let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
-            let ocl = backend_arc
-                .as_any()
-                .downcast_ref::<OpenCLBackend>()
-                .ok_or_else(|| anyhow::anyhow!("GPU mode requires OpenCLBackend"))?;
+        let mut written = 0usize;
+        while written < seq_len {
+            if self.res_pos >= self.res_cap {
+                self.flush_residual_gpu()?;
+            }
+            // How many tokens we can write in this batch without overflow
+            let batch = (seq_len - written).min(self.res_cap - self.res_pos);
 
-            let mut written = 0usize;
-            while written < seq_len {
-                if self.res_pos >= self.res_cap {
-                    self.flush_residual_gpu()?;
-                }
-                // How many tokens we can write in this batch without overflow
-                let batch = (seq_len - written).min(self.res_cap - self.res_pos);
-
-                // We need to call the kernel for the [written..written+batch] slice of new_k/v.
-                // The kernel signature is: input[seq_len, kv_heads, head_dim] → residual[kv_heads, res_cap, head_dim]
-                // But our input tensor contains all seq_len tokens; we need a view of [batch] tokens starting at `written`.
-                // Since GPU tensors may not support views, we create a lightweight wrapper pointing into the same buffer.
-                // SAFETY: We rely on the kernel only reading `seq_len` tokens from the start of the input buffer.
-                // To avoid GPU sub-buffer complexity, if written==0 and batch==seq_len we pass as-is.
-                // Otherwise, we fall back to the CPU copy_slice approach per token.
-                if written == 0 && batch == seq_len {
-                    // Fast path: pass entire input at once
+            // We need to call the kernel for the [written..written+batch] slice of new_k/v.
+            // The kernel signature is: input[seq_len, kv_heads, head_dim] → residual[kv_heads, res_cap, head_dim]
+            // But our input tensor contains all seq_len tokens; we need a view of [batch] tokens starting at `written`.
+            // Since GPU tensors may not support views, we create a lightweight wrapper pointing into the same buffer.
+            // SAFETY: We rely on the kernel only reading `seq_len` tokens from the start of the input buffer.
+            // To avoid GPU sub-buffer complexity, if written==0 and batch==seq_len we pass as-is.
+            // Otherwise, we fall back to the CPU copy_slice approach per token.
+            if written == 0 && batch == seq_len {
+                // Fast path: pass entire input at once
+                let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
+                let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
+                kivi_be.kivi_gather_update(
+                    new_k,
+                    gpu_res_k,
+                    self.kv_heads,
+                    self.res_cap,
+                    self.head_dim,
+                    batch,
+                    self.res_pos,
+                )?;
+                kivi_be.kivi_gather_update(
+                    new_v,
+                    gpu_res_v,
+                    self.kv_heads,
+                    self.res_cap,
+                    self.head_dim,
+                    batch,
+                    self.res_pos,
+                )?;
+            } else {
+                // Slow path: token-by-token copy_slice for the sub-range
+                for s in written..written + batch {
                     let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
                     let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
-                    ocl.kivi_gather_update(
-                        new_k,
-                        gpu_res_k,
-                        self.kv_heads,
-                        self.res_cap,
-                        self.head_dim,
-                        batch,
-                        self.res_pos,
-                    )?;
-                    ocl.kivi_gather_update(
-                        new_v,
-                        gpu_res_v,
-                        self.kv_heads,
-                        self.res_cap,
-                        self.head_dim,
-                        batch,
-                        self.res_pos,
-                    )?;
-                } else {
-                    // Slow path: token-by-token copy_slice for the sub-range
-                    for s in written..written + batch {
-                        let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
-                        let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
-                        for h in 0..self.kv_heads {
-                            let src_off = s * self.kv_heads * self.head_dim + h * self.head_dim;
-                            let dst_off = h * self.res_cap * self.head_dim
-                                + (self.res_pos + (s - written)) * self.head_dim;
-                            ocl.copy_slice(new_k, gpu_res_k, src_off, dst_off, self.head_dim)?;
-                            ocl.copy_slice(new_v, gpu_res_v, src_off, dst_off, self.head_dim)?;
-                        }
+                    for h in 0..self.kv_heads {
+                        let src_off = s * self.kv_heads * self.head_dim + h * self.head_dim;
+                        let dst_off = h * self.res_cap * self.head_dim
+                            + (self.res_pos + (s - written)) * self.head_dim;
+                        backend_arc.copy_slice(
+                            new_k,
+                            gpu_res_k,
+                            src_off,
+                            dst_off,
+                            self.head_dim,
+                        )?;
+                        backend_arc.copy_slice(
+                            new_v,
+                            gpu_res_v,
+                            src_off,
+                            dst_off,
+                            self.head_dim,
+                        )?;
                     }
                 }
-                self.res_pos += batch;
-                written += batch;
             }
-            return Ok(());
+            self.res_pos += batch;
+            written += batch;
         }
-        #[allow(unreachable_code)]
-        Err(anyhow::anyhow!(
-            "update_gpu called but opencl feature not enabled"
-        ))
+        Ok(())
     }
 
     /// GPU flush: read GPU residual → CPU quantize → upload Q2 blocks to GPU →
