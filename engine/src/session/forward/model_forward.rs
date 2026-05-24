@@ -17,13 +17,14 @@ use crate::backend::Backend;
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
 use crate::buffer::DType;
+use crate::kv_cache_ops::KVLayout;
 use crate::layers::workspace::{LayerWorkspace, PrefillWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
 use crate::models::config::ModelArch;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
-use crate::pressure::kv_cache::{KVCache, KVLayout};
+use crate::pressure::kv_cache::KVCache;
 use crate::session::traits::{Forward, StepCtx};
 use crate::shape::Shape;
 use crate::tensor::Tensor;

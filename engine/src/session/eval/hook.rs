@@ -5,7 +5,7 @@
 //! QCF metric collection.
 
 use crate::inference::attention_scores::AttentionScoreAccumulator;
-use crate::pressure::kv_cache::KVCacheOps;
+use crate::kv_cache_ops::KVCacheOps;
 
 /// Result of a post-decode-step hook invocation.
 #[derive(Debug, Default)]

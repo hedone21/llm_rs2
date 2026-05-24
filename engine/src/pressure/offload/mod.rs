@@ -16,9 +16,9 @@ pub mod store;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
+use crate::kv_cache_ops::{KVCacheOps, KVLayout};
 use crate::memory::Memory;
 use crate::memory::host::shared::SharedBuffer;
-use crate::pressure::kv_cache::{KVCacheOps, KVLayout};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 use anyhow::Result;
@@ -520,7 +520,7 @@ impl crate::pressure::kv_cache::PrefetchableCache for OffloadKVCache {
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 mod tests {
     use super::*;
-    use crate::pressure::kv_cache::KVCacheOps;
+    use crate::kv_cache_ops::KVCacheOps;
 
     fn make_test_tensor(
         seq_len: usize,

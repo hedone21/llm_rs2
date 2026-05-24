@@ -248,7 +248,7 @@ pub fn run_kivi_ppl(
     residual_size: usize,
     text_file: &str,
 ) -> anyhow::Result<()> {
-    use crate::pressure::kv_cache::KVCacheOps;
+    use crate::kv_cache_ops::KVCacheOps;
 
     let hidden_size = model.config.hidden_size;
     let vocab_size = model.config.vocab_size;

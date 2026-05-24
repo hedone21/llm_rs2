@@ -19,9 +19,9 @@
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
+use crate::kv_cache_ops::{KVCacheOps, KVLayout, KiviRawBuffers};
 use crate::memory::Memory;
 use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
-use crate::pressure::kv_cache::{KVCacheOps, KVLayout, KiviRawBuffers};
 use crate::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -2766,7 +2766,8 @@ mod tests {
     /// Data pattern: sin-based low-rank structure (realistic for attention KV).
     #[test]
     fn test_compare_kivi_vs_baseline() {
-        use crate::pressure::kv_cache::{KVCache, KVCacheOps};
+        use crate::kv_cache_ops::KVCacheOps;
+        use crate::pressure::kv_cache::KVCache;
 
         let kv_heads = 8;
         let head_dim = 64;
@@ -3396,7 +3397,7 @@ mod tests {
     /// Test 13: needs_attn_scores() mirrors awqe_enabled.
     #[test]
     fn test_kivi_needs_attn_scores() {
-        use crate::pressure::kv_cache::KVCacheOps;
+        use crate::kv_cache_ops::KVCacheOps;
 
         let mut cache = KiviCache::new(1, 32, 256, 32);
 

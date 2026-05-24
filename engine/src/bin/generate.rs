@@ -3972,7 +3972,7 @@ fn run_kivi(
     ignore_eos: bool,
     cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
-    use llm_rs2::pressure::kv_cache::KVCacheOps;
+    use llm_rs2::kv_cache_ops::KVCacheOps;
 
     println!(
         "[KIVI] KV cache enabled — bits={}, residual_size={}, max_seq_len={}",
@@ -4572,7 +4572,7 @@ fn run_offload(
     command_executor: &mut Option<CommandExecutor>,
     cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
-    use llm_rs2::pressure::kv_cache::KVCacheOps;
+    use llm_rs2::kv_cache_ops::KVCacheOps;
     use llm_rs2::pressure::offload::OffloadKVCache;
     use llm_rs2::pressure::offload::raw_store::RawStore;
 

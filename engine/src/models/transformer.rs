@@ -4,13 +4,14 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::buffer::{Buffer, DType};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::kv_cache_ops::KVCacheOps;
 use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
 use crate::memory::Memory;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
-use crate::pressure::kv_cache::{KVCache, KVCacheOps};
+use crate::pressure::kv_cache::KVCache;
 use crate::pressure::offload::preload_pool::{self, PreloadPool};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -1981,7 +1982,7 @@ impl TransformerModel {
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
         use crate::backend::opencl::plan::*;
-        use crate::pressure::kv_cache::KVLayout;
+        use crate::kv_cache_ops::KVLayout;
 
         // Phase 4-4.8 diagnostic: env-gated line-by-line trace to identify
         // which None-return path fires when the happy-path ModelForward
