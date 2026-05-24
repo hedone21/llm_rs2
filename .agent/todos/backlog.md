@@ -119,28 +119,19 @@
 - **실측 비용**: B-5b Phase 2 vtable Δ -0.231% / -0.018% 측정으로 string compare 비용도 ≈ 0 추정. **production 영향 매우 작음** (KIVI 모드 한정).
 - **우선순위 사유**: P2 — INV-LAYER-003 143건 해소가 ROI 더 큼. KIVI는 production 사용 빈도 낮고 vtable 비용 측정 0.
 
-## [P2] CpuBackend 생성 책임 통일 (DI 강화) — 2026-05-24 등록 (3B sub-sprint 검토 후속)
-- **Status**: TODO (3B 폐기 결정에 따라 backlog 등록)
-- **선행**: 3A handoff (HEAD `060b1a78`) — `CpuBackend` import 정리 3B sub-sprint ROI 5% 미만으로 폐기 결정
-- **본질**: production code에서 `Arc::new(CpuBackend::new())` 객체 직접 생성 호출지 ~10건이 분산되어 의존성 주입(DI)이 불완전. test 코드는 매 함수마다 새 backend 생성이 자연스러우나(40+ 호출지), production은 단일 객체를 외부 주입 받는 게 정석.
-- **현재 상태 (실측 2026-05-24)**:
-  - `Arc<dyn Backend>` / `Arc<CpuBackend>` field로 보유: `safetensors.rs:47/117`, `pressure/kivi_cache.rs:228/358`, `session/forward/offload_forward.rs:35/65`, `session/init.rs:201`, `models/weights/release_worker.rs:240`
-  - `cpu_companion()` trait method (backend.rs:1185) 인프라는 이미 존재 — cuda_pc/mod.rs는 10+곳에서 활용. OpenCL backend는 `Arc::new(CpuBackend::new())`로 자체 cpu_companion field 초기화 (mod.rs:1541) → 진정한 single ownership 아님.
-- **목표**:
-  - production 전체에서 `Arc::new(CpuBackend::new())` 호출 ≤ 2건 (entry point + GPU backend 내부 1건)
-  - 다른 호출지는 `&dyn Backend` 매개변수 / `Arc<dyn Backend>` 주입 받아 `backend.cpu_companion()` 활용
-- **부수 효과**:
-  - layer_lint INV-LAYER-003 해소: ~7~10건 (3B 진짜 해소량)
-  - 메모리 footprint: 동일 CpuBackend 객체 1개로 공유 가능 (현재는 여러 인스턴스 존재)
-  - test 코드는 손대지 않음 (test scope 외)
-- **fix 방안 후보**:
-  - (A) 호출지별 signature 변경 — 각 production 함수가 `Arc<dyn Backend>`를 받도록 시그니처 점진 변경. 0.5~1일.
-  - (B) GPU backend의 `cpu_companion` field를 outside-injected로 변경 — `OpenCLBackend::new(cpu: Arc<dyn Backend>)` signature 갱신. main session/init.rs에서 single instance 주입. 1일.
-  - (C) global singleton — `static CPU_BACKEND: LazyLock<Arc<CpuBackend>>` 도입. 가장 단순하나 testability 손상.
-- **위험 / 트레이드오프**:
-  - `Arc<CpuBackend>` 명시 타입 사용처(safetensors:47, kivi_cache:228)는 CpuBackend specific method 호출 가능성 — `Arc<dyn Backend>`로 다운그레이드 시 검증 필요
-  - `cpu_companion()`이 `&dyn Backend` 반환 → `Arc<dyn Backend>` 필요한 곳은 clone() 패턴 추가 필요
-- **우선순위 사유**: P2 — 단독 ROI 5% 미만이지만 (a) 인프라 정리 효과 + (b) test/production 책임 분리 + (c) 메모리 footprint 개선 cumulative value. INV-LAYER-005 generate.rs 분할 sprint와 동시 진행 시 시너지 (둘 다 ownership 정리).
+## [PARTIAL → DROP candidate] CpuBackend 생성 책임 통일 (DI 강화) — 2026-05-24 등록 / 2026-05-24 부분 정리
+- **Status**: 부분 정리 완료 (3B Minimal, master `7df6c0b6`) — 나머지 작업은 ROI 0으로 평가, DROP 후보
+- **2026-05-24 추가 측정 결과**: L4(`session/`) → L1(`backend::cpu`) import는 `scripts/layer_lint.py` invariant 미정의 영역 (INV-LAYER-001~005 모두 L4 source 규칙 없음). 본 entry의 "INV-LAYER-003 ~7~10건 해소" 추정은 잘못된 사전 측정이었음. 실제로는 trait signature 변경 옵션 (B/Hammered) 진행해도 baseline 0건 효과.
+- **완료된 부분 (3B Minimal, commit `7df6c0b6`)**:
+  - `session/batch/runner.rs:202/364` → `cpu_backend_arc.clone()` (alloc 2건 제거)
+  - `session/qcf_runtime.rs:202/237/284/295/326` → `cpu_backend.clone()` (alloc 5건 제거 + `cpu_back: Arc<dyn Backend>` 중간 변수 2건 폐기)
+  - `runner.rs` / `qcf_runtime.rs`의 `use crate::backend::cpu::CpuBackend;` import 2건 제거
+  - 정성적 효과: 단일 Arc 공유로 메모리 footprint ↓ + production DI 강화
+- **잔여 (DROP 후보)**:
+  - `qcf_runtime.rs:881` (debug dump fallback) 1건 — 함수가 cpu_backend 미수신, signature 변경 비용 > ROI
+  - `pressure/kivi_cache.rs:358` (`KiviCache::new()` default `Arc::new(CpuBackend::new())`) — 호출지 전원 test scope
+  - test scope 40+ 호출지 — 의도된 test 패턴 (각 test 독립 객체)
+- **선행 sprint와 시너지**: 본 작업이 동시 묶일 만한 후속 sprint는 잠재적으로 [P2] `generate 바이너리 분할 + Manager 통합`. 새 entry point 작성 시 single CpuBackend instance 주입 패턴이 자연스럽게 들어감. 단독 진행은 ROI 미만.
 
 ## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
 - **Status**: TODO (M2 baseline부터 누적, M3.0 무관)
