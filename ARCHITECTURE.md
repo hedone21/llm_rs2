@@ -1509,14 +1509,18 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - V-07, V-08, V-19(`tensor_partition.rs` → `ClSubBuffer`) 해소.
   - V-09(buffer→`SecondaryMmap`)는 SecondaryMmap이 L3 Pressure state(§13.3)이므로 별도 trait inversion 필요 — V-09는 Step 3 보조 작업.
 
-**§E — 테스트 코드의 backend import 허용 정책: RESOLVED (점진적 — 신규 테스트만 tests/spec/ 이전)**
+**§E — 테스트 코드의 backend import 허용 정책: RESOLVED (점진적 — 신규 테스트만 tests/spec/ 이전; 2026-05-24 S-C2b 갱신)**
 - **결정**:
   - **기존**: lib 내부 inline `#[cfg(test)]` 안의 backend import(V-15: `core/eviction/*`, `core/pressure/*`의 `CpuBackend` instantiation)는 **그대로 유지** (grandfathered exception).
   - **신규**: 앞으로 추가하는 모든 spec test 및 단위 테스트는 **`engine/tests/spec/`**에 작성하며, 이곳에서만 backend instantiation을 허용한다.
+  - **2026-05-24 S-C2b 갱신**: `_find_test_block_ranges` 알고리즘이 `#[cfg(test)] #[allow(...)] mod tests { ... }` 와 같은 다중 attribute 패턴을 인식 못 해 test block 21건이 production code 위반으로 잘못 분류된 회귀 fix. `entered_block` flag 추가로 brace_depth가 한 번도 양수가 되지 않은 채 종료되는 false positive 차단. INV-LAYER-003 L3→L1 검사에서도 `is_test_block`이면 자동 baseline 제외 (INV-LAYER-001 data_consumer 패턴과 동일).
 - **근거**: V-15 사례는 다수 모듈(eviction/pressure handlers)에 산재해 있어 일괄 이전 시 PR 범위가 과대해진다. INV-LAYER-001/002의 "테스트도 production code"라는 엄격한 해석은 마이그레이션 효율을 해친다. 한편 신규 테스트를 모두 `tests/spec/`로 강제하면 backend instantiation의 무절제한 확산은 차단된다. 베이스라인 기반 점진 축소 전략(spec/41-invariants.md §3.26 "베이스라인 정책")과 정합.
 - **버린 옵션**: (a) lib 내부 inline 테스트의 backend import 즉시 금지 — 마이그레이션 단계 폭증, PR 분할 곤란. (b) lib 내부 inline 테스트 영구 허용 — 신규 테스트도 같은 패턴으로 확산.
+- **layer_lint.py 처리**:
+  - `_find_test_block_ranges`: `#[cfg(test)]` 또는 `#[test]` 발견 시 in_test=True 진입. brace_depth 변동 추적하여 `entered_block` flag가 True로 한 번 set된 이후에만 zone 종료 판정. attribute가 brace를 가지지 않으므로 multi-attribute 패턴도 정확히 인식.
+  - INV-LAYER-001/002/003 검사에서 `is_test_block=True`이면 자동 baseline 제외. data_consumer 자동 제외와 동일 운용.
 - **영향**:
-  - INV-LAYER-001/002의 NOTE/예외 절에 "lib 내부 `#[cfg(test)]` backend import는 grandfathered exception"으로 명시.
+  - INV-LAYER-001/002/003의 NOTE/예외 절에 "lib 내부 `#[cfg(test)]` backend import는 grandfathered exception"으로 명시.
   - feedback `spec_tests_required`와 일관 — 새 INV 관련 테스트는 `tests/spec/` 필수.
   - V-15는 baseline JSON(`engine/tests/spec/inv_layer_baseline.json`)에 등재되어 마이그레이션 마지막에 0으로 수렴.
 

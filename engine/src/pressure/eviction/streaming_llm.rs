@@ -86,7 +86,6 @@ impl EvictionPolicy for StreamingLLMPolicy {
 #[allow(clippy::identity_op, clippy::erasing_op)]
 mod tests {
     use super::*;
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L (test block, S-C2b 알고리즘 개선 대기)
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::{Buffer, DType};
     use crate::memory::host::shared::SharedBuffer;

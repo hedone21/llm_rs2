@@ -398,6 +398,7 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
     ranges = []
     in_test = False
     brace_depth = 0
+    entered_block = False
     start = 0
 
     for i, line in enumerate(lines, 1):
@@ -408,13 +409,20 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
                 in_test = True
                 start = i
                 brace_depth = 0
+                entered_block = False
 
         if in_test:
             brace_depth += stripped.count("{") - stripped.count("}")
-            if brace_depth <= 0 and i > start:
+            if brace_depth > 0:
+                entered_block = True
+            # block에 한 번도 진입하지 않았으면 아직 attribute 행렬을 통과 중
+            # (e.g. `#[cfg(test)] #[allow(...)] mod tests {`).
+            # entered_block True인 상태에서만 종료 판정.
+            if entered_block and brace_depth <= 0 and i > start:
                 ranges.append((start, i))
                 in_test = False
                 brace_depth = 0
+                entered_block = False
 
     return ranges
 
@@ -750,6 +758,12 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 # 데이터 소비자로 import하는 경우 INV-LAYER-001 baseline에서 제외.
                 # (spec/41-invariants.md INV-LAYER-001 비고 참조)
                 if inv_id == "INV-LAYER-001" and is_data_consumer(imp_clean):
+                    continue
+
+                # §13.8-E (S-C2b, 2026-05-24): test block grandfathered exception.
+                # `#[cfg(test)]` 또는 `#[test]` 블록 안의 backend/cross-domain import는
+                # 자동 baseline 제외. INV-LAYER-001/002/003에 공통 적용.
+                if is_test and inv_id in ("INV-LAYER-001", "INV-LAYER-002", "INV-LAYER-003"):
                     continue
 
                 v_id = lookup_v_id(rel_path, imp_clean)
