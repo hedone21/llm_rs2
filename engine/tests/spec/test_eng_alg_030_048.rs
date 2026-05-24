@@ -316,7 +316,8 @@ fn test_eng_alg_045_nmse_block_q2() {
 #[test]
 fn test_eng_alg_046_flush_proxy_basic() {
     use llm_rs2::qcf::QcfConfig;
-    use llm_rs2::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
+    use llm_rs2::qcf::quant_qcf::compute_flush_nmse;
+    use llm_rs2::qcf_types::KiviFlushParams;
     use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
@@ -349,7 +350,8 @@ fn test_eng_alg_046_flush_proxy_basic() {
 #[test]
 fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
     use llm_rs2::qcf::QcfConfig;
-    use llm_rs2::qcf::quant_qcf::{KiviFlushParams, compute_flush_nmse};
+    use llm_rs2::qcf::quant_qcf::compute_flush_nmse;
+    use llm_rs2::qcf_types::KiviFlushParams;
     use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
@@ -396,7 +398,8 @@ fn test_eng_alg_046_flush_proxy_q2_higher_than_q8() {
 #[test]
 fn test_eng_alg_047_flush_opr_basic() {
     use llm_rs2::qcf::QcfConfig;
-    use llm_rs2::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
+    use llm_rs2::qcf::quant_qcf::compute_flush_opr;
+    use llm_rs2::qcf_types::KiviFlushParams;
     use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;
@@ -426,7 +429,8 @@ fn test_eng_alg_047_flush_opr_basic() {
 #[test]
 fn test_eng_alg_047_flush_opr_q2_higher() {
     use llm_rs2::qcf::QcfConfig;
-    use llm_rs2::qcf::quant_qcf::{KiviFlushParams, compute_flush_opr};
+    use llm_rs2::qcf::quant_qcf::compute_flush_opr;
+    use llm_rs2::qcf_types::KiviFlushParams;
     use llm_rs2::quant::QKKV;
 
     let kv_heads = 1;

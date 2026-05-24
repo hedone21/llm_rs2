@@ -15,16 +15,7 @@ pub type ImportanceWithRaws = (
     Vec<(Vec<f32>, usize, usize)>,
 );
 
-/// Sub-layer type for fine-grained importance tracking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SubLayer {
-    /// Full layer (attention + MLP combined).
-    Full,
-    /// Attention sub-layer only.
-    Attention,
-    /// MLP/FFN sub-layer only.
-    Mlp,
-}
+pub use crate::qcf_types::SubLayer;
 
 /// A single importance entry for one (sub-)layer.
 #[derive(Debug, Clone)]

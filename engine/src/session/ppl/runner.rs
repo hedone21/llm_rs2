@@ -1024,10 +1024,8 @@ pub fn run_ppl(
                         && let Some(acc) = score_accumulator.as_ref()
                         && let Some(head_attn) = acc.last_step_head_attn()
                     {
-                        use crate::qcf::{
-                            AggregationMode, QcfActionType, QcfKvParams, VDataSource,
-                            compute_qcf_kv,
-                        };
+                        use crate::qcf::{QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
+                        use crate::qcf_types::AggregationMode;
                         let target_len = ((before_len as f32) * ratio) as usize;
                         let cache = &kv_caches[0];
                         let v_cpu_bytes: Option<&[u8]> = v_cpu_data.as_deref().map(|s| {

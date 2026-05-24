@@ -1855,7 +1855,13 @@ impl TransformerModel {
             // Record importance after layer forward
             if let Some(ref mut coll) = importance_collector {
                 let x_data = x.as_slice::<f32>();
-                coll.record_after(x_data, seq_len, hidden_size, i, crate::qcf::SubLayer::Full);
+                coll.record_after(
+                    x_data,
+                    seq_len,
+                    hidden_size,
+                    i,
+                    crate::qcf_types::SubLayer::Full,
+                );
             }
 
             // Capture attention scores for H2O/H2O+ accumulator

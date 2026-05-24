@@ -1540,12 +1540,18 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - §13.4 directory migration map에 "shared identifier promotion" 항목 추가 (TBD, B-2 완료 후).
   - 향후 유사 패턴(예: `OpKind`와 같이 양 도메인 공유 어휘) 식별 시 본 정책 참조.
   - 5건 이상 누적 시 §13.4에 *promotion register* 표 신설 검토 (§F allowlist 정책과 동일 운용 원리).
-- **§G 적용 register** (5건 미만이므로 sub-list 형식 유지):
-  - `OpKind` (B-2a sprint, RESOLVED) — `observability/profile/op_trace.rs` → `engine/src/op_kind.rs`
-  - `KVCacheOps` (B-5b Phase 1, RESOLVED) — `pressure/kv_cache.rs` trait 부분 → `engine/src/kv_cache_ops.rs`
-  - `PartitionWsCell` / `PartitionWorkspace` (B-5a sprint, RESOLVED) — `layers/tensor_partition.rs` 일부 → `engine/src/partition_workspace.rs`
-  - `CpuKernelSet` / `OpenClSecondary` / `SecondaryStore` (B-5b Phase 2 Stage 1, RESOLVED) — Backend trait capability 인프라 (`engine/src/cpu_kernels.rs`, `engine/src/secondary.rs`)
-  - **`hybrid_attention` 모듈** (B-5b Phase 3 A, RESOLVED 2026-05-23) — `layers/hybrid_attention.rs` → `engine/src/hybrid_attention.rs`. 격상 단위는 모듈 전체 (`HybridAttnSetup`/`HybridGpuBuffer` struct + `HybridScope` RAII + `compute_kv_split`/`current`/`install` free fn). §G 본문 조건 1 "RAII guard 본 정책 밖" 문구는 *RAII guard 단독 격상*을 제외하려는 의도이며, 본 사례는 `HybridAttnSetup` data identifier + 그 lifetime을 관리하는 `HybridScope` 동반 격상 패턴으로 §G 정신과 부합. plan.rs(L1) hot path 호출이 §J 본문 "read-only 정책 query 한정" 제약과 mismatch (AtomicI32 store + Mutex lock + cl_mem 참조 부수효과 발생)이므로 §J zone marker 적용은 폐기되고 §G 격상으로 본질 해소. Backend trait method 추가 없음(ISP 누적 +0).
+- **§G 적용 register** (2026-05-24 표 형식으로 갱신, 6건 누적):
+
+| 식별자 | sprint | commit | 원위치 → 신위치 | 사용 도메인 | 격상 근거 |
+|---|---|---|---|---|---|
+| `OpKind` | B-2a | (RESOLVED) | `observability/profile/op_trace.rs` → `engine/src/op_kind.rs` | observability + L3-inference | producer/consumer 양방향 어휘 |
+| `KVCacheOps` (trait + `KVLayout` + `KiviRawBuffers`) | B-5b Phase 1 | (RESOLVED) | `pressure/kv_cache.rs` trait 부분 → `engine/src/kv_cache_ops.rs` | L3-pressure + L1 plan | trait + layout enum 공유 |
+| `PartitionWsCell` / `PartitionWorkspace` | B-5a | `232d45ec` | `layers/tensor_partition.rs` 일부 → `engine/src/partition_workspace.rs` | L3-inference + L1 plan | workspace cell 공유 |
+| `CpuKernelSet` / `OpenClSecondary` / `SecondaryStore` | B-5b Phase 2 Stage 1 | (RESOLVED) | Backend trait capability 인프라 (`engine/src/cpu_kernels.rs`, `engine/src/secondary.rs`) | L1 + L3 | capability trait |
+| `hybrid_attention` 모듈 | B-5b Phase 3 A | 2026-05-23 (RESOLVED) | `layers/hybrid_attention.rs` → `engine/src/hybrid_attention.rs` | L3-inference + L1 plan | RAII + data identifier 동반 격상 (§G 본문 조건 1 "RAII guard 단독 격상" 제외 의도 외 사례) |
+| **QCF data identifiers** (`QcfMetric`/`QcfConfig`/`QcfMode`/`AggregationMode`/`KiviFlushParams`/`FlushAttentionParams`/`SubLayer`/`ImportanceFormula` + `aggregate_heads`) | **S-3b-1** | **2026-05-24** | **`qcf/{mod,quant_qcf,layer_importance}.rs` → `engine/src/qcf_types.rs`** | **L3-qcf (신설) + L3-pressure + L3-inference + observability** | **3-도메인 + observability 공유 측정 어휘. 측정 로직(`compute_flush_*`, `ImportanceCollector`)은 L3-qcf에 유지** |
+
+**임계 정책**: 5건 미만 sub-list 형식, 5건 이상 표 형식. **10건 이상** 누적 시 layer_lint.py 명시적 allowlist (자동 검출) 도입 검토 — §F 정책과 동일 운용 원리. `hybrid_attention` 격상 시 자세한 근거: 격상 단위는 모듈 전체(`HybridAttnSetup`/`HybridGpuBuffer` struct + `HybridScope` RAII + `compute_kv_split`/`current`/`install` free fn). §G 본문 조건 1 "RAII guard 본 정책 밖" 문구는 *RAII guard 단독 격상*을 제외하려는 의도이며, 본 사례는 `HybridAttnSetup` data identifier + 그 lifetime을 관리하는 `HybridScope` 동반 격상 패턴으로 §G 정신과 부합. plan.rs(L1) hot path 호출이 §J 본문 "read-only 정책 query 한정" 제약과 mismatch (AtomicI32 store + Mutex lock + cl_mem 참조 부수효과 발생)이므로 §J zone marker 적용은 폐기되고 §G 격상으로 본질 해소. Backend trait method 추가 없음(ISP 누적 +0).
 
 **§H — Instrument macro helper 정책: RESOLVED (2026-05-22)**
 - **결정**: L2에 정의된 매크로가 expansion 내부에서 cross-cutting concrete(`observability/profile/*` 등)를 참조하는 패턴은 일정 조건을 만족하면 INV-LAYER-003/004를 위반하지 않는 것으로 본다. 매크로는 *기계적 코드 생성 도구*이며 source-level import 그래프와는 별도 차원에서 동작한다.

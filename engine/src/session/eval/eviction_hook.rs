@@ -9,9 +9,10 @@ use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kv_cache::{KVCache, max_cache_pos};
 use crate::qcf::{
-    AggregationMode, QcfActionType, QcfConfig, QcfKvParams, VDataSource, aggregate_heads,
-    compute_c1, compute_d7, compute_qcf_kv, identify_retained_for_action,
+    QcfActionType, QcfKvParams, VDataSource, compute_c1, compute_d7, compute_qcf_kv,
+    identify_retained_for_action,
 };
+use crate::qcf_types::{AggregationMode, QcfConfig, aggregate_heads};
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
 #[derive(Debug, Clone)]
@@ -705,7 +706,7 @@ mod tests {
     use super::*;
     use crate::pressure::cache_manager::CacheManager;
     use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
-    use crate::qcf::{QcfConfig, QcfMode};
+    use crate::qcf_types::{QcfConfig, QcfMode};
     use crate::resilience::sys_monitor::{MemoryStats, SystemMonitor};
     use anyhow::Result as AResult;
 

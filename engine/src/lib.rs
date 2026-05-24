@@ -18,6 +18,7 @@ pub mod op_kind;
 pub mod partition_workspace;
 pub mod pressure;
 pub mod qcf;
+pub mod qcf_types;
 pub mod quant;
 pub mod shape;
 pub mod tensor;

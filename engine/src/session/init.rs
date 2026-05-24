@@ -48,7 +48,7 @@ pub struct SessionInitCtx {
     /// swap layer 선택 알고리즘 (--swap-algorithm).
     pub swap_algorithm: crate::models::weights::SwapAlgorithm,
     /// layer 중요도 계산 공식 (--importance-formula).
-    pub importance_formula: crate::qcf::ImportanceFormula,
+    pub importance_formula: crate::qcf_types::ImportanceFormula,
     /// `compare` 모드 활성 여부 (importance_formula = MeanPool이지만 3-way 수집).
     pub importance_compare: bool,
     /// 명시적 swap 대상 layer 목록 (--swap-only-layers, § 4 ground-truth study).
@@ -519,14 +519,14 @@ impl SessionInitCtx {
         // Parse --importance-formula (§4 EuroSys'27 study). `compare` enables
         // three_way collector + post-warmup DP-LLM proxy ε computation.
         let (importance_formula, importance_compare) = match args.importance_formula.as_str() {
-            "mean_pool" => (crate::qcf::ImportanceFormula::MeanPool, false),
-            "shortgpt_bi" => (crate::qcf::ImportanceFormula::ShortGptBi, false),
-            "dpllm_proxy" => (crate::qcf::ImportanceFormula::DpllmProxy, false),
-            "dpllm_multi" => (crate::qcf::ImportanceFormula::DpllmMulti, false),
-            "dpllm_abs" => (crate::qcf::ImportanceFormula::DpllmAbs, false),
-            "dpllm_qcf" => (crate::qcf::ImportanceFormula::DpllmQcf, false),
-            "direct_attn" => (crate::qcf::ImportanceFormula::DirectAttn, false),
-            "compare" => (crate::qcf::ImportanceFormula::MeanPool, true),
+            "mean_pool" => (crate::qcf_types::ImportanceFormula::MeanPool, false),
+            "shortgpt_bi" => (crate::qcf_types::ImportanceFormula::ShortGptBi, false),
+            "dpllm_proxy" => (crate::qcf_types::ImportanceFormula::DpllmProxy, false),
+            "dpllm_multi" => (crate::qcf_types::ImportanceFormula::DpllmMulti, false),
+            "dpllm_abs" => (crate::qcf_types::ImportanceFormula::DpllmAbs, false),
+            "dpllm_qcf" => (crate::qcf_types::ImportanceFormula::DpllmQcf, false),
+            "direct_attn" => (crate::qcf_types::ImportanceFormula::DirectAttn, false),
+            "compare" => (crate::qcf_types::ImportanceFormula::MeanPool, true),
             other => anyhow::bail!(
                 "--importance-formula: unknown value '{}'. Valid: mean_pool, shortgpt_bi, dpllm_proxy, dpllm_multi, dpllm_abs, dpllm_qcf, direct_attn, compare",
                 other

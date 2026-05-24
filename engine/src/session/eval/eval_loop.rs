@@ -18,7 +18,8 @@ use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
-use crate::qcf::{ImportanceCollector, SubLayer};
+use crate::qcf::ImportanceCollector;
+use crate::qcf_types::SubLayer;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 

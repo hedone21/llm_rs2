@@ -138,7 +138,7 @@ pub struct QcfWarmupConfig<'a> {
     pub force_ratio: Option<f32>,
     pub swap_algorithm: crate::models::weights::SwapAlgorithm,
     pub execute_swap: bool,
-    pub importance_formula: crate::qcf::ImportanceFormula,
+    pub importance_formula: crate::qcf_types::ImportanceFormula,
     pub importance_three_way: bool,
     pub swap_only_layers: Option<&'a [usize]>,
     pub decode_x_steps: usize,
@@ -274,7 +274,7 @@ pub fn run_qcf_warmup_workflow(
             );
 
             let mut collector_decode = ImportanceCollector::new_with_formula(
-                crate::qcf::ImportanceFormula::DirectAttn,
+                crate::qcf_types::ImportanceFormula::DirectAttn,
                 false,
             );
 
@@ -381,7 +381,7 @@ pub fn run_qcf_warmup_workflow(
     // ── Build ImportanceTable (+ optional DP-LLM ε variants) + reset KV cache ────
     let direct_attn_primary = matches!(
         importance_formula,
-        crate::qcf::ImportanceFormula::DirectAttn
+        crate::qcf_types::ImportanceFormula::DirectAttn
     );
     let cache_raw = importance_three_way || direct_attn_primary;
     let mut direct_attn_f5_decode_only: Option<Vec<f32>> = None;
