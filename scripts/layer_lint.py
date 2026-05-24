@@ -260,6 +260,14 @@ def _extract_backend(rel_path: str) -> str:
 # Cross-backend 위반 (V-04, V-05) 별도 처리
 # ────────────────────────────────────────────────────────────────────
 
+# ARCHITECTURE.md §13.8-K — Sub-layer dependency 허용 화이트리스트.
+# (source_backend, target_backend) 페어. source가 target의 런타임 substrate
+# (메모리/context owner)에 해당하는 경우만 등록 가능 — 일반 fallback은 제외.
+ALLOWED_BACKEND_CHAINS: set[tuple[str, str]] = {
+    ("qnn_oppkg", "opencl"),  # qnn_oppkg가 OpenCL secondary slot 위에서 동작 (rpcmem DMA-BUF interop)
+}
+
+
 def check_cross_backend(src_rel: str, import_path: str) -> tuple[str | None, str | None]:
     """
     L1↔L1 cross-backend import를 별도로 검사.
@@ -291,6 +299,10 @@ def check_cross_backend(src_rel: str, import_path: str) -> tuple[str | None, str
 
     # 동일 backend 내부 (예: backend/cpu/x86.rs → backend/cpu/common.rs) 는 허용
     if src_be == dst_be:
+        return (None, None)
+
+    # §13.8-K sub-layer dependency 화이트리스트 — 허용 chain은 위반 미반환
+    if (src_be, dst_be) in ALLOWED_BACKEND_CHAINS:
         return (None, None)
 
     # 다른 backend로의 cross-import

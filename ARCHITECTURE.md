@@ -1625,4 +1625,27 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 5건 이상 누적 시 §13.4에 *dispatch orchestrator register* 표 신설 검토 (§F/G/I allowlist 정책과 동일 운용 원리).
   - 본 §J는 §13.8-F(enum-as-data identifier 예외)와 다음과 같이 직교한다 — §F는 *cross-cutting → L3 enum import*를 baseline에 grandfathered로 허용하고, §J는 *L1 → L3 정책 query 호출*을 zone marker 한정으로 허용. 적용 방향과 범위가 다르므로 동시 적용 가능.
 
+**§K — Cross-backend chain 예외 (qnn_oppkg → opencl): RESOLVED (2026-05-24)**
+- **결정**: 특정 GPU backend 간 cross-import는 *sub-layer dependency* 패턴으로 분류하여 INV-LAYER-001 위반에서 제외한다. 본 결정 시점 화이트리스트는 `{ (qnn_oppkg, opencl) }`. 화이트리스트 외 cross-backend import는 위반 그대로 적용된다.
+- **허용 조건** (3개 모두 만족):
+  1. **Sub-layer 관계**: target backend가 source backend의 *런타임 substrate*(메모리/context owner)여야 한다 — 단순 fallback이나 utility 의존(예: cuda → cpu_fallback)은 본 예외 밖이다.
+  2. **Type 종류**: import 대상이 backend struct 자체 또는 그 내부 자원(context/queue/memory handle) 접근용 API여야 한다 — 자유 함수 호출이나 일반 utility는 별도 정책 (§G/H/I/J).
+  3. **운용 단방향성**: chain은 *단방향*이며 양방향 의존이 발생하면 sub-layer 관계가 깨진 것이므로 본 예외에서 즉시 제외하고 trait 추출(§B 패턴) 또는 별도 재설계로 전환한다.
+- **근거**: qnn_oppkg는 ARM/Adreno SoC에서 QNN OpPackage path로 실행되지만, weight/KV 메모리는 OpenCL `clCreateBuffer(CL_MEM_USE_HOST_PTR)`로 alias된 rpcmem DMA-BUF heap을 공유한다 (HTP↔Adreno zero-copy interop, M2 단계 검증 완료). 즉 qnn_oppkg는 *OpenCL secondary slot 위에서 동작하는 dispatch layer*이며, OpenCLBackend를 downcast하여 cl_mem/queue/context에 접근하는 것이 design intent다. 일반 cross-backend(cuda → cpu fallback 등)와는 본질이 다르다 — 후자는 *대체* 관계, 전자는 *계층* 관계.
+- **§13.8-B와의 관계**: §B는 backend가 *자원의 owner*임을 인정하고 pressure(L3)와의 경계를 `WeightStagingPool` trait으로 정리한다. §K는 backend *간*의 sub-layer 관계를 명시적 화이트리스트로 정리한다 — 두 정책은 적용 단위가 다르며(§B = backend↔pressure, §K = backend↔backend) 동시 적용 가능.
+- **버린 옵션**:
+  - (a) **`OpenCLContextProvider` trait 추출 + qnn_oppkg가 trait만 의존**: cl_mem alias 본질이 컨텍스트별 핸들 공유에 있어 trait API surface가 30+ 메서드로 부풀고 vtable 비용도 hot path에서 누적된다. INV-LAYER-001 위반은 사라지지만 결합도는 실질적으로 그대로다.
+  - (b) **qnn_oppkg를 `backend/opencl/qnn_oppkg/` 하위 sub-module로 통합**: mod 분리를 깨뜨려 single mod responsibility(qnn_oppkg는 QNN OpPackage path, opencl은 OpenCL kernel dispatch)를 훼손한다. PR 범위도 폭증한다.
+  - (c) **dispatch trait 도입(`SubLayerDispatch`)**: 1건 한정 패턴을 추상화로 일반화 — 누적된 sub-layer 관계가 5건 이상으로 늘기 전에는 ROI 음(陰).
+- **적용**:
+  - `scripts/layer_lint.py`에 `ALLOWED_BACKEND_CHAINS: Set[Tuple[str, str]] = { ("qnn_oppkg", "opencl") }` 상수 추가. `check_cross_backend()`에서 화이트리스트 멤버십 검사 후 `(None, None)` 반환.
+  - 화이트리스트에 등록된 cross-backend import는 baseline JSON에서 제거.
+  - 신규 chain 등록 시 본 §K register에 추가 + baseline 갱신.
+- **§K 적용 register** (1건):
+  - `qnn_oppkg → opencl` (S-1 sprint 2026-05-24, RESOLVED) — `backend/qnn_oppkg/mod.rs:134/142`의 `OpenCLBackend` downcast. 근거: rpcmem DMA-BUF heap interop으로 zero-copy 공유.
+- **운용 메모**:
+  - 신규 chain 추가 시 PR description에 *sub-layer 관계 근거* 명시(메모리 공유 / context owner 등 구체적 substrate fact).
+  - 5건 이상 누적 시 §13.4에 *sub-layer chain register* 표 신설 검토 (§F/G/I allowlist 정책과 동일 운용 원리).
+  - 화이트리스트 외 cross-backend import 시 본 §K 우회를 우려하여 PR 리뷰 시 화이트리스트 변경이 동반되는지 확인.
+
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.

@@ -1639,7 +1639,7 @@ impl FullKernelPlan {
                         // setup의 CPU Vec (Mutex guarded single-writer)에만 쓴다.
                         // GPU partial 읽기는 6)의 spin-poll + acquire fence 이후.
                         unsafe {
-                            crate::backend::cpu::neon::flash_partial_kv_range_f16(
+                            crate::quant::flash_neon::flash_partial_kv_range_f16(
                                 hybrid.q_host_ptr,
                                 hybrid.k_host_ptr,
                                 hybrid.v_host_ptr,
@@ -1706,7 +1706,7 @@ impl FullKernelPlan {
 
                         // 7) Merge (GPU partial + CPU partial → out_attn).
                         unsafe {
-                            crate::backend::cpu::neon::merge_two_partials_f32(
+                            crate::quant::flash_neon::merge_two_partials_f32(
                                 setup.partial_ml_gpu.host_ptr() as *const f32,
                                 setup.partial_o_gpu.host_ptr() as *const f32,
                                 ml_guard.as_ptr(),

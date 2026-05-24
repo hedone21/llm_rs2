@@ -1720,7 +1720,7 @@ impl TransformerLayer {
 
                         #[cfg(target_arch = "aarch64")]
                         let score = unsafe {
-                            crate::backend::cpu::neon::CpuBackendNeon::vec_dot_f16_f32(
+                            crate::quant::flash_neon::vec_dot_f16_f32(
                                 head_dim,
                                 q_data.as_ptr().add(q_off),
                                 k_raw.add(off),

@@ -2,6 +2,9 @@ use half::f16;
 
 pub mod f16_bulk;
 
+#[cfg(target_arch = "aarch64")]
+pub mod flash_neon;
+
 pub const QK4_0: usize = 32;
 pub const QK4_1: usize = 32;
 
