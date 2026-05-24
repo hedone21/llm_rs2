@@ -19,7 +19,6 @@ pub mod partition_workspace;
 pub mod pressure;
 pub mod qcf;
 pub mod quant;
-pub mod secondary;
 pub mod shape;
 pub mod tensor;
 pub mod thread_pool;
