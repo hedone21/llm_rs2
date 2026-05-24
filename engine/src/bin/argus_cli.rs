@@ -1,12 +1,18 @@
-//! argus-cli — single-prompt inference (v0).
+//! argus-cli — single-prompt inference.
 //!
 //! ARGUS CLI 패밀리의 단일 추론 엔트리. legacy `generate` 의 standard happy
-//! path 만 지원하는 minimal PoC. chat / experiment / ppl / eval / dump /
-//! prompt-batch / weight swap / KIVI / offload / profile / tensor-partition /
-//! resilience 는 v0 에서 미구현이며 명시적으로 reject 한다.
+//! path + production resilience 를 지원한다. chat / experiment / ppl / eval /
+//! dump / prompt-batch / weight swap / KIVI / offload / profile /
+//! tensor-partition 는 아직 미구현이며 명시적으로 reject 한다.
 //!
-//! 후속 v1 sub-sprint 에서 resilience default-on (`--no-resilience` opt-out),
-//! prompt-batch, swap, eviction subcommand 를 흡수한다.
+//! ## v1 흡수 진행 (sub-sprint 단위)
+//!
+//! - **v1-1 (current)**: resilience default-on (`--no-resilience` opt-out).
+//! - v1-2: `--prompt-batch` (session::batch).
+//! - v1-3: weight swap 8종 (session::decode_fallback::swap_dispatch).
+//! - v1-4: `--profile` / `--profile-events`.
+//! - v1-5: KIVI / Offload `--kv-mode`.
+//! - v1-6: `--tensor-partition > 0`.
 
 use anyhow::bail;
 use clap::Parser;
@@ -26,7 +32,13 @@ use tokenizers::Tokenizer;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // v1-1: resilience default-on. `--no-resilience` 가 명시되면 effective=false,
+    // 그 외에는 effective=true (legacy `--enable-resilience` flag 도 그대로 효과).
+    // SessionInitCtx / prefill / batch 등 호출지는 모두 `args.enable_resilience`
+    // 만 참조하므로 진입 직후 1회만 갱신하면 일관된다.
+    args.enable_resilience = !args.no_resilience;
 
     reject_unsupported_modes_v0(&args)?;
 
@@ -157,9 +169,6 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
     }
     if args.prompt_batch.is_some() {
         bail!("argus-cli v0: --prompt-batch not yet supported (planned for v1)");
-    }
-    if args.enable_resilience {
-        bail!("argus-cli v0: --enable-resilience not yet supported (planned for v1)");
     }
     if !matches!(args.effective_kv_mode(), KvMode::Standard) {
         bail!("argus-cli v0: only --kv-mode standard supported (KIVI/Offload planned for v1)");

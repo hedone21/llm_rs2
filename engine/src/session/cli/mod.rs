@@ -471,9 +471,19 @@ pub struct Args {
     #[clap(flatten)]
     pub eviction_common: EvictionCommonArgs,
 
-    /// Enable resilience manager for adaptive inference
+    /// Enable resilience manager for adaptive inference.
+    /// Legacy generate 기준 flag. argus-cli v1+ 는 default-on 정책이며,
+    /// 비활성화는 [`Self::no_resilience`] (`--no-resilience`) 를 사용한다.
     #[arg(long, default_value_t = false)]
     pub enable_resilience: bool,
+
+    /// Disable resilience manager (argus-cli v1+ opt-out).
+    /// argus-cli v1 에서는 resilience 가 default-on 이므로 비활성화하려면
+    /// 이 flag 를 명시. legacy `generate` binary 는 이 flag 를 무시
+    /// (default-off 정책 유지) — argus-cli main 에서만 [`Self::enable_resilience`]
+    /// 를 effective 결정한다.
+    #[arg(long, default_value_t = false)]
+    pub no_resilience: bool,
 
     /// Pre-allocate dual CPU/GPU buffers for zero-alloc SwitchHw.
     /// Without this flag, only throttle/suspend directives work (no backend switch).
