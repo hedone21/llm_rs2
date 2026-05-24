@@ -119,6 +119,29 @@
 - **실측 비용**: B-5b Phase 2 vtable Δ -0.231% / -0.018% 측정으로 string compare 비용도 ≈ 0 추정. **production 영향 매우 작음** (KIVI 모드 한정).
 - **우선순위 사유**: P2 — INV-LAYER-003 143건 해소가 ROI 더 큼. KIVI는 production 사용 빈도 낮고 vtable 비용 측정 0.
 
+## [P2] CpuBackend 생성 책임 통일 (DI 강화) — 2026-05-24 등록 (3B sub-sprint 검토 후속)
+- **Status**: TODO (3B 폐기 결정에 따라 backlog 등록)
+- **선행**: 3A handoff (HEAD `060b1a78`) — `CpuBackend` import 정리 3B sub-sprint ROI 5% 미만으로 폐기 결정
+- **본질**: production code에서 `Arc::new(CpuBackend::new())` 객체 직접 생성 호출지 ~10건이 분산되어 의존성 주입(DI)이 불완전. test 코드는 매 함수마다 새 backend 생성이 자연스러우나(40+ 호출지), production은 단일 객체를 외부 주입 받는 게 정석.
+- **현재 상태 (실측 2026-05-24)**:
+  - `Arc<dyn Backend>` / `Arc<CpuBackend>` field로 보유: `safetensors.rs:47/117`, `pressure/kivi_cache.rs:228/358`, `session/forward/offload_forward.rs:35/65`, `session/init.rs:201`, `models/weights/release_worker.rs:240`
+  - `cpu_companion()` trait method (backend.rs:1185) 인프라는 이미 존재 — cuda_pc/mod.rs는 10+곳에서 활용. OpenCL backend는 `Arc::new(CpuBackend::new())`로 자체 cpu_companion field 초기화 (mod.rs:1541) → 진정한 single ownership 아님.
+- **목표**:
+  - production 전체에서 `Arc::new(CpuBackend::new())` 호출 ≤ 2건 (entry point + GPU backend 내부 1건)
+  - 다른 호출지는 `&dyn Backend` 매개변수 / `Arc<dyn Backend>` 주입 받아 `backend.cpu_companion()` 활용
+- **부수 효과**:
+  - layer_lint INV-LAYER-003 해소: ~7~10건 (3B 진짜 해소량)
+  - 메모리 footprint: 동일 CpuBackend 객체 1개로 공유 가능 (현재는 여러 인스턴스 존재)
+  - test 코드는 손대지 않음 (test scope 외)
+- **fix 방안 후보**:
+  - (A) 호출지별 signature 변경 — 각 production 함수가 `Arc<dyn Backend>`를 받도록 시그니처 점진 변경. 0.5~1일.
+  - (B) GPU backend의 `cpu_companion` field를 outside-injected로 변경 — `OpenCLBackend::new(cpu: Arc<dyn Backend>)` signature 갱신. main session/init.rs에서 single instance 주입. 1일.
+  - (C) global singleton — `static CPU_BACKEND: LazyLock<Arc<CpuBackend>>` 도입. 가장 단순하나 testability 손상.
+- **위험 / 트레이드오프**:
+  - `Arc<CpuBackend>` 명시 타입 사용처(safetensors:47, kivi_cache:228)는 CpuBackend specific method 호출 가능성 — `Arc<dyn Backend>`로 다운그레이드 시 검증 필요
+  - `cpu_companion()`이 `&dyn Backend` 반환 → `Arc<dyn Backend>` 필요한 곳은 clone() 패턴 추가 필요
+- **우선순위 사유**: P2 — 단독 ROI 5% 미만이지만 (a) 인프라 정리 효과 + (b) test/production 책임 분리 + (c) 메모리 footprint 개선 cumulative value. INV-LAYER-005 generate.rs 분할 sprint와 동시 진행 시 시너지 (둘 다 ownership 정리).
+
 ## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
 - **Status**: TODO (M2 baseline부터 누적, M3.0 무관)
 - **상세**: `cargo clippy --workspace --features opencl --tests -- -D warnings`에서 `crates/qnn_oppkg_poc/src/lib.rs:725` 근방 raw pointer deref 함수에 `unsafe` 누락. rust 1.93 신규 lint. M1 회귀 안전망 crate이라 P3 우선순위. M2가 main 진입한 이상 PoC는 read-only — 손대지 않거나 일괄 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`로 silence.
