@@ -410,14 +410,18 @@ impl RpcmemSecondaryStore {
                 // `secondary_arc` (whole store) + `Arc::clone(region)` (this
                 // layer's rpcmem allocation), both moved into the alias
                 // buffer per `Backend::alloc_alias_weight_buffer` contract.
+                let secondary_dyn: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> =
+                    secondary_arc.clone();
+                let region_dyn: Arc<dyn crate::memory::secondary::RpcmemRegionGuard> =
+                    region.clone();
                 let alloc_res = unsafe {
                     backend.alloc_alias_weight_buffer(
                         host_ptr,
                         offset,
                         len,
                         dtype,
-                        Arc::clone(&secondary_arc),
-                        Arc::clone(region),
+                        secondary_dyn,
+                        region_dyn,
                     )
                 };
                 match alloc_res {

@@ -1707,14 +1707,16 @@ impl<'a> SwapExecutor<'a> {
         // `Arc::clone(secondary)` (whole store) + `alias.region` (this
         // layer's rpcmem allocation), both moved into the alias buffer per
         // `Backend::alloc_alias_weight_buffer` contract.
+        let secondary_dyn: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
+        let region_dyn: Arc<dyn crate::memory::secondary::RpcmemRegionGuard> = alias.region;
         let buf = unsafe {
             self.backend.alloc_alias_weight_buffer(
                 alias.host_ptr,
                 alias.offset,
                 alias.len,
                 alias.dtype,
-                Arc::clone(secondary),
-                alias.region,
+                secondary_dyn,
+                region_dyn,
             )
         }
         .map_err(|e| SwapError::BufferAllocationFailed {
@@ -2863,14 +2865,16 @@ fn try_alias_materialise_standalone(
     // (whole store) + `alias.region` (this layer's rpcmem allocation), both
     // moved into the alias buffer per `Backend::alloc_alias_weight_buffer`
     // contract.
+    let secondary_dyn: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
+    let region_dyn: Arc<dyn crate::memory::secondary::RpcmemRegionGuard> = alias.region;
     let buf = unsafe {
         backend.alloc_alias_weight_buffer(
             alias.host_ptr,
             alias.offset,
             alias.len,
             alias.dtype,
-            Arc::clone(secondary),
-            alias.region,
+            secondary_dyn,
+            region_dyn,
         )
     }
     .map_err(|e| SwapError::BufferAllocationFailed {

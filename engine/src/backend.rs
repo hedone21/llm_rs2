@@ -908,8 +908,8 @@ pub trait Backend: Send + Sync {
         offset: usize,
         size: usize,
         dtype: DType,
-        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
-        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+        secondary_arc: std::sync::Arc<dyn crate::memory::host::mmap::MmapKeepAlive>,
+        layer_region: std::sync::Arc<dyn crate::memory::secondary::RpcmemRegionGuard>,
     ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         Ok(None)
     }
@@ -929,8 +929,8 @@ pub trait Backend: Send + Sync {
         offset: usize,
         size: usize,
         dtype: DType,
-        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
-        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+        secondary_arc: std::sync::Arc<dyn crate::memory::host::mmap::MmapKeepAlive>,
+        layer_region: std::sync::Arc<dyn crate::memory::secondary::RpcmemRegionGuard>,
     ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         Ok(None)
     }

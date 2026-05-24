@@ -1014,42 +1014,6 @@
     {
       "id": "V-??",
       "file": "backend.rs",
-      "line": 911,
-      "import": "crate::models::weights::SecondaryMmap",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend.rs",
-      "line": 912,
-      "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend.rs",
-      "line": 932,
-      "import": "crate::models::weights::SecondaryMmap",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend.rs",
-      "line": 933,
-      "import": "crate::models::weights::rpcmem_secondary::RpcmemLayerRegion",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend.rs",
       "line": 1242,
       "import": "crate::backend::cpu::common::CpuBackendCommon",
       "rule": "INV-LAYER-002",
