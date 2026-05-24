@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::inference::sampling;
 use crate::inference::skip_config::SkipConfig;
@@ -199,7 +198,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
     let cpu_gen_input = Tensor::new(
         Shape::new(vec![1, 1]),
         cpu_gen_indices_buf,
-        Arc::new(CpuBackend::new()),
+        cpu_backend_arc.clone(),
     );
     let gpu_gen_input_buf = memory.alloc(4, DType::U8)?;
     let mut gen_input_tensor =
@@ -361,7 +360,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 let cpu_chunk_tensor = Tensor::new(
                     Shape::new(vec![1, chunk_len]),
                     cpu_chunk_buf,
-                    Arc::new(CpuBackend::new()),
+                    cpu_backend_arc.clone(),
                 );
                 let input_tensor = backend.copy_from(&cpu_chunk_tensor)?;
 
