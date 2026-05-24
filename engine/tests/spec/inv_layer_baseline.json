@@ -20,42 +20,6 @@
       "is_test_block": false
     },
     {
-      "id": "V-21",
-      "file": "models/transformer.rs",
-      "line": 15,
-      "import": "crate::pressure::offload::preload_pool::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-24",
-      "file": "pressure/weight_swap_handler.rs",
-      "line": 21,
-      "import": "crate::models::config::ModelConfig",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-24",
-      "file": "pressure/weight_swap_handler.rs",
-      "line": 22,
-      "import": "crate::models::weights::swap_executor::SwapExecutor",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-24",
-      "file": "pressure/weight_swap_handler.rs",
-      "line": 23,
-      "import": "crate::models::weights::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
       "id": "V-30",
       "file": "bin/generate.rs",
       "line": 2,
@@ -345,33 +309,6 @@
     },
     {
       "id": "V-??",
-      "file": "layers/llama_layer.rs",
-      "line": 12,
-      "import": "crate::pressure::kv_cache::KVCache",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "layers/llama_layer.rs",
-      "line": 16,
-      "import": "crate::pressure::kv_cache::KVCache",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "layers/transformer_layer/mod.rs",
-      "line": 12,
-      "import": "crate::pressure::kv_cache::KVCache",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
       "file": "memory/opencl/host_ptr_pool_buffer.rs",
       "line": 26,
       "import": "crate::backend::opencl::host_ptr_pool::HostPtrPoolGuard",
@@ -379,43 +316,7 @@
       "kind": "L2→L1 (backend-specific impl 직접 의존)",
       "is_test_block": false,
       "note": "V-07 패턴"
-    },
-    {
-      "id": "V-??",
-      "file": "models/transformer.rs",
-      "line": 14,
-      "import": "crate::pressure::kv_cache::KVCache",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "models/transformer.rs",
-      "line": 174,
-      "import": "crate::pressure::d2o_layer_alloc::D2OVarianceCollector",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "models/transformer.rs",
-      "line": 2783,
-      "import": "crate::pressure::kv_cache::PrefetchableCache",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "models/transformer.rs",
-      "line": 2786,
-      "import": "crate::pressure::offload::prefetch::PrefetchController",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
     }
   ],
-  "baseline_count": 46
+  "baseline_count": 35
 }

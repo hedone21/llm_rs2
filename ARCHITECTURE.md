@@ -1705,6 +1705,40 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 5건 이상의 hot path marker 누적 시 sub-trait 격상 별 sprint 강제 trigger (현재 14건 hot path가 이미 sub-trait sprint 대상).
   - marker 라인 자체는 zero-cost (주석). 런타임 영향 0.
 
+**§O — Cross-L3 domain vocabulary zone (type alias default + public API surface): RESOLVED (2026-05-24, S-C3)**
+- **결정**: L3 도메인 간 cross-domain concrete import 중 (1) generic type alias의 default param, (2) public API surface(`pub fn` signature)의 도메인 타입 노출, (3) weight swap orchestrator의 models 도메인 참조 같이 *도메인 어휘 공유* 성격의 import는 함수/use 단위 marker `// LAYER-EXEMPT: cross_l3_vocabulary`로 zone 명시 시 lint baseline 제외.
+- **허용 조건** (3개 모두 만족):
+  1. **Vocabulary 성격**: import 대상이 *도메인 어휘*(type alias default, struct field 정의, enum-as-data identifier, KVCacheOps 같은 trait의 default 구현체) 또는 *cold path orchestrator*의 인접 도메인 참조여야 한다. hot path concrete method 호출은 본 예외 밖이다.
+  2. **본질 격상 backlog 동반**: marker 부착 시 PR description 또는 인접 backlog 항목에 *본질 trait inversion 별 sprint 후보* 명시 (예: WeightSwapDispatch trait, KvCacheView trait, PreloadPool L2 격상).
+  3. **방향성**: L3 ↔ L3 양방향 모두 허용 (pressure ↔ inference). 일방향만 허용하는 §L과 다름.
+- **근거**: cross-L3 trait inversion이 본질 해소이나, 다음 사유로 marker 우선 적용이 cost-effective:
+  - **Type alias default**: caller convenience를 위한 외부 API surface — KVCache default를 KVCacheOps trait의 default impl로 노출하는 패턴이 일반적. trait inversion으로 default를 강제 제거하면 caller에 명시 강제 ripple 폭증.
+  - **Weight swap orchestrator**: pressure가 models의 SwapExecutor + LayerSlot + SecondaryMmap을 직접 사용하는 패턴은 WeightSwapDispatch trait + handler 이동(`models/weights/swap_handler.rs`)으로 해소 가능하나, ActionResult enum이 pressure 도메인이므로 잔여 위반 1건 남음 (§F enum-as-data). 격상 ROI는 trade-off.
+  - **PreloadPool / PrefetchableCache**: L2(shared/) 격상 또는 extension trait 분리가 본질이나 별 sprint scope.
+- **§L/§N과의 관계**:
+  - **§L**: L3→L1 backend impl + cross-L3 default initialization (단방향). marker = `backend_concrete_downcast`.
+  - **§N**: cross-cutting ↔ L3 trait/enum usage (방향 불문, but cross-cutting 매개). marker = `cross_cutting_trait_usage`.
+  - **§O**: L3 ↔ L3 vocabulary (양방향). marker = `cross_l3_vocabulary`.
+  - 세 marker family는 의미가 다르므로 분리 (혼동 방지). 모두 §13.8-J `// LAYER-EXEMPT-END` 종료 지원.
+- **버린 옵션**:
+  - (a) **KVCache 자체를 L2 격상**: pressure-specific eviction method 분리 + caller ripple 큼. 별 sprint scope.
+  - (b) **WeightSwapHandler를 models/weights로 이동**: ActionResult enum 의존 잔존 + pressure/mod.rs re-export ripple. 의미는 있지만 본 sprint scope 밖.
+  - (c) **모든 cross-L3 marker 일괄 허용 (정책 약화)**: trait inversion 동기 약화. 본 §O는 register 기반으로 항목별 정당화 강제.
+- **§O 적용 register** (S-C3 sprint 2026-05-24, RESOLVED):
+  - **Type alias default** 3건:
+    - `layers/llama_layer.rs:12,16` — `LlamaLayerForwardArgs<'a, C = KVCache>`, `LlamaForwardGenArgs<'a, C = KVCache>` (KVCacheOps generic default)
+    - `layers/transformer_layer/mod.rs:12` — `LayerForwardArgs<'a, C: KVCacheOps = KVCache>` (struct default param)
+    - `models/transformer.rs:14` — `TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache>` (struct default param + `&mut [KVCache]` concrete signatures)
+  - **Offload path** 3건:
+    - `models/transformer.rs:15` — `PreloadPool` (offload thread pool, L2 격상 backlog)
+    - `models/transformer.rs:2783,2786` — `PrefetchableCache` + `PrefetchController` (offload-only path, 격상 backlog)
+  - **Weight swap orchestrator** 3건:
+    - `pressure/weight_swap_handler.rs:21,22,23` — `ModelConfig`, `SwapExecutor`, `LayerSlot`/`SecondaryMmap` (WeightSwapDispatch trait + handler 이동 backlog)
+- **운용 메모**:
+  - marker는 의도성 명시. PR description에 *본질 trait inversion backlog 후보* 또는 *외부 API surface로 정당화* 기재.
+  - 5건 이상 누적 시 §13.4에 *cross-L3 vocabulary register* 표 신설 검토.
+  - 향후 trait inversion 별 sprint 진행 시 register에서 항목 제거.
+
 **§N — Cross-cutting ↔ L3 trait/enum usage zone: RESOLVED (2026-05-24, S-C4)**
 - **결정**: L3 도메인이 cross-cutting(`observability/`, `resilience/`)의 trait/enum/struct을 import하는 경우(INV-LAYER-003 cross-cutting variant), 또는 cross-cutting이 L3 도메인의 enum/struct을 §13.8-F enum-as-data identifier로 import하는 경우(INV-LAYER-004), 함수/use 단위 marker `// LAYER-EXEMPT: cross_cutting_trait_usage`로 zone 명시 시 lint baseline 제외.
 - **허용 조건** (3개 모두 만족):

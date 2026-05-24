@@ -352,7 +352,9 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool, bool]]:
     l_auto_ranges = _find_ext_anchor_ranges(lines)
     # §13.8-N cross-cutting trait/enum usage zone (cross-cutting ↔ L3 trait/enum import)
     n_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_N)
-    l_zone_ranges = l_marker_ranges + l_auto_ranges + n_marker_ranges
+    # §13.8-O cross-L3 vocabulary zone (L3↔L3 domain vocabulary: type alias default, public API surface)
+    o_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_O)
+    l_zone_ranges = l_marker_ranges + l_auto_ranges + n_marker_ranges + o_marker_ranges
 
     def in_test_block(lineno: int) -> bool:
         return any(s <= lineno <= e for s, e in test_block_ranges)
@@ -438,6 +440,7 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
 _EXEMPT_MARKER = "// LAYER-EXEMPT: dispatch_orchestrator"
 _EXEMPT_MARKER_L = "// LAYER-EXEMPT: backend_concrete_downcast"
 _EXEMPT_MARKER_N = "// LAYER-EXEMPT: cross_cutting_trait_usage"
+_EXEMPT_MARKER_O = "// LAYER-EXEMPT: cross_l3_vocabulary"
 _EXEMPT_END_MARKER = "// LAYER-EXEMPT-END"
 
 # fn 시그니처 패턴: `fn name(...) -> ... {` 또는 `fn name(...) {`

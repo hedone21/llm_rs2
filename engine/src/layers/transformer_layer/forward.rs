@@ -60,7 +60,7 @@ impl TransformerLayer {
         local_attn_window: Option<usize>,
         prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
         layer_idx: usize,
-        mut variance_collector: Option<&mut crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
+        mut variance_collector: Option<&mut dyn crate::qcf_collector::VarianceObserver>,
         mut profiler: Option<&mut dyn crate::instrument::OpInstrument>,
     ) -> Result<()> {
         let q_dim = self.wq.shape().dims()[0];

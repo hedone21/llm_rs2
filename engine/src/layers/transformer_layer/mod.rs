@@ -9,6 +9,7 @@ use crate::buffer::DType;
 use crate::kv_cache_ops::KVCacheOps;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type alias default (KVCacheOps generic 기본형)
 use crate::pressure::kv_cache::KVCache;
 use crate::shape::Shape;
 use crate::tensor::Tensor;

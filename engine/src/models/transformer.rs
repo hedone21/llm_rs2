@@ -11,7 +11,9 @@ use crate::layers::workspace::LayerWorkspace;
 use crate::memory::Memory;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type alias default + concrete kv_caches slice signature
 use crate::pressure::kv_cache::KVCache;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O preload thread pool (L2 격상 backlog)
 use crate::pressure::offload::preload_pool::{self, PreloadPool};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -171,7 +173,7 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub logits_last_only: bool,
     /// Optional D2O variance collector for layer-level allocation.
     /// When provided during prefill, captures per-layer attention column-sums.
-    pub variance_collector: Option<&'a mut crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
+    pub variance_collector: Option<&'a mut dyn crate::qcf_collector::VarianceObserver>,
     /// Optional layer boundary hook (LISWAP-4 / ENG-ALG-235).
     ///
     /// When `Some`, `forward_into` calls `hook.on_layer_boundary(idx, seq_len)`
@@ -1746,7 +1748,9 @@ impl TransformerModel {
                         self.config.sliding_window,
                         Some(pws),
                         i,
-                        variance_collector.as_deref_mut(),
+                        variance_collector
+                            .as_deref_mut()
+                            .map(|c| c as &mut dyn crate::qcf_collector::VarianceObserver),
                         profiler_ptr.map(|p| unsafe { &mut *p }),
                     )?;
                 } else {
@@ -2780,6 +2784,7 @@ impl TransformerModel {
     /// thread accesses any given `kv_caches[j]` at a time.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
+    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path trait bound + PrefetchController (offload 분리 backlog)
     pub fn forward_into_offload<C: crate::pressure::kv_cache::PrefetchableCache>(
         &self,
         args: TransformerModelForwardArgs<'_, C>,

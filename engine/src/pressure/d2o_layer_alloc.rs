@@ -211,6 +211,36 @@ impl D2OVarianceCollector {
     }
 }
 
+// L2 trait impl — L3-inference (transformer forward) 가 concrete 의존 없이
+// dyn dispatch 로 collect_layer 호출 (S-C3 trait inversion).
+impl crate::qcf_collector::VarianceObserver for D2OVarianceCollector {
+    fn collect_layer(
+        &mut self,
+        layer_idx: usize,
+        q: &[f32],
+        k: &[f32],
+        seq_len: usize,
+        cache_seq_len: usize,
+        q_stride: usize,
+        k_stride: usize,
+        kv_head_stride: usize,
+        start_pos: usize,
+    ) {
+        D2OVarianceCollector::collect_layer(
+            self,
+            layer_idx,
+            q,
+            k,
+            seq_len,
+            cache_seq_len,
+            q_stride,
+            k_stride,
+            kv_head_stride,
+            start_pos,
+        );
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

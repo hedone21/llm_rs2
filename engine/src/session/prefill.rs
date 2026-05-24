@@ -357,7 +357,9 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
                 // Chunked mode: only the last position's logits needed (saves GPU memory).
                 // Non-chunked: write all positions (original behaviour).
                 logits_last_only: chunked,
-                variance_collector: variance_collector.as_mut(),
+                variance_collector: variance_collector
+                    .as_mut()
+                    .map(|c| c as &mut dyn crate::qcf_collector::VarianceObserver),
                 prefill_workspace: None,
 
                 layer_boundary_hook: None,
