@@ -415,61 +415,7 @@
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "models/weights/phase_aware_swap.rs",
-      "line": 32,
-      "import": "crate::observability::profile::op_trace::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "observability/events.rs",
-      "line": 7,
-      "import": "crate::pressure::",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(observability)→L3-pressure (trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "pressure/cache_manager.rs",
-      "line": 6,
-      "import": "crate::observability::events::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "pressure/cache_manager.rs",
-      "line": 14,
-      "import": "crate::resilience::sys_monitor::SystemMonitor",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(resilience) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "resilience/executor.rs",
-      "line": 10,
-      "import": "crate::pressure::eviction::EvictMethod",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(resilience)→L3-pressure (trait inversion 필요)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "resilience/mod.rs",
-      "line": 15,
-      "import": "crate::pressure::eviction::EvictMethod",
-      "rule": "INV-LAYER-004",
-      "kind": "cross-cutting(resilience)→L3-pressure (trait inversion 필요)",
-      "is_test_block": false
     }
   ],
-  "baseline_count": 52
+  "baseline_count": 46
 }

@@ -350,7 +350,9 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool, bool]]:
     # §13.8-L backend concrete downcast zone 범위 감지 (marker + EXT-anchored auto)
     l_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_L)
     l_auto_ranges = _find_ext_anchor_ranges(lines)
-    l_zone_ranges = l_marker_ranges + l_auto_ranges
+    # §13.8-N cross-cutting trait/enum usage zone (cross-cutting ↔ L3 trait/enum import)
+    n_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_N)
+    l_zone_ranges = l_marker_ranges + l_auto_ranges + n_marker_ranges
 
     def in_test_block(lineno: int) -> bool:
         return any(s <= lineno <= e for s, e in test_block_ranges)
@@ -435,6 +437,7 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
 
 _EXEMPT_MARKER = "// LAYER-EXEMPT: dispatch_orchestrator"
 _EXEMPT_MARKER_L = "// LAYER-EXEMPT: backend_concrete_downcast"
+_EXEMPT_MARKER_N = "// LAYER-EXEMPT: cross_cutting_trait_usage"
 _EXEMPT_END_MARKER = "// LAYER-EXEMPT-END"
 
 # fn 시그니처 패턴: `fn name(...) -> ... {` 또는 `fn name(...) {`
@@ -723,6 +726,16 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 # 대상과 충돌하지 않음 (의도성 명시 위치만 제외).
                 if in_l and src_layer in _L3_DOMAINS \
                         and (dst_layer == "L1" or dst_layer in _L3_DOMAINS):
+                    continue
+
+                # §13.8-N: cross_cutting_trait_usage zone — L3 → cross-cutting
+                # (INV-LAYER-003) 및 cross-cutting → L3 (INV-LAYER-004) 양방향 trait/
+                # enum usage 의도성 명시. trait inversion이 이미 적용된 곳 또는
+                # §13.8-F enum-as-data identifier 예외에 해당하는 경우 사용.
+                if in_l and (
+                    (src_layer in _L3_DOMAINS and dst_layer in ("observability", "resilience"))
+                    or (src_layer in ("observability", "resilience") and dst_layer in _L3_DOMAINS)
+                ):
                     continue
 
                 # cross-backend 검사

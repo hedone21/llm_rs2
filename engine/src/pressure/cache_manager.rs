@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N EventSink trait inversion (V-12)
 use crate::observability::events::{CacheEvent, EventSink, NoOpSink};
 use crate::pressure::eviction::EvictMethod;
 use crate::pressure::eviction::EvictionPolicy;
@@ -11,6 +12,7 @@ use crate::pressure::{
     ActionResult, CachePressurePipeline, EvictionHandler, HandlerContext, MIN_EVICT_TOKENS,
     PressureLevel, PressureStageConfig, SwapHandler,
 };
+// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N SystemMonitor trait
 use crate::resilience::sys_monitor::SystemMonitor;
 use std::path::PathBuf;
 

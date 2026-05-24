@@ -1705,4 +1705,29 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 5건 이상의 hot path marker 누적 시 sub-trait 격상 별 sprint 강제 trigger (현재 14건 hot path가 이미 sub-trait sprint 대상).
   - marker 라인 자체는 zero-cost (주석). 런타임 영향 0.
 
+**§N — Cross-cutting ↔ L3 trait/enum usage zone: RESOLVED (2026-05-24, S-C4)**
+- **결정**: L3 도메인이 cross-cutting(`observability/`, `resilience/`)의 trait/enum/struct을 import하는 경우(INV-LAYER-003 cross-cutting variant), 또는 cross-cutting이 L3 도메인의 enum/struct을 §13.8-F enum-as-data identifier로 import하는 경우(INV-LAYER-004), 함수/use 단위 marker `// LAYER-EXEMPT: cross_cutting_trait_usage`로 zone 명시 시 lint baseline 제외.
+- **허용 조건** (3개 모두 만족):
+  1. **Type 종류**: trait 또는 §13.8-F에 해당하는 enum/struct(*data identifier*)여야 한다 — 일반 concrete 함수 호출이나 RAII guard 등은 본 예외 밖이다.
+  2. **방향성**: cross-cutting → L3 enum/struct (§F 패턴) 또는 L3 → cross-cutting trait import (의도된 trait inversion). 양방향 모두 동일 marker 적용.
+  3. **결합도**: cross-cutting 측이 L3 type의 *데이터* 또는 *trait method*만 사용하며, L3 측이 cross-cutting의 lifecycle을 관리하지 않는다.
+- **근거**: §13.8-F는 enum-as-data identifier 예외를 spec에 정의했으나 layer_lint.py가 enum 종류를 자동 식별하지 못해 V-10/V-12가 baseline에 남아있었다. §13.8-J/L과 동일한 marker family 패턴으로 의도성을 표면화하고 lint exception을 명시적으로 한다. trait import는 이미 trait inversion이 적용된 결과이므로 lint가 잡는 path-only 판정의 false positive에 해당.
+- **§F와의 관계**: §F는 *정책 정의*(어떤 enum/struct이 data identifier 자격이 있는지), §N은 *layer_lint 적용 메커니즘*(marker 명시). 두 정책은 직교 — §F는 본 §N marker 사용의 정당성을 spec에 부여한다.
+- **§L과의 관계**: §L은 L3→L1 backend impl downcast + cross-L3 default init. §N은 cross-cutting ↔ L3 trait/enum usage. 두 marker family는 의미가 다르므로 분리 (혼동 방지).
+- **버린 옵션**:
+  - (a) **§F를 layer_lint.py에 자동 인식 로직으로 추가**: enum 자체를 path-only로 식별하기 어렵다(struct도 동일 path). KNOWN_V_MAP의 V-ID 기반 화이트리스트는 정직성 떨어짐. marker 명시가 더 정직.
+  - (b) **observability/events.rs의 pressure import를 별도 shared 모듈로 추출**: V-12에서 이미 평가됨 — EventSink가 L3 변경 표현 채널이므로 pressure type 보유 정당. shared 추출 시 도메인 어휘 dumping ground 위험.
+- **§N 적용 register** (S-C4 sprint 2026-05-24, RESOLVED):
+  - **L3 → cross-cutting trait** 3건:
+    - `models/weights/phase_aware_swap.rs:32` — `observability::profile::op_trace::{DdrPhase, PhaseHook}` (PhaseHook L2 격상 backlog 대기)
+    - `pressure/cache_manager.rs:6` — `observability::events::{CacheEvent, EventSink, NoOpSink}` (EventSink trait inversion 완료)
+    - `pressure/cache_manager.rs:14` — `resilience::sys_monitor::SystemMonitor` (SystemMonitor trait inversion 완료)
+  - **Cross-cutting → L3 enum (§F)** 3건:
+    - `observability/events.rs:7` — `pressure::{ActionResult, PressureLevel}` (V-12, EventSink label vocabulary)
+    - `resilience/executor.rs:10` — `pressure::eviction::EvictMethod` (V-10, EvictPlan.method field)
+    - `resilience/mod.rs:15` — `pressure::eviction::EvictMethod` re-export (V-10)
+- **운용 메모**:
+  - marker는 trait/enum import에만 사용. concrete struct/함수 import에 부주의하게 박지 말 것.
+  - 5건 이상 누적 시 §13.4에 *cross-cutting trait usage register* 표 신설 검토.
+
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.

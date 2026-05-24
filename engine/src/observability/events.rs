@@ -4,6 +4,7 @@
 //! eviction triggers, score snapshots) and an `EventSink` trait for consumers.
 //! Default `NoOpSink` is zero-cost when observability is not needed.
 
+// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N §F enum-as-data identifier (V-12)
 use crate::pressure::{ActionResult, PressureLevel};
 
 // ── Event types ──────────────────────────────────────────────
