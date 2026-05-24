@@ -4665,6 +4665,17 @@ impl Backend for OpenCLBackend {
         self
     }
 
+    // §13.8-L S-L-1: Profile hook trait methods — inherent impl 으로 위임.
+    fn profile_events_enabled(&self) -> bool {
+        self.profile_events_enabled
+    }
+    fn set_op_label(&self, label: &'static str) {
+        Self::set_op_label(self, label)
+    }
+    fn clear_op_label(&self) {
+        Self::clear_op_label(self)
+    }
+
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
         let buf =
             get_cl_mem(t.buffer().as_ref()).map_err(|_| anyhow::anyhow!("Not OpenCL buffer"))?;

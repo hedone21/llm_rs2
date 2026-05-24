@@ -1313,6 +1313,16 @@ impl Backend for CudaBackend {
         self
     }
 
+    // §13.8-L S-L-1: Profile hook trait methods — inherent impl 으로 위임.
+    // CUDA 는 자체 event-based profiling 을 쓰지 않으므로
+    // `profile_events_enabled` 는 default(false) 그대로 둔다.
+    fn set_op_label(&self, label: &'static str) {
+        Self::set_op_label(self, label)
+    }
+    fn clear_op_label(&self) {
+        Self::clear_op_label(self)
+    }
+
     fn name(&self) -> &str {
         "CUDA"
     }

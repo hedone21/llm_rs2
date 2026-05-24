@@ -1248,6 +1248,28 @@ pub trait Backend: Send + Sync {
     //
     // Architect 라운드: `arch/sprint_backend_extension_round.md` R-EXT-1/3.
 
+    // ────────────────────────────────────────────────────────────────────
+    // §13.8-L hot path Profile hook (S-L-1):
+    // `--profile-events` / `--cuda-profile` 가 op 라벨을 흘려넣을 때 사용.
+    // GPU backend 만 override. CPU/QNN 등은 default no-op 으로 충분.
+    // 이 3 메서드를 통해 forward_gen.rs 의 OpenCLBackend / CudaBackend
+    // downcast 5건이 사라진다.
+
+    /// `true` 면 backend 가 자체적으로 per-op GPU event 프로파일링을 수행
+    /// 한다는 의미. forward_gen 의 wall-clock + `clFinish()` 경로를
+    /// 비활성화해 double-counting 을 막는다. Default `false`.
+    fn profile_events_enabled(&self) -> bool {
+        false
+    }
+
+    /// caller-side label hint — backend 가 다음 dispatch 의 op 명을
+    /// 알게 해서 `matmul_qkv` / `matmul_wo` / `matmul_ffn` / `lm_head` 같이
+    /// 동일 GEMV/GEMM 커널이라도 구분 가능하게 한다. Default no-op.
+    fn set_op_label(&self, _label: &'static str) {}
+
+    /// Label clear hook. set_op_label 의 pair. Default no-op.
+    fn clear_op_label(&self) {}
+
     /// Cold-path backend-specific extension lookup (string-keyed downcast).
     ///
     /// `downcast_ref::<OpenCLBackend>()` 등 outer-module downcast 를

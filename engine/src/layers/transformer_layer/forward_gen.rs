@@ -51,55 +51,13 @@ impl TransformerLayer {
         // events, so the legacy wall-clock + `clFinish()` path must stay
         // silent to avoid double-counting and to preserve the zero-overhead
         // property of event-based profiling.
-        #[cfg(feature = "opencl")]
-        let event_profiling = backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .map(|b| b.profile_events_enabled)
-            .unwrap_or(false);
-        #[cfg(not(feature = "opencl"))]
-        let event_profiling = false;
-
-        // `set_label` / `clear_label`: caller-side label hints used only by
-        // `--profile-events` / `--cuda-profile` to distinguish matmul_qkv /
-        // matmul_wo / matmul_ffn / lm_head (all dispatch the same
-        // GEMV/GEMM kernels). No-op on CPU or when neither profiler is
-        // active.
-        #[allow(unused_variables)]
-        let set_label = |label: &'static str| {
-            #[cfg(feature = "opencl")]
-            if event_profiling
-                && let Some(ocl_be) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            {
-                ocl_be.set_op_label(label);
-            }
-            #[cfg(feature = "cuda-embedded")]
-            if let Some(cu_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::cuda_embedded::CudaBackend>()
-            {
-                cu_be.set_op_label(label);
-            }
-        };
-        let clear_label = || {
-            #[cfg(feature = "opencl")]
-            if event_profiling
-                && let Some(ocl_be) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            {
-                ocl_be.clear_op_label();
-            }
-            #[cfg(feature = "cuda-embedded")]
-            if let Some(cu_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::cuda_embedded::CudaBackend>()
-            {
-                cu_be.clear_op_label();
-            }
-        };
+        // §13.8-L S-L-1: GPU event-profiling flag + op label hook 를
+        // Backend trait method 로 통일했다. OpenCL backend 만 `true` 를
+        // 반환하고, CUDA / CPU / QNN 등은 default `false`.
+        // 두 hook 모두 default no-op 이라 cfg gate 가 사라진다.
+        let event_profiling = backend.profile_events_enabled();
+        let set_label = |label: &'static str| backend.set_op_label(label);
+        let clear_label = || backend.clear_op_label();
 
         macro_rules! prof_start {
             () => {
