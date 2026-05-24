@@ -1650,14 +1650,11 @@ impl TransformerModel {
         // When active, attention_gen writes scores to a persistent GPU buffer and
         // reduce_layer runs on-device — no CPU readback needed per layer.
         // This means we set need_scores=false for the layer forward path.
-        #[cfg(feature = "opencl")]
-        let gpu_score_active = backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .and_then(|ocl_be| ocl_be.gpu_score_acc())
-            .is_some_and(|acc| acc.is_active());
-        #[cfg(not(feature = "opencl"))]
-        let gpu_score_active = false;
+        //
+        // §13.8-L S-L-2: Backend trait `gpu_score_acc()` 로 OpenCLBackend
+        // downcast 제거. CPU / CUDA / QNN 등 비-OpenCL backend 는 default
+        // `None` 반환 → `is_some_and` 가 false 로 자연 fallthrough.
+        let gpu_score_active = backend.gpu_score_acc().is_some_and(|acc| acc.is_active());
 
         // 2. Per-token weight snapshot (ENG-ALG-214-SNAP, INV-121).
         // The snapshot vector is materialised once at token entry so the

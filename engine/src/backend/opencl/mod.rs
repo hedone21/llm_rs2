@@ -4676,6 +4676,16 @@ impl Backend for OpenCLBackend {
         Self::clear_op_label(self)
     }
 
+    // §13.8-L S-L-2: GpuScoreAccess trait method — inherent impl 으로 위임.
+    // `&self -> &mut dyn` 패턴은 inherent `gpu_score_acc_mut` 의
+    // UnsafeCell-backed 구현을 trait 으로 노출 (single-threaded 가정).
+    fn gpu_score_acc(&self) -> Option<&dyn crate::backend::GpuScoreAccess> {
+        Self::gpu_score_acc(self).map(|s| s as &dyn crate::backend::GpuScoreAccess)
+    }
+    fn gpu_score_acc_mut(&self) -> Option<&mut dyn crate::backend::GpuScoreAccess> {
+        Self::gpu_score_acc_mut(self).map(|s| s as &mut dyn crate::backend::GpuScoreAccess)
+    }
+
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
         let buf =
             get_cl_mem(t.buffer().as_ref()).map_err(|_| anyhow::anyhow!("Not OpenCL buffer"))?;

@@ -26,6 +26,44 @@
 use anyhow::Result;
 use ocl::core::Kernel as CoreKernel;
 
+use crate::backend::GpuScoreAccess;
+
+// §13.8-L S-L-2: GpuScoreAccess trait impl — inherent method 위임.
+// trait method 가 forward.rs / forward_gen.rs hot path 의 OpenCLBackend
+// downcast 2건을 제거하기 위해 정의되었음. OpenCL-specific 메서드
+// (`score_buf_mem`, `end_step`, `sync_to_cpu`, `reset`) 는 trait 에서
+// 제외 — OpenCL backend 내부 경로 (plan.rs 등) 가 inherent method 로
+// 직접 호출.
+impl GpuScoreAccess for GpuScoreAccumulator {
+    fn is_active(&self) -> bool {
+        GpuScoreAccumulator::is_active(self)
+    }
+    fn set_active(&mut self, active: bool) {
+        GpuScoreAccumulator::set_active(self, active)
+    }
+    fn current_layer_idx(&self) -> usize {
+        GpuScoreAccumulator::current_layer_idx(self)
+    }
+    fn set_current_layer_idx(&mut self, layer_idx: usize) {
+        GpuScoreAccumulator::set_current_layer_idx(self, layer_idx)
+    }
+    fn n_heads_q(&self) -> usize {
+        GpuScoreAccumulator::n_heads_q(self)
+    }
+    fn n_layers(&self) -> usize {
+        GpuScoreAccumulator::n_layers(self)
+    }
+    fn layer_offset_elems(&self, layer_idx: usize) -> usize {
+        GpuScoreAccumulator::layer_offset_elems(self, layer_idx)
+    }
+    fn score_stride(&self) -> usize {
+        GpuScoreAccumulator::score_stride(self)
+    }
+    fn steps_accumulated(&self) -> usize {
+        GpuScoreAccumulator::steps_accumulated(self)
+    }
+}
+
 /// GPU-resident score accumulator that avoids per-token GPU->CPU readback.
 pub struct GpuScoreAccumulator {
     /// Persistent GPU buffer for per-layer attention scores output.

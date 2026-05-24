@@ -497,11 +497,10 @@ impl TransformerLayer {
                 // [n_layers, n_heads_q, score_stride] slice of `score_buf`. The plan
                 // path pre-bakes this offset at build time; the non-plan (forward_gen)
                 // path must set it dynamically per layer.
-                #[cfg(feature = "opencl")]
-                if let Some(ocl_be) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-                    && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+                // §13.8-L S-L-2: Backend trait `gpu_score_acc_mut()` 로
+                // OpenCLBackend downcast 제거. 비-OpenCL backend 는 default
+                // `None` → if-let chain 이 자연 skip 된다.
+                if let Some(gpu_acc) = backend.gpu_score_acc_mut()
                     && gpu_acc.is_active()
                 {
                     gpu_acc.set_current_layer_idx(layer_idx);
