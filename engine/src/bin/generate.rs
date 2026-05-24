@@ -3716,13 +3716,13 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                 if requires_scores && scores_opt.is_none() {
                     continue;
                 }
-                let Some(v_source) = VDataSource::from_kv_cache(cache, None) else {
+                let Some(v_source) = VDataSource::from_buffer(&cache.v_buffer, None) else {
                     continue;
                 };
                 // D2O simulator (paper Eq.8) needs K for nearest-neighbour
                 // matching; other actions ignore `k_source`.
                 let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
-                    VDataSource::k_from_kv_cache(cache)
+                    VDataSource::from_buffer(&cache.k_buffer, None)
                 } else {
                     None
                 };

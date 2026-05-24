@@ -35,8 +35,8 @@
 use super::{AggregationMode, aggregate_heads};
 use crate::buffer::DType;
 use crate::kv_cache_ops::KVLayout;
-use crate::pressure::kv_cache::KVCache;
 use crate::quant::{BlockQ4_0, QK4_0};
+use crate::tensor::Tensor;
 
 // ── Action types ────────────────────────────────────────────────
 
@@ -81,17 +81,21 @@ pub enum VDataSource<'a> {
 }
 
 impl<'a> VDataSource<'a> {
-    /// Build a `VDataSource` view of a `KVCache`'s V buffer.
+    /// Build a `VDataSource` view from a Tensor buffer (V or K).
     ///
-    /// - `v_cpu_bytes = Some(...)`: GPU backend with explicit host readback;
+    /// - `cpu_bytes = Some(...)`: GPU backend with explicit host readback;
     ///   the byte slice is reinterpreted by `dtype`.
-    /// - `v_cpu_bytes = None`: read directly from `cache.v_buffer.as_slice()`.
+    /// - `cpu_bytes = None`: read directly from `buffer.as_slice()`.
     ///   Returns `None` if the host pointer is null (device-only buffer).
     ///
     /// Returns `None` for unsupported dtypes.
-    pub fn from_kv_cache(cache: &'a KVCache, v_cpu_bytes: Option<&'a [u8]>) -> Option<Self> {
-        let dtype = cache.v_buffer.dtype();
-        if let Some(bytes) = v_cpu_bytes {
+    ///
+    /// 본 함수는 S-3b-3에서 KVCache struct 의존을 제거하기 위해 `&Tensor`
+    /// 매개변수를 받도록 변경되었다 (β 옵션). caller는 `cache.v_buffer` /
+    /// `cache.k_buffer` 를 직접 전달한다.
+    pub fn from_buffer(buffer: &'a Tensor, cpu_bytes: Option<&'a [u8]>) -> Option<Self> {
+        let dtype = buffer.dtype();
+        if let Some(bytes) = cpu_bytes {
             return Some(match dtype {
                 DType::F32 => {
                     let elems = bytes.len() / std::mem::size_of::<f32>();
@@ -111,32 +115,13 @@ impl<'a> VDataSource<'a> {
                 _ => return None,
             });
         }
-        if cache.v_buffer.buffer().as_ptr().is_null() {
+        if buffer.buffer().as_ptr().is_null() {
             return None;
         }
         Some(match dtype {
-            DType::F32 => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-            DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-            DType::Q4_0 => VDataSource::Q4_0(cache.v_buffer.as_slice::<BlockQ4_0>()),
-            _ => return None,
-        })
-    }
-
-    /// Build a `VDataSource` view of a `KVCache`'s **K** buffer (used for D2O
-    /// nearest-neighbour matching).
-    ///
-    /// Returns `None` for device-only (host pointer null) caches or
-    /// unsupported dtypes. This mirrors `from_kv_cache` but reads
-    /// `cache.k_buffer` instead of `cache.v_buffer`.
-    pub fn k_from_kv_cache(cache: &'a KVCache) -> Option<Self> {
-        let dtype = cache.k_buffer.dtype();
-        if cache.k_buffer.buffer().as_ptr().is_null() {
-            return None;
-        }
-        Some(match dtype {
-            DType::F32 => VDataSource::F32(cache.k_buffer.as_slice::<f32>()),
-            DType::F16 => VDataSource::F16(cache.k_buffer.as_slice::<u16>()),
-            DType::Q4_0 => VDataSource::Q4_0(cache.k_buffer.as_slice::<BlockQ4_0>()),
+            DType::F32 => VDataSource::F32(buffer.as_slice::<f32>()),
+            DType::F16 => VDataSource::F16(buffer.as_slice::<u16>()),
+            DType::Q4_0 => VDataSource::Q4_0(buffer.as_slice::<BlockQ4_0>()),
             _ => return None,
         })
     }

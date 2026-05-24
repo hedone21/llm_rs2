@@ -1046,7 +1046,7 @@ pub fn run_ppl(
                         } else {
                             QcfActionType::EvictSliding { target_len }
                         };
-                        match VDataSource::from_kv_cache(cache, v_cpu_bytes) {
+                        match VDataSource::from_buffer(&cache.v_buffer, v_cpu_bytes) {
                             Some(v_source) => {
                                 let params = QcfKvParams {
                                     action,

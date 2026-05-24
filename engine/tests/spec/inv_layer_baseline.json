@@ -1426,15 +1426,6 @@
     },
     {
       "id": "V-??",
-      "file": "qcf/qcf_kv.rs",
-      "line": 38,
-      "import": "crate::pressure::kv_cache::KVCache",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-qcf→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
       "file": "resilience/executor.rs",
       "line": 10,
       "import": "crate::pressure::eviction::EvictMethod",
