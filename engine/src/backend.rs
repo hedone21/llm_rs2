@@ -83,6 +83,34 @@ impl GpuEvent {
     }
 }
 
+// ── Cold-path extension namespace (ggml `get_proc_address` 차용) ──────────
+//
+// `Backend::get_extension(name)` 의 `name` 컨벤션. 호출지가 자유 문자열을
+// 박는 silent-None 회피용으로 본 const 만 사용한다.
+//
+// 본 entry 는 *cold path* 전용. forward / decode loop 안에서 호출 금지.
+// (RAII guard / HashMap 비용 발생; 자세한 정책은 `Backend::get_extension`
+// rustdoc 참조).
+//
+// Architect 라운드: `arch/sprint_backend_extension_round.md` R-EXT-1 (α).
+
+/// Cold-path extension key — `OpenCLBackend` 핸들 (queue 접근용).
+///
+/// 반환 타입은 `&OpenCLBackend` 로 downcast 해서 사용한다.
+pub const EXT_OPENCL_QUEUE: &str = "opencl_queue";
+
+/// Cold-path extension key — OpenCL secondary slot (qnn_oppkg swap path).
+///
+/// 반환 타입은 `&OpenCLBackend` 로 downcast 해서 사용한다.
+/// 현재는 `EXT_OPENCL_QUEUE` 와 동일한 핸들을 반환하지만, 향후
+/// secondary store 추상화가 구체화되면 별도 타입을 반환할 수 있다.
+pub const EXT_OPENCL_SECONDARY: &str = "opencl_secondary";
+
+/// Cold-path extension key — `QnnOppkgBackend` 핸들 (rpcmem secondary loader 등).
+///
+/// 반환 타입은 `&QnnOppkgBackend` 로 downcast 해서 사용한다.
+pub const EXT_QNN_OPPKG: &str = "qnn_oppkg";
+
 pub trait Backend: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
     fn name(&self) -> &str;
@@ -1180,6 +1208,32 @@ pub trait Backend: Send + Sync {
     /// vtable cost below measurement noise; Stage 2-B regression re-check
     /// follows in a separate task.
     fn yield_after_layer(&self, _layer: usize, _is_decode: bool) {}
+
+    // COLD-EXT: ─────────────────────────────────────────────────────────────
+    //
+    // 본 method 는 *cold path 전용*. forward / decode loop 안에서 호출 금지.
+    // 차용 출처: ggml `ggml_backend_reg_get_proc_address(reg, name)` —
+    // 표준 vtable 밖의 backend-specific 진입점을 string lookup 으로 통일.
+    //
+    // 호출지는 `EXT_OPENCL_QUEUE` 등 모듈 const 만 인자로 전달해야 한다
+    // (자유 문자열 silent-None 방어). 사용 가능한 key 는
+    // `engine/src/backend.rs` 상단 `EXT_*` const 열거 참조.
+    //
+    // Architect 라운드: `arch/sprint_backend_extension_round.md` R-EXT-1/3.
+
+    /// Cold-path backend-specific extension lookup (string-keyed downcast).
+    ///
+    /// `downcast_ref::<OpenCLBackend>()` 등 outer-module downcast 를
+    /// trait method 한 군데로 통일. Hot path (forward/decode loop) 진입
+    /// 금지 — `Any` downcast 비용 + lookup branch 가 매 layer 호출에
+    ///누적된다. Sprint scope = qnn_oppkg swap path / secondary_mmap loader
+    /// / transformer loader 의 4건. KIVI / forward downcast 는 별도.
+    ///
+    /// 반환값을 사용할 때는 호출지에서 `downcast_ref::<...>()` 으로
+    /// 구체 타입을 꺼낸다. 등록되지 않은 key 는 `None` 반환.
+    fn get_extension(&self, _name: &str) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -434,10 +434,11 @@ impl SessionInitCtx {
                 #[cfg(feature = "opencl")]
                 let primary_mem: Arc<dyn Memory> = match (&gpu_mem_arc, &gpu_be) {
                     (Some(ocl_m), Some(ocl_be)) => {
+                        // COLD-EXT: backend init, primary_mem 구성 1회만 호출.
                         if let Some(ocl_concrete) = ocl_be
-                            .as_any()
-                            .downcast_ref::<crate::backend::opencl::OpenCLBackend>(
-                        ) {
+                            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+                            .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
+                        {
                             eprintln!(
                                 "[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)"
                             );
@@ -610,9 +611,10 @@ impl SessionInitCtx {
         // 빌드 + Android runtime에서만 본격 동작.
         #[cfg(feature = "qnn")]
         if args.backend == "qnn_oppkg" || args.backend == "qnngpu" {
+            // COLD-EXT: backend init, graphFinalize N회 직렬 실행 setup.
             if let Some(qnn_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>()
+                .get_extension(crate::backend::EXT_QNN_OPPKG)
+                .and_then(|a| a.downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>())
             {
                 // ModelConfig → LayerConfig 변환. M3.2 단계는 Qwen2.5-1.5B 단일
                 // 모델 지원 (ENG-QNN-225 / INV-176). 추후 다른 모델 추가 시
@@ -991,9 +993,10 @@ impl SessionInitCtx {
                     // pattern is recorded *before* any AUF SOA bypass swap path
                     // adds placeholder cl_mems on top.
                     #[cfg(feature = "opencl")]
+                    // COLD-EXT: diagnostic dump after noshuffle prep (1회).
                     if let Some(ocl_be) = backend
-                        .as_any()
-                        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                        .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+                        .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
                     {
                         ocl_be.dump_cl_mem_diagnostics(" stage=after_noshuffle_prep");
                     }

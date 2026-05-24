@@ -372,9 +372,10 @@ impl TransformerModel {
     ) -> Result<usize> {
         let mut count = 0;
         #[cfg(feature = "opencl")]
+        // COLD-EXT: KV cache GPU buffer init (1회만 호출).
         let ocl_queue = gpu_backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+            .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
             .map(|be| be.queue.clone());
         #[cfg(not(feature = "opencl"))]
         let ocl_queue: Option<()> = None;
@@ -809,9 +810,10 @@ impl TransformerModel {
     /// Call at startup when resilience/tensor-partition is enabled and backend is GPU.
     #[cfg(feature = "opencl")]
     pub fn map_weights_for_cpu(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
+        // COLD-EXT: weight mmap startup (1회).
         let ocl_be = gpu_backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+            .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
             .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
         let queue = ocl_be.queue.clone();
 
@@ -1052,9 +1054,11 @@ impl TransformerModel {
         use crate::backend::opencl::{NoshuffleSoaEntry, OpenCLBackend, get_cl_mem};
         use crate::memory::opencl::noshuffle::NoshuffleWeightBuffer;
 
+        // COLD-EXT: noshuffle SOA loader path. `as_any().downcast_ref` 대신
+        // trait extension lookup 사용.
         let ocl_be = backend
-            .as_any()
-            .downcast_ref::<OpenCLBackend>()
+            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+            .and_then(|a| a.downcast_ref::<OpenCLBackend>())
             .ok_or_else(|| anyhow!("Not OpenCL backend"))?;
 
         // `LLMRS_KEEP_Q4_ORIGINAL=1` is an escape hatch for diagnostic

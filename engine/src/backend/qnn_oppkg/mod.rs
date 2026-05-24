@@ -135,8 +135,10 @@ impl QnnOppkgBackend {
     ) -> Option<R> {
         let slot = self.fallback_backend.lock().ok()?;
         let be = slot.as_ref()?;
+        // COLD-EXT: swap path. `as_any().downcast_ref` 대신 trait extension
+        // lookup 사용 (Backend trait 외부 진입점 통일).
         let ocl = be
-            .as_any()
+            .get_extension(crate::backend::EXT_OPENCL_SECONDARY)?
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
         Some(f(ocl))
     }
@@ -823,6 +825,16 @@ impl Backend for QnnOppkgBackend {
     // B-5b Phase 2 Stage 2-B: intra-token GPU yield hook routed through trait.
     fn yield_after_layer(&self, layer: usize, is_decode: bool) {
         crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
+    }
+
+    // COLD-EXT: backend handle 노출 — rpcmem secondary loader 가
+    // `downcast_ref::<QnnOppkgBackend>()` 대신 본 lookup 사용. 정책은
+    // `Backend::get_extension` rustdoc 참조.
+    fn get_extension(&self, name: &str) -> Option<&dyn std::any::Any> {
+        match name {
+            crate::backend::EXT_QNN_OPPKG => Some(self as &dyn std::any::Any),
+            _ => None,
+        }
     }
 }
 

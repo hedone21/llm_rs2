@@ -6590,6 +6590,19 @@ impl Backend for OpenCLBackend {
     fn yield_after_layer(&self, layer: usize, is_decode: bool) {
         crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
     }
+
+    // COLD-EXT: backend handle 노출 — qnn_oppkg swap path / secondary_mmap
+    // loader / transformer loader 에서 `downcast_ref::<OpenCLBackend>()` 를
+    // 대체하기 위한 string-keyed lookup. 자세한 정책은 `Backend::get_extension`
+    // rustdoc + `arch/sprint_backend_extension_round.md` R-EXT-1 참조.
+    fn get_extension(&self, name: &str) -> Option<&dyn std::any::Any> {
+        match name {
+            crate::backend::EXT_OPENCL_QUEUE | crate::backend::EXT_OPENCL_SECONDARY => {
+                Some(self as &dyn std::any::Any)
+            }
+            _ => None,
+        }
+    }
 }
 
 // ── KIVI Q2 dispatch functions (OpenCLBackend-specific, not part of Backend trait) ──
