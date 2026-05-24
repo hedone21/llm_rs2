@@ -311,7 +311,7 @@ pub struct SwapExecutor<'a> {
     /// tensors that need runtime unpermute fall back to the bg_fetch
     /// build path.
     #[cfg(feature = "cuda-embedded")]
-    pub mmap_registration: Option<Arc<crate::buffer::cuda_mmap_alias_buffer::CudaMmapRegistration>>,
+    pub mmap_registration: Option<Arc<crate::memory::cuda::mmap::CudaMmapRegistration>>,
 }
 
 impl<'a> SwapExecutor<'a> {
