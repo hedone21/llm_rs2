@@ -1091,16 +1091,19 @@ python scripts/run_device.py -d pixel generate --backend opencl
 
 **Cross-cutting 규칙**: Observability/Resilience는 모든 레이어가 import 가능하다. 단 cross-cutting 모듈이 L3 도메인의 concrete type을 직접 import할 때는 trait/Sink 경유로 제한된다 (예: `EventSink` trait, `Transport` trait).
 
-### 13.2 Domain Boundary: Pressure vs Inference (L3 결정)
+### 13.2 Domain Boundary: Pressure vs Inference vs QCF (L3 결정)
 
-**채택**: L3 내부는 *Pressure* (메모리 압박 대응)와 *Inference* (forward path) 도메인으로 분리한다.
+**채택 (S-3b-2, 2026-05-24 갱신)**: L3 내부는 *Pressure* (메모리 압박 대응), *Inference* (forward path), *QCF* (Quality Cost Function 측정) 세 도메인으로 분리한다.
 
-**폐기**: "Cache vs Inference" 분류. KV cache eviction과 weight swap이 모두 같은 `CachePressurePipeline`을 통해 트리거되는 현실(현 `core/pressure/weight_swap_handler.rs` 존재)을 반영하면, "캐시 관리"는 더 일반적인 "메모리 압박 응답"의 한 갈래이다.
+**폐기 (1차)**: "Cache vs Inference" 분류. KV cache eviction과 weight swap이 모두 같은 `CachePressurePipeline`을 통해 트리거되는 현실(현 `core/pressure/weight_swap_handler.rs` 존재)을 반영하면, "캐시 관리"는 더 일반적인 "메모리 압박 응답"의 한 갈래이다.
+
+**갱신 (2차, S-3b-2)**: `qcf/`를 L3-inference에서 분리하여 독립 L3 도메인으로 인정. QCF는 lossy action(eviction/quantization/skip)의 quality cost를 *측정*하는 도메인이며, pressure도 inference도 아닌 측정/평가 책임. data identifier는 §13.8-G로 L2(`engine/src/qcf_types.rs`)에 격상하여 양 도메인 공유 어휘로 통합한다.
 
 근거:
 - `core/pressure/weight_swap_handler.rs`는 weight를 KV eviction과 동일한 pipeline에 등록한다 → "캐시 도메인"이 아닌 "압박 도메인"으로 보는 것이 정합적.
 - `D2OHandler`, `SwapHandler`, `CompressHandler`, `QuantizeHandler`, `MergeHandler`, `SparseHandler`는 모두 "캐시 상태를 변형하는" 핸들러이며, weight swap은 "weight 상태를 변형하는" 핸들러로 **동일 추상화**에 자연 편입된다.
 - "Inference"는 *현재 토큰의 forward pass*에 한정한다 — 모델/레이어/attention/sampling만 포함. 압박-반응형 변형은 모두 L3 Pressure 도메인에 둔다.
+- "QCF"는 *측정 도메인* — `compute_flush_*`, `ImportanceCollector`, `DegradationEstimator` 등 quality cost 산출 로직. pressure 측 핸들러와 inference 측 prefill 모두로부터 호출되므로 단방향 도메인 종속이 어색. 독립 도메인으로 분리하여 caller가 trait(`QcfComputer`/`ImportanceCollect`) 경유로 의존하도록 강제 (Phase 4 trait inversion 대상).
 
 다이어그램 (목표 구조):
 
@@ -1123,9 +1126,14 @@ flowchart TB
         Layers["layers/<br/>(LlamaLayer, attention,<br/>workspace)"]
         Samp["sampling, attention_scores,<br/>speculative, skip_config"]
     end
+    subgraph L3C ["L3 QCF — qcf/"]
+        QcfCompute["compute_flush_*<br/>(NMSE/OPR/AWQE/aw_vopr)"]
+        QcfImp["ImportanceCollector<br/>ImportanceTable<br/>DegradationEstimator"]
+        QcfTraits["QcfComputer trait<br/>ImportanceCollect trait"]
+    end
     subgraph L2 ["L2 Abstraction — shared/"]
         Trait["backend (trait), buffer (trait),<br/>tensor, memory_buf, shape"]
-        Util["thread_pool, quant,<br/>tensor_partition, qcf"]
+        Util["thread_pool, quant,<br/>tensor_partition,<br/>qcf_types (§G shared)"]
     end
     subgraph L1 ["L1 Backend — backend/"]
         CPU["cpu (Neon, AVX)"]
@@ -1143,14 +1151,19 @@ flowchart TB
     L5 --> L4
     L4 --> L3A
     L4 --> L3B
+    L4 --> L3C
     L3A --> L2
     L3B --> L2
+    L3C --> L2
     L2 --> L1
+    L3A -.via trait.-> L3C
+    L3B -.via trait.-> L3C
     L4 -.uses.-> CC1
     L4 -.uses.-> CC2
     L3A -.via trait.-> CC1
     L3A -.via trait.-> CC2
     L3B -.via trait.-> CC1
+    L3C -.via trait.-> CC1
     L1 -.via trait.-> CC2
 ```
 
@@ -1496,14 +1509,18 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - V-07, V-08, V-19(`tensor_partition.rs` → `ClSubBuffer`) 해소.
   - V-09(buffer→`SecondaryMmap`)는 SecondaryMmap이 L3 Pressure state(§13.3)이므로 별도 trait inversion 필요 — V-09는 Step 3 보조 작업.
 
-**§E — 테스트 코드의 backend import 허용 정책: RESOLVED (점진적 — 신규 테스트만 tests/spec/ 이전)**
+**§E — 테스트 코드의 backend import 허용 정책: RESOLVED (점진적 — 신규 테스트만 tests/spec/ 이전; 2026-05-24 S-C2b 갱신)**
 - **결정**:
   - **기존**: lib 내부 inline `#[cfg(test)]` 안의 backend import(V-15: `core/eviction/*`, `core/pressure/*`의 `CpuBackend` instantiation)는 **그대로 유지** (grandfathered exception).
   - **신규**: 앞으로 추가하는 모든 spec test 및 단위 테스트는 **`engine/tests/spec/`**에 작성하며, 이곳에서만 backend instantiation을 허용한다.
+  - **2026-05-24 S-C2b 갱신**: `_find_test_block_ranges` 알고리즘이 `#[cfg(test)] #[allow(...)] mod tests { ... }` 와 같은 다중 attribute 패턴을 인식 못 해 test block 21건이 production code 위반으로 잘못 분류된 회귀 fix. `entered_block` flag 추가로 brace_depth가 한 번도 양수가 되지 않은 채 종료되는 false positive 차단. INV-LAYER-003 L3→L1 검사에서도 `is_test_block`이면 자동 baseline 제외 (INV-LAYER-001 data_consumer 패턴과 동일).
 - **근거**: V-15 사례는 다수 모듈(eviction/pressure handlers)에 산재해 있어 일괄 이전 시 PR 범위가 과대해진다. INV-LAYER-001/002의 "테스트도 production code"라는 엄격한 해석은 마이그레이션 효율을 해친다. 한편 신규 테스트를 모두 `tests/spec/`로 강제하면 backend instantiation의 무절제한 확산은 차단된다. 베이스라인 기반 점진 축소 전략(spec/41-invariants.md §3.26 "베이스라인 정책")과 정합.
 - **버린 옵션**: (a) lib 내부 inline 테스트의 backend import 즉시 금지 — 마이그레이션 단계 폭증, PR 분할 곤란. (b) lib 내부 inline 테스트 영구 허용 — 신규 테스트도 같은 패턴으로 확산.
+- **layer_lint.py 처리**:
+  - `_find_test_block_ranges`: `#[cfg(test)]` 또는 `#[test]` 발견 시 in_test=True 진입. brace_depth 변동 추적하여 `entered_block` flag가 True로 한 번 set된 이후에만 zone 종료 판정. attribute가 brace를 가지지 않으므로 multi-attribute 패턴도 정확히 인식.
+  - INV-LAYER-001/002/003 검사에서 `is_test_block=True`이면 자동 baseline 제외. data_consumer 자동 제외와 동일 운용.
 - **영향**:
-  - INV-LAYER-001/002의 NOTE/예외 절에 "lib 내부 `#[cfg(test)]` backend import는 grandfathered exception"으로 명시.
+  - INV-LAYER-001/002/003의 NOTE/예외 절에 "lib 내부 `#[cfg(test)]` backend import는 grandfathered exception"으로 명시.
   - feedback `spec_tests_required`와 일관 — 새 INV 관련 테스트는 `tests/spec/` 필수.
   - V-15는 baseline JSON(`engine/tests/spec/inv_layer_baseline.json`)에 등재되어 마이그레이션 마지막에 0으로 수렴.
 
@@ -1540,12 +1557,18 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - §13.4 directory migration map에 "shared identifier promotion" 항목 추가 (TBD, B-2 완료 후).
   - 향후 유사 패턴(예: `OpKind`와 같이 양 도메인 공유 어휘) 식별 시 본 정책 참조.
   - 5건 이상 누적 시 §13.4에 *promotion register* 표 신설 검토 (§F allowlist 정책과 동일 운용 원리).
-- **§G 적용 register** (5건 미만이므로 sub-list 형식 유지):
-  - `OpKind` (B-2a sprint, RESOLVED) — `observability/profile/op_trace.rs` → `engine/src/op_kind.rs`
-  - `KVCacheOps` (B-5b Phase 1, RESOLVED) — `pressure/kv_cache.rs` trait 부분 → `engine/src/kv_cache_ops.rs`
-  - `PartitionWsCell` / `PartitionWorkspace` (B-5a sprint, RESOLVED) — `layers/tensor_partition.rs` 일부 → `engine/src/partition_workspace.rs`
-  - `CpuKernelSet` / `OpenClSecondary` / `SecondaryStore` (B-5b Phase 2 Stage 1, RESOLVED) — Backend trait capability 인프라 (`engine/src/cpu_kernels.rs`, `engine/src/secondary.rs`)
-  - **`hybrid_attention` 모듈** (B-5b Phase 3 A, RESOLVED 2026-05-23) — `layers/hybrid_attention.rs` → `engine/src/hybrid_attention.rs`. 격상 단위는 모듈 전체 (`HybridAttnSetup`/`HybridGpuBuffer` struct + `HybridScope` RAII + `compute_kv_split`/`current`/`install` free fn). §G 본문 조건 1 "RAII guard 본 정책 밖" 문구는 *RAII guard 단독 격상*을 제외하려는 의도이며, 본 사례는 `HybridAttnSetup` data identifier + 그 lifetime을 관리하는 `HybridScope` 동반 격상 패턴으로 §G 정신과 부합. plan.rs(L1) hot path 호출이 §J 본문 "read-only 정책 query 한정" 제약과 mismatch (AtomicI32 store + Mutex lock + cl_mem 참조 부수효과 발생)이므로 §J zone marker 적용은 폐기되고 §G 격상으로 본질 해소. Backend trait method 추가 없음(ISP 누적 +0).
+- **§G 적용 register** (2026-05-24 표 형식으로 갱신, 6건 누적):
+
+| 식별자 | sprint | commit | 원위치 → 신위치 | 사용 도메인 | 격상 근거 |
+|---|---|---|---|---|---|
+| `OpKind` | B-2a | (RESOLVED) | `observability/profile/op_trace.rs` → `engine/src/op_kind.rs` | observability + L3-inference | producer/consumer 양방향 어휘 |
+| `KVCacheOps` (trait + `KVLayout` + `KiviRawBuffers`) | B-5b Phase 1 | (RESOLVED) | `pressure/kv_cache.rs` trait 부분 → `engine/src/kv_cache_ops.rs` | L3-pressure + L1 plan | trait + layout enum 공유 |
+| `PartitionWsCell` / `PartitionWorkspace` | B-5a | `232d45ec` | `layers/tensor_partition.rs` 일부 → `engine/src/partition_workspace.rs` | L3-inference + L1 plan | workspace cell 공유 |
+| `CpuKernelSet` / `OpenClSecondary` / `SecondaryStore` | B-5b Phase 2 Stage 1 | (RESOLVED) | Backend trait capability 인프라 (`engine/src/cpu_kernels.rs`, `engine/src/secondary.rs`) | L1 + L3 | capability trait |
+| `hybrid_attention` 모듈 | B-5b Phase 3 A | 2026-05-23 (RESOLVED) | `layers/hybrid_attention.rs` → `engine/src/hybrid_attention.rs` | L3-inference + L1 plan | RAII + data identifier 동반 격상 (§G 본문 조건 1 "RAII guard 단독 격상" 제외 의도 외 사례) |
+| **QCF data identifiers** (`QcfMetric`/`QcfConfig`/`QcfMode`/`AggregationMode`/`KiviFlushParams`/`FlushAttentionParams`/`SubLayer`/`ImportanceFormula` + `aggregate_heads`) | **S-3b-1** | **2026-05-24** | **`qcf/{mod,quant_qcf,layer_importance}.rs` → `engine/src/qcf_types.rs`** | **L3-qcf (신설) + L3-pressure + L3-inference + observability** | **3-도메인 + observability 공유 측정 어휘. 측정 로직(`compute_flush_*`, `ImportanceCollector`)은 L3-qcf에 유지** |
+
+**임계 정책**: 5건 미만 sub-list 형식, 5건 이상 표 형식. **10건 이상** 누적 시 layer_lint.py 명시적 allowlist (자동 검출) 도입 검토 — §F 정책과 동일 운용 원리. `hybrid_attention` 격상 시 자세한 근거: 격상 단위는 모듈 전체(`HybridAttnSetup`/`HybridGpuBuffer` struct + `HybridScope` RAII + `compute_kv_split`/`current`/`install` free fn). §G 본문 조건 1 "RAII guard 본 정책 밖" 문구는 *RAII guard 단독 격상*을 제외하려는 의도이며, 본 사례는 `HybridAttnSetup` data identifier + 그 lifetime을 관리하는 `HybridScope` 동반 격상 패턴으로 §G 정신과 부합. plan.rs(L1) hot path 호출이 §J 본문 "read-only 정책 query 한정" 제약과 mismatch (AtomicI32 store + Mutex lock + cl_mem 참조 부수효과 발생)이므로 §J zone marker 적용은 폐기되고 §G 격상으로 본질 해소. Backend trait method 추가 없음(ISP 누적 +0).
 
 **§H — Instrument macro helper 정책: RESOLVED (2026-05-22)**
 - **결정**: L2에 정의된 매크로가 expansion 내부에서 cross-cutting concrete(`observability/profile/*` 등)를 참조하는 패턴은 일정 조건을 만족하면 INV-LAYER-003/004를 위반하지 않는 것으로 본다. 매크로는 *기계적 코드 생성 도구*이며 source-level import 그래프와는 별도 차원에서 동작한다.
@@ -1624,5 +1647,148 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - marker zone 안에서 instantiation 코드를 시도하면 INV-LAYER-001/003 위반이 여전히 발생 — zone은 *정책 query에 한정*. struct/enum 정의 위치 자체가 문제라면 §13.8-G shared identifier promotion으로, trait method 의존이 문제라면 trait inversion으로 처리한다.
   - 5건 이상 누적 시 §13.4에 *dispatch orchestrator register* 표 신설 검토 (§F/G/I allowlist 정책과 동일 운용 원리).
   - 본 §J는 §13.8-F(enum-as-data identifier 예외)와 다음과 같이 직교한다 — §F는 *cross-cutting → L3 enum import*를 baseline에 grandfathered로 허용하고, §J는 *L1 → L3 정책 query 호출*을 zone marker 한정으로 허용. 적용 방향과 범위가 다르므로 동시 적용 가능.
+
+**§K — Cross-backend chain 예외 (qnn_oppkg → opencl): RESOLVED (2026-05-24)**
+- **결정**: 특정 GPU backend 간 cross-import는 *sub-layer dependency* 패턴으로 분류하여 INV-LAYER-001 위반에서 제외한다. 본 결정 시점 화이트리스트는 `{ (qnn_oppkg, opencl) }`. 화이트리스트 외 cross-backend import는 위반 그대로 적용된다.
+- **허용 조건** (3개 모두 만족):
+  1. **Sub-layer 관계**: target backend가 source backend의 *런타임 substrate*(메모리/context owner)여야 한다 — 단순 fallback이나 utility 의존(예: cuda → cpu_fallback)은 본 예외 밖이다.
+  2. **Type 종류**: import 대상이 backend struct 자체 또는 그 내부 자원(context/queue/memory handle) 접근용 API여야 한다 — 자유 함수 호출이나 일반 utility는 별도 정책 (§G/H/I/J).
+  3. **운용 단방향성**: chain은 *단방향*이며 양방향 의존이 발생하면 sub-layer 관계가 깨진 것이므로 본 예외에서 즉시 제외하고 trait 추출(§B 패턴) 또는 별도 재설계로 전환한다.
+- **근거**: qnn_oppkg는 ARM/Adreno SoC에서 QNN OpPackage path로 실행되지만, weight/KV 메모리는 OpenCL `clCreateBuffer(CL_MEM_USE_HOST_PTR)`로 alias된 rpcmem DMA-BUF heap을 공유한다 (HTP↔Adreno zero-copy interop, M2 단계 검증 완료). 즉 qnn_oppkg는 *OpenCL secondary slot 위에서 동작하는 dispatch layer*이며, OpenCLBackend를 downcast하여 cl_mem/queue/context에 접근하는 것이 design intent다. 일반 cross-backend(cuda → cpu fallback 등)와는 본질이 다르다 — 후자는 *대체* 관계, 전자는 *계층* 관계.
+- **§13.8-B와의 관계**: §B는 backend가 *자원의 owner*임을 인정하고 pressure(L3)와의 경계를 `WeightStagingPool` trait으로 정리한다. §K는 backend *간*의 sub-layer 관계를 명시적 화이트리스트로 정리한다 — 두 정책은 적용 단위가 다르며(§B = backend↔pressure, §K = backend↔backend) 동시 적용 가능.
+- **버린 옵션**:
+  - (a) **`OpenCLContextProvider` trait 추출 + qnn_oppkg가 trait만 의존**: cl_mem alias 본질이 컨텍스트별 핸들 공유에 있어 trait API surface가 30+ 메서드로 부풀고 vtable 비용도 hot path에서 누적된다. INV-LAYER-001 위반은 사라지지만 결합도는 실질적으로 그대로다.
+  - (b) **qnn_oppkg를 `backend/opencl/qnn_oppkg/` 하위 sub-module로 통합**: mod 분리를 깨뜨려 single mod responsibility(qnn_oppkg는 QNN OpPackage path, opencl은 OpenCL kernel dispatch)를 훼손한다. PR 범위도 폭증한다.
+  - (c) **dispatch trait 도입(`SubLayerDispatch`)**: 1건 한정 패턴을 추상화로 일반화 — 누적된 sub-layer 관계가 5건 이상으로 늘기 전에는 ROI 음(陰).
+- **적용**:
+  - `scripts/layer_lint.py`에 `ALLOWED_BACKEND_CHAINS: Set[Tuple[str, str]] = { ("qnn_oppkg", "opencl") }` 상수 추가. `check_cross_backend()`에서 화이트리스트 멤버십 검사 후 `(None, None)` 반환.
+  - 화이트리스트에 등록된 cross-backend import는 baseline JSON에서 제거.
+  - 신규 chain 등록 시 본 §K register에 추가 + baseline 갱신.
+- **§K 적용 register** (1건):
+  - `qnn_oppkg → opencl` (S-1 sprint 2026-05-24, RESOLVED) — `backend/qnn_oppkg/mod.rs:134/142`의 `OpenCLBackend` downcast. 근거: rpcmem DMA-BUF heap interop으로 zero-copy 공유.
+- **운용 메모**:
+  - 신규 chain 추가 시 PR description에 *sub-layer 관계 근거* 명시(메모리 공유 / context owner 등 구체적 substrate fact).
+  - 5건 이상 누적 시 §13.4에 *sub-layer chain register* 표 신설 검토 (§F/G/I allowlist 정책과 동일 운용 원리).
+  - 화이트리스트 외 cross-backend import 시 본 §K 우회를 우려하여 PR 리뷰 시 화이트리스트 변경이 동반되는지 확인.
+
+**§L — Backend concrete downcast zone (L3→L1 cold-path access + cross-L3 default init): RESOLVED (2026-05-24, S-C5 확장)**
+- **결정**: L3 도메인(`pressure/`, `layers/`, `models/`, `inference/`, `qcf/`)에서 L1 backend의 concrete struct(`OpenCLBackend`/`CudaBackend`/`QnnOppkgBackend`/`CpuBackend`)을 downcast 또는 인스턴스 생성으로 접근하는 패턴, 그리고 cross-L3 concrete default initialization(예: pressure가 qcf의 unit struct을 trait 구현체로 default field 보유)은 두 갈래로 분리하여 운용한다.
+  - **(L-auto) EXT-anchored chain**: `get_extension(crate::backend::EXT_*)` 직후의 `.downcast_ref::<*Backend>()` chain은 *자동 화이트리스트*. lint script가 ±5 라인 윈도우에서 anchor 탐지.
+  - **(L-marker) Bare downcast / instance**: `as_any().downcast_ref::<*Backend>()` 또는 `Arc::new(*Backend::new())` 패턴은 함수/블록 단위 zone marker(`// LAYER-EXEMPT: backend_concrete_downcast`)로 명시. marker zone 안의 L3→L1 import는 baseline에서 제외.
+- **허용 조건** (4개 모두 만족):
+  1. **Cold path 우세 또는 hot path measured-OK**: marker 부착자가 hot path에 있는 경우 vtable lookup 비용을 측정해야 한다. Decode loop에서 layer당 호출 시 token당 ≤100회 downcast (현 실측 ~80회/token, TBT 대비 <0.01%)는 허용.
+  2. **Type 종류**: import 대상이 backend struct 자체이거나, 그 내부 자원(`queue`/`gpu_score_acc`/`profile_events_enabled` 등) 접근 API여야 한다.
+  3. **명시 의도**: marker는 함수 시그니처 위 또는 블록 시작 직후 한 줄. PR description에 *cold path 근거* 또는 *hot path 측정값* 기재.
+  4. **Sub-trait 격상 backlog 동반**: marker zone 누적 시 동등 패턴의 sub-trait 격상(예: `OpenCLContext`/`CudaContext` trait + `get_extension`이 `&dyn Trait` 반환) 별 sprint 후보로 등록. 본 sprint 종료 시점 backlog "KiviCache hot path downcast resolve" 항목과 본 §L의 hot path 14건이 그 후보.
+- **근거**:
+  - **EXT-anchored auto (L-auto)**: 이미 backend extension sprint R-EXT-1/2에서 `EXT_OPENCL_QUEUE`/`EXT_OPENCL_SECONDARY`/`EXT_QNN_OPPKG` 정책 키가 정의됨 (`backend.rs:97-112`). chain 패턴은 *의도된 cold-path access*로 spec이 인정한 경로. lint script가 자동 인식 (코드 변경 0).
+  - **Bare marker (L-marker)**: bare `as_any().downcast_ref` 또는 `CpuBackend::new()`는 caller가 backend trait object를 받았음에도 concrete impl에 의존하는 패턴. trait 추출이 본질 해결이나 transitive cost(Queue/GpuScoreAcc/Program 등 nested trait + Plan executor 추상화)가 별 sprint급. 본 §L은 *현 시점의 cost-effective 정책* — marker로 *의도성을 표면화*하고 hot path 누적은 정량 측정 동반.
+- **§K/§J와의 관계**:
+  - **§K (sub-layer chain)**: backend↔backend 간 cross-import 화이트리스트. §L은 L3→L1 downcast — 적용 단위 다름.
+  - **§J (dispatch_orchestrator zone)**: L1→L3 build-time policy query. §L은 L3→L1 backend access — 방향 반대.
+  - 세 정책 모두 `// LAYER-EXEMPT: <kind>` marker family 공유.
+- **버린 옵션**:
+  - (a) **`OpenCLContext`/`CudaContext` sub-trait 격상 (S-C1b)**: 본질 해결이나 transitive drag 큼 (8+ 메서드 trait + 3 nested trait + Plan executor 추상화). 본 sprint scope 밖, 별 sprint 후보로 backlog 등록.
+  - (b) **75 callsite register-based 화이트리스트**: §K처럼 (file, type, line) 화이트리스트 부풀어 오름. 1건 한정 §K와 달리 75건은 register 운용 비용 큼.
+  - (c) **모든 backend concrete downcast 자동 인식**: lint 의미 약화, hot path / cold path 구분 없이 통과. 비추천.
+- **layer_lint.py 처리**:
+  - **(L-auto)** `_find_ext_downcast_anchors`: 라인별 `\.get_extension\(crate::backend::EXT_\w+\)` 패턴 발견 시 그 라인 ±5 윈도우를 anchor zone으로 등록. zone 안의 backend concrete downcast import는 baseline 제외.
+  - **(L-marker)** `_find_backend_downcast_zone_ranges`: §13.8-J `_find_exempt_zone_ranges` 패턴 재사용. marker 형식 `// LAYER-EXEMPT: backend_concrete_downcast` (정확히 이 텍스트). 함수 시그니처 바로 위 또는 블록 시작 다음 줄. zone close는 함수 종료 또는 `// LAYER-EXEMPT-END`.
+  - **검사 제외 대상**: zone 안의 `crate::backend::*::*Backend` 인라인 / `use crate::backend::*::*Backend;` use 문, `Arc::new(*Backend::new())` 인스턴스 생성, `*Backend::new()` 호출.
+  - **검사 적용 대상**: zone 안이라도 다른 카테고리(예: `crate::pressure::*` cross-domain) import는 본 예외 밖이다. baseline에 등재 유지.
+- **§L 적용 register** (S-C1 sprint 2026-05-24, RESOLVED; S-C5 확장):
+  - **L-auto** 4건: `models/transformer.rs:380/818`, `models/weights/secondary_mmap.rs:754/796` — `get_extension(EXT_OPENCL_QUEUE/EXT_OPENCL_SECONDARY/EXT_QNN_OPPKG)` chain.
+  - **L-marker** 75건: 함수 단위 marker로 ~20개 함수에 분포. INIT 27 / HOT 14 / COLD_SWAP 14 / COLD_EVICT 6 / OTHER 14.
+  - **L-marker cross-L3** 1건 (S-C5): `pressure/kivi_cache.rs:387` — `KiviQcfComputer` default initialization (S-3b-4 trail). 본 default는 ZST unit struct trait 구현체로 의미상 결합도 0이나 정직성 위해 marker 명시.
+- **운용 메모**:
+  - 신규 marker 추가 시 PR description에 *해당 함수가 cold path임을 입증하는 호출 빈도 데이터* 또는 *hot path 측정값 (downcast 비용 vs TBT 비율)* 기재.
+  - 5건 이상의 hot path marker 누적 시 sub-trait 격상 별 sprint 강제 trigger (현재 14건 hot path가 이미 sub-trait sprint 대상).
+  - marker 라인 자체는 zero-cost (주석). 런타임 영향 0.
+
+**§O — Cross-L3 domain vocabulary zone (type alias default + public API surface): RESOLVED (2026-05-24, S-C3)**
+- **결정**: L3 도메인 간 cross-domain concrete import 중 (1) generic type alias의 default param, (2) public API surface(`pub fn` signature)의 도메인 타입 노출, (3) weight swap orchestrator의 models 도메인 참조 같이 *도메인 어휘 공유* 성격의 import는 함수/use 단위 marker `// LAYER-EXEMPT: cross_l3_vocabulary`로 zone 명시 시 lint baseline 제외.
+- **허용 조건** (3개 모두 만족):
+  1. **Vocabulary 성격**: import 대상이 *도메인 어휘*(type alias default, struct field 정의, enum-as-data identifier, KVCacheOps 같은 trait의 default 구현체) 또는 *cold path orchestrator*의 인접 도메인 참조여야 한다. hot path concrete method 호출은 본 예외 밖이다.
+  2. **본질 격상 backlog 동반**: marker 부착 시 PR description 또는 인접 backlog 항목에 *본질 trait inversion 별 sprint 후보* 명시 (예: WeightSwapDispatch trait, KvCacheView trait, PreloadPool L2 격상).
+  3. **방향성**: L3 ↔ L3 양방향 모두 허용 (pressure ↔ inference). 일방향만 허용하는 §L과 다름.
+- **근거**: cross-L3 trait inversion이 본질 해소이나, 다음 사유로 marker 우선 적용이 cost-effective:
+  - **Type alias default**: caller convenience를 위한 외부 API surface — KVCache default를 KVCacheOps trait의 default impl로 노출하는 패턴이 일반적. trait inversion으로 default를 강제 제거하면 caller에 명시 강제 ripple 폭증.
+  - **Weight swap orchestrator**: pressure가 models의 SwapExecutor + LayerSlot + SecondaryMmap을 직접 사용하는 패턴은 WeightSwapDispatch trait + handler 이동(`models/weights/swap_handler.rs`)으로 해소 가능하나, ActionResult enum이 pressure 도메인이므로 잔여 위반 1건 남음 (§F enum-as-data). 격상 ROI는 trade-off.
+  - **PreloadPool / PrefetchableCache**: L2(shared/) 격상 또는 extension trait 분리가 본질이나 별 sprint scope.
+- **§L/§N과의 관계**:
+  - **§L**: L3→L1 backend impl + cross-L3 default initialization (단방향). marker = `backend_concrete_downcast`.
+  - **§N**: cross-cutting ↔ L3 trait/enum usage (방향 불문, but cross-cutting 매개). marker = `cross_cutting_trait_usage`.
+  - **§O**: L3 ↔ L3 vocabulary (양방향). marker = `cross_l3_vocabulary`.
+  - 세 marker family는 의미가 다르므로 분리 (혼동 방지). 모두 §13.8-J `// LAYER-EXEMPT-END` 종료 지원.
+- **버린 옵션**:
+  - (a) **KVCache 자체를 L2 격상**: pressure-specific eviction method 분리 + caller ripple 큼. 별 sprint scope.
+  - (b) **WeightSwapHandler를 models/weights로 이동**: ActionResult enum 의존 잔존 + pressure/mod.rs re-export ripple. 의미는 있지만 본 sprint scope 밖.
+  - (c) **모든 cross-L3 marker 일괄 허용 (정책 약화)**: trait inversion 동기 약화. 본 §O는 register 기반으로 항목별 정당화 강제.
+- **§O 적용 register** (S-C3 sprint 2026-05-24, RESOLVED):
+  - **Type alias default** 3건:
+    - `layers/llama_layer.rs:12,16` — `LlamaLayerForwardArgs<'a, C = KVCache>`, `LlamaForwardGenArgs<'a, C = KVCache>` (KVCacheOps generic default)
+    - `layers/transformer_layer/mod.rs:12` — `LayerForwardArgs<'a, C: KVCacheOps = KVCache>` (struct default param)
+    - `models/transformer.rs:14` — `TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache>` (struct default param + `&mut [KVCache]` concrete signatures)
+  - **Offload path** 3건:
+    - `models/transformer.rs:15` — `PreloadPool` (offload thread pool, L2 격상 backlog)
+    - `models/transformer.rs:2783,2786` — `PrefetchableCache` + `PrefetchController` (offload-only path, 격상 backlog)
+  - **Weight swap orchestrator** 3건:
+    - `pressure/weight_swap_handler.rs:21,22,23` — `ModelConfig`, `SwapExecutor`, `LayerSlot`/`SecondaryMmap` (WeightSwapDispatch trait + handler 이동 backlog)
+- **운용 메모**:
+  - marker는 의도성 명시. PR description에 *본질 trait inversion backlog 후보* 또는 *외부 API surface로 정당화* 기재.
+  - 5건 이상 누적 시 §13.4에 *cross-L3 vocabulary register* 표 신설 검토.
+  - 향후 trait inversion 별 sprint 진행 시 register에서 항목 제거.
+
+**§N — Cross-cutting ↔ L3 trait/enum usage zone: RESOLVED (2026-05-24, S-C4)**
+- **결정**: L3 도메인이 cross-cutting(`observability/`, `resilience/`)의 trait/enum/struct을 import하는 경우(INV-LAYER-003 cross-cutting variant), 또는 cross-cutting이 L3 도메인의 enum/struct을 §13.8-F enum-as-data identifier로 import하는 경우(INV-LAYER-004), 함수/use 단위 marker `// LAYER-EXEMPT: cross_cutting_trait_usage`로 zone 명시 시 lint baseline 제외.
+- **허용 조건** (3개 모두 만족):
+  1. **Type 종류**: trait 또는 §13.8-F에 해당하는 enum/struct(*data identifier*)여야 한다 — 일반 concrete 함수 호출이나 RAII guard 등은 본 예외 밖이다.
+  2. **방향성**: cross-cutting → L3 enum/struct (§F 패턴) 또는 L3 → cross-cutting trait import (의도된 trait inversion). 양방향 모두 동일 marker 적용.
+  3. **결합도**: cross-cutting 측이 L3 type의 *데이터* 또는 *trait method*만 사용하며, L3 측이 cross-cutting의 lifecycle을 관리하지 않는다.
+- **근거**: §13.8-F는 enum-as-data identifier 예외를 spec에 정의했으나 layer_lint.py가 enum 종류를 자동 식별하지 못해 V-10/V-12가 baseline에 남아있었다. §13.8-J/L과 동일한 marker family 패턴으로 의도성을 표면화하고 lint exception을 명시적으로 한다. trait import는 이미 trait inversion이 적용된 결과이므로 lint가 잡는 path-only 판정의 false positive에 해당.
+- **§F와의 관계**: §F는 *정책 정의*(어떤 enum/struct이 data identifier 자격이 있는지), §N은 *layer_lint 적용 메커니즘*(marker 명시). 두 정책은 직교 — §F는 본 §N marker 사용의 정당성을 spec에 부여한다.
+- **§L과의 관계**: §L은 L3→L1 backend impl downcast + cross-L3 default init. §N은 cross-cutting ↔ L3 trait/enum usage. 두 marker family는 의미가 다르므로 분리 (혼동 방지).
+- **버린 옵션**:
+  - (a) **§F를 layer_lint.py에 자동 인식 로직으로 추가**: enum 자체를 path-only로 식별하기 어렵다(struct도 동일 path). KNOWN_V_MAP의 V-ID 기반 화이트리스트는 정직성 떨어짐. marker 명시가 더 정직.
+  - (b) **observability/events.rs의 pressure import를 별도 shared 모듈로 추출**: V-12에서 이미 평가됨 — EventSink가 L3 변경 표현 채널이므로 pressure type 보유 정당. shared 추출 시 도메인 어휘 dumping ground 위험.
+- **§N 적용 register** (S-C4 sprint 2026-05-24, RESOLVED + S-D2 확장 2026-05-24):
+  - **L3 → cross-cutting trait** 3건:
+    - `models/weights/phase_aware_swap.rs:32` — `observability::profile::op_trace::{DdrPhase, PhaseHook}` (PhaseHook L2 격상 backlog 대기)
+    - `pressure/cache_manager.rs:6` — `observability::events::{CacheEvent, EventSink, NoOpSink}` (EventSink trait inversion 완료)
+    - `pressure/cache_manager.rs:14` — `resilience::sys_monitor::SystemMonitor` (SystemMonitor trait inversion 완료)
+  - **Cross-cutting → L3 enum (§F)** 3건:
+    - `observability/events.rs:7` — `pressure::{ActionResult, PressureLevel}` (V-12, EventSink label vocabulary)
+    - `resilience/executor.rs:10` — `pressure::eviction::EvictMethod` (V-10, EvictPlan.method field)
+    - `resilience/mod.rs:15` — `pressure::eviction::EvictMethod` re-export (V-10)
+  - **L1 → cross-cutting trait** 1건 (S-D2 확장):
+    - `backend/opencl/gpu_self_meter.rs:13` — `resilience::gpu_self_meter::GpuSelfMeter` (V-01, OpenCL impl-only)
+- **운용 메모**:
+  - marker는 trait/enum import에만 사용. concrete struct/함수 import에 부주의하게 박지 말 것.
+  - 5건 이상 누적 시 §13.4에 *cross-cutting trait usage register* 표 신설 검토.
+
+**§P — Cross-backend bootstrap zone (L1↔L1 cpu_companion + placeholder): RESOLVED (2026-05-24, S-D2)**
+- **결정**: L1 backend impl이 다른 L1 backend(주로 CPU)의 singleton/constructor를 *cpu_companion field init* 또는 *placeholder dependency* 용으로 import하는 경우, 함수/블록 단위 marker `// LAYER-EXEMPT: cross_backend_bootstrap`로 zone 명시 시 INV-LAYER-001 cross-backend baseline 제외.
+- **허용 조건** (3개 모두 만족):
+  1. **Bootstrap 성격**: import 대상이 backend constructor (`CpuBackend::new`) 또는 singleton 헬퍼 (`cpu_singleton()`) 여야 한다. backend 간 forward op 위임은 본 예외 밖이다.
+  2. **단일 호출지**: 각 backend constructor 안에서 1~2 callsite 한정 (cpu_companion field init 또는 placeholder Tensor backend 부착).
+  3. **Forward 미참조**: placeholder의 경우 forward 경로가 본 backend Arc를 참조하지 않아야 한다 (ZST 등가).
+- **근거**: cross-backend bootstrap은 backend implementation의 internal concern. CUDA/OpenCL backend가 host fallback용으로 CPU singleton을 사용하는 패턴은 단일 인프라 함수에서 일관적이고, trait method (`cpu_companion()`) 격상 시 testing/mock에 oneOff ripple.
+- **§L/§N/§O와의 관계**:
+  - **§L**: L3→L1 backend impl downcast + cross-L3 default init. 본 §P와 source layer 다름.
+  - **§N**: cross-cutting ↔ L3 (그리고 L1→cross-cutting trait) usage. 본 §P와 dst layer 다름.
+  - **§O**: L3 ↔ L3 vocabulary. 본 §P와 layer 조합 다름.
+- **버린 옵션**:
+  - (a) **`cpu_companion()` Backend trait method 격상**: 단 4 callsite를 위해 trait method 추가는 testing/mock ripple 크다. mock backend 모두 default body 구현 강제.
+  - (b) **Backend-agnostic CPU bootstrap free fn (`engine/src/cpu_bootstrap.rs`) 추출**: 여전히 `CpuBackend` type을 알아야 함, marker 대비 본질 격상 효과 0.
+- **§P 적용 register** (S-D2 sprint 2026-05-24, RESOLVED):
+  - **CPU companion field init** 3건:
+    - `backend/cuda_embedded/mod.rs:531` — `cpu_singleton()` (host fallback routing)
+    - `backend/cuda_pc/mod.rs:329` — `cpu_singleton()` (host fallback routing)
+    - `backend/opencl/mod.rs:1542` — `cpu_singleton()` (host fallback routing)
+  - **Placeholder Tensor backend** 1건:
+    - `backend/opencl/mod.rs:5244` — `CpuBackend::new()` (placeholder Tensor에 부착; forward 미참조)
+- **운용 메모**:
+  - marker는 backend impl 내부 한정. L3/L4에서 cross-backend access 는 본 예외 밖.
+  - 5건 이상 누적 시 backend trait method 격상 별 sprint 강제 trigger.
 
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.

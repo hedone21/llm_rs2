@@ -83,6 +83,112 @@ impl GpuEvent {
     }
 }
 
+// ── Cold-path extension namespace (ggml `get_proc_address` 차용) ──────────
+//
+// `Backend::get_extension(name)` 의 `name` 컨벤션. 호출지가 자유 문자열을
+// 박는 silent-None 회피용으로 본 const 만 사용한다.
+//
+// 본 entry 는 *cold path* 전용. forward / decode loop 안에서 호출 금지.
+// (RAII guard / HashMap 비용 발생; 자세한 정책은 `Backend::get_extension`
+// rustdoc 참조).
+//
+// Architect 라운드: `arch/sprint_backend_extension_round.md` R-EXT-1 (α).
+
+/// Cold-path extension key — `OpenCLBackend` 핸들 (queue 접근용).
+///
+/// 반환 타입은 `&OpenCLBackend` 로 downcast 해서 사용한다.
+pub const EXT_OPENCL_QUEUE: &str = "opencl_queue";
+
+/// Cold-path extension key — OpenCL secondary slot (qnn_oppkg swap path).
+///
+/// 반환 타입은 `&OpenCLBackend` 로 downcast 해서 사용한다.
+/// 현재는 `EXT_OPENCL_QUEUE` 와 동일한 핸들을 반환하지만, 향후
+/// secondary store 추상화가 구체화되면 별도 타입을 반환할 수 있다.
+pub const EXT_OPENCL_SECONDARY: &str = "opencl_secondary";
+
+/// Cold-path extension key — `QnnOppkgBackend` 핸들 (rpcmem secondary loader 등).
+///
+/// 반환 타입은 `&QnnOppkgBackend` 로 downcast 해서 사용한다.
+pub const EXT_QNN_OPPKG: &str = "qnn_oppkg";
+
+/// §13.8-L S-L-3 — KIVI native attention dispatch 추상화.
+///
+/// KIVI Q2/Q4/Q8 quantized KV cache 의 fused attention + residual update
+/// 커널은 현재 OpenCL backend 만 보유합니다. forward_gen 및 KiviCache
+/// 가 OpenCL backend 의 inherent 메서드 4종을 호출하기 위해 사용하던
+/// downcast 패턴을 본 trait method 호출로 통합합니다.
+///
+/// `is_nosub_device` 는 KIVI-specific 한 분기에서 sub-group reduce 비
+/// 가용 device (예: Adreno) 를 식별. OpenCL 외 backend 는 `false` (기본
+/// 무관) 또는 trait 미구현 (`Backend::as_kivi_attention` 이 `None`).
+pub trait KiviAttentionBackend: Send + Sync {
+    /// KIVI fused attention 커널이 해당 bit-width 로 컴파일되어 있는지.
+    fn has_kivi_attn_kernel(&self, bits: u8) -> bool;
+
+    /// Sub-group reduce 가 비활성인 device 인지 (KIVI native attention 분기).
+    fn is_nosub_device(&self) -> bool;
+
+    /// KIVI fused attention dispatch. residual K/V + quantized K/V 를
+    /// 한 커널 안에서 dequantize + attention.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen_kivi(
+        &self,
+        q: &Tensor,
+        qk_buf: &Tensor,
+        qv_buf: &Tensor,
+        res_k: &Tensor,
+        res_v: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        q_tokens: usize,
+        res_tokens: usize,
+        res_cap: usize,
+        scale: f32,
+        scores_out: Option<&mut [f32]>,
+        bits: u8,
+    ) -> Result<()>;
+
+    /// KV residual gather + scatter update. 다음 token 의 K/V 를 residual
+    /// circular buffer 에 누적.
+    #[allow(clippy::too_many_arguments)]
+    fn kivi_gather_update(
+        &self,
+        input: &Tensor,
+        residual: &mut Tensor,
+        kv_heads: usize,
+        res_cap: usize,
+        head_dim: usize,
+        seq_len: usize,
+        res_pos: usize,
+    ) -> Result<()>;
+}
+
+/// §13.8-L S-L-2 — GPU score accumulator 추상화.
+///
+/// `forward_into` / `forward_gen` 같은 hot path 가 OpenCL backend 의
+/// `GpuScoreAccumulator` inherent struct 에 접근하기 위한 trait 입니다.
+/// 본 trait 는 *backend-agnostic* 인 read/write API 만 노출하고,
+/// OpenCL-specific 한 `score_buf_mem()` (returns `&ocl::core::Mem`),
+/// `end_step(...)`, `sync_to_cpu(queue)`, `reset(queue)` 등 raw OpenCL
+/// 자원에 닿는 메서드는 OpenCL backend 안에서 inherent method 그대로
+/// 사용합니다 (`OpenCLBackend::execute_plan` 등 OpenCL 내부 경로).
+///
+/// `&self -> &mut Self` 반환은 OpenCL backend 의 `UnsafeCell`-backed
+/// accumulator 와 일치 (single-threaded 추론 가정).
+pub trait GpuScoreAccess: Send + Sync {
+    fn is_active(&self) -> bool;
+    fn set_active(&mut self, active: bool);
+    fn current_layer_idx(&self) -> usize;
+    fn set_current_layer_idx(&mut self, layer_idx: usize);
+    fn n_heads_q(&self) -> usize;
+    fn n_layers(&self) -> usize;
+    fn layer_offset_elems(&self, layer_idx: usize) -> usize;
+    fn score_stride(&self) -> usize;
+    fn steps_accumulated(&self) -> usize;
+}
+
 pub trait Backend: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
     fn name(&self) -> &str;
@@ -880,8 +986,8 @@ pub trait Backend: Send + Sync {
         offset: usize,
         size: usize,
         dtype: DType,
-        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
-        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+        secondary_arc: std::sync::Arc<dyn crate::memory::host::mmap::MmapKeepAlive>,
+        layer_region: std::sync::Arc<dyn crate::memory::secondary::RpcmemRegionGuard>,
     ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         Ok(None)
     }
@@ -901,8 +1007,8 @@ pub trait Backend: Send + Sync {
         offset: usize,
         size: usize,
         dtype: DType,
-        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
-        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+        secondary_arc: std::sync::Arc<dyn crate::memory::host::mmap::MmapKeepAlive>,
+        layer_region: std::sync::Arc<dyn crate::memory::secondary::RpcmemRegionGuard>,
     ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         Ok(None)
     }
@@ -1164,22 +1270,121 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// Intra-token GPU yield hook. Default no-op (CPU backends).
+    /// Intra-token cooperative yield hook.
     ///
     /// Called once per layer in the decode loop (and per layer in the OpenCL
-    /// plan path). GPU backends (`OpenCLBackend`, `CudaBackend` (pc + embedded),
-    /// `QnnOppkgBackend`) override this to delegate to
-    /// `crate::resilience::gpu_yield::gpu_yield_impl` which performs
-    /// `synchronize()` + optional `sleep_us()` when configured via
-    /// `LLMRS_DECODE_YIELD_EVERY`/`LLMRS_DECODE_YIELD_US`.
+    /// plan path). The default body implements env-driven yield:
+    /// flush via `self.synchronize()` and sleep `LLMRS_DECODE_YIELD_US`
+    /// microseconds every `LLMRS_DECODE_YIELD_EVERY` layers, gated by
+    /// `is_decode`. CPU backends inherit the default — when env vars are
+    /// unset, `yield_every() == 0` short-circuits before `synchronize()`,
+    /// so the hook is effectively zero-cost.
     ///
-    /// B-5b Phase 2 Stage 2-B: call sites
-    /// (`backend/opencl/plan.rs`, `models/transformer.rs`) now invoke this
-    /// trait method instead of the previous freestanding
-    /// `gpu_yield::maybe_yield_after_layer`. Stage 2-A S25 result showed
-    /// vtable cost below measurement noise; Stage 2-B regression re-check
-    /// follows in a separate task.
-    fn yield_after_layer(&self, _layer: usize, _is_decode: bool) {}
+    /// Backends may override this to use a backend-specific yield primitive
+    /// (custom scheduler hint, finer-grained sync), but the default works
+    /// for all backends. The freestanding `gpu_yield_impl` helper was
+    /// folded into this default body (S-2 sprint 2026-05-24) so that
+    /// `backend.rs` (L2) no longer crosses the cross-cutting boundary that
+    /// INV-LAYER-001 prohibits — env-var caching lives in
+    /// `crate::yield_policy` (also L2).
+    ///
+    /// B-5b Phase 2 Stage 2-A S25 microbench showed vtable cost below
+    /// measurement noise.
+    fn yield_after_layer(&self, layer_idx: usize, is_decode: bool) {
+        if !is_decode {
+            return;
+        }
+        let every = crate::yield_policy::yield_every();
+        if every == 0 {
+            return;
+        }
+        if !(layer_idx + 1).is_multiple_of(every) {
+            return;
+        }
+        // flush + wait: kernels already dispatched must drain before the
+        // sleep is useful (otherwise the sleep overlaps with the in-flight
+        // burst and buys nothing). synchronize() errors are swallowed —
+        // yield is a best effort, not a correctness hook.
+        let _ = self.synchronize();
+        let us = crate::yield_policy::yield_us();
+        if us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(us));
+        } else {
+            std::thread::yield_now();
+        }
+    }
+
+    // COLD-EXT: ─────────────────────────────────────────────────────────────
+    //
+    // 본 method 는 *cold path 전용*. forward / decode loop 안에서 호출 금지.
+    // 차용 출처: ggml `ggml_backend_reg_get_proc_address(reg, name)` —
+    // 표준 vtable 밖의 backend-specific 진입점을 string lookup 으로 통일.
+    //
+    // 호출지는 `EXT_OPENCL_QUEUE` 등 모듈 const 만 인자로 전달해야 한다
+    // (자유 문자열 silent-None 방어). 사용 가능한 key 는
+    // `engine/src/backend.rs` 상단 `EXT_*` const 열거 참조.
+    //
+    // Architect 라운드: `arch/sprint_backend_extension_round.md` R-EXT-1/3.
+
+    // ────────────────────────────────────────────────────────────────────
+    // §13.8-L hot path Profile hook (S-L-1):
+    // `--profile-events` / `--cuda-profile` 가 op 라벨을 흘려넣을 때 사용.
+    // GPU backend 만 override. CPU/QNN 등은 default no-op 으로 충분.
+    // 이 3 메서드를 통해 forward_gen.rs 의 OpenCLBackend / CudaBackend
+    // downcast 5건이 사라진다.
+
+    /// `true` 면 backend 가 자체적으로 per-op GPU event 프로파일링을 수행
+    /// 한다는 의미. forward_gen 의 wall-clock + `clFinish()` 경로를
+    /// 비활성화해 double-counting 을 막는다. Default `false`.
+    fn profile_events_enabled(&self) -> bool {
+        false
+    }
+
+    /// caller-side label hint — backend 가 다음 dispatch 의 op 명을
+    /// 알게 해서 `matmul_qkv` / `matmul_wo` / `matmul_ffn` / `lm_head` 같이
+    /// 동일 GEMV/GEMM 커널이라도 구분 가능하게 한다. Default no-op.
+    fn set_op_label(&self, _label: &'static str) {}
+
+    /// Label clear hook. set_op_label 의 pair. Default no-op.
+    fn clear_op_label(&self) {}
+
+    /// §13.8-L S-L-2: GPU score accumulator 접근 hook. OpenCL backend 만
+    /// 활성, 그 외 backend 는 default `None`. forward.rs / forward_gen.rs
+    /// 의 `backend.as_any().downcast_ref::<OpenCLBackend>().and_then(...)`
+    /// chain 2건이 본 trait method 호출로 통합된다.
+    fn gpu_score_acc(&self) -> Option<&dyn GpuScoreAccess> {
+        None
+    }
+
+    /// `gpu_score_acc` 의 mutable 버전. OpenCL backend 의 inherent
+    /// `gpu_score_acc_mut(&self) -> Option<&mut ...>` 와 동일한 패턴
+    /// (`UnsafeCell`-backed). single-threaded 추론 가정.
+    #[allow(clippy::mut_from_ref)]
+    fn gpu_score_acc_mut(&self) -> Option<&mut dyn GpuScoreAccess> {
+        None
+    }
+
+    /// §13.8-L S-L-3: KIVI native attention dispatch hook. OpenCL backend
+    /// 만 활성, 그 외 backend 는 default `None`. forward_gen.rs / kivi_cache.rs
+    /// 의 hot-path `OpenCLBackend` downcast 가 본 trait method 호출로
+    /// 축약된다.
+    fn as_kivi_attention(&self) -> Option<&dyn KiviAttentionBackend> {
+        None
+    }
+
+    /// Cold-path backend-specific extension lookup (string-keyed downcast).
+    ///
+    /// `downcast_ref::<OpenCLBackend>()` 등 outer-module downcast 를
+    /// trait method 한 군데로 통일. Hot path (forward/decode loop) 진입
+    /// 금지 — `Any` downcast 비용 + lookup branch 가 매 layer 호출에
+    ///누적된다. Sprint scope = qnn_oppkg swap path / secondary_mmap loader
+    /// / transformer loader 의 4건. KIVI / forward downcast 는 별도.
+    ///
+    /// 반환값을 사용할 때는 호출지에서 `downcast_ref::<...>()` 으로
+    /// 구체 타입을 꺼낸다. 등록되지 않은 key 는 `None` 반환.
+    fn get_extension(&self, _name: &str) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+// L1 backend impl이 resilience 도메인의 `GpuSelfMeter` trait 정의만 import — trait
+// inversion 자체는 이미 적용된 형태(impl-only)로 lint path-only 판정 false positive.
+// LAYER-EXEMPT: cross_cutting_trait_usage
 use crate::resilience::gpu_self_meter::GpuSelfMeter;
 
 /// OpenCL queue profiling 기반 GPU 사용률 누적기.

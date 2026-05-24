@@ -133,13 +133,13 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     );
 
     let qcf_mode_enum = match args.qcf_mode.as_str() {
-        "caote" => crate::qcf::QcfMode::Caote,
-        "both" => crate::qcf::QcfMode::Both,
-        _ => crate::qcf::QcfMode::Attn,
+        "caote" => crate::qcf_types::QcfMode::Caote,
+        "both" => crate::qcf_types::QcfMode::Both,
+        _ => crate::qcf_types::QcfMode::Attn,
     };
-    let qcf_config = crate::qcf::QcfConfig {
+    let qcf_config = crate::qcf_types::QcfConfig {
         mode: qcf_mode_enum,
-        ..crate::qcf::QcfConfig::default()
+        ..crate::qcf_types::QcfConfig::default()
     };
 
     let eval_config = crate::session::eval::EvalConfig {

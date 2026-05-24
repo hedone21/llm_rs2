@@ -74,10 +74,15 @@ LAYER_RULES = [
     # L3-inference: 추론 연산 도메인
     # Step 4-C: sampling/skip_config/speculative/attention_scores promoted to engine/src/inference/
     ("inference",               "L3-inference"),
-    # Step 4-B: qcf promoted from core/qcf to engine/src/qcf (top-level L3-inference)
-    ("qcf",                     "L3-inference"),  # QCF는 inference-side 메트릭
     ("layers",                  "L3-inference"),
     ("models",                  "L3-inference"),  # models/weights/* 포함
+
+    # L3-qcf: Quality Cost Function 측정 도메인 (S-3b-2, 2026-05-24)
+    # QCF는 lossy action(eviction/quantization/skip)의 quality cost 측정 도메인.
+    # pressure 도 inference 도 아닌 *측정/평가* 도메인이며, 양쪽 모두로부터 호출됨.
+    # data identifier 는 §G로 L2(`engine/src/qcf_types.rs`)에 격상, 측정 로직은
+    # 본 L3-qcf 도메인(`engine/src/qcf/`)에 유지.
+    ("qcf",                     "L3-qcf"),
 
     # L4: orchestration (Step 5-A: chat_template promoted from core/ to session/)
     ("session",                 "L4"),
@@ -123,7 +128,9 @@ def classify_module(rel_path: str) -> str:
     # directory-prefix rules (Rust 2018+ pattern — trait lives next to impl dir).
     TOP_LEVEL_L2 = {"backend.rs", "buffer.rs", "memory.rs", "tensor.rs",
                     "shape.rs", "quant.rs", "thread_pool.rs", "op_kind.rs",
-                    "partition_workspace.rs", "kv_cache_ops.rs"}
+                    "partition_workspace.rs", "kv_cache_ops.rs",
+                    "yield_policy.rs", "qcf_types.rs",
+                    "qcf_computer.rs", "qcf_collector.rs"}
     if norm in TOP_LEVEL_L2:
         return "L2"
     for prefix, layer in LAYER_RULES:
@@ -158,7 +165,7 @@ def classify_import(import_path: str) -> str:
     # Top-level L2 abstraction files (engine/src/*.rs, Rust 2018+ pattern)
     if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
                     "quant", "thread_pool", "op_kind", "partition_workspace",
-                    "kv_cache_ops"):
+                    "kv_cache_ops", "yield_policy"):
         return "L2"
     # 기존 경로 기반 매칭으로 fallback
     return classify_module(mod_path if mod_path else p.replace("::", "/"))
@@ -168,6 +175,9 @@ def classify_import(import_path: str) -> str:
 # 위반 판정 규칙 (INV-LAYER-001~005)
 # ────────────────────────────────────────────────────────────────────
 
+_L3_DOMAINS = ("L3-pressure", "L3-inference", "L3-qcf")
+
+
 def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str | None, str | None, str | None]:
     """
     (src_layer, dst_layer) 쌍에 대해 위반하는 INV-LAYER-XXX와 kind 문자열을 반환.
@@ -176,9 +186,9 @@ def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str |
     """
     # INV-LAYER-001: L1 backend → L2(shared/buffer/memory/auf) + cross-cutting 외 import 금지
     # 허용: L1→L2, L1→L1(동일 backend 내부), L1→observability, L1→resilience, L1→L3-core(Backend trait)
-    # 금지: L1→L3-pressure, L1→L3-inference, L1→L4, L1→L5
+    # 금지: L1→L3-pressure, L1→L3-inference, L1→L3-qcf, L1→L4, L1→L5
     if src_layer == "L1":
-        if dst_layer in ("L3-pressure", "L3-inference", "L4", "L5"):
+        if dst_layer in (*_L3_DOMAINS, "L4", "L5"):
             # V-01: L1→cross-cutting concrete (resilience임에도 concrete 직접 import)
             # V-02: L1→L3-inference
             # V-03: L1→L3-inference (models/weights)
@@ -200,32 +210,30 @@ def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str |
 
     # INV-LAYER-002: L2 → L3+/L4/L5 import 금지
     if src_layer == "L2":
-        if dst_layer in ("L3-pressure", "L3-inference", "L4", "L5"):
+        if dst_layer in (*_L3_DOMAINS, "L4", "L5"):
             kind = f"L2→{dst_layer} (상위 레이어 역방향 import)"
             return ("INV-LAYER-002", kind, None)
         if dst_layer == "L1":
             kind = f"L2→L1 (backend-specific impl 직접 의존)"
             return ("INV-LAYER-002", kind, "V-07 패턴")
 
-    # INV-LAYER-003: L3-inference ↔ L3-pressure는 trait만 허용, concrete 금지
-    if src_layer == "L3-inference" and dst_layer == "L3-pressure":
-        kind = "L3-inference→L3-pressure (cross-domain concrete import)"
-        return ("INV-LAYER-003", kind, None)
-    if src_layer == "L3-pressure" and dst_layer == "L3-inference":
-        kind = "L3-pressure→L3-inference (cross-domain concrete import)"
+    # INV-LAYER-003 (S-3b-2, 2026-05-24 일반화): 모든 L3 도메인 쌍 사이 cross-domain
+    # concrete import 금지 (Q1 결정 — 예외는 사용자 확인 후 처리). trait 만 허용.
+    if src_layer in _L3_DOMAINS and dst_layer in _L3_DOMAINS and src_layer != dst_layer:
+        kind = f"{src_layer}→{dst_layer} (cross-domain concrete import)"
         return ("INV-LAYER-003", kind, None)
     # L3→L1 (backend concrete downcast)
-    if src_layer in ("L3-pressure", "L3-inference") and dst_layer == "L1":
+    if src_layer in _L3_DOMAINS and dst_layer == "L1":
         kind = f"{src_layer}→L1 (backend impl 직접 의존)"
         return ("INV-LAYER-003", kind, "downcast 패턴")
     # L3→cross-cutting concrete (V-10, V-14, V-22, V-26 등)
-    if src_layer in ("L3-pressure", "L3-inference") and dst_layer in ("observability", "resilience"):
+    if src_layer in _L3_DOMAINS and dst_layer in ("observability", "resilience"):
         kind = f"{src_layer}→cross-cutting({dst_layer}) (concrete 직접 의존, trait inversion 필요)"
         return ("INV-LAYER-003", kind, None)
 
     # INV-LAYER-004: cross-cutting(observability/resilience) → L3 concrete import 금지
     if src_layer in ("observability", "resilience"):
-        if dst_layer in ("L1", "L3-pressure", "L3-inference"):
+        if dst_layer in ("L1", *_L3_DOMAINS):
             kind = f"cross-cutting({src_layer})→{dst_layer} (trait inversion 필요)"
             return ("INV-LAYER-004", kind, None)
 
@@ -238,7 +246,7 @@ def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str |
         skip = any(name_no_ext.startswith(p) for p in L5_SKIP_PATTERNS)
         if not skip and basename == "generate.rs":
             # generate.rs → L1/L2/L3/observability/resilience 직접 import는 모두 위반
-            if dst_layer in ("L1", "L2", "L3-pressure", "L3-inference", "L3-core",
+            if dst_layer in ("L1", "L2", *_L3_DOMAINS, "L3-core",
                              "observability", "resilience"):
                 kind = f"L5/generate.rs→{dst_layer} (L4 session/ 우회)"
                 return ("INV-LAYER-005", kind, None)
@@ -259,6 +267,14 @@ def _extract_backend(rel_path: str) -> str:
 # ────────────────────────────────────────────────────────────────────
 # Cross-backend 위반 (V-04, V-05) 별도 처리
 # ────────────────────────────────────────────────────────────────────
+
+# ARCHITECTURE.md §13.8-K — Sub-layer dependency 허용 화이트리스트.
+# (source_backend, target_backend) 페어. source가 target의 런타임 substrate
+# (메모리/context owner)에 해당하는 경우만 등록 가능 — 일반 fallback은 제외.
+ALLOWED_BACKEND_CHAINS: set[tuple[str, str]] = {
+    ("qnn_oppkg", "opencl"),  # qnn_oppkg가 OpenCL secondary slot 위에서 동작 (rpcmem DMA-BUF interop)
+}
+
 
 def check_cross_backend(src_rel: str, import_path: str) -> tuple[str | None, str | None]:
     """
@@ -293,6 +309,10 @@ def check_cross_backend(src_rel: str, import_path: str) -> tuple[str | None, str
     if src_be == dst_be:
         return (None, None)
 
+    # §13.8-K sub-layer dependency 화이트리스트 — 허용 chain은 위반 미반환
+    if (src_be, dst_be) in ALLOWED_BACKEND_CHAINS:
+        return (None, None)
+
     # 다른 backend로의 cross-import
     kind = f"L1({src_be})→L1({dst_be}) (cross-backend import)"
     return ("INV-LAYER-001", kind)
@@ -309,11 +329,13 @@ RE_USE_LIB = re.compile(r'^\s*(?:pub\s+)?use\s+(llm_rs2::\S+)\s*;', re.MULTILINE
 # 인라인 crate:: 참조 (함수 본문 내)
 RE_INLINE_CRATE = re.compile(r'(?<!\w)(crate::[a-zA-Z_][a-zA-Z0-9_:]*)')
 
-def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
+def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool, bool]]:
     """
-    파일에서 (line_number, import_path, is_test_block, in_exempt_zone) 목록 반환.
+    파일에서 (line_number, import_path, is_test_block, in_exempt_zone, in_l_zone) 목록 반환.
     is_test_block=True는 #[cfg(test)] 블록 내부.
     in_exempt_zone=True는 §13.8-J LAYER-EXEMPT: dispatch_orchestrator zone 내부.
+    in_l_zone=True는 §13.8-L LAYER-EXEMPT: backend_concrete_downcast zone 내부
+            (marker 또는 EXT-anchored auto chain).
     """
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
@@ -324,25 +346,34 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
     # #[cfg(test)] 블록 범위 감지 (간단한 brace 카운팅)
     test_block_ranges = _find_test_block_ranges(lines)
     # §13.8-J dispatch orchestrator zone 범위 감지
-    exempt_zone_ranges = _find_exempt_zone_ranges(lines)
+    exempt_zone_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER)
+    # §13.8-L backend concrete downcast zone 범위 감지 (marker + EXT-anchored auto)
+    l_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_L)
+    l_auto_ranges = _find_ext_anchor_ranges(lines)
+    # §13.8-N cross-cutting trait/enum usage zone (cross-cutting ↔ L3 trait/enum import)
+    n_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_N)
+    # §13.8-O cross-L3 vocabulary zone (L3↔L3 domain vocabulary: type alias default, public API surface)
+    o_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_O)
+    # §13.8-P cross_backend_bootstrap zone (L1↔L1: cpu_companion / placeholder dependency)
+    p_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_P)
+    l_zone_ranges = (
+        l_marker_ranges + l_auto_ranges + n_marker_ranges + o_marker_ranges + p_marker_ranges
+    )
 
     def in_test_block(lineno: int) -> bool:
-        for start, end in test_block_ranges:
-            if start <= lineno <= end:
-                return True
-        return False
+        return any(s <= lineno <= e for s, e in test_block_ranges)
 
     def in_exempt_zone(lineno: int) -> bool:
-        for start, end in exempt_zone_ranges:
-            if start <= lineno <= end:
-                return True
-        return False
+        return any(s <= lineno <= e for s, e in exempt_zone_ranges)
+
+    def in_l_zone(lineno: int) -> bool:
+        return any(s <= lineno <= e for s, e in l_zone_ranges)
 
     # use crate:: 문 추출
     for i, line in enumerate(lines, 1):
         m = RE_USE_CRATE.match(line)
         if m:
-            results.append((i, m.group(1), in_test_block(i), in_exempt_zone(i)))
+            results.append((i, m.group(1), in_test_block(i), in_exempt_zone(i), in_l_zone(i)))
 
     # use llm_rs2:: 문 추출 (bin/ 파일용) — llm_rs2::foo → crate::foo로 정규화
     for i, line in enumerate(lines, 1):
@@ -350,7 +381,7 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
         if m:
             # llm_rs2:: → crate:: 로 정규화하여 레이어 분류에 사용
             normalized = m.group(1).replace("llm_rs2::", "crate::", 1)
-            results.append((i, normalized, in_test_block(i), in_exempt_zone(i)))
+            results.append((i, normalized, in_test_block(i), in_exempt_zone(i), in_l_zone(i)))
 
     # 인라인 crate:: 참조 추출 (use 문이 아닌 것)
     for i, line in enumerate(lines, 1):
@@ -362,7 +393,7 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
             imp = m.group(1)
             # 최소 2단계 이상의 경로만 (crate::foo 이상)
             if imp.count("::") >= 1:
-                results.append((i, imp, in_test_block(i), in_exempt_zone(i)))
+                results.append((i, imp, in_test_block(i), in_exempt_zone(i), in_l_zone(i)))
 
     return results
 
@@ -375,6 +406,7 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
     ranges = []
     in_test = False
     brace_depth = 0
+    entered_block = False
     start = 0
 
     for i, line in enumerate(lines, 1):
@@ -385,13 +417,20 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
                 in_test = True
                 start = i
                 brace_depth = 0
+                entered_block = False
 
         if in_test:
             brace_depth += stripped.count("{") - stripped.count("}")
-            if brace_depth <= 0 and i > start:
+            if brace_depth > 0:
+                entered_block = True
+            # block에 한 번도 진입하지 않았으면 아직 attribute 행렬을 통과 중
+            # (e.g. `#[cfg(test)] #[allow(...)] mod tests {`).
+            # entered_block True인 상태에서만 종료 판정.
+            if entered_block and brace_depth <= 0 and i > start:
                 ranges.append((start, i))
                 in_test = False
                 brace_depth = 0
+                entered_block = False
 
     return ranges
 
@@ -403,15 +442,22 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
 # ────────────────────────────────────────────────────────────────────
 
 _EXEMPT_MARKER = "// LAYER-EXEMPT: dispatch_orchestrator"
+_EXEMPT_MARKER_L = "// LAYER-EXEMPT: backend_concrete_downcast"
+_EXEMPT_MARKER_N = "// LAYER-EXEMPT: cross_cutting_trait_usage"
+_EXEMPT_MARKER_O = "// LAYER-EXEMPT: cross_l3_vocabulary"
+_EXEMPT_MARKER_P = "// LAYER-EXEMPT: cross_backend_bootstrap"
 _EXEMPT_END_MARKER = "// LAYER-EXEMPT-END"
 
 # fn 시그니처 패턴: `fn name(...) -> ... {` 또는 `fn name(...) {`
 _RE_FN_START = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+\w+')
 
+# §13.8-L EXT-anchored chain 자동 인식 패턴
+_RE_EXT_ANCHOR = re.compile(r'\.get_extension\(crate::backend::EXT_\w+\)')
 
-def _find_exempt_zone_ranges(lines: list[str]) -> list[tuple[int, int]]:
+
+def _find_exempt_zone_ranges(lines: list[str], marker: str = _EXEMPT_MARKER) -> list[tuple[int, int]]:
     """
-    `// LAYER-EXEMPT: dispatch_orchestrator` marker가 표시된 zone의
+    `// LAYER-EXEMPT: <kind>` marker가 표시된 zone의
     (start_line, end_line) 목록을 반환 (1-based 라인 번호, 양 끝 포함).
 
     두 가지 부착 형태 지원:
@@ -435,26 +481,43 @@ def _find_exempt_zone_ranges(lines: list[str]) -> list[tuple[int, int]]:
     while i < n:
         stripped = lines[i].strip()
 
-        if _EXEMPT_MARKER not in stripped:
+        if marker not in stripped:
             i += 1
             continue
 
         marker_lineno = i + 1  # 1-based
 
-        # 다음 줄이 fn 시그니처인지 확인 (함수 형태)
+        # marker 다음의 attribute / doc comment / 빈 줄을 스킵하여 target 코드 라인 찾기.
         next_i = i + 1
+        code_i = next_i
+        while code_i < n:
+            stripped_c = lines[code_i].strip()
+            if (stripped_c.startswith("#[") or stripped_c.startswith("///")
+                    or stripped_c.startswith("//!") or stripped_c == ""):
+                code_i += 1
+                continue
+            break
+
+        # use 문 형태: 1줄 zone
+        if code_i < n and (RE_USE_CRATE.match(lines[code_i]) or RE_USE_LIB.match(lines[code_i])):
+            ranges.append((code_i + 1, code_i + 1))
+            i = code_i + 1
+            continue
+
+        # 다음 줄이 fn 시그니처인지 확인 (함수 형태)
+        next_i = code_i  # fn form 검사 시점도 attribute skip 이후로
         if next_i < n and _RE_FN_START.match(lines[next_i]):
-            # 함수 형태: fn 시그니처 줄부터 `{`를 찾아 zone 시작 확정
-            zone_start = None
+            # 함수 형태: fn 시그니처 줄부터 (시그니처 안의 crate:: 참조도 포함) zone 시작.
+            zone_start = next_i + 1  # 1-based, fn 시그니처 라인
             brace_depth = 0
+            entered_block = False
             j = next_i
             while j < n:
                 seg = lines[j].strip()
                 brace_depth += seg.count("{") - seg.count("}")
-                if "{" in seg and zone_start is None:
-                    zone_start = j + 1  # 1-based, 시그니처 끝 `{` 포함 줄
-                if zone_start is not None and brace_depth <= 0:
-                    # zone = zone_start ~ j+1 (1-based)
+                if brace_depth > 0:
+                    entered_block = True
+                if entered_block and brace_depth <= 0:
                     ranges.append((zone_start, j + 1))
                     i = j + 1
                     break
@@ -492,9 +555,30 @@ def _find_exempt_zone_ranges(lines: list[str]) -> list[tuple[int, int]]:
                 i = next_i
             continue
 
-        # marker가 있지만 위 두 경우에 해당하지 않으면 무시
+        # fall-through: marker 다음 코드 라인 1줄을 zone으로 등록
+        # (struct field / 일반 식별자 등 form 분기 없는 경우)
+        if code_i < n:
+            ranges.append((code_i + 1, code_i + 1))
+            i = code_i + 1
+            continue
+
+        # 더 이상 코드 라인 없음
         i += 1
 
+    return ranges
+
+
+def _find_ext_anchor_ranges(lines: list[str], window: int = 5) -> list[tuple[int, int]]:
+    """
+    §13.8-L (L-auto) — `.get_extension(crate::backend::EXT_*)` chain 라인 ±window 윈도우를
+    자동 화이트리스트 zone으로 등록. anchor 라인의 다음 N줄까지의 backend concrete
+    downcast / instance import를 baseline 제외 대상으로 표시.
+    """
+    ranges: list[tuple[int, int]] = []
+    n = len(lines)
+    for i, line in enumerate(lines, 1):
+        if _RE_EXT_ANCHOR.search(line):
+            ranges.append((max(1, i - 1), min(n, i + window)))
     return ranges
 
 
@@ -627,7 +711,7 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
             src_layer = classify_module(rel_path)
             imports = extract_imports(full_path)
 
-            for lineno, imp, is_test, is_exempt in imports:
+            for lineno, imp, is_test, is_exempt, in_l in imports:
                 # imp에서 정규화된 경로 추출
                 imp_clean = imp.strip()
                 if imp_clean.startswith("crate::"):
@@ -639,7 +723,36 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 # §13.8-J: dispatch_orchestrator zone 안의 L3 import는
                 # INV-LAYER-001 위반에서 제외 (정책 query 함수 호출 한정).
                 # zone 안이면 cross-backend 검사도 건너뜀 (L1→L1 는 zone 범위 밖).
-                if is_exempt and dst_layer in ("L3-pressure", "L3-inference"):
+                if is_exempt and dst_layer in _L3_DOMAINS:
+                    continue
+
+                # §13.8-L: backend_concrete_downcast zone (marker 또는 EXT-anchored
+                # auto chain) 안의 import는 INV-LAYER-003 전체에서 제외.
+                # 적용 범위: L3→L1 backend impl + cross-L3 default initialization
+                # (예: pressure가 qcf concrete unit struct을 default field로 보유).
+                # 본 정책은 marker 단위로 적용되므로 별 sprint(S-C3) trait inversion
+                # 대상과 충돌하지 않음 (의도성 명시 위치만 제외).
+                if in_l and src_layer in _L3_DOMAINS \
+                        and (dst_layer == "L1" or dst_layer in _L3_DOMAINS):
+                    continue
+
+                # §13.8-N: cross_cutting_trait_usage zone — L3 → cross-cutting
+                # (INV-LAYER-003) 및 cross-cutting → L3 (INV-LAYER-004) 양방향 trait/
+                # enum usage 의도성 명시. trait inversion이 이미 적용된 곳 또는
+                # §13.8-F enum-as-data identifier 예외에 해당하는 경우 사용.
+                # (S-D2 확장) L1 backend impl 이 cross-cutting trait 을 impl-only 로
+                # import 하는 경우(예: `GpuSelfMeter`)도 동일 marker 허용.
+                if in_l and (
+                    (src_layer in _L3_DOMAINS and dst_layer in ("observability", "resilience"))
+                    or (src_layer in ("observability", "resilience") and dst_layer in _L3_DOMAINS)
+                    or (src_layer == "L1" and dst_layer in ("observability", "resilience"))
+                ):
+                    continue
+
+                # §13.8-P: cross_backend_bootstrap zone — L1 backend impl이 다른
+                # L1 backend의 singleton/constructor를 cpu_companion 또는 placeholder
+                # dependency용으로 import. INV-LAYER-001 cross-backend 위반 한정 우회.
+                if in_l and src_layer == "L1" and dst_layer == "L1":
                     continue
 
                 # cross-backend 검사
@@ -679,6 +792,12 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 # 데이터 소비자로 import하는 경우 INV-LAYER-001 baseline에서 제외.
                 # (spec/41-invariants.md INV-LAYER-001 비고 참조)
                 if inv_id == "INV-LAYER-001" and is_data_consumer(imp_clean):
+                    continue
+
+                # §13.8-E (S-C2b, 2026-05-24): test block grandfathered exception.
+                # `#[cfg(test)]` 또는 `#[test]` 블록 안의 backend/cross-domain import는
+                # 자동 baseline 제외. INV-LAYER-001/002/003에 공통 적용.
+                if is_test and inv_id in ("INV-LAYER-001", "INV-LAYER-002", "INV-LAYER-003"):
                     continue
 
                 v_id = lookup_v_id(rel_path, imp_clean)

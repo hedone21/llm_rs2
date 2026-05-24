@@ -9,9 +9,10 @@ use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kv_cache::{KVCache, max_cache_pos};
 use crate::qcf::{
-    AggregationMode, QcfActionType, QcfConfig, QcfKvParams, VDataSource, aggregate_heads,
-    compute_c1, compute_d7, compute_qcf_kv, identify_retained_for_action,
+    QcfActionType, QcfKvParams, VDataSource, compute_c1, compute_d7, compute_qcf_kv,
+    identify_retained_for_action,
 };
+use crate::qcf_types::{AggregationMode, QcfConfig, aggregate_heads};
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
 #[derive(Debug, Clone)]
@@ -332,7 +333,7 @@ impl StepHook<KVCache> for EvictionHook {
         // QCF (unified output-error formula). Action picks the simulated retention.
         let qcf_caote = if can_compute_qcf {
             let cache = &caches[0];
-            let v_source = VDataSource::from_kv_cache(cache, v_cpu_bytes.as_deref())
+            let v_source = VDataSource::from_buffer(&cache.v_buffer, v_cpu_bytes.as_deref())
                 .unwrap_or_else(|| {
                     // fallback: treat as F32 (may be incorrect for unknown dtypes)
                     VDataSource::F32(cache.v_buffer.as_slice::<f32>())
@@ -368,7 +369,7 @@ impl StepHook<KVCache> for EvictionHook {
             // D2O simulator (paper Eq.8) needs K for nearest-neighbour
             // matching; other actions ignore `k_source`.
             let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
-                VDataSource::k_from_kv_cache(cache)
+                VDataSource::from_buffer(&cache.k_buffer, None)
             } else {
                 None
             };
@@ -448,13 +449,15 @@ impl StepHook<KVCache> for EvictionHook {
                             continue;
                         }
 
-                        let v_source_l =
-                            match VDataSource::from_kv_cache(cache_l, v_cpu_bytes_l.as_deref()) {
-                                Some(vs) => vs,
-                                None => VDataSource::F32(cache_l.v_buffer.as_slice::<f32>()),
-                            };
+                        let v_source_l = match VDataSource::from_buffer(
+                            &cache_l.v_buffer,
+                            v_cpu_bytes_l.as_deref(),
+                        ) {
+                            Some(vs) => vs,
+                            None => VDataSource::F32(cache_l.v_buffer.as_slice::<f32>()),
+                        };
                         let k_source_l = if self.is_d2o {
-                            VDataSource::k_from_kv_cache(cache_l)
+                            VDataSource::from_buffer(&cache_l.k_buffer, None)
                         } else {
                             None
                         };
@@ -705,7 +708,7 @@ mod tests {
     use super::*;
     use crate::pressure::cache_manager::CacheManager;
     use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
-    use crate::qcf::{QcfConfig, QcfMode};
+    use crate::qcf_types::{QcfConfig, QcfMode};
     use crate::resilience::sys_monitor::{MemoryStats, SystemMonitor};
     use anyhow::Result as AResult;
 

@@ -427,7 +427,7 @@ pub fn run_decode_prologue(ctx: DecodePrologueCtx<'_>) -> anyhow::Result<DecodeP
         #[cfg(feature = "opencl")]
         let _hybrid_scope = {
             use crate::hybrid_attention::{self, HybridAttnSetup};
-            use crate::pressure::kv_cache::KVLayout;
+            use crate::kv_cache_ops::KVLayout;
             match HybridAttnSetup::from_env() {
                 Some(kv_frac) => {
                     let backend_is_opencl = backend.name() == "OpenCL";

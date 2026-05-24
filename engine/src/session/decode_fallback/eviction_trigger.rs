@@ -63,11 +63,13 @@ pub fn run_auto_eviction(ctx: AutoEvictionCtx<'_>) -> anyhow::Result<()> {
         // 1. GPU score acc is active AND
         // 2. Eviction is imminent (score-based at 90% capacity) OR non-score-based with acc
         #[cfg(feature = "opencl")]
+        // COLD-EXT: GPU score sync — eviction 임박 (capacity 90%) 또는 score
+        // accumulator 활성 시점만 진입. per-token 호출 아님.
         if (score_based_eviction && before_len >= capacity * 9 / 10
             || score_accumulator.as_ref().is_some_and(|a| a.is_active()))
             && let Some(ocl_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+                .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
             && let Some(gpu_acc) = ocl_be.gpu_score_acc()
             && gpu_acc.is_active()
         {
@@ -184,10 +186,11 @@ pub fn run_auto_eviction(ctx: AutoEvictionCtx<'_>) -> anyhow::Result<()> {
                 acc.reset();
             }
             // Reset GPU score accumulator after eviction
+            // COLD-EXT: eviction 발생 시점만 진입.
             #[cfg(feature = "opencl")]
             if let Some(ocl_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+                .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
                 && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
                 && gpu_acc.is_active()
             {

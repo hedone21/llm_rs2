@@ -229,6 +229,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 ///
 /// `window_size`: Optional sliding window size. `None` = full causal attention.
 #[allow(clippy::too_many_arguments)]
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path NEON fallback dispatch
 pub fn flash_attention_forward_strided(
     q: &[f32],
     k: &[f32],

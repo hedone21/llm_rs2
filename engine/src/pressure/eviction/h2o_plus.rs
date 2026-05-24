@@ -176,8 +176,8 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
+    use crate::kv_cache_ops::KVLayout;
     use crate::memory::host::shared::SharedBuffer;
-    use crate::pressure::kv_cache::KVLayout;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;

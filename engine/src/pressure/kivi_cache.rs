@@ -17,11 +17,12 @@
 //! CPU-only mode is fully preserved for backward compatibility.
 
 use crate::backend::Backend;
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
+use crate::kv_cache_ops::{KVCacheOps, KVLayout, KiviRawBuffers};
 use crate::memory::Memory;
 use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
-use crate::pressure::kv_cache::{KVCacheOps, KVLayout, KiviRawBuffers};
 use crate::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -196,6 +197,9 @@ pub struct KiviPlanBuffers<'a> {
 /// Set `gpu_backend` to `Some(...)` via `new_gpu()`. GPU buffers hold persistent
 /// residual and attention F32 data. CPU residual vectors are still allocated for
 /// the quantize step (cold path). All hot-path operations dispatch GPU kernels.
+///
+/// S-3b-4: `qcf_computer: Box<dyn QcfComputer>` 는 trait method
+/// `clone_box()` 기반 `impl Clone for Box<dyn QcfComputer>` 으로 Clone 지원.
 #[derive(Clone)]
 pub struct KiviCache {
     /// Current quantization bit-width (2, 4, or 8).
@@ -236,7 +240,7 @@ pub struct KiviCache {
     group_size: usize,
 
     /// Accumulated flush proxy metrics (NMSE). Pushed during `flush_residual()`.
-    flush_proxies: Vec<crate::qcf::QcfMetric>,
+    flush_proxies: Vec<crate::qcf_types::QcfMetric>,
 
     /// Whether AWQE computation is enabled (set via set_awqe_enabled()).
     awqe_enabled: bool,
@@ -269,6 +273,11 @@ pub struct KiviCache {
     gpu_q2k_blocks: usize,
     /// Number of Q2 value blocks written to `gpu_q2v`.
     gpu_q2v_blocks: usize,
+
+    /// QCF flush proxy 계산기 (L2 trait dispatch, S-3b-4 γ-2).
+    /// Default = `KiviQcfComputer` (stateless). caller 가 다른 구현체를
+    /// 주입하려면 `set_qcf_computer` 사용.
+    qcf_computer: Box<dyn crate::qcf_computer::QcfComputer>,
 }
 
 impl KiviCache {
@@ -375,6 +384,8 @@ impl KiviCache {
             gpu_q2v: None,
             gpu_q2k_blocks: 0,
             gpu_q2v_blocks: 0,
+            // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cross-L3 default qcf computer (cold-path one-time init, S-3b-4 trail)
+            qcf_computer: Box::<crate::qcf::KiviQcfComputer>::default(),
         }
     }
 
@@ -389,7 +400,7 @@ impl KiviCache {
     }
 
     /// Take all accumulated flush proxy metrics (NMSE), draining the internal buffer.
-    pub fn take_flush_proxies(&mut self) -> Vec<crate::qcf::QcfMetric> {
+    pub fn take_flush_proxies(&mut self) -> Vec<crate::qcf_types::QcfMetric> {
         std::mem::take(&mut self.flush_proxies)
     }
 
@@ -812,8 +823,8 @@ impl KiviCache {
             let n_groups = self.res_pos / gs;
             let flush_tokens = n_groups * gs;
             if flush_tokens > 0 {
-                let config = crate::qcf::QcfConfig::default();
-                let params = crate::qcf::KiviFlushParams {
+                let config = crate::qcf_types::QcfConfig::default();
+                let params = crate::qcf_types::KiviFlushParams {
                     res_k: &self.res_k,
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
@@ -822,7 +833,7 @@ impl KiviCache {
                     res_cap: self.res_cap,
                     bits: self.bits,
                 };
-                let metric = crate::qcf::compute_flush_nmse(&params, &config);
+                let metric = self.qcf_computer.flush_nmse(&params, &config);
                 return metric.normalized_value.clamp(0.0, 1.0);
             }
         }
@@ -890,8 +901,8 @@ impl KiviCache {
         let flush_tokens = n_groups * gs;
 
         // Compute NMSE proxy before quantization (FP32 originals still available)
-        let qcf_config = crate::qcf::QcfConfig::default();
-        let proxy_params = crate::qcf::KiviFlushParams {
+        let qcf_config = crate::qcf_types::QcfConfig::default();
+        let proxy_params = crate::qcf_types::KiviFlushParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,
@@ -901,9 +912,9 @@ impl KiviCache {
             bits: self.bits,
         };
         self.flush_proxies
-            .push(crate::qcf::compute_flush_nmse(&proxy_params, &qcf_config));
+            .push(self.qcf_computer.flush_nmse(&proxy_params, &qcf_config));
         self.flush_proxies
-            .push(crate::qcf::compute_flush_opr(&proxy_params, &qcf_config));
+            .push(self.qcf_computer.flush_opr(&proxy_params, &qcf_config));
 
         // AWQE: attention-weighted quantization error (V-only)
         if let Some(ref attn) = self.last_attn_scores {
@@ -913,7 +924,7 @@ impl KiviCache {
                 0
             };
             if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
-                let awqe_params = crate::qcf::FlushAttentionParams {
+                let awqe_params = crate::qcf_types::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -928,10 +939,10 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::qcf::compute_flush_awqe(&awqe_params, &qcf_config));
+                    .push(self.qcf_computer.flush_awqe(&awqe_params, &qcf_config));
 
                 // AW-VOPR: attention-weighted vector output perturbation ratio
-                let vopr_params = crate::qcf::FlushAttentionParams {
+                let vopr_params = crate::qcf_types::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -946,7 +957,7 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::qcf::compute_flush_aw_vopr(&vopr_params, &qcf_config));
+                    .push(self.qcf_computer.flush_aw_vopr(&vopr_params, &qcf_config));
             }
         }
 
@@ -1548,78 +1559,83 @@ impl KiviCache {
 
     /// GPU update path: scatter input tokens into GPU residual buffer using
     /// `kivi_gather_update` kernel, flushing when the residual is full.
-    #[allow(unused_variables)]
+    // §13.8-L S-L-3: KiviAttentionBackend trait 으로 OpenCLBackend
+    // downcast 제거. fast path 의 `kivi_gather_update` 2건은 trait method,
+    // slow path 의 `copy_slice` 는 Backend trait 의 일반 메서드라 그대로
+    // dyn dispatch — 함수 내 잔존 downcast/import 0 이므로 marker 제거.
     fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
-        #[cfg(feature = "opencl")]
-        {
-            use crate::backend::opencl::OpenCLBackend;
+        let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
+        let kivi_be = backend_arc
+            .as_kivi_attention()
+            .ok_or_else(|| anyhow::anyhow!("GPU mode requires a KIVI-capable backend"))?;
 
-            let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
-            let ocl = backend_arc
-                .as_any()
-                .downcast_ref::<OpenCLBackend>()
-                .ok_or_else(|| anyhow::anyhow!("GPU mode requires OpenCLBackend"))?;
+        let mut written = 0usize;
+        while written < seq_len {
+            if self.res_pos >= self.res_cap {
+                self.flush_residual_gpu()?;
+            }
+            // How many tokens we can write in this batch without overflow
+            let batch = (seq_len - written).min(self.res_cap - self.res_pos);
 
-            let mut written = 0usize;
-            while written < seq_len {
-                if self.res_pos >= self.res_cap {
-                    self.flush_residual_gpu()?;
-                }
-                // How many tokens we can write in this batch without overflow
-                let batch = (seq_len - written).min(self.res_cap - self.res_pos);
-
-                // We need to call the kernel for the [written..written+batch] slice of new_k/v.
-                // The kernel signature is: input[seq_len, kv_heads, head_dim] → residual[kv_heads, res_cap, head_dim]
-                // But our input tensor contains all seq_len tokens; we need a view of [batch] tokens starting at `written`.
-                // Since GPU tensors may not support views, we create a lightweight wrapper pointing into the same buffer.
-                // SAFETY: We rely on the kernel only reading `seq_len` tokens from the start of the input buffer.
-                // To avoid GPU sub-buffer complexity, if written==0 and batch==seq_len we pass as-is.
-                // Otherwise, we fall back to the CPU copy_slice approach per token.
-                if written == 0 && batch == seq_len {
-                    // Fast path: pass entire input at once
+            // We need to call the kernel for the [written..written+batch] slice of new_k/v.
+            // The kernel signature is: input[seq_len, kv_heads, head_dim] → residual[kv_heads, res_cap, head_dim]
+            // But our input tensor contains all seq_len tokens; we need a view of [batch] tokens starting at `written`.
+            // Since GPU tensors may not support views, we create a lightweight wrapper pointing into the same buffer.
+            // SAFETY: We rely on the kernel only reading `seq_len` tokens from the start of the input buffer.
+            // To avoid GPU sub-buffer complexity, if written==0 and batch==seq_len we pass as-is.
+            // Otherwise, we fall back to the CPU copy_slice approach per token.
+            if written == 0 && batch == seq_len {
+                // Fast path: pass entire input at once
+                let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
+                let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
+                kivi_be.kivi_gather_update(
+                    new_k,
+                    gpu_res_k,
+                    self.kv_heads,
+                    self.res_cap,
+                    self.head_dim,
+                    batch,
+                    self.res_pos,
+                )?;
+                kivi_be.kivi_gather_update(
+                    new_v,
+                    gpu_res_v,
+                    self.kv_heads,
+                    self.res_cap,
+                    self.head_dim,
+                    batch,
+                    self.res_pos,
+                )?;
+            } else {
+                // Slow path: token-by-token copy_slice for the sub-range
+                for s in written..written + batch {
                     let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
                     let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
-                    ocl.kivi_gather_update(
-                        new_k,
-                        gpu_res_k,
-                        self.kv_heads,
-                        self.res_cap,
-                        self.head_dim,
-                        batch,
-                        self.res_pos,
-                    )?;
-                    ocl.kivi_gather_update(
-                        new_v,
-                        gpu_res_v,
-                        self.kv_heads,
-                        self.res_cap,
-                        self.head_dim,
-                        batch,
-                        self.res_pos,
-                    )?;
-                } else {
-                    // Slow path: token-by-token copy_slice for the sub-range
-                    for s in written..written + batch {
-                        let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
-                        let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
-                        for h in 0..self.kv_heads {
-                            let src_off = s * self.kv_heads * self.head_dim + h * self.head_dim;
-                            let dst_off = h * self.res_cap * self.head_dim
-                                + (self.res_pos + (s - written)) * self.head_dim;
-                            ocl.copy_slice(new_k, gpu_res_k, src_off, dst_off, self.head_dim)?;
-                            ocl.copy_slice(new_v, gpu_res_v, src_off, dst_off, self.head_dim)?;
-                        }
+                    for h in 0..self.kv_heads {
+                        let src_off = s * self.kv_heads * self.head_dim + h * self.head_dim;
+                        let dst_off = h * self.res_cap * self.head_dim
+                            + (self.res_pos + (s - written)) * self.head_dim;
+                        backend_arc.copy_slice(
+                            new_k,
+                            gpu_res_k,
+                            src_off,
+                            dst_off,
+                            self.head_dim,
+                        )?;
+                        backend_arc.copy_slice(
+                            new_v,
+                            gpu_res_v,
+                            src_off,
+                            dst_off,
+                            self.head_dim,
+                        )?;
                     }
                 }
-                self.res_pos += batch;
-                written += batch;
             }
-            return Ok(());
+            self.res_pos += batch;
+            written += batch;
         }
-        #[allow(unreachable_code)]
-        Err(anyhow::anyhow!(
-            "update_gpu called but opencl feature not enabled"
-        ))
+        Ok(())
     }
 
     /// GPU flush: read GPU residual → CPU quantize → upload Q2 blocks to GPU →
@@ -1656,8 +1672,8 @@ impl KiviCache {
         }
 
         // 2. Compute QCF proxy metrics (same as CPU path)
-        let qcf_config = crate::qcf::QcfConfig::default();
-        let proxy_params = crate::qcf::KiviFlushParams {
+        let qcf_config = crate::qcf_types::QcfConfig::default();
+        let proxy_params = crate::qcf_types::KiviFlushParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,
@@ -1667,9 +1683,9 @@ impl KiviCache {
             bits: self.bits,
         };
         self.flush_proxies
-            .push(crate::qcf::compute_flush_nmse(&proxy_params, &qcf_config));
+            .push(self.qcf_computer.flush_nmse(&proxy_params, &qcf_config));
         self.flush_proxies
-            .push(crate::qcf::compute_flush_opr(&proxy_params, &qcf_config));
+            .push(self.qcf_computer.flush_opr(&proxy_params, &qcf_config));
 
         // AWQE (same logic as CPU flush_residual)
         if let Some(ref attn) = self.last_attn_scores {
@@ -1679,7 +1695,7 @@ impl KiviCache {
                 0
             };
             if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
-                let awqe_params = crate::qcf::FlushAttentionParams {
+                let awqe_params = crate::qcf_types::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -1694,10 +1710,10 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::qcf::compute_flush_awqe(&awqe_params, &qcf_config));
+                    .push(self.qcf_computer.flush_awqe(&awqe_params, &qcf_config));
 
                 // AW-VOPR: attention-weighted vector output perturbation ratio
-                let vopr_params = crate::qcf::FlushAttentionParams {
+                let vopr_params = crate::qcf_types::FlushAttentionParams {
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
                     head_dim: self.head_dim,
@@ -1712,7 +1728,7 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::qcf::compute_flush_aw_vopr(&vopr_params, &qcf_config));
+                    .push(self.qcf_computer.flush_aw_vopr(&vopr_params, &qcf_config));
             }
         }
 
@@ -1796,6 +1812,7 @@ impl KiviCache {
     /// `n_groups`: number of key groups (= flush_tokens / group_size)
     /// `tok_base`: token offset in the attention buffer for this flush
     /// `tmp_qk`/`tmp_qv`: temporary quantized blocks (not stored in self.qk/qv in GPU mode)
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI flush upload
     fn upload_and_dequant_flush_with(
         &mut self,
         flush_tokens: usize,
@@ -2092,6 +2109,7 @@ impl KiviCache {
     /// - `q2_deq_tokens` is kept in sync with `q2_tokens` during `flush_residual_gpu`,
     ///   so no incremental dequant is needed here.
     /// - Residual scatter: uses `kivi_scatter_residual` kernel (always re-done each call).
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI view assemble
     fn assemble_view_gpu(&mut self) -> Result<()> {
         // Defensive: ensure attn buffers can hold q2_tokens + res_pos
         let needed = self.q2_tokens + self.res_pos;
@@ -2393,6 +2411,7 @@ impl KVCacheOps for KiviCache {
         self.res_pos >= self.res_cap
     }
 
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path KIVI flush check
     fn flush_if_needed(&mut self) -> Result<bool> {
         if self.res_pos >= self.res_cap {
             if self.gpu_backend.is_some() {
@@ -2766,7 +2785,8 @@ mod tests {
     /// Data pattern: sin-based low-rank structure (realistic for attention KV).
     #[test]
     fn test_compare_kivi_vs_baseline() {
-        use crate::pressure::kv_cache::{KVCache, KVCacheOps};
+        use crate::kv_cache_ops::KVCacheOps;
+        use crate::pressure::kv_cache::KVCache;
 
         let kv_heads = 8;
         let head_dim = 64;
@@ -3396,7 +3416,7 @@ mod tests {
     /// Test 13: needs_attn_scores() mirrors awqe_enabled.
     #[test]
     fn test_kivi_needs_attn_scores() {
-        use crate::pressure::kv_cache::KVCacheOps;
+        use crate::kv_cache_ops::KVCacheOps;
 
         let mut cache = KiviCache::new(1, 32, 256, 32);
 

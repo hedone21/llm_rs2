@@ -748,8 +748,9 @@ pub(crate) fn try_promote_auf_self_secondary_to_rpcmem(
 
     #[cfg(all(feature = "qnn", target_os = "android"))]
     {
+        // COLD-EXT: AUF self-secondary loader path.
         let qnn = backend
-            .as_any()
+            .get_extension(crate::backend::EXT_QNN_OPPKG)?
             .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>()?;
         let runtime = qnn.runtime_arc();
         let rpcmem_fns = runtime.rpcmem_fns();
@@ -789,9 +790,10 @@ fn try_open_rpcmem_secondary(
 ) -> Result<SecondaryMmap, LoadError> {
     #[cfg(all(feature = "qnn", target_os = "android"))]
     {
+        // COLD-EXT: GGUF secondary loader path.
         let qnn = backend
-            .as_any()
-            .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>()
+            .get_extension(crate::backend::EXT_QNN_OPPKG)
+            .and_then(|a| a.downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>())
             .ok_or_else(|| LoadError::SecondaryUnavailable {
                 path: path.to_path_buf(),
                 source: anyhow::anyhow!(

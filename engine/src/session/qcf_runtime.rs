@@ -11,7 +11,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::backend::Backend;
-use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
@@ -139,7 +138,7 @@ pub struct QcfWarmupConfig<'a> {
     pub force_ratio: Option<f32>,
     pub swap_algorithm: crate::models::weights::SwapAlgorithm,
     pub execute_swap: bool,
-    pub importance_formula: crate::qcf::ImportanceFormula,
+    pub importance_formula: crate::qcf_types::ImportanceFormula,
     pub importance_three_way: bool,
     pub swap_only_layers: Option<&'a [usize]>,
     pub decode_x_steps: usize,
@@ -199,7 +198,7 @@ pub fn run_qcf_warmup_workflow(
         let cpu_warmup = Tensor::new(
             Shape::new(vec![1, actual_warmup_len]),
             warmup_buf,
-            Arc::new(CpuBackend::new()),
+            cpu_backend.clone(),
         );
         let warmup_input = backend.copy_from(&cpu_warmup)?;
 
@@ -234,8 +233,7 @@ pub fn run_qcf_warmup_workflow(
         // Read the argmax of the last token's logits — first decode-step input.
         last_token_logits_argmax = if decode_x_steps > 0 {
             // Copy the final `[vocab_size]` slice of warmup_logits to host.
-            let cpu_back: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-            let host_logits = cpu_back.copy_from(&warmup_logits)?;
+            let host_logits = cpu_backend.copy_from(&warmup_logits)?;
             let last_offset = (actual_warmup_len - 1) * vocab_size;
             let host_data = unsafe {
                 std::slice::from_raw_parts(
@@ -276,12 +274,11 @@ pub fn run_qcf_warmup_workflow(
             );
 
             let mut collector_decode = ImportanceCollector::new_with_formula(
-                crate::qcf::ImportanceFormula::DirectAttn,
+                crate::qcf_types::ImportanceFormula::DirectAttn,
                 false,
             );
 
             let mut next_tok: u32 = last_token_logits_argmax;
-            let cpu_back: Arc<dyn Backend> = Arc::new(CpuBackend::new());
 
             for step in 0..decode_x_steps {
                 let decode_buf = Galloc::new().alloc(4, DType::U8)?;
@@ -289,11 +286,8 @@ pub fn run_qcf_warmup_workflow(
                     let ptr = decode_buf.as_mut_ptr() as *mut u32;
                     *ptr = next_tok;
                 }
-                let cpu_decode = Tensor::new(
-                    Shape::new(vec![1, 1]),
-                    decode_buf,
-                    Arc::new(CpuBackend::new()),
-                );
+                let cpu_decode =
+                    Tensor::new(Shape::new(vec![1, 1]), decode_buf, cpu_backend.clone());
                 let decode_input = backend.copy_from(&cpu_decode)?;
 
                 let decode_logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
@@ -325,7 +319,7 @@ pub fn run_qcf_warmup_workflow(
                 backend.synchronize()?;
 
                 // argmax for next decode step
-                let host_logits = cpu_back.copy_from(&decode_logits)?;
+                let host_logits = cpu_backend.copy_from(&decode_logits)?;
                 let host_data = unsafe {
                     std::slice::from_raw_parts(
                         host_logits.buffer().as_ptr() as *const f32,
@@ -387,7 +381,7 @@ pub fn run_qcf_warmup_workflow(
     // ── Build ImportanceTable (+ optional DP-LLM ε variants) + reset KV cache ────
     let direct_attn_primary = matches!(
         importance_formula,
-        crate::qcf::ImportanceFormula::DirectAttn
+        crate::qcf_types::ImportanceFormula::DirectAttn
     );
     let cache_raw = importance_three_way || direct_attn_primary;
     let mut direct_attn_f5_decode_only: Option<Vec<f32>> = None;
@@ -678,7 +672,7 @@ pub fn dispatch_swap_weights(
     model: &crate::models::transformer::TransformerModel,
     ratio: f32,
     target_dtype: llm_shared::DtypeTag,
-    importance_table: Option<&crate::qcf::ImportanceTable>,
+    importance_table: Option<&dyn crate::qcf_collector::ImportanceLookup>,
     decode_token_index: usize,
     swap_plan_out: &mut Option<crate::models::weights::IncrementalSwapPlan>,
     manager_report_out: &mut Option<(f32, usize, std::time::Instant, f32)>,

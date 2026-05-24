@@ -224,6 +224,7 @@ impl StageBreakdown {
     ///
     /// Example:
     /// `prefault=12.3ms mmap_permute=123.4ms arc_swap=0.1ms madvise=0.2ms synchronize=0.5ms soa_reconvert=45.6ms gen_bump=0.1ms`
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path stage log formatter
     pub fn to_log_line(&self) -> String {
         format!(
             "prefault={:.1}ms mmap_permute={:.1}ms arc_swap={:.1}ms madvise={:.1}ms \
@@ -288,6 +289,7 @@ pub struct SwapExecutor<'a> {
     /// path is unchanged — that path is already zero-copy by construction.
     /// `None` (default) → behaviour identical to the pre-Stage-3 baseline.
     /// Plan: `compiled-chasing-hopper.md` Direction A track, Stage 3.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path pool field
     #[cfg(feature = "opencl")]
     pub host_ptr_pool: Option<Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>>,
 
@@ -370,6 +372,7 @@ impl<'a> SwapExecutor<'a> {
     /// Direction A track, Stage 3. Setting this on a CPU executor is a
     /// no-op (the AOS path skips the pool when `is_cpu`).
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path pool injection
     pub fn with_host_ptr_pool(
         mut self,
         pool: Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>,
@@ -1574,6 +1577,7 @@ impl<'a> SwapExecutor<'a> {
     /// The AUF SOA fast path is deliberately skipped here — `enqueue_write_async`
     /// targets the AOS path for the prototype and AUF SOA registration is
     /// handled synchronously in Stage (d). Production quality may revisit this.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path swap materialise
     fn materialise_cpu_tensor(
         &self,
         secondary: &Arc<SecondaryMmap>,
@@ -1707,14 +1711,16 @@ impl<'a> SwapExecutor<'a> {
         // `Arc::clone(secondary)` (whole store) + `alias.region` (this
         // layer's rpcmem allocation), both moved into the alias buffer per
         // `Backend::alloc_alias_weight_buffer` contract.
+        let secondary_dyn: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
+        let region_dyn: Arc<dyn crate::memory::secondary::RpcmemRegionGuard> = alias.region;
         let buf = unsafe {
             self.backend.alloc_alias_weight_buffer(
                 alias.host_ptr,
                 alias.offset,
                 alias.len,
                 alias.dtype,
-                Arc::clone(secondary),
-                alias.region,
+                secondary_dyn,
+                region_dyn,
             )
         }
         .map_err(|e| SwapError::BufferAllocationFailed {
@@ -1862,6 +1868,7 @@ impl<'a> SwapExecutor<'a> {
 
     /// Materialise one weight tensor from the secondary mmap, applying Q/K
     /// row permutation when `subname` identifies a Llama Q/K weight.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path swap materialise (full)
     fn materialise_tensor(
         &self,
         secondary: &Arc<SecondaryMmap>,
@@ -2143,6 +2150,7 @@ impl<'a> SwapExecutor<'a> {
     /// guard so callers analysing buffer lifetimes see the same shape as the
     /// `BorrowedMmapBuffer` path.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path pool materialise
     fn try_pool_materialise(
         &self,
         secondary: &Arc<SecondaryMmap>,
@@ -2227,7 +2235,7 @@ impl<'a> SwapExecutor<'a> {
         let dtype = cpu_tensor.dtype();
         let mmap_guard: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
         let buf: Arc<dyn crate::buffer::Buffer> = Arc::new(
-            crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
+            crate::backend::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
                 guard,
                 size,
                 dtype,
@@ -2412,6 +2420,7 @@ pub fn record_swap_release_pub(backend: &Arc<dyn Backend>, count: usize, bytes: 
     record_swap_release(backend, count, bytes);
 }
 
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path swap counter
 fn record_swap_release(backend: &Arc<dyn Backend>, count: usize, bytes: usize) {
     if count == 0 {
         return;
@@ -2744,6 +2753,7 @@ pub(crate) fn build_layer_via_pool_standalone(
     ))
 }
 
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path standalone materialise
 fn materialise_cpu_tensor_standalone(
     secondary: &Arc<SecondaryMmap>,
     layer_idx: usize,
@@ -2863,14 +2873,16 @@ fn try_alias_materialise_standalone(
     // (whole store) + `alias.region` (this layer's rpcmem allocation), both
     // moved into the alias buffer per `Backend::alloc_alias_weight_buffer`
     // contract.
+    let secondary_dyn: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
+    let region_dyn: Arc<dyn crate::memory::secondary::RpcmemRegionGuard> = alias.region;
     let buf = unsafe {
         backend.alloc_alias_weight_buffer(
             alias.host_ptr,
             alias.offset,
             alias.len,
             alias.dtype,
-            Arc::clone(secondary),
-            alias.region,
+            secondary_dyn,
+            region_dyn,
         )
     }
     .map_err(|e| SwapError::BufferAllocationFailed {

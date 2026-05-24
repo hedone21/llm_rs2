@@ -18,8 +18,11 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::memory::Memory;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O ModelConfig (§F enum-as-data identifier 후보, shared/ L2 격상 backlog)
 use crate::models::config::ModelConfig;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O weight swap orchestrator (WeightSwapHandler models/weights 이전 backlog)
 use crate::models::weights::swap_executor::SwapExecutor;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O weight slot/secondary handle
 use crate::models::weights::{LayerSlot, SecondaryMmap};
 
 use super::ActionResult;

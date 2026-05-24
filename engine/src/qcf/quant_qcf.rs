@@ -3,7 +3,9 @@
 //! NMSE = MSE(X, X') / Var(X) where X' = dequantize(quantize(X)).
 //! Computed inline during residual buffer flush when FP32 originals are available.
 
-use super::{QcfConfig, QcfMetric, aggregate_heads};
+use crate::qcf_types::{
+    FlushAttentionParams, KiviFlushParams, QcfConfig, QcfMetric, aggregate_heads,
+};
 use crate::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 
 /// Compute NMSE for a single quantization group of QKKV (32) values.
@@ -46,17 +48,6 @@ pub fn compute_nmse_block(original: &[f32; QKKV], bits: u8, epsilon: f32) -> f32
         / QKKV as f32;
 
     (mse / var).clamp(0.0, 1.0)
-}
-
-/// Parameters for flush proxy computation.
-pub struct KiviFlushParams<'a> {
-    pub res_k: &'a [f32],
-    pub res_v: &'a [f32],
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    pub flush_tokens: usize,
-    pub res_cap: usize,
-    pub bits: u8,
 }
 
 /// Compute flush proxy from FP32 residual key/value buffers.
@@ -280,37 +271,6 @@ pub fn compute_flush_opr(params: &KiviFlushParams, _config: &QcfConfig) -> QcfMe
         per_head: Some(per_head_opr),
         tokens_affected: flush_tokens,
     }
-}
-
-/// Parameters for attention-weighted V-quantization error metrics.
-///
-/// Shared between [`compute_flush_awqe`] (scalar AWQE) and
-/// [`compute_flush_aw_vopr`] (vector AW-VOPR): same V residual, same attention
-/// scores, same GQA layout — only the aggregation differs.
-pub struct FlushAttentionParams<'a> {
-    /// V residual (FP32 originals, about to be quantized).
-    /// Layout: `[kv_heads][res_cap][head_dim]`.
-    pub res_v: &'a [f32],
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    /// Tokens being flushed (always multiple of QKKV).
-    pub flush_tokens: usize,
-    pub res_cap: usize,
-    pub bits: u8,
-
-    /// Post-softmax attention scores from the previous decode step.
-    /// Layout: `[n_heads_q * scores_stride]`.
-    pub attn_scores: &'a [f32],
-    pub n_heads_q: usize,
-    /// Spacing between Q heads in attn_scores (= max_seq_len allocation).
-    pub scores_stride: usize,
-    /// `n_heads_q / kv_heads`: number of Q heads per KV head.
-    pub gqa_group_size: usize,
-
-    /// Cache position of the first flush token (= q2_tokens before flush).
-    pub flush_cache_start: usize,
-    /// Number of valid positions per head in attn_scores (= effective_cache_len at snapshot).
-    pub scores_valid_len: usize,
 }
 
 /// Compute AWQE: Σ_t α_{kv_h,t} · ε_{kv_h,t} for each KV head.
@@ -543,6 +503,38 @@ pub fn compute_flush_aw_vopr(params: &FlushAttentionParams, config: &QcfConfig) 
         normalized_value: raw_value,
         per_head: Some(per_head_vopr),
         tokens_affected: flush_tokens,
+    }
+}
+
+// ── QcfComputer trait impl (S-3b-4 trait inversion) ─────────────────
+
+/// Stateless KIVI flush proxy 계산기.
+///
+/// `QcfComputer` trait 의 4 메서드를 본 모듈의 자유 함수 4개로 위임.
+/// pressure/kivi_cache 가 `&dyn QcfComputer` 로 의존하여 L3-pressure →
+/// L3-qcf cross-domain concrete import 를 제거한다.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KiviQcfComputer;
+
+impl crate::qcf_computer::QcfComputer for KiviQcfComputer {
+    fn flush_nmse(&self, params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric {
+        compute_flush_nmse(params, config)
+    }
+
+    fn flush_opr(&self, params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric {
+        compute_flush_opr(params, config)
+    }
+
+    fn flush_awqe(&self, params: &FlushAttentionParams, config: &QcfConfig) -> QcfMetric {
+        compute_flush_awqe(params, config)
+    }
+
+    fn flush_aw_vopr(&self, params: &FlushAttentionParams, config: &QcfConfig) -> QcfMetric {
+        compute_flush_aw_vopr(params, config)
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::qcf_computer::QcfComputer> {
+        Box::new(*self)
     }
 }
 

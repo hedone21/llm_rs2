@@ -18,6 +18,7 @@ use self::gpu_self_meter::OpenClEventGpuMeter;
 pub mod gpu_score;
 pub mod gpu_self_meter;
 pub mod host_ptr_pool;
+pub mod host_ptr_pool_buffer;
 pub mod memory;
 pub mod plan;
 
@@ -148,7 +149,7 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // CL_MEM_ALLOC_HOST_PTR, filled via map/memcpy/unmap before use).
     if let Some(pp) = buf
         .as_any()
-        .downcast_ref::<crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>()
+        .downcast_ref::<crate::backend::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>()
     {
         return pp
             .cl_mem()
@@ -186,7 +187,7 @@ pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
         "SliceBuffer"
     } else if any.is::<crate::memory::host::mmap::MmapBuffer>() {
         "MmapBuffer"
-    } else if any.is::<crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
+    } else if any.is::<crate::backend::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
         "HostPtrPool"
     } else {
         "Unknown"
@@ -1535,10 +1536,10 @@ impl OpenCLBackend {
             // `swap_context_or_init()` / `swap_queue_or_init()`.
             swap_context: std::sync::OnceLock::new(),
             swap_queue: std::sync::OnceLock::new(),
-            // B-5b Phase 2 Stage 1: own a CPU companion for Stage 2 host
-            // fallback routing. `CpuBackend::new()` returns `Self` (not
-            // `Result`) on every target arch, so this is infallible.
-            cpu_companion: Arc::new(crate::backend::cpu::CpuBackend::new()),
+            // CPU companion for host fallback routing (S-2 sprint
+            // 2026-05-24): shared singleton — feature detection runs once.
+            // LAYER-EXEMPT: cross_backend_bootstrap — §13.8-P cpu_companion init.
+            cpu_companion: crate::backend::cpu::cpu_singleton(),
         })
     }
 
@@ -4664,6 +4665,33 @@ impl Backend for OpenCLBackend {
         self
     }
 
+    // §13.8-L S-L-1: Profile hook trait methods — inherent impl 으로 위임.
+    fn profile_events_enabled(&self) -> bool {
+        self.profile_events_enabled
+    }
+    fn set_op_label(&self, label: &'static str) {
+        Self::set_op_label(self, label)
+    }
+    fn clear_op_label(&self) {
+        Self::clear_op_label(self)
+    }
+
+    // §13.8-L S-L-2: GpuScoreAccess trait method — inherent impl 으로 위임.
+    // `&self -> &mut dyn` 패턴은 inherent `gpu_score_acc_mut` 의
+    // UnsafeCell-backed 구현을 trait 으로 노출 (single-threaded 가정).
+    fn gpu_score_acc(&self) -> Option<&dyn crate::backend::GpuScoreAccess> {
+        Self::gpu_score_acc(self).map(|s| s as &dyn crate::backend::GpuScoreAccess)
+    }
+    fn gpu_score_acc_mut(&self) -> Option<&mut dyn crate::backend::GpuScoreAccess> {
+        Self::gpu_score_acc_mut(self).map(|s| s as &mut dyn crate::backend::GpuScoreAccess)
+    }
+
+    // §13.8-L S-L-3: KiviAttentionBackend trait expose — OpenCL backend
+    // 만 활성. 그 외 backend 는 Backend trait default `None`.
+    fn as_kivi_attention(&self) -> Option<&dyn crate::backend::KiviAttentionBackend> {
+        Some(self as &dyn crate::backend::KiviAttentionBackend)
+    }
+
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
         let buf =
             get_cl_mem(t.buffer().as_ref()).map_err(|_| anyhow::anyhow!("Not OpenCL buffer"))?;
@@ -5238,6 +5266,8 @@ impl Backend for OpenCLBackend {
         // The forward path ignores `Tensor::backend()` for OpenCL dispatch —
         // it operates through `Backend::matmul_*` on the `LayerWeights`'
         // outer backend Arc. The cl_mem path does not consult tensor.backend.
+        // placeholder Tensor용 CPU backend Arc; forward는 본 backend Arc 미참조.
+        // LAYER-EXEMPT: cross_backend_bootstrap
         let cpu_be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
         Ok(Some(Tensor::new(shape, placeholder, cpu_be)))
     }
@@ -5304,8 +5334,8 @@ impl Backend for OpenCLBackend {
         offset: usize,
         size: usize,
         dtype: DType,
-        secondary_arc: std::sync::Arc<crate::models::weights::SecondaryMmap>,
-        layer_region: std::sync::Arc<crate::models::weights::rpcmem_secondary::RpcmemLayerRegion>,
+        secondary_arc: std::sync::Arc<dyn crate::memory::host::mmap::MmapKeepAlive>,
+        layer_region: std::sync::Arc<dyn crate::memory::secondary::RpcmemRegionGuard>,
     ) -> Result<Option<std::sync::Arc<dyn crate::buffer::Buffer>>> {
         if size == 0 || host_ptr.is_null() {
             return Ok(None);
@@ -6586,9 +6616,19 @@ impl Backend for OpenCLBackend {
         &*self.cpu_companion
     }
 
-    // B-5b Phase 2 Stage 2-B: intra-token GPU yield hook routed through trait.
-    fn yield_after_layer(&self, layer: usize, is_decode: bool) {
-        crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
+    // yield_after_layer: trait default body (S-2 sprint 2026-05-24).
+
+    // COLD-EXT: backend handle 노출 — qnn_oppkg swap path / secondary_mmap
+    // loader / transformer loader 에서 `downcast_ref::<OpenCLBackend>()` 를
+    // 대체하기 위한 string-keyed lookup. 자세한 정책은 `Backend::get_extension`
+    // rustdoc + `arch/sprint_backend_extension_round.md` R-EXT-1 참조.
+    fn get_extension(&self, name: &str) -> Option<&dyn std::any::Any> {
+        match name {
+            crate::backend::EXT_OPENCL_QUEUE | crate::backend::EXT_OPENCL_SECONDARY => {
+                Some(self as &dyn std::any::Any)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -7062,6 +7102,73 @@ impl OpenCLBackend {
             8 => kernels.kernel_attn_gen_kivi_q8.is_some(),
             _ => false,
         }
+    }
+}
+
+// §13.8-L S-L-3: KIVI native attention trait impl — 모두 OpenCLBackend
+// 의 inherent method 로 위임. `as_kivi_attention` 이 `Some(&self as &dyn
+// KiviAttentionBackend)` 를 반환하므로 caller 는 backend trait method 만
+// 사용해 downcast 가 사라진다.
+impl crate::backend::KiviAttentionBackend for OpenCLBackend {
+    fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
+        Self::has_kivi_attn_kernel(self, bits)
+    }
+
+    fn is_nosub_device(&self) -> bool {
+        Self::is_nosub(self)
+    }
+
+    fn attention_gen_kivi(
+        &self,
+        q: &Tensor,
+        qk_buf: &Tensor,
+        qv_buf: &Tensor,
+        res_k: &Tensor,
+        res_v: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        q_tokens: usize,
+        res_tokens: usize,
+        res_cap: usize,
+        scale: f32,
+        scores_out: Option<&mut [f32]>,
+        bits: u8,
+    ) -> Result<()> {
+        Self::attention_gen_kivi(
+            self,
+            q,
+            qk_buf,
+            qv_buf,
+            res_k,
+            res_v,
+            out,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            q_tokens,
+            res_tokens,
+            res_cap,
+            scale,
+            scores_out,
+            bits,
+        )
+    }
+
+    fn kivi_gather_update(
+        &self,
+        input: &Tensor,
+        residual: &mut Tensor,
+        kv_heads: usize,
+        res_cap: usize,
+        head_dim: usize,
+        seq_len: usize,
+        res_pos: usize,
+    ) -> Result<()> {
+        Self::kivi_gather_update(
+            self, input, residual, kv_heads, res_cap, head_dim, seq_len, res_pos,
+        )
     }
 }
 

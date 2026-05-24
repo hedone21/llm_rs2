@@ -248,7 +248,7 @@ pub fn run_kivi_ppl(
     residual_size: usize,
     text_file: &str,
 ) -> anyhow::Result<()> {
-    use crate::pressure::kv_cache::KVCacheOps;
+    use crate::kv_cache_ops::KVCacheOps;
 
     let hidden_size = model.config.hidden_size;
     let vocab_size = model.config.vocab_size;
@@ -1024,10 +1024,8 @@ pub fn run_ppl(
                         && let Some(acc) = score_accumulator.as_ref()
                         && let Some(head_attn) = acc.last_step_head_attn()
                     {
-                        use crate::qcf::{
-                            AggregationMode, QcfActionType, QcfKvParams, VDataSource,
-                            compute_qcf_kv,
-                        };
+                        use crate::qcf::{QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
+                        use crate::qcf_types::AggregationMode;
                         let target_len = ((before_len as f32) * ratio) as usize;
                         let cache = &kv_caches[0];
                         let v_cpu_bytes: Option<&[u8]> = v_cpu_data.as_deref().map(|s| {
@@ -1048,7 +1046,7 @@ pub fn run_ppl(
                         } else {
                             QcfActionType::EvictSliding { target_len }
                         };
-                        match VDataSource::from_kv_cache(cache, v_cpu_bytes) {
+                        match VDataSource::from_buffer(&cache.v_buffer, v_cpu_bytes) {
                             Some(v_source) => {
                                 let params = QcfKvParams {
                                     action,

@@ -4,18 +4,22 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::buffer::{Buffer, DType};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::kv_cache_ops::KVCacheOps;
 use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
 use crate::memory::Memory;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
-use crate::pressure::kv_cache::{KVCache, KVCacheOps};
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type alias default + concrete kv_caches slice signature
+use crate::pressure::kv_cache::KVCache;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O preload thread pool (L2 격상 backlog)
 use crate::pressure::offload::preload_pool::{self, PreloadPool};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
 #[cfg(feature = "opencl")]
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::opencl::plan::FullKernelPlan;
 
 /// Returns true if this layer uses local (sliding window) attention.
@@ -35,6 +39,7 @@ fn is_local_layer(layer_idx: usize, pattern: Option<usize>) -> bool {
 /// lm_head (and any other op the caller knows about).
 #[inline]
 #[allow(unused_variables)]
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path op label routing
 fn with_op_label<F, T>(backend: &Arc<dyn Backend>, label: &'static str, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
@@ -160,14 +165,15 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Optional importance collector for Layer Skip QCF.
     /// When provided during prefill, captures per-layer cosine similarity.
-    pub importance_collector: Option<&'a mut crate::qcf::ImportanceCollector>,
+    /// Uses L2 `ImportanceCollect` trait (§13.8-G + INV-LAYER-003 trait inversion).
+    pub importance_collector: Option<&'a mut dyn crate::qcf_collector::ImportanceCollect>,
     /// When true, only compute logits for the last sequence position.
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
     pub logits_last_only: bool,
     /// Optional D2O variance collector for layer-level allocation.
     /// When provided during prefill, captures per-layer attention column-sums.
-    pub variance_collector: Option<&'a mut crate::pressure::d2o_layer_alloc::D2OVarianceCollector>,
+    pub variance_collector: Option<&'a mut dyn crate::qcf_collector::VarianceObserver>,
     /// Optional layer boundary hook (LISWAP-4 / ENG-ALG-235).
     ///
     /// When `Some`, `forward_into` calls `hook.on_layer_boundary(idx, seq_len)`
@@ -365,6 +371,7 @@ impl TransformerModel {
     ///
     /// Returns the number of tensors migrated.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path GPU migration
     pub fn migrate_weights_to_gpu(
         &mut self,
         _gpu_mem: &dyn Memory,
@@ -372,9 +379,10 @@ impl TransformerModel {
     ) -> Result<usize> {
         let mut count = 0;
         #[cfg(feature = "opencl")]
+        // COLD-EXT: KV cache GPU buffer init (1회만 호출).
         let ocl_queue = gpu_backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+            .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
             .map(|be| be.queue.clone());
         #[cfg(not(feature = "opencl"))]
         let ocl_queue: Option<()> = None;
@@ -509,6 +517,7 @@ impl TransformerModel {
     /// must pass the OpenCL/CUDA backend here — `Tensor::backend()` may still
     /// point at the CPU loader because `copy_weight_from` preserves the
     /// source tensor's backend reference.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path lm_head quant
     pub fn quantize_lm_head_to_q4_0(&mut self, runtime_backend: &Arc<dyn Backend>) -> Result<bool> {
         use crate::memory::host::shared::SharedBuffer;
         use crate::models::loader::convert::quantize_q4_0;
@@ -679,6 +688,7 @@ impl TransformerModel {
     ///
     /// Returns `Ok(())` on success. On error (e.g. upload failed), the model
     /// state is unchanged (install is the last step).
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path AUF lm_head load
     pub fn load_lm_head_from_auf(
         &mut self,
         payload: &crate::auf::reader::LmHeadPayload<'_>,
@@ -809,9 +819,10 @@ impl TransformerModel {
     /// Call at startup when resilience/tensor-partition is enabled and backend is GPU.
     #[cfg(feature = "opencl")]
     pub fn map_weights_for_cpu(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
+        // COLD-EXT: weight mmap startup (1회).
         let ocl_be = gpu_backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+            .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
             .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
         let queue = ocl_be.queue.clone();
 
@@ -1044,6 +1055,7 @@ impl TransformerModel {
     ///
     /// Returns the number of weight tensors converted.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path noshuffle SOA prep
     pub fn prepare_noshuffle_buffers(
         &mut self,
         backend: &Arc<dyn Backend>,
@@ -1052,9 +1064,11 @@ impl TransformerModel {
         use crate::backend::opencl::{NoshuffleSoaEntry, OpenCLBackend, get_cl_mem};
         use crate::memory::opencl::noshuffle::NoshuffleWeightBuffer;
 
+        // COLD-EXT: noshuffle SOA loader path. `as_any().downcast_ref` 대신
+        // trait extension lookup 사용.
         let ocl_be = backend
-            .as_any()
-            .downcast_ref::<OpenCLBackend>()
+            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+            .and_then(|a| a.downcast_ref::<OpenCLBackend>())
             .ok_or_else(|| anyhow!("Not OpenCL backend"))?;
 
         // `LLMRS_KEEP_Q4_ORIGINAL=1` is an escape hatch for diagnostic
@@ -1244,6 +1258,7 @@ impl TransformerModel {
     ///
     /// Returns the number of tensors migrated.
     #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path CUDA migration
     pub fn migrate_weights_to_cuda(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
         let mut count = 0;
 
@@ -1461,6 +1476,7 @@ impl TransformerModel {
     ///
     /// Eviction is the caller's responsibility (via `CacheManager`).
     /// Score accumulation is handled internally since it requires per-layer iteration.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path GPU score acc setup
     pub fn forward_into<C: KVCacheOps>(&self, args: TransformerModelForwardArgs<C>) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
@@ -1634,14 +1650,11 @@ impl TransformerModel {
         // When active, attention_gen writes scores to a persistent GPU buffer and
         // reduce_layer runs on-device — no CPU readback needed per layer.
         // This means we set need_scores=false for the layer forward path.
-        #[cfg(feature = "opencl")]
-        let gpu_score_active = backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .and_then(|ocl_be| ocl_be.gpu_score_acc())
-            .is_some_and(|acc| acc.is_active());
-        #[cfg(not(feature = "opencl"))]
-        let gpu_score_active = false;
+        //
+        // §13.8-L S-L-2: Backend trait `gpu_score_acc()` 로 OpenCLBackend
+        // downcast 제거. CPU / CUDA / QNN 등 비-OpenCL backend 는 default
+        // `None` 반환 → `is_some_and` 가 false 로 자연 fallthrough.
+        let gpu_score_active = backend.gpu_score_acc().is_some_and(|acc| acc.is_active());
 
         // 2. Per-token weight snapshot (ENG-ALG-214-SNAP, INV-121).
         // The snapshot vector is materialised once at token entry so the
@@ -1732,7 +1745,9 @@ impl TransformerModel {
                         self.config.sliding_window,
                         Some(pws),
                         i,
-                        variance_collector.as_deref_mut(),
+                        variance_collector
+                            .as_deref_mut()
+                            .map(|c| c as &mut dyn crate::qcf_collector::VarianceObserver),
                         profiler_ptr.map(|p| unsafe { &mut *p }),
                     )?;
                 } else {
@@ -1850,7 +1865,13 @@ impl TransformerModel {
             // Record importance after layer forward
             if let Some(ref mut coll) = importance_collector {
                 let x_data = x.as_slice::<f32>();
-                coll.record_after(x_data, seq_len, hidden_size, i, crate::qcf::SubLayer::Full);
+                coll.record_after(
+                    x_data,
+                    seq_len,
+                    hidden_size,
+                    i,
+                    crate::qcf_types::SubLayer::Full,
+                );
             }
 
             // Capture attention scores for H2O/H2O+ accumulator
@@ -1967,6 +1988,7 @@ impl TransformerModel {
     /// Build a pre-bound GPU kernel execution plan for decode (seq_len=1).
     /// Returns None if the backend is not OpenCL or if plan construction fails.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L build-time plan construction
     pub fn build_plan(
         &self,
         x: &Tensor,
@@ -1977,7 +1999,7 @@ impl TransformerModel {
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
         use crate::backend::opencl::plan::*;
-        use crate::pressure::kv_cache::KVLayout;
+        use crate::kv_cache_ops::KVLayout;
 
         // Phase 4-4.8 diagnostic: env-gated line-by-line trace to identify
         // which None-return path fires when the happy-path ModelForward
@@ -2464,6 +2486,7 @@ impl TransformerModel {
     /// Falls back to forward_into() on plan invalidation.
     #[cfg(feature = "opencl")]
     #[allow(clippy::too_many_arguments)]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path plan execute (token TBT measured)
     pub fn execute_plan(
         &self,
         plan: &FullKernelPlan,
@@ -2534,6 +2557,7 @@ impl TransformerModel {
     /// Returns None if the backend is not OpenCL, plan construction fails,
     /// or KIVI GPU buffers are not available.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L build-time KIVI plan construction
     pub fn build_plan_for_kivi(
         &self,
         x: &Tensor,
@@ -2709,6 +2733,7 @@ impl TransformerModel {
     /// Falls back if plan is invalidated.
     #[cfg(feature = "opencl")]
     #[allow(clippy::too_many_arguments)]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI plan execute
     pub fn execute_plan_for_kivi(
         &self,
         plan: &FullKernelPlan,
@@ -2756,6 +2781,7 @@ impl TransformerModel {
     /// thread accesses any given `kv_caches[j]` at a time.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
+    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path trait bound + PrefetchController (offload 분리 backlog)
     pub fn forward_into_offload<C: crate::pressure::kv_cache::PrefetchableCache>(
         &self,
         args: TransformerModelForwardArgs<'_, C>,

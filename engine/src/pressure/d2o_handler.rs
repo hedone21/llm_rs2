@@ -692,6 +692,7 @@ fn scatter_reduce_f16(
 }
 
 #[allow(clippy::needless_range_loop)]
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path D2O Q4 scatter
 fn scatter_reduce_q4(
     cache: &mut KVCache,
     passing_positions: &[usize],
@@ -827,9 +828,9 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
+    use crate::kv_cache_ops::KVLayout;
     use crate::memory::host::shared::SharedBuffer;
     use crate::pressure::PressureLevel;
-    use crate::pressure::kv_cache::KVLayout;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;

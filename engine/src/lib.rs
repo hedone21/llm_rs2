@@ -18,11 +18,14 @@ pub mod op_kind;
 pub mod partition_workspace;
 pub mod pressure;
 pub mod qcf;
+pub mod qcf_collector;
+pub mod qcf_computer;
+pub mod qcf_types;
 pub mod quant;
-pub mod secondary;
 pub mod shape;
 pub mod tensor;
 pub mod thread_pool;
+pub mod yield_policy;
 
 pub mod experiment;
 pub mod observability;

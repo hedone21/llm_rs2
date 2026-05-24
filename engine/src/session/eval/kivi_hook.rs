@@ -34,7 +34,7 @@ impl CacheSnapshot<KiviCache> for KiviCacheSnapshot {
 /// Does not perform eviction; `PostStepResult` is always the default (no eviction).
 pub struct KiviHook {
     /// QCF metric collection config (used for aggregation strategy).
-    pub qcf_config: crate::qcf::QcfConfig,
+    pub qcf_config: crate::qcf_types::QcfConfig,
     /// Whether to compute and dump experimental QCF metrics (ARGUS Step 5).
     pub experimental_enabled: bool,
     /// Sample layer indices for multi-layer flush proxy (ARGUS Step 5).
@@ -58,7 +58,7 @@ pub struct KiviHook {
 
 impl KiviHook {
     pub fn new(
-        qcf_config: crate::qcf::QcfConfig,
+        qcf_config: crate::qcf_types::QcfConfig,
         experimental_enabled: bool,
         qcf_sample_layers: Vec<usize>,
         score_accumulator: Option<AttentionScoreAccumulator>,
@@ -244,7 +244,7 @@ impl StepHook<KiviCache> for KiviHook {
 mod tests {
     use super::*;
     use crate::pressure::kivi_cache::KiviCache;
-    use crate::qcf::QcfConfig;
+    use crate::qcf_types::QcfConfig;
 
     fn make_hook() -> KiviHook {
         KiviHook::new(QcfConfig::default(), false, vec![0], None)

@@ -348,14 +348,18 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
                     .map(|p| &mut p.ops as &mut dyn crate::instrument::OpInstrument),
                 skip_config: None,
                 importance_collector: if inject_collector {
-                    on_demand_collector.as_mut()
+                    on_demand_collector
+                        .as_mut()
+                        .map(|c| c as &mut dyn crate::qcf_collector::ImportanceCollect)
                 } else {
                     None
                 },
                 // Chunked mode: only the last position's logits needed (saves GPU memory).
                 // Non-chunked: write all positions (original behaviour).
                 logits_last_only: chunked,
-                variance_collector: variance_collector.as_mut(),
+                variance_collector: variance_collector
+                    .as_mut()
+                    .map(|c| c as &mut dyn crate::qcf_collector::VarianceObserver),
                 prefill_workspace: None,
 
                 layer_boundary_hook: None,

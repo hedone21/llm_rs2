@@ -1,85 +1,15 @@
-//! Intra-token GPU yield helper.
+//! Intra-token cooperative yield — re-exports.
 //!
-//! During decode, flushes the GPU command queue every N layers and sleeps
-//! for M microseconds. This creates scheduling windows for higher-priority
-//! GPU contexts (e.g. foreground games) that would otherwise be starved
-//! while a token's kernel chain runs uninterrupted.
+//! S-2 sprint 2026-05-24: env-var caching + yield logic moved to
+//! `crate::yield_policy` (L2) so that `Backend::yield_after_layer`
+//! default body can read it without crossing the cross-cutting boundary
+//! that INV-LAYER-001 prohibits. The freestanding `gpu_yield_impl`
+//! helper is gone — all dispatch flows through the trait method now.
 //!
-//! Configured via env vars, seeded from CLI flags by `generate.rs`:
-//! - `LLMRS_DECODE_YIELD_EVERY` — layer interval (0 disables, default 0).
-//! - `LLMRS_DECODE_YIELD_US` — sleep microseconds (default 500).
-//!
-//! Values are read once via `OnceLock` so the hot path is a branch + cmp.
+//! Existing public surface is preserved as thin re-exports for any
+//! external resilience consumer that still imports from this module.
 
-use std::sync::OnceLock;
-use std::time::Duration;
-
-use crate::backend::Backend;
-
-static YIELD_EVERY: OnceLock<usize> = OnceLock::new();
-static YIELD_US: OnceLock<u64> = OnceLock::new();
-
-fn yield_every() -> usize {
-    *YIELD_EVERY.get_or_init(|| {
-        std::env::var("LLMRS_DECODE_YIELD_EVERY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
-
-fn yield_us() -> u64 {
-    *YIELD_US.get_or_init(|| {
-        std::env::var("LLMRS_DECODE_YIELD_US")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(500)
-    })
-}
-
-/// Fast check: is intra-token yield configured? Callers can skip the
-/// per-layer hook entirely when this returns false.
-#[inline]
-pub fn intra_token_yield_enabled() -> bool {
-    yield_every() > 0
-}
-
-/// Backend-agnostic implementation of the intra-token GPU yield hook.
-///
-/// `layer_idx` is the 0-based index of the layer that just ran. The yield
-/// fires at `(layer_idx + 1) % every == 0`, matching a human-intuitive
-/// "every N layers" reading.
-///
-/// `is_decode` gates the hook so prefill (bursty by design) is unaffected.
-///
-/// B-5b Phase 2 Stage 2-B: invoked from GPU backends' `yield_after_layer`
-/// trait method override. The freestanding helper (previously
-/// `maybe_yield_after_layer`) was removed; all dispatch flows through the
-/// `Backend` trait now.
-#[inline]
-pub fn gpu_yield_impl(backend: &dyn Backend, layer_idx: usize, is_decode: bool) {
-    if !is_decode {
-        return;
-    }
-    let every = yield_every();
-    if every == 0 {
-        return;
-    }
-    if !(layer_idx + 1).is_multiple_of(every) {
-        return;
-    }
-    // flush + wait: kernels already dispatched must drain before the sleep
-    // is useful (otherwise the sleep overlaps with the in-flight burst and
-    // buys nothing). synchronize() errors are swallowed — yield is a best
-    // effort, not a correctness hook.
-    let _ = backend.synchronize();
-    let us = yield_us();
-    if us > 0 {
-        std::thread::sleep(Duration::from_micros(us));
-    } else {
-        std::thread::yield_now();
-    }
-}
+pub use crate::yield_policy::{intra_token_yield_enabled, yield_every, yield_us};
 
 #[cfg(test)]
 mod tests {

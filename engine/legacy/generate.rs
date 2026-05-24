@@ -2388,7 +2388,9 @@ fn main() -> anyhow::Result<()> {
                         &model,
                         ratio,
                         target_dtype,
-                        importance_table_for_swap.as_ref(),
+                        importance_table_for_swap
+                            .as_ref()
+                            .map(|t| t as &dyn llm_rs2::qcf_collector::ImportanceLookup),
                         decode_token_index,
                         &mut incremental_force_swap_plan,
                         &mut manager_swap_report_pending,
@@ -3716,13 +3718,13 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                 if requires_scores && scores_opt.is_none() {
                     continue;
                 }
-                let Some(v_source) = VDataSource::from_kv_cache(cache, None) else {
+                let Some(v_source) = VDataSource::from_buffer(&cache.v_buffer, None) else {
                     continue;
                 };
                 // D2O simulator (paper Eq.8) needs K for nearest-neighbour
                 // matching; other actions ignore `k_source`.
                 let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
-                    VDataSource::k_from_kv_cache(cache)
+                    VDataSource::from_buffer(&cache.k_buffer, None)
                 } else {
                     None
                 };
@@ -3972,7 +3974,7 @@ fn run_kivi(
     ignore_eos: bool,
     cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
-    use llm_rs2::pressure::kv_cache::KVCacheOps;
+    use llm_rs2::kv_cache_ops::KVCacheOps;
 
     println!(
         "[KIVI] KV cache enabled — bits={}, residual_size={}, max_seq_len={}",
@@ -4572,7 +4574,7 @@ fn run_offload(
     command_executor: &mut Option<CommandExecutor>,
     cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
-    use llm_rs2::pressure::kv_cache::KVCacheOps;
+    use llm_rs2::kv_cache_ops::KVCacheOps;
     use llm_rs2::pressure::offload::OffloadKVCache;
     use llm_rs2::pressure::offload::raw_store::RawStore;
 

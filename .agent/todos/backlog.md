@@ -4,6 +4,26 @@
 
 ---
 
+## [P2] §13.8-L hot path sub-trait 격상 — 2026-05-24 등록 (S-C1 후속)
+- **Status**: TODO (D-1 sprint S-C1 후 marker로 우회, 본질 격상 backlog 등록)
+- **선행**: `.agent/todos/handoff_inv_layer003_complete_2026_05_24.md` (D-1 sprint handoff)
+- **상세**: §13.8-L L-marker 75건 중 hot path 14건 (forward.rs/forward_gen.rs/attention.rs/llama_layer.rs)의 `as_any().downcast_ref::<*Backend>()` 패턴을 `OpenCLContext` / `CudaContext` / `QnnOppkgContext` sub-trait 격상으로 해소.
+- **API surface 추정**: OpenCLContext ~8 메서드 (queue, set_op_label, has_kivi_attn_kernel, is_nosub, gpu_score_acc, etc) + nested trait 3개 (Queue/GpuScoreAcc/Program).
+- **선행 작업**: Plan executor 추상화 — `plan.execute(ocl_backend, ...)` 함수 시그니처를 trait dispatch로 변경. 이게 본 sprint의 가장 큰 산.
+- **비용**: 3~5일. S25 Adreno OpenCL + Jetson CUDA + S25 qnn_oppkg 3종 bit-identical 디바이스 게이트 필수.
+- **연관**: 기존 `[P2] KiviCache hot path downcast resolve` 항목과 통합 처리 가능.
+
+## [P2] §13.8-O cross-L3 vocabulary trait inversion — 2026-05-24 등록 (S-C3 후속)
+- **Status**: TODO (D-1 sprint S-C3 후 marker로 우회, 본질 격상 backlog 등록)
+- **선행**: `.agent/todos/handoff_inv_layer003_complete_2026_05_24.md`
+- **상세**: §13.8-O register 9건의 본질 trait inversion. 3 갈래:
+  - **WeightSwapDispatch trait** (3건): `pressure/weight_swap_handler.rs`의 ModelConfig + SwapExecutor + LayerSlot/SecondaryMmap 의존을 trait + handler 이동(`models/weights/swap_handler.rs`)으로 해소. ActionResult enum 의존은 §13.8-F.
+  - **PrefetchAccess + PreloadPool L2 격상** (3건): `pressure/offload/{preload_pool,prefetch}` 의 trait/struct을 L2 또는 inference 도메인으로 격상. forward_into_offload 분리 결정 선행.
+  - **KvCacheView trait** (3건): `KVCacheOps` trait의 default type parameter를 caller에 명시 강제 또는 KVCache의 일부 method를 read-only trait으로 분리. 외부 API surface 영향 큼.
+- **비용**: 1~3일 (3 트랙 분할 가능). 디바이스 게이트는 ModelForward path에 한정 (S-C3a/b/c sub-sprint 분할).
+
+---
+
 ## [PARTIAL → CANCELLED] Phase 4-4-2.3 — decode_fallback 추출 — 2026-05-21 부분 완료 + 잔여 취소
 - **Status**: 3a/3c/3b **완료** (master `02cb7106`). 3d/3e는 **취소** — 사용자 결정 (2026-05-21).
 - **결정 사유**: generate.rs를 더 줄이지 않고 legacy로 보존, 새로운 다수 바이너리로 기능 분할하는 방향 전환. 잔여 3d/3e/4-4-2.4 추출은 새 바이너리 설계 안에서 자연 해소.
@@ -106,6 +126,36 @@
 - **추정 원인**: `RpcmemAliasBuffer` Drop ordering 또는 `cl_mem` release ↔ `rpcmem_free` race. OpenCL queue/context teardown 순서.
 - **참고 파일**: `engine/src/buffer/rpcmem_alias_buffer.rs`, `engine/src/models/weights/rpcmem_secondary.rs::RpcmemLayerRegion::Drop`
 - **fix 방안 후보**: (a) explicit drop sequence (cl_mem all release → rpcmem_free), (b) reference count guard, (c) backend teardown 시 rpcmem region 명시 release
+
+## [P2] KiviCache hot path downcast resolve — 2026-05-24 등록 (backend extension sprint 후속)
+- **Status**: TODO (사용자 선택 C에 따라 본 sprint 취소, backlog 등록)
+- **선행**: `.agent/todos/handoff_backend_extension_2026_05_24.md` (HEAD `5be6c0d7`)
+- **상세**: `engine/src/pressure/kivi_cache.rs:1559/1842/2108` 3건 `as_any().downcast_ref::<OpenCLBackend>()` — KIVI 모드 진입 시 per-token × 16 layer 호출 (R2 게이트 hot path 확정).
+- **제약**: `OpenCLBackend`는 Clone 미구현 + `Arc<dyn Backend>` → `Arc<OpenCLBackend>` Rust 기본 API 변환 불가. 단순 패턴 통일(`get_extension`)은 본 sprint 정책("hot path 보존")과 mismatch.
+- **fix 방안 후보**:
+  - (B) `OpenCLBackend` self-ref Arc — `Arc::new_cyclic` + `self_weak: Weak<Self>` field 추가, `OpenCLBackend::new()` signature를 `-> Result<Arc<Self>>`로 변경. KiviCache는 `Option<Arc<OpenCLBackend>>` 보유. 영향 범위 큼 (호출지 5+곳 마이그레이션). cuda/qnn backend도 같은 패턴 따라야 일관성. 추정 1~2일.
+  - (B') KiviCache 한정 unsafe raw pointer 보존 — `gpu_opencl_ptr: Option<*const OpenCLBackend>` + invariant guard (Arc<dyn Backend> alive). `unsafe impl Send/Sync` 필요. 추정 0.5일.
+  - (E) 새 trait `KiviGpuOps` inversion (RpoenCL impl) — signature 변경. 추정 1일.
+- **실측 비용**: B-5b Phase 2 vtable Δ -0.231% / -0.018% 측정으로 string compare 비용도 ≈ 0 추정. **production 영향 매우 작음** (KIVI 모드 한정).
+- **우선순위 사유**: P2 — INV-LAYER-003 143건 해소가 ROI 더 큼. KIVI는 production 사용 빈도 낮고 vtable 비용 측정 0.
+
+## [DROP — 2026-05-24] CpuBackend 생성 책임 통일 (DI 강화) — 2026-05-24 등록 / 2026-05-24 종결
+- **Status**: 부분 정리 완료 (3B Minimal, master `7df6c0b6`) — 나머지 작업은 ROI 0으로 평가, DROP 후보
+- **2026-05-24 추가 측정 결과**: L4(`session/`) → L1(`backend::cpu`) import는 `scripts/layer_lint.py` invariant 미정의 영역 (INV-LAYER-001~005 모두 L4 source 규칙 없음). 본 entry의 "INV-LAYER-003 ~7~10건 해소" 추정은 잘못된 사전 측정이었음. 실제로는 trait signature 변경 옵션 (B/Hammered) 진행해도 baseline 0건 효과.
+- **완료된 부분 (3B Minimal, commit `7df6c0b6`)**:
+  - `session/batch/runner.rs:202/364` → `cpu_backend_arc.clone()` (alloc 2건 제거)
+  - `session/qcf_runtime.rs:202/237/284/295/326` → `cpu_backend.clone()` (alloc 5건 제거 + `cpu_back: Arc<dyn Backend>` 중간 변수 2건 폐기)
+  - `runner.rs` / `qcf_runtime.rs`의 `use crate::backend::cpu::CpuBackend;` import 2건 제거
+  - 정성적 효과: 단일 Arc 공유로 메모리 footprint ↓ + production DI 강화
+- **2026-05-24 S-2.5 sprint에서 GPU backend bootstrap 3건 추가 정리 (`9b8bcddd`)**:
+  - `engine/src/backend/cpu/mod.rs::cpu_singleton()` (`OnceLock<Arc<dyn Backend>>`) free fn 추가.
+  - cuda_embedded:530 / cuda_pc:328 / opencl:1540 의 `Arc::new(CpuBackend::new())` → `cpu_singleton()`. allocator + feature detect 3회 → 1회.
+  - baseline 효과 0 (cross-backend import 패턴 동일) — 사용자 결정 옵션 B로 의식적 진행.
+- **잔여 (의도적 보류)**:
+  - `qcf_runtime.rs:881` (debug dump fallback) 1건 — 함수가 cpu_backend 미수신, signature 변경 비용 > ROI
+  - `pressure/kivi_cache.rs:358` (`KiviCache::new()` default `Arc::new(CpuBackend::new())`) — 호출지 전원 test scope
+  - test scope 40+ 호출지 — 의도된 test 패턴 (각 test 독립 객체)
+- **DROP 사유**: production callsite (session/, GPU backend bootstrap 3건) 정리 완료. 잔여 callsite는 본질적으로 단독 진행 ROI 미만 (test scope 또는 sig 변경 cost > value).
 
 ## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
 - **Status**: TODO (M2 baseline부터 누적, M3.0 무관)

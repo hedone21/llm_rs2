@@ -16,7 +16,7 @@ use crate::models::transformer::TransformerModel;
 use crate::models::weights::SwapAlgorithm;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kv_cache::KVCache;
-use crate::qcf::ImportanceFormula;
+use crate::qcf_types::ImportanceFormula;
 use crate::session::cli::Args;
 
 pub struct EvalLlRunCtx {

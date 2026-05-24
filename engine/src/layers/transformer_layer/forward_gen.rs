@@ -16,6 +16,11 @@ fn partition_async_read_enabled() -> bool {
 
 impl TransformerLayer {
     /// Fast path for single token generation using pre-allocated workspace.
+    ///
+    /// §13.8-L S-L-1/2/3 적용 후: backend downcast 가 trait method 호출
+    /// (`profile_events_enabled` / `set_op_label` / `clear_op_label` /
+    /// `gpu_score_acc_mut` / `as_kivi_attention`) 로 통합되어 marker zone
+    /// 불필요.
     pub(super) fn forward_gen<C: KVCacheOps>(&self, mut args: ForwardGenArgs<C>) -> Result<()> {
         // SWIFT: if both sub-layers are skipped, early return (identity)
         if args.skip_attn && args.skip_mlp {
@@ -50,55 +55,13 @@ impl TransformerLayer {
         // events, so the legacy wall-clock + `clFinish()` path must stay
         // silent to avoid double-counting and to preserve the zero-overhead
         // property of event-based profiling.
-        #[cfg(feature = "opencl")]
-        let event_profiling = backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .map(|b| b.profile_events_enabled)
-            .unwrap_or(false);
-        #[cfg(not(feature = "opencl"))]
-        let event_profiling = false;
-
-        // `set_label` / `clear_label`: caller-side label hints used only by
-        // `--profile-events` / `--cuda-profile` to distinguish matmul_qkv /
-        // matmul_wo / matmul_ffn / lm_head (all dispatch the same
-        // GEMV/GEMM kernels). No-op on CPU or when neither profiler is
-        // active.
-        #[allow(unused_variables)]
-        let set_label = |label: &'static str| {
-            #[cfg(feature = "opencl")]
-            if event_profiling
-                && let Some(ocl_be) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            {
-                ocl_be.set_op_label(label);
-            }
-            #[cfg(feature = "cuda-embedded")]
-            if let Some(cu_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::cuda_embedded::CudaBackend>()
-            {
-                cu_be.set_op_label(label);
-            }
-        };
-        let clear_label = || {
-            #[cfg(feature = "opencl")]
-            if event_profiling
-                && let Some(ocl_be) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            {
-                ocl_be.clear_op_label();
-            }
-            #[cfg(feature = "cuda-embedded")]
-            if let Some(cu_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::cuda_embedded::CudaBackend>()
-            {
-                cu_be.clear_op_label();
-            }
-        };
+        // §13.8-L S-L-1: GPU event-profiling flag + op label hook 를
+        // Backend trait method 로 통일했다. OpenCL backend 만 `true` 를
+        // 반환하고, CUDA / CPU / QNN 등은 default `false`.
+        // 두 hook 모두 default no-op 이라 cfg gate 가 사라진다.
+        let event_profiling = backend.profile_events_enabled();
+        let set_label = |label: &'static str| backend.set_op_label(label);
+        let clear_label = || backend.clear_op_label();
 
         macro_rules! prof_start {
             () => {
@@ -365,7 +328,7 @@ impl TransformerLayer {
         let t = prof_start!();
         let tr = crate::op_start_kind!(KvUpdate);
         let kv_dtype = kv_cache.kv_dtype();
-        use crate::pressure::kv_cache::KVLayout;
+        use crate::kv_cache_ops::KVLayout;
         if kv_dtype == DType::F16 && is_gpu && is_decode && kv_cache.layout() == KVLayout::HeadMajor
         {
             // GPU F16 HeadMajor: fused cast+scatter kernel (1 dispatch instead of 2+16)
@@ -446,23 +409,23 @@ impl TransformerLayer {
         let need_scores = args.need_scores || kv_cache.needs_attn_scores();
 
         // KIVI native attention: bypass F32 dequant + scatter by fusing dequant
-        // into the attention kernel. Only available for OpenCL GPU + KiviCache.
-        #[cfg(feature = "opencl")]
+        // into the attention kernel. Only available for KIVI-capable GPU backend
+        // (현재는 OpenCL).
+        //
+        // §13.8-L S-L-3: Backend trait `as_kivi_attention()` 로 OpenCLBackend
+        // downcast 제거. 비-KIVI backend 는 `None` → 자연 fallthrough.
         let kivi_native_dispatched = if is_gpu {
             if let Some(raw) = kv_cache.get_kivi_raw_buffers() {
-                if let Some(ocl_be) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-                {
+                if let Some(kivi_be) = backend.as_kivi_attention() {
                     // Only use native KIVI attention on non-subgroup devices (NVIDIA).
                     // On Adreno (subgroups), the F32 dequant + subgroup attention_gen is faster
                     // because the native kernel uses workgroup reduction instead of subgroup ops.
-                    if ocl_be.has_kivi_attn_kernel(raw.bits)
-                        && ocl_be.is_nosub()
+                    if kivi_be.has_kivi_attn_kernel(raw.bits)
+                        && kivi_be.is_nosub_device()
                         && (raw.q_tokens + raw.res_tokens) > 0
                     {
                         let scale = 1.0 / (head_dim as f32).sqrt();
-                        ocl_be.attention_gen_kivi(
+                        kivi_be.attention_gen_kivi(
                             &q_rope,
                             raw.qk_buf,
                             raw.qv_buf,
@@ -496,8 +459,6 @@ impl TransformerLayer {
         } else {
             false
         };
-        #[cfg(not(feature = "opencl"))]
-        let kivi_native_dispatched = false;
 
         if !kivi_native_dispatched {
             let (k_cache, v_cache) = kv_cache.get_view();
@@ -538,11 +499,10 @@ impl TransformerLayer {
                 // [n_layers, n_heads_q, score_stride] slice of `score_buf`. The plan
                 // path pre-bakes this offset at build time; the non-plan (forward_gen)
                 // path must set it dynamically per layer.
-                #[cfg(feature = "opencl")]
-                if let Some(ocl_be) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-                    && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+                // §13.8-L S-L-2: Backend trait `gpu_score_acc_mut()` 로
+                // OpenCLBackend downcast 제거. 비-OpenCL backend 는 default
+                // `None` → if-let chain 이 자연 skip 된다.
+                if let Some(gpu_acc) = backend.gpu_score_acc_mut()
                     && gpu_acc.is_active()
                 {
                     gpu_acc.set_current_layer_idx(layer_idx);
@@ -1720,7 +1680,7 @@ impl TransformerLayer {
 
                         #[cfg(target_arch = "aarch64")]
                         let score = unsafe {
-                            crate::backend::cpu::neon::CpuBackendNeon::vec_dot_f16_f32(
+                            crate::quant::flash_neon::vec_dot_f16_f32(
                                 head_dim,
                                 q_data.as_ptr().add(q_off),
                                 k_raw.add(off),
@@ -1781,7 +1741,7 @@ impl TransformerLayer {
         head_dim: usize,
         cache_seq_len: usize,
         kv_start_pos: usize,
-        layout: crate::pressure::kv_cache::KVLayout,
+        layout: crate::kv_cache_ops::KVLayout,
         capacity: usize,
         need_scores: bool,
         backend: &Arc<dyn Backend>,
@@ -1795,7 +1755,7 @@ impl TransformerLayer {
         let blocks_per_row = head_dim / QK4_0;
         let scale = 1.0 / (head_dim as f32).sqrt();
         let n_rep = n_heads_q / n_heads_kv;
-        let is_head_major = layout == crate::pressure::kv_cache::KVLayout::HeadMajor;
+        let is_head_major = layout == crate::kv_cache_ops::KVLayout::HeadMajor;
 
         // 1. Read Q (F32) from GPU
         let mut q_data = vec![0.0f32; q.size() / 4];

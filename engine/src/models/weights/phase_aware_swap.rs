@@ -29,6 +29,7 @@ use crate::models::weights::async_swap::{AsyncSwapDispatcher, ChunkDispatchJob, 
 use crate::models::weights::secondary_mmap::SecondaryMmap;
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
 use crate::models::weights::swap_executor::SwapExecutor;
+// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N op_trace hook (PhaseHook L2 격상 backlog 대기)
 use crate::observability::profile::op_trace::{DdrPhase, PhaseHook};
 use crate::op_kind::OpKind;
 use crate::tensor::Tensor;

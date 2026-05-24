@@ -18,6 +18,7 @@ use anyhow::{Result, anyhow};
 
 use crate::auf::{AufView, BackendTag, LAYER_IDX_CROSS, TensorDType, TensorKind, open as auf_open};
 use crate::backend::Backend;
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::auf_view_buffer::AufViewBuffer;
 use crate::buffer::{Buffer, DType};

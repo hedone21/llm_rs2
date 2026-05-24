@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::inference::sampling;
 use crate::inference::skip_config::SkipConfig;
@@ -81,13 +80,13 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
     // forward calls in this branch route score_accumulator through the hook.
     use crate::session::eval::StepHook;
     let pb_qcf_mode_enum = match args.qcf_mode.as_str() {
-        "caote" => crate::qcf::QcfMode::Caote,
-        "both" => crate::qcf::QcfMode::Both,
-        _ => crate::qcf::QcfMode::Attn,
+        "caote" => crate::qcf_types::QcfMode::Caote,
+        "both" => crate::qcf_types::QcfMode::Both,
+        _ => crate::qcf_types::QcfMode::Attn,
     };
-    let pb_qcf_config = crate::qcf::QcfConfig {
+    let pb_qcf_config = crate::qcf_types::QcfConfig {
         mode: pb_qcf_mode_enum,
-        ..crate::qcf::QcfConfig::default()
+        ..crate::qcf_types::QcfConfig::default()
     };
     let pb_ratio_mode = args.kv_budget_ratio() > 0.0;
     let pb_hook_budget = if pb_ratio_mode { 0 } else { args.kv_budget() };
@@ -199,7 +198,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
     let cpu_gen_input = Tensor::new(
         Shape::new(vec![1, 1]),
         cpu_gen_indices_buf,
-        Arc::new(CpuBackend::new()),
+        cpu_backend_arc.clone(),
     );
     let gpu_gen_input_buf = memory.alloc(4, DType::U8)?;
     let mut gen_input_tensor =
@@ -361,7 +360,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 let cpu_chunk_tensor = Tensor::new(
                     Shape::new(vec![1, chunk_len]),
                     cpu_chunk_buf,
-                    Arc::new(CpuBackend::new()),
+                    cpu_backend_arc.clone(),
                 );
                 let input_tensor = backend.copy_from(&cpu_chunk_tensor)?;
 
@@ -705,7 +704,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
             // attention scores, then restore current_pos so cache state
             // matches prompt_tokens (probe entry beyond current_pos is
             // invisible to subsequent forward calls).
-            use crate::pressure::kv_cache::KVCacheOps;
+            use crate::kv_cache_ops::KVCacheOps;
             if hook.needs_score_probe(&kv_caches) {
                 let saved_positions: Vec<usize> =
                     kv_caches.iter().map(|c| c.current_pos()).collect();
