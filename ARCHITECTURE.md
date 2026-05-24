@@ -1091,16 +1091,19 @@ python scripts/run_device.py -d pixel generate --backend opencl
 
 **Cross-cutting 규칙**: Observability/Resilience는 모든 레이어가 import 가능하다. 단 cross-cutting 모듈이 L3 도메인의 concrete type을 직접 import할 때는 trait/Sink 경유로 제한된다 (예: `EventSink` trait, `Transport` trait).
 
-### 13.2 Domain Boundary: Pressure vs Inference (L3 결정)
+### 13.2 Domain Boundary: Pressure vs Inference vs QCF (L3 결정)
 
-**채택**: L3 내부는 *Pressure* (메모리 압박 대응)와 *Inference* (forward path) 도메인으로 분리한다.
+**채택 (S-3b-2, 2026-05-24 갱신)**: L3 내부는 *Pressure* (메모리 압박 대응), *Inference* (forward path), *QCF* (Quality Cost Function 측정) 세 도메인으로 분리한다.
 
-**폐기**: "Cache vs Inference" 분류. KV cache eviction과 weight swap이 모두 같은 `CachePressurePipeline`을 통해 트리거되는 현실(현 `core/pressure/weight_swap_handler.rs` 존재)을 반영하면, "캐시 관리"는 더 일반적인 "메모리 압박 응답"의 한 갈래이다.
+**폐기 (1차)**: "Cache vs Inference" 분류. KV cache eviction과 weight swap이 모두 같은 `CachePressurePipeline`을 통해 트리거되는 현실(현 `core/pressure/weight_swap_handler.rs` 존재)을 반영하면, "캐시 관리"는 더 일반적인 "메모리 압박 응답"의 한 갈래이다.
+
+**갱신 (2차, S-3b-2)**: `qcf/`를 L3-inference에서 분리하여 독립 L3 도메인으로 인정. QCF는 lossy action(eviction/quantization/skip)의 quality cost를 *측정*하는 도메인이며, pressure도 inference도 아닌 측정/평가 책임. data identifier는 §13.8-G로 L2(`engine/src/qcf_types.rs`)에 격상하여 양 도메인 공유 어휘로 통합한다.
 
 근거:
 - `core/pressure/weight_swap_handler.rs`는 weight를 KV eviction과 동일한 pipeline에 등록한다 → "캐시 도메인"이 아닌 "압박 도메인"으로 보는 것이 정합적.
 - `D2OHandler`, `SwapHandler`, `CompressHandler`, `QuantizeHandler`, `MergeHandler`, `SparseHandler`는 모두 "캐시 상태를 변형하는" 핸들러이며, weight swap은 "weight 상태를 변형하는" 핸들러로 **동일 추상화**에 자연 편입된다.
 - "Inference"는 *현재 토큰의 forward pass*에 한정한다 — 모델/레이어/attention/sampling만 포함. 압박-반응형 변형은 모두 L3 Pressure 도메인에 둔다.
+- "QCF"는 *측정 도메인* — `compute_flush_*`, `ImportanceCollector`, `DegradationEstimator` 등 quality cost 산출 로직. pressure 측 핸들러와 inference 측 prefill 모두로부터 호출되므로 단방향 도메인 종속이 어색. 독립 도메인으로 분리하여 caller가 trait(`QcfComputer`/`ImportanceCollect`) 경유로 의존하도록 강제 (Phase 4 trait inversion 대상).
 
 다이어그램 (목표 구조):
 
@@ -1123,9 +1126,14 @@ flowchart TB
         Layers["layers/<br/>(LlamaLayer, attention,<br/>workspace)"]
         Samp["sampling, attention_scores,<br/>speculative, skip_config"]
     end
+    subgraph L3C ["L3 QCF — qcf/"]
+        QcfCompute["compute_flush_*<br/>(NMSE/OPR/AWQE/aw_vopr)"]
+        QcfImp["ImportanceCollector<br/>ImportanceTable<br/>DegradationEstimator"]
+        QcfTraits["QcfComputer trait<br/>ImportanceCollect trait"]
+    end
     subgraph L2 ["L2 Abstraction — shared/"]
         Trait["backend (trait), buffer (trait),<br/>tensor, memory_buf, shape"]
-        Util["thread_pool, quant,<br/>tensor_partition, qcf"]
+        Util["thread_pool, quant,<br/>tensor_partition,<br/>qcf_types (§G shared)"]
     end
     subgraph L1 ["L1 Backend — backend/"]
         CPU["cpu (Neon, AVX)"]
@@ -1143,14 +1151,19 @@ flowchart TB
     L5 --> L4
     L4 --> L3A
     L4 --> L3B
+    L4 --> L3C
     L3A --> L2
     L3B --> L2
+    L3C --> L2
     L2 --> L1
+    L3A -.via trait.-> L3C
+    L3B -.via trait.-> L3C
     L4 -.uses.-> CC1
     L4 -.uses.-> CC2
     L3A -.via trait.-> CC1
     L3A -.via trait.-> CC2
     L3B -.via trait.-> CC1
+    L3C -.via trait.-> CC1
     L1 -.via trait.-> CC2
 ```
 

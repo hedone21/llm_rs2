@@ -35,7 +35,7 @@
       "line": 825,
       "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -44,7 +44,7 @@
       "line": 904,
       "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -53,7 +53,7 @@
       "line": 906,
       "import": "crate::qcf::compute_flush_opr",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -62,7 +62,7 @@
       "line": 931,
       "import": "crate::qcf::compute_flush_awqe",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -71,7 +71,7 @@
       "line": 949,
       "import": "crate::qcf::compute_flush_aw_vopr",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -90,7 +90,7 @@
       "line": 1670,
       "import": "crate::qcf::compute_flush_nmse",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -99,7 +99,7 @@
       "line": 1672,
       "import": "crate::qcf::compute_flush_opr",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -108,7 +108,7 @@
       "line": 1697,
       "import": "crate::qcf::compute_flush_awqe",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -117,7 +117,7 @@
       "line": 1715,
       "import": "crate::qcf::compute_flush_aw_vopr",
       "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-inference (cross-domain concrete import)",
+      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
       "is_test_block": false
     },
     {
@@ -442,7 +442,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 1904,
+      "line": 1910,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -452,7 +452,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 1983,
+      "line": 1989,
       "import": "crate::backend::opencl::get_cl_mem",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -462,7 +462,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 1984,
+      "line": 1990,
       "import": "crate::backend::opencl::plan::*",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -472,7 +472,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2088,
+      "line": 2094,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -482,7 +482,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2488,
+      "line": 2494,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -492,7 +492,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2550,
+      "line": 2556,
       "import": "crate::backend::opencl::get_cl_mem",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -502,7 +502,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2551,
+      "line": 2557,
       "import": "crate::backend::opencl::plan::*",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -512,7 +512,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2597,
+      "line": 2603,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -522,7 +522,7 @@
     {
       "id": "V-20",
       "file": "models/transformer.rs",
-      "line": 2731,
+      "line": 2737,
       "import": "crate::backend::opencl::OpenCLBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -623,6 +623,24 @@
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
       "is_test_block": false,
       "note": "downcast 패턴"
+    },
+    {
+      "id": "V-26",
+      "file": "models/weights/decider.rs",
+      "line": 21,
+      "import": "crate::qcf::layer_importance::",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-inference→L3-qcf (cross-domain concrete import)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-26",
+      "file": "models/weights/decider.rs",
+      "line": 340,
+      "import": "crate::qcf::layer_importance::",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-inference→L3-qcf (cross-domain concrete import)",
+      "is_test_block": true
     },
     {
       "id": "V-30",
@@ -1030,6 +1048,15 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
+      "line": 164,
+      "import": "crate::qcf::ImportanceCollector",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-inference→L3-qcf (cross-domain concrete import)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-??",
+      "file": "models/transformer.rs",
       "line": 171,
       "import": "crate::pressure::d2o_layer_alloc::D2OVarianceCollector",
       "rule": "INV-LAYER-003",
@@ -1079,7 +1106,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 2547,
+      "line": 2553,
       "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -1088,7 +1115,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 2723,
+      "line": 2729,
       "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -1097,7 +1124,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 2764,
+      "line": 2770,
       "import": "crate::pressure::kv_cache::PrefetchableCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -1106,7 +1133,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 2767,
+      "line": 2773,
       "import": "crate::pressure::offload::prefetch::PrefetchController",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
@@ -1115,7 +1142,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 3147,
+      "line": 3153,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1125,7 +1152,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 3309,
+      "line": 3315,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1135,7 +1162,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 3777,
+      "line": 3783,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1145,7 +1172,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 3803,
+      "line": 3809,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1155,7 +1182,7 @@
     {
       "id": "V-??",
       "file": "models/transformer.rs",
-      "line": 3857,
+      "line": 3863,
       "import": "crate::backend::cpu::CpuBackend",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L1 (backend impl 직접 의존)",
@@ -1403,7 +1430,7 @@
       "line": 38,
       "import": "crate::pressure::kv_cache::KVCache",
       "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
+      "kind": "L3-qcf→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
     },
     {

@@ -74,10 +74,15 @@ LAYER_RULES = [
     # L3-inference: 추론 연산 도메인
     # Step 4-C: sampling/skip_config/speculative/attention_scores promoted to engine/src/inference/
     ("inference",               "L3-inference"),
-    # Step 4-B: qcf promoted from core/qcf to engine/src/qcf (top-level L3-inference)
-    ("qcf",                     "L3-inference"),  # QCF는 inference-side 메트릭
     ("layers",                  "L3-inference"),
     ("models",                  "L3-inference"),  # models/weights/* 포함
+
+    # L3-qcf: Quality Cost Function 측정 도메인 (S-3b-2, 2026-05-24)
+    # QCF는 lossy action(eviction/quantization/skip)의 quality cost 측정 도메인.
+    # pressure 도 inference 도 아닌 *측정/평가* 도메인이며, 양쪽 모두로부터 호출됨.
+    # data identifier 는 §G로 L2(`engine/src/qcf_types.rs`)에 격상, 측정 로직은
+    # 본 L3-qcf 도메인(`engine/src/qcf/`)에 유지.
+    ("qcf",                     "L3-qcf"),
 
     # L4: orchestration (Step 5-A: chat_template promoted from core/ to session/)
     ("session",                 "L4"),
@@ -169,6 +174,9 @@ def classify_import(import_path: str) -> str:
 # 위반 판정 규칙 (INV-LAYER-001~005)
 # ────────────────────────────────────────────────────────────────────
 
+_L3_DOMAINS = ("L3-pressure", "L3-inference", "L3-qcf")
+
+
 def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str | None, str | None, str | None]:
     """
     (src_layer, dst_layer) 쌍에 대해 위반하는 INV-LAYER-XXX와 kind 문자열을 반환.
@@ -177,9 +185,9 @@ def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str |
     """
     # INV-LAYER-001: L1 backend → L2(shared/buffer/memory/auf) + cross-cutting 외 import 금지
     # 허용: L1→L2, L1→L1(동일 backend 내부), L1→observability, L1→resilience, L1→L3-core(Backend trait)
-    # 금지: L1→L3-pressure, L1→L3-inference, L1→L4, L1→L5
+    # 금지: L1→L3-pressure, L1→L3-inference, L1→L3-qcf, L1→L4, L1→L5
     if src_layer == "L1":
-        if dst_layer in ("L3-pressure", "L3-inference", "L4", "L5"):
+        if dst_layer in (*_L3_DOMAINS, "L4", "L5"):
             # V-01: L1→cross-cutting concrete (resilience임에도 concrete 직접 import)
             # V-02: L1→L3-inference
             # V-03: L1→L3-inference (models/weights)
@@ -201,32 +209,30 @@ def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str |
 
     # INV-LAYER-002: L2 → L3+/L4/L5 import 금지
     if src_layer == "L2":
-        if dst_layer in ("L3-pressure", "L3-inference", "L4", "L5"):
+        if dst_layer in (*_L3_DOMAINS, "L4", "L5"):
             kind = f"L2→{dst_layer} (상위 레이어 역방향 import)"
             return ("INV-LAYER-002", kind, None)
         if dst_layer == "L1":
             kind = f"L2→L1 (backend-specific impl 직접 의존)"
             return ("INV-LAYER-002", kind, "V-07 패턴")
 
-    # INV-LAYER-003: L3-inference ↔ L3-pressure는 trait만 허용, concrete 금지
-    if src_layer == "L3-inference" and dst_layer == "L3-pressure":
-        kind = "L3-inference→L3-pressure (cross-domain concrete import)"
-        return ("INV-LAYER-003", kind, None)
-    if src_layer == "L3-pressure" and dst_layer == "L3-inference":
-        kind = "L3-pressure→L3-inference (cross-domain concrete import)"
+    # INV-LAYER-003 (S-3b-2, 2026-05-24 일반화): 모든 L3 도메인 쌍 사이 cross-domain
+    # concrete import 금지 (Q1 결정 — 예외는 사용자 확인 후 처리). trait 만 허용.
+    if src_layer in _L3_DOMAINS and dst_layer in _L3_DOMAINS and src_layer != dst_layer:
+        kind = f"{src_layer}→{dst_layer} (cross-domain concrete import)"
         return ("INV-LAYER-003", kind, None)
     # L3→L1 (backend concrete downcast)
-    if src_layer in ("L3-pressure", "L3-inference") and dst_layer == "L1":
+    if src_layer in _L3_DOMAINS and dst_layer == "L1":
         kind = f"{src_layer}→L1 (backend impl 직접 의존)"
         return ("INV-LAYER-003", kind, "downcast 패턴")
     # L3→cross-cutting concrete (V-10, V-14, V-22, V-26 등)
-    if src_layer in ("L3-pressure", "L3-inference") and dst_layer in ("observability", "resilience"):
+    if src_layer in _L3_DOMAINS and dst_layer in ("observability", "resilience"):
         kind = f"{src_layer}→cross-cutting({dst_layer}) (concrete 직접 의존, trait inversion 필요)"
         return ("INV-LAYER-003", kind, None)
 
     # INV-LAYER-004: cross-cutting(observability/resilience) → L3 concrete import 금지
     if src_layer in ("observability", "resilience"):
-        if dst_layer in ("L1", "L3-pressure", "L3-inference"):
+        if dst_layer in ("L1", *_L3_DOMAINS):
             kind = f"cross-cutting({src_layer})→{dst_layer} (trait inversion 필요)"
             return ("INV-LAYER-004", kind, None)
 
@@ -239,7 +245,7 @@ def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str |
         skip = any(name_no_ext.startswith(p) for p in L5_SKIP_PATTERNS)
         if not skip and basename == "generate.rs":
             # generate.rs → L1/L2/L3/observability/resilience 직접 import는 모두 위반
-            if dst_layer in ("L1", "L2", "L3-pressure", "L3-inference", "L3-core",
+            if dst_layer in ("L1", "L2", *_L3_DOMAINS, "L3-core",
                              "observability", "resilience"):
                 kind = f"L5/generate.rs→{dst_layer} (L4 session/ 우회)"
                 return ("INV-LAYER-005", kind, None)
@@ -652,7 +658,7 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 # §13.8-J: dispatch_orchestrator zone 안의 L3 import는
                 # INV-LAYER-001 위반에서 제외 (정책 query 함수 호출 한정).
                 # zone 안이면 cross-backend 검사도 건너뜀 (L1→L1 는 zone 범위 밖).
-                if is_exempt and dst_layer in ("L3-pressure", "L3-inference"):
+                if is_exempt and dst_layer in _L3_DOMAINS:
                     continue
 
                 # cross-backend 검사
