@@ -822,10 +822,7 @@ impl TransformerModel {
     /// to host pointers; only OpenCL needs explicit `UnifiedBuffer` mapping, so
     /// the wrapper is no-op for everything else. Always defined regardless of
     /// `opencl` feature — callers stay cfg-free.
-    pub fn map_weights_for_host_access(
-        &mut self,
-        gpu_backend: &Arc<dyn Backend>,
-    ) -> Result<usize> {
+    pub fn map_weights_for_host_access(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
         #[cfg(feature = "opencl")]
         {
             if gpu_backend
