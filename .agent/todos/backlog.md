@@ -119,7 +119,7 @@
 - **실측 비용**: B-5b Phase 2 vtable Δ -0.231% / -0.018% 측정으로 string compare 비용도 ≈ 0 추정. **production 영향 매우 작음** (KIVI 모드 한정).
 - **우선순위 사유**: P2 — INV-LAYER-003 143건 해소가 ROI 더 큼. KIVI는 production 사용 빈도 낮고 vtable 비용 측정 0.
 
-## [PARTIAL → DROP candidate] CpuBackend 생성 책임 통일 (DI 강화) — 2026-05-24 등록 / 2026-05-24 부분 정리
+## [DROP — 2026-05-24] CpuBackend 생성 책임 통일 (DI 강화) — 2026-05-24 등록 / 2026-05-24 종결
 - **Status**: 부분 정리 완료 (3B Minimal, master `7df6c0b6`) — 나머지 작업은 ROI 0으로 평가, DROP 후보
 - **2026-05-24 추가 측정 결과**: L4(`session/`) → L1(`backend::cpu`) import는 `scripts/layer_lint.py` invariant 미정의 영역 (INV-LAYER-001~005 모두 L4 source 규칙 없음). 본 entry의 "INV-LAYER-003 ~7~10건 해소" 추정은 잘못된 사전 측정이었음. 실제로는 trait signature 변경 옵션 (B/Hammered) 진행해도 baseline 0건 효과.
 - **완료된 부분 (3B Minimal, commit `7df6c0b6`)**:
@@ -127,11 +127,15 @@
   - `session/qcf_runtime.rs:202/237/284/295/326` → `cpu_backend.clone()` (alloc 5건 제거 + `cpu_back: Arc<dyn Backend>` 중간 변수 2건 폐기)
   - `runner.rs` / `qcf_runtime.rs`의 `use crate::backend::cpu::CpuBackend;` import 2건 제거
   - 정성적 효과: 단일 Arc 공유로 메모리 footprint ↓ + production DI 강화
-- **잔여 (DROP 후보)**:
+- **2026-05-24 S-2.5 sprint에서 GPU backend bootstrap 3건 추가 정리 (`9b8bcddd`)**:
+  - `engine/src/backend/cpu/mod.rs::cpu_singleton()` (`OnceLock<Arc<dyn Backend>>`) free fn 추가.
+  - cuda_embedded:530 / cuda_pc:328 / opencl:1540 의 `Arc::new(CpuBackend::new())` → `cpu_singleton()`. allocator + feature detect 3회 → 1회.
+  - baseline 효과 0 (cross-backend import 패턴 동일) — 사용자 결정 옵션 B로 의식적 진행.
+- **잔여 (의도적 보류)**:
   - `qcf_runtime.rs:881` (debug dump fallback) 1건 — 함수가 cpu_backend 미수신, signature 변경 비용 > ROI
   - `pressure/kivi_cache.rs:358` (`KiviCache::new()` default `Arc::new(CpuBackend::new())`) — 호출지 전원 test scope
   - test scope 40+ 호출지 — 의도된 test 패턴 (각 test 독립 객체)
-- **선행 sprint와 시너지**: 본 작업이 동시 묶일 만한 후속 sprint는 잠재적으로 [P2] `generate 바이너리 분할 + Manager 통합`. 새 entry point 작성 시 single CpuBackend instance 주입 패턴이 자연스럽게 들어감. 단독 진행은 ROI 미만.
+- **DROP 사유**: production callsite (session/, GPU backend bootstrap 3건) 정리 완료. 잔여 callsite는 본질적으로 단독 진행 ROI 미만 (test scope 또는 sig 변경 cost > value).
 
 ## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
 - **Status**: TODO (M2 baseline부터 누적, M3.0 무관)
