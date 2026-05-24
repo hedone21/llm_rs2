@@ -688,21 +688,26 @@ impl SessionInitCtx {
         // directive handler below). This avoids the ~200 ms startup cost and
         // the 400+ MB RSS uplift that hit every run which only enabled the
         // manager channel but never actually used CPU-side weight access.
+        // §13.8-B B-1: cfg-gate-free wrapper (`map_weights_for_host_access`).
+        // OpenCL 미빌드 또는 backend가 OpenCL 아닐 때 wrapper가 Ok(0) 반환.
+        // tensor_partition helper는 layers::tensor_partition 모듈에 있어 opencl
+        // off 시점에는 import 되지 않으므로 partition 조건만 cfg-gate 유지한다.
         #[cfg(feature = "opencl")]
         let cli_partition_needs_cpu_weights = args.tensor_partition > 0.0
             && !crate::layers::tensor_partition::is_gpu_only_ratio(args.tensor_partition);
-        #[cfg(feature = "opencl")]
+        #[cfg(not(feature = "opencl"))]
+        let cli_partition_needs_cpu_weights = false;
         if is_gpu
             && (args.resilience_prealloc_switch
                 || cli_partition_needs_cpu_weights
                 || args.prefill_cpu_chunk_size > 0)
         {
-            match model.map_weights_for_cpu(&backend) {
+            match model.map_weights_for_host_access(&backend) {
                 Ok(n) if n > 0 => eprintln!(
                     "[Backend] Mapped {} weight tensors for dual CPU/GPU access",
                     n
                 ),
-                Ok(_) => {} // All weights already CPU-accessible
+                Ok(_) => {} // No remap needed (already host-accessible / non-OpenCL backend).
                 Err(e) => eprintln!("[Backend] Weight mapping failed (switch may crash): {}", e),
             }
         }
