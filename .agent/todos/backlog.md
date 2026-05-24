@@ -4,6 +4,26 @@
 
 ---
 
+## [P2] §13.8-L hot path sub-trait 격상 — 2026-05-24 등록 (S-C1 후속)
+- **Status**: TODO (D-1 sprint S-C1 후 marker로 우회, 본질 격상 backlog 등록)
+- **선행**: `.agent/todos/handoff_inv_layer003_complete_2026_05_24.md` (D-1 sprint handoff)
+- **상세**: §13.8-L L-marker 75건 중 hot path 14건 (forward.rs/forward_gen.rs/attention.rs/llama_layer.rs)의 `as_any().downcast_ref::<*Backend>()` 패턴을 `OpenCLContext` / `CudaContext` / `QnnOppkgContext` sub-trait 격상으로 해소.
+- **API surface 추정**: OpenCLContext ~8 메서드 (queue, set_op_label, has_kivi_attn_kernel, is_nosub, gpu_score_acc, etc) + nested trait 3개 (Queue/GpuScoreAcc/Program).
+- **선행 작업**: Plan executor 추상화 — `plan.execute(ocl_backend, ...)` 함수 시그니처를 trait dispatch로 변경. 이게 본 sprint의 가장 큰 산.
+- **비용**: 3~5일. S25 Adreno OpenCL + Jetson CUDA + S25 qnn_oppkg 3종 bit-identical 디바이스 게이트 필수.
+- **연관**: 기존 `[P2] KiviCache hot path downcast resolve` 항목과 통합 처리 가능.
+
+## [P2] §13.8-O cross-L3 vocabulary trait inversion — 2026-05-24 등록 (S-C3 후속)
+- **Status**: TODO (D-1 sprint S-C3 후 marker로 우회, 본질 격상 backlog 등록)
+- **선행**: `.agent/todos/handoff_inv_layer003_complete_2026_05_24.md`
+- **상세**: §13.8-O register 9건의 본질 trait inversion. 3 갈래:
+  - **WeightSwapDispatch trait** (3건): `pressure/weight_swap_handler.rs`의 ModelConfig + SwapExecutor + LayerSlot/SecondaryMmap 의존을 trait + handler 이동(`models/weights/swap_handler.rs`)으로 해소. ActionResult enum 의존은 §13.8-F.
+  - **PrefetchAccess + PreloadPool L2 격상** (3건): `pressure/offload/{preload_pool,prefetch}` 의 trait/struct을 L2 또는 inference 도메인으로 격상. forward_into_offload 분리 결정 선행.
+  - **KvCacheView trait** (3건): `KVCacheOps` trait의 default type parameter를 caller에 명시 강제 또는 KVCache의 일부 method를 read-only trait으로 분리. 외부 API surface 영향 큼.
+- **비용**: 1~3일 (3 트랙 분할 가능). 디바이스 게이트는 ModelForward path에 한정 (S-C3a/b/c sub-sprint 분할).
+
+---
+
 ## [PARTIAL → CANCELLED] Phase 4-4-2.3 — decode_fallback 추출 — 2026-05-21 부분 완료 + 잔여 취소
 - **Status**: 3a/3c/3b **완료** (master `02cb7106`). 3d/3e는 **취소** — 사용자 결정 (2026-05-21).
 - **결정 사유**: generate.rs를 더 줄이지 않고 legacy로 보존, 새로운 다수 바이너리로 기능 분할하는 방향 전환. 잔여 3d/3e/4-4-2.4 추출은 새 바이너리 설계 안에서 자연 해소.
