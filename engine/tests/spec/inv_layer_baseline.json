@@ -20,15 +20,6 @@
       "is_test_block": false
     },
     {
-      "id": "V-13",
-      "file": "pressure/kivi_cache.rs",
-      "line": 387,
-      "import": "crate::qcf::KiviQcfComputer",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→L3-qcf (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
       "id": "V-21",
       "file": "models/transformer.rs",
       "line": 15,
@@ -372,15 +363,6 @@
     },
     {
       "id": "V-??",
-      "file": "layers/transformer_layer/forward.rs",
-      "line": 63,
-      "import": "crate::pressure::d2o_layer_alloc::D2OVarianceCollector",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
       "file": "layers/transformer_layer/mod.rs",
       "line": 12,
       "import": "crate::pressure::kv_cache::KVCache",
@@ -412,24 +394,6 @@
       "file": "models/transformer.rs",
       "line": 174,
       "import": "crate::pressure::d2o_layer_alloc::D2OVarianceCollector",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "models/transformer.rs",
-      "line": 2565,
-      "import": "crate::pressure::kivi_cache::KiviCache",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "models/transformer.rs",
-      "line": 2742,
-      "import": "crate::pressure::kivi_cache::KiviCache",
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→L3-pressure (cross-domain concrete import)",
       "is_test_block": false
@@ -507,5 +471,5 @@
       "is_test_block": false
     }
   ],
-  "baseline_count": 56
+  "baseline_count": 52
 }

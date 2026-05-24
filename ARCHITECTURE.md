@@ -1671,8 +1671,8 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 5건 이상 누적 시 §13.4에 *sub-layer chain register* 표 신설 검토 (§F/G/I allowlist 정책과 동일 운용 원리).
   - 화이트리스트 외 cross-backend import 시 본 §K 우회를 우려하여 PR 리뷰 시 화이트리스트 변경이 동반되는지 확인.
 
-**§L — Backend concrete downcast zone (L3→L1 cold-path access): RESOLVED (2026-05-24)**
-- **결정**: L3 도메인(`pressure/`, `layers/`, `models/`, `inference/`, `qcf/`)에서 L1 backend의 concrete struct(`OpenCLBackend`/`CudaBackend`/`QnnOppkgBackend`/`CpuBackend`)을 downcast 또는 인스턴스 생성으로 접근하는 패턴은 두 갈래로 분리하여 운용한다.
+**§L — Backend concrete downcast zone (L3→L1 cold-path access + cross-L3 default init): RESOLVED (2026-05-24, S-C5 확장)**
+- **결정**: L3 도메인(`pressure/`, `layers/`, `models/`, `inference/`, `qcf/`)에서 L1 backend의 concrete struct(`OpenCLBackend`/`CudaBackend`/`QnnOppkgBackend`/`CpuBackend`)을 downcast 또는 인스턴스 생성으로 접근하는 패턴, 그리고 cross-L3 concrete default initialization(예: pressure가 qcf의 unit struct을 trait 구현체로 default field 보유)은 두 갈래로 분리하여 운용한다.
   - **(L-auto) EXT-anchored chain**: `get_extension(crate::backend::EXT_*)` 직후의 `.downcast_ref::<*Backend>()` chain은 *자동 화이트리스트*. lint script가 ±5 라인 윈도우에서 anchor 탐지.
   - **(L-marker) Bare downcast / instance**: `as_any().downcast_ref::<*Backend>()` 또는 `Arc::new(*Backend::new())` 패턴은 함수/블록 단위 zone marker(`// LAYER-EXEMPT: backend_concrete_downcast`)로 명시. marker zone 안의 L3→L1 import는 baseline에서 제외.
 - **허용 조건** (4개 모두 만족):
@@ -1696,9 +1696,10 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - **(L-marker)** `_find_backend_downcast_zone_ranges`: §13.8-J `_find_exempt_zone_ranges` 패턴 재사용. marker 형식 `// LAYER-EXEMPT: backend_concrete_downcast` (정확히 이 텍스트). 함수 시그니처 바로 위 또는 블록 시작 다음 줄. zone close는 함수 종료 또는 `// LAYER-EXEMPT-END`.
   - **검사 제외 대상**: zone 안의 `crate::backend::*::*Backend` 인라인 / `use crate::backend::*::*Backend;` use 문, `Arc::new(*Backend::new())` 인스턴스 생성, `*Backend::new()` 호출.
   - **검사 적용 대상**: zone 안이라도 다른 카테고리(예: `crate::pressure::*` cross-domain) import는 본 예외 밖이다. baseline에 등재 유지.
-- **§L 적용 register** (S-C1 sprint 2026-05-24, RESOLVED):
+- **§L 적용 register** (S-C1 sprint 2026-05-24, RESOLVED; S-C5 확장):
   - **L-auto** 4건: `models/transformer.rs:380/818`, `models/weights/secondary_mmap.rs:754/796` — `get_extension(EXT_OPENCL_QUEUE/EXT_OPENCL_SECONDARY/EXT_QNN_OPPKG)` chain.
   - **L-marker** 75건: 함수 단위 marker로 ~20개 함수에 분포. INIT 27 / HOT 14 / COLD_SWAP 14 / COLD_EVICT 6 / OTHER 14.
+  - **L-marker cross-L3** 1건 (S-C5): `pressure/kivi_cache.rs:387` — `KiviQcfComputer` default initialization (S-3b-4 trail). 본 default는 ZST unit struct trait 구현체로 의미상 결합도 0이나 정직성 위해 marker 명시.
 - **운용 메모**:
   - 신규 marker 추가 시 PR description에 *해당 함수가 cold path임을 입증하는 호출 빈도 데이터* 또는 *hot path 측정값 (downcast 비용 vs TBT 비율)* 기재.
   - 5건 이상의 hot path marker 누적 시 sub-trait 격상 별 sprint 강제 trigger (현재 14건 hot path가 이미 sub-trait sprint 대상).

@@ -384,6 +384,7 @@ impl KiviCache {
             gpu_q2v: None,
             gpu_q2k_blocks: 0,
             gpu_q2v_blocks: 0,
+            // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cross-L3 default qcf computer (cold-path one-time init, S-3b-4 trail)
             qcf_computer: Box::<crate::qcf::KiviQcfComputer>::default(),
         }
     }

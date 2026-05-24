@@ -716,9 +716,13 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                     continue
 
                 # §13.8-L: backend_concrete_downcast zone (marker 또는 EXT-anchored
-                # auto chain) 안의 L3→L1 import는 INV-LAYER-003에서 제외.
-                # L3→L3 cross-domain이나 다른 카테고리는 본 예외 밖.
-                if in_l and src_layer in _L3_DOMAINS and dst_layer == "L1":
+                # auto chain) 안의 import는 INV-LAYER-003 전체에서 제외.
+                # 적용 범위: L3→L1 backend impl + cross-L3 default initialization
+                # (예: pressure가 qcf concrete unit struct을 default field로 보유).
+                # 본 정책은 marker 단위로 적용되므로 별 sprint(S-C3) trait inversion
+                # 대상과 충돌하지 않음 (의도성 명시 위치만 제외).
+                if in_l and src_layer in _L3_DOMAINS \
+                        and (dst_layer == "L1" or dst_layer in _L3_DOMAINS):
                     continue
 
                 # cross-backend 검사
