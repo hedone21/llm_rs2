@@ -12,13 +12,49 @@ mod qnn_bindgen {
     use std::env;
     use std::path::PathBuf;
 
+    /// SDK include path resolution (B-4):
+    /// 1. `QNN_SDK_ROOT` env (worktree / CI 명시 override).
+    /// 2. `<workspace_root>/third_party/qnn_sdk_2.33/include/QNN` (default).
+    /// 3. git worktree 시 main repo `<main>/third_party/...` fallback —
+    ///    `.git` file의 `gitdir: <main>/.git/worktrees/<name>` 추적.
+    fn resolve_qnn_sdk_inc(workspace_root: &std::path::Path) -> PathBuf {
+        if let Ok(env_root) = env::var("QNN_SDK_ROOT") {
+            let p = PathBuf::from(env_root).join("include/QNN");
+            if p.exists() {
+                return p;
+            }
+        }
+        let primary = workspace_root.join("third_party/qnn_sdk_2.33/include/QNN");
+        if primary.exists() {
+            return primary;
+        }
+        let git_file = workspace_root.join(".git");
+        if let Ok(contents) = std::fs::read_to_string(&git_file)
+            && let Some(line) = contents.lines().next()
+            && let Some(gitdir) = line.strip_prefix("gitdir: ")
+        {
+            let gitdir = PathBuf::from(gitdir.trim());
+            if let Some(main_repo) = gitdir
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+            {
+                let fallback = main_repo.join("third_party/qnn_sdk_2.33/include/QNN");
+                if fallback.exists() {
+                    return fallback;
+                }
+            }
+        }
+        primary
+    }
+
     pub fn run() {
         // SDK location (relative to workspace root, since cargo runs build.rs in crate dir)
         let workspace_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
             .parent()
             .unwrap()
             .to_path_buf();
-        let sdk_inc = workspace_root.join("third_party/qnn_sdk_2.33/include/QNN");
+        let sdk_inc = resolve_qnn_sdk_inc(&workspace_root);
         if !sdk_inc.exists() {
             println!(
                 "cargo:warning=QNN SDK not found at {} — set up `third_party/qnn_sdk_2.33/include/QNN/` for `qnn` feature builds",

@@ -817,6 +817,26 @@ impl TransformerModel {
     /// PSS double-counting.
     ///
     /// Call at startup when resilience/tensor-partition is enabled and backend is GPU.
+    /// Backend-agnostic wrapper that dispatches to the active GPU's host-access
+    /// remap path. CPU / CUDA UMA / non-OpenCL backends already expose weights
+    /// to host pointers; only OpenCL needs explicit `UnifiedBuffer` mapping, so
+    /// the wrapper is no-op for everything else. Always defined regardless of
+    /// `opencl` feature — callers stay cfg-free.
+    pub fn map_weights_for_host_access(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
+        #[cfg(feature = "opencl")]
+        {
+            if gpu_backend
+                .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+                .is_some()
+            {
+                return self.map_weights_for_cpu(gpu_backend);
+            }
+        }
+        // CPU / CUDA UMA / QNN: weights already host-pointer-accessible.
+        let _ = gpu_backend;
+        Ok(0)
+    }
+
     #[cfg(feature = "opencl")]
     pub fn map_weights_for_cpu(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
         // COLD-EXT: weight mmap startup (1회).

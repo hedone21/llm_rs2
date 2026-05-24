@@ -1,5 +1,46 @@
 // Generates QNN SDK bindings into OUT_DIR. Mirrors engine/build.rs.
 
+/// SDK include path resolution (B-4):
+/// 1. `QNN_SDK_ROOT` env var (worktree / CI 명시 override).
+/// 2. `<workspace_root>/third_party/qnn_sdk_2.33/include/QNN` (default).
+/// 3. git worktree 시 main repo `<main>/third_party/...` fallback —
+///    `.git` file에 적힌 `gitdir: <main>/.git/worktrees/<name>` 추적.
+/// 모두 실패 시 primary path 반환 (warning + empty bindings 출력).
+fn resolve_qnn_sdk_inc(workspace_root: &std::path::Path) -> std::path::PathBuf {
+    use std::env;
+    use std::path::PathBuf;
+
+    if let Ok(env_root) = env::var("QNN_SDK_ROOT") {
+        let p = PathBuf::from(env_root).join("include/QNN");
+        if p.exists() {
+            return p;
+        }
+    }
+    let primary = workspace_root.join("third_party/qnn_sdk_2.33/include/QNN");
+    if primary.exists() {
+        return primary;
+    }
+    let git_file = workspace_root.join(".git");
+    if let Ok(contents) = std::fs::read_to_string(&git_file)
+        && let Some(line) = contents.lines().next()
+        && let Some(gitdir) = line.strip_prefix("gitdir: ")
+    {
+        let gitdir = PathBuf::from(gitdir.trim());
+        // gitdir layout: <main>/.git/worktrees/<name>
+        if let Some(main_repo) = gitdir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            let fallback = main_repo.join("third_party/qnn_sdk_2.33/include/QNN");
+            if fallback.exists() {
+                return fallback;
+            }
+        }
+    }
+    primary
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -12,7 +53,7 @@ fn main() {
         .parent()
         .unwrap()
         .to_path_buf();
-    let sdk_inc = workspace_root.join("third_party/qnn_sdk_2.33/include/QNN");
+    let sdk_inc = resolve_qnn_sdk_inc(&workspace_root);
     if !sdk_inc.exists() {
         println!("cargo:warning=QNN SDK not found at {}", sdk_inc.display());
         let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());

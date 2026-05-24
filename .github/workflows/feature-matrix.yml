@@ -1,0 +1,69 @@
+# Feature matrix CI (§13.8-B B-5).
+#
+# 다중 cargo feature 조합을 매 PR / push 시 자동 빌드하여 broken feature
+# combination 회귀를 머지 전 차단한다. QNN SDK는 EULA-bound이며 CI runner에는
+# 없으므로 build.rs 가 empty bindings 출력 + lib syntax check 만 가능 (qnn 조합은
+# OS dispatch 가 실패하지만 syntactic build 는 통과).
+name: feature-matrix
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: default
+            args: ""
+          - label: no-default-features
+            args: "--no-default-features"
+          - label: +opencl
+            args: "--no-default-features --features opencl"
+          - label: +opencl,resilience
+            args: "--no-default-features --features opencl,resilience"
+          - label: +cuda
+            args: "--no-default-features --features cuda"
+          - label: +cuda-embedded
+            args: "--no-default-features --features cuda-embedded"
+          - label: +qnn
+            args: "--no-default-features --features qnn"
+          - label: +vulkan
+            args: "--no-default-features --features vulkan"
+          - label: +resilience
+            args: "--no-default-features --features resilience"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install OpenCL headers
+        if: contains(matrix.label, 'opencl') || matrix.label == 'default'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.label }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.label }}-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build (${{ matrix.label }})
+        run: cargo build --release --bin argus_cli ${{ matrix.args }}

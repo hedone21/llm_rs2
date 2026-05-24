@@ -440,7 +440,8 @@ fn remap_weights_for_cpu_after_swap(
     if !is_gpu || !enabled {
         return;
     }
-    match model.map_weights_for_cpu(backend) {
+    // §13.8-B B-1: cfg-gate-free wrapper. opencl off / non-OpenCL backend면 Ok(0).
+    match model.map_weights_for_host_access(backend) {
         Ok(0) => {}
         Ok(n) => eprintln!(
             "[Backend] Re-mapped {} weight tensors after {} (host pointer restored)",
