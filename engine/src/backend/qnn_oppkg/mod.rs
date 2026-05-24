@@ -822,10 +822,7 @@ impl Backend for QnnOppkgBackend {
         self
     }
 
-    // B-5b Phase 2 Stage 2-B: intra-token GPU yield hook routed through trait.
-    fn yield_after_layer(&self, layer: usize, is_decode: bool) {
-        crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
-    }
+    // yield_after_layer: trait default body (S-2 sprint 2026-05-24).
 
     // COLD-EXT: backend handle 노출 — rpcmem secondary loader 가
     // `downcast_ref::<QnnOppkgBackend>()` 대신 본 lookup 사용. 정책은

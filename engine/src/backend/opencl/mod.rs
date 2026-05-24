@@ -1535,10 +1535,9 @@ impl OpenCLBackend {
             // `swap_context_or_init()` / `swap_queue_or_init()`.
             swap_context: std::sync::OnceLock::new(),
             swap_queue: std::sync::OnceLock::new(),
-            // B-5b Phase 2 Stage 1: own a CPU companion for Stage 2 host
-            // fallback routing. `CpuBackend::new()` returns `Self` (not
-            // `Result`) on every target arch, so this is infallible.
-            cpu_companion: Arc::new(crate::backend::cpu::CpuBackend::new()),
+            // CPU companion for host fallback routing (S-2 sprint
+            // 2026-05-24): shared singleton — feature detection runs once.
+            cpu_companion: crate::backend::cpu::cpu_singleton(),
         })
     }
 
@@ -6586,10 +6585,7 @@ impl Backend for OpenCLBackend {
         &*self.cpu_companion
     }
 
-    // B-5b Phase 2 Stage 2-B: intra-token GPU yield hook routed through trait.
-    fn yield_after_layer(&self, layer: usize, is_decode: bool) {
-        crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
-    }
+    // yield_after_layer: trait default body (S-2 sprint 2026-05-24).
 
     // COLD-EXT: backend handle 노출 — qnn_oppkg swap path / secondary_mmap
     // loader / transformer loader 에서 `downcast_ref::<OpenCLBackend>()` 를

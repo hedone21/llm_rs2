@@ -22,6 +22,7 @@ pub mod quant;
 pub mod shape;
 pub mod tensor;
 pub mod thread_pool;
+pub mod yield_policy;
 
 pub mod experiment;
 pub mod observability;

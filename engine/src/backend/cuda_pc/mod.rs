@@ -323,9 +323,9 @@ impl CudaBackend {
             // LISWAP-2 prototype (plan: chasing-hopper). Lazy-init in
             // `transfer_stream_or_init`.
             transfer_stream: Arc::new(std::sync::OnceLock::new()),
-            // B-5b Phase 2 Stage 1: CPU companion for Stage 2 host fallback
-            // routing. `CpuBackend::new()` is infallible across target archs.
-            cpu_companion: Arc::new(crate::backend::cpu::CpuBackend::new()),
+            // CPU companion for host fallback routing (S-2 sprint
+            // 2026-05-24): shared singleton — feature detection runs once.
+            cpu_companion: crate::backend::cpu::cpu_singleton(),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -1803,10 +1803,7 @@ impl Backend for CudaBackend {
         &*self.cpu_companion
     }
 
-    // B-5b Phase 2 Stage 2-B: intra-token GPU yield hook routed through trait.
-    fn yield_after_layer(&self, layer: usize, is_decode: bool) {
-        crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
-    }
+    // yield_after_layer: trait default body (S-2 sprint 2026-05-24).
 }
 
 #[cfg(test)]

@@ -1192,22 +1192,49 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// Intra-token GPU yield hook. Default no-op (CPU backends).
+    /// Intra-token cooperative yield hook.
     ///
     /// Called once per layer in the decode loop (and per layer in the OpenCL
-    /// plan path). GPU backends (`OpenCLBackend`, `CudaBackend` (pc + embedded),
-    /// `QnnOppkgBackend`) override this to delegate to
-    /// `crate::resilience::gpu_yield::gpu_yield_impl` which performs
-    /// `synchronize()` + optional `sleep_us()` when configured via
-    /// `LLMRS_DECODE_YIELD_EVERY`/`LLMRS_DECODE_YIELD_US`.
+    /// plan path). The default body implements env-driven yield:
+    /// flush via `self.synchronize()` and sleep `LLMRS_DECODE_YIELD_US`
+    /// microseconds every `LLMRS_DECODE_YIELD_EVERY` layers, gated by
+    /// `is_decode`. CPU backends inherit the default — when env vars are
+    /// unset, `yield_every() == 0` short-circuits before `synchronize()`,
+    /// so the hook is effectively zero-cost.
     ///
-    /// B-5b Phase 2 Stage 2-B: call sites
-    /// (`backend/opencl/plan.rs`, `models/transformer.rs`) now invoke this
-    /// trait method instead of the previous freestanding
-    /// `gpu_yield::maybe_yield_after_layer`. Stage 2-A S25 result showed
-    /// vtable cost below measurement noise; Stage 2-B regression re-check
-    /// follows in a separate task.
-    fn yield_after_layer(&self, _layer: usize, _is_decode: bool) {}
+    /// Backends may override this to use a backend-specific yield primitive
+    /// (custom scheduler hint, finer-grained sync), but the default works
+    /// for all backends. The freestanding `gpu_yield_impl` helper was
+    /// folded into this default body (S-2 sprint 2026-05-24) so that
+    /// `backend.rs` (L2) no longer crosses the cross-cutting boundary that
+    /// INV-LAYER-001 prohibits — env-var caching lives in
+    /// `crate::yield_policy` (also L2).
+    ///
+    /// B-5b Phase 2 Stage 2-A S25 microbench showed vtable cost below
+    /// measurement noise.
+    fn yield_after_layer(&self, layer_idx: usize, is_decode: bool) {
+        if !is_decode {
+            return;
+        }
+        let every = crate::yield_policy::yield_every();
+        if every == 0 {
+            return;
+        }
+        if !(layer_idx + 1).is_multiple_of(every) {
+            return;
+        }
+        // flush + wait: kernels already dispatched must drain before the
+        // sleep is useful (otherwise the sleep overlaps with the in-flight
+        // burst and buys nothing). synchronize() errors are swallowed —
+        // yield is a best effort, not a correctness hook.
+        let _ = self.synchronize();
+        let us = crate::yield_policy::yield_us();
+        if us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(us));
+        } else {
+            std::thread::yield_now();
+        }
+    }
 
     // COLD-EXT: ─────────────────────────────────────────────────────────────
     //

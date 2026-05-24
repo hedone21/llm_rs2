@@ -525,9 +525,9 @@ impl CudaBackend {
             graph_update_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             graph_instantiate_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             graph_step_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            // B-5b Phase 2 Stage 1: CPU companion for Stage 2 host fallback
-            // routing. `CpuBackend::new()` is infallible across target archs.
-            cpu_companion: Arc::new(crate::backend::cpu::CpuBackend::new()),
+            // CPU companion for host fallback routing (S-2 sprint
+            // 2026-05-24): shared singleton — feature detection runs once.
+            cpu_companion: crate::backend::cpu::cpu_singleton(),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -3062,10 +3062,8 @@ impl Backend for CudaBackend {
         &*self.cpu_companion
     }
 
-    // B-5b Phase 2 Stage 2-B: intra-token GPU yield hook routed through trait.
-    fn yield_after_layer(&self, layer: usize, is_decode: bool) {
-        crate::resilience::gpu_yield::gpu_yield_impl(self, layer, is_decode);
-    }
+    // yield_after_layer: trait default body (S-2 sprint 2026-05-24) — folded
+    // gpu_yield_impl into Backend default to remove L1 → resilience import.
 }
 
 #[cfg(test)]
