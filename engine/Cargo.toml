@@ -332,3 +332,9 @@ path = "microbench/vulkan_hello.rs"
 name = "microbench_vulkan_two_queue"
 path = "microbench/vulkan_two_queue.rs"
 
+# Sprint argus-cli-v0 baseline 비교용 임시 entry. 호스트/디바이스 게이트 완료 후
+# `git rm engine/legacy/generate.rs` + 이 entry 제거 예정 (PoC 단계에서만 빌드).
+[[bin]]
+name = "legacy_generate"
+path = "legacy/generate.rs"
+
