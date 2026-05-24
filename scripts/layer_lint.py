@@ -329,11 +329,13 @@ RE_USE_LIB = re.compile(r'^\s*(?:pub\s+)?use\s+(llm_rs2::\S+)\s*;', re.MULTILINE
 # 인라인 crate:: 참조 (함수 본문 내)
 RE_INLINE_CRATE = re.compile(r'(?<!\w)(crate::[a-zA-Z_][a-zA-Z0-9_:]*)')
 
-def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
+def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool, bool]]:
     """
-    파일에서 (line_number, import_path, is_test_block, in_exempt_zone) 목록 반환.
+    파일에서 (line_number, import_path, is_test_block, in_exempt_zone, in_l_zone) 목록 반환.
     is_test_block=True는 #[cfg(test)] 블록 내부.
     in_exempt_zone=True는 §13.8-J LAYER-EXEMPT: dispatch_orchestrator zone 내부.
+    in_l_zone=True는 §13.8-L LAYER-EXEMPT: backend_concrete_downcast zone 내부
+            (marker 또는 EXT-anchored auto chain).
     """
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
@@ -344,25 +346,26 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
     # #[cfg(test)] 블록 범위 감지 (간단한 brace 카운팅)
     test_block_ranges = _find_test_block_ranges(lines)
     # §13.8-J dispatch orchestrator zone 범위 감지
-    exempt_zone_ranges = _find_exempt_zone_ranges(lines)
+    exempt_zone_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER)
+    # §13.8-L backend concrete downcast zone 범위 감지 (marker + EXT-anchored auto)
+    l_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_L)
+    l_auto_ranges = _find_ext_anchor_ranges(lines)
+    l_zone_ranges = l_marker_ranges + l_auto_ranges
 
     def in_test_block(lineno: int) -> bool:
-        for start, end in test_block_ranges:
-            if start <= lineno <= end:
-                return True
-        return False
+        return any(s <= lineno <= e for s, e in test_block_ranges)
 
     def in_exempt_zone(lineno: int) -> bool:
-        for start, end in exempt_zone_ranges:
-            if start <= lineno <= end:
-                return True
-        return False
+        return any(s <= lineno <= e for s, e in exempt_zone_ranges)
+
+    def in_l_zone(lineno: int) -> bool:
+        return any(s <= lineno <= e for s, e in l_zone_ranges)
 
     # use crate:: 문 추출
     for i, line in enumerate(lines, 1):
         m = RE_USE_CRATE.match(line)
         if m:
-            results.append((i, m.group(1), in_test_block(i), in_exempt_zone(i)))
+            results.append((i, m.group(1), in_test_block(i), in_exempt_zone(i), in_l_zone(i)))
 
     # use llm_rs2:: 문 추출 (bin/ 파일용) — llm_rs2::foo → crate::foo로 정규화
     for i, line in enumerate(lines, 1):
@@ -370,7 +373,7 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
         if m:
             # llm_rs2:: → crate:: 로 정규화하여 레이어 분류에 사용
             normalized = m.group(1).replace("llm_rs2::", "crate::", 1)
-            results.append((i, normalized, in_test_block(i), in_exempt_zone(i)))
+            results.append((i, normalized, in_test_block(i), in_exempt_zone(i), in_l_zone(i)))
 
     # 인라인 crate:: 참조 추출 (use 문이 아닌 것)
     for i, line in enumerate(lines, 1):
@@ -382,7 +385,7 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool]]:
             imp = m.group(1)
             # 최소 2단계 이상의 경로만 (crate::foo 이상)
             if imp.count("::") >= 1:
-                results.append((i, imp, in_test_block(i), in_exempt_zone(i)))
+                results.append((i, imp, in_test_block(i), in_exempt_zone(i), in_l_zone(i)))
 
     return results
 
@@ -423,15 +426,19 @@ def _find_test_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
 # ────────────────────────────────────────────────────────────────────
 
 _EXEMPT_MARKER = "// LAYER-EXEMPT: dispatch_orchestrator"
+_EXEMPT_MARKER_L = "// LAYER-EXEMPT: backend_concrete_downcast"
 _EXEMPT_END_MARKER = "// LAYER-EXEMPT-END"
 
 # fn 시그니처 패턴: `fn name(...) -> ... {` 또는 `fn name(...) {`
 _RE_FN_START = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+\w+')
 
+# §13.8-L EXT-anchored chain 자동 인식 패턴
+_RE_EXT_ANCHOR = re.compile(r'\.get_extension\(crate::backend::EXT_\w+\)')
 
-def _find_exempt_zone_ranges(lines: list[str]) -> list[tuple[int, int]]:
+
+def _find_exempt_zone_ranges(lines: list[str], marker: str = _EXEMPT_MARKER) -> list[tuple[int, int]]:
     """
-    `// LAYER-EXEMPT: dispatch_orchestrator` marker가 표시된 zone의
+    `// LAYER-EXEMPT: <kind>` marker가 표시된 zone의
     (start_line, end_line) 목록을 반환 (1-based 라인 번호, 양 끝 포함).
 
     두 가지 부착 형태 지원:
@@ -455,26 +462,43 @@ def _find_exempt_zone_ranges(lines: list[str]) -> list[tuple[int, int]]:
     while i < n:
         stripped = lines[i].strip()
 
-        if _EXEMPT_MARKER not in stripped:
+        if marker not in stripped:
             i += 1
             continue
 
         marker_lineno = i + 1  # 1-based
 
-        # 다음 줄이 fn 시그니처인지 확인 (함수 형태)
+        # marker 다음의 attribute / doc comment / 빈 줄을 스킵하여 target 코드 라인 찾기.
         next_i = i + 1
+        code_i = next_i
+        while code_i < n:
+            stripped_c = lines[code_i].strip()
+            if (stripped_c.startswith("#[") or stripped_c.startswith("///")
+                    or stripped_c.startswith("//!") or stripped_c == ""):
+                code_i += 1
+                continue
+            break
+
+        # use 문 형태: 1줄 zone
+        if code_i < n and (RE_USE_CRATE.match(lines[code_i]) or RE_USE_LIB.match(lines[code_i])):
+            ranges.append((code_i + 1, code_i + 1))
+            i = code_i + 1
+            continue
+
+        # 다음 줄이 fn 시그니처인지 확인 (함수 형태)
+        next_i = code_i  # fn form 검사 시점도 attribute skip 이후로
         if next_i < n and _RE_FN_START.match(lines[next_i]):
-            # 함수 형태: fn 시그니처 줄부터 `{`를 찾아 zone 시작 확정
-            zone_start = None
+            # 함수 형태: fn 시그니처 줄부터 (시그니처 안의 crate:: 참조도 포함) zone 시작.
+            zone_start = next_i + 1  # 1-based, fn 시그니처 라인
             brace_depth = 0
+            entered_block = False
             j = next_i
             while j < n:
                 seg = lines[j].strip()
                 brace_depth += seg.count("{") - seg.count("}")
-                if "{" in seg and zone_start is None:
-                    zone_start = j + 1  # 1-based, 시그니처 끝 `{` 포함 줄
-                if zone_start is not None and brace_depth <= 0:
-                    # zone = zone_start ~ j+1 (1-based)
+                if brace_depth > 0:
+                    entered_block = True
+                if entered_block and brace_depth <= 0:
                     ranges.append((zone_start, j + 1))
                     i = j + 1
                     break
@@ -512,9 +536,30 @@ def _find_exempt_zone_ranges(lines: list[str]) -> list[tuple[int, int]]:
                 i = next_i
             continue
 
-        # marker가 있지만 위 두 경우에 해당하지 않으면 무시
+        # fall-through: marker 다음 코드 라인 1줄을 zone으로 등록
+        # (struct field / 일반 식별자 등 form 분기 없는 경우)
+        if code_i < n:
+            ranges.append((code_i + 1, code_i + 1))
+            i = code_i + 1
+            continue
+
+        # 더 이상 코드 라인 없음
         i += 1
 
+    return ranges
+
+
+def _find_ext_anchor_ranges(lines: list[str], window: int = 5) -> list[tuple[int, int]]:
+    """
+    §13.8-L (L-auto) — `.get_extension(crate::backend::EXT_*)` chain 라인 ±window 윈도우를
+    자동 화이트리스트 zone으로 등록. anchor 라인의 다음 N줄까지의 backend concrete
+    downcast / instance import를 baseline 제외 대상으로 표시.
+    """
+    ranges: list[tuple[int, int]] = []
+    n = len(lines)
+    for i, line in enumerate(lines, 1):
+        if _RE_EXT_ANCHOR.search(line):
+            ranges.append((max(1, i - 1), min(n, i + window)))
     return ranges
 
 
@@ -647,7 +692,7 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
             src_layer = classify_module(rel_path)
             imports = extract_imports(full_path)
 
-            for lineno, imp, is_test, is_exempt in imports:
+            for lineno, imp, is_test, is_exempt, in_l in imports:
                 # imp에서 정규화된 경로 추출
                 imp_clean = imp.strip()
                 if imp_clean.startswith("crate::"):
@@ -660,6 +705,12 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 # INV-LAYER-001 위반에서 제외 (정책 query 함수 호출 한정).
                 # zone 안이면 cross-backend 검사도 건너뜀 (L1→L1 는 zone 범위 밖).
                 if is_exempt and dst_layer in _L3_DOMAINS:
+                    continue
+
+                # §13.8-L: backend_concrete_downcast zone (marker 또는 EXT-anchored
+                # auto chain) 안의 L3→L1 import는 INV-LAYER-003에서 제외.
+                # L3→L3 cross-domain이나 다른 카테고리는 본 예외 밖.
+                if in_l and src_layer in _L3_DOMAINS and dst_layer == "L1":
                     continue
 
                 # cross-backend 검사

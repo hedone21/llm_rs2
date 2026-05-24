@@ -17,6 +17,7 @@
 //! CPU-only mode is fully preserved for backward compatibility.
 
 use crate::backend::Backend;
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
 use crate::kv_cache_ops::{KVCacheOps, KVLayout, KiviRawBuffers};
@@ -1558,6 +1559,7 @@ impl KiviCache {
     /// GPU update path: scatter input tokens into GPU residual buffer using
     /// `kivi_gather_update` kernel, flushing when the residual is full.
     #[allow(unused_variables)]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI GPU update
     fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
         #[cfg(feature = "opencl")]
         {
@@ -1805,6 +1807,7 @@ impl KiviCache {
     /// `n_groups`: number of key groups (= flush_tokens / group_size)
     /// `tok_base`: token offset in the attention buffer for this flush
     /// `tmp_qk`/`tmp_qv`: temporary quantized blocks (not stored in self.qk/qv in GPU mode)
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI flush upload
     fn upload_and_dequant_flush_with(
         &mut self,
         flush_tokens: usize,
@@ -2101,6 +2104,7 @@ impl KiviCache {
     /// - `q2_deq_tokens` is kept in sync with `q2_tokens` during `flush_residual_gpu`,
     ///   so no incremental dequant is needed here.
     /// - Residual scatter: uses `kivi_scatter_residual` kernel (always re-done each call).
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI view assemble
     fn assemble_view_gpu(&mut self) -> Result<()> {
         // Defensive: ensure attn buffers can hold q2_tokens + res_pos
         let needed = self.q2_tokens + self.res_pos;
@@ -2402,6 +2406,7 @@ impl KVCacheOps for KiviCache {
         self.res_pos >= self.res_cap
     }
 
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path KIVI flush check
     fn flush_if_needed(&mut self) -> Result<bool> {
         if self.res_pos >= self.res_cap {
             if self.gpu_backend.is_some() {
@@ -2420,6 +2425,7 @@ impl KVCacheOps for KiviCache {
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L (test block, S-C2b 알고리즘 개선 대기)
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::Buffer;
     use crate::memory::host::shared::SharedBuffer;

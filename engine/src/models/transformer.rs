@@ -17,6 +17,7 @@ use crate::shape::Shape;
 use crate::tensor::Tensor;
 
 #[cfg(feature = "opencl")]
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::opencl::plan::FullKernelPlan;
 
 /// Returns true if this layer uses local (sliding window) attention.
@@ -36,6 +37,7 @@ fn is_local_layer(layer_idx: usize, pattern: Option<usize>) -> bool {
 /// lm_head (and any other op the caller knows about).
 #[inline]
 #[allow(unused_variables)]
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path op label routing
 fn with_op_label<F, T>(backend: &Arc<dyn Backend>, label: &'static str, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
@@ -367,6 +369,7 @@ impl TransformerModel {
     ///
     /// Returns the number of tensors migrated.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path GPU migration
     pub fn migrate_weights_to_gpu(
         &mut self,
         _gpu_mem: &dyn Memory,
@@ -512,6 +515,7 @@ impl TransformerModel {
     /// must pass the OpenCL/CUDA backend here — `Tensor::backend()` may still
     /// point at the CPU loader because `copy_weight_from` preserves the
     /// source tensor's backend reference.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path lm_head quant
     pub fn quantize_lm_head_to_q4_0(&mut self, runtime_backend: &Arc<dyn Backend>) -> Result<bool> {
         use crate::memory::host::shared::SharedBuffer;
         use crate::models::loader::convert::quantize_q4_0;
@@ -682,6 +686,7 @@ impl TransformerModel {
     ///
     /// Returns `Ok(())` on success. On error (e.g. upload failed), the model
     /// state is unchanged (install is the last step).
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path AUF lm_head load
     pub fn load_lm_head_from_auf(
         &mut self,
         payload: &crate::auf::reader::LmHeadPayload<'_>,
@@ -1048,6 +1053,7 @@ impl TransformerModel {
     ///
     /// Returns the number of weight tensors converted.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path noshuffle SOA prep
     pub fn prepare_noshuffle_buffers(
         &mut self,
         backend: &Arc<dyn Backend>,
@@ -1250,6 +1256,7 @@ impl TransformerModel {
     ///
     /// Returns the number of tensors migrated.
     #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path CUDA migration
     pub fn migrate_weights_to_cuda(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
         let mut count = 0;
 
@@ -1467,6 +1474,7 @@ impl TransformerModel {
     ///
     /// Eviction is the caller's responsibility (via `CacheManager`).
     /// Score accumulation is handled internally since it requires per-layer iteration.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path GPU score acc setup
     pub fn forward_into<C: KVCacheOps>(&self, args: TransformerModelForwardArgs<C>) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
@@ -1979,6 +1987,7 @@ impl TransformerModel {
     /// Build a pre-bound GPU kernel execution plan for decode (seq_len=1).
     /// Returns None if the backend is not OpenCL or if plan construction fails.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L build-time plan construction
     pub fn build_plan(
         &self,
         x: &Tensor,
@@ -2476,6 +2485,7 @@ impl TransformerModel {
     /// Falls back to forward_into() on plan invalidation.
     #[cfg(feature = "opencl")]
     #[allow(clippy::too_many_arguments)]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path plan execute (token TBT measured)
     pub fn execute_plan(
         &self,
         plan: &FullKernelPlan,
@@ -2546,6 +2556,7 @@ impl TransformerModel {
     /// Returns None if the backend is not OpenCL, plan construction fails,
     /// or KIVI GPU buffers are not available.
     #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L build-time KIVI plan construction
     pub fn build_plan_for_kivi(
         &self,
         x: &Tensor,
@@ -2721,6 +2732,7 @@ impl TransformerModel {
     /// Falls back if plan is invalidated.
     #[cfg(feature = "opencl")]
     #[allow(clippy::too_many_arguments)]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI plan execute
     pub fn execute_plan_for_kivi(
         &self,
         plan: &FullKernelPlan,

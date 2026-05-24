@@ -184,6 +184,7 @@ impl EvictionPolicy for H2OPolicy {
 #[allow(clippy::needless_range_loop, clippy::useless_vec)]
 mod tests {
     use super::*;
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L (test block, S-C2b 알고리즘 개선 대기)
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
     use crate::memory::host::shared::SharedBuffer;

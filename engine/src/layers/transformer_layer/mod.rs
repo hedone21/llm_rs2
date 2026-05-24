@@ -2,6 +2,7 @@ mod forward;
 mod forward_gen;
 
 use crate::backend::Backend;
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::Buffer;
 use crate::buffer::DType;

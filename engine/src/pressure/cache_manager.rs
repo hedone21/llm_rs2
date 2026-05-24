@@ -558,6 +558,7 @@ impl CacheManager {
 
     /// Shared eviction logic: compute target_len, dispatch to policy methods.
     /// Used by both `force_evict_by_policy()` and can be reused by EvictionHandler.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path eviction dispatch
     fn run_policy_eviction(
         policy: &dyn EvictionPolicy,
         caches: &mut [KVCache],
@@ -666,6 +667,7 @@ impl CacheManager {
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L (test block, S-C2b 알고리즘 개선 대기)
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
     use crate::memory::host::shared::SharedBuffer;

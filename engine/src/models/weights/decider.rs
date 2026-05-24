@@ -340,6 +340,7 @@ fn uniform_select_by_index(needed: usize, candidates: &[usize]) -> Vec<usize> {
 mod tests {
     use super::*;
     use crate::qcf::layer_importance::ImportanceTable;
+    use crate::qcf_types::ImportanceEntry;
 
     // ── Helper builders ──
 

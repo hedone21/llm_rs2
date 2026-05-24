@@ -37,6 +37,7 @@ fn warn_gpu_fallback_once(
 impl TransformerLayer {
     /// Standard forward path (Prefill or dynamic generation)
     #[allow(clippy::too_many_arguments)]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path forward (OpenCL/QNN/CPU dispatch)
     pub(crate) fn forward_prefill<C: KVCacheOps>(
         &self,
         x: &mut Tensor,

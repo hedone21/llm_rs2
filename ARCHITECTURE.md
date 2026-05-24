@@ -1667,4 +1667,37 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 5건 이상 누적 시 §13.4에 *sub-layer chain register* 표 신설 검토 (§F/G/I allowlist 정책과 동일 운용 원리).
   - 화이트리스트 외 cross-backend import 시 본 §K 우회를 우려하여 PR 리뷰 시 화이트리스트 변경이 동반되는지 확인.
 
+**§L — Backend concrete downcast zone (L3→L1 cold-path access): RESOLVED (2026-05-24)**
+- **결정**: L3 도메인(`pressure/`, `layers/`, `models/`, `inference/`, `qcf/`)에서 L1 backend의 concrete struct(`OpenCLBackend`/`CudaBackend`/`QnnOppkgBackend`/`CpuBackend`)을 downcast 또는 인스턴스 생성으로 접근하는 패턴은 두 갈래로 분리하여 운용한다.
+  - **(L-auto) EXT-anchored chain**: `get_extension(crate::backend::EXT_*)` 직후의 `.downcast_ref::<*Backend>()` chain은 *자동 화이트리스트*. lint script가 ±5 라인 윈도우에서 anchor 탐지.
+  - **(L-marker) Bare downcast / instance**: `as_any().downcast_ref::<*Backend>()` 또는 `Arc::new(*Backend::new())` 패턴은 함수/블록 단위 zone marker(`// LAYER-EXEMPT: backend_concrete_downcast`)로 명시. marker zone 안의 L3→L1 import는 baseline에서 제외.
+- **허용 조건** (4개 모두 만족):
+  1. **Cold path 우세 또는 hot path measured-OK**: marker 부착자가 hot path에 있는 경우 vtable lookup 비용을 측정해야 한다. Decode loop에서 layer당 호출 시 token당 ≤100회 downcast (현 실측 ~80회/token, TBT 대비 <0.01%)는 허용.
+  2. **Type 종류**: import 대상이 backend struct 자체이거나, 그 내부 자원(`queue`/`gpu_score_acc`/`profile_events_enabled` 등) 접근 API여야 한다.
+  3. **명시 의도**: marker는 함수 시그니처 위 또는 블록 시작 직후 한 줄. PR description에 *cold path 근거* 또는 *hot path 측정값* 기재.
+  4. **Sub-trait 격상 backlog 동반**: marker zone 누적 시 동등 패턴의 sub-trait 격상(예: `OpenCLContext`/`CudaContext` trait + `get_extension`이 `&dyn Trait` 반환) 별 sprint 후보로 등록. 본 sprint 종료 시점 backlog "KiviCache hot path downcast resolve" 항목과 본 §L의 hot path 14건이 그 후보.
+- **근거**:
+  - **EXT-anchored auto (L-auto)**: 이미 backend extension sprint R-EXT-1/2에서 `EXT_OPENCL_QUEUE`/`EXT_OPENCL_SECONDARY`/`EXT_QNN_OPPKG` 정책 키가 정의됨 (`backend.rs:97-112`). chain 패턴은 *의도된 cold-path access*로 spec이 인정한 경로. lint script가 자동 인식 (코드 변경 0).
+  - **Bare marker (L-marker)**: bare `as_any().downcast_ref` 또는 `CpuBackend::new()`는 caller가 backend trait object를 받았음에도 concrete impl에 의존하는 패턴. trait 추출이 본질 해결이나 transitive cost(Queue/GpuScoreAcc/Program 등 nested trait + Plan executor 추상화)가 별 sprint급. 본 §L은 *현 시점의 cost-effective 정책* — marker로 *의도성을 표면화*하고 hot path 누적은 정량 측정 동반.
+- **§K/§J와의 관계**:
+  - **§K (sub-layer chain)**: backend↔backend 간 cross-import 화이트리스트. §L은 L3→L1 downcast — 적용 단위 다름.
+  - **§J (dispatch_orchestrator zone)**: L1→L3 build-time policy query. §L은 L3→L1 backend access — 방향 반대.
+  - 세 정책 모두 `// LAYER-EXEMPT: <kind>` marker family 공유.
+- **버린 옵션**:
+  - (a) **`OpenCLContext`/`CudaContext` sub-trait 격상 (S-C1b)**: 본질 해결이나 transitive drag 큼 (8+ 메서드 trait + 3 nested trait + Plan executor 추상화). 본 sprint scope 밖, 별 sprint 후보로 backlog 등록.
+  - (b) **75 callsite register-based 화이트리스트**: §K처럼 (file, type, line) 화이트리스트 부풀어 오름. 1건 한정 §K와 달리 75건은 register 운용 비용 큼.
+  - (c) **모든 backend concrete downcast 자동 인식**: lint 의미 약화, hot path / cold path 구분 없이 통과. 비추천.
+- **layer_lint.py 처리**:
+  - **(L-auto)** `_find_ext_downcast_anchors`: 라인별 `\.get_extension\(crate::backend::EXT_\w+\)` 패턴 발견 시 그 라인 ±5 윈도우를 anchor zone으로 등록. zone 안의 backend concrete downcast import는 baseline 제외.
+  - **(L-marker)** `_find_backend_downcast_zone_ranges`: §13.8-J `_find_exempt_zone_ranges` 패턴 재사용. marker 형식 `// LAYER-EXEMPT: backend_concrete_downcast` (정확히 이 텍스트). 함수 시그니처 바로 위 또는 블록 시작 다음 줄. zone close는 함수 종료 또는 `// LAYER-EXEMPT-END`.
+  - **검사 제외 대상**: zone 안의 `crate::backend::*::*Backend` 인라인 / `use crate::backend::*::*Backend;` use 문, `Arc::new(*Backend::new())` 인스턴스 생성, `*Backend::new()` 호출.
+  - **검사 적용 대상**: zone 안이라도 다른 카테고리(예: `crate::pressure::*` cross-domain) import는 본 예외 밖이다. baseline에 등재 유지.
+- **§L 적용 register** (S-C1 sprint 2026-05-24, RESOLVED):
+  - **L-auto** 4건: `models/transformer.rs:380/818`, `models/weights/secondary_mmap.rs:754/796` — `get_extension(EXT_OPENCL_QUEUE/EXT_OPENCL_SECONDARY/EXT_QNN_OPPKG)` chain.
+  - **L-marker** 75건: 함수 단위 marker로 ~20개 함수에 분포. INIT 27 / HOT 14 / COLD_SWAP 14 / COLD_EVICT 6 / OTHER 14.
+- **운용 메모**:
+  - 신규 marker 추가 시 PR description에 *해당 함수가 cold path임을 입증하는 호출 빈도 데이터* 또는 *hot path 측정값 (downcast 비용 vs TBT 비율)* 기재.
+  - 5건 이상의 hot path marker 누적 시 sub-trait 격상 별 sprint 강제 trigger (현재 14건 hot path가 이미 sub-trait sprint 대상).
+  - marker 라인 자체는 zero-cost (주석). 런타임 영향 0.
+
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.

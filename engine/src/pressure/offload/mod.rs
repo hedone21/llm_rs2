@@ -14,6 +14,7 @@ pub mod raw_store;
 pub mod store;
 
 use crate::backend::Backend;
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
 use crate::kv_cache_ops::{KVCacheOps, KVLayout};

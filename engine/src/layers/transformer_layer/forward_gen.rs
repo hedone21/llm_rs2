@@ -16,6 +16,7 @@ fn partition_async_read_enabled() -> bool {
 
 impl TransformerLayer {
     /// Fast path for single token generation using pre-allocated workspace.
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path decode (OpenCL/CUDA dispatch)
     pub(super) fn forward_gen<C: KVCacheOps>(&self, mut args: ForwardGenArgs<C>) -> Result<()> {
         // SWIFT: if both sub-layers are skipped, early return (identity)
         if args.skip_attn && args.skip_mlp {

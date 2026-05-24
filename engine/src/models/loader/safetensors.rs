@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::Backend;
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::memory::Memory;
