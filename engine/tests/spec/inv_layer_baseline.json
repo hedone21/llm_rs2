@@ -1,23 +1,14 @@
 {
   "violations": [
     {
-      "id": "V-01",
-      "file": "backend/opencl/gpu_self_meter.rs",
-      "line": 10,
-      "import": "crate::resilience::gpu_self_meter::GpuSelfMeter",
-      "rule": "INV-LAYER-001",
-      "kind": "L1→resilience (cross-cutting concrete 직접 의존)",
-      "is_test_block": false,
-      "note": "V-01 패턴"
-    },
-    {
       "id": "V-02",
       "file": "backend/opencl/plan.rs",
       "line": 16,
       "import": "crate::layers::tensor_partition::",
       "rule": "INV-LAYER-001",
       "kind": "L1→L3-inference (역방향 import)",
-      "is_test_block": false
+      "is_test_block": false,
+      "note": "tensor_partition L2 격상 별 sprint 대기"
     },
     {
       "id": "V-30",
@@ -261,62 +252,7 @@
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "auf/dtype_convert.rs",
-      "line": 22,
-      "import": "crate::models::loader::convert::",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L3-inference (상위 레이어 역방향 import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/cuda_embedded/mod.rs",
-      "line": 530,
-      "import": "crate::backend::cpu::cpu_singleton",
-      "rule": "INV-LAYER-001",
-      "kind": "L1(cuda_embedded)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/cuda_pc/mod.rs",
-      "line": 328,
-      "import": "crate::backend::cpu::cpu_singleton",
-      "rule": "INV-LAYER-001",
-      "kind": "L1(cuda_pc)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/opencl/mod.rs",
-      "line": 1540,
-      "import": "crate::backend::cpu::cpu_singleton",
-      "rule": "INV-LAYER-001",
-      "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "backend/opencl/mod.rs",
-      "line": 5240,
-      "import": "crate::backend::cpu::CpuBackend::new",
-      "rule": "INV-LAYER-001",
-      "kind": "L1(opencl)→L1(cpu) (cross-backend import)",
-      "is_test_block": false
-    },
-    {
-      "id": "V-??",
-      "file": "memory/opencl/host_ptr_pool_buffer.rs",
-      "line": 26,
-      "import": "crate::backend::opencl::host_ptr_pool::HostPtrPoolGuard",
-      "rule": "INV-LAYER-002",
-      "kind": "L2→L1 (backend-specific impl 직접 의존)",
-      "is_test_block": false,
-      "note": "V-07 패턴"
     }
   ],
-  "baseline_count": 35
+  "baseline_count": 28
 }

@@ -354,7 +354,11 @@ def extract_imports(file_path: str) -> list[tuple[int, str, bool, bool, bool]]:
     n_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_N)
     # §13.8-O cross-L3 vocabulary zone (L3↔L3 domain vocabulary: type alias default, public API surface)
     o_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_O)
-    l_zone_ranges = l_marker_ranges + l_auto_ranges + n_marker_ranges + o_marker_ranges
+    # §13.8-P cross_backend_bootstrap zone (L1↔L1: cpu_companion / placeholder dependency)
+    p_marker_ranges = _find_exempt_zone_ranges(lines, _EXEMPT_MARKER_P)
+    l_zone_ranges = (
+        l_marker_ranges + l_auto_ranges + n_marker_ranges + o_marker_ranges + p_marker_ranges
+    )
 
     def in_test_block(lineno: int) -> bool:
         return any(s <= lineno <= e for s, e in test_block_ranges)
@@ -441,6 +445,7 @@ _EXEMPT_MARKER = "// LAYER-EXEMPT: dispatch_orchestrator"
 _EXEMPT_MARKER_L = "// LAYER-EXEMPT: backend_concrete_downcast"
 _EXEMPT_MARKER_N = "// LAYER-EXEMPT: cross_cutting_trait_usage"
 _EXEMPT_MARKER_O = "// LAYER-EXEMPT: cross_l3_vocabulary"
+_EXEMPT_MARKER_P = "// LAYER-EXEMPT: cross_backend_bootstrap"
 _EXEMPT_END_MARKER = "// LAYER-EXEMPT-END"
 
 # fn 시그니처 패턴: `fn name(...) -> ... {` 또는 `fn name(...) {`
@@ -735,10 +740,19 @@ def analyze(src_root: str, inv_filter: str | None) -> list[dict]:
                 # (INV-LAYER-003) 및 cross-cutting → L3 (INV-LAYER-004) 양방향 trait/
                 # enum usage 의도성 명시. trait inversion이 이미 적용된 곳 또는
                 # §13.8-F enum-as-data identifier 예외에 해당하는 경우 사용.
+                # (S-D2 확장) L1 backend impl 이 cross-cutting trait 을 impl-only 로
+                # import 하는 경우(예: `GpuSelfMeter`)도 동일 marker 허용.
                 if in_l and (
                     (src_layer in _L3_DOMAINS and dst_layer in ("observability", "resilience"))
                     or (src_layer in ("observability", "resilience") and dst_layer in _L3_DOMAINS)
+                    or (src_layer == "L1" and dst_layer in ("observability", "resilience"))
                 ):
+                    continue
+
+                # §13.8-P: cross_backend_bootstrap zone — L1 backend impl이 다른
+                # L1 backend의 singleton/constructor를 cpu_companion 또는 placeholder
+                # dependency용으로 import. INV-LAYER-001 cross-backend 위반 한정 우회.
+                if in_l and src_layer == "L1" and dst_layer == "L1":
                     continue
 
                 # cross-backend 검사

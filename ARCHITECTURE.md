@@ -1751,7 +1751,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - **버린 옵션**:
   - (a) **§F를 layer_lint.py에 자동 인식 로직으로 추가**: enum 자체를 path-only로 식별하기 어렵다(struct도 동일 path). KNOWN_V_MAP의 V-ID 기반 화이트리스트는 정직성 떨어짐. marker 명시가 더 정직.
   - (b) **observability/events.rs의 pressure import를 별도 shared 모듈로 추출**: V-12에서 이미 평가됨 — EventSink가 L3 변경 표현 채널이므로 pressure type 보유 정당. shared 추출 시 도메인 어휘 dumping ground 위험.
-- **§N 적용 register** (S-C4 sprint 2026-05-24, RESOLVED):
+- **§N 적용 register** (S-C4 sprint 2026-05-24, RESOLVED + S-D2 확장 2026-05-24):
   - **L3 → cross-cutting trait** 3건:
     - `models/weights/phase_aware_swap.rs:32` — `observability::profile::op_trace::{DdrPhase, PhaseHook}` (PhaseHook L2 격상 backlog 대기)
     - `pressure/cache_manager.rs:6` — `observability::events::{CacheEvent, EventSink, NoOpSink}` (EventSink trait inversion 완료)
@@ -1760,8 +1760,35 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
     - `observability/events.rs:7` — `pressure::{ActionResult, PressureLevel}` (V-12, EventSink label vocabulary)
     - `resilience/executor.rs:10` — `pressure::eviction::EvictMethod` (V-10, EvictPlan.method field)
     - `resilience/mod.rs:15` — `pressure::eviction::EvictMethod` re-export (V-10)
+  - **L1 → cross-cutting trait** 1건 (S-D2 확장):
+    - `backend/opencl/gpu_self_meter.rs:13` — `resilience::gpu_self_meter::GpuSelfMeter` (V-01, OpenCL impl-only)
 - **운용 메모**:
   - marker는 trait/enum import에만 사용. concrete struct/함수 import에 부주의하게 박지 말 것.
   - 5건 이상 누적 시 §13.4에 *cross-cutting trait usage register* 표 신설 검토.
+
+**§P — Cross-backend bootstrap zone (L1↔L1 cpu_companion + placeholder): RESOLVED (2026-05-24, S-D2)**
+- **결정**: L1 backend impl이 다른 L1 backend(주로 CPU)의 singleton/constructor를 *cpu_companion field init* 또는 *placeholder dependency* 용으로 import하는 경우, 함수/블록 단위 marker `// LAYER-EXEMPT: cross_backend_bootstrap`로 zone 명시 시 INV-LAYER-001 cross-backend baseline 제외.
+- **허용 조건** (3개 모두 만족):
+  1. **Bootstrap 성격**: import 대상이 backend constructor (`CpuBackend::new`) 또는 singleton 헬퍼 (`cpu_singleton()`) 여야 한다. backend 간 forward op 위임은 본 예외 밖이다.
+  2. **단일 호출지**: 각 backend constructor 안에서 1~2 callsite 한정 (cpu_companion field init 또는 placeholder Tensor backend 부착).
+  3. **Forward 미참조**: placeholder의 경우 forward 경로가 본 backend Arc를 참조하지 않아야 한다 (ZST 등가).
+- **근거**: cross-backend bootstrap은 backend implementation의 internal concern. CUDA/OpenCL backend가 host fallback용으로 CPU singleton을 사용하는 패턴은 단일 인프라 함수에서 일관적이고, trait method (`cpu_companion()`) 격상 시 testing/mock에 oneOff ripple.
+- **§L/§N/§O와의 관계**:
+  - **§L**: L3→L1 backend impl downcast + cross-L3 default init. 본 §P와 source layer 다름.
+  - **§N**: cross-cutting ↔ L3 (그리고 L1→cross-cutting trait) usage. 본 §P와 dst layer 다름.
+  - **§O**: L3 ↔ L3 vocabulary. 본 §P와 layer 조합 다름.
+- **버린 옵션**:
+  - (a) **`cpu_companion()` Backend trait method 격상**: 단 4 callsite를 위해 trait method 추가는 testing/mock ripple 크다. mock backend 모두 default body 구현 강제.
+  - (b) **Backend-agnostic CPU bootstrap free fn (`engine/src/cpu_bootstrap.rs`) 추출**: 여전히 `CpuBackend` type을 알아야 함, marker 대비 본질 격상 효과 0.
+- **§P 적용 register** (S-D2 sprint 2026-05-24, RESOLVED):
+  - **CPU companion field init** 3건:
+    - `backend/cuda_embedded/mod.rs:531` — `cpu_singleton()` (host fallback routing)
+    - `backend/cuda_pc/mod.rs:329` — `cpu_singleton()` (host fallback routing)
+    - `backend/opencl/mod.rs:1542` — `cpu_singleton()` (host fallback routing)
+  - **Placeholder Tensor backend** 1건:
+    - `backend/opencl/mod.rs:5244` — `CpuBackend::new()` (placeholder Tensor에 부착; forward 미참조)
+- **운용 메모**:
+  - marker는 backend impl 내부 한정. L3/L4에서 cross-backend access 는 본 예외 밖.
+  - 5건 이상 누적 시 backend trait method 격상 별 sprint 강제 trigger.
 
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.

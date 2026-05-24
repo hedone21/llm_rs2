@@ -527,6 +527,7 @@ impl CudaBackend {
             graph_step_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // CPU companion for host fallback routing (S-2 sprint
             // 2026-05-24): shared singleton — feature detection runs once.
+            // LAYER-EXEMPT: cross_backend_bootstrap — §13.8-P cpu_companion init.
             cpu_companion: crate::backend::cpu::cpu_singleton(),
         };
 

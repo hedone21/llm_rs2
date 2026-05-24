@@ -18,6 +18,7 @@ use self::gpu_self_meter::OpenClEventGpuMeter;
 pub mod gpu_score;
 pub mod gpu_self_meter;
 pub mod host_ptr_pool;
+pub mod host_ptr_pool_buffer;
 pub mod memory;
 pub mod plan;
 
@@ -148,7 +149,7 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // CL_MEM_ALLOC_HOST_PTR, filled via map/memcpy/unmap before use).
     if let Some(pp) = buf
         .as_any()
-        .downcast_ref::<crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>()
+        .downcast_ref::<crate::backend::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>()
     {
         return pp
             .cl_mem()
@@ -186,7 +187,7 @@ pub fn buffer_kind_label(buf: &dyn Buffer) -> &'static str {
         "SliceBuffer"
     } else if any.is::<crate::memory::host::mmap::MmapBuffer>() {
         "MmapBuffer"
-    } else if any.is::<crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
+    } else if any.is::<crate::backend::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer>() {
         "HostPtrPool"
     } else {
         "Unknown"
@@ -1537,6 +1538,7 @@ impl OpenCLBackend {
             swap_queue: std::sync::OnceLock::new(),
             // CPU companion for host fallback routing (S-2 sprint
             // 2026-05-24): shared singleton — feature detection runs once.
+            // LAYER-EXEMPT: cross_backend_bootstrap — §13.8-P cpu_companion init.
             cpu_companion: crate::backend::cpu::cpu_singleton(),
         })
     }
@@ -5237,6 +5239,8 @@ impl Backend for OpenCLBackend {
         // The forward path ignores `Tensor::backend()` for OpenCL dispatch —
         // it operates through `Backend::matmul_*` on the `LayerWeights`'
         // outer backend Arc. The cl_mem path does not consult tensor.backend.
+        // placeholder Tensor용 CPU backend Arc; forward는 본 backend Arc 미참조.
+        // LAYER-EXEMPT: cross_backend_bootstrap
         let cpu_be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
         Ok(Some(Tensor::new(shape, placeholder, cpu_be)))
     }

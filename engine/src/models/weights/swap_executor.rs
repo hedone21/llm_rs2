@@ -2235,7 +2235,7 @@ impl<'a> SwapExecutor<'a> {
         let dtype = cpu_tensor.dtype();
         let mmap_guard: Arc<dyn crate::memory::host::mmap::MmapKeepAlive> = secondary.clone();
         let buf: Arc<dyn crate::buffer::Buffer> = Arc::new(
-            crate::memory::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
+            crate::backend::opencl::host_ptr_pool_buffer::HostPtrPoolBuffer::new(
                 guard,
                 size,
                 dtype,

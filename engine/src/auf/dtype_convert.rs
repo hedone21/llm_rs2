@@ -19,7 +19,7 @@
 /// - `spec/41-invariants.md` §3.18 (INV-137~139)
 use crate::auf::error::{AufError, AufResult};
 use crate::auf::tensor_index::TensorDType;
-use crate::models::loader::convert::{f16_to_f32, quantize_q4_0};
+use crate::quant::convert::{f16_to_f32, quantize_q4_0};
 use crate::quant::{BlockQ4_0, QK4_0};
 use half::f16;
 

@@ -1,5 +1,6 @@
 use half::f16;
 
+pub mod convert;
 pub mod f16_bulk;
 
 #[cfg(target_arch = "aarch64")]

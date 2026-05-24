@@ -4,8 +4,11 @@
 //! (F16, F32, Q4_0). Extracted from `transformer.rs::load_with_dtype` so they
 //! can be reused by any `TensorSource` implementation.
 
-use crate::quant::{BlockQ4_0, QK4_0};
 use half::f16;
+
+// S-D1.1 (2026-05-24, INV-LAYER-002 해소): `f16_to_f32` 와 `quantize_q4_0` 는
+// L2 `quant::convert` 로 격상되었다. 본 모듈은 backward-compat 을 위한 re-export.
+pub use crate::quant::convert::{f16_to_f32, quantize_q4_0};
 
 /// Convert BF16 raw bytes to F16 values in a pre-allocated destination buffer.
 ///
@@ -41,48 +44,6 @@ pub fn bf16_to_f32(src: &[u8], dst: &mut [f32], num_elements: usize) {
     for (i, &b) in src_u16.iter().enumerate() {
         dst[i] = half::bf16::from_bits(b).to_f32();
     }
-}
-
-/// Convert F16 raw bytes to F32 values in a pre-allocated destination buffer.
-///
-/// # Safety
-/// `src` must contain `num_elements * 2` bytes of valid F16 data.
-/// `dst` must have at least `num_elements` entries.
-pub fn f16_to_f32(src: &[u8], dst: &mut [f32], num_elements: usize) {
-    let src_u16 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, num_elements) };
-    for (i, &b) in src_u16.iter().enumerate() {
-        dst[i] = f16::from_bits(b).to_f32();
-    }
-}
-
-/// Quantize F32 data into Q4_0 blocks.
-///
-/// `rows` and `cols` define the 2D shape. `cols` must be a multiple of `QK4_0` (32).
-/// Returns a Vec of `BlockQ4_0` with `rows * (cols / QK4_0)` entries.
-pub fn quantize_q4_0(f32_data: &[f32], rows: usize, cols: usize) -> Vec<BlockQ4_0> {
-    let nb_k = cols / QK4_0;
-    let mut blocks = Vec::with_capacity(rows * nb_k);
-    for j in 0..rows {
-        for bi in 0..nb_k {
-            let offset = j * cols + bi * QK4_0;
-            let src = &f32_data[offset..offset + QK4_0];
-            let mut block = BlockQ4_0 {
-                d: f16::from_f32(0.0),
-                qs: [0; 16],
-            };
-            let max_val = src.iter().map(|v| v.abs()).fold(0.0f32, |x, y| x.max(y));
-            let d = max_val / 7.0;
-            let id = if d == 0.0 { 0.0 } else { 1.0 / d };
-            block.d = f16::from_f32(d);
-            for z in 0..16 {
-                let v0 = (src[z] * id).round().clamp(-8.0, 7.0) as i8;
-                let v1 = (src[z + 16] * id).round().clamp(-8.0, 7.0) as i8;
-                block.qs[z] = (v0 + 8) as u8 | (((v1 + 8) as u8) << 4);
-            }
-            blocks.push(block);
-        }
-    }
-    blocks
 }
 
 /// Release mmap pages after tensor data has been converted.
