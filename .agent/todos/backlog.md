@@ -107,6 +107,18 @@
 - **참고 파일**: `engine/src/buffer/rpcmem_alias_buffer.rs`, `engine/src/models/weights/rpcmem_secondary.rs::RpcmemLayerRegion::Drop`
 - **fix 방안 후보**: (a) explicit drop sequence (cl_mem all release → rpcmem_free), (b) reference count guard, (c) backend teardown 시 rpcmem region 명시 release
 
+## [P2] KiviCache hot path downcast resolve — 2026-05-24 등록 (backend extension sprint 후속)
+- **Status**: TODO (사용자 선택 C에 따라 본 sprint 취소, backlog 등록)
+- **선행**: `.agent/todos/handoff_backend_extension_2026_05_24.md` (HEAD `5be6c0d7`)
+- **상세**: `engine/src/pressure/kivi_cache.rs:1559/1842/2108` 3건 `as_any().downcast_ref::<OpenCLBackend>()` — KIVI 모드 진입 시 per-token × 16 layer 호출 (R2 게이트 hot path 확정).
+- **제약**: `OpenCLBackend`는 Clone 미구현 + `Arc<dyn Backend>` → `Arc<OpenCLBackend>` Rust 기본 API 변환 불가. 단순 패턴 통일(`get_extension`)은 본 sprint 정책("hot path 보존")과 mismatch.
+- **fix 방안 후보**:
+  - (B) `OpenCLBackend` self-ref Arc — `Arc::new_cyclic` + `self_weak: Weak<Self>` field 추가, `OpenCLBackend::new()` signature를 `-> Result<Arc<Self>>`로 변경. KiviCache는 `Option<Arc<OpenCLBackend>>` 보유. 영향 범위 큼 (호출지 5+곳 마이그레이션). cuda/qnn backend도 같은 패턴 따라야 일관성. 추정 1~2일.
+  - (B') KiviCache 한정 unsafe raw pointer 보존 — `gpu_opencl_ptr: Option<*const OpenCLBackend>` + invariant guard (Arc<dyn Backend> alive). `unsafe impl Send/Sync` 필요. 추정 0.5일.
+  - (E) 새 trait `KiviGpuOps` inversion (RpoenCL impl) — signature 변경. 추정 1일.
+- **실측 비용**: B-5b Phase 2 vtable Δ -0.231% / -0.018% 측정으로 string compare 비용도 ≈ 0 추정. **production 영향 매우 작음** (KIVI 모드 한정).
+- **우선순위 사유**: P2 — INV-LAYER-003 143건 해소가 ROI 더 큼. KIVI는 production 사용 빈도 낮고 vtable 비용 측정 0.
+
 ## [P3] qnn_oppkg_poc clippy not_unsafe_ptr_arg_deref 15 errors — 2026-05-10 발견
 - **Status**: TODO (M2 baseline부터 누적, M3.0 무관)
 - **상세**: `cargo clippy --workspace --features opencl --tests -- -D warnings`에서 `crates/qnn_oppkg_poc/src/lib.rs:725` 근방 raw pointer deref 함수에 `unsafe` 누락. rust 1.93 신규 lint. M1 회귀 안전망 crate이라 P3 우선순위. M2가 main 진입한 이상 PoC는 read-only — 손대지 않거나 일괄 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`로 silence.
