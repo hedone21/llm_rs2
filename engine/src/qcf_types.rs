@@ -80,6 +80,29 @@ pub enum SubLayer {
     Mlp,
 }
 
+// ── ImportanceEntry (S-3b-4 추가) ─────────────────────────────────
+
+/// A single importance entry for one (sub-)layer.
+///
+/// 측정 결과 데이터 컨테이너 (data identifier) — §G shared identifier
+/// promotion으로 L2에 위치. ImportanceTable struct 가 보유한 `Vec<Entry>`
+/// 의 원소로, decider/eval 등 다른 L3 도메인에서 read-only 로 참조한다.
+#[derive(Debug, Clone)]
+pub struct ImportanceEntry {
+    pub layer_id: usize,
+    pub sublayer: SubLayer,
+    pub importance: f32,
+    /// Output-to-input Perturbation Ratio for layer skip:
+    /// `||output - input|| / ||input||`.
+    pub opr: f32,
+    /// Side-by-side measurement in 3-way comparison mode.
+    /// `1 − cos(mean_pool(h_in), mean_pool(h_out))`. None unless `three_way` enabled.
+    pub importance_mean_pool: Option<f32>,
+    /// Side-by-side measurement in 3-way comparison mode.
+    /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` (ShortGPT BI). None unless `three_way` enabled.
+    pub importance_shortgpt_bi: Option<f32>,
+}
+
 // ── QcfMetric / QcfMode / QcfConfig ───────────────────────────────
 
 /// A QCF metric collected from a single lossy action execution.

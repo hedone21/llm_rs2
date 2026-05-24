@@ -38,7 +38,8 @@ pub use qcf_kv::{
     identify_retained_h2o, identify_retained_sliding,
 };
 pub use quant_qcf::{
-    compute_flush_aw_vopr, compute_flush_awqe, compute_flush_nmse, compute_flush_opr,
+    KiviQcfComputer, compute_flush_aw_vopr, compute_flush_awqe, compute_flush_nmse,
+    compute_flush_opr,
 };
 pub use skip_qcf::SkipQcfTracker;
 pub use topk_retention::{TopKRetentionResult, compute_topk_retention};

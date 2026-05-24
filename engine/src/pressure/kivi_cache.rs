@@ -196,6 +196,9 @@ pub struct KiviPlanBuffers<'a> {
 /// Set `gpu_backend` to `Some(...)` via `new_gpu()`. GPU buffers hold persistent
 /// residual and attention F32 data. CPU residual vectors are still allocated for
 /// the quantize step (cold path). All hot-path operations dispatch GPU kernels.
+///
+/// S-3b-4: `qcf_computer: Box<dyn QcfComputer>` 는 trait method
+/// `clone_box()` 기반 `impl Clone for Box<dyn QcfComputer>` 으로 Clone 지원.
 #[derive(Clone)]
 pub struct KiviCache {
     /// Current quantization bit-width (2, 4, or 8).
@@ -269,6 +272,11 @@ pub struct KiviCache {
     gpu_q2k_blocks: usize,
     /// Number of Q2 value blocks written to `gpu_q2v`.
     gpu_q2v_blocks: usize,
+
+    /// QCF flush proxy 계산기 (L2 trait dispatch, S-3b-4 γ-2).
+    /// Default = `KiviQcfComputer` (stateless). caller 가 다른 구현체를
+    /// 주입하려면 `set_qcf_computer` 사용.
+    qcf_computer: Box<dyn crate::qcf_computer::QcfComputer>,
 }
 
 impl KiviCache {
@@ -375,6 +383,7 @@ impl KiviCache {
             gpu_q2v: None,
             gpu_q2k_blocks: 0,
             gpu_q2v_blocks: 0,
+            qcf_computer: Box::<crate::qcf::KiviQcfComputer>::default(),
         }
     }
 
@@ -822,7 +831,7 @@ impl KiviCache {
                     res_cap: self.res_cap,
                     bits: self.bits,
                 };
-                let metric = crate::qcf::compute_flush_nmse(&params, &config);
+                let metric = self.qcf_computer.flush_nmse(&params, &config);
                 return metric.normalized_value.clamp(0.0, 1.0);
             }
         }
@@ -901,9 +910,9 @@ impl KiviCache {
             bits: self.bits,
         };
         self.flush_proxies
-            .push(crate::qcf::compute_flush_nmse(&proxy_params, &qcf_config));
+            .push(self.qcf_computer.flush_nmse(&proxy_params, &qcf_config));
         self.flush_proxies
-            .push(crate::qcf::compute_flush_opr(&proxy_params, &qcf_config));
+            .push(self.qcf_computer.flush_opr(&proxy_params, &qcf_config));
 
         // AWQE: attention-weighted quantization error (V-only)
         if let Some(ref attn) = self.last_attn_scores {
@@ -928,7 +937,7 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::qcf::compute_flush_awqe(&awqe_params, &qcf_config));
+                    .push(self.qcf_computer.flush_awqe(&awqe_params, &qcf_config));
 
                 // AW-VOPR: attention-weighted vector output perturbation ratio
                 let vopr_params = crate::qcf_types::FlushAttentionParams {
@@ -946,7 +955,7 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::qcf::compute_flush_aw_vopr(&vopr_params, &qcf_config));
+                    .push(self.qcf_computer.flush_aw_vopr(&vopr_params, &qcf_config));
             }
         }
 
@@ -1667,9 +1676,9 @@ impl KiviCache {
             bits: self.bits,
         };
         self.flush_proxies
-            .push(crate::qcf::compute_flush_nmse(&proxy_params, &qcf_config));
+            .push(self.qcf_computer.flush_nmse(&proxy_params, &qcf_config));
         self.flush_proxies
-            .push(crate::qcf::compute_flush_opr(&proxy_params, &qcf_config));
+            .push(self.qcf_computer.flush_opr(&proxy_params, &qcf_config));
 
         // AWQE (same logic as CPU flush_residual)
         if let Some(ref attn) = self.last_attn_scores {
@@ -1694,7 +1703,7 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::qcf::compute_flush_awqe(&awqe_params, &qcf_config));
+                    .push(self.qcf_computer.flush_awqe(&awqe_params, &qcf_config));
 
                 // AW-VOPR: attention-weighted vector output perturbation ratio
                 let vopr_params = crate::qcf_types::FlushAttentionParams {
@@ -1712,7 +1721,7 @@ impl KiviCache {
                     scores_valid_len: attn.valid_len,
                 };
                 self.flush_proxies
-                    .push(crate::qcf::compute_flush_aw_vopr(&vopr_params, &qcf_config));
+                    .push(self.qcf_computer.flush_aw_vopr(&vopr_params, &qcf_config));
             }
         }
 

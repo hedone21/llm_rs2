@@ -2388,7 +2388,9 @@ fn main() -> anyhow::Result<()> {
                         &model,
                         ratio,
                         target_dtype,
-                        importance_table_for_swap.as_ref(),
+                        importance_table_for_swap
+                            .as_ref()
+                            .map(|t| t as &dyn llm_rs2::qcf_collector::ImportanceLookup),
                         decode_token_index,
                         &mut incremental_force_swap_plan,
                         &mut manager_swap_report_pending,

@@ -15,24 +15,7 @@ pub type ImportanceWithRaws = (
     Vec<(Vec<f32>, usize, usize)>,
 );
 
-pub use crate::qcf_types::SubLayer;
-
-/// A single importance entry for one (sub-)layer.
-#[derive(Debug, Clone)]
-pub struct ImportanceEntry {
-    pub layer_id: usize,
-    pub sublayer: SubLayer,
-    pub importance: f32,
-    /// Output-to-input Perturbation Ratio for layer skip:
-    /// `||output - input|| / ||input||`.
-    pub opr: f32,
-    /// Side-by-side measurement in 3-way comparison mode.
-    /// `1 − cos(mean_pool(h_in), mean_pool(h_out))`. None unless `three_way` enabled.
-    pub importance_mean_pool: Option<f32>,
-    /// Side-by-side measurement in 3-way comparison mode.
-    /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` (ShortGPT BI). None unless `three_way` enabled.
-    pub importance_shortgpt_bi: Option<f32>,
-}
+pub use crate::qcf_types::{ImportanceEntry, SubLayer};
 
 /// Pre-computed importance table for all layers.
 ///
@@ -396,6 +379,35 @@ impl ImportanceCollector {
 impl Default for ImportanceCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Trait impls for L2 abstraction (S-3b-4 γ-2 trait inversion) ─────
+
+impl crate::qcf_collector::ImportanceCollect for ImportanceCollector {
+    fn snapshot_before(&mut self, x: &[f32], seq_len: usize, dim: usize) {
+        ImportanceCollector::snapshot_before(self, x, seq_len, dim);
+    }
+
+    fn record_after(
+        &mut self,
+        x: &[f32],
+        seq_len: usize,
+        hidden_size: usize,
+        layer: usize,
+        sublayer: SubLayer,
+    ) {
+        ImportanceCollector::record_after(self, x, seq_len, hidden_size, layer, sublayer);
+    }
+}
+
+impl crate::qcf_collector::ImportanceLookup for ImportanceTable {
+    fn is_empty(&self) -> bool {
+        ImportanceTable::is_empty(self)
+    }
+
+    fn entries(&self) -> &[ImportanceEntry] {
+        ImportanceTable::entries(self)
     }
 }
 

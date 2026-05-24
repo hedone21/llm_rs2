@@ -161,7 +161,8 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Optional importance collector for Layer Skip QCF.
     /// When provided during prefill, captures per-layer cosine similarity.
-    pub importance_collector: Option<&'a mut crate::qcf::ImportanceCollector>,
+    /// Uses L2 `ImportanceCollect` trait (§13.8-G + INV-LAYER-003 trait inversion).
+    pub importance_collector: Option<&'a mut dyn crate::qcf_collector::ImportanceCollect>,
     /// When true, only compute logits for the last sequence position.
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].

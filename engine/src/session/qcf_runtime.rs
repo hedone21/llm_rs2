@@ -672,7 +672,7 @@ pub fn dispatch_swap_weights(
     model: &crate::models::transformer::TransformerModel,
     ratio: f32,
     target_dtype: llm_shared::DtypeTag,
-    importance_table: Option<&crate::qcf::ImportanceTable>,
+    importance_table: Option<&dyn crate::qcf_collector::ImportanceLookup>,
     decode_token_index: usize,
     swap_plan_out: &mut Option<crate::models::weights::IncrementalSwapPlan>,
     manager_report_out: &mut Option<(f32, usize, std::time::Instant, f32)>,

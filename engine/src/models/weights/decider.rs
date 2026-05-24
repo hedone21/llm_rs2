@@ -18,7 +18,8 @@
 use std::collections::HashSet;
 
 use crate::models::weights::QuantNoiseTable;
-use crate::qcf::layer_importance::{ImportanceTable, SubLayer};
+use crate::qcf_collector::ImportanceLookup;
+use crate::qcf_types::SubLayer;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -87,7 +88,8 @@ pub struct SwapDecision {
 /// to `Uniform`.
 pub struct WeightSwapDecider<'a> {
     /// Importance table from the last prefill (None = fallback).
-    pub importance: Option<&'a ImportanceTable>,
+    /// Uses L2 `ImportanceLookup` trait (§13.8-G + INV-LAYER-003 trait inversion).
+    pub importance: Option<&'a dyn ImportanceLookup>,
     /// Quantization noise table from engine init (None = fallback).
     pub noise: Option<&'a QuantNoiseTable>,
     /// Total number of decoder layers in the model.
@@ -251,7 +253,7 @@ impl<'a> WeightSwapDecider<'a> {
 pub fn compute_qcf_weight_swap(
     swap_set: &[usize],
     noise: &QuantNoiseTable,
-    importance: Option<&ImportanceTable>,
+    importance: Option<&dyn ImportanceLookup>,
     n_decoder_layers: usize,
 ) -> f32 {
     let _t = crate::qcf_timer!(QCF_WEIGHT_SWAP);
@@ -262,7 +264,7 @@ pub fn compute_qcf_weight_swap(
 fn compute_qcf_swap_internal(
     swap_set: &[usize],
     n_decoder_layers: usize,
-    importance: Option<&ImportanceTable>,
+    importance: Option<&dyn ImportanceLookup>,
     noise: Option<&QuantNoiseTable>,
 ) -> f32 {
     if swap_set.is_empty() {
@@ -337,7 +339,7 @@ fn uniform_select_by_index(needed: usize, candidates: &[usize]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qcf::layer_importance::{ImportanceEntry, SubLayer};
+    use crate::qcf::layer_importance::ImportanceTable;
 
     // ── Helper builders ──
 

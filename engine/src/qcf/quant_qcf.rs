@@ -506,6 +506,38 @@ pub fn compute_flush_aw_vopr(params: &FlushAttentionParams, config: &QcfConfig) 
     }
 }
 
+// ── QcfComputer trait impl (S-3b-4 trait inversion) ─────────────────
+
+/// Stateless KIVI flush proxy 계산기.
+///
+/// `QcfComputer` trait 의 4 메서드를 본 모듈의 자유 함수 4개로 위임.
+/// pressure/kivi_cache 가 `&dyn QcfComputer` 로 의존하여 L3-pressure →
+/// L3-qcf cross-domain concrete import 를 제거한다.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KiviQcfComputer;
+
+impl crate::qcf_computer::QcfComputer for KiviQcfComputer {
+    fn flush_nmse(&self, params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric {
+        compute_flush_nmse(params, config)
+    }
+
+    fn flush_opr(&self, params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric {
+        compute_flush_opr(params, config)
+    }
+
+    fn flush_awqe(&self, params: &FlushAttentionParams, config: &QcfConfig) -> QcfMetric {
+        compute_flush_awqe(params, config)
+    }
+
+    fn flush_aw_vopr(&self, params: &FlushAttentionParams, config: &QcfConfig) -> QcfMetric {
+        compute_flush_aw_vopr(params, config)
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::qcf_computer::QcfComputer> {
+        Box::new(*self)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::erasing_op)]
 mod tests {

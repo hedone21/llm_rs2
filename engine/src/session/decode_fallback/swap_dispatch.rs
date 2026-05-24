@@ -278,7 +278,9 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                     compute_qcf_weight_swap(
                         &actually_swapped_now,
                         &ctx.model.quant_noise,
-                        ctx.importance_table_for_swap.as_ref(),
+                        ctx.importance_table_for_swap
+                            .as_ref()
+                            .map(|t| t as &dyn crate::qcf_collector::ImportanceLookup),
                         n_layers,
                     )
                 };

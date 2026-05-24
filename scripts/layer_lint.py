@@ -129,7 +129,8 @@ def classify_module(rel_path: str) -> str:
     TOP_LEVEL_L2 = {"backend.rs", "buffer.rs", "memory.rs", "tensor.rs",
                     "shape.rs", "quant.rs", "thread_pool.rs", "op_kind.rs",
                     "partition_workspace.rs", "kv_cache_ops.rs",
-                    "yield_policy.rs", "qcf_types.rs"}
+                    "yield_policy.rs", "qcf_types.rs",
+                    "qcf_computer.rs", "qcf_collector.rs"}
     if norm in TOP_LEVEL_L2:
         return "L2"
     for prefix, layer in LAYER_RULES:
