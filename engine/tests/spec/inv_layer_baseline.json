@@ -252,7 +252,25 @@
       "rule": "INV-LAYER-005",
       "kind": "L5/generate.rs→L3-pressure (L4 session/ 우회)",
       "is_test_block": false
+    },
+    {
+      "id": "V-31",
+      "file": "models/weights/swap_executor.rs",
+      "line": 63,
+      "import": "crate::observability::events::",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-inference→cross-cutting(observability) — §13.8-N cross_cutting_trait_usage (S-1+α, marker도 parser가 multi-item use {} 라인 직후 marker block-form으로 오해)",
+      "is_test_block": false
+    },
+    {
+      "id": "V-31",
+      "file": "models/weights/phase_aware_swap.rs",
+      "line": 35,
+      "import": "crate::observability::profile::op_trace::",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-inference→cross-cutting(observability) — §13.8-N op_trace hook (PhaseHook L2 격상 backlog), S-1+α에서 events use {} 선행으로 parser block-form 오해 → baseline 등록",
+      "is_test_block": false
     }
   ],
-  "baseline_count": 28
+  "baseline_count": 30
 }

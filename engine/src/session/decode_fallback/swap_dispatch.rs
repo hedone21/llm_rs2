@@ -19,7 +19,7 @@ use crate::models::weights::{
     AsyncSwapDispatcher, DynamicKController, IncrementalSwapPlan, IntraForwardSwapHook,
     PhaseAwareSwapDispatcher, ProbingKController,
 };
-use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent};
+use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
 use crate::observability::rss_trace::read_bytes_now;
 use crate::qcf::ImportanceTable;
 use crate::session::cli::Args;
@@ -148,7 +148,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                     });
                     ctx.event_sink
                         .emit(CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained {
-                            kind: "Incremental",
+                            kind: WeightSwapKind::Incremental,
                             chunk_idx: ctx.decode_token_index,
                             layers_done: report.swapped.len(),
                             latency_ms,
@@ -195,7 +195,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                 Err(e) => {
                     ctx.event_sink
                         .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                            kind: "Incremental",
+                            kind: WeightSwapKind::Incremental,
                             reason: e.to_string(),
                             layer: None,
                             token: Some(ctx.decode_token_index),
@@ -260,7 +260,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                 if let Err(e) = dispatcher.drain(std::time::Duration::from_secs(2)) {
                     ctx.event_sink
                         .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                            kind: "Incremental",
+                            kind: WeightSwapKind::Incremental,
                             reason: format!("LISWAP-2 drain failed: {e}"),
                             layer: None,
                             token: Some(ctx.decode_token_index),
@@ -269,7 +269,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                     drain_ms = (drain_t.elapsed().as_secs_f64() * 1000.0) as f32;
                     ctx.event_sink
                         .emit(CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained {
-                            kind: "Incremental",
+                            kind: WeightSwapKind::Incremental,
                             chunk_idx: ctx.decode_token_index,
                             layers_done: 0, // LISWAP-2 dispatcher drain, no new layers
                             latency_ms: drain_ms,
@@ -279,7 +279,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
             }
             ctx.event_sink
                 .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
-                    kind: "Incremental",
+                    kind: WeightSwapKind::Incremental,
                     qcf_actual: None,
                     token: ctx.decode_token_index,
                     elapsed_ms: drain_ms,
@@ -324,7 +324,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                     .collect();
                 ctx.event_sink
                     .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
-                        kind: "Incremental",
+                        kind: WeightSwapKind::Incremental,
                         qcf_actual: Some(qcf_swap_actual),
                         token: ctx.decode_token_index,
                         elapsed_ms: latency_ms as f32,
@@ -372,7 +372,7 @@ pub fn retire_intra_forward(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()>
             Ok(()) => {
                 ctx.event_sink
                     .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
-                        kind: "IntraForward",
+                        kind: WeightSwapKind::IntraForward,
                         qcf_actual: None,
                         token: ctx.decode_token_index,
                         elapsed_ms: (drain_t.elapsed().as_secs_f64() * 1000.0) as f32,
@@ -392,7 +392,7 @@ pub fn retire_intra_forward(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()>
             Err(e) => {
                 ctx.event_sink
                     .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                        kind: "IntraForward",
+                        kind: WeightSwapKind::IntraForward,
                         reason: format!("finalize failed: {e}"),
                         layer: None,
                         token: Some(ctx.decode_token_index),
@@ -443,7 +443,7 @@ pub fn retire_phase_aware(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
             Ok(()) => {
                 ctx.event_sink
                     .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
-                        kind: "PhaseAware",
+                        kind: WeightSwapKind::PhaseAware,
                         qcf_actual: None,
                         token: ctx.decode_token_index,
                         elapsed_ms: (drain_t.elapsed().as_secs_f64() * 1000.0) as f32,
@@ -463,7 +463,7 @@ pub fn retire_phase_aware(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
             Err(e) => {
                 ctx.event_sink
                     .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                        kind: "PhaseAware",
+                        kind: WeightSwapKind::PhaseAware,
                         reason: format!("finalize failed: {e}"),
                         layer: None,
                         token: Some(ctx.decode_token_index),

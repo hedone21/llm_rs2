@@ -1377,6 +1377,7 @@ fn main() -> anyhow::Result<()> {
                     dispatcher,
                     DType::Q4_0,
                     config,
+                    Arc::clone(&event_sink),
                 );
                 // LISWAP Phase 4: install weak self-ref so the worker thread can
                 // call back into try_dispatch_chunk_worker via ChunkDispatchJob.
@@ -1443,6 +1444,7 @@ fn main() -> anyhow::Result<()> {
                     Some(Arc::clone(&model.release_worker)),
                     DType::Q4_0,
                     config,
+                    Arc::clone(&event_sink),
                 ));
             } else if args.swap_incremental_per_tick > 0 {
                 eprintln!(
