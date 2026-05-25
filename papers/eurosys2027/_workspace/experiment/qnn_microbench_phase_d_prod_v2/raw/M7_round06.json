@@ -1,0 +1,32 @@
+{
+  "cell": "M7",
+  "round_idx": 6,
+  "is_warmup": false,
+  "ok": true,
+  "latency_ms": 0.3083,
+  "max_abs_err": null,
+  "cosine": null,
+  "stderr": ".cpp:621] 10 inference took 3.083000 ms, avg 0.308300 ms\nI 00:00:00.116918 executorch:qnn_executor_runner.cpp:665] Total 1 inference took 3.083000 ms, avg 3.083000 ms\nI 00:00:00.117117 executorch:qnn_executor_runner.cpp:730] Write etdump to etdump.etdp, Size = 2296\n[INFO] [Qnn ExecuTorch]: Destroy Qnn context\n[INFO] [Qnn ExecuTorch]: Destroy Qnn device\n[INFO] [Qnn ExecuTorch]: Destroy Qnn backend\n",
+  "raw_stdout": "",
+  "thermal_before": {
+    "cpu_little": 33.0,
+    "cpu_mid": 33.4,
+    "cpu_prime": 31.5,
+    "gpu_5": 31.9,
+    "gpu_7": 31.5,
+    "hex_vec": 31.5,
+    "hex_mat": 31.9,
+    "ddr": 32.3
+  },
+  "thermal_after": {
+    "cpu_little": 33.0,
+    "cpu_mid": 32.6,
+    "cpu_prime": 31.9,
+    "gpu_5": 31.9,
+    "gpu_7": 31.5,
+    "hex_vec": 31.9,
+    "hex_mat": 32.3,
+    "ddr": 32.3
+  },
+  "error": null
+}

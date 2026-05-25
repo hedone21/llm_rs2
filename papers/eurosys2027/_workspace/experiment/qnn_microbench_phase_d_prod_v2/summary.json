@@ -1,0 +1,38 @@
+{
+  "M6b": {
+    "meta": {
+      "dtype": "f16",
+      "backend": "executorch"
+    },
+    "n_raw": 7,
+    "n_outlier": 0,
+    "n_valid": 7,
+    "median_ms": 0.4558,
+    "stdev_ms": 0.0143,
+    "cv_pct": 3.14,
+    "p25_ms": 0.4492,
+    "p75_ms": 0.4746,
+    "min_ms": 0.4433,
+    "max_ms": 0.4838,
+    "max_abs_err_max": null,
+    "cosine_min": null
+  },
+  "M7": {
+    "meta": {
+      "dtype": "w8a8",
+      "backend": "executorch"
+    },
+    "n_raw": 7,
+    "n_outlier": 0,
+    "n_valid": 7,
+    "median_ms": 0.276,
+    "stdev_ms": 0.0196,
+    "cv_pct": 7.11,
+    "p25_ms": 0.2732,
+    "p75_ms": 0.3083,
+    "min_ms": 0.273,
+    "max_ms": 0.3154,
+    "max_abs_err_max": null,
+    "cosine_min": null
+  }
+}

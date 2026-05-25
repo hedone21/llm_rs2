@@ -459,7 +459,10 @@ def run_trial(
         )
 
     thermal_after = adb.read_zones()
-    lat, err, cos = parse_trial_output(stdout, cell.latency_pattern)
+    # Executorch (qnn_executor_runner) 는 logging 을 stderr 로 출력하므로
+    # parse 시 stdout + stderr 양쪽 합쳐서 본다.
+    combined = (stdout or "") + "\n" + (stderr or "")
+    lat, err, cos = parse_trial_output(combined, cell.latency_pattern)
     parsed_latency = lat is not None
     if lat is None:
         # Crash (signal kill 등) 시에만 latency 없음. wall-clock 으로 폴백.

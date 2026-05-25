@@ -1,0 +1,152 @@
+[init] device=R3CY408S5SB
+[init] out=papers/eurosys2027/_workspace/experiment/qnn_microbench_phase_d_prod_v2
+[init] enabled cells: ['M6b', 'M7']
+[preflight] zombie check OK
+[preflight] max_zone=cpu_little=32.6°C (start<40.0°C)
+[preflight] airplane_mode_on='0'
+[preflight] WARN: airplane mode is OFF — measurement noise risk
+[matrix] 2 cells × 10 rounds = 20 trials
+[matrix] cells: ['M6b', 'M7']
+[matrix] session warmup 60s
+
+=== round 1/10 (WARMUP) order=['M7', 'M6b'] ===
+
+--- M7 round 1 (warmup) ---
+  result: ok=True latency=0.337ms err=None cos=None max_before=33.0°C max_after=34.2°C
+
+--- M6b round 1 (warmup) ---
+  result: ok=True latency=0.471ms err=None cos=None max_before=33.0°C max_after=34.2°C
+[cooldown:inter-round 1->2] min=300s
+  [inter-round 1->2] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+=== round 2/10 (WARMUP) order=['M7', 'M6b'] ===
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+--- M7 round 2 (warmup) ---
+  result: ok=True latency=0.261ms err=None cos=None max_before=33.0°C max_after=32.6°C
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=cpu_mid=32.6°C target<42°C
+
+--- M6b round 2 (warmup) ---
+  result: ok=True latency=0.548ms err=None cos=None max_before=33.0°C max_after=32.6°C
+[cooldown:inter-round 2->3] min=300s
+  [inter-round 2->3] elapsed=0s max=cpu_little=32.6°C target<42°C
+
+=== round 3/10 (WARMUP) order=['M6b', 'M7'] ===
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=cpu_little=31.9°C target<42°C
+
+--- M6b round 3 (warmup) ---
+  result: ok=True latency=0.451ms err=None cos=None max_before=32.6°C max_after=32.3°C
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=cpu_little=32.3°C target<42°C
+
+--- M7 round 3 (warmup) ---
+  result: ok=True latency=0.279ms err=None cos=None max_before=33.4°C max_after=32.6°C
+[cooldown:inter-round 3->4] min=300s
+  [inter-round 3->4] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+=== round 4/10 (MEASURE) order=['M7', 'M6b'] ===
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=cpu_little=33.4°C target<42°C
+
+--- M7 round 4 (measure) ---
+  result: ok=True latency=0.273ms err=None cos=None max_before=32.6°C max_after=32.3°C
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=cpu_mid=32.6°C target<42°C
+
+--- M6b round 4 (measure) ---
+  result: ok=True latency=0.454ms err=None cos=None max_before=33.0°C max_after=32.3°C
+[cooldown:inter-round 4->5] min=300s
+  [inter-round 4->5] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+=== round 5/10 (MEASURE) order=['M7', 'M6b'] ===
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=cpu_little=32.6°C target<42°C
+
+--- M7 round 5 (measure) ---
+  result: ok=True latency=0.308ms err=None cos=None max_before=33.0°C max_after=32.6°C
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=ddr=32.3°C target<42°C
+
+--- M6b round 5 (measure) ---
+  result: ok=True latency=0.460ms err=None cos=None max_before=32.3°C max_after=33.4°C
+[cooldown:inter-round 5->6] min=300s
+  [inter-round 5->6] elapsed=0s max=cpu_little=32.3°C target<42°C
+
+=== round 6/10 (MEASURE) order=['M7', 'M6b'] ===
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=cpu_little=32.3°C target<42°C
+
+--- M7 round 6 (measure) ---
+  result: ok=True latency=0.276ms err=None cos=None max_before=32.6°C max_after=33.0°C
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+--- M6b round 6 (measure) ---
+  result: ok=True latency=0.449ms err=None cos=None max_before=33.0°C max_after=33.4°C
+[cooldown:inter-round 6->7] min=300s
+  [inter-round 6->7] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+=== round 7/10 (MEASURE) order=['M7', 'M6b'] ===
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=cpu_little=33.4°C target<42°C
+
+--- M7 round 7 (measure) ---
+  result: ok=True latency=0.308ms err=None cos=None max_before=33.4°C max_after=33.0°C
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=cpu_little=33.4°C target<42°C
+
+--- M6b round 7 (measure) ---
+  result: ok=True latency=0.443ms err=None cos=None max_before=33.0°C max_after=32.6°C
+[cooldown:inter-round 7->8] min=300s
+  [inter-round 7->8] elapsed=0s max=cpu_little=31.9°C target<42°C
+
+=== round 8/10 (MEASURE) order=['M7', 'M6b'] ===
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+--- M7 round 8 (measure) ---
+  result: ok=True latency=0.315ms err=None cos=None max_before=32.3°C max_after=32.3°C
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=cpu_little=32.6°C target<42°C
+
+--- M6b round 8 (measure) ---
+  result: ok=True latency=0.484ms err=None cos=None max_before=33.0°C max_after=32.6°C
+[cooldown:inter-round 8->9] min=300s
+  [inter-round 8->9] elapsed=0s max=cpu_mid=33.0°C target<42°C
+
+=== round 9/10 (MEASURE) order=['M6b', 'M7'] ===
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+--- M6b round 9 (measure) ---
+  result: ok=True latency=0.475ms err=None cos=None max_before=32.3°C max_after=33.0°C
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=cpu_little=33.0°C target<42°C
+
+--- M7 round 9 (measure) ---
+  result: ok=True latency=0.275ms err=None cos=None max_before=32.3°C max_after=32.3°C
+[cooldown:inter-round 9->10] min=300s
+  [inter-round 9->10] elapsed=0s max=ddr=32.3°C target<42°C
+
+=== round 10/10 (MEASURE) order=['M7', 'M6b'] ===
+[cooldown:inter-cell M7] min=45s
+  [inter-cell M7] elapsed=0s max=gpu_5=31.9°C target<42°C
+
+--- M7 round 10 (measure) ---
+  result: ok=True latency=0.273ms err=None cos=None max_before=32.3°C max_after=33.0°C
+[cooldown:inter-cell M6b] min=45s
+  [inter-cell M6b] elapsed=0s max=cpu_little=32.6°C target<42°C
+
+--- M6b round 10 (measure) ---
+  result: ok=True latency=0.456ms err=None cos=None max_before=32.3°C max_after=33.4°C
+
+[done] outputs:
+  - papers/eurosys2027/_workspace/experiment/qnn_microbench_phase_d_prod_v2/raw/
+  - papers/eurosys2027/_workspace/experiment/qnn_microbench_phase_d_prod_v2/aggregated.csv
+  - papers/eurosys2027/_workspace/experiment/qnn_microbench_phase_d_prod_v2/summary.json
+  - papers/eurosys2027/_workspace/experiment/qnn_microbench_phase_d_prod_v2/thermal_log.csv
+  - papers/eurosys2027/_workspace/experiment/qnn_microbench_phase_d_prod_v2/round_sequence.json
+  - papers/eurosys2027/_workspace/experiment/qnn_microbench_phase_d_prod_v2/report.md
