@@ -41,9 +41,10 @@ from typing import Dict, List, Optional, Tuple
 # ----------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEVICE_BIN_DIR = "/data/local/tmp/llmrs/bin"
+# devices.toml: galaxy_s25.paths.work_dir = /data/local/tmp (run_device.py push 위치).
+DEVICE_BIN_DIR = "/data/local/tmp"
 DEVICE_QNN_LIBDIR = "/data/local/tmp/qnn"
-DEVICE_WORK_DIR = "/data/local/tmp/llmrs/microbench"
+DEVICE_WORK_DIR = "/data/local/tmp"
 
 # ----------------------------------------------------------------------
 # Thermal monitoring (S25 SM8750, Phase A.2 결과 반영)
@@ -145,17 +146,22 @@ class Cell:
     tolerance_cosine: float = 0.999
     enabled: bool = True
     optional: bool = False
+    # 같은 group_key 의 cell 은 한 번만 bin 실행, 결과 stdout 을 모든 cell 의 parser 가 공유.
+    # 예: M3/M4 둘 다 qnngpu_matmul_tbt 의 stdout 에서 각자 다른 line 추출.
+    group_key: Optional[str] = None
+    latency_pattern: Optional[str] = None  # regex with 1 capture group (ms)
 
     def adb_cmd(self, work_dir: str) -> str:
         env_str = " ".join(f"{k}={v}" for k, v in self.env.items())
         env_prefix = f"{env_str} " if env_str else ""
         bin_path = f"{DEVICE_BIN_DIR}/{self.bin_name}"
         args_str = " ".join(self.args)
-        # LD_LIBRARY_PATH = QNN libs + standard
-        ld_path = f"{DEVICE_QNN_LIBDIR}:/system/lib64"
+        # LD_LIBRARY_PATH: work_dir (libqnn_oppkg.so 등) + QNN libs + system
+        ld_path = f"{DEVICE_WORK_DIR}:{DEVICE_QNN_LIBDIR}:/system/lib64"
+        adsp = f"ADSP_LIBRARY_PATH={DEVICE_QNN_LIBDIR} "
         return (
             f"cd {work_dir} && "
-            f"LD_LIBRARY_PATH={ld_path} {env_prefix}"
+            f"LD_LIBRARY_PATH={ld_path} {adsp}{env_prefix}"
             f"taskset 3f {bin_path} {args_str}"
         )
 
@@ -184,23 +190,31 @@ def build_cells(enable: List[str]) -> List[Cell]:
              args=[str(K), str(N)],
              tolerance_max_abs=0.1, tolerance_cosine=0.99,
              optional=True),
-        # M3/M4: 같은 bin 의 multi-key output. 일단 두 cell 으로 분리 표기하되
-        # 같은 bin 을 두 번 호출. Phase C 진입 시 single-trial dual-result 로 fine-tune.
+        # M3/M4: qnngpu_matmul_tbt 한 bin 의 dual-result.
+        # output:
+        #   "Baseline OpenCL mul_mv_f16_f32 ... median=X ms"
+        #   "Test     QNN-GPU MAT_MUL ... median=Y ms"
+        # 같은 bin run → group_key 로 stdout 공유. latency_pattern 으로 cell 별 추출.
         Cell("M3",  "f16",  "opencl",
-             "microbench_oppkg_gemv_vs_baseline",
-             args=[n_iters_str],
-             env={"LLMRS_MICROBENCH_MODE": "baseline"},
-             tolerance_max_abs=1e-2, tolerance_cosine=0.999),
+             "microbench_qnngpu_matmul_tbt",
+             args=[str(K), str(N), n_iters_str],
+             tolerance_max_abs=1e-2, tolerance_cosine=0.999,
+             group_key="qnngpu_tbt",
+             latency_pattern=r"Baseline\s+OpenCL.*median=([\d.]+)\s*ms"),
         Cell("M4",  "f16",  "qnn-gpu",
-             "microbench_oppkg_gemv_vs_baseline",
-             args=[n_iters_str],
-             env={"LLMRS_MICROBENCH_MODE": "oppkg"},
-             tolerance_max_abs=1e-2, tolerance_cosine=0.999),
+             "microbench_qnngpu_matmul_tbt",
+             args=[str(K), str(N), n_iters_str],
+             tolerance_max_abs=1e-2, tolerance_cosine=0.999,
+             group_key="qnngpu_tbt",
+             latency_pattern=r"Test\s+QNN-GPU.*median=([\d.]+)\s*ms"),
+        # M5: latency 측정 bin 부재 (qnn_oppkg_matmul_q40_correct 는 correctness only).
+        # Phase C 진입 시 별 bin 작성 필요. 일단 optional.
         Cell("M5",  "q4_0", "opencl",
              "microbench_qnn_oppkg_matmul_q40_correct",
-             args=[],  # env var 기반
+             args=[],
              env={"QNN_BACKEND_LIB": f"{DEVICE_QNN_LIBDIR}/libQnnGpu.so"},
-             tolerance_max_abs=0.05, tolerance_cosine=0.999),
+             tolerance_max_abs=0.05, tolerance_cosine=0.999,
+             optional=True),
         Cell("M6",  "fp32", "executorch",
              "qnn_executor_runner",
              args=["--model_path", "matmul_fp32.pte"],
@@ -294,14 +308,23 @@ def _parse_regex(s: str, pat: str) -> Optional[float]:
     return None
 
 
-def parse_trial_output(stdout: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Returns (latency_ms, max_abs_err, cosine)."""
+def parse_trial_output(
+    stdout: str,
+    custom_pattern: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Returns (latency_ms, max_abs_err, cosine).
+
+    custom_pattern 이 주어지면 그것만 사용 (multi-key bin 의 cell-specific 추출).
+    """
     lat = None
-    for _, fn in _LAT_PATTERNS:
-        v = fn(stdout)
-        if v is not None:
-            lat = v
-            break
+    if custom_pattern:
+        lat = _parse_regex(stdout, custom_pattern)
+    if lat is None:
+        for _, fn in _LAT_PATTERNS:
+            v = fn(stdout)
+            if v is not None:
+                lat = v
+                break
     err = _parse_json_field(stdout, "max_abs_err")
     if err is None:
         err = _parse_regex(stdout, r"max[_\s]abs[_\s]err[:\s]+([\d.eE+-]+)")
@@ -424,9 +447,10 @@ def run_trial(
         )
 
     thermal_after = adb.read_zones()
-    lat, err, cos = parse_trial_output(stdout)
-    # fallback: if no latency parsed, use wall-clock (대략적, log)
+    lat, err, cos = parse_trial_output(stdout, cell.latency_pattern)
+    parsed_latency = lat is not None
     if lat is None:
+        # Crash (signal kill 등) 시에만 latency 없음. wall-clock 으로 폴백.
         lat = elapsed_wall
 
     accuracy_ok = True
@@ -435,15 +459,21 @@ def run_trial(
     if cos is not None and cos < cell.tolerance_cosine:
         accuracy_ok = False
 
+    # measurement validity 의 핵심 = latency 가 stdout 에서 parse 되었는가.
+    # binary returncode != 0 자체는 본 매트릭스 입장에서 fatal 아님 (verdict
+    # PASS/FAIL 의 표현일 수 있음 — 예: qnngpu_matmul_tbt 가 RED 시 exit 1).
+    valid = parsed_latency and accuracy_ok
+
     return TrialResult(
         cell=cell.name, round_idx=round_idx, is_warmup=is_warmup,
-        ok=(ok and accuracy_ok),
+        ok=valid,
         latency_ms=lat, max_abs_err=err, cosine=cos,
         stderr=stderr[-400:] if stderr else "",
         raw_stdout=stdout[-1200:] if stdout else "",
         thermal_before=thermal_before, thermal_after=thermal_after,
-        error=None if (ok and accuracy_ok) else (
-            "binary failed" if not ok else "accuracy out of tolerance"
+        error=None if valid else (
+            "binary crashed (no latency in stdout)" if not parsed_latency
+            else "accuracy out of tolerance"
         ),
     )
 
@@ -626,7 +656,17 @@ def main() -> int:
     parser.add_argument("--out", required=True, help="Output directory")
     parser.add_argument("--dry-run-setup", action="store_true",
                         help="Skip measurement; just verify ADB + zones + zombie check")
+    parser.add_argument("--quick", action="store_true",
+                        help="단축 cooldown (inter-cell 10s, inter-round 30s) — protocol 검증용")
     args = parser.parse_args()
+
+    if args.quick:
+        global COOLDOWN_MIN_S, COOLDOWN_MAX_S, INTER_ROUND_S, INTER_ROUND_MAX_S, SESSION_WARMUP_S
+        COOLDOWN_MIN_S = 10
+        COOLDOWN_MAX_S = 60
+        INTER_ROUND_S = 30
+        INTER_ROUND_MAX_S = 90
+        SESSION_WARMUP_S = 15
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
