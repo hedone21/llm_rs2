@@ -52,6 +52,10 @@ pub fn run_auto_eviction(ctx: AutoEvictionCtx<'_>) -> anyhow::Result<()> {
         actual_protected_prefix,
         decode_token_index,
     } = ctx;
+    // backend is only consumed inside the `#[cfg(feature = "opencl")]` GPU
+    // score sync block; silence unused-variable lint when opencl is off.
+    #[cfg(not(feature = "opencl"))]
+    let _ = &backend;
 
     // Auto-eviction after forward pass (non-experiment mode)
     if auto_eviction {

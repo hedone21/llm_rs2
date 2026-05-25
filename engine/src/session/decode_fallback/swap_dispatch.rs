@@ -476,6 +476,7 @@ pub fn retire_phase_aware(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "opencl")]
 fn remap_weights_for_cpu_after_swap(
     model: &mut TransformerModel,
     backend: &Arc<dyn Backend>,
