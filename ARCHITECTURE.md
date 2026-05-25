@@ -162,7 +162,7 @@ graph TB
         Traits["session::traits<br/>(Forward / EvictionStage / SwapStage /<br/>CommandSource / TokenSampler / DecodeObserver)"]
         Defaults["session::defaults<br/>(NoOp* + GreedySampler)"]
         Prefill["session::prefill<br/>(legacy chunked prefill)"]
-        SwapRt["session::swap_runtime<br/>EngineSwapRuntime + SwapCommitSlot<br/>(Manager WHAT → engine HOW, §13.8-M)"]
+        SwapRt["session::swap_runtime<br/>EngineSwapRuntime + SwapCommitSlot<br/>(precision swap entry, Manager WHAT →<br/>engine HOW, §13.8-M)"]
         Chat["session::chat::<br/>{repl, session, stop_condition}"]
         Eval["session::eval / batch / ppl"]
         FwdImpls["session::forward::<br/>{model, kivi, offload}_forward"]
@@ -180,7 +180,7 @@ graph TB
         Model["models::TransformerModel"]
         Layer["layers::transformer_layer +<br/>llama_layer"]
         Inf["inference::sampling / skip_config /<br/>speculative / attention_scores"]
-        WSwap["models::weights::*<br/>(swap_executor, intra_forward_swap,<br/>phase_aware_swap, async_swap)<br/>eprintln 0 — EventSink emit only<br/>(S-1 / S-1+α / S-1+β)"]
+        WSwap["models::weights::* — Precision Swap track<br/>(weight dtype 교체, 자세히는 §Precision Swap)<br/>SwapExecutor + 4 dispatcher<br/>(Incremental / IntraForward /<br/>PhaseAware / Async)<br/>+ Decider / ReleaseWorker / NoiseTable<br/>eprintln 0 — EventSink emit only<br/>(S-1 / S-1+α / S-1+β)"]
     end
 
     subgraph L3Q ["L3 QCF — qcf*/"]
@@ -436,6 +436,132 @@ classDiagram
 - `outbound_sink: dyn ManagerOutbound` 별도 trait (capability / heartbeat / qcf send).
 - legacy 흡수 v1-1 ~ v1-6 sub-sprint 진행 중 (argus-cli 진입점 README 참조).
 
+
+### Precision Swap Track — Component Diagram
+
+"Precision swap" (코드 식별자: `weight_swap`, `WeightSwap*`) = 런타임 메모리·연산 예산에 맞춰 layer 별 weight *수치 정밀도(dtype)* 를 교체하는 트랙. 본 다이어그램은 트랙 전체 컴포넌트 (자산 / orchestrator / 4 dispatcher / state recovery / backend alias buffer / observability) 와 흐름을 시각화한다. 상위 §Top-level Component Diagram 의 `WSwap` 노드를 분해한 결과.
+
+```mermaid
+graph TB
+    %% ── L4 entry ──────────────────────────────────────────────
+    subgraph Entry ["L4 entry — session/"]
+        SwapRt["EngineSwapRuntime<br/>+ SwapCommitSlot<br/>(§13.8-M, M sprint)"]
+        CliMode["session::cli::SwapMode<br/>(--swap {incremental, intra-forward,<br/>phase-aware, layer-immediate}, A1)"]
+    end
+
+    %% ── Manager (cross-cutting) ───────────────────────────────
+    subgraph CC ["× Cross-cutting"]
+        Cmd["resilience::CommandExecutor<br/>EngineCommand::SwapWeights<br/>{ratio, target_dtype}"]
+        Evt["observability::events<br/>WeightSwapEvent — 8 variant<br/>(PlanCommitted/ChunkDrained/<br/>PlanRetired/SwapFailed/BatchSummary/<br/>ConfigWarning/SubBatchWait/<br/>SwapProfBreakdown)<br/>× WeightSwapKind 5"]
+    end
+
+    %% ── L3 Inference: models/weights/ orchestrator + dispatcher
+    subgraph Orch ["L3 Inference — models/weights/ orchestrator"]
+        Decider["WeightSwapDecider<br/>+ SwapDecision + SwapAlgorithm enum<br/>(QCF_weight evaluation)"]
+        Exec["SwapExecutor<br/>(primary, sync/async path,<br/>chunk granularity = WeightChunk)"]
+    end
+
+    subgraph Disp ["L3 Inference — 4 mode dispatchers"]
+        IncPlan["IncrementalSwapPlan<br/>(per_tick chunk drain,<br/>Manager-driven default)"]
+        IfHook["IntraForwardSwapHook<br/>+ IntraForwardSwapPlan<br/>(per-layer mid-forward,<br/>LISWAP-4)"]
+        PhAware["PhaseAwareSwapDispatcher<br/>(phase-aware chunk,<br/>--swap-phase-aware-chunk-mb)"]
+        AsyncDis["AsyncSwapDispatcher<br/>(event_sink hold worker thread,<br/>S-1+β)"]
+        DynK["DynamicKController<br/>+ ProbingKController<br/>(LISWAP-1/2 K-sweep)"]
+    end
+
+    %% ── L3 State (Pressure-side or weights-side state) ────────
+    subgraph State ["L3 — Swap state"]
+        Slot["LayerSlot<br/>(Arc<LayerWeights> snapshot,<br/>SwappedLayer)"]
+        Pool["LayerObjectPool<br/>(host-pinned staging,<br/>§13.8-B WeightStagingPool)"]
+        Release["PrimaryReleaseWorker<br/>(Phase 6.5 −81% RSS,<br/>ReleaseJob queue)"]
+        Tomb["PrimaryWeightsTombstone<br/>(Sprint C-1/2/3 PLACEHOLDER +<br/>PRIMARY DROP, 1.81 GB recover)"]
+        Noise["QuantNoiseTable<br/>(Q4 quant noise compensation)"]
+        SwapH["pressure::weight_swap_handler<br/>(CachePressureHandler impl)"]
+    end
+
+    %% ── L2 자산 (backing + secondary) ────────────────────────
+    subgraph Asset ["L2 자산 — backing + secondary"]
+        AufBack["AufBacking / GgufBacking<br/>(primary weight mmap)"]
+        AufFmt["AUF format<br/>(shared/auf/*, §13.8-A,<br/>self-contained single-file)"]
+        SecMmap["SecondaryMmap<br/>(AufSecondaryMmap /<br/>GgufSecondaryMmap, zero-copy)"]
+        RpcMem["RpcmemSecondaryStore<br/>+ RpcmemLayerRegion<br/>+ HostPtrAlias<br/>(HTP↔Adreno DMA-BUF heap,<br/>M2 zero-copy interop)"]
+    end
+
+    %% ── L1 Backend alias buffer ───────────────────────────────
+    subgraph BeBuf ["L1 backend alias buffer"]
+        ClAlias["backend/opencl::<br/>HostPtrPoolBuffer<br/>(CL_MEM_ALLOC_HOST_PTR alias,<br/>HOST_WRITE_ONLY -35%)"]
+        CuAlias["backend/cuda_*::<br/>CudaMmapAliasBuffer<br/>(Hammer D ArcSwap alias)"]
+        QnnAlias["backend/qnn_oppkg::<br/>RpcmemAliasBuffer"]
+    end
+
+    %% ── Reports ───────────────────────────────────────────────
+    subgraph Rep ["Reports"]
+        Report["SwapReport + StageBreakdown<br/>+ SwapError + DrainError"]
+    end
+
+    %% ── 흐름: Manager WHAT → SwapRt → engine HOW ─────────────
+    Cmd -.SwapWeights {ratio,dtype}.- SwapRt
+    CliMode -.default_mode.- SwapRt
+    SwapRt -.handle_swap_weights<br/>(4-way dispatch).- Disp
+
+    %% ── orchestrator decides ──────────────────────────────────
+    SwapRt --> Exec
+    Exec --> Decider
+    Decider -.QCF_weight cost.- Evt
+
+    %% ── 4 mode dispatchers route through Exec ────────────────
+    IncPlan --> Exec
+    IfHook --> Exec
+    PhAware --> Exec
+    AsyncDis --> Exec
+    DynK -.K size.- IncPlan
+    DynK -.K size.- IfHook
+
+    %% ── Exec consumes asset / produces state ─────────────────
+    Asset --> Exec
+    AufFmt -.format.- AufBack
+    AufFmt -.format.- SecMmap
+    SecMmap --> Exec
+    RpcMem --> Exec
+    AufBack --> Slot
+    Exec --> Slot
+    Exec --> Pool
+    Exec -.alias.- BeBuf
+    BeBuf -.host_ptr.- Pool
+
+    %% ── post-commit recovery ─────────────────────────────────
+    Exec -.commit.- Release
+    Release --> Tomb
+    Tomb -.RSS drop.- AufBack
+    Exec -.compensation.- Noise
+
+    %% ── Pressure pipeline handler ────────────────────────────
+    SwapH --> Exec
+    SwapH -.handler dispatch.- Slot
+
+    %% ── observability emit (eprintln 0, S-1 ~ S-1+β) ─────────
+    Exec -.WeightSwapEvent.- Evt
+    IncPlan -.WeightSwapEvent.- Evt
+    IfHook -.WeightSwapEvent.- Evt
+    PhAware -.WeightSwapEvent.- Evt
+    AsyncDis -.WeightSwapEvent.- Evt
+    Release -.WeightSwapEvent::ConfigWarning.- Evt
+
+    %% ── reports ──────────────────────────────────────────────
+    Exec --> Report
+    Report -.to Manager.- Cmd
+```
+
+**다이어그램 읽기**:
+- 실선 `-->` = owned 또는 직접 함수 호출.
+- 점선 `-.label.-` = trait dispatch / 메시지 / 외부 이벤트.
+- **Entry (L4)**: Manager 또는 사용자(`--swap` flag) 가 둘 다 같은 `EngineSwapRuntime` 진입. mode 결정은 engine 자율 (§13.8-M).
+- **Orch + Disp (L3 Inference)**: `SwapExecutor` 가 primary, 4 mode dispatcher 는 *얼마나 / 언제 / 어느 layer* 를 commit 할지 정책만 결정 후 Exec 에 위임. `DynamicK`/`ProbingK` 는 chunk size K 만 조절 (LISWAP-1/2).
+- **Asset (L2)**: `AUF` 포맷이 primary + secondary 양쪽 자산 공통 (single-file). `SecondaryMmap` 은 OS mmap zero-copy, `RpcmemSecondaryStore` 는 Android DMA-BUF heap 으로 HTP↔Adreno 공유.
+- **State (L3)**: `LayerSlot` = layer 별 Arc snapshot (atomic 교체). `PrimaryReleaseWorker` 는 swap 완료 layer 의 primary backing 메모리 회수 (Phase 6.5 −81%). `Tombstone` 은 회수 완료 marker. `WeightSwapHandler` 는 pressure pipeline 진입점 (CachePressureHandler).
+- **BeBuf (L1)**: backend 별 alias buffer 가 host pointer 를 GPU/NPU 메모리로 mmap. zero-copy 경로의 실제 substrate.
+- **eprintln 0 정책**: 4 dispatcher + Exec + ReleaseWorker 모두 `WeightSwapEvent` emit 만 사용 (S-1 / S-1+α / S-1+β 3 sprint). stderr 직접 출력 없음.
+- **부분 미구현**: argus-cli + DecodeLoop 경로는 §13.8-M 정책 따라 후속 sprint 에서 흡수 예정 (handoff R5 후속 후보 A). 현재 legacy generate path + PPL runner 만 wire 됨.
 
 ### Key Components
 
