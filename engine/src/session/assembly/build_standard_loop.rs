@@ -30,6 +30,7 @@ use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::session::cli::Args;
 use crate::session::forward::{ModelForward, alloc_standard_kv_caches};
+use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
 /// Phase 4-4-a: standard generate happy path 진입 가드.
@@ -79,6 +80,7 @@ pub fn is_standard_happy_path(args: &Args) -> bool {
 ///
 /// - `max_seq_len`: KV cache 용량 + lazy `PrefillWorkspace` cap
 /// - `kv_dtype`: KV cache element type (F32/F16/Q4_0). 호출자가 args에서 결정
+/// - `resilience`: P3.3 — `Some(adapter)` 이면 3 slot에 주입, `None` 이면 NoOp default.
 #[allow(clippy::too_many_arguments)]
 pub fn build_standard_loop(
     backend: Arc<dyn Backend>,
@@ -90,6 +92,7 @@ pub fn build_standard_loop(
     kv_dtype: DType,
     sampling_config: SamplingConfig,
     plan_enabled: bool,
+    resilience: Option<ResilienceAdapter>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     let kv = alloc_standard_kv_caches(
@@ -121,6 +124,11 @@ pub fn build_standard_loop(
         builder.with_sampler(RepetitionPenaltySampler::new(sampling_config, vocab_size))
     } else {
         builder.with_sampler(GreedySampler)
+    };
+    // P3.3: resilience adapter 주입 (Some → 3 slot 주입, None → NoOp default 유지)
+    let builder = match resilience {
+        Some(adapter) => builder.with_resilience(adapter),
+        None => builder,
     };
     Ok(builder.build())
 }

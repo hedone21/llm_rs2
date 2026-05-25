@@ -745,7 +745,7 @@ mod tests {
             0.5,
             is_d2o,
             "f32".to_string(),
-            std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
+            crate::backend::cpu::cpu_singleton(),
             false,
             vec![], // qcf_sample_layers: empty → internal fallback to [0]
         )
@@ -866,7 +866,7 @@ mod tests {
             0.5,
             false,
             "f32".to_string(),
-            std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
+            crate::backend::cpu::cpu_singleton(),
             false,
             vec![0, 4, 8, 12, 15],
         );

@@ -41,6 +41,9 @@ use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::secondary_mmap::SecondaryMmap;
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
 use crate::models::weights::swap_executor::SwapExecutor;
+// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+α)
+#[rustfmt::skip]
+use crate::observability::events::{CacheEvent, EventSink, NoOpSink, WeightSwapEvent, WeightSwapKind};
 
 // ── LayerBoundaryHook trait ────────────────────────────────────────────────
 
@@ -177,6 +180,8 @@ pub struct IntraForwardSwapHook {
     /// `on_layer_boundary` can hand a typed `Arc<Self>` to the callback
     /// closure (trait-internal `&self` cannot upgrade to `Arc<Self>`).
     self_weak: Weak<Self>,
+    /// S-1+α: structured event sink. `NoOpSink` when caller does not supply one.
+    event_sink: Arc<dyn EventSink>,
     _phantom: PhantomData<()>,
 }
 
@@ -186,6 +191,8 @@ impl IntraForwardSwapHook {
     /// `layer_slots.len()` is the total layer count (used for `pending_events`
     /// size). `target_dtype` is the dtype the swap converts to.
     /// `config` is borrowed by `SwapExecutor` during dispatch.
+    /// `event_sink` (S-1+α): structured `WeightSwapEvent` consumer. Production
+    /// callers pass `Arc::new(StderrDiagnosticSink)`; tests use `Arc::new(NoOpSink)`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         layers: Vec<usize>,
@@ -197,6 +204,7 @@ impl IntraForwardSwapHook {
         release_worker: Option<Arc<PrimaryReleaseWorker>>,
         target_dtype: DType,
         config: Arc<crate::models::config::ModelConfig>,
+        event_sink: Arc<dyn EventSink>,
     ) -> Arc<Self> {
         Self::new_internal(
             layers,
@@ -208,6 +216,7 @@ impl IntraForwardSwapHook {
             release_worker,
             target_dtype,
             config,
+            event_sink,
         )
     }
 
@@ -215,6 +224,7 @@ impl IntraForwardSwapHook {
     /// this way will not dispatch on `on_layer_boundary` (no slot has a
     /// secondary handle), but `arm_pending_for_test` / `clear_pending_for_test`
     /// / `pending_event_for` work as usual for INV-149 ordering tests.
+    /// Default event sink is `NoOpSink`.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn new_for_test(
@@ -236,6 +246,7 @@ impl IntraForwardSwapHook {
             None,
             target_dtype,
             config,
+            Arc::new(NoOpSink),
         )
     }
 
@@ -250,6 +261,7 @@ impl IntraForwardSwapHook {
         release_worker: Option<Arc<PrimaryReleaseWorker>>,
         target_dtype: DType,
         config: Arc<crate::models::config::ModelConfig>,
+        event_sink: Arc<dyn EventSink>,
     ) -> Arc<Self> {
         let num_layers = layer_slots.len();
         let pending_events: Vec<ArcSwapOption<GpuEvent>> =
@@ -267,6 +279,7 @@ impl IntraForwardSwapHook {
             finalized: AtomicBool::new(false),
             config,
             self_weak: w.clone(),
+            event_sink,
             _phantom: PhantomData,
         })
     }
@@ -442,13 +455,15 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
                 Arc::clone(&self.backend),
                 &memory,
                 Arc::clone(rw),
-            ),
+            )
+            .with_event_sink(Arc::clone(&self.event_sink)),
             None => SwapExecutor::new(
                 self.target_dtype,
                 self.config.as_ref(),
                 Arc::clone(&self.backend),
                 &memory,
-            ),
+            )
+            .with_event_sink(Arc::clone(&self.event_sink)),
         };
 
         let async_build =
@@ -456,10 +471,15 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
         let (new_layer, write_event) = match async_build {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "[IntraForwardSwap] layer {idx}: async build failed: {e}; \
-                     dropping (plan continues without this layer)"
-                );
+                self.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                        kind: WeightSwapKind::IntraForward,
+                        reason: format!(
+                            "async build failed: {e}; dropping (plan continues without this layer)"
+                        ),
+                        layer: Some(idx),
+                        token: None,
+                    }));
                 plan.mark_dispatched(idx);
                 return;
             }
@@ -501,10 +521,13 @@ impl LayerBoundaryHook for IntraForwardSwapHook {
         };
 
         if let Err(e) = self.dispatcher.submit_commit(job) {
-            eprintln!(
-                "[IntraForwardSwap] layer {idx}: dispatcher submit failed: {e}; \
-                 clearing pending and skipping"
-            );
+            self.event_sink
+                .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                    kind: WeightSwapKind::IntraForward,
+                    reason: format!("dispatcher submit failed: {e}; clearing pending and skipping"),
+                    layer: Some(idx),
+                    token: None,
+                }));
             self.clear_pending(idx);
             plan.mark_dispatched(idx);
             return;

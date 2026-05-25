@@ -41,6 +41,36 @@ impl From<SecondaryDtypeArg> for crate::models::weights::SecondaryDtypeChoice {
     }
 }
 
+/// `--swap` CLI 인수 — 4 swap 모드 선택용 통합 shorthand (backlog P3, 2026-05-25).
+///
+/// `--swap` (단독): default = IntraForward 활성 (LISWAP-4, production winner).
+/// `--swap <MODE>`: 명시 모드 선택. `intra-forward` / `incremental` /
+/// `phase-aware` / `layer-immediate`.
+///
+/// 기존 4 flag (`--swap-incremental-per-tick`, `--swap-intra-forward`,
+/// `--swap-phase-aware`, `--swap-layer-immediate`)는 deprecated. 직접 사용
+/// 시 stderr 1회 경고 후 그대로 동작. `--swap` 사용 시 기존 flag보다 우선.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapMode {
+    IntraForward,
+    Incremental,
+    PhaseAware,
+    LayerImmediate,
+}
+
+/// `--swap` value_parser.
+pub fn parse_swap_mode(s: &str) -> Result<SwapMode, String> {
+    match s.to_lowercase().as_str() {
+        "intra-forward" | "intra_forward" | "intraforward" => Ok(SwapMode::IntraForward),
+        "incremental" => Ok(SwapMode::Incremental),
+        "phase-aware" | "phase_aware" | "phaseaware" => Ok(SwapMode::PhaseAware),
+        "layer-immediate" | "layer_immediate" | "layerimmediate" => Ok(SwapMode::LayerImmediate),
+        other => Err(format!(
+            "unknown swap mode '{other}'. Valid: intra-forward, incremental, phase-aware, layer-immediate"
+        )),
+    }
+}
+
 /// `--secondary-layout` CLI 인수 값.
 ///
 /// AUF의 어떤 weights variant로 swap 후 텐서를 만들지 결정한다. 기본은
@@ -1015,6 +1045,21 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub swap_layer_immediate: bool,
 
+    /// 4 swap 모드 통합 shorthand (backlog P3, 2026-05-25).
+    ///
+    /// `--swap` (단독): default = IntraForward (LISWAP-4 production winner).
+    /// `--swap <MODE>`: 명시 모드 선택. `intra-forward` / `incremental` /
+    /// `phase-aware` / `layer-immediate`.
+    ///
+    /// `--swap` 사용 시 init 단계에서 legacy 4 flag (`--swap-intra-forward`
+    /// 등)로 변환되어 기존 dispatch path가 그대로 동작한다. `Incremental` 모드
+    /// 선택 시 `--swap-incremental-per-tick K`가 0이면 K=2 default 적용.
+    ///
+    /// 기존 4 flag 직접 사용은 deprecated — init.rs에서 stderr 1회 경고
+    /// (`--swap`으로 마이그레이션 권장). 동작은 그대로 보존.
+    #[arg(long, value_parser = parse_swap_mode, num_args = 0..=1, default_missing_value = "intra-forward")]
+    pub swap: Option<SwapMode>,
+
     /// LISWAP-6 Dynamic-K controller — auto-tune `--swap-incremental-per-tick`
     /// based on measured per-layer release cost vs forward wall.
     ///
@@ -1136,6 +1181,68 @@ pub struct Args {
 /// `args.kv_budget`, ...) read through these methods so the C2 commit
 /// changes only `cli/mod.rs`. Call sites migrate to direct enum match in C3.
 impl Args {
+    /// Normalize `--swap` shorthand to legacy 4 flags (backlog P3, 2026-05-25).
+    ///
+    /// `Args::parse()` 직후 1회 호출. `--swap` set 시 해당 legacy field 활성화
+    /// (Incremental은 `--swap-incremental-per-tick`가 0이면 K=2 default).
+    /// `--swap` unset + legacy 4 flag 직접 사용 시 stderr 1회 deprecation 경고.
+    /// 이후 dispatch path는 기존 4 field만 읽으면 됨.
+    pub fn normalize_swap_shorthand(&mut self) {
+        if let Some(mode) = self.swap {
+            match mode {
+                SwapMode::IntraForward => self.swap_intra_forward = true,
+                SwapMode::Incremental => {
+                    if self.swap_incremental_per_tick == 0 {
+                        self.swap_incremental_per_tick = 2;
+                    }
+                }
+                SwapMode::PhaseAware => self.swap_phase_aware = true,
+                SwapMode::LayerImmediate => self.swap_layer_immediate = true,
+            }
+        } else {
+            let used_legacy = self.swap_incremental_per_tick > 0
+                || self.swap_intra_forward
+                || self.swap_phase_aware
+                || self.swap_layer_immediate;
+            if used_legacy {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "[deprecation] --swap-incremental-per-tick / --swap-intra-forward / \
+                         --swap-phase-aware / --swap-layer-immediate 직접 사용은 향후 제거 예정. \
+                         `--swap [intra-forward|incremental|phase-aware|layer-immediate]` 통합 \
+                         flag로 마이그레이션 권장 (backlog P3, 2026-05-25)."
+                    );
+                });
+            }
+        }
+    }
+
+    /// Engine 내부 dispatch default mode 결정.
+    ///
+    /// Manager `SwapWeights` 수신 시 어느 mode (Incremental / IntraForward /
+    /// PhaseAware / LayerImmediate) 로 dispatch 할지의 default. `--swap` enum
+    /// 우선, 미지정 시 legacy 4 flag로부터 추론, 모두 미지정이면 LISWAP-4
+    /// production winner (IntraForward) 기본.
+    ///
+    /// `normalize_swap_shorthand()` 후 호출 권장 (legacy field 일치 보장).
+    /// 상세 mental model: arch/weight_swap.md §2.8.1.
+    pub fn resolved_swap_mode(&self) -> SwapMode {
+        if let Some(mode) = self.swap {
+            mode
+        } else if self.swap_phase_aware {
+            SwapMode::PhaseAware
+        } else if self.swap_layer_immediate {
+            SwapMode::LayerImmediate
+        } else if self.swap_intra_forward {
+            SwapMode::IntraForward
+        } else if self.swap_incremental_per_tick > 0 {
+            SwapMode::Incremental
+        } else {
+            SwapMode::IntraForward
+        }
+    }
+
     /// KV mode (단순 reader — legacy fallback 제거됨, 옵션 C 완료).
     pub fn effective_kv_mode(&self) -> KvMode {
         self.kv_mode_args.kv_mode

@@ -24,6 +24,8 @@ use llm_rs2::pressure::kv_cache::{KVCache, KVLayout};
 use llm_rs2::session::cli::{Args, KvMode};
 use llm_rs2::session::init::SessionInitCtx;
 use llm_rs2::session::is_standard_happy_path;
+use llm_rs2::session::resilience_adapter::ResilienceAdapter;
+use llm_rs2::session::resilience_init::build_command_executor;
 use llm_rs2::session::standard_happy::{StandardHappyCtx, run_standard_happy_path};
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
@@ -33,6 +35,10 @@ use tokenizers::Tokenizer;
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let mut args = Args::parse();
+
+    // backlog P3 (2026-05-25): `--swap` shorthand → legacy 4 flag normalize.
+    // `--swap` set 시 해당 legacy field 활성화 후 dispatch path는 그대로.
+    args.normalize_swap_shorthand();
 
     // v1-1: resilience default-on. `--no-resilience` 가 명시되면 effective=false,
     // 그 외에는 effective=true (legacy `--enable-resilience` flag 도 그대로 효과).
@@ -121,6 +127,14 @@ fn main() -> anyhow::Result<()> {
         bail!("argus-cli v0: --num-tokens must be >= 1");
     }
 
+    // P4: ResilienceAdapter 생성. `--no-resilience` 시 None (NoOp default).
+    // transport 연결 실패는 Err로 전파 — graceful fail, panic 없음.
+    let resilience: Option<ResilienceAdapter> = if args.enable_resilience {
+        build_command_executor(&args, &model)?.map(ResilienceAdapter::new)
+    } else {
+        None
+    };
+
     run_standard_happy_path(StandardHappyCtx {
         args,
         backend,
@@ -135,6 +149,7 @@ fn main() -> anyhow::Result<()> {
         kv_type,
         sampling_config,
         vocab_size,
+        resilience,
     })
 }
 

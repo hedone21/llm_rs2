@@ -477,8 +477,7 @@ impl TransformerModel {
         }
         // Set cpu_backend for gather_embed fallback path
         if self.cpu_backend.is_none() {
-            self.cpu_backend =
-                Some(Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>);
+            self.cpu_backend = Some(crate::backend::cpu::cpu_singleton());
         }
         Ok(count)
     }
@@ -623,7 +622,7 @@ impl TransformerModel {
         } else if !is_gpu {
             backend.clone()
         } else {
-            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>
+            crate::backend::cpu::cpu_singleton()
         };
         let cpu_tensor = Tensor::new(cpu_shape, cpu_buf, cpu_backend);
 
@@ -766,7 +765,7 @@ impl TransformerModel {
         } else if !is_gpu {
             backend.clone()
         } else {
-            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>
+            crate::backend::cpu::cpu_singleton()
         };
         let cpu_tensor = Tensor::new(shape, cpu_buf, cpu_backend);
 
@@ -1369,8 +1368,7 @@ impl TransformerModel {
 
         // Set cpu_backend for gather_embed fallback path
         if self.cpu_backend.is_none() {
-            self.cpu_backend =
-                Some(Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>);
+            self.cpu_backend = Some(crate::backend::cpu::cpu_singleton());
         }
 
         Ok(count)

@@ -1199,7 +1199,7 @@ impl TransformerLayer {
                 let cpu_out = Tensor::new(
                     out_attn.shape().clone(),
                     buf,
-                    Arc::new(crate::backend::cpu::CpuBackend::new()),
+                    crate::backend::cpu::cpu_singleton(),
                 );
                 out_attn = backend.copy_from(&cpu_out)?;
             }

@@ -58,6 +58,9 @@ use crate::models::transformer::TransformerModel;
 use crate::models::weights::async_swap::AsyncSwapDispatcher;
 use crate::models::weights::release_worker::PrimaryReleaseWorker;
 use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
+// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+α)
+#[rustfmt::skip]
+use crate::observability::events::{CacheEvent, EventSink, NoOpSink, WeightSwapEvent, WeightSwapKind};
 use crate::tensor::Tensor;
 
 /// Errors surfaced by `SwapExecutor::execute`.
@@ -312,6 +315,17 @@ pub struct SwapExecutor<'a> {
     /// build path.
     #[cfg(feature = "cuda-embedded")]
     pub mmap_registration: Option<Arc<crate::memory::cuda::mmap::CudaMmapRegistration>>,
+
+    /// S-1+α: dispatcher identity for `WeightSwapEvent` emit. Defaults to
+    /// `IntraForward` (Q1 결정). PhaseAware / Subsystem caller가
+    /// `.with_kind(...)` chain으로 override.
+    pub kind: WeightSwapKind,
+
+    /// S-1+α: structured event sink. Defaults to `NoOpSink` so existing
+    /// constructors (test fixtures, internal helpers) keep working without a
+    /// caller-supplied sink. Production callers attach `StderrDiagnosticSink`
+    /// or a custom sink via `.with_event_sink(...)`.
+    pub event_sink: Arc<dyn EventSink>,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -336,6 +350,8 @@ impl<'a> SwapExecutor<'a> {
             layer_pool: None,
             #[cfg(feature = "cuda-embedded")]
             mmap_registration: None,
+            kind: WeightSwapKind::default(),
+            event_sink: Arc::new(NoOpSink),
         }
     }
 
@@ -363,7 +379,24 @@ impl<'a> SwapExecutor<'a> {
             layer_pool: None,
             #[cfg(feature = "cuda-embedded")]
             mmap_registration: None,
+            kind: WeightSwapKind::default(),
+            event_sink: Arc::new(NoOpSink),
         }
+    }
+
+    /// S-1+α: override dispatcher identity used in emitted `WeightSwapEvent`s.
+    /// PhaseAware / Subsystem caller만 chain; default (IntraForward) 사용 시 생략.
+    pub fn with_kind(mut self, kind: WeightSwapKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// S-1+α: attach a structured event sink. Production callers pass
+    /// `Arc::new(StderrDiagnosticSink)` or a custom sink. Tests can omit this
+    /// to keep `NoOpSink` (silent).
+    pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.event_sink = sink;
+        self
     }
 
     /// LISWAP-3 prototype builder — attach a `HostPtrPool` so the AOS
@@ -786,6 +819,9 @@ impl<'a> SwapExecutor<'a> {
                 let config_owned = self.config.clone();
                 let target_dtype = self.target_dtype;
                 let release_worker_clone = self.release_worker.clone();
+                // S-1+α: capture event_sink + kind into BgFetch closure.
+                let bg_event_sink: Arc<dyn EventSink> = Arc::clone(&self.event_sink);
+                let bg_kind = self.kind;
 
                 // LISWAP-8 Phase B: try to take a pool entry for this
                 // layer. If `Some`, the worker closure overwrites the
@@ -877,9 +913,14 @@ impl<'a> SwapExecutor<'a> {
                         let (new_layer, write_event) = match result {
                             Ok(pair) => pair,
                             Err(e) => {
-                                eprintln!(
-                                    "[BgFetch] layer {layer_idx} build failed: {e}; skipping"
-                                );
+                                bg_event_sink.emit(CacheEvent::WeightSwap(
+                                    WeightSwapEvent::SwapFailed {
+                                        kind: bg_kind,
+                                        reason: format!("BgFetch build failed: {e}"),
+                                        layer: Some(layer_idx),
+                                        token: None,
+                                    },
+                                ));
                                 return;
                             }
                         };
@@ -887,9 +928,14 @@ impl<'a> SwapExecutor<'a> {
                         if !write_event.is_dummy()
                             && let Err(e) = backend_arc.wait_event_blocking(&write_event)
                         {
-                            eprintln!(
-                                "[BgFetch] layer {layer_idx} wait_event_blocking failed: {e}; skipping"
-                            );
+                            bg_event_sink.emit(CacheEvent::WeightSwap(
+                                WeightSwapEvent::SwapFailed {
+                                    kind: bg_kind,
+                                    reason: format!("BgFetch wait_event_blocking failed: {e}"),
+                                    layer: Some(layer_idx),
+                                    token: None,
+                                },
+                            ));
                             return;
                         }
 
@@ -906,9 +952,13 @@ impl<'a> SwapExecutor<'a> {
 
                 let t_submit = Instant::now();
                 if let Err(e) = dispatcher.submit_dispatch_chunk(job) {
-                    eprintln!(
-                        "[BgFetch] layer {layer_idx}: submit_dispatch_chunk failed: {e}; skipping"
-                    );
+                    self.event_sink
+                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                            kind: self.kind,
+                            reason: format!("BgFetch submit_dispatch_chunk failed: {e}"),
+                            layer: Some(layer_idx),
+                            token: None,
+                        }));
                     report.skipped.push(layer_idx);
                     continue;
                 }
@@ -969,9 +1019,13 @@ impl<'a> SwapExecutor<'a> {
                 let (new_layer, write_event) = match async_result {
                     Ok(pair) => pair,
                     Err(e) => {
-                        eprintln!(
-                            "[AsyncSwap] layer {layer_idx}: async transfer failed: {e}; skipping"
-                        );
+                        self.event_sink
+                            .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                                kind: self.kind,
+                                reason: format!("AsyncSwap async transfer failed: {e}"),
+                                layer: Some(layer_idx),
+                                token: None,
+                            }));
                         report.skipped.push(layer_idx);
                         continue;
                     }
@@ -997,9 +1051,13 @@ impl<'a> SwapExecutor<'a> {
                 // only record the submit latency (nanoseconds) on the main thread.
                 let t_b0 = Instant::now();
                 if let Err(e) = dispatcher.submit_commit(job) {
-                    eprintln!(
-                        "[AsyncSwap] layer {layer_idx}: dispatcher submit failed: {e}; skipping"
-                    );
+                    self.event_sink
+                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                            kind: self.kind,
+                            reason: format!("AsyncSwap dispatcher submit failed: {e}"),
+                            layer: Some(layer_idx),
+                            token: None,
+                        }));
                     report.skipped.push(layer_idx);
                     continue;
                 }
@@ -1282,10 +1340,14 @@ impl<'a> SwapExecutor<'a> {
         // ("memory peak ≤ 1 layer") is satisfied iff max ≤ 1 here.
         if diag_enabled {
             let mode = if use_async { "async" } else { "sync" };
-            eprintln!(
-                "[SwapPeak] mode={mode} target_layers={} max_release_pending={max_release_pending} max_dispatcher_pending={max_dispatcher_pending}",
-                target_layers.len(),
-            );
+            self.event_sink
+                .emit(CacheEvent::WeightSwap(WeightSwapEvent::BatchSummary {
+                    kind: self.kind,
+                    mode,
+                    target_layers: target_layers.len(),
+                    max_release_pending,
+                    max_dispatcher_pending,
+                }));
         }
 
         Ok(report)
@@ -1655,8 +1717,7 @@ impl<'a> SwapExecutor<'a> {
             ))
         };
 
-        let cpu_backend: Arc<dyn Backend> =
-            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+        let cpu_backend = crate::backend::cpu::cpu_singleton();
         Ok(Tensor::new(shape, cpu_buf, cpu_backend))
     }
 
@@ -2020,8 +2081,7 @@ impl<'a> SwapExecutor<'a> {
 
         // ── sub-stage: cpu_tensor ───────────────────────────────────────────
         let t_cpu = if prof { Some(Instant::now()) } else { None };
-        let cpu_backend: Arc<dyn Backend> =
-            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+        let cpu_backend = crate::backend::cpu::cpu_singleton();
         let cpu_tensor = Tensor::new(shape.clone(), cpu_buf, cpu_backend);
         let us_cpu = t_cpu.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
@@ -2826,8 +2886,7 @@ fn materialise_cpu_tensor_standalone(
         ))
     };
 
-    let cpu_backend: Arc<dyn Backend> =
-        Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+    let cpu_backend = crate::backend::cpu::cpu_singleton();
     let _ = backend;
     Ok(Tensor::new(shape, cpu_buf, cpu_backend))
 }
@@ -3059,7 +3118,7 @@ mod tests {
         // production path and the inner `LayerWeights` can be dropped to
         // release every buffer Arc. This mirrors the WSWAP-5-PRIMARY-DROP
         // primary cl_mem release semantics on the device.
-        let be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        let be: Arc<dyn Backend> = crate::backend::cpu::cpu_singleton();
         let initial = Arc::new(build_test_layer(&be));
         let slot = LayerSlot::new(
             (*initial).clone(),
@@ -3121,7 +3180,7 @@ mod tests {
         // after the helper consumes the layer.
         use std::sync::Weak;
 
-        let be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        let be: Arc<dyn Backend> = crate::backend::cpu::cpu_singleton();
         let layer = build_test_layer(&be);
         // Capture weak refs to the 7 weight buffers.
         let weaks: Vec<Weak<dyn crate::buffer::Buffer>> = [

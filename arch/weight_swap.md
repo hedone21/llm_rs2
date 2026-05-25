@@ -687,6 +687,30 @@ pub enum ResilienceAction {
 
 ---
 
+### 2.8.1 Manager → Engine swap protocol: WHAT vs HOW (2026-05-25)
+
+**원칙**: Manager는 **WHAT**만 결정하고, **HOW**는 engine 내부 사항이다.
+
+| 결정 주체 | 결정 영역 | 매핑 |
+|---|---|---|
+| **Manager** | *WHAT* — 무엇을 할지 | wire format 3 필드: `SwapWeights` variant 자체 + `target_dtype: DtypeTag` + `ratio: f32` |
+| **Engine** | *HOW* — 어떻게 할지 | swap mode (Incremental / IntraForward / PhaseAware / LayerImmediate), per-tick K, dispatcher 종류, target_layers 선택 알고리즘 |
+| **사용자 (CLI)** | Engine의 HOW default 설정 | `--swap [intra-forward\|incremental\|phase-aware\|layer-immediate]` flag로 engine 내부 default mode 결정 (`engine/src/session/cli/mod.rs::SwapMode`) |
+
+**근거**:
+- Manager는 system signal (memory pressure / thermal / compute guidance / energy) 에 정책으로 반응한다. swap mode는 dispatch 수단의 trade-off (latency vs memory spike vs forward overhead) 이므로 정책 layer가 모르는 게 옳다.
+- Manager가 mode를 보내면 wire format 비대화 + Manager 정책 책임 침범 + backward-compat fragility (신규 mode 추가 시 wire schema 변경).
+- 사용자는 `--swap intra-forward` 같은 CLI flag로 engine의 default mode를 한 번 설정. Manager가 SwapWeights 신호를 보내면 engine은 그 default mode로 commit. 사용자 의도가 Manager 경로에도 자연 전파.
+
+**구현 매핑**:
+- wire: `shared::EngineCommand::SwapWeights { ratio, target_dtype }` — mode 필드 **없음** (현재 그대로).
+- engine 내부 dispatch: `engine/src/session/swap_runtime.rs::EngineSwapRuntime::handle_swap_weights()` 가 `self.default_mode` (CLI flag normalize 결과)로 4-way 분기하여 `SwapCommitSlot` 에 commit.
+- CLI 강제 경로 (`--force-swap-ratio`): `legacy/generate.rs::dispatch_force_swap!` 매크로가 동일 4-way 분기 (본 sprint scope에서는 매크로 그대로 유지, 후속 sprint에서 method 흡수 가능).
+
+**Mental model 한 줄**: *Manager는 "Q4로 50% 바꿔라"만, Engine은 "어떤 시점에 어떤 mechanism으로 바꿀지"를 자율 결정한다.*
+
+---
+
 ### 2.9 컴포넌트: Manager 측 SwapWeights 통합 (lua_policy 직접 매핑 + hierarchical ActionId 경로)
 
 **설계 결정**: SwapWeights는 Manager에서 두 경로로 노출된다. 두 경로는 **동일한 IPC 명령**(`EngineCommand::SwapWeights { ratio, target_dtype }`)을 산출하지만 산출 단계와 정책 표면이 다르다. spec/23-manager-data.md MGR-DAT-040의 카탈로그가 두 경로에 대한 단일 진실원이다.

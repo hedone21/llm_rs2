@@ -872,7 +872,7 @@ pub fn dump_layer_weights_to_dir(
                 // The lm_head can live on a CPU backend even when the main
                 // backend is GPU (`lm_head_on_cpu`) — fall back to CpuBackend
                 // for that case so we still get a dump file out.
-                let cpu_be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+                let cpu_be: Arc<dyn Backend> = crate::backend::cpu::cpu_singleton();
                 match cpu_be.read_buffer(t, &mut bytes) {
                     Ok(()) => {
                         let fname = format!("model_{}_{:?}.bin", name, dt);

@@ -19,6 +19,7 @@ use crate::models::weights::{
     AsyncSwapDispatcher, DynamicKController, IncrementalSwapPlan, IntraForwardSwapHook,
     PhaseAwareSwapDispatcher, ProbingKController,
 };
+use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
 use crate::observability::rss_trace::read_bytes_now;
 use crate::qcf::ImportanceTable;
 use crate::session::cli::Args;
@@ -51,6 +52,10 @@ pub struct SwapDispatchCtx<'a> {
     pub probing_k_controller: &'a mut Option<ProbingKController>,
     pub manager_swap_report_pending: &'a mut Option<(f32, usize, std::time::Instant, f32)>,
     pub ready_weight_swap_report: &'a mut Option<llm_shared::WeightSwapReport>,
+    /// S-1: structured event sink for swap lifecycle events.
+    /// `NoOpSink` (default) means emit is a no-op; switch to
+    /// `StderrDiagnosticSink` for `[WeightSwap]` logging.
+    pub event_sink: &'a Arc<dyn EventSink>,
 }
 
 /// J3 — Layer-Incremental Swap dispatch (ENG-ALG-233).
@@ -133,18 +138,22 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
             ) {
                 Ok(report) => {
                     let io_after = read_bytes_now();
-                    eprintln!(
-                        "[IncrementalSwap] tick={} chunk={:?} swapped={} remaining={} latency={:.1}ms read_bytes_delta={}",
-                        ctx.decode_token_index,
-                        &chunk,
-                        report.swapped.len(),
-                        inc_plan.remaining_count(),
-                        t_swap.elapsed().as_secs_f64() * 1000.0,
-                        io_after.saturating_sub(io_before),
-                    );
-                    if let Some(ref stages) = report.stage_breakdown {
-                        eprintln!("[IncrementalSwap] stages: {}", stages.to_log_line());
-                    }
+                    let latency_ms = (t_swap.elapsed().as_secs_f64() * 1000.0) as f32;
+                    let stages_str = report.stage_breakdown.as_ref().map(|s| {
+                        format!(
+                            "{} | read_bytes_delta={}",
+                            s.to_log_line(),
+                            io_after.saturating_sub(io_before)
+                        )
+                    });
+                    ctx.event_sink
+                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained {
+                            kind: WeightSwapKind::Incremental,
+                            chunk_idx: ctx.decode_token_index,
+                            layers_done: report.swapped.len(),
+                            latency_ms,
+                            stages: stages_str,
+                        }));
                     #[cfg(feature = "opencl")]
                     remap_weights_for_cpu_after_swap(
                         ctx.model,
@@ -184,10 +193,13 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[IncrementalSwap] swap error on tick={}: {}",
-                        ctx.decode_token_index, e
-                    );
+                    ctx.event_sink
+                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                            kind: WeightSwapKind::Incremental,
+                            reason: e.to_string(),
+                            layer: None,
+                            token: Some(ctx.decode_token_index),
+                        }));
                 }
             }
         }
@@ -238,25 +250,43 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
         }
         // ENG-ALG-233: retire plan when all layers have been drained (INV-145).
         if inc_plan.is_done() {
-            eprintln!(
-                "[IncrementalSwap] plan complete (started_at_token={}, finished_at_token={})",
-                inc_plan.started_at_token(),
-                ctx.decode_token_index,
-            );
+            let started_at = inc_plan.started_at_token();
             // LISWAP-2: drain async dispatcher to ensure all in-flight commits land
             // before the plan is retired. drain failure is non-fatal — prototype
             // robustness is secondary to measurement.
+            let mut drain_ms: f32 = 0.0;
             if let Some(dispatcher) = ctx.async_swap_dispatcher.as_ref() {
                 let drain_t = std::time::Instant::now();
                 if let Err(e) = dispatcher.drain(std::time::Duration::from_secs(2)) {
-                    eprintln!("[LISWAP-2] drain failed: {e}");
+                    ctx.event_sink
+                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                            kind: WeightSwapKind::Incremental,
+                            reason: format!("LISWAP-2 drain failed: {e}"),
+                            layer: None,
+                            token: Some(ctx.decode_token_index),
+                        }));
                 } else {
-                    eprintln!(
-                        "[LISWAP-2] dispatcher drained: {:.1}ms",
-                        drain_t.elapsed().as_secs_f64() * 1000.0
-                    );
+                    drain_ms = (drain_t.elapsed().as_secs_f64() * 1000.0) as f32;
+                    ctx.event_sink
+                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained {
+                            kind: WeightSwapKind::Incremental,
+                            chunk_idx: ctx.decode_token_index,
+                            layers_done: 0, // LISWAP-2 dispatcher drain, no new layers
+                            latency_ms: drain_ms,
+                            stages: Some("liswap-2-drain".to_string()),
+                        }));
                 }
             }
+            ctx.event_sink
+                .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
+                    kind: WeightSwapKind::Incremental,
+                    qcf_actual: None,
+                    token: ctx.decode_token_index,
+                    elapsed_ms: drain_ms,
+                    ratio: None,
+                    n_planned: Some(ctx.decode_token_index.saturating_sub(started_at)),
+                    actually_q4: None,
+                }));
             *ctx.incremental_force_swap_plan = None;
 
             // LISWAP-6 manager path: build WeightSwapReport when the plan
@@ -292,15 +322,16 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                         to_dtype: llm_shared::DtypeTag::Q4_0,
                     })
                     .collect();
-                eprintln!(
-                    "[WeightSwap] manager plan complete: ratio={:.2}, planned={}, \
-                     actually_q4={}, qcf_swap={:.4}, latency={}ms",
-                    ratio,
-                    n_planned,
-                    layers_swapped.len(),
-                    qcf_swap_actual,
-                    latency_ms,
-                );
+                ctx.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
+                        kind: WeightSwapKind::Incremental,
+                        qcf_actual: Some(qcf_swap_actual),
+                        token: ctx.decode_token_index,
+                        elapsed_ms: latency_ms as f32,
+                        ratio: Some(ratio),
+                        n_planned: Some(n_planned),
+                        actually_q4: Some(layers_swapped.len()),
+                    }));
                 *ctx.ready_weight_swap_report = Some(llm_shared::WeightSwapReport {
                     layers_swapped,
                     freed_bytes: 0,
@@ -339,11 +370,16 @@ pub fn retire_intra_forward(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()>
             std::time::Duration::from_secs(10),
         ) {
             Ok(()) => {
-                eprintln!(
-                    "[IntraForwardSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms)",
-                    ctx.decode_token_index,
-                    drain_t.elapsed().as_secs_f64() * 1000.0,
-                );
+                ctx.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
+                        kind: WeightSwapKind::IntraForward,
+                        qcf_actual: None,
+                        token: ctx.decode_token_index,
+                        elapsed_ms: (drain_t.elapsed().as_secs_f64() * 1000.0) as f32,
+                        ratio: None,
+                        n_planned: None,
+                        actually_q4: None,
+                    }));
                 #[cfg(feature = "opencl")]
                 remap_weights_for_cpu_after_swap(
                     ctx.model,
@@ -354,10 +390,13 @@ pub fn retire_intra_forward(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()>
                 );
             }
             Err(e) => {
-                eprintln!(
-                    "[IntraForwardSwap] finalize failed at token={}: {}",
-                    ctx.decode_token_index, e
-                );
+                ctx.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                        kind: WeightSwapKind::IntraForward,
+                        reason: format!("finalize failed: {e}"),
+                        layer: None,
+                        token: Some(ctx.decode_token_index),
+                    }));
             }
         }
         *ctx.intra_forward_swap_hook = None; // retire
@@ -402,12 +441,16 @@ pub fn retire_phase_aware(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
             std::time::Duration::from_secs(10),
         ) {
             Ok(()) => {
-                eprintln!(
-                    "[PhaseAwareSwap] plan retired at token={} (drain+sync+bump+invalidate {:.1}ms, chunks={})",
-                    ctx.decode_token_index,
-                    drain_t.elapsed().as_secs_f64() * 1000.0,
-                    disp.dispatched_count(),
-                );
+                ctx.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
+                        kind: WeightSwapKind::PhaseAware,
+                        qcf_actual: None,
+                        token: ctx.decode_token_index,
+                        elapsed_ms: (drain_t.elapsed().as_secs_f64() * 1000.0) as f32,
+                        ratio: None,
+                        n_planned: Some(disp.dispatched_count() as usize),
+                        actually_q4: None,
+                    }));
                 #[cfg(feature = "opencl")]
                 remap_weights_for_cpu_after_swap(
                     ctx.model,
@@ -418,10 +461,13 @@ pub fn retire_phase_aware(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
                 );
             }
             Err(e) => {
-                eprintln!(
-                    "[PhaseAwareSwap] finalize failed at token={}: {}",
-                    ctx.decode_token_index, e
-                );
+                ctx.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                        kind: WeightSwapKind::PhaseAware,
+                        reason: format!("finalize failed: {e}"),
+                        layer: None,
+                        token: Some(ctx.decode_token_index),
+                    }));
             }
         }
         *ctx.phase_aware_swap_dispatcher = None;

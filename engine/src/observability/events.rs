@@ -41,6 +41,99 @@ pub struct ScoreSnapshot {
     pub above_2sigma_frac: f32,
 }
 
+/// Dispatcher identity for `WeightSwapEvent`.
+///
+/// CLI-flag-determined static choice — `--swap-incremental-per-tick K`,
+/// `--swap-intra-forward`, `--swap-phase-aware` are mutually exclusive.
+/// `Subsystem` is used for swap_executor's BgFetch/AsyncSwap helpers whose
+/// caller dispatcher is indirect (S-1+α: `SwapExecutor` defaults to
+/// `IntraForward` and PhaseAware/Subsystem callers override via
+/// `.with_kind(...)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WeightSwapKind {
+    Incremental,
+    #[default]
+    IntraForward,
+    PhaseAware,
+    Subsystem,
+}
+
+impl WeightSwapKind {
+    /// Stable string label used in stderr emit output. Matches the legacy
+    /// S-1 `&'static str` values so downstream grep patterns continue to work.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Incremental => "Incremental",
+            Self::IntraForward => "IntraForward",
+            Self::PhaseAware => "PhaseAware",
+            Self::Subsystem => "Subsystem",
+        }
+    }
+}
+
+impl std::fmt::Display for WeightSwapKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Structured events emitted during weight swap operations.
+///
+/// 5 variants. Each carries `kind: WeightSwapKind` identifying which dispatcher
+/// emitted the event (see `WeightSwapKind` docstring).
+#[derive(Debug, Clone)]
+pub enum WeightSwapEvent {
+    /// Dispatcher committed a swap plan — layer/chunk partition decided.
+    PlanCommitted {
+        kind: WeightSwapKind,
+        algorithm: &'static str,
+        ratio: f32,
+        k_chunk: usize,
+        n_layers: usize,
+    },
+    /// One chunk drained (transfer + commit completed).
+    ChunkDrained {
+        kind: WeightSwapKind,
+        chunk_idx: usize,
+        layers_done: usize,
+        latency_ms: f32,
+        /// Optional stage breakdown string (e.g. "mmap:12.3/permute:8.1/...").
+        stages: Option<String>,
+    },
+    /// Plan finished — incremental_plan=None or J4/J5 finalize ok.
+    PlanRetired {
+        kind: WeightSwapKind,
+        qcf_actual: Option<f32>,
+        token: usize,
+        elapsed_ms: f32,
+        /// Optional ratio / layer counts (J3 manager-plan path provides these,
+        /// J4/J5 do not).
+        ratio: Option<f32>,
+        n_planned: Option<usize>,
+        actually_q4: Option<usize>,
+    },
+    /// Swap failed mid-flight (build / dispatch / drain / finalize error).
+    SwapFailed {
+        kind: WeightSwapKind,
+        reason: String,
+        layer: Option<usize>,
+        token: Option<usize>,
+    },
+    /// Batch-end diagnostic snapshot (env-gated by `LLMRS_SWAP_DRAIN_DIAG=1`).
+    ///
+    /// Reports worst observed queue depth during the batch. The user's hard
+    /// constraint ("memory peak ≤ 1 layer") is satisfied iff both
+    /// `max_release_pending` and `max_dispatcher_pending` ≤ 1.
+    BatchSummary {
+        kind: WeightSwapKind,
+        /// "sync" or "async" — swap_executor execution path.
+        mode: &'static str,
+        target_layers: usize,
+        max_release_pending: usize,
+        max_dispatcher_pending: usize,
+    },
+}
+
 /// Structured events emitted during cache management.
 #[derive(Debug, Clone)]
 pub enum CacheEvent {
@@ -65,6 +158,8 @@ pub enum CacheEvent {
     ScoreDiagnostic(ScoreSnapshot),
     /// Proxy metric computed during a lossy cache action.
     ProxyComputed(crate::qcf_types::QcfMetric),
+    /// Weight swap lifecycle event (S-1).
+    WeightSwap(WeightSwapEvent),
 }
 
 // ── Sink trait ────────────────────────────────────────────────
@@ -80,6 +175,15 @@ pub struct NoOpSink;
 impl EventSink for NoOpSink {
     #[inline(always)]
     fn emit(&self, _event: CacheEvent) {}
+}
+
+/// S-1+α: factory returning a `NoOpSink` as `Arc<dyn EventSink>`.
+///
+/// Allows L3 (e.g. `models/weights/swap_executor.rs`) to initialise an event
+/// sink without naming the concrete `NoOpSink` type — preserving the
+/// L3-inference → cross-cutting concrete-import boundary (INV-LAYER-003).
+pub fn noop_sink() -> std::sync::Arc<dyn EventSink> {
+    std::sync::Arc::new(NoOpSink)
 }
 
 // ── Built-in sinks ───────────────────────────────────────────
@@ -189,6 +293,88 @@ impl EventSink for StderrDiagnosticSink {
                     } else {
                         String::new()
                     }
+                );
+            }
+            CacheEvent::WeightSwap(WeightSwapEvent::PlanCommitted {
+                kind,
+                algorithm,
+                ratio,
+                k_chunk,
+                n_layers,
+            }) => {
+                eprintln!(
+                    "[WeightSwap] PlanCommitted: kind={}, algo={}, ratio={:.2}, k={}, n_layers={}",
+                    kind, algorithm, ratio, k_chunk, n_layers
+                );
+            }
+            CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained {
+                kind,
+                chunk_idx,
+                layers_done,
+                latency_ms,
+                ref stages,
+            }) => {
+                if let Some(s) = stages {
+                    eprintln!(
+                        "[WeightSwap] ChunkDrained: kind={}, idx={}, layers={}, latency={:.1}ms, stages={}",
+                        kind, chunk_idx, layers_done, latency_ms, s
+                    );
+                } else {
+                    eprintln!(
+                        "[WeightSwap] ChunkDrained: kind={}, idx={}, layers={}, latency={:.1}ms",
+                        kind, chunk_idx, layers_done, latency_ms
+                    );
+                }
+            }
+            CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
+                kind,
+                qcf_actual,
+                token,
+                elapsed_ms,
+                ratio,
+                n_planned,
+                actually_q4,
+            }) => {
+                let qcf_str = qcf_actual
+                    .map(|v| format!("{:.4}", v))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let ratio_str = ratio
+                    .map(|v| format!(", ratio={:.2}", v))
+                    .unwrap_or_default();
+                let planned_str = n_planned
+                    .map(|v| format!(", planned={}", v))
+                    .unwrap_or_default();
+                let actual_str = actually_q4
+                    .map(|v| format!(", actually_q4={}", v))
+                    .unwrap_or_default();
+                eprintln!(
+                    "[WeightSwap] PlanRetired: kind={}, qcf={}, token={}, elapsed={:.1}ms{}{}{}",
+                    kind, qcf_str, token, elapsed_ms, ratio_str, planned_str, actual_str
+                );
+            }
+            CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+                kind,
+                ref reason,
+                layer,
+                token,
+            }) => {
+                let layer_str = layer.map(|v| format!(", layer={}", v)).unwrap_or_default();
+                let token_str = token.map(|v| format!(", token={}", v)).unwrap_or_default();
+                eprintln!(
+                    "[WeightSwap] SwapFailed: kind={}, reason=\"{}\"{}{}",
+                    kind, reason, layer_str, token_str
+                );
+            }
+            CacheEvent::WeightSwap(WeightSwapEvent::BatchSummary {
+                kind,
+                mode,
+                target_layers,
+                max_release_pending,
+                max_dispatcher_pending,
+            }) => {
+                eprintln!(
+                    "[WeightSwap] BatchSummary: kind={}, mode={}, target_layers={}, max_release_pending={}, max_dispatcher_pending={}",
+                    kind, mode, target_layers, max_release_pending, max_dispatcher_pending
                 );
             }
         }
@@ -436,6 +622,134 @@ mod tests {
         // All tokens are prefix, rest_avg should be 0
         assert_eq!(snap.rest_avg, 0.0);
         assert_eq!(snap.above_1sigma_frac, 0.0);
+    }
+
+    #[test]
+    fn test_noop_sink_accepts_weight_swap() {
+        let sink = NoOpSink;
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanCommitted {
+            kind: WeightSwapKind::IntraForward,
+            algorithm: "ImportanceAware",
+            ratio: 0.5,
+            k_chunk: 8,
+            n_layers: 14,
+        }));
+    }
+
+    #[test]
+    fn test_collecting_sink_captures_weight_swap_kinds() {
+        let sink = CollectingSink::new();
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanCommitted {
+            kind: WeightSwapKind::Incremental,
+            algorithm: "Sequential",
+            ratio: 0.3,
+            k_chunk: 4,
+            n_layers: 10,
+        }));
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained {
+            kind: WeightSwapKind::IntraForward,
+            chunk_idx: 0,
+            layers_done: 8,
+            latency_ms: 124.5,
+            stages: None,
+        }));
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
+            kind: WeightSwapKind::PhaseAware,
+            qcf_actual: Some(0.083),
+            token: 42,
+            elapsed_ms: 890.0,
+            ratio: None,
+            n_planned: None,
+            actually_q4: None,
+        }));
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
+            kind: WeightSwapKind::Subsystem,
+            reason: "mmap fault".to_string(),
+            layer: Some(3),
+            token: None,
+        }));
+
+        let events = sink.events();
+        assert_eq!(events.len(), 4);
+        // Verify kind is preserved for each dispatcher source.
+        let kinds: Vec<WeightSwapKind> = events
+            .iter()
+            .filter_map(|e| match e {
+                CacheEvent::WeightSwap(WeightSwapEvent::PlanCommitted { kind, .. })
+                | CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained { kind, .. })
+                | CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired { kind, .. })
+                | CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed { kind, .. })
+                | CacheEvent::WeightSwap(WeightSwapEvent::BatchSummary { kind, .. }) => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                WeightSwapKind::Incremental,
+                WeightSwapKind::IntraForward,
+                WeightSwapKind::PhaseAware,
+                WeightSwapKind::Subsystem,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_weight_swap_event_clone_and_debug() {
+        // Sanity: derived Debug + Clone work for downstream observers / test fixtures.
+        let evt = WeightSwapEvent::ChunkDrained {
+            kind: WeightSwapKind::Incremental,
+            chunk_idx: 3,
+            layers_done: 14,
+            latency_ms: 98.3,
+            stages: Some("mmap:12.3/permute:8.1".to_string()),
+        };
+        let cloned = evt.clone();
+        assert!(format!("{:?}", cloned).contains("ChunkDrained"));
+        assert!(format!("{:?}", cloned).contains("mmap:12.3/permute:8.1"));
+    }
+
+    #[test]
+    fn test_weight_swap_kind_default_is_intra_forward() {
+        // Q1 결정: SwapExecutor 등이 builder default로 IntraForward를 사용한다.
+        assert_eq!(WeightSwapKind::default(), WeightSwapKind::IntraForward);
+        // Display label은 S-1 legacy &'static str 값과 동일 (grep 호환).
+        assert_eq!(WeightSwapKind::Incremental.as_str(), "Incremental");
+        assert_eq!(WeightSwapKind::IntraForward.as_str(), "IntraForward");
+        assert_eq!(WeightSwapKind::PhaseAware.as_str(), "PhaseAware");
+        assert_eq!(WeightSwapKind::Subsystem.as_str(), "Subsystem");
+    }
+
+    #[test]
+    fn test_batch_summary_emit_and_collect() {
+        // BatchSummary는 swap_executor:1285의 [SwapPeak] diag summary를 EventSink로
+        // 라우팅한다. 운영 제약 "메모리 peak ≤ 1 layer" 검증선.
+        let sink = CollectingSink::new();
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::BatchSummary {
+            kind: WeightSwapKind::Subsystem,
+            mode: "async",
+            target_layers: 14,
+            max_release_pending: 1,
+            max_dispatcher_pending: 1,
+        }));
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CacheEvent::WeightSwap(WeightSwapEvent::BatchSummary {
+                kind,
+                mode,
+                target_layers,
+                max_release_pending,
+                max_dispatcher_pending,
+            }) => {
+                assert_eq!(*kind, WeightSwapKind::Subsystem);
+                assert_eq!(*mode, "async");
+                assert_eq!(*target_layers, 14);
+                assert_eq!(*max_release_pending, 1);
+                assert_eq!(*max_dispatcher_pending, 1);
+            }
+            other => panic!("expected BatchSummary, got {other:?}"),
+        }
     }
 
     #[test]

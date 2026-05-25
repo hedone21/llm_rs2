@@ -24,6 +24,15 @@
 
 ---
 
+## [DONE] swap 기본 모드를 `--swap-intra-forward`로 — 2026-05-25 종결
+- **Status**: DONE (옵션 (b) `--swap` shorthand 채택, 2026-05-25)
+- **선택 옵션**: (b) CLI 신규 `--swap [intra-forward|incremental|phase-aware|layer-immediate]`. flag 단독 시 default = IntraForward (LISWAP-4 production winner). 기존 4 flag는 deprecated + stderr 1회 경고 후 그대로 동작.
+- **구현**: `engine/src/session/cli/mod.rs` — `SwapMode` enum + `parse_swap_mode` + `swap: Option<SwapMode>` field + `Args::normalize_swap_shorthand()`. caller (`argus_cli.rs`, `legacy/generate.rs`)에서 `Args::parse()` 직후 normalize 호출. Manager-driven path는 별도 (qcf_runtime.rs sync path 등 backlog P3 잔여).
+- **검증**: cargo test --lib 1194 PASS, spec inv_layer 8 PASS, clippy --lib + main bins clean. S25 Adreno OpenCL Qwen2.5-1.5b Q4_0 32 토큰 baseline vs --swap intra-forward generation **bit-identical** (Paris... 동일).
+- **잔여 (별 sprint)**: (a) Manager-driven swap path (executor.rs:549~) 자동 IntraForward 분기 — Manager 정책 layer 영향 큰 작업으로 분리. argus_cli v0 reject 함수의 swap 4 flag 차단 (v1-3 sprint 대상).
+
+---
+
 ## [PARTIAL → CANCELLED] Phase 4-4-2.3 — decode_fallback 추출 — 2026-05-21 부분 완료 + 잔여 취소
 - **Status**: 3a/3c/3b **완료** (master `02cb7106`). 3d/3e는 **취소** — 사용자 결정 (2026-05-21).
 - **결정 사유**: generate.rs를 더 줄이지 않고 legacy로 보존, 새로운 다수 바이너리로 기능 분할하는 방향 전환. 잔여 3d/3e/4-4-2.4 추출은 새 바이너리 설계 안에서 자연 해소.
