@@ -120,213 +120,468 @@ sequenceDiagram
 
 > 이하 "High-Level Architecture" ~ "Resilience Subsystem"은 Engine(`llm_rs2`) 크레이트의 내부 구조를 설명합니다.
 
-### Component Diagram
+### 진입점 이분화 (2026-05-25 상태)
+
+리팩토링 막바지 단계로 진입점이 두 개로 분기되어 있습니다. 두 경로 모두 동일한 L2/L3 도메인 (`backend/`, `inference/`, `pressure/`)을 공유하지만, decode 루프 조립 방식이 다릅니다.
+
+| 진입점 | 파일 | LOC | 상태 | 책임 흡수 방식 |
+|--------|------|-----|------|----------------|
+| **legacy generate** | `engine/legacy/generate.rs` | ~5000 | 운영용 (모든 모드) | 거대 `main()` 단일 함수 — prefill/decode 인라인 + `CommandExecutor` 직접 보유 |
+| **argus-cli** | `engine/src/bin/argus_cli.rs` | ~320 | 진행 중 (happy path만) | `SessionInitCtx::build` → `run_standard_happy_path` → `DecodeLoop` 트레이트 6종 |
+
+**legacy 만 보유한 모드**: chat / experiment / ppl / eval / dump / prompt-batch / weight swap / KIVI / offload / profile / tensor-partition. argus-cli 는 이들을 `reject_unsupported_modes_v0()`에서 명시적으로 차단하며 v1-1 ~ v1-6 sub-sprint 로 점진 흡수 중입니다 (현재 v1-1 = resilience default-on 완료).
+
+다른 bin: `auf_tool`(AUF 빌드), `test_backend`(백엔드 정합성), `test_model`(모델 로딩), `signal_injector`(시그널 주입), `test_q4_soa_byte_equal`(SOA Q4 정합성).
+
+### Top-level Component Diagram
+
 ```mermaid
 graph TB
-    subgraph BinaryLayer ["Binaries"]
-        Generate["generate"]
-        GenerateHybrid["generate_hybrid"]
-        MicroBench["micro_bench"]
-        TestBackend["test_backend"]
+    subgraph L5 ["L5 Adapter — bin/"]
+        Legacy["engine/legacy/generate.rs<br/>(monolith main, 모든 모드)"]
+        ArgusCli["bin/argus_cli.rs<br/>(v0: happy path only)"]
+        SigInj["bin/signal_injector"]
+        AufTool["bin/auf_tool"]
+        TestBin["bin/test_backend / test_model"]
     end
 
-    subgraph ModelComponent ["Model"]
-        LlamaModel["LlamaModel"]
-        LlamaLayer["LlamaLayer"]
-        LayerWS["LayerWorkspace"]
-        Attention["Attention (CPU fallback)"]
+    subgraph L4 ["L4 Orchestration — session/"]
+        Init["session::init::SessionInitCtx"]
+        StdHappy["session::standard_happy::<br/>run_standard_happy_path"]
+        Loop["session::DecodeLoop<br/>+ DecodeLoopBuilder (typestate)"]
+        Traits["session::traits<br/>(Forward / EvictionStage / SwapStage /<br/>CommandSource / TokenSampler / DecodeObserver)"]
+        Defaults["session::defaults<br/>(NoOp* + GreedySampler)"]
+        Prefill["session::prefill<br/>(legacy chunked prefill)"]
+        Chat["session::chat::<br/>{repl, session, stop_condition}"]
+        Eval["session::eval / batch / ppl"]
+        FwdImpls["session::forward::<br/>{model, kivi, offload}_forward"]
     end
 
-    subgraph CoreComponent ["Core"]
-        BackendTrait["Backend trait"]
-        MemoryTrait["Memory trait"]
-        BufferTrait["Buffer trait"]
-        KVCacheOpsTrait["KVCacheOps trait"]
-        KVCache["KVCache"]
-        KiviCache["KiviCache (Q2/Q4/Q8+Residual)"]
-        OffloadKVCache["OffloadKVCache (RawStore/DiskStore)"]
-        Tensor["Tensor"]
-        Shape["Shape"]
-        Quant["Quant (Q4_0, Q2_0, KVQ4, KVQ8)"]
-        SkipConfig["SkipConfig (SWIFT)"]
-        Speculative["SpeculativeDecoder"]
-        MathUtils["MathUtils (avg_pool, topk)"]
+    subgraph L3P ["L3 Pressure — pressure/"]
+        CacheMgr["pressure::cache_manager"]
+        Pipeline["CachePressurePipeline +<br/>CachePressureHandler trait"]
+        EvPolicy["pressure::eviction::*<br/>(Sliding / H2O / D2O / Streaming)"]
+        Handlers["{eviction,d2o,swap,<br/>quantize,weight_swap}_handler"]
+        KvState["pressure::{kv_cache, kivi_cache,<br/>offload, kv_migrate}"]
     end
 
-    subgraph QCFSubsystem ["QCF (Quality Cost Function)"]
-        QcfMetric["QcfMetric / QcfConfig"]
-        EvictionQcf["compute_eviction_qcf"]
-        QuantQcf["compute_flush_qcf (NMSE)"]
-        SkipQcf["SkipQcfTracker"]
-        LayerImp["ImportanceTable / ImportanceCollector"]
-        DegEst["DegradationEstimator (α×Q)"]
+    subgraph L3I ["L3 Inference — models/, layers/, inference/"]
+        Model["models::TransformerModel"]
+        Layer["layers::transformer_layer +<br/>llama_layer"]
+        Inf["inference::sampling / skip_config /<br/>speculative / attention_scores"]
+        WSwap["models::weights::*<br/>(swap_executor, intra_forward_swap,<br/>phase_aware_swap, async_swap)"]
     end
 
-    subgraph EvictionSubsystem ["KV Cache Management"]
-        CacheManager["CacheManager"]
-        Pipeline["CachePressurePipeline"]
-        HandlerTrait["CachePressureHandler trait"]
-        EvictionHandler["EvictionHandler"]
-        D2OHandler["D2OHandler"]
-        SnapKVHandler["SnapKVHandler"]
-        QuantizeHandler["QuantizeHandler"]
-        SwapHandler["SwapHandler"]
-        EvictionPolicy["EvictionPolicy trait"]
-        NoEviction["NoEvictionPolicy"]
-        SlidingWindow["SlidingWindowPolicy (+ StreamingLLM)"]
-        H2O["H2OPolicy (3-partition)"]
-        ScoreAccum["AttentionScoreAccumulator"]
-        SysMonitor["SystemMonitor trait"]
-        LinuxMonitor["LinuxSystemMonitor"]
-        EventSinkTrait["EventSink trait"]
+    subgraph L3Q ["L3 QCF — qcf*/"]
+        QcfTypes["qcf_types (L2 격상, §G)"]
+        QcfImpl["qcf:: ImportanceCollector,<br/>DegradationEstimator,<br/>compute_flush_*"]
     end
 
-    subgraph BackendComponent ["Compute Backends"]
-        CpuBackend["CpuBackend"]
-        OpenCLBackend["OpenCLBackend"]
+    subgraph L2 ["L2 Abstraction — engine/src 루트"]
+        BackendTrait["backend::Backend trait"]
+        Buf["buffer / tensor / shape / memory<br/>quant / thread_pool /<br/>kv_cache_ops / op_kind /<br/>partition_workspace / hybrid_attention<br/>cpu_kernels / secondary / instrument"]
     end
 
-    subgraph MemoryComponent ["Memory Management"]
-        Galloc["Galloc"]
-        SharedBuffer["SharedBuffer"]
+    subgraph L1 ["L1 Backend — backend/"]
+        Cpu["backend::cpu (NEON/AVX2)"]
+        Cl["backend::opencl"]
+        CuE["backend::cuda_embedded"]
+        CuP["backend::cuda_pc"]
+        Qnn["backend::qnn_oppkg"]
     end
 
-    Generate --> LlamaModel
-    GenerateHybrid --> LlamaModel
-    LlamaModel --> LlamaLayer
-    LlamaLayer --> LayerWS
-    LlamaLayer --> Attention
-    LlamaLayer --> KVCacheOpsTrait
-    KVCache -.-> KVCacheOpsTrait
-    KiviCache -.-> KVCacheOpsTrait
-    OffloadKVCache -.-> KVCacheOpsTrait
+    subgraph CC1 ["× Observability"]
+        Events["observability::events<br/>(EventSink, CacheEvent)"]
+        Profile["observability::profile::*<br/>(OpProfiler, op_trace)"]
+        Rss["observability::rss_trace"]
+    end
 
-    Generate --> CacheManager
-    CacheManager --> Pipeline
-    CacheManager --> SysMonitor
-    CacheManager --> EventSinkTrait
-    Pipeline --> HandlerTrait
-    HandlerTrait -.-> EvictionHandler
-    HandlerTrait -.-> D2OHandler
-    HandlerTrait -.-> SnapKVHandler
-    HandlerTrait -.-> QuantizeHandler
-    HandlerTrait -.-> SwapHandler
-    EvictionHandler --> EvictionPolicy
-    SnapKVHandler --> MathUtils
-    NoEviction -.-> EvictionPolicy
-    SlidingWindow -.-> EvictionPolicy
-    H2O -.-> EvictionPolicy
-    LinuxMonitor -.-> SysMonitor
-    EvictionPolicy --> KVCache
-    Generate --> KiviCache
-    Generate --> SkipConfig
-    SkipConfig --> Speculative
-    LlamaLayer --> SkipConfig
-    H2O --> ScoreAccum
+    subgraph CC2 ["× Resilience"]
+        ResMgr["resilience::ResilienceManager"]
+        Exec["resilience::CommandExecutor<br/>(legacy 만 보유, DecodeLoop 미연결)"]
+        Strat["resilience::strategy::*"]
+        Tp["resilience::transport::Transport"]
+        Sys["resilience::sys_monitor"]
+    end
 
-    Generate --> QcfMetric
-    EvictionHandler --> EvictionQcf
-    SnapKVHandler --> EvictionQcf
-    QuantizeHandler --> QuantQcf
-    EvictionQcf --> KVCache
-    EvictionQcf --> ScoreAccum
-    QuantQcf --> KiviCache
-    LlamaModel --> LayerImp
-    DegEst --> QcfMetric
+    Legacy --> Init
+    Legacy --> Prefill
+    Legacy --> Chat
+    Legacy --> Eval
+    Legacy --> Model
+    Legacy --> CacheMgr
+    Legacy --> Exec
 
-    Tensor --> BufferTrait
-    Tensor --> BackendTrait
-    Tensor --> Shape
+    ArgusCli --> Init
+    ArgusCli --> StdHappy
+    StdHappy --> Loop
+    Loop --> Traits
+    Traits -.default.- Defaults
+    Traits -.impl.- FwdImpls
 
-    CpuBackend -.-> BackendTrait
-    OpenCLBackend -.-> BackendTrait
-    Galloc -.-> MemoryTrait
-    SharedBuffer -.-> BufferTrait
-    Galloc --> SharedBuffer
+    FwdImpls --> Model
+    Model --> Layer
+    Layer --> BackendTrait
+    Model --> Inf
+    Init --> Model
+    Init --> BackendTrait
+
+    Loop -.via trait.- CacheMgr
+    CacheMgr --> Pipeline
+    Pipeline --> Handlers
+    Handlers --> EvPolicy
+    Handlers --> KvState
+    EvPolicy --> KvState
+
+    WSwap -.swap state.- KvState
+    Handlers -.weight swap.- WSwap
+
+    Cpu -.impl.- BackendTrait
+    Cl -.impl.- BackendTrait
+    CuE -.impl.- BackendTrait
+    CuP -.impl.- BackendTrait
+    Qnn -.impl.- BackendTrait
+
+    Layer --> Buf
+    Model --> Buf
+    KvState --> Buf
+
+    CacheMgr --> Events
+    Pipeline --> Events
+    Layer --> Profile
+    Model --> Profile
+
+    Exec -.SystemSignal.- ResMgr
+    ResMgr --> Strat
+    Strat --> CacheMgr
+    Tp -.IPC.- ResMgr
+
+    QcfImpl --> QcfTypes
+    Handlers -.QCF estimate.- QcfImpl
+    Inf -.QCF source.- QcfImpl
 ```
+
+**다이어그램 읽기**:
+- 실선 `-->` = owned 또는 직접 함수 호출.
+- 점선 `-.label.-` = trait dispatch / 메시지 / 외부 이벤트.
+- L4 `session/` 가 L3 두 도메인(Pressure ↔ Inference ↔ QCF) 결합점.
+- `resilience::CommandExecutor` ↔ `DecodeLoop` 사이는 **현재 미연결** — 본 다이어그램에서도 점선 미표기 (§ "Manager IPC wiring 현황" 참조).
+
+### Session — 6 trait + DecodeLoopBuilder typestate
+
+`session/traits.rs` 가 정의하는 6 trait + `StepCtx` 와 `session/decode_loop.rs` 의 typestate builder 가 본 리팩토링의 SOLID 분해 진입점입니다. 모든 trait + builder 가 L4 `session/` 산하에 통일되어 있습니다 (사용자 결정 #1, `arch/inference_pipeline.md` §11.1).
+
+```mermaid
+classDiagram
+    class StepCtx {
+        +pos: usize
+        +prev_token: u32
+        +kv_capacity: usize
+        +decode_step: usize
+        +stop_requested: &AtomicBool
+    }
+
+    class Forward {
+        <<trait, required>>
+        +prefill(tokens, start_pos) Result~Vec~f32~~
+        +step(ctx, token) Result~Vec~f32~~
+        +finalize() Result~()~ default
+        +on_kv_prune(new_pos) default
+        +reset_kv() Result~()~ default
+        +try_evict(cm, scores, force, ratio) default
+    }
+
+    class EvictionStage {
+        <<trait, optional>>
+        +before_step(ctx) Result~EvictionOutcome~
+        +ensure_capacity(ctx, additional) default
+    }
+
+    class SwapStage {
+        <<trait, optional>>
+        +before_step(ctx) Result
+        +after_step(ctx) Result
+        +pending_report() Option~WeightSwapReport~ default
+    }
+
+    class CommandSource {
+        <<trait, optional>>
+        +poll(ctx) Result~Option~EngineCommand~~
+    }
+
+    class TokenSampler {
+        <<trait, default=Greedy>>
+        +sample(ctx, logits) u32
+        +observe_token(token) default
+    }
+
+    class DecodeObserver {
+        <<trait, multi>>
+        +on_prefill_end(ctx, logits) default
+        +on_step_end(ctx, sampled, step_ms) default
+        +on_eviction(ctx, outcome) default
+        +finalize() Result default
+    }
+
+    class DecodeLoop {
+        -forward: Box~dyn Forward~
+        -eviction: Box~dyn EvictionStage~
+        -swap: Box~dyn SwapStage~
+        -cmd_source: Box~dyn CommandSource~
+        -sampler: Box~dyn TokenSampler~
+        -observers: Vec~Box~dyn DecodeObserver~~
+        -stop_flag: Arc~AtomicBool~
+        +prefill(tokens) Result~Vec~f32~~
+        +run(budget, first_token) Result~DecodeResult~
+        +run_until_stop(first_token, stop) Result~DecodeResult~
+    }
+
+    class DecodeLoopBuilder~F~ {
+        +new() Builder~NoForward~
+        +with_forward(fwd) Builder~HasForward~
+        +with_eviction(e) Self
+        +with_swap(s) Self
+        +with_cmd_source(c) Self
+        +with_sampler(s) Self
+        +add_observer(o) Self
+        +build() DecodeLoop
+    }
+
+    class ModelForward {
+        <<impl Forward>>
+        +owns: backend, model,<br/>kv_caches, workspace
+    }
+    class KiviForward {
+        <<impl Forward, planned>>
+    }
+    class OffloadForward {
+        <<impl Forward, planned>>
+    }
+    class GreedySampler {
+        <<impl TokenSampler, default>>
+    }
+    class RepetitionPenaltySampler {
+        <<impl TokenSampler>>
+    }
+    class NoOpEvictionStage {
+        <<impl EvictionStage, default>>
+    }
+    class NoOpSwapStage {
+        <<impl SwapStage, default>>
+    }
+    class NoOpCommandSource {
+        <<impl CommandSource, default>>
+    }
+    class NoOpObserver {
+        <<impl DecodeObserver, default>>
+    }
+
+    DecodeLoop --> Forward
+    DecodeLoop --> EvictionStage
+    DecodeLoop --> SwapStage
+    DecodeLoop --> CommandSource
+    DecodeLoop --> TokenSampler
+    DecodeLoop --> DecodeObserver
+    DecodeLoopBuilder ..> DecodeLoop : build()
+    Forward ..|> ModelForward
+    Forward ..|> KiviForward
+    Forward ..|> OffloadForward
+    TokenSampler ..|> GreedySampler
+    TokenSampler ..|> RepetitionPenaltySampler
+    EvictionStage ..|> NoOpEvictionStage
+    SwapStage ..|> NoOpSwapStage
+    CommandSource ..|> NoOpCommandSource
+    DecodeObserver ..|> NoOpObserver
+```
+
+상세 시그니처 + 변경 이유(SRP 6 분해) + 빌더 typestate 정당화: `arch/inference_pipeline.md` §2 ~ §4.
+
+### Manager IPC wiring 현황 (drift 마킹)
+
+> **Drift detected — follow-up sprint 필요**: `resilience::CommandExecutor` 가 legacy generate path 에서만 instantiate 되며, argus-cli / `SessionInitCtx::build` / `run_standard_happy_path` 어디에도 생성되지 않습니다. 결과적으로 `DecodeLoop::run` 안의 `cmd_source.poll()` 결과는 `decode_loop.rs:121` 에서 명시 코멘트(`Command dispatch is Phase 4-3+; we accept and drop for now.`) 와 함께 drop 됩니다. ExecutionPlan consumption (Throttle / Suspend / Evict / SwitchHw / SwapWeights / LayerSkip / PartitionRatio) 은 0 LOC. send_capability / send_qcf_estimate / send_weight_swap_report / on_token_generated outbound hook 또한 DecodeLoop 외곽에 미연결.
+
+| 책임 | legacy generate | argus-cli + DecodeLoop |
+|------|-----------------|------------------------|
+| CommandExecutor 생성 | `legacy/generate.rs:596` | **없음** |
+| ExecutionPlan apply | `legacy/generate.rs:2267 / 4277 / 4846` 등 (Throttle, Evict, SwitchHw, SwapWeights) | **drop (decode_loop.rs:121~122)** |
+| capability send | legacy 안 `executor.send_capability(...)` | 없음 |
+| heartbeat / qcf estimate | legacy 안 직접 호출 | 없음 |
+
+향후 후속 sprint:
+- `ManagerCmdSource: CommandSource` 구현체 도입 (`arch/inference_pipeline.md` §8.1 매트릭스).
+- `ExecutionPlanApplyObserver: DecodeObserver` 또는 `DecodeLoop::handle_command()` 본문 구현.
+- `outbound_sink: dyn ManagerOutbound` 별도 trait (capability / heartbeat / qcf send).
+- legacy 흡수 v1-1 ~ v1-6 sub-sprint 진행 중 (argus-cli 진입점 README 참조).
+
 
 ### Key Components
 
-| Component | 역할 | 파일 |
+> **표 갱신 정책 (2026-05-25)**: 본 표는 *컴포넌트 → 디렉토리* 매핑에 한정합니다. 줄번호는 적지 않습니다(피드백 `arch_component_centric` 준수). 구체 파일 식별은 `engine/src/` 트리에서 `grep` 또는 `Glob` 으로 확인합니다.
+
+| Component | 역할 | 위치 |
 |:----------|:-----|:-----|
-| **Tensor** | 논리적 데이터 단위. Buffer(물리 메모리) + Shape(차원) + Backend(연산 위임) | `engine/src/core/tensor.rs` |
-| **Backend** | 하드웨어 가속기 추상화 (matmul, softmax, RoPE 등 연산자 정의) | `engine/src/core/backend.rs` |
-| **Galloc** | 시스템/장치 공유 메모리 할당자. Zero-copy의 핵심 | `engine/src/memory/galloc.rs` |
-| **KVCacheOps** | KV 캐시 추상화 trait (OCP 확장점). `update`, `get_view`, `kv_dtype` 등 | `engine/src/core/kv_cache.rs` |
-| **KVCache** | 표준 KV 캐시 (F32/F16/Q4_0). Eviction + `compress_per_head()` 지원. KVCacheOps 구현 | `engine/src/core/kv_cache.rs` |
-| **KiviCache** | KIVI 다중 비트 압축 캐시 (Q2/Q4/Q8). FP32 Residual + 양자화 저장소. `transition_bits()`로 동적 비트 전환 | `engine/src/core/kivi_cache.rs` |
-| **CacheManager** | 메모리 압박 감지 + CachePressurePipeline을 통한 eviction 조율. EventSink 기반 이벤트 출력 | `engine/src/core/cache_manager.rs` |
-| **CachePressurePipeline** | PressureLevel별 다중 CachePressureHandler 순차 실행 | `engine/src/core/pressure/mod.rs` |
-| **SnapKVHandler** | SnapKV prefill-time 1회 압축 — observation window voting + avg pooling + per-head top-k | `engine/src/core/pressure/compress_handler.rs` |
-| **QuantizeHandler** | Pressure → KIVI bits 매핑 (Warning→8, Critical→4, Emergency→2) | `engine/src/core/pressure/quantize_handler.rs` |
-| **SwapHandler** | LRU 기반 KV 캐시 디스크 오프로드 (Warning+ 압력에서 동작) | `engine/src/core/pressure/swap_handler.rs` |
-| **DiskStore** | 파일 기반 KV 캐시 저장소 (OffloadStore trait 구현) | `engine/src/core/offload/disk_store.rs` |
-| **EventSink** | 캐시 관리 이벤트 구조화 출력 (NoOpSink, StderrDiagnosticSink) | `engine/src/core/events.rs` |
-| **SamplingConfig** | 토큰 샘플링 파라미터 (temperature, top-k, top-p 등) | `engine/src/core/sampling.rs` |
-| **SkipConfig** | SWIFT 레이어 스킵 설정 — attention/MLP 독립 스킵, layer 0/L-1 보호 | `engine/src/core/skip_config.rs` |
-| **SpeculativeDecoder** | SWIFT draft/verify 프레임워크 — KV rollback, matchness, skip optimizer | `engine/src/core/speculative.rs` |
-| **MathUtils** | avg_pool_1d, topk_indices_per_head — SnapKV/압축 알고리즘용 유틸리티 | `engine/src/core/math_utils.rs` |
-| **LlamaLayer** | 단일 트랜스포머 레이어 (`forward` 내부에서 seq_len + skip 분기) | `engine/src/layers/llama_layer.rs` |
-| **LayerWorkspace** | 생성 루프용 사전 할당 작업 텐서 (매 토큰 재사용) | `engine/src/layers/workspace.rs` |
-| **LlamaModel** | 모델 로딩, 임베딩, 레이어 반복(skip_config 전달), 로짓 계산 | `engine/src/models/llama/llama_model.rs` |
-| **AttentionScoreAccumulator** | H2O/SnapKV용 attention importance score 누적 (decay, reset) | `engine/src/core/attention_scores.rs` |
-| **QcfMetric** | lossy action의 품질 열화 측정값 (action, raw_value, per_head, tokens_affected) | `engine/src/core/qcf/mod.rs` |
-| **DegradationEstimator** | QCF→PPL 증가량 변환 (offline-calibrated PiecewiseLinear + runtime EMA 보정) | `engine/src/core/qcf/estimator.rs` |
-| **ImportanceTable** | Prefill 시 cosine similarity 기반 레이어 중요도 테이블. Layer Skip QCF 계산용 | `engine/src/core/qcf/layer_importance.rs` |
-| **StepHook** | Eval 루프의 캐시 관리 정책 추상화 trait (`before_importance_pass`, `before_question`, `after_question`) | `engine/src/eval/hook.rs` |
-| **EvictionHook** | KVCache 전용 eval hook — importance 2-pass, eviction 트리거, 스냅샷 | `engine/src/eval/eviction_hook.rs` |
-| **KiviHook** | KiviCache 전용 eval hook — KIVI 압축 정책 연동 | `engine/src/eval/kivi_hook.rs` |
-| **EvalOutput** | Eval-LL 결과 구조체 (NLL, QCF, OPR 메트릭 포함) | `engine/src/eval/output.rs` |
+| **Tensor / Shape / DType** | 논리적 데이터 단위. Buffer(물리 메모리) + Shape(차원) + Backend(연산 위임) | `engine/src/{tensor,shape,buffer}.rs` (L2) |
+| **Backend** | 하드웨어 가속기 추상화 (matmul, softmax, RoPE 등). `cpu_kernels`/`secondary` capability trait 동반 | `engine/src/backend.rs` (trait) + `engine/src/backend/<be>/mod.rs` (impl) |
+| **Galloc** | 시스템/장치 공유 메모리 할당자. Zero-copy의 핵심. `Memory` trait impl | `engine/src/memory/galloc.rs` |
+| **KVCacheOps** | KV 캐시 추상화 trait (OCP 확장점) — `update`, `get_view`, `kv_dtype`. §G shared identifier promotion 으로 L2 격상 | `engine/src/kv_cache_ops.rs` (L2) |
+| **KVCache** | 표준 KV 캐시 (F32/F16/Q4_0). Eviction + `compress_per_head()` 지원 | `engine/src/pressure/kv_cache.rs` |
+| **KiviCache** | KIVI 다중 비트 압축 캐시 (Q2/Q4/Q8). FP32 Residual + 양자화 저장소 | `engine/src/pressure/kivi_cache.rs` |
+| **CacheManager** | 메모리 압박 감지 + CachePressurePipeline 조율. `EventSink` 기반 이벤트 출력 | `engine/src/pressure/cache_manager.rs` |
+| **CachePressurePipeline + Handler** | PressureLevel별 다중 `CachePressureHandler` 순차 실행 | `engine/src/pressure/mod.rs` |
+| **EvictionHandler / D2OHandler / WeightSwapHandler / QuantizeHandler / SwapHandler** | Pressure handler impl 군 | `engine/src/pressure/*_handler.rs` |
+| **EvictionPolicy** | 단순 KV eviction 전략 (NoEviction / Sliding / StreamingLLM / H2O / H2OPlus) | `engine/src/pressure/eviction/*.rs` |
+| **OffloadKVCache + DiskStore / RawStore / PrefetchController** | KV 디스크 오프로드 (Warning+ 압력) | `engine/src/pressure/offload/*.rs` |
+| **EventSink** | 캐시 관리 이벤트 구조화 출력 (NoOpSink, StderrDiagnosticSink) | `engine/src/observability/events.rs` |
+| **OpProfiler / op_trace** | per-op latency 측정 + `op_span!` 매크로 (§H instrument helper, OpKind = §G shared id) | `engine/src/observability/profile/*` + `engine/src/op_kind.rs` (L2) + `engine/src/instrument.rs` (L2) |
+| **SamplingConfig** | 토큰 샘플링 파라미터 (temperature, top-k, top-p) | `engine/src/inference/sampling.rs` |
+| **SkipConfig + SpeculativeDecoder** | SWIFT 레이어 스킵 / draft-verify 프레임워크 | `engine/src/inference/{skip_config,speculative}.rs` |
+| **TransformerLayer / LlamaLayer + LayerWorkspace** | 단일 트랜스포머 레이어 + 사전 할당 작업 텐서 | `engine/src/layers/*` |
+| **TransformerModel** | 모델 로딩, 임베딩, 레이어 반복, 로짓 계산. Multi-arch (Llama / Qwen2) | `engine/src/models/transformer.rs` + `engine/src/models/loader/{auf,gguf,safetensors}/` |
+| **AUF (Argus Unified Format)** | mmap zero-copy 가중치 + secondary swap 자산 single-file 포맷 | `engine/src/auf/*` (L2) |
+| **Weight Swap (LayerSlot / SecondaryMmap / SwapExecutor)** | dynamic layer dtype 교체. swap_executor / async_swap / phase_aware_swap / intra_forward_swap | `engine/src/models/weights/*` |
+| **AttentionScoreAccumulator** | H2O/SnapKV용 attention importance score 누적 (decay, reset) | `engine/src/inference/attention_scores.rs` |
+| **QcfMetric / ImportanceTable / DegradationEstimator** | lossy action 품질 cost. KV / Weight 두 패밀리 분리 | `engine/src/qcf/*` + `engine/src/qcf_types.rs` (L2 shared, §G) |
+| **HybridAttention setup** | OpenCL Plan 의 GPU/CPU split attention 셋업 (§G L2 격상) | `engine/src/hybrid_attention.rs` (L2) |
+| **PartitionWorkspace + tensor_partition** | FFN gate/up 동시분할. PartitionWsCell 은 L2 (§G) | `engine/src/partition_workspace.rs` (L2) + `engine/src/layers/tensor_partition.rs` (L3) |
+| **DecodeLoop + 6 trait + Builder** | L4 session 진입점. 신규 inference 조립자 | `engine/src/session/decode_loop.rs` + `engine/src/session/traits.rs` + `engine/src/session/defaults.rs` |
+| **session::standard_happy + assembly::build_standard_loop** | argus-cli happy path → `DecodeLoop + ModelForward` 조립 | `engine/src/session/standard_happy.rs` + `engine/src/session/assembly/build_standard_loop.rs` |
+| **ModelForward / KiviForward / OffloadForward** | 6 trait 중 `Forward` 구현체 (KIVI / Offload 는 chat phase 에 도입) | `engine/src/session/forward/*.rs` |
+| **session::prefill** | legacy chunked prefill 헬퍼. `CommandExecutor` poll 보유 (legacy 진입점에서만 사용) | `engine/src/session/prefill.rs` |
+| **session::chat::{repl, session, stop_condition}** | chat REPL (Phase 4-5 재작성, `ChatTurnExec` 폐기 결과) | `engine/src/session/chat/*.rs` |
+| **session::eval / batch / ppl / dump_importance** | 평가/실험 진입점 (§I observability sub-module L4 promotion 결과 격상됨) | `engine/src/session/{eval,batch,ppl}/*.rs` + `engine/src/session/dump_importance.rs` |
+| **CommandExecutor / ExecutionPlan** | Manager IPC inbound + ExecutionPlan 누적. **legacy generate 안에서만 instantiate** (DecodeLoop 미연결 — drift) | `engine/src/resilience/executor.rs` |
+| **ResilienceManager + Strategy** | SystemSignal poll + 4종 Strategy(memory/thermal/energy/compute) | `engine/src/resilience/{manager,strategy/*}.rs` |
+| **Transport (DBus / Unix / TCP / Mock)** | Manager↔Engine wire format. `Transport` trait 추상화 | `engine/src/resilience/{transport,dbus_transport}.rs` |
+| **GpuSelfMeter / ProcSelfMeter** | GPU `cl_event` 기반 / proc 기반 자기 메트릭 측정 | `engine/src/resilience/{gpu_self_meter,proc_self_meter}.rs` |
 
 ---
 
 ## Inference Execution Flow
 
-### Prefill → Decode 순서도
+### A. Happy path (argus-cli → DecodeLoop)
+
+`bin/argus_cli.rs::main()` 진입 후 `SessionInitCtx::build` → `run_standard_happy_path` → `DecodeLoopBuilder` → `DecodeLoop::prefill / run` 으로 흐릅니다. legacy generate path 와 동일 L3 도메인을 공유하나 step-by-step 책임이 6 trait 으로 분해되어 있습니다.
 
 ```mermaid
 sequenceDiagram
-    participant User as generate.rs
-    participant Model as LlamaModel
-    participant Layer as LlamaLayer
-    participant Cache as KVCache
-    participant CM as CacheManager
-    participant Backend
+    autonumber
+    participant Cli as bin/argus_cli
+    participant Init as SessionInitCtx
+    participant Std as run_standard_happy_path
+    participant Bld as DecodeLoopBuilder
+    participant Loop as DecodeLoop
+    participant Fwd as Forward (ModelForward)
+    participant Ev as EvictionStage
+    participant Sw as SwapStage
+    participant Cm as CommandSource
+    participant Sa as TokenSampler
+    participant Ob as DecodeObserver
 
-    Note over User: === PREFILL PHASE ===
-    User->>Model: forward_into(tokens[0..N], start_pos=0)
-    loop Each Layer
-        Model->>Layer: forward(x, kv_cache, start_pos)
-        Layer->>Backend: rms_norm, matmul (QKV), rope
-        Layer->>Cache: update(K, V) at current_pos
-        Layer->>Backend: attention (full seq), matmul (FFN)
+    Cli->>Cli: Args::parse() + reject_unsupported_modes_v0()
+    Cli->>Init: build(&args)
+    Init-->>Cli: SessionInitCtx { backend, memory, model, ... }
+    Cli->>Std: run_standard_happy_path(StandardHappyCtx)
+    Std->>Bld: new().with_forward(ModelForward)
+    Note over Bld: NoForward → HasForward (typestate)
+    Std->>Bld: with_eviction / swap / cmd_source / sampler / add_observer
+    Std->>Bld: .build()
+    Bld-->>Std: DecodeLoop (Box<dyn Trait> 6종 owned)
+
+    rect rgb(40,60,100)
+    Note over Std,Loop: === PREFILL PHASE ===
+    Std->>Loop: prefill(&tokens)
+    Loop->>Fwd: prefill(tokens, start_pos=0)
+    Fwd-->>Loop: Vec<f32> last_logits
+    Loop->>Sa: observe_token(t) for t in tokens
+    Loop->>Ob: on_prefill_end(ctx, &last_logits)
+    Loop-->>Std: last_logits
+    Std->>Std: first_token = sampling::sample(&last_logits, prompt, ...)
     end
-    Model-->>User: logits, sample first token
 
-    Note over User: === DECODE PHASE ===
-    loop Each Token
-        User->>Model: forward_into(token, start_pos)
-        loop Each Layer
-            Model->>Layer: forward(x, kv_cache, start_pos)
-            Layer->>Backend: rms_norm, matmul (QKV), rope
-            Layer->>Cache: update(K, V) at current_pos
-            Layer->>Backend: attention_gen (single Q vs cache)
-            Layer->>Backend: matmul (FFN)
+    rect rgb(40,100,60)
+    Note over Std,Loop: === DECODE PHASE ===
+    Std->>Loop: run(budget = num_tokens - 1, first_token)
+    loop For each step (until budget / EOS / StopFlag)
+        Loop->>Cm: poll(&ctx)
+        Note right of Cm: Drift: 결과 drop (argus-cli)<br/>legacy 만 ExecutionPlan 소비
+        Loop->>Ev: before_step(&ctx)
+        Ev-->>Loop: EvictionOutcome (None / Pruned / Skipped)
+        Loop->>Ob: on_eviction(&ctx, &outcome)
+        alt outcome = Pruned { new_pos }
+            Loop->>Loop: pos = new_pos
+            Loop->>Fwd: on_kv_prune(new_pos)
         end
-        Model-->>User: Result<()> (logits in logits_out)
-        User->>CM: maybe_evict(kv_caches) [caller 책임]
-        CM-->>User: EvictionResult
-        Note over User: start_pos += 1 (항상 단조 증가)
+        Loop->>Sw: before_step(&ctx)
+        Loop->>Fwd: step(&ctx, prev_token)
+        Fwd-->>Loop: Vec<f32> logits
+        Loop->>Sw: after_step(&ctx)
+        Loop->>Sa: sample(&ctx, &logits)
+        Sa-->>Loop: u32 sampled
+        Loop->>Sa: observe_token(sampled)
+        Loop->>Ob: on_step_end(&ctx, sampled, step_ms)
+        Loop->>Loop: prev_token = sampled; pos += 1; decode_step += 1
+    end
+    Loop->>Fwd: finalize()
+    Loop->>Ob: finalize()
+    Loop-->>Std: DecodeResult { tokens_generated, final_pos, stopped_by }
+    end
+
+    Std->>Cli: tokenizer.decode(prompt + first + result.tokens_generated)
+```
+
+**6 trait 호출 순서 보장**: `(a) cmd poll → (b) eviction → (c) swap before → (d) forward → (e) swap after → (f) sample → (g) observers`. 모든 trait 은 매 step `StepCtx` 를 새로 build 받으며 mut state 보존 금지.
+
+### B. Legacy path (generate monolith)
+
+`engine/legacy/generate.rs::main()` (~5000 LOC) 은 prefill/decode 인라인 루프 + `CommandExecutor` 직접 보유. 모든 production 모드(chat/experiment/ppl/eval/dump/prompt-batch/swap/profile/KIVI/tensor-partition)가 살아있습니다. DecodeLoop 흡수가 부분 완료 (Phase 4-4-2.3 a/c/b RESOLVED, 3d/3e/4-4-2.4 CANCELED — [[generate-split-binaries]]).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Bin as engine/legacy/generate.rs
+    participant Mgr as Manager (IPC)
+    participant Init as SessionInitCtx
+    participant Exec as CommandExecutor
+    participant Pf as session::prefill
+    participant Model as TransformerModel
+    participant Cache as KVCache / CacheManager
+    participant Swap as SwapExecutor / async_swap
+
+    Bin->>Bin: Args::parse() + 모드 dispatch
+    Bin->>Init: SessionInitCtx::build(&args)
+    Bin->>Exec: CommandExecutor::new(Transport, schedule?)
+    Bin->>Mgr: send_capability(EngineCapability)
+    Bin->>Pf: prefill(...) (chunked, CommandExecutor poll between chunks)
+
+    loop Each decode token (legacy inline loop)
+        Bin->>Exec: poll() → ExecutionPlan
+        opt ExecutionPlan.swap_weights = Some((ratio, dtype))
+            Bin->>Swap: WeightSwapDecider + SwapExecutor::execute_on_slots
+        end
+        opt ExecutionPlan.evict = Some(EvictPlan)
+            Bin->>Cache: force_evict_with_scores(...)
+        end
+        opt ExecutionPlan.switch_device / partition_ratio / throttle / suspend
+            Bin->>Bin: apply (SwitchHw / partition / sleep / break)
+        end
+        Bin->>Model: forward_into(token, start_pos)
+        Model-->>Bin: logits
+        Bin->>Bin: sample → token id → output
+        Bin->>Exec: on_token_generated(...)
+        opt request_qcf
+            Bin->>Mgr: send_qcf_estimate(QcfEstimate)
+        end
+        Bin->>Mgr: heartbeat (EngineStatus, weight_swap_report)
     end
 ```
 
-### Eval-LL Flow
+### C. Eval-LL Flow
 
-Log-likelihood 평가 루프는 `StepHook` trait으로 캐시 관리 정책을 추상화하여, KVCache와 KiviCache 경로의 코드 중복을 제거합니다.
+Log-likelihood 평가 루프는 `StepHook` trait으로 캐시 관리 정책을 추상화하여, KVCache와 KiviCache 경로의 코드 중복을 제거합니다. §I observability sub-module L4 promotion 결과 `session/eval/` 로 격상되어 본 흐름은 L4 진입점입니다 (`session/eval/eval_loop.rs::run_eval_ll_generic`).
 
 ```
-generate.rs main()
-  → Hook 생성: EvictionHook | KiviHook
+session/eval/runner.rs
+  → Hook 생성: EvictionHook | KiviHook (session/eval/{eviction_hook,kivi_hook}.rs)
   → run_eval_ll_generic<C: KVCacheOps>(model, caches, hook, questions)
       → [Importance 2-pass] hook.before_importance_pass()
       → [Question loop]
@@ -338,9 +593,9 @@ generate.rs main()
       → EvalOutput JSON
 ```
 
-`EvictionHook`은 `KVCache`를, `KiviHook`은 `KiviCache`를 각각 전담하며, `generate.rs`는 Hook 생성만 담당합니다. 상세: [`docs/38_eval_refactoring.md`](docs/38_eval_refactoring.md)
+`EvictionHook`은 `KVCache`를, `KiviHook`은 `KiviCache`를 각각 전담하며, `session/eval/runner.rs` 는 Hook 생성만 담당합니다. 상세: [`docs/38_eval_refactoring.md`](docs/38_eval_refactoring.md)
 
-### RoPE와 Eviction의 관계 (중요!)
+### D. RoPE와 Eviction의 관계 (불변)
 
 > **⚠️ RoPE Position은 eviction과 무관하게 단조 증가해야 합니다.**
 >
@@ -484,6 +739,10 @@ KiviCache 데이터 흐름:
 
 ### 2. Directory Structure
 
+> **갱신 정책 (2026-05-25)**: 본 트리는 `engine/src/` 의 *디렉토리 단위 역할*만 기술합니다. 파일 단위 진실원본은 `git ls-files engine/src/ | sort`. 컴포넌트 → 위치 매핑은 위의 **Key Components** 표를 사용하십시오.
+>
+> **삭제된 미존재 항목 (이전 stale tree)**: `engine/src/core/*` 통째, `engine/src/eval/*` 통째, `engine/src/models/llama/llama_model.rs` 단일 파일 가정, `engine/src/profile/*`, `engine/src/memory/galloc.rs` (`memory.rs` 단일 파일로 통합됨), `engine/src/buffer/*` 디렉토리(`buffer.rs` 단일 파일), `bin/generate_hybrid.rs`, `bin/micro_bench.rs`. 모두 §13 마이그레이션 결과 실제 트리와 mismatch였음.
+
 ```
 llm_rs2/
 ├── ARCHITECTURE.md          # 본 문서
@@ -494,121 +753,113 @@ llm_rs2/
 │
 ├── engine/                  # ★ LLM 추론 엔진 (llm_rs2 crate)
 │   ├── Cargo.toml
+│   ├── legacy/
+│   │   └── generate.rs                  # ★ Legacy monolith main (~5000 LOC, 모든 production 모드). Cargo bin = `legacy_generate`.
+│   ├── microbench/                      # 60+ probe/microbench 바이너리 ([[bin]] entries in Cargo.toml)
+│   ├── kernels/                         # OpenCL 커널 (~87개 .cl), 런타임 dlopen
 │   └── src/
-│       ├── lib.rs               # 라이브러리 루트 (모듈 선언)
-│       ├── main.rs              # 기본 엔트리포인트 (미사용)
-│       ├── experiment.rs        # 실험 설정/데이터 수집
-│       ├── bin/
-│       │   ├── generate.rs      # ★ 주력 추론 바이너리 (단일 백엔드)
-│       │   ├── generate_hybrid.rs  # CPU↔GPU 동적 전환 추론
-│       │   ├── micro_bench.rs   # 개별 연산자 벤치마크
-│       │   ├── test_backend.rs  # 백엔드 정합성 테스트
-│       │   ├── test_model.rs    # 모델 로딩 테스트
-│       │   └── signal_injector.rs  # Resilience 시그널 주입 테스트
+│       ├── lib.rs                       # 라이브러리 루트 (pub mod ...)
+│       ├── main.rs                      # 기본 엔트리포인트 (미사용 stub)
 │       │
-│       ├── core/                      # 핵심 추상화 레이어
-│       │   ├── mod.rs                 # 모듈 선언
-│       │   ├── backend.rs             # Backend trait (17개 연산자 정의)
-│       │   ├── buffer.rs              # Buffer trait + DType enum
-│       │   ├── memory.rs              # Memory trait (alloc/used_memory)
-│       │   ├── tensor.rs              # Tensor struct (Shape + Buffer + Backend)
-│       │   ├── shape.rs               # Shape struct (dims, numel)
-│       │   ├── kv_cache.rs            # KVCacheOps trait + KVCache (update, prune_prefix, get_view)
-│       │   ├── kivi_cache.rs          # KiviCache (KIVI Q2 압축 + FP32 Residual)
-│       │   ├── cache_manager.rs       # CacheManager (eviction 조율)
-│       │   ├── sys_monitor.rs         # SystemMonitor trait + LinuxSystemMonitor
-│       │   ├── quant.rs               # BlockQ4_0, BlockQ2_0, BlockKVQ4, BlockKVQ8 양자화 구조체
-│       │   ├── attention_scores.rs    # AttentionScoreAccumulator (H2O/SnapKV importance tracking)
-│       │   ├── events.rs              # EventSink trait, CacheEvent enum, StderrDiagnosticSink
-│       │   ├── sampling.rs            # SamplingConfig, sample() 함수
-│       │   ├── skip_config.rs         # SkipConfig (SWIFT 레이어 스킵 설정)
-│       │   ├── speculative.rs         # SpeculativeDecoder, SkipOptimizer (SWIFT draft/verify)
-│       │   ├── math_utils.rs          # avg_pool_1d, topk_indices_per_head (SnapKV 유틸리티)
-│       │   ├── offload/               # KV Cache Offload (레이어별 프리페치)
-│       │   │   ├── mod.rs             # OffloadKVCache struct + KVCacheOps/PrefetchableCache impl
-│       │   │   ├── store.rs           # OffloadStore trait
-│       │   │   ├── raw_store.rs       # RawStore (무압축 Vec<u8> 저장)
-│       │   │   ├── disk_store.rs      # DiskStore (파일 기반 KV 캐시 저장)
-│       │   │   ├── prefetch.rs        # PrefetchController (적응형 프리페치 깊이)
-│       │   │   └── preload_pool.rs    # PreloadPool (지속성 스레드 풀)
-│       │   ├── eviction/              # Eviction 정책 (Strategy Pattern)
-│       │   │   ├── mod.rs             # EvictionPolicy trait
-│       │   │   ├── no_eviction.rs     # NoEvictionPolicy (항상 skip)
-│       │   │   ├── sliding_window.rs  # SlidingWindowPolicy (최근 N 토큰 유지 + StreamingLLM alias)
-│       │   │   ├── h2o.rs             # H2OPolicy (3-partition: prefix + heavy hitters + recent)
-│       │   │   └── h2o_plus.rs        # H2OPlusPolicy (per-head GQA-aware variant)
-│       │   └── pressure/              # CachePressure 핸들러 (Pipeline Pattern)
-│       │       ├── mod.rs             # CachePressureHandler trait, CachePressurePipeline
-│       │       ├── eviction_handler.rs # EvictionHandler (EvictionPolicy → Handler 어댑터)
-│       │       ├── d2o_handler.rs     # D2OHandler (merge compensation)
-│       │       ├── compress_handler.rs # SnapKVHandler (prefill-time 1회 압축)
-│       │       ├── quantize_handler.rs # QuantizeHandler (pressure→KIVI bits 전환)
-│       │       ├── swap_handler.rs    # SwapHandler (LRU 디스크 오프로드)
-│       │       └── {merge,sparse}_handler.rs  # stubs
+│       │ # ── L2 abstraction (root 평면, §13.4 격상 결과) ──
+│       ├── backend.rs                   # Backend trait (17+ 연산)
+│       ├── buffer.rs                    # Buffer trait + DType enum (SharedBuffer / UnifiedBuffer 포함)
+│       ├── memory.rs                    # Memory trait + Galloc
+│       ├── tensor.rs                    # Tensor struct
+│       ├── shape.rs                     # Shape struct
+│       ├── quant.rs                     # BlockQ4_0 / Q2_0 / KVQ4 / KVQ8 양자화 블록
+│       ├── kv_cache_ops.rs              # KVCacheOps trait (§G shared identifier 격상)
+│       ├── op_kind.rs                   # OpKind enum (§G shared id, profiler/op_trace 공용)
+│       ├── instrument.rs                # OpInstrument trait + op_span! 매크로 (§H)
+│       ├── cpu_kernels.rs               # CPU kernel capability trait
+│       ├── partition_workspace.rs       # PartitionWsCell (FFN gate/up 분할 워크스페이스, §G)
+│       ├── hybrid_attention.rs          # Plan attention setup (§G L2 격상)
+│       ├── thread_pool.rs               # SpinPool (hybrid spin+park 스레드풀)
+│       ├── yield_policy.rs              # CPU yield 정책
+│       ├── qcf_types.rs                 # QcfMetric / ImportanceFormula 등 IPC-shared 타입 (§G)
+│       ├── qcf_computer.rs              # ImportanceCollector front
+│       ├── qcf_collector.rs             # variance/score collector
+│       ├── experiment.rs                # 실험 설정/데이터 수집
 │       │
-│       ├── eval/                      # 평가 프레임워크 (StepHook 기반 제네릭 eval 루프)
-│       │   ├── mod.rs                 # 모듈 공개 인터페이스
-│       │   ├── hook.rs                # StepHook trait, CacheSnapshot trait
-│       │   ├── eval_loop.rs           # run_eval_ll_generic<C: KVCacheOps>
-│       │   ├── eviction_hook.rs       # EvictionHook (KVCache 전용)
-│       │   ├── kivi_hook.rs           # KiviHook (KiviCache 전용)
-│       │   ├── output.rs              # EvalOutput, EvalConfig, EvalQuestion
-│       │   └── qcf_helpers.rs         # QCF/OPR 메트릭 집계 유틸리티
-│       │
-│       ├── models/llama/
-│       │   └── llama_model.rs    # LlamaModel (from_dir, forward_into)
-│       │
-│       ├── layers/
-│       │   ├── llama_layer.rs    # LlamaLayer (forward — seq_len에 따라 내부 분기)
-│       │   ├── attention.rs      # CPU attention 함수 (naive, flash)
-│       │   └── workspace.rs      # LayerWorkspace (사전 할당 버퍼)
-│       │
+│       │ # ── L1 backend impls ──
 │       ├── backend/
-│       │   ├── cpu/
-│       │   │   ├── mod.rs        # CpuBackend struct
-│       │   │   ├── common.rs     # 공통 연산 (portable)
-│       │   │   ├── neon.rs       # ARM64 NEON SIMD 최적화
-│       │   │   └── x86.rs        # x86 SSE/AVX fallback
-│       │   └── opencl/
-│       │       ├── mod.rs        # OpenCLBackend struct & implementation
-│       │       ├── buffer.rs     # OpenCL용 SharedBuffer 확장
-│       │       └── memory.rs     # OpenCL용 Galloc (CL_MEM_ALLOC_HOST_PTR)
+│       │   ├── cpu/                     # CpuBackend (mod / common / neon ARM64 / x86 fallback)
+│       │   ├── opencl/                  # OpenCLBackend (mod / memory / plan / host_ptr_pool* / gpu_self_meter / gpu_score)
+│       │   ├── cuda_pc/                 # CUDA discrete GPU (PC dGPU)
+│       │   ├── cuda_embedded/           # CUDA Jetson UMA (kernels / memory / profiler)
+│       │   └── qnn_oppkg/               # QNN OpPackage HTP (runtime / graph_cache / layer_graph / weight_pack / kv_buffer / hybrid_memory)
 │       │
-│       ├── resilience/                  # Resilience Manager (feature-gated)
-│       │   ├── mod.rs                   # 모듈 선언 + re-exports
-│       │   ├── manager.rs               # ResilienceManager (poll, execute_action)
-│       │   ├── executor.rs              # Action 실행 로직
-│       │   ├── signal.rs                # SystemSignal, Level, enum types
-│       │   ├── state.rs                 # OperatingMode (Normal/Degraded/Minimal/Suspended)
-│       │   ├── transport.rs             # Transport trait + SignalListener<T> (별도 스레드)
-│       │   ├── dbus_transport.rs        # DbusTransport (zbus blocking, Transport 구현)
-│       │   └── strategy/                # Signal reaction strategies
-│       │       ├── mod.rs               # ResilienceAction, resolve_conflicts()
-│       │       ├── memory.rs            # MemoryStrategy
-│       │       ├── thermal.rs           # ThermalStrategy
-│       │       ├── energy.rs            # EnergyStrategy
-│       │       └── compute.rs           # ComputeStrategy
+│       │ # ── L2 자산/포맷 ──
+│       ├── auf/                         # AUF (Argus Unified Format) — mmap zero-copy single-file 자산
+│       │   ├── header.rs / meta.rs / section.rs / reader.rs / writer.rs / tensor_index.rs
+│       │   ├── q4_0_soa.rs              # SOA Q4_0 layout
+│       │   ├── dtype_convert.rs / stripper.rs / source_hash.rs / tokenizer.rs / error.rs
 │       │
-│       ├── profile/               # 추론 프로파일링 프레임워크
-│       │   ├── mod.rs             # Profiler struct, ProbeSet
-│       │   ├── latency.rs         # LatencyProbe (레이어별 지연시간)
-│       │   ├── ops.rs             # OpsProbe (연산자별 소요시간)
-│       │   ├── cache.rs           # CacheProbe (KV 캐시 상태)
-│       │   ├── scores.rs          # ScoresProbe (attention score 분포)
-│       │   └── entropy.rs         # EntropyProbe (출력 엔트로피)
+│       │ # ── L3 Inference 도메인 ──
+│       ├── inference/                   # SamplingConfig, SkipConfig, SpeculativeDecoder, AttentionScoreAccumulator
+│       ├── layers/                      # LayerWorkspace / attention / staging_pool / tensor_partition / llama_layer / transformer_layer{forward, forward_gen}
+│       ├── models/                      # TransformerModel (multi-arch) + config + loader{auf, gguf, safetensors, convert} + mappers{llama, qwen2, gemma3} + weights{slot, secondary_mmap, swap_executor, async_swap, intra_forward_swap, phase_aware_swap, dynamic_k, probing_k, decider, release_worker, layer_object_pool, backing, noise_table, rpcmem_secondary, incremental_plan}
 │       │
-│       ├── memory/galloc.rs       # Galloc (CPU 전용 메모리 할당)
-│       └── buffer/
-│           ├── shared_buffer.rs   # SharedBuffer (CPU Vec)
-│           └── unified_buffer.rs  # UnifiedBuffer (CPU-GPU zero-copy)
-│
-│   └── kernels/              # OpenCL 커널 파일 (~87개 .cl 파일)
-│       ├── mul_mv_q4_0_f32*.cl   # Q4_0 양자화 MatVec 커널
-│       ├── rms_norm.cl           # RMS Norm 커널
-│       ├── rope.cl               # RoPE 커널
-│       ├── simple_ops.cl         # 기본 연산 (add, scale, silu)
-│       ├── flash_attn_f32.cl     # Flash Attention 커널
-│       └── ...
+│       │ # ── L3 Pressure 도메인 ──
+│       ├── pressure/                    # KV cache 관리
+│       │   ├── kv_cache.rs              # 표준 KVCache (F32/F16/Q4_0)
+│       │   ├── kivi_cache.rs            # KIVI 다중 비트 (Q2/Q4/Q8 + FP32 Residual)
+│       │   ├── kv_migrate.rs            # KV cache 디바이스 이동
+│       │   ├── cache_manager.rs         # CacheManager (Pipeline 조율)
+│       │   ├── mod.rs                   # CachePressurePipeline + Handler trait
+│       │   ├── {eviction,d2o,quantize,swap,weight_swap}_handler.rs  # Pressure handlers
+│       │   ├── d2o_layer_alloc.rs       # D2O layer-level variance allocation
+│       │   ├── eviction/                # EvictionPolicy 구현체 (no_eviction / sliding_window / streaming_llm / h2o / h2o_plus / method)
+│       │   └── offload/                 # OffloadKVCache + store / raw_store / disk_store / prefetch / preload_pool
+│       │
+│       │ # ── L3 QCF 도메인 ──
+│       ├── qcf/                         # QcfMetric impl, ImportanceTable, DegradationEstimator
+│       │   ├── qcf_kv.rs / quant_qcf.rs / skip_qcf.rs   # action-별 QCF 계산
+│       │   ├── topk_retention.rs / entropy.rs / layer_importance.rs / layer_aggregation.rs
+│       │   └── estimator.rs             # DegradationEstimator (ΔPPL 환산)
+│       │
+│       │ # ── L4 Orchestration (session/) ──
+│       ├── session/                     # Decode pipeline orchestration
+│       │   ├── traits.rs                # 6 trait: Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver + StepCtx
+│       │   ├── defaults.rs              # NoOp* + GreedySampler
+│       │   ├── decode_loop.rs           # DecodeLoop + DecodeLoopBuilder typestate
+│       │   ├── init.rs                  # SessionInitCtx::build(&args)
+│       │   ├── cli/                     # Args + KvMode + eviction sub-args (Phase 4-1 추출)
+│       │   ├── assembly/                # build_standard_loop + is_standard_happy_path
+│       │   ├── standard_happy.rs        # run_standard_happy_path (argus-cli 진입)
+│       │   ├── forward/                 # ModelForward / KiviForward / OffloadForward (Forward trait impls)
+│       │   ├── samplers/                # RepetitionPenaltySampler 등
+│       │   ├── prefill.rs               # Legacy chunked prefill (legacy generate 전용)
+│       │   ├── decode_fallback/         # legacy decode 추출: prologue / eviction_trigger / swap_dispatch
+│       │   ├── chat/                    # repl + session + stop_condition (Phase 4-5)
+│       │   ├── chat_ipc.rs              # chat IPC adapter (V-11 해소, core → session 이관)
+│       │   ├── chat_template.rs         # chat 템플릿
+│       │   ├── eval/                    # Eval-LL runner + StepHook (eviction_hook / kivi_hook) + helpers / args / output / qcf_helpers
+│       │   ├── batch/                   # --prompt-batch (args / runner / helpers)
+│       │   ├── ppl/                     # --ppl (args / runner)
+│       │   ├── dump_importance.rs       # --dump-importance
+│       │   ├── qcf_runtime.rs           # QCF runtime wrapper
+│       │   └── warmup.rs                # Backend warmup
+│       │
+│       │ # ── Cross-cutting ──
+│       ├── observability/               # EventSink, CacheEvent, OpProfiler, op_trace, rss_trace
+│       │   ├── events.rs                # EventSink trait + CacheEvent enum
+│       │   ├── rss_trace.rs             # /proc/self RSS 추적
+│       │   └── profile/                 # OpProfiler + ops/latency/cache/scores/entropy/op_trace/quality_metrics
+│       │
+│       ├── resilience/                  # Manager IPC + SystemSignal (feature-gated)
+│       │   ├── manager.rs / executor.rs / signal.rs / state.rs / sys_monitor.rs
+│       │   ├── transport.rs / dbus_transport.rs
+│       │   ├── strategy/                # memory / thermal / compute / energy
+│       │   ├── gpu_self_meter.rs / gpu_yield.rs / proc_self_meter.rs
+│       │
+│       └── bin/                         # 진입점 바이너리 (§3 표 참조)
+│           ├── argus_cli.rs             # ★ argus-cli (신규, happy path만 — v1-1)
+│           ├── auf_tool.rs              # AUF 자산 빌드 (build / info)
+│           ├── test_backend.rs          # CPU vs GPU 백엔드 정합성
+│           ├── test_model.rs            # 모델 로딩 검증
+│           ├── test_q4_soa_byte_equal.rs # SOA Q4_0 byte-equal 검증
+│           └── signal_injector.rs       # Resilience 시그널 주입 테스트
 │
 ├── shared/                  # ★ 공유 신호 타입 (llm_shared crate)
 │   ├── Cargo.toml
@@ -710,16 +961,24 @@ llm_rs2/
 
 ### 3. Binaries
 
-| Binary | 용도 | 주요 옵션 |
-|:-------|:----|:---------|
-| `generate` | 단일 백엔드 추론 (주력) | `--backend`, `--kv-type`, `--kv-offload`, `--max-prefetch-depth`, `--eviction-policy`, `--eviction-window`, `--enable-resilience`, `--resilience-transport`, `--initial-kv-capacity`, `--kivi`, `--kivi-residual-size` |
-| `generate_hybrid` | CPU↔GPU 동적 전환 추론 | `--switch-threshold`, `--warmup-tokens` |
-| `micro_bench` | 개별 연산자 벤치마크 | 연산별 크기 지정 |
-| `test_backend` | 백엔드 정합성 검증 | CPU vs OpenCL 결과 비교 |
-| `test_model` | 모델 로딩 검증 | `--model-path` |
-| `signal_injector` | Resilience 시그널 주입 테스트 | `--signal-type`, `--level` |
+진입점이 두 트랙으로 분기되어 있습니다 — 이 표는 *현재 실제 빌드되는* 바이너리입니다.
 
-`generate` 바이너리의 eviction 관련 CLI 옵션:
+| Binary (Cargo name) | 트랙 / 소스 | 용도 | 주요 옵션 |
+|:--------------------|:------------|:----|:---------|
+| `legacy_generate` | `engine/legacy/generate.rs` ([[bin]] entry) | 단일 백엔드 추론 — **모든 production 모드 (chat/experiment/ppl/eval/dump/prompt-batch/swap/profile/KIVI/tensor-partition)** | `--backend`, `--kv-type`, `--kv-mode`, `--eviction-policy`, `--eviction-window`, `--enable-resilience`/`--no-resilience`, `--initial-kv-capacity`, `--kivi-residual-size`, `--tensor-partition`, `--secondary-gguf`(deprecated), `--force-swap-ratio`, `--swap-intra-forward`, `--swap-phase-aware`, `--profile`, `--prompt-batch`, `--chat`, `--ppl`, `--eval-ll`, `--qcf-dump`, `--dump-importance` |
+| `argus_cli` | `engine/src/bin/argus_cli.rs` | **신규** 분리 진입점 — happy path 만 (`DecodeLoop + ModelForward`). v1-1~v1-6 sub-sprint 로 legacy 모드 점진 흡수 중 | `--backend`, `--kv-type`, `--num-tokens`, `--no-resilience` (default-on, v1-1 RESOLVED). 나머지 옵션은 reject |
+| `auf_tool` | `engine/src/bin/auf_tool.rs` | AUF 자산 빌드 (`build`/`info`) | `--tokenizer-config`, `--bos-token-id`, `--eos-token-id` |
+| `test_backend` | `engine/src/bin/test_backend.rs` | 백엔드 정합성 검증 (CPU vs GPU) | — |
+| `test_model` | `engine/src/bin/test_model.rs` | 모델 로딩 검증 | `--model-path` |
+| `signal_injector` | `engine/src/bin/signal_injector.rs` | Resilience 시그널 주입 테스트 | `--signal-type`, `--level` |
+| `test_q4_soa_byte_equal` | `engine/src/bin/test_q4_soa_byte_equal.rs` | SOA Q4 byte-equal 검증 | — |
+| `micro_bench` + 60+ `microbench_*` / `probe_*` | `engine/microbench/*.rs` ([[bin]] entries) | 개별 op / 백엔드 probe / Vulkan / QNN / OpenCL throughput 측정 도구군 (paper experiment용) | 각 바이너리별로 상이 — `cargo run --bin <name> -- --help` 참조 |
+
+> **stale 항목 삭제 (이전 §3 표)**: `generate_hybrid` (CPU↔GPU 동적 전환 추론) — 현 트리에 미존재, polyglot binary로 부활 시 [[generate-split-binaries]] backlog 에서 처리. `micro_bench` 는 `engine/microbench/micro_bench.rs` 로 이관되어 살아있음 — 위 표 마지막 행에 microbench 패밀리로 집계.
+
+> **Cargo bin name 컨벤션**: `engine/src/bin/*.rs` 는 파일명이 곧 Cargo bin name (`argus_cli.rs` → `cargo run --bin argus_cli`). `engine/legacy/*.rs` 와 `engine/microbench/*.rs` 는 [[bin]] entry 로 명시되어 bin name 이 파일 경로와 다를 수 있음 (예: `legacy/generate.rs` → `legacy_generate`).
+
+`legacy_generate` 바이너리의 eviction 관련 CLI 옵션:
 ```
 --eviction-policy <POLICY>       none | sliding | streaming | h2o | h2o_plus | d2o [default: none]
 --eviction-window <SIZE>         Sliding/streaming window size [default: 1024, streaming: 2000]
@@ -736,7 +995,7 @@ llm_rs2/
 --d2o-merge-e <E>                D2O merge weight parameter [default: 1.0]
 ```
 
-`generate` 바이너리의 KIVI 관련 CLI 옵션:
+`legacy_generate` 바이너리의 KIVI 관련 CLI 옵션:
 ```
 --kivi                           KIVI 다중 비트 압축 모드 활성화 (eviction과 상호 배제)
 --kivi-residual-size <N>         FP32 Residual 버퍼 크기 [default: 32]
@@ -1071,7 +1330,7 @@ python scripts/run_device.py -d pixel generate --backend opencl
 
 ## 13. Layered Architecture (Open-Source Refactoring Target)
 
-> **Status (2026-05-16, updated)**: 외부 공개를 위한 레이어드 구조가 결정되었다. 본 섹션은 **목표 구조(target)**와 **현재 구조에서 발견된 위반(violation)**, 그리고 **마이그레이션 순서(plan)**를 기술한다. 코드 이동은 아직 수행되지 않았다 — 이 섹션은 설계 합의의 단일 출처(SoT)이다. **§13.8의 5개 미결 사항(§A~E)은 모두 RESOLVED**되어 §13.4 매핑과 §13.7 Migration Plan에 반영되었다 (이전 §UNRESOLVED 표기는 §13.8 "Resolved Decisions"로 갱신).
+> **Status (2026-05-25 갱신)**: 외부 공개를 위한 레이어드 구조 결정 및 다수 마이그레이션 단계 진행 중. 본 섹션은 **목표 구조(target)**, **현재 구조에서 발견된 위반(violation)**, **마이그레이션 순서(plan)** 를 기술한다. **Step 3 sub-sprint 5개 + Phase 4-1 / 4-2 / 4-3 / 4-4-2.3 a/c/b 완료**, Phase 4-4-2.3 d/e + 4-4-2.4 (main() ≤400 LOC) **CANCELED** ([[generate-split-binaries]] 방향 전환). 신규 진입점 `bin/argus_cli.rs` 가 happy path 흡수 (v1-1 RESOLVED). **§13.8 의 §A~§P 모두 RESOLVED** 되어 §13.4 매핑과 §13.7 Migration Plan에 반영. **§13.1 Layer Definitions 의 "현재 경로" 컬럼은 2026-05-25 실측 기준**으로 갱신됨.
 >
 > 본 절의 레이어 규칙은 spec 측 `INV-LAYER-001 ~ INV-LAYER-005` (`spec/01-architecture.md` §3.8 SYS-100~105, `spec/41-invariants.md` §3.26)와 1:1 대응한다. 코드 매핑/예외 처리 상세는 `arch/01-architecture.md` §6 "Layered Architecture Mapping" 참조.
 
@@ -1079,15 +1338,17 @@ python scripts/run_device.py -d pixel generate --backend opencl
 
 5개 레이어 + 2개 cross-cutting 모듈. **의존 방향은 위에서 아래로만** (L5→L4→L3→L2→L1) 흐른다. 동일 레이어 모듈 사이 cross-import는 신중히 허용하되 사이클은 금지된다.
 
-| Layer | 책임 | 새 경로 (post-migration) | 현재 경로 |
-|-------|------|------------------------|----------|
-| **L5 Adapter** | CLI, IPC adapter, signal injection, binary entrypoint | `bin/` | `bin/` |
-| **L4 Orchestration** | Decode loop, eviction trigger, swap dispatch, prefill 흐름 | `session/` (신규) | `bin/generate.rs` 내부 (monolith) |
-| **L3 Domain** | KV pressure pipeline / Inference forward path | `pressure/`, `inference/` | `core/{kv_cache,cache_manager,eviction,pressure,offload}`, `core/{kivi_cache,attention_scores}`, `layers/`, `models/` |
-| **L2 Abstraction** | Backend trait, Tensor, Buffer, DType, Memory, Shape, ThreadPool, QCF, TensorPartition | `shared/` | `core/{backend,tensor,buffer,memory,shape,quant,thread_pool,qcf,sampling,skip_config,speculative,math_utils,chat_template,chat_ipc}`, `layers/tensor_partition.rs` |
-| **L1 Backend** | 하드웨어별 연산 구현 (CPU NEON/AVX, OpenCL, CUDA, QNN) | `backend/{cpu,opencl,cuda_embedded,cuda_pc,qnn_oppkg}/` | `backend/`, `buffer/` (일부) |
-| **× Observability** | Events, profile, eval, experiment, RSS trace | `observability/{events,profile,eval,experiment,rss_trace}` | `core/{events,rss_trace}`, `profile/`, `eval/`, `experiment.rs` |
-| **× Resilience** | Signal/strategy/manager, sys monitor, gpu yield, auf format | `resilience/`, `resilience/{sys_monitor,gpu_yield,auf}` | `resilience/`, `core/{sys_monitor,gpu_yield}`, `auf/` |
+| Layer | 책임 | 목표 경로 | 현재 경로 (2026-05-25 실측) |
+|-------|------|----------|----------------------------|
+| **L5 Adapter** | CLI, IPC adapter, signal injection, binary entrypoint | `bin/` | `engine/src/bin/{argus_cli, auf_tool, signal_injector, test_backend, test_model, test_q4_soa_byte_equal}.rs` + `engine/legacy/generate.rs` (monolith, 보존 결정) |
+| **L4 Orchestration** | Decode loop, eviction trigger, swap dispatch, prefill 흐름, chat REPL, eval/batch/ppl 진입점 | `session/` | `engine/src/session/{init, traits, decode_loop, defaults, samplers, standard_happy, prefill, assembly/, forward/, chat/, chat_ipc, chat_template, eval/, batch/, ppl/, decode_fallback/, cli/, warmup, qcf_runtime, dump_importance}` |
+| **L3 Pressure** | KV pressure pipeline (CacheManager + Handler) | `pressure/` | `engine/src/pressure/{kv_cache, kivi_cache, cache_manager, kv_migrate, eviction/, offload/, *_handler.rs}` |
+| **L3 Inference** | Forward path (models, layers, sampling, skip, speculative) | `inference/` | `engine/src/{models/, layers/, inference/}` + `engine/src/models/weights/*` (weight swap state) |
+| **L3 QCF** | Quality cost (importance, degradation) — 측정 도메인 | `qcf/` | `engine/src/{qcf/, qcf_collector, qcf_computer}` |
+| **L2 Abstraction** | Backend trait, Tensor, Buffer, DType, Memory, Shape, ThreadPool, KVCacheOps, OpKind, PartitionWorkspace, HybridAttention, CpuKernelSet, Secondary, Instrument, QcfTypes, AUF | `engine/src/` 루트 | `engine/src/{tensor, shape, buffer, memory, quant, thread_pool, kv_cache_ops, op_kind, partition_workspace, hybrid_attention, cpu_kernels, secondary, instrument, qcf_types, yield_policy}.rs` + `engine/src/{backend.rs, auf/, memory/}` |
+| **L1 Backend** | 하드웨어별 연산 구현 (CPU NEON/AVX, OpenCL, CUDA, QNN) | `backend/{cpu,opencl,cuda_embedded,cuda_pc,qnn_oppkg}/` | `engine/src/backend/{cpu, opencl, cuda_embedded, cuda_pc, qnn_oppkg}/` |
+| **× Observability** | Events, profile, RSS trace, experiment (eval 은 L4 격상) | `observability/` | `engine/src/observability/{events, rss_trace, profile/}` + `engine/src/experiment.rs` |
+| **× Resilience** | Signal/strategy/manager, sys monitor, gpu yield, executor, transport | `resilience/` | `engine/src/resilience/{manager, executor, signal, state, strategy/, transport, dbus_transport, sys_monitor, gpu_yield, gpu_self_meter, proc_self_meter}` |
 
 **Cross-cutting 규칙**: Observability/Resilience는 모든 레이어가 import 가능하다. 단 cross-cutting 모듈이 L3 도메인의 concrete type을 직접 import할 때는 trait/Sink 경유로 제한된다 (예: `EventSink` trait, `Transport` trait).
 
@@ -1428,10 +1689,22 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 검증 게이트: `cargo build` PASS + `layer_lint` baseline 그대로(31건 동결) + `engine/tests/spec/test_inv_layer_007.rs`(`trybuild` typestate negative test) PASS.
 - **Step 2-3 첫 구현체 (`ModelForward`)** — `session::Forward` 구현체 1개 + `session::EvictionStage` no-op + `session::TokenSampler` 1개를 도입하고, 신규 `bin/probe_inference_loop.rs` (microbench)에서 `DecodeLoop::run`을 호출하여 forward path만 검증. `bin/generate.rs`는 미변경. (Task #4 finalize 2026-05-16 사용자 결정 #1 — 6 trait 모두 `session/`에 위치)
   - 검증 게이트: probe binary가 S25에서 기존 generate.rs와 동일 TBT 대역(±10%) + same first-token.
-- **Step 2-4 main() 조립자화** — `bin/generate.rs::main()`을 builder 호출로 교체. 6 책임이 6 trait 구현체로 흡수. 남는 코드는 `clap::Parser::parse()` + `DecodeLoopBuilder` 조립 + `prefill` + `run` + `finalize` 5단계 ≤ 400 LOC.
-  - 검증 게이트: 모든 디바이스 e2e 통과 (S25 + Jetson + host CPU), TBT 회귀 ≤ 5% (Adreno 14ms baseline).
-- **Step 2-5 나머지 구현체 + chat REPL 전면 재작성** — `KiviForward` / `OffloadForward` 도입. **`ChatTurnExec` trait은 폐기**(Task #4 finalize 2026-05-16 사용자 결정 #3). `bin/generate.rs`의 chat REPL 1,178 LOC + `ChatTurnExec` 3 impl(~300 LOC)을 삭제하고 `session/chat/{repl, turn, stop_condition}.rs`로 **DecodeLoop 패턴 전면 재작성**. `core/chat_ipc.rs` → `session/chat_ipc.rs` 이관. sub-step 4-5-a~f로 PR 분할 (`arch/inference_pipeline.md` §9 참조).
+- **Step 2-4 main() 조립자화** — `bin/generate.rs::main()`을 builder 호출로 교체. 6 책임이 6 trait 구현체로 흡수.
+  - **진행 현황 (2026-05-25, master `02cb7106`)**: Phase 4-4-2.3 a/c/b 완료. 세 sub-phase로 추출:
+    - 4-4-2.3a (`9313670b`, +655 LOC): decode prologue → `session::decode_fallback::prologue`.
+    - 4-4-2.3c (`bcb221e2`, +200 LOC): eviction trigger → `session::decode_fallback::eviction_trigger`.
+    - 4-4-2.3b (`02cb7106`, +452 LOC): swap dispatcher → `session::decode_fallback::swap_dispatch`.
+    - 결과: `bin/generate.rs` 5,778 → **4,953 LOC (-14.3%)**.
+  - **취소**: 4-4-2.3d / 3e / 4-4-2.4 (`bin/generate.rs` ≤ 400 LOC 압축). 사유: legacy generate.rs 를 보존하고 다수 바이너리로 분할하는 방향 전환 ([[generate-split-binaries]] backlog [P2] 등록, 상세 설계 라운드 대기). argus-cli 가 happy path 흡수, chat / experiment / ppl 등은 별 바이너리 후보.
+  - 검증 게이트 (4-4-2.3 a/c/b): 모든 디바이스 e2e 통과 (S25 + Jetson + host CPU), TBT 회귀 ≤ 5%.
+- **Step 2-5 나머지 구현체 + chat REPL 전면 재작성** — `KiviForward` / `OffloadForward` 도입 (현재 `session/forward/{kivi,offload}_forward.rs` 스텁 존재). **`ChatTurnExec` trait은 폐기**(Task #4 finalize 2026-05-16 사용자 결정 #3). chat REPL 은 `session/chat/{repl, session, stop_condition}.rs` 로 이관 완료 (4-5-c 단계). `core/chat_ipc.rs` → `session/chat_ipc.rs` 이관 완료.
   - 검증 게이트: G1(/stats 라인 동치) + G2(multi-turn KV bit-identical) + G3(/reset 동작) + G4(chat-specific eviction 동치) + G5(`core/chat_ipc.rs` import zero).
+
+**Step 2-bis: argus-cli v1 흡수 (2026-05-25 진행 중)**
+- 4-4-2.4 취소 결정의 자연 후속. legacy generate 보존 + argus-cli 점진 흡수.
+- **v1-1 RESOLVED** (HEAD `83d7cb4a`): resilience default-on (`--no-resilience` opt-out).
+- **v1-2 ~ v1-6 pending**: prompt-batch / swap / profile / KIVI+Offload (`--kv-mode`) / tensor-partition.
+- 본 갈래는 §13.7 Step 2 ~ Step 5 와 직교 — argus-cli 흡수 완료 후에도 legacy generate 는 보존 (다수 바이너리 분할 방향).
 
 **Step 3: L1/L2 경계 정리** (backend impl이 `shared/` 외 import 제거 + backend-specific buffer/pool/포맷 재배치)
 
