@@ -3,11 +3,11 @@
 //! `DecodeLoopBuilder::build` substitutes these whenever the caller did not
 //! provide a concrete implementation (`with_eviction` / `with_swap` / etc).
 
-use llm_shared::EngineCommand;
+use crate::resilience::{ExecutionPlan, KVSnapshot};
 
 use super::traits::{
-    CommandSource, DecodeObserver, EvictionOutcome, EvictionStage, SkipReason, StepCtx, SwapStage,
-    TokenSampler,
+    CommandSource, DecodeObserver, EngineReport, EvictionOutcome, EvictionStage, SkipReason,
+    StepCtx, SwapStage, TokenSampler, TokenTickSink,
 };
 
 /// Eviction stage that never prunes. Used when caller skipped `with_eviction`.
@@ -37,10 +37,20 @@ impl SwapStage for NoOpSwapStage {
 pub struct NoOpCommandSource;
 
 impl CommandSource for NoOpCommandSource {
-    fn poll(&mut self, _ctx: &StepCtx) -> anyhow::Result<Option<EngineCommand>> {
-        Ok(None)
+    fn poll(&mut self, _ctx: &StepCtx, _kv: &KVSnapshot) -> anyhow::Result<ExecutionPlan> {
+        Ok(ExecutionPlan::default())
     }
 }
+
+/// EngineReport that drops all outbound messages.
+pub struct NoOpEngineReport;
+
+impl EngineReport for NoOpEngineReport {}
+
+/// TokenTickSink that does nothing.
+pub struct NoOpTokenTickSink;
+
+impl TokenTickSink for NoOpTokenTickSink {}
 
 /// Greedy sampler (argmax). Pipeline default when caller skipped `with_sampler`.
 pub struct GreedySampler;
@@ -106,10 +116,13 @@ mod tests {
     }
 
     #[test]
-    fn no_op_command_source_yields_none() {
+    fn no_op_command_source_yields_default_plan() {
         let stop = AtomicBool::new(false);
         let c = ctx(&stop);
         let mut s = NoOpCommandSource;
-        assert!(s.poll(&c).unwrap().is_none());
+        let snap = crate::resilience::KVSnapshot::default();
+        let plan = s.poll(&c, &snap).unwrap();
+        assert!(!plan.suspended);
+        assert_eq!(plan.throttle_delay_ms, 0);
     }
 }

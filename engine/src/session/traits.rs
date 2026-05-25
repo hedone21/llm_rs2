@@ -10,7 +10,9 @@
 
 use std::sync::atomic::AtomicBool;
 
-use llm_shared::{EngineCommand, WeightSwapReport};
+use llm_shared::{EngineCapability, QcfEstimate, WeightSwapReport};
+
+use crate::resilience::{ExecutionPlan, KVSnapshot};
 
 /// Read-only context handed to every trait at each decode step.
 ///
@@ -140,8 +142,27 @@ pub trait SwapStage {
 
 /// External command channel (manager IPC, schedule, stdin, ...).
 pub trait CommandSource {
-    fn poll(&mut self, ctx: &StepCtx) -> anyhow::Result<Option<EngineCommand>>;
+    /// Per-step poll. KVSnapshot은 heartbeat 페이로드.
+    /// Default Noop은 `ExecutionPlan::default()`를 반환.
+    fn poll(&mut self, ctx: &StepCtx, kv_snap: &KVSnapshot) -> anyhow::Result<ExecutionPlan>;
 }
+
+/// Outbound reporting channel (engine → manager).
+pub trait EngineReport {
+    fn send_capability(&mut self, _cap: EngineCapability) {}
+    fn send_qcf_estimate(&mut self, _qcf: QcfEstimate) {}
+    fn send_swap_report(&mut self, _report: WeightSwapReport) {}
+}
+
+/// Per-token tick sink.
+pub trait TokenTickSink {
+    /// decode step 완료 후 1회. sampler 호출 후, observer 이전.
+    fn on_token_generated(&mut self, _ctx: &StepCtx) {}
+}
+
+/// Convenience supertrait bundling the three resilience-facing traits.
+pub trait ResilienceBundle: CommandSource + EngineReport + TokenTickSink {}
+impl<T: CommandSource + EngineReport + TokenTickSink> ResilienceBundle for T {}
 
 /// Token sampler. Default impl `GreedySampler` in [`super::defaults`].
 pub trait TokenSampler {
