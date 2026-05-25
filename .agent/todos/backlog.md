@@ -24,17 +24,12 @@
 
 ---
 
-## [P3] swap 기본 모드를 `--swap-intra-forward`로 — 2026-05-25 등록
-- **Status**: TODO (사용자 결정 2026-05-25)
-- **현황**: 4 swap 모드 (`--swap-incremental-per-tick K` / `--swap-intra-forward` / `--swap-phase-aware` / `--swap-layer-immediate`) 모두 default OFF. Manager `EngineCommand::SwapWeights` 도착 시 현재는 `incremental_force_swap_plan` 생성 path (= Incremental dispatcher) 단일 진입.
-- **요구**: swap 활성화 시 IntraForward를 기본 채택. Paper sprint LISWAP-1~8에서 IntraForward가 main winner였던 측정 근거 반영.
-- **모호 사항 (구현 전 결정 필요)**:
-  - (a) Manager-driven swap path 변경: `dispatch_swap_weights` (executor.rs:549~)가 incremental_plan 대신 intra_forward_swap_hook 생성으로 분기 — Manager 정책 layer 영향 큼
-  - (b) CLI 신규 `--swap` shorthand (flag 없이 모드 선택): `--swap intra-forward` (default) / `incremental` / `phase-aware` / `layer-immediate`
-  - (c) 기존 4 flag 그대로 두되 4 모드 모두 OFF + `--enable-swap` 새 flag 추가 시 IntraForward 활성
-- **선행**: S-1 (WeightSwapEvent) 완료 후 IntraForward path event 발행이 정착되어야 본 작업 측정/검증 가능
-- **비용**: (b) 또는 (c) 채택 시 1~2h. (a) 채택 시 Manager 정책 영향 분석 + 디바이스 게이트 0.5~1일
-- **연관**: argus_cli v1-3 swap 흡수 (`handoff_argus_cli_v1_1_resilience_2026_05_24.md` v1-3 항목)
+## [DONE] swap 기본 모드를 `--swap-intra-forward`로 — 2026-05-25 종결
+- **Status**: DONE (옵션 (b) `--swap` shorthand 채택, 2026-05-25)
+- **선택 옵션**: (b) CLI 신규 `--swap [intra-forward|incremental|phase-aware|layer-immediate]`. flag 단독 시 default = IntraForward (LISWAP-4 production winner). 기존 4 flag는 deprecated + stderr 1회 경고 후 그대로 동작.
+- **구현**: `engine/src/session/cli/mod.rs` — `SwapMode` enum + `parse_swap_mode` + `swap: Option<SwapMode>` field + `Args::normalize_swap_shorthand()`. caller (`argus_cli.rs`, `legacy/generate.rs`)에서 `Args::parse()` 직후 normalize 호출. Manager-driven path는 별도 (qcf_runtime.rs sync path 등 backlog P3 잔여).
+- **검증**: cargo test --lib 1194 PASS, spec inv_layer 8 PASS, clippy --lib + main bins clean. S25 Adreno OpenCL Qwen2.5-1.5b Q4_0 32 토큰 baseline vs --swap intra-forward generation **bit-identical** (Paris... 동일).
+- **잔여 (별 sprint)**: (a) Manager-driven swap path (executor.rs:549~) 자동 IntraForward 분기 — Manager 정책 layer 영향 큰 작업으로 분리. argus_cli v0 reject 함수의 swap 4 flag 차단 (v1-3 sprint 대상).
 
 ---
 

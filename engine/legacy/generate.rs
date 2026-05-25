@@ -92,8 +92,10 @@ fn main() -> anyhow::Result<()> {
     rss_trace("start");
     io_trace("start");
 
-    #[allow(unused_mut)]
     let mut args = Args::parse();
+
+    // backlog P3 (2026-05-25): `--swap` shorthand → legacy 4 flag normalize.
+    args.normalize_swap_shorthand();
 
     let ctx = llm_rs2::session::init::SessionInitCtx::build(&args)?;
 

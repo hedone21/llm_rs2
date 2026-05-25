@@ -36,6 +36,10 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let mut args = Args::parse();
 
+    // backlog P3 (2026-05-25): `--swap` shorthand → legacy 4 flag normalize.
+    // `--swap` set 시 해당 legacy field 활성화 후 dispatch path는 그대로.
+    args.normalize_swap_shorthand();
+
     // v1-1: resilience default-on. `--no-resilience` 가 명시되면 effective=false,
     // 그 외에는 effective=true (legacy `--enable-resilience` flag 도 그대로 효과).
     // SessionInitCtx / prefill / batch 등 호출지는 모두 `args.enable_resilience`
