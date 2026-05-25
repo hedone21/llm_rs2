@@ -92,6 +92,8 @@ sequenceDiagram
     box rgb(50,120,80) Engine (llm_rs2)
         participant Res as ResilienceManager
         participant CM as CacheManager
+        participant SwapRt as EngineSwapRuntime
+        participant WSwap as models::weights
     end
 
     OS->>Mon: metric (memory 15%)
@@ -100,12 +102,20 @@ sequenceDiagram
     Res->>CM: Evict(0.50)
     CM-->>Res: cache pruned
 
-    Note over OS,CM: 회복
+    Note over OS,WSwap: 회복
 
     OS->>Mon: metric (memory 55%)
     Mon->>PE: threshold 회복
     PE->>Res: SystemSignal (Normal)
     Res-->>Res: RestoreDefaults
+
+    Note over OS,WSwap: Manager-driven weight swap (§13.8-M)
+
+    PE->>Res: EngineCommand::SwapWeights<br/>{ratio=0.5, target_dtype=Q4_0}
+    Res->>SwapRt: handle_swap_weights (WHAT)
+    SwapRt-->>SwapRt: --swap CLI mode 적용 (HOW)
+    SwapRt->>WSwap: 4-way dispatch<br/>(Incremental/IntraForward/PhaseAware/LayerImmediate)
+    WSwap-->>SwapRt: SwapCommitSlot
 ```
 
 **통신 방향**: Manager → Engine (단방향). Engine은 Manager에 피드백을 보내지 않음 (fire-and-forget).
@@ -152,6 +162,7 @@ graph TB
         Traits["session::traits<br/>(Forward / EvictionStage / SwapStage /<br/>CommandSource / TokenSampler / DecodeObserver)"]
         Defaults["session::defaults<br/>(NoOp* + GreedySampler)"]
         Prefill["session::prefill<br/>(legacy chunked prefill)"]
+        SwapRt["session::swap_runtime<br/>EngineSwapRuntime + SwapCommitSlot<br/>(Manager WHAT → engine HOW, §13.8-M)"]
         Chat["session::chat::<br/>{repl, session, stop_condition}"]
         Eval["session::eval / batch / ppl"]
         FwdImpls["session::forward::<br/>{model, kivi, offload}_forward"]
@@ -169,7 +180,7 @@ graph TB
         Model["models::TransformerModel"]
         Layer["layers::transformer_layer +<br/>llama_layer"]
         Inf["inference::sampling / skip_config /<br/>speculative / attention_scores"]
-        WSwap["models::weights::*<br/>(swap_executor, intra_forward_swap,<br/>phase_aware_swap, async_swap)"]
+        WSwap["models::weights::*<br/>(swap_executor, intra_forward_swap,<br/>phase_aware_swap, async_swap)<br/>eprintln 0 — EventSink emit only<br/>(S-1 / S-1+α / S-1+β)"]
     end
 
     subgraph L3Q ["L3 QCF — qcf*/"]
@@ -191,14 +202,14 @@ graph TB
     end
 
     subgraph CC1 ["× Observability"]
-        Events["observability::events<br/>(EventSink, CacheEvent)"]
+        Events["observability::events<br/>(EventSink, CacheEvent)<br/>WeightSwapEvent — 8 variant ×<br/>WeightSwapKind 5 (S-1 / S-1+α / S-1+β)"]
         Profile["observability::profile::*<br/>(OpProfiler, op_trace)"]
         Rss["observability::rss_trace"]
     end
 
     subgraph CC2 ["× Resilience"]
         ResMgr["resilience::ResilienceManager"]
-        Exec["resilience::CommandExecutor<br/>(legacy 만 보유, DecodeLoop 미연결)"]
+        Exec["resilience::CommandExecutor<br/>(legacy 만 보유, DecodeLoop 미연결)<br/>SwapWeights 만 SwapRt wire (M sprint)"]
         Strat["resilience::strategy::*"]
         Tp["resilience::transport::Transport"]
         Sys["resilience::sys_monitor"]
@@ -236,6 +247,13 @@ graph TB
     WSwap -.swap state.- KvState
     Handlers -.weight swap.- WSwap
 
+    %% M sprint: Manager SwapWeights wire (WHAT) → EngineSwapRuntime (HOW)
+    Legacy --> SwapRt
+    Exec -.SwapWeights ratio+dtype.- SwapRt
+    SwapRt -.4-way commit.- WSwap
+    SwapRt --> Events
+    WSwap -.WeightSwapEvent emit.- Events
+
     Cpu -.impl.- BackendTrait
     Cl -.impl.- BackendTrait
     CuE -.impl.- BackendTrait
@@ -266,6 +284,8 @@ graph TB
 - 점선 `-.label.-` = trait dispatch / 메시지 / 외부 이벤트.
 - L4 `session/` 가 L3 두 도메인(Pressure ↔ Inference ↔ QCF) 결합점.
 - `resilience::CommandExecutor` ↔ `DecodeLoop` 사이는 **현재 미연결** — 본 다이어그램에서도 점선 미표기 (§ "Manager IPC wiring 현황" 참조).
+- **`SwapWeights` 만 부분 해소** (M sprint, §13.8-M): `Exec -.SwapWeights.- SwapRt -.4-way commit.- WSwap`. Manager 는 WHAT (`ratio` + `target_dtype`), engine 은 HOW (CLI `--swap` mode 자율 dispatch).
+- **`WSwap → Events`** = sub-module 의 모든 stderr 가 EventSink emit 으로 우회 (S-1 ~ S-1+β 3 sprint, eprintln 0).
 
 ### Session — 6 trait + DecodeLoopBuilder typestate
 

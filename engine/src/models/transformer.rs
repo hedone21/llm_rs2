@@ -5,6 +5,7 @@ use crate::backend::Backend;
 use crate::buffer::{Buffer, DType};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv_cache_ops::KVCacheOps;
+#[cfg(feature = "opencl")]
 use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
