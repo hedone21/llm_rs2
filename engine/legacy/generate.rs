@@ -27,8 +27,7 @@ use llm_rs2::session::cli::{Args, KvMode, parse_qcf_sample_layers};
 use llm_rs2::session::eval::load_eval_questions;
 use llm_rs2::session::ppl::run_kivi_ppl;
 use llm_rs2::session::qcf_runtime::{
-    QcfWarmupConfig, QcfWarmupCtx, dispatch_swap_weights, read_allow_boundary_env, run_layer_swap,
-    run_qcf_warmup_workflow,
+    QcfWarmupConfig, QcfWarmupCtx, read_allow_boundary_env, run_layer_swap, run_qcf_warmup_workflow,
 };
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
@@ -1150,6 +1149,33 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         }
+    };
+
+    // M-Sprint (α): Manager-driven swap path를 사용자 의도(`--swap` flag)에
+    // 정합. Engine 내부 default mode (CLI `--swap` normalize 결과) 로 Manager
+    // `SwapWeights` 신호를 4-way 분기 (Incremental / IntraForward / PhaseAware
+    // / LayerImmediate). 사용자가 `--swap intra-forward` 같은 flag를 명시하면
+    // Manager 경로에서도 그 mode로 commit. CLI 강제 경로 (`dispatch_force_swap!`
+    // 매크로) 는 본 sprint scope 외 — 기존 그대로 유지. 상세 mental model:
+    // arch/weight_swap.md §2.8.1 (WHAT vs HOW).
+    let swap_runtime: llm_rs2::session::swap_runtime::EngineSwapRuntime = {
+        let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| cpu_backend_arc.clone());
+        let runtime_dispatcher = std::sync::Arc::new(
+            llm_rs2::models::weights::AsyncSwapDispatcher::new(swap_backend.clone()),
+        );
+        llm_rs2::session::swap_runtime::EngineSwapRuntime::new(
+            swap_backend,
+            runtime_dispatcher,
+            std::sync::Arc::new(model.config.clone()),
+            std::sync::Arc::clone(&model.release_worker),
+            std::sync::Arc::clone(&event_sink),
+            args.resolved_swap_mode(),
+            args.swap_phase_aware_chunk_mb.max(1) * 1_048_576,
+            args.swap_phase_aware_max_chunks_per_token,
+        )
     };
 
     // LISWAP-6 — Dynamic K controller. Active when `--swap-dynamic-k` is set.
@@ -2399,7 +2425,22 @@ fn main() -> anyhow::Result<()> {
                 // `plan.swap_weights` for the same-tick path.
                 let pending_swap = executor.take_pending_swap_weights().or(plan.swap_weights);
                 if let Some((ratio, target_dtype)) = pending_swap {
-                    dispatch_swap_weights(
+                    // M-Sprint (α): Manager-driven dispatch는 EngineSwapRuntime의
+                    // default mode (args.resolved_swap_mode()) 로 4-way 분기. SwapCommitSlot
+                    // 의 결과를 기존 3 변수 (incremental_force_swap_plan /
+                    // intra_forward_swap_hook / phase_aware_swap_dispatcher) 로
+                    // 분해하여 decode loop의 기존 drain/retire 경로와 호환.
+                    use llm_rs2::session::swap_runtime::SwapCommitSlot;
+                    let mut commit_slot = if let Some(plan) = incremental_force_swap_plan.take() {
+                        SwapCommitSlot::Incremental(plan)
+                    } else if let Some(hook) = intra_forward_swap_hook.take() {
+                        SwapCommitSlot::IntraForward(hook)
+                    } else if let Some(disp) = phase_aware_swap_dispatcher.take() {
+                        SwapCommitSlot::PhaseAware(disp)
+                    } else {
+                        SwapCommitSlot::Idle
+                    };
+                    swap_runtime.handle_swap_weights(
                         &model,
                         ratio,
                         target_dtype,
@@ -2407,9 +2448,21 @@ fn main() -> anyhow::Result<()> {
                             .as_ref()
                             .map(|t| t as &dyn llm_rs2::qcf_collector::ImportanceLookup),
                         decode_token_index,
-                        &mut incremental_force_swap_plan,
+                        &mut commit_slot,
                         &mut manager_swap_report_pending,
                     );
+                    match commit_slot {
+                        SwapCommitSlot::Idle => {}
+                        SwapCommitSlot::Incremental(plan) => {
+                            incremental_force_swap_plan = Some(plan);
+                        }
+                        SwapCommitSlot::IntraForward(hook) => {
+                            intra_forward_swap_hook = Some(hook);
+                        }
+                        SwapCommitSlot::PhaseAware(disp) => {
+                            phase_aware_swap_dispatcher = Some(disp);
+                        }
+                    }
                     // Note: remap_weights_for_cpu_after_swap will be called
                     // per-chunk in the incremental swap dispatch block above.
                 }

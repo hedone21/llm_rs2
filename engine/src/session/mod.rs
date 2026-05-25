@@ -18,6 +18,7 @@ pub mod resilience_adapter;
 pub mod resilience_init;
 pub mod samplers;
 pub mod standard_happy;
+pub mod swap_runtime;
 pub mod traits;
 pub mod warmup;
 

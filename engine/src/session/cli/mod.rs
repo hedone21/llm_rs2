@@ -1218,6 +1218,31 @@ impl Args {
         }
     }
 
+    /// Engine 내부 dispatch default mode 결정.
+    ///
+    /// Manager `SwapWeights` 수신 시 어느 mode (Incremental / IntraForward /
+    /// PhaseAware / LayerImmediate) 로 dispatch 할지의 default. `--swap` enum
+    /// 우선, 미지정 시 legacy 4 flag로부터 추론, 모두 미지정이면 LISWAP-4
+    /// production winner (IntraForward) 기본.
+    ///
+    /// `normalize_swap_shorthand()` 후 호출 권장 (legacy field 일치 보장).
+    /// 상세 mental model: arch/weight_swap.md §2.8.1.
+    pub fn resolved_swap_mode(&self) -> SwapMode {
+        if let Some(mode) = self.swap {
+            mode
+        } else if self.swap_phase_aware {
+            SwapMode::PhaseAware
+        } else if self.swap_layer_immediate {
+            SwapMode::LayerImmediate
+        } else if self.swap_intra_forward {
+            SwapMode::IntraForward
+        } else if self.swap_incremental_per_tick > 0 {
+            SwapMode::Incremental
+        } else {
+            SwapMode::IntraForward
+        }
+    }
+
     /// KV mode (단순 reader — legacy fallback 제거됨, 옵션 C 완료).
     pub fn effective_kv_mode(&self) -> KvMode {
         self.kv_mode_args.kv_mode
