@@ -245,7 +245,8 @@ graph TB
     EvPolicy --> KvState
 
     WSwap -.swap state.- KvState
-    Handlers -.weight swap.- WSwap
+    %% NOTE: pressure::weight_swap_handler 는 dormant (handler 정의만, pipeline 미등록).
+    %% CacheManager 경유 precision swap path 는 현재 미구현 — 직접 edge 없음.
 
     %% M sprint: Manager SwapWeights wire (WHAT) → EngineSwapRuntime (HOW)
     Legacy --> SwapRt
@@ -476,7 +477,7 @@ graph TB
         Release["PrimaryReleaseWorker<br/>(Phase 6.5 −81% RSS,<br/>ReleaseJob queue)"]
         Tomb["PrimaryWeightsTombstone<br/>(Sprint C-1/2/3 PLACEHOLDER +<br/>PRIMARY DROP, 1.81 GB recover)"]
         Noise["QuantNoiseTable<br/>(Q4 quant noise compensation)"]
-        SwapH["pressure::weight_swap_handler<br/>(CachePressureHandler impl)"]
+        SwapH["pressure::weight_swap_handler<br/>(CachePressureHandler impl)<br/><b>dormant</b> — production wire 0<br/>(handler 정의만, CachePressurePipeline<br/>미등록, CacheManager 호출 안 됨)"]
     end
 
     %% ── L2 자산 (backing + secondary) ────────────────────────
@@ -535,9 +536,9 @@ graph TB
     Tomb -.RSS drop.- AufBack
     Exec -.compensation.- Noise
 
-    %% ── Pressure pipeline handler ────────────────────────────
-    SwapH --> Exec
-    SwapH -.handler dispatch.- Slot
+    %% ── Pressure pipeline handler — dormant ──────────────────
+    %% SwapH 는 정의만 존재. CachePressurePipeline 등록 / SwapExecutor 호출 모두
+    %% production 코드에 0 — 미래 wire 후보 (handoff R5 후속 후보 참조).
 
     %% ── observability emit (eprintln 0, S-1 ~ S-1+β) ─────────
     Exec -.WeightSwapEvent.- Evt
@@ -558,10 +559,12 @@ graph TB
 - **Entry (L4)**: Manager 또는 사용자(`--swap` flag) 가 둘 다 같은 `EngineSwapRuntime` 진입. mode 결정은 engine 자율 (§13.8-M).
 - **Orch + Disp (L3 Inference)**: `SwapExecutor` 가 primary, 4 mode dispatcher 는 *얼마나 / 언제 / 어느 layer* 를 commit 할지 정책만 결정 후 Exec 에 위임. `DynamicK`/`ProbingK` 는 chunk size K 만 조절 (LISWAP-1/2).
 - **Asset (L2)**: `AUF` 포맷이 primary + secondary 양쪽 자산 공통 (single-file). `SecondaryMmap` 은 OS mmap zero-copy, `RpcmemSecondaryStore` 는 Android DMA-BUF heap 으로 HTP↔Adreno 공유.
-- **State (L3)**: `LayerSlot` = layer 별 Arc snapshot (atomic 교체). `PrimaryReleaseWorker` 는 swap 완료 layer 의 primary backing 메모리 회수 (Phase 6.5 −81%). `Tombstone` 은 회수 완료 marker. `WeightSwapHandler` 는 pressure pipeline 진입점 (CachePressureHandler).
+- **State (L3)**: `LayerSlot` = layer 별 Arc snapshot (atomic 교체). `PrimaryReleaseWorker` 는 swap 완료 layer 의 primary backing 메모리 회수 (Phase 6.5 −81%). `Tombstone` 은 회수 완료 marker. `WeightSwapHandler` 는 **dormant** — `CachePressureHandler` trait 을 구현해 두었으나 `CachePressurePipeline` 에 등록되지 않으며 `CacheManager` 가 호출하지 않는다. 즉 *KV cache manager 가 메모리 압박 시 precision swap 을 trigger 하는 path 는 현재 미구현*. wire 는 후속 sprint 후보.
 - **BeBuf (L1)**: backend 별 alias buffer 가 host pointer 를 GPU/NPU 메모리로 mmap. zero-copy 경로의 실제 substrate.
 - **eprintln 0 정책**: 4 dispatcher + Exec + ReleaseWorker 모두 `WeightSwapEvent` emit 만 사용 (S-1 / S-1+α / S-1+β 3 sprint). stderr 직접 출력 없음.
-- **부분 미구현**: argus-cli + DecodeLoop 경로는 §13.8-M 정책 따라 후속 sprint 에서 흡수 예정 (handoff R5 후속 후보 A). 현재 legacy generate path + PPL runner 만 wire 됨.
+- **부분 미구현 (2건)**:
+  1. argus-cli + DecodeLoop 경로는 §13.8-M 정책 따라 후속 sprint 에서 흡수 예정 (handoff R5 후속 후보 A). 현재 legacy generate path + PPL runner 만 wire 됨.
+  2. `WeightSwapHandler` ↔ `CachePressurePipeline` wire 는 0 LOC. 현 production trigger 는 (a) Manager `SwapWeights` → `EngineSwapRuntime`, (b) CLI `--force-swap-ratio` macro, (c) PPL runner — 3 path 뿐이며 모두 `CacheManager` 를 거치지 않는다.
 
 ### Key Components
 
