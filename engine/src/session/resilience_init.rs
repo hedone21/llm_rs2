@@ -5,7 +5,10 @@
 //!
 //! - experiment_schedule 분기 제외 (argus-cli v0 reject)
 //! - `args.enable_resilience` 가 false이면 `Ok(None)` 반환
-//! - transport 연결 실패 시 graceful `Err` 전파 (panic 없음)
+//! - **graceful fallback**: transport 연결 실패 / unknown transport / feature
+//!   off 시 `warn!` 로그 + `Ok(None)` 반환 (Manager 없이 NoOp 추론 진행).
+//!   v1-1 default-on 정책에서 일반 사용자가 Manager 안 띄워도 추론이
+//!   깨지지 않도록 한다.
 
 use std::time::Duration;
 
@@ -42,28 +45,38 @@ pub fn build_command_executor(
         let _ = args.heartbeat_gpu_profile; // 컴파일러 경고 방지
     }
 
-    // transport 분기
-    let (cmd_rx, resp_tx, _handle) = match args.resilience_transport.as_str() {
+    // transport 분기. spawn 실패 / unknown transport / feature off 모두 graceful
+    // fallback (warn + Ok(None)) — default-on 정책 회귀 차단.
+    let spawn_result: Result<_> = match args.resilience_transport.as_str() {
         #[cfg(feature = "resilience")]
         "dbus" => {
             use crate::resilience::DbusTransport;
-            MessageLoop::spawn(DbusTransport::new())?
+            MessageLoop::spawn(DbusTransport::new()).map_err(anyhow::Error::from)
         }
         #[cfg(unix)]
         s if s.starts_with("unix:") => {
             use crate::resilience::UnixSocketTransport;
             let path = std::path::PathBuf::from(&s[5..]);
-            MessageLoop::spawn(UnixSocketTransport::new(path))?
+            MessageLoop::spawn(UnixSocketTransport::new(path)).map_err(anyhow::Error::from)
         }
         s if s.starts_with("tcp:") => {
             let addr = s[4..].to_string();
-            MessageLoop::spawn(TcpTransport::new(addr))?
+            MessageLoop::spawn(TcpTransport::new(addr)).map_err(anyhow::Error::from)
         }
-        other => {
-            anyhow::bail!(
-                "[Resilience] Unknown transport: '{}'. Use dbus / unix:<path> / tcp:<addr>",
-                other
+        other => Err(anyhow::anyhow!(
+            "Unknown transport '{}' (use dbus / unix:<path> / tcp:<addr>)",
+            other
+        )),
+    };
+
+    let (cmd_rx, resp_tx, _handle) = match spawn_result {
+        Ok(triple) => triple,
+        Err(e) => {
+            eprintln!(
+                "[Resilience] Manager unreachable ({}), running without resilience.",
+                e
             );
+            return Ok(None);
         }
     };
 
