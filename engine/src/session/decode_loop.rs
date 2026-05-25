@@ -9,12 +9,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crate::resilience::KVSnapshot;
+
 use super::defaults::{
-    GreedySampler, NoOpCommandSource, NoOpEvictionStage, NoOpObserver, NoOpSwapStage,
+    GreedySampler, NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver,
+    NoOpSwapStage, NoOpTokenTickSink,
 };
 use super::traits::{
-    CommandSource, DecodeObserver, DecodeResult, EvictionOutcome, EvictionStage, Forward, StepCtx,
-    StopReason, SwapStage, TokenSampler,
+    CommandSource, DecodeObserver, DecodeResult, EngineReport, EvictionOutcome, EvictionStage,
+    Forward, StepCtx, StopReason, SwapStage, TokenSampler, TokenTickSink,
 };
 
 /// Typestate marker — Forward not yet supplied. `.build()` is unavailable.
@@ -31,6 +34,10 @@ pub struct DecodeLoop {
     cmd_source: Box<dyn CommandSource>,
     sampler: Box<dyn TokenSampler>,
     observers: Vec<Box<dyn DecodeObserver>>,
+    // P3에서 실제 보고 구현체 주입 시 사용. 현재는 no-op default만 주입.
+    #[allow(dead_code)]
+    report: Box<dyn EngineReport>,
+    tick_sink: Box<dyn TokenTickSink>,
     stop_flag: Arc<AtomicBool>,
     pos: usize,
     decode_step: usize,
@@ -90,6 +97,19 @@ impl DecodeLoop {
         Ok(logits)
     }
 
+    /// Build a minimal KVSnapshot from current loop state.
+    fn build_kv_snapshot(&self) -> KVSnapshot {
+        KVSnapshot {
+            total_tokens: self.pos,
+            capacity: self.kv_capacity,
+            total_bytes: 0, // P3에서 진짜 값 주입
+            protected_prefix: 0,
+            kv_dtype: String::new(),
+            eviction_policy: String::new(),
+            skip_ratio: 0.0,
+        }
+    }
+
     /// Run up to `budget` decode steps starting from `first_token` (the token
     /// already sampled from `prefill`'s last logits). Returns sampled tokens
     /// (does **not** include `first_token`) + reason loop exited. Caller is
@@ -118,8 +138,15 @@ impl DecodeLoop {
                 self.decode_step,
                 &stop,
             );
-            let _cmd = self.cmd_source.poll(&ctx)?;
-            // Command dispatch is Phase 4-3+; we accept and drop for now.
+            let kv_snap = self.build_kv_snapshot();
+            let plan = self.cmd_source.poll(&ctx, &kv_snap)?;
+            if plan.suspended {
+                stopped_by = StopReason::CommandRequested;
+                break;
+            }
+            if plan.throttle_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
+            }
 
             // (b) eviction
             let ctx = step_ctx(
@@ -191,6 +218,16 @@ impl DecodeLoop {
             // 것과 동치.
             self.sampler.observe_token(sampled);
 
+            // (f2) tick sink — sampler 호출 후, observer 이전
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &stop,
+            );
+            self.tick_sink.on_token_generated(&ctx);
+
             // (g) observers
             let ctx = step_ctx(
                 self.pos,
@@ -254,7 +291,15 @@ impl DecodeLoop {
                 self.decode_step,
                 &atomic_stop,
             );
-            let _cmd = self.cmd_source.poll(&ctx)?;
+            let kv_snap = self.build_kv_snapshot();
+            let plan = self.cmd_source.poll(&ctx, &kv_snap)?;
+            if plan.suspended {
+                stopped_by = StopReason::CommandRequested;
+                break;
+            }
+            if plan.throttle_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
+            }
 
             // (b) eviction
             let ctx = step_ctx(
@@ -323,6 +368,16 @@ impl DecodeLoop {
             let sampled = self.sampler.sample(&ctx, &logits);
             self.sampler.observe_token(sampled);
 
+            // (f2) tick sink — sampler 호출 후, observer 이전
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                &atomic_stop,
+            );
+            self.tick_sink.on_token_generated(&ctx);
+
             // (g) observers
             let ctx = step_ctx(
                 self.pos,
@@ -390,6 +445,8 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     cmd_source: Option<Box<dyn CommandSource>>,
     sampler: Option<Box<dyn TokenSampler>>,
     observers: Vec<Box<dyn DecodeObserver>>,
+    report: Option<Box<dyn EngineReport>>,
+    tick_sink: Option<Box<dyn TokenTickSink>>,
     stop_flag: Option<Arc<AtomicBool>>,
     kv_capacity: usize,
 }
@@ -410,6 +467,8 @@ impl DecodeLoopBuilder<NoForward> {
             cmd_source: None,
             sampler: None,
             observers: Vec::new(),
+            report: None,
+            tick_sink: None,
             stop_flag: None,
             kv_capacity: 0,
         }
@@ -424,6 +483,8 @@ impl DecodeLoopBuilder<NoForward> {
             cmd_source: self.cmd_source,
             sampler: self.sampler,
             observers: self.observers,
+            report: self.report,
+            tick_sink: self.tick_sink,
             stop_flag: self.stop_flag,
             kv_capacity: self.kv_capacity,
         }
@@ -460,6 +521,14 @@ impl<F> DecodeLoopBuilder<F> {
         self.kv_capacity = c;
         self
     }
+    pub fn with_engine_report<T: EngineReport + 'static>(mut self, r: T) -> Self {
+        self.report = Some(Box::new(r));
+        self
+    }
+    pub fn with_tick_sink<T: TokenTickSink + 'static>(mut self, t: T) -> Self {
+        self.tick_sink = Some(Box::new(t));
+        self
+    }
 }
 
 impl DecodeLoopBuilder<HasForward> {
@@ -479,6 +548,10 @@ impl DecodeLoopBuilder<HasForward> {
             } else {
                 self.observers
             },
+            report: self.report.unwrap_or_else(|| Box::new(NoOpEngineReport)),
+            tick_sink: self
+                .tick_sink
+                .unwrap_or_else(|| Box::new(NoOpTokenTickSink)),
             stop_flag: self
                 .stop_flag
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),

@@ -22,10 +22,12 @@ pub mod warmup;
 pub use assembly::{build_standard_loop, is_standard_happy_path};
 pub use decode_loop::{DecodeLoop, DecodeLoopBuilder, HasForward, NoForward};
 pub use defaults::{
-    GreedySampler, NoOpCommandSource, NoOpEvictionStage, NoOpObserver, NoOpSwapStage,
+    GreedySampler, NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver,
+    NoOpSwapStage, NoOpTokenTickSink,
 };
 pub use samplers::RepetitionPenaltySampler;
 pub use traits::{
-    CommandSource, DecodeObserver, DecodeResult, EvictionOutcome, EvictionStage, Forward,
-    SkipReason, StepCtx, StopReason, SwapStage, TokenSampler,
+    CommandSource, DecodeObserver, DecodeResult, EngineReport, EvictionOutcome, EvictionStage,
+    Forward, ResilienceBundle, SkipReason, StepCtx, StopReason, SwapStage, TokenSampler,
+    TokenTickSink,
 };

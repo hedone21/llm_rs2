@@ -1,8 +1,189 @@
 # Inference Pipeline — DecodeLoop SOLID 분해 + 빌더 설계
 
-> spec/01-architecture.md §3.8 (SYS-100, SYS-105) + `INV-LAYER-005/006/007`의 구현 설계. `bin/generate.rs` 13,017 LOC 중 `main()` 7,051 LOC을 6개 trait 추상화 + typestate builder로 분해한다. 본 문서는 코드가 없는 단계(Migration Step 2-2 이전)의 **설계 결정 단일 진실 원본**이다.
+> spec/01-architecture.md §3.8 (SYS-100, SYS-105) + `INV-LAYER-005/006/007`의 구현 설계. legacy `bin/generate.rs` 13,017 LOC 중 `main()` 7,051 LOC을 6개 trait 추상화 + typestate builder로 분해하기 위한 설계. **본 문서는 2026-05-16 finalize 시점 설계 단일 진실 원본**이며 일부 단계는 이미 구현 완료되었다.
 
-본 문서의 trait API와 빌더 시그니처는 Migration Step 2-2에서 `engine/src/session/decode_loop.rs`로 1:1 이식되어야 한다. 시그니처 변경은 본 문서의 갱신을 동반한다.
+본 문서의 trait API와 빌더 시그니처는 `engine/src/session/decode_loop.rs` + `engine/src/session/traits.rs` + `engine/src/session/defaults.rs` 로 이식 완료되었다 (Phase 4-2 HEAD `584496b7`). 시그니처 변경은 본 문서의 갱신을 동반한다.
+
+## 컴포넌트 — `session/` 디렉토리 (Post Phase 4-2/4-3/4-4-2.3, 2026-05-25 실측)
+
+```mermaid
+flowchart TB
+    subgraph Bin ["L5 bin/"]
+        argus[argus_cli]
+        legacy[legacy/generate.rs<br/>monolith]
+    end
+
+    subgraph Sess ["L4 session/"]
+        init[init::SessionInitCtx]
+        std[standard_happy::<br/>run_standard_happy_path]
+        asm[assembly::build_standard_loop]
+        loop[decode_loop::<br/>DecodeLoop + Builder]
+        tr[traits::*<br/>6 trait]
+        def[defaults::*<br/>NoOp + Greedy]
+        sa[samplers::<br/>RepetitionPenalty]
+        fwd[forward/<br/>model / kivi / offload]
+        prefill[prefill::*<br/>chunked, CommandExecutor poll]
+        chat[chat/<br/>repl + session + stop_condition]
+        chatipc[chat_ipc]
+        chattmp[chat_template]
+        eval[eval/<br/>hook + runner + eviction/kivi]
+        batch[batch/<br/>args + runner + helpers]
+        ppl[ppl/<br/>args + runner]
+        decfb[decode_fallback/<br/>prologue + eviction_trigger + swap_dispatch]
+        cli[cli/<br/>Args + KvMode + eviction]
+        warm[warmup]
+        qcfrt[qcf_runtime]
+        dump[dump_importance]
+    end
+
+    argus --> init
+    argus --> std
+    std --> asm
+    asm --> loop
+    loop --> tr
+    tr -. impl .- fwd
+    tr -. default .- def
+
+    legacy --> init
+    legacy --> prefill
+    legacy --> chat
+    legacy --> eval
+    legacy --> batch
+    legacy --> ppl
+    legacy --> decfb
+    legacy --> qcfrt
+    legacy --> dump
+    legacy --> chat
+    chat --> chatipc
+    chat --> chattmp
+    chat --> loop
+
+    style argus fill:#2d5a3d
+    style legacy fill:#5a3d2d
+    style loop fill:#3d2d5a
+    style tr fill:#3d2d5a
+```
+
+**파일 단위 진실원본**: `git ls-files engine/src/session/ | sort` 결과와 본 다이어그램이 1:1 매칭되어야 한다. drift 발견 시 본 절을 우선 갱신.
+
+## 진행 현황 요약 (2026-05-25 시점)
+
+| Phase | 상태 | HEAD | 비고 |
+|-------|------|------|------|
+| Phase 4-1 외곽 추출 (`SessionInitCtx`) | **DONE** | `f637722e` | main() 7,051 → 6,122 LOC. S25 OpenCL + Jetson CUDA 32-token bit-identical PASS. |
+| Phase 4-2 trait + Builder + defaults | **DONE** | `584496b7` | +929 LOC. trybuild + spec test PASS. legacy generate.rs 변경 0. |
+| Phase 4-3 `ModelForward` + probe microbench | **DONE** | `c63190d1` | S25 Δ=2.29%, host CPU Qwen2.5-1.5B Q4_0 Δ=1.53%. 게이트 5% 절반 이내. |
+| Phase 4-4-2.3 a/c/b — prologue/eviction/swap 추출 | **DONE** | `9313670b` + `bcb221e2` + `02cb7106` | `decode_fallback/{prologue,eviction_trigger,swap_dispatch}.rs` 신설. generate.rs 5,778 → 4,953 (-14.3%). |
+| Phase 4-4-2.3 d/e + 4-4-2.4 (main ≤400 LOC) | **CANCELED** | — | 방향 전환: legacy generate.rs 보존 + 다수 바이너리 분할 ([[generate-split-binaries]] backlog [P2]). |
+| Phase 4-5 chat REPL 재작성 | **PARTIAL DONE** | (다수) | `session/chat/{repl,session,stop_condition}.rs` 신설. `core/chat_ipc.rs` → `session/chat_ipc.rs` 이관. `KiviForward`/`OffloadForward` 스텁 존재. |
+
+### argus-cli 신규 진입점 (Phase 4-4 후속, 2026-05-25)
+
+Phase 4-4-2.4 취소 결정의 결과로 새 진입점 `engine/src/bin/argus_cli.rs` 가 도입되었다. 진행 sub-sprint:
+- **v1-1 RESOLVED** (HEAD `83d7cb4a`): resilience default-on (`--no-resilience` opt-out).
+- **v1-2 pending**: `--prompt-batch` (`session::batch`).
+- **v1-3 pending**: weight swap 8종 (`session::decode_fallback::swap_dispatch`).
+- **v1-4 pending**: `--profile` / `--profile-events`.
+- **v1-5 pending**: KIVI / Offload `--kv-mode`.
+- **v1-6 pending**: `--tensor-partition > 0`.
+
+argus-cli 는 현재 happy path (= `is_standard_happy_path(&args)`) 만 흡수하고 나머지를 `reject_unsupported_modes_v0()` 에서 명시적 차단. legacy generate 와 argus-cli 의 진입점 이분화는 ARCHITECTURE.md §Engine Architecture 참조.
+
+## 두 진입점의 inference 시퀀스 (실측 코드 반영)
+
+### argus-cli (happy path)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cli as argus_cli::main
+    participant Init as SessionInitCtx
+    participant Std as run_standard_happy_path
+    participant Asm as assembly::build_standard_loop
+    participant Loop as DecodeLoop
+    participant Fwd as ModelForward
+    Cli->>Cli: Args::parse() + reject_unsupported_modes_v0
+    Cli->>Init: build(&args)
+    Init-->>Cli: SessionInitCtx
+    Cli->>Std: StandardHappyCtx { ... }
+    Std->>Asm: build_standard_loop(backend, memory, model, ...)
+    Asm-->>Std: DecodeLoop (Box<dyn Forward=ModelForward> + defaults)
+    Std->>Loop: prefill(tokens)
+    Loop->>Fwd: prefill(tokens, start_pos=0)
+    Fwd-->>Loop: last_logits
+    Std->>Std: first_token = sampling::sample(...)
+    Std->>Loop: run(budget, first_token)
+    loop step
+        Loop->>Loop: poll → drop (drift)
+        Loop->>Loop: eviction.before_step → None
+        Loop->>Loop: swap.before_step → ()
+        Loop->>Fwd: step(ctx, prev)
+        Fwd-->>Loop: logits
+        Loop->>Loop: swap.after_step → ()
+        Loop->>Loop: sampler.sample → tok
+        Loop->>Loop: observers.on_step_end
+    end
+    Loop->>Fwd: finalize
+    Loop-->>Std: DecodeResult
+    Std->>Cli: tokenizer.decode + TBT 출력
+```
+
+### legacy generate (full feature path)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Bin as legacy/generate
+    participant Init as SessionInitCtx
+    participant Exec as CommandExecutor
+    participant Mgr as Manager IPC
+    participant Pf as session::prefill
+    participant Model as TransformerModel
+    participant CM as CacheManager
+    participant Sw as SwapExecutor
+    Bin->>Init: build(&args)
+    Bin->>Exec: CommandExecutor::new(transport, schedule?)
+    Bin->>Mgr: send_capability(EngineCapability)
+    Bin->>Pf: chunked_prefill_with_command_executor(...)
+    Pf->>Exec: poll() between chunks
+    Pf->>Model: forward(prefill chunk, kv_caches)
+    Pf-->>Bin: prefill done
+    loop decode tokens (inline)
+        Bin->>Exec: poll() → ExecutionPlan
+        opt swap_weights
+            Bin->>Sw: WeightSwapDecider + SwapExecutor
+        end
+        opt evict / switch_device / partition_ratio / throttle / suspend
+            Bin->>CM: force_evict / switch / sleep / break
+        end
+        Bin->>Model: forward_into(token, start_pos)
+        Bin->>Bin: sample → token id
+        Bin->>Exec: on_token_generated(...)
+        opt request_qcf
+            Bin->>Mgr: send_qcf_estimate
+        end
+        Bin->>Mgr: heartbeat (EngineStatus)
+    end
+```
+
+## Manager IPC wiring 격차 (Drift, follow-up 필요)
+
+본 절은 *의도된 설계와 현재 코드 사이의 격차* 를 명시한다.
+
+| 책임 | 의도된 설계 | 현재 코드 상태 |
+|------|-------------|----------------|
+| `CommandSource` slot | `ManagerCmdSource: CommandSource` 등록 (§8.1 매트릭스) | trait 슬롯 존재. `NoOpCommandSource` 만 default. `ManagerCmdSource` 구현체 0 LOC. |
+| `cmd_source.poll()` 결과 소비 | `DecodeLoop::handle_command(cmd)` 가 ExecutionPlan 을 dispatch | `decode_loop.rs:121~122`: `let _cmd = self.cmd_source.poll(&ctx)?; // Command dispatch is Phase 4-3+; we accept and drop for now.` |
+| ExecutionPlan 적용 (Throttle / Suspend / Evict / SwitchHw / SwapWeights / LayerSkip / PartitionRatio / SetTargetTbt) | DecodeLoop / forward stage / eviction stage / swap stage 협업 | **0 LOC in argus-cli path** — legacy generate.rs:2267 / 4277 / 4846 에서만 수행 |
+| Outbound: capability / heartbeat / qcf estimate / weight swap report / on_token_generated | `OutboundSink` 또는 `DecodeObserver` 어댑터 | legacy 만 수행. DecodeLoop 외곽 hook 없음. |
+
+**해소 후보 sprint**:
+1. `session::command::manager_cmd_source.rs` 신설 — `Arc<Mutex<CommandExecutor>>` wrap.
+2. `DecodeLoop::handle_command(EngineCommand)` 본문 구현 — eviction stage / swap stage / forward stage 로 dispatch.
+3. `session::observer::manager_outbound_obs.rs` — `DecodeObserver` impl 로 capability + heartbeat + qcf 발신.
+4. `argus-cli` v1-3 (weight swap) / v1-4 (profile) 흡수와 묶음 가능.
+
+본 격차는 Phase 4-4-2.4 취소 결정 이전 가정 (= legacy generate ≤ 400 LOC 압축 후 모든 IPC 가 DecodeLoop 안으로 흡수) 의 부산물이다. 다수 바이너리 분할 방향으로 전환된 만큼, argus-cli 외 별 바이너리 (argus-chat / argus-bench / argus-eval) 도입 시 본 wiring 을 어디서 어떻게 공유할지 별 sprint 라운드 필요.
 
 ---
 
@@ -348,30 +529,87 @@ impl DecodeLoopBuilder<HasForward> {
 }
 ```
 
-### 4.3 사용 예시 — production decode (`generate.rs::main()`)
+### 4.3 사용 예시 — argus-cli happy path (실측 코드 반영, 2026-05-25)
+
+> **주의**: 본 예시는 `bin/argus_cli.rs::main` + `session::standard_happy::run_standard_happy_path` + `session::assembly::build_standard_loop` 의 **현 실제 코드** 를 압축한 것이다. Phase 4-4-2.4 (legacy main ≤400 LOC 통합) 가 CANCELED 되면서 빌더 호출 site 가 단일 통합 `main()` 이 아닌 `run_standard_happy_path` 안으로 이동했다. swap/cmd_source/multi-observer 등은 v1-2 ~ v1-6 sub-sprint 에서 추가 예정 (Manager IPC wiring 격차 절 참조).
+
+`bin/argus_cli.rs::main` 진입 흐름 (압축):
 
 ```rust
-fn run_production(args: &Args, ctx: SessionInitCtx) -> anyhow::Result<()> {
-    let loop_ = DecodeLoopBuilder::new()
-        .with_forward(ModelForward::from_init(ctx.backend, ctx.model, ctx.kv_caches, ctx.workspace)?)
-        .with_eviction(CacheManagerStage::new(ctx.cache_manager, ctx.score_accumulator, ctx.skip_config))
-        .with_swap(build_swap_stage(args)?)             // sync / async / phase / probing
-        .with_cmd_source(ManagerCmdSource::connect(args.manager_socket.as_deref())?)
-        .with_sampler(SamplingConfig::from(args).into_sampler())
-        .add_observer(ProfilerObs::new(args.profile))
-        .add_observer(ExperimentWriterObs::open(&args.experiment_out)?)
-        .add_observer(TbtLogObs::open(&args.tbt_log)?)
-        .with_stop_flag(install_sigint_handler())
-        .build();
+fn main() -> anyhow::Result<()> {
+    env_logger::init();
+    let mut args = Args::parse();
+    args.enable_resilience = !args.no_resilience;     // v1-1: default-on
+    reject_unsupported_modes_v0(&args)?;              // v0 미구현 모드 명시 차단
 
-    let mut loop_ = loop_;
-    let _ = loop_.prefill(&prompt_tokens)?;
-    let result = loop_.run(args.max_new_tokens)?;
-    loop_.finalize()?;
-    println!("{}", decode_to_string(&result.tokens));
+    let ctx = SessionInitCtx::build(&args)?;          // backend / memory / model / sampling_config 일괄 초기화
+    let tokenizer = Tokenizer::from_file(&resolve_tokenizer_path(&args, &ctx.model_path, ctx.is_gguf))?;
+    check_vocab_compatibility(&tokenizer, &ctx.model, &tokenizer_path)?;
+    let tokens: Vec<u32> = tokenizer.encode(args.prompt.as_str(), true)?.get_ids().to_vec();
+
+    let kv_caches = alloc_standard_kv_caches(/* HeadMajor F32/F16/Q4_0 num_layers개 */)?;
+    if !is_standard_happy_path(&args) { bail!("argus-cli v0: not yet supported"); }
+
+    run_standard_happy_path(StandardHappyCtx {
+        args, backend: ctx.backend, memory: ctx.memory, cpu_backend_arc: ctx.cpu_backend_arc,
+        model: ctx.model, tokenizer, kv_caches, tokens,
+        initial_kv_capacity, max_seq_len, kv_type, sampling_config: ctx.sampling_config, vocab_size,
+    })
+}
+```
+
+`run_standard_happy_path` 내부 — `build_standard_loop` 가 [`DecodeLoop`] 을 조립하고, prefill → first_token sampling → run 순서로 호출:
+
+```rust
+pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
+    let StandardHappyCtx { args, backend, memory, cpu_backend_arc, model,
+                            tokenizer, kv_caches, tokens, initial_kv_capacity,
+                            max_seq_len, kv_type, sampling_config, vocab_size } = ctx;
+
+    drop(kv_caches);                                  // build_standard_loop가 자체 alloc
+
+    let mut decode_loop = build_standard_loop(
+        backend, memory, cpu_backend_arc, model,
+        initial_kv_capacity, max_seq_len, kv_type,
+        sampling_config.clone(), !args.no_gpu_plan,
+    )?;
+    let mut last_logits = decode_loop.prefill(&tokens)?;
+
+    // Phase 4-4.7: production fallback과 동치 — repetition penalty가 prompt suffix에 적용됨
+    let first_token = sampling::sample(&mut last_logits, &tokens, vocab_size, &sampling_config, None);
+    let result = decode_loop.run(args.num_tokens - 1, first_token)?;
+
+    let mut final_tokens = tokens.clone();
+    final_tokens.push(first_token);
+    final_tokens.extend_from_slice(&result.tokens_generated);
+    println!("{}", tokenizer.decode(&final_tokens, true)?);
     Ok(())
 }
 ```
+
+`build_standard_loop` (in `session/assembly/build_standard_loop.rs`) — 빌더 typestate 적용 site:
+
+```rust
+pub fn build_standard_loop(/* unpack-args */) -> Result<DecodeLoop> {
+    let kv = alloc_standard_kv_caches(&model, backend.clone(), memory.clone(), ...)?;
+    let mf = ModelForward::new(backend, memory, cpu_backend, Arc::new(model), kv,
+                                max_seq_len, plan_enabled)?;
+
+    // Phase 4-4.7: sampler 자동 선택. temperature==0 && repetition_penalty==1.0이면
+    // GreedySampler == sampling::sample 결과. 그 외는 RepetitionPenaltySampler.
+    let use_stateful =
+        sampling_config.repetition_penalty != 1.0 || sampling_config.temperature != 0.0;
+    let builder = DecodeLoopBuilder::new().with_forward(mf);   // NoForward → HasForward
+    let builder = if use_stateful {
+        builder.with_sampler(RepetitionPenaltySampler::new(sampling_config, vocab_size))
+    } else {
+        builder.with_sampler(GreedySampler)
+    };
+    Ok(builder.build())                               // eviction/swap/cmd_source/observer = defaults (No-op)
+}
+```
+
+> **legacy generate path 는 별 빌더 site 없이 살아있다**. `engine/legacy/generate.rs::main()` 은 본 빌더를 거치지 않고 prefill/decode 를 inline 으로 수행하며 `CommandExecutor` 를 직접 보유한다. argus-cli v1-2 ~ v1-6 sub-sprint 가 legacy 의 prompt-batch / swap / profile / KIVI / Offload / tensor-partition 모드를 점진 흡수하면서 빌더 호출 site 가 분기별로 늘어날 예정 (다수 바이너리 분할 방향, [[generate-split-binaries]]).
 
 ### 4.4 typestate vs runtime check — 결정 근거
 
@@ -390,63 +628,57 @@ fn run_production(args: &Args, ctx: SessionInitCtx) -> anyhow::Result<()> {
 
 ---
 
-## 5. `main()` 조립자 변환 예시 (~80 LOC)
+## 5. 진입점 조립자 — 실측 코드 (2026-05-25)
 
-현 `main()` 7,051 LOC은 Migration Step 2-4 후 다음 4단계로 압축된다.
+> **History**: 본 절은 원래 *legacy main() 7,051 LOC → ≤400 LOC 압축 변환 예시* 였다. Phase 4-4-2.4 CANCELED 결정 (2026-05-21, [[generate-split-binaries]]) 이후 단일 통합 main() 모델이 폐기되고 **다수 바이너리 분할 + argus-cli 신규 진입점** 으로 방향이 바뀌어, 예시 코드를 실측 코드 기반으로 교체했다.
+
+현재 빌더 사용 site 는 한 곳뿐이다 — `session::assembly::build_standard_loop`. argus-cli happy path (§4.3 참조) 가 이 빌더를 호출한다. v1-2 ~ v1-6 sub-sprint 에서 새 진입점 (argus-chat / argus-bench / argus-eval 가능성) 마다 자신의 build_*_loop 헬퍼를 추가하는 것이 자연 확장 패턴.
+
+### 5.1 빌더 호출 site 의 현재 모양
 
 ```rust
-fn main() -> anyhow::Result<()> {
-    // ─── Stage 1: CLI parse + log init ──────────────────────────
-    let args = Args::parse();
-    init_logging(&args)?;
-    if args.dump_config { return dump_cli_and_exit(&args); }
+// engine/src/session/assembly/build_standard_loop.rs (실측 압축)
+pub fn build_standard_loop(
+    backend: Arc<dyn Backend>, memory: Arc<dyn Memory>, cpu_backend: Arc<dyn Backend>,
+    model: TransformerModel, initial_kv_capacity: usize, max_seq_len: usize,
+    kv_dtype: DType, sampling_config: SamplingConfig, plan_enabled: bool,
+) -> Result<DecodeLoop> {
+    let kv = alloc_standard_kv_caches(&model, backend.clone(), memory.clone(), ...)?;
+    let mf = ModelForward::new(backend, memory, cpu_backend, Arc::new(model), kv,
+                                max_seq_len, plan_enabled)?;
+    let use_stateful =
+        sampling_config.repetition_penalty != 1.0 || sampling_config.temperature != 0.0;
 
-    // ─── Stage 2: backend + model + ctx init (session::init 헬퍼) ──
-    let mut ctx = SessionInitCtx::build(&args)?;  // backend, model, kv_caches, workspace, cache_manager
-                                                  // tokenizer, sampling_cfg, score_accumulator,
-                                                  // manager_client (option), experiment_schedule (option)
-                                                  // 모두 여기서 owned로 묶임
-
-    // ─── Stage 3: DecodeLoop 조립 (chat / generate / kivi / offload 분기) ──
-    let mut loop_ = match (args.chat, args.use_kivi, args.offload_path.is_some()) {
-        (false, false, false) => build_standard_loop(&args, &mut ctx)?,
-        (false, true,  false) => build_kivi_loop(&args, &mut ctx)?,
-        (false, false, true ) => build_offload_loop(&args, &mut ctx)?,
-        (true,  _,     _    ) => return run_chat_repl_v2(&args, ctx),    // chat REPL은 §10 위험 분석 참조
-        _ => anyhow::bail!("incompatible mode combination"),
+    let builder = DecodeLoopBuilder::new().with_forward(mf);   // 필수 — NoForward → HasForward
+    let builder = if use_stateful {
+        builder.with_sampler(RepetitionPenaltySampler::new(sampling_config, vocab_size))
+    } else {
+        builder.with_sampler(GreedySampler)                    // happy path 의 default
     };
-
-    // ─── Stage 4: prefill + decode + finalize ────────────────────
-    let prompt_tokens = ctx.tokenizer.encode_prompt(&args.prompt, &args)?;
-    let _ = loop_.prefill(&prompt_tokens)?;
-
-    let stopped = loop_.run(args.max_new_tokens)?;
-    loop_.finalize()?;
-
-    print_result(&ctx.tokenizer, &stopped);
-    Ok(())
-}
-
-fn build_standard_loop(args: &Args, ctx: &mut SessionInitCtx) -> anyhow::Result<DecodeLoop> {
-    let mut b = DecodeLoopBuilder::new()
-        .with_forward(ModelForward::from_ctx(ctx)?)
-        .with_eviction(CacheManagerStage::from_ctx(ctx))
-        .with_sampler(ctx.sampling_cfg.clone().into_sampler())
-        .with_stop_flag(install_sigint_handler());
-
-    if let Some(swap) = build_swap_stage(args, ctx)? { b = b.with_swap(swap); }
-    if let Some(src) = build_command_source(args, ctx)? { b = b.with_cmd_source(src); }
-
-    if let Some(p) = ProfilerObs::maybe(args)? { b = b.add_observer(p); }
-    if let Some(w) = ExperimentWriterObs::maybe(args)? { b = b.add_observer(w); }
-    if let Some(t) = TbtLogObs::maybe(args)? { b = b.add_observer(t); }
-    if let Some(s) = SystemSamplerObs::maybe(args)? { b = b.add_observer(s); }
-
-    Ok(b.build())
+    Ok(builder.build())                                        // eviction/swap/cmd_source/observer = defaults
 }
 ```
 
-이 변환 후 `main()` 본체 + 4개 `build_*_loop` 헬퍼 합계 < 400 LOC 목표. 나머지 코드는 `session::init`(SessionInitCtx 빌드), `session::forward::ModelForward`, `session::eviction::CacheManagerStage` 등 **L4 `session/` 내부 sub-module**에 분배된다 — concrete forward/eviction/swap stage 구현체는 모두 `session/`이 직접 owner이며 L3 도메인의 trait/struct를 builder가 주입받아 보유한다. INV-LAYER-006(L4 struct 필드 = trait object/generic만) 준수.
+### 5.2 신규 진입점 도입 시 확장 매트릭스 (예고)
+
+v1 sub-sprint 별 추가될 slot. 각 v1 작업은 builder 한 site 에 한두 `.with_*()` 호출을 추가한다.
+
+| sub-sprint | 추가 slot | 후보 구현체 위치 |
+|------------|-----------|------------------|
+| v1-2 prompt-batch | (sampling 변형은 builder 외) | `session/batch/runner.rs` 가 build_*_loop 호출자만 분기 |
+| v1-3 weight swap | `.with_swap(SyncSwapStage / AsyncSwapStage / PhaseAwareSwapStage / ...)` | `session/decode_fallback/swap_dispatch.rs` + `session/swap/*` (TBD) |
+| v1-4 profile | `.add_observer(ProfilerObs::maybe(args)?)` | `session/observer/profiler_obs.rs` (신규) |
+| v1-5 KIVI / Offload | `with_forward(KiviForward / OffloadForward)` 대신 분기 | `session/forward/{kivi_forward, offload_forward}.rs` (스텁 존재) |
+| v1-6 tensor-partition | (forward 내부 plan 분기) | `session/forward/model_forward.rs` (기존 hot path 확장) |
+| Manager IPC wiring | `.with_cmd_source(ManagerCmdSource)` + `.add_observer(ManagerOutboundObs)` | `session/command/manager_cmd_source.rs`, `session/observer/manager_outbound_obs.rs` (둘 다 신규 — Manager IPC 격차 참조) |
+
+### 5.3 legacy generate 는 빌더를 우회한다
+
+`engine/legacy/generate.rs::main()` 은 본 빌더를 호출하지 않고 prefill/decode 를 inline 으로 수행한다. legacy 는 모든 production 모드 (chat/experiment/ppl/eval/dump/prompt-batch/swap/profile/KIVI/tensor-partition) 를 유지하며, sub-sprint 가 흡수 완료 후에도 보존되는 방향으로 정해졌다. INV-LAYER-006 (L4 struct 필드 = trait object/generic 만) 준수 책임은 *DecodeLoop 를 사용하는 새 진입점들 (`argus_cli` + 향후 argus-chat 등)* 에 한정된다.
+
+### 5.4 SessionInitCtx 의 책임 경계
+
+`session::init::SessionInitCtx::build(&args)` 는 **모든 진입점이 공유** 한다. backend / memory / model / cpu_backend / sampling_config / swap_algorithm / importance_formula / model_path / is_gpu / weights_on_gpu 를 일괄 초기화한다. 즉 진입점이 추가될 때마다 reinitialize 하지 않고 build_*_loop 만 다양화한다 — INV-LAYER-005 (L4 가 L3 양 도메인을 합법적으로 import) 의 자연 구현.
 
 ---
 
@@ -636,32 +868,42 @@ monomorphize 안:
 
 `ARCHITECTURE.md` §13.7 Step 2와 1:1 정합. 본 절은 산출물 + 검증 게이트만 상세화.
 
-### Phase 4-1 (= Step 2-1) 외곽 추출
-- **산출물**: `session/init.rs` (SessionInitCtx + `build()` 헬퍼), `session/cli_dump.rs` (dump_cli_and_exit). `main()` 7,051 → ~6,500 LOC.
-- **검증 게이트**: `cargo test --workspace` PASS + S25/Jetson e2e 생성 동치 (greedy seed 동일 토큰).
+### Phase 4-1 (= Step 2-1) 외곽 추출 — **DONE** HEAD `f637722e`
+- **산출물**: `session/init.rs` (SessionInitCtx + `build()` 헬퍼), `session/cli/` (Args + dump). `main()` 7,051 → 6,122 LOC (실측).
+- **검증 게이트**: `cargo test --workspace` PASS + S25/Jetson e2e 생성 동치 (greedy seed 동일 토큰). 둘 다 PASS.
 - **위험**: 거의 없음 — 순수 함수 이동.
 
-### Phase 4-2 (= Step 2-2) trait 정의 + 빌더
+### Phase 4-2 (= Step 2-2) trait 정의 + 빌더 — **DONE** HEAD `584496b7`
 - **산출물**:
-  - `session/traits.rs` — 6 trait 정의 (`Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver`) + `StepCtx` / `DecodeResult` / `StopReason` / `EvictionOutcome`. 사용자 결정 #1: 모두 `session/`. `Forward::finalize`/`on_kv_prune`은 default no-op (결정 #2).
-  - `session/decode_loop.rs` — `DecodeLoop` struct + `DecodeLoopBuilder` (typestate).
-  - `session/defaults.rs` — 5개 no-op default (`NoEvictionStage`/`NoSwapStage`/`NoCommandSource`/`NoOpObserver`/`GreedySampler`).
-  - `session/observer/mod.rs` — `DecodeObserver` re-export.
+  - `session/traits.rs` — 6 trait 정의 (`Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver`) + `StepCtx` / `DecodeResult` / `StopReason` / `EvictionOutcome` / `SkipReason`. 사용자 결정 #1 적용: 모두 `session/`. `Forward::finalize`/`on_kv_prune`은 default no-op (결정 #2). 추가로 `Forward::reset_kv`, `Forward::try_evict` default no-op 도입 (Phase 4-5-d/e 흡수).
+  - `session/decode_loop.rs` — `DecodeLoop` struct + `DecodeLoopBuilder` (typestate) + `NoForward`/`HasForward` marker.
+  - `session/defaults.rs` — 5개 no-op default (`NoOpEvictionStage`/`NoOpSwapStage`/`NoOpCommandSource`/`NoOpObserver`/`GreedySampler`).
+  - `session/samplers/` — `RepetitionPenaltySampler` 등.
   - `session/mod.rs` — module root + `pub use` re-export로 외부 `use llm_rs2::session::*` 1줄 진입.
-- **검증 게이트**: `cargo build` PASS, `engine/tests/spec/test_inv_layer_007.rs` (trybuild typestate negative test + lifecycle hook default 검증) PASS, `layer_lint` baseline 그대로(31건 동결, 신규 trait 정의가 새 위반 야기하지 않음을 확인).
-- **위험**: trait 시그니처 동결 — 추후 변경이 어렵다. 본 단계 PR 리뷰에 architect/senior implementer 양측 sign-off 필수.
+- **검증 게이트**: `cargo build` PASS, `engine/tests/spec/test_inv_layer_007.rs` (trybuild typestate negative test + lifecycle hook default 검증) PASS, `layer_lint` baseline 동결.
+- **위험**: trait 시그니처 동결 — 추후 변경이 어렵다. 본 단계 PR 리뷰에 architect/senior implementer 양측 sign-off 완료.
 
-### Phase 4-3 (= Step 2-3) 첫 구현체 (`ModelForward`)
-- **산출물**: `session/forward/model_forward.rs`, `bin/probe_inference_loop.rs` (microbench binary).
-- **검증 게이트**: probe binary가 S25 + Jetson + host CPU에서 기존 `generate` 대비 동일 TBT 대역(±5%) + same first 32 tokens. Vtable overhead 측정 게이트(§7) 통과.
-- **위험**: vtable cost 회귀. 회귀 ≥ 5% 시 §7.3 escape hatch (partial monomorphization) 검토.
+### Phase 4-3 (= Step 2-3) 첫 구현체 (`ModelForward`) — **DONE** HEAD `c63190d1`
+- **산출물**: `session/forward/model_forward.rs` (`ModelForward`), `session/assembly/build_standard_loop.rs` (표준 조립). probe microbench 별도.
+- **검증 게이트 결과**: host CPU Qwen2.5-1.5B Q4_0 **Δ=1.53%**, S25 Adreno OpenCL gen=32 runs=5 **Δ=2.29%** — 둘 다 bit-identical, 게이트 5% 절반 이내 → §7.3 escape hatch 불필요.
+- **위험**: vtable cost 회귀 — 게이트 통과로 해소.
 
-### Phase 4-4 (= Step 2-4) main() 조립자화
-- **산출물**: `bin/generate.rs::main()` 7,051 → ≤ 400 LOC. 4개 `build_*_loop` 헬퍼. 모든 forward variant(standard/kivi/offload)가 `DecodeLoopBuilder`를 통해 조립.
-- **검증 게이트**: 모든 디바이스 e2e (S25 + Jetson + host CPU) + chat 모드 / kivi 모드 / offload 모드 sanity (각 1회), TBT 회귀 ≤ 5%, all `bin/generate` integration tests PASS.
-- **위험**: 큰 PR (수천 LOC 이동). 부분 PR 권장 — 모드별로 분할 (`build_standard_loop` 먼저, 이후 kivi, offload).
+### Phase 4-4 (= Step 2-4) main() 조립자화 — **CANCELED + 부분 DONE**
+- **부분 DONE (4-4-2.3 a/c/b)**: `session::decode_fallback::{prologue, eviction_trigger, swap_dispatch}` 추출. generate.rs 5,778 → 4,953 LOC (-14.3%).
+  - 4-4-2.3a `9313670b`: decode prologue (655 LOC).
+  - 4-4-2.3c `bcb221e2`: eviction trigger (200 LOC).
+  - 4-4-2.3b `02cb7106`: swap dispatcher (452 LOC).
+- **CANCELED (4-4-2.3 d/e + 4-4-2.4)**: `bin/generate.rs::main()` ≤ 400 LOC 압축 목표는 폐기. 사유:
+  - legacy generate.rs 를 보존하고 다수 바이너리로 분할하는 방향 ([[generate-split-binaries]] backlog [P2]).
+  - `argus-cli` 신규 진입점 도입으로 happy path 흡수 (v1-1 RESOLVED `83d7cb4a`).
+- **새 흐름**: argus-cli v1 sub-sprint (v1-2~v1-6) 로 legacy 모드를 점진 흡수. legacy generate 는 흡수 완료 후에도 보존 (조정 라운드 결과).
+- **검증 게이트 결과 (4-4-2.3 a/c/b 한정)**: 모든 디바이스 e2e PASS, TBT 회귀 ≤ 5%.
+- **drift RESOLVED (2026-05-25)**: §4.3 / §5 빌더 예시 코드를 `bin/argus_cli.rs::main` + `session::standard_happy::run_standard_happy_path` + `session::assembly::build_standard_loop` 의 실측 코드 기반으로 갱신. 단일 통합 main() ≤ 400 LOC 가정 폐기.
 
-### Phase 4-5 (= Step 2-5) 나머지 구현체 + chat REPL 전면 재작성
+### Phase 4-5 (= Step 2-5) 나머지 구현체 + chat REPL 전면 재작성 — **PARTIAL DONE**
+
+> **진행 현황 (2026-05-25)**: chat REPL 의 `session/chat/{repl, session, stop_condition}.rs` 신설은 완료. `core/chat_ipc.rs` → `session/chat_ipc.rs` 이관 완료. `KiviForward`/`OffloadForward` 스텁 존재 (`session/forward/{kivi_forward, offload_forward}.rs`). `ChatTurnExec` trait + 3 impl 제거는 legacy generate 분할 방향 전환과 맞물려 별 sprint 회부 — chat 은 argus-chat 신규 바이너리에 들어갈 예정 ([[generate-split-binaries]]). 본 §의 sub-step 4-5-a~f 는 그 sprint 에서 재정렬.
+
 
 **사용자 결정 #3 (2026-05-16)**: `ChatTurnExec` trait은 **폐기**한다. adapter로 유지하지 않는다. 현 `bin/generate.rs`의 chat REPL 1,178 LOC를 본 phase에서 **DecodeLoop 패턴으로 전면 재작성**한다.
 
@@ -691,8 +933,10 @@ monomorphize 안:
   - **G5** `core/chat_ipc.rs` import zero from `bin/`, `core/chat_template.rs`는 본 phase 범위 외 (Migration Step 4에서 처리).
 - **위험**: §10.4 "chat 전면 재작성 risk" 참조. 본 phase가 다른 Phase보다 PR 규모가 크므로 sub-step별 PR 분할 필수.
 
-### 다음 진입점 (이 문서 완료 후)
-- Implementer에게 Phase 4-1 위임. SessionInitCtx 헬퍼 추출이 첫 작업.
+### 다음 진입점 (2026-05-25 시점)
+- Phase 4-1 ~ 4-4-2.3 a/c/b DONE. Phase 4-4-2.4 CANCELED → 다수 바이너리 분할 방향.
+- 우선순위 1: argus-cli v1-2 (`--prompt-batch`) 흡수 + Manager IPC wiring `ManagerCmdSource`/`handle_command` 도입 라운드 (본 문서 "Manager IPC wiring 격차" 참조).
+- 우선순위 2: 다수 바이너리 분할 라운드 — argus-chat / argus-bench / argus-eval 분리 설계. chat REPL 의 `ChatTurnExec` 제거가 자연 합류.
 
 ---
 
