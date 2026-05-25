@@ -1086,6 +1086,13 @@ fn main() -> anyhow::Result<()> {
     let mut incremental_force_swap_plan: Option<llm_rs2::models::weights::IncrementalSwapPlan> =
         None;
 
+    // S-1: shared EventSink for weight swap lifecycle events.
+    // Single Arc reused across all SwapDispatchCtx instances per tick.
+    // StderrDiagnosticSink emits `[WeightSwap]`-prefixed lines for operator
+    // grep; swap flag OFF means dispatchers early-return so emit count is 0.
+    let event_sink: std::sync::Arc<dyn llm_rs2::observability::events::EventSink> =
+        std::sync::Arc::new(llm_rs2::observability::events::StderrDiagnosticSink);
+
     // LISWAP-6 manager path: when manager triggers SwapWeights, the plan is
     // committed to `incremental_force_swap_plan` and this state records the
     // information needed to send WeightSwapReport on plan completion.
@@ -2179,6 +2186,7 @@ fn main() -> anyhow::Result<()> {
                         probing_k_controller: &mut probing_k_controller,
                         manager_swap_report_pending: &mut manager_swap_report_pending,
                         ready_weight_swap_report: &mut ready_weight_swap_report,
+                        event_sink: &event_sink,
                     };
                 llm_rs2::session::decode_fallback::swap_dispatch::run_incremental_dispatch(
                     &mut swap_ctx,
