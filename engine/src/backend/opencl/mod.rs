@@ -5268,7 +5268,7 @@ impl Backend for OpenCLBackend {
         // outer backend Arc. The cl_mem path does not consult tensor.backend.
         // placeholder Tensor용 CPU backend Arc; forward는 본 backend Arc 미참조.
         // LAYER-EXEMPT: cross_backend_bootstrap
-        let cpu_be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        let cpu_be: Arc<dyn Backend> = crate::backend::cpu::cpu_singleton();
         Ok(Some(Tensor::new(shape, placeholder, cpu_be)))
     }
 

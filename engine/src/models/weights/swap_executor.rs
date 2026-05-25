@@ -1717,8 +1717,7 @@ impl<'a> SwapExecutor<'a> {
             ))
         };
 
-        let cpu_backend: Arc<dyn Backend> =
-            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+        let cpu_backend = crate::backend::cpu::cpu_singleton();
         Ok(Tensor::new(shape, cpu_buf, cpu_backend))
     }
 
@@ -2082,8 +2081,7 @@ impl<'a> SwapExecutor<'a> {
 
         // ── sub-stage: cpu_tensor ───────────────────────────────────────────
         let t_cpu = if prof { Some(Instant::now()) } else { None };
-        let cpu_backend: Arc<dyn Backend> =
-            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+        let cpu_backend = crate::backend::cpu::cpu_singleton();
         let cpu_tensor = Tensor::new(shape.clone(), cpu_buf, cpu_backend);
         let us_cpu = t_cpu.map(|t| t.elapsed().as_micros() as f64 / 1.0);
 
@@ -2888,8 +2886,7 @@ fn materialise_cpu_tensor_standalone(
         ))
     };
 
-    let cpu_backend: Arc<dyn Backend> =
-        Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+    let cpu_backend = crate::backend::cpu::cpu_singleton();
     let _ = backend;
     Ok(Tensor::new(shape, cpu_buf, cpu_backend))
 }
@@ -3121,7 +3118,7 @@ mod tests {
         // production path and the inner `LayerWeights` can be dropped to
         // release every buffer Arc. This mirrors the WSWAP-5-PRIMARY-DROP
         // primary cl_mem release semantics on the device.
-        let be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        let be: Arc<dyn Backend> = crate::backend::cpu::cpu_singleton();
         let initial = Arc::new(build_test_layer(&be));
         let slot = LayerSlot::new(
             (*initial).clone(),
@@ -3183,7 +3180,7 @@ mod tests {
         // after the helper consumes the layer.
         use std::sync::Weak;
 
-        let be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        let be: Arc<dyn Backend> = crate::backend::cpu::cpu_singleton();
         let layer = build_test_layer(&be);
         // Capture weak refs to the 7 weight buffers.
         let weaks: Vec<Weak<dyn crate::buffer::Buffer>> = [

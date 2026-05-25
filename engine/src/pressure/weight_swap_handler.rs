@@ -175,7 +175,7 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config: make_minimal_config(),
-            backend: Arc::new(crate::backend::cpu::CpuBackend::new()),
+            backend: crate::backend::cpu::cpu_singleton(),
         });
         let memory = Arc::new(crate::memory::galloc::Galloc::new());
         let handler = WeightSwapHandler::new(model_ref, memory, DType::Q4_0);
@@ -192,7 +192,7 @@ mod tests {
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config: make_minimal_config(),
-            backend: Arc::new(crate::backend::cpu::CpuBackend::new()),
+            backend: crate::backend::cpu::cpu_singleton(),
         });
         let memory = Arc::new(crate::memory::galloc::Galloc::new());
         let handler = WeightSwapHandler::new(model_ref, memory, DType::Q4_0);
