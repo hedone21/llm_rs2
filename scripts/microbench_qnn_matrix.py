@@ -150,17 +150,24 @@ class Cell:
     # 예: M3/M4 둘 다 qnngpu_matmul_tbt 의 stdout 에서 각자 다른 line 추출.
     group_key: Optional[str] = None
     latency_pattern: Optional[str] = None  # regex with 1 capture group (ms)
+    # cell 별 path override (Executorch path = /data/local/tmp/executorch 등)
+    work_dir_override: Optional[str] = None
+    bin_dir_override: Optional[str] = None
+    extra_ld_paths: List[str] = field(default_factory=list)
 
     def adb_cmd(self, work_dir: str) -> str:
         env_str = " ".join(f"{k}={v}" for k, v in self.env.items())
         env_prefix = f"{env_str} " if env_str else ""
-        bin_path = f"{DEVICE_BIN_DIR}/{self.bin_name}"
+        bin_dir = self.bin_dir_override or DEVICE_BIN_DIR
+        bin_path = f"{bin_dir}/{self.bin_name}"
         args_str = " ".join(self.args)
-        # LD_LIBRARY_PATH: work_dir (libqnn_oppkg.so 등) + QNN libs + system
-        ld_path = f"{DEVICE_WORK_DIR}:{DEVICE_QNN_LIBDIR}:/system/lib64"
-        adsp = f"ADSP_LIBRARY_PATH={DEVICE_QNN_LIBDIR} "
+        wd = self.work_dir_override or work_dir
+        # LD_LIBRARY_PATH: work_dir + extra + QNN libs + system
+        ld_parts = [wd] + self.extra_ld_paths + [DEVICE_QNN_LIBDIR, "/system/lib64"]
+        ld_path = ":".join(ld_parts)
+        adsp = f"ADSP_LIBRARY_PATH={wd} "
         return (
-            f"cd {work_dir} && "
+            f"cd {wd} && "
             f"LD_LIBRARY_PATH={ld_path} {adsp}{env_prefix}"
             f"taskset 3f {bin_path} {args_str}"
         )
@@ -215,21 +222,26 @@ def build_cells(enable: List[str]) -> List[Cell]:
              env={"QNN_BACKEND_LIB": f"{DEVICE_QNN_LIBDIR}/libQnnGpu.so"},
              tolerance_max_abs=0.05, tolerance_cosine=0.999,
              optional=True),
-        Cell("M6",  "fp32", "executorch",
-             "qnn_executor_runner",
-             args=["--model_path", "matmul_fp32.pte"],
-             tolerance_max_abs=1e-3, tolerance_cosine=0.9999,
-             optional=True),
+        # M6 (FP32) 는 HTP 가 native 지원 안 함 — drop (paper conclusion 명료)
+        # M6b/M7: qnn_executor_runner 의 output: "10 inference took X ms, avg Y ms"
         Cell("M6b", "f16",  "executorch",
              "qnn_executor_runner",
-             args=["--model_path", "matmul_f16.pte"],
+             args=["--model_path", "matmul_f16.pte",
+                   "--input_list_path", "input_list.txt",
+                   "--warm_up", "3", "--iteration", "10"],
              tolerance_max_abs=1e-2, tolerance_cosine=0.999,
-             optional=True),
+             work_dir_override="/data/local/tmp/executorch",
+             bin_dir_override="/data/local/tmp/executorch",
+             latency_pattern=r"inference took [\d.]+\s*ms,\s*avg\s+([\d.]+)\s*ms"),
         Cell("M7",  "w8a8", "executorch",
              "qnn_executor_runner",
-             args=["--model_path", "matmul_w8a8.pte"],
+             args=["--model_path", "matmul_w8a8.pte",
+                   "--input_list_path", "input_list.txt",
+                   "--warm_up", "3", "--iteration", "10"],
              tolerance_max_abs=0.1, tolerance_cosine=0.99,
-             optional=True),
+             work_dir_override="/data/local/tmp/executorch",
+             bin_dir_override="/data/local/tmp/executorch",
+             latency_pattern=r"inference took [\d.]+\s*ms,\s*avg\s+([\d.]+)\s*ms"),
         Cell("Ref", "f32",  "cpu-neon",
              "microbench_cpu_gemv_f32_ref",  # 미존재 — 후속 별 bin 작성 시 활성화
              args=[str(K), str(N), "6"],
