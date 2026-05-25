@@ -529,6 +529,24 @@ impl<F> DecodeLoopBuilder<F> {
         self.tick_sink = Some(Box::new(t));
         self
     }
+
+    /// P3.3: [`ResilienceAdapter`]를 3개 slot(cmd_source / report / tick_sink)에 동시에 주입한다.
+    ///
+    /// 단일 인스턴스를 `Arc<Mutex<ResilienceAdapter>>`로 감싸 3개 newtype wrapper에 공유하므로
+    /// ownership 이전 없이 3개 slot을 충족시킨다. per-token Mutex lock은
+    /// (poll 1회 + on_token_generated 1회) 정도라 contention 무시 가능.
+    pub fn with_resilience(
+        mut self,
+        adapter: super::resilience_adapter::ResilienceAdapter,
+    ) -> Self {
+        use super::resilience_adapter::{CmdSrcWrapper, ReportWrapper, TickWrapper};
+        use std::sync::Mutex;
+        let shared = Arc::new(Mutex::new(adapter));
+        self.cmd_source = Some(Box::new(CmdSrcWrapper(Arc::clone(&shared))));
+        self.report = Some(Box::new(ReportWrapper(Arc::clone(&shared))));
+        self.tick_sink = Some(Box::new(TickWrapper(shared)));
+        self
+    }
 }
 
 impl DecodeLoopBuilder<HasForward> {

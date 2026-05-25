@@ -24,6 +24,8 @@ use llm_rs2::pressure::kv_cache::{KVCache, KVLayout};
 use llm_rs2::session::cli::{Args, KvMode};
 use llm_rs2::session::init::SessionInitCtx;
 use llm_rs2::session::is_standard_happy_path;
+use llm_rs2::session::resilience_adapter::ResilienceAdapter;
+use llm_rs2::session::resilience_init::build_command_executor;
 use llm_rs2::session::standard_happy::{StandardHappyCtx, run_standard_happy_path};
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
@@ -121,6 +123,14 @@ fn main() -> anyhow::Result<()> {
         bail!("argus-cli v0: --num-tokens must be >= 1");
     }
 
+    // P4: ResilienceAdapter 생성. `--no-resilience` 시 None (NoOp default).
+    // transport 연결 실패는 Err로 전파 — graceful fail, panic 없음.
+    let resilience: Option<ResilienceAdapter> = if args.enable_resilience {
+        build_command_executor(&args, &model)?.map(ResilienceAdapter::new)
+    } else {
+        None
+    };
+
     run_standard_happy_path(StandardHappyCtx {
         args,
         backend,
@@ -135,6 +145,7 @@ fn main() -> anyhow::Result<()> {
         kv_type,
         sampling_config,
         vocab_size,
+        resilience,
     })
 }
 

@@ -14,6 +14,8 @@ pub mod init;
 pub mod ppl;
 pub mod prefill;
 pub mod qcf_runtime;
+pub mod resilience_adapter;
+pub mod resilience_init;
 pub mod samplers;
 pub mod standard_happy;
 pub mod traits;

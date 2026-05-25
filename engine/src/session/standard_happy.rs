@@ -16,6 +16,7 @@ use crate::models::transformer::TransformerModel;
 use crate::pressure::kv_cache::KVCache;
 use crate::session::assembly::build_standard_loop;
 use crate::session::cli::Args;
+use crate::session::resilience_adapter::ResilienceAdapter;
 
 pub struct StandardHappyCtx {
     pub args: Args,
@@ -31,6 +32,8 @@ pub struct StandardHappyCtx {
     pub kv_type: DType,
     pub sampling_config: SamplingConfig,
     pub vocab_size: usize,
+    /// P4: ResilienceAdapter 주입 (None 이면 NoOp default).
+    pub resilience: Option<ResilienceAdapter>,
 }
 
 pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
@@ -48,6 +51,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         kv_type,
         sampling_config,
         vocab_size,
+        resilience,
     } = ctx;
 
     eprintln!(
@@ -71,6 +75,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         kv_type,
         sampling_config.clone(),
         !args.no_gpu_plan,
+        resilience,
     )?;
 
     let t_prefill = std::time::Instant::now();

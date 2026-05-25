@@ -1779,6 +1779,9 @@ fn main() -> anyhow::Result<()> {
                 kv_type,
                 sampling_config: sampling_config.clone(),
                 vocab_size,
+                // legacy generate.rs는 자체 CommandExecutor를 보유하므로 None 전달.
+                // P4+ 에서 마이그레이션 시 command_executor → ResilienceAdapter 변환 예정.
+                resilience: None,
             },
         );
     }
