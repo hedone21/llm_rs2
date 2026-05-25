@@ -1137,6 +1137,7 @@ fn main() -> anyhow::Result<()> {
             if swap_backend.supports_async_transfer() {
                 Some(llm_rs2::models::weights::AsyncSwapDispatcher::new(
                     swap_backend,
+                    std::sync::Arc::clone(&event_sink),
                 ))
             } else {
                 if args.swap_incremental_per_tick > 0 {
@@ -1163,9 +1164,11 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .cloned()
             .unwrap_or_else(|| cpu_backend_arc.clone());
-        let runtime_dispatcher = std::sync::Arc::new(
-            llm_rs2::models::weights::AsyncSwapDispatcher::new(swap_backend.clone()),
-        );
+        let runtime_dispatcher =
+            std::sync::Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                swap_backend.clone(),
+                std::sync::Arc::clone(&event_sink),
+            ));
         llm_rs2::session::swap_runtime::EngineSwapRuntime::new(
             swap_backend,
             runtime_dispatcher,
@@ -1380,6 +1383,7 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| cpu_backend_arc.clone());
                 let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
                     Arc::clone(&swap_backend),
+                    Arc::clone(&event_sink),
                 ));
                 let secondary = match model.secondary_mmap.as_ref() {
                     Some(s) => Arc::clone(s),
@@ -1430,6 +1434,7 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| cpu_backend_arc.clone());
                 let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
                     Arc::clone(&swap_backend),
+                    Arc::clone(&event_sink),
                 ));
                 let mode_flag_name = if args.swap_layer_immediate {
                     "--swap-layer-immediate"

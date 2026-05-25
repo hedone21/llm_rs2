@@ -399,11 +399,14 @@ classDiagram
 ### Manager IPC wiring 현황 (drift 마킹)
 
 > **Drift detected — follow-up sprint 필요**: `resilience::CommandExecutor` 가 legacy generate path 에서만 instantiate 되며, argus-cli / `SessionInitCtx::build` / `run_standard_happy_path` 어디에도 생성되지 않습니다. 결과적으로 `DecodeLoop::run` 안의 `cmd_source.poll()` 결과는 `decode_loop.rs:121` 에서 명시 코멘트(`Command dispatch is Phase 4-3+; we accept and drop for now.`) 와 함께 drop 됩니다. ExecutionPlan consumption (Throttle / Suspend / Evict / SwitchHw / SwapWeights / LayerSkip / PartitionRatio) 은 0 LOC. send_capability / send_qcf_estimate / send_weight_swap_report / on_token_generated outbound hook 또한 DecodeLoop 외곽에 미연결.
+>
+> **부분 해소 — SwapWeights wire (M sprint, 2026-05-25)**: legacy generate path 한정으로 `EngineSwapRuntime::handle_swap_weights` (session/swap_runtime.rs) 가 Manager `EngineCommand::SwapWeights { ratio, target_dtype }` 3 필드 (WHAT) 를 받아 engine 내부 default mode (`--swap` CLI flag normalize 결과) 로 4-way (`Incremental` / `IntraForward` / `PhaseAware` / `LayerImmediate`) dispatch 후 `SwapCommitSlot` 에 commit 한다. mode 결정 위치는 **engine 자율 (HOW)** — wire format 에 노출되지 않음. argus-cli + DecodeLoop 경로는 §13.8-M 정책으로 동일 패턴 흡수 예정.
 
 | 책임 | legacy generate | argus-cli + DecodeLoop |
 |------|-----------------|------------------------|
 | CommandExecutor 생성 | `legacy/generate.rs:596` | **없음** |
-| ExecutionPlan apply | `legacy/generate.rs:2267 / 4277 / 4846` 등 (Throttle, Evict, SwitchHw, SwapWeights) | **drop (decode_loop.rs:121~122)** |
+| ExecutionPlan apply (Throttle / Evict / SwitchHw) | `legacy/generate.rs:2267 / 4277 / 4846` 등 | **drop (decode_loop.rs:121~122)** |
+| ExecutionPlan apply (**SwapWeights**) | `legacy/generate.rs:2402` → `EngineSwapRuntime::handle_swap_weights` (M sprint RESOLVED) | **drop** |
 | capability send | legacy 안 `executor.send_capability(...)` | 없음 |
 | heartbeat / qcf estimate | legacy 안 직접 호출 | 없음 |
 
@@ -439,6 +442,8 @@ classDiagram
 | **TransformerModel** | 모델 로딩, 임베딩, 레이어 반복, 로짓 계산. Multi-arch (Llama / Qwen2) | `engine/src/models/transformer.rs` + `engine/src/models/loader/{auf,gguf,safetensors}/` |
 | **AUF (Argus Unified Format)** | mmap zero-copy 가중치 + secondary swap 자산 single-file 포맷 | `engine/src/auf/*` (L2) |
 | **Weight Swap (LayerSlot / SecondaryMmap / SwapExecutor)** | dynamic layer dtype 교체. swap_executor / async_swap / phase_aware_swap / intra_forward_swap | `engine/src/models/weights/*` |
+| **EngineSwapRuntime + SwapCommitSlot** | Manager `SwapWeights` (WHAT) → engine 내부 mode (HOW) 4-way dispatcher. `--swap` CLI flag normalize 결과를 default mode 로 보유. §13.8-M | `engine/src/session/swap_runtime.rs` |
+| **WeightSwapEvent + WeightSwapKind** | 구조화 swap lifecycle event (8 variant: PlanCommitted / ChunkDrained / PlanRetired / SwapFailed / BatchSummary / ConfigWarning / SubBatchWait / SwapProfBreakdown). 5 kind (Incremental / IntraForward / PhaseAware / Subsystem) | `engine/src/observability/events.rs` |
 | **AttentionScoreAccumulator** | H2O/SnapKV용 attention importance score 누적 (decay, reset) | `engine/src/inference/attention_scores.rs` |
 | **QcfMetric / ImportanceTable / DegradationEstimator** | lossy action 품질 cost. KV / Weight 두 패밀리 분리 | `engine/src/qcf/*` + `engine/src/qcf_types.rs` (L2 shared, §G) |
 | **HybridAttention setup** | OpenCL Plan 의 GPU/CPU split attention 셋업 (§G L2 격상) | `engine/src/hybrid_attention.rs` (L2) |
@@ -965,7 +970,7 @@ llm_rs2/
 
 | Binary (Cargo name) | 트랙 / 소스 | 용도 | 주요 옵션 |
 |:--------------------|:------------|:----|:---------|
-| `legacy_generate` | `engine/legacy/generate.rs` ([[bin]] entry) | 단일 백엔드 추론 — **모든 production 모드 (chat/experiment/ppl/eval/dump/prompt-batch/swap/profile/KIVI/tensor-partition)** | `--backend`, `--kv-type`, `--kv-mode`, `--eviction-policy`, `--eviction-window`, `--enable-resilience`/`--no-resilience`, `--initial-kv-capacity`, `--kivi-residual-size`, `--tensor-partition`, `--secondary-gguf`(deprecated), `--force-swap-ratio`, `--swap-intra-forward`, `--swap-phase-aware`, `--profile`, `--prompt-batch`, `--chat`, `--ppl`, `--eval-ll`, `--qcf-dump`, `--dump-importance` |
+| `legacy_generate` | `engine/legacy/generate.rs` ([[bin]] entry) | 단일 백엔드 추론 — **모든 production 모드 (chat/experiment/ppl/eval/dump/prompt-batch/swap/profile/KIVI/tensor-partition)** | `--backend`, `--kv-type`, `--kv-mode`, `--eviction-policy`, `--eviction-window`, `--enable-resilience`/`--no-resilience`, `--initial-kv-capacity`, `--kivi-residual-size`, `--tensor-partition`, `--secondary-gguf`(deprecated), `--swap [MODE]` (shorthand, A1 sprint — `incremental` / `intra-forward` / `phase-aware` / `layer-immediate`), `--force-swap-ratio`/`--swap-intra-forward`/`--swap-phase-aware`/`--swap-layer-immediate` (deprecated, A1), `--profile`, `--prompt-batch`, `--chat`, `--ppl`, `--eval-ll`, `--qcf-dump`, `--dump-importance` |
 | `argus_cli` | `engine/src/bin/argus_cli.rs` | **신규** 분리 진입점 — happy path 만 (`DecodeLoop + ModelForward`). v1-1~v1-6 sub-sprint 로 legacy 모드 점진 흡수 중 | `--backend`, `--kv-type`, `--num-tokens`, `--no-resilience` (default-on, v1-1 RESOLVED). 나머지 옵션은 reject |
 | `auf_tool` | `engine/src/bin/auf_tool.rs` | AUF 자산 빌드 (`build`/`info`) | `--tokenizer-config`, `--bos-token-id`, `--eos-token-id` |
 | `test_backend` | `engine/src/bin/test_backend.rs` | 백엔드 정합성 검증 (CPU vs GPU) | — |
@@ -1500,6 +1505,9 @@ session/
 ├── init.rs                                 SessionInitCtx (Phase 4-1 외곽 추출)
 ├── cli.rs                                  Args (clap::Parser) + dump_config 헬퍼
 ├── prefill.rs                              prompt processing 헬퍼
+├── swap_runtime.rs                         EngineSwapRuntime + SwapCommitSlot (M sprint, §13.8-M)
+│                                            - Manager SwapWeights (WHAT) → 4-way mode dispatch (HOW)
+│                                            - handle_swap_weights / commit slot in/out
 ├── chat_ipc.rs                             (← core/chat_ipc.rs, §13.8-C, V-11 해소)
 ├── chat/                                   Phase 4-5: ChatTurnExec 폐기 후 1,178 LOC 재작성 (결정 #3)
 │   ├── mod.rs
@@ -1740,7 +1748,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 
 ### 13.8 Resolved Decisions
 
-본 절은 §13 마이그레이션 진입 전 결정해야 할 5개 항목(원래 §UNRESOLVED-A~E)에 대한 **최종 결정**을 기록한다. 결정 시점: 2026-05-16. 모든 항목 RESOLVED.
+본 절은 §13 마이그레이션 진입 전 결정해야 할 항목(원래 §UNRESOLVED-A~E)에 대한 **최종 결정**과, 마이그레이션 진행 중 발견된 추가 정책 (§F~§P, §M) 을 기록한다. 첫 5건 결정 시점: 2026-05-16. 모든 항목 RESOLVED. §M 은 M sprint (2026-05-25) 산출.
 
 **§A — AUF 위치: RESOLVED (shared/auf/)**
 - **결정**: `auf/` → **`shared/auf/`**.
@@ -2063,5 +2071,27 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - **운용 메모**:
   - marker는 backend impl 내부 한정. L3/L4에서 cross-backend access 는 본 예외 밖.
   - 5건 이상 누적 시 backend trait method 격상 별 sprint 강제 trigger.
+
+**§M — Manager WHAT vs Engine HOW (swap mode 결정 위치): RESOLVED (2026-05-25, M sprint)**
+- **결정**: Manager → Engine wire format (`shared::EngineCommand::SwapWeights { ratio, target_dtype }`) 은 **WHAT** 만 명시한다. swap mode (`Incremental` / `IntraForward` / `PhaseAware` / `LayerImmediate`) 는 wire format 에 노출되지 않으며, engine 내부 `EngineSwapRuntime::handle_swap_weights` 가 engine-side default mode (사용자가 `--swap` CLI flag 로 한 번 normalize 한 결과) 로 자율 dispatch 한다 (**HOW**).
+- **근거**:
+  - swap mode 는 디바이스·메모리·workload 특성에 따라 달라지는 *engine-internal optimization choice* 다. Manager 는 자원 budget (`ratio`) 과 target precision (`target_dtype`) 만 알면 충분하며, 어떤 dispatcher (sub-batch chunk drain vs intra-forward hook vs phase-aware vs layer-immediate) 를 쓸지 결정할 도메인 지식이 없다.
+  - 만약 mode 가 wire format 에 노출되면 (a) Manager 가 engine internals 에 결합되고 (b) 새 dispatcher 추가 시 protocol breaking change 가 발생한다. WHAT/HOW 분리는 forward-compatible.
+  - 사용자 직접 trigger (CLI `--force-swap-ratio` 등) 는 같은 mental model 로 `EngineSwapRuntime` 을 경유한다.
+- **§13.8-N/§F 와의 관계**: §N (cross-cutting ↔ L3 trait usage) / §F (enum-as-data identifier) 와 직교 — 본 §M 은 *protocol 설계 정책*, §N/§F 는 *import 위반 zone 정책*.
+- **버린 옵션**:
+  - (a) **`EngineCommand::SwapWeights { ratio, target_dtype, mode }` 4 필드**: Manager 가 mode 를 결정해야 함 → engine internals 결합 + protocol breaking 위험.
+  - (b) **`EngineCommand::SwapWeightsIncremental {...}` 등 mode 별 variant**: protocol 표면 불필요 확장, mode 가 늘 때마다 shared crate 변경.
+  - (c) **mode 를 매 caller (legacy generate / PPL runner) 에서 직접 dispatch**: M sprint 이전 상태. 코드 중복 + Manager path 와 CLI force path 에서 일관성 없는 mode 결정 (Manager 경로는 `per_tick=2 IncrementalSwapPlan` 강제, CLI 경로는 `--swap` flag 존중).
+- **적용**:
+  - `engine/src/session/swap_runtime.rs::EngineSwapRuntime` 신설. `handle_swap_weights(ratio, target_dtype, token, planned_q4) -> SwapCommitSlot` 가 4-way 분기.
+  - `legacy/generate.rs:2402` (Manager-driven dispatch) + `engine/src/session/ppl/runner.rs:829` (PPL caller) 가 단일 진입점 사용.
+  - CLI force path (`dispatch_force_swap!` 매크로) 는 본 sprint scope (M) 에서 그대로 유지. β sprint 에서 매크로 도 EngineSwapRuntime method 로 흡수 예정 (handoff R5 후속 후보 C).
+- **observability 통합**: dispatcher 가 commit 한 mode 는 `WeightSwapEvent.kind: WeightSwapKind` 필드 (`Incremental` / `IntraForward` / `PhaseAware` / `Subsystem`) 로 노출되어 downstream grep / 측정 도구가 mode 별 분류 가능 (S-1+α sprint).
+- **eprintln 0 정책**: 세 swap 모듈 (`models/weights/async_swap.rs` / `models/weights/phase_aware_swap.rs` / `models/weights/swap_executor.rs`) 은 모든 stderr 출력을 `EventSink` 경유로 우회 (S-1 / S-1+α / S-1+β 3 sprint). 이로써 (1) downstream 도구가 structured event 만 소비하면 되고 (2) bench mode 의 stdout/stderr 노이즈 0 이며 (3) sub-module 직접 io::Write 결합이 사라져 INV-LAYER-003 위반 누적 회피.
+- **운용 메모**:
+  - 신규 dispatcher 추가 시 `EngineSwapRuntime::handle_swap_weights` 분기에만 등록. wire format 은 불변.
+  - `WeightSwapKind` 추가 시 `noop_sink()` test 와 `events.rs` `StderrSink` arm 갱신 필수.
+  - argus-cli + DecodeLoop 흡수 (`SwapStage` trait 본격 wire) 는 별 sprint (Phase 4-4+).
 
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.

@@ -132,6 +132,43 @@ pub enum WeightSwapEvent {
         max_release_pending: usize,
         max_dispatcher_pending: usize,
     },
+    /// Config-parse / startup warning (S-1+β B 카테고리).
+    ///
+    /// Dispatcher와 무관 — `source` 가 origin 식별. swap subsystem 의 일부지만
+    /// swap action 자체는 아니므로 `kind` 필드를 갖지 않는다.
+    ConfigWarning {
+        /// 발화 위치 식별자: "force_every_tick" / "phase_aware_subname" /
+        /// "phase_aware_chunk_subname".
+        source: &'static str,
+        message: String,
+    },
+    /// Per-layer sub-batch wait observation (S-1+β C 카테고리, profiling trace).
+    ///
+    /// Wait time observed at the start of each layer iteration. Emitted whenever
+    /// `wait_ms > 0.1`. 사용자 alert 가치는 낮지만 trace 채널 분리를 위해 별
+    /// variant.
+    SubBatchWait { layer_idx: usize, wait_ms: f32 },
+    /// Per-subname swap stage breakdown (S-1+β C 카테고리, env-gated by
+    /// `LLMRS_SWAP_PROFILE_BREAKDOWN=1`).
+    ///
+    /// stage timings(us) — early-return / upload / final path 모두 같은 variant
+    /// 재사용. 미발생 stage 는 0.0.
+    SwapProfBreakdown {
+        layer_idx: usize,
+        subname: String,
+        is_weight: bool,
+        tensor_size: usize,
+        lookup_us: f32,
+        dim_us: f32,
+        bytes_us: f32,
+        permute_us: f32,
+        wrap_us: f32,
+        cpu_us: f32,
+        upload_us: f32,
+        total_us: f32,
+        /// "rpcmem-alias" — alias path. 그 외는 "" (memcpy / fallback).
+        source: &'static str,
+    },
 }
 
 /// Structured events emitted during cache management.
@@ -375,6 +412,57 @@ impl EventSink for StderrDiagnosticSink {
                 eprintln!(
                     "[WeightSwap] BatchSummary: kind={}, mode={}, target_layers={}, max_release_pending={}, max_dispatcher_pending={}",
                     kind, mode, target_layers, max_release_pending, max_dispatcher_pending
+                );
+            }
+            CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
+                source,
+                ref message,
+            }) => {
+                eprintln!("[WeightSwap] ConfigWarning: source={}, {}", source, message);
+            }
+            CacheEvent::WeightSwap(WeightSwapEvent::SubBatchWait { layer_idx, wait_ms }) => {
+                eprintln!(
+                    "[WeightSwap] SubBatchWait: layer_idx={} wait_ms={:.2}",
+                    layer_idx, wait_ms
+                );
+            }
+            CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
+                layer_idx,
+                ref subname,
+                is_weight,
+                tensor_size,
+                lookup_us,
+                dim_us,
+                bytes_us,
+                permute_us,
+                wrap_us,
+                cpu_us,
+                upload_us,
+                total_us,
+                source,
+            }) => {
+                let source_str = if source.is_empty() {
+                    String::new()
+                } else {
+                    format!(" source={}", source)
+                };
+                eprintln!(
+                    "[swap-prof] layer={} sub={} is_weight={} size={} \
+                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
+                     wrap={:.1} cpu={:.1} upload={:.1} total={:.1}{}",
+                    layer_idx,
+                    subname,
+                    is_weight as u8,
+                    tensor_size,
+                    lookup_us,
+                    dim_us,
+                    bytes_us,
+                    permute_us,
+                    wrap_us,
+                    cpu_us,
+                    upload_us,
+                    total_us,
+                    source_str,
                 );
             }
         }
@@ -749,6 +837,89 @@ mod tests {
                 assert_eq!(*max_dispatcher_pending, 1);
             }
             other => panic!("expected BatchSummary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_config_warning_emit_and_collect() {
+        // S-1+β: ConfigWarning 은 dispatcher 와 무관 — source 가 origin 식별.
+        let sink = CollectingSink::new();
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
+            source: "force_every_tick",
+            message: "LLMRS_SWAP_FORCE_EVERY_TICK=1 enabled — INV-141 release drain skipped"
+                .to_string(),
+        }));
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
+            source: "phase_aware_subname",
+            message: "unknown subname 'foo' (ignored)".to_string(),
+        }));
+        let events = sink.events();
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning { source, message }) => {
+                assert_eq!(*source, "force_every_tick");
+                assert!(message.contains("INV-141"));
+            }
+            other => panic!("expected ConfigWarning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sub_batch_wait_emit_and_collect() {
+        // S-1+β: SubBatchWait 는 C 카테고리 profiling trace.
+        let sink = CollectingSink::new();
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::SubBatchWait {
+            layer_idx: 7,
+            wait_ms: 1.42,
+        }));
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CacheEvent::WeightSwap(WeightSwapEvent::SubBatchWait { layer_idx, wait_ms }) => {
+                assert_eq!(*layer_idx, 7);
+                assert!((wait_ms - 1.42).abs() < 1e-3);
+            }
+            other => panic!("expected SubBatchWait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_swap_prof_breakdown_emit_and_collect() {
+        // S-1+β: SwapProfBreakdown 는 LLMRS_SWAP_PROFILE_BREAKDOWN=1 env-gated trace.
+        let sink = CollectingSink::new();
+        sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
+            layer_idx: 3,
+            subname: "q".to_string(),
+            is_weight: true,
+            tensor_size: 4_194_304,
+            lookup_us: 12.3,
+            dim_us: 4.5,
+            bytes_us: 8.7,
+            permute_us: 0.0,
+            wrap_us: 0.0,
+            cpu_us: 0.0,
+            upload_us: 0.0,
+            total_us: 25.5,
+            source: "rpcmem-alias",
+        }));
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
+                layer_idx,
+                subname,
+                is_weight,
+                tensor_size,
+                source,
+                ..
+            }) => {
+                assert_eq!(*layer_idx, 3);
+                assert_eq!(subname, "q");
+                assert!(*is_weight);
+                assert_eq!(*tensor_size, 4_194_304);
+                assert_eq!(*source, "rpcmem-alias");
+            }
+            other => panic!("expected SwapProfBreakdown, got {other:?}"),
         }
     }
 
