@@ -27,8 +27,17 @@
       "rule": "INV-LAYER-003",
       "kind": "L3-inference→cross-cutting(observability) — §13.8-N op_trace hook (PhaseHook L2 격상 backlog). S-1+α events use {} 선행으로 parser block-form 오해.",
       "is_test_block": false
+    },
+    {
+      "id": "V-31",
+      "file": "models/weights/async_swap.rs",
+      "line": 41,
+      "import": "crate::observability::events::",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-inference→cross-cutting(observability) — §13.8-N cross_cutting_trait_usage (S-1+β). marker도 parser가 multi-item use {} 라인 직후 marker block-form으로 오해.",
+      "is_test_block": false
     }
   ],
-  "baseline_count": 3,
-  "notes": "Refreshed 2026-05-25 after B-2~B-5 + S-1+α + B2.5 cpu_singleton sprints. Previous 30-entry baseline (B-4 era) was stale: file relocations + rule unification rendered most recorded line ranges obsolete. Current baseline reflects layer_lint's actual current findings — 3 real violations all tracked separately (V-02 tensor_partition promotion, V-31 §13.8-N marker parser limitation)."
+  "baseline_count": 4,
+  "notes": "Refreshed 2026-05-25 after B-2~B-5 + S-1+α + B2.5 cpu_singleton + S-1+β sprints. 4 real violations all tracked separately (V-02 tensor_partition promotion, V-31 §13.8-N marker parser limitation × 3)."
 }

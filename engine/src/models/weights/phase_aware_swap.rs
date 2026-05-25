@@ -92,20 +92,48 @@ struct PartialLayer {
 }
 
 impl PartialLayer {
-    fn install(&mut self, subname: &str, tensor: Tensor) {
+    /// Returns `true` when the subname is recognised and the tensor was
+    /// installed. `false` signals an unknown subname — caller emits
+    /// `ConfigWarning` (S-1+β B 카테고리).
+    fn install(&mut self, subname: &str, tensor: Tensor) -> bool {
         match subname {
-            "attn_q.weight" => self.wq = Some(tensor),
-            "attn_k.weight" => self.wk = Some(tensor),
-            "attn_v.weight" => self.wv = Some(tensor),
-            "attn_output.weight" => self.wo = Some(tensor),
-            "ffn_gate.weight" => self.w_gate = Some(tensor),
-            "ffn_up.weight" => self.w_up = Some(tensor),
-            "ffn_down.weight" => self.w_down = Some(tensor),
-            "attn_norm.weight" => self.attention_norm = Some(tensor),
-            "ffn_norm.weight" => self.ffn_norm = Some(tensor),
-            other => {
-                eprintln!("[PhaseAwareSwap] unknown subname '{other}' (ignored)");
+            "attn_q.weight" => {
+                self.wq = Some(tensor);
+                true
             }
+            "attn_k.weight" => {
+                self.wk = Some(tensor);
+                true
+            }
+            "attn_v.weight" => {
+                self.wv = Some(tensor);
+                true
+            }
+            "attn_output.weight" => {
+                self.wo = Some(tensor);
+                true
+            }
+            "ffn_gate.weight" => {
+                self.w_gate = Some(tensor);
+                true
+            }
+            "ffn_up.weight" => {
+                self.w_up = Some(tensor);
+                true
+            }
+            "ffn_down.weight" => {
+                self.w_down = Some(tensor);
+                true
+            }
+            "attn_norm.weight" => {
+                self.attention_norm = Some(tensor);
+                true
+            }
+            "ffn_norm.weight" => {
+                self.ffn_norm = Some(tensor);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -370,7 +398,11 @@ impl PhaseAwareSwapDispatcher {
             "attn_norm.weight" => &snapshot.attention_norm,
             "ffn_norm.weight" => &snapshot.ffn_norm,
             other => {
-                eprintln!("[PhaseAwareSwap] unknown chunk subname '{other}' (skipped)");
+                self.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
+                        source: "phase_aware_chunk_subname",
+                        message: format!("unknown chunk subname '{other}' (skipped)"),
+                    }));
                 return Ok(());
             }
         };
@@ -442,10 +474,17 @@ impl PhaseAwareSwapDispatcher {
                 .pending_layers
                 .lock()
                 .map_err(|_| anyhow!("[PhaseAwareSwap] pending_layers lock poisoned"))?;
-            pending
+            let installed = pending
                 .entry(chunk.layer_idx)
                 .or_default()
                 .install(chunk.subname, t);
+            if !installed {
+                self.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
+                        source: "phase_aware_subname",
+                        message: format!("unknown subname '{}' (ignored)", chunk.subname),
+                    }));
+            }
         }
 
         // 6. Update in_flight with this chunk's event so a Heavy-phase

@@ -23,6 +23,7 @@ use llm_rs2::buffer::DType;
 use llm_rs2::models::config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::async_swap::AsyncSwapDispatcher;
 use llm_rs2::models::weights::{IntraForwardSwapHook, LayerSlot};
+use llm_rs2::observability::events::noop_sink;
 
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::host::shared::SharedBuffer;
@@ -91,7 +92,7 @@ fn make_test_hook(
     plan_layers: Vec<usize>,
 ) -> (Arc<IntraForwardSwapHook>, Arc<AsyncSwapDispatcher>) {
     let be = cpu_backend();
-    let dispatcher = Arc::new(AsyncSwapDispatcher::new(be.clone()));
+    let dispatcher = Arc::new(AsyncSwapDispatcher::new(be.clone(), noop_sink()));
     let slots: Vec<Arc<LayerSlot>> = (0..n_layers).map(|_| make_slot(&be)).collect();
     let config = make_config();
     let hook = IntraForwardSwapHook::new_for_test(

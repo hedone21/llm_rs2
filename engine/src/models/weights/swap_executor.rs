@@ -31,17 +31,18 @@ use std::time::{Duration, Instant};
 fn force_every_tick_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        let enabled = std::env::var("LLMRS_SWAP_FORCE_EVERY_TICK")
+        std::env::var("LLMRS_SWAP_FORCE_EVERY_TICK")
             .map(|v| v == "1")
-            .unwrap_or(false);
-        if enabled {
-            eprintln!(
-                "[warn] LLMRS_SWAP_FORCE_EVERY_TICK=1 enabled — INV-141 release drain skipped, \
-                 memory spike risk, measurement-only"
-            );
-        }
-        enabled
+            .unwrap_or(false)
     })
+}
+
+/// S-1+β: process-wide guard so caller emits the `force_every_tick`
+/// `ConfigWarning` exactly once across the entire run, even when multiple
+/// SwapExecutor instances re-check the env flag.
+fn force_every_tick_warning_consumed() -> bool {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.set(()).is_err()
 }
 
 use anyhow::Result;
@@ -526,6 +527,15 @@ impl<'a> SwapExecutor<'a> {
         // token at the user-requested rate instead of throttling on the previous
         // batch's release backlog. Memory-spike risk — measurement only.
         let force_every_tick = force_every_tick_enabled();
+        if force_every_tick && !force_every_tick_warning_consumed() {
+            self.event_sink
+                .emit(CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
+                    source: "force_every_tick",
+                    message: "LLMRS_SWAP_FORCE_EVERY_TICK=1 enabled — INV-141 release drain \
+                              skipped, memory spike risk, measurement-only"
+                        .to_string(),
+                }));
+        }
         if !force_every_tick && let Some(worker) = &self.release_worker {
             let pending = worker.pending_count();
             if pending > 0 {
@@ -746,12 +756,11 @@ impl<'a> SwapExecutor<'a> {
                     std::hint::spin_loop();
                 }
                 if let Some(t0) = wait_start {
-                    let wait_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let wait_ms = (t0.elapsed().as_secs_f64() * 1000.0) as f32;
                     if wait_ms > 0.1 {
-                        eprintln!(
-                            "[SubBatchWait] layer_idx={} wait_ms={:.2}",
-                            layer_idx, wait_ms
-                        );
+                        self.event_sink.emit(CacheEvent::WeightSwap(
+                            WeightSwapEvent::SubBatchWait { layer_idx, wait_ms },
+                        ));
                     }
                 }
             }
@@ -2035,21 +2044,23 @@ impl<'a> SwapExecutor<'a> {
             // Emit profiling line so the alias path is visible in
             // `LLMRS_SWAP_PROFILE_BREAKDOWN=1` traces.
             if let Some(t_tot) = t_total {
-                let us_total = t_tot.elapsed().as_micros() as f64;
-                eprintln!(
-                    "[swap-prof] layer={} sub={} is_weight={} size={} \
-                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
-                     wrap=0.0 cpu=0.0 upload=0.0 total={:.1} source=rpcmem-alias",
-                    layer_idx,
-                    subname,
-                    is_weight as u8,
-                    tensor_size,
-                    us_lookup.unwrap_or(0.0),
-                    us_dim.unwrap_or(0.0),
-                    us_bytes.unwrap_or(0.0),
-                    us_permute.unwrap_or(0.0),
-                    us_total,
-                );
+                let us_total = t_tot.elapsed().as_micros() as f32;
+                self.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
+                        layer_idx,
+                        subname: subname.to_string(),
+                        is_weight,
+                        tensor_size,
+                        lookup_us: us_lookup.unwrap_or(0.0) as f32,
+                        dim_us: us_dim.unwrap_or(0.0) as f32,
+                        bytes_us: us_bytes.unwrap_or(0.0) as f32,
+                        permute_us: us_permute.unwrap_or(0.0) as f32,
+                        wrap_us: 0.0,
+                        cpu_us: 0.0,
+                        upload_us: 0.0,
+                        total_us: us_total,
+                        source: "rpcmem-alias",
+                    }));
             }
             return Ok(t);
         }
@@ -2089,23 +2100,23 @@ impl<'a> SwapExecutor<'a> {
         if is_cpu {
             // Emit profiling line even on early return path.
             if let Some(t_tot) = t_total {
-                let us_total = t_tot.elapsed().as_micros() as f64;
-                eprintln!(
-                    "[swap-prof] layer={} sub={} is_weight={} size={} \
-                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
-                     wrap={:.1} cpu={:.1} upload=0.0 total={:.1}",
-                    layer_idx,
-                    subname,
-                    is_weight as u8,
-                    tensor_size,
-                    us_lookup.unwrap_or(0.0),
-                    us_dim.unwrap_or(0.0),
-                    us_bytes.unwrap_or(0.0),
-                    us_permute.unwrap_or(0.0),
-                    us_wrap.unwrap_or(0.0),
-                    us_cpu.unwrap_or(0.0),
-                    us_total,
-                );
+                let us_total = t_tot.elapsed().as_micros() as f32;
+                self.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
+                        layer_idx,
+                        subname: subname.to_string(),
+                        is_weight,
+                        tensor_size,
+                        lookup_us: us_lookup.unwrap_or(0.0) as f32,
+                        dim_us: us_dim.unwrap_or(0.0) as f32,
+                        bytes_us: us_bytes.unwrap_or(0.0) as f32,
+                        permute_us: us_permute.unwrap_or(0.0) as f32,
+                        wrap_us: us_wrap.unwrap_or(0.0) as f32,
+                        cpu_us: us_cpu.unwrap_or(0.0) as f32,
+                        upload_us: 0.0,
+                        total_us: us_total,
+                        source: "",
+                    }));
             }
             return Ok(cpu_tensor);
         }
@@ -2129,26 +2140,25 @@ impl<'a> SwapExecutor<'a> {
         {
             if let Some(t_tot) = t_total {
                 let us_upload = t_upload
-                    .map(|t| t.elapsed().as_micros() as f64)
+                    .map(|t| t.elapsed().as_micros() as f32)
                     .unwrap_or(0.0);
-                let us_total = t_tot.elapsed().as_micros() as f64;
-                eprintln!(
-                    "[swap-prof] layer={} sub={} is_weight={} size={} \
-                     lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
-                     wrap={:.1} cpu={:.1} upload={:.1} total={:.1}",
-                    layer_idx,
-                    subname,
-                    is_weight as u8,
-                    tensor_size,
-                    us_lookup.unwrap_or(0.0),
-                    us_dim.unwrap_or(0.0),
-                    us_bytes.unwrap_or(0.0),
-                    us_permute.unwrap_or(0.0),
-                    us_wrap.unwrap_or(0.0),
-                    us_cpu.unwrap_or(0.0),
-                    us_upload,
-                    us_total,
-                );
+                let us_total = t_tot.elapsed().as_micros() as f32;
+                self.event_sink
+                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
+                        layer_idx,
+                        subname: subname.to_string(),
+                        is_weight,
+                        tensor_size,
+                        lookup_us: us_lookup.unwrap_or(0.0) as f32,
+                        dim_us: us_dim.unwrap_or(0.0) as f32,
+                        bytes_us: us_bytes.unwrap_or(0.0) as f32,
+                        permute_us: us_permute.unwrap_or(0.0) as f32,
+                        wrap_us: us_wrap.unwrap_or(0.0) as f32,
+                        cpu_us: us_cpu.unwrap_or(0.0) as f32,
+                        upload_us: us_upload,
+                        total_us: us_total,
+                        source: "",
+                    }));
             }
             return Ok(t);
         }
@@ -2171,26 +2181,25 @@ impl<'a> SwapExecutor<'a> {
 
         if let Some(t_tot) = t_total {
             let us_upload = t_upload
-                .map(|t| t.elapsed().as_micros() as f64)
+                .map(|t| t.elapsed().as_micros() as f32)
                 .unwrap_or(0.0);
-            let us_total = t_tot.elapsed().as_micros() as f64;
-            eprintln!(
-                "[swap-prof] layer={} sub={} is_weight={} size={} \
-                 lookup={:.1} dim={:.1} bytes={:.1} permute={:.1} \
-                 wrap={:.1} cpu={:.1} upload={:.1} total={:.1}",
-                layer_idx,
-                subname,
-                is_weight as u8,
-                tensor_size,
-                us_lookup.unwrap_or(0.0),
-                us_dim.unwrap_or(0.0),
-                us_bytes.unwrap_or(0.0),
-                us_permute.unwrap_or(0.0),
-                us_wrap.unwrap_or(0.0),
-                us_cpu.unwrap_or(0.0),
-                us_upload,
-                us_total,
-            );
+            let us_total = t_tot.elapsed().as_micros() as f32;
+            self.event_sink
+                .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
+                    layer_idx,
+                    subname: subname.to_string(),
+                    is_weight,
+                    tensor_size,
+                    lookup_us: us_lookup.unwrap_or(0.0) as f32,
+                    dim_us: us_dim.unwrap_or(0.0) as f32,
+                    bytes_us: us_bytes.unwrap_or(0.0) as f32,
+                    permute_us: us_permute.unwrap_or(0.0) as f32,
+                    wrap_us: us_wrap.unwrap_or(0.0) as f32,
+                    cpu_us: us_cpu.unwrap_or(0.0) as f32,
+                    upload_us: us_upload,
+                    total_us: us_total,
+                    source: "",
+                }));
         }
 
         result
