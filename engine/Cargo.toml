@@ -132,6 +132,10 @@ name = "microbench_htp_fastrpc_dryrun"
 path = "microbench/htp_fastrpc_dryrun.rs"
 
 [[bin]]
+name = "microbench_htp_rmsnorm"
+path = "microbench/htp_rmsnorm.rs"
+
+[[bin]]
 name = "microbench_htp_opencl_interop"
 path = "microbench/htp_opencl_interop.rs"
 
