@@ -42,7 +42,7 @@ use crate::memory::rpcmem::allocator::RpcmemAllocator;
 use crate::model_config::ModelConfig;
 use crate::models::loader::gguf::GgufFile;
 #[cfg(target_os = "android")]
-use crate::models::loader::gguf::{ggml_type_to_dtype, tensor_byte_size};
+use crate::models::loader::gguf::{ggml_type_to_dtype, parse_model_config, tensor_byte_size};
 use crate::models::weights::SecondaryMmap;
 use crate::models::weights::backing::WeightSectionView;
 #[cfg(target_os = "android")]
@@ -220,7 +220,7 @@ impl RpcmemSecondaryStore {
                 .map_err(|e| anyhow!("rpcmem_secondary: GGUF open failed: {e}"))?;
 
             // Validate metadata vs primary (same checks as open_secondary_gguf).
-            let secondary_config = ModelConfig::from_gguf_metadata(&gguf)
+            let secondary_config = parse_model_config(&gguf)
                 .map_err(|e| anyhow!("rpcmem_secondary: config parse failed: {e}"))?;
             check_metadata_match(primary_config, &secondary_config)?;
 

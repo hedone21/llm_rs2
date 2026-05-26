@@ -552,10 +552,9 @@ fn load_tokenizer_from_json(
 
 /// GGUF에서 AufMeta를 구성한다.
 fn build_meta_from_gguf(gguf: &llm_rs2::models::loader::gguf::GgufFile) -> Result<AufMeta> {
-    use llm_rs2::model_config::ModelConfig;
+    use llm_rs2::models::loader::gguf::parse_model_config;
 
-    let config = ModelConfig::from_gguf_metadata(gguf)
-        .map_err(|e| anyhow!("ModelConfig 파싱 실패: {}", e))?;
+    let config = parse_model_config(gguf).map_err(|e| anyhow!("ModelConfig 파싱 실패: {}", e))?;
 
     // max_seq_len: ModelConfig에 없으므로 GGUF에서 직접 읽는다
     let arch_str = gguf.get_str("general.architecture").unwrap_or("llama");
@@ -717,7 +716,7 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     )?;
 
     // 7) ModelConfig (Q/K permute shape 결정용)
-    let config = llm_rs2::model_config::ModelConfig::from_gguf_metadata(&gguf)
+    let config = llm_rs2::models::loader::gguf::parse_model_config(&gguf)
         .map_err(|e| anyhow!("ModelConfig 파싱 실패: {}", e))?;
 
     // 8) weight payload 생성 (각 variant 별)

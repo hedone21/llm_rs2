@@ -620,6 +620,122 @@ pub(crate) fn qk_permute_shape(name: &str, config: &ModelConfig) -> Option<(usiz
     }
 }
 
+/// Construct a [`ModelConfig`] from GGUF metadata.
+///
+/// GGUF metadata keys follow the pattern `{arch}.{param_name}` where
+/// `{arch}` comes from `general.architecture`.
+pub fn parse_model_config(gguf: &GgufFile) -> Result<ModelConfig> {
+    use crate::model_config::ModelArch;
+
+    let arch_str = gguf
+        .get_str("general.architecture")
+        .ok_or_else(|| anyhow!("GGUF: missing 'general.architecture' metadata"))?;
+
+    let arch = match arch_str {
+        "llama" => ModelArch::Llama,
+        "qwen2" => ModelArch::Qwen2,
+        "gemma" | "gemma2" | "gemma3" => ModelArch::Gemma3,
+        _ => anyhow::bail!("GGUF: unsupported architecture '{}'", arch_str),
+    };
+
+    let prefix = arch_str;
+
+    let hidden_size =
+        gguf.get_u32(&format!("{prefix}.embedding_length"))
+            .ok_or_else(|| anyhow!("GGUF: missing {prefix}.embedding_length"))? as usize;
+    let num_hidden_layers =
+        gguf.get_u32(&format!("{prefix}.block_count"))
+            .ok_or_else(|| anyhow!("GGUF: missing {prefix}.block_count"))? as usize;
+    let num_attention_heads = gguf
+        .get_u32(&format!("{prefix}.attention.head_count"))
+        .ok_or_else(|| anyhow!("GGUF: missing {prefix}.attention.head_count"))?
+        as usize;
+    let num_key_value_heads = gguf
+        .get_u32(&format!("{prefix}.attention.head_count_kv"))
+        .unwrap_or(num_attention_heads as u32) as usize;
+    let intermediate_size =
+        gguf.get_u32(&format!("{prefix}.feed_forward_length"))
+            .ok_or_else(|| anyhow!("GGUF: missing {prefix}.feed_forward_length"))? as usize;
+    let vocab_size = gguf
+        .get_u32(&format!("{prefix}.vocab_size"))
+        .map(|v| v as usize)
+        .or_else(|| match gguf.metadata.get("tokenizer.ggml.tokens") {
+            Some(GgufValue::Array(arr)) => Some(arr.len()),
+            _ => None,
+        })
+        .unwrap_or(32000);
+    let rms_norm_eps = gguf
+        .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
+        .unwrap_or(1e-5) as f64;
+    let rope_theta = gguf
+        .get_f32(&format!("{prefix}.rope.freq_base"))
+        .unwrap_or(10000.0) as f64;
+    // head_dim: use explicit GGUF metadata if available (Gemma3 has head_dim != hidden/heads).
+    // Gemma3 GGUF stores head_dim as `attention.key_length`, not `attention.head_dim`.
+    let head_dim = gguf
+        .get_u32(&format!("{prefix}.attention.head_dim"))
+        .or_else(|| gguf.get_u32(&format!("{prefix}.attention.key_length")))
+        .map(|v| v as usize)
+        .unwrap_or(hidden_size / num_attention_heads);
+
+    let has_qkv_bias = matches!(arch, ModelArch::Qwen2);
+    let tie_word_embeddings = gguf.find_tensor("output.weight").is_none();
+
+    // Gemma3 specific fields
+    let (
+        rope_local_theta,
+        sliding_window,
+        sliding_window_pattern,
+        query_pre_attn_scalar,
+        embed_scale,
+    ) = match arch {
+        ModelArch::Gemma3 => {
+            let local_theta = gguf
+                .get_f32(&format!("{prefix}.rope.local.freq_base"))
+                .unwrap_or(10000.0) as f64;
+            let sw = gguf
+                .get_u32(&format!("{prefix}.attention.sliding_window"))
+                .map(|v| v as usize);
+            let sw_pattern = gguf
+                .get_u32(&format!("{prefix}.attention.sliding_window_pattern"))
+                .map(|v| v as usize);
+            let qpas = gguf
+                .get_u32(&format!("{prefix}.attention.query_pre_attn_scalar"))
+                .map(|v| v as usize);
+            let es = Some((hidden_size as f32).sqrt());
+            (Some(local_theta), sw, sw_pattern, qpas, es)
+        }
+        _ => (None, None, None, None, None),
+    };
+
+    // eos_token_id: GGUF may store it as an array or a single value
+    let eos_token_id = gguf
+        .get_u32("tokenizer.ggml.eos_token_id")
+        .unwrap_or(u32::MAX);
+
+    Ok(ModelConfig {
+        arch,
+        hidden_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        intermediate_size,
+        vocab_size,
+        rms_norm_eps,
+        rope_theta,
+        has_qkv_bias,
+        tie_word_embeddings,
+        eos_token_id,
+        rope_local_theta,
+        sliding_window,
+        sliding_window_pattern,
+        query_pre_attn_scalar,
+        embed_scale,
+        weight_prefix: String::new(),
+    })
+}
+
 /// Determine the "weight dtype" of a GGUF file by looking at the dominant
 /// ggml_type across weight tensors (excluding norms and biases).
 fn detect_weight_dtype(gguf: &GgufFile) -> DType {
@@ -654,7 +770,7 @@ impl GgufSource {
     /// Open a GGUF model file and parse metadata + tensor info.
     pub fn open(path: &Path) -> Result<Self> {
         let gguf = GgufFile::open(path)?;
-        let config = ModelConfig::from_gguf_metadata(&gguf)?;
+        let config = parse_model_config(&gguf)?;
         let weight_dtype = detect_weight_dtype(&gguf);
 
         eprintln!(
@@ -1572,7 +1688,7 @@ mod tests {
     fn test_config_from_gguf_llama() {
         let data = make_simple_gguf();
         let gguf = parse_from_bytes(&data).expect("Failed to parse GGUF");
-        let config = ModelConfig::from_gguf_metadata(&gguf).expect("Failed to create config");
+        let config = parse_model_config(&gguf).expect("Failed to create config");
 
         assert_eq!(config.arch, crate::model_config::ModelArch::Llama);
         assert_eq!(config.hidden_size, 64);
@@ -1603,7 +1719,7 @@ mod tests {
             .add_metadata_u32("qwen2.context_length", 32768);
         let bytes = builder.build();
         let gguf = parse_from_bytes(&bytes).expect("Failed to parse GGUF");
-        let config = ModelConfig::from_gguf_metadata(&gguf).expect("Failed to create config");
+        let config = parse_model_config(&gguf).expect("Failed to create config");
 
         assert_eq!(config.arch, crate::model_config::ModelArch::Qwen2);
         assert!(config.has_qkv_bias);
@@ -1671,7 +1787,7 @@ mod tests {
     fn test_resolve_name_embed() {
         let data = make_simple_gguf();
         let gguf = parse_from_bytes(&data).expect("Failed to parse GGUF");
-        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let config = parse_model_config(&gguf).unwrap();
         let source = GgufSource {
             gguf,
             config,
@@ -1810,7 +1926,7 @@ mod tests {
         let bytes = builder.build();
         let gguf = parse_from_bytes(&bytes).expect("parse");
 
-        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let config = parse_model_config(&gguf).unwrap();
         let source = GgufSource {
             gguf,
             config,
@@ -1892,7 +2008,7 @@ mod tests {
         let bytes = builder.build();
         let gguf = parse_from_bytes(&bytes).expect("parse");
 
-        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let config = parse_model_config(&gguf).unwrap();
         let source = GgufSource {
             gguf,
             config,
@@ -1964,7 +2080,7 @@ mod tests {
         let bytes = builder.build();
         let gguf = parse_from_bytes(&bytes).expect("parse");
 
-        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let config = parse_model_config(&gguf).unwrap();
         let source = GgufSource {
             gguf,
             config,
@@ -2030,7 +2146,7 @@ mod tests {
         let bytes = builder.build();
         let gguf = parse_from_bytes(&bytes).expect("parse");
 
-        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let config = parse_model_config(&gguf).unwrap();
         let source = GgufSource {
             gguf,
             config,

@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use crate::buffer::DType;
 use crate::model_config::ModelConfig;
-use crate::models::loader::gguf::{GgufFile, ggml_type_to_dtype, tensor_byte_size};
+use crate::models::loader::gguf::{
+    GgufFile, ggml_type_to_dtype, parse_model_config, tensor_byte_size,
+};
 
 // ── AUF crate imports ──────────────────────────────────────────────────────
 // AUF helper logic lives in `crate::models::loader::auf::secondary` (W-AUF-1
@@ -857,7 +859,7 @@ fn open_secondary_gguf(
 
     // Model metadata must match the primary config (ENG-DAT-C10).
     let secondary_config =
-        ModelConfig::from_gguf_metadata(&gguf).map_err(|e| LoadError::SecondaryUnavailable {
+        parse_model_config(&gguf).map_err(|e| LoadError::SecondaryUnavailable {
             path: path.to_path_buf(),
             source: e,
         })?;
