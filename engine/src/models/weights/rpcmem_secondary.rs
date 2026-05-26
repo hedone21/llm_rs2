@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::backend::Backend;
 use crate::buffer::{Buffer, DType};
+use crate::memory::rpcmem::allocator::RpcmemAllocator;
 use crate::models::config::ModelConfig;
 use crate::models::loader::gguf::GgufFile;
 #[cfg(target_os = "android")]
@@ -50,18 +51,14 @@ use crate::models::weights::backing::{AufBacking, GgufBacking};
 use crate::models::weights::secondary_mmap::parse_block_tensor_name;
 use crate::models::weights::secondary_mmap::{LayerTensorSlice, SecondaryTensorInfo};
 
-/// rpcmem alloc/free fn-pointer pair (Android-only). On non-Android targets,
-/// the store rejects construction so the field is gated.
-#[cfg(target_os = "android")]
-type RpcmemAllocFn = unsafe extern "C" fn(i32, u32, i32) -> *mut std::ffi::c_void;
-#[cfg(target_os = "android")]
-type RpcmemFreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
-
 /// Per-layer rpcmem region. Owns one `rpcmem_alloc` allocation that holds
 /// every swap-relevant tensor for the layer, with `tensor_map` describing
 /// each tensor's offset/length within the region.
+///
+/// Sprint 2a Phase 2: `Arc<RpcmemAllocator>` 보유로 lifetime 을 type system
+/// 강제 (INV-RPCMEM-005). Drop 순서: region 먼저, allocator 나중.
 pub struct RpcmemLayerRegion {
-    /// Base host pointer returned by `rpcmem_alloc` (mmap'd DMA-BUF region).
+    /// Base host pointer returned by `RpcmemAllocator::alloc` (mmap'd DMA-BUF).
     host_ptr: *mut u8,
     /// Total bytes allocated. Read by Drop diagnostics + size sanity tests.
     /// Allowed to be `dead_code` on non-Android because the Drop arm is gated.
@@ -69,10 +66,11 @@ pub struct RpcmemLayerRegion {
     size: usize,
     /// Subname (e.g. "attn_q.weight") → (offset_in_region, byte_len, dtype).
     tensor_map: HashMap<String, (usize, usize, DType)>,
-    /// rpcmem_free fn-pointer cached so Drop doesn't need a runtime handle.
-    /// Android-only — host targets never construct this struct.
-    #[cfg(target_os = "android")]
-    rpcmem_free: RpcmemFreeFn,
+    /// rpcmem allocator — Arc 보유로 buffer lifetime ⊂ allocator lifetime
+    /// 을 type system 으로 강제 (INV-RPCMEM-005). Drop 에서 `allocator.free`
+    /// 호출. host 빌드에서도 Arc field 자체는 보유 가능 (Drop 분기에서
+    /// no-op 처리).
+    allocator: Arc<RpcmemAllocator>,
 }
 
 // SAFETY: rpcmem_alloc returns a host-accessible mapping. The underlying
@@ -113,11 +111,12 @@ pub struct HostPtrAlias {
 
 impl Drop for RpcmemLayerRegion {
     fn drop(&mut self) {
-        #[cfg(target_os = "android")]
         if !self.host_ptr.is_null() {
-            // SAFETY: host_ptr produced by rpcmem_alloc; Drop runs once;
-            // alias lifetime invariant guarantees no live cl_mem references.
-            unsafe { (self.rpcmem_free)(self.host_ptr.cast()) };
+            // SAFETY: host_ptr produced by self.allocator.alloc; Drop runs
+            // once; alias lifetime invariant guarantees no live cl_mem refs.
+            // host build 에서는 ExternalFns variant 가 dummy 일 수 있으나
+            // 호스트 path 는 host_ptr 가 null 이라 분기 진입 불가.
+            unsafe { self.allocator.free(self.host_ptr) };
         }
     }
 }
@@ -164,12 +163,13 @@ pub struct RpcmemSecondaryStore {
     /// The cached `RpcmemAliasBuffer` instances upgrade this to install
     /// their `Weak<SecondaryMmap>` lifetime back-reference.
     self_weak: OnceLock<Weak<SecondaryMmap>>,
-    /// rpcmem alloc/free fn-pointers from the QNN runtime.
-    /// Android-only — host targets cannot construct this store.
-    #[cfg(target_os = "android")]
-    rpcmem_alloc: RpcmemAllocFn,
-    #[cfg(target_os = "android")]
-    rpcmem_free: RpcmemFreeFn,
+    /// Sprint 2a Phase 2 (ENG-RPCMEM-030/032): backend-agnostic rpcmem
+    /// allocator. `RpcmemLayerRegion` clones from this Arc so allocator
+    /// lifetime ⊃ region lifetime (INV-RPCMEM-005). Shared with the
+    /// OpenCLBackend via `EXT_RPCMEM_ALLOCATOR` extension (INV-RPCMEM-002).
+    /// Android-only field: used in `build_layer_region` under `#[cfg(target_os = "android")]`.
+    #[allow(dead_code)]
+    allocator: Arc<RpcmemAllocator>,
 }
 
 impl std::fmt::Debug for RpcmemSecondaryStore {
@@ -192,20 +192,23 @@ impl std::fmt::Debug for RpcmemSecondaryStore {
 impl RpcmemSecondaryStore {
     /// Open a GGUF secondary file and prepare the lazy store.
     ///
-    /// `qnn_runtime_rpcmem_fns` is the `(alloc, free)` pair extracted from
-    /// `QnnOppkgRuntime::rpcmem_fns()` (Android-only). On non-Android targets
-    /// this constructor returns an error — callers should fall back to the
-    /// regular `SecondaryMmap::Gguf` variant.
+    /// Sprint 2a Phase 2 (ENG-RPCMEM-030): `allocator` is the shared
+    /// `Arc<RpcmemAllocator>` obtained from
+    /// `OpenCLBackend::get_extension(EXT_RPCMEM_ALLOCATOR)` (or, during Sprint
+    /// 2a coexistence, from `QnnOppkgRuntime` wrapped via
+    /// `RpcmemAllocator::from_external_fns`). On non-Android targets this
+    /// constructor returns an error — callers should fall back to the regular
+    /// `SecondaryMmap::Gguf` variant.
     pub fn from_gguf(
         path: &std::path::Path,
         primary_config: &ModelConfig,
         primary_gguf: &GgufFile,
         backend: Arc<dyn Backend>,
-        #[cfg(target_os = "android")] qnn_runtime_rpcmem_fns: (RpcmemAllocFn, RpcmemFreeFn),
+        allocator: Arc<RpcmemAllocator>,
     ) -> Result<Self> {
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (path, primary_config, primary_gguf, backend);
+            let _ = (path, primary_config, primary_gguf, backend, allocator);
             Err(anyhow!(
                 "RpcmemSecondaryStore is Android-only (rpcmem heap unavailable on host targets)"
             ))
@@ -275,7 +278,6 @@ impl RpcmemSecondaryStore {
                 }
             }
 
-            let (rpcmem_alloc, rpcmem_free) = qnn_runtime_rpcmem_fns;
             let backing: Arc<dyn WeightSectionView> = Arc::new(GgufBacking {
                 gguf: Arc::new(gguf),
                 source_path: path.to_path_buf(),
@@ -289,8 +291,7 @@ impl RpcmemSecondaryStore {
                 alias_cache: Mutex::new(HashMap::new()),
                 backend_weak: Mutex::new(Some(Arc::downgrade(&backend))),
                 self_weak: OnceLock::new(),
-                rpcmem_alloc,
-                rpcmem_free,
+                allocator,
             })
         }
     }
@@ -307,11 +308,11 @@ impl RpcmemSecondaryStore {
         layer_index: Vec<LayerTensorSlice>,
         diag_source_path: PathBuf,
         backend: Arc<dyn Backend>,
-        #[cfg(target_os = "android")] qnn_runtime_rpcmem_fns: (RpcmemAllocFn, RpcmemFreeFn),
+        allocator: Arc<RpcmemAllocator>,
     ) -> Result<Self> {
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (view, layer_index, diag_source_path, backend);
+            let _ = (view, layer_index, diag_source_path, backend, allocator);
             Err(anyhow!(
                 "RpcmemSecondaryStore::from_auf_self_secondary is Android-only \
                  (rpcmem heap unavailable on host targets); caller must fall back \
@@ -321,7 +322,6 @@ impl RpcmemSecondaryStore {
 
         #[cfg(target_os = "android")]
         {
-            let (rpcmem_alloc, rpcmem_free) = qnn_runtime_rpcmem_fns;
             let backing: Arc<dyn WeightSectionView> = Arc::new(AufBacking {
                 view,
                 source_path: diag_source_path.clone(),
@@ -334,8 +334,7 @@ impl RpcmemSecondaryStore {
                 alias_cache: Mutex::new(HashMap::new()),
                 backend_weak: Mutex::new(Some(Arc::downgrade(&backend))),
                 self_weak: OnceLock::new(),
-                rpcmem_alloc,
-                rpcmem_free,
+                allocator,
             })
         }
     }
@@ -372,10 +371,7 @@ impl RpcmemSecondaryStore {
     /// region has been allocated. Silent no-op when prerequisites are
     /// missing (no backend / no self_weak / non-OpenCL backend) — the swap
     /// path falls back to direct allocation in that case.
-    #[cfg_attr(
-        not(feature = "opencl"),
-        allow(unused_variables, unused_mut)
-    )]
+    #[cfg_attr(not(feature = "opencl"), allow(unused_variables, unused_mut))]
     fn populate_alias_cache_for_layer(&self, layer_idx: usize, region: &Arc<RpcmemLayerRegion>) {
         // Both prerequisites must be installed; otherwise skip caching.
         let Some(secondary_arc) = self.self_weak.get().and_then(Weak::upgrade) else {
@@ -556,9 +552,6 @@ impl RpcmemSecondaryStore {
 
     #[cfg(target_os = "android")]
     fn build_layer_region(&self, layer_idx: usize) -> Result<Arc<RpcmemLayerRegion>> {
-        const RPCMEM_HEAP_ID_SYSTEM: i32 = 25;
-        const RPCMEM_DEFAULT_FLAGS: u32 = 1;
-
         let layer_slice = self.layer_index.get(layer_idx).ok_or_else(|| {
             anyhow!(
                 "rpcmem_secondary: layer_idx {layer_idx} out of range (max {})",
@@ -593,17 +586,11 @@ impl RpcmemSecondaryStore {
         }
 
         // 1. rpcmem_alloc — single backing region for the whole layer.
-        // SAFETY: rpcmem_alloc fn-pointer obtained from libcdsprpc.so via
-        // QnnOppkgRuntime::rpcmem_fns(); validity is enforced at runtime init.
-        let host_ptr = unsafe {
-            (self.rpcmem_alloc)(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, total as i32)
-        };
-        if host_ptr.is_null() {
-            return Err(anyhow!(
-                "rpcmem_secondary: rpcmem_alloc(size={total}) returned NULL for layer {layer_idx}"
-            ));
-        }
-        let host_ptr = host_ptr as *mut u8;
+        // SAFETY: self.allocator is shared (INV-RPCMEM-002) and outlives every
+        // region (INV-RPCMEM-005). Failure → caller `ensure_layer_loaded`
+        // surfaces it; secondary loader treats it as
+        // `SecondaryUnavailable` and falls back to GGUF mmap (INV-RPCMEM-003).
+        let (host_ptr, _fd) = unsafe { self.allocator.alloc(total)? };
 
         // 2. memcpy each tensor from the backing weights section into the region.
         // Best-effort: if any copy fails (would only happen on a corrupt range),
@@ -616,10 +603,10 @@ impl RpcmemSecondaryStore {
             let src_start = info.offset;
             let src_end = info.offset + info.len;
             if src_end > mmap_bytes.len() || len != info.len {
-                // Free + abort.
-                #[cfg(target_os = "android")]
+                // Free + abort. SAFETY: host_ptr was just returned by
+                // self.allocator.alloc; no aliases have been built yet.
                 unsafe {
-                    (self.rpcmem_free)(host_ptr.cast());
+                    self.allocator.free(host_ptr);
                 }
                 return Err(anyhow!(
                     "rpcmem_secondary: tensor '{}' offset/len exceeds mmap (layer {layer_idx})",
@@ -642,7 +629,7 @@ impl RpcmemSecondaryStore {
             host_ptr,
             size: total,
             tensor_map,
-            rpcmem_free: self.rpcmem_free,
+            allocator: Arc::clone(&self.allocator),
         }))
     }
 

@@ -1612,13 +1612,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qnn_oppkg_poc"
-version = "0.1.0"
-dependencies = [
- "bindgen",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"

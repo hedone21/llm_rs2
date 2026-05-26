@@ -161,14 +161,14 @@ fn main() -> anyhow::Result<()> {
     let mut dev_cfg_list: [*const QnnDevice_Config_t; 3] =
         [dev_cfg_arch_ptr, dev_cfg_unsigned_ptr, ptr::null()];
     let mut device: Qnn_DeviceHandle_t = ptr::null_mut();
-    let err =
-        unsafe { (v.deviceCreate.unwrap())(ptr::null_mut(), dev_cfg_list.as_mut_ptr(), &mut device) };
+    let err = unsafe {
+        (v.deviceCreate.unwrap())(ptr::null_mut(), dev_cfg_list.as_mut_ptr(), &mut device)
+    };
     anyhow::ensure!(err == 0, "deviceCreate err=0x{:x}", err);
     println!("deviceCreate (V79 + unsigned PD): OK");
 
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err =
-        unsafe { (v.contextCreate.unwrap())(backend, device, ptr::null_mut(), &mut ctx) };
+    let err = unsafe { (v.contextCreate.unwrap())(backend, device, ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
     println!("contextCreate (with device): OK");
 

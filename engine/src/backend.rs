@@ -25,10 +25,6 @@ pub use cuda_embedded as cuda;
 #[cfg(feature = "opencl")]
 pub mod opencl;
 
-// QNN OpPackage backend (M3.1 skeleton, ENG-QNN-201~210, INV-166~180).
-#[cfg(feature = "qnn")]
-pub mod qnn_oppkg;
-
 // ============================================================================
 // Backend trait + GpuEvent (originally `core/backend.rs`).
 // ============================================================================
@@ -99,17 +95,21 @@ impl GpuEvent {
 /// 반환 타입은 `&OpenCLBackend` 로 downcast 해서 사용한다.
 pub const EXT_OPENCL_QUEUE: &str = "opencl_queue";
 
-/// Cold-path extension key — OpenCL secondary slot (qnn_oppkg swap path).
+/// Cold-path extension key — OpenCL secondary slot (precision swap path).
 ///
 /// 반환 타입은 `&OpenCLBackend` 로 downcast 해서 사용한다.
 /// 현재는 `EXT_OPENCL_QUEUE` 와 동일한 핸들을 반환하지만, 향후
 /// secondary store 추상화가 구체화되면 별도 타입을 반환할 수 있다.
 pub const EXT_OPENCL_SECONDARY: &str = "opencl_secondary";
 
-/// Cold-path extension key — `QnnOppkgBackend` 핸들 (rpcmem secondary loader 등).
+/// Cold-path extension key — backend-agnostic `Arc<RpcmemAllocator>` 핸들.
 ///
-/// 반환 타입은 `&QnnOppkgBackend` 로 downcast 해서 사용한다.
-pub const EXT_QNN_OPPKG: &str = "qnn_oppkg";
+/// Sprint 2a Phase 2 (ENG-RPCMEM-024 / INV-RPCMEM-002) 에서 도입. OpenCL backend
+/// 가 `--opencl-rpcmem` 활성 시 본 extension 을 통해 `Arc<RpcmemAllocator>` 를
+/// expose 하며, `RpcmemSecondaryStore` loader 가 본 키로 lookup 한다. 반환
+/// 타입은 `&Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>` 로 downcast
+/// 후 clone 하여 사용한다.
+pub const EXT_RPCMEM_ALLOCATOR: &str = "rpcmem_allocator";
 
 /// §13.8-L S-L-3 — KIVI native attention dispatch 추상화.
 ///
@@ -944,11 +944,11 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
-    /// LISWAP-6 — DMA-BUF alias buffer for swap path (Adreno + qnn_oppkg).
+    /// LISWAP-6 — DMA-BUF alias buffer for swap path (Adreno rpcmem).
     ///
-    /// Backends with rpcmem heap interop (`qnn_oppkg`) — and the OpenCL
-    /// backend on Adreno — can convert a host-mapped pointer (returned by
-    /// `RpcmemSecondaryStore::host_ptr_for`) into a `cl_mem` alias via
+    /// The OpenCL backend on Adreno (with `--opencl-rpcmem`) can convert a
+    /// host-mapped pointer (returned by `RpcmemSecondaryStore::host_ptr_for`)
+    /// into a `cl_mem` alias via
     /// `CL_MEM_USE_HOST_PTR`, eliminating the `clEnqueueWriteBuffer` H2D copy
     /// during weight swap. The returned buffer holds the supplied lifetime
     /// guards (`secondary_arc` + `layer_region`) so the rpcmem allocation
@@ -1025,13 +1025,13 @@ pub trait Backend: Send + Sync {
 
     /// 14-node single-layer graph dispatch (qnn_oppkg M3.3에서 본격 구현).
     ///
-    /// QNN OpPackage M3 (ENG-QNN-211/213/214/INV-175): `supports_layer_graph()`
+    /// Layer graph fast path (ENG-QNN-211/213/214/INV-175): `supports_layer_graph()`
     /// 가 true인 backend는 `transformer.rs::forward_into` layer loop가 layer
     /// 1개를 본 method 1회 호출로 처리하도록 사용한다. trait method (matmul/
     /// rope/attention_gen 등) 호출은 fallback debug 경로로만 남으며, fast path
     /// 정상 동작 시 호출 횟수는 0이어야 한다 (INV-175).
     ///
-    /// Default: 미지원 backend는 `Err`. M3.3에서 `QnnOppkgBackend`가 본격 override.
+    /// Default: 미지원 backend는 `Err`.
     #[allow(unused_variables, clippy::too_many_arguments)]
     fn execute_layer_graph(
         &self,
@@ -1252,8 +1252,6 @@ pub trait Backend: Send + Sync {
     /// - `CpuBackend` (NEON / AVX2 / generic): returns `self`.
     /// - `OpenCLBackend` / `CudaBackend` (PC + embedded): return their owned
     ///   `cpu_companion` injected at construction time.
-    /// - `QnnOppkgBackend`: returns `self` (routes through its OpenCL
-    ///   secondary slot for actual host fallback at the call site).
     ///
     /// No default impl: returning `self` here would coerce `&Self` to
     /// `&dyn Backend`, which Rust forbids without a `Self: Sized` bound;

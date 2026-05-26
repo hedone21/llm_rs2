@@ -273,10 +273,10 @@ pub struct Args {
     #[arg(short, long, default_value_t = 20)]
     pub num_tokens: usize,
 
-    /// Backend to use: "cpu", "opencl", "qnn_oppkg", or "cuda" (build with --features cuda).
-    /// Default: Android target → "qnn_oppkg" (Adreno production path), else → "cpu".
+    /// Backend to use: "cpu", "opencl", or "cuda" (build with --features cuda).
+    /// Default: Android target → "opencl" (Adreno production path), else → "cpu".
     #[cfg(target_os = "android")]
-    #[arg(short, long, default_value = "qnn_oppkg")]
+    #[arg(short, long, default_value = "opencl")]
     pub backend: String,
 
     #[cfg(not(target_os = "android"))]
@@ -293,6 +293,18 @@ pub struct Args {
     /// `--prefill-cpu-chunk-size > 0`, `--enable-resilience`.
     #[arg(long, default_value_t = false)]
     pub no_zero_copy: bool,
+
+    /// Sprint 2a Phase 2 (ENG-RPCMEM-040): enable rpcmem DMA-BUF zero-copy
+    /// allocation for KV cache and precision swap secondary store.
+    ///
+    /// Adreno Android only — host builds receive a warning and silently
+    /// demote. Requires `--backend opencl`.
+    ///
+    /// When active, OpenCL backend eagerly dlopens `libcdsprpc.so` and shares
+    /// a single `Arc<RpcmemAllocator>` between `OpenCLMemory::alloc_kv`
+    /// (KV path) and `RpcmemSecondaryStore` (precision swap secondary).
+    #[arg(long, default_value_t = false)]
+    pub opencl_rpcmem: bool,
 
     #[arg(long, default_value_t = 2048)]
     pub max_seq_len: usize,
@@ -1140,27 +1152,6 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub swap_no_throttle: bool,
 
-    // ── QNN OpPackage backend (M3, ENG-QNN-220) ─────────────────
-    /// Eager prebuild of all 28 layer graphs at model load time
-    /// (ENG-QNN-209, D1 결정).
-    ///
-    /// `true` (default): model load 시점에 N×`graphFinalize` (≤ 200 ms/layer)
-    /// 직렬 실행. Decode 동안 추가 finalize는 0회 (INV-167).
-    /// `false`: lazy build (M3.5 timebox 미사용 시 진입 불가, debug 용도).
-    ///
-    /// 본 flag는 `--backend qnn_oppkg | qnngpu` 활성 시에만 유효하다.
-    #[arg(long, default_value_t = true)]
-    pub qnn_graph_cache_prebuild: bool,
-
-    /// Allow trait fallback path when graph fast path fails (ENG-QNN-220).
-    ///
-    /// `false` (default): fast path 실패 시 즉시 `Err`. INV-175 (fallback count
-    /// == 0) 게이트와 정합한다.
-    /// `true`: debug 용도 — fast path 실패 시 OpenCL secondary backend로
-    /// fallback. production 측정에서는 OFF 유지.
-    #[arg(long, default_value_t = false)]
-    pub qnn_allow_fallback: bool,
-
     /// Top-level subcommand wrapper.
     ///
     /// `eviction <policy>` form is the only currently registered
@@ -1263,6 +1254,19 @@ impl Args {
         match self.kv_mode_args.kv_mode {
             KvMode::Offload => self.kv_mode_args.kv_offload_storage.clone(),
             _ => String::new(),
+        }
+    }
+
+    /// ENG-RPCMEM-041 / INV-RPCMEM-006: effective `--opencl-rpcmem` 값.
+    ///
+    /// Sprint 2b: qnn_oppkg backend 제거됨. `--backend qnn_oppkg | qnngpu` 는
+    /// 실제 backend init 에서 unknown backend 로 bail 하므로 이 분기는 production
+    /// 경로에서 unreachable 하다. INV-RPCMEM-006 spec test 호환을 위해 보존.
+    pub fn effective_opencl_rpcmem(&self) -> bool {
+        if self.backend == "qnn_oppkg" || self.backend == "qnngpu" {
+            false
+        } else {
+            self.opencl_rpcmem
         }
     }
 

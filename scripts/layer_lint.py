@@ -49,7 +49,6 @@ LAYER_RULES = [
     ("backend/cpu",             "L1"),
     ("backend/cuda_embedded",   "L1"),
     ("backend/cuda_pc",         "L1"),
-    ("backend/qnn_oppkg",       "L1"),
     ("backend",                 "L1"),
 
     # L2: shared buffer/memory abstractions + generic types
@@ -271,9 +270,7 @@ def _extract_backend(rel_path: str) -> str:
 # ARCHITECTURE.md §13.8-K — Sub-layer dependency 허용 화이트리스트.
 # (source_backend, target_backend) 페어. source가 target의 런타임 substrate
 # (메모리/context owner)에 해당하는 경우만 등록 가능 — 일반 fallback은 제외.
-ALLOWED_BACKEND_CHAINS: set[tuple[str, str]] = {
-    ("qnn_oppkg", "opencl"),  # qnn_oppkg가 OpenCL secondary slot 위에서 동작 (rpcmem DMA-BUF interop)
-}
+ALLOWED_BACKEND_CHAINS: set[tuple[str, str]] = set()  # qnn_oppkg→opencl chain은 Sprint 2b (2026-05-26) 에서 제거됨
 
 
 def check_cross_backend(src_rel: str, import_path: str) -> tuple[str | None, str | None]:
@@ -593,11 +590,7 @@ KNOWN_V_MAP = [
     (r"backend/opencl/",                r"resilience::gpu_self_meter",   "V-01"),
     # V-02: backend/opencl/plan.rs → layers::tensor_partition, layers::workspace
     (r"backend/opencl/plan\.rs",         r"layers::",                    "V-02"),
-    # V-03: backend/qnn_oppkg/ → models::weights (LayerSlot), layers::transformer_layer
-    (r"backend/qnn_oppkg/",              r"models::weights",             "V-03"),
-    (r"backend/qnn_oppkg/layer_graph",   r"layers::transformer_layer",   "V-03"),
-    # V-04: backend/qnn_oppkg/ → backend::opencl (cross-backend)
-    (r"backend/qnn_oppkg/mod\.rs",       r"backend::opencl::OpenCLBackend", "V-04"),
+    # V-03/V-04: backend/qnn_oppkg/ 관련 패턴은 Sprint 2b (2026-05-26) 에서 production 제거됨
     # V-05: backend/cuda_*/ → backend::cpu::CpuBackend (cpu_fallback)
     (r"backend/cuda_(embedded|pc)/mod\.rs", r"backend::cpu::CpuBackend", "V-05"),
     # V-06: backend/cpu/x86.rs, neon.rs → cpu/common (동일 backend 내부 — 허용)
