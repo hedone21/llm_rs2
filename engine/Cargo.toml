@@ -80,6 +80,9 @@ vulkan = ["ash"]                # Vulkan PoC (microbench bins only)
 qnn = ["libloading", "bindgen", "dep:qnn_oppkg"]  # QNN HTP PoC + M3 backend wire-up
 cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)
 cuda-embedded = ["cudarc"]      # Embedded UMA version, e.g. Jetson Xavier (cuda_embedded/)
+# Q-2.2-α HTP FastRPC PoC backend. QNN SDK 의존 0, libcdsprpc.so dlopen + 자체
+# HVX skel (llama.cpp Path B 차용). default OFF. target = aarch64-linux-android.
+htp_fastrpc = ["libloading"]
 resilience = ["zbus"]
 
 # ─── Microbench / probe binaries (Phase 4-D: moved from src/bin/) ───

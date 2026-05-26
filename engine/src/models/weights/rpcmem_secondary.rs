@@ -372,10 +372,7 @@ impl RpcmemSecondaryStore {
     /// region has been allocated. Silent no-op when prerequisites are
     /// missing (no backend / no self_weak / non-OpenCL backend) — the swap
     /// path falls back to direct allocation in that case.
-    #[cfg_attr(
-        not(feature = "opencl"),
-        allow(unused_variables, unused_mut)
-    )]
+    #[cfg_attr(not(feature = "opencl"), allow(unused_variables, unused_mut))]
     fn populate_alias_cache_for_layer(&self, layer_idx: usize, region: &Arc<RpcmemLayerRegion>) {
         // Both prerequisites must be installed; otherwise skip caching.
         let Some(secondary_arc) = self.self_weak.get().and_then(Weak::upgrade) else {

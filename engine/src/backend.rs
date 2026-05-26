@@ -29,6 +29,11 @@ pub mod opencl;
 #[cfg(feature = "qnn")]
 pub mod qnn_oppkg;
 
+// HTP FastRPC backend (Q-2.2-α PoC, INV-HTP-FRPC-001~005).
+// QNN SDK 의존 0; libcdsprpc.so dlopen + 자체 HVX skel 차용.
+#[cfg(feature = "htp_fastrpc")]
+pub mod htp_fastrpc;
+
 // ============================================================================
 // Backend trait + GpuEvent (originally `core/backend.rs`).
 // ============================================================================
