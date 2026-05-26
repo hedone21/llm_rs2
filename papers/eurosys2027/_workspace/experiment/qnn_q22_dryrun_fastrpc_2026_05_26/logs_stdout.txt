@@ -1,0 +1,22 @@
+=== microbench_htp_fastrpc_dryrun (Q-2.2 dry-run B) ===
+
+[1/4] dlopen OK: /vendor/lib64/libcdsprpc.so
+[1/4] using: /vendor/lib64/libcdsprpc.so
+
+[2/4] dlsym remote_session_control OK
+
+[3/4] FASTRPC_RESERVE_NEW_SESSION (req_id=13, struct size=40)
+      domain="cdsp" (len=4), session="llmrs_dryrun" (len=12)
+[3/4] ✓ PASS — effective_domain_id=7, session_id=1
+      ⇒ FastRPC channel open 성공 (Q-2.1 QNN domain_init 차단과 대비)
+
+[4/4] DSPRPC_CONTROL_UNSIGNED_MODULE (req_id=2, struct size=8)
+      domain=7, enable=1
+[4/4] ✓ PASS — unsigned PD 활성화 성공
+
+=== ALL PASS — Q-2.2 진입 GREEN ===
+  • FastRPC channel: open OK
+  • Unsigned PD: enabled OK
+  • 가설 정밀화: Q-2.1 차단은 QNN backend 의 domain_init vendor control 에 한정.
+                  FastRPC layer 자체는 stock S25 에서 살아있음.
+  • 다음: Q-2.2-α Architect spec (FastRPC IDL backend 신설)

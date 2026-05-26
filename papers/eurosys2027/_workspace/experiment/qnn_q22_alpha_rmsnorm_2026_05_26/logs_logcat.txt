@@ -1,0 +1,2 @@
+05-26 13:37:54.652 25619 25619 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/rpcmem_android.c:357: rpcmem_deinit_internal done
+05-26 13:37:54.652 25619 25619 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4858: fastrpc_apps_user_deinit done
