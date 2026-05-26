@@ -1,9 +1,9 @@
-# Handoff: Q-2.2-α PoC 종결 (AMBER) → Q-2.2-β.IDL 진입
+# Handoff: Q-2.2-α PoC 종결 (AMBER) → Q-2.2-β.START 진입
 
-**작성**: 2026-05-26 (2026-05-26 grill-me 검토 후 정정)
+**작성**: 2026-05-26 (2026-05-26 두 차례 grill-me 검토 후 정정 — qaic dependency 제거 + stop scope 추가 + path A 정의 정밀화)
 **HEAD**: `222f5016 feat(htp-fastrpc): Q-2.2-α Phase 6 — stock S25 raw HTP path 부분 GREEN`
 **worktree**: `.claude/worktrees/b5_trait_extension`
-**다음 세션 진입 문장**: **"Q-2.2-β.IDL 진입 — qaic 자동 stub 추출 후 htp_iface_start 정확 구현 + rmsnorm dispatch GREEN"**
+**다음 세션 진입 문장**: **"Q-2.2-β.START 진입 — llama.cpp build tree stub 의 lifecycle 4 method (start/stop/ETM×2) 직접 transcribe + Drop integration + rmsnorm dispatch GREEN"**
 
 ---
 
@@ -88,25 +88,27 @@ I microbench_htp_rmsnorm: ... dspqueue_close: closed Queue 0, 0xb400007e3943f010
 
 ---
 
-## 다음 작업: β 단계 분할 (β-1.IDL → β-2.MM)
+## 다음 작업: β 단계 분할 (β-1.START → β-2.MM)
 
 PoC 본질 = MatMul HTP NPU GREEN. 단일 sprint 가 아닌 2 sub-sprint 분할:
 
-### β-1.IDL: htp_iface_start IDL stub + rmsnorm dispatch GREEN (3-4h)
+### β-1.START: lifecycle 4 method transcribe + start/stop + rmsnorm dispatch GREEN (3-3.5h)
 
-**검증 게이트**: `microbench_htp_rmsnorm` 재실행 → Stage 5 (dspqueue_write) rc=0 + DSP rsp.status == HTP_STATUS_OK + correctness `max_abs_err < 1e-3` vs CPU baseline (gamma=1).
+**검증 게이트**: `microbench_htp_rmsnorm` 재실행 → Stage 5 (dspqueue_write) rc=0 + DSP rsp.status == HTP_STATUS_OK + correctness `max_abs_err < 1e-3` vs CPU baseline (gamma=1) + logcat 에 stop 호출 흔적 (Drop RAII).
 
-작업 분해 (qaic 가용성 사전 verify 완료, `/opt/hexagon/6.4.0.2/ipc/fastrpc/qaic/bin/qaic`):
+**핵심 결정**: qaic 우리 pipeline 진입 불필요. llama.cpp build tree 의 자동 생성 stub `.c` 가 이미 deterministic 상태로 존재. 우리는 4 lifecycle method 의 sc/pra layout 을 Rust 로 transcribe.
+
+작업 분해:
 
 | 단계 | 작업 | 추정 | Risk | Fallback |
 |---|---|---|---|---|
-| β-1.1 | Docker 안 `qaic` 로 `htp_iface.idl` 컴파일 → `htp_iface_stub.c` 자동 생성 + `htp_iface_start` 의 `sc` macro + `pra` packing 코드 추출 | 30 min | 낮음 (qaic 동작 verify 됨) | SDK header `remote.h` 의 macro manual 분석 (+1-2h) |
-| β-1.2 | `engine/src/backend/htp_fastrpc/host.rs::try_start_iface` 정확 구현 교체 (`remote_arg pra[]` Rust struct + `remote_handle64_invoke(handle, sc, pra)`) | 1-1.5h | 중간 (C union → Rust repr(C) 정확 매핑) | n_hvx sweep (1/2/4) |
+| β-1.1 | `/home/go/Workspace/llama.cpp/build-snapdragon/ggml/src/ggml-hexagon/htp_iface_stub.c` 의 4 lifecycle method (start/stop/enable_etm/disable_etm) sc/pra layout + `methods[]` method id 정밀 추출. qaic 안 씀 — 자동 생성 산출물 deterministic | 35 min | 낮음 (build tree 산출물 결정적, llama.cpp 가 검증) | — |
+| β-1.2 | `engine/src/backend/htp_fastrpc/host.rs::try_start_iface` 정확 구현 교체 + `try_stop_iface` 신설 + `Drop` impl 에서 stop 호출 (RAII cleanup). ETM 2 method 은 stub + TODO (profiling 인프라 통합 시) | 1.5-2h | 중간 (C union → Rust repr(C) 정확 매핑) | n_hvx sweep (1/2/4) |
 | β-1.3 | host build + clippy + Android cross-build | 15 min | 낮음 | — |
-| β-1.4 | microbench_htp_rmsnorm S25 재실행 + correctness gate | 30 min | 중간 (packet schema mismatch 시 rsp.status != OK 가능) | logcat 분석 + llama.cpp `htp_tensor_init` byte 비교 |
-| β-1.5 | report.md + commit + β-2.MM handoff | 30 min | 낮음 | — |
+| β-1.4 | microbench_htp_rmsnorm S25 재실행 + correctness gate (rc=0, rsp.status OK, max_abs_err < 1e-3) + logcat 에 stop 호출 흔적 검증 | 30 min | 중간 (packet schema mismatch 시 rsp.status != OK 가능) | logcat 분석 + llama.cpp `init_general_req` byte 비교, n_hvx sweep |
+| β-1.5 | `papers/.../qnn_q22_beta_start_<date>/report.md` + commit + β-2.MM handoff | 30 min | 낮음 | — |
 
-n_hvx default = 4 (llama.cpp `opt_nhvx`).
+n_hvx default = 4 (llama.cpp `opt_nhvx`). ETM = ARM/Hexagon Embedded Trace Macrocell (hardware trace unit), 본 PoC scope 외 — profiling 인프라 통합 시 구현.
 
 ### β-2.MM: matmul Q-proj HTP NPU GREEN + 정확성 (4-5h)
 
@@ -132,7 +134,7 @@ n_hvx default = 4 (llama.cpp `opt_nhvx`).
 
 ### 위험 시나리오
 
-- β-1 IDL stub fail (qaic 출력이 기대와 다름) → SDK header manual 분석으로 fallback (+1-2h)
+- β-1 packet schema mismatch (sc bits / pra layout 오해석) → llama.cpp `init_general_req` byte-level 비교 verify + n_hvx sweep (1/2/4)
 - β-1 PASS 후 β-2 packet schema mismatch → llama.cpp `init_matmul_req` 의 byte-level 비교 verify
 - HVX op 가 stock device 에서 차단 (signed-only 강제) → 가능성 낮음 (libggml-htp-v79.so dlopen 자체는 PASS 했으므로 unsigned PD 정책 적용 중)
 
@@ -144,7 +146,7 @@ n_hvx default = 4 (llama.cpp `opt_nhvx`).
 - **llama.cpp `HTP_OP_RMS_NORM` 은 gamma 미적용** (unary-ops.c::rms_norm_f32). 본 sprint 의 3-way correctness 는 CPU/OpenCL baseline 도 gamma=1.0 fill 로 비교. β 단계의 진짜 gamma 적용 RMSNorm 은 HTP_OP_MUL chain 필요 — 별 작업.
 - **dspqueue_write rc=0x48** (DSP worker not attached): 본 sprint 의 미해결 issue. β.IDL 진입점.
 - **`htp_iface.idl` start method 의 `attr` byte**: SDK header 의 attr enum 정확값 미확정 (보통 0 이지만 IDL annotation 따라 다름). qaic 자동 stub 실행 시 정확값 도출 필요.
-- **path A (자체 IDL + qaic + HVX skel) 는 본 sprint 에서 미진입**. β 의 IDL stub 작업 성공 후에도 path A 는 별 sprint (matmul 등 자체 op 작성 시점에 필요).
+- **path A (자체 HVX skel 빌드) 는 본 sprint 에서 미진입**. **path B 만으로 LLM 전체 forward path cover 가능** — llama.cpp skel 의 op 25개 (MUL_MAT/RMS_NORM/ROPE/FLASH_ATTN_EXT/GLU_SWIGLU/CPY/SOFTMAX 등) + dtype 7종 (F32/F16/Q4_0/Q8_0/I32/I64/MXFP4) + lifecycle 4 method 가 이미 완비. β-1/β-2 GREEN 후 β-3+ 는 packet enum 추가만으로 LLM 전체 ARGUS backend 도달 가능. path A 진입은 우리만의 fused op / KV layout / production governance 요구 발생 시 (PoC scope 외). 자체 IDL + qaic 도 path A 진입 후 **lifecycle 변경 시에만** 필요 (대부분 시나리오는 llama.cpp IDL source-level reuse).
 - **dry-run prototype (microbench_htp_fastrpc_dryrun) 의 fastrpc mod**: 본 sprint backend skeleton 으로 흡수 완료. dry-run 자체는 그대로 microbench 유지 — β 진입 후 polishing 또는 삭제 결정.
 
 ---

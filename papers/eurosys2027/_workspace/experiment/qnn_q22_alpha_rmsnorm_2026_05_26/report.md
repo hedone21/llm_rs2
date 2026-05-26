@@ -38,7 +38,7 @@
 - `dspqueue_create(128KB req, 64KB resp)` + `dspqueue_export` → `queue_id=33002528702464` ✓
 - `dspqueue_write` ✗ **rc=0x48** (DSP-side worker 미시작, `htp_iface_start` IDL 호출 누락)
 
-⇒ FastRPC channel + handle + queue 모두 정상 setup. 실제 op dispatch (dspqueue_write) 만 IDL stub 정확 구현 부재로 차단. **β 단계 진입점**: `htp_iface_start` IDL invocation 정확 구현 (`REMOTE_SCALARS_MAKEX` macro + `remote_handle64_invoke` parameter array layout).
+⇒ FastRPC channel + handle + queue 모두 정상 setup. 실제 op dispatch (dspqueue_write) 만 lifecycle `htp_iface_start` 의 sc/pra layout 부정확으로 차단. **β 단계 진입점**: llama.cpp build tree `htp_iface_stub.c` 의 lifecycle 4 method 자동 생성 stub 을 직접 transcribe → `host.rs` 의 `try_start_iface` + `try_stop_iface` 정확 구현 + Drop RAII (qaic 우리 pipeline 진입 불필요 — 산출물 deterministic).
 
 ---
 
@@ -119,20 +119,25 @@ CPU 1.00× baseline, OpenCL 185× slower (dispatch overhead, scale 작음 — `[
 
 ---
 
-## β 단계 진입점
+## β 단계 진입점 (Q-2.2-β.START)
 
 다음 sprint 명확한 진입:
 
-1. **`htp_iface_start` IDL stub 정확 구현** (1 method, ~150 LOC):
-   - `REMOTE_SCALARS_MAKEX(attr=0, method=0, in_h=0, out_h=0, in_b=3, out_b=0)` macro 값 확정
-   - `remote_arg pra[3] = [{u32 sess_id}, {u64 dsp_queue_id}, {u32 n_hvx}]` parameter array layout
-   - `remote_handle64_invoke(handle, sc, pra)` 호출
-   - HVX thread 수 결정 (default = `n_hvx=4`)
-2. **Re-run Phase 6** → dspqueue_write rc=0 GREEN 기대
-3. **rms_norm correctness gate** (max_abs_err < 1e-3 vs CPU baseline)
-4. **3-way timing** complete table 생성
+1. **llama.cpp build tree stub transcribe** (qaic 우리 pipeline 진입 불필요):
+   - source: `/home/go/Workspace/llama.cpp/build-snapdragon/ggml/src/ggml-hexagon/htp_iface_stub.c`
+   - 추출 대상: 4 lifecycle method (`start`, `stop`, `enable_etm`, `disable_etm`) 의 sc/pra layout + `methods[]` table 의 method id 4개
+   - 자동 생성 산출물이 deterministic 상태로 존재 → llama.cpp 가 이미 검증
+2. **host.rs 정확 구현**:
+   - `try_start_iface` body 교체 (`sess_id` u32 + `dsp_queue_id` u64 + `n_hvx` u32 의 primary input packing)
+   - `try_stop_iface` 신설 + `Drop` impl 에서 stop 호출 (RAII cleanup)
+   - ETM 2 method (`enable_etm`/`disable_etm`) 은 stub + TODO — profiling 인프라 통합 시 활용 (ARM/Hexagon Embedded Trace Macrocell, hardware trace unit)
+3. **Re-run Phase 6** → dspqueue_write rc=0 + DSP rsp.status == HTP_STATUS_OK GREEN
+4. **rms_norm correctness gate** (max_abs_err < 1e-3 vs CPU baseline gamma=1)
+5. **3-way timing** complete table + logcat 에 stop 호출 흔적 검증
 
-이후 β 의 본격 작업 (matmul Q-proj 등) 진입.
+β-1.START GREEN 후 β-2.MM (matmul Q-proj NPU GREEN + 정확성) — PoC 진짜 종결.
+
+**Path B 의 ceiling**: llama.cpp skel binary 가 op 25개 (MUL_MAT/RMS_NORM/ROPE/FLASH_ATTN_EXT/GLU_SWIGLU/SOFTMAX/CPY/GET_ROWS/SET_ROWS 등 LLM 전체 forward path) + dtype 7종 (F32/F16/Q4_0/Q8_0/I32/I64/MXFP4) + lifecycle 4 method 이미 cover. β-1/β-2 GREEN 이후 β-3+ 는 packet enum 추가만으로 LLM 전체 ARGUS backend 도달 가능. path A (자체 HVX skel 빌드) 진입은 우리만의 fused op / KV layout / production governance 요구 시 (PoC scope 외).
 
 ---
 
