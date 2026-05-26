@@ -1,0 +1,4 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b-q4_0.gguf
+Error: Unknown backend: qnn_oppkg. Use cpu, opencl, or cuda.
