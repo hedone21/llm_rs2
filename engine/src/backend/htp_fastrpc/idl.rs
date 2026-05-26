@@ -258,6 +258,37 @@ pub fn init_rmsnorm_req(req: &mut HtpGeneralReq, eps: f32, src0: HtpTensor, dst:
     req.dst = dst;
 }
 
+/// MUL_MAT op req 초기화. src0=weight (constant, e.g. Q4_0), src1=input (F32),
+/// dst=output (F32). op_params 슬롯 미사용 (flags 로만 제어).
+///
+/// llama.cpp `ggml-hexagon.cpp::init_binary_req<true>` 의 MUL_MAT 분기와 동일.
+/// `skip_quantize=true` 이면 host 가 src1 을 미리 양자화했음을 알림 (PoC 에서는
+/// 항상 false — DSP-side dynamic quantize 사용).
+///
+/// llama.cpp DSP-side 가 지원하는 weight dtype 은 Q4_0 / Q8_0 / MXFP4
+/// (`matmul-ops.c::htp_mminit_vec_dot`). F32 weight 미지원.
+pub fn init_matmul_req(
+    req: &mut HtpGeneralReq,
+    src0: HtpTensor,
+    src1: HtpTensor,
+    dst: HtpTensor,
+    skip_quantize: bool,
+) {
+    req.op = HTP_OP_MUL_MAT;
+    req.flags = if skip_quantize {
+        HTP_OPFLAGS_SKIP_QUANTIZE
+    } else {
+        0
+    };
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.src0 = src0;
+    req.src1 = src1;
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +333,44 @@ mod tests {
         // 미사용 src1~src4 는 zero
         assert_eq!(req.src1.type_, 0);
         assert_eq!(req.src1.ne, [0; HTP_MAX_DIMS]);
+    }
+
+    #[test]
+    fn init_matmul_req_packs_constants() {
+        // Qwen2.5-1.5B Q-proj shape: W[N=1536, K=1536] Q4_0, x[K=1536] F32, y[N=1536] F32
+        const K: u32 = 1536;
+        const N: u32 = 1536;
+        // Q4_0: nb[0] = sizeof(block_q4_0) = 18, nb[1] = (K/32)*18, nb[2..3] = N*nb[1]
+        let row_bytes_w = (K / 32) * 18;
+        let plane_bytes_w = N * row_bytes_w;
+        let src0 = htp_tensor_from_shape(
+            HTP_TYPE_Q4_0,
+            [K, N, 1, 1],
+            [18, row_bytes_w, plane_bytes_w, plane_bytes_w],
+        );
+        let src1 = htp_tensor_from_shape(HTP_TYPE_F32, [K, 1, 1, 1], [4, K * 4, K * 4, K * 4]);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [N, 1, 1, 1], [4, N * 4, N * 4, N * 4]);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_matmul_req(&mut req, src0, src1, dst, false);
+
+        assert_eq!(req.op, HTP_OP_MUL_MAT);
+        assert_eq!(req.flags, 0, "skip_quantize=false → flags=0");
+        assert_eq!(req.src0.type_, HTP_TYPE_Q4_0);
+        assert_eq!(req.src1.type_, HTP_TYPE_F32);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        // 미사용 src2..src4 zero
+        assert_eq!(req.src2.type_, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+        // op_params 는 MUL_MAT 에서 미사용
+        assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
+
+        // skip_quantize=true 분기
+        let mut req2 = HtpGeneralReq::zeroed();
+        init_matmul_req(&mut req2, src0, src1, dst, true);
+        assert_eq!(req2.flags, HTP_OPFLAGS_SKIP_QUANTIZE);
     }
 
     #[test]

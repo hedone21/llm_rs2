@@ -31,9 +31,10 @@ pub use host::{
     HTP_ARCH_V79, HtpFastrpcHost, RPCMEM_DEFAULT_FLAGS, RPCMEM_HEAP_ID_SYSTEM, RemoteHandle64,
 };
 pub use idl::{
-    DspqBufferType, HTP_MAX_DIMS, HTP_MAX_OP_PARAMS_SLOTS, HTP_MAX_PACKET_BUFFERS, HTP_OP_RMS_NORM,
-    HTP_TYPE_F16, HTP_TYPE_F32, HTP_TYPE_Q4_0, HTP_TYPE_Q8_0, HtpGeneralReq, HtpGeneralRsp,
-    HtpTensor, htp_tensor_from_shape, init_rmsnorm_req,
+    DspqBufferType, HTP_MAX_DIMS, HTP_MAX_OP_PARAMS_SLOTS, HTP_MAX_PACKET_BUFFERS, HTP_OP_MUL_MAT,
+    HTP_OP_RMS_NORM, HTP_OPFLAGS_SKIP_QUANTIZE, HTP_TYPE_F16, HTP_TYPE_F32, HTP_TYPE_Q4_0,
+    HTP_TYPE_Q8_0, HtpGeneralReq, HtpGeneralRsp, HtpTensor, htp_tensor_from_shape, init_matmul_req,
+    init_rmsnorm_req,
 };
 
 use std::sync::Arc;

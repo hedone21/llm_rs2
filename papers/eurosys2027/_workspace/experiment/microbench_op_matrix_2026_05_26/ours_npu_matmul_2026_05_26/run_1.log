@@ -1,0 +1,24 @@
+=== microbench_htp_matmul (Q-2.2 β G2 sprint) ===
+
+Config:
+  weight shape  = [N=1536, K=1536] Q4_0 (1327104 B)
+  input shape   = [K=1536] F32 (6144 B)
+  output shape  = [N=1536] F32 (6144 B)
+  warmup iter   = 10
+  measure iter  = 100
+  err thresh    = 0.05
+
+[1/2] CPU baseline (Q4_0 × F32 → F32, NEON matmul_transposed)
+  baseline magnitude: max|y| = 3.4304
+  mean=156.75 us (median=137.71, stddev=52.67, n=100)
+
+[2/2] QNN HTP NPU (FastRPC + libggml-htp-v79.so dspqueue)
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=7, session_id=1, queue_id=78082505441280
+  htp_iface_start: OK (n_hvx=0)
+  diag: rsp.op=4, status=1, prof_usecs=700, prof_cycles=1482626, prof_pkts=96942, rsp_buf_count=1
+  mean=151.73 us (median=146.88, stddev=25.88, n=100)
+  vs CPU: max_abs_err=2.224e-2, max_rel_err=1.860e1 — PASS
+
+=== Summary ===
+CPU:        156.75 us/op (1.00x baseline)
+QNN HTP:    151.73 us/op (0.97x, +3% vs CPU), err=2.22e-2
