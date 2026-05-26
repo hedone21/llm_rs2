@@ -467,13 +467,25 @@ impl HtpFastrpcHost {
         let rpcmem_to_fd: RpcmemToFdFn = dlsym!(lib, RpcmemToFdFn, b"rpcmem_to_fd\0");
         let fastrpc_mmap: FastrpcMmapFn = dlsym!(lib, FastrpcMmapFn, b"fastrpc_mmap\0");
         let fastrpc_munmap: FastrpcMunmapFn = dlsym!(lib, FastrpcMunmapFn, b"fastrpc_munmap\0");
-        // remote_register_buf_attr2 는 optional. libcdsprpc.so 의 strings export
-        // 에 존재 (S25 vendor lib 검증) 하지만 구 driver 호환 위해 None tolerant.
-        let remote_register_buf_attr2: Option<RemoteRegisterBufAttr2Fn> = unsafe {
-            lib.get::<RemoteRegisterBufAttr2Fn>(b"remote_register_buf_attr2\0")
-                .ok()
-                .map(|s| *s)
-        };
+        // remote_register_buf_attr2 — env var 로 control (옵션 D ablation).
+        //
+        // β-1.QUEUE.2 에서 `ref_count=-1` logcat 우회 위해 추가. 그러나 옵션 D
+        // (2026-05-26) 측정에서 `dspqueue_write rc=0xe (AEE_EUNABLETOLOAD)` fail
+        // 잔존. llama.cpp `ggml-hexagon.cpp` 는 `remote_register_buf_attr2` 호출
+        // 안 함 (fastrpc_mmap + FASTRPC_MAP_FD 만으로 dspqueue dispatch GREEN).
+        //
+        // default = OFF (llama.cpp 와 동일 path). 비교 ablation 필요시
+        // `HTP_FASTRPC_REGISTER_BUF=1` 환경변수로 강제 enable.
+        let remote_register_buf_attr2: Option<RemoteRegisterBufAttr2Fn> =
+            if std::env::var_os("HTP_FASTRPC_REGISTER_BUF").is_some() {
+                unsafe {
+                    lib.get::<RemoteRegisterBufAttr2Fn>(b"remote_register_buf_attr2\0")
+                        .ok()
+                        .map(|s| *s)
+                }
+            } else {
+                None
+            };
         let dspqueue_create: DspqueueCreateFn = dlsym!(lib, DspqueueCreateFn, b"dspqueue_create\0");
         let dspqueue_close: DspqueueCloseFn = dlsym!(lib, DspqueueCloseFn, b"dspqueue_close\0");
         let dspqueue_export: DspqueueExportFn = dlsym!(lib, DspqueueExportFn, b"dspqueue_export\0");
@@ -490,36 +502,52 @@ impl HtpFastrpcHost {
         let remote_session_control: RemoteSessionControlFn =
             dlsym!(lib, RemoteSessionControlFn, b"remote_session_control\0");
 
-        // ── Step 3: FASTRPC_RESERVE_NEW_SESSION ──
+        // ── Step 3: FASTRPC_RESERVE_NEW_SESSION (옵션 D 가설 3 ablation) ──
+        //
+        // llama.cpp `ggml-hexagon.cpp:1559-1577` 는 `dev_id != 0` 일 때만 RESERVE
+        // 호출. dev_id == 0 (single session) 은 RESERVE skip + `domain_id=3` /
+        // `session_id=0` hardcode. logcat 비교:
+        //   - llama.cpp (dev_id=0): `domain-id 3 session-id 0` → dispatch GREEN
+        //   - 우리 (RESERVE 항상): `domain_id=7 session_id=1` → dspqueue_write fail
+        //
+        // env `HTP_FASTRPC_DEV0_PATH=1` 로 dev_id=0 path 강제 (RESERVE skip).
+        // default = RESERVE 호출 (기존 동작).
         let mut domain_name = CDSP_DOMAIN_NAME.as_bytes().to_vec();
         domain_name.push(0); // null-terminate
         let mut session_name_bytes = session_name.as_bytes().to_vec();
         session_name_bytes.push(0);
 
-        let mut reserve_req = RemoteRpcReserveNewSession {
-            domain_name: domain_name.as_mut_ptr(),
-            domain_name_len: (domain_name.len() - 1) as u32,
-            session_name: session_name_bytes.as_mut_ptr(),
-            session_name_len: (session_name_bytes.len() - 1) as u32,
-            effective_domain_id: 0,
-            session_id: 0,
-        };
-        let reserve_size = core::mem::size_of::<RemoteRpcReserveNewSession>() as u32;
+        let (domain_id, session_id) = if std::env::var_os("HTP_FASTRPC_DEV0_PATH").is_some() {
+            // dev_id=0 path: RESERVE skip, CDSP default (domain 3, session 0).
+            (3i32, 0u32)
+        } else {
+            let mut reserve_req = RemoteRpcReserveNewSession {
+                domain_name: domain_name.as_mut_ptr(),
+                domain_name_len: (domain_name.len() - 1) as u32,
+                session_name: session_name_bytes.as_mut_ptr(),
+                session_name_len: (session_name_bytes.len() - 1) as u32,
+                effective_domain_id: 0,
+                session_id: 0,
+            };
+            let reserve_size = core::mem::size_of::<RemoteRpcReserveNewSession>() as u32;
 
-        // SAFETY: req struct + size 가 일치하며 buffer 는 stack live.
-        let rc = unsafe {
-            remote_session_control(
-                FASTRPC_RESERVE_NEW_SESSION,
-                &mut reserve_req as *mut _ as *mut c_void,
-                reserve_size,
+            // SAFETY: req struct + size 가 일치하며 buffer 는 stack live.
+            let rc = unsafe {
+                remote_session_control(
+                    FASTRPC_RESERVE_NEW_SESSION,
+                    &mut reserve_req as *mut _ as *mut c_void,
+                    reserve_size,
+                )
+            };
+            if rc != AEE_SUCCESS {
+                return Err(map_aee_err(rc))
+                    .with_context(|| "htp_fastrpc: FASTRPC_RESERVE_NEW_SESSION");
+            }
+            (
+                reserve_req.effective_domain_id as i32,
+                reserve_req.session_id,
             )
         };
-        if rc != AEE_SUCCESS {
-            return Err(map_aee_err(rc))
-                .with_context(|| "htp_fastrpc: FASTRPC_RESERVE_NEW_SESSION");
-        }
-        let domain_id = reserve_req.effective_domain_id as i32;
-        let session_id = reserve_req.session_id;
 
         // ── Step 4: DSPRPC_CONTROL_UNSIGNED_MODULE ──
         let mut unsigned_req = RemoteRpcControlUnsignedModule {
@@ -617,9 +645,18 @@ impl HtpFastrpcHost {
         }
 
         // ── Step 7: dspqueue_create(128KB req, 64KB resp) ──
+        //
+        // callback context 가설 (옵션 D 가설 2): llama.cpp `ggml-hexagon.cpp:1648`
+        // 는 `(void*) this` 전달. NULL 인 우리 동작이 root cause 가능성 — env
+        // `HTP_FASTRPC_NONNULL_CTX=1` 로 dummy non-null 전달. 2026-05-26 측정
+        // 에서 가설 ✗ (동일 rc=0xe). default = NULL (기존 동작).
         let mut queue: DspQueueT = core::ptr::null_mut();
-        // SAFETY: callback/context null OK (we drive read/write explicitly,
-        // ggml-hexagon 와 동일 policy).
+        let cb_ctx: *mut c_void = if std::env::var_os("HTP_FASTRPC_NONNULL_CTX").is_some() {
+            &handle as *const _ as *mut c_void
+        } else {
+            core::ptr::null_mut()
+        };
+        // SAFETY: callback null (explicit read/write), context per env.
         let rc = unsafe {
             dspqueue_create(
                 domain_id,
@@ -628,7 +665,7 @@ impl HtpFastrpcHost {
                 64 * 1024,  // resp queue
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
-                core::ptr::null_mut(),
+                cb_ctx,
                 &mut queue as *mut _,
             )
         };
