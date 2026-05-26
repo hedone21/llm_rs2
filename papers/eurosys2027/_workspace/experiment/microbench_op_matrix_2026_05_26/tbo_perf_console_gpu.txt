@@ -1,0 +1,311 @@
+ggml_opencl: selected platform: 'QUALCOMM Snapdragon(TM)'
+
+ggml_opencl: device: 'QUALCOMM Adreno(TM) 830 (OpenCL 3.0 Adreno(TM) 830)'
+ggml_opencl: OpenCL driver: OpenCL 3.0 QUALCOMM build: 0800.40.1 Compiler E031.47.18.36
+ggml_opencl: vector subgroup broadcast support: true
+ggml_opencl: device FP16 support: true
+ggml_opencl: mem base addr align: 128
+ggml_opencl: max mem alloc size: 1024 MB
+ggml_opencl: device max image buffer size (pixels): 134217728
+ggml_opencl: device max workgroup size: 1024
+ggml_opencl: SVM coarse grain buffer support: true
+ggml_opencl: SVM fine grain buffer support: true
+ggml_opencl: SVM fine grain system support: false
+ggml_opencl: SVM atomics support: true
+ggml_opencl: flattening quantized weights representation as struct of arrays (GGML_OPENCL_SOA_Q)
+ggml_opencl: using kernels optimized for Adreno (GGML_OPENCL_USE_ADRENO_KERNELS)
+ggml_opencl: loading OpenCL kernels..................................................................................................
+ggml_opencl: default device: 'QUALCOMM Adreno(TM) 830 (OpenCL 3.0 Adreno(TM) 830)'
+ggml-hex: Loading driver libcdsprpc.so
+ggml-hex: Hexagon backend (experimental) : allocating new registry : ndev 1
+ggml-hex: Hexagon Arch version v79
+ggml-hex: allocating new session: HTP0
+ggml-hex: new session: HTP0 : session-id 0 domain-id 3 uri file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 handle 0xb400007d06199250
+Testing 3 devices
+
+Backend 1/3: GPUOpenCL
+  Device description: QUALCOMM Adreno(TM) 830
+  Device memory: 0 MB (0 MB free)
+
+  ADD(type=f32,ne=[4096,1,1,1],nr=[1,1,1,1],nf=1,perm1=0):             65520 runs -    16.68 us/run -       48 kB/run - [1;34m   2.74 GB/s[0m
+  ADD(type=f32,ne=[4096,1,1,1],nr=[1,512,1,1],nf=1,perm1=0):                    2732 runs -   418.60 us/run -    24576 kB/run - [1;34m  55.99 GB/s[0m
+  SOFT_MAX(type=f32,ne=[4096,4096,5,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  52 runs - 38693.81 us/run -   655360 kB/run - [1;34m  16.31 GB/s[0m
+  SOFT_MAX(type=f32,ne=[12888,256,5,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 261 runs -  7705.07 us/run -   128880 kB/run - [1;34m  15.98 GB/s[0m
+  SOFT_MAX(type=f32,ne=[77,4096,5,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  2724 runs -  1752.88 us/run -    12320 kB/run - [1;34m   6.70 GB/s[0m
+  SOFT_MAX(type=f32,ne=[1024,1024,10,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                410 runs -  4082.30 us/run -    81920 kB/run - [1;34m  19.16 GB/s[0m
+  SOFT_MAX(type=f32,ne=[77,1024,10,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 5448 runs -  1166.34 us/run -     6160 kB/run - [1;34m   5.04 GB/s[0m
+  SOFT_MAX(type=f32,ne=[256,256,20,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 3277 runs -   599.78 us/run -    10240 kB/run - [1;34m  16.28 GB/s[0m
+  SOFT_MAX(type=f32,ne=[64,64,20,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  16382 runs -   107.82 us/run -      640 kB/run - [1;34m   5.66 GB/s[0m
+  SOFT_MAX(type=f32,ne=[77,64,20,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  16382 runs -   117.40 us/run -      770 kB/run - [1;34m   6.26 GB/s[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=16416,n=1,k=128,bs=[8,1],nr=[4,1],per=[0,2,1,3],k_v=0,o=1):                    744 runs - 20629.21 us/run - 134.48 MFLOP/run - [1;34m  6.52 GFLOPS[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=128,n=1,k=16416,bs=[8,1],nr=[4,1],per=[0,1,2,3],k_v=32832,o=1):                744 runs -  2980.73 us/run - 134.48 MFLOP/run - [1;34m 45.12 GFLOPS[0m
+  MUL_MAT(type_a=f32,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   852 runs -  6794.27 us/run - 117.44 MFLOP/run - [1;34m 17.29 GFLOPS[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   852 runs -  7274.49 us/run - 117.44 MFLOP/run - [1;34m 16.14 GFLOPS[0m
+  MUL_MAT(type_a=bf16,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  852 runs -  2183.03 us/run - 117.44 MFLOP/run - [1;34m 53.80 GFLOPS[0m
+  MUL_MAT(type_a=q4_1,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  852 runs -  2332.01 us/run - 117.44 MFLOP/run - [1;34m 50.36 GFLOPS[0m
+  MUL_MAT(type_a=q5_0,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q5_1,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q8_0,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  852 runs -  3311.14 us/run - 117.44 MFLOP/run - [1;34m 35.47 GFLOPS[0m
+  MUL_MAT(type_a=mxfp4,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                 852 runs -  3031.37 us/run - 117.44 MFLOP/run - [1;34m 38.74 GFLOPS[0m
+  MUL_MAT(type_a=q2_K,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q3_K,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  852 runs -  2260.07 us/run - 117.44 MFLOP/run - [1;34m 51.96 GFLOPS[0m
+  MUL_MAT(type_a=q5_K,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q6_K,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  852 runs -  7815.73 us/run - 117.44 MFLOP/run - [1;34m 15.03 GFLOPS[0m
+  MUL_MAT(type_a=iq2_xxs,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_xs,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_s,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_xxs,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_s,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_m,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_nl,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_s,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_xs,type_b=f32,m=4096,n=1,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=f32,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   426 runs - 100971.49 us/run - 234.88 MFLOP/run - [1;34m  2.33 GFLOPS[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   426 runs - 85909.97 us/run - 234.88 MFLOP/run - [1;34m  2.73 GFLOPS[0m
+  MUL_MAT(type_a=bf16,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  426 runs -  9691.15 us/run - 234.88 MFLOP/run - [1;34m 24.24 GFLOPS[0m
+  MUL_MAT(type_a=q4_1,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  426 runs - 10948.51 us/run - 234.88 MFLOP/run - [1;34m 21.45 GFLOPS[0m
+  MUL_MAT(type_a=q5_0,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q5_1,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q8_0,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  426 runs - 12244.70 us/run - 234.88 MFLOP/run - [1;34m 19.18 GFLOPS[0m
+  MUL_MAT(type_a=mxfp4,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                 426 runs -  6921.47 us/run - 234.88 MFLOP/run - [1;34m 33.94 GFLOPS[0m
+  MUL_MAT(type_a=q2_K,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q3_K,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  426 runs -  4864.11 us/run - 234.88 MFLOP/run - [1;34m 48.29 GFLOPS[0m
+  MUL_MAT(type_a=q5_K,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q6_K,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  426 runs - 21010.25 us/run - 234.88 MFLOP/run - [1;34m 11.18 GFLOPS[0m
+  MUL_MAT(type_a=iq2_xxs,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_xs,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_s,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_xxs,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_s,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_m,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_nl,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_s,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_xs,type_b=f32,m=4096,n=2,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=f32,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   284 runs - 104289.35 us/run - 352.32 MFLOP/run - [1;34m  3.38 GFLOPS[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   284 runs - 73512.44 us/run - 352.32 MFLOP/run - [1;34m  4.79 GFLOPS[0m
+  MUL_MAT(type_a=bf16,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  284 runs - 12677.46 us/run - 352.32 MFLOP/run - [1;34m 27.79 GFLOPS[0m
+  MUL_MAT(type_a=q4_1,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  284 runs - 17272.06 us/run - 352.32 MFLOP/run - [1;34m 20.40 GFLOPS[0m
+  MUL_MAT(type_a=q5_0,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q5_1,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q8_0,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  284 runs - 15678.18 us/run - 352.32 MFLOP/run - [1;34m 22.47 GFLOPS[0m
+  MUL_MAT(type_a=mxfp4,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                 284 runs - 10800.63 us/run - 352.32 MFLOP/run - [1;34m 32.62 GFLOPS[0m
+  MUL_MAT(type_a=q2_K,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q3_K,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  284 runs -  8293.56 us/run - 352.32 MFLOP/run - [1;34m 42.48 GFLOPS[0m
+  MUL_MAT(type_a=q5_K,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q6_K,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  284 runs - 30214.99 us/run - 352.32 MFLOP/run - [1;34m 11.66 GFLOPS[0m
+  MUL_MAT(type_a=iq2_xxs,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_xs,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_s,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_xxs,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_s,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_m,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_nl,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_s,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_xs,type_b=f32,m=4096,n=3,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=f32,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   213 runs - 108782.18 us/run - 469.76 MFLOP/run - [1;34m  4.32 GFLOPS[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   213 runs - 58587.98 us/run - 469.76 MFLOP/run - [1;34m  8.02 GFLOPS[0m
+  MUL_MAT(type_a=bf16,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  213 runs - 10056.49 us/run - 469.76 MFLOP/run - [1;34m 46.71 GFLOPS[0m
+  MUL_MAT(type_a=q4_1,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  213 runs - 11557.29 us/run - 469.76 MFLOP/run - [1;34m 40.65 GFLOPS[0m
+  MUL_MAT(type_a=q5_0,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q5_1,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q8_0,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  213 runs - 12123.09 us/run - 469.76 MFLOP/run - [1;34m 38.75 GFLOPS[0m
+  MUL_MAT(type_a=mxfp4,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                 213 runs - 10657.05 us/run - 469.76 MFLOP/run - [1;34m 44.08 GFLOPS[0m
+  MUL_MAT(type_a=q2_K,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q3_K,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  213 runs -  8551.37 us/run - 469.76 MFLOP/run - [1;34m 54.93 GFLOPS[0m
+  MUL_MAT(type_a=q5_K,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q6_K,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  213 runs - 41075.11 us/run - 469.76 MFLOP/run - [1;34m 11.44 GFLOPS[0m
+  MUL_MAT(type_a=iq2_xxs,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_xs,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_s,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_xxs,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_s,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_m,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_nl,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_s,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_xs,type_b=f32,m=4096,n=4,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=f32,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   171 runs - 114685.28 us/run - 587.20 MFLOP/run - [1;34m  5.12 GFLOPS[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   171 runs - 86164.24 us/run - 587.20 MFLOP/run - [1;34m  6.81 GFLOPS[0m
+  MUL_MAT(type_a=bf16,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  171 runs - 11094.02 us/run - 587.20 MFLOP/run - [1;34m 52.93 GFLOPS[0m
+  MUL_MAT(type_a=q4_1,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  171 runs - 13315.49 us/run - 587.20 MFLOP/run - [1;34m 44.10 GFLOPS[0m
+  MUL_MAT(type_a=q5_0,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q5_1,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q8_0,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  171 runs - 11632.30 us/run - 587.20 MFLOP/run - [1;34m 50.48 GFLOPS[0m
+  MUL_MAT(type_a=mxfp4,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                 171 runs - 12133.99 us/run - 587.20 MFLOP/run - [1;34m 48.39 GFLOPS[0m
+  MUL_MAT(type_a=q2_K,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q3_K,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  171 runs - 10269.78 us/run - 587.20 MFLOP/run - [1;34m 57.18 GFLOPS[0m
+  MUL_MAT(type_a=q5_K,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q6_K,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  171 runs - 59603.39 us/run - 587.20 MFLOP/run - [1;34m  9.85 GFLOPS[0m
+  MUL_MAT(type_a=iq2_xxs,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_xs,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_s,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_xxs,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_s,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_m,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_nl,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_s,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_xs,type_b=f32,m=4096,n=5,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=f32,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   107 runs - 112455.20 us/run - 939.52 MFLOP/run - [1;34m  8.35 GFLOPS[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   107 runs - 71327.58 us/run - 939.52 MFLOP/run - [1;34m 13.17 GFLOPS[0m
+  MUL_MAT(type_a=bf16,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  107 runs - 11149.28 us/run - 939.52 MFLOP/run - [1;34m 84.27 GFLOPS[0m
+  MUL_MAT(type_a=q4_1,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  107 runs - 13302.64 us/run - 939.52 MFLOP/run - [1;34m 70.63 GFLOPS[0m
+  MUL_MAT(type_a=q5_0,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q5_1,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q8_0,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  107 runs - 13685.18 us/run - 939.52 MFLOP/run - [1;34m 68.65 GFLOPS[0m
+  MUL_MAT(type_a=mxfp4,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                 107 runs - 25563.63 us/run - 939.52 MFLOP/run - [1;34m 36.75 GFLOPS[0m
+  MUL_MAT(type_a=q2_K,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q3_K,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  107 runs - 17002.55 us/run - 939.52 MFLOP/run - [1;34m 55.26 GFLOPS[0m
+  MUL_MAT(type_a=q5_K,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q6_K,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  107 runs - 77195.20 us/run - 939.52 MFLOP/run - [1;34m 12.17 GFLOPS[0m
+  MUL_MAT(type_a=iq2_xxs,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_xs,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_s,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_xxs,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_s,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_m,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_nl,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_s,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_xs,type_b=f32,m=4096,n=8,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=f32,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   2 runs - 992269.50 us/run -  60.13 GFLOP/run - [1;34m 60.60 GFLOPS[0m
+  MUL_MAT(type_a=f16,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                   2 runs - 668875.50 us/run -  60.13 GFLOP/run - [1;34m 89.90 GFLOPS[0m
+  MUL_MAT(type_a=bf16,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_0,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  8 runs - 145602.50 us/run -  60.13 GFLOP/run - [1;34m412.97 GFLOPS[0m
+  MUL_MAT(type_a=q4_1,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  6 runs - 195355.50 us/run -  60.13 GFLOP/run - [1;34m307.80 GFLOPS[0m
+  MUL_MAT(type_a=q5_0,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q5_1,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q8_0,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  6 runs - 199769.50 us/run -  60.13 GFLOP/run - [1;34m300.99 GFLOPS[0m
+  MUL_MAT(type_a=mxfp4,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                 2 runs - 2099708.50 us/run -  60.13 GFLOP/run - [1;34m 28.64 GFLOPS[0m
+  MUL_MAT(type_a=q2_K,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q3_K,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q4_K,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  2 runs - 1724248.00 us/run -  60.13 GFLOP/run - [1;34m 34.87 GFLOPS[0m
+  MUL_MAT(type_a=q5_K,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=q6_K,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1):                  2 runs - 900780.50 us/run -  60.13 GFLOP/run - [1;34m 66.75 GFLOPS[0m
+  MUL_MAT(type_a=iq2_xxs,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_xs,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq2_s,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_xxs,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_s,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq1_m,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_nl,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq3_s,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  MUL_MAT(type_a=iq4_xs,type_b=f32,m=4096,n=512,k=14336,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1): not supported
+  FLASH_ATTN_EXT(hsk=72,hsv=72,nh=16,nr23=[1,1],kv=5776,nb=5776,mask=0,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]): not supported
+  FLASH_ATTN_EXT(hsk=64,hsv=64,nh=8,nr23=[8,1],kv=7680,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                     795 runs - 15558.54 us/run - 125.83 MFLOP/run - [1;34m  8.09 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=64,hsv=64,nh=8,nr23=[8,1],kv=7680,nb=4,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                     199 runs - 122821.79 us/run - 503.32 MFLOP/run - [1;34m  4.10 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=64,hsv=64,nh=8,nr23=[1,1],kv=4096,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                    8190 runs -  1825.61 us/run -   8.39 MFLOP/run - [1;34m  4.59 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=64,hsv=64,nh=8,nr23=[4,1],kv=4096,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                    2981 runs -  2387.92 us/run -  33.55 MFLOP/run - [1;34m 14.05 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=128,hsv=128,nh=8,nr23=[1,1],kv=4096,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                  5961 runs -  9205.87 us/run -  16.78 MFLOP/run - [1;34m  1.82 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=128,hsv=128,nh=8,nr23=[4,1],kv=4096,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                  1491 runs - 18553.05 us/run -  67.11 MFLOP/run - [1;34m  3.62 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=64,hsv=64,nh=8,nr23=[1,1],kv=8192,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                    5961 runs -  4936.24 us/run -  16.78 MFLOP/run - [1;34m  3.40 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=64,hsv=64,nh=8,nr23=[4,1],kv=8192,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                    1491 runs -  5280.03 us/run -  67.11 MFLOP/run - [1;34m 12.71 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=128,hsv=128,nh=8,nr23=[1,1],kv=8192,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                  2981 runs - 19772.41 us/run -  33.55 MFLOP/run - [1;34m  1.70 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=128,hsv=128,nh=8,nr23=[4,1],kv=8192,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                   746 runs - 40280.37 us/run - 134.22 MFLOP/run - [1;34m  3.33 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=64,hsv=64,nh=8,nr23=[1,1],kv=16384,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                   2981 runs - 11157.86 us/run -  33.55 MFLOP/run - [1;34m  3.01 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=64,hsv=64,nh=8,nr23=[4,1],kv=16384,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                    746 runs - 14913.10 us/run - 134.22 MFLOP/run - [1;34m  9.00 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=128,hsv=128,nh=8,nr23=[1,1],kv=16384,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                 1491 runs - 37246.91 us/run -  67.11 MFLOP/run - [1;34m  1.80 GFLOPS[0m
+  FLASH_ATTN_EXT(hsk=128,hsv=128,nh=8,nr23=[4,1],kv=16384,nb=1,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_KV=f16,permute=[0,1,2,3]):                  373 runs - 72560.19 us/run - 268.44 MFLOP/run - [1;34m  3.70 GFLOPS[0m
+  SOFT_MAX(type=f32,ne=[8192,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                   8191 runs -   139.35 us/run -       64 kB/run - [1;34m   0.44 GB/s[0m
+  SOFT_MAX(type=f32,ne=[8192,4,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                   8191 runs -   141.99 us/run -      256 kB/run - [1;34m   1.72 GB/s[0m
+  SOFT_MAX(type=f32,ne=[8192,16,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  8191 runs -   159.66 us/run -     1024 kB/run - [1;34m   6.12 GB/s[0m
+  SOFT_MAX(type=f32,ne=[16384,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  8191 runs -   258.89 us/run -      128 kB/run - [1;34m   0.47 GB/s[0m
+  SOFT_MAX(type=f32,ne=[16384,4,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  8191 runs -   278.25 us/run -      512 kB/run - [1;34m   1.75 GB/s[0m
+  SOFT_MAX(type=f32,ne=[16384,16,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 8191 runs -   353.53 us/run -     2048 kB/run - [1;34m   5.53 GB/s[0m
+  SOFT_MAX(type=f32,ne=[32768,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  8191 runs -   459.00 us/run -      256 kB/run - [1;34m   0.53 GB/s[0m
+  SOFT_MAX(type=f32,ne=[32768,4,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  8191 runs -   531.99 us/run -     1024 kB/run - [1;34m   1.84 GB/s[0m
+  SOFT_MAX(type=f32,ne=[32768,16,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 8191 runs -   678.87 us/run -     4096 kB/run - [1;34m   5.75 GB/s[0m
+  SOFT_MAX(type=f32,ne=[65536,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  8191 runs -  1007.86 us/run -      512 kB/run - [1;34m   0.48 GB/s[0m
+  SOFT_MAX(type=f32,ne=[65536,4,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                  8191 runs -  1202.26 us/run -     2048 kB/run - [1;34m   1.62 GB/s[0m
+  SOFT_MAX(type=f32,ne=[65536,16,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 4097 runs -  1350.97 us/run -     8192 kB/run - [1;34m   5.78 GB/s[0m
+  SOFT_MAX(type=f32,ne=[131072,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 8191 runs -  2062.33 us/run -     1024 kB/run - [1;34m   0.47 GB/s[0m
+  SOFT_MAX(type=f32,ne=[131072,4,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 8191 runs -  2276.38 us/run -     4096 kB/run - [1;34m   1.72 GB/s[0m
+  SOFT_MAX(type=f32,ne=[131072,16,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                2049 runs -  2770.03 us/run -    16384 kB/run - [1;34m   5.64 GB/s[0m
+  SOFT_MAX(type=f32,ne=[262144,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 8191 runs -  4369.51 us/run -     2048 kB/run - [1;34m   0.45 GB/s[0m
+  SOFT_MAX(type=f32,ne=[262144,4,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 4097 runs -  4420.98 us/run -     8192 kB/run - [1;34m   1.77 GB/s[0m
+  SOFT_MAX(type=f32,ne=[262144,16,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                1025 runs -  5590.31 us/run -    32768 kB/run - [1;34m   5.59 GB/s[0m
+  SOFT_MAX(type=f32,ne=[524288,1,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 8191 runs -  8245.41 us/run -     4096 kB/run - [1;34m   0.47 GB/s[0m
+  SOFT_MAX(type=f32,ne=[524288,4,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 2049 runs -  8614.11 us/run -    16384 kB/run - [1;34m   1.81 GB/s[0m
+  SOFT_MAX(type=f32,ne=[524288,16,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=1.000000,max_bias=0.000000,inplace=0):                 513 runs - 10892.47 us/run -    65536 kB/run - [1;34m   5.74 GB/s[0m
+  ADD_ID(type_a=f32,type_b=f32,n_embd=2880,n_experts=128,n_experts_used=4,n_token=1):                  40955 runs -    27.43 us/run -       90 kB/run - [1;34m   3.13 GB/s[0m
+  ADD_ID(type_a=f32,type_b=f32,n_embd=2880,n_experts=32,n_experts_used=4,n_token=1):                   40955 runs -    27.01 us/run -       90 kB/run - [1;34m   3.18 GB/s[0m
+  ADD_ID(type_a=f32,type_b=f32,n_embd=2880,n_experts=128,n_experts_used=4,n_token=512):                  725 runs -  2878.69 us/run -    46335 kB/run - [1;34m  15.35 GB/s[0m
+  ADD_ID(type_a=f32,type_b=f32,n_embd=2880,n_experts=32,n_experts_used=4,n_token=512):                   728 runs -  2596.00 us/run -    46143 kB/run - [1;34m  16.95 GB/s[0m
+  ROPE(type=f32,ne_a=[128,32,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                2048 runs -  1078.69 us/run -    16386 kB/run - [1;34m  14.49 GB/s[0m
+  ROPE(type=f32,ne_a=[128,64,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                1024 runs -  2140.09 us/run -    32770 kB/run - [1;34m  14.61 GB/s[0m
+  ROPE(type=f32,ne_a=[80,32,512,1],n_dims=20,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                  3277 runs -  1101.83 us/run -    10242 kB/run - [1;34m   8.87 GB/s[0m
+  ROPE(type=f32,ne_a=[64,8,512,1],n_dims=64,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                   8191 runs -   283.93 us/run -     2050 kB/run - [1;34m   6.89 GB/s[0m
+  ROPE(type=f32,ne_a=[128,12,512,1],n_dims=128,mode=8,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                5455 runs -   571.52 us/run -     6152 kB/run - [1;34m  10.27 GB/s[0m
+  ROPE(type=f32,ne_a=[128,12,512,1],n_dims=128,mode=40,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):               5455 runs -   612.81 us/run -     6152 kB/run - [1;34m   9.57 GB/s[0m
+  ROPE(type=f32,ne_a=[80,16,2,1],n_dims=80,mode=24,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                  32764 runs -    36.52 us/run -       20 kB/run - [1;34m   0.52 GB/s[0m
+  ROPE(type=f32,ne_a=[128,32,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                 912 runs -  1106.64 us/run -    73633 kB/run - [1;34m  63.83 GB/s[0m
+  ROPE(type=f32,ne_a=[128,64,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                 684 runs -  2103.17 us/run -   147265 kB/run - [1;34m  67.56 GB/s[0m
+  ROPE(type=f32,ne_a=[80,32,512,1],n_dims=20,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                  1460 runs -  1092.48 us/run -    46021 kB/run - [1;34m  40.32 GB/s[0m
+  ROPE(type=f32,ne_a=[64,8,512,1],n_dims=64,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                   7290 runs -   271.80 us/run -     9205 kB/run - [1;34m  32.32 GB/s[0m
+  ROPE(type=f32,ne_a=[128,12,512,1],n_dims=128,mode=8,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                2430 runs -   574.37 us/run -    27619 kB/run - [1;34m  45.96 GB/s[0m
+  ROPE(type=f32,ne_a=[128,12,512,1],n_dims=128,mode=40,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):               2430 runs -   613.32 us/run -    27619 kB/run - [1;34m  43.04 GB/s[0m
+  ROPE(type=f32,ne_a=[80,16,2,1],n_dims=80,mode=24,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                  32760 runs -    34.26 us/run -       59 kB/run - [1;34m   1.66 GB/s[0m
+  ROPE(type=f32,ne_a=[128,32,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                2048 runs -  1082.06 us/run -    16386 kB/run - [1;34m  14.45 GB/s[0m
+  ROPE(type=f32,ne_a=[128,64,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                1024 runs -  2141.80 us/run -    32770 kB/run - [1;34m  14.60 GB/s[0m
+  ROPE(type=f32,ne_a=[80,32,512,1],n_dims=20,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                  3277 runs -  1140.63 us/run -    10242 kB/run - [1;34m   8.56 GB/s[0m
+  ROPE(type=f32,ne_a=[64,8,512,1],n_dims=64,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                   8191 runs -   285.23 us/run -     2050 kB/run - [1;34m   6.85 GB/s[0m
+  ROPE(type=f32,ne_a=[128,12,512,1],n_dims=128,mode=8,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                5455 runs -   590.65 us/run -     6152 kB/run - [1;34m   9.93 GB/s[0m
+  ROPE(type=f32,ne_a=[128,12,512,1],n_dims=128,mode=40,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):               5455 runs -   611.62 us/run -     6152 kB/run - [1;34m   9.59 GB/s[0m
+  ROPE(type=f32,ne_a=[80,16,2,1],n_dims=80,mode=24,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                  32764 runs -    32.22 us/run -       20 kB/run - [1;34m   0.60 GB/s[0m
+  ROPE(type=f32,ne_a=[128,32,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                 912 runs -  1195.84 us/run -    73633 kB/run - [1;34m  59.07 GB/s[0m
+  ROPE(type=f32,ne_a=[128,64,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                 456 runs -  2368.46 us/run -   147265 kB/run - [1;34m  59.99 GB/s[0m
+  ROPE(type=f32,ne_a=[80,32,512,1],n_dims=20,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                  1460 runs -  1191.89 us/run -    46021 kB/run - [1;34m  36.96 GB/s[0m
+  ROPE(type=f32,ne_a=[64,8,512,1],n_dims=64,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                   3645 runs -   285.54 us/run -     9205 kB/run - [1;34m  30.77 GB/s[0m
+  ROPE(type=f32,ne_a=[128,12,512,1],n_dims=128,mode=8,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                2430 runs -   594.17 us/run -    27619 kB/run - [1;34m  44.43 GB/s[0m
+  ROPE(type=f32,ne_a=[128,12,512,1],n_dims=128,mode=40,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):               2430 runs -   627.57 us/run -    27619 kB/run - [1;34m  42.06 GB/s[0m
+  ROPE(type=f32,ne_a=[80,16,2,1],n_dims=80,mode=24,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                  32760 runs -    35.87 us/run -       59 kB/run - [1;34m   1.59 GB/s[0m
+  ROPE(type=f16,ne_a=[128,32,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                4096 runs -  1056.00 us/run -     8194 kB/run - [1;34m   7.40 GB/s[0m
+  ROPE(type=f16,ne_a=[128,64,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                2048 runs -  2138.44 us/run -    16386 kB/run - [1;34m   7.31 GB/s[0m
+  ROPE(type=f16,ne_a=[80,32,512,1],n_dims=20,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                  6552 runs -  1141.70 us/run -     5122 kB/run - [1;34m   4.28 GB/s[0m
+  ROPE(type=f16,ne_a=[64,8,512,1],n_dims=64,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                   8191 runs -   283.28 us/run -     1026 kB/run - [1;34m   3.45 GB/s[0m
+  ROPE(type=f16,ne_a=[128,12,512,1],n_dims=128,mode=8,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                8191 runs -   573.78 us/run -     3080 kB/run - [1;34m   5.12 GB/s[0m
+  ROPE(type=f16,ne_a=[128,12,512,1],n_dims=128,mode=40,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):               8191 runs -   595.73 us/run -     3080 kB/run - [1;34m   4.93 GB/s[0m
+  ROPE(type=f16,ne_a=[80,16,2,1],n_dims=80,mode=24,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=0,inplace=0):                  32764 runs -    32.14 us/run -       10 kB/run - [1;34m   0.30 GB/s[0m
+  ROPE(type=f16,ne_a=[128,32,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                1824 runs -  1082.35 us/run -    36817 kB/run - [1;34m  32.54 GB/s[0m
+  ROPE(type=f16,ne_a=[128,64,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                 912 runs -  2139.49 us/run -    73633 kB/run - [1;34m  33.01 GB/s[0m
+  ROPE(type=f16,ne_a=[80,32,512,1],n_dims=20,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                  1459 runs -  1086.32 us/run -    23011 kB/run - [1;34m  20.24 GB/s[0m
+  ROPE(type=f16,ne_a=[64,8,512,1],n_dims=64,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                   7289 runs -   279.93 us/run -     4603 kB/run - [1;34m  15.69 GB/s[0m
+  ROPE(type=f16,ne_a=[128,12,512,1],n_dims=128,mode=8,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                2430 runs -   573.82 us/run -    13813 kB/run - [1;34m  22.98 GB/s[0m
+  ROPE(type=f16,ne_a=[128,12,512,1],n_dims=128,mode=40,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):               2430 runs -   578.70 us/run -    13813 kB/run - [1;34m  22.79 GB/s[0m
+  ROPE(type=f16,ne_a=[80,16,2,1],n_dims=80,mode=24,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=0,v=1,inplace=0):                  40950 runs -    24.92 us/run -       29 kB/run - [1;34m   1.14 GB/s[0m
+  ROPE(type=f16,ne_a=[128,32,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                4095 runs -   913.96 us/run -     8194 kB/run - [1;34m   8.55 GB/s[0m
+  ROPE(type=f16,ne_a=[128,64,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                2048 runs -  1679.67 us/run -    16386 kB/run - [1;34m   9.31 GB/s[0m
+  ROPE(type=f16,ne_a=[80,32,512,1],n_dims=20,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                  6551 runs -   881.08 us/run -     5122 kB/run - [1;34m   5.54 GB/s[0m
+  ROPE(type=f16,ne_a=[64,8,512,1],n_dims=64,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                   8191 runs -   187.03 us/run -     1026 kB/run - [1;34m   5.23 GB/s[0m
+  ROPE(type=f16,ne_a=[128,12,512,1],n_dims=128,mode=8,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                8191 runs -   323.38 us/run -     3080 kB/run - [1;34m   9.08 GB/s[0m
+  ROPE(type=f16,ne_a=[128,12,512,1],n_dims=128,mode=40,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):               8191 runs -   312.30 us/run -     3080 kB/run - [1;34m   9.41 GB/s[0m
+  ROPE(type=f16,ne_a=[80,16,2,1],n_dims=80,mode=24,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=0,inplace=0):                  57337 runs -    19.67 us/run -       10 kB/run - [1;34m   0.49 GB/s[0m
+  ROPE(type=f16,ne_a=[128,32,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                2736 runs -   474.81 us/run -    36818 kB/run - [1;34m  74.17 GB/s[0m
+  ROPE(type=f16,ne_a=[128,64,512,1],n_dims=128,mode=0,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                1368 runs -   898.82 us/run -    73634 kB/run - [1;34m  78.59 GB/s[0m
+  ROPE(type=f16,ne_a=[80,32,512,1],n_dims=20,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                  2918 runs -   489.71 us/run -    23011 kB/run - [1;34m  44.90 GB/s[0m
+  ROPE(type=f16,ne_a=[64,8,512,1],n_dims=64,mode=2,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                  14578 runs -   115.57 us/run -     4604 kB/run - [1;34m  38.01 GB/s[0m
+  ROPE(type=f16,ne_a=[128,12,512,1],n_dims=128,mode=8,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                4860 runs -   239.22 us/run -    13814 kB/run - [1;34m  55.13 GB/s[0m
+  ROPE(type=f16,ne_a=[128,12,512,1],n_dims=128,mode=40,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):               4860 runs -   253.83 us/run -    13814 kB/run - [1;34m  51.96 GB/s[0m
+  ROPE(type=f16,ne_a=[80,16,2,1],n_dims=80,mode=24,n_ctx=512,fs=1.000000,ef=0.000000,af=1.000000,ff=1,v=1,inplace=0):                  57330 runs -    17.81 us/run -       30 kB/run - [1;34m   1.61 GB/s[0m
+  SUM_ROWS(type=f32,ne=[8192,1,1,1],permute=0,slice=0):                49146 runs -    20.97 us/run -       32 kB/run - [1;34m   1.46 GB/s[0m
+  SUM_ROWS(type=f32,ne=[8192,8192,1,1],permute=0,slice=0):               256 runs -  6662.31 us/run -   262176 kB/run - [1;34m  37.82 GB/s[0m
+  SUM_ROWS(type=f32,ne=[128,8192,1,1],permute=0,slice=0):               8129 runs -   274.52 us/run -     4128 kB/run - [1;34m  14.34 GB/s[0m
+  ARGSORT(type=f32,ne=[65000,16,1,1],order=0): not supported
+  ARGSORT(type=f32,ne=[200000,1,1,1],order=0): not supported
+  ARGSORT(type=f32,ne=[200000,16,1,1],order=0): not supported
+  Backend OpenCL: [1;32mOK[0m
+Backend 2/3: HTP0
+  Skipping
+Backend 3/3: CPU
+  Skipping
+3/3 backends passed
+[1;32mOK[0m
