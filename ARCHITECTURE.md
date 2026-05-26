@@ -1987,7 +1987,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - §13.4 directory migration map에 "shared identifier promotion" 항목 추가 (TBD, B-2 완료 후).
   - 향후 유사 패턴(예: `OpKind`와 같이 양 도메인 공유 어휘) 식별 시 본 정책 참조.
   - 5건 이상 누적 시 §13.4에 *promotion register* 표 신설 검토 (§F allowlist 정책과 동일 운용 원리).
-- **§G 적용 register** (2026-05-24 표 형식으로 갱신, 6건 누적):
+- **§G 적용 register** (2026-05-26 표 형식으로 갱신, 6건 RESOLVED + 1건 CANDIDATE):
 
 | 식별자 | sprint | commit | 원위치 → 신위치 | 사용 도메인 | 격상 근거 |
 |---|---|---|---|---|---|
@@ -1997,6 +1997,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 | `CpuKernelSet` / `OpenClSecondary` / `SecondaryStore` | B-5b Phase 2 Stage 1 | (RESOLVED) | Backend trait capability 인프라 (`engine/src/cpu_kernels.rs`, `engine/src/secondary.rs`) | L1 + L3 | capability trait |
 | `hybrid_attention` 모듈 | B-5b Phase 3 A | 2026-05-23 (RESOLVED) | `layers/hybrid_attention.rs` → `engine/src/hybrid_attention.rs` | L3-inference + L1 plan | RAII + data identifier 동반 격상 (§G 본문 조건 1 "RAII guard 단독 격상" 제외 의도 외 사례) |
 | **QCF data identifiers** (`QcfMetric`/`QcfConfig`/`QcfMode`/`AggregationMode`/`KiviFlushParams`/`FlushAttentionParams`/`SubLayer`/`ImportanceFormula` + `aggregate_heads`) | **S-3b-1** | **2026-05-24** | **`qcf/{mod,quant_qcf,layer_importance}.rs` → `engine/src/qcf_types.rs`** | **L3-qcf (신설) + L3-pressure + L3-inference + observability** | **3-도메인 + observability 공유 측정 어휘. 측정 로직(`compute_flush_*`, `ImportanceCollector`)은 L3-qcf에 유지** |
+| `ModelConfig` | TBD (별 sprint 후보) | **CANDIDATE** (2026-05-26 등록) | `inference/models/config.rs` → `shared/model_config.rs` 후보 | L3-inference (owner) + L3-pressure (`weight_swap_handler.rs`) | INV-LAYER-003 보조 위계 우선순위 #3 — inference owned *configuration* 어휘를 pressure가 weight swap orchestrator에서 직접 import. 양 도메인 동등 사용이므로 §G L2 격상이 자연 정합. 현재는 §13.8-O `cross_l3_vocabulary` marker로 escape (`pressure/weight_swap_handler.rs:21`). 격상 시 §O register에서 항목 제거. |
 
 **임계 정책**: 5건 미만 sub-list 형식, 5건 이상 표 형식. **10건 이상** 누적 시 layer_lint.py 명시적 allowlist (자동 검출) 도입 검토 — §F 정책과 동일 운용 원리. `hybrid_attention` 격상 시 자세한 근거: 격상 단위는 모듈 전체(`HybridAttnSetup`/`HybridGpuBuffer` struct + `HybridScope` RAII + `compute_kv_split`/`current`/`install` free fn). §G 본문 조건 1 "RAII guard 본 정책 밖" 문구는 *RAII guard 단독 격상*을 제외하려는 의도이며, 본 사례는 `HybridAttnSetup` data identifier + 그 lifetime을 관리하는 `HybridScope` 동반 격상 패턴으로 §G 정신과 부합. plan.rs(L1) hot path 호출이 §J 본문 "read-only 정책 query 한정" 제약과 mismatch (AtomicI32 store + Mutex lock + cl_mem 참조 부수효과 발생)이므로 §J zone marker 적용은 폐기되고 §G 격상으로 본질 해소. Backend trait method 추가 없음(ISP 누적 +0).
 
@@ -2141,6 +2142,11 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   1. **Vocabulary 성격**: import 대상이 *도메인 어휘*(type alias default, struct field 정의, enum-as-data identifier, KVCacheOps 같은 trait의 default 구현체) 또는 *cold path orchestrator*의 인접 도메인 참조여야 한다. hot path concrete method 호출은 본 예외 밖이다.
   2. **본질 격상 backlog 동반**: marker 부착 시 PR description 또는 인접 backlog 항목에 *본질 trait inversion 별 sprint 후보* 명시 (예: WeightSwapDispatch trait, KvCacheView trait, PreloadPool L2 격상).
   3. **방향성**: L3 ↔ L3 양방향 모두 허용 (pressure ↔ inference). 일방향만 허용하는 §L과 다름.
+- **해소 우선순위 (INV-LAYER-003 보조 위계, 2026-05-26 명시화)**: cross-L3 vocabulary 침범은 spec INV-LAYER-003 NOTE의 보조 위계(**pressure = stateful runtime resource owner, inference = forward pass executor**)에 따라 다음 우선순위로 해소한다.
+  1. **위계 정합 방향** (inference → pressure resource): trait 격상으로 처리. 예: `KVCacheOps`(KVCache 임차), `PreloadAccess`(PreloadPool 임차). pressure가 자원 owner이므로 inference가 trait으로 임차하는 패턴이 자연 정합 — 본질 해소는 trait 노출이며 register 잔존 시 별 sprint candidate.
+  2. **위계 어긋남 방향** (pressure → inference owned data): 데이터 owner를 pressure로 이전. 본 §O 본문의 *Phase 6 weight_slot/secondary_mmap → pressure 이전* 결정이 이 우선순위의 적용 사례. pressure가 inference의 stateful resource를 import하는 게 아니라, 해당 resource가 본래 pressure 소유 자산임을 명시화한다.
+  3. **양 도메인 공유 configuration**: §13.8-G L2 promotion. inference의 *configuration* 어휘(예: `ModelConfig`)를 pressure가 직접 import할 때 적용 — 양 도메인 동등 사용 시 owner를 inference로 두는 게 자의적이므로 `shared/model_config.rs`로 격상하여 양 도메인 공유 어휘로 정착시킨다.
+  - **위계 외 패턴**: 비-resource 성격(예: pressure가 inference orchestration 호출 등)의 cross-L3 import는 본 §O `cross_l3_vocabulary` marker zone을 escape hatch로 유지한다. 단 register 누적 5건 이상 시 §13.4 vocabulary register 신설 + trait inversion 별 sprint 강제 trigger.
 - **근거**: cross-L3 trait inversion이 본질 해소이나, 다음 사유로 marker 우선 적용이 cost-effective:
   - **Type alias default**: caller convenience를 위한 외부 API surface — KVCache default를 KVCacheOps trait의 default impl로 노출하는 패턴이 일반적. trait inversion으로 default를 강제 제거하면 caller에 명시 강제 ripple 폭증.
   - **Weight swap orchestrator**: pressure가 models의 SwapExecutor + LayerSlot + SecondaryMmap을 직접 사용하는 패턴은 WeightSwapDispatch trait + handler 이동(`models/weights/swap_handler.rs`)으로 해소 가능하나, ActionResult enum이 pressure 도메인이므로 잔여 위반 1건 남음 (§F enum-as-data). 격상 ROI는 trade-off.
@@ -2164,6 +2170,9 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
     - `models/transformer.rs:2783,2786` — `PrefetchableCache` + `PrefetchController` (offload-only path, 격상 backlog)
   - **Weight swap orchestrator** 3건:
     - `pressure/weight_swap_handler.rs:21,22,23` — `ModelConfig`, `SwapExecutor`, `LayerSlot`/`SecondaryMmap` (WeightSwapDispatch trait + handler 이동 backlog)
+    - **세부 분류 (보조 위계 적용, 2026-05-26)**:
+      - `SwapExecutor`, `LayerSlot`, `SecondaryMmap` — **위계 어긋남 방향** (pressure → inference owned resource). 본질은 데이터 owner를 pressure로 이전(우선순위 #2) — weight_slot/secondary_mmap은 본래 pressure 자원이므로 `pressure/state/weight_slot/`으로 이전(§6.3 결정 반영). `SwapExecutor`도 동행 이전 후보.
+      - `ModelConfig` — **양 도메인 공유 configuration** (우선순위 #3). inference 소유이나 pressure(weight swap), inference(forward) 양쪽이 동등 사용 → **§13.8-G L2 promotion candidate로 등록** (`shared/model_config.rs` 후보). §G register 참조.
 - **운용 메모**:
   - marker는 의도성 명시. PR description에 *본질 trait inversion backlog 후보* 또는 *외부 API surface로 정당화* 기재.
   - 5건 이상 누적 시 §13.4에 *cross-L3 vocabulary register* 표 신설 검토.

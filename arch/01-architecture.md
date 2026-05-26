@@ -376,6 +376,7 @@ SYS-064, INV-018, INV-013
 ### 6.3 컴포넌트: L3 Pressure Domain (`pressure/`)
 
 - **책임 (spec WHAT → HOW)**: SYS-101. 메모리 압박 응답 — KV eviction, KV quantization, KV compress, KV swap, weight swap.
+- **역할 (INV-LAYER-003 보조 위계, 2026-05-26 명시화)**: **stateful runtime resource owner**. inference가 trait으로 임차하는 runtime resource(KV cache, weight slot, secondary mmap, preload pool, kivi cache)를 소유한다. inference로의 노출은 trait 형식만 허용(`KVCacheOps`, `PreloadAccess` 등). 본 위계가 §13.8-O cross-L3 vocabulary 침범 해소 우선순위의 기준이다 — 위계 어긋남 방향(pressure → inference owned data)은 데이터 owner를 pressure로 이전하거나 §13.8-G로 L2 격상.
 - **하위 구조 (Coordinator / Policy / State)**:
   - **Coordinator**: `pressure/manager.rs` (← `core/cache_manager.rs`). `CachePressurePipeline`을 호출하여 신호 수신 시 정책 실행.
   - **Policy/Pressure trait**: `pressure/policy/pressure.rs` (← `core/pressure/mod.rs`). `CachePressureHandler` trait + `Pipeline`.
@@ -397,6 +398,7 @@ SYS-064, INV-018, INV-013
 ### 6.4 컴포넌트: L3 Inference Domain (`inference/`)
 
 - **책임 (spec WHAT → HOW)**: SYS-101. 단일 토큰의 forward pass — 모델 구조, layer 계산, attention, sampling, chat 템플릿 변환.
+- **역할 (INV-LAYER-003 보조 위계, 2026-05-26 명시화)**: **forward pass executor**. pressure가 소유한 runtime resource를 trait으로 임차한다(`KVCacheOps`, `PreloadAccess`). 자신은 stateful runtime resource를 노출하지 않으며 inference 도메인이 보유한 양 도메인 공유 어휘는 *configuration* 성격(예: `ModelConfig`)에 한정된다 — 이 어휘를 pressure가 직접 import할 때는 §13.8-G L2 promotion 후보로 등재한다.
 - **포함 모듈 (post-migration, §13.8 결정 반영)**:
   - `inference/models/{transformer, llama/, mappers/, loader/, config}.rs` (← `models/`).
   - `inference/layers/{transformer_layer/, attention, hybrid_attention, workspace}.rs` (← `layers/`).

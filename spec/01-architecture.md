@@ -597,6 +597,8 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 
 **NOTE (테스트 코드 정책, §13.8-E)**: lib 내부 inline `#[cfg(test)]` 블록의 backend instantiation(예: `core/eviction/*`, `core/pressure/*`에서 `CpuBackend::new()`)은 **grandfathered exception**으로 baseline에 등재된 채 유지된다. 신규로 추가하는 spec/단위 테스트는 모두 `engine/tests/spec/` 아래에 작성해야 하며, 본 위치에서만 backend instantiation을 허용한다. feedback `spec_tests_required`와 정합 — INV-LAYER 관련 spec 테스트는 `tests/spec/test_inv_layer_{001..005}.rs`에 위치한다. baseline에 등재된 lib 내부 테스트는 마이그레이션 마지막 단계(Step 5 이후)에 0으로 수렴시킨다.
 
+**NOTE (INV-LAYER-003 보조 위계, 2026-05-26 명시화)**: L3 도메인 `{inference/, pressure/, qcf/}`은 import 규칙상 **수평 동등**이지만, **데이터 owner 측면에서는 pressure가 stateful runtime resource owner이다**. pressure가 소유하는 자원 = `{KV cache, weight slot, secondary mmap, preload pool, kivi cache}`이며, inference는 이 자원을 trait(`KVCacheOps`, `PreloadAccess` 등)으로 임차한다. inference는 forward pass executor 역할을 하며 자신의 stateful runtime resource를 노출하지 않는다 (`ModelConfig` 등 *configuration* 어휘만 보유). 역방향(pressure → inference vocabulary)은 inference의 *configuration* 어휘(예: `ModelConfig`)에 한정되며, 이 패턴은 §13.8-G L2 promotion (양 도메인 공유 어휘로 격상) 또는 §13.8-O `cross_l3_vocabulary` marker로 처리한다. 본 위계는 §13.8-O 우선순위 결정의 근거이며, arch §6.3/§6.4 책임 paragraph에 대응 매핑되어 있다.
+
 상세 INV 카탈로그 항목은 `spec/41-invariants.md` §3.26 참조. 코드 매핑은 `arch/01-architecture.md` §6 참조. 위반 현황(실측)과 마이그레이션 계획은 `ARCHITECTURE.md` §13 참조. L4 내부 `DecodeLoop` SOLID 분해 + 빌더 설계(INV-LAYER-006/007)는 `arch/inference_pipeline.md` 참조.
 
 ## 4. Alternative Behavior
