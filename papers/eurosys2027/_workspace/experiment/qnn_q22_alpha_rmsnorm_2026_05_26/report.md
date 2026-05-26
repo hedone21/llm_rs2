@@ -1,10 +1,28 @@
-# Q-2.2-α PoC Phase 6 — Stock S25 raw HTP path 부분 GREEN
+# Q-2.2-α PoC Phase 6 — Stock S25 raw HTP path AMBER (인프라 GREEN, NPU compute 0회)
 
 **작성**: 2026-05-26
 **HEAD (직전)**: `5842fe74 feat(microbench): Q-2.2-α Phase 5 — 3-way RMSNorm microbench`
 **디바이스**: Galaxy S25 (R3CY408S5SB / SM8750 / HTP V79), stock non-rooted
 **대상 bin**: `microbench_htp_rmsnorm` (3-way: CPU NEON / OpenCL / QNN HTP raw)
-**결과**: **부분 GREEN — 4-step handshake + handle_open + GET_URI + dspqueue create/export 모두 GREEN. dspqueue_write 단계 rc=0x48 (htp_iface_start IDL stub 누락). β 진입점 명확**
+**결과**: **AMBER — 인프라/handshake 까지 GREEN, NPU 에서 실제 compute 는 0회 실행.** PoC 정의 = "간단한 MatMul 이 HTP NPU 에서 동작 + 정확성 검증" 기준으로 본 sprint 의 본질 미달성. β 단계로 분할 진행 필요.
+
+---
+
+## ⚠ Status 표기 정정 (2026-05-26 grill-me 검토 후)
+
+직전 "부분 GREEN" 표현은 misleading. 본 sprint 가 검증한 것의 정확한 layer:
+
+| Layer | 도달 |
+|---|---|
+| Host: FastRPC handshake + handle_open + dspqueue create/export | ✓ |
+| **DSP-side `libggml-htp-v79.so` skel binary load** | ✓ (logcat `open success: ...handle 0x2d2f60`) |
+| DSP-side worker thread start (`htp_iface_start` IDL) | ✗ |
+| **NPU HVX compute (`hvx_fast_rms_norm_f32` 함수 실행)** | **✗ — 0 회** |
+| Host: 결과 readback + correctness | ✗ |
+
+⇒ **NPU 의 HVX vector unit 은 한 줄도 실행되지 않음**. PoC 본질 (= "NPU 가 실제로 도와줄지 측정") 30% 달성, 70% 미달성. 본 sprint 의 산출물은 **재사용 가능한 인프라 + handshake capability 검증** 으로 한정.
+
+본 sprint 의 사용자 원 의도: 3-way (CPU/GPU/NPU) 성능 비교. 현재 측정 = 2-way (CPU/OpenCL) 만, NPU column SKIP. 의도 부합도 ~30%.
 
 ---
 

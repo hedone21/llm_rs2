@@ -1,15 +1,39 @@
-# Handoff: Q-2.2-α PoC 종결 → Q-2.2-β.IDL 진입
+# Handoff: Q-2.2-α PoC 종결 (AMBER) → Q-2.2-β.IDL 진입
 
-**작성**: 2026-05-26
+**작성**: 2026-05-26 (2026-05-26 grill-me 검토 후 정정)
 **HEAD**: `222f5016 feat(htp-fastrpc): Q-2.2-α Phase 6 — stock S25 raw HTP path 부분 GREEN`
 **worktree**: `.claude/worktrees/b5_trait_extension`
-**다음 세션 진입 문장**: **"Q-2.2-β.IDL 진입 — htp_iface_start IDL stub 정확 구현"**
+**다음 세션 진입 문장**: **"Q-2.2-β.IDL 진입 — qaic 자동 stub 추출 후 htp_iface_start 정확 구현 + rmsnorm dispatch GREEN"**
+
+---
+
+## ⚠ Status 정정 (grill-me 검토 결과)
+
+**평가: AMBER** (이전 "부분 GREEN" 표현은 misleading).
+
+근거:
+- PoC 의 사용자 원 정의 = "간단한 MatMul 이 HTP NPU 에서 동작 + 정확성 검증" (= 실제 NPU compute 동작)
+- 본 sprint 결과 = **NPU 의 HVX vector unit 한 줄도 실행 안 됨** (logcat: skel `libggml-htp-v79.so` dlopen 까지만, `hvx_fast_rms_norm_f32` 호출 0회)
+- 본 sprint 의 사용자 원 의도 (3-way CPU/GPU/NPU 성능 비교) 부합도 = ~30% (NPU column SKIP)
+- 인프라/handshake/capability 검증 GREEN, dispatch/execution 검증 MISS
+
+본 sprint 의 산출물 = **재사용 가능한 인프라 + capability 검증** 으로 한정.
 
 ---
 
 ## TL;DR
 
-Q-2.2-α PoC (8 Phase) 완료. 핵심 검증 3건 모두 GREEN — (a) llama.cpp ggml-hexagon path stock S25 동작 / (b) 우리 host Rust binding 1772 LOC 으로 4-step handshake + GET_URI + handle_open + dspqueue create/export 모두 stock device PASS / (c) 자체 빌드 DSP skel binary `libggml-htp-v79.so` (271 KB) DSP-side dlopen 성공 (logcat 직접 증명). 미완: dspqueue_write rc=0x48 (DSP worker 미시작, htp_iface_start IDL stub 누락). β 단계 시작 작업으로 IDL stub 정확 구현 → 진짜 HTP rms_norm dispatch GREEN.
+Q-2.2-α PoC (8 Phase) 완료. 검증 layer:
+
+| 검증 | 상태 |
+|---|---|
+| (a) llama.cpp ggml-hexagon path stock S25 동작 | ✓ |
+| (b) host Rust binding 1772 LOC 으로 4-step handshake + GET_URI + handle_open + dspqueue create/export | ✓ |
+| (c) 자체 빌드 DSP skel binary `libggml-htp-v79.so` (271 KB) stock S25 DSP-side dlopen | ✓ |
+| (d) **DSP-side HVX 함수 실제 실행** | **✗ (0 회)** |
+| (e) MatMul correctness on HTP NPU | ✗ |
+
+PoC 본질 = (d)(e) 까지 검증. 본 sprint 는 (a)(b)(c) 까지. **β 단계로 분할 진행 필요** — 단순 1 sprint 보강 아닌 sprint scope 재정의 (rmsnorm IDL PoC → matmul dispatch + 정확성).
 
 ---
 
@@ -64,57 +88,53 @@ I microbench_htp_rmsnorm: ... dspqueue_close: closed Queue 0, 0xb400007e3943f010
 
 ---
 
-## 다음 작업: Q-2.2-β.IDL 진입점
+## 다음 작업: β 단계 분할 (β-1.IDL → β-2.MM)
 
-### 단일 task
+PoC 본질 = MatMul HTP NPU GREEN. 단일 sprint 가 아닌 2 sub-sprint 분할:
 
-**`htp_iface_start` IDL stub 정확 구현** (1 method, ~150 LOC)
+### β-1.IDL: htp_iface_start IDL stub + rmsnorm dispatch GREEN (3-4h)
 
-검증 게이트: `microbench_htp_rmsnorm` 재실행 → Stage 5 (dspqueue_write) rc=0 GREEN + correctness `max_abs_err < 1e-3` vs CPU baseline (gamma=1).
+**검증 게이트**: `microbench_htp_rmsnorm` 재실행 → Stage 5 (dspqueue_write) rc=0 + DSP rsp.status == HTP_STATUS_OK + correctness `max_abs_err < 1e-3` vs CPU baseline (gamma=1).
 
-### 구현 detail
+작업 분해 (qaic 가용성 사전 verify 완료, `/opt/hexagon/6.4.0.2/ipc/fastrpc/qaic/bin/qaic`):
 
-1. **`REMOTE_SCALARS_MAKEX` macro 값 확정**:
-   - llama.cpp 의 IDL stub binary 또는 Hexagon SDK 의 `remote.h` 에서 직접 추출
-   - `REMOTE_SCALARS_MAKEX(attr, method, in_h, out_h, in_b, out_b)` = `((attr)<<24 | (method)<<16 | (in_h)<<12 | (out_h)<<8 | (in_b)<<4 | (out_b))`
-   - `htp_iface_start` = method idx 0 (htp_iface.idl 의 첫 method), `attr=0, in_h=0, out_h=0`
-   - parameter type: `sess_id u32 (in), dsp_queue_id u64 (in), n_hvx u32 (in)` → primitive `in_b=3, out_b=0` 일 가능성, 또는 buffer `in_b=0, out_b=0` 가능성
-   - 정확값 검증: Docker 안에서 `qaic -E htp_iface.idl` 실행 후 자동 생성 stub C source 읽기 (~10분 작업)
+| 단계 | 작업 | 추정 | Risk | Fallback |
+|---|---|---|---|---|
+| β-1.1 | Docker 안 `qaic` 로 `htp_iface.idl` 컴파일 → `htp_iface_stub.c` 자동 생성 + `htp_iface_start` 의 `sc` macro + `pra` packing 코드 추출 | 30 min | 낮음 (qaic 동작 verify 됨) | SDK header `remote.h` 의 macro manual 분석 (+1-2h) |
+| β-1.2 | `engine/src/backend/htp_fastrpc/host.rs::try_start_iface` 정확 구현 교체 (`remote_arg pra[]` Rust struct + `remote_handle64_invoke(handle, sc, pra)`) | 1-1.5h | 중간 (C union → Rust repr(C) 정확 매핑) | n_hvx sweep (1/2/4) |
+| β-1.3 | host build + clippy + Android cross-build | 15 min | 낮음 | — |
+| β-1.4 | microbench_htp_rmsnorm S25 재실행 + correctness gate | 30 min | 중간 (packet schema mismatch 시 rsp.status != OK 가능) | logcat 분석 + llama.cpp `htp_tensor_init` byte 비교 |
+| β-1.5 | report.md + commit + β-2.MM handoff | 30 min | 낮음 | — |
 
-2. **`remote_arg` struct 정확 layout**:
-   ```c
-   struct remote_arg {
-       union {
-           struct remote_buf buf;
-           struct remote_handle h;
-           struct remote_handle64 h64;
-       } u;
-       struct remote_buf {
-           void *pv;
-           size_t nLen;
-       };
-   };
-   ```
-   sess_id (u32) 와 n_hvx (u32) 는 primitive — `pra[].buf.pv = &val; pra[].buf.nLen = sizeof(val)` 형태 또는 직접 scalar packing.
+n_hvx default = 4 (llama.cpp `opt_nhvx`).
 
-3. **호출 site**: `engine/src/backend/htp_fastrpc/host.rs::HtpFastrpcHost::new` 의 Step 7 (`htp_iface_start`) 위치. 현재 `try_start_iface` 가 best-effort 반환 — 그것을 정확 호출로 교체.
+### β-2.MM: matmul Q-proj HTP NPU GREEN + 정확성 (4-5h)
 
-4. **`n_hvx` 값 선택**: llama.cpp default = 4 (`opt_nhvx=4`). 그대로 차용.
+**PoC 종결 게이트**: HTP_OP_MUL_MAT (=4) 호출 → output max_abs_err < 1e-3 vs CPU baseline + 3-way timing complete (CPU/OpenCL/HTP).
+
+작업 분해:
+- HtpGeneralReq.op = HTP_OP_MUL_MAT (=4)
+- src0 = input tensor [1, K], src1 = weight tensor [K, N] (F32 first; Q4_0 dequant 은 추후)
+- dst = output [1, N]
+- n_bufs = 3 (input + weight + output)
+- weight RpcmemBuffer alloc + upload (~9MB for Qwen Q-proj [1536, 1536])
+- shape: `[1, 1536] × [1536, 1536] = [1, 1536]` (Qwen2.5-1.5B Q-proj, "간단한 MatMul" 정의)
+- microbench_htp_matmul 신설 (~400 LOC) 또는 microbench_htp_rmsnorm 에 matmul case 추가
+- llama.cpp `matmul-ops.c::matmul_f32` 의 op_params + packet schema 직접 reference
+
+### 두 sub-sprint 합산 추정: 7-9h
+
+각 sub-sprint 별로 별 session + commit + handoff. β-2.MM 완료 시 본 PoC 진짜 GREEN.
 
 ### 위임 권장
 
-Senior implementer 위임 (FFI + unsafe + IDL stub):
-- Hexagon SDK Docker 안에서 `qaic` 실행 + stub C 분석
-- `host.rs` 의 `try_start_iface` 교체 (~150 LOC)
-- `microbench_htp_rmsnorm` 재실행 (S25)
-- correctness gate (max_abs_err < 1e-3) + timing 측정
+각 sub-sprint senior-implementer 위임 (FFI + unsafe + IDL + HVX schema 매핑).
 
-작업일 추정: 2-3 시간 (qaic 출력 분석이 가장 큰 unknown).
+### 위험 시나리오
 
-### β 진입 결정 게이트
-
-- htp_iface_start GREEN → β.A: 진짜 HTP rms_norm GREEN → 3-way 측정 complete
-- htp_iface_start FAIL → β.B 차선: llama.cpp 빌드한 `libggml-hexagon.so` host shim 의 `init_dsp` symbol 을 dlopen 해서 setup → 우리 binding 은 그 후 dspqueue handle 만 차용 (더 복잡하지만 IDL macro 의존 0)
+- β-1 IDL stub fail (qaic 출력이 기대와 다름) → SDK header manual 분석으로 fallback (+1-2h)
+- β-1 PASS 후 β-2 packet schema mismatch → llama.cpp `init_matmul_req` 의 byte-level 비교 verify
+- HVX op 가 stock device 에서 차단 (signed-only 강제) → 가능성 낮음 (libggml-htp-v79.so dlopen 자체는 PASS 했으므로 unsigned PD 정책 적용 중)
 
 ---
 
