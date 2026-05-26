@@ -673,11 +673,11 @@ pub fn open_secondary_with_options(
 
 /// LISWAP-6 — backend-aware variant of `open_secondary_with_options`.
 ///
-/// When `backend` reports the `qnn_oppkg` family AND the secondary file is
-/// GGUF, this constructor returns a `SecondaryMmap::Rpcmem` variant that
-/// participates in the DMA-BUF alias swap path (zero-H2D-copy weight swap).
-/// All other combinations dispatch to the standard GGUF / AUF paths so
-/// behaviour for non-`qnn_oppkg` backends is unchanged.
+/// When `backend` exposes `EXT_RPCMEM_ALLOCATOR` (i.e. OpenCL backend with
+/// `--opencl-rpcmem` active) AND the secondary file is GGUF, this constructor
+/// returns a `SecondaryMmap::Rpcmem` variant that participates in the DMA-BUF
+/// alias swap path (zero-H2D-copy weight swap).
+/// All other combinations dispatch to the standard GGUF / AUF paths.
 ///
 /// On rpcmem construction failure (Android-only path / runtime not ready /
 /// rpcmem alloc rejected at metadata-validation), the function gracefully
@@ -701,7 +701,7 @@ pub fn open_secondary_with_backend(
             secondary_layout_choice,
         );
     }
-    // qnn_oppkg + GGUF → try Rpcmem; fall back to standard GGUF on any error.
+    // rpcmem backend + GGUF → try Rpcmem; fall back to standard GGUF on any error.
     match try_open_rpcmem_secondary(path, primary_config, primary_gguf, backend) {
         Ok(handle) => Ok(handle),
         Err(e) => {
@@ -714,22 +714,26 @@ pub fn open_secondary_with_backend(
     }
 }
 
-/// Returns true when `backend` is the `qnn_oppkg` family (M3 GPU OpPackage)
-/// — the only backend that exposes the rpcmem heap required for the alias
-/// path. Detected via `Backend::name()` to avoid feature-gate gymnastics on
-/// the trait object.
+/// Returns true when `backend` can expose an rpcmem allocator for the
+/// secondary-store alias path.
+///
+/// Sprint 2b: EXT_RPCMEM_ALLOCATOR 단독 lookup (EXT_QNN_OPPKG fallback 제거됨).
+/// `--opencl-rpcmem` 활성 OpenCL backend 가 본 extension 으로
+/// `Arc<RpcmemAllocator>` 노출.
 ///
 /// `pub(crate)` since W-AUF-2 — `resolve_secondary` consults the same predicate
 /// when deciding whether to promote an AUF self-secondary to the RpcMem variant.
 pub(crate) fn backend_supports_rpcmem_secondary(
     backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> bool {
-    let name = backend.name();
-    name.contains("QNN OpPackage") || name.contains("qnn_oppkg")
+    backend
+        .get_extension(crate::backend::EXT_RPCMEM_ALLOCATOR)
+        .is_some()
 }
 
 /// W-AUF-2.3 — Promote a `SecondaryMmap::Auf` self-secondary to the
-/// `SecondaryMmap::Rpcmem` variant when the backend is `qnn_oppkg`.
+/// `SecondaryMmap::Rpcmem` variant when the backend supports rpcmem
+/// (`EXT_RPCMEM_ALLOCATOR` exposed, e.g. OpenCL + `--opencl-rpcmem`).
 ///
 /// `Some(rpc)` 반환 시 호출자는 그 핸들을 사용한다. `None`이면 promote를
 /// 시도하지 않은 것 (호스트 빌드 / 다른 backend). promote 시도가 실패한 경우
@@ -746,20 +750,16 @@ pub(crate) fn try_promote_auf_self_secondary_to_rpcmem(
         return None;
     }
 
-    #[cfg(all(feature = "qnn", target_os = "android"))]
+    #[cfg(target_os = "android")]
     {
-        // COLD-EXT: AUF self-secondary loader path.
-        let qnn = backend
-            .get_extension(crate::backend::EXT_QNN_OPPKG)?
-            .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>()?;
-        let runtime = qnn.runtime_arc();
-        let rpcmem_fns = runtime.rpcmem_fns();
+        // Sprint 2a Phase 2 (ENG-RPCMEM-031): 2-tier allocator lookup.
+        let allocator = resolve_rpcmem_allocator(backend)?;
         match crate::models::weights::rpcmem_secondary::RpcmemSecondaryStore::from_auf_self_secondary(
             view,
             layer_index,
             diag_source_path,
             std::sync::Arc::clone(backend),
-            (rpcmem_fns.0, rpcmem_fns.1),
+            allocator,
         ) {
             Ok(store) => Some(SecondaryMmap::Rpcmem(store)),
             Err(e) => {
@@ -770,16 +770,15 @@ pub(crate) fn try_promote_auf_self_secondary_to_rpcmem(
             }
         }
     }
-    #[cfg(not(all(feature = "qnn", target_os = "android")))]
+    #[cfg(not(target_os = "android"))]
     {
         let _ = (view, layer_index, diag_source_path);
         // 호스트/non-Android에서는 rpcmem feature 자체가 없어 promote 불가.
-        // backend.name()이 qnn_oppkg를 거짓으로 자처해도 None을 돌려보내 fallback 유지.
         None
     }
 }
 
-/// Try to construct a `SecondaryMmap::Rpcmem` for `qnn_oppkg`. Errors
+/// Try to construct a `SecondaryMmap::Rpcmem` via rpcmem allocator. Errors
 /// surface as a generic `LoadError::SecondaryUnavailable` so the caller's
 /// fallback is uniform.
 fn try_open_rpcmem_secondary(
@@ -788,26 +787,23 @@ fn try_open_rpcmem_secondary(
     primary_gguf: &GgufFile,
     backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> Result<SecondaryMmap, LoadError> {
-    #[cfg(all(feature = "qnn", target_os = "android"))]
+    #[cfg(target_os = "android")]
     {
-        // COLD-EXT: GGUF secondary loader path.
-        let qnn = backend
-            .get_extension(crate::backend::EXT_QNN_OPPKG)
-            .and_then(|a| a.downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>())
-            .ok_or_else(|| LoadError::SecondaryUnavailable {
+        // Sprint 2a Phase 2 (ENG-RPCMEM-031): 2-tier allocator lookup.
+        let allocator =
+            resolve_rpcmem_allocator(backend).ok_or_else(|| LoadError::SecondaryUnavailable {
                 path: path.to_path_buf(),
                 source: anyhow::anyhow!(
-                    "rpcmem secondary: backend name claims qnn_oppkg but downcast failed"
+                    "rpcmem secondary: backend does not expose EXT_RPCMEM_ALLOCATOR \
+                     — enable --opencl-rpcmem to activate rpcmem allocator"
                 ),
             })?;
-        let runtime = qnn.runtime_arc();
-        let rpcmem_fns = runtime.rpcmem_fns();
         let store = crate::models::weights::rpcmem_secondary::RpcmemSecondaryStore::from_gguf(
             path,
             primary_config,
             primary_gguf,
             std::sync::Arc::clone(backend),
-            (rpcmem_fns.0, rpcmem_fns.1),
+            allocator,
         )
         .map_err(|e| LoadError::SecondaryUnavailable {
             path: path.to_path_buf(),
@@ -815,16 +811,34 @@ fn try_open_rpcmem_secondary(
         })?;
         Ok(SecondaryMmap::Rpcmem(store))
     }
-    #[cfg(not(all(feature = "qnn", target_os = "android")))]
+    #[cfg(not(target_os = "android"))]
     {
         let _ = (path, primary_config, primary_gguf, backend);
         Err(LoadError::SecondaryUnavailable {
             path: path.to_path_buf(),
             source: anyhow::anyhow!(
-                "rpcmem secondary requires Android + qnn feature; falling back to GGUF"
+                "rpcmem secondary requires Android target; falling back to GGUF mmap"
             ),
         })
     }
+}
+
+/// Sprint 2b (ENG-RPCMEM-031) — `Arc<RpcmemAllocator>` resolve.
+///
+/// `EXT_RPCMEM_ALLOCATOR` 단독 lookup. `--opencl-rpcmem` 활성 OpenCL backend
+/// 가 본 extension 으로 `Arc<RpcmemAllocator>` 를 노출한다.
+/// Sprint 2a 공존 EXT_QNN_OPPKG path 는 Sprint 2b 에서 제거됨.
+#[cfg(target_os = "android")]
+fn resolve_rpcmem_allocator(
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
+) -> Option<std::sync::Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>> {
+    if let Some(ext) = backend.get_extension(crate::backend::EXT_RPCMEM_ALLOCATOR)
+        && let Some(arc) =
+            ext.downcast_ref::<std::sync::Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>>()
+    {
+        return Some(std::sync::Arc::clone(arc));
+    }
+    None
 }
 
 // ──────────────────────────────────────────────────────────────────────────

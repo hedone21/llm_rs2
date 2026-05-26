@@ -187,6 +187,21 @@
 | INV-154 | cdylib `backendApiVersion == (3, 7, 0)`. SDK 계약 버전. Phase R G-1-F 결정적 fix. | Compatibility | 🆕 미구현 | `crates/qnn_oppkg/tests/spec/test_inv_154_api_version.rs` (FFI surface) |
 | INV-155 | 100회 register/free 후 last-50 VmRSS slope < 1 KB/iter. PoC leak 패턴 폐기, M1.8 reverse-mapping table 정상화. | Safety | 🆕 미구현 | `engine/src/bin/microbench_qnn_oppkg_leak.rs` (디바이스 microbench) |
 
+## RpcmemAllocator Backend-agnostic Split (INV-RPCMEM-001 ~ INV-RPCMEM-008, 2026-05-26 Sprint 2a Phase 2)
+
+> `libcdsprpc.so` 의존을 backend-agnostic 단일 책임 모듈로 격리. 대응 명세: `30-engine.md` 부록 E (ENG-RPCMEM-010 ~ ENG-RPCMEM-C04). 대응 arch: `arch/rpcmem_allocator.md`, `arch/opencl_backend.md`, `arch/precision_swap.md`. **Implementer 가 task #3 구현 + 테스트 작성**, 본 항목은 spec 정의 + skeleton 위치만.
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-RPCMEM-001 | `RpcmemAllocator::new()` 는 호스트 빌드에서 `Err` 또는 컴파일 제외 (Android-only). | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_rpcmem_001_android_only.rs` |
+| INV-RPCMEM-002 | OpenCLBackend / RpcmemSecondaryStore 가 보유하는 `Arc<RpcmemAllocator>` 는 동일 인스턴스 (`Arc::as_ptr` equality). | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_rpcmem_002_single_instance.rs` |
+| INV-RPCMEM-003 | rpcmem alloc 실패 시 per-buffer fallback (UnifiedBuffer / SecondaryUnavailable). session abort 금지. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_rpcmem_003_per_buffer_fallback.rs` (mocked allocator) |
+| INV-RPCMEM-004 | RpcmemAllocator 는 libQnnGpu.so / libqnn_oppkg.so dlopen 금지. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_rpcmem_004_no_qnn_dlopen.rs` (source-grep) |
+| INV-RPCMEM-005 | RpcmemAllocator::Drop 시점에 모든 rpcmem buffer 가 이미 drop. allocator lifetime ⊃ buffer lifetime. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_rpcmem_005_drop_order.rs` (Arc strong_count) |
+| INV-RPCMEM-006 | `--opencl-rpcmem` + `--backend qnn_oppkg` 동시 지정 시 전자 무시 + warning 1회 (Sprint 2a 호환). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_rpcmem_006_cli_mutex.rs` (CLI parser test) |
+| INV-RPCMEM-007 | `OpenCLMemory::alloc` (activation) 은 rpcmem heap 사용 금지. KV/secondary 전용. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_rpcmem_007_activation_no_rpcmem.rs` (downcast 검증) |
+| INV-RPCMEM-008 | RpcmemKvBuffer / RpcmemAliasBuffer 의 host_ptr 은 rpcmem alloc 영역 한정. raw clientBuf import 금지. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_rpcmem_008_no_raw_clientbuf.rs` (source-grep) |
+
 ## Intra-forward Layer-aligned Swap (INV-147 ~ INV-150, 2026-05-08)
 
 > Forward 중간 layer 경계 dispatch 시도. 대응 명세: `32-engine-algorithms.md` §3.12.22 (ENG-ALG-235~238), `33-engine-data.md` §3.24 (ENG-DAT-101), `arch/weight_swap.md` §10.

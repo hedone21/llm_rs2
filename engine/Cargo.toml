@@ -48,10 +48,9 @@ ash = { version = "0.38", optional = true }
 # QNN/HTP probe (microbench-only PoC, default off)
 libloading = { version = "0.8", optional = true }
 
-# QNN OpPackage host metadata (M3.1, INV-180).
-# `crates/qnn_oppkg`는 cdylib + rlib 동시 빌드. engine은 host metadata
-# (LayerConfig, LAYER_NODE_COUNT 등)만 link하며, cdylib 산출물 (.so) 자체는
-# 디바이스에서 dlopen으로 적재된다 (engine binary가 직접 link하지 않음).
+# QNN OpPackage (microbench bin 전용, Sprint 2b 이후 production code 미사용).
+# `crates/qnn_oppkg`는 microbench/qnn_oppkg_* paper evidence 빌드에만 사용.
+# production engine/src/ 은 이 crate 에 의존하지 않는다.
 qnn_oppkg = { path = "../crates/qnn_oppkg", optional = true }
 
 # CUDA (Jetson)
@@ -65,6 +64,15 @@ zbus = { version = "5", optional = true, default-features = false, features = ["
 
 tempfile = "3.0"
 
+# RpcmemAllocator (Sprint 2a Phase 2, ENG-RPCMEM-010 ~ C04): libcdsprpc.so
+# dlopen needs `libloading` whenever `--opencl-rpcmem` is active. The new
+# allocator module (`engine/src/memory/rpcmem/allocator.rs`) is cfg-gated to
+# `target_os = "android"`, so the dependency is only pulled in on android
+# targets — host builds remain unchanged. Independent from the `qnn` feature
+# (which used to be the sole owner of libloading); both can coexist.
+[target.'cfg(target_os = "android")'.dependencies]
+libloading = "0.8"
+
 [dev-dependencies]
 # compile-fail / compile-pass tests for session typestate (INV-LAYER-007).
 trybuild = "1.0"
@@ -77,7 +85,7 @@ default = ["opencl", "profile"]
 opencl = ["ocl"]
 profile = []
 vulkan = ["ash"]                # Vulkan PoC (microbench bins only)
-qnn = ["libloading", "bindgen", "dep:qnn_oppkg"]  # QNN HTP PoC + M3 backend wire-up
+qnn = ["libloading", "bindgen", "dep:qnn_oppkg"]  # microbench bin 빌드 전용. production code 는 qnn feature 불필요
 cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)
 cuda-embedded = ["cudarc"]      # Embedded UMA version, e.g. Jetson Xavier (cuda_embedded/)
 # Q-2.2-α HTP FastRPC PoC backend. QNN SDK 의존 0, libcdsprpc.so dlopen + 자체

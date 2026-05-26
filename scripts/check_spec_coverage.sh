@@ -34,9 +34,12 @@ fi
 SPEC_INVS=$(grep -oE 'INV-[0-9]+' spec/41-invariants.md | sort -u)
 # INV-LAYER-NNN 시리즈도 추출 (spec/41-invariants.md §3.26)
 SPEC_INVS_LAYER=$(grep -oE 'INV-LAYER-[0-9]+' spec/41-invariants.md | sort -u)
+# INV-RPCMEM-NNN 시리즈도 추출 (spec/41-invariants.md §3.27, Sprint 2a Phase 2)
+SPEC_INVS_RPCMEM=$(grep -oE 'INV-RPCMEM-[0-9]+' spec/41-invariants.md | sort -u)
 
 TEST_INVS=""
 TEST_INVS_LAYER=""
+TEST_INVS_RPCMEM=""
 SPEC_DIRS=""
 for d in engine/tests/spec manager/tests/spec shared/tests/spec; do
   [ -d "$d" ] && SPEC_DIRS="$SPEC_DIRS $d"
@@ -76,6 +79,18 @@ if [ -n "$SPEC_DIRS" ]; then
     done
   done
   TEST_INVS_LAYER=$(printf '%s\n' $TEST_INVS_LAYER | sort -u)
+
+  # INV-RPCMEM-NNN 파일명에서 추출 (test_inv_rpcmem_NNN 패턴, Sprint 2a Phase 2)
+  for d in $SPEC_DIRS; do
+    for f in "$d"/test_inv_rpcmem_*.rs; do
+      [ -f "$f" ] || continue
+      base=$(basename "$f" .rs)
+      # test_inv_rpcmem_001_android_only → INV-RPCMEM-001
+      n=$(echo "$base" | grep -oE 'rpcmem_[0-9]+' | grep -oE '[0-9]+' | head -1)
+      [ -n "$n" ] && TEST_INVS_RPCMEM="$TEST_INVS_RPCMEM INV-RPCMEM-$(printf '%03d' "$n")"
+    done
+  done
+  TEST_INVS_RPCMEM=$(printf '%s\n' $TEST_INVS_RPCMEM | sort -u)
 fi
 
 INV_TEST_MISSING=""
@@ -89,6 +104,13 @@ done
 # INV-LAYER-NNN 시리즈 검사 (test_inv_layer_NNN.rs 파일 존재 여부)
 for inv in $SPEC_INVS_LAYER; do
   if ! echo "$TEST_INVS_LAYER" | grep -qwF "$inv"; then
+    INV_TEST_MISSING="${INV_TEST_MISSING}  ${inv}\n"
+  fi
+done
+
+# INV-RPCMEM-NNN 시리즈 검사 (test_inv_rpcmem_NNN.rs 파일 존재 여부)
+for inv in $SPEC_INVS_RPCMEM; do
+  if ! echo "$TEST_INVS_RPCMEM" | grep -qwF "$inv"; then
     INV_TEST_MISSING="${INV_TEST_MISSING}  ${inv}\n"
   fi
 done

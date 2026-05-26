@@ -10,7 +10,7 @@ LISWAP-6 weight swap 의 production 사용법. spike 회피 hard constraint 를 
   --secondary-gguf qwen2.5-1.5b-q4_0.gguf \
   --force-swap-ratio 0.9 \
   --swap-incremental-per-tick 2 \
-  --backend qnn_oppkg \
+  --backend opencl --opencl-rpcmem \
   -p "<prompt>" -n 30
 ```
 
@@ -127,7 +127,7 @@ for (i, layer) in target_layers.iter().enumerate() {
 
 **알고리즘 한계**: "이번 token outlier 인 동시에 release 가 ms 단위로 느려진" 동시 이벤트 = 1 token 단발 spike 가능. 즉시 다음 token 부터 흡수. 완벽 보호는 layer-immediate 통합 (후속 V4).
 
-## 디바이스 측정 (Galaxy S25, qnn_oppkg alias)
+## 디바이스 측정 (Galaxy S25, opencl --opencl-rpcmem alias)
 
 Qwen2.5-1.5B-F16 primary + Q4_0 secondary GGUF, n=30 decode, 3 run median.
 
@@ -149,7 +149,7 @@ alias 환경에서 sub-batch pause cutoff 0% — silent safety net. 비-alias / 
   --secondary-gguf <secondary_q4>.gguf \
   --force-swap-ratio <0.0~1.0> \
   --swap-incremental-per-tick 2 \
-  --backend qnn_oppkg \
+  --backend opencl --opencl-rpcmem \
   -p "<prompt>" -n <decode_tokens>
 ```
 
@@ -195,7 +195,7 @@ stderr 로그 예:
 
 ### ✓ 검증된 안전 영역
 
-- **Galaxy S25 + qnn_oppkg + Qwen 1.5B + LISWAP-6 alias**: 실측 spike 0, garbage 0, F+S 31ms
+- **Galaxy S25 + opencl --opencl-rpcmem + Qwen 1.5B + LISWAP-6 alias**: 실측 spike 0, garbage 0, F+S 31ms (이전 qnn_oppkg 측정 = Sprint 2b 통합 전 표현)
 
 ### △ 미검증 (환경 가정 다름)
 

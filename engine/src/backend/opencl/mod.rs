@@ -550,6 +550,14 @@ pub struct OpenCLBackend {
     // the field is owned but unused — Backend::cpu_companion() returns
     // `&*self.cpu_companion`.
     cpu_companion: Arc<dyn Backend>,
+
+    // Sprint 2a Phase 2 (ENG-RPCMEM-020 ~ 024): backend-agnostic rpcmem
+    // allocator. `Some` iff `--opencl-rpcmem` was active at construction time
+    // **and** eager dlopen succeeded (Android only). `None` = legacy path
+    // (UnifiedBuffer KV + GGUF mmap secondary). Exposed via
+    // `Backend::get_extension(EXT_RPCMEM_ALLOCATOR)` so the precision swap
+    // loader (`RpcmemSecondaryStore`) shares the same instance (INV-RPCMEM-002).
+    rpcmem_allocator: Option<Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>>,
 }
 
 /// Per-category cl_mem allocation bucket (WSWAP-5-TBT-DIAG).
@@ -584,6 +592,46 @@ impl std::fmt::Debug for OpenCLBackend {
 impl OpenCLBackend {
     pub fn new() -> Result<Self> {
         Self::new_with_profile_events(false)
+    }
+
+    /// Sprint 2a Phase 2 (ENG-RPCMEM-020 ~ 024): construct with both profile-
+    /// events and `--opencl-rpcmem` toggles. When `opencl_rpcmem` is true the
+    /// constructor eagerly attempts `RpcmemAllocator::new()`; on failure the
+    /// flag is silently demoted (stderr warning 1회) so the host build keeps
+    /// running with the standard UnifiedBuffer KV path (INV-RPCMEM-001/003).
+    ///
+    /// The eager init choice matches arch §3.1 — lazy init at the first KV
+    /// alloc would surface dlopen failures inside the hot path, increasing
+    /// debugging cost. Eager dlopen costs only 3 symbol lookups (~few ms).
+    pub fn new_with_options(profile_events_enabled: bool, opencl_rpcmem: bool) -> Result<Self> {
+        let mut backend = Self::new_with_profile_events(profile_events_enabled)?;
+        if opencl_rpcmem {
+            match crate::memory::rpcmem::allocator::RpcmemAllocator::new() {
+                Ok(alloc) => {
+                    backend.rpcmem_allocator = Some(Arc::new(alloc));
+                    eprintln!(
+                        "[OpenCL] --opencl-rpcmem: RpcmemAllocator init OK (libcdsprpc.so dlopen 성공)"
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[OpenCL] --opencl-rpcmem 강등: RpcmemAllocator init 실패 ({e}). \
+                         UnifiedBuffer/GGUF mmap path 로 진행."
+                    );
+                    // backend.rpcmem_allocator already None from new path.
+                }
+            }
+        }
+        Ok(backend)
+    }
+
+    /// Read-only accessor — `Some` iff `--opencl-rpcmem` 가 활성이고 dlopen 성공.
+    /// Sprint 2a Phase 2 의 OpenCLMemory::new_with_rpcmem 와 secondary loader
+    /// 가 본 메서드로 동일 `Arc` 인스턴스를 공유한다 (INV-RPCMEM-002).
+    pub fn rpcmem_allocator(
+        &self,
+    ) -> Option<Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>> {
+        self.rpcmem_allocator.as_ref().map(Arc::clone)
     }
 
     /// Build an OpenCLBackend with optional per-op event profiling.
@@ -1540,6 +1588,10 @@ impl OpenCLBackend {
             // 2026-05-24): shared singleton — feature detection runs once.
             // LAYER-EXEMPT: cross_backend_bootstrap — §13.8-P cpu_companion init.
             cpu_companion: crate::backend::cpu::cpu_singleton(),
+            // Sprint 2a Phase 2: default off. `new_with_options(_, true)` 가
+            // dlopen 후 본 field 를 `Some` 으로 set 한다. 기존 `new` /
+            // `new_with_profile_events` 진입점은 None 유지 (legacy path).
+            rpcmem_allocator: None,
         })
     }
 
@@ -6627,6 +6679,16 @@ impl Backend for OpenCLBackend {
             crate::backend::EXT_OPENCL_QUEUE | crate::backend::EXT_OPENCL_SECONDARY => {
                 Some(self as &dyn std::any::Any)
             }
+            // Sprint 2a Phase 2 (ENG-RPCMEM-024 / INV-RPCMEM-002): expose the
+            // backend-agnostic rpcmem allocator. Returns `Some(&Arc<...>)` only
+            // when `--opencl-rpcmem` was active and the eager dlopen succeeded;
+            // otherwise `None` so the caller falls back to the standard mmap
+            // path. Consumers downcast via `downcast_ref::<Arc<RpcmemAllocator>>()`
+            // and clone the inner Arc.
+            crate::backend::EXT_RPCMEM_ALLOCATOR => self
+                .rpcmem_allocator
+                .as_ref()
+                .map(|a| a as &dyn std::any::Any),
             _ => None,
         }
     }
