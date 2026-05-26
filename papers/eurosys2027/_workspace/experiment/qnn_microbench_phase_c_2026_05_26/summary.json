@@ -1,0 +1,38 @@
+{
+  "M3": {
+    "meta": {
+      "dtype": "f16",
+      "backend": "opencl"
+    },
+    "n_raw": 7,
+    "n_outlier": 0,
+    "n_valid": 7,
+    "median_ms": 0.589,
+    "stdev_ms": 0.0112,
+    "cv_pct": 1.91,
+    "p25_ms": 0.583,
+    "p75_ms": 0.593,
+    "min_ms": 0.571,
+    "max_ms": 0.608,
+    "max_abs_err_max": null,
+    "cosine_min": null
+  },
+  "M4": {
+    "meta": {
+      "dtype": "f16",
+      "backend": "qnn-gpu"
+    },
+    "n_raw": 7,
+    "n_outlier": 1,
+    "n_valid": 6,
+    "median_ms": 1.5285,
+    "stdev_ms": 0.1375,
+    "cv_pct": 9.0,
+    "p25_ms": 1.4905,
+    "p75_ms": 1.7545,
+    "min_ms": 1.48,
+    "max_ms": 1.798,
+    "max_abs_err_max": null,
+    "cosine_min": null
+  }
+}

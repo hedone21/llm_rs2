@@ -1,0 +1,15 @@
+=== microbench_htp_rpcmem_throughput (Phase 12 / R1 + R3) ===
+
+Config: 25 MB FP32 (6553600 elements), n_iters=20
+libcdsprpc.so: dlopen + dlsym OK (rpcmem_alloc/free/to_fd)
+
+[R3] Alloc feasibility (system heap):
+  rpcmem_alloc(   1 MB): OK
+  rpcmem_alloc(  25 MB): OK
+  rpcmem_alloc( 100 MB): OK
+  rpcmem_alloc(  25 MB): OK
+R3 verdict: 600MB=— | 25MB chunk=✓
+
+rpcmem buffers: a=0x786cf5f000 fd=6, b=0x786b65f000 fd=7, c=0x7869d5f000 fd=8
+Error: contextCreate err=0x36b1
+EXIT_CODE:1

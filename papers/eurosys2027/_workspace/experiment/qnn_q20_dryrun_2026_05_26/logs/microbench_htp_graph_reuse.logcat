@@ -1,0 +1,95 @@
+05-26 09:34:37.163 22145 22146 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/mod_table.c:701: open_mod_table_open_from_static: reverse module apps_std opened with handle 0x273bb3e8 (idx 0)
+05-26 09:34:37.163 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /data/local/tmp/executorch:/data/local/tmp/qnn:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:/dsp/cdsp/./libQnnHtpV79Skel.so with       fopen:6us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.163 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /data/local/tmp/executorch:/data/local/tmp/qnn:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:/dsp/./libQnnHtpV79Skel.so with       fopen:4us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.163 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /vendor/lib64/rfs/dsp/cdsp/./libQnnHtpV79Skel.so with       fopen:5us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.163 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /vendor/lib64/rfs/dsp/./libQnnHtpV79Skel.so with       fopen:6us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.163 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /vendor/lib/rfsa/adsp/cdsp/./libQnnHtpV79Skel.so with       fopen:4us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.163 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /vendor/lib/rfsa/adsp/./libQnnHtpV79Skel.so with       fopen:5us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.163 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /vendor/lib/rfsa/dsp/cdsp/./libQnnHtpV79Skel.so with       fopen:4us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.163 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /vendor/lib/rfsa/dsp/./libQnnHtpV79Skel.so with       fopen:4us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.164 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /vendor/dsp/cdsp/./libQnnHtpV79Skel.so with       fopen:11us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0xd
+05-26 09:34:37.164 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for /vendor/dsp/./libQnnHtpV79Skel.so with       fopen:9us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0xd
+05-26 09:34:37.164 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for ./libQnnHtpV79Skel.so with       fopen:5us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.164 22145 22146 D microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for ./libQnnHtpV79Skel.so with       fopen:4us, read:0us, rpc_alloc:0us,       mmap:0us fd 0x0 error_code 0x2
+05-26 09:34:37.164 22145 22146 W microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1185: Warning: apps_std_fopen_with_env_fd failed with 0xd for path /vendor/dsp/cdsp/./libQnnHtpV79Skel.so name ./libQnnHtpV79Skel.so (No such file or directory)
+05-26 09:34:37.164 22145 22146 E microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/mod_table.c:863: Error 0xd: open_mod_table_handle_invoke failed for handle:0x273bb3e8, sc:0x1f050100
+05-26 09:34:37.164 22145 22146 W microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1056: Warning: apps_std_fopen_with_env failed with 0x2 for libQnnHtpV79Skel.so (No such file or directory)
+05-26 09:34:37.164 22145 22146 E microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/mod_table.c:863: Error 0x2: open_mod_table_handle_invoke failed for handle:0x273bb3e8, sc:0x13050100
+05-26 09:34:37.164  2353  2393 W cdsprpcd: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1056: Warning: apps_std_fopen_with_env failed with 0x2 for libQnnHtpV79Skel.so (No such file or directory)
+05-26 09:34:37.165 22145 22145 E microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1636: Error 0x80000406: remote_handle_open_domain: dynamic loading failed for file:///libQnnHtpV79Skel.so?qnn_skel_handle_invoke&_modver=1.0&_dom=cdsp on domain 3 (dlerror _rtld_map_object_ex: cannot open libQnnHtpV79Skel.so, errno 2 (no such file or directory)
+05-26 09:34:37.165 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 257 for domain 3 is 1
+05-26 09:34:37.165 22145 22145 E microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1794: Error 0x80000406: remote_handle64_open failed for file:///libQnnHtpV79Skel.so?qnn_skel_handle_invoke&_modver=1.0&_dom=cdsp (errno Success) (user err 0x80000406)
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> DspTransport.openSession qnn_open failed, 0x80000406, prio 100
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> IDspTransport: Unable to load lib 0x80000406
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> DspTransport.getHandle failed, error 0x00000008
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> createDspTransportInstance failed to config transport object
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> error in creation of transport instance
+05-26 09:34:37.165 22145 22145 W QnnDsp  : QnnDsp <W> Failed to create transport instance: 1002
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> Failed to create transport for device, error: 1002
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> Failed to load skel, error: 1002
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> Transport layer setup failed: 14001
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> Failed to parse default platform info: 14001
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> Failed to load default platform info: 14001
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> Failed to parse platform config: 14001
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> default device creation failed
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> Failed to register context to device and backend
+05-26 09:34:37.165 22145 22145 E QnnDsp  : QnnDsp <E> Failed to create context with err 0x36b1
+05-26 09:34:37.167 22145 22145 W QnnDsp  : QnnDsp <W> Backend 1 free cleanup called during process exit
+05-26 09:34:37.167 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4532: close_dev: unloading library libcdsprpc.so
+05-26 09:34:37.167 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 0: dev -1
+05-26 09:34:37.167 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 1: dev -1
+05-26 09:34:37.167 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 2: dev -1
+05-26 09:34:37.167 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 3: dev 6
+05-26 09:34:37.168 22145 22147 W microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/log_config.c:394:Warning: file_watcher_thread received exit for domain 3, file microbench_htp_graph_reuse.farf
+05-26 09:34:37.168 22145 22147 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/log_config.c:446: file_watcher_thread exiting for domain 3
+05-26 09:34:37.168 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/mod_table.c:792: open_mod_table_close: closed reverse module apps_std with handle 0x273bb3e8
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: close_device_node: closed dev 6 on domain 3
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3548: domain_deinit: closed device 6 on domain 3 (kill time 2926 us)
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 4: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 5: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 6: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 7: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 8: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 9: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 10: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 11: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 12: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 13: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 14: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 15: dev -1
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/rpcmem_android.c:357: rpcmem_deinit_internal done
+05-26 09:34:37.171 22145 22145 I microbench_htp_graph_reuse: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4858: fastrpc_apps_user_deinit done
+05-26 09:34:37.173 22145 22145 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x712b2ff2c8 in tid 22145 (microbench_htp_), pid 22145 (microbench_htp_)
+05-26 09:34:37.205 22150 22150 I crash_dump64: obtaining output fd from tombstoned, type: kDebuggerdTombstoneProto
+05-26 09:34:37.206  1355  1355 I tombstoned: received crash request for pid 22145
+05-26 09:34:37.223 22150 22150 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
+05-26 09:34:37.224 22150 22150 F DEBUG   : Build fingerprint: 'samsung/pa1qksx/pa1q:16/BP2A.250605.031.A3/S931NKSS9BZCH_OKR9BZCH:user/release-keys'
+05-26 09:34:37.224 22150 22150 F DEBUG   : Revision: '11'
+05-26 09:34:37.224 22150 22150 F DEBUG   : ABI: 'arm64'
+05-26 09:34:37.224 22150 22150 F DEBUG   : Processor: '4'
+05-26 09:34:37.224 22150 22150 F DEBUG   : Timestamp: 2026-05-26 09:34:37.208194819+0900
+05-26 09:34:37.224 22150 22150 F DEBUG   : Process uptime: 1s
+05-26 09:34:37.224 22150 22150 F DEBUG   : Cmdline: ./microbench_htp_graph_reuse
+05-26 09:34:37.224 22150 22150 F DEBUG   : pid: 22145, tid: 22145, name: microbench_htp_  >>> ./microbench_htp_graph_reuse <<<
+05-26 09:34:37.224 22150 22150 F DEBUG   : uid: 2000
+05-26 09:34:37.224 22150 22150 F DEBUG   : tagged_addr_ctrl: 0000000000000001 (PR_TAGGED_ADDR_ENABLE)
+05-26 09:34:37.224 22150 22150 F DEBUG   : pac_enabled_keys: 000000000000000f (PR_PAC_APIAKEY, PR_PAC_APIBKEY, PR_PAC_APDAKEY, PR_PAC_APDBKEY)
+05-26 09:34:37.224 22150 22150 F DEBUG   : signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x000000712b2ff2c8
+05-26 09:34:37.224 22150 22150 F DEBUG   :     x0  0000000000000000  x1  00000073c02fcbb0  x2  00000073c0304020  x3  0000000000000010
+05-26 09:34:37.224 22150 22150 F DEBUG   :     x4  fffffffffffffff0  x5  0000000000000040  x6  000000000000003f  x7  0000000000000000
+05-26 09:34:37.224 22150 22150 F DEBUG   :     x8  0000000000000001  x9  0000000000005681  x10 0000000000005681  x11 0234afcf2c51472f
+05-26 09:34:37.224 22150 22150 F DEBUG   :     x12 00000073bf16bc00  x13 000000000000002e  x14 00000073bf16b300  x15 000000000000000a
+05-26 09:34:37.224 22150 22150 F DEBUG   :     x16 0000000000000001  x17 00000073c022e9c0  x18 00000073bf4f8000  x19 0000007ffce3d260
+05-26 09:34:37.224 22150 22150 F DEBUG   :     x20 000000712b4ab000  x21 0000000000000000  x22 000000712b2a3e1e  x23 0000000000000001
+05-26 09:34:37.224 22150 22150 F DEBUG   :     x24 b4000072ac63a0d8  x25 00000073bc790000  x26 000000712b401748  x27 00000073bc790000
+05-26 09:34:37.224 22150 22150 F DEBUG   :     x28 00000073bc790000  x29 0000007ffce3d1d0
+05-26 09:34:37.224 22150 22150 F DEBUG   :     lr  000000712b2ff2c8  sp  0000007ffce3d1d0  pc  000000712b2ff2c8  pst 0000000080001000
+05-26 09:34:37.224 22150 22150 F DEBUG   : 1 total frames
+05-26 09:34:37.224 22150 22150 F DEBUG   : backtrace:
+05-26 09:34:37.224 22150 22150 F DEBUG   :       #00 pc 000000712b2ff2c8  <unknown>
+05-26 09:34:37.227  1355  1355 E tombstoned: Tombstone written to: tombstone_12
+05-26 09:34:37.227  2281  3574 E NativeTombstoneManager: Tombstone's UID (2000) not an app, ignoring
+05-26 09:34:37.229  2281  3574 I DropBoxManagerService: add tag=SYSTEM_TOMBSTONE_PROTO_WITH_HEADERS isTagEnabled=true flags=0x0
+05-26 09:34:37.232  2281  3574 E NativeTombstoneManager: Tombstone's UID (2000) not an app, ignoring
+05-26 09:34:37.233  2281  3574 I BootReceiver: Copying /data/tombstones/tombstone_12 to DropBox (SYSTEM_TOMBSTONE)
+05-26 09:34:37.233  2281  3574 I DropBoxManagerService: add tag=SYSTEM_TOMBSTONE isTagEnabled=true flags=0x6

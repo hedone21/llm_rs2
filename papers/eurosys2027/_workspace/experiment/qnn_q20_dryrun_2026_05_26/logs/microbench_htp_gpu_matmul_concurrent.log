@@ -1,0 +1,8 @@
+=== microbench_htp_gpu_matmul_concurrent (Phase 32b-2 / R3) ===
+
+HTP MatMul: A[1,1024] × B[1024,4096] (DDR-heavy: 16MB B + 4KB A + 16KB C)
+GPU GEMV:   same scale on OpenCL
+n_iters per config: 30
+
+Error: contextCreate err=0x36b1
+EXIT_CODE:1

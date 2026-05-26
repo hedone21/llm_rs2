@@ -1,0 +1,7 @@
+=== microbench_htp_correctness (LISWAP-5 Phase B / Q1) ===
+
+Provider: backendId=6, providerName="HTP_QTI_AISW", api=2.27.0
+backendCreate: OK (0x1)
+backendGetApiVersion: core=2.27.0, backend=5.37.0
+Error: contextCreate err=0x36b1
+EXIT_CODE:139

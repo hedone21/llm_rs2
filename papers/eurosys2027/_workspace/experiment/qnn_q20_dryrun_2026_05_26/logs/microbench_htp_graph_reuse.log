@@ -1,0 +1,5 @@
+=== microbench_htp_graph_reuse (Phase 11 / R8 + R5 sanity) ===
+
+Config: 25 MB FP32 (6553600 elements), n_iters=20
+Error: contextCreate err=0x36b1
+EXIT_CODE:139

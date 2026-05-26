@@ -1,0 +1,32 @@
+{
+  "cell": "M4",
+  "round_idx": 8,
+  "is_warmup": false,
+  "ok": true,
+  "latency_ms": 1.798,
+  "max_abs_err": null,
+  "cosine": null,
+  "stderr": "",
+  "raw_stdout": "=== microbench_qnngpu_matmul_tbt (Phase R / R-B1) ===\n\nDim: M=1, K=1536, N=8960\nBaseline: OpenCL mul_mv_f16_f32 (F16 weight, F32 in/out)\nTest:     QNN-GPU FullyConnected (F16, weight[N,K] native, MEMHANDLE/DMA_BUF)\nn_iters per config: 10\n\nQNN-GPU graph (MatMul 1x1536x8960) finalize: OK (155.2 ms)\nWarmup (5 iters each)...\n\nBaseline OpenCL mul_mv_f16_f32 (F16w, F32x)      mean=0.579ms median=0.580ms \u03c3=0.003ms \u03c3/mean=0.0058\nTest     QNN-GPU MAT_MUL (F32\u00d7F32, MEMHANDLE)    mean=1.678ms median=1.798ms \u03c3=0.197ms \u03c3/mean=0.1176\n\n=== R-B1 summary ===\nbaseline mean: 0.579ms (median 0.580ms, \u03c3/mean 0.0058)\nqnn-gpu mean:  1.678ms (median 1.798ms, \u03c3/mean 0.1176)\nratio q/b:     2.899x  (\u22641.00 GREEN, \u22641.10 YELLOW, >1.10 RED)\n\nR-B1 verdict: \u2717 RED\n",
+  "thermal_before": {
+    "cpu_little": 32.6,
+    "cpu_mid": 32.6,
+    "cpu_prime": 31.5,
+    "gpu_5": 31.5,
+    "gpu_7": 31.5,
+    "hex_vec": 31.1,
+    "hex_mat": 31.5,
+    "ddr": 31.5
+  },
+  "thermal_after": {
+    "cpu_little": 33.4,
+    "cpu_mid": 33.8,
+    "cpu_prime": 32.3,
+    "gpu_5": 33.8,
+    "gpu_7": 33.1,
+    "hex_vec": 31.5,
+    "hex_mat": 31.9,
+    "ddr": 33.0
+  },
+  "error": null
+}

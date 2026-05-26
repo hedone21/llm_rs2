@@ -1,0 +1,16 @@
+=== M7 raw output ===
+[INFO] [Qnn ExecuTorch]: QnnContextCustomProtocol expected magic number: 0x5678abcd but get: 0x2000000
+[INFO] [Qnn ExecuTorch]: Running level=1 optimization.
+I 00:00:00.118070 executorch:qnn_executor_runner.cpp:415] Method loaded.
+E 00:00:00.118239 executorch:method.cpp:1378] Output 0 is memory planned, or is a constant. Cannot override the existing data pointer.
+I 00:00:00.118268 executorch:qnn_executor_runner.cpp:475] ignoring error from set_output_data_ptr(): 0x2
+I 00:00:00.118280 executorch:qnn_executor_runner.cpp:478] Inputs prepared.
+I 00:00:00.118404 executorch:qnn_executor_runner.cpp:484] Number of inputs: 1
+I 00:00:00.118602 executorch:qnn_executor_runner.cpp:597] Perform 3 inference for warming up
+I 00:00:00.120510 executorch:qnn_executor_runner.cpp:603] Start inference (0)
+I 00:00:00.124119 executorch:qnn_executor_runner.cpp:621] 10 inference took 3.580000 ms, avg 0.358000 ms
+I 00:00:00.124189 executorch:qnn_executor_runner.cpp:665] Total 1 inference took 3.580000 ms, avg 3.580000 ms
+I 00:00:00.124393 executorch:qnn_executor_runner.cpp:730] Write etdump to etdump.etdp, Size = 2296
+[INFO] [Qnn ExecuTorch]: Destroy Qnn context
+[INFO] [Qnn ExecuTorch]: Destroy Qnn device
+[INFO] [Qnn ExecuTorch]: Destroy Qnn backend

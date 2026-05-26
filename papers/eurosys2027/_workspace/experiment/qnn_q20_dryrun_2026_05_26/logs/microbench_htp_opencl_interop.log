@@ -1,0 +1,181 @@
+=== microbench_htp_opencl_interop (R-Y / Phase 32b-interop) ===
+
+Buffer: 1024 f32 elements (4096 bytes)
+dlopen libcdsprpc.so + libOpenCL.so: OK
+dlsym clCreateBufferWithProperties + Acquire/Release ExternalMemObjectsKHR: OK
+OpenCL platform/device/context: OK (QUALCOMM Adreno(TM) 830)
+
+[Stage A] CPU host write → rpcmem → GPU kernel read
+  rpcmem: in=0x71b228d000 fd=10, out=0x71b228b000 fd=11
+  cl_mem (in) from dmabuf fd: OK (0xb40000714d015b90)
+  cl_mem (out) from dmabuf fd: OK (0xb40000714d017500)
+  GPU kernel exec (with acquire/release): 7.102 ms
+  Stage A correctness: ✗ 1024 mismatch
+    first bad: out[0]=0 (expected 9)
+
+[Sync cost] host pointer write → GPU sees update
+  Sync iter 0 sample bad: out[0]=0 expected=7
+  Sync iter 0 sample bad: out[1]=0 expected=9
+  Sync iter 0 sample bad: out[2]=0 expected=11
+  Sync iter 0 sample bad: out[3]=0 expected=13
+  Sync iter 0 sample bad: out[4]=0 expected=15
+  Sync iter 0 sample bad: out[5]=0 expected=17
+  Sync iter 0 sample bad: out[6]=0 expected=19
+  Sync iter 0 sample bad: out[7]=0 expected=21
+  Sync iter 1 sample bad: out[0]=0 expected=7.2
+  Sync iter 1 sample bad: out[1]=0 expected=9.2
+  Sync iter 1 sample bad: out[2]=0 expected=11.2
+  Sync iter 1 sample bad: out[3]=0 expected=13.2
+  Sync iter 1 sample bad: out[4]=0 expected=15.2
+  Sync iter 1 sample bad: out[5]=0 expected=17.2
+  Sync iter 1 sample bad: out[6]=0 expected=19.2
+  Sync iter 1 sample bad: out[7]=0 expected=21.2
+  Sync iter 2 sample bad: out[0]=0 expected=7.4
+  Sync iter 2 sample bad: out[1]=0 expected=9.4
+  Sync iter 2 sample bad: out[2]=0 expected=11.4
+  Sync iter 2 sample bad: out[3]=0 expected=13.4
+  Sync iter 2 sample bad: out[4]=0 expected=15.4
+  Sync iter 2 sample bad: out[5]=0 expected=17.4
+  Sync iter 2 sample bad: out[6]=0 expected=19.4
+  Sync iter 2 sample bad: out[7]=0 expected=21.4
+  Sync iter 3 sample bad: out[0]=0 expected=7.6
+  Sync iter 3 sample bad: out[1]=0 expected=9.6
+  Sync iter 3 sample bad: out[2]=0 expected=11.6
+  Sync iter 3 sample bad: out[3]=0 expected=13.6
+  Sync iter 3 sample bad: out[4]=0 expected=15.6
+  Sync iter 3 sample bad: out[5]=0 expected=17.6
+  Sync iter 3 sample bad: out[6]=0 expected=19.6
+  Sync iter 3 sample bad: out[7]=0 expected=21.6
+  Sync iter 4 sample bad: out[0]=0 expected=7.8
+  Sync iter 4 sample bad: out[1]=0 expected=9.8
+  Sync iter 4 sample bad: out[2]=0 expected=11.8
+  Sync iter 4 sample bad: out[3]=0 expected=13.8
+  Sync iter 4 sample bad: out[4]=0 expected=15.8
+  Sync iter 4 sample bad: out[5]=0 expected=17.8
+  Sync iter 4 sample bad: out[6]=0 expected=19.8
+  Sync iter 4 sample bad: out[7]=0 expected=21.8
+  Sync iter 5 sample bad: out[0]=0 expected=8
+  Sync iter 5 sample bad: out[1]=0 expected=10
+  Sync iter 5 sample bad: out[2]=0 expected=12
+  Sync iter 5 sample bad: out[3]=0 expected=14
+  Sync iter 5 sample bad: out[4]=0 expected=16
+  Sync iter 5 sample bad: out[5]=0 expected=18
+  Sync iter 5 sample bad: out[6]=0 expected=20
+  Sync iter 5 sample bad: out[7]=0 expected=22
+  Sync iter 6 sample bad: out[0]=0 expected=8.2
+  Sync iter 6 sample bad: out[1]=0 expected=10.2
+  Sync iter 6 sample bad: out[2]=0 expected=12.2
+  Sync iter 6 sample bad: out[3]=0 expected=14.2
+  Sync iter 6 sample bad: out[4]=0 expected=16.2
+  Sync iter 6 sample bad: out[5]=0 expected=18.2
+  Sync iter 6 sample bad: out[6]=0 expected=20.2
+  Sync iter 6 sample bad: out[7]=0 expected=22.2
+  Sync iter 7 sample bad: out[0]=0 expected=8.4
+  Sync iter 7 sample bad: out[1]=0 expected=10.4
+  Sync iter 7 sample bad: out[2]=0 expected=12.4
+  Sync iter 7 sample bad: out[3]=0 expected=14.4
+  Sync iter 7 sample bad: out[4]=0 expected=16.4
+  Sync iter 7 sample bad: out[5]=0 expected=18.4
+  Sync iter 7 sample bad: out[6]=0 expected=20.4
+  Sync iter 7 sample bad: out[7]=0 expected=22.4
+  Sync iter 8 sample bad: out[0]=0 expected=8.6
+  Sync iter 8 sample bad: out[1]=0 expected=10.6
+  Sync iter 8 sample bad: out[2]=0 expected=12.6
+  Sync iter 8 sample bad: out[3]=0 expected=14.6
+  Sync iter 8 sample bad: out[4]=0 expected=16.6
+  Sync iter 8 sample bad: out[5]=0 expected=18.6
+  Sync iter 8 sample bad: out[6]=0 expected=20.6
+  Sync iter 8 sample bad: out[7]=0 expected=22.6
+  Sync iter 9 sample bad: out[0]=0 expected=8.8
+  Sync iter 9 sample bad: out[1]=0 expected=10.8
+  Sync iter 9 sample bad: out[2]=0 expected=12.8
+  Sync iter 9 sample bad: out[3]=0 expected=14.8
+  Sync iter 9 sample bad: out[4]=0 expected=16.8
+  Sync iter 9 sample bad: out[5]=0 expected=18.8
+  Sync iter 9 sample bad: out[6]=0 expected=20.8
+  Sync iter 9 sample bad: out[7]=0 expected=22.8
+  Sync iter 10 sample bad: out[0]=0 expected=9
+  Sync iter 10 sample bad: out[1]=0 expected=11
+  Sync iter 10 sample bad: out[2]=0 expected=13
+  Sync iter 10 sample bad: out[3]=0 expected=15
+  Sync iter 10 sample bad: out[4]=0 expected=17
+  Sync iter 10 sample bad: out[5]=0 expected=19
+  Sync iter 10 sample bad: out[6]=0 expected=21
+  Sync iter 10 sample bad: out[7]=0 expected=23
+  Sync iter 11 sample bad: out[0]=0 expected=9.2
+  Sync iter 11 sample bad: out[1]=0 expected=11.2
+  Sync iter 11 sample bad: out[2]=0 expected=13.2
+  Sync iter 11 sample bad: out[3]=0 expected=15.2
+  Sync iter 11 sample bad: out[4]=0 expected=17.2
+  Sync iter 11 sample bad: out[5]=0 expected=19.2
+  Sync iter 11 sample bad: out[6]=0 expected=21.2
+  Sync iter 11 sample bad: out[7]=0 expected=23.2
+  Sync iter 12 sample bad: out[0]=0 expected=9.4
+  Sync iter 12 sample bad: out[1]=0 expected=11.4
+  Sync iter 12 sample bad: out[2]=0 expected=13.4
+  Sync iter 12 sample bad: out[3]=0 expected=15.4
+  Sync iter 12 sample bad: out[4]=0 expected=17.4
+  Sync iter 12 sample bad: out[5]=0 expected=19.4
+  Sync iter 12 sample bad: out[6]=0 expected=21.4
+  Sync iter 12 sample bad: out[7]=0 expected=23.4
+  Sync iter 13 sample bad: out[0]=0 expected=9.6
+  Sync iter 13 sample bad: out[1]=0 expected=11.6
+  Sync iter 13 sample bad: out[2]=0 expected=13.6
+  Sync iter 13 sample bad: out[3]=0 expected=15.6
+  Sync iter 13 sample bad: out[4]=0 expected=17.6
+  Sync iter 13 sample bad: out[5]=0 expected=19.6
+  Sync iter 13 sample bad: out[6]=0 expected=21.6
+  Sync iter 13 sample bad: out[7]=0 expected=23.6
+  Sync iter 14 sample bad: out[0]=0 expected=9.8
+  Sync iter 14 sample bad: out[1]=0 expected=11.8
+  Sync iter 14 sample bad: out[2]=0 expected=13.8
+  Sync iter 14 sample bad: out[3]=0 expected=15.8
+  Sync iter 14 sample bad: out[4]=0 expected=17.8
+  Sync iter 14 sample bad: out[5]=0 expected=19.8
+  Sync iter 14 sample bad: out[6]=0 expected=21.8
+  Sync iter 14 sample bad: out[7]=0 expected=23.8
+  Sync iter 15 sample bad: out[0]=0 expected=10
+  Sync iter 15 sample bad: out[1]=0 expected=12
+  Sync iter 15 sample bad: out[2]=0 expected=14
+  Sync iter 15 sample bad: out[3]=0 expected=16
+  Sync iter 15 sample bad: out[4]=0 expected=18
+  Sync iter 15 sample bad: out[5]=0 expected=20
+  Sync iter 15 sample bad: out[6]=0 expected=22
+  Sync iter 15 sample bad: out[7]=0 expected=24
+  Sync iter 16 sample bad: out[0]=0 expected=10.2
+  Sync iter 16 sample bad: out[1]=0 expected=12.2
+  Sync iter 16 sample bad: out[2]=0 expected=14.2
+  Sync iter 16 sample bad: out[3]=0 expected=16.2
+  Sync iter 16 sample bad: out[4]=0 expected=18.2
+  Sync iter 16 sample bad: out[5]=0 expected=20.2
+  Sync iter 16 sample bad: out[6]=0 expected=22.2
+  Sync iter 16 sample bad: out[7]=0 expected=24.2
+  Sync iter 17 sample bad: out[0]=0 expected=10.4
+  Sync iter 17 sample bad: out[1]=0 expected=12.4
+  Sync iter 17 sample bad: out[2]=0 expected=14.4
+  Sync iter 17 sample bad: out[3]=0 expected=16.4
+  Sync iter 17 sample bad: out[4]=0 expected=18.4
+  Sync iter 17 sample bad: out[5]=0 expected=20.4
+  Sync iter 17 sample bad: out[6]=0 expected=22.4
+  Sync iter 17 sample bad: out[7]=0 expected=24.4
+  Sync iter 18 sample bad: out[0]=0 expected=10.6
+  Sync iter 18 sample bad: out[1]=0 expected=12.6
+  Sync iter 18 sample bad: out[2]=0 expected=14.6
+  Sync iter 18 sample bad: out[3]=0 expected=16.6
+  Sync iter 18 sample bad: out[4]=0 expected=18.6
+  Sync iter 18 sample bad: out[5]=0 expected=20.6
+  Sync iter 18 sample bad: out[6]=0 expected=22.6
+  Sync iter 18 sample bad: out[7]=0 expected=24.6
+  Sync iter 19 sample bad: out[0]=0 expected=10.8
+  Sync iter 19 sample bad: out[1]=0 expected=12.8
+  Sync iter 19 sample bad: out[2]=0 expected=14.8
+  Sync iter 19 sample bad: out[3]=0 expected=16.8
+  Sync iter 19 sample bad: out[4]=0 expected=18.8
+  Sync iter 19 sample bad: out[5]=0 expected=20.8
+  Sync iter 19 sample bad: out[6]=0 expected=22.8
+  Sync iter 19 sample bad: out[7]=0 expected=24.8
+  20-iter mean GPU kernel time (incl any cache sync): 0.147 ms (median 0.147)
+
+[Stage B] HTP write (ElementWiseAdd) → GPU read same dmabuf cl_mem
+Error: contextCreate err=0x36b1
+EXIT_CODE:1

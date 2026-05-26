@@ -1,0 +1,5 @@
+=== microbench_htp_throughput (LISWAP-5 Phase D / Q3) ===
+
+Config: 64 MB FP32 (16777216 elements), n_iters=10
+Error: contextCreate err=0x36b1
+EXIT_CODE:139

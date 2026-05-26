@@ -1,0 +1,22 @@
+{
+  "M6b": {
+    "meta": {
+      "dtype": "f16",
+      "backend": "executorch"
+    },
+    "n": 0,
+    "n_valid": 0,
+    "median": null,
+    "cv_pct": null
+  },
+  "M7": {
+    "meta": {
+      "dtype": "w8a8",
+      "backend": "executorch"
+    },
+    "n": 0,
+    "n_valid": 0,
+    "median": null,
+    "cv_pct": null
+  }
+}

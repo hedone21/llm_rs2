@@ -1,0 +1,5 @@
+=== microbench_htp_matmul_correctness (Phase 32b-1) ===
+
+MatMul: A[1, 1024] × B[1024, 4096] = C[1, 4096]
+Error: contextCreate err=0x36b1
+EXIT_CODE:139
