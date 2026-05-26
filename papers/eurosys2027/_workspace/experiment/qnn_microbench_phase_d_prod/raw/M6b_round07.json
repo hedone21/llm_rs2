@@ -1,0 +1,32 @@
+{
+  "cell": "M6b",
+  "round_idx": 7,
+  "is_warmup": false,
+  "ok": false,
+  "latency_ms": 209.43713188171387,
+  "max_abs_err": null,
+  "cosine": null,
+  "stderr": ".cpp:621] 10 inference took 4.563000 ms, avg 0.456300 ms\nI 00:00:00.143457 executorch:qnn_executor_runner.cpp:665] Total 1 inference took 4.563000 ms, avg 4.563000 ms\nI 00:00:00.143560 executorch:qnn_executor_runner.cpp:730] Write etdump to etdump.etdp, Size = 2296\n[INFO] [Qnn ExecuTorch]: Destroy Qnn context\n[INFO] [Qnn ExecuTorch]: Destroy Qnn device\n[INFO] [Qnn ExecuTorch]: Destroy Qnn backend\n",
+  "raw_stdout": "",
+  "thermal_before": {
+    "cpu_little": 32.3,
+    "cpu_mid": 32.3,
+    "cpu_prime": 31.9,
+    "gpu_5": 31.9,
+    "gpu_7": 31.5,
+    "hex_vec": 31.5,
+    "hex_mat": 31.9,
+    "ddr": 31.9
+  },
+  "thermal_after": {
+    "cpu_little": 32.3,
+    "cpu_mid": 31.9,
+    "cpu_prime": 31.9,
+    "gpu_5": 32.3,
+    "gpu_7": 31.9,
+    "hex_vec": 31.9,
+    "hex_mat": 32.3,
+    "ddr": 32.6
+  },
+  "error": "binary crashed (no latency in stdout)"
+}

@@ -30,6 +30,49 @@ mod qnn {
     include!(concat!(env!("OUT_DIR"), "/qnn_bindings.rs"));
 }
 
+// HTP-specific device custom config (from third_party/qnn_sdk_2.33/include/QNN/HTP/QnnHtpDevice.h).
+// bindgen은 QnnInterface.h 만 처리하므로 HTP 헤더 타입은 여기에 직접 정의한다.
+// Q-2 dry-run gate: stock S25 에서 unsigned-PD 명시가 없으면 contextCreate err=0x36b1.
+#[cfg(feature = "qnn")]
+#[allow(non_snake_case, non_camel_case_types, dead_code)]
+mod qnn_htp {
+    pub const QNN_HTP_DEVICE_ARCH_V79: u32 = 79;
+
+    pub const QNN_HTP_DEVICE_CONFIG_OPTION_ARCH: u32 = 1;
+    pub const QNN_HTP_DEVICE_CONFIG_OPTION_SIGNEDPD: u32 = 2;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct QnnHtpDevice_Minimum_Arch_t {
+        pub deviceId: u32,
+        pub arch: u32, // QnnHtpDevice_Arch_t
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct QnnHtpDevice_UseSignedProcessDomain_t {
+        pub deviceId: u32,
+        pub useSignedProcessDomain: bool,
+    }
+
+    // SDK header에 있는 anonymous union의 최대 크기를 커버하도록 8바이트 align +
+    // 충분한 storage (Minimum_Arch_t 가 8B, UseSignedProcessDomain_t 가 8B, socModel u32).
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub union QnnHtpDevice_CustomConfig_Union_t {
+        pub socModel: u32,
+        pub arch: QnnHtpDevice_Minimum_Arch_t,
+        pub useSignedProcessDomain: QnnHtpDevice_UseSignedProcessDomain_t,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct QnnHtpDevice_CustomConfig_t {
+        pub option: u32, // QnnHtpDevice_ConfigOption_t
+        pub payload: QnnHtpDevice_CustomConfig_Union_t,
+    }
+}
+
 #[cfg(feature = "qnn")]
 fn main() -> anyhow::Result<()> {
     use libloading::{Library, Symbol};
@@ -39,6 +82,7 @@ fn main() -> anyhow::Result<()> {
     use std::time::Instant;
 
     use qnn::*;
+    use qnn_htp::*;
 
     // FFN gate scale: Qwen2.5-1.5B has dim=1536, ffn_dim=8960. We use simpler 1024×4096.
     let args: Vec<String> = std::env::args().collect();
@@ -70,10 +114,63 @@ fn main() -> anyhow::Result<()> {
     let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
     let err = unsafe { (v.backendCreate.unwrap())(ptr::null_mut(), ptr::null_mut(), &mut backend) };
     anyhow::ensure!(err == 0, "backendCreate err=0x{:x}", err);
+
+    // ── Q-2 dry-run gate: HTP device with custom config (unsigned PD + V79 arch) ──
+    // stock S25 (R3CY408S5SB) 는 deviceCreate 없이 contextCreate(NULL device) 호출 시
+    // contextCreate err=0x36b1 (AEE_ENOSUCHMOD): DSP가 application PD에 Skel.so publish 실패.
+    // Executorch HtpDevice.cpp:304~321 패턴: arch=V79 + useSignedProcessDomain=false.
+    let mut htp_cfg_arch = QnnHtpDevice_CustomConfig_t {
+        option: QNN_HTP_DEVICE_CONFIG_OPTION_ARCH,
+        payload: QnnHtpDevice_CustomConfig_Union_t {
+            arch: QnnHtpDevice_Minimum_Arch_t {
+                deviceId: 0,
+                arch: QNN_HTP_DEVICE_ARCH_V79,
+            },
+        },
+    };
+    // LLMRS_HTP_SIGNED_PD=1 → signed PD path (stock device 차단 가설 검증용)
+    let use_signed = std::env::var("LLMRS_HTP_SIGNED_PD").is_ok();
+    let mut htp_cfg_unsigned = QnnHtpDevice_CustomConfig_t {
+        option: QNN_HTP_DEVICE_CONFIG_OPTION_SIGNEDPD,
+        payload: QnnHtpDevice_CustomConfig_Union_t {
+            useSignedProcessDomain: QnnHtpDevice_UseSignedProcessDomain_t {
+                deviceId: 0,
+                useSignedProcessDomain: use_signed,
+            },
+        },
+    };
+    println!(
+        "HTP custom config: arch=V79, useSignedProcessDomain={}",
+        use_signed
+    );
+    let dev_cfg_arch = QnnDevice_Config_t {
+        option: QnnDevice_ConfigOption_t_QNN_DEVICE_CONFIG_OPTION_CUSTOM,
+        __bindgen_anon_1: QnnDevice_Config_t__bindgen_ty_1 {
+            customConfig: &mut htp_cfg_arch as *mut _ as *mut std::os::raw::c_void,
+        },
+    };
+    let dev_cfg_unsigned = QnnDevice_Config_t {
+        option: QnnDevice_ConfigOption_t_QNN_DEVICE_CONFIG_OPTION_CUSTOM,
+        __bindgen_anon_1: QnnDevice_Config_t__bindgen_ty_1 {
+            customConfig: &mut htp_cfg_unsigned as *mut _ as *mut std::os::raw::c_void,
+        },
+    };
+    let dev_cfg_arch_ptr: *const QnnDevice_Config_t = &dev_cfg_arch;
+    let dev_cfg_unsigned_ptr: *const QnnDevice_Config_t = &dev_cfg_unsigned;
+    // QNN convention: NULL-terminated array of *const QnnDevice_Config_t.
+    let mut dev_cfg_list: [*const QnnDevice_Config_t; 3] =
+        [dev_cfg_arch_ptr, dev_cfg_unsigned_ptr, ptr::null()];
+    let mut device: Qnn_DeviceHandle_t = ptr::null_mut();
+    let err =
+        unsafe { (v.deviceCreate.unwrap())(ptr::null_mut(), dev_cfg_list.as_mut_ptr(), &mut device) };
+    anyhow::ensure!(err == 0, "deviceCreate err=0x{:x}", err);
+    println!("deviceCreate (V79 + unsigned PD): OK");
+
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
     let err =
-        unsafe { (v.contextCreate.unwrap())(backend, ptr::null_mut(), ptr::null_mut(), &mut ctx) };
+        unsafe { (v.contextCreate.unwrap())(backend, device, ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
+    println!("contextCreate (with device): OK");
 
     let graph_name = CString::new("htp_matmul").unwrap();
     let mut graph: Qnn_GraphHandle_t = ptr::null_mut();
@@ -294,6 +391,7 @@ fn main() -> anyhow::Result<()> {
 
     unsafe {
         let _ = (v.contextFree.unwrap())(ctx, ptr::null_mut());
+        let _ = (v.deviceFree.unwrap())(device);
         let _ = (v.backendFree.unwrap())(backend);
     }
     if pass_acceptable {

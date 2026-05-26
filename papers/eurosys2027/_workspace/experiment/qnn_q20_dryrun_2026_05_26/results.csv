@@ -1,0 +1,10 @@
+bin,returncode,verdict,key_log
+microbench_htp_correctness,139,SEGFAULT,"backendCreate: OK (0x1) "
+microbench_htp_gpu_matmul_concurrent,1,FAIL,"Error: contextCreate err=0x36b1 "
+microbench_htp_gpu_parallel,1,FAIL,"Error: contextCreate err=0x36b1 "
+microbench_htp_graph_reuse,139,SEGFAULT,"Error: contextCreate err=0x36b1 "
+microbench_htp_matmul_correctness,139,SEGFAULT,"Error: contextCreate err=0x36b1 "
+microbench_htp_opencl_interop,1,FAIL,"dlopen libcdsprpc.so + libOpenCL.so: OK "
+microbench_htp_qnngpu_share,1,FAIL,"Error: HTP contextCreate err=0x36b1 "
+microbench_htp_rpcmem_throughput,1,FAIL,"libcdsprpc.so: dlopen + dlsym OK (rpcmem_alloc/free/to_fd) "
+microbench_htp_throughput,139,SEGFAULT,"Error: contextCreate err=0x36b1 "

@@ -1,0 +1,7 @@
+=== microbench_htp_qnngpu_share (R-Y option 3) ===
+
+rpcmem buffers: a fd=6, b fd=7, c fd=8 (SHARED), d fd=9
+HTP backend: provider=HTP_QTI_AISW
+QNN-GPU backend: provider=GPU_QTI_AISW
+Error: HTP contextCreate err=0x36b1
+EXIT_CODE:1
