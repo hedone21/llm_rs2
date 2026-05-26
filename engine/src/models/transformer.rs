@@ -131,7 +131,8 @@ pub struct TransformerModel {
     /// - `secondary_mmap == None`: `QuantNoiseTable::empty()` (len==0).
     /// - Secondary present but all layers failed: `QuantNoiseTable::uniform_ones(n)`.
     /// - Normal: `QuantNoiseTable::new_from_frobenius(...)` with `is_computed=true`.
-    pub quant_noise: Arc<crate::models::weights::QuantNoiseTable>,
+    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference owner accepts pressure-owned resource via Arc field
+    pub quant_noise: Arc<crate::pressure::weights::QuantNoiseTable>,
     /// Async primary cl_mem release worker (ENG-ALG-228 / ENG-DAT-100).
     ///
     /// Spawned once at model creation. `SwapExecutor` enqueues displaced
@@ -142,7 +143,8 @@ pub struct TransformerModel {
     /// `Arc` so `SwapExecutor` (which borrows references) can hold a clone
     /// without lifetime coupling to the model. Drop impl joins the worker
     /// thread, ensuring all destructors run before process exit.
-    pub release_worker: Arc<crate::models::weights::PrimaryReleaseWorker>,
+    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference owner accepts pressure-owned resource via Arc field
+    pub release_worker: Arc<crate::pressure::weights::PrimaryReleaseWorker>,
 }
 
 pub struct TransformerModelForwardArgs<'a, C: KVCacheOps> {
@@ -184,7 +186,7 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps> {
     /// `layer.forward`, calls the wait gate via `hook.pending_event_for(idx)`).
     /// When `None`, the hot-path overhead is one `Option::is_some` branch
     /// per layer (INV-147).
-    pub layer_boundary_hook: Option<&'a dyn crate::models::weights::LayerBoundaryHook>,
+    pub layer_boundary_hook: Option<&'a dyn crate::layer_boundary_hook::LayerBoundaryHook>,
 }
 
 impl TransformerModel {
@@ -3140,10 +3142,12 @@ impl TransformerModel {
 /// When `model.secondary_mmap` is `None` the empty table is returned without
 /// log output.  On complete failure the fallback `uniform_ones` table is
 /// returned and a warning is emitted.
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference function creates pressure-owned resource via ctor
 fn compute_quant_noise_for_model(
     model: &TransformerModel,
-) -> Arc<crate::models::weights::QuantNoiseTable> {
-    use crate::models::weights::QuantNoiseTable;
+) -> Arc<crate::pressure::weights::QuantNoiseTable> {
+    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference owner accepts pressure-owned resource via ctor
+    use crate::pressure::weights::QuantNoiseTable;
 
     let secondary = match model.secondary_mmap.as_ref() {
         Some(s) => s,
@@ -3254,8 +3258,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
                 cpu_be.clone(),
             )),
         };
@@ -3406,8 +3410,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
                 cpu_be.clone(),
             )),
         };
@@ -3520,8 +3524,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
                 cpu_be.clone(),
             )),
         };
@@ -3624,8 +3628,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
                 cpu_be.clone(),
             )),
         };
@@ -3704,8 +3708,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
+            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
                 cpu_be.clone(),
             )),
         };

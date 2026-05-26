@@ -8,7 +8,7 @@
 //! 정확히 1회만 dispatch된다. `mark_dispatched(idx)` 후 `should_dispatch(idx)`는
 //! 영구적으로 false. 동일 idx에 대한 중복 mark는 안전 (no-op).
 
-use llm_rs2::models::weights::IntraForwardSwapPlan;
+use llm_rs2::pressure::weights::IntraForwardSwapPlan;
 
 #[test]
 fn test_should_dispatch_then_mark_disables_redispatch() {

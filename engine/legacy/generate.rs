@@ -1084,7 +1084,7 @@ fn main() -> anyhow::Result<()> {
     // the swap is NOT executed here. Instead, an IncrementalSwapPlan is
     // committed and stored below; the decode loop drains it chunk-by-chunk.
     // per_tick == 0 (default): single-shot path, unchanged from before.
-    let mut incremental_force_swap_plan: Option<llm_rs2::models::weights::IncrementalSwapPlan> =
+    let mut incremental_force_swap_plan: Option<llm_rs2::pressure::weights::IncrementalSwapPlan> =
         None;
 
     // S-1: shared EventSink for weight swap lifecycle events.
@@ -1108,7 +1108,7 @@ fn main() -> anyhow::Result<()> {
     // Decode loop injects `Some(&*hook)` into `layer_boundary_hook` and calls
     // `finalize` once `plan_is_complete()` to drain dispatcher + bump
     // ratio_generation + invalidate SOA registry.
-    let mut intra_forward_swap_hook: Option<Arc<llm_rs2::models::weights::IntraForwardSwapHook>> =
+    let mut intra_forward_swap_hook: Option<Arc<llm_rs2::pressure::weights::IntraForwardSwapHook>> =
         None;
 
     // LISWAP-5: phase-aware async swap dispatcher. Created when
@@ -1118,7 +1118,7 @@ fn main() -> anyhow::Result<()> {
     // `finalize` drains remaining chunks + bumps ratio_generation when decode
     // ends.
     let mut phase_aware_swap_dispatcher: Option<
-        Arc<llm_rs2::models::weights::PhaseAwareSwapDispatcher>,
+        Arc<llm_rs2::pressure::weights::PhaseAwareSwapDispatcher>,
     > = None;
 
     // LISWAP-2 prototype: async swap dispatcher lifecycle.
@@ -1128,14 +1128,14 @@ fn main() -> anyhow::Result<()> {
     // NOTE: also created when per_tick == 0 so that manager-triggered incremental
     // swap (LISWAP-6 manager path) can use async dispatch even without
     // --swap-incremental-per-tick CLI flag.
-    let async_swap_dispatcher: Option<llm_rs2::models::weights::AsyncSwapDispatcher> = {
+    let async_swap_dispatcher: Option<llm_rs2::pressure::weights::AsyncSwapDispatcher> = {
         if args.swap_async_dispatch {
             let swap_backend: Arc<dyn Backend> = gpu_backend_arc
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| cpu_backend_arc.clone());
             if swap_backend.supports_async_transfer() {
-                Some(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                Some(llm_rs2::pressure::weights::AsyncSwapDispatcher::new(
                     swap_backend,
                     std::sync::Arc::clone(&event_sink),
                 ))
@@ -1165,7 +1165,7 @@ fn main() -> anyhow::Result<()> {
             .cloned()
             .unwrap_or_else(|| cpu_backend_arc.clone());
         let runtime_dispatcher =
-            std::sync::Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+            std::sync::Arc::new(llm_rs2::pressure::weights::AsyncSwapDispatcher::new(
                 swap_backend.clone(),
                 std::sync::Arc::clone(&event_sink),
             ));
@@ -1190,9 +1190,9 @@ fn main() -> anyhow::Result<()> {
             "--swap-dynamic-k and --swap-probing-k are mutually exclusive — pick one controller"
         );
     }
-    let mut dynamic_k_controller: Option<llm_rs2::models::weights::DynamicKController> =
+    let mut dynamic_k_controller: Option<llm_rs2::pressure::weights::DynamicKController> =
         if args.swap_dynamic_k {
-            Some(llm_rs2::models::weights::DynamicKController::new())
+            Some(llm_rs2::pressure::weights::DynamicKController::new())
         } else {
             None
         };
@@ -1202,17 +1202,17 @@ fn main() -> anyhow::Result<()> {
 
     // Probing-K controller (bottom-up alternative to ARGUS). Starts at K=1 and
     // probes upward subject to a stability window + release-queue spike guard.
-    let mut probing_k_controller: Option<llm_rs2::models::weights::ProbingKController> =
+    let mut probing_k_controller: Option<llm_rs2::pressure::weights::ProbingKController> =
         if args.swap_probing_k {
             let growth = match args.swap_probing_growth.to_ascii_lowercase().as_str() {
-                "linear" => llm_rs2::models::weights::GrowthMode::Linear,
-                "binary" => llm_rs2::models::weights::GrowthMode::Binary,
+                "linear" => llm_rs2::pressure::weights::GrowthMode::Linear,
+                "binary" => llm_rs2::pressure::weights::GrowthMode::Binary,
                 other => anyhow::bail!(
                     "--swap-probing-growth must be 'linear' or 'binary', got '{other}'"
                 ),
             };
             let mut c =
-                llm_rs2::models::weights::ProbingKController::with_options(1, usize::MAX, growth);
+                llm_rs2::pressure::weights::ProbingKController::with_options(1, usize::MAX, growth);
             c.set_stability_window(args.swap_probing_window.max(1));
             Some(c)
         } else {
@@ -1381,7 +1381,7 @@ fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .cloned()
                     .unwrap_or_else(|| cpu_backend_arc.clone());
-                let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                let dispatcher = Arc::new(llm_rs2::pressure::weights::AsyncSwapDispatcher::new(
                     Arc::clone(&swap_backend),
                     Arc::clone(&event_sink),
                 ));
@@ -1401,7 +1401,7 @@ fn main() -> anyhow::Result<()> {
                     target_layers.len(),
                     args.swap_phase_aware_chunk_mb
                 );
-                let phase_dispatcher = llm_rs2::models::weights::PhaseAwareSwapDispatcher::new(
+                let phase_dispatcher = llm_rs2::pressure::weights::PhaseAwareSwapDispatcher::new(
                     chunk_size_bytes,
                     model.layers.clone(),
                     secondary,
@@ -1432,7 +1432,7 @@ fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .cloned()
                     .unwrap_or_else(|| cpu_backend_arc.clone());
-                let dispatcher = Arc::new(llm_rs2::models::weights::AsyncSwapDispatcher::new(
+                let dispatcher = Arc::new(llm_rs2::pressure::weights::AsyncSwapDispatcher::new(
                     Arc::clone(&swap_backend),
                     Arc::clone(&event_sink),
                 ));
@@ -1467,7 +1467,7 @@ fn main() -> anyhow::Result<()> {
                     ratio,
                     target_layers.len()
                 );
-                intra_forward_swap_hook = Some(llm_rs2::models::weights::IntraForwardSwapHook::new(
+                intra_forward_swap_hook = Some(llm_rs2::pressure::weights::IntraForwardSwapHook::new(
                     target_layers,
                     0,
                     dispatcher,
@@ -1487,7 +1487,7 @@ fn main() -> anyhow::Result<()> {
                     args.swap_incremental_per_tick,
                     target_layers.len().div_ceil(args.swap_incremental_per_tick),
                 );
-                incremental_force_swap_plan = Some(llm_rs2::models::weights::IncrementalSwapPlan::new(
+                incremental_force_swap_plan = Some(llm_rs2::pressure::weights::IncrementalSwapPlan::new(
                     target_layers,
                     args.swap_incremental_per_tick,
                     0,
@@ -1547,7 +1547,7 @@ fn main() -> anyhow::Result<()> {
         let ratio = ratio.clamp(0.0, 1.0);
         let num_layers = model.layers.len();
         let target_layers =
-            llm_rs2::models::weights::SwapExecutor::uniform_target_layers(ratio, num_layers);
+            llm_rs2::pressure::weights::SwapExecutor::uniform_target_layers(ratio, num_layers);
 
         // ── LISWAP-6: Eager prefault ─────────────────────────────────────
         // qnn_oppkg + Rpcmem variant 일 때 swap 시점의 rpcmem_alloc 비용
@@ -1677,7 +1677,7 @@ fn main() -> anyhow::Result<()> {
     // Accumulated state produced by the QCF dump workflow.
     // Only populated when args.qcf_dump.is_some().
     let mut qcf_warmup_importance: Option<llm_rs2::qcf::ImportanceTable> = None;
-    let mut qcf_swap_decision: Option<llm_rs2::models::weights::decider::SwapDecision> = None;
+    let mut qcf_swap_decision: Option<llm_rs2::pressure::weights::decider::SwapDecision> = None;
     let qcf_workflow_start = std::time::Instant::now();
 
     if args.qcf_dump.is_some() && (args.ppl.is_some() || !prompt.is_empty()) {
@@ -2081,10 +2081,10 @@ fn main() -> anyhow::Result<()> {
                 // The cast to `&dyn LayerBoundaryHook` happens inside the
                 // option mapping so the args field can be `Option<&dyn _>`
                 // — this is the *only* place a real hook is wired in.
-                let liswap4_hook: Option<&dyn llm_rs2::models::weights::LayerBoundaryHook> =
+                let liswap4_hook: Option<&dyn llm_rs2::layer_boundary_hook::LayerBoundaryHook> =
                     intra_forward_swap_hook
                         .as_deref()
-                        .map(|h| h as &dyn llm_rs2::models::weights::LayerBoundaryHook);
+                        .map(|h| h as &dyn llm_rs2::layer_boundary_hook::LayerBoundaryHook);
 
                 model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gen_input_tensor,
@@ -3911,7 +3911,7 @@ fn build_layer_swap_estimate(
     let per_layer_noise: Vec<Option<f32>> = (0..n).map(|i| noise.epsilon(i)).collect();
 
     // qcf_swap_at_ratio: sample at representative ratios
-    use llm_rs2::models::weights::WeightSwapDecider;
+    use llm_rs2::pressure::weights::WeightSwapDecider;
     use std::collections::HashMap;
 
     let sample_ratios = [0.1f32, 0.25, 0.5, 0.75, 1.0];
@@ -3924,7 +3924,7 @@ fn build_layer_swap_estimate(
             n_decoder_layers: n,
             currently_swapped: &[],
             allow_boundary_layers: read_allow_boundary_env(),
-            algorithm: llm_rs2::models::weights::SwapAlgorithm::ImportanceAware,
+            algorithm: llm_rs2::pressure::weights::SwapAlgorithm::ImportanceAware,
         };
         let (_, qcf) = decider.decide_dry_run(r);
         qcf_swap_at_ratio.insert(format!("{:.2}", r), qcf);

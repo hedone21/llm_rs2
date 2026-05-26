@@ -11,9 +11,9 @@ use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::models::weights::decider::SwapDecision;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kv_cache::KVCache;
+use crate::pressure::weights::decider::SwapDecision;
 use crate::qcf::ImportanceTable;
 use crate::session::cli::Args;
 
@@ -49,7 +49,7 @@ pub struct PplRunCtx {
 
     // 다른 outer state (ppl_main에서 직접 참조)
     pub auto_eviction: bool,
-    pub swap_algorithm: crate::models::weights::SwapAlgorithm,
+    pub swap_algorithm: crate::pressure::weights::SwapAlgorithm,
 }
 
 /// Return value from `run_ppl` for use by the caller (e.g. `--qcf-dump`).

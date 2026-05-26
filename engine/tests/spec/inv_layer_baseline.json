@@ -11,33 +11,56 @@
       "note": "tensor_partition L2 격상 별 sprint 대기"
     },
     {
-      "id": "V-31",
-      "file": "models/weights/swap_executor.rs",
-      "line": 63,
-      "import": "crate::observability::events::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) — §13.8-N cross_cutting_trait_usage (S-1+α). marker도 parser가 multi-item use {} 라인 직후 marker block-form으로 오해.",
-      "is_test_block": false
+      "id": "V-32",
+      "file": "backend/htp_fastrpc/mod.rs",
+      "line": 91,
+      "import": "crate::backend::cpu::cpu_singleton",
+      "rule": "INV-LAYER-001",
+      "kind": "L1(htp_fastrpc)→L1(cpu) (cross-backend import)",
+      "is_test_block": false,
+      "note": "Sprint C와 무관한 기존 htp_fastrpc cross-backend 의존, 별도 sprint 대기"
+    },
+    {
+      "id": "V-32",
+      "file": "backend/htp_fastrpc/mod.rs",
+      "line": 527,
+      "import": "crate::backend::cpu::cpu_singleton",
+      "rule": "INV-LAYER-001",
+      "kind": "L1(htp_fastrpc)→L1(cpu) (cross-backend import)",
+      "is_test_block": true,
+      "note": "Sprint C와 무관한 기존 htp_fastrpc cross-backend 의존 (test block), 별도 sprint 대기"
     },
     {
       "id": "V-31",
-      "file": "models/weights/phase_aware_swap.rs",
+      "file": "pressure/weights/intra_forward_swap.rs",
+      "line": 49,
+      "import": "crate::observability::events::",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
+      "is_test_block": false,
+      "note": "Sprint C 도메인 재배치 후 pressure/weights/로 이동. §13.8-N cross_cutting_trait_usage, observability trait inversion backlog."
+    },
+    {
+      "id": "V-31",
+      "file": "pressure/weights/phase_aware_swap.rs",
       "line": 35,
+      "import": "crate::observability::events::",
+      "rule": "INV-LAYER-003",
+      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
+      "is_test_block": false,
+      "note": "Sprint C 도메인 재배치 후 pressure/weights/로 이동. §13.8-N cross_cutting_trait_usage."
+    },
+    {
+      "id": "V-31",
+      "file": "pressure/weights/phase_aware_swap.rs",
+      "line": 37,
       "import": "crate::observability::profile::op_trace::",
       "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) — §13.8-N op_trace hook (PhaseHook L2 격상 backlog). S-1+α events use {} 선행으로 parser block-form 오해.",
-      "is_test_block": false
-    },
-    {
-      "id": "V-31",
-      "file": "models/weights/async_swap.rs",
-      "line": 41,
-      "import": "crate::observability::events::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-inference→cross-cutting(observability) — §13.8-N cross_cutting_trait_usage (S-1+β). marker도 parser가 multi-item use {} 라인 직후 marker block-form으로 오해.",
-      "is_test_block": false
+      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
+      "is_test_block": false,
+      "note": "Sprint C 도메인 재배치 후 pressure/weights/로 이동. §13.8-N op_trace hook, PhaseHook L2 격상 backlog."
     }
   ],
-  "baseline_count": 4,
-  "notes": "Refreshed 2026-05-25 after B-2~B-5 + S-1+α + B2.5 cpu_singleton + S-1+β sprints. 4 real violations all tracked separately (V-02 tensor_partition promotion, V-31 §13.8-N marker parser limitation × 3)."
+  "baseline_count": 6,
+  "notes": "Refreshed 2026-05-26 after Sprint C (pressure/weights/ domain relocation). V-02 tensor_partition promotion (별도 sprint), V-32 htp_fastrpc cross-backend 2건 (Sprint C 무관), V-31 observability §13.8-N 3건 (pressure/weights/ 이동 후 재등록, trait inversion backlog)."
 }

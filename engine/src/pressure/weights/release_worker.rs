@@ -30,8 +30,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::backend::Backend;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure worker → inference weight resource (LayerWeights)
 use crate::models::weights::LayerWeights;
-use crate::models::weights::swap_executor::record_swap_release_pub;
+use crate::pressure::weights::swap_executor::record_swap_release_pub;
 
 /// Message sent to the release worker.
 pub enum ReleaseJob {

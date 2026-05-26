@@ -1,6 +1,6 @@
 //! `ProbingKController` — bottom-up adaptive `K` for incremental weight swap.
 //!
-//! Complement to [`crate::models::weights::DynamicKController`] (ARGUS). The
+//! Complement to [`crate::pressure::weights::DynamicKController`] (ARGUS). The
 //! latter calibrates `K` once at Phase 0 (timing-based) and stays monotonic
 //! non-increasing. This controller instead starts from `K = 1` (the safest
 //! possible chunk) and probes the chunk size upward while monitoring two

@@ -17,7 +17,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use llm_rs2::models::weights::{LayerBoundaryHook, NoOpHook};
+use llm_rs2::layer_boundary_hook::{LayerBoundaryHook, NoOpHook};
 
 /// Case 1 (host-trivial): `pending_event_for_dyn` default returns None.
 #[test]

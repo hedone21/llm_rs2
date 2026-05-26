@@ -17,11 +17,11 @@ use llm_shared::DtypeTag;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::models::transformer::TransformerModel;
-use crate::models::weights::{
+use crate::observability::events::EventSink;
+use crate::pressure::weights::{
     AsyncSwapDispatcher, IncrementalSwapPlan, IntraForwardSwapHook, PhaseAwareSwapDispatcher,
     PrimaryReleaseWorker,
 };
-use crate::observability::events::EventSink;
 use crate::session::cli::SwapMode;
 
 /// Engine 내부 swap dispatch의 commit 결과.
@@ -152,7 +152,7 @@ impl EngineSwapRuntime {
         commit_slot: &mut SwapCommitSlot,
         manager_report_out: &mut Option<(f32, usize, Instant, f32)>,
     ) {
-        use crate::models::weights::{
+        use crate::pressure::weights::{
             SwapAlgorithm, SwapDecision, WeightSwapDecider, compute_qcf_weight_swap,
         };
 

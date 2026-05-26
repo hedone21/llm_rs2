@@ -11,6 +11,7 @@ pub mod hybrid_attention;
 pub mod inference;
 pub mod instrument;
 pub mod kv_cache_ops;
+pub mod layer_boundary_hook;
 pub mod layers;
 pub mod memory;
 pub mod model_config;

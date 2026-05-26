@@ -16,7 +16,7 @@
 //!
 //! Spec: INV-128, ENG-ALG-218.
 
-use llm_rs2::models::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
+use llm_rs2::pressure::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
 use llm_rs2::qcf::layer_importance::ImportanceCollector;
 use llm_rs2::qcf::layer_importance::ImportanceTable;
 

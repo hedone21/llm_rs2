@@ -21,7 +21,7 @@ use crate::tensor::Tensor;
 
 pub struct QcfWarmupResult {
     pub importance: crate::qcf::ImportanceTable,
-    pub decision: Option<crate::models::weights::SwapDecision>,
+    pub decision: Option<crate::pressure::weights::SwapDecision>,
     /// Per-layer DP-LLM proxy ε (single-tensor relative `attn_output`).
     /// `Some` only in compare mode.
     pub dpllm_epsilon: Option<Vec<f32>>,
@@ -53,7 +53,7 @@ pub fn run_layer_swap(
     target_layers: &[usize],
     gpu_backend: Option<&Arc<dyn Backend>>,
     cpu_backend: &Arc<dyn Backend>,
-    async_dispatcher: Option<&crate::models::weights::AsyncSwapDispatcher>,
+    async_dispatcher: Option<&crate::pressure::weights::AsyncSwapDispatcher>,
     #[cfg(feature = "opencl")] host_ptr_pool: Option<
         Arc<crate::backend::opencl::host_ptr_pool::HostPtrPool>,
     >,
@@ -63,13 +63,13 @@ pub fn run_layer_swap(
     #[cfg(feature = "cuda-embedded")] mmap_registration: Option<
         Arc<crate::memory::cuda::mmap::CudaMmapRegistration>,
     >,
-) -> Result<crate::models::weights::SwapReport, crate::models::weights::SwapError> {
+) -> Result<crate::pressure::weights::SwapReport, crate::pressure::weights::SwapError> {
     let swap_memory = Galloc::new();
     let swap_backend: Arc<dyn Backend> =
         gpu_backend.cloned().unwrap_or_else(|| cpu_backend.clone());
     // ENG-ALG-228: attach the model's async release worker so Stage (c) enqueues
     // displaced LayerWeights for background drop instead of blocking inline.
-    let executor = crate::models::weights::SwapExecutor::new_with_worker(
+    let executor = crate::pressure::weights::SwapExecutor::new_with_worker(
         DType::Q4_0,
         &model.config,
         swap_backend,
@@ -136,7 +136,7 @@ pub struct QcfWarmupCtx<'a> {
 /// Behaviour knobs for [`run_qcf_warmup_workflow`] (scalar/option values).
 pub struct QcfWarmupConfig<'a> {
     pub force_ratio: Option<f32>,
-    pub swap_algorithm: crate::models::weights::SwapAlgorithm,
+    pub swap_algorithm: crate::pressure::weights::SwapAlgorithm,
     pub execute_swap: bool,
     pub importance_formula: crate::qcf_types::ImportanceFormula,
     pub importance_three_way: bool,
@@ -149,7 +149,7 @@ pub fn run_qcf_warmup_workflow(
     ctx: QcfWarmupCtx<'_>,
     cfg: QcfWarmupConfig<'_>,
 ) -> anyhow::Result<QcfWarmupResult> {
-    use crate::models::weights::WeightSwapDecider;
+    use crate::pressure::weights::WeightSwapDecider;
     use crate::qcf::ImportanceCollector;
 
     let QcfWarmupCtx {
@@ -399,7 +399,7 @@ pub fn run_qcf_warmup_workflow(
         let sec_opt = model.secondary_mmap.as_ref();
         let eps_single = if importance_three_way {
             sec_opt.map(|sec| {
-                crate::models::weights::noise_table::compute_input_aware_epsilon(
+                crate::pressure::weights::noise_table::compute_input_aware_epsilon(
                     &model.layers,
                     sec,
                     &x_means,
@@ -410,7 +410,7 @@ pub fn run_qcf_warmup_workflow(
         };
         let eps_multi = if importance_three_way {
             sec_opt.map(|sec| {
-                crate::models::weights::noise_table::compute_input_aware_epsilon_multitensor(
+                crate::pressure::weights::noise_table::compute_input_aware_epsilon_multitensor(
                     &model.layers,
                     sec,
                     &x_means,
@@ -421,7 +421,7 @@ pub fn run_qcf_warmup_workflow(
         };
         let eps_abs = if importance_three_way {
             sec_opt.map(|sec| {
-                crate::models::weights::noise_table::compute_input_aware_epsilon_absolute(
+                crate::pressure::weights::noise_table::compute_input_aware_epsilon_absolute(
                     &model.layers,
                     sec,
                     &x_means,
@@ -432,7 +432,7 @@ pub fn run_qcf_warmup_workflow(
         };
         let eps_qcf = if importance_three_way {
             sec_opt.map(|sec| {
-                crate::models::weights::noise_table::compute_input_aware_epsilon_qcf(
+                crate::pressure::weights::noise_table::compute_input_aware_epsilon_qcf(
                     &model.layers,
                     sec,
                     &x_means,
@@ -447,7 +447,7 @@ pub fn run_qcf_warmup_workflow(
             let n_heads = model.config.num_attention_heads;
             let n_kv_heads = model.config.num_key_value_heads;
             let d_head = model.config.head_dim;
-            let pairs = crate::models::weights::noise_table::compute_cascade_attn_perturbation(
+            let pairs = crate::pressure::weights::noise_table::compute_cascade_attn_perturbation(
                 &model.layers,
                 sec,
                 &raws,
@@ -469,14 +469,15 @@ pub fn run_qcf_warmup_workflow(
             let d_head = model.config.head_dim;
 
             // (1) decode-only
-            let pairs_dec = crate::models::weights::noise_table::compute_cascade_attn_perturbation(
-                &model.layers,
-                sec,
-                raws_dec,
-                n_heads,
-                n_kv_heads,
-                d_head,
-            );
+            let pairs_dec =
+                crate::pressure::weights::noise_table::compute_cascade_attn_perturbation(
+                    &model.layers,
+                    sec,
+                    raws_dec,
+                    n_heads,
+                    n_kv_heads,
+                    d_head,
+                );
             direct_attn_f5_decode_only =
                 Some(pairs_dec.iter().map(|(_, b)| *b).collect::<Vec<f32>>());
 
@@ -501,7 +502,7 @@ pub fn run_qcf_warmup_workflow(
                     raws_merged.push((merged, *p_t + *d_t, dim));
                 }
                 let pairs_pd =
-                    crate::models::weights::noise_table::compute_cascade_attn_perturbation(
+                    crate::pressure::weights::noise_table::compute_cascade_attn_perturbation(
                         &model.layers,
                         sec,
                         &raws_merged,
@@ -575,7 +576,7 @@ pub fn run_qcf_warmup_workflow(
                 .copied()
                 .filter(|i| *i < model.layers.len())
                 .collect();
-            let qcf_override = crate::models::weights::compute_qcf_weight_swap(
+            let qcf_override = crate::pressure::weights::compute_qcf_weight_swap(
                 &override_layers,
                 model.quant_noise.as_ref(),
                 Some(&imp_table),
@@ -585,7 +586,7 @@ pub fn run_qcf_warmup_workflow(
                 "[QCF-dump]{} swap-only override: layers={:?} (ignoring algorithm/ratio decision)",
                 log_prefix, override_layers,
             );
-            crate::models::weights::SwapDecision {
+            crate::pressure::weights::SwapDecision {
                 selected_layers: override_layers,
                 qcf_swap_estimate: qcf_override,
                 fallback_used: false,
@@ -674,10 +675,10 @@ pub fn dispatch_swap_weights(
     target_dtype: llm_shared::DtypeTag,
     importance_table: Option<&dyn crate::qcf_collector::ImportanceLookup>,
     decode_token_index: usize,
-    swap_plan_out: &mut Option<crate::models::weights::IncrementalSwapPlan>,
+    swap_plan_out: &mut Option<crate::pressure::weights::IncrementalSwapPlan>,
     manager_report_out: &mut Option<(f32, usize, std::time::Instant, f32)>,
 ) {
-    use crate::models::weights::{
+    use crate::pressure::weights::{
         IncrementalSwapPlan, SwapDecision, WeightSwapDecider, compute_qcf_weight_swap,
     };
     use llm_shared::DtypeTag;
@@ -729,7 +730,7 @@ pub fn dispatch_swap_weights(
         n_decoder_layers: n_layers,
         currently_swapped: &currently_swapped,
         allow_boundary_layers: allow_boundary,
-        algorithm: crate::models::weights::SwapAlgorithm::ImportanceAware,
+        algorithm: crate::pressure::weights::SwapAlgorithm::ImportanceAware,
     };
     let decision: SwapDecision = decider.decide(ratio);
 

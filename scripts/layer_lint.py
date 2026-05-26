@@ -130,7 +130,7 @@ def classify_module(rel_path: str) -> str:
                     "partition_workspace.rs", "kv_cache_ops.rs",
                     "yield_policy.rs", "qcf_types.rs",
                     "qcf_computer.rs", "qcf_collector.rs",
-                    "model_config.rs"}
+                    "model_config.rs", "layer_boundary_hook.rs"}
     if norm in TOP_LEVEL_L2:
         return "L2"
     for prefix, layer in LAYER_RULES:

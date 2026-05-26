@@ -25,10 +25,12 @@
 
 use crate::backend::{Backend, GpuEvent};
 use crate::buffer::DType;
-use crate::models::weights::async_swap::{AsyncSwapDispatcher, ChunkDispatchJob, SwapCommitJob};
+use crate::pressure::weights::async_swap::{AsyncSwapDispatcher, ChunkDispatchJob, SwapCommitJob};
+use crate::pressure::weights::swap_executor::SwapExecutor;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot/SecondaryMmap)
 use crate::models::weights::secondary_mmap::SecondaryMmap;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
-use crate::models::weights::swap_executor::SwapExecutor;
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+α)
 use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N op_trace hook (PhaseHook L2 격상 backlog 대기)

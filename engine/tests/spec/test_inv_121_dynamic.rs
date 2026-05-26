@@ -247,7 +247,7 @@ fn swap_executor_bumps_ratio_generation_exactly_once_per_batch() {
     // requires a `TransformerModel` instance and therefore a real
     // `SecondaryMmap`, which is heavy to stand up host-side. Instead we
     // exercise `uniform_target_layers` + the layout contract directly.
-    use llm_rs2::models::weights::SwapExecutor;
+    use llm_rs2::pressure::weights::SwapExecutor;
 
     let picks = SwapExecutor::uniform_target_layers(0.0, 16);
     assert!(picks.is_empty(), "ratio=0.0 must yield empty picks");

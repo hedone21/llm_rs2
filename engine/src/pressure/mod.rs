@@ -15,6 +15,7 @@ pub mod kivi_cache;
 pub mod kv_cache;
 pub mod kv_migrate;
 pub mod offload;
+pub mod weights;
 
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)
 pub mod d2o_handler;

@@ -476,7 +476,7 @@ fn sprint_d_auto_q4_0_only_auf_selects_q4_0() {
 #[test]
 fn d4_swap_executor_signature_unchanged() {
     use llm_rs2::buffer::DType;
-    use llm_rs2::models::weights::SwapExecutor;
+    use llm_rs2::pressure::weights::SwapExecutor;
 
     // SwapExecutor::new 시그니처 컴파일타임 체크:
     // target_dtype: DType이 첫 번째 파라미터이고 나머지 인수 타입이 맞아야 한다.

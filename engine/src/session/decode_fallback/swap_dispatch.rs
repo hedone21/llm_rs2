@@ -15,12 +15,12 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::models::transformer::TransformerModel;
-use crate::models::weights::{
+use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
+use crate::observability::rss_trace::read_bytes_now;
+use crate::pressure::weights::{
     AsyncSwapDispatcher, DynamicKController, IncrementalSwapPlan, IntraForwardSwapHook,
     PhaseAwareSwapDispatcher, ProbingKController,
 };
-use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
-use crate::observability::rss_trace::read_bytes_now;
 use crate::qcf::ImportanceTable;
 use crate::session::cli::Args;
 use crate::session::qcf_runtime::run_layer_swap;
@@ -296,7 +296,7 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
             if let Some((ratio, n_planned, plan_start, qcf_estimated)) =
                 ctx.manager_swap_report_pending.take()
             {
-                use crate::models::weights::compute_qcf_weight_swap;
+                use crate::pressure::weights::compute_qcf_weight_swap;
                 let latency_ms = plan_start.elapsed().as_millis() as u64;
                 let n_layers = ctx.model.layers.len();
                 let actually_swapped_now: Vec<usize> = (0..n_layers)

@@ -46,7 +46,7 @@ pub struct SessionInitCtx {
     pub cpu_memory_arc: Arc<dyn Memory>,
 
     /// swap layer 선택 알고리즘 (--swap-algorithm).
-    pub swap_algorithm: crate::models::weights::SwapAlgorithm,
+    pub swap_algorithm: crate::pressure::weights::SwapAlgorithm,
     /// layer 중요도 계산 공식 (--importance-formula).
     pub importance_formula: crate::qcf_types::ImportanceFormula,
     /// `compare` 모드 활성 여부 (importance_formula = MeanPool이지만 3-way 수집).
@@ -394,13 +394,15 @@ impl SessionInitCtx {
         }
 
         // Parse --swap-algorithm (used by --qcf-dump warmup-swap path; U5 ablation).
-        let swap_algorithm = crate::models::weights::SwapAlgorithm::from_cli(&args.swap_algorithm)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--swap-algorithm: unknown value '{}'. Valid: imp, seq, rev, uni, anti",
-                    args.swap_algorithm
-                )
-            })?;
+        let swap_algorithm = crate::pressure::weights::SwapAlgorithm::from_cli(
+            &args.swap_algorithm,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--swap-algorithm: unknown value '{}'. Valid: imp, seq, rev, uni, anti",
+                args.swap_algorithm
+            )
+        })?;
 
         // Parse --importance-formula (§4 EuroSys'27 study). `compare` enables
         // three_way collector + post-warmup DP-LLM proxy ε computation.

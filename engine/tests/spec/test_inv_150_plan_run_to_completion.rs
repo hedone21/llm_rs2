@@ -21,9 +21,10 @@ use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::model_config::{ModelArch, ModelConfig};
-use llm_rs2::models::weights::async_swap::AsyncSwapDispatcher;
-use llm_rs2::models::weights::{IntraForwardSwapHook, LayerSlot};
+use llm_rs2::models::weights::LayerSlot;
 use llm_rs2::observability::events::noop_sink;
+use llm_rs2::pressure::weights::IntraForwardSwapHook;
+use llm_rs2::pressure::weights::async_swap::AsyncSwapDispatcher;
 
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::host::shared::SharedBuffer;

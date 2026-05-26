@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 
-use crate::models::weights::QuantNoiseTable;
+use crate::pressure::weights::QuantNoiseTable;
 use crate::qcf_collector::ImportanceLookup;
 use crate::qcf_types::SubLayer;
 

@@ -34,8 +34,9 @@
 
 use crate::backend::{Backend, GpuEvent};
 use crate::buffer::DType;
-use crate::models::weights::release_worker::PrimaryReleaseWorker;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
+use crate::pressure::weights::release_worker::PrimaryReleaseWorker;
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+β)
 #[rustfmt::skip]
 use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};

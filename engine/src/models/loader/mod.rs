@@ -547,7 +547,8 @@ pub fn load_model(
     // at model creation. The worker retains a clone of `backend` for
     // diagnostic calls; `TransformerModel` owns the `Arc` so the worker
     // outlives any `SwapExecutor` borrow.
-    let release_worker = Arc::new(crate::models::weights::PrimaryReleaseWorker::spawn(
+    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader creates pressure-owned resource via ctor
+    let release_worker = Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
         backend.clone(),
     ));
 
@@ -567,7 +568,8 @@ pub fn load_model(
         // `TransformerModel::load_gguf_with_secondary` right after this
         // call, or left as empty when the caller builds the model directly
         // (e.g. tests). ENG-DAT-095, ENG-ALG-216.
-        quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+        // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader creates pressure-owned resource via ctor
+        quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
         release_worker,
     })
 }

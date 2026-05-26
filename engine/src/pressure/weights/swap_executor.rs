@@ -50,15 +50,22 @@ use llm_shared::DtypeTag;
 
 use crate::backend::{Backend, GpuEvent};
 use crate::buffer::{Buffer, DType};
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference layer type (TransformerLayer/WeightStagingPool)
 use crate::layers::transformer_layer::TransformerLayer;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference staging pool trait
+#[cfg(feature = "cuda-embedded")]
+use crate::layers::staging_pool::WeightStagingPool;
 use crate::memory::Memory;
 use crate::memory::host::shared::SharedBuffer;
 use crate::model_config::ModelConfig;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference loader/model type
 use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference TransformerModel
 use crate::models::transformer::TransformerModel;
-use crate::models::weights::async_swap::AsyncSwapDispatcher;
-use crate::models::weights::release_worker::PrimaryReleaseWorker;
-use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot/SecondaryMmap/SecondaryTensorInfo)
+use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap, SecondaryTensorInfo};
+use crate::pressure::weights::async_swap::AsyncSwapDispatcher;
+use crate::pressure::weights::release_worker::PrimaryReleaseWorker;
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+α)
 #[rustfmt::skip]
 use crate::observability::events::{CacheEvent, EventSink, NoOpSink, WeightSwapEvent, WeightSwapKind};
@@ -306,7 +313,7 @@ pub struct SwapExecutor<'a> {
     ///
     /// Stored as `Arc<dyn WeightStagingPool>` (Migration Step 3-B DIP).
     #[cfg(feature = "cuda-embedded")]
-    pub layer_pool: Option<Arc<dyn crate::layers::staging_pool::WeightStagingPool>>,
+    pub layer_pool: Option<Arc<dyn WeightStagingPool>>,
 
     /// LISWAP-8 Hammer D: registered mmap region for alias-only swap.
     /// When `Some` and `LLMRS_SWAP_MMAP_ALIAS=1` is set, weights are
@@ -419,10 +426,7 @@ impl<'a> SwapExecutor<'a> {
     /// reuses pre-allocated layer buffers instead of calling `cuMemAlloc`
     /// on the dispatch thread. Activated by `LLMRS_SWAP_LAYER_POOL=1` env.
     #[cfg(feature = "cuda-embedded")]
-    pub fn with_layer_pool(
-        mut self,
-        pool: Arc<dyn crate::layers::staging_pool::WeightStagingPool>,
-    ) -> Self {
+    pub fn with_layer_pool(mut self, pool: Arc<dyn WeightStagingPool>) -> Self {
         self.layer_pool = Some(pool);
         self
     }
@@ -509,7 +513,7 @@ impl<'a> SwapExecutor<'a> {
     pub fn execute_on_slots(
         &self,
         layers: &[Arc<LayerSlot>],
-        secondary_mmap: Option<&Arc<crate::models::weights::SecondaryMmap>>,
+        secondary_mmap: Option<&Arc<SecondaryMmap>>,
         ratio_generation: &Arc<std::sync::atomic::AtomicU64>,
         target_layers: &[usize],
         async_dispatcher: Option<&AsyncSwapDispatcher>,
@@ -839,17 +843,13 @@ impl<'a> SwapExecutor<'a> {
                 // back to the Phase A path (`build_layer_async_standalone`)
                 // which allocates fresh device buffers.
                 #[cfg(feature = "cuda-embedded")]
-                let pool_entry: Option<
-                    crate::layers::transformer_layer::TransformerLayer,
-                > = if layer_pool_active {
+                let pool_entry: Option<TransformerLayer> = if layer_pool_active {
                     self.layer_pool.as_ref().and_then(|p| p.take())
                 } else {
                     None
                 };
                 #[cfg(not(feature = "cuda-embedded"))]
-                let pool_entry: Option<
-                    crate::layers::transformer_layer::TransformerLayer,
-                > = None;
+                let pool_entry: Option<TransformerLayer> = None;
 
                 // Hammer D: mmap alias path takes highest priority when
                 // registration is attached and the env is set.
@@ -864,7 +864,7 @@ impl<'a> SwapExecutor<'a> {
                 #[cfg(not(feature = "cuda-embedded"))]
                 let mmap_reg: Option<()> = None;
 
-                let job = crate::models::weights::async_swap::ChunkDispatchJob {
+                let job = crate::pressure::weights::async_swap::ChunkDispatchJob {
                     run: Box::new(move || {
                         let result = {
                             #[cfg(feature = "cuda-embedded")]
@@ -1046,7 +1046,7 @@ impl<'a> SwapExecutor<'a> {
                 // next forward call).
                 let dispatcher = async_dispatcher.expect("use_async => dispatcher Some");
                 let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
-                let job = crate::models::weights::async_swap::SwapCommitJob {
+                let job = crate::pressure::weights::async_swap::SwapCommitJob {
                     slot: Arc::clone(slot),
                     new_weights: new_arc,
                     new_dtype: self.target_dtype,
@@ -1740,7 +1740,7 @@ impl<'a> SwapExecutor<'a> {
         secondary: &Arc<SecondaryMmap>,
         layer_idx: usize,
         subname: &str,
-        info: &crate::models::weights::secondary_mmap::SecondaryTensorInfo,
+        info: &SecondaryTensorInfo,
         shape: &crate::shape::Shape,
     ) -> Result<Option<Tensor>, SwapError> {
         // Only the Rpcmem variant carries a per-layer rpcmem region.
@@ -2905,7 +2905,7 @@ fn try_alias_materialise_standalone(
     secondary: &Arc<SecondaryMmap>,
     layer_idx: usize,
     subname: &str,
-    info: &crate::models::weights::secondary_mmap::SecondaryTensorInfo,
+    info: &SecondaryTensorInfo,
     shape: &crate::shape::Shape,
     backend: &Arc<dyn Backend>,
 ) -> Result<Option<Tensor>, SwapError> {

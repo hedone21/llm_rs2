@@ -13,9 +13,9 @@ use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::models::weights::SwapAlgorithm;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kv_cache::KVCache;
+use crate::pressure::weights::SwapAlgorithm;
 use crate::qcf_types::ImportanceFormula;
 use crate::session::cli::Args;
 

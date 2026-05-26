@@ -49,7 +49,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     // questions' prompt text instead of a corpus file for the warmup input.
     let eval_ll_qcf_start = std::time::Instant::now();
     let mut eval_ll_qcf_importance: Option<crate::qcf::ImportanceTable> = None;
-    let mut eval_ll_qcf_decision: Option<crate::models::weights::decider::SwapDecision> = None;
+    let mut eval_ll_qcf_decision: Option<crate::pressure::weights::decider::SwapDecision> = None;
     let mut eval_ll_qcf_dpllm_epsilon: Option<Vec<f32>> = None;
     let mut eval_ll_qcf_dpllm_epsilon_multi: Option<Vec<f32>> = None;
     let mut eval_ll_qcf_dpllm_epsilon_abs: Option<Vec<f32>> = None;

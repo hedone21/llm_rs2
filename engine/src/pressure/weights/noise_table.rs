@@ -11,7 +11,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot/SecondaryMmap)
 use crate::models::weights::secondary_mmap::SecondaryMmap;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
+use crate::models::weights::slot::LayerSlot;
 use crate::quant::{BlockQ4_0, QK4_0};
 
 // ── QuantNoiseTable ───────────────────────────────────────────────────────────
@@ -71,7 +74,7 @@ impl QuantNoiseTable {
     /// If the entire computation fails (e.g. `secondary` has no layers at
     /// all), the caller should fall back to `QuantNoiseTable::uniform_ones`.
     pub fn new_from_frobenius(
-        primary_slots: &[Arc<crate::models::weights::LayerSlot>],
+        primary_slots: &[Arc<LayerSlot>],
         secondary: &Arc<SecondaryMmap>,
     ) -> Self {
         let n = primary_slots.len();
@@ -343,7 +346,7 @@ fn dequantize_q4_0_blocks(raw: &[u8], numel: usize) -> Vec<f32> {
 /// or `x_mean` length disagrees with `wo`'s input dim.  When
 /// `x_means.len() != primary_slots.len()`, every entry is NaN.
 pub fn compute_input_aware_epsilon(
-    primary_slots: &[Arc<crate::models::weights::LayerSlot>],
+    primary_slots: &[Arc<LayerSlot>],
     secondary: &Arc<SecondaryMmap>,
     x_means: &[Vec<f32>],
 ) -> Vec<f32> {
@@ -447,7 +450,7 @@ pub fn compute_input_aware_epsilon(
 ///
 /// This is the §4 candidate "D" — signal-scaled rather than relative.
 pub fn compute_input_aware_epsilon_absolute(
-    primary_slots: &[Arc<crate::models::weights::LayerSlot>],
+    primary_slots: &[Arc<LayerSlot>],
     secondary: &Arc<SecondaryMmap>,
     x_means: &[Vec<f32>],
 ) -> Vec<f32> {
@@ -532,7 +535,7 @@ pub fn compute_input_aware_epsilon_absolute(
 /// `‖ΔO‖ / ‖O‖` into two static weight-space factors.  Layers with
 /// either factor unavailable yield `NaN`.
 pub fn compute_input_aware_epsilon_qcf(
-    primary_slots: &[Arc<crate::models::weights::LayerSlot>],
+    primary_slots: &[Arc<LayerSlot>],
     secondary: &Arc<SecondaryMmap>,
     x_means: &[Vec<f32>],
 ) -> Vec<f32> {
@@ -586,7 +589,7 @@ pub fn compute_input_aware_epsilon_qcf(
 /// be a shape mismatch.  The sum is over min(6, valid) finite per-tensor ε
 /// contributions; layers with zero valid tensors yield `NaN`.
 pub fn compute_input_aware_epsilon_multitensor(
-    primary_slots: &[Arc<crate::models::weights::LayerSlot>],
+    primary_slots: &[Arc<LayerSlot>],
     secondary: &Arc<SecondaryMmap>,
     x_means: &[Vec<f32>],
 ) -> Vec<f32> {
@@ -763,7 +766,7 @@ fn primary_tensor_to_f32(tensor: &crate::tensor::Tensor) -> Option<Vec<f32>> {
 /// (sec4 ablation — relative perturbation is invariant to RoPE under both
 /// precisions in expectation).
 pub fn compute_cascade_attn_perturbation(
-    primary_slots: &[Arc<crate::models::weights::LayerSlot>],
+    primary_slots: &[Arc<LayerSlot>],
     secondary: &Arc<SecondaryMmap>,
     raws: &[(Vec<f32>, usize, usize)],
     n_heads: usize,

@@ -214,7 +214,7 @@ fn weight_swapped_fields_roundtrip() {
 /// bounded by ratio.
 #[test]
 fn uniform_target_layers_contract() {
-    use llm_rs2::models::weights::SwapExecutor;
+    use llm_rs2::pressure::weights::SwapExecutor;
 
     assert!(SwapExecutor::uniform_target_layers(0.0, 16).is_empty());
     assert_eq!(SwapExecutor::uniform_target_layers(1.0, 16).len(), 16);

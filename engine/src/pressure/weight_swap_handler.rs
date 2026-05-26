@@ -19,10 +19,9 @@ use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::model_config::ModelConfig;
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O weight swap orchestrator (WeightSwapHandler models/weights 이전 backlog)
-use crate::models::weights::swap_executor::SwapExecutor;
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O weight slot/secondary handle
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure handler → inference weight resource (LayerSlot/SecondaryMmap)
 use crate::models::weights::{LayerSlot, SecondaryMmap};
+use crate::pressure::weights::swap_executor::SwapExecutor;
 
 use super::ActionResult;
 

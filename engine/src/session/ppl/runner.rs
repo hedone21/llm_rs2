@@ -725,7 +725,7 @@ pub fn run_ppl(
     // (phase, token_idx, token_id, nll, swap_state, layers_swapped)
     let mut per_token_log: Vec<(&'static str, usize, u32, f64, &'static str, usize)> = Vec::new();
     let log_per_token = args.ppl_nll_csv.is_some();
-    let mut ppl_swap_plan: Option<crate::models::weights::IncrementalSwapPlan> = None;
+    let mut ppl_swap_plan: Option<crate::pressure::weights::IncrementalSwapPlan> = None;
     // dispatch_swap_weights 시그니처 호환용 (PPL 경로에서는 manager 보고 안 함).
     let mut ppl_swap_report_unused: Option<(f32, usize, std::time::Instant, f32)> = None;
     let mut layers_swapped_so_far: usize = 0;
