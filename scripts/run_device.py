@@ -2,13 +2,16 @@
 """Unified device runner — build, deploy, and execute binaries on any registered device.
 
 Usage:
-    python scripts/run_device.py -d pixel generate --prompt "Hello" -n 128
+    python scripts/run_device.py -d pixel argus_cli --prompt "Hello" -n 128
     python scripts/run_device.py -d host test_backend
-    python scripts/run_device.py -d pixel --skip-build generate -b opencl
+    python scripts/run_device.py -d pixel --skip-build argus_cli -b opencl
     python scripts/run_device.py --list-devices
 
     # Build + deploy multiple binaries without executing (deploy-only):
-    python scripts/run_device.py -d pixel --skip-exec generate --extra-bin llm_manager
+    python scripts/run_device.py -d pixel --skip-exec argus_cli --extra-bin llm_manager
+
+    # Legacy frozen binary (commit 7065196c, 2026-05-24):
+    python scripts/run_device.py -d pixel legacy_generate --prompt "Hello"
 """
 
 from __future__ import annotations
@@ -25,6 +28,12 @@ from device_registry.builder import build_binary, get_local_binary_path
 from device_registry.config import load_all_devices, load_device_config
 from device_registry.connection import create_connection
 from device_registry.deployer import deploy_binary, deploy_eval_files, verify_model
+
+# Binaries that consume `--model-path` and benefit from model verification.
+# `generate` was renamed to `legacy_generate` and the new entry point is
+# `argus_cli` (commit 7065196c, 2026-05-24). Keep `generate` listed for any
+# downstream fork that still ships it.
+_INFERENCE_BINARIES = ("argus_cli", "legacy_generate", "generate")
 
 
 def _list_devices() -> int:
@@ -64,7 +73,7 @@ def main() -> int:
 
     if not remaining:
         parser.print_help()
-        print("\nError: BINARY name required (e.g., generate, test_backend)")
+        print("\nError: BINARY name required (e.g., argus_cli, test_backend)")
         return 1
 
     binary_name = remaining[0]
@@ -108,7 +117,7 @@ def main() -> int:
             deploy_eval_files(conn, device, _PROJECT_ROOT / "experiments" / "prompts", dry_run=args.dry_run)
 
         # Verify model if it's an inference binary
-        if binary_name in ("generate", "generate") and not args.dry_run:
+        if binary_name in _INFERENCE_BINARIES and not args.dry_run:
             verify_model(conn, device)
     else:
         print("\n[2/3] Deploy skipped")
@@ -138,7 +147,7 @@ def main() -> int:
         if (
             device.paths.model_dir
             and "--model-path" not in args_str
-            and binary_name in ("generate", "generate")
+            and binary_name in _INFERENCE_BINARIES
         ):
             args_str = f"--model-path {device.paths.model_dir} {args_str}"
 
