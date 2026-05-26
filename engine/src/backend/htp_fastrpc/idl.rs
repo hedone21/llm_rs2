@@ -289,6 +289,59 @@ pub fn init_matmul_req(
     req.dst = dst;
 }
 
+/// Element-wise binary op (MUL/ADD/SUB/DIV) req 초기화. n_bufs=3 path.
+///
+/// llama.cpp `ggml-hexagon.cpp::init_binary_req<false>` (`_is_src0_constant=false`,
+/// MUL_MAT 가 아닌 element-wise) 와 동일. src0/src1 모두 host activation 이라
+/// `DSPQBUF_TYPE_CPU_WRITE_DSP_READ`. op_params 슬롯 미사용 (ggml 측에서 element-
+/// wise op 는 op_params 비어 있음 — `proc_binary_req` 가 src/dst data ptr 만
+/// 사용한다, `htp/main.c:602`).
+pub fn init_binary_req(
+    req: &mut HtpGeneralReq,
+    op: u32,
+    src0: HtpTensor,
+    src1: HtpTensor,
+    dst: HtpTensor,
+) {
+    debug_assert!(
+        op == HTP_OP_MUL || op == HTP_OP_ADD || op == HTP_OP_SUB || op == HTP_OP_DIV,
+        "init_binary_req: op must be one of MUL/ADD/SUB/DIV"
+    );
+    req.op = op;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.src0 = src0;
+    req.src1 = src1;
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
+/// Unary activation op (SILU/GELU) req 초기화. n_bufs=2 path.
+///
+/// llama.cpp `ggml-hexagon.cpp::init_unary_req` 의 `GGML_OP_UNARY` 분기와 동일.
+/// `proc_activations_req` 가 op_params 를 그대로 사용하지만 ggml unary op 의
+/// op_params 는 본질적으로 empty 라 zero-init OK (`htp/main.c:828`).
+///
+/// `src1` slot 은 미사용 (zero) — `htp/main.c:821-823` 가 `n_bufs==3` 일 때만
+/// `octx.src1` 를 채운다.
+pub fn init_unary_act_req(req: &mut HtpGeneralReq, op: u32, src0: HtpTensor, dst: HtpTensor) {
+    debug_assert!(
+        op == HTP_OP_UNARY_SILU || op == HTP_OP_UNARY_GELU,
+        "init_unary_act_req: op must be UNARY_SILU or UNARY_GELU"
+    );
+    req.op = op;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.src0 = src0;
+    req.src1 = HtpTensor::zeroed();
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +424,74 @@ mod tests {
         let mut req2 = HtpGeneralReq::zeroed();
         init_matmul_req(&mut req2, src0, src1, dst, true);
         assert_eq!(req2.flags, HTP_OPFLAGS_SKIP_QUANTIZE);
+    }
+
+    #[test]
+    fn init_binary_req_mul_zeroes_unused_slots() {
+        // Qwen2.5-1.5B SwiGLU element-wise mul: x[8960] F32 × y[8960] F32 → z[8960] F32
+        const DIM: u32 = 8960;
+        let nb = [4u32, DIM * 4, DIM * 4, DIM * 4];
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_binary_req(&mut req, HTP_OP_MUL, src0, src1, dst);
+
+        assert_eq!(req.op, HTP_OP_MUL);
+        assert_eq!(req.flags, 0);
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.src1.type_, HTP_TYPE_F32);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        assert_eq!(req.src0.ne[0], DIM);
+        assert_eq!(req.src1.ne[0], DIM);
+        // 미사용 src2..src4 zero
+        assert_eq!(req.src2.type_, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+        // op_params 미사용
+        assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
+    }
+
+    #[test]
+    fn init_binary_req_add_uses_add_op() {
+        // Qwen2.5-1.5B residual add: x[1536] F32 + y[1536] F32 → z[1536] F32
+        const DIM: u32 = 1536;
+        let nb = [4u32, DIM * 4, DIM * 4, DIM * 4];
+        let t = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_binary_req(&mut req, HTP_OP_ADD, t, t, t);
+
+        assert_eq!(req.op, HTP_OP_ADD);
+        assert_eq!(req.flags, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+    }
+
+    #[test]
+    fn init_unary_act_req_silu_packs_correctly() {
+        // Qwen2.5-1.5B SiLU activation: x[8960] F32 → y[8960] F32
+        const DIM: u32 = 8960;
+        let nb = [4u32, DIM * 4, DIM * 4, DIM * 4];
+        let src = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_unary_act_req(&mut req, HTP_OP_UNARY_SILU, src, dst);
+
+        assert_eq!(req.op, HTP_OP_UNARY_SILU);
+        assert_eq!(req.flags, 0);
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        // n_bufs=2 path: src1 미사용 (zero)
+        assert_eq!(req.src1.type_, 0);
+        assert_eq!(req.src1.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+        // op_params 미사용
+        assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
     }
 
     #[test]

@@ -148,6 +148,18 @@ name = "microbench_htp_matmul"
 path = "microbench/htp_matmul.rs"
 
 [[bin]]
+name = "microbench_htp_add"
+path = "microbench/htp_add.rs"
+
+[[bin]]
+name = "microbench_htp_mul"
+path = "microbench/htp_mul.rs"
+
+[[bin]]
+name = "microbench_htp_silu"
+path = "microbench/htp_silu.rs"
+
+[[bin]]
 name = "microbench_htp_opencl_interop"
 path = "microbench/htp_opencl_interop.rs"
 
