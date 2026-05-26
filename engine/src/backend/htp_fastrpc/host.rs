@@ -62,21 +62,25 @@ pub const RPCMEM_HEAP_ID_SYSTEM: c_int = 25;
 pub const RPCMEM_DEFAULT_FLAGS: u32 = 1;
 /// `RPCMEM_HEAP_NOREG` — alloc 시점에 모든 FastRPC domain 자동 register 를
 /// 막는다. 명시 `fastrpc_mmap` 으로 특정 domain 에만 register 할 때 필수.
-/// 출처: Qualcomm Hexagon SDK `rpcmem.h` 공개값. llama.cpp ggml-hexagon.cpp:268
-/// 가 본 값을 OR.
+/// 출처: QC fastrpc 오픈소스 `inc/rpcmem.h` (github.com/quic/fastrpc).
+/// llama.cpp `ggml-hexagon.cpp:268` 가 본 값을 OR.
 ///
-/// **β-1 NOTE**: 본 값(0x80000000) 와 0x80000 둘 다 stock S25 에서
-/// `fastrpc_mmap rc=0x1 (EIO)` 결과로 동일 — NOREG bit 가 driver-internal
-/// 검증을 통과 못 함. 정확값은 Hexagon SDK `rpcmem.h` (`/opt/hexagon/X.Y/
-/// ipc/fastrpc/rpcmem/inc/rpcmem.h`) 의 직접 확인이 필요. 본 PoC 의 첫
-/// 실험값은 가장 일반적인 0x80000000 유지.
-pub const RPCMEM_HEAP_NOREG: u32 = 0x8000_0000;
+/// β-1.MAP 결정값: 0x40000000 (이전 0x80000000 은 `RPCMEM_HEAP_DEFAULT` 였음).
+pub const RPCMEM_HEAP_NOREG: u32 = 0x4000_0000;
+
+/// `RPCMEM_TRY_MAP_STATIC` — static map hint. SDK header 발견 정의값. 일부
+/// fastrpc 경로에서 mmap 통과 조건. β-1.MAP fallback 후보로 보유.
+pub const RPCMEM_TRY_MAP_STATIC: u32 = 0x0400_0000;
 
 /// HTP architecture version. S25 = Hexagon v79 (NSP v79).
 pub const HTP_ARCH_V79: u32 = 79;
 
-/// fastrpc_mmap flags. ggml-hexagon 은 `FASTRPC_MAP_FD = 16` 사용.
-pub const FASTRPC_MAP_FD: u32 = 16;
+/// `enum fastrpc_map_flags` — QC fastrpc 오픈소스 `inc/remote.h`.
+/// β-1.MAP 결정값: 진짜 `FASTRPC_MAP_FD = 2`. 이전 `16` 은 `FASTRPC_MAP_FD_NOMAP`
+/// 변종 ("등록만 하고 실제 mmap 은 하지 않음") 으로, `fastrpc_mmap rc=0x1 EIO`
+/// 의 root cause 였음. llama.cpp 가 `FASTRPC_MAP_FD` 심볼 그대로 사용해
+/// SDK header 의 enum 값에 의존했기에 본 PoC 도 우연히 16 을 잘못 가져왔던 것.
+pub const FASTRPC_MAP_FD: u32 = 2;
 
 // ── FastRPC request structs (mirror of remote.h) ──
 

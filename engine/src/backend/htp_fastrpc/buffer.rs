@@ -24,9 +24,14 @@ use super::host::{
 };
 use super::idl::DspqBufferType;
 
-/// alloc flags = `RPCMEM_DEFAULT_FLAGS | RPCMEM_HEAP_NOREG`. NOREG 가 있어야
-/// 명시 `fastrpc_mmap` 으로 특정 domain 에 register 가 가능 (auto-register 와
-/// 충돌 안 함). llama.cpp ggml-hexagon.cpp:268 와 동일.
+/// alloc flags = `RPCMEM_DEFAULT_FLAGS | RPCMEM_HEAP_NOREG`. llama.cpp
+/// `ggml-hexagon.cpp:268` 와 동일. NOREG 는 alloc 시점에 모든 도메인 자동
+/// register 를 막아 명시 `fastrpc_mmap` 으로 특정 도메인에만 register 한다.
+///
+/// β-1.MAP 검증: NOREG 포함/제거 두 변형 모두 `fastrpc_mmap rc=0` (이전
+/// β-1.START 의 `rc=0x1 EIO` 는 FASTRPC_MAP_FD enum 값 오인 (16 → 2) 이
+/// root cause 였음). 둘의 차이는 dspqueue_write 시 `fastrpc_buffer_ref`
+/// 카운트 동작에만 영향을 줘 본 PoC scope 외. NOREG 유지 = llama.cpp 일치.
 const RPCMEM_ALLOC_FLAGS: u32 = RPCMEM_DEFAULT_FLAGS | RPCMEM_HEAP_NOREG;
 
 /// rpcmem-backed buffer. RAII free, single-owner.
@@ -110,12 +115,14 @@ impl RpcmemBuffer {
         //
         // dspqueue_write 가 `Buffer FD not mapped to domain N` 으로 fail 하지
         // 않으려면 buffer 를 FastRPC domain 에 명시 mmap 해야 한다 (llama.cpp
-        // ggml-hexagon.cpp:235 와 동일 패턴). `RPCMEM_DEFAULT_FLAGS` 만으로는
-        // 자동 register 가 되지 않는 driver 가 존재 — stock S25 가 그 경우.
+        // ggml-hexagon.cpp:235 와 동일 패턴).
+        //
+        // β-1.MAP root cause: 이전 `FASTRPC_MAP_FD = 16` 은 사실
+        // `FASTRPC_MAP_FD_NOMAP` (등록만, 실제 mmap 안 함) — `rc=0x1 EIO` 의
+        // 원인. QC fastrpc 오픈소스 enum 정확값 = 2.
         //
         // SAFETY: domain_id / fd / ptr / size 모두 직전에 valid 확인.
-        // FASTRPC_MAP_FD=16 → DMA-BUF heap 의 fd-based mapping. length 는
-        // page-aligned `alloc_size` 사용.
+        // length 는 page-aligned `alloc_size` 사용.
         let mmap_rc = unsafe {
             (host.fastrpc_mmap)(
                 host.domain_id,
