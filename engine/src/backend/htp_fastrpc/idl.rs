@@ -342,6 +342,97 @@ pub fn init_unary_act_req(req: &mut HtpGeneralReq, op: u32, src0: HtpTensor, dst
     req.dst = dst;
 }
 
+/// ROPE op params (ggml convention).
+///
+/// **DSP-side decode slot 매핑** (ggml.c::ggml_rope_ext + rope-ops.c::execute_op_rope_f32
+/// 실측):
+///   [0] n_past (unused, 0)
+///   [1] n_dims (i32) — 회전할 dim (head_dim 이하)
+///   [2] mode (i32) — 0=normal interleaved, 2=NeoX split, 8/40=Qwen-VL
+///   [3] n_ctx (unused, 0)
+///   [4] n_ctx_orig (i32) — YaRN extension 의 원래 context length
+///   [5] freq_base (f32 bits) — Qwen2.5=1e6, Llama3=5e5
+///   [6] freq_scale (f32 bits)
+///   [7] ext_factor (f32 bits) — YaRN extrapolation factor
+///   [8] attn_factor (f32 bits)
+///   [9] beta_fast (f32 bits)
+///   [10] beta_slow (f32 bits)
+///   [11..14] sections[4] (Qwen-VL multimodal RoPE, 미사용 시 0)
+#[derive(Clone, Copy, Debug)]
+pub struct RopeParams {
+    pub n_dims: i32,
+    pub mode: i32,
+    pub n_ctx_orig: i32,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub ext_factor: f32,
+    pub attn_factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+}
+
+impl RopeParams {
+    /// Qwen2.5 vendor RoPE params (mode=0 normal interleaved, freq_base=1e6).
+    pub fn qwen2_5() -> Self {
+        Self {
+            n_dims: 128,
+            mode: 0,
+            n_ctx_orig: 32768,
+            freq_base: 1_000_000.0,
+            freq_scale: 1.0,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+        }
+    }
+}
+
+/// ROPE op req 초기화 (n_bufs=3 path — src2 freq_factors 미사용).
+///
+/// llama.cpp `ggml-hexagon.cpp::init_rope_req` 의 op_params packing 패턴 동일
+/// (`memcpy(&req->op_params, &t->op_params, sizeof(t->op_params))`). ggml.c
+/// `ggml_rope_ext` (line 4125-) 의 `params[15]` layout 을 그대로 따른다 — slot 0
+/// 과 3 은 **legacy unused (n_past / n_ctx)** 라 반드시 0 유지.
+///
+/// DSP-side `proc_rope_req` 가 n_bufs=3 path 도 분기 처리 (`htp/main.c:857-908`,
+/// `if (4 == n_bufs) octx.src2 = req->src2;` else 3-buf). src2 buffer 자체를
+/// 보내지 않으면 freq_factors=NULL 동작.
+///
+/// 인자:
+///   src0 = input `[head_dim, n_heads, n_tokens]` F32
+///   src1 = positions `[n_tokens]` i32 (HTP_TYPE_I32)
+///   dst  = output, src0 와 동일 shape
+pub fn init_rope_req(
+    req: &mut HtpGeneralReq,
+    params: &RopeParams,
+    src0: HtpTensor,
+    src1: HtpTensor,
+    dst: HtpTensor,
+) {
+    req.op = HTP_OP_ROPE;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    // slot 0 = n_past (unused, 0)
+    req.op_params[1] = params.n_dims;
+    req.op_params[2] = params.mode;
+    // slot 3 = n_ctx (unused, 0)
+    req.op_params[4] = params.n_ctx_orig;
+    req.op_params[5] = params.freq_base.to_bits() as i32;
+    req.op_params[6] = params.freq_scale.to_bits() as i32;
+    req.op_params[7] = params.ext_factor.to_bits() as i32;
+    req.op_params[8] = params.attn_factor.to_bits() as i32;
+    req.op_params[9] = params.beta_fast.to_bits() as i32;
+    req.op_params[10] = params.beta_slow.to_bits() as i32;
+    // slot 11..14 = sections[4] (Qwen-VL multimodal RoPE), unused 시 0 유지.
+    req.src0 = src0;
+    req.src1 = src1;
+    req.src2 = HtpTensor::zeroed(); // n_bufs=3 path: freq_factors 미사용
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +583,91 @@ mod tests {
         assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
         // op_params 미사용
         assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
+    }
+
+    #[test]
+    fn init_rope_req_qwen2_5_packs_op_params_correctly() {
+        // Qwen2.5-1.5B Q-rotation decode: input [head_dim=128, n_heads=12, n_tokens=1] F32
+        //                                  positions [1] i32
+        // ggml convention: slot 0=n_past, 1=n_dims, 2=mode, 3=n_ctx, 4=n_ctx_orig,
+        //                  5=freq_base, 6=freq_scale, 7=ext_factor, 8=attn_factor,
+        //                  9=beta_fast, 10=beta_slow, 11..14=sections.
+        const HEAD_DIM: u32 = 128;
+        const N_HEADS: u32 = 12;
+        const N_TOKENS: u32 = 1;
+        let nb_in = [
+            4u32,
+            HEAD_DIM * 4,
+            HEAD_DIM * N_HEADS * 4,
+            HEAD_DIM * N_HEADS * N_TOKENS * 4,
+        ];
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [HEAD_DIM, N_HEADS, N_TOKENS, 1], nb_in);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_I32, [N_TOKENS, 1, 1, 1], [4, 4, 4, 4]);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [HEAD_DIM, N_HEADS, N_TOKENS, 1], nb_in);
+
+        let params = RopeParams::qwen2_5();
+        let mut req = HtpGeneralReq::zeroed();
+        init_rope_req(&mut req, &params, src0, src1, dst);
+
+        assert_eq!(req.op, HTP_OP_ROPE);
+        assert_eq!(req.flags, 0);
+        // slot 0 = n_past (unused)
+        assert_eq!(req.op_params[0], 0, "n_past must be 0 (unused)");
+        // i32 slots
+        assert_eq!(req.op_params[1], 128, "n_dims");
+        assert_eq!(req.op_params[2], 0, "mode=normal");
+        // slot 3 = n_ctx (unused)
+        assert_eq!(req.op_params[3], 0, "n_ctx must be 0 (unused)");
+        assert_eq!(req.op_params[4], 32768, "n_ctx_orig");
+        // f32-bitcast slots
+        assert_eq!(
+            req.op_params[5],
+            1_000_000.0_f32.to_bits() as i32,
+            "freq_base"
+        );
+        assert_eq!(req.op_params[6], 1.0_f32.to_bits() as i32, "freq_scale");
+        assert_eq!(req.op_params[7], 0.0_f32.to_bits() as i32, "ext_factor");
+        assert_eq!(req.op_params[8], 1.0_f32.to_bits() as i32, "attn_factor");
+        assert_eq!(req.op_params[9], 32.0_f32.to_bits() as i32, "beta_fast");
+        assert_eq!(req.op_params[10], 1.0_f32.to_bits() as i32, "beta_slow");
+        // sections (slot 11..14) zero — Qwen2.5 는 multimodal RoPE 미사용
+        for (idx, slot) in req.op_params[11..15].iter().enumerate() {
+            assert_eq!(*slot, 0, "sections[{idx}] must be zero");
+        }
+        // slot 15 도 zero
+        assert_eq!(req.op_params[15], 0);
+        // src binding
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.src0.ne[0], HEAD_DIM);
+        assert_eq!(req.src1.type_, HTP_TYPE_I32, "positions tensor i32");
+        assert_eq!(req.src1.ne[0], N_TOKENS);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        // n_bufs=3 path — src2 미사용 (freq_factors NULL)
+        assert_eq!(req.src2.type_, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+    }
+
+    #[test]
+    fn init_rope_req_f32_bit_pattern_roundtrips() {
+        // f32::to_bits() as i32 → DSP-side *(float *)&op_params[i] read 시 원본 복원
+        // 검증. wrong cast (예: as i32 빠뜨림 → truncation) 시 freq_base 등 wrong value.
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [128, 12, 1, 1], [4, 512, 6144, 6144]);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_I32, [1, 1, 1, 1], [4, 4, 4, 4]);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [128, 12, 1, 1], [4, 512, 6144, 6144]);
+
+        let params = RopeParams::qwen2_5();
+        let mut req = HtpGeneralReq::zeroed();
+        init_rope_req(&mut req, &params, src0, src1, dst);
+
+        // 각 f32 슬롯을 다시 decode 했을 때 원본 값과 일치 (ggml slot 5..10)
+        assert_eq!(f32::from_bits(req.op_params[5] as u32), 1_000_000.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[6] as u32), 1.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[7] as u32), 0.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[8] as u32), 1.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[9] as u32), 32.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[10] as u32), 1.0_f32);
     }
 
     #[test]

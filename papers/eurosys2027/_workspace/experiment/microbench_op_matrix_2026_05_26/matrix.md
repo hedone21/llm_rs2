@@ -43,7 +43,7 @@ N% 는 ggml test suite의 op_params (dtype, ne, GQA bs 등) sweep 중 PASS 비�
 |---:|---|:--:|---|:--:|:--:|:--:|:--:|
 |  6 | **RMS_NORM** / RMS_NORM | A | `[1536]` | ✓ | △ 76% | △ 52% | ✓ |
 |  4 | **MUL_MAT** / MUL_MAT | A | Q4_0 K=1536/N∈{1536,256,8960} + lm_head Q4 K=1536/N=151936 | △ 81% | △ 52% | △ 25% | ✗ |
-| 14 | **ROPE** / ROPE | A | head_dim=128 (q12,kv2) θ=1e6 | ✓ | ✓ | △ 22% | ✗ |
+| 14 | **ROPE** / ROPE | A | head_dim=128 (q12,kv2) θ=1e6 | ✓ | ✓ | △ 22% | 101.20 μs |
 | 15 | **FLASH_ATTN_EXT** / FLASH_ATTN_EXT | A | hs=128 nh=12 nkv=2 (GQA) | ✓ | △ 54% | **✗** | ✗ |
 | 17 | **GET_ROWS** / GET_ROWS | A | embed `[151936, 1536]` | ✓ | △ 12% | △ 8% | ✗ |
 |  7 | **SILU** / UNARY_SILU | A | `[8960]` | ✓ | △ 25% | △ 25% | ✓ |

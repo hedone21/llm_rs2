@@ -160,6 +160,10 @@ name = "microbench_htp_silu"
 path = "microbench/htp_silu.rs"
 
 [[bin]]
+name = "microbench_htp_rope"
+path = "microbench/htp_rope.rs"
+
+[[bin]]
 name = "microbench_htp_opencl_interop"
 path = "microbench/htp_opencl_interop.rs"
 

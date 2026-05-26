@@ -1,0 +1,26 @@
+=== microbench_htp_rope (Q-2.2 β G3 sprint) ===
+
+Config:
+  input  shape  = [128, 12, 1] F32 (6144 B)
+  pos    shape  = [1] i32 (alloc 64 B, ≥64 B min)
+  output shape  = same as input (6144 B)
+  rope params   = n_dims=128 mode=0 freq_base=1000000 freq_scale=1
+  position      = 5
+  warmup iter   = 10
+  measure iter  = 1000
+  err thresh    = 0.001
+
+[1/2] CPU baseline (host-side mode=0 normal RoPE reference)
+  baseline magnitude: max|y| = 0.6913
+  mean=14.91 us (median=14.69, stddev=3.82, n=1000)
+
+[2/2] QNN HTP NPU (FastRPC + libggml-htp-v79.so dspqueue)
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=7, session_id=1, queue_id=89077621719040
+  htp_iface_start: OK (n_hvx=0)
+  diag: rsp.op=14, status=1, prof_usecs=93, prof_cycles=196856, prof_pkts=40352, rsp_buf_count=1
+  mean=100.24 us (median=99.90, stddev=53.72, n=1000)
+  vs CPU: max_abs_err=2.235e-7, max_rel_err=1.830e-5 — PASS
+
+=== Summary ===
+CPU:         14.91 us/op (1.00x baseline)
+QNN HTP:    100.24 us/op (6.72x, -85% vs CPU), err=2.24e-7
