@@ -33,6 +33,7 @@ mod qnn {
 // HTP-specific device custom config (from third_party/qnn_sdk_2.33/include/QNN/HTP/QnnHtpDevice.h).
 // bindgen은 QnnInterface.h 만 처리하므로 HTP 헤더 타입은 여기에 직접 정의한다.
 // Q-2 dry-run gate: stock S25 에서 unsigned-PD 명시가 없으면 contextCreate err=0x36b1.
+// Q-2.1 추가: PlatformInfo block (Executorch HtpDevicePlatformInfoConfig.cpp:13-58 차용).
 #[cfg(feature = "qnn")]
 #[allow(non_snake_case, non_camel_case_types, dead_code)]
 mod qnn_htp {
@@ -40,6 +41,15 @@ mod qnn_htp {
 
     pub const QNN_HTP_DEVICE_CONFIG_OPTION_ARCH: u32 = 1;
     pub const QNN_HTP_DEVICE_CONFIG_OPTION_SIGNEDPD: u32 = 2;
+
+    // QnnHtpDevice_DeviceType_t (QnnHtpDevice.h:84-87)
+    pub const QNN_HTP_DEVICE_TYPE_ON_CHIP: u32 = 0;
+
+    // SocInfo: SM8750 (Snapdragon 8 Elite Gen ?). Executorch utils.py:1278-1315 mapping.
+    pub const QNN_SOC_MODEL_SM8750: u32 = 57;
+
+    // V79 VTCM (per Executorch SocInfo, V79 = 8 MB)
+    pub const QNN_HTP_V79_VTCM_SIZE_MB: usize = 8;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -71,11 +81,47 @@ mod qnn_htp {
         pub option: u32, // QnnHtpDevice_ConfigOption_t
         pub payload: QnnHtpDevice_CustomConfig_Union_t,
     }
+
+    // ── PlatformInfo block (Executorch HtpDevicePlatformInfoConfig.cpp 차용) ──
+    // QnnHtpDevice_OnChipDeviceInfoExtension_t (QnnHtpDevice.h:113-120)
+    // 주의: `vtcmSize: size_t` 가 첫 필드. ARM64 에서 size_t=u64.
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct QnnHtpDevice_OnChipDeviceInfoExtension_t {
+        pub vtcmSize: usize,
+        pub socModel: u32,
+        pub signedPdSupport: bool,
+        pub dlbcSupport: bool,
+        pub arch: u32, // QnnHtpDevice_Arch_t
+    }
+
+    // QnnHtpDevice_DeviceInfoExtension_t (QnnHtpDevice.h:126-131)
+    // bindgen 의 _QnnDevice_DeviceInfoExtension_t 는 opaque struct 이지만,
+    // 실제 storage 는 HTP backend 가 본 struct 로 캐스트한다.
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct QnnHtpDevice_DeviceInfoExtension_t {
+        pub devType: u32, // QnnHtpDevice_DeviceType_t
+        pub onChipDevice: QnnHtpDevice_OnChipDeviceInfoExtension_t,
+    }
+}
+
+// Q-2.1 patch: RTLD_GLOBAL dlopen (Executorch QnnImplementation.cpp:60-80 차용).
+// libloading 0.8 default 는 RTLD_LAZY | RTLD_LOCAL (Adreno OpenCL 과 동일 default).
+// HTP backend 는 inter-lib symbol resolution (Skel ↔ Stub ↔ Calculator) 가 필요할 수 있어
+// RTLD_GLOBAL 명시. RTLD_NOW 도 함께 (lazy binding 부작용 회피).
+#[cfg(feature = "qnn")]
+unsafe fn dlopen_global(path: &str) -> anyhow::Result<libloading::Library> {
+    use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
+    // SAFETY: caller responsible for path validity. Library 는 process lifetime 까지 leak 의도.
+    let lib = unsafe { UnixLibrary::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }
+        .map_err(|e| anyhow::anyhow!("dlopen RTLD_GLOBAL fail {}: {}", path, e))?;
+    Ok(libloading::Library::from(lib))
 }
 
 #[cfg(feature = "qnn")]
 fn main() -> anyhow::Result<()> {
-    use libloading::{Library, Symbol};
+    use libloading::Symbol;
     use std::ffi::CString;
     use std::os::raw::c_uint;
     use std::ptr;
@@ -97,8 +143,32 @@ fn main() -> anyhow::Result<()> {
     );
 
     // ── HTP setup ──
-    let lib = unsafe { Library::new("/data/local/tmp/qnn/libQnnHtp.so") }
-        .or_else(|_| unsafe { Library::new("libQnnHtp.so") })?;
+    // Q-2.1: RTLD_GLOBAL 로 preload (Executorch 동일 패턴).
+    // 순서: System → Prepare → V79 (skel/stub/calculator) → Htp main.
+    // 각 lib 의 export symbol 이 후속 lib resolve 단계에서 가시화되어야 함.
+    let preload_libs = [
+        "/data/local/tmp/qnn/libQnnSystem.so",
+        "/data/local/tmp/qnn/libQnnHtpPrepare.so",
+        "/data/local/tmp/qnn/libQnnHtpV79Stub.so",
+        "/data/local/tmp/qnn/libQnnHtpV79.so",
+        "/data/local/tmp/qnn/libQnnHtpV79Skel.so",
+        "/data/local/tmp/qnn/libQnnHtpV79CalculatorStub.so",
+    ];
+    let mut _preloaded: Vec<libloading::Library> = Vec::new();
+    for p in preload_libs.iter() {
+        match unsafe { dlopen_global(p) } {
+            Ok(l) => {
+                println!("preload RTLD_GLOBAL OK: {}", p);
+                _preloaded.push(l);
+            }
+            Err(e) => {
+                println!("preload RTLD_GLOBAL skip: {} ({})", p, e);
+            }
+        }
+    }
+    let lib = unsafe { dlopen_global("/data/local/tmp/qnn/libQnnHtp.so") }
+        .or_else(|_| unsafe { dlopen_global("libQnnHtp.so") })?;
+    println!("dlopen libQnnHtp.so RTLD_GLOBAL OK");
     type GetProvidersFn = unsafe extern "C" fn(*mut *mut *const QnnInterface_t, *mut c_uint) -> u64;
     let get_providers: Symbol<GetProvidersFn> = unsafe { lib.get(b"QnnInterface_getProviders\0")? };
     let mut providers: *mut *const QnnInterface_t = ptr::null_mut();
@@ -155,20 +225,86 @@ fn main() -> anyhow::Result<()> {
             customConfig: &mut htp_cfg_unsigned as *mut _ as *mut std::os::raw::c_void,
         },
     };
+    // ── Q-2.1 patch: PlatformInfo block (Executorch HtpDevicePlatformInfoConfig.cpp:13-58) ──
+    // socModel/vtcm/arch/signedPdSupport/dlbcSupport 을 device-side dispatch 에 명시 전달.
+    // CustomConfig (ARCH + SIGNEDPD) 만으로는 deviceCreate err=0x36b1 (AEE_ENOSUCHMOD) 발생.
+    let mut on_chip = QnnHtpDevice_OnChipDeviceInfoExtension_t {
+        vtcmSize: QNN_HTP_V79_VTCM_SIZE_MB,
+        socModel: QNN_SOC_MODEL_SM8750,
+        signedPdSupport: use_signed,
+        dlbcSupport: true,
+        arch: QNN_HTP_DEVICE_ARCH_V79,
+    };
+    let mut dev_info_ext = QnnHtpDevice_DeviceInfoExtension_t {
+        devType: QNN_HTP_DEVICE_TYPE_ON_CHIP,
+        onChipDevice: on_chip,
+    };
+    // QnnDevice_CoreInfo_t: version=1 + v1 { coreId=0, coreType=0, ext=NULL }.
+    let mut core_info = QnnDevice_CoreInfo_t {
+        version: QnnDevice_CoreInfoVersion_t_QNN_DEVICE_CORE_INFO_VERSION_1,
+        __bindgen_anon_1: QnnDevice_CoreInfo_t__bindgen_ty_1 {
+            v1: QnnDevice_CoreInfoV1_t {
+                coreId: 0,
+                coreType: 0,
+                coreInfoExtension: ptr::null_mut(),
+            },
+        },
+    };
+    // QnnDevice_HardwareDeviceInfo_t: v1 { deviceId=0, deviceType=0, numCores=1, cores=&core_info,
+    //                                       deviceInfoExtension=&dev_info_ext (HTP onChip block) }.
+    let mut hw_dev_info = QnnDevice_HardwareDeviceInfo_t {
+        version: QnnDevice_HardwareDeviceInfoVersion_t_QNN_DEVICE_HARDWARE_DEVICE_INFO_VERSION_1,
+        __bindgen_anon_1: QnnDevice_HardwareDeviceInfo_t__bindgen_ty_1 {
+            v1: QnnDevice_HardwareDeviceInfoV1_t {
+                deviceId: 0,
+                deviceType: 0,
+                numCores: 1,
+                cores: &mut core_info as *mut QnnDevice_CoreInfo_t,
+                // HTP backend가 본 opaque 포인터를 QnnHtpDevice_DeviceInfoExtension_t* 로 캐스트.
+                deviceInfoExtension: &mut dev_info_ext as *mut _
+                    as *mut _QnnDevice_DeviceInfoExtension_t,
+            },
+        },
+    };
+    let mut platform_info = QnnDevice_PlatformInfo_t {
+        version: QnnDevice_PlatformInfoVersion_t_QNN_DEVICE_PLATFORM_INFO_VERSION_1,
+        __bindgen_anon_1: QnnDevice_PlatformInfo_t__bindgen_ty_1 {
+            v1: QnnDevice_PlatformInfoV1_t {
+                numHwDevices: 1,
+                hwDevices: &mut hw_dev_info as *mut QnnDevice_HardwareDeviceInfo_t,
+            },
+        },
+    };
+    let dev_cfg_platform = QnnDevice_Config_t {
+        option: QnnDevice_ConfigOption_t_QNN_DEVICE_CONFIG_OPTION_PLATFORM_INFO,
+        __bindgen_anon_1: QnnDevice_Config_t__bindgen_ty_1 {
+            hardwareInfo: &mut platform_info as *mut QnnDevice_PlatformInfo_t,
+        },
+    };
+
     let dev_cfg_arch_ptr: *const QnnDevice_Config_t = &dev_cfg_arch;
     let dev_cfg_unsigned_ptr: *const QnnDevice_Config_t = &dev_cfg_unsigned;
+    let dev_cfg_platform_ptr: *const QnnDevice_Config_t = &dev_cfg_platform;
     // QNN convention: NULL-terminated array of *const QnnDevice_Config_t.
-    let mut dev_cfg_list: [*const QnnDevice_Config_t; 3] =
-        [dev_cfg_arch_ptr, dev_cfg_unsigned_ptr, ptr::null()];
+    // 순서: ARCH → SIGNEDPD → PLATFORM_INFO → NULL.
+    // PlatformInfo 가 마지막 — backend 가 custom config 로 baseline 설정 후 platform block 적용.
+    let mut dev_cfg_list: [*const QnnDevice_Config_t; 4] = [
+        dev_cfg_arch_ptr,
+        dev_cfg_unsigned_ptr,
+        dev_cfg_platform_ptr,
+        ptr::null(),
+    ];
+    // suppress unused-mut warnings on the helper struct held by reference.
+    let _ = &mut on_chip;
     let mut device: Qnn_DeviceHandle_t = ptr::null_mut();
-    let err =
-        unsafe { (v.deviceCreate.unwrap())(ptr::null_mut(), dev_cfg_list.as_mut_ptr(), &mut device) };
+    let err = unsafe {
+        (v.deviceCreate.unwrap())(ptr::null_mut(), dev_cfg_list.as_mut_ptr(), &mut device)
+    };
     anyhow::ensure!(err == 0, "deviceCreate err=0x{:x}", err);
-    println!("deviceCreate (V79 + unsigned PD): OK");
+    println!("deviceCreate (V79 + unsigned PD + PlatformInfo): OK");
 
     let mut ctx: Qnn_ContextHandle_t = ptr::null_mut();
-    let err =
-        unsafe { (v.contextCreate.unwrap())(backend, device, ptr::null_mut(), &mut ctx) };
+    let err = unsafe { (v.contextCreate.unwrap())(backend, device, ptr::null_mut(), &mut ctx) };
     anyhow::ensure!(err == 0, "contextCreate err=0x{:x}", err);
     println!("contextCreate (with device): OK");
 

@@ -1,0 +1,12 @@
+=== microbench_htp_matmul_correctness (Phase 32b-1) ===
+
+MatMul: A[1, 1024] × B[1024, 4096] = C[1, 4096]
+preload RTLD_GLOBAL OK: /data/local/tmp/qnn/libQnnSystem.so
+preload RTLD_GLOBAL OK: /data/local/tmp/qnn/libQnnHtpPrepare.so
+preload RTLD_GLOBAL OK: /data/local/tmp/qnn/libQnnHtpV79Stub.so
+preload RTLD_GLOBAL skip: /data/local/tmp/qnn/libQnnHtpV79.so (dlopen RTLD_GLOBAL fail /data/local/tmp/qnn/libQnnHtpV79.so: dlopen failed: "/data/local/tmp/qnn/libQnnHtpV79.so" is 32-bit instead of 64-bit)
+preload RTLD_GLOBAL skip: /data/local/tmp/qnn/libQnnHtpV79Skel.so (dlopen RTLD_GLOBAL fail /data/local/tmp/qnn/libQnnHtpV79Skel.so: dlopen failed: "/data/local/tmp/qnn/libQnnHtpV79Skel.so" is 32-bit instead of 64-bit)
+preload RTLD_GLOBAL OK: /data/local/tmp/qnn/libQnnHtpV79CalculatorStub.so
+dlopen libQnnHtp.so RTLD_GLOBAL OK
+HTP custom config: arch=V79, useSignedProcessDomain=false
+Error: deviceCreate err=0x36b1

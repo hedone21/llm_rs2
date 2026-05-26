@@ -1,0 +1,14 @@
+05-26 11:36:26.698 23857 23857 W QnnDsp  : QnnDsp <W> Initializing HtpProvider
+05-26 11:36:26.698 23857 23857 W QnnDsp  : QnnDsp <W> Specified config ARCH, ignoring on real target
+05-26 11:36:26.699 23857 23857 E adsprpc : remote.c:40:Control stubbed routine - Return failure
+05-26 11:36:26.699 23857 23857 E QnnDsp  : QnnDsp <E> Fail to get effective domain id from rpc with DeviceId 0 coreId 0 pdId 0
+05-26 11:36:26.699 23857 23857 E QnnDsp  : QnnDsp <E> error in creation of transport instance
+05-26 11:36:26.699 23857 23857 W QnnDsp  : QnnDsp <W> Failed to create transport instance: 1002
+05-26 11:36:26.699 23857 23857 E QnnDsp  : QnnDsp <E> Failed to create transport for device, error: 1002
+05-26 11:36:26.699 23857 23857 E QnnDsp  : QnnDsp <E> Failed to load skel, error: 1002
+05-26 11:36:26.699 23857 23857 E QnnDsp  : QnnDsp <E> Transport layer setup failed: 14001
+05-26 11:36:26.699 23857 23857 E QnnDsp  : QnnDsp <E> Failed to parse default platform info: 14001
+05-26 11:36:26.699 23857 23857 E QnnDsp  : QnnDsp <E> Failed to parse platform config: 14001
+05-26 11:36:26.699 23857 23857 W QnnDsp  : QnnDsp <W> Backend 1 free cleanup called during process exit
+05-26 11:36:34.323  5788  6546 I SDHMS:x : SIOP:: AP:265 BAT:264 USB:260 CHG:264 PA:263 WIFI:270 CF:271 BLK:0 SUBBAT:0 LRPTHM:264 SKIN:283 SKINF:279 SKINB:283 LRP:283 LRF:279 LRB:283 APT:278 APR:281 RCV:272 SPK:281 CHGF:279 CHGR:283 MEMF:278 MEMR:282 WIFIF:278 WIFIR:281 FCAM:260 UPSPK:264 DNSPK:260 VAP:264 VWIFI:270 AMB2:255 HIGH:0 AVGCUR:2 POWER:8
+05-26 11:36:44.367  5788  6546 I SDHMS:x : SIOP:: AP:265 BAT:264 USB:260 CHG:264 PA:263 WIFI:270 CF:271 BLK:0 SUBBAT:0 LRPTHM:264 SKIN:283 SKINF:279 SKINB:283 LRP:283 LRF:279 LRB:283 APT:278 APR:281 RCV:272 SPK:281 CHGF:279 CHGR:283 MEMF:278 MEMR:282 WIFIF:278 WIFIR:281 FCAM:260 UPSPK:264 DNSPK:260 VAP:265 VWIFI:270 AMB2:255 HIGH:0 AVGCUR:2 POWER:8
