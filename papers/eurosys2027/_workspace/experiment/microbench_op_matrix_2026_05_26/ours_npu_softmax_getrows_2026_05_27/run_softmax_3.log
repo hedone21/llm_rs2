@@ -1,0 +1,26 @@
+=== microbench_htp_softmax (Q-2.2 β G4a sprint) ===
+
+Config:
+  input  shape  = [2048, 1, 12] F32 (98304 B)
+  output shape  = same as input (98304 B)
+  scale         = 0.08838835 (1/sqrt(128))
+  max_bias      = 0
+  warmup iter   = 10
+  measure iter  = 200
+  err thresh    = 0.001
+
+[1/2] CPU baseline (host-side per-row softmax reference)
+  baseline magnitude: max|y|=0.000758, min|y|=2.965e-4
+  row sum |Σy-1| max: 1.073e-6 (should be ≤1e-5)
+  mean=177.63 us (median=176.09, stddev=6.66, n=200)
+
+[2/2] QNN HTP NPU (FastRPC + libggml-htp-v79.so dspqueue)
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=7, session_id=1, queue_id=93475668230144
+  htp_iface_start: OK (n_hvx=0)
+  diag: rsp.op=12, status=1, prof_usecs=99, prof_cycles=210613, prof_pkts=45900, rsp_buf_count=1
+  mean=124.99 us (median=124.32, stddev=9.93, n=200)
+  vs CPU: max_abs_err=5.821e-10, max_rel_err=8.647e-7 — PASS
+
+=== Summary ===
+CPU:        177.63 us/op (1.00x baseline)
+QNN HTP:    124.99 us/op (0.70x, +42% vs CPU), err=5.82e-10

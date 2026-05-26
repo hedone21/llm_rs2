@@ -433,6 +433,87 @@ pub fn init_rope_req(
     req.dst = dst;
 }
 
+/// SOFTMAX op params (ggml convention, 2 f32 slots).
+///
+/// **DSP-side decode slot 매핑** (ggml.c::ggml_soft_max_impl):
+///   [0] scale (f32 bits) — Qwen2.5/Llama 표준 attention: 1/sqrt(head_dim)
+///   [1] max_bias (f32 bits) — ALiBi max_bias, 0 for non-ALiBi (Qwen/Llama 기본)
+#[derive(Clone, Copy, Debug)]
+pub struct SoftmaxParams {
+    pub scale: f32,
+    pub max_bias: f32,
+}
+
+impl SoftmaxParams {
+    /// Qwen2.5 standard attention softmax: scale=1/sqrt(128), max_bias=0.
+    pub fn qwen2_5() -> Self {
+        Self {
+            scale: 1.0 / (128.0_f32).sqrt(),
+            max_bias: 0.0,
+        }
+    }
+}
+
+/// SOFTMAX op req 초기화 (n_bufs=2 mask-less path).
+///
+/// llama.cpp `ggml-hexagon.cpp::init_unary_req` 의 `GGML_OP_SOFT_MAX` 분기와
+/// 동일 (`memcpy(&req->op_params, &t->op_params, sizeof(t->op_params))`). ggml
+/// 의 softmax op_params 는 `{scale, max_bias}` 2 f32 slot 만 사용 (`ggml.c::
+/// ggml_soft_max_impl`).
+///
+/// DSP-side `htp/main.c:1119-1128` 는 `HTP_OP_SOFTMAX` 에 대해 n_bufs ∈ {2, 3}
+/// 모두 수용. mask 없는 path = `n_bufs=2` 로 src1 buffer 자체를 dspqueue 에
+/// 보내지 않는다.
+///
+/// 인자:
+///   src0 = attention scores `[k_len, q_len, n_heads, 1]` F32 (ggml ne[0]=innermost)
+///   dst  = output, src0 와 동일 shape
+pub fn init_softmax_req(
+    req: &mut HtpGeneralReq,
+    params: &SoftmaxParams,
+    src0: HtpTensor,
+    dst: HtpTensor,
+) {
+    req.op = HTP_OP_SOFTMAX;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.op_params[0] = params.scale.to_bits() as i32;
+    req.op_params[1] = params.max_bias.to_bits() as i32;
+    req.src0 = src0;
+    req.src1 = HtpTensor::zeroed(); // n_bufs=2 path: mask 미사용
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
+/// GET_ROWS op req 초기화 (n_bufs=3 strict).
+///
+/// llama.cpp `ggml-hexagon.cpp::init_get_rows_req` 와 동일. op_params 미사용
+/// (ggml `ggml_get_rows` 가 op_params 를 설정하지 않음). DSP-side `htp/main.c:
+/// 1162-1167` 가 `n_bufs == 3` 을 strict 요구 (src0=embed, src1=idx, dst).
+///
+/// 인자:
+///   src0 = embed table `[hidden, vocab, 1, 1]` F32/F16
+///   src1 = indices `[n_tokens, 1, 1, 1]` i32 (ggml `b->type == GGML_TYPE_I32`)
+///   dst  = gathered rows `[hidden, n_tokens, 1, 1]` F32
+pub fn init_get_rows_req(
+    req: &mut HtpGeneralReq,
+    src0: HtpTensor,
+    src1: HtpTensor,
+    dst: HtpTensor,
+) {
+    req.op = HTP_OP_GET_ROWS;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.src0 = src0;
+    req.src1 = src1;
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +749,109 @@ mod tests {
         assert_eq!(f32::from_bits(req.op_params[8] as u32), 1.0_f32);
         assert_eq!(f32::from_bits(req.op_params[9] as u32), 32.0_f32);
         assert_eq!(f32::from_bits(req.op_params[10] as u32), 1.0_f32);
+    }
+
+    #[test]
+    fn init_softmax_req_qwen2_5_packs_scale_and_max_bias() {
+        // Qwen2.5 decode attention softmax: scores [k_len=2048, q_len=1, n_heads=12, 1]
+        // ggml convention ne[0]=innermost.
+        const K_LEN: u32 = 2048;
+        const Q_LEN: u32 = 1;
+        const N_HEADS: u32 = 12;
+        let nb = [
+            4u32,
+            K_LEN * 4,
+            K_LEN * Q_LEN * 4,
+            K_LEN * Q_LEN * N_HEADS * 4,
+        ];
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [K_LEN, Q_LEN, N_HEADS, 1], nb);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [K_LEN, Q_LEN, N_HEADS, 1], nb);
+
+        let params = SoftmaxParams::qwen2_5();
+        let mut req = HtpGeneralReq::zeroed();
+        init_softmax_req(&mut req, &params, src0, dst);
+
+        assert_eq!(req.op, HTP_OP_SOFTMAX);
+        assert_eq!(req.flags, 0);
+        // slot 0 = scale (f32 bit-cast), slot 1 = max_bias.
+        let expected_scale = 1.0_f32 / (128.0_f32).sqrt();
+        assert_eq!(
+            req.op_params[0],
+            expected_scale.to_bits() as i32,
+            "scale bit pattern"
+        );
+        assert_eq!(req.op_params[1], 0.0_f32.to_bits() as i32, "max_bias=0");
+        // slot 2..15 zero.
+        for (idx, slot) in req.op_params[2..].iter().enumerate() {
+            assert_eq!(*slot, 0, "op_params[{}] must be zero", idx + 2);
+        }
+        // src0/dst F32 + ne shape preserved.
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.src0.ne[0], K_LEN);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        // n_bufs=2 path: src1 zero (mask-less).
+        assert_eq!(req.src1.type_, 0);
+        assert_eq!(req.src1.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+    }
+
+    #[test]
+    fn init_softmax_req_f32_bit_pattern_roundtrips() {
+        // f32::to_bits() as i32 → DSP-side *(float *)&op_params[i] read 시 원본 복원
+        // 검증. wrong cast (예: as i32 빠뜨림) 시 scale 이 wrong value 로 decode.
+        let nb = [4u32, 2048 * 4, 2048 * 4, 2048 * 12 * 4];
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [2048, 1, 12, 1], nb);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [2048, 1, 12, 1], nb);
+
+        let params = SoftmaxParams::qwen2_5();
+        let mut req = HtpGeneralReq::zeroed();
+        init_softmax_req(&mut req, &params, src0, dst);
+
+        let decoded_scale = f32::from_bits(req.op_params[0] as u32);
+        let decoded_max_bias = f32::from_bits(req.op_params[1] as u32);
+        assert_eq!(decoded_scale, params.scale);
+        assert_eq!(decoded_max_bias, params.max_bias);
+        // explicit 값 검증: 1/sqrt(128).
+        assert!((decoded_scale - 0.088_388_35_f32).abs() < 1e-7);
+    }
+
+    #[test]
+    fn init_get_rows_req_packs_strict_n_bufs_3() {
+        // GET_ROWS dummy: embed [hidden=1536, vocab=1024] F32, idx [1] i32 → dst [1536] F32
+        const HIDDEN: u32 = 1536;
+        const VOCAB: u32 = 1024;
+        const N_TOKENS: u32 = 1;
+        let nb_embed = [4u32, HIDDEN * 4, HIDDEN * VOCAB * 4, HIDDEN * VOCAB * 4];
+        let nb_idx = [4u32, 4, 4, 4];
+        let nb_dst = [4u32, HIDDEN * 4, HIDDEN * 4, HIDDEN * 4];
+
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [HIDDEN, VOCAB, 1, 1], nb_embed);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_I32, [N_TOKENS, 1, 1, 1], nb_idx);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [HIDDEN, N_TOKENS, 1, 1], nb_dst);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_get_rows_req(&mut req, src0, src1, dst);
+
+        assert_eq!(req.op, HTP_OP_GET_ROWS);
+        assert_eq!(req.flags, 0);
+        // op_params 미사용 — 전 슬롯 zero.
+        assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
+        // src binding
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.src0.ne[0], HIDDEN);
+        assert_eq!(req.src0.ne[1], VOCAB);
+        assert_eq!(req.src1.type_, HTP_TYPE_I32, "idx tensor must be i32");
+        assert_eq!(req.src1.ne[0], N_TOKENS);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        assert_eq!(req.dst.ne[0], HIDDEN);
+        assert_eq!(req.dst.ne[1], N_TOKENS);
+        // 미사용 src2..src4 zero
+        assert_eq!(req.src2.type_, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
     }
 
     #[test]

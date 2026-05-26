@@ -164,6 +164,14 @@ name = "microbench_htp_rope"
 path = "microbench/htp_rope.rs"
 
 [[bin]]
+name = "microbench_htp_softmax"
+path = "microbench/htp_softmax.rs"
+
+[[bin]]
+name = "microbench_htp_get_rows"
+path = "microbench/htp_get_rows.rs"
+
+[[bin]]
 name = "microbench_htp_opencl_interop"
 path = "microbench/htp_opencl_interop.rs"
 
