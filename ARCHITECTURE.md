@@ -1739,7 +1739,7 @@ session/
 | **V-21** | `models/transformer.rs:9` | `crate::core::offload::preload_pool::{self, PreloadPool}` | L3→L3 (Inference→Pressure State) | preload_pool은 Pressure State에 속함. TransformerModel이 직접 import할 게 아니라 L4에서 inject |
 | **V-22** | `models/transformer.rs:158,1447,1478,1489,1860,1871,1881,1911`, `core/qcf/layer_importance.rs:75-102`, `core/sampling.rs:131` | `crate::profile::ops::OpProfiler`, `crate::profile::op_trace::*`, `crate::profile::quality_metrics::Timer` | L3→Cross-cutting (profiling) | 3 패턴 혼합 해소. **`op_trace::*` 부분**: B-2c sprint `op_span!` 매크로 + `OpKind` enum L2 격상 (§13.8-G shared identifier promotion + §13.8-H instrument macro helper 적용). **`OpProfiler` 부분**: B-2d sprint `OpInstrument` trait inversion. **`Timer` 부분**: B-2b sprint `qcf_timer!` 매크로 (§13.8-H). [§13.8-G/H] |
 | **V-23** | `models/transformer.rs:644,3556,3586,3615`, `models/weights/secondary_mmap.rs:26,729,940,944,...`, `buffer/borrowed_mmap_buffer.rs:120,216`, `models/weights/rpcmem_secondary.rs:46+` | `crate::auf::{reader::*, section::*, header::*, tensor_index::*, AufError, AufView, AufMeta, BackendTag}` | L3→Cross-cutting / 또는 일반 가중치 포맷 | **AUF가 resilience 전용이 아닌 일반 모델 로딩에 쓰이고 있음** — §13.8-A에서 `engine/src/auf/` (L2 sub-dir)로 이동 결정(RESOLVED). 이동 후 L3→L2 정상 의존이 되어 V-23 해소 |
-| **V-24** | `core/pressure/weight_swap_handler.rs:21,22,23,136,175,192` | `crate::models::config::ModelConfig`, `crate::models::weights::{LayerSlot, SecondaryMmap, swap_executor::SwapExecutor}`, `crate::backend::cpu::CpuBackend`, `crate::memory::galloc::Galloc` | L3 Pressure↔Inference (현재 구조)에서 보면 cross-domain. **재정의(13.2) 후엔 동일 도메인 Pressure 내부 import**이지만 ModelConfig는 inference-side 의존이라 잔존 위반 | ModelConfig를 L2(`engine/src/model_config.rs`)로 격상 (§13.8-G CANDIDATE, 2026-05-26 등록) + LayerSlot/SecondaryMmap은 `pressure/state/`로 이동 |
+| **V-24** | `core/pressure/weight_swap_handler.rs:21,22,23,136,175,192` | `crate::models::config::ModelConfig`, `crate::models::weights::{LayerSlot, SecondaryMmap, swap_executor::SwapExecutor}`, `crate::backend::cpu::CpuBackend`, `crate::memory::galloc::Galloc` | L3 Pressure↔Inference (현재 구조)에서 보면 cross-domain. **재정의(13.2) 후엔 동일 도메인 Pressure 내부 import**이지만 ModelConfig는 inference-side 의존이라 잔존 위반 | **ModelConfig 부분 RESOLVED** (Sprint B + B-fixup, 2026-05-26, `6dcba548` + `d78d3956`) — `engine/src/model_config.rs` L2 직속 격상 + `from_gguf_metadata` → `models/loader/gguf.rs::parse_model_config` 이전. LayerSlot/SecondaryMmap/SwapExecutor는 Sprint C(weight_slot pressure 이전) 잔존 |
 | **V-25** | `models/weights/swap_executor.rs:55,57,58,2139,2146,2410`, `models/weights/intra_forward_swap.rs:43`, `models/weights/phase_aware_swap.rs:33` | `crate::layers::transformer_layer::TransformerLayer`, `crate::models::loader::gguf::*`, `crate::models::transformer::TransformerModel`, `crate::backend::opencl::host_ptr_pool::HostPtrPool`, `crate::profile::op_trace::*` | L3 Pressure→L3 Inference + L3→L1 + L3→Cross-cutting | swap_executor는 layer/transformer로의 mutation을 trait(`SwapTarget`)으로 추상화 — `TransformerModel`이 trait을 impl, executor는 trait만 알면 됨 |
 | **V-26** | `models/weights/decider.rs:20` | `crate::core::qcf::layer_importance::{ImportanceTable, SubLayer}` | L3 Pressure→L2 (QCF) | qcf가 L2 sub-dir(`engine/src/qcf/`)로 이동했으므로 L2 의존이라 위반 없음. 현 구조에서는 도메인 cross 아님 |
 | **V-27** | `models/weights/layer_object_pool.rs:32,37,124` | `crate::buffer::cuda_buffer::*`, `crate::layers::transformer_layer::TransformerLayer`, downcast `crate::backend::cuda_embedded::CudaBackend` | L3 Pressure→L1 + L3 Pressure→L3 Inference | weight pool은 backend-aware concrete이므로 backend별로 분기된 hook 구조로 재설계 |
@@ -1819,7 +1819,7 @@ session/
 | **새 eviction 정책 추가** | `pressure/policy/eviction/<name>.rs` | `pressure::policy::eviction::EvictionPolicy` trait, `pressure::state::kv_cache::KVCache` |
 | **새 pressure handler 추가** (예: compression scheme) | `pressure/policy/handlers/<name>_handler.rs` | `pressure::policy::pressure::CachePressureHandler` trait |
 | **새 sampling 방법 추가** | `inference/sampling.rs` 확장 | `shared::backend::Backend`만 |
-| **새 모델 아키텍처 추가** (예: Mistral) | `inference/models/<name>/` + `inference/models/mappers/<name>.rs` | `inference/layers::transformer_layer::TransformerLayer`, `crate::model_config::ModelConfig` (§G CANDIDATE 격상 후) |
+| **새 모델 아키텍처 추가** (예: Mistral) | `inference/models/<name>/` + `inference/models/mappers/<name>.rs` | `inference/layers::transformer_layer::TransformerLayer`, `crate::model_config::ModelConfig` (§G RESOLVED, 2026-05-26) |
 | **새 CLI 모드** | `session/<mode>.rs` (new) + `bin/<mode>.rs` (thin) | `session::DecodeSession` 또는 신규 session struct |
 | **새 manager 신호 종류** | workspace `shared/` 크레이트 (`llm_shared`, 별 crate) + `resilience/signal.rs` + `resilience/strategy/<name>.rs` | `shared::SystemSignal` enum 확장 |
 | **새 observability sink** | `observability/events.rs::EventSink` 구현 | `observability::events::CacheEvent` |
@@ -1987,7 +1987,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - §13.4 directory migration map에 "shared identifier promotion" 항목 추가 (TBD, B-2 완료 후).
   - 향후 유사 패턴(예: `OpKind`와 같이 양 도메인 공유 어휘) 식별 시 본 정책 참조.
   - 5건 이상 누적 시 §13.4에 *promotion register* 표 신설 검토 (§F allowlist 정책과 동일 운용 원리).
-- **§G 적용 register** (2026-05-26 표 형식으로 갱신, 6건 RESOLVED + 1건 CANDIDATE):
+- **§G 적용 register** (2026-05-26 표 형식으로 갱신, 7건 RESOLVED + 0건 CANDIDATE; ModelConfig 2026-05-26 격상 완료):
 
 | 식별자 | sprint | commit | 원위치 → 신위치 | 사용 도메인 | 격상 근거 |
 |---|---|---|---|---|---|
@@ -1997,7 +1997,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 | `CpuKernelSet` / `OpenClSecondary` / `SecondaryStore` | B-5b Phase 2 Stage 1 | (RESOLVED) | Backend trait capability 인프라 (`engine/src/cpu_kernels.rs`, `engine/src/secondary.rs`) | L1 + L3 | capability trait |
 | `hybrid_attention` 모듈 | B-5b Phase 3 A | 2026-05-23 (RESOLVED) | `layers/hybrid_attention.rs` → `engine/src/hybrid_attention.rs` | L3-inference + L1 plan | RAII + data identifier 동반 격상 (§G 본문 조건 1 "RAII guard 단독 격상" 제외 의도 외 사례) |
 | **QCF data identifiers** (`QcfMetric`/`QcfConfig`/`QcfMode`/`AggregationMode`/`KiviFlushParams`/`FlushAttentionParams`/`SubLayer`/`ImportanceFormula` + `aggregate_heads`) | **S-3b-1** | **2026-05-24** | **`qcf/{mod,quant_qcf,layer_importance}.rs` → `engine/src/qcf_types.rs`** | **L3-qcf (신설) + L3-pressure + L3-inference + observability** | **3-도메인 + observability 공유 측정 어휘. 측정 로직(`compute_flush_*`, `ImportanceCollector`)은 L3-qcf에 유지** |
-| `ModelConfig` | TBD (별 sprint 후보) | **CANDIDATE** (2026-05-26 등록) | `inference/models/config.rs` → `engine/src/model_config.rs` (L2 직속) 후보 | L3-inference (owner) + L3-pressure (`weight_swap_handler.rs`) | INV-LAYER-003 보조 위계 우선순위 #3 — inference owned *configuration* 어휘를 pressure가 weight swap orchestrator에서 직접 import. 양 도메인 동등 사용이므로 §G L2 격상이 자연 정합. 현재는 §13.8-O `cross_l3_vocabulary` marker로 escape (`pressure/weight_swap_handler.rs:21`). 격상 시 §O register에서 항목 제거. **2026-05-26 정정**: 신위치 표기 `shared/model_config.rs`는 도입하지 않은 디렉토리. 격상 위치는 engine 직속 L2 모듈 `engine/src/model_config.rs` (arch §6.2 "L2 위치 정책" 참조). |
+| `ModelConfig` | precision swap Sprint B + B-fixup | `6dcba548` + `d78d3956` (RESOLVED, 2026-05-26) | `inference/models/config.rs` → `engine/src/model_config.rs` (L2 직속) | L3-inference + L3-pressure (`weight_swap_handler.rs`) | INV-LAYER-003 보조 위계 우선순위 #3 — 양 도메인 공유 configuration. Sprint B에서 struct 정의 격상, Sprint B-fixup에서 `from_gguf_metadata` → `models/loader/gguf.rs::parse_model_config` 이전으로 L2→L3 의존 0 달성. §O register에서 항목 제거. 격상 위치는 engine 직속 L2 모듈 (arch §6.2 "L2 위치 정책" 참조). |
 
 **임계 정책**: 5건 미만 sub-list 형식, 5건 이상 표 형식. **10건 이상** 누적 시 layer_lint.py 명시적 allowlist (자동 검출) 도입 검토 — §F 정책과 동일 운용 원리. `hybrid_attention` 격상 시 자세한 근거: 격상 단위는 모듈 전체(`HybridAttnSetup`/`HybridGpuBuffer` struct + `HybridScope` RAII + `compute_kv_split`/`current`/`install` free fn). §G 본문 조건 1 "RAII guard 본 정책 밖" 문구는 *RAII guard 단독 격상*을 제외하려는 의도이며, 본 사례는 `HybridAttnSetup` data identifier + 그 lifetime을 관리하는 `HybridScope` 동반 격상 패턴으로 §G 정신과 부합. plan.rs(L1) hot path 호출이 §J 본문 "read-only 정책 query 한정" 제약과 mismatch (AtomicI32 store + Mutex lock + cl_mem 참조 부수효과 발생)이므로 §J zone marker 적용은 폐기되고 §G 격상으로 본질 해소. Backend trait method 추가 없음(ISP 누적 +0).
 
@@ -2168,11 +2168,11 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - **Offload path** 3건:
     - `models/transformer.rs:15` — `PreloadPool` (offload thread pool, L2 격상 backlog)
     - `models/transformer.rs:2783,2786` — `PrefetchableCache` + `PrefetchController` (offload-only path, 격상 backlog)
-  - **Weight swap orchestrator** 3건:
-    - `pressure/weight_swap_handler.rs:21,22,23` — `ModelConfig`, `SwapExecutor`, `LayerSlot`/`SecondaryMmap` (WeightSwapDispatch trait + handler 이동 backlog)
+  - **Weight swap orchestrator** 2건 (ModelConfig 2026-05-26 Sprint B + B-fixup으로 §G RESOLVED 후 제거):
+    - `pressure/weight_swap_handler.rs:23,25` — `SwapExecutor`, `LayerSlot`/`SecondaryMmap` (WeightSwapDispatch trait + handler 이동 backlog)
     - **세부 분류 (보조 위계 적용, 2026-05-26)**:
-      - `SwapExecutor`, `LayerSlot`, `SecondaryMmap` — **위계 어긋남 방향** (pressure → inference owned resource). 본질은 데이터 owner를 pressure로 이전(우선순위 #2) — weight_slot/secondary_mmap은 본래 pressure 자원이므로 `pressure/state/weight_slot/`으로 이전(§6.3 결정 반영). `SwapExecutor`도 동행 이전 후보.
-      - `ModelConfig` — **양 도메인 공유 configuration** (우선순위 #3). inference 소유이나 pressure(weight swap), inference(forward) 양쪽이 동등 사용 → **§13.8-G L2 promotion candidate로 등록** (`engine/src/model_config.rs` L2 직속 후보). §G register 참조.
+      - `SwapExecutor`, `LayerSlot`, `SecondaryMmap` — **위계 어긋남 방향** (pressure → inference owned resource). 본질은 데이터 owner를 pressure로 이전(우선순위 #2) — weight_slot/secondary_mmap은 본래 pressure 자원이므로 `pressure/state/weight_slot/`으로 이전(§6.3 결정 반영). `SwapExecutor`도 동행 이전 후보. → Sprint C(precision swap 갈래 1 후속).
+      - ~~`ModelConfig`~~ — 2026-05-26 RESOLVED. §G register 참조.
 - **운용 메모**:
   - marker는 의도성 명시. PR description에 *본질 trait inversion backlog 후보* 또는 *외부 API surface로 정당화* 기재.
   - 5건 이상 누적 시 §13.4에 *cross-L3 vocabulary register* 표 신설 검토.
