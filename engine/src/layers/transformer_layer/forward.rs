@@ -554,15 +554,14 @@ impl TransformerLayer {
                     #[cfg(feature = "opencl")]
                     {
                         // OpenCL device-only buffers need enqueue_write_buffer.
-                        // backend가 OpenCL이 아니면(qnn_oppkg) secondary로 위임.
                         if dst_ptr.is_null()
                             && let Ok(dst_mem) =
                                 crate::backend::opencl::get_cl_mem(ws.out_attn.buffer().as_ref())
                         {
-                            let direct = backend
+                            if let Some(ocl) = backend
                                 .as_any()
-                                .downcast_ref::<crate::backend::opencl::OpenCLBackend>();
-                            let write_via = |ocl: &crate::backend::opencl::OpenCLBackend| -> anyhow::Result<()> {
+                                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                            {
                                 unsafe {
                                     ocl::core::enqueue_write_buffer(
                                         &ocl.queue,
@@ -574,26 +573,7 @@ impl TransformerLayer {
                                         None::<&mut ocl::core::Event>,
                                     )?;
                                 }
-                                Ok(())
-                            };
-                            if let Some(ocl) = direct {
-                                write_via(ocl)?;
                             } else {
-                                #[cfg(feature = "qnn")]
-                                if let Some(qnn) = backend
-                                    .as_any()
-                                    .downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>(
-                                ) {
-                                    qnn.with_opencl_secondary(write_via)
-                                        .ok_or_else(|| anyhow::anyhow!(
-                                            "qnn_oppkg fallback prefill: OpenCL secondary unavailable"
-                                        ))??;
-                                } else {
-                                    anyhow::bail!(
-                                        "prefill flash_attn CPU fallback: backend not OpenCL nor qnn_oppkg+OpenCL secondary"
-                                    );
-                                }
-                                #[cfg(not(feature = "qnn"))]
                                 anyhow::bail!(
                                     "prefill flash_attn CPU fallback: backend not OpenCL"
                                 );

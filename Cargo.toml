@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine", "shared", "manager", "crates/qnn_oppkg_poc", "crates/qnn_oppkg"]
+members = ["engine", "shared", "manager", "crates/qnn_oppkg"]
 resolver = "3"
 
 [profile.release]

@@ -162,19 +162,6 @@ impl SessionInitCtx {
             );
         }
 
-        // ENG-RPCMEM-041 / INV-RPCMEM-006: --opencl-rpcmem + --backend qnn_oppkg|qnngpu
-        // 동시 지정 시 전자를 무시 (qnn_oppkg 가 자체 rpcmem path 보유). Sprint 2b 에서
-        // qnn_oppkg 삭제 시 본 validation 도 함께 삭제.
-        if args.opencl_rpcmem && (args.backend == "qnn_oppkg" || args.backend == "qnngpu") {
-            eprintln!(
-                "[Config] --opencl-rpcmem 무시: --backend {} 는 자체 rpcmem path 보유. \
-                 Sprint 2b 에서 qnn_oppkg 삭제 후 --opencl-rpcmem 단독 사용 가능.",
-                args.backend
-            );
-            // args 는 &Args — 실제 field 변경 불가. 본 validation 은 경고 전용.
-            // opencl 분기 진입 시 args.opencl_rpcmem 이 전달되지 않으므로 이중 활성 없음.
-        }
-
         // --greedy overrides temperature to 0 (args is &Args so we apply inline)
         let effective_temperature = if args.greedy { 0.0 } else { args.temperature };
         let sampling_config = SamplingConfig {
@@ -250,8 +237,7 @@ impl SessionInitCtx {
             #[cfg(feature = "opencl")]
             "opencl" | "gpu" => {
                 // ENG-RPCMEM-042 / INV-RPCMEM-006 — Sprint 2a Phase 2:
-                // --opencl-rpcmem 은 --backend opencl 전용. qnn_oppkg/qnngpu 와
-                // 동시 지정 시 (실제로 여기 진입할 수 없지만 방어 코드 유지).
+                // --opencl-rpcmem 은 --backend opencl 전용.
                 // 실질 mutex 는 아래 opencl_rpcmem 인자로 new_with_options 에 전달.
                 let gpu_concrete =
                     Arc::new(crate::backend::opencl::OpenCLBackend::new_with_options(
@@ -374,129 +360,6 @@ impl SessionInitCtx {
                 }
                 let gpu: Arc<dyn Backend> = gpu_concrete;
                 (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
-            }
-            // ENG-QNN-202/INV-170: qnn_oppkg는 default off opt-in. feature 비활성 시
-            // 본 분기는 컴파일에서 제거되어 unknown backend로 빠진다.
-            #[cfg(feature = "qnn")]
-            "qnn_oppkg" | "qnngpu" => {
-                // QNN backend는 호스트(non-Android)에서 init 실패 → 명확한 Err 전파.
-                // 디바이스 빌드에서만 정상 진행 가능 (libQnnGpu.so 존재).
-                // ENG-QNN-209/D1: --qnn-graph-cache-prebuild flag (default true)는
-                // 백엔드 생성 시점에 wired 후 model load 완료 시점에 actual prebuild가
-                // 발동된다.
-                let qnn = Arc::new(crate::backend::qnn_oppkg::QnnOppkgBackend::with_prebuild(
-                    args.qnn_graph_cache_prebuild,
-                )?);
-                let qnn_mem: Arc<dyn Memory> = Arc::new(
-                    crate::backend::qnn_oppkg::memory::QnnOppkgMemory::new(qnn.clone()),
-                );
-
-                // ENG-QNN-206: SwitchHw round-trip을 위해 OpenCL backend를 secondary로
-                // 등록. OpenCL init이 fail하면 secondary 없이 진행 (SwitchHw 비활성).
-                #[cfg(feature = "opencl")]
-                let (gpu_be, gpu_mem_arc): (
-                    Option<Arc<dyn Backend>>,
-                    Option<Arc<dyn Memory>>,
-                ) = match crate::backend::opencl::OpenCLBackend::new_with_profile_events(
-                    args.profile_events || args.heartbeat_gpu_profile,
-                ) {
-                    Ok(gpu_concrete) => {
-                        let gpu_concrete = Arc::new(gpu_concrete);
-                        let gm: Arc<dyn Memory> =
-                            Arc::new(crate::backend::opencl::memory::OpenCLMemory::new(
-                                gpu_concrete.context.clone(),
-                                gpu_concrete.queue.clone(),
-                                !args.no_zero_copy,
-                            ));
-                        let g = gpu_concrete as Arc<dyn Backend>;
-                        eprintln!(
-                            "[Backend] QNN-GPU primary, OpenCL secondary available (SwitchHw ready)"
-                        );
-                        (Some(g), Some(gm))
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[Backend] QNN-GPU only (OpenCL secondary init failed: {})",
-                            e
-                        );
-                        (None, None)
-                    }
-                };
-                #[cfg(not(feature = "opencl"))]
-                let (gpu_be, gpu_mem_arc): (
-                    Option<Arc<dyn Backend>>,
-                    Option<Arc<dyn Memory>>,
-                ) = (None, None);
-
-                // qnn_graph_cache_prebuild는 위에서 with_prebuild()에 wired됨.
-                // qnn_allow_fallback는 M3.3 forward path에서 활용.
-                let _ = args.qnn_allow_fallback;
-
-                // M3.4: OpenCL secondary를 qnn_oppkg backend의 fallback target으로
-                // 등록. prefill 및 model load 단계에서 trait method 호출 시
-                // OpenCL secondary가 처리. decode (seq_len=1) fast path만 graph
-                // 직접 dispatch (INV-175).
-                #[cfg(feature = "opencl")]
-                if let Some(ref gpu_concrete) = gpu_be {
-                    qnn.set_fallback_backend(gpu_concrete.clone());
-                    eprintln!(
-                        "[Backend] qnn_oppkg fallback wired to OpenCL secondary (prefill + model load 위임)"
-                    );
-                }
-                // M3.4: production activation/KV memory는 OpenCL secondary로 위임.
-                // qnn_oppkg backend는 graph build 시점에 internal rpcmem alloc으로
-                // weight + scratch를 보유한다. production이 만드는 activation tensor는
-                // OpenCL buffer로 남아 prefill + model load fallback path가 자연스럽게
-                // 작동한다. KV cache는 OpenCL buffer (graph 내부 KvScatter는 자체
-                // rpcmem 사용 + execute path에서 host-side memcpy로 동기화).
-                let qnn_dyn: Arc<dyn Backend> = qnn.clone();
-                // Step 1 (KV zero-copy): OpenCL secondary가 있으면 HybridMemory로
-                // primary_mem을 구성한다. alloc()은 OpenCL cl_mem으로 위임하고,
-                // alloc_kv()는 rpcmem + CL_MEM_USE_HOST_PTR dual buffer를 반환.
-                // production prefill path (cl_mem 경유)는 무손상.
-                #[cfg(feature = "opencl")]
-                let primary_mem: Arc<dyn Memory> = match (&gpu_mem_arc, &gpu_be) {
-                    (Some(ocl_m), Some(ocl_be)) => {
-                        // COLD-EXT: backend init, primary_mem 구성 1회만 호출.
-                        if let Some(ocl_concrete) = ocl_be
-                            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
-                            .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
-                        {
-                            eprintln!(
-                                "[Backend] QNN primary_mem → QnnOppkgHybridMemory (KV zero-copy Step 1)"
-                            );
-                            Arc::new(
-                                crate::backend::qnn_oppkg::hybrid_memory::QnnOppkgHybridMemory::new(
-                                    ocl_m.clone(),
-                                    qnn.clone(),
-                                    ocl_concrete.context.clone(),
-                                ),
-                            )
-                        } else {
-                            ocl_m.clone()
-                        }
-                    }
-                    (Some(m), None) => m.clone(),
-                    (None, _) => qnn_mem.clone(),
-                };
-                #[cfg(not(feature = "opencl"))]
-                let primary_mem: Arc<dyn Memory> = qnn_mem.clone();
-                // M3.4 D-D.4: gpu_backend_arc로는 OpenCL secondary를 노출한다.
-                // primary qnn_oppkg는 noshuffle prep / map_weights_for_cpu / RSS
-                // diag 등 OpenCL-specific path에 downcast 불가하므로, secondary가
-                // 있으면 secondary를 보조 backend로 expose. 없으면 None (해당
-                // path들은 qnn_oppkg-only 환경에서 불활성).
-                let gpu_backend_for_caller: Option<Arc<dyn Backend>> = match &gpu_be {
-                    Some(be) => Some(be.clone()),
-                    None => Some(qnn_dyn.clone()),
-                };
-                (
-                    qnn_dyn,
-                    primary_mem.clone(),
-                    gpu_backend_for_caller,
-                    Some(primary_mem),
-                    true,
-                )
             }
             _ => anyhow::bail!(
                 "Unknown backend: {}. Use cpu, opencl, or cuda.",
@@ -626,33 +489,6 @@ impl SessionInitCtx {
         // Tester pulls this file to analyse kgsl/ion/dmabuf VMA distribution.
         if std::env::var("LLMRS_DUMP_SMAPS_T1").is_ok() {
             dump_smaps("T1_model_loaded");
-        }
-
-        // ENG-QNN-203/INV-167 — Eager prebuild of layer graph cache (D1 결정).
-        // Model load + LayerSlot 등록이 완료된 시점에 N×graphFinalize를 직렬 실행한다.
-        // host build에서는 backend init이 이미 fail하여 본 분기 도달 불가; 디바이스
-        // 빌드 + Android runtime에서만 본격 동작.
-        #[cfg(feature = "qnn")]
-        if args.backend == "qnn_oppkg" || args.backend == "qnngpu" {
-            // COLD-EXT: backend init, graphFinalize N회 직렬 실행 setup.
-            if let Some(qnn_be) = backend
-                .get_extension(crate::backend::EXT_QNN_OPPKG)
-                .and_then(|a| a.downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>())
-            {
-                // ModelConfig → LayerConfig 변환. M3.2 단계는 Qwen2.5-1.5B 단일
-                // 모델 지원 (ENG-QNN-225 / INV-176). 추후 다른 모델 추가 시
-                // dispatch table 도입 예정.
-                let mc = &model.config;
-                let layer_cfg = crate::backend::qnn_oppkg::layer_graph::LayerConfig {
-                    dim: mc.hidden_size as u32,
-                    n_head: mc.num_attention_heads as u32,
-                    n_kv_heads: mc.num_key_value_heads as u32,
-                    head_dim: mc.head_dim as u32,
-                    ffn_dim: mc.intermediate_size as u32,
-                    kv_capacity: args.max_seq_len as u32,
-                };
-                qnn_be.prebuild_graph_cache(&model.layers, &layer_cfg)?;
-            }
         }
 
         // WSWAP-6-PREFAULT: eager prefault of the secondary weight file.
@@ -998,19 +834,7 @@ impl SessionInitCtx {
                         || cli_partition_needs_cpu_weights
                         || args.prefill_cpu_chunk_size > 0
                         || args.enable_resilience;
-                    // M3.4 D-D.4: qnn_oppkg primary는 noshuffle prep을 OpenCL secondary
-                    // backend로 위임해야 한다. primary 자체는 OpenCLBackend가 아니라
-                    // downcast가 fail하기 때문. fallback gpu_backend_arc가 있으면
-                    // 그것을, 없으면 원래 backend (OpenCL primary)를 사용.
-                    let prep_backend: &Arc<dyn Backend> = if (args.backend == "qnn_oppkg"
-                        || args.backend == "qnngpu")
-                        && let Some(ref gpu_be) = gpu_backend_arc
-                    {
-                        gpu_be
-                    } else {
-                        &backend
-                    };
-                    match model.prepare_noshuffle_buffers(prep_backend, keep_for_cpu) {
+                    match model.prepare_noshuffle_buffers(&backend, keep_for_cpu) {
                         Ok(n) => {
                             eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n)
                         }

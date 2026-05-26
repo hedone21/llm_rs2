@@ -673,11 +673,11 @@ pub fn open_secondary_with_options(
 
 /// LISWAP-6 — backend-aware variant of `open_secondary_with_options`.
 ///
-/// When `backend` reports the `qnn_oppkg` family AND the secondary file is
-/// GGUF, this constructor returns a `SecondaryMmap::Rpcmem` variant that
-/// participates in the DMA-BUF alias swap path (zero-H2D-copy weight swap).
-/// All other combinations dispatch to the standard GGUF / AUF paths so
-/// behaviour for non-`qnn_oppkg` backends is unchanged.
+/// When `backend` exposes `EXT_RPCMEM_ALLOCATOR` (i.e. OpenCL backend with
+/// `--opencl-rpcmem` active) AND the secondary file is GGUF, this constructor
+/// returns a `SecondaryMmap::Rpcmem` variant that participates in the DMA-BUF
+/// alias swap path (zero-H2D-copy weight swap).
+/// All other combinations dispatch to the standard GGUF / AUF paths.
 ///
 /// On rpcmem construction failure (Android-only path / runtime not ready /
 /// rpcmem alloc rejected at metadata-validation), the function gracefully
@@ -701,7 +701,7 @@ pub fn open_secondary_with_backend(
             secondary_layout_choice,
         );
     }
-    // qnn_oppkg + GGUF → try Rpcmem; fall back to standard GGUF on any error.
+    // rpcmem backend + GGUF → try Rpcmem; fall back to standard GGUF on any error.
     match try_open_rpcmem_secondary(path, primary_config, primary_gguf, backend) {
         Ok(handle) => Ok(handle),
         Err(e) => {
@@ -717,34 +717,23 @@ pub fn open_secondary_with_backend(
 /// Returns true when `backend` can expose an rpcmem allocator for the
 /// secondary-store alias path.
 ///
-/// Sprint 2a Phase 2 (ENG-RPCMEM-031): 2-tier extension lookup —
-///   1. `EXT_RPCMEM_ALLOCATOR` (신규, backend-agnostic): `--opencl-rpcmem`
-///      활성 OpenCL backend 가 본 extension 으로 `Arc<RpcmemAllocator>` 노출.
-///   2. `EXT_QNN_OPPKG` (Sprint 2a 호환, Sprint 2b 에서 제거): 기존
-///      `QnnOppkgRuntime::rpcmem_fns()` path.
-///
-/// 두 path 가 동일 process 에서 동시 활성되는 케이스는 INV-RPCMEM-006 CLI
-/// mutex 로 차단된다 (전자가 강등됨).
+/// Sprint 2b: EXT_RPCMEM_ALLOCATOR 단독 lookup (EXT_QNN_OPPKG fallback 제거됨).
+/// `--opencl-rpcmem` 활성 OpenCL backend 가 본 extension 으로
+/// `Arc<RpcmemAllocator>` 노출.
 ///
 /// `pub(crate)` since W-AUF-2 — `resolve_secondary` consults the same predicate
 /// when deciding whether to promote an AUF self-secondary to the RpcMem variant.
 pub(crate) fn backend_supports_rpcmem_secondary(
     backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> bool {
-    // Priority 1: EXT_RPCMEM_ALLOCATOR (Sprint 2a Phase 2 신규 path).
-    if backend
+    backend
         .get_extension(crate::backend::EXT_RPCMEM_ALLOCATOR)
         .is_some()
-    {
-        return true;
-    }
-    // Priority 2: EXT_QNN_OPPKG (Sprint 2a 공존 — Sprint 2b 제거 예정).
-    let name = backend.name();
-    name.contains("QNN OpPackage") || name.contains("qnn_oppkg")
 }
 
 /// W-AUF-2.3 — Promote a `SecondaryMmap::Auf` self-secondary to the
-/// `SecondaryMmap::Rpcmem` variant when the backend is `qnn_oppkg`.
+/// `SecondaryMmap::Rpcmem` variant when the backend supports rpcmem
+/// (`EXT_RPCMEM_ALLOCATOR` exposed, e.g. OpenCL + `--opencl-rpcmem`).
 ///
 /// `Some(rpc)` 반환 시 호출자는 그 핸들을 사용한다. `None`이면 promote를
 /// 시도하지 않은 것 (호스트 빌드 / 다른 backend). promote 시도가 실패한 경우
@@ -785,12 +774,11 @@ pub(crate) fn try_promote_auf_self_secondary_to_rpcmem(
     {
         let _ = (view, layer_index, diag_source_path);
         // 호스트/non-Android에서는 rpcmem feature 자체가 없어 promote 불가.
-        // backend.name()이 qnn_oppkg를 거짓으로 자처해도 None을 돌려보내 fallback 유지.
         None
     }
 }
 
-/// Try to construct a `SecondaryMmap::Rpcmem` for `qnn_oppkg`. Errors
+/// Try to construct a `SecondaryMmap::Rpcmem` via rpcmem allocator. Errors
 /// surface as a generic `LoadError::SecondaryUnavailable` so the caller's
 /// fallback is uniform.
 fn try_open_rpcmem_secondary(
@@ -806,8 +794,8 @@ fn try_open_rpcmem_secondary(
             resolve_rpcmem_allocator(backend).ok_or_else(|| LoadError::SecondaryUnavailable {
                 path: path.to_path_buf(),
                 source: anyhow::anyhow!(
-                    "rpcmem secondary: backend exposes neither EXT_RPCMEM_ALLOCATOR \
-                     nor EXT_QNN_OPPKG — cannot acquire rpcmem allocator"
+                    "rpcmem secondary: backend does not expose EXT_RPCMEM_ALLOCATOR \
+                     — enable --opencl-rpcmem to activate rpcmem allocator"
                 ),
             })?;
         let store = crate::models::weights::rpcmem_secondary::RpcmemSecondaryStore::from_gguf(
@@ -835,39 +823,20 @@ fn try_open_rpcmem_secondary(
     }
 }
 
-/// Sprint 2a Phase 2 (ENG-RPCMEM-031) — 2-tier `Arc<RpcmemAllocator>` resolve.
+/// Sprint 2b (ENG-RPCMEM-031) — `Arc<RpcmemAllocator>` resolve.
 ///
-/// 우선순위:
-/// 1. `EXT_RPCMEM_ALLOCATOR` (신규, backend-agnostic) — OpenCL backend +
-///    `--opencl-rpcmem` 활성 시.
-/// 2. `EXT_QNN_OPPKG` (Sprint 2a 공존, Sprint 2b 제거) — `QnnOppkgRuntime`
-///    의 fn-pointer 를 `RpcmemAllocator::from_external_fns` 로 wrap.
-///
-/// 두 path 가 동일 process 에서 동시 활성되는 케이스는 INV-RPCMEM-006 CLI
-/// mutex 로 차단.
+/// `EXT_RPCMEM_ALLOCATOR` 단독 lookup. `--opencl-rpcmem` 활성 OpenCL backend
+/// 가 본 extension 으로 `Arc<RpcmemAllocator>` 를 노출한다.
+/// Sprint 2a 공존 EXT_QNN_OPPKG path 는 Sprint 2b 에서 제거됨.
 #[cfg(target_os = "android")]
 fn resolve_rpcmem_allocator(
     backend: &std::sync::Arc<dyn crate::backend::Backend>,
 ) -> Option<std::sync::Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>> {
-    // Priority 1: backend-agnostic EXT_RPCMEM_ALLOCATOR.
     if let Some(ext) = backend.get_extension(crate::backend::EXT_RPCMEM_ALLOCATOR)
         && let Some(arc) =
             ext.downcast_ref::<std::sync::Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>>()
     {
         return Some(std::sync::Arc::clone(arc));
-    }
-    // Priority 2: qnn_oppkg fn-pointer fallback (Sprint 2a 공존).
-    #[cfg(feature = "qnn")]
-    if let Some(ext) = backend.get_extension(crate::backend::EXT_QNN_OPPKG)
-        && let Some(qnn) = ext.downcast_ref::<crate::backend::qnn_oppkg::QnnOppkgBackend>()
-    {
-        let runtime = qnn.runtime_arc();
-        let fns = runtime.rpcmem_fns();
-        return Some(std::sync::Arc::new(
-            crate::memory::rpcmem::allocator::RpcmemAllocator::from_external_fns(
-                fns.0, fns.1, fns.2,
-            ),
-        ));
     }
     None
 }
