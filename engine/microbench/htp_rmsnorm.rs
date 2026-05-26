@@ -433,9 +433,9 @@ fn run_htp(
 
         use anyhow::Context;
         use llm_rs2::backend::htp_fastrpc::{
-            AEE_SUCCESS, DSPQUEUE_TIMEOUT, DspQueueBuffer, DspqBufferType, HTP_TYPE_F32,
-            HtpFastrpcHost, HtpGeneralReq, HtpGeneralRsp, RpcmemBuffer, htp_tensor_from_shape,
-            init_rmsnorm_req, map_aee_err, map_htp_status,
+            AEE_SUCCESS, DSPQUEUE_TIMEOUT, DspQueueBuffer, DspqBufferType, HTP_STATUS_OK,
+            HTP_TYPE_F32, HtpFastrpcHost, HtpGeneralReq, HtpGeneralRsp, RpcmemBuffer,
+            htp_tensor_from_shape, init_rmsnorm_req, map_aee_err, map_htp_status,
         };
 
         // 4-step FastRPC handshake.
@@ -570,7 +570,8 @@ fn run_htp(
             if rc != AEE_SUCCESS {
                 return Err(map_aee_err(rc).context("dspqueue_read").into());
             }
-            if rsp.status != 0 {
+            // HTP_STATUS_OK = 1 (llama.cpp htp-msg.h:24). 0 은 uninitialized.
+            if rsp.status != HTP_STATUS_OK {
                 return Err(map_htp_status(rsp.status).context("DSP op status").into());
             }
 

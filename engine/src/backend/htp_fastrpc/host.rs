@@ -137,35 +137,59 @@ pub struct RemoteRpcControlLatency {
 
 /// `struct dspqueue_buffer` — dspqueue_write/read 의 buffer descriptor.
 ///
-/// llama.cpp `ggml-hexagon.cpp:2224-2255` (htp_req_buff_init) 에서 사용되는
-/// field 만 명시. SDK 헤더가 stock S25 에 있지 않아 ggml-hexagon 의 사용
-/// 패턴을 ground truth 로 채택.
+/// **byte-identical to QC `inc/dspqueue.h` (BSD-3-Clause)**:
+///
+/// ```c
+/// struct dspqueue_buffer {
+///     uint32_t fd;      /* offset  0 */
+///     uint32_t size;    /* offset  4 */
+///     uint32_t offset;  /* offset  8 */
+///     uint32_t flags;   /* offset 12 */
+///     union { void *ptr; uint64_t address; }; /* offset 16 (8B align) */
+/// };
+/// /* sizeof = 24 bytes */
+/// ```
+///
+/// **Q-2.2 옵션 D continue fix (2026-05-26)**: 이전 정의는 `fd / ptr / offset /
+/// size / flags / reserved[3]` (= 40 B) 순서 — ggml-hexagon 의 field 사용
+/// 순서(`d->fd, d->ptr, d->offset, d->size, d->flags`)를 struct layout 으로
+/// 오인. driver 는 `(fd, size, offset, flags, ptr)` 순으로 read 하므로 우리
+/// `ptr` 의 하위 4 B 가 driver 의 `size` 슬롯, 상위 4 B 가 `offset` 슬롯으로
+/// 잘못 해석되어:
+///   - logcat `b->offset == 0` assertion fail (line 1208) — ptr 상위 32bit
+///   - logcat `(b->flags & DSPQUEUE_BUFFER_FLAG_DEREF) == 0` fail (line 1185)
+///     — flags 슬롯이 우리 `offset` (=0) 으로 잘못 읽힘
+///   - logcat `fastrpc_buffer_ref ref=-1` (line 1196) — driver 가 알 수 없는
+///     fd/size 조합으로 buffer registry lookup 실패
+///
+/// 출처: <https://raw.githubusercontent.com/quic/fastrpc/master/inc/dspqueue.h>
+/// (commit 시점 무관, BSD-3-Clause). llama.cpp 의 field 이름 사용은 동일
+/// (`fd/ptr/offset/size/flags`) 하나 declaration 순서는 SDK 헤더가 진짜.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct DspQueueBuffer {
     /// rpcmem fd (mandatory).
-    pub fd: c_int,
-    /// host virtual address (mandatory).
-    pub ptr: *mut c_void,
-    /// offset within the mapped region.
-    pub offset: u32,
-    /// byte size to transfer.
+    pub fd: u32,
+    /// byte size to transfer. `0` 이면 framework 가 mapped size 로 자동 set.
     pub size: u32,
+    /// offset within the mapped region. `ptr` 이 이미 offset 포함.
+    pub offset: u32,
     /// cache maintenance flags. `DSPQUEUE_BUFFER_FLAG_*`.
     pub flags: u32,
-    /// pad / reserved. ggml-hexagon 은 memset(0) 후 명시 field 만 set.
-    pub reserved: [u32; 3],
+    /// host virtual address (NULL = remote-only mapping). `ptr` 은 offset
+    /// 가산된 주소. union 의 `ptr` variant 사용. address (u64) variant 는
+    /// `ptr` 와 같은 8 B 슬롯.
+    pub ptr: *mut c_void,
 }
 
 impl DspQueueBuffer {
     pub const fn zeroed() -> Self {
         Self {
             fd: 0,
-            ptr: core::ptr::null_mut(),
-            offset: 0,
             size: 0,
+            offset: 0,
             flags: 0,
-            reserved: [0; 3],
+            ptr: core::ptr::null_mut(),
         }
     }
 }
@@ -921,6 +945,27 @@ mod tests {
         assert!(b.ptr.is_null());
         assert_eq!(b.size, 0);
         assert_eq!(b.flags, 0);
+    }
+
+    /// QC `inc/dspqueue.h` (BSD-3-Clause) 와 byte-identical 보장.
+    ///
+    /// layout:
+    ///   fd (u32) @0, size (u32) @4, offset (u32) @8, flags (u32) @12, ptr (u64) @16
+    ///   sizeof = 24 byte.
+    ///
+    /// 옛 layout `fd + ptr + offset + size + flags + reserved[3]` (= 40 B) 였을
+    /// 때 driver 가 우리 ptr 의 하위 32bit 를 size 슬롯, 상위 32bit 를 offset
+    /// 슬롯으로 read 해 `b->offset == 0` assertion fail. Q-2.2 옵션 D continue
+    /// fix 의 회귀 방지.
+    #[test]
+    fn dspq_buffer_layout_matches_qc_sdk() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<DspQueueBuffer>(), 24);
+        assert_eq!(offset_of!(DspQueueBuffer, fd), 0);
+        assert_eq!(offset_of!(DspQueueBuffer, size), 4);
+        assert_eq!(offset_of!(DspQueueBuffer, offset), 8);
+        assert_eq!(offset_of!(DspQueueBuffer, flags), 12);
+        assert_eq!(offset_of!(DspQueueBuffer, ptr), 16);
     }
 
     /// `remote_scalars_makex` 값이 llama.cpp 자동 생성 stub 의

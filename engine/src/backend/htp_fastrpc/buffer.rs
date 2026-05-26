@@ -229,14 +229,16 @@ impl RpcmemBuffer {
                 self.size
             ));
         }
+        // QC `dspqueue_buffer.fd` 는 u32. `RpcmemBuffer::fd` 는 c_int (i32,
+        // rpcmem_to_fd 시그니처에 일치). 정상 fd 는 음수가 아니므로 cast 안전.
         Ok(DspQueueBuffer {
-            fd: self.fd,
-            // SAFETY: pointer arithmetic 가 buffer 안에 머무름 (위에서 검증).
-            ptr: unsafe { self.ptr.add(offset as usize) } as *mut c_void,
-            offset,
+            fd: self.fd as u32,
             size,
+            offset,
             flags: direction.to_flags(),
-            reserved: [0; 3],
+            // SAFETY: pointer arithmetic 가 buffer 안에 머무름 (위에서 검증).
+            // QC SDK 주석 "The virtual address #ptr includes the offset" 와 일치.
+            ptr: unsafe { self.ptr.add(offset as usize) } as *mut c_void,
         })
     }
 }
