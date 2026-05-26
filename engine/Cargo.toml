@@ -65,6 +65,15 @@ zbus = { version = "5", optional = true, default-features = false, features = ["
 
 tempfile = "3.0"
 
+# RpcmemAllocator (Sprint 2a Phase 2, ENG-RPCMEM-010 ~ C04): libcdsprpc.so
+# dlopen needs `libloading` whenever `--opencl-rpcmem` is active. The new
+# allocator module (`engine/src/memory/rpcmem/allocator.rs`) is cfg-gated to
+# `target_os = "android"`, so the dependency is only pulled in on android
+# targets — host builds remain unchanged. Independent from the `qnn` feature
+# (which used to be the sole owner of libloading); both can coexist.
+[target.'cfg(target_os = "android")'.dependencies]
+libloading = "0.8"
+
 [dev-dependencies]
 # compile-fail / compile-pass tests for session typestate (INV-LAYER-007).
 trybuild = "1.0"

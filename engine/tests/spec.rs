@@ -364,3 +364,24 @@ mod test_batch_helpers;
 // KvMode ValueEnum 파싱, KvModeArgs flatten, legacy --kivi/--kv-offload shim.
 #[path = "spec/test_kv_mode_args.rs"]
 mod test_kv_mode_args;
+
+// ── INV-RPCMEM-001~008: RpcmemAllocator backend-agnostic 분리 (Sprint 2a Phase 2) ──
+// ENG-RPCMEM-010~042 + ENG-RPCMEM-C01~C04 구현 검증.
+// Android-only INV (001/002/005/007) 는 호스트에서 source-grep / skip.
+// 호스트 검증 가능 INV (003/004/006/007/008) 는 mock allocator 또는 source-grep.
+#[path = "spec/test_inv_rpcmem_001_android_only.rs"]
+mod test_inv_rpcmem_001_android_only;
+#[path = "spec/test_inv_rpcmem_002_single_instance.rs"]
+mod test_inv_rpcmem_002_single_instance;
+#[path = "spec/test_inv_rpcmem_003_per_buffer_fallback.rs"]
+mod test_inv_rpcmem_003_per_buffer_fallback;
+#[path = "spec/test_inv_rpcmem_004_no_qnn_dlopen.rs"]
+mod test_inv_rpcmem_004_no_qnn_dlopen;
+#[path = "spec/test_inv_rpcmem_005_drop_order.rs"]
+mod test_inv_rpcmem_005_drop_order;
+#[path = "spec/test_inv_rpcmem_006_cli_mutex.rs"]
+mod test_inv_rpcmem_006_cli_mutex;
+#[path = "spec/test_inv_rpcmem_007_activation_no_rpcmem.rs"]
+mod test_inv_rpcmem_007_activation_no_rpcmem;
+#[path = "spec/test_inv_rpcmem_008_no_raw_clientbuf.rs"]
+mod test_inv_rpcmem_008_no_raw_clientbuf;

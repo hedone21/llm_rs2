@@ -32,7 +32,12 @@ fn allocator_source_does_not_reference_libqnngpu() {
         return;
     }
     let src = fs::read_to_string(&path).expect("read allocator.rs");
-    let forbidden = ["libQnnGpu.so", "libqnn_oppkg.so", "QNN_BACKEND_LIB", "QNN_OPPKG_LIB"];
+    let forbidden = [
+        "libQnnGpu.so",
+        "libqnn_oppkg.so",
+        "QNN_BACKEND_LIB",
+        "QNN_OPPKG_LIB",
+    ];
     for literal in forbidden {
         assert!(
             !src.contains(literal),

@@ -162,6 +162,19 @@ impl SessionInitCtx {
             );
         }
 
+        // ENG-RPCMEM-041 / INV-RPCMEM-006: --opencl-rpcmem + --backend qnn_oppkg|qnngpu
+        // 동시 지정 시 전자를 무시 (qnn_oppkg 가 자체 rpcmem path 보유). Sprint 2b 에서
+        // qnn_oppkg 삭제 시 본 validation 도 함께 삭제.
+        if args.opencl_rpcmem && (args.backend == "qnn_oppkg" || args.backend == "qnngpu") {
+            eprintln!(
+                "[Config] --opencl-rpcmem 무시: --backend {} 는 자체 rpcmem path 보유. \
+                 Sprint 2b 에서 qnn_oppkg 삭제 후 --opencl-rpcmem 단독 사용 가능.",
+                args.backend
+            );
+            // args 는 &Args — 실제 field 변경 불가. 본 validation 은 경고 전용.
+            // opencl 분기 진입 시 args.opencl_rpcmem 이 전달되지 않으므로 이중 활성 없음.
+        }
+
         // --greedy overrides temperature to 0 (args is &Args so we apply inline)
         let effective_temperature = if args.greedy { 0.0 } else { args.temperature };
         let sampling_config = SamplingConfig {
@@ -236,13 +249,18 @@ impl SessionInitCtx {
             }
             #[cfg(feature = "opencl")]
             "opencl" | "gpu" => {
-                let gpu_concrete = Arc::new(
-                    crate::backend::opencl::OpenCLBackend::new_with_profile_events(
+                // ENG-RPCMEM-042 / INV-RPCMEM-006 — Sprint 2a Phase 2:
+                // --opencl-rpcmem 은 --backend opencl 전용. qnn_oppkg/qnngpu 와
+                // 동시 지정 시 (실제로 여기 진입할 수 없지만 방어 코드 유지).
+                // 실질 mutex 는 아래 opencl_rpcmem 인자로 new_with_options 에 전달.
+                let gpu_concrete =
+                    Arc::new(crate::backend::opencl::OpenCLBackend::new_with_options(
                         // MSG-068 Phase 2: heartbeat-gpu-profile도 같은 queue
                         // profiling 인프라를 사용하므로 어느 한쪽이 켜지면 활성화.
                         args.profile_events || args.heartbeat_gpu_profile,
-                    )?,
-                );
+                        // ENG-RPCMEM-042: pass --opencl-rpcmem flag.
+                        args.opencl_rpcmem,
+                    )?);
                 // Zero-copy is the default. `--no-zero-copy` disables it unless
                 // another feature requires host-accessible buffers (resilience
                 // SwitchHw, tensor partition, prefill CPU interleave) — those
@@ -280,12 +298,17 @@ impl SessionInitCtx {
                          (primary memory = device-only)"
                     );
                 }
-                let gpu_mem: Arc<dyn Memory> =
-                    Arc::new(crate::backend::opencl::memory::OpenCLMemory::new(
+                // ENG-RPCMEM-042 / INV-RPCMEM-002: OpenCLMemory 에 동일 Arc<RpcmemAllocator>
+                // 주입. new_with_rpcmem 은 None 일 때 기존 new() 와 동일 동작.
+                let rpcmem_alloc = gpu_concrete.rpcmem_allocator();
+                let gpu_mem: Arc<dyn Memory> = Arc::new(
+                    crate::backend::opencl::memory::OpenCLMemory::new_with_rpcmem(
                         gpu_concrete.context.clone(),
                         gpu_concrete.queue.clone(),
                         effective_zero_copy,
-                    ));
+                        rpcmem_alloc,
+                    ),
+                );
                 let gpu: Arc<dyn Backend> = gpu_concrete;
                 // GPU is primary; keep a ref as secondary for SwitchHw round-trip
                 (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)

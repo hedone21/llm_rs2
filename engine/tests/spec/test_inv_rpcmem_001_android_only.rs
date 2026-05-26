@@ -4,46 +4,64 @@
 //!
 //! 대응 spec: `spec/30-engine.md` 부록 E.2 (ENG-RPCMEM-011), `spec/41-invariants.md` §3.27.
 //! 대응 arch: `arch/rpcmem_allocator.md` §2.2, `arch/opencl_backend.md` §2.2.
-//!
-//! 본 파일은 Sprint 2a Phase 2 spec/arch 단계의 **테스트 skeleton** 이다.
-//! Implementer (task #3) 가 RpcmemAllocator + OpenCLBackend::new_with_options
-//! 구현 후 본 테스트 본문을 채운다. 현재는 컴파일 가능한 `unimplemented!` placeholder.
 
 #![allow(dead_code, unused_imports)]
-
-// 호스트 빌드 검증:
-// (a) `RpcmemAllocator::new()` 호출 시 Err 반환 (또는 type 자체가 사용 불가).
-// (b) `OpenCLBackend::new_with_options(false, true)` 호출 시 `opencl_rpcmem`
-//     필드가 false 로 강등됨 + stderr 에 "강등" 문자열 포함.
-//
-// Android 빌드는 본 테스트의 대상 외 (별도 디바이스 microbench 에서 검증).
 
 #[cfg(not(target_os = "android"))]
 #[test]
 fn host_build_rpcmem_allocator_returns_err_or_excluded() {
-    // TODO Implementer: 다음 중 하나로 구현
-    //   1. `RpcmemAllocator::new().is_err()` 검증 (host 에서 컴파일 가능 case).
-    //   2. `#[cfg(target_os = "android")]` 로 type 자체가 host 에서 부재 →
-    //      별도의 host stub (Infallible 등) 부재를 컴파일 타임 검증.
-    eprintln!("[INV-RPCMEM-001 skeleton] TODO: Implementer 가 본 테스트 본문 채움");
+    // INV-RPCMEM-001 검증: host 빌드에서 `RpcmemAllocator::new()` 는 Err 반환.
+    let r = llm_rs2::memory::rpcmem::allocator::RpcmemAllocator::new();
+    assert!(
+        r.is_err(),
+        "INV-RPCMEM-001: host build 에서 RpcmemAllocator::new() 는 Err 반환해야 함. \
+         got Ok variant — libcdsprpc.so Android-only constraint 위반."
+    );
+    // source-grep: allocator.rs 에 `#[cfg(target_os = "android")]` 가 존재함을 검증.
+    let src_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("memory")
+        .join("rpcmem")
+        .join("allocator.rs");
+    let src = std::fs::read_to_string(&src_path).expect("read allocator.rs");
+    assert!(
+        src.contains(r#"#[cfg(target_os = "android")]"#),
+        "INV-RPCMEM-001: allocator.rs 에 target_os = android cfg gate 가 없음."
+    );
 }
 
 #[cfg(not(target_os = "android"))]
 #[test]
 fn host_build_opencl_backend_demotes_rpcmem_flag() {
-    // TODO Implementer:
-    //   1. `OpenCLBackend::new_with_options(false, true)` 호출 (host 에서 opencl
-    //      backend init 가능 — GPU 부재 시 backend init 자체가 Err 일 수 있으므로
-    //      mock context 사용 또는 skip).
-    //   2. stderr capture (예: `gag::BufferRedirect`) 로 "강등" 또는 "demote" 문자열 포함 검증.
-    //   3. backend.get_extension(EXT_RPCMEM_ALLOCATOR) == None 검증.
-    eprintln!("[INV-RPCMEM-001 skeleton] TODO: Implementer 가 본 테스트 본문 채움");
+    // ENG-RPCMEM-021 / INV-RPCMEM-001: host 빌드에서 `new_with_options(_, true)` 호출 시
+    // rpcmem_allocator 가 None 으로 강등됨.
+    //
+    // OpenCL 없는 호스트에서는 backend init 자체가 Err (GPU 없음) 이므로 source-grep
+    // 으로 강등 로직 존재 검증.
+    let src_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("backend")
+        .join("opencl")
+        .join("mod.rs");
+    if !src_path.exists() {
+        eprintln!("[INV-RPCMEM-001] opencl/mod.rs 없음 (opencl feature 미활성) — skip");
+        return;
+    }
+    let src = std::fs::read_to_string(&src_path).expect("read opencl/mod.rs");
+    // new_with_options 가 RpcmemAllocator::new() Err 시 강등 메시지 출력함을 source-grep.
+    assert!(
+        src.contains("--opencl-rpcmem 강등") || src.contains("opencl_rpcmem 강등"),
+        "INV-RPCMEM-001: opencl/mod.rs 에 rpcmem 강등 경고 출력 코드가 없음."
+    );
+    assert!(
+        src.contains("new_with_options"),
+        "INV-RPCMEM-001: opencl/mod.rs 에 new_with_options 가 없음."
+    );
 }
 
 #[cfg(target_os = "android")]
 #[test]
 fn android_build_test_runs_on_device() {
     // Android 디바이스 microbench 에서만 의미. 호스트 cargo test 에서는 skip.
-    // 실 검증은 `microbench_rpcmem_smoke` (task #3 산출물) 또는 디바이스 e2e.
     eprintln!("[INV-RPCMEM-001 skeleton] Android target — 디바이스 측정 대상.");
 }

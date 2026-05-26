@@ -111,6 +111,15 @@ pub const EXT_OPENCL_SECONDARY: &str = "opencl_secondary";
 /// 반환 타입은 `&QnnOppkgBackend` 로 downcast 해서 사용한다.
 pub const EXT_QNN_OPPKG: &str = "qnn_oppkg";
 
+/// Cold-path extension key — backend-agnostic `Arc<RpcmemAllocator>` 핸들.
+///
+/// Sprint 2a Phase 2 (ENG-RPCMEM-024 / INV-RPCMEM-002) 에서 도입. OpenCL backend
+/// 가 `--opencl-rpcmem` 활성 시 본 extension 을 통해 `Arc<RpcmemAllocator>` 를
+/// expose 하며, `RpcmemSecondaryStore` loader 가 본 키로 lookup 한다. 반환
+/// 타입은 `&Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>` 로 downcast
+/// 후 clone 하여 사용한다.
+pub const EXT_RPCMEM_ALLOCATOR: &str = "rpcmem_allocator";
+
 /// §13.8-L S-L-3 — KIVI native attention dispatch 추상화.
 ///
 /// KIVI Q2/Q4/Q8 quantized KV cache 의 fused attention + residual update

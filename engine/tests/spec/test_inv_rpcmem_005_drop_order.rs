@@ -35,7 +35,8 @@ fn rpcmem_kv_buffer_holds_arc_allocator() {
     }
     let src = fs::read_to_string(&path).expect("read kv_buffer.rs");
     assert!(
-        src.contains("Arc<RpcmemAllocator>") || src.contains("Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>"),
+        src.contains("Arc<RpcmemAllocator>")
+            || src.contains("Arc<crate::memory::rpcmem::allocator::RpcmemAllocator>"),
         "INV-RPCMEM-005: kv_buffer.rs 가 Arc<RpcmemAllocator> field 를 보유해야 함."
     );
 }

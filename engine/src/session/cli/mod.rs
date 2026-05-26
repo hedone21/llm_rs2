@@ -294,6 +294,20 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub no_zero_copy: bool,
 
+    /// Sprint 2a Phase 2 (ENG-RPCMEM-040): enable rpcmem DMA-BUF zero-copy
+    /// allocation for KV cache and precision swap secondary store.
+    ///
+    /// Adreno Android only — host builds receive a warning and silently
+    /// demote. Requires `--backend opencl`. Mutually exclusive with
+    /// `--backend qnn_oppkg|qnngpu` (Sprint 2a: stderr warning + silent
+    /// demotion; Sprint 2b will remove the mutex once qnn_oppkg is gone).
+    ///
+    /// When active, OpenCL backend eagerly dlopens `libcdsprpc.so` and shares
+    /// a single `Arc<RpcmemAllocator>` between `OpenCLMemory::alloc_kv`
+    /// (KV path) and `RpcmemSecondaryStore` (precision swap secondary).
+    #[arg(long, default_value_t = false)]
+    pub opencl_rpcmem: bool,
+
     #[arg(long, default_value_t = 2048)]
     pub max_seq_len: usize,
 
@@ -1263,6 +1277,20 @@ impl Args {
         match self.kv_mode_args.kv_mode {
             KvMode::Offload => self.kv_mode_args.kv_offload_storage.clone(),
             _ => String::new(),
+        }
+    }
+
+    /// ENG-RPCMEM-041 / INV-RPCMEM-006: effective `--opencl-rpcmem` 값.
+    ///
+    /// `--backend qnn_oppkg | qnngpu` 와 동시 지정 시 `false` 를 반환한다.
+    /// `opencl_rpcmem` field 가 true 여도 이 메서드를 통해 확인해야 한다.
+    /// Sprint 2b 에서 qnn_oppkg 삭제 시 본 메서드는 `self.opencl_rpcmem` 직접 반환으로
+    /// 단순화된다.
+    pub fn effective_opencl_rpcmem(&self) -> bool {
+        if self.backend == "qnn_oppkg" || self.backend == "qnngpu" {
+            false
+        } else {
+            self.opencl_rpcmem
         }
     }
 
