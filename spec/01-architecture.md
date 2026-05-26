@@ -555,7 +555,7 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 | Layer | 책임 | 모듈 (post-migration) |
 |-------|------|---------------------|
 | **L1 Backend** | 하드웨어별 연산 구현 | `backend/{cpu,opencl,cuda_embedded,cuda_pc,qnn_oppkg}/` |
-| **L2 Abstraction** | 백엔드-독립 trait, Tensor/Buffer/DType, 공용 utility | `shared/` (engine 내부) |
+| **L2 Abstraction** | 백엔드-독립 trait, Tensor/Buffer/DType, 공용 utility | engine 직속 L2 모듈 + L2 sub-dir (arch §6.2 참조) |
 | **L3 Domain** | KV pressure 응답 / Inference forward path | `pressure/`, `inference/` |
 | **L4 Orchestration** | Decode loop, eviction/swap 트리거, IPC dispatch | `session/` |
 | **L5 Adapter** | CLI, binary entry, signal injection | `bin/` |
@@ -572,7 +572,7 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 - **Observability**: events, profile, eval, experiment, rss_trace. 모든 레이어에서 import 가능.
 - **Resilience**: signal/strategy/manager, sys_monitor, gpu_yield. L5에서 L1까지 import 가능.
 
-> **AUF 위치 결정 (2026-05-16)**: AUF(Argus Unified Format)는 cross-cutting Resilience에 속하지 않고 **L2(`shared/auf/`)**에 둔다. AUF는 GGUF/Safetensors와 동급의 가중치 포맷이며, inference 측 모델 로더와 resilience 측 weight swap이 모두 사용하는 공용 자산이기 때문이다. 상세 근거: `ARCHITECTURE.md` §13.8-A (실측 V-23).
+> **AUF 위치 결정 (2026-05-16, 2026-05-26 정정)**: AUF(Argus Unified Format)는 cross-cutting Resilience에 속하지 않고 **L2(`engine/src/auf/`, L2 sub-dir)**에 둔다. AUF는 GGUF/Safetensors와 동급의 가중치 포맷이며, inference 측 모델 로더와 resilience 측 weight swap이 모두 사용하는 공용 자산이기 때문이다. L2 디렉토리(`shared/`)는 도입하지 않으며 engine 직속 sub-dir에 위치한다 (arch §6.2 "L2 위치 정책" 참조). 상세 근거: `ARCHITECTURE.md` §13.8-A (실측 V-23).
 
 **[SYS-103]** 의존 방향은 L5 → L4 → L3 → L2 → L1 한 방향만 허용한다. 동일 레이어 내 cross-import는 모듈 간 사이클이 없는 한 허용된다. *(MUST)*
 
@@ -587,8 +587,8 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 
 | ID | 한줄 요약 |
 |----|----------|
-| INV-LAYER-001 | L1 backend는 L2(`shared/`)와 cross-cutting(`observability/`, `resilience/`) 외 import 금지. backend 사이의 cross-import는 명시적 허용 zone(예: `cpu_fallback()`)에 한해 인정. backend-aware staging pool(CUDA `layer_object_pool`, OpenCL `host_ptr_pool`)은 backend가 소유하고, pressure handler는 `WeightStagingPool` trait(L2)으로 접근한다. |
-| INV-LAYER-002 | L2 `shared/`는 L3(`pressure/`, `inference/`), L4(`session/`), L5(`bin/`) 어떤 모듈도 import 금지. backend-specific buffer/memory는 `shared/`가 아닌 `backend/<be>/buffer/`에 위치한다 (`cl_*`, `cuda_*`, `rpcmem_*`). AUF(가중치 포맷)는 `shared/auf/`에 위치한다 — backend-specific이 아닌 공용 자산이므로 L2가 적합. |
+| INV-LAYER-001 | L1 backend는 L2(engine 직속 L2 모듈 + L2 sub-dir, arch §6.2 참조)와 cross-cutting(`observability/`, `resilience/`) 외 import 금지. backend 사이의 cross-import는 명시적 허용 zone(예: `cpu_fallback()`)에 한해 인정. backend-aware staging pool(CUDA `layer_object_pool`, OpenCL `host_ptr_pool`)은 backend가 소유하고, pressure handler는 `WeightStagingPool` trait(L2)으로 접근한다. |
+| INV-LAYER-002 | L2 (engine 직속 L2 모듈 + L2 sub-dir, arch §6.2 참조)는 L3(`pressure/`, `inference/`), L4(`session/`), L5(`bin/`) 어떤 모듈도 import 금지. backend-specific buffer/memory는 L2가 아닌 `backend/<be>/buffer/`에 위치한다 (`cl_*`, `cuda_*`, `rpcmem_*`). AUF(가중치 포맷)는 L2 sub-dir `engine/src/auf/`에 위치한다 — backend-specific이 아닌 공용 자산이므로 L2가 적합. L2 디렉토리(`shared/`)는 도입하지 않으며, L2 모듈은 engine 직속 파일 또는 L2 sub-dir로 식별된다 (`scripts/layer_lint.py`의 `TOP_LEVEL_L2` set + `LAYER_RULES` prefix matching). |
 | INV-LAYER-003 | **모든 L3 도메인 쌍 사이 cross-domain concrete import 금지** (S-3b-2, 2026-05-24 일반화). 현 L3 도메인 = {`inference/`, `pressure/`, `qcf/`}. 다른 L3 도메인의 *trait* 만 import 가능, *concrete struct/enum/free fn* 금지. 도메인 노출 trait 예: `pressure/` = `CachePressureHandler`/`EvictionPolicy`/`KVCacheOps`/`WeightStagingPool`, `qcf/` = `QcfComputer`/`ImportanceCollect` 등. 도메인 어휘로 양 도메인이 동등 사용하는 data identifier 는 §13.8-G로 L2(`engine/src/qcf_types.rs` 등)에 격상. 동일 도메인 내부 cross-import는 자유(예: `inference/chat_template.rs` ↔ `inference/models/<arch>/chat_template.rs`). 예외가 불가피한 신규 패턴은 사용자 확인 후 §13.8 정책으로 추가. |
 | INV-LAYER-004 | Cross-cutting 모듈(`observability/`, `resilience/`)이 L3 도메인의 concrete type을 import할 때는 trait/Sink 경유로 한정한다. 예외는 본 절에 명시적으로 기재된 케이스(예: `events::CacheEvent` enum이 pressure 결과를 표현)에 한정. |
 | INV-LAYER-005 | L5 `bin/` 안의 production entrypoint(`generate`)는 L4 `session/`만 직접 import한다. test/microbench binary는 본 규칙 밖. `chat_ipc`는 L4(`session/chat_ipc.rs`) 책임이며 외부 IPC adapter로서 production binary가 직접 import하지 않는다. |

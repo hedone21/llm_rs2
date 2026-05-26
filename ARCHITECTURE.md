@@ -483,7 +483,7 @@ graph TB
     %% ── L2 자산 (backing + secondary) ────────────────────────
     subgraph Asset ["L2 자산 — backing + secondary"]
         AufBack["AufBacking / GgufBacking<br/>(primary weight mmap)"]
-        AufFmt["AUF format<br/>(shared/auf/*, §13.8-A,<br/>self-contained single-file)"]
+        AufFmt["AUF format<br/>(engine/src/auf/*, L2 sub-dir, §13.8-A,<br/>self-contained single-file)"]
         SecMmap["SecondaryMmap<br/>(AufSecondaryMmap /<br/>GgufSecondaryMmap, zero-copy)"]
         RpcMem["RpcmemSecondaryStore<br/>+ RpcmemLayerRegion<br/>+ HostPtrAlias<br/>(HTP↔Adreno DMA-BUF heap,<br/>M2 zero-copy interop)"]
     end
@@ -1546,9 +1546,9 @@ flowchart TB
         QcfImp["ImportanceCollector<br/>ImportanceTable<br/>DegradationEstimator"]
         QcfTraits["QcfComputer trait<br/>ImportanceCollect trait"]
     end
-    subgraph L2 ["L2 Abstraction — shared/"]
-        Trait["backend (trait), buffer (trait),<br/>tensor, memory_buf, shape"]
-        Util["thread_pool, quant,<br/>tensor_partition,<br/>qcf_types (§G shared)"]
+    subgraph L2 ["L2 Abstraction — engine 직속 + L2 sub-dir (arch §6.2)"]
+        Trait["backend (trait), buffer (trait),<br/>tensor, memory, shape"]
+        Util["thread_pool, quant, op_kind,<br/>qcf_types (§G), kv_cache_ops (§G),<br/>hybrid_attention (§G), cpu_kernels,<br/>partition_workspace, instrument,<br/>auf/ (L2 sub-dir), buffer/ (L2 sub-dir),<br/>qcf/ (L2 sub-dir)"]
     end
     subgraph L1 ["L1 Backend — backend/"]
         CPU["cpu (Neon, AVX)"]
@@ -1673,13 +1673,13 @@ session/
 |----------|--------|------|
 | `bin/generate.rs` | `bin/generate.rs` (thin, ≤400 LOC) + `session/` 디렉토리 전체 (위 트리) | 13,022 LOC monolith 분리. trait/구현체 통일 위치 = `session/`. `bin/generate.rs::run_chat_repl` + `ChatTurnExec` trait → `session/chat/` 신규 재작성으로 폐기 [Task #4 finalize 2026-05-16] |
 | `bin/{test_backend,test_model,signal_injector,microbench_*}.rs` | `bin/` (그대로) | |
-| `core/backend.rs` | `shared/backend.rs` | trait 정의 |
-| `core/tensor.rs`, `core/buffer.rs`, `core/shape.rs`, `core/memory.rs` | `shared/{tensor,buffer,shape,memory_buf}.rs` | `core/memory.rs` → `memory_buf.rs` (재이름) |
-| `core/quant.rs` | `shared/quant.rs` | |
-| `core/thread_pool.rs` | `shared/thread_pool.rs` | |
-| `core/qcf/` | `shared/qcf/` | 양 도메인 공용 metric |
+| `core/backend.rs` | `engine/src/backend.rs` (L2 직속) | trait 정의 |
+| `core/tensor.rs`, `core/buffer.rs`, `core/shape.rs`, `core/memory.rs` | `engine/src/{tensor,buffer,shape,memory}.rs` (L2 직속, `buffer/` L2 sub-dir 포함) | `core/memory.rs`는 `memory.rs`로 (재이름 보류 — 현 위치는 `engine/src/memory.rs`) |
+| `core/quant.rs` | `engine/src/quant.rs` (L2 직속) | |
+| `core/thread_pool.rs` | `engine/src/thread_pool.rs` (L2 직속) | |
+| `core/qcf/` | `engine/src/qcf/` (L2 sub-dir) | 양 도메인 공용 metric 측정 로직 owner (data identifier는 `qcf_types.rs`로 분리 — §G S-3b-1) |
 | `core/sampling.rs`, `core/skip_config.rs`, `core/speculative.rs`, `core/attention_scores.rs` | `inference/{sampling,skip_config,speculative,attention_scores}.rs` | |
-| `core/math_utils.rs` | `shared/math_utils.rs` | |
+| `core/math_utils.rs` | `engine/src/math_utils.rs` (L2 직속, 신설 시) | |
 | `core/chat_template.rs` | **generic 부분**: `inference/chat_template.rs`<br/>**모델별 구현체**: `inference/models/<arch>/chat_template.rs` (예: llama) | 모델별 special token/포맷 분리. V-11 해소 (chat→ModelArch가 동일 도메인 internal) [§13.8-C] |
 | `core/chat_ipc.rs` | `session/chat_ipc.rs` | L4 IPC adapter [§13.8-C] |
 | `core/kv_cache.rs`, `core/kivi_cache.rs`, `core/kv_migrate.rs` | `pressure/state/{kv_cache,kivi_cache,kv_migrate}.rs` | |
@@ -1690,25 +1690,25 @@ session/
 | `core/sys_monitor.rs` | `resilience/sys_monitor.rs` | |
 | `core/gpu_yield.rs` | `resilience/gpu_yield.rs` | |
 | `core/events.rs`, `core/rss_trace.rs` | `observability/{events,rss_trace}.rs` | |
-| `layers/` | `inference/layers/` | 단 `tensor_partition.rs`는 `shared/tensor_partition/`으로 |
-| `layers/tensor_partition.rs` | `shared/tensor_partition.rs` | 백엔드 분할 = L2 책임 |
+| `layers/` | `inference/layers/` | 단 `tensor_partition.rs`는 `engine/src/tensor_partition/` (L2 sub-dir)으로 |
+| `layers/tensor_partition.rs` | `engine/src/tensor_partition.rs` (L2 직속, TBD) | 백엔드 분할 = L2 책임. `PartitionWsCell`/`PartitionWorkspace`는 §G B-5a `engine/src/partition_workspace.rs`로 격상 완료 |
 | `models/` | `inference/models/` | 단, `weights/`는 `pressure/policy/handlers/weight_swap/`으로 분리 |
 | `models/weights/` (handler 군) | `pressure/policy/handlers/weight_swap/` | swap_executor, async_swap, release_worker, phase_aware_swap, intra_forward_swap |
 | `models/weights/{slot,secondary_mmap,rpcmem_secondary}.rs` | `pressure/state/weight_slot/` | State 측면 (Arc<LayerWeights> snapshot) |
 | `models/weights/layer_object_pool.rs` | **`backend/cuda_embedded/pool.rs`** (and/or `backend/cuda_pc/pool.rs`) | CUDA host-pinned pool은 CUDA backend 자원. pressure가 `WeightStagingPool` trait으로 접근. V-27 해소 [§13.8-B] |
 | `backend/opencl/host_ptr_pool.rs` | `backend/opencl/host_ptr_pool.rs` (그대로) | 이미 backend/ 산하 [§13.8-B] |
 | `backend/` | `backend/` (그대로) | |
-| `buffer/{shared_buffer,slice_buffer,mmap_buffer,unified_buffer,borrowed_mmap_buffer}.rs` | `shared/buffer/{...}.rs` | generic buffer만 L2 유지 [§13.8-D] |
+| `buffer/{shared_buffer,slice_buffer,mmap_buffer,unified_buffer,borrowed_mmap_buffer}.rs` | `engine/src/buffer/{...}.rs` (L2 sub-dir) | generic buffer만 L2 유지 [§13.8-D] |
 | `buffer/{cl_sub_buffer,cl_wrapped_buffer}.rs` | `backend/opencl/buffer/{cl_sub_buffer,cl_wrapped_buffer}.rs` | V-08 해소 [§13.8-D] |
 | `buffer/host_ptr_pool_buffer.rs` | `backend/opencl/buffer/host_ptr_pool_buffer.rs` | V-07 해소 (HostPtrPoolGuard와 한 폴더) [§13.8-D] |
 | `buffer/cuda_buffer.rs`, `buffer/cuda_mmap_alias_buffer.rs` | `backend/cuda_embedded/buffer/` 및/또는 `backend/cuda_pc/buffer/` | 두 CUDA backend 공유 시 `backend/cuda_common/buffer/` 신설 후보 (Step 3 실측 후 확정) [§13.8-D] |
 | `buffer/rpcmem_alias_buffer.rs` | `backend/qnn_oppkg/buffer/rpcmem_alias_buffer.rs` | V-08 해소 [§13.8-D] |
-| `memory/galloc.rs` | `shared/memory_alloc.rs` (Galloc) | L2 Memory impl |
+| `memory/galloc.rs` | `engine/src/memory_alloc.rs` (L2 직속, Galloc) | L2 Memory impl |
 | `profile/` | `observability/profile/` | |
 | `eval/` | **`session/eval/`** | V-16/V-28/V-29 해소. L3 의존 다수 + backend instantiate 본질 → L4 격상. [§13.8-I] |
 | `experiment.rs` | `observability/experiment.rs` | |
 | `resilience/` | `resilience/` (그대로) | |
-| `auf/` | **`shared/auf/`** | V-23 해소. AUF는 GGUF/Safetensors 동급 가중치 포맷이므로 L2 자산 [§13.8-A] |
+| `auf/` | **`engine/src/auf/`** (L2 sub-dir) | V-23 해소. AUF는 GGUF/Safetensors 동급 가중치 포맷이므로 L2 자산 [§13.8-A] (RESOLVED `5ddc66bf`) |
 
 ### 13.5 Violations (실측, HEAD `d8f26156`)
 
@@ -1717,16 +1717,16 @@ session/
 | # | 파일 (위반 측) | Import 대상 | 위반 종류 | 해결 방향 |
 |---|--------------|------------|----------|----------|
 | **V-01** | `backend/opencl/mod.rs:16` | `crate::resilience::gpu_self_meter::OpenClEventGpuMeter` | L1→Cross-cutting concrete (역방향 → trait 경유 필요) | `OpenClEventGpuMeter`를 `Backend` trait 외부의 별도 trait(`GpuEventMeter`)로 추출, OpenCL backend가 register 인터페이스 노출 |
-| **V-02** | `backend/opencl/plan.rs:17,21` | `crate::layers::tensor_partition::*`, `crate::layers::workspace::PartitionWsCell` | L1→L3 (Inference 도메인 import) | tensor_partition을 L2(`shared/`)로 이동 (13.4 매핑 완료) + `PartitionWsCell`도 L2로 추출 (현재 layers/workspace 안에 있음). **§13.8-J dispatch orchestrator zone 적용 예정 (B-5a sprint)**: tensor_partition 정책 함수 호출은 `build_partition_plan` zone marker로 baseline 제외. `PartitionWsCell`/`PartitionWorkspace`는 §13.8-G shared identifier promotion으로 `inference/partition_workspace.rs` 이동 (`RESOLVED partial: B-5a, HEAD `232d45ec` (PartitionWs L2) + `98293b25` (Policy snapshot + zone marker). 잔존 1건 plan.rs:17 multi-item use (PartitionContext 함수 시그니처 의존)는 후속 sprint`). |
+| **V-02** | `backend/opencl/plan.rs:17,21` | `crate::layers::tensor_partition::*`, `crate::layers::workspace::PartitionWsCell` | L1→L3 (Inference 도메인 import) | tensor_partition을 L2(engine 직속, `engine/src/tensor_partition/`)로 이동 (13.4 매핑 완료) + `PartitionWsCell`도 L2로 추출 (현재 layers/workspace 안에 있음). **§13.8-J dispatch orchestrator zone 적용 예정 (B-5a sprint)**: tensor_partition 정책 함수 호출은 `build_partition_plan` zone marker로 baseline 제외. `PartitionWsCell`/`PartitionWorkspace`는 §13.8-G shared identifier promotion으로 `inference/partition_workspace.rs` 이동 (`RESOLVED partial: B-5a, HEAD `232d45ec` (PartitionWs L2) + `98293b25` (Policy snapshot + zone marker). 잔존 1건 plan.rs:17 multi-item use (PartitionContext 함수 시그니처 의존)는 후속 sprint`). |
 | **V-03** | `backend/qnn_oppkg/graph_cache.rs:17`, `mod.rs:35`, `layer_graph.rs:41` | `crate::models::weights::LayerSlot`, `crate::layers::transformer_layer::TransformerLayer` | L1→L3 (Inference type 직접 의존) | LayerSlot/TransformerLayer를 trait-defined opaque handle로 추상화, backend는 trait만 import |
 | **V-04** | `backend/qnn_oppkg/mod.rs:134,140`, `backend/qnn_oppkg/hybrid_memory.rs:13`, `backend/qnn_oppkg/memory.rs:19` | `crate::backend::opencl::OpenCLBackend` | L1↔L1 cross-backend import | qnn_oppkg가 OpenCL primitive를 빌려쓰는 경로(`with_opencl()`) — L2에 공용 GPU buffer trait/utility 추출 검토 |
 | **V-05** | `backend/cuda_pc/mod.rs:597`, `backend/cuda_embedded/mod.rs:1249` | `crate::backend::cpu::CpuBackend` | L1↔L1 (cpu_fallback path) | 각 backend 안의 `cpu_fallback()`은 동일한 패턴 — L2에 `CpuFallback` 어댑터 trait 추출 |
 | **V-06** | `backend/cpu/x86.rs:2`, `backend/cpu/neon.rs:1` | `crate::backend::cpu::common::CpuBackendCommon` | L1↔L1 (cpu 내부) | 동일 backend 내부 모듈 의존이므로 위반 아님 (cpu 하위 모듈 사이 cross-import 허용) |
 | **V-07** | `buffer/host_ptr_pool_buffer.rs:25` | `crate::backend::opencl::host_ptr_pool::HostPtrPoolGuard` | L2→L1 (역방향) | `HostPtrPoolGuard`는 OpenCL backend 내부 자원의 RAII guard — `buffer/`를 L2 abstraction과 backend-specific impl로 분리 (host_ptr_pool_buffer는 `backend/opencl/buffer/`로 이관) |
-| **V-08** | `buffer/cuda_buffer.rs`, `buffer/cuda_mmap_alias_buffer.rs`, `buffer/rpcmem_alias_buffer.rs`, `buffer/cl_sub_buffer.rs`, `buffer/cl_wrapped_buffer.rs` | (자체 import는 OK, 사용처가 backend) | 같은 패턴: backend-specific buffer가 `buffer/`에 있음 | backend-specific buffer는 `backend/<be>/buffer/`로 이관, generic buffer(`shared_buffer`, `mmap_buffer`, `slice_buffer`, `unified_buffer`)만 `shared/buffer/`에 남김 |
+| **V-08** | `buffer/cuda_buffer.rs`, `buffer/cuda_mmap_alias_buffer.rs`, `buffer/rpcmem_alias_buffer.rs`, `buffer/cl_sub_buffer.rs`, `buffer/cl_wrapped_buffer.rs` | (자체 import는 OK, 사용처가 backend) | 같은 패턴: backend-specific buffer가 `buffer/`에 있음 | backend-specific buffer는 `backend/<be>/buffer/`로 이관, generic buffer(`shared_buffer`, `mmap_buffer`, `slice_buffer`, `unified_buffer`)만 L2 sub-dir `engine/src/buffer/`에 남김 |
 | **V-09** | `buffer/cuda_mmap_alias_buffer.rs:22`, `buffer/rpcmem_alias_buffer.rs:25`, `buffer/host_ptr_pool_buffer.rs:27`, `buffer/borrowed_mmap_buffer.rs:19` | `crate::models::weights::SecondaryMmap` | L2→L3 (Pressure state 의존) | `SecondaryMmap`을 L2의 mmap-backed file source trait(`SecondaryStore` 등)으로 추상화 — 구현은 pressure/에 남기되 buffer는 trait만 import |
 | **V-10** | `pressure/cache_manager.rs:13` | `crate::resilience::EvictMethod` | L3→Cross-cutting concrete | **EvictMethod → `pressure/eviction/method.rs`로 이동 (definitional owner = pressure 도메인). `resilience/executor.rs`는 §13.8-F enum-as-data identifier 예외로 허용.** [§13.8-F] |
-| **V-11** | `core/chat_template.rs:1` | `crate::models::config::ModelArch` | L3 state→L3 inference (도메인 cross) | `ModelArch` enum을 `shared/` 또는 `session/`(IPC 용)으로 이동 |
+| **V-11** | `core/chat_template.rs:1` | `crate::models::config::ModelArch` | L3 state→L3 inference (도메인 cross) | `ModelArch` enum을 L2(`engine/src/`) 또는 `session/`(IPC 용)으로 이동 |
 | **V-12** | `core/events.rs:7` | `crate::core::pressure::{ActionResult, PressureLevel}` | Cross-cutting(observability) → L3 (Pressure concrete) | events.rs는 L3 변경 사항을 표현해야 하므로 의존 자체는 허용. 단 events가 L3 trait의 출력 채널이 되도록 EventSink trait을 통한 inversion 강화 |
 | **V-13** | `core/kivi_cache.rs:19,1568,1863,2128` | `crate::backend::cpu::CpuBackend`, `crate::backend::opencl::{OpenCLBackend, get_cl_mem}` | L3→L1 (state가 backend impl 직접 의존) | KiviCache 내부의 `Arc<dyn Backend>` 의존을 trait 기반으로 유지, downcast 경로는 backend 측에 위임하는 helper trait 추가 |
 | **V-14** | `core/kivi_cache.rs:803`, `core/sampling.rs:131`, `core/qcf/layer_importance.rs:75`, `core/qcf/unified_qcf.rs:178`, `models/weights/decider.rs:262` | `crate::profile::quality_metrics::Timer/QCF_*` | L3/L2 → Cross-cutting(observability) concrete | B-2b sprint에서 `qcf_timer!` 매크로 + cfg gate(`profile` feature)로 해소. §13.8-H instrument macro helper 정책 적용. 매크로는 `engine/src/instrument.rs`(L2)에 정의, 사용처는 매크로만 import. [§13.8-H] |
@@ -1735,13 +1735,13 @@ session/
 | **V-17** | `layers/attention.rs:261` (test), `layers/workspace.rs:548` (test), `layers/transformer_layer/forward*.rs` 다수 | `crate::backend::cpu::neon::*`, `crate::backend::opencl::{OpenCLBackend, get_cl_mem}`, `crate::backend::cuda_embedded::CudaBackend` (downcast) | L3→L1 (Inference가 backend impl 직접 의존) | downcast 경로는 backend 측에서 capability trait 노출 (예: `as_opencl(&self) -> Option<&OpenCLOps>`). NEON 직접 호출은 backend method로 재흡수 (Backend trait에 적절한 method 추가) |
 | **V-18** | `layers/transformer_layer/mod.rs:12,21`, `layers/transformer_layer/forward.rs:17,65,78,1196,1303` | `crate::memory::galloc::Galloc`, `crate::profile::ops::{OpProfiler, PrefillOpProfiler}` | L3→Cross-cutting (Galloc 자체는 L2 Memory impl, OpProfiler는 observability) | **OpProfiler/PrefillOpProfiler 부분**: B-2d sprint에서 `OpInstrument` trait + trait object로 해소 (정통 trait inversion, §13.8-H 무관 — struct 보유 vs hot-path RAII는 별도 패턴). **Galloc 부분**: 별도 backlog(B-2 scope 외). |
 | **V-19** | `layers/tensor_partition.rs:1,196,196` | `crate::buffer::slice_buffer::SliceBuffer`, `crate::buffer::cl_sub_buffer::ClSubBuffer` | L3→L2 + L1 | tensor_partition을 L2로 이동하면 V-19의 첫번째는 OK, 두번째(ClSubBuffer)는 backend-specific이므로 backend trait의 sub-buffer interface로 추상화 |
-| **V-20** | `models/transformer.rs:19,45,56,337,...,3556~3617` | `crate::backend::opencl::{plan::FullKernelPlan, OpenCLBackend, NoshuffleSoaEntry, get_cl_mem, plan::*}`, `crate::backend::cuda_embedded::CudaBackend`, `crate::auf::{reader::LmHeadPayload, section::*, tensor_index::*}` | L3→L1 다수 + L3→Cross-cutting | `TransformerModel`이 plan 구성과 backend downcast를 직접 수행 — L4(`session/`)에서 plan을 build해서 model에 주입하는 inversion 필요. AUF 의존은 §13.8-A(RESOLVED, `shared/auf/`) 이동 후 L3→L2 정상 의존이 됨 |
+| **V-20** | `models/transformer.rs:19,45,56,337,...,3556~3617` | `crate::backend::opencl::{plan::FullKernelPlan, OpenCLBackend, NoshuffleSoaEntry, get_cl_mem, plan::*}`, `crate::backend::cuda_embedded::CudaBackend`, `crate::auf::{reader::LmHeadPayload, section::*, tensor_index::*}` | L3→L1 다수 + L3→Cross-cutting | `TransformerModel`이 plan 구성과 backend downcast를 직접 수행 — L4(`session/`)에서 plan을 build해서 model에 주입하는 inversion 필요. AUF 의존은 §13.8-A(RESOLVED, `engine/src/auf/` L2 sub-dir) 이동 후 L3→L2 정상 의존이 됨 |
 | **V-21** | `models/transformer.rs:9` | `crate::core::offload::preload_pool::{self, PreloadPool}` | L3→L3 (Inference→Pressure State) | preload_pool은 Pressure State에 속함. TransformerModel이 직접 import할 게 아니라 L4에서 inject |
 | **V-22** | `models/transformer.rs:158,1447,1478,1489,1860,1871,1881,1911`, `core/qcf/layer_importance.rs:75-102`, `core/sampling.rs:131` | `crate::profile::ops::OpProfiler`, `crate::profile::op_trace::*`, `crate::profile::quality_metrics::Timer` | L3→Cross-cutting (profiling) | 3 패턴 혼합 해소. **`op_trace::*` 부분**: B-2c sprint `op_span!` 매크로 + `OpKind` enum L2 격상 (§13.8-G shared identifier promotion + §13.8-H instrument macro helper 적용). **`OpProfiler` 부분**: B-2d sprint `OpInstrument` trait inversion. **`Timer` 부분**: B-2b sprint `qcf_timer!` 매크로 (§13.8-H). [§13.8-G/H] |
-| **V-23** | `models/transformer.rs:644,3556,3586,3615`, `models/weights/secondary_mmap.rs:26,729,940,944,...`, `buffer/borrowed_mmap_buffer.rs:120,216`, `models/weights/rpcmem_secondary.rs:46+` | `crate::auf::{reader::*, section::*, header::*, tensor_index::*, AufError, AufView, AufMeta, BackendTag}` | L3→Cross-cutting / 또는 일반 가중치 포맷 | **AUF가 resilience 전용이 아닌 일반 모델 로딩에 쓰이고 있음** — §13.8-A에서 `shared/auf/`로 이동 결정(RESOLVED). 이동 후 L3→L2 정상 의존이 되어 V-23 해소 |
-| **V-24** | `core/pressure/weight_swap_handler.rs:21,22,23,136,175,192` | `crate::models::config::ModelConfig`, `crate::models::weights::{LayerSlot, SecondaryMmap, swap_executor::SwapExecutor}`, `crate::backend::cpu::CpuBackend`, `crate::memory::galloc::Galloc` | L3 Pressure↔Inference (현재 구조)에서 보면 cross-domain. **재정의(13.2) 후엔 동일 도메인 Pressure 내부 import**이지만 ModelConfig는 inference-side 의존이라 잔존 위반 | ModelConfig를 `shared/config.rs`로 이동 + LayerSlot/SecondaryMmap은 `pressure/state/`로 이동 |
+| **V-23** | `models/transformer.rs:644,3556,3586,3615`, `models/weights/secondary_mmap.rs:26,729,940,944,...`, `buffer/borrowed_mmap_buffer.rs:120,216`, `models/weights/rpcmem_secondary.rs:46+` | `crate::auf::{reader::*, section::*, header::*, tensor_index::*, AufError, AufView, AufMeta, BackendTag}` | L3→Cross-cutting / 또는 일반 가중치 포맷 | **AUF가 resilience 전용이 아닌 일반 모델 로딩에 쓰이고 있음** — §13.8-A에서 `engine/src/auf/` (L2 sub-dir)로 이동 결정(RESOLVED). 이동 후 L3→L2 정상 의존이 되어 V-23 해소 |
+| **V-24** | `core/pressure/weight_swap_handler.rs:21,22,23,136,175,192` | `crate::models::config::ModelConfig`, `crate::models::weights::{LayerSlot, SecondaryMmap, swap_executor::SwapExecutor}`, `crate::backend::cpu::CpuBackend`, `crate::memory::galloc::Galloc` | L3 Pressure↔Inference (현재 구조)에서 보면 cross-domain. **재정의(13.2) 후엔 동일 도메인 Pressure 내부 import**이지만 ModelConfig는 inference-side 의존이라 잔존 위반 | ModelConfig를 L2(`engine/src/model_config.rs`)로 격상 (§13.8-G CANDIDATE, 2026-05-26 등록) + LayerSlot/SecondaryMmap은 `pressure/state/`로 이동 |
 | **V-25** | `models/weights/swap_executor.rs:55,57,58,2139,2146,2410`, `models/weights/intra_forward_swap.rs:43`, `models/weights/phase_aware_swap.rs:33` | `crate::layers::transformer_layer::TransformerLayer`, `crate::models::loader::gguf::*`, `crate::models::transformer::TransformerModel`, `crate::backend::opencl::host_ptr_pool::HostPtrPool`, `crate::profile::op_trace::*` | L3 Pressure→L3 Inference + L3→L1 + L3→Cross-cutting | swap_executor는 layer/transformer로의 mutation을 trait(`SwapTarget`)으로 추상화 — `TransformerModel`이 trait을 impl, executor는 trait만 알면 됨 |
-| **V-26** | `models/weights/decider.rs:20` | `crate::core::qcf::layer_importance::{ImportanceTable, SubLayer}` | L3 Pressure→L2 (QCF) | qcf가 shared/로 이동하면 L2 의존이라 위반 없음. 현 구조에서는 도메인 cross 아님 |
+| **V-26** | `models/weights/decider.rs:20` | `crate::core::qcf::layer_importance::{ImportanceTable, SubLayer}` | L3 Pressure→L2 (QCF) | qcf가 L2 sub-dir(`engine/src/qcf/`)로 이동했으므로 L2 의존이라 위반 없음. 현 구조에서는 도메인 cross 아님 |
 | **V-27** | `models/weights/layer_object_pool.rs:32,37,124` | `crate::buffer::cuda_buffer::*`, `crate::layers::transformer_layer::TransformerLayer`, downcast `crate::backend::cuda_embedded::CudaBackend` | L3 Pressure→L1 + L3 Pressure→L3 Inference | weight pool은 backend-aware concrete이므로 backend별로 분기된 hook 구조로 재설계 |
 | **V-28** | `eval/qcf_helpers.rs:9`, `eval/eval_loop.rs:23`, `eval/eviction_hook.rs:9,10,11` | `crate::models::weights::QuantNoiseTable`, `crate::models::transformer::{TransformerModel,...}`, `crate::core::cache_manager::CacheManager`, `crate::core::kv_cache::{KVCache, max_cache_pos}`, `crate::core::qcf::*` | Cross-cutting(observability)→L3 (다수) | eval은 L3에 의존할 수밖에 없는 진단/평가 코드 — L4 `session/eval/`로 격상 후 L3 trait만 의존. **RESOLVED (B-4, HEAD `ae3a1d42`)** |
 | **V-29** | `eval/eviction_hook.rs:319` | downcast `crate::backend::opencl::OpenCLBackend` | Cross-cutting→L1 (직접 downcast) | V-16과 동일. **RESOLVED (B-4, HEAD `ae3a1d42`)** |
@@ -1771,14 +1771,14 @@ session/
 - V-04 (qnn_oppkg→opencl cross-backend), V-05 (cpu_fallback 백엔드끼리 의존) — 동일 layer 내 cross 패턴
 - V-13 (KiviCache가 OpenCLBackend 직접 downcast) — L3 State가 L1 concrete
 - V-17 (layers가 NEON 직접 호출) — Backend trait 우회 (INV-012 위반 가능)
-- V-23 (AUF가 일반 모델 로딩에 사용) — `auf/` 위치 합의(`resilience/auf/`) 재검토 필요
+- V-23 (AUF가 일반 모델 로딩에 사용) — `auf/` 위치 합의(`resilience/auf/`) 재검토 필요 → RESOLVED `5ddc66bf` L2 sub-dir `engine/src/auf/`
 - V-27 (layer_object_pool이 CudaBackend downcast)
 
 **Resolution Log** (Migration Step 3 진행 결과, 2026-05-20 기준):
 
 | V-?? | HEAD | 해소 방법 | 잔존 |
 |---|---|---|---|
-| **V-23** | `5ddc66bf` (Step 3-A) | `auf/` → `shared/auf/` 이동, `dtype_convert.rs`는 engine 의존성 보존 위해 `auf_dtype_convert.rs`로 분리 | 없음 |
+| **V-23** | `5ddc66bf` (Step 3-A) | `auf/` → `engine/src/auf/` (L2 sub-dir) 이동, `dtype_convert.rs`는 engine 의존성 보존 위해 `auf_dtype_convert.rs`로 분리 | 없음 |
 | **V-07** | `c2cb436f` (Step 3-D-b) | `buffer/host_ptr_pool_buffer.rs` → `memory/opencl/host_ptr_pool_buffer.rs`. 단 `HostPtrPoolGuard` import 1건은 L2→L1 잔존 | 1건 (backlog: backend trait 추출 필요) |
 | **V-08** | `c2cb436f` (Step 3-D-b) | backend-specific buffer를 `memory/<resource>/`로 일괄 이동 (`memory/opencl/`, `memory/cuda/`, `memory/rpcmem/`). 위치는 L2 유지하되 grouping이 물리 메모리 자원 기준이 됨 | 없음 (path-only 갱신) |
 | **V-09** | `fc6baee8` (Step 3-E) | `memory/secondary.rs`에 `SecondaryMmapBytes` (1 method) + `RpcmemRegionGuard` (marker) trait 신설. 4개 lifetime-guard 호출처는 `Arc<dyn MmapKeepAlive>`로 erasure, cuda/mmap.rs는 `SecondaryMmapBytes::raw_bytes()` 호출. **5건 해소** | 없음 |
@@ -1814,14 +1814,14 @@ session/
 
 | 작업 | 진입 모듈 | 의존해야 하는 것 |
 |------|---------|----------------|
-| **새 백엔드 추가** (예: Metal, Vulkan) | `backend/<name>/mod.rs` | `shared::backend::Backend` trait, `shared::buffer::Buffer` trait, `shared::memory_buf::Memory` trait |
-| **새 양자화 추가** (예: Q5_K, Q6_K) | `shared/quant.rs` + `backend/<be>/` 안 dequant kernel | `shared::buffer::DType` enum 확장 |
+| **새 백엔드 추가** (예: Metal, Vulkan) | `backend/<name>/mod.rs` | `crate::backend::Backend` trait, `crate::buffer::Buffer` trait, `crate::memory::Memory` trait (L2 직속) |
+| **새 양자화 추가** (예: Q5_K, Q6_K) | `engine/src/quant.rs` (L2 직속) + `backend/<be>/` 안 dequant kernel | `crate::buffer::DType` enum 확장 |
 | **새 eviction 정책 추가** | `pressure/policy/eviction/<name>.rs` | `pressure::policy::eviction::EvictionPolicy` trait, `pressure::state::kv_cache::KVCache` |
 | **새 pressure handler 추가** (예: compression scheme) | `pressure/policy/handlers/<name>_handler.rs` | `pressure::policy::pressure::CachePressureHandler` trait |
 | **새 sampling 방법 추가** | `inference/sampling.rs` 확장 | `shared::backend::Backend`만 |
-| **새 모델 아키텍처 추가** (예: Mistral) | `inference/models/<name>/` + `inference/models/mappers/<name>.rs` | `inference/layers::transformer_layer::TransformerLayer`, `shared::config::ModelConfig` |
+| **새 모델 아키텍처 추가** (예: Mistral) | `inference/models/<name>/` + `inference/models/mappers/<name>.rs` | `inference/layers::transformer_layer::TransformerLayer`, `crate::model_config::ModelConfig` (§G CANDIDATE 격상 후) |
 | **새 CLI 모드** | `session/<mode>.rs` (new) + `bin/<mode>.rs` (thin) | `session::DecodeSession` 또는 신규 session struct |
-| **새 manager 신호 종류** | `shared/` 크레이트 + `resilience/signal.rs` + `resilience/strategy/<name>.rs` | `shared::SystemSignal` enum 확장 |
+| **새 manager 신호 종류** | workspace `shared/` 크레이트 (`llm_shared`, 별 crate) + `resilience/signal.rs` + `resilience/strategy/<name>.rs` | `shared::SystemSignal` enum 확장 |
 | **새 observability sink** | `observability/events.rs::EventSink` 구현 | `observability::events::CacheEvent` |
 | **새 weight swap 정책** | `pressure/policy/handlers/weight_swap/<name>.rs` | `WeightSwapTarget` trait (TBD) |
 
@@ -1863,24 +1863,24 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - **v1-2 ~ v1-6 pending**: prompt-batch / swap / profile / KIVI+Offload (`--kv-mode`) / tensor-partition.
 - 본 갈래는 §13.7 Step 2 ~ Step 5 와 직교 — argus-cli 흡수 완료 후에도 legacy generate 는 보존 (다수 바이너리 분할 방향).
 
-**Step 3: L1/L2 경계 정리** (backend impl이 `shared/` 외 import 제거 + backend-specific buffer/pool/포맷 재배치)
+**Step 3: L1/L2 경계 정리** (backend impl이 L2 (engine 직속 + L2 sub-dir) 외 import 제거 + backend-specific buffer/pool/포맷 재배치)
 
 **진행 현황 (2026-05-20 기준)**: 본 Step은 plan 재설계(B안, `/home/go/.claude/plans/proud-strolling-whale.md`)를 거쳐 6 sub-sprint(3-A → 3-D-a → 3-D-b → 3-D-c → 3-B + 3-E → 3-F)로 분할 진행. 5개 sub-sprint 완료, baseline 309 → 286(-23). INV-LAYER-002 9건 → 1건. 잔존: V-07(`HostPtrPoolGuard` import), V-19 본질(tensor_partition L3→L1), V-25(HostPtrPool downcast) — backlog 등록.
 
 - V-01 (opencl→gpu_self_meter): trait inversion (`GpuEventMeter` trait 신설) — **TODO** (backlog)
-- V-02 (opencl→layers): tensor_partition을 `shared/`로 이동 (먼저 위치만, 로직은 그대로) — **TODO** (V-19와 함께 backlog)
+- V-02 (opencl→layers): tensor_partition을 L2(`engine/src/tensor_partition/`)로 이동 (먼저 위치만, 로직은 그대로) — **TODO** (V-19와 함께 backlog)
 - V-03 (qnn_oppkg→models): LayerSlot을 trait 기반 handle로 변환 — **TODO** (backlog)
-- V-04 (qnn_oppkg→opencl), V-05 (cpu_fallback): `shared/`에 `GpuInteropTrait`/`CpuFallback` 도입 또는 명시적 cross-backend 허용 zone 정의 — **TODO** (backlog)
+- V-04 (qnn_oppkg→opencl), V-05 (cpu_fallback): L2에 `GpuInteropTrait`/`CpuFallback` 도입 또는 명시적 cross-backend 허용 zone 정의 — **TODO** (backlog)
 - **§13.8-D**: backend-specific buffer 일괄 이동 — **RESOLVED** (3-D-a `3afafa06` dead code 삭제 + MmapBuffer 통합, 3-D-b `c2cb436f` `memory/<resource>/` 신설로 backend → memory 이전. B안 적용: `backend/<be>/buffer/` 대신 `memory/<resource>/` 사용, 의미적으로 더 적합 — rpcmem은 OpenCL/QNN 공유 자원이고 CUDA buffer는 cuda_embedded/cuda_pc 공유). V-08 path 갱신, V-19 일부(import path)
 - **§13.8-B**: `WeightStagingPool` trait — **RESOLVED** (3-B `56074264`). 단 `layer_object_pool.rs`는 위치 유지(파일 이동 시 신규 L1→L3 import 위반 발생), `Backend::bind_current_thread()` default method + CudaBackend override + `engine/src/layers/staging_pool.rs` 신설로 downcast 제거. V-27 해소
-- **§13.8-A**: `auf/` → `shared/auf/` — **RESOLVED** (3-A `5ddc66bf`). V-23 해소
+- **§13.8-A**: `auf/` → `engine/src/auf/` (L2 sub-dir) — **RESOLVED** (3-A `5ddc66bf`). V-23 해소
 - **§3-E (V-09 추가)**: `memory/secondary.rs` 신설 (`SecondaryMmapBytes` + `RpcmemRegionGuard` trait) — **RESOLVED** (3-E `fc6baee8`). 4 lifetime-guard 호출처를 `Arc<dyn MmapKeepAlive>`로 erasure. V-09 5건 해소
 - **§3-F (검증·문서)**: baseline JSON 전면 갱신 (305→286 entries) + ARCHITECTURE.md §13.5 Resolution Log 추가 + §13.7 진행 현황 갱신 — **RESOLVED** (3-F, 본 commit)
 
 **Step 4: L3 재배치** (`core/` → `pressure/`, `inference/` rename only)
 - `core/{kv_cache, kivi_cache, kv_migrate, cache_manager, eviction, pressure, offload}` → `pressure/`
 - `models/`, `layers/` → `inference/`
-- `core/{backend, tensor, buffer, memory, shape, quant, thread_pool, qcf, sampling, math_utils, skip_config, speculative, attention_scores}` → 분류에 따라 `shared/` 또는 `inference/`
+- `core/{backend, tensor, buffer, memory, shape, quant, thread_pool, qcf, sampling, math_utils, skip_config, speculative, attention_scores}` → 분류에 따라 L2(engine 직속 또는 L2 sub-dir, §6.2) 또는 `inference/`
 - **§13.8-C**: `core/chat_template.rs` → `inference/chat_template.rs` (generic) + `inference/models/<arch>/chat_template.rs` (모델별 구현체로 분배). V-11 해소
 - `weight_swap_handler.rs` 안의 `models::weights::*` import는 동일 도메인(Pressure) import로 자연 해결 — 같이 이동
 - rename only, 로직 변경 없음. clippy/test pass
@@ -1889,7 +1889,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - `core/events.rs`, `core/rss_trace.rs`, `profile/`, `eval/`, `experiment.rs` → `observability/`
 - `core/sys_monitor.rs`, `core/gpu_yield.rs` → `resilience/`
 - `OpProfiler` 등 cross-cutting concrete 의존을 trait inversion으로 정리 (V-14, V-18, V-22)
-- (`auf/`는 Step 3에서 이미 `shared/auf/`로 이동 완료 — 본 단계 제외)
+- (`auf/`는 Step 3에서 이미 `engine/src/auf/` L2 sub-dir로 이동 완료 — 본 단계 제외)
 
 **Step 6: (별도)** `/simplify` 코드 정리 — orphan import, dead code, 미사용 의존 제거
 
@@ -1899,19 +1899,19 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 
 본 절은 §13 마이그레이션 진입 전 결정해야 할 항목(원래 §UNRESOLVED-A~E)에 대한 **최종 결정**과, 마이그레이션 진행 중 발견된 추가 정책 (§F~§P, §M) 을 기록한다. 첫 5건 결정 시점: 2026-05-16. 모든 항목 RESOLVED. §M 은 M sprint (2026-05-25) 산출.
 
-**§A — AUF 위치: RESOLVED (shared/auf/)**
-- **결정**: `auf/` → **`shared/auf/`**.
-- **근거**: V-23(`ARCHITECTURE.md` §13.5)에서 AUF가 `models/weights/secondary_mmap.rs`, `models/transformer.rs`, `buffer/borrowed_mmap_buffer.rs`의 일반 모델 로딩 path에 깊이 박혀 있음이 실측되었다. 후보 `resilience/auf/`는 cross-cutting 위치이지만 "resilience가 트리거하지 않는 가중치 로딩"이 이미 import하고 있어 의미적으로 맞지 않는다. AUF는 GGUF/Safetensors와 동급 가중치 포맷(L2 자산)이며, "resilience-aware swap" 측면은 사용자(SwapExecutor)에서 처리하므로 포맷 자체는 일반 자산이다. shared/(L2)에 두면 inference + resilience 양쪽이 의존할 수 있어 V-23 잔존 위반이 자연 해소된다.
-- **버린 옵션**: (a) `resilience/auf/` — V-23 실측상 inference path에 박혀 있어 부적합. (b) `inference/formats/auf/` — resilience swap 측에서 자산 변환에 쓰이므로 L3 단일 도메인 종속도 부적합.
-- **영향**: Migration Step 3(L1/L2 경계 정리)에서 `auf/` 모듈을 `shared/auf/`로 이동. §13.4 매핑 갱신, INV-LAYER-002의 "backend-specific은 backend 측으로" 원칙과 자연 정합. cross-cutting 분리(Step 5)에서 제외(Step 5는 `auf/` 항목 제거).
+**§A — AUF 위치: RESOLVED (L2 sub-dir `engine/src/auf/`)**
+- **결정**: `auf/` → **`engine/src/auf/`** (L2 sub-dir). 2026-05-26 정정: 이전 표기 `shared/auf/`는 도입하지 않은 디렉토리 페이퍼 목표. 실제 위치는 engine 직속 L2 sub-dir.
+- **근거**: V-23(`ARCHITECTURE.md` §13.5)에서 AUF가 `models/weights/secondary_mmap.rs`, `models/transformer.rs`, `buffer/borrowed_mmap_buffer.rs`의 일반 모델 로딩 path에 깊이 박혀 있음이 실측되었다. 후보 `resilience/auf/`는 cross-cutting 위치이지만 "resilience가 트리거하지 않는 가중치 로딩"이 이미 import하고 있어 의미적으로 맞지 않는다. AUF는 GGUF/Safetensors와 동급 가중치 포맷(L2 자산)이며, "resilience-aware swap" 측면은 사용자(SwapExecutor)에서 처리하므로 포맷 자체는 일반 자산이다. L2 sub-dir에 두면 inference + resilience 양쪽이 의존할 수 있어 V-23 잔존 위반이 자연 해소된다.
+- **버린 옵션**: (a) `resilience/auf/` — V-23 실측상 inference path에 박혀 있어 부적합. (b) `inference/formats/auf/` — resilience swap 측에서 자산 변환에 쓰이므로 L3 단일 도메인 종속도 부적합. (c) `shared/auf/` 디렉토리 신설 — `shared/` 디렉토리 자체를 도입하지 않는 §6.2 "L2 위치 정책" (2026-05-26)에 따라 폐기.
+- **영향**: Migration Step 3(L1/L2 경계 정리)에서 `auf/` 모듈을 `engine/src/auf/` L2 sub-dir로 이동 (`5ddc66bf` RESOLVED). §13.4 매핑 갱신, INV-LAYER-002의 "backend-specific은 backend 측으로" 원칙과 자연 정합. cross-cutting 분리(Step 5)에서 제외(Step 5는 `auf/` 항목 제거).
 
 **§B — `layer_object_pool`, `host_ptr_pool` 등 backend-aware pool 위치: RESOLVED (backend/<be>/pool.rs + WeightStagingPool trait)**
-- **결정**: `models/weights/layer_object_pool.rs`(CUDA pool) → **`backend/cuda_embedded/pool.rs`** 및/또는 `backend/cuda_pc/pool.rs`. `backend/opencl/host_ptr_pool.rs`는 위치 유지. pressure handler는 **`WeightStagingPool` trait**(shared/에 정의)을 통해 의존 역전으로 접근한다.
+- **결정**: `models/weights/layer_object_pool.rs`(CUDA pool) → **`backend/cuda_embedded/pool.rs`** 및/또는 `backend/cuda_pc/pool.rs`. `backend/opencl/host_ptr_pool.rs`는 위치 유지. pressure handler는 **`WeightStagingPool` trait**(L2에 정의 — `engine/src/weight_staging_pool.rs` 또는 `engine/src/layers/staging_pool.rs`)을 통해 의존 역전으로 접근한다.
 - **근거**: 두 pool 모두 backend-종속 자원(CUDA `cuMemAlloc` host pinned, OpenCL `clCreateBuffer(CL_MEM_ALLOC_HOST_PTR)`)을 소유한다. backend가 자원의 owner이고 lifecycle도 backend context와 결합되어 있으므로 backend/ 산하가 자연스럽다. pressure(L3)는 자원의 사용자일 뿐이므로 trait 경유로 접근하면 INV-LAYER-001(L1→상위 import 금지) + INV-LAYER-003(L3→concrete backend impl 금지) 양쪽을 동시에 만족한다.
 - **버린 옵션**: `pressure/policy/handlers/weight_swap/pools/`에 backend별 sub-module — backend resource를 L3가 소유한다는 의미가 되어 INV-LAYER-001을 우회하는 형태가 된다. V-27(layer_object_pool→CudaBackend downcast)이 해결되지 않는다.
 - **영향**:
   - Migration Step 3(L1/L2 경계 정리)에서 backend-aware pool을 backend/ 폴더로 이동.
-  - `WeightStagingPool` trait을 shared/에 신설.
+  - `WeightStagingPool` trait을 L2(engine 직속, `engine/src/weight_staging_pool.rs`)에 신설.
   - V-27 해소 + INV-LAYER-001/003 강화.
 
 **§C — `chat_ipc.rs`, `chat_template.rs` 위치: RESOLVED (다중 위치)**
@@ -1920,20 +1920,20 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 모델 독립적인 **generic chat infrastructure**(공통 trait, 메타 형식 등)는 **`inference/chat_template.rs`** (또는 `inference/chat/`).
   - `core/chat_ipc.rs` → **`session/chat_ipc.rs`** (L4 — 외부 IPC adapter 성격).
 - **근거**: chat_template은 `ModelArch` enum과 모델별 special token 처리에 의존하므로 inference 도메인. 다만 단일 파일에 여러 아키텍처가 섞여 있다면 generic 부분과 모델별 부분을 나누는 게 inference 내부 응집도에 부합한다. chat_ipc는 외부 입력을 받는 IPC adapter이므로 decode loop의 동등 계층(L4)이 자연스럽다.
-- **버린 옵션**: (a) chat_template 전체를 `shared/`에 두기 — `ModelArch` enum import(V-11)가 잔존. (b) chat_ipc를 `bin/`에 두기 — L5는 thin entrypoint여야 하며 IPC 어댑터는 L4 책임.
+- **버린 옵션**: (a) chat_template 전체를 L2(engine 직속)에 두기 — `ModelArch` enum import(V-11)가 잔존. (b) chat_ipc를 `bin/`에 두기 — L5는 thin entrypoint여야 하며 IPC 어댑터는 L4 책임.
 - **영향**:
   - Migration Step 2(L5/L4 분리)에서 `chat_ipc.rs`를 `session/`으로 이관.
   - Migration Step 4(L3 재배치)에서 `chat_template.rs`를 `inference/`로 이관하면서 모델별 코드는 `inference/models/<arch>/`로 분배.
   - V-11(`chat_template`→`ModelArch`) 해소 — 동일 도메인 내부 import가 됨.
 
 **§D — backend-specific buffer 위치: RESOLVED (backend/<be>/buffer/)**
-- **결정**: `cl_*`, `cuda_*`, `rpcmem_*` 접두어를 가진 모든 buffer는 **`backend/<be>/buffer/`**로 이동. generic buffer(`shared_buffer`, `slice_buffer`, `mmap_buffer`, `unified_buffer`, `borrowed_mmap_buffer`)만 **`shared/buffer/`**에 유지.
+- **결정**: `cl_*`, `cuda_*`, `rpcmem_*` 접두어를 가진 모든 buffer는 **`backend/<be>/buffer/`** 또는 **`memory/<resource>/`**(B안 적용)로 이동. generic buffer(`shared_buffer`, `slice_buffer`, `mmap_buffer`, `unified_buffer`, `borrowed_mmap_buffer`)만 **L2 sub-dir `engine/src/buffer/`**에 유지.
 - **근거**: V-08(`ARCHITECTURE.md` §13.5)에서 `buffer/` 디렉토리에 backend-specific impl이 섞여 있어 L2(shared)에서 L1(backend)을 import하는 역방향 의존(V-07: `buffer/host_ptr_pool_buffer.rs` → `backend::opencl::host_ptr_pool::HostPtrPoolGuard`)이 다수 발생. 이름이 명시적으로 backend-종속(`cl_`, `cuda_`, `rpcmem_`)인 모듈을 backend 폴더로 옮기면 L2/L1 경계가 정합화된다.
 - **이동 대상 (V-08에서 식별)**:
   - `buffer/cl_sub_buffer.rs`, `buffer/cl_wrapped_buffer.rs`, `buffer/host_ptr_pool_buffer.rs` → `backend/opencl/buffer/`
   - `buffer/cuda_buffer.rs`, `buffer/cuda_mmap_alias_buffer.rs` → `backend/cuda_embedded/buffer/` 또는 `backend/cuda_pc/buffer/` (공용이면 양쪽에 re-export, 분기점은 Step 3 실측 후 결정 — 두 backend가 공유하는 경우 `backend/cuda_common/buffer/` 신설도 후보)
   - `buffer/rpcmem_alias_buffer.rs` → `backend/qnn_oppkg/buffer/`
-- **버린 옵션**: 모든 buffer를 `shared/buffer/`에 두고 backend-종속 코드는 `#[cfg(feature=...)]`로 게이트 — 위반이 컴파일 시점에 숨겨질 뿐 import 그래프는 그대로. INV-LAYER-002 위반 해소 안 됨.
+- **버린 옵션**: 모든 buffer를 L2 sub-dir `engine/src/buffer/`에 두고 backend-종속 코드는 `#[cfg(feature=...)]`로 게이트 — 위반이 컴파일 시점에 숨겨질 뿐 import 그래프는 그대로. INV-LAYER-002 위반 해소 안 됨.
 - **영향**:
   - Migration Step 3(L1/L2 경계 정리)에서 일괄 이동.
   - V-07, V-08, V-19(`tensor_partition.rs` → `ClSubBuffer`) 해소.
@@ -1963,24 +1963,24 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - **근거**: V-12(`core/events.rs::ActionResult`)에서 이미 같은 패턴이 선례로 허용되어 있다 (§13.5: "events.rs는 L3 변경 사항을 표현해야 하므로 의존 자체는 허용. 단 events가 L3 trait의 출력 채널이 되도록 EventSink trait을 통한 inversion 강화"). enum의 정의는 L3 도메인의 *어휘*이며, cross-cutting이 이를 식별자(label)로 보유하는 것은 trait inversion으로 해소되지 않는 본질적 의존이다. enum을 trait으로 wrapping하면 표현력만 잃고 결합도는 그대로다.
 - **선례**: V-12 — `observability/events.rs`가 `pressure::ActionResult`/`PressureLevel`을 EventSink로 흘려보내는 label로 보유.
 - **적용 예**: V-10 — `resilience/executor.rs`가 `pressure::eviction::EvictMethod`를 `EvictPlan.method` 필드로 보유 (B-1 sprint에서 EvictMethod가 `resilience/`에서 `pressure/eviction/`로 이동한 후, resilience → pressure 방향 import가 §F 예외로 허용됨).
-- **버린 옵션**: (a) 모든 enum을 `shared/`로 추출 — `shared/`가 도메인 어휘의 dumping ground가 되어 SRP 위반. enum은 정의상 도메인에 종속된 closed set이며, 도메인 외부에 두는 것은 의미적으로 부적합. (b) 모든 cross-cutting→L3 enum import를 trait inversion으로 해소 — enum의 외부 dispatch를 위해 `dyn EvictMethodLabel` 같은 trait object를 만드는 것은 결합도 감소 없이 추상화 비용만 증가시킨다.
+- **버린 옵션**: (a) 모든 enum을 L2(engine 직속)로 추출 — L2가 도메인 어휘의 dumping ground가 되어 SRP 위반. enum은 정의상 도메인에 종속된 closed set이며, 도메인 외부에 두는 것은 의미적으로 부적합. (b) 모든 cross-cutting→L3 enum import를 trait inversion으로 해소 — enum의 외부 dispatch를 위해 `dyn EvictMethodLabel` 같은 trait object를 만드는 것은 결합도 감소 없이 추상화 비용만 증가시킨다.
 - **영향**:
   - INV-LAYER-004 비고에 본 예외 명시 (spec/41-invariants.md).
   - layer_lint.py 처리: §F 예외는 자동 검출이 어렵고 패턴 빈도가 낮으므로 baseline JSON에 등재 유지(grandfathered). spec 코멘트와 §13.8-F 본 결정문에서 그라데이션 처리한다. 향후 패턴이 5건 이상 누적되면 layer_lint.py에 명시적 allowlist 도입 검토.
 
 **§G — Shared identifier promotion 패턴: RESOLVED (2026-05-22)**
-- **결정**: cross-cutting 도메인(`observability/`, `resilience/`) 또는 L3 도메인 외부에 정의된 enum/struct이 양쪽 도메인에서 *동등하게* 사용되어 definitional ownership을 단일 도메인에 귀속시키기 어려운 경우, 해당 type을 **L2(`shared/`)로 격상**하는 것을 허용한다.
+- **결정**: cross-cutting 도메인(`observability/`, `resilience/`) 또는 L3 도메인 외부에 정의된 enum/struct이 양쪽 도메인에서 *동등하게* 사용되어 definitional ownership을 단일 도메인에 귀속시키기 어려운 경우, 해당 type을 **L2(engine 직속 모듈 또는 L2 sub-dir, §6.2 참조)로 격상**하는 것을 허용한다.
 - **허용 조건** (3개 모두 만족):
   1. **Type 종류**: 대상이 enum/struct 등 *data identifier*여야 한다 — trait, concrete 함수, RAII guard 등은 본 정책 밖이다.
   2. **사용 분포**: 양쪽 도메인이 type을 *동등하게* 사용해야 한다 — 한쪽이 owner이고 다른 쪽이 consumer라면 §F(enum-as-data identifier 예외) 또는 trait inversion이 우선 적용된다.
-  3. **위치 정합성**: 이동 후 L2 위치가 자연스러워야 한다 — `tensor.rs`, `shape.rs`, `quant.rs`와 동급 패턴(도메인 어휘 공유 자산)이어야 한다.
+  3. **위치 정합성**: 이동 후 L2 위치(engine 직속 또는 L2 sub-dir)가 자연스러워야 한다 — `engine/src/tensor.rs`, `engine/src/shape.rs`, `engine/src/quant.rs`와 동급 패턴(도메인 어휘 공유 자산)이어야 한다.
 - **근거**: §F는 enum이 cross-cutting과 L3 사이를 *단방향 message data*로 흐를 때 적용된다(producer/labeler ↔ consumer/dispatcher). 그러나 enum/struct이 양 도메인에서 *대등한 어휘*로 쓰이면 단방향 message 패턴이 성립하지 않는다. 이 경우 한쪽 도메인을 임의로 owner로 지정하는 것은 자의적이며, 다른 쪽이 §F 예외를 매번 적용해야 하는 부담을 만든다. L2로 격상하면 도메인 어휘가 *공유 자산*으로 명시화되어 import 방향 자체가 사라진다.
 - **§F와의 관계**:
   - **§F (enum-as-data identifier 예외)**: cross-cutting → L3 concrete enum import를 *예외로 허용*한다 (import 위반은 grandfathered, type 위치는 L3 유지). 단방향 message data 패턴 전제.
   - **§G (shared identifier promotion)**: type을 *L2로 이동*하여 import 위반 자체를 *소거*한다 (위치 재배치). 양방향 공유 어휘 패턴 전제.
   - 즉 §F는 위반을 *수용*하고, §G는 위반을 *제거*한다. §F는 owner를 단일 도메인에 명확히 둘 수 있을 때, §G는 그렇지 못할 때 적용한다.
 - **선례**: V-10의 `EvictMethod`는 §F로 처리됨 — `pressure/eviction/method.rs`에 definitional owner를 두고 resilience는 §F 예외로 import. 즉 EvictMethod는 pressure 도메인 어휘가 명확하므로 §G 대상이 아니다.
-- **적용 예**: B-2a sprint **`OpKind` enum** — 현재 `observability/profile/op_trace.rs:113`에 정의되어 있으나, L3 inference(`models/transformer.rs`, `layers/transformer_layer/forward.rs` 등)가 `OpKind::Embedding`, `OpKind::RmsNorm` 등을 직접 인자로 전달하며 적극 사용한다. observability(producer, op_trace recorder) 측과 L3(consumer, op 식별 인자) 측이 어휘를 *대등하게* 보유하므로, 어느 한쪽에 owner를 두는 게 자연스럽지 않다. → L2(`engine/src/ops.rs` 또는 `engine/src/op_kind.rs`)로 격상하여 `tensor.rs`/`shape.rs`/`quant.rs`와 동급 도메인 어휘 자산으로 정착시킨다.
+- **적용 예**: B-2a sprint **`OpKind` enum** — 현재 `observability/profile/op_trace.rs:113`에 정의되어 있으나, L3 inference(`models/transformer.rs`, `layers/transformer_layer/forward.rs` 등)가 `OpKind::Embedding`, `OpKind::RmsNorm` 등을 직접 인자로 전달하며 적극 사용한다. observability(producer, op_trace recorder) 측과 L3(consumer, op 식별 인자) 측이 어휘를 *대등하게* 보유하므로, 어느 한쪽에 owner를 두는 게 자연스럽지 않다. → L2 직속 모듈 `engine/src/op_kind.rs`로 격상하여 `engine/src/tensor.rs`/`shape.rs`/`quant.rs`와 동급 도메인 어휘 자산으로 정착시킨다.
 - **버린 옵션**: (a) OpKind를 observability owner로 두고 L3 import는 §F 예외로 처리 — L3가 정의자가 아닌 곳의 어휘를 매 forward op마다 import하게 되어 §F의 *단방향 message data* 전제와 어긋난다. (b) OpKind를 L3 inference로 owner 이전 — observability/profile의 op recorder가 L3 enum을 import하게 되어 INV-LAYER-004 trait inversion 원칙을 우회한다.
 - **영향**:
   - B-2a sprint에서 OpKind enum을 L2로 이동 (Pattern B 해소의 핵심).
@@ -1997,7 +1997,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 | `CpuKernelSet` / `OpenClSecondary` / `SecondaryStore` | B-5b Phase 2 Stage 1 | (RESOLVED) | Backend trait capability 인프라 (`engine/src/cpu_kernels.rs`, `engine/src/secondary.rs`) | L1 + L3 | capability trait |
 | `hybrid_attention` 모듈 | B-5b Phase 3 A | 2026-05-23 (RESOLVED) | `layers/hybrid_attention.rs` → `engine/src/hybrid_attention.rs` | L3-inference + L1 plan | RAII + data identifier 동반 격상 (§G 본문 조건 1 "RAII guard 단독 격상" 제외 의도 외 사례) |
 | **QCF data identifiers** (`QcfMetric`/`QcfConfig`/`QcfMode`/`AggregationMode`/`KiviFlushParams`/`FlushAttentionParams`/`SubLayer`/`ImportanceFormula` + `aggregate_heads`) | **S-3b-1** | **2026-05-24** | **`qcf/{mod,quant_qcf,layer_importance}.rs` → `engine/src/qcf_types.rs`** | **L3-qcf (신설) + L3-pressure + L3-inference + observability** | **3-도메인 + observability 공유 측정 어휘. 측정 로직(`compute_flush_*`, `ImportanceCollector`)은 L3-qcf에 유지** |
-| `ModelConfig` | TBD (별 sprint 후보) | **CANDIDATE** (2026-05-26 등록) | `inference/models/config.rs` → `shared/model_config.rs` 후보 | L3-inference (owner) + L3-pressure (`weight_swap_handler.rs`) | INV-LAYER-003 보조 위계 우선순위 #3 — inference owned *configuration* 어휘를 pressure가 weight swap orchestrator에서 직접 import. 양 도메인 동등 사용이므로 §G L2 격상이 자연 정합. 현재는 §13.8-O `cross_l3_vocabulary` marker로 escape (`pressure/weight_swap_handler.rs:21`). 격상 시 §O register에서 항목 제거. |
+| `ModelConfig` | TBD (별 sprint 후보) | **CANDIDATE** (2026-05-26 등록) | `inference/models/config.rs` → `engine/src/model_config.rs` (L2 직속) 후보 | L3-inference (owner) + L3-pressure (`weight_swap_handler.rs`) | INV-LAYER-003 보조 위계 우선순위 #3 — inference owned *configuration* 어휘를 pressure가 weight swap orchestrator에서 직접 import. 양 도메인 동등 사용이므로 §G L2 격상이 자연 정합. 현재는 §13.8-O `cross_l3_vocabulary` marker로 escape (`pressure/weight_swap_handler.rs:21`). 격상 시 §O register에서 항목 제거. **2026-05-26 정정**: 신위치 표기 `shared/model_config.rs`는 도입하지 않은 디렉토리. 격상 위치는 engine 직속 L2 모듈 `engine/src/model_config.rs` (arch §6.2 "L2 위치 정책" 참조). |
 
 **임계 정책**: 5건 미만 sub-list 형식, 5건 이상 표 형식. **10건 이상** 누적 시 layer_lint.py 명시적 allowlist (자동 검출) 도입 검토 — §F 정책과 동일 운용 원리. `hybrid_attention` 격상 시 자세한 근거: 격상 단위는 모듈 전체(`HybridAttnSetup`/`HybridGpuBuffer` struct + `HybridScope` RAII + `compute_kv_split`/`current`/`install` free fn). §G 본문 조건 1 "RAII guard 본 정책 밖" 문구는 *RAII guard 단독 격상*을 제외하려는 의도이며, 본 사례는 `HybridAttnSetup` data identifier + 그 lifetime을 관리하는 `HybridScope` 동반 격상 패턴으로 §G 정신과 부합. plan.rs(L1) hot path 호출이 §J 본문 "read-only 정책 query 한정" 제약과 mismatch (AtomicI32 store + Mutex lock + cl_mem 참조 부수효과 발생)이므로 §J zone marker 적용은 폐기되고 §G 격상으로 본질 해소. Backend trait method 추가 없음(ISP 누적 +0).
 
@@ -2060,7 +2060,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
   - 4개 모두 *trait inversion의 비용이 더 크다고 spec이 판단한 영역*. 적용 단위(식별자 / 매크로 / 모듈 / zone)가 다르며 mutually exclusive하다.
 - **버린 옵션**:
   - (a) **`PartitionPolicy` trait + dyn dispatch 도입**: build-time 정책 query가 본질이라 trait dispatch는 source overhead만 누적. 매번 trait object를 instantiate하거나 보관하는 비용은 zero-cost 추상화 원칙과 어긋난다.
-  - (b) **`shared/` 폴더 신설 후 `tensor_partition` 통째 격상**: `tensor_partition`은 backend-aware split_weight 함수를 보유한다(`cpu_backend: &Arc<dyn Backend>`). 격상 시 L2가 backend trait을 import하게 되어 의미상 정상이지만 별도 sprint scope(Step 3)가 필요. B-5 scope에서는 *부분 해소*가 자연 — struct(`PartitionWsCell`/`PartitionWorkspace`)는 §G로, 정책 함수 호출은 §J로.
+  - (b) **L2 sub-dir(`engine/src/tensor_partition/`)로 `tensor_partition` 통째 격상**: `tensor_partition`은 backend-aware split_weight 함수를 보유한다(`cpu_backend: &Arc<dyn Backend>`). 격상 시 L2가 backend trait을 import하게 되어 의미상 정상이지만 별도 sprint scope(Step 3)가 필요. B-5 scope에서는 *부분 해소*가 자연 — struct(`PartitionWsCell`/`PartitionWorkspace`)는 §G로, 정책 함수 호출은 §J로.
   - (c) **`Plan`을 backend-generic으로 재설계**: OpenCL batched command stream 의존이 본질적으로 backend-specific하므로 매우 큰 작업. 본 sprint scope 밖(B-3 sprint 영역).
 - **적용**:
   - **`backend/opencl/plan.rs::build_partition_plan`** (B-5a sprint 적용): env flag query를 build 시점에 `PartitionPolicySnapshot`으로 캡쳐. zone marker는 `build_partition_plan` 함수 시그니처 위에 부착.
@@ -2145,12 +2145,12 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
 - **해소 우선순위 (INV-LAYER-003 보조 위계, 2026-05-26 명시화)**: cross-L3 vocabulary 침범은 spec INV-LAYER-003 NOTE의 보조 위계(**pressure = stateful runtime resource owner, inference = forward pass executor**)에 따라 다음 우선순위로 해소한다.
   1. **위계 정합 방향** (inference → pressure resource): trait 격상으로 처리. 예: `KVCacheOps`(KVCache 임차), `PreloadAccess`(PreloadPool 임차). pressure가 자원 owner이므로 inference가 trait으로 임차하는 패턴이 자연 정합 — 본질 해소는 trait 노출이며 register 잔존 시 별 sprint candidate.
   2. **위계 어긋남 방향** (pressure → inference owned data): 데이터 owner를 pressure로 이전. 본 §O 본문의 *Phase 6 weight_slot/secondary_mmap → pressure 이전* 결정이 이 우선순위의 적용 사례. pressure가 inference의 stateful resource를 import하는 게 아니라, 해당 resource가 본래 pressure 소유 자산임을 명시화한다.
-  3. **양 도메인 공유 configuration**: §13.8-G L2 promotion. inference의 *configuration* 어휘(예: `ModelConfig`)를 pressure가 직접 import할 때 적용 — 양 도메인 동등 사용 시 owner를 inference로 두는 게 자의적이므로 `shared/model_config.rs`로 격상하여 양 도메인 공유 어휘로 정착시킨다.
+  3. **양 도메인 공유 configuration**: §13.8-G L2 promotion. inference의 *configuration* 어휘(예: `ModelConfig`)를 pressure가 직접 import할 때 적용 — 양 도메인 동등 사용 시 owner를 inference로 두는 게 자의적이므로 L2 직속 모듈 `engine/src/model_config.rs`로 격상하여 양 도메인 공유 어휘로 정착시킨다.
   - **위계 외 패턴**: 비-resource 성격(예: pressure가 inference orchestration 호출 등)의 cross-L3 import는 본 §O `cross_l3_vocabulary` marker zone을 escape hatch로 유지한다. 단 register 누적 5건 이상 시 §13.4 vocabulary register 신설 + trait inversion 별 sprint 강제 trigger.
 - **근거**: cross-L3 trait inversion이 본질 해소이나, 다음 사유로 marker 우선 적용이 cost-effective:
   - **Type alias default**: caller convenience를 위한 외부 API surface — KVCache default를 KVCacheOps trait의 default impl로 노출하는 패턴이 일반적. trait inversion으로 default를 강제 제거하면 caller에 명시 강제 ripple 폭증.
   - **Weight swap orchestrator**: pressure가 models의 SwapExecutor + LayerSlot + SecondaryMmap을 직접 사용하는 패턴은 WeightSwapDispatch trait + handler 이동(`models/weights/swap_handler.rs`)으로 해소 가능하나, ActionResult enum이 pressure 도메인이므로 잔여 위반 1건 남음 (§F enum-as-data). 격상 ROI는 trade-off.
-  - **PreloadPool / PrefetchableCache**: L2(shared/) 격상 또는 extension trait 분리가 본질이나 별 sprint scope.
+  - **PreloadPool / PrefetchableCache**: L2(engine 직속 또는 L2 sub-dir) 격상 또는 extension trait 분리가 본질이나 별 sprint scope.
 - **§L/§N과의 관계**:
   - **§L**: L3→L1 backend impl + cross-L3 default initialization (단방향). marker = `backend_concrete_downcast`.
   - **§N**: cross-cutting ↔ L3 trait/enum usage (방향 불문, but cross-cutting 매개). marker = `cross_cutting_trait_usage`.
@@ -2172,7 +2172,7 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
     - `pressure/weight_swap_handler.rs:21,22,23` — `ModelConfig`, `SwapExecutor`, `LayerSlot`/`SecondaryMmap` (WeightSwapDispatch trait + handler 이동 backlog)
     - **세부 분류 (보조 위계 적용, 2026-05-26)**:
       - `SwapExecutor`, `LayerSlot`, `SecondaryMmap` — **위계 어긋남 방향** (pressure → inference owned resource). 본질은 데이터 owner를 pressure로 이전(우선순위 #2) — weight_slot/secondary_mmap은 본래 pressure 자원이므로 `pressure/state/weight_slot/`으로 이전(§6.3 결정 반영). `SwapExecutor`도 동행 이전 후보.
-      - `ModelConfig` — **양 도메인 공유 configuration** (우선순위 #3). inference 소유이나 pressure(weight swap), inference(forward) 양쪽이 동등 사용 → **§13.8-G L2 promotion candidate로 등록** (`shared/model_config.rs` 후보). §G register 참조.
+      - `ModelConfig` — **양 도메인 공유 configuration** (우선순위 #3). inference 소유이나 pressure(weight swap), inference(forward) 양쪽이 동등 사용 → **§13.8-G L2 promotion candidate로 등록** (`engine/src/model_config.rs` L2 직속 후보). §G register 참조.
 - **운용 메모**:
   - marker는 의도성 명시. PR description에 *본질 trait inversion backlog 후보* 또는 *외부 API surface로 정당화* 기재.
   - 5건 이상 누적 시 §13.4에 *cross-L3 vocabulary register* 표 신설 검토.
