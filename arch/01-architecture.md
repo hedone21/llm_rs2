@@ -359,7 +359,7 @@ SYS-064, INV-018, INV-013
 - **포함 모듈 (현 위치, §13.8 결정 반영)**:
   - **Trait 정의**: `engine/src/backend.rs`, `engine/src/buffer.rs`, `engine/src/memory.rs`, **`engine/src/weight_staging_pool.rs`** (§13.8-B — backend pool 접근용 trait, 신설 위치).
   - **데이터 타입**: `engine/src/tensor.rs`, `engine/src/shape.rs`, `engine/src/quant.rs`, `engine/src/qcf_types.rs` (§G S-3b-1 격상), `engine/src/op_kind.rs` (§G B-2a 격상).
-  - **공용 utility**: `engine/src/thread_pool.rs`, `engine/src/math_utils.rs` (신설 시), `engine/src/tensor_partition/` (TBD — L2 sub-dir 후보), `engine/src/qcf/` (L2 sub-dir, qcf 측정 로직 owner. data identifier는 `qcf_types.rs`로 분리), `engine/src/qcf_collector.rs`, `engine/src/qcf_computer.rs`, `engine/src/instrument.rs` (§H instrument macro), `engine/src/kv_cache_ops.rs` (§G B-5b 격상), `engine/src/hybrid_attention.rs` (§G B-5b Phase 3 A 격상), `engine/src/cpu_kernels.rs`, `engine/src/partition_workspace.rs`, `engine/src/yield_policy.rs` — 모두 engine 직속 L2 모듈.
+  - **공용 utility**: `engine/src/thread_pool.rs`, `engine/src/math_utils.rs` (신설 시), `engine/src/tensor_partition/` (TBD — L2 sub-dir 후보), `engine/src/qcf/` (L2 sub-dir, qcf 측정 로직 owner. data identifier는 `qcf_types.rs`로 분리), `engine/src/qcf_collector.rs`, `engine/src/qcf_computer.rs`, `engine/src/instrument.rs` (§H instrument macro), `engine/src/kv_cache_ops.rs` (§G B-5b 격상), `engine/src/hybrid_attention.rs` (§G B-5b Phase 3 A 격상), `engine/src/cpu_kernels.rs`, `engine/src/partition_workspace.rs`, `engine/src/yield_policy.rs`, **`engine/src/layer_boundary_hook.rs`** (§G #8 Sprint C 2026-05-26 격상 — inference forward + pressure swap impl 공유 hook trait) — 모두 engine 직속 L2 모듈.
   - **공용 buffer impl**: `engine/src/buffer/{shared_buffer, mmap_buffer, slice_buffer, unified_buffer, borrowed_mmap_buffer}` (L2 sub-dir) — generic만 유지 (§13.8-D). backend-specific(`cl_*`, `cuda_*`, `rpcmem_*`, `host_ptr_pool_buffer`)은 모두 `backend/<be>/buffer/` 또는 `memory/<resource>/`로 이동.
   - **공용 가중치 포맷**: **`engine/src/auf/`** (L2 sub-dir, §13.8-A RESOLVED `5ddc66bf`) — Argus Unified Format. GGUF/Safetensors와 동급 자산. resilience 전용이 아니라 inference 측 모델 로딩과 weight swap 양쪽이 공용으로 사용한다.
 - **의존**: 외부 crate(`half`, `bytemuck`, `anyhow`) + cross-cutting trait만. **L3/L4/L5 import 금지**.
@@ -386,18 +386,22 @@ L2 디렉토리(`shared/`)는 도입하지 않는다. L2 모듈은 engine 직속
   - **Policy/Pressure trait**: `pressure/policy/pressure.rs` (← `core/pressure/mod.rs`). `CachePressureHandler` trait + `Pipeline`.
   - **Policy/Eviction**: `pressure/policy/eviction/{sliding_window, h2o, h2o_plus, d2o, no_eviction, streaming_llm, mod.rs}`. `EvictionPolicy` trait.
   - **Policy/Handlers**: `pressure/policy/handlers/{eviction, d2o, compress, quantize, swap, merge, sparse, weight_swap}_handler.rs`.
-  - **Policy/Weight swap (sub-handler)**: `pressure/policy/handlers/weight_swap/{swap_executor, async_swap, release_worker, phase_aware_swap, intra_forward_swap, decider, noise_table, probing_k, dynamic_k, incremental_plan}.rs` (← `models/weights/`).
+  - **Policy/Weight swap (sub-handler)**: **`pressure/weights/{swap_executor, decider, async_swap, phase_aware_swap, intra_forward_swap, incremental_plan, dynamic_k, probing_k, noise_table, release_worker}.rs`** (Sprint C 2026-05-26, `5c698d79` ← `models/weights/`). 페이퍼 목표 `pressure/policy/handlers/weight_swap/`는 폐기 — 평면 `pressure/weights/` sub-dir로 정착.
   - **State/KV**: `pressure/state/{kv_cache, kivi_cache, kv_migrate}.rs`, `pressure/state/offload/` (← `core/offload/`).
-  - **State/Weight slot**: `pressure/state/weight_slot/{slot, secondary_mmap, rpcmem_secondary}.rs` (← `models/weights/`).<br/>**Note (§13.8-B)**: `layer_object_pool.rs`는 본 위치가 아닌 **`backend/cuda_embedded/pool.rs`**로 이동한다 — 자원 owner가 backend이고 pressure는 `WeightStagingPool` trait으로 접근.
+  - **State/Weight slot**: **`models/weights/{slot, secondary_mmap, rpcmem_secondary, backing}.rs` inference 잔존** (Sprint C 결정). `LayerSlot`이 owns `TransformerLayer` (inference data)이므로 pressure 이전 시 더 큰 위계 어긋남 (pressure → inference data ownership) 발생. pressure orchestrator(`pressure/weights/*`)는 §13.8-O `cross_l3_vocabulary` marker로 임차 명시 (5 파일 marker — pressure → inference 잔존 weight resource). `SecondaryStore` trait inversion(V-09 `SecondaryMmapBytes` 패턴 확장)은 backlog 별 sprint.<br/>**Note (§13.8-B)**: `layer_object_pool.rs`는 본 위치가 아닌 **`backend/cuda_embedded/pool.rs`**로 이동한다 — 자원 owner가 backend이고 pressure는 `WeightStagingPool` trait으로 접근. Sprint C에서는 결정 보류로 inference 잔존.
 - **의존**: L2 (engine 직속 모듈 + L2 sub-dir, §6.2 참조) + cross-cutting trait. `inference/`의 trait(`TransformerLayer` 등)을 매우 제한적으로 import할 수 있으나, concrete struct import는 금지(INV-LAYER-003). backend pool 사용 시 `crate::weight_staging_pool::WeightStagingPool` trait 경유.
 - **공용 인터페이스**:
   - `CachePressureHandler` trait — `handle(ctx) -> ActionResult`.
   - `EvictionPolicy` trait — `should_evict() / evict() / evict_with_scores() / name()`.
   - `KVCacheOps` trait — `update / get_view / kv_dtype / current_pos / capacity`. **이 trait이 Pressure와 Inference의 inversion 경계**.
+  - **`LayerBoundaryHook` trait (L2 `engine/src/layer_boundary_hook.rs`, Sprint C 2026-05-26)** — `on_layer_boundary(idx, seq_len)` + `pending_event_for_dyn(idx) -> Option<Arc<GpuEvent>>` default method. inference forward path가 `Option<&dyn LayerBoundaryHook>`로 호출, `IntraForwardSwapHook`(pressure) + `NoOpHook`(L2 default fallback) 두 impl. §13.8-G B-5b `KVCacheOps`/`PreloadAccess`와 동일 패턴 — 양 도메인 공유 어휘.
   - `WeightSwapTarget` trait (TBD, Step 4 마이그레이션에서 신설) — `swap_executor`가 transformer model의 layer를 변경하기 위한 trait. 현재는 `TransformerModel`을 직접 import (V-25).
-  - `SecondaryStore` trait (TBD) — buffer가 mmap-backed secondary source에 접근하는 inversion 경로 (V-09 해소용).
-- **예외 처리**: `weight_swap_handler.rs`가 `models::config::ModelConfig`를 import (V-24) — `ModelConfig`는 L2(`engine/src/model_config.rs`)로 격상해야 함 (§13.8-G CANDIDATE, 2026-05-26 등록).
-- **현 위반**: V-10(→ resilience::EvictMethod), V-13(KiviCache→OpenCLBackend downcast), V-21(transformer→preload_pool inference→pressure cross-domain), V-24(weight_swap→models), V-25(swap_executor→layers/models), V-26(decider→qcf), V-27(layer_object_pool→CudaBackend — §13.8-B 이동 + `WeightStagingPool` trait 도입으로 해소).
+  - `SecondaryStore` trait (TBD) — buffer가 mmap-backed secondary source에 접근하는 inversion 경로 (V-09 해소용). Sprint C 후 `pressure/weights/noise_table.rs`도 본 trait의 적용 candidate.
+- **예외 처리**:
+  - ~~`weight_swap_handler.rs`가 `models::config::ModelConfig`를 import (V-24)~~ — Sprint B + B-fixup RESOLVED (§13.8-G #7 `ModelConfig` L2 격상, `6dcba548` + `d78d3956`).
+  - ~~`weight_swap_handler.rs`가 `models::weights::{SwapExecutor, LayerSlot, SecondaryMmap}`를 import (V-24 weight swap 부분)~~ — Sprint C RESOLVED (`5c698d79`, orchestrator 10 파일 `pressure/weights/` 이전으로 같은 도메인 내부 import 자연 정렬). `LayerSlot`/`SecondaryMmap`은 inference 잔존, pressure orchestrator(`pressure/weights/{swap_executor, noise_table, phase_aware_swap, intra_forward_swap, async_swap}.rs` 5 파일)가 §13.8-O `cross_l3_vocabulary` marker로 임차.
+  - transformer.rs(inference) → `pressure::weights::{QuantNoiseTable, PrimaryReleaseWorker}` ctor 호출 패턴 17건 — `// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference owner accepts pressure-owned resource via Arc field` marker. 본질 해소(setup helper로 ctor 이전)는 backlog 별 sprint.
+- **현 위반**: V-10(→ resilience::EvictMethod), V-13(KiviCache→OpenCLBackend downcast), V-21(transformer→preload_pool inference→pressure cross-domain), V-24(weight swap RESOLVED Sprint C), V-25(swap_executor→layers/models), V-26(decider→qcf), V-27(layer_object_pool→CudaBackend — §13.8-B 이동 + `WeightStagingPool` trait 도입으로 해소).
 
 ### 6.4 컴포넌트: L3 Inference Domain (`inference/`)
 
@@ -407,6 +411,7 @@ L2 디렉토리(`shared/`)는 도입하지 않는다. L2 모듈은 engine 직속
   - `inference/models/{transformer, llama/, mappers/, loader/, config}.rs` (← `models/`).
   - `inference/layers/{transformer_layer/, attention, hybrid_attention, workspace}.rs` (← `layers/`).
   - `inference/{sampling, attention_scores, speculative, skip_config}.rs` (← `core/`).
+  - **`models/weights/{slot, secondary_mmap, rpcmem_secondary, backing, layer_object_pool}.rs`** — weight resource owner (LayerSlot/SecondaryMmap/SecondaryBacking/CUDA host-pinned pool). Sprint C 2026-05-26 결정으로 inference 잔존 — `LayerSlot`이 owns `TransformerLayer` 이므로 데이터 ownership 측면에서 inference 도메인이 자연. pressure orchestrator(`pressure/weights/*`)가 §13.8-O `cross_l3_vocabulary` marker로 임차하여 mutate. `layer_object_pool.rs`는 §13.8-B 결정 보류로 잔존.
   - **`inference/chat_template.rs`** — generic chat infra (← `core/chat_template.rs`의 모델 독립 부분, §13.8-C).
   - **`inference/models/<arch>/chat_template.rs`** — 모델별 chat 템플릿 구현체 (예: `inference/models/llama/chat_template.rs`). `ModelArch`와 동일 도메인이므로 V-11 자연 해소.
 - **의존**: L2 (engine 직속 모듈 + L2 sub-dir, §6.2 참조) + cross-cutting trait. Pressure 도메인의 trait(`KVCacheOps`)만 import. AUF 사용은 `crate::auf::*` (§13.8-A) — V-23 해소.
@@ -416,6 +421,7 @@ L2 디렉토리(`shared/`)는 도입하지 않는다. L2 모듈은 engine 직속
   - `LayerWorkspace` — decode 루프용 사전 할당 버퍼.
   - `SamplingConfig::sample()`, `AttentionScoreAccumulator::accumulate()`.
   - `ChatTemplate` trait (TBD, §13.8-C) — 모델별 prompt 변환 추상화. impl은 `inference/models/<arch>/chat_template.rs`.
+  - **`LayerBoundaryHook` trait (L2 임차, Sprint C 2026-05-26)** — `TransformerModelForwardArgs::layer_boundary_hook: Option<&'a dyn crate::layer_boundary_hook::LayerBoundaryHook>` 필드로 forward path가 layer 경계마다 hook 호출. pressure 도메인 impl(`IntraForwardSwapHook`)을 trait object로 임차하여 LISWAP-4 intra-forward swap을 트리거. 이전 `crate::models::weights::LayerBoundaryHook` import는 §G #8로 L2 격상되어 inference→pressure trait import 위반 자연 해소.
 - **예외 처리**: 일부 forward path가 `crate::backend::cpu::neon::*`를 직접 호출 (V-17) — INV-012(Backend trait이 유일 추상화)와 INV-LAYER-003 둘 다 위반. Backend trait에 적절한 method 추가로 흡수 또는 downcast trait(`as_neon() -> Option<&CpuNeon>`)을 backend 측에 노출하는 방식으로 inversion 필요.
 - **현 위반**: V-17(layers→backend NEON/CUDA/OpenCL), V-18(layers→Galloc, OpProfiler), V-19(layers→buffer/cl_sub_buffer — §13.8-D로 reverse 방향 정렬), V-20(transformer→opencl plan), V-22(transformer→profile), V-23(transformer→auf — §13.8-A로 reverse 방향 정렬).
 
