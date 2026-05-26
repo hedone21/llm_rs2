@@ -80,7 +80,7 @@ serial = "R3CY408S5SB"
 target = "aarch64-linux-android"
 toolchain = "android-ndk"
 binary_dir = "target/aarch64-linux-android/release"
-features = ["opencl", "vulkan", "qnn"]
+features = ["opencl", "vulkan", "qnn", "htp_fastrpc"]
 default_features = false
 
 [devices.galaxy_s25.paths]

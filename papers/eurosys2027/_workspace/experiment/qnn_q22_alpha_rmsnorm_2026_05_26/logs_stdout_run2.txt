@@ -1,0 +1,24 @@
+=== microbench_htp_rmsnorm (Q-2.2-α PoC Phase 5) ===
+
+Config:
+  shape       = [1, 1536]
+  eps         = 0.00001
+  add_unit    = false
+  warmup iter = 10
+  measure iter= 1000
+  err thresh  = 0.001
+
+[1/3] CPU baseline (f32)
+  mean=0.86 us (median=0.83, stddev=0.05, n=1000)
+
+[2/3] OpenCL GPU
+  mean=164.08 us (median=156.09, stddev=50.37, n=1000)
+  vs CPU: max_abs_err=0.000e0, max_rel_err=0.000e0 — PASS
+
+[3/3] QNN HTP NPU (FastRPC + libggml-htp-v79.so dspqueue)
+  SKIP — HtpFastrpcHost::new failed: htp_fastrpc: remote_handle64_open uri=file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0
+
+=== Summary ===
+CPU:          0.86 us/op (1.00x baseline)
+OpenCL:     164.08 us/op (191.32x, -99% vs CPU), err=0.00e0
+QNN HTP:  SKIP (Phase 6 device deploy required)

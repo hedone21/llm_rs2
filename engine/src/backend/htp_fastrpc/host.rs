@@ -89,6 +89,23 @@ pub struct RemoteRpcControlUnsignedModule {
     pub enable: i32,
 }
 
+/// `struct remote_rpc_get_uri` — remote.h. session-encoded URI 획득용.
+///
+/// `FASTRPC_GET_URI` 가 reserve_session 으로 얻은 session_id 를
+/// session-encoded URI 로 변환 (default domain → session-specific domain).
+/// 본 step 누락 시 raw URI 로 handle_open 호출 → fallback to default
+/// domain 3 → `Error 0xe (AEE_ENOSUCHMOD) domain >= 0` 로 fail (실측 검증).
+#[repr(C)]
+pub struct RemoteRpcGetUri {
+    pub domain_name: *mut u8,
+    pub domain_name_len: u32,
+    pub session_id: u32,
+    pub module_uri: *mut u8,
+    pub module_uri_len: u32,
+    pub uri: *mut u8,
+    pub uri_len: u32,
+}
+
 /// `struct remote_rpc_control_latency` — remote.h.
 #[repr(C)]
 pub struct RemoteRpcControlLatency {
@@ -414,14 +431,51 @@ impl HtpFastrpcHost {
                 .with_context(|| "htp_fastrpc: DSPRPC_CONTROL_UNSIGNED_MODULE");
         }
 
-        // ── Step 5: remote_handle64_open(uri) ──
+        // ── Step 5a: FASTRPC_GET_URI — session-encoded URI 획득 ──
         //
-        // URI 형식: `file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0`
-        // S25 = Hexagon v79.
-        let uri = format!(
+        // 누락 시 raw URI 로 handle_open 호출 → default domain 3 fallback →
+        // `Error 0xe (AEE_ENOSUCHMOD) domain >= 0` (Q-2.2-α Phase 6 실측에서 확인,
+        // llama.cpp ggml-hexagon.cpp:1580-1606 와 동일 sequence 보정).
+        let raw_uri = format!(
             "file:///libggml-htp-v{arch}.so?htp_iface_skel_handle_invoke&_modver=1.0",
             arch = HTP_ARCH_V79,
         );
+        let mut raw_uri_bytes = raw_uri.as_bytes().to_vec();
+        raw_uri_bytes.push(0);
+        let mut session_uri_buf = vec![0u8; 256];
+
+        let mut get_uri_req = RemoteRpcGetUri {
+            domain_name: domain_name.as_mut_ptr(),
+            domain_name_len: (domain_name.len() - 1) as u32,
+            session_id,
+            module_uri: raw_uri_bytes.as_mut_ptr(),
+            module_uri_len: (raw_uri_bytes.len() - 1) as u32,
+            uri: session_uri_buf.as_mut_ptr(),
+            uri_len: session_uri_buf.len() as u32,
+        };
+        let get_uri_size = core::mem::size_of::<RemoteRpcGetUri>() as u32;
+        // SAFETY: 모든 raw ptr 가 ScopedLive vec 의 backing. struct lifetime 호출 종료까지.
+        let rc = unsafe {
+            remote_session_control(
+                FASTRPC_GET_URI,
+                &mut get_uri_req as *mut _ as *mut c_void,
+                get_uri_size,
+            )
+        };
+        let uri = if rc == AEE_SUCCESS {
+            // session_uri_buf 안에 null-terminated 문자열이 채워짐.
+            let nul = session_uri_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(session_uri_buf.len());
+            String::from_utf8_lossy(&session_uri_buf[..nul]).into_owned()
+        } else {
+            // fallback to raw URI (single-session path)
+            eprintln!("htp_fastrpc: FASTRPC_GET_URI failed rc={rc:#x}, fallback to raw URI");
+            raw_uri.clone()
+        };
+
+        // ── Step 5b: remote_handle64_open(session_uri) ──
         let uri_c =
             CString::new(uri.as_str()).map_err(|e| anyhow!("htp_fastrpc: URI null byte: {}", e))?;
         let mut handle: RemoteHandle64 = 0;

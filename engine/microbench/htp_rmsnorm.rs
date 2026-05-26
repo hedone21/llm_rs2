@@ -89,9 +89,11 @@ fn main() -> anyhow::Result<()> {
         // mid-magnitude pseudo-uniform on [-0.5, 0.5)
         *x = ((i as f32) * 0.0173 + 0.07).rem_euclid(1.0) - 0.5;
     }
-    for (i, w) in host_w.iter_mut().enumerate() {
-        // RMSNorm gamma standard init centered at 1.0, small spread
-        *w = 1.0 + (((i as f32) * 0.0091 + 0.13).rem_euclid(1.0) - 0.5) * 0.04;
+    // PoC: gamma=1.0 fill (no-op affine). llama.cpp HTP_OP_RMS_NORM 은 gamma 미적용
+    // (unary-ops.c::rms_norm_f32 가 input/rms(input) 만 처리). CPU/OpenCL baseline 도
+    // 동일하게 gamma=1 로 비교 → output == input / rms(input) 형태로 3-way 일치.
+    for w in host_w.iter_mut() {
+        *w = 1.0;
     }
 
     // ── [1/3] CPU baseline ─────────────────────────────────────────────────
@@ -157,7 +159,7 @@ fn main() -> anyhow::Result<()> {
             Some(stats)
         }
         Err(e) => {
-            println!("  SKIP — {}\n", e);
+            println!("  SKIP — {:#}\n", e);
             None
         }
     };
@@ -190,7 +192,7 @@ fn main() -> anyhow::Result<()> {
             Some(stats)
         }
         Err(e) => {
-            println!("  SKIP — {}\n", e);
+            println!("  SKIP — {:#}\n", e);
             None
         }
     };
@@ -490,20 +492,25 @@ fn run_htp(
 
         // Build dispatcher closure — re-issued each iter.
         // Each iter:
-        //   1. CpuWriteDspRead flush input + weight
-        //   2. dspqueue_write([x, w, y], packet)
+        //   1. CpuWriteDspRead flush input
+        //   2. dspqueue_write([x, y], packet)  ← n_bufs=2 (llama.cpp htp/main.c:1081
+        //      "if (n_bufs != 2) Bad unary-req buffer list")
         //   3. dspqueue_read (blocking)
         //   4. check rsp.status
+        //
+        // NOTE: llama.cpp HTP_OP_RMS_NORM 은 gamma 미적용. unary-ops.c::rms_norm_f32
+        //       가 (src, dst, op_params[0]=eps) 만 사용. gamma 곱하기는 별도 op
+        //       (HTP_OP_MUL) 로 chain — PoC scope 외. CPU baseline 도 gamma=1 비교.
+        let _ = (ne_w, nb_w, &buf_w); // weight buffer 는 hold 만 (alloc/lifetime)
         let dispatch = |measure_timing: bool| -> anyhow::Result<f64> {
             let mut req = HtpGeneralReq::zeroed();
             let src0 = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
             let dst = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
             init_rmsnorm_req(&mut req, eps, src0, dst);
-            req.src1 = htp_tensor_from_shape(HTP_TYPE_F32, ne_w, nb_w);
+            // src1 미사용 (n_bufs=2 path)
 
-            let mut bufs: [DspQueueBuffer; 3] = [
+            let mut bufs: [DspQueueBuffer; 2] = [
                 buf_x.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, bytes_x as u32)?,
-                buf_w.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, bytes_w as u32)?,
                 buf_y.dsp_buf(DspqBufferType::DspWriteCpuRead, 0, bytes_y as u32)?,
             ];
 
@@ -515,7 +522,7 @@ fn run_htp(
                 (host.dspqueue_write)(
                     host.queue,
                     0, // flags
-                    3, // num_buffers
+                    2, // num_buffers (input + output)
                     bufs.as_mut_ptr(),
                     core::mem::size_of::<HtpGeneralReq>() as u32,
                     &req as *const _ as *const u8,
@@ -529,7 +536,7 @@ fn run_htp(
             // dspqueue_read (DSP → host, blocking)
             let mut rsp = HtpGeneralRsp::zeroed();
             let mut rsp_buf_count: u32 = 0;
-            let mut rsp_bufs: [DspQueueBuffer; 3] = [DspQueueBuffer::zeroed(); 3];
+            let mut rsp_bufs: [DspQueueBuffer; 2] = [DspQueueBuffer::zeroed(); 2];
             let mut rsp_msg_len: u32 = 0;
             let mut rsp_flags: u32 = 0;
 
