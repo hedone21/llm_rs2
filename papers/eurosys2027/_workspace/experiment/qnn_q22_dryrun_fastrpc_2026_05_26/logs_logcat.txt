@@ -1,0 +1,25 @@
+05-26 12:18:02.030 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/rpcmem_android.c:210: set up allocator 0xb40000736f7a6c50 for DMA buf heap system, ION heap system, heap mask 0x2000000, flags 0x1, legacy flags 0x1
+05-26 12:18:02.031 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:336: Reading configuration file: microbench_htp_fastrpc_dryrun.debugconfig
+05-26 12:18:02.031 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:367: fastrpc_config_init: Couldn't find file microbench_htp_fastrpc_dryrun.debugconfig, errno (No such file or directory) at /vendor/lib64/rfs/dsp, /vendor/lib/rfsa/adsp,
+05-26 12:18:02.031 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4957: fastrpc_apps_user_init done  with default domain:3 and &fastrpc_trace:0x728cf78680
+05-26 12:18:02.031 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:5071: multidsplib_env_init: libcdsprpc.so loaded
+05-26 12:18:02.031 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2890: remote_session_control Unsigned PD enable 1 request for domain 7
+05-26 12:18:02.031 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4532: close_dev: unloading library libcdsprpc.so
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 0: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 1: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 2: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 3: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 4: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 5: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 6: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 7: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 8: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 9: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 10: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 11: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 12: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 13: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 14: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 15: dev -1
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/rpcmem_android.c:357: rpcmem_deinit_internal done
+05-26 12:18:02.032 24717 24717 I microbench_htp_fastrpc_dryrun: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4858: fastrpc_apps_user_deinit done

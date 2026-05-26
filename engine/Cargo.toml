@@ -125,6 +125,10 @@ name = "microbench_htp_matmul_correctness"
 path = "microbench/htp_matmul_correctness.rs"
 
 [[bin]]
+name = "microbench_htp_fastrpc_dryrun"
+path = "microbench/htp_fastrpc_dryrun.rs"
+
+[[bin]]
 name = "microbench_htp_opencl_interop"
 path = "microbench/htp_opencl_interop.rs"
 
