@@ -237,6 +237,25 @@ pub type RemoteHandle64ControlFn =
 pub type RemoteSessionControlFn =
     unsafe extern "C" fn(req: u32, data: *mut c_void, datalen: u32) -> c_int;
 
+/// `remote_register_buf_attr2` — rpcmem buffer 를 FastRPC call 에 사용 가능하도록
+/// driver-internal table 에 등록. `fastrpc_mmap` 와는 별개 (mmap = SMMU 매핑,
+/// register = ref count + zero-copy 가능 표시). dspqueue_write 가 buffer 를
+/// attach 할 때 driver 가 본 table 을 lookup 해 ref count 를 +1; 미등록 buffer
+/// 면 ref=-1 underflow 로 `AEE_EUNABLETOLOAD (0xe)` fail.
+///
+/// QC `inc/remote.h`: `void remote_register_buf_attr2(void* buf, size_t size,
+/// int fd, int attr);`. `fd = -1` 로 호출하면 deregister.
+pub type RemoteRegisterBufAttr2Fn =
+    unsafe extern "C" fn(buf: *mut c_void, size: usize, fd: c_int, attr: c_int);
+
+/// `remote_register_buf_attr2` 의 `attr` 인자 상수 (QC `inc/remote.h`).
+///
+/// PoC 본 sprint 는 `FASTRPC_ATTR_NONE = 0` 사용 (default, llama.cpp 동일).
+pub const FASTRPC_ATTR_NONE: c_int = 0;
+pub const FASTRPC_ATTR_NON_COHERENT: c_int = 2;
+pub const FASTRPC_ATTR_COHERENT: c_int = 4;
+pub const FASTRPC_ATTR_KEEP_MAP: c_int = 8;
+
 // Note: `remote_handle64_invoke` 는 htp_iface_start/stop lifecycle IDL call
 // 용으로만 사용 (op dispatch path 아님). signature 단순화: scalars + raw arg
 // array. PoC scope 에서는 직접 사용하지 않고 host.rs 의 lifecycle helper
@@ -270,6 +289,9 @@ pub struct HtpFastrpcHost {
     pub rpcmem_to_fd: RpcmemToFdFn,
     pub fastrpc_mmap: FastrpcMmapFn,
     pub fastrpc_munmap: FastrpcMunmapFn,
+    /// `remote_register_buf_attr2` — optional. 미export device 는 None →
+    /// `RpcmemBuffer::alloc` 가 silent skip (이전 동작 유지).
+    pub remote_register_buf_attr2: Option<RemoteRegisterBufAttr2Fn>,
     pub dspqueue_create: DspqueueCreateFn,
     pub dspqueue_close: DspqueueCloseFn,
     pub dspqueue_export: DspqueueExportFn,
@@ -445,6 +467,13 @@ impl HtpFastrpcHost {
         let rpcmem_to_fd: RpcmemToFdFn = dlsym!(lib, RpcmemToFdFn, b"rpcmem_to_fd\0");
         let fastrpc_mmap: FastrpcMmapFn = dlsym!(lib, FastrpcMmapFn, b"fastrpc_mmap\0");
         let fastrpc_munmap: FastrpcMunmapFn = dlsym!(lib, FastrpcMunmapFn, b"fastrpc_munmap\0");
+        // remote_register_buf_attr2 는 optional. libcdsprpc.so 의 strings export
+        // 에 존재 (S25 vendor lib 검증) 하지만 구 driver 호환 위해 None tolerant.
+        let remote_register_buf_attr2: Option<RemoteRegisterBufAttr2Fn> = unsafe {
+            lib.get::<RemoteRegisterBufAttr2Fn>(b"remote_register_buf_attr2\0")
+                .ok()
+                .map(|s| *s)
+        };
         let dspqueue_create: DspqueueCreateFn = dlsym!(lib, DspqueueCreateFn, b"dspqueue_create\0");
         let dspqueue_close: DspqueueCloseFn = dlsym!(lib, DspqueueCloseFn, b"dspqueue_close\0");
         let dspqueue_export: DspqueueExportFn = dlsym!(lib, DspqueueExportFn, b"dspqueue_export\0");
@@ -633,6 +662,7 @@ impl HtpFastrpcHost {
             rpcmem_to_fd,
             fastrpc_mmap,
             fastrpc_munmap,
+            remote_register_buf_attr2,
             dspqueue_create,
             dspqueue_close,
             dspqueue_export,

@@ -77,9 +77,23 @@ pub const HTP_OPFLAGS_EARLY_WAKEUP: u32 = 1 << 2;
 //
 // 본 모듈에 두는 이유: `htp_general_req` 와 함께 enqueue 되는 동반 데이터라
 // idl schema 의 일부로 묶는다. dspqueue 자체는 transport 라 host.rs 에 있다.
+//
+// QC fastrpc 오픈소스 `inc/dspqueue.h` 정확값 (β-1.QUEUE 정정, 2026-05-26):
+//
+//   DSPQUEUE_BUFFER_FLAG_REF                  = 0x04
+//   DSPQUEUE_BUFFER_FLAG_DEREF                = 0x08
+//   DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER         = 0x10
+//   DSPQUEUE_BUFFER_FLAG_INVALIDATE_SENDER    = 0x20
+//   DSPQUEUE_BUFFER_FLAG_FLUSH_RECIPIENT      = 0x40
+//   DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT = 0x80
+//
+// β-1.MAP root cause 와 동일 클래스: 이전 `1 << 0` / `1 << 1` 은 driver 가
+// 인식하지 못하는 reserved/invalid bit. logcat 에 `flags 0x3` 으로 그대로
+// 흘러나오며 `dspqueue_write` 가 `AEE_EUNABLETOLOAD (0xe)` + driver-side
+// `fastrpc_buffer_ref ref=-1` 로 fail.
 
-pub const DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER: u32 = 1 << 0;
-pub const DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT: u32 = 1 << 1;
+pub const DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER: u32 = 1 << 4;
+pub const DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT: u32 = 1 << 7;
 
 /// dspqueue_buffer cache 정책 (ggml-hexagon `dspqbuf_type` 차용).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

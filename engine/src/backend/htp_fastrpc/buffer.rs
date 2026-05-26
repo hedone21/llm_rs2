@@ -19,8 +19,8 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use super::host::{
-    DspQueueBuffer, FASTRPC_MAP_FD, HtpFastrpcHost, RPCMEM_DEFAULT_FLAGS, RPCMEM_HEAP_ID_SYSTEM,
-    RPCMEM_HEAP_NOREG,
+    DspQueueBuffer, FASTRPC_ATTR_NONE, FASTRPC_MAP_FD, HtpFastrpcHost, RPCMEM_DEFAULT_FLAGS,
+    RPCMEM_HEAP_ID_SYSTEM, RPCMEM_HEAP_NOREG,
 };
 use super::idl::DspqBufferType;
 
@@ -143,6 +143,24 @@ impl RpcmemBuffer {
             ));
         }
 
+        // ── remote_register_buf_attr2 (driver-internal ref count 보장) ─────
+        //
+        // β-1.QUEUE.2: `fastrpc_mmap` 은 SMMU 매핑만 set 하고 driver-internal
+        // buffer ref count 는 별도 API. `dspqueue_write` 가 buffer 를 attach
+        // 시 ref count +1 을 시도하지만 미등록 buffer 이면 ref=-1 underflow →
+        // `AEE_EUNABLETOLOAD (0xe)` fail (β-1.MAP 직후 logcat 패턴).
+        //
+        // QC `inc/remote.h`: "Registration functions prepare buffers for use
+        // in FastRPC calls — distinct from fastrpc_mmap() which creates
+        // mappings for DMA buffers." 즉 zero-copy 양 path 가 모두 필요.
+        //
+        // Option 이라 미export device (구 driver) 는 silent skip. S25 의
+        // libcdsprpc.so 는 export 확인됨 (host.rs dlsym 시점에 확인).
+        if let Some(register) = host.remote_register_buf_attr2 {
+            // SAFETY: ptr/size/fd 모두 직전 valid. attr=NONE 은 default.
+            unsafe { register(ptr as *mut c_void, alloc_size, fd, FASTRPC_ATTR_NONE) };
+        }
+
         Ok(Self {
             ptr,
             fd,
@@ -226,6 +244,19 @@ impl RpcmemBuffer {
 impl Drop for RpcmemBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // remote_register_buf_attr2 deregister 먼저 (fd=-1 sentinel). 등록
+            // 시점에 None 이었어도 호출 자체가 valid (no-op).
+            if let Some(register) = self.host.remote_register_buf_attr2 {
+                // SAFETY: ptr/size 는 alloc 시점 valid. fd=-1 = deregister.
+                unsafe {
+                    register(
+                        self.ptr as *mut c_void,
+                        self.alloc_size,
+                        -1,
+                        FASTRPC_ATTR_NONE,
+                    );
+                }
+            }
             // mmap 했었다면 munmap 먼저. munmap rc 무시 (best-effort cleanup,
             // host 의 domain 자체가 close 되면 자동 정리됨).
             if self.mapped {
