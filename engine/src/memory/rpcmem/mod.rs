@@ -12,5 +12,7 @@
 //! `RpcmemSecondaryStore` (D5'). The QNN consumer (`QnnBuffer::Rpcmem`) stays
 //! in `backend/qnn_oppkg/` as a backend-internal view (Sprint 2b cleanup).
 pub mod allocator;
+#[cfg(feature = "opencl")]
 pub mod kv_buffer;
+#[cfg(feature = "opencl")]
 pub mod opencl_alias;

@@ -63,7 +63,9 @@ use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference TransformerModel
 use crate::models::transformer::TransformerModel;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot/SecondaryMmap/SecondaryTensorInfo)
-use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap, SecondaryTensorInfo};
+use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
+#[cfg(feature = "opencl")]
+use crate::models::weights::SecondaryTensorInfo;
 use crate::pressure::weights::async_swap::AsyncSwapDispatcher;
 use crate::pressure::weights::release_worker::PrimaryReleaseWorker;
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+α)

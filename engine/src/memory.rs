@@ -20,7 +20,6 @@ pub mod galloc;
 pub mod host;
 #[cfg(feature = "opencl")]
 pub mod opencl;
-#[cfg(feature = "opencl")]
 pub mod rpcmem;
 pub mod secondary;
 
