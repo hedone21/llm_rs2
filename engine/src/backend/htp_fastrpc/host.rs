@@ -22,6 +22,7 @@
 
 use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -59,12 +60,27 @@ pub const DSPQUEUE_TIMEOUT: u32 = 10_000_000;
 pub const RPCMEM_HEAP_ID_SYSTEM: c_int = 25;
 /// rpcmem default flags. llama.cpp 동일.
 pub const RPCMEM_DEFAULT_FLAGS: u32 = 1;
+/// `RPCMEM_HEAP_NOREG` — alloc 시점에 모든 FastRPC domain 자동 register 를
+/// 막는다. 명시 `fastrpc_mmap` 으로 특정 domain 에만 register 할 때 필수.
+/// 출처: QC fastrpc 오픈소스 `inc/rpcmem.h` (github.com/quic/fastrpc).
+/// llama.cpp `ggml-hexagon.cpp:268` 가 본 값을 OR.
+///
+/// β-1.MAP 결정값: 0x40000000 (이전 0x80000000 은 `RPCMEM_HEAP_DEFAULT` 였음).
+pub const RPCMEM_HEAP_NOREG: u32 = 0x4000_0000;
+
+/// `RPCMEM_TRY_MAP_STATIC` — static map hint. SDK header 발견 정의값. 일부
+/// fastrpc 경로에서 mmap 통과 조건. β-1.MAP fallback 후보로 보유.
+pub const RPCMEM_TRY_MAP_STATIC: u32 = 0x0400_0000;
 
 /// HTP architecture version. S25 = Hexagon v79 (NSP v79).
 pub const HTP_ARCH_V79: u32 = 79;
 
-/// fastrpc_mmap flags. ggml-hexagon 은 `FASTRPC_MAP_FD = 16` 사용.
-pub const FASTRPC_MAP_FD: u32 = 16;
+/// `enum fastrpc_map_flags` — QC fastrpc 오픈소스 `inc/remote.h`.
+/// β-1.MAP 결정값: 진짜 `FASTRPC_MAP_FD = 2`. 이전 `16` 은 `FASTRPC_MAP_FD_NOMAP`
+/// 변종 ("등록만 하고 실제 mmap 은 하지 않음") 으로, `fastrpc_mmap rc=0x1 EIO`
+/// 의 root cause 였음. llama.cpp 가 `FASTRPC_MAP_FD` 심볼 그대로 사용해
+/// SDK header 의 enum 값에 의존했기에 본 PoC 도 우연히 16 을 잘못 가져왔던 것.
+pub const FASTRPC_MAP_FD: u32 = 2;
 
 // ── FastRPC request structs (mirror of remote.h) ──
 
@@ -121,35 +137,59 @@ pub struct RemoteRpcControlLatency {
 
 /// `struct dspqueue_buffer` — dspqueue_write/read 의 buffer descriptor.
 ///
-/// llama.cpp `ggml-hexagon.cpp:2224-2255` (htp_req_buff_init) 에서 사용되는
-/// field 만 명시. SDK 헤더가 stock S25 에 있지 않아 ggml-hexagon 의 사용
-/// 패턴을 ground truth 로 채택.
+/// **byte-identical to QC `inc/dspqueue.h` (BSD-3-Clause)**:
+///
+/// ```c
+/// struct dspqueue_buffer {
+///     uint32_t fd;      /* offset  0 */
+///     uint32_t size;    /* offset  4 */
+///     uint32_t offset;  /* offset  8 */
+///     uint32_t flags;   /* offset 12 */
+///     union { void *ptr; uint64_t address; }; /* offset 16 (8B align) */
+/// };
+/// /* sizeof = 24 bytes */
+/// ```
+///
+/// **Q-2.2 옵션 D continue fix (2026-05-26)**: 이전 정의는 `fd / ptr / offset /
+/// size / flags / reserved[3]` (= 40 B) 순서 — ggml-hexagon 의 field 사용
+/// 순서(`d->fd, d->ptr, d->offset, d->size, d->flags`)를 struct layout 으로
+/// 오인. driver 는 `(fd, size, offset, flags, ptr)` 순으로 read 하므로 우리
+/// `ptr` 의 하위 4 B 가 driver 의 `size` 슬롯, 상위 4 B 가 `offset` 슬롯으로
+/// 잘못 해석되어:
+///   - logcat `b->offset == 0` assertion fail (line 1208) — ptr 상위 32bit
+///   - logcat `(b->flags & DSPQUEUE_BUFFER_FLAG_DEREF) == 0` fail (line 1185)
+///     — flags 슬롯이 우리 `offset` (=0) 으로 잘못 읽힘
+///   - logcat `fastrpc_buffer_ref ref=-1` (line 1196) — driver 가 알 수 없는
+///     fd/size 조합으로 buffer registry lookup 실패
+///
+/// 출처: <https://raw.githubusercontent.com/quic/fastrpc/master/inc/dspqueue.h>
+/// (commit 시점 무관, BSD-3-Clause). llama.cpp 의 field 이름 사용은 동일
+/// (`fd/ptr/offset/size/flags`) 하나 declaration 순서는 SDK 헤더가 진짜.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct DspQueueBuffer {
     /// rpcmem fd (mandatory).
-    pub fd: c_int,
-    /// host virtual address (mandatory).
-    pub ptr: *mut c_void,
-    /// offset within the mapped region.
-    pub offset: u32,
-    /// byte size to transfer.
+    pub fd: u32,
+    /// byte size to transfer. `0` 이면 framework 가 mapped size 로 자동 set.
     pub size: u32,
+    /// offset within the mapped region. `ptr` 이 이미 offset 포함.
+    pub offset: u32,
     /// cache maintenance flags. `DSPQUEUE_BUFFER_FLAG_*`.
     pub flags: u32,
-    /// pad / reserved. ggml-hexagon 은 memset(0) 후 명시 field 만 set.
-    pub reserved: [u32; 3],
+    /// host virtual address (NULL = remote-only mapping). `ptr` 은 offset
+    /// 가산된 주소. union 의 `ptr` variant 사용. address (u64) variant 는
+    /// `ptr` 와 같은 8 B 슬롯.
+    pub ptr: *mut c_void,
 }
 
 impl DspQueueBuffer {
     pub const fn zeroed() -> Self {
         Self {
             fd: 0,
-            ptr: core::ptr::null_mut(),
-            offset: 0,
             size: 0,
+            offset: 0,
             flags: 0,
-            reserved: [0; 3],
+            ptr: core::ptr::null_mut(),
         }
     }
 }
@@ -221,6 +261,25 @@ pub type RemoteHandle64ControlFn =
 pub type RemoteSessionControlFn =
     unsafe extern "C" fn(req: u32, data: *mut c_void, datalen: u32) -> c_int;
 
+/// `remote_register_buf_attr2` — rpcmem buffer 를 FastRPC call 에 사용 가능하도록
+/// driver-internal table 에 등록. `fastrpc_mmap` 와는 별개 (mmap = SMMU 매핑,
+/// register = ref count + zero-copy 가능 표시). dspqueue_write 가 buffer 를
+/// attach 할 때 driver 가 본 table 을 lookup 해 ref count 를 +1; 미등록 buffer
+/// 면 ref=-1 underflow 로 `AEE_EUNABLETOLOAD (0xe)` fail.
+///
+/// QC `inc/remote.h`: `void remote_register_buf_attr2(void* buf, size_t size,
+/// int fd, int attr);`. `fd = -1` 로 호출하면 deregister.
+pub type RemoteRegisterBufAttr2Fn =
+    unsafe extern "C" fn(buf: *mut c_void, size: usize, fd: c_int, attr: c_int);
+
+/// `remote_register_buf_attr2` 의 `attr` 인자 상수 (QC `inc/remote.h`).
+///
+/// PoC 본 sprint 는 `FASTRPC_ATTR_NONE = 0` 사용 (default, llama.cpp 동일).
+pub const FASTRPC_ATTR_NONE: c_int = 0;
+pub const FASTRPC_ATTR_NON_COHERENT: c_int = 2;
+pub const FASTRPC_ATTR_COHERENT: c_int = 4;
+pub const FASTRPC_ATTR_KEEP_MAP: c_int = 8;
+
 // Note: `remote_handle64_invoke` 는 htp_iface_start/stop lifecycle IDL call
 // 용으로만 사용 (op dispatch path 아님). signature 단순화: scalars + raw arg
 // array. PoC scope 에서는 직접 사용하지 않고 host.rs 의 lifecycle helper
@@ -254,6 +313,9 @@ pub struct HtpFastrpcHost {
     pub rpcmem_to_fd: RpcmemToFdFn,
     pub fastrpc_mmap: FastrpcMmapFn,
     pub fastrpc_munmap: FastrpcMunmapFn,
+    /// `remote_register_buf_attr2` — optional. 미export device 는 None →
+    /// `RpcmemBuffer::alloc` 가 silent skip (이전 동작 유지).
+    pub remote_register_buf_attr2: Option<RemoteRegisterBufAttr2Fn>,
     pub dspqueue_create: DspqueueCreateFn,
     pub dspqueue_close: DspqueueCloseFn,
     pub dspqueue_export: DspqueueExportFn,
@@ -275,7 +337,71 @@ pub struct HtpFastrpcHost {
     pub queue: DspQueueT,
     /// dspqueue_export 로 얻은 queue id (DSP 측에서 import 시 사용).
     pub queue_id: u64,
+    /// `htp_iface_start` 호출 후 true. Drop / shutdown 에서 stop 호출 여부
+    /// 분기. `Acquire`/`Release` 로 publish.
+    iface_started: AtomicBool,
 }
+
+/// FastRPC `remote_arg` (buf variant). `remote.h` 에서:
+///
+/// ```c
+/// typedef struct remote_buf { void *pv; size_t nLen; } remote_buf;
+/// typedef union remote_arg { remote_buf buf; uint32_t h; } remote_arg;
+/// ```
+///
+/// aarch64-linux-android: pv (8B) + n_len (8B) = 16B, alignment 8.
+/// htp_iface 의 lifecycle method 는 buf variant 만 사용한다 (handle variant
+/// 는 dspqueue 등 다른 경로용).
+#[repr(C)]
+struct RemoteArgBuf {
+    pv: *mut c_void,
+    n_len: usize,
+}
+
+/// `REMOTE_SCALARS_MAKEX(nAttr, nMethod, nIn, nOut, noIn, noOut)` — remote.h.
+///
+/// ```c
+/// #define REMOTE_SCALARS_MAKEX(nAttr,nMethod,nIn,nOut,noIn,noOut) \
+///     ((((uint32_t)  (nAttr) & 0x07) << 29) | \
+///      (((uint32_t)(nMethod) & 0x1f) << 24) | \
+///      (((uint32_t)    (nIn) & 0xff) << 16) | \
+///      (((uint32_t)   (nOut) & 0xff) <<  8) | \
+///      (((uint32_t)   (noIn) & 0x0f) <<  4) | \
+///       ((uint32_t)  (noOut)         & 0x0f))
+/// ```
+#[inline]
+const fn remote_scalars_makex(
+    attr: u32,
+    method: u32,
+    n_in: u32,
+    n_out: u32,
+    no_in: u32,
+    no_out: u32,
+) -> u32 {
+    ((attr & 0x7) << 29)
+        | ((method & 0x1f) << 24)
+        | ((n_in & 0xff) << 16)
+        | ((n_out & 0xff) << 8)
+        | ((no_in & 0xf) << 4)
+        | (no_out & 0xf)
+}
+
+// ── htp_iface method IDs (llama.cpp build-snapdragon/.../htp_iface_stub.c) ──
+//
+// `static const Method methods[4] = { ... }` 의 array index = method id.
+// open/close 는 `remote_handle64_{open,close}` 가 직접 처리 → invoke 안 씀.
+//
+// | method        | mid | sc (host)             | primIn size | layout                                      |
+// |---------------|-----|-----------------------|-------------|---------------------------------------------|
+// | start         | 2   | MAKEX(0,2,1,0,0,0)    | 24 B        | u32 sess_id @0, u64 queue_id @8, u32 nhvx @16 |
+// | stop          | 3   | MAKEX(0,3,0,0,0,0)    | 0 (no pra)  | —                                           |
+// | enable_etm    | 4   | MAKEX(0,4,0,0,0,0)    | 0           | —                                           |
+// | disable_etm   | 5   | MAKEX(0,5,0,0,0,0)    | 0           | —                                           |
+
+const HTP_IFACE_MID_START: u32 = 2;
+const HTP_IFACE_MID_STOP: u32 = 3;
+const HTP_IFACE_MID_ENABLE_ETM: u32 = 4;
+const HTP_IFACE_MID_DISABLE_ETM: u32 = 5;
 
 // SAFETY: 모든 FFI symbol pointer 는 dlopen 으로부터 얻은 process-global
 // 주소이며 thread-safe 호출이 보장된다 (libcdsprpc 자체가 multi-thread
@@ -365,6 +491,25 @@ impl HtpFastrpcHost {
         let rpcmem_to_fd: RpcmemToFdFn = dlsym!(lib, RpcmemToFdFn, b"rpcmem_to_fd\0");
         let fastrpc_mmap: FastrpcMmapFn = dlsym!(lib, FastrpcMmapFn, b"fastrpc_mmap\0");
         let fastrpc_munmap: FastrpcMunmapFn = dlsym!(lib, FastrpcMunmapFn, b"fastrpc_munmap\0");
+        // remote_register_buf_attr2 — env var 로 control (옵션 D ablation).
+        //
+        // β-1.QUEUE.2 에서 `ref_count=-1` logcat 우회 위해 추가. 그러나 옵션 D
+        // (2026-05-26) 측정에서 `dspqueue_write rc=0xe (AEE_EUNABLETOLOAD)` fail
+        // 잔존. llama.cpp `ggml-hexagon.cpp` 는 `remote_register_buf_attr2` 호출
+        // 안 함 (fastrpc_mmap + FASTRPC_MAP_FD 만으로 dspqueue dispatch GREEN).
+        //
+        // default = OFF (llama.cpp 와 동일 path). 비교 ablation 필요시
+        // `HTP_FASTRPC_REGISTER_BUF=1` 환경변수로 강제 enable.
+        let remote_register_buf_attr2: Option<RemoteRegisterBufAttr2Fn> =
+            if std::env::var_os("HTP_FASTRPC_REGISTER_BUF").is_some() {
+                unsafe {
+                    lib.get::<RemoteRegisterBufAttr2Fn>(b"remote_register_buf_attr2\0")
+                        .ok()
+                        .map(|s| *s)
+                }
+            } else {
+                None
+            };
         let dspqueue_create: DspqueueCreateFn = dlsym!(lib, DspqueueCreateFn, b"dspqueue_create\0");
         let dspqueue_close: DspqueueCloseFn = dlsym!(lib, DspqueueCloseFn, b"dspqueue_close\0");
         let dspqueue_export: DspqueueExportFn = dlsym!(lib, DspqueueExportFn, b"dspqueue_export\0");
@@ -381,36 +526,52 @@ impl HtpFastrpcHost {
         let remote_session_control: RemoteSessionControlFn =
             dlsym!(lib, RemoteSessionControlFn, b"remote_session_control\0");
 
-        // ── Step 3: FASTRPC_RESERVE_NEW_SESSION ──
+        // ── Step 3: FASTRPC_RESERVE_NEW_SESSION (옵션 D 가설 3 ablation) ──
+        //
+        // llama.cpp `ggml-hexagon.cpp:1559-1577` 는 `dev_id != 0` 일 때만 RESERVE
+        // 호출. dev_id == 0 (single session) 은 RESERVE skip + `domain_id=3` /
+        // `session_id=0` hardcode. logcat 비교:
+        //   - llama.cpp (dev_id=0): `domain-id 3 session-id 0` → dispatch GREEN
+        //   - 우리 (RESERVE 항상): `domain_id=7 session_id=1` → dspqueue_write fail
+        //
+        // env `HTP_FASTRPC_DEV0_PATH=1` 로 dev_id=0 path 강제 (RESERVE skip).
+        // default = RESERVE 호출 (기존 동작).
         let mut domain_name = CDSP_DOMAIN_NAME.as_bytes().to_vec();
         domain_name.push(0); // null-terminate
         let mut session_name_bytes = session_name.as_bytes().to_vec();
         session_name_bytes.push(0);
 
-        let mut reserve_req = RemoteRpcReserveNewSession {
-            domain_name: domain_name.as_mut_ptr(),
-            domain_name_len: (domain_name.len() - 1) as u32,
-            session_name: session_name_bytes.as_mut_ptr(),
-            session_name_len: (session_name_bytes.len() - 1) as u32,
-            effective_domain_id: 0,
-            session_id: 0,
-        };
-        let reserve_size = core::mem::size_of::<RemoteRpcReserveNewSession>() as u32;
+        let (domain_id, session_id) = if std::env::var_os("HTP_FASTRPC_DEV0_PATH").is_some() {
+            // dev_id=0 path: RESERVE skip, CDSP default (domain 3, session 0).
+            (3i32, 0u32)
+        } else {
+            let mut reserve_req = RemoteRpcReserveNewSession {
+                domain_name: domain_name.as_mut_ptr(),
+                domain_name_len: (domain_name.len() - 1) as u32,
+                session_name: session_name_bytes.as_mut_ptr(),
+                session_name_len: (session_name_bytes.len() - 1) as u32,
+                effective_domain_id: 0,
+                session_id: 0,
+            };
+            let reserve_size = core::mem::size_of::<RemoteRpcReserveNewSession>() as u32;
 
-        // SAFETY: req struct + size 가 일치하며 buffer 는 stack live.
-        let rc = unsafe {
-            remote_session_control(
-                FASTRPC_RESERVE_NEW_SESSION,
-                &mut reserve_req as *mut _ as *mut c_void,
-                reserve_size,
+            // SAFETY: req struct + size 가 일치하며 buffer 는 stack live.
+            let rc = unsafe {
+                remote_session_control(
+                    FASTRPC_RESERVE_NEW_SESSION,
+                    &mut reserve_req as *mut _ as *mut c_void,
+                    reserve_size,
+                )
+            };
+            if rc != AEE_SUCCESS {
+                return Err(map_aee_err(rc))
+                    .with_context(|| "htp_fastrpc: FASTRPC_RESERVE_NEW_SESSION");
+            }
+            (
+                reserve_req.effective_domain_id as i32,
+                reserve_req.session_id,
             )
         };
-        if rc != AEE_SUCCESS {
-            return Err(map_aee_err(rc))
-                .with_context(|| "htp_fastrpc: FASTRPC_RESERVE_NEW_SESSION");
-        }
-        let domain_id = reserve_req.effective_domain_id as i32;
-        let session_id = reserve_req.session_id;
 
         // ── Step 4: DSPRPC_CONTROL_UNSIGNED_MODULE ──
         let mut unsigned_req = RemoteRpcControlUnsignedModule {
@@ -508,9 +669,18 @@ impl HtpFastrpcHost {
         }
 
         // ── Step 7: dspqueue_create(128KB req, 64KB resp) ──
+        //
+        // callback context 가설 (옵션 D 가설 2): llama.cpp `ggml-hexagon.cpp:1648`
+        // 는 `(void*) this` 전달. NULL 인 우리 동작이 root cause 가능성 — env
+        // `HTP_FASTRPC_NONNULL_CTX=1` 로 dummy non-null 전달. 2026-05-26 측정
+        // 에서 가설 ✗ (동일 rc=0xe). default = NULL (기존 동작).
         let mut queue: DspQueueT = core::ptr::null_mut();
-        // SAFETY: callback/context null OK (we drive read/write explicitly,
-        // ggml-hexagon 와 동일 policy).
+        let cb_ctx: *mut c_void = if std::env::var_os("HTP_FASTRPC_NONNULL_CTX").is_some() {
+            &handle as *const _ as *mut c_void
+        } else {
+            core::ptr::null_mut()
+        };
+        // SAFETY: callback null (explicit read/write), context per env.
         let rc = unsafe {
             dspqueue_create(
                 domain_id,
@@ -519,7 +689,7 @@ impl HtpFastrpcHost {
                 64 * 1024,  // resp queue
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
-                core::ptr::null_mut(),
+                cb_ctx,
                 &mut queue as *mut _,
             )
         };
@@ -539,8 +709,10 @@ impl HtpFastrpcHost {
             return Err(map_aee_err(rc)).with_context(|| "htp_fastrpc: dspqueue_export");
         }
 
-        // PoC scope: `htp_iface_start(handle, dev_id, queue_id, n_hvx)` 는
-        // Phase 4 작업. 본 단계에서는 setup 완료 ready state 까지만 보장.
+        // `htp_iface_start(handle, sess_id, queue_id, n_hvx)` 는 caller
+        // (HtpFastrpcBackend::new) 가 본 인스턴스의 [`try_start_iface`] 를
+        // 명시 호출한다. n_hvx 정책 분리를 위해 new_internal 은 setup ready
+        // state 까지만 보장.
 
         Ok(Arc::new(Self {
             lib,
@@ -551,6 +723,7 @@ impl HtpFastrpcHost {
             rpcmem_to_fd,
             fastrpc_mmap,
             fastrpc_munmap,
+            remote_register_buf_attr2,
             dspqueue_create,
             dspqueue_close,
             dspqueue_export,
@@ -566,14 +739,128 @@ impl HtpFastrpcHost {
             handle,
             queue,
             queue_id,
+            iface_started: AtomicBool::new(false),
         }))
+    }
+
+    /// `htp_iface_start(handle, sess_id, queue_id, n_hvx)` IDL invocation.
+    ///
+    /// 자동 생성 stub `htp_iface_stub.c::htp_iface_start` 의 packet schema 를
+    /// Rust 로 직접 transcribe — `mid=2`, sc = `MAKEX(0,2,1,0,0,0)`, primIn 은
+    /// 24 byte (u32 sess_id @0, u64 queue_id @8, u32 n_hvx @16). `remote_arg`
+    /// 1 개를 buf variant 로 채워 `pv=primIn`, `n_len=24`.
+    ///
+    /// `n_hvx` 는 사용할 HVX vector unit 수. llama.cpp 의 `opt_nhvx` 기본값은
+    /// 0 (= use all). PoC 는 0 을 권장 (DSP-side 가 device default 결정).
+    ///
+    /// 본 메서드는 idempotent: `iface_started` 가 이미 true 면 즉시 Ok.
+    pub fn try_start_iface(&self, n_hvx: u32) -> Result<()> {
+        if self.iface_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.handle == 0 {
+            return Err(anyhow!(
+                "htp_fastrpc: try_start_iface called with invalid handle"
+            ));
+        }
+
+        // primIn buffer — 정확히 24 byte. u64 alignment 유지.
+        let mut prim_in: [u64; 3] = [0; 3];
+        let prim_bytes =
+            unsafe { core::slice::from_raw_parts_mut(prim_in.as_mut_ptr() as *mut u8, 24) };
+        // u32 sess_id @ offset 0
+        prim_bytes[0..4].copy_from_slice(&self.session_id.to_ne_bytes());
+        // u64 queue_id @ offset 8 (offset 4..8 은 padding, primIn[0] 의 상위 4B)
+        prim_bytes[8..16].copy_from_slice(&self.queue_id.to_ne_bytes());
+        // u32 n_hvx @ offset 16
+        prim_bytes[16..20].copy_from_slice(&n_hvx.to_ne_bytes());
+
+        let mut pra = RemoteArgBuf {
+            pv: prim_in.as_mut_ptr() as *mut c_void,
+            n_len: 24,
+        };
+        let sc = remote_scalars_makex(0, HTP_IFACE_MID_START, 1, 0, 0, 0);
+
+        // SAFETY: handle valid (4-step handshake 통과 후), pra 는 stack live
+        // (호출 종료 후 즉시 무효). remote_handle64_invoke 는 동기 호출이라
+        // pra 가 호출 본문 동안 유효.
+        let rc = unsafe {
+            (self.remote_handle64_invoke)(self.handle, sc, &mut pra as *mut _ as *mut c_void)
+        };
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc)).with_context(|| {
+                format!(
+                    "htp_fastrpc: htp_iface_start (sess={}, queue_id={:#x}, n_hvx={})",
+                    self.session_id, self.queue_id, n_hvx
+                )
+            });
+        }
+        self.iface_started.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// `htp_iface_stop` IDL invocation. mid=3, sc = `MAKEX(0,3,0,0,0,0)`,
+    /// pra = NULL (인자 없음). idempotent: 시작 안 된 상태에서 호출하면 no-op.
+    ///
+    /// 자동 생성 stub `_stub_method_1` 의 호출 패턴: `remote_handle64_invoke(_handle, sc, NULL)`.
+    pub fn try_stop_iface(&self) -> Result<()> {
+        if !self.iface_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.handle == 0 {
+            // 이미 close 된 handle — Drop 의 best-effort 호출에서 진입 가능.
+            self.iface_started.store(false, Ordering::Release);
+            return Ok(());
+        }
+        let sc = remote_scalars_makex(0, HTP_IFACE_MID_STOP, 0, 0, 0, 0);
+        // SAFETY: handle valid, pra=NULL (인자 0 개).
+        let rc = unsafe { (self.remote_handle64_invoke)(self.handle, sc, core::ptr::null_mut()) };
+        // started flag 는 stop 호출 결과 무관 clear (재시도 방지).
+        self.iface_started.store(false, Ordering::Release);
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc)).with_context(|| "htp_fastrpc: htp_iface_stop");
+        }
+        Ok(())
+    }
+
+    /// `htp_iface_enable_etm` IDL invocation. mid=4. ETM = ARM/Hexagon
+    /// Embedded Trace Macrocell — 하드웨어 trace unit. profiling 인프라
+    /// 통합 시 사용. PoC scope 외라 wire-up 만 해두고 호출 site 는 없음.
+    ///
+    /// TODO(profiling): trace control flag + buffer routing 추가 후 호출.
+    #[allow(dead_code)]
+    pub fn try_enable_etm(&self) -> Result<()> {
+        let sc = remote_scalars_makex(0, HTP_IFACE_MID_ENABLE_ETM, 0, 0, 0, 0);
+        // SAFETY: handle valid (precondition).
+        let rc = unsafe { (self.remote_handle64_invoke)(self.handle, sc, core::ptr::null_mut()) };
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc)).with_context(|| "htp_fastrpc: htp_iface_enable_etm");
+        }
+        Ok(())
+    }
+
+    /// `htp_iface_disable_etm` IDL invocation. mid=5. ETM 비활성화. PoC
+    /// scope 외 (enable_etm pair).
+    #[allow(dead_code)]
+    pub fn try_disable_etm(&self) -> Result<()> {
+        let sc = remote_scalars_makex(0, HTP_IFACE_MID_DISABLE_ETM, 0, 0, 0, 0);
+        // SAFETY: handle valid.
+        let rc = unsafe { (self.remote_handle64_invoke)(self.handle, sc, core::ptr::null_mut()) };
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc)).with_context(|| "htp_fastrpc: htp_iface_disable_etm");
+        }
+        Ok(())
     }
 
     /// `htp_iface_stop` 후 `remote_handle64_close` + `dspqueue_close` 를
     /// 호출하는 명시 teardown. `Drop` 도 동일 시퀀스를 수행하지만, error
     /// 보고가 필요한 경우 본 메서드를 명시 호출한다.
     pub fn shutdown(&mut self) -> Result<()> {
-        // PoC scope: `htp_iface_stop` IDL invocation 은 Phase 4 작업.
+        // iface 가 started 상태면 stop 먼저 (lazy → close → dangling worker 회피).
+        // stop 실패는 진단 출력만 하고 진행 (handle/queue close 우선).
+        if let Err(e) = self.try_stop_iface() {
+            eprintln!("htp_fastrpc: shutdown stop_iface failed (continuing close): {e}");
+        }
 
         if !self.queue.is_null() {
             // SAFETY: queue 가 valid handle.
@@ -600,6 +887,11 @@ impl Drop for HtpFastrpcHost {
         // Best-effort teardown — Drop 안에서는 error 를 panic 으로 escalate
         // 하지 않는다 (INV-HTP-FRPC-001 lifecycle 의 1-shot 책임은 정상
         // 종료 경로에서 `shutdown` 으로 검증된다).
+        //
+        // iface_started 인 경우 DSP-side worker thread 가 dspqueue 를 detach
+        // 한 뒤 handle/queue 를 close 해야 worker leak 이 없다. stop 결과는
+        // 무시 (Drop 본질).
+        let _ = self.try_stop_iface();
         if !self.queue.is_null() {
             // SAFETY: queue 가 valid 일 때만 호출.
             unsafe { (self.dspqueue_close)(self.queue) };
@@ -653,5 +945,59 @@ mod tests {
         assert!(b.ptr.is_null());
         assert_eq!(b.size, 0);
         assert_eq!(b.flags, 0);
+    }
+
+    /// QC `inc/dspqueue.h` (BSD-3-Clause) 와 byte-identical 보장.
+    ///
+    /// layout:
+    ///   fd (u32) @0, size (u32) @4, offset (u32) @8, flags (u32) @12, ptr (u64) @16
+    ///   sizeof = 24 byte.
+    ///
+    /// 옛 layout `fd + ptr + offset + size + flags + reserved[3]` (= 40 B) 였을
+    /// 때 driver 가 우리 ptr 의 하위 32bit 를 size 슬롯, 상위 32bit 를 offset
+    /// 슬롯으로 read 해 `b->offset == 0` assertion fail. Q-2.2 옵션 D continue
+    /// fix 의 회귀 방지.
+    #[test]
+    fn dspq_buffer_layout_matches_qc_sdk() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<DspQueueBuffer>(), 24);
+        assert_eq!(offset_of!(DspQueueBuffer, fd), 0);
+        assert_eq!(offset_of!(DspQueueBuffer, size), 4);
+        assert_eq!(offset_of!(DspQueueBuffer, offset), 8);
+        assert_eq!(offset_of!(DspQueueBuffer, flags), 12);
+        assert_eq!(offset_of!(DspQueueBuffer, ptr), 16);
+    }
+
+    /// `remote_scalars_makex` 값이 llama.cpp 자동 생성 stub 의
+    /// `REMOTE_SCALARS_MAKEX` 와 일치하는지 검증. mid 별 sc encoding 은
+    /// FastRPC wire format 의 핵심이라 transcribe 정확성을 단정한다.
+    #[test]
+    fn iface_method_sc_encoding() {
+        // start(0, 2, 1, 0, 0, 0) = (2 << 24) | (1 << 16)
+        assert_eq!(
+            remote_scalars_makex(0, HTP_IFACE_MID_START, 1, 0, 0, 0),
+            0x0201_0000
+        );
+        // stop(0, 3, 0, 0, 0, 0) = (3 << 24)
+        assert_eq!(
+            remote_scalars_makex(0, HTP_IFACE_MID_STOP, 0, 0, 0, 0),
+            0x0300_0000
+        );
+        // enable_etm(0, 4, 0, 0, 0, 0) = (4 << 24)
+        assert_eq!(
+            remote_scalars_makex(0, HTP_IFACE_MID_ENABLE_ETM, 0, 0, 0, 0),
+            0x0400_0000
+        );
+        // disable_etm(0, 5, 0, 0, 0, 0) = (5 << 24)
+        assert_eq!(
+            remote_scalars_makex(0, HTP_IFACE_MID_DISABLE_ETM, 0, 0, 0, 0),
+            0x0500_0000
+        );
+    }
+
+    #[test]
+    fn remote_arg_buf_layout_size() {
+        // aarch64 / x86_64 (LP64): pv(8) + n_len(8) = 16 B.
+        assert_eq!(core::mem::size_of::<RemoteArgBuf>(), 16);
     }
 }

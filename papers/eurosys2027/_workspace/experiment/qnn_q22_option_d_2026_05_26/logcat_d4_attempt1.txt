@@ -1,0 +1,177 @@
+--------- beginning of main
+05-26 19:43:24.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779792204
+05-26 19:43:24.005  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:43:24.005  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 262 
+05-26 19:43:24.005  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663203
+05-26 19:43:24.005  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663201
+05-26 19:43:24.005  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:43:24.005  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663201
+05-26 19:43:24.005  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:43:24.005  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:43:24.451  2222  2222 I CNSS    : /sys/wifi/max_chipset_log_size doesn't exist
+05-26 19:43:24.455  2281  3729 D ConnectivityService: reportNetworkActive, notify 2 listeners
+05-26 19:43:24.986 31837 31837 E Adreno-AppProfiles: QSPM AIDL service doesn't exist
+05-26 19:43:25.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779792205
+05-26 19:43:25.002  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:43:25.002  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 262 
+05-26 19:43:25.002  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663203
+05-26 19:43:25.002  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663201
+05-26 19:43:25.002  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:43:25.002  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663201
+05-26 19:43:25.002  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:43:25.003  1798  2034 E HeatmapThread: !@ CAM is Working
+--------- beginning of system
+05-26 19:43:25.699  1117  1117 D io_stats: !@ Write_top(KB): kworker/u17:3:/(26182) 48
+05-26 19:43:26.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779792206
+05-26 19:43:26.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:43:26.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 262 
+05-26 19:43:26.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663203
+05-26 19:43:26.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663201
+05-26 19:43:26.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:43:26.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663201
+05-26 19:43:26.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:43:26.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:43:26.447  1760  2613 I thermal_core: pivot(AP) : 278, skin : 282
+05-26 19:43:26.480  2281  6076 D NetdEventListenerService: CSC Feature value: true
+05-26 19:43:26.480  1725  1742 D AHAL_ModulePrimary_QTI: getVendorParameters: id count: 1
+05-26 19:43:26.480  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:43:26.480  1725  1742 D AHAL_SecModulePrimary: onGetSECGenericParameters get temperature for g_hw_speaker_amp_temp_rcv: 0
+05-26 19:43:26.480  1725  1742 D AHAL_ModulePrimary_QTI: getVendorParameters: id count: 1
+05-26 19:43:26.481  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:43:26.481  1725  1742 D AHAL_SecModulePrimary: onGetSECGenericParameters get temperature for g_hw_speaker_amp_temp_spk: 0
+05-26 19:43:26.481  5788  6546 I SDHMS:x : SIOP:: AP:278 BAT:262 USB:259 CHG:264 PA:272 WIFI:283 CF:270 BLK:0 SUBBAT:0 LRPTHM:263 SKIN:281 SKINF:277 SKINB:281 LRP:281 LRF:277 LRB:281 APT:276 APR:281 RCV:271 SPK:280 CHGF:277 CHGR:281 MEMF:276 MEMR:279 WIFIF:276 WIFIR:279 FCAM:258 UPSPK:263 DNSPK:258 VAP:266 VWIFI:271 AMB2:253 HIGH:0 AVGCUR:0 POWER:0
+05-26 19:43:26.481  5788  6546 I AudioManager: setParameters keyValuePairs = g_hw_speaker_amp_temp_spk=28
+05-26 19:43:26.481  1786 32265 D AudioFlinger: setParameters: filtered dev setParameters keyvalue g_hw_speaker_amp_temp_spk=28
+05-26 19:43:26.481  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters enter
+05-26 19:43:26.481  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters Exit
+05-26 19:43:26.482  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: configured g_hw_speaker_amp_temp_spk
+05-26 19:43:26.482  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: handler set on Feature:0
+05-26 19:43:26.482  1725  1742 D AHAL_SecModulePrimary: onSetSECGenericParameters set temperature for g_hw_speaker_amp_temp_spk: 28
+05-26 19:43:26.482  1725  1742 I PAL: API: pal_set_param: 1377: Enter: param id 3002
+05-26 19:43:26.482  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:43:26.482  1786 32265 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:43:26.482  1786 32265 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:43:26.482  5788  6546 I AudioManager: setParameters keyValuePairs = g_hw_speaker_amp_temp_rcv=27
+05-26 19:43:26.482  1786 32265 D AudioFlinger: setParameters: filtered dev setParameters keyvalue g_hw_speaker_amp_temp_rcv=27
+05-26 19:43:26.482  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters enter
+05-26 19:43:26.482  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters Exit
+05-26 19:43:26.482  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: configured g_hw_speaker_amp_temp_rcv
+05-26 19:43:26.482  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: handler set on Feature:0
+05-26 19:43:26.482  1725  1742 D AHAL_SecModulePrimary: onSetSECGenericParameters set temperature for g_hw_speaker_amp_temp_rcv: 27
+05-26 19:43:26.482  1725  1742 I PAL: API: pal_set_param: 1377: Enter: param id 3001
+05-26 19:43:26.482  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:43:26.482  1786 32265 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:43:26.482  1786 32265 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:43:26.760 24906 24959 I Finsky  : [56] Stats for Executor: LightweightExecutor vrc@341b1d4[Running, pool size = 4, active threads = 0, queued tasks = 0, completed tasks = 942]
+05-26 19:43:26.760 24906 24959 I Finsky  : [56] Stats for Executor: BlockingExecutor vrc@f26896[Running, pool size = 0, active threads = 0, queued tasks = 0, completed tasks = 101]
+05-26 19:43:26.760 24906 24959 I Finsky  : [56] Stats for Executor: bgExecutor vrc@6f9cf76[Running, pool size = 4, active threads = 0, queued tasks = 0, completed tasks = 2264]
+05-26 19:43:26.819 24906 24959 I Finsky  : [56] Stats for Executor: GrpcBackgroundExecutor vrc@6b851b8[Running, pool size = 3, active threads = 0, queued tasks = 0, completed tasks = 3]
+05-26 19:43:27.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779792207
+05-26 19:43:27.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:43:27.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 262 
+05-26 19:43:27.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663203
+05-26 19:43:27.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663201
+05-26 19:43:27.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:43:27.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663201
+05-26 19:43:27.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:43:27.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:43:27.649 31837 31837 I DMABUFHEAPS: Using DMA-BUF heap named: system
+05-26 19:43:27.649 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/rpcmem_android.c:210: set up allocator 0xb400007a3677cd50 for DMA buf heap system, ION heap system, heap mask 0x2000000, flags 0x1, legacy flags 0x1
+05-26 19:43:27.649 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:336: Reading configuration file: microbench_htp_rmsnorm.debugconfig
+05-26 19:43:27.649 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:367: fastrpc_config_init: Couldn't find file microbench_htp_rmsnorm.debugconfig, errno (No such file or directory) at /vendor/lib64/rfs/dsp, /vendor/lib/rfsa/adsp,
+05-26 19:43:27.649 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4957: fastrpc_apps_user_init done  with default domain:3 and &fastrpc_trace:0x79a4bf8680
+05-26 19:43:27.649 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:5071: multidsplib_env_init: libcdsprpc.so loaded
+05-26 19:43:27.649 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2890: remote_session_control Unsigned PD enable 1 request for domain 7
+05-26 19:43:27.649 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 133 for domain 7 is 1
+05-26 19:43:27.649 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: close_device_node: closed dev 9 on domain 7
+05-26 19:43:27.649 31837 31837 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3868: Error 0xd: open_shell failed for domain 3 search paths used are /usr/lib/dsp/, /vendor/dsp/, /vendor/dsp/xdsp/ (errno Permission denied)
+05-26 19:43:27.649 31837 31837 W libc    : Access denied finding property "persist.vendor.fastrpc.process.attrs"
+05-26 19:43:27.649 31837 31837 W libc    : Access denied finding property "persist.vendor.fastrpc.process.clockvote"
+05-26 19:43:27.650  2353  2393 I cdsprpcd: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1023: Successfully opened file /vendor/dsp/cdsp/fastrpc_shell_unsigned_3
+05-26 19:43:27.671 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3948: Created user PD on domain 7, dbg_trace 0x0, enabled attr=> RPC timeout:0, Dbg Mode:N, CRC:N, Unsigned:Y, Signed:N, Adapt QOS:N, PD dump: (Config:N, Dbg:N), Perf: (Kernel:N, DSP:N), Iregion:N, QTF:N, UAF:N userPD initmem len:0x500000, Log pkt: N
+05-26 19:43:27.671 31837 31837 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3903: Error 0xffffffff: fastrpc_enable_kernel_optimizations failed for domain 7 (Bad address)
+05-26 19:43:27.672 31837 31837 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/log_config.c:608:Error : Unable to add watcher for folder /vendor/lib64/rfs/dsp : errno is Permission denied
+05-26 19:43:27.672 31837 31837 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/log_config.c:608:Error : Unable to add watcher for folder /vendor/lib/rfsa/adsp : errno is Permission denied
+05-26 19:43:27.672 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_perf.c:292: fastrpc_perf_init: enabled systrace 0x0 and RPC traces (kernel 0, dsp 0) with frequency 1000
+05-26 19:43:27.672 31837 31848 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/listener_android.c:119: listener thread starting
+05-26 19:43:27.672 31837 31849 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/log_config.c:360: file_watcher_thread starting for domain 7
+05-26 19:43:27.672 31837 31849 W microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/log_config.c:380:file_watcher_thread: Couldn't find file microbench_htp_rmsnorm.farf, errno (No such file or directory) at ;/vendor/lib64/rfs/dsp;/vendor/lib/rfsa/adsp;/vendor/lib/rfsa/dsp;/vendor/dsp;
+05-26 19:43:27.672 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 129 for domain 7 is 1
+05-26 19:43:27.674 31837 31848 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/mod_table.c:701: open_mod_table_open_from_static: reverse module apps_std opened with handle 0xa4bfb3e8 (idx 0)
+05-26 19:43:27.675 31837 31848 D microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for ./libggml-htp-v79.so with       fopen:35us, read:247us, rpc_alloc:46us,       mmap:297us fd 0x11 error_code 0x0
+05-26 19:43:27.675 31837 31848 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1133: Successfully opened file ./libggml-htp-v79.so
+05-26 19:43:27.679 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1800: remote_handle64_open: opened handle 0xb400007a667f2e90 (remote 0x2d2f60) for file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=1 on domain 7 (spawn time 23479 us, load time 6400 us), refs 1
+05-26 19:43:27.679 31837 31850 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_latency.c:98: fastrpc_latency_thread_handler started for QoS with activity window 100 ms
+05-26 19:43:27.679 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2515: remote_handle_control_domain: requested QOS 1, latency 0 for domain 7 handle 0xb400007a667f2e90
+05-26 19:43:27.680 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1800: remote_handle64_open: opened handle 0xb400007a667f0390 (remote 0x2d2d60) for file:///libdspqueue_rpc_skel.so?dspqueue_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=1 on domain 7 (spawn time 1 us, load time 294 us), refs 2
+05-26 19:43:27.680 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 10 for domain 3 is 1
+05-26 19:43:27.680 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: close_device_node: closed dev 16 on domain 3
+05-26 19:43:27.680 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:103: fastrpc_notif_domain_init: FastRPC notification worker thread launched
+05-26 19:43:27.681 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3026: remote_session_control Register PD status notification request for domain 7
+05-26 19:43:27.681 31837 31851 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2205: get_remote_notif_response: received status notification 0 for domain 3, session 1
+05-26 19:43:27.681 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 130 for domain 7 is 1
+05-26 19:43:27.681 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 259 for domain 7 is 1
+05-26 19:43:27.682 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 257 for domain 3 is 1
+05-26 19:43:27.682 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: close_device_node: closed dev 18 on domain 3
+05-26 19:43:27.682 31837 31837 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1477: Error 0x80000414: remote_handle64_invoke failed for handle 0xb400007a667f0390, interface libdspqueue_rpc_skel.so method 3 on domain 7 (sc 0x3010100) (errno Success) (user err 0x80000414)
+05-26 19:43:27.682 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/dspqueue/dspqueue_cpu.c:642: dspqueue_create: created Queue 0, 0xb400007a36779fd0, DSP 0x00000000 for domain 7
+05-26 19:43:27.683 31837 31837 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/dspqueue/dspqueue_cpu.c:1185::Error: 0xe: (b->flags & DSPQUEUE_BUFFER_FLAG_DEREF) == 0
+05-26 19:43:27.683 31837 31837 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/dspqueue/dspqueue_cpu.c:1283: Error 0xe: dspqueue_write_noblock failed for queue 0xb400007a36779fd0 (flags 0x3, num_buffers 2, message_length 312)
+05-26 19:43:27.683 31837 31837 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/dspqueue/dspqueue_cpu.c:1362: Error 0xe: dspqueue_write failed for queue 0xb400007a36779fd0 (flags 0x0, num_buffers 2, message_length 312 errno Success)
+05-26 19:43:27.686 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/dspqueue/dspqueue_cpu.c:849: dspqueue_close: destroying queues and signals for domain 7
+05-26 19:43:27.686 31837 31837 W microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1849:Warning: remote_handle_close: Non-domain usage of FastRPC will be deprecated, use domains to offload to DSP using FastRPC
+05-26 19:43:27.686 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1835: remote_handle_close_domain: closed handle 0x2d2d60 (skel unload time 268 us)
+05-26 19:43:27.686 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1920: remote_handle64_close: closed handle 0xb400007a667f0390 remote handle 0x2d2d60 name libdspqueue_rpc_skel.so, refs 1 domain 7
+05-26 19:43:27.686 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1688: List of open handles on domain 7:
+05-26 19:43:27.686 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1694: libggml-htp-v79.so, handle 0x2d2f60
+05-26 19:43:27.686 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:123: dspsignal_domain_deinit done for domain 7
+05-26 19:43:27.686 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/dspqueue/dspqueue_cpu.c:855: dspqueue_close: closed Queue 0, 0xb400007a36779fd0, DSP 0x00000000 for domain 7
+05-26 19:43:27.686 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 7: dev 9
+05-26 19:43:27.687 31837 31851 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2205: get_remote_notif_response: received status notification 1 for domain 3, session 1
+05-26 19:43:27.687 31837 31851 E microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:56:Error 0xc: notif_fastrpc_thread FastRPC notification worker thread exited for domain 7 (errno Success), notif_domain_deinit started 0
+05-26 19:43:27.687 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:123: dspsignal_domain_deinit done for domain 7
+05-26 19:43:27.687 31837 31849 W microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/log_config.c:394:Warning: file_watcher_thread received exit for domain 7, file microbench_htp_rmsnorm.farf
+05-26 19:43:27.687 31837 31849 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/log_config.c:446: file_watcher_thread exiting for domain 7
+05-26 19:43:27.687 31837 31850 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_latency.c:157: FastRPC latency thread for QoS exited
+05-26 19:43:27.687 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_latency.c:69: latency thread joined
+05-26 19:43:27.687 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:72: fastrpc_notif_domain_deinit: Waiting for FastRPC notification worker thread to join
+05-26 19:43:27.688 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:80: fastrpc_notif_domain_deinit: Fastrpc notification worker thread joined
+05-26 19:43:27.688 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/mod_table.c:792: open_mod_table_close: closed reverse module apps_std with handle 0xa4bfb3e8
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: close_device_node: closed dev 9 on domain 7
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3548: domain_deinit: closed device 9 on domain 7 (kill time 2227 us)
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1920: remote_handle64_close: closed handle 0xb400007a667f2e90 remote handle 0x2d2f60 name libggml-htp-v79.so, refs 0 domain 7
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1688: List of open handles on domain 7:
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4532: close_dev: unloading library libcdsprpc.so
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 0: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 1: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 2: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 3: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 4: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 5: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 6: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 7: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 8: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 9: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 10: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 11: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 12: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 13: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 14: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 15: dev -1
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/rpcmem_android.c:357: rpcmem_deinit_internal done
+05-26 19:43:27.690 31837 31837 I microbench_htp_rmsnorm: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4858: fastrpc_apps_user_deinit done
+05-26 19:43:28.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779792208
+05-26 19:43:28.004  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:43:28.004  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 262 
+05-26 19:43:28.005  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663203
+05-26 19:43:28.005  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663201
+05-26 19:43:28.005  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:43:28.005  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663201
+05-26 19:43:28.005  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:43:28.005  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:43:28.473  1760  1760 I seh_thermal_service: getTemperaturesWithType SehTemperatureType: 3
+05-26 19:43:28.473  1758  1758 I sehhealth-service: updateLrpSysfs: write: 281
+05-26 19:43:28.474  1758  1882 E BatteryDump: !@new_battery_dump : 4211,-10,600,1500,79,262,258,265,262,0,282,262,0,Not-charging,NO_CHARGING,Normal,Good,USB_CDP,2,Normal,0,0,9300,0x8000,0x11010000,0x0,0,0,119,v0002,0000,0000,00000000,0,0,0,0,34,4211,7895,990,0,
+05-26 19:43:28.525  2281  2976 D MARsPolicyManager: triggerAction called!
+05-26 19:43:28.525  2281  2976 I NSLocationMonitor: getGPSUsingApps() called
+05-26 19:43:28.526  5110  5156 I NSLocationManager_FLP: getGPSUsingApps, No change

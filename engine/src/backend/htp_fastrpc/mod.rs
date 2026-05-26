@@ -31,15 +31,18 @@ pub use host::{
     HTP_ARCH_V79, HtpFastrpcHost, RPCMEM_DEFAULT_FLAGS, RPCMEM_HEAP_ID_SYSTEM, RemoteHandle64,
 };
 pub use idl::{
-    DspqBufferType, HTP_MAX_DIMS, HTP_MAX_OP_PARAMS_SLOTS, HTP_MAX_PACKET_BUFFERS, HTP_OP_RMS_NORM,
-    HTP_TYPE_F16, HTP_TYPE_F32, HTP_TYPE_Q4_0, HTP_TYPE_Q8_0, HtpGeneralReq, HtpGeneralRsp,
-    HtpTensor, htp_tensor_from_shape, init_rmsnorm_req,
+    DspqBufferType, HTP_MAX_DIMS, HTP_MAX_OP_PARAMS_SLOTS, HTP_MAX_PACKET_BUFFERS, HTP_OP_ADD,
+    HTP_OP_GET_ROWS, HTP_OP_MUL, HTP_OP_MUL_MAT, HTP_OP_RMS_NORM, HTP_OP_ROPE, HTP_OP_SOFTMAX,
+    HTP_OP_UNARY_GELU, HTP_OP_UNARY_SILU, HTP_OPFLAGS_SKIP_QUANTIZE, HTP_TYPE_F16, HTP_TYPE_F32,
+    HTP_TYPE_I32, HTP_TYPE_Q4_0, HTP_TYPE_Q8_0, HtpGeneralReq, HtpGeneralRsp, HtpTensor,
+    RopeParams, SoftmaxParams, htp_tensor_from_shape, init_binary_req, init_get_rows_req,
+    init_matmul_req, init_rmsnorm_req, init_rope_req, init_softmax_req, init_unary_act_req,
 };
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::backend::{Backend, GpuEvent, GpuScoreAccess, KiviAttentionBackend};
 use crate::buffer::DType;
@@ -65,15 +68,15 @@ pub struct HtpFastrpcBackend {
     /// `cpu_singleton()` 에서 process-wide Arc 를 share.
     cpu_companion: Arc<dyn Backend>,
 
-    /// `htp_iface_start` IDL invocation 의 결과. true 면 DSP-side skel 이
-    /// dspqueue worker 를 활성화한 상태, false 면 lazy init 으로 첫
-    /// dspqueue_write 시점에 시작될 것으로 가정 (best-effort 정책).
-    iface_started: AtomicBool,
-
     /// 현재 layer index (Phase 4 placeholder, β 단계에서 graph dispatch 시 활용).
     #[allow(dead_code)]
     layer_idx: AtomicUsize,
 }
+
+/// `htp_iface_start` 의 n_hvx default. llama.cpp `ggml-hexagon.cpp::opt_nhvx`
+/// 의 기본값 0 = "use all" 와 동일. DSP-side 가 device 의 HVX unit 수에
+/// 맞춰 선택. 환경 변수로 override 가능 (`HTP_FASTRPC_N_HVX`).
+const HTP_FASTRPC_N_HVX_DEFAULT: u32 = 0;
 
 // SAFETY: HtpFastrpcHost 가 Send+Sync (dlsym 결과 fn ptr 는 process-global).
 // cpu_companion 은 Arc<dyn Backend> 로 자체 Send+Sync 보유. 나머지 atomic.
@@ -86,84 +89,35 @@ impl HtpFastrpcBackend {
     /// 시도한다 (실패해도 fatal 아님 — DSP-side skel 의 lazy init 에 의존).
     ///
     /// `cpu_companion` 은 process-wide `cpu_singleton()` 에서 share.
+    ///
+    /// 본 메서드는 `host.try_start_iface(n_hvx)` 를 명시 호출하여 DSP-side
+    /// worker thread 가 dspqueue 를 attach 한 ready state 까지 보장한다. start
+    /// 실패는 fatal — caller 가 명시적으로 error 를 받아 fallback 결정.
+    ///
+    /// `n_hvx` 는 환경 변수 `HTP_FASTRPC_N_HVX` 가 있으면 그 값, 없으면
+    /// [`HTP_FASTRPC_N_HVX_DEFAULT`] (=0, "use all").
     pub fn new(session_name: &str) -> Result<Self> {
         let host = HtpFastrpcHost::new(session_name)?;
         let cpu_companion = crate::backend::cpu::cpu_singleton();
 
-        let backend = Self {
+        let n_hvx = std::env::var("HTP_FASTRPC_N_HVX")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(HTP_FASTRPC_N_HVX_DEFAULT);
+        host.try_start_iface(n_hvx).with_context(|| {
+            format!("htp_fastrpc: HtpFastrpcBackend::new — try_start_iface(n_hvx={n_hvx}) failed")
+        })?;
+
+        Ok(Self {
             host,
             cpu_companion,
-            iface_started: AtomicBool::new(false),
             layer_idx: AtomicUsize::new(0),
-        };
-
-        // best-effort `htp_iface_start` invocation. 실패 시 lazy init 가정.
-        match backend.try_start_iface() {
-            Ok(true) => {
-                backend.iface_started.store(true, Ordering::Release);
-            }
-            Ok(false) => {
-                // iface_start skipped (e.g. non-android stub).
-            }
-            Err(e) => {
-                eprintln!(
-                    "htp_fastrpc: htp_iface_start best-effort failed ({e}); \
-                     relying on DSP-side lazy init"
-                );
-            }
-        }
-        Ok(backend)
+        })
     }
 
     /// 진단/테스트용 host 접근자.
     pub fn host(&self) -> &Arc<HtpFastrpcHost> {
         &self.host
-    }
-
-    /// `htp_iface_start(handle, sess_id, queue_id, n_hvx)` IDL invocation.
-    ///
-    /// Phase 4 best-effort: 정확한 `sc` (scalars) 값은 qaic 자동 생성 stub 에
-    /// 의존한다. 본 sprint scope 에서는 `libggml-htp-v79.so` 의 IDL helper 가
-    /// host-side 에서 사용 불가하므로 (DSP ELF) 표준 IDL stub macro 추정값
-    /// 으로 시도한다. 실패 시 caller 가 lazy init 에 의존.
-    ///
-    /// `remote_handle64_invoke(handle, sc, pra)` 의 signature 는
-    /// (handle, scalars, pra_array_ptr). `pra` 는 fastrpc method 인자
-    /// (`sess_id`, `queue_id`, `n_hvx` 3 입력) 의 raw buffer descriptor 배열.
-    ///
-    /// PoC: 본 함수가 실패해도 dspqueue_write 의 첫 호출에서 DSP-side
-    /// skel 이 lazy init 되는 것을 기대 (ggml-hexagon 동일 정책).
-    #[cfg_attr(not(target_os = "android"), allow(clippy::unnecessary_wraps))]
-    fn try_start_iface(&self) -> Result<bool> {
-        // non-android stub or DSP skel not yet wired — skip silently.
-        #[cfg(not(target_os = "android"))]
-        {
-            Ok(false)
-        }
-
-        // Android target — invoke 시도.
-        #[cfg(target_os = "android")]
-        {
-            // qaic-generated `htp_iface_start` 의 정확한 scalars (sc) 값은
-            // SDK header (htp_iface_stub.c) 의 IDL macro 결과인데, 본 sprint
-            // scope 에서는 stub 추출이 막혀 있어 fallback 추정값 0 으로 시도.
-            // 실패하면 Err 반환 — caller 가 lazy init 에 의존.
-            //
-            // PRA (parameter array) layout: 3 inputs (sess_id, queue_id, n_hvx)
-            // 를 stack-alloc 한 IDL helper 가 필요. 본 PoC 는 그 helper 까지
-            // 작성하지 않고 `pra = null` 로 보내어 실패 → lazy init 경로 강제.
-            // 추후 β 단계에서 `libggml-htp-v79.so` 의 stub 을 빌드 분석하여
-            // 정확한 sc/pra 를 채워 넣는다.
-            //
-            // best-effort 의미: 본 호출은 항상 Err 가 예상되며, caller
-            // (`new`) 는 stderr 경고만 출력하고 진행. 실제 op dispatch 의
-            // 첫 dspqueue_write 가 DSP-side skel 의 lazy init 을 트리거한다.
-            let _ = &self.host;
-            anyhow::bail!(
-                "htp_fastrpc: htp_iface_start IDL invocation not yet wired \
-                 (qaic stub extraction pending); relying on lazy init"
-            )
-        }
     }
 
     /// rms_norm 진짜 HTP 호출 path. input/output Tensor backing 이 RpcmemBuffer

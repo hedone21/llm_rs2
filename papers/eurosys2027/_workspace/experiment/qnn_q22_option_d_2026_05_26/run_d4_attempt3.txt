@@ -1,0 +1,26 @@
+=== microbench_htp_rmsnorm (Q-2.2-α PoC Phase 5) ===
+
+Config:
+  shape       = [1, 1536]
+  eps         = 0.00001
+  add_unit    = false
+  warmup iter = 10
+  measure iter= 1000
+  err thresh  = 0.001
+
+[1/3] CPU baseline (f32)
+  mean=1.05 us (median=1.04, stddev=0.55, n=1000)
+
+[2/3] OpenCL GPU
+  mean=157.04 us (median=141.09, stddev=49.26, n=1000)
+  vs CPU: max_abs_err=0.000e0, max_rel_err=0.000e0 — PASS
+
+[3/3] QNN HTP NPU (FastRPC + libggml-htp-v79.so dspqueue)
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=3, session_id=0, queue_id=56642028699648
+  htp_iface_start: OK (n_hvx=0)
+  SKIP — dspqueue_write: htp_fastrpc: AEEResult=AEE_EUNABLETOLOAD (0xe, raw=14)
+
+=== Summary ===
+CPU:          1.05 us/op (1.00x baseline)
+OpenCL:     157.04 us/op (150.11x, -99% vs CPU), err=0.00e0
+QNN HTP:  SKIP (Phase 6 device deploy required)

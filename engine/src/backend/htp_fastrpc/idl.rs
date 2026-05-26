@@ -77,9 +77,23 @@ pub const HTP_OPFLAGS_EARLY_WAKEUP: u32 = 1 << 2;
 //
 // 본 모듈에 두는 이유: `htp_general_req` 와 함께 enqueue 되는 동반 데이터라
 // idl schema 의 일부로 묶는다. dspqueue 자체는 transport 라 host.rs 에 있다.
+//
+// QC fastrpc 오픈소스 `inc/dspqueue.h` 정확값 (β-1.QUEUE 정정, 2026-05-26):
+//
+//   DSPQUEUE_BUFFER_FLAG_REF                  = 0x04
+//   DSPQUEUE_BUFFER_FLAG_DEREF                = 0x08
+//   DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER         = 0x10
+//   DSPQUEUE_BUFFER_FLAG_INVALIDATE_SENDER    = 0x20
+//   DSPQUEUE_BUFFER_FLAG_FLUSH_RECIPIENT      = 0x40
+//   DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT = 0x80
+//
+// β-1.MAP root cause 와 동일 클래스: 이전 `1 << 0` / `1 << 1` 은 driver 가
+// 인식하지 못하는 reserved/invalid bit. logcat 에 `flags 0x3` 으로 그대로
+// 흘러나오며 `dspqueue_write` 가 `AEE_EUNABLETOLOAD (0xe)` + driver-side
+// `fastrpc_buffer_ref ref=-1` 로 fail.
 
-pub const DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER: u32 = 1 << 0;
-pub const DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT: u32 = 1 << 1;
+pub const DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER: u32 = 1 << 4;
+pub const DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT: u32 = 1 << 7;
 
 /// dspqueue_buffer cache 정책 (ggml-hexagon `dspqbuf_type` 차용).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -244,6 +258,262 @@ pub fn init_rmsnorm_req(req: &mut HtpGeneralReq, eps: f32, src0: HtpTensor, dst:
     req.dst = dst;
 }
 
+/// MUL_MAT op req 초기화. src0=weight (constant, e.g. Q4_0), src1=input (F32),
+/// dst=output (F32). op_params 슬롯 미사용 (flags 로만 제어).
+///
+/// llama.cpp `ggml-hexagon.cpp::init_binary_req<true>` 의 MUL_MAT 분기와 동일.
+/// `skip_quantize=true` 이면 host 가 src1 을 미리 양자화했음을 알림 (PoC 에서는
+/// 항상 false — DSP-side dynamic quantize 사용).
+///
+/// llama.cpp DSP-side 가 지원하는 weight dtype 은 Q4_0 / Q8_0 / MXFP4
+/// (`matmul-ops.c::htp_mminit_vec_dot`). F32 weight 미지원.
+pub fn init_matmul_req(
+    req: &mut HtpGeneralReq,
+    src0: HtpTensor,
+    src1: HtpTensor,
+    dst: HtpTensor,
+    skip_quantize: bool,
+) {
+    req.op = HTP_OP_MUL_MAT;
+    req.flags = if skip_quantize {
+        HTP_OPFLAGS_SKIP_QUANTIZE
+    } else {
+        0
+    };
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.src0 = src0;
+    req.src1 = src1;
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
+/// Element-wise binary op (MUL/ADD/SUB/DIV) req 초기화. n_bufs=3 path.
+///
+/// llama.cpp `ggml-hexagon.cpp::init_binary_req<false>` (`_is_src0_constant=false`,
+/// MUL_MAT 가 아닌 element-wise) 와 동일. src0/src1 모두 host activation 이라
+/// `DSPQBUF_TYPE_CPU_WRITE_DSP_READ`. op_params 슬롯 미사용 (ggml 측에서 element-
+/// wise op 는 op_params 비어 있음 — `proc_binary_req` 가 src/dst data ptr 만
+/// 사용한다, `htp/main.c:602`).
+pub fn init_binary_req(
+    req: &mut HtpGeneralReq,
+    op: u32,
+    src0: HtpTensor,
+    src1: HtpTensor,
+    dst: HtpTensor,
+) {
+    debug_assert!(
+        op == HTP_OP_MUL || op == HTP_OP_ADD || op == HTP_OP_SUB || op == HTP_OP_DIV,
+        "init_binary_req: op must be one of MUL/ADD/SUB/DIV"
+    );
+    req.op = op;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.src0 = src0;
+    req.src1 = src1;
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
+/// Unary activation op (SILU/GELU) req 초기화. n_bufs=2 path.
+///
+/// llama.cpp `ggml-hexagon.cpp::init_unary_req` 의 `GGML_OP_UNARY` 분기와 동일.
+/// `proc_activations_req` 가 op_params 를 그대로 사용하지만 ggml unary op 의
+/// op_params 는 본질적으로 empty 라 zero-init OK (`htp/main.c:828`).
+///
+/// `src1` slot 은 미사용 (zero) — `htp/main.c:821-823` 가 `n_bufs==3` 일 때만
+/// `octx.src1` 를 채운다.
+pub fn init_unary_act_req(req: &mut HtpGeneralReq, op: u32, src0: HtpTensor, dst: HtpTensor) {
+    debug_assert!(
+        op == HTP_OP_UNARY_SILU || op == HTP_OP_UNARY_GELU,
+        "init_unary_act_req: op must be UNARY_SILU or UNARY_GELU"
+    );
+    req.op = op;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.src0 = src0;
+    req.src1 = HtpTensor::zeroed();
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
+/// ROPE op params (ggml convention).
+///
+/// **DSP-side decode slot 매핑** (ggml.c::ggml_rope_ext + rope-ops.c::execute_op_rope_f32
+/// 실측):
+///   [0] n_past (unused, 0)
+///   [1] n_dims (i32) — 회전할 dim (head_dim 이하)
+///   [2] mode (i32) — 0=normal interleaved, 2=NeoX split, 8/40=Qwen-VL
+///   [3] n_ctx (unused, 0)
+///   [4] n_ctx_orig (i32) — YaRN extension 의 원래 context length
+///   [5] freq_base (f32 bits) — Qwen2.5=1e6, Llama3=5e5
+///   [6] freq_scale (f32 bits)
+///   [7] ext_factor (f32 bits) — YaRN extrapolation factor
+///   [8] attn_factor (f32 bits)
+///   [9] beta_fast (f32 bits)
+///   [10] beta_slow (f32 bits)
+///   [11..14] sections[4] (Qwen-VL multimodal RoPE, 미사용 시 0)
+#[derive(Clone, Copy, Debug)]
+pub struct RopeParams {
+    pub n_dims: i32,
+    pub mode: i32,
+    pub n_ctx_orig: i32,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub ext_factor: f32,
+    pub attn_factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+}
+
+impl RopeParams {
+    /// Qwen2.5 vendor RoPE params (mode=0 normal interleaved, freq_base=1e6).
+    pub fn qwen2_5() -> Self {
+        Self {
+            n_dims: 128,
+            mode: 0,
+            n_ctx_orig: 32768,
+            freq_base: 1_000_000.0,
+            freq_scale: 1.0,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+        }
+    }
+}
+
+/// ROPE op req 초기화 (n_bufs=3 path — src2 freq_factors 미사용).
+///
+/// llama.cpp `ggml-hexagon.cpp::init_rope_req` 의 op_params packing 패턴 동일
+/// (`memcpy(&req->op_params, &t->op_params, sizeof(t->op_params))`). ggml.c
+/// `ggml_rope_ext` (line 4125-) 의 `params[15]` layout 을 그대로 따른다 — slot 0
+/// 과 3 은 **legacy unused (n_past / n_ctx)** 라 반드시 0 유지.
+///
+/// DSP-side `proc_rope_req` 가 n_bufs=3 path 도 분기 처리 (`htp/main.c:857-908`,
+/// `if (4 == n_bufs) octx.src2 = req->src2;` else 3-buf). src2 buffer 자체를
+/// 보내지 않으면 freq_factors=NULL 동작.
+///
+/// 인자:
+///   src0 = input `[head_dim, n_heads, n_tokens]` F32
+///   src1 = positions `[n_tokens]` i32 (HTP_TYPE_I32)
+///   dst  = output, src0 와 동일 shape
+pub fn init_rope_req(
+    req: &mut HtpGeneralReq,
+    params: &RopeParams,
+    src0: HtpTensor,
+    src1: HtpTensor,
+    dst: HtpTensor,
+) {
+    req.op = HTP_OP_ROPE;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    // slot 0 = n_past (unused, 0)
+    req.op_params[1] = params.n_dims;
+    req.op_params[2] = params.mode;
+    // slot 3 = n_ctx (unused, 0)
+    req.op_params[4] = params.n_ctx_orig;
+    req.op_params[5] = params.freq_base.to_bits() as i32;
+    req.op_params[6] = params.freq_scale.to_bits() as i32;
+    req.op_params[7] = params.ext_factor.to_bits() as i32;
+    req.op_params[8] = params.attn_factor.to_bits() as i32;
+    req.op_params[9] = params.beta_fast.to_bits() as i32;
+    req.op_params[10] = params.beta_slow.to_bits() as i32;
+    // slot 11..14 = sections[4] (Qwen-VL multimodal RoPE), unused 시 0 유지.
+    req.src0 = src0;
+    req.src1 = src1;
+    req.src2 = HtpTensor::zeroed(); // n_bufs=3 path: freq_factors 미사용
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
+/// SOFTMAX op params (ggml convention, 2 f32 slots).
+///
+/// **DSP-side decode slot 매핑** (ggml.c::ggml_soft_max_impl):
+///   [0] scale (f32 bits) — Qwen2.5/Llama 표준 attention: 1/sqrt(head_dim)
+///   [1] max_bias (f32 bits) — ALiBi max_bias, 0 for non-ALiBi (Qwen/Llama 기본)
+#[derive(Clone, Copy, Debug)]
+pub struct SoftmaxParams {
+    pub scale: f32,
+    pub max_bias: f32,
+}
+
+impl SoftmaxParams {
+    /// Qwen2.5 standard attention softmax: scale=1/sqrt(128), max_bias=0.
+    pub fn qwen2_5() -> Self {
+        Self {
+            scale: 1.0 / (128.0_f32).sqrt(),
+            max_bias: 0.0,
+        }
+    }
+}
+
+/// SOFTMAX op req 초기화 (n_bufs=2 mask-less path).
+///
+/// llama.cpp `ggml-hexagon.cpp::init_unary_req` 의 `GGML_OP_SOFT_MAX` 분기와
+/// 동일 (`memcpy(&req->op_params, &t->op_params, sizeof(t->op_params))`). ggml
+/// 의 softmax op_params 는 `{scale, max_bias}` 2 f32 slot 만 사용 (`ggml.c::
+/// ggml_soft_max_impl`).
+///
+/// DSP-side `htp/main.c:1119-1128` 는 `HTP_OP_SOFTMAX` 에 대해 n_bufs ∈ {2, 3}
+/// 모두 수용. mask 없는 path = `n_bufs=2` 로 src1 buffer 자체를 dspqueue 에
+/// 보내지 않는다.
+///
+/// 인자:
+///   src0 = attention scores `[k_len, q_len, n_heads, 1]` F32 (ggml ne[0]=innermost)
+///   dst  = output, src0 와 동일 shape
+pub fn init_softmax_req(
+    req: &mut HtpGeneralReq,
+    params: &SoftmaxParams,
+    src0: HtpTensor,
+    dst: HtpTensor,
+) {
+    req.op = HTP_OP_SOFTMAX;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.op_params[0] = params.scale.to_bits() as i32;
+    req.op_params[1] = params.max_bias.to_bits() as i32;
+    req.src0 = src0;
+    req.src1 = HtpTensor::zeroed(); // n_bufs=2 path: mask 미사용
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
+/// GET_ROWS op req 초기화 (n_bufs=3 strict).
+///
+/// llama.cpp `ggml-hexagon.cpp::init_get_rows_req` 와 동일. op_params 미사용
+/// (ggml `ggml_get_rows` 가 op_params 를 설정하지 않음). DSP-side `htp/main.c:
+/// 1162-1167` 가 `n_bufs == 3` 을 strict 요구 (src0=embed, src1=idx, dst).
+///
+/// 인자:
+///   src0 = embed table `[hidden, vocab, 1, 1]` F32/F16
+///   src1 = indices `[n_tokens, 1, 1, 1]` i32 (ggml `b->type == GGML_TYPE_I32`)
+///   dst  = gathered rows `[hidden, n_tokens, 1, 1]` F32
+pub fn init_get_rows_req(
+    req: &mut HtpGeneralReq,
+    src0: HtpTensor,
+    src1: HtpTensor,
+    dst: HtpTensor,
+) {
+    req.op = HTP_OP_GET_ROWS;
+    req.flags = 0;
+    req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+    req.src0 = src0;
+    req.src1 = src1;
+    req.src2 = HtpTensor::zeroed();
+    req.src3 = HtpTensor::zeroed();
+    req.src4 = HtpTensor::zeroed();
+    req.dst = dst;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +558,300 @@ mod tests {
         // 미사용 src1~src4 는 zero
         assert_eq!(req.src1.type_, 0);
         assert_eq!(req.src1.ne, [0; HTP_MAX_DIMS]);
+    }
+
+    #[test]
+    fn init_matmul_req_packs_constants() {
+        // Qwen2.5-1.5B Q-proj shape: W[N=1536, K=1536] Q4_0, x[K=1536] F32, y[N=1536] F32
+        const K: u32 = 1536;
+        const N: u32 = 1536;
+        // Q4_0: nb[0] = sizeof(block_q4_0) = 18, nb[1] = (K/32)*18, nb[2..3] = N*nb[1]
+        let row_bytes_w = (K / 32) * 18;
+        let plane_bytes_w = N * row_bytes_w;
+        let src0 = htp_tensor_from_shape(
+            HTP_TYPE_Q4_0,
+            [K, N, 1, 1],
+            [18, row_bytes_w, plane_bytes_w, plane_bytes_w],
+        );
+        let src1 = htp_tensor_from_shape(HTP_TYPE_F32, [K, 1, 1, 1], [4, K * 4, K * 4, K * 4]);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [N, 1, 1, 1], [4, N * 4, N * 4, N * 4]);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_matmul_req(&mut req, src0, src1, dst, false);
+
+        assert_eq!(req.op, HTP_OP_MUL_MAT);
+        assert_eq!(req.flags, 0, "skip_quantize=false → flags=0");
+        assert_eq!(req.src0.type_, HTP_TYPE_Q4_0);
+        assert_eq!(req.src1.type_, HTP_TYPE_F32);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        // 미사용 src2..src4 zero
+        assert_eq!(req.src2.type_, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+        // op_params 는 MUL_MAT 에서 미사용
+        assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
+
+        // skip_quantize=true 분기
+        let mut req2 = HtpGeneralReq::zeroed();
+        init_matmul_req(&mut req2, src0, src1, dst, true);
+        assert_eq!(req2.flags, HTP_OPFLAGS_SKIP_QUANTIZE);
+    }
+
+    #[test]
+    fn init_binary_req_mul_zeroes_unused_slots() {
+        // Qwen2.5-1.5B SwiGLU element-wise mul: x[8960] F32 × y[8960] F32 → z[8960] F32
+        const DIM: u32 = 8960;
+        let nb = [4u32, DIM * 4, DIM * 4, DIM * 4];
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_binary_req(&mut req, HTP_OP_MUL, src0, src1, dst);
+
+        assert_eq!(req.op, HTP_OP_MUL);
+        assert_eq!(req.flags, 0);
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.src1.type_, HTP_TYPE_F32);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        assert_eq!(req.src0.ne[0], DIM);
+        assert_eq!(req.src1.ne[0], DIM);
+        // 미사용 src2..src4 zero
+        assert_eq!(req.src2.type_, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+        // op_params 미사용
+        assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
+    }
+
+    #[test]
+    fn init_binary_req_add_uses_add_op() {
+        // Qwen2.5-1.5B residual add: x[1536] F32 + y[1536] F32 → z[1536] F32
+        const DIM: u32 = 1536;
+        let nb = [4u32, DIM * 4, DIM * 4, DIM * 4];
+        let t = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_binary_req(&mut req, HTP_OP_ADD, t, t, t);
+
+        assert_eq!(req.op, HTP_OP_ADD);
+        assert_eq!(req.flags, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+    }
+
+    #[test]
+    fn init_unary_act_req_silu_packs_correctly() {
+        // Qwen2.5-1.5B SiLU activation: x[8960] F32 → y[8960] F32
+        const DIM: u32 = 8960;
+        let nb = [4u32, DIM * 4, DIM * 4, DIM * 4];
+        let src = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [DIM, 1, 1, 1], nb);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_unary_act_req(&mut req, HTP_OP_UNARY_SILU, src, dst);
+
+        assert_eq!(req.op, HTP_OP_UNARY_SILU);
+        assert_eq!(req.flags, 0);
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        // n_bufs=2 path: src1 미사용 (zero)
+        assert_eq!(req.src1.type_, 0);
+        assert_eq!(req.src1.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+        // op_params 미사용
+        assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
+    }
+
+    #[test]
+    fn init_rope_req_qwen2_5_packs_op_params_correctly() {
+        // Qwen2.5-1.5B Q-rotation decode: input [head_dim=128, n_heads=12, n_tokens=1] F32
+        //                                  positions [1] i32
+        // ggml convention: slot 0=n_past, 1=n_dims, 2=mode, 3=n_ctx, 4=n_ctx_orig,
+        //                  5=freq_base, 6=freq_scale, 7=ext_factor, 8=attn_factor,
+        //                  9=beta_fast, 10=beta_slow, 11..14=sections.
+        const HEAD_DIM: u32 = 128;
+        const N_HEADS: u32 = 12;
+        const N_TOKENS: u32 = 1;
+        let nb_in = [
+            4u32,
+            HEAD_DIM * 4,
+            HEAD_DIM * N_HEADS * 4,
+            HEAD_DIM * N_HEADS * N_TOKENS * 4,
+        ];
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [HEAD_DIM, N_HEADS, N_TOKENS, 1], nb_in);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_I32, [N_TOKENS, 1, 1, 1], [4, 4, 4, 4]);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [HEAD_DIM, N_HEADS, N_TOKENS, 1], nb_in);
+
+        let params = RopeParams::qwen2_5();
+        let mut req = HtpGeneralReq::zeroed();
+        init_rope_req(&mut req, &params, src0, src1, dst);
+
+        assert_eq!(req.op, HTP_OP_ROPE);
+        assert_eq!(req.flags, 0);
+        // slot 0 = n_past (unused)
+        assert_eq!(req.op_params[0], 0, "n_past must be 0 (unused)");
+        // i32 slots
+        assert_eq!(req.op_params[1], 128, "n_dims");
+        assert_eq!(req.op_params[2], 0, "mode=normal");
+        // slot 3 = n_ctx (unused)
+        assert_eq!(req.op_params[3], 0, "n_ctx must be 0 (unused)");
+        assert_eq!(req.op_params[4], 32768, "n_ctx_orig");
+        // f32-bitcast slots
+        assert_eq!(
+            req.op_params[5],
+            1_000_000.0_f32.to_bits() as i32,
+            "freq_base"
+        );
+        assert_eq!(req.op_params[6], 1.0_f32.to_bits() as i32, "freq_scale");
+        assert_eq!(req.op_params[7], 0.0_f32.to_bits() as i32, "ext_factor");
+        assert_eq!(req.op_params[8], 1.0_f32.to_bits() as i32, "attn_factor");
+        assert_eq!(req.op_params[9], 32.0_f32.to_bits() as i32, "beta_fast");
+        assert_eq!(req.op_params[10], 1.0_f32.to_bits() as i32, "beta_slow");
+        // sections (slot 11..14) zero — Qwen2.5 는 multimodal RoPE 미사용
+        for (idx, slot) in req.op_params[11..15].iter().enumerate() {
+            assert_eq!(*slot, 0, "sections[{idx}] must be zero");
+        }
+        // slot 15 도 zero
+        assert_eq!(req.op_params[15], 0);
+        // src binding
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.src0.ne[0], HEAD_DIM);
+        assert_eq!(req.src1.type_, HTP_TYPE_I32, "positions tensor i32");
+        assert_eq!(req.src1.ne[0], N_TOKENS);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        // n_bufs=3 path — src2 미사용 (freq_factors NULL)
+        assert_eq!(req.src2.type_, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+    }
+
+    #[test]
+    fn init_rope_req_f32_bit_pattern_roundtrips() {
+        // f32::to_bits() as i32 → DSP-side *(float *)&op_params[i] read 시 원본 복원
+        // 검증. wrong cast (예: as i32 빠뜨림 → truncation) 시 freq_base 등 wrong value.
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [128, 12, 1, 1], [4, 512, 6144, 6144]);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_I32, [1, 1, 1, 1], [4, 4, 4, 4]);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [128, 12, 1, 1], [4, 512, 6144, 6144]);
+
+        let params = RopeParams::qwen2_5();
+        let mut req = HtpGeneralReq::zeroed();
+        init_rope_req(&mut req, &params, src0, src1, dst);
+
+        // 각 f32 슬롯을 다시 decode 했을 때 원본 값과 일치 (ggml slot 5..10)
+        assert_eq!(f32::from_bits(req.op_params[5] as u32), 1_000_000.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[6] as u32), 1.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[7] as u32), 0.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[8] as u32), 1.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[9] as u32), 32.0_f32);
+        assert_eq!(f32::from_bits(req.op_params[10] as u32), 1.0_f32);
+    }
+
+    #[test]
+    fn init_softmax_req_qwen2_5_packs_scale_and_max_bias() {
+        // Qwen2.5 decode attention softmax: scores [k_len=2048, q_len=1, n_heads=12, 1]
+        // ggml convention ne[0]=innermost.
+        const K_LEN: u32 = 2048;
+        const Q_LEN: u32 = 1;
+        const N_HEADS: u32 = 12;
+        let nb = [
+            4u32,
+            K_LEN * 4,
+            K_LEN * Q_LEN * 4,
+            K_LEN * Q_LEN * N_HEADS * 4,
+        ];
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [K_LEN, Q_LEN, N_HEADS, 1], nb);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [K_LEN, Q_LEN, N_HEADS, 1], nb);
+
+        let params = SoftmaxParams::qwen2_5();
+        let mut req = HtpGeneralReq::zeroed();
+        init_softmax_req(&mut req, &params, src0, dst);
+
+        assert_eq!(req.op, HTP_OP_SOFTMAX);
+        assert_eq!(req.flags, 0);
+        // slot 0 = scale (f32 bit-cast), slot 1 = max_bias.
+        let expected_scale = 1.0_f32 / (128.0_f32).sqrt();
+        assert_eq!(
+            req.op_params[0],
+            expected_scale.to_bits() as i32,
+            "scale bit pattern"
+        );
+        assert_eq!(req.op_params[1], 0.0_f32.to_bits() as i32, "max_bias=0");
+        // slot 2..15 zero.
+        for (idx, slot) in req.op_params[2..].iter().enumerate() {
+            assert_eq!(*slot, 0, "op_params[{}] must be zero", idx + 2);
+        }
+        // src0/dst F32 + ne shape preserved.
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.src0.ne[0], K_LEN);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        // n_bufs=2 path: src1 zero (mask-less).
+        assert_eq!(req.src1.type_, 0);
+        assert_eq!(req.src1.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
+    }
+
+    #[test]
+    fn init_softmax_req_f32_bit_pattern_roundtrips() {
+        // f32::to_bits() as i32 → DSP-side *(float *)&op_params[i] read 시 원본 복원
+        // 검증. wrong cast (예: as i32 빠뜨림) 시 scale 이 wrong value 로 decode.
+        let nb = [4u32, 2048 * 4, 2048 * 4, 2048 * 12 * 4];
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [2048, 1, 12, 1], nb);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [2048, 1, 12, 1], nb);
+
+        let params = SoftmaxParams::qwen2_5();
+        let mut req = HtpGeneralReq::zeroed();
+        init_softmax_req(&mut req, &params, src0, dst);
+
+        let decoded_scale = f32::from_bits(req.op_params[0] as u32);
+        let decoded_max_bias = f32::from_bits(req.op_params[1] as u32);
+        assert_eq!(decoded_scale, params.scale);
+        assert_eq!(decoded_max_bias, params.max_bias);
+        // explicit 값 검증: 1/sqrt(128).
+        assert!((decoded_scale - 0.088_388_35_f32).abs() < 1e-7);
+    }
+
+    #[test]
+    fn init_get_rows_req_packs_strict_n_bufs_3() {
+        // GET_ROWS dummy: embed [hidden=1536, vocab=1024] F32, idx [1] i32 → dst [1536] F32
+        const HIDDEN: u32 = 1536;
+        const VOCAB: u32 = 1024;
+        const N_TOKENS: u32 = 1;
+        let nb_embed = [4u32, HIDDEN * 4, HIDDEN * VOCAB * 4, HIDDEN * VOCAB * 4];
+        let nb_idx = [4u32, 4, 4, 4];
+        let nb_dst = [4u32, HIDDEN * 4, HIDDEN * 4, HIDDEN * 4];
+
+        let src0 = htp_tensor_from_shape(HTP_TYPE_F32, [HIDDEN, VOCAB, 1, 1], nb_embed);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_I32, [N_TOKENS, 1, 1, 1], nb_idx);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, [HIDDEN, N_TOKENS, 1, 1], nb_dst);
+
+        let mut req = HtpGeneralReq::zeroed();
+        init_get_rows_req(&mut req, src0, src1, dst);
+
+        assert_eq!(req.op, HTP_OP_GET_ROWS);
+        assert_eq!(req.flags, 0);
+        // op_params 미사용 — 전 슬롯 zero.
+        assert_eq!(req.op_params, [0; HTP_MAX_OP_PARAMS_SLOTS]);
+        // src binding
+        assert_eq!(req.src0.type_, HTP_TYPE_F32);
+        assert_eq!(req.src0.ne[0], HIDDEN);
+        assert_eq!(req.src0.ne[1], VOCAB);
+        assert_eq!(req.src1.type_, HTP_TYPE_I32, "idx tensor must be i32");
+        assert_eq!(req.src1.ne[0], N_TOKENS);
+        assert_eq!(req.dst.type_, HTP_TYPE_F32);
+        assert_eq!(req.dst.ne[0], HIDDEN);
+        assert_eq!(req.dst.ne[1], N_TOKENS);
+        // 미사용 src2..src4 zero
+        assert_eq!(req.src2.type_, 0);
+        assert_eq!(req.src2.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src3.ne, [0; HTP_MAX_DIMS]);
+        assert_eq!(req.src4.ne, [0; HTP_MAX_DIMS]);
     }
 
     #[test]

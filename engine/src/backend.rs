@@ -25,6 +25,10 @@ pub use cuda_embedded as cuda;
 #[cfg(feature = "opencl")]
 pub mod opencl;
 
+// QC HTP NPU via FastRPC + dspqueue (Path B, llama.cpp libggml-htp skel reuse).
+#[cfg(feature = "htp_fastrpc")]
+pub mod htp_fastrpc;
+
 // ============================================================================
 // Backend trait + GpuEvent (originally `core/backend.rs`).
 // ============================================================================

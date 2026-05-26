@@ -1,0 +1,38 @@
+ggml_opencl: selected platform: 'QUALCOMM Snapdragon(TM)'
+
+ggml_opencl: device: 'QUALCOMM Adreno(TM) 830 (OpenCL 3.0 Adreno(TM) 830)'
+ggml_opencl: OpenCL driver: OpenCL 3.0 QUALCOMM build: 0800.40.1 Compiler E031.47.18.36
+ggml_opencl: vector subgroup broadcast support: true
+ggml_opencl: device FP16 support: true
+ggml_opencl: mem base addr align: 128
+ggml_opencl: max mem alloc size: 1024 MB
+ggml_opencl: device max image buffer size (pixels): 134217728
+ggml_opencl: device max workgroup size: 1024
+ggml_opencl: SVM coarse grain buffer support: true
+ggml_opencl: SVM fine grain buffer support: true
+ggml_opencl: SVM fine grain system support: false
+ggml_opencl: SVM atomics support: true
+ggml_opencl: flattening quantized weights representation as struct of arrays (GGML_OPENCL_SOA_Q)
+ggml_opencl: using kernels optimized for Adreno (GGML_OPENCL_USE_ADRENO_KERNELS)
+ggml_opencl: loading OpenCL kernels..................................................................................................
+ggml_opencl: default device: 'QUALCOMM Adreno(TM) 830 (OpenCL 3.0 Adreno(TM) 830)'
+ggml-hex: Loading driver libcdsprpc.so
+ggml-hex: Hexagon backend (experimental) : allocating new registry : ndev 1
+ggml-hex: Hexagon Arch version v79
+ggml-hex: allocating new session: HTP0
+ggml-hex: new session: HTP0 : session-id 0 domain-id 3 uri file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 handle 0xb40000771d15aa90
+Testing 3 devices
+
+Backend 1/3: GPUOpenCL
+  Device description: QUALCOMM Adreno(TM) 830
+  Device memory: 0 MB (0 MB free)
+
+  ADD(type=f32,ne=[4096,1,1,1],nr=[1,1,1,1],nf=1,perm1=0):            106470 runs -    10.17 us/run -       48 kB/run - [1;34m   4.50 GB/s[0m
+  ADD(type=f32,ne=[4096,1,1,1],nr=[1,512,1,1],nf=1,perm1=0):                    4098 runs -   250.34 us/run -    24576 kB/run - [1;34m  93.62 GB/s[0m
+  CPY(type_src=f32,type_dst=f16,ne=[512,3072,1,1],permute_src=[0,0,0,0],permute_dst=[0,0,0,0],_src_transpose=0):                7282 runs -   141.95 us/run -     9216 kB/run - [1;34m  61.93 GB/s[0m
+  CPY(type_src=f32,type_dst=f32,ne=[8192,512,2,1],permute_src=[0,2,1,3],permute_dst=[0,0,0,0],_src_transpose=0):                1026 runs -  1159.16 us/run -    65536 kB/run - [1;34m  53.97 GB/s[0m
+  CPY(type_src=f32,type_dst=f32,ne=[3072,512,2,1],permute_src=[0,2,1,3],permute_dst=[0,0,0,0],_src_transpose=0):                2732 runs -   486.94 us/run -    24576 kB/run - [1;34m  48.15 GB/s[0m
+  CPY(type_src=f32,type_dst=q4_0,ne=[8192,512,2,1],permute_src=[0,0,0,0],permute_dst=[0,0,0,0],_src_transpose=0): not supported
+  CPY(type_src=q4_0,type_dst=f32,ne=[8192,512,2,1],permute_src=[0,0,0,0],permute_dst=[0,0,0,0],_src_transpose=0): not supported
+  CPY(type_src=f32,type_dst=f32,ne=[786432,256,1,1],permute_src=[1,0,2,3],permute_dst=[0,0,0,0],_src_transpose=0):                22 runs - 140497.41 us/run -  1572864 kB/run - [1;34m  10.92 GB/s[0m
+  CPY(type_src=f16,type_dst=f16,ne=[786432,256,1,1],permute_src=[1,0,2,3],permute_dst=[0,0,0,0],_src_transpose=0): Killed 

@@ -18,8 +18,21 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 
-use super::host::{DspQueueBuffer, HtpFastrpcHost, RPCMEM_DEFAULT_FLAGS, RPCMEM_HEAP_ID_SYSTEM};
+use super::host::{
+    DspQueueBuffer, FASTRPC_ATTR_NONE, FASTRPC_MAP_FD, HtpFastrpcHost, RPCMEM_DEFAULT_FLAGS,
+    RPCMEM_HEAP_ID_SYSTEM, RPCMEM_HEAP_NOREG,
+};
 use super::idl::DspqBufferType;
+
+/// alloc flags = `RPCMEM_DEFAULT_FLAGS | RPCMEM_HEAP_NOREG`. llama.cpp
+/// `ggml-hexagon.cpp:268` 와 동일. NOREG 는 alloc 시점에 모든 도메인 자동
+/// register 를 막아 명시 `fastrpc_mmap` 으로 특정 도메인에만 register 한다.
+///
+/// β-1.MAP 검증: NOREG 포함/제거 두 변형 모두 `fastrpc_mmap rc=0` (이전
+/// β-1.START 의 `rc=0x1 EIO` 는 FASTRPC_MAP_FD enum 값 오인 (16 → 2) 이
+/// root cause 였음). 둘의 차이는 dspqueue_write 시 `fastrpc_buffer_ref`
+/// 카운트 동작에만 영향을 줘 본 PoC scope 외. NOREG 유지 = llama.cpp 일치.
+const RPCMEM_ALLOC_FLAGS: u32 = RPCMEM_DEFAULT_FLAGS | RPCMEM_HEAP_NOREG;
 
 /// rpcmem-backed buffer. RAII free, single-owner.
 ///
@@ -33,10 +46,16 @@ pub struct RpcmemBuffer {
     ptr: *mut u8,
     /// rpcmem fd (`rpcmem_to_fd` 결과). dspqueue_buffer 의 fd field 로 전달.
     fd: c_int,
-    /// allocated byte size (user-requested, padding 미포함).
+    /// user-requested byte size (slice/dsp_buf 가 본 값을 노출).
     size: usize,
+    /// 실제 rpcmem allocation 크기 (page-aligned ≥ size). `fastrpc_mmap` 와
+    /// `fastrpc_munmap` 의 length 인자로 사용.
+    alloc_size: usize,
     /// FFI symbol holder. Arc 로 backend / buffer pool 등에서 공유.
     host: Arc<HtpFastrpcHost>,
+    /// `fastrpc_mmap(domain, fd, base, 0, alloc_size, FASTRPC_MAP_FD)` 호출
+    /// 결과. true 면 Drop 에서 `fastrpc_munmap` 을 호출.
+    mapped: bool,
 }
 
 // SAFETY: ptr 은 rpcmem 영역 (process-global). host 의 rpcmem_free 는
@@ -53,18 +72,27 @@ impl RpcmemBuffer {
         if size == 0 {
             return Err(anyhow!("htp_fastrpc: RpcmemBuffer::alloc size == 0"));
         }
+        // fastrpc_mmap 가 length 4K alignment 요구 (driver-dependent;
+        // ARM page = 4 KiB). llama.cpp 도 `size += 4*1024` 로 padding 후
+        // round 결과를 mmap. self.size 는 user-requested 값을 유지.
+        const PAGE_SIZE: usize = 4096;
+        let alloc_size = size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         // SAFETY: rpcmem_alloc 은 thread-safe entry point. size 가 i32::MAX
         // 초과면 caller 책임 (rpcmem_alloc2 가 usize-size 받지만 optional).
         let raw = if let Some(alloc2) = host.rpcmem_alloc2 {
-            unsafe { alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size) }
+            unsafe { alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_ALLOC_FLAGS, alloc_size) }
         } else {
-            if size > i32::MAX as usize {
+            if alloc_size > i32::MAX as usize {
                 return Err(anyhow!(
-                    "htp_fastrpc: RpcmemBuffer::alloc size {size} exceeds i32::MAX (use rpcmem_alloc2)"
+                    "htp_fastrpc: RpcmemBuffer::alloc size {alloc_size} exceeds i32::MAX (use rpcmem_alloc2)"
                 ));
             }
             unsafe {
-                (host.rpcmem_alloc)(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size as c_int)
+                (host.rpcmem_alloc)(
+                    RPCMEM_HEAP_ID_SYSTEM,
+                    RPCMEM_ALLOC_FLAGS,
+                    alloc_size as c_int,
+                )
             }
         };
         if raw.is_null() {
@@ -82,11 +110,64 @@ impl RpcmemBuffer {
                 "htp_fastrpc: rpcmem_to_fd returned {fd} (size={size})"
             ));
         }
+
+        // ── fastrpc_mmap (FastRPC domain 에 buffer 등록) ───────────────────
+        //
+        // dspqueue_write 가 `Buffer FD not mapped to domain N` 으로 fail 하지
+        // 않으려면 buffer 를 FastRPC domain 에 명시 mmap 해야 한다 (llama.cpp
+        // ggml-hexagon.cpp:235 와 동일 패턴).
+        //
+        // β-1.MAP root cause: 이전 `FASTRPC_MAP_FD = 16` 은 사실
+        // `FASTRPC_MAP_FD_NOMAP` (등록만, 실제 mmap 안 함) — `rc=0x1 EIO` 의
+        // 원인. QC fastrpc 오픈소스 enum 정확값 = 2.
+        //
+        // SAFETY: domain_id / fd / ptr / size 모두 직전에 valid 확인.
+        // length 는 page-aligned `alloc_size` 사용.
+        let mmap_rc = unsafe {
+            (host.fastrpc_mmap)(
+                host.domain_id,
+                fd,
+                ptr as *mut c_void,
+                0,
+                alloc_size,
+                FASTRPC_MAP_FD,
+            )
+        };
+        if mmap_rc != 0 {
+            // mmap 실패 → free 후 에러. rpcmem 자체는 valid 였으니 free 호출.
+            unsafe { (host.rpcmem_free)(ptr as *mut c_void) };
+            return Err(anyhow!(
+                "htp_fastrpc: fastrpc_mmap rc={mmap_rc:#x} (domain={}, fd={}, size={alloc_size})",
+                host.domain_id,
+                fd,
+            ));
+        }
+
+        // ── remote_register_buf_attr2 (driver-internal ref count 보장) ─────
+        //
+        // β-1.QUEUE.2: `fastrpc_mmap` 은 SMMU 매핑만 set 하고 driver-internal
+        // buffer ref count 는 별도 API. `dspqueue_write` 가 buffer 를 attach
+        // 시 ref count +1 을 시도하지만 미등록 buffer 이면 ref=-1 underflow →
+        // `AEE_EUNABLETOLOAD (0xe)` fail (β-1.MAP 직후 logcat 패턴).
+        //
+        // QC `inc/remote.h`: "Registration functions prepare buffers for use
+        // in FastRPC calls — distinct from fastrpc_mmap() which creates
+        // mappings for DMA buffers." 즉 zero-copy 양 path 가 모두 필요.
+        //
+        // Option 이라 미export device (구 driver) 는 silent skip. S25 의
+        // libcdsprpc.so 는 export 확인됨 (host.rs dlsym 시점에 확인).
+        if let Some(register) = host.remote_register_buf_attr2 {
+            // SAFETY: ptr/size/fd 모두 직전 valid. attr=NONE 은 default.
+            unsafe { register(ptr as *mut c_void, alloc_size, fd, FASTRPC_ATTR_NONE) };
+        }
+
         Ok(Self {
             ptr,
             fd,
             size,
+            alloc_size,
             host,
+            mapped: true,
         })
     }
 
@@ -148,14 +229,16 @@ impl RpcmemBuffer {
                 self.size
             ));
         }
+        // QC `dspqueue_buffer.fd` 는 u32. `RpcmemBuffer::fd` 는 c_int (i32,
+        // rpcmem_to_fd 시그니처에 일치). 정상 fd 는 음수가 아니므로 cast 안전.
         Ok(DspQueueBuffer {
-            fd: self.fd,
-            // SAFETY: pointer arithmetic 가 buffer 안에 머무름 (위에서 검증).
-            ptr: unsafe { self.ptr.add(offset as usize) } as *mut c_void,
-            offset,
+            fd: self.fd as u32,
             size,
+            offset,
             flags: direction.to_flags(),
-            reserved: [0; 3],
+            // SAFETY: pointer arithmetic 가 buffer 안에 머무름 (위에서 검증).
+            // QC SDK 주석 "The virtual address #ptr includes the offset" 와 일치.
+            ptr: unsafe { self.ptr.add(offset as usize) } as *mut c_void,
         })
     }
 }
@@ -163,6 +246,34 @@ impl RpcmemBuffer {
 impl Drop for RpcmemBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // remote_register_buf_attr2 deregister 먼저 (fd=-1 sentinel). 등록
+            // 시점에 None 이었어도 호출 자체가 valid (no-op).
+            if let Some(register) = self.host.remote_register_buf_attr2 {
+                // SAFETY: ptr/size 는 alloc 시점 valid. fd=-1 = deregister.
+                unsafe {
+                    register(
+                        self.ptr as *mut c_void,
+                        self.alloc_size,
+                        -1,
+                        FASTRPC_ATTR_NONE,
+                    );
+                }
+            }
+            // mmap 했었다면 munmap 먼저. munmap rc 무시 (best-effort cleanup,
+            // host 의 domain 자체가 close 되면 자동 정리됨).
+            if self.mapped {
+                // SAFETY: domain/fd/ptr/size 모두 alloc 시점에 valid 였고,
+                // 본 Drop 진입 전에는 unchanged.
+                unsafe {
+                    (self.host.fastrpc_munmap)(
+                        self.host.domain_id,
+                        self.fd,
+                        self.ptr as *mut c_void,
+                        self.alloc_size,
+                    );
+                }
+                self.mapped = false;
+            }
             // SAFETY: ptr 은 alloc 시점에 rpcmem_alloc 으로 얻은 값 (단일
             // owner). Drop 1회만 호출되며 Clone 미구현으로 컴파일 타임
             // 차단됨.

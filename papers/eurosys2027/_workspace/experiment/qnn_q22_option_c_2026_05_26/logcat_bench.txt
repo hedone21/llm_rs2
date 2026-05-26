@@ -1,0 +1,526 @@
+--------- beginning of main
+05-26 19:12:34.720 31287 31298 W .android.as.oss: userfaultfd: MOVE ioctl seems unsupported: Connection timed out
+05-26 19:12:35.004  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790355
+05-26 19:12:35.007  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:35.007  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 280 
+05-26 19:12:35.007  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:35.007  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:35.008  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:35.008  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:35.008  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:35.008  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:35.015  1853  1853 I SurfaceFlinger: SFWD update time=950467287112840
+--------- beginning of system
+05-26 19:12:35.822  1117  1117 D io_stats: !@ Write_top(KB): kworker/u17:3:/(26182) 144
+05-26 19:12:36.004  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790356
+05-26 19:12:36.008  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:36.009  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 280 
+05-26 19:12:36.009  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:36.009  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:36.009  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:36.009  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:36.009  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:36.009  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:36.850  2281  3795 I ChimeraSystemEventListener: MSG_ONE_HOUR_TIMER
+05-26 19:12:36.854  2281  3795 I ChimeraSystemEventListener: startOneHourTimer
+05-26 19:12:37.004  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790357
+05-26 19:12:37.007  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:37.007  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 280 
+05-26 19:12:37.007  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:37.007  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:37.007  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:37.007  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:37.008  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:37.008  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:37.425  2281  3601 D ActivityManager: freezing 23472 com.skms.android.agent:remote
+05-26 19:12:37.494  1760  2613 I thermal_core: pivot(AP) : 297, skin : 307
+05-26 19:12:37.532  1725  1742 D AHAL_ModulePrimary_QTI: getVendorParameters: id count: 1
+05-26 19:12:37.532  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:37.532  1725  1742 D AHAL_SecModulePrimary: onGetSECGenericParameters get temperature for g_hw_speaker_amp_temp_rcv: 0
+05-26 19:12:37.533  1725  5582 D AHAL_ModulePrimary_QTI: getVendorParameters: id count: 1
+05-26 19:12:37.533  1725  5582 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:37.533  1725  5582 D AHAL_SecModulePrimary: onGetSECGenericParameters get temperature for g_hw_speaker_amp_temp_spk: 0
+05-26 19:12:37.534  5788  6546 I SDHMS:x : SIOP:: AP:297 BAT:279 USB:261 CHG:292 PA:296 WIFI:303 CF:300 BLK:0 SUBBAT:0 LRPTHM:297 SKIN:300 SKINF:295 SKINB:300 LRP:300 LRF:295 LRB:300 APT:295 APR:300 RCV:288 SPK:283 CHGF:294 CHGR:299 MEMF:294 MEMR:299 WIFIF:294 WIFIR:300 FCAM:261 UPSPK:292 DNSPK:261 VAP:307 VWIFI:300 AMB2:253 HIGH:0 AVGCUR:-65 POWER:-273
+05-26 19:12:37.535  5788  6546 I AudioManager: setParameters keyValuePairs = g_hw_speaker_amp_temp_spk=28
+05-26 19:12:37.537  1786  4509 D AudioFlinger: setParameters: filtered dev setParameters keyvalue g_hw_speaker_amp_temp_spk=28
+05-26 19:12:37.537  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters enter
+05-26 19:12:37.537  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters Exit
+05-26 19:12:37.537  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: configured g_hw_speaker_amp_temp_spk
+05-26 19:12:37.537  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: handler set on Feature:0
+05-26 19:12:37.537  1725  1742 D AHAL_SecModulePrimary: onSetSECGenericParameters set temperature for g_hw_speaker_amp_temp_spk: 28
+05-26 19:12:37.537  1725  1742 I PAL: API: pal_set_param: 1377: Enter: param id 3002
+05-26 19:12:37.537  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:37.538  1786  4509 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:37.538  1786  4509 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:37.539  5788  6546 I AudioManager: setParameters keyValuePairs = g_hw_speaker_amp_temp_rcv=29
+05-26 19:12:37.539  1786  1786 D AudioFlinger: setParameters: filtered dev setParameters keyvalue g_hw_speaker_amp_temp_rcv=29
+05-26 19:12:37.539  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters enter
+05-26 19:12:37.539  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters Exit
+05-26 19:12:37.540  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: configured g_hw_speaker_amp_temp_rcv
+05-26 19:12:37.540  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: handler set on Feature:0
+05-26 19:12:37.540  1725  1742 D AHAL_SecModulePrimary: onSetSECGenericParameters set temperature for g_hw_speaker_amp_temp_rcv: 29
+05-26 19:12:37.540  1725  1742 I PAL: API: pal_set_param: 1377: Enter: param id 3001
+05-26 19:12:37.540  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:37.540  1786  1786 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:37.540  1786  1786 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:37.673  4178  4178 I wpa_supplicant: Heartbeat 94960
+05-26 19:12:37.823  1117  1117 D io_stats: !@   8,0 r 3380921 137524272 w 3635487 64949912 d 832507 284859352 f 58664 381263 iot 1245696 0 th 0 0 0 pt 0 inp 0 0 950470.095
+05-26 19:12:38.004  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790358
+05-26 19:12:38.008  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:38.008  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 280 
+05-26 19:12:38.008  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:38.008  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:38.008  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:38.008  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:38.009  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:38.009  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:38.613 15393 15555 V CpEventLog(u0): [P] cp_state: [                 contacts = {contacts=426, raw_contacts=527, data=2590, account={secphone(1)=0, sim(3)=0, sim2(4)=0, agg(5)=0, duo(11)=101, google(12)=426, samsung(13)=0, mobileservice(14)=0}, trash=0, trash_acc={}, trash_sync=0, database=contacts2.db} ]
+05-26 19:12:38.613 15393 15555 V CpEventLog(u0): [P] cp_state: [               aggregated = {[12,11]=101, [12]=325} ]
+05-26 19:12:38.613 15393 15555 V CpEventLog(u0): [P] cp_state: [                  request = {ALL(0)={avg=1, cnt=6, dur=6, ops={query=6}}, com.samsung.cmh(15295)={avg=3, cnt=2, dur=6, ops={query=2}}, contacts(15683)={avg=0, cnt=4, dur=0, ops={query=4}}} ]
+05-26 19:12:38.613 15393 15555 V CpEventLog(u0): [P] cp_state: [                    calls = {types={[200]=5, [300]=5, [1000]=16}, database=calllog.db} ]
+05-26 19:12:38.613 15393 15555 V CpEventLog(u0): [P] cp_state: [                  profile = {contacts=0, raw_contacts=0, data=0, account={secphone(1)=0, sim(3)=0, sim2(4)=0, agg(5)=0, duo(11)=0, google(12)=0, samsung(13)=0, mobileservice(14)=0}, trash=0, trash_acc={}, trash_sync=0, database=profile.db} ]
+05-26 19:12:38.613 15393 15555 V CpEventLog(u0): [P] cp_state: [               sa_profile = {contacts=0, raw_contacts=0, data=0, account={secphone(1)=0, sim(3)=0, sim2(4)=0, agg(5)=0, duo(11)=0, google(12)=0, samsung(13)=0, mobileservice(14)=0}, trash=0, trash_acc={}, trash_sync=0, database=profile_sa.db} ]
+05-26 19:12:38.613 15393 15555 V CpEventLog(u0): [P] cp_state: [                      etc = {binders=0, country_iso=KR, version=15.6.28, db_version=2000, db_size=3, db_wal_size=1, csc=KOO/KOR, sec_enabled=false, is_roaming=false} ]
+05-26 19:12:38.613 15393 15555 V CpEventLog(u0): [P] cp_state: ------------------------------------------------------------------------------
+05-26 19:12:39.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790359
+05-26 19:12:39.004  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:39.004  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 280 
+05-26 19:12:39.004  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:39.004  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:39.004  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:39.004  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:39.004  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:39.004  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:39.005  2281  2976 D MARsPolicyManager: triggerAction called!
+05-26 19:12:39.005  2281  2976 I NSLocationMonitor: getGPSUsingApps() called
+05-26 19:12:39.006  5110  5156 I NSLocationManager_FLP: getGPSUsingApps, No change
+05-26 19:12:39.023  1760  1760 I seh_thermal_service: getTemperaturesWithType SehTemperatureType: 3
+05-26 19:12:39.023  1758  1882 E BatteryDump: !@new_battery_dump : 4210,7,600,1500,79,279,261,291,279,0,307,291,0,Not-charging,NO_CHARGING,Normal,Good,USB_CDP,2,Normal,0,0,9300,0x8000,0x11010000,0x0,0,0,236,v0002,0000,0000,00000000,0,0,0,0,34,4213,7910,990,0,
+05-26 19:12:39.023  1758  1758 I sehhealth-service: updateLrpSysfs: write: 300
+05-26 19:12:39.824  1117  1117 D io_stats: !@   8,0 r 3380921 137524272 w 3635495 64949952 d 832507 284859352 f 58665 381264 iot 1245704 0 th 0 0 0 pt 0 inp 0 0 950472.096
+05-26 19:12:39.825  1117  1117 D io_stats: !@ Write_top(KB): kworker/u17:0:/(27511) 16 soft.appmanager:low(21455) 16 jbd2/sda7-8:/(1068) 12
+05-26 19:12:40.004  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790360
+05-26 19:12:40.008  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:40.008  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:40.009  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:40.009  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:40.009  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:40.009  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:40.009  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:40.009  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:41.004  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790361
+05-26 19:12:41.007  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:41.007  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:41.007  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:41.007  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:41.007  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:41.007  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:41.008  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:41.008  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:41.786  2281  2929 D BatteryExternalStatsWorker: update stats : procstate-change (10)
+05-26 19:12:41.786  2281  2929 D BatteryExternalStatsWorker: Fetch WiFi data
+05-26 19:12:41.786  2281  2929 D BatteryExternalStatsWorker: Update Rail Energy data
+05-26 19:12:41.798  2222  2222 I CNSS    : /sys/wifi/max_chipset_log_size doesn't exist
+05-26 19:12:41.816  2281  3704 E WifiStaIfaceAidlImpl: getCachedScanData failed with service-specific exception: android.os.ServiceSpecificException:  (code 4)
+05-26 19:12:41.816  2281  2929 D BatteryExternalStatsWorker: mStats lock released
+05-26 19:12:41.821  2281  2929 D BatteryExternalStatsWorker: Update wifi state
+05-26 19:12:41.821  2281  2929 D BatteryExternalStatsWorker: done updateExternalStatsLocked
+05-26 19:12:42.004  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790362
+05-26 19:12:42.009  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:42.009  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:42.009  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:42.009  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:42.009  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:42.009  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:42.009  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:42.009  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:42.520 31428 31428 E Adreno-AppProfiles: QSPM AIDL service doesn't exist
+05-26 19:12:42.941 31083 31131 I LPAPSH  : STOP SmpInitializer: com.samsung.euicc.push.SmpInitializer$1@9476030                                [at com.samsung.euicc.push.SmpInitializer$1.run(SmpInitializer$1.java:90)]
+05-26 19:12:42.942 31083 31131 I LPAPSH  : quitSafely                                                                                          [at com.samsung.euicc.push.SmpInitializer$1.run(SmpInitializer$1.java:104)]
+05-26 19:12:42.984 31083 31083 I SLPASVC : From Client: DisconnectRequest (-1146534185, com.samsung.euicc)                                     [at com.samsung.euicc.lpaService.worker.RxHandler.preProcessRequest(RxHandler.java:281)]
+05-26 19:12:42.984 31083 31083 E SLPASVC : disconnect key: -1146534185                                                                         [at com.samsung.euicc.lpaService.worker.RxHandler.preProcessRequest(RxHandler.java:298)]
+05-26 19:12:42.984 31083 31083 I SLPASVC : 1348482573 : connected!!                                                                            [at com.samsung.euicc.lpaService.worker.RxHandler.isConnected(RxHandler.java:496)]
+05-26 19:12:42.984 31083 31083 I SLPASVC : To Client: DisconnectResponse                                                                       [at com.samsung.euicc.lpaService.worker.RxHandler.sendToClient(RxHandler.java:397)]
+05-26 19:12:42.985 31083 31107 I LpaConnector: LpaConnectedState::exit()                                                                           [at com.samsung.euicc.internal.lib.lpa.LpaConnector$LpaConnectedState.exit(LpaConnector$LpaConnectedState.java:390)]
+05-26 19:12:43.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790363
+05-26 19:12:43.002  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:43.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:43.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:43.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:43.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:43.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:43.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:43.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:43.040  3900  4056 D EuiccConnector: handleMessage: E msg.what=3
+05-26 19:12:43.040  3900  4056 D EuiccConnector: processMsg: ConnectedState
+05-26 19:12:43.041 31083 31083 I SLPASVC : EuiccServiceImpl.onUnbind()                                                                         [at com.samsung.euicc.service.EuiccServiceImpl.onUnbind(EuiccServiceImpl.java:203)]
+05-26 19:12:43.041 31083 31083 I SLPASVC : To Service : DisconnectRequest                                                                      [at com.samsung.euicc.service.EuiccServiceImpl.sendToService(EuiccServiceImpl.java:162)]
+05-26 19:12:43.041  3900  4056 D EuiccConnector: transitionTo: destState=AvailableState
+05-26 19:12:43.041  3900  4056 D EuiccConnector: handleMessage: new destination call exit/enter
+05-26 19:12:43.041  3900  4056 D EuiccConnector: setupTempStateStackWithStatesToEnter: X mTempStateStackCount=2,curStateInfo: null
+05-26 19:12:43.041  3900  4056 D EuiccConnector: invokeExitMethods: ConnectedState
+05-26 19:12:43.041  3900  4056 D EuiccConnector: invokeExitMethods: DisconnectedState
+05-26 19:12:43.041  3900  4056 D EuiccConnector: moveTempStackToStateStack: i=1,j=0
+05-26 19:12:43.041  3900  4056 D EuiccConnector: moveTempStackToStateStack: i=0,j=1
+05-26 19:12:43.041  3900  4056 D EuiccConnector: moveTempStackToStateStack: X mStateStackTop=1,startingIndex=0,Top=AvailableState
+05-26 19:12:43.041  3900  4056 D EuiccConnector: invokeEnterMethods: UnavailableState
+05-26 19:12:43.041  3900  4056 D EuiccConnector: invokeEnterMethods: AvailableState
+05-26 19:12:43.041  3900  4056 D EuiccConnector: handleMessage: X
+05-26 19:12:43.042 31083 31083 I SLPASVC : From Client: DisconnectRequest (1348482573, com.samsung.euicc)                                      [at com.samsung.euicc.lpaService.worker.RxHandler.preProcessRequest(RxHandler.java:281)]
+05-26 19:12:43.042 31083 31083 E SLPASVC : disconnect key: 1348482573                                                                          [at com.samsung.euicc.lpaService.worker.RxHandler.preProcessRequest(RxHandler.java:298)]
+05-26 19:12:43.042 31083 31083 E SLPASVC : To Client messenger is NULL                                                                         [at com.samsung.euicc.lpaService.worker.RxHandler.sendToClient(RxHandler.java:380)]
+05-26 19:12:43.042 31083 31083 I SLPASVC : onUnbind                                                                                            [at com.samsung.euicc.lpaService.LpaService.onUnbind(LpaService.java:175)]
+05-26 19:12:43.042 31083 31083 I SLPASVC : no busy worker. stop foreground                                                                     [at com.samsung.euicc.lpaService.LpaServiceHandler.checkStopCondition(LpaServiceHandler.java:115)]
+05-26 19:12:43.042 31083 31083 W SLPASVC : updateFreeNvMemorySize                                                                              [at com.samsung.euicc.lpaService.LpaService.updateFreeNvMemorySize(LpaService.java:261)]
+05-26 19:12:43.043 31083 31083 I SLPASVC : Es10Factory.create(): 1                                                                             [at com.samsung.euicc.lpaService.gsma.phase2.es10.Es10Factory.create(Es10Factory.java:50)]
+05-26 19:12:43.043 31083 31083 I SLPASVC : create MEP B                                                                                        [at com.samsung.euicc.lpaService.gsma.phase2.es10.Es10Factory.create(Es10Factory.java:56)]
+05-26 19:12:43.044 31083 31124 I SLPASVC : EuiccLogicalChannel::openBySlot():  physicalSlotIndex = 1, portIndex = 0                            [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.openBySlot(EuiccLogicalChannel.java:251)]
+05-26 19:12:43.065 31083 31124 I SLPASVC : 0x00000001 was opened                                                                               [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.openBySlot(EuiccLogicalChannel.java:293)]
+05-26 19:12:43.065 31083 31124 I SLPASVC :  cla: 80 ins: E2 Le: 00                                                                             [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.storeData(EuiccLogicalChannel.java:68)]
+05-26 19:12:43.065 31083 31124 I SLPASVC : [STORE DATA] blockNumber : 0                                                                        [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.storeData(EuiccLogicalChannel.java:78)]
+05-26 19:12:43.065 31083 31124 I SLPASVC : case 4 command APDU                                                                                 [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.getCmdApdu(EuiccLogicalChannel.java:206)]
+05-26 19:12:43.082 31083 31124 I SLPASVC : APDU StatusWord - 9X XX                                                                             [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.handleResponse(EuiccLogicalChannel.java:231)]
+05-26 19:12:43.082 31083 31124 I SLPASVC : EuiccLogicalChannel::close(): 1                                                                     [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.close(EuiccLogicalChannel.java:45)]
+05-26 19:12:43.090 31083 31083 I SLPASVC : freeNvm: 809320                                                                                     [at com.samsung.euicc.util.EuiccSvcLog.sp(EuiccSvcLog.java:108)]
+05-26 19:12:43.090 31083 31083 I SLPASVC : freeVm: 88015                                                                                       [at com.samsung.euicc.util.EuiccSvcLog.sp(EuiccSvcLog.java:108)]
+05-26 19:12:43.090 31083 31083 I SLPASVC : firmware[1]: 82.82.0                                                                                [at com.samsung.euicc.util.EuiccSvcLog.sp(EuiccSvcLog.java:108)]
+05-26 19:12:43.091 31083 31083 I SLPASVC : available vm: 88015                                                                                 [at com.samsung.euicc.util.EuiccSvcLog.sp(EuiccSvcLog.java:108)]
+05-26 19:12:43.091 31083 31083 E SLPASVC : available memory: 809320                                                                            [at com.samsung.euicc.lpaService.gsma.phase2.es10.Es10MepBase.getAvailableMemory(Es10MepBase.java:36)]
+05-26 19:12:43.091 31083 31083 I SLPASVC : available memory: 809320                                                                            [at com.samsung.euicc.util.EuiccSvcLog.sp(EuiccSvcLog.java:108)]
+05-26 19:12:43.091 31083 31083 I SLPASVC : update FreeSize(1):809320                                                                           [at com.samsung.euicc.lpaService.LpaService.updateFreeNvMemorySize(LpaService.java:272)]
+05-26 19:12:43.092 31083 31124 I SLPASVC : EuiccLogicalChannel::openBySlot():  physicalSlotIndex = 1, portIndex = 0                            [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.openBySlot(EuiccLogicalChannel.java:251)]
+05-26 19:12:43.111 31083 31124 I SLPASVC : 0x00000001 was opened                                                                               [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.openBySlot(EuiccLogicalChannel.java:293)]
+05-26 19:12:43.111 31083 31124 I SLPASVC :  cla: 80 ins: E2 Le: 00                                                                             [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.storeData(EuiccLogicalChannel.java:68)]
+05-26 19:12:43.111 31083 31124 I SLPASVC : [STORE DATA] blockNumber : 0                                                                        [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.storeData(EuiccLogicalChannel.java:78)]
+05-26 19:12:43.111 31083 31124 I SLPASVC : case 4 command APDU                                                                                 [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.getCmdApdu(EuiccLogicalChannel.java:206)]
+05-26 19:12:43.118 31083 31124 I SLPASVC : APDU StatusWord - 9X XX                                                                             [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.handleResponse(EuiccLogicalChannel.java:231)]
+05-26 19:12:43.118 31083 31124 I SLPASVC : EuiccLogicalChannel::close(): 1                                                                     [at com.samsung.euicc.lpaService.gsma.phase2.es10.uicc.EuiccLogicalChannel.close(EuiccLogicalChannel.java:45)]
+05-26 19:12:43.125 31083 31083 I SLPASVC : onDestroy                                                                                           [at com.samsung.euicc.lpaService.LpaService.onDestroy(LpaService.java:209)]
+05-26 19:12:43.125 31083 31083 W SLPASVC : + clear resource                                                                                    [at com.samsung.euicc.lpaService.LpaService.clearResource(LpaService.java:215)]
+05-26 19:12:43.125 31083 31083 W SLPASVC : stop start                                                                                          [at com.samsung.euicc.lpaService.StopHandler.stop(StopHandler.java:18)]
+05-26 19:12:43.125 31083 31083 W SLPASVC : stop end                                                                                            [at com.samsung.euicc.lpaService.StopHandler.stop(StopHandler.java:38)]
+05-26 19:12:43.125 31083 31083 E SLPASVC : initHandlerIfNeed                                                                                   [at com.samsung.euicc.lpaService.bootstrap.VsimNetworkRequester.initHandlerIfNeed(VsimNetworkRequester.java:47)]
+05-26 19:12:43.126 31083 31083 I SLPASVC : Unbind request                                                                                      [at com.samsung.euicc.lpaService.bootstrap.VsimNetworkRequester.unBind(VsimNetworkRequester.java:150)]
+05-26 19:12:43.126 31083 31083 I SLPASVC : bindProcessToNetwork: true                                                                          [at com.samsung.euicc.lpaService.bootstrap.VsimNetworkRequester.unbindVsimNetwork(VsimNetworkRequester.java:156)]
+05-26 19:12:43.126 31083 31083 I SLPASVC : complete to remove network callbacks                                                                [at com.samsung.euicc.lpaService.bootstrap.VsimNetworkRequester.unbindVsimNetwork(VsimNetworkRequester.java:159)]
+05-26 19:12:43.126 31083 31083 I SLPASVC : Unbind request complete                                                                             [at com.samsung.euicc.lpaService.bootstrap.VsimNetworkRequester.unBind(VsimNetworkRequester.java:152)]
+05-26 19:12:43.126 31083 31083 W SLPASVC : - clear resource                                                                                    [at com.samsung.euicc.lpaService.LpaService.clearResource(LpaService.java:243)]
+05-26 19:12:43.126 31083 31083 I Process : Sending signal. PID: 31083 SIG: 9
+05-26 19:12:43.138  1618  1618 I Zygote  : Process 31083 exited due to signal 9 (Killed)
+05-26 19:12:43.138  2281  2915 I libprocessgroup: Removed cgroup /sys/fs/cgroup/system/uid_1000/pid_31083
+05-26 19:12:43.138  2281  6000 I ActivityManager: Process com.samsung.euicc (pid 31083) has died: fg  SVC (1634,3970)
+05-26 19:12:43.825  1117  1117 D io_stats: !@ Read_top(KB): llama-bench:normal(31428) 16
+05-26 19:12:43.825  1117  1117 D io_stats: !@ Write_top(KB): kworker/u17:0:/(27511) 92 earchbox:search:low(26353) 20 kworker/u17:3:/(26182) 4
+05-26 19:12:44.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790364
+05-26 19:12:44.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:44.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:44.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:44.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:44.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:44.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:44.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:44.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:44.016  2281  2976 D MARsPolicyManager: triggerAction called!
+05-26 19:12:44.016  2281  2976 I NSLocationMonitor: getGPSUsingApps() called
+05-26 19:12:44.016  5110  5156 I NSLocationManager_FLP: getGPSUsingApps, No change
+05-26 19:12:45.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790365
+05-26 19:12:45.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:45.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:45.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:45.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:45.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:45.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:45.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:45.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:46.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790366
+05-26 19:12:46.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:46.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:46.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:46.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:46.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:46.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:46.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:46.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:47.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790367
+05-26 19:12:47.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:47.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:47.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:47.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:47.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:47.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:47.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:47.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:47.535  1760  2613 I thermal_core: pivot(AP) : 330, skin : 300
+05-26 19:12:47.568  1725  5582 D AHAL_ModulePrimary_QTI: getVendorParameters: id count: 1
+05-26 19:12:47.568  1725  5582 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:47.568  1725  5582 D AHAL_SecModulePrimary: onGetSECGenericParameters get temperature for g_hw_speaker_amp_temp_rcv: 0
+05-26 19:12:47.568  1725  5582 D AHAL_ModulePrimary_QTI: getVendorParameters: id count: 1
+05-26 19:12:47.568  1725  5582 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:47.568  1725  5582 D AHAL_SecModulePrimary: onGetSECGenericParameters get temperature for g_hw_speaker_amp_temp_spk: 0
+05-26 19:12:47.568  5788  6546 I SDHMS:x : SIOP:: AP:330 BAT:278 USB:262 CHG:292 PA:322 WIFI:338 CF:299 BLK:0 SUBBAT:0 LRPTHM:302 SKIN:301 SKINF:294 SKINB:301 LRP:301 LRF:294 LRB:301 APT:294 APR:301 RCV:284 SPK:274 CHGF:292 CHGR:298 MEMF:292 MEMR:296 WIFIF:292 WIFIR:299 FCAM:261 UPSPK:293 DNSPK:261 VAP:311 VWIFI:304 AMB2:253 HIGH:0 AVGCUR:-24 POWER:-100
+05-26 19:12:47.568  5788  6546 I AudioManager: setParameters keyValuePairs = g_hw_speaker_amp_temp_spk=27
+05-26 19:12:47.569  1786  1786 D AudioFlinger: setParameters: filtered dev setParameters keyvalue g_hw_speaker_amp_temp_spk=27
+05-26 19:12:47.569  1725  5582 D AHAL_HFP_QTI: hfp_set_parameters enter
+05-26 19:12:47.569  1725  5582 D AHAL_HFP_QTI: hfp_set_parameters Exit
+05-26 19:12:47.569  1725  5582 D AHAL_SecModulePrimary: processSetVendorParameters: configured g_hw_speaker_amp_temp_spk
+05-26 19:12:47.569  1725  5582 D AHAL_SecModulePrimary: processSetVendorParameters: handler set on Feature:0
+05-26 19:12:47.569  1725  5582 D AHAL_SecModulePrimary: onSetSECGenericParameters set temperature for g_hw_speaker_amp_temp_spk: 27
+05-26 19:12:47.569  1725  5582 I PAL: API: pal_set_param: 1377: Enter: param id 3002
+05-26 19:12:47.569  1725  5582 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:47.569  1786  1786 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:47.569  1786  1786 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:47.569  5788  6546 I AudioManager: setParameters keyValuePairs = g_hw_speaker_amp_temp_rcv=28
+05-26 19:12:47.569  1786  4509 D AudioFlinger: setParameters: filtered dev setParameters keyvalue g_hw_speaker_amp_temp_rcv=28
+05-26 19:12:47.569  1725  5582 D AHAL_HFP_QTI: hfp_set_parameters enter
+05-26 19:12:47.569  1725  5582 D AHAL_HFP_QTI: hfp_set_parameters Exit
+05-26 19:12:47.569  1725  5582 D AHAL_SecModulePrimary: processSetVendorParameters: configured g_hw_speaker_amp_temp_rcv
+05-26 19:12:47.569  1725  5582 D AHAL_SecModulePrimary: processSetVendorParameters: handler set on Feature:0
+05-26 19:12:47.569  1725  5582 D AHAL_SecModulePrimary: onSetSECGenericParameters set temperature for g_hw_speaker_amp_temp_rcv: 28
+05-26 19:12:47.569  1725  5582 I PAL: API: pal_set_param: 1377: Enter: param id 3001
+05-26 19:12:47.569  1725  5582 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:47.570  1786  4509 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:47.570  1786  4509 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:47.680  4178  4178 I wpa_supplicant: Heartbeat 94961
+05-26 19:12:47.826  1117  1117 D io_stats: !@   8,0 r 3380925 137524288 w 3635521 64950092 d 832508 284859396 f 58665 381266 iot 1245708 0 th 0 0 0 pt 0 inp 0 0 950480.098
+05-26 19:12:47.826  1117  1117 D io_stats: !@ Write_top(KB): soft.appmanager:low(21455) 16 kworker/4:0:/(25630) 8
+05-26 19:12:48.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790368
+05-26 19:12:48.002  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:48.002  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:48.002  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:48.002  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:48.002  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:48.002  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:48.002  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:48.002  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:49.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790369
+05-26 19:12:49.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:49.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 279 
+05-26 19:12:49.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:49.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:49.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:49.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:49.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:49.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:49.023  2281  2976 D MARsPolicyManager: triggerAction called!
+05-26 19:12:49.023  2281  2976 I NSLocationMonitor: getGPSUsingApps() called
+05-26 19:12:49.023  5110  5156 I NSLocationManager_FLP: getGPSUsingApps, No change
+05-26 19:12:49.136  1760  1760 I seh_thermal_service: getTemperaturesWithType SehTemperatureType: 3
+05-26 19:12:49.136  1758  1758 I sehhealth-service: updateLrpSysfs: write: 301
+05-26 19:12:49.137  1758  1882 E BatteryDump: !@new_battery_dump : 4200,-227,600,1500,79,278,262,294,278,0,300,287,0,Not-charging,NO_CHARGING,Normal,Good,USB_CDP,2,Normal,0,0,9300,0x8000,0x11010000,0x0,0,0,353,v0002,0000,0000,00000000,0,0,0,0,34,4213,7910,990,0,
+05-26 19:12:49.826  1117  1117 D io_stats: !@   8,0 r 3380925 137524288 w 3635524 64950104 d 832508 284859396 f 58665 381266 iot 1245712 0 th 0 0 0 pt 0 inp 0 0 950482.098
+05-26 19:12:50.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790370
+05-26 19:12:50.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:50.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:50.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:50.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:50.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:50.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:50.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:50.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:50.116  2281  3570 I UsageStatsService: User[0] Flushing usage stats to disk
+05-26 19:12:50.124  2281  3793 D BackgroundInstallControlService: Package event received: 0
+05-26 19:12:50.564 31367 31371 W om.sec.spp.push: userfaultfd: MOVE ioctl seems unsupported: Connection timed out
+05-26 19:12:50.840  2281  3815 I BatteryService_BatteryPropertiesRegistrar: [getProperty]id:6
+05-26 19:12:50.840  2281  3815 I BatteryService_BatteryPropertiesRegistrar: [getProperty]prop.long:-9223372036854775808 ,prop.string:null
+05-26 19:12:50.840  2281  3815 I BatteryService_BatteryPropertiesRegistrar: [getProperty]id:4
+05-26 19:12:50.840  2281  3815 I BatteryService_BatteryPropertiesRegistrar: [getProperty]prop.long:-9223372036854775808 ,prop.string:null
+05-26 19:12:50.841  2281  3815 I SemWifiIntelligentTrainingManager: Tr. cond. check: false / 1 (2) / false / 0 (1)
+05-26 19:12:50.841  2281  3815 I BatteryService_BatteryPropertiesRegistrar: [getProperty]id:6
+05-26 19:12:50.841  2281  3815 I BatteryService_BatteryPropertiesRegistrar: [getProperty]prop.long:-9223372036854775808 ,prop.string:null
+05-26 19:12:51.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790371
+05-26 19:12:51.002  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:51.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:51.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:51.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:51.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:51.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:51.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:51.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:51.826  1117  1117 D io_stats: !@   8,0 r 3380925 137524288 w 3635545 64950380 d 832508 284859396 f 58665 381273 iot 1245716 0 th 0 0 0 pt 0 inp 0 0 950484.098
+05-26 19:12:51.826  1117  1117 D io_stats: !@ Write_top(KB): system_server:normal(2281) 276 vendor.samsung.:normal(1758) 8 kworker/u17:3:/(26182) 4
+05-26 19:12:52.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790372
+05-26 19:12:52.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:52.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:52.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:52.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:52.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:52.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:52.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:52.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:53.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790373
+05-26 19:12:53.002  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:53.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:53.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:53.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:53.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:53.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:53.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:53.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:54.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790374
+05-26 19:12:54.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:54.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:54.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:54.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:54.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:54.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:54.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:54.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:54.030  2281  2976 D MARsPolicyManager: triggerAction called!
+05-26 19:12:54.030  2281  2976 I NSLocationMonitor: getGPSUsingApps() called
+05-26 19:12:54.030  5110  5156 I NSLocationManager_FLP: getGPSUsingApps, No change
+05-26 19:12:54.464 31428 31428 I DMABUFHEAPS: Using DMA-BUF heap named: system
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/rpcmem_android.c:210: set up allocator 0xb4000077e1d26d50 for DMA buf heap system, ION heap system, heap mask 0x2000000, flags 0x1, legacy flags 0x1
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:336: Reading configuration file: llama-bench.debugconfig
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:367: fastrpc_config_init: Couldn't find file llama-bench.debugconfig, errno (No such file or directory) at /vendor/lib64/rfs/dsp, /vendor/lib/rfsa/adsp,
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4957: fastrpc_apps_user_init done  with default domain:3 and &fastrpc_trace:0x76e5ff8680
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:5071: multidsplib_env_init: libcdsprpc.so loaded
+05-26 19:12:54.464 31428 31428 W llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2569:Warning: remote_handle_control: Non-domain usage of FastRPC will be deprecated, use domains to offload to DSP using FastRPC
+05-26 19:12:54.464 31428 31428 E llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2570: remote_handle_control request ID 2 received
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2526: Info: remote_handle_control_domain capability request of attribute 6 for domain 3
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 6 for domain 3 is 35961
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: close_device_node: closed dev 10 on domain 3
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2890: remote_session_control Unsigned PD enable 1 request for domain 3
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 133 for domain 3 is 1
+05-26 19:12:54.464 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: close_device_node: closed dev 10 on domain 3
+05-26 19:12:54.464 31428 31428 E llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3868: Error 0xd: open_shell failed for domain 3 search paths used are /usr/lib/dsp/, /vendor/dsp/, /vendor/dsp/xdsp/ (errno Permission denied)
+05-26 19:12:54.464 31428 31428 W libc    : Access denied finding property "persist.vendor.fastrpc.process.attrs"
+05-26 19:12:54.465 31428 31428 W libc    : Access denied finding property "persist.vendor.fastrpc.process.clockvote"
+05-26 19:12:54.466  2353  2393 I cdsprpcd: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1023: Successfully opened file /vendor/dsp/cdsp/fastrpc_shell_unsigned_3
+05-26 19:12:54.488 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3948: Created user PD on domain 3, dbg_trace 0x0, enabled attr=> RPC timeout:0, Dbg Mode:N, CRC:N, Unsigned:Y, Signed:N, Adapt QOS:N, PD dump: (Config:N, Dbg:N), Perf: (Kernel:N, DSP:N), Iregion:N, QTF:N, UAF:N userPD initmem len:0x500000, Log pkt: N
+05-26 19:12:54.488 31428 31428 E llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3903: Error 0xffffffff: fastrpc_enable_kernel_optimizations failed for domain 3 (Bad address)
+05-26 19:12:54.488 31428 31433 I llama-bench: vendor/qcom/proprietary/adsprpc/src/listener_android.c:119: listener thread starting
+05-26 19:12:54.489 31428 31428 E llama-bench: vendor/qcom/proprietary/adsprpc/src/log_config.c:608:Error : Unable to add watcher for folder /vendor/lib64/rfs/dsp : errno is Permission denied
+05-26 19:12:54.489 31428 31428 E llama-bench: vendor/qcom/proprietary/adsprpc/src/log_config.c:608:Error : Unable to add watcher for folder /vendor/lib/rfsa/adsp : errno is Permission denied
+05-26 19:12:54.489 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_perf.c:292: fastrpc_perf_init: enabled systrace 0x0 and RPC traces (kernel 0, dsp 0) with frequency 1000
+05-26 19:12:54.489 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 129 for domain 3 is 1
+05-26 19:12:54.489 31428 31434 I llama-bench: vendor/qcom/proprietary/adsprpc/src/log_config.c:360: file_watcher_thread starting for domain 3
+05-26 19:12:54.489 31428 31434 W llama-bench: vendor/qcom/proprietary/adsprpc/src/log_config.c:380:file_watcher_thread: Couldn't find file llama-bench.farf, errno (No such file or directory) at ;/vendor/lib64/rfs/dsp;/vendor/lib/rfsa/adsp;/vendor/lib/rfsa/dsp;/vendor/dsp;
+05-26 19:12:54.490 31428 31433 I llama-bench: vendor/qcom/proprietary/adsprpc/src/mod_table.c:701: open_mod_table_open_from_static: reverse module apps_std opened with handle 0xe5ffb3e8 (idx 0)
+05-26 19:12:54.491 31428 31433 D llama-bench: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:382: apps_std_fopen_fd done for ./libggml-htp-v79.so with       fopen:17us, read:98us, rpc_alloc:14us,       mmap:293us fd 0x12 error_code 0x0
+05-26 19:12:54.491 31428 31433 I llama-bench: vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1133: Successfully opened file ./libggml-htp-v79.so
+05-26 19:12:54.494 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1800: remote_handle64_open: opened handle 0xb400007951dcdf90 (remote 0x2d2f60) for file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 on domain 3 (spawn time 24315 us, load time 5221 us), refs 1
+05-26 19:12:54.494 31428 31435 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_latency.c:98: fastrpc_latency_thread_handler started for QoS with activity window 100 ms
+05-26 19:12:54.494 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2515: remote_handle_control_domain: requested QOS 1, latency 1 for domain 3 handle 0xb400007951dcdf90
+05-26 19:12:54.494 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1800: remote_handle64_open: opened handle 0xb400007951dc0a10 (remote 0x2d2d60) for file:///libdspqueue_rpc_skel.so?dspqueue_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 on domain 3 (spawn time 0 us, load time 101 us), refs 2
+05-26 19:12:54.494 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 10 for domain 3 is 1
+05-26 19:12:54.494 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:103: fastrpc_notif_domain_init: FastRPC notification worker thread launched
+05-26 19:12:54.494 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3026: remote_session_control Register PD status notification request for domain 3
+05-26 19:12:54.494 31428 31436 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2205: get_remote_notif_response: received status notification 0 for domain 3, session 0
+05-26 19:12:54.495 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 130 for domain 3 is 1
+05-26 19:12:54.495 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 259 for domain 3 is 1
+05-26 19:12:54.495 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2332: Info: remote_get_info capability of attribute 257 for domain 3 is 1
+05-26 19:12:54.495 31428 31428 E llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1477: Error 0x80000414: remote_handle64_invoke failed for handle 0xb400007951dc0a10, interface libdspqueue_rpc_skel.so method 3 on domain 3 (sc 0x3010100) (errno Success) (user err 0x80000414)
+05-26 19:12:54.495 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/dspqueue/dspqueue_cpu.c:642: dspqueue_create: created Queue 0, 0xb4000077e1d27ed0, DSP 0x00000000 for domain 3
+05-26 19:12:54.746  1117  1120 D io_stats: !@ cpu boost: status(ON), traffic_level(3), io_cpus(0x3d), boosted_cpus(0x3d), set_freq(2000000)
+05-26 19:12:55.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790375
+05-26 19:12:55.002  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:55.002  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:55.002  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:55.002  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:55.002  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:55.002  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:55.002  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:55.002  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:55.832  1117  1117 D io_stats: !@   8,0 r 3382371 138566456 w 3635545 64950380 d 833246 284874140 f 58665 381273 iot 1245980 0 th 0 0 0 pt 0 inp 0 0 950488.104
+05-26 19:12:55.832  1117  1117 D io_stats: !@ Read_top(KB): llama-bench:normal(31428) 1042160 kworker/u18:0:/(15560) 8
+05-26 19:12:56.004  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790376
+05-26 19:12:56.005  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:56.005  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:56.005  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:56.005  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:56.005  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:56.005  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:56.005  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:56.005  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:57.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790377
+05-26 19:12:57.002  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:57.002  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:57.002  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:57.002  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:57.002  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:57.002  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:57.002  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:57.002  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:57.570  1760  2613 I thermal_core: pivot(AP) : 393, skin : 301
+05-26 19:12:57.603  1725  5582 D AHAL_ModulePrimary_QTI: getVendorParameters: id count: 1
+05-26 19:12:57.603  1725  5582 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:57.603  1725  5582 D AHAL_SecModulePrimary: onGetSECGenericParameters get temperature for g_hw_speaker_amp_temp_rcv: 0
+05-26 19:12:57.603  1725  1742 D AHAL_ModulePrimary_QTI: getVendorParameters: id count: 1
+05-26 19:12:57.603  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:57.603  1725  1742 D AHAL_SecModulePrimary: onGetSECGenericParameters get temperature for g_hw_speaker_amp_temp_spk: 0
+05-26 19:12:57.603  5788  6546 I SDHMS:x : SIOP:: AP:393 BAT:281 USB:262 CHG:319 PA:361 WIFI:392 CF:316 BLK:0 SUBBAT:0 LRPTHM:329 SKIN:312 SKINF:302 SKINB:312 LRP:312 LRF:302 LRB:312 APT:302 APR:312 RCV:283 SPK:262 CHGF:300 CHGR:306 MEMF:299 MEMR:303 WIFIF:299 WIFIR:307 FCAM:262 UPSPK:299 DNSPK:261 VAP:328 VWIFI:313 AMB2:253 HIGH:0 AVGCUR:-57 POWER:-239
+05-26 19:12:57.603  5788  6546 I AudioManager: setParameters keyValuePairs = g_hw_speaker_amp_temp_spk=26
+05-26 19:12:57.603  1786  1786 D AudioFlinger: setParameters: filtered dev setParameters keyvalue g_hw_speaker_amp_temp_spk=26
+05-26 19:12:57.603  1725  5582 D AHAL_HFP_QTI: hfp_set_parameters enter
+05-26 19:12:57.603  1725  5582 D AHAL_HFP_QTI: hfp_set_parameters Exit
+05-26 19:12:57.603  1725  5582 D AHAL_SecModulePrimary: processSetVendorParameters: configured g_hw_speaker_amp_temp_spk
+05-26 19:12:57.603  1725  5582 D AHAL_SecModulePrimary: processSetVendorParameters: handler set on Feature:0
+05-26 19:12:57.603  1725  5582 D AHAL_SecModulePrimary: onSetSECGenericParameters set temperature for g_hw_speaker_amp_temp_spk: 26
+05-26 19:12:57.603  1725  5582 I PAL: API: pal_set_param: 1377: Enter: param id 3002
+05-26 19:12:57.603  1725  5582 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:57.603  1786  1786 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:57.603  1786  1786 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:57.604  5788  6546 I AudioManager: setParameters keyValuePairs = g_hw_speaker_amp_temp_rcv=28
+05-26 19:12:57.604  1786  1786 D AudioFlinger: setParameters: filtered dev setParameters keyvalue g_hw_speaker_amp_temp_rcv=28
+05-26 19:12:57.604  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters enter
+05-26 19:12:57.604  1725  1742 D AHAL_HFP_QTI: hfp_set_parameters Exit
+05-26 19:12:57.604  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: configured g_hw_speaker_amp_temp_rcv
+05-26 19:12:57.604  1725  1742 D AHAL_SecModulePrimary: processSetVendorParameters: handler set on Feature:0
+05-26 19:12:57.604  1725  1742 D AHAL_SecModulePrimary: onSetSECGenericParameters set temperature for g_hw_speaker_amp_temp_rcv: 28
+05-26 19:12:57.604  1725  1742 I PAL: API: pal_set_param: 1377: Enter: param id 3001
+05-26 19:12:57.604  1725  1742 I PAL: ResourceManager: getActiveStream_l: 6569: no active streams found for device 3 ret -2
+05-26 19:12:57.604  1786  1786 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:57.604  1786  1786 E ConversionHelperAidl: Function: parseAndSetVendorParameters Line: 94 Failed 
+05-26 19:12:57.688  4178  4178 I wpa_supplicant: Heartbeat 94962
+05-26 19:12:57.832  1117  1117 D io_stats: !@   8,0 r 3382373 138566464 w 3635553 64950404 d 833246 284874140 f 58665 381275 iot 1245984 0 th 0 0 0 pt 0 inp 0 0 950490.104
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4532: close_dev: unloading library libcdsprpc.so
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 0: dev -1
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 1: dev -1
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 2: dev -1
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 3: dev 10
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:123: dspsignal_domain_deinit done for domain 3
+05-26 19:12:57.892 31428 31436 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2205: get_remote_notif_response: received status notification 1 for domain 3, session 0
+05-26 19:12:57.892 31428 31436 I llama-bench: vendor/qcom/proprietary/adsprpc/src/dspqueue/dspqueue_cpu.c:2214: dspqueue_notif_callback for domain 3, session 0, status 1
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:275::Error: 0xd: (ds = signals->domain_signals[domain]) != NULL
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:292: Error 0xd: dspsignal_cancel_wait failed (domain 3, ID 0) errno Success
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:275::Error: 0xd: (ds = signals->domain_signals[domain]) != NULL
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:292: Error 0xd: dspsignal_cancel_wait failed (domain 3, ID 1) errno Success
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:275::Error: 0xd: (ds = signals->domain_signals[domain]) != NULL
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:292: Error 0xd: dspsignal_cancel_wait failed (domain 3, ID 2) errno Success
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:275::Error: 0xd: (ds = signals->domain_signals[domain]) != NULL
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/dspsignal.c:292: Error 0xd: dspsignal_cancel_wait failed (domain 3, ID 3) errno Success
+05-26 19:12:57.892 31428 31436 E llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:56:Error 0xc: notif_fastrpc_thread FastRPC notification worker thread exited for domain 3 (errno Success), notif_domain_deinit started 0
+05-26 19:12:57.892 31428 31434 W llama-bench: vendor/qcom/proprietary/adsprpc/src/log_config.c:394:Warning: file_watcher_thread received exit for domain 3, file llama-bench.farf
+05-26 19:12:57.892 31428 31434 I llama-bench: vendor/qcom/proprietary/adsprpc/src/log_config.c:446: file_watcher_thread exiting for domain 3
+05-26 19:12:57.892 31428 31435 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_latency.c:157: FastRPC latency thread for QoS exited
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_latency.c:69: latency thread joined
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:72: fastrpc_notif_domain_deinit: Waiting for FastRPC notification worker thread to join
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:80: fastrpc_notif_domain_deinit: Fastrpc notification worker thread joined
+05-26 19:12:57.892 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/mod_table.c:792: open_mod_table_close: closed reverse module apps_std with handle 0xe5ffb3e8
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: close_device_node: closed dev 10 on domain 3
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3548: domain_deinit: closed device 10 on domain 3 (kill time 3490 us)
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 4: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 5: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 6: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 7: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 8: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 9: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 10: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 11: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 12: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 13: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 14: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3504: domain_deinit for domain 15: dev -1
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/rpcmem_android.c:357: rpcmem_deinit_internal done
+05-26 19:12:57.896 31428 31428 I llama-bench: vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4858: fastrpc_apps_user_deinit done
+05-26 19:12:58.001  1798  2034 E HeatmapThread: ECT Thread time in milliseconds: 1779790378
+05-26 19:12:58.003  1798  2034 D HeatmapThread: !@ batteryplugType : 2
+05-26 19:12:58.003  1798  2034 D HeatmapThread: !@ batteryLevel : 79  batteryTemperature : 278 
+05-26 19:12:58.003  1798  2034 D HeatmapThread: !@ Heatmap currtime: 29663172
+05-26 19:12:58.003  1798  2034 D HeatmapThread: !@ Heatmap prevtime: 29663171
+05-26 19:12:58.003  1798  2034 D HeatmapThread: !@ Heatmap plugstarttime: 29647331
+05-26 19:12:58.003  1798  2034 D HeatmapThread: !@ Heatmap prevv_dsoh_update_time: 29663171
+05-26 19:12:58.003  1798  2034 E HeatmapThread: !@ CAM New BSOH: 100
+05-26 19:12:58.003  1798  2034 E HeatmapThread: !@ CAM is Working
+05-26 19:12:58.185  2281  2901 E Watchdog: !@Sync: 31669 heap(MB): 122 / 150 FD: 1197 [2026-05-26 19:12:58.185]
+05-26 19:12:58.799  1117  1120 D io_stats: !@ cpu boost: status(OFF), traffic_level(0), io_cpus(0x0), boosted_cpus(0x0), set_freq(0)
