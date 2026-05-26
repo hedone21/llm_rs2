@@ -1,4 +1,4 @@
-use crate::models::config::ModelArch;
+use crate::model_config::ModelArch;
 use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

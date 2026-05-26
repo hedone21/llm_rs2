@@ -22,7 +22,7 @@ use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::layers::transformer_layer::{QkvBias, TransformerLayer};
 use crate::memory::Memory;
-use crate::models::config::ModelConfig;
+use crate::model_config::ModelConfig;
 use crate::models::transformer::TransformerModel;
 use crate::tensor::Tensor;
 

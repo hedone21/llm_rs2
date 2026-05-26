@@ -27,7 +27,7 @@ use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::memory::host::shared::SharedBuffer;
-use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
 use llm_rs2::pressure::ActionResult;
 use llm_rs2::pressure::kv_cache::KVCache;

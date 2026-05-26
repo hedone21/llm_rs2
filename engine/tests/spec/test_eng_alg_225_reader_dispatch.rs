@@ -484,7 +484,7 @@ fn d4_swap_executor_signature_unchanged() {
     // 이 함수가 컴파일되면 SwapExecutor::new 시그니처가 unchanged임이 증명된다.
     fn _assert_swap_executor_signature<'a>(
         dtype: DType,
-        config: &'a llm_rs2::models::config::ModelConfig,
+        config: &'a llm_rs2::model_config::ModelConfig,
         backend: std::sync::Arc<dyn llm_rs2::backend::Backend>,
         mem: &'a dyn llm_rs2::memory::Memory,
     ) -> SwapExecutor<'a> {
@@ -500,8 +500,8 @@ fn d4_swap_executor_signature_unchanged() {
 /// 테스트용 더미 `ModelConfig` 생성.
 ///
 /// `num_hidden_layers`만 커스텀하고 나머지는 최소값을 사용한다.
-fn make_dummy_model_config(num_layers: usize) -> llm_rs2::models::config::ModelConfig {
-    use llm_rs2::models::config::{ModelArch, ModelConfig};
+fn make_dummy_model_config(num_layers: usize) -> llm_rs2::model_config::ModelConfig {
+    use llm_rs2::model_config::{ModelArch, ModelConfig};
     ModelConfig {
         arch: ModelArch::Llama,
         hidden_size: 32,

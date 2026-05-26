@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use crate::backend::Backend;
 use crate::buffer::{Buffer, DType};
 use crate::memory::rpcmem::allocator::RpcmemAllocator;
-use crate::models::config::ModelConfig;
+use crate::model_config::ModelConfig;
 use crate::models::loader::gguf::GgufFile;
 #[cfg(target_os = "android")]
 use crate::models::loader::gguf::{ggml_type_to_dtype, tensor_byte_size};

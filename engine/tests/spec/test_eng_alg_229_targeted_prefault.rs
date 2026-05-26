@@ -19,7 +19,7 @@ use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKi
 use llm_rs2::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
 use llm_rs2::auf::writer::AufWriter;
 use llm_rs2::auf::{AufMeta, BackendTag};
-use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::{SecondaryDtypeChoice, build_auf_secondary_from_view};
 
 // ── Common fixture builder ───────────────────────────────────────────────────

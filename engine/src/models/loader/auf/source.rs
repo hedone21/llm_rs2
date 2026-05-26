@@ -23,7 +23,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::auf_view_buffer::AufViewBuffer;
 use crate::buffer::{Buffer, DType};
 use crate::memory::Memory;
-use crate::models::config::{ModelArch, ModelConfig};
+use crate::model_config::{ModelArch, ModelConfig};
 use crate::models::loader::auf::secondary::auf_dtype_to_engine;
 use crate::models::loader::{LayerBiasKind, LayerWeightKind, TensorId, TensorSource};
 use crate::shape::Shape;

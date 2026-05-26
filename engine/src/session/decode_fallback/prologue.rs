@@ -571,7 +571,7 @@ pub fn run_decode_prologue(ctx: DecodePrologueCtx<'_>) -> anyhow::Result<DecodeP
             && !args.profile
             && !args.no_gpu_plan
             && accumulator_compatible_with_plan
-            && model.config.arch != crate::models::config::ModelArch::Gemma3
+            && model.config.arch != crate::model_config::ModelArch::Gemma3
             && !args.swap_intra_forward
             && !args.swap_layer_immediate
             && !args.swap_phase_aware

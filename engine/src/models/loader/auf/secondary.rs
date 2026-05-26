@@ -21,7 +21,7 @@ use crate::auf::{
     tensor_index::{LAYER_IDX_CROSS, TensorDType},
 };
 use crate::buffer::DType;
-use crate::models::config::ModelConfig;
+use crate::model_config::ModelConfig;
 use crate::models::weights::secondary_mmap::{
     AufSecondaryMmap, LayerTensorSlice, LoadError, SecondaryDtypeChoice, SecondaryLayoutChoice,
     SecondaryMmap, SecondaryTensorInfo, tensor_kind_to_subname,
@@ -753,7 +753,7 @@ mod tests {
     }
 
     fn make_test_config() -> ModelConfig {
-        use crate::models::config::ModelArch;
+        use crate::model_config::ModelArch;
         ModelConfig {
             arch: ModelArch::Llama,
             hidden_size: 64,

@@ -2,7 +2,7 @@ mod gemma3;
 mod llama;
 mod qwen2;
 
-use super::config::ModelArch;
+use crate::model_config::ModelArch;
 
 /// Per-layer weight tensor names in the safetensors file.
 pub struct LayerWeightNames {

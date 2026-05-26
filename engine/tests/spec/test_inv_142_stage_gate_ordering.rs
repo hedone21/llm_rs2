@@ -37,7 +37,7 @@ use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::{LayerSlot, StageBreakdown, SwapError, SwapExecutor};
 use llm_rs2::tensor::Tensor;
 

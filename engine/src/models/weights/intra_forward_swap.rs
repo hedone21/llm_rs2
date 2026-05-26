@@ -174,7 +174,7 @@ pub struct IntraForwardSwapHook {
     finalized: AtomicBool,
     /// Model config — needed by `SwapExecutor::build_layer_from_mmap_async`
     /// for Q/K permutation gating.
-    config: Arc<crate::models::config::ModelConfig>,
+    config: Arc<crate::model_config::ModelConfig>,
     /// Self-weak reference for the dispatcher worker callback path. Set
     /// after construction by `Arc::new_cyclic`. Used so the trait-impl
     /// `on_layer_boundary` can hand a typed `Arc<Self>` to the callback
@@ -203,7 +203,7 @@ impl IntraForwardSwapHook {
         backend: Arc<dyn Backend>,
         release_worker: Option<Arc<PrimaryReleaseWorker>>,
         target_dtype: DType,
-        config: Arc<crate::models::config::ModelConfig>,
+        config: Arc<crate::model_config::ModelConfig>,
         event_sink: Arc<dyn EventSink>,
     ) -> Arc<Self> {
         Self::new_internal(
@@ -234,7 +234,7 @@ impl IntraForwardSwapHook {
         layer_slots: Vec<Arc<LayerSlot>>,
         backend: Arc<dyn Backend>,
         target_dtype: DType,
-        config: Arc<crate::models::config::ModelConfig>,
+        config: Arc<crate::model_config::ModelConfig>,
     ) -> Arc<Self> {
         Self::new_internal(
             layers,
@@ -260,7 +260,7 @@ impl IntraForwardSwapHook {
         backend: Arc<dyn Backend>,
         release_worker: Option<Arc<PrimaryReleaseWorker>>,
         target_dtype: DType,
-        config: Arc<crate::models::config::ModelConfig>,
+        config: Arc<crate::model_config::ModelConfig>,
         event_sink: Arc<dyn EventSink>,
     ) -> Arc<Self> {
         let num_layers = layer_slots.len();

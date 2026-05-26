@@ -10,7 +10,7 @@ use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
 use crate::memory::Memory;
-use crate::models::config::{ModelArch, ModelConfig};
+use crate::model_config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O PreloadAccess trait (inference→pressure trait boundary)
 use crate::pressure::offload::preload_pool::PreloadAccess;
@@ -2413,7 +2413,7 @@ impl TransformerModel {
             partition_cpu_backend: layer_snaps
                 .iter()
                 .find_map(|l| l.partition_ctx.as_ref().map(|c| c.cpu_backend.clone())),
-            partition_use_gelu_tanh: self.config.arch == crate::models::config::ModelArch::Gemma3,
+            partition_use_gelu_tanh: self.config.arch == crate::model_config::ModelArch::Gemma3,
             lm_head_dtype: self.lm_head.dtype(),
             // UMA hybrid attention: pulled from the thread-local HybridScope
             // installed by the caller (generate.rs decode entry). Mutually
@@ -3233,7 +3233,7 @@ mod tests {
             has_qkv_bias: false,
             tie_word_embeddings: false,
             eos_token_id: 2,
-            arch: crate::models::config::ModelArch::Llama,
+            arch: crate::model_config::ModelArch::Llama,
             rope_local_theta: None,
             sliding_window: None,
             sliding_window_pattern: None,
@@ -3499,7 +3499,7 @@ mod tests {
             has_qkv_bias: false,
             tie_word_embeddings: true,
             eos_token_id: 2,
-            arch: crate::models::config::ModelArch::Llama,
+            arch: crate::model_config::ModelArch::Llama,
             rope_local_theta: None,
             sliding_window: None,
             sliding_window_pattern: None,
@@ -3603,7 +3603,7 @@ mod tests {
             has_qkv_bias: false,
             tie_word_embeddings: true,
             eos_token_id: 2,
-            arch: crate::models::config::ModelArch::Llama,
+            arch: crate::model_config::ModelArch::Llama,
             rope_local_theta: None,
             sliding_window: None,
             sliding_window_pattern: None,
@@ -3683,7 +3683,7 @@ mod tests {
             has_qkv_bias: false,
             tie_word_embeddings: false,
             eos_token_id: 2,
-            arch: crate::models::config::ModelArch::Llama,
+            arch: crate::model_config::ModelArch::Llama,
             rope_local_theta: None,
             sliding_window: None,
             sliding_window_pattern: None,
@@ -3842,7 +3842,7 @@ mod tests {
 
         struct DummySource;
         impl TensorSource for DummySource {
-            fn config(&self) -> &crate::models::config::ModelConfig {
+            fn config(&self) -> &crate::model_config::ModelConfig {
                 unimplemented!("not exercised by resolve_secondary non-AUF path")
             }
             fn load_tensor(
@@ -3896,7 +3896,7 @@ mod tests {
 
         struct DummySource;
         impl TensorSource for DummySource {
-            fn config(&self) -> &crate::models::config::ModelConfig {
+            fn config(&self) -> &crate::model_config::ModelConfig {
                 unimplemented!()
             }
             fn load_tensor(

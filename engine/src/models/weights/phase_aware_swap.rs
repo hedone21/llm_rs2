@@ -195,7 +195,7 @@ pub struct PhaseAwareSwapDispatcher {
     /// finalize() 호출 후 true. 이후 dispatch / hook fire는 noop.
     finalized: AtomicBool,
     /// `Arc::new`로 보관된 model config — `SwapExecutor` 생성 시 borrow.
-    config: Arc<crate::models::config::ModelConfig>,
+    config: Arc<crate::model_config::ModelConfig>,
     /// Per-layer staging buffer. `try_dispatch_chunk`이 enqueue한 결과를
     /// `is_last_in_layer` 도달 시 모아서 LayerWeights로 조립.
     pending_layers: Mutex<HashMap<usize, PartialLayer>>,
@@ -239,7 +239,7 @@ impl PhaseAwareSwapDispatcher {
         backend: Arc<dyn Backend>,
         dispatcher: Arc<AsyncSwapDispatcher>,
         target_dtype: DType,
-        config: Arc<crate::models::config::ModelConfig>,
+        config: Arc<crate::model_config::ModelConfig>,
         event_sink: Arc<dyn EventSink>,
     ) -> Arc<Self> {
         Arc::new(Self {

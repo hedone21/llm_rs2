@@ -60,7 +60,7 @@ impl SwapCommitSlot {
 pub struct EngineSwapRuntime {
     swap_backend: Arc<dyn Backend>,
     dispatcher: Arc<AsyncSwapDispatcher>,
-    config: Arc<crate::models::config::ModelConfig>,
+    config: Arc<crate::model_config::ModelConfig>,
     release_worker: Arc<PrimaryReleaseWorker>,
     event_sink: Arc<dyn EventSink>,
     /// CLI `--swap` flag normalize 결과. Manager-driven swap 시 이 mode로 commit.
@@ -76,7 +76,7 @@ impl EngineSwapRuntime {
     pub fn new(
         swap_backend: Arc<dyn Backend>,
         dispatcher: Arc<AsyncSwapDispatcher>,
-        config: Arc<crate::models::config::ModelConfig>,
+        config: Arc<crate::model_config::ModelConfig>,
         release_worker: Arc<PrimaryReleaseWorker>,
         event_sink: Arc<dyn EventSink>,
         default_mode: SwapMode,
@@ -107,7 +107,7 @@ impl EngineSwapRuntime {
         &self.dispatcher
     }
 
-    pub fn config(&self) -> &Arc<crate::models::config::ModelConfig> {
+    pub fn config(&self) -> &Arc<crate::model_config::ModelConfig> {
         &self.config
     }
 

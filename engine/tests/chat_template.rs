@@ -1,6 +1,6 @@
 //! Integration tests for the chat template module — byte-exact goldens.
 
-use llm_rs2::models::config::ModelArch;
+use llm_rs2::model_config::ModelArch;
 use llm_rs2::session::chat_template::ChatTemplate;
 
 #[test]

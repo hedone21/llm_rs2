@@ -21,7 +21,7 @@ use llm_rs2::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
 use llm_rs2::auf::writer::AufWriter;
 use llm_rs2::auf::{AufMeta, BackendTag};
 use llm_rs2::buffer::DType;
-use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::build_auf_secondary_from_view;
 use std::path::Path;
 

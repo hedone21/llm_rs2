@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::buffer::DType;
-use crate::models::config::ModelConfig;
+use crate::model_config::ModelConfig;
 use crate::models::loader::gguf::{GgufFile, ggml_type_to_dtype, tensor_byte_size};
 
 // ── AUF crate imports ──────────────────────────────────────────────────────
@@ -1205,7 +1205,7 @@ mod tests {
         use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
         use crate::auf::writer::AufWriter;
         use crate::auf::{AufMeta, BackendTag};
-        use crate::models::config::{ModelArch, ModelConfig};
+        use crate::model_config::{ModelArch, ModelConfig};
         use crate::models::weights::SecondaryDtypeChoice;
         use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
 
@@ -1354,7 +1354,7 @@ mod tests {
         use crate::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
         use crate::auf::writer::AufWriter;
         use crate::auf::{AufMeta, BackendTag};
-        use crate::models::config::{ModelArch, ModelConfig};
+        use crate::model_config::{ModelArch, ModelConfig};
         use crate::models::weights::SecondaryDtypeChoice;
         use crate::models::weights::secondary_mmap::build_auf_secondary_from_view;
 

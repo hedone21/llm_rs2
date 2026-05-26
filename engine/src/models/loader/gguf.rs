@@ -17,7 +17,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::host::mmap::MmapBuffer;
-use crate::models::config::ModelConfig;
+use crate::model_config::ModelConfig;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -605,7 +605,7 @@ pub(crate) fn unpermute_qk_rows(
 /// `pub(crate)` for the same reason as `unpermute_qk_rows` — the swap
 /// executor needs the exact same gating to decide whether to permute.
 pub(crate) fn qk_permute_shape(name: &str, config: &ModelConfig) -> Option<(usize, usize)> {
-    use crate::models::config::ModelArch;
+    use crate::model_config::ModelArch;
     if config.arch != ModelArch::Llama {
         return None;
     }
@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn test_qk_permute_shape_gating() {
-        use crate::models::config::ModelArch;
+        use crate::model_config::ModelArch;
         fn make_cfg(arch: ModelArch) -> ModelConfig {
             ModelConfig {
                 arch,
@@ -1574,7 +1574,7 @@ mod tests {
         let gguf = parse_from_bytes(&data).expect("Failed to parse GGUF");
         let config = ModelConfig::from_gguf_metadata(&gguf).expect("Failed to create config");
 
-        assert_eq!(config.arch, crate::models::config::ModelArch::Llama);
+        assert_eq!(config.arch, crate::model_config::ModelArch::Llama);
         assert_eq!(config.hidden_size, 64);
         assert_eq!(config.num_hidden_layers, 2);
         assert_eq!(config.num_attention_heads, 4);
@@ -1605,7 +1605,7 @@ mod tests {
         let gguf = parse_from_bytes(&bytes).expect("Failed to parse GGUF");
         let config = ModelConfig::from_gguf_metadata(&gguf).expect("Failed to create config");
 
-        assert_eq!(config.arch, crate::models::config::ModelArch::Qwen2);
+        assert_eq!(config.arch, crate::model_config::ModelArch::Qwen2);
         assert!(config.has_qkv_bias);
         assert_eq!(config.hidden_size, 1536);
         assert_eq!(config.num_hidden_layers, 28);

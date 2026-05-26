@@ -123,8 +123,8 @@ fn build_auf_with_variant_tag() -> Vec<u8> {
 }
 
 /// Construct a minimal `ModelConfig` matching make_meta() (vocab_size=10, hidden_dim=32).
-fn make_model_config() -> llm_rs2::models::config::ModelConfig {
-    use llm_rs2::models::config::{ModelArch, ModelConfig};
+fn make_model_config() -> llm_rs2::model_config::ModelConfig {
+    use llm_rs2::model_config::{ModelArch, ModelConfig};
     ModelConfig {
         arch: ModelArch::Llama,
         hidden_size: 32,

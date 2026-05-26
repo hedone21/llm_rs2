@@ -13,6 +13,7 @@ pub mod instrument;
 pub mod kv_cache_ops;
 pub mod layers;
 pub mod memory;
+pub mod model_config;
 pub mod models;
 pub mod op_kind;
 pub mod partition_workspace;

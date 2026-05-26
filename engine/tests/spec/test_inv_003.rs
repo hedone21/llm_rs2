@@ -7,7 +7,7 @@
 
 use std::io::Write;
 
-use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::model_config::{ModelArch, ModelConfig};
 
 /// 임시 디렉토리에 config.json을 작성하고 ModelConfig::from_json()을 호출하는 헬퍼.
 fn parse_config_json(json: &str) -> anyhow::Result<ModelConfig> {

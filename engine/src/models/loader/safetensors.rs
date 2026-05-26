@@ -19,7 +19,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::config::ModelConfig;
+use crate::model_config::ModelConfig;
 use crate::models::mappers::{WeightMapper, create_mapper_with_prefix};
 use crate::shape::Shape;
 use crate::tensor::Tensor;

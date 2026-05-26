@@ -20,7 +20,7 @@ use std::time::Duration;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
-use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::async_swap::AsyncSwapDispatcher;
 use llm_rs2::models::weights::{IntraForwardSwapHook, LayerSlot};
 use llm_rs2::observability::events::noop_sink;

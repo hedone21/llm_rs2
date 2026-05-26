@@ -53,7 +53,7 @@ use crate::buffer::{Buffer, DType};
 use crate::layers::transformer_layer::TransformerLayer;
 use crate::memory::Memory;
 use crate::memory::host::shared::SharedBuffer;
-use crate::models::config::ModelConfig;
+use crate::model_config::ModelConfig;
 use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::async_swap::AsyncSwapDispatcher;

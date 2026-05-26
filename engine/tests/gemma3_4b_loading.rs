@@ -35,12 +35,12 @@ fn gemma3_4b_config_flattens_and_sets_prefix() {
         return;
     };
 
-    let cfg = llm_rs2::models::config::ModelConfig::from_json(&dir)
-        .expect("ModelConfig::from_json failed");
+    let cfg =
+        llm_rs2::model_config::ModelConfig::from_json(&dir).expect("ModelConfig::from_json failed");
 
     assert_eq!(
         cfg.arch,
-        llm_rs2::models::config::ModelArch::Gemma3,
+        llm_rs2::model_config::ModelArch::Gemma3,
         "Expected arch Gemma3, got {:?}",
         cfg.arch
     );

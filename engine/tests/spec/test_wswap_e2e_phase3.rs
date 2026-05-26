@@ -20,7 +20,7 @@ use llm_rs2::buffer::DType;
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::{
     LayerSlot, QuantNoiseTable, SwapAlgorithm, WeightSwapDecider, compute_qcf_weight_swap,
 };

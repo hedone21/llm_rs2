@@ -552,7 +552,7 @@ fn load_tokenizer_from_json(
 
 /// GGUF에서 AufMeta를 구성한다.
 fn build_meta_from_gguf(gguf: &llm_rs2::models::loader::gguf::GgufFile) -> Result<AufMeta> {
-    use llm_rs2::models::config::ModelConfig;
+    use llm_rs2::model_config::ModelConfig;
 
     let config = ModelConfig::from_gguf_metadata(gguf)
         .map_err(|e| anyhow!("ModelConfig 파싱 실패: {}", e))?;
@@ -717,7 +717,7 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     )?;
 
     // 7) ModelConfig (Q/K permute shape 결정용)
-    let config = llm_rs2::models::config::ModelConfig::from_gguf_metadata(&gguf)
+    let config = llm_rs2::model_config::ModelConfig::from_gguf_metadata(&gguf)
         .map_err(|e| anyhow!("ModelConfig 파싱 실패: {}", e))?;
 
     // 8) weight payload 생성 (각 variant 별)
@@ -919,7 +919,7 @@ fn select_lm_head_source(has_separate: bool, has_token_embd: bool) -> Option<LmH
 /// 결정에 사용). source가 둘 다 없거나 Off 모드면 false.
 fn extract_weight_blobs(
     gguf: &llm_rs2::models::loader::gguf::GgufFile,
-    config: &llm_rs2::models::config::ModelConfig,
+    config: &llm_rs2::model_config::ModelConfig,
     lm_head_mode: IncludeLmHeadMode,
     candidate_dtypes: Option<&[TensorDType]>,
     quiet: bool,
@@ -1293,9 +1293,9 @@ fn quantize_lm_head_to_q4_0(
 /// 동등한 로직을 로컬에 구현한다.
 fn qk_permute_shape_local(
     name: &str,
-    config: &llm_rs2::models::config::ModelConfig,
+    config: &llm_rs2::model_config::ModelConfig,
 ) -> Option<(usize, usize)> {
-    use llm_rs2::models::config::ModelArch;
+    use llm_rs2::model_config::ModelArch;
     if config.arch != ModelArch::Llama {
         return None;
     }

@@ -251,7 +251,7 @@ fn len_of(s: &str) -> usize {
 fn auf_secondary_tensor_bytes_base_offset_round_trip() {
     use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
     use llm_rs2::auf::{AufMeta, BackendTag};
-    use llm_rs2::models::config::{ModelArch, ModelConfig};
+    use llm_rs2::model_config::{ModelArch, ModelConfig};
     use llm_rs2::models::weights::build_auf_secondary_from_view;
     use std::path::Path;
 
@@ -422,7 +422,7 @@ fn auf_secondary_layout_auto_falls_back_to_cpu_aos() {
     use llm_rs2::auf::AufMeta;
     use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
     use llm_rs2::buffer::DType;
-    use llm_rs2::models::config::{ModelArch, ModelConfig};
+    use llm_rs2::model_config::{ModelArch, ModelConfig};
     use llm_rs2::models::weights::{
         SecondaryDtypeChoice, SecondaryLayoutChoice, open_secondary_auf,
     };
@@ -539,7 +539,7 @@ fn auf_secondary_auto_prefers_weight_dtype_over_norm_f32() {
     use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
     use llm_rs2::auf::{AufMeta, BackendTag};
     use llm_rs2::buffer::DType;
-    use llm_rs2::models::config::{ModelArch, ModelConfig};
+    use llm_rs2::model_config::{ModelArch, ModelConfig};
     use llm_rs2::models::weights::{SecondaryDtypeChoice, build_auf_secondary_from_view};
     use std::path::Path;
 

@@ -15,7 +15,7 @@ use anyhow::Result;
 use tokenizers::Tokenizer;
 
 use crate::inference::sampling::{self, SamplingConfig};
-use crate::models::config::ModelArch;
+use crate::model_config::ModelArch;
 use crate::session::chat::session::ChatSession;
 use crate::session::chat::stop_condition::{ChatStopCondition, build_chat_stop_ids};
 use crate::session::chat_ipc::{

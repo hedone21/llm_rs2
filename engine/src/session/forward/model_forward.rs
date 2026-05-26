@@ -22,7 +22,7 @@ use crate::layers::workspace::{LayerWorkspace, PrefillWorkspace, WorkspaceConfig
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
-use crate::models::config::ModelArch;
+use crate::model_config::ModelArch;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::pressure::kv_cache::KVCache;
 use crate::session::traits::{Forward, StepCtx};

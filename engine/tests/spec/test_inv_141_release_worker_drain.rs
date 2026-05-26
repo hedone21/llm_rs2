@@ -206,7 +206,7 @@ fn inv_141_swap_executor_rejects_on_drain_timeout() {
     use std::sync::atomic::AtomicU64;
 
     use llm_rs2::memory::galloc::Galloc;
-    use llm_rs2::models::config::{ModelArch, ModelConfig};
+    use llm_rs2::model_config::{ModelArch, ModelConfig};
     use llm_rs2::models::weights::{LayerSlot, SwapError, SwapExecutor};
 
     fn minimal_config() -> ModelConfig {

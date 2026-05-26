@@ -37,7 +37,7 @@ use llm_rs2::auf::{
 use llm_rs2::backend::Backend;
 use llm_rs2::buffer::{Buffer, DType};
 use llm_rs2::memory::host::mmap::MmapBuffer;
-use llm_rs2::models::config::{ModelArch, ModelConfig};
+use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::SecondaryMmap;
 use llm_rs2::models::weights::secondary_mmap::{
     SecondaryDtypeChoice, build_auf_secondary_from_view,

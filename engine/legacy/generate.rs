@@ -2138,7 +2138,7 @@ fn main() -> anyhow::Result<()> {
                     && !args.profile
                     && !args.no_gpu_plan
                     && accumulator_compatible_with_plan
-                    && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
+                    && model.config.arch != llm_rs2::model_config::ModelArch::Gemma3
                 {
                     gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
                     if partition_active_any && gpu_plan.is_none() {
