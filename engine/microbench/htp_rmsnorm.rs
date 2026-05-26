@@ -431,6 +431,7 @@ fn run_htp(
     {
         use std::time::Instant;
 
+        use anyhow::Context;
         use llm_rs2::backend::htp_fastrpc::{
             AEE_SUCCESS, DSPQUEUE_TIMEOUT, DspQueueBuffer, DspqBufferType, HTP_TYPE_F32,
             HtpFastrpcHost, HtpGeneralReq, HtpGeneralRsp, RpcmemBuffer, htp_tensor_from_shape,
@@ -446,6 +447,18 @@ fn run_htp(
             "  host: libcdsprpc.so={}, domain_id={}, session_id={}, queue_id={}",
             host.lib_path, host.domain_id, host.session_id, host.queue_id
         );
+
+        // β-1 PoC: lifecycle htp_iface_start(handle, sess_id, queue_id, n_hvx).
+        // 본 호출이 DSP-side worker thread 를 dspqueue 에 attach 시킨다. 누락 시
+        // dspqueue_write 가 rc=0x48 (DSP worker not attached) 로 fail — Q-2.2-α
+        // Phase 6 의 root cause.
+        let n_hvx: u32 = std::env::var("HTP_FASTRPC_N_HVX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        host.try_start_iface(n_hvx)
+            .with_context(|| format!("htp_iface_start(n_hvx={n_hvx})"))?;
+        println!("  htp_iface_start: OK (n_hvx={n_hvx})");
 
         // ── Allocate rpcmem buffers ─────────────────────────────────────────
         //

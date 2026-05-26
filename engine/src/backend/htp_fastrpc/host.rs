@@ -22,6 +22,7 @@
 
 use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -59,6 +60,17 @@ pub const DSPQUEUE_TIMEOUT: u32 = 10_000_000;
 pub const RPCMEM_HEAP_ID_SYSTEM: c_int = 25;
 /// rpcmem default flags. llama.cpp 동일.
 pub const RPCMEM_DEFAULT_FLAGS: u32 = 1;
+/// `RPCMEM_HEAP_NOREG` — alloc 시점에 모든 FastRPC domain 자동 register 를
+/// 막는다. 명시 `fastrpc_mmap` 으로 특정 domain 에만 register 할 때 필수.
+/// 출처: Qualcomm Hexagon SDK `rpcmem.h` 공개값. llama.cpp ggml-hexagon.cpp:268
+/// 가 본 값을 OR.
+///
+/// **β-1 NOTE**: 본 값(0x80000000) 와 0x80000 둘 다 stock S25 에서
+/// `fastrpc_mmap rc=0x1 (EIO)` 결과로 동일 — NOREG bit 가 driver-internal
+/// 검증을 통과 못 함. 정확값은 Hexagon SDK `rpcmem.h` (`/opt/hexagon/X.Y/
+/// ipc/fastrpc/rpcmem/inc/rpcmem.h`) 의 직접 확인이 필요. 본 PoC 의 첫
+/// 실험값은 가장 일반적인 0x80000000 유지.
+pub const RPCMEM_HEAP_NOREG: u32 = 0x8000_0000;
 
 /// HTP architecture version. S25 = Hexagon v79 (NSP v79).
 pub const HTP_ARCH_V79: u32 = 79;
@@ -275,7 +287,71 @@ pub struct HtpFastrpcHost {
     pub queue: DspQueueT,
     /// dspqueue_export 로 얻은 queue id (DSP 측에서 import 시 사용).
     pub queue_id: u64,
+    /// `htp_iface_start` 호출 후 true. Drop / shutdown 에서 stop 호출 여부
+    /// 분기. `Acquire`/`Release` 로 publish.
+    iface_started: AtomicBool,
 }
+
+/// FastRPC `remote_arg` (buf variant). `remote.h` 에서:
+///
+/// ```c
+/// typedef struct remote_buf { void *pv; size_t nLen; } remote_buf;
+/// typedef union remote_arg { remote_buf buf; uint32_t h; } remote_arg;
+/// ```
+///
+/// aarch64-linux-android: pv (8B) + n_len (8B) = 16B, alignment 8.
+/// htp_iface 의 lifecycle method 는 buf variant 만 사용한다 (handle variant
+/// 는 dspqueue 등 다른 경로용).
+#[repr(C)]
+struct RemoteArgBuf {
+    pv: *mut c_void,
+    n_len: usize,
+}
+
+/// `REMOTE_SCALARS_MAKEX(nAttr, nMethod, nIn, nOut, noIn, noOut)` — remote.h.
+///
+/// ```c
+/// #define REMOTE_SCALARS_MAKEX(nAttr,nMethod,nIn,nOut,noIn,noOut) \
+///     ((((uint32_t)  (nAttr) & 0x07) << 29) | \
+///      (((uint32_t)(nMethod) & 0x1f) << 24) | \
+///      (((uint32_t)    (nIn) & 0xff) << 16) | \
+///      (((uint32_t)   (nOut) & 0xff) <<  8) | \
+///      (((uint32_t)   (noIn) & 0x0f) <<  4) | \
+///       ((uint32_t)  (noOut)         & 0x0f))
+/// ```
+#[inline]
+const fn remote_scalars_makex(
+    attr: u32,
+    method: u32,
+    n_in: u32,
+    n_out: u32,
+    no_in: u32,
+    no_out: u32,
+) -> u32 {
+    ((attr & 0x7) << 29)
+        | ((method & 0x1f) << 24)
+        | ((n_in & 0xff) << 16)
+        | ((n_out & 0xff) << 8)
+        | ((no_in & 0xf) << 4)
+        | (no_out & 0xf)
+}
+
+// ── htp_iface method IDs (llama.cpp build-snapdragon/.../htp_iface_stub.c) ──
+//
+// `static const Method methods[4] = { ... }` 의 array index = method id.
+// open/close 는 `remote_handle64_{open,close}` 가 직접 처리 → invoke 안 씀.
+//
+// | method        | mid | sc (host)             | primIn size | layout                                      |
+// |---------------|-----|-----------------------|-------------|---------------------------------------------|
+// | start         | 2   | MAKEX(0,2,1,0,0,0)    | 24 B        | u32 sess_id @0, u64 queue_id @8, u32 nhvx @16 |
+// | stop          | 3   | MAKEX(0,3,0,0,0,0)    | 0 (no pra)  | —                                           |
+// | enable_etm    | 4   | MAKEX(0,4,0,0,0,0)    | 0           | —                                           |
+// | disable_etm   | 5   | MAKEX(0,5,0,0,0,0)    | 0           | —                                           |
+
+const HTP_IFACE_MID_START: u32 = 2;
+const HTP_IFACE_MID_STOP: u32 = 3;
+const HTP_IFACE_MID_ENABLE_ETM: u32 = 4;
+const HTP_IFACE_MID_DISABLE_ETM: u32 = 5;
 
 // SAFETY: 모든 FFI symbol pointer 는 dlopen 으로부터 얻은 process-global
 // 주소이며 thread-safe 호출이 보장된다 (libcdsprpc 자체가 multi-thread
@@ -539,8 +615,10 @@ impl HtpFastrpcHost {
             return Err(map_aee_err(rc)).with_context(|| "htp_fastrpc: dspqueue_export");
         }
 
-        // PoC scope: `htp_iface_start(handle, dev_id, queue_id, n_hvx)` 는
-        // Phase 4 작업. 본 단계에서는 setup 완료 ready state 까지만 보장.
+        // `htp_iface_start(handle, sess_id, queue_id, n_hvx)` 는 caller
+        // (HtpFastrpcBackend::new) 가 본 인스턴스의 [`try_start_iface`] 를
+        // 명시 호출한다. n_hvx 정책 분리를 위해 new_internal 은 setup ready
+        // state 까지만 보장.
 
         Ok(Arc::new(Self {
             lib,
@@ -566,14 +644,128 @@ impl HtpFastrpcHost {
             handle,
             queue,
             queue_id,
+            iface_started: AtomicBool::new(false),
         }))
+    }
+
+    /// `htp_iface_start(handle, sess_id, queue_id, n_hvx)` IDL invocation.
+    ///
+    /// 자동 생성 stub `htp_iface_stub.c::htp_iface_start` 의 packet schema 를
+    /// Rust 로 직접 transcribe — `mid=2`, sc = `MAKEX(0,2,1,0,0,0)`, primIn 은
+    /// 24 byte (u32 sess_id @0, u64 queue_id @8, u32 n_hvx @16). `remote_arg`
+    /// 1 개를 buf variant 로 채워 `pv=primIn`, `n_len=24`.
+    ///
+    /// `n_hvx` 는 사용할 HVX vector unit 수. llama.cpp 의 `opt_nhvx` 기본값은
+    /// 0 (= use all). PoC 는 0 을 권장 (DSP-side 가 device default 결정).
+    ///
+    /// 본 메서드는 idempotent: `iface_started` 가 이미 true 면 즉시 Ok.
+    pub fn try_start_iface(&self, n_hvx: u32) -> Result<()> {
+        if self.iface_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.handle == 0 {
+            return Err(anyhow!(
+                "htp_fastrpc: try_start_iface called with invalid handle"
+            ));
+        }
+
+        // primIn buffer — 정확히 24 byte. u64 alignment 유지.
+        let mut prim_in: [u64; 3] = [0; 3];
+        let prim_bytes =
+            unsafe { core::slice::from_raw_parts_mut(prim_in.as_mut_ptr() as *mut u8, 24) };
+        // u32 sess_id @ offset 0
+        prim_bytes[0..4].copy_from_slice(&self.session_id.to_ne_bytes());
+        // u64 queue_id @ offset 8 (offset 4..8 은 padding, primIn[0] 의 상위 4B)
+        prim_bytes[8..16].copy_from_slice(&self.queue_id.to_ne_bytes());
+        // u32 n_hvx @ offset 16
+        prim_bytes[16..20].copy_from_slice(&n_hvx.to_ne_bytes());
+
+        let mut pra = RemoteArgBuf {
+            pv: prim_in.as_mut_ptr() as *mut c_void,
+            n_len: 24,
+        };
+        let sc = remote_scalars_makex(0, HTP_IFACE_MID_START, 1, 0, 0, 0);
+
+        // SAFETY: handle valid (4-step handshake 통과 후), pra 는 stack live
+        // (호출 종료 후 즉시 무효). remote_handle64_invoke 는 동기 호출이라
+        // pra 가 호출 본문 동안 유효.
+        let rc = unsafe {
+            (self.remote_handle64_invoke)(self.handle, sc, &mut pra as *mut _ as *mut c_void)
+        };
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc)).with_context(|| {
+                format!(
+                    "htp_fastrpc: htp_iface_start (sess={}, queue_id={:#x}, n_hvx={})",
+                    self.session_id, self.queue_id, n_hvx
+                )
+            });
+        }
+        self.iface_started.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// `htp_iface_stop` IDL invocation. mid=3, sc = `MAKEX(0,3,0,0,0,0)`,
+    /// pra = NULL (인자 없음). idempotent: 시작 안 된 상태에서 호출하면 no-op.
+    ///
+    /// 자동 생성 stub `_stub_method_1` 의 호출 패턴: `remote_handle64_invoke(_handle, sc, NULL)`.
+    pub fn try_stop_iface(&self) -> Result<()> {
+        if !self.iface_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.handle == 0 {
+            // 이미 close 된 handle — Drop 의 best-effort 호출에서 진입 가능.
+            self.iface_started.store(false, Ordering::Release);
+            return Ok(());
+        }
+        let sc = remote_scalars_makex(0, HTP_IFACE_MID_STOP, 0, 0, 0, 0);
+        // SAFETY: handle valid, pra=NULL (인자 0 개).
+        let rc = unsafe { (self.remote_handle64_invoke)(self.handle, sc, core::ptr::null_mut()) };
+        // started flag 는 stop 호출 결과 무관 clear (재시도 방지).
+        self.iface_started.store(false, Ordering::Release);
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc)).with_context(|| "htp_fastrpc: htp_iface_stop");
+        }
+        Ok(())
+    }
+
+    /// `htp_iface_enable_etm` IDL invocation. mid=4. ETM = ARM/Hexagon
+    /// Embedded Trace Macrocell — 하드웨어 trace unit. profiling 인프라
+    /// 통합 시 사용. PoC scope 외라 wire-up 만 해두고 호출 site 는 없음.
+    ///
+    /// TODO(profiling): trace control flag + buffer routing 추가 후 호출.
+    #[allow(dead_code)]
+    pub fn try_enable_etm(&self) -> Result<()> {
+        let sc = remote_scalars_makex(0, HTP_IFACE_MID_ENABLE_ETM, 0, 0, 0, 0);
+        // SAFETY: handle valid (precondition).
+        let rc = unsafe { (self.remote_handle64_invoke)(self.handle, sc, core::ptr::null_mut()) };
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc)).with_context(|| "htp_fastrpc: htp_iface_enable_etm");
+        }
+        Ok(())
+    }
+
+    /// `htp_iface_disable_etm` IDL invocation. mid=5. ETM 비활성화. PoC
+    /// scope 외 (enable_etm pair).
+    #[allow(dead_code)]
+    pub fn try_disable_etm(&self) -> Result<()> {
+        let sc = remote_scalars_makex(0, HTP_IFACE_MID_DISABLE_ETM, 0, 0, 0, 0);
+        // SAFETY: handle valid.
+        let rc = unsafe { (self.remote_handle64_invoke)(self.handle, sc, core::ptr::null_mut()) };
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc)).with_context(|| "htp_fastrpc: htp_iface_disable_etm");
+        }
+        Ok(())
     }
 
     /// `htp_iface_stop` 후 `remote_handle64_close` + `dspqueue_close` 를
     /// 호출하는 명시 teardown. `Drop` 도 동일 시퀀스를 수행하지만, error
     /// 보고가 필요한 경우 본 메서드를 명시 호출한다.
     pub fn shutdown(&mut self) -> Result<()> {
-        // PoC scope: `htp_iface_stop` IDL invocation 은 Phase 4 작업.
+        // iface 가 started 상태면 stop 먼저 (lazy → close → dangling worker 회피).
+        // stop 실패는 진단 출력만 하고 진행 (handle/queue close 우선).
+        if let Err(e) = self.try_stop_iface() {
+            eprintln!("htp_fastrpc: shutdown stop_iface failed (continuing close): {e}");
+        }
 
         if !self.queue.is_null() {
             // SAFETY: queue 가 valid handle.
@@ -600,6 +792,11 @@ impl Drop for HtpFastrpcHost {
         // Best-effort teardown — Drop 안에서는 error 를 panic 으로 escalate
         // 하지 않는다 (INV-HTP-FRPC-001 lifecycle 의 1-shot 책임은 정상
         // 종료 경로에서 `shutdown` 으로 검증된다).
+        //
+        // iface_started 인 경우 DSP-side worker thread 가 dspqueue 를 detach
+        // 한 뒤 handle/queue 를 close 해야 worker leak 이 없다. stop 결과는
+        // 무시 (Drop 본질).
+        let _ = self.try_stop_iface();
         if !self.queue.is_null() {
             // SAFETY: queue 가 valid 일 때만 호출.
             unsafe { (self.dspqueue_close)(self.queue) };
@@ -653,5 +850,38 @@ mod tests {
         assert!(b.ptr.is_null());
         assert_eq!(b.size, 0);
         assert_eq!(b.flags, 0);
+    }
+
+    /// `remote_scalars_makex` 값이 llama.cpp 자동 생성 stub 의
+    /// `REMOTE_SCALARS_MAKEX` 와 일치하는지 검증. mid 별 sc encoding 은
+    /// FastRPC wire format 의 핵심이라 transcribe 정확성을 단정한다.
+    #[test]
+    fn iface_method_sc_encoding() {
+        // start(0, 2, 1, 0, 0, 0) = (2 << 24) | (1 << 16)
+        assert_eq!(
+            remote_scalars_makex(0, HTP_IFACE_MID_START, 1, 0, 0, 0),
+            0x0201_0000
+        );
+        // stop(0, 3, 0, 0, 0, 0) = (3 << 24)
+        assert_eq!(
+            remote_scalars_makex(0, HTP_IFACE_MID_STOP, 0, 0, 0, 0),
+            0x0300_0000
+        );
+        // enable_etm(0, 4, 0, 0, 0, 0) = (4 << 24)
+        assert_eq!(
+            remote_scalars_makex(0, HTP_IFACE_MID_ENABLE_ETM, 0, 0, 0, 0),
+            0x0400_0000
+        );
+        // disable_etm(0, 5, 0, 0, 0, 0) = (5 << 24)
+        assert_eq!(
+            remote_scalars_makex(0, HTP_IFACE_MID_DISABLE_ETM, 0, 0, 0, 0),
+            0x0500_0000
+        );
+    }
+
+    #[test]
+    fn remote_arg_buf_layout_size() {
+        // aarch64 / x86_64 (LP64): pv(8) + n_len(8) = 16 B.
+        assert_eq!(core::mem::size_of::<RemoteArgBuf>(), 16);
     }
 }
