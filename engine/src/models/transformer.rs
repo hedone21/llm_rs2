@@ -12,10 +12,12 @@ use crate::layers::workspace::LayerWorkspace;
 use crate::memory::Memory;
 use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type alias default + concrete kv_caches slice signature
-use crate::pressure::kv_cache::KVCache;
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O preload thread pool (L2 격상 backlog)
-use crate::pressure::offload::preload_pool::{self, PreloadPool};
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O PreloadAccess trait (inference→pressure trait boundary)
+use crate::pressure::offload::preload_pool::PreloadAccess;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O preload result type
+use crate::pressure::offload::preload_pool::PreloadResult;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type-erased preload function
+use crate::pressure::offload::preload_pool::preload_erased;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -119,7 +121,7 @@ pub struct TransformerModel {
     /// Lazily initialized on first `forward_into_offload` call.
     /// `OnceLock` allows interior mutability without lock contention on subsequent calls
     /// (`forward_into_offload` takes `&self`).
-    pub(crate) preload_pool: std::sync::OnceLock<PreloadPool>,
+    pub(crate) preload_pool: std::sync::OnceLock<Box<dyn PreloadAccess>>,
     /// Per-layer quantization noise factor table (ENG-DAT-095).
     ///
     /// Computed once at init via `QuantNoiseTable::new_from_frobenius` when a
@@ -143,7 +145,7 @@ pub struct TransformerModel {
     pub release_worker: Arc<crate::models::weights::PrimaryReleaseWorker>,
 }
 
-pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
+pub struct TransformerModelForwardArgs<'a, C: KVCacheOps> {
     pub input_tokens: &'a Tensor,
     pub start_pos: usize,
     pub kv_caches: &'a mut [C],
@@ -1375,11 +1377,11 @@ impl TransformerModel {
         Ok(count)
     }
 
-    pub fn forward(
+    pub fn forward<C: KVCacheOps>(
         &self,
         input_tokens: &Tensor,
         start_pos: usize,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [C],
         backend: &Arc<dyn Backend>,
         memory: &dyn Memory,
     ) -> Result<Tensor> {
@@ -2007,13 +2009,13 @@ impl TransformerModel {
     /// Build a pre-bound GPU kernel execution plan for decode (seq_len=1).
     /// Returns None if the backend is not OpenCL or if plan construction fails.
     #[cfg(feature = "opencl")]
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L build-time plan construction
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L build-time plan construction; direct KVCache field access required for cl_mem extraction
     pub fn build_plan(
         &self,
         x: &Tensor,
         logits: &Tensor,
         ws: &LayerWorkspace,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [crate::pressure::kv_cache::KVCache],
         backend: &Arc<dyn Backend>,
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
@@ -2512,7 +2514,7 @@ impl TransformerModel {
         input_tokens: &Tensor,
         start_pos: usize,
         x_gen: &mut Tensor,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [crate::pressure::kv_cache::KVCache],
         logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
@@ -2867,9 +2869,11 @@ impl TransformerModel {
         // Lazy-init persistent thread pool (sized to max_depth for full concurrency).
         // `get_or_init` runs the closure exactly once across all callers; subsequent
         // calls are a single atomic load with no lock.
-        let pool = self
-            .preload_pool
-            .get_or_init(|| PreloadPool::new(prefetch.max_depth()));
+        let pool = self.preload_pool.get_or_init(|| {
+            Box::new(crate::pressure::offload::preload_pool::PreloadPool::new(
+                prefetch.max_depth(),
+            )) as Box<dyn PreloadAccess>
+        });
 
         // 2. Synchronous initial preload: layers [0..depth)
         // Retained layers (preloaded=true) skip via early-return.
@@ -2886,18 +2890,14 @@ impl TransformerModel {
         // 4. Each element is accessed by at most one thread at a time:
         //    - A preload task for element j completes before j is used for forward
         //    - release_buffers(j) happens after forward(j) completes
-        let mut pending: Vec<Option<std::sync::mpsc::Receiver<preload_pool::PreloadResult>>> =
+        let mut pending: Vec<Option<std::sync::mpsc::Receiver<PreloadResult>>> =
             (0..num_layers).map(|_| None).collect();
 
         // Fire initial background preloads for layers [depth..2*depth)
         #[allow(clippy::needless_range_loop)]
         for j in depth..(2 * depth).min(num_layers) {
-            pending[j] = Some(unsafe {
-                pool.submit(
-                    caches_ptr.add(j) as *mut (),
-                    preload_pool::preload_erased::<C>,
-                )
-            });
+            pending[j] =
+                Some(unsafe { pool.submit_raw(caches_ptr.add(j) as *mut (), preload_erased::<C>) });
         }
 
         // 3. Layer loop
@@ -2905,13 +2905,13 @@ impl TransformerModel {
             // Collect preload result for layer i (if any).
             if let Some(rx) = pending[i].take() {
                 match rx.recv() {
-                    Ok(preload_pool::PreloadResult {
+                    Ok(PreloadResult {
                         result: Ok(()),
                         duration,
                     }) => {
                         prefetch.record_preload(duration);
                     }
-                    Ok(preload_pool::PreloadResult { result: Err(e), .. }) => {
+                    Ok(PreloadResult { result: Err(e), .. }) => {
                         log::warn!("L{i} preload failed: {e}, falling back to sync");
                     }
                     Err(_) => {
@@ -2924,10 +2924,7 @@ impl TransformerModel {
             let far_idx = i + depth;
             if far_idx < num_layers && pending[far_idx].is_none() {
                 pending[far_idx] = Some(unsafe {
-                    pool.submit(
-                        caches_ptr.add(far_idx) as *mut (),
-                        preload_pool::preload_erased::<C>,
-                    )
+                    pool.submit_raw(caches_ptr.add(far_idx) as *mut (), preload_erased::<C>)
                 });
             }
 

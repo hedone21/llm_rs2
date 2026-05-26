@@ -9,10 +9,7 @@ pub use super::transformer_layer::{ForwardGenArgs, LayerForwardArgs, QkvBias, Tr
 pub type LlamaLayer = TransformerLayer;
 
 /// Backward-compatible alias for [`LayerForwardArgs`].
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type alias default (KVCacheOps generic 기본형)
-pub type LlamaLayerForwardArgs<'a, C = crate::pressure::kv_cache::KVCache> =
-    LayerForwardArgs<'a, C>;
+pub type LlamaLayerForwardArgs<'a, C> = LayerForwardArgs<'a, C>;
 
 /// Backward-compatible alias for [`ForwardGenArgs`].
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type alias default
-pub type LlamaForwardGenArgs<'a, C = crate::pressure::kv_cache::KVCache> = ForwardGenArgs<'a, C>;
+pub type LlamaForwardGenArgs<'a, C> = ForwardGenArgs<'a, C>;

@@ -9,8 +9,6 @@ use crate::buffer::DType;
 use crate::kv_cache_ops::KVCacheOps;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type alias default (KVCacheOps generic 기본형)
-use crate::pressure::kv_cache::KVCache;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 use anyhow::Result;
@@ -320,7 +318,7 @@ impl TransformerLayer {
     }
 }
 
-pub struct ForwardGenArgs<'a, C: KVCacheOps = KVCache> {
+pub struct ForwardGenArgs<'a, C: KVCacheOps> {
     pub x: &'a mut Tensor,
     pub kv_cache: &'a mut C,
     pub start_pos: usize,
@@ -357,7 +355,7 @@ pub struct ForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     pub is_last_layer: bool,
 }
 
-pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
+pub struct LayerForwardArgs<'a, C: KVCacheOps> {
     pub x: &'a mut Tensor,
     pub kv_cache: &'a mut C,
     pub start_pos: usize,
