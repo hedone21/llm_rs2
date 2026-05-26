@@ -29,9 +29,11 @@
 | `ENG-DAT` | 010–099 | Engine 데이터 (33) |
 | `ENG-CUDA` | 010–099 | Engine CUDA 백엔드 (34) |
 | `ENG-QNN` | 010–099 | QNN OpPackage cdylib (30 §3.7 부록) |
+| `ENG-RPCMEM` | 010–099 | RpcmemAllocator backend-agnostic (30 부록 E, Sprint 2a Phase 2) |
 | `XC` | 010–099 | 횡단관심사 (40) |
 | `INV` | 001–999 | 불변식 (41) — 전체 수집 |
 | `INV-LAYER` | 001–099 | 불변식 (Engine 내부 layering 별칭, 41 §3.26) |
+| `INV-RPCMEM` | 001–099 | 불변식 (RpcmemAllocator 별칭, 41 §3.27) |
 | `TOOL` | 010–099 | 테스트 도구 (50) |
 | `CON` | 001–999 | 적합성 기준 (90) |
 | `TRC` | 001–999 | 추적성 (91) |

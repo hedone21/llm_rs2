@@ -1085,3 +1085,113 @@ diff \
 ### D.4 Constraints (placeholder)
 
 본 부록의 본문은 M4.0 진입 시 (M3.4 메인 게이트 통과 + Auto-Gate) 채운다. `arch/weight_swap.md` §11에 컴포넌트 도식만 placeholder로 작성.
+
+## 부록 E. RpcmemAllocator (Sprint 2a Phase 2, 2026-05-26)
+
+> **TL;DR**: `libcdsprpc.so` 3 심볼(`rpcmem_alloc`/`rpcmem_free`/`rpcmem_to_fd`)을 단일 책임 모듈 `engine/src/memory/rpcmem/allocator.rs`로 격리하고, OpenCL backend 가 `--opencl-rpcmem` 활성 시 KV cache zero-copy + RpcmemSecondaryStore precision swap 두 consumer 에게 동일 `Arc<RpcmemAllocator>` 인스턴스를 주입한다. `qnn_oppkg` backend 가 보유하던 `libQnnGpu.so` / `libqnn_oppkg.so` dlopen 경로는 본 단계 이후 dead path 가 되며 Sprint 2b 에서 backend 자체와 함께 제거된다. INV-001/010/011(2 프로세스 + Shared) 와 INV-170(qnn_oppkg opt-in) 정신은 보존되며, libcdsprpc.so 만 production code path 로 승격된다.
+
+### E.1 정의
+
+| 용어 | 정의 |
+|------|------|
+| **rpcmem heap** | Qualcomm FastRPC 가 노출하는 DMA-BUF heap. `libcdsprpc.so` 의 `rpcmem_alloc`/`rpcmem_free` 로 alloc/free 하며, `rpcmem_to_fd` 로 DMA-BUF fd 를 얻는다. CPU↔GPU↔HTP 가 동일 물리 페이지를 공유 (Adreno UMA). |
+| **RpcmemAllocator** | `libcdsprpc.so` 의 dlopen 핸들 + 3 fn-pointer 캐시를 보유한 단일 책임 모듈. process lifetime 동안 단일 인스턴스. |
+| **`--opencl-rpcmem`** | OpenCL backend 옵션. 활성 시 (a) `OpenCLMemory::alloc_kv` 가 rpcmem + `CL_MEM_USE_HOST_PTR` alias 경로 사용, (b) precision swap 의 secondary store 가 `RpcmemSecondaryStore` 변형 사용. default off (opt-in). |
+| **RpcmemAliasBuffer** | rpcmem host pointer 를 OpenCL `CL_MEM_USE_HOST_PTR` alias 로 감싼 zero-copy 버퍼. 기존 `engine/src/memory/rpcmem/opencl_alias.rs` 모듈을 재사용. |
+| **Self-secondary** | AUF multi-dtype variant 에서 primary 와 secondary 가 같은 AUF 파일을 공유하는 precision swap path (W-AUF-2). RpcmemAllocator 주입 path 가 GGUF secondary 와 동일하다. |
+
+### E.2 Allocator 모듈 책임 [ENG-RPCMEM-010 ~ ENG-RPCMEM-013]
+
+**[ENG-RPCMEM-010]** `engine/src/memory/rpcmem/allocator.rs` 는 `libcdsprpc.so` 의 `dlopen` 과 `rpcmem_alloc` / `rpcmem_free` / `rpcmem_to_fd` 3 심볼 lookup 을 수행하는 단일 진입점이다. cdsprpc symbol 을 직접 `libloading::Symbol`로 가져오는 다른 production 모듈을 추가 금지한다 (테스트/microbench 는 제외). *(MUST)*
+
+**[ENG-RPCMEM-011]** `RpcmemAllocator::new()` 는 호스트(non-Android) 타겟에서 컴파일에 포함되지 않거나 (`#[cfg(target_os = "android")]`) 호출 시 `Err`을 반환한다. 호출자(OpenCLBackend init / RpcmemSecondaryStore loader) 는 `Err` 시 `--opencl-rpcmem` 을 자동으로 비활성화 (warning 1회 stderr) 하여 host build 가 계속 진행되어야 한다. *(MUST)*
+
+**[ENG-RPCMEM-012]** `RpcmemAllocator` 는 `Send + Sync` 이며 process lifetime 동안 단일 인스턴스가 `Arc<RpcmemAllocator>` 로 OpenCLBackend 와 RpcmemSecondaryStore 양쪽에 공유된다. Backend init 시점에 1회 alloc 후 model load / swap path 가 동일 Arc 를 clone 한다. *(MUST)*
+
+**[ENG-RPCMEM-013]** `RpcmemAllocator` 의 Drop 은 `libcdsprpc.so` 의 `dlclose` 만 수행하며 outstanding `host_ptr` 의 `rpcmem_free` 는 호출하지 않는다. buffer lifetime (`QnnOppkgKvBuffer` 후신 / `RpcmemLayerRegion`) 이 각자의 Drop 에서 `rpcmem_free` 를 호출한다 (allocator lifetime ⊃ 모든 buffer lifetime 이 보장되어야 한다 — INV-RPCMEM-005). *(MUST)*
+
+### E.3 OpenCL Backend Wire-up [ENG-RPCMEM-020 ~ ENG-RPCMEM-024]
+
+**[ENG-RPCMEM-020]** `OpenCLBackend::new_with_profile_events` 의 시그니처는 변경하지 않는다. 신규 `OpenCLBackend::new_with_options(profile_events_enabled, opencl_rpcmem)` 를 추가하고 기존 `new`/`new_with_profile_events` 는 `opencl_rpcmem = false` 로 위임한다. (호환성 우선) *(SHOULD)*
+
+**[ENG-RPCMEM-021]** `opencl_rpcmem = true` 시 `OpenCLBackend` 는 `Arc<RpcmemAllocator>` 를 lazy init (첫 alloc 시점에 한 번) 또는 `new_with_options` 진입 시점에 eager init 한다. 본 단계는 eager init 을 선택한다 (lazy 의 첫 alloc 지점은 hot path 라 init failure visibility 낮음). `RpcmemAllocator::new()` 가 `Err` 일 경우 `OpenCLBackend::new_with_options` 가 `opencl_rpcmem = false` 로 강등하고 stderr 에 1회 경고를 출력한다 (ENG-RPCMEM-011 호환). *(MUST)*
+
+**[ENG-RPCMEM-022]** `OpenCLMemory` 는 `opencl_rpcmem` 활성 시 `Arc<RpcmemAllocator>` 를 보유한다. `alloc_kv(size, dtype)` 는:
+1. `opencl_rpcmem == false` → 기존 `UnifiedBuffer` (Phase 0) 경로 유지.
+2. `opencl_rpcmem == true` → `RpcmemAllocator::alloc(size)` 호출 → `CL_MEM_USE_HOST_PTR` alias 생성 → KV-shape `RpcmemKvBuffer` (구 `QnnOppkgKvBuffer` 의 후신, Sprint 2a Phase 3 에서 신설 또는 기존 코드 이동) 반환.
+3. rpcmem alloc 실패 시 `UnifiedBuffer` fallback (per-buffer fallback, session 전체 abort 금지 — INV-RPCMEM-003). *(MUST)*
+
+**[ENG-RPCMEM-023]** `OpenCLMemory::alloc` (activation tensor) 은 `opencl_rpcmem` 값과 무관하게 기존 `OpenCLBuffer`/`UnifiedBuffer` 경로만 사용한다. rpcmem 은 KV cache 와 precision swap secondary 전용. activation 은 short-lived 라 zero-copy benefit 이 없으며 rpcmem heap 단편화 위험만 증가. *(MUST)*
+
+**[ENG-RPCMEM-024]** `OpenCLBackend::get_extension(EXT_RPCMEM_ALLOCATOR)` 가 `opencl_rpcmem` 활성 시 `Arc<RpcmemAllocator>` 의 raw view (`&dyn Any`) 를 반환한다. RpcmemSecondaryStore loader 가 본 extension 으로 allocator 핸들을 획득한다 (현 `EXT_QNN_OPPKG` downcast 패턴을 그대로 따름). 비활성 시 `None`. *(MUST)*
+
+### E.4 Precision Swap Wire-up [ENG-RPCMEM-030 ~ ENG-RPCMEM-033]
+
+**[ENG-RPCMEM-030]** `RpcmemSecondaryStore::from_gguf` / `RpcmemSecondaryStore::from_auf_self_secondary` 의 마지막 parameter `(RpcmemAllocFn, RpcmemFreeFn)` 을 `Arc<RpcmemAllocator>` 로 교체한다. 내부 `build_layer_region` 은 `allocator.alloc(total)` 을 호출하고 `RpcmemLayerRegion` 은 `Arc<RpcmemAllocator>` (또는 `RpcmemFreeFn` 추출) 를 보유하여 Drop 시 free 한다. fn-pointer 직접 보유 대신 `Arc<RpcmemAllocator>` 보유를 권장 (lifetime 종속 명시화). *(MUST)*
+
+**[ENG-RPCMEM-031]** `secondary_mmap.rs::try_open_rpcmem_secondary` 와 `try_open_rpcmem_self_secondary_for_auf` 의 backend lookup 분기는 다음 우선순위로 변경된다:
+1. `EXT_RPCMEM_ALLOCATOR` (신규) 가 `Some(allocator)` → 본 allocator 사용.
+2. (Sprint 2a 유지) `EXT_QNN_OPPKG` 가 `Some(qnn_oppkg)` → 기존 `QnnOppkgRuntime::rpcmem_fns()` 사용. (Sprint 2b backend 제거 시 본 분기도 삭제)
+3. 둘 다 `None` → `SecondaryUnavailable` 로 GGUF/AUF 일반 mmap path 로 fallback.
+
+`backend_supports_rpcmem_secondary(backend)` 는 두 extension 중 하나라도 `Some` 일 때 true 를 반환한다. *(MUST)*
+
+**[ENG-RPCMEM-032]** RpcmemSecondaryStore 는 OpenCLBackend 가 보유한 `Arc<RpcmemAllocator>` 와 동일 인스턴스를 받는다 (clone 으로 공유). 같은 process 안에서 두 개의 RpcmemAllocator 가 alloc 되어 별도 dlopen 핸들을 갖는 상태는 금지된다 (INV-RPCMEM-002). *(MUST)*
+
+**[ENG-RPCMEM-033]** `RpcmemSecondaryStore::backend_weak` 로 보유되는 `Weak<dyn Backend>` 는 `OpenCLBackend` 를 가리키며, LISWAP-6 Phase 1 alias cache populate 시 `Backend::alloc_alias_weight_buffer` 호출 경로는 기존(M3) 그대로 유지된다. 즉 본 부록의 변경은 alloc 분리만 다루며 alias 생성 경로(`opencl/mod.rs::alloc_alias_weight_buffer`) 는 무변경. *(MUST)*
+
+### E.5 CLI / Session Wire-up [ENG-RPCMEM-040 ~ ENG-RPCMEM-042]
+
+**[ENG-RPCMEM-040]** `engine/src/session/cli/mod.rs::CliArgs` 에 `pub opencl_rpcmem: bool` (default false, `--opencl-rpcmem`) flag 를 추가한다. doc comment 는 (a) Android-only, (b) KV cache + precision swap secondary 둘 다 활성화됨, (c) Sprint 2a verification gate 측정용임을 명시. *(MUST)*
+
+**[ENG-RPCMEM-041]** Sprint 2a (본 부록 도입 단계) 에서 `--opencl-rpcmem` 와 `--backend qnn_oppkg | qnngpu` 가 동시 지정될 경우 stderr 경고 1회 후 `--opencl-rpcmem` 가 무시된다 (qnn_oppkg backend 가 자체 rpcmem path 보유 — 중복 활성 방지). Sprint 2b 에서 `qnn_oppkg` backend 가 제거되면 본 mutex 도 삭제된다. *(MUST)*
+
+**[ENG-RPCMEM-042]** `session/init.rs::build_runtime` 의 `"opencl"` 분기는 `OpenCLBackend::new_with_options(profile_events, args.opencl_rpcmem)` 로 변경되며, 반환된 backend 를 `EXT_RPCMEM_ALLOCATOR` extension 으로 노출한다. `"qnn_oppkg"` 분기는 무변경 (Sprint 2b 에서 삭제). `"cpu"` / `"cuda"` 분기는 `--opencl-rpcmem` 를 무시한다 (stderr 경고 1회). *(MUST)*
+
+### E.6 Constraints [ENG-RPCMEM-C01 ~ ENG-RPCMEM-C04]
+
+**[ENG-RPCMEM-C01]** `RpcmemAllocator` 는 `libQnnGpu.so` 또는 `libqnn_oppkg.so` 를 dlopen 하지 않는다. QNN-GPU 의존 제거가 본 모듈의 핵심 목적. *(MUST NOT)*
+
+**[ENG-RPCMEM-C02]** Sprint 2a Phase 2 본 단계에서 `engine/src/backend/qnn_oppkg/` 의 어떤 코드도 수정/삭제하지 않는다. 두 path (qnn_oppkg backend / `--opencl-rpcmem`) 가 공존하며 회귀 검증 안전망으로 유지된다. Sprint 2b backend 제거 단계에서 비로소 삭제. *(MUST NOT)*
+
+**[ENG-RPCMEM-C03]** `--opencl-rpcmem` 활성 시에도 fast feasibility 측정 (Phase 10 HeteroLLM 재현) 결과의 raw `clientBuf` slow path (0.04 GB/s) 는 회피한다. 즉 `RpcmemAliasBuffer` (`CL_MEM_USE_HOST_PTR` alias) 만 사용하며 OpenCL backend 가 별도의 `clientBuf` import 를 추가하지 않는다. *(MUST NOT)*
+
+**[ENG-RPCMEM-C04]** `RpcmemAllocator` 모듈은 INV-LAYER-001/002 를 준수한다. `memory/rpcmem/allocator.rs` 는 L2 (`memory/`) 에 위치하며 L3 (`models/`, `pressure/`, `inference/`) 의 어떤 모듈도 import 하지 않는다. allocator 가 노출하는 API 는 `unsafe fn alloc(&self, size) -> Result<(*mut u8, RawFd)>` / `unsafe fn free(&self, host_ptr)` 의 raw byte interface 만 유지한다. *(MUST)*
+
+### E.7 Invariants
+
+| ID | 한줄 요약 |
+|----|-----------|
+| INV-RPCMEM-001 | RpcmemAllocator 는 Android target 에서만 컴파일된다 (host 는 컴파일 자체에서 제외 또는 `new()` 가 `Err`). |
+| INV-RPCMEM-002 | `--opencl-rpcmem` 활성 시 OpenCLBackend 와 RpcmemSecondaryStore 는 동일 `Arc<RpcmemAllocator>` 인스턴스를 공유한다 (single allocator per session). |
+| INV-RPCMEM-003 | rpcmem alloc 실패는 per-buffer fallback (UnifiedBuffer 또는 SecondaryUnavailable) — session abort 금지. |
+| INV-RPCMEM-004 | `RpcmemAllocator` 는 `libQnnGpu.so` / `libqnn_oppkg.so` 를 dlopen 하지 않는다 (libcdsprpc.so 만). |
+| INV-RPCMEM-005 | `RpcmemAllocator::Drop` 시점에 모든 rpcmem buffer (RpcmemKvBuffer / RpcmemLayerRegion) 는 이미 drop 되어 있어야 한다 (lifetime 포함 관계). |
+| INV-RPCMEM-006 | `--opencl-rpcmem` 와 `--backend qnn_oppkg` 동시 지정 시 본 sprint(2a)에서는 전자가 무시되며 stderr 경고 1회 출력. |
+| INV-RPCMEM-007 | `OpenCLMemory::alloc` (activation) 은 `opencl_rpcmem` 값과 무관하게 rpcmem heap 을 사용하지 않는다 (KV/secondary 전용). |
+| INV-RPCMEM-008 | `RpcmemAliasBuffer` 의 backing host_ptr 은 allocator 가 alloc 한 rpcmem 영역 안에만 존재한다 (raw `clientBuf` import 금지 — Phase 10 결과 회피). |
+
+상세는 `spec/41-invariants.md` §3.27 참조.
+
+### E.8 Rationale (non-normative)
+
+#### E.8.1 왜 별도 backend 가 아닌 OpenCLBackend 의 옵션인가
+
+`qnn_oppkg` backend 는 raw QNN-GPU graph execution path (M3 layer graph) 와 rpcmem KV 두 가지를 묶어 도입되었으나 paper main evidence 측정 (`project_qnn_oppkg_m2_complete_20260510.md`, `project_swap_overhead_opencl_complete_20260509.md`) 결과:
+- M3 graph path 의 production code 진입은 fast path 미사용 — `--backend qnn_oppkg fast off` 가 production default.
+- 실측 가속의 95% 가 rpcmem DMA-BUF + USE_HOST_PTR alias (KV zero-copy) 에서 기인.
+
+따라서 `qnn_oppkg` 라는 backend ID 를 유지할 정당성이 약하며, OpenCLBackend 가 옵션으로 rpcmem path 를 활성화하는 것이 SOLID 의 SRP / OCP 양쪽을 만족한다.
+
+#### E.8.2 왜 lazy init 이 아닌 eager init 인가
+
+`OpenCLBackend::new_with_options` 진입 시점에 `RpcmemAllocator::new()` 가 실패하면 `--opencl-rpcmem` 가 자동 강등된다. lazy init (첫 KV alloc 시점) 은 model load 후의 hot path 에서 dlopen 실패가 드러나 디버깅 비용이 증가한다. eager init 의 비용은 dlopen 3 symbol lookup + zero allocation 으로 ~수 ms 수준.
+
+#### E.8.3 왜 `--opencl-rpcmem` 가 단일 flag 로 KV + secondary 양쪽을 활성화하는가
+
+두 consumer 는 사실상 같은 allocator 위에서 동작하며, KV 만 끄거나 secondary 만 끄는 모드는 실측 use case 가 없다. flag 분리는 표면적 유연성을 위해 인터페이스를 늘릴 뿐 실측 측정 매트릭스를 줄이지 못한다. 측정 sprint 가 종결되어 production opt-in 으로 굳어진 후 분리 필요성이 입증되면 분리한다 (YAGNI).
+
+#### E.8.4 왜 Sprint 2b 이전에 backend 를 삭제하지 않는가
+
+회귀 안전망. `--opencl-rpcmem` 측정이 `--backend qnn_oppkg` 와 동등 또는 우월함이 디바이스에서 검증된 후에야 backend 모듈을 삭제한다. 본 단계는 두 path 의 공존 + 단일 sprint verification gate 통과를 목적으로 한다.
+
