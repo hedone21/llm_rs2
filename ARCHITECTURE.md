@@ -2193,15 +2193,18 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
     - `pressure/weights/async_swap.rs` — `crate::models::weights::LayerSlot` (worker thread slot mutation)
     - **분류**: 위계 정합 방향 (pressure orchestrator가 inference 잔존 stateful resource를 *임차하여 mutate*). 5건 모두 `cross_l3_vocabulary` marker 부착, baseline 자동 제외.
     - **본질 해소 backlog (§7.5 design doc 참조)**: `SecondaryStore` trait inversion (V-09 `SecondaryMmapBytes` 패턴 — `pressure/weights/noise_table.rs` 우선 candidate). 별 sprint.
-  - **Transformer ctor 위계 어긋남** — **Sprint C 부작용으로 신규 등록 (위계 어긋남 방향, marker 유지)**:
-    - `models/transformer.rs:134` — `pub quant_noise: Arc<crate::pressure::weights::QuantNoiseTable>` field 정의 (inference owner accepts pressure-owned resource)
-    - `models/transformer.rs:145` — `pub release_worker: Arc<crate::pressure::weights::PrimaryReleaseWorker>` field 정의 (동일 사유)
-    - `models/transformer.rs` 5개 init path × 2 ctor (`QuantNoiseTable::empty()` + `PrimaryReleaseWorker::spawn(...)`) = 10건 + field 2 + `compute_quant_noise_for_model` 2건 + LayerBoundaryHook 1건 + 기타 ≈ **17건** — 모두 `// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference owner accepts pressure-owned resource via Arc field` marker.
-    - **분류**: 위계 어긋남 방향 (inference TransformerModel이 pressure-owned 자원의 ctor를 직접 호출). §13.8-O 우선순위 #2 (데이터 owner를 pressure로 이전)이 본질 해소이나 본 sprint scope 외.
-    - **본질 해소 backlog (§7.4 design doc 참조)**: `pressure::weights::setup_runtime_resources(config) -> RuntimeResources` setup helper로 ctor 호출 이전. transformer.rs는 RuntimeResources를 인자로 받아 field에 install. 별 sprint.
+  - **Transformer ctor 위계 어긋남** — **ctor 호출 RESOLVED (Sprint D, 2026-05-26)**:
+    - `models/transformer.rs:134` — `pub quant_noise: Arc<crate::pressure::weights::QuantNoiseTable>` field 정의 잔존 marker (inference owner accepts pressure-owned resource)
+    - `models/transformer.rs:146` — `pub release_worker: Arc<crate::pressure::weights::PrimaryReleaseWorker>` field 정의 잔존 marker (동일 사유)
+    - **ctor 호출 해소 결과**: `pressure::weights::setup_runtime_resources(backend) -> RuntimeResources` setup helper(`engine/src/pressure/weights/setup.rs` 신설) 도입. `models/loader/mod.rs` production ctor 1건 + `models/transformer.rs` test ctor 5건 모두 setup helper 사용으로 변환. inference 도메인에서 `QuantNoiseTable::empty()`/`PrimaryReleaseWorker::spawn(...)` 직접 호출 0건 달성. 옛 `compute_quant_noise_for_model` 함수(transformer.rs 내) → `pressure::weights::compute_quant_noise(slots, secondary)` 이전(noise_table.rs). marker line: loader/mod.rs 2건 + transformer.rs helper 2건 = **4건 제거**.
+    - **잔존 marker**: field 정의 2건 (L134/L146) — `TransformerModel` struct 정의에 pressure 타입이 직접 등장하므로 본질 trait inversion(`RuntimeResourcesAccess` trait + `Arc<dyn RuntimeResources>` field) 없이 못 빠짐. 별 sprint scope.
+    - **신규 marker (Sprint D 부작용, 위계 정합 방향)**:
+      - `models/transformer.rs:21` `use crate::pressure::weights::compute_quant_noise;` — inference loader → pressure ε helper 임차.
+      - `models/loader/mod.rs:27` `use crate::pressure::weights::setup_runtime_resources;` — inference loader → pressure runtime resource setup 임차.
+    - **분류**: 위계 정합 방향 (inference가 pressure trait/helper를 임차). §13.8-O 우선순위 #1 — register 잔존이 정합 상태. 본질 해소는 trait inversion(`RuntimeResourcesAccess`)이며 별 sprint candidate.
 - **운용 메모**:
   - marker는 의도성 명시. PR description에 *본질 trait inversion backlog 후보* 또는 *외부 API surface로 정당화* 기재.
-  - 5건 이상 누적 시 §13.4에 *cross-L3 vocabulary register* 표 신설 검토. **2026-05-26 Sprint C 시점**: Type alias default 3 + Offload path 3 + Weight swap cross-L3 vocabulary 5 + Transformer ctor 17 = **누적 28건**. 5건 임계 초과로 §13.4 register 표 신설 + trait inversion sprint trigger 검토 필요 (backlog 등록).
+  - 5건 이상 누적 시 §13.4에 *cross-L3 vocabulary register* 표 신설 검토. **2026-05-26 Sprint D 시점**: Type alias default 3 + Offload path 3 + Weight swap cross-L3 vocabulary 5 + Transformer ctor 호출 해소 후 (field 2 + 위계 정합 use 2) = **누적 15건**. Sprint C 28건 대비 -13. 5건 임계 초과 유지 — `RuntimeResourcesAccess` / `SecondaryStore` trait inversion 등 별 sprint trigger 잔존.
   - 향후 trait inversion 별 sprint 진행 시 register에서 항목 제거.
 
 **§N — Cross-cutting ↔ L3 trait/enum usage zone: RESOLVED (2026-05-24, S-C4)**

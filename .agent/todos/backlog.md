@@ -29,12 +29,13 @@
     - PreloadAccess trait inversion 적용 (`engine/src/pressure/offload/preload_pool.rs::pub trait PreloadAccess`, Sprint A `a9dcb5be` 시기).
     - 잔여: `models/transformer.rs:2807`의 `PrefetchController` import marker(`§13.8-O offload-path trait bound + PrefetchController (offload 분리 backlog)`). preload_pool/prefetch의 L2 또는 inference 도메인 격상 + `forward_into_offload` 분리는 별 sprint backlog (아래 [P2] offload 분리 항목 참조).
   - **KvCacheView trait** (3건) — **RESOLVED (`45bfd16f` B-5b-1b)**: `KVCacheOps` trait L2 격상 (`engine/src/kv_cache_ops.rs`), 외부 import path 일괄 재지향.
-- **잔존 marker 24건의 의미**: 본 RESOLVED는 *위반 zone 정책*의 RESOLVED — register 갱신과 동기화된 정합 marker 24건이 잔존 (pressure orchestrator 5 파일 LayerSlot/SecondaryMmap 임차 5건, transformer.rs ctor 위계 어긋남 17건, 기타 2건). 본질 해소(setup helper 이전, secondary backing trait inversion 등)는 별 sprint:
-  - [P2] transformer.rs ctor 위계 어긋남 본질 해소 (`arch/weights_pressure_split.md §7.4`) — 17건 marker → setup helper로 ctor 이전. ROI: marker ≈10건 감소. 추정 1일.
+- **잔존 marker 의미**: 본 RESOLVED는 *위반 zone 정책*의 RESOLVED — register 갱신과 동기화된 정합 marker가 잔존. Sprint D(2026-05-26)로 transformer.rs ctor 호출 부분 추가 해소. 본질 해소(struct field trait inversion 등)는 별 sprint:
+  - [RESOLVED Sprint D 2026-05-26] transformer.rs ctor 호출 위계 어긋남 본질 해소 (`arch/weights_pressure_split.md §7.4`) — `setup_runtime_resources` helper + `compute_quant_noise` 이전 완료. marker 순감 2건 (loader 2 + transformer helper 2 제거, use 위계 정합 2 추가). 잔여 field 정의 2건은 별 sprint(`RuntimeResourcesAccess` trait inversion).
   - [P2] SecondaryStore trait inversion (`arch/weights_pressure_split.md §7.5`) — V-09 `SecondaryMmapBytes` 패턴 확장.
   - [P2] observability events trait inversion (`arch/weights_pressure_split.md §7.1`) — Sprint C 잔여.
   - [P2] op_trace `DdrPhase`/`PhaseHook` L2 격상 (`arch/weights_pressure_split.md §7.2`).
   - [P2] offload 분리 (preload_pool/prefetch L2 격상 + `forward_into_offload` 분리) — 갈래 2 잔여.
+  - [P3] `RuntimeResourcesAccess` trait inversion — `TransformerModel::quant_noise`/`release_worker` field를 `Arc<dyn ...>` trait object로 추상화 → field marker 2건 자연 해소. Sprint D 후속.
 - **참고 register**:
   - `ARCHITECTURE.md` §13.8-O register V-24 (line 1755) — RESOLVED 상세 + register 갱신 이력 (line 1811).
   - `arch/weights_pressure_split.md` Sprint C design doc + §7 별 sprint backlog 5건.

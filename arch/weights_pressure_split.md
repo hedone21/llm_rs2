@@ -509,11 +509,13 @@ baseline 출력과 diff 0 byte 확인. 실패 시 sprint roll-back.
 - **결정 필요 사항**: (a) inference 잔존 확정 + §13.8-B 본문에 "file 위치는 inference 잔존, trait/Backend hook으로 backend 자원 접근" 명시 추가 vs (b) `TransformerLayer` 의존을 trait inversion으로 해소 후 backend로 이동.
 - **본 sprint 결정**: scope 외 — `models/weights/`에 잔존.
 
-### §7.4 [P2] §13.8-O — transformer.rs ctor 위계 어긋남 본질 해소
+### §7.4 [RESOLVED] §13.8-O — transformer.rs ctor 위계 어긋남 본질 해소 — 2026-05-26 Sprint D 완료
 
-- **대상**: `models/transformer.rs:3257/3258, 3409/3410, 3523/3524, 3627/3628, 3707/3708` (5개 init path, 각각 `QuantNoiseTable::empty()` + `PrimaryReleaseWorker::spawn(...)` ctor 2건씩, 총 10건).
-- **방향**: TransformerWeights 생성 시 pressure-owned 자원 ctor 호출을 `pressure::weights::setup_runtime_resources(config) -> RuntimeResources` setup helper로 분리. transformer.rs는 RuntimeResources를 인자로 받아 field에 install.
-- **ROI**: §13.8-O cross_l3_vocabulary marker 약 10건 → 0건. 단 별 sprint(추정 1일).
+- **결과**: 본 design doc 명세대로 `pressure::weights::setup_runtime_resources(backend) -> RuntimeResources` setup helper 신설(`engine/src/pressure/weights/setup.rs`). production ctor 1건(`models/loader/mod.rs`) + test ctor 5건(`models/transformer.rs`) 모두 setup helper 사용으로 변환. inference 도메인의 `QuantNoiseTable::empty()` / `PrimaryReleaseWorker::spawn(...)` 직접 호출 **0건** 달성. 옛 `compute_quant_noise_for_model` helper → `pressure::weights::compute_quant_noise(slots, secondary)` 이전(noise_table.rs).
+- **marker 변화**: 해소 4건 (loader/mod.rs 2 + transformer.rs helper 2) + 신규 위계 정합 marker 2건 (use 문 합법화) = **순감 2건**. 잔존 field 정의 2건은 본질 trait inversion(`RuntimeResourcesAccess` trait) 필요 — 별 sprint scope.
+- **검증**: spec INV-LAYER 8/8 PASS, layer_lint new_violations=0, S25 Adreno OpenCL Qwen2.5-1.5b Q4_0 32토큰 bit-identical (first_token=6313, TBT 30.33 ms/tok Δ +0.07 측정 노이즈).
+- **잔여 후속 sprint** (별 entry):
+  - `RuntimeResourcesAccess` trait inversion — `TransformerModel::quant_noise`/`release_worker` field를 `Arc<dyn RuntimeResourcesAccess>` trait object로 추상화. struct 정의 자체에서 pressure 타입 제거 → field marker 2건 자연 해소. 비용 1~2일 + struct field migration ripple.
 
 ### §7.5 [P2] §13.8-O — secondary backing trait inversion
 
