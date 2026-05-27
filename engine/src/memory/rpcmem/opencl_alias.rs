@@ -19,8 +19,6 @@
 //!
 //! Spec: ENG-DAT-094, INV-143 (alias lifetime via Arc retention).
 
-#![cfg(feature = "opencl")]
-
 use crate::buffer::{Buffer, DType};
 use crate::memory::host::mmap::MmapKeepAlive;
 use crate::memory::secondary::RpcmemRegionGuard;

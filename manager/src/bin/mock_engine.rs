@@ -380,7 +380,6 @@ fn run_protocol(args: &Args, stream: &mut (impl Read + Write)) -> anyhow::Result
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        ..Default::default()
     };
     send_message(stream, &EngineMessage::Capability(capability)).context("send Capability")?;
     println!("[MockEngine] Sent Capability (device={})", args.device);

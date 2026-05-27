@@ -76,12 +76,13 @@ mod qcom_ffi {
         pub enqueue_recording: clEnqueueRecordingQCOM_fn,
     }
 
+    #[allow(clippy::missing_transmute_annotations)]
     pub fn load() -> Option<QcomFns> {
         unsafe {
             // libOpenCL.so on Android = /vendor/lib64/libOpenCL.so or /system/vendor/lib64/libOpenCL.so
             let lib_paths = [
-                b"/vendor/lib64/libOpenCL.so\0".as_ptr() as *const libc::c_char,
-                b"libOpenCL.so\0".as_ptr() as *const libc::c_char,
+                c"/vendor/lib64/libOpenCL.so".as_ptr(),
+                c"libOpenCL.so".as_ptr(),
             ];
             let mut handle: *mut c_void = std::ptr::null_mut();
             for path in lib_paths {
@@ -366,7 +367,7 @@ fn main() -> anyhow::Result<()> {
         &samples_b_ms,
         n_dispatches,
     );
-    drop(arg_updates);
+    let _ = arg_updates;
 
     // Cleanup
     unsafe { (qcom.release_recording)(recording) };

@@ -10,6 +10,8 @@
 //! mismatch, ...).
 //!
 //! 6 sub-graph plan (each end-point exported to host APP_READ):
+//!
+//! ```text
 //!   1. RmsNorm(pre) -> Q proj -> RoPE(Q)              => q_rot
 //!   2. RmsNorm(pre) -> K proj -> V proj -> RoPE(K)
 //!                   -> KvScatter                      => kcache, vcache
@@ -18,6 +20,7 @@
 //!   5. (host inputs) x_attn                           => RmsNorm(post)
 //!                   + gate/up proj + SiluMul          => silu_out
 //!   6. (host inputs) silu_out + x_attn                => Down proj + Add => x_out
+//! ```
 //!
 //! Each sub-graph reuses the same rpcmem-backed weights/inputs as the 14-node
 //! chain. Outputs are read back through APP_READ host buffers immediately

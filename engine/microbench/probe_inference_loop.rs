@@ -173,7 +173,7 @@ fn upload_prompt(
         cpu_buf,
         cpu_backend.clone(),
     );
-    backend.copy_from(&cpu_tensor).map_err(Into::into)
+    backend.copy_from(&cpu_tensor)
 }
 
 /// Per-run measurement: returns (tok0_ms, per_step_ms vec of length budget).

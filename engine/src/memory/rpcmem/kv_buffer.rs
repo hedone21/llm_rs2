@@ -25,8 +25,6 @@
 //!    system 으로 강제. allocator strong_count 가 0 이 되어야 dlclose 가 호출
 //!    되므로 본 buffer 가 살아있는 동안 allocator 도 살아있다 (INV-RPCMEM-005).
 
-#![cfg(feature = "opencl")]
-
 use crate::buffer::{Buffer, DType};
 use crate::memory::rpcmem::allocator::RpcmemAllocator;
 use anyhow::Result;

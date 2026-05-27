@@ -10,8 +10,8 @@
 //!
 //! Inputs:
 //!   - Q4_0 weight is generated random in **host SOA layout** directly:
-//!       host_q [num_blocks * 16] uchar  (4-bit packed quants)
-//!       host_d [num_blocks]      half   (per-block scale)
+//!     host_q [num_blocks * 16] uchar  (4-bit packed quants)
+//!     host_d [num_blocks]      half   (per-block scale)
 //!     Both raw OpenCL and the OpPackage path consume the same byte buffers.
 //!   - x [M, K] FLOAT_32 random.
 //!

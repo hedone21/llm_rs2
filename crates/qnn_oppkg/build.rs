@@ -5,6 +5,7 @@
 /// 2. `<workspace_root>/third_party/qnn_sdk_2.33/include/QNN` (default).
 /// 3. git worktree 시 main repo `<main>/third_party/...` fallback —
 ///    `.git` file에 적힌 `gitdir: <main>/.git/worktrees/<name>` 추적.
+///
 /// 모두 실패 시 primary path 반환 (warning + empty bindings 출력).
 fn resolve_qnn_sdk_inc(workspace_root: &std::path::Path) -> std::path::PathBuf {
     use std::env;

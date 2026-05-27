@@ -42,7 +42,7 @@
 //! Multi-token decode requires `n_kv` to grow per step (`prefill_len + step_idx
 //! + 1`), so `n_kv` moves to a 1-element INT_32 input tensor that the host
 //! writes before each `graphExecute`. Mirrors D-D.1+D-D.2 (RoPE/KvScatter
-//! pos-as-buffer) — same architectural reason.
+//!   pos-as-buffer) — same architectural reason.
 //!
 //! The kernel now reads `const int n_kv = n_kv_buf[0];` at the top.
 //!

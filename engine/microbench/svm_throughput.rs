@@ -126,19 +126,18 @@ fn main() -> anyhow::Result<()> {
     // one work-item per CHUNK to avoid massive GPU dispatch.
     const CHUNK: usize = 65536; // each WI processes 64K floats
     let n_workitems = n_floats / CHUNK;
-    let src = format!(
-        r#"
-        __kernel void svm_read(__global const float* in_buf, __global float* out_buf, const uint chunk) {{
+    let src = r#"
+        __kernel void svm_read(__global const float* in_buf, __global float* out_buf, const uint chunk) {
             uint id = get_global_id(0);
             float acc = 0.0f;
             uint base = id * chunk;
-            for (uint i = 0; i < chunk; i++) {{
+            for (uint i = 0; i < chunk; i++) {
                 acc += in_buf[base + i] * 0.001f;
-            }}
+            }
             out_buf[id] = acc;
-        }}
+        }
         "#
-    );
+    .to_string();
     let program = Program::builder()
         .devices(device)
         .src(src)

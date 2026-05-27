@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
     for (label, props) in configs {
         println!("\n=== {} ===", label);
 
-        let queue_props = props.map(|p| ocl::core::CommandQueueProperties::from_bits_truncate(p));
+        let queue_props = props.map(ocl::core::CommandQueueProperties::from_bits_truncate);
         let queue = Queue::new(&context, device, queue_props)?;
 
         // Allocate ALLOC_HOST_PTR buffer (production swap path와 동일)

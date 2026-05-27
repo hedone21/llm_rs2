@@ -67,12 +67,10 @@ mod ahb {
         pub release: release_fn,
     }
 
+    #[allow(clippy::missing_transmute_annotations)]
     pub fn load() -> Option<AhbFns> {
         unsafe {
-            let lib_paths = [
-                b"libnativewindow.so\0".as_ptr() as *const libc::c_char,
-                b"libandroid.so\0".as_ptr() as *const libc::c_char,
-            ];
+            let lib_paths = [c"libnativewindow.so".as_ptr(), c"libandroid.so".as_ptr()];
             let mut handle: *mut c_void = std::ptr::null_mut();
             for path in lib_paths {
                 handle = libc::dlopen(path, libc::RTLD_NOW);
@@ -227,7 +225,7 @@ fn main() -> anyhow::Result<()> {
             allocation_type: qcom::CL_MEM_ANDROID_AHARDWAREBUFFER_HOST_PTR_QCOM,
             host_cache_policy: cache_policy,
         },
-        ahb_ptr: ahb_buf as *mut std::ffi::c_void,
+        ahb_ptr: ahb_buf,
     };
 
     // Match MNN OpenCLBackend.cpp:758 — USE_HOST_PTR + EXT_HOST_PTR_QCOM, size=0.
