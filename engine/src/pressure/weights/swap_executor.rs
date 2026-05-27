@@ -68,9 +68,6 @@ use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
 #[cfg(feature = "opencl")]
 use crate::models::weights::SecondaryTensorInfo;
 use crate::pressure::weights::async_swap::AsyncSwapDispatcher;
-// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+α)
-#[rustfmt::skip]
-use crate::observability::events::{CacheEvent, EventSink, NoOpSink, WeightSwapEvent, WeightSwapKind};
 use crate::tensor::Tensor;
 
 /// Errors surfaced by `SwapExecutor::execute`.
@@ -326,16 +323,10 @@ pub struct SwapExecutor<'a> {
     #[cfg(feature = "cuda-embedded")]
     pub mmap_registration: Option<Arc<crate::memory::cuda::mmap::CudaMmapRegistration>>,
 
-    /// S-1+α: dispatcher identity for `WeightSwapEvent` emit. Defaults to
-    /// `IntraForward` (Q1 결정). PhaseAware / Subsystem caller가
-    /// `.with_kind(...)` chain으로 override.
-    pub kind: WeightSwapKind,
-
-    /// S-1+α: structured event sink. Defaults to `NoOpSink` so existing
-    /// constructors (test fixtures, internal helpers) keep working without a
-    /// caller-supplied sink. Production callers attach `StderrDiagnosticSink`
-    /// or a custom sink via `.with_event_sink(...)`.
-    pub event_sink: Arc<dyn EventSink>,
+    /// Dispatcher identity label used in log lines. Defaults to
+    /// `"IntraForward"`. PhaseAware / Subsystem / Incremental caller 는
+    /// `.with_kind("...")` chain 으로 override.
+    pub kind: &'static str,
 }
 
 impl<'a> SwapExecutor<'a> {
@@ -360,8 +351,7 @@ impl<'a> SwapExecutor<'a> {
             layer_pool: None,
             #[cfg(feature = "cuda-embedded")]
             mmap_registration: None,
-            kind: WeightSwapKind::default(),
-            event_sink: Arc::new(NoOpSink),
+            kind: "IntraForward",
         }
     }
 
@@ -389,23 +379,16 @@ impl<'a> SwapExecutor<'a> {
             layer_pool: None,
             #[cfg(feature = "cuda-embedded")]
             mmap_registration: None,
-            kind: WeightSwapKind::default(),
-            event_sink: Arc::new(NoOpSink),
+            kind: "IntraForward",
         }
     }
 
-    /// S-1+α: override dispatcher identity used in emitted `WeightSwapEvent`s.
-    /// PhaseAware / Subsystem caller만 chain; default (IntraForward) 사용 시 생략.
-    pub fn with_kind(mut self, kind: WeightSwapKind) -> Self {
+    /// Override dispatcher identity used in log lines. PhaseAware /
+    /// Subsystem / Incremental caller만 chain; default ("IntraForward")
+    /// 사용 시 생략. expected values: "IntraForward" / "PhaseAware" /
+    /// "Subsystem" / "Incremental".
+    pub fn with_kind(mut self, kind: &'static str) -> Self {
         self.kind = kind;
-        self
-    }
-
-    /// S-1+α: attach a structured event sink. Production callers pass
-    /// `Arc::new(StderrDiagnosticSink)` or a custom sink. Tests can omit this
-    /// to keep `NoOpSink` (silent).
-    pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
-        self.event_sink = sink;
         self
     }
 
@@ -534,13 +517,11 @@ impl<'a> SwapExecutor<'a> {
         // batch's release backlog. Memory-spike risk — measurement only.
         let force_every_tick = force_every_tick_enabled();
         if force_every_tick && !force_every_tick_warning_consumed() {
-            self.event_sink
-                .emit(CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
-                    source: "force_every_tick",
-                    message: "LLMRS_SWAP_FORCE_EVERY_TICK=1 enabled — INV-141 release drain \
-                              skipped, memory spike risk, measurement-only"
-                        .to_string(),
-                }));
+            crate::action_diag_helper::log_swap_config_warning(
+                "force_every_tick",
+                "LLMRS_SWAP_FORCE_EVERY_TICK=1 enabled — INV-141 release drain \
+                 skipped, memory spike risk, measurement-only",
+            );
         }
         if !force_every_tick && let Some(worker) = &self.release_worker {
             let pending = worker.pending_count();
@@ -764,9 +745,7 @@ impl<'a> SwapExecutor<'a> {
                 if let Some(t0) = wait_start {
                     let wait_ms = (t0.elapsed().as_secs_f64() * 1000.0) as f32;
                     if wait_ms > 0.1 {
-                        self.event_sink.emit(CacheEvent::WeightSwap(
-                            WeightSwapEvent::SubBatchWait { layer_idx, wait_ms },
-                        ));
+                        crate::action_diag_helper::log_swap_sub_batch_wait(layer_idx, wait_ms);
                     }
                 }
             }
@@ -834,9 +813,8 @@ impl<'a> SwapExecutor<'a> {
                 let config_owned = self.config.clone();
                 let target_dtype = self.target_dtype;
                 let release_worker_clone = self.release_worker.clone();
-                // S-1+α: capture event_sink + kind into BgFetch closure.
-                let bg_event_sink: Arc<dyn EventSink> = Arc::clone(&self.event_sink);
-                let bg_kind = self.kind;
+                // Capture dispatcher identity label into BgFetch closure for log lines.
+                let bg_kind: &'static str = self.kind;
 
                 // LISWAP-8 Phase B: try to take a pool entry for this
                 // layer. If `Some`, the worker closure overwrites the
@@ -924,14 +902,12 @@ impl<'a> SwapExecutor<'a> {
                         let (new_layer, write_event) = match result {
                             Ok(pair) => pair,
                             Err(e) => {
-                                bg_event_sink.emit(CacheEvent::WeightSwap(
-                                    WeightSwapEvent::SwapFailed {
-                                        kind: bg_kind,
-                                        reason: format!("BgFetch build failed: {e}"),
-                                        layer: Some(layer_idx),
-                                        token: None,
-                                    },
-                                ));
+                                crate::action_diag_helper::log_swap_failed(
+                                    bg_kind,
+                                    &format!("BgFetch build failed: {e}"),
+                                    Some(layer_idx),
+                                    None,
+                                );
                                 return;
                             }
                         };
@@ -939,14 +915,12 @@ impl<'a> SwapExecutor<'a> {
                         if !write_event.is_dummy()
                             && let Err(e) = backend_arc.wait_event_blocking(&write_event)
                         {
-                            bg_event_sink.emit(CacheEvent::WeightSwap(
-                                WeightSwapEvent::SwapFailed {
-                                    kind: bg_kind,
-                                    reason: format!("BgFetch wait_event_blocking failed: {e}"),
-                                    layer: Some(layer_idx),
-                                    token: None,
-                                },
-                            ));
+                            crate::action_diag_helper::log_swap_failed(
+                                bg_kind,
+                                &format!("BgFetch wait_event_blocking failed: {e}"),
+                                Some(layer_idx),
+                                None,
+                            );
                             return;
                         }
 
@@ -963,13 +937,12 @@ impl<'a> SwapExecutor<'a> {
 
                 let t_submit = Instant::now();
                 if let Err(e) = dispatcher.submit_dispatch_chunk(job) {
-                    self.event_sink
-                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                            kind: self.kind,
-                            reason: format!("BgFetch submit_dispatch_chunk failed: {e}"),
-                            layer: Some(layer_idx),
-                            token: None,
-                        }));
+                    crate::action_diag_helper::log_swap_failed(
+                        self.kind,
+                        &format!("BgFetch submit_dispatch_chunk failed: {e}"),
+                        Some(layer_idx),
+                        None,
+                    );
                     report.skipped.push(layer_idx);
                     continue;
                 }
@@ -1030,13 +1003,12 @@ impl<'a> SwapExecutor<'a> {
                 let (new_layer, write_event) = match async_result {
                     Ok(pair) => pair,
                     Err(e) => {
-                        self.event_sink
-                            .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                                kind: self.kind,
-                                reason: format!("AsyncSwap async transfer failed: {e}"),
-                                layer: Some(layer_idx),
-                                token: None,
-                            }));
+                        crate::action_diag_helper::log_swap_failed(
+                            self.kind,
+                            &format!("AsyncSwap async transfer failed: {e}"),
+                            Some(layer_idx),
+                            None,
+                        );
                         report.skipped.push(layer_idx);
                         continue;
                     }
@@ -1062,13 +1034,12 @@ impl<'a> SwapExecutor<'a> {
                 // only record the submit latency (nanoseconds) on the main thread.
                 let t_b0 = Instant::now();
                 if let Err(e) = dispatcher.submit_commit(job) {
-                    self.event_sink
-                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                            kind: self.kind,
-                            reason: format!("AsyncSwap dispatcher submit failed: {e}"),
-                            layer: Some(layer_idx),
-                            token: None,
-                        }));
+                    crate::action_diag_helper::log_swap_failed(
+                        self.kind,
+                        &format!("AsyncSwap dispatcher submit failed: {e}"),
+                        Some(layer_idx),
+                        None,
+                    );
                     report.skipped.push(layer_idx);
                     continue;
                 }
@@ -1351,14 +1322,13 @@ impl<'a> SwapExecutor<'a> {
         // ("memory peak ≤ 1 layer") is satisfied iff max ≤ 1 here.
         if diag_enabled {
             let mode = if use_async { "async" } else { "sync" };
-            self.event_sink
-                .emit(CacheEvent::WeightSwap(WeightSwapEvent::BatchSummary {
-                    kind: self.kind,
-                    mode,
-                    target_layers: target_layers.len(),
-                    max_release_pending,
-                    max_dispatcher_pending,
-                }));
+            crate::action_diag_helper::log_swap_batch_summary(
+                self.kind,
+                mode,
+                target_layers.len(),
+                max_release_pending,
+                max_dispatcher_pending,
+            );
         }
 
         Ok(report)
@@ -2047,22 +2017,21 @@ impl<'a> SwapExecutor<'a> {
             // `LLMRS_SWAP_PROFILE_BREAKDOWN=1` traces.
             if let Some(t_tot) = t_total {
                 let us_total = t_tot.elapsed().as_micros() as f32;
-                self.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
-                        layer_idx,
-                        subname: subname.to_string(),
-                        is_weight,
-                        tensor_size,
-                        lookup_us: us_lookup.unwrap_or(0.0) as f32,
-                        dim_us: us_dim.unwrap_or(0.0) as f32,
-                        bytes_us: us_bytes.unwrap_or(0.0) as f32,
-                        permute_us: us_permute.unwrap_or(0.0) as f32,
-                        wrap_us: 0.0,
-                        cpu_us: 0.0,
-                        upload_us: 0.0,
-                        total_us: us_total,
-                        source: "rpcmem-alias",
-                    }));
+                crate::action_diag_helper::log_swap_prof_breakdown(
+                    layer_idx,
+                    subname,
+                    is_weight,
+                    tensor_size,
+                    us_lookup.unwrap_or(0.0) as f32,
+                    us_dim.unwrap_or(0.0) as f32,
+                    us_bytes.unwrap_or(0.0) as f32,
+                    us_permute.unwrap_or(0.0) as f32,
+                    0.0,
+                    0.0,
+                    0.0,
+                    us_total,
+                    "rpcmem-alias",
+                );
             }
             return Ok(t);
         }
@@ -2103,22 +2072,21 @@ impl<'a> SwapExecutor<'a> {
             // Emit profiling line even on early return path.
             if let Some(t_tot) = t_total {
                 let us_total = t_tot.elapsed().as_micros() as f32;
-                self.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
-                        layer_idx,
-                        subname: subname.to_string(),
-                        is_weight,
-                        tensor_size,
-                        lookup_us: us_lookup.unwrap_or(0.0) as f32,
-                        dim_us: us_dim.unwrap_or(0.0) as f32,
-                        bytes_us: us_bytes.unwrap_or(0.0) as f32,
-                        permute_us: us_permute.unwrap_or(0.0) as f32,
-                        wrap_us: us_wrap.unwrap_or(0.0) as f32,
-                        cpu_us: us_cpu.unwrap_or(0.0) as f32,
-                        upload_us: 0.0,
-                        total_us: us_total,
-                        source: "",
-                    }));
+                crate::action_diag_helper::log_swap_prof_breakdown(
+                    layer_idx,
+                    subname,
+                    is_weight,
+                    tensor_size,
+                    us_lookup.unwrap_or(0.0) as f32,
+                    us_dim.unwrap_or(0.0) as f32,
+                    us_bytes.unwrap_or(0.0) as f32,
+                    us_permute.unwrap_or(0.0) as f32,
+                    us_wrap.unwrap_or(0.0) as f32,
+                    us_cpu.unwrap_or(0.0) as f32,
+                    0.0,
+                    us_total,
+                    "",
+                );
             }
             return Ok(cpu_tensor);
         }
@@ -2145,22 +2113,21 @@ impl<'a> SwapExecutor<'a> {
                     .map(|t| t.elapsed().as_micros() as f32)
                     .unwrap_or(0.0);
                 let us_total = t_tot.elapsed().as_micros() as f32;
-                self.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
-                        layer_idx,
-                        subname: subname.to_string(),
-                        is_weight,
-                        tensor_size,
-                        lookup_us: us_lookup.unwrap_or(0.0) as f32,
-                        dim_us: us_dim.unwrap_or(0.0) as f32,
-                        bytes_us: us_bytes.unwrap_or(0.0) as f32,
-                        permute_us: us_permute.unwrap_or(0.0) as f32,
-                        wrap_us: us_wrap.unwrap_or(0.0) as f32,
-                        cpu_us: us_cpu.unwrap_or(0.0) as f32,
-                        upload_us: us_upload,
-                        total_us: us_total,
-                        source: "",
-                    }));
+                crate::action_diag_helper::log_swap_prof_breakdown(
+                    layer_idx,
+                    subname,
+                    is_weight,
+                    tensor_size,
+                    us_lookup.unwrap_or(0.0) as f32,
+                    us_dim.unwrap_or(0.0) as f32,
+                    us_bytes.unwrap_or(0.0) as f32,
+                    us_permute.unwrap_or(0.0) as f32,
+                    us_wrap.unwrap_or(0.0) as f32,
+                    us_cpu.unwrap_or(0.0) as f32,
+                    us_upload,
+                    us_total,
+                    "",
+                );
             }
             return Ok(t);
         }
@@ -2186,22 +2153,21 @@ impl<'a> SwapExecutor<'a> {
                 .map(|t| t.elapsed().as_micros() as f32)
                 .unwrap_or(0.0);
             let us_total = t_tot.elapsed().as_micros() as f32;
-            self.event_sink
-                .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapProfBreakdown {
-                    layer_idx,
-                    subname: subname.to_string(),
-                    is_weight,
-                    tensor_size,
-                    lookup_us: us_lookup.unwrap_or(0.0) as f32,
-                    dim_us: us_dim.unwrap_or(0.0) as f32,
-                    bytes_us: us_bytes.unwrap_or(0.0) as f32,
-                    permute_us: us_permute.unwrap_or(0.0) as f32,
-                    wrap_us: us_wrap.unwrap_or(0.0) as f32,
-                    cpu_us: us_cpu.unwrap_or(0.0) as f32,
-                    upload_us: us_upload,
-                    total_us: us_total,
-                    source: "",
-                }));
+            crate::action_diag_helper::log_swap_prof_breakdown(
+                layer_idx,
+                subname,
+                is_weight,
+                tensor_size,
+                us_lookup.unwrap_or(0.0) as f32,
+                us_dim.unwrap_or(0.0) as f32,
+                us_bytes.unwrap_or(0.0) as f32,
+                us_permute.unwrap_or(0.0) as f32,
+                us_wrap.unwrap_or(0.0) as f32,
+                us_cpu.unwrap_or(0.0) as f32,
+                us_upload,
+                us_total,
+                "",
+            );
         }
 
         result

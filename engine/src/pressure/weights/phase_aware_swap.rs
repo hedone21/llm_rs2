@@ -31,8 +31,6 @@ use crate::pressure::weights::swap_executor::SwapExecutor;
 use crate::models::weights::secondary_mmap::SecondaryMmap;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
-// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+α)
-use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N op_trace hook (PhaseHook L2 격상 backlog 대기)
 use crate::observability::profile::op_trace::{DdrPhase, PhaseHook};
 use crate::op_kind::OpKind;
@@ -225,14 +223,11 @@ pub struct PhaseAwareSwapDispatcher {
     /// When the dispatcher is dropped, upgrade returns `None` and the queued
     /// job becomes a noop.
     self_weak: OnceLock<Weak<Self>>,
-    /// S-1+α: structured `WeightSwapEvent` consumer.
-    event_sink: Arc<dyn EventSink>,
 }
 
 impl PhaseAwareSwapDispatcher {
     /// 생성자 — chunk_size_bytes는 보통 4 MB (`chunk_size_mb * 1_048_576`).
     /// v1에서는 per-tensor 단위라 이 값은 진단/보고용.
-    /// `event_sink` (S-1+α): structured `WeightSwapEvent` consumer.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         chunk_size_bytes: usize,
@@ -242,7 +237,6 @@ impl PhaseAwareSwapDispatcher {
         dispatcher: Arc<AsyncSwapDispatcher>,
         target_dtype: DType,
         config: Arc<crate::model_config::ModelConfig>,
-        event_sink: Arc<dyn EventSink>,
     ) -> Arc<Self> {
         Arc::new(Self {
             chunk_queue: Mutex::new(VecDeque::new()),
@@ -264,7 +258,6 @@ impl PhaseAwareSwapDispatcher {
             max_chunks_per_token: AtomicUsize::new(0),
             chunks_dispatched_this_token: AtomicUsize::new(0),
             self_weak: OnceLock::new(),
-            event_sink,
         })
     }
 
@@ -337,13 +330,12 @@ impl PhaseAwareSwapDispatcher {
             if !ev.is_dummy()
                 && let Err(e) = self.backend.wait_event_blocking(ev.as_ref())
             {
-                self.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                        kind: WeightSwapKind::PhaseAware,
-                        reason: format!("wait_pending failed: {e}"),
-                        layer: None,
-                        token: None,
-                    }));
+                crate::action_diag_helper::log_swap_failed(
+                    "PhaseAware",
+                    &format!("wait_pending failed: {e}"),
+                    None,
+                    None,
+                );
             }
         }
     }
@@ -400,11 +392,10 @@ impl PhaseAwareSwapDispatcher {
             "attn_norm.weight" => &snapshot.attention_norm,
             "ffn_norm.weight" => &snapshot.ffn_norm,
             other => {
-                self.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
-                        source: "phase_aware_chunk_subname",
-                        message: format!("unknown chunk subname '{other}' (skipped)"),
-                    }));
+                crate::action_diag_helper::log_swap_config_warning(
+                    "phase_aware_chunk_subname",
+                    &format!("unknown chunk subname '{other}' (skipped)"),
+                );
                 return Ok(());
             }
         };
@@ -417,8 +408,7 @@ impl PhaseAwareSwapDispatcher {
             Arc::clone(&self.backend),
             &memory,
         )
-        .with_kind(WeightSwapKind::PhaseAware)
-        .with_event_sink(Arc::clone(&self.event_sink));
+        .with_kind("PhaseAware");
 
         // Norms (`*_norm.weight`) may be absent from the secondary; treat as
         // optional and fall back to the snapshot tensor in that case.
@@ -433,16 +423,15 @@ impl PhaseAwareSwapDispatcher {
                 Ok(Some((t, e))) => (Some(t), Some(e)),
                 Ok(None) => (None, None),
                 Err(e) => {
-                    self.event_sink
-                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                            kind: WeightSwapKind::PhaseAware,
-                            reason: format!(
-                                "subname '{}' async build failed: {e}; skipping chunk",
-                                chunk.subname
-                            ),
-                            layer: Some(chunk.layer_idx),
-                            token: None,
-                        }));
+                    crate::action_diag_helper::log_swap_failed(
+                        "PhaseAware",
+                        &format!(
+                            "subname '{}' async build failed: {e}; skipping chunk",
+                            chunk.subname
+                        ),
+                        Some(chunk.layer_idx),
+                        None,
+                    );
                     (None, None)
                 }
             }
@@ -455,16 +444,15 @@ impl PhaseAwareSwapDispatcher {
             ) {
                 Ok((t, e)) => (Some(t), Some(e)),
                 Err(e) => {
-                    self.event_sink
-                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                            kind: WeightSwapKind::PhaseAware,
-                            reason: format!(
-                                "subname '{}' async build failed: {e}; skipping chunk",
-                                chunk.subname
-                            ),
-                            layer: Some(chunk.layer_idx),
-                            token: None,
-                        }));
+                    crate::action_diag_helper::log_swap_failed(
+                        "PhaseAware",
+                        &format!(
+                            "subname '{}' async build failed: {e}; skipping chunk",
+                            chunk.subname
+                        ),
+                        Some(chunk.layer_idx),
+                        None,
+                    );
                     (None, None)
                 }
             }
@@ -481,11 +469,10 @@ impl PhaseAwareSwapDispatcher {
                 .or_default()
                 .install(chunk.subname, t);
             if !installed {
-                self.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::ConfigWarning {
-                        source: "phase_aware_subname",
-                        message: format!("unknown subname '{}' (ignored)", chunk.subname),
-                    }));
+                crate::action_diag_helper::log_swap_config_warning(
+                    "phase_aware_subname",
+                    &format!("unknown subname '{}' (ignored)", chunk.subname),
+                );
             }
         }
 
@@ -529,13 +516,12 @@ impl PhaseAwareSwapDispatcher {
         let new_layer = match partial.into_layer_weights(snapshot.as_ref()) {
             Ok(l) => l,
             Err(e) => {
-                self.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                        kind: WeightSwapKind::PhaseAware,
-                        reason: format!("assemble failed: {e}; commit skipped"),
-                        layer: Some(layer_idx),
-                        token: None,
-                    }));
+                crate::action_diag_helper::log_swap_failed(
+                    "PhaseAware",
+                    &format!("assemble failed: {e}; commit skipped"),
+                    Some(layer_idx),
+                    None,
+                );
                 return Ok(());
             }
         };
@@ -555,13 +541,12 @@ impl PhaseAwareSwapDispatcher {
             layer_idx: Some(layer_idx),
         };
         if let Err(e) = self.dispatcher.submit_commit(job) {
-            self.event_sink
-                .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                    kind: WeightSwapKind::PhaseAware,
-                    reason: format!("dispatcher submit failed: {e}"),
-                    layer: Some(layer_idx),
-                    token: None,
-                }));
+            crate::action_diag_helper::log_swap_failed(
+                "PhaseAware",
+                &format!("dispatcher submit failed: {e}"),
+                Some(layer_idx),
+                None,
+            );
         }
         Ok(())
     }
@@ -603,13 +588,12 @@ impl PhaseAwareSwapDispatcher {
             }
             self.wait_pending();
             if let Err(e) = self.try_dispatch_chunk() {
-                self.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                        kind: WeightSwapKind::PhaseAware,
-                        reason: format!("finalize drain dispatch error: {e}"),
-                        layer: None,
-                        token: None,
-                    }));
+                crate::action_diag_helper::log_swap_failed(
+                    "PhaseAware",
+                    &format!("finalize drain dispatch error: {e}"),
+                    None,
+                    None,
+                );
                 break;
             }
         }

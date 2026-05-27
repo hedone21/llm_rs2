@@ -40,7 +40,6 @@ use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
-use llm_rs2::observability::events::noop_sink;
 use llm_rs2::pressure::weights::SwapExecutor;
 use llm_rs2::pressure::weights::async_swap::AsyncSwapDispatcher;
 use llm_rs2::tensor::Tensor;
@@ -262,7 +261,7 @@ fn test_async_path_skips_synchronize_on_empty_batch() {
 
     // Create a dispatcher (even though it won't be used with secondary=None).
     let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let dispatcher = AsyncSwapDispatcher::new(cpu_be, noop_sink());
+    let dispatcher = AsyncSwapDispatcher::new(cpu_be);
 
     let executor = SwapExecutor::new(DType::Q4_0, &config, be.clone(), &memory);
 
@@ -300,7 +299,7 @@ fn test_supports_async_transfer_false_uses_sync_fallback() {
     let memory = Galloc::new();
 
     let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let dispatcher = AsyncSwapDispatcher::new(cpu_be, noop_sink());
+    let dispatcher = AsyncSwapDispatcher::new(cpu_be);
 
     let executor = SwapExecutor::new(DType::Q4_0, &config, be.clone(), &memory);
 
@@ -338,7 +337,7 @@ fn test_async_path_empty_target_layers() {
     let memory = Galloc::new();
 
     let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let dispatcher = AsyncSwapDispatcher::new(cpu_be, noop_sink());
+    let dispatcher = AsyncSwapDispatcher::new(cpu_be);
 
     let executor = SwapExecutor::new(DType::Q4_0, &config, be.clone(), &memory);
 
@@ -372,7 +371,7 @@ fn test_async_path_no_secondary_no_pending_jobs() {
     let memory = Galloc::new();
 
     let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let dispatcher = AsyncSwapDispatcher::new(cpu_be, noop_sink());
+    let dispatcher = AsyncSwapDispatcher::new(cpu_be);
 
     let executor = SwapExecutor::new(DType::Q4_0, &config, be.clone(), &memory);
 
@@ -444,7 +443,7 @@ fn test_stage_breakdown_log_line_format() {
 #[test]
 fn test_async_path_submit_deferred_commit() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let dispatcher = AsyncSwapDispatcher::new(be.clone(), noop_sink());
+    let dispatcher = AsyncSwapDispatcher::new(be.clone());
 
     // pending은 초기에 0.
     assert_eq!(dispatcher.pending_count(), 0, "initial pending must be 0");
@@ -495,7 +494,7 @@ fn test_async_path_submit_deferred_commit() {
 #[test]
 fn test_async_dispatcher_submit_drain_dtype_change() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let dispatcher = Arc::new(AsyncSwapDispatcher::new(be.clone(), noop_sink()));
+    let dispatcher = Arc::new(AsyncSwapDispatcher::new(be.clone()));
 
     const N: usize = 5;
     let slots: Vec<Arc<LayerSlot>> = (0..N)

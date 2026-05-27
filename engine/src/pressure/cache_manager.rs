@@ -3,8 +3,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N EventSink trait inversion (V-12)
-use crate::observability::events::{CacheEvent, EventSink, NoOpSink};
 use crate::pressure::eviction::EvictMethod;
 use crate::pressure::eviction::EvictionPolicy;
 use crate::pressure::kv_cache::{KVCache, max_cache_pos};
@@ -56,8 +54,6 @@ pub struct CacheManager {
     monitor: Box<dyn SystemMonitor>,
     /// Eviction triggers when available memory drops below this threshold (bytes).
     threshold_bytes: usize,
-    /// Event sink for observability. Defaults to `NoOpSink` (zero overhead).
-    event_sink: Arc<dyn EventSink>,
     /// Named eviction policies for Manager-directed dispatch (resilience).
     policies: HashMap<EvictMethod, Box<dyn EvictionPolicy>>,
     /// Optional disk-backed swap handler for `KvOffload` directives.
@@ -85,7 +81,6 @@ impl CacheManager {
             pipeline,
             monitor,
             threshold_bytes,
-            event_sink: Arc::new(NoOpSink),
             policies: HashMap::new(),
             swap_handler: None,
         }
@@ -104,20 +99,9 @@ impl CacheManager {
             pipeline,
             monitor,
             threshold_bytes,
-            event_sink: Arc::new(NoOpSink),
             policies: HashMap::new(),
             swap_handler: None,
         }
-    }
-
-    /// Set the event sink for observability.
-    pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
-        self.event_sink = sink;
-    }
-
-    /// Get a reference to the event sink.
-    pub fn event_sink(&self) -> &Arc<dyn EventSink> {
-        &self.event_sink
     }
 
     /// Enable disk-backed KV swap. The resulting `SwapHandler` is stored on the
@@ -262,18 +246,18 @@ impl CacheManager {
             (pressure, mem_available)
         };
 
-        self.event_sink.emit(CacheEvent::PressureDetected {
-            level: pressure,
-            mem_available,
-            forced: force,
-        });
-
         if force {
+            log::info!("[CacheEvent] Budget eviction (forced)");
             log::info!(
                 "[CacheManager] budget eviction (forced), executing '{}'",
                 self.pipeline.name(),
             );
         } else {
+            log::info!(
+                "[CacheEvent] Pressure {:?}, mem_available={} MB",
+                pressure,
+                mem_available / (1024 * 1024),
+            );
             log::info!(
                 "[CacheManager] pressure={:?}, executing '{}'",
                 pressure,
@@ -311,11 +295,12 @@ impl CacheManager {
             for cache in ctx.caches.iter_mut() {
                 bytes_released += cache.release_unused_pages();
             }
-            self.event_sink.emit(CacheEvent::EvictionCompleted {
-                policy: self.pipeline.name(),
-                tokens_removed: eviction_result.tokens_removed,
-                new_pos: eviction_result.new_pos,
-            });
+            log::info!(
+                "[CacheEvent] Eviction completed: policy='{}', removed={}, new_pos={}",
+                self.pipeline.name(),
+                eviction_result.tokens_removed,
+                eviction_result.new_pos,
+            );
             if bytes_released > 0 {
                 log::info!(
                     "[CacheManager] released {} MB of physical pages after eviction",
@@ -423,12 +408,7 @@ impl CacheManager {
             .map(|s| s.available)
             .unwrap_or(usize::MAX);
 
-        self.event_sink.emit(CacheEvent::PressureDetected {
-            level: pressure,
-            mem_available,
-            forced: true,
-        });
-
+        log::info!("[CacheEvent] Budget eviction (forced)");
         log::info!(
             "[CacheManager] budget eviction (forced+layer_ratios), executing '{}'",
             self.pipeline.name(),
@@ -452,11 +432,12 @@ impl CacheManager {
             for cache in ctx.caches.iter_mut() {
                 cache.release_unused_pages();
             }
-            self.event_sink.emit(CacheEvent::EvictionCompleted {
-                policy: self.pipeline.name(),
-                tokens_removed: eviction_result.tokens_removed,
-                new_pos: eviction_result.new_pos,
-            });
+            log::info!(
+                "[CacheEvent] Eviction completed: policy='{}', removed={}, new_pos={}",
+                self.pipeline.name(),
+                eviction_result.tokens_removed,
+                eviction_result.new_pos,
+            );
         }
 
         Ok(eviction_result)
@@ -520,11 +501,12 @@ impl CacheManager {
             for cache in caches.iter_mut() {
                 cache.release_unused_pages();
             }
-            self.event_sink.emit(CacheEvent::EvictionCompleted {
-                policy: policy.name().to_string(),
-                tokens_removed: result.tokens_removed,
-                new_pos: result.new_pos,
-            });
+            log::info!(
+                "[CacheEvent] Eviction completed: policy='{}', removed={}, new_pos={}",
+                policy.name(),
+                result.tokens_removed,
+                result.new_pos,
+            );
         }
 
         Ok(result)
@@ -548,11 +530,12 @@ impl CacheManager {
             for cache in caches.iter_mut() {
                 cache.release_unused_pages();
             }
-            self.event_sink.emit(CacheEvent::EvictionCompleted {
-                policy: policy.name().to_string(),
-                tokens_removed: result.tokens_removed,
-                new_pos: result.new_pos,
-            });
+            log::info!(
+                "[CacheEvent] Eviction completed: policy='{}', removed={}, new_pos={}",
+                policy.name(),
+                result.tokens_removed,
+                result.new_pos,
+            );
         }
 
         Ok(result)

@@ -4,6 +4,20 @@
 
 ---
 
+## [P2] typed lifecycle hook 확장 (h-1) — 별 sprint, 2026-05-27 등록
+- **배경**: events sprint(2026-05-27)에서 사용자 결정 — sink가 fire-and-forget 디버깅 채널(비즈니스 영향 0)이라는 결론에 도달했으나, **비즈니스 동작(KV cache 관리, swap trigger)을 typed lifecycle hook으로 격리**하는 트랙은 별 sprint로 분리. 본 sprint는 events trait 인프라 제거(외과적)만 처리.
+- **방향**: `LayerBoundaryHook` (Sprint C에서 L2 격상 `engine/src/layer_boundary_hook.rs`)이 이미 precedent. 추가로 typed hook을 다음 단위로 확장 가설:
+  - `PressureHook` (신규) — 매 step pressure 체크 → eviction trigger (현재 `cache_manager.maybe_evict()` 직접 호출 패턴 격리)
+  - `KvCacheHook` (신규) — KV append/grow/evict 직접 호출 추상화
+  - `PrefetchHook` (신규) — 다음 layer/token weight 사전 로드
+  - 기존 `LayerBoundaryHook` + `Sampler` + `StopChecker` + `ModelForward` + `DecodeWorkspace` + `Logits` (Phase 4-2/4-3 6 trait)와 일관 패턴
+- **이득**: inference loop이 KV cache / swap_executor / cache_manager 모듈 직접 import 0으로 격리. 신규 도메인(speculative decoding, prefetch) 추가 시 inference loop 무변경.
+- **위험**: silent drop이 비즈니스 영향 (eviction 안 일어남 → OOM, swap 안 일어남 → 정확도 저하). typed hook 패턴이면 컴파일 타임에 등록 누락 차단. event bus(callback registry)는 비추 — silent drop 위험.
+- **블로커**: 본 트랙은 inference loop 전체 재설계 (Phase 4-4 후속) — 1~2주 범위. design round (Architect + 사용자) 필수.
+- **연관**: `[P2] generate 바이너리 분할 + Manager 통합` (line ~71) — 함께 처리하면 자연. handoff `arch/inference_pipeline.md` precedent (Phase 4-2 4-3 6 trait + DecodeLoopBuilder typestate).
+
+---
+
 ## [P3] §13.8-L hot path sub-trait 격상 — 잔여 7건 (2026-05-26 P2→P3 강등, 리뷰 결과)
 - **Status**: TODO (P3) — 정책 RESOLVED + 1차 sprint(`b94e55ee`)로 강제 trigger 사유 해소. 잔여 marker는 정적, 새 추가 없으면 status quo로 충분.
 - **강등 사유 (리뷰 결정 2026-05-26)**: §13.8-L 정책 자체가 RESOLVED (`ARCHITECTURE.md` line 2120 `§L … RESOLVED (2026-05-24, S-C5 확장)`) + S-L-1/2/3 1차 sprint 종결 (`b94e55ee`, hot path marker 9→7). 잔여 7건의 baseline 효과 0 + transitive drag(PlanExecutor 8+ method + nested 3 trait + OpenCL queue trait 노출)이 3~5일로 ROI 최저. 동시 backlog의 generate 분할 / transformer.rs ctor 본질 해소 트랙이 더 ROI 큼.

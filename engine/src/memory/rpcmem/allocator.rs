@@ -292,9 +292,9 @@ mod tests {
         let a = RpcmemAllocator::from_external_fns(dummy_alloc, dummy_free, dummy_to_fd);
         let (af, ff, tf) = a.raw_fns();
         // pointer equality
-        assert_eq!(af as usize, dummy_alloc as usize);
-        assert_eq!(ff as usize, dummy_free as usize);
-        assert_eq!(tf as usize, dummy_to_fd as usize);
+        assert_eq!(af as usize, dummy_alloc as *const () as usize);
+        assert_eq!(ff as usize, dummy_free as *const () as usize);
+        assert_eq!(tf as usize, dummy_to_fd as *const () as usize);
     }
 
     /// `alloc(0)` 은 Err.

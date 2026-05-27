@@ -20,7 +20,6 @@ use crate::buffer::DType;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::observability::events::StderrDiagnosticSink;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use crate::pressure::eviction::h2o::H2OPolicy;
@@ -596,7 +595,7 @@ fn build_chat_eviction_internal(
         };
     let threshold_bytes = (args.memory_threshold_mb * 1024 * 1024) as usize;
 
-    let mut cache_manager = if args.eviction_policy == "d2o" {
+    let cache_manager = if args.eviction_policy == "d2o" {
         let d2o_handler = D2OHandler::new(D2OConfig {
             keep_ratio: args.d2o_keep_ratio,
             protected_prefix: actual_protected_prefix,
@@ -645,7 +644,6 @@ fn build_chat_eviction_internal(
         };
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     };
-    cache_manager.set_event_sink(Arc::new(StderrDiagnosticSink));
 
     let score_based = matches!(args.eviction_policy.as_str(), "h2o" | "h2o_plus" | "d2o");
 

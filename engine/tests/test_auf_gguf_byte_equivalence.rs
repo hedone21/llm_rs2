@@ -285,7 +285,7 @@ fn auf_gguf_byte_equivalence_qwen25_1_5b_full_sweep() {
     };
 
     for (name, id) in cross {
-        probe(format!("{name}"), id);
+        probe(name.to_string(), id);
     }
     for layer in 0..n_layers {
         for (name, kind) in &per_layer {

@@ -490,12 +490,11 @@ baseline 출력과 diff 0 byte 확인. 실패 시 sprint roll-back.
 
 본 sprint 완료 후 다음을 `.agent/todos/backlog.md`에 등록:
 
-### §7.1 [P2] §13.8-O cross-L3 vocabulary trait inversion — observability events trait inversion (Sprint C 잔여)
+### §7.1 [RESOLVED] events trait inversion — 2026-05-27 events sprint 완료
 
-- **대상**: `pressure/weights/{swap_executor, async_swap, intra_forward_swap, phase_aware_swap}.rs`의 `observability::events::{CacheEvent, EventSink, NoOpSink, WeightSwapEvent, WeightSwapKind}` direct import (4 파일, 5 import).
-- **방향**: pressure → cross-cutting trait inversion. `WeightSwapEventSink` trait를 pressure 측에 정의하고 observability가 impl 제공(이미 `EventSink` 패턴의 확장).
-- **ROI**: cross-cutting marker 5건 → 0건. 단 별 sprint(추정 1~2일).
-- **블로커**: 없음.
+- **결과**: trait inversion이 아니라 **인프라 자체 제거** 방향으로 종결. 사용자 사전 리뷰에서 sink가 fire-and-forget 디버깅 채널(비즈니스 영향 0)이라는 결론 → cross-domain sink trait + super-enum 인프라 (`EventSink` + `CacheEvent` 6 variant + `WeightSwapEvent` 8 + `WeightSwapKind` 5 + `NoOpSink`/`StderrDiagnosticSink`/`CollectingSink`) 자체 제거. 53 emit 사이트를 `log::info!`/`log::warn!` macro 직접 호출 + 응축 helper(`crate::action_diag_helper::log_swap_*` 8개 + `log_score_diag` 1개)로 치환. 7 DI 사이트 ctor 인자 + 필드 제거. `observability/events.rs` 파일 삭제. action_diag_helper.rs는 top-level L2 (`engine/src/action_diag_helper.rs`, runtime_resources_access.rs precedent).
+- **baseline 영향**: V-31 observability::events 2건 + 미등록 swap_executor/async_swap 2건 모두 해소. baseline 6→3. V-31 op_trace 1건(`§7.2 PhaseHook L2 격상`)만 잔존.
+- **후속**: typed lifecycle hook 확장(h-1) 별 sprint — `arch/typed_hook_extension.md`(미작성, backlog) 참조. 본 sprint는 외과적 cleanup 한정, hook 확장은 inference loop 재설계 트랙.
 
 ### §7.2 [P2] §13.8-O — phase_aware_swap의 op_trace::{DdrPhase, PhaseHook} L2 격상
 

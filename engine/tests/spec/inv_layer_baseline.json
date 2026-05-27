@@ -42,35 +42,15 @@
     },
     {
       "id": "V-31",
-      "file": "pressure/weights/intra_forward_swap.rs",
-      "line": 49,
-      "import": "crate::observability::events::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false,
-      "note": "Sprint C 도메인 재배치 후 pressure/weights/로 이동. §13.8-N cross_cutting_trait_usage, observability trait inversion backlog."
-    },
-    {
-      "id": "V-31",
-      "file": "pressure/weights/phase_aware_swap.rs",
-      "line": 35,
-      "import": "crate::observability::events::",
-      "rule": "INV-LAYER-003",
-      "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
-      "is_test_block": false,
-      "note": "Sprint C 도메인 재배치 후 pressure/weights/로 이동. §13.8-N cross_cutting_trait_usage."
-    },
-    {
-      "id": "V-31",
       "file": "pressure/weights/phase_aware_swap.rs",
       "line": 37,
       "import": "crate::observability::profile::op_trace::",
       "rule": "INV-LAYER-003",
       "kind": "L3-pressure→cross-cutting(observability) (concrete 직접 의존, trait inversion 필요)",
       "is_test_block": false,
-      "note": "Sprint C 도메인 재배치 후 pressure/weights/로 이동. §13.8-N op_trace hook, PhaseHook L2 격상 backlog."
+      "note": "Sprint C 도메인 재배치 후 pressure/weights/로 이동. §13.8-N op_trace hook, PhaseHook L2 격상 backlog (events sprint 와 분리된 트랙)."
     }
   ],
-  "baseline_count": 6,
-  "notes": "Refreshed 2026-05-26 after Sprint C (pressure/weights/ domain relocation). V-02 tensor_partition promotion (별도 sprint), V-32 htp_fastrpc cross-backend 2건 (Sprint C 무관), V-31 observability §13.8-N 3건 (pressure/weights/ 이동 후 재등록, trait inversion backlog)."
+  "baseline_count": 4,
+  "notes": "Refreshed 2026-05-27 after events trait inversion sprint (CacheEvent / EventSink / WeightSwapEvent 전부 제거 → log crate macro 치환, events.rs 삭제, action_diag_helper.rs 신설). V-02 tensor_partition promotion (별도 sprint), V-32 htp_fastrpc cross-backend 2건 (별도 sprint), V-31 op_trace 1건만 잔존 (PhaseHook L2 격상 별 sprint 대기). V-31 observability::events 2건 (intra_forward_swap.rs:49, phase_aware_swap.rs:35) 은 본 sprint 로 해소."
 }

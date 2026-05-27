@@ -17,7 +17,6 @@ use llm_shared::DtypeTag;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::models::transformer::TransformerModel;
-use crate::observability::events::EventSink;
 use crate::pressure::weights::{
     AsyncSwapDispatcher, IncrementalSwapPlan, IntraForwardSwapHook, PhaseAwareSwapDispatcher,
 };
@@ -62,7 +61,6 @@ pub struct EngineSwapRuntime {
     dispatcher: Arc<AsyncSwapDispatcher>,
     config: Arc<crate::model_config::ModelConfig>,
     release_worker: Arc<dyn ReleaseWorkerAccess>,
-    event_sink: Arc<dyn EventSink>,
     /// CLI `--swap` flag normalize 결과. Manager-driven swap 시 이 mode로 commit.
     default_mode: SwapMode,
     /// PhaseAware mode 전용: `--swap-phase-aware-chunk-mb` * 1 MB.
@@ -78,7 +76,6 @@ impl EngineSwapRuntime {
         dispatcher: Arc<AsyncSwapDispatcher>,
         config: Arc<crate::model_config::ModelConfig>,
         release_worker: Arc<dyn ReleaseWorkerAccess>,
-        event_sink: Arc<dyn EventSink>,
         default_mode: SwapMode,
         phase_chunk_size_bytes: usize,
         phase_max_chunks_per_token: usize,
@@ -88,7 +85,6 @@ impl EngineSwapRuntime {
             dispatcher,
             config,
             release_worker,
-            event_sink,
             default_mode,
             phase_chunk_size_bytes,
             phase_max_chunks_per_token,
@@ -113,10 +109,6 @@ impl EngineSwapRuntime {
 
     pub fn release_worker(&self) -> &Arc<dyn ReleaseWorkerAccess> {
         &self.release_worker
-    }
-
-    pub fn event_sink(&self) -> &Arc<dyn EventSink> {
-        &self.event_sink
     }
 
     pub fn phase_chunk_size_bytes(&self) -> usize {
@@ -261,7 +253,6 @@ impl EngineSwapRuntime {
                     Some(Arc::clone(&self.release_worker)),
                     DType::Q4_0,
                     Arc::clone(&self.config),
-                    Arc::clone(&self.event_sink),
                 );
                 *commit_slot = SwapCommitSlot::IntraForward(hook);
             }
@@ -278,7 +269,6 @@ impl EngineSwapRuntime {
                     Arc::clone(&self.dispatcher),
                     DType::Q4_0,
                     Arc::clone(&self.config),
-                    Arc::clone(&self.event_sink),
                 );
                 phase_dispatcher.install_self_weak();
                 phase_dispatcher.commit_plan(&decision.selected_layers);

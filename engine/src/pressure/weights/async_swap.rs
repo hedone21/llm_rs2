@@ -37,9 +37,6 @@ use crate::buffer::DType;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
 use crate::runtime_resources_access::ReleaseWorkerAccess;
-// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+β)
-#[rustfmt::skip]
-use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -136,10 +133,9 @@ pub struct AsyncSwapDispatcher {
 
 impl AsyncSwapDispatcher {
     /// Spawn the background worker thread, retaining `backend` for
-    /// `wait_event_blocking` calls inside the worker loop. `event_sink` is
-    /// cloned into the worker so `process_commit` failures can emit
-    /// `WeightSwapEvent::SwapFailed` (S-1+β).
-    pub fn new(backend: Arc<dyn Backend>, event_sink: Arc<dyn EventSink>) -> Self {
+    /// `wait_event_blocking` calls inside the worker loop. Failures inside
+    /// `process_commit` are logged directly via the action diag helpers.
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         let (sender, receiver) = mpsc::channel::<SwapJob>();
         let pending = Arc::new(AtomicUsize::new(0));
         let pending_worker = Arc::clone(&pending);
@@ -147,7 +143,7 @@ impl AsyncSwapDispatcher {
         let handle = thread::Builder::new()
             .name("llmrs-async-swap".into())
             .spawn(move || {
-                worker_loop(receiver, backend, pending_worker, event_sink);
+                worker_loop(receiver, backend, pending_worker);
             })
             .expect("failed to spawn AsyncSwapDispatcher thread");
 
@@ -232,16 +228,11 @@ impl Drop for AsyncSwapDispatcher {
 
 // ── Worker loop ─────────────────────────────────────────────────────────────
 
-fn worker_loop(
-    rx: mpsc::Receiver<SwapJob>,
-    backend: Arc<dyn Backend>,
-    pending: Arc<AtomicUsize>,
-    event_sink: Arc<dyn EventSink>,
-) {
+fn worker_loop(rx: mpsc::Receiver<SwapJob>, backend: Arc<dyn Backend>, pending: Arc<AtomicUsize>) {
     while let Ok(job) = rx.recv() {
         match job {
             SwapJob::Commit(commit) => {
-                process_commit(commit, &backend, &event_sink);
+                process_commit(commit, &backend);
                 pending.fetch_sub(1, Ordering::Release);
             }
             SwapJob::DispatchChunk(dispatch) => {
@@ -256,7 +247,7 @@ fn worker_loop(
 }
 
 /// Execute one commit job: wait → swap → chain release → on_complete.
-fn process_commit(job: SwapCommitJob, backend: &Arc<dyn Backend>, event_sink: &Arc<dyn EventSink>) {
+fn process_commit(job: SwapCommitJob, backend: &Arc<dyn Backend>) {
     // LISWAP-6 Phase 5: alias path는 cl_mem이 이미 GPU-visible 이므로
     // wait할 GPU 작업 없음. dummy event는 wait_event_blocking 의 fall-through
     // self.synchronize() 가 forward GPU op까지 block 시키는 부작용을 일으키므로
@@ -264,12 +255,12 @@ fn process_commit(job: SwapCommitJob, backend: &Arc<dyn Backend>, event_sink: &A
     if !job.write_event.is_dummy()
         && let Err(e) = backend.wait_event_blocking(job.write_event.as_ref())
     {
-        event_sink.emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-            kind: WeightSwapKind::Subsystem,
-            reason: format!("wait_event_blocking failed: {e}; commit skipped"),
-            layer: job.layer_idx,
-            token: None,
-        }));
+        crate::action_diag_helper::log_swap_failed(
+            "Subsystem",
+            &format!("wait_event_blocking failed: {e}; commit skipped"),
+            job.layer_idx,
+            None,
+        );
         // slot retains old weights — safe to continue
         return;
     }
@@ -310,7 +301,6 @@ mod tests {
     use crate::buffer::DType;
     use crate::layers::transformer_layer::TransformerLayer;
     use crate::memory::host::shared::SharedBuffer;
-    use crate::observability::events::noop_sink;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
     use std::sync::Arc;
@@ -361,7 +351,7 @@ mod tests {
     #[test]
     fn test_submit_one_commit_drain() {
         let be = cpu_be();
-        let dispatcher = AsyncSwapDispatcher::new(be.clone(), noop_sink());
+        let dispatcher = AsyncSwapDispatcher::new(be.clone());
 
         let slot = make_slot(&be, DType::F16);
         assert_eq!(slot.current_dtype(), DType::F16);
@@ -394,7 +384,7 @@ mod tests {
     #[test]
     fn test_submit_multiple_concurrent() {
         let be = cpu_be();
-        let dispatcher = Arc::new(AsyncSwapDispatcher::new(be.clone(), noop_sink()));
+        let dispatcher = Arc::new(AsyncSwapDispatcher::new(be.clone()));
 
         let slots: Vec<Arc<LayerSlot>> = (0..10).map(|_| make_slot(&be, DType::F16)).collect();
 
@@ -445,7 +435,7 @@ mod tests {
     #[test]
     fn test_drop_without_drain_terminates_thread() {
         let be = cpu_be();
-        let dispatcher = AsyncSwapDispatcher::new(be.clone(), noop_sink());
+        let dispatcher = AsyncSwapDispatcher::new(be.clone());
 
         let slot = make_slot(&be, DType::F16);
         dispatcher
@@ -473,7 +463,7 @@ mod tests {
     #[test]
     fn test_drain_deadline_exceeded() {
         let be = cpu_be();
-        let dispatcher = AsyncSwapDispatcher::new(be.clone(), noop_sink());
+        let dispatcher = AsyncSwapDispatcher::new(be.clone());
 
         // No jobs — drain on empty must be instant Ok.
         dispatcher

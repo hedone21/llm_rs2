@@ -11,7 +11,6 @@ use llm_rs2::layers::workspace::{
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
-use llm_rs2::observability::events::{self, CacheEvent, StderrDiagnosticSink};
 use llm_rs2::observability::rss_trace::{io_trace, rss_trace};
 use llm_rs2::pressure::cache_manager::CacheManager;
 use llm_rs2::pressure::d2o_handler::{D2OConfig, D2OHandler};
@@ -896,9 +895,6 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Setup event sink for score diagnostics
-    cache_manager.set_event_sink(Arc::new(StderrDiagnosticSink));
-
     // Enable disk-backed KV swap when --swap-dir is provided.
     // KvOffload directives write to this directory; RestoreDefaults recalls.
     if let Some(dir) = args.swap_dir.clone() {
@@ -1087,13 +1083,6 @@ fn main() -> anyhow::Result<()> {
     let mut incremental_force_swap_plan: Option<llm_rs2::pressure::weights::IncrementalSwapPlan> =
         None;
 
-    // S-1: shared EventSink for weight swap lifecycle events.
-    // Single Arc reused across all SwapDispatchCtx instances per tick.
-    // StderrDiagnosticSink emits `[WeightSwap]`-prefixed lines for operator
-    // grep; swap flag OFF means dispatchers early-return so emit count is 0.
-    let event_sink: std::sync::Arc<dyn llm_rs2::observability::events::EventSink> =
-        std::sync::Arc::new(llm_rs2::observability::events::StderrDiagnosticSink);
-
     // LISWAP-6 manager path: when manager triggers SwapWeights, the plan is
     // committed to `incremental_force_swap_plan` and this state records the
     // information needed to send WeightSwapReport on plan completion.
@@ -1137,7 +1126,6 @@ fn main() -> anyhow::Result<()> {
             if swap_backend.supports_async_transfer() {
                 Some(llm_rs2::pressure::weights::AsyncSwapDispatcher::new(
                     swap_backend,
-                    std::sync::Arc::clone(&event_sink),
                 ))
             } else {
                 if args.swap_incremental_per_tick > 0 {
@@ -1164,17 +1152,14 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .cloned()
             .unwrap_or_else(|| cpu_backend_arc.clone());
-        let runtime_dispatcher =
-            std::sync::Arc::new(llm_rs2::pressure::weights::AsyncSwapDispatcher::new(
-                swap_backend.clone(),
-                std::sync::Arc::clone(&event_sink),
-            ));
+        let runtime_dispatcher = std::sync::Arc::new(
+            llm_rs2::pressure::weights::AsyncSwapDispatcher::new(swap_backend.clone()),
+        );
         llm_rs2::session::swap_runtime::EngineSwapRuntime::new(
             swap_backend,
             runtime_dispatcher,
             std::sync::Arc::new(model.config.clone()),
             std::sync::Arc::clone(&model.release_worker),
-            std::sync::Arc::clone(&event_sink),
             args.resolved_swap_mode(),
             args.swap_phase_aware_chunk_mb.max(1) * 1_048_576,
             args.swap_phase_aware_max_chunks_per_token,
@@ -1383,7 +1368,6 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| cpu_backend_arc.clone());
                 let dispatcher = Arc::new(llm_rs2::pressure::weights::AsyncSwapDispatcher::new(
                     Arc::clone(&swap_backend),
-                    Arc::clone(&event_sink),
                 ));
                 let secondary = match model.secondary_mmap.as_ref() {
                     Some(s) => Arc::clone(s),
@@ -1409,7 +1393,6 @@ fn main() -> anyhow::Result<()> {
                     dispatcher,
                     DType::Q4_0,
                     config,
-                    Arc::clone(&event_sink),
                 );
                 // LISWAP Phase 4: install weak self-ref so the worker thread can
                 // call back into try_dispatch_chunk_worker via ChunkDispatchJob.
@@ -1434,7 +1417,6 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| cpu_backend_arc.clone());
                 let dispatcher = Arc::new(llm_rs2::pressure::weights::AsyncSwapDispatcher::new(
                     Arc::clone(&swap_backend),
-                    Arc::clone(&event_sink),
                 ));
                 let mode_flag_name = if args.swap_layer_immediate {
                     "--swap-layer-immediate"
@@ -1477,7 +1459,6 @@ fn main() -> anyhow::Result<()> {
                     Some(Arc::clone(&model.release_worker)),
                     DType::Q4_0,
                     config,
-                    Arc::clone(&event_sink),
                 ));
             } else if args.swap_incremental_per_tick > 0 {
                 eprintln!(
@@ -2221,7 +2202,6 @@ fn main() -> anyhow::Result<()> {
                         probing_k_controller: &mut probing_k_controller,
                         manager_swap_report_pending: &mut manager_swap_report_pending,
                         ready_weight_swap_report: &mut ready_weight_swap_report,
-                        event_sink: &event_sink,
                     };
                 llm_rs2::session::decode_fallback::swap_dispatch::run_incremental_dispatch(
                     &mut swap_ctx,
@@ -2530,34 +2510,25 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
 
-                        // ── Score distribution diagnostic (via events system) ──
+                        // ── Score distribution diagnostic ──
                         if let Some(acc) = score_accumulator.as_ref() {
                             let scores = acc.importance_scores();
                             let cache_pos = kv_caches[0].current_pos;
-
-                            if let Some(snapshot) = events::build_score_snapshot(
+                            let csv_path: Option<std::path::PathBuf> =
+                                args.experiment_output.as_ref().map(|out_path| {
+                                    std::path::PathBuf::from(format!(
+                                        "{}.scores.csv",
+                                        out_path.trim_end_matches(".jsonl")
+                                    ))
+                                });
+                            llm_rs2::action_diag_helper::log_score_diag(
                                 scores,
                                 cache_pos,
                                 actual_protected_prefix,
                                 decode_token_index,
                                 10,
-                            ) {
-                                cache_manager
-                                    .event_sink()
-                                    .emit(CacheEvent::ScoreDiagnostic(snapshot));
-
-                                if let Some(ref out_path) = args.experiment_output {
-                                    let diag_path = format!(
-                                        "{}.scores.csv",
-                                        out_path.trim_end_matches(".jsonl")
-                                    );
-                                    if events::dump_scores_csv(scores, cache_pos, &diag_path)
-                                        .is_ok()
-                                    {
-                                        eprintln!("[ScoreDiag] Scores dumped to {}", diag_path);
-                                    }
-                                }
-                            }
+                                csv_path.as_deref(),
+                            );
                         }
 
                         // Build ScoreContext from accumulator for policy-directed eviction

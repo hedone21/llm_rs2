@@ -15,7 +15,6 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::models::transformer::TransformerModel;
-use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
 use crate::observability::rss_trace::read_bytes_now;
 use crate::pressure::weights::{
     AsyncSwapDispatcher, DynamicKController, IncrementalSwapPlan, IntraForwardSwapHook,
@@ -52,10 +51,6 @@ pub struct SwapDispatchCtx<'a> {
     pub probing_k_controller: &'a mut Option<ProbingKController>,
     pub manager_swap_report_pending: &'a mut Option<(f32, usize, std::time::Instant, f32)>,
     pub ready_weight_swap_report: &'a mut Option<llm_shared::WeightSwapReport>,
-    /// S-1: structured event sink for swap lifecycle events.
-    /// `NoOpSink` (default) means emit is a no-op; switch to
-    /// `StderrDiagnosticSink` for `[WeightSwap]` logging.
-    pub event_sink: &'a Arc<dyn EventSink>,
 }
 
 /// J3 — Layer-Incremental Swap dispatch (ENG-ALG-233).
@@ -146,14 +141,13 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                             io_after.saturating_sub(io_before)
                         )
                     });
-                    ctx.event_sink
-                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained {
-                            kind: WeightSwapKind::Incremental,
-                            chunk_idx: ctx.decode_token_index,
-                            layers_done: report.swapped.len(),
-                            latency_ms,
-                            stages: stages_str,
-                        }));
+                    crate::action_diag_helper::log_swap_chunk_drained(
+                        "Incremental",
+                        ctx.decode_token_index,
+                        report.swapped.len(),
+                        latency_ms,
+                        stages_str.as_deref(),
+                    );
                     #[cfg(feature = "opencl")]
                     remap_weights_for_cpu_after_swap(
                         ctx.model,
@@ -193,13 +187,12 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                     }
                 }
                 Err(e) => {
-                    ctx.event_sink
-                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                            kind: WeightSwapKind::Incremental,
-                            reason: e.to_string(),
-                            layer: None,
-                            token: Some(ctx.decode_token_index),
-                        }));
+                    crate::action_diag_helper::log_swap_failed(
+                        "Incremental",
+                        &e.to_string(),
+                        None,
+                        Some(ctx.decode_token_index),
+                    );
                 }
             }
         }
@@ -258,35 +251,32 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
             if let Some(dispatcher) = ctx.async_swap_dispatcher.as_ref() {
                 let drain_t = std::time::Instant::now();
                 if let Err(e) = dispatcher.drain(std::time::Duration::from_secs(2)) {
-                    ctx.event_sink
-                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                            kind: WeightSwapKind::Incremental,
-                            reason: format!("LISWAP-2 drain failed: {e}"),
-                            layer: None,
-                            token: Some(ctx.decode_token_index),
-                        }));
+                    crate::action_diag_helper::log_swap_failed(
+                        "Incremental",
+                        &format!("LISWAP-2 drain failed: {e}"),
+                        None,
+                        Some(ctx.decode_token_index),
+                    );
                 } else {
                     drain_ms = (drain_t.elapsed().as_secs_f64() * 1000.0) as f32;
-                    ctx.event_sink
-                        .emit(CacheEvent::WeightSwap(WeightSwapEvent::ChunkDrained {
-                            kind: WeightSwapKind::Incremental,
-                            chunk_idx: ctx.decode_token_index,
-                            layers_done: 0, // LISWAP-2 dispatcher drain, no new layers
-                            latency_ms: drain_ms,
-                            stages: Some("liswap-2-drain".to_string()),
-                        }));
+                    crate::action_diag_helper::log_swap_chunk_drained(
+                        "Incremental",
+                        ctx.decode_token_index,
+                        0,
+                        drain_ms,
+                        Some("liswap-2-drain"),
+                    );
                 }
             }
-            ctx.event_sink
-                .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
-                    kind: WeightSwapKind::Incremental,
-                    qcf_actual: None,
-                    token: ctx.decode_token_index,
-                    elapsed_ms: drain_ms,
-                    ratio: None,
-                    n_planned: Some(ctx.decode_token_index.saturating_sub(started_at)),
-                    actually_q4: None,
-                }));
+            crate::action_diag_helper::log_swap_plan_retired(
+                "Incremental",
+                None,
+                ctx.decode_token_index,
+                drain_ms,
+                None,
+                Some(ctx.decode_token_index.saturating_sub(started_at)),
+                None,
+            );
             *ctx.incremental_force_swap_plan = None;
 
             // LISWAP-6 manager path: build WeightSwapReport when the plan
@@ -322,16 +312,15 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
                         to_dtype: llm_shared::DtypeTag::Q4_0,
                     })
                     .collect();
-                ctx.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
-                        kind: WeightSwapKind::Incremental,
-                        qcf_actual: Some(qcf_swap_actual),
-                        token: ctx.decode_token_index,
-                        elapsed_ms: latency_ms as f32,
-                        ratio: Some(ratio),
-                        n_planned: Some(n_planned),
-                        actually_q4: Some(layers_swapped.len()),
-                    }));
+                crate::action_diag_helper::log_swap_plan_retired(
+                    "Incremental",
+                    Some(qcf_swap_actual),
+                    ctx.decode_token_index,
+                    latency_ms as f32,
+                    Some(ratio),
+                    Some(n_planned),
+                    Some(layers_swapped.len()),
+                );
                 *ctx.ready_weight_swap_report = Some(llm_shared::WeightSwapReport {
                     layers_swapped,
                     freed_bytes: 0,
@@ -370,16 +359,15 @@ pub fn retire_intra_forward(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()>
             std::time::Duration::from_secs(10),
         ) {
             Ok(()) => {
-                ctx.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
-                        kind: WeightSwapKind::IntraForward,
-                        qcf_actual: None,
-                        token: ctx.decode_token_index,
-                        elapsed_ms: (drain_t.elapsed().as_secs_f64() * 1000.0) as f32,
-                        ratio: None,
-                        n_planned: None,
-                        actually_q4: None,
-                    }));
+                crate::action_diag_helper::log_swap_plan_retired(
+                    "IntraForward",
+                    None,
+                    ctx.decode_token_index,
+                    (drain_t.elapsed().as_secs_f64() * 1000.0) as f32,
+                    None,
+                    None,
+                    None,
+                );
                 #[cfg(feature = "opencl")]
                 remap_weights_for_cpu_after_swap(
                     ctx.model,
@@ -390,13 +378,12 @@ pub fn retire_intra_forward(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()>
                 );
             }
             Err(e) => {
-                ctx.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                        kind: WeightSwapKind::IntraForward,
-                        reason: format!("finalize failed: {e}"),
-                        layer: None,
-                        token: Some(ctx.decode_token_index),
-                    }));
+                crate::action_diag_helper::log_swap_failed(
+                    "IntraForward",
+                    &format!("finalize failed: {e}"),
+                    None,
+                    Some(ctx.decode_token_index),
+                );
             }
         }
         *ctx.intra_forward_swap_hook = None; // retire
@@ -441,16 +428,15 @@ pub fn retire_phase_aware(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
             std::time::Duration::from_secs(10),
         ) {
             Ok(()) => {
-                ctx.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::PlanRetired {
-                        kind: WeightSwapKind::PhaseAware,
-                        qcf_actual: None,
-                        token: ctx.decode_token_index,
-                        elapsed_ms: (drain_t.elapsed().as_secs_f64() * 1000.0) as f32,
-                        ratio: None,
-                        n_planned: Some(disp.dispatched_count() as usize),
-                        actually_q4: None,
-                    }));
+                crate::action_diag_helper::log_swap_plan_retired(
+                    "PhaseAware",
+                    None,
+                    ctx.decode_token_index,
+                    (drain_t.elapsed().as_secs_f64() * 1000.0) as f32,
+                    None,
+                    Some(disp.dispatched_count() as usize),
+                    None,
+                );
                 #[cfg(feature = "opencl")]
                 remap_weights_for_cpu_after_swap(
                     ctx.model,
@@ -461,13 +447,12 @@ pub fn retire_phase_aware(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
                 );
             }
             Err(e) => {
-                ctx.event_sink
-                    .emit(CacheEvent::WeightSwap(WeightSwapEvent::SwapFailed {
-                        kind: WeightSwapKind::PhaseAware,
-                        reason: format!("finalize failed: {e}"),
-                        layer: None,
-                        token: Some(ctx.decode_token_index),
-                    }));
+                crate::action_diag_helper::log_swap_failed(
+                    "PhaseAware",
+                    &format!("finalize failed: {e}"),
+                    None,
+                    Some(ctx.decode_token_index),
+                );
             }
         }
         *ctx.phase_aware_swap_dispatcher = None;
