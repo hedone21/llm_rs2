@@ -5,8 +5,8 @@
 //! `qcf_swap_predicted` with actual NLL/quality metrics.
 
 use super::output::EvalOutput;
-use crate::pressure::weights::QuantNoiseTable;
 use crate::qcf::layer_importance::ImportanceTable;
+use crate::runtime_resources_access::QuantNoiseAccess;
 
 /// Context for one layer-swap QCF measurement run.
 pub struct QcfSwapDumpContext<'a> {
@@ -29,8 +29,9 @@ pub struct QcfSwapDumpContext<'a> {
     pub fallback_used: bool,
     /// Full importance table built from warmup prefill (optional).
     pub importance_table: Option<&'a ImportanceTable>,
-    /// Quantization noise table built from secondary mmap (optional).
-    pub noise_table: Option<&'a QuantNoiseTable>,
+    /// Quantization noise table built from secondary mmap (optional). Held as
+    /// `dyn` so callers can pass `model.quant_noise.as_ref()` directly.
+    pub noise_table: Option<&'a dyn QuantNoiseAccess>,
     /// Perplexity result from `run_ppl()` (None in generation mode).
     pub ppl: Option<f64>,
     /// Average negative log-likelihood (None in generation mode).

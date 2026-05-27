@@ -7,13 +7,15 @@
 //! 도메인에 정착시키고, inference 는 `RuntimeResources` 를 받아 field 에
 //! install 하는 형태로 정합.
 //!
-//! field 정의(`TransformerModel::quant_noise` / `release_worker`) 자체의 marker
-//! 는 본질 trait inversion 없이 못 빠지므로 잔존한다 — struct 정의에 pressure
-//! 타입이 직접 등장하기 때문.
+//! 2026-05-27 후속 sprint (`RuntimeResourcesAccess` trait inversion): field
+//! 타입을 trait object (`Arc<dyn QuantNoiseAccess>` / `Arc<dyn
+//! ReleaseWorkerAccess>`) 로 격상. struct 정의에서 pressure 타입 노출 0건 →
+//! cross-L3 vocabulary marker 자연 해소.
 
 use std::sync::Arc;
 
 use crate::backend::Backend;
+use crate::runtime_resources_access::{QuantNoiseAccess, ReleaseWorkerAccess};
 
 use super::noise_table::QuantNoiseTable;
 use super::release_worker::PrimaryReleaseWorker;
@@ -21,10 +23,12 @@ use super::release_worker::PrimaryReleaseWorker;
 /// Pressure-owned runtime resources required by `TransformerModel` at init.
 ///
 /// Constructed by [`setup_runtime_resources`] and consumed by the inference
-/// loader / test helpers via struct field install.
+/// loader / test helpers via struct field install. The fields are exposed as
+/// trait objects so the inference struct definition does not reference
+/// pressure-side concrete types directly.
 pub struct RuntimeResources {
-    pub quant_noise: Arc<QuantNoiseTable>,
-    pub release_worker: Arc<PrimaryReleaseWorker>,
+    pub quant_noise: Arc<dyn QuantNoiseAccess>,
+    pub release_worker: Arc<dyn ReleaseWorkerAccess>,
 }
 
 /// Initialize pressure-owned runtime resources for a fresh `TransformerModel`.

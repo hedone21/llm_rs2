@@ -33,6 +33,7 @@ use crate::backend::Backend;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure worker → inference weight resource (LayerWeights)
 use crate::models::weights::LayerWeights;
 use crate::pressure::weights::swap_executor::record_swap_release_pub;
+use crate::runtime_resources_access::{DrainError, ReleaseWorkerAccess};
 
 /// Message sent to the release worker.
 pub enum ReleaseJob {
@@ -167,24 +168,22 @@ impl Drop for PrimaryReleaseWorker {
     }
 }
 
-/// Error returned by [`PrimaryReleaseWorker::drain`] on timeout.
-#[derive(Debug)]
-pub struct DrainError {
-    pub pending: usize,
-    pub timeout_ms: u64,
-}
+/// Cross-cutting trait impl: lets `TransformerModel` hold an
+/// `Arc<dyn ReleaseWorkerAccess>` instead of the concrete worker type
+/// (§13.8-O 본질 해소). Forwards every method to the inherent impl above.
+impl ReleaseWorkerAccess for PrimaryReleaseWorker {
+    fn enqueue_release(&self, layer: LayerWeights) {
+        PrimaryReleaseWorker::enqueue_release(self, layer);
+    }
 
-impl std::fmt::Display for DrainError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "primary release worker drain timeout: {} jobs remaining after {}ms",
-            self.pending, self.timeout_ms
-        )
+    fn pending_count(&self) -> usize {
+        PrimaryReleaseWorker::pending_count(self)
+    }
+
+    fn drain(&self, deadline: Duration) -> Result<(), DrainError> {
+        PrimaryReleaseWorker::drain(self, deadline)
     }
 }
-
-impl std::error::Error for DrainError {}
 
 /// Tally the byte sizes of all tensors in a `LayerWeights` before dropping.
 ///

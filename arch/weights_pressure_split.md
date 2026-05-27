@@ -515,7 +515,7 @@ baseline 출력과 diff 0 byte 확인. 실패 시 sprint roll-back.
 - **marker 변화**: 해소 4건 (loader/mod.rs 2 + transformer.rs helper 2) + 신규 위계 정합 marker 2건 (use 문 합법화) = **순감 2건**. 잔존 field 정의 2건은 본질 trait inversion(`RuntimeResourcesAccess` trait) 필요 — 별 sprint scope.
 - **검증**: spec INV-LAYER 8/8 PASS, layer_lint new_violations=0, S25 Adreno OpenCL Qwen2.5-1.5b Q4_0 32토큰 bit-identical (first_token=6313, TBT 30.33 ms/tok Δ +0.07 측정 노이즈).
 - **잔여 후속 sprint** (별 entry):
-  - `RuntimeResourcesAccess` trait inversion — `TransformerModel::quant_noise`/`release_worker` field를 `Arc<dyn RuntimeResourcesAccess>` trait object로 추상화. struct 정의 자체에서 pressure 타입 제거 → field marker 2건 자연 해소. 비용 1~2일 + struct field migration ripple.
+  - ~~`RuntimeResourcesAccess` trait inversion — `TransformerModel::quant_noise`/`release_worker` field를 `Arc<dyn RuntimeResourcesAccess>` trait object로 추상화. struct 정의 자체에서 pressure 타입 제거 → field marker 2건 자연 해소. 비용 1~2일 + struct field migration ripple.~~ → **RESOLVED Sprint E (2026-05-27)**: trait 2개 분리 (`QuantNoiseAccess` + `ReleaseWorkerAccess`) cross-cutting top-level L2 file `engine/src/runtime_resources_access.rs` 신설 + `DrainError` 이전. field type을 trait object로 격상. 호출지 15+ 사이트 sig 마이그레이션. cross_l3_vocabulary marker 2건 제거 (L2→L3 payload marker 1건 신규 — baseline V-34, kv_cache_ops의 Tensor payload와 동일 위계). 검증: cargo fmt + clippy clean, INV-141 7/7 + INV-LAYER 8/8 PASS, layer_lint baseline 0 new.
 
 ### §7.5 [P2] §13.8-O — secondary backing trait inversion
 

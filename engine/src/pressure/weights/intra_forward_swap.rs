@@ -38,8 +38,8 @@ use crate::backend::{Backend, GpuEvent};
 use crate::buffer::DType;
 use crate::layer_boundary_hook::LayerBoundaryHook;
 use crate::pressure::weights::async_swap::{AsyncSwapDispatcher, SwapCommitJob};
-use crate::pressure::weights::release_worker::PrimaryReleaseWorker;
 use crate::pressure::weights::swap_executor::SwapExecutor;
+use crate::runtime_resources_access::ReleaseWorkerAccess;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot/SecondaryMmap)
 use crate::models::weights::secondary_mmap::SecondaryMmap;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
@@ -134,7 +134,7 @@ pub struct IntraForwardSwapHook {
     secondary: Option<Arc<SecondaryMmap>>,
     layer_slots: Vec<Arc<LayerSlot>>,
     backend: Arc<dyn Backend>,
-    release_worker: Option<Arc<PrimaryReleaseWorker>>,
+    release_worker: Option<Arc<dyn ReleaseWorkerAccess>>,
     target_dtype: DType,
     /// Per-slot pending event registry (ENG-DAT-101). Indexed by layer_idx.
     /// `None` = no in-flight swap. Lock-free read by forward thread.
@@ -177,7 +177,7 @@ impl IntraForwardSwapHook {
         secondary: Arc<SecondaryMmap>,
         layer_slots: Vec<Arc<LayerSlot>>,
         backend: Arc<dyn Backend>,
-        release_worker: Option<Arc<PrimaryReleaseWorker>>,
+        release_worker: Option<Arc<dyn ReleaseWorkerAccess>>,
         target_dtype: DType,
         config: Arc<crate::model_config::ModelConfig>,
         event_sink: Arc<dyn EventSink>,
@@ -234,7 +234,7 @@ impl IntraForwardSwapHook {
         secondary: Option<Arc<SecondaryMmap>>,
         layer_slots: Vec<Arc<LayerSlot>>,
         backend: Arc<dyn Backend>,
-        release_worker: Option<Arc<PrimaryReleaseWorker>>,
+        release_worker: Option<Arc<dyn ReleaseWorkerAccess>>,
         target_dtype: DType,
         config: Arc<crate::model_config::ModelConfig>,
         event_sink: Arc<dyn EventSink>,

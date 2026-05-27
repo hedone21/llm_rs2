@@ -68,7 +68,6 @@ use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
 #[cfg(feature = "opencl")]
 use crate::models::weights::SecondaryTensorInfo;
 use crate::pressure::weights::async_swap::AsyncSwapDispatcher;
-use crate::pressure::weights::release_worker::PrimaryReleaseWorker;
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+α)
 #[rustfmt::skip]
 use crate::observability::events::{CacheEvent, EventSink, NoOpSink, WeightSwapEvent, WeightSwapKind};
@@ -293,7 +292,7 @@ pub struct SwapExecutor<'a> {
     /// When `Some`, Stage (c) enqueues displaced `LayerWeights` here instead
     /// of dropping inline. INV-141 is verified at the top of each batch.
     /// `None` → original inline drop path (host tests, CPU backend fallback).
-    pub release_worker: Option<Arc<PrimaryReleaseWorker>>,
+    pub release_worker: Option<Arc<dyn crate::runtime_resources_access::ReleaseWorkerAccess>>,
     /// LISWAP-3 prototype: opt-in `CL_MEM_ALLOC_HOST_PTR` pool path.
     ///
     /// When `Some`, GPU AOS weight materialisation routes through the pool
@@ -376,7 +375,7 @@ impl<'a> SwapExecutor<'a> {
         config: &'a ModelConfig,
         backend: Arc<dyn Backend>,
         memory: &'a dyn Memory,
-        release_worker: Arc<PrimaryReleaseWorker>,
+        release_worker: Arc<dyn crate::runtime_resources_access::ReleaseWorkerAccess>,
     ) -> Self {
         Self {
             target_dtype,

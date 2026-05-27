@@ -11,6 +11,16 @@
       "note": "tensor_partition L2 격상 별 sprint 대기"
     },
     {
+      "id": "V-34",
+      "file": "runtime_resources_access.rs",
+      "line": 16,
+      "import": "crate::models::weights::LayerWeights",
+      "rule": "INV-LAYER-002",
+      "kind": "L2→L3-inference (cross-cutting trait payload, 의도된 패턴)",
+      "is_test_block": false,
+      "note": "§13.8-O 본질 해소 sprint (2026-05-27). cross-cutting top-level L2 trait `ReleaseWorkerAccess::enqueue_release` 가 inference payload `LayerWeights` 를 받기 위한 signature 정합 — `kv_cache_ops` 가 `Tensor` 를 signature 에 노출하는 패턴과 동일 위계. transformer.rs 의 cross_l3_vocabulary marker 2건 (quant_noise / release_worker field) 제거의 대가로 1건 신규. 정합 marker 가 동봉되어 있음."
+    },
+    {
       "id": "V-32",
       "file": "backend/htp_fastrpc/mod.rs",
       "line": 91,

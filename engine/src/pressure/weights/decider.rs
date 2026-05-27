@@ -17,9 +17,12 @@
 
 use std::collections::HashSet;
 
-use crate::pressure::weights::QuantNoiseTable;
 use crate::qcf_collector::ImportanceLookup;
 use crate::qcf_types::SubLayer;
+use crate::runtime_resources_access::QuantNoiseAccess;
+
+#[cfg(test)]
+use crate::pressure::weights::QuantNoiseTable;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -90,8 +93,10 @@ pub struct WeightSwapDecider<'a> {
     /// Importance table from the last prefill (None = fallback).
     /// Uses L2 `ImportanceLookup` trait (§13.8-G + INV-LAYER-003 trait inversion).
     pub importance: Option<&'a dyn ImportanceLookup>,
-    /// Quantization noise table from engine init (None = fallback).
-    pub noise: Option<&'a QuantNoiseTable>,
+    /// Quantization noise table from engine init (None = fallback). Held as a
+    /// `dyn` trait object so callers can pass `model.quant_noise.as_ref()`
+    /// without coupling to the concrete `QuantNoiseTable` type.
+    pub noise: Option<&'a dyn QuantNoiseAccess>,
     /// Total number of decoder layers in the model.
     pub n_decoder_layers: usize,
     /// Layers that are already at the target dtype — excluded from re-selection.
@@ -252,7 +257,7 @@ impl<'a> WeightSwapDecider<'a> {
 /// - Returns `0.0` when `swap_set` is empty or denominator ≈ 0.
 pub fn compute_qcf_weight_swap(
     swap_set: &[usize],
-    noise: &QuantNoiseTable,
+    noise: &dyn QuantNoiseAccess,
     importance: Option<&dyn ImportanceLookup>,
     n_decoder_layers: usize,
 ) -> f32 {
@@ -265,7 +270,7 @@ fn compute_qcf_swap_internal(
     swap_set: &[usize],
     n_decoder_layers: usize,
     importance: Option<&dyn ImportanceLookup>,
-    noise: Option<&QuantNoiseTable>,
+    noise: Option<&dyn QuantNoiseAccess>,
 ) -> f32 {
     if swap_set.is_empty() {
         return 0.0;

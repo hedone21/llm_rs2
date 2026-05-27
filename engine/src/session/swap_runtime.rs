@@ -20,8 +20,8 @@ use crate::models::transformer::TransformerModel;
 use crate::observability::events::EventSink;
 use crate::pressure::weights::{
     AsyncSwapDispatcher, IncrementalSwapPlan, IntraForwardSwapHook, PhaseAwareSwapDispatcher,
-    PrimaryReleaseWorker,
 };
+use crate::runtime_resources_access::ReleaseWorkerAccess;
 use crate::session::cli::SwapMode;
 
 /// Engine 내부 swap dispatch의 commit 결과.
@@ -61,7 +61,7 @@ pub struct EngineSwapRuntime {
     swap_backend: Arc<dyn Backend>,
     dispatcher: Arc<AsyncSwapDispatcher>,
     config: Arc<crate::model_config::ModelConfig>,
-    release_worker: Arc<PrimaryReleaseWorker>,
+    release_worker: Arc<dyn ReleaseWorkerAccess>,
     event_sink: Arc<dyn EventSink>,
     /// CLI `--swap` flag normalize 결과. Manager-driven swap 시 이 mode로 commit.
     default_mode: SwapMode,
@@ -77,7 +77,7 @@ impl EngineSwapRuntime {
         swap_backend: Arc<dyn Backend>,
         dispatcher: Arc<AsyncSwapDispatcher>,
         config: Arc<crate::model_config::ModelConfig>,
-        release_worker: Arc<PrimaryReleaseWorker>,
+        release_worker: Arc<dyn ReleaseWorkerAccess>,
         event_sink: Arc<dyn EventSink>,
         default_mode: SwapMode,
         phase_chunk_size_bytes: usize,
@@ -111,7 +111,7 @@ impl EngineSwapRuntime {
         &self.config
     }
 
-    pub fn release_worker(&self) -> &Arc<PrimaryReleaseWorker> {
+    pub fn release_worker(&self) -> &Arc<dyn ReleaseWorkerAccess> {
         &self.release_worker
     }
 
@@ -197,7 +197,7 @@ impl EngineSwapRuntime {
         );
         let decider = WeightSwapDecider {
             importance,
-            noise: Some(&model.quant_noise),
+            noise: Some(model.quant_noise.as_ref()),
             n_decoder_layers: n_layers,
             currently_swapped: &currently_swapped,
             allow_boundary_layers: allow_boundary,
@@ -217,7 +217,7 @@ impl EngineSwapRuntime {
         // ── 5. QCF estimate ──────────────────────────────────────────────
         let qcf_swap_estimated = compute_qcf_weight_swap(
             &decision.selected_layers,
-            &model.quant_noise,
+            model.quant_noise.as_ref(),
             importance,
             n_layers,
         );

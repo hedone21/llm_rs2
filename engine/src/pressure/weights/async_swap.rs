@@ -36,7 +36,7 @@ use crate::backend::{Backend, GpuEvent};
 use crate::buffer::DType;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
-use crate::pressure::weights::release_worker::PrimaryReleaseWorker;
+use crate::runtime_resources_access::ReleaseWorkerAccess;
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N WeightSwapEvent emit (S-1+β)
 #[rustfmt::skip]
 use crate::observability::events::{CacheEvent, EventSink, WeightSwapEvent, WeightSwapKind};
@@ -68,7 +68,7 @@ pub struct SwapCommitJob {
     /// When `Some`, successful `Arc::try_unwrap` on the old weights triggers
     /// `release_worker.enqueue_release(old_layer)`. When `None`, old weights
     /// are dropped inline.
-    pub release_worker: Option<Arc<PrimaryReleaseWorker>>,
+    pub release_worker: Option<Arc<dyn ReleaseWorkerAccess>>,
     /// Optional commit-complete callback (LISWAP-4 / ENG-ALG-237).
     ///
     /// Invoked on the dispatcher worker thread immediately after

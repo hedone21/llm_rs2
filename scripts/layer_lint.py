@@ -130,7 +130,8 @@ def classify_module(rel_path: str) -> str:
                     "partition_workspace.rs", "kv_cache_ops.rs",
                     "yield_policy.rs", "qcf_types.rs",
                     "qcf_computer.rs", "qcf_collector.rs",
-                    "model_config.rs", "layer_boundary_hook.rs"}
+                    "model_config.rs", "layer_boundary_hook.rs",
+                    "runtime_resources_access.rs"}
     if norm in TOP_LEVEL_L2:
         return "L2"
     for prefix, layer in LAYER_RULES:
@@ -165,7 +166,8 @@ def classify_import(import_path: str) -> str:
     # Top-level L2 abstraction files (engine/src/*.rs, Rust 2018+ pattern)
     if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
                     "quant", "thread_pool", "op_kind", "partition_workspace",
-                    "kv_cache_ops", "yield_policy"):
+                    "kv_cache_ops", "yield_policy",
+                    "runtime_resources_access"):
         return "L2"
     # 기존 경로 기반 매칭으로 fallback
     return classify_module(mod_path if mod_path else p.replace("::", "/"))

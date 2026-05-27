@@ -16,6 +16,7 @@ use crate::models::weights::secondary_mmap::SecondaryMmap;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
 use crate::models::weights::slot::LayerSlot;
 use crate::quant::{BlockQ4_0, QK4_0};
+use crate::runtime_resources_access::QuantNoiseAccess;
 
 // ── QuantNoiseTable ───────────────────────────────────────────────────────────
 
@@ -212,6 +213,30 @@ impl QuantNoiseTable {
     }
 }
 
+/// Cross-cutting trait impl: lets inference owner / pressure consumers interact
+/// with the table via `dyn QuantNoiseAccess` (§13.8-O 본질 해소).
+impl QuantNoiseAccess for QuantNoiseTable {
+    fn epsilon(&self, layer_id: usize) -> Option<f32> {
+        QuantNoiseTable::epsilon(self, layer_id)
+    }
+
+    fn len(&self) -> usize {
+        QuantNoiseTable::len(self)
+    }
+
+    fn is_computed(&self) -> bool {
+        QuantNoiseTable::is_computed(self)
+    }
+
+    fn as_slice(&self) -> &[f32] {
+        QuantNoiseTable::as_slice(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        QuantNoiseTable::is_empty(self)
+    }
+}
+
 /// Compute the per-layer quantization noise table for a freshly loaded model.
 ///
 /// Pressure-side relocation of `compute_quant_noise_for_model` (formerly
@@ -229,7 +254,7 @@ impl QuantNoiseTable {
 pub fn compute_quant_noise(
     primary_slots: &[Arc<LayerSlot>],
     secondary: Option<&Arc<SecondaryMmap>>,
-) -> Arc<QuantNoiseTable> {
+) -> Arc<dyn QuantNoiseAccess> {
     let secondary = match secondary {
         Some(s) => s,
         None => return Arc::new(QuantNoiseTable::empty()),

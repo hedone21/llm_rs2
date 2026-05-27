@@ -235,10 +235,15 @@ fn inv_141_swap_executor_rejects_on_drain_timeout() {
     }
 
     let be = cpu_be();
-    let worker = Arc::new(PrimaryReleaseWorker::spawn(be.clone()));
+    let worker_concrete = Arc::new(PrimaryReleaseWorker::spawn(be.clone()));
+    // Keep a concrete handle for the `pending` field injection below, and
+    // hand a trait-object clone to the executor (which expects the cross-cutting
+    // `ReleaseWorkerAccess` trait, §13.8-O 본질 해소 sprint).
+    let worker: Arc<dyn llm_rs2::runtime_resources_access::ReleaseWorkerAccess> =
+        worker_concrete.clone();
 
     // Inject an artificial pending to force drain timeout.
-    worker.pending.fetch_add(1, Ordering::Release);
+    worker_concrete.pending.fetch_add(1, Ordering::Release);
 
     let layers: Vec<Arc<LayerSlot>> = (0..2)
         .map(|_| Arc::new(LayerSlot::new(make_layer(&be), DType::F16, None)))
@@ -266,5 +271,5 @@ fn inv_141_swap_executor_rejects_on_drain_timeout() {
     );
 
     // Restore balance so drop/join does not block.
-    worker.pending.fetch_sub(1, Ordering::Release);
+    worker_concrete.pending.fetch_sub(1, Ordering::Release);
 }

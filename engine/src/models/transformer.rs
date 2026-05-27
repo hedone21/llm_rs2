@@ -124,29 +124,31 @@ pub struct TransformerModel {
     /// `OnceLock` allows interior mutability without lock contention on subsequent calls
     /// (`forward_into_offload` takes `&self`).
     pub(crate) preload_pool: std::sync::OnceLock<Box<dyn PreloadAccess>>,
-    /// Per-layer quantization noise factor table (ENG-DAT-095).
+    /// Per-layer quantization noise factor table accessor (ENG-DAT-095).
     ///
-    /// Computed once at init via `QuantNoiseTable::new_from_frobenius` when a
-    /// secondary mmap is present (ENG-ALG-216).  `WeightSwapDecider` (Stage B)
-    /// reads this for importance × ε layer ranking.
+    /// Trait object so the struct definition does not reference pressure-side
+    /// concrete types directly (§13.8-O cross-L3 vocabulary 본질 해소,
+    /// 2026-05-27 sprint). The installed impl is `QuantNoiseTable` produced
+    /// by `pressure::weights::setup_runtime_resources` and later replaced via
+    /// `pressure::weights::compute_quant_noise` once the secondary mmap is
+    /// known (ENG-ALG-216).
     ///
     /// - `secondary_mmap == None`: `QuantNoiseTable::empty()` (len==0).
     /// - Secondary present but all layers failed: `QuantNoiseTable::uniform_ones(n)`.
     /// - Normal: `QuantNoiseTable::new_from_frobenius(...)` with `is_computed=true`.
-    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference owner accepts pressure-owned resource via Arc field
-    pub quant_noise: Arc<crate::pressure::weights::QuantNoiseTable>,
-    /// Async primary cl_mem release worker (ENG-ALG-228 / ENG-DAT-100).
+    pub quant_noise: Arc<dyn crate::runtime_resources_access::QuantNoiseAccess>,
+    /// Async primary cl_mem release worker accessor (ENG-ALG-228 / ENG-DAT-100).
     ///
-    /// Spawned once at model creation. `SwapExecutor` enqueues displaced
-    /// `LayerWeights` here in Stage (c) to avoid blocking `clReleaseMemObject`
-    /// on the swap critical path. INV-141 is checked at the start of each
-    /// subsequent swap batch.
+    /// Trait object — the installed impl is `PrimaryReleaseWorker` spawned by
+    /// `pressure::weights::setup_runtime_resources`. `SwapExecutor` clones the
+    /// `Arc<dyn ReleaseWorkerAccess>` to enqueue displaced `LayerWeights` in
+    /// Stage (c) and to call `drain` (INV-141) before the next swap batch.
     ///
     /// `Arc` so `SwapExecutor` (which borrows references) can hold a clone
-    /// without lifetime coupling to the model. Drop impl joins the worker
-    /// thread, ensuring all destructors run before process exit.
-    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference owner accepts pressure-owned resource via Arc field
-    pub release_worker: Arc<crate::pressure::weights::PrimaryReleaseWorker>,
+    /// without lifetime coupling to the model. Drop impl on the underlying
+    /// `PrimaryReleaseWorker` joins the worker thread, ensuring all destructors
+    /// run before process exit.
+    pub release_worker: Arc<dyn crate::runtime_resources_access::ReleaseWorkerAccess>,
 }
 
 pub struct TransformerModelForwardArgs<'a, C: KVCacheOps> {

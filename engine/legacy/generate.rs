@@ -3892,7 +3892,7 @@ fn build_layer_swap_estimate(
     let imp = importance_table?;
 
     let n = model.layers.len();
-    let noise = &model.quant_noise;
+    let noise = model.quant_noise.as_ref();
 
     // per_layer_importance: indexed by decoder layer id
     let per_layer_importance: Vec<f32> = (0..n)

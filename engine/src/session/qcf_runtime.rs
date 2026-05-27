@@ -726,7 +726,7 @@ pub fn dispatch_swap_weights(
     );
     let decider = WeightSwapDecider {
         importance: importance_table,
-        noise: Some(&model.quant_noise),
+        noise: Some(model.quant_noise.as_ref()),
         n_decoder_layers: n_layers,
         currently_swapped: &currently_swapped,
         allow_boundary_layers: allow_boundary,
@@ -747,7 +747,7 @@ pub fn dispatch_swap_weights(
     // ── 4. Compute QCF estimate for the planned layers ─────────────────────
     let qcf_swap_estimated = compute_qcf_weight_swap(
         &decision.selected_layers,
-        &model.quant_noise,
+        model.quant_noise.as_ref(),
         importance_table,
         n_layers,
     );
