@@ -13,14 +13,26 @@
 - **비용**: 3~5일. S25 Adreno OpenCL + Jetson CUDA + S25 qnn_oppkg 3종 bit-identical 디바이스 게이트 필수.
 - **연관**: 기존 `[P2] KiviCache hot path downcast resolve` 항목과 통합 처리 가능.
 
-## [P2] §13.8-O cross-L3 vocabulary trait inversion — 2026-05-24 등록 (S-C3 후속)
-- **Status**: TODO (D-1 sprint S-C3 후 marker로 우회, 본질 격상 backlog 등록)
-- **선행**: `.agent/todos/handoff_inv_layer003_complete_2026_05_24.md`
-- **상세**: §13.8-O register 9건의 본질 trait inversion. 3 갈래:
-  - **WeightSwapDispatch trait** (3건): `pressure/weight_swap_handler.rs`의 ModelConfig + SwapExecutor + LayerSlot/SecondaryMmap 의존을 trait + handler 이동(`models/weights/swap_handler.rs`)으로 해소. ActionResult enum 의존은 §13.8-F.
-  - **PrefetchAccess + PreloadPool L2 격상** (3건): `pressure/offload/{preload_pool,prefetch}` 의 trait/struct을 L2 또는 inference 도메인으로 격상. forward_into_offload 분리 결정 선행.
-  - **KvCacheView trait** (3건): `KVCacheOps` trait의 default type parameter를 caller에 명시 강제 또는 KVCache의 일부 method를 read-only trait으로 분리. 외부 API surface 영향 큼.
-- **비용**: 1~3일 (3 트랙 분할 가능). 디바이스 게이트는 ModelForward path에 한정 (S-C3a/b/c sub-sprint 분할).
+## [RESOLVED] §13.8-O cross-L3 vocabulary trait inversion — 2026-05-26 종결
+- **Status**: RESOLVED — ARCHITECTURE.md `§O — Cross-L3 domain vocabulary zone: RESOLVED (2026-05-24, S-C3; Sprint C 2026-05-26 갱신)` (line ~2130).
+- **선행 (역사)**: 2026-05-24 등록 시점에 D-1 sprint S-C3 후 marker 우회 + 본질 격상 backlog로 분리. 이후 3 갈래 본질 해소가 별 sprint 시리즈로 진행되어 RESOLVED.
+- **3 갈래 해소 상태**:
+  - **WeightSwapDispatch trait** (3건) — **RESOLVED (Sprint B + B-fixup + Sprint C, 2026-05-26)**:
+    - ModelConfig 부분: `6dcba548` + `d78d3956` — `engine/src/model_config.rs` L2 직속 격상 + `from_gguf_metadata` → `models/loader/gguf.rs::parse_model_config` 이전.
+    - Weight swap 부분: `5c698d79` — orchestrator 10 파일 (`swap_executor`/`async_swap`/`phase_aware_swap`/`intra_forward_swap`/`decider`/`incremental_plan`/`dynamic_k`/`probing_k`/`noise_table`/`release_worker`) `models/weights/` → `pressure/weights/` git mv + `LayerBoundaryHook` trait L2 격상(`engine/src/layer_boundary_hook.rs`). `weight_swap_handler.rs:22-25` LAYER-EXEMPT marker 2건 자연 해소.
+  - **PrefetchAccess + PreloadPool L2 격상** (3건) — **PARTIAL RESOLVED**:
+    - PreloadAccess trait inversion 적용 (`engine/src/pressure/offload/preload_pool.rs::pub trait PreloadAccess`, Sprint A `a9dcb5be` 시기).
+    - 잔여: `models/transformer.rs:2807`의 `PrefetchController` import marker(`§13.8-O offload-path trait bound + PrefetchController (offload 분리 backlog)`). preload_pool/prefetch의 L2 또는 inference 도메인 격상 + `forward_into_offload` 분리는 별 sprint backlog (아래 [P2] offload 분리 항목 참조).
+  - **KvCacheView trait** (3건) — **RESOLVED (`45bfd16f` B-5b-1b)**: `KVCacheOps` trait L2 격상 (`engine/src/kv_cache_ops.rs`), 외부 import path 일괄 재지향.
+- **잔존 marker 24건의 의미**: 본 RESOLVED는 *위반 zone 정책*의 RESOLVED — register 갱신과 동기화된 정합 marker 24건이 잔존 (pressure orchestrator 5 파일 LayerSlot/SecondaryMmap 임차 5건, transformer.rs ctor 위계 어긋남 17건, 기타 2건). 본질 해소(setup helper 이전, secondary backing trait inversion 등)는 별 sprint:
+  - [P2] transformer.rs ctor 위계 어긋남 본질 해소 (`arch/weights_pressure_split.md §7.4`) — 17건 marker → setup helper로 ctor 이전. ROI: marker ≈10건 감소. 추정 1일.
+  - [P2] SecondaryStore trait inversion (`arch/weights_pressure_split.md §7.5`) — V-09 `SecondaryMmapBytes` 패턴 확장.
+  - [P2] observability events trait inversion (`arch/weights_pressure_split.md §7.1`) — Sprint C 잔여.
+  - [P2] op_trace `DdrPhase`/`PhaseHook` L2 격상 (`arch/weights_pressure_split.md §7.2`).
+  - [P2] offload 분리 (preload_pool/prefetch L2 격상 + `forward_into_offload` 분리) — 갈래 2 잔여.
+- **참고 register**:
+  - `ARCHITECTURE.md` §13.8-O register V-24 (line 1755) — RESOLVED 상세 + register 갱신 이력 (line 1811).
+  - `arch/weights_pressure_split.md` Sprint C design doc + §7 별 sprint backlog 5건.
 
 ---
 

@@ -1,11 +1,25 @@
 # Handoff: precision swap §13.8-O 갈래 1 (WeightSwapDispatch trait 격상) 진입
 
+> **[STALE — 2026-05-26 Sprint C로 종결]** 본 문서는 grill 라운드 결과의 옵션 분석 산출물.
+> 이후 사용자 결정으로 **arch §6.3 방향(weight_swap 전체 `pressure/weights/`로 이전)** 채택,
+> Sprint B/B-fixup + Sprint C 시리즈가 다음 commit으로 실행되어 §13.8-O 갈래 1 RESOLVED:
+> - `6dcba548` refactor(model_config): Sprint B — ModelConfig L2 격상
+> - `d78d3956` refactor(model_config): Sprint B-fixup — from_gguf_metadata L3 이전
+> - `5c698d79` refactor(weights): Sprint C — pressure/weights/ 도메인 재배치 + LayerBoundaryHook L2 격상
+>
+> RESOLVED 상태:
+> - `ARCHITECTURE.md` §13.8-O register V-24 (line 1755): `Status — Weight swap 부분 RESOLVED (Sprint C)`
+> - `ARCHITECTURE.md` §O zone (line ~2130): `§O — Cross-L3 domain vocabulary zone: RESOLVED (2026-05-24, S-C3; Sprint C 2026-05-26 갱신)`
+> - `.agent/todos/backlog.md` `[RESOLVED] §13.8-O cross-L3 vocabulary trait inversion — 2026-05-26 종결`
+>
+> 본 문서가 제안한 *옵션 비교 분석*은 결정의 근거로 보존하되, **진입 대상이 아니며 후속 작업 없음**. 잔여 본질 해소 (transformer.rs ctor 17건, secondary backing trait inversion 등)는 `arch/weights_pressure_split.md §7` 별 sprint backlog 참조.
+
 **작성**: 2026-05-26
-**HEAD**: `f89f6669 Merge pull request #13 from hedone21/worktree-b5_trait_extension`
+**HEAD (작성 시점)**: `f89f6669 Merge pull request #13 from hedone21/worktree-b5_trait_extension`
 **브랜치 / Worktree**: `master`
 **작성자**: main session (grill-me skill 라운드)
 
-**다음 세션 진입 문장**: "precision swap 갈래 1 옵션 결정 후 진행"
+**~~다음 세션 진입 문장~~**: ~~"precision swap 갈래 1 옵션 결정 후 진행"~~ — Sprint C로 종결.
 
 ---
 
