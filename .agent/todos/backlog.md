@@ -4,14 +4,19 @@
 
 ---
 
-## [P2] §13.8-L hot path sub-trait 격상 — 2026-05-24 등록 (S-C1 후속)
-- **Status**: TODO (D-1 sprint S-C1 후 marker로 우회, 본질 격상 backlog 등록)
-- **선행**: `.agent/todos/handoff_inv_layer003_complete_2026_05_24.md` (D-1 sprint handoff)
-- **상세**: §13.8-L L-marker 75건 중 hot path 14건 (forward.rs/forward_gen.rs/attention.rs/llama_layer.rs)의 `as_any().downcast_ref::<*Backend>()` 패턴을 `OpenCLContext` / `CudaContext` / `QnnOppkgContext` sub-trait 격상으로 해소.
-- **API surface 추정**: OpenCLContext ~8 메서드 (queue, set_op_label, has_kivi_attn_kernel, is_nosub, gpu_score_acc, etc) + nested trait 3개 (Queue/GpuScoreAcc/Program).
-- **선행 작업**: Plan executor 추상화 — `plan.execute(ocl_backend, ...)` 함수 시그니처를 trait dispatch로 변경. 이게 본 sprint의 가장 큰 산.
-- **비용**: 3~5일. S25 Adreno OpenCL + Jetson CUDA + S25 qnn_oppkg 3종 bit-identical 디바이스 게이트 필수.
-- **연관**: 기존 `[P2] KiviCache hot path downcast resolve` 항목과 통합 처리 가능.
+## [P3] §13.8-L hot path sub-trait 격상 — 잔여 7건 (2026-05-26 P2→P3 강등, 리뷰 결과)
+- **Status**: TODO (P3) — 정책 RESOLVED + 1차 sprint(`b94e55ee`)로 강제 trigger 사유 해소. 잔여 marker는 정적, 새 추가 없으면 status quo로 충분.
+- **강등 사유 (리뷰 결정 2026-05-26)**: §13.8-L 정책 자체가 RESOLVED (`ARCHITECTURE.md` line 2120 `§L … RESOLVED (2026-05-24, S-C5 확장)`) + S-L-1/2/3 1차 sprint 종결 (`b94e55ee`, hot path marker 9→7). 잔여 7건의 baseline 효과 0 + transitive drag(PlanExecutor 8+ method + nested 3 trait + OpenCL queue trait 노출)이 3~5일로 ROI 최저. 동시 backlog의 generate 분할 / transformer.rs ctor 본질 해소 트랙이 더 ROI 큼.
+- **잔여 marker 7건 (handoff_inv_layer_L_hot_path_subtrait_2026_05_24.md §다음 작업 D)**:
+  - **PlanExecutor 군 (3건)**: `models/transformer.rs:1479` (forward_into) / `:2492` (execute_plan) / `:2739` (KIVI plan execute). `FullKernelPlan` struct가 `OpenCLBackend` concrete를 직접 받음 — trait 추상화 시 nested trait 3개(Queue/GpuScoreAcc/Program) 동반 노출 필요. 가장 큰 산.
+  - **flash_attention NEON fallback (1건)**: `layers/attention.rs:232`. 함수 안 backend downcast 분석 필요 (격상 가능성 미평가).
+  - **kivi raw queue (3건)**: `pressure/kivi_cache.rs:1811` (flush_residual_gpu) / `:2108` (assemble_view_gpu) / 기타. `get_cl_mem` + raw `ocl::core::enqueue_write_buffer` 직접 호출 — trait method 추출 시 OpenCL queue trait surface 노출 → backend abstraction 약화.
+- **재발동 트리거 조건** (자동 P2 승격):
+  - 새 GPU backend(Vulkan/WebGPU 등)가 production 진지 검토 → PlanExecutor 한정 sprint 발동
+  - hot path marker 7 → 10+ inflation
+  - paper figure / spec 가독성 사유로 사용자 명시 우선순위 부여
+- **연관**: 본 항목과 `[P3] KiviCache hot path downcast resolve` 항목은 통합 처리 가능 (잔여 위치 일부 중복).
+- **참고**: `papers/eurosys2027/` 또는 conversation log의 §13.8-L 리뷰(2026-05-26, review 스킬 산출물)에 옵션 비교 + 리스크 + DA Pass + 권고 보존.
 
 ## [RESOLVED] §13.8-O cross-L3 vocabulary trait inversion — 2026-05-26 종결
 - **Status**: RESOLVED — ARCHITECTURE.md `§O — Cross-L3 domain vocabulary zone: RESOLVED (2026-05-24, S-C3; Sprint C 2026-05-26 갱신)` (line ~2130).
@@ -148,17 +153,17 @@
 - **참고 파일**: `engine/src/buffer/rpcmem_alias_buffer.rs`, `engine/src/models/weights/rpcmem_secondary.rs::RpcmemLayerRegion::Drop`
 - **fix 방안 후보**: (a) explicit drop sequence (cl_mem all release → rpcmem_free), (b) reference count guard, (c) backend teardown 시 rpcmem region 명시 release
 
-## [P2] KiviCache hot path downcast resolve — 2026-05-24 등록 (backend extension sprint 후속)
-- **Status**: TODO (사용자 선택 C에 따라 본 sprint 취소, backlog 등록)
+## [P3] KiviCache hot path downcast resolve — 2026-05-24 등록 (backend extension sprint 후속) / 2026-05-26 P2→P3 강등
+- **Status**: TODO (P3) — §13.8-L 강등과 동기 (잔여 위치 일부 중복, 통합 처리 가능).
 - **선행**: `.agent/todos/handoff_backend_extension_2026_05_24.md` (HEAD `5be6c0d7`)
-- **상세**: `engine/src/pressure/kivi_cache.rs:1559/1842/2108` 3건 `as_any().downcast_ref::<OpenCLBackend>()` — KIVI 모드 진입 시 per-token × 16 layer 호출 (R2 게이트 hot path 확정).
+- **상세 (위치 정정 2026-05-26)**: 원래 `kivi_cache.rs:1559/1842/2108` 3건으로 등록되었으나 **`:1559`는 S-L-3 sub-sprint(`dde575b9`)에서 KiviAttentionBackend trait 격상으로 이미 해소**. 잔여는 2건: `:1842` (flush_residual_gpu, raw `ocl::core::enqueue_write_buffer` 호출) / `:2108` (assemble_view_gpu, 동일 패턴). 두 위치 모두 OpenCL queue handle을 trait surface로 노출해야 하므로 §13.8-L 잔여 7건 중 kivi raw queue 군과 본질 동일 sprint.
 - **제약**: `OpenCLBackend`는 Clone 미구현 + `Arc<dyn Backend>` → `Arc<OpenCLBackend>` Rust 기본 API 변환 불가. 단순 패턴 통일(`get_extension`)은 본 sprint 정책("hot path 보존")과 mismatch.
 - **fix 방안 후보**:
   - (B) `OpenCLBackend` self-ref Arc — `Arc::new_cyclic` + `self_weak: Weak<Self>` field 추가, `OpenCLBackend::new()` signature를 `-> Result<Arc<Self>>`로 변경. KiviCache는 `Option<Arc<OpenCLBackend>>` 보유. 영향 범위 큼 (호출지 5+곳 마이그레이션). cuda/qnn backend도 같은 패턴 따라야 일관성. 추정 1~2일.
   - (B') KiviCache 한정 unsafe raw pointer 보존 — `gpu_opencl_ptr: Option<*const OpenCLBackend>` + invariant guard (Arc<dyn Backend> alive). `unsafe impl Send/Sync` 필요. 추정 0.5일.
   - (E) 새 trait `KiviGpuOps` inversion (RpoenCL impl) — signature 변경. 추정 1일.
 - **실측 비용**: B-5b Phase 2 vtable Δ -0.231% / -0.018% 측정으로 string compare 비용도 ≈ 0 추정. **production 영향 매우 작음** (KIVI 모드 한정).
-- **우선순위 사유**: P2 — INV-LAYER-003 143건 해소가 ROI 더 큼. KIVI는 production 사용 빈도 낮고 vtable 비용 측정 0.
+- **강등 사유 (2026-05-26 리뷰 결정)**: 위 `[P3] §13.8-L hot path sub-trait 격상` 강등과 같은 논리 — 1차 sub-trait sprint로 trigger 사유 해소, 잔여는 정적, transitive drag 큼, production 영향 미미.
 
 ## [DROP — 2026-05-24] CpuBackend 생성 책임 통일 (DI 강화) — 2026-05-24 등록 / 2026-05-24 종결
 - **Status**: 부분 정리 완료 (3B Minimal, master `7df6c0b6`) — 나머지 작업은 ROI 0으로 평가, DROP 후보
