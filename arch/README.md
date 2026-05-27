@@ -46,10 +46,14 @@ spec/ 대응이 아닌 독립적인 feature 설계 문서:
 | `rpcmem_allocator.md` | RpcmemAllocator — `libcdsprpc.so` 단일 책임 모듈 (Sprint 2a Phase 2, ENG-RPCMEM-010~013) |
 | `opencl_backend.md` | OpenCLBackend `--opencl-rpcmem` wire-up + OpenCLMemory alloc_kv 분기 + RpcmemKvBuffer (Sprint 2a Phase 2, ENG-RPCMEM-020~024) |
 | `precision_swap.md` | RpcmemSecondaryStore allocator routing (fn-pointer → `Arc<RpcmemAllocator>`, 2-tier backend lookup) (Sprint 2a Phase 2, ENG-RPCMEM-030~033) |
+| `inference_pipeline.md` | **v1** — DecodeLoop SOLID 분해 + 빌더 (Phase 4-2/4-3/4-4-2.3 7-trait, 2026-05-16~25). Phase β 시점에 v2로 재작성 예정 (`pipeline_stage_design.md` 기준). |
+| `pipeline_stage_design.md` | **v3 메인** — DecodeLoop 단일 `PipelineStage` trait + `LifecyclePhase` enum + entry point별 `PipelineRegistry` 패턴 (2026-05-27, 23 라운드 grill). spec 대응: `spec/41-invariants.md` §3.28 (INV-DECODE-STAGE-001~007). |
 
 > **QNN OpPackage cdylib (M1, 2026-05-09)**: 별도 arch 파일 없이 `arch/30-engine.md` §16에 매핑. cdylib(`crates/qnn_oppkg/`)는 engine/manager/shared와 cargo dependency edge를 형성하지 않는 외부 산출물(INV-151). spec 대응: `spec/30-engine.md` 부록 A (ENG-QNN-010~C04, INV-151~155).
 
 > **Sprint 2a Phase 2 — RpcmemAllocator 분리 (2026-05-26)**: `--backend qnn_oppkg` 의 production-critical 가속 원천인 `libcdsprpc.so` 의존을 backend-agnostic 한 단일 책임 모듈로 격리. `--opencl-rpcmem` flag 활성 시 OpenCLBackend 가 KV cache + precision swap secondary 양쪽에서 동일 `Arc<RpcmemAllocator>` 를 사용. `libQnnGpu.so` / `libqnn_oppkg.so` dlopen 은 Sprint 2b 에서 backend 와 함께 제거. spec 대응: `spec/30-engine.md` 부록 E (ENG-RPCMEM-010~C04, INV-RPCMEM-001~008).
+
+> **DecodeLoop v3 Hook Pattern (2026-05-27)**: v2 7-trait 설계의 잔여 문제(R-2 EvictionStage 시그니처 부족, R-5 ResilienceStage 신설 결정점, God Ctx, Manager IPC wiring 격차, 신규 책임 추가 비용)를 단일 `PipelineStage` trait + `LifecyclePhase` enum + entry point별 `PipelineRegistry` 패턴으로 재설계. 23 라운드 grill 결정. Phase α/β/γ 3 단계 8~13주 작업. arch 대응: `pipeline_stage_design.md`. spec 대응: `spec/41-invariants.md` §3.28 (INV-DECODE-STAGE-001~007). Phase α 진입: `.agent/todos/handoff_pipeline_stage_design_2026_05_27.md`. `inference_pipeline.md` v2 재작성은 Phase β scope.
 
 ## 규칙
 
