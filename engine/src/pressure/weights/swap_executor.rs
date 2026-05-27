@@ -64,6 +64,7 @@ use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
 use crate::models::transformer::TransformerModel;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot/SecondaryMmap/SecondaryTensorInfo)
 use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (SecondaryTensorInfo, opencl path)
 #[cfg(feature = "opencl")]
 use crate::models::weights::SecondaryTensorInfo;
 use crate::pressure::weights::async_swap::AsyncSwapDispatcher;

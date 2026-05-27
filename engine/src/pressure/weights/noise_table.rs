@@ -212,6 +212,57 @@ impl QuantNoiseTable {
     }
 }
 
+/// Compute the per-layer quantization noise table for a freshly loaded model.
+///
+/// Pressure-side relocation of `compute_quant_noise_for_model` (formerly
+/// inference-side, §13.8-O 우선순위 #2 — design doc `arch/weights_pressure_split.md
+/// §7.4`).  The inference loader / test helpers call this *after* the
+/// `TransformerModel` ctor has installed the empty placeholder from
+/// [`super::setup::setup_runtime_resources`].
+///
+/// - `primary_slots` — the model's decoder `LayerSlot`s (typically
+///   `model.layers.as_slice()`).
+/// - `secondary` — when `None`, returns the empty table (no log).
+///
+/// On failure (no decoder layers / all-NaN per-layer ε), falls back to
+/// `QuantNoiseTable::uniform_ones(n)` with a warning log (ENG-ALG-216).
+pub fn compute_quant_noise(
+    primary_slots: &[Arc<LayerSlot>],
+    secondary: Option<&Arc<SecondaryMmap>>,
+) -> Arc<QuantNoiseTable> {
+    let secondary = match secondary {
+        Some(s) => s,
+        None => return Arc::new(QuantNoiseTable::empty()),
+    };
+
+    let n = primary_slots.len();
+    if n == 0 {
+        log::warn!("ε calc: no decoder layers — returning empty QuantNoiseTable");
+        return Arc::new(QuantNoiseTable::empty());
+    }
+
+    let table = QuantNoiseTable::new_from_frobenius(primary_slots, secondary);
+
+    if !table.is_computed() {
+        // new_from_frobenius returned with computed_at_init=false only
+        // when n==0, which we already handled above.
+        log::warn!("ε calc: new_from_frobenius returned fallback — using uniform_ones");
+        return Arc::new(QuantNoiseTable::uniform_ones(n));
+    }
+
+    // Check if all layers failed (all NaN) — ENG-ALG-216 "전체 실패" path.
+    let all_nan = table.as_slice().iter().all(|v| !v.is_finite());
+    if all_nan {
+        log::warn!(
+            "ε calc: all {} layers failed — falling back to uniform_ones",
+            n
+        );
+        Arc::new(QuantNoiseTable::uniform_ones(n))
+    } else {
+        Arc::new(table)
+    }
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Compute ε_t for a single tensor in a single layer.

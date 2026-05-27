@@ -24,6 +24,8 @@ use crate::layers::transformer_layer::{QkvBias, TransformerLayer};
 use crate::memory::Memory;
 use crate::model_config::ModelConfig;
 use crate::models::transformer::TransformerModel;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader uses pressure-owned runtime resource setup (위계 정합 방향, design doc §7.4)
+use crate::pressure::weights::setup_runtime_resources;
 use crate::tensor::Tensor;
 
 /// Runtime weight-load configuration.
@@ -543,14 +545,11 @@ pub fn load_model(
         weight_prefix: config.weight_prefix.clone(),
     };
 
-    // ENG-ALG-228 / ENG-DAT-100: spawn the async primary release worker once
-    // at model creation. The worker retains a clone of `backend` for
-    // diagnostic calls; `TransformerModel` owns the `Arc` so the worker
-    // outlives any `SwapExecutor` borrow.
-    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader creates pressure-owned resource via ctor
-    let release_worker = Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
-        backend.clone(),
-    ));
+    // ENG-ALG-228 / ENG-DAT-100: spawn the async primary release worker + empty
+    // ε table via the pressure-side setup helper (§13.8-O 우선순위 #2). The
+    // worker retains a clone of `backend`; `TransformerModel` owns the `Arc`s
+    // so they outlive any `SwapExecutor` borrow.
+    let runtime = setup_runtime_resources(backend.clone());
 
     Ok(TransformerModel {
         config: model_config,
@@ -568,8 +567,7 @@ pub fn load_model(
         // `TransformerModel::load_gguf_with_secondary` right after this
         // call, or left as empty when the caller builds the model directly
         // (e.g. tests). ENG-DAT-095, ENG-ALG-216.
-        // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader creates pressure-owned resource via ctor
-        quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
-        release_worker,
+        quant_noise: runtime.quant_noise,
+        release_worker: runtime.release_worker,
     })
 }

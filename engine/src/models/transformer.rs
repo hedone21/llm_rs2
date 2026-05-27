@@ -18,6 +18,8 @@ use crate::pressure::offload::preload_pool::PreloadAccess;
 use crate::pressure::offload::preload_pool::PreloadResult;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type-erased preload function
 use crate::pressure::offload::preload_pool::preload_erased;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader uses pressure-owned ε helper (위계 정합 방향, design doc §7.4)
+use crate::pressure::weights::compute_quant_noise;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -286,7 +288,8 @@ impl TransformerModel {
             crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
 
         // ENG-ALG-216: eager ε computation immediately after secondary mmap open.
-        model.quant_noise = compute_quant_noise_for_model(&model);
+        model.quant_noise =
+            compute_quant_noise(model.layers.as_slice(), model.secondary_mmap.as_ref());
 
         if std::env::var("LLMRS_MADV_DONTNEED").is_ok() {
             source.madvise_dontneed();
@@ -319,7 +322,8 @@ impl TransformerModel {
 
         let mut model =
             crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
-        model.quant_noise = compute_quant_noise_for_model(&model);
+        model.quant_noise =
+            compute_quant_noise(model.layers.as_slice(), model.secondary_mmap.as_ref());
         Ok(model)
     }
 
@@ -354,7 +358,8 @@ impl TransformerModel {
 
         // ENG-ALG-216: eager ε computation immediately after secondary mmap open.
         // `load_model` already stored the `Arc<SecondaryMmap>` on the model.
-        model.quant_noise = compute_quant_noise_for_model(&model);
+        model.quant_noise =
+            compute_quant_noise(model.layers.as_slice(), model.secondary_mmap.as_ref());
 
         // LLMRS_MADV_DONTNEED: after all weights are loaded (and GPU-uploaded by
         // load_model), advise the kernel that the file page cache is expendable.
@@ -3136,52 +3141,6 @@ impl TransformerModel {
 
 // ── ε computation helper ──────────────────────────────────────────────────────
 
-/// Build a `QuantNoiseTable` for the given model (ENG-ALG-216).
-///
-/// Called immediately after `load_model()` returns in `load_gguf_with_secondary`.
-/// When `model.secondary_mmap` is `None` the empty table is returned without
-/// log output.  On complete failure the fallback `uniform_ones` table is
-/// returned and a warning is emitted.
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference function creates pressure-owned resource via ctor
-fn compute_quant_noise_for_model(
-    model: &TransformerModel,
-) -> Arc<crate::pressure::weights::QuantNoiseTable> {
-    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference owner accepts pressure-owned resource via ctor
-    use crate::pressure::weights::QuantNoiseTable;
-
-    let secondary = match model.secondary_mmap.as_ref() {
-        Some(s) => s,
-        None => return Arc::new(QuantNoiseTable::empty()),
-    };
-
-    let n = model.layers.len();
-    if n == 0 {
-        log::warn!("ε calc: no decoder layers — returning empty QuantNoiseTable");
-        return Arc::new(QuantNoiseTable::empty());
-    }
-
-    let table = QuantNoiseTable::new_from_frobenius(model.layers.as_slice(), secondary);
-
-    if !table.is_computed() {
-        // new_from_frobenius returned with computed_at_init=false only
-        // when n==0, which we already handled above.
-        log::warn!("ε calc: new_from_frobenius returned fallback — using uniform_ones");
-        return Arc::new(QuantNoiseTable::uniform_ones(n));
-    }
-
-    // Check if all layers failed (all NaN) — ENG-ALG-216 "전체 실패" path.
-    let all_nan = table.as_slice().iter().all(|v| !v.is_finite());
-    if all_nan {
-        log::warn!(
-            "ε calc: all {} layers failed — falling back to uniform_ones",
-            n
-        );
-        Arc::new(QuantNoiseTable::uniform_ones(n))
-    } else {
-        Arc::new(table)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3246,6 +3205,7 @@ mod tests {
             weight_prefix: String::new(),
         };
 
+        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3258,10 +3218,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
-                cpu_be.clone(),
-            )),
+            quant_noise: runtime.quant_noise.clone(),
+            release_worker: runtime.release_worker.clone(),
         };
         (model, cpu_be)
     }
@@ -3398,6 +3356,7 @@ mod tests {
         };
 
         let lm_head = norm.clone();
+        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3410,10 +3369,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
-                cpu_be.clone(),
-            )),
+            quant_noise: runtime.quant_noise.clone(),
+            release_worker: runtime.release_worker.clone(),
         };
 
         // Gather token 0 → should be [1.0, 1.0], then scale → [2.0, 2.0]
@@ -3512,6 +3469,7 @@ mod tests {
             weight_prefix: String::new(),
         };
 
+        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3524,10 +3482,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
-                cpu_be.clone(),
-            )),
+            quant_noise: runtime.quant_noise.clone(),
+            release_worker: runtime.release_worker.clone(),
         };
 
         // Gather tokens [1, 6]
@@ -3616,6 +3572,7 @@ mod tests {
             weight_prefix: String::new(),
         };
 
+        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3628,10 +3585,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
-                cpu_be.clone(),
-            )),
+            quant_noise: runtime.quant_noise.clone(),
+            release_worker: runtime.release_worker.clone(),
         };
 
         let idx_buf = mem.alloc(4, DType::F32).unwrap();
@@ -3696,6 +3651,7 @@ mod tests {
             weight_prefix: String::new(),
         };
 
+        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3708,10 +3664,8 @@ mod tests {
             preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: Arc::new(crate::pressure::weights::QuantNoiseTable::empty()),
-            release_worker: Arc::new(crate::pressure::weights::PrimaryReleaseWorker::spawn(
-                cpu_be.clone(),
-            )),
+            quant_noise: runtime.quant_noise.clone(),
+            release_worker: runtime.release_worker.clone(),
         };
         (model, cpu_be)
     }

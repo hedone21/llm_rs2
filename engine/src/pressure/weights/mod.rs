@@ -18,6 +18,7 @@ pub mod noise_table;
 pub mod phase_aware_swap;
 pub mod probing_k;
 pub mod release_worker;
+pub mod setup;
 pub mod swap_executor;
 
 pub use async_swap::{AsyncSwapDispatcher, SwapCommitJob, SwapJob};
@@ -25,10 +26,11 @@ pub use decider::{SwapAlgorithm, SwapDecision, WeightSwapDecider, compute_qcf_we
 pub use dynamic_k::DynamicKController;
 pub use incremental_plan::IncrementalSwapPlan;
 pub use intra_forward_swap::{IntraForwardSwapHook, IntraForwardSwapPlan};
-pub use noise_table::QuantNoiseTable;
+pub use noise_table::{QuantNoiseTable, compute_quant_noise};
 pub use phase_aware_swap::{PhaseAwareSwapDispatcher, WeightChunk};
 pub use probing_k::{GrowthMode, ProbingKController};
 pub use release_worker::PrimaryReleaseWorker;
+pub use setup::{RuntimeResources, setup_runtime_resources};
 pub use swap_executor::{
     StageBreakdown, SwapError, SwapExecutor, SwapReport, SwappedLayer, dtype_tag_to_dtype,
 };
