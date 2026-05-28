@@ -1081,6 +1081,7 @@ def _build_stub_so(log_fn) -> None:
             return
 
     src = "/tmp/libggml_hexagon_stub.c"
+    # D2 fix: htpdrv_init() 도 override 하여 libggml-hexagon.so 내부 init 경로까지 차단
     stub_c = """
 #include <stddef.h>
 typedef void* ggml_backend_reg_t;
@@ -1098,6 +1099,7 @@ static ggml_backend_dev_t _dev(ggml_backend_reg_t r, size_t i) { (void)r; (void)
 static void* _proc(ggml_backend_reg_t r, const char* n) { (void)r; (void)n; return NULL; }
 static ggml_backend_reg_s _stub = { .iface = { _name, _count, _dev, _proc }, .context = NULL };
 ggml_backend_reg_t ggml_backend_hexagon_reg(void) { return (ggml_backend_reg_t)&_stub; }
+int htpdrv_init(void) { return 0; }
 """
     Path(src).write_text(stub_c)
     r = subprocess.run(
