@@ -172,6 +172,26 @@ name = "microbench_htp_get_rows"
 path = "microbench/htp_get_rows.rs"
 
 [[bin]]
+name = "microbench_htp_matmul_f16"
+path = "microbench/htp_matmul_f16.rs"
+
+[[bin]]
+name = "microbench_htp_add_f16"
+path = "microbench/htp_add_f16.rs"
+
+[[bin]]
+name = "microbench_htp_mul_f16"
+path = "microbench/htp_mul_f16.rs"
+
+[[bin]]
+name = "microbench_htp_silu_f16"
+path = "microbench/htp_silu_f16.rs"
+
+[[bin]]
+name = "microbench_htp_flash_attn_ext"
+path = "microbench/htp_flash_attn_ext.rs"
+
+[[bin]]
 name = "microbench_htp_opencl_interop"
 path = "microbench/htp_opencl_interop.rs"
 
