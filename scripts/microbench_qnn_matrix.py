@@ -59,6 +59,8 @@ DEVICE_BIN_DIR = "/data/local/tmp"
 DEVICE_QNN_LIBDIR = "/data/local/tmp/qnn"
 DEVICE_WORK_DIR = "/data/local/tmp"
 DEVICE_EXECUTORCH_DIR = "/data/local/tmp/executorch"
+# D2 fix: HTP0 selective disable stub (CPU/GPU 단독 실행 시 unsigned PD error 방지)
+LCPP_STUB_SO = "libggml-hexagon-stub.so"
 
 HOST_LCPP_DIR = Path("/home/go/Workspace/llama.cpp/build-snapdragon/bin")
 
@@ -688,6 +690,16 @@ def _lcpp_cells(backend_key: str) -> List[FullCell]:
     flag = {"lcpp.cpu": "CPU", "lcpp.gpu": "GPUOpenCL", "lcpp.htp": "HTP0"}[backend_key]
     is_htp = (backend_key == "lcpp.htp")
 
+    # D2 fix: CPU/GPU 단독 실행 시 libggml-hexagon.so 가 NEEDED 로 load 되면서
+    # ggml_backend_hexagon_reg() → htpdrv_init() → session create → unsigned PD error abort.
+    # LD_PRELOAD stub 으로 ggml_backend_hexagon_reg() + htpdrv_init() 을 override 하여 차단.
+    # HTP 는 device_init_failed ⚠ 셀이므로 stub 불필요.
+    stub_env: dict = (
+        {"LD_PRELOAD": f"{DEVICE_BIN_DIR}/{LCPP_STUB_SO}"}
+        if not is_htp
+        else {}
+    )
+
     for dtype in ("f16", "q4_0"):
         for op in ALL_OPS:
             if dtype == "q4_0" and op in ACTIVATION_ONLY_OPS:
@@ -726,6 +738,7 @@ def _lcpp_cells(backend_key: str) -> List[FullCell]:
                         bin_dir=DEVICE_BIN_DIR,
                         args=["perf", "-o", "MUL_MAT", "-b", flag,
                               "-p", f"n=1,k=14336"],
+                        env=stub_env,
                         latency_pattern=r"([\d.]+)\s*us/run",
                         latency_unit="us",
                         tol_max_abs=5e-2 if dtype == "q4_0" else 1e-2,
@@ -742,6 +755,7 @@ def _lcpp_cells(backend_key: str) -> List[FullCell]:
                     bin_name="test-backend-ops",
                     bin_dir=DEVICE_BIN_DIR,
                     args=["perf", "-o", lcpp_op, "-b", flag],
+                    env=stub_env,
                     latency_pattern=r"([\d.]+)\s*us/run",
                     latency_unit="us",
                     tol_max_abs=1e-2,
@@ -834,18 +848,35 @@ class TrialResult:
 
 
 _LAT_PATTERNS = [
+    # JSON structured output (ms 직접 반환)
     ("json_latency_ms", lambda s: _parse_json_field(s, "latency_ms")),
     ("json_median_ns",  lambda s: _ns_to_ms(_parse_json_field(s, "median_ns"))),
     ("json_median_ms",  lambda s: _parse_json_field(s, "median_ms")),
+    # ms 단위 평문 패턴
     ("latency_re", lambda s: _parse_regex(s, r"latency[:\s]+([\d.]+)\s*ms")),
     ("median_re",  lambda s: _parse_regex(s, r"median[:\s]+([\d.]+)\s*ms")),
     ("tbt_re",     lambda s: _parse_regex(s, r"tbt[:\s]+([\d.]+)\s*ms")),
+    # us 단위 평문 패턴 → ms 변환 (D3 fix: ours.htp F16 bins 출력 형식)
+    # 형식: "mean=97.27 us" / "HTP F16: mean=211.80 us" / "97.27 us/op"
+    # last-match: stdout에 CPU baseline(앞) + HTP(뒤) 순서이므로 마지막 값이 NPU 결과
+    ("mean_us_re",   lambda s: _us_to_ms(_parse_regex_last(s, r"mean=([\d.]+)\s*(?:us|μs|µs)"))),
+    ("median_us_re", lambda s: _us_to_ms(_parse_regex_last(s, r"median=([\d.]+)\s*(?:us|μs|µs)"))),
+    ("xus_op_re",    lambda s: _us_to_ms(_parse_regex_last(s, r"([\d.]+)\s*(?:us|μs|µs)/op"))),
+    ("xus_run_re",   lambda s: _us_to_ms(_parse_regex_last(s, r"([\d.]+)\s*(?:us|μs|µs)/run"))),
+    # ns 단위 평문 패턴 → ms 변환 (방어적)
+    ("mean_ns_re",   lambda s: _ns_to_ms(_parse_regex_last(s, r"mean=([\d.]+)\s*ns"))),
+    ("median_ns_re", lambda s: _ns_to_ms(_parse_regex_last(s, r"median=([\d.]+)\s*ns"))),
+    # 최후 fallback (ms 단위 숫자)
     ("any_ms_re",  lambda s: _parse_regex(s, r"([\d.]+)\s*ms")),
 ]
 
 
 def _ns_to_ms(v: Optional[float]) -> Optional[float]:
     return v / 1e6 if v is not None else None
+
+
+def _us_to_ms(v: Optional[float]) -> Optional[float]:
+    return v / 1e3 if v is not None else None
 
 
 def _parse_json_field(s: str, key: str) -> Optional[float]:
@@ -872,36 +903,56 @@ def _parse_regex(s: str, pat: str) -> Optional[float]:
     return None
 
 
+def _parse_regex_last(s: str, pat: str) -> Optional[float]:
+    """re.findall로 모든 매칭을 찾고 마지막 값을 반환.
+
+    stdout에 CPU baseline + HTP 결과가 순서대로 나올 때
+    마지막 값이 HTP(NPU) 결과이므로 last-match가 정확하다.
+    """
+    matches = re.findall(pat, s, flags=re.IGNORECASE)
+    if matches:
+        try:
+            return float(matches[-1])
+        except Exception:
+            return None
+    return None
+
+
 def parse_trial_output(
     stdout: str,
     custom_pattern: Optional[str] = None,
     latency_unit: str = "ms",
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Returns (latency_ms, max_abs_err, cosine)."""
-    lat_raw = None
+    """Returns (latency_ms, max_abs_err, cosine).
+
+    custom_pattern hit → lat_raw은 raw 값(latency_unit 단위)이므로 변환 적용.
+    _LAT_PATTERNS fallback hit → 이미 ms로 정규화된 값이므로 변환 skip.
+    """
+    lat_ms = None
+
     if custom_pattern:
         lat_raw = _parse_regex(stdout, custom_pattern)
+        if lat_raw is not None:
+            # custom_pattern은 cell.latency_unit 단위 → ms 변환
+            if latency_unit == "ns":
+                lat_ms = lat_raw / 1e6
+            elif latency_unit == "us":
+                lat_ms = lat_raw / 1e3
+            else:
+                lat_ms = lat_raw
 
-    if lat_raw is None:
+    if lat_ms is None:
+        # _LAT_PATTERNS는 모두 ms 단위로 정규화된 값을 반환 → 변환 불필요
         for _, fn in _LAT_PATTERNS:
             v = fn(stdout)
             if v is not None:
-                lat_raw = v
+                lat_ms = v
                 break
-
-    # 단위 변환 → ms
-    lat_ms = None
-    if lat_raw is not None:
-        if latency_unit == "ns":
-            lat_ms = lat_raw / 1e6
-        elif latency_unit == "us":
-            lat_ms = lat_raw / 1e3
-        else:
-            lat_ms = lat_raw
 
     err = _parse_json_field(stdout, "max_abs_err")
     if err is None:
-        err = _parse_regex(stdout, r"max[_\s]abs[_\s]err[:\s]+([\d.eE+-]+)")
+        # D4 fix: '=' 도 구분자로 허용 (stdout 형식: max_abs_err=3.537e-2)
+        err = _parse_regex(stdout, r"max[_\s]abs[_\s]err[=:\s]+([\d.eE+-]+)")
     cos = _parse_json_field(stdout, "cosine")
     if cos is None:
         cos = _parse_regex(stdout, r"cosine[:\s]+([\d.eE+-]+)")
