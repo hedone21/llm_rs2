@@ -609,3 +609,43 @@ driver `build_full_matrix_cells()` 기준 집계 (2026-05-28):
 - [x] Phase entry points (P1a/b/c/d/P2) 매핑
 - [x] 추가 리스크 8건 표면화
 - [x] cell_inventory.md 분리 작성 책임 명시 (다음 산출물)
+
+---
+
+## §P4 Phase B 결함 기록 (2026-05-28)
+
+### D7 — lcpp.{cpu,gpu} ROPE F16 300s timeout
+
+**증상**: `lcpp_cpu_ROPE_f16`, `lcpp_gpu_ROPE_f16` 2 cell이 test-backend-ops perf 실행 시 hang 또는
+300s 초과 → driver SIGKILL 강제 종료. stdout 비어있음. 13 round × 300s = 65분 낭비.
+
+**원인**: test-backend-ops ROPE perf case가 head_dim 분배 또는 dynamic shape sweep 시 매우 비효율적.
+upstream (llama.cpp) 측 이슈. `_LCPP_F16_F32_FALLBACK` 에 ROPE 가 포함돼 있어 f16 dtype 도 F32 path 로 실행되는데,
+ROPE F32 perf sweep가 특정 shape 조합에서 hang.
+
+**Fix**: `_LCPP_PERF_TIMEOUT = {("ROPE", "f16")}` 추가 → `_lcpp_cells()` status 로직에
+`(op, dtype) in _LCPP_PERF_TIMEOUT` 체크를 `is_htp` 바로 다음에 추가.
+
+**영향 cell**: lcpp.cpu ROPE F16 + lcpp.gpu ROPE F16 = **2 cell → `⚠ lcpp_perf_timeout`** (measurable=0).
+
+### D8 — ours.gpu MUL_MAT driver-bin filter contract mismatch
+
+**증상**: `ours_gpu_MUL_MAT_{f16,q4_0}_{mm_ffn,mm_lmh,mm_qkv}` **6 cell** RED.
+driver stdout에 latency JSON 없음 → `N/A` 집계.
+
+**원인**: driver `_ours_gpu_cells()` 가 `--ops MUL_MAT_Q4_0_MM_FFN` (narrow cell_id 형식)을 보냈으나,
+bin `should_run()` 이 `cell_id.starts_with(filter)` 비교 → filter=`"MUL_MAT_Q4_0_MM_FFN"`, cell_prefix=`"MUL_MAT_Q4_0"` →
+`"MUL_MAT_Q4_0".starts_with("MUL_MAT_Q4_0_MM_FFN")` = **false** (방향 역전).
+
+**Fix**: 3-인자 명시 protocol 도입 (`--op X --dtype Y [--shape Z]`):
+- Driver: `args=["--op", op, "--dtype", dtype, "--shape", sid]` (MUL_MAT) / `["--op", op, "--dtype", dtype]` (단일-shape op).
+- Bin: `ExplicitFilter { op, dtype, shape }` 구조체 + `matches()` 메서드 (대소문자 무관 exact match).
+  `should_run` 클로저: explicit 우선, 없으면 legacy `--ops` prefix 매칭 (backward-compat).
+
+**영향 cell**: ours.gpu MUL_MAT F16 × 3 shape + Q4_0 × 3 shape = **6 cell 회복 (+ → 측정 가능)**.
+F16 row도 동일 mismatch이므로 6 cell 모두 영향 확인.
+
+**변경 파일**:
+- `scripts/microbench_qnn_matrix.py` — `_ours_gpu_cells()` args 수정 + `_LCPP_PERF_TIMEOUT` + `_lcpp_cells()` 체크.
+- `engine/microbench/opencl_op_matrix.rs` — `ExplicitFilter` 구조체 + `should_run_legacy()` + `should_run` 클로저 교체.
+  legacy `--ops` backward-compat 보존 (bin 단독 실행 시 `--ops MUL_MAT_F16` 여전히 동작).

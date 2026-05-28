@@ -951,10 +951,45 @@ mod bench {
 
     // ── filter helper ─────────────────────────────────────────────────────────
 
-    fn should_run(filter: &Option<Vec<String>>, cell_id: &str) -> bool {
+    /// 명시적 3-인자 필터 (--op / --dtype / --shape).
+    /// 셋 중 지정된 것만 매칭 (None = 와일드카드).
+    struct ExplicitFilter {
+        op: Option<String>,
+        dtype: Option<String>,
+        shape: Option<String>,
+    }
+
+    impl ExplicitFilter {
+        fn matches(&self, op: &str, dtype: &str, shape: &str) -> bool {
+            self.op
+                .as_ref()
+                .map(|f| f.eq_ignore_ascii_case(op))
+                .unwrap_or(true)
+                && self
+                    .dtype
+                    .as_ref()
+                    .map(|f| f.eq_ignore_ascii_case(dtype))
+                    .unwrap_or(true)
+                && self
+                    .shape
+                    .as_ref()
+                    .map(|f| f.eq_ignore_ascii_case(shape))
+                    .unwrap_or(true)
+        }
+
+        fn any_set(&self) -> bool {
+            self.op.is_some() || self.dtype.is_some() || self.shape.is_some()
+        }
+    }
+
+    /// 레거시 --ops prefix 필터 (backward-compat: 인자 없을 때 전체 실행).
+    fn should_run_legacy(filter: &Option<Vec<String>>, cell_prefix: &str) -> bool {
         match filter {
             None => true,
-            Some(ops) => ops.iter().any(|op| cell_id.starts_with(op.as_str())),
+            // driver 가 보내는 값이 cell_prefix 보다 길거나 같을 수 있으므로 양방향 prefix 매칭.
+            Some(ops) => ops
+                .iter()
+                .any(|op| cell_prefix.starts_with(op.as_str()) || op.starts_with(cell_prefix)),
         }
     }
 
@@ -963,11 +998,48 @@ mod bench {
     pub fn run() -> anyhow::Result<()> {
         let args: Vec<String> = std::env::args().collect();
 
-        let filter: Option<Vec<String>> = args
+        // 명시적 3-인자 필터 파싱 (D8 fix: driver 가 --op X --dtype Y --shape Z 를 보낸다)
+        let explicit = ExplicitFilter {
+            op: args
+                .iter()
+                .position(|a| a == "--op")
+                .and_then(|i| args.get(i + 1))
+                .cloned(),
+            dtype: args
+                .iter()
+                .position(|a| a == "--dtype")
+                .and_then(|i| args.get(i + 1))
+                .cloned(),
+            shape: args
+                .iter()
+                .position(|a| a == "--shape")
+                .and_then(|i| args.get(i + 1))
+                .cloned(),
+        };
+
+        // 레거시 --ops (backward-compat: --ops 없고 explicit 도 없으면 전체 실행)
+        let legacy_filter: Option<Vec<String>> = args
             .iter()
             .position(|a| a == "--ops")
             .and_then(|i| args.get(i + 1))
             .map(|s| s.split(',').map(|x| x.to_string()).collect());
+
+        // should_run: explicit 우선, 없으면 legacy --ops, 둘 다 없으면 전체 실행
+        let should_run = |op: &str, dtype: &str, shape: &str| -> bool {
+            if explicit.any_set() {
+                explicit.matches(op, dtype, shape)
+            } else {
+                // legacy: cell_prefix = "{OP}_{DTYPE}" 또는 "{OP}_{DTYPE}_{SHAPE}"
+                let cell_prefix_base = format!("{}_{}", op, dtype.to_uppercase());
+                let cell_prefix_shape = if shape.is_empty() || shape == op {
+                    cell_prefix_base.clone()
+                } else {
+                    format!("{}_{}", cell_prefix_base, shape.to_uppercase())
+                };
+                should_run_legacy(&legacy_filter, &cell_prefix_base)
+                    || should_run_legacy(&legacy_filter, &cell_prefix_shape)
+            }
+        };
 
         let ctx = init()?;
 
@@ -976,45 +1048,49 @@ mod bench {
         println!("# cell_id: ours.gpu.<OP>.<DTYPE>[.<shape_id>]");
 
         // ── MUL_MAT F16 ──────────────────────────────────────────────────────
-        if should_run(&filter, "MUL_MAT_F16") {
+        if should_run("MUL_MAT", "f16", "mm_ffn") {
             eprintln!("# MUL_MAT F16 mm_ffn K={} N={}", DIM, FFN_DIM);
             bench_mul_mat_f16(&ctx, "ours.gpu.MUL_MAT.F16.mm_ffn", DIM, FFN_DIM)?;
-
+        }
+        if should_run("MUL_MAT", "f16", "mm_lmh") {
             eprintln!("# MUL_MAT F16 mm_lmh K={} N={}", DIM, VOCAB);
             bench_mul_mat_f16(&ctx, "ours.gpu.MUL_MAT.F16.mm_lmh", DIM, VOCAB)?;
-
+        }
+        if should_run("MUL_MAT", "f16", "mm_qkv") {
             let qkv_n = N_HEADS_Q * HEAD_DIM + 2 * N_HEADS_KV * HEAD_DIM; // 2048
             eprintln!("# MUL_MAT F16 mm_qkv K={} N={}", DIM, qkv_n);
             bench_mul_mat_f16(&ctx, "ours.gpu.MUL_MAT.F16.mm_qkv", DIM, qkv_n)?;
         }
 
         // ── MUL_MAT Q4_0 ─────────────────────────────────────────────────────
-        if should_run(&filter, "MUL_MAT_Q4_0") {
+        if should_run("MUL_MAT", "q4_0", "mm_ffn") {
             eprintln!("# MUL_MAT Q4_0 mm_ffn K={} N={}", DIM, FFN_DIM);
             bench_mul_mat_q4_0(&ctx, "ours.gpu.MUL_MAT.Q4_0.mm_ffn", DIM, FFN_DIM)?;
-
+        }
+        if should_run("MUL_MAT", "q4_0", "mm_lmh") {
             eprintln!("# MUL_MAT Q4_0 mm_lmh K={} N={}", DIM, VOCAB);
             bench_mul_mat_q4_0(&ctx, "ours.gpu.MUL_MAT.Q4_0.mm_lmh", DIM, VOCAB)?;
-
+        }
+        if should_run("MUL_MAT", "q4_0", "mm_qkv") {
             let qkv_n = N_HEADS_Q * HEAD_DIM + 2 * N_HEADS_KV * HEAD_DIM;
             eprintln!("# MUL_MAT Q4_0 mm_qkv K={} N={}", DIM, qkv_n);
             bench_mul_mat_q4_0(&ctx, "ours.gpu.MUL_MAT.Q4_0.mm_qkv", DIM, qkv_n)?;
         }
 
         // ── RMS_NORM F16 ─────────────────────────────────────────────────────
-        if should_run(&filter, "RMS_NORM_F16") {
+        if should_run("RMS_NORM", "f16", "") {
             eprintln!("# RMS_NORM F16 dim={}", DIM);
             bench_rms_norm(&ctx, "ours.gpu.RMS_NORM.F16", DIM)?;
         }
 
         // ── ROPE F16 ─────────────────────────────────────────────────────────
-        if should_run(&filter, "ROPE_F16") {
+        if should_run("ROPE", "f16", "") {
             eprintln!("# ROPE F16 n_heads={} head_dim={}", N_HEADS_Q, HEAD_DIM);
             bench_rope(&ctx, "ours.gpu.ROPE.F16")?;
         }
 
         // ── FLASH_ATTN_EXT F16 ───────────────────────────────────────────────
-        if should_run(&filter, "FLASH_ATTN_EXT_F16") {
+        if should_run("FLASH_ATTN_EXT", "f16", "") {
             eprintln!(
                 "# FLASH_ATTN_EXT F16 hs=128 nh={} nkv={} ctx={}",
                 N_HEADS_Q, N_HEADS_KV, CTX_LEN
@@ -1032,7 +1108,7 @@ mod bench {
         }
 
         // ── GET_ROWS F16 ─────────────────────────────────────────────────────
-        if should_run(&filter, "GET_ROWS_F16") {
+        if should_run("GET_ROWS", "f16", "") {
             eprintln!("# GET_ROWS F16 vocab={} dim={}", VOCAB, DIM);
             match bench_get_rows(&ctx, "ours.gpu.GET_ROWS.F16") {
                 Ok(()) => {}
@@ -1047,7 +1123,7 @@ mod bench {
         }
 
         // ── SILU F16 ─────────────────────────────────────────────────────────
-        if should_run(&filter, "SILU_F16") {
+        if should_run("SILU", "f16", "") {
             eprintln!("# SILU F16 (silu_mul fused) dim={}", FFN_DIM);
             bench_silu_mul(&ctx, "ours.gpu.SILU.F16", FFN_DIM)?;
         }
@@ -1055,39 +1131,39 @@ mod bench {
         // ── MUL F16 ──────────────────────────────────────────────────────────
         // Production uses the same fused silu_mul kernel for gate×up (SiLU on gate, MUL).
         // Standalone MUL latency = same kernel dispatch with a different cell_id.
-        if should_run(&filter, "MUL_F16") {
+        if should_run("MUL", "f16", "") {
             eprintln!("# MUL F16 dim={}", FFN_DIM);
             bench_silu_mul(&ctx, "ours.gpu.MUL.F16", FFN_DIM)?;
         }
 
         // ── ADD F16 ──────────────────────────────────────────────────────────
-        if should_run(&filter, "ADD_F16") {
+        if should_run("ADD", "f16", "") {
             eprintln!("# ADD F16 dim={}", DIM);
             bench_add(&ctx, "ours.gpu.ADD.F16", DIM)?;
         }
 
         // ── SOFT_MAX F16 ─────────────────────────────────────────────────────
-        if should_run(&filter, "SOFT_MAX_F16") {
+        if should_run("SOFT_MAX", "f16", "") {
             eprintln!("# SOFT_MAX F16 shape=[{},1,{}]", N_HEADS_Q, CTX_LEN);
             bench_softmax(&ctx, "ours.gpu.SOFT_MAX.F16", N_HEADS_Q, CTX_LEN)?;
         }
 
         // ── SCALE F16 ────────────────────────────────────────────────────────
-        if should_run(&filter, "SCALE_F16") {
+        if should_run("SCALE", "f16", "") {
             let total = N_HEADS_Q * CTX_LEN;
             eprintln!("# SCALE F16 total={}", total);
             bench_scale(&ctx, "ours.gpu.SCALE.F16", total)?;
         }
 
         // ── CPY F16 ──────────────────────────────────────────────────────────
-        if should_run(&filter, "CPY_F16") {
+        if should_run("CPY", "f16", "") {
             let n_elem = 2 * HEAD_DIM; // [2, 1, head_dim]
             eprintln!("# CPY F16 (F32→F16) n_elem={}", n_elem);
             bench_cpy(&ctx, "ours.gpu.CPY.F16", n_elem)?;
         }
 
         // ── SET_ROWS F16 ─────────────────────────────────────────────────────
-        if should_run(&filter, "SET_ROWS_F16") {
+        if should_run("SET_ROWS", "f16", "") {
             eprintln!(
                 "# SET_ROWS F16 n_kv={} head_dim={} cap={}",
                 N_HEADS_KV, HEAD_DIM, CTX_LEN
