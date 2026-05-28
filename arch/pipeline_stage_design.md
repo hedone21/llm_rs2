@@ -1,6 +1,6 @@
 # Pipeline Stage Design — DecodeLoop v3 (Hook Pattern)
 
-> **상태**: 설계 finalize 2026-05-27 → **2026-05-28 본 grill 12 결정 반영** (KvBundle/WeightBundle trait 폐기 + KVCacheLayer/WeightLayer trait + ctx 5→3 field + KV dispatch Generic→Trait object). 단일 진실원본.
+> **상태**: 설계 finalize 2026-05-27 → **2026-05-28 본 grill 12 결정 + 후속 2 결정 반영** → **2026-05-28~29 본 sub-grill 4 결정 + 갈래 B 메타 결정 반영** (KvBundle/WeightBundle trait 폐기 + KVCacheLayer/WeightLayer trait + ctx 5→2 field + KV dispatch Generic→Trait object + StorageSpec 폐기 + 3-tier Stage 패턴 + Stage cardinality 자유 + Score 도메인 별 sprint + KVCacheView dtype 폐기). 단일 진실원본.
 > **선행 문서**: `arch/inference_pipeline.md` v1 (Phase 4-2/4-3/4-4-2.3 — `Forward / EvictionStage / SwapStage / CommandSource / TokenSampler / DecodeObserver` 7-trait 설계). 본 문서는 v1을 단일 PipelineStage trait + lifecycle phase enum + entry point별 PipelineRegistry 패턴으로 재설계한다.
 > **선행 후속 관계**: `arch/inference_pipeline.md` v2는 본 문서 기준으로 Phase β scope에서 재작성된다. 본 sprint 외 별 sprint.
 > **본 sprint에서 풀지 않은 결정점**: Q24 sub-trait 4종 (`KVCacheView` / `WeightLayerView` / `SecondaryStore` / `SparsePattern` / `StorageSpec`)의 시그니처 detail. Phase α-W 작업 일부로 통합 (별 sprint X — KVCacheLayer/WeightLayer trait 채택으로 작업 자연 통합).
@@ -22,14 +22,176 @@
 
 ---
 
-## 0. TL;DR
+## 0. Executive Overview (2026-05-29 신설)
+
+> **외부 explorer 진입점**. 본 절은 standalone 으로 읽혀도 본 sprint 의 전체 그림을 파악할 수 있도록 작성되었다. 본문 §1 이하는 결정의 세부 근거와 sub-trait detail 을 담는다.
+
+### 0.1 본 sprint 미션 (1단락)
+
+본 sprint 는 `DecodeLoop` v2 7-trait 설계의 잔여 문제 (R-2 EvictionStage 시그니처 부족 / R-5 ResilienceStage 신설 결정점 미해결 / God Ctx 12·21 필드 / Manager IPC wiring 격차 / 신규 책임 추가 OCP 위반) 를 **단일 `PipelineStage` trait + `LifecyclePhase` enum + entry point별 `PipelineRegistry`** 패턴으로 재설계한다. 본 grill (2026-05-27 23 라운드 → 2026-05-28 본 grill 12 결정 + 후속 2 결정) 결과: (1) **KvBundle/WeightBundle trait 폐기** (god abstraction 회피), (2) **KVCacheLayer/WeightLayer trait + interior mutability** ((γ) 모델, LayerSlot::rcu_weights 자연 확장), (3) **PipelineStage register 시점 `Arc<dyn KVCacheLayer>` / `Arc<dyn WeightLayer>` 보관**, (4) **`StageContext` 2 field 슬림** (`step` / `profiler`). 본 sub-grill (2026-05-28~29) 추가 결정: (5) **3-tier Stage 패턴** (Primitive-only / Paradigm-specific / Cross-paradigm — 의도적 비대칭 인정), (6) **Stage cardinality 자유** (1/N/0 layer), (7) **Score 도메인 별 sprint 분리** (hot/cold path asymmetry intentional), (8) **`KVCacheView::dtype()` 폐기** (Stage 가 storage paradigm 모름 정신 일관). 메타 결정 **갈래 B (Boundary 명시)**: PipelineStage 적용 범위 = KV/Weight state mutation 도메인 한정. Cross-cutting (score collection / dispatch / cross-paradigm policy) 은 자기 패턴 인정.
+
+### 0.2 본 grill 누적 결정 18 건 (한 줄씩)
+
+| # | 결정 (한 줄) | 출처 |
+|---|---|---|
+| 1 | (β) sync model — Buffer-level lazy + access-mode-aware, 새 sync 인프라 0건 | 본 grill |
+| 2 | (d-1) primitive only — storage-format-agnostic, Stage 가 dtype/codebook 모름 | 본 grill |
+| 3 | Q7 (A) 유지 — AttentionKernels sub-trait 분리 (A') 보류 | 본 grill |
+| 4 | Mixed storage 허용 — layer 별 다른 storage paradigm OK | 본 grill |
+| 5 | 호환성 차단 인프라 X — 만나면 panic | 본 grill |
+| 6 | KvBundle / WeightBundle trait 폐기 — Stage register 시점 layer handle 보관 | 본 grill |
+| 7 | StageContext 5 → 3 field (kv/weights field 폐기, backend_ext 유지) | 본 grill |
+| 8 | (γ) Layer handle 전환 — KVCacheLayer / WeightLayer trait + interior mutability | 본 grill |
+| 9 | KV dispatch Trait object 전면 채택 — ADR-0001 필수, kv_cache_ops.rs:53 반전 | 본 grill |
+| 10 | Weight dispatch — LayerSlot 유지 + WeightLayer thin wrap, KV 와 비대칭 | 본 grill |
+| 11 | Sprint 분리: Phase α-W → ADR-0001 → Phase α-K (12~19주) | 본 grill |
+| 12 | LayerDispatch enum: Fixed 3 variant (Full / Skip / Partition) | 본 grill |
+| 13 | PipelineDispatcher trait 유지 (mock 패턴 + INV-LAYER-006 + vtable noise) | 본 grill 후속 |
+| 14 | BackendExtensions trait 폐기 — ctx 3 → 2 field, Layer impl 이 backend ref 보유 | 본 grill 후속 |
+| **15** | **3-tier Stage 패턴 — Primitive-only / Paradigm-specific / Cross-paradigm** | **본 sub-grill (2026-05-28~29)** |
+| **16** | **Stage cardinality 자유 (1/N/0 layer)** — 임의 1-layer 가정 폐기 | **본 sub-grill (2026-05-28~29)** |
+| **17** | **Score 도메인 별 sprint — hot/cold path asymmetry intentional, EvictionHook 1:1 wrap 유지** | **본 sub-grill (2026-05-28~29)** |
+| **18** | **`KVCacheView::dtype()` 폐기 — Backend / Layer 내부 보관, Stage 노출 0** | **본 sub-grill (2026-05-28~29)** |
+
+### 0.3 본 sub-grill 메타 결정 — 갈래 B (Boundary 명시)
+
+본 sub-grill 의 발견 모순 10건 매트릭스가 한 본질을 가리킨다: **"single pattern fits all" 가정의 한계**. PipelineStage 가 모든 cross-cutting 책임을 흡수하려 하지 않는다. 채택:
+
+| 도메인 | 패턴 |
+|---|---|
+| **KV/Weight state mutation** | **PipelineStage 적용 범위** — hook 패턴 일관 |
+| Score collection (hot path) | Backend inline + Observer (Stage 흡수 안 함) |
+| Score aggregation/read (cold path) | PipelineStage on_phase |
+| Cross-paradigm policy (D2O) | Strategy callback (Stage 의 책임이 아님) |
+| Backend capability | Backend trait method (§13.8-L 패턴) |
+
+발견된 asymmetry (hot/cold path 책임 분리 / 3-tier Stage 패턴의 verbose / cross-paradigm K read 등) 는 도메인 본질의 정직한 표현 — **intentional**. 통일 패턴 강제 안 함.
+
+### 0.4 전체 구조 다이어그램
+
+```mermaid
+flowchart TB
+    subgraph Outer ["L4 DecodeLoop (Outer Loop)"]
+        decode["DecodeLoop::run()"]
+        registry["PipelineRegistry"]
+        cmdexec["CommandExecutor (Manager IPC)"]
+    end
+
+    subgraph Stages ["L3 cross-cutting engine/src/stages/ (3-tier Stage)"]
+        subgraph T1 ["Tier 1: Primitive-only"]
+            t1_evict["EvictionStage<br/>Arc&lt;dyn KVCacheLayer&gt;"]
+            t1_swap["SwapDispatchStage<br/>Arc&lt;dyn WeightLayer&gt;"]
+        end
+        subgraph T2 ["Tier 2: Paradigm-specific"]
+            t2_kivi["KviQuantizeStage<br/>Arc&lt;KIVILayer&gt; (concrete)"]
+            t2_snap["SnapKvCompressStage<br/>Arc&lt;SnapKVLayer&gt;"]
+        end
+        subgraph T3 ["Tier 3: Cross-paradigm"]
+            t3_tier["TierMoveStage<br/>Arc&lt;dyn TierMovable&gt;"]
+            t3_score["ScoreResetStage<br/>Arc&lt;dyn ScoreResettable&gt;"]
+        end
+    end
+
+    subgraph Inner ["L3 inference/ — Forward path (Inner Loop)"]
+        fwd["Forward::step()"]
+        layer["Per-layer execution"]
+    end
+
+    subgraph Layers ["L3 KVCacheLayer impl + L1 Backend"]
+        std_layer["StandardLayer"]
+        kivi_layer["KIVILayer"]
+        backend["Backend (OpenCL / CUDA / CPU)"]
+    end
+
+    decode --> registry
+    decode --> cmdexec
+    decode --> fwd
+    registry --> T1
+    registry --> T2
+    registry --> T3
+    fwd --> layer
+    layer --> std_layer
+    layer --> kivi_layer
+    std_layer --> backend
+    kivi_layer --> backend
+
+    T1 -.->|"Arc&lt;dyn KVCacheLayer&gt;"| std_layer
+    T1 -.->|"Arc&lt;dyn KVCacheLayer&gt;"| kivi_layer
+    T2 -.->|"Arc&lt;KIVILayer&gt; concrete"| kivi_layer
+    T3 -.->|"Arc&lt;dyn TierMovable&gt; capability"| std_layer
+    T3 -.->|"Arc&lt;dyn TierMovable&gt; capability"| kivi_layer
+
+    style decode fill:#2d5a3d
+    style registry fill:#2d5a3d
+    style T1 fill:#2d4a5a
+    style T2 fill:#5a4a2d
+    style T3 fill:#5a2d4a
+```
+
+**다이어그램 해석**:
+- Outer (DecodeLoop) — 모든 Stage 의 dispatch 진입점, Manager IPC owned.
+- 3-tier Stage 패턴 — Tier 1 (base trait `Arc<dyn>`), Tier 2 (concrete `Arc<ConcreteLayer>` — downcast 0), Tier 3 (capability trait `Arc<dyn CapabilityTrait>` — Stage 측 정의).
+- Inner (Forward path) — Per-layer execution 은 KVCacheLayer / WeightLayer impl 을 통해 backend capability 호출 (Layer impl 내부에서, Stage 가 mechanism 모름).
+
+### 0.5 적용 범위 boundary 표 (PipelineStage vs Cross-cutting)
+
+| 도메인 | 적용 패턴 | 위치 | 근거 |
+|---|---|---|---|
+| KV state mutation | **PipelineStage** (Tier 1/2/3) | `engine/src/stages/kv/` | 본 sprint scope |
+| Weight state mutation | **PipelineStage** (Tier 1) | `engine/src/stages/weight/` | 본 sprint scope |
+| Backend / DecodeLoop 협업 | **PipelineStage** (Tier 3 또는 system/) | `engine/src/stages/system/` | 본 sprint scope |
+| Score collection (매 layer, hot path) | **Backend inline + Observer** | `engine/src/backend/...` | hot/cold asymmetry intentional |
+| Score aggregation / read (cold path) | **PipelineStage on_phase** | `engine/src/stages/kv/eviction.rs` | 결정 #17 |
+| Cross-paradigm policy (D2O) | **Strategy callback** | KVCacheLayer impl 내부 | 결정 #17 |
+| Backend capability provider | **Backend trait method** | `engine/src/backend.rs` | §13.8-L 패턴 |
+| Manager IPC poll / outbound | **DecodeLoop 본체** (stage 외부) | `engine/src/session/decode_loop.rs` | Q17-2 / Q22 |
+| Forward / Sampler | **별 trait** (PipelineStage 아님) | `engine/src/session/traits.rs` | W-1 결정 |
+| Prefill chunking (llm.npu 트랙) | **PipelineStage** (Tier 1 PrefillChunkingStage) — forward-compat | (Phase NPU-1, 별 sprint) | 본 sprint 흡수 안 함, 막지도 않음 |
+| Async block scheduling (llm.npu 트랙) | **AsyncBlockScheduler** 별 추상화 | (Phase NPU-3~5, 별 sprint) | 본 sprint scope 외, sync 가정 충돌 |
+
+### 0.6 다음 sprint 분기
+
+```
+[Phase α-W (2-3주)] Weight + PipelineStage 인프라 + Bundle 폐기
+    ↓
+[ADR-0001 (2-3일)] KV dispatch paradigm Accepted
+    ↓
+[Phase α-K (4-6주)] KV Generic → Trait object 전환
+    ↓
+[Phase β (3-4주)] DecodeLoop 재작성 + arch/inference_pipeline.md v2
+    ↓
+[Phase γ (3-4주)] legacy generate.rs 잔여 마이그레이션 + PACT2026 PoC
+```
+
+**총 12-19주**. 본 sub-grill 4 결정은 Phase α-W 직접 영향 (`StorageSpec` 폐기 → trait detail 변경 / 3-tier 패턴 → stages/ sub-structure 변경 / `KVCacheView::dtype()` 폐기 → trait detail 변경).
+
+**별 sprint (Phase α-W/K 외)**:
+- **Score domain refactor** — 결정 #17. Prerequisite §13.5 #11. 추천 갈래 4 (Generic capability lookup) / 7 (Nested PipelineStage cost 명시) / 2 (Monomorphic input fallback). Pre-rejected 1 (trait method overload) / 3 (Decorator) / 5 (Event sourcing enum) / 8 (Closure).
+- **Phase NPU-1~5** (llm.npu / mllm-NPU 흡수, ASPLOS 2025) — Prompt level chunking (NPU-1) ✓ / Tensor level outlier (NPU-2) ✓ / Block level scheduling (NPU-3~5) △ — sync 가정 충돌. 본 sprint scope 외, 본 grill 구조가 막지 않음 (forward-compat). 상세는 §13.5 부록.
+
+### 0.7 미해결 sub-grill 매트릭스 링크
+
+본 sprint 진입 전 또는 진행 중 finalize 필요한 sub-grill 모두 **§13.5** 에 매트릭스로 정리.
+
+- **Phase α-W 진입 전**: Q-#1-3 (K/V raw read 노출 여부) / Q-#1-4 (capacity 중복) / Q-#1-5 (mutation 누설) / #2 (WeightLayerView) / #3 (SecondaryStore) / #4 (SparsePattern) / #6 (system/ 명명) / #11 (Layer impl backend ref 보유 패턴) / #12 (KVCacheLayer/WeightLayer impl 시그니처 detail)
+- **Phase α-K 진입 전**: ADR-0001 작성 + KVCacheOps 15 method → KVCacheLayer 매핑 표 + CacheManager 마이그레이션 plan
+- **Phase β scope**: arch/inference_pipeline.md v2 재작성 + DecodeLoop 재작성
+- **별 sprint**: #13 (Score domain refactor) / #14 (Multiple EvictionStage)
+
+상세는 **§13.5 본 sub-grill (2026-05-28~29) 미해결 결정점 매트릭스** 참조.
+
+---
+
+## 0.A. TL;DR (Legacy, 본 sub-grill 이후 §0 Executive Overview 로 대체됨)
+
+> 본 절은 본 sprint 의 초기 (2026-05-27) TL;DR 으로, 본 sub-grill (2026-05-28~29) 추가 결정 4 건 + 갈래 B 메타 결정이 반영되어 있지 않다. 외부 explorer 는 **§0 Executive Overview** 를 진입점으로 한다. 본 절은 결정 history 보존을 위해 유지.
 
 - DecodeLoop의 7-trait v2 설계는 (a) `EvictionStage` 시그니처 부족 → 책임 재분배 깊이 (R-2), (b) `ResilienceStage` 신설 결정점 미해결 (R-5), (c) `decode_fallback/{eviction_trigger,swap_dispatch}.rs`의 God Ctx 12/21 필드, (d) `arch/inference_pipeline.md:177` Manager IPC wiring 격차, (e) speculative decoding / per-op measurement 등 신규 책임 추가 비용 문제를 해결하지 못한다.
 - 본 문서는 **단일 `PipelineStage` trait + `LifecyclePhase` enum + entry point별 `PipelineRegistry`** 패턴으로 재설계한다. 모든 책임을 stage(phase event handler) 단위로 분해, `Arc<dyn PipelineStage>` 공유 + entry point별 selection.
 - 의도된 효과: SRP/OCP 양립 (`PipelineStage::on_phase` 1개 method), 신규 책임 추가 비용 = 새 stage struct + 새 entry point에서 `submit()` 1줄.
-- 인정 비용: god ctx (`StageContext` 5 field) 명시 수용 + 권한 강제는 code review (M1만). 컴파일 강제 시 sub-trait 보유 비용이 과대.
-- 작업 분해 — **Phase α (WeightBundle prerequisite, 2~3주) / Phase β (hook pattern 본격, 3~4주) / Phase γ (legacy 잔여 마이그레이션, 3~4주)** = 총 8~13주.
-- Escape hatch — Pre-α-1 design round 합의 실패 또는 Pre-α-2 PoC 4 test 중 1+ fail 시 v2 (b₁) 7-trait 후퇴. Phase β 진입 후 후퇴는 권장하지 않으며 stage impl 재설계로 해소.
+- 인정 비용: god ctx (`StageContext` 5 field — 본 grill 2026-05-28: **2 field 로 축소**) 명시 수용 + 권한 강제는 code review (M1만).
+- 작업 분해 — **Phase α-W (2~3주) → ADR-0001 → Phase α-K (4~6주) / Phase β (3~4주) / Phase γ (3~4주)** = 총 12~19주 (본 grill 결정 #11).
+- Escape hatch — Pre-α-1 design round 합의 실패 또는 Phase α-W PoC 4 test 중 1+ fail 시 v2 (b₁) 7-trait 후퇴. Phase β 진입 후 후퇴는 권장하지 않으며 stage impl 재설계로 해소.
 
 ---
 
@@ -388,15 +550,20 @@ pub trait PipelineDispatcher: Send + Sync {
 - L3 inference code 에서 dispatch 호출 없음 → trait 의 L2 위치 정당화 약함. **L4 `session/` 으로 이동 가능**.
 - 단 본 grill 후속 결정 13 에서는 trait **유지** 만 확정 — 위치 이동은 별 sub-grill (handoff R5 #10).
 
-### 3.5 `KVCacheLayer` (L2) — 본 grill 2026-05-28 (KvBundle trait 폐기 후 layer handle 모델)
+### 3.5 `KVCacheLayer` (L2) — 본 grill 2026-05-28 + 본 sub-grill 2026-05-28~29 갱신
 
 **이전 결정 (2026-05-27) → 본 grill 변경**:
 - `KvBundle` (8 mutation method + layer-wide vs per-layer scope 혼재) **폐기**.
 - 변경 사유: (a) KvBundle trait는 god abstraction — ctx field로 모든 layer state 노출, (b) PipelineRegistry 정신과 충돌 (stage 객체 캡슐화), (c) `LayerSlot::rcu_weights` 와 같은 layer-self-mutation 패턴이 본 프로젝트에 이미 정착되어 있어 자연 확장 가능.
 - 본 grill 채택: **`KVCacheLayer` trait + Stage 객체 내부 `Arc<dyn KVCacheLayer>` 보관 + interior mutability**.
 
+**본 sub-grill 2026-05-28~29 추가 변경**:
+- 결정 #15 (3-tier Stage 패턴): Tier 2 paradigm-specific Stage 는 `Arc<ConcreteLayer>` (예: `Arc<KIVILayer>`) 보유. KVCacheLayer **trait 에 `as_any()` 추가 안 함** — downcast 의도적 차단.
+- 결정 #15 의 부산물: **`StorageSpec` trait 폐기** + **`apply_storage(spec)` method 폐기**. Storage paradigm 별 mutation 은 Tier 2 (paradigm-specific Stage 가 concrete struct method 직접 호출) 로 흡수.
+- 결정 #18: **`KVCacheView::dtype()` method 부재 명시**. Mixed paradigm (KIVI residual F16 + quantized Q4) 의미 모호 + 외부 노출 0 필요 + INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 정신 정합 (Stage 가 storage paradigm 모름). Backend / Layer 내부 보관. Profiler / Manager IPC 가 layer dtype 필요 시 별 capability trait (`LayerProfileable`) 또는 backend trait 경로.
+
 ```rust
-// engine/src/kv_layer.rs (신규, 본 grill 2026-05-28)
+// engine/src/kv_layer.rs (신규, 본 grill 2026-05-28 + 본 sub-grill 2026-05-28~29)
 
 pub trait KVCacheLayer: Send + Sync {
     // Read (immutable identity)
@@ -405,13 +572,18 @@ pub trait KVCacheLayer: Send + Sync {
     fn capacity(&self) -> usize;
     fn view(&self) -> &dyn KVCacheView;
 
+    // as_any() 부재 (본 sub-grill 결정 #15) — downcast 의도적 차단.
+    // Tier 2 paradigm-specific Stage 는 Arc<ConcreteLayer> (예: Arc<KIVILayer>) 보유
+    // → register 시점 compile-time type 강제, 런타임 downcast 0.
+
     // Mutation API — interior mutability (`&self`, NOT `&mut self`)
     //
     // INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 준수 (storage-format-agnostic).
     // INV-DECODE-STAGE-001 (KV-PHASE) 준수 (PreLayer/PostLayer/Fine(*) 금지).
     // sync 모델 (β): R1 (host read) / R2 (release) / R3 (backend transition) 자동.
     //
-    // 5 mutation primitive — semantic op only, dtype/codebook/rotation 모름.
+    // 3 mutation primitive — semantic op only, dtype/codebook/rotation 모름.
+    // (본 sub-grill 결정 #15: apply_storage 폐기 — Tier 2 paradigm-specific Stage 흡수)
 
     /// Single-token KV write — primitive granularity.
     fn write_kv(&self, pos: usize, k: &[f32], v: &[f32]) -> Result<()>;
@@ -427,26 +599,31 @@ pub trait KVCacheLayer: Send + Sync {
     /// Sliding / H2O / SnapKV: `compact(keep, &[])`.
     /// D2O: `compact(keep, merges_slice)` — paper Eq.10/11.
     ///
-    /// keep 과 merges 의 atomic 결합 — 5 → 3 primitive 통합 근거 (D2O semantic 보장).
+    /// keep 과 merges 의 atomic 결합 — D2O semantic 보장 (Tier 1 primitive-only).
     fn compact(&self, keep: &[usize], merges: &[(usize, usize, f32)]) -> Result<()>;
+}
 
-    /// Apply storage spec — dtype/codebook/rotation/sparse pattern 모두 spec 한 axis 로 흡수.
-    ///
-    /// 이전 grill `set_layer_dtype` / `set_sparse_pattern` / `migrate_layer` 통합.
-    /// StorageSpec trait 의 detail signature 는 Phase α-K Q24 sub-trait round.
-    fn apply_storage(&self, spec: &dyn StorageSpec) -> Result<()>;
+// KVCacheView — 본 sub-grill 결정 #18 (dtype 폐기)
+pub trait KVCacheView: Send + Sync {
+    // dtype() method 부재 — Stage 가 storage paradigm 모름 정신.
+    // Backend / Layer 내부 dtype 보관 + 필요 시 별 capability trait (LayerProfileable) 경로.
+
+    // (sub-trait detail Q-#1-3/Q-#1-4/Q-#1-5 미해결 — §13.5)
+    // - K/V raw read 노출 여부 (D2O cosine similarity 의 K read)
+    // - capacity 중복 (KVCacheLayer::capacity 와)
+    // - mutation 누설 (view 가 read-only 보장 의무)
 }
 ```
 
-**Mutation 5 → 3 primitive 통합 근거 (본 grill 2026-05-28)**:
-- 이전 (KvBundle 7 mutation method: prune / offload / recall / set_layer_dtype / merge_evicted / compress_prefix / set_sparse_pattern + 2 backend integration)
-- 통합:
-  - `prune` + `merge_evicted` → **`compact(keep, merges)`** — atomic semantic (D2O Eq.10/11 보장: keep 과 merge 시간적 결합 강함)
-  - `offload` + `recall` → **storage spec 의 한 axis (Tier::Primary / Tier::Secondary)** → `apply_storage` 흡수
-  - `set_layer_dtype` + `compress_prefix` + `set_sparse_pattern` → **storage spec 다른 axes (Dtype / Codebook / SparsePattern / SnapWindow)** → `apply_storage` 흡수
-  - `migrate_layer` → `apply_storage` 흡수 (Tier 가 spec 의 한 axis)
-  - `sync_gpu_scores` + `reset_gpu_score_acc` → **`view().score_handle()`** 으로 이동 (KVCacheView sub-trait, Phase α-K Q24)
-- 결과: 8 method → 5 method (idx / current_pos / capacity / view + 3 mutation + apply_storage). primitive only, storage-format-agnostic.
+**Mutation 8 → 3 primitive 통합 근거 (본 grill 2026-05-28 + 본 sub-grill 2026-05-28~29)**:
+- 이전 (KvBundle 7 mutation method): prune / offload / recall / set_layer_dtype / merge_evicted / compress_prefix / set_sparse_pattern + 2 backend integration
+- 1차 통합 (본 grill 2026-05-28): 5 method (write_kv / write_kv_batch / compact / apply_storage + view).
+- **2차 통합 (본 sub-grill 2026-05-28~29, 결정 #15): 3 mutation primitive — `apply_storage` 폐기**:
+  - `apply_storage(StorageSpec::Dtype(...))` → Tier 2 `KviQuantizeStage` 가 `Arc<KIVILayer>` 보유 + concrete method (`KIVILayer::quantize_to_q4()`) 직접 호출
+  - `apply_storage(StorageSpec::Tier(Secondary))` → Tier 3 `TierMoveStage` 가 `Arc<dyn TierMovable>` capability trait 보유 + `move_to_secondary()` 호출
+  - `apply_storage(StorageSpec::SparsePattern(...))` → Tier 2 `SparseApplyStage` 가 `Arc<SparseLayer>` 직접 보유
+- 결과: 3 mutation primitive (write_kv / write_kv_batch / compact) + 4 read method (idx / current_pos / capacity / view). primitive only, storage-format-agnostic, downcast 0.
+- **`StorageSpec` trait 자체 폐기** — spec object 시그니처 (Dtype / Codebook / Rotation / Tier / SparsePattern axis) finalize 필요 없음 (Q24-5 자연 해소).
 
 **(d-1) primitive only 결정 (본 grill 2026-05-28, 결정 #2)**:
 - Method 가 token / layer / range granularity 만 알고 storage paradigm (dtype / codebook / rotation matrix / sparse pattern) 은 **모름**.
@@ -482,26 +659,32 @@ pub trait KVCacheLayer: Send + Sync {
 - 두 도메인을 동일 패턴으로 묶으려 하지 않음. Weight 는 LayerSlot/RCU 패턴 보존 + WeightLayer trait thin wrap, KV 는 KVCacheOps → KVCacheLayer trait object 전환.
 - Sprint 분리 (Phase α-W → ADR-0001 → Phase α-K) — risk 분산 + escape hatch.
 
-### 3.6 `WeightLayer` (L2) — 본 grill 2026-05-28 (WeightBundle trait 폐기 후 layer handle 모델)
+### 3.6 `WeightLayer` (L2) — 본 grill 2026-05-28 + 본 sub-grill 2026-05-28~29 갱신
 
 **이전 결정 (2026-05-27) → 본 grill 변경**:
 - `WeightBundle` (10 method 통합 trait) **폐기**.
 - 변경 사유: KV 와 동일 — god abstraction 회피, Stage register 시점 layer handle 보관.
 - 본 grill 채택: **`WeightLayer` trait + Stage 객체 내부 `Arc<dyn WeightLayer>` 보관 + interior mutability via RCU (LayerSlot::rcu_weights 자연 확장)**.
 
+**본 sub-grill 2026-05-28~29 추가 변경**:
+- 결정 #15 (3-tier Stage 패턴): `WeightStorageSpec` trait **폐기** + `apply_storage(spec)` method **폐기**. Storage paradigm 별 mutation 은 Tier 2 (paradigm-specific Stage 가 concrete struct method 직접 호출, 예: `WeightSwapStage` 가 `Arc<LayerSlot>` 보유 + `swap_to_f16()` 직접 호출) 로 흡수.
+- 결정 #15 의 부산물: `WeightLayer` trait 에 `as_any()` 추가 안 함 — downcast 의도적 차단.
+
 ```rust
-// engine/src/weight_layer.rs (신규, 본 grill 2026-05-28)
+// engine/src/weight_layer.rs (신규, 본 grill 2026-05-28 + 본 sub-grill 2026-05-28~29)
 
 pub trait WeightLayer: Send + Sync {
     fn idx(&self) -> usize;
     fn view(&self) -> &dyn WeightLayerView;
 
-    /// Apply storage spec — dtype (F16/Q4_0/Q8_0/...) / variant / tier 흡수.
-    /// 이전 WeightBundle::swap_layer / enqueue_release / secondary_store 통합.
-    fn apply_storage(&self, spec: &dyn WeightStorageSpec) -> Result<()>;
+    // apply_storage(spec) 폐기 (본 sub-grill 결정 #15) — Tier 2 paradigm-specific
+    // Stage (예: WeightSwapStage 가 Arc<LayerSlot> 보유) 가 concrete method 직접 호출.
+    // WeightStorageSpec trait 자체 폐기 (Q24-5 자연 해소).
+    // as_any() 부재 — downcast 의도적 차단.
 
     /// Apply layer-level dispatch (skip / partition / full).
     /// 이전 WeightBundle::set_layer_skip_ratio / set_partition_ratio 통합.
+    /// Tier 1 primitive — LayerDispatch enum 은 dispatch paradigm 한정 (3 variant 고정, 결정 #12)
     fn apply_dispatch(&self, dispatch: LayerDispatch) -> Result<()>;
 }
 
@@ -521,13 +704,14 @@ pub trait SwapMetrics: Send + Sync {
 }
 ```
 
-**10 → 4 method 통합 (본 grill 2026-05-28, 결정 #10)**:
+**10 → 3 method 통합 (본 grill 2026-05-28 + 본 sub-grill 2026-05-28~29, 결정 #10 + #15)**:
 - 이전 WeightBundle: 10 method (n_layers / current_dtype / layer_view / swap_layer / enqueue_release / release_pending / secondary_store / set_partition_ratio / set_layer_skip_ratio / switch_device)
-- 통합 후 WeightLayer: 4 method (idx / view / apply_storage / apply_dispatch)
+- 1차 통합 (본 grill 2026-05-28): 4 method (idx / view / apply_storage / apply_dispatch)
+- **2차 통합 (본 sub-grill 2026-05-28~29, 결정 #15): 3 method (idx / view / apply_dispatch)** — `apply_storage` 폐기
   - `n_layers` → DecodeLoop / model init 시 `Vec<Arc<dyn WeightLayer>>` 의 `.len()`
-  - `current_dtype` → `view().dtype()` 으로 이동
-  - `swap_layer` + `enqueue_release` + `secondary_store` → `apply_storage(spec)` 흡수
-  - `set_partition_ratio` + `set_layer_skip_ratio` → `apply_dispatch(LayerDispatch::Partition / Skip)`
+  - `current_dtype` → Backend / Layer 내부 보관 (본 sub-grill 결정 #18 정합, KVCacheView 와 동일 정신)
+  - `swap_layer` + `enqueue_release` + `secondary_store` → **Tier 2 paradigm-specific Stage** (예: `WeightSwapStage` 가 `Arc<LayerSlot>` 보유 + `swap_to_f16()` / `enqueue_release()` 등 concrete method 직접 호출)
+  - `set_partition_ratio` + `set_layer_skip_ratio` → `apply_dispatch(LayerDispatch::Partition / Skip)` (Tier 1 primitive)
   - `release_pending` + ratio generation → **별 trait `SwapMetrics`** (measurement axis 분리, INV-LAYER-006 정합)
   - `switch_device` → backend 단위 op (model / engine 수준), layer-self 아님 → DecodeLoop 또는 OneShotSwitchDeviceStage 가 backend 직접 호출.
 
@@ -669,25 +853,35 @@ impl PipelineDispatcher for PipelineRegistry {
 - 데이터 추출 함수 (QCF 계산 — EvictionPolicyStage 또는 OneShotQcfReportStage 내부 helper)
 - outbound channel (Manager IPC handler — DecodeLoop 본체)
 
-### 5.2 패턴 시그니처 (본 grill 2026-05-28 — (γ) layer handle 모델)
+### 5.2 패턴 시그니처 — 3-tier Stage 패턴 (본 sub-grill 2026-05-28~29 결정 #15/#16/#17)
 
-**이전 (2026-05-27) → 본 grill 변경**:
-- 이전 패턴: `ctx.kv` / `ctx.weights` 통해 모든 layer 접근. Stage 가 어느 layer 를 만질지 phase 처리 안에서 결정.
-- 본 grill 패턴: Stage 가 register 시점에 `Arc<dyn KVCacheLayer>` / `Arc<dyn WeightLayer>` 보관. phase 처리 안에서 직접 layer self method 호출 (interior mutability).
+**이전 (2026-05-27) → 본 grill (2026-05-28) → 본 sub-grill (2026-05-28~29) 변경**:
+- 이전 패턴 (2026-05-27): `ctx.kv` / `ctx.weights` 통해 모든 layer 접근. Stage 가 어느 layer 를 만질지 phase 처리 안에서 결정.
+- 본 grill 패턴 (2026-05-28): Stage 가 register 시점에 `Arc<dyn KVCacheLayer>` / `Arc<dyn WeightLayer>` 보관. phase 처리 안에서 직접 layer self method 호출 (interior mutability). 단일 패턴 가정 — 모든 Stage 가 `Arc<dyn KVCacheLayer>` 또는 `Arc<dyn WeightLayer>` 보유.
+- **본 sub-grill 패턴 (2026-05-28~29, 결정 #15): 3-tier Stage 패턴** — Stage 의 책임 본질에 따라 3 tier 로 분류:
+  - **Tier 1 Primitive-only Stage**: base trait `Arc<dyn KVCacheLayer>` / `Arc<dyn WeightLayer>` 보유. base trait method (compact 등) 만 호출.
+  - **Tier 2 Paradigm-specific Stage**: `Arc<ConcreteLayer>` (예: `Arc<KIVILayer>`) 보유. concrete struct method 직접 호출. **register 시점 compile-time type 강제 — downcast 0**.
+  - **Tier 3 Cross-paradigm Stage**: `Arc<dyn CapabilityTrait>` 보유. capability trait 는 **Stage 측 정의** (base trait 변경 0, OCP 보존).
+- 결정 #16 (Stage cardinality 자유): 임의 1-layer 가정 폐기. 1/N/0 layer Stage 본질에 따라 결정.
+- 결정 #17 (Score 도메인 asymmetry intentional): `EvictionStage` 는 score_accumulator field 보존 (concrete type, hot/cold path 책임 분리).
+
+#### 5.2.1 Tier 1 Primitive-only Stage — `Arc<dyn KVCacheLayer>` / `Arc<dyn WeightLayer>`
 
 ```rust
-// 예시: EvictionStage (본 grill 2026-05-28 + 후속 결정 14)
-// 위치 (post-grill review 2026-05-28): engine/src/stages/kv/eviction.rs (L3 cross-cutting)
-//
-// 본 grill 후속 결정 14 (2026-05-28) — Stage 는 backend capability 모름.
-// ctx.backend_ext 사용 금지 — `BackendExtensions` trait 폐기. Layer impl 이 backend ref 보유.
+// 예시: EvictionStage (Tier 1, cardinality N — cross-layer policy)
+// 위치: engine/src/stages/kv/eviction.rs (L3 cross-cutting)
+// 본 sub-grill 결정 #17: score_accumulator field 보존 (concrete type, asymmetry intentional)
 
 pub struct EvictionStage {
-    layer: Arc<dyn KVCacheLayer>,        // register 시점 보관 (단일 layer 책임)
+    // cardinality N — cross-layer policy (모든 KV layer 책임)
+    layers: Vec<Arc<dyn KVCacheLayer>>,
     policy: Box<dyn EvictionPolicy + Send + Sync>,
 
-    // mutable state — 명시 Mutex
-    score_accumulator: Mutex<Option<AttentionScoreAccumulator>>,
+    // Score domain (본 sub-grill 결정 #17 — pragmatic deferral):
+    // - Collection (hot path) = Backend inline (Stage 외부)
+    // - Aggregation/read (cold path) = 본 EvictionStage on_phase 내부
+    // 별 sprint refactor (§13.5 #13) 까지 concrete type 보존.
+    score_accumulator: Option<AttentionScoreAccumulator>,
 }
 
 impl PipelineStage for EvictionStage {
@@ -700,41 +894,108 @@ impl PipelineStage for EvictionStage {
         }
 
         // Layer self method 호출만 — backend / dtype / codebook 의식 없음.
-        // score_handle() 내부에서 layer impl 이 backend ref 통해 gpu_score_acc() capability 호출.
-        let scores = self.layer.view().score_handle().unwrap().read_scores();
-        let keep = self.policy.decide_keep(&scores);
-        self.layer.compact(&keep, &[])?;  // primitive only — KIVI? Sparse? layer 가 캡슐화.
+        // base trait `compact` primitive 만 사용 — Tier 1 정신.
+        for layer in &self.layers {
+            let scores = layer.view().score_handle().unwrap().read_scores();
+            let keep = self.policy.decide_keep(&scores);
+            layer.compact(&keep, &[])?;
+        }
 
         Ok(StageOutcome::Continue)
     }
 }
 
-// Model init pattern (본 grill 2026-05-28)
-let kv_layers: Vec<Arc<dyn KVCacheLayer>> = (0..n_layers)
-    .map(|idx| KIVILayer::new(idx, ...) as Arc<dyn KVCacheLayer>)
-    .collect();
-
-// Stage register 시 layer handle 직접 전달
-let eviction = EvictionStage {
-    layer: kv_layers[5].clone(),
-    policy: Box::new(SlidingPolicy::new()),
-    score_accumulator: Mutex::new(None),
-};
-pipeline_registry.submit(Arc::new(eviction));
-
-// D2O 예시 — compact 의 merges 활용
-let d2o = D2OMergeStage {
-    layer: kv_layers[5].clone(),
-    state: Mutex::new(D2OState::new()),
-};
-// on_phase 안에서: self.layer.compact(&keep, &merges_eq10_11)?;
+// SwapDispatchStage (Tier 1, cardinality N)
+pub struct SwapDispatchStage {
+    layers: Vec<Arc<dyn WeightLayer>>,   // base trait, primitive (apply_dispatch) 만 호출
+}
 ```
 
-OneShot 예시:
+#### 5.2.2 Tier 2 Paradigm-specific Stage — `Arc<ConcreteLayer>`
 
 ```rust
-// 예시: OneShotEvictStage (Manager Evict 명령)
-// 위치 (post-grill review 2026-05-28): engine/src/stages/kv/oneshot_evict.rs (L3 cross-cutting)
+// 예시: KviQuantizeStage (Tier 2, cardinality 1 — signal-driven paradigm-specific)
+// 위치: engine/src/stages/kv/kivi_quantize.rs (L3 cross-cutting)
+// 본 sub-grill 결정 #15: concrete Arc, downcast 0.
+
+pub struct KviQuantizeStage {
+    // cardinality 1 — signal-driven paradigm-specific
+    // Arc<KIVILayer> concrete — register 시점 compile-time type 강제.
+    layer: Arc<KIVILayer>,
+    target_dtype: Q4Variant,
+}
+
+impl PipelineStage for KviQuantizeStage {
+    fn name(&self) -> &str { "kivi_quantize" }
+    fn lifecycle(&self) -> StageLifecycle { StageLifecycle::OneShot }
+
+    fn on_phase(&self, phase: &LifecyclePhase, _ctx: &mut StageContext<'_>) -> Result<StageOutcome> {
+        if !matches!(phase, LifecyclePhase::PreForward) {
+            return Ok(StageOutcome::Continue);
+        }
+
+        // KIVI-specific method 직접 호출 — apply_storage(spec) trait method 우회.
+        // Stage 가 KIVI 특성 (residual F16 + quantized Q4) 의식 OK — Tier 2 정신.
+        self.layer.quantize_to_q4(self.target_dtype)?;
+
+        Ok(StageOutcome::Consumed)
+    }
+}
+
+// SnapKvCompressStage (Tier 2, cardinality N)
+pub struct SnapKvCompressStage {
+    layers: Vec<Arc<SnapKVLayer>>,   // concrete, SnapKV-specific method 호출
+}
+```
+
+#### 5.2.3 Tier 3 Cross-paradigm Stage — `Arc<dyn CapabilityTrait>` (Stage 측 정의)
+
+```rust
+// 예시: TierMoveStage (Tier 3, cardinality N — cross-paradigm capability)
+// 위치: engine/src/stages/system/tier_move.rs (L3 cross-cutting)
+// 본 sub-grill 결정 #15: capability trait Stage 측 정의 (base trait 변경 0, OCP 보존)
+
+// Stage 측 정의 — KVCacheLayer / WeightLayer base trait 변경 없음.
+pub trait TierMovable: Send + Sync {
+    fn move_to_secondary(&self) -> Result<()>;
+    fn move_to_primary(&self) -> Result<()>;
+}
+
+// 각 layer impl 이 TierMovable 별도 구현 (StandardLayer / KIVILayer / OffloadLayer ...)
+// → cross-paradigm capability 흡수, base trait 변경 0.
+
+pub struct TierMoveStage {
+    layers: Vec<Arc<dyn TierMovable>>,   // capability trait — Stage 측 정의
+    target_tier: Tier,
+}
+
+impl PipelineStage for TierMoveStage {
+    fn name(&self) -> &str { "tier_move" }
+    fn lifecycle(&self) -> StageLifecycle { StageLifecycle::OneShot }
+
+    fn on_phase(&self, phase: &LifecyclePhase, _ctx: &mut StageContext<'_>) -> Result<StageOutcome> {
+        if !matches!(phase, LifecyclePhase::PreEviction) {
+            return Ok(StageOutcome::Continue);
+        }
+
+        // capability trait method 호출 — paradigm 모름, Stage 측 정의 trait 만 의식.
+        for layer in &self.layers {
+            match self.target_tier {
+                Tier::Secondary => layer.move_to_secondary()?,
+                Tier::Primary => layer.move_to_primary()?,
+            }
+        }
+
+        Ok(StageOutcome::Consumed)
+    }
+}
+```
+
+#### 5.2.4 OneShot 예시 (Tier 1)
+
+```rust
+// 예시: OneShotEvictStage (Tier 1, cardinality N)
+// 위치: engine/src/stages/kv/oneshot_evict.rs (L3 cross-cutting)
 
 pub struct OneShotEvictStage {
     layers: Vec<Arc<dyn KVCacheLayer>>,   // layer-wide eviction = 모든 layer handle 보유
@@ -747,7 +1008,7 @@ impl PipelineStage for OneShotEvictStage {
 
     fn on_phase(&self, phase: &LifecyclePhase, _ctx: &mut StageContext<'_>) -> Result<StageOutcome> {
         if !matches!(phase, LifecyclePhase::PreEviction) {
-            return Ok(StageOutcome::Continue);  // 자기 phase 도달 전 대기
+            return Ok(StageOutcome::Continue);
         }
 
         for layer in &self.layers {
@@ -762,35 +1023,90 @@ impl PipelineStage for OneShotEvictStage {
 }
 ```
 
-**Layer handle 보관 패턴 결정 근거 (본 grill 결정 #8)**:
+#### 5.2.5 Model init pattern + Stage register (본 sub-grill 2026-05-28~29)
+
+```rust
+// Model init pattern — KIVILayer 는 concrete + dyn 양쪽 보관 가능 (Arc 복제)
+let kivi_layer_5 = Arc::new(KIVILayer::new(5, ...));   // Tier 2 용
+let kv_layers: Vec<Arc<dyn KVCacheLayer>> = (0..n_layers)
+    .map(|idx| {
+        if idx == 5 {
+            kivi_layer_5.clone() as Arc<dyn KVCacheLayer>  // Tier 1 용
+        } else {
+            Arc::new(StandardLayer::new(idx, ...)) as Arc<dyn KVCacheLayer>
+        }
+    })
+    .collect();
+
+// Tier 1 Stage register — base trait Arc<dyn>
+let eviction = EvictionStage {
+    layers: kv_layers.clone(),
+    policy: Box::new(SlidingPolicy::new()),
+    score_accumulator: None,
+};
+pipeline_registry.submit(Arc::new(eviction));
+
+// Tier 2 Stage register — concrete Arc<KIVILayer>
+let kvi_quant = KviQuantizeStage {
+    layer: kivi_layer_5.clone(),   // concrete, downcast 0
+    target_dtype: Q4Variant::Q4_0,
+};
+pipeline_registry.submit(Arc::new(kvi_quant));
+
+// Tier 3 Stage register — capability trait Arc<dyn TierMovable>
+let tier_move = TierMoveStage {
+    layers: kv_layers.iter()
+        .filter_map(|l| {
+            // 각 layer impl 이 TierMovable 별도 구현 (impl 에서 Arc<dyn TierMovable> 반환 helper)
+            l.as_tier_movable()   // 미해결 결정점: capability 추출 패턴 — §13.5 #11
+        })
+        .collect(),
+    target_tier: Tier::Secondary,
+};
+pipeline_registry.submit(Arc::new(tier_move));
+```
+
+**Layer handle 보관 패턴 결정 근거 (본 grill 결정 #8 + 본 sub-grill 결정 #15)**:
 - `LayerSlot::rcu_weights` 패턴 자연 확장 — `&self` mutation via interior mutability.
 - Stage 가 자기 책임 layer 만 보유 → 권한 명확화 (god ctx 회피).
 - KV / Weight 양 도메인 통일 패턴 (KV = `Arc<dyn KVCacheLayer>`, Weight = `Arc<dyn WeightLayer>`).
 - INV-STAGE-LAYER-HANDLE (신규) 로 spec 명문화.
+- **본 sub-grill 결정 #15**: 3-tier 패턴으로 single pattern fits all 가정 폐기. Tier 본질에 따라 base trait `Arc<dyn>` / concrete `Arc<ConcreteLayer>` / capability `Arc<dyn CapabilityTrait>` 분기.
+- **본 sub-grill 결정 #16**: Stage cardinality 자유 (1/N/0). 결정 #6 ("Stage register 시점 layer handle 보관") 의 자연 해석 명문화.
 
-### 5.3 Stage 종류 매트릭스
+### 5.3 Stage 종류 매트릭스 (본 sub-grill 2026-05-28~29: tier + cardinality 컬럼 추가)
 
 **Persistent stages** (registry build 시 등록):
 
-| Stage | 책임 | Trigger | Phase |
-|---|---|---|---|
-| `EvictionPolicyStage` | pressure-based auto eviction | KV cap 90% 자동 | PreEviction |
-| `KvMergeStage` (D2O) | eviction 후 compensation | 자동 | PostEviction |
-| `SwapDispatchStage` | intra-forward swap | layer event 자동 | PostLayer |
+| Stage | 책임 | Trigger | Phase | Tier | Cardinality |
+|---|---|---|---|---|---|
+| `EvictionPolicyStage` | pressure-based auto eviction | KV cap 90% 자동 | PreEviction | 1 | N (cross-layer policy) |
+| `KvMergeStage` (D2O) | eviction 후 compensation | 자동 | PostEviction | 1 | N (cross-layer) |
+| `SwapDispatchStage` | intra-forward swap | layer event 자동 | PostLayer | 1 | N (cross-layer) |
 
 **OneShot stages** (Manager 명령으로 동적 `submit`):
 
-| Stage | Manager command | Phase |
-|---|---|---|
-| `OneShotEvictStage` | Evict | PreEviction |
-| `OneShotSwapStage` | SwapWeights | PreSwap |
-| `OneShotOffloadStage` | KvOffload | PreEviction |
-| `OneShotRecallStage` | RestoreDefaults (또는 별) | PreEviction |
-| `OneShotPartitionStage` | SetPartitionRatio | PreForward |
-| `OneShotLayerSkipStage` | SetLayerSkip | PreForward |
-| `OneShotSwitchDeviceStage` | SwitchHw | PreForward |
-| `OneShotKvQuantStage` | KvQuantDynamic | PreForward |
-| `OneShotQcfReportStage` | RequestQcf | (미해결 결정점 — PreCommandPoll 폐기 후 후속 round에서 phase 매핑 확정) |
+| Stage | Manager command | Phase | Tier | Cardinality |
+|---|---|---|---|---|
+| `OneShotEvictStage` | Evict | PreEviction | 1 | N |
+| `OneShotSwapStage` | SwapWeights | PreSwap | 2 (Arc<LayerSlot>) | 1 (signal-driven) |
+| `OneShotOffloadStage` | KvOffload | PreEviction | 3 (Arc<dyn TierMovable>) | N |
+| `OneShotRecallStage` | RestoreDefaults (또는 별) | PreEviction | 3 (Arc<dyn TierMovable>) | N |
+| `OneShotPartitionStage` | SetPartitionRatio | PreForward | 1 | N |
+| `OneShotLayerSkipStage` | SetLayerSkip | PreForward | 1 | N |
+| `OneShotSwitchDeviceStage` | SwitchHw | PreForward | (backend-only) | 0 (no layer) |
+| `OneShotKvQuantStage` | KvQuantDynamic | PreForward | 2 (Arc<KIVILayer>) | 1 (signal-driven) |
+| `OneShotQcfReportStage` | RequestQcf | (미해결 — §13.3) | (TBD) | (TBD) |
+
+**Cardinality 본질 (본 sub-grill 결정 #16)**:
+- **1 layer**: signal-driven paradigm-specific (KviQuantize / OneShotSwap — 특정 layer 만 영향)
+- **N layer**: cross-layer policy (Eviction / KvMerge / SwapDispatch / ScoreCollector / OneShotEvict / TierMove)
+- **0 layer**: backend-only (OneShotSwitchDevice — backend switch 만, layer state mutation 없음)
+
+**Tier 본질 (본 sub-grill 결정 #15)**:
+- **Tier 1 Primitive-only**: base trait Arc<dyn>, base trait method (compact / write_kv / apply_dispatch) 만
+- **Tier 2 Paradigm-specific**: concrete Arc<ConcreteLayer>, concrete struct method 직접 호출, downcast 0
+- **Tier 3 Cross-paradigm**: Arc<dyn CapabilityTrait>, capability trait Stage 측 정의 (base trait 변경 0)
 
 **폐기 stage** (이전 안에서):
 - `ManagerCommandStage` — Manager IPC가 DecodeLoop owned (stage 외부)
@@ -831,13 +1147,33 @@ engine/src/stages/
     └── oneshot_qcf_report.rs   # phase 매핑 미해결 — §13.3
 ```
 
-**분류 규약**:
+**분류 규약** (본 sub-grill 2026-05-28~29: 3-tier 패턴 정합 갱신):
 
-| 의존 | 위치 | 예 |
+| 의존 (Tier 분류) | 위치 | 예 |
 |---|---|---|
-| `Arc<dyn KVCacheLayer>` 만 | `kv/` | EvictionPolicyStage, KvMergeStage(D2O), OneShotEvictStage, OneShotOffloadStage, OneShotRecallStage, OneShotKvQuantStage |
-| `Arc<dyn WeightLayer>` 만 | `weight/` | SwapDispatchStage, OneShotSwapStage, OneShotPartitionStage, OneShotLayerSkipStage |
-| 두 layer trait 모두 또는 backend / DecodeLoop 협업 | `system/` | OneShotSwitchDeviceStage (backend switch), OneShotQcfReportStage (QCF estimator inject) |
+| `Arc<dyn KVCacheLayer>` (Tier 1) / `Arc<ConcreteKVLayer>` (Tier 2) | `kv/` | EvictionPolicyStage (T1, N) / KvMergeStage D2O (T1, N) / OneShotEvictStage (T1, N) / OneShotKvQuantStage **KviQuantizeStage** (T2, 1) / SnapKvCompressStage (T2, N) |
+| `Arc<dyn WeightLayer>` (Tier 1) / `Arc<ConcreteWLayer>` (Tier 2) | `weight/` | SwapDispatchStage (T1, N) / OneShotSwapStage (T2, 1) / OneShotPartitionStage (T1, N) / OneShotLayerSkipStage (T1, N) |
+| `Arc<dyn CapabilityTrait>` (Tier 3) 또는 backend / DecodeLoop 협업 | `system/` | OneShotSwitchDeviceStage (backend-only, 0 layer) / OneShotQcfReportStage / **TierMoveStage** (T3 `Arc<dyn TierMovable>`, N) / **OneShotOffloadStage** (T3, N) / **OneShotRecallStage** (T3, N) |
+
+**3-tier 패턴 가이드 (외부 기여자 가이드 doc 의 base, Phase α-W 신설)**:
+
+1. **Tier 결정**: Stage 의 책임이
+   - base trait method (compact / write_kv / apply_dispatch) 만 호출 → **Tier 1** → `kv/` 또는 `weight/`
+   - 특정 paradigm 의 concrete struct method 호출 (KIVI 의 quantize_to_q4 등) → **Tier 2** → `kv/` 또는 `weight/`
+   - 여러 paradigm 에 걸친 capability (TierMovable / ScoreResettable 등) → **Tier 3** → `system/` (capability trait Stage 측 정의)
+2. **Cardinality 결정**:
+   - 단일 layer 만 영향 (signal-driven paradigm-specific) → cardinality 1
+   - cross-layer policy → cardinality N
+   - backend-only → cardinality 0
+3. **Tier 2 / Tier 3 의 선택 가이드**:
+   - 한 paradigm 의 단일 layer impl 에만 적용 → Tier 2 (concrete Arc)
+   - 여러 layer impl 이 같은 capability 제공 → Tier 3 (Stage 측 capability trait 정의)
+   - Tier 2 → Tier 3 승격 시점: capability 가 2+ layer impl 에서 등장 (frequency × cost 비례)
+
+**INV 정합 의무**:
+- INV-DECODE-STAGE-001 (KV-PHASE): Tier 1/2/3 모두 mutation method 허용 phase 준수
+- INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC: **Tier 1 만 적용** (Tier 2 는 paradigm-specific 의도, Tier 3 은 capability trait 의 추상화 책임)
+- INV-STAGE-LAYER-HANDLE: Tier 1/2/3 모두 register 시점 layer handle 보관 패턴 준수
 
 **mod.rs 신규 stage 가이드 (Phase α-W 진입 시 작성, 미해결 결정점 §13.3)**:
 - PipelineStage trait 학습 진입점 (`arch/pipeline_stage_design.md §3.1`)
@@ -1149,7 +1485,7 @@ INV-DECODE-STAGE-002 / 003 의 정신은 다음에 흡수되어 보존:
 
 **Q24-4 (유지): `SparsePattern`** — 본 sprint scope 결정 (stub or 별 sprint). Sparse attention kernel 통합 (현 미구현). KVCacheLayer impl 인 `SparseLayer` 의 dependency.
 
-**Q24-5 (신규): `StorageSpec` + `WeightStorageSpec`** — 본 grill 결정 #2/#3 (apply_storage 흡수) 의 spec object 시그니처. Dtype / Codebook / Rotation / Tier / SparsePattern axis 표현. trait object vs enum 검토.
+**Q24-5 (해소 2026-05-28~29 본 sub-grill 결정 #15): ~~`StorageSpec` + `WeightStorageSpec`~~** — **자연 폐기**. 본 sub-grill 결정 #15 (3-tier Stage 패턴) 의 부산물로 spec object 패턴 자체가 불필요해짐. Storage paradigm 별 mutation 은 Tier 2 paradigm-specific Stage 가 `Arc<ConcreteLayer>` (예: `Arc<KIVILayer>`) 직접 보유 + concrete struct method (`KIVILayer::quantize_to_q4()` 등) 직접 호출로 흡수. `apply_storage(spec)` method 자체 폐기 → spec object 시그니처 finalize 필요 없음.
 
 ### 13.2 Phase α-K 진입 전 매핑 작업
 
@@ -1226,6 +1562,93 @@ INV-DECODE-STAGE-002 / 003 의 정신은 다음에 흡수되어 보존:
      - `StandardLayer` = `GpuScoreAccess` 만
      - `OffloadLayer` = `SecondaryStore`
    - 결정 시점: Phase α-W KVCacheLayer / WeightLayer impl 시그니처 detail finalize 와 같은 sub-grill round.
+
+### 13.6 본 sub-grill (2026-05-28~29) 누적 결정 + 갈래 B 메타 결정 + 발견 모순 매트릭스
+
+본 sub-grill 은 본 grill (2026-05-28) 의 KVCacheLayer / WeightLayer trait 시그니처 detail finalize 과정에서 다음 발견 모순을 식별했고, 해결책으로 4 결정 + 갈래 B (Boundary 명시) 메타 결정을 채택했다.
+
+#### 13.6.1 본 sub-grill 결정 4 건
+
+| # | 결정 | 출처 sub-grill round |
+|---|---|---|
+| **#15** | **3-tier Stage 패턴 (Tier 1 Primitive-only / Tier 2 Paradigm-specific / Tier 3 Cross-paradigm)** — 이전 apply_storage(spec) + StorageSpec trait 폐기. Tier 2 는 concrete `Arc<ConcreteLayer>` 보유 + downcast 0. Tier 3 capability trait 는 Stage 측 정의 (base trait 변경 0, OCP 보존). | sub-grill #5 (StorageSpec 결과) |
+| **#16** | **Stage cardinality 자유 (1/N/0 layer)** — 임의 1-layer 가정 폐기. 1 layer (signal-driven paradigm-specific) / N layer (cross-layer policy) / 0 layer (backend-only) Stage 본질에 따라 결정. | 본 grill 결정 #6 자연 해석 명문화 |
+| **#17** | **Score 도메인 별 sprint (pragmatic deferral + asymmetry intentional)** — EvictionHook → EvictionStage 1:1 wrap. `score_accumulator: Option<AttentionScoreAccumulator>` field 보존 (concrete type). 본 sprint 에서 score 도메인 재설계 안 함. Score 도메인은 hot path (collection 매 layer = backend inline) / cold path (aggregation+read = PipelineStage) 의 자연 책임 분리. **이 asymmetry 가 어색이 아니라 도메인 본질의 정직한 표현** — 통일 패턴 강제 안 함. 별 sprint 추천 갈래 4 (Generic capability lookup) / 7 (Nested PipelineStage cost 명시) / 2 (Monomorphic input fallback). Pre-rejected 1 (trait method overload) / 3 (Decorator) / 5 (Event sourcing enum) / 8 (Closure). | sub-grill #F (Score domain) |
+| **#18** | **`KVCacheView::dtype()` 폐기** — dtype 사용처 5건 (`backend/opencl/mod.rs:3284`, `backend.rs:372`, `model_forward.rs:528`, `kv_migrate.rs:100`, `pressure/kv_cache.rs:1016`) 모두 backend impl 내부 또는 layer 내부 — 외부 노출 0 필요. Mixed paradigm (KIVI residual F16 + quantized Q4) 의미 모호 → 단일 dtype() 답 없음. INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 정신 정합. Backend / Layer 내부 보관. Profiler / Manager IPC 가 layer dtype 필요 시 별 capability trait (`LayerProfileable`) 또는 backend trait 경로. | sub-grill (KVCacheView detail) |
+
+#### 13.6.2 갈래 B (Boundary 명시) 메타 결정 — "single pattern fits all" 가정 폐기
+
+본 sub-grill 의 모든 발견 모순 10건 (3.6.4) 의 본질 = **"single pattern fits all" 가정의 한계**. PipelineStage 가 모든 cross-cutting 책임을 흡수하려 하지 않는다.
+
+**채택**:
+- **PipelineStage 적용 범위 = KV/Weight state mutation 도메인**
+- **Cross-cutting (score collection / dispatch / cross-paradigm policy) = 자기 패턴 인정**:
+  - Score collection (hot path) → Backend inline + Observer
+  - Score aggregation/read (cold path) → PipelineStage
+  - Cross-paradigm policy (D2O) → Strategy callback
+  - Backend capability → Backend trait method (§13.8-L)
+- **발견된 asymmetry 는 도메인 본질의 정직한 표현 — intentional**
+
+#### 13.6.3 미해결 sub-grill 매트릭스 (Q-#1-3 ~ #12)
+
+본 sub-grill (2026-05-28~29) 종결 후 잔여 미해결 sub-trait detail. 다음 sub-grill round 또는 Phase α-W 진입 전 finalize.
+
+| ID | 결정점 | 우선순위 | 진입 추천 순서 |
+|---|---|---|---|
+| **Q-#1-3** | **K/V raw read 노출 여부** — D2O cosine similarity 의 K read 가 KVCacheView 에 raw K/V slice 노출을 요구. (a) noexpose + paradigm-specific helper / (b) raw K/V slice 노출 (paradigm-agnostic 가정 깨짐). Tier 3 capability trait (`Arc<dyn DenseKVRead>`) 후보. | 즉시 (다음 sub-grill 진입점) | 1 |
+| **Q-#1-4** | **capacity 중복** — `KVCacheLayer::capacity()` 와 `KVCacheView::capacity()` 중복. (a) view 만 보유 / (b) layer 만 보유 / (c) 양쪽 — view 가 layer 의 read-only alias 역할 | 즉시 (Q-#1-3 와 같은 sub-grill round) | 2 |
+| **Q-#1-5** | **mutation 누설** — KVCacheView 가 read-only 보장 의무 어떻게 강제? (a) `&self` 만 노출 (interior mutability 폐기) / (b) sealed trait / (c) view 가 immutable snapshot | 즉시 (Q-#1-3/4 와 같은 sub-grill round) | 3 |
+| **#2** | **WeightLayerView** — Llama / Qwen / Mistral 흡수. Generic `weight_tensor(name)` vs specific method (`q_proj()` / `k_proj()` / ...). dtype() 부재 정합 (#18). | Phase α-W 진입 전 | 4 |
+| **#3** | **SecondaryStore** — backlog [P2] `arch/weights_pressure_split.md §7.5` 확정. mmap-based vs file-based vs streaming. AUF format integration (`arch/auf_format.md`). | Phase α-W 진입과 같이 진행 | 5 |
+| **#4** | **SparsePattern** — Stub or 별 sprint. Sparse attention kernel 통합 (현 미구현). KVCacheLayer impl 인 `SparseLayer` 의 dependency. | 별 sprint | 6 |
+| **#6** | **system/ 명명 검토** — 후보: `system/` vs `misc/` vs `dispatch/`. backend / DecodeLoop 협업의 본질 표현. | Phase α-W stages/ 디렉토리 신설 commit 전 | 7 |
+| **#11** | **Layer impl backend ref 보유 패턴** — full `Arc<dyn Backend>` vs ISP-split capability sub-trait. layer impl 별 capability 의존도 표 작성 후 결정. (위 13.5 #7 과 동일) | Phase α-W 진입 전 필수 | 8 |
+| **#12** | **KVCacheLayer / WeightLayer impl 시그니처 detail finalize** — Q-#1-3/4/5 의 결과를 반영한 trait method 최종 시그니처 finalize. | Phase α-W 진입 전 필수 | 9 |
+
+#### 13.6.4 본 sub-grill 발견 모순 10건 매트릭스
+
+미래 explorer 가 "왜 갈래 B (Boundary 명시) 가 채택되었는가" 자연 이해 가능하도록 발견 모순 명시:
+
+| # | 발견 모순 | 해소 |
+|---|---|---|
+| 1 | `apply_storage(spec)` 가 KIVI residual F16 + quantized Q4 의 mixed dtype 표현 불가 | 결정 #15 — Tier 2 paradigm-specific Stage 흡수 |
+| 2 | StorageSpec trait 의 enum variant 추가 = OCP 위반 (Codebook / Rotation / Tier / SparsePattern axis 매번 추가) | 결정 #15 — StorageSpec 자체 폐기 |
+| 3 | KVCacheView::dtype() 의 mixed paradigm 답 모호 | 결정 #18 — dtype() 폐기 |
+| 4 | EvictionStage 의 score_accumulator field 가 hot path (매 layer collection, backend inline) 와 cold path (eviction phase read) 책임 혼재 | 결정 #17 — asymmetry intentional, 별 sprint |
+| 5 | OneShotKvQuantStage 가 모든 layer 가 KIVI 라고 가정 (downcast 필요) | 결정 #15 Tier 2 — concrete Arc<KIVILayer> 보유, downcast 0 |
+| 6 | TierMoveStage 가 cross-paradigm (StandardLayer / KIVILayer / OffloadLayer 모두) — base trait 에 move_to_secondary() 추가 = OCP 위반 | 결정 #15 Tier 3 — Stage 측 capability trait 정의 |
+| 7 | Stage 가 항상 1 layer 책임 가정 (이전 안) — Eviction / SwapDispatch 등 N layer 필요 | 결정 #16 — cardinality 자유 (1/N/0) |
+| 8 | D2O cosine similarity 가 K read 필요 — KVCacheView::k_raw() 추가 시 paradigm-agnostic 가정 깨짐 | Q-#1-3 미해결 (다음 sub-grill round) |
+| 9 | "PipelineStage 가 모든 cross-cutting 흡수" 시도 — Manager IPC / Outbound / Forward sync 등 본질이 다른 책임 모두 stage 화 시도 시 god abstraction 재발생 | 갈래 B (Boundary 명시) — PipelineStage 적용 범위 = KV/Weight state mutation 한정 |
+| 10 | KVCacheLayer::as_any() 추가 = Tier 2 Stage 가 runtime downcast → type safety 약화 + Q9 호환성 차단 인프라 X 정신 위반 | 결정 #15 — as_any() 부재 명시, Tier 2 가 register 시점 concrete Arc<ConcreteLayer> 보유 |
+
+#### 13.6.5 부록 — llm.npu / mllm-NPU (ASPLOS 2025) 정합도 평가
+
+본 sub-grill 종결 시 사용자 추가 평가 요청 — llm.npu (mllm-NPU, ASPLOS 2025, arxiv 2407.05858) 의 3-level reconstruction 과 본 grill 구조 정합도.
+
+| llm.npu level | 본 grill 구조 정합 | 등급 |
+|---|---|---|
+| **Prompt level chunking** (prefill 을 작은 chunk 로 분할 + early termination) | ✓ — 본 grill `KVCacheLayer::write_kv_batch(pos_range, ...)` primitive + 신규 `PrefillChunkingStage` (Tier 1, cardinality N) 흡수 가능 | GREEN (forward-compat) |
+| **Tensor level outlier** (outlier-aware quantization, GPU/NPU 분할 dispatch) | ✓ — 본 프로젝트 Tensor Partition 패턴 (`arch/tensor_partition.md`) + `LayerDispatch::Partition { gpu_ratio }` 정합 | GREEN (이미 정합) |
+| **Block level scheduling** (Multi-backend per inference + async / out-of-order) | △ — 본 grill 결정 #14 (Layer impl 의 backend ref 보유) 자연 확장으로 multi-backend per layer OK. 단 async / out-of-order 는 PipelineStage sync 가정과 충돌 → 갈래 B (Boundary 명시) 의 적용 사례. `AsyncBlockScheduler` 별 추상화 필요 | YELLOW (부분) |
+
+**본질 트랙 다름**:
+- llm.npu = prefill latency (1000 tok/s) + heterogeneous parallelism (GPU + NPU + CPU 동시)
+- llm.rs = decode TBT (32 ms/tok) + state mutation diversity (KIVI / D2O / SnapKV / Sparse / Swap)
+
+**본 grill 구조의 llm.npu 트랙 흡수도**:
+- **막지 않음 (forward-compat)** — `PrefillChunkingStage` Tier 1 신설 + `LayerDispatch::Partition` 확장 + Layer impl backend ref 보유 (결정 #14) 패턴 모두 본 grill 구조와 정합.
+- **흡수도 안 함** — async / out-of-order block scheduling 은 본 sprint scope 외. 별 sprint (Phase NPU-1~5) 로 점진 도입 가능.
+
+**Phase NPU-1~5 가설 plan** (별 sprint, 본 sprint scope 외):
+- **Phase NPU-1**: `PrefillChunkingStage` Tier 1 신설 + chunk-aware prefill primitive 검증 (early termination + chunk boundary phase)
+- **Phase NPU-2**: Tensor Partition 의 outlier-aware quantization 확장 (GPU/NPU 분할 dispatch)
+- **Phase NPU-3**: `AsyncBlockScheduler` 별 추상화 — PipelineStage sync 가정 외 별 trait
+- **Phase NPU-4**: Multi-backend per inference (Layer impl 별 다른 backend) production wiring
+- **Phase NPU-5**: out-of-order block scheduling — Forward path async pipeline
+
+**본 sprint 와의 boundary 명시**:
+본 sprint scope 에서 llm.npu 트랙 흡수 시도하지 않는 게 정직 (갈래 B 정신 일관). 본 grill 구조가 forward-compat 만 보장.
 
 ---
 
@@ -1312,26 +1735,33 @@ INV-DECODE-STAGE-002 / 003 의 정신은 다음에 흡수되어 보존:
 
 ---
 
-## 16. 본 grill 2026-05-28 후속 결정 요약 (KvBundle/WeightBundle grill 종결)
+## 16. 본 grill 2026-05-28 + 본 sub-grill 2026-05-28~29 후속 결정 요약 (KvBundle/WeightBundle grill 종결 + 3-tier Stage 패턴)
 
-본 grill (2026-05-28) 은 이전 grill (2026-05-27, HEAD `6f07af8d`) 의 KvBundle 8 method / WeightBundle 10 method 시그니처 결정을 재검토했다. 결정 14 건 누적 (본문 결정 12 + post-grill 후속 결정 13/14):
+본 grill (2026-05-28) 은 이전 grill (2026-05-27, HEAD `6f07af8d`) 의 KvBundle 8 method / WeightBundle 10 method 시그니처 결정을 재검토했다. **본 sub-grill (2026-05-28~29) 은 본 grill 결정 위에 KVCacheLayer / WeightLayer 시그니처 detail finalize 과정에서 발견한 모순 10건을 해결하는 4 결정 + 갈래 B (Boundary 명시) 메타 결정을 추가**. 누적 18 건 (본문 결정 12 + post-grill 후속 결정 13/14 + 본 sub-grill 결정 15~18):
 
-| # | 결정 | 의미 / 이전 결정과의 관계 |
-|---|---|---|
-| 1 | **(β) sync model** | Buffer-level lazy + access-mode-aware. R1/R2/R3 자동. **새 sync 인프라 0건 필요**. INV-KVBUNDLE-SYNC 폐기. |
-| 2 | **(d-1) primitive only — storage-format-agnostic** | KVCacheLayer method 가 token/layer/range granularity 만 알고 storage paradigm 모름. KVCacheLayer impl 이 mechanism 캡슐화. |
-| 3 | **Q7 (A) 유지** (AttentionKernels sub-trait 분리 (A') 보류) | 본 프로젝트 KiviAttentionBackend / GpuScoreAccess 패턴 + frequency × cost 정당화 부족. |
-| 4 | **Q8 Mixed storage 허용** | Layer 별 다른 storage paradigm OK. |
-| 5 | **Q9 호환성 차단 인프라 X** | 만나면 panic. |
-| 6 | **KvBundle / WeightBundle trait 폐기** | 본 프로젝트가 이미 Bundle 없이 동작. Stage register 시점 layer handle 보관 → ctx layer field 자체 폐기. |
-| 7 | **StageContext 5 field → 3 field** | `kv` / `weights` 폐기. `step` / `backend_ext` / `profiler` 유지. |
-| 8 | **(γ) Layer handle 전환** | KVCacheLayer / WeightLayer trait + interior mutability. Stage 가 `Arc<dyn ...>` 보관. LayerSlot::rcu_weights 자연 확장. |
-| 9 | **KV dispatch 갈래 2 Trait object 전면 채택** | KVCacheOps generic → KVCacheLayer trait object. **kv_cache_ops.rs:53 정책 정면 반전 → ADR-0001 작성 필수**. |
-| 10 | **Weight dispatch: LayerSlot 유지 + WeightLayer trait wrap** | Weight 도메인은 이미 RCU 패턴 (γ 정합). Forward path 무변경. ~5 file 추가만. **KV 와 비대칭**. |
-| 11 | **Sprint 분리: Phase α-W → ADR-0001 → Phase α-K** | Phase α-W (Weight + PipelineStage 인프라, low risk, 2-3주) 먼저. Risk 분산 + escape hatch. |
-| 12 | **LayerDispatch enum: Fixed 3 variant (Full/Skip/Partition)** | Dispatch paradigm frequency 낮음 (연 1건 미만). enum + match exhaustive 가독성 우월. |
-| **13** | **PipelineDispatcher trait 유지** (post-grill 후속) | 단일 impl 우려에도 trait 유지. 근거: (a) deletion test — trait 폐기 시 DecodeLoop 이 concrete `Arc<PipelineRegistry>` 결합 → INV-LAYER-006 위반, (b) mock 패턴 정합 (mock_engine/mock_manager 정착 + 미래 NoopDispatcher / TestMockDispatcher 보장), (c) vtable cost ~3 μs/sec (noise 이하) — 결정 9 일관성. 위치 재검토 (L2 vs L4) 는 별 sub-grill (R5 #10). |
-| **14** | **BackendExtensions trait 폐기** (post-grill 후속) | §13.8-L Backend trait capability provider 패턴 (`backend.gpu_score_acc()`, `backend.as_kivi_attention()`) 이 이미 정착 → `BackendExtensions` trait 은 중복 추상화 + leaky abstraction (`as_opencl_secondary()` 명명 leak). (γ) 정신 일관 적용 — Stage 는 mechanism 모름, Layer impl 이 backend ref 보유 + capability 내부 호출. **StageContext 3 → 2 field** (`step` / `profiler` 만). Backend trait Stage 2 sprint 명명 정합 + Layer impl backend ref 보유 패턴 sub-grill 2건 분리 (R5 #11/#12). |
+| # | 결정 | 의미 / 이전 결정과의 관계 | Sprint 영향 |
+|---|---|---|---|
+| 1 | **(β) sync model** | Buffer-level lazy + access-mode-aware. R1/R2/R3 자동. **새 sync 인프라 0건 필요**. INV-KVBUNDLE-SYNC 폐기. | — |
+| 2 | **(d-1) primitive only — storage-format-agnostic** | KVCacheLayer method 가 token/layer/range granularity 만 알고 storage paradigm 모름. KVCacheLayer impl 이 mechanism 캡슐화. | — |
+| 3 | **Q7 (A) 유지** (AttentionKernels sub-trait 분리 (A') 보류) | 본 프로젝트 KiviAttentionBackend / GpuScoreAccess 패턴 + frequency × cost 정당화 부족. | — |
+| 4 | **Q8 Mixed storage 허용** | Layer 별 다른 storage paradigm OK. | — |
+| 5 | **Q9 호환성 차단 인프라 X** | 만나면 panic. | — |
+| 6 | **KvBundle / WeightBundle trait 폐기** | 본 프로젝트가 이미 Bundle 없이 동작. Stage register 시점 layer handle 보관 → ctx layer field 자체 폐기. | Phase α-W |
+| 7 | **StageContext 5 field → 3 field** | `kv` / `weights` 폐기. `step` / `backend_ext` / `profiler` 유지. | Phase α-W |
+| 8 | **(γ) Layer handle 전환** | KVCacheLayer / WeightLayer trait + interior mutability. Stage 가 `Arc<dyn ...>` 보관. LayerSlot::rcu_weights 자연 확장. | Phase α-W |
+| 9 | **KV dispatch 갈래 2 Trait object 전면 채택** | KVCacheOps generic → KVCacheLayer trait object. **kv_cache_ops.rs:53 정책 정면 반전 → ADR-0001 작성 필수**. | Phase α-K |
+| 10 | **Weight dispatch: LayerSlot 유지 + WeightLayer trait wrap** | Weight 도메인은 이미 RCU 패턴 (γ 정합). Forward path 무변경. ~5 file 추가만. **KV 와 비대칭**. | Phase α-W |
+| 11 | **Sprint 분리: Phase α-W → ADR-0001 → Phase α-K** | Phase α-W (Weight + PipelineStage 인프라, low risk, 2-3주) 먼저. Risk 분산 + escape hatch. | Sprint 분리 |
+| 12 | **LayerDispatch enum: Fixed 3 variant (Full/Skip/Partition)** | Dispatch paradigm frequency 낮음 (연 1건 미만). enum + match exhaustive 가독성 우월. | Phase α-W |
+| **13** | **PipelineDispatcher trait 유지** (post-grill 후속) | 단일 impl 우려에도 trait 유지. 근거: (a) deletion test — trait 폐기 시 DecodeLoop 이 concrete `Arc<PipelineRegistry>` 결합 → INV-LAYER-006 위반, (b) mock 패턴 정합 (mock_engine/mock_manager 정착 + 미래 NoopDispatcher / TestMockDispatcher 보장), (c) vtable cost ~3 μs/sec (noise 이하) — 결정 9 일관성. 위치 재검토 (L2 vs L4) 는 별 sub-grill (R5 #10). | Phase α-W |
+| **14** | **BackendExtensions trait 폐기** (post-grill 후속) | §13.8-L Backend trait capability provider 패턴 (`backend.gpu_score_acc()`, `backend.as_kivi_attention()`) 이 이미 정착 → `BackendExtensions` trait 은 중복 추상화 + leaky abstraction (`as_opencl_secondary()` 명명 leak). (γ) 정신 일관 적용 — Stage 는 mechanism 모름, Layer impl 이 backend ref 보유 + capability 내부 호출. **StageContext 3 → 2 field** (`step` / `profiler` 만). Backend trait Stage 2 sprint 명명 정합 + Layer impl backend ref 보유 패턴 sub-grill 2건 분리 (R5 #11/#12). | Phase α-W |
+| **15** | **3-tier Stage 패턴 (본 sub-grill 2026-05-28~29)** | Tier 1 Primitive-only (`Arc<dyn KVCacheLayer>` / `Arc<dyn WeightLayer>`, base trait method 만) / Tier 2 Paradigm-specific (`Arc<ConcreteLayer>` 예 `Arc<KIVILayer>`, concrete struct method 직접 호출, downcast 0) / Tier 3 Cross-paradigm (`Arc<dyn CapabilityTrait>`, capability trait Stage 측 정의 — base trait 변경 0, OCP 보존). **부산물**: `StorageSpec` / `WeightStorageSpec` trait 폐기 (Q24-5 자연 해소), `apply_storage(spec)` method 폐기, `KVCacheLayer::as_any()` 부재 (downcast 의도적 차단). | **Phase α-W 직접** |
+| **16** | **Stage cardinality 자유 (1/N/0 layer)** (본 sub-grill 2026-05-28~29) | 임의 1-layer-per-stage 가정 폐기. 1 layer (signal-driven paradigm-specific) / N layer (cross-layer policy) / 0 layer (backend-only). 본 grill 결정 #6 자연 해석 명문화. | **Phase α-W 직접** |
+| **17** | **Score 도메인 별 sprint — pragmatic deferral + asymmetry intentional** (본 sub-grill 2026-05-28~29) | EvictionHook → EvictionStage 1:1 wrap. `score_accumulator: Option<AttentionScoreAccumulator>` field 보존 (concrete type). 본 sprint 에서 score 도메인 재설계 안 함. **핵심 발견**: Score 도메인은 hot path (collection 매 layer = backend inline) / cold path (aggregation+read = PipelineStage) 의 자연 책임 분리. 이 asymmetry 가 어색이 아니라 도메인 본질의 정직한 표현 — 통일 패턴 강제 안 함. 별 sprint 추천 갈래 4/7/2, Pre-rejected 1/3/5/8. | 별 sprint |
+| **18** | **`KVCacheView::dtype()` 폐기** (본 sub-grill 2026-05-28~29) | dtype 사용처 5건 모두 backend impl 내부 또는 layer 내부 — 외부 노출 0 필요. Mixed paradigm (KIVI residual F16 + quantized Q4) 의미 모호 → 단일 dtype() 답 없음. INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 정신 정합. Backend / Layer 내부 보관. Profiler / Manager IPC 가 layer dtype 필요 시 별 capability trait (`LayerProfileable`) 또는 backend trait 경로. | **Phase α-W 직접** |
+
+**메타 결정 — 갈래 B (Boundary 명시, 본 sub-grill 2026-05-28~29)**:
+본 sub-grill 의 모든 발견 모순 10건 (§13.6.4 매트릭스) 의 본질 = **"single pattern fits all" 가정의 한계**. PipelineStage 가 모든 cross-cutting 책임을 흡수하려 하지 않는다. 채택: PipelineStage 적용 범위 = **KV/Weight state mutation 도메인 한정**. Cross-cutting (score collection / dispatch / cross-paradigm policy / Backend capability) = **자기 패턴 인정**. 발견된 asymmetry 는 도메인 본질의 정직한 표현 — **intentional**.
 
 ### 16.1 KV vs Weight 도메인 비대칭 — 본 grill 핵심 발견
 
@@ -1361,4 +1791,8 @@ Sprint 분리 (결정 #11) 의 직접 근거.
 | 단일 Phase α 2-3주 | Phase α-W → ADR-0001 → Phase α-K 분리 | KV/Weight 도메인 비대칭. 큰 risk 위에 큰 risk 쌓지 않음. |
 | (PipelineDispatcher 단일 impl 우려) | **trait 유지** (본 grill 후속 결정 13) | deletion test 결과 INV-LAYER-006 위반 + 본 프로젝트 mock 패턴 (mock_engine/mock_manager) 정착 → 미래 impl ≥ 2 보장 (NoopDispatcher / TestMockDispatcher) + vtable cost ~3 μs/sec (noise 이하). 단일 impl 우려 반박. |
 | BackendExtensions trait 신설 (3 method `as_opencl_secondary` / `gpu_score_acc` / `host_ptr_swap_pool`) | **폐기** (본 grill 후속 결정 14) | §13.8-L Backend trait capability provider 패턴 (`backend.gpu_score_acc()`, `backend.as_kivi_attention()`) 중복 추상화 + leaky abstraction (`as_opencl_secondary()` backend variant 명명 leak). (γ) 정신 일관 — Layer impl 이 backend ref 보유 + capability 내부 호출. StageContext 3 → 2 field (`step` / `profiler` 만). |
+| `apply_storage(spec)` + `StorageSpec` / `WeightStorageSpec` trait 신설 (Dtype/Codebook/Rotation/Tier/SparsePattern axis enum) | **폐기** (본 sub-grill 결정 #15) | 3-tier Stage 패턴 채택 — Tier 2 paradigm-specific Stage 가 `Arc<ConcreteLayer>` (예: `Arc<KIVILayer>`) 보유 + concrete struct method 직접 호출로 흡수. spec object 패턴 불필요. Q24-5 자연 해소. KVCacheLayer mutation primitive 5 → 3 (write_kv / write_kv_batch / compact). WeightLayer method 4 → 3 (idx / view / apply_dispatch). |
+| 임의 "Stage 가 1 layer 보유" 가정 (이전 안 예시 시그니처) | **cardinality 자유** (본 sub-grill 결정 #16) | 1 layer (signal-driven paradigm-specific, 예: KviQuantizeStage) / N layer (cross-layer policy, 예: EvictionStage) / 0 layer (backend-only, 예: OneShotSwitchDeviceStage). 본 grill 결정 #6 자연 해석 명문화. §5.3 Stage 종류 매트릭스에 cardinality + tier 컬럼 추가. |
+| EvictionHook → EvictionStage 의 score_accumulator 처리 미확정 | **pragmatic deferral + 별 sprint** (본 sub-grill 결정 #17) | EvictionHook 1:1 wrap. score_accumulator field 보존 (concrete type). Score 도메인 hot path (backend inline collection) / cold path (PipelineStage on_phase aggregation+read) asymmetry **intentional** — 도메인 본질의 정직한 표현. 별 sprint refactor (§13.6.1 #17). |
+| `KVCacheView::dtype() -> KvDtype` method 노출 (이전 안) | **폐기** (본 sub-grill 결정 #18) | dtype 사용처 5건 모두 backend impl 내부 / layer 내부 — 외부 노출 0 필요. Mixed paradigm 의미 모호. INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 정신 정합. Backend / Layer 내부 보관. Profiler / Manager IPC 필요 시 별 capability trait (`LayerProfileable`) 또는 backend trait 경로. |
 

@@ -1,36 +1,111 @@
-# Handoff — KvBundle/WeightBundle Grill 종결 → Phase α-W 진입
+# Handoff — KvBundle/WeightBundle Grill 종결 → Phase α-W 진입 (본 sub-grill 2026-05-28~29 누적)
 
-> **일자**: 2026-05-28
+> **일자**: 2026-05-28 (본 grill) + 2026-05-28~29 (본 sub-grill 누적)
 > **작성자**: Architect (orchestrator 보고용)
-> **진입 문장**: **"Pipeline stage Phase α-W 진입 — Weight + PipelineStage 인프라 + Bundle 폐기"**
+> **진입 문장 (현재)**: **"본 sub-grill 잔여 미해결 sub-trait detail finalize — Q-#1-3 K/V raw read 노출 여부 부터"**
+> **이전 진입 문장 (본 sub-grill 후 supersede)**: ~~"Pipeline stage Phase α-W 진입 — Weight + PipelineStage 인프라 + Bundle 폐기"~~
 > **선행 문서**:
-> - `arch/pipeline_stage_design.md` (본 sprint 단일 진실원본, 2026-05-27 23 라운드 grill + **2026-05-28 본 grill 12 결정** 반영)
+> - `arch/pipeline_stage_design.md` (본 sprint 단일 진실원본, 2026-05-27 23 라운드 grill + **2026-05-28 본 grill 12 결정 + 후속 2 결정 + 2026-05-28~29 본 sub-grill 4 결정 + 갈래 B 메타 결정** 반영. **§0 Executive Overview 진입점**.)
 > - `docs/adr/0001-kv-dispatch-paradigm.md` (KV dispatch Generic → Trait object 정식 결정)
-> - `spec/41-invariants.md` §3.28 (INV-DECODE-STAGE-001/004~007 + INV-KVCACHELAYER-* + INV-STAGE-LAYER-HANDLE; INV-DECODE-STAGE-002/003 폐기)
+> - `spec/41-invariants.md` §3.28 (INV-DECODE-STAGE-001/004~007 + INV-KVCACHELAYER-* + INV-STAGE-LAYER-HANDLE; INV-DECODE-STAGE-002/003 폐기; INV-LAYER-006 / INV-STAGE-LAYER-HANDLE / INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 본문 갱신 — 본 sub-grill 결정 반영)
 > **이전 handoff**: `.agent/todos/handoff_pipeline_stage_design_2026_05_27.md` — 본 grill 결정으로 supersede (Phase α 분리 등). 이전 handoff 의 일부 결정사항은 본 grill 에서 변경됨, 변경 매트릭스는 R6 참조.
 
 ---
 
-## R1. What was decided (결정사항 요약 — 본 grill 14 결정)
+## R0. 본 sub-grill (2026-05-28~29) 후 신규 진입점
 
-### 본 grill 누적 결정 14 건 (본문 12 + post-grill 후속 2)
+본 sub-grill 종결 후 다음 세션 진입 추천 순서:
 
-| # | 결정 | 의미 |
-|---|---|---|
-| 1 | **(β) sync model** | Buffer-level lazy + access-mode-aware. R1/R2/R3 자동. 새 sync 인프라 0건. INV-KVBUNDLE-SYNC 폐기. |
-| 2 | **(d-1) primitive only — storage-format-agnostic** | KVCacheLayer method 가 token/layer/range granularity 만 알고 storage paradigm 모름. KVCacheLayer impl 이 mechanism 캡슐화. |
-| 3 | **Q7 (A) 유지** (AttentionKernels sub-trait 분리 (A') 보류) | 본 프로젝트 KiviAttentionBackend / GpuScoreAccess 패턴 + frequency × cost 정당화 부족. |
-| 4 | **Q8 Mixed storage 허용** | Layer 별 다른 storage paradigm OK (layer 0 = KIVI Q4, layer 1 = TurboQuant, ...). |
-| 5 | **Q9 호환성 차단 인프라 X** | 만나면 panic. |
-| 6 | **KvBundle / WeightBundle trait 폐기** | Stage register 시점 layer handle 보관 → ctx layer field 자체 폐기. |
-| 7 | **StageContext 5 field → 3 field** | `kv` / `weights` 폐기. `step` / `backend_ext` / `profiler` 유지. |
-| 8 | **(γ) Layer handle 전환** | KVCacheLayer / WeightLayer trait + interior mutability. Stage 가 `Arc<dyn ...>` 보관. LayerSlot::rcu_weights 자연 확장. |
-| 9 | **KV dispatch 갈래 2 Trait object 전면 채택** | kv_cache_ops.rs:53 정책 정면 반전. **ADR-0001 작성 필수**. 갈래 1/3/4 REJECTED. |
-| 10 | **Weight dispatch: LayerSlot + WeightLayer thin wrap** | Forward path 무변경. ~5 file 추가. KV 와 비대칭. |
-| 11 | **Sprint 분리: Phase α-W → ADR-0001 → Phase α-K** | Risk 분산 + escape hatch. |
-| 12 | **LayerDispatch enum: Fixed 3 variant (Full / Skip / Partition)** | enum + match exhaustive 가독성 우월. |
-| **13** | **PipelineDispatcher trait 유지** (post-grill 후속) | 단일 impl 우려 반박 — deletion test (INV-LAYER-006 위반) + mock 패턴 정합 (mock_engine/mock_manager 정착) + vtable cost noise 이하. 위치 (L2 vs L4) 만 별 sub-grill (R5 #10). |
-| **14** | **BackendExtensions trait 폐기** (post-grill 후속) | §13.8-L Backend trait capability provider 패턴 중복 추상화 + `as_opencl_secondary()` 명명 leak. (γ) 정신 일관 — Layer impl 이 backend ref 보유 + capability 내부 호출. **StageContext 3 → 2 field** (`step` / `profiler` 만). Sub-grill 2건 분리 (R5 #11/#12). |
+### 신규 진입 추천 순서
+
+1. **Q-#1-3 — K/V raw read 노출 여부** (다음 sub-grill 진입점, R5 #1 Q24-1 detail)
+   - D2O cosine similarity 가 K read 필요 — KVCacheView 에 raw K/V slice 노출 요구.
+   - 갈래 (a) noexpose + paradigm-specific helper / (b) raw K/V slice 노출 (paradigm-agnostic 가정 깨짐) / (c) Tier 3 capability trait (`Arc<dyn DenseKVRead>`)
+2. **Q-#1-4 — capacity 중복** (Q-#1-3 와 같은 sub-grill round)
+3. **Q-#1-5 — mutation 누설** (Q-#1-3/4 와 같은 sub-grill round)
+4. **#2 — WeightLayerView** (Phase α-W 진입 전)
+5. **#3 — SecondaryStore** (Phase α-W 진입과 같이 진행)
+6. **#4 — SparsePattern** (별 sprint)
+7. **#6 — system/ 명명** (Phase α-W stages/ 디렉토리 신설 commit 전)
+8. **#11 — Layer impl backend ref 보유 패턴** (Phase α-W 진입 전 필수)
+9. **#12 — KVCacheLayer / WeightLayer impl 시그니처 detail finalize** (Phase α-W 진입 전 필수)
+
+본 sub-grill 결정 4 건 + 갈래 B 메타 결정 요약은 R1 참조. 미해결 sub-grill 매트릭스는 R5 + arch §13.6 참조.
+
+### 본 sub-grill (2026-05-28~29) 누적 결정 요약
+
+- **결정 #15**: 3-tier Stage 패턴 (Tier 1 Primitive-only / Tier 2 Paradigm-specific concrete Arc / Tier 3 Cross-paradigm capability trait Stage 측 정의). 부산물: `StorageSpec` 폐기, `apply_storage(spec)` method 폐기, `KVCacheLayer::as_any()` 부재.
+- **결정 #16**: Stage cardinality 자유 (1/N/0 layer).
+- **결정 #17**: Score 도메인 별 sprint (pragmatic deferral + asymmetry intentional). EvictionHook 1:1 wrap. R5 #13 신규 등록.
+- **결정 #18**: `KVCacheView::dtype()` 폐기. Backend / Layer 내부 보관.
+- **메타 결정 — 갈래 B (Boundary 명시)**: PipelineStage 적용 범위 = KV/Weight state mutation 한정. Cross-cutting 은 자기 패턴 인정. asymmetry intentional.
+
+### llm.npu / mllm-NPU (ASPLOS 2025) 정합도 평가
+
+본 grill 구조 vs llm.npu 3-level reconstruction:
+- **Prompt level chunking** → ✓ GREEN (`PrefillChunkingStage` Tier 1 신설 가능, forward-compat)
+- **Tensor level outlier** → ✓ GREEN (Tensor Partition 패턴 + `LayerDispatch::Partition` 정합)
+- **Block level scheduling** → △ YELLOW (Layer impl backend ref 보유 = OK, 단 async/out-of-order PipelineStage sync 가정 충돌 → `AsyncBlockScheduler` 별 추상화 필요)
+
+본 sprint scope 외, 본 grill 구조가 **막지 않음 (forward-compat)** 단 흡수도 안 함. Phase NPU-1~5 가설 plan 으로 점진 도입 가능. 상세는 arch §13.6.5.
+
+### Architect 위임 누적 변경 매트릭스 (본 sub-grill commit 후 상태)
+
+| 파일 | 변경 내역 |
+|---|---|
+| `arch/pipeline_stage_design.md` | §0 Executive Overview 신설 + §3.5/3.6/5.2/5.3/5.4/13.1 갱신 (3-tier 패턴 + cardinality + StorageSpec 폐기 + dtype 폐기) + §13.6 본 sub-grill 매트릭스 신설 (결정 4 + 갈래 B + 미해결 9건 + 발견 모순 10건 + llm.npu 부록) + §16 누적 결정 14 → 18 + §16.3 변경 추적성 4 row 추가 |
+| `spec/41-invariants.md` | INV-LAYER-006 본문 갱신 (PipelineDispatcher 위치 L4 finalize) + INV-STAGE-LAYER-HANDLE 본문 갱신 (3-tier + cardinality 자유) + INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 본문 보강 (Tier 1 한정 + dtype 노출 X) + §3.28 변경 요약에 본 sub-grill 5 결정 추가 |
+| `arch/README.md` | pipeline_stage_design.md 행 갱신 + 본 sub-grill (2026-05-28~29) callout 절 추가 (3차 review 표시: §0 Overview + 4 결정 + 갈래 B + llm.npu 정합도) |
+| `.agent/todos/handoff_kv_weight_grill_2026_05_28.md` | R0 신규 진입점 + R1 결정 14 → 18 + R5 #5 StorageSpec 해소 + #10 위치 결정 (L4 finalize) + #13/#14 신규 등록 + R6 본 sub-grill 변경 내역 명시 + 자기점검 row 추가 |
+
+신규 file 작성 없음 (handoff 통합). 다음 세션 진입은 본 파일 R0 + arch §0 Executive Overview 동시 진입.
+
+### 자기점검 (handoff-doc 스킬, 본 sub-grill 진입 검증)
+
+| 점검 항목 | 확인 |
+|----------|------|
+| 진입 문장 신규 | "본 sub-grill 잔여 미해결 sub-trait detail finalize — Q-#1-3 K/V raw read 노출 여부 부터" |
+| §0 Executive Overview 진입점 | arch/pipeline_stage_design.md §0 standalone 으로 본 sprint 전체 그림 파악 가능 |
+| 누적 결정 명시 | 본 grill 14 (12 + 후속 2) + 본 sub-grill 4 = 18 결정 + 갈래 B 메타 결정 |
+| 미해결 sub-grill 매트릭스 | R5 (Q-#1-3~#12, 9건) + arch §13.6.3 (동일 표) |
+| 발견 모순 매트릭스 | arch §13.6.4 (10건) → 갈래 B 채택 근거 |
+| llm.npu 정합도 평가 | arch §13.6.5 부록 (Phase NPU-1~5 가설 plan, 본 sprint scope 외 forward-compat) |
+| Architect 위임 누적 변경 매트릭스 | R0 (4 파일 변경 내역) |
+| 신규 sub-grill 등록 (Score 도메인) | R5 #13 + #14 (Multiple EvictionStage) |
+
+---
+
+## R1. What was decided (결정사항 요약 — 본 grill 14 결정 + 본 sub-grill 4 결정 = 누적 18)
+
+### 본 grill + 본 sub-grill 누적 결정 18 건 (본문 12 + post-grill 후속 2 + 본 sub-grill 4)
+
+| # | 결정 | 의미 | 출처 |
+|---|---|---|---|
+| 1 | **(β) sync model** | Buffer-level lazy + access-mode-aware. R1/R2/R3 자동. 새 sync 인프라 0건. INV-KVBUNDLE-SYNC 폐기. | 본 grill |
+| 2 | **(d-1) primitive only — storage-format-agnostic** | KVCacheLayer method 가 token/layer/range granularity 만 알고 storage paradigm 모름. KVCacheLayer impl 이 mechanism 캡슐화. | 본 grill |
+| 3 | **Q7 (A) 유지** (AttentionKernels sub-trait 분리 (A') 보류) | 본 프로젝트 KiviAttentionBackend / GpuScoreAccess 패턴 + frequency × cost 정당화 부족. | 본 grill |
+| 4 | **Q8 Mixed storage 허용** | Layer 별 다른 storage paradigm OK (layer 0 = KIVI Q4, layer 1 = TurboQuant, ...). | 본 grill |
+| 5 | **Q9 호환성 차단 인프라 X** | 만나면 panic. | 본 grill |
+| 6 | **KvBundle / WeightBundle trait 폐기** | Stage register 시점 layer handle 보관 → ctx layer field 자체 폐기. | 본 grill |
+| 7 | **StageContext 5 field → 3 field** | `kv` / `weights` 폐기. `step` / `backend_ext` / `profiler` 유지. | 본 grill |
+| 8 | **(γ) Layer handle 전환** | KVCacheLayer / WeightLayer trait + interior mutability. Stage 가 `Arc<dyn ...>` 보관. LayerSlot::rcu_weights 자연 확장. | 본 grill |
+| 9 | **KV dispatch 갈래 2 Trait object 전면 채택** | kv_cache_ops.rs:53 정책 정면 반전. **ADR-0001 작성 필수**. 갈래 1/3/4 REJECTED. | 본 grill |
+| 10 | **Weight dispatch: LayerSlot + WeightLayer thin wrap** | Forward path 무변경. ~5 file 추가. KV 와 비대칭. | 본 grill |
+| 11 | **Sprint 분리: Phase α-W → ADR-0001 → Phase α-K** | Risk 분산 + escape hatch. | 본 grill |
+| 12 | **LayerDispatch enum: Fixed 3 variant (Full / Skip / Partition)** | enum + match exhaustive 가독성 우월. | 본 grill |
+| **13** | **PipelineDispatcher trait 유지** (post-grill 후속) | 단일 impl 우려 반박 — deletion test (INV-LAYER-006 위반) + mock 패턴 정합 (mock_engine/mock_manager 정착) + vtable cost noise 이하. 위치 (L2 vs L4) 만 별 sub-grill (R5 #10). | 본 grill 후속 |
+| **14** | **BackendExtensions trait 폐기** (post-grill 후속) | §13.8-L Backend trait capability provider 패턴 중복 추상화 + `as_opencl_secondary()` 명명 leak. (γ) 정신 일관 — Layer impl 이 backend ref 보유 + capability 내부 호출. **StageContext 3 → 2 field** (`step` / `profiler` 만). Sub-grill 2건 분리 (R5 #11/#12). | 본 grill 후속 |
+| **15** | **3-tier Stage 패턴 (Tier 1 Primitive-only / Tier 2 Paradigm-specific / Tier 3 Cross-paradigm)** | Tier 2 concrete `Arc<ConcreteLayer>` register 시점 compile-time type 강제, downcast 0. Tier 3 capability trait Stage 측 정의 (base trait 변경 0, OCP 보존). **부산물**: `StorageSpec` / `WeightStorageSpec` trait 폐기 (Q24-5 자연 해소), `apply_storage(spec)` method 폐기, `KVCacheLayer::as_any()` 부재. | **본 sub-grill (2026-05-28~29)** |
+| **16** | **Stage cardinality 자유 (1/N/0 layer)** | 임의 1-layer 가정 폐기. 1 layer (signal-driven paradigm-specific) / N layer (cross-layer policy) / 0 layer (backend-only). 본 grill 결정 #6 자연 해석 명문화. | **본 sub-grill (2026-05-28~29)** |
+| **17** | **Score 도메인 별 sprint — pragmatic deferral + asymmetry intentional** | EvictionHook → EvictionStage 1:1 wrap. score_accumulator field 보존 (concrete type). Score 도메인 hot path (collection backend inline) / cold path (aggregation+read PipelineStage) 의 자연 책임 분리 — asymmetry intentional. 별 sprint 추천 갈래 4/7/2, Pre-rejected 1/3/5/8. R5 #13 신규 등록. | **본 sub-grill (2026-05-28~29)** |
+| **18** | **`KVCacheView::dtype()` 폐기** | dtype 사용처 5건 모두 backend / layer 내부 — 외부 노출 0 필요. Mixed paradigm 의미 모호. INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 정신 정합. Backend / Layer 내부 보관. Profiler / Manager IPC 필요 시 별 capability trait (`LayerProfileable`) 또는 backend trait 경로. | **본 sub-grill (2026-05-28~29)** |
+
+### 메타 결정 — 갈래 B (Boundary 명시, 본 sub-grill 2026-05-28~29)
+
+본 sub-grill 의 발견 모순 10건 (arch §13.6.4) 의 본질 = **"single pattern fits all" 가정의 한계**. PipelineStage 가 모든 cross-cutting 책임을 흡수하려 하지 않는다. 채택:
+- **PipelineStage 적용 범위 = KV/Weight state mutation 도메인 한정**
+- **Cross-cutting (score collection / dispatch / cross-paradigm policy / Backend capability) = 자기 패턴 인정**
+- **발견된 asymmetry 는 도메인 본질의 정직한 표현 — intentional**
 
 ### Spec INV 변경 (본 grill 결정 → 카탈로그 반영)
 
@@ -167,12 +242,12 @@
 
 ### Phase α-W 진입 전
 
-1. **sub-trait detail finalize** (`arch/pipeline_stage_design.md` §13.1):
-   - **Q24-1**: `KVCacheView` (KVCacheLayer::view 반환 type)
-   - **Q24-2**: `WeightLayerView` (WeightLayer::view 반환 type) — Llama / Qwen / Mistral 흡수
+1. **sub-trait detail finalize** (`arch/pipeline_stage_design.md` §13.1 / §13.6):
+   - **Q24-1**: `KVCacheView` (KVCacheLayer::view 반환 type) — 본 sub-grill 결정 #18 (dtype 폐기) 반영. Q-#1-3 (K/V raw read 노출) / Q-#1-4 (capacity 중복) / Q-#1-5 (mutation 누설) 미해결.
+   - **Q24-2**: `WeightLayerView` (WeightLayer::view 반환 type) — Llama / Qwen / Mistral 흡수. dtype() 부재 정합 (결정 #18).
    - **Q24-3**: `SecondaryStore` (backlog [P2] `arch/weights_pressure_split.md §7.5` 확정, Phase α-W 와 같이 진행)
    - **Q24-4**: `SparsePattern` (stub or 별 sprint)
-   - **Q24-5 (신규)**: `StorageSpec` + `WeightStorageSpec` (apply_storage 흡수 spec object 시그니처)
+   - **~~Q24-5 (해소 본 sub-grill 2026-05-28~29)~~**: ~~`StorageSpec` + `WeightStorageSpec`~~ — **자연 폐기** (본 sub-grill 결정 #15 — 3-tier Stage 패턴 채택 → Tier 2 paradigm-specific Stage 가 concrete struct method 직접 호출로 흡수, spec object 패턴 불필요).
 
 ### Phase α-K 진입 전 (R-G2 + R-G4 mitigation)
 
@@ -216,13 +291,15 @@
 
 본 grill 후속 결정 13 (PipelineDispatcher trait 유지) + 결정 14 (BackendExtensions trait 폐기) 누적 결과 추가 sub-grill 3 건 등록. arch §13.5 참조.
 
-10. **`PipelineDispatcher` trait 위치 재검토** (별 sub-grill, Phase α-W detail):
-    - 본 grill 후속 결정 13 에서 trait **유지** 확정 (deletion test PASS + INV-LAYER-006 강제 + mock 패턴 정합). 단 위치만 미해결.
-    - §6.1 sequence 점검 — 모든 `dispatch()` 호출지가 L4 `DecodeLoop::run()` 또는 L4 `Forward::step()` 내부 (`PreLayer` / `PostLayer` phase) 안. L3 inference code 호출 없음 → L2 위치 정당화 약함, L4 `session/` 이동 가능.
-    - 갈래:
-      - (A) L2 유지 — abstraction primitive 정신 보존, future-proof
-      - (B) L4 `session/` 이동 — 실제 사용 위치 기반 정합
-    - 결정 시점: Phase α-W stages/ 디렉토리 신설 commit 전 (PipelineRegistry impl 위치와 같이)
+10. ~~**`PipelineDispatcher` trait 위치 재검토** (별 sub-grill, Phase α-W detail)~~ — **결정 본 sub-grill 2026-05-28~29: L4 `engine/src/session/` finalize**:
+    - 본 grill 후속 결정 13 에서 trait **유지** 확정 (deletion test PASS + INV-LAYER-006 강제 + mock 패턴 정합).
+    - 본 sub-grill (2026-05-28~29) 에서 위치 **L4 `engine/src/session/`** finalize 확정. 근거:
+      - §6.1 sequence 점검 — 모든 `dispatch()` 호출지가 L4 `DecodeLoop::run()` 또는 L4 `Forward::step()` 내부 (`PreLayer` / `PostLayer` phase) 안. L3 inference code 호출 없음 → L4 정합.
+      - PipelineRegistry impl 위치 (L4 `session/pipeline_registry.rs`) 와 trait 위치 같은 sub-directory 로 통일 → discoverability + cohesion.
+      - INV-LAYER-006 본문 갱신 (spec/41-invariants.md) — PipelineDispatcher trait 위치 = L4 명시.
+    - 갈래 (rejected):
+      - ~~(A) L2 유지~~ — abstraction primitive 정신 보존 명목이나 실제 사용 위치 L4 한정으로 정당화 약함
+      - **(B) L4 `session/` 이동** — **CHOSEN**, 실제 사용 위치 기반 정합 + impl 과 같은 sub-directory
 
 11. **Backend trait `as_opencl_secondary()` 명명 정합 sub-grill** (별 sub-grill, Phase α-W 종료 후 ~ Phase α-K 진입 전, ADR-0001 timing 권장):
     - 본 grill 후속 결정 14 에서 `BackendExtensions` trait 자체 폐기 확정. 진행 중 sprint 충돌:
@@ -245,9 +322,38 @@
       - `OffloadLayer` = `SecondaryStore`
     - 결정 시점: Phase α-W KVCacheLayer / WeightLayer impl 시그니처 detail finalize 와 같은 sub-grill round.
 
+### 본 sub-grill (2026-05-28~29) 신규 등록 sub-grill 2건
+
+13. **Score domain refactor** (별 sprint, 본 sub-grill 결정 #17 직접 결과):
+    - **Prerequisite**: #11 (Layer impl backend ref 보유 패턴 — backend capability 의존도 표) 선결.
+    - Score 도메인 의 본질:
+      - **Hot path** (collection 매 layer = backend inline) — F32 KV: backend kernel inline accumulation. Q4/F16 KV: separate compute_attention_scores pass.
+      - **Cold path** (aggregation + read = PipelineStage on_phase) — eviction 시 score buffer read + sort + decide_keep.
+      - **이 asymmetry 가 어색이 아니라 도메인 본질의 정직한 표현** — 통일 패턴 강제 안 함 (갈래 B Boundary 명시).
+    - **추천 갈래** (sub-grill 에서 결정):
+      - **갈래 4**: Generic capability lookup (Stage 가 `Arc<dyn ScoreReadable>` 보유, score buffer read 만 추상화)
+      - **갈래 7**: Nested PipelineStage cost 명시 (score read 를 PostEviction phase 내부 sub-stage 로 분리)
+      - **갈래 2**: Monomorphic input fallback (F32 vs Q4 별 concrete struct, dispatch 시점 분기)
+    - **Pre-rejected** (자명히 부적합):
+      - 갈래 1 (trait method overload) — semantic 모호
+      - 갈래 3 (Decorator) — score buffer 가 owner-aware 가 아님
+      - 갈래 5 (Event sourcing enum) — hot path frequency × cost 폭증
+      - 갈래 8 (Closure) — RAII 패턴 위반
+    - **Asymmetry note**: hot path 와 cold path 의 책임 분리는 통일 패턴 강제 시 god abstraction 재발생. 별 sprint 에서 결정.
+    - 결정 시점: Phase α-K 종료 후 또는 별 sprint round.
+
+14. **Multiple EvictionStage 시나리오** (별 sprint, #13 와 묶음):
+    - 본 sub-grill 결정 #17 의 직접 결과 — score domain refactor 시 multiple EvictionStage (예: layer 0~5 sliding + layer 6~15 H2O 등) 시나리오 finalize.
+    - 시나리오:
+      - (a) Per-layer-group EvictionStage — `Vec<EvictionStage>` (각 stage 가 cardinality K layer 보유)
+      - (b) Single EvictionStage + policy table — `EvictionStage { policy_per_layer: Vec<Box<dyn EvictionPolicy>> }`
+      - (c) PipelineRegistry 가 layer group 별 dispatcher 분리
+    - cardinality 자유 (결정 #16) 기반에서 자연 표현 가능 — 단 score_accumulator ownership 패턴 finalize 필요 (#13 결과 의존).
+    - 결정 시점: Phase α-K 종료 후 또는 #13 와 같은 sub-grill round.
+
 ### 본 grill 에서 해결된 open questions (이전 grill 미해결 → 본 grill 결정)
 
-- ~~`score_accumulator` ownership~~ — 본 grill #8 (Stage register 시점 layer handle 보관) 후: `KVCacheLayer::view()::score_handle()` 으로 layer 내부 흡수 → 외부 ownership 패턴 불필요.
+- ~~`score_accumulator` ownership~~ — 본 grill #8 (Stage register 시점 layer handle 보관) 후: `KVCacheLayer::view()::score_handle()` 으로 layer 내부 흡수 → 외부 ownership 패턴 불필요. **본 sub-grill 2026-05-28~29 결정 #17 추가**: EvictionHook → EvictionStage 1:1 wrap + `score_accumulator: Option<AttentionScoreAccumulator>` concrete type 보존 (pragmatic deferral). 별 sprint refactor (#13).
 
 ---
 
@@ -255,7 +361,7 @@
 
 ### 본 grill 산출물
 
-- `arch/pipeline_stage_design.md` — 메인 진실원본 (16 절, 본 grill 14 결정 반영 (본문 12 + post-grill 후속 2), Q1~Q35 매트릭스). **post-grill review 2026-05-28** 1차: §2 다이어그램 화살표 정정 + concrete stages 위치 L4 session/ → L3 cross-cutting `engine/src/stages/{kv,weight,system}/` 이동 + §5.4 sub-structure 신설 + §13.4 후속 결정점 4건. **post-grill review 2026-05-28** 2차 (본 위임): §3.3 ctx 3 → 2 field (backend_ext 폐기) + §3.4 PipelineDispatcher trait 유지 명문화 (§3.4.1 추가) + §3.7 제목 변경 ("Profiler (L2)") + §3.7.1 BackendExtensions trait 폐기 sub-section + §5.2 EvictionStage 예시 backend_ext 사용 금지 + KIVI 예시 교정 (`as_kivi_attention()` / `gpu_score_acc()` / `kivi_gather_update()`) + §6 DecodeLoop backend_ext field 삭제 + `pipeline: Arc<dyn PipelineDispatcher>` 변경 + §2 Mermaid 다이어그램 `bext` 노드 + 관련 화살표 삭제 + `kvcache_impl --> be` / `weight_impl --> be` 추가 + §10 Phase α-W 게이트 갱신 (sub-grill 2건 명시) + §13.5 후속 결정점 3건 (R5 #10/#11/#12) + §16 누적 결정 12 → 14 건 + §16.3 변경 추적성 2 row 추가.
+- `arch/pipeline_stage_design.md` — 메인 진실원본 (16 절, 본 grill 14 결정 반영 (본문 12 + post-grill 후속 2), Q1~Q35 매트릭스). **post-grill review 2026-05-28** 1차: §2 다이어그램 화살표 정정 + concrete stages 위치 L4 session/ → L3 cross-cutting `engine/src/stages/{kv,weight,system}/` 이동 + §5.4 sub-structure 신설 + §13.4 후속 결정점 4건. **post-grill review 2026-05-28** 2차: §3.3 ctx 3 → 2 field (backend_ext 폐기) + §3.4 PipelineDispatcher trait 유지 명문화 (§3.4.1 추가) + §3.7 제목 변경 ("Profiler (L2)") + §3.7.1 BackendExtensions trait 폐기 sub-section + §5.2 EvictionStage 예시 backend_ext 사용 금지 + KIVI 예시 교정 + §6 DecodeLoop backend_ext field 삭제 + `pipeline: Arc<dyn PipelineDispatcher>` 변경 + §2 Mermaid 다이어그램 `bext` 노드 + 관련 화살표 삭제 + §10 Phase α-W 게이트 갱신 + §13.5 후속 결정점 3건 (R5 #10/#11/#12) + §16 누적 결정 12 → 14 건 + §16.3 변경 추적성 2 row 추가. **본 sub-grill 2026-05-28~29 (3차, 본 위임)**: **§0 Executive Overview 신설** (외부 explorer 진입점, standalone 으로 본 sprint 전체 그림 파악 가능) + §3.5 KVCacheLayer 시그니처 갱신 (apply_storage / as_any / dtype 폐기, 5 → 3 mutation primitive) + §3.6 WeightLayer 동일 갱신 (apply_storage 폐기, 4 → 3 method) + §5.2 Stage 패턴 3-tier 분리 (Tier 1/2/3 예시) + §5.3 cardinality + tier 컬럼 추가 + §5.4 3-tier 패턴 가이드 + §13.1 Q24-5 (StorageSpec) 해소 + §13.6 본 sub-grill 매트릭스 신설 (결정 4 + 갈래 B + 미해결 9건 + 발견 모순 10건 + llm.npu / mllm-NPU ASPLOS 2025 정합도 부록) + §16 누적 결정 14 → 18 + §16.3 변경 추적성 4 row 추가.
 - `docs/adr/0001-kv-dispatch-paradigm.md` — KV dispatch Generic → Trait object 정식 결정 (Status: Accepted).
 - `docs/adr/README.md` — ADR 디렉토리 신설.
 - `spec/41-invariants.md` §3.28 — INV 표 갱신 (INV-DECODE-STAGE-002/003 폐기 + 신규 3건 추가). **post-grill review 2026-05-28** 1차: INV-STAGE-MODULE-LOCATION 후보 등록 — 즉시 추가 X, Phase α-W 진입 commit 에서 추가 (R5 #4 + arch §13.4). **post-grill review 2026-05-28** 2차 (본 위임): INV-DECODE-STAGE-006 (CTX-AUTHORITY) 본문 갱신 — 3 field → 2 field (backend_ext 폐기) + §3.28 변경 요약에 본 grill 후속 결정 14 1줄 추가.
@@ -317,3 +423,4 @@
 | Sprint 분리 명시 | R1 (Phase α-W 2-3주 → ADR-0001 → Phase α-K 4-6주, 총 12-19주) |
 | post-grill review 2026-05-28 추가 (1차) | R5 #7~#9 (BackendExtensions 재설계 sub-grill + stages/mod.rs 가이드 doc + system/ 명명 검토) + R6 (arch/pipeline_stage_design.md §2 다이어그램 정정 + §5.4 sub-structure + §13.4 결정점 4건) |
 | post-grill review 2026-05-28 추가 (2차, 본 위임) | R1 결정 13/14 추가 (PipelineDispatcher trait 유지 + BackendExtensions trait 폐기) + R5 #10~#12 (PipelineDispatcher 위치 + Backend trait 명명 정합 + Layer impl backend ref 보유 패턴) + R6 본 위임 arch/spec/handoff 변경 내역 명시 + ctx 3 → 2 field 본문 갱신 |
+| **본 sub-grill 2026-05-28~29 추가 (3차, 본 위임)** | R1 결정 15~18 추가 (3-tier Stage 패턴 + cardinality 자유 + Score 도메인 별 sprint + KVCacheView::dtype() 폐기) + 메타 결정 갈래 B (Boundary 명시) + R5 #5 StorageSpec 해소 + #10 PipelineDispatcher 위치 결정 (L4 finalize) + #13 Score domain refactor 신규 + #14 Multiple EvictionStage 신규 + R6 본 위임 arch/spec/README/handoff 변경 내역 명시 + §0 Executive Overview 신설 + llm.npu / mllm-NPU 정합도 평가 |
