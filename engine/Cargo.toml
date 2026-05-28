@@ -220,6 +220,10 @@ name = "microbench_oppkg_mixed_layer"
 path = "microbench/oppkg_mixed_layer.rs"
 
 [[bin]]
+name = "microbench_opencl_op_matrix"
+path = "microbench/opencl_op_matrix.rs"
+
+[[bin]]
 name = "microbench_ops"
 path = "microbench/ops.rs"
 
@@ -378,6 +382,11 @@ path = "microbench/vulkan_hello.rs"
 [[bin]]
 name = "microbench_vulkan_two_queue"
 path = "microbench/vulkan_two_queue.rs"
+
+# P1a ARM64Neon CPU microbench — Sprint Qwen2.5-1.5B full matrix (2026-05-28)
+[[bin]]
+name = "microbench_neon_op_matrix"
+path = "microbench/neon_op_matrix.rs"
 
 # Sprint argus-cli-v0 baseline 비교용 임시 entry. 호스트/디바이스 게이트 완료 후
 # `git rm engine/legacy/generate.rs` + 이 entry 제거 예정 (PoC 단계에서만 빌드).
