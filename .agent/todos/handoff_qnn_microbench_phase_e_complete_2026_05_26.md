@@ -5,6 +5,10 @@
 **브랜치**: `worktree-b5_trait_extension`
 **다음 세션 진입 문장**: "Q-2 진입 — HTP backend trait `engine/src/backend/qnn_htp/` 신설"
 
+**후속 sprint (2026-05-28 진입)**: Full Microbench Matrix — `.agent/todos/sprint_microbench_full_matrix_2026_05_28.md` (13 op × 7 backend × 2 dtype = 182 cell paper main evidence 매트릭스).
+4-cell GREEN이 본 sprint의 substrate 4 cell로 사용됨 (M3/M4/M6b/M7 결과 inherit).
+P0 entry: `.agent/todos/handoff_microbench_full_matrix_phaseP0_2026_05_28.md`.
+
 ---
 
 ## TL;DR

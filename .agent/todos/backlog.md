@@ -4,6 +4,53 @@
 
 ---
 
+## [ACTIVE Sprint] Qwen 2.5-1.5B Full Microbench Matrix (2026-05-28 진입)
+
+- **Master TODO**: `.agent/todos/sprint_microbench_full_matrix_2026_05_28.md`
+- **Entry handoff (P0 Architect)**: `.agent/todos/handoff_microbench_full_matrix_phaseP0_2026_05_28.md`
+- **목표**: 13 op × 7 backend × 2 dtype = **182 cell** paper main evidence 통합 매트릭스 측정 (Galaxy S25 단일 디바이스)
+- **선행 sprint**: μ-Q1 4-cell (`handoff_qnn_microbench_phase_e_complete_2026_05_26.md`, M3/M4/M6b/M7 GREEN)
+- **Phase 분해**: P0 (Architect 디자인) → P1{a,b,c,d} 병렬 (Implementer/Senior) → P2 (Implementer, P0 후 시작) → P3 (Implementer) → P4 (Tester, 8~12 device hour)
+- **확정 사항**:
+  - Op 13개 (Tier A+B+D, Qwen 실사용): `MUL_MAT`, `RMS_NORM`, `ROPE`, `FLASH_ATTN_EXT`, `GET_ROWS`, `SILU`, `MUL`, `ADD`, `SOFT_MAX`, `SCALE`, `CPY`, `SET_ROWS`, `SWIGLU`
+  - Backend 7개: ARM64Neon CPU / OpenCL GPU / ExecuTorch HTP NPU / Ours-NPU HTP FastRPC / L.cpp.CPU / L.cpp.GPU (Adreno) / L.cpp.HTP0 (Hexagon)
+  - Dtype 2개: F16, Q4_0 (ExecuTorch Q4 = `use_8a4w` W4A8 단일)
+  - Shape: Qwen 2.5-1.5B actual (hidden=1536, n_heads=12, n_kv=2, head_dim=128, FFN=8960, vocab=151936, n_layers=28)
+- **Tier-A 우선순위 (hot path 8 op)**: MUL_MAT, RMS_NORM, ROPE, FLASH_ATTN_EXT, GET_ROWS, SILU, MUL, ADD
+
+---
+
+## [P2] LLama 3.2 1B 동일 shape 매트릭스 재측정 (Qwen Full Microbench Matrix sprint 완료 후)
+
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: `sprint_microbench_full_matrix_2026_05_28` 종결 + P4 보고서 GREEN
+- **Description**:
+  - Qwen 2.5-1.5B Full Microbench Matrix sprint 완료 후, 동일 driver (`scripts/microbench_qnn_matrix.py` 확장본) + 동일 protocol로 LLama 3.2 1B 매트릭스 재측정
+  - shape 매핑만 변경 (dim=2048, n_heads_q=32, n_kv_heads=8, head_dim=64, FFN=8192, vocab=128256, n_layers=16)
+  - Q4_0 dtype은 동일, F16 dtype도 동일
+  - 13 op × 7 backend × 2 dtype = 182 cell (Qwen과 동일 구조)
+- **Acceptance Criteria**:
+  - LLama 3.2 1B 매트릭스 `papers/eurosys2027/_workspace/experiment/microbench_full_matrix_llama321b_<DATE>/report.md`
+  - Qwen 결과와 nominal shape 차이 분석 (head_dim=64 vs 128, FFN=8192 vs 8960 등이 latency에 미치는 영향)
+- **Notes**: paper figure에서 2 model 비교 가능. driver 확장 0 (재사용).
+
+## [P3] Tier-E 11 op 측정 (Qwen 미사용 op, 본 sprint 제외)
+
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: `sprint_microbench_full_matrix_2026_05_28` driver (P3 확장) 완료
+- **Description**:
+  - Qwen 2.5-1.5B에서 사용되지 않는 11 op (Tier-E) 측정
+  - 후보: `OUT_PROD`, `DIAG_MASK_INF`, `ARGMAX`, `ARGSORT`, `LEAKY_RELU`, `GELU`, `TANH`, `SQR`, `SQRT`, `SUM_ROWS`, `MEAN` (사전 조사 필요)
+  - paper main evidence 아닌 supplementary table 용도
+- **Acceptance Criteria**:
+  - 11 op × 7 backend × 2 dtype = 154 cell 측정 완료 (UNSUPPORTED는 skip)
+  - supplementary appendix table 생성
+- **Notes**: paper main figure에 직접 인용 없음, reviewer rebuttal용. priority 낮음.
+
+---
+
 ## [P2] typed lifecycle hook 확장 (h-1) — 별 sprint, 2026-05-27 등록
 - **배경**: events sprint(2026-05-27)에서 사용자 결정 — sink가 fire-and-forget 디버깅 채널(비즈니스 영향 0)이라는 결론에 도달했으나, **비즈니스 동작(KV cache 관리, swap trigger)을 typed lifecycle hook으로 격리**하는 트랙은 별 sprint로 분리. 본 sprint는 events trait 인프라 제거(외과적)만 처리.
 - **방향**: `LayerBoundaryHook` (Sprint C에서 L2 격상 `engine/src/layer_boundary_hook.rs`)이 이미 precedent. 추가로 typed hook을 다음 단위로 확장 가설:
