@@ -11,9 +11,9 @@
 
 ---
 
-## R1. What was decided (결정사항 요약 — 본 grill 12 결정)
+## R1. What was decided (결정사항 요약 — 본 grill 14 결정)
 
-### 본 grill 누적 결정 12 건
+### 본 grill 누적 결정 14 건 (본문 12 + post-grill 후속 2)
 
 | # | 결정 | 의미 |
 |---|---|---|
@@ -29,6 +29,8 @@
 | 10 | **Weight dispatch: LayerSlot + WeightLayer thin wrap** | Forward path 무변경. ~5 file 추가. KV 와 비대칭. |
 | 11 | **Sprint 분리: Phase α-W → ADR-0001 → Phase α-K** | Risk 분산 + escape hatch. |
 | 12 | **LayerDispatch enum: Fixed 3 variant (Full / Skip / Partition)** | enum + match exhaustive 가독성 우월. |
+| **13** | **PipelineDispatcher trait 유지** (post-grill 후속) | 단일 impl 우려 반박 — deletion test (INV-LAYER-006 위반) + mock 패턴 정합 (mock_engine/mock_manager 정착) + vtable cost noise 이하. 위치 (L2 vs L4) 만 별 sub-grill (R5 #10). |
+| **14** | **BackendExtensions trait 폐기** (post-grill 후속) | §13.8-L Backend trait capability provider 패턴 중복 추상화 + `as_opencl_secondary()` 명명 leak. (γ) 정신 일관 — Layer impl 이 backend ref 보유 + capability 내부 호출. **StageContext 3 → 2 field** (`step` / `profiler` 만). Sub-grill 2건 분리 (R5 #11/#12). |
 
 ### Spec INV 변경 (본 grill 결정 → 카탈로그 반영)
 
@@ -40,7 +42,7 @@
 | **신규** | INV-KVCACHELAYER-PAIRED-KERNEL | KVCacheLayer impl 과 paired backend attention kernel 매핑 의무. |
 | **신규** | INV-STAGE-LAYER-HANDLE | PipelineStage 가 layer handle 을 register 시점 보관. ctx 에 kv/weights field 두지 않음. |
 | **수정** | INV-DECODE-STAGE-001 (KV-PHASE) | mutation method 표현이 ctx.kv → Stage 보유 KVCacheLayer handle 로 변경. 정신 유지. |
-| **수정** | INV-DECODE-STAGE-006 (CTX-AUTHORITY) | 5 field → 3 field. kv/weights 책임 경계 위반 risk 자체 사라짐. |
+| **수정** | INV-DECODE-STAGE-006 (CTX-AUTHORITY) | 5 field → 3 field (본 grill) → **2 field** (`step` / `profiler`, 본 grill 후속 결정 14). `backend_ext` 폐기 — BackendExtensions trait 자체 폐기. 권한 강제 영역 = profiler 1 field 한정. |
 
 ### Sprint 분리 (본 grill 결정 #11)
 
@@ -186,6 +188,63 @@
 
 6. **arch/inference_pipeline.md v2 재작성 범위** — Phase β scope, 별 sprint.
 
+### post-grill review 2026-05-28 신규 (다이어그램 정정 + stages 위치 이동 후속)
+
+본 grill 종결 후 사용자 추가 review 결과 식별된 후속 결정점. 모두 별 sub-grill round 로 분리.
+
+7. **`BackendExtensions` trait 재설계 sub-grill** — 우선순위: **Phase α-W 종료 후, Phase α-K 진입 전** (ADR-0001 timing 과 같이):
+   - 문제: `BackendExtensions::as_opencl_secondary()` 메소드가 trait 에 backend variant 이름을 박음 → **leaky abstraction (§13.8-O cross-L3 vocabulary trait inversion 위반 신호)**
+   - 식별 경위: §2 다이어그램 정정 과정에서 이전 `bext --> be` (backend impl 을 의존하는 것처럼) 화살표 방향 오류가 본질 leaky abstraction 의 외화임을 확인
+   - 갈래 (sub-grill 에서 결정):
+     - (A) capability lookup pattern (`extensions::<dyn OpenClSecondary>()` generic dispatch)
+     - (B) service locator (`lookup<T: Any>()` 런타임 type lookup)
+     - (C) 현재 유지 + OCP 비용 정당화
+   - 본 grill 에서 시그니처 재설계 X — Phase α-W 본 작업 (Weight infra) 와 직교, α-K 진입 전 sub-grill 로 분리
+
+8. **`engine/src/stages/mod.rs` 신규 stage 추가 가이드 doc 작성** (Phase α-W architect detail):
+   - 외부 기여자 진입점 — PipelineStage trait 학습 → layer handle 보관 패턴 → submit() 호출 시점
+   - INV-DECODE-STAGE-001 (KV-PHASE) / INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC / INV-STAGE-LAYER-HANDLE 체크리스트
+   - 어느 sub-directory (kv/ vs weight/ vs system/) 에 넣을지 분류 규약 (§5.4 표)
+   - 작성 시점: Phase α-W stages/ 디렉토리 신설 commit 과 같은 commit
+
+9. **`system/` 모듈 명명 검토** (Phase α-W architect detail):
+   - 후보: `system/` vs `misc/` vs `dispatch/`
+   - 결정 기준: backend / DecodeLoop 협업의 본질 표현 + 외부 기여자 직관성
+   - 결정 시점: Phase α-W stages/ 디렉토리 신설 commit 전
+
+### post-grill review 2026-05-28 후속 (결정 13/14 본 grill 누적, Architect 위임 2 차)
+
+본 grill 후속 결정 13 (PipelineDispatcher trait 유지) + 결정 14 (BackendExtensions trait 폐기) 누적 결과 추가 sub-grill 3 건 등록. arch §13.5 참조.
+
+10. **`PipelineDispatcher` trait 위치 재검토** (별 sub-grill, Phase α-W detail):
+    - 본 grill 후속 결정 13 에서 trait **유지** 확정 (deletion test PASS + INV-LAYER-006 강제 + mock 패턴 정합). 단 위치만 미해결.
+    - §6.1 sequence 점검 — 모든 `dispatch()` 호출지가 L4 `DecodeLoop::run()` 또는 L4 `Forward::step()` 내부 (`PreLayer` / `PostLayer` phase) 안. L3 inference code 호출 없음 → L2 위치 정당화 약함, L4 `session/` 이동 가능.
+    - 갈래:
+      - (A) L2 유지 — abstraction primitive 정신 보존, future-proof
+      - (B) L4 `session/` 이동 — 실제 사용 위치 기반 정합
+    - 결정 시점: Phase α-W stages/ 디렉토리 신설 commit 전 (PipelineRegistry impl 위치와 같이)
+
+11. **Backend trait `as_opencl_secondary()` 명명 정합 sub-grill** (별 sub-grill, Phase α-W 종료 후 ~ Phase α-K 진입 전, ADR-0001 timing 권장):
+    - 본 grill 후속 결정 14 에서 `BackendExtensions` trait 자체 폐기 확정. 진행 중 sprint 충돌:
+      - `engine/src/backend.rs:1232-1255` Backend trait Stage 2 sprint 가 `as_opencl_secondary()` method default impl 추가 중 → 본 결정의 명명 정합 충돌 (variant 이름 박힘).
+    - 갈래 (sub-grill 에서 결정):
+      - (A) `secondary_store_handle()` 명명 정합 — backend variant 이름 (`opencl`) 제거
+      - (B) cold-path `get_extension(EXT_SECONDARY_STORE)` 격하 — 확장 API 패턴
+      - (C) sub-trait 분리 (`SecondaryStoreProvider`) — Backend trait 결합도 분산
+    - §13.8-O cross-L3 vocabulary trait inversion 정신 정합 필수.
+    - 우선순위 근거: Phase α-W (Weight infra) 와 직교, ADR-0001 timing 과 같이 sub-grill round 진행.
+
+12. **`KVCacheLayer` / `WeightLayer` impl 의 backend ref 보유 패턴** (별 sub-grill, Phase α-W 진입 전 필수):
+    - 본 grill 후속 결정 14 의 직접 결과 — Stage 가 backend capability 모름 → Layer impl 이 backend ref 보유 + capability 내부 호출.
+    - 후보:
+      - (a) Full `Arc<dyn Backend>` 보유 — layer impl 단순, vtable 1 lookup, 단 layer 가 Backend trait 전체 의식
+      - (b) Capability sub-trait 별 보유 (예: `Arc<dyn KiviAttentionBackend>` + `Arc<dyn GpuScoreAccess>` 등 ISP-split) — ISP 강화, 단 layer impl 복잡 + sub-trait 정의 비용
+    - 결정 방법: layer impl 별 capability 의존도 표 작성 후 결정. 예시:
+      - `KIVILayer` = `KiviAttentionBackend` + `GpuScoreAccess`
+      - `StandardLayer` = `GpuScoreAccess` 만
+      - `OffloadLayer` = `SecondaryStore`
+    - 결정 시점: Phase α-W KVCacheLayer / WeightLayer impl 시그니처 detail finalize 와 같은 sub-grill round.
+
 ### 본 grill 에서 해결된 open questions (이전 grill 미해결 → 본 grill 결정)
 
 - ~~`score_accumulator` ownership~~ — 본 grill #8 (Stage register 시점 layer handle 보관) 후: `KVCacheLayer::view()::score_handle()` 으로 layer 내부 흡수 → 외부 ownership 패턴 불필요.
@@ -196,10 +255,10 @@
 
 ### 본 grill 산출물
 
-- `arch/pipeline_stage_design.md` — 메인 진실원본 (16 절, 본 grill 12 결정 반영, Q1~Q35 매트릭스).
+- `arch/pipeline_stage_design.md` — 메인 진실원본 (16 절, 본 grill 14 결정 반영 (본문 12 + post-grill 후속 2), Q1~Q35 매트릭스). **post-grill review 2026-05-28** 1차: §2 다이어그램 화살표 정정 + concrete stages 위치 L4 session/ → L3 cross-cutting `engine/src/stages/{kv,weight,system}/` 이동 + §5.4 sub-structure 신설 + §13.4 후속 결정점 4건. **post-grill review 2026-05-28** 2차 (본 위임): §3.3 ctx 3 → 2 field (backend_ext 폐기) + §3.4 PipelineDispatcher trait 유지 명문화 (§3.4.1 추가) + §3.7 제목 변경 ("Profiler (L2)") + §3.7.1 BackendExtensions trait 폐기 sub-section + §5.2 EvictionStage 예시 backend_ext 사용 금지 + KIVI 예시 교정 (`as_kivi_attention()` / `gpu_score_acc()` / `kivi_gather_update()`) + §6 DecodeLoop backend_ext field 삭제 + `pipeline: Arc<dyn PipelineDispatcher>` 변경 + §2 Mermaid 다이어그램 `bext` 노드 + 관련 화살표 삭제 + `kvcache_impl --> be` / `weight_impl --> be` 추가 + §10 Phase α-W 게이트 갱신 (sub-grill 2건 명시) + §13.5 후속 결정점 3건 (R5 #10/#11/#12) + §16 누적 결정 12 → 14 건 + §16.3 변경 추적성 2 row 추가.
 - `docs/adr/0001-kv-dispatch-paradigm.md` — KV dispatch Generic → Trait object 정식 결정 (Status: Accepted).
 - `docs/adr/README.md` — ADR 디렉토리 신설.
-- `spec/41-invariants.md` §3.28 — INV 표 갱신 (INV-DECODE-STAGE-002/003 폐기 + 신규 3건 추가).
+- `spec/41-invariants.md` §3.28 — INV 표 갱신 (INV-DECODE-STAGE-002/003 폐기 + 신규 3건 추가). **post-grill review 2026-05-28** 1차: INV-STAGE-MODULE-LOCATION 후보 등록 — 즉시 추가 X, Phase α-W 진입 commit 에서 추가 (R5 #4 + arch §13.4). **post-grill review 2026-05-28** 2차 (본 위임): INV-DECODE-STAGE-006 (CTX-AUTHORITY) 본문 갱신 — 3 field → 2 field (backend_ext 폐기) + §3.28 변경 요약에 본 grill 후속 결정 14 1줄 추가.
 - `arch/README.md` — cross-reference 갱신.
 - `arch/inference_pipeline.md` v1 — deprecation notice 정련 (v3 본 grill 결정 인용).
 
@@ -256,3 +315,5 @@
 | 본 grill 핵심 결정 12 건 명시 | R1 (전체 표) |
 | Spec INV 변경 명시 | R1 (폐기 2건 + 신규 3건 + 수정 2건 매트릭스) |
 | Sprint 분리 명시 | R1 (Phase α-W 2-3주 → ADR-0001 → Phase α-K 4-6주, 총 12-19주) |
+| post-grill review 2026-05-28 추가 (1차) | R5 #7~#9 (BackendExtensions 재설계 sub-grill + stages/mod.rs 가이드 doc + system/ 명명 검토) + R6 (arch/pipeline_stage_design.md §2 다이어그램 정정 + §5.4 sub-structure + §13.4 결정점 4건) |
+| post-grill review 2026-05-28 추가 (2차, 본 위임) | R1 결정 13/14 추가 (PipelineDispatcher trait 유지 + BackendExtensions trait 폐기) + R5 #10~#12 (PipelineDispatcher 위치 + Backend trait 명명 정합 + Layer impl backend ref 보유 패턴) + R6 본 위임 arch/spec/handoff 변경 내역 명시 + ctx 3 → 2 field 본문 갱신 |
