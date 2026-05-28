@@ -71,7 +71,6 @@ mod bench {
         prog_simple: Program,
         prog_mul_mv_f16: Program,
         prog_mul_mat_q4_0: Program,
-        prog_flash_attn_q1: Program,
         prog_get_rows: Program,
     }
 
@@ -134,15 +133,6 @@ mod bench {
             .cmplr_opt(&opts)
             .build(&context)?;
 
-        // Flash attention decode Q1, DK=128 for Qwen2.5-1.5B (head_dim=128)
-        let flash_src = include_str!("../kernels/flash_attn_f32_f16.cl");
-        let prog_flash_attn_q1 = Program::builder()
-            .devices(device)
-            .src(flash_src)
-            .cmplr_opt(format!("{} -DDK=128 -DDV=128 -DBLOCK_M=4", opts))
-            .build(&context)
-            .map_err(|e| anyhow::anyhow!("flash_attn_q1 DK=128 compile: {}", e))?;
-
         let prog_get_rows = Program::builder()
             .devices(device)
             .src(include_str!("../kernels/get_rows.cl"))
@@ -155,7 +145,6 @@ mod bench {
             prog_simple,
             prog_mul_mv_f16,
             prog_mul_mat_q4_0,
-            prog_flash_attn_q1,
             prog_get_rows,
         })
     }
@@ -530,7 +519,22 @@ mod bench {
     // ── FLASH_ATTN_EXT F16 decode Q1 ─────────────────────────────────────────
 
     fn bench_flash_attn(ctx: &Ctx, cell_id: &str) -> anyhow::Result<()> {
-        let kernel = ocl::core::create_kernel(&ctx.prog_flash_attn_q1, "flash_attn_f32_f16_q1")?;
+        // Lazy compile: FlashAttn 커널은 이 op 실행 시에만 빌드한다.
+        // flash_attn_f32_f16.cl은 BLOCK_N(prefill 전용 define)이 없으면 전체 컴파일 실패하므로
+        // init() 단계에서 eager 빌드하지 않는다.
+        let device = ocl::Device::first(ocl::Platform::default())?;
+        let opts = build_opts(&device);
+        let prog_flash_attn_q1 = Program::builder()
+            .devices(device)
+            .src(include_str!("../kernels/flash_attn_f32_f16.cl"))
+            .cmplr_opt(format!(
+                "{} -DDK=128 -DDV=128 -DBLOCK_M=4 -DBLOCK_N=8",
+                opts
+            ))
+            .build(&ctx.context)
+            .map_err(|e| anyhow::anyhow!("flash_attn_q1 DK=128 compile: {}", e))?;
+
+        let kernel = ocl::core::create_kernel(&prog_flash_attn_q1, "flash_attn_f32_f16_q1")?;
 
         let n_heads_q = N_HEADS_Q;
         let n_heads_kv = N_HEADS_KV;
