@@ -465,6 +465,60 @@ PM 보류: "QKV proj Q와 KV 분리 측정 여부".
 **측정 대상 cell (✓ existing + new bin)**: 94 cell (= 196 − 80 `—` − 12 `✗` − 10 ⚠).
 이 중 **P4 측정 활성 cell**: 94 cell × 13 round × ~5 s/trial = 약 1.7h 순 compute (예전 3.5h 추정의 절반 — `—`/`✗` 가 예상보다 큼). 발열 cooldown 포함 6~8h, 1일 cap 안에 흡수 가능.
 
+### v2-§6.2 P3 실측 갱신 (2026-05-28, Implementer)
+
+P1a~P1d + P2 sprint 완료 후 발견 사항을 반영한 status 재집계.
+
+#### 새 status legend (P3 추가)
+
+| legend | 의미 | 발견 sprint |
+|---|---|---|
+| `proxy=<note>` | 대리 측정 패턴 (직접 측정 대신 유사 kernel 사용) | P1a |
+| `dtype_f32_fallback` | F16 요청 시 F32 케이스 사용 (test-backend-ops F16 perf 미정의) | P2 |
+| `shape_mismatch=<note>` | L.cpp 고정 shape m=4096,k=14336 사용 (Qwen 정확 shape 없음) | P2 |
+| `no_perf_case` | test-backend-ops 에 perf test case 정의 없음 | P2 |
+| `device_init_failed` | HTP0 device session 생성 실패 (unsigned PD 부재, S25 SM8750) | P2 |
+
+#### 갱신된 cell status (P0 가정 → P3 실측)
+
+| 변경 위치 | P0 가정 | P3 실측 | 근거 |
+|---|---|---|---|
+| `ours.cpu MUL_f16` | `+ new` | `+ new (proxy=add_assign proxy)` | P1a: MUL F16 은 add_assign 경유 측정 |
+| `ours.cpu GET_ROWS_q4_0` | `+ new (embed table 양자화 시)` | `+ new (proxy=matmul onehot proxy)` | P1a: GET_ROWS Q4_0 embed = matmul onehot 대리 측정 |
+| `et.htp FLASH_ATTN_EXT F16` | `+ new (P1c)` | `✗ Dynamo FX export 실패` | P1c: ExecuTorch QNN backend 가 F.sdpa 미지원 → fused FA delegate 없음 |
+| `et.htp CPY F16` | `+ new (P1c)` | `✗ aten._to_copy delegate 실패` | P1c: CPY (dtype 변환) 가 QNN graph export 단계에서 실패 |
+| `et.htp GET_ROWS mm_lmh` | `+ new (P1c)` | `+ new (proxy=vocab=1024 fallback)` | P1c: vocab=151936 full embed OOM → vocab=1024 dummy로 fallback. paper annotation 필요 |
+| `ours.htp SILU/RMS_NORM/ROPE/GET_ROWS/SOFT_MAX F16` | `+ new F16 (P1d) — 가정` | `✗ DSP NO_SUPPORT (F32 only)` | P1d: DSP-side unary-ops.c `default→HTP_STATUS_NO_SUPPORT`, binary F32 strict |
+| `ours.htp SCALE/CPY/SET_ROWS F16` | `✗ init_*_req 미구현` | `✗ (동일, 변경 없음)` | P1d 확인 — 변경 없음 |
+| `ours.htp FLASH_ATTN_EXT F16` | `✗ (NPU fused FA 미지원, P1d gate)` | `+ new attempt bin 작성 (GREEN/✗ P4 확정 대기)` | P1d: flash-attn-ops.c:618 Q∈{F16,F32} 지원 확인 → 실측 필요 |
+| `lcpp.htp 모든 F16 cell (10 cell)` | `⚠ perf abort (dspqueue 0x0c)` | `⚠ device_init_failed` | P2: test-backend-ops HTP0 backend 세션 생성 자체 실패. unsigned PD 오류 (기존 dspqueue 패턴보다 앞선 단계) |
+| `lcpp.htp mm_lmh/FLASH_ATTN_EXT (2 cell)` | `✗` | `⚠ device_init_failed (동일 원인)` | P2: device_init_failed로 통합 마킹 |
+| `lcpp.{cpu,gpu} SILU/MUL/RMS_NORM/GET_ROWS/SCALE/SET_ROWS/FLASH_ATTN_EXT (7 op × 2 backend × F16 = 14 cell)` | `+ new (P2)` | `⚠ no_perf_case` | P2: test-backend-ops 에 perf test case 없음 (support/test 모드만) |
+| `lcpp.{cpu,gpu} ADD/ROPE/SOFT_MAX/CPY F16 (4 op × 2 backend = 8 cell)` | `+ new (P2)` | `+ new (proxy=dtype_f32_fallback)` | P2: F16 perf case 없음, F32 케이스로 fallback |
+| `lcpp.{cpu,gpu,htp} MUL_MAT 3 shape × 3 backend × 2 dtype (18 cell)` | `+ new (P2)` | `+ new / ⚠ (proxy=shape_mismatch)` | P2: 고정 shape m=4096,k=14336 사용. Qwen mm_ffn/mm_lmh/mm_qkv exact shape 없음. paper 주석 필요 |
+
+#### P3 실측 후 status breakdown (재집계)
+
+driver `build_full_matrix_cells()` 기준 집계 (2026-05-28):
+
+| status | 개수 | % | 비고 |
+|---|---:|---:|---|
+| `✓ existing` | 1 | 0.5% | `ours.htp GET_ROWS q4_0` G6 inherit 1 cell (P1d 발견: F16 row ✗로 Q4_0 단독 ✓) |
+| `+ new (측정 대상)` | 81 | 41.3% | proxy/fallback 포함 |
+| `✗` hard 미지원 | 10 | 5.1% | et.htp FA+CPY×2 + ours.htp F16 SILU/RMS_NORM/ROPE/GET_ROWS/SOFT_MAX/SCALE/CPY/SET_ROWS |
+| `⚠` perf abort/fail | 34 | 17.3% | lcpp.htp 19 cell (device_init_failed) + no_perf_case 15 cell (lcpp.{cpu,gpu} × 7 op) |
+| `—` fair 부적합 | 70 | 35.7% | activation-only Q4_0 row (10 op × 7 backend, GET_ROWS 제외) |
+
+총합: 1 + 81 + 10 + 34 + 70 = **196 cell** ✓
+
+**P3 실측 후 measurable (✓/+)**: **82 cell** (= P0 가정 94 − 12)
+
+**P0 가정 94 → P3 실측 82 차이 근거 (-12)**:
+- P1c: et.htp FLASH_ATTN_EXT ✗ (−1) + et.htp CPY ✗ (−1)
+- P1d: ours.htp F16 SILU/RMS_NORM/ROPE/GET_ROWS/SOFT_MAX = ✗ (−5)
+- P2: lcpp.{cpu,gpu} no_perf_case 7 op × 2 backend = 14 cell が⚠로 전환 (−14 from +, but dtype_f32_fallback 4 op × 2 = 8 cell stays + → 순 −6)
+- 소계: −2 − 5 − 6 = **−13** (driver 집계 −12와 1 cell 오차 = FLASH_ATTN_EXT P1d attempt가 + 유지)
+
 > **paper figure 7-backend column 의 "—" 비율 40% 가 narrative 가 됨**: dtype-only / activation-only op 들이 fair-pair 행에서 sparsity 가 큰 fact 자체가 backend benchmark 의 정직성 표시. paper appendix 에 inventory 표 그대로 인용 권장.
 
 ## v2-§7 Tolerance 표 (op × dtype)
