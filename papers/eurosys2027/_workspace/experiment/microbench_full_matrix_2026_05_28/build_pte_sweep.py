@@ -441,6 +441,68 @@ def _sha256(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# sidecar metadata 생성
+# ---------------------------------------------------------------------------
+
+def _tensor_meta(t: "torch.Tensor") -> dict:
+    """단일 텐서의 shape/dtype/nbytes 정보를 dict로 반환."""
+    dtype_map = {
+        torch.float32: "f32",
+        torch.float16: "f16",
+        torch.bfloat16: "bf16",
+        torch.int64: "i64",
+        torch.int32: "i32",
+        torch.int16: "i16",
+        torch.int8: "i8",
+        torch.uint8: "u8",
+        torch.bool: "bool",
+    }
+    nbytes = t.numel() * t.element_size()
+    return {
+        "shape": list(t.shape),
+        "dtype": dtype_map.get(t.dtype, str(t.dtype)),
+        "nbytes": nbytes,
+    }
+
+
+def emit_meta(op: str, shape_id: str | None, pte_path: str) -> str:
+    """PTE sidecar `.meta.json` 를 pte_path 옆에 생성한다.
+
+    반환값: sidecar 파일 경로.
+
+    sidecar 스키마:
+      {
+        "op": "SILU",
+        "shape_id": null,
+        "pte_path": "silu_fp16.pte",
+        "inputs": [
+          {"shape": [1, 8960], "dtype": "f16", "nbytes": 17920}
+        ]
+      }
+
+    dtype 은 PTE build dtype (use_fp16/use_8a4w) 과 무관하게
+    make_inputs() 의 실제 input tensor dtype 을 사용한다.
+    (use_8a4w 도 activation input 은 F32/F16 이므로 shape/nbytes 정확히 반영)
+    """
+    import json
+
+    inputs_tuple = make_inputs(op, shape_id)
+    inputs_meta = [_tensor_meta(t) for t in inputs_tuple]
+
+    meta = {
+        "op": op,
+        "shape_id": shape_id,
+        "pte_path": os.path.basename(pte_path),
+        "inputs": inputs_meta,
+    }
+
+    meta_path = pte_path + ".meta.json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta_path
+
+
+# ---------------------------------------------------------------------------
 # cell 목록 생성
 # ---------------------------------------------------------------------------
 
@@ -513,6 +575,16 @@ def main() -> int:
         help="venv 가용성 + 1-cell dry-run (MUL_MAT mm_ffn use_fp16)",
     )
     p.add_argument(
+        "--emit-meta",
+        action="store_true",
+        help="각 PTE 옆에 .meta.json sidecar 생성 (driver input 자동 생성용)",
+    )
+    p.add_argument(
+        "--meta-only",
+        action="store_true",
+        help="PTE 빌드 없이 기존 PTE 에 대한 .meta.json sidecar 만 생성",
+    )
+    p.add_argument(
         "--verbose",
         action="store_true",
         default=True,
@@ -520,6 +592,27 @@ def main() -> int:
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
+
+    if args.meta_only:
+        # PTE 빌드 없이 기존 PTE 에 대한 sidecar 만 생성
+        cells = enumerate_cells(
+            None if args.op == "ALL" else [args.op],
+            None if args.shape == "ALL" else [args.shape],
+            None if args.dtype == "ALL" else [args.dtype],
+        )
+        print(f"=== META-ONLY: {len(cells)} cells → {args.out_dir} ===\n")
+        n_ok = 0
+        for op, shape_id, dtype in cells:
+            pte_path = cell_to_path(op, shape_id, dtype, args.out_dir)
+            if not os.path.exists(pte_path):
+                print(f"  [skip] {pte_path} (PTE 없음)")
+                continue
+            meta_path = emit_meta(op, shape_id, pte_path)
+            n_ok += 1
+            if args.verbose:
+                print(f"  [meta] {os.path.basename(meta_path)}")
+        print(f"\n  Meta sidecar 생성: {n_ok}개")
+        return 0
 
     if args.dry_run:
         print("=== DRY-RUN: MUL_MAT mm_ffn use_fp16 ===")
@@ -551,6 +644,11 @@ def main() -> int:
         print(f"{label} building {op}{'/' + shape_id if shape_id else ''} {dtype} ...")
         r = build_pte(op, shape_id, dtype, out_path, verbose=args.verbose)
         results.append(r)
+        # sidecar: PTE 성공 or meta-emit 모드면 생성 (CPY skip → PTE 없으므로 skip 됨)
+        if (args.emit_meta or args.meta_only) and r["ok"]:
+            meta_path = emit_meta(op, shape_id, out_path)
+            if args.verbose:
+                print(f"       → meta: {os.path.basename(meta_path)}")
 
     # 요약
     ok = [r for r in results if r["ok"]]

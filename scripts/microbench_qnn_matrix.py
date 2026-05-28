@@ -424,7 +424,10 @@ def _ours_cpu_cells() -> List[FullCell]:
 
 
 def _ours_gpu_cells() -> List[FullCell]:
-    """ours.gpu — microbench_opencl_op_matrix CLI."""
+    """ours.gpu — microbench_opencl_op_matrix CLI.
+
+    D8 fix: --op X --dtype Y [--shape Z] 명시 인자로 bin 의 ExplicitFilter 와 정확 매칭.
+    """
     cells = []
     for dtype in ("f16", "q4_0"):
         for op in ALL_OPS:
@@ -447,7 +450,7 @@ def _ours_gpu_cells() -> List[FullCell]:
                         status="+",
                         bin_name="microbench_opencl_op_matrix",
                         bin_dir=DEVICE_BIN_DIR,
-                        args=["--ops", f"MUL_MAT_{dtype.upper()}_{sid.upper()}"],
+                        args=["--op", op, "--dtype", dtype, "--shape", sid],
                         latency_pattern=r'"median_ns"\s*:\s*([\d.]+)',
                         latency_unit="ns",
                         tol_max_abs=5e-2 if dtype == "q4_0" else 1e-2,
@@ -461,7 +464,7 @@ def _ours_gpu_cells() -> List[FullCell]:
                     status="+",
                     bin_name="microbench_opencl_op_matrix",
                     bin_dir=DEVICE_BIN_DIR,
-                    args=["--ops", f"{op}_{dtype.upper()}"],
+                    args=["--op", op, "--dtype", dtype],
                     latency_pattern=r'"median_ns"\s*:\s*([\d.]+)',
                     latency_unit="ns",
                     tol_max_abs=1e-2,
@@ -598,6 +601,15 @@ _ET_HTP_PTE_STATUS: Dict[str, str] = {
 
 _ET_HTP_HARD_FAIL_OPS = {"FLASH_ATTN_EXT", "CPY"}  # P1c ✗ 확정
 
+# PTE builder 출력 디렉토리 (호스트 상 sidecar .meta.json 위치)
+HOST_PTE_DIR = Path(
+    "/home/go/Workspace/llm_rs2/papers/eurosys2027/_workspace/experiment"
+    "/microbench_full_matrix_2026_05_28/pte"
+)
+
+# device 상 input 파일 저장 디렉토리
+DEVICE_INPUT_DIR = f"{DEVICE_EXECUTORCH_DIR}/inputs"
+
 
 def _pte_path(op: str, shape_id: str, dtype: str) -> str:
     """device 상의 .pte 경로."""
@@ -608,8 +620,143 @@ def _pte_path(op: str, shape_id: str, dtype: str) -> str:
     return f"{DEVICE_EXECUTORCH_DIR}/pte/{op_lower}_{dtype_tag}.pte"
 
 
+def _pte_basename(op: str, shape_id: str, dtype: str) -> str:
+    """PTE 파일명 (확장자 포함)."""
+    dtype_tag = "fp16" if dtype == "f16" else "w4a8"
+    if op == "MUL_MAT":
+        return f"mul_mat_{shape_id}_{dtype_tag}.pte"
+    op_lower = op.lower()
+    return f"{op_lower}_{dtype_tag}.pte"
+
+
+def _host_meta_path(op: str, shape_id: str, dtype: str) -> Path:
+    """호스트 상의 sidecar .meta.json 경로."""
+    return HOST_PTE_DIR / (_pte_basename(op, shape_id, dtype) + ".meta.json")
+
+
+def _input_list_device_path(op: str, shape_id: str, dtype: str) -> str:
+    """device 상의 input_list.txt 경로 (cell 별 고유 이름)."""
+    dtype_tag = "fp16" if dtype == "f16" else "w4a8"
+    if op == "MUL_MAT":
+        cell_tag = f"mul_mat_{shape_id}_{dtype_tag}"
+    else:
+        cell_tag = f"{op.lower()}_{dtype_tag}"
+    return f"{DEVICE_INPUT_DIR}/{cell_tag}_input_list.txt"
+
+
+def prepare_et_htp_inputs(
+    adb: "Adb",
+    op: str,
+    shape_id: str,
+    dtype: str,
+    log_fn,
+) -> Optional[str]:
+    """D5+D6 fix: sidecar .meta.json 을 읽어 random input bin files 를 생성하고
+    device 에 push 한 뒤 input_list.txt 경로를 반환한다.
+
+    반환: device 상의 input_list.txt 경로. 실패 시 None.
+
+    sidecar schema:
+      {"inputs": [{"shape": [...], "dtype": "f32", "nbytes": N}, ...]}
+
+    qnn_executor_runner input_list.txt 형식:
+      공백 구분 파일 경로 1줄 (warmup+measure 회수만큼 반복되지 않아도 됨 —
+      runner 는 행 단위로 반복하므로 1행으로 충분).
+
+    input dtype 매핑:
+      "f32" → np.float32, "f16" → np.float16,
+      "i64" → np.int64,   "i32" → np.int32, "bool" → np.bool_
+    """
+    import struct
+    import tempfile
+
+    meta_path = _host_meta_path(op, shape_id, dtype)
+    if not meta_path.exists():
+        log_fn(f"  [et-input] WARN: meta 없음 → {meta_path}")
+        return None
+
+    with meta_path.open() as f:
+        meta = json.load(f)
+
+    inputs_meta = meta.get("inputs", [])
+    if not inputs_meta:
+        log_fn(f"  [et-input] WARN: inputs 필드 비어 있음 → {meta_path}")
+        return None
+
+    _DTYPE_NP: Dict[str, str] = {
+        "f32": "float32", "f16": "float16", "bf16": "float16",
+        "i64": "int64", "i32": "int32", "i16": "int16",
+        "i8": "int8", "u8": "uint8", "bool": "bool",
+    }
+
+    import numpy as np
+
+    # 호스트 임시 디렉토리에 input bin 생성
+    tmp_dir = Path(tempfile.mkdtemp(prefix="et_input_"))
+    dtype_tag = "fp16" if dtype == "f16" else "w4a8"
+    if op == "MUL_MAT":
+        cell_tag = f"mul_mat_{shape_id}_{dtype_tag}"
+    else:
+        cell_tag = f"{op.lower()}_{dtype_tag}"
+
+    device_input_files: List[str] = []
+    rng = np.random.default_rng(42)
+
+    for i, inp in enumerate(inputs_meta):
+        np_dtype_str = _DTYPE_NP.get(inp["dtype"], "float32")
+        np_dtype = np.dtype(np_dtype_str)
+        shape = inp["shape"]
+        nbytes_expected = inp["nbytes"]
+
+        if np_dtype_str in ("int64", "int32", "int16", "int8", "uint8"):
+            arr = rng.integers(0, 10, size=shape, dtype=np_dtype)
+        elif np_dtype_str == "bool":
+            arr = rng.integers(0, 2, size=shape, dtype=np.uint8).astype(bool)
+        else:
+            arr = rng.standard_normal(shape).astype(np_dtype)
+
+        # nbytes 검증
+        actual_nbytes = arr.nbytes
+        if actual_nbytes != nbytes_expected:
+            log_fn(
+                f"  [et-input] WARN: input[{i}] shape={shape} dtype={np_dtype_str} "
+                f"nbytes={actual_nbytes} (meta says {nbytes_expected})"
+            )
+
+        bin_name = f"{cell_tag}_input{i}.bin"
+        bin_path = tmp_dir / bin_name
+        arr.tobytes()  # 방어적 확인
+        with open(bin_path, "wb") as bf:
+            bf.write(arr.tobytes())
+
+        device_bin_path = f"{DEVICE_INPUT_DIR}/{bin_name}"
+        adb.push(str(bin_path), device_bin_path)
+        device_input_files.append(device_bin_path)
+        log_fn(f"  [et-input] pushed input[{i}] {bin_name} ({actual_nbytes}B)")
+
+    # input_list.txt: 1행 = space-구분 파일 경로
+    input_list_txt = " ".join(device_input_files)
+    input_list_local = tmp_dir / f"{cell_tag}_input_list.txt"
+    input_list_local.write_text(input_list_txt + "\n")
+
+    device_input_list = _input_list_device_path(op, shape_id, dtype)
+    adb.push(str(input_list_local), device_input_list)
+    log_fn(f"  [et-input] pushed input_list.txt → {device_input_list} ({len(inputs_meta)} input(s))")
+
+    # 임시 파일 정리
+    import shutil
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return device_input_list
+
+
 def _et_htp_cells() -> List[FullCell]:
-    """et.htp — ExecuTorch qnn_executor_runner + .pte."""
+    """et.htp — ExecuTorch qnn_executor_runner + .pte.
+
+    D5+D6 fix: --input_list_path 를 각 cell args 에 포함.
+    input_list.txt 는 run_full_matrix() 의 preflight 단계에서
+    prepare_et_htp_inputs() 로 사전 생성 + push 된다.
+    """
     cells = []
     for dtype in ("f16", "q4_0"):
         dtype_tag = "fp16" if dtype == "f16" else "w4a8"
@@ -634,6 +781,7 @@ def _et_htp_cells() -> List[FullCell]:
                 for sid, sdef in MULMAT_SHAPES.items():
                     # mm_lmh vocab=151936: OOM 위험 → paper annotation 필요
                     pte = _pte_path(op, sid, dtype)
+                    input_list = _input_list_device_path(op, sid, dtype)
                     cells.append(FullCell(
                         cell_id=_cell_id("et.htp", op, dtype, sid),
                         backend="et.htp",
@@ -644,6 +792,7 @@ def _et_htp_cells() -> List[FullCell]:
                         bin_name="qnn_executor_runner",
                         bin_dir=DEVICE_EXECUTORCH_DIR,
                         args=["--model_path", pte,
+                              "--input_list_path", input_list,
                               "--warm_up", "3", "--iteration", "10"],
                         work_dir=DEVICE_EXECUTORCH_DIR,
                         latency_pattern=r"avg\s+([\d.]+)\s*ms",
@@ -653,6 +802,7 @@ def _et_htp_cells() -> List[FullCell]:
                     ))
             else:
                 pte = _pte_path(op, op, dtype)
+                input_list = _input_list_device_path(op, op, dtype)
                 cells.append(FullCell(
                     cell_id=_cell_id("et.htp", op, dtype, op),
                     backend="et.htp",
@@ -662,6 +812,7 @@ def _et_htp_cells() -> List[FullCell]:
                     bin_name="qnn_executor_runner",
                     bin_dir=DEVICE_EXECUTORCH_DIR,
                     args=["--model_path", pte,
+                          "--input_list_path", input_list,
                           "--warm_up", "3", "--iteration", "10"],
                     work_dir=DEVICE_EXECUTORCH_DIR,
                     latency_pattern=r"avg\s+([\d.]+)\s*ms",
@@ -676,6 +827,9 @@ def _et_htp_cells() -> List[FullCell]:
 _LCPP_NO_PERF_CASE = {"SILU", "MUL", "RMS_NORM", "GET_ROWS", "SCALE", "SET_ROWS", "FLASH_ATTN_EXT"}
 # P2 발견: F16 dtype 없는 op (F32 fallback만)
 _LCPP_F16_F32_FALLBACK = {"ADD", "ROPE", "SOFT_MAX", "CPY"}
+# D7 fix: test-backend-ops ROPE perf case 가 head_dim 분배로 300s 초과 hang.
+# lcpp.{cpu,gpu} ROPE F16 cell 은 측정 시도 안 함 → ⚠ lcpp_perf_timeout 마킹.
+_LCPP_PERF_TIMEOUT = {("ROPE", "f16")}
 # P2 발견: lcpp.htp device_init_failed
 _LCPP_HTP_DEVICE_FAIL = True
 
@@ -715,6 +869,10 @@ def _lcpp_cells(backend_key: str) -> List[FullCell]:
                 # P2: device_init_failed — 모든 cell ⚠
                 status = "⚠"
                 proxy_note = "device_init_failed"
+            elif (op, dtype) in _LCPP_PERF_TIMEOUT:
+                # D7 fix: ROPE F16 perf case 가 300s 초과 hang → 측정 skip
+                status = "⚠"
+                proxy_note = "lcpp_perf_timeout"
             elif op in _LCPP_NO_PERF_CASE:
                 status = "⚠"
                 proxy_note = "no_perf_case"
@@ -1222,6 +1380,17 @@ def run_full_matrix(
     rng = random.Random(seed)
     sequence: List[List[str]] = []
     results: Dict[str, List[TrialResult]] = {c.cell_id: [] for c in cells}
+
+    # D5+D6 fix: et.htp measurable cells 에 대해 input files 를 사전 준비
+    if not dry_run:
+        et_cells = [c for c in measurable if c.backend == "et.htp"]
+        if et_cells:
+            log_fn(f"[full-matrix] D5+D6 fix: et.htp input preflight ({len(et_cells)} cells)")
+            adb.shell(f"mkdir -p {DEVICE_INPUT_DIR}", check=False)
+            for c in et_cells:
+                result = prepare_et_htp_inputs(adb, c.op, c.shape_id, c.dtype, log_fn)
+                if result is None:
+                    log_fn(f"  [et-input] WARN: {c.cell_id} input 준비 실패 → cell 이 실행 오류를 반환할 수 있음")
 
     if not dry_run:
         log_fn(f"[matrix] session warmup {SESSION_WARMUP_S}s")
