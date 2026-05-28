@@ -931,8 +931,8 @@ INV-DECODE-STAGE-002 / 003 의 정신은 다음에 흡수되어 보존:
 |---|---|---|
 | `Forward` trait | **보존** | W-1 결정 |
 | `TokenSampler` trait | **보존** | W-1 결정 |
-| `EvictionStage` trait | **폐기 → 단일 `PipelineStage` 흡수** | hook 패턴 |
-| `SwapStage` trait | **폐기 → 단일 `PipelineStage` 흡수** | hook 패턴 |
+| `EvictionStage` trait | **폐기** | `EvictionPolicyStage: PipelineStage`로 흡수 |
+| `SwapStage` trait | **폐기** | `SwapDispatchStage: PipelineStage`로 흡수 |
 | `CommandSource` trait | **폐기** | DecodeLoop 본체에서 `CommandExecutor` 직접 보유 |
 | `DecodeObserver` trait | **폐기** | DecodeLoop 본체에서 직접 outbound |
 | `DecodeLoopBuilder` typestate | **보존** | INV-LAYER-007 정합 |
@@ -949,22 +949,6 @@ INV-DECODE-STAGE-002 / 003 의 정신은 다음에 흡수되어 보존:
 | `StageContext::weights` field | `&mut dyn WeightBundle` 노출 | **폐기** — Stage 내부 `Arc<dyn WeightLayer>` |
 | KV dispatch | (명시 결정 없음, Generic 가정) | **Trait object 전환** — ADR-0001 필수 |
 | Weight dispatch | (명시 결정 없음, concrete 가정) | **LayerSlot + WeightLayer thin wrap** (forward 무변경) |
-
-### 10.1 보존/철회 매트릭스 (Phase β 진입 전 명시 필요)
-
-`arch/inference_pipeline.md` v1의 다음 컴포넌트는 본 설계 진입 시 운명이 결정된다:
-
-| v1 컴포넌트 | 운명 | 근거 |
-|---|---|---|
-| `Forward` trait | **보존** | W-1 결정 |
-| `TokenSampler` trait | **보존** | W-1 결정 |
-| `EvictionStage` trait | **폐기** | `EvictionPolicyStage: PipelineStage`로 흡수 |
-| `SwapStage` trait | **폐기** | `SwapDispatchStage: PipelineStage`로 흡수 |
-| `CommandSource` trait | **폐기** | DecodeLoop 본체에서 `CommandExecutor` 직접 보유 |
-| `DecodeObserver` trait | **폐기** | DecodeLoop 본체에서 직접 outbound |
-| `DecodeLoopBuilder` typestate | **보존** | INV-LAYER-007 정합 |
-| `SessionInitCtx` | **보존** | Phase 4-1 산출물, 본 설계와 직교 |
-| `legacy generate.rs` | **보존** (Phase γ까지) | `[[generate-split-binaries]]` backlog 묶음 옵션 |
 
 ---
 
