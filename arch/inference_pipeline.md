@@ -1,10 +1,27 @@
 # Inference Pipeline — DecodeLoop SOLID 분해 + 빌더 설계
 
 > **v1 (Phase 4-2/4-3/4-4-2.3 7-trait, 2026-05-16~25)** — 본 문서.
-> **v3 (Hook pattern, 2026-05-27 grill 결정)** — `arch/pipeline_stage_design.md` 참조.
+> **v3 (Hook pattern, 2026-05-27 grill 결정 + 2026-05-28 KvBundle/WeightBundle grill 종결)** — `arch/pipeline_stage_design.md` 참조.
 >
-> **본 문서(v1) 운명**: Phase β 시점에 v3 기준으로 **v2로 재작성** 예정. 본 sprint 외 별 sprint scope. v1의 `EvictionStage` / `SwapStage` / `CommandSource` / `DecodeObserver` 4 trait는 v3에서 단일 `PipelineStage` trait로 흡수 폐기, `Forward` / `TokenSampler` 2 trait + `DecodeLoopBuilder` typestate는 보존 (`pipeline_stage_design.md` §10.1 보존/철회 매트릭스 참조).
-> **v1 → v3 보존**: INV-LAYER-006/007 (DecodeLoop 추상화 결합도 + typestate builder), `SessionInitCtx` (Phase 4-1 산출물), `Forward` + `TokenSampler` trait 시그니처. v3 진입 후에도 정합 유지.
+> **본 문서(v1) 운명**: Phase β 시점에 v3 기준으로 **v2로 재작성** 예정. 본 sprint 외 별 sprint scope.
+>
+> **v1 → v3 폐기 매트릭스**:
+> - `EvictionStage` / `SwapStage` / `CommandSource` / `DecodeObserver` 4 trait → 단일 `PipelineStage` trait 로 흡수 (2026-05-27 hook 패턴 결정)
+> - **본 grill 2026-05-28 추가 폐기**: v1 의 `cache_manager` / `weight_bundle` 어떤 abstraction 도 god ctx 형태로 ctx 에 노출하지 않음. Stage 객체가 `Arc<dyn KVCacheLayer>` / `Arc<dyn WeightLayer>` 를 register 시점 보관 ((γ) interior mutability 모델, `LayerSlot::rcu_weights` 자연 확장).
+>
+> **v1 → v3 보존**:
+> - `Forward` / `TokenSampler` 2 trait + `DecodeLoopBuilder` typestate (W-1, INV-LAYER-007 정합)
+> - `SessionInitCtx` (Phase 4-1 산출물, 본 설계와 직교)
+> - INV-LAYER-006/007 (DecodeLoop 추상화 결합도 + typestate builder)
+>
+> **v3 본 grill 2026-05-28 핵심 인용 (v2 재작성 시 반영 의무)**:
+> 1. KvBundle / WeightBundle trait **폐기** → KVCacheLayer (5 method) / WeightLayer (4 method) + SwapMetrics 별 trait
+> 2. StageContext 3 field (`step` / `backend_ext` / `profiler`) — kv / weights 폐기
+> 3. KV dispatch Generic → Trait object 전환 (`docs/adr/0001-kv-dispatch-paradigm.md` 정식 결정)
+> 4. Sprint 분리: Phase α-W (2-3주) → ADR-0001 → Phase α-K (4-6주)
+> 5. (β) sync 모델 + (d-1) primitive only + Q7 (A) composite kernel ownership 유지
+>
+> v2 재작성 범위 / scope 는 Phase β 진입 시점에 별 sprint 로 결정. 본 v1 문서는 git history 보존 목적 (Phase γ 까지 legacy generate.rs 유지 동안 참조).
 
 > spec/01-architecture.md §3.8 (SYS-100, SYS-105) + `INV-LAYER-005/006/007`의 구현 설계. legacy `bin/generate.rs` 13,017 LOC 중 `main()` 7,051 LOC을 6개 trait 추상화 + typestate builder로 분해하기 위한 설계. **본 문서는 2026-05-16 finalize 시점 설계 단일 진실 원본**이며 일부 단계는 이미 구현 완료되었다.
 

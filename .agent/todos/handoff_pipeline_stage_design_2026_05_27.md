@@ -5,6 +5,38 @@
 > **진입 문장**: "Pipeline stage Phase α 진입 — Pre-α-1 design round (Q24 sub-trait 4종) 시작"
 > **선행 문서**: `arch/pipeline_stage_design.md` (본 sprint 단일 진실원본, 23 라운드 grill 결정 반영)
 > **선행 spec**: `spec/41-invariants.md` §3.28 (INV-DECODE-STAGE-001~007)
+>
+> ---
+>
+> ## **⚠ 본 handoff 는 2026-05-28 KvBundle/WeightBundle grill 결정으로 SUPERSEDED**
+>
+> **후속 handoff**: `.agent/todos/handoff_kv_weight_grill_2026_05_28.md` — 본 grill 12 결정 반영 (KvBundle/WeightBundle trait 폐기 + KVCacheLayer/WeightLayer trait + ctx 5→3 field + KV dispatch Generic → Trait object + Sprint 분리 Phase α-W → ADR-0001 → Phase α-K).
+>
+> **본 handoff 의 다음 결정이 supersede 됨**:
+> | 본 handoff (2026-05-27) | 2026-05-28 본 grill 변경 |
+> |---|---|
+> | 단일 Phase α (WeightBundle prerequisite, 2-3주) | **Phase α-W (Weight + PipelineStage 인프라, 2-3주) → ADR-0001 → Phase α-K (KV refactor 4-6주)** |
+> | KvBundle 8 method 시그니처 + WeightBundle 10 method 시그니처 | **KvBundle / WeightBundle trait 폐기 → KVCacheLayer (5 method) / WeightLayer (4 method) + SwapMetrics 별 trait** |
+> | god ctx 5 field 인정 (kv / weights 포함) | **3 field 축소 (step / backend_ext / profiler)** — kv / weights 는 Stage 가 register 시점 layer handle 보관 |
+> | Pre-α-2 PoC scope (KIVI per-layer mix 포함) | **Phase α-W PoC scope (Weight swap 정확성 회귀 0건 포함)** — KIVI 시나리오는 Phase α-K 로 이동 |
+> | Q24 sub-trait 4종 (KVCacheView / LayerView / SecondaryStore / SparsePattern) | **Q24 5종 (Q24-5 StorageSpec 추가, LayerView → WeightLayerView 재명명)** |
+> | 총 작업 기간 8~13주 | **총 12~19주** (KV refactor risk 분리로 +4-6주) |
+>
+> **본 handoff 의 보존된 결정** (2026-05-28 후에도 유효):
+> - 단일 PipelineStage trait + LifecyclePhase enum (P3 21 variant + P4 feature-gated) + PipelineRegistry 패턴
+> - W-1 Forward / TokenSampler 별 trait 유지
+> - Manager IPC 위치 = DecodeLoop owned (stage 외부)
+> - error handling = panic on Err
+> - registry = `Arc<PipelineRegistry>` + `Mutex<Vec<Arc<dyn PipelineStage>>>` interior mutability
+> - OneShot lifecycle = `StageLifecycle::OneShot` + `StageOutcome::Consumed` + dispatcher 자동 GC
+>
+> **INV 변경**:
+> - **폐기**: INV-DECODE-STAGE-002 (KVBUNDLE-CONSISTENCY) — KvBundle trait 폐기로 자연 해소
+> - **폐기**: INV-DECODE-STAGE-003 (KVBUNDLE-SYNC) — (β) sync 모델 자동 처리
+> - **신규**: INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC / INV-KVCACHELAYER-PAIRED-KERNEL / INV-STAGE-LAYER-HANDLE
+> - **수정**: INV-DECODE-STAGE-001 (ctx.kv → Stage 보유 layer handle) / INV-DECODE-STAGE-006 (5 field → 3 field)
+>
+> 후속 handoff 의 R6 (References) 가 본 handoff 와의 supersede 매트릭스 5건을 상세 기술. **다음 세션 진입 문장은 후속 handoff 의 진입 문장 "Pipeline stage Phase α-W 진입" 을 사용**.
 
 ---
 
