@@ -732,6 +732,10 @@
 - **Status**: CANCELLED (2026-03-31)
 - **Notes**: 1B+2048ctx 타겟에서 실익 없음. stub 삭제 (7742543)
 
+## [P3] QuantizeHandler stub 제거 + ENG-ALG-092 spec 개정
+- **Status**: TODO (2026-05-29 grill ③ B-b, "진짜 나중에" 미룸 — 중요도 낮음)
+- **Notes**: `QuantizeHandler::handle()`은 어느 pipeline에도 등록 안 되는 NoOp stub (위 MergeHandler/SparseHandler 동류, 단 아직 미삭제). 단순 삭제 불가 사유 — `target_bits_for_pressure`(PressureLevel→KIVI bits 매핑)가 ENG-ALG-092 *(MUST)* 로 명세 + `test_eng_alg_060_092.rs`/`test_action_pool.rs`가 검증(production 호출지는 0). 묶음 작업: (a) QuantizeHandler struct 삭제, (b) `target_bits_for_pressure`를 free fn 강등 또는 함께 정리, (c) ENG-ALG-092 표 정정 — 제목 "6종"인데 표엔 4개만 나열(Compress/Merge/Sparse 잔재 stale) + QuantizeHandler "완료"인데 never-registered NoOp(spec-impl divergence), (d) spec test 갱신. spec ID 걸려 Architect/spec-manage 라운드 필요. **선행 완료**: 2026-05-29 B-a — `ActionResult` dead variant `Quantized`/`Recalled` 삭제(producer/consumer 0, 영수증 채널의 빈 칸).
+
 ## [P3] EnergyConstraint 스펙-코드 Divergence 해소
 - **Status**: TODO
 - **Sprint**: backlog

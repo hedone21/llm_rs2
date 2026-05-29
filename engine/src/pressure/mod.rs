@@ -83,12 +83,8 @@ pub enum ActionResult {
         tokens_removed: usize,
         new_pos: usize,
     },
-    /// KV precision was reduced (stub).
-    Quantized,
     /// KV data was swapped to secondary storage (disk offload).
     Swapped { tokens_swapped: usize },
-    /// KV data was recalled (restored) from secondary storage back into cache.
-    Recalled { tokens_recalled: usize },
     /// Decoder layer weights were swapped to a lower-precision dtype (weight swap).
     WeightSwapped {
         /// Number of layers whose weights were atomically replaced.
@@ -504,9 +500,7 @@ mod tests {
             }
             .is_action()
         );
-        assert!(ActionResult::Quantized.is_action());
         assert!(ActionResult::Swapped { tokens_swapped: 0 }.is_action());
-        assert!(ActionResult::Recalled { tokens_recalled: 0 }.is_action());
         assert!(
             ActionResult::WeightSwapped {
                 layers_changed: 1,
