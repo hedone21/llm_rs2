@@ -291,12 +291,14 @@ mutation primitive 3개는 storage-format-agnostic. dtype / codebook / rotation 
 ```rust
 pub trait WeightLayer: Send + Sync {
     fn idx(&self) -> usize;
-    fn view(&self) -> WeightView<'_>;
     fn apply_dispatch(&self, d: LayerDispatch) -> Result<()>;   // LayerDispatch = Full / Skip / Partition (고정 3 variant)
+    // view() 없음 (Q-#2 해소 2026-05-29) — 아래 설명.
     // apply_storage(spec) 없음 — precision swap 등 paradigm mutation 은
     //   concrete-handle Stage (예: WeightSwapStage with Arc<LayerSlot>) 가 concrete method 직접 호출
 }
 ```
+
+**read 표면 분리 (Q-#2 = WeightLayerView 해소, 2026-05-29)**: `WeightLayerView` trait + `WeightLayer::view()` **삭제** — KV(§4.1)와 대칭. 근거: (1) `LayerWeights = TransformerLayer` (`models/weights/slot.rs:23`) — 런타임 weight 구조체가 **단 1개**, 아키텍처 차이(Llama/Qwen/Gemma)는 **load-time mapper**(`models/mappers/`)가 흡수(arch별 차이는 `Option` 필드, 예: Qwen `qkv_bias`). (2) forward 는 `slot.load_weights() -> Arc<TransformerLayer>` 로 concrete 직접 read — base trait view() 우회. (3) Stage 는 content 가 아니라 dispatch 모드(`apply_dispatch`)만; precision swap 은 concrete-handle(`Arc<LayerSlot>`). → `WeightLayer::view()` 소비하는 base-trait-handle 보유자 0. concrete layout 1개라 `&dyn WeightLayerView` trait 은 1-adapter = 가설적 seam (deletion test 불통과). `weight_tensor(name)` vs typed-method 질문도 증발(concrete named 필드 직접 read). **승격 trigger**: `TransformerLayer` 로 매핑 불가능한 2번째 런타임 weight layout 등장 시 `WeightLayerView` 도입.
 
 ---
 

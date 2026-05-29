@@ -81,8 +81,8 @@ Top recommendation = ② (de-risk 전제 + 죽은 INV 부활).
 
 1. ~~**Q-#1-3 — K/V raw read 노출**~~ **해소 (2026-05-29) → 갈래 (a)**: D2O 를 `Arc<StandardLayer>` concrete-handle Stage 로, raw K read 는 inherent method 직접 호출. `DenseKVRead` capability 는 2nd consumer 시 승격(1-adapter=premature). 상세 `arch/pipeline_stage_design_v2.md §3.4`.
 2. ~~**Q-#1-4 — capacity 중복** / **Q-#1-5 — mutation 누설**~~ **해소 (2026-05-29) → `KVCacheView` + `view()` 삭제**: #18 + Q-#1-3(a) 이후 view 멤버 0·소비자 0. read = geometry(Layer) + content(concrete-handle). KVCacheLayer 7→6 method. 상세 `arch/pipeline_stage_design_v2.md §4.1`. (**다음 sub-grill 진입점 = #2 WeightLayerView**)
-3. **#2 — WeightLayerView** (다음 sub-grill 진입점, Phase α-W 진입 전)
-4. **#3 — SecondaryStore** (Phase α-W 진입과 같이 진행)
+3. ~~**#2 — WeightLayerView**~~ **해소 (2026-05-29) → trait + `WeightLayer::view()` 삭제 (KV와 대칭)**: 런타임 weight layout 단일(`TransformerLayer`), arch 는 load-time mapper. `WeightLayer` 3→2 method. 상세 `arch/pipeline_stage_design_v2.md §4.2`.
+4. **#3 — SecondaryStore** (다음 sub-grill 진입점, Phase α-W 진입과 같이 진행)
 5. **#4 — SparsePattern** (별 sprint)
 6. **#6 — system/ 명명** (Phase α-W stages/ 디렉토리 신설 commit 전)
 7. **#11 — Layer impl backend ref 보유 패턴** (Phase α-W 진입 전 필수)
@@ -302,8 +302,8 @@ Top recommendation = ② (de-risk 전제 + 죽은 INV 부활).
 
 1. **sub-trait detail finalize** (`arch/pipeline_stage_design.md` §13.1 / §13.6):
    - ~~**Q24-1**: `KVCacheView`~~ **해소 완료 (2026-05-29)** — Q-#1-3/4/5 동시 종결. **Q-#1-3 → 갈래 (a)**: raw K 안 노출, D2O 는 concrete-handle Stage(`Arc<StandardLayer>` + inherent `read_k_layer_wide`), DenseKVRead capability 는 2nd consumer 시 승격. **Q-#1-4/5 → `KVCacheView` + `view()` 삭제**: #18(dtype 폐기) + Q-#1-3(a) 이후 view 멤버 0·소비자 0(deletion test 불통과). read = geometry(idx/current_pos/capacity, Layer 본체) + content(concrete-handle). capacity 중복 소거 + mutation 누설 불가. 승격 trigger = 2번째 paradigm-agnostic content-read 소비자. 상세 = `arch/pipeline_stage_design_v2.md §3.4`(Q-#1-3) + §4.1(Q-#1-4/5). KVCacheLayer 7→6 method.
-   - **Q24-2**: `WeightLayerView` (WeightLayer::view 반환 type) — Llama / Qwen / Mistral 흡수. dtype() 부재 정합 (결정 #18).
-   - **Q24-3**: `SecondaryStore` (backlog [P2] `arch/weights_pressure_split.md §7.5` 확정, Phase α-W 와 같이 진행)
+   - ~~**Q24-2**: `WeightLayerView`~~ **해소 완료 (2026-05-29) → trait + `WeightLayer::view()` 삭제 (KV와 대칭)**: `LayerWeights = TransformerLayer` (`slot.rs:23`) 런타임 weight 구조체 단 1개, arch 차이는 load-time mapper(`models/mappers/`)가 흡수(Option 필드). forward 는 `slot.load_weights()` 로 concrete 직접 read(base trait 우회), Stage 는 dispatch 모드만(precision swap=concrete-handle). → view() 소비자 0 + concrete layout 1개 → `&dyn WeightLayerView` = 1-adapter 가설적 seam(deletion test 불통과). `weight_tensor(name)` vs typed-method 질문 증발. `WeightLayer` 3→2 method (idx + apply_dispatch). 승격 trigger = `TransformerLayer` 매핑 불가 2번째 런타임 layout. 상세 = `arch/pipeline_stage_design_v2.md §4.2`. (※ spec line 571 의 `WeightLayer::apply_storage` 는 결정 #15에서 이미 폐기된 stale 참조 — #12 finalize 시 정리.)
+   - **Q24-3**: `SecondaryStore` (다음 sub-grill 진입점, backlog [P2] `arch/weights_pressure_split.md §7.5` 확정, Phase α-W 와 같이 진행)
    - **Q24-4**: `SparsePattern` (stub or 별 sprint)
    - **~~Q24-5 (해소 본 sub-grill 2026-05-28~29)~~**: ~~`StorageSpec` + `WeightStorageSpec`~~ — **자연 폐기** (본 sub-grill 결정 #15 — 3-tier Stage 패턴 채택 → Tier 2 paradigm-specific Stage 가 concrete struct method 직접 호출로 흡수, spec object 패턴 불필요).
 
