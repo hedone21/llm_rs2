@@ -282,8 +282,10 @@ Stage 가 layer 를 보유하는 `Arc<...>` handle 의 정적 타입은 Rust 에
 
 규칙은 handle *타입* 에서 자동 도출된다 ("tier 라벨" 불필요): base-trait-handle 을 든 Stage 는 paradigm 을 몰라야 한다(`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`); concrete-handle 을 든 Stage 가 그 타입을 아는 것은 위반이 아니다(그게 concrete 를 든다는 의미); capability-handle 은 Stage 측 trait 의 추상화 책임. 4번째 형태는 없다(enum-of-concrete 는 OCP 재발이라 기각).
 
-**concrete-handle 실제 예시 — D2O eviction (결정 2026-05-29)**: D2O 는 evict 토큰을 K 코사인 유사도로 retained nearest 에 merge 한다(`engine/src/pressure/d2o_handler.rs` — `dequantize_k` 가 F32/F16/Q4_0 분기). raw K read 가 필요해 base-trait-handle 로는 불가하지만, **capability-handle(`Arc<dyn DenseKVRead>`)을 지금 만들지 않는다**. raw-K-read 소비자가 D2O **하나뿐**이기 때문(H2O/SnapKV 는 attention score, Sliding/Streaming 은 position 으로 결정 — K 안 읽음). 1-adapter = 가설적 seam → capability trait 은 premature abstraction. 따라서 D2O Stage 는 `Arc<StandardLayer>` 를 든 **concrete-handle Stage** 로, K read 는 `StandardLayer` 의 inherent method (`read_k_layer_wide`) 직접 호출. dense concrete 가 `StandardLayer` 1개뿐이라 "dtype 변종마다 재구현" 부담 없음(이 type 이 F32/F16/Q4_0 내부 처리). KIVI/Sparse 위엔 타입 불일치로 build 시점 차단 → 잘못된 paradigm silent garbage 원천 봉쇄.
+**concrete-handle 실제 예시 — D2O eviction**: D2O 는 evict 토큰을 K 코사인 유사도로 retained nearest 에 merge 한다(`engine/src/pressure/d2o_handler.rs` — `dequantize_k` 가 F32/F16/Q4_0 분기). raw K read 가 필요해 base-trait-handle 로는 불가하지만, **capability-handle(`Arc<dyn DenseKVRead>`)을 지금 만들지 않는다**. raw-K-read 소비자가 D2O **하나뿐**이기 때문(H2O/SnapKV 는 attention score, Sliding/Streaming 은 position 으로 결정 — K 안 읽음). 1-adapter = 가설적 seam → capability trait 은 premature abstraction. 따라서 D2O Stage 는 `Arc<StandardLayer>` 를 든 **concrete-handle Stage** 로, K read 는 `StandardLayer` 의 inherent method (`read_k_layer_wide`) 직접 호출. dense concrete 가 `StandardLayer` 1개뿐이라 "dtype 변종마다 재구현" 부담 없음(이 type 이 F32/F16/Q4_0 내부 처리). KIVI/Sparse 위엔 타입 불일치로 build 시점 차단 → 잘못된 paradigm silent garbage 원천 봉쇄.
 - **승격 trigger**: 2번째 raw-K-read 소비자(예: K-기반 클러스터링 eviction) **또는** 2번째 dense `KVCacheLayer` impl 이 등장하면 — 그때 `read_k_layer_wide` 를 `DenseKVRead` capability trait 으로 기계적 추출(method→trait + 양쪽 impl). 그 전엔 추출 금지(deletion-test 미통과).
+
+> **연혁** — 결정 2026-05-29: D2O eviction 을 concrete-handle Stage(`Arc<StandardLayer>`)로 확정하고, `DenseKVRead` capability 는 미생성(raw-K-read 소비자 1개 = 가설적 seam).
 
 ---
 
@@ -292,6 +294,10 @@ Stage 가 layer 를 보유하는 `Arc<...>` handle 의 정적 타입은 Rust 에
 (γ) interior mutability 모델 — layer 가 `&self` 통해 자기 state 를 mutate (`LayerSlot::rcu_weights` 패턴의 자연 확장). KV dispatch 는 Generic monomorphization → Trait object (`docs/adr/0001`).
 
 ### 4.1 `KVCacheLayer`
+
+**역할.** KV 캐시의 state mutation primitive 를 **storage-format-agnostic** 하게 제공하는 base trait. base-trait-handle 을 든 Stage 는 이 3개 mutation(`write_kv` / `write_kv_batch` / `compact`) + 3개 geometry(`idx` / `current_pos` / `capacity`) 만 알면 되고, dtype/codebook/rotation/sparse pattern 은 impl(`StandardLayer` / `KIVILayer` / `SparseLayer`) 이 캡슐화하므로 모른다 (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`). 새 paradigm = 새 impl + paired attention kernel (`INV-KVCACHELAYER-PAIRED-KERNEL`), base-trait-handle Stage 변경 0.
+
+**read 표면은 두 갈래로 분리된다.** (1) **geometry**(idx / current_pos / capacity) 는 base trait method 로 Layer 본체가 단일 소유한다 — capacity 가 한 곳에만 있어 중복이 없다. (2) **content**(raw K/V 값) 는 base trait 에 두지 않는다; concrete-handle 의 read-only inherent method(예: `StandardLayer::read_k_layer_wide -> Cow<[f32]>`)로만 접근한다. 제네릭 read view 가 없으므로 mutation 이 샐 표면도 없다 (mutation 은 3 primitive 단일 경로).
 
 ```rust
 pub trait KVCacheLayer: Send + Sync {
@@ -306,23 +312,28 @@ pub trait KVCacheLayer: Send + Sync {
 }
 ```
 
-mutation primitive 3개는 storage-format-agnostic. dtype / codebook / rotation matrix / sparse pattern 은 impl(`StandardLayer` / `KIVILayer` / `SparseLayer`) 이 캡슐화. 새 paradigm = 새 impl + paired attention kernel (`INV-KVCACHELAYER-PAIRED-KERNEL`), base-trait-handle Stage 변경 0.
+**승격 trigger**: 2번째 paradigm-agnostic content-read 소비자가 등장하면 그때 `KVCacheView` capability 를 재도입한다 (§3.4 D2O 의 `DenseKVRead` 와 대칭 — 그 전엔 빈 trait 금지, deletion test).
 
-**read 표면 분리 (Q-#1-4/5 해소, 2026-05-29)**: `KVCacheView` + `view()` **삭제**. read 는 두 갈래로 나뉜다 — (1) **geometry** (idx / current_pos / capacity) 는 위 3개 method 로 Layer 본체에 둔다, (2) **content** (raw K/V 값) 는 concrete-handle 의 read-only inherent method(예: `StandardLayer::read_k_layer_wide -> Cow<[f32]>`)로만. #18(dtype 폐기) + Q-#1-3 (a)(raw K → concrete-handle) 이후 KVCacheView 는 멤버 0·소비자 0 (eviction 정책은 position/score 만 읽고 content 안 읽음; backend·score·D2O 는 view 우회) → deletion test 불통과라 삭제. 부수 효과: **capacity 중복(Q-#1-4) 원천 소거** (capacity 는 Layer 단일 소유), **mutation 누설(Q-#1-5) 불가** (제네릭 read view 부재 → 샐 표면 없음; mutation 은 3 primitive 단일 경로). **승격 trigger**: 2번째 paradigm-agnostic content-read 소비자 등장 시 `KVCacheView` 재도입 (Q-#1-3 과 대칭, 그 전엔 빈 trait 금지).
+> **연혁** — Q-#1-4/5 해소 (2026-05-29): `KVCacheView` trait + `view()` 를 **삭제**했다. #18(dtype 폐기) + Q-#1-3 (a)(raw K → concrete-handle) 이후 `KVCacheView` 는 멤버 0·소비자 0 이 되었다 (eviction 정책은 position/score 만 읽고, backend·score·D2O 는 view 를 우회) → deletion test 불통과. 삭제의 부수 효과로 capacity 중복(Q-#1-4)과 mutation 누설 표면(Q-#1-5)이 함께 소거되었다.
 
 ### 4.2 `WeightLayer`
+
+**역할.** weight layer 의 dispatch 모드(Full / Skip / Partition)를 적용하는 base trait — KV(§4.1)와 대칭이다. base-trait-handle 을 든 Stage 는 dispatch 모드만 알고 weight content 는 모른다. precision swap 등 paradigm mutation 은 concrete-handle Stage(예: `WeightSwapStage` with `Arc<LayerSlot>`)가 concrete method 로 직접 수행한다.
+
+**read 표면은 concrete-handle 로만.** forward 는 `slot.load_weights() -> Arc<TransformerLayer>` 로 concrete weight 를 직접 읽는다. base trait 에 제네릭 read view(`view()`)를 두지 않는 이유는 **런타임 weight 구조체가 `TransformerLayer` 단 하나**이기 때문이다 — 아키텍처 차이(Llama / Qwen / Gemma)는 load-time mapper(`models/mappers/`)가 `Option` 필드(예: Qwen `qkv_bias`)로 흡수하므로 런타임에는 단일 layout 만 존재한다. concrete layout 이 1개뿐이라 `&dyn WeightLayerView` 는 1-adapter 가설적 seam 이다.
 
 ```rust
 pub trait WeightLayer: Send + Sync {
     fn idx(&self) -> usize;
     fn apply_dispatch(&self, d: LayerDispatch) -> Result<()>;   // LayerDispatch = Full / Skip / Partition (고정 3 variant)
-    // view() 없음 (Q-#2 해소 2026-05-29) — 아래 설명.
-    // apply_storage(spec) 없음 — precision swap 등 paradigm mutation 은
-    //   concrete-handle Stage (예: WeightSwapStage with Arc<LayerSlot>) 가 concrete method 직접 호출
+    // view() 없음 — read 는 concrete-handle (load_weights) 경유. 연혁 참조.
+    // apply_storage(spec) 없음 — precision swap 등은 concrete-handle Stage (Arc<LayerSlot>) 가 직접 호출
 }
 ```
 
-**read 표면 분리 (Q-#2 = WeightLayerView 해소, 2026-05-29)**: `WeightLayerView` trait + `WeightLayer::view()` **삭제** — KV(§4.1)와 대칭. 근거: (1) `LayerWeights = TransformerLayer` (`models/weights/slot.rs:23`) — 런타임 weight 구조체가 **단 1개**, 아키텍처 차이(Llama/Qwen/Gemma)는 **load-time mapper**(`models/mappers/`)가 흡수(arch별 차이는 `Option` 필드, 예: Qwen `qkv_bias`). (2) forward 는 `slot.load_weights() -> Arc<TransformerLayer>` 로 concrete 직접 read — base trait view() 우회. (3) Stage 는 content 가 아니라 dispatch 모드(`apply_dispatch`)만; precision swap 은 concrete-handle(`Arc<LayerSlot>`). → `WeightLayer::view()` 소비하는 base-trait-handle 보유자 0. concrete layout 1개라 `&dyn WeightLayerView` trait 은 1-adapter = 가설적 seam (deletion test 불통과). `weight_tensor(name)` vs typed-method 질문도 증발(concrete named 필드 직접 read). **승격 trigger**: `TransformerLayer` 로 매핑 불가능한 2번째 런타임 weight layout 등장 시 `WeightLayerView` 도입.
+**승격 trigger**: `TransformerLayer` 로 매핑 불가능한 2번째 런타임 weight layout 이 등장하면 그때 `WeightLayerView` 를 도입한다 (KV §4.1 의 `KVCacheView` 재도입 trigger 와 대칭).
+
+> **연혁** — Q-#2(WeightLayerView) 해소 (2026-05-29): `WeightLayerView` trait + `WeightLayer::view()` 를 **삭제**했다 (KV §4.1 과 대칭). `WeightLayer::view()` 를 소비하는 base-trait-handle 보유자가 0 이고(forward 는 concrete `load_weights()` 우회), concrete layout 이 `TransformerLayer` 1개뿐이라 deletion test 불통과. `weight_tensor(name)` vs typed-method 논쟁도 함께 증발(concrete named 필드 직접 read).
 
 ---
 
