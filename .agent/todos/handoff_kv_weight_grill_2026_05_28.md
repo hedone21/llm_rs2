@@ -71,6 +71,28 @@ Top recommendation = ② (de-risk 전제 + 죽은 INV 부활).
 
 **구현 진입**: 위 ①·② 는 설계 노트 단계. 실제 구현은 Phase α-W/α-K migration 과 동행 (#2 harness 가 ①③④ 회귀 그물이므로 #2 먼저).
 
+### 2026-05-29 후속 — Q-#1-3/4/5 + #2 + improve-codebase 2차 review + ③ 구현
+
+**Q sub-grill 종결** (상세 R5/R0): Q-#1-3 → 갈래 (a) D2O concrete-handle(`Arc<StandardLayer>`, DenseKVRead 미생성, 2nd-consumer 승격) / Q-#1-4/5 → `KVCacheView`+`view()` 삭제(read=geometry on Layer + content on concrete-handle, KVCacheLayer 7→6 method) / #2 → `WeightLayerView`+`WeightLayer::view()` 삭제(런타임 weight layout 단일 `TransformerLayer`, arch=load-time mapper, WeightLayer 3→2 method). 공통 패턴: view trait 을 hot consumer 유무 + concrete layout 수로 실측 → 대부분 가설적 seam → 삭제.
+
+**improve-codebase-architecture 2차 review** (코드 shallowness 실측, 리포트 `/tmp/architecture-review-20260529_152746.html` 휘발, Explore ×2: Backend=80 method[storage/SOA/scatter 37], as_any 호출 53, CacheManager 1529 LOC[80% pass-through]). 후보(1차 review ①~⑤와 **별개**, 코드 레벨 — 충돌 방지 위해 prime 표기):
+
+| # | 후보 | 강도 | 상태 |
+|---|---|---|---|
+| ①′ | CacheManager 삭제 (얇은 dispatcher, ADR-0001 이 legacy policy registry obsolete화) | Strong | 보류 — #2 harness + Phase α-K 선행 |
+| ②′ | Backend 80-method storage long-tail 37 → capability | Worth | **보류 (friction-triggered)** — depth 아닌 front-door ergonomics, Backend breadth=도메인 본질. 1차 Speculative+2차로 2회 거론 → ADR-0002 후보지만 **미작성**(offer 미응답) |
+| ③′ | ActionResult dead variant 정리 | Worth | **B-a 완료** `6077c796` (Quantized/Recalled 삭제). **B-b 보류** → backlog [P3] (QuantizeHandler struct 삭제 + ENG-ALG-092 MUST spec 개정, Architect/spec-manage 필요) |
+| ④′ | CapabilityRegistry 4→1 아닌 4→2 (as_any 53곳 대부분 escape hatch) | Worth | 미grill — **재개 시 다음 자연 후보** |
+| ⑤′ | KVCacheView 삭제 후 KV 메타데이터(kv_heads/head_dim/layout) 거처 | Speculative | α-K 매핑(R-G2)에 흡수 |
+
+핵심 발견(③′): `ActionResult` 는 추론 정확성 로직이 아니라 **영수증/관찰 채널** (handler in-place mutate → 결과 미독해도 decode 정상, pipeline 이 결과로 분기 안 함, new_pos 는 `max_cache_pos` redundant, 소비자 전부 profiler/PPL/log/test).
+
+**세션 commit (2026-05-29)**: `1fa14877`(SOLID/DRY/KISS grill + v2 + Q-#1-3) → `ceac7eec`(Q-#1-4/5 KVCacheView 삭제) → `1337f322`(#2 WeightLayerView 삭제) → `6077c796`(③′ B-a ActionResult dead variant).
+
+**메모리 정정**: MEMORY.md ActionResult 정의(실제=NoOp/Evicted/Quantized/Swapped/Recalled/WeightSwapped, dead=Quantized·Recalled; 구버전 Merged/Compressed/Sparsified 폐기) + pressure 경로 `core/` 접두어 제거 + 핸들러 목록 정정.
+
+**재개 진입점**: ④′ CapabilityRegistry 4→2 (저비용, 다음 자연 후보) **또는** 1차 review 의 ④/⑤(KVCacheLayer KIVI creep / 순서-안전 property test). ①′·②′·B-b 는 모두 보류·선행조건 있음. 미응답 thread: ②′ ADR-0002 작성 여부.
+
 ---
 
 ## R0. 본 sub-grill (2026-05-28~29) 후 신규 진입점
