@@ -271,16 +271,20 @@ Stage 가 layer 를 보유하는 `Arc<...>` handle 의 정적 타입은 Rust 에
 
 ```rust
 pub trait KVCacheLayer: Send + Sync {
-    fn view(&self) -> KVCacheView<'_>;
+    fn idx(&self) -> usize;
+    fn current_pos(&self) -> usize;
+    fn capacity(&self) -> usize;
     fn write_kv(&self, /* ... */) -> Result<()>;
     fn write_kv_batch(&self, /* ... */) -> Result<()>;
     fn compact(&self, keep: &[usize], merges: &[Merge]) -> Result<()>;   // keep+merges atomic
     // as_any() 없음 — downcast 의도적 차단.
-    // dtype() 없음 — Stage 가 storage paradigm 모름 (KVCacheView 도 dtype 미노출).
+    // dtype() / KVCacheView 없음 — Stage 가 storage paradigm 모름.
 }
 ```
 
 mutation primitive 3개는 storage-format-agnostic. dtype / codebook / rotation matrix / sparse pattern 은 impl(`StandardLayer` / `KIVILayer` / `SparseLayer`) 이 캡슐화. 새 paradigm = 새 impl + paired attention kernel (`INV-KVCACHELAYER-PAIRED-KERNEL`), base-trait-handle Stage 변경 0.
+
+**read 표면 분리 (Q-#1-4/5 해소, 2026-05-29)**: `KVCacheView` + `view()` **삭제**. read 는 두 갈래로 나뉜다 — (1) **geometry** (idx / current_pos / capacity) 는 위 3개 method 로 Layer 본체에 둔다, (2) **content** (raw K/V 값) 는 concrete-handle 의 read-only inherent method(예: `StandardLayer::read_k_layer_wide -> Cow<[f32]>`)로만. #18(dtype 폐기) + Q-#1-3 (a)(raw K → concrete-handle) 이후 KVCacheView 는 멤버 0·소비자 0 (eviction 정책은 position/score 만 읽고 content 안 읽음; backend·score·D2O 는 view 우회) → deletion test 불통과라 삭제. 부수 효과: **capacity 중복(Q-#1-4) 원천 소거** (capacity 는 Layer 단일 소유), **mutation 누설(Q-#1-5) 불가** (제네릭 read view 부재 → 샐 표면 없음; mutation 은 3 primitive 단일 경로). **승격 trigger**: 2번째 paradigm-agnostic content-read 소비자 등장 시 `KVCacheView` 재도입 (Q-#1-3 과 대칭, 그 전엔 빈 trait 금지).
 
 ### 4.2 `WeightLayer`
 

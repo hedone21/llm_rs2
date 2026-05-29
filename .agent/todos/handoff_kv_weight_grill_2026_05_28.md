@@ -79,15 +79,14 @@ Top recommendation = ② (de-risk 전제 + 죽은 INV 부활).
 
 ### 신규 진입 추천 순서
 
-1. ~~**Q-#1-3 — K/V raw read 노출 여부**~~ **해소 (2026-05-29) → 갈래 (a)**: D2O 를 `Arc<StandardLayer>` concrete-handle Stage 로, raw K read 는 inherent method 직접 호출. capability trait(`DenseKVRead`) **지금 안 만듦** — raw-K-read 소비자가 D2O 하나뿐(H2O/SnapKV=score, Sliding/Streaming=position)이라 1-adapter = 가설적 seam = premature. 승격 trigger: 2번째 K-reader 또는 2번째 dense impl 등장 시 method→trait 기계적 추출. 상세 = `arch/pipeline_stage_design_v2.md §3.4`. (다음 sub-grill 진입점은 Q-#1-4)
-2. **Q-#1-4 — capacity 중복** (다음 sub-grill 진입점, Q-#1-5 와 같은 round)
-3. **Q-#1-5 — mutation 누설** (Q-#1-3/4 와 같은 sub-grill round)
-4. **#2 — WeightLayerView** (Phase α-W 진입 전)
-5. **#3 — SecondaryStore** (Phase α-W 진입과 같이 진행)
-6. **#4 — SparsePattern** (별 sprint)
-7. **#6 — system/ 명명** (Phase α-W stages/ 디렉토리 신설 commit 전)
-8. **#11 — Layer impl backend ref 보유 패턴** (Phase α-W 진입 전 필수)
-9. **#12 — KVCacheLayer / WeightLayer impl 시그니처 detail finalize** (Phase α-W 진입 전 필수)
+1. ~~**Q-#1-3 — K/V raw read 노출**~~ **해소 (2026-05-29) → 갈래 (a)**: D2O 를 `Arc<StandardLayer>` concrete-handle Stage 로, raw K read 는 inherent method 직접 호출. `DenseKVRead` capability 는 2nd consumer 시 승격(1-adapter=premature). 상세 `arch/pipeline_stage_design_v2.md §3.4`.
+2. ~~**Q-#1-4 — capacity 중복** / **Q-#1-5 — mutation 누설**~~ **해소 (2026-05-29) → `KVCacheView` + `view()` 삭제**: #18 + Q-#1-3(a) 이후 view 멤버 0·소비자 0. read = geometry(Layer) + content(concrete-handle). KVCacheLayer 7→6 method. 상세 `arch/pipeline_stage_design_v2.md §4.1`. (**다음 sub-grill 진입점 = #2 WeightLayerView**)
+3. **#2 — WeightLayerView** (다음 sub-grill 진입점, Phase α-W 진입 전)
+4. **#3 — SecondaryStore** (Phase α-W 진입과 같이 진행)
+5. **#4 — SparsePattern** (별 sprint)
+6. **#6 — system/ 명명** (Phase α-W stages/ 디렉토리 신설 commit 전)
+7. **#11 — Layer impl backend ref 보유 패턴** (Phase α-W 진입 전 필수)
+8. **#12 — KVCacheLayer / WeightLayer impl 시그니처 detail finalize** (Phase α-W 진입 전 필수)
 
 본 sub-grill 결정 4 건 + 갈래 B 메타 결정 요약은 R1 참조. 미해결 sub-grill 매트릭스는 R5 + arch §13.6 참조.
 
@@ -302,7 +301,7 @@ Top recommendation = ② (de-risk 전제 + 죽은 INV 부활).
 ### Phase α-W 진입 전
 
 1. **sub-trait detail finalize** (`arch/pipeline_stage_design.md` §13.1 / §13.6):
-   - **Q24-1**: `KVCacheView` (KVCacheLayer::view 반환 type) — 본 sub-grill 결정 #18 (dtype 폐기) 반영. **Q-#1-3 (K/V raw read) 해소 2026-05-29 → 갈래 (a)**: KVCacheView 에 raw K 안 노출, D2O 는 concrete-handle Stage(`Arc<StandardLayer>` + inherent `read_k_layer_wide`). DenseKVRead capability 는 2nd consumer 시 승격(`arch/pipeline_stage_design_v2.md §3.4`). Q-#1-4 (capacity 중복) / Q-#1-5 (mutation 누설) 미해결.
+   - ~~**Q24-1**: `KVCacheView`~~ **해소 완료 (2026-05-29)** — Q-#1-3/4/5 동시 종결. **Q-#1-3 → 갈래 (a)**: raw K 안 노출, D2O 는 concrete-handle Stage(`Arc<StandardLayer>` + inherent `read_k_layer_wide`), DenseKVRead capability 는 2nd consumer 시 승격. **Q-#1-4/5 → `KVCacheView` + `view()` 삭제**: #18(dtype 폐기) + Q-#1-3(a) 이후 view 멤버 0·소비자 0(deletion test 불통과). read = geometry(idx/current_pos/capacity, Layer 본체) + content(concrete-handle). capacity 중복 소거 + mutation 누설 불가. 승격 trigger = 2번째 paradigm-agnostic content-read 소비자. 상세 = `arch/pipeline_stage_design_v2.md §3.4`(Q-#1-3) + §4.1(Q-#1-4/5). KVCacheLayer 7→6 method.
    - **Q24-2**: `WeightLayerView` (WeightLayer::view 반환 type) — Llama / Qwen / Mistral 흡수. dtype() 부재 정합 (결정 #18).
    - **Q24-3**: `SecondaryStore` (backlog [P2] `arch/weights_pressure_split.md §7.5` 확정, Phase α-W 와 같이 진행)
    - **Q24-4**: `SparsePattern` (stub or 별 sprint)
