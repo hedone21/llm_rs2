@@ -2,13 +2,74 @@
 
 > **일자**: 2026-05-28 (본 grill) + 2026-05-28~29 (본 sub-grill 누적)
 > **작성자**: Architect (orchestrator 보고용)
-> **진입 문장 (현재)**: **"본 sub-grill 잔여 미해결 sub-trait detail finalize — Q-#1-3 K/V raw read 노출 여부 부터"**
+> **진입 문장 (현재, 2026-05-29 갱신)**: **"Phase α-W 구현 진입 — 설계 단일 진실원본 = `arch/pipeline_stage_design_v2.md`"** 또는 잔여 sub-trait detail finalize (Q-#1-3 K/V raw read 등, R5). 2026-05-29 SOLID/DRY/KISS grill 종결은 R0′ 참조.
 > **이전 진입 문장 (본 sub-grill 후 supersede)**: ~~"Pipeline stage Phase α-W 진입 — Weight + PipelineStage 인프라 + Bundle 폐기"~~
 > **선행 문서**:
-> - `arch/pipeline_stage_design.md` (본 sprint 단일 진실원본, 2026-05-27 23 라운드 grill + **2026-05-28 본 grill 12 결정 + 후속 2 결정 + 2026-05-28~29 본 sub-grill 4 결정 + 갈래 B 메타 결정** 반영. **§0 Executive Overview 진입점**.)
+> - `arch/pipeline_stage_design_v2.md` (**2026-05-29 clean 재작성 — 설계 현재 상태 단일 진실원본, overview-first**). `arch/pipeline_stage_design.md` (v1) 는 결정 *이력* 보존용 (grill 라운드 / 결정 #N 로그 / §13.5 매트릭스 / Resolution Log).
 > - `docs/adr/0001-kv-dispatch-paradigm.md` (KV dispatch Generic → Trait object 정식 결정)
 > - `spec/41-invariants.md` §3.28 (INV-DECODE-STAGE-001/004~007 + INV-KVCACHELAYER-* + INV-STAGE-LAYER-HANDLE; INV-DECODE-STAGE-002/003 폐기; INV-LAYER-006 / INV-STAGE-LAYER-HANDLE / INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC 본문 갱신 — 본 sub-grill 결정 반영)
 > **이전 handoff**: `.agent/todos/handoff_pipeline_stage_design_2026_05_27.md` — 본 grill 결정으로 supersede (Phase α 분리 등). 이전 handoff 의 일부 결정사항은 본 grill 에서 변경됨, 변경 매트릭스는 R6 참조.
+
+---
+
+## R0′. 2026-05-29 SOLID/DRY/KISS grill 종결 + clean 재작성
+
+> **트리거**: `/grill-me` — "지금까지 grill 한 설계를 SOLID/DRY/KISS 로 검토, 어떤 기능 추가도 최소 변경으로 (성능 타협 없이)".
+> **결과물**: `arch/pipeline_stage_design_v2.md` (clean 재작성, 단일 진실원본) + spec INV 2 신규 + 기존 2 갱신 (v1 은 이력 보존).
+
+### 8 결정 (Q1~Q8)
+
+| Q | 결정 |
+|---|---|
+| Q1 | path-dependent 합격선 — 갈래 B 를 metric governing principle 로 (hot=perf 우선·locality / cold=zero-edit OCP) |
+| Q2 | capability 노출 handle-form 통일 — 소비자가 construction 시점 handle 보유, per-forward `as_xxx` lookup 폐기 (hot path 분기 0) |
+| Q3/Q4 | 새 backend 비용 = compute auto-default→`cpu_companion` + fallback profiling (count, env-gated, op_trace 재사용). memory/sync 는 자기 contract. required floor ~4. → **INV-BACKEND-COMPUTE-FALLBACK** |
+| Q5 | 생성 측 floor = typed `CapabilityRegistry` (anymap). `as_any`/`as_kivi_attention`/`gpu_score_acc`/`get_extension` 4 → 1 수렴 |
+| Q6 | 구 #17/#13 회수 — score collection = `ScoreCollector` capability (CPU reference + 선택적 fused kernel). accumulator 출력 shape 는 YAGNI defer |
+| Q7 | 3-category trait 거버넌스 (front-door capping ~7 / capability opt-in / 내부 seam deletion-test). front-door 단일 가이드 = v2 §0.4 |
+| Q8 | 순서=사용자 책임 / 안전=프레임워크 보장. submit-order 현행 유지. ordering policy(commutativity/named-phase/priority) 미도입. → **INV-STAGE-ORDER-SAFETY** |
+
+### 추가 정련 — 3-tier → handle-form
+"Tier 1/2/3" 계층 명명 폐기 → base-trait-handle / concrete-handle / capability-handle (순서 없는 메뉴, Rust 핸들 타입 exhaustive). 규칙은 tier 라벨이 아니라 handle *타입* 에서 자동 도출. spec INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC / INV-STAGE-LAYER-HANDLE 본문 재서술. (grill 시작 전 보류됐던 정련 — 본 grill 에 흡수 완료.)
+
+### 회수 (retire)
+구 R5 #13 (Score domain refactor 별 sprint) + #17 deferral → Q6 으로 흡수. score 는 별 메커니즘 아님 — ScoreCollector capability 로 §3 capability 모델 적용. 단 GPU-fused 성능은 fused attention kernel 변종 필요 (intrinsic hot-path 비용, opt-in, §1.1 합격선 허용).
+
+### 신규 별 액션
+44-trait deletion-test 감사 (v2 §7 ③ 내부 seam 가지치기) — PipelineStage sprint 중 자연 정리 또는 설계 완료 후. 즉시 액션 X.
+
+### 메모리
+`feedback_safety_over_policy.md` 신규 — 확장점 유효 구성(stage 순서 등)은 robustness(crash-safe) 만 보장, policy/config 로 사용자 선택 금지 안 함.
+
+### 변경 파일 (2026-05-29)
+- `arch/pipeline_stage_design_v2.md` (신규, clean) / `arch/pipeline_stage_design.md` (v1 상단 supersede 포인터만)
+- `spec/41-invariants.md` (INV-STAGE-ORDER-SAFETY + INV-BACKEND-COMPUTE-FALLBACK 신규, INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC/INV-STAGE-LAYER-HANDLE handle-form 재서술, §3.28 요약 + count 184→186)
+- `arch/backend_conformance_harness.md` (신규 — improve-codebase-architecture 후보 ② 설계 노트, 구조 확정 / 내용물 보류)
+- 본 handoff (R0′ 추가, 헤더 갱신)
+
+### improve-codebase-architecture 검토 (2026-05-29 후속, deep-module 렌즈)
+
+설계 v2 를 deep-module 렌즈(작은 interface·큰 leverage / deletion test / locality / interface=test surface)로 검토. 리포트 `/tmp/architecture-review-20260529_103537.html` (휘발). 5 deepening 후보:
+
+| # | 후보 | 강도 | 상태 |
+|---|---|---|---|
+| ① | score formula 단일화 + `GpuScoreAccess` accessor 정리 | Strong→**축소** | **확정 → `arch/score_formula_consolidation.md`** (grill 후 inversion·capability-trait 기각, 정직한 형태 = 작은 내부 2건) |
+| ② | Backend conformance harness (재사용 lib fn) | Strong | **구조 확정 → `arch/backend_conformance_harness.md`** |
+| ③ | 5 shallow hook trait → 단일 PipelineStage 흡수 충실도 | Worth | 설계 v2 가 다룸, migration 충실도 확인 |
+| ④ | `KVCacheLayer` migration 이 base trait KIVI no-op creep 떨궈내야 | Worth | 미grill |
+| ⑤ | `PipelineStage` 순서-안전 property test (INV-STAGE-ORDER-SAFETY 실체화) | Worth | 미grill |
+
+추가 관찰(Speculative): Backend long-tail (~28 SOA/scatter method) storage-plugin 분리 — capability 로 옮길 후보, 별 라운드.
+
+Top recommendation = ② (de-risk 전제 + 죽은 INV 부활).
+
+**2026-05-29 세션 grill 완료분**:
+- **② 구조 확정** → `arch/backend_conformance_harness.md` (lib fn / spy 계약 / host·device / 흡수 partition). 내용물(oracle·coverage·tolerance) 보류.
+- **① 확정(축소)** → `arch/score_formula_consolidation.md`. grill 이 리포트의 "ScoreCollector capability + inversion" over-reach 를 실측 호출 분포 + deletion test 로 깎아냄 → 정직한 형태 = ①-a accessor 9→2(inversion 없음) + ①-b pure formula fn + GPU conformance(새 trait 없음). interface 무변경. opaque-sink·capability-trait 기각 이유는 노트 §5.
+
+**다음 세션 후보 (미grill)**: ④ `KVCacheLayer` migration 의 KIVI no-op creep 제거 / ⑤ `PipelineStage` 순서-안전 property test (INV-STAGE-ORDER-SAFETY 실체화). ③(hook 흡수)은 설계 v2 가 이미 다룸 — Phase α-W migration 충실도로 확인.
+
+**구현 진입**: 위 ①·② 는 설계 노트 단계. 실제 구현은 Phase α-W/α-K migration 과 동행 (#2 harness 가 ①③④ 회귀 그물이므로 #2 먼저).
 
 ---
 
@@ -18,10 +79,8 @@
 
 ### 신규 진입 추천 순서
 
-1. **Q-#1-3 — K/V raw read 노출 여부** (다음 sub-grill 진입점, R5 #1 Q24-1 detail)
-   - D2O cosine similarity 가 K read 필요 — KVCacheView 에 raw K/V slice 노출 요구.
-   - 갈래 (a) noexpose + paradigm-specific helper / (b) raw K/V slice 노출 (paradigm-agnostic 가정 깨짐) / (c) Tier 3 capability trait (`Arc<dyn DenseKVRead>`)
-2. **Q-#1-4 — capacity 중복** (Q-#1-3 와 같은 sub-grill round)
+1. ~~**Q-#1-3 — K/V raw read 노출 여부**~~ **해소 (2026-05-29) → 갈래 (a)**: D2O 를 `Arc<StandardLayer>` concrete-handle Stage 로, raw K read 는 inherent method 직접 호출. capability trait(`DenseKVRead`) **지금 안 만듦** — raw-K-read 소비자가 D2O 하나뿐(H2O/SnapKV=score, Sliding/Streaming=position)이라 1-adapter = 가설적 seam = premature. 승격 trigger: 2번째 K-reader 또는 2번째 dense impl 등장 시 method→trait 기계적 추출. 상세 = `arch/pipeline_stage_design_v2.md §3.4`. (다음 sub-grill 진입점은 Q-#1-4)
+2. **Q-#1-4 — capacity 중복** (다음 sub-grill 진입점, Q-#1-5 와 같은 round)
 3. **Q-#1-5 — mutation 누설** (Q-#1-3/4 와 같은 sub-grill round)
 4. **#2 — WeightLayerView** (Phase α-W 진입 전)
 5. **#3 — SecondaryStore** (Phase α-W 진입과 같이 진행)
@@ -243,7 +302,7 @@
 ### Phase α-W 진입 전
 
 1. **sub-trait detail finalize** (`arch/pipeline_stage_design.md` §13.1 / §13.6):
-   - **Q24-1**: `KVCacheView` (KVCacheLayer::view 반환 type) — 본 sub-grill 결정 #18 (dtype 폐기) 반영. Q-#1-3 (K/V raw read 노출) / Q-#1-4 (capacity 중복) / Q-#1-5 (mutation 누설) 미해결.
+   - **Q24-1**: `KVCacheView` (KVCacheLayer::view 반환 type) — 본 sub-grill 결정 #18 (dtype 폐기) 반영. **Q-#1-3 (K/V raw read) 해소 2026-05-29 → 갈래 (a)**: KVCacheView 에 raw K 안 노출, D2O 는 concrete-handle Stage(`Arc<StandardLayer>` + inherent `read_k_layer_wide`). DenseKVRead capability 는 2nd consumer 시 승격(`arch/pipeline_stage_design_v2.md §3.4`). Q-#1-4 (capacity 중복) / Q-#1-5 (mutation 누설) 미해결.
    - **Q24-2**: `WeightLayerView` (WeightLayer::view 반환 type) — Llama / Qwen / Mistral 흡수. dtype() 부재 정합 (결정 #18).
    - **Q24-3**: `SecondaryStore` (backlog [P2] `arch/weights_pressure_split.md §7.5` 확정, Phase α-W 와 같이 진행)
    - **Q24-4**: `SparsePattern` (stub or 별 sprint)
