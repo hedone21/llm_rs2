@@ -48,14 +48,17 @@ eviction Stage가 *어느 토큰을 버릴지* 고를 때 참조하는 규칙. S
 **device (실행 바탕)**:
 Format·Stage가 *그 위에서 실행되는* 물리 자원. 두 직교 하위차원으로 분해된다 — **compute**(연산기 = backend: CPU NEON / Adreno OpenCL / Jetson CUDA)와 **data**(메모리 = memory allocator). 둘은 직교다: UMA(ARM SoC)에서는 여러 backend가 한 memory를 공유하고(연산기만 바뀜), discrete GPU에서는 backend마다 별도 memory(VRAM↔RAM 이동)다. 그래서 device를 (backend, memory) 1:1 페어로 묶지 않는다.
 
-**Fabric** (이름 미확정 — v2 §3 참조):
+**Hardware** (구 Fabric — 2026-05-31 명명 확정, v2 §3.5):
 device 자원을 담는 런타임 객체. 내부에 backend 레지스트리 ⊥ memory 레지스트리를 분리 보유하고, `resolve(target)`이 "이 backend로 가려면 어느 memory?"의 UMA/discrete 분기를 한 곳에 가둔다. Stage는 이 객체를 register 시점에 보관하고(`Arc`, interior mutability), device를 바꾸는 Stage(switch)가 그 내부 활성 backend를 mutate한다.
 
 **switch** (device 제어 Stage):
 실행 바탕을 바꾸는 Stage. 연산기를 GPU↔CPU 전환하고(필요시 KV를 새 backend로 migrate), 표현(Format)은 안 바꾼다. 안전한 경계(prefill→decode 등)에서만 실행된다. 별도 축이 아니라 [Stage](#관리-동작--verb)의 한 종류다.
 
 **partition** (WeightFormat dispatch 모드):
-한 layer의 forward를 여러 backend에 동시 분산하는 것. 별도 축이 아니라 **WeightFormat의 dispatch 모드**(Full / Skip / Partition)이며, 분산 대상 backend는 Fabric에서 받는다. 즉 partition = WeightFormat dispatch(Format 축) × companion backend(실행 바탕)의 곱이다.
+한 layer의 forward를 여러 backend에 동시 분산하는 것. 별도 축이 아니라 **WeightFormat의 dispatch 모드**(Full / Skip / Partition)이며, 분산 대상 backend는 Hardware에서 받는다. 즉 partition = WeightFormat dispatch(Format 축) × companion backend(실행 바탕)의 곱이다.
+
+**Pressure / PressureSource** (system 조건 입력):
+Stage가 반응하는 system 압력을 0–100 단일 scalar(`Pressure`)로 표현한 것, 그리고 그 값을 공급하는 pluggable 소스. `ManagerPressureSource`(기본, manager 통합값 수신) / `LocalPressureSource`(manager-less 자율 계산) / 3rd-party impl이 같은 `fn pressure(&self) -> Pressure` 뒤에 숨고, 소비 Stage는 어느 소스인지 구분하지 않는다. 여러 입력(memory/thermal/energy)의 통합은 source impl 내부 책임 — carrier는 단일 scalar라 신호 *종류* 확장(anymap)이 불필요하다. 소스는 construction 시점 보유(교체 지점), 값은 매 step `StepInfo`에 read-only로 실린다. 4-level `PressureLevel` enum은 여기에 흡수되고 파생 `band()`로 강등. 상세: v2 §5.1.
 
 ### Stage가 Format을 잡는 방식 — handle 3종
 
