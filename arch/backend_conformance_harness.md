@@ -64,7 +64,7 @@ op 순회 + 비교 + `ConformanceReport` 빌드가 본 함수에 locality. **세
 | hand-rolled per-op reference (384~449) | **oracle seam 의 임시 adapter** (보류 결정까지) |
 | `run_kivi_attention_test` (689) | **분리 → `assert_kivi_conformance(&dyn KiviAttentionBackend)`** (capability conformance, earmark) |
 
-base `Backend` conformance 는 **paradigm-agnostic 유지** (KIVI 는 capability conformance 로 — 후보 ④ 정신).
+base `Backend` conformance 는 **Format-agnostic 유지** (KIVI 는 capability conformance 로 — 후보 ④ 정신).
 
 ## 3. 보류 (내용물 — content)
 
@@ -78,5 +78,5 @@ base `Backend` conformance 는 **paradigm-agnostic 유지** (KIVI 는 capability
 
 - **deletion test ✓** — 1,041 LOC mixed concern → lib 함수 한 곳 + thin bin (~80).
 - `INV-BACKEND-COMPUTE-FALLBACK` 가 죽은 글자 → **실행 검증**.
-- ①(ScoreCollector) / ③(hook 흡수) / ④(KVCacheLayer) migration 의 **회귀 그물** (de-risk 전제 — 그래서 후보 중 first).
+- ①(ScoreCollector) / ③(hook 흡수) / ④(KVCacheFormat) migration 의 **회귀 그물** (de-risk 전제 — 그래서 후보 중 first).
 - 패턴이 후보 ⑤ (PipelineStage 순서-안전 property test) 로 확장.
