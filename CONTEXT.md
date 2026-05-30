@@ -1,6 +1,6 @@
 # llm.rs — KV/Weight 캐시 관리 컨텍스트
 
-decode 루프가 도는 동안 KV·weight 캐시를 *어떤 형태로 저장*하고 *어떻게 관리*하는가에 관한 용어집. 두 직교 축 — **저장 형태(Format)** 와 **관리 동작(Stage)** — 을 중심으로 한다.
+decode 루프가 도는 동안 KV·weight 캐시를 *어떤 형태로 저장*하고 *어떻게 관리*하는가에 관한 용어집. 두 직교 축 — **저장 형태(Format)** 와 **관리 동작(Stage)** — 과, 그 둘이 그 위에서 실행되는 **실행 바탕(device)** 을 다룬다. device는 축이 아니라 두 축이 올라앉는 무대다.
 
 ## Language
 
@@ -14,6 +14,9 @@ decode 루프가 도는 동안 KV·weight 캐시를 *어떤 형태로 저장*하
 
 **직교성 (orthogonality)**:
 두 축은 서로 독립이다. M개 Format × N개 Stage의 조합 비용이 M×N이 아니라 **M+N**이 되도록 한다 (조합 폭발 방지).
+
+**실행 바탕은 축이 아니다 (device)**:
+두 축이 *그 위에서 실행되는* 물리 자원(연산기·메모리)은 별도의 "축"이 아니라 **바탕**이다. device를 축으로 보면 Format·Stage와 곱해지는 것처럼 오해되지만, device가 바뀌어도(GPU→CPU) Format은 그대로 따라간다 — KIVI는 GPU든 CPU든 KIVI다. 즉 device는 곱이 아니라 *위치*다. 상세는 아래 «실행 바탕 — device».
 
 ### 저장 형태 — noun
 
@@ -34,11 +37,25 @@ _Avoid_: Layer (저장 형태에는 쓰지 않는다 — "Layer"는 transformer 
 ### 관리 동작 — verb
 
 **Stage**:
-decode 루프가 도는 동안 매 단계(phase)마다 끼어들어 KV·weight·system state를 변경하는 cross-cutting 동작. "무엇을 하나"라는 동사(verb)에 해당한다. 저장 형태를 바꾸지 않고 Format의 mutation primitive(예: `compact`)만 호출하므로 가볍게 확장된다. 실행 순서는 통합자 책임, 안전(crash-free)은 프레임워크 책임. 예: eviction Stage, swap Stage, quantize Stage.
+decode 루프가 도는 동안 매 단계(phase)마다 끼어들어 KV·weight·system state를 변경하는 cross-cutting 동작. "무엇을 하나"라는 동사(verb)에 해당한다. 대부분의 Stage는 저장 형태를 바꾸지 않고 Format의 mutation primitive(예: `compact`)만 호출하므로 가볍게 확장된다 (eviction·swap·quantize). 일부 Stage는 **실행 바탕(device)을 제어**한다 (예: switch — 연산기를 GPU↔CPU 전환). 어느 경우든 *표현(Format)은 안 바꾼다*. 실행 순서는 통합자 책임, 안전(crash-free)은 프레임워크 책임.
 _Avoid_: Handler, hook — 같은 개념의 현 코드 구현 명칭일 뿐, 도메인 용어로는 Stage.
 
 **EvictionPolicy** (eviction Stage 내부 규칙):
 eviction Stage가 *어느 토큰을 버릴지* 고를 때 참조하는 규칙. Stage 자체가 아니라 한 Stage(eviction)가 감싸 실행하는 부품이며, 모든 Stage가 갖는 건 아니다 (swap·quantize Stage엔 없음). 예: `Sliding`(최근 N), `H2O`(heavy hitter + 최근), `D2O`(버릴 토큰을 병합).
+
+### 실행 바탕 — device
+
+**device (실행 바탕)**:
+Format·Stage가 *그 위에서 실행되는* 물리 자원. 두 직교 하위차원으로 분해된다 — **compute**(연산기 = backend: CPU NEON / Adreno OpenCL / Jetson CUDA)와 **data**(메모리 = memory allocator). 둘은 직교다: UMA(ARM SoC)에서는 여러 backend가 한 memory를 공유하고(연산기만 바뀜), discrete GPU에서는 backend마다 별도 memory(VRAM↔RAM 이동)다. 그래서 device를 (backend, memory) 1:1 페어로 묶지 않는다.
+
+**Fabric** (이름 미확정 — v2 §3 참조):
+device 자원을 담는 런타임 객체. 내부에 backend 레지스트리 ⊥ memory 레지스트리를 분리 보유하고, `resolve(target)`이 "이 backend로 가려면 어느 memory?"의 UMA/discrete 분기를 한 곳에 가둔다. Stage는 이 객체를 register 시점에 보관하고(`Arc`, interior mutability), device를 바꾸는 Stage(switch)가 그 내부 활성 backend를 mutate한다.
+
+**switch** (device 제어 Stage):
+실행 바탕을 바꾸는 Stage. 연산기를 GPU↔CPU 전환하고(필요시 KV를 새 backend로 migrate), 표현(Format)은 안 바꾼다. 안전한 경계(prefill→decode 등)에서만 실행된다. 별도 축이 아니라 [Stage](#관리-동작--verb)의 한 종류다.
+
+**partition** (WeightFormat dispatch 모드):
+한 layer의 forward를 여러 backend에 동시 분산하는 것. 별도 축이 아니라 **WeightFormat의 dispatch 모드**(Full / Skip / Partition)이며, 분산 대상 backend는 Fabric에서 받는다. 즉 partition = WeightFormat dispatch(Format 축) × companion backend(실행 바탕)의 곱이다.
 
 ### Stage가 Format을 잡는 방식 — handle 3종
 
@@ -58,6 +75,7 @@ Stage가 자신이 관리할 Format을 보유하는 참조의 정적 타입. 순
 - **Layer는 transformer layer 전용**: "Layer"(`LlamaLayer`/`TransformerLayer`, 16개 디코더 블록, `LayerSlot`·`layer_idx` 등)는 *모델 구조*만 가리킨다. KV·weight의 *저장 형태*는 절대 "Layer"라 부르지 않고 **Format**(`KVCacheFormat`/`WeightFormat`)이라 부른다. (이전엔 둘 다 "Layer"여서 충돌 — Format으로 분리해 해소.)
 - **Stage vs Handler/hook**: 도메인 용어는 **Stage**. 현 코드의 `CachePressureHandler` + 여러 decode hook trait은 같은 개념의 과도기 구현이다.
 - **Eviction은 동작이지 형태가 아니다**: eviction은 토큰을 버리는 *동작*(verb)이라 **Stage**(Stage 축)다. KIVI 양자화는 바이트 형태를 바꾸는 *저장 형태*(noun)라 **Format**(Format 축)다. "KIVI도 양자화라는 동작이니 Stage 아니냐"는 흔한 혼동 — KIVI는 전용 paired kernel을 동반하므로 Format이다.
+- **device는 축이 아니라 바탕**: 저장 형태(Format)·관리 동작(Stage)은 직교 *축*(곱해진다)이지만, 연산기·메모리(device)는 두 축이 *그 위에서 실행되는 바탕*이다. switch(device 전환)는 새 축이 아니라 device를 바꾸는 **Stage**이고, partition(multi-device 분산)은 **WeightFormat dispatch 모드**다. "device를 3번째 축으로" 라는 충동은 기각됐다 — device가 바뀌어도 Format은 따라가므로 곱이 아니라 위치다 (2026-05-30 grill 결정).
 
 ## Example dialogue
 
