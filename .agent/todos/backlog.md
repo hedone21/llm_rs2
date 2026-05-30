@@ -816,15 +816,16 @@
 ---
 
 ## [P2] Format 명명 통일 — `KVCacheLayer`/`WeightLayer` → `KVCacheFormat`/`WeightFormat`
-- **Status**: OPEN
+- **Status**: PARTIAL — `arch/pipeline_stage_design_v2.md` + `CONTEXT.md` 완료 (2026-05-30). 잔여 = spec INV 본문 prose + 잔여 arch 문서 + 코드(`KVCacheOps`).
 - **Sprint**: backlog
 - **Dependencies**: 없음 (문서 rename은 독립). 코드 rename만 ADR-0001/Phase α-K 동행.
-- **Description**: "Layer"가 두 의미로 충돌 — ① transformer layer(`LlamaLayer`/`TransformerLayer`/`LayerSlot`/`layer_idx` 등 코드 다수) ② 저장 paradigm(설계 `KVCacheLayer`/`WeightLayer`, 코드엔 grep 0건). 특히 weight/precision swap 도메인에 `LayerSlot`(①)과 설계 `WeightLayer`(②)가 공존 예정이라 혼동. grill(2026-05-30) 결과 **저장 형태(noun)는 `Format`으로 통일**. "Layer"는 transformer layer 전용으로 보존.
+- **Description**: "Layer"가 두 의미로 충돌 — ① transformer layer(`LlamaLayer`/`TransformerLayer`/`LayerSlot`/`layer_idx` 등 코드 다수) ② 저장 형태(설계 `KVCacheLayer`/`WeightLayer`, 코드엔 grep 0건). 특히 weight/precision swap 도메인에 `LayerSlot`(①)과 설계 `WeightLayer`(②)가 공존 예정이라 혼동. grill(2026-05-30) 결과 **저장 형태(noun)는 `Format`으로 통일**. "Layer"는 transformer layer 전용으로 보존.
 - **범위 (문서 — 코드 0)**:
-  - `arch/pipeline_stage_design_v2.md`: §4.1 `KVCacheLayer`→`KVCacheFormat`, §4.2 `WeightLayer`→`WeightFormat`, §2/§3.4 본문 중 ② 의미의 "Layer"→"Format" (transformer layer 의미는 유지).
-  - `spec/41-invariants.md`: `INV-KVCACHELAYER-*` → `INV-KVCACHEFORMAT-*` (PRIMITIVE-AGNOSTIC / PAIRED-KERNEL). `tests/spec/` 동반 갱신.
-  - handle 3종 시그니처 예시 `Arc<dyn KVCacheLayer>` → `Arc<dyn KVCacheFormat>`.
+  - ~~`arch/pipeline_stage_design_v2.md`~~ **완료 (2026-05-30)**: 타입명(`KVCacheLayer→KVCacheFormat` 등) + 축명(`storage/policy 축`→`Format/Stage 축`) + generic "paradigm"→"Format" 일괄. handle 3종 예시 `Arc<dyn KVCacheFormat>` 포함.
+  - **잔여** `spec/41-invariants.md`: INV **본문 prose**의 `KVCacheLayer`/`WeightLayer`/`*Layer`/`paradigm` → `*Format`. **INV ID(`INV-KVCACHELAYER-*` / `INV-STAGE-LAYER-HANDLE`)는 안정 키로 유지** (2026-05-30 결정 — ID는 추적용 opaque key, rename 이득<비용). → `tests/spec/` 영향 없음 (ID 불변 + 해당 INV는 source-grep 검증이라 전용 테스트 파일 부재).
+  - **잔여** 잔여 arch 문서 prose: `arch/inference_pipeline.md` · `arch/README.md` · `arch/backend_conformance_harness.md` · `docs/adr/0001-kv-dispatch-paradigm.md`.
+  - **동결** `arch/pipeline_stage_design.md` (v1, 124곳): 결정-이력 아카이브 → 당시 명칭 보존, 손대지 않음.
 - **코드 rename (ADR-0001 진입 시 흡수)**: `KVCacheOps` → `KVCacheFormat` (현 trait 명). 선행 불필요 — Generic→dyn 전환 sprint와 동행.
-- **이미 반영**: `CONTEXT.md` (Format 용어 + Flagged ambiguities에 충돌·해소 근거).
-- **담당 권장**: Architect (설계/spec 문서 rename)
-- **작성일**: 2026-05-30
+- **이미 반영**: `CONTEXT.md` (Format 용어 + 두 축 Format/Stage + Flagged ambiguities) + `arch/pipeline_stage_design_v2.md` (2026-05-30).
+- **담당 권장**: Architect (잔여 spec/arch 문서 rename)
+- **작성일**: 2026-05-30 / **갱신**: 2026-05-30 (v2 완료, INV ID 유지 결정, 잔여 범위 확정)
