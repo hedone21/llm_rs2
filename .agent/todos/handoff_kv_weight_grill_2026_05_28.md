@@ -82,7 +82,7 @@ Top recommendation = ② (de-risk 전제 + 죽은 INV 부활).
 | ①′ | CacheManager 삭제 (얇은 dispatcher, ADR-0001 이 legacy policy registry obsolete화) | Strong | 보류 — #2 harness + Phase α-K 선행 |
 | ②′ | Backend 80-method storage long-tail 37 → capability | Worth | **보류 (friction-triggered)** — depth 아닌 front-door ergonomics, Backend breadth=도메인 본질. 1차 Speculative+2차로 2회 거론 → ADR-0002 후보지만 **미작성**(offer 미응답) |
 | ③′ | ActionResult dead variant 정리 | Worth | **B-a 완료** `6077c796` (Quantized/Recalled 삭제). **B-b 보류** → backlog [P3] (QuantizeHandler struct 삭제 + ENG-ALG-092 MUST spec 개정, Architect/spec-manage 필요) |
-| ④′ | CapabilityRegistry 4→1 아닌 4→2 (as_any 53곳 대부분 escape hatch) | Worth | 미grill — **재개 시 다음 자연 후보** |
+| ④′ | CapabilityRegistry 4→1 아닌 4→2 (as_any 53곳 대부분 escape hatch) | Worth | **완료 (2026-05-29)** — grill 종결 + arch/spec 문서화 `91392a79` + 문서 구조개선 `1feefdbf`. 결론 아래 "④′ 종결" 참조 |
 | ⑤′ | KVCacheView 삭제 후 KV 메타데이터(kv_heads/head_dim/layout) 거처 | Speculative | α-K 매핑(R-G2)에 흡수 |
 
 핵심 발견(③′): `ActionResult` 는 추론 정확성 로직이 아니라 **영수증/관찰 채널** (handler in-place mutate → 결과 미독해도 decode 정상, pipeline 이 결과로 분기 안 함, new_pos 는 `max_cache_pos` redundant, 소비자 전부 profiler/PPL/log/test).
@@ -91,7 +91,20 @@ Top recommendation = ② (de-risk 전제 + 죽은 INV 부활).
 
 **메모리 정정**: MEMORY.md ActionResult 정의(실제=NoOp/Evicted/Quantized/Swapped/Recalled/WeightSwapped, dead=Quantized·Recalled; 구버전 Merged/Compressed/Sparsified 폐기) + pressure 경로 `core/` 접두어 제거 + 핸들러 목록 정정.
 
-**재개 진입점**: ④′ CapabilityRegistry 4→2 (저비용, 다음 자연 후보) **또는** 1차 review 의 ④/⑤(KVCacheLayer KIVI creep / 순서-안전 property test). ①′·②′·B-b 는 모두 보류·선행조건 있음. 미응답 thread: ②′ ADR-0002 작성 여부.
+**재개 진입점 (2026-05-30 갱신)**: **1차 review ④ (KVCacheLayer KIVI no-op creep) grill 진행 중 → 별 handoff `handoff_kvcachelayer_attention_into_2026_05_30.md` 로 분리.** 결론(미확정) = `attention_into` base trait 추가로 forward_gen paradigm sniff 제거, ④-a(base trait 7, 지금 확정 가능)/④-b(plan enum 평탄화, Phase α-K 연기) 분리. 런타임 KIVI 활성화 stress test 통과. **§4.1 정정 확정 대기** — 사용자 "다시 한번 논의" 요청. 다음 진입 = 그 handoff §5 재논의 진입점.
+> 그 외 후보 = 1차 ⑤ (PipelineStage 순서-안전 property test, INV-STAGE-ORDER-SAFETY 실체화) **또는** Phase α-W 진입 전 필수 #11/#12. ①′·②′·B-b·#4·#6 은 모두 보류·선행조건 있음. 미응답 thread: ②′ ADR-0002 작성 여부.
+
+### ④′ 종결 — CapabilityRegistry 흡수 경계 (2026-05-29)
+
+**grill 결론 ("4→2" 의 정밀 완성형)**: 신설 메커니즘은 **`CapabilityRegistry` 하나**뿐 (흡수 대상 = backend-agnostic capability handle = gpu_score / KIVI). 구 "4 메커니즘 → 1 수렴" 은 **폐기** — 실측상 `as_any` 53곳 중 capability lookup 0건(concrete downcast 32 + buffer 25). 나머지는 신설 아닌 제자리 귀속: ② 자원=`get_extension`(라이프사이클 상이 유지) / ③ 관찰=log macro+`action_diag_helper`(`d0bd0802` EventSink 제거 → capability 화 회귀 금지) / memory=기존 `memory/` abstraction.
+
+**도메인 귀속 기준** (escape hatch 판정): model forward 도메인 *내부* concrete downcast 는 정당(`// LAYER-EXEMPT`, 실행 책임자) — plan.execute(1-consumer)·noshuffle SOA·enqueue. 타 도메인(pressure/eviction)의 downcast 는 누수 → ①②③/memory 흡수. **KIVI(완성) vs plan(예외) 분기**: KIVI=cross-domain 소비자 + trait 기존 존재 → 반쪽 trait 봉합해 ① 흡수; plan=single-domain 1-consumer → 가설적 seam, 예외 유지.
+
+**변경 파일**: `arch/pipeline_stage_design_v2.md §3.3`(WHY 의도 + §3.3.1 귀속표 + §3.3.2 도메인 귀속) + `spec/41-invariants.md:559`(4→1 문구 정정). markdown only, INV 신설/폐기 0. 도메인 귀속 INV 는 Phase α-W stages/ 신설 시점 등록(현재 vacuous).
+
+**문서 컨벤션 확립**(`1feefdbf`): v2 소섹션은 **역할/의도 먼저 → `> 연혁` blockquote 맨 아래**. 승격 trigger 는 미래 확장 규칙이라 본문. §3.4/§4.1/§4.2 적용 완료. 향후 v2 편집 시 동일 패턴 유지.
+
+**세션 커밋**: `91392a79`(CapabilityRegistry 흡수 경계 + 의도) → `1feefdbf`(§3.4/§4.1/§4.2 구조 개선).
 
 ---
 
