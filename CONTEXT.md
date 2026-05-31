@@ -1,92 +1,101 @@
 # llm.rs — KV/Weight 캐시 관리 컨텍스트
 
-decode 루프가 도는 동안 KV·weight 캐시를 *어떤 형태로 저장*하고 *어떻게 관리*하는가에 관한 용어집. 두 직교 축 — **저장 형태(Format)** 와 **관리 동작(Stage)** — 과, 그 둘이 그 위에서 실행되는 **실행 바탕(device)** 을 다룬다. device는 축이 아니라 두 축이 올라앉는 무대다.
+decode 루프가 도는 동안 KV·weight 데이터를 *어떻게 다루는가*에 관한 용어집. 세 직교 축 — **stage**(메모리 상주 데이터 조절) ⊥ **format**(연산 표현 precision) ⊥ **hardware**(연산 위치) — 을 다룬다. 세 축은 독립이라 멤버 조합 비용이 곱(M×N×K)이 아니라 합(M+N+K)이 되도록 설계한다.
 
 ## Language
 
-### 두 축
+### 세 축
 
-**Format 축 (format axis)**:
-"데이터를 어떤 바이트 형태로 저장하고, 그 위에서 attention을 어떻게 계산하는가"의 축. 멤버는 **Format** impl로 표현된다 (noun).
+**stage 축**:
+decode가 도는 동안 *메모리에 상주하는 데이터*(kvcache 토큰, weight layer)를 조절하는 축 — 수정·삭제·로드/언로드. "메모리에 무엇이 얼마나 올라가 있나"를 제어한다. 멤버 예: H2O(토큰 삭제=evict), D2O(토큰 병합=수정), weight swap(layer 로드/언로드).
 
-**Stage 축 (stage axis)**:
-"decode가 도는 동안 KV·weight·system state에 어떤 관리 동작을 끼워 넣는가"의 축. 멤버는 **Stage**로 표현된다 (verb). eviction·swap·quantize 등.
+**format 축**:
+각 연산이 *어떤 데이터 표현(precision)으로* 수행되는가의 축. "이 연산을 어떤 포맷으로 계산하나"를 제어한다. 한 멤버 = 하나의 표현 = 바이트 레이아웃 + precision + 그걸 읽는 전용 커널(**paired kernel**). 예: f16, q4_0, q8_0, KIVI(Q2 packed + F32 residual). precision과 레이아웃은 분리된 적 없는 한 좌표다(q4_0 = 4bit 블록 레이아웃이자 precision).
+
+**hardware 축** (신규):
+연산이 *어느 물리 연산기*에서 실행되는가의 축. "이 연산을 어디서 계산하나"를 제어한다. 멤버 = backend(CPU NEON / Adreno OpenCL / Jetson CUDA / NPU)이며, 데이터가 사는 memory를 동반한다. 런타임에선 [`Hardware`](#hardware--연산-위치) 객체(read-only resolver)가 좌표를 해석한다.
 
 **직교성 (orthogonality)**:
-두 축은 서로 독립이다. M개 Format × N개 Stage의 조합 비용이 M×N이 아니라 **M+N**이 되도록 한다 (조합 폭발 방지).
+세 축은 서로 독립이다. 한 축에 멤버를 더해도 다른 축 코드를 안 건드린다 — stage 추가는 커널 0, format 추가는 backend별 opt-in 커널, hardware 추가는 resolver 항목 + opt-in 커널. dispatch·stage·resolver 인터페이스 비용은 합(**M+N+K**)으로 유지된다 (조합 폭발 방지).
 
-**실행 바탕은 축이 아니다 (device)**:
-두 축이 *그 위에서 실행되는* 물리 자원(연산기·메모리)은 별도의 "축"이 아니라 **바탕**이다. device를 축으로 보면 Format·Stage와 곱해지는 것처럼 오해되지만, device가 바뀌어도(GPU→CPU) Format은 그대로 따라간다 — KIVI는 GPU든 CPU든 KIVI다. 즉 device는 곱이 아니라 *위치*다. 상세는 아래 «실행 바탕 — device».
+**3축의 근거 — precision ⊥ backend 는 분리 가능**:
+format(precision)과 hardware(backend)가 같은 개념이면 2축, 분리되면 3축이다. 코드가 분리를 증명한다 — 단일 OpenCL backend 하나가 6 precision(f32/f16/q4_0/q8_0/q6_k/mxfp4) 커널을 갖고, q4_0은 CPU·GPU·CUDA 세 backend에 모두 존재한다. 매핑이 many-to-many라 precision은 backend의 함수가 아니다 → 독립 축 (2026-05-31 grill 결정, 2026-05-30 "device는 축 아님" 결정을 뒤집음).
 
-### 저장 형태 — noun
+**복합 동작 = 단일축 primitive 의 합성**:
+현실의 여러 동작은 두 축을 동시에 건드린다 — weight swap(stage 로드 + format precision 변경), switch+migrate(hardware 이동), KIVI(stage 수정 + format precision). 이들은 *단일축 primitive 의 합성*으로 분해한다. 새 복합 기능 = 기존 primitive 의 새 조합 → 새 monolith 0줄. 직교성은 primitive 레벨에서 유지되고, 복합 동작은 3-공간의 벡터가 된다.
 
-**Format**:
-KV 또는 weight 데이터가 *저장된 바이트 형태*와 그 형태로 연산하는 방식을 캡슐화한 단위. "어떻게 생겼나"라는 명사(noun)에 해당한다. 한 구체적 형태가 곧 하나의 Format이다 — 예: `Standard`(F32/F16/Q4_0 연속), `KIVI`(Q2 packed + F32 residual). 새 Format을 더하면 새 바이트 레이아웃 + 전용 커널(**paired kernel**)이 따라온다 — 무겁지만 격리된 확장.
-_Note_: 정밀도(F32/F16/Q4_0)는 한 Format *안의* 파라미터지 Format을 가르는 축이 아니다 (그래서 "Precision"이라 부르지 않는다). `Standard` 하나가 세 정밀도를 품고, Q4_0(양자화)도 `Standard`에 속한다 — Format을 가르는 축은 바이트 레이아웃 + paired kernel이다.
-_Avoid_: Layer (저장 형태에는 쓰지 않는다 — "Layer"는 transformer layer 전용. → Flagged ambiguities). Paradigm (Format과 동의어라 폐기).
+**(format × hardware) 커널은 M×N — 단 Backend 인터페이스 아래 격리**:
+q4-on-Adreno 커널과 q4-on-CPU 커널은 물리적으로 다른 코드라, (format × hardware) 커널 행렬은 환원 불가능한 M×N이다. 그러나 이 행렬은 `backend.matmul(q4_tensor)` 내부 dispatch 에 갇혀 있어 호출자·stage·resolver 는 어느 커널이 뜨는지 모른다. 불가피한 M×N을 leaf 한 곳에 가두는 것이 3축 구조의 핵심 — 성능(특화 커널)과 확장성(가산 인터페이스)을 동시에 잡는 지점이다.
 
-**KVCacheFormat**:
-여러 KV Format을 추상화하는 base trait. 호출자에게 geometry(위치·용량)·mutation(쓰기·compact)·attention만 노출하고, dtype·codebook·정밀도 같은 내부는 숨긴다 (Format-agnostic). 현 코드의 `KVCacheOps`가 이 역할이며 명칭 정리 예정.
-
-**WeightFormat**:
-모델 가중치의 여러 Format을 추상화하는 base trait. KVCacheFormat과 대칭이며, dispatch 모드(Full/Skip/Partition)만 노출한다.
-
-**Paired kernel**:
-한 Format의 바이트 레이아웃을 읽어 attention을 수행하는 전용 연산 커널. 저장 형태가 다르면 읽는 커널도 달라야 하므로, 새 Format 추가에 따라오는 환원 불가능한 비용이다.
-
-### 관리 동작 — verb
+### stage — 메모리 상주 데이터 조절
 
 **Stage**:
-decode 루프가 도는 동안 매 단계(phase)마다 끼어들어 KV·weight·system state를 변경하는 cross-cutting 동작. "무엇을 하나"라는 동사(verb)에 해당한다. 대부분의 Stage는 저장 형태를 바꾸지 않고 Format의 mutation primitive(예: `compact`)만 호출하므로 가볍게 확장된다 (eviction·swap·quantize). 일부 Stage는 **실행 바탕(device)을 제어**한다 (예: switch — 연산기를 GPU↔CPU 전환). 어느 경우든 *표현(Format)은 안 바꾼다*. 실행 순서는 통합자 책임, 안전(crash-free)은 프레임워크 책임.
-_Avoid_: Handler, hook — 같은 개념의 현 코드 구현 명칭일 뿐, 도메인 용어로는 Stage.
+decode 루프가 도는 동안 매 단계(phase)마다 끼어들어 *메모리 상주 데이터*(kvcache·weight)를 수정·삭제·로드하는 cross-cutting 동작. 대부분의 Stage 는 표현(format)·위치(hardware)를 안 바꾸고 데이터의 존재·양만 조절한다 (eviction·merge·weight swap). 실행 순서는 통합자 책임, 안전(crash-free)은 프레임워크 책임.
+_Avoid_: Handler, hook — 같은 개념의 현 코드 구현 명칭일 뿐, 도메인 용어로는 Stage. (단 코드의 `PipelineStage` *메커니즘* 명칭과 *축* 명칭 "stage"는 층위가 다르다 — → Flagged ambiguities.)
 
 **EvictionPolicy** (eviction Stage 내부 규칙):
-eviction Stage가 *어느 토큰을 버릴지* 고를 때 참조하는 규칙. Stage 자체가 아니라 한 Stage(eviction)가 감싸 실행하는 부품이며, 모든 Stage가 갖는 건 아니다 (swap·quantize Stage엔 없음). 예: `Sliding`(최근 N), `H2O`(heavy hitter + 최근), `D2O`(버릴 토큰을 병합).
+eviction Stage 가 *어느 토큰을 버릴지* 고를 때 참조하는 규칙. Stage 자체가 아니라 한 Stage(eviction)가 감싸 실행하는 부품이며, 모든 Stage 가 갖는 건 아니다 (weight swap Stage 엔 없음). 예: `Sliding`(최근 N), `H2O`(heavy hitter + 최근), `D2O`(버릴 토큰을 병합).
 
-### 실행 바탕 — device
+### format — 연산 표현
 
-**device (실행 바탕)**:
-Format·Stage가 *그 위에서 실행되는* 물리 자원. 두 직교 하위차원으로 분해된다 — **compute**(연산기 = backend: CPU NEON / Adreno OpenCL / Jetson CUDA)와 **data**(메모리 = memory allocator). 둘은 직교다: UMA(ARM SoC)에서는 여러 backend가 한 memory를 공유하고(연산기만 바뀜), discrete GPU에서는 backend마다 별도 memory(VRAM↔RAM 이동)다. 그래서 device를 (backend, memory) 1:1 페어로 묶지 않는다.
+**format**:
+KV 또는 weight 데이터가 *저장·연산되는 표현*. "어떤 포맷으로 계산하나"라는 데이터 좌표다. 한 구체적 표현이 곧 하나의 format 멤버다 — 예: `f16`, `q4_0`, `KIVI`(Q2 packed + F32 residual). 새 format 을 더하면 새 바이트 레이아웃 + 전용 커널(**paired kernel**, backend 별)이 따라온다 — 무겁지만 격리된 확장.
+_Note_: precision(q4/f16)과 바이트 레이아웃은 분리된 두 개념이 아니라 한 좌표다. (이전 모델은 "precision 은 Format 안 파라미터"라며 분리했으나 폐기 — q4 와 f16 은 이미 다른 paired kernel 을 쓰므로 precision 이 곧 표현을 가른다.)
+_Avoid_: Layer (→ Flagged ambiguities). Precision (precision 은 format 의 다른 이름일 뿐 별도 축이 아니다).
 
-**Hardware** (구 Fabric — 2026-05-31 명명 확정, v2 §3.5):
-device 자원을 담는 런타임 객체. 내부에 backend 레지스트리 ⊥ memory 레지스트리를 분리 보유하고, `resolve(target)`이 "이 backend로 가려면 어느 memory?"의 UMA/discrete 분기를 한 곳에 가둔다. Stage는 이 객체를 register 시점에 보관하고(`Arc`, interior mutability), device를 바꾸는 Stage(switch)가 그 내부 활성 backend를 mutate한다.
+**KVCacheFormat / WeightFormat**:
+여러 format 을 추상화하는 base trait. 호출자에게 geometry(위치·용량)·mutation(쓰기·compact)·attention(KV) 또는 dispatch(weight)만 노출하고, dtype·codebook·precision 같은 내부는 숨긴다 (format-agnostic). Stage 는 이 trait 을 통해 데이터를 조작한다.
 
-**switch** (device 제어 Stage):
-실행 바탕을 바꾸는 Stage. 연산기를 GPU↔CPU 전환하고(필요시 KV를 새 backend로 migrate), 표현(Format)은 안 바꾼다. 안전한 경계(prefill→decode 등)에서만 실행된다. 별도 축이 아니라 [Stage](#관리-동작--verb)의 한 종류다.
+**Paired kernel**:
+한 format 의 바이트 레이아웃을 읽어 연산을 수행하는 전용 커널. format 이 다르면 읽는 커널도 다르고, backend 마다도 달라야 하므로 (format × hardware) M×N 행렬을 이룬다 — 새 format·backend 추가에 따라오는 환원 불가능한 leaf 비용이며 Backend 인터페이스 아래 격리된다.
 
-**partition** (WeightFormat dispatch 모드):
-한 layer의 forward를 여러 backend에 동시 분산하는 것. 별도 축이 아니라 **WeightFormat의 dispatch 모드**(Full / Skip / Partition)이며, 분산 대상 backend는 Hardware에서 받는다. 즉 partition = WeightFormat dispatch(Format 축) × companion backend(실행 바탕)의 곱이다.
+### hardware — 연산 위치
+
+**hardware (연산 위치)**:
+연산이 실행되는 물리 자원. 두 직교 하위차원으로 분해된다 — **compute**(연산기 = backend: CPU NEON / Adreno OpenCL / Jetson CUDA / NPU)와 **data**(메모리 = memory allocator). 둘은 직교다: UMA(ARM SoC)에서는 여러 backend 가 한 memory 를 공유하고(연산기만 바뀜), discrete GPU 에서는 backend 마다 별도 memory(VRAM↔RAM 이동)다. 그래서 (backend, memory) 를 1:1 페어로 묶지 않는다.
+
+**Hardware** (런타임 resolver):
+hardware 축 좌표를 해석하는 런타임 객체. 내부에 backend 레지스트리 ⊥ memory 레지스트리를 분리 보유하고, `resolve(target)`이 "이 backend 로 가려면 어느 memory?"의 UMA/discrete 분기를 한 곳에 가둔다. **read-only resolver** 다 — 활성 backend 를 mutable 하게 들고 있지 않으며("현재 device"는 decode-loop local 상태), 어떤 연산도 이 객체를 통해 "현재"를 관찰하지 않는다(실행은 텐서 태그로 storage 에서 backend 를 얻음). (구 `Fabric` / 구 "실행 바탕" 개념을 hardware 축의 resolver 로 재정의 — 2026-05-31.)
+
+**switch** (hardware 축 이동):
+연산 위치를 GPU↔CPU 전환하고(필요시 KV 를 새 backend 의 memory 로 migrate), 표현(format)은 안 바꾼다. 안전한 경계(prefill→decode 등)에서만 실행된다. hardware 축을 따라 데이터를 옮기는 동작이다. (구 모델에선 "device 제어 Stage"였으나, 3축에서 device 가 축으로 승격되며 **switch 는 hardware 축 동작**이 됨 — 더 이상 Stage 아님. 2026-05-31 갱신.)
+
+**partition** (format × hardware 곱):
+한 layer 의 forward 를 여러 backend 에 동시 분산하는 것. 슬라이스마다 다른 (format, hardware) 좌표를 가질 수 있다 — 예: GPU 슬라이스는 f16, NPU 슬라이스는 q4 (HeteroLLM). 즉 partition = format(표현) × hardware(위치)의 곱이며, 분산 대상 backend 는 `Hardware.resolve()`에서 받는다. 단일 "현재 위치" 포인터로는 두 좌표를 동시에 못 찍으므로 resolver 가 필요한 정확한 근거다.
 
 **Pressure / PressureSource** (system 조건 입력):
-Stage가 반응하는 system 압력을 0–100 단일 scalar(`Pressure`)로 표현한 것, 그리고 그 값을 공급하는 pluggable 소스. `ManagerPressureSource`(기본, manager 통합값 수신) / `LocalPressureSource`(manager-less 자율 계산) / 3rd-party impl이 같은 `fn pressure(&self) -> Pressure` 뒤에 숨고, 소비 Stage는 어느 소스인지 구분하지 않는다. 여러 입력(memory/thermal/energy)의 통합은 source impl 내부 책임 — carrier는 단일 scalar라 신호 *종류* 확장(anymap)이 불필요하다. 소스는 construction 시점 보유(교체 지점), 값은 매 step `StepInfo`에 read-only로 실린다. 4-level `PressureLevel` enum은 여기에 흡수되고 파생 `band()`로 강등. 상세: v2 §5.1.
+Stage 가 반응하는 system 압력을 0–100 단일 scalar(`Pressure`)로 표현한 것, 그리고 그 값을 공급하는 pluggable 소스. 어느 축도 아닌 *입력 신호*다 — stage 가 이 값을 읽고 동작 강도를 정한다. `ManagerPressureSource`(기본, manager 통합값 수신) / `LocalPressureSource`(manager-less 자율 계산) / 3rd-party impl 이 같은 `fn pressure(&self) -> Pressure` 뒤에 숨고, 소비 Stage 는 어느 소스인지 구분하지 않는다. 여러 입력(memory/thermal/energy)의 통합은 source impl 내부 책임 — carrier 는 단일 scalar 라 신호 *종류* 확장(anymap)이 불필요하다. 소스는 construction 시점 보유(교체 지점), 값은 매 step `StepInfo`에 read-only 로 실린다. 상세: v2 §5.1.
 
-### Stage가 Format을 잡는 방식 — handle 3종
+### Stage 가 데이터를 잡는 방식 — handle 3종
 
-Stage가 자신이 관리할 Format을 보유하는 참조의 정적 타입. 순서 없는 3개 메뉴이며, 4번째는 없다.
+Stage 가 자신이 조절할 데이터(format)를 보유하는 참조의 정적 타입. 순서 없는 3개 메뉴이며, 4번째는 없다.
 
 **Base-trait-handle**:
-`Arc<dyn KVCacheFormat>` 형태. 이를 든 Stage는 어느 Format인지 *몰라야* 한다. 예: position만 보는 Sliding.
+`Arc<dyn KVCacheFormat>` 형태. 이를 든 Stage 는 어느 format 인지 *몰라야* 한다. 예: position 만 보는 Sliding.
 
 **Concrete-handle**:
-`Arc<StandardFormat>`처럼 특정 Format 타입을 든 형태. 그 타입을 *아는 것이 정상*이다(그게 concrete를 든다는 의미). 예: 원본 K를 직접 읽어야 하는 D2O.
+`Arc<StandardFormat>`처럼 특정 format 타입을 든 형태. 그 타입을 *아는 것이 정상*이다(그게 concrete 를 든다는 의미). 예: 원본 K 를 직접 읽어야 하는 D2O.
 
 **Capability-handle**:
-`Arc<dyn SomeCapability>` 형태. 이종 Format을 가로지르는 *능력*을 추상화한다. 소비자가 둘 이상일 때만 만든다(하나뿐이면 가설적 seam이라 만들지 않는다).
+`Arc<dyn SomeCapability>` 형태. 이종 format 을 가로지르는 *능력*을 추상화한다. 소비자가 둘 이상일 때만 만든다(하나뿐이면 가설적 seam 이라 만들지 않는다).
 
 ## Flagged ambiguities
 
-- **Layer는 transformer layer 전용**: "Layer"(`LlamaLayer`/`TransformerLayer`, 16개 디코더 블록, `LayerSlot`·`layer_idx` 등)는 *모델 구조*만 가리킨다. KV·weight의 *저장 형태*는 절대 "Layer"라 부르지 않고 **Format**(`KVCacheFormat`/`WeightFormat`)이라 부른다. (이전엔 둘 다 "Layer"여서 충돌 — Format으로 분리해 해소.)
-- **Stage vs Handler/hook**: 도메인 용어는 **Stage**. 현 코드의 `CachePressureHandler` + 여러 decode hook trait은 같은 개념의 과도기 구현이다.
-- **Eviction은 동작이지 형태가 아니다**: eviction은 토큰을 버리는 *동작*(verb)이라 **Stage**(Stage 축)다. KIVI 양자화는 바이트 형태를 바꾸는 *저장 형태*(noun)라 **Format**(Format 축)다. "KIVI도 양자화라는 동작이니 Stage 아니냐"는 흔한 혼동 — KIVI는 전용 paired kernel을 동반하므로 Format이다.
-- **device는 축이 아니라 바탕**: 저장 형태(Format)·관리 동작(Stage)은 직교 *축*(곱해진다)이지만, 연산기·메모리(device)는 두 축이 *그 위에서 실행되는 바탕*이다. switch(device 전환)는 새 축이 아니라 device를 바꾸는 **Stage**이고, partition(multi-device 분산)은 **WeightFormat dispatch 모드**다. "device를 3번째 축으로" 라는 충동은 기각됐다 — device가 바뀌어도 Format은 따라가므로 곱이 아니라 위치다 (2026-05-30 grill 결정).
+- **Layer 는 transformer layer 전용**: "Layer"(`LlamaLayer`/`TransformerLayer`, 16개 디코더 블록, `LayerSlot`·`layer_idx` 등)는 *모델 구조*만 가리킨다. KV·weight 의 *표현*은 절대 "Layer"라 부르지 않고 **format**(`KVCacheFormat`/`WeightFormat`)이라 부른다.
+- **stage 축 vs `PipelineStage` 메커니즘**: "stage"(축)은 메모리 상주 데이터를 조절하는 *개념 차원*이고, 코드의 `PipelineStage`/`CachePressureHandler`는 decode 루프 hook *메커니즘*이다. 한 `PipelineStage` 가 한 축(eviction→stage) 또는 여러 축(KIVI→stage+format 합성)을 건드릴 수 있다. 같은 단어지만 층위가 다르다.
+- **format 은 표현(precision+layout 융합)**: 구 "precision 은 Format 안 파라미터 / Standard·KIVI 는 별개 바이트 레이아웃"은 폐기. q4/f16/KIVI 는 각각 format 축의 한 좌표다.
+- **device 는 이제 축이다 (구 "바탕" 폐기)**: 2026-05-30 "device 는 축이 아니라 바탕" 결정을 2026-05-31 grill 에서 뒤집음. precision(format)과 backend(hardware)가 분리 가능함을 코드로 확인(단일 backend 가 6 precision, q4 가 3 backend) → hardware 는 정식 축. switch = hardware 축 동작, partition = format × hardware 곱. (M×N 커널 행렬은 Backend 인터페이스 아래 격리되므로 축 가산성은 유지.)
+- **Eviction 은 stage 이고 KIVI 는 format(+stage 합성)이다**: eviction 은 토큰을 버리는 *상주 데이터 조절*이라 **stage**. KIVI 양자화는 바이트 표현을 바꾸는 *format* 이자 그 변환 동작이 *상주 데이터를 수정*하므로 stage 와의 **합성**이다.
 
 ## Example dialogue
 
-> **Dev**: KIVI를 추가하려는데, Sliding이나 H2O처럼 Stage로 넣으면 되나요?
-> **Expert**: 아니요. Sliding·H2O는 "어느 토큰을 버리나"라는 **동작(Stage)** 이라 저장 형태를 안 건드려요. KIVI는 KV를 Q2로 *다시 깔고* 그 위에서 attention하는 **저장 형태(Format)** 예요. 그래서 KVCacheFormat impl + paired kernel이 따라옵니다.
-> **Dev**: 그럼 KIVI Format 위에서 Sliding을 돌릴 수도 있나요?
-> **Expert**: 네. 그게 두 축이 **직교**한다는 뜻이에요. KIVI(Format 축) 위에서 Sliding(Stage 축)이 `compact`만 호출하면 됩니다. Sliding은 그 밑이 Q2인지 F32인지 몰라요 — **base-trait-handle**을 들었으니까요.
-> **Dev**: 그 "Format"이 transformer layer랑 다른 건가요?
-> **Expert**: 완전히 달라요. transformer **layer**는 모델 디코더 블록(16개)이고, **Format**은 그 layer들의 KV/weight가 *어떤 바이트로 저장되나*예요. "layer 16번의 KV를 KIVI Format으로 저장"처럼 둘이 같이 쓰입니다.
-> **Dev**: D2O도 base-trait-handle인가요?
-> **Expert**: D2O는 원본 K를 직접 읽어 병합해야 해서 **concrete-handle**(`Arc<StandardFormat>`)을 듭니다. 특정 Format을 아는 게 정상이에요 — 그게 concrete를 든다는 의미니까요.
+> **Dev**: KIVI 를 추가하려는데, Sliding 이나 H2O 처럼 stage 로 넣으면 되나요?
+> **Expert**: 부분만 맞아요. Sliding·H2O 는 "어느 토큰을 버리나"라는 **stage** 동작이라 표현을 안 건드려요. KIVI 는 KV 를 Q2 로 *다시 깔고*(상주 데이터 수정 = stage) 그 위에서 Q2 precision 으로 attention(=format)하는 **합성**이에요. 그래서 KVCacheFormat impl + paired kernel(format)이 따라옵니다.
+> **Dev**: 그럼 KIVI format 위에서 Sliding 을 돌릴 수도 있나요?
+> **Expert**: 네. 그게 세 축이 **직교**한다는 뜻이에요. KIVI(format 좌표) 위에서 Sliding(stage 동작)이 `compact`만 호출하면 됩니다. Sliding 은 그 밑이 Q2 인지 F32 인지 몰라요 — **base-trait-handle**을 들었으니까요.
+> **Dev**: GPU 에서 돌리던 걸 CPU 로 옮기는 switch 는 어느 축이죠?
+> **Expert**: **hardware** 축이에요. 연산 *위치*를 옮기는 거라 표현(format)도 동작(stage)도 안 바꿔요 — KIVI 는 GPU 든 CPU 든 KIVI 입니다. switch 가 KV 를 새 memory 로 migrate 하는 것도 hardware 축 이동의 일부예요.
+> **Dev**: partition 에서 GPU 는 f16, NPU 는 q4 로 두고 싶은데요.
+> **Expert**: 그게 format × hardware 곱이에요. 슬라이스마다 (f16, GPU) / (q4, NPU) 라는 서로 다른 좌표를 갖는 거죠. 단일 "현재 device" 포인터로는 두 좌표를 동시에 못 찍으니, `Hardware.resolve()`로 슬라이스별 backend 를 받습니다.
+> **Dev**: 그 "format"이 transformer layer 랑 다른 건가요?
+> **Expert**: 완전히 달라요. transformer **layer**는 모델 디코더 블록(16개)이고, **format**은 그 layer 들의 KV/weight 가 *어떤 표현으로 연산되나*예요.
