@@ -8,3 +8,10 @@ Interview me relentlessly about every aspect of this plan until we reach a share
 Ask the questions one at a time.
 
 If a question can be answered by exploring the codebase, explore the codebase instead.
+
+When a question involves changes to code, show the concrete artifact alongside your recommended answer — not just prose:
+
+- **Code-level change** (new or changed trait / struct / enum / signature): show the actual Rust, with real field names and signatures. Mark each piece — ✅ existing or already-agreed, 🔵 proposed this turn (under review), 🟡 deferred / grows later, ⏸️ out of scope. Ground names in the real codebase (cite `file:line` for existing types so the user can verify).
+- **Structural change** (module / trait relationships, dispatch flow, state machine): show ASCII UML — trait+impl tree, dispatch sequence with `──▶`, or before/after diagrams. (Mermaid is for `docs/`; inline grill answers use ASCII.)
+
+Tie the artifact to the recommendation so the user sees exactly what they would be agreeing to before they answer.
