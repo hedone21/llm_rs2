@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
+use crate::hardware::Hardware;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
 use crate::memory::Memory;
@@ -26,10 +27,7 @@ pub struct BatchRunCtx {
     // ─── 백엔드 / 메모리 / 모델 ──────────────────────────────────────────
     pub backend: Arc<dyn Backend>,
     pub memory: Arc<dyn Memory>,
-    pub cpu_backend_arc: Arc<dyn Backend>,
-    pub cpu_memory_arc: Arc<dyn Memory>,
-    pub gpu_backend_arc: Option<Arc<dyn Backend>>,
-    pub gpu_memory_arc: Option<Arc<dyn Memory>>,
+    pub hardware: Arc<Hardware>,
     pub model: TransformerModel,
     pub tokenizer: Tokenizer,
 

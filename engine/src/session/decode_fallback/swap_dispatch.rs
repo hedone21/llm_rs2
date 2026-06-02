@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
+use crate::hardware::{DeviceTarget, Hardware};
 use crate::models::transformer::TransformerModel;
 use crate::observability::rss_trace::read_bytes_now;
 use crate::pressure::weights::{
@@ -30,8 +31,7 @@ pub struct SwapDispatchCtx<'a> {
     pub decode_token_index: usize,
     pub forward_ms: f64,
     pub backend: &'a Arc<dyn Backend>,
-    pub gpu_backend_arc: &'a Option<Arc<dyn Backend>>,
-    pub cpu_backend_arc: &'a Arc<dyn Backend>,
+    pub hardware: &'a Hardware,
     pub is_gpu: bool,
     pub async_swap_dispatcher: &'a Option<AsyncSwapDispatcher>,
     #[cfg(feature = "opencl")]
@@ -58,6 +58,19 @@ pub struct SwapDispatchCtx<'a> {
 /// Drain chunk + run_layer_swap + Dynamic-K/Probing-K calibration/observation
 /// + plan retire + manager WeightSwapReport build.
 pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
+    // Phase α-W-2: hardware resolver 에서 cpu/gpu secondary Arc 를 재바인딩.
+    // owned 로 만들어 ctx 다른 필드 mutable borrow 와 disjoint 하게 유지한다.
+    let cpu_backend_arc = ctx
+        .hardware
+        .resolve(DeviceTarget::Cpu)
+        .expect("Cpu always resolves")
+        .0
+        .clone();
+    let gpu_backend_arc: Option<Arc<dyn Backend>> = ctx
+        .hardware
+        .resolve(DeviceTarget::Gpu)
+        .map(|(b, _)| b.clone());
+
     // ── Layer-Incremental Swap dispatch (ENG-ALG-233) ──────────────────
     // Runs after forward, before sampling. Per-tick: drain up to N layers
     // and call SwapExecutor::execute_on_slots with the chunk.
@@ -121,8 +134,8 @@ pub fn run_incremental_dispatch(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result
             match run_layer_swap(
                 ctx.model,
                 &chunk,
-                ctx.gpu_backend_arc.as_ref(),
-                ctx.cpu_backend_arc,
+                gpu_backend_arc.as_ref(),
+                &cpu_backend_arc,
                 ctx.async_swap_dispatcher.as_ref(),
                 #[cfg(feature = "opencl")]
                 ctx.host_ptr_swap_pool.clone(),
@@ -345,11 +358,13 @@ pub fn retire_intra_forward(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()>
         && hook.plan_is_complete()
     {
         let drain_t = std::time::Instant::now();
-        let backend_for_invalidate: Arc<dyn Backend> = ctx
-            .gpu_backend_arc
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| Arc::clone(ctx.backend));
+        // Phase α-W-2: hardware resolver 에서 gpu secondary Arc 를 재바인딩.
+        let gpu_backend_arc: Option<Arc<dyn Backend>> = ctx
+            .hardware
+            .resolve(DeviceTarget::Gpu)
+            .map(|(b, _)| b.clone());
+        let backend_for_invalidate: Arc<dyn Backend> =
+            gpu_backend_arc.unwrap_or_else(|| Arc::clone(ctx.backend));
         let invalidate = move || {
             backend_for_invalidate.invalidate_noshuffle_soa_registry();
         };
@@ -414,11 +429,13 @@ pub fn retire_phase_aware(ctx: &mut SwapDispatchCtx<'_>) -> anyhow::Result<()> {
         && disp.is_complete()
     {
         let drain_t = std::time::Instant::now();
-        let backend_for_invalidate: Arc<dyn Backend> = ctx
-            .gpu_backend_arc
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| Arc::clone(ctx.backend));
+        // Phase α-W-2: hardware resolver 에서 gpu secondary Arc 를 재바인딩.
+        let gpu_backend_arc: Option<Arc<dyn Backend>> = ctx
+            .hardware
+            .resolve(DeviceTarget::Gpu)
+            .map(|(b, _)| b.clone());
+        let backend_for_invalidate: Arc<dyn Backend> =
+            gpu_backend_arc.unwrap_or_else(|| Arc::clone(ctx.backend));
         let invalidate = move || {
             backend_for_invalidate.invalidate_noshuffle_soa_registry();
         };

@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     let ctx = SessionInitCtx::build(&args)?;
     let backend = ctx.backend;
     let memory = ctx.memory;
-    let cpu_backend_arc = ctx.cpu_backend_arc;
+    let hardware = ctx.hardware;
     let sampling_config = ctx.sampling_config;
     let model = ctx.model;
     let model_path = ctx.model_path;
@@ -139,7 +139,7 @@ fn main() -> anyhow::Result<()> {
         args,
         backend,
         memory,
-        cpu_backend_arc,
+        hardware,
         model,
         tokenizer,
         kv_caches,

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
+use crate::hardware::Hardware;
 use crate::inference::sampling::SamplingConfig;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
@@ -27,23 +28,18 @@ pub struct SessionInitCtx {
     /// 모델이 GGUF 포맷이면 true.
     pub is_gguf: bool,
 
-    /// 주 backend (CPU 또는 GPU).
+    /// 주 backend (CPU 또는 GPU). "현재 활성 device" = decode-loop local.
     pub backend: Arc<dyn Backend>,
     /// 주 메모리 할당자.
     pub memory: Arc<dyn Memory>,
-    /// SwitchHw 용 GPU secondary backend (CPU primary일 때 Some).
-    pub gpu_backend_arc: Option<Arc<dyn Backend>>,
-    /// SwitchHw 용 GPU secondary 메모리 할당자.
-    pub gpu_memory_arc: Option<Arc<dyn Memory>>,
     /// 현재 GPU가 primary backend이면 true (main()이 SwitchHw 후 mutation).
     pub is_gpu: bool,
     /// 모델 weights가 GPU cl_mem에 있으면 true.
     pub weights_on_gpu: bool,
 
-    /// CPU 백엔드 (SwitchHw fallback, tensor partition, weight migration).
-    pub cpu_backend_arc: Arc<dyn Backend>,
-    /// CPU 메모리 할당자.
-    pub cpu_memory_arc: Arc<dyn Memory>,
+    /// hardware 축 resolver — 흩어진 cpu/gpu backend·memory secondary Arc를 흡수.
+    /// `hardware.resolve(target)` 로 (backend, memory) 페어를 푼다 (Phase α-W-2).
+    pub hardware: Arc<Hardware>,
 
     /// swap layer 선택 알고리즘 (--swap-algorithm).
     pub swap_algorithm: crate::pressure::weights::SwapAlgorithm,
@@ -867,18 +863,28 @@ impl SessionInitCtx {
         #[cfg(not(feature = "opencl"))]
         let weights_on_gpu = false;
 
+        // Phase α-W-2: 흩어진 4 secondary Arc 를 단일 Hardware resolver 로 흡수.
+        // primary `backend`/`memory` 는 위에서 이미 cpu/gpu 로컬의 clone 으로 set 되어
+        // 있으므로, 4 Arc 를 move 하는 Hardware::new 호출이 안전하다.
+        // 매핑: cpu=cpu_backend_arc / gpu=gpu_backend_arc / host=cpu_memory_arc /
+        //       device=gpu_memory_arc (UMA/discrete 직교는 resolve 내부에서 처리).
+        let hardware = Arc::new(Hardware::new(
+            cpu_backend_arc,
+            gpu_backend_arc,
+            None,
+            cpu_memory_arc,
+            gpu_memory_arc,
+        ));
+
         Ok(SessionInitCtx {
             sampling_config,
             model_path: model_path.clone(),
             is_gguf,
             backend,
             memory,
-            gpu_backend_arc,
-            gpu_memory_arc,
             is_gpu,
             weights_on_gpu,
-            cpu_backend_arc,
-            cpu_memory_arc,
+            hardware,
             swap_algorithm,
             importance_formula,
             importance_compare,

@@ -10,6 +10,7 @@ use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
+use crate::hardware::{DeviceTarget, Hardware};
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
@@ -22,7 +23,7 @@ pub struct StandardHappyCtx {
     pub args: Args,
     pub backend: Arc<dyn Backend>,
     pub memory: Arc<dyn Memory>,
-    pub cpu_backend_arc: Arc<dyn Backend>,
+    pub hardware: Arc<Hardware>,
     pub model: TransformerModel,
     pub tokenizer: Tokenizer,
     pub kv_caches: Vec<KVCache>,
@@ -41,7 +42,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args,
         backend,
         memory,
-        cpu_backend_arc,
+        hardware,
         model,
         tokenizer,
         kv_caches,
@@ -53,6 +54,14 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         vocab_size,
         resilience,
     } = ctx;
+
+    // Phase α-W-2: hardware resolver 에서 cpu secondary Arc 를 재바인딩.
+    // 로컬이 정확히 같은 Arc 를 보유하므로 본문 사용처는 무변경.
+    let cpu_backend_arc = hardware
+        .resolve(DeviceTarget::Cpu)
+        .expect("Cpu always resolves")
+        .0
+        .clone();
 
     eprintln!(
         "[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens={}, budget={})",

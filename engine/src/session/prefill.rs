@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
+use crate::hardware::{DeviceTarget, Hardware};
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::inference::skip_config::SkipConfig;
 use crate::memory::Memory;
@@ -48,8 +49,7 @@ pub struct PrefillCtx<'a> {
     // ── Arc clones (Backend/Memory) ───────────────────────────────
     pub backend: Arc<dyn Backend>,
     pub memory: Arc<dyn Memory>,
-    pub cpu_backend_arc: Arc<dyn Backend>,
-    pub cpu_memory_arc: Arc<dyn Memory>,
+    pub hardware: Arc<Hardware>,
 
     // ── Constants ─────────────────────────────────────────────────
     pub vocab_size: usize,
@@ -106,8 +106,7 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
         sampling_config,
         backend,
         memory,
-        cpu_backend_arc,
-        cpu_memory_arc,
+        hardware,
         vocab_size,
         hidden_size,
         max_seq_len,
@@ -123,6 +122,19 @@ pub fn run_chunked_prefill(ctx: PrefillCtx<'_>) -> anyhow::Result<PrefillOutput>
         mut throttle_delay_ms,
         mut command_executor,
     } = ctx;
+
+    // Phase α-W-2: hardware resolver 에서 cpu secondary Arc 2개를 재바인딩.
+    // 로컬이 정확히 같은 Arc 를 보유하므로 본문 사용처는 무변경.
+    let cpu_backend_arc = hardware
+        .resolve(DeviceTarget::Cpu)
+        .expect("Cpu always resolves")
+        .0
+        .clone();
+    let cpu_memory_arc = hardware
+        .resolve(DeviceTarget::Cpu)
+        .expect("Cpu always resolves")
+        .1
+        .clone();
 
     // Inference profiler (activated by either --profile or --profile-events).
     // Declared before prefill so PrefillOpProfiler can be populated.

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
+use crate::hardware::{DeviceTarget, Hardware};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::layers::workspace::{
     LayerWorkspace, PartitionWorkspace, PartitionWsCell, WorkspaceConfig,
@@ -36,10 +37,7 @@ pub struct DecodePrologueCtx<'a> {
     pub backend: Arc<dyn Backend>,
     pub is_gpu: bool,
     pub memory: Arc<dyn Memory>,
-    pub cpu_backend_arc: Arc<dyn Backend>,
-    pub cpu_memory_arc: Arc<dyn Memory>,
-    pub gpu_backend_arc: Option<Arc<dyn Backend>>,
-    pub gpu_memory_arc: Option<Arc<dyn Memory>>,
+    pub hardware: Arc<Hardware>,
     pub kv_caches: Vec<KVCache>,
     pub logits: Tensor,
     pub deferred_switch: Option<String>,
@@ -130,10 +128,7 @@ pub fn run_decode_prologue(ctx: DecodePrologueCtx<'_>) -> anyhow::Result<DecodeP
         mut backend,
         mut is_gpu,
         memory,
-        cpu_backend_arc,
-        cpu_memory_arc,
-        gpu_backend_arc,
-        gpu_memory_arc,
+        hardware,
         mut kv_caches,
         mut logits,
         deferred_switch,
@@ -150,6 +145,23 @@ pub fn run_decode_prologue(ctx: DecodePrologueCtx<'_>) -> anyhow::Result<DecodeP
         weights_on_gpu,
         score_accumulator,
     } = ctx;
+
+    // Phase α-W-2: hardware resolver 에서 4 secondary Arc 를 재바인딩.
+    // 로컬이 정확히 같은 Arc 를 보유하므로 본문 사용처는 무변경.
+    let cpu_backend_arc = hardware
+        .resolve(DeviceTarget::Cpu)
+        .expect("Cpu always resolves")
+        .0
+        .clone();
+    let cpu_memory_arc = hardware
+        .resolve(DeviceTarget::Cpu)
+        .expect("Cpu always resolves")
+        .1
+        .clone();
+    let gpu_backend_arc: Option<Arc<dyn Backend>> =
+        hardware.resolve(DeviceTarget::Gpu).map(|(b, _)| b.clone());
+    let gpu_memory_arc: Option<Arc<dyn Memory>> =
+        hardware.resolve(DeviceTarget::Gpu).map(|(_, m)| m.clone());
 
     // ── A: Deferred SwitchHw (GPU↔CPU KV migrate + backend/is_gpu 재할당) ──
     if let Some(ref device) = deferred_switch

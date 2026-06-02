@@ -103,12 +103,29 @@ fn main() -> anyhow::Result<()> {
     let is_gguf = ctx.is_gguf;
     let backend = ctx.backend;
     let memory = ctx.memory;
-    let gpu_backend_arc = ctx.gpu_backend_arc;
-    let gpu_memory_arc = ctx.gpu_memory_arc;
     let is_gpu = ctx.is_gpu;
     let weights_on_gpu = ctx.weights_on_gpu;
-    let cpu_backend_arc = ctx.cpu_backend_arc;
-    let cpu_memory_arc = ctx.cpu_memory_arc;
+    // Phase α-W-2: SessionInitCtx 가 4 secondary Arc 를 단일 Hardware 로 흡수했다.
+    // legacy main() 본문은 4 로컬을 광범위하게 직접 쓰므로, ctx unpack 지점에서
+    // hardware 를 보유하고 동시에 4 로컬을 resolve() 로 재바인딩한다.
+    // 로컬이 정확히 같은 Arc 를 보유하므로 본문 사용처는 무변경.
+    let hardware = ctx.hardware;
+    let cpu_backend_arc = hardware
+        .resolve(llm_rs2::hardware::DeviceTarget::Cpu)
+        .expect("Cpu always resolves")
+        .0
+        .clone();
+    let cpu_memory_arc = hardware
+        .resolve(llm_rs2::hardware::DeviceTarget::Cpu)
+        .expect("Cpu always resolves")
+        .1
+        .clone();
+    let gpu_backend_arc: Option<Arc<dyn Backend>> = hardware
+        .resolve(llm_rs2::hardware::DeviceTarget::Gpu)
+        .map(|(b, _)| b.clone());
+    let gpu_memory_arc: Option<Arc<dyn Memory>> = hardware
+        .resolve(llm_rs2::hardware::DeviceTarget::Gpu)
+        .map(|(_, m)| m.clone());
     let swap_algorithm = ctx.swap_algorithm;
     let importance_formula = ctx.importance_formula;
     let importance_compare = ctx.importance_compare;
@@ -1751,10 +1768,7 @@ fn main() -> anyhow::Result<()> {
             args: args.clone(),
             backend,
             memory,
-            cpu_backend_arc,
-            cpu_memory_arc,
-            gpu_backend_arc,
-            gpu_memory_arc,
+            hardware,
             model,
             tokenizer,
             kv_caches,
@@ -1792,7 +1806,7 @@ fn main() -> anyhow::Result<()> {
                 args: args.clone(),
                 backend: backend.clone(),
                 memory: memory.clone(),
-                cpu_backend_arc: cpu_backend_arc.clone(),
+                hardware: hardware.clone(),
                 model,
                 tokenizer,
                 kv_caches,
@@ -1826,8 +1840,7 @@ fn main() -> anyhow::Result<()> {
             sampling_config: &sampling_config,
             backend: backend.clone(),
             memory: memory.clone(),
-            cpu_backend_arc: cpu_backend_arc.clone(),
-            cpu_memory_arc: cpu_memory_arc.clone(),
+            hardware: hardware.clone(),
             vocab_size,
             hidden_size,
             max_seq_len,
@@ -1878,10 +1891,7 @@ fn main() -> anyhow::Result<()> {
             backend: backend.clone(),
             is_gpu,
             memory: memory.clone(),
-            cpu_backend_arc: cpu_backend_arc.clone(),
-            cpu_memory_arc: cpu_memory_arc.clone(),
-            gpu_backend_arc: gpu_backend_arc.clone(),
-            gpu_memory_arc: gpu_memory_arc.clone(),
+            hardware: hardware.clone(),
             kv_caches,
             logits,
             deferred_switch,
@@ -2182,8 +2192,7 @@ fn main() -> anyhow::Result<()> {
                         decode_token_index,
                         forward_ms,
                         backend: &backend,
-                        gpu_backend_arc: &gpu_backend_arc,
-                        cpu_backend_arc: &cpu_backend_arc,
+                        hardware: &hardware,
                         is_gpu,
                         async_swap_dispatcher: &async_swap_dispatcher,
                         #[cfg(feature = "opencl")]
