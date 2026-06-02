@@ -109,6 +109,8 @@ cargo build --release --bin mock_manager --features resilience
 
 ## 5. 신호 → 액션 매핑
 
+> ⚠️ **α-W-3 STALE 경고 (2026-06-02)**: 본 §5 의 `MemoryStrategy` / `Evict` / `LimitTokens` / `SwitchBackend` 어휘는 `arch/pipeline_stage_design_v2.md` §5.4 결정으로 폐기·변경 예정. canonical 은 `spec/31-engine-state.md` §3.5/§3.6 (α-W-3 갱신본) — `MemoryStrategy` 삭제(memory → graded `Pressure` scalar), strategy 출력은 `EngineCommand`(`SwitchHw`/`Throttle`/`Suspend`/`RestoreDefaults`)로 통일, `LimitTokens`/`RejectNew` 폐기. 본 가이드는 코드 co-evolution 완료 후 갱신된다.
+
 ### 5.1 운영 모드
 
 | 모드 | 조건 | 동작 |

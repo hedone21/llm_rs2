@@ -201,12 +201,14 @@ CommandExecutor는 Manager로부터 수신한 EngineDirective를 디코딩하여
 
 | 컴포넌트 | 입력 | 출력 |
 |---------|------|------|
-| ResilienceManager | SystemSignal (D-Bus) | ResilienceAction[] |
+| ResilienceManager (manager-less `LocalPolicy`) | SystemSignal | EngineCommand[] |
 
-- ResilienceManager는 도메인별 Strategy(Memory, Thermal, Compute, Energy)를 보유하며, 수신 신호의 Level에 따라 해당 Strategy에 대응을 위임한다.
-- 각 Strategy는 Level별로 미리 정의된 대응 액션(SwitchBackend, Throttle, LimitTokens, Evict, Suspend 등)을 반환한다.
-- Emergency Level 수신 시 Thermal/Energy Strategy는 `Suspend`를, Memory Strategy는 공격적 eviction(25%)을 반환한다 (SYS-055).
-- 다수 Strategy의 출력이 충돌하면 `resolve_conflicts()`가 병합한다. **Suspend는 모든 다른 액션에 우선한다**.
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 출력 어휘 `ResilienceAction[]`(폐기) → `EngineCommand[]`(`shared/`, 유일 이산 어휘). `MemoryStrategy` 삭제 → memory 압력은 graded `Pressure` scalar 경로(`LocalPressureSource`)로 분리. strategy 는 Thermal/Compute/Energy 3종만 잔존하며 *mode* 명령(switch/suspend) 전용.
+
+- ResilienceManager(manager-less `LocalPolicy`)는 도메인별 Strategy(Thermal, Compute, Energy)를 보유하며, 수신 신호의 Level에 따라 해당 Strategy에 대응을 위임한다.
+- 각 Strategy는 Level별로 미리 정의된 *mode* 대응 명령(`SwitchHw`, `Throttle`, `Suspend`, `RestoreDefaults`)을 `EngineCommand` 로 반환한다. (memory eviction 강도는 graded `Pressure` scalar 가 담당; `LimitTokens`/`RejectNew` 는 어휘 부재로 폐기 — `31-engine-state.md` ENG-ST-052.)
+- Emergency Level 수신 시 Thermal/Energy Strategy는 `Suspend`를 반환한다. Memory 압력은 graded `Pressure` 융합으로 공격적 eviction 을 구동한다 (SYS-055).
+- 다수 Strategy의 출력이 충돌하면 `resolve_conflicts()`가 병합한다. **Suspend는 모든 다른 명령에 우선한다**.
 - 이 경로는 Manager 없이 D-Bus로 운영할 때 Engine의 자율 안전 메커니즘을 제공한다 (SYS-050 참조).
 
 > **참고 (non-normative)**: Directive 경로(SYS-085)와 Strategy 경로(SYS-085a)는 전송 매체에 따라 배타적으로 활성화된다. 양방향 프로토콜(Unix Socket/TCP) 사용 시 Directive 경로가, D-Bus 사용 시 Strategy 경로가 활성화된다.

@@ -131,8 +131,8 @@
 |----|------|----------|---------|------|------|
 | INV-070 | 31-engine-state ENG-ST-011 | `OperatingMode.from_levels()` = 순수 함수. 이전 상태 미의존. | Correctness | static | 함수 시그니처 |
 | INV-071 | 31-engine-state ENG-ST-020 | EngineState 전이는 CommandExecutor 내부에서만. 외부 직접 변경 금지. | Correctness | static | 캡슐화 |
-| INV-072 | 31-engine-state ENG-ST-060 | `resolve_conflicts()`: Suspend 존재 시 반환 = `[Suspend]`. | Safety | runtime, test | |
-| INV-073 | 31-engine-state ENG-ST-060 | `resolve_conflicts()`: RestoreDefaults는 다른 제약 없을 때만 반환. | Correctness | runtime, test | |
+| INV-072 | 31-engine-state ENG-ST-060 | `resolve_conflicts(Vec<EngineCommand>)`: `Suspend` 존재 시 반환 = `[Suspend]`. | Safety | runtime, test | α-W-3: 어휘 ResilienceAction→EngineCommand (규칙 불변) |
+| INV-073 | 31-engine-state ENG-ST-060 | `resolve_conflicts(Vec<EngineCommand>)`: `RestoreDefaults`는 다른 제약 없을 때만 반환. | Correctness | runtime, test | α-W-3: 어휘 ResilienceAction→EngineCommand (규칙 불변) |
 | INV-074 | 31-engine-state ENG-ST-034 | `plan.suspended == true`이면 evict/switch_device/prepare_device = None. | Safety | runtime | poll step 5. => INV-062 |
 | INV-075 | 31-engine-state ENG-ST-033 | Resume: compute/memory_level을 Normal로, throttle_delay_ms를 0으로. | Correctness | runtime | |
 | INV-076 | 31-engine-state ENG-ST-033 | RestoreDefaults: active_actions 비움, throttle를 0으로, compute/memory를 Normal로. | Correctness | runtime | |

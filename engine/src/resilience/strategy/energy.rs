@@ -1,9 +1,8 @@
-use super::{ResilienceAction, ResilienceStrategy};
-use crate::resilience::signal::{Level, RecommendedBackend, SystemSignal};
-use crate::resilience::state::OperatingMode;
+use super::ResilienceStrategy;
+use crate::resilience::signal::{EngineCommand, Level, SystemSignal};
 
 /// Energy constraint response strategy.
-/// Reduces power consumption proportional to severity.
+/// Reduces power consumption proportional to severity (ENG-ST-052).
 pub struct EnergyStrategy;
 
 impl Default for EnergyStrategy {
@@ -19,24 +18,25 @@ impl EnergyStrategy {
 }
 
 impl ResilienceStrategy for EnergyStrategy {
-    fn react(&mut self, signal: &SystemSignal, _mode: OperatingMode) -> Vec<ResilienceAction> {
+    fn react(&mut self, signal: &SystemSignal) -> Vec<EngineCommand> {
         let SystemSignal::EnergyConstraint { level, .. } = signal else {
             return vec![];
         };
 
         match level {
-            Level::Normal => vec![ResilienceAction::RestoreDefaults],
-            Level::Warning => vec![ResilienceAction::SwitchBackend {
-                to: RecommendedBackend::Cpu,
+            Level::Normal => vec![EngineCommand::RestoreDefaults],
+            Level::Warning => vec![EngineCommand::SwitchHw {
+                device: "cpu".to_string(),
             }],
+            // 구 LimitTokens{64} drop (ENG-ST-052 α-W-3): EngineCommand 등가 부재.
             Level::Critical => vec![
-                ResilienceAction::SwitchBackend {
-                    to: RecommendedBackend::Cpu,
+                EngineCommand::SwitchHw {
+                    device: "cpu".to_string(),
                 },
-                ResilienceAction::LimitTokens { max_tokens: 64 },
-                ResilienceAction::Throttle { delay_ms: 30 },
+                EngineCommand::Throttle { delay_ms: 30 },
             ],
-            Level::Emergency => vec![ResilienceAction::Suspend, ResilienceAction::RejectNew],
+            // 구 RejectNew drop (ENG-ST-052 α-W-3) — Emergency stop-intent 는 Suspend 가 흡수.
+            Level::Emergency => vec![EngineCommand::Suspend],
         }
     }
 
@@ -61,23 +61,19 @@ mod tests {
     #[test]
     fn test_energy_normal_restores() {
         let mut strategy = EnergyStrategy::new();
-        let actions = strategy.react(
-            &energy_signal(Level::Normal, EnergyReason::Charging),
-            OperatingMode::Normal,
-        );
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], ResilienceAction::RestoreDefaults));
+        let commands = strategy.react(&energy_signal(Level::Normal, EnergyReason::Charging));
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], EngineCommand::RestoreDefaults));
     }
 
     #[test]
-    fn test_energy_emergency_suspends_and_rejects() {
+    fn test_energy_emergency_suspends() {
         let mut strategy = EnergyStrategy::new();
-        let actions = strategy.react(
-            &energy_signal(Level::Emergency, EnergyReason::BatteryCritical),
-            OperatingMode::Suspended,
-        );
-        assert_eq!(actions.len(), 2);
-        assert!(matches!(actions[0], ResilienceAction::Suspend));
-        assert!(matches!(actions[1], ResilienceAction::RejectNew));
+        let commands = strategy.react(&energy_signal(
+            Level::Emergency,
+            EnergyReason::BatteryCritical,
+        ));
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], EngineCommand::Suspend));
     }
 }

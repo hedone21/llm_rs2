@@ -1510,7 +1510,8 @@ match command:
 | 이미 모든 layer swap 완료 (needed=0) | `Ok` + 빈 report (reject 아님) |
 
 **교차 참조**:
-- `ResilienceAction::SwapWeights`(engine 내부 enum)와 `EngineCommand::SwapWeights`(shared enum)는 **서로 다른 타입**이다. Manager의 외부 결정은 `EngineCommand::SwapWeights`, engine 내부 `MemoryStrategy`가 `Level::Critical`에서 내리는 fallback 결정은 `ResilienceAction::SwapWeights`. 둘 다 같은 dispatch 루트(위 의사코드)로 귀결된다. 자세한 매핑은 arch/weight_swap.md §3에 있다.
+- 트리거 어휘는 `EngineCommand::SwapWeights`(`shared/`, MSG-042) 단일이다. Manager-full 의 외부 결정도, manager-less `LocalPolicy` 의 자율 결정(구 `MemoryStrategy` fallback)도 모두 `EngineCommand::SwapWeights` 를 생산하며 같은 dispatch 루트(위 의사코드)로 귀결된다. 자세한 매핑은 arch/weight_swap.md §3에 있다.
+  - **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 구 engine 내부 `ResilienceAction::SwapWeights` enum 은 `ResilienceAction`/`MemoryStrategy` 삭제와 함께 폐기. 본 절(ENG-ALG-211/212/214)의 `ResilienceAction::SwapWeights` 트리거 표기는 `EngineCommand::SwapWeights` 로 읽는다. (setup-1회 명령이라 OneShot Stage 우회 직접 적용 여지는 §5.4 friction-triggered 잔여 — Phase α-W 진입 시 판정.)
 
 ---
 

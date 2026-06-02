@@ -305,6 +305,8 @@ assert_eq!(mode, OperatingMode::Minimal);
 
 ## 3. Strategy Framework
 
+> ⚠️ **α-W-3 STALE 경고 (2026-06-02)**: 본 §3·§4 의 `ResilienceAction` / `MemoryStrategy` / `react(.., mode)` / `execute_action` API 는 `arch/pipeline_stage_design_v2.md` §5.4 결정으로 폐기·변경 예정이다. canonical 어휘는 `spec/31-engine-state.md` §3.5/§3.6 (α-W-3 갱신본): (1) `ResilienceAction` 삭제 → `EngineCommand`(`shared/`) 단일 어휘, (2) `MemoryStrategy` 삭제 → graded `Pressure` scalar 경로(thermal/energy/compute strategy 3종 잔존), (3) `react(&mut self, signal) -> Vec<EngineCommand>` (dead `mode` 인자 제거), (4) `resolve_conflicts(Vec<EngineCommand>)` 4규칙. 본 레퍼런스는 코드 co-evolution 완료 후 일괄 갱신된다.
+
 ### 3.1 `ResilienceAction`
 
 Strategy가 시그널에 대응하여 반환하는 액션. 추론 루프에서 실행됨.

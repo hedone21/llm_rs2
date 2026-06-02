@@ -289,7 +289,7 @@ StreamingParams: `struct { sink_size: usize, window_size: usize }`. Streaming ev
 
 ### 3.5 ResilienceManager State [ENG-ST-050 ~ ENG-ST-055]
 
-> 이 섹션은 D-Bus/Strategy 경로(레거시) 전용이다. Directive 경로에서는 사용되지 않는다.
+> **α-W-3 갱신 (§5.4 drift-sync)**: 이 섹션의 strategy 경로는 manager-less `LocalPolicy`(front-door ①, `ResilienceStrategy` 3종 + `resolve_conflicts`)로 재정위된다. `ResilienceAction`/`MemoryStrategy` 삭제, 출력 어휘는 `EngineCommand`(`shared/`)로 통일. manager-full Directive 경로는 종전대로 `signal_to_manager_message()` → `EngineCommand` → `CommandExecutor` 를 사용하며 본 섹션을 경유하지 않는다.
 
 **[ENG-ST-050]** 내부 상태 필드: *(MUST)*
 
@@ -300,76 +300,88 @@ StreamingParams: `struct { sink_size: usize, window_size: usize }`. Streaming ev
 | current_levels.compute | Level | Normal | 최신 compute signal level |
 | current_levels.thermal | Level | Normal | 최신 thermal signal level |
 | current_levels.energy | Level | Normal | 최신 energy signal level |
-| strategies.memory | Box&lt;dyn ResilienceStrategy&gt; | MemoryStrategy | Memory 전략 |
 | strategies.compute | Box&lt;dyn ResilienceStrategy&gt; | ComputeStrategy | Compute 전략 |
 | strategies.thermal | Box&lt;dyn ResilienceStrategy&gt; | ThermalStrategy | Thermal 전략 |
 | strategies.energy | Box&lt;dyn ResilienceStrategy&gt; | EnergyStrategy | Energy 전략 |
 
+> **α-W-3 갱신 (§5.4 drift-sync)**: `strategies.memory` 행 제거 — `MemoryStrategy` 삭제, memory 압력은 graded `Pressure` scalar(`LocalPressureSource`) 경로로 흐른다. strategy 는 thermal/energy/compute 3개만 잔존.
+
 **[ENG-ST-051]** `poll()` 실행 흐름: *(MUST)*
 
+> **α-W-3 갱신 (§5.4 drift-sync)**: 반환 어휘 `Vec<ResilienceAction>` → `Vec<EngineCommand>`. `react()` 가 dead `mode` 인자 제거(2b OperatingMode 재계산은 `react()` 입력이 아닌 보고/상태용으로만 잔존).
+
 ```
-function poll() -> Vec<ResilienceAction>:
-    all_actions = []
+function poll() -> Vec<EngineCommand>:
+    all_cmds = []
 
     1. try_recv drain -> SystemSignal 수집
     2. 각 signal에 대해 process_signal():
        a. Level 캐시 갱신 (해당 domain)
-       b. OperatingMode 재계산 (from_levels)
-       c. 해당 Strategy.react(signal, mode) -> Vec<ResilienceAction>
-       d. all_actions에 추가
-    3. all_actions 비어 있으면 -> return []
-    4. return resolve_conflicts(all_actions)
+       b. OperatingMode 재계산 (from_levels) [보고/상태용]
+       c. 해당 Strategy.react(signal) -> Vec<EngineCommand>
+       d. all_cmds에 추가
+    3. all_cmds 비어 있으면 -> return []
+    4. return resolve_conflicts(all_cmds)
 ```
 
 **[ENG-ST-052]** Strategy 반응 테이블: *(MUST)*
 
-| Strategy | Level | Actions |
-|----------|-------|---------|
-| Memory | Normal | RestoreDefaults |
-| Memory | Warning | Evict { target_ratio: 0.85 } |
-| Memory | Critical | Evict { target_ratio: 0.50 } |
-| Memory | Emergency | Evict { target_ratio: 0.25 } + RejectNew |
+> **α-W-3 갱신 (§5.4 drift-sync)**: 출력 어휘를 `ResilienceAction`(폐기) → `EngineCommand`(`shared/`, 18-variant, 유일 이산 어휘)로 통일. **Memory strategy 행 전면 제거** — memory 압력은 이산 strategy 가 아니라 graded `Pressure` scalar(0–100)로 흐른다 (`LocalPressureSource` 가 전 센서 magnitude 를 융합, §5.1/§5.4; `MemoryStrategy` 삭제). 따라서 strategy 는 **thermal/energy/compute 3개**만 남으며, 이들은 scalar 로 환원 불가한 *mode* 이산 명령(switch/suspend)만 낸다 (thermal/energy 의 magnitude 도 `Pressure` scalar 에 융합되지만 그건 `PressureSource` 측 관여이고, `react()` 는 mode 출력 전용). `Evict` 행은 graded 경로로 이관되어 strategy 어휘에서 소멸.
+
+| Strategy | Level | EngineCommand |
+|----------|-------|---------------|
 | Thermal | Normal | RestoreDefaults |
-| Thermal | Warning | SwitchBackend { Cpu } |
-| Thermal | Critical | SwitchBackend { Cpu } + Throttle { (1-throttle_ratio)*100 } + LimitTokens { 64 } |
+| Thermal | Warning | SwitchHw { device: "cpu" } |
+| Thermal | Critical | SwitchHw { device: "cpu" } + Throttle { delay_ms: (1-throttle_ratio)*100 } |
 | Thermal | Emergency | Suspend |
 | Compute | Normal | RestoreDefaults |
 | Compute | Warning | (없음 -- 준비만, 전환 안 함) |
-| Compute | Critical | SwitchBackend { recommended } 또는 Throttle { 50 } (이미 해당 backend면) |
-| Compute | Emergency | SwitchBackend { Cpu } + Throttle { 100 } |
+| Compute | Critical | SwitchHw { device: recommended } 또는 Throttle { delay_ms: 50 } (이미 해당 backend면) |
+| Compute | Emergency | SwitchHw { device: "cpu" } + Throttle { delay_ms: 100 } |
 | Energy | Normal | RestoreDefaults |
-| Energy | Warning | SwitchBackend { Cpu } |
-| Energy | Critical | SwitchBackend { Cpu } + LimitTokens { 64 } + Throttle { 30 } |
-| Energy | Emergency | Suspend + RejectNew |
+| Energy | Warning | SwitchHw { device: "cpu" } |
+| Energy | Critical | SwitchHw { device: "cpu" } + Throttle { delay_ms: 30 } |
+| Energy | Emergency | Suspend |
+
+> **superseded (α-W-3, §5.4) — silent 삭제 금지로 명기**:
+> - **Memory strategy 4행 전체** (`Normal→RestoreDefaults`, `Warning→Evict{0.85}`, `Critical→Evict{0.50}`, `Emergency→Evict{0.25}+RejectNew`): graded `Pressure` scalar 경로로 이관 (`LocalPressureSource` → `band()` → `EvictionStage`). `MemoryStrategy` 자체가 소멸하므로 행 제거.
+> - **Thermal Critical 의 `LimitTokens { 64 }`** 및 **Energy Critical 의 `LimitTokens { 64 }`**: `EngineCommand` 에 등가 변종 부재 + production `CommandExecutor`/`ExecutionPlan` 미처리(한 번도 live 배선 안 됨) → **drop**. throttle 의 token-rate 억제 의도는 잔존 `Throttle` 이 흡수.
+> - **Energy Emergency 의 `RejectNew`**: 동일 사유로 **drop**. stop-intent 는 `Suspend` 가 흡수.
+> - **`SwitchBackend { Cpu }` → `SwitchHw { device: "cpu" }`** 매핑: `RecommendedBackend::Cpu`→`"cpu"`, `Gpu`→`"gpu"`, `Any`→switch 생략(구체 GPU backend(opencl/cuda) 해석은 dispatcher/`Hardware` 책임).
 
 **[ENG-ST-053]** ResilienceStrategy trait: *(MUST)*
 
+> **α-W-3 갱신 (§5.4 drift-sync)**: 시그니처에서 dead `mode: OperatingMode` 인자 제거(`react()` 가 `mode` 를 소비한 적 없음), 출력을 `Vec<EngineCommand>` 로 통일. trait 은 front-door 확장점 ① 로 **생존**(manager-less `LocalPolicy` 의 정책 단위, §5.4 / arch §7).
+
 ```
 trait ResilienceStrategy: Send + Sync
-    react(signal: &SystemSignal, mode: OperatingMode) -> Vec<ResilienceAction>
+    react(&mut self, signal: &SystemSignal) -> Vec<EngineCommand>
     name() -> &str
 ```
 
-**[ENG-ST-054]** InferenceContext + execute_action: *(MUST)*
+**[ENG-ST-054]** `EngineCommand` → `LoopControl` 적용: *(MUST)*
 
-ResilienceManager는 `InferenceContext`를 통해 추론 루프 상태에 직접 작용할 수 있다. 단, 현재 `generate.rs`에서는 이 경로를 사용하지 않는다.
+> **α-W-3 갱신 (§5.4 drift-sync)**: `react()` 출력이 `EngineCommand` 로 통일되므로 변환·적용은 `CommandDispatcher`(L4) → `LoopControl`(②control 채널) 단일 거처로 이동(구 `InferenceContext`/`execute_action` 의 ad-hoc 직접 적용 폐기). ①KV/weight·③switch 명령은 `registry.submit(OneShotStage)` 로 간다 (§5.4 A-1 3역할 분리). `LoopControl` 은 ②control 명령(throttle/target_tbt/suspend/resume/restore)만 보유한다.
+
+`LocalPolicy.poll()` 이 반환한 `Vec<EngineCommand>` 는 `CommandDispatcher` 가 채널별로 분배한다. ②control 채널 적용:
 
 ```
-InferenceContext:
-    max_tokens: &mut usize
-    throttle_delay_ms: &mut u64
-    suspended: &mut bool
-    reject_new: &mut bool
+LoopControl (구 InferenceContext ② 잔여):
+    throttle_delay_ms: u64
+    target_tbt_ms: u64
+    suspended: bool
 
-function execute_action(action: &ResilienceAction, ctx: &mut InferenceContext):
-    Evict          -> log (CacheManager 연동은 Phase 3a)
-    SwitchBackend  -> log (hybrid 모드 처리)
-    LimitTokens    -> ctx.max_tokens = min(current, max_tokens)
-    Throttle       -> ctx.throttle_delay_ms = delay_ms
-    Suspend        -> ctx.suspended = true
-    RejectNew      -> ctx.reject_new = true
-    RestoreDefaults -> ctx.throttle_delay_ms = 0, ctx.reject_new = false
+function apply(cmd: &EngineCommand, lc: &mut LoopControl):
+    Throttle { delay_ms } -> lc.throttle_delay_ms = delay_ms
+    SetTargetTbt { target_ms } -> lc.target_tbt_ms = target_ms
+    Suspend                -> lc.suspended = true
+    Resume                 -> lc.suspended = false
+    RestoreDefaults        -> lc.throttle_delay_ms = 0, lc.target_tbt_ms = 0
+    SwitchHw / Prepare*    -> ③switch 채널 (registry/Hardware), LoopControl 무관
+    Kv* / SwapWeights / LayerSkip / SetPartitionRatio / SetPrefillPolicy -> ①KV/weight 채널 (OneShot Stage)
 ```
+
+> **superseded (α-W-3, §5.4)**: 구 `InferenceContext` 의 `max_tokens: &mut usize` / `reject_new: &mut bool` 필드와 `execute_action` 의 `LimitTokens`/`RejectNew`/`Evict`/`SwitchBackend` 분기는 **폐기**. `LimitTokens`/`RejectNew` 는 `EngineCommand` 등가 부재로 어휘 자체가 소멸(ENG-ST-052 참조), `Evict` 는 graded `Pressure` 경로로, `SwitchBackend` 는 `SwitchHw` 로 이관. `&mut` borrow 기반 직접 작용 모델은 `LoopControl` 값-기반 적용으로 대체.
 
 **[ENG-ST-055]** ResilienceManager와 CommandExecutor의 관계:
 
@@ -379,84 +391,88 @@ function execute_action(action: &ResilienceAction, ctx: &mut InferenceContext):
 
 ### 3.6 resolve_conflicts() Priority Rules [ENG-ST-060 ~ ENG-ST-065]
 
-**[ENG-ST-060]** 충돌 해소 규칙 -- 7규칙 전수 열거: *(MUST)*
+**[ENG-ST-060]** 충돌 해소 규칙 -- 4규칙 전수 열거: *(MUST)*
+
+> **α-W-3 갱신 (§5.4 drift-sync)**: `resolve_conflicts` 입력·출력 어휘 `Vec<ResilienceAction>` → `Vec<EngineCommand>`. strategy 어휘 축소(Memory·LimitTokens·RejectNew 소멸, SwitchBackend→SwitchHw)로 규칙 수 **7→4**. 어휘에서 사라진 명령에 대응하던 R3(Evict)·R5(LimitTokens)·R7(RejectNew)는 폐기(아래 superseded). manager-less `LocalPolicy` 가 thermal/energy/compute 3 strategy 출력을 cross-domain 해소한다(§5.4).
 
 | 규칙 | 우선순위 | 해소 방식 |
 |------|---------|----------|
-| R1. Suspend overrides all | 최고 | Suspend 존재 시 다른 모든 action 폐기. `[Suspend]`만 반환 |
-| R2. RestoreDefaults suppressed | 최저 | 다른 제약(Evict/Throttle/SwitchBackend/LimitTokens/RejectNew)이 하나라도 있으면 RestoreDefaults 무시 |
-| R3. Evict: most aggressive | -- | 복수 Evict 중 `min(target_ratio)` 선택 |
-| R4. SwitchBackend: CPU wins | -- | 복수 SwitchBackend 중 Cpu가 하나라도 있으면 Cpu. 아니면 마지막 값 |
-| R5. LimitTokens: smallest | -- | 복수 LimitTokens 중 `min(max_tokens)` 선택 |
-| R6. Throttle: largest delay | -- | 복수 Throttle 중 `max(delay_ms)` 선택 |
-| R7. RejectNew: any | -- | 하나라도 있으면 포함 |
+| R1. Suspend overrides all | 최고 | `Suspend` 존재 시 다른 모든 명령 폐기. `[Suspend]`만 반환 |
+| R2. RestoreDefaults suppressed | 최저 | 다른 제약(`SwitchHw`/`Throttle`/`SetTargetTbt` 등)이 하나라도 있으면 `RestoreDefaults` 무시 |
+| R3. SwitchHw: "cpu" precedence | -- | 복수 `SwitchHw` 중 `device == "cpu"` 가 하나라도 있으면 `"cpu"`. 아니면 마지막 값 |
+| R4. Throttle: largest delay | -- | 복수 `Throttle` 중 `max(delay_ms)` 선택 |
+
+> 그 외 `EngineCommand` 변종(`SetTargetTbt`/`Resume`/`PrepareComputeUnit`/`Kv*`/`SwapWeights`/`LayerSkip`/`SetPartitionRatio`/`SetPrefillPolicy`/`RequestQcf`)은 **pass-through** — strategy 가 생산하지 않거나 충돌 의미가 없어 그대로 통과한다. (strategy 출력은 R1~R4 가 다루는 `Suspend`/`SwitchHw`/`Throttle`/`RestoreDefaults` 에 한정되지만, `resolve_conflicts` 는 임의 `EngineCommand` 벡터에 대해 vacuous-agnostic 하게 정의된다 — 해당 변종이 입력에 없으면 그 규칙은 no-op.)
+
+> **superseded (α-W-3, §5.4) — silent 삭제 금지로 명기**:
+> - **구 R3 (Evict: most aggressive, `min(target_ratio)`)**: `Evict` 가 strategy 어휘에서 소멸(graded `Pressure` 경로 이관) → 폐기. graded eviction 강도 결정은 `Pressure` scalar 의 `band()` 가 담당하므로 충돌 해소 불필요.
+> - **구 R5 (LimitTokens: smallest, `min(max_tokens)`)**: `LimitTokens` 어휘 소멸(EngineCommand 등가 부재) → 폐기.
+> - **구 R7 (RejectNew: any)**: `RejectNew` 어휘 소멸 → 폐기.
+> - **구 R4 (SwitchBackend: CPU wins)** → 현 R3 (`SwitchHw "cpu" precedence`)로 재명명·재정의(`RecommendedBackend::Cpu` enum 비교 → `device == "cpu"` 문자열 비교).
+> - **구 R6 (Throttle: largest delay)** → 현 R4 로 번호만 이동(의미 불변).
 
 **[ENG-ST-061]** 해소 알고리즘 의사코드: *(MUST)*
 
+> **α-W-3 갱신 (§5.4 drift-sync)**: `EngineCommand` 어휘로 갱신. evict/tokens/reject 누산 제거(어휘 소멸), switch_device 는 enum 폴드 → `device == "cpu"` 문자열 폴드, pass-through 명령(R1~R4 비대상)은 원순서 보존하여 결과에 포함.
+
 ```
-function resolve_conflicts(actions: Vec<ResilienceAction>) -> Vec<ResilienceAction>:
-    if actions is empty: return []
+function resolve_conflicts(cmds: Vec<EngineCommand>) -> Vec<EngineCommand>:
+    if cmds is empty: return []
 
     // Single-pass scan
-    min_evict_ratio = +INF
     max_delay = 0
-    min_tokens = MAX
-    target_backend = None
+    target_device = None        // String, "cpu" precedence fold
     has_suspend = false
-    has_reject = false
     has_restore = false
+    passthrough = []            // R1~R4 비대상 명령 (원순서 보존)
 
-    for action in actions:
-        match action:
-            Evict { ratio }        -> min_evict_ratio = min(min_evict_ratio, ratio)
-            SwitchBackend { to }   -> target_backend = fold (CPU always wins)
-            LimitTokens { tokens } -> min_tokens = min(min_tokens, tokens)
-            Throttle { delay }     -> max_delay = max(max_delay, delay)
-            Suspend                -> has_suspend = true
-            RejectNew              -> has_reject = true
-            RestoreDefaults        -> has_restore = true
+    for cmd in cmds:
+        match cmd:
+            SwitchHw { device }  -> target_device = fold ("cpu" always wins, else last)
+            Throttle { delay }   -> max_delay = max(max_delay, delay)
+            Suspend              -> has_suspend = true
+            RestoreDefaults      -> has_restore = true
+            _                    -> passthrough.push(cmd)   // SetTargetTbt/Resume/Kv*/... pass-through
 
     // R1: Suspend overrides all
     if has_suspend: return [Suspend]
 
-    // R2: RestoreDefaults only when no other constraints
-    if has_restore AND no other constraints:
-        return [RestoreDefaults]
-
     // Build result from non-default values
     result = []
-    if min_evict_ratio < +INF:  result.push(Evict { min_evict_ratio })
-    if target_backend is Some:  result.push(SwitchBackend { target_backend })
-    if min_tokens < MAX:        result.push(LimitTokens { min_tokens })
-    if max_delay > 0:           result.push(Throttle { max_delay })
-    if has_reject:              result.push(RejectNew)
+    if target_device is Some:   result.push(SwitchHw { device: target_device })
+    if max_delay > 0:           result.push(Throttle { delay_ms: max_delay })
+    result.extend(passthrough)
+
+    // R2: RestoreDefaults only when no other constraints
+    if has_restore AND result is empty:
+        return [RestoreDefaults]
 
     return result
 ```
 
-**[ENG-ST-062]** 해소 예시:
+**[ENG-ST-062]** 해소 예시: *(α-W-3 갱신, EngineCommand 어휘)*
 
-| 시나리오 | 입력 Actions | 해소 결과 |
-|---------|-------------|----------|
-| Memory Warning + Thermal Warning | [Evict(0.85), SwitchBackend(Cpu)] | [Evict(0.85), SwitchBackend(Cpu)] |
-| Memory Critical + Thermal Critical | [Evict(0.50), SwitchBackend(Cpu)+Throttle(50)+LimitTokens(64)] | [Evict(0.50), SwitchBackend(Cpu), LimitTokens(64), Throttle(50)] |
-| Memory Warning + Energy Emergency | [Evict(0.85), Suspend+RejectNew] | [Suspend] (R1) |
-| All Normal: RestoreDefaults x4 | [Restore, Restore, Restore, Restore] | [RestoreDefaults] |
-| Memory Warning + Thermal Normal | [Evict(0.85), RestoreDefaults] | [Evict(0.85)] (R2: Restore 억제) |
+| 시나리오 | 입력 EngineCommand | 해소 결과 |
+|---------|-------------------|----------|
+| Thermal Warning + Energy Warning | [SwitchHw("cpu"), SwitchHw("cpu")] | [SwitchHw("cpu")] (R3) |
+| Thermal Critical + Energy Critical | [SwitchHw("cpu"), Throttle(100), SwitchHw("cpu"), Throttle(30)] | [SwitchHw("cpu"), Throttle(100)] (R3 cpu, R4 max) |
+| Thermal Emergency + Energy Warning | [Suspend, SwitchHw("cpu")] | [Suspend] (R1) |
+| Compute Critical(gpu) + Thermal Warning | [SwitchHw("gpu"), SwitchHw("cpu")] | [SwitchHw("cpu")] (R3: cpu precedence) |
+| All Normal: RestoreDefaults x3 | [Restore, Restore, Restore] | [RestoreDefaults] (R2: result empty) |
+| Thermal Warning + Compute Normal | [SwitchHw("cpu"), RestoreDefaults] | [SwitchHw("cpu")] (R2: Restore 억제) |
 
-**[ENG-ST-063]** ResilienceAction 7종: *(MUST)*
+**[ENG-ST-063]** Strategy 출력 EngineCommand 변종 (이산 mode 채널): *(MUST)*
 
-| Action | 설명 | DbusTransport 경로의 EngineCommand 매핑 |
-|--------|------|--------------------------------------|
-| Evict { target_ratio } | KV 캐시 eviction | KvEvictH2o / KvEvictSliding |
-| SwitchBackend { to } | 백엔드 전환 | SwitchHw { device } |
-| LimitTokens { max_tokens } | 최대 생성 토큰 제한 | (`execute_action`에서 직접 적용) |
-| Throttle { delay_ms } | 토큰 간 지연 | Throttle { delay_ms } |
-| Suspend | 추론 중단 | Suspend |
-| RejectNew | 새 추론 요청 거부 | (`execute_action`에서 직접 적용) |
-| RestoreDefaults | 모든 제약 해제 | RestoreDefaults |
+> **α-W-3 갱신 (§5.4 drift-sync)**: 구 "ResilienceAction 7종" 표 → strategy 가 실제 생산하는 `EngineCommand` 부분집합으로 대체. `ResilienceAction` 타입 자체가 삭제되므로(§5.4) "Action → EngineCommand 매핑" 칼럼은 무의미해져 제거. thermal/energy/compute strategy 의 `react()` 는 아래 변종만 낸다 (graded magnitude 는 `Pressure` scalar 가, KV/weight 명령은 manager IPC 또는 OneShot Stage 가 담당).
 
-> ResilienceAction은 Strategy 경로 내부 타입이다. DbusTransport는 이 Action을 거치지 않고 `signal_to_manager_message()`에서 직접 SystemSignal을 EngineCommand로 변환한다. ResilienceManager + Strategy + `resolve_conflicts()`는 독립 실행 시 (`generate.rs` 미사용) `InferenceContext`를 통해 직접 적용될 수 있다.
+| EngineCommand | 설명 | 어느 strategy 가 생산 |
+|--------------|------|--------------------|
+| SwitchHw { device } | 백엔드 전환 ("cpu"/"gpu") | Thermal/Energy/Compute |
+| Throttle { delay_ms } | 토큰 간 지연 | Thermal/Energy/Compute |
+| Suspend | 추론 중단 | Thermal(Emergency)/Energy(Emergency) |
+| RestoreDefaults | 모든 제약 해제 | 모든 strategy(Normal) |
+
+> **superseded (α-W-3, §5.4)**: 구 표의 `Evict`/`LimitTokens`/`RejectNew` 행 폐기 — `Evict` 는 graded `Pressure` 경로(strategy 비생산), `LimitTokens`/`RejectNew` 는 `EngineCommand` 등가 부재로 어휘 소멸. `ResilienceAction` 은 production 소비자 0(test-only)였으며 삭제됨; manager-full 경로(`signal_to_manager_message()`)는 이미 `SystemSignal` → `EngineCommand` 직접 변환을 사용해 왔고 본 변경의 영향을 받지 않는다.
 
 ### 3.7 KVSnapshot Reporting [ENG-ST-070]
 
@@ -537,20 +553,22 @@ Directive 2 (seq_id=11): [KvEvictSliding { keep_ratio: 0.5 }, Throttle { delay_m
 
 ### 6.3 Strategy 경로: Memory Critical + Thermal Warning
 
+> **α-W-3 갱신 (§5.4 drift-sync)**: Memory 압력은 strategy 가 아닌 graded `Pressure` scalar 경로로 분리됐다. 따라서 이 시나리오는 두 경로의 **병렬 흐름**으로 재기술된다 — memory magnitude 는 `LocalPressureSource` 가 `Pressure(0–100)` 으로 융합해 `band()`→`EvictionStage`(graded eviction)를 구동하고, thermal 의 *mode* 출력만 `LocalPolicy`(strategy) → `EngineCommand` 로 흐른다. 두 경로는 같은 thermal 센서를 두 목적(입력 scalar ⊕ 출력 이산명령)으로 읽는다.
+
 ```
-ResilienceManager.poll():
-  signal 1: MemoryPressure { level: Critical }
-    current_levels.memory = Critical
-    mode = from_levels(Critical, Normal, Normal, Normal) = Minimal
-    MemoryStrategy.react() -> [Evict { 0.50 }]
+[연속 채널] LocalPressureSource.poll():
+  memory magnitude (Critical급) ⊕ thermal magnitude (Warning급) -> Pressure ≈ <fused>
+    -> StepInfo -> EvictionStage.band() -> graded eviction (강도 = Pressure 함수)
+  (이산 EngineCommand 미생산)
 
-  signal 2: ThermalAlert { level: Warning }
+[이산 채널] LocalPolicy.poll():
+  signal: ThermalAlert { level: Warning }
     current_levels.thermal = Warning
-    mode = from_levels(Critical, Normal, Warning, Normal) = Minimal
-    ThermalStrategy.react() -> [SwitchBackend { Cpu }]
+    ThermalStrategy.react(signal) -> [SwitchHw { device: "cpu" }]
+  (MemoryPressure 는 strategy 비대상 — graded 경로가 흡수)
 
-  all_actions = [Evict(0.50), SwitchBackend(Cpu)]
-  resolve_conflicts() -> [Evict(0.50), SwitchBackend(Cpu)]
+  all_cmds = [SwitchHw("cpu")]
+  resolve_conflicts() -> [SwitchHw("cpu")]   -- CommandDispatcher -> ③switch 채널
 ```
 
 ### 6.4 D-Bus Emergency 자율 전이

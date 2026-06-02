@@ -6,9 +6,8 @@
 //! INV-075: Resume => compute/memory_level Normal, throttle 0
 //! INV-076: RestoreDefaults => active_actions cleared, throttle 0, levels Normal
 
-use llm_rs2::resilience::ResilienceAction;
 use llm_rs2::resilience::strategy::resolve_conflicts;
-use llm_shared::{EngineCommand, EngineState, RecommendedBackend, ResourceLevel};
+use llm_shared::{EngineCommand, EngineState, ResourceLevel};
 
 use super::helpers::{empty_snap, make_executor, send_directive};
 
@@ -19,55 +18,52 @@ use super::helpers::{empty_snap, make_executor, send_directive};
 #[test]
 fn test_inv_072_suspend_overrides_all() {
     // Suspend with multiple other actions should return only [Suspend].
-    let actions = vec![
-        ResilienceAction::Evict { target_ratio: 0.5 },
-        ResilienceAction::SwitchBackend {
-            to: RecommendedBackend::Cpu,
+    let commands = vec![
+        EngineCommand::KvEvictH2o { keep_ratio: 0.5 },
+        EngineCommand::SwitchHw {
+            device: "cpu".to_string(),
         },
-        ResilienceAction::LimitTokens { max_tokens: 64 },
-        ResilienceAction::Throttle { delay_ms: 100 },
-        ResilienceAction::RejectNew,
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::Suspend,
+        EngineCommand::Throttle { delay_ms: 100 },
+        EngineCommand::RestoreDefaults,
+        EngineCommand::Suspend,
     ];
 
-    let result = resolve_conflicts(actions);
+    let result = resolve_conflicts(commands);
     assert_eq!(result.len(), 1, "Suspend must override all other actions");
     assert!(
-        matches!(result[0], ResilienceAction::Suspend),
+        matches!(result[0], EngineCommand::Suspend),
         "Only Suspend should remain"
     );
 }
 
 #[test]
 fn test_inv_072_suspend_alone() {
-    let actions = vec![ResilienceAction::Suspend];
-    let result = resolve_conflicts(actions);
+    let commands = vec![EngineCommand::Suspend];
+    let result = resolve_conflicts(commands);
     assert_eq!(result.len(), 1);
-    assert!(matches!(result[0], ResilienceAction::Suspend));
+    assert!(matches!(result[0], EngineCommand::Suspend));
 }
 
 #[test]
 fn test_inv_072_suspend_with_evict() {
-    let actions = vec![
-        ResilienceAction::Evict { target_ratio: 0.25 },
-        ResilienceAction::Suspend,
+    let commands = vec![
+        EngineCommand::KvEvictH2o { keep_ratio: 0.25 },
+        EngineCommand::Suspend,
     ];
-    let result = resolve_conflicts(actions);
+    let result = resolve_conflicts(commands);
     assert_eq!(result.len(), 1);
-    assert!(matches!(result[0], ResilienceAction::Suspend));
+    assert!(matches!(result[0], EngineCommand::Suspend));
 }
 
 #[test]
-fn test_inv_072_suspend_with_reject_and_throttle() {
-    let actions = vec![
-        ResilienceAction::RejectNew,
-        ResilienceAction::Throttle { delay_ms: 50 },
-        ResilienceAction::Suspend,
+fn test_inv_072_suspend_with_throttle() {
+    let commands = vec![
+        EngineCommand::Throttle { delay_ms: 50 },
+        EngineCommand::Suspend,
     ];
-    let result = resolve_conflicts(actions);
+    let result = resolve_conflicts(commands);
     assert_eq!(result.len(), 1);
-    assert!(matches!(result[0], ResilienceAction::Suspend));
+    assert!(matches!(result[0], EngineCommand::Suspend));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -76,96 +72,67 @@ fn test_inv_072_suspend_with_reject_and_throttle() {
 
 #[test]
 fn test_inv_073_restore_defaults_alone() {
-    let actions = vec![ResilienceAction::RestoreDefaults];
-    let result = resolve_conflicts(actions);
+    let commands = vec![EngineCommand::RestoreDefaults];
+    let result = resolve_conflicts(commands);
     assert_eq!(result.len(), 1);
-    assert!(matches!(result[0], ResilienceAction::RestoreDefaults));
+    assert!(matches!(result[0], EngineCommand::RestoreDefaults));
 }
 
 #[test]
 fn test_inv_073_restore_defaults_multiple() {
-    // Multiple RestoreDefaults (e.g., from all 4 strategies returning Normal)
-    let actions = vec![
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::RestoreDefaults,
+    // Multiple RestoreDefaults (e.g., from all 3 strategies returning Normal)
+    let commands = vec![
+        EngineCommand::RestoreDefaults,
+        EngineCommand::RestoreDefaults,
+        EngineCommand::RestoreDefaults,
     ];
-    let result = resolve_conflicts(actions);
+    let result = resolve_conflicts(commands);
     assert_eq!(result.len(), 1);
-    assert!(matches!(result[0], ResilienceAction::RestoreDefaults));
+    assert!(matches!(result[0], EngineCommand::RestoreDefaults));
 }
 
 #[test]
 fn test_inv_073_restore_suppressed_by_evict() {
-    let actions = vec![
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::Evict { target_ratio: 0.85 },
+    let commands = vec![
+        EngineCommand::RestoreDefaults,
+        EngineCommand::KvEvictH2o { keep_ratio: 0.85 },
     ];
-    let result = resolve_conflicts(actions);
-    // RestoreDefaults should be suppressed; only Evict should remain
+    let result = resolve_conflicts(commands);
+    // RestoreDefaults should be suppressed; KvEvictH2o passes through
     assert_eq!(result.len(), 1);
     assert!(
-        matches!(result[0], ResilienceAction::Evict { .. }),
-        "RestoreDefaults must be suppressed when Evict is present"
+        matches!(result[0], EngineCommand::KvEvictH2o { .. }),
+        "RestoreDefaults must be suppressed when KvEvictH2o is present"
     );
 }
 
 #[test]
 fn test_inv_073_restore_suppressed_by_throttle() {
-    let actions = vec![
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::Throttle { delay_ms: 30 },
+    let commands = vec![
+        EngineCommand::RestoreDefaults,
+        EngineCommand::Throttle { delay_ms: 30 },
     ];
-    let result = resolve_conflicts(actions);
+    let result = resolve_conflicts(commands);
     assert_eq!(result.len(), 1);
     assert!(
-        matches!(result[0], ResilienceAction::Throttle { .. }),
+        matches!(result[0], EngineCommand::Throttle { .. }),
         "RestoreDefaults must be suppressed when Throttle is present"
     );
 }
 
 #[test]
-fn test_inv_073_restore_suppressed_by_switch_backend() {
-    let actions = vec![
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::SwitchBackend {
-            to: RecommendedBackend::Cpu,
+fn test_inv_073_restore_suppressed_by_switch_hw() {
+    let commands = vec![
+        EngineCommand::RestoreDefaults,
+        EngineCommand::SwitchHw {
+            device: "cpu".to_string(),
         },
     ];
-    let result = resolve_conflicts(actions);
+    let result = resolve_conflicts(commands);
     assert_eq!(result.len(), 1);
     assert!(
-        matches!(result[0], ResilienceAction::SwitchBackend { .. }),
-        "RestoreDefaults must be suppressed when SwitchBackend is present"
-    );
-}
-
-#[test]
-fn test_inv_073_restore_suppressed_by_limit_tokens() {
-    let actions = vec![
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::LimitTokens { max_tokens: 64 },
-    ];
-    let result = resolve_conflicts(actions);
-    assert_eq!(result.len(), 1);
-    assert!(
-        matches!(result[0], ResilienceAction::LimitTokens { .. }),
-        "RestoreDefaults must be suppressed when LimitTokens is present"
-    );
-}
-
-#[test]
-fn test_inv_073_restore_suppressed_by_reject_new() {
-    let actions = vec![
-        ResilienceAction::RestoreDefaults,
-        ResilienceAction::RejectNew,
-    ];
-    let result = resolve_conflicts(actions);
-    assert_eq!(result.len(), 1);
-    assert!(
-        matches!(result[0], ResilienceAction::RejectNew),
-        "RestoreDefaults must be suppressed when RejectNew is present"
+        matches!(result[0], EngineCommand::SwitchHw { .. }),
+        "RestoreDefaults must be suppressed when SwitchHw is present"
     );
 }
 

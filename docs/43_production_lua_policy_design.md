@@ -102,6 +102,8 @@ kv_merge_d2o, kv_quant_dynamic, set_partition_ratio
 
 ## 2. 갭 분석
 
+> ⚠️ **α-W-3 STALE 경고 (2026-06-02)**: 본 §2 (및 후속 절)에서 "Rust 전략 참고 기준"으로 인용하는 `MemoryStrategy::react()` 의 `[Evict{0.25}, RejectNew]` 매핑은 `arch/pipeline_stage_design_v2.md` §5.4 결정으로 폐기 예정이다. `MemoryStrategy` 삭제(memory → graded `Pressure` scalar), `RejectNew`/`LimitTokens` 어휘 소멸. canonical 은 `spec/31-engine-state.md` §3.5/§3.6 (α-W-3 갱신본). 따라서 본 문서가 "Rust 전략 대비 Lua 표현력 부족"의 비교 기준으로 삼는 매핑은 재검토 대상 — Lua 정책의 cross-domain 해소 책임(manager PolicyEngine)은 유지되나, 비교 baseline 인 engine 측 `MemoryStrategy`/`ResilienceAction` 은 더 이상 존재하지 않는다.
+
 ### 2.1 필수 보완 사항 (P0 — production 운영 불가 사유)
 
 #### P0-1. 단일 action 반환으로 인한 복합 대응 불가

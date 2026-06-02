@@ -1,10 +1,9 @@
 use std::sync::mpsc;
 
-use super::signal::{Level, SystemSignal};
+use super::signal::{EngineCommand, Level, SystemSignal};
 use super::state::OperatingMode;
 use super::strategy::{
-    ComputeStrategy, EnergyStrategy, MemoryStrategy, ResilienceAction, ResilienceStrategy,
-    ThermalStrategy, resolve_conflicts,
+    ComputeStrategy, EnergyStrategy, ResilienceStrategy, ThermalStrategy, resolve_conflicts,
 };
 
 /// Cache of latest levels for each signal type.
@@ -26,9 +25,11 @@ impl SignalLevels {
     }
 }
 
-/// Strategy implementations per signal type.
+/// Strategy implementations per signal type (discrete-command 산출, ENG-ST-052).
+///
+/// memory 압력은 strategy 가 아니라 graded `Pressure` scalar(§5.1/§5.4)로 흐르므로 여기 없다
+/// (구 `MemoryStrategy` 폐기). thermal/energy/compute 만 *mode* 이산 명령을 낸다.
 struct Strategies {
-    memory: Box<dyn ResilienceStrategy>,
     compute: Box<dyn ResilienceStrategy>,
     thermal: Box<dyn ResilienceStrategy>,
     energy: Box<dyn ResilienceStrategy>,
@@ -37,7 +38,6 @@ struct Strategies {
 impl Strategies {
     fn new() -> Self {
         Self {
-            memory: Box::new(MemoryStrategy::new()),
             compute: Box::new(ComputeStrategy::new()),
             thermal: Box::new(ThermalStrategy::new()),
             energy: Box::new(EnergyStrategy::new()),
@@ -45,9 +45,11 @@ impl Strategies {
     }
 }
 
-/// Central resilience orchestrator.
-/// Receives signals via mpsc channel, delegates to strategies,
-/// resolves conflicts, and returns actions for the inference loop.
+/// Central resilience orchestrator (manager-less 자율 정책의 원형 — `LocalPolicy` `CommandSource`
+/// 로 발전 예정, ENG-ST-055).
+///
+/// Receives signals via mpsc channel, delegates to strategies, resolves conflicts,
+/// and returns discrete `EngineCommand`s for the inference loop.
 pub struct ResilienceManager {
     rx: mpsc::Receiver<SystemSignal>,
     mode: OperatingMode,
@@ -66,22 +68,20 @@ impl ResilienceManager {
         }
     }
 
-    /// Non-blocking poll: drain all pending signals from channel,
-    /// process them through strategies, resolve conflicts,
-    /// and return the final list of actions.
-    /// Called once per token in the inference loop.
-    pub fn poll(&mut self) -> Vec<ResilienceAction> {
-        let mut all_actions = Vec::new();
+    /// Non-blocking poll: drain all pending signals, process through strategies, resolve
+    /// conflicts, and return the final discrete commands. Called once per token (ENG-ST-051).
+    pub fn poll(&mut self) -> Vec<EngineCommand> {
+        let mut all_commands = Vec::new();
 
         while let Ok(signal) = self.rx.try_recv() {
-            self.process_signal(&signal, &mut all_actions);
+            self.process_signal(&signal, &mut all_commands);
         }
 
-        if all_actions.is_empty() {
+        if all_commands.is_empty() {
             return vec![];
         }
 
-        resolve_conflicts(all_actions)
+        resolve_conflicts(all_commands)
     }
 
     /// Current operating mode.
@@ -89,24 +89,16 @@ impl ResilienceManager {
         self.mode
     }
 
-    fn process_signal(&mut self, signal: &SystemSignal, actions: &mut Vec<ResilienceAction>) {
-        // 1. Update level cache
+    fn process_signal(&mut self, signal: &SystemSignal, commands: &mut Vec<EngineCommand>) {
+        // 1. Update level cache (memory level 도 mode 계산에 기여하므로 추적 유지).
         match signal {
-            SystemSignal::MemoryPressure { level, .. } => {
-                self.current_levels.memory = *level;
-            }
-            SystemSignal::ComputeGuidance { level, .. } => {
-                self.current_levels.compute = *level;
-            }
-            SystemSignal::ThermalAlert { level, .. } => {
-                self.current_levels.thermal = *level;
-            }
-            SystemSignal::EnergyConstraint { level, .. } => {
-                self.current_levels.energy = *level;
-            }
+            SystemSignal::MemoryPressure { level, .. } => self.current_levels.memory = *level,
+            SystemSignal::ComputeGuidance { level, .. } => self.current_levels.compute = *level,
+            SystemSignal::ThermalAlert { level, .. } => self.current_levels.thermal = *level,
+            SystemSignal::EnergyConstraint { level, .. } => self.current_levels.energy = *level,
         }
 
-        // 2. Recalculate operating mode
+        // 2. Recalculate operating mode.
         self.mode = OperatingMode::from_levels(
             self.current_levels.memory,
             self.current_levels.compute,
@@ -114,60 +106,15 @@ impl ResilienceManager {
             self.current_levels.energy,
         );
 
-        // 3. Delegate to corresponding strategy
-        let strategy_actions = match signal {
-            SystemSignal::MemoryPressure { .. } => self.strategies.memory.react(signal, self.mode),
-            SystemSignal::ComputeGuidance { .. } => {
-                self.strategies.compute.react(signal, self.mode)
-            }
-            SystemSignal::ThermalAlert { .. } => self.strategies.thermal.react(signal, self.mode),
-            SystemSignal::EnergyConstraint { .. } => {
-                self.strategies.energy.react(signal, self.mode)
-            }
+        // 3. Delegate to strategy. memory 는 graded(§5.4) → discrete 명령 없음.
+        let strategy_commands = match signal {
+            SystemSignal::MemoryPressure { .. } => vec![],
+            SystemSignal::ComputeGuidance { .. } => self.strategies.compute.react(signal),
+            SystemSignal::ThermalAlert { .. } => self.strategies.thermal.react(signal),
+            SystemSignal::EnergyConstraint { .. } => self.strategies.energy.react(signal),
         };
 
-        actions.extend(strategy_actions);
-    }
-}
-
-/// Mutable inference loop state passed to action executor.
-pub struct InferenceContext<'a> {
-    pub max_tokens: &'a mut usize,
-    pub throttle_delay_ms: &'a mut u64,
-    pub suspended: &'a mut bool,
-    pub reject_new: &'a mut bool,
-}
-
-/// Execute a single resilience action against inference loop state.
-pub fn execute_action(action: &ResilienceAction, ctx: &mut InferenceContext) {
-    match action {
-        ResilienceAction::Evict { target_ratio } => {
-            // Phase 3a: integrate with CacheManager
-            log::info!(
-                "[Resilience] Evict requested: target_ratio={}",
-                target_ratio
-            );
-        }
-        ResilienceAction::SwitchBackend { to } => {
-            // Handled by generate binary via ExecutionPlan.switch_device
-            log::info!("[Resilience] Backend switch requested: {:?}", to);
-        }
-        ResilienceAction::LimitTokens { max_tokens } => {
-            *ctx.max_tokens = (*ctx.max_tokens).min(*max_tokens);
-        }
-        ResilienceAction::Throttle { delay_ms } => {
-            *ctx.throttle_delay_ms = *delay_ms;
-        }
-        ResilienceAction::Suspend => {
-            *ctx.suspended = true;
-        }
-        ResilienceAction::RejectNew => {
-            *ctx.reject_new = true;
-        }
-        ResilienceAction::RestoreDefaults => {
-            *ctx.throttle_delay_ms = 0;
-            *ctx.reject_new = false;
-        }
+        commands.extend(strategy_commands);
     }
 }
 
@@ -184,16 +131,15 @@ mod tests {
     fn test_manager_poll_returns_empty_when_no_signals() {
         let (_, rx) = mpsc::channel();
         let mut mgr = ResilienceManager::new(rx);
-        let actions = mgr.poll();
-        assert!(actions.is_empty());
+        assert!(mgr.poll().is_empty());
         assert_eq!(mgr.mode(), OperatingMode::Normal);
     }
 
     #[test]
-    fn test_manager_processes_memory_signal() {
+    fn test_manager_memory_signal_is_graded_only() {
+        // memory 압력은 graded(§5.4) → discrete 명령 없음(구 MemoryStrategy Evict 폐기). 단 mode 기여.
         let (tx, rx) = mpsc::channel();
         let mut mgr = ResilienceManager::new(rx);
-
         send_signal(
             &tx,
             SystemSignal::MemoryPressure {
@@ -203,23 +149,15 @@ mod tests {
                 reclaim_target_bytes: 100 * 1024 * 1024,
             },
         );
-
-        let actions = mgr.poll();
-        assert!(!actions.is_empty());
+        assert!(mgr.poll().is_empty());
         assert_eq!(mgr.mode(), OperatingMode::Minimal);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, ResilienceAction::Evict { .. }))
-        );
     }
 
     #[test]
     fn test_manager_handles_multiple_signals() {
         let (tx, rx) = mpsc::channel();
         let mut mgr = ResilienceManager::new(rx);
-
-        // Send memory warning + thermal critical simultaneously
+        // memory warning(graded, 명령 0) + thermal critical(discrete) 동시
         send_signal(
             &tx,
             SystemSignal::MemoryPressure {
@@ -238,11 +176,8 @@ mod tests {
                 throttle_ratio: 0.5,
             },
         );
-
-        let actions = mgr.poll();
-        // Should have conflict-resolved actions from both strategies
-        assert!(!actions.is_empty());
-        // Mode should be Minimal (Critical > Warning)
+        let commands = mgr.poll();
+        assert!(!commands.is_empty());
         assert_eq!(mgr.mode(), OperatingMode::Minimal);
     }
 
@@ -252,7 +187,6 @@ mod tests {
         let mut mgr = ResilienceManager::new(rx);
         assert_eq!(mgr.mode(), OperatingMode::Normal);
 
-        // Normal → Degraded
         send_signal(
             &tx,
             SystemSignal::MemoryPressure {
@@ -265,7 +199,6 @@ mod tests {
         mgr.poll();
         assert_eq!(mgr.mode(), OperatingMode::Degraded);
 
-        // Degraded → Minimal
         send_signal(
             &tx,
             SystemSignal::ThermalAlert {
@@ -278,7 +211,6 @@ mod tests {
         mgr.poll();
         assert_eq!(mgr.mode(), OperatingMode::Minimal);
 
-        // Minimal → Suspended
         send_signal(
             &tx,
             SystemSignal::EnergyConstraint {
@@ -290,7 +222,6 @@ mod tests {
         mgr.poll();
         assert_eq!(mgr.mode(), OperatingMode::Suspended);
 
-        // Suspended → Normal (all signals recover)
         send_signal(
             &tx,
             SystemSignal::MemoryPressure {
@@ -325,8 +256,6 @@ mod tests {
     fn test_manager_survives_channel_disconnect() {
         let (tx, rx) = mpsc::channel();
         let mut mgr = ResilienceManager::new(rx);
-
-        // Send one signal, then drop sender
         send_signal(
             &tx,
             SystemSignal::MemoryPressure {
@@ -338,100 +267,12 @@ mod tests {
         );
         drop(tx);
 
-        // First poll processes the buffered signal
-        let actions = mgr.poll();
-        assert!(!actions.is_empty());
+        // memory → 명령 0, mode Degraded.
+        assert!(mgr.poll().is_empty());
         assert_eq!(mgr.mode(), OperatingMode::Degraded);
 
-        // Second poll: channel disconnected, no panic, state preserved
-        let actions = mgr.poll();
-        assert!(actions.is_empty());
+        // channel disconnected: no panic, state preserved.
+        assert!(mgr.poll().is_empty());
         assert_eq!(mgr.mode(), OperatingMode::Degraded);
-    }
-
-    #[test]
-    fn test_execute_suspend_sets_flag() {
-        let mut max_tokens = 128;
-        let mut throttle_delay_ms = 0u64;
-        let mut suspended = false;
-        let mut reject_new = false;
-
-        let mut ctx = InferenceContext {
-            max_tokens: &mut max_tokens,
-            throttle_delay_ms: &mut throttle_delay_ms,
-            suspended: &mut suspended,
-            reject_new: &mut reject_new,
-        };
-
-        execute_action(&ResilienceAction::Suspend, &mut ctx);
-        assert!(suspended);
-    }
-
-    #[test]
-    fn test_execute_limit_tokens() {
-        let mut max_tokens = 128;
-        let mut throttle_delay_ms = 0u64;
-        let mut suspended = false;
-        let mut reject_new = false;
-
-        {
-            let mut ctx = InferenceContext {
-                max_tokens: &mut max_tokens,
-                throttle_delay_ms: &mut throttle_delay_ms,
-                suspended: &mut suspended,
-                reject_new: &mut reject_new,
-            };
-            execute_action(&ResilienceAction::LimitTokens { max_tokens: 64 }, &mut ctx);
-        }
-        assert_eq!(max_tokens, 64);
-
-        // Should take minimum
-        {
-            let mut ctx = InferenceContext {
-                max_tokens: &mut max_tokens,
-                throttle_delay_ms: &mut throttle_delay_ms,
-                suspended: &mut suspended,
-                reject_new: &mut reject_new,
-            };
-            execute_action(&ResilienceAction::LimitTokens { max_tokens: 200 }, &mut ctx);
-        }
-        assert_eq!(max_tokens, 64);
-    }
-
-    #[test]
-    fn test_execute_restore_clears_constraints() {
-        let mut max_tokens = 64;
-        let mut throttle_delay_ms = 100u64;
-        let mut suspended = false;
-        let mut reject_new = true;
-
-        let mut ctx = InferenceContext {
-            max_tokens: &mut max_tokens,
-            throttle_delay_ms: &mut throttle_delay_ms,
-            suspended: &mut suspended,
-            reject_new: &mut reject_new,
-        };
-
-        execute_action(&ResilienceAction::RestoreDefaults, &mut ctx);
-        assert_eq!(throttle_delay_ms, 0);
-        assert!(!reject_new);
-    }
-
-    #[test]
-    fn test_execute_throttle_sets_delay() {
-        let mut max_tokens = 128;
-        let mut throttle_delay_ms = 0u64;
-        let mut suspended = false;
-        let mut reject_new = false;
-
-        let mut ctx = InferenceContext {
-            max_tokens: &mut max_tokens,
-            throttle_delay_ms: &mut throttle_delay_ms,
-            suspended: &mut suspended,
-            reject_new: &mut reject_new,
-        };
-
-        execute_action(&ResilienceAction::Throttle { delay_ms: 50 }, &mut ctx);
-        assert_eq!(throttle_delay_ms, 50);
     }
 }

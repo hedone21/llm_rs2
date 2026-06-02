@@ -595,7 +595,7 @@
 |--------|------|--------|------|
 | `--model-path` | String | (기존) | Primary 가중치 파일. 초기 로딩 시 모든 decoder layer가 이 파일의 dtype으로 로드된다. |
 | `--model-path-secondary` | String? | None | Secondary 가중치 파일 (낮은 정밀도, e.g. Q4_0). 제공 시 디스크에 mmap만 되고, 런타임 swap 대상으로 예약된다. (ENG-DAT-090) |
-| `--force-swap-ratio` | `Option<f32>` | None | 디버그 전용. Manager 없이 prefill 종료 시 `ResilienceAction::SwapWeights { ratio }`를 직접 트리거한다. 값은 `[0.0, 1.0]`. (ENG-ALG-211 debug hook) |
+| `--force-swap-ratio` | `Option<f32>` | None | 디버그 전용. Manager 없이 prefill 종료 시 `EngineCommand::SwapWeights { ratio }`를 직접 트리거한다 (α-W-3 §5.4: 구 `ResilienceAction::SwapWeights` 폐기, `EngineCommand` 단일 어휘로 읽음). 값은 `[0.0, 1.0]`. (ENG-ALG-211 debug hook) |
 | `--swap-intra-forward` | `bool` | false | Intra-forward Layer-aligned Swap (LISWAP-4) 활성화 플래그. true 시 매 forward의 layer 경계에서 plan에 등록된 layer의 swap을 별도 transfer queue로 비동기 dispatch하고, ArcSwap commit은 dispatcher worker가 cl_event 완료 후 수행한다. plan당 ratio_generation bump 1회 (LISWAP-1의 chunk × N과 다름). default false에서 `LayerBoundaryHook`은 None으로 주입되어 forward path는 zero overhead (INV-147). LISWAP-1 플래그(`--swap-incremental-per-tick > 0`)와 상호 배타 (ENG-DAT-C18). (32-engine-algorithms §3.12.22, ENG-ALG-235~238, INV-147~150) |
 
 ---
@@ -1444,7 +1444,7 @@ impl IntraForwardSwapHook {
 
 **[ENG-DAT-C08]** Swap 대상 layer index는 `[0, num_layers)` 범위 내여야 하며, 이 범위 밖 인덱스를 담은 swap 요청은 NoOp으로 처리된다. *(MUST)*
 
-**[ENG-DAT-C09]** `LoadConfig::secondary_source == None`이면 `ResilienceAction::SwapWeights`는 무조건 NoOp을 반환한다. 로딩 경로는 단일 primary 파일만 열고, `LayerSlot::secondary_mmap_handle`은 모두 `None`이다. *(MUST)*
+**[ENG-DAT-C09]** `LoadConfig::secondary_source == None`이면 `EngineCommand::SwapWeights`(α-W-3 §5.4: 구 `ResilienceAction::SwapWeights` 폐기)는 무조건 NoOp을 반환한다. 로딩 경로는 단일 primary 파일만 열고, `LayerSlot::secondary_mmap_handle`은 모두 `None`이다. *(MUST)*
 
 **[ENG-DAT-C10]** Primary와 secondary 가중치 파일의 모델 메타데이터(GGUF metadata의 `n_layer`, `n_head`, `n_kv_head`, `hidden_size`, `intermediate_size`, `head_dim`) 및 각 layer tensor의 shape은 모두 일치해야 한다. 불일치 시 loader는 에러 반환하고 swap 경로도 비활성화된다. *(MUST)*
 

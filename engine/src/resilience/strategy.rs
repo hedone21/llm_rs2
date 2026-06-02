@@ -1,132 +1,98 @@
-use super::signal::{RecommendedBackend, SystemSignal};
-use super::state::OperatingMode;
+use super::signal::{EngineCommand, RecommendedBackend, SystemSignal};
 
 pub mod compute;
 pub mod energy;
-pub mod memory;
 pub mod thermal;
 
 pub use compute::ComputeStrategy;
 pub use energy::EnergyStrategy;
-pub use memory::MemoryStrategy;
 pub use thermal::ThermalStrategy;
 
-/// Action to be executed by the inference loop in response to a signal.
-#[derive(Debug, Clone)]
-pub enum ResilienceAction {
-    /// KV cache eviction. target_ratio: target ratio relative to current cache (0.0~1.0).
-    Evict { target_ratio: f32 },
-    /// Backend switch.
-    SwitchBackend { to: RecommendedBackend },
-    /// Limit generated tokens.
-    LimitTokens { max_tokens: usize },
-    /// Insert delay between token generation (ms).
-    Throttle { delay_ms: u64 },
-    /// Pause inference.
-    Suspend,
-    /// Reject new inference requests.
-    RejectNew,
-    /// Release previous constraints (return to normal).
-    RestoreDefaults,
+/// 추상 backend 역할 → `SwitchHw` device 문자열. `Any` → `None`(switch 생략).
+///
+/// 구체 GPU backend(opencl/cuda) 해석은 dispatcher/`Hardware` 책임이다(`DeviceTarget::Gpu`
+/// resolve, §3.5) — 여기선 추상 역할 문자열("cpu"/"gpu")만 낸다 (ENG-ST-052).
+pub(crate) fn switch_device(backend: RecommendedBackend) -> Option<&'static str> {
+    match backend {
+        RecommendedBackend::Cpu => Some("cpu"),
+        RecommendedBackend::Gpu => Some("gpu"),
+        RecommendedBackend::Any => None,
+    }
 }
 
-/// Signal reaction strategy interface.
-/// Follows the same pattern as `EvictionPolicy` trait.
+/// Signal reaction strategy interface (front-door ①, §0.4 / ENG-ST-053).
+///
+/// 출력은 이산 명령 `EngineCommand` 다 (§5.4 — 구 `ResilienceAction` 폐기, EngineCommand 단일
+/// 어휘). manager-less 자율 정책(`LocalPolicy`)의 정책 단위. graded magnitude(eviction 강도)는
+/// 이 채널이 아니라 `Pressure` scalar(§5.1)가 담당하므로, react 는 *mode* 출력
+/// (switch/suspend/throttle/restore)만 낸다. 구 `mode: OperatingMode` 인자는 dead 라 제거됨.
 pub trait ResilienceStrategy: Send + Sync {
-    /// Receive signal and return list of actions to execute.
-    /// Returns empty Vec if no action needed.
-    fn react(&mut self, signal: &SystemSignal, mode: OperatingMode) -> Vec<ResilienceAction>;
+    /// Receive signal and return discrete commands to execute. Empty Vec = no action.
+    fn react(&mut self, signal: &SystemSignal) -> Vec<EngineCommand>;
 
     /// Strategy name (for logging).
     fn name(&self) -> &str;
 }
 
-/// Merge actions from multiple strategies, resolving conflicts.
+/// Merge discrete commands from multiple strategies, resolving conflicts (ENG-ST-060, 4규칙).
 ///
-/// Rules:
-/// - Suspend overrides everything
-/// - CPU backend preferred over GPU (safety first)
-/// - Most aggressive eviction ratio (min) wins
-/// - Largest delay wins
-/// - RestoreDefaults only when no other constraints exist
-pub fn resolve_conflicts(actions: Vec<ResilienceAction>) -> Vec<ResilienceAction> {
-    if actions.is_empty() {
+/// - R1. `Suspend` overrides everything → `[Suspend]`
+/// - R2. `RestoreDefaults` only when no other constraints
+/// - R3. `SwitchHw`: `device == "cpu"` precedence (안전 우선), 아니면 마지막 값
+/// - R4. `Throttle`: largest `delay_ms` wins
+/// - 그 외 명령(`SetTargetTbt`/`Resume`/`Kv*`/...)은 원순서 보존 pass-through (vacuous-agnostic).
+pub fn resolve_conflicts(commands: Vec<EngineCommand>) -> Vec<EngineCommand> {
+    if commands.is_empty() {
         return vec![];
     }
 
-    let mut min_evict_ratio = f32::MAX;
     let mut max_delay = 0u64;
-    let mut min_tokens = usize::MAX;
-    let mut target_backend: Option<RecommendedBackend> = None;
+    let mut target_device: Option<String> = None;
     let mut has_suspend = false;
-    let mut has_reject = false;
     let mut has_restore = false;
+    let mut passthrough: Vec<EngineCommand> = Vec::new();
 
-    for action in &actions {
-        match action {
-            ResilienceAction::Evict { target_ratio } => {
-                min_evict_ratio = min_evict_ratio.min(*target_ratio);
+    for cmd in commands {
+        match cmd {
+            EngineCommand::Suspend => has_suspend = true,
+            EngineCommand::RestoreDefaults => has_restore = true,
+            EngineCommand::Throttle { delay_ms } => max_delay = max_delay.max(delay_ms),
+            EngineCommand::SwitchHw { device } => {
+                // R3: "cpu" always wins, else last value.
+                target_device = Some(
+                    if target_device.as_deref() == Some("cpu") || device == "cpu" {
+                        "cpu".to_string()
+                    } else {
+                        device
+                    },
+                );
             }
-            ResilienceAction::SwitchBackend { to } => {
-                target_backend = Some(match (target_backend, to) {
-                    (Some(RecommendedBackend::Cpu), _) => RecommendedBackend::Cpu,
-                    (_, RecommendedBackend::Cpu) => RecommendedBackend::Cpu,
-                    (_, other) => *other,
-                });
-            }
-            ResilienceAction::LimitTokens { max_tokens } => {
-                min_tokens = min_tokens.min(*max_tokens);
-            }
-            ResilienceAction::Throttle { delay_ms } => {
-                max_delay = max_delay.max(*delay_ms);
-            }
-            ResilienceAction::Suspend => has_suspend = true,
-            ResilienceAction::RejectNew => has_reject = true,
-            ResilienceAction::RestoreDefaults => has_restore = true,
+            other => passthrough.push(other),
         }
     }
 
-    // Suspend overrides everything
+    // R1: Suspend overrides all.
     if has_suspend {
-        return vec![ResilienceAction::Suspend];
+        return vec![EngineCommand::Suspend];
     }
 
-    // RestoreDefaults only when no other constraints
-    if has_restore
-        && min_evict_ratio >= f32::MAX
-        && max_delay == 0
-        && min_tokens == usize::MAX
-        && target_backend.is_none()
-        && !has_reject
-    {
-        return vec![ResilienceAction::RestoreDefaults];
-    }
-
-    let mut resolved = Vec::new();
-
-    if min_evict_ratio < f32::MAX {
-        resolved.push(ResilienceAction::Evict {
-            target_ratio: min_evict_ratio,
-        });
-    }
-    if let Some(backend) = target_backend {
-        resolved.push(ResilienceAction::SwitchBackend { to: backend });
-    }
-    if min_tokens < usize::MAX {
-        resolved.push(ResilienceAction::LimitTokens {
-            max_tokens: min_tokens,
-        });
+    let mut result = Vec::new();
+    if let Some(device) = target_device {
+        result.push(EngineCommand::SwitchHw { device });
     }
     if max_delay > 0 {
-        resolved.push(ResilienceAction::Throttle {
+        result.push(EngineCommand::Throttle {
             delay_ms: max_delay,
         });
     }
-    if has_reject {
-        resolved.push(ResilienceAction::RejectNew);
+    result.extend(passthrough);
+
+    // R2: RestoreDefaults only when no other constraint.
+    if has_restore && result.is_empty() {
+        return vec![EngineCommand::RestoreDefaults];
     }
 
-    resolved
+    result
 }
 
 #[cfg(test)]
@@ -135,94 +101,69 @@ mod tests {
 
     #[test]
     fn test_empty_input_returns_empty() {
-        let result = resolve_conflicts(vec![]);
-        assert!(result.is_empty());
+        assert!(resolve_conflicts(vec![]).is_empty());
     }
 
     #[test]
     fn test_cpu_always_wins_over_gpu() {
-        let actions = vec![
-            ResilienceAction::SwitchBackend {
-                to: RecommendedBackend::Gpu,
+        let result = resolve_conflicts(vec![
+            EngineCommand::SwitchHw {
+                device: "gpu".to_string(),
             },
-            ResilienceAction::SwitchBackend {
-                to: RecommendedBackend::Cpu,
+            EngineCommand::SwitchHw {
+                device: "cpu".to_string(),
             },
-        ];
-        let result = resolve_conflicts(actions);
+        ]);
         assert_eq!(result.len(), 1);
         match &result[0] {
-            ResilienceAction::SwitchBackend { to } => {
-                assert_eq!(*to, RecommendedBackend::Cpu);
-            }
-            _ => panic!("Expected SwitchBackend"),
-        }
-    }
-
-    #[test]
-    fn test_most_aggressive_eviction_wins() {
-        let actions = vec![
-            ResilienceAction::Evict { target_ratio: 0.85 },
-            ResilienceAction::Evict { target_ratio: 0.50 },
-            ResilienceAction::Evict { target_ratio: 0.75 },
-        ];
-        let result = resolve_conflicts(actions);
-        assert_eq!(result.len(), 1);
-        match &result[0] {
-            ResilienceAction::Evict { target_ratio } => {
-                assert!((target_ratio - 0.50).abs() < f32::EPSILON);
-            }
-            _ => panic!("Expected Evict"),
+            EngineCommand::SwitchHw { device } => assert_eq!(device, "cpu"),
+            _ => panic!("Expected SwitchHw"),
         }
     }
 
     #[test]
     fn test_largest_delay_wins() {
-        let actions = vec![
-            ResilienceAction::Throttle { delay_ms: 30 },
-            ResilienceAction::Throttle { delay_ms: 100 },
-            ResilienceAction::Throttle { delay_ms: 50 },
-        ];
-        let result = resolve_conflicts(actions);
+        let result = resolve_conflicts(vec![
+            EngineCommand::Throttle { delay_ms: 30 },
+            EngineCommand::Throttle { delay_ms: 100 },
+            EngineCommand::Throttle { delay_ms: 50 },
+        ]);
         assert_eq!(result.len(), 1);
         match &result[0] {
-            ResilienceAction::Throttle { delay_ms } => assert_eq!(*delay_ms, 100),
+            EngineCommand::Throttle { delay_ms } => assert_eq!(*delay_ms, 100),
             _ => panic!("Expected Throttle"),
         }
     }
 
     #[test]
     fn test_suspend_overrides_all() {
-        let actions = vec![
-            ResilienceAction::Evict { target_ratio: 0.50 },
-            ResilienceAction::SwitchBackend {
-                to: RecommendedBackend::Cpu,
+        let result = resolve_conflicts(vec![
+            EngineCommand::SwitchHw {
+                device: "cpu".to_string(),
             },
-            ResilienceAction::Suspend,
-            ResilienceAction::Throttle { delay_ms: 100 },
-        ];
-        let result = resolve_conflicts(actions);
+            EngineCommand::Suspend,
+            EngineCommand::Throttle { delay_ms: 100 },
+        ]);
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], ResilienceAction::Suspend));
+        assert!(matches!(result[0], EngineCommand::Suspend));
     }
 
     #[test]
     fn test_restore_only_when_no_other_constraints() {
-        // RestoreDefaults + Evict → Evict only (RestoreDefaults suppressed)
-        let actions = vec![
-            ResilienceAction::RestoreDefaults,
-            ResilienceAction::Evict { target_ratio: 0.85 },
-        ];
-        let result = resolve_conflicts(actions);
+        let result = resolve_conflicts(vec![
+            EngineCommand::RestoreDefaults,
+            EngineCommand::SwitchHw {
+                device: "cpu".to_string(),
+            },
+        ]);
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], ResilienceAction::Evict { .. }));
+        assert!(matches!(result[0], EngineCommand::SwitchHw { .. }));
     }
 
     #[test]
     fn test_restore_alone_passes_through() {
-        let actions = vec![ResilienceAction::RestoreDefaults];
-        let result = resolve_conflicts(actions);
+        let result = resolve_conflicts(vec![EngineCommand::RestoreDefaults]);
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], ResilienceAction::RestoreDefaults));
+        assert!(matches!(result[0], EngineCommand::RestoreDefaults));
     }
 }

@@ -16,14 +16,14 @@ pub mod dbus_transport;
 pub use crate::pressure::eviction::EvictMethod;
 pub use executor::{CommandExecutor, EvictPlan, ExecutionPlan, KVSnapshot, StreamingParams};
 pub use gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter};
-pub use manager::{InferenceContext, ResilienceManager, execute_action};
+pub use manager::ResilienceManager;
 pub use signal::{
     CommandResponse, CommandResult, EngineCapability, EngineCommand, EngineDirective,
     EngineMessage, EngineState, EngineStatus, ManagerMessage, ResourceLevel,
 };
 pub use signal::{ComputeReason, EnergyReason, Level, RecommendedBackend, SystemSignal};
 pub use state::OperatingMode;
-pub use strategy::{ResilienceAction, ResilienceStrategy};
+pub use strategy::ResilienceStrategy;
 #[cfg(unix)]
 pub use transport::UnixSocketTransport;
 pub use transport::{

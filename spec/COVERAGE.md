@@ -90,8 +90,8 @@
 |-----|------|---------|------|-----------|
 | INV-070 | `OperatingMode.from_levels()` = 순수 함수. 이전 상태 미의존. | Correctness | ✅ | `engine/tests/spec/test_fsm_operating_mode.rs` |
 | INV-071 | EngineState 전이는 CommandExecutor 내부에서만. | Correctness | ✅ | `engine/tests/spec/test_inv_072_076.rs` |
-| INV-072 | `resolve_conflicts()`: Suspend 존재 시 반환 = `[Suspend]`. | Safety | ✅ | `engine/tests/spec/test_inv_072_076.rs` |
-| INV-073 | `resolve_conflicts()`: RestoreDefaults는 다른 제약 없을 때만. | Correctness | ✅ | `engine/tests/spec/test_inv_072_076.rs` |
+| INV-072 | `resolve_conflicts(Vec<EngineCommand>)`: `Suspend` 존재 시 반환 = `[Suspend]`. (α-W-3: 어휘 갱신) | Safety | ✅ | `engine/tests/spec/test_inv_072_076.rs` |
+| INV-073 | `resolve_conflicts(Vec<EngineCommand>)`: `RestoreDefaults`는 다른 제약 없을 때만. (α-W-3: 어휘 갱신) | Correctness | ✅ | `engine/tests/spec/test_inv_072_076.rs` |
 | INV-074 | `plan.suspended == true`이면 evict/switch_device/prepare_device = None. | Safety | ✅ | `engine/tests/spec/test_inv_072_076.rs` |
 | INV-075 | Resume: compute/memory_level을 Normal로, throttle_delay_ms를 0으로. | Correctness | ✅ | `engine/tests/spec/test_inv_072_076.rs` |
 | INV-076 | RestoreDefaults: active_actions 비움, throttle 0, levels Normal. | Correctness | ✅ | `engine/tests/spec/test_inv_072_076.rs` |
@@ -255,7 +255,7 @@
 | MSG-068 | (D) | self_gpu_pct Phase 1 placeholder (항상 0.0) | 🆕 | `engine/tests/spec/test_msg_060_self_util.rs` |
 | MSG-069 | (D) | ctx.engine.cpu_pct/gpu_pct LuaPolicy 노출 계약 | 🆕 | `manager/tests/spec/test_mgr_dat_075_076_engine_util.rs` |
 | MSG-042 | (D) | `EngineCommand::SwapWeights { ratio, target_dtype: DtypeTag }` serde + dispatch contract (ENG-ALG-214-ROUTE) | 🆕 | `shared/tests/spec/test_msg_042_swap_weights_cmd.rs` |
-| MSG-080 | (D) | [DEPRECATED 재정의됨, 2026-04-24 Phase 3]: Phase 2 초안의 `ResilienceAction::SwapWeights` serde 항목. shared crate에서는 `EngineCommand::SwapWeights`(MSG-042)로 흡수되고, engine 내부 `ResilienceAction::SwapWeights`는 Rust-only 타입으로 테스트 대상 아님. MSG-080 ID는 새 용도 할당 없음. | — | — |
+| MSG-080 | (D) | [DEPRECATED 재정의됨, 2026-04-24 Phase 3]: Phase 2 초안의 `ResilienceAction::SwapWeights` serde 항목. shared crate에서는 `EngineCommand::SwapWeights`(MSG-042)로 흡수됨. (α-W-3 §5.4: engine 내부 `ResilienceAction` 타입 자체가 삭제되어 "Rust-only 타입" 서술도 만료 — `EngineCommand::SwapWeights` 단일.) MSG-080 ID는 새 용도 할당 없음. | — | — |
 | MSG-081 | (D) | [DEPRECATED, 2026-04-24 Phase 3]: 구 `CommandResponse::WeightSwapped` variant 제안. Phase 3에서는 별도 `WeightSwapReport` EngineMessage로 대체(MSG-089). MSG-081 ID 폐기. | — | — |
 | MSG-082 | (D) | `DtypeTag` enum (Q4_0 유효, F16/F32/Q8_0 reserved) serde round-trip | 🆕 | `shared/tests/spec/test_msg_082_dtype_tag.rs` |
 | MSG-088 | (D) | QcfEstimate `layer_swap` 필드 확장 (LayerSwapEstimate: per_layer_importance + per_layer_noise + qcf_swap_at_ratio). `#[serde(default)]` 전방 호환. | 🆕 | `shared/tests/spec/test_msg_088_qcf_estimate_layer_swap.rs` |

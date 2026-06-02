@@ -1,7 +1,12 @@
-//! Integration test: Memory pressure → KV cache eviction → memory reduction
+//! Integration test: KV cache eviction → memory reduction
 //!
-//! Tests the full pipeline:
-//!   MemoryPressure signal → ResilienceManager → Evict action → CacheManager → prune_prefix
+//! Tests the eviction pipeline directly:
+//!   apply_eviction(caches, ratio) → CacheManager → prune_prefix
+//!
+//! MemoryStrategy was removed in α-W-3. Memory pressure no longer produces
+//! discrete Evict commands. This test exercises the eviction helper directly
+//! using the ratios that MemoryStrategy previously mapped:
+//!   Warning→0.85, Critical→0.50, Emergency→0.25.
 //!
 //! Outputs JSON data to results/data/eviction_memory_test.json for visualization.
 
@@ -13,14 +18,10 @@ mod eviction_memory_test {
     use llm_rs2::pressure::cache_manager::CacheManager;
     use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
     use llm_rs2::pressure::kv_cache::KVCache;
-    use llm_rs2::resilience::signal::{Level, SystemSignal};
-    use llm_rs2::resilience::strategy::ResilienceAction;
-    use llm_rs2::resilience::sys_monitor::{MemoryStats, SystemMonitor};
     use llm_rs2::shape::Shape;
     use llm_rs2::tensor::Tensor;
 
     use std::sync::Arc;
-    use std::sync::mpsc;
 
     /// Llama 3.2 1B-like config
     const NUM_LAYERS: usize = 16;
@@ -28,17 +29,15 @@ mod eviction_memory_test {
     const HEAD_DIM: usize = 64;
     const MAX_SEQ_LEN: usize = 2048;
 
-    /// Mock SystemMonitor that reports configurable available memory
-    struct MockMonitor {
-        available: usize,
-    }
+    /// Mock SystemMonitor that reports zero available memory (always triggers eviction threshold)
+    struct MockMonitor;
 
-    impl SystemMonitor for MockMonitor {
-        fn mem_stats(&self) -> anyhow::Result<MemoryStats> {
-            Ok(MemoryStats {
+    impl llm_rs2::resilience::sys_monitor::SystemMonitor for MockMonitor {
+        fn mem_stats(&self) -> anyhow::Result<llm_rs2::resilience::sys_monitor::MemoryStats> {
+            Ok(llm_rs2::resilience::sys_monitor::MemoryStats {
                 total: 4 * 1024 * 1024 * 1024,
-                available: self.available,
-                free: self.available / 2,
+                available: 0,
+                free: 0,
             })
         }
     }
@@ -109,8 +108,7 @@ mod eviction_memory_test {
         let window_size = MAX_SEQ_LEN;
         let policy = SlidingWindowPolicy::new(window_size, 0);
 
-        // Low available memory to trigger CacheManager's threshold check
-        let monitor = MockMonitor { available: 0 };
+        let monitor = MockMonitor;
 
         let cm = CacheManager::new(
             Box::new(policy),
@@ -185,19 +183,7 @@ mod eviction_memory_test {
         }
         assert_eq!(caches[0].current_pos, 200);
 
-        // ── Phase 2: Warning → Evict 85% ──
-        let (tx, rx) = mpsc::channel();
-        let mut mgr = llm_rs2::resilience::ResilienceManager::new(rx);
-
-        tx.send(SystemSignal::MemoryPressure {
-            level: Level::Warning,
-            available_bytes: 200 * 1024 * 1024,
-            total_bytes: 4 * 1024 * 1024 * 1024,
-            reclaim_target_bytes: 50 * 1024 * 1024,
-        })
-        .unwrap();
-
-        let actions = mgr.poll();
+        // ── Phase 2: Warning → Evict 85% directly ──
         current_level = "warning".to_string();
 
         // Record pre-eviction
@@ -211,17 +197,8 @@ mod eviction_memory_test {
             level: current_level.clone(),
         });
 
-        // Execute eviction action
-        for action in &actions {
-            if let ResilienceAction::Evict { target_ratio } = action {
-                assert!(
-                    (*target_ratio - 0.85).abs() < f32::EPSILON,
-                    "Warning should produce target_ratio=0.85, got {}",
-                    target_ratio
-                );
-                apply_eviction(&mut caches, *target_ratio);
-            }
-        }
+        // Warning level → ratio 0.85 (matches former MemoryStrategy::Warning mapping)
+        apply_eviction(&mut caches, 0.85);
 
         let mem_after = total_memory_bytes(&caches);
         let pos_after_warning = caches[0].current_pos;
@@ -262,16 +239,7 @@ mod eviction_memory_test {
             }
         }
 
-        // ── Phase 4: Critical → Evict 50% ──
-        tx.send(SystemSignal::MemoryPressure {
-            level: Level::Critical,
-            available_bytes: 50 * 1024 * 1024,
-            total_bytes: 4 * 1024 * 1024 * 1024,
-            reclaim_target_bytes: 200 * 1024 * 1024,
-        })
-        .unwrap();
-
-        let actions = mgr.poll();
+        // ── Phase 4: Critical → Evict 50% directly ──
         current_level = "critical".to_string();
 
         let mem_before_crit = total_memory_bytes(&caches);
@@ -285,16 +253,8 @@ mod eviction_memory_test {
             level: current_level.clone(),
         });
 
-        for action in &actions {
-            if let ResilienceAction::Evict { target_ratio } = action {
-                assert!(
-                    (*target_ratio - 0.50).abs() < f32::EPSILON,
-                    "Critical should produce target_ratio=0.50, got {}",
-                    target_ratio
-                );
-                apply_eviction(&mut caches, *target_ratio);
-            }
-        }
+        // Critical level → ratio 0.50
+        apply_eviction(&mut caches, 0.50);
 
         let mem_after_crit = total_memory_bytes(&caches);
         let pos_after_crit = caches[0].current_pos;
@@ -312,7 +272,7 @@ mod eviction_memory_test {
             "Memory should decrease after critical eviction"
         );
 
-        // ── Phase 5: Fill more, then Emergency → Evict 25% ──
+        // ── Phase 5: Fill more, then Emergency → Evict 25% directly ──
         for i in 0..80 {
             fill_token(&mut caches, &backend);
             if (i + 1) % 10 == 0 {
@@ -328,15 +288,6 @@ mod eviction_memory_test {
             }
         }
 
-        tx.send(SystemSignal::MemoryPressure {
-            level: Level::Emergency,
-            available_bytes: 10 * 1024 * 1024,
-            total_bytes: 4 * 1024 * 1024 * 1024,
-            reclaim_target_bytes: 500 * 1024 * 1024,
-        })
-        .unwrap();
-
-        let actions = mgr.poll();
         current_level = "emergency".to_string();
 
         let mem_before_emerg = total_memory_bytes(&caches);
@@ -350,16 +301,8 @@ mod eviction_memory_test {
             level: current_level.clone(),
         });
 
-        for action in &actions {
-            if let ResilienceAction::Evict { target_ratio } = action {
-                assert!(
-                    (*target_ratio - 0.25).abs() < f32::EPSILON,
-                    "Emergency should produce target_ratio=0.25, got {}",
-                    target_ratio
-                );
-                apply_eviction(&mut caches, *target_ratio);
-            }
-        }
+        // Emergency level → ratio 0.25
+        apply_eviction(&mut caches, 0.25);
 
         let mem_after_emerg = total_memory_bytes(&caches);
         let pos_after_emerg = caches[0].current_pos;
@@ -377,22 +320,11 @@ mod eviction_memory_test {
             "Memory should decrease after emergency eviction"
         );
 
-        // ── Phase 6: Recovery → Normal ──
-        tx.send(SystemSignal::MemoryPressure {
-            level: Level::Normal,
-            available_bytes: 2 * 1024 * 1024 * 1024,
-            total_bytes: 4 * 1024 * 1024 * 1024,
-            reclaim_target_bytes: 0,
-        })
-        .unwrap();
-
-        let actions = mgr.poll();
+        // ── Phase 6: Recovery — Normal level produces no commands. Cache unchanged. ──
+        // (MemoryStrategy is removed; Normal signal no longer triggers commands.
+        //  We just verify that not calling apply_eviction leaves the cache intact.)
         current_level = "normal".to_string();
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, ResilienceAction::RestoreDefaults))
-        );
+        let pos_before_recovery = caches[0].current_pos;
 
         // Continue filling to show recovery
         for i in 0..60 {
@@ -409,6 +341,12 @@ mod eviction_memory_test {
                 });
             }
         }
+
+        // Verify recovery: cache grew past recovery start point
+        assert!(
+            caches[0].current_pos > pos_before_recovery,
+            "Cache should grow during recovery phase"
+        );
 
         // ── Verify data integrity after evictions ──
         // After all evictions, the remaining tokens should still have valid data
@@ -553,48 +491,6 @@ mod eviction_memory_test {
                 i,
                 k_data[0]
             );
-        }
-    }
-
-    /// Verify signal-to-action mapping for each pressure level
-    #[test]
-    fn test_signal_to_eviction_pipeline() {
-        let test_cases = vec![
-            (Level::Warning, 0.85f32),
-            (Level::Critical, 0.50f32),
-            (Level::Emergency, 0.25f32),
-        ];
-
-        for (level, expected_ratio) in test_cases {
-            let (tx, rx) = mpsc::channel();
-            let mut mgr = llm_rs2::resilience::ResilienceManager::new(rx);
-
-            tx.send(SystemSignal::MemoryPressure {
-                level,
-                available_bytes: 50 * 1024 * 1024,
-                reclaim_target_bytes: 100 * 1024 * 1024,
-            })
-            .unwrap();
-
-            let actions = mgr.poll();
-            let evict_action = actions
-                .iter()
-                .find(|a| matches!(a, ResilienceAction::Evict { .. }));
-            assert!(
-                evict_action.is_some(),
-                "Level {:?} should produce Evict action",
-                level
-            );
-
-            if let Some(ResilienceAction::Evict { target_ratio }) = evict_action {
-                assert!(
-                    (*target_ratio - expected_ratio).abs() < f32::EPSILON,
-                    "Level {:?} should produce ratio {}, got {}",
-                    level,
-                    expected_ratio,
-                    target_ratio
-                );
-            }
         }
     }
 }

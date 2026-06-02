@@ -183,13 +183,15 @@ D-Bus system bus --> DbusTransport --> signal_to_manager_message() --> ManagerMe
 | 컴포넌트 | 책임 |
 |----------|------|
 | DbusTransport | D-Bus 시스템 버스 연결, legacy SystemSignal 파싱, ManagerMessage 변환 |
-| ResilienceManager | 4종 SystemSignal 수신, SignalLevels 캐시, OperatingMode 계산, 4종 Strategy 위임, `resolve_conflicts()` |
-| Strategy 4종 | MemoryStrategy, ComputeStrategy, ThermalStrategy, EnergyStrategy |
+| ResilienceManager | 4종 SystemSignal 수신, SignalLevels 캐시, OperatingMode 계산, 3종 Strategy 위임, `resolve_conflicts()` |
+| Strategy 3종 | ComputeStrategy, ThermalStrategy, EnergyStrategy (α-W-3: `MemoryStrategy` 삭제 → graded `Pressure`) |
+
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: `MemoryStrategy` 삭제(memory 압력은 graded `Pressure` scalar 경로, `LocalPressureSource` 융합) → strategy 3종. strategy 출력 어휘는 `ResilienceAction`(폐기) → `EngineCommand`(`shared/`)로 통일. manager-less 자율 경로는 `LocalPolicy`(front-door ①)로 재정위. 상세: `31-engine-state.md` §3.5/§3.6.
 
 - DbusTransport 내부에서 SystemSignal을 EngineCommand로 변환한다 (`signal_to_manager_message`)
 - ResilienceManager는 `generate.rs` 메인 루프에서 **직접 사용되지 않는다**. DbusTransport가 변환한 결과가 `ManagerMessage::Directive`로 CommandExecutor에 전달된다
 - Emergency level signal 수신 시 DbusTransport가 `EngineCommand::Suspend`로 변환하여 Engine이 자율적으로 Suspended 상태에 진입한다 (SYS-055)
-- ResilienceManager/Strategy는 독립적으로도 사용 가능하나 (`manager.rs`의 `InferenceContext` + `execute_action`), 현재 `generate.rs`에서는 이 경로를 사용하지 않는다
+- ResilienceManager/Strategy 의 manager-less 정책 적용은 `CommandDispatcher` → `LoopControl`(②control) / `registry.submit`(①KV/weight·③switch)로 일원화된다 (α-W-3, §5.4; 구 `InferenceContext` + `execute_action` 직접 작용 폐기)
 - OperatingMode FSM 상세 → `31-engine-state.md` ENG-ST-010 ~ ENG-ST-015
 
 **공존 규칙** (SYS-085):
