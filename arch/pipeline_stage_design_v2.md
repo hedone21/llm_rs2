@@ -450,7 +450,7 @@ flowchart LR
 
 **역할.** KV 캐시의 **state 책임**(geometry · mutation · attention)을 **storage-format-agnostic** 하게 제공하는 base trait — geometry 3(`idx` / `current_pos` / `capacity`) + mutation 3(`write_kv` / `write_kv_batch` / `compact`) + attention 1(`attention_into`) = **7 method**. base-trait-handle 을 든 Stage 는 geometry·mutation 만 알면 되고, forward 는 `attention_into` 로 q→out 만 보므로 양쪽 다 dtype/codebook/rotation/sparse pattern 을 모른다 (impl(`StandardFormat` / `KIVIFormat` / `SparseFormat`)이 캡슐화, `INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`). 새 Format = 새 impl + paired attention kernel (`INV-KVCACHELAYER-PAIRED-KERNEL`), **base trait·forward 변경 0**.
 
-**read 표면은 두 갈래로 분리된다.** (1) **geometry**(idx / current_pos / capacity) 는 base trait method 로 Layer 본체가 단일 소유한다 — capacity 가 한 곳에만 있어 중복이 없다. (2) **content**(raw K/V 값) 는 base trait 에 두지 않는다; concrete-handle 의 read-only inherent method(예: `StandardFormat::read_k_layer_wide -> Cow<[f32]>`)로만 접근한다. 제네릭 read view 가 없으므로 mutation 이 샐 표면도 없다 (mutation 은 3 primitive 단일 경로). **attention 은 content read 표면을 늘리지 않는다** — `attention_into` 가 layer 내부에서 자기 K/V 를 소비하되 결과(out)만 호출자에 돌려주므로 content 가 base trait 으로 새지 않는다 (forward 는 q/out 만 봄).
+**read 표면은 두 갈래로 분리된다.** (1) **geometry**(idx / current_pos / capacity) 는 base trait method 로 Layer 본체가 단일 소유한다 — capacity 가 한 곳에만 있어 중복이 없다. (2) **content**(raw K/V 값) 는 base trait 에 두지 않는다; concrete-handle 의 read-only inherent method(예: `StandardFormat::read_k_layer_wide -> Cow<[f32]>`)로만 접근한다. 제네릭 read view 가 없으므로 mutation 이 샐 표면도 없다 (mutation 은 3 primitive 단일 경로). **attention 은 content read 표면을 늘리지 않는다** — `attention_into` 가 layer 내부에서 자기 K/V 를 소비하되 결과(out)와 파생 score(post-softmax attention weight, raw K/V 아님)만 호출자에 돌려주므로 content 가 base trait 으로 새지 않는다 (forward 는 q/out/scores 만 보고 K/V content 는 못 봄; score 는 §4.1 R4 연혁의 생산 seam).
 
 ```rust
 pub trait KVCacheFormat: Send + Sync {
@@ -460,9 +460,25 @@ pub trait KVCacheFormat: Send + Sync {
     fn write_kv(&self, /* ... */) -> Result<()>;
     fn write_kv_batch(&self, /* ... */) -> Result<()>;
     fn compact(&self, keep: &[usize], merges: &[Merge]) -> Result<()>;   // keep+merges atomic
-    fn attention_into(&self, /* q, backend, out, dims, scores */) -> Result<()>; // impl 이 paired kernel dispatch (NVIDIA fused / Adreno dequant). 정확한 시그니처 = impl 단계(#12)
+    fn attention_into(
+        &self,
+        q: &Tensor,                  // forward 가 계산한 query
+        backend: &dyn Backend,       // execution-owned 범용 backend (per-call, format ⊥ hardware)
+        out: &mut Tensor,            // attention 출력
+        dims: AttnDims,              // cache 가 모르는 값만 (n_heads_q / window)
+        scores: Option<&mut [f32]>,  // 생산 seam: Some 이면 raw post-softmax score 기록. 누적·소비는 밖.
+    ) -> Result<()>;                 // impl 이 paired kernel dispatch (NVIDIA fused / Adreno dequant)
     // as_any() 없음 — downcast 의도적 차단.
     // dtype() / KVCacheView 없음 — Stage 가 어느 Format 인지 모름.
+    // needs_attn_scores() 없음 — KIVI AWQE 자기-need 는 impl 내부 흡수 (Q2). scores Option 은 stage-need 전용.
+}
+
+// per-call attention 파라미터 — cache 가 self 로 알 수 없는 외부 값만.
+// (n_heads_kv / head_dim / capacity / current_pos / scale=1/√hd 는 전부 format 내부)
+#[derive(Clone, Copy)]
+pub struct AttnDims {
+    pub n_heads_q: usize,        // GQA 쿼리 헤드 (q 속성 — KV 캐시는 kv_heads 만 앎)
+    pub window: Option<usize>,   // Gemma3 local SWA (global 이면 None)
 }
 ```
 
@@ -477,6 +493,8 @@ pub trait KVCacheFormat: Send + Sync {
 > **연혁** — Format 용어 정리 (2026-05-30 grill-with-docs): `/CONTEXT.md` 확정에 맞춰 본 v2 문서의 저장-형태 명칭을 `Layer → Format` 으로 일괄 정리했다 (`KVCacheLayer→KVCacheFormat` / `WeightLayer→WeightFormat` / `StandardLayer→StandardFormat` / `KIVILayer→KIVIFormat` / `SparseLayer→SparseFormat` / `ConcreteLayer→ConcreteFormat`, axis 명칭 `storage 축→Format 축` · `policy 축→Stage 축`, generic "paradigm"→"Format"). "Layer" 는 transformer 디코더 블록(`TransformerLayer`/`LayerSlot`/`layer_idx`) 전용으로 한정. **INV ID(`INV-KVCACHELAYER-*` / `INV-STAGE-LAYER-HANDLE`)는 추적용 안정 키로 유지**(본문 prose 만 갱신). **잔여 [P2]**: spec/41-invariants.md INV 본문 + 잔여 arch 문서(inference_pipeline·README·backend_conformance·adr/0001) + 코드(`KVCacheOps→KVCacheFormat`, Phase α-K 동행). v1(`pipeline_stage_design.md`)은 결정-이력 아카이브라 동결.
 >
 > **연혁** — item 1 (switch KV migrate) 해소 (2026-05-31 grill): migrate 를 **interior-mutate** 로 확정 (현 `kv/kv_migrate.rs::migrate_kv_caches` 의 `&mut [KVCache]` `*kv=new_kv` 값 교체는 held-handle 모델과 충돌 → Phase α-K 수렴). 결정적 관찰: UMA migrate 는 데이터(format 좌표) 불변·backend 태그(hardware 좌표)만 교체(`kv_migrate.rs:84-97`)라 **hardware 축 op** 이다. 따라서 migrate 는 KVCacheFormat mutation primitive(write_kv/compact)에 **넣지 않는다**(handoff 원 Q1 = No, cross-axis 오염 회피). seam: KV storage(buffer+태그)를 format 과 분리된 **slot 으로 빼고**(weight `Arc<LayerSlot>` 과 대칭 → "KV·weight 동일 3축" 원칙 실현) format 은 slot 을 읽어 계산만, migrate 는 slot 내용 swap — **(c) storage-slot 잠정 결정**(대안 (a) format 메서드=축 오염, (b) `Relocatable` capability=소비자 1개 deletion-test 불통과). 후속 재검토 여지 표시.
+>
+> **연혁** — R4 `attention_into` 시그니처 확정 (2026-06-02 grill-me): placeholder 주석(`/* q, backend, out, dims, scores */` + "impl 단계(#12)")을 실제 시그니처로 박았다. **미정이 아니라 미기재였음** — 현 3-way 분기(`forward_gen.rs:417-510`: `attention_gen_kivi`/`attention_gen`/`flash_attention_forward_strided`)의 인자를 "format 이 `&self` 로 아는 것"(n_heads_kv·head_dim·capacity·current_pos·scale·K/V 버퍼·stride·dtype·KIVI 토큰수) vs "forward 가 주는 것"(`q`·`backend`·`out`·`n_heads_q`·`window`·`scores`)으로 가르면 단일 시그니처로 수렴. ① **backend per-call 전달**(execution-owned 범용 backend, G1 "agnostic→execution 주인" 정합; format ⊥ hardware 유지. KIVI capability 만 `KIVIFormat` 보유=G1 settled. attention 은 Backend method 에서 Format method 로 이동 — format 이 raw 커널을 backend 에 위임). ② **`scores: Option<&mut [f32]>` = 생산 seam** — format 은 raw post-softmax score 를 *생산*만; 누적(시간축 importance)·소비(H2O ranking `evict_with_scores`(`eviction.rs:26`) / KIVI AWQE flush)는 밖. fused 경로 담보(별도 `compute_attention_scores` pass ~6배 회피). ③ **`needs_attn_scores()` format 내부 흡수** — KIVI AWQE 자기-need 는 impl 이 자기 버퍼에 자가 기록(8번째 method 안 만듦, ④ KIVI creep 제거 정신). `scores` Option 트리거는 stage-need 전용(forward 가 context 질의 = α-W 배선). ④ **`AttnDims{n_heads_q, window}`** = cache 가 모르는 외부 값만(no-redundancy, capacity 단일소유와 동일 정신; `scale` 은 `query_pre_attn_scalar` 모델 등장 시 promotion-trigger). 본 시그니처는 cold path(`Arc<dyn>`) 트레이트 표면 — hot path concrete-handle fast play(④-a)·`AttentionVariant` 평탄화(④-b)는 별도 inherent 라 트레이트와 독립, **α-K 유지**(friction-triggered). "#12" dangling(v1 동결 grill 번호)→실제 구현 = Phase α-K. ADR-0001 §43 annotation(SSOT=v2 §4.1)이 이제 구체 시그니처로 resolve. 코드 적용 = Phase α-K.
 
 ### 4.2 `WeightFormat`
 
