@@ -40,6 +40,7 @@ KV cache 구현체로 `KVCache` (standard F32/F16/Q4_0) 와 `KiviCache` (KIVI Q2
 
 상세:
 - `KVCacheOps` trait (현 ~15 method) → `KVCacheFormat` trait (5 method: idx / current_pos / capacity / view / 3 mutation + apply_storage). 자세한 시그니처는 `arch/pipeline_stage_design.md` §3.5.
+  - **[갱신 주 2026-06-02, R5]** 본 method 집합은 ADR 작성(2026-05-28) *이후* 진화했다 — `view`/`KVCacheView` **삭제**(v2 §4.1 연혁), `apply_storage` **폐기**(결정 #15), `attention_into` **추가**. 현재는 **7 method** = geometry 3(idx/current_pos/capacity) + mutation 3(write_kv/write_kv_batch/compact) + attention 1(attention_into). ADR 본문은 작성 시점 기록으로 보존하며(역사적 결정), 현재 시그니처의 SSOT 는 `arch/pipeline_stage_design_v2.md` §4.1 다.
 - Forward path 의 `<C: KVCacheOps>` generic parameter → `&[Arc<dyn KVCacheFormat>]` slice.
 - `LlamaLayer::forward` / `attention_gen` / `CacheManager` / `EvictionPolicy` / `D2OHandler` / `CachePressurePipeline` 모두 trait object 기반으로 마이그레이션.
 - KVCacheOps 의 15 method 중 read-only 일부 → KVCacheView sub-trait (KVCacheFormat::view 반환).

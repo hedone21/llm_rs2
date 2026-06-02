@@ -537,6 +537,21 @@ pub struct StepInfo {           // read-only per-step VALUE (Copy, borrow 0) —
     // 승격 trigger: observe Stage 가 토큰 스트림 소비 요구 시 `prev_token: u32` 추가
     //               (driver 가 이미 보유 — ripple 0, trait·소비자 무변경)
 }
+
+// LifecyclePhase — canonical variant 목록 (SSOT; spec/41 INV-DECODE-STAGE-001 은 본 목록을 참조한다)
+pub enum LifecyclePhase {
+    // 경계 (boundary tier)
+    SessionStart, SessionEnd, TurnStart, TurnEnd,
+    // prefill
+    PrefillStart, PrefillChunkBoundary, PrefillEnd,
+    // decode step (1×/token)
+    DecodeStart, PreForward, PostForward, PreSample, PostSample, DecodeEnd,
+    // cross-cutting stage hook (mutation 허용)
+    PreEviction, PostEviction, PreSwap, PostSwapBefore, PostSwapAfter,
+    // per-layer (N×/token) — mutation 금지 (INV-DECODE-STAGE-001)
+    PreLayer, PostLayer, Fine(/* sub-step 식별자 */),
+    Finalize,
+}
 ```
 
 **`StepInfo` 3필드 borrow-0 (G5-2).** v1 `StepCtx`(`session/traits.rs:21`) 5필드 중 `pos`·`decode_step` 만 승계. 드롭: `prev_token`(샘플러 도메인 — `TokenSampler` 별도 생존 front-door ①), `kv_capacity`(Stage 가 register 시점 보유한 `KVCacheFormat` handle 에서 query — ctx 로 흘리면 god-ctx, `INV-STAGE-LAYER-HANDLE` 위반), `stop_requested: &AtomicBool`(v2 는 `StageOutcome::Stop(StopReason)` **반환**으로 정지 → flag 관찰 불요, borrow 제거로 `Copy` 성립). prefill/decode 구분은 `on_phase(phase: &LifecyclePhase, ...)` 인자가 담아 중복 불요. 매 step driver 가 값 스냅샷을 복사 전달.
