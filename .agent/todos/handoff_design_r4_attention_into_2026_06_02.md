@@ -4,7 +4,14 @@
 **HEAD**: `01e3b101 docs: R5 cross-doc drift sync (spec/41 + ADR-0001 ↔ v2 SSOT)`
 **브랜치**: master (worktree 아님)
 **작성자**: 메인 세션 (오케스트레이터)
-**다음 세션 진입 문장**: **"R4 진행"**
+**다음 세션 진입 문장**: ~~**"R4 진행"**~~ → **종결됨 (아래 CLOSED 참조)**
+
+> **✅ CLOSED 2026-06-02** — R4·R2·R3 전부 grill-me 종결. 외부 2차 평가 발견사항 **전체 종결**(C1·C2·R1·R5·R4·R2·R3). 신규 3 커밋:
+> - `93f6fa75` R4 — `attention_into` 시그니처 확정(q/backend/out/`AttnDims`/scores; backend per-call; scores=생산 seam; `needs_attn_scores` 흡수; "#12" 해소→α-K). v2 §4.1.
+> - `649bbd87` R2 — `INV-STAGE-ORDER-SAFETY` **폐기** + totality 미신설(compact Result 흡수). §1.2 "Safety over policy"→**"Mechanism over policy"** 재서술. v2 §0.2/§1.2/§5.3/§8 + spec/41.
+> - `22b6539a` R3 — α-K substep별 중간 bit-identical 게이트 신설(게이트 강도=dispatch tier; avg_tbt를 (2)/(3)/(4) 전부). v2 §9.1 + ADR-0001 §8.3 annotation.
+>
+> **설계 grill 트랙 완료.** 다음 트랙 = Phase α-W *구현*(코드: `format/`·`capability/`·`hardware.rs`·`pipeline.rs`·`stages/` 신설 + `Hardware` resolve Option) 또는 backlog [P2]. 코드는 전부 미착수(설계만 확정).
 
 ---
 
