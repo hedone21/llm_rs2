@@ -408,10 +408,12 @@ pub fn load_model(
         // weight dtype). Secondary handle is cloned into the slot so the
         // Phase 2 `SwapExecutor` can locate per-layer tensor bytes without
         // touching the root container.
+        let layer_idx = layers.len();
         layers.push(Arc::new(LayerSlot::new(
             layer,
             weight_dtype,
             secondary_mmap.clone(),
+            layer_idx,
         )));
     }
 

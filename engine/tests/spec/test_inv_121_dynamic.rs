@@ -85,7 +85,7 @@ fn forward_snapshot_is_monotonic_under_concurrent_swap() {
 
     let slots: Arc<Vec<LayerSlot>> = Arc::new(
         (0..num_layers)
-            .map(|_| LayerSlot::new(tagged_layer(&be, 0), DType::F32, None))
+            .map(|_| LayerSlot::new(tagged_layer(&be, 0), DType::F32, None, 0))
             .collect(),
     );
 
@@ -191,7 +191,7 @@ fn snapshot_arcs_are_immutable_for_reader_lifetime() {
     // even after an intervening `swap_weights`. This is INV-123: swap is
     // a single-step install that never mutates old Arcs in place.
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let slot = LayerSlot::new(tagged_layer(&be, 42), DType::F32, None);
+    let slot = LayerSlot::new(tagged_layer(&be, 42), DType::F32, None, 0);
 
     let snap_before = slot.load_weights();
     let ptr_before = Arc::as_ptr(&snap_before);

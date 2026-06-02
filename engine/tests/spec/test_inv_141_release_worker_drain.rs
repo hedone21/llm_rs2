@@ -246,7 +246,7 @@ fn inv_141_swap_executor_rejects_on_drain_timeout() {
     worker_concrete.pending.fetch_add(1, Ordering::Release);
 
     let layers: Vec<Arc<LayerSlot>> = (0..2)
-        .map(|_| Arc::new(LayerSlot::new(make_layer(&be), DType::F16, None)))
+        .map(|_| Arc::new(LayerSlot::new(make_layer(&be), DType::F16, None, 0)))
         .collect();
     let ratio_gen = Arc::new(AtomicU64::new(0));
     let config = minimal_config();

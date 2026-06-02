@@ -218,7 +218,7 @@ fn empty_swap_batch_does_not_invalidate() {
     let be_dyn: Arc<dyn Backend> = be_counting.clone();
 
     let layers: Vec<Arc<LayerSlot>> = (0..2)
-        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None)))
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None, 0)))
         .collect();
     let ratio_gen = Arc::new(AtomicU64::new(0));
     let config = minimal_model_config();

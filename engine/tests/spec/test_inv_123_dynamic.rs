@@ -93,7 +93,7 @@ fn arc_swap_store_is_single_step_vs_readers() {
     // writes. Any torn snapshot (mixed-generation tensors in the same
     // Arc) falsifies INV-123.
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let slot = Arc::new(LayerSlot::new(make_layer(&be, 0), DType::F32, None));
+    let slot = Arc::new(LayerSlot::new(make_layer(&be, 0), DType::F32, None, 0));
 
     let stop = Arc::new(AtomicBool::new(false));
     let gen_counter = Arc::new(AtomicU64::new(0));
@@ -159,7 +159,7 @@ fn batch_swap_snapshot_sees_consistent_per_slot_state() {
     let num_slots = 4;
     let slots: Arc<Vec<LayerSlot>> = Arc::new(
         (0..num_slots)
-            .map(|_| LayerSlot::new(make_layer(&be, 0), DType::F32, None))
+            .map(|_| LayerSlot::new(make_layer(&be, 0), DType::F32, None, 0))
             .collect(),
     );
 
@@ -252,7 +252,7 @@ fn strong_count_guards_madvise_decision() {
     // and madvise would fire. This mirrors the Stage 1 conservative
     // policy (ENG-ALG-211 step (d)).
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let slot = LayerSlot::new(make_layer(&be, 7), DType::F32, None);
+    let slot = LayerSlot::new(make_layer(&be, 7), DType::F32, None, 0);
 
     let reader_snap = slot.load_weights();
     assert!(Arc::strong_count(&reader_snap) >= 2);

@@ -57,7 +57,7 @@ fn make_dummy_layer(be: &Arc<dyn Backend>) -> TransformerLayer {
 fn layer_slot_initial_state_matches_default_dtype() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let layer = make_dummy_layer(&be);
-    let slot = LayerSlot::new(layer, DType::F16, None);
+    let slot = LayerSlot::new(layer, DType::F16, None, 0);
     assert_eq!(slot.current_dtype(), DType::F16);
     assert_eq!(slot.generation(), 0);
     assert!(slot.secondary_mmap_handle().is_none());
@@ -67,7 +67,7 @@ fn layer_slot_initial_state_matches_default_dtype() {
 fn layer_slot_load_weights_yields_consistent_snapshot() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let layer = make_dummy_layer(&be);
-    let slot = LayerSlot::new(layer, DType::F16, None);
+    let slot = LayerSlot::new(layer, DType::F16, None, 0);
 
     let snap_a = slot.load_weights();
     let snap_b = slot.load_weights();
@@ -80,7 +80,7 @@ fn layer_slot_load_weights_yields_consistent_snapshot() {
 fn swap_weights_bumps_generation_and_current_dtype() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let layer = make_dummy_layer(&be);
-    let slot = LayerSlot::new(layer, DType::F16, None);
+    let slot = LayerSlot::new(layer, DType::F16, None, 0);
 
     let new_layer = make_dummy_layer(&be);
     let new_arc = Arc::new(new_layer);
@@ -99,7 +99,7 @@ fn swap_weights_bumps_generation_and_current_dtype() {
 fn store_weights_same_dtype_keeps_generation() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let layer = make_dummy_layer(&be);
-    let slot = LayerSlot::new(layer, DType::F16, None);
+    let slot = LayerSlot::new(layer, DType::F16, None, 0);
 
     let other = Arc::new(make_dummy_layer(&be));
     slot.store_weights_same_dtype(other.clone());
@@ -117,7 +117,7 @@ fn store_weights_same_dtype_keeps_generation() {
 fn rcu_weights_clone_and_install() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let layer = make_dummy_layer(&be);
-    let slot = LayerSlot::new(layer, DType::F16, None);
+    let slot = LayerSlot::new(layer, DType::F16, None, 0);
 
     // Observe wq tensor size before the update.
     let pre = slot.load_weights();

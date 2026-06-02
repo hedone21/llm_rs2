@@ -459,7 +459,7 @@ fn test_inv_131_non_adreno_backend_noop() {
 
     // 빈 layer 집합으로 실행 — secondary 없으므로 swap 발생하지 않음.
     let layers: Vec<Arc<LayerSlot>> = (0..4)
-        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None)))
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None, 0)))
         .collect();
     let ratio_gen = Arc::new(AtomicU64::new(0));
 

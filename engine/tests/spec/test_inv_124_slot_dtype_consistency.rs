@@ -55,7 +55,7 @@ fn dummy_layer(be: &Arc<dyn Backend>, dtype: DType) -> TransformerLayer {
 fn initial_slot_dtype_matches_weights() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let layer = dummy_layer(&be, DType::F16);
-    let slot = LayerSlot::new(layer, DType::F16, None);
+    let slot = LayerSlot::new(layer, DType::F16, None, 0);
 
     let loaded = slot.load_weights();
     assert_eq!(slot.current_dtype(), DType::F16);
@@ -68,7 +68,7 @@ fn initial_slot_dtype_matches_weights() {
 #[test]
 fn swap_installs_new_dtype_atomically() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let slot = LayerSlot::new(dummy_layer(&be, DType::F16), DType::F16, None);
+    let slot = LayerSlot::new(dummy_layer(&be, DType::F16), DType::F16, None, 0);
 
     let new_layer = dummy_layer(&be, DType::Q4_0);
     let new_arc = Arc::new(new_layer);
@@ -84,7 +84,7 @@ fn swap_installs_new_dtype_atomically() {
 #[test]
 fn same_dtype_rewrap_preserves_consistency() {
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let slot = LayerSlot::new(dummy_layer(&be, DType::F16), DType::F16, None);
+    let slot = LayerSlot::new(dummy_layer(&be, DType::F16), DType::F16, None, 0);
 
     let rewrapped = Arc::new(dummy_layer(&be, DType::F16));
     slot.store_weights_same_dtype(rewrapped.clone());

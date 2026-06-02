@@ -60,7 +60,7 @@ fn make_layer(be: &Arc<dyn Backend>) -> TransformerLayer {
 }
 
 fn make_slot(be: &Arc<dyn Backend>) -> Arc<LayerSlot> {
-    Arc::new(LayerSlot::new(make_layer(be), DType::F16, None))
+    Arc::new(LayerSlot::new(make_layer(be), DType::F16, None, 0))
 }
 
 fn make_config() -> Arc<ModelConfig> {

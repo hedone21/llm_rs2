@@ -990,82 +990,45 @@ impl TransformerModel {
     pub fn prepare_tensor_partition(
         &mut self,
         gpu_ratio: f32,
-        cpu_backend: &Arc<dyn Backend>,
+        hw: &crate::hardware::Hardware,
     ) -> Result<usize> {
-        use crate::layers::tensor_partition::{
-            PartitionContext, is_gpu_only_ratio, split_weight, split_weight_col,
-        };
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use crate::format::weight_format::{LayerDispatch, SliceSpec, WeightFormat};
+        use crate::hardware::DeviceTarget;
+        use crate::layers::tensor_partition::is_gpu_only_ratio;
 
         // GPU-only fast path: leave partition_ctx cleared so forward() takes
         // the dense full-weight GPU matmul path. Avoids per-token host
         // staging (read_buffer + CPU matmul on a clamped 128-row slice +
         // GPU↔host merge) that is independent of ratio once partition_ctx
         // is installed. See `is_gpu_only_ratio` / `GPU_ONLY_THRESHOLD`.
+        //
+        // The per-slot gen-counter / RCU store sequencing (INV-120) now lives
+        // in `LayerSlot::apply_dispatch`; this method only fans the dispatch
+        // mode out over the layers.
         if is_gpu_only_ratio(gpu_ratio) {
-            // Still bump any surviving generation counters before we drop the
-            // contexts — a plan that was built against the previous ratio
-            // must observe `Err(PlanInvalidated)` on its next execute() rather
-            // than dispatch against cl_mem handles that no longer back the
-            // active forward path. (INV-120)
             for slot in &self.layers {
-                let old = slot.load_weights();
-                if let Some(ref ctx) = old.partition_ctx {
-                    ctx.ratio_generation.fetch_add(1, Ordering::Release);
-                }
-                let mut new = (*old).clone();
-                new.partition_ctx = None;
-                slot.store_weights_same_dtype(Arc::new(new));
+                slot.apply_dispatch(LayerDispatch::Full, hw)?;
             }
             return Ok(0);
         }
 
+        let dtype = self.layers[0].load_weights().w_gate.dtype();
+        let specs = vec![
+            SliceSpec {
+                share: gpu_ratio,
+                hardware: DeviceTarget::Gpu,
+                format: dtype,
+            },
+            SliceSpec {
+                share: 1.0 - gpu_ratio,
+                hardware: DeviceTarget::Cpu,
+                format: dtype,
+            },
+        ];
         let mut count = 0;
         for slot in &self.layers {
-            let old = slot.load_weights();
-            // Reuse the existing Arc<AtomicU64> if a partition_ctx is already
-            // installed so that plans built against the prior generation see
-            // the bump. A fresh install starts at 0 — the first plan build
-            // captures 0 and only misses when a subsequent re-split bumps it.
-            let prev_gen = old
-                .partition_ctx
-                .as_ref()
-                .map(|c| c.ratio_generation.clone());
-
-            // Strategy B: whole-FFN slice.
-            // gate/up split_row is on the ffn_hidden (out_dim) axis.
-            // down split_col is on the ffn_hidden (in_dim) axis — same
-            // logical dimension, so we reuse gate's split_row.
-            let gate = split_weight(&old.w_gate, gpu_ratio, cpu_backend)?;
-            let up = split_weight(&old.w_up, gpu_ratio, cpu_backend)?;
-            debug_assert_eq!(
-                gate.split_row, up.split_row,
-                "gate/up split_row must match (same ffn_hidden, same gpu_ratio)",
-            );
-            let down = split_weight_col(&old.w_down, gate.split_row, cpu_backend)?;
+            slot.apply_dispatch(LayerDispatch::Partition(specs.clone()), hw)?;
             count += 3;
-
-            // Bump the shared counter if this is a re-split; allocate a fresh
-            // counter at 0 otherwise. Release ordering pairs with the Acquire
-            // load in `PartitionStep::run` / `build_partitioned_layer_plan`.
-            let gen_arc = match prev_gen {
-                Some(g) => {
-                    g.fetch_add(1, Ordering::Release);
-                    g
-                }
-                None => Arc::new(AtomicU64::new(0)),
-            };
-
-            let mut new = (*old).clone();
-            new.partition_ctx = Some(PartitionContext {
-                gpu_ratio,
-                cpu_backend: cpu_backend.clone(),
-                gate,
-                up,
-                down,
-                ratio_generation: gen_arc,
-            });
-            slot.store_weights_same_dtype(Arc::new(new));
         }
         Ok(count)
     }

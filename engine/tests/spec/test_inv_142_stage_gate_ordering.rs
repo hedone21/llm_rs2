@@ -232,7 +232,7 @@ fn empty_swap_batch_skips_stage_gate() {
     let be_dyn: Arc<dyn Backend> = mock.clone();
 
     let layers: Vec<Arc<LayerSlot>> = (0..2)
-        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None)))
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None, 0)))
         .collect();
     let ratio_gen = Arc::new(AtomicU64::new(0));
     let config = minimal_config();
@@ -368,7 +368,7 @@ fn empty_batch_ordering_invariants_hold() {
     let be_dyn: Arc<dyn Backend> = mock.clone();
 
     let layers: Vec<Arc<LayerSlot>> = (0..2)
-        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None)))
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be_dyn), DType::F16, None, 0)))
         .collect();
     let ratio_gen = Arc::new(AtomicU64::new(7)); // arbitrary non-zero starting value
     let config = minimal_config();

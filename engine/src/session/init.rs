@@ -750,6 +750,24 @@ impl SessionInitCtx {
             }
         }
 
+        // Phase α-W-2: 흩어진 4 secondary Arc 를 단일 Hardware resolver 로 흡수.
+        // primary `backend`/`memory` 는 위에서 이미 cpu/gpu 로컬의 clone 으로 set 되어
+        // 있으므로, 4 Arc 를 move 하는 Hardware::new 호출이 안전하다.
+        // 매핑: cpu=cpu_backend_arc / gpu=gpu_backend_arc / host=cpu_memory_arc /
+        //       device=gpu_memory_arc (UMA/discrete 직교는 resolve 내부에서 처리).
+        //
+        // Phase α-W-5: tensor partition 이 `prepare_tensor_partition(.., &hardware)` 로
+        // hardware resolver 를 직접 요구하므로 생성을 partition 블록 직전으로 끌어올린다.
+        // 762~865 사이는 backend/model/args/is_gpu 만 by-ref 로 쓰고 4 Arc 를 by-value
+        // consume 하지 않으므로 이동이 안전하다.
+        let hardware = Arc::new(Hardware::new(
+            cpu_backend_arc,
+            gpu_backend_arc,
+            None,
+            cpu_memory_arc,
+            gpu_memory_arc,
+        ));
+
         // Tensor partition: split FFN gate/up weights for CPU-GPU cooperative inference.
         // Requires weights to be CPU-accessible (after map_weights_for_cpu).
         //
@@ -759,7 +777,7 @@ impl SessionInitCtx {
         // path. We still call it so the semantics (and the "Prepared 0" log)
         // are explicit.
         if args.tensor_partition > 0.0 && args.tensor_partition < 1.0 {
-            match model.prepare_tensor_partition(args.tensor_partition, &cpu_backend_arc) {
+            match model.prepare_tensor_partition(args.tensor_partition, &hardware) {
                 Ok(0) => eprintln!(
                     "[Partition] ratio={:.3} treated as GPU-only (>= {:.3}); partition path disabled",
                     args.tensor_partition,
@@ -863,18 +881,7 @@ impl SessionInitCtx {
         #[cfg(not(feature = "opencl"))]
         let weights_on_gpu = false;
 
-        // Phase α-W-2: 흩어진 4 secondary Arc 를 단일 Hardware resolver 로 흡수.
-        // primary `backend`/`memory` 는 위에서 이미 cpu/gpu 로컬의 clone 으로 set 되어
-        // 있으므로, 4 Arc 를 move 하는 Hardware::new 호출이 안전하다.
-        // 매핑: cpu=cpu_backend_arc / gpu=gpu_backend_arc / host=cpu_memory_arc /
-        //       device=gpu_memory_arc (UMA/discrete 직교는 resolve 내부에서 처리).
-        let hardware = Arc::new(Hardware::new(
-            cpu_backend_arc,
-            gpu_backend_arc,
-            None,
-            cpu_memory_arc,
-            gpu_memory_arc,
-        ));
+        // (Phase α-W-5) `hardware` 는 partition 블록 직전(~line 761)에서 이미 생성됨.
 
         Ok(SessionInitCtx {
             sampling_config,

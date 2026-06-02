@@ -144,7 +144,7 @@ fn ratio_generation_bumps_equal_chunk_count() {
     let be = cpu_be();
     let ratio_generation = Arc::new(AtomicU64::new(0));
     let layers: Vec<LayerSlot> = (0..4)
-        .map(|_| LayerSlot::new(dummy_layer(&be), DType::F16, None))
+        .map(|_| LayerSlot::new(dummy_layer(&be), DType::F16, None, 0))
         .collect();
 
     // Simulate chunk dispatch with no secondary (execute_on_slots → no-op but

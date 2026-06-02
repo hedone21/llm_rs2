@@ -210,7 +210,7 @@ fn dummy_layer(be: &Arc<dyn Backend>) -> llm_rs2::layers::transformer_layer::Tra
 
 fn make_layers(be: &Arc<dyn Backend>, n: usize) -> Vec<Arc<LayerSlot>> {
     (0..n)
-        .map(|_| Arc::new(LayerSlot::new(dummy_layer(be), DType::F16, None)))
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(be), DType::F16, None, 0)))
         .collect()
 }
 
@@ -448,7 +448,7 @@ fn test_async_path_submit_deferred_commit() {
     // pending은 초기에 0.
     assert_eq!(dispatcher.pending_count(), 0, "initial pending must be 0");
 
-    let slot = Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None));
+    let slot = Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None, 0));
     let new_weights = Arc::new(dummy_layer(&be));
 
     use llm_rs2::pressure::weights::async_swap::SwapCommitJob;
@@ -498,7 +498,7 @@ fn test_async_dispatcher_submit_drain_dtype_change() {
 
     const N: usize = 5;
     let slots: Vec<Arc<LayerSlot>> = (0..N)
-        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None)))
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None, 0)))
         .collect();
 
     use llm_rs2::pressure::weights::async_swap::SwapCommitJob;

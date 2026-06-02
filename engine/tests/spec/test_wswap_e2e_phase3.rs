@@ -92,7 +92,7 @@ fn minimal_config(n_layers: usize) -> ModelConfig {
 fn make_model_ref(n_layers: usize) -> Arc<WeightSwapModelRef> {
     let be = cpu_be();
     let layers: Vec<Arc<LayerSlot>> = (0..n_layers)
-        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None)))
+        .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None, 0)))
         .collect();
     Arc::new(WeightSwapModelRef {
         layers: Arc::new(layers),

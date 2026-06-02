@@ -2785,7 +2785,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         // Re-split weights with new ratio (only if lazy map succeeded)
                         if lazy_map_ok {
-                            match model.prepare_tensor_partition(ratio, &cpu_backend_arc) {
+                            match model.prepare_tensor_partition(ratio, &hardware) {
                                 Ok(n) => {
                                     eprintln!(
                                         "[Partition] Re-split {} weights with ratio {:.2}",
@@ -3109,8 +3109,7 @@ fn main() -> anyhow::Result<()> {
                         // Restore to CLI partition ratio
                         let layer0_probe = model.layers[0].load_weights();
                         if !layer0_probe.wq.as_ptr().is_null()
-                            && let Ok(n) =
-                                model.prepare_tensor_partition(cli_ratio, &cpu_backend_arc)
+                            && let Ok(n) = model.prepare_tensor_partition(cli_ratio, &hardware)
                         {
                             eprintln!(
                                 "[Partition] RestoreDefaults: re-split {} weights with CLI ratio {:.2}",

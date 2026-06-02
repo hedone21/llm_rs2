@@ -32,6 +32,7 @@ pub trait WeightFormat: Send + Sync {
 ///
 /// spec·struct 는 **N-capable 지금** / N-way 병렬 dispatch+merge 커널은 leaf 로 성장
 /// (새 HW 추가 시 spec 재형성 0, leaf 한 곳만 — 3축 "M×N 은 Backend 아래 leaf 격리" 원칙).
+#[derive(Clone)]
 pub enum LayerDispatch {
     /// 1-slice dense fast-path (slice 기계 우회).
     Full,
@@ -42,6 +43,7 @@ pub enum LayerDispatch {
 }
 
 /// per-slice precision (GPU-f16 / NPU-q4) — partition = format(표현) × hardware(위치)의 곱.
+#[derive(Clone)]
 pub struct SliceSpec {
     pub share: f32,
     pub hardware: DeviceTarget,

@@ -76,7 +76,7 @@ fn snapshot_captured_before_swap_survives_incremental_chunk() {
 
     // Build LayerSlot with generation=1 weights
     let gen1_layer = make_layer(&be, 1);
-    let slot = LayerSlot::new(gen1_layer, DType::F16, None);
+    let slot = LayerSlot::new(gen1_layer, DType::F16, None, 0);
 
     // Simulate token T: capture snapshot (INV-121 / INV-144)
     let snapshot_before_swap = slot.load_weights();
@@ -116,7 +116,7 @@ fn multiple_chunks_each_token_snapshot_is_isolated() {
     // Build 4 slots
     let n = 4usize;
     let slots: Vec<LayerSlot> = (0..n)
-        .map(|i| LayerSlot::new(make_layer(&be, i as u64), DType::F16, None))
+        .map(|i| LayerSlot::new(make_layer(&be, i as u64), DType::F16, None, 0))
         .collect();
 
     // Token T: capture all snapshots
@@ -159,7 +159,7 @@ fn multiple_chunks_each_token_snapshot_is_isolated() {
 #[test]
 fn plan_completion_does_not_invalidate_prior_snapshots() {
     let be = cpu_be();
-    let slot = LayerSlot::new(make_layer(&be, 1), DType::F16, None);
+    let slot = LayerSlot::new(make_layer(&be, 1), DType::F16, None, 0);
 
     // Capture snapshot at token T
     let snap_t = slot.load_weights();

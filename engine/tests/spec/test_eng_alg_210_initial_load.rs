@@ -51,7 +51,7 @@ fn initial_load_uniform_dtype_secondary_none() {
     // Secondary = None → every slot opens with its handle empty.
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let slots: Vec<LayerSlot> = (0..16)
-        .map(|_| LayerSlot::new(dummy_layer(&be), DType::F16, None))
+        .map(|_| LayerSlot::new(dummy_layer(&be), DType::F16, None, 0))
         .collect();
 
     for slot in &slots {
@@ -68,7 +68,7 @@ fn initial_load_uniform_dtype_all_slots_identical() {
     // already present mixed state.
     let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let slots: Vec<LayerSlot> = (0..32)
-        .map(|_| LayerSlot::new(dummy_layer(&be), DType::Q4_0, None))
+        .map(|_| LayerSlot::new(dummy_layer(&be), DType::Q4_0, None, 0))
         .collect();
     assert!(slots.iter().all(|s| s.current_dtype() == DType::Q4_0));
 }

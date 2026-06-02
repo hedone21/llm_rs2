@@ -338,7 +338,7 @@ mod tests {
     }
 
     fn make_slot(be: &Arc<dyn Backend>, dtype: DType) -> Arc<LayerSlot> {
-        Arc::new(LayerSlot::new(make_layer(be), dtype, None))
+        Arc::new(LayerSlot::new(make_layer(be), dtype, None, 0))
     }
 
     fn make_weights(be: &Arc<dyn Backend>) -> Arc<LayerWeights> {

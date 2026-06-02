@@ -3101,6 +3101,7 @@ mod tests {
             (*initial).clone(),
             DType::F32,
             None, // No secondary mmap; not exercised by this test.
+            0,
         );
         // Capture the wq buffer Arc from the initial install.
         let initial_wq_buf = Arc::clone(slot.load_weights().wq.buffer());
