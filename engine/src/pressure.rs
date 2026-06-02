@@ -12,9 +12,11 @@
 pub mod cache_manager;
 pub mod eviction;
 pub mod kivi_cache;
+pub mod kivi_format;
 pub mod kv_cache;
 pub mod kv_migrate;
 pub mod offload;
+pub mod standard_format;
 pub mod weights;
 
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)

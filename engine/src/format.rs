@@ -6,11 +6,13 @@
 //! 두고, **impl 은 데이터에 내재**한다(KV → `kv/`(현 `pressure/`), weight → `models/weights/`).
 //! **guard rail: impl 은 여기 금지** (§2.1).
 //!
-//! Phase α-W 는 `WeightFormat`(신설, 현 코드 trait 부재)만 입주시킨다. `KVCacheFormat` 은 현
-//! `kv_cache_ops.rs` 의 `KVCacheOps` 를 rename·이동하는 **Phase α-K** 에서 `format/kv_cache_format.rs`
-//! 로 입주한다(C2 연혁 — `Merge` compact arg 동반). 따라서 α-W 에는 `kv_cache_format` 모듈을
-//! 만들지 않는다(빈 모듈 회귀 회피).
+//! Phase α-W 는 `WeightFormat`(신설, 현 코드 trait 부재)만 입주시킨다. `KVCacheFormat` 은
+//! **Phase α-K substep (1)** 에서 `format/kv_cache_format.rs` 로 입주한다(C2 연혁 — `Merge`
+//! compact arg 동반). 단 substep (1) 은 purely additive·unwired 이라 현 `kv_cache_ops.rs` 의
+//! `KVCacheOps` 와 **공존**한다(rename 이 아니라 신규 trait 신설; 기존 경로 무변).
 
+pub mod kv_cache_format;
 pub mod weight_format;
 
+pub use kv_cache_format::{AttnDims, KVCacheFormat, Merge};
 pub use weight_format::{LayerDispatch, SliceSpec, WeightFormat};
