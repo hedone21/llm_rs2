@@ -43,13 +43,13 @@
 
 ```mermaid
 flowchart TB
-    subgraph MGR["Manager Process"]
-        MS["MemoryStrategy<br/>(engine/src/resilience/strategy/memory.rs 매핑)"]
+    subgraph MGR["Manager Process / LocalPolicy"]
+        MS["LocalPolicy / Manager PolicyEngine<br/>(graded Pressure 융합 + 이산 EngineCommand)"]
         SIG["SystemSignal::MemoryPressure"]
     end
 
     subgraph RES["Resilience Layer (Engine)"]
-        RA["ResilienceAction::SwapWeights { ratio }"]
+        RA["EngineCommand::SwapWeights { ratio }"]
         PIPE["CachePressurePipeline"]
     end
 
@@ -97,6 +97,8 @@ flowchart TB
     style RES fill:#e1bee7
 ```
 
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 위 다이어그램의 좌측 두 노드는 구 어휘를 현행 흐름으로 그렸던 것을 교체했다. (1) `MemoryStrategy` 는 **삭제** — memory 압력 magnitude 는 graded `Pressure(0–100)` scalar 로 흐르고 `LocalPressureSource`(manager-less) / Manager PolicyEngine(manager-full)가 전 센서를 융합한다. (2) `ResilienceAction::SwapWeights` 는 **삭제** — `EngineCommand::SwapWeights`(`shared/src/lib.rs:189`, 18-variant, `kv.*`/`weight.*` dot-prefix)가 유일한 이산 어휘다. 따라서 `RA` 노드는 `EngineCommand::SwapWeights` 로 읽는다. swap 트리거 자체(MSG-042, DtypeTag, §2.8.1 WHAT vs HOW)는 `EngineCommand` 쪽이 살아있어 본질 불변. 미러: `spec/32-engine-algorithms.md:1514` 배너.
+
 > **Sprint 1 W-AUF-1 — secondary 진입 정책 갱신 (2026-05-19)**: AUF가 primary loader로 승격되면서(`arch/auf_format.md` §1.1) 위 다이어그램의 `Arc<SecondaryMmap>` 경로는 두 입력원을 받는다 — (1) **legacy dual-file**: `--model-path X.gguf` + `--secondary-gguf Y.auf|.gguf` (현재까지의 정식 경로), (2) **W-AUF-1**: `--model-path foo.auf` 단일 (현재는 self-secondary stub None, 기존 dual-file과 동등). `--secondary-gguf`는 **deprecated alias**로 stderr 경고 1회 후 그대로 동작하며 `.gguf`/`.auf` 양쪽 입력을 계속 수용한다 (INV-136 갱신). **W-AUF-2 예고**: `CAPABILITY_BIT_MULTI_DTYPE` ON 또는 multi-variant AUF는 explicit `secondary_source`가 없을 때 self-secondary를 자동 활성하도록 확장 예정 (`LoadConfig::disable_self_secondary` 플래그로 끌 수 있음). 향후 dual-file 경로는 legacy로 라벨되며 W-AUF-2 + N 시점에 `--secondary-gguf` 최종 제거.
 
 ### 1.2 시그널 → Swap 완료 Sequence
@@ -112,7 +114,7 @@ sequenceDiagram
     participant Fwd as Forward Loop
 
     Mgr->>Eng: SystemSignal::MemoryPressure(Critical)
-    Eng->>Eng: MemoryStrategy.react() → SwapWeights { ratio: 0.5 }
+    Eng->>Eng: LocalPolicy/PolicyEngine → EngineCommand::SwapWeights { ratio: 0.5 }
     Eng->>Handler: pipeline.handle(ctx)
 
     alt in prefill
@@ -633,24 +635,23 @@ flowchart TD
 
 ---
 
-### 2.8 컴포넌트: `ResilienceAction::SwapWeights` (engine 내부) vs `EngineCommand::SwapWeights` (shared)
+### 2.8 컴포넌트: `EngineCommand::SwapWeights` (shared, 유일 이산 어휘)
 
-**중요 정정 (2026-04-24 v4)**: 이전 arch 초안은 `ResilienceAction`을 shared crate의 enum으로 서술했으나, 실구조는 **engine 내부 enum**이다 (`engine/src/resilience/strategy/mod.rs`). Phase 3에서 Manager 통합은 **shared의 `EngineCommand` enum에 variant를 추가**하는 별개 경로로 수행된다.
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 이 절의 골격 전제 — "engine 내부 `ResilienceAction::SwapWeights` enum vs shared `EngineCommand::SwapWeights`" 라는 **두 진입점 이분법** — 은 이제 **거짓**이다. `ResilienceAction` enum 자체가 **삭제**되었으므로(α-W-3, `EngineCommand`(`shared/src/lib.rs:189`, 18-variant)가 유일한 이산 어휘) "engine 내부 enum" 진입점은 더 이상 존재하지 않는다. 아래 **2026-04-24 v4 "중요 정정"**(`ResilienceAction` 을 engine 내부 enum 이라 단언) 자체가 **superseded** — 그 정정이 가정한 enum 이 폐기됐다. 본 절은 `EngineCommand::SwapWeights` **단일**로 재서술한다. swap 의 wire format 본질(MSG-042 / DtypeTag / §2.8.1 WHAT vs HOW)은 `EngineCommand` 쪽이 살아있어 그대로 보존. 미러: `spec/32-engine-algorithms.md:1514`, `spec/33-engine-data.md` ENG-DAT-C09.
 
-**두 경로의 구분**:
+**경로 (단일 이산 어휘)**:
 
-| 타입 | 위치 | 역할 | Phase 3 처리 |
-|------|------|------|-------------|
-| `ResilienceAction::SwapWeights { target_ratio }` | `engine/src/resilience/strategy/mod.rs` (내부 enum) | Engine 내부 `MemoryStrategy::react()`가 Manager 없이 생성하는 fallback action | **Phase 3 신규 variant로 추가 권장** (Phase 2 범위에선 미추가). dispatch는 최종적으로 Phase 3의 공통 helper로 귀결. shared 프로토콜과 무관. |
-| `EngineCommand::SwapWeights { ratio, target_dtype }` | `shared/src/lib.rs` (프로토콜 enum) | Manager → Engine IPC payload | **MSG-042로 정의**. shared crate에 필수 추가. |
+| 타입 | 위치 | 역할 |
+|------|------|------|
+| `EngineCommand::SwapWeights { ratio, target_dtype }` | `shared/src/lib.rs` (프로토콜 enum, MSG-042) | swap 트리거의 **유일한 이산 어휘**. manager-full 의 외부 결정도, manager-less `LocalPolicy` 의 자율 결정(구 `MemoryStrategy` fallback이 담당하던 역할)도 모두 이 variant 를 생산하고 동일 dispatch 루트로 귀결한다. |
+
+> **연혁 — 2026-04-24 v4 "중요 정정" (superseded by α-W-3)**: 당시 초안은 *"`ResilienceAction` 을 shared crate enum 으로 서술했으나 실구조는 engine 내부 enum (`engine/src/resilience/strategy/mod.rs`)이다"* 라고 정정했고, Phase 3 Manager 통합을 *"shared `EngineCommand` enum 에 variant 추가하는 별개 경로"* 로 분리 서술했다. 이 정정이 단언한 engine 내부 `ResilienceAction` enum 은 α-W-3 에서 **삭제**되었으므로(`ResilienceManager`/4-strategy/`resolve_conflicts` 모두 production 소비자 0 = test-only 였음), "두 별개 경로" 프레이밍은 `EngineCommand::SwapWeights` 단일로 붕괴한다. 역사적 기록으로만 남긴다.
 
 **설계 결정**:
 
-- **ENG-ALG-214-ROUTE**: `generate.rs` dispatch 루프에 단일 `handle_swap_weights(ratio, target_dtype)` 함수를 추가한다. 두 진입점(shared `EngineCommand` / engine internal `ResilienceAction`)이 이 함수를 공유한다.
-- **MemoryStrategy 기본 매핑 (engine-internal fallback)**:
-  - `MemoryPressure::Critical → ResilienceAction::SwapWeights { target_ratio: 0.5, target_dtype: Q4_0 }`
-  - `MemoryPressure::Emergency → ResilienceAction::SwapWeights { target_ratio: 1.0, target_dtype: Q4_0 }`
-  - 이는 **Manager가 응답 지연 시**의 engine-independent fallback용이다. Manager가 활성화되면 Manager의 LuaPolicy 결정이 우선한다 (더 최신 signal).
+- **ENG-ALG-214-ROUTE**: `generate.rs` dispatch 루프에 단일 `handle_swap_weights(ratio, target_dtype)` 함수를 둔다. manager-full(IPC 수신 `EngineCommand`)과 manager-less(`LocalPolicy` 가 자율 생산한 `EngineCommand`)가 같은 함수를 공유한다 — 이제 둘 다 **동일 어휘 `EngineCommand::SwapWeights`** 라 변환 분기가 없다.
+- **manager-less 기본 트리거** (구 `MemoryStrategy` engine-internal fallback의 후신): manager-less 경로에서는 `LocalPolicy` 가 `EngineCommand::SwapWeights` 를 직접 생산하거나, 디버그 훅 `--force-swap-ratio`(spec/33 ENG-DAT-C09)가 prefill 종료 시 `EngineCommand::SwapWeights { ratio }` 를 직접 트리거한다. memory 압력 magnitude 자체는 graded `Pressure(0–100)` scalar 로 흐르며(`LocalPressureSource` 융합), `MemoryStrategy` 는 더 이상 SwapWeights 를 생성하지 않는다(삭제됨). Manager 가 활성화되면 Manager PolicyEngine(Lua DPP) 결정이 우선한다.
+  - 참고(legacy mapping, 역사적): 구 fallback 은 `Critical → ratio 0.5`, `Emergency → ratio 1.0` (`target_dtype: Q4_0`) 매핑을 썼다. 현 경로에서는 이 ratio 결정이 `LocalPolicy`/Manager PolicyEngine 의 정책 책임으로 이전됐다.
 - **프로토콜 호환성**: shared 쪽 신규 필드는 `#[serde(default, skip_serializing_if = "Option::is_none")]` 원칙(INV-028) 준수. 구 Manager는 `layer_swap`/`weight_swap_report`를 모르는 상태로도 동작 가능.
 
 **인터페이스 (shared, MSG-042/082/089)**:
@@ -676,14 +677,7 @@ pub enum EngineMessage {
 }
 ```
 
-**인터페이스 (engine 내부, Phase 3 권장 신규)**:
-```rust
-// engine/src/resilience/strategy/mod.rs
-pub enum ResilienceAction {
-    // ... 기존 variant ...
-    SwapWeights { target_ratio: f32, target_dtype: DtypeTag },  // DtypeTag는 shared에서 re-export
-}
-```
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 구 초안은 여기에 *"인터페이스 (engine 내부, Phase 3 권장 신규)"* 로 `engine/src/resilience/strategy/mod.rs` 의 `ResilienceAction { SwapWeights { target_ratio, target_dtype } }` enum 코드블록을 제시했다. `ResilienceAction` enum 은 α-W-3 에서 **삭제**되었으므로 이 "신규 engine 내부 인터페이스"는 더 이상 존재하지 않는다 — swap 의 유일한 이산 인터페이스는 위 `EngineCommand::SwapWeights`(shared) 단일이다. manager-less 자율 트리거는 별도 enum 없이 `LocalPolicy` 가 `EngineCommand::SwapWeights` 를 생산하거나 `--force-swap-ratio` 훅(ENG-DAT-C09)으로 흐른다.
 
 ---
 
@@ -1124,7 +1118,9 @@ flowchart TB
 
 Stage 2 `weight_swap_handler.rs`는 `CachePressurePipeline`에 **등록하지 않는다**. 대신 "Decider → Executor" 호출을 캡슐화하는 내부 모듈로 격하한다. 이 경우 Stage 2 테스트(WSWAP-2-HANDLER)는 그대로 유효하며, 단지 Pipeline dispatch test만 제거된다.
 
-**engine 내부 fallback 경로**: `ResilienceAction::SwapWeights`(engine 내부 enum)은 별도 경로이다. `MemoryStrategy`(`engine/src/resilience/strategy/memory.rs`)가 Manager 없이 engine 독립으로 swap을 트리거할 때 발행하는 engine-internal action이다. 이는 `generate.rs`의 resilience action loop에서 **동일한** dispatch 함수(SwapWeights 처리 코드)로 귀결된다. 즉 두 진입점이 있으나 공통 Decider + Executor를 공유한다. `ResilienceAction::SwapWeights`는 shared crate에 노출되지 않으며 테스트 대상도 아니다.
+**manager-less 트리거 경로**: manager-less 환경에서도 swap 어휘는 동일 — `EngineCommand::SwapWeights`(shared, 유일 이산 어휘)다. `LocalPolicy` 가 자율로 이 command 를 생산하거나, 디버그 훅 `--force-swap-ratio`(ENG-DAT-C09)가 prefill 종료 시 직접 트리거한다. 두 경우 모두 `generate.rs` dispatch 루프의 **동일한** `handle_swap_weights` 함수로 귀결되어 공통 Decider + Executor 를 공유한다.
+
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 위 산문의 구 서술 — *"`ResilienceAction::SwapWeights`(engine 내부 enum)은 별도 경로이고 `MemoryStrategy`(`engine/src/resilience/strategy/memory.rs`)가 발행하는 engine-internal action"* — 은 폐기됐다. `ResilienceAction`/`MemoryStrategy` 모두 α-W-3 에서 **삭제**(production 소비자 0 = test-only)되었고, manager-full/manager-less 양쪽 모두 `EngineCommand::SwapWeights` 단일 어휘로 수렴해 "두 별개 진입점" 프레이밍이 붕괴했다. memory magnitude 는 graded `Pressure(0–100)` scalar(`LocalPressureSource` 융합)로 흐르며 `MemoryStrategy` 의 swap 발행 역할은 소멸했다.
 
 ### 3.4 LuaPolicy API shape 예시
 

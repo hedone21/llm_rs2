@@ -625,11 +625,13 @@ pub fn from_messages(messages: Vec<ManagerMessage>) -> Self;   // pre-loaded
 
 ## 7. ResilienceManager (D-Bus 레거시 경로, ENG-016)
 
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 본 절의 strategy 출력 어휘는 폐기 타입 `ResilienceAction`(engine 내부 coarse 7-variant)이 아니라 `EngineCommand`(`shared/src/lib.rs:189`, 18-variant, `kv.*`/`weight.*` dot-prefix)다 — `EngineCommand` 가 **유일한 이산 어휘**다. `MemoryStrategy` 는 삭제(memory 압력은 graded `Pressure(0–100)` scalar 경로, `LocalPressureSource` 가 memory·thermal·energy magnitude 를 단일 scalar 로 융합) → strategy 는 **Thermal/Energy/Compute 3종**만 생존하며, scalar 로 환원 불가한 *mode* 명령(switch/suspend)만 낸다. `ResilienceStrategy::react` 는 `mode: OperatingMode` dead param 을 제거한다. `ResilienceManager`/4-strategy/`resolve_conflicts` 는 production 소비자 0(test-only)였고, 라이브 경로는 `EngineCommand`→`CommandExecutor::apply_command`(`executor.rs`)→`ExecutionPlan` 이다 (`execute_action`/`InferenceContext` 폐기). 아래 코드블록·표·규칙은 이 canonical 어휘로 읽는다.
+
 ### 설계 결정
 
 **Spec WHAT**: D-Bus signal에 직접 반응하는 자율 모드 (ENG-061).
 
-**구현 HOW**: `ResilienceManager`는 4종 `SystemSignal`을 `mpsc` 채널로 수신하고, `SignalLevels` 캐시 갱신 → `OperatingMode` 계산 → 4종 `ResilienceStrategy` 위임 → `resolve_conflicts()` 충돌 해소의 순서로 동작한다.
+**구현 HOW**: `ResilienceManager`는 4종 `SystemSignal`을 `mpsc` 채널로 수신하고, `SignalLevels` 캐시 갱신 → 해당 `ResilienceStrategy`(Thermal/Energy/Compute 3종; α-W-3 에서 `MemoryStrategy` 소멸 — memory 압력은 graded `Pressure` scalar 경로로 분리) `.react(signal)` → `Vec<EngineCommand>` 수집 → `resolve_conflicts()` 충돌 해소의 순서로 동작한다. `OperatingMode` 계산은 더 이상 `react()` 입력이 아니라 보고/상태용으로만 잔존한다(§5.4 CF3 — 구 `react(signal, mode)` 의 `mode` dead param 제거; 위 배너).
 
 **중요**: `generate.rs`에서 직접 사용되지 않는다. DbusTransport가 `signal_to_manager_message()`로 변환하여 CommandExecutor에 전달하므로, 사실상 Directive 경로로 합류한다.
 
@@ -647,42 +649,44 @@ impl OperatingMode {
 
 ### ResilienceStrategy trait
 
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: `react` 시그니처에서 구 `mode: OperatingMode` 인자는 dead 라 제거하고, 출력을 `Vec<EngineCommand>` 로 통일한다(구 `Vec<ResilienceAction>` 폐기). `name()` 은 불변.
+
 ```rust
 // engine/src/resilience/strategy/mod.rs
 pub trait ResilienceStrategy: Send + Sync {
-    fn react(&mut self, signal: &SystemSignal, mode: OperatingMode) -> Vec<ResilienceAction>;
+    fn react(&mut self, signal: &SystemSignal) -> Vec<EngineCommand>;
     fn name(&self) -> &str;
 }
 ```
 
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: `MemoryStrategy` 행 삭제 — memory 압력은 이산 strategy 가 아니라 graded `Pressure(0–100)` scalar 경로(`LocalPressureSource` 융합)로 흐른다. 생존 strategy 는 scalar 로 환원 불가한 *mode* 명령(switch/suspend)을 내는 3종뿐이다.
+
 | Strategy | 코드 |
 |----------|------|
-| MemoryStrategy | `strategy/memory.rs` |
 | ComputeStrategy | `strategy/compute.rs` |
 | ThermalStrategy | `strategy/thermal.rs` |
 | EnergyStrategy | `strategy/energy.rs` |
 
-### ResilienceAction
+### 이산 어휘 = EngineCommand
 
-```rust
-pub enum ResilienceAction {
-    Evict { target_ratio: f32 },
-    SwitchBackend { to: RecommendedBackend },
-    LimitTokens { max_tokens: usize },
-    Throttle { delay_ms: u64 },
-    Suspend,
-    RejectNew,
-    RestoreDefaults,
-}
-```
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 구 `ResilienceAction` enum(engine 내부 coarse 7-variant)은 **삭제됨**. `EngineCommand`(`shared/src/lib.rs:189`, fine 18-variant, `kv.*`/`weight.*` dot-prefix)가 이미 cross-domain 해소된 정식 wire format 이자 **유일한 이산 어휘**다. strategy 의 출력은 이 `EngineCommand` 를 직접 생산한다. 구 `ResilienceAction` 변형 → `EngineCommand` 매핑 요약:
+>
+> - `Evict { target_ratio }` → **폐기** (graded `Pressure` scalar 경로로 흡수)
+> - `SwitchBackend { to }` → `SwitchHw { device }`
+> - `LimitTokens { max_tokens }` → **폐기** (`EngineCommand` 등가 부재로 어휘 소멸)
+> - `Throttle { delay_ms }` → `Throttle { delay_ms }` (유지)
+> - `Suspend` → `Suspend` (유지)
+> - `RejectNew` → **폐기** (`EngineCommand` 등가 부재로 어휘 소멸)
+> - `RestoreDefaults` → `RestoreDefaults` (유지)
 
 ### resolve_conflicts() 규칙
 
-- Suspend가 있으면 다른 모든 액션을 무시
-- CPU backend가 GPU보다 우선 (안전 우선)
-- 가장 공격적인 eviction ratio (최소값)가 승리
-- 최대 delay가 승리
-- RestoreDefaults는 다른 제약이 없을 때만 유효
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: `resolve_conflicts(Vec<EngineCommand>) -> Vec<EngineCommand>` 로 시그니처가 바뀌고, 규칙은 7→4 로 축소된다 (Evict/LimitTokens/RejectNew 폐기). 아래는 생존 규칙. (단 `ResilienceManager`/4-strategy/`resolve_conflicts` 자체는 production 소비자 0 = test-only 였으며, 라이브 경로는 `EngineCommand`→`CommandExecutor::apply_command`(`executor.rs`)→`ExecutionPlan` 이다.)
+
+- (R1) `Suspend`가 있으면 결과를 `[Suspend]` 로 환원 (다른 모든 명령 무시)
+- `SwitchHw { device: "cpu" }`가 GPU보다 우선 (안전 우선; 구 SwitchBackend CPU-wins)
+- 최대 delay 의 `Throttle`가 승리
+- (R2) `RestoreDefaults`는 다른 제약이 없을 때(단독일 때)만 유효
 
 ### DbusTransport 변환 테이블 (ENG-024)
 

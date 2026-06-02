@@ -47,13 +47,15 @@ flowchart TB
 
 ### Emergency 자율 대응 (CROSS-013)
 
-Emergency 시그널은 Manager 없이도 Engine이 자율적으로 처리한다:
+Emergency 시그널은 Manager 없이도 Engine이 자율적으로 처리한다. 대응은 두 채널로 갈린다: **memory 압력의 magnitude**는 graded `Pressure(0–100)` scalar 로 융합되어 공격적 eviction 을 구동하고(연속 채널), scalar 로 환원 불가한 **mode 명령**(switch/suspend)은 생존 strategy 가 `EngineCommand` 이산 채널로 낸다.
 
-| Strategy | 파일 | Emergency 대응 |
-|----------|------|---------------|
-| MemoryStrategy | `engine/src/resilience/strategy/memory.rs` | `Evict(0.25)` + `RejectNew` |
-| ThermalStrategy | `engine/src/resilience/strategy/thermal.rs` | `Suspend` |
-| EnergyStrategy | `engine/src/resilience/strategy/energy.rs` | `Suspend` + `RejectNew` |
+| 출처 | 채널 | 파일 | Emergency 대응 |
+|------|------|------|---------------|
+| memory magnitude | graded scalar | `engine/src/resilience/local_pressure_source.rs` (`LocalPressureSource`) | `Pressure`→공격적 eviction (전 센서 magnitude 융합) |
+| ThermalStrategy | 이산 (`EngineCommand`) | `engine/src/resilience/strategy/thermal.rs` | `Suspend` |
+| EnergyStrategy | 이산 (`EngineCommand`) | `engine/src/resilience/strategy/energy.rs` | `Suspend` |
+
+> **α-W-3 갱신 (`arch/pipeline_stage_design_v2.md` §5.4 drift-sync)**: 구 `MemoryStrategy` 행(`Evict(0.25)` + `RejectNew`)은 폐기. (1) `MemoryStrategy` 삭제 — memory 압력의 magnitude 는 thermal·energy 와 함께 `LocalPressureSource` 가 단일 `Pressure(0–100)` scalar 로 융합하여 graded eviction 강도를 구동한다(연속 채널, R1 일원화 2026-06-02). (2) `Evict(target_ratio)`/`RejectNew` 어휘 소멸 — eviction 강도는 이제 이산 명령이 아니라 graded scalar 가 담당하고, `RejectNew` 는 `EngineCommand` 등가가 부재해 폐기(CF5). (3) 생존 strategy 는 Thermal/Energy/Compute 3종뿐이며 scalar 로 환원 불가한 *mode* 명령(switch/suspend)만 `EngineCommand` 로 낸다 — 이들의 magnitude 는 별도로 Pressure scalar 에 융합된다. Thermal/Energy 의 Emergency 대응은 `EngineCommand::Suspend`(구 `ResilienceAction::Suspend` 아님; `ResilienceAction` enum 자체가 삭제됨, CF1).
 
 ---
 
