@@ -93,8 +93,8 @@ fn main() -> anyhow::Result<()> {
                         // 인스턴스에서 파생해 보관 (R4: new_gpu 의 backend 인자와 같은
                         // 객체). KIVI test 루프(아래)가 이 handle 을 new_gpu 에 전달.
                         let b = Arc::new(b);
-                        opencl_kivi_handle =
-                            Some(b.clone() as Arc<dyn llm_rs2::capability::kivi_attention::KiviAttentionBackend>);
+                        opencl_kivi_handle = Some(b.clone()
+                            as Arc<dyn llm_rs2::capability::kivi_attention::KiviAttentionBackend>);
                         backends.push(b as Arc<dyn Backend>);
                     }
                     Err(e) => println!(

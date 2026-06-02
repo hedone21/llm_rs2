@@ -1333,7 +1333,11 @@ impl TransformerLayer {
 
             // CPU down matmul on its slice: down.cpu_slice = [hidden, ffn_hidden-split_col],
             // input = pw.gate_cpu = [1, 1, ffn_hidden-split_col], output = [1, 1, hidden].
-            cpu.matmul_transposed(&pw.gate_cpu, part.down.cpu_slice(), &mut pw.down_partial_cpu)?;
+            cpu.matmul_transposed(
+                &pw.gate_cpu,
+                part.down.cpu_slice(),
+                &mut pw.down_partial_cpu,
+            )?;
 
             let t_cpu_done = if part_trace {
                 Some(std::time::Instant::now())

@@ -1180,7 +1180,10 @@ mod tests {
         let pw = split_weight_col(&w, split_col, &cpu).unwrap();
         assert_eq!(pw.split_row, split_col); // repurposed field
         assert_eq!(pw.gpu_slice().shape().dims(), &[out_dim, split_col]);
-        assert_eq!(pw.cpu_slice().shape().dims(), &[out_dim, in_dim - split_col]);
+        assert_eq!(
+            pw.cpu_slice().shape().dims(),
+            &[out_dim, in_dim - split_col]
+        );
 
         // Verify byte-exact data for every row.
         let orig = w.as_slice::<f32>();

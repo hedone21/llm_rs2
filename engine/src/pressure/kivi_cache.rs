@@ -19,8 +19,8 @@
 use crate::backend::Backend;
 // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
-use crate::capability::kivi_attention::KiviAttentionBackend;
 use crate::buffer::{Buffer, DType};
+use crate::capability::kivi_attention::KiviAttentionBackend;
 use crate::kv_cache_ops::{KVCacheOps, KVLayout, KiviRawBuffers};
 use crate::memory::Memory;
 use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
@@ -3883,8 +3883,16 @@ mod tests {
         // new_gpu with non-OpenCL backend: falls back to CPU mode
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
-        let cache_fallback =
-            KiviCache::new_gpu(kv_heads, head_dim, max_seq, res_cap, 2, cpu_backend, None, memory);
+        let cache_fallback = KiviCache::new_gpu(
+            kv_heads,
+            head_dim,
+            max_seq,
+            res_cap,
+            2,
+            cpu_backend,
+            None,
+            memory,
+        );
         assert!(!cache_fallback.is_gpu());
         assert_eq!(
             cache_fallback.gpu_attn_capacity(),

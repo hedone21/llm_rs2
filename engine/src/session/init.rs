@@ -239,7 +239,14 @@ impl SessionInitCtx {
                 // CPU primary: backend(=CpuBackend) 는 KIVI native attention capability
                 // 미보유 → 빈 registry. GPU secondary 가 있어도 primary backend 가 GPU
                 // 가 아니므로(decode 가 GPU new_gpu 로 진입 안 함) register 하지 않는다.
-                (cpu, cpu_mem, gpu_be, gpu_mem_arc, false, CapabilityRegistry::new())
+                (
+                    cpu,
+                    cpu_mem,
+                    gpu_be,
+                    gpu_mem_arc,
+                    false,
+                    CapabilityRegistry::new(),
+                )
             }
             #[cfg(feature = "opencl")]
             "opencl" | "gpu" => {
