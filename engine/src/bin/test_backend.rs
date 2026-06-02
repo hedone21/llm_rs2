@@ -63,6 +63,12 @@ fn main() -> anyhow::Result<()> {
     println!("=== LLM RS2 Backend Test Suite (Expanded) ===");
 
     let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
+    // Phase α-W-4 §3.3: OpenCL backend 의 KIVI native attention handle (R4: KIVI
+    // test 가 new_gpu 에 넘길 때 backend 와 동일 ocl 인스턴스의 clone).
+    #[cfg(feature = "opencl")]
+    let mut opencl_kivi_handle: Option<
+        Arc<dyn llm_rs2::capability::kivi_attention::KiviAttentionBackend>,
+    > = None;
     for name in &args.backends {
         match name.to_lowercase().as_str() {
             "auto" | "cpu" => backends.push(Arc::new(CpuBackend::new())),
@@ -82,7 +88,15 @@ fn main() -> anyhow::Result<()> {
             "opencl" | "gpu" => {
                 #[cfg(feature = "opencl")]
                 match OpenCLBackend::new() {
-                    Ok(b) => backends.push(Arc::new(b)),
+                    Ok(b) => {
+                        // Phase α-W-4 §3.3: KIVI native attention handle 을 동일 ocl
+                        // 인스턴스에서 파생해 보관 (R4: new_gpu 의 backend 인자와 같은
+                        // 객체). KIVI test 루프(아래)가 이 handle 을 new_gpu 에 전달.
+                        let b = Arc::new(b);
+                        opencl_kivi_handle =
+                            Some(b.clone() as Arc<dyn llm_rs2::capability::kivi_attention::KiviAttentionBackend>);
+                        backends.push(b as Arc<dyn Backend>);
+                    }
                     Err(e) => println!(
                         "Warning: Failed to initialize OpenCL backend: {}. Skipping.",
                         e
@@ -214,7 +228,12 @@ fn main() -> anyhow::Result<()> {
             backend.name()
         );
         for bits in [2u8, 4, 8] {
-            run_kivi_attention_test(&mut all_results, backend.clone(), bits);
+            run_kivi_attention_test(
+                &mut all_results,
+                backend.clone(),
+                opencl_kivi_handle.clone(),
+                bits,
+            );
         }
     }
 
@@ -686,7 +705,12 @@ fn xorshift32(state: &mut u32) -> f32 {
 /// (enough tokens to trigger multiple flushes), then compares:
 ///   CPU: get_view() -> naive single-token attention
 ///   GPU: attention_gen_kivi() native kernel
-fn run_kivi_attention_test(results: &mut Vec<TestResult>, backend: Arc<dyn Backend>, bits: u8) {
+fn run_kivi_attention_test(
+    results: &mut Vec<TestResult>,
+    backend: Arc<dyn Backend>,
+    kivi: Option<Arc<dyn llm_rs2::capability::kivi_attention::KiviAttentionBackend>>,
+    bits: u8,
+) {
     let kv_heads: usize = 8;
     let head_dim: usize = 64;
     let n_heads_q: usize = 32; // GQA ratio = 4
@@ -698,6 +722,7 @@ fn run_kivi_attention_test(results: &mut Vec<TestResult>, backend: Arc<dyn Backe
 
     match perform_kivi_attention_test(
         backend.clone(),
+        kivi,
         bits,
         kv_heads,
         head_dim,
@@ -749,6 +774,7 @@ fn run_kivi_attention_test(results: &mut Vec<TestResult>, backend: Arc<dyn Backe
 #[allow(clippy::too_many_arguments)]
 fn perform_kivi_attention_test(
     backend: Arc<dyn Backend>,
+    kivi: Option<Arc<dyn llm_rs2::capability::kivi_attention::KiviAttentionBackend>>,
     bits: u8,
     kv_heads: usize,
     head_dim: usize,
@@ -761,6 +787,7 @@ fn perform_kivi_attention_test(
     {
         let _ = (
             backend,
+            kivi,
             bits,
             kv_heads,
             head_dim,
@@ -805,6 +832,7 @@ fn perform_kivi_attention_test(
             residual_size,
             bits,
             backend.clone(),
+            kivi,
             gpu_memory.clone(),
         );
         assert!(gpu_cache.is_gpu(), "GPU cache creation failed");

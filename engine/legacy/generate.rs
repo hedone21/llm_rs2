@@ -2,6 +2,7 @@ use clap::Parser;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
+use llm_rs2::capability::kivi_attention::KiviAttentionBackend;
 use llm_rs2::inference::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::inference::sampling::{self, SamplingConfig};
 use llm_rs2::instrument::OpInstrument;
@@ -130,6 +131,10 @@ fn main() -> anyhow::Result<()> {
     let importance_formula = ctx.importance_formula;
     let importance_compare = ctx.importance_compare;
     let swap_only_layers = ctx.swap_only_layers;
+    // Phase α-W-4 §3.3: L2 backend capability 레지스트리. OpenCL backend 면
+    // KIVI native attention handle 이 등록되어 있다. KIVI cache 생성 시
+    // `caps.get::<dyn KiviAttentionBackend>()` 로 pull 한다.
+    let caps = ctx.caps;
     let mut model = ctx.model;
 
     // 2. Tokenizer
@@ -282,6 +287,9 @@ fn main() -> anyhow::Result<()> {
         };
         let qcf_config = llm_rs2::qcf::QcfConfig::default();
         let kivi_bits = args.effective_kivi_bits();
+        // Phase α-W-4 §3.3: KIVI native attention handle 을 caps 에서 1회 pull
+        // (closure 밖). OpenCL backend 면 Some, 그 외 None.
+        let kivi_cap = caps.get::<dyn KiviAttentionBackend>();
         let mut kv_caches: Vec<KiviCache> = (0..num_layers)
             .map(|_| {
                 KiviCache::new_gpu(
@@ -291,6 +299,7 @@ fn main() -> anyhow::Result<()> {
                     args.effective_kivi_residual_size(),
                     kivi_bits,
                     backend.clone(),
+                    kivi_cap.clone(),
                     memory.clone(),
                 )
             })
@@ -368,6 +377,7 @@ fn main() -> anyhow::Result<()> {
             &model,
             &tokenizer,
             &backend,
+            caps.get::<dyn KiviAttentionBackend>(),
             &memory,
             kv_heads,
             head_dim,
@@ -485,6 +495,7 @@ fn main() -> anyhow::Result<()> {
         let mut session = if matches!(args.effective_kv_mode(), KvMode::Kivi) {
             build_chat_kivi(ChatKiviArgs {
                 backend: backend.clone(),
+                kivi: caps.get::<dyn KiviAttentionBackend>(),
                 memory: memory.clone(),
                 model: model_arc,
                 kv_heads,
@@ -745,6 +756,7 @@ fn main() -> anyhow::Result<()> {
             &model,
             &tokenizer,
             &backend,
+            caps.get::<dyn KiviAttentionBackend>(),
             &memory,
             &input_ids,
             &sampling_config,
@@ -4004,6 +4016,9 @@ fn run_kivi(
     model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
+    // Phase α-W-4 §3.3: KIVI native attention handle (caps 에서 caller 가 pull).
+    // OpenCL backend 면 Some, 그 외 None.
+    kivi: Option<Arc<dyn KiviAttentionBackend>>,
     memory: &Arc<dyn Memory>,
     input_ids: &[u32],
     sampling_config: &SamplingConfig,
@@ -4056,6 +4071,7 @@ fn run_kivi(
                 residual_size,
                 initial_bits,
                 backend.clone(),
+                kivi.clone(),
                 memory.clone(),
             )
         })

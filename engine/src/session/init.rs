@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
+use crate::capability::CapabilityRegistry;
 use crate::hardware::Hardware;
 use crate::inference::sampling::SamplingConfig;
 use crate::memory::Memory;
@@ -40,6 +41,12 @@ pub struct SessionInitCtx {
     /// hardware 축 resolver — 흩어진 cpu/gpu backend·memory secondary Arc를 흡수.
     /// `hardware.resolve(target)` 로 (backend, memory) 페어를 푼다 (Phase α-W-2).
     pub hardware: Arc<Hardware>,
+
+    /// L2 backend capability 레지스트리 (Phase α-W-4 §3.3). OpenCL backend 면
+    /// `KiviAttentionBackend` handle 이 등록되어 있고, 그 외(CPU-only/CUDA)는 빈
+    /// registry 다. 소비자(KiviCache 생성 caller)가 construction 시점에 1회
+    /// `caps.get::<dyn KiviAttentionBackend>()` pull 한다.
+    pub caps: Arc<CapabilityRegistry>,
 
     /// swap layer 선택 알고리즘 (--swap-algorithm).
     pub swap_algorithm: crate::pressure::weights::SwapAlgorithm,
@@ -186,12 +193,13 @@ impl SessionInitCtx {
         // Backend initialization: primary backend + secondary for SwitchHw resilience.
         // GPU secondary is auto-initialized when available (soft failure OK).
         #[allow(clippy::type_complexity)]
-        let (backend, memory, gpu_backend_arc, gpu_memory_arc, is_gpu): (
+        let (backend, memory, gpu_backend_arc, gpu_memory_arc, is_gpu, caps): (
             Arc<dyn Backend>,
             Arc<dyn Memory>,
             Option<Arc<dyn Backend>>,
             Option<Arc<dyn Memory>>,
             bool,
+            CapabilityRegistry,
         ) = match args.backend.as_str() {
             "cpu" => {
                 let cpu = Arc::new(CpuBackend::new()) as Arc<dyn Backend>;
@@ -228,7 +236,10 @@ impl SessionInitCtx {
                     Option<Arc<dyn Backend>>,
                     Option<Arc<dyn Memory>>,
                 ) = (None, None);
-                (cpu, cpu_mem, gpu_be, gpu_mem_arc, false)
+                // CPU primary: backend(=CpuBackend) 는 KIVI native attention capability
+                // 미보유 → 빈 registry. GPU secondary 가 있어도 primary backend 가 GPU
+                // 가 아니므로(decode 가 GPU new_gpu 로 진입 안 함) register 하지 않는다.
+                (cpu, cpu_mem, gpu_be, gpu_mem_arc, false, CapabilityRegistry::new())
             }
             #[cfg(feature = "opencl")]
             "opencl" | "gpu" => {
@@ -291,9 +302,24 @@ impl SessionInitCtx {
                         rpcmem_alloc,
                     ),
                 );
+                // Phase α-W-4 §3.3: OpenCL backend 는 KIVI native attention capability
+                // 보유 → registry 에 register. R4 불변식: register 하는 Arc 와 아래에서
+                // primary backend 로 쓰는 Arc 는 **동일 ocl 인스턴스의 clone** 이어야 한다
+                // (KiviCache.kivi 와 일반 ops 가 같은 객체를 봐야 함). gpu_concrete 는
+                // 여기까지 단일 인스턴스이므로 clone 으로 두 trait object 를 파생한다.
+                // gpu_score 는 결정 #5 에 따라 register 하지 않는다(소비자 0, β 까지).
+                let mut caps = CapabilityRegistry::new();
+                caps.register::<dyn crate::backend::KiviAttentionBackend>(gpu_concrete.clone());
                 let gpu: Arc<dyn Backend> = gpu_concrete;
                 // GPU is primary; keep a ref as secondary for SwitchHw round-trip
-                (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
+                (
+                    gpu.clone(),
+                    gpu_mem.clone(),
+                    Some(gpu),
+                    Some(gpu_mem),
+                    true,
+                    caps,
+                )
             }
             #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
             "cuda" => {
@@ -355,13 +381,23 @@ impl SessionInitCtx {
                     }
                 }
                 let gpu: Arc<dyn Backend> = gpu_concrete;
-                (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
+                // CUDA backend 는 KIVI native attention capability 미보유 → 빈 registry.
+                (
+                    gpu.clone(),
+                    gpu_mem.clone(),
+                    Some(gpu),
+                    Some(gpu_mem),
+                    true,
+                    CapabilityRegistry::new(),
+                )
             }
             _ => anyhow::bail!(
                 "Unknown backend: {}. Use cpu, opencl, or cuda.",
                 args.backend
             ),
         };
+        // Phase α-W-4 §3.3: registry freeze. 이후 소비자는 read-only pull 만.
+        let caps = Arc::new(caps);
         // cpu_backend_arc: always available for migration and SwitchHw fallback.
         let cpu_backend_arc: Arc<dyn Backend> = if args.backend == "cpu" {
             backend.clone()
@@ -892,6 +928,7 @@ impl SessionInitCtx {
             is_gpu,
             weights_on_gpu,
             hardware,
+            caps,
             swap_algorithm,
             importance_formula,
             importance_compare,

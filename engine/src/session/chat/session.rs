@@ -17,6 +17,7 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
+use crate::capability::kivi_attention::KiviAttentionBackend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
@@ -381,6 +382,10 @@ pub struct ChatStandardArgs {
 /// [`build_chat_kivi`]에 전달하는 args.
 pub struct ChatKiviArgs {
     pub backend: Arc<dyn Backend>,
+    /// KIVI native attention capability handle (Phase α-W-4 §3.3). 최외곽 caller 가
+    /// `caps.get::<dyn KiviAttentionBackend>()` 로 pull 해 채운다 (OpenCL backend 면
+    /// `Some`, 그 외 `None`). `alloc_kivi_kv_caches` 로 그대로 전달.
+    pub kivi: Option<Arc<dyn KiviAttentionBackend>>,
     pub memory: Arc<dyn Memory>,
     pub model: Arc<TransformerModel>,
     pub kv_heads: usize,
@@ -473,6 +478,7 @@ pub fn build_chat_kivi(args: ChatKiviArgs) -> Result<ChatSession> {
         residual_size,
         bits,
         &args.backend,
+        &args.kivi,
         &args.memory,
     );
 

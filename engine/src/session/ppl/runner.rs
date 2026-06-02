@@ -9,6 +9,7 @@ use tokenizers::Tokenizer;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
+use crate::capability::kivi_attention::KiviAttentionBackend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::{self};
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
@@ -240,6 +241,9 @@ pub fn run_kivi_ppl(
     model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
+    // Phase α-W-4 §3.3: KIVI native attention handle (caller 가 caps 에서 pull).
+    // OpenCL backend 면 Some, 그 외 None.
+    kivi: Option<Arc<dyn KiviAttentionBackend>>,
     memory: &Arc<dyn Memory>,
     kv_heads: usize,
     head_dim: usize,
@@ -290,6 +294,7 @@ pub fn run_kivi_ppl(
                 residual_size,
                 2,
                 backend.clone(),
+                kivi.clone(),
                 memory.clone(),
             )
         })

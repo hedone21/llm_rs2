@@ -19,6 +19,7 @@
 use crate::backend::Backend;
 // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
+use crate::capability::kivi_attention::KiviAttentionBackend;
 use crate::buffer::{Buffer, DType};
 use crate::kv_cache_ops::{KVCacheOps, KVLayout, KiviRawBuffers};
 use crate::memory::Memory;
@@ -250,6 +251,12 @@ pub struct KiviCache {
     // ── GPU-native buffers (None = CPU-only mode, backward compatible) ──
     /// GPU backend handle. Some ↔ GPU mode enabled.
     gpu_backend: Option<Arc<dyn Backend>>,
+    /// KIVI native attention capability handle (Phase α-W-4 §3.3). Some ↔ GPU
+    /// 모드 + OpenCL backend. `update_gpu` 의 `kivi_gather_update` dispatch 가
+    /// 매 토큰 `as_kivi_attention()` lookup 대신 본 handle 을 직접 쓴다. caller
+    /// 가 `caps.get::<dyn KiviAttentionBackend>()` 로 pull 해 `new_gpu` 에 전달
+    /// (R4: gpu_backend 와 동일 ocl 인스턴스의 clone).
+    kivi: Option<Arc<dyn KiviAttentionBackend>>,
     /// Memory allocator used to create GPU buffers (used by ensure_gpu_attn_capacity).
     gpu_memory: Option<Arc<dyn Memory>>,
     /// GPU F32 residual K buffer: [kv_heads, res_cap, head_dim]
@@ -374,6 +381,7 @@ impl KiviCache {
             last_attn_scores: None,
             // GPU fields — None in CPU-only mode
             gpu_backend: None,
+            kivi: None,
             gpu_memory: None,
             gpu_res_k: None,
             gpu_res_v: None,
@@ -420,6 +428,12 @@ impl KiviCache {
     ///
     /// When `backend` is an OpenCL backend, allocates persistent GPU buffers for
     /// residual and attention data. Falls back to CPU-only mode if GPU allocation fails.
+    ///
+    /// `kivi` 는 KIVI native attention capability handle (Phase α-W-4 §3.3). caller 가
+    /// `caps.get::<dyn KiviAttentionBackend>()` 로 pull 해 전달한다. R3 불변식: OpenCL
+    /// backend 로 GPU 모드 진입 시 반드시 `Some` (init.rs 가 OpenCL 에 register). R4
+    /// 불변식: `backend` 와 동일 ocl 인스턴스의 clone.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_gpu(
         kv_heads: usize,
         head_dim: usize,
@@ -427,6 +441,7 @@ impl KiviCache {
         residual_size: usize,
         bits: u8,
         backend: Arc<dyn Backend>,
+        kivi: Option<Arc<dyn KiviAttentionBackend>>,
         memory: Arc<dyn Memory>,
     ) -> Self {
         let mut cache = Self::new_with_bits(kv_heads, head_dim, max_seq_len, residual_size, bits);
@@ -564,6 +579,7 @@ impl KiviCache {
                 }
 
                 cache.gpu_backend = Some(backend);
+                cache.kivi = kivi;
                 cache.gpu_memory = Some(memory);
                 cache.gpu_res_k = Some(res_k);
                 cache.gpu_res_v = Some(res_v);
@@ -1564,10 +1580,20 @@ impl KiviCache {
     // slow path 의 `copy_slice` 는 Backend trait 의 일반 메서드라 그대로
     // dyn dispatch — 함수 내 잔존 downcast/import 0 이므로 marker 제거.
     fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
+        // slow path 의 `copy_slice` 는 Backend trait 의 일반 ops → gpu_backend 유지.
         let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
-        let kivi_be = backend_arc
-            .as_kivi_attention()
-            .ok_or_else(|| anyhow::anyhow!("GPU mode requires a KIVI-capable backend"))?;
+        // fast path 의 `kivi_gather_update` 는 KIVI native capability → 매 토큰
+        // `as_kivi_attention()` lookup 대신 construction 시 pull 된 handle 직접 사용
+        // (Phase α-W-4 §3.3). R3: GPU 모드면 OpenCL backend 라 caller 가 Some 보장.
+        // owned clone 으로 self 의 mutable borrow(gpu_res_k/flush_residual_gpu)와
+        // 충돌 회피 (기존 backend_arc 패턴과 동일).
+        let kivi_be = self
+            .kivi
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("KIVI GPU 모드인데 kivi handle 부재 (registry 미등록?)")
+            })?
+            .clone();
 
         let mut written = 0usize;
         while written < seq_len {
@@ -3261,7 +3287,7 @@ mod tests {
         use crate::memory::galloc::Galloc;
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
-        let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
+        let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
         // CpuBackend.name() != "OpenCL" → must fall back to CPU mode
         assert!(
             !cache.is_gpu(),
@@ -3734,7 +3760,7 @@ mod tests {
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
 
         // new_gpu with non-OpenCL backend falls back to CPU mode
-        let cache_cpu = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
+        let cache_cpu = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
         assert!(!cache_cpu.is_gpu());
         // CPU mode: attn_k_buf/attn_v_buf should be fully allocated
         let attn_cap = cache_cpu.attn_k_buf.size() + cache_cpu.attn_v_buf.size();
@@ -3858,7 +3884,7 @@ mod tests {
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
         let cache_fallback =
-            KiviCache::new_gpu(kv_heads, head_dim, max_seq, res_cap, 2, cpu_backend, memory);
+            KiviCache::new_gpu(kv_heads, head_dim, max_seq, res_cap, 2, cpu_backend, None, memory);
         assert!(!cache_fallback.is_gpu());
         assert_eq!(
             cache_fallback.gpu_attn_capacity(),
@@ -4024,7 +4050,7 @@ mod tests {
         use crate::memory::galloc::Galloc;
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
-        let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
+        let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
         // CPU fallback: gpu_attn_k/v should be None
         assert!(
             cache.gpu_attn_k.is_none(),
