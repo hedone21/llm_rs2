@@ -137,6 +137,10 @@ QCF(Quality Cost Function)는 두 패밀리로 명확히 구분한다. 액션마
 
 Conventional Commits: `type(scope): subject` — 명령형 현재 시제. Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
 
+## 코드 스타일 컨벤션
+
+- **모듈 파일 스타일 = no-`mod.rs`** (Rust 모던 path 스타일, 2026-06-02 결정). 디렉토리 모듈의 루트는 `foo/mod.rs` 가 아니라 형제 `foo.rs` 다 (`foo.rs` + `foo/` 안에 서브모듈). 두 스타일 다 Rust 2024 에서 유효하나, no-`mod.rs` 가 권장 모던 관용구(`cargo new` 기본)이고 이미 top-level (`backend.rs`/`buffer.rs`/`memory.rs`/`quant.rs`)이 채택한 패턴이라 프로젝트 전역 컨벤션으로 채택한다. **신규·이동 모듈은 반드시 이 스타일.** 기존 nested `mod.rs` 38개는 일괄 sweep (별도 `chore:` 커밋, `git mv` history 보존)으로 정리. 대응 설계: `arch/pipeline_stage_design_v2.md` §2.1 규칙 C.
+
 ## 에이전트 시스템
 
 6개 특화 서브에이전트가 `.claude/agents/`에 정의되어 있다. 메인 세션이 오케스트레이터 역할을 하며 에이전트 간 결과를 전달한다.
