@@ -13,11 +13,7 @@ fn host_build_source_verifies_single_instance_sharing() {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     // 1. OpenCLBackend::get_extension 이 EXT_RPCMEM_ALLOCATOR 를 노출.
-    let opencl_mod = base
-        .join("src")
-        .join("backend")
-        .join("opencl")
-        .join("mod.rs");
+    let opencl_mod = base.join("src").join("backend").join("opencl.rs");
     if opencl_mod.exists() {
         let src = std::fs::read_to_string(&opencl_mod).expect("read opencl/mod.rs");
         assert!(

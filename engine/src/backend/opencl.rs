@@ -782,8 +782,8 @@ impl OpenCLBackend {
         // === Load kernel programs with fallback ===
 
         // Matmul F32: try original, fallback to nosub, then dummy
-        let matmul_src = include_str!("../../../kernels/mul_mv_f32_f32.cl");
-        let matmul_fallback_src = include_str!("../../../kernels/fallback/mul_mv_f32_f32_nosub.cl");
+        let matmul_src = include_str!("../../kernels/mul_mv_f32_f32.cl");
+        let matmul_fallback_src = include_str!("../../kernels/fallback/mul_mv_f32_f32_nosub.cl");
         let program = match Program::builder()
             .devices(device)
             .src(matmul_src)
@@ -815,8 +815,8 @@ impl OpenCLBackend {
         };
 
         // Simple ops: try original, fallback to nosub file
-        let simple_ops_src = include_str!("../../../kernels/simple_ops.cl");
-        let simple_ops_fallback_src = include_str!("../../../kernels/fallback/simple_ops_nosub.cl");
+        let simple_ops_src = include_str!("../../kernels/simple_ops.cl");
+        let simple_ops_fallback_src = include_str!("../../kernels/fallback/simple_ops_nosub.cl");
         let simple_ops_program = match Program::builder()
             .devices(device)
             .src(simple_ops_src)
@@ -841,8 +841,8 @@ impl OpenCLBackend {
         };
 
         // Q4_0 matmul: try original, fallback to nosub, then dummy
-        let q4_0_src = include_str!("../../../kernels/mul_mv_q4_0_f32.cl");
-        let q4_0_fallback_src = include_str!("../../../kernels/fallback/mul_mv_q4_0_f32_nosub.cl");
+        let q4_0_src = include_str!("../../kernels/mul_mv_q4_0_f32.cl");
+        let q4_0_fallback_src = include_str!("../../kernels/fallback/mul_mv_q4_0_f32_nosub.cl");
         let q4_0_program = match Program::builder()
             .devices(device)
             .src(q4_0_src)
@@ -874,7 +874,7 @@ impl OpenCLBackend {
         };
 
         // Get rows: try original, fallback to dummy
-        let get_rows_src = include_str!("../../../kernels/get_rows.cl");
+        let get_rows_src = include_str!("../../kernels/get_rows.cl");
         let get_rows_program = match Program::builder()
             .devices(device)
             .src(get_rows_src)
@@ -892,7 +892,7 @@ impl OpenCLBackend {
         };
 
         // Quantize Q4_0: try original, fallback to dummy
-        let q4_quant_src = include_str!("../../../kernels/quantize_q4_0.cl");
+        let q4_quant_src = include_str!("../../kernels/quantize_q4_0.cl");
         let quant_q4_0_program = match Program::builder()
             .devices(device)
             .src(q4_quant_src)
@@ -923,8 +923,8 @@ impl OpenCLBackend {
         // correct local/global geometry. Historically both paths shared a single
         // (nosub) dispatch, which silently corrupted the 4-wave variant — the
         // "broken on Adreno 830" story was a dispatch bug, not a kernel bug.
-        let f16_src = include_str!("../../../kernels/mul_mv_f16_f32.cl");
-        let f16_fallback_src = include_str!("../../../kernels/fallback/mul_mv_f16_f32_nosub.cl");
+        let f16_src = include_str!("../../kernels/mul_mv_f16_f32.cl");
+        let f16_fallback_src = include_str!("../../kernels/fallback/mul_mv_f16_f32_nosub.cl");
         let f16_is_nosub: bool;
         // 2026-04-22: nosub (single-SG, N_DST=4) is DEFAULT on Adreno 830 —
         // matches llama.cpp's design and measured −33% TBT at n=1024 (Qwen F16)
@@ -982,7 +982,7 @@ impl OpenCLBackend {
         };
 
         // F16 GEMV N_DST=4 variant for large-N decode (lm_head, FFN)
-        let f16_l4_src = include_str!("../../../kernels/mul_mv_f16_f32_l4.cl");
+        let f16_l4_src = include_str!("../../kernels/mul_mv_f16_f32_l4.cl");
         let f16_l4_program = match Program::builder()
             .devices(device)
             .src(f16_l4_src)
@@ -1006,7 +1006,7 @@ impl OpenCLBackend {
         // Activation ne11=1 case: 1 output row per WG, 64-lane subgroup reduce,
         // no local memory. llama.cpp selects this when ne11*ne12 < 4.
         // Tested 2026-04-22 to close the remaining n=2000 gap vs llama.cpp.
-        let f16_1row_src = include_str!("../../../kernels/mul_mv_f16_f32_1row_simple.cl");
+        let f16_1row_src = include_str!("../../kernels/mul_mv_f16_f32_1row_simple.cl");
         let f16_1row_program = match Program::builder()
             .devices(device)
             .src(f16_1row_src)
@@ -1026,8 +1026,8 @@ impl OpenCLBackend {
         // Flash attention kernels — compiled with head_dim-specific defines.
         // Each DK variant is a separate program because DK is a compile-time
         // constant (q_priv[DK_VEC] / o_acc[DV_VEC] are private arrays).
-        let flash_attn_src = include_str!("../../../kernels/flash_attn_f32_f16.cl");
-        let flash_attn_f32_src = include_str!("../../../kernels/flash_attn_f32.cl");
+        let flash_attn_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
+        let flash_attn_f32_src = include_str!("../../kernels/flash_attn_f32.cl");
 
         // DK=64 (Llama 3.2 1B, other head_dim=64 models)
         let flash_attn_dk64_defines = "-DDK=64 -DDV=64 -DBLOCK_M=64 -DBLOCK_N=32";
@@ -1125,7 +1125,7 @@ impl OpenCLBackend {
         };
 
         // GEMM kernels for prefill — tiled matmul (BM=64, BN=64, BK=16)
-        let gemm_f16_src = include_str!("../../../kernels/mul_mm_f16_f32_l4_lm.cl");
+        let gemm_f16_src = include_str!("../../kernels/mul_mm_f16_f32_l4_lm.cl");
         let gemm_f16_program = match Program::builder()
             .devices(device)
             .src(gemm_f16_src)
@@ -1145,7 +1145,7 @@ impl OpenCLBackend {
             }
         };
 
-        let gemm_f32_src = include_str!("../../../kernels/mul_mm_f32_f32_l4_lm.cl");
+        let gemm_f32_src = include_str!("../../kernels/mul_mm_f32_f32_l4_lm.cl");
         let gemm_f32_program = match Program::builder()
             .devices(device)
             .src(gemm_f32_src)
@@ -1166,7 +1166,7 @@ impl OpenCLBackend {
         };
 
         // Q4_0 tiled GEMM for prefill (interleaved BlockQ4_0 layout).
-        let gemm_q4_0_src = include_str!("../../../kernels/mul_mm_q4_0_f32_l4_lm.cl");
+        let gemm_q4_0_src = include_str!("../../kernels/mul_mm_q4_0_f32_l4_lm.cl");
         let gemm_q4_0_program = match Program::builder()
             .devices(device)
             .src(gemm_q4_0_src)
@@ -1187,7 +1187,7 @@ impl OpenCLBackend {
         };
 
         // KIVI Q2 kernels (optional — dequantize/scatter for GPU-native KiviCache)
-        let kivi_q2_src = include_str!("../../../kernels/kivi_q2.cl");
+        let kivi_q2_src = include_str!("../../kernels/kivi_q2.cl");
         let kivi_q2_kernels = Program::builder()
             .devices(device)
             .src(kivi_q2_src)
@@ -1201,7 +1201,7 @@ impl OpenCLBackend {
         }
 
         // KIVI fused attention kernels (optional — native Q2/Q4/Q8 attention)
-        let kivi_attn_src = include_str!("../../../kernels/kivi_attn.cl");
+        let kivi_attn_src = include_str!("../../kernels/kivi_attn.cl");
         let kivi_attn_program = Program::builder()
             .devices(device)
             .src(kivi_attn_src)
@@ -1215,7 +1215,7 @@ impl OpenCLBackend {
         }
 
         // Score-only attention kernel (Q*K^T + softmax, no V multiply)
-        let attn_scores_src = include_str!("../../../kernels/attention_scores.cl");
+        let attn_scores_src = include_str!("../../kernels/attention_scores.cl");
         let attention_scores_program = Program::builder()
             .devices(device)
             .src(attn_scores_src)
@@ -1229,7 +1229,7 @@ impl OpenCLBackend {
         }
 
         // Q4_0 noshuffle SOA conversion kernel (cvt.cl already contains the kernel)
-        let cvt_noshuffle_src = include_str!("../../../kernels/cvt.cl");
+        let cvt_noshuffle_src = include_str!("../../kernels/cvt.cl");
         let cvt_noshuffle_program = Program::builder()
             .devices(device)
             .src(cvt_noshuffle_src)
@@ -1247,7 +1247,7 @@ impl OpenCLBackend {
         // (per-thread float4 budget) leaves the legacy `cvt.cl` path intact.
         // `convert_q4_0_to_noshuffle()` falls back to the 4-step path when this
         // program (and therefore `kernel_cvt_q4_0_noshuffle_fused`) is `None`.
-        let cvt_noshuffle_fused_src = include_str!("../../../kernels/cvt_q4_0_noshuffle_fused.cl");
+        let cvt_noshuffle_fused_src = include_str!("../../kernels/cvt_q4_0_noshuffle_fused.cl");
         let cvt_noshuffle_fused_program = Program::builder()
             .devices(device)
             .src(cvt_noshuffle_fused_src)
@@ -1267,7 +1267,7 @@ impl OpenCLBackend {
         // Adreno Q4_0 GEMM fast path: `mul_mat_Ab_Bi_8x4.cl` consumes SOA
         // weights (from cvt.cl) and F16-transposed activations to compute
         // prefill matmul at ~4-5x the throughput of generic `mul_mm_q4_0`.
-        let gemm_ab_bi_src = include_str!("../../../kernels/mul_mat_Ab_Bi_8x4.cl");
+        let gemm_ab_bi_src = include_str!("../../kernels/mul_mat_Ab_Bi_8x4.cl");
         let gemm_ab_bi_program = Program::builder()
             .devices(device)
             .src(gemm_ab_bi_src)
@@ -1284,7 +1284,7 @@ impl OpenCLBackend {
 
         // Activation transpose kernel (F32 → F16, pads N to multiple of 8).
         // Required pre-processing for `mul_mat_Ab_Bi_8x4`.
-        let transpose_src = include_str!("../../../kernels/transpose.cl");
+        let transpose_src = include_str!("../../kernels/transpose.cl");
         let transpose_program = Program::builder()
             .devices(device)
             .src(transpose_src)
@@ -2857,7 +2857,7 @@ impl OpenCLBackend {
         // SAFETY: single-threaded inference access (same pattern as kernels UnsafeCell)
         let cache = unsafe { &mut *self.gemv_noshuffle_cache.get() };
         if !cache.contains_key(&ne01) {
-            let gemv_src = include_str!("../../../kernels/gemv_noshuffle_q4_0.cl");
+            let gemv_src = include_str!("../../kernels/gemv_noshuffle_q4_0.cl");
             let defines = format!(
                 "{} -DLINE_STRIDE_A={} -DBLOCK_STRIDE_A={} -DSIMDGROUP_WIDTH={}",
                 self.cl_opts, line_stride_a, block_stride_a, simdgroup_width

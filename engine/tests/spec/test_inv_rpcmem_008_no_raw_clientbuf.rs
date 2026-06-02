@@ -47,8 +47,7 @@ fn opencl_backend_mod_no_raw_client_buf() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join("backend")
-        .join("opencl")
-        .join("mod.rs");
+        .join("opencl.rs");
     check_source_no_clientbuf(&path);
 }
 

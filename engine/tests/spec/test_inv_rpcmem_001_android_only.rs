@@ -41,8 +41,7 @@ fn host_build_opencl_backend_demotes_rpcmem_flag() {
     let src_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join("backend")
-        .join("opencl")
-        .join("mod.rs");
+        .join("opencl.rs");
     if !src_path.exists() {
         eprintln!("[INV-RPCMEM-001] opencl/mod.rs 없음 (opencl feature 미활성) — skip");
         return;
