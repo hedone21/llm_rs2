@@ -1224,8 +1224,8 @@ impl TransformerLayer {
             // 1. GPU: enqueue the entire FFN chain on the split_col-wide slice.
             //    No flush/sync in between — in-order queue preserves ordering
             //    and the GPU can pipeline the chain end-to-end.
-            backend.matmul_transposed(&ws.residual, &part.gate.gpu_slice, &mut pw.gate_gpu)?;
-            backend.matmul_transposed(&ws.residual, &part.up.gpu_slice, &mut pw.up_gpu)?;
+            backend.matmul_transposed(&ws.residual, part.gate.gpu_slice(), &mut pw.gate_gpu)?;
+            backend.matmul_transposed(&ws.residual, part.up.gpu_slice(), &mut pw.up_gpu)?;
             if use_gelu_tanh {
                 backend.gelu_tanh_mul(&mut pw.gate_gpu, &pw.up_gpu)?;
             } else {
@@ -1233,7 +1233,7 @@ impl TransformerLayer {
             }
             backend.matmul_transposed(
                 &pw.gate_gpu,
-                &part.down.gpu_slice,
+                part.down.gpu_slice(),
                 &mut pw.down_partial_gpu,
             )?;
             backend.flush()?;
@@ -1249,7 +1249,7 @@ impl TransformerLayer {
             let cpu = &part.cpu_backend;
             #[cfg(target_arch = "aarch64")]
             let used_fused = {
-                let cpu_slice_dtype = part.gate.cpu_slice.dtype();
+                let cpu_slice_dtype = part.gate.cpu_slice().dtype();
                 let cpu_is_neon = cpu.name().contains("CPU");
                 if cpu_is_neon && cpu_slice_dtype == DType::F16 {
                     // B-5b Phase 2 Stage 2-A: route through the CPU
@@ -1264,14 +1264,14 @@ impl TransformerLayer {
                             k_cpu,
                             &[
                                 (
-                                    part.gate.cpu_slice.as_ptr() as *const u16,
+                                    part.gate.cpu_slice().as_ptr() as *const u16,
                                     pw.gate_cpu.as_mut_ptr() as *mut f32,
-                                    part.gate.cpu_slice.shape().dims()[0],
+                                    part.gate.cpu_slice().shape().dims()[0],
                                 ),
                                 (
-                                    part.up.cpu_slice.as_ptr() as *const u16,
+                                    part.up.cpu_slice().as_ptr() as *const u16,
                                     pw.up_cpu.as_mut_ptr() as *mut f32,
-                                    part.up.cpu_slice.shape().dims()[0],
+                                    part.up.cpu_slice().shape().dims()[0],
                                 ),
                             ],
                         );
@@ -1288,14 +1288,14 @@ impl TransformerLayer {
                             k_cpu,
                             &[
                                 (
-                                    part.gate.cpu_slice.as_ptr() as *const BlockQ4_0,
+                                    part.gate.cpu_slice().as_ptr() as *const BlockQ4_0,
                                     pw.gate_cpu.as_mut_ptr() as *mut f32,
-                                    part.gate.cpu_slice.shape().dims()[0],
+                                    part.gate.cpu_slice().shape().dims()[0],
                                 ),
                                 (
-                                    part.up.cpu_slice.as_ptr() as *const BlockQ4_0,
+                                    part.up.cpu_slice().as_ptr() as *const BlockQ4_0,
                                     pw.up_cpu.as_mut_ptr() as *mut f32,
-                                    part.up.cpu_slice.shape().dims()[0],
+                                    part.up.cpu_slice().shape().dims()[0],
                                 ),
                             ],
                         );
@@ -1320,8 +1320,8 @@ impl TransformerLayer {
                         dst.copy_from_slice(src);
                     }
                 }
-                cpu.matmul_transposed(&pw.residual_cpu, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
-                cpu.matmul_transposed(&pw.residual_cpu, &part.up.cpu_slice, &mut pw.up_cpu)?;
+                cpu.matmul_transposed(&pw.residual_cpu, part.gate.cpu_slice(), &mut pw.gate_cpu)?;
+                cpu.matmul_transposed(&pw.residual_cpu, part.up.cpu_slice(), &mut pw.up_cpu)?;
             }
 
             // CPU silu/gelu * up on its slice.
@@ -1333,7 +1333,7 @@ impl TransformerLayer {
 
             // CPU down matmul on its slice: down.cpu_slice = [hidden, ffn_hidden-split_col],
             // input = pw.gate_cpu = [1, 1, ffn_hidden-split_col], output = [1, 1, hidden].
-            cpu.matmul_transposed(&pw.gate_cpu, &part.down.cpu_slice, &mut pw.down_partial_cpu)?;
+            cpu.matmul_transposed(&pw.gate_cpu, part.down.cpu_slice(), &mut pw.down_partial_cpu)?;
 
             let t_cpu_done = if part_trace {
                 Some(std::time::Instant::now())

@@ -40,19 +40,55 @@ pub fn is_gpu_only_ratio(gpu_ratio: f32) -> bool {
     gpu_ratio >= GPU_ONLY_THRESHOLD
 }
 
+/// A single slice of a partitioned weight: the sub-tensor, the backend that
+/// computes it, and the number of elements along the split axis.
+///
+/// `rows` = number of elements along the **split axis**: for a row-split
+/// (`split_weight`, out_dim axis) it is the number of output rows; for a
+/// col-split (`split_weight_col`, in_dim axis) it is the number of inner
+/// columns. This may differ from `tensor.shape().dims()[0]` (e.g. col-split
+/// keeps `out_dim` rows while `rows` carries the column count).
+///
+/// N-capable container element (current production: always 2 = `[gpu, cpu]`).
+#[derive(Clone)]
+pub struct WeightSlice {
+    pub tensor: Tensor,
+    pub backend: Arc<dyn Backend>,
+    pub rows: usize,
+}
+
 /// A weight tensor split row-wise into GPU and CPU partitions.
 ///
 /// For a weight `W [out_dim, in_dim]`, the split produces:
-///   - `gpu_slice`: `W[0..split_row, :]`   (processed by GPU)
-///   - `cpu_slice`: `W[split_row.., :]`     (processed by CPU)
+///   - `slices[0]` (GPU): `W[0..split_row, :]`   (processed by GPU)
+///   - `slices[1]` (CPU): `W[split_row.., :]`     (processed by CPU)
 ///
 /// Each slice owns an independent buffer (pre-copied from the original weight).
 /// GPU slices have a valid `cl_mem` handle; CPU slices have valid host pointers.
+///
+/// `slices` is an N-capable composite; current production always holds exactly
+/// two slices in fixed order `[gpu, cpu]`. Use `gpu_slice()` / `cpu_slice()` to
+/// read the underlying tensors by that contract.
 #[derive(Clone)]
 pub struct PartitionedWeight {
-    pub gpu_slice: Tensor,
-    pub cpu_slice: Tensor,
+    /// N-slice composite. Current production = `[gpu, cpu]` (fixed order).
+    pub slices: Vec<WeightSlice>,
     pub split_row: usize,
+}
+
+impl PartitionedWeight {
+    #[inline]
+    pub fn gpu_slice(&self) -> &Tensor {
+        &self.slices[0].tensor
+    }
+    #[inline]
+    pub fn cpu_slice(&self) -> &Tensor {
+        &self.slices[1].tensor
+    }
+    #[inline]
+    pub fn gpu_slice_mut(&mut self) -> &mut Tensor {
+        &mut self.slices[0].tensor
+    }
 }
 
 /// Per-layer partition context holding CPU backend and partitioned weights.
@@ -247,8 +283,19 @@ pub fn split_weight(
     );
 
     Ok(PartitionedWeight {
-        gpu_slice: gpu_tensor,
-        cpu_slice: cpu_tensor,
+        // slices[0]=GPU, slices[1]=CPU 순서 고정 (gpu_slice()/cpu_slice() 접근자 계약)
+        slices: vec![
+            WeightSlice {
+                tensor: gpu_tensor,
+                backend: weight.backend().clone(),
+                rows: split_row,
+            },
+            WeightSlice {
+                tensor: cpu_tensor,
+                backend: cpu_backend.clone(),
+                rows: out_dim - split_row,
+            },
+        ],
         split_row,
     })
 }
@@ -387,8 +434,19 @@ pub fn split_weight_col(
     );
 
     Ok(PartitionedWeight {
-        gpu_slice: gpu_tensor,
-        cpu_slice: cpu_tensor,
+        // slices[0]=GPU, slices[1]=CPU 순서 고정 (gpu_slice()/cpu_slice() 접근자 계약)
+        slices: vec![
+            WeightSlice {
+                tensor: gpu_tensor,
+                backend: weight.backend().clone(),
+                rows: split_col,
+            },
+            WeightSlice {
+                tensor: cpu_tensor,
+                backend: cpu_backend.clone(),
+                rows: in_dim - split_col,
+            },
+        ],
         split_row: split_col, // field repurposed to carry the col-split
     })
 }
@@ -811,8 +869,8 @@ mod tests {
         let w = make_f32_weight(5504, 1536);
         let cpu = cpu_backend();
         let pw = split_weight(&w, 0.7, &cpu).unwrap();
-        let gpu_rows = pw.gpu_slice.shape().dims()[0];
-        let cpu_rows = pw.cpu_slice.shape().dims()[0];
+        let gpu_rows = pw.gpu_slice().shape().dims()[0];
+        let cpu_rows = pw.cpu_slice().shape().dims()[0];
         assert_eq!(gpu_rows + cpu_rows, 5504);
         assert_eq!(gpu_rows, pw.split_row);
     }
@@ -825,14 +883,14 @@ mod tests {
         let cpu = cpu_backend();
         let pw = split_weight(&w, 0.6, &cpu).unwrap();
 
-        let gpu_size = pw.gpu_slice.size();
-        let cpu_size = pw.cpu_slice.size();
+        let gpu_size = pw.gpu_slice().size();
+        let cpu_size = pw.cpu_slice().size();
         assert_eq!(gpu_size + cpu_size, w.size());
 
         // Verify data content matches original weight bytes (pre-copy creates independent buffers).
         let orig = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.size()) };
-        let gpu_data = unsafe { std::slice::from_raw_parts(pw.gpu_slice.as_ptr(), gpu_size) };
-        let cpu_data = unsafe { std::slice::from_raw_parts(pw.cpu_slice.as_ptr(), cpu_size) };
+        let gpu_data = unsafe { std::slice::from_raw_parts(pw.gpu_slice().as_ptr(), gpu_size) };
+        let cpu_data = unsafe { std::slice::from_raw_parts(pw.cpu_slice().as_ptr(), cpu_size) };
         assert_eq!(gpu_data, &orig[..gpu_size]);
         assert_eq!(cpu_data, &orig[gpu_size..]);
     }
@@ -844,14 +902,14 @@ mod tests {
         let cpu = cpu_backend();
         let pw = split_weight(&w, 0.5, &cpu).unwrap();
 
-        assert_eq!(pw.gpu_slice.size() + pw.cpu_slice.size(), w.size());
+        assert_eq!(pw.gpu_slice().size() + pw.cpu_slice().size(), w.size());
 
         // Verify data integrity: read a value from the cpu_slice region
         let split_row = pw.split_row;
         let in_dim = 512;
         let expected_idx = split_row * in_dim; // first element of cpu region
         let expected_val = expected_idx as f32 * 0.001;
-        let cpu_data = pw.cpu_slice.as_slice::<f32>();
+        let cpu_data = pw.cpu_slice().as_slice::<f32>();
         assert!(
             (cpu_data[0] - expected_val).abs() < 1e-6,
             "expected {}, got {}",
@@ -895,14 +953,14 @@ mod tests {
         let gpu_buf = memory.alloc(split_row * 4, DType::F32).unwrap();
         let mut out_gpu = Tensor::new(Shape::new(vec![1, 1, split_row]), gpu_buf, backend.clone());
         backend
-            .matmul_transposed(&x, &pw.gpu_slice, &mut out_gpu)
+            .matmul_transposed(&x, pw.gpu_slice(), &mut out_gpu)
             .unwrap();
 
         // CPU part: out_cpu = x * W_cpu^T => [1, 1, out_dim - split_row]
         let cpu_rows = out_dim - split_row;
         let cpu_buf = memory.alloc(cpu_rows * 4, DType::F32).unwrap();
         let mut out_cpu = Tensor::new(Shape::new(vec![1, 1, cpu_rows]), cpu_buf, cpu2.clone());
-        cpu2.matmul_transposed(&x, &pw.cpu_slice, &mut out_cpu)
+        cpu2.matmul_transposed(&x, pw.cpu_slice(), &mut out_cpu)
             .unwrap();
 
         // Compare: concat(out_gpu, out_cpu) == out_full
@@ -981,12 +1039,12 @@ mod tests {
         let gpu_buf = memory.alloc(split_row * 4, DType::F32).unwrap();
         let mut out_gpu = Tensor::new(Shape::new(vec![1, 1, split_row]), gpu_buf, backend.clone());
         backend
-            .matmul_transposed(&x, &pw.gpu_slice, &mut out_gpu)
+            .matmul_transposed(&x, pw.gpu_slice(), &mut out_gpu)
             .unwrap();
 
         let cpu_buf = memory.alloc(cpu_rows * 4, DType::F32).unwrap();
         let mut out_cpu = Tensor::new(Shape::new(vec![1, 1, cpu_rows]), cpu_buf, cpu2.clone());
-        cpu2.matmul_transposed(&x, &pw.cpu_slice, &mut out_cpu)
+        cpu2.matmul_transposed(&x, pw.cpu_slice(), &mut out_cpu)
             .unwrap();
 
         // Compare
@@ -1060,7 +1118,7 @@ mod tests {
         let pw_low = split_weight(&w, 0.01, &cpu).unwrap();
         assert_eq!(pw_low.split_row, ROW_ALIGNMENT);
         assert_eq!(
-            pw_low.gpu_slice.shape().dims()[0] + pw_low.cpu_slice.shape().dims()[0],
+            pw_low.gpu_slice().shape().dims()[0] + pw_low.cpu_slice().shape().dims()[0],
             1024
         );
 
@@ -1068,7 +1126,7 @@ mod tests {
         let pw_high = split_weight(&w, 0.99, &cpu).unwrap();
         assert_eq!(pw_high.split_row, 1024 - ROW_ALIGNMENT);
         assert_eq!(
-            pw_high.gpu_slice.shape().dims()[0] + pw_high.cpu_slice.shape().dims()[0],
+            pw_high.gpu_slice().shape().dims()[0] + pw_high.cpu_slice().shape().dims()[0],
             1024
         );
     }
@@ -1080,8 +1138,8 @@ mod tests {
         let cpu = cpu_backend();
         let pw = split_weight(&w, 0.5, &cpu).unwrap();
         assert_eq!(pw.split_row, 128);
-        assert_eq!(pw.gpu_slice.shape().dims(), &[128, 128]);
-        assert_eq!(pw.cpu_slice.shape().dims(), &[128, 128]);
+        assert_eq!(pw.gpu_slice().shape().dims(), &[128, 128]);
+        assert_eq!(pw.cpu_slice().shape().dims(), &[128, 128]);
     }
 
     // Error case: out_dim too small for partitioning.
@@ -1121,13 +1179,13 @@ mod tests {
 
         let pw = split_weight_col(&w, split_col, &cpu).unwrap();
         assert_eq!(pw.split_row, split_col); // repurposed field
-        assert_eq!(pw.gpu_slice.shape().dims(), &[out_dim, split_col]);
-        assert_eq!(pw.cpu_slice.shape().dims(), &[out_dim, in_dim - split_col]);
+        assert_eq!(pw.gpu_slice().shape().dims(), &[out_dim, split_col]);
+        assert_eq!(pw.cpu_slice().shape().dims(), &[out_dim, in_dim - split_col]);
 
         // Verify byte-exact data for every row.
         let orig = w.as_slice::<f32>();
-        let gpu_data = pw.gpu_slice.as_slice::<f32>();
-        let cpu_data = pw.cpu_slice.as_slice::<f32>();
+        let gpu_data = pw.gpu_slice().as_slice::<f32>();
+        let cpu_data = pw.cpu_slice().as_slice::<f32>();
         let cpu_cols = in_dim - split_col;
         for r in 0..out_dim {
             for c in 0..split_col {
@@ -1156,16 +1214,16 @@ mod tests {
 
         let pw = split_weight_col(&w, split_col, &cpu).unwrap();
         let gpu_data =
-            unsafe { std::slice::from_raw_parts(pw.gpu_slice.as_ptr(), pw.gpu_slice.size()) };
+            unsafe { std::slice::from_raw_parts(pw.gpu_slice().as_ptr(), pw.gpu_slice().size()) };
         let cpu_data =
-            unsafe { std::slice::from_raw_parts(pw.cpu_slice.as_ptr(), pw.cpu_slice.size()) };
+            unsafe { std::slice::from_raw_parts(pw.cpu_slice().as_ptr(), pw.cpu_slice().size()) };
         let orig = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.size()) };
 
         let row_bytes = in_dim / 32 * 18;
         let gpu_row_bytes = split_col / 32 * 18;
         let cpu_row_bytes = (in_dim - split_col) / 32 * 18;
-        assert_eq!(pw.gpu_slice.size(), out_dim * gpu_row_bytes);
-        assert_eq!(pw.cpu_slice.size(), out_dim * cpu_row_bytes);
+        assert_eq!(pw.gpu_slice().size(), out_dim * gpu_row_bytes);
+        assert_eq!(pw.cpu_slice().size(), out_dim * cpu_row_bytes);
 
         for r in 0..out_dim {
             let orig_row = &orig[r * row_bytes..(r + 1) * row_bytes];
@@ -1226,12 +1284,12 @@ mod tests {
             backend.clone(),
         );
         backend
-            .matmul_transposed(&x_gpu, &pw.gpu_slice, &mut out_gpu)
+            .matmul_transposed(&x_gpu, pw.gpu_slice(), &mut out_gpu)
             .unwrap();
 
         let cpu_out_buf = memory.alloc(out_dim * 4, DType::F32).unwrap();
         let mut out_cpu = Tensor::new(Shape::new(vec![1, 1, out_dim]), cpu_out_buf, cpu2.clone());
-        cpu2.matmul_transposed(&x_cpu, &pw.cpu_slice, &mut out_cpu)
+        cpu2.matmul_transposed(&x_cpu, pw.cpu_slice(), &mut out_cpu)
             .unwrap();
 
         // Sum: full ≈ gpu_partial + cpu_partial (elementwise on out_dim).

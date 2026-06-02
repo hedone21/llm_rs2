@@ -1208,11 +1208,11 @@ impl TransformerModel {
             }
             // Partition slices: when `--tensor-partition <r>` is active the
             // plan-path FFN dispatches onto `partition_ctx.{gate,up,down}.
-            // gpu_slice`. Without SOA these fall back to the AOS GEMV kernel
-            // which is measurably slower than noshuffle on Adreno 830 (see
-            // build_partitioned_layer_plan). Register the sub-buffer cl_mems
-            // here so the plan builder can look them up via the same key
-            // scheme used for full weights.
+            // gpu_slice()` (slices[0]). Without SOA these fall back to the AOS
+            // GEMV kernel which is measurably slower than noshuffle on Adreno
+            // 830 (see build_partitioned_layer_plan). Register the sub-buffer
+            // cl_mems here so the plan builder can look them up via the same
+            // key scheme used for full weights.
             //
             // Partition slices live on `ClSubBuffer` whose cl_mem references
             // a parent full-weight allocation — we cannot drop the parent
@@ -1221,9 +1221,9 @@ impl TransformerModel {
             // cl_mem address rather than the placeholder.
             if let Some(ref mut ctx) = layer.partition_ctx {
                 for weight in [
-                    &mut ctx.gate.gpu_slice,
-                    &mut ctx.up.gpu_slice,
-                    &mut ctx.down.gpu_slice,
+                    ctx.gate.gpu_slice_mut(),
+                    ctx.up.gpu_slice_mut(),
+                    ctx.down.gpu_slice_mut(),
                 ] {
                     if process_weight(weight, false)? {
                         count += 1;
@@ -2221,9 +2221,9 @@ impl TransformerModel {
             let (partition_gate_ns, partition_up_ns, partition_down_ns) =
                 match layer.partition_ctx.as_ref() {
                     Some(ctx) => (
-                        ns_entry(&ctx.gate.gpu_slice),
-                        ns_entry(&ctx.up.gpu_slice),
-                        ns_entry(&ctx.down.gpu_slice),
+                        ns_entry(ctx.gate.gpu_slice()),
+                        ns_entry(ctx.up.gpu_slice()),
+                        ns_entry(ctx.down.gpu_slice()),
                     ),
                     None => (None, None, None),
                 };

@@ -691,21 +691,21 @@ impl TransformerLayer {
                 // 2. GPU: enqueue gate+up matmuls back-to-back, one flush.
                 backend.matmul_transposed(
                     x,
-                    &part.gate.gpu_slice,
+                    part.gate.gpu_slice(),
                     &mut part_ws.gate_gpu_partial,
                 )?;
-                backend.matmul_transposed(x, &part.up.gpu_slice, &mut part_ws.up_gpu_partial)?;
+                backend.matmul_transposed(x, part.up.gpu_slice(), &mut part_ws.up_gpu_partial)?;
                 backend.flush()?;
 
                 // 3. CPU: gate+up NEON matmuls on the (already-read) x_cpu.
                 part.cpu_backend.matmul_transposed(
                     &part_ws.x_cpu,
-                    &part.gate.cpu_slice,
+                    part.gate.cpu_slice(),
                     &mut part_ws.gate_cpu_partial,
                 )?;
                 part.cpu_backend.matmul_transposed(
                     &part_ws.x_cpu,
-                    &part.up.cpu_slice,
+                    part.up.cpu_slice(),
                     &mut part_ws.up_cpu_partial,
                 )?;
 

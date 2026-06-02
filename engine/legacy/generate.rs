@@ -2823,13 +2823,13 @@ fn main() -> anyhow::Result<()> {
                                             log.push_str(&format!(
                                                 "gate_gpu_slice={} up_gpu_slice={} down_gpu_slice={}",
                                                 buffer_kind_label(
-                                                    ctx.gate.gpu_slice.buffer().as_ref()
+                                                    ctx.gate.gpu_slice().buffer().as_ref()
                                                 ),
                                                 buffer_kind_label(
-                                                    ctx.up.gpu_slice.buffer().as_ref()
+                                                    ctx.up.gpu_slice().buffer().as_ref()
                                                 ),
                                                 buffer_kind_label(
-                                                    ctx.down.gpu_slice.buffer().as_ref()
+                                                    ctx.down.gpu_slice().buffer().as_ref()
                                                 ),
                                             ));
                                         }

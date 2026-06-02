@@ -3512,17 +3512,17 @@ pub fn build_partitioned_layer_plan(
         crate::backend::opencl::get_cl_mem(pw_ref.cpu_merge_staging.buffer().as_ref())
             .context("partition cpu_merge_staging cl_mem")?;
 
-    // Partition weight slice cl_mem handles. `gpu_slice` tensors are produced
-    // by `split_weight` / `split_weight_col` via `backend.copy_from`, so they
-    // are regular (non-noshuffle) GPU buffers.
+    // Partition weight slice cl_mem handles. `gpu_slice()` (slices[0]) tensors
+    // are produced by `split_weight` / `split_weight_col` via
+    // `backend.copy_from`, so they are regular (non-noshuffle) GPU buffers.
     let gate_slice_mem =
-        crate::backend::opencl::get_cl_mem(partition_ctx.gate.gpu_slice.buffer().as_ref())
+        crate::backend::opencl::get_cl_mem(partition_ctx.gate.gpu_slice().buffer().as_ref())
             .context("partition gate slice cl_mem")?;
     let up_slice_mem =
-        crate::backend::opencl::get_cl_mem(partition_ctx.up.gpu_slice.buffer().as_ref())
+        crate::backend::opencl::get_cl_mem(partition_ctx.up.gpu_slice().buffer().as_ref())
             .context("partition up slice cl_mem")?;
     let down_slice_mem =
-        crate::backend::opencl::get_cl_mem(partition_ctx.down.gpu_slice.buffer().as_ref())
+        crate::backend::opencl::get_cl_mem(partition_ctx.down.gpu_slice().buffer().as_ref())
             .context("partition down slice cl_mem")?;
 
     // Dtype dispatch: partition weights inherit the base model dtype. When
@@ -3531,7 +3531,7 @@ pub fn build_partitioned_layer_plan(
     // Adreno-optimized `kernel_gemv_noshuffle_q4_0` path; otherwise fall back
     // to the AOS `kernel_mul_mat_q4_0_f32`. The F16 path forwards the L4
     // program so large slices select the N_DST=4 kernel.
-    let gate_dtype = partition_ctx.gate.gpu_slice.dtype();
+    let gate_dtype = partition_ctx.gate.gpu_slice().dtype();
     let use_q4_0 = gate_dtype == crate::buffer::DType::Q4_0;
 
     let build_matmul = |src: &Mem,
@@ -3752,9 +3752,9 @@ pub fn build_partitioned_layer_plan(
     // Arc clone on the underlying Buffer.
     let cpu_ctx = Arc::new(PartitionPlanContext {
         cpu_backend: cpu_backend.clone(),
-        gate_cpu: partition_ctx.gate.cpu_slice.clone(),
-        up_cpu: partition_ctx.up.cpu_slice.clone(),
-        down_cpu: partition_ctx.down.cpu_slice.clone(),
+        gate_cpu: partition_ctx.gate.cpu_slice().clone(),
+        up_cpu: partition_ctx.up.cpu_slice().clone(),
+        down_cpu: partition_ctx.down.cpu_slice().clone(),
         workspace: workspace.clone(),
         residual_buf_handle: config.residual_buf.clone(),
         residual_host_ptr: config.residual_host_ptr,
