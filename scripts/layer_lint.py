@@ -64,6 +64,17 @@ LAYER_RULES = [
     # B-2a: §13.8-G shared identifier promotion — op span identifier used by
     # both observability (producer) and L3 inference (consumer).
     ("op_kind",                 "L2"),
+    # Phase α-W: 확장 파이프라인 L2 추상화 (arch/pipeline_stage_design_v2.md §2.1)
+    # capability=CapabilityRegistry, format=KV/Weight Format base trait,
+    # hardware=Hardware resolver, pipeline=PipelineStage 패밀리.
+    ("capability",              "L2"),
+    ("format",                  "L2"),
+    ("hardware",                "L2"),
+    ("pipeline",                "L2"),
+    # NOTE(Phase α-W-1): `stages/`(§2.1 L3 cross-cutting) 는 의도적으로 미분류(unknown) 상태다.
+    # α-W-1 골격은 import 0(빈 모듈)이라 위반을 만들지 않는다. stages 는 kv/weight(L3) 에 수평
+    # 의존(L3→L3)하므로 L2 로 박으면 향후 INV-LAYER-002 오탐이 난다 — 올바른 layer 분류
+    # (전용 도메인 vs L4 vs 수평-허용 규칙)는 실 Stage 가 입주하는 Phase α-K 에서 확정한다.
 
     # L3-pressure: KV cache 관리, eviction, offload, swap handler
     # Step 4-D: core/{cache_manager,kv_cache,kivi_cache,kv_migrate,eviction,
@@ -132,7 +143,9 @@ def classify_module(rel_path: str) -> str:
                     "qcf_computer.rs", "qcf_collector.rs",
                     "model_config.rs", "layer_boundary_hook.rs",
                     "runtime_resources_access.rs",
-                    "action_diag_helper.rs"}
+                    "action_diag_helper.rs",
+                    # Phase α-W: 확장 파이프라인 L2 추상화 (§2.1 규칙 A — top-level 형제)
+                    "capability.rs", "format.rs", "hardware.rs", "pipeline.rs"}
     if norm in TOP_LEVEL_L2:
         return "L2"
     for prefix, layer in LAYER_RULES:
@@ -168,7 +181,9 @@ def classify_import(import_path: str) -> str:
     if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
                     "quant", "thread_pool", "op_kind", "partition_workspace",
                     "kv_cache_ops", "yield_policy",
-                    "runtime_resources_access", "action_diag_helper"):
+                    "runtime_resources_access", "action_diag_helper",
+                    # Phase α-W: 확장 파이프라인 L2 추상화 (LAYER_RULES fallback 과 일치 유지)
+                    "capability", "format", "hardware", "pipeline"):
         return "L2"
     # 기존 경로 기반 매칭으로 fallback
     return classify_module(mod_path if mod_path else p.replace("::", "/"))
