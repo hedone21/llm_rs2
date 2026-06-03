@@ -39,7 +39,7 @@
 ---
 
 ## [P1] Step 1 — B-2/B-4 cold-path flip (forward_into prefill + eval)
-- **Status**: IN PROGRESS (①-a + C3 + **①-b ✅ host+S25 device `2bf5c500`**; **①-c 다음**)
+- **Status**: IN PROGRESS (①-a + C3 + **①-b ✅ `2bf5c500`** + **①-c ✅ host `1e4f20fe`**; **①-d 다음**)
 - **Sprint**: current
 - **Dependencies**: (3c-fwd) ✅ `c2b05aff` + (3c-evict) ✅ `2f014163` (선결 완료). Architect 설계 라운드 권장(B-2 full-surface fork 형태).
 - **차단 cluster**: B-2 (forward chain full-surface) + B-4 (eval 다형성). **hot path 미접촉**(prefill/eval = cold tier).
@@ -53,8 +53,8 @@
   - **①-a (3a)/(3b) trait-gap + write_kv/attention_into GPU fast-path**: ✅ **phantom/완료** — `write_kv`(standard_format.rs:120 GPU scatter)·`attention_into`(:235) 이미 wired((3c-fwd) device PASS, 3a/3b ✅ `5ea8ad47`/`3bc03e59`). 추가 작업 없음.
   - **C3 = `write_kv_batch` GPU prefill batch scatter**: ✅ **host `2e6b50fb`** + **device bit-identical ①-b 게이트에서 실증**(F16 GPU batch scatter / Q4_0 cast / F32 GPU batch scatter 모두 PASS).
   - **①-b = B-2 prefill batch entry (C1)**: ✅ **완료 `2bf5c500`** — `forward_into_fmt` multi-token prefill dispatch + `forward_prefill_fmt`(신규) + `StandardFormat::attention_into` prefill arm(`prefill_attention`) + `TransformerModelForwardFmtArgs.logits_last_only` + `ModelForward::prefill` 게이트 배선. 설계+적대검증 = `design_alpha_k_1b_cut_2026_06_04.md`(workflow wfceex20u). **host**: build + standard_format 13/13 + non-opencl 회귀 0 + fmt + clippy clean. **S25 device 게이트 PASS**: F16(rpcmem GPU flash)/Q4_0(rpcmem CPU dequant)/F32(device-only GPU flash) **3 dtype × `--no-gpu-plan` bit-identical**(텍스트+first token 49689+count 31 일치) + avg_tbt Δ∈[−1.9%, +0.6%]·TTFT Δ∈[−3.1%, +1.4%] (모두 ≤+3%). hot path(gate OFF) 무변. **Jetson CUDA prefill = optional follow-on**(같은 Backend trait `flash_attention_prefill`, S25 가 GPU-flash+CPU-fallback+e2e 커버). NoEviction(happy-path) — Sliding/H2O eviction-during-prefill 은 ①-b 범위 밖(3c-evict).
-  - **①-c ★다음 = B-4 eval flip** (forward_into flip *이후* thin follow-on): `run_eval_ll_generic<C>`(eval_loop.rs:45) + `StepHook<C>`/`CacheSnapshot<C>` 의 `C` 를 fmt-cache/enum 으로. host + legacy EvalOutput JSON bit-identical(KVCache·KiviCache 각 1회).
-  - **①-d = B-2 비-decode 잔여**(warmup/qcf_runtime/batch/ppl) forward_into 호출처 fmt entry 전환. host + 회귀 0.
+  - **①-c ✅ = B-4 eval flip** (`1e4f20fe`): **Strategy A (transient per-call fmt-wrap)** — eval 이 concrete `Vec<KVCache>`/`Vec<KiviCache>` 를 계속 소유, forward 1회만 `EvalCacheKind::forward_fmt_roundtrip`(fmt_bridge.rs 신규) 로 wrap→`forward_into_fmt`→into_inner 복귀. hook/snapshot/`force_evict` 무수정(forward↔hook 시퀀셜). `forward_into_fmt` 에 score_accumulator/skip_config/importance_collector/cache_self_need_scores 4필드 additive 확장(forward_into 미러). `StepHook<C>`/`CacheSnapshot<C>` 바운드 0. **scope 정정: SSOT "thin" 은 census 빈틈 — 실제는 中규모(~290 LOC), forward_into_fmt feature parity 확장 필요**(eval 이 ModelForward 안 거치고 forward_into 직접 호출 7곳). **host 게이트**: legacy `--eval-ll` BEFORE vs AFTER — **KVCache F16 basic+H2O bit-identical**, **KIVI flush 정수회계(flush_count/q2_tokens/res_pos/predicted) 완전일치**(nll Δ~1e-6~2e-4 = ★2 KIVI get_view=F32 carve-out, device-only bit-identical). KVCacheOps trait 생존(Step 5 폐기) — `EvalCacheKind for KiviCache` 의 `use KVCacheOps` 1개 잔여(Step 5 정리). 설계+적대검증 = `design_alpha_k_1c_cut_2026_06_04.md`(workflow `wdrcgtqwz`, 5 lens).
+  - **①-d ★다음 = B-2 비-decode 잔여**(warmup/qcf_runtime/batch/ppl) forward_into 호출처 fmt entry 전환. host + 회귀 0.
 
 ---
 
