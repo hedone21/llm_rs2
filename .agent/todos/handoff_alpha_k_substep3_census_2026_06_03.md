@@ -1,9 +1,9 @@
-# Handoff: Phase α-K substep (3) — ripple census 완료 + SSOT 경계 재정의 (impl 미착수)
+# Handoff: Phase α-K substep (3) — ripple census + SSOT 재정의 + (3a) 구현 완료
 
-**작성**: 2026-06-03
-**HEAD**: substep(2) 종결 `27f9fa6c` 이후, 본 census의 SSOT 수정 커밋 직후
+**작성**: 2026-06-03 (3a 완료 갱신)
+**HEAD**: `5ea8ad47` (3a 구현). SSOT 재정의 `90bb424f`+`b8937153`, census `27f9fa6c` 이후.
 **브랜치**: `master` (origin 미push)
-**다음 세션 진입 문장**: **"α-K substep (3a) 진행"** (host-only additive — trait gap 봉합 seam 준비. device 불요. 첫 device round는 3c).
+**다음 세션 진입 문장**: **"α-K substep (3b) 진행"** (attention_into Q4-GPU-fallback + write_kv 비-F32 cast scratch 흡수. cast scratch는 host-testable(F16 CPU cache+backend.cast), Q4-GPU-fallback은 device(3c)).
 
 > **이번 세션 결과 (2026-06-03)**: substep(3) 진입 작업 = type-flip ripple census(워크플로우 `wf_c2e4bf13-9e3`, 5 island + synthesis + 3-lens adversarial) 완료. census가 **§9.1/ADR의 substep(3) perf-crux 규정이 부정확함**을 소스로 반증 → Architect 라우팅으로 SSOT(arch §9.1·§8·§1.1 / ADR §8.3·§6.5 / spec/41) 재정의 완료. **impl 코드는 미착수**(사용자 "Architect 라우팅 먼저" 선택). 핵심 발견 = 아래 §1.
 
@@ -35,8 +35,8 @@
 ## §3. 확정된 substep(3) cut-point (branch-by-abstraction)
 in-place flip 불가 → **신 entry `forward_into_fmt` + 신 args struct + `ModelForward` fmt-cache wiring**으로 fallback 분기 후 단일 호출처 전환.
 
-- **(3a)** trait gap 봉합 — `KVCacheFormat`(7 method)에 누락된 forward_gen 호출 집합(layout/kv_dtype/get_buffers_mut/ensure_capacity/advance_pos/needs_attn_scores/get_kivi_raw_buffers)을 **base trait에 추가하지 않고**(추가 시 `INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC` 위반) impl 내부(`attention_into`/`write_kv`)로 흡수할 seam을 host-only additive로 준비. **base-trait creep 금지.** 게이트: **host build + test** (device 불요).
-- **(3b)** `attention_into` + `write_kv` GPU scatter fast-path(forward_gen `ensure_capacity→get_buffers_mut→kv_scatter→advance_pos` 묶음) 흡수 완성. host.
+- **(3a) ✅ 완료 (`5ea8ad47`)** — `write_kv`/`write_kv_batch`에 `backend: &dyn Backend`(form A) 추가. StandardFormat::write_inner가 GPU F16/F32 HeadMajor decode scatter fast-path 흡수(host 미진입, device 3c) + 표준 경로 KVCache::update fallback. KIVIFormat::write_inner가 update_kv_cache CPU-only(sync+update) 흡수. MISSING method는 impl 내부 소비(base-trait creep 0). host build+13 test+fmt+clippy clean + 적대 검증 3 lens refuted=0. **비-F32 cast scratch + device readback + Q4-GPU-fallback은 3b/3c 연기**(unwired라 무회귀).
+- **(3b)** `attention_into` Q4-GPU-fallback 정밀 재현(device) + `write_kv` 비-F32 CPU cast scratch(forward_gen `memory.alloc`+`ws.k_cast`) 흡수 — **scratch/memory 설계 결정 동반**(StandardFormat 내부 lazy scratch vs write_kv signature에 memory 추가). cast 경로는 F16 CPU cache+backend.cast로 host-testable, Q4-GPU-fallback은 device(3c).
 - **(3c)** 신 entry `forward_into_fmt` + 신 args struct + `ModelForward` fmt-cache wiring으로 decode fallback 단일 호출처 trait 전환. **★device — `--no-gpu-plan` 강제 필수** + eviction 발화(`-n 256 --memory-threshold-mb 999999 --eviction-target-ratio 0.5`).
 - **(3d)** prefill path flip + plan 평가(여기서 (3p) 분기 결정).
 
@@ -54,8 +54,8 @@ in-place flip 불가 → **신 entry `forward_into_fmt` + 신 args struct + `Mod
 - **baseline 동결 = `9b350609`** (substep 1·2a·2b additive/byte-identical라 현 HEAD와 거동 동일).
 
 ## §6. 자기점검
-- 진입 문장: ✓ "α-K substep (3a) 진행" (host-only additive trait gap seam. device 첫 노출은 3c).
-- 왜 멈췄나: ✓ census가 SSOT 부정확성 발견 → 사용자 "Architect 라우팅 먼저" → SSOT 재정의 완료. impl은 별 작업이라 새 세션 진입(3a host-only로 device 불요지만, write_kv form 적용 범위 (3a) census 재확인 동반).
+- 진입 문장: ✓ "α-K substep (3b) 진행" (attention_into Q4-GPU-fallback + write_kv 비-F32 cast scratch. scratch/memory 설계 결정 동반).
+- 왜 멈췄나: ✓ census→SSOT 재정의→3a 구현(host-gated+적대검증)까지 완료한 클린 체크포인트. 3b는 cast scratch의 memory/scratch 설계 결정(StandardFormat lazy vs signature memory 추가)이 선행이라 새 증분 진입. (3a 진행 시 write_kv form A 적용 범위 = forward_gen/prefill 모두 backend 보유 확인됨; write_kv 호출처 production 0 = 완전 additive.)
 - 최대 landmine: ✓ (3) device 게이트 `--no-gpu-plan` 미강제 시 vacuous(production plan path가 flip 코드 가림). 진짜 perf revoke는 (3p)에서. (4)는 (3p) 선결 차단(plan-dep).
 - 검증 게이트: ✓ census load-bearing 주장 4건 소스 직접 검증(model_forward.rs step/161, plan.rs:1257, standard_format.rs:8-9). SSOT 수정 3파일 diff 외과적 확인.
 - device 가용: ✓ S25 USB(`R3CY408S5SB`). Jetson 블로커 잔존(사용자 요청 시 복구). 3a/3b는 device 불요.
