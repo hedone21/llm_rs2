@@ -80,6 +80,35 @@ impl EvictionPolicy for StreamingLLMPolicy {
     fn name(&self) -> &str {
         "streaming_llm"
     }
+
+    /// (3c-evict) keep-list. `evict()` 의 보존 영역 `[0..sink_size) ∪ [recent_start..current)` 을
+    /// prefix(sink)-포함 ascending 으로 산출 (`shift_positions(recent_start, sink_size, eff_window)`
+    /// 와 등가). no-op 분기는 전체 보존. `sink_size`/`window_size` 는 생성자에서 `.max(1)`.
+    fn plan_keep(
+        &self,
+        current_pos: usize,
+        target_len: usize,
+        _importance: Option<&[f32]>,
+    ) -> Option<(Vec<usize>, Vec<crate::format::Merge>)> {
+        let current = current_pos;
+        let keep = self.keep_size();
+
+        let effective_window = if target_len > 0 && target_len < keep {
+            target_len.saturating_sub(self.sink_size).max(1)
+        } else {
+            self.window_size
+        };
+        let effective_keep = self.sink_size + effective_window;
+
+        if current <= effective_keep {
+            return Some(((0..current).collect(), Vec::new()));
+        }
+
+        let recent_start = current - effective_window;
+        let mut keep_list: Vec<usize> = (0..self.sink_size).collect();
+        keep_list.extend(recent_start..current);
+        Some((keep_list, Vec::new()))
+    }
 }
 
 #[cfg(test)]

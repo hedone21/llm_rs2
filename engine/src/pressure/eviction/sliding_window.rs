@@ -90,6 +90,39 @@ impl EvictionPolicy for SlidingWindowPolicy {
     fn name(&self) -> &str {
         "sliding_window"
     }
+
+    /// (3c-evict) keep-list. `evict()` 의 보존 영역 `[0..prefix) ∪ [prefix+prune_count..current)`
+    /// 을 prefix-포함 ascending 으로 산출. no-op 분기(`evict()` early-return)는 전체 보존 `[0..current)`.
+    /// `protected_prefix >= 4`(생성자 clamp)라 `evict()` 의 prefix==0 `prune_prefix` 분기는 dead —
+    /// 본 keep-list 는 prefix>0 의 `shift_positions(prefix+prune_count, prefix, remaining)` 와 등가.
+    fn plan_keep(
+        &self,
+        current_pos: usize,
+        target_len: usize,
+        _importance: Option<&[f32]>,
+    ) -> Option<(Vec<usize>, Vec<crate::format::Merge>)> {
+        let current = current_pos;
+        let max_keep = self.window_size + self.protected_prefix;
+        let min_keep = (self.protected_prefix + 16).min(max_keep);
+        let keep = target_len.clamp(min_keep, max_keep);
+
+        if current <= keep {
+            return Some(((0..current).collect(), Vec::new()));
+        }
+
+        let removable_count = current - self.protected_prefix;
+        let tokens_to_keep_after_prefix = keep.saturating_sub(self.protected_prefix);
+
+        if tokens_to_keep_after_prefix >= removable_count {
+            return Some(((0..current).collect(), Vec::new()));
+        }
+
+        let prune_count = removable_count - tokens_to_keep_after_prefix;
+
+        let mut keep_list: Vec<usize> = (0..self.protected_prefix).collect();
+        keep_list.extend((self.protected_prefix + prune_count)..current);
+        Some((keep_list, Vec::new()))
+    }
 }
 
 #[cfg(test)]

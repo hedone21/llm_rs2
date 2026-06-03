@@ -178,6 +178,72 @@ impl EvictionPolicy for H2OPolicy {
     fn name(&self) -> &str {
         "h2o"
     }
+
+    /// (3c-evict) keep-list. `evict_with_scores`(importance Some) 또는 `evict`(None)의 보존 영역을
+    /// **prefix-포함 ascending** 으로 산출. score 경로는 `evict_with_scores` 가 이미 호출하는
+    /// `compact_keep_positions(keep_all, prefix)`(line ~169)의 `keep_all = [hh ++ recent]` 와 동일
+    /// 토큰을 prefix 와 합쳐 `[0..prefix) ++ hh_positions ++ [recent_start..current)` 로 반환한다 —
+    /// `compact(keep, write_start=0)` 의 prefix batch 가 src==dst no-op 이므로 등가. merges 없음.
+    fn plan_keep(
+        &self,
+        current_pos: usize,
+        target_len: usize,
+        importance: Option<&[f32]>,
+    ) -> Option<(Vec<usize>, Vec<crate::format::Merge>)> {
+        let current = current_pos;
+        let keep = target_len.max(self.protected_prefix + 2);
+        let prefix = self.protected_prefix;
+
+        if current <= keep {
+            return Some(((0..current).collect(), Vec::new()));
+        }
+
+        match importance {
+            // score-free fallback (`evict`): prefix + most-recent.
+            None => {
+                let available = keep.saturating_sub(prefix);
+                let recent_budget = available;
+                let actual_recent = recent_budget.min(current - prefix);
+                let prune_count = current - prefix - actual_recent;
+                if prune_count == 0 {
+                    return Some(((0..current).collect(), Vec::new()));
+                }
+                let mut keep_list: Vec<usize> = (0..prefix).collect();
+                keep_list.extend((prefix + prune_count)..current);
+                Some((keep_list, Vec::new()))
+            }
+            // score-based (`evict_with_scores`): prefix + heavy hitters + recent window.
+            Some(imp) => {
+                let available = keep.saturating_sub(prefix);
+                let hh_budget = (available as f32 * self.keep_ratio) as usize;
+                let recent_budget = available - hh_budget;
+                let actual_recent = recent_budget.min(current - prefix);
+                let recent_start = current.saturating_sub(actual_recent).max(prefix);
+                let evictable_start = prefix;
+
+                // 1. (pos, score) over evictable range. 2. stable sort desc (== evict_with_scores).
+                let mut token_scores: Vec<(usize, f32)> = (evictable_start..recent_start)
+                    .map(|pos| (pos, imp.get(pos).copied().unwrap_or(0.0)))
+                    .collect();
+                token_scores
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // 3. top-hh_budget by score, then re-sort by position (== evict_with_scores).
+                let mut hh_positions: Vec<usize> = token_scores
+                    .iter()
+                    .take(hh_budget)
+                    .map(|(pos, _)| *pos)
+                    .collect();
+                hh_positions.sort();
+
+                // 4. prefix + HH(position order) + recent(position order), all ascending.
+                let mut keep_list: Vec<usize> = (0..prefix).collect();
+                keep_list.extend_from_slice(&hh_positions);
+                keep_list.extend(recent_start..current);
+                Some((keep_list, Vec::new()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

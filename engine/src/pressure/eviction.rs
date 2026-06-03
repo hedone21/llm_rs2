@@ -1,3 +1,4 @@
+use crate::format::Merge;
 use crate::pressure::kv_cache::KVCache;
 use anyhow::Result;
 
@@ -49,6 +50,30 @@ pub trait EvictionPolicy: Send + Sync {
     ) -> Result<()> {
         self.evict_with_scores(cache, target_len, flat_importance)
     }
+
+    /// (Phase α-K substep 3c-evict) keep-list 산출 — in-place `evict*` 와 **동일 의미**의
+    /// 보존 토큰 목록(+merges)을 산출하되 버퍼는 건드리지 않는다. 호출자가
+    /// [`crate::format::KVCacheFormat::compact`]`(keep, merges)` 로 적용한다 (ADR-0001 §4.2
+    /// interior-mutability eviction — eviction 을 `&mut KVCache` 가 아니라 `&self` compact 로 옮겨
+    /// `Vec<Arc<StandardFormat>>` by-value 소유 ⊥ 연속 `&mut [KVCache]` 충돌을 해소).
+    ///
+    /// `keep` 은 **prefix 포함 ascending** 이어야 한다 — `compact(keep, write_start=0)` 의 재배치가
+    /// in-place `evict` 의 버퍼/`current_pos` 와 bit-identical 이도록 (등가식: §9.1-EVICT (b)).
+    /// `importance` Some → score-based(H2O `evict_with_scores`), None → score-free(`evict`).
+    ///
+    /// **Default = `None`** — 단일 layer-wide keep-list 로 표현 불가한 정책은 미지원을 나타낸다
+    /// (per-head H2O+ = head 별 다른 keep, 가중 merge D2O = `EvictionPolicy` 아님; §9.1-EVICT-DEFER).
+    /// branch-by-abstraction: in-place `evict*` 와 **공존**하며 그 경로를 refactor 하지 않는다
+    /// (production World B 무회귀). 현 단계는 unwired — 정식 게이트는 host unit test (compact_parity).
+    fn plan_keep(
+        &self,
+        current_pos: usize,
+        target_len: usize,
+        importance: Option<&[f32]>,
+    ) -> Option<(Vec<usize>, Vec<Merge>)> {
+        let _ = (current_pos, target_len, importance);
+        None
+    }
 }
 
 pub mod h2o;
@@ -57,6 +82,9 @@ pub mod method;
 pub mod no_eviction;
 pub mod sliding_window;
 pub mod streaming_llm;
+
+#[cfg(test)]
+mod compact_parity;
 
 pub use h2o::H2OPolicy;
 pub use h2o_plus::H2OPlusPolicy;

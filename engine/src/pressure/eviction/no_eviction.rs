@@ -30,6 +30,17 @@ impl EvictionPolicy for NoEvictionPolicy {
     fn name(&self) -> &str {
         "none"
     }
+
+    /// (3c-evict) keep-list. `evict()` 는 no-op 이므로 전체 보존 `[0..current)` — `compact` 도
+    /// src==dst 단일 batch no-op 으로 버퍼/`current_pos` 무변(등가).
+    fn plan_keep(
+        &self,
+        current_pos: usize,
+        _target_len: usize,
+        _importance: Option<&[f32]>,
+    ) -> Option<(Vec<usize>, Vec<crate::format::Merge>)> {
+        Some(((0..current_pos).collect(), Vec::new()))
+    }
 }
 
 #[cfg(test)]
