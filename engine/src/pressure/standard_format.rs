@@ -36,6 +36,70 @@ impl StandardFormat {
             inner: Mutex::new(inner),
         }
     }
+
+    /// KV write 흡수 — `forward_gen` 의 KV-update 분기(transformer_layer/forward_gen.rs:330-386)를
+    /// format 표면으로 옮긴 것. `is_decode`(seq_len=1)면 GPU fused cast+scatter fast-path 게이팅.
+    ///
+    /// **host 경로 = correctness fallback(`KVCache::update`)** — `CpuBackend` 는 `is_gpu()==false`라
+    /// GPU scatter 분기를 밟지 않으므로 host build+test 가 F32 경로를 검증하고, GPU scatter 정확성은
+    /// device round(substep (3c))에서 검증한다. **비-F32(F16/Q4_0) 비-GPU cast 경로**(forward_gen 의
+    /// `memory.alloc` + `ws.k_cast` scratch)는 본 substep 에서 흡수하지 않는다(scratch/memory 설계 동반
+    /// = 후속 substep). 현재 unwired 라 무회귀 — F16/Q4_0 wrapper 의 비-GPU write 는 dtype 일치 전제의
+    /// `update` 직접 호출로 남는다(production 호출처 0).
+    fn write_inner(
+        &self,
+        new_k: &Tensor,
+        new_v: &Tensor,
+        backend: &dyn Backend,
+        is_decode: bool,
+    ) -> Result<()> {
+        use crate::kv_cache_ops::KVLayout;
+
+        let mut cache = self.inner.lock().unwrap();
+        let kv_dtype = cache.kv_dtype();
+
+        // GPU F16 HeadMajor decode: fused cast+scatter (1 dispatch). host 미진입(is_gpu=false).
+        if is_decode
+            && backend.is_gpu()
+            && kv_dtype == DType::F16
+            && cache.layout() == KVLayout::HeadMajor
+        {
+            let pos = KVCacheOps::current_pos(&*cache);
+            cache.ensure_capacity(pos + 1)?;
+            let cap = cache.capacity();
+            let head_dim = cache.head_dim();
+            if let Some((k_buf, v_buf)) = cache.get_buffers_mut() {
+                backend.kv_scatter_f32_to_f16(new_k, new_v, k_buf, v_buf, head_dim, cap, pos)?;
+            }
+            cache.advance_pos(1);
+            return Ok(());
+        }
+
+        // GPU F32 HeadMajor decode: single batched scatter dispatch.
+        if is_decode
+            && backend.is_gpu()
+            && kv_dtype == DType::F32
+            && cache.layout() == KVLayout::HeadMajor
+            && backend.supports_kv_scatter_f32_batch()
+        {
+            let pos = KVCacheOps::current_pos(&*cache);
+            cache.ensure_capacity(pos + 1)?;
+            let cap = cache.capacity();
+            let n_heads_kv = cache.kv_heads();
+            let head_dim = cache.head_dim();
+            if let Some((k_buf, v_buf)) = cache.get_buffers_mut() {
+                backend.kv_scatter_f32_to_f32_batch(
+                    new_k, new_v, k_buf, v_buf, n_heads_kv, head_dim, cap, pos, 1,
+                )?;
+            }
+            cache.advance_pos(1);
+            return Ok(());
+        }
+
+        // Correctness/CPU 경로: `KVCache` 는 GPU-buffer 보유라 `update` 가 내부 backend 로 자체 처리
+        // (구 `update_kv_cache` 의 has_gpu_buffers 분기). 비-F32 cast 흡수는 후속 substep.
+        cache.update(new_k, new_v)
+    }
 }
 
 impl KVCacheFormat for StandardFormat {
@@ -51,13 +115,14 @@ impl KVCacheFormat for StandardFormat {
         self.inner.lock().unwrap().capacity()
     }
 
-    fn write_kv(&self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
-        // 단일 토큰 write — geometry 상 batch 와 동일 경로(KVCache::update 가 seq_len 으로 분기).
-        self.inner.lock().unwrap().update(new_k, new_v)
+    fn write_kv(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
+        // decode (seq_len=1) — GPU fused cast+scatter fast-path 게이팅 가능.
+        self.write_inner(new_k, new_v, backend, true)
     }
 
-    fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
-        self.inner.lock().unwrap().update(new_k, new_v)
+    fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
+        // prefill (seq_len>1) — decode fast-path 미적용(GPU prefill batch scatter 흡수는 후속 substep).
+        self.write_inner(new_k, new_v, backend, false)
     }
 
     fn compact(&self, keep: &[usize], merges: &[Merge]) -> Result<()> {
@@ -253,14 +318,14 @@ mod tests {
         let token = vec![1.0f32; kv_heads * head_dim];
         let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &token);
         let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &token);
-        fmt.write_kv(&k, &v).unwrap();
+        fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
         assert_eq!(fmt.current_pos(), 1);
 
         // batch write: 2 tokens
         let batch = vec![2.0f32; 2 * kv_heads * head_dim];
         let kb = f32_tensor(vec![1, 2, kv_heads, head_dim], &batch);
         let vb = f32_tensor(vec![1, 2, kv_heads, head_dim], &batch);
-        fmt.write_kv_batch(&kb, &vb).unwrap();
+        fmt.write_kv_batch(&kb, &vb, &CpuBackend::new()).unwrap();
         assert_eq!(fmt.current_pos(), 3);
     }
 
@@ -275,7 +340,7 @@ mod tests {
             let t = vec![p as f32; kv_heads * head_dim];
             let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
             let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
-            fmt.write_kv(&k, &v).unwrap();
+            fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
         }
         assert_eq!(fmt.current_pos(), 4);
 
@@ -304,7 +369,7 @@ mod tests {
             let t = vec![p; kv_heads * head_dim];
             let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
             let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
-            fmt.write_kv(&k, &v).unwrap();
+            fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
         }
 
         // Merge token 3 into token 1, then keep {0, 1, 2}.
@@ -338,7 +403,7 @@ mod tests {
         for _ in 0..2 {
             let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &k_row);
             let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &v_row);
-            fmt.write_kv(&k, &v).unwrap();
+            fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
         }
         assert_eq!(fmt.current_pos(), 2);
 
@@ -382,7 +447,7 @@ mod tests {
             let t = vec![p as f32; head_dim];
             let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
             let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
-            fmt.write_kv(&k, &v).unwrap();
+            fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
         }
 
         let q = f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![1.0; head_dim]);

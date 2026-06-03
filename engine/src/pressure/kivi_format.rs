@@ -38,6 +38,21 @@ impl KIVIFormat {
             inner: Mutex::new(inner),
         }
     }
+
+    /// KV write 흡수 — `KiviCache` 는 CPU-only(`get_buffers_mut`==None) 라 GPU scatter fast-path
+    /// 대상이 아니다. 구 `update_kv_cache`(transformer_layer.rs:31) 의 CPU-only 분기를 옮긴 것:
+    /// producer tensor 가 host-mapped GPU 메모리(non-null ptr)면 device 커널 완료 전 stale read
+    /// 방지를 위해 `synchronize` 후 `KiviCache::update`(Q2 quant + residual append 자체 수행) 호출.
+    ///
+    /// decode/prefill 동일 경로(`KiviCache::update` 가 seq_len 으로 분기). device-only producer
+    /// (`as_ptr()` null)의 명시적 readback 은 후속 device substep 으로 연기(host 미발생).
+    fn write_inner(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
+        let mut cache = self.inner.lock().unwrap();
+        if !new_k.as_ptr().is_null() {
+            backend.synchronize()?;
+        }
+        cache.update(new_k, new_v)
+    }
 }
 
 impl KVCacheFormat for KIVIFormat {
@@ -53,13 +68,12 @@ impl KVCacheFormat for KIVIFormat {
         KVCacheOps::capacity(&*self.inner.lock().unwrap())
     }
 
-    fn write_kv(&self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
-        // 단일 토큰 write — KiviCache::update 가 residual append + 필요시 flush 를 자체 수행.
-        self.inner.lock().unwrap().update(new_k, new_v)
+    fn write_kv(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
+        self.write_inner(new_k, new_v, backend)
     }
 
-    fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
-        self.inner.lock().unwrap().update(new_k, new_v)
+    fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
+        self.write_inner(new_k, new_v, backend)
     }
 
     fn compact(&self, _keep: &[usize], _merges: &[Merge]) -> Result<()> {
@@ -263,13 +277,13 @@ mod tests {
         let token = vec![1.0f32; kv_heads * HD];
         let k = f32_tensor(vec![1, 1, kv_heads, HD], &token);
         let v = f32_tensor(vec![1, 1, kv_heads, HD], &token);
-        fmt.write_kv(&k, &v).unwrap();
+        fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
         assert_eq!(fmt.current_pos(), 1);
 
         let batch = vec![2.0f32; 2 * kv_heads * HD];
         let kb = f32_tensor(vec![1, 2, kv_heads, HD], &batch);
         let vb = f32_tensor(vec![1, 2, kv_heads, HD], &batch);
-        fmt.write_kv_batch(&kb, &vb).unwrap();
+        fmt.write_kv_batch(&kb, &vb, &CpuBackend::new()).unwrap();
         assert_eq!(fmt.current_pos(), 3);
     }
 
@@ -279,7 +293,7 @@ mod tests {
         let token = vec![1.0f32; HD];
         let k = f32_tensor(vec![1, 1, 1, HD], &token);
         let v = f32_tensor(vec![1, 1, 1, HD], &token);
-        fmt.write_kv(&k, &v).unwrap();
+        fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
         assert_eq!(fmt.current_pos(), 1);
         // compact is a no-op for KIVI; pos unchanged.
         fmt.compact(&[0], &[]).unwrap();
@@ -301,7 +315,7 @@ mod tests {
         for _ in 0..2 {
             let k = f32_tensor(vec![1, 1, kv_heads, HD], &k_row);
             let v = f32_tensor(vec![1, 1, kv_heads, HD], &v_row);
-            fmt.write_kv(&k, &v).unwrap();
+            fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
         }
         assert_eq!(fmt.current_pos(), 2);
 
@@ -348,7 +362,7 @@ mod tests {
         let row = vec![1.0f32; HD];
         let k = f32_tensor(vec![1, 1, kv_heads, HD], &row);
         let v = f32_tensor(vec![1, 1, kv_heads, HD], &row);
-        fmt.write_kv(&k, &v).unwrap();
+        fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
 
         let q = f32_tensor(vec![1, 1, n_heads_q, HD], &row);
         let mut out = f32_tensor(vec![1, 1, n_heads_q, HD], &vec![0.0; HD]);

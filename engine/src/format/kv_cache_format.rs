@@ -69,10 +69,19 @@ pub trait KVCacheFormat: Send + Sync {
     // ── mutation (3) ──
 
     /// 단일 토큰 write (decode). 입력 shape: `[batch, 1, kv_heads, head_dim]`.
-    fn write_kv(&self, new_k: &Tensor, new_v: &Tensor) -> Result<()>;
+    ///
+    /// `backend` = KV write 가 hardware 를 알아야 하는 두 경우의 핸들 (§9.1 (3a) form A):
+    /// (1) producer tensor 가 host-mapped GPU 메모리(CUDA pinned / OpenCL UMA)면 device 커널
+    /// 완료 전 stale 읽기 방지를 위한 `synchronize` (구 `update_kv_cache` 의 readback 계약),
+    /// (2) GPU decode fast-path 의 fused cast+scatter 커널 dispatch (`kv_scatter_*`). `backend` 는
+    /// execution-owned 범용 핸들이라 format⊥hardware (`attention_into` 가 이미 받는 것과 동일 패턴)
+    /// — base trait 표면에 dtype/codebook 이 새지 않는다(`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`).
+    fn write_kv(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()>;
 
     /// prefill multi-token write. 입력 shape: `[batch, seq_len, kv_heads, head_dim]`.
-    fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor) -> Result<()>;
+    ///
+    /// `backend` = `write_kv` 와 동일 계약. (GPU prefill batch scatter 흡수는 후속 substep.)
+    fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()>;
 
     /// keep + merges atomic compaction. `keep` 토큰을 앞으로 당기고, `merges` 의 가중 병합을
     /// (compaction 이전 좌표계에서) buffer 에 적용한다 (§4.1 — D2O Step 5→6 의미).
