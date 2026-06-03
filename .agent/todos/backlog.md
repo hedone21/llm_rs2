@@ -20,6 +20,22 @@
 
 ---
 
+## [ACTIVE Roadmap] Phase α-K BC 완주 — `KVCacheOps` trait 완전 폐기 (2026-06-04 진입)
+
+- **Master roadmap**: `.agent/todos/roadmap_alpha_k_bc_completion_2026_06_04.md`
+- **목표**: `KVCacheOps` trait 완전 삭제((4)). production 을 `KVCacheFormat` 패러다임으로 통일.
+- **SSOT**: `arch/pipeline_stage_design_v2.md` §9.1 "⚠️ α-K (3p)/(4) 방향" 블록(2026-06-04 BC 확정) + ADR `docs/adr/0001-kv-dispatch-paradigm.md` §8.3.
+- **5 step (위험 낮은 순, legacy = reference baseline → 마지막 폐기)**:
+  - **Step 1 [P1/current]** B-2/B-4 cold-path flip (forward_into prefill + eval, hot 미접촉)
+  - **Step 2 [P1/next]** B-3 offload 분리 (`PrefetchableCache` KVCacheOps 비의존 재정의)
+  - **Step 3 [P1/next]** (3p) ④-a hot-path flip (plan path concrete-handle, ★perf crux, 회귀 시 (3p)만 revert)
+  - **Step 4 [P2/backlog]** device-gate 를 legacy_generate → argus_cli 로 이주
+  - **Step 5 [P2/backlog]** legacy 폐기 + KVCacheOps trait 삭제
+- **선행 완료**: (3c-fwd) ✅ `c2b05aff` / (3c-evict) ✅ `2f014163`.
+- **진입 handoff**: `.agent/todos/handoff_alpha_k_3d_entry_2026_06_03.md`.
+
+---
+
 ## [P2] LLama 3.2 1B 동일 shape 매트릭스 재측정 (Qwen Full Microbench Matrix sprint 완료 후)
 
 - **Status**: TODO
