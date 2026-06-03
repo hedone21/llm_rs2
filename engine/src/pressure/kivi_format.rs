@@ -319,8 +319,8 @@ mod tests {
         }
         assert_eq!(fmt.current_pos(), 2);
 
-        let q = f32_tensor(vec![1, 1, n_heads_q, HD], &vec![1.0; HD]);
-        let mut out = f32_tensor(vec![1, 1, n_heads_q, HD], &vec![0.0; HD]);
+        let q = f32_tensor(vec![1, 1, n_heads_q, HD], &[1.0; HD]);
+        let mut out = f32_tensor(vec![1, 1, n_heads_q, HD], &[0.0; HD]);
         let backend = CpuBackend::new();
         let mut scores = vec![0.0f32; n_heads_q * 2];
 
@@ -365,7 +365,7 @@ mod tests {
         fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
 
         let q = f32_tensor(vec![1, 1, n_heads_q, HD], &row);
-        let mut out = f32_tensor(vec![1, 1, n_heads_q, HD], &vec![0.0; HD]);
+        let mut out = f32_tensor(vec![1, 1, n_heads_q, HD], &[0.0; HD]);
         let backend = CpuBackend::new();
         fmt.attention_into(
             &q,
