@@ -121,6 +121,18 @@ impl KVCache {
         self.head_dim
     }
 
+    /// Read-only handle to the grow-on-demand allocator, if this cache is dynamic.
+    ///
+    /// Returns the backend-appropriate `Memory` (host `Galloc` / `OpenCLMemory` /
+    /// `CudaMemory`) used internally for `ensure_capacity`. Exposed so a wrapping
+    /// `KVCacheFormat` impl (`StandardFormat`) can allocate its cast scratch from the
+    /// *same* allocator the cache itself uses — keeping the format⊥hardware seam intact
+    /// without threading a second `Memory` through the trait signature. `None` for
+    /// fully pre-allocated caches built via `new()`.
+    pub(crate) fn memory(&self) -> Option<Arc<dyn Memory>> {
+        self.memory.clone()
+    }
+
     /// Element offset for position `pos` of head `head`.
     ///
     /// - SeqMajor: `pos * kv_heads * head_dim + head * head_dim`

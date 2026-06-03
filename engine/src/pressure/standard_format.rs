@@ -19,13 +19,25 @@ use crate::kv_cache_ops::KVCacheOps;
 use crate::pressure::kv_cache::KVCache;
 use crate::tensor::Tensor;
 
+/// 내부 가변 상태 — `KVCache` 와 비-F32 cast scratch 를 **단일 lock** 으로 묶는다.
+///
+/// scratch(`k_cast`/`v_cast`)는 비-F32 write 경로의 reusable buffer 로, `forward_gen` 의
+/// `ws.k_cast`/`ws.v_cast` 와 같은 역할(토큰마다 재할당 방지). cache 와 한 `Mutex` 안에 두어
+/// 별도 lock 으로 인한 동시성 hazard 를 원천 차단한다(write 가 cache+scratch 를 항상 함께 만짐).
+struct StandardFormatInner {
+    cache: KVCache,
+    /// Lazy cast scratch (target dtype). 첫 비-F32 write 에서 inner cache 의 allocator 로 할당.
+    k_cast: Option<Tensor>,
+    v_cast: Option<Tensor>,
+}
+
 /// Standard (F32/F16/Q4_0) KV cache 를 `KVCacheFormat` 으로 노출하는 wrapper.
 ///
 /// 기존 `KVCache` 를 `Mutex` 로 감싸 `&self` 메서드에서 내부 `&mut` 메서드에 위임한다.
 /// `KVCache` 자체는 무변.
 pub struct StandardFormat {
     idx: usize,
-    inner: Mutex<KVCache>,
+    inner: Mutex<StandardFormatInner>,
 }
 
 impl StandardFormat {
@@ -33,19 +45,23 @@ impl StandardFormat {
     pub fn new(idx: usize, inner: KVCache) -> Self {
         Self {
             idx,
-            inner: Mutex::new(inner),
+            inner: Mutex::new(StandardFormatInner {
+                cache: inner,
+                k_cast: None,
+                v_cast: None,
+            }),
         }
     }
 
     /// KV write 흡수 — `forward_gen` 의 KV-update 분기(transformer_layer/forward_gen.rs:330-386)를
     /// format 표면으로 옮긴 것. `is_decode`(seq_len=1)면 GPU fused cast+scatter fast-path 게이팅.
     ///
-    /// **host 경로 = correctness fallback(`KVCache::update`)** — `CpuBackend` 는 `is_gpu()==false`라
-    /// GPU scatter 분기를 밟지 않으므로 host build+test 가 F32 경로를 검증하고, GPU scatter 정확성은
-    /// device round(substep (3c))에서 검증한다. **비-F32(F16/Q4_0) 비-GPU cast 경로**(forward_gen 의
-    /// `memory.alloc` + `ws.k_cast` scratch)는 본 substep 에서 흡수하지 않는다(scratch/memory 설계 동반
-    /// = 후속 substep). 현재 unwired 라 무회귀 — F16/Q4_0 wrapper 의 비-GPU write 는 dtype 일치 전제의
-    /// `update` 직접 호출로 남는다(production 호출처 0).
+    /// **host 경로 = correctness fallback** — `CpuBackend` 는 `is_gpu()==false`라 GPU scatter 분기를
+    /// 밟지 않으므로 host build+test 가 F32/비-F32 cast 경로를 검증하고, GPU scatter 정확성은
+    /// device round(substep (3c))에서 검증한다. **비-F32(F16/Q4_0) cast 경로**(forward_gen 의
+    /// `memory.alloc` + `ws.k_cast` scratch)는 inner `KVCache` 의 allocator 로 scratch 를 lazy 할당해
+    /// 흡수한다 — write_kv signature 에 `memory` 를 추가하지 않는다(format⊥hardware, KVCache 가 이미
+    /// 동일 allocator 보유). 여전히 unwired 라 무회귀(production 호출처 0).
     fn write_inner(
         &self,
         new_k: &Tensor,
@@ -55,15 +71,16 @@ impl StandardFormat {
     ) -> Result<()> {
         use crate::kv_cache_ops::KVLayout;
 
-        let mut cache = self.inner.lock().unwrap();
-        let kv_dtype = cache.kv_dtype();
+        let mut guard = self.inner.lock().unwrap();
+        let kv_dtype = guard.cache.kv_dtype();
 
         // GPU F16 HeadMajor decode: fused cast+scatter (1 dispatch). host 미진입(is_gpu=false).
         if is_decode
             && backend.is_gpu()
             && kv_dtype == DType::F16
-            && cache.layout() == KVLayout::HeadMajor
+            && guard.cache.layout() == KVLayout::HeadMajor
         {
+            let cache = &mut guard.cache;
             let pos = KVCacheOps::current_pos(&*cache);
             cache.ensure_capacity(pos + 1)?;
             let cap = cache.capacity();
@@ -79,9 +96,10 @@ impl StandardFormat {
         if is_decode
             && backend.is_gpu()
             && kv_dtype == DType::F32
-            && cache.layout() == KVLayout::HeadMajor
+            && guard.cache.layout() == KVLayout::HeadMajor
             && backend.supports_kv_scatter_f32_batch()
         {
+            let cache = &mut guard.cache;
             let pos = KVCacheOps::current_pos(&*cache);
             cache.ensure_capacity(pos + 1)?;
             let cap = cache.capacity();
@@ -96,9 +114,70 @@ impl StandardFormat {
             return Ok(());
         }
 
-        // Correctness/CPU 경로: `KVCache` 는 GPU-buffer 보유라 `update` 가 내부 backend 로 자체 처리
-        // (구 `update_kv_cache` 의 has_gpu_buffers 분기). 비-F32 cast 흡수는 후속 substep.
-        cache.update(new_k, new_v)
+        // 비-F32 cast 경로: F32 입력을 cache dtype(F16/Q4_0)으로 cast 후 update. (forward_gen 의
+        // `kv_dtype != F32` 분기 흡수.) `KVCache::update` 는 cast 를 하지 않고 입력이 이미 cache dtype
+        // 임을 전제하므로, scatter fast-path 에 안 잡힌 비-F32 write 는 반드시 여기서 cast 해야 한다
+        // (Q4_0 은 GPU 에서도 fast-path 부재라 이 경로). dtype 미일치 silent garbage 방지.
+        if kv_dtype != DType::F32 {
+            let memory = guard.cache.memory().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "StandardFormat: non-F32 cast write requires a dynamic KVCache (memory=Some); \
+                     fully pre-allocated caches built via KVCache::new() cannot allocate cast scratch"
+                )
+            })?;
+            // scratch lazy 할당 (target dtype). 동일 shape 면 재사용(decode 연속 토큰=seq1 고정),
+            // shape 가 바뀌면 재할당한다 — write_kv(decode seq=1)와 write_kv_batch(prefill seq>1)가
+            // 같은 format 에서 cast 분기를 공유하므로(K/V 는 KV 불변식상 동일 shape), 첫 write 의
+            // 크기로 굳히면 batch↔decode 혼용 시 cast zip 절단·update 오동작. (forward_gen 은
+            // decode-only 라 단일 크기였음.)
+            let n_elem: usize = new_k.shape().dims().iter().product();
+            let buf_size = match kv_dtype {
+                DType::F16 => n_elem * 2,
+                DType::Q4_0 => {
+                    (n_elem / crate::quant::QK4_0) * std::mem::size_of::<crate::quant::BlockQ4_0>()
+                }
+                _ => n_elem * 4,
+            };
+            let k_stale = guard
+                .k_cast
+                .as_ref()
+                .is_none_or(|t| t.shape().dims() != new_k.shape().dims());
+            if k_stale {
+                let buf = memory.alloc(buf_size, kv_dtype)?;
+                guard.k_cast = Some(Tensor::new(
+                    new_k.shape().clone(),
+                    buf,
+                    new_k.backend().clone(),
+                ));
+            }
+            let v_stale = guard
+                .v_cast
+                .as_ref()
+                .is_none_or(|t| t.shape().dims() != new_v.shape().dims());
+            if v_stale {
+                let buf = memory.alloc(buf_size, kv_dtype)?;
+                guard.v_cast = Some(Tensor::new(
+                    new_v.shape().clone(),
+                    buf,
+                    new_v.backend().clone(),
+                ));
+            }
+            // 필드별 독립 mutable borrow (cache + scratch 동시 접근).
+            let StandardFormatInner {
+                cache,
+                k_cast,
+                v_cast,
+            } = &mut *guard;
+            let k_cast = k_cast.as_mut().unwrap();
+            let v_cast = v_cast.as_mut().unwrap();
+            backend.cast(new_k, k_cast)?;
+            backend.cast(new_v, v_cast)?;
+            return cache.update(k_cast, v_cast);
+        }
+
+        // Correctness/CPU F32 경로: `KVCache` 는 GPU-buffer 보유라 `update` 가 내부 backend 로 자체 처리
+        // (구 `update_kv_cache` 의 has_gpu_buffers 분기).
+        guard.cache.update(new_k, new_v)
     }
 }
 
@@ -108,11 +187,11 @@ impl KVCacheFormat for StandardFormat {
     }
 
     fn current_pos(&self) -> usize {
-        KVCacheOps::current_pos(&*self.inner.lock().unwrap())
+        KVCacheOps::current_pos(&self.inner.lock().unwrap().cache)
     }
 
     fn capacity(&self) -> usize {
-        self.inner.lock().unwrap().capacity()
+        self.inner.lock().unwrap().cache.capacity()
     }
 
     fn write_kv(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
@@ -126,19 +205,19 @@ impl KVCacheFormat for StandardFormat {
     }
 
     fn compact(&self, keep: &[usize], merges: &[Merge]) -> Result<()> {
-        let mut cache = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
 
         // Step 1 (merges): 가중 병합을 compaction 이전 좌표계에서 buffer 에 in-place 적용.
         // F32/F16 만 지원(CPU-accessible buffer 전제). Q4_0 은 dequant+requant 비용으로 merge
         // 스킵(D2O 의 GPU-only merge_enabled=false 와 동일한 보수적 fallback) — keep compaction 만.
         if !merges.is_empty() {
-            apply_merges(&mut cache, merges);
+            apply_merges(&mut guard.cache, merges);
         }
 
         // Step 2 (keep): retained 토큰을 앞으로 당김. write_start=0 으로 전체 재배치
         // (compact 의 keep 은 절대 위치 목록, ascending 가정).
-        cache.compact_keep_positions(keep, 0)?;
-        cache.set_current_pos(keep.len());
+        guard.cache.compact_keep_positions(keep, 0)?;
+        guard.cache.set_current_pos(keep.len());
         Ok(())
     }
 
@@ -150,7 +229,8 @@ impl KVCacheFormat for StandardFormat {
         dims: AttnDims,
         scores: Option<&mut [f32]>,
     ) -> Result<()> {
-        let mut cache = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        let cache = &mut guard.cache;
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
         let cache_seq_len = KVCacheOps::current_pos(&*cache);
@@ -299,6 +379,28 @@ mod tests {
         KVCache::new(k, v, max_seq)
     }
 
+    fn f16_tensor(dims: Vec<usize>, data: &[f32]) -> Tensor {
+        use half::f16;
+        let buf = Arc::new(SharedBuffer::new(data.len() * 2, DType::F16));
+        let mut t = Tensor::new(Shape::new(dims), buf, Arc::new(CpuBackend::new()));
+        for (d, &s) in t.as_mut_slice::<f16>().iter_mut().zip(data.iter()) {
+            *d = f16::from_f32(s);
+        }
+        t
+    }
+
+    /// Build a SeqMajor F16 *dynamic* KVCache with a real allocator (`memory=Some`),
+    /// so the non-F32 cast scratch path can lazily allocate its scratch buffers.
+    fn make_f16_dynamic_cache(max_seq: usize, kv_heads: usize, head_dim: usize) -> KVCache {
+        use crate::memory::Memory;
+        use crate::memory::galloc::Galloc;
+        let total = max_seq * kv_heads * head_dim;
+        let k = f16_tensor(vec![1, max_seq, kv_heads, head_dim], &vec![0.0f32; total]);
+        let v = f16_tensor(vec![1, max_seq, kv_heads, head_dim], &vec![0.0f32; total]);
+        let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+        KVCache::new_dynamic(k, v, max_seq, max_seq, kv_heads, head_dim, mem)
+    }
+
     #[test]
     fn test_geometry_delegates_to_kvcache() {
         let cache = make_cache(8, 2, 4);
@@ -330,6 +432,132 @@ mod tests {
     }
 
     #[test]
+    fn test_write_kv_f16_casts_f32_input() {
+        use half::f16;
+        // F16 cache + CpuBackend(is_gpu()==false) → 비-F32 cast 분기(GPU scatter fast-path 미진입).
+        // F32 입력이 F16 으로 cast 되어 저장되는지 검증 — `KVCache::update` 는 cast 를 안 하므로
+        // 이 흡수가 빠지면 dtype 미일치 silent garbage. (forward_gen 의 `kv_dtype != F32` 흡수.)
+        let kv_heads = 2;
+        let head_dim = 4;
+        let row = kv_heads * head_dim;
+        let fmt = StandardFormat::new(0, make_f16_dynamic_cache(8, kv_heads, head_dim));
+
+        // F16 로 정확히 표현 가능한 값(0.5 배수).
+        let token0: Vec<f32> = (0..row).map(|i| (i as f32) * 0.5).collect();
+        let k0 = f32_tensor(vec![1, 1, kv_heads, head_dim], &token0);
+        let v0 = f32_tensor(vec![1, 1, kv_heads, head_dim], &token0);
+        fmt.write_kv(&k0, &v0, &CpuBackend::new()).unwrap();
+        assert_eq!(fmt.current_pos(), 1);
+
+        // 두 번째 토큰 — lazy scratch 재사용 경로(k_cast/v_cast 이미 Some).
+        let token1: Vec<f32> = (0..row).map(|i| (i as f32) + 1.0).collect();
+        let k1 = f32_tensor(vec![1, 1, kv_heads, head_dim], &token1);
+        let v1 = f32_tensor(vec![1, 1, kv_heads, head_dim], &token1);
+        fmt.write_kv(&k1, &v1, &CpuBackend::new()).unwrap();
+        assert_eq!(fmt.current_pos(), 2);
+
+        // F16 buffer 검증: SeqMajor 라 pos*row + idx.
+        let guard = fmt.inner.lock().unwrap();
+        let k16 = guard.cache.k_buffer.as_slice::<f16>();
+        let v16 = guard.cache.v_buffer.as_slice::<f16>();
+        for (i, &exp) in token0.iter().enumerate() {
+            assert!(
+                (k16[i].to_f32() - exp).abs() < 1e-3,
+                "pos0 K[{i}] expected {exp}, got {}",
+                k16[i].to_f32()
+            );
+            assert!((v16[i].to_f32() - exp).abs() < 1e-3);
+        }
+        for (i, &exp) in token1.iter().enumerate() {
+            assert!(
+                (k16[row + i].to_f32() - exp).abs() < 1e-3,
+                "pos1 K[{i}] expected {exp}, got {}",
+                k16[row + i].to_f32()
+            );
+            assert!((v16[row + i].to_f32() - exp).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn test_write_kv_f16_batch_then_decode_reallocs_scratch() {
+        use half::f16;
+        // write_kv_batch(seq=2) 가 cast scratch 를 seq=2 크기로 굳힌 뒤 write_kv(seq=1) 가 와도
+        // scratch 가 shape 변화에 맞춰 재할당되어 둘 다 정확해야 한다(가드 부재 시 cast zip 절단).
+        let kv_heads = 2;
+        let head_dim = 4;
+        let row = kv_heads * head_dim;
+        let fmt = StandardFormat::new(0, make_f16_dynamic_cache(8, kv_heads, head_dim));
+
+        // prefill batch: 2 tokens. token@pos p = 0.5*(p+1) 균일.
+        let batch: Vec<f32> = (0..2 * row)
+            .map(|i| if i < row { 0.5 } else { 1.0 })
+            .collect();
+        let kb = f32_tensor(vec![1, 2, kv_heads, head_dim], &batch);
+        let vb = f32_tensor(vec![1, 2, kv_heads, head_dim], &batch);
+        fmt.write_kv_batch(&kb, &vb, &CpuBackend::new()).unwrap();
+        assert_eq!(fmt.current_pos(), 2);
+
+        // decode single: shape [1,1,...] — scratch 재할당 트리거.
+        let dec = vec![2.5f32; row];
+        let kd = f32_tensor(vec![1, 1, kv_heads, head_dim], &dec);
+        let vd = f32_tensor(vec![1, 1, kv_heads, head_dim], &dec);
+        fmt.write_kv(&kd, &vd, &CpuBackend::new()).unwrap();
+        assert_eq!(fmt.current_pos(), 3);
+
+        let guard = fmt.inner.lock().unwrap();
+        let k16 = guard.cache.k_buffer.as_slice::<f16>();
+        // pos0 = 0.5, pos1 = 1.0 (batch), pos2 = 2.5 (decode).
+        for i in 0..row {
+            assert!(
+                (k16[i].to_f32() - 0.5).abs() < 1e-3,
+                "pos0[{i}]={}",
+                k16[i].to_f32()
+            );
+            assert!(
+                (k16[row + i].to_f32() - 1.0).abs() < 1e-3,
+                "pos1[{i}]={}",
+                k16[row + i].to_f32()
+            );
+            assert!(
+                (k16[2 * row + i].to_f32() - 2.5).abs() < 1e-3,
+                "pos2[{i}]={}",
+                k16[2 * row + i].to_f32()
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_kv_f16_requires_dynamic_cache() {
+        // 비-F32 cast 는 inner cache 의 allocator 가 필요. `KVCache::new()`(memory=None)로 만든
+        // F16 cache 는 scratch 할당 불가 → 명시적 에러(silent 오동작 금지).
+        let kv_heads = 1;
+        let head_dim = 4;
+        let total = 8 * kv_heads * head_dim;
+        let buf_k = Arc::new(SharedBuffer::new(total * 2, DType::F16));
+        let buf_v = Arc::new(SharedBuffer::new(total * 2, DType::F16));
+        let k = Tensor::new(
+            Shape::new(vec![1, 8, kv_heads, head_dim]),
+            buf_k,
+            Arc::new(CpuBackend::new()),
+        );
+        let v = Tensor::new(
+            Shape::new(vec![1, 8, kv_heads, head_dim]),
+            buf_v,
+            Arc::new(CpuBackend::new()),
+        );
+        let fmt = StandardFormat::new(0, KVCache::new(k, v, 8)); // memory=None
+
+        let token = vec![1.0f32; kv_heads * head_dim];
+        let kt = f32_tensor(vec![1, 1, kv_heads, head_dim], &token);
+        let vt = f32_tensor(vec![1, 1, kv_heads, head_dim], &token);
+        let err = fmt.write_kv(&kt, &vt, &CpuBackend::new());
+        assert!(
+            err.is_err(),
+            "F16 cast on pre-allocated (memory=None) cache must error"
+        );
+    }
+
+    #[test]
     fn test_compact_keep_only() {
         let kv_heads = 1;
         let head_dim = 2;
@@ -349,8 +577,8 @@ mod tests {
         assert_eq!(fmt.current_pos(), 2);
 
         // Verify buffer layout: pos0 = token0 (unchanged), pos1 = token2 (moved from 2).
-        let cache = fmt.inner.lock().unwrap();
-        let k = cache.k_buffer.as_slice::<f32>();
+        let guard = fmt.inner.lock().unwrap();
+        let k = guard.cache.k_buffer.as_slice::<f32>();
         assert_eq!(k[0], 0.0, "kept pos0 = token0");
         assert_eq!(k[1], 0.0);
         assert_eq!(k[2], 2.0, "compacted pos1 = token2");
@@ -381,8 +609,8 @@ mod tests {
         fmt.compact(&[0, 1, 2], &merges).unwrap();
         assert_eq!(fmt.current_pos(), 3);
 
-        let cache = fmt.inner.lock().unwrap();
-        let k = cache.k_buffer.as_slice::<f32>();
+        let guard = fmt.inner.lock().unwrap();
+        let k = guard.cache.k_buffer.as_slice::<f32>();
         // pos0=token0=0, pos1=merged(10,6)=8, pos2=token2=2
         assert_eq!(k[0], 0.0);
         assert_eq!(k[2], 8.0, "merged into-token = mean(10,6)");
