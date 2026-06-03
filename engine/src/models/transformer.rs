@@ -214,6 +214,17 @@ pub struct TransformerModelForwardFmtArgs<'a> {
     /// prefill 한정: true 면 마지막 토큰 hidden 만 lm_head (logits_out=[1,1,vocab]).
     /// decode(seq_len=1)에선 무관. forward_into 의 `logits_last_only`(transformer.rs:1960) 미러.
     pub logits_last_only: bool,
+    /// H2O-style eviction score accumulator (Phase α-K ①-c — eval flip). `Some` 이면 decode 마다
+    /// post-softmax score 를 누적(`forward_into:1894-1922` 미러). production(ModelForward)은 항상 `None`.
+    pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
+    /// SWIFT layer-skip 설정 (Phase α-K ①-c). production 은 항상 `None`.
+    pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
+    /// Layer Skip QCF importance collector — prefill 2-pass 전용 (Phase α-K ①-c). production 은 `None`.
+    pub importance_collector: Option<&'a mut dyn crate::qcf_collector::ImportanceCollect>,
+    /// cache 자가-need(KIVI AWQE) 힌트 (Phase α-K ①-c). base trait 에 `needs_attn_scores` 가 없으므로
+    /// (§4.1 R4 ③) caller 가 `caches[0].needs_attn_scores()` 를 산출해 주입한다 — `need_scores` 의 OR
+    /// 항(`forward_gen.rs:409` 미러). production 은 `false`.
+    pub cache_self_need_scores: bool,
 }
 
 impl TransformerModel {
@@ -2027,6 +2038,11 @@ impl TransformerModel {
         let logits_out = args.logits_out;
         let x_gen = args.x_gen;
         let mut workspace = args.workspace;
+        // Phase α-K ①-c: eval feature threading (production ModelForward 은 전부 None/false).
+        let mut score_accumulator = args.score_accumulator;
+        let skip_config = args.skip_config;
+        let mut importance_collector = args.importance_collector;
+        let cache_self_need_scores = args.cache_self_need_scores;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -2085,11 +2101,19 @@ impl TransformerModel {
             needs_ws_sync = backend.is_gpu();
         }
 
+        // GPU-side score accumulator active 여부 — active 면 attention_gen 이 on-device 로 score 를
+        // 처리하므로 CPU need_scores=false (forward_into:1673 미러).
+        let gpu_score_active = backend.gpu_score_acc().is_some_and(|acc| acc.is_active());
+
         // Per-token weight snapshot (ENG-ALG-214-SNAP / INV-121) — forward_into 와 동일.
         let layer_snapshots: Vec<Arc<TransformerLayer>> =
             self.layers.iter().map(|s| s.load_weights()).collect();
         for (i, layer_arc) in layer_snapshots.iter().enumerate() {
             let layer = &**layer_arc;
+
+            // SWIFT layer-skip (forward_into:1715 미러). skip_config None 이면 (false, false).
+            let (s_attn, s_mlp) =
+                skip_config.map_or((false, false), |sc| (sc.skip_attn(i), sc.skip_mlp(i)));
 
             let rope_theta = if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern) {
                 self.config
@@ -2104,7 +2128,23 @@ impl TransformerModel {
                 None
             };
 
+            // importance snapshot before layer (forward_into:1733 미러) — prefill 2-pass 전용.
+            if let Some(ref mut coll) = importance_collector {
+                let x_data = x.as_slice::<f32>();
+                coll.snapshot_before(x_data, seq_len, hidden_size);
+            }
+
             if is_decode {
+                // need_scores = (GPU acc 미활성 시 score_acc layer-track) || cache 자가-need(KIVI AWQE).
+                // forward_into:1707 + forward_gen.rs:409 AWQE OR 항 미러.
+                let acc_need = if gpu_score_active {
+                    false
+                } else {
+                    score_accumulator
+                        .as_ref()
+                        .is_some_and(|acc| acc.should_track_layer(i))
+                };
+                let need_scores = acc_need || cache_self_need_scores;
                 let ws = workspace
                     .as_deref_mut()
                     .expect("forward_into_fmt decode requires a LayerWorkspace (seq_len=1)");
@@ -2116,11 +2156,10 @@ impl TransformerModel {
                     ws,
                     rms_norm_eps: self.config.rms_norm_eps as f32,
                     rope_theta,
-                    // happy-path: score_accumulator/GPU acc 비활성 → need_scores=false (3c-evict 에서 확장).
-                    need_scores: false,
+                    need_scores,
                     head_dim: self.config.head_dim,
-                    skip_attn: false,
-                    skip_mlp: false,
+                    skip_attn: s_attn,
+                    skip_mlp: s_mlp,
                     rms_norm_add_unit: is_gemma3,
                     use_gelu_tanh: is_gemma3,
                     is_local_attn: is_local,
@@ -2144,8 +2183,8 @@ impl TransformerModel {
                         batch_size,
                         seq_len,
                         dim: hidden_size,
-                        skip_attn: false,
-                        skip_mlp: false,
+                        skip_attn: s_attn,
+                        skip_mlp: s_mlp,
                         rms_norm_add_unit: is_gemma3,
                         use_gelu_tanh: is_gemma3,
                         is_local_attn: is_local,
@@ -2153,6 +2192,68 @@ impl TransformerModel {
                     },
                 )?;
             }
+
+            // importance record after layer (forward_into:1882-1891 미러) — prefill 2-pass 전용.
+            if let Some(ref mut coll) = importance_collector {
+                let x_data = x.as_slice::<f32>();
+                coll.record_after(
+                    x_data,
+                    seq_len,
+                    hidden_size,
+                    i,
+                    crate::qcf_types::SubLayer::Full,
+                );
+            }
+
+            // CPU attention-score 누적 (forward_into:1893-1922 미러). workspace Some(decode)에서만 —
+            // prefill 은 owned_prefill_ws 라 args.workspace=None → 자연 skip. cache_seq_len 은
+            // fmts[i].current_pos() 로 취득(base trait, kv_caches[i] 대체).
+            if let (Some(acc), Some(ws)) = (&mut score_accumulator, &workspace)
+                && acc.should_track_layer(i)
+            {
+                let cache_seq_len = fmts[i].current_pos();
+                let score_offset = ws.score_offset;
+                let effective_len = cache_seq_len - score_offset;
+                let n_heads_q = self.config.num_attention_heads;
+                let stride = ws.scores.len() / n_heads_q;
+
+                if acc.n_kv_heads() > 0 {
+                    let n_kv_heads = self.config.num_key_value_heads;
+                    acc.accumulate_layer_gqa(
+                        &ws.scores,
+                        stride,
+                        effective_len,
+                        n_heads_q,
+                        n_kv_heads,
+                        score_offset,
+                    );
+                } else {
+                    acc.accumulate_layer(
+                        &ws.scores,
+                        stride,
+                        effective_len,
+                        n_heads_q,
+                        score_offset,
+                    );
+                }
+            }
+        }
+
+        // step-local importance 를 cumulative 로 flush (forward_into:1926-1928 미러).
+        if let Some(ref mut acc) = score_accumulator {
+            acc.end_step();
+        }
+
+        // GPU score accumulator step flush (forward_into:1930-1941 미러).
+        #[cfg(feature = "opencl")]
+        if gpu_score_active
+            && let Some(ocl_be) = backend
+                .as_any()
+                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+        {
+            let cache_seq_len = fmts[0].current_pos();
+            gpu_acc.end_step(ocl_be.queue.as_core(), cache_seq_len)?;
         }
 
         // 3. Final Norm.

@@ -64,6 +64,16 @@ impl StandardFormat {
         f(&mut guard.cache)
     }
 
+    /// wrapping 을 해제하고 내부 `KVCache` 를 반환 (Phase α-K ①-c eval transient-wrap round-trip).
+    ///
+    /// eval 이 forward 1회 동안만 `Vec<KVCache>` → `Arc<StandardFormat>` 로 wrap 한 뒤
+    /// `Arc::try_unwrap().into_inner()` 로 concrete cache 를 복귀시키는 seam. cast scratch
+    /// (`k_cast`/`v_cast`)는 transient 라 버린다(다음 wrap 에서 lazy 재할당). base trait 무변
+    /// (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`).
+    pub(crate) fn into_inner(self) -> KVCache {
+        self.inner.into_inner().unwrap().cache
+    }
+
     /// KV write 흡수 — `forward_gen` 의 KV-update 분기(transformer_layer/forward_gen.rs:330-386)를
     /// format 표면으로 옮긴 것. `is_decode`(seq_len=1)면 GPU fused cast+scatter fast-path 게이팅.
     ///

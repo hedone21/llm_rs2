@@ -53,6 +53,14 @@ impl KIVIFormat {
         }
         cache.update(new_k, new_v)
     }
+
+    /// wrapping 을 해제하고 내부 `KiviCache` 를 반환 (Phase α-K ①-c eval transient-wrap round-trip).
+    ///
+    /// `StandardFormat::into_inner` 대칭. eval 이 forward 1회 동안만 `Vec<KiviCache>` →
+    /// `Arc<KIVIFormat>` 로 wrap 후 `Arc::try_unwrap().into_inner()` 로 복귀시킨다. base trait 무변.
+    pub(crate) fn into_inner(self) -> KiviCache {
+        self.inner.into_inner().unwrap()
+    }
 }
 
 impl KVCacheFormat for KIVIFormat {

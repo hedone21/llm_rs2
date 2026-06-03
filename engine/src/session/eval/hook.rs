@@ -5,7 +5,6 @@
 //! QCF metric collection.
 
 use crate::inference::attention_scores::AttentionScoreAccumulator;
-use crate::kv_cache_ops::KVCacheOps;
 
 /// Result of a post-decode-step hook invocation.
 #[derive(Debug, Default)]
@@ -19,7 +18,10 @@ pub struct PostStepResult {
 }
 
 /// Snapshot of KV cache state for choice-level restore.
-pub trait CacheSnapshot<C: KVCacheOps>: Send {
+///
+/// Phase α-K ①-c: `C: KVCacheOps` 바운드 제거 — `C` 는 concrete `KVCache`/`KiviCache` 둘뿐이고
+/// impl 이 이미 concrete 타입 인자라 바운드 불요. KVCacheOps 폐기(Step 5)의 eval 차단 해소.
+pub trait CacheSnapshot<C>: Send {
     /// Restore caches to the snapshotted state.
     fn restore_to(&self, caches: &mut [C]);
 }
@@ -29,7 +31,7 @@ pub trait CacheSnapshot<C: KVCacheOps>: Send {
 /// Implementations:
 /// - `EvictionHook` (KVCache): budget-based eviction + CAOTE/attn QCF
 /// - `KiviHook` (KiviCache): flush proxy collection (NMSE + OPR)
-pub trait StepHook<C: KVCacheOps> {
+pub trait StepHook<C> {
     /// Called after each decode step. Performs eviction/flush if needed.
     /// QCF results are stored on the hook itself (exposed via `extra_question_fields`).
     fn post_decode_step(&mut self, caches: &mut [C], step: usize) -> PostStepResult;

@@ -1,4 +1,4 @@
-//! Generic eval-LL loop: `run_eval_ll_generic<C: KVCacheOps>`.
+//! Generic eval-LL loop: `run_eval_ll_generic<C: EvalCacheKind>`.
 //!
 //! Replaces `run_eval_ll` and `run_kivi_eval_ll` in `generate.rs`.
 //! The two modes differ only in their `StepHook` implementations and
@@ -13,16 +13,16 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::inference::sampling;
 use crate::inference::skip_config::SkipConfig;
-use crate::kv_cache_ops::KVCacheOps;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
 use crate::qcf::ImportanceCollector;
 use crate::qcf_types::SubLayer;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
+use super::fmt_bridge::EvalCacheKind;
 use super::hook::StepHook;
 use super::output::{EvalConfig, EvalOutput, EvalQuestion};
 
@@ -42,12 +42,12 @@ use super::output::{EvalConfig, EvalOutput, EvalQuestion};
 /// Returns an `EvalOutput` whose `to_json()` matches the format previously
 /// produced by `run_eval_ll` and `run_kivi_eval_ll` exactly.
 #[allow(clippy::too_many_arguments)]
-pub fn run_eval_ll_generic<C: KVCacheOps>(
+pub fn run_eval_ll_generic<C: EvalCacheKind>(
     model: &TransformerModel,
     tokenizer: &tokenizers::Tokenizer,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
-    kv_caches: &mut [C],
+    kv_caches: &mut Vec<C>,
     hook: &mut dyn StepHook<C>,
     questions: &[EvalQuestion],
     eval_config: &EvalConfig,
@@ -246,7 +246,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         // current_pos afterwards so eviction sees the correct token count.
         if hook.needs_score_probe(kv_caches) {
             // Save current_pos before probe (will be prompt_len)
-            let saved_positions: Vec<usize> = kv_caches.iter().map(|c| c.current_pos()).collect();
+            let saved_positions: Vec<usize> = kv_caches.iter().map(|c| c.cur_pos()).collect();
 
             let last_token_id = prompt_ids[prompt_len - 1];
             // SAFETY: cpu_gen_input was allocated with 4 bytes (one u32).
@@ -262,30 +262,30 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                 acc.begin_step();
             }
 
-            model.forward_into(TransformerModelForwardArgs {
-                input_tokens: &gpu_gen_input,
-                start_pos: start_pos_after_prompt - 1,
-                kv_caches,
-                backend,
-                memory,
-                logits_out: &mut decode_logits,
-                x_gen: Some(&mut x_gen),
-                workspace: Some(&mut gen_ws),
-                score_accumulator: hook.score_accumulator(),
-                profiler: None,
-                skip_config,
-                importance_collector: None,
-                logits_last_only: false,
-                variance_collector: None,
-                prefill_workspace: None,
-
-                layer_boundary_hook: None,
+            // Phase α-K ①-c: forward_into → fmt round-trip. cache_self_need(KIVI AWQE)는 wrap 전 산출.
+            let probe_need = kv_caches.first().is_some_and(|c| c.needs_scores());
+            C::forward_fmt_roundtrip(kv_caches, |fmts| {
+                model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                    input_tokens: &gpu_gen_input,
+                    start_pos: start_pos_after_prompt - 1,
+                    fmts,
+                    backend,
+                    memory,
+                    logits_out: &mut decode_logits,
+                    x_gen: Some(&mut x_gen),
+                    workspace: Some(&mut gen_ws),
+                    logits_last_only: false,
+                    score_accumulator: hook.score_accumulator(),
+                    skip_config,
+                    importance_collector: None,
+                    cache_self_need_scores: probe_need,
+                })
             })?;
 
             // Restore current_pos: undo the probe's kv_cache.update() increment.
             // The extra entry at position prompt_len is beyond current_pos and invisible.
             for (cache, &pos) in kv_caches.iter_mut().zip(saved_positions.iter()) {
-                cache.set_current_pos(pos);
+                cache.set_cur_pos(pos);
             }
         }
 
@@ -354,24 +354,23 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         acc.begin_step();
                     }
 
-                    model.forward_into(TransformerModelForwardArgs {
-                        input_tokens: &gpu_gen_input,
-                        start_pos: sp,
-                        kv_caches,
-                        backend,
-                        memory,
-                        logits_out: &mut decode_logits,
-                        x_gen: Some(&mut x_gen),
-                        workspace: Some(&mut gen_ws),
-                        score_accumulator: hook.score_accumulator(),
-                        profiler: None,
-                        skip_config,
-                        importance_collector: None,
-                        logits_last_only: false,
-                        variance_collector: None,
-                        prefill_workspace: None,
-
-                        layer_boundary_hook: None,
+                    let dec_need = kv_caches.first().is_some_and(|c| c.needs_scores());
+                    C::forward_fmt_roundtrip(kv_caches, |fmts| {
+                        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                            input_tokens: &gpu_gen_input,
+                            start_pos: sp,
+                            fmts,
+                            backend,
+                            memory,
+                            logits_out: &mut decode_logits,
+                            x_gen: Some(&mut x_gen),
+                            workspace: Some(&mut gen_ws),
+                            logits_last_only: false,
+                            score_accumulator: hook.score_accumulator(),
+                            skip_config,
+                            importance_collector: None,
+                            cache_self_need_scores: dec_need,
+                        })
                     })?;
                     sp += 1;
 
@@ -442,7 +441,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         );
 
         // ── Per-question result JSON ──
-        let final_cache_pos = kv_caches.iter().map(|c| c.current_pos()).max().unwrap_or(0);
+        let final_cache_pos = kv_caches.iter().map(|c| c.cur_pos()).max().unwrap_or(0);
 
         let extra = hook.extra_question_fields(kv_caches);
 
@@ -523,12 +522,12 @@ type ImportancePassResult = (
 );
 
 #[allow(clippy::too_many_arguments)]
-fn run_importance_pass<C: KVCacheOps>(
+fn run_importance_pass<C: EvalCacheKind>(
     model: &TransformerModel,
     tokenizer: &tokenizers::Tokenizer,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
-    kv_caches: &mut [C],
+    kv_caches: &mut Vec<C>,
     hook: &mut dyn StepHook<C>,
     questions: &[EvalQuestion],
     vocab_size: usize,
@@ -574,24 +573,22 @@ fn run_importance_pass<C: KVCacheOps>(
     );
 
     let mut collector = ImportanceCollector::new();
-    model.forward_into(TransformerModelForwardArgs {
-        input_tokens: &input_tensor,
-        start_pos: 0,
-        kv_caches,
-        backend,
-        memory,
-        logits_out: &mut imp_logits,
-        x_gen: None,
-        workspace: None,
-        score_accumulator: None,
-        profiler: None,
-        skip_config: None, // intentionally None for importance measurement
-        importance_collector: Some(&mut collector),
-        logits_last_only: false,
-        variance_collector: None,
-        prefill_workspace: None,
-
-        layer_boundary_hook: None,
+    C::forward_fmt_roundtrip(kv_caches, |fmts| {
+        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            input_tokens: &input_tensor,
+            start_pos: 0,
+            fmts,
+            backend,
+            memory,
+            logits_out: &mut imp_logits,
+            x_gen: None,
+            workspace: None,
+            logits_last_only: false,
+            score_accumulator: None,
+            skip_config: None, // intentionally None for importance measurement
+            importance_collector: Some(&mut collector),
+            cache_self_need_scores: false,
+        })
     })?;
 
     let table = collector.build();
@@ -623,11 +620,11 @@ fn run_importance_pass<C: KVCacheOps>(
 /// - `prompt_logits_cpu`: logits for the last prompt token (for scoring cont_ids[0])
 /// - `start_pos_after_prompt`: KV cache position after processing all prompt tokens
 #[allow(clippy::too_many_arguments)]
-fn run_prefill<C: KVCacheOps>(
+fn run_prefill<C: EvalCacheKind>(
     model: &TransformerModel,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
-    kv_caches: &mut [C],
+    kv_caches: &mut Vec<C>,
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
     decode_logits: &mut Tensor,
@@ -641,7 +638,7 @@ fn run_prefill<C: KVCacheOps>(
 ) -> Result<(Vec<f32>, usize)> {
     // When KV caches need attention scores (KIVI+AWQE/AW-VOPR), use token-by-token
     // prefill so each KIVI flush has scores from the previous step.
-    let needs_scores = !kv_caches.is_empty() && kv_caches[0].needs_attn_scores();
+    let needs_scores = !kv_caches.is_empty() && kv_caches[0].needs_scores();
     if needs_scores && prompt_ids.len() > 1 {
         return run_token_by_token_prefill(
             model,
@@ -678,11 +675,11 @@ fn run_prefill<C: KVCacheOps>(
 /// so `set_attn_scores()` is called between tokens, giving KIVI flushes access to
 /// attention scores for weighted error computation.
 #[allow(clippy::too_many_arguments)]
-fn run_token_by_token_prefill<C: KVCacheOps>(
+fn run_token_by_token_prefill<C: EvalCacheKind>(
     model: &TransformerModel,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
-    kv_caches: &mut [C],
+    kv_caches: &mut Vec<C>,
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
     decode_logits: &mut Tensor,
@@ -712,24 +709,23 @@ fn run_token_by_token_prefill<C: KVCacheOps>(
             std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
         })?;
 
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &gen_input,
-            start_pos: i,
-            kv_caches,
-            backend,
-            memory,
-            logits_out: decode_logits,
-            x_gen: Some(x_gen),
-            workspace: Some(gen_ws),
-            score_accumulator: hook.score_accumulator(),
-            profiler: None,
-            skip_config,
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-            prefill_workspace: None,
-
-            layer_boundary_hook: None,
+        let tbt_need = kv_caches.first().is_some_and(|c| c.needs_scores());
+        C::forward_fmt_roundtrip(kv_caches, |fmts| {
+            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                input_tokens: &gen_input,
+                start_pos: i,
+                fmts,
+                backend,
+                memory,
+                logits_out: decode_logits,
+                x_gen: Some(x_gen),
+                workspace: Some(gen_ws),
+                logits_last_only: false,
+                score_accumulator: hook.score_accumulator(),
+                skip_config,
+                importance_collector: None,
+                cache_self_need_scores: tbt_need,
+            })
         })?;
     }
 
@@ -745,11 +741,11 @@ fn run_token_by_token_prefill<C: KVCacheOps>(
 
 /// Full prefill: forward all prompt tokens in a single batched pass.
 #[allow(clippy::too_many_arguments)]
-fn run_full_prefill<C: KVCacheOps>(
+fn run_full_prefill<C: EvalCacheKind>(
     model: &TransformerModel,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
-    kv_caches: &mut [C],
+    kv_caches: &mut Vec<C>,
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
     vocab_size: usize,
@@ -780,24 +776,23 @@ fn run_full_prefill<C: KVCacheOps>(
         backend.clone(),
     );
 
-    model.forward_into(TransformerModelForwardArgs {
-        input_tokens: &input_tensor,
-        start_pos: 0,
-        kv_caches,
-        backend,
-        memory,
-        logits_out: &mut prefill_logits,
-        x_gen: None,
-        workspace: None,
-        score_accumulator: hook.score_accumulator(),
-        profiler: None,
-        skip_config,
-        importance_collector: None,
-        logits_last_only: true,
-        variance_collector: None,
-        prefill_workspace: None,
-
-        layer_boundary_hook: None,
+    let fp_need = kv_caches.first().is_some_and(|c| c.needs_scores());
+    C::forward_fmt_roundtrip(kv_caches, |fmts| {
+        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            input_tokens: &input_tensor,
+            start_pos: 0,
+            fmts,
+            backend,
+            memory,
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            logits_last_only: true,
+            score_accumulator: hook.score_accumulator(),
+            skip_config,
+            importance_collector: None,
+            cache_self_need_scores: fp_need,
+        })
     })?;
 
     // Read logits (only last position — much smaller than full prompt × vocab)
@@ -823,11 +818,11 @@ fn run_full_prefill<C: KVCacheOps>(
 /// scores during the decode phase. This gives post_prefill high-quality scores
 /// for eviction decisions, matching the quality of decode-step accumulation.
 #[allow(clippy::too_many_arguments, dead_code, clippy::ptr_arg)]
-fn run_chunked_prefill<C: KVCacheOps>(
+fn run_chunked_prefill<C: EvalCacheKind>(
     model: &TransformerModel,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
-    kv_caches: &mut [C],
+    kv_caches: &mut Vec<C>,
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
     decode_logits: &mut Tensor,
@@ -870,24 +865,23 @@ fn run_chunked_prefill<C: KVCacheOps>(
         acc.begin_step();
     }
 
-    model.forward_into(TransformerModelForwardArgs {
-        input_tokens: &input_tensor,
-        start_pos: 0,
-        kv_caches,
-        backend,
-        memory,
-        logits_out: &mut prefill_logits,
-        x_gen: None,
-        workspace: None,
-        score_accumulator: hook.score_accumulator(),
-        profiler: None,
-        skip_config,
-        importance_collector: None,
-        logits_last_only: true,
-        variance_collector: None,
-        prefill_workspace: None,
-
-        layer_boundary_hook: None,
+    let fp_need = kv_caches.first().is_some_and(|c| c.needs_scores());
+    C::forward_fmt_roundtrip(kv_caches, |fmts| {
+        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            input_tokens: &input_tensor,
+            start_pos: 0,
+            fmts,
+            backend,
+            memory,
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            logits_last_only: true,
+            score_accumulator: hook.score_accumulator(),
+            skip_config,
+            importance_collector: None,
+            cache_self_need_scores: fp_need,
+        })
     })?;
 
     // Explicitly drop GPU buffers and flush queue to free VRAM before the
@@ -926,24 +920,23 @@ fn run_chunked_prefill<C: KVCacheOps>(
             acc.begin_step();
         }
 
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &gen_input,
-            start_pos,
-            kv_caches,
-            backend,
-            memory,
-            logits_out: decode_logits,
-            x_gen: Some(x_gen),
-            workspace: Some(gen_ws),
-            score_accumulator: hook.score_accumulator(),
-            profiler: None,
-            skip_config,
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-            prefill_workspace: None,
-
-            layer_boundary_hook: None,
+        let cp_need = kv_caches.first().is_some_and(|c| c.needs_scores());
+        C::forward_fmt_roundtrip(kv_caches, |fmts| {
+            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                input_tokens: &gen_input,
+                start_pos,
+                fmts,
+                backend,
+                memory,
+                logits_out: decode_logits,
+                x_gen: Some(x_gen),
+                workspace: Some(gen_ws),
+                logits_last_only: false,
+                score_accumulator: hook.score_accumulator(),
+                skip_config,
+                importance_collector: None,
+                cache_self_need_scores: cp_need,
+            })
         })?;
         start_pos += 1;
     }

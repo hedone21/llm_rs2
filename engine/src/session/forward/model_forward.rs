@@ -406,6 +406,11 @@ impl Forward for ModelForward {
                         x_gen: None,
                         workspace: None,
                         logits_last_only: true,
+                        // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
+                        score_accumulator: None,
+                        skip_config: None,
+                        importance_collector: None,
+                        cache_self_need_scores: false,
                     })?;
             } else {
                 self.model.forward_into(TransformerModelForwardArgs {
@@ -472,6 +477,11 @@ impl Forward for ModelForward {
                     x_gen: Some(&mut self.decode_x_gen),
                     workspace: Some(&mut self.decode_workspace),
                     logits_last_only: false,
+                    // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
+                    score_accumulator: None,
+                    skip_config: None,
+                    importance_collector: None,
+                    cache_self_need_scores: false,
                 })?;
             return self.read_logits(&self.logits_decode);
         }
