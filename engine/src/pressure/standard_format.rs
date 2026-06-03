@@ -300,12 +300,47 @@ impl KVCacheFormat for StandardFormat {
         dims: AttnDims,
         scores: Option<&mut [f32]>,
     ) -> Result<()> {
+        let seq_len = q.shape().dims()[1];
+
         let mut guard = self.inner.lock().unwrap();
         let cache = &mut guard.cache;
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
         let cache_seq_len = KVCacheOps::current_pos(&*cache);
 
+        // ── prefill (seq_len>1): multi-token causal attention (C-1, §9.1-BC1 / ①-b) ──
+        // decode delegate(attention_gen / attention_q4_gpu_fallback)는 single-query +
+        // causal-mask 부재라 재사용 불가 → forward_prefill(forward.rs:259-585) attention 블록을
+        // `prefill_attention` 으로 미러. effective_cache_len clamp 를 **우회**하고(전체 cache_seq_len
+        // K + window 를 flash 내부 마스킹에 위임) q_start_pos = cache_seq_len - seq_len. prefill 은
+        // score 누적 안 함(scores 무시 — forward_prefill 의 `_need_scores`/variance_collector 와 동일).
+        if seq_len > 1 {
+            let kv_capacity = cache.capacity();
+            let kv_layout = cache.layout();
+            let batch_size = q.shape().dims()[0];
+            let q_start_pos = cache_seq_len - seq_len;
+            let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
+            let _ = scores;
+            return prefill_attention(
+                q,
+                out,
+                &k_cache,
+                &v_cache,
+                dims.n_heads_q,
+                n_heads_kv,
+                head_dim,
+                seq_len,
+                cache_seq_len,
+                kv_capacity,
+                batch_size,
+                kv_layout,
+                q_start_pos,
+                dims.window,
+                backend,
+            );
+        }
+
+        // ── decode (seq_len==1): 기존 경로 (byte-불변) ──
         // Sliding window: 최근 window 토큰으로 제한 (Gemma3 local). global 이면 전체.
         let effective_cache_len = match dims.window {
             Some(w) => cache_seq_len.min(w),
@@ -455,6 +490,288 @@ fn merge_row_f16(
         }
         buf[into_off + d] = f16::from_f32(acc);
     }
+}
+
+/// prefill multi-token causal attention (C-1, §9.1-BC1 / ①-b).
+///
+/// `forward_prefill`(transformer_layer/forward.rs:259-585)의 attention 블록을 그대로 미러한다 —
+/// **decode delegate(`attention_gen` / `attention_q4_gpu_fallback`)는 single-query + causal-mask
+/// 부재라 multi-token prefill 에 재사용 불가**(bit-identical 검증 wfceex20u 정정 B). GPU
+/// `flash_attention_prefill` 시도 → 미dispatch(Q4_0 / head_dim 미지원 / CPU)면 dtype별 dequant +
+/// `flash_attention_forward_strided`(causal mask 는 `q_start_pos`). prefill 은 score 누적 안 함
+/// (forward_prefill 의 `_need_scores` 동일) → scores 인자 없음. `window` 는 flash 내부 마스킹에
+/// 위임(decode 진입부의 `effective_cache_len` clamp **우회** — 정정 C). variance_collector/profiler/
+/// fallback warn 은 happy-path 미진입·수치-무관이라 생략. forward_prefill 무수정(additive fork) —
+/// 중복은 host parity test 로 bit-identical 증명, Step 5(forward_prefill<C> 삭제)에서 자연 해소.
+#[allow(clippy::too_many_arguments)]
+fn prefill_attention(
+    q: &Tensor,
+    out: &mut Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    seq_len: usize,
+    cache_seq_len: usize,
+    kv_capacity: usize,
+    batch_size: usize,
+    kv_layout: crate::kv_cache_ops::KVLayout,
+    q_start_pos: usize,
+    window: Option<usize>,
+    backend: &dyn Backend,
+) -> Result<()> {
+    use crate::kv_cache_ops::KVLayout;
+
+    let is_gpu = backend.is_gpu();
+    // GPU flash attention prefill — KV 버퍼가 실제 GPU 버퍼일 때만(CPU-only cache 는 fallback).
+    let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
+    let gpu_dispatched = if is_gpu && kv_is_gpu {
+        backend.flash_attention_prefill(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            head_dim,
+            kv_capacity,
+            batch_size,
+            kv_layout == KVLayout::HeadMajor,
+        )?
+    } else {
+        false
+    };
+    if gpu_dispatched {
+        return Ok(());
+    }
+
+    // CPU attention fallback (GPU 미dispatch 포함).
+    let is_device_only = is_gpu && q.as_ptr().is_null();
+    let mut out_vec: Vec<f32> = Vec::new();
+    {
+        fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+        }
+
+        let mut q_vec = Vec::new();
+        let mut k_vec = Vec::new();
+        let mut v_vec = Vec::new();
+
+        let (q_data, k_data, v_data, out_ptr) = if is_device_only {
+            let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
+                if t.dtype() == DType::Q4_0 {
+                    use crate::quant::{BlockQ4_0, QK4_0};
+                    let numel = t.numel();
+                    let n_blocks = numel / QK4_0;
+                    let byte_size = n_blocks * std::mem::size_of::<BlockQ4_0>();
+                    let mut byte_vec = vec![0u8; byte_size];
+                    backend.read_buffer(t, &mut byte_vec)?;
+                    vec.resize(numel, 0.0);
+                    let blocks = unsafe {
+                        std::slice::from_raw_parts(byte_vec.as_ptr() as *const BlockQ4_0, n_blocks)
+                    };
+                    for i in 0..n_blocks {
+                        let mut tmp = [0.0f32; QK4_0];
+                        blocks[i].dequantize(&mut tmp);
+                        vec[i * QK4_0..(i + 1) * QK4_0].copy_from_slice(&tmp);
+                    }
+                } else if t.dtype() == DType::F16 {
+                    let numel = t.numel();
+                    let byte_size = numel * 2;
+                    let mut byte_vec = vec![0u8; byte_size];
+                    backend.read_buffer(t, &mut byte_vec)?;
+                    vec.resize(numel, 0.0);
+                    unsafe {
+                        crate::quant::f16_bulk::bulk_f16_to_f32(
+                            byte_vec.as_ptr() as *const u16,
+                            vec.as_mut_ptr(),
+                            numel,
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        let f16_slice = unsafe {
+                            std::slice::from_raw_parts(byte_vec.as_ptr() as *const half::f16, numel)
+                        };
+                        for i in 0..numel {
+                            vec[i] = f16_slice[i].to_f32();
+                        }
+                    }
+                } else {
+                    vec.resize(t.numel(), 0.0);
+                    backend.read_buffer(t, as_u8_mut(vec))?;
+                }
+                Ok(())
+            };
+
+            read_to_f32(q, &mut q_vec)?;
+            read_to_f32(k_cache, &mut k_vec)?;
+            read_to_f32(v_cache, &mut v_vec)?;
+
+            out_vec.resize(out.numel(), 0.0);
+
+            (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
+        } else if k_cache.dtype() == DType::Q4_0 {
+            use crate::quant::{BlockQ4_0, QK4_0};
+            let n_elems = if kv_layout == KVLayout::HeadMajor {
+                n_heads_kv * kv_capacity * head_dim
+            } else {
+                cache_seq_len * n_heads_kv * head_dim
+            };
+            let n_blocks = n_elems / QK4_0;
+            let k_q4 = unsafe {
+                std::slice::from_raw_parts(k_cache.as_ptr() as *const BlockQ4_0, n_blocks)
+            };
+            let v_q4 = unsafe {
+                std::slice::from_raw_parts(v_cache.as_ptr() as *const BlockQ4_0, n_blocks)
+            };
+            k_vec.resize(n_elems, 0.0f32);
+            v_vec.resize(n_elems, 0.0f32);
+            for i in 0..n_blocks {
+                let mut tmp = [0.0f32; QK4_0];
+                k_q4[i].dequantize(&mut tmp);
+                k_vec[i * QK4_0..(i + 1) * QK4_0].copy_from_slice(&tmp);
+                v_q4[i].dequantize(&mut tmp);
+                v_vec[i * QK4_0..(i + 1) * QK4_0].copy_from_slice(&tmp);
+            }
+            (
+                q.as_slice::<f32>(),
+                &k_vec[..],
+                &v_vec[..],
+                out.as_mut_slice::<f32>(),
+            )
+        } else if k_cache.dtype() == DType::F16 {
+            let n_elems = if kv_layout == KVLayout::HeadMajor {
+                n_heads_kv * kv_capacity * head_dim
+            } else {
+                cache_seq_len * n_heads_kv * head_dim
+            };
+            let k_f16_ptr = k_cache.as_ptr() as *const u16;
+            let v_f16_ptr = v_cache.as_ptr() as *const u16;
+            k_vec.resize(n_elems, 0.0f32);
+            v_vec.resize(n_elems, 0.0f32);
+            unsafe {
+                crate::quant::f16_bulk::bulk_f16_to_f32(k_f16_ptr, k_vec.as_mut_ptr(), n_elems);
+                crate::quant::f16_bulk::bulk_f16_to_f32(v_f16_ptr, v_vec.as_mut_ptr(), n_elems);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let k_f16 =
+                    unsafe { std::slice::from_raw_parts(k_f16_ptr as *const half::f16, n_elems) };
+                let v_f16 =
+                    unsafe { std::slice::from_raw_parts(v_f16_ptr as *const half::f16, n_elems) };
+                for i in 0..n_elems {
+                    k_vec[i] = k_f16[i].to_f32();
+                    v_vec[i] = v_f16[i].to_f32();
+                }
+            }
+            (
+                q.as_slice::<f32>(),
+                &k_vec[..],
+                &v_vec[..],
+                out.as_mut_slice::<f32>(),
+            )
+        } else {
+            (
+                q.as_slice::<f32>(),
+                k_cache.as_slice::<f32>(),
+                v_cache.as_slice::<f32>(),
+                out.as_mut_slice::<f32>(),
+            )
+        };
+
+        for x in out_ptr.iter_mut() {
+            *x = 0.0;
+        }
+
+        use crate::layers::attention::flash_attention_forward_strided;
+        let is_head_major_pf = kv_layout == KVLayout::HeadMajor;
+        let chunk_q_stride = seq_len * n_heads_q * head_dim;
+        let chunk_out_stride = seq_len * n_heads_q * head_dim;
+        let chunk_k_stride = kv_capacity * n_heads_kv * head_dim;
+        let (k_pos_stride, kv_head_stride) = if is_head_major_pf {
+            (head_dim, kv_capacity * head_dim)
+        } else {
+            (n_heads_kv * head_dim, head_dim)
+        };
+
+        for (b, out_batch) in out_ptr.chunks_mut(chunk_out_stride).enumerate() {
+            let q_start = b * chunk_q_stride;
+            let k_start = b * chunk_k_stride;
+            let v_start = b * chunk_k_stride;
+            let q_slice = &q_data[q_start..q_start + chunk_q_stride];
+            let k_valid_len = if is_head_major_pf {
+                n_heads_kv * kv_capacity * head_dim
+            } else {
+                cache_seq_len * n_heads_kv * head_dim
+            };
+            let k_slice = &k_data[k_start..k_start + k_valid_len];
+            let v_slice = &v_data[v_start..v_start + k_valid_len];
+
+            flash_attention_forward_strided(
+                q_slice,
+                k_slice,
+                v_slice,
+                out_batch,
+                n_heads_q,
+                n_heads_kv,
+                seq_len,
+                cache_seq_len,
+                head_dim,
+                n_heads_q * head_dim,
+                k_pos_stride,
+                k_pos_stride,
+                n_heads_q * head_dim,
+                kv_head_stride,
+                q_start_pos,
+                32,
+                32,
+                window,
+            );
+        }
+    }
+
+    if is_device_only {
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts(out_vec.as_ptr() as *const u8, out_vec.len() * 4) };
+        let dst_ptr = out.as_mut_ptr();
+        if !dst_ptr.is_null() {
+            // UMA / pinned memory: direct memcpy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(out_bytes.as_ptr(), dst_ptr, out_bytes.len());
+            }
+        }
+        #[cfg(feature = "opencl")]
+        {
+            // OpenCL device-only buffers need enqueue_write_buffer.
+            if dst_ptr.is_null()
+                && let Ok(dst_mem) = crate::backend::opencl::get_cl_mem(out.buffer().as_ref())
+            {
+                if let Some(ocl) = backend
+                    .as_any()
+                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                {
+                    unsafe {
+                        ocl::core::enqueue_write_buffer(
+                            &ocl.queue,
+                            dst_mem,
+                            true,
+                            0,
+                            out_bytes,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )?;
+                    }
+                } else {
+                    anyhow::bail!("prefill flash_attn CPU fallback: backend not OpenCL");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -854,6 +1171,66 @@ mod tests {
         // post-softmax scores: 2 equal weights summing to 1.
         assert!((scores[0] - 0.5).abs() < 1e-4);
         assert!((scores[1] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_prefill_attention_causal_uniform() {
+        // C-1 (①-b): multi-token prefill attention via attention_into(seq_len>1).
+        // K=0 → 모든 score 0 → uniform softmax. V[pos]=pos (broadcast). causal mask 로
+        // query row r 은 cache pos 0..=r 만 attend → out[r] = mean(0..=r) = r/2.
+        // write_kv_batch(prefill write) + attention_into(prefill arm) 합동 검증.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let n_heads_q = 1;
+        let seq = 4;
+        let fmt = StandardFormat::new(0, make_cache(16, kv_heads, head_dim));
+        let backend = CpuBackend::new();
+
+        let k_data = vec![0.0f32; seq * kv_heads * head_dim];
+        let mut v_data = vec![0.0f32; seq * kv_heads * head_dim];
+        for p in 0..seq {
+            for d in 0..head_dim {
+                v_data[p * kv_heads * head_dim + d] = p as f32;
+            }
+        }
+        let kb = f32_tensor(vec![1, seq, kv_heads, head_dim], &k_data);
+        let vb = f32_tensor(vec![1, seq, kv_heads, head_dim], &v_data);
+        fmt.write_kv_batch(&kb, &vb, &backend).unwrap();
+        assert_eq!(fmt.current_pos(), seq);
+
+        // q 값은 무관(K=0 → score 0). out = [1, seq, n_heads_q*head_dim].
+        let q = f32_tensor(
+            vec![1, seq, n_heads_q, head_dim],
+            &vec![1.0; seq * n_heads_q * head_dim],
+        );
+        let mut out = f32_tensor(
+            vec![1, seq, n_heads_q * head_dim],
+            &vec![0.0; seq * n_heads_q * head_dim],
+        );
+
+        fmt.attention_into(
+            &q,
+            &backend,
+            &mut out,
+            AttnDims {
+                n_heads_q,
+                window: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        let o = out.as_slice::<f32>();
+        for r in 0..seq {
+            let expected = r as f32 / 2.0; // mean(0..=r)
+            for d in 0..head_dim {
+                let got = o[r * head_dim + d];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "row {r} d {d}: expected {expected}, got {got}"
+                );
+            }
+        }
     }
 
     #[test]

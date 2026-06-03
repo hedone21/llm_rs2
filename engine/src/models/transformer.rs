@@ -208,7 +208,12 @@ pub struct TransformerModelForwardFmtArgs<'a> {
     pub memory: &'a dyn Memory,
     pub logits_out: &'a mut Tensor,
     pub x_gen: Option<&'a mut Tensor>,
+    /// decode(seq_len=1) workspace. prefill(seq_len>1)은 forward_into_fmt 가 owned
+    /// PrefillWorkspace 를 자체 할당하므로 None 이어도 무방.
     pub workspace: Option<&'a mut LayerWorkspace>,
+    /// prefill 한정: true 면 마지막 토큰 hidden 만 lm_head (logits_out=[1,1,vocab]).
+    /// decode(seq_len=1)에선 무관. forward_into 의 `logits_last_only`(transformer.rs:1960) 미러.
+    pub logits_last_only: bool,
 }
 
 impl TransformerModel {
@@ -1996,22 +2001,23 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// `forward_into` 의 KVCacheFormat trait-object fork (Phase α-K substep 3c, **decode-only**).
+    /// `forward_into` 의 KVCacheFormat trait-object fork (Phase α-K substep 3c + ①-b).
     ///
-    /// `forward_into` 와 동일한 decode 골격(embedding → layer loop → final norm → lm_head)이되,
-    /// 각 layer 의 KV write + attention 을 `layer.forward_gen_fmt`(→ `fmt.write_kv` / `fmt.attention_into`)
-    /// 로 위임한다. branch-by-abstraction: 기존 `forward_into` 와 공존(production 무변), `ModelForward`
-    /// 가 `LLMRS_KV_FMT` 게이트 ON + `--no-gpu-plan` 시 decode fallback 으로 본 entry 호출.
+    /// `forward_into` 와 동일한 골격(embedding → layer loop → final norm → lm_head)이되, 각 layer 의
+    /// KV write + attention 을 trait object 로 위임한다: **decode(seq_len=1)** = `forward_gen_fmt`
+    /// (→ `fmt.write_kv` / `fmt.attention_into` single-query), **prefill(seq_len>1)** = `forward_prefill_fmt`
+    /// (→ `fmt.write_kv_batch` / `fmt.attention_into` multi-token causal, ①-b). branch-by-abstraction:
+    /// 기존 `forward_into` 와 공존(production 무변), `ModelForward` 가 `LLMRS_KV_FMT` 게이트 ON 시 호출.
     ///
-    /// **happy-path decode 전용**: `is_standard_happy_path`(eviction=none / skip=0 / profile off /
-    /// partition off) 보장 하에 score_accumulator·profiler·skip·partition 이 전부 비활성이므로 골격이
-    /// `forward_into` 의 라이브 decode arm 과 일치한다. score 누적·eviction flip 은 (3c-evict) 후속
-    /// increment, prefill flip 은 (3d).
+    /// **happy-path 전용**: eviction=none / skip=0 / profile off / partition off 보장 하에
+    /// score_accumulator·profiler·skip·partition 이 전부 비활성이므로 골격이 `forward_into` 의 라이브
+    /// arm 과 일치한다. score 누적·eviction flip 은 (3c-evict) 후속.
     ///
-    /// **bit-identical 범위**: F16/Q4_0 KV(default=F16) 및 F32-device-only(null host ptr)에서만 동치.
-    /// **⚠️ F32 KV + host-mapped 버퍼**(rpcmem/zero-copy/CPU)는 `forward_into` 가 inline-NEON attention
-    /// 을 타는 반면 `attention_into` 는 `backend.attention_gen` 위임 → 누산 순서 상이로 NOT bit-identical.
-    /// (3c) device 게이트는 F16/Q4_0 KV 만 대상. 상세: `forward_gen_fmt.rs` 헤더.
+    /// **bit-identical 범위**: decode 는 F16/Q4_0 KV(default=F16) 및 F32-device-only 에서만 동치
+    /// (⚠️ **F32 KV + host-mapped** 는 `forward_gen` 이 inline-NEON attention 을 타는 반면 decode
+    /// `attention_into` 는 `backend.attention_gen` 위임 → NOT bit-identical, `forward_gen_fmt.rs` 헤더).
+    /// **prefill 은 F16/Q4_0/F32 모두 동치** — decode 와 달리 `forward_prefill` 도 inline-NEON 아닌
+    /// flash 경로라 `attention_into` prefill arm 과 누산 순서 일치(`standard_format::prefill_attention`).
     pub fn forward_into_fmt(&self, args: TransformerModelForwardFmtArgs) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
@@ -2025,11 +2031,20 @@ impl TransformerModel {
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
         let hidden_size = self.config.hidden_size;
-        debug_assert_eq!(seq_len, 1, "forward_into_fmt is decode-only (substep 3c)");
+        let is_decode = seq_len == 1;
 
-        // 1. Embedding — decode(seq_len=1) 는 caller x_gen 재사용.
-        let mut x = if let Some(xb) = x_gen {
-            (*xb).clone()
+        // 1. Embedding — decode(seq_len=1) 는 caller x_gen 재사용, prefill 은 [batch, seq_len, hidden] 할당.
+        let mut x = if is_decode {
+            if let Some(xb) = x_gen {
+                (*xb).clone()
+            } else {
+                let x_buf = memory.alloc(batch_size * seq_len * hidden_size * 4, DType::F32)?;
+                Tensor::new(
+                    Shape::new(vec![batch_size, seq_len, hidden_size]),
+                    x_buf,
+                    backend.clone(),
+                )
+            }
         } else {
             let x_buf = memory.alloc(batch_size * seq_len * hidden_size * 4, DType::F32)?;
             Tensor::new(
@@ -2044,6 +2059,31 @@ impl TransformerModel {
         }
 
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
+
+        // prefill owned PrefillWorkspace (forward_into:1583-1607 미러, CPU/GPU 모두 할당 — fmt 경로는
+        // forward_prefill_fmt 가 항상 workspace 를 요구). needs_ws_sync = GPU 한정(drop 전 sync).
+        let mut owned_prefill_ws: Option<crate::layers::workspace::PrefillWorkspace> = None;
+        let mut needs_ws_sync = false;
+        if !is_decode {
+            use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
+            let ws_cfg = WsCfg {
+                batch_size,
+                dim: hidden_size,
+                q_dim: self.config.num_attention_heads * self.config.head_dim,
+                k_dim: self.config.num_key_value_heads * self.config.head_dim,
+                v_dim: self.config.num_key_value_heads * self.config.head_dim,
+                ffn_hidden: self.config.intermediate_size,
+                n_heads: self.config.num_attention_heads,
+                max_seq_len: 0,
+            };
+            owned_prefill_ws = Some(PrefillWorkspace::new(
+                &ws_cfg,
+                seq_len,
+                memory,
+                backend.clone(),
+            )?);
+            needs_ws_sync = backend.is_gpu();
+        }
 
         // Per-token weight snapshot (ENG-ALG-214-SNAP / INV-121) — forward_into 와 동일.
         let layer_snapshots: Vec<Arc<TransformerLayer>> =
@@ -2064,28 +2104,55 @@ impl TransformerModel {
                 None
             };
 
-            let ws = workspace
-                .as_deref_mut()
-                .expect("forward_into_fmt requires a decode workspace (seq_len=1)");
-            layer.forward_gen_fmt(crate::layers::transformer_layer::ForwardGenFmtArgs {
-                x: &mut x,
-                fmt: &fmts[i],
-                start_pos,
-                backend,
-                ws,
-                rms_norm_eps: self.config.rms_norm_eps as f32,
-                rope_theta,
-                // happy-path: score_accumulator/GPU acc 비활성 → need_scores=false (3c-evict 에서 확장).
-                need_scores: false,
-                head_dim: self.config.head_dim,
-                skip_attn: false,
-                skip_mlp: false,
-                rms_norm_add_unit: is_gemma3,
-                use_gelu_tanh: is_gemma3,
-                is_local_attn: is_local,
-                local_attn_window: self.config.sliding_window,
-                layer_idx: i,
-            })?;
+            if is_decode {
+                let ws = workspace
+                    .as_deref_mut()
+                    .expect("forward_into_fmt decode requires a LayerWorkspace (seq_len=1)");
+                layer.forward_gen_fmt(crate::layers::transformer_layer::ForwardGenFmtArgs {
+                    x: &mut x,
+                    fmt: &fmts[i],
+                    start_pos,
+                    backend,
+                    ws,
+                    rms_norm_eps: self.config.rms_norm_eps as f32,
+                    rope_theta,
+                    // happy-path: score_accumulator/GPU acc 비활성 → need_scores=false (3c-evict 에서 확장).
+                    need_scores: false,
+                    head_dim: self.config.head_dim,
+                    skip_attn: false,
+                    skip_mlp: false,
+                    rms_norm_add_unit: is_gemma3,
+                    use_gelu_tanh: is_gemma3,
+                    is_local_attn: is_local,
+                    local_attn_window: self.config.sliding_window,
+                    layer_idx: i,
+                })?;
+            } else {
+                let pws = owned_prefill_ws
+                    .as_mut()
+                    .expect("forward_into_fmt prefill requires PrefillWorkspace (seq_len>1)");
+                layer.forward_prefill_fmt(
+                    crate::layers::transformer_layer::ForwardPrefillFmtArgs {
+                        x: &mut x,
+                        fmt: &fmts[i],
+                        start_pos,
+                        backend,
+                        pws,
+                        rms_norm_eps: self.config.rms_norm_eps as f32,
+                        rope_theta,
+                        head_dim: self.config.head_dim,
+                        batch_size,
+                        seq_len,
+                        dim: hidden_size,
+                        skip_attn: false,
+                        skip_mlp: false,
+                        rms_norm_add_unit: is_gemma3,
+                        use_gelu_tanh: is_gemma3,
+                        is_local_attn: is_local,
+                        local_attn_window: self.config.sliding_window,
+                    },
+                )?;
+            }
         }
 
         // 3. Final Norm.
@@ -2096,11 +2163,30 @@ impl TransformerModel {
             is_gemma3,
         )?;
 
-        // 4. Head (decode seq_len=1 → x 는 [1,1,hidden], logits_last_only 무관).
-        if self.lm_head_on_cpu {
+        // 4. Head — prefill+logits_last_only 면 마지막 토큰 hidden 만 (forward_into:1960 미러).
+        if args.logits_last_only && seq_len > 1 {
+            let last_offset = (seq_len - 1) * hidden_size;
+            let last_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+            let mut x_last = Tensor::new(
+                Shape::new(vec![1, 1, hidden_size]),
+                last_buf,
+                backend.clone(),
+            );
+            backend.copy_slice(&x, &mut x_last, last_offset, 0, hidden_size)?;
+            if self.lm_head_on_cpu {
+                self.lm_head_matmul_cpu(&x_last, logits_out, backend)?;
+            } else {
+                backend.matmul_transposed(&x_last, &self.lm_head, logits_out)?;
+            }
+        } else if self.lm_head_on_cpu {
             self.lm_head_matmul_cpu(&x, logits_out, backend)?;
         } else {
             backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
+        }
+
+        // prefill owned PrefillWorkspace drop 전 GPU 커널 완료 보장 (forward_into:1989-1994).
+        if needs_ws_sync {
+            backend.synchronize()?;
         }
 
         Ok(())

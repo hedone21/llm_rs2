@@ -363,6 +363,12 @@ impl Forward for ModelForward {
         // path (`generate.rs:3371`) bit-for-bit. The caller-reuse optimisation
         // is deferred until the paradigm-equivalence regression is closed.
 
+        // Phase α-K ①-b: `LLMRS_KV_FMT` 게이트 ON(+ fmt_eligible) 시 prefill 도 fmt 경로로 통일.
+        // chunk loop **전** wrap — (3c)는 step()=decode 에서 lazy wrap(prefill 이후)했으나, prefill flip
+        // 으로 prefill 시작으로 이동. 이후 decode step() 의 ensure_fmt_wrapped 는 idempotent no-op
+        // (fmt_caches 이미 Some). 게이트 OFF / fmt_eligible=false(chat·eval) 면 no-op → 기존 forward_into.
+        self.ensure_fmt_wrapped();
+
         let mut chunk_start = 0;
         while chunk_start < seq_len {
             let chunk_end = (chunk_start + chunk_size).min(seq_len);
@@ -378,24 +384,49 @@ impl Forward for ModelForward {
             // current stack frame.
             let memory: &dyn Memory = unsafe { &*memory_ref };
 
-            self.model.forward_into(TransformerModelForwardArgs {
-                input_tokens: &input_tensor,
-                start_pos: start_pos + chunk_start,
-                kv_caches: &mut self.kv_caches,
-                backend: &backend,
-                memory,
-                logits_out: &mut self.logits_prefill_last,
-                x_gen: None,
-                workspace: None,
-                prefill_workspace: None,
-                score_accumulator: None,
-                profiler: None,
-                skip_config: None,
-                importance_collector: None,
-                logits_last_only: true,
-                variance_collector: None,
-                layer_boundary_hook: None,
-            })?;
+            // fmt 게이트 ON → forward_into_fmt(write_kv_batch + multi-token causal attention).
+            // concrete Arc clone → transient dyn Vec (step():423-427 패턴). 게이트 ON 시 kv_caches 는
+            // ensure_fmt_wrapped 가 mem::take 로 비웠으므로 **반드시** fmt 분기여야 한다(forward_into 는
+            // 빈 slice 인덱싱 panic) — 검증 wfceex20u 정정 E.
+            let dyn_fmts: Option<Vec<Arc<dyn KVCacheFormat>>> =
+                self.fmt_caches.as_ref().map(|fmts| {
+                    fmts.iter()
+                        .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
+                        .collect()
+                });
+            if let Some(dyn_fmts) = dyn_fmts {
+                self.model
+                    .forward_into_fmt(TransformerModelForwardFmtArgs {
+                        input_tokens: &input_tensor,
+                        start_pos: start_pos + chunk_start,
+                        fmts: &dyn_fmts,
+                        backend: &backend,
+                        memory,
+                        logits_out: &mut self.logits_prefill_last,
+                        x_gen: None,
+                        workspace: None,
+                        logits_last_only: true,
+                    })?;
+            } else {
+                self.model.forward_into(TransformerModelForwardArgs {
+                    input_tokens: &input_tensor,
+                    start_pos: start_pos + chunk_start,
+                    kv_caches: &mut self.kv_caches,
+                    backend: &backend,
+                    memory,
+                    logits_out: &mut self.logits_prefill_last,
+                    x_gen: None,
+                    workspace: None,
+                    prefill_workspace: None,
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None,
+                    importance_collector: None,
+                    logits_last_only: true,
+                    variance_collector: None,
+                    layer_boundary_hook: None,
+                })?;
+            }
 
             chunk_start = chunk_end;
         }
@@ -440,6 +471,7 @@ impl Forward for ModelForward {
                     logits_out: &mut self.logits_decode,
                     x_gen: Some(&mut self.decode_x_gen),
                     workspace: Some(&mut self.decode_workspace),
+                    logits_last_only: false,
                 })?;
             return self.read_logits(&self.logits_decode);
         }
