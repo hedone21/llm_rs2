@@ -204,6 +204,7 @@ impl CacheManager {
         scores: ScoreContext,
         force: bool,
         force_target_ratio: Option<f32>,
+        layer_ratios: Option<&[(f32, f32)]>,
     ) -> Result<EvictionResult> {
         if caches.is_empty() {
             return Ok(EvictionResult {
@@ -249,7 +250,12 @@ impl CacheManager {
         if force {
             log::info!("[CacheEvent] Budget eviction (forced)");
             log::info!(
-                "[CacheManager] budget eviction (forced), executing '{}'",
+                "[CacheManager] budget eviction (forced{}), executing '{}'",
+                if layer_ratios.is_some() {
+                    "+layer_ratios"
+                } else {
+                    ""
+                },
                 self.pipeline.name(),
             );
         } else {
@@ -284,7 +290,7 @@ impl CacheManager {
             mem_available,
             target_ratio: force_target_ratio,
             qcf_sink: None,
-            layer_ratios: None,
+            layer_ratios,
         };
         let results = self.pipeline.execute(&mut ctx)?;
         let eviction_result = Self::pipeline_results_to_eviction_result(&results, ctx.caches);
@@ -318,7 +324,7 @@ impl CacheManager {
     ///
     /// Called after each generation step in the inference loop.
     pub fn maybe_evict(&self, caches: &mut [KVCache]) -> Result<EvictionResult> {
-        self.execute_dispatch(caches, ScoreContext::None, false, None)
+        self.execute_dispatch(caches, ScoreContext::None, false, None, None)
     }
 
     /// Check memory pressure and evict using importance scores.
@@ -330,7 +336,7 @@ impl CacheManager {
         caches: &mut [KVCache],
         importance: &[f32],
     ) -> Result<EvictionResult> {
-        self.execute_dispatch(caches, ScoreContext::Flat { importance }, false, None)
+        self.execute_dispatch(caches, ScoreContext::Flat { importance }, false, None, None)
     }
 
     /// Check memory pressure and evict using per-KV-head importance scores.
@@ -352,6 +358,7 @@ impl CacheManager {
             },
             false,
             None,
+            None,
         )
     }
 
@@ -360,7 +367,7 @@ impl CacheManager {
     /// Used when eviction is triggered externally (e.g., by resilience signals).
     /// Runs at `Emergency` pressure level.
     pub fn force_evict(&self, caches: &mut [KVCache], target_ratio: f32) -> Result<EvictionResult> {
-        self.execute_dispatch(caches, ScoreContext::None, true, Some(target_ratio))
+        self.execute_dispatch(caches, ScoreContext::None, true, Some(target_ratio), None)
     }
 
     /// Force eviction with importance scores, bypassing should_evict() and memory checks.
@@ -378,6 +385,7 @@ impl CacheManager {
             ScoreContext::Flat { importance },
             true,
             Some(target_ratio),
+            None,
         )
     }
 
@@ -393,54 +401,15 @@ impl CacheManager {
         importance: &[f32],
         layer_ratios: &[(f32, f32)],
     ) -> Result<EvictionResult> {
-        if caches.is_empty() {
-            return Ok(EvictionResult {
-                evicted: false,
-                tokens_removed: 0,
-                new_pos: 0,
-            });
-        }
-
-        let pressure = PressureLevel::Emergency;
-        let mem_available = self
-            .monitor
-            .mem_stats()
-            .map(|s| s.available)
-            .unwrap_or(usize::MAX);
-
-        log::info!("[CacheEvent] Budget eviction (forced)");
-        log::info!(
-            "[CacheManager] budget eviction (forced+layer_ratios), executing '{}'",
-            self.pipeline.name(),
-        );
-
-        let mut ctx = HandlerContext {
+        // 2a: budget eviction은 execute_dispatch 의 force 경로 + layer_ratios 전달로 수렴.
+        // (구 인라인 복제 제거 — pipeline.execute/release_unused_pages 동작 byte-identical.)
+        self.execute_dispatch(
             caches,
-            importance: Some(importance),
-            head_importance: None,
-            n_kv_heads: 0,
-            pressure_level: pressure,
-            mem_available,
-            target_ratio: Some(target_ratio),
-            qcf_sink: None,
-            layer_ratios: Some(layer_ratios),
-        };
-        let results = self.pipeline.execute(&mut ctx)?;
-        let eviction_result = Self::pipeline_results_to_eviction_result(&results, ctx.caches);
-
-        if eviction_result.evicted {
-            for cache in ctx.caches.iter_mut() {
-                cache.release_unused_pages();
-            }
-            log::info!(
-                "[CacheEvent] Eviction completed: policy='{}', removed={}, new_pos={}",
-                self.pipeline.name(),
-                eviction_result.tokens_removed,
-                eviction_result.new_pos,
-            );
-        }
-
-        Ok(eviction_result)
+            ScoreContext::Flat { importance },
+            true,
+            Some(target_ratio),
+            Some(layer_ratios),
+        )
     }
 
     /// Force eviction with per-KV-head importance scores.
@@ -464,6 +433,7 @@ impl CacheManager {
             },
             true,
             Some(target_ratio),
+            None,
         )
     }
 
@@ -1525,5 +1495,53 @@ mod tests {
             "H2O should reduce to 16 tokens (ratio 0.2), got {}",
             result.new_pos
         );
+    }
+
+    /// 2a 회귀 가드: budget eviction(force_evict_with_scores_and_budgets)이 execute_dispatch
+    /// 의 force 경로 + layer_ratios 전달로 수렴한 뒤에도, layer_ratios 를 무시하는
+    /// 핸들러(SlidingWindow)에서는 force_evict_with_scores 와 **동일한** EvictionResult 를
+    /// 낸다 — 구 인라인 복제 제거가 byte-identical 함을 증명한다.
+    #[test]
+    fn test_force_evict_with_scores_and_budgets_matches_force_path() {
+        let importance = vec![1.0f32; 100];
+        let layer_ratios = vec![(0.5f32, 0.5f32); 4];
+        let make_cm = || {
+            CacheManager::new(
+                Box::new(SlidingWindowPolicy::new(20, 0)),
+                Box::new(MockMonitor {
+                    available: 10 * 1024 * 1024,
+                }),
+                256 * 1024 * 1024,
+                0.3,
+            )
+        };
+
+        let cm_budgets = make_cm();
+        let mut caches_budgets = make_caches(4, 100);
+        let r_budgets = cm_budgets
+            .force_evict_with_scores_and_budgets(
+                &mut caches_budgets,
+                0.3,
+                &importance,
+                &layer_ratios,
+            )
+            .unwrap();
+
+        let cm_force = make_cm();
+        let mut caches_force = make_caches(4, 100);
+        let r_force = cm_force
+            .force_evict_with_scores(&mut caches_force, 0.3, &importance)
+            .unwrap();
+
+        assert!(
+            r_budgets.evicted,
+            "budget eviction should evict at Emergency level"
+        );
+        assert_eq!(r_budgets.evicted, r_force.evicted);
+        assert_eq!(r_budgets.tokens_removed, r_force.tokens_removed);
+        assert_eq!(r_budgets.new_pos, r_force.new_pos);
+        for (a, b) in caches_budgets.iter().zip(caches_force.iter()) {
+            assert_eq!(a.current_pos, b.current_pos);
+        }
     }
 }
