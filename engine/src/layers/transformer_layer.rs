@@ -1,5 +1,7 @@
 mod forward;
 mod forward_gen;
+mod forward_gen_fmt;
+pub(crate) use forward_gen_fmt::ForwardGenFmtArgs;
 
 use crate::backend::Backend;
 // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L

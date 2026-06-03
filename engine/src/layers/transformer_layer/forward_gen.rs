@@ -549,7 +549,7 @@ impl TransformerLayer {
                     kv_cache.layout(),
                     kv_cache.capacity(),
                     need_scores,
-                    backend,
+                    backend.as_ref(),
                 )?;
             } else {
                 // CPU attention path (Fallback for OpenCL or native CPU F32)
@@ -1733,8 +1733,12 @@ impl TransformerLayer {
     /// The OpenCL backend has no Q4_0 dequant-attention kernel, so this path
     /// reads Q4_0 raw bytes from GPU, dequantizes on CPU, computes full
     /// attention (scores + weighted V sum), and writes the result back to GPU.
+    // `pub(crate)`: Phase α-K substep (3c) — `StandardFormat::attention_into` 의
+    // Q4_0+GPU fallback 흡수가 본 fn 을 재사용한다(중복 0, DRY). forward_gen 의
+    // 기존 `Self::attention_q4_gpu_fallback` 호출은 그대로(bit-identical) — 본 변경은
+    // visibility 확장뿐이라 codegen 무변.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-    fn attention_q4_gpu_fallback(
+    pub(crate) fn attention_q4_gpu_fallback(
         q: &Tensor,
         k_cache: &Tensor,
         v_cache: &Tensor,
@@ -1748,7 +1752,10 @@ impl TransformerLayer {
         layout: crate::kv_cache_ops::KVLayout,
         capacity: usize,
         need_scores: bool,
-        backend: &Arc<dyn Backend>,
+        // `&dyn Backend` (구 `&Arc<dyn Backend>`): substep (3c) 에서 `StandardFormat::attention_into`
+        // (trait method 라 `&dyn Backend` 만 보유)가 본 fn 을 재사용하기 위한 일반화. body 는 backend
+        // 의 `&self` 메서드(read_buffer/write_buffer)만 호출하므로 `&dyn` 으로 충분 — Arc 무관.
+        backend: &dyn Backend,
     ) -> Result<()> {
         use crate::quant::{BlockQ4_0, QK4_0};
 

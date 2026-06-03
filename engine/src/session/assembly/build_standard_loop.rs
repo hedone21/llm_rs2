@@ -111,6 +111,8 @@ pub fn build_standard_loop(
         kv,
         max_seq_len,
         plan_enabled,
+        // fmt_eligible: single-prompt happy-path → `LLMRS_KV_FMT` 게이트 자격 부여 (substep 3c).
+        true,
     )?;
 
     // Phase 4-4.7: sampler 자동 선택. production `sampling::sample`은

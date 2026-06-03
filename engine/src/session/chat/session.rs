@@ -435,6 +435,8 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
         args.kv_caches,
         max_seq_len,
         false, // chat 모드는 plan path 비활성 (D4: eviction + plan 공존 미지원)
+        // fmt_eligible=false: chat 멀티턴은 prefill 재호출 → fmt wrap 시 turn2 panic (substep 3c).
+        false,
     )?;
 
     let decode_loop = DecodeLoopBuilder::new()

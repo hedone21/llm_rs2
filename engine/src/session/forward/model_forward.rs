@@ -17,14 +17,18 @@ use crate::backend::Backend;
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
 use crate::buffer::DType;
+use crate::format::KVCacheFormat;
 use crate::kv_cache_ops::KVLayout;
 use crate::layers::workspace::{LayerWorkspace, PrefillWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
 use crate::model_config::ModelArch;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::models::transformer::{
+    TransformerModel, TransformerModelForwardArgs, TransformerModelForwardFmtArgs,
+};
 use crate::pressure::kv_cache::KVCache;
+use crate::pressure::standard_format::StandardFormat;
 use crate::session::traits::{Forward, StepCtx};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -65,6 +69,18 @@ pub struct ModelForward {
 
     vocab_size: usize,
 
+    // Phase α-K substep (3c): fmt-cache wiring. `LLMRS_KV_FMT` 게이트 ON 시 prefill 직후(첫 step
+    // lazy) `kv_caches` 를 `Vec<Arc<StandardFormat>>` 로 wrap(by-value move, 단일 물리 캐시) →
+    // decode fallback 을 `forward_into_fmt`(trait object) 로 전환. 게이트 OFF(None) 시 기존 경로
+    // (production 무변). happy-path 전용(eviction=none → NoOpEvictionStage, --no-gpu-plan 강제).
+    fmt_caches: Option<Vec<Arc<StandardFormat>>>,
+
+    // fmt-cache 게이트 자격 — **single-prompt happy-path 빌더(build_standard_loop)만 true**.
+    // chat(build_chat_standard)/eval 등 prefill 이 멀티턴 재호출되는 경로는 false 로 주입하여
+    // `LLMRS_KV_FMT` 가 set 돼 있어도 wrap 이 발동하지 않게 한다(turn2 prefill 이 mem::take 로 빈
+    // kv_caches 를 인덱싱하는 panic + eviction 회계 붕괴 차단 — 적대 검증 wiring-safety lens).
+    fmt_eligible: bool,
+
     // Phase 4-4.7 (A1): plan-aware decode. step()이 production fallback
     // (generate.rs l.4351~4477)과 동일하게 execute_plan → forward_into fallback
     // → 다음 step lazy rebuild를 자체적으로 수행한다.
@@ -88,6 +104,8 @@ impl ModelForward {
     ///
     /// `max_seq_len` caps the lazy `PrefillWorkspace` allocation. KV caches
     /// must already be sized for the same context window.
+    // 생성자 — 소유 의존성 다수 (substep 3c 에서 fmt_eligible 추가로 8 인자).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend: Arc<dyn Backend>,
         memory: Arc<dyn Memory>,
@@ -96,6 +114,8 @@ impl ModelForward {
         kv_caches: Vec<KVCache>,
         max_seq_len: usize,
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))] plan_enabled: bool,
+        // Phase α-K (3c): fmt-cache 게이트 자격. single-prompt happy-path 만 true(아래 필드 doc).
+        fmt_eligible: bool,
     ) -> Result<Self> {
         let hidden_size = model.config.hidden_size;
         let vocab_size = model.config.vocab_size;
@@ -133,6 +153,8 @@ impl ModelForward {
             logits_decode,
             logits_prefill_last,
             vocab_size,
+            fmt_caches: None,
+            fmt_eligible,
             #[cfg(feature = "opencl")]
             gpu_plan: None,
             #[cfg(feature = "opencl")]
@@ -214,6 +236,36 @@ impl ModelForward {
 
     pub fn model(&self) -> &Arc<TransformerModel> {
         &self.model
+    }
+
+    /// Phase α-K (3c): `LLMRS_KV_FMT` 게이트 ON 시 `kv_caches` 를 `StandardFormat` 으로 1회 wrap.
+    ///
+    /// prefill 이 채운 캐시를 **by-value move**(`mem::take`)하므로 물리 캐시는 fmt 안에 단 한 벌만
+    /// 존재(dual-ownership 부재 — interior mutability 로 forward/eviction 모두 `&self` 통과, ADR-0001
+    /// §4.2). 게이트 OFF / 이미 wrap / `kv_caches` 빈 경우 no-op. 첫 `step()` 에서 lazy 호출되므로
+    /// prefill(→ `kv_caches` 직접 write) 이후 시점이 보장된다.
+    fn ensure_fmt_wrapped(&mut self) {
+        // fmt_eligible=false(chat/eval 빌더) 면 env 무관 no-op — 멀티턴 prefill panic 방지.
+        if !self.fmt_eligible
+            || !standard_format_gate_enabled()
+            || self.fmt_caches.is_some()
+            || self.kv_caches.is_empty()
+        {
+            return;
+        }
+        let caches = std::mem::take(&mut self.kv_caches);
+        let fmts: Vec<Arc<StandardFormat>> = caches
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| Arc::new(StandardFormat::new(i, c)))
+            .collect();
+        if std::env::var_os("LLMRS_FWD_TRACE").is_some() {
+            eprintln!(
+                "[fwd-trace] KV_FMT ON: wrapped {} KVCache → StandardFormat (decode = forward_into_fmt)",
+                fmts.len()
+            );
+        }
+        self.fmt_caches = Some(fmts);
     }
 
     /// Construct the input `[1, seq_len]` U32 tensor on the active backend.
@@ -360,6 +412,38 @@ impl Forward for ModelForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
+        // Phase α-K (3c): fmt-cache 게이트. `LLMRS_KV_FMT` ON 시 plan 우회 + `forward_into_fmt`(trait
+        // object) 로 decode. 게이트는 `--no-gpu-plan` 동반 강제 전제(plan 활성 + fmt 동시 미지원 —
+        // plan 이 `&mut Vec<KVCache>` 를 보는데 fmt 는 move 후 빈 Vec). 게이트 OFF 시 아래 기존 경로
+        // (production 무변). transient `Vec<Arc<dyn KVCacheFormat>>` = concrete Arc clone(escape 0,
+        // 호출 종료 시 drop) — cold path 라 N Arc clone 비용 무관.
+        self.ensure_fmt_wrapped();
+        // concrete Arc clone → transient dyn Vec (fmt_caches borrow 는 map 클로저 안에서 종료되어
+        // 아래 &mut self 필드 borrow 와 충돌하지 않는다).
+        let dyn_fmts: Option<Vec<Arc<dyn KVCacheFormat>>> = self.fmt_caches.as_ref().map(|fmts| {
+            fmts.iter()
+                .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
+                .collect()
+        });
+        if let Some(dyn_fmts) = dyn_fmts {
+            let backend = self.backend.clone();
+            let memory_ref: *const dyn Memory = self.memory.as_ref();
+            // SAFETY: `self.memory` 는 self 소유, 본 call stack 동안 유효 (기존 fallback 동일 패턴).
+            let memory: &dyn Memory = unsafe { &*memory_ref };
+            self.model
+                .forward_into_fmt(TransformerModelForwardFmtArgs {
+                    input_tokens: &self.decode_input,
+                    start_pos: ctx.pos,
+                    fmts: &dyn_fmts,
+                    backend: &backend,
+                    memory,
+                    logits_out: &mut self.logits_decode,
+                    x_gen: Some(&mut self.decode_x_gen),
+                    workspace: Some(&mut self.decode_workspace),
+                })?;
+            return self.read_logits(&self.logits_decode);
+        }
+
         // Phase 4-4.7 (A1): plan path 우선 시도. invalidation 또는 build 실패 시
         // forward_into fallback. production fallback (generate.rs l.4351~4376) 패턴.
         #[cfg(feature = "opencl")]
@@ -442,8 +526,15 @@ impl Forward for ModelForward {
     }
 
     fn reset_kv(&mut self) -> anyhow::Result<()> {
-        for cache in &mut self.kv_caches {
-            cache.current_pos = 0;
+        // fmt 활성 시 inner cache 는 StandardFormat 안 → with_cache_mut seam 으로 reset.
+        if let Some(fmts) = &self.fmt_caches {
+            for f in fmts {
+                f.with_cache_mut(|c| c.current_pos = 0);
+            }
+        } else {
+            for cache in &mut self.kv_caches {
+                cache.current_pos = 0;
+            }
         }
         Ok(())
     }
@@ -478,6 +569,15 @@ impl Forward for ModelForward {
             Ok((0, before_pos))
         }
     }
+}
+
+/// `LLMRS_KV_FMT` 게이트 (Phase α-K 3c, 기본 OFF). OnceLock 캐시 → per-step 비용 ~0.
+///
+/// ON 시 ModelForward decode fallback 이 `forward_into_fmt`(KVCacheFormat trait object) 로 전환.
+/// device 검증 전용 임시 게이트 — production 무회귀 우선이라 CLI Args 표면 미오염(env only).
+fn standard_format_gate_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("LLMRS_KV_FMT").is_some())
 }
 
 fn workspace_config_for(model: &TransformerModel, max_seq_len: usize) -> WorkspaceConfig {

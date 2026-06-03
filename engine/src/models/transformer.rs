@@ -193,6 +193,24 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps> {
     pub layer_boundary_hook: Option<&'a dyn crate::layer_boundary_hook::LayerBoundaryHook>,
 }
 
+/// `forward_into` 의 KVCacheFormat trait-object fork 인자 (Phase α-K substep 3c).
+///
+/// `TransformerModelForwardArgs` 의 `kv_caches: &mut [C]`(generic) 만
+/// `fmts: &[Arc<dyn KVCacheFormat>]`(trait object, `&self` mutation 이라 `&mut` 불요)로 교체.
+/// **decode-only**(seq_len=1) — prefill flip 은 (3d). score/profiler/skip/importance/variance/
+/// prefill_ws/layer_boundary 는 happy-path decode 가 안 쓰므로(`is_standard_happy_path` 보장) 드롭
+/// (CLAUDE.md 추측성 유연성 금지 — 필요 시 후속 substep 에서 추가). eviction score 누적은 (3c-evict).
+pub struct TransformerModelForwardFmtArgs<'a> {
+    pub input_tokens: &'a Tensor,
+    pub start_pos: usize,
+    pub fmts: &'a [Arc<dyn crate::format::KVCacheFormat>],
+    pub backend: &'a Arc<dyn Backend>,
+    pub memory: &'a dyn Memory,
+    pub logits_out: &'a mut Tensor,
+    pub x_gen: Option<&'a mut Tensor>,
+    pub workspace: Option<&'a mut LayerWorkspace>,
+}
+
 impl TransformerModel {
     pub fn load(model_path: &str, backend: Arc<dyn Backend>, _memory: &dyn Memory) -> Result<Self> {
         Self::load_with_dtype(model_path, backend, _memory, DType::F16)
@@ -1973,6 +1991,116 @@ impl TransformerModel {
         // Without this, Adreno drivers may reclaim mapped memory prematurely.
         if needs_ws_sync {
             backend.synchronize()?;
+        }
+
+        Ok(())
+    }
+
+    /// `forward_into` 의 KVCacheFormat trait-object fork (Phase α-K substep 3c, **decode-only**).
+    ///
+    /// `forward_into` 와 동일한 decode 골격(embedding → layer loop → final norm → lm_head)이되,
+    /// 각 layer 의 KV write + attention 을 `layer.forward_gen_fmt`(→ `fmt.write_kv` / `fmt.attention_into`)
+    /// 로 위임한다. branch-by-abstraction: 기존 `forward_into` 와 공존(production 무변), `ModelForward`
+    /// 가 `LLMRS_KV_FMT` 게이트 ON + `--no-gpu-plan` 시 decode fallback 으로 본 entry 호출.
+    ///
+    /// **happy-path decode 전용**: `is_standard_happy_path`(eviction=none / skip=0 / profile off /
+    /// partition off) 보장 하에 score_accumulator·profiler·skip·partition 이 전부 비활성이므로 골격이
+    /// `forward_into` 의 라이브 decode arm 과 일치한다. score 누적·eviction flip 은 (3c-evict) 후속
+    /// increment, prefill flip 은 (3d).
+    ///
+    /// **bit-identical 범위**: F16/Q4_0 KV(default=F16) 및 F32-device-only(null host ptr)에서만 동치.
+    /// **⚠️ F32 KV + host-mapped 버퍼**(rpcmem/zero-copy/CPU)는 `forward_into` 가 inline-NEON attention
+    /// 을 타는 반면 `attention_into` 는 `backend.attention_gen` 위임 → 누산 순서 상이로 NOT bit-identical.
+    /// (3c) device 게이트는 F16/Q4_0 KV 만 대상. 상세: `forward_gen_fmt.rs` 헤더.
+    pub fn forward_into_fmt(&self, args: TransformerModelForwardFmtArgs) -> Result<()> {
+        let input_tokens = args.input_tokens;
+        let start_pos = args.start_pos;
+        let fmts = args.fmts;
+        let backend = args.backend;
+        let memory = args.memory;
+        let logits_out = args.logits_out;
+        let x_gen = args.x_gen;
+        let mut workspace = args.workspace;
+
+        let batch_size = input_tokens.shape().dims()[0];
+        let seq_len = input_tokens.shape().dims()[1];
+        let hidden_size = self.config.hidden_size;
+        debug_assert_eq!(seq_len, 1, "forward_into_fmt is decode-only (substep 3c)");
+
+        // 1. Embedding — decode(seq_len=1) 는 caller x_gen 재사용.
+        let mut x = if let Some(xb) = x_gen {
+            (*xb).clone()
+        } else {
+            let x_buf = memory.alloc(batch_size * seq_len * hidden_size * 4, DType::F32)?;
+            Tensor::new(
+                Shape::new(vec![batch_size, seq_len, hidden_size]),
+                x_buf,
+                backend.clone(),
+            )
+        };
+        self.gather_embed(input_tokens, &mut x, backend)?;
+        if let Some(scale) = self.config.embed_scale {
+            backend.scale(&mut x, scale)?;
+        }
+
+        let is_gemma3 = self.config.arch == ModelArch::Gemma3;
+
+        // Per-token weight snapshot (ENG-ALG-214-SNAP / INV-121) — forward_into 와 동일.
+        let layer_snapshots: Vec<Arc<TransformerLayer>> =
+            self.layers.iter().map(|s| s.load_weights()).collect();
+        for (i, layer_arc) in layer_snapshots.iter().enumerate() {
+            let layer = &**layer_arc;
+
+            let rope_theta = if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern) {
+                self.config
+                    .rope_local_theta
+                    .unwrap_or(self.config.rope_theta) as f32
+            } else {
+                self.config.rope_theta as f32
+            };
+            let is_local = if is_gemma3 {
+                Some(is_local_layer(i, self.config.sliding_window_pattern))
+            } else {
+                None
+            };
+
+            let ws = workspace
+                .as_deref_mut()
+                .expect("forward_into_fmt requires a decode workspace (seq_len=1)");
+            layer.forward_gen_fmt(crate::layers::transformer_layer::ForwardGenFmtArgs {
+                x: &mut x,
+                fmt: &fmts[i],
+                start_pos,
+                backend,
+                ws,
+                rms_norm_eps: self.config.rms_norm_eps as f32,
+                rope_theta,
+                // happy-path: score_accumulator/GPU acc 비활성 → need_scores=false (3c-evict 에서 확장).
+                need_scores: false,
+                head_dim: self.config.head_dim,
+                skip_attn: false,
+                skip_mlp: false,
+                rms_norm_add_unit: is_gemma3,
+                use_gelu_tanh: is_gemma3,
+                is_local_attn: is_local,
+                local_attn_window: self.config.sliding_window,
+                layer_idx: i,
+            })?;
+        }
+
+        // 3. Final Norm.
+        backend.rms_norm(
+            &mut x,
+            &self.norm,
+            self.config.rms_norm_eps as f32,
+            is_gemma3,
+        )?;
+
+        // 4. Head (decode seq_len=1 → x 는 [1,1,hidden], logits_last_only 무관).
+        if self.lm_head_on_cpu {
+            self.lm_head_matmul_cpu(&x, logits_out, backend)?;
+        } else {
+            backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
         }
 
         Ok(())

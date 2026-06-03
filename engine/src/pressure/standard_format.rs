@@ -53,6 +53,17 @@ impl StandardFormat {
         }
     }
 
+    /// 내부 `KVCache` 에 `&mut` 접근하여 `f` 실행 (substep 3c fmt-cache wiring).
+    ///
+    /// forward(write_kv/attention_into)는 base trait 으로 통과하지만, fmt 활성 시
+    /// non-forward 연산(reset_kv 등)이 inner cache 에 도달할 seam 이 필요하다 — base trait 에
+    /// method 를 추가하지 않고(`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`) concrete inherent 로 제공.
+    /// lock guard 안에서 closure 를 실행하므로 호출 종료 시 lock 이 풀린다.
+    pub(crate) fn with_cache_mut<R>(&self, f: impl FnOnce(&mut KVCache) -> R) -> R {
+        let mut guard = self.inner.lock().unwrap();
+        f(&mut guard.cache)
+    }
+
     /// KV write 흡수 — `forward_gen` 의 KV-update 분기(transformer_layer/forward_gen.rs:330-386)를
     /// format 표면으로 옮긴 것. `is_decode`(seq_len=1)면 GPU fused cast+scatter fast-path 게이팅.
     ///
@@ -243,13 +254,44 @@ impl KVCacheFormat for StandardFormat {
 
         let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
 
+        // Q4_0 + GPU: `backend.attention_gen` 은 GPU 에 Q4_0 dequant-attention 커널이 없어
+        // BlockQ4_0 raw 바이트를 float 로 오독 → garbage. forward_gen 의 `attention_q4_gpu_fallback`
+        // (GPU→CPU readback + dequant + attention + writeback)을 그대로 재사용해 흡수한다 (substep
+        // 3c, DRY — 중복 0). `kv_start_pos` = forward_gen.rs:404 와 동일 식(window-clamp 시작 offset).
+        // CpuBackend(is_gpu=false)에선 진입 안 함 → host 경로는 아래 attention_gen 유지(Q4_0 CPU arm).
+        if cache.kv_dtype() == DType::Q4_0 && backend.is_gpu() {
+            let kv_start_pos = cache_seq_len - effective_cache_len;
+            let layout = cache.layout();
+            let capacity = cache.capacity();
+            let need_scores = scores.is_some();
+            let mut empty: [f32; 0] = [];
+            let scores_buf: &mut [f32] = match scores {
+                Some(s) => s,
+                None => &mut empty,
+            };
+            return crate::layers::transformer_layer::TransformerLayer::attention_q4_gpu_fallback(
+                q,
+                &k_cache,
+                &v_cache,
+                out,
+                scores_buf,
+                dims.n_heads_q,
+                n_heads_kv,
+                head_dim,
+                effective_cache_len,
+                kv_start_pos,
+                layout,
+                capacity,
+                need_scores,
+                backend,
+            );
+        }
+
         // typed/F32 경로: backend.attention_gen 에 위임. CPU backend 는 F32/F16/Q4_0 을 dtype-aware
         // 하게 처리(default impl=F32/F16, CpuBackend override 가 Q4_0 등 흡수). GPU backend 는
-        // 자기 커널로 dispatch(host 미검증 — device 검증은 후속 wiring substep).
+        // 자기 커널로 dispatch(host 미검증 — device 검증은 substep 3c device round).
         //
-        // NOTE: kivi-native(get_kivi_raw_buffers) 분기는 KIVIFormat 소관이라 여기 없음. Q4_0+GPU
-        // CPU-dequant fallback 의 정밀 재현(attention_q4_gpu_fallback)도 wiring substep 으로 연기 —
-        // 본 substep 은 CPU-testable F32/F16 경로의 정확성만 담보한다.
+        // NOTE: kivi-native(get_kivi_raw_buffers) 분기는 KIVIFormat 소관이라 여기 없음.
         backend.attention_gen(
             q,
             &k_cache,
