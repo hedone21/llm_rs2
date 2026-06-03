@@ -125,6 +125,65 @@ impl StandardFormat {
             return Ok(());
         }
 
+        // ──────────────────────────────────────────────────────────────────────
+        // C3 (§9.1-BC1-CONTRACT ⚠️⚠️ 2차 정정): GPU *prefill batch* scatter fast-path.
+        // `write_kv_batch`(decode_fast_path=false, seq_len>1)이 위 decode fast-path 묶음을
+        // batch(count=seq_len)로 미러링한다. 게이팅·dtype·position 회계는 decode 분기와 동일하되
+        // count 인자만 `1`→실제 seq_len. **bit-identical to cast/update** (kv_scatter_*_batch 의
+        // dst_off = h*cap*head_dim + (write_pos_start+s)*head_dim = KVCache::update 의 batch dst_off,
+        // advance_pos(seq_len) = update 의 `current_pos += seq_len` + high_water 갱신과 동일).
+        // host(CpuBackend, is_gpu=false)는 미진입 → 아래 cast/update 경로가 검증. GPU scatter
+        // 정확성은 device round(S25/Jetson)에서 검증. Q4_0 은 GPU fast-path 부재(아래 :131 주석)라
+        // 진입하지 않고 cast 경로 유지.
+        let seq_len = new_k.shape().dims()[1];
+
+        // GPU F16 HeadMajor batch: fused cast+scatter (1 dispatch over seq_len positions).
+        // decode F16(single-pos `kv_scatter_f32_to_f16`)과 달리 batch 변형은 host-pointer
+        // fallback 이 device-only 버퍼에서 segfault 하므로 `supports_kv_scatter_batch()` 게이트
+        // 필수(미충족 시 아래 cast 경로로 자연 강하 — 동일 출력).
+        if !is_decode
+            && backend.is_gpu()
+            && kv_dtype == DType::F16
+            && guard.cache.layout() == KVLayout::HeadMajor
+            && backend.supports_kv_scatter_batch()
+        {
+            let cache = &mut guard.cache;
+            let pos = KVCacheOps::current_pos(&*cache);
+            cache.ensure_capacity(pos + seq_len)?;
+            let cap = cache.capacity();
+            let n_heads_kv = cache.kv_heads();
+            let head_dim = cache.head_dim();
+            if let Some((k_buf, v_buf)) = cache.get_buffers_mut() {
+                backend.kv_scatter_f32_to_f16_batch(
+                    new_k, new_v, k_buf, v_buf, n_heads_kv, head_dim, cap, pos, seq_len,
+                )?;
+            }
+            cache.advance_pos(seq_len);
+            return Ok(());
+        }
+
+        // GPU F32 HeadMajor batch: single batched scatter dispatch over seq_len positions.
+        if !is_decode
+            && backend.is_gpu()
+            && kv_dtype == DType::F32
+            && guard.cache.layout() == KVLayout::HeadMajor
+            && backend.supports_kv_scatter_f32_batch()
+        {
+            let cache = &mut guard.cache;
+            let pos = KVCacheOps::current_pos(&*cache);
+            cache.ensure_capacity(pos + seq_len)?;
+            let cap = cache.capacity();
+            let n_heads_kv = cache.kv_heads();
+            let head_dim = cache.head_dim();
+            if let Some((k_buf, v_buf)) = cache.get_buffers_mut() {
+                backend.kv_scatter_f32_to_f32_batch(
+                    new_k, new_v, k_buf, v_buf, n_heads_kv, head_dim, cap, pos, seq_len,
+                )?;
+            }
+            cache.advance_pos(seq_len);
+            return Ok(());
+        }
+
         // 비-F32 cast 경로: F32 입력을 cache dtype(F16/Q4_0)으로 cast 후 update. (forward_gen 의
         // `kv_dtype != F32` 분기 흡수.) `KVCache::update` 는 cast 를 하지 않고 입력이 이미 cache dtype
         // 임을 전제하므로, scatter fast-path 에 안 잡힌 비-F32 write 는 반드시 여기서 cast 해야 한다
@@ -211,7 +270,8 @@ impl KVCacheFormat for StandardFormat {
     }
 
     fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
-        // prefill (seq_len>1) — decode fast-path 미적용(GPU prefill batch scatter 흡수는 후속 substep).
+        // prefill (seq_len>1) — C3(§9.1-BC1-CONTRACT): GPU prefill batch scatter fast-path 흡수 완료
+        // (F32/F16 HeadMajor + supports gate). Q4_0 및 게이트 미충족·CPU 는 cast/update 폴백.
         self.write_inner(new_k, new_v, backend, false)
     }
 
@@ -657,6 +717,98 @@ mod tests {
         assert_eq!(k[0], 0.0);
         assert_eq!(k[2], 8.0, "merged into-token = mean(10,6)");
         assert_eq!(k[4], 2.0);
+    }
+
+    #[test]
+    fn test_write_kv_batch_f32_matches_sequential_decode() {
+        // C3 (§9.1-BC1-CONTRACT): multi-token write_kv_batch must produce a buffer
+        // bit-identical to writing the same tokens one-by-one via write_kv (decode).
+        // host(CpuBackend, is_gpu=false) → cast/update fallback covers correctness;
+        // GPU scatter fast-path is device-verified.
+        let kv_heads = 2;
+        let head_dim = 4;
+        let row = kv_heads * head_dim;
+        let seq = 3;
+
+        // distinct per-(token, elem) values, exactly F32-representable.
+        let batch: Vec<f32> = (0..seq * row).map(|i| i as f32).collect();
+
+        // (A) batch write.
+        let fmt_batch = StandardFormat::new(0, make_cache(8, kv_heads, head_dim));
+        let kb = f32_tensor(vec![1, seq, kv_heads, head_dim], &batch);
+        let vb = f32_tensor(vec![1, seq, kv_heads, head_dim], &batch);
+        fmt_batch
+            .write_kv_batch(&kb, &vb, &CpuBackend::new())
+            .unwrap();
+        assert_eq!(fmt_batch.current_pos(), seq);
+
+        // (B) reference: same tokens written one at a time via write_kv (decode).
+        let fmt_seq = StandardFormat::new(0, make_cache(8, kv_heads, head_dim));
+        for s in 0..seq {
+            let tok = &batch[s * row..(s + 1) * row];
+            let k = f32_tensor(vec![1, 1, kv_heads, head_dim], tok);
+            let v = f32_tensor(vec![1, 1, kv_heads, head_dim], tok);
+            fmt_seq.write_kv(&k, &v, &CpuBackend::new()).unwrap();
+        }
+        assert_eq!(fmt_seq.current_pos(), seq);
+
+        // K/V buffers must be byte-identical.
+        let gb = fmt_batch.inner.lock().unwrap();
+        let gs = fmt_seq.inner.lock().unwrap();
+        let kb_buf = gb.cache.k_buffer.as_slice::<f32>();
+        let ks_buf = gs.cache.k_buffer.as_slice::<f32>();
+        let vb_buf = gb.cache.v_buffer.as_slice::<f32>();
+        let vs_buf = gs.cache.v_buffer.as_slice::<f32>();
+        assert_eq!(kb_buf, ks_buf, "K batch buffer != sequential-decode buffer");
+        assert_eq!(vb_buf, vs_buf, "V batch buffer != sequential-decode buffer");
+    }
+
+    #[test]
+    fn test_write_kv_batch_f16_matches_sequential_decode() {
+        use half::f16;
+        // F16 cache: batch write goes through the non-F32 cast path on CpuBackend
+        // (supports_kv_scatter_batch()==false). Must equal sequential decode writes.
+        let kv_heads = 2;
+        let head_dim = 4;
+        let row = kv_heads * head_dim;
+        let seq = 3;
+
+        // 0.5-multiples so values are exactly representable in F16.
+        let batch: Vec<f32> = (0..seq * row).map(|i| (i as f32) * 0.5).collect();
+
+        // (A) batch write.
+        let fmt_batch = StandardFormat::new(0, make_f16_dynamic_cache(8, kv_heads, head_dim));
+        let kb = f32_tensor(vec![1, seq, kv_heads, head_dim], &batch);
+        let vb = f32_tensor(vec![1, seq, kv_heads, head_dim], &batch);
+        fmt_batch
+            .write_kv_batch(&kb, &vb, &CpuBackend::new())
+            .unwrap();
+        assert_eq!(fmt_batch.current_pos(), seq);
+
+        // (B) reference: sequential decode writes.
+        let fmt_seq = StandardFormat::new(0, make_f16_dynamic_cache(8, kv_heads, head_dim));
+        for s in 0..seq {
+            let tok = &batch[s * row..(s + 1) * row];
+            let k = f32_tensor(vec![1, 1, kv_heads, head_dim], tok);
+            let v = f32_tensor(vec![1, 1, kv_heads, head_dim], tok);
+            fmt_seq.write_kv(&k, &v, &CpuBackend::new()).unwrap();
+        }
+        assert_eq!(fmt_seq.current_pos(), seq);
+
+        let gb = fmt_batch.inner.lock().unwrap();
+        let gs = fmt_seq.inner.lock().unwrap();
+        let kb_buf = gb.cache.k_buffer.as_slice::<f16>();
+        let ks_buf = gs.cache.k_buffer.as_slice::<f16>();
+        let vb_buf = gb.cache.v_buffer.as_slice::<f16>();
+        let vs_buf = gs.cache.v_buffer.as_slice::<f16>();
+        assert_eq!(
+            kb_buf, ks_buf,
+            "F16 K batch buffer != sequential-decode buffer"
+        );
+        assert_eq!(
+            vb_buf, vs_buf,
+            "F16 V batch buffer != sequential-decode buffer"
+        );
     }
 
     #[test]
