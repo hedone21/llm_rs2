@@ -4,6 +4,7 @@
 //! work seamlessly inside a `CachePressurePipeline`.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
+use crate::pressure::cache_manager::{CacheManager, ScoreContext};
 use crate::pressure::eviction::EvictionPolicy;
 use anyhow::Result;
 
@@ -45,62 +46,38 @@ impl CachePressureHandler for EvictionHandler {
         }
 
         let current_pos = ctx.caches[0].current_pos;
-        // Use signal's target_ratio if provided, otherwise fall back to handler config
+        // Use signal's target_ratio if provided, otherwise fall back to handler config.
         let effective_ratio = ctx.target_ratio.unwrap_or(self.target_ratio);
-        let target_len = ((current_pos as f32) * effective_ratio) as usize;
-        let target_len = target_len.max(1);
+        let target_len = (((current_pos as f32) * effective_ratio) as usize).max(1);
 
-        if current_pos <= target_len {
-            return Ok(ActionResult::NoOp);
-        }
+        // α-K 2b: guard + per-policy dispatch + 결과 조립은 registry 경로와 공유하는
+        // 단일 코어(CacheManager::run_policy_eviction)에 위임한다. EHH 는 target_len(≥1)을
+        // 미리 해소해 넘기므로 코어의 `target_len > 0` 한정 guard 가 기존 거동과 동일하다.
+        let scores = match (ctx.importance, ctx.head_importance) {
+            (Some(flat), Some(head)) if ctx.n_kv_heads > 0 => ScoreContext::PerHead {
+                flat,
+                head,
+                n_kv_heads: ctx.n_kv_heads,
+            },
+            (Some(flat), _) => ScoreContext::Flat { importance: flat },
+            _ => ScoreContext::None,
+        };
 
-        let tokens_to_remove = current_pos - target_len;
-        if tokens_to_remove < MIN_EVICT_TOKENS {
-            log::debug!(
-                "[EvictionHandler] skip: policy='{}', tokens_to_remove={} < MIN_EVICT_TOKENS={} \
-                 (current_pos={}, target_len={})",
-                self.policy.name(),
-                tokens_to_remove,
-                MIN_EVICT_TOKENS,
-                current_pos,
-                target_len,
-            );
-            return Ok(ActionResult::NoOp);
-        }
-
-        log::debug!(
-            "[EvictionHandler] policy='{}': {} → {} tokens",
-            self.policy.name(),
-            current_pos,
+        let result = CacheManager::run_policy_eviction(
+            self.policy.as_ref(),
+            ctx.caches,
             target_len,
-        );
+            scores,
+        )?;
 
-        for cache in ctx.caches.iter_mut() {
-            if let (Some(flat), Some(head_imp)) = (ctx.importance, ctx.head_importance) {
-                if ctx.n_kv_heads > 0 {
-                    self.policy.evict_with_head_scores(
-                        cache,
-                        target_len,
-                        flat,
-                        head_imp,
-                        ctx.n_kv_heads,
-                    )?;
-                } else {
-                    self.policy.evict_with_scores(cache, target_len, flat)?;
-                }
-            } else if let Some(importance) = ctx.importance {
-                self.policy
-                    .evict_with_scores(cache, target_len, importance)?;
-            } else {
-                self.policy.evict(cache, target_len)?;
-            }
+        if result.evicted {
+            Ok(ActionResult::Evicted {
+                tokens_removed: result.tokens_removed,
+                new_pos: result.new_pos,
+            })
+        } else {
+            Ok(ActionResult::NoOp)
         }
-
-        let new_pos = ctx.caches[0].current_pos;
-        Ok(ActionResult::Evicted {
-            tokens_removed: current_pos - new_pos,
-            new_pos,
-        })
     }
 
     fn name(&self) -> &str {

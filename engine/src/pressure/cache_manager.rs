@@ -465,7 +465,8 @@ impl CacheManager {
             .get(&method)
             .ok_or_else(|| anyhow::anyhow!("no registered policy for {:?}", method))?;
 
-        let result = Self::run_policy_eviction(policy.as_ref(), caches, target_ratio, scores)?;
+        let target_len = Self::resolve_target_len(max_cache_pos(caches), target_ratio);
+        let result = Self::run_policy_eviction(policy.as_ref(), caches, target_len, scores)?;
 
         if result.evicted {
             for cache in caches.iter_mut() {
@@ -494,7 +495,8 @@ impl CacheManager {
         target_ratio: f32,
         scores: ScoreContext,
     ) -> Result<EvictionResult> {
-        let result = Self::run_policy_eviction(policy, caches, target_ratio, scores)?;
+        let target_len = Self::resolve_target_len(max_cache_pos(caches), target_ratio);
+        let result = Self::run_policy_eviction(policy, caches, target_len, scores)?;
 
         if result.evicted {
             for cache in caches.iter_mut() {
@@ -511,13 +513,30 @@ impl CacheManager {
         Ok(result)
     }
 
-    /// Shared eviction logic: compute target_len, dispatch to policy methods.
-    /// Used by both `force_evict_by_policy()` and can be reused by EvictionHandler.
+    /// `target_ratio` → `target_len` 변환 (registry 경로 전용 helper).
+    ///
+    /// `target_ratio <= 0.0` 은 "정책이 결정" (StreamingLLM 이 자기 sink+window
+    /// 사용) → `target_len = 0` 으로 정책 default keep_size 를 쓴다 (1 로 강제 안 함).
+    fn resolve_target_len(current_pos: usize, target_ratio: f32) -> usize {
+        if target_ratio <= 0.0 {
+            0
+        } else {
+            ((current_pos as f32) * target_ratio).max(1.0) as usize
+        }
+    }
+
+    /// Shared eviction core: guard on `target_len`, dispatch to policy methods,
+    /// assemble result. `target_len == 0` means "policy decides" (guards skipped).
+    ///
+    /// pressure 파이프라인의 `EvictionHandler::handle` 와 registry 경로의
+    /// `force_evict_by_policy(_ref)` 가 공유하는 **단일 eviction 알고리즘** (α-K 2b
+    /// 통합 — 구 EvictionHandler 인라인 복제 제거). 호출자는 각자 자기 규칙으로
+    /// `target_len` 을 미리 해소해 전달한다 (EHH=`max(1)`, registry=`resolve_target_len`).
     // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path eviction dispatch
-    fn run_policy_eviction(
+    pub(crate) fn run_policy_eviction(
         policy: &dyn EvictionPolicy,
         caches: &mut [KVCache],
-        target_ratio: f32,
+        target_len: usize,
         scores: ScoreContext,
     ) -> Result<EvictionResult> {
         if caches.is_empty() {
@@ -529,14 +548,6 @@ impl CacheManager {
         }
 
         let current_pos = max_cache_pos(caches);
-        // target_ratio=0.0 means "let the policy decide" (e.g. StreamingLLM uses
-        // its own sink_size + window_size). Pass target_len=0 so the policy's
-        // default keep_size is used instead of forcing target_len=1.
-        let target_len = if target_ratio <= 0.0 {
-            0
-        } else {
-            ((current_pos as f32) * target_ratio).max(1.0) as usize
-        };
         if target_len > 0 && current_pos <= target_len {
             return Ok(EvictionResult {
                 evicted: false,
