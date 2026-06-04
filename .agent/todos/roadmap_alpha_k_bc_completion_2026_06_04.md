@@ -60,17 +60,19 @@
 ---
 
 ## [P1] Step 2 — B-3 offload 분리 (`PrefetchableCache` KVCacheOps 비의존 재정의)
-- **Status**: TODO
-- **Sprint**: next
-- **Dependencies**: Step 1 (forward chain flip — `forward_into_offload<C>` 가 B-2 forward chain 에 의존). 독립 분리 가능하면 Step 1 과 병렬 평가.
+- **Status**: ✅ **COMPLETE** (`936d0c99`, Option A = supertrait bound 제거안). **다음 = Step 3((3p) ④-a hot crux)**. production hot(plan path) 무접촉 유지.
+- **Sprint**: current → done
+- **Dependencies**: Step 1 ✅ (forward chain flip). offload 는 `forward_into<C>` caller 가 아닌 **별개 forward** 라 실제로는 Step 1 과 독립했으나, B-2 OLD chain(`layer.forward<OffloadKVCache>`) 소비는 공유.
 - **차단 cluster**: B-3 (offload). **production hot 아님** (opt-in `--kv-offload`, plan path 미사용).
-- **Description**: `PrefetchableCache: KVCacheOps` supertrait(kv_cache.rs:16) 의 supertrait bound 를 제거하여 `PrefetchableCache` 를 `KVCacheOps` 비의존으로 **재정의**. + `forward_into_offload<C>`(transformer.rs:2906) + `preload_erased<C>` fn-ptr(preload_pool.rs:177) 의 generic 소비를 trait object/비-generic 으로 전환. 권장 처리(ADR §8.3 B-3) = offload 를 (4) 트랙에서 **분리**(KVCacheOps 비의존화)하여 KVCacheOps 폐기의 컴파일 차단을 해소.
-- **권장 역할**: Architect (`PrefetchableCache` 재정의 형태 — KVCacheOps 의 어느 method 가 offload 에 실제 필요한지 census, supertrait → 독립 trait 또는 KVCacheFormat 위임) → Implementer (구현 + host test) → Tester (`--kv-offload` K-sweep crash-free + sane).
-- **Acceptance Criteria**:
-  - host: build + test, `PrefetchableCache` 가 `KVCacheOps` 를 supertrait 로 더 이상 요구하지 않음(grep 확인).
-  - device: `--kv-offload` 경로 crash-free + sane output (offload 는 production hot 아님 → bit-identical 보다 정확성+안정성 우선). 가능하면 legacy offload 출력과 bit-identical.
-  - hot path 무변 확인.
-- **Notes**: offload 는 `--kv-offload` opt-in 이라 device 게이트는 sanity 중심. fn-ptr(`preload_erased`)의 generic erasure 방식이 설계 포인트.
+- **Description**: `PrefetchableCache: KVCacheOps` supertrait(kv_cache.rs:22) 제거하여 standalone 재정의 + `forward_into_offload<C>`(transformer.rs)·`preload_erased::<C>` 호출의 generic 소비를 concrete `OffloadKVCache` 로 monomorphize. 권장 처리(ADR §8.3 B-3 + SSOT §9.1:753) = offload 를 (4) 트랙에서 **분리**(supertrait bound 제거안).
+- **권장 역할**: Architect (census) → Implementer (구현+host) → Tester (`--kv-offload` sanity). **실제 수행**: 메인 세션(census + Option A 구현 + host gate + 적대검증 workflow `w06swlxi9`).
+- **Acceptance Criteria** — ✅ 충족:
+  - ✅ host: build + clippy `--workspace -D warnings` + fmt clean. offload 58 + preload 14 + base-vs-offload accuracy test pass. `grep "PrefetchableCache:"` supertrait 0 / `forward_into_offload<` generic 0.
+  - ✅ device(host CPU 대체): `--kv-mode offload --kv-offload-storage raw --kv-type f16` host CPU greedy n=32 crash-free + sane + BEFORE/AFTER **생성텍스트 bit-identical**(md5 `568a03e...` 동일, timing 라인만 wall-clock 노이즈). full lib 1229 pass / 26 fail(24 opencl GPU부재 + 2 RSS flaky, 둘다 비-회귀). **S25/Jetson device 게이트는 forward 무변(monomorphization-only)이라 불요** — Option A 는 코드 경로를 안 바꿈.
+  - ✅ hot path 무변(plan path 미접촉).
+- **수행 결과 (Option A 정밀 범위 — V3 적대검증 반영, 과장 금지)**: Step 2 = **B-3 cluster 분리(5 차단자 중 1개)** — offload-**specific** KVCacheOps 결합(supertrait + offload-전용 generic `forward_into_offload<C>`/`preload_erased::<C>`)만 제거. **(4) KVCacheOps 폐기 자체는 미진전** — B-1(plan)/B-2(forward chain)/B-4(eval)/B-5(legacy) 차단자 잔존.
+- **★잔여 = B-2 OLD-chain 삭제 prerequisite (Step 5 선결, 강제 유지지 설계 종착 아님)**: Option A 후에도 `forward_into_offload` 본체가 **공유 OLD B-2 layer chain**(`layer.forward<OffloadKVCache>` → `forward_gen<C>`/`forward_prefill<C>`)을 계속 소비 + `impl KVCacheOps for OffloadKVCache`(offload.rs:263) 유지. 이는 설계 의도가 아니라 **B-2 OLD chain 이 살아있는 한 강제 유지**다. 최종 `KVCacheOps` 삭제(Step 5: OLD layer chain 삭제) 이전에 **`forward_into_offload` 의 fmt 이주**(`forward_gen_fmt`/`forward_prefill_fmt` + `OffloadKVCache: KVCacheFormat` interior-mutability + preload pool aliasing 재설계 = **Option B**, **device GPU 재검증 필수**)가 필요하다. **순서 명시**: `forward_into_offload` 는 `forward_into<C>` 의 caller 가 **아니라 자체 layer loop 를 가진 별개 forward** 라 ①-a~①-d(=forward_into caller 이주)가 미접촉 → **Step 5 의 OLD-chain 삭제 단위에 포함**(또는 그 직전 전용 증분). `run_chunked_prefill`(prefill.rs)과 동급의 B-2 OLD-chain 잔여 소비자.
+- **Notes**: `preload_erased<C: PrefetchableCache>` 는 standalone bound 로 generic 유지(KVCacheOps 비의존 = 차단자 아님; roadmap 의 "비-generic 전환"은 KVCacheOps 결합 제거가 목적이었고 supertrait 제거로 달성). PrefetchableCache trait 은 standalone 으로 보존(`재정의`, 삭제 아님).
 
 ---
 
@@ -107,8 +109,9 @@
 - **Status**: TODO
 - **Sprint**: backlog
 - **Dependencies**: Step 1·2·3·4 전부. **컴파일 차단자 0 확인이 진입 조건**(B-1~B-4 flip 완료 + B-5 legacy 이주).
-- **차단 cluster**: 없음 (deletion). B-5 legacy(`legacy/generate.rs`)가 `forward_into`/`execute_plan`/`execute_plan_for_kivi`/`forward_into_offload`/`run_eval_ll_generic` + `use KVCacheOps`(:4044/4645) 전부 호출 → legacy 폐기로 마지막 소비자 제거.
-- **Description**: (a) `legacy_generate` bin + `engine/legacy/generate.rs` 폐기(사용자 결정: legacy disposable, 호환성 불필요). (b) `KVCacheOps` trait 삭제 — `kv_cache_ops.rs:53` 의 generic monomorphization 정책 주석 제거(ADR-0001 §8 item 1). 컴파일 차단자 0(B-1~B-4 flip 완료) 확인 후 진행.
+- **차단 cluster**: 없음 (deletion). B-5 legacy(`legacy/generate.rs`)가 `forward_into`/`execute_plan`/`execute_plan_for_kivi`/`forward_into_offload`/`run_eval_ll_generic` + `use KVCacheOps`(:4044/4645) 전부 호출 → legacy 폐기로 *legacy 측* 소비자 제거. **⚠️ legacy 폐기 ≠ 모든 소비자 제거**: 아래 B-2 OLD-chain 잔여(non-legacy) 가 별도로 남는다.
+- **★B-2 OLD-chain 잔여 소비자 (legacy 외, Step 5 진입 전 반드시 migrate)**: `KVCacheOps`/OLD layer chain(`forward_gen<C>`/`forward_prefill<C>`)을 직접 쓰는 **non-legacy** 소비자 2개 — (1) **`forward_into_offload`**(transformer.rs, **OffloadForward** offload_forward.rs:156/190 = `chat/session.rs:547` 사용)가 본체에서 `layer.forward<OffloadKVCache>` + `OffloadKVCache: KVCacheOps`(offload.rs:263) 소비 → **fmt 이주(Option B: `forward_gen_fmt` + `OffloadKVCache: KVCacheFormat` interior-mut + preload pool aliasing 재설계, device GPU 재검증) 필요**. (2) **`run_chunked_prefill`**(prefill.rs, profiler+variance_collector) → `forward_prefill<C>` 소비(①-e 잔여). 둘 다 Step 2(B-3 분리)·①-a~①-d(forward_into caller 이주)에 미포함 → **여기(Step 5) 또는 그 직전 전용 증분에서 처리**.
+- **Description**: (a) `legacy_generate` bin + `engine/legacy/generate.rs` 폐기(사용자 결정: legacy disposable, 호환성 불필요). (b) **위 B-2 OLD-chain 잔여 2 소비자(`forward_into_offload`/`run_chunked_prefill`) fmt 이주** → OLD layer chain(`forward_gen<C>`/`forward_prefill<C>`/`forward_into<C>`) + `impl KVCacheOps for OffloadKVCache` 삭제 가능. (c) `KVCacheOps` trait 삭제 — `kv_cache_ops.rs:53` 의 generic monomorphization 정책 주석 제거(ADR-0001 §8 item 1). 컴파일 차단자 0(B-1~B-4 flip + 위 잔여 migrate 완료) 확인 후 진행.
 - **권장 역할**: Architect (KVCacheOps 잔존 소비자 0 최종 census — `grep KVCacheOps` 전수) → Senior Implementer (trait 삭제 + 잔여 정리) → Tester (device-gate full 최종 — *진짜 최종 perf*, parallel path 제거 후 monomorphization 드러남).
 - **Acceptance Criteria**:
   - `grep -r "KVCacheOps" engine/` 0건 (trait + 모든 generic bound + use 삭제).
@@ -123,12 +126,14 @@
 
 ```
 (3c-fwd ✅) ─┐
-(3c-evict ✅)─┴→ Step 1 ✅ (B-2 prefill + B-4 eval, cold) ─┬→ Step 3 ((3p) B-1 plan, HOT crux)
-                Step 2 (B-3 offload, cold) ─────────────┘        │
+(3c-evict ✅)─┴→ Step 1 ✅ (B-2 prefill + B-4 eval, cold) ─┬→ Step 3 ((3p) B-1 plan, HOT crux) ★다음
+                Step 2 ✅ (B-3 offload 분리, cold) ───────┘        │
                                                                  ↓
                                           Step 4 (device-gate → argus_cli)
                                                                  ↓
-                                          Step 5 (legacy 폐기 + KVCacheOps 삭제)
+                                          Step 5 (legacy 폐기 + B-2 OLD-chain 잔여 migrate
+                                                  [forward_into_offload/run_chunked_prefill]
+                                                  + KVCacheOps 삭제)
 ```
 
 - **위험 순서**: Step 1·2 (cold, hot 무접촉) → Step 3 (hot crux, 회귀 시 (3p)만 revert) → Step 4·5 (legacy 폐기).
