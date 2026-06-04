@@ -4,7 +4,6 @@ use std::sync::Arc;
 use crate::backend::Backend;
 use crate::buffer::{Buffer, DType};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
-use crate::kv_cache_ops::KVCacheOps;
 #[cfg(feature = "opencl")]
 use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::TransformerLayer;
@@ -116,7 +115,9 @@ pub struct TransformerModel {
     pub release_worker: Arc<dyn crate::runtime_resources_access::ReleaseWorkerAccess>,
 }
 
-pub struct TransformerModelForwardArgs<'a, C: KVCacheOps> {
+// 5-F: `C: KVCacheOps` bound 제거 — forward_into_offload_fmt(offload fmt 경로)가 concrete
+// OffloadKVCache 로만 단형화하며 OffloadKVCache inherent(5-E) 만 사용. 필드는 전부 데이터.
+pub struct TransformerModelForwardArgs<'a, C> {
     pub input_tokens: &'a Tensor,
     pub start_pos: usize,
     pub kv_caches: &'a mut [C],
@@ -2419,43 +2420,6 @@ impl TransformerModel {
                 log::warn!("Failed to build KIVI GPU kernel plan: {}", e);
                 None
             }
-        }
-    }
-
-    /// Execute a pre-built KIVI GPU kernel plan for a single decode token.
-    /// Falls back if plan is invalidated.
-    #[cfg(feature = "opencl")]
-    #[allow(clippy::too_many_arguments)]
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI plan execute
-    pub fn execute_plan_for_kivi(
-        &self,
-        plan: &FullKernelPlan,
-        input_tokens: &Tensor,
-        start_pos: usize,
-        x_gen: &mut Tensor,
-        kv_caches: &mut [crate::pressure::kivi_cache::KiviCache],
-        logits_out: &mut Tensor,
-        backend: &Arc<dyn Backend>,
-    ) -> Result<bool> {
-        self.gather_embed(input_tokens, x_gen, backend)?;
-
-        let ocl_backend = backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
-
-        match plan.execute(ocl_backend, start_pos, kv_caches) {
-            Ok(()) => {
-                if plan.lm_head.is_none() {
-                    if self.lm_head_on_cpu {
-                        self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
-                    } else {
-                        backend.matmul_transposed(x_gen, &self.lm_head, logits_out)?;
-                    }
-                }
-                Ok(true)
-            }
-            Err(_) => Ok(false),
         }
     }
 
