@@ -77,9 +77,10 @@
 ---
 
 ## [P1] Step 3 — (3p) ④-a hot-path flip (plan path concrete-handle)
-- **Status**: TODO
+- **Status**: **설계 ✅** (`design_alpha_k_3p_cut_2026_06_04.md`, workflow `wf_2be25cb8-bc9` 3 design + 3 verify) → **device 구현·게이트 대기**. (3d) plan-eval = flip 확정(선결 충족). **acceptance = device 전용**(plan GPU-only) — host 세션 미완료 가능.
 - **Sprint**: next
-- **Dependencies**: Step 1 (B-2 prefill flip — plan 평가가 forward chain 정합 필요) + Step 2 권장 선행. **(3d) prefill flip + plan 평가 = (3p) 분기 결정** (handoff_alpha_k_3d_entry 의 미해결 — 이 step 의 진입 전 확정 필요).
+- **Dependencies**: Step 1 (B-2 prefill flip — plan 평가가 forward chain 정합 필요) + Step 2 권장 선행. **(3d) plan 평가 = (3p) 분기 결정 → flip 확정**(SSOT line 761 BC 결정 + ①-b S25 device PASS 정합). (3p) 실작업 = step() fmt/plan 상호배타 해소. World A eviction seam(F1)은 hard 선결 아님(decode_loop try_evict 0건).
+- **설계 결론(`design_alpha_k_3p_cut`)**: ④-a = plan-local 최소 trait `PlanCacheHandle`(plan_geometry 1 lock + plan_advance 1 lock + plan_kv_bufs read seam) + concrete-handle monomorphize(`execute_fmt<H>`, **vtable 0**). flip 표면 4개 = execute(C 6지점) + StandardFormat/KIVIFormat inherent + **build_plan(★V1 적대검증이 잡은 누락 — KVCache pub k_buffer/v_buffer 직접 접근 :2577/2760 → fmt seam 필요)** + ModelForward wiring(fmt/plan 상호배타 해소). perf = neutral-or-slightly-worse(2 lock/layer, ~32 lock/tok, <0.01% TBT 예상·device 실측). ④-b(AttentionVariant 평탄화) defer 확정(attention=enum static, C 미접촉). host scaffold = device 라운드 동행(독립 land 안 함 — orphan dead_code 위험 + revert 격리).
 - **차단 cluster**: B-1 (plan `execute<C: KVCacheOps>` plan.rs:1257). **production hot layer-tier crux** — BC 완주의 유일한 perf 위험 지점.
 - **Description**: `plan.rs::execute<C: KVCacheOps>`(:1257) 를 **④-a concrete-handle**(`Arc<StandardFormat>`/`Arc<KIVIFormat>`, static dispatch, vtable 0)로 flip. C 가 닿는 표면 = 6 스칼라 getter(capacity :1286/1293 / current_pos :1286/1290/1291/1851 / res_pos :1294 / q2_tokens :1295) + `advance_pos` 1회(:1828)뿐(K/V 버퍼 데이터 접근 0, attention 은 `AttentionVariant` enum static — `attention_into` 호출 0건). dyn trait object 가 **아니다**(ADR §8.3 정정 1). perf 측정 대상 = **vtable 아님 = ④-a getter/advance 의 layer당 Mutex lock**(`StandardFormat` 의 `inner.lock().unwrap()` 패턴).
 - **권장 역할**: Architect (④-a concrete-handle 도입 형태 + `AttentionVariant` 평탄화(④-b) 묶음 여부 friction-triggered 판단) → Senior Implementer (plan.rs 핫패스 flip — GPU/lock 비용 민감) → Tester (device-gate full + avg_tbt 실측).
