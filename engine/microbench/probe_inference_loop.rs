@@ -47,7 +47,7 @@ use llm_rs2::format::KVCacheFormat;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
+use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use llm_rs2::pressure::standard_format::StandardFormat;
 use llm_rs2::session::forward::{ModelForward, alloc_standard_kv_caches};
 use llm_rs2::session::{DecodeLoopBuilder, Forward, GreedySampler, StepCtx};
@@ -215,7 +215,7 @@ fn impl_run_decode_loop(
         kv,
         max_seq_len,
         // Phase 4-4.7: microbench는 vtable overhead만 측정. plan path는 별도
-        // device G7' 게이트로 검증되므로 여기서는 비활성화 → forward_into_fmt fallback만.
+        // device G7' 게이트로 검증되므로 여기서는 비활성화 → forward_into fallback만.
         false,
     )?;
 
@@ -299,7 +299,7 @@ fn impl_run_direct(
         kv_dtype,
     )?;
     // Phase α-K Step 5-F: production(`ModelForward`)과 동일하게 KVCache 를 StandardFormat
-    // 으로 wrap 한 뒤 `forward_into_fmt`(trait object) 경로로 측정한다. OLD `forward_into<C>`
+    // 으로 wrap 한 뒤 `forward_into`(trait object) 경로로 측정한다. OLD `forward_into<C>`
     // 폐기에 맞춘 미러.
     let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = kv
         .into_iter()
@@ -334,7 +334,7 @@ fn impl_run_direct(
     let t0 = Instant::now();
 
     // Prefill — paradigm 통일: read last logits and argmax for first_token.
-    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+    model.forward_into(TransformerModelForwardArgs {
         input_tokens: &prefill_input,
         start_pos: 0,
         fmts: &dyn_fmts,
@@ -359,7 +359,7 @@ fn impl_run_direct(
 
     while tokens.len() < budget {
         backend.write_buffer(&mut decode_input, &prev.to_ne_bytes())?;
-        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &decode_input,
             start_pos: pos,
             fmts: &dyn_fmts,

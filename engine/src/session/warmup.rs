@@ -16,7 +16,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::pressure::kv_cache::KVCache;
 use crate::session::eval::EvalCacheKind;
 use crate::shape::Shape;
@@ -71,7 +71,7 @@ pub fn run_warmup(
     // workspace=None decode fallthrough(발산 A) 진입. 어차피 직후 KV cache reset(아래 103) →
     // bit-identity 가 구조적으로 보장(forward 출력/KV write 전부 폐기).
     KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
-        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &warmup_input,
             start_pos: 0,
             fmts,

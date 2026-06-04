@@ -18,7 +18,7 @@ use crate::buffer::DType;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::models::transformer::{OffloadForwardArgs, TransformerModel};
 use crate::pressure::offload::OffloadKVCache;
 use crate::pressure::offload::prefetch::PrefetchController;
 use crate::pressure::offload::raw_store::RawStore;
@@ -120,9 +120,9 @@ impl OffloadForward {
             .collect()
     }
 
-    /// `wrap_caches` 의 역 — `forward_into_offload_fmt` 종료 후 concrete `OffloadKVCache` 복귀.
+    /// `wrap_caches` 의 역 — `forward_into_offload` 종료 후 concrete `OffloadKVCache` 복귀.
     ///
-    /// `forward_into_offload_fmt` 의 `DrainGuard` 가 **모든 반환 경로(정상·에러·패닉)** 에서 preload
+    /// `forward_into_offload` 의 `DrainGuard` 가 **모든 반환 경로(정상·에러·패닉)** 에서 preload
     /// worker 의 raw-ptr deref/lock 완료를 보장하므로(B-1), 여기 도달 시 어떤 worker 도 OffloadFormat 을
     /// 만지지 않는다 → `Arc::try_unwrap` strong_count=1 → 항상 성공. `expect` 는 그 불변식의 방어적
     /// assertion 이다(정상 흐름에선 발화 불가 — worker 는 raw-ptr 라 strong count 에 안 잡힘).
@@ -187,8 +187,8 @@ impl Forward for OffloadForward {
 
         // Phase α-K Step 5-B: transient wrap (EvalCacheKind round-trip 미러).
         let wrapped = self.wrap_caches();
-        let result = self.model.forward_into_offload_fmt(
-            TransformerModelForwardArgs {
+        let result = self.model.forward_into_offload(
+            OffloadForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos,
                 kv_caches: &mut [],
@@ -226,8 +226,8 @@ impl Forward for OffloadForward {
 
         // Phase α-K Step 5-B: transient wrap (EvalCacheKind round-trip 미러).
         let wrapped = self.wrap_caches();
-        let result = self.model.forward_into_offload_fmt(
-            TransformerModelForwardArgs {
+        let result = self.model.forward_into_offload(
+            OffloadForwardArgs {
                 input_tokens: &self.decode_input,
                 start_pos: ctx.pos,
                 kv_caches: &mut [],

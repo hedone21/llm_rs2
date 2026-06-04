@@ -19,7 +19,7 @@ use crate::layers::workspace::{
 };
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::TransformerModelForwardFmtArgs;
+use crate::models::transformer::TransformerModelForwardArgs;
 use crate::pressure::kv_cache::KVCache;
 use crate::resilience::KVSnapshot;
 use crate::session::batch::args::BatchRunCtx;
@@ -384,7 +384,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
 
                 // Phase α-K ①-d: forward_into → fmt round-trip (GPU prefill chunk).
                 KVCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
-                    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                    model.forward_into(TransformerModelForwardArgs {
                         input_tokens: &input_tensor,
                         start_pos: chunk_start,
                         fmts,
@@ -452,7 +452,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
 
                             // Phase α-K ①-d: forward_into → fmt round-trip (CPU interleave prefill).
                             KVCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
-                                model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                                model.forward_into(TransformerModelForwardArgs {
                                     input_tokens: &cpu_in_tensor,
                                     start_pos: cpu_chunk_start_pos,
                                     fmts,
@@ -742,7 +742,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 // Phase α-K ①-d: forward_into → fmt round-trip (decode probe; workspace=Some →
                 // forward_gen_fmt, 발산 A 무관). score-feed 활성(H2O 누적).
                 KVCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
-                    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                    model.forward_into(TransformerModelForwardArgs {
                         input_tokens: &gen_input_tensor,
                         start_pos: prompt_tokens - 1,
                         fmts,
@@ -817,7 +817,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 // Phase α-K ①-d: forward_into → fmt round-trip (decode loop; workspace=Some →
                 // forward_gen_fmt, 발산 A 무관). score-feed 활성(H2O 누적).
                 KVCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
-                    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                    model.forward_into(TransformerModelForwardArgs {
                         input_tokens: &gen_input_tensor,
                         start_pos: batch_start_pos,
                         fmts,

@@ -14,7 +14,7 @@ use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::TransformerModelForwardFmtArgs;
+use crate::models::transformer::TransformerModelForwardArgs;
 use crate::pressure::kv_cache::KVCache;
 use crate::session::eval::EvalCacheKind;
 use crate::shape::Shape;
@@ -212,7 +212,7 @@ pub fn run_qcf_warmup_workflow(
 
         // Phase α-K ①-d: forward_into → fmt round-trip (warmup prefill, importance 부착).
         KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
-            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &warmup_input,
                 start_pos: 0,
                 fmts,
@@ -298,9 +298,9 @@ pub fn run_qcf_warmup_workflow(
                 );
 
                 // Phase α-K ①-d: forward_into → fmt round-trip (decode-X, seq_len=1 workspace=None
-                // → forward_into_fmt 의 발산 A fallthrough = 구 layer.forward→forward_prefill bit-identical).
+                // → forward_into 의 발산 A fallthrough = 구 layer.forward→forward_prefill bit-identical).
                 KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
-                    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                    model.forward_into(TransformerModelForwardArgs {
                         input_tokens: &decode_input,
                         start_pos: actual_warmup_len + step,
                         fmts,

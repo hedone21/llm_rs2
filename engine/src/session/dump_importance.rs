@@ -13,7 +13,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::pressure::kv_cache::KVCache;
 use crate::qcf::ImportanceCollector;
 use crate::session::eval::EvalCacheKind;
@@ -67,7 +67,7 @@ pub fn run_dump_importance(mut ctx: DumpImportanceCtx) -> anyhow::Result<()> {
     // ctx.kv_caches 는 owned Vec → 시그니처 변경 불요. disjoint field borrow(model/backend/memory
     // vs kv_caches)로 closure 와 &mut 공존.
     KVCache::forward_fmt_roundtrip(&mut ctx.kv_caches, |fmts| {
-        ctx.model.forward_into_fmt(TransformerModelForwardFmtArgs {
+        ctx.model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos: 0,
             fmts,

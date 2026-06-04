@@ -16,7 +16,7 @@ use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
-use crate::models::transformer::TransformerModelForwardFmtArgs;
+use crate::models::transformer::TransformerModelForwardArgs;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kivi_cache::KiviCache;
 use crate::pressure::kv_cache::KVCache;
@@ -364,7 +364,7 @@ pub fn run_kivi_ppl(
         );
 
         // Phase α-K ①-e: run_kivi_ppl prefill flip — `KiviCache::forward_fmt_roundtrip` 로 forward 1회
-        // 동안만 `Vec<KiviCache>` → `Arc<KIVIFormat>` wrap → `forward_into_fmt` → concrete 복귀
+        // 동안만 `Vec<KiviCache>` → `Arc<KIVIFormat>` wrap → `forward_into` → concrete 복귀
         // (①-c eval 미러). multi-token prefill 은 KIVIFormat::attention_into 의 신규 prefill arm
         // (seq_len>1 → `prefill_attention` 재사용, kivi_format.rs:106)을 경유 — OLD forward_prefill<C>
         // 의 KIVI 경로(get_view → flash)와 bit-identical. AWQE 는 run_kivi_ppl 미활성
@@ -373,7 +373,7 @@ pub fn run_kivi_ppl(
         // res_pos 접근은 concrete Vec 복귀 후라 borrow 충돌 없음.
         let cache_self_need_scores = kv_caches.first().is_some_and(|c| c.needs_scores());
         KiviCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
-            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos: 0,
                 fmts,
@@ -451,13 +451,13 @@ pub fn run_kivi_ppl(
             std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
         })?;
 
-        // Phase α-K ①-e: run_kivi_ppl decode flip — forward_fmt_roundtrip + forward_into_fmt.
+        // Phase α-K ①-e: run_kivi_ppl decode flip — forward_fmt_roundtrip + forward_into.
         // decode(seq_len=1)는 KIVIFormat::attention_into 의 decode arm(attention_native / F32-view
         // fallback)을 경유 — ①-c eval KIVI 와 동일 경로(host nll Δ~1e-6=★2 carve-out bit-identical
         // 검증됨). `cache_self_need_scores` 는 AWQE 미활성으로 false(decode 의 need_scores OR 항).
         let cache_self_need_scores = kv_caches.first().is_some_and(|c| c.needs_scores());
         KiviCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
-            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &gen_input_gpu,
                 start_pos,
                 fmts,
@@ -780,7 +780,7 @@ pub fn run_ppl(
         // Phase α-K ①-d: forward_into → fmt round-trip (run_ppl prefill). begin_step 선행(위) 유지.
         // KVCache → cache_self_need_scores=false. score-feed 는 prefill(workspace=None)이라 자연 skip.
         KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
-            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos: 0,
                 fmts,
@@ -944,7 +944,7 @@ pub fn run_ppl(
         // Phase α-K ①-d: forward_into → fmt round-trip (run_ppl decode; workspace=Some →
         // forward_gen_fmt, 발산 A 무관). score-feed 활성(H2O 누적).
         KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
-            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &gen_input_gpu,
                 start_pos,
                 fmts,

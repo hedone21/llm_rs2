@@ -18,7 +18,7 @@ use crate::format::KVCacheFormat;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::pressure::kivi_cache::KiviCache;
 use crate::pressure::kivi_format::KIVIFormat;
 use crate::session::traits::{Forward, StepCtx};
@@ -149,7 +149,7 @@ impl Forward for KiviForward {
         }
         let input_tensor = self.build_input_tensor(tokens)?;
 
-        // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into_fmt 이주.
+        // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into 이주.
         // wrap 전에 concrete cache 에서 AWQE need_scores 산출 (①-c 수용 잔여 패턴).
         // 5-E: KiviCache inherent `is_awqe_enabled` 직접 호출 (KVCacheOps 경유 제거).
         let need_scores = self.kv_caches.first().is_some_and(|c| c.is_awqe_enabled());
@@ -173,7 +173,7 @@ impl Forward for KiviForward {
         // raw pointer는 현재 stack frame 내에서만 역참조된다.
         let memory: &dyn Memory = unsafe { &*memory_ref };
 
-        let fwd_result = self.model.forward_into_fmt(TransformerModelForwardFmtArgs {
+        let fwd_result = self.model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos,
             fmts: &dyn_fmts,
@@ -211,7 +211,7 @@ impl Forward for KiviForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
-        // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into_fmt 이주.
+        // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into 이주.
         // 5-E: KiviCache inherent `is_awqe_enabled` 직접 호출 (KVCacheOps 경유 제거).
         let need_scores = self.kv_caches.first().is_some_and(|c| c.is_awqe_enabled());
 
@@ -232,7 +232,7 @@ impl Forward for KiviForward {
         // raw pointer는 현재 stack frame 내에서만 역참조된다.
         let memory: &dyn Memory = unsafe { &*memory_ref };
 
-        let fwd_result = self.model.forward_into_fmt(TransformerModelForwardFmtArgs {
+        let fwd_result = self.model.forward_into(TransformerModelForwardArgs {
             input_tokens: &self.decode_input,
             start_pos: ctx.pos,
             fmts: &dyn_fmts,

@@ -928,7 +928,7 @@ impl PartitionStep {
 
 /// Plan-path geometry snapshot for one KV cache (Phase α-K (3p) ④-a).
 ///
-/// `execute_fmt` reads these four scalars **once per layer** via a single lock
+/// `execute` reads these four scalars **once per layer** via a single lock
 /// on the `StandardFormat` wrapper (`plan_geometry()`), replacing the four
 /// separate `KVCacheOps` getter calls that `execute<C>` makes against a `&mut C`.
 /// Standard caches have no residual / quantized partition, so `res_pos` and
@@ -1275,7 +1275,7 @@ impl FullKernelPlan {
     ///
     /// plan path 는 GPU 전용이라 host 에서 기능 미발화 — bit-identical/avg_tbt acceptance 는
     /// device 세션(S25 OpenCL + Jetson CUDA).
-    pub fn execute_fmt(
+    pub fn execute(
         &self,
         backend: &crate::backend::opencl::OpenCLBackend,
         start_pos: usize,

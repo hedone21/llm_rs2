@@ -91,9 +91,9 @@ impl StandardFormat {
     }
 
     #[cfg(feature = "opencl")]
-    /// plan 빌드용 lock guard (Phase α-K (3p) ④-a `build_plan_fmt`).
+    /// plan 빌드용 lock guard (Phase α-K (3p) ④-a `build_plan`).
     ///
-    /// `build_plan_fmt` 는 모든 핸들의 guard 를 동시에 잡고 `&KVCache` 슬라이스를 만들어
+    /// `build_plan` 는 모든 핸들의 guard 를 동시에 잡고 `&KVCache` 슬라이스를 만들어
     /// `build_plan` 본문(byte-identical)을 재사용한다. cl_mem 핸들은 `build_full_plan` 안에서
     /// `set_kernel_arg` 로 즉시 바인딩(클론)되므로 guard 가 그 호출 동안만 살아 있으면 충분하다.
     pub(crate) fn plan_lock(&self) -> std::sync::MutexGuard<'_, StandardFormatInner> {
@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn test_plan_advance_bumps_current_pos() {
         // (3p) ④-a: plan_advance(n) 후 plan_geometry().current_pos 가 증가해야 한다
-        // (execute_fmt 의 레이어 끝 advance 미러).
+        // (execute 의 레이어 끝 advance 미러).
         let kv_heads = 2;
         let head_dim = 4;
         let fmt = StandardFormat::new(0, make_cache(8, kv_heads, head_dim));
@@ -969,7 +969,7 @@ mod tests {
     #[cfg(feature = "opencl")]
     #[test]
     fn test_plan_lock_reads_buffer() {
-        // (3p) ④-a: plan_lock() guard seam — build_plan_fmt 가 KV buffer(`k_buffer`)에
+        // (3p) ④-a: plan_lock() guard seam — build_plan 가 KV buffer(`k_buffer`)에
         // 도달하는 경로(guard 를 잡고 `&KVCache` 슬라이스를 만들어 byte-identical build_plan
         // 본문을 재사용).
         let kv_heads = 1;

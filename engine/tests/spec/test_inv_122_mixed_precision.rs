@@ -41,7 +41,7 @@ use llm_rs2::buffer::DType;
 use llm_rs2::format::KVCacheFormat;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
+use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use llm_rs2::pressure::kv_cache::{KVCache, KVLayout};
 use llm_rs2::pressure::standard_format::StandardFormat;
 use llm_rs2::shape::Shape;
@@ -147,14 +147,14 @@ fn run_forward_cpu(model: &TransformerModel, prompt_ids: &[u32]) -> anyhow::Resu
         .collect();
 
     // Phase α-K Step 5-F: production(`ModelForward`)과 동일하게 KVCache 를 StandardFormat
-    // 으로 wrap 한 뒤 `forward_into_fmt`(trait object) 경로로 forward 한다.
+    // 으로 wrap 한 뒤 `forward_into`(trait object) 경로로 forward 한다.
     let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = kv_caches
         .into_iter()
         .enumerate()
         .map(|(i, c)| Arc::new(StandardFormat::new(i, c)) as Arc<dyn KVCacheFormat>)
         .collect();
 
-    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+    model.forward_into(TransformerModelForwardArgs {
         input_tokens: &input_tensor,
         start_pos: 0,
         fmts: &dyn_fmts,

@@ -16,7 +16,7 @@ use crate::inference::skip_config::SkipConfig;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::qcf::ImportanceCollector;
 use crate::qcf_types::SubLayer;
 use crate::shape::Shape;
@@ -265,7 +265,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
             // Phase α-K ①-c: forward_into → fmt round-trip. cache_self_need(KIVI AWQE)는 wrap 전 산출.
             let probe_need = kv_caches.first().is_some_and(|c| c.needs_scores());
             C::forward_fmt_roundtrip(kv_caches, |fmts| {
-                model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gpu_gen_input,
                     start_pos: start_pos_after_prompt - 1,
                     fmts,
@@ -356,7 +356,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
 
                     let dec_need = kv_caches.first().is_some_and(|c| c.needs_scores());
                     C::forward_fmt_roundtrip(kv_caches, |fmts| {
-                        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                        model.forward_into(TransformerModelForwardArgs {
                             input_tokens: &gpu_gen_input,
                             start_pos: sp,
                             fmts,
@@ -574,7 +574,7 @@ fn run_importance_pass<C: EvalCacheKind>(
 
     let mut collector = ImportanceCollector::new();
     C::forward_fmt_roundtrip(kv_caches, |fmts| {
-        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos: 0,
             fmts,
@@ -711,7 +711,7 @@ fn run_token_by_token_prefill<C: EvalCacheKind>(
 
         let tbt_need = kv_caches.first().is_some_and(|c| c.needs_scores());
         C::forward_fmt_roundtrip(kv_caches, |fmts| {
-            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &gen_input,
                 start_pos: i,
                 fmts,
@@ -778,7 +778,7 @@ fn run_full_prefill<C: EvalCacheKind>(
 
     let fp_need = kv_caches.first().is_some_and(|c| c.needs_scores());
     C::forward_fmt_roundtrip(kv_caches, |fmts| {
-        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos: 0,
             fmts,
@@ -867,7 +867,7 @@ fn run_chunked_prefill<C: EvalCacheKind>(
 
     let fp_need = kv_caches.first().is_some_and(|c| c.needs_scores());
     C::forward_fmt_roundtrip(kv_caches, |fmts| {
-        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos: 0,
             fmts,
@@ -922,7 +922,7 @@ fn run_chunked_prefill<C: EvalCacheKind>(
 
         let cp_need = kv_caches.first().is_some_and(|c| c.needs_scores());
         C::forward_fmt_roundtrip(kv_caches, |fmts| {
-            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &gen_input,
                 start_pos,
                 fmts,

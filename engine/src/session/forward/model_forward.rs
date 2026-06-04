@@ -24,7 +24,7 @@ use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
 use crate::model_config::ModelArch;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::pressure::kv_cache::KVCache;
 use crate::pressure::standard_format::StandardFormat;
 use crate::session::traits::{Forward, StepCtx};
@@ -191,13 +191,13 @@ impl ModelForward {
             }
             return None;
         }
-        // (3p) ④-a: `build_plan_fmt`(StandardFormat handle slice). 5-F: fmt 가 유일 경로 —
+        // (3p) ④-a: `build_plan`(StandardFormat handle slice). 5-F: fmt 가 유일 경로 —
         // ensure_fmt_wrapped 가 kv_caches 를 mem::take 로 fmt_caches 로 옮겼으므로 항상 Some.
         let handles = self
             .fmt_caches
             .as_ref()
             .expect("fmt_caches Some after ensure_fmt_wrapped (5-F: fmt-only)");
-        let plan = self.model.build_plan_fmt(
+        let plan = self.model.build_plan(
             &self.decode_x_gen,
             &self.logits_decode,
             &self.decode_workspace,
@@ -238,7 +238,7 @@ impl ModelForward {
             .collect();
         if std::env::var_os("LLMRS_FWD_TRACE").is_some() {
             eprintln!(
-                "[fwd-trace] fmt default: wrapped {} KVCache → StandardFormat (decode = forward_into_fmt)",
+                "[fwd-trace] fmt default: wrapped {} KVCache → StandardFormat (decode = forward_into)",
                 fmts.len()
             );
         }
@@ -337,7 +337,7 @@ impl Forward for ModelForward {
         let chunk_size = self.derive_chunk_size(seq_len);
         // 5-F: fmt 가 유일 경로. chunk loop 전에 ensure_fmt_wrapped 로 kv_caches 를 fmt_caches 로
         // wrap(idempotent — 이후 decode step() 의 호출은 fmt_caches 이미 Some 이라 no-op).
-        // 이후 각 chunk 를 forward_into_fmt(multi-token prefill batch scatter)로 처리.
+        // 이후 각 chunk 를 forward_into(multi-token prefill batch scatter)로 처리.
         self.ensure_fmt_wrapped();
 
         let mut chunk_start = 0;
@@ -364,23 +364,22 @@ impl Forward for ModelForward {
                 .iter()
                 .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
                 .collect();
-            self.model
-                .forward_into_fmt(TransformerModelForwardFmtArgs {
-                    input_tokens: &input_tensor,
-                    start_pos: start_pos + chunk_start,
-                    fmts: &dyn_fmts,
-                    backend: &backend,
-                    memory,
-                    logits_out: &mut self.logits_prefill_last,
-                    x_gen: None,
-                    workspace: None,
-                    logits_last_only: true,
-                    // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
-                    score_accumulator: None,
-                    skip_config: None,
-                    importance_collector: None,
-                    cache_self_need_scores: false,
-                })?;
+            self.model.forward_into(TransformerModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos: start_pos + chunk_start,
+                fmts: &dyn_fmts,
+                backend: &backend,
+                memory,
+                logits_out: &mut self.logits_prefill_last,
+                x_gen: None,
+                workspace: None,
+                logits_last_only: true,
+                // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
+                score_accumulator: None,
+                skip_config: None,
+                importance_collector: None,
+                cache_self_need_scores: false,
+            })?;
 
             chunk_start = chunk_end;
         }
@@ -397,10 +396,10 @@ impl Forward for ModelForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
-        // 5-F: fmt 가 유일 경로. plan path(execute_plan_fmt) 우선 시도 → build/invalidation 시
-        // forward_into_fmt(trait object) 폴백. ensure_fmt_wrapped 가 prefill 시작에 wrap 완료.
+        // 5-F: fmt 가 유일 경로. plan path(execute_plan) 우선 시도 → build/invalidation 시
+        // forward_into(trait object) 폴백. ensure_fmt_wrapped 가 prefill 시작에 wrap 완료.
         self.ensure_fmt_wrapped();
-        // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan_fmt.
+        // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan.
         #[cfg(feature = "opencl")]
         {
             if self.gpu_plan.is_none() && !self.sticky_disabled {
@@ -413,7 +412,7 @@ impl Forward for ModelForward {
                     .fmt_caches
                     .as_ref()
                     .expect("fmt_caches Some after ensure_fmt_wrapped (5-F: fmt-only)");
-                self.model.execute_plan_fmt(
+                self.model.execute_plan(
                     plan,
                     &self.decode_input,
                     ctx.pos,
@@ -437,7 +436,7 @@ impl Forward for ModelForward {
             }
         }
 
-        // 폴백: forward_into_fmt(trait object) — plan 미빌드(host CPU)·invalidation 경로.
+        // 폴백: forward_into(trait object) — plan 미빌드(host CPU)·invalidation 경로.
         let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = self
             .fmt_caches
             .as_ref()
@@ -449,23 +448,22 @@ impl Forward for ModelForward {
         let memory_ref: *const dyn Memory = self.memory.as_ref();
         // SAFETY: `self.memory` 는 self 소유, 본 call stack 동안 유효.
         let memory: &dyn Memory = unsafe { &*memory_ref };
-        self.model
-            .forward_into_fmt(TransformerModelForwardFmtArgs {
-                input_tokens: &self.decode_input,
-                start_pos: ctx.pos,
-                fmts: &dyn_fmts,
-                backend: &backend,
-                memory,
-                logits_out: &mut self.logits_decode,
-                x_gen: Some(&mut self.decode_x_gen),
-                workspace: Some(&mut self.decode_workspace),
-                logits_last_only: false,
-                // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
-                score_accumulator: None,
-                skip_config: None,
-                importance_collector: None,
-                cache_self_need_scores: false,
-            })?;
+        self.model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &self.decode_input,
+            start_pos: ctx.pos,
+            fmts: &dyn_fmts,
+            backend: &backend,
+            memory,
+            logits_out: &mut self.logits_decode,
+            x_gen: Some(&mut self.decode_x_gen),
+            workspace: Some(&mut self.decode_workspace),
+            logits_last_only: false,
+            // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
+            score_accumulator: None,
+            skip_config: None,
+            importance_collector: None,
+            cache_self_need_scores: false,
+        })?;
         self.read_logits(&self.logits_decode)
     }
 

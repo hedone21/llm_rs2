@@ -115,9 +115,9 @@ pub struct TransformerModel {
     pub release_worker: Arc<dyn crate::runtime_resources_access::ReleaseWorkerAccess>,
 }
 
-// 5-F: `C: KVCacheOps` bound 제거 — forward_into_offload_fmt(offload fmt 경로)가 concrete
+// 5-F: `C: KVCacheOps` bound 제거 — forward_into_offload(offload fmt 경로)가 concrete
 // OffloadKVCache 로만 단형화하며 OffloadKVCache inherent(5-E) 만 사용. 필드는 전부 데이터.
-pub struct TransformerModelForwardArgs<'a, C> {
+pub struct OffloadForwardArgs<'a, C> {
     pub input_tokens: &'a Tensor,
     pub start_pos: usize,
     pub kv_caches: &'a mut [C],
@@ -161,12 +161,12 @@ pub struct TransformerModelForwardArgs<'a, C> {
 
 /// `forward_into` 의 KVCacheFormat trait-object fork 인자 (Phase α-K substep 3c).
 ///
-/// `TransformerModelForwardArgs` 의 `kv_caches: &mut [C]`(generic) 만
+/// `OffloadForwardArgs` 의 `kv_caches: &mut [C]`(generic) 만
 /// `fmts: &[Arc<dyn KVCacheFormat>]`(trait object, `&self` mutation 이라 `&mut` 불요)로 교체.
 /// **decode-only**(seq_len=1) — prefill flip 은 (3d). score/profiler/skip/importance/variance/
 /// prefill_ws/layer_boundary 는 happy-path decode 가 안 쓰므로(`is_standard_happy_path` 보장) 드롭
 /// (CLAUDE.md 추측성 유연성 금지 — 필요 시 후속 substep 에서 추가). eviction score 누적은 (3c-evict).
-pub struct TransformerModelForwardFmtArgs<'a> {
+pub struct TransformerModelForwardArgs<'a> {
     pub input_tokens: &'a Tensor,
     pub start_pos: usize,
     pub fmts: &'a [Arc<dyn crate::format::KVCacheFormat>],
@@ -174,7 +174,7 @@ pub struct TransformerModelForwardFmtArgs<'a> {
     pub memory: &'a dyn Memory,
     pub logits_out: &'a mut Tensor,
     pub x_gen: Option<&'a mut Tensor>,
-    /// decode(seq_len=1) workspace. prefill(seq_len>1)은 forward_into_fmt 가 owned
+    /// decode(seq_len=1) workspace. prefill(seq_len>1)은 forward_into 가 owned
     /// PrefillWorkspace 를 자체 할당하므로 None 이어도 무방.
     pub workspace: Option<&'a mut LayerWorkspace>,
     /// prefill 한정: true 면 마지막 토큰 hidden 만 lm_head (logits_out=[1,1,vocab]).
@@ -1366,7 +1366,7 @@ impl TransformerModel {
     /// `attention_into` 는 `backend.attention_gen` 위임 → NOT bit-identical, `forward_gen_fmt.rs` 헤더).
     /// **prefill 은 F16/Q4_0/F32 모두 동치** — decode 와 달리 `forward_prefill` 도 inline-NEON 아닌
     /// flash 경로라 `attention_into` prefill arm 과 누산 순서 일치(`standard_format::prefill_attention`).
-    pub fn forward_into_fmt(&self, args: TransformerModelForwardFmtArgs) -> Result<()> {
+    pub fn forward_into(&self, args: TransformerModelForwardArgs) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
         let fmts = args.fmts;
@@ -1526,7 +1526,7 @@ impl TransformerModel {
                 let need_scores = acc_need || cache_self_need_scores;
                 let ws = workspace
                     .as_deref_mut()
-                    .expect("forward_into_fmt decode requires a LayerWorkspace (seq_len=1)");
+                    .expect("forward_into decode requires a LayerWorkspace (seq_len=1)");
                 layer.forward_gen_fmt(crate::layers::transformer_layer::ForwardGenFmtArgs {
                     x: &mut x,
                     fmt: &fmts[i],
@@ -1548,7 +1548,7 @@ impl TransformerModel {
             } else {
                 let pws = owned_prefill_ws
                     .as_mut()
-                    .expect("forward_into_fmt prefill requires PrefillWorkspace (seq_len>1)");
+                    .expect("forward_into prefill requires PrefillWorkspace (seq_len>1)");
                 layer.forward_prefill_fmt(
                     crate::layers::transformer_layer::ForwardPrefillFmtArgs {
                         x: &mut x,
@@ -1680,7 +1680,7 @@ impl TransformerModel {
     /// perf 무영향. production 게이트(`LLMRS_KV_FMT`) OFF 시 미발화(byte-불변).
     #[cfg(feature = "opencl")]
     // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L build-time plan construction; StandardFormat guard seam for cl_mem extraction
-    pub fn build_plan_fmt(
+    pub fn build_plan(
         &self,
         x: &Tensor,
         logits: &Tensor,
@@ -2184,13 +2184,13 @@ impl TransformerModel {
 
     /// (3p) ④-a — `execute_plan` 의 fmt-handle copy-fork (Phase α-K BC Step 3).
     ///
-    /// `execute_plan` 미러 — `plan.execute(...)` → `plan.execute_fmt(...)`(StandardFormat
+    /// `execute_plan` 미러 — `plan.execute(...)` → `plan.execute(...)`(StandardFormat
     /// concrete-handle) 만 교체. lm_head / gather_embed 분기 동일. production 게이트
     /// (`LLMRS_KV_FMT`) OFF 시 미발화. acceptance = device 세션(plan GPU-only).
     #[cfg(feature = "opencl")]
     #[allow(clippy::too_many_arguments)]
     // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path plan execute (token TBT measured)
-    pub fn execute_plan_fmt(
+    pub fn execute_plan(
         &self,
         plan: &FullKernelPlan,
         input_tokens: &Tensor,
@@ -2209,7 +2209,7 @@ impl TransformerModel {
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
             .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
 
-        let result = plan.execute_fmt(ocl_backend, start_pos, handles);
+        let result = plan.execute(ocl_backend, start_pos, handles);
         if std::env::var_os("LLMRS_PLAN_TRACE").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
             static OK_CNT: AtomicU64 = AtomicU64::new(0);
@@ -2219,7 +2219,7 @@ impl TransformerModel {
                     let n = OK_CNT.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || n.is_power_of_two() || n.is_multiple_of(32) {
                         eprintln!(
-                            "[plan-trace] execute_plan_fmt ok={} err={}",
+                            "[plan-trace] execute_plan ok={} err={}",
                             n,
                             ERR_CNT.load(Ordering::Relaxed)
                         );
@@ -2432,7 +2432,7 @@ impl TransformerModel {
     ///   1. `kv_caches: &mut [OffloadKVCache]` → `fmts: &[Arc<OffloadFormat>]`(transient wrap).
     ///      preload/retain/release 는 `OffloadFormat` 의 interior-mut(`&self`) 메서드 경유.
     ///   2. forward 위임: decode → `forward_gen_fmt`(`&Arc<dyn KVCacheFormat>` + LayerWorkspace),
-    ///      prefill → owned `PrefillWorkspace` + `forward_prefill_fmt`(forward_into_fmt:2096 미러).
+    ///      prefill → owned `PrefillWorkspace` + `forward_prefill_fmt`(forward_into:2096 미러).
     ///
     /// `dyn_fmts` = `fmts` 를 `Arc<dyn KVCacheFormat>` 로 업캐스트한 Vec(루프 전 1회) — fmt fork 가
     /// `&Arc<dyn KVCacheFormat>` 를 요구. `OffloadFormat` 은 interior-mut 라 preload pool 의 raw cast 가
@@ -2440,9 +2440,9 @@ impl TransformerModel {
     /// OLD :3875 일치). 마지막 pending drain 으로 모든 background task 가 종료 전 완료/drop 됨을 보장
     /// (caller 의 `Arc::try_unwrap` 성공 전제).
     // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path concrete OffloadFormat + PrefetchController (offload 분리 backlog)
-    pub fn forward_into_offload_fmt(
+    pub fn forward_into_offload(
         &self,
-        args: TransformerModelForwardArgs<'_, OffloadKVCache>,
+        args: OffloadForwardArgs<'_, OffloadKVCache>,
         fmts: &[Arc<crate::pressure::offload_format::OffloadFormat>],
         prefetch: &mut crate::pressure::offload::prefetch::PrefetchController,
     ) -> Result<()> {
@@ -2502,7 +2502,7 @@ impl TransformerModel {
             .map(|a| a.clone() as Arc<dyn crate::format::KVCacheFormat>)
             .collect();
 
-        // prefill owned PrefillWorkspace (forward_into_fmt:2096 미러). decode 는 args.workspace 사용,
+        // prefill owned PrefillWorkspace (forward_into:2096 미러). decode 는 args.workspace 사용,
         // prefill 은 owned alloc(forward_prefill_fmt 가 항상 PrefillWorkspace 요구).
         let ws_cfg = WsCfg {
             batch_size,
@@ -2656,7 +2656,7 @@ impl TransformerModel {
                 // 첫 prefill(chat repl.rs:89 → OffloadForward::prefill(tokens=[bos], workspace=None))
                 // 경로 — OLD forward_into_offload 는 layer.forward 가 seq_len==1+workspace=None 에서
                 // forward_prefill 로 fall-through(transformer_layer.rs:261, degenerate 1-token).
-                // 둘 다 forward_prefill_fmt(owned PrefillWorkspace) 로 미러(forward_into_fmt:2141 동형).
+                // 둘 다 forward_prefill_fmt(owned PrefillWorkspace) 로 미러(forward_into:2141 동형).
                 // owned_prefill_ws 는 seq_len>1 이면 루프 전 alloc(:4025), 발산 A 면 여기서 lazy alloc.
                 if owned_prefill_ws.is_none() {
                     owned_prefill_ws = Some(PrefillWorkspace::new(
@@ -2727,7 +2727,7 @@ impl TransformerModel {
             is_gemma3,
         )?;
         // ★W-1(적대검증): prefill(seq_len>1)+logits_last_only 면 마지막 토큰 hidden 만 head 에 통과
-        // (forward_into_fmt:2311 미러). OLD forward_into_offload 의 tail 은 이 분기가 없어 logits_out=
+        // (forward_into:2311 미러). OLD forward_into_offload 의 tail 은 이 분기가 없어 logits_out=
         // [1,1,vocab](OffloadForward::prefill 할당)에 [1,seq_len,vocab] 를 써 heap overflow 했다 —
         // 신규 함수가 OOB write 하지 않도록 정정(decode seq_len=1 은 분기 미진입 → byte-불변).
         if args.logits_last_only && seq_len > 1 {
@@ -2750,7 +2750,7 @@ impl TransformerModel {
             backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
         }
 
-        // prefill owned PrefillWorkspace drop 전 GPU 커널 완료 보장 (forward_into_fmt:2333 미러).
+        // prefill owned PrefillWorkspace drop 전 GPU 커널 완료 보장 (forward_into:2333 미러).
         if needs_ws_sync {
             backend.synchronize()?;
         }

@@ -284,7 +284,7 @@ impl KVCacheFormat for OffloadFormat {
 
 /// Type-erased preload function for `OffloadFormat` background prefetch tasks.
 ///
-/// `forward_into_offload_fmt` 의 preload pool 이 `submit_raw(Arc::as_ptr(&fmt) as *mut (), …)` 로
+/// `forward_into_offload` 의 preload pool 이 `submit_raw(Arc::as_ptr(&fmt) as *mut (), …)` 로
 /// 제출한다. `OffloadFormat` 은 interior-mut(`&self`)라 raw cast 가 `*const` 이며 `Mutex` 가
 /// aliasing 을 흡수한다.
 ///

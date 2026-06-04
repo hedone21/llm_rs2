@@ -4,7 +4,7 @@
 //! `.agent/todos/design_alpha_k_1c_cut_2026_06_04.md`(workflow `wdrcgtqwz`, Strategy A).
 //!
 //! eval 은 concrete `Vec<KVCache>`(EvictionHook) / `Vec<KiviCache>`(KiviHook) 를 **계속 소유**하되,
-//! forward 1회 동안만 `Arc<dyn KVCacheFormat>` 로 wrap 하여 `forward_into_fmt` 에 위임한다(round-trip).
+//! forward 1회 동안만 `Arc<dyn KVCacheFormat>` 로 wrap 하여 `forward_into` 에 위임한다(round-trip).
 //! hook/snapshot/eviction 은 forward 와 interleave 하지 않으므로(forward → post_prefill/snapshot/
 //! restore 시퀀셜) round-trip 후 복귀한 concrete slice 를 그대로 받는다 → hook impl 무수정.
 //!
@@ -27,7 +27,7 @@ use crate::pressure::standard_format::StandardFormat;
 
 /// eval 의 cache 다형성을 `KVCacheOps` 바운드 없이 추상화 (Phase α-K ①-c).
 ///
-/// `forward_fmt_roundtrip` 가 fmt-wrap → `forward_into_fmt` → unwrap 을 캡슐화하고, 나머지 3 메서드는
+/// `forward_fmt_roundtrip` 가 fmt-wrap → `forward_into` → unwrap 을 캡슐화하고, 나머지 3 메서드는
 /// eval_loop 의 직접 cache 접근(`current_pos`/`set_current_pos`/`needs_attn_scores`)을 노출한다.
 pub trait EvalCacheKind: Sized + Send {
     /// `caches` 전체를 forward 1회 동안 `Arc<dyn KVCacheFormat>` 로 wrap 하여 `run` 에 넘기고, 종료 후
