@@ -81,6 +81,13 @@ pub struct OffloadKVCache {
     /// Number of tokens written to attn_buf but not yet flushed to store.
     /// When preloaded, decode updates go to attn_buf only; store catches up on release.
     store_behind: usize,
+    /// 비-F32(F16) write 의 **영속** cast scratch (target dtype). `OffloadFormat`(Step 5-B)이
+    /// transient wrap 으로 매 토큰 재생성돼도 이 필드는 `OffloadKVCache` 에 남아 GPU 버퍼 재할당을
+    /// 막는다 — OLD `forward_gen` 의 `LayerWorkspace.k_cast` 1회 할당·재사용과 동등(per-token GPU
+    /// alloc 56회/token → avg_tbt +5.8% 회귀 방지). decode seq_len=1 고정이라 shape 안정 → 1회 alloc.
+    /// `pub(crate)` — 형제 모듈 `offload_format.rs`(OffloadFormat::write_inner)가 접근.
+    pub(crate) cast_k: Option<Tensor>,
+    pub(crate) cast_v: Option<Tensor>,
 }
 
 impl OffloadKVCache {
@@ -116,6 +123,8 @@ impl OffloadKVCache {
             gpu_k_buf: None,
             gpu_v_buf: None,
             store_behind: 0,
+            cast_k: None,
+            cast_v: None,
         }
     }
 

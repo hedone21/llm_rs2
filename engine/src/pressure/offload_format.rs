@@ -22,25 +22,15 @@ use crate::kv_cache_ops::KVCacheOps;
 use crate::pressure::offload::OffloadKVCache;
 use crate::tensor::Tensor;
 
-/// 내부 가변 상태 — `OffloadKVCache` 와 비-F32 cast scratch 를 **단일 lock** 으로 묶는다.
-///
-/// `StandardFormatInner` 미러: scratch(`k_cast`/`v_cast`)는 비-F32 write 의 reusable buffer.
-/// cache 와 한 `Mutex` 안에 두어 별도 lock 으로 인한 동시성 hazard 를 차단한다.
-struct OffloadFormatInner {
-    cache: OffloadKVCache,
-    /// Lazy cast scratch (target dtype). 첫 비-F32 write 에서 `cache.cast_memory()`(GPU) 또는
-    /// host `Galloc`(CPU) 로 할당.
-    k_cast: Option<Tensor>,
-    v_cast: Option<Tensor>,
-}
-
 /// `OffloadKVCache` 를 `KVCacheFormat` 으로 노출하는 wrapper (`StandardFormat` 의 offload 짝).
 ///
 /// 기존 `OffloadKVCache` 를 `Mutex` 로 감싸 `&self` 메서드에서 내부 `&mut` 메서드에 위임한다.
-/// `OffloadKVCache` 자체는 무변.
+/// `OffloadKVCache` 자체는 무변. **cast scratch(`cast_k`/`cast_v`)는 `OffloadKVCache` 필드**라
+/// transient wrap/unwrap 을 가로질러 영속한다(StandardFormatInner 가 별도 scratch 를 둔 것과 달리 —
+/// transient-wrap 매 토큰 재생성 시 GPU 버퍼 재할당을 막아 avg_tbt 회귀 방지, §device-gate W-3).
 pub struct OffloadFormat {
     idx: usize,
-    inner: Mutex<OffloadFormatInner>,
+    inner: Mutex<OffloadKVCache>,
 }
 
 impl OffloadFormat {
@@ -48,24 +38,20 @@ impl OffloadFormat {
     pub fn new(idx: usize, cache: OffloadKVCache) -> Self {
         Self {
             idx,
-            inner: Mutex::new(OffloadFormatInner {
-                cache,
-                k_cast: None,
-                v_cast: None,
-            }),
+            inner: Mutex::new(cache),
         }
     }
 
     /// wrapping 을 해제하고 내부 `OffloadKVCache` 를 반환 (transient-wrap round-trip).
     ///
     /// `StandardFormat::into_inner` 미러 — cross-token 상태(retained attn_buf / gpu_k_buf /
-    /// current_pos / store_behind)는 전부 `OffloadKVCache` 필드라 unwrap 을 가로질러 보존된다.
-    /// cast scratch(`k_cast`/`v_cast`)는 transient 라 버린다(다음 wrap 에서 lazy 재할당).
+    /// current_pos / store_behind / **cast_k·cast_v scratch**)는 전부 `OffloadKVCache` 필드라
+    /// unwrap 을 가로질러 보존된다(다음 wrap 에서 재할당 0 — per-token GPU alloc 회귀 방지).
     ///
     /// `pub`(StandardFormat::into_inner 의 `pub(crate)` 와 달리) — `legacy_generate` 가 별도 bin
     /// 크레이트라 offload device 게이트 매체(run_offload)에서 wrap/unwrap 에 접근해야 한다(5-A).
     pub fn into_inner(self) -> OffloadKVCache {
-        self.inner.into_inner().unwrap().cache
+        self.inner.into_inner().unwrap()
     }
 
     /// preload pool background task seam — interior-mut(`&self`).
@@ -74,23 +60,23 @@ impl OffloadFormat {
     /// `*const OffloadFormat` 이라도 `Mutex` 가 aliasing 을 흡수한다(far_idx≠i 불변식은 retain/release
     /// 로직 보존용으로만 유지, soundness 는 Mutex 가 보장).
     pub(crate) fn preload_locked(&self) -> Result<()> {
-        self.inner.lock().unwrap().cache.preload()
+        self.inner.lock().unwrap().preload()
     }
 
     /// `OffloadKVCache::release_buffers(&mut)` 를 `&self` 로 미러.
     pub(crate) fn release_locked(&self) {
-        self.inner.lock().unwrap().cache.release_buffers();
+        self.inner.lock().unwrap().release_buffers();
     }
 
     /// `OffloadKVCache::retain_preload(&mut)` 를 `&self` 로 미러.
     pub(crate) fn retain_locked(&self) {
-        self.inner.lock().unwrap().cache.retain_preload();
+        self.inner.lock().unwrap().retain_preload();
     }
 
     /// `OffloadKVCache::reset_session(&mut)` 를 `&self` 로 미러.
     #[allow(dead_code)]
     pub(crate) fn reset_session_locked(&self) {
-        self.inner.lock().unwrap().cache.reset_session();
+        self.inner.lock().unwrap().reset_session();
     }
 
     /// KV write 흡수 — `forward_gen` 의 KV-update 분기(transformer_layer.rs:35 `update_kv_cache`
@@ -104,14 +90,16 @@ impl OffloadFormat {
     /// `update_kv_cache` 의 has_gpu_buffers=false 분기) 후 `update`. CpuBackend.synchronize 는 no-op.
     fn write_inner(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
         let mut guard = self.inner.lock().unwrap();
-        let kv_dtype = guard.cache.kv_dtype();
+        let kv_dtype = guard.kv_dtype();
 
         if kv_dtype != DType::F32 {
             // 비-F32 cast 경로 (F16). F32 입력을 cache dtype 으로 cast 후 update.
             // `OffloadKVCache::update` 는 cast 를 안 하고 입력이 이미 cache dtype 임을 전제(raw byte
             // copy)하므로, 반드시 여기서 cast 해야 한다(dtype 미일치 silent garbage 방지).
+            // scratch(`cast_k`/`cast_v`)는 **OffloadKVCache 영속 필드** — transient wrap/unwrap 을
+            // 가로질러 보존돼 GPU 버퍼 재할당이 1회뿐(StandardFormatInner 가 매-wrap 재할당하던
+            // device avg_tbt +5.8% 회귀를 OLD LayerWorkspace 재사용 수준으로 회복).
             let memory = guard
-                .cache
                 .cast_memory()
                 .unwrap_or_else(|| Arc::new(crate::memory::galloc::Galloc::new()));
             let n_elem: usize = new_k.shape().dims().iter().product();
@@ -123,39 +111,36 @@ impl OffloadFormat {
                 _ => n_elem * 4,
             };
             let k_stale = guard
-                .k_cast
+                .cast_k
                 .as_ref()
                 .is_none_or(|t| t.shape().dims() != new_k.shape().dims());
             if k_stale {
                 let buf = memory.alloc(buf_size, kv_dtype)?;
-                guard.k_cast = Some(Tensor::new(
+                guard.cast_k = Some(Tensor::new(
                     new_k.shape().clone(),
                     buf,
                     new_k.backend().clone(),
                 ));
             }
             let v_stale = guard
-                .v_cast
+                .cast_v
                 .as_ref()
                 .is_none_or(|t| t.shape().dims() != new_v.shape().dims());
             if v_stale {
                 let buf = memory.alloc(buf_size, kv_dtype)?;
-                guard.v_cast = Some(Tensor::new(
+                guard.cast_v = Some(Tensor::new(
                     new_v.shape().clone(),
                     buf,
                     new_v.backend().clone(),
                 ));
             }
-            let OffloadFormatInner {
-                cache,
-                k_cast,
-                v_cast,
-            } = &mut *guard;
-            let k_cast = k_cast.as_mut().unwrap();
-            let v_cast = v_cast.as_mut().unwrap();
-            backend.cast(new_k, k_cast)?;
-            backend.cast(new_v, v_cast)?;
-            return cache.update(k_cast, v_cast);
+            // cast scratch 가 inner cache 의 필드라 `&mut self.cast_k` 와 `self.update(&mut self)` 가
+            // 동시에 성립 못 함 → cast 직후 Tensor clone(Arc 버퍼 + Shape, 저비용)으로 borrow 분리.
+            backend.cast(new_k, guard.cast_k.as_mut().unwrap())?;
+            backend.cast(new_v, guard.cast_v.as_mut().unwrap())?;
+            let kc = guard.cast_k.clone().unwrap();
+            let vc = guard.cast_v.clone().unwrap();
+            return guard.update(&kc, &vc);
         }
 
         // F32 경로 (transformer_layer.rs:35 `update_kv_cache` 미러).
@@ -165,7 +150,7 @@ impl OffloadFormat {
         if !new_k.as_ptr().is_null() {
             backend.synchronize()?;
         }
-        guard.cache.update(new_k, new_v)
+        guard.update(new_k, new_v)
     }
 }
 
@@ -175,12 +160,12 @@ impl KVCacheFormat for OffloadFormat {
     }
 
     fn current_pos(&self) -> usize {
-        // path X: KVCacheOps trait 은 5-E 까지 생존 (StandardFormat:304 미러).
-        KVCacheOps::current_pos(&self.inner.lock().unwrap().cache)
+        // path X: KVCacheOps trait 은 5-E 까지 생존 (StandardFormat:304 미러). MutexGuard → &OffloadKVCache deref.
+        KVCacheOps::current_pos(&*self.inner.lock().unwrap())
     }
 
     fn capacity(&self) -> usize {
-        self.inner.lock().unwrap().cache.capacity()
+        self.inner.lock().unwrap().capacity()
     }
 
     fn write_kv(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
@@ -210,7 +195,7 @@ impl KVCacheFormat for OffloadFormat {
         let seq_len = q.shape().dims()[1];
 
         let mut guard = self.inner.lock().unwrap();
-        let cache = &mut guard.cache;
+        let cache = &mut *guard;
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
         let cache_seq_len = KVCacheOps::current_pos(&*cache);
