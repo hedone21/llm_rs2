@@ -38,10 +38,12 @@ use std::sync::Arc;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
+use llm_rs2::format::KVCacheFormat;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
 use llm_rs2::pressure::kv_cache::{KVCache, KVLayout};
+use llm_rs2::pressure::standard_format::StandardFormat;
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
 // ── 환경변수 키 ──────────────────────────────────────────────────────────────
@@ -129,7 +131,7 @@ fn run_forward_cpu(model: &TransformerModel, prompt_ids: &[u32]) -> anyhow::Resu
 
     // KV caches: HeadMajor
     let n_layers = cfg.num_hidden_layers;
-    let mut kv_caches: Vec<KVCache> = (0..n_layers)
+    let kv_caches: Vec<KVCache> = (0..n_layers)
         .map(|_| {
             let shape = Shape::new(vec![1, kv_heads, capacity, head_dim]);
             let k_buf = mem
@@ -144,24 +146,28 @@ fn run_forward_cpu(model: &TransformerModel, prompt_ids: &[u32]) -> anyhow::Resu
         })
         .collect();
 
-    model.forward_into(TransformerModelForwardArgs {
+    // Phase α-K Step 5-F: production(`ModelForward`)과 동일하게 KVCache 를 StandardFormat
+    // 으로 wrap 한 뒤 `forward_into_fmt`(trait object) 경로로 forward 한다.
+    let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = kv_caches
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| Arc::new(StandardFormat::new(i, c)) as Arc<dyn KVCacheFormat>)
+        .collect();
+
+    model.forward_into_fmt(TransformerModelForwardFmtArgs {
         input_tokens: &input_tensor,
         start_pos: 0,
-        kv_caches: &mut kv_caches,
+        fmts: &dyn_fmts,
         backend: &backend,
         memory: &*mem,
         logits_out: &mut logits_out,
         x_gen: None,
         workspace: None,
         score_accumulator: None,
-        profiler: None,
         skip_config: None,
         importance_collector: None,
         logits_last_only: false,
-        variance_collector: None,
-        prefill_workspace: None,
-
-        layer_boundary_hook: None,
+        cache_self_need_scores: false,
     })?;
 
     // last-token logits 추출 (인덱스 [0, seq_len-1, :])

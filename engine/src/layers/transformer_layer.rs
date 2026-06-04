@@ -1,4 +1,3 @@
-mod forward;
 mod forward_gen;
 mod forward_gen_fmt;
 mod forward_prefill_fmt;
@@ -6,13 +5,7 @@ pub(crate) use forward_gen_fmt::ForwardGenFmtArgs;
 pub(crate) use forward_prefill_fmt::ForwardPrefillFmtArgs;
 
 use crate::backend::Backend;
-// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
-use crate::backend::cpu::CpuBackend;
-use crate::buffer::Buffer;
 use crate::buffer::DType;
-use crate::kv_cache_ops::KVCacheOps;
-use crate::memory::Memory;
-use crate::memory::galloc::Galloc;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 use anyhow::Result;
@@ -20,172 +13,10 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 use crate::layers::tensor_partition::PartitionContext;
-use crate::memory::host::shared::SharedBuffer;
 
 // OpInstrument trait object는 LayerForwardArgs/LayerGenForwardArgs.profiler에서 사용.
 // OpProfiler/PrefillOpProfiler concrete는 observability/profile/ops/ 직접 import.
 pub use crate::instrument::OpInstrument;
-
-/// Update KV cache with K/V tensors, handling GPU→CPU readback when needed.
-///
-/// GPU-only tensors (`as_ptr()` returns null, e.g. NVIDIA UnifiedBuffer) are
-/// read back to CPU when the cache does not support direct GPU buffer access
-/// (e.g. `KiviCache`). Regular `KVCache` handles GPU tensors internally via
-/// `backend.copy_slice`, so no readback occurs for the common case.
-pub(super) fn update_kv_cache<C: KVCacheOps>(
-    kv_cache: &mut C,
-    k: &Tensor,
-    v: &Tensor,
-    backend: &Arc<dyn Backend>,
-) -> Result<()> {
-    let has_gpu_buffers = kv_cache.get_buffers_mut().is_some();
-
-    // GPU-buffer caches (e.g. `KVCache`) accept GPU tensors directly via
-    // `backend.copy_slice`. No host-side read, so no sync needed here.
-    if has_gpu_buffers {
-        return kv_cache.update(k, v);
-    }
-
-    // CPU-only cache (e.g. `KiviCache`) reads the K/V via `as_slice::<f32>()`.
-    // If the producer tensor lives in host-mapped GPU memory (CUDA pinned,
-    // OpenCL UMA), the host pointer is non-null but the device kernels that
-    // wrote it may not have completed — `as_slice` would then return stale
-    // bytes. Synchronize before the read.
-    if !k.as_ptr().is_null() {
-        backend.synchronize()?;
-        return kv_cache.update(k, v);
-    }
-
-    // Device-only tensors (`as_ptr()` is null): explicit readback.
-    let k_cpu = gpu_readback(k, backend)?;
-    let v_cpu = gpu_readback(v, backend)?;
-    kv_cache.update(&k_cpu, &v_cpu)
-}
-
-/// Read a GPU tensor back to a CPU SharedBuffer tensor.
-fn gpu_readback(tensor: &Tensor, backend: &Arc<dyn Backend>) -> Result<Tensor> {
-    let byte_size = tensor.buffer().size();
-    let cpu_buf = Arc::new(SharedBuffer::new(byte_size, tensor.dtype()));
-    unsafe {
-        let dst = std::slice::from_raw_parts_mut(cpu_buf.as_mut_ptr(), byte_size);
-        backend.read_buffer(tensor, dst)?;
-    }
-    Ok(Tensor::new(
-        tensor.shape().clone(),
-        cpu_buf,
-        Arc::new(CpuBackend::new()),
-    ))
-}
-
-// --- x86_64 AVX2 SIMD helpers for attention ---
-
-/// Dot product: sum(a[i] * b[i]) for i in 0..len, using AVX2+FMA.
-/// head_dim=64 → 8 AVX2 iterations (4x unrolled = 2 outer iterations).
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub(super) unsafe fn dot_f32_avx2(a: *const f32, b: *const f32, len: usize) -> f32 {
-    unsafe {
-        use std::arch::x86_64::*;
-        let mut sum = _mm256_setzero_ps();
-        let mut i = 0;
-
-        // 4x unrolled: 32 floats per iteration
-        while i + 32 <= len {
-            let a0 = _mm256_loadu_ps(a.add(i));
-            let b0 = _mm256_loadu_ps(b.add(i));
-            sum = _mm256_fmadd_ps(a0, b0, sum);
-
-            let a1 = _mm256_loadu_ps(a.add(i + 8));
-            let b1 = _mm256_loadu_ps(b.add(i + 8));
-            sum = _mm256_fmadd_ps(a1, b1, sum);
-
-            let a2 = _mm256_loadu_ps(a.add(i + 16));
-            let b2 = _mm256_loadu_ps(b.add(i + 16));
-            sum = _mm256_fmadd_ps(a2, b2, sum);
-
-            let a3 = _mm256_loadu_ps(a.add(i + 24));
-            let b3 = _mm256_loadu_ps(b.add(i + 24));
-            sum = _mm256_fmadd_ps(a3, b3, sum);
-
-            i += 32;
-        }
-
-        while i + 8 <= len {
-            let a0 = _mm256_loadu_ps(a.add(i));
-            let b0 = _mm256_loadu_ps(b.add(i));
-            sum = _mm256_fmadd_ps(a0, b0, sum);
-            i += 8;
-        }
-
-        // Horizontal sum: 256→128→scalar
-        let hi = _mm256_extractf128_ps(sum, 1);
-        let lo = _mm256_castps256_ps128(sum);
-        let sum128 = _mm_add_ps(lo, hi);
-        let shuf = _mm_movehdup_ps(sum128);
-        let sums = _mm_add_ps(sum128, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        let result128 = _mm_add_ss(sums, shuf2);
-        let mut result = _mm_cvtss_f32(result128);
-
-        // Scalar tail
-        while i < len {
-            result += *a.add(i) * *b.add(i);
-            i += 1;
-        }
-
-        result
-    }
-}
-
-/// Weighted accumulation: out[i] += weight * v[i] for i in 0..len, using AVX2+FMA.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub(super) unsafe fn weighted_accum_f32_avx2(
-    out: *mut f32,
-    v: *const f32,
-    weight: f32,
-    len: usize,
-) {
-    unsafe {
-        use std::arch::x86_64::*;
-        let w = _mm256_set1_ps(weight);
-        let mut i = 0;
-
-        // 4x unrolled: 32 floats per iteration
-        while i + 32 <= len {
-            let o0 = _mm256_loadu_ps(out.add(i));
-            let v0 = _mm256_loadu_ps(v.add(i));
-            _mm256_storeu_ps(out.add(i), _mm256_fmadd_ps(w, v0, o0));
-
-            let o1 = _mm256_loadu_ps(out.add(i + 8));
-            let v1 = _mm256_loadu_ps(v.add(i + 8));
-            _mm256_storeu_ps(out.add(i + 8), _mm256_fmadd_ps(w, v1, o1));
-
-            let o2 = _mm256_loadu_ps(out.add(i + 16));
-            let v2 = _mm256_loadu_ps(v.add(i + 16));
-            _mm256_storeu_ps(out.add(i + 16), _mm256_fmadd_ps(w, v2, o2));
-
-            let o3 = _mm256_loadu_ps(out.add(i + 24));
-            let v3 = _mm256_loadu_ps(v.add(i + 24));
-            _mm256_storeu_ps(out.add(i + 24), _mm256_fmadd_ps(w, v3, o3));
-
-            i += 32;
-        }
-
-        while i + 8 <= len {
-            let o0 = _mm256_loadu_ps(out.add(i));
-            let v0 = _mm256_loadu_ps(v.add(i));
-            _mm256_storeu_ps(out.add(i), _mm256_fmadd_ps(w, v0, o0));
-            i += 8;
-        }
-
-        // Scalar tail
-        while i < len {
-            *out.add(i) += weight * *v.add(i);
-            i += 1;
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct QkvBias {
@@ -232,167 +63,6 @@ pub struct TransformerLayer {
     pub partition_ctx: Option<PartitionContext>,
 }
 
-impl TransformerLayer {
-    pub fn forward<C: KVCacheOps>(&self, args: LayerForwardArgs<C>) -> Result<()> {
-        let skip_attn = args.skip_attn;
-        let skip_mlp = args.skip_mlp;
-
-        // SWIFT: if both sub-layers are skipped, early return (identity)
-        if skip_attn && skip_mlp {
-            return Ok(());
-        }
-
-        let x = args.x;
-        let kv_cache = args.kv_cache;
-        let start_pos = args.start_pos;
-        let backend = args.backend;
-        let memory = args.memory;
-        let rms_norm_eps = args.rms_norm_eps;
-        let rope_theta = args.rope_theta;
-        let workspace = args.workspace;
-
-        let batch_size = x.shape().dims()[0];
-        let seq_len = x.shape().dims()[1];
-        let dim = x.shape().dims()[2];
-        let head_dim = args.head_dim;
-
-        let need_scores = args.need_scores;
-
-        if seq_len == 1
-            && let Some(ws) = workspace
-        {
-            return self.forward_gen(ForwardGenArgs {
-                x,
-                kv_cache,
-                start_pos,
-                backend,
-                memory,
-                ws,
-                rms_norm_eps,
-                rope_theta,
-                need_scores,
-                head_dim,
-                profiler: args.profiler,
-                skip_attn,
-                skip_mlp,
-                rms_norm_add_unit: args.rms_norm_add_unit,
-                use_gelu_tanh: args.use_gelu_tanh,
-                is_local_attn: args.is_local_attn,
-                local_attn_window: args.local_attn_window,
-                layer_idx: args.layer_id,
-                is_last_layer: args.is_last_layer,
-            });
-        }
-
-        self.forward_prefill(
-            x,
-            kv_cache,
-            start_pos,
-            backend,
-            memory,
-            rms_norm_eps,
-            rope_theta,
-            need_scores,
-            head_dim,
-            batch_size,
-            seq_len,
-            dim,
-            skip_attn,
-            skip_mlp,
-            args.rms_norm_add_unit,
-            args.use_gelu_tanh,
-            args.is_local_attn,
-            args.local_attn_window,
-            None, // prefill_ws: passed separately via forward_into dispatch
-            0,    // layer_idx: unknown in this path (no variance collector)
-            None, // variance_collector: not available here
-            args.profiler,
-        )
-    }
-
-    fn alloc_temp(
-        &self,
-        shape: Vec<usize>,
-        memory: &dyn Memory,
-        backend: &Arc<dyn Backend>,
-    ) -> Result<Tensor> {
-        let size: usize = shape.iter().product();
-        let buf = memory.alloc(size * 4, DType::F32)?;
-        Ok(Tensor::new(Shape::new(shape), buf, backend.clone()))
-    }
-}
-
-pub struct ForwardGenArgs<'a, C: KVCacheOps> {
-    pub x: &'a mut Tensor,
-    pub kv_cache: &'a mut C,
-    pub start_pos: usize,
-    pub backend: &'a Arc<dyn Backend>,
-    pub memory: &'a dyn Memory,
-    pub ws: &'a mut crate::layers::workspace::LayerWorkspace,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    /// When true, compute attention scores into ws.scores even for non-F32 KV cache.
-    /// Required for H2O/H2O+ score accumulation with Q4_0/F16 KV cache.
-    pub need_scores: bool,
-    pub head_dim: usize,
-    /// Optional per-op profiler for timing breakdown.
-    pub profiler: Option<&'a mut dyn OpInstrument>,
-    /// SWIFT: skip attention sub-layer (identity pass).
-    pub skip_attn: bool,
-    /// SWIFT: skip MLP/FFN sub-layer (identity pass).
-    pub skip_mlp: bool,
-    /// Gemma3: true → `x * (1 + w) / rms(x)`, false → `x * w / rms(x)` (Llama/Qwen2).
-    pub rms_norm_add_unit: bool,
-    /// Gemma3: true → GELU_tanh activation, false → SiLU (Llama/Qwen2).
-    pub use_gelu_tanh: bool,
-    /// Gemma3: whether this layer uses local (sliding window) attention.
-    pub is_local_attn: Option<bool>,
-    /// Gemma3: local attention window size (sliding_window value).
-    pub local_attn_window: Option<usize>,
-    /// 0-based layer index. Used by `LLMRS_PARTITION_FUSED_MERGE` to decide
-    /// whether the layer should consume the previous layer's partition
-    /// partial buffers via `fused_norm_merge` (layer_idx > 0).
-    pub layer_idx: usize,
-    /// True when this is the final transformer layer. Used by
-    /// `LLMRS_PARTITION_FUSED_MERGE` to keep the legacy merge + residual
-    /// add path so the final norm + lm_head see the fully accumulated `x`.
-    pub is_last_layer: bool,
-}
-
-pub struct LayerForwardArgs<'a, C: KVCacheOps> {
-    pub x: &'a mut Tensor,
-    pub kv_cache: &'a mut C,
-    pub start_pos: usize,
-    pub backend: &'a Arc<dyn Backend>,
-    pub memory: &'a dyn Memory,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    pub workspace: Option<&'a mut crate::layers::workspace::LayerWorkspace>,
-    pub need_scores: bool,
-    pub head_dim: usize,
-    /// Optional per-op profiler for timing breakdown.
-    pub profiler: Option<&'a mut dyn OpInstrument>,
-    /// Layer index (0-based). Used for SWIFT layer skip.
-    pub layer_id: usize,
-    /// If true, skip the attention sub-layer (identity pass).
-    pub skip_attn: bool,
-    /// If true, skip the MLP/FFN sub-layer (identity pass).
-    pub skip_mlp: bool,
-    /// Gemma3: true → `x * (1 + w) / rms(x)`, false → `x * w / rms(x)` (Llama/Qwen2).
-    pub rms_norm_add_unit: bool,
-    /// Gemma3: true → GELU_tanh activation, false → SiLU (Llama/Qwen2).
-    pub use_gelu_tanh: bool,
-    /// Gemma3: whether this layer uses local (sliding window) attention.
-    pub is_local_attn: Option<bool>,
-    /// Gemma3: local attention window size (sliding_window value).
-    pub local_attn_window: Option<usize>,
-    /// True when this is the final transformer layer. Consumed by
-    /// `forward_gen` under `LLMRS_PARTITION_FUSED_MERGE` to keep the legacy
-    /// post-FFN residual add on the last layer so the final norm + lm_head
-    /// see the fully accumulated `x`.
-    pub is_last_layer: bool,
-}
-
 // OpProfiler/OpInstrument: OpProfiler is re-exported for backward compat (constructor callers).
 // OpInstrument is the trait object type used in LayerForwardArgs/LayerGenForwardArgs.profiler.
 
@@ -403,6 +73,7 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps> {
 #[allow(clippy::needless_range_loop, clippy::unnecessary_literal_unwrap)]
 mod tests {
     use super::*;
+    use crate::backend::cpu::CpuBackend;
     use crate::memory::host::shared::SharedBuffer;
 
     /// Replicate the softmax computation used in forward_gen (F32 inline path)

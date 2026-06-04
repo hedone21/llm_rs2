@@ -43,10 +43,12 @@ use serde_json::json;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
+use llm_rs2::format::KVCacheFormat;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
+use llm_rs2::pressure::standard_format::StandardFormat;
 use llm_rs2::session::forward::{ModelForward, alloc_standard_kv_caches};
 use llm_rs2::session::{DecodeLoopBuilder, Forward, GreedySampler, StepCtx};
 use llm_rs2::shape::Shape;
@@ -288,7 +290,7 @@ fn impl_run_direct(
         max_seq_len,
     };
     let initial_capacity = max_seq_len.next_power_of_two().min(max_seq_len);
-    let mut kv = alloc_standard_kv_caches(
+    let kv = alloc_standard_kv_caches(
         model,
         backend.clone(),
         memory.clone(),
@@ -296,6 +298,14 @@ fn impl_run_direct(
         max_seq_len,
         kv_dtype,
     )?;
+    // Phase α-K Step 5-F: production(`ModelForward`)과 동일하게 KVCache 를 StandardFormat
+    // 으로 wrap 한 뒤 `forward_into_fmt`(trait object) 경로로 측정한다. OLD `forward_into<C>`
+    // 폐기에 맞춘 미러.
+    let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = kv
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| Arc::new(StandardFormat::new(i, c)) as Arc<dyn KVCacheFormat>)
+        .collect();
 
     let prefill_input = upload_prompt(backend, &cpu_backend, prompt)?;
     let prefill_logits_buf = memory.alloc(vocab * 4, DType::F32)?;
@@ -324,23 +334,20 @@ fn impl_run_direct(
     let t0 = Instant::now();
 
     // Prefill — paradigm 통일: read last logits and argmax for first_token.
-    model.forward_into(TransformerModelForwardArgs {
+    model.forward_into_fmt(TransformerModelForwardFmtArgs {
         input_tokens: &prefill_input,
         start_pos: 0,
-        kv_caches: &mut kv,
+        fmts: &dyn_fmts,
         backend,
         memory: memory.as_ref(),
         logits_out: &mut prefill_logits,
         x_gen: None,
         workspace: None,
-        prefill_workspace: None,
         score_accumulator: None,
-        profiler: None,
         skip_config: None,
         importance_collector: None,
         logits_last_only: true,
-        variance_collector: None,
-        layer_boundary_hook: None,
+        cache_self_need_scores: false,
     })?;
     let prefill_logits_host = read_logits(backend, &prefill_logits, vocab)?;
     let first_token = greedy_argmax(&prefill_logits_host);
@@ -352,23 +359,20 @@ fn impl_run_direct(
 
     while tokens.len() < budget {
         backend.write_buffer(&mut decode_input, &prev.to_ne_bytes())?;
-        model.forward_into(TransformerModelForwardArgs {
+        model.forward_into_fmt(TransformerModelForwardFmtArgs {
             input_tokens: &decode_input,
             start_pos: pos,
-            kv_caches: &mut kv,
+            fmts: &dyn_fmts,
             backend,
             memory: memory.as_ref(),
             logits_out: &mut decode_logits,
             x_gen: Some(&mut x_gen),
             workspace: Some(&mut ws),
-            prefill_workspace: None,
             score_accumulator: None,
-            profiler: None,
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
-            variance_collector: None,
-            layer_boundary_hook: None,
+            cache_self_need_scores: false,
         })?;
         let logits = read_logits(backend, &decode_logits, vocab)?;
         let next = greedy_argmax(&logits);
