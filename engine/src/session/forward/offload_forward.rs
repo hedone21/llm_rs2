@@ -22,6 +22,7 @@ use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::pressure::offload::OffloadKVCache;
 use crate::pressure::offload::prefetch::PrefetchController;
 use crate::pressure::offload::raw_store::RawStore;
+use crate::pressure::offload_format::OffloadFormat;
 use crate::session::traits::{Forward, StepCtx};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -106,6 +107,37 @@ impl OffloadForward {
         &mut self.kv_caches
     }
 
+    /// `self.kv_caches` 를 `Vec<Arc<OffloadFormat>>` 로 transient wrap (Step 5-B).
+    ///
+    /// `EvalCacheKind` round-trip 미러 — `mem::take` 로 `self.kv_caches` 를 비우고(turn2 prefill 재진입
+    /// 안전) `OffloadFormat` 으로 감싼다. cross-token 상태(retained attn_buf / gpu_k_buf / current_pos /
+    /// store_behind)는 `OffloadKVCache` 필드라 wrap/unwrap 을 가로질러 보존된다.
+    fn wrap_caches(&mut self) -> Vec<Arc<OffloadFormat>> {
+        std::mem::take(&mut self.kv_caches)
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| Arc::new(OffloadFormat::new(i, c)))
+            .collect()
+    }
+
+    /// `wrap_caches` 의 역 — `forward_into_offload_fmt` 종료 후 concrete `OffloadKVCache` 복귀.
+    ///
+    /// `forward_into_offload_fmt` 의 `DrainGuard` 가 **모든 반환 경로(정상·에러·패닉)** 에서 preload
+    /// worker 의 raw-ptr deref/lock 완료를 보장하므로(B-1), 여기 도달 시 어떤 worker 도 OffloadFormat 을
+    /// 만지지 않는다 → `Arc::try_unwrap` strong_count=1 → 항상 성공. `expect` 는 그 불변식의 방어적
+    /// assertion 이다(정상 흐름에선 발화 불가 — worker 는 raw-ptr 라 strong count 에 안 잡힘).
+    fn unwrap_caches(&mut self, wrapped: Vec<Arc<OffloadFormat>>) {
+        self.kv_caches = wrapped
+            .into_iter()
+            .map(|a| {
+                Arc::try_unwrap(a)
+                    .ok()
+                    .expect("offload fmt unwrap: dangling Arc (preload not drained)")
+                    .into_inner()
+            })
+            .collect();
+    }
+
     /// prefill용 입력 텐서를 백엔드에 업로드한다.
     fn build_input_tensor(&self, tokens: &[u32]) -> Result<Tensor> {
         let seq_len = tokens.len();
@@ -153,27 +185,56 @@ impl Forward for OffloadForward {
         // raw pointer는 현재 stack frame 내에서만 역참조된다.
         let memory: &dyn Memory = unsafe { &*memory_ref };
 
-        self.model.forward_into_offload(
-            TransformerModelForwardArgs {
-                input_tokens: &input_tensor,
-                start_pos,
-                kv_caches: &mut self.kv_caches,
-                backend: &backend,
-                memory,
-                logits_out: &mut self.logits_prefill_last,
-                x_gen: None,
-                workspace: None,
-                prefill_workspace: None,
-                score_accumulator: None,
-                profiler: None,
-                skip_config: None,
-                importance_collector: None,
-                logits_last_only: true,
-                variance_collector: None,
-                layer_boundary_hook: None,
-            },
-            &mut self.prefetch,
-        )?;
+        if offload_fmt_gate_enabled() {
+            // Phase α-K Step 5-B: transient wrap (EvalCacheKind round-trip 미러).
+            let wrapped = self.wrap_caches();
+            let result = self.model.forward_into_offload_fmt(
+                TransformerModelForwardArgs {
+                    input_tokens: &input_tensor,
+                    start_pos,
+                    kv_caches: &mut [],
+                    backend: &backend,
+                    memory,
+                    logits_out: &mut self.logits_prefill_last,
+                    x_gen: None,
+                    workspace: None,
+                    prefill_workspace: None,
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None,
+                    importance_collector: None,
+                    logits_last_only: true,
+                    variance_collector: None,
+                    layer_boundary_hook: None,
+                },
+                &wrapped,
+                &mut self.prefetch,
+            );
+            self.unwrap_caches(wrapped);
+            result?; // unwrap 후 ? — panic-safe 복귀.
+        } else {
+            self.model.forward_into_offload(
+                TransformerModelForwardArgs {
+                    input_tokens: &input_tensor,
+                    start_pos,
+                    kv_caches: &mut self.kv_caches,
+                    backend: &backend,
+                    memory,
+                    logits_out: &mut self.logits_prefill_last,
+                    x_gen: None,
+                    workspace: None,
+                    prefill_workspace: None,
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None,
+                    importance_collector: None,
+                    logits_last_only: true,
+                    variance_collector: None,
+                    layer_boundary_hook: None,
+                },
+                &mut self.prefetch,
+            )?;
+        }
 
         self.read_logits(&self.logits_prefill_last)
     }
@@ -187,27 +248,56 @@ impl Forward for OffloadForward {
         let memory_ref: *const dyn Memory = self.memory.as_ref();
         let memory: &dyn Memory = unsafe { &*memory_ref };
 
-        self.model.forward_into_offload(
-            TransformerModelForwardArgs {
-                input_tokens: &self.decode_input,
-                start_pos: ctx.pos,
-                kv_caches: &mut self.kv_caches,
-                backend: &backend,
-                memory,
-                logits_out: &mut self.logits_decode,
-                x_gen: Some(&mut self.decode_x_gen),
-                workspace: Some(&mut self.decode_workspace),
-                prefill_workspace: None,
-                score_accumulator: None,
-                profiler: None,
-                skip_config: None,
-                importance_collector: None,
-                logits_last_only: false,
-                variance_collector: None,
-                layer_boundary_hook: None,
-            },
-            &mut self.prefetch,
-        )?;
+        if offload_fmt_gate_enabled() {
+            // Phase α-K Step 5-B: transient wrap (EvalCacheKind round-trip 미러).
+            let wrapped = self.wrap_caches();
+            let result = self.model.forward_into_offload_fmt(
+                TransformerModelForwardArgs {
+                    input_tokens: &self.decode_input,
+                    start_pos: ctx.pos,
+                    kv_caches: &mut [],
+                    backend: &backend,
+                    memory,
+                    logits_out: &mut self.logits_decode,
+                    x_gen: Some(&mut self.decode_x_gen),
+                    workspace: Some(&mut self.decode_workspace),
+                    prefill_workspace: None,
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None,
+                    importance_collector: None,
+                    logits_last_only: false,
+                    variance_collector: None,
+                    layer_boundary_hook: None,
+                },
+                &wrapped,
+                &mut self.prefetch,
+            );
+            self.unwrap_caches(wrapped);
+            result?; // unwrap 후 ? — panic-safe 복귀.
+        } else {
+            self.model.forward_into_offload(
+                TransformerModelForwardArgs {
+                    input_tokens: &self.decode_input,
+                    start_pos: ctx.pos,
+                    kv_caches: &mut self.kv_caches,
+                    backend: &backend,
+                    memory,
+                    logits_out: &mut self.logits_decode,
+                    x_gen: Some(&mut self.decode_x_gen),
+                    workspace: Some(&mut self.decode_workspace),
+                    prefill_workspace: None,
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None,
+                    importance_collector: None,
+                    logits_last_only: false,
+                    variance_collector: None,
+                    layer_boundary_hook: None,
+                },
+                &mut self.prefetch,
+            )?;
+        }
 
         self.read_logits(&self.logits_decode)
     }
@@ -227,6 +317,16 @@ impl Forward for OffloadForward {
         }
         Ok(())
     }
+}
+
+/// `LLMRS_OFFLOAD_FMT` 게이트 (Phase α-K Step 5-B, 기본 OFF). OnceLock 캐시 → per-call 비용 ~0.
+///
+/// ON 시 `OffloadForward` 가 `forward_into_offload_fmt`(KVCacheFormat trait object) 로 전환한다.
+/// device 검증 전용 임시 게이트 — production 무회귀 우선이라 CLI Args 표면 미오염(env only).
+/// `model_forward.rs::standard_format_gate_enabled`(LLMRS_KV_FMT) 미러.
+fn offload_fmt_gate_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("LLMRS_OFFLOAD_FMT").is_some())
 }
 
 fn workspace_config_for(model: &TransformerModel, max_seq_len: usize) -> WorkspaceConfig {

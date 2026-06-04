@@ -130,6 +130,18 @@ impl OffloadKVCache {
         self.gpu_memory = Some(memory);
     }
 
+    /// Allocator for non-F32 cast scratch in `OffloadFormat` (Phase α-K Step 5-B).
+    ///
+    /// Returns the GPU `Memory` handle when a GPU backend is wired (so cast buffers
+    /// land in device memory the attention path can read), `None` on CPU-only runs
+    /// (the caller falls back to a host `Galloc`). `OffloadKVCache` has no `KVCache::memory()`
+    /// equivalent, so this getter is the single seam used to allocate cast tensors —
+    /// keeps `KVCacheFormat::write_kv` signature free of a `memory` parameter
+    /// (format ⊥ hardware), mirroring `StandardFormat`'s use of `KVCache::memory()`.
+    pub(crate) fn cast_memory(&self) -> Option<Arc<dyn Memory>> {
+        self.gpu_memory.clone()
+    }
+
     /// Migrate data from an existing KVCache (raw buffer copy).
     /// The source KVCache's data is read and stored in the offload store.
     pub fn migrate_from_raw(

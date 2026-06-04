@@ -4711,6 +4711,18 @@ fn run_offload(
         })
         .collect();
 
+    // Phase α-K Step 5-B: offload **decode** fmt 게이트 (기본 OFF). ON 시 decode 가
+    // `forward_into_offload_fmt`(KVCacheFormat trait object) 로 전환 — device 게이트 매체
+    // (5-A: legacy offload 한시 보존). OFF 는 OLD 경로(decode=forward_into_offload) byte-불변.
+    // prefill 은 항상 forward_into(정상 경로) — offload preload prefill 버그 회피. host/device
+    // f16 ON==OFF bit-identical 로 decode arm 을 검증한다.
+    let offload_fmt_on = std::env::var_os("LLMRS_OFFLOAD_FMT").is_some();
+    if offload_fmt_on {
+        eprintln!(
+            "[Offload] LLMRS_OFFLOAD_FMT ON → decode = forward_into_offload_fmt (KVCacheFormat trait object)"
+        );
+    }
+
     let vocab_size = model.config.vocab_size;
     let hidden_size = model.config.hidden_size;
     let q_dim = model.config.num_attention_heads * head_dim;
@@ -4780,7 +4792,11 @@ fn run_offload(
             backend.clone(),
         );
 
-        // Prefill uses standard forward_into (no prefetch needed for batch)
+        // Prefill uses standard forward_into (no prefetch needed for batch).
+        // ★offload fmt 게이트는 prefill 에 적용하지 않는다 — `forward_into_offload`(preload pool)는
+        // 빈 캐시(current_pos=0) preload 가 `preloaded=true` 로 설정해 get_view 가 store 로드를
+        // 건너뛰는 사전 존재 버그가 있어 prefill 에 부적합(아래 decode 만 fmt 게이트). legacy 는
+        // 정상 경로(forward_into prefill)를 유지하고, fmt 검증은 decode arm 으로 한정한다.
         model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos,
@@ -4885,28 +4901,73 @@ fn run_offload(
         // - non-retained layers: release_buffers() sets preloaded=false
 
         let fwd_start = std::time::Instant::now();
-        model.forward_into_offload(
-            TransformerModelForwardArgs {
-                input_tokens: &gen_input,
-                start_pos,
-                kv_caches: &mut kv_caches,
-                backend,
-                memory: memory.as_ref(),
-                logits_out: &mut logits,
-                x_gen: Some(&mut x_gen),
-                workspace: Some(&mut gen_ws),
-                score_accumulator: None,
-                profiler: None,
-                skip_config: None,
-                importance_collector: None,
-                logits_last_only: false,
-                variance_collector: None,
-                prefill_workspace: None,
+        if offload_fmt_on {
+            // Step 5-B fmt 경로: transient OffloadFormat wrap (OffloadForward 게이트 미러).
+            // cross-token 상태(retained attn_buf / gpu_k_buf / current_pos)는 OffloadKVCache
+            // 필드라 wrap/unwrap 을 가로질러 보존된다. 모든 preload task 가 forward 종료 전
+            // drain 되므로 Arc::try_unwrap 이 성공한다(dangling 시 expect panic 차단).
+            use llm_rs2::pressure::offload_format::OffloadFormat;
+            let wrapped: Vec<Arc<OffloadFormat>> = std::mem::take(&mut kv_caches)
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| Arc::new(OffloadFormat::new(i, c)))
+                .collect();
+            let result = model.forward_into_offload_fmt(
+                TransformerModelForwardArgs {
+                    input_tokens: &gen_input,
+                    start_pos,
+                    kv_caches: &mut [],
+                    backend,
+                    memory: memory.as_ref(),
+                    logits_out: &mut logits,
+                    x_gen: Some(&mut x_gen),
+                    workspace: Some(&mut gen_ws),
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None,
+                    importance_collector: None,
+                    logits_last_only: false,
+                    variance_collector: None,
+                    prefill_workspace: None,
+                    layer_boundary_hook: None,
+                },
+                &wrapped,
+                &mut prefetch,
+            );
+            kv_caches = wrapped
+                .into_iter()
+                .map(|a| {
+                    Arc::try_unwrap(a)
+                        .ok()
+                        .expect("offload fmt unwrap: dangling Arc (preload not drained)")
+                        .into_inner()
+                })
+                .collect();
+            result?;
+        } else {
+            model.forward_into_offload(
+                TransformerModelForwardArgs {
+                    input_tokens: &gen_input,
+                    start_pos,
+                    kv_caches: &mut kv_caches,
+                    backend,
+                    memory: memory.as_ref(),
+                    logits_out: &mut logits,
+                    x_gen: Some(&mut x_gen),
+                    workspace: Some(&mut gen_ws),
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None,
+                    importance_collector: None,
+                    logits_last_only: false,
+                    variance_collector: None,
+                    prefill_workspace: None,
 
-                layer_boundary_hook: None,
-            },
-            &mut prefetch,
-        )?;
+                    layer_boundary_hook: None,
+                },
+                &mut prefetch,
+            )?;
+        }
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
 

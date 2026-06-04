@@ -16,6 +16,7 @@ pub mod kivi_format;
 pub mod kv_cache;
 pub mod kv_migrate;
 pub mod offload;
+pub mod offload_format;
 pub mod standard_format;
 pub mod weights;
 
