@@ -1,9 +1,32 @@
-# Handoff: α-K BC Step 3 ((3p) ④-a) 코드+host게이트 완료 → device 게이트(=acceptance)
+# Handoff: α-K BC Step 3 ((3p) ④-a) — device 게이트 ✅ COMPLETE → Step 4
 
-**작성**: 2026-06-04 (메인 세션)
-**HEAD**: `659b130a` 설계 + (본 갱신 = 구현 커밋 예정)
-**브랜치**: `master` (origin push 미실행 — 사용자 요청 시)
-**다음 세션 진입 문장**: **"BC Step 3 device 게이트"** (device-capable 세션: S25 OpenCL + Jetson CUDA 필요 — 코드 완성, **게이트만** 잔여)
+**작성**: 2026-06-04 (메인 세션) / **갱신**: 2026-06-04 (device 게이트 세션, S25 실측)
+**HEAD**: `ae9fc460` fix(non-opencl 빌드 복구) ← `004147bf` 구현 ← `659b130a` 설계
+**브랜치**: `master` — **`ae9fc460` push 미실행** (사용자 승인 대기; ⚠️ origin/master 는 `004147bf` 에서 non-opencl 빌드 깨진 상태)
+**다음 세션 진입 문장**: **"BC Step 4"** (LLMRS_KV_FMT 기본화 결정 + argus_cli 전환)
+
+---
+
+## ★ Step 3 device 게이트 결과 (2026-06-04 S25 실측) — PASS
+
+**S25 Adreno OpenCL (`-b opencl --opencl-rpcmem`) = (3p) ④-a flip 의 완전·충분한 acceptance. PASS.**
+
+| 게이트 | 결과 |
+|---|---|
+| **발화 확인** | F16 weight 모델(qwen2.5-1.5b-f16.gguf)에서 `LLMRS_KV_FMT=1` → "build_plan SUCCESS" + "KV_FMT ON" → `execute_plan_fmt` 발화 확정. KV dtype f16/f32/q4 전부 plan build SUCCESS. |
+| **bit-identical** | f16/f32/q4 KV 3 dtype 전부 **ON(execute_plan_fmt) ≡ OFF(execute<C>)** 32-tok 생성 텍스트 완전 일치. post-fix(`ae9fc460`) 재확인도 3/3 일치. |
+| **avg_tbt Δ≤+3%** | f16 KV ON/OFF 인터리브 n=7: ON median 59.61 / OFF 59.47 → **Δ +0.24%** (mean +0.53%). StandardFormat getter Mutex lock(56/tok)=무시 가능. vtable-free concrete-handle 설계 검증. |
+
+### ★ 게이트 spec 정정 2건 (handoff 원안 오류 — 코드 ground-truth 로 정정)
+1. **"5 KV: Sliding/H2O/D2O/KIVI/SnapKV" = 오류.** `is_standard_happy_path` 가 `eviction_policy()=="none"` 를 요구(`build_standard_loop.rs:60`) → eviction 켜면 happy path 이탈 → fallback decode loop(generic `execute_plan`, `LLMRS_KV_FMT` 무시) → ON≡OFF 가 vacuous → flip 미검증. **올바른 게이트 = no-eviction standard happy path × KV dtype(f16/f32/q4).** 발화엔 **F16 weight 모델 필수**(q4_0 weight → build_plan None(SOA q_img/qkv_bias) → dyn fallback, flip 미발화).
+2. **"Jetson CUDA" = flip 미적용.** `execute_plan_fmt`/`build_plan_fmt`/`execute_fmt` + step() plan 분기 전부 `#[cfg(feature="opencl")]`; CUDA 백엔드(cuda_embedded/cuda_pc)엔 plan 경로 부재. Jetson(cuda-embedded, opencl 없음) 빌드는 flip 코드 통째 컴파일 제외 → fmt-ON 도 `forward_into_fmt`(dyn, =(3c-fwd)) 로 빠짐. **(3p) flip acceptance = S25 OpenCL 단독.**
+
+### ★ Step 3 회귀 적발 + fix (`ae9fc460`)
+- 발화 분석 중 발견: `004147bf` 가 `standard_format.rs::plan_geometry()` 에서 opencl-게이트 타입 `crate::backend::opencl::plan::PlanGeometry` 를 cfg 게이트 없이 참조 → **non-opencl 빌드(Jetson cuda-embedded 등) E0433 컴파일 실패**.
+- fix: plan seam 3 메서드(plan_geometry/plan_advance/plan_lock) + unit test 3개 `#[cfg(feature="opencl")]` 게이트. opencl 빌드 no-op(16/16 PASS, S25 post-fix bit-identical 3/3). non-opencl `cargo check` PASS(구 FAIL).
+
+### 기존 이슈 플래그 (out of scope — flip 무관)
+- **f32 / q4 KV + F16 weight 모델 = degenerate 출력** ("Paris" 뒤 garbage/non-rendering). **OFF(untouched execute<C>)에도 동일** → flip 회귀 아님, 기존 production 이슈. f16 KV 만 coherent. 별도 트랙.
 
 > 설계 SSOT = **`design_alpha_k_3p_cut_2026_06_04.md`**(workflow `wf_2be25cb8-bc9`, 3 design + 3 verify, §구현 정정 포함). roadmap = `roadmap_alpha_k_bc_completion_2026_06_04.md` Step 3. arch SSOT = `arch/pipeline_stage_design_v2.md` §9.1 line 742~746/761 + §4.1 연혁 ④. ADR §8.3 정정1/2. 트랙 = [[project-pipeline-alpha-k]].
 
@@ -21,18 +44,18 @@
 | Step 2 (B-3 offload 분리) | ✅ | `936d0c99` host bit-identical |
 | Step 3 설계 | ✅ | `659b130a` + workflow `wf_2be25cb8-bc9`(V1→흡수, V2/V3 confirmed) |
 | **Step 3 구현 + host 게이트** | ✅ **완료** | 코드 commit(본 handoff 동행) — execute_fmt↔execute / build_plan_fmt↔build_plan / execute_plan_fmt↔execute_plan **기계적 diff=문서화 변경뿐**, 보호 함수 0 deletion, clippy/fmt clean, standard_format 16/16, 전체 lib 1235 pass/23 fail(전부 GPU부재) |
-| **Step 3 device 게이트** | ★**다음** | **device-gate(full)**: 5 KV × 32-tok bit-identical + avg_tbt Δ≤+3% (S25 `opencl --opencl-rpcmem` + Jetson CUDA, `LLMRS_KV_FMT=1`, n≥5 median tok0-inclusive) |
-| Step 4·5 | TODO | — |
+| **Step 3 device 게이트** | ✅ **PASS** | **S25 OpenCL** = 완전 acceptance. bit-identical f16/f32/q4 KV 3/3 (ON≡OFF) + avg_tbt Δ +0.24% median(n=7). 게이트 spec 2건 정정(eviction→KV dtype, Jetson N/A). 회귀 fix `ae9fc460`. |
+| Step 4·5 | ★**다음** | Step 4 = LLMRS_KV_FMT 기본화 결정 + argus_cli 전환. Step 5 = legacy 폐기 + KVCacheOps 삭제(B-2 OLD-chain forward_into_offload/run_chunked_prefill 포함). |
 
 ---
 
-## 다음 작업 (Step 3 device 게이트 — **코드 추가 없음, 게이트만**)
-1. **device 빌드 + 배포** (S25 OpenCL, Jetson CUDA). 코드는 master 에 이미 있음(`execute_fmt`/`build_plan_fmt`/wiring, 게이트 OFF default).
-2. **bit-identical**: `LLMRS_KV_FMT=1 legacy_generate -b opencl --opencl-rpcmem --greedy -n 32` (5 KV: Sliding/H2O/D2O/KIVI/SnapKV) 출력이 **OFF(=execute<C>)** 출력과 **token-id 완전 일치**. 단, plan path 발화 확인(`LLMRS_PLAN_TRACE` 로 execute_plan_fmt ok 카운트>0). reference baseline = legacy 출력.
-   - **★주의(게이트 발화)**: fmt-ON 시 plan 이 발화하려면 (a) build_plan_fmt 가 None 반환 안 해야(GPU+F16/지원 dtype), (b) `--no-gpu-plan` **미사용**(plan 켜야). MIN_EVICT_TOKENS 등 eviction 발화 조건은 (3c-evict) 트랙(eviction unwired 라도 decode bit-identical 게이트 성립).
-3. **avg_tbt Δ≤+3%**: ON vs OFF avg_tbt(n≥5 median, tok0-inclusive, cool-state). 회귀 +3% 초과 시 root-cause=StandardFormat getter layer당 Mutex lock(2/layer, vtable 아님). thermal 지배 주의(cool-state first-run).
-- **권장 역할**: Tester (device-gate full + avg_tbt 실측). 코드 변경 불필요(PASS 시); 회귀 시 **(3p)만 revert**(execute_fmt/build_plan_fmt/wiring 제거, Step 1·2 cold cluster 유지, 전역 원칙 5).
-- **★device 에서 특히 검증할 의미 변경 1건**: geometry **단일 lock 스냅샷**(`plan_geometry()` 1회)이 execute<C> 의 per-getter 호출과 bit-identical 인지(host 분석상 루프 본문 첫 mutation 이전 스냅샷이라 동일값, 단 device 실측으로 확정). 나머지는 순수 mechanical substitution.
+## 다음 작업 (Step 4 — LLMRS_KV_FMT 기본화 결정 + argus_cli 전환)
+> Step 3 device 게이트 PASS 로 (3p) ④-a flip 이 production-equivalent(bit-identical) + perf-neutral(+0.24%) 임이 device 실측 확정됨. 단 게이트는 여전히 `LLMRS_KV_FMT` OFF default → production hot path 는 아직 `execute<C>`.
+1. **LLMRS_KV_FMT 기본화 결정** (사용자/Architect): flip 을 production-default(ON)로 승격할지. S25 OpenCL 한정 검증이므로 다른 Adreno/플랫폼 추가 검증 필요 여부 판단. 기본화 시 `is_fmt_gate_on()` default 반전 + 회귀 모니터링.
+2. **argus_cli 전환**: 신규 single-prompt bin(`run_standard_happy_path`)도 동일 flip 경로 사용 확인 + 게이트.
+3. **Step 5 차단자**: legacy 폐기 + `KVCacheOps` 완전 삭제. B-2 OLD-chain 잔여(`forward_into_offload`/`run_chunked_prefill`)는 fmt 이주(Option B, device GPU 재검증 필수) 선결.
+- **권장 역할**: Architect(기본화 결정/범위) → Implementer(배선).
+- **★Step 3 회귀 시 처방**: (3p)만 revert(`execute_fmt`/`build_plan_fmt`/`execute_plan_fmt`/wiring + standard_format plan seam 제거), Step 1·2 cold cluster 유지. fix `ae9fc460` 는 빌드 복구라 유지.
 
 ---
 

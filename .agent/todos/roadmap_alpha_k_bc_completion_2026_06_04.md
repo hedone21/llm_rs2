@@ -77,7 +77,8 @@
 ---
 
 ## [P1] Step 3 — (3p) ④-a hot-path flip (plan path concrete-handle)
-- **Status**: **설계 ✅ + 구현 host-gated ✅** (`design_alpha_k_3p_cut_2026_06_04.md`, 설계 workflow `wf_2be25cb8-bc9`) → **device 게이트만 잔여**(=acceptance). 코드 작성 완료(additive + `LLMRS_KV_FMT` OFF, production-default byte-불변): `plan.rs::execute_fmt`(execute<C> copy-fork) + `StandardFormat::plan_geometry/plan_advance/plan_lock` + `transformer.rs::build_plan_fmt/execute_plan_fmt` + `model_forward` wiring(fmt-ON plan-on-handle→dyn 폴백). 메인 세션 재검증: 3 함수 기계적 diff=문서화된 변경뿐(byte-identical), 보호 함수 0 deletion, clippy/fmt clean, standard_format 16/16, 전체 lib 1235 pass/23 fail(전부 GPU부재). **acceptance=device 전용**(plan GPU-only=host 휴면): 5 KV × 32-tok bit-identical + avg_tbt Δ≤+3% (S25+Jetson). 구현 정정 2건(PlanCacheHandle trait 미도입=직접 Arc<StandardFormat> / plan_lock guard seam) — 설계 문서 §구현 정정.
+- **Status**: ✅ **COMPLETE — device 게이트 PASS** (S25 OpenCL, 2026-06-04). **S25 Adreno `opencl --opencl-rpcmem` = (3p) ④-a flip 의 완전·충분 acceptance** — flip 은 **opencl 전용**(CUDA 백엔드 plan 경로 부재; `execute_plan_fmt`/`build_plan_fmt`/`execute_fmt` + step plan 분기 전부 `#[cfg(opencl)]`). F16 weight 모델에서 `LLMRS_KV_FMT=1` → "build_plan SUCCESS" 발화 확정, **bit-identical f16/f32/q4 KV 3/3 ON(execute_plan_fmt)≡OFF(execute<C>)**, **avg_tbt Δ +0.24% median(n=7)** ≪ +3%(lock 56/tok 무시 가능, vtable-free 검증). **게이트 spec 2건 정정**: (1) "5 KV=eviction policy"=오류 — eviction 켜면 `is_standard_happy_path` false→fallback loop(`LLMRS_KV_FMT` 무시)→ON≡OFF vacuous; 올바른 변이=**KV dtype + F16 weight 필수**(q4_0 weight→build_plan None→dyn fallback). (2) "Jetson CUDA"=flip 미적용(opencl 전용). **회귀 적발+fix 2건**: `004147bf` 가 standard_format plan_geometry 에서 비-게이트 opencl 타입 참조→non-opencl 빌드 break → **`ae9fc460`**(plan seam cfg(opencl) 게이트); 기존 `:3859` map_weights_for_cpu 마이그레이션 누락(3afcc47b 기원, Step 3 무관) → **`26e77908`**(Jetson cuda 빌드 복구, 컴파일+deploy 확인). 기존 이슈 플래그: f32/q4 KV + F16 weight = degenerate 출력(OFF 에도 동일=flip 무관). **다음 = Step 4(LLMRS_KV_FMT 기본화 결정)**.
+  - (구판) **설계 ✅ + 구현 host-gated ✅** (`design_alpha_k_3p_cut_2026_06_04.md`, 설계 workflow `wf_2be25cb8-bc9`). 코드: `plan.rs::execute_fmt`(execute<C> copy-fork) + `StandardFormat::plan_geometry/plan_advance/plan_lock`(현 cfg(opencl) 게이트) + `transformer.rs::build_plan_fmt/execute_plan_fmt` + `model_forward` wiring. additive + `LLMRS_KV_FMT` OFF default(production hot 은 여전히 `execute<C>` — 기본화는 Step 4).
 - **Sprint**: next
 - **Dependencies**: Step 1 (B-2 prefill flip — plan 평가가 forward chain 정합 필요) + Step 2 권장 선행. **(3d) plan 평가 = (3p) 분기 결정 → flip 확정**(SSOT line 761 BC 결정 + ①-b S25 device PASS 정합). (3p) 실작업 = step() fmt/plan 상호배타 해소. World A eviction seam(F1)은 hard 선결 아님(decode_loop try_evict 0건).
 - **설계 결론(`design_alpha_k_3p_cut`)**: ④-a = plan-local 최소 trait `PlanCacheHandle`(plan_geometry 1 lock + plan_advance 1 lock + plan_kv_bufs read seam) + concrete-handle monomorphize(`execute_fmt<H>`, **vtable 0**). flip 표면 4개 = execute(C 6지점) + StandardFormat/KIVIFormat inherent + **build_plan(★V1 적대검증이 잡은 누락 — KVCache pub k_buffer/v_buffer 직접 접근 :2577/2760 → fmt seam 필요)** + ModelForward wiring(fmt/plan 상호배타 해소). perf = neutral-or-slightly-worse(2 lock/layer, ~32 lock/tok, <0.01% TBT 예상·device 실측). ④-b(AttentionVariant 평탄화) defer 확정(attention=enum static, C 미접촉). host scaffold = device 라운드 동행(독립 land 안 함 — orphan dead_code 위험 + revert 격리).
@@ -127,10 +128,10 @@
 
 ```
 (3c-fwd ✅) ─┐
-(3c-evict ✅)─┴→ Step 1 ✅ (B-2 prefill + B-4 eval, cold) ─┬→ Step 3 ((3p) B-1 plan, HOT crux) ★다음
+(3c-evict ✅)─┴→ Step 1 ✅ (B-2 prefill + B-4 eval, cold) ─┬→ Step 3 ✅ ((3p) B-1 plan, HOT crux) — S25 device PASS
                 Step 2 ✅ (B-3 offload 분리, cold) ───────┘        │
                                                                  ↓
-                                          Step 4 (device-gate → argus_cli)
+                                          Step 4 ★다음 (LLMRS_KV_FMT 기본화 + device-gate → argus_cli)
                                                                  ↓
                                           Step 5 (legacy 폐기 + B-2 OLD-chain 잔여 migrate
                                                   [forward_into_offload/run_chunked_prefill]
