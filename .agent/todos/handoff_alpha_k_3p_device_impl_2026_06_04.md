@@ -3,7 +3,7 @@
 **작성**: 2026-06-04 (메인 세션) / **갱신**: 2026-06-04 (device 게이트 세션, S25 실측)
 **HEAD**: `ae9fc460` fix(non-opencl 빌드 복구) ← `004147bf` 구현 ← `659b130a` 설계
 **브랜치**: `master` — **`ae9fc460` push 미실행** (사용자 승인 대기; ⚠️ origin/master 는 `004147bf` 에서 non-opencl 빌드 깨진 상태)
-**다음 세션 진입 문장**: **"BC Step 5"** (legacy 폐기 + B-2 OLD-chain 잔여 migrate + KVCacheOps 삭제). **Step 3·4 모두 ✅ COMPLETE** (아래).
+**다음 세션 진입 문장**: **"BC Step 5 구현"** (설계 ✅ `design_alpha_k_step5_2026_06_04.md` 완료 → 5-A 거취 확정 → 5-C/5-D host → 5-B offload device). **Step 3·4 ✅ COMPLETE + Step 5 설계 ✅** (아래).
 
 ---
 
@@ -46,16 +46,18 @@
 | **Step 3 구현 + host 게이트** | ✅ **완료** | 코드 commit(본 handoff 동행) — execute_fmt↔execute / build_plan_fmt↔build_plan / execute_plan_fmt↔execute_plan **기계적 diff=문서화 변경뿐**, 보호 함수 0 deletion, clippy/fmt clean, standard_format 16/16, 전체 lib 1235 pass/23 fail(전부 GPU부재) |
 | **Step 3 device 게이트** | ✅ **PASS** | **S25 OpenCL** = 완전 acceptance. bit-identical f16/f32/q4 KV 3/3 (ON≡OFF) + avg_tbt Δ +0.24% median(n=7). 게이트 spec 2건 정정(eviction→KV dtype, Jetson N/A). 회귀 fix `ae9fc460`+`26e77908`. |
 | **Step 4 (device-gate → argus_cli)** | ✅ **PASS** | argus_cli CLI 갭 0(Args+happy-path 공유). S25: argus OFF≡legacy OFF 3/3(baseline 연속성) + argus ON≡OFF 3/3(fmt 게이트) + execute_plan_fmt 발화 확인 + avg_tbt Δ+0.10%. 게이트 명령=roadmap Step 4 §canonical. |
-| Step 5 | ★**다음** | legacy 폐기 + B-2 OLD-chain 잔여(forward_into_offload/run_chunked_prefill) fmt 이주 + KVCacheOps trait 삭제. ★argus 는 happy-path 전용 → 비-happy 모드 family bin 이주/drop 결정 선결. |
+| **Step 5 설계** | ✅ **완료** | `design_alpha_k_step5_2026_06_04.md`(워크플로 `wf_79f8158a-015`, blocking 4 반영). 갈래 A(inherent-only) + 6 증분(5-A→5-C∥5-D→5-B device→5-E→5-F 비가역). ★OLD-chain 소비자 **3개**(offload/chunked-prefill + **KiviForward 신규**). ★offload device 매체 부재(BL-1)→argus-bench 선결. ★verify.py stale. 거취 권고=A1. |
+| Step 5 구현 | ★**다음** | 5-A 거취 확정(A1 권고) → 5-C(KiviForward)·5-D(chunked-prefill) host → 5-B(offload Option B′, device 필수) → 5-E(inherent rewire) → 5-F(legacy+trait 삭제, 비가역 device). |
 
 ---
 
-## 다음 작업 (Step 5 — legacy 폐기 + KVCacheOps trait 삭제)
-> Step 3(flip 정확/perf) + Step 4(argus_cli 게이트 매체 등가) PASS 로 BC 의 cold/hot flip + 게이트 이주가 모두 완료. 남은 것은 OLD path(`KVCacheOps`) 소비자 0 만들고 trait 삭제(roadmap Step 5 SSOT).
-1. **비-happy 모드 거취 결정** (Architect/사용자): argus_cli 는 happy-path 전용(eviction/KIVI/offload/swap/profile/batch reject). legacy 폐기 전 이 모드들을 argus-chat/argus-eval/argus-bench family bin 으로 이주할지, 일부 drop 할지 결정. **이게 legacy 폐기의 실질 선결**(device-gate 매체는 Step 4 로 이미 이전).
-2. **B-2 OLD-chain 잔여 2 소비자 fmt 이주** (roadmap Step 5 §★): `forward_into_offload`(OffloadForward, chat/session.rs:547) + `run_chunked_prefill`(prefill.rs profiler/variance). 둘 다 OLD `forward_gen<C>`/`forward_prefill<C>` + `impl KVCacheOps for OffloadKVCache` 소비 → Option B(`forward_gen_fmt`+`OffloadKVCache: KVCacheFormat` interior-mut+preload aliasing 재설계, **device GPU 재검증 필수**).
-3. **`KVCacheOps` trait 삭제**: `grep -r KVCacheOps engine/` 0건 확인 후 trait + generic bound + use 삭제 → `KVCacheFormat` rename 동행(ADR-0001). **device-gate full = 진짜 최종 perf**(parallel path 제거 후 monomorphization 드러남).
-- **권장 역할**: Architect(비-happy 모드 거취 + KVCacheOps 잔존 census) → Senior Implementer(offload fmt 이주 — GPU/aliasing 민감) → Tester(device-gate 최종).
+## 다음 작업 (Step 5 구현 — 설계 SSOT = `design_alpha_k_step5_2026_06_04.md`)
+> Step 5 설계 완료. 6 증분 시퀀싱 = `5-A → 5-C∥5-D → 5-B(device) → 5-E → 5-F(비가역 device)`. 상세·게이트·landmine 은 설계 문서 §4(offload)/§6(시퀀싱)/§7(미해결) 참조. 아래는 진입 경로.
+1. **5-A 거취 확정** (사용자/Architect, 코드 0): 설계 권고 = **A1(session 함수 라이브러리 보존)** — KIVI/offload/eval 을 라이브러리 API 로 생존, family bin(argus-eval/bench/chat)은 backlog. A1 채택 시 5-B/5-C/5-D fmt 이주 **필수 확정**. + **BL-1 결정**: offload device 매체로 argus-bench(offload 지원) 확보를 5-B 선결로 격상할지 vs legacy 를 offload 한정 5-F 부분 제외. (A2 drop 시 Step 5 가 순수 host rewire 로 축소되나 기능 손실.)
+2. **5-C(KiviForward) + 5-D(chunked-prefill) — host, 저위험 선착수**: `kivi_forward.rs:157/188` `forward_into<KiviCache>` → forward_into_fmt(①-c/①-e 선례). `prefill.rs:348/446` → forward_into_fmt(①-d 동형). 둘 다 host bit-identical 게이트(5-D device 불요, 5-C device 권장).
+3. **5-B(offload Option B′) — device 필수**: forward_into_offload loop 골격 보존 + `layer.forward`→`forward_gen_fmt`/`forward_prefill_fmt` + `OffloadFormat`(Mutex wrapper). preload aliasing 재설계. **device 게이트 = 설계 §4.6**(F16·F32 both, prefill≥64tok, retain depth<layers, Mutex poisoning, raw worst-case TBT). ★BL-1 매체 선확보.
+4. **5-E(inherent rewire, additive) → 5-F(legacy+trait 삭제, 비가역)**: 설계 §3(메서드별 목적지)/§6.2(grep 게이트)/§6.3(비가역 안전장치 4중).
+- **권장 역할**: Architect/PM(5-A 거취 + BL-1 결정) → Implementer(5-C/5-D host) → Senior Implementer(5-B offload — GPU/aliasing/Mutex 민감) → Tester(5-B·5-F device).
 - **★Step 3/4 회귀 시 처방**: (3p)만 revert(`execute_fmt`/`build_plan_fmt`/`execute_plan_fmt`/wiring + standard_format plan seam 제거), Step 1·2 cold cluster 유지. fix `ae9fc460`(plan seam cfg)+`26e77908`(map_weights cfg-free)는 빌드 복구라 유지.
 
 ---
