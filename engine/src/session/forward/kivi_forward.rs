@@ -14,11 +14,13 @@ use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::capability::kivi_attention::KiviAttentionBackend;
+use crate::format::KVCacheFormat;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
 use crate::pressure::kivi_cache::KiviCache;
+use crate::pressure::kivi_format::KIVIFormat;
 use crate::session::traits::{Forward, StepCtx};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -147,6 +149,25 @@ impl Forward for KiviForward {
         }
         let input_tensor = self.build_input_tensor(tokens)?;
 
+        // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into_fmt 이주.
+        // wrap 전에 concrete cache 에서 AWQE need_scores 산출 (①-c 수용 잔여 패턴).
+        let need_scores = self
+            .kv_caches
+            .first()
+            .is_some_and(crate::kv_cache_ops::KVCacheOps::needs_attn_scores);
+
+        // kv_caches를 transient KIVIFormat Arc로 wrap (fmt_bridge.rs EvalCacheKind for KiviCache 패턴).
+        let taken = std::mem::take(&mut self.kv_caches);
+        let kfs: Vec<Arc<KIVIFormat>> = taken
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| Arc::new(KIVIFormat::new(i, c)))
+            .collect();
+        let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = kfs
+            .iter()
+            .map(|a| a.clone() as Arc<dyn KVCacheFormat>)
+            .collect();
+
         // borrow 충돌 회피: Arc clone으로 backend/memory 분리.
         let backend = self.backend.clone();
         let memory_ref: *const dyn Memory = self.memory.as_ref();
@@ -154,24 +175,35 @@ impl Forward for KiviForward {
         // raw pointer는 현재 stack frame 내에서만 역참조된다.
         let memory: &dyn Memory = unsafe { &*memory_ref };
 
-        self.model.forward_into(TransformerModelForwardArgs {
+        let fwd_result = self.model.forward_into_fmt(TransformerModelForwardFmtArgs {
             input_tokens: &input_tensor,
             start_pos,
-            kv_caches: &mut self.kv_caches,
+            fmts: &dyn_fmts,
             backend: &backend,
             memory,
             logits_out: &mut self.logits_prefill_last,
             x_gen: None,
             workspace: None,
-            prefill_workspace: None,
+            logits_last_only: true,
             score_accumulator: None,
-            profiler: None,
             skip_config: None,
             importance_collector: None,
-            logits_last_only: true,
-            variance_collector: None,
-            layer_boundary_hook: None,
-        })?;
+            cache_self_need_scores: need_scores,
+        });
+
+        // transient dyn refcount 해제 후 concrete KiviCache 복귀.
+        drop(dyn_fmts);
+        self.kv_caches = kfs
+            .into_iter()
+            .map(|a| {
+                Arc::try_unwrap(a)
+                    .ok()
+                    .expect("transient KIVIFormat has external Arc clone — prefill")
+                    .into_inner()
+            })
+            .collect();
+
+        fwd_result?;
 
         self.read_logits(&self.logits_prefill_last)
     }
@@ -181,28 +213,57 @@ impl Forward for KiviForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
+        // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into_fmt 이주.
+        let need_scores = self
+            .kv_caches
+            .first()
+            .is_some_and(crate::kv_cache_ops::KVCacheOps::needs_attn_scores);
+
+        let taken = std::mem::take(&mut self.kv_caches);
+        let kfs: Vec<Arc<KIVIFormat>> = taken
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| Arc::new(KIVIFormat::new(i, c)))
+            .collect();
+        let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = kfs
+            .iter()
+            .map(|a| a.clone() as Arc<dyn KVCacheFormat>)
+            .collect();
+
         let backend = self.backend.clone();
         let memory_ref: *const dyn Memory = self.memory.as_ref();
+        // SAFETY: self.memory는 self가 살아있는 동안 유효하다.
+        // raw pointer는 현재 stack frame 내에서만 역참조된다.
         let memory: &dyn Memory = unsafe { &*memory_ref };
 
-        self.model.forward_into(TransformerModelForwardArgs {
+        let fwd_result = self.model.forward_into_fmt(TransformerModelForwardFmtArgs {
             input_tokens: &self.decode_input,
             start_pos: ctx.pos,
-            kv_caches: &mut self.kv_caches,
+            fmts: &dyn_fmts,
             backend: &backend,
             memory,
             logits_out: &mut self.logits_decode,
             x_gen: Some(&mut self.decode_x_gen),
             workspace: Some(&mut self.decode_workspace),
-            prefill_workspace: None,
+            logits_last_only: false,
             score_accumulator: None,
-            profiler: None,
             skip_config: None,
             importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-            layer_boundary_hook: None,
-        })?;
+            cache_self_need_scores: need_scores,
+        });
+
+        drop(dyn_fmts);
+        self.kv_caches = kfs
+            .into_iter()
+            .map(|a| {
+                Arc::try_unwrap(a)
+                    .ok()
+                    .expect("transient KIVIFormat has external Arc clone — step")
+                    .into_inner()
+            })
+            .collect();
+
+        fwd_result?;
 
         self.read_logits(&self.logits_decode)
     }
