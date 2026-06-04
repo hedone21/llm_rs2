@@ -3856,7 +3856,7 @@ fn remap_weights_for_cpu_after_swap(
     if !is_gpu || !enabled {
         return;
     }
-    match model.map_weights_for_cpu(backend) {
+    match model.map_weights_for_host_access(backend) {
         Ok(0) => {}
         Ok(n) => eprintln!(
             "[Backend] Re-mapped {} weight tensors after {} (host pointer restored)",
