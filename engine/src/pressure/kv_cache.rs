@@ -5,9 +5,9 @@ use crate::tensor::Tensor;
 use anyhow::Result;
 use std::sync::Arc;
 
-// BC re-export: KVCacheOps, KVLayout, KiviRawBuffers를 L2(kv_cache_ops)로 격상.
-// 기존 `pressure::kv_cache::KVCacheOps` 등 경로는 그대로 동작한다.
-pub use crate::kv_cache_ops::{KVCacheOps, KVLayout, KiviRawBuffers};
+// BC re-export: KVLayout, KiviRawBuffers 를 L2(kv_cache_ops)로 격상. KVCacheOps trait 은
+// 5-F 에서 폐기됨(inherent 전환 완료) — kv_cache_ops.rs 는 이제 layout/raw-buffer 타입 전용.
+pub use crate::kv_cache_ops::{KVLayout, KiviRawBuffers};
 
 /// Extension trait for KV caches that support prefetch pipelines.
 ///
@@ -1058,64 +1058,6 @@ fn page_size() -> usize {
         let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if ps > 0 { ps as usize } else { 4096 }
     })
-}
-
-// ── KVCacheOps implementation for KVCache ───────────────────────────────────
-
-impl KVCacheOps for KVCache {
-    // Phase α-K BC 5-E: 본문은 inherent 로 이전됨 — trait 메서드는 inherent 를 위임 호출한다
-    // (inherent 우선순위로 recursion 없음). 5-F 에서 본 impl 블록을 통째로 삭제한다.
-    fn current_pos(&self) -> usize {
-        self.current_pos()
-    }
-
-    fn set_current_pos(&mut self, pos: usize) {
-        self.set_current_pos(pos)
-    }
-
-    fn capacity(&self) -> usize {
-        self.capacity()
-    }
-
-    fn kv_heads(&self) -> usize {
-        self.kv_heads()
-    }
-
-    fn head_dim(&self) -> usize {
-        self.head_dim()
-    }
-
-    fn layout(&self) -> KVLayout {
-        self.layout()
-    }
-
-    fn kv_dtype(&self) -> DType {
-        self.kv_dtype()
-    }
-
-    fn memory_usage_bytes(&self) -> usize {
-        self.memory_usage_bytes()
-    }
-
-    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
-        self.update(new_k, new_v)
-    }
-
-    fn get_view(&mut self) -> (Tensor, Tensor) {
-        self.view()
-    }
-
-    fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
-        self.get_buffers_mut()
-    }
-
-    fn advance_pos(&mut self, n: usize) {
-        self.advance_pos(n)
-    }
-
-    fn ensure_capacity(&mut self, min_tokens: usize) -> Result<bool> {
-        self.ensure_capacity(min_tokens)
-    }
 }
 
 /// Get the maximum current_pos across all KV caches.

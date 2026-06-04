@@ -17,7 +17,7 @@ use crate::backend::Backend;
 // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
-use crate::kv_cache_ops::{KVCacheOps, KVLayout};
+use crate::kv_cache_ops::KVLayout;
 use crate::memory::Memory;
 use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
@@ -529,51 +529,6 @@ impl OffloadKVCache {
         let v_tensor = Tensor::new(shape, v_buf, cpu_backend);
 
         (k_tensor, v_tensor)
-    }
-}
-
-impl KVCacheOps for OffloadKVCache {
-    // Phase α-K BC 5-E: 본문은 inherent 로 이전됨 — trait 메서드는 inherent 를 위임 호출한다
-    // (inherent 우선순위로 recursion 없음). 5-F 에서 본 impl 블록을 통째로 삭제한다.
-    // set_current_pos/memory_usage_bytes 는 생존 fmt 소비자 미호출이라 inherent 미신설(trait 본문 유지).
-    fn current_pos(&self) -> usize {
-        self.current_pos()
-    }
-
-    fn set_current_pos(&mut self, pos: usize) {
-        self.current_pos = pos;
-    }
-
-    fn capacity(&self) -> usize {
-        self.capacity()
-    }
-
-    fn kv_heads(&self) -> usize {
-        self.kv_heads()
-    }
-
-    fn head_dim(&self) -> usize {
-        self.head_dim()
-    }
-
-    fn layout(&self) -> KVLayout {
-        self.layout()
-    }
-
-    fn kv_dtype(&self) -> DType {
-        self.kv_dtype()
-    }
-
-    fn memory_usage_bytes(&self) -> usize {
-        self.memory_usage_bytes()
-    }
-
-    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
-        self.update(new_k, new_v)
-    }
-
-    fn get_view(&mut self) -> (Tensor, Tensor) {
-        self.get_view()
     }
 }
 

@@ -21,7 +21,7 @@ use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
 use crate::capability::kivi_attention::KiviAttentionBackend;
-use crate::kv_cache_ops::{KVCacheOps, KVLayout, KiviRawBuffers};
+use crate::kv_cache_ops::{KVLayout, KiviRawBuffers};
 use crate::memory::Memory;
 use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
 use crate::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
@@ -2419,117 +2419,6 @@ impl KiviCache {
     }
 }
 
-impl KVCacheOps for KiviCache {
-    // Phase α-K BC 5-E: 본문은 inherent 로 이전됨 — trait 메서드는 inherent 를 위임 호출한다
-    // (inherent 우선순위로 recursion 없음). 5-F 에서 본 impl 블록을 통째로 삭제한다.
-    // set_current_pos/memory_usage_bytes/get_buffers_mut/advance_pos/res_pos/q2_tokens/res_cap/
-    // needs_flush/flush_if_needed 는 생존 fmt 소비자가 호출하지 않아 inherent 미신설(trait 본문 유지).
-    fn current_pos(&self) -> usize {
-        self.current_pos()
-    }
-
-    fn set_current_pos(&mut self, _pos: usize) {
-        // KiviCache position is derived from q2_tokens + res_pos; no-op.
-    }
-
-    fn capacity(&self) -> usize {
-        self.capacity()
-    }
-
-    fn kv_heads(&self) -> usize {
-        self.kv_heads()
-    }
-
-    fn head_dim(&self) -> usize {
-        self.head_dim()
-    }
-
-    fn layout(&self) -> KVLayout {
-        self.layout()
-    }
-
-    fn kv_dtype(&self) -> DType {
-        self.kv_dtype()
-    }
-
-    fn memory_usage_bytes(&self) -> usize {
-        self.memory_usage_bytes()
-    }
-
-    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
-        self.update(new_k, new_v)
-    }
-
-    fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
-        // GPU mode: return residual buffers to signal GPU tensor compatibility.
-        // This tells update_kv_cache() to pass GPU tensors directly instead of
-        // reading back to CPU. The actual data flow goes through update_gpu().
-        if let (Some(k), Some(v)) = (&mut self.gpu_res_k, &mut self.gpu_res_v) {
-            Some((k, v))
-        } else {
-            None
-        }
-    }
-
-    fn get_view(&mut self) -> (Tensor, Tensor) {
-        self.get_view()
-    }
-
-    fn needs_attn_scores(&self) -> bool {
-        self.is_awqe_enabled()
-    }
-
-    fn set_attn_scores(
-        &mut self,
-        scores: &[f32],
-        n_heads_q: usize,
-        stride: usize,
-        valid_len: usize,
-    ) {
-        self.set_attn_scores(scores, n_heads_q, stride, valid_len)
-    }
-
-    fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
-        self.get_kivi_raw_buffers()
-    }
-
-    fn advance_pos(&mut self, n: usize) {
-        // In Plan mode, the GPU gather kernel already wrote data to the residual buffer.
-        // We only need to advance res_pos so the CPU state tracks GPU state.
-        self.res_pos += n;
-    }
-
-    fn res_pos(&self) -> usize {
-        self.res_pos
-    }
-
-    fn q2_tokens(&self) -> usize {
-        self.q2_tokens
-    }
-
-    fn res_cap(&self) -> usize {
-        self.res_cap
-    }
-
-    fn needs_flush(&self) -> bool {
-        self.res_pos >= self.res_cap
-    }
-
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path KIVI flush check
-    fn flush_if_needed(&mut self) -> Result<bool> {
-        if self.res_pos >= self.res_cap {
-            if self.gpu_backend.is_some() {
-                self.flush_residual_gpu()?;
-            } else {
-                self.flush_residual();
-            }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
@@ -3516,31 +3405,30 @@ mod tests {
         );
     }
 
-    /// Test 13: needs_attn_scores() mirrors awqe_enabled.
+    /// Test 13: is_awqe_enabled() mirrors set_awqe_enabled (5-F: trait needs_attn_scores
+    /// 폐기 — 본문이 위임하던 inherent is_awqe_enabled 를 직접 검증).
     #[test]
     fn test_kivi_needs_attn_scores() {
-        use crate::kv_cache_ops::KVCacheOps;
-
         let mut cache = KiviCache::new(1, 32, 256, 32);
 
         // Default: false
         assert!(
-            !cache.needs_attn_scores(),
-            "needs_attn_scores() must be false by default"
+            !cache.is_awqe_enabled(),
+            "is_awqe_enabled() must be false by default"
         );
 
         // After enabling
         cache.set_awqe_enabled(true);
         assert!(
-            cache.needs_attn_scores(),
-            "needs_attn_scores() must be true after set_awqe_enabled(true)"
+            cache.is_awqe_enabled(),
+            "is_awqe_enabled() must be true after set_awqe_enabled(true)"
         );
 
         // After disabling again
         cache.set_awqe_enabled(false);
         assert!(
-            !cache.needs_attn_scores(),
-            "needs_attn_scores() must be false after set_awqe_enabled(false)"
+            !cache.is_awqe_enabled(),
+            "is_awqe_enabled() must be false after set_awqe_enabled(false)"
         );
     }
 
@@ -3800,21 +3688,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_get_kivi_raw_buffers_trait_default_none() {
-        use crate::pressure::kv_cache::KVCache;
-        // Standard KVCache should return None via trait default
-        let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
-        let buf_k = Arc::new(SharedBuffer::new(8 * 2048 * 64 * 4, DType::F32));
-        let buf_v = Arc::new(SharedBuffer::new(8 * 2048 * 64 * 4, DType::F32));
-        let k = Tensor::new(Shape::new(vec![1, 2048, 8, 64]), buf_k, backend.clone());
-        let v = Tensor::new(Shape::new(vec![1, 2048, 8, 64]), buf_v, backend);
-        let cache = KVCache::new(k, v, 2048);
-        assert!(
-            cache.get_kivi_raw_buffers().is_none(),
-            "KVCache trait default should return None"
-        );
-    }
+    // (5-F: test_get_kivi_raw_buffers_trait_default_none 삭제 — KVCacheOps trait 폐기로
+    //  KVCache 엔 get_kivi_raw_buffers 메서드 자체가 없음. KiviCache inherent 만 잔존.)
 
     #[test]
     fn test_kivi_raw_buffers_trait_none_for_cpu() {
