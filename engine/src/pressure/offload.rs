@@ -279,42 +279,48 @@ impl OffloadKVCache {
         *slot = Some(buf.clone());
         buf
     }
-}
 
-impl KVCacheOps for OffloadKVCache {
-    fn current_pos(&self) -> usize {
+    // ── KVCacheOps primitives moved to inherent (Phase α-K BC 5-E) ───────────
+    // KVCacheOps trait 은 5-F 까지 생존하되, 본문은 inherent 로 이전하고 trait 메서드는
+    // 이 inherent 를 위임 호출한다(byte-identical, 단일 본문). fmt 경로(OffloadFormat)가
+    // trait 경유 없이 직접 호출하도록 한다. set_current_pos/memory_usage_bytes 는 생존
+    // fmt 소비자가 호출하지 않아 inherent 미신설(trait 본문 유지).
+
+    /// Number of valid tokens currently in the cache.
+    pub fn current_pos(&self) -> usize {
         self.current_pos
     }
 
-    fn set_current_pos(&mut self, pos: usize) {
-        self.current_pos = pos;
-    }
-
-    fn capacity(&self) -> usize {
+    /// Physical buffer capacity in tokens.
+    pub fn capacity(&self) -> usize {
         self.max_seq_len
     }
 
-    fn kv_heads(&self) -> usize {
+    /// Number of KV heads.
+    pub fn kv_heads(&self) -> usize {
         self.kv_heads
     }
 
-    fn head_dim(&self) -> usize {
+    /// Dimension per head.
+    pub fn head_dim(&self) -> usize {
         self.head_dim
     }
 
-    fn layout(&self) -> KVLayout {
+    /// Memory layout (offload is always SeqMajor).
+    pub fn layout(&self) -> KVLayout {
         KVLayout::SeqMajor
     }
 
-    fn kv_dtype(&self) -> DType {
+    /// The DType that the caller should pass to `update()`.
+    pub fn kv_dtype(&self) -> DType {
         self.dtype
     }
 
-    fn memory_usage_bytes(&self) -> usize {
-        self.store.storage_size()
-    }
+    // (memory_usage_bytes 는 fmt 소비자 미호출 — offload 자체 test + legacy 만 사용하므로
+    //  set_current_pos 등 다른 trait-only 메서드와 함께 5-F 로 defer. trait 본문 유지.)
 
-    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
+    /// Append new K/V data. Input shape: `[batch, seq_len, kv_heads, head_dim]`.
+    pub fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
         let seq_len = new_k.shape().dims()[1];
         let total_after = self.current_pos + seq_len;
         if total_after > self.max_seq_len {
@@ -394,7 +400,10 @@ impl KVCacheOps for OffloadKVCache {
         Ok(())
     }
 
-    fn get_view(&mut self) -> (Tensor, Tensor) {
+    /// K/V tensors for attention covering `[0..current_pos]`.
+    ///
+    /// `&mut self` — lazy attn-buffer assembly + optional GPU upload. 충돌 없는 동명 inherent.
+    pub fn get_view(&mut self) -> (Tensor, Tensor) {
         let total = self.current_pos;
         let cpu_backend: Arc<dyn crate::backend::Backend> = self.out_backend.clone();
 
@@ -520,6 +529,51 @@ impl KVCacheOps for OffloadKVCache {
     }
 }
 
+impl KVCacheOps for OffloadKVCache {
+    // Phase α-K BC 5-E: 본문은 inherent 로 이전됨 — trait 메서드는 inherent 를 위임 호출한다
+    // (inherent 우선순위로 recursion 없음). 5-F 에서 본 impl 블록을 통째로 삭제한다.
+    // set_current_pos/memory_usage_bytes 는 생존 fmt 소비자 미호출이라 inherent 미신설(trait 본문 유지).
+    fn current_pos(&self) -> usize {
+        self.current_pos()
+    }
+
+    fn set_current_pos(&mut self, pos: usize) {
+        self.current_pos = pos;
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity()
+    }
+
+    fn kv_heads(&self) -> usize {
+        self.kv_heads()
+    }
+
+    fn head_dim(&self) -> usize {
+        self.head_dim()
+    }
+
+    fn layout(&self) -> KVLayout {
+        self.layout()
+    }
+
+    fn kv_dtype(&self) -> DType {
+        self.kv_dtype()
+    }
+
+    fn memory_usage_bytes(&self) -> usize {
+        self.store.storage_size()
+    }
+
+    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
+        self.update(new_k, new_v)
+    }
+
+    fn get_view(&mut self) -> (Tensor, Tensor) {
+        self.get_view()
+    }
+}
+
 impl crate::pressure::kv_cache::PrefetchableCache for OffloadKVCache {
     fn preload(&mut self) -> Result<()> {
         self.preload()
@@ -542,6 +596,7 @@ impl crate::pressure::kv_cache::PrefetchableCache for OffloadKVCache {
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 mod tests {
     use super::*;
+    // memory_usage_bytes(OffloadKVCache trait-only, 5-F defer) 호출용 — compare_views 단형화 후 유일 잔여.
     use crate::kv_cache_ops::KVCacheOps;
 
     fn make_test_tensor(
@@ -717,14 +772,11 @@ mod tests {
         )
     }
 
-    /// Compare get_view outputs between two KVCacheOps implementations.
-    /// Returns (matches, total_elements).
-    fn compare_views<A: KVCacheOps, B: KVCacheOps>(
-        a: &mut A,
-        b: &mut B,
-        dtype: DType,
-    ) -> (bool, usize) {
-        let (k_a, v_a) = a.get_view();
+    /// Compare view outputs between a base `KVCache` and an `OffloadKVCache`.
+    /// Returns (matches, total_elements). (Phase α-K BC 5-E: generic `<A,B: KVCacheOps>` →
+    /// concrete 단형화, 호출처가 단일 KVCache+OffloadKVCache 조합뿐이라 generic 불요.)
+    fn compare_views(a: &mut KVCache, b: &mut OffloadKVCache, dtype: DType) -> (bool, usize) {
+        let (k_a, v_a) = a.view();
         let (k_b, v_b) = b.get_view();
 
         let total_bytes = a.current_pos() * a.kv_heads() * a.head_dim() * dtype.size();
@@ -1576,7 +1628,7 @@ mod tests {
                     make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
                 for c in bases.iter_mut() {
                     c.update(&k, &v).unwrap();
-                    let _ = KVCacheOps::get_view(c);
+                    let _ = c.view();
                 }
             }
             start.elapsed().as_secs_f64() * 1000.0

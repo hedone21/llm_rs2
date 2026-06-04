@@ -17,7 +17,6 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::format::{AttnDims, KVCacheFormat, Merge};
-use crate::kv_cache_ops::KVCacheOps;
 use crate::pressure::kivi_cache::KiviCache;
 use crate::tensor::Tensor;
 
@@ -69,11 +68,11 @@ impl KVCacheFormat for KIVIFormat {
     }
 
     fn current_pos(&self) -> usize {
-        KVCacheOps::current_pos(&*self.inner.lock().unwrap())
+        self.inner.lock().unwrap().current_pos()
     }
 
     fn capacity(&self) -> usize {
-        KVCacheOps::capacity(&*self.inner.lock().unwrap())
+        self.inner.lock().unwrap().capacity()
     }
 
     fn write_kv(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
@@ -116,12 +115,12 @@ impl KVCacheFormat for KIVIFormat {
         if seq_len > 1 {
             let n_heads_kv = cache.kv_heads();
             let head_dim = cache.head_dim();
-            let kv_capacity = KVCacheOps::capacity(&*cache);
-            let kv_layout = KVCacheOps::layout(&*cache);
-            let cache_seq_len = KVCacheOps::current_pos(&*cache);
+            let kv_capacity = cache.capacity();
+            let kv_layout = cache.layout();
+            let cache_seq_len = cache.current_pos();
             let batch_size = q.shape().dims()[0];
             let q_start_pos = cache_seq_len - seq_len;
-            let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
+            let (k_cache, v_cache) = cache.get_view();
             let _ = scores;
             return crate::pressure::standard_format::prefill_attention(
                 q,
@@ -165,8 +164,8 @@ impl KVCacheFormat for KIVIFormat {
         // fallback: dequantized F32 view → backend.attention_gen (CPU-testable).
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
-        let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
-        let cache_seq_len = KVCacheOps::current_pos(&*cache);
+        let (k_cache, v_cache) = cache.get_view();
+        let cache_seq_len = cache.current_pos();
         let effective_cache_len = match dims.window {
             Some(w) => cache_seq_len.min(w),
             None => cache_seq_len,

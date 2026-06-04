@@ -298,7 +298,7 @@ impl SwapHandler {
             // cache had grown just enough to fit decode after offload but
             // not enough to hold offloaded + current (e.g. offload 20, then
             // decode 49 tokens → capacity=64 < 49 + 20 = 69).
-            use crate::kv_cache_ops::KVCacheOps;
+            // Phase α-K BC 5-E: KVCache inherent `ensure_capacity` 직접 호출 (KVCacheOps import 제거).
             if let Err(e) = cache.ensure_capacity(existing + count) {
                 eprintln!(
                     "[SwapHandler] recall for layer {}: grow to {} failed: {}; skipping",

@@ -125,8 +125,8 @@ impl EvalCacheKind for KiviCache {
     }
 
     fn cur_pos(&self) -> usize {
-        // KiviCache::current_pos = total_tokens() (private fn) → KVCacheOps 경유 (①-c 수용 잔여, Step5 정리).
-        crate::kv_cache_ops::KVCacheOps::current_pos(self)
+        // Phase α-K BC 5-E: KiviCache inherent `current_pos`(=total_tokens()) 직접 호출 (①-c 수용 잔여 해소).
+        self.current_pos()
     }
 
     fn set_cur_pos(&mut self, _pos: usize) {
@@ -134,7 +134,8 @@ impl EvalCacheKind for KiviCache {
     }
 
     fn needs_scores(&self) -> bool {
-        crate::kv_cache_ops::KVCacheOps::needs_attn_scores(self)
+        // Phase α-K BC 5-E: KiviCache inherent `is_awqe_enabled`(=awqe_enabled) 직접 호출 (①-c 수용 잔여 해소).
+        self.is_awqe_enabled()
     }
 }
 

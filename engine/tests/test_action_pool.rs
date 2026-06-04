@@ -6,7 +6,7 @@
 use llm_rs2::inference::skip_config::SkipConfig;
 use llm_rs2::inference::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
 use llm_rs2::pressure::kivi_cache::KiviCache;
-use llm_rs2::pressure::kv_cache::{KVCache, KVCacheOps, KVLayout};
+use llm_rs2::pressure::kv_cache::{KVCache, KVLayout};
 use llm_rs2::pressure::offload::store::OffloadStore;
 use llm_rs2::pressure::quantize_handler::QuantizeHandler;
 use llm_rs2::pressure::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
@@ -150,6 +150,7 @@ fn test_kivi_transition_8_4_2_bounded_error() {
     // Cache should still be usable
     let (k, _v) = cache.get_view();
     assert_eq!(k.shape().dims()[1], 65);
+    // (KiviCache::get_view — inherent 0-arg, Phase α-K BC 5-E)
 }
 
 fn make_kivi_input(

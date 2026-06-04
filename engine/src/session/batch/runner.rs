@@ -720,7 +720,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
             // attention scores, then restore current_pos so cache state
             // matches prompt_tokens (probe entry beyond current_pos is
             // invisible to subsequent forward calls).
-            use crate::kv_cache_ops::KVCacheOps;
+            // Phase α-K BC 5-E: KVCache inherent `current_pos` 직접 호출 (KVCacheOps import 제거).
             if hook.needs_score_probe(&kv_caches) {
                 let saved_positions: Vec<usize> =
                     kv_caches.iter().map(|c| c.current_pos()).collect();

@@ -18,7 +18,6 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::format::{AttnDims, KVCacheFormat, Merge};
-use crate::kv_cache_ops::KVCacheOps;
 use crate::pressure::offload::OffloadKVCache;
 use crate::tensor::Tensor;
 
@@ -160,8 +159,8 @@ impl KVCacheFormat for OffloadFormat {
     }
 
     fn current_pos(&self) -> usize {
-        // path X: KVCacheOps trait 은 5-E 까지 생존 (StandardFormat:304 미러). MutexGuard → &OffloadKVCache deref.
-        KVCacheOps::current_pos(&*self.inner.lock().unwrap())
+        // Phase α-K BC 5-E: OffloadKVCache inherent `current_pos` 직접 호출 (path X KVCacheOps 경유 해소).
+        self.inner.lock().unwrap().current_pos()
     }
 
     fn capacity(&self) -> usize {
@@ -198,7 +197,7 @@ impl KVCacheFormat for OffloadFormat {
         let cache = &mut *guard;
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
-        let cache_seq_len = KVCacheOps::current_pos(&*cache);
+        let cache_seq_len = cache.current_pos();
 
         // ── prefill (seq_len>1): multi-token causal attention (StandardFormat:361-385 미러) ──
         // decode delegate 는 single-query + causal-mask 부재라 재사용 불가 → prefill_attention(free fn).
@@ -207,7 +206,7 @@ impl KVCacheFormat for OffloadFormat {
             let kv_layout = cache.layout(); // = SeqMajor
             let batch_size = q.shape().dims()[0];
             let q_start_pos = cache_seq_len - seq_len;
-            let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
+            let (k_cache, v_cache) = cache.get_view();
             let _ = scores;
             return crate::pressure::standard_format::prefill_attention(
                 q,
@@ -236,7 +235,7 @@ impl KVCacheFormat for OffloadFormat {
         let kv_dtype = cache.kv_dtype();
         let layout = cache.layout();
         let capacity = cache.capacity();
-        let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
+        let (k_cache, v_cache) = cache.get_view();
 
         // Q4_0 + GPU: backend.attention_gen 은 GPU Q4_0 dequant-attention 커널 부재라 garbage →
         // attention_q4_gpu_fallback 재사용. CpuBackend(is_gpu=false)는 미진입 → 아래 attention_gen.
@@ -321,8 +320,6 @@ mod tests {
     /// reference 와 wrapper 출력이 일치하는지 검증.
     #[test]
     fn test_attention_into_decode_matches_raw_offload() {
-        use crate::kv_cache_ops::KVCacheOps;
-
         let kv_heads = 2;
         let head_dim = 8; // F32 attention path (Q4_0 아님)
         let n_heads_q = 4; // GQA n_rep=2
@@ -346,7 +343,7 @@ mod tests {
         assert_eq!(fmt.current_pos(), 3);
         assert_eq!(fmt_ref.current_pos(), 3);
         let mut raw = fmt_ref.into_inner();
-        assert_eq!(KVCacheOps::current_pos(&raw), 3);
+        assert_eq!(raw.current_pos(), 3);
 
         // decode query.
         let q_data: Vec<f32> = (0..n_heads_q * head_dim)
@@ -372,8 +369,8 @@ mod tests {
         .unwrap();
 
         // OLD reference: get_view + backend.attention_gen.
-        let cache_seq_len = KVCacheOps::current_pos(&raw);
-        let (k_view, v_view) = KVCacheOps::get_view(&mut raw);
+        let cache_seq_len = raw.current_pos();
+        let (k_view, v_view) = raw.get_view();
         let mut out_ref = f32_tensor(
             vec![1, 1, n_heads_q, head_dim],
             &vec![0.0; n_heads_q * head_dim],
@@ -474,7 +471,6 @@ mod tests {
     /// into_inner 가 cross-token 상태(current_pos)를 보존하는지.
     #[test]
     fn test_into_inner_preserves_pos() {
-        use crate::kv_cache_ops::KVCacheOps;
         let backend = CpuBackend::new();
         let fmt = OffloadFormat::new(3, make_f16_offload(1, 4, 8));
         let token = vec![0.5f32; 4];
@@ -483,6 +479,6 @@ mod tests {
         fmt.write_kv(&k, &v, &backend).unwrap();
         assert_eq!(fmt.idx(), 3);
         let cache = fmt.into_inner();
-        assert_eq!(KVCacheOps::current_pos(&cache), 1);
+        assert_eq!(cache.current_pos(), 1);
     }
 }

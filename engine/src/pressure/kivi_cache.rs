@@ -2232,18 +2232,19 @@ impl KiviCache {
         );
         (k, v)
     }
-}
 
-impl KVCacheOps for KiviCache {
-    fn current_pos(&self) -> usize {
+    // ── KVCacheOps primitives moved to inherent (Phase α-K BC 5-E) ───────────
+    // KVCacheOps trait 은 5-F 까지 생존하되, 본문은 inherent 로 이전하고 trait 메서드는
+    // 이 inherent 를 위임 호출한다(byte-identical, 단일 본문). fmt 경로(KIVIFormat/fmt_bridge/
+    // KiviForward)가 trait 경유 없이 직접 호출하도록 한다.
+
+    /// Number of valid tokens currently in the cache (q2_tokens + res_pos).
+    pub fn current_pos(&self) -> usize {
         self.total_tokens()
     }
 
-    fn set_current_pos(&mut self, _pos: usize) {
-        // KiviCache position is derived from q2_tokens + res_pos; no-op.
-    }
-
-    fn capacity(&self) -> usize {
+    /// Physical buffer capacity in tokens (bits=16 GPU ⇒ residual capacity).
+    pub fn capacity(&self) -> usize {
         // bits=16 GPU: return GPU residual capacity (may be smaller than max_seq_len
         // due to grow-on-demand). Used for HeadMajor stride calculations.
         if self.bits == 16 && self.gpu_res_k.is_some() {
@@ -2253,15 +2254,8 @@ impl KVCacheOps for KiviCache {
         }
     }
 
-    fn kv_heads(&self) -> usize {
-        self.kv_heads
-    }
-
-    fn head_dim(&self) -> usize {
-        self.head_dim
-    }
-
-    fn layout(&self) -> KVLayout {
+    /// Memory layout (bits=16 GPU ⇒ HeadMajor residual).
+    pub fn layout(&self) -> KVLayout {
         // bits=16 GPU mode: residual is HeadMajor [kv_heads, res_cap, head_dim].
         // bits=2/4/8 GPU mode: assembled attn view is SeqMajor [total, kv_heads, head_dim].
         // CPU mode: always SeqMajor.
@@ -2272,17 +2266,23 @@ impl KVCacheOps for KiviCache {
         }
     }
 
-    fn kv_dtype(&self) -> DType {
+    /// Number of KV heads.
+    pub fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    /// Dimension per head.
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// The DType the caller should pass to `update()` (KIVI quantizes internally → F32).
+    pub fn kv_dtype(&self) -> DType {
         DType::F32
     }
 
-    fn memory_usage_bytes(&self) -> usize {
-        let q_bytes = self.qk.memory_bytes() + self.qv.memory_bytes();
-        let res_bytes = self.res_pos * self.kv_heads * self.head_dim * 4 * 2; // K + V
-        q_bytes + res_bytes
-    }
-
-    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
+    /// Append new K/V data. Input shape: `[batch, seq_len, kv_heads, head_dim]`.
+    pub fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
         let seq_len = new_k.shape().dims()[1];
         let total_after = self.total_tokens() + seq_len;
         if total_after > self.max_seq_len {
@@ -2328,18 +2328,11 @@ impl KVCacheOps for KiviCache {
         Ok(())
     }
 
-    fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
-        // GPU mode: return residual buffers to signal GPU tensor compatibility.
-        // This tells update_kv_cache() to pass GPU tensors directly instead of
-        // reading back to CPU. The actual data flow goes through update_gpu().
-        if let (Some(k), Some(v)) = (&mut self.gpu_res_k, &mut self.gpu_res_v) {
-            Some((k, v))
-        } else {
-            None
-        }
-    }
-
-    fn get_view(&mut self) -> (Tensor, Tensor) {
+    /// K/V tensors for attention covering `[0..current_pos]` (dequantized assembly).
+    ///
+    /// `&mut self` — internal buffer assembly (KIVI dequantization). 충돌 없는 동명 inherent
+    /// (KVCache 와 달리 KiviCache 는 기존 `get_view` inherent 부재).
+    pub fn get_view(&mut self) -> (Tensor, Tensor) {
         // GPU path: return tensors backed by GPU attention buffers
         if self.gpu_backend.is_some() {
             return self.get_view_gpu();
@@ -2381,11 +2374,13 @@ impl KVCacheOps for KiviCache {
         (k_tensor, v_tensor)
     }
 
-    fn needs_attn_scores(&self) -> bool {
+    /// Whether AWQE is enabled (decode-time attention scores required).
+    pub fn is_awqe_enabled(&self) -> bool {
         self.awqe_enabled
     }
 
-    fn set_attn_scores(
+    /// Store post-softmax attention scores from the latest decode step (AWQE).
+    pub fn set_attn_scores(
         &mut self,
         scores: &[f32],
         n_heads_q: usize,
@@ -2411,8 +2406,91 @@ impl KVCacheOps for KiviCache {
         snapshot.valid_len = valid_len;
     }
 
-    fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
+    /// Raw GPU buffers for native KIVI fused attention (Some only in GPU mode).
+    pub fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
         self.get_raw_gpu_buffers()
+    }
+
+    /// Memory usage in bytes for currently stored KV data.
+    pub fn memory_usage_bytes(&self) -> usize {
+        let q_bytes = self.qk.memory_bytes() + self.qv.memory_bytes();
+        let res_bytes = self.res_pos * self.kv_heads * self.head_dim * 4 * 2; // K + V
+        q_bytes + res_bytes
+    }
+}
+
+impl KVCacheOps for KiviCache {
+    // Phase α-K BC 5-E: 본문은 inherent 로 이전됨 — trait 메서드는 inherent 를 위임 호출한다
+    // (inherent 우선순위로 recursion 없음). 5-F 에서 본 impl 블록을 통째로 삭제한다.
+    // set_current_pos/memory_usage_bytes/get_buffers_mut/advance_pos/res_pos/q2_tokens/res_cap/
+    // needs_flush/flush_if_needed 는 생존 fmt 소비자가 호출하지 않아 inherent 미신설(trait 본문 유지).
+    fn current_pos(&self) -> usize {
+        self.current_pos()
+    }
+
+    fn set_current_pos(&mut self, _pos: usize) {
+        // KiviCache position is derived from q2_tokens + res_pos; no-op.
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity()
+    }
+
+    fn kv_heads(&self) -> usize {
+        self.kv_heads()
+    }
+
+    fn head_dim(&self) -> usize {
+        self.head_dim()
+    }
+
+    fn layout(&self) -> KVLayout {
+        self.layout()
+    }
+
+    fn kv_dtype(&self) -> DType {
+        self.kv_dtype()
+    }
+
+    fn memory_usage_bytes(&self) -> usize {
+        self.memory_usage_bytes()
+    }
+
+    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
+        self.update(new_k, new_v)
+    }
+
+    fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
+        // GPU mode: return residual buffers to signal GPU tensor compatibility.
+        // This tells update_kv_cache() to pass GPU tensors directly instead of
+        // reading back to CPU. The actual data flow goes through update_gpu().
+        if let (Some(k), Some(v)) = (&mut self.gpu_res_k, &mut self.gpu_res_v) {
+            Some((k, v))
+        } else {
+            None
+        }
+    }
+
+    fn get_view(&mut self) -> (Tensor, Tensor) {
+        self.get_view()
+    }
+
+    fn needs_attn_scores(&self) -> bool {
+        self.is_awqe_enabled()
+    }
+
+    fn set_attn_scores(
+        &mut self,
+        scores: &[f32],
+        n_heads_q: usize,
+        stride: usize,
+        valid_len: usize,
+    ) {
+        self.set_attn_scores(scores, n_heads_q, stride, valid_len)
+    }
+
+    fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
+        self.get_kivi_raw_buffers()
     }
 
     fn advance_pos(&mut self, n: usize) {
@@ -2811,7 +2889,6 @@ mod tests {
     /// Data pattern: sin-based low-rank structure (realistic for attention KV).
     #[test]
     fn test_compare_kivi_vs_baseline() {
-        use crate::kv_cache_ops::KVCacheOps;
         use crate::pressure::kv_cache::KVCache;
 
         let kv_heads = 8;
@@ -2926,7 +3003,7 @@ mod tests {
                 cache.update(&k, &v).unwrap();
             }
 
-            let (kv, vv) = KVCacheOps::get_view(&mut cache);
+            let (kv, vv) = cache.view();
             let n = total * kv_heads * head_dim;
             baseline_k = kv.as_slice::<f32>()[..n].to_vec();
             baseline_v = vv.as_slice::<f32>()[..n].to_vec();

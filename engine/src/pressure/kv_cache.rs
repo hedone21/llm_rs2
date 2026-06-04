@@ -947,6 +947,65 @@ impl KVCache {
 
         Ok(())
     }
+
+    // ── KVCacheOps primitives moved to inherent (Phase α-K BC 5-E) ───────────
+    // KVCacheOps trait 은 5-F 까지 생존하되, 본문은 inherent 로 이전하고 trait 메서드는
+    // 이 inherent 를 위임 호출한다(byte-identical, 단일 본문). fmt 경로(StandardFormat)와
+    // 비-forward 소비자(swap_handler/batch)가 trait 경유 없이 직접 호출하도록 한다.
+    // (`capacity`/`kv_heads`/`head_dim`/`layout`/`update`/`memory_usage_bytes` 는 이미 inherent.)
+
+    /// Number of valid tokens currently in the cache.
+    pub fn current_pos(&self) -> usize {
+        self.current_pos
+    }
+
+    /// Override the current position counter (pos==0 도 high_water 리셋).
+    pub fn set_current_pos(&mut self, pos: usize) {
+        self.current_pos = pos;
+        if pos == 0 {
+            self.high_water_pos = 0;
+        }
+    }
+
+    /// The DType that the caller should pass to `update()`.
+    pub fn kv_dtype(&self) -> DType {
+        self.k_buffer.dtype()
+    }
+
+    /// K/V tensors for attention covering `[0..current_pos]`.
+    ///
+    /// 기존 inherent `get_view(&self, seq_len)`(:534)와 시그니처가 달라 동명 정의가 불가하므로
+    /// `view` 로 신설한다(Phase α-K BC 5-E R3). trait `get_view(&mut self)` 가 이를 위임한다.
+    pub fn view(&mut self) -> (Tensor, Tensor) {
+        (self.k_buffer.clone(), self.v_buffer.clone())
+    }
+
+    /// Direct access to underlying K/V buffers for zero-overhead scatter writes.
+    pub fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
+        Some((&mut self.k_buffer, &mut self.v_buffer))
+    }
+
+    /// Advance position counter without performing any data copy.
+    pub fn advance_pos(&mut self, n: usize) {
+        self.current_pos += n;
+        self.high_water_pos = self.high_water_pos.max(self.current_pos);
+    }
+
+    /// Ensure the cache has capacity for at least `min_tokens` total tokens.
+    pub fn ensure_capacity(&mut self, min_tokens: usize) -> Result<bool> {
+        if min_tokens <= self.capacity {
+            return Ok(false);
+        }
+        if min_tokens > self.max_seq_len {
+            return Err(anyhow::anyhow!(
+                "KV Cache overflow: need {} tokens but max_seq_len={}",
+                min_tokens,
+                self.max_seq_len
+            ));
+        }
+        self.grow(min_tokens)?;
+        Ok(true)
+    }
 }
 
 // ── madvise helpers ─────────────────────────────────────────────────────────
@@ -1004,35 +1063,34 @@ fn page_size() -> usize {
 // ── KVCacheOps implementation for KVCache ───────────────────────────────────
 
 impl KVCacheOps for KVCache {
+    // Phase α-K BC 5-E: 본문은 inherent 로 이전됨 — trait 메서드는 inherent 를 위임 호출한다
+    // (inherent 우선순위로 recursion 없음). 5-F 에서 본 impl 블록을 통째로 삭제한다.
     fn current_pos(&self) -> usize {
-        self.current_pos
+        self.current_pos()
     }
 
     fn set_current_pos(&mut self, pos: usize) {
-        self.current_pos = pos;
-        if pos == 0 {
-            self.high_water_pos = 0;
-        }
+        self.set_current_pos(pos)
     }
 
     fn capacity(&self) -> usize {
-        self.capacity
+        self.capacity()
     }
 
     fn kv_heads(&self) -> usize {
-        self.kv_heads
+        self.kv_heads()
     }
 
     fn head_dim(&self) -> usize {
-        self.head_dim
+        self.head_dim()
     }
 
     fn layout(&self) -> KVLayout {
-        self.layout
+        self.layout()
     }
 
     fn kv_dtype(&self) -> DType {
-        self.k_buffer.dtype()
+        self.kv_dtype()
     }
 
     fn memory_usage_bytes(&self) -> usize {
@@ -1044,31 +1102,19 @@ impl KVCacheOps for KVCache {
     }
 
     fn get_view(&mut self) -> (Tensor, Tensor) {
-        (self.k_buffer.clone(), self.v_buffer.clone())
+        self.view()
     }
 
     fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
-        Some((&mut self.k_buffer, &mut self.v_buffer))
+        self.get_buffers_mut()
     }
 
     fn advance_pos(&mut self, n: usize) {
-        self.current_pos += n;
-        self.high_water_pos = self.high_water_pos.max(self.current_pos);
+        self.advance_pos(n)
     }
 
     fn ensure_capacity(&mut self, min_tokens: usize) -> Result<bool> {
-        if min_tokens <= self.capacity {
-            return Ok(false);
-        }
-        if min_tokens > self.max_seq_len {
-            return Err(anyhow::anyhow!(
-                "KV Cache overflow: need {} tokens but max_seq_len={}",
-                min_tokens,
-                self.max_seq_len
-            ));
-        }
-        self.grow(min_tokens)?;
-        Ok(true)
+        self.ensure_capacity(min_tokens)
     }
 }
 

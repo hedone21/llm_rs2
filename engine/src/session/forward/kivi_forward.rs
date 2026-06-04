@@ -151,10 +151,8 @@ impl Forward for KiviForward {
 
         // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into_fmt 이주.
         // wrap 전에 concrete cache 에서 AWQE need_scores 산출 (①-c 수용 잔여 패턴).
-        let need_scores = self
-            .kv_caches
-            .first()
-            .is_some_and(crate::kv_cache_ops::KVCacheOps::needs_attn_scores);
+        // 5-E: KiviCache inherent `is_awqe_enabled` 직접 호출 (KVCacheOps 경유 제거).
+        let need_scores = self.kv_caches.first().is_some_and(|c| c.is_awqe_enabled());
 
         // kv_caches를 transient KIVIFormat Arc로 wrap (fmt_bridge.rs EvalCacheKind for KiviCache 패턴).
         let taken = std::mem::take(&mut self.kv_caches);
@@ -214,10 +212,8 @@ impl Forward for KiviForward {
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
         // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into_fmt 이주.
-        let need_scores = self
-            .kv_caches
-            .first()
-            .is_some_and(crate::kv_cache_ops::KVCacheOps::needs_attn_scores);
+        // 5-E: KiviCache inherent `is_awqe_enabled` 직접 호출 (KVCacheOps 경유 제거).
+        let need_scores = self.kv_caches.first().is_some_and(|c| c.is_awqe_enabled());
 
         let taken = std::mem::take(&mut self.kv_caches);
         let kfs: Vec<Arc<KIVIFormat>> = taken

@@ -4,7 +4,6 @@
 //! KiviCache는 FP32 residual buffer + quantized compressed storage 구조.
 
 use llm_rs2::pressure::kivi_cache::KiviCache;
-use llm_rs2::pressure::kv_cache::KVCacheOps;
 
 // ══════════════════════════════════════════════════════════════
 // ENG-ALG-020: KiviCache 기본 동작

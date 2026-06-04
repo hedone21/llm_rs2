@@ -15,7 +15,6 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::format::{AttnDims, KVCacheFormat, Merge};
-use crate::kv_cache_ops::KVCacheOps;
 use crate::pressure::kv_cache::KVCache;
 use crate::tensor::Tensor;
 
@@ -73,7 +72,7 @@ impl StandardFormat {
     pub(crate) fn plan_geometry(&self) -> crate::backend::opencl::plan::PlanGeometry {
         let g = self.inner.lock().unwrap();
         crate::backend::opencl::plan::PlanGeometry {
-            current_pos: KVCacheOps::current_pos(&g.cache),
+            current_pos: g.cache.current_pos(),
             capacity: g.cache.capacity(),
             res_pos: 0,
             q2_tokens: 0,
@@ -136,7 +135,7 @@ impl StandardFormat {
             && guard.cache.layout() == KVLayout::HeadMajor
         {
             let cache = &mut guard.cache;
-            let pos = KVCacheOps::current_pos(&*cache);
+            let pos = cache.current_pos();
             cache.ensure_capacity(pos + 1)?;
             let cap = cache.capacity();
             let head_dim = cache.head_dim();
@@ -155,7 +154,7 @@ impl StandardFormat {
             && backend.supports_kv_scatter_f32_batch()
         {
             let cache = &mut guard.cache;
-            let pos = KVCacheOps::current_pos(&*cache);
+            let pos = cache.current_pos();
             cache.ensure_capacity(pos + 1)?;
             let cap = cache.capacity();
             let n_heads_kv = cache.kv_heads();
@@ -192,7 +191,7 @@ impl StandardFormat {
             && backend.supports_kv_scatter_batch()
         {
             let cache = &mut guard.cache;
-            let pos = KVCacheOps::current_pos(&*cache);
+            let pos = cache.current_pos();
             cache.ensure_capacity(pos + seq_len)?;
             let cap = cache.capacity();
             let n_heads_kv = cache.kv_heads();
@@ -214,7 +213,7 @@ impl StandardFormat {
             && backend.supports_kv_scatter_f32_batch()
         {
             let cache = &mut guard.cache;
-            let pos = KVCacheOps::current_pos(&*cache);
+            let pos = cache.current_pos();
             cache.ensure_capacity(pos + seq_len)?;
             let cap = cache.capacity();
             let n_heads_kv = cache.kv_heads();
@@ -301,7 +300,7 @@ impl KVCacheFormat for StandardFormat {
     }
 
     fn current_pos(&self) -> usize {
-        KVCacheOps::current_pos(&self.inner.lock().unwrap().cache)
+        self.inner.lock().unwrap().cache.current_pos()
     }
 
     fn capacity(&self) -> usize {
@@ -350,7 +349,7 @@ impl KVCacheFormat for StandardFormat {
         let cache = &mut guard.cache;
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
-        let cache_seq_len = KVCacheOps::current_pos(&*cache);
+        let cache_seq_len = cache.current_pos();
 
         // ── prefill (seq_len>1): multi-token causal attention (C-1, §9.1-BC1 / ①-b) ──
         // decode delegate(attention_gen / attention_q4_gpu_fallback)는 single-query +
@@ -363,7 +362,7 @@ impl KVCacheFormat for StandardFormat {
             let kv_layout = cache.layout();
             let batch_size = q.shape().dims()[0];
             let q_start_pos = cache_seq_len - seq_len;
-            let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
+            let (k_cache, v_cache) = cache.view();
             let _ = scores;
             return prefill_attention(
                 q,
@@ -391,7 +390,7 @@ impl KVCacheFormat for StandardFormat {
             None => cache_seq_len,
         };
 
-        let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
+        let (k_cache, v_cache) = cache.view();
 
         // Q4_0 + GPU: `backend.attention_gen` 은 GPU 에 Q4_0 dequant-attention 커널이 없어
         // BlockQ4_0 raw 바이트를 float 로 오독 → garbage. forward_gen 의 `attention_q4_gpu_fallback`
