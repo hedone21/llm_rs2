@@ -9,7 +9,8 @@
 //!
 //! - **v1-1 (current)**: resilience default-on (`--no-resilience` opt-out).
 //! - v1-2: `--prompt-batch` (session::batch).
-//! - v1-3: weight swap 8종 (session::decode_fallback::swap_dispatch).
+//! - v1-3: weight swap 8종 — α-K BC 5-F 에서 decode_fallback(legacy 전용) 폐기됨.
+//!   argus-bench 로 fmt 경로 재구현 필요(별도 트랙).
 //! - v1-4: `--profile` / `--profile-events`.
 //! - v1-5: KIVI / Offload `--kv-mode`.
 //! - v1-6: `--tensor-partition > 0`.

@@ -213,9 +213,7 @@ fn impl_run_decode_loop(
         kv,
         max_seq_len,
         // Phase 4-4.7: microbench는 vtable overhead만 측정. plan path는 별도
-        // device G7' 게이트로 검증되므로 여기서는 비활성화 → forward_into fallback만.
-        false,
-        // fmt_eligible: microbench 는 forward_into vtable 측정 (substep 3c fmt flip 비대상).
+        // device G7' 게이트로 검증되므로 여기서는 비활성화 → forward_into_fmt fallback만.
         false,
     )?;
 

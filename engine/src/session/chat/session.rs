@@ -435,11 +435,6 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
         args.kv_caches,
         max_seq_len,
         false, // chat 모드는 plan path 비활성 (D4: eviction + plan 공존 미지원)
-        // fmt_eligible=true (BC (3d) S3): chat 도 fmt 자격. turn2 prefill panic 은 ①-b 의
-        // forward_into_fmt multi-token prefill dispatch(append at current_pos, q_start_pos 정합)로
-        // 해소, eviction 회계는 (3d) S2 의 try_evict UER 분기로 보존. 5-F(F0)에서 `LLMRS_KV_FMT`
-        // env 게이트 제거 → chat 도 fmt 가 production 기본 경로. 설계: design_alpha_k_3d_chat_fmt.
-        true,
     )?;
 
     let decode_loop = DecodeLoopBuilder::new()

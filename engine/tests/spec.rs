@@ -337,8 +337,6 @@ mod test_inv_layer_005;
 mod test_inv_layer_006;
 #[path = "spec/test_inv_layer_007.rs"]
 mod test_inv_layer_007;
-#[path = "spec/test_model_forward_parity.rs"]
-mod test_model_forward_parity;
 
 // ── Phase 4-5-d: ChatSession multi-turn + /reset + ensure_capacity + stats_line ──
 // G2: multi-turn KV pos 누적 보존 (DecodeLoop turn 사이 owned 재사용)

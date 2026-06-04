@@ -24,9 +24,7 @@ use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
 use crate::model_config::ModelArch;
-use crate::models::transformer::{
-    TransformerModel, TransformerModelForwardArgs, TransformerModelForwardFmtArgs,
-};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
 use crate::pressure::kv_cache::KVCache;
 use crate::pressure::standard_format::StandardFormat;
 use crate::session::traits::{Forward, StepCtx};
@@ -71,15 +69,8 @@ pub struct ModelForward {
 
     // fmt-cache wiring. prefill 시작 시 `kv_caches` 를 `Vec<Arc<StandardFormat>>` 로 wrap
     // (by-value move, 단일 물리 캐시) → forward/decode/eviction 모두 fmt(StandardFormat) 경로.
-    // 5-F(F0): `LLMRS_KV_FMT` env 게이트 제거 — fmt 가 production 기본. fmt_eligible 빌더면 항상 Some.
+    // 5-F: fmt 가 production 유일 경로(OLD forward_into<C> 폐기). prefill 후 항상 Some.
     fmt_caches: Option<Vec<Arc<StandardFormat>>>,
-
-    // fmt-cache 자격 — **happy-path(build_standard_loop) + chat(build_chat_standard) 둘 다 true**
-    // (BC (3d) S3 에서 chat 추가). chat 멀티턴 turn2 prefill 은 ①-b 의 forward_into_fmt multi-token
-    // dispatch(append at current_pos)로, eviction 회계는 (3d) S2 try_evict UER 분기로 보존된다.
-    // eval 등 ModelForward 를 거치지 않는 경로(fmt_bridge transient roundtrip)는 무관. 5-F(F0)
-    // 이후 두 빌더 모두 true 라 사실상 항상 fmt — 본 플래그는 F2 정리 후보(현재는 보존).
-    fmt_eligible: bool,
 
     // Phase 4-4.7 (A1): plan-aware decode. step()이 production fallback
     // (generate.rs l.4351~4477)과 동일하게 execute_plan → forward_into fallback
@@ -104,7 +95,6 @@ impl ModelForward {
     ///
     /// `max_seq_len` caps the lazy `PrefillWorkspace` allocation. KV caches
     /// must already be sized for the same context window.
-    // 생성자 — 소유 의존성 다수 (substep 3c 에서 fmt_eligible 추가로 8 인자).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend: Arc<dyn Backend>,
@@ -114,8 +104,6 @@ impl ModelForward {
         kv_caches: Vec<KVCache>,
         max_seq_len: usize,
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))] plan_enabled: bool,
-        // Phase α-K (3c): fmt-cache 게이트 자격. single-prompt happy-path 만 true(아래 필드 doc).
-        fmt_eligible: bool,
     ) -> Result<Self> {
         let hidden_size = model.config.hidden_size;
         let vocab_size = model.config.vocab_size;
@@ -154,7 +142,6 @@ impl ModelForward {
             logits_prefill_last,
             vocab_size,
             fmt_caches: None,
-            fmt_eligible,
             #[cfg(feature = "opencl")]
             gpu_plan: None,
             #[cfg(feature = "opencl")]
@@ -204,26 +191,19 @@ impl ModelForward {
             }
             return None;
         }
-        // (3p) ④-a: fmt active(`fmt_caches` Some) 면 `build_plan_fmt`(StandardFormat
-        // handle slice)로 빌드 — fmt wrap 이 `kv_caches` 를 mem::take 해 비웠으므로 기존
-        // `build_plan(&mut kv_caches)` 는 빈 슬라이스 → 무효. fmt OFF 시 기존 경로(무변).
-        let plan = if let Some(handles) = self.fmt_caches.as_ref() {
-            self.model.build_plan_fmt(
-                &self.decode_x_gen,
-                &self.logits_decode,
-                &self.decode_workspace,
-                handles,
-                &self.backend,
-            )
-        } else {
-            self.model.build_plan(
-                &self.decode_x_gen,
-                &self.logits_decode,
-                &self.decode_workspace,
-                &mut self.kv_caches,
-                &self.backend,
-            )
-        };
+        // (3p) ④-a: `build_plan_fmt`(StandardFormat handle slice). 5-F: fmt 가 유일 경로 —
+        // ensure_fmt_wrapped 가 kv_caches 를 mem::take 로 fmt_caches 로 옮겼으므로 항상 Some.
+        let handles = self
+            .fmt_caches
+            .as_ref()
+            .expect("fmt_caches Some after ensure_fmt_wrapped (5-F: fmt-only)");
+        let plan = self.model.build_plan_fmt(
+            &self.decode_x_gen,
+            &self.logits_decode,
+            &self.decode_workspace,
+            handles,
+            &self.backend,
+        );
         if plan.is_none() {
             // build_plan이 None 반환 → 본 모델/상태에서 plan path 미지원.
             // 매 step 시도를 막기 위해 sticky lock-out.
@@ -237,31 +217,17 @@ impl ModelForward {
         plan
     }
 
-    /// Borrow the underlying KV caches (Phase 4-4 `EvictionStage` will reach
-    /// in via `&mut self` accessors once those traits are wired).
-    pub fn kv_caches(&self) -> &[KVCache] {
-        &self.kv_caches
-    }
-
-    pub fn kv_caches_mut(&mut self) -> &mut [KVCache] {
-        &mut self.kv_caches
-    }
-
     pub fn model(&self) -> &Arc<TransformerModel> {
         &self.model
     }
 
-    /// Phase α-K (3c): `LLMRS_KV_FMT` 게이트 ON 시 `kv_caches` 를 `StandardFormat` 으로 1회 wrap.
+    /// `kv_caches` 를 `StandardFormat` 으로 1회 wrap (prefill 시작 시 lazy).
     ///
-    /// prefill 이 채운 캐시를 **by-value move**(`mem::take`)하므로 물리 캐시는 fmt 안에 단 한 벌만
-    /// 존재(dual-ownership 부재 — interior mutability 로 forward/eviction 모두 `&self` 통과, ADR-0001
-    /// §4.2). 게이트 OFF / 이미 wrap / `kv_caches` 빈 경우 no-op. 첫 `step()` 에서 lazy 호출되므로
-    /// prefill(→ `kv_caches` 직접 write) 이후 시점이 보장된다.
+    /// **by-value move**(`mem::take`)하므로 물리 캐시는 fmt 안에 단 한 벌만 존재(dual-ownership
+    /// 부재 — interior mutability 로 forward/eviction 모두 `&self` 통과, ADR-0001 §4.2). 이미 wrap /
+    /// `kv_caches` 빈 경우 no-op. 5-F: fmt 가 production 유일 경로(OLD forward_into<C> 폐기).
     fn ensure_fmt_wrapped(&mut self) {
-        // Phase α-K BC 5-F (F0): `LLMRS_KV_FMT` env 게이트 제거 — fmt 가 production 기본 경로.
-        // fmt_eligible 빌더(happy-path/chat)는 항상 wrap. fmt_eligible=false(현재 미존재 —
-        // eval 등은 ModelForward 미경유) 또는 이미 wrap / 빈 캐시면 no-op.
-        if !self.fmt_eligible || self.fmt_caches.is_some() || self.kv_caches.is_empty() {
+        if self.fmt_caches.is_some() || self.kv_caches.is_empty() {
             return;
         }
         let caches = std::mem::take(&mut self.kv_caches);
@@ -369,15 +335,9 @@ impl Forward for ModelForward {
         }
         let seq_len = tokens.len();
         let chunk_size = self.derive_chunk_size(seq_len);
-        // Phase 4-4.5: pass `prefill_workspace: None` so `forward_into` allocates
-        // its own owned workspace per chunk — matches the production prefill
-        // path (`generate.rs:3371`) bit-for-bit. The caller-reuse optimisation
-        // is deferred until the paradigm-equivalence regression is closed.
-
-        // Phase α-K ①-b: `LLMRS_KV_FMT` 게이트 ON(+ fmt_eligible) 시 prefill 도 fmt 경로로 통일.
-        // chunk loop **전** wrap — (3c)는 step()=decode 에서 lazy wrap(prefill 이후)했으나, prefill flip
-        // 으로 prefill 시작으로 이동. 이후 decode step() 의 ensure_fmt_wrapped 는 idempotent no-op
-        // (fmt_caches 이미 Some). 게이트 OFF / fmt_eligible=false(chat·eval) 면 no-op → 기존 forward_into.
+        // 5-F: fmt 가 유일 경로. chunk loop 전에 ensure_fmt_wrapped 로 kv_caches 를 fmt_caches 로
+        // wrap(idempotent — 이후 decode step() 의 호출은 fmt_caches 이미 Some 이라 no-op).
+        // 이후 각 chunk 를 forward_into_fmt(multi-token prefill batch scatter)로 처리.
         self.ensure_fmt_wrapped();
 
         let mut chunk_start = 0;
@@ -395,54 +355,32 @@ impl Forward for ModelForward {
             // current stack frame.
             let memory: &dyn Memory = unsafe { &*memory_ref };
 
-            // fmt 게이트 ON → forward_into_fmt(write_kv_batch + multi-token causal attention).
-            // concrete Arc clone → transient dyn Vec (step():423-427 패턴). 게이트 ON 시 kv_caches 는
-            // ensure_fmt_wrapped 가 mem::take 로 비웠으므로 **반드시** fmt 분기여야 한다(forward_into 는
-            // 빈 slice 인덱싱 panic) — 검증 wfceex20u 정정 E.
-            let dyn_fmts: Option<Vec<Arc<dyn KVCacheFormat>>> =
-                self.fmt_caches.as_ref().map(|fmts| {
-                    fmts.iter()
-                        .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
-                        .collect()
-                });
-            if let Some(dyn_fmts) = dyn_fmts {
-                self.model
-                    .forward_into_fmt(TransformerModelForwardFmtArgs {
-                        input_tokens: &input_tensor,
-                        start_pos: start_pos + chunk_start,
-                        fmts: &dyn_fmts,
-                        backend: &backend,
-                        memory,
-                        logits_out: &mut self.logits_prefill_last,
-                        x_gen: None,
-                        workspace: None,
-                        logits_last_only: true,
-                        // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
-                        score_accumulator: None,
-                        skip_config: None,
-                        importance_collector: None,
-                        cache_self_need_scores: false,
-                    })?;
-            } else {
-                self.model.forward_into(TransformerModelForwardArgs {
+            // 5-F: fmt 가 유일 경로. ensure_fmt_wrapped 가 kv_caches 를 mem::take 로 fmt_caches 로
+            // 옮겼으므로 항상 Some. concrete Arc clone → transient dyn Vec.
+            let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = self
+                .fmt_caches
+                .as_ref()
+                .expect("fmt_caches Some after ensure_fmt_wrapped (5-F: fmt-only)")
+                .iter()
+                .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
+                .collect();
+            self.model
+                .forward_into_fmt(TransformerModelForwardFmtArgs {
                     input_tokens: &input_tensor,
                     start_pos: start_pos + chunk_start,
-                    kv_caches: &mut self.kv_caches,
+                    fmts: &dyn_fmts,
                     backend: &backend,
                     memory,
                     logits_out: &mut self.logits_prefill_last,
                     x_gen: None,
                     workspace: None,
-                    prefill_workspace: None,
+                    logits_last_only: true,
+                    // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
                     score_accumulator: None,
-                    profiler: None,
                     skip_config: None,
                     importance_collector: None,
-                    logits_last_only: true,
-                    variance_collector: None,
-                    layer_boundary_hook: None,
+                    cache_self_need_scores: false,
                 })?;
-            }
 
             chunk_start = chunk_end;
         }
@@ -459,150 +397,75 @@ impl Forward for ModelForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
-        // Phase α-K (3c → (3p) ④-a): fmt-cache 게이트. `LLMRS_KV_FMT` ON 시 단일 물리 캐시를
-        // `StandardFormat` 으로 wrap 한 뒤, **plan path(`execute_plan_fmt`)를 먼저 시도**하고
-        // (build/invalidation 시) `forward_into_fmt`(trait object)로 폴백한다. (3c 까지는 plan 을
-        // 무조건 우회하고 dyn 폴백만 갔으나, (3p) 에서 plan/fmt 상호배타를 해소 — plan 이 이제
-        // `&[Arc<StandardFormat>]` 핸들을 직접 받는다.) 게이트 OFF 시 아래 기존 경로(production 무변).
+        // 5-F: fmt 가 유일 경로. plan path(execute_plan_fmt) 우선 시도 → build/invalidation 시
+        // forward_into_fmt(trait object) 폴백. ensure_fmt_wrapped 가 prefill 시작에 wrap 완료.
         self.ensure_fmt_wrapped();
-        if self.fmt_caches.is_some() {
-            // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan_fmt.
-            #[cfg(feature = "opencl")]
-            {
-                if self.gpu_plan.is_none() && !self.sticky_disabled {
-                    self.gpu_plan = self.try_build_plan();
-                }
-                let plan_opt = self.gpu_plan.take();
-                let plan_result = if let Some(plan) = plan_opt.as_ref() {
-                    let backend = self.backend.clone();
-                    let handles = self
-                        .fmt_caches
-                        .as_ref()
-                        .expect("fmt_caches Some checked above");
-                    self.model.execute_plan_fmt(
-                        plan,
-                        &self.decode_input,
-                        ctx.pos,
-                        &mut self.decode_x_gen,
-                        handles,
-                        &mut self.logits_decode,
-                        &backend,
-                    )
-                } else {
-                    Ok(false)
-                };
-                match plan_result {
-                    Ok(true) => {
-                        self.gpu_plan = plan_opt;
-                        return self.read_logits(&self.logits_decode);
-                    }
-                    Ok(false) | Err(_) => {
-                        // build 실패 / invalidation — dyn 폴백으로 강하 (gpu_plan 은
-                        // take() 로 이미 None, 다음 step 에서 lazy rebuild).
-                    }
-                }
-            }
-
-            // 폴백: forward_into_fmt(trait object) — plan 미빌드(host CPU)·invalidation 경로.
-            // concrete Arc clone → transient dyn Vec (fmt_caches borrow 는 map 클로저 안에서 종료).
-            let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = self
-                .fmt_caches
-                .as_ref()
-                .expect("fmt_caches Some checked above")
-                .iter()
-                .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
-                .collect();
-            let backend = self.backend.clone();
-            let memory_ref: *const dyn Memory = self.memory.as_ref();
-            // SAFETY: `self.memory` 는 self 소유, 본 call stack 동안 유효 (기존 fallback 동일 패턴).
-            let memory: &dyn Memory = unsafe { &*memory_ref };
-            self.model
-                .forward_into_fmt(TransformerModelForwardFmtArgs {
-                    input_tokens: &self.decode_input,
-                    start_pos: ctx.pos,
-                    fmts: &dyn_fmts,
-                    backend: &backend,
-                    memory,
-                    logits_out: &mut self.logits_decode,
-                    x_gen: Some(&mut self.decode_x_gen),
-                    workspace: Some(&mut self.decode_workspace),
-                    logits_last_only: false,
-                    // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
-                    score_accumulator: None,
-                    skip_config: None,
-                    importance_collector: None,
-                    cache_self_need_scores: false,
-                })?;
-            return self.read_logits(&self.logits_decode);
-        }
-
-        // Phase 4-4.7 (A1): plan path 우선 시도. invalidation 또는 build 실패 시
-        // forward_into fallback. production fallback (generate.rs l.4351~4376) 패턴.
+        // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan_fmt.
         #[cfg(feature = "opencl")]
         {
-            // Lazy build: gpu_plan이 None이고 sticky_disabled가 false일 때만 시도.
             if self.gpu_plan.is_none() && !self.sticky_disabled {
                 self.gpu_plan = self.try_build_plan();
             }
-
-            // borrow 충돌 회피: plan을 step scope로 take, 결과에 따라 복귀/drop.
-            // (execute_plan은 `&plan` + `&mut kv_caches` 동시 borrow 필요)
             let plan_opt = self.gpu_plan.take();
             let plan_result = if let Some(plan) = plan_opt.as_ref() {
                 let backend = self.backend.clone();
-                self.model.execute_plan(
+                let handles = self
+                    .fmt_caches
+                    .as_ref()
+                    .expect("fmt_caches Some after ensure_fmt_wrapped (5-F: fmt-only)");
+                self.model.execute_plan_fmt(
                     plan,
                     &self.decode_input,
                     ctx.pos,
                     &mut self.decode_x_gen,
-                    &mut self.kv_caches,
+                    handles,
                     &mut self.logits_decode,
                     &backend,
                 )
             } else {
                 Ok(false)
             };
-
             match plan_result {
                 Ok(true) => {
-                    // 성공: plan을 다시 보유 + logits 반환.
                     self.gpu_plan = plan_opt;
                     return self.read_logits(&self.logits_decode);
                 }
                 Ok(false) | Err(_) => {
-                    // Invalidated (KV resize 등) 또는 execute 오류 — plan_opt drop,
-                    // gpu_plan은 take()로 이미 None. fallback으로 진행.
-                    // 다음 step 진입부에서 lazy rebuild 자동 시도.
+                    // build 실패 / invalidation — dyn 폴백으로 강하 (gpu_plan 은
+                    // take() 로 이미 None, 다음 step 에서 lazy rebuild).
                 }
             }
         }
 
-        // Fallback: forward_into 직접 호출 (production l.4380~4438과 동치).
-        // Same trick as prefill: split &mut borrows so we do not hold &self
-        // and &mut self.kv_caches simultaneously inside the args literal.
+        // 폴백: forward_into_fmt(trait object) — plan 미빌드(host CPU)·invalidation 경로.
+        let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = self
+            .fmt_caches
+            .as_ref()
+            .expect("fmt_caches Some after ensure_fmt_wrapped (5-F: fmt-only)")
+            .iter()
+            .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
+            .collect();
         let backend = self.backend.clone();
         let memory_ref: *const dyn Memory = self.memory.as_ref();
+        // SAFETY: `self.memory` 는 self 소유, 본 call stack 동안 유효.
         let memory: &dyn Memory = unsafe { &*memory_ref };
-
-        self.model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &self.decode_input,
-            start_pos: ctx.pos,
-            kv_caches: &mut self.kv_caches,
-            backend: &backend,
-            memory,
-            logits_out: &mut self.logits_decode,
-            x_gen: Some(&mut self.decode_x_gen),
-            workspace: Some(&mut self.decode_workspace),
-            prefill_workspace: None,
-            score_accumulator: None,
-            profiler: None,
-            skip_config: None,
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-            layer_boundary_hook: None,
-        })?;
-
+        self.model
+            .forward_into_fmt(TransformerModelForwardFmtArgs {
+                input_tokens: &self.decode_input,
+                start_pos: ctx.pos,
+                fmts: &dyn_fmts,
+                backend: &backend,
+                memory,
+                logits_out: &mut self.logits_decode,
+                x_gen: Some(&mut self.decode_x_gen),
+                workspace: Some(&mut self.decode_workspace),
+                logits_last_only: false,
+                // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
+                score_accumulator: None,
+                skip_config: None,
+                importance_collector: None,
+                cache_self_need_scores: false,
+            })?;
         self.read_logits(&self.logits_decode)
     }
 
