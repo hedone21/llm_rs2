@@ -19,13 +19,15 @@ use crate::layers::workspace::{
 };
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::TransformerModelForwardArgs;
+use crate::models::transformer::TransformerModelForwardFmtArgs;
+use crate::pressure::kv_cache::KVCache;
 use crate::resilience::KVSnapshot;
 use crate::session::batch::args::BatchRunCtx;
 use crate::session::batch::helpers::{
     load_prompt_batch, make_partition_gpu_alloc, resolve_prompt, unix_ts,
 };
 use crate::session::cli::parse_qcf_sample_layers;
+use crate::session::eval::EvalCacheKind;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -380,24 +382,23 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 );
                 let input_tensor = backend.copy_from(&cpu_chunk_tensor)?;
 
-                model.forward_into(TransformerModelForwardArgs {
-                    input_tokens: &input_tensor,
-                    start_pos: chunk_start,
-                    kv_caches: &mut kv_caches,
-                    backend: &backend,
-                    memory: batch_effective_mem,
-                    logits_out: &mut prefill_logits,
-                    x_gen: None,
-                    workspace: None,
-                    score_accumulator: hook.score_accumulator(),
-                    profiler: None,
-                    skip_config: skip_config.as_ref(),
-                    importance_collector: None,
-                    logits_last_only: chunked,
-                    variance_collector: None,
-                    prefill_workspace: None,
-
-                    layer_boundary_hook: None,
+                // Phase α-K ①-d: forward_into → fmt round-trip (GPU prefill chunk).
+                KVCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
+                    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                        input_tokens: &input_tensor,
+                        start_pos: chunk_start,
+                        fmts,
+                        backend: &backend,
+                        memory: batch_effective_mem,
+                        logits_out: &mut prefill_logits,
+                        x_gen: None,
+                        workspace: None,
+                        logits_last_only: chunked,
+                        score_accumulator: hook.score_accumulator(),
+                        skip_config: skip_config.as_ref(),
+                        importance_collector: None,
+                        cache_self_need_scores: false,
+                    })
                 })?;
                 backend.synchronize()?;
                 drop(input_tensor);
@@ -449,24 +450,23 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                                 cpu_backend_arc.clone(),
                             );
 
-                            model.forward_into(TransformerModelForwardArgs {
-                                input_tokens: &cpu_in_tensor,
-                                start_pos: cpu_chunk_start_pos,
-                                kv_caches: &mut kv_caches,
-                                backend: &cpu_backend_arc,
-                                memory: cpu_memory_arc.as_ref(),
-                                logits_out: &mut cpu_logits,
-                                x_gen: None,
-                                workspace: None,
-                                score_accumulator: hook.score_accumulator(),
-                                profiler: None,
-                                skip_config: skip_config.as_ref(),
-                                importance_collector: None,
-                                logits_last_only: true,
-                                variance_collector: None,
-                                prefill_workspace: None,
-
-                                layer_boundary_hook: None,
+                            // Phase α-K ①-d: forward_into → fmt round-trip (CPU interleave prefill).
+                            KVCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
+                                model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                                    input_tokens: &cpu_in_tensor,
+                                    start_pos: cpu_chunk_start_pos,
+                                    fmts,
+                                    backend: &cpu_backend_arc,
+                                    memory: cpu_memory_arc.as_ref(),
+                                    logits_out: &mut cpu_logits,
+                                    x_gen: None,
+                                    workspace: None,
+                                    logits_last_only: true,
+                                    score_accumulator: hook.score_accumulator(),
+                                    skip_config: skip_config.as_ref(),
+                                    importance_collector: None,
+                                    cache_self_need_scores: false,
+                                })
                             })?;
                             drop(cpu_in_tensor);
                             drop(cpu_logits);
@@ -739,24 +739,24 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 } else {
                     cpu_memory_arc.as_ref()
                 };
-                model.forward_into(TransformerModelForwardArgs {
-                    input_tokens: &gen_input_tensor,
-                    start_pos: prompt_tokens - 1,
-                    kv_caches: &mut kv_caches,
-                    backend: &backend,
-                    memory: probe_mem,
-                    logits_out: &mut logits,
-                    x_gen: Some(&mut x_gen),
-                    workspace: Some(&mut gen_ws),
-                    score_accumulator: hook.score_accumulator(),
-                    profiler: None,
-                    skip_config: skip_config.as_ref(),
-                    importance_collector: None,
-                    logits_last_only: false,
-                    variance_collector: None,
-                    prefill_workspace: None,
-
-                    layer_boundary_hook: None,
+                // Phase α-K ①-d: forward_into → fmt round-trip (decode probe; workspace=Some →
+                // forward_gen_fmt, 발산 A 무관). score-feed 활성(H2O 누적).
+                KVCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
+                    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                        input_tokens: &gen_input_tensor,
+                        start_pos: prompt_tokens - 1,
+                        fmts,
+                        backend: &backend,
+                        memory: probe_mem,
+                        logits_out: &mut logits,
+                        x_gen: Some(&mut x_gen),
+                        workspace: Some(&mut gen_ws),
+                        logits_last_only: false,
+                        score_accumulator: hook.score_accumulator(),
+                        skip_config: skip_config.as_ref(),
+                        importance_collector: None,
+                        cache_self_need_scores: false,
+                    })
                 })?;
                 for (cache, &pos) in kv_caches.iter_mut().zip(saved_positions.iter()) {
                     cache.set_current_pos(pos);
@@ -814,24 +814,24 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 } else {
                     cpu_memory_arc.as_ref()
                 };
-                model.forward_into(TransformerModelForwardArgs {
-                    input_tokens: &gen_input_tensor,
-                    start_pos: batch_start_pos,
-                    kv_caches: &mut kv_caches,
-                    backend: &backend,
-                    memory: effective_mem,
-                    logits_out: &mut logits,
-                    x_gen: Some(&mut x_gen),
-                    workspace: Some(&mut gen_ws),
-                    score_accumulator: hook.score_accumulator(),
-                    profiler: None,
-                    skip_config: skip_config.as_ref(),
-                    importance_collector: None,
-                    logits_last_only: false,
-                    variance_collector: None,
-                    prefill_workspace: None,
-
-                    layer_boundary_hook: None,
+                // Phase α-K ①-d: forward_into → fmt round-trip (decode loop; workspace=Some →
+                // forward_gen_fmt, 발산 A 무관). score-feed 활성(H2O 누적).
+                KVCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
+                    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                        input_tokens: &gen_input_tensor,
+                        start_pos: batch_start_pos,
+                        fmts,
+                        backend: &backend,
+                        memory: effective_mem,
+                        logits_out: &mut logits,
+                        x_gen: Some(&mut x_gen),
+                        workspace: Some(&mut gen_ws),
+                        logits_last_only: false,
+                        score_accumulator: hook.score_accumulator(),
+                        skip_config: skip_config.as_ref(),
+                        importance_collector: None,
+                        cache_self_need_scores: false,
+                    })
                 })?;
                 backend.synchronize()?;
                 hook.post_decode_step(&mut kv_caches, generated_count);

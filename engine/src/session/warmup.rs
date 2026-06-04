@@ -16,8 +16,9 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
 use crate::pressure::kv_cache::KVCache;
+use crate::session::eval::EvalCacheKind;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -29,7 +30,7 @@ pub fn run_warmup(
     model: &mut TransformerModel,
     backend: &Arc<dyn Backend>,
     memory: &Arc<dyn Memory>,
-    kv_caches: &mut [KVCache],
+    kv_caches: &mut Vec<KVCache>,
     tokens: &[u32],
     vocab_size: usize,
 ) -> anyhow::Result<()> {
@@ -66,23 +67,25 @@ pub fn run_warmup(
     let warmup_logits_buf = memory.alloc(warmup_tokens * vocab_size * 4, DType::F32)?;
     let mut warmup_logits = Tensor::new(warmup_logits_shape, warmup_logits_buf, backend.clone());
 
-    model.forward_into(TransformerModelForwardArgs {
-        input_tokens: &warmup_input,
-        start_pos: 0,
-        kv_caches,
-        backend,
-        memory: memory.as_ref(),
-        logits_out: &mut warmup_logits,
-        x_gen: None,
-        workspace: None,
-        score_accumulator: None,
-        profiler: None,
-        skip_config: None,
-        importance_collector: None,
-        logits_last_only: false,
-        variance_collector: None,
-        prefill_workspace: None,
-        layer_boundary_hook: None,
+    // Phase α-K ①-d: forward_into → fmt round-trip. seq_len=warmup_tokens(기본 1)이라 보통
+    // workspace=None decode fallthrough(발산 A) 진입. 어차피 직후 KV cache reset(아래 103) →
+    // bit-identity 가 구조적으로 보장(forward 출력/KV write 전부 폐기).
+    KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
+        model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            input_tokens: &warmup_input,
+            start_pos: 0,
+            fmts,
+            backend,
+            memory: memory.as_ref(),
+            logits_out: &mut warmup_logits,
+            x_gen: None,
+            workspace: None,
+            logits_last_only: false,
+            score_accumulator: None,
+            skip_config: None,
+            importance_collector: None,
+            cache_self_need_scores: false,
+        })
     })?;
     backend.synchronize()?;
     let warmup_ms = warmup_start.elapsed().as_secs_f64() * 1000.0;

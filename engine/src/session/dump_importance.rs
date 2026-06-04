@@ -13,9 +13,10 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
+use crate::models::transformer::{TransformerModel, TransformerModelForwardFmtArgs};
 use crate::pressure::kv_cache::KVCache;
 use crate::qcf::ImportanceCollector;
+use crate::session::eval::EvalCacheKind;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -62,23 +63,25 @@ pub fn run_dump_importance(mut ctx: DumpImportanceCtx) -> anyhow::Result<()> {
         ctx.backend.clone(),
     );
 
-    ctx.model.forward_into(TransformerModelForwardArgs {
-        input_tokens: &input_tensor,
-        start_pos: 0,
-        kv_caches: &mut ctx.kv_caches,
-        backend: &ctx.backend,
-        memory: &*ctx.memory,
-        logits_out: &mut logits,
-        x_gen: None,
-        workspace: None,
-        score_accumulator: None,
-        profiler: None,
-        skip_config: None,
-        importance_collector: Some(&mut collector),
-        logits_last_only: false,
-        variance_collector: None,
-        prefill_workspace: None,
-        layer_boundary_hook: None,
+    // Phase α-K ①-d: forward_into → fmt round-trip (prefill, qcf:212 구조적 쌍둥이).
+    // ctx.kv_caches 는 owned Vec → 시그니처 변경 불요. disjoint field borrow(model/backend/memory
+    // vs kv_caches)로 closure 와 &mut 공존.
+    KVCache::forward_fmt_roundtrip(&mut ctx.kv_caches, |fmts| {
+        ctx.model.forward_into_fmt(TransformerModelForwardFmtArgs {
+            input_tokens: &input_tensor,
+            start_pos: 0,
+            fmts,
+            backend: &ctx.backend,
+            memory: &*ctx.memory,
+            logits_out: &mut logits,
+            x_gen: None,
+            workspace: None,
+            logits_last_only: false,
+            score_accumulator: None,
+            skip_config: None,
+            importance_collector: Some(&mut collector),
+            cache_self_need_scores: false,
+        })
     })?;
 
     let table = collector.build();

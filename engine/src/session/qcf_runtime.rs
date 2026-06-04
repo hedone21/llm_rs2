@@ -14,8 +14,9 @@ use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
-use crate::models::transformer::TransformerModelForwardArgs;
+use crate::models::transformer::TransformerModelForwardFmtArgs;
 use crate::pressure::kv_cache::KVCache;
+use crate::session::eval::EvalCacheKind;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -126,7 +127,7 @@ pub struct QcfWarmupCtx<'a> {
     pub model: &'a crate::models::transformer::TransformerModel,
     pub backend: &'a Arc<dyn Backend>,
     pub memory: &'a dyn Memory,
-    pub kv_caches: &'a mut [KVCache],
+    pub kv_caches: &'a mut Vec<KVCache>,
     pub vocab_size: usize,
     pub warmup_ids: &'a [u32],
     pub gpu_backend: Option<&'a Arc<dyn Backend>>,
@@ -209,24 +210,23 @@ pub fn run_qcf_warmup_workflow(
             backend.clone(),
         );
 
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &warmup_input,
-            start_pos: 0,
-            kv_caches,
-            backend,
-            memory,
-            logits_out: &mut warmup_logits,
-            x_gen: None,
-            workspace: None,
-            score_accumulator: None,
-            profiler: None,
-            skip_config: None,
-            importance_collector: Some(&mut collector),
-            logits_last_only: false,
-            variance_collector: None,
-            prefill_workspace: None,
-
-            layer_boundary_hook: None,
+        // Phase α-K ①-d: forward_into → fmt round-trip (warmup prefill, importance 부착).
+        KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
+            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                input_tokens: &warmup_input,
+                start_pos: 0,
+                fmts,
+                backend,
+                memory,
+                logits_out: &mut warmup_logits,
+                x_gen: None,
+                workspace: None,
+                logits_last_only: false,
+                score_accumulator: None,
+                skip_config: None,
+                importance_collector: Some(&mut collector),
+                cache_self_need_scores: false,
+            })
         })?;
         backend.synchronize()?;
 
@@ -297,24 +297,24 @@ pub fn run_qcf_warmup_workflow(
                     backend.clone(),
                 );
 
-                model.forward_into(TransformerModelForwardArgs {
-                    input_tokens: &decode_input,
-                    start_pos: actual_warmup_len + step,
-                    kv_caches,
-                    backend,
-                    memory,
-                    logits_out: &mut decode_logits,
-                    x_gen: None,
-                    workspace: None,
-                    score_accumulator: None,
-                    profiler: None,
-                    skip_config: None,
-                    importance_collector: Some(&mut collector_decode),
-                    logits_last_only: true,
-                    variance_collector: None,
-                    prefill_workspace: None,
-
-                    layer_boundary_hook: None,
+                // Phase α-K ①-d: forward_into → fmt round-trip (decode-X, seq_len=1 workspace=None
+                // → forward_into_fmt 의 발산 A fallthrough = 구 layer.forward→forward_prefill bit-identical).
+                KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
+                    model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                        input_tokens: &decode_input,
+                        start_pos: actual_warmup_len + step,
+                        fmts,
+                        backend,
+                        memory,
+                        logits_out: &mut decode_logits,
+                        x_gen: None,
+                        workspace: None,
+                        logits_last_only: true,
+                        score_accumulator: None,
+                        skip_config: None,
+                        importance_collector: Some(&mut collector_decode),
+                        cache_self_need_scores: false,
+                    })
                 })?;
                 backend.synchronize()?;
 

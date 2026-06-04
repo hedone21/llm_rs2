@@ -17,10 +17,12 @@ use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
 use crate::models::transformer::TransformerModelForwardArgs;
+use crate::models::transformer::TransformerModelForwardFmtArgs;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kivi_cache::KiviCache;
 use crate::pressure::kv_cache::KVCache;
 use crate::session::cli::Args;
+use crate::session::eval::EvalCacheKind;
 use crate::session::ppl::args::PplResult;
 use crate::session::ppl::args::PplRunCtx;
 use crate::session::qcf_runtime::{
@@ -364,6 +366,12 @@ pub fn run_kivi_ppl(
             backend.clone(),
         );
 
+        // Phase α-K ①-d: run_kivi_ppl 은 **defer**(forward_into 유지). KIVI multi-token prefill 은
+        // forward_into_fmt → forward_prefill_fmt → KIVIFormat::attention_into 인데, KIVIFormat 은
+        // prefill arm 부재(attention_gen=single-query decode 전용, kivi_format.rs:95-173) → multi-token
+        // 진입 시 panic. KiviCache::get_view 가 compact view 라 StandardFormat 의 prefill_attention 을
+        // 그대로 못 쓰고 layout/capacity/bits·GPU native·device 검증이 필요한 별도 feature 증분(①-e 후보).
+        // 따라서 run_kivi_ppl(prefill+decode)은 fmt 전환을 보류하고 generic forward_into 를 유지한다.
         model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos: 0,
@@ -380,7 +388,6 @@ pub fn run_kivi_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
-
             layer_boundary_hook: None,
         })?;
 
@@ -445,6 +452,8 @@ pub fn run_kivi_ppl(
             std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
         })?;
 
+        // Phase α-K ①-d: run_kivi_ppl 은 defer (위 prefill 주석 참조 — KIVIFormat prefill arm 부재).
+        // decode(seq_len=1)는 fmt 가능하나 prefill 이 generic 이라 함수 단위로 보류(일관성).
         model.forward_into(TransformerModelForwardArgs {
             input_tokens: &gen_input_gpu,
             start_pos,
@@ -461,7 +470,6 @@ pub fn run_kivi_ppl(
             logits_last_only: false,
             variance_collector: None,
             prefill_workspace: None,
-
             layer_boundary_hook: None,
         })?;
         start_pos += 1;
@@ -593,7 +601,7 @@ pub fn run_ppl(
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
-    kv_caches: &mut [KVCache],
+    kv_caches: &mut Vec<KVCache>,
     cache_manager: &mut CacheManager,
     score_accumulator: &mut Option<AttentionScoreAccumulator>,
     vocab_size: usize,
@@ -768,24 +776,24 @@ pub fn run_ppl(
             acc.begin_step();
         }
 
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos: 0,
-            kv_caches,
-            backend,
-            memory,
-            logits_out: &mut prefill_logits,
-            x_gen: None,
-            workspace: None,
-            score_accumulator: score_accumulator.as_mut(),
-            profiler: None,
-            skip_config,
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-            prefill_workspace: None,
-
-            layer_boundary_hook: None,
+        // Phase α-K ①-d: forward_into → fmt round-trip (run_ppl prefill). begin_step 선행(위) 유지.
+        // KVCache → cache_self_need_scores=false. score-feed 는 prefill(workspace=None)이라 자연 skip.
+        KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
+            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                input_tokens: &input_tensor,
+                start_pos: 0,
+                fmts,
+                backend,
+                memory,
+                logits_out: &mut prefill_logits,
+                x_gen: None,
+                workspace: None,
+                logits_last_only: false,
+                score_accumulator: score_accumulator.as_mut(),
+                skip_config,
+                importance_collector: None,
+                cache_self_need_scores: false,
+            })
         })?;
 
         // Read all prefill logits to CPU
@@ -932,24 +940,24 @@ pub fn run_ppl(
             std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
         })?;
 
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &gen_input_gpu,
-            start_pos,
-            kv_caches,
-            backend,
-            memory,
-            logits_out: &mut decode_logits,
-            x_gen: Some(&mut x_gen),
-            workspace: Some(&mut gen_ws),
-            score_accumulator: score_accumulator.as_mut(),
-            profiler: None,
-            skip_config,
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-            prefill_workspace: None,
-
-            layer_boundary_hook: None,
+        // Phase α-K ①-d: forward_into → fmt round-trip (run_ppl decode; workspace=Some →
+        // forward_gen_fmt, 발산 A 무관). score-feed 활성(H2O 누적).
+        KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
+            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                input_tokens: &gen_input_gpu,
+                start_pos,
+                fmts,
+                backend,
+                memory,
+                logits_out: &mut decode_logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                logits_last_only: false,
+                score_accumulator: score_accumulator.as_mut(),
+                skip_config,
+                importance_collector: None,
+                cache_self_need_scores: false,
+            })
         })?;
         start_pos += 1;
 

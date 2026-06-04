@@ -2078,20 +2078,22 @@ impl TransformerModel {
 
         // prefill owned PrefillWorkspace (forward_into:1583-1607 미러, CPU/GPU 모두 할당 — fmt 경로는
         // forward_prefill_fmt 가 항상 workspace 를 요구). needs_ws_sync = GPU 한정(drop 전 sync).
-        let mut owned_prefill_ws: Option<crate::layers::workspace::PrefillWorkspace> = None;
+        // Phase α-K ①-d: ws_cfg 를 함수 스코프로 끌어올려 prefill arm + workspace-None decode
+        // fallthrough(발산 A)가 공유. prefill 은 즉시 alloc, fallthrough 는 진입 시 lazy alloc.
+        use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
+        let ws_cfg = WsCfg {
+            batch_size,
+            dim: hidden_size,
+            q_dim: self.config.num_attention_heads * self.config.head_dim,
+            k_dim: self.config.num_key_value_heads * self.config.head_dim,
+            v_dim: self.config.num_key_value_heads * self.config.head_dim,
+            ffn_hidden: self.config.intermediate_size,
+            n_heads: self.config.num_attention_heads,
+            max_seq_len: 0,
+        };
+        let mut owned_prefill_ws: Option<PrefillWorkspace> = None;
         let mut needs_ws_sync = false;
         if !is_decode {
-            use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
-            let ws_cfg = WsCfg {
-                batch_size,
-                dim: hidden_size,
-                q_dim: self.config.num_attention_heads * self.config.head_dim,
-                k_dim: self.config.num_key_value_heads * self.config.head_dim,
-                v_dim: self.config.num_key_value_heads * self.config.head_dim,
-                ffn_hidden: self.config.intermediate_size,
-                n_heads: self.config.num_attention_heads,
-                max_seq_len: 0,
-            };
             owned_prefill_ws = Some(PrefillWorkspace::new(
                 &ws_cfg,
                 seq_len,
@@ -2134,7 +2136,47 @@ impl TransformerModel {
                 coll.snapshot_before(x_data, seq_len, hidden_size);
             }
 
-            if is_decode {
+            if is_decode && workspace.is_none() {
+                // 발산 A (Phase α-K ①-d): 구 forward_into 의 decode(seq_len==1, workspace=None)는
+                // layer.forward 가 forward_prefill 로 fall-through(transformer_layer.rs:261/287,
+                // degenerate 1-token). forward_prefill_fmt 는 forward_prefill 과 bit-identical(seq_len=1
+                // flash 경로)이라 동일 시맨틱. warmup(기본 warmup_tokens=1)·qcf decode-X 만 진입 —
+                // production 호출처(model_forward decode=workspace Some, eval decode=workspace Some,
+                // 모든 prefill=seq_len>1)는 미발화(순수 additive).
+                if owned_prefill_ws.is_none() {
+                    owned_prefill_ws = Some(PrefillWorkspace::new(
+                        &ws_cfg,
+                        seq_len,
+                        memory,
+                        backend.clone(),
+                    )?);
+                    needs_ws_sync = backend.is_gpu();
+                }
+                let pws = owned_prefill_ws
+                    .as_mut()
+                    .expect("fallthrough PrefillWorkspace just allocated");
+                layer.forward_prefill_fmt(
+                    crate::layers::transformer_layer::ForwardPrefillFmtArgs {
+                        x: &mut x,
+                        fmt: &fmts[i],
+                        start_pos,
+                        backend,
+                        pws,
+                        rms_norm_eps: self.config.rms_norm_eps as f32,
+                        rope_theta,
+                        head_dim: self.config.head_dim,
+                        batch_size,
+                        seq_len,
+                        dim: hidden_size,
+                        skip_attn: s_attn,
+                        skip_mlp: s_mlp,
+                        rms_norm_add_unit: is_gemma3,
+                        use_gelu_tanh: is_gemma3,
+                        is_local_attn: is_local,
+                        local_attn_window: self.config.sliding_window,
+                    },
+                )?;
+            } else if is_decode {
                 // need_scores = (GPU acc 미활성 시 score_acc layer-track) || cache 자가-need(KIVI AWQE).
                 // forward_into:1707 + forward_gen.rs:409 AWQE OR 항 미러.
                 let acc_need = if gpu_score_active {
