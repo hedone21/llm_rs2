@@ -640,6 +640,44 @@ impl Forward for ModelForward {
         force: bool,
         target_ratio: f32,
     ) -> anyhow::Result<(usize, usize)> {
+        // Phase α-K BC (3d): fmt 활성(chat fmt-wrap) 시 UER(Unwrap-Evict-Rewrap).
+        // fmt-wrap 이 kv_caches 를 mem::take 해 비웠으므로 OLD 경로는 빈 슬라이스 → silent no-op.
+        // inner KVCache 들을 연속 Vec 로 꺼내(take_inner) OLD `cache_manager.{force,maybe}_evict*`
+        // 를 **그대로 재사용**(전 정책 sliding/h2o/h2o_plus/d2o + D2O cross-layer merge + execute_dispatch
+        // 의 madvise/new_pos/CacheEvent 보존, selection 동일성 = code-path 동일성) 후 다시 넣는다(put_inner).
+        // 설계: design_alpha_k_3d_chat_fmt_2026_06_04.md (Approach B, 적대검증 3 lens 만장일치).
+        if let Some(fmts) = &self.fmt_caches {
+            // W1 불변식: fmts = ensure_fmt_wrapped enumerate 순서 == layer idx (D2O cross-layer 전제).
+            let before_pos = fmts
+                .first()
+                .map(|f| f.with_cache_mut(|c| c.current_pos))
+                .unwrap_or(0);
+            let mut temp: Vec<crate::pressure::kv_cache::KVCache> =
+                fmts.iter().map(|f| f.take_inner()).collect();
+            // evict 결과를 캡처 → `?` 전파를 rewrap 이후로 미뤄 placeholder 잔존 방지(잔여위험 1).
+            let evict_result = if force {
+                match scores {
+                    Some(sc) => cache_manager.force_evict_with_scores(&mut temp, target_ratio, sc),
+                    None => cache_manager.force_evict(&mut temp, target_ratio),
+                }
+            } else {
+                match scores {
+                    Some(sc) => cache_manager.maybe_evict_with_scores(&mut temp, sc),
+                    None => cache_manager.maybe_evict(&mut temp),
+                }
+            };
+            // rewrap: 항상 실행(Err/Ok 무관) — inner 복귀, placeholder 폐기.
+            for (f, c) in fmts.iter().zip(temp.into_iter()) {
+                f.put_inner(c);
+            }
+            let result = evict_result?;
+            return if result.evicted {
+                Ok((before_pos.saturating_sub(result.new_pos), result.new_pos))
+            } else {
+                Ok((0, before_pos))
+            };
+        }
+
         let before_pos = self.kv_caches.first().map(|c| c.current_pos).unwrap_or(0);
 
         let result = if force {

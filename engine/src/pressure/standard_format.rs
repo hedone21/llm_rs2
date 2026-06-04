@@ -8,6 +8,7 @@
 //! 0(unit test 에서만 생성). 내부 가변성 = `std::sync::Mutex`(trait `Send+Sync` 요구로 `RefCell`
 //! 불가; §4.1 R4 상 cold-path 라 lock 비용 무관).
 
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -15,7 +16,9 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::format::{AttnDims, KVCacheFormat, Merge};
+use crate::memory::host::shared::SharedBuffer;
 use crate::pressure::kv_cache::KVCache;
+use crate::shape::Shape;
 use crate::tensor::Tensor;
 
 /// 내부 가변 상태 — `KVCache` 와 비-F32 cast scratch 를 **단일 lock** 으로 묶는다.
@@ -105,6 +108,31 @@ impl StandardFormat {
     /// (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`).
     pub(crate) fn into_inner(self) -> KVCache {
         self.inner.into_inner().unwrap().cache
+    }
+
+    /// Unwrap-Evict-Rewrap (UER) seam (Phase α-K BC (3d)): inner `KVCache` 를 일시적으로 꺼낸다.
+    ///
+    /// chat 멀티턴 eviction 이 `CacheManager::force_evict(&mut [KVCache])`(연속 슬라이스 요구,
+    /// D2O cross-layer 정확성)를 **OLD 경로 그대로** 재사용하도록, fmt_caches 의 inner cache 들을
+    /// 연속 `Vec<KVCache>` 로 모으는 용도. `put_inner` 와 페어 호출(단일 lock 구간 sequential).
+    /// cast scratch(`k_cast`/`v_cast`)는 guard 에 남아 보존된다(다음 write 재사용). Arc 는 보존
+    /// (into_inner 의 try_unwrap 과 달리 self 미소비) — listener phase 무관.
+    ///
+    /// `KVCache: !Default` 이므로 `mem::take` 불가 → cache 자신의 backend 로 만든 0-size
+    /// placeholder 로 `mem::replace`. placeholder 는 `put_inner` 까지 microsecond 만 잔존(eviction
+    /// = turn 경계 cold path 라 per-layer 0-byte 할당 무시 가능).
+    pub(crate) fn take_inner(&self) -> KVCache {
+        let mut guard = self.inner.lock().unwrap();
+        let backend = guard.cache.k_buffer.backend().clone();
+        let buf = Arc::new(SharedBuffer::new(0, DType::F32));
+        let ph_k = Tensor::new(Shape::new(vec![1, 0, 1, 1]), buf.clone(), backend.clone());
+        let ph_v = Tensor::new(Shape::new(vec![1, 0, 1, 1]), buf, backend);
+        std::mem::replace(&mut guard.cache, KVCache::new(ph_k, ph_v, 0))
+    }
+
+    /// `take_inner` 의 역연산 — evict 된 `KVCache` 를 다시 넣는다(placeholder 폐기).
+    pub(crate) fn put_inner(&self, cache: KVCache) {
+        self.inner.lock().unwrap().cache = cache;
     }
 
     /// KV write 흡수 — `forward_gen` 의 KV-update 분기(transformer_layer/forward_gen.rs:330-386)를
@@ -875,6 +903,32 @@ mod tests {
         assert_eq!(fmt.idx(), 3);
         assert_eq!(fmt.capacity(), 8);
         assert_eq!(fmt.current_pos(), 0);
+    }
+
+    #[test]
+    fn test_take_put_inner_round_trip() {
+        // Phase α-K BC (3d) S1: take_inner → put_inner 는 identity. 토큰 write 후 take 한 cache 가
+        // 데이터·pos 를 보존하고, put 후 wrapper 가 다시 정상 접근 가능해야 한다(eviction UER seam).
+        let kv_heads = 2;
+        let head_dim = 4;
+        let fmt = StandardFormat::new(0, make_cache(8, kv_heads, head_dim));
+        let token = vec![7.0f32; kv_heads * head_dim];
+        let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &token);
+        let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &token);
+        fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
+        assert_eq!(fmt.current_pos(), 1);
+
+        // take: 꺼낸 cache 가 데이터·pos 보존, wrapper 는 placeholder(pos=0) 보유.
+        let taken = fmt.take_inner();
+        assert_eq!(taken.current_pos, 1);
+        assert_eq!(taken.k_buffer.as_slice::<f32>()[0], 7.0);
+        assert_eq!(fmt.current_pos(), 0, "take 후 wrapper 는 placeholder");
+
+        // put: 복귀하면 wrapper 가 원래 cache 를 다시 노출.
+        fmt.put_inner(taken);
+        assert_eq!(fmt.current_pos(), 1, "put 후 원래 cache 복귀");
+        let guard = fmt.inner.lock().unwrap();
+        assert_eq!(guard.cache.k_buffer.as_slice::<f32>()[0], 7.0);
     }
 
     #[cfg(feature = "opencl")]
