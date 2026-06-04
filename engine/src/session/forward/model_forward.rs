@@ -69,17 +69,16 @@ pub struct ModelForward {
 
     vocab_size: usize,
 
-    // Phase α-K substep (3c): fmt-cache wiring. `LLMRS_KV_FMT` 게이트 ON 시 prefill 직후(첫 step
-    // lazy) `kv_caches` 를 `Vec<Arc<StandardFormat>>` 로 wrap(by-value move, 단일 물리 캐시) →
-    // decode fallback 을 `forward_into_fmt`(trait object) 로 전환. 게이트 OFF(None) 시 기존 경로
-    // (production 무변).
+    // fmt-cache wiring. prefill 시작 시 `kv_caches` 를 `Vec<Arc<StandardFormat>>` 로 wrap
+    // (by-value move, 단일 물리 캐시) → forward/decode/eviction 모두 fmt(StandardFormat) 경로.
+    // 5-F(F0): `LLMRS_KV_FMT` env 게이트 제거 — fmt 가 production 기본. fmt_eligible 빌더면 항상 Some.
     fmt_caches: Option<Vec<Arc<StandardFormat>>>,
 
-    // fmt-cache 게이트 자격 — **happy-path(build_standard_loop) + chat(build_chat_standard) 둘 다 true**
+    // fmt-cache 자격 — **happy-path(build_standard_loop) + chat(build_chat_standard) 둘 다 true**
     // (BC (3d) S3 에서 chat 추가). chat 멀티턴 turn2 prefill 은 ①-b 의 forward_into_fmt multi-token
     // dispatch(append at current_pos)로, eviction 회계는 (3d) S2 try_evict UER 분기로 보존된다.
-    // eval 등 ModelForward 를 거치지 않는 경로(fmt_bridge transient roundtrip)는 무관. 실제 fmt 발동은
-    // 이 플래그 AND `LLMRS_KV_FMT` 게이트 둘 다 필요(production env OFF → OLD 유지, 가역).
+    // eval 등 ModelForward 를 거치지 않는 경로(fmt_bridge transient roundtrip)는 무관. 5-F(F0)
+    // 이후 두 빌더 모두 true 라 사실상 항상 fmt — 본 플래그는 F2 정리 후보(현재는 보존).
     fmt_eligible: bool,
 
     // Phase 4-4.7 (A1): plan-aware decode. step()이 production fallback
@@ -259,12 +258,10 @@ impl ModelForward {
     /// §4.2). 게이트 OFF / 이미 wrap / `kv_caches` 빈 경우 no-op. 첫 `step()` 에서 lazy 호출되므로
     /// prefill(→ `kv_caches` 직접 write) 이후 시점이 보장된다.
     fn ensure_fmt_wrapped(&mut self) {
-        // fmt_eligible=false(chat/eval 빌더) 면 env 무관 no-op — 멀티턴 prefill panic 방지.
-        if !self.fmt_eligible
-            || !standard_format_gate_enabled()
-            || self.fmt_caches.is_some()
-            || self.kv_caches.is_empty()
-        {
+        // Phase α-K BC 5-F (F0): `LLMRS_KV_FMT` env 게이트 제거 — fmt 가 production 기본 경로.
+        // fmt_eligible 빌더(happy-path/chat)는 항상 wrap. fmt_eligible=false(현재 미존재 —
+        // eval 등은 ModelForward 미경유) 또는 이미 wrap / 빈 캐시면 no-op.
+        if !self.fmt_eligible || self.fmt_caches.is_some() || self.kv_caches.is_empty() {
             return;
         }
         let caches = std::mem::take(&mut self.kv_caches);
@@ -275,7 +272,7 @@ impl ModelForward {
             .collect();
         if std::env::var_os("LLMRS_FWD_TRACE").is_some() {
             eprintln!(
-                "[fwd-trace] KV_FMT ON: wrapped {} KVCache → StandardFormat (decode = forward_into_fmt)",
+                "[fwd-trace] fmt default: wrapped {} KVCache → StandardFormat (decode = forward_into_fmt)",
                 fmts.len()
             );
         }
@@ -702,15 +699,6 @@ impl Forward for ModelForward {
             Ok((0, before_pos))
         }
     }
-}
-
-/// `LLMRS_KV_FMT` 게이트 (Phase α-K 3c, 기본 OFF). OnceLock 캐시 → per-step 비용 ~0.
-///
-/// ON 시 ModelForward decode fallback 이 `forward_into_fmt`(KVCacheFormat trait object) 로 전환.
-/// device 검증 전용 임시 게이트 — production 무회귀 우선이라 CLI Args 표면 미오염(env only).
-fn standard_format_gate_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("LLMRS_KV_FMT").is_some())
 }
 
 fn workspace_config_for(model: &TransformerModel, max_seq_len: usize) -> WorkspaceConfig {
