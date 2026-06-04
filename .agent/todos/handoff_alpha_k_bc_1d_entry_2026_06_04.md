@@ -1,7 +1,7 @@
 # Handoff: α-K BC ①-c 완료 → ①-d (B-2 비-decode 잔여 flip)
 
 **작성**: 2026-06-04 (메인 세션)
-**HEAD**: `1e4f20fe feat(kv): Phase α-K BC ①-c — eval flip to forward_into_fmt (KVCacheOps 바운드 제거)`
+**HEAD**: `1e4f20fe feat(kv): Phase α-K BC ①-c — eval flip to forward_into_fmt (KVCacheOps 바운드 제거)` (impl 체크포인트; 뒤이은 docs 커밋 `d13c6acc` 가 roadmap+본 handoff 동반)
 **브랜치**: `master` (origin push 미실행 — 사용자 요청 시)
 **다음 세션 진입 문장**: **"BC ①-d 진행"**
 
