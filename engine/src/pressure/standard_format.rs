@@ -513,8 +513,13 @@ fn merge_row_f16(
 /// 위임(decode 진입부의 `effective_cache_len` clamp **우회** — 정정 C). variance_collector/profiler/
 /// fallback warn 은 happy-path 미진입·수치-무관이라 생략. forward_prefill 무수정(additive fork) —
 /// 중복은 host parity test 로 bit-identical 증명, Step 5(forward_prefill<C> 삭제)에서 자연 해소.
+///
+/// **Phase α-K ①-e**: `KIVIFormat::attention_into` 의 prefill arm 도 이 free fn 을 재사용한다
+/// (`pub(crate)`). KIVI 는 multi-token prefill native 커널 부재라 dequantized view(`get_view`) +
+/// 본 함수로 처리 — KIVI CPU(SeqMajor F32) / GPU(bits=16 HeadMajor, bits 2/4/8 assembled) 모두
+/// `kv_layout`/`kv_capacity` 인자로 분기되므로 별도 경로 불요.
 #[allow(clippy::too_many_arguments)]
-fn prefill_attention(
+pub(crate) fn prefill_attention(
     q: &Tensor,
     out: &mut Tensor,
     k_cache: &Tensor,

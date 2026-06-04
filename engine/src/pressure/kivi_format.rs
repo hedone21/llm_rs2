@@ -103,6 +103,45 @@ impl KVCacheFormat for KIVIFormat {
         let mut cache = self.inner.lock().unwrap();
         let n_heads_q = dims.n_heads_q;
 
+        // ── prefill (seq_len>1): multi-token causal attention (Phase α-K ①-e) ──
+        // KIVI 는 multi-token prefill native 커널 부재(attention_gen / attention_native 는 single-query
+        // decode 전용 — causal-mask 없음)라, dequantized view(get_view) + StandardFormat 의
+        // `prefill_attention`(free fn, pub(crate)) 재사용으로 처리한다(DRY). OLD generic
+        // `forward_prefill<C>`(forward.rs:251-585)의 KIVI 경로(get_view → flash_attention_prefill /
+        // flash_attention_forward_strided)와 bit-identical: KIVI CPU(SeqMajor F32) / GPU(bits=16
+        // HeadMajor, bits 2/4/8 assembled) 모두 `kv_layout`/`kv_capacity` 인자로 분기된다.
+        // `q_start_pos = cache_seq_len - seq_len`(= forward_prefill 의 start_pos, write 후 불변식).
+        // prefill 은 score 누적 안 함(forward_prefill 의 `_need_scores` 동일) → `scores` 무시.
+        let seq_len = q.shape().dims()[1];
+        if seq_len > 1 {
+            let n_heads_kv = cache.kv_heads();
+            let head_dim = cache.head_dim();
+            let kv_capacity = KVCacheOps::capacity(&*cache);
+            let kv_layout = KVCacheOps::layout(&*cache);
+            let cache_seq_len = KVCacheOps::current_pos(&*cache);
+            let batch_size = q.shape().dims()[0];
+            let q_start_pos = cache_seq_len - seq_len;
+            let (k_cache, v_cache) = KVCacheOps::get_view(&mut *cache);
+            let _ = scores;
+            return crate::pressure::standard_format::prefill_attention(
+                q,
+                out,
+                &k_cache,
+                &v_cache,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                seq_len,
+                cache_seq_len,
+                kv_capacity,
+                batch_size,
+                kv_layout,
+                q_start_pos,
+                dims.window,
+                backend,
+            );
+        }
+
         // kivi-native 경로 게이팅(host 미검증 — device 검증은 후속 substep). 게이팅 조건만 미리
         // 평가하고(borrow 분리), dispatch 는 별도 헬퍼에 위임해 scores ownership 을 단일 경로로 가둔다.
         // get_kivi_raw_buffers 가 Some + backend 가 KiviAttentionBackend + has_kivi_attn_kernel +
@@ -359,6 +398,66 @@ mod tests {
             (s - 1.0).abs() < 1e-3,
             "post-softmax weights sum to 1, got {s}"
         );
+    }
+
+    #[test]
+    fn test_attention_into_prefill_causal_uniform() {
+        // Phase α-K ①-e: multi-token prefill arm (seq_len>1). seq=4 < res_cap(=RES=32)라 Q2 flush
+        // 미발생 → residual 이 raw F32 그대로 dequant(exact)되어 bit-exact 검증 가능. K=0 → 모든
+        // score 0 → uniform softmax. V[pos]=pos(broadcast). causal mask 로 query row r 은 cache pos
+        // 0..=r 만 attend → out[r] = mean(0..=r) = r/2. write_kv_batch(prefill write) +
+        // attention_into(신규 prefill arm) 합동 검증 + causal-mask 확인(arm 부재 시 panic 회귀 가드).
+        let kv_heads = 1;
+        let n_heads_q = 1;
+        let seq = 4;
+        let fmt = KIVIFormat::new(0, KiviCache::new(kv_heads, HD, MAXSEQ, RES));
+        let backend = CpuBackend::new();
+
+        let k_data = vec![0.0f32; seq * kv_heads * HD];
+        let mut v_data = vec![0.0f32; seq * kv_heads * HD];
+        for p in 0..seq {
+            for d in 0..HD {
+                v_data[p * kv_heads * HD + d] = p as f32;
+            }
+        }
+        let kb = f32_tensor(vec![1, seq, kv_heads, HD], &k_data);
+        let vb = f32_tensor(vec![1, seq, kv_heads, HD], &v_data);
+        fmt.write_kv_batch(&kb, &vb, &backend).unwrap();
+        assert_eq!(fmt.current_pos(), seq);
+
+        // q 값은 무관(K=0 → score 0). out = [1, seq, n_heads_q*head_dim].
+        let q = f32_tensor(
+            vec![1, seq, n_heads_q, HD],
+            &vec![1.0; seq * n_heads_q * HD],
+        );
+        let mut out = f32_tensor(
+            vec![1, seq, n_heads_q * HD],
+            &vec![0.0; seq * n_heads_q * HD],
+        );
+
+        fmt.attention_into(
+            &q,
+            &backend,
+            &mut out,
+            AttnDims {
+                n_heads_q,
+                window: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        let o = out.as_slice::<f32>();
+        for r in 0..seq {
+            let expected = r as f32 / 2.0; // mean(0..=r), causal mask
+            for d in 0..HD {
+                let got = o[r * HD + d];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "row {r} d {d}: expected {expected} (causal mean 0..=r), got {got}"
+                );
+            }
+        }
     }
 
     #[test]

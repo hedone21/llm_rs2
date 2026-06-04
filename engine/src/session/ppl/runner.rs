@@ -16,7 +16,6 @@ use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
-use crate::models::transformer::TransformerModelForwardArgs;
 use crate::models::transformer::TransformerModelForwardFmtArgs;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kivi_cache::KiviCache;
@@ -366,29 +365,31 @@ pub fn run_kivi_ppl(
             backend.clone(),
         );
 
-        // Phase α-K ①-d: run_kivi_ppl 은 **defer**(forward_into 유지). KIVI multi-token prefill 은
-        // forward_into_fmt → forward_prefill_fmt → KIVIFormat::attention_into 인데, KIVIFormat 은
-        // prefill arm 부재(attention_gen=single-query decode 전용, kivi_format.rs:95-173) → multi-token
-        // 진입 시 panic. KiviCache::get_view 가 compact view 라 StandardFormat 의 prefill_attention 을
-        // 그대로 못 쓰고 layout/capacity/bits·GPU native·device 검증이 필요한 별도 feature 증분(①-e 후보).
-        // 따라서 run_kivi_ppl(prefill+decode)은 fmt 전환을 보류하고 generic forward_into 를 유지한다.
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos: 0,
-            kv_caches: &mut kv_caches,
-            backend,
-            memory: memory.as_ref(),
-            logits_out: &mut prefill_logits,
-            x_gen: None,
-            workspace: None,
-            score_accumulator: None,
-            profiler: None,
-            skip_config: None,
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-            prefill_workspace: None,
-            layer_boundary_hook: None,
+        // Phase α-K ①-e: run_kivi_ppl prefill flip — `KiviCache::forward_fmt_roundtrip` 로 forward 1회
+        // 동안만 `Vec<KiviCache>` → `Arc<KIVIFormat>` wrap → `forward_into_fmt` → concrete 복귀
+        // (①-c eval 미러). multi-token prefill 은 KIVIFormat::attention_into 의 신규 prefill arm
+        // (seq_len>1 → `prefill_attention` 재사용, kivi_format.rs:106)을 경유 — OLD forward_prefill<C>
+        // 의 KIVI 경로(get_view → flash)와 bit-identical. AWQE 는 run_kivi_ppl 미활성
+        // (set_awqe_enabled 미호출)이라 `cache_self_need_scores`=false(forward_gen.rs:409 OR 항 = false);
+        // prefill 은 score 누적 안 하므로 어차피 무관. roundtrip 종료 후 take_flush_proxies/q2_tokens/
+        // res_pos 접근은 concrete Vec 복귀 후라 borrow 충돌 없음.
+        let cache_self_need_scores = kv_caches.first().is_some_and(|c| c.needs_scores());
+        KiviCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
+            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                input_tokens: &input_tensor,
+                start_pos: 0,
+                fmts,
+                backend,
+                memory: memory.as_ref(),
+                logits_out: &mut prefill_logits,
+                x_gen: None,
+                workspace: None,
+                logits_last_only: false,
+                score_accumulator: None,
+                skip_config: None,
+                importance_collector: None,
+                cache_self_need_scores,
+            })
         })?;
 
         // Collect flush QCF metrics from prefill
@@ -452,25 +453,27 @@ pub fn run_kivi_ppl(
             std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
         })?;
 
-        // Phase α-K ①-d: run_kivi_ppl 은 defer (위 prefill 주석 참조 — KIVIFormat prefill arm 부재).
-        // decode(seq_len=1)는 fmt 가능하나 prefill 이 generic 이라 함수 단위로 보류(일관성).
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &gen_input_gpu,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend,
-            memory: memory.as_ref(),
-            logits_out: &mut decode_logits,
-            x_gen: Some(&mut x_gen),
-            workspace: Some(&mut gen_ws),
-            score_accumulator: None,
-            profiler: None,
-            skip_config: None,
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-            prefill_workspace: None,
-            layer_boundary_hook: None,
+        // Phase α-K ①-e: run_kivi_ppl decode flip — forward_fmt_roundtrip + forward_into_fmt.
+        // decode(seq_len=1)는 KIVIFormat::attention_into 의 decode arm(attention_native / F32-view
+        // fallback)을 경유 — ①-c eval KIVI 와 동일 경로(host nll Δ~1e-6=★2 carve-out bit-identical
+        // 검증됨). `cache_self_need_scores` 는 AWQE 미활성으로 false(decode 의 need_scores OR 항).
+        let cache_self_need_scores = kv_caches.first().is_some_and(|c| c.needs_scores());
+        KiviCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
+            model.forward_into_fmt(TransformerModelForwardFmtArgs {
+                input_tokens: &gen_input_gpu,
+                start_pos,
+                fmts,
+                backend,
+                memory: memory.as_ref(),
+                logits_out: &mut decode_logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                logits_last_only: false,
+                score_accumulator: None,
+                skip_config: None,
+                importance_collector: None,
+                cache_self_need_scores,
+            })
         })?;
         start_pos += 1;
 
