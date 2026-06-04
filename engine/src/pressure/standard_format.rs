@@ -64,6 +64,7 @@ impl StandardFormat {
         f(&mut guard.cache)
     }
 
+    #[cfg(feature = "opencl")]
     /// plan hot-path geometry 스냅샷 (Phase α-K (3p) ④-a).
     ///
     /// **단일 lock** 으로 `current_pos`/`capacity` 를 묶어 [`PlanGeometry`] 로 반환한다 —
@@ -79,6 +80,7 @@ impl StandardFormat {
         }
     }
 
+    #[cfg(feature = "opencl")]
     /// plan hot-path position advance (Phase α-K (3p) ④-a).
     ///
     /// `execute<C>` 의 레이어 끝 `cache.advance_pos(n)` 를 `&self` + interior-mut 로 미러.
@@ -86,6 +88,7 @@ impl StandardFormat {
         self.with_cache_mut(|c| c.advance_pos(n));
     }
 
+    #[cfg(feature = "opencl")]
     /// plan 빌드용 lock guard (Phase α-K (3p) ④-a `build_plan_fmt`).
     ///
     /// `build_plan_fmt` 는 모든 핸들의 guard 를 동시에 잡고 `&KVCache` 슬라이스를 만들어
@@ -875,6 +878,7 @@ mod tests {
         assert_eq!(fmt.current_pos(), 0);
     }
 
+    #[cfg(feature = "opencl")]
     #[test]
     fn test_plan_geometry_delegates_and_zeroes_residual() {
         // (3p) ④-a: plan_geometry()가 inner KVCache current_pos/capacity 를 정확히 위임하고
@@ -887,6 +891,7 @@ mod tests {
         assert_eq!(g.q2_tokens, 0);
     }
 
+    #[cfg(feature = "opencl")]
     #[test]
     fn test_plan_advance_bumps_current_pos() {
         // (3p) ④-a: plan_advance(n) 후 plan_geometry().current_pos 가 증가해야 한다
@@ -908,6 +913,7 @@ mod tests {
         assert_eq!(fmt.plan_geometry().current_pos, 3);
     }
 
+    #[cfg(feature = "opencl")]
     #[test]
     fn test_plan_lock_reads_buffer() {
         // (3p) ④-a: plan_lock() guard seam — build_plan_fmt 가 KV buffer(`k_buffer`)에
