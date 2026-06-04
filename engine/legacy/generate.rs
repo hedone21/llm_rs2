@@ -477,8 +477,13 @@ fn main() -> anyhow::Result<()> {
             build_chat_standard,
         };
 
+        // `--greedy` 는 temperature 를 0 으로 강제(재현성). non-chat 경로(session/init.rs:168-171)는
+        // 이미 적용하나, chat 분기는 별도로 SamplingConfig 를 구성하면서 이 override 를 누락하고
+        // 있었다 → first-token 샘플링(repl.rs `sampling::sample`)이 temperature=0.8(기본)로 RNG 경로를
+        // 타 매 실행 첫 토큰이 비결정 → 전체 생성 발산. canonical override 를 미러한다.
+        let effective_temperature = if args.greedy { 0.0 } else { args.temperature };
         let sampling_config = SamplingConfig {
-            temperature: args.temperature,
+            temperature: effective_temperature,
             top_p: args.top_p,
             top_k: args.top_k,
             repetition_penalty: args.repetition_penalty,
