@@ -72,13 +72,14 @@ pub struct ModelForward {
     // Phase α-K substep (3c): fmt-cache wiring. `LLMRS_KV_FMT` 게이트 ON 시 prefill 직후(첫 step
     // lazy) `kv_caches` 를 `Vec<Arc<StandardFormat>>` 로 wrap(by-value move, 단일 물리 캐시) →
     // decode fallback 을 `forward_into_fmt`(trait object) 로 전환. 게이트 OFF(None) 시 기존 경로
-    // (production 무변). happy-path 전용(eviction=none → NoOpEvictionStage, --no-gpu-plan 강제).
+    // (production 무변).
     fmt_caches: Option<Vec<Arc<StandardFormat>>>,
 
-    // fmt-cache 게이트 자격 — **single-prompt happy-path 빌더(build_standard_loop)만 true**.
-    // chat(build_chat_standard)/eval 등 prefill 이 멀티턴 재호출되는 경로는 false 로 주입하여
-    // `LLMRS_KV_FMT` 가 set 돼 있어도 wrap 이 발동하지 않게 한다(turn2 prefill 이 mem::take 로 빈
-    // kv_caches 를 인덱싱하는 panic + eviction 회계 붕괴 차단 — 적대 검증 wiring-safety lens).
+    // fmt-cache 게이트 자격 — **happy-path(build_standard_loop) + chat(build_chat_standard) 둘 다 true**
+    // (BC (3d) S3 에서 chat 추가). chat 멀티턴 turn2 prefill 은 ①-b 의 forward_into_fmt multi-token
+    // dispatch(append at current_pos)로, eviction 회계는 (3d) S2 try_evict UER 분기로 보존된다.
+    // eval 등 ModelForward 를 거치지 않는 경로(fmt_bridge transient roundtrip)는 무관. 실제 fmt 발동은
+    // 이 플래그 AND `LLMRS_KV_FMT` 게이트 둘 다 필요(production env OFF → OLD 유지, 가역).
     fmt_eligible: bool,
 
     // Phase 4-4.7 (A1): plan-aware decode. step()이 production fallback
