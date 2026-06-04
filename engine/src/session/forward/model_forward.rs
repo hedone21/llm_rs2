@@ -204,13 +204,26 @@ impl ModelForward {
             }
             return None;
         }
-        let plan = self.model.build_plan(
-            &self.decode_x_gen,
-            &self.logits_decode,
-            &self.decode_workspace,
-            &mut self.kv_caches,
-            &self.backend,
-        );
+        // (3p) ④-a: fmt active(`fmt_caches` Some) 면 `build_plan_fmt`(StandardFormat
+        // handle slice)로 빌드 — fmt wrap 이 `kv_caches` 를 mem::take 해 비웠으므로 기존
+        // `build_plan(&mut kv_caches)` 는 빈 슬라이스 → 무효. fmt OFF 시 기존 경로(무변).
+        let plan = if let Some(handles) = self.fmt_caches.as_ref() {
+            self.model.build_plan_fmt(
+                &self.decode_x_gen,
+                &self.logits_decode,
+                &self.decode_workspace,
+                handles,
+                &self.backend,
+            )
+        } else {
+            self.model.build_plan(
+                &self.decode_x_gen,
+                &self.logits_decode,
+                &self.decode_workspace,
+                &mut self.kv_caches,
+                &self.backend,
+            )
+        };
         if plan.is_none() {
             // build_plan이 None 반환 → 본 모델/상태에서 plan path 미지원.
             // 매 step 시도를 막기 위해 sticky lock-out.
@@ -448,20 +461,59 @@ impl Forward for ModelForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
-        // Phase α-K (3c): fmt-cache 게이트. `LLMRS_KV_FMT` ON 시 plan 우회 + `forward_into_fmt`(trait
-        // object) 로 decode. 게이트는 `--no-gpu-plan` 동반 강제 전제(plan 활성 + fmt 동시 미지원 —
-        // plan 이 `&mut Vec<KVCache>` 를 보는데 fmt 는 move 후 빈 Vec). 게이트 OFF 시 아래 기존 경로
-        // (production 무변). transient `Vec<Arc<dyn KVCacheFormat>>` = concrete Arc clone(escape 0,
-        // 호출 종료 시 drop) — cold path 라 N Arc clone 비용 무관.
+        // Phase α-K (3c → (3p) ④-a): fmt-cache 게이트. `LLMRS_KV_FMT` ON 시 단일 물리 캐시를
+        // `StandardFormat` 으로 wrap 한 뒤, **plan path(`execute_plan_fmt`)를 먼저 시도**하고
+        // (build/invalidation 시) `forward_into_fmt`(trait object)로 폴백한다. (3c 까지는 plan 을
+        // 무조건 우회하고 dyn 폴백만 갔으나, (3p) 에서 plan/fmt 상호배타를 해소 — plan 이 이제
+        // `&[Arc<StandardFormat>]` 핸들을 직접 받는다.) 게이트 OFF 시 아래 기존 경로(production 무변).
         self.ensure_fmt_wrapped();
-        // concrete Arc clone → transient dyn Vec (fmt_caches borrow 는 map 클로저 안에서 종료되어
-        // 아래 &mut self 필드 borrow 와 충돌하지 않는다).
-        let dyn_fmts: Option<Vec<Arc<dyn KVCacheFormat>>> = self.fmt_caches.as_ref().map(|fmts| {
-            fmts.iter()
+        if self.fmt_caches.is_some() {
+            // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan_fmt.
+            #[cfg(feature = "opencl")]
+            {
+                if self.gpu_plan.is_none() && !self.sticky_disabled {
+                    self.gpu_plan = self.try_build_plan();
+                }
+                let plan_opt = self.gpu_plan.take();
+                let plan_result = if let Some(plan) = plan_opt.as_ref() {
+                    let backend = self.backend.clone();
+                    let handles = self
+                        .fmt_caches
+                        .as_ref()
+                        .expect("fmt_caches Some checked above");
+                    self.model.execute_plan_fmt(
+                        plan,
+                        &self.decode_input,
+                        ctx.pos,
+                        &mut self.decode_x_gen,
+                        handles,
+                        &mut self.logits_decode,
+                        &backend,
+                    )
+                } else {
+                    Ok(false)
+                };
+                match plan_result {
+                    Ok(true) => {
+                        self.gpu_plan = plan_opt;
+                        return self.read_logits(&self.logits_decode);
+                    }
+                    Ok(false) | Err(_) => {
+                        // build 실패 / invalidation — dyn 폴백으로 강하 (gpu_plan 은
+                        // take() 로 이미 None, 다음 step 에서 lazy rebuild).
+                    }
+                }
+            }
+
+            // 폴백: forward_into_fmt(trait object) — plan 미빌드(host CPU)·invalidation 경로.
+            // concrete Arc clone → transient dyn Vec (fmt_caches borrow 는 map 클로저 안에서 종료).
+            let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = self
+                .fmt_caches
+                .as_ref()
+                .expect("fmt_caches Some checked above")
+                .iter()
                 .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
-                .collect()
-        });
-        if let Some(dyn_fmts) = dyn_fmts {
+                .collect();
             let backend = self.backend.clone();
             let memory_ref: *const dyn Memory = self.memory.as_ref();
             // SAFETY: `self.memory` 는 self 소유, 본 call stack 동안 유효 (기존 fallback 동일 패턴).

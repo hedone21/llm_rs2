@@ -24,8 +24,8 @@ use crate::tensor::Tensor;
 /// scratch(`k_cast`/`v_cast`)는 비-F32 write 경로의 reusable buffer 로, `forward_gen` 의
 /// `ws.k_cast`/`ws.v_cast` 와 같은 역할(토큰마다 재할당 방지). cache 와 한 `Mutex` 안에 두어
 /// 별도 lock 으로 인한 동시성 hazard 를 원천 차단한다(write 가 cache+scratch 를 항상 함께 만짐).
-struct StandardFormatInner {
-    cache: KVCache,
+pub(crate) struct StandardFormatInner {
+    pub(crate) cache: KVCache,
     /// Lazy cast scratch (target dtype). 첫 비-F32 write 에서 inner cache 의 allocator 로 할당.
     k_cast: Option<Tensor>,
     v_cast: Option<Tensor>,
@@ -62,6 +62,37 @@ impl StandardFormat {
     pub(crate) fn with_cache_mut<R>(&self, f: impl FnOnce(&mut KVCache) -> R) -> R {
         let mut guard = self.inner.lock().unwrap();
         f(&mut guard.cache)
+    }
+
+    /// plan hot-path geometry 스냅샷 (Phase α-K (3p) ④-a).
+    ///
+    /// **단일 lock** 으로 `current_pos`/`capacity` 를 묶어 [`PlanGeometry`] 로 반환한다 —
+    /// `execute<C>` 가 레이어 진입부에서 호출하던 4개 `KVCacheOps` getter 를 1 lock 으로 통합.
+    /// standard 는 residual/quantized partition 부재라 `res_pos`/`q2_tokens` = 0.
+    pub(crate) fn plan_geometry(&self) -> crate::backend::opencl::plan::PlanGeometry {
+        let g = self.inner.lock().unwrap();
+        crate::backend::opencl::plan::PlanGeometry {
+            current_pos: KVCacheOps::current_pos(&g.cache),
+            capacity: g.cache.capacity(),
+            res_pos: 0,
+            q2_tokens: 0,
+        }
+    }
+
+    /// plan hot-path position advance (Phase α-K (3p) ④-a).
+    ///
+    /// `execute<C>` 의 레이어 끝 `cache.advance_pos(n)` 를 `&self` + interior-mut 로 미러.
+    pub(crate) fn plan_advance(&self, n: usize) {
+        self.with_cache_mut(|c| c.advance_pos(n));
+    }
+
+    /// plan 빌드용 lock guard (Phase α-K (3p) ④-a `build_plan_fmt`).
+    ///
+    /// `build_plan_fmt` 는 모든 핸들의 guard 를 동시에 잡고 `&KVCache` 슬라이스를 만들어
+    /// `build_plan` 본문(byte-identical)을 재사용한다. cl_mem 핸들은 `build_full_plan` 안에서
+    /// `set_kernel_arg` 로 즉시 바인딩(클론)되므로 guard 가 그 호출 동안만 살아 있으면 충분하다.
+    pub(crate) fn plan_lock(&self) -> std::sync::MutexGuard<'_, StandardFormatInner> {
+        self.inner.lock().unwrap()
     }
 
     /// wrapping 을 해제하고 내부 `KVCache` 를 반환 (Phase α-K ①-c eval transient-wrap round-trip).
@@ -842,6 +873,59 @@ mod tests {
         assert_eq!(fmt.idx(), 3);
         assert_eq!(fmt.capacity(), 8);
         assert_eq!(fmt.current_pos(), 0);
+    }
+
+    #[test]
+    fn test_plan_geometry_delegates_and_zeroes_residual() {
+        // (3p) ④-a: plan_geometry()가 inner KVCache current_pos/capacity 를 정확히 위임하고
+        // standard 의 res_pos/q2_tokens 는 0 이어야 한다.
+        let fmt = StandardFormat::new(0, make_cache(8, 2, 4));
+        let g = fmt.plan_geometry();
+        assert_eq!(g.capacity, 8);
+        assert_eq!(g.current_pos, 0);
+        assert_eq!(g.res_pos, 0);
+        assert_eq!(g.q2_tokens, 0);
+    }
+
+    #[test]
+    fn test_plan_advance_bumps_current_pos() {
+        // (3p) ④-a: plan_advance(n) 후 plan_geometry().current_pos 가 증가해야 한다
+        // (execute_fmt 의 레이어 끝 advance 미러).
+        let kv_heads = 2;
+        let head_dim = 4;
+        let fmt = StandardFormat::new(0, make_cache(8, kv_heads, head_dim));
+
+        // ensure_capacity is not required for advance_pos (pure position bump).
+        fmt.plan_advance(1);
+        assert_eq!(fmt.plan_geometry().current_pos, 1);
+        assert_eq!(
+            fmt.current_pos(),
+            1,
+            "plan_advance must mutate the same cache"
+        );
+
+        fmt.plan_advance(2);
+        assert_eq!(fmt.plan_geometry().current_pos, 3);
+    }
+
+    #[test]
+    fn test_plan_lock_reads_buffer() {
+        // (3p) ④-a: plan_lock() guard seam — build_plan_fmt 가 KV buffer(`k_buffer`)에
+        // 도달하는 경로(guard 를 잡고 `&KVCache` 슬라이스를 만들어 byte-identical build_plan
+        // 본문을 재사용).
+        let kv_heads = 1;
+        let head_dim = 2;
+        let fmt = StandardFormat::new(0, make_cache(8, kv_heads, head_dim));
+
+        // write one token = [7, 7], then read it back through the guard seam.
+        let t = vec![7.0f32; kv_heads * head_dim];
+        let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
+        let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
+        fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
+
+        let guard = fmt.plan_lock();
+        assert_eq!(guard.cache.capacity(), 8);
+        assert_eq!(guard.cache.k_buffer.as_slice::<f32>()[0], 7.0);
     }
 
     #[test]

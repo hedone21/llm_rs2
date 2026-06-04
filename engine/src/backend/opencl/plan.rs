@@ -926,6 +926,26 @@ impl PartitionStep {
     }
 }
 
+/// Plan-path geometry snapshot for one KV cache (Phase α-K (3p) ④-a).
+///
+/// `execute_fmt` reads these four scalars **once per layer** via a single lock
+/// on the `StandardFormat` wrapper (`plan_geometry()`), replacing the four
+/// separate `KVCacheOps` getter calls that `execute<C>` makes against a `&mut C`.
+/// Standard caches have no residual / quantized partition, so `res_pos` and
+/// `q2_tokens` are always `0`; the fields exist for symmetry with the (deferred)
+/// KIVI plan flip.
+///
+/// **Single-lock-snapshot contract**: a `PlanGeometry` value MUST be produced
+/// under one lock acquisition so the four fields are mutually consistent (matters
+/// for KIVI where `current_pos == q2_tokens + res_pos`; irrelevant for standard
+/// but the contract is documented here so the KIVI flip preserves it).
+pub(crate) struct PlanGeometry {
+    pub current_pos: usize,
+    pub capacity: usize,
+    pub res_pos: usize,
+    pub q2_tokens: usize,
+}
+
 /// Execution plan for the full model decode pass.
 pub struct FullKernelPlan {
     /// Per-layer plans (indexed by layer number)
@@ -1849,6 +1869,677 @@ impl FullKernelPlan {
             && gpu_acc.is_active()
         {
             let cache_seq_len = kv_caches[0].current_pos();
+            if let Err(e) = gpu_acc.end_step(queue, cache_seq_len) {
+                log::error!(
+                    "Plan gpu_score end_step failed: n_kv={}: {}",
+                    cache_seq_len,
+                    e
+                );
+            }
+        }
+
+        // Final norm
+        if backend.profile_events_enabled {
+            if let Err(e) = backend.enqueue_kernel_labeled(
+                &self.final_norm.kernel,
+                self.final_norm.op_tag.profile_label(),
+                self.final_norm.ndim,
+                &self.final_norm.global_work_size,
+                self.final_norm.local_work_size,
+            ) {
+                log::error!("Plan enqueue_kernel_labeled final_norm failed: {}", e);
+            }
+        } else {
+            unsafe {
+                if let Err(e) = ocl::core::enqueue_kernel(
+                    queue,
+                    &self.final_norm.kernel,
+                    self.final_norm.ndim,
+                    None,
+                    &self.final_norm.global_work_size,
+                    self.final_norm.local_work_size,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                ) {
+                    log::error!("Plan enqueue final_norm failed: {}", e);
+                }
+            }
+        }
+
+        // lm_head matmul (skipped when lm_head is on CPU or has an unsupported
+        // dtype — see `build_full_plan` for the dtype gating).
+        //
+        // Route through `dispatch_step` so any future `noshuffle_act_rebuild`
+        // hooks can participate. `dynamic_args` is empty here so there is no
+        // per-token overhead from the dispatcher wrapping.
+        if let Some(ref lm_head) = self.lm_head {
+            Self::dispatch_step(backend, lm_head, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        if op_trace {
+            OP_TRACE_ACC.with(|c| {
+                if let Some(m) = c.borrow_mut().take() {
+                    let mut entries: Vec<(String, u64)> = m.into_iter().collect();
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    let parts: Vec<String> = entries
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect();
+                    eprintln!("[OP_TRACE] n_kv={} {}", trace_n_kv, parts.join(" "));
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// (3p) ④-a — `execute<C>` 의 production fmt-handle copy-fork (Phase α-K BC Step 3).
+    ///
+    /// `execute<C: KVCacheOps>(&mut [C])` 와 본문 byte-identical 이되, C-접촉 지점만
+    /// `StandardFormat` concrete-handle(`plan_geometry`/`plan_advance`)로 교체한다 — vtable 0
+    /// (static dispatch). 게이트 OFF(`LLMRS_KV_FMT` 미설정) 시 production 은 `execute<C>` 를
+    /// 계속 쓰고 본 메서드는 미발화(byte-불변). legacy `execute<C>` 는 Step 5 까지 co-exist.
+    ///
+    /// plan path 는 GPU 전용이라 host 에서 기능 미발화 — bit-identical/avg_tbt acceptance 는
+    /// device 세션(S25 OpenCL + Jetson CUDA).
+    pub fn execute_fmt(
+        &self,
+        backend: &crate::backend::opencl::OpenCLBackend,
+        start_pos: usize,
+        handles: &[std::sync::Arc<crate::pressure::standard_format::StandardFormat>],
+    ) -> std::result::Result<(), PlanInvalidated> {
+        // ENG-ALG-219: single Acquire load at entry — if a weight swap has
+        // bumped ratio_generation since build_plan, the pre-bound cl_mem
+        // handles may reference stale weight buffers (INV-129).
+        check_global_generation(
+            self.ratio_generation_at_build,
+            &self.ratio_generation_counter,
+        )?;
+
+        let debug_sync = std::env::var("PLAN_DEBUG").is_ok();
+        let op_trace = std::env::var_os("LLMRS_OP_TRACE").is_some();
+        let queue = backend.queue.as_core();
+
+        if op_trace {
+            OP_TRACE_ACC.with(|c| {
+                *c.borrow_mut() = Some(std::collections::HashMap::new());
+            });
+        }
+        let mut trace_n_kv: i32 = 0;
+
+        for (i, layer_plan) in self.layers.iter().enumerate() {
+            let handle = &handles[i];
+            // (3p) ④-a: single-lock geometry snapshot replaces the four
+            // `KVCacheOps` getters that `execute<C>` reads off `&mut C`.
+            let g = handle.plan_geometry();
+
+            // Check for KV cache resize or capacity overflow (plan invalidation)
+            if g.capacity != self.kv_capacity || g.current_pos >= g.capacity {
+                return Err(PlanInvalidated);
+            }
+
+            let cache_seq_len = g.current_pos as i32;
+            let write_pos = g.current_pos as i32;
+            let start_pos_i32 = start_pos as i32;
+            let kv_cap = g.capacity as i32;
+            let rp = g.res_pos as i32;
+            let q2t = g.q2_tokens as i32;
+            let rt = rp; // res_tokens = res_pos before advance
+
+            // Attention sees the token we just scattered
+            let attn_seq_len = cache_seq_len + 1;
+            if op_trace {
+                trace_n_kv = attn_seq_len;
+            }
+
+            // Steps 1-6: pre-KV steps
+            for (si, step) in layer_plan.steps_pre_kv.iter().enumerate() {
+                Self::dispatch_step(
+                    backend,
+                    step,
+                    start_pos_i32,
+                    cache_seq_len,
+                    write_pos,
+                    kv_cap,
+                    rp,
+                    q2t,
+                    rt,
+                );
+                if debug_sync {
+                    ocl::core::finish(queue).ok();
+                    eprintln!(
+                        "[Plan] L{} pre_kv[{}] {:?} OK (pos={}, cap={})",
+                        i, si, step.op_tag, start_pos, kv_cap
+                    );
+                }
+            }
+            // Step 7: KV update
+            match &layer_plan.kv_update {
+                KvUpdateVariant::Standard(step) => {
+                    Self::dispatch_step(
+                        backend,
+                        step,
+                        start_pos_i32,
+                        cache_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
+                    if debug_sync {
+                        ocl::core::finish(queue).ok();
+                        eprintln!(
+                            "[Plan] L{} kv_scatter OK (write_pos={}, cap={})",
+                            i, write_pos, kv_cap
+                        );
+                    }
+                }
+                KvUpdateVariant::Kivi { gather_k, gather_v } => {
+                    Self::dispatch_step(
+                        backend,
+                        gather_k,
+                        start_pos_i32,
+                        cache_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
+                    Self::dispatch_step(
+                        backend,
+                        gather_v,
+                        start_pos_i32,
+                        cache_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
+                }
+            }
+
+            // After KV update, res_tokens is res_pos + 1 for attention
+            let rt_after = rp + 1;
+
+            // Step 8: Attention — uses attn_seq_len (includes just-scattered token)
+            match &layer_plan.attention {
+                AttentionVariant::Standard(step) => {
+                    if debug_sync {
+                        eprintln!(
+                            "[Plan] L{} attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                            i, attn_seq_len, step.global_work_size, step.local_work_size
+                        );
+                    }
+                    Self::dispatch_step(
+                        backend,
+                        step,
+                        start_pos_i32,
+                        attn_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
+                    // GPU score accumulator: per-layer scores now live in the
+                    // layer's own slice of `score_buf` (offset pre-baked at
+                    // plan-build time, see `LayerPlanConfig::gpu_score_layer_offset`).
+                    // A single fused reduce kernel folds all layers into
+                    // cumulative importance at `end_step()` after the final
+                    // layer — no per-layer dispatch needed here.
+                    if debug_sync {
+                        eprintln!("[Plan] L{} attention enqueued, calling finish...", i);
+                        ocl::core::finish(queue).ok();
+                        eprintln!("[Plan] L{} attention OK (attn_seq_len={})", i, attn_seq_len);
+                    }
+                }
+                AttentionVariant::StandardFlash(step) => {
+                    if debug_sync {
+                        eprintln!(
+                            "[Plan] L{} flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                            i, attn_seq_len, step.global_work_size, step.local_work_size
+                        );
+                    }
+                    let trace_q1 = std::env::var_os("LLMRS_TRACE_Q1").is_some();
+                    if trace_q1 {
+                        ocl::core::finish(queue).ok();
+                    }
+                    let q1_start = std::time::Instant::now();
+                    Self::dispatch_step(
+                        backend,
+                        step,
+                        start_pos_i32,
+                        attn_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
+                    if trace_q1 {
+                        ocl::core::finish(queue).ok();
+                        let us = q1_start.elapsed().as_nanos() as u64 / 1000;
+                        eprintln!("[Q1_TRACE] layer={} n_kv={} us={}", i, attn_seq_len, us);
+                    }
+                    // LLMRS_Q1_REPEAT=N: re-dispatch the Q1 kernel (N-1) additional
+                    // times against the same KV state, measuring each repetition in
+                    // isolation. The first (production) iteration follows matmul_qkv
+                    // /rope/kv_update and reads KV "cold" from the just-written slot;
+                    // subsequent reps read it "warm". Comparing rep=0 vs rep>=1
+                    // slope against n_kv separates kernel-intrinsic cost from
+                    // context-dependent cache/coherency effects.
+                    let q1_repeat: u32 = std::env::var("LLMRS_Q1_REPEAT")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1);
+                    for rep in 1..q1_repeat {
+                        ocl::core::finish(queue).ok();
+                        let rep_start = std::time::Instant::now();
+                        Self::dispatch_step(
+                            backend,
+                            step,
+                            start_pos_i32,
+                            attn_seq_len,
+                            write_pos,
+                            kv_cap,
+                            rp,
+                            q2t,
+                            rt,
+                        );
+                        ocl::core::finish(queue).ok();
+                        let rep_us = rep_start.elapsed().as_nanos() as u64 / 1000;
+                        eprintln!(
+                            "[Q1_REPEAT] layer={} n_kv={} rep={} us={}",
+                            i, attn_seq_len, rep, rep_us
+                        );
+                    }
+                    if debug_sync {
+                        ocl::core::finish(queue).ok();
+                        eprintln!(
+                            "[Plan] L{} flash attention OK (attn_seq_len={})",
+                            i, attn_seq_len
+                        );
+                    }
+                }
+                AttentionVariant::KiviAssembled {
+                    scatter_k,
+                    scatter_v,
+                    attn,
+                } => {
+                    // Scatter residual to F32 attn buffer (with updated res_tokens)
+                    Self::dispatch_step(
+                        backend,
+                        scatter_k,
+                        start_pos_i32,
+                        cache_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt_after,
+                    );
+                    Self::dispatch_step(
+                        backend,
+                        scatter_v,
+                        start_pos_i32,
+                        cache_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt_after,
+                    );
+                    // Attention over total = q2_tokens + res_tokens_after
+                    let total = q2t + rt_after;
+                    Self::dispatch_step(
+                        backend,
+                        attn,
+                        start_pos_i32,
+                        total,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt_after,
+                    );
+                }
+                AttentionVariant::KiviNative(step) => {
+                    // Native KIVI attention: q2_tokens and res_tokens are dynamic
+                    Self::dispatch_step(
+                        backend,
+                        step,
+                        start_pos_i32,
+                        cache_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt_after,
+                    );
+                }
+                AttentionVariant::HybridKvSplit {
+                    partial_step,
+                    hybrid,
+                } => {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        use std::sync::atomic::{AtomicI32, Ordering, fence};
+
+                        // Stage D: blocking clFinish를 제거하고 sigflag(atomic_xchg)
+                        // + 호스트 spin-poll 로 CPU/GPU partial을 병렬 실행한다.
+                        // fallback 경로로 spin count 초과 시에만 blocking finish.
+                        //
+                        // 최대 spin iteration. Adreno 830 기준 Q1 partial 커널이
+                        // 수백 μs 내에 끝나므로 10M iteration은 넉넉한 상한
+                        // (ARM A72 @ 2GHz 기준 약 5ms).
+                        const MAX_SPIN: u64 = 10_000_000;
+
+                        // 1) kv_end(GPU) = attn_seq_len - round(attn_seq_len * kv_frac)
+                        //    kv_start = 0 (고정). CPU는 [kv_end_gpu, attn_seq_len)를 담당.
+                        let kv_len = attn_seq_len as usize;
+                        let (kv_end_gpu, _kv_end_cpu) =
+                            crate::hybrid_attention::compute_kv_split(kv_len, hybrid.kv_frac);
+
+                        // 현재 설치된 setup 획득 — ready_flags host_ptr 직접 접근용.
+                        let setup = crate::hybrid_attention::current().expect(
+                            "HybridKvSplit variant selected but no HybridAttnSetup installed",
+                        );
+
+                        // 2) ready_flags 를 0으로 리셋 (UMA 직접 쓰기).
+                        //    반드시 partial kernel enqueue **전**에 수행해야 한다.
+                        //    enqueue 후에 리셋하면 커널이 1로 set 한 값을 덮어쓰는 race 발생.
+                        let ready_ptr = setup.ready_flags_gpu.host_ptr() as *mut AtomicI32;
+                        let n_heads_q = hybrid.n_heads_q;
+                        unsafe {
+                            for h in 0..n_heads_q {
+                                // Relaxed store는 순서 보장이 약하지만, 뒤에 release
+                                // fence 를 삽입하므로 GPU kernel dispatch 이전에
+                                // 모든 0 쓰기가 가시화된다.
+                                (*ready_ptr.add(h)).store(0, Ordering::Relaxed);
+                            }
+                        }
+                        // ARM DMB ISH: 0 초기화 쓰기가 GPU(같은 UMA 메모리)에
+                        // 가시화된 뒤에 커널이 시작되도록 release fence.
+                        fence(Ordering::Release);
+
+                        // 3) GPU partial enqueue — HybridKvEnd(arg 41) 는 직접 패치.
+                        unsafe {
+                            let kv_end_i32 = kv_end_gpu as i32;
+                            // partial_step.dynamic_args에 HybridKvEnd가 들어있지만,
+                            // 실제 값을 kv_frac과 kv_len 기반으로 여기서 계산하므로
+                            // dispatch_step의 기본 경로 대신 수동으로 세팅 후 enqueue.
+                            for dyn_arg in &partial_step.dynamic_args {
+                                if let DynamicArg::HybridKvEnd { arg_idx } = dyn_arg {
+                                    let _ = ocl::core::set_kernel_arg(
+                                        &partial_step.kernel,
+                                        *arg_idx,
+                                        ocl::core::ArgVal::scalar(&kv_end_i32),
+                                    );
+                                }
+                            }
+                        }
+
+                        // Enqueue GPU partial (dynamic_args의 HybridKvEnd 는 위에서 패치함).
+                        let enqueue_ok = unsafe {
+                            match ocl::core::enqueue_kernel(
+                                queue,
+                                &partial_step.kernel,
+                                partial_step.ndim,
+                                None,
+                                &partial_step.global_work_size,
+                                partial_step.local_work_size,
+                                None::<&ocl::core::Event>,
+                                None::<&mut ocl::core::Event>,
+                            ) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    log::error!(
+                                        "Plan hybrid partial enqueue failed: L{} n_kv={}: {}",
+                                        i,
+                                        kv_len,
+                                        e
+                                    );
+                                    false
+                                }
+                            }
+                        };
+
+                        // 4) Flush — 드라이버 큐에서 디바이스로 실제 제출 개시.
+                        //    Adreno는 대체로 즉시 시작하나, 명시적 flush로 드라이버
+                        //    지연 가능성을 차단한다.
+                        if enqueue_ok {
+                            let _ = ocl::core::flush(queue);
+                        }
+
+                        // 5) CPU partial over [kv_end_gpu, kv_len) — GPU와 병렬 실행.
+                        let inv_sqrt_dk = 1.0f32 / (hybrid.head_dim as f32).sqrt();
+                        let mut ml_guard = setup
+                            .partial_ml_cpu
+                            .lock()
+                            .expect("hybrid partial_ml_cpu mutex poisoned");
+                        let mut o_guard = setup
+                            .partial_o_cpu
+                            .lock()
+                            .expect("hybrid partial_o_cpu mutex poisoned");
+                        // SAFETY: host pointers are permanent-mapped for the
+                        // lifetime of the HybridScope installed by generate.rs.
+                        // CPU partial은 GPU-side partial 버퍼는 건드리지 않고
+                        // setup의 CPU Vec (Mutex guarded single-writer)에만 쓴다.
+                        // GPU partial 읽기는 6)의 spin-poll + acquire fence 이후.
+                        unsafe {
+                            crate::quant::flash_neon::flash_partial_kv_range_f16(
+                                hybrid.q_host_ptr,
+                                hybrid.k_host_ptr,
+                                hybrid.v_host_ptr,
+                                ml_guard.as_mut_ptr(),
+                                o_guard.as_mut_ptr(),
+                                hybrid.n_heads_q,
+                                hybrid.n_heads_kv,
+                                hybrid.head_dim,
+                                hybrid.kv_capacity,
+                                kv_end_gpu,
+                                kv_len,
+                                inv_sqrt_dk,
+                            );
+                        }
+
+                        // 6) Spin-poll: head 별 sigflag 가 1이 될 때까지 대기.
+                        //    enqueue 자체가 실패한 경우 폴링 생략 (flag는 영원히 0).
+                        let mut fallback_used = false;
+                        if enqueue_ok {
+                            for h in 0..n_heads_q {
+                                // SAFETY: ready_flags_gpu는 n_heads_q 크기로
+                                // 할당되었고 UMA로 permanent-map 되어 있다.
+                                let flag = unsafe { &*ready_ptr.add(h) };
+                                let mut spins: u64 = 0;
+                                while flag.load(Ordering::Acquire) == 0 {
+                                    std::hint::spin_loop();
+                                    spins += 1;
+                                    if spins >= MAX_SPIN {
+                                        // Fallback: blocking finish로 전환.
+                                        fallback_used = true;
+                                        break;
+                                    }
+                                }
+                                if fallback_used {
+                                    break;
+                                }
+                            }
+                        }
+                        if fallback_used {
+                            // 안전망: 드라이버가 커널 실행을 지연시키거나
+                            // 기타 이유로 sigflag가 늦는 경우 blocking finish.
+                            let _ = ocl::core::finish(queue);
+                            thread_local! {
+                                static WARNED: std::cell::Cell<bool> =
+                                    const { std::cell::Cell::new(false) };
+                            }
+                            WARNED.with(|w| {
+                                if !w.get() {
+                                    log::warn!(
+                                        "Plan hybrid spin-poll exceeded MAX_SPIN={} iterations; \
+                                         falling back to blocking finish (future occurrences suppressed)",
+                                        MAX_SPIN
+                                    );
+                                    w.set(true);
+                                }
+                            });
+                        }
+                        // 명시적 acquire fence — ARM memory model상 Acquire load 가
+                        // 뒤따르는 비-atomic 읽기 (partial_ml/partial_o) 의 가시성을
+                        // 보장하지만, head별 loop 완료 후 partial_ml_gpu /
+                        // partial_o_gpu 전체에 대한 acquire 를 한 번 더 잠그는
+                        // 차원에서 배리어 삽입.
+                        fence(Ordering::Acquire);
+
+                        // 7) Merge (GPU partial + CPU partial → out_attn).
+                        unsafe {
+                            crate::quant::flash_neon::merge_two_partials_f32(
+                                setup.partial_ml_gpu.host_ptr() as *const f32,
+                                setup.partial_o_gpu.host_ptr() as *const f32,
+                                ml_guard.as_ptr(),
+                                o_guard.as_ptr(),
+                                hybrid.out_attn_host_ptr,
+                                hybrid.n_heads_q,
+                                hybrid.head_dim,
+                            );
+                        }
+                        // 8) Release fence — out_attn 쓰기가 후속 OpenCL 커널
+                        //    (Wo matmul 등) 에 가시화되도록.
+                        fence(Ordering::Release);
+                        drop(ml_guard);
+                        drop(o_guard);
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        // NEON 의존 → 비 aarch64 호스트에서는 hybrid variant를
+                        // 건드리지 않는다. gating(build_layer_plan)이 이미
+                        // aarch64 용도가 아니면 hybrid를 만들지 못하도록
+                        // 막는 게 이상적이나, 현재는 컴파일 가드만 유지.
+                        let _ = (partial_step, hybrid);
+                        log::error!(
+                            "HybridKvSplit reached dispatch on non-aarch64 host; \
+                             gate in generate.rs or build_layer_plan is broken"
+                        );
+                    }
+                }
+            }
+
+            // Steps 9-10: post-attention pre-FFN (Wo matmul, add_rms_norm).
+            for (si, step) in layer_plan.steps_post_attn_pre_ffn.iter().enumerate() {
+                Self::dispatch_step(
+                    backend,
+                    step,
+                    start_pos_i32,
+                    cache_seq_len,
+                    write_pos,
+                    kv_cap,
+                    rp,
+                    q2t,
+                    rt,
+                );
+                if debug_sync {
+                    ocl::core::finish(queue).ok();
+                    eprintln!(
+                        "[Plan] L{} post_attn_pre_ffn[{}] {:?} OK",
+                        i, si, step.op_tag
+                    );
+                }
+            }
+
+            // Steps 11-14: FFN (GPU-only or cooperative partition).
+            let skip_post_ffn = match &layer_plan.ffn {
+                FfnVariant::GpuOnly {
+                    gate,
+                    up,
+                    silu_mul,
+                    down,
+                } => {
+                    for step in [gate, up, silu_mul, down] {
+                        Self::dispatch_step(
+                            backend,
+                            step,
+                            start_pos_i32,
+                            cache_seq_len,
+                            write_pos,
+                            kv_cap,
+                            rp,
+                            q2t,
+                            rt,
+                        );
+                        if debug_sync {
+                            ocl::core::finish(queue).ok();
+                            eprintln!("[Plan] L{} ffn {:?} OK", i, step.op_tag);
+                        }
+                    }
+                    false
+                }
+                FfnVariant::Partitioned(step) => {
+                    step.run(backend, i)?;
+                    if debug_sync {
+                        ocl::core::finish(queue).ok();
+                        eprintln!("[Plan] L{} partition FFN OK", i);
+                    }
+                    // `Fused` merge already performs `x += gpu_partial + cpu_partial`
+                    // inside PartitionStep::run, so the standalone post_ffn
+                    // add_assign step becomes redundant. `Deferred` is still
+                    // broken on plan path (see PartitionMerge::Deferred doc).
+                    match step.merge {
+                        PartitionMerge::Fused { .. } => true,
+                        PartitionMerge::Deferred => !step.is_last_layer,
+                        PartitionMerge::Inline { .. } => false,
+                    }
+                }
+            };
+
+            // Step 15: add_assign (x += down). Partition `Deferred` layers
+            // fold this into the next layer's fused norm kernel.
+            if !skip_post_ffn {
+                for (si, step) in layer_plan.steps_post_ffn.iter().enumerate() {
+                    Self::dispatch_step(
+                        backend,
+                        step,
+                        start_pos_i32,
+                        cache_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
+                    if debug_sync {
+                        ocl::core::finish(queue).ok();
+                        eprintln!("[Plan] L{} post_ffn[{}] {:?} OK", i, si, step.op_tag);
+                    }
+                }
+            }
+            handle.plan_advance(1);
+
+            if layer_plan.flush_after
+                && let Err(e) = ocl::core::flush(queue)
+            {
+                log::error!("Plan flush failed: {}", e);
+            }
+
+            // Intra-token GPU yield hook. Plan path is decode-only, so
+            // `is_decode = true` unconditionally.
+            backend.yield_after_layer(i, true);
+        }
+
+        // GPU score accumulator: flush step-local scores into cumulative
+        // importance and clear step buffers. Mirrors transformer.rs:979 for
+        // the non-plan path. Uses the post-advance cache position (one past
+        // the token just scattered) so `end_step` sees the same length the
+        // runtime sees.
+        if self.writes_gpu_scores
+            && !handles.is_empty()
+            && let Some(gpu_acc) = backend.gpu_score_acc_mut()
+            && gpu_acc.is_active()
+        {
+            let cache_seq_len = handles[0].plan_geometry().current_pos;
             if let Err(e) = gpu_acc.end_step(queue, cache_seq_len) {
                 log::error!(
                     "Plan gpu_score end_step failed: n_kv={}: {}",

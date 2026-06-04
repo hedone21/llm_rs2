@@ -2834,6 +2834,516 @@ impl TransformerModel {
         }
     }
 
+    /// (3p) ④-a — `build_plan` 의 fmt-handle copy-fork (Phase α-K BC Step 3).
+    ///
+    /// `build_plan` 본문 byte-identical 이되, KV buffer 직접 접근(`kv_caches[i].k_buffer`
+    /// 등)을 `StandardFormat` lock guard 경유로 도달하도록 진입부에서 guard 슬라이스를 잡고
+    /// `&KVCache` 슬라이스로 재바인딩한다. plan 빌드는 decode 첫 step lazy 1회 — lock 비용
+    /// perf 무영향. production 게이트(`LLMRS_KV_FMT`) OFF 시 미발화(byte-불변).
+    #[cfg(feature = "opencl")]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L build-time plan construction; StandardFormat guard seam for cl_mem extraction
+    pub fn build_plan_fmt(
+        &self,
+        x: &Tensor,
+        logits: &Tensor,
+        ws: &LayerWorkspace,
+        handles: &[Arc<crate::pressure::standard_format::StandardFormat>],
+        backend: &Arc<dyn Backend>,
+    ) -> Option<FullKernelPlan> {
+        // (3p) ④-a: lock every StandardFormat guard up front and bind a
+        // `&KVCache` slice so the byte-identical `build_plan` body below can
+        // keep indexing `kv_caches[i]`. The cl_mem / host-ptr handles read
+        // here are bound into the kernel via `set_kernel_arg` *inside*
+        // `build_full_plan`, so the guards only need to outlive that call
+        // (FullKernelPlan holds no borrow into the caches).
+        let __fmt_guards: Vec<_> = handles.iter().map(|h| h.plan_lock()).collect();
+        let kv_caches: Vec<&crate::pressure::kv_cache::KVCache> =
+            __fmt_guards.iter().map(|g| &g.cache).collect();
+        use crate::backend::opencl::get_cl_mem;
+        use crate::backend::opencl::plan::*;
+        use crate::kv_cache_ops::KVLayout;
+
+        // Phase 4-4.8 diagnostic: env-gated line-by-line trace to identify
+        // which None-return path fires when the happy-path ModelForward
+        // sticky-locks. Costs 1 syscall per build_plan call when unset.
+        let trace = std::env::var_os("LLMRS_BUILD_PLAN_TRACE").is_some();
+        macro_rules! trace_none {
+            ($tag:expr) => {{
+                if trace {
+                    eprintln!(
+                        "[build_plan-trace] None at {} ({}:{})",
+                        $tag,
+                        file!(),
+                        line!()
+                    );
+                }
+                return None;
+            }};
+        }
+
+        // Snapshot every layer's weights once and keep the Arcs alive for the
+        // duration of plan construction. The cl_mem references captured below
+        // rely on these Arcs remaining in scope (INV-123 snapshot semantics).
+        let layer_snaps: Vec<Arc<TransformerLayer>> =
+            self.layers.iter().map(|s| s.load_weights()).collect();
+        if layer_snaps.is_empty() {
+            trace_none!("layer_snaps.is_empty");
+        }
+        // ENG-ALG-219 / weight-swap: per-layer dtype tracking. A weight swap
+        // batch may leave the model in a *mixed* state (some layers F16, some
+        // Q4_0) — `uniform_target_layers` deliberately excludes layer 0 for
+        // ratio ≤ 0.5. Earlier the plan derived a single `is_q4_0` flag from
+        // layer 0 alone, which routed every Q4_0 layer through the F16 matmul
+        // kernel and produced silent garbage (Phase 3.7b ratio scan: ratios
+        // 0.10/0.20/0.25/0.50 stuck in invisible-token loop). The plan now
+        // accepts heterogeneous F16 + Q4_0 layers; per-layer noshuffle lookup
+        // selects the correct matmul step inside `build_layer_plan`.
+        //
+        // GPU plan supports F16 weights or Q4_0 with noshuffle SOA conversion.
+        // Reject the plan only when at least one layer has neither dtype.
+        if layer_snaps.iter().any(|l| {
+            let d = l.wq.dtype();
+            d != crate::buffer::DType::F16 && d != crate::buffer::DType::Q4_0
+        }) {
+            trace_none!("wq dtype not F16/Q4_0");
+        }
+        let any_q4_0 = layer_snaps
+            .iter()
+            .any(|l| l.wq.dtype() == crate::buffer::DType::Q4_0);
+
+        // kernel_add_row_bias expects F32 bias buffers. If any layer has
+        // a QKV bias that isn't F32, fall back to the legacy path.
+        if self.config.has_qkv_bias {
+            for layer in &layer_snaps {
+                if layer.qkv_bias.as_ref().is_some_and(|bias| {
+                    bias.bq.dtype() != crate::buffer::DType::F32
+                        || bias.bk.dtype() != crate::buffer::DType::F32
+                        || bias.bv.dtype() != crate::buffer::DType::F32
+                }) {
+                    trace_none!("qkv_bias dtype not F32");
+                }
+            }
+        }
+
+        if backend.name() != "OpenCL" || kv_caches.is_empty() {
+            trace_none!("backend not OpenCL or kv_caches empty");
+        }
+
+        // Helper macro to extract cl_mem from tensor. Diagnostic-aware: emits
+        // a trace tag identifying which tensor lookup failed.
+        macro_rules! cl {
+            ($t:expr) => {
+                match get_cl_mem($t.buffer().as_ref()) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        if trace {
+                            eprintln!(
+                                "[build_plan-trace] None at cl!(...) get_cl_mem failed: \
+                                 expr={} ({}:{})",
+                                stringify!($t),
+                                file!(),
+                                line!()
+                            );
+                        }
+                        return None;
+                    }
+                }
+            };
+        }
+
+        let dim = self.config.hidden_size;
+        let head_dim = self.config.head_dim;
+        let n_kv_heads = self.config.num_key_value_heads;
+        let capacity = kv_caches[0].capacity();
+
+        let (kv_pos_stride, kv_head_stride) = if kv_caches[0].layout() == KVLayout::HeadMajor {
+            (head_dim as i32, (capacity * head_dim) as i32)
+        } else {
+            ((n_kv_heads * head_dim) as i32, head_dim as i32)
+        };
+
+        let ocl_backend = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
+
+        // For each Q4_0 layer, verify the noshuffle SOA entry (with q_img)
+        // is available. Mixed-state batches install Q4_0 layers piecewise so
+        // the layer 0-only check that lived here previously was insufficient
+        // — if layer 0 stays F16 and layer 1 is freshly Q4_0, missing layer 1
+        // SOA must still abort the GPU plan and force the legacy path.
+        for (li, layer) in layer_snaps.iter().enumerate() {
+            if layer.wq.dtype() != crate::buffer::DType::Q4_0 {
+                continue;
+            }
+            let wq_key = cl!(layer.wq).as_ptr() as usize;
+            if trace && li == 0 {
+                let is_nb = layer
+                    .wq
+                    .buffer()
+                    .as_any()
+                    .downcast_ref::<crate::memory::opencl::noshuffle::NoshuffleWeightBuffer>()
+                    .is_some();
+                eprintln!(
+                    "[build_plan-trace] layer0 wq key=0x{:x} is_NoshuffleWeightBuffer={}",
+                    wq_key, is_nb
+                );
+            }
+            match ocl_backend.lookup_noshuffle_soa(wq_key) {
+                Some(e) if e.q_img.is_some() => {}
+                Some(_) => {
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at Q4_0 SOA q_img missing layer={} \
+                             ({}:{})",
+                            li,
+                            file!(),
+                            line!()
+                        );
+                    }
+                    return None;
+                }
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at Q4_0 SOA entry missing layer={} \
+                             ({}:{})",
+                            li,
+                            file!(),
+                            line!()
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+
+        // Helper: lookup noshuffle SOA entry and return NoshufflePlanEntry if
+        // available. Per-tensor dtype gate — F16 weights legitimately have no
+        // SOA entry and must return None so `build_layer_plan` selects the
+        // F16 matmul step. Q4_0 weights with a missing entry also return
+        // None, but the per-layer abort above means we never reach this with
+        // an unregistered Q4_0 weight in production.
+        let ns_entry = |tensor: &Tensor| -> Option<NoshufflePlanEntry<'_>> {
+            if tensor.dtype() != crate::buffer::DType::Q4_0 {
+                return None;
+            }
+            let key = cl!(tensor).as_ptr() as usize;
+            let entry = ocl_backend.lookup_noshuffle_soa(key)?;
+            let q_img = entry.q_img.as_ref()?;
+            Some(NoshufflePlanEntry {
+                q_img,
+                d_buf: &entry.d_buf,
+                ne00: entry.ne00,
+                ne01: entry.ne01,
+            })
+        };
+
+        // Collect per-layer buffer handles
+        let mut layer_bufs = Vec::new();
+        let mut kv_bufs_vec = Vec::new();
+        for (i, layer) in layer_snaps.iter().map(|a| &**a).enumerate() {
+            // Extract optional QKV bias cl_mem handles. Non-bias models
+            // short-circuit this block with (None, None, None). For bias
+            // models (e.g. Qwen2), the `cl!` macro returns None from the
+            // outer function if any buffer lookup fails.
+            let (bq, bk, bv) = match layer.qkv_bias.as_ref() {
+                Some(bias) => (Some(cl!(bias.bq)), Some(cl!(bias.bk)), Some(cl!(bias.bv))),
+                None => (None, None, None),
+            };
+            let (partition_gate_ns, partition_up_ns, partition_down_ns) =
+                match layer.partition_ctx.as_ref() {
+                    Some(ctx) => (
+                        ns_entry(ctx.gate.gpu_slice()),
+                        ns_entry(ctx.up.gpu_slice()),
+                        ns_entry(ctx.down.gpu_slice()),
+                    ),
+                    None => (None, None, None),
+                };
+            layer_bufs.push(LayerBufs {
+                wq: cl!(layer.wq),
+                wk: cl!(layer.wk),
+                wv: cl!(layer.wv),
+                wo: cl!(layer.wo),
+                w_gate: cl!(layer.w_gate),
+                w_up: cl!(layer.w_up),
+                w_down: cl!(layer.w_down),
+                attn_norm: cl!(layer.attention_norm),
+                ffn_norm: cl!(layer.ffn_norm),
+                bq,
+                bk,
+                bv,
+                wq_noshuffle: ns_entry(&layer.wq),
+                wk_noshuffle: ns_entry(&layer.wk),
+                wv_noshuffle: ns_entry(&layer.wv),
+                wo_noshuffle: ns_entry(&layer.wo),
+                w_gate_noshuffle: ns_entry(&layer.w_gate),
+                w_up_noshuffle: ns_entry(&layer.w_up),
+                w_down_noshuffle: ns_entry(&layer.w_down),
+                partition_gate_noshuffle: partition_gate_ns,
+                partition_up_noshuffle: partition_up_ns,
+                partition_down_noshuffle: partition_down_ns,
+            });
+            kv_bufs_vec.push(KvBufs {
+                k_cache: cl!(kv_caches[i].k_buffer),
+                v_cache: cl!(kv_caches[i].v_buffer),
+            });
+        }
+
+        // Build noshuffle GEMV programs whenever *any* layer is Q4_0
+        // (compile per unique ne01 dimension). In a heterogeneous F16+Q4_0
+        // mixed-state batch the F16 layers contribute no entries to the
+        // ne01 set; only the Q4_0 layers do, which is exactly what the
+        // noshuffle programs need to cover.
+        let noshuffle_programs = if any_q4_0 {
+            // Collect unique ne01 values from all noshuffle entries — including
+            // partition slice entries whose `ne01` (split_row or hidden_size)
+            // typically differs from the full weight's ne01.
+            let mut ne01_set: Vec<usize> = layer_bufs
+                .iter()
+                .flat_map(|lb| {
+                    [
+                        lb.wq_noshuffle.as_ref(),
+                        lb.wk_noshuffle.as_ref(),
+                        lb.wv_noshuffle.as_ref(),
+                        lb.wo_noshuffle.as_ref(),
+                        lb.w_gate_noshuffle.as_ref(),
+                        lb.w_up_noshuffle.as_ref(),
+                        lb.w_down_noshuffle.as_ref(),
+                        lb.partition_gate_noshuffle.as_ref(),
+                        lb.partition_up_noshuffle.as_ref(),
+                        lb.partition_down_noshuffle.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.ne01)
+                })
+                .collect();
+            // Also include lm_head ne01 if applicable
+            if !self.lm_head_on_cpu
+                && let Some(ref e) = ns_entry(&self.lm_head)
+            {
+                ne01_set.push(e.ne01);
+            }
+            ne01_set.sort_unstable();
+            ne01_set.dedup();
+            match build_noshuffle_programs(
+                &ocl_backend.device,
+                &ocl_backend.context,
+                &ocl_backend.cl_opts,
+                &ne01_set,
+            ) {
+                Ok(progs) => Some(progs),
+                Err(e) => {
+                    log::warn!("Failed to build noshuffle programs for plan: {}", e);
+                    if trace {
+                        eprintln!(
+                            "[build_plan-trace] None at build_noshuffle_programs err={} \
+                             ({}:{})",
+                            e,
+                            file!(),
+                            line!()
+                        );
+                    }
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
+        // lm_head noshuffle entry (Q4_0 on GPU only)
+        let lm_head_noshuffle = if !self.lm_head_on_cpu {
+            ns_entry(&self.lm_head)
+        } else {
+            None
+        };
+
+        // Mirror the runtime gate in `attention_gen` — flash attention has no
+        // score output, so an active GPU score accumulator forces the legacy
+        // attention path and pre-binds the persistent score buffer into the
+        // attention kernel args (arg 4, `write_scores=1`, `score_stride`).
+        let plan_needs_scores = ocl_backend
+            .gpu_score_acc()
+            .is_some_and(|acc| acc.is_active());
+        let (gpu_score_buf, gpu_score_stride) = if plan_needs_scores {
+            match ocl_backend.gpu_score_acc() {
+                Some(acc) => (Some(acc.score_buf_mem()), acc.score_stride() as i32),
+                None => (None, 0),
+            }
+        } else {
+            (None, 0)
+        };
+
+        // Hybrid setup Arc: build_full_plan 호출 동안 cl_mem 참조가 유효해야
+        // 하므로 local binding으로 lifetime을 확장한다. None이면 hybrid 비활성.
+        let hybrid_setup_arc = {
+            let partition_active = layer_snaps.iter().any(|l| l.partition_ctx.is_some());
+            if partition_active {
+                None
+            } else {
+                crate::hybrid_attention::current()
+            }
+        };
+
+        let full_config = FullPlanConfig {
+            context: &ocl_backend.context,
+            f16_program: &ocl_backend.f16_program,
+            f16_l4_program: ocl_backend.f16_l4_program.as_ref(),
+            simple_ops_program: &ocl_backend.simple_ops_program,
+            q4_0_program: &ocl_backend.q4_0_program,
+            flash_attn_f32_f16_program_dk64: ocl_backend.flash_attn_f32_f16_program_dk64.as_ref(),
+            flash_attn_f32_f16_program_dk128: ocl_backend.flash_attn_f32_f16_program_dk128.as_ref(),
+            needs_attention_scores: plan_needs_scores,
+            gpu_score_buf,
+            gpu_score_stride,
+            layer_bufs,
+            x_buf: cl!(x),
+            q_buf: cl!(ws.q),
+            k_buf: cl!(ws.k),
+            v_buf: cl!(ws.v),
+            out_attn_buf: cl!(ws.out_attn),
+            attn_out_buf: cl!(ws.attn_out),
+            gate_buf: cl!(ws.gate),
+            up_buf: cl!(ws.up),
+            down_buf: cl!(ws.down),
+            residual_buf: cl!(ws.residual),
+            // Permanent-mapped host ptr when residual UnifiedBuffer has
+            // been mapped (LLMRS_PARTITION_ZCOPY_RESIDUAL or the
+            // partition poll-flag auto-enable). `as_ptr()` returns null
+            // when unmapped.
+            residual_host_ptr: ws.residual.buffer().as_ptr(),
+            kv_bufs: kv_bufs_vec,
+            final_norm_buf: cl!(self.norm),
+            lm_head_buf: if self.lm_head_on_cpu {
+                None
+            } else {
+                Some(cl!(self.lm_head))
+            },
+            logits_buf: cl!(logits),
+            dim,
+            n_heads_q: self.config.num_attention_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_hidden: self.config.intermediate_size,
+            vocab_size: self.config.vocab_size,
+            rms_norm_eps: self.config.rms_norm_eps as f32,
+            rope_theta: self.config.rope_theta as f32,
+            kv_capacity: capacity,
+            kv_pos_stride,
+            kv_head_stride,
+            is_nosub: ocl_backend.is_nosub(),
+            noshuffle_programs,
+            lm_head_noshuffle,
+            partition_layers: {
+                // Route each layer's optional PartitionContext into the plan
+                // builder. When any layer has a partition_ctx, the FFN
+                // segment uses `build_partitioned_layer_plan`; otherwise the
+                // legacy GPU-only FFN is used per layer. See arch A.6.1.
+                let mut any = false;
+                let v: Vec<Option<&PartitionContext>> = layer_snaps
+                    .iter()
+                    .map(|l| {
+                        let opt = l.partition_ctx.as_ref();
+                        any |= opt.is_some();
+                        opt
+                    })
+                    .collect();
+                if any { Some(v) } else { None }
+            },
+            partition_workspace: ws.partition_ws.clone(),
+            partition_cpu_backend: layer_snaps
+                .iter()
+                .find_map(|l| l.partition_ctx.as_ref().map(|c| c.cpu_backend.clone())),
+            partition_use_gelu_tanh: self.config.arch == crate::model_config::ModelArch::Gemma3,
+            lm_head_dtype: self.lm_head.dtype(),
+            // UMA hybrid attention: pulled from the thread-local HybridScope
+            // installed by the caller (generate.rs decode entry). Mutually
+            // exclusive with FFN tensor partition in v1.
+            hybrid_attn: hybrid_setup_arc.as_ref().and_then(|setup| {
+                // Gather per-layer K/V host pointers from the KV caches
+                // (must already be host-mapped by the caller — we rely
+                // on as_ptr() returning non-null; if any KV buffer isn't
+                // mapped, bail out and disable hybrid for this plan build).
+                let kv_host_ptrs: Vec<(*const u16, *const u16)> = kv_caches
+                    .iter()
+                    .map(|c| {
+                        let k = c.k_buffer.buffer().as_ptr() as *const u16;
+                        let v = c.v_buffer.buffer().as_ptr() as *const u16;
+                        (k, v)
+                    })
+                    .collect();
+                let any_null = kv_host_ptrs.iter().any(|(k, v)| k.is_null() || v.is_null());
+                // Workspace q/out_attn must also be mapped.
+                let q_host_ptr = ws.q.buffer().as_ptr() as *const f32;
+                let out_host_ptr = ws.out_attn.buffer().as_ptr() as *mut f32;
+                if any_null || q_host_ptr.is_null() || out_host_ptr.is_null() {
+                    log::warn!(
+                        "Hybrid attention requested but KV/Q/out_attn buffers not \
+                         host-mapped; skipping hybrid for this plan build"
+                    );
+                    None
+                } else {
+                    Some(HybridAttnPlanConfig {
+                        kv_frac: setup.kv_frac,
+                        partial_ml_mem: setup.partial_ml_gpu.cl_mem(),
+                        partial_o_mem: setup.partial_o_gpu.cl_mem(),
+                        ready_flags_mem: setup.ready_flags_gpu.cl_mem(),
+                        q_host_ptr,
+                        out_attn_host_ptr: out_host_ptr,
+                        kv_host_ptrs,
+                    })
+                }
+            }),
+            // ENG-ALG-219: pass the global ratio_generation counter so the
+            // plan can detect weight swaps at execute() entry (INV-129).
+            ratio_generation: self.ratio_generation.clone(),
+        };
+
+        match build_full_plan(&full_config) {
+            Ok(plan) => {
+                // Mixed-state diagnostic: count Q4_0 layers explicitly so a
+                // partial swap shows up (e.g. "8/16 Q4_0 noshuffle") rather
+                // than collapsing to a single boolean.
+                let q4_0_count = layer_snaps
+                    .iter()
+                    .filter(|l| l.wq.dtype() == crate::buffer::DType::Q4_0)
+                    .count();
+                log::info!(
+                    "GPU kernel plan built ({} layers, capacity={}, q4_noshuffle={}/{})",
+                    self.layers.len(),
+                    capacity,
+                    q4_0_count,
+                    self.layers.len(),
+                );
+                Some(plan)
+            }
+            Err(e) => {
+                // The plan builder bails with a short message whenever an
+                // opt-in flag is off (e.g. `LLMRS_PARTITION_PLAN=0`, currently
+                // the default on Adreno until the upstream plan-path parity
+                // bug is triaged). Demote that expected signal to `info!` so
+                // partition runs — which rebuild the plan every token after a
+                // fallback — do not spam warnings. Any real kernel-build /
+                // cl_mem failure still surfaces via the full context chain.
+                let chain = format!("{:#}", e);
+                if chain.contains("LLMRS_PARTITION_PLAN=0") {
+                    log::info!("GPU kernel plan skipped: {}", chain);
+                } else {
+                    log::warn!("Failed to build GPU kernel plan: {}", chain);
+                }
+                if trace {
+                    eprintln!(
+                        "[build_plan-trace] None at build_full_plan err chain={} ({}:{})",
+                        chain,
+                        file!(),
+                        line!()
+                    );
+                }
+                None
+            }
+        }
+    }
+
     /// Execute a pre-built GPU kernel plan for a single decode token.
     /// Falls back to forward_into() on plan invalidation.
     #[cfg(feature = "opencl")]
@@ -2892,6 +3402,71 @@ impl TransformerModel {
                 //      dispatch on dtype; the plan has no F32 step, so we
                 //      dispatch here instead of CPU-fallback (which would
                 //      require `self.lm_head` to be a CPU tensor).
+                if plan.lm_head.is_none() {
+                    if self.lm_head_on_cpu {
+                        self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
+                    } else {
+                        backend.matmul_transposed(x_gen, &self.lm_head, logits_out)?;
+                    }
+                }
+                Ok(true)
+            }
+            Err(_) => Ok(false), // plan invalidated, caller should rebuild
+        }
+    }
+
+    /// (3p) ④-a — `execute_plan` 의 fmt-handle copy-fork (Phase α-K BC Step 3).
+    ///
+    /// `execute_plan` 미러 — `plan.execute(...)` → `plan.execute_fmt(...)`(StandardFormat
+    /// concrete-handle) 만 교체. lm_head / gather_embed 분기 동일. production 게이트
+    /// (`LLMRS_KV_FMT`) OFF 시 미발화. acceptance = device 세션(plan GPU-only).
+    #[cfg(feature = "opencl")]
+    #[allow(clippy::too_many_arguments)]
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path plan execute (token TBT measured)
+    pub fn execute_plan_fmt(
+        &self,
+        plan: &FullKernelPlan,
+        input_tokens: &Tensor,
+        start_pos: usize,
+        x_gen: &mut Tensor,
+        handles: &[Arc<crate::pressure::standard_format::StandardFormat>],
+        logits_out: &mut Tensor,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<bool> {
+        // 1. Embedding lookup: CPU gather + upload to GPU x-buffer
+        self.gather_embed(input_tokens, x_gen, backend)?;
+
+        // 2. Execute plan (all layers + final norm + optionally lm_head)
+        let ocl_backend = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
+
+        let result = plan.execute_fmt(ocl_backend, start_pos, handles);
+        if std::env::var_os("LLMRS_PLAN_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static OK_CNT: AtomicU64 = AtomicU64::new(0);
+            static ERR_CNT: AtomicU64 = AtomicU64::new(0);
+            match &result {
+                Ok(()) => {
+                    let n = OK_CNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_power_of_two() || n.is_multiple_of(32) {
+                        eprintln!(
+                            "[plan-trace] execute_plan_fmt ok={} err={}",
+                            n,
+                            ERR_CNT.load(Ordering::Relaxed)
+                        );
+                    }
+                }
+                Err(_) => {
+                    ERR_CNT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        match result {
+            Ok(()) => {
+                // lm_head=None gating identical to execute_plan (CPU tied embedding
+                // or unsupported GPU dtype → dispatch here instead of CPU fallback).
                 if plan.lm_head.is_none() {
                     if self.lm_head_on_cpu {
                         self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
