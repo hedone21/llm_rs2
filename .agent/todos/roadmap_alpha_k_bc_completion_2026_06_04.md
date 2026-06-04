@@ -93,8 +93,9 @@
 ---
 
 ## [P2] Step 4 — device-gate 를 legacy_generate → argus_cli 로 이주
-- **Status**: TODO
-- **Sprint**: backlog
+- **Status**: ✅ **COMPLETE — argus_cli device-gate 등가 검증 PASS** (S25 OpenCL, 2026-06-04). **CLI 갭 0**(argus_cli 가 legacy 와 동일한 `session::cli::Args` parse + 동일 `run_standard_happy_path`→ModelForward→fmt 게이트 공유). 유일 차이=resilience default-on→`--no-resilience` 로 legacy `resilience:None` 정합. **검증(F16 weight 모델, f16/f32/q4 KV)**: (a) **argus OFF ≡ legacy OFF bit-identical 3/3**(reference baseline 연속성), (b) **argus ON ≡ argus OFF bit-identical 3/3**(fmt 게이트 동작), (c) argus ON 에서 "build_plan SUCCESS"+"KV_FMT ON" 발화 확인(execute_plan_fmt, 비-vacuous), (d) **argus avg_tbt ON/OFF Δ+0.10%**(n=5)·절대값 ~59.4ms≈legacy(flip perf-neutral 재현). **다음 = Step 5(legacy 폐기 + KVCacheOps 삭제)**. ★Step 5 주의: argus_cli 는 **happy-path 전용**(eviction/KIVI/offload/swap/profile/batch reject) — legacy 폐기 전 비-happy-path 모드는 argus-chat/argus-eval 등 family bin 으로 이주하거나 drop 결정 필요(현 reject 메시지=planned).
+- **canonical 게이트 명령** (legacy_generate 대체): `LLMRS_KV_FMT=1 argus_cli -b opencl --opencl-rpcmem --greedy -n 32 --no-resilience --model-path <F16.gguf> --tokenizer-path <tokenizer.json> --kv-type {f16,f32,q4} --prompt "..."`. **F16 weight 모델 필수**(q4_0 weight→build_plan None→dyn fallback, flip 미발화). ON(execute_plan_fmt) vs OFF(execute<C>) 비교.
+- **Sprint**: ✅ done
 - **Dependencies**: Step 1·2·3 (flip 들이 argus_cli 경로에서 동작해야 device-gate 이주 가능). **legacy 폐기(Step 5) 의 선결**.
 - **차단 cluster**: B-5 부수효과 (legacy_generate 가 현 device-gate bin — MEMORY [[project_pipeline_alpha_w]]). legacy 폐기 전 device 게이트 매체 이전 필수.
 - **Description**: 현 device 게이트 bin = `legacy_generate`(`engine/legacy/generate.rs`). legacy 를 폐기(Step 5)하려면 device bit-identical/avg_tbt 게이트를 **`argus_cli`**(`engine/src/bin/argus_cli.rs`)로 먼저 이주해야 한다. argus_cli 가 5 KV 구성 × eviction subcommand × `--opencl-rpcmem` × greedy 32-tok 측정을 legacy 와 동등하게 수행하는지 확인 + 갭 메움.
@@ -131,9 +132,9 @@
 (3c-evict ✅)─┴→ Step 1 ✅ (B-2 prefill + B-4 eval, cold) ─┬→ Step 3 ✅ ((3p) B-1 plan, HOT crux) — S25 device PASS
                 Step 2 ✅ (B-3 offload 분리, cold) ───────┘        │
                                                                  ↓
-                                          Step 4 ★다음 (LLMRS_KV_FMT 기본화 + device-gate → argus_cli)
+                                          Step 4 ✅ (device-gate → argus_cli, S25 등가 PASS)
                                                                  ↓
-                                          Step 5 (legacy 폐기 + B-2 OLD-chain 잔여 migrate
+                                          Step 5 ★다음 (legacy 폐기 + B-2 OLD-chain 잔여 migrate
                                                   [forward_into_offload/run_chunked_prefill]
                                                   + KVCacheOps 삭제)
 ```

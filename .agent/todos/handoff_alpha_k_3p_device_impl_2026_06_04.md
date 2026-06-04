@@ -3,7 +3,7 @@
 **작성**: 2026-06-04 (메인 세션) / **갱신**: 2026-06-04 (device 게이트 세션, S25 실측)
 **HEAD**: `ae9fc460` fix(non-opencl 빌드 복구) ← `004147bf` 구현 ← `659b130a` 설계
 **브랜치**: `master` — **`ae9fc460` push 미실행** (사용자 승인 대기; ⚠️ origin/master 는 `004147bf` 에서 non-opencl 빌드 깨진 상태)
-**다음 세션 진입 문장**: **"BC Step 4"** (LLMRS_KV_FMT 기본화 결정 + argus_cli 전환)
+**다음 세션 진입 문장**: **"BC Step 5"** (legacy 폐기 + B-2 OLD-chain 잔여 migrate + KVCacheOps 삭제). **Step 3·4 모두 ✅ COMPLETE** (아래).
 
 ---
 
@@ -44,18 +44,19 @@
 | Step 2 (B-3 offload 분리) | ✅ | `936d0c99` host bit-identical |
 | Step 3 설계 | ✅ | `659b130a` + workflow `wf_2be25cb8-bc9`(V1→흡수, V2/V3 confirmed) |
 | **Step 3 구현 + host 게이트** | ✅ **완료** | 코드 commit(본 handoff 동행) — execute_fmt↔execute / build_plan_fmt↔build_plan / execute_plan_fmt↔execute_plan **기계적 diff=문서화 변경뿐**, 보호 함수 0 deletion, clippy/fmt clean, standard_format 16/16, 전체 lib 1235 pass/23 fail(전부 GPU부재) |
-| **Step 3 device 게이트** | ✅ **PASS** | **S25 OpenCL** = 완전 acceptance. bit-identical f16/f32/q4 KV 3/3 (ON≡OFF) + avg_tbt Δ +0.24% median(n=7). 게이트 spec 2건 정정(eviction→KV dtype, Jetson N/A). 회귀 fix `ae9fc460`. |
-| Step 4·5 | ★**다음** | Step 4 = LLMRS_KV_FMT 기본화 결정 + argus_cli 전환. Step 5 = legacy 폐기 + KVCacheOps 삭제(B-2 OLD-chain forward_into_offload/run_chunked_prefill 포함). |
+| **Step 3 device 게이트** | ✅ **PASS** | **S25 OpenCL** = 완전 acceptance. bit-identical f16/f32/q4 KV 3/3 (ON≡OFF) + avg_tbt Δ +0.24% median(n=7). 게이트 spec 2건 정정(eviction→KV dtype, Jetson N/A). 회귀 fix `ae9fc460`+`26e77908`. |
+| **Step 4 (device-gate → argus_cli)** | ✅ **PASS** | argus_cli CLI 갭 0(Args+happy-path 공유). S25: argus OFF≡legacy OFF 3/3(baseline 연속성) + argus ON≡OFF 3/3(fmt 게이트) + execute_plan_fmt 발화 확인 + avg_tbt Δ+0.10%. 게이트 명령=roadmap Step 4 §canonical. |
+| Step 5 | ★**다음** | legacy 폐기 + B-2 OLD-chain 잔여(forward_into_offload/run_chunked_prefill) fmt 이주 + KVCacheOps trait 삭제. ★argus 는 happy-path 전용 → 비-happy 모드 family bin 이주/drop 결정 선결. |
 
 ---
 
-## 다음 작업 (Step 4 — LLMRS_KV_FMT 기본화 결정 + argus_cli 전환)
-> Step 3 device 게이트 PASS 로 (3p) ④-a flip 이 production-equivalent(bit-identical) + perf-neutral(+0.24%) 임이 device 실측 확정됨. 단 게이트는 여전히 `LLMRS_KV_FMT` OFF default → production hot path 는 아직 `execute<C>`.
-1. **LLMRS_KV_FMT 기본화 결정** (사용자/Architect): flip 을 production-default(ON)로 승격할지. S25 OpenCL 한정 검증이므로 다른 Adreno/플랫폼 추가 검증 필요 여부 판단. 기본화 시 `is_fmt_gate_on()` default 반전 + 회귀 모니터링.
-2. **argus_cli 전환**: 신규 single-prompt bin(`run_standard_happy_path`)도 동일 flip 경로 사용 확인 + 게이트.
-3. **Step 5 차단자**: legacy 폐기 + `KVCacheOps` 완전 삭제. B-2 OLD-chain 잔여(`forward_into_offload`/`run_chunked_prefill`)는 fmt 이주(Option B, device GPU 재검증 필수) 선결.
-- **권장 역할**: Architect(기본화 결정/범위) → Implementer(배선).
-- **★Step 3 회귀 시 처방**: (3p)만 revert(`execute_fmt`/`build_plan_fmt`/`execute_plan_fmt`/wiring + standard_format plan seam 제거), Step 1·2 cold cluster 유지. fix `ae9fc460` 는 빌드 복구라 유지.
+## 다음 작업 (Step 5 — legacy 폐기 + KVCacheOps trait 삭제)
+> Step 3(flip 정확/perf) + Step 4(argus_cli 게이트 매체 등가) PASS 로 BC 의 cold/hot flip + 게이트 이주가 모두 완료. 남은 것은 OLD path(`KVCacheOps`) 소비자 0 만들고 trait 삭제(roadmap Step 5 SSOT).
+1. **비-happy 모드 거취 결정** (Architect/사용자): argus_cli 는 happy-path 전용(eviction/KIVI/offload/swap/profile/batch reject). legacy 폐기 전 이 모드들을 argus-chat/argus-eval/argus-bench family bin 으로 이주할지, 일부 drop 할지 결정. **이게 legacy 폐기의 실질 선결**(device-gate 매체는 Step 4 로 이미 이전).
+2. **B-2 OLD-chain 잔여 2 소비자 fmt 이주** (roadmap Step 5 §★): `forward_into_offload`(OffloadForward, chat/session.rs:547) + `run_chunked_prefill`(prefill.rs profiler/variance). 둘 다 OLD `forward_gen<C>`/`forward_prefill<C>` + `impl KVCacheOps for OffloadKVCache` 소비 → Option B(`forward_gen_fmt`+`OffloadKVCache: KVCacheFormat` interior-mut+preload aliasing 재설계, **device GPU 재검증 필수**).
+3. **`KVCacheOps` trait 삭제**: `grep -r KVCacheOps engine/` 0건 확인 후 trait + generic bound + use 삭제 → `KVCacheFormat` rename 동행(ADR-0001). **device-gate full = 진짜 최종 perf**(parallel path 제거 후 monomorphization 드러남).
+- **권장 역할**: Architect(비-happy 모드 거취 + KVCacheOps 잔존 census) → Senior Implementer(offload fmt 이주 — GPU/aliasing 민감) → Tester(device-gate 최종).
+- **★Step 3/4 회귀 시 처방**: (3p)만 revert(`execute_fmt`/`build_plan_fmt`/`execute_plan_fmt`/wiring + standard_format plan seam 제거), Step 1·2 cold cluster 유지. fix `ae9fc460`(plan seam cfg)+`26e77908`(map_weights cfg-free)는 빌드 복구라 유지.
 
 ---
 
