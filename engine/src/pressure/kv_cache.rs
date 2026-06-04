@@ -13,7 +13,13 @@ pub use crate::kv_cache_ops::{KVCacheOps, KVLayout, KiviRawBuffers};
 ///
 /// Implementors: `OffloadKVCache`.
 /// Used by `forward_into_offload` to overlap I/O with compute.
-pub trait PrefetchableCache: KVCacheOps {
+///
+/// **KVCacheOps 비의존 (Phase α-K BC Step 2, B-3 offload 분리)** — 구
+/// `PrefetchableCache: KVCacheOps` supertrait 를 제거해 prefetch 계약(preload/release/retain)을
+/// KV 저장 형태와 분리한다. cache geometry/mutation 이 필요한 offload forward 는 concrete
+/// `OffloadKVCache`(KVCacheOps 직접 impl)를 쓰므로 trait 표면에 KVCacheOps 를 끌어올 필요가 없다.
+/// 이로써 offload cluster 가 `KVCacheOps` 폐기((4)) 차단자에서 빠진다(SSOT §9.1 B-3).
+pub trait PrefetchableCache {
     /// Pre-load data from external storage into memory buffers.
     fn preload(&mut self) -> Result<()>;
 

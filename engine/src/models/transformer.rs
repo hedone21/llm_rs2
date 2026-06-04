@@ -18,6 +18,8 @@ use crate::pressure::offload::preload_pool::PreloadAccess;
 use crate::pressure::offload::preload_pool::PreloadResult;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O type-erased preload function
 use crate::pressure::offload::preload_pool::preload_erased;
+// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path concrete cache (forward_into_offload monomorphization, BC Step 2)
+use crate::pressure::offload::OffloadKVCache;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader uses pressure-owned ε helper (위계 정합 방향, design doc §7.4)
 use crate::pressure::weights::compute_quant_noise;
 use crate::shape::Shape;
@@ -3131,10 +3133,15 @@ impl TransformerModel {
     /// thread accesses any given `kv_caches[j]` at a time.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
-    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path trait bound + PrefetchController (offload 분리 backlog)
-    pub fn forward_into_offload<C: crate::pressure::kv_cache::PrefetchableCache>(
+    // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path concrete OffloadKVCache + PrefetchController (offload 분리 backlog)
+    // BC Step 2 (B-3 offload 분리): generic `<C: PrefetchableCache>` → concrete `OffloadKVCache`.
+    // `PrefetchableCache` 가 더는 `KVCacheOps` supertrait 를 갖지 않으므로 args struct
+    // (`TransformerModelForwardArgs<'_, C: KVCacheOps>`)·`layer.forward` 의 KVCacheOps 요구는
+    // 유일 구현체 `OffloadKVCache`(KVCacheOps 직접 impl)로 직접 충족한다. 호출처(OffloadForward/
+    // legacy)는 이미 `Vec<OffloadKVCache>` 를 넘기므로 무변.
+    pub fn forward_into_offload(
         &self,
-        args: TransformerModelForwardArgs<'_, C>,
+        args: TransformerModelForwardArgs<'_, OffloadKVCache>,
         prefetch: &mut crate::pressure::offload::prefetch::PrefetchController,
     ) -> Result<()> {
         let input_tokens = args.input_tokens;
@@ -3225,8 +3232,12 @@ impl TransformerModel {
         // Fire initial background preloads for layers [depth..2*depth)
         #[allow(clippy::needless_range_loop)]
         for j in depth..(2 * depth).min(num_layers) {
-            pending[j] =
-                Some(unsafe { pool.submit_raw(caches_ptr.add(j) as *mut (), preload_erased::<C>) });
+            pending[j] = Some(unsafe {
+                pool.submit_raw(
+                    caches_ptr.add(j) as *mut (),
+                    preload_erased::<OffloadKVCache>,
+                )
+            });
         }
 
         // 3. Layer loop
@@ -3253,7 +3264,10 @@ impl TransformerModel {
             let far_idx = i + depth;
             if far_idx < num_layers && pending[far_idx].is_none() {
                 pending[far_idx] = Some(unsafe {
-                    pool.submit_raw(caches_ptr.add(far_idx) as *mut (), preload_erased::<C>)
+                    pool.submit_raw(
+                        caches_ptr.add(far_idx) as *mut (),
+                        preload_erased::<OffloadKVCache>,
+                    )
                 });
             }
 
