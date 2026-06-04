@@ -2,7 +2,7 @@
 
 **작성**: 2026-06-04 (메인 세션)
 **HEAD**: `84bed97e feat(kv): Phase α-K BC ①-d — B-2 비-decode forward_into→forward_into_fmt flip (10 site)` (impl; 뒤이은 docs 커밋이 roadmap+본 handoff 동반)
-**브랜치**: `master` (origin push 미실행 — 사용자 요청 시)
+**브랜치**: `master` (**origin push 완료** 2026-06-04 — `origin/master` = `b3d8307d`, ①-d impl+docs 포함)
 **다음 세션 진입 문장**: **"BC ①-e 진행"**
 
 > roadmap = `roadmap_alpha_k_bc_completion_2026_06_04.md`(Step 1: ①-a/b/c/d ✅, ①-e 다음). 설계+적대검증 = `design_alpha_k_1d_cut_2026_06_04.md`(workflow `w12qx2ybg`). SSOT = `arch/pipeline_stage_design_v2.md` §9.1-BC1'. 트랙 = [[project-pipeline-alpha-k]].
