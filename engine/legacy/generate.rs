@@ -4647,7 +4647,8 @@ fn run_offload(
     command_executor: &mut Option<CommandExecutor>,
     cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
-    use llm_rs2::kv_cache_ops::KVCacheOps;
+    // (KVCacheOps import 제거 — 5-F defer-fix 에서 OffloadKVCache::memory_usage_bytes 가
+    //  inherent 로 승격되어 trait import 불요. legacy 는 F1 에서 폐기 예정.)
     use llm_rs2::pressure::offload::OffloadKVCache;
     use llm_rs2::pressure::offload::raw_store::RawStore;
 

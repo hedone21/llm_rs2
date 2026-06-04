@@ -283,8 +283,8 @@ impl OffloadKVCache {
     // ── KVCacheOps primitives moved to inherent (Phase α-K BC 5-E) ───────────
     // KVCacheOps trait 은 5-F 까지 생존하되, 본문은 inherent 로 이전하고 trait 메서드는
     // 이 inherent 를 위임 호출한다(byte-identical, 단일 본문). fmt 경로(OffloadFormat)가
-    // trait 경유 없이 직접 호출하도록 한다. set_current_pos/memory_usage_bytes 는 생존
-    // fmt 소비자가 호출하지 않아 inherent 미신설(trait 본문 유지).
+    // trait 경유 없이 직접 호출하도록 한다. set_current_pos 는 생존 fmt 소비자가 호출하지
+    // 않아 inherent 미신설(trait 본문 유지, 5-F 에서 trait 와 함께 소멸).
 
     /// Number of valid tokens currently in the cache.
     pub fn current_pos(&self) -> usize {
@@ -316,8 +316,11 @@ impl OffloadKVCache {
         self.dtype
     }
 
-    // (memory_usage_bytes 는 fmt 소비자 미호출 — offload 자체 test + legacy 만 사용하므로
-    //  set_current_pos 등 다른 trait-only 메서드와 함께 5-F 로 defer. trait 본문 유지.)
+    /// Total bytes held by the offload store. (5-F: trait-only 였던 메서드를 inherent 로
+    /// 승격 — offload test 가 KVCacheOps import 없이 직접 호출하도록 하여 trait 삭제 대비.)
+    pub fn memory_usage_bytes(&self) -> usize {
+        self.store.storage_size()
+    }
 
     /// Append new K/V data. Input shape: `[batch, seq_len, kv_heads, head_dim]`.
     pub fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
@@ -562,7 +565,7 @@ impl KVCacheOps for OffloadKVCache {
     }
 
     fn memory_usage_bytes(&self) -> usize {
-        self.store.storage_size()
+        self.memory_usage_bytes()
     }
 
     fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
@@ -596,8 +599,7 @@ impl crate::pressure::kv_cache::PrefetchableCache for OffloadKVCache {
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 mod tests {
     use super::*;
-    // memory_usage_bytes(OffloadKVCache trait-only, 5-F defer) 호출용 — compare_views 단형화 후 유일 잔여.
-    use crate::kv_cache_ops::KVCacheOps;
+    // (memory_usage_bytes 는 5-F defer-fix 로 inherent 승격 — KVCacheOps trait import 불요.)
 
     fn make_test_tensor(
         seq_len: usize,
