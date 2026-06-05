@@ -8,8 +8,9 @@
 > ## ▶ 재개 진입점 (compact 후 여기서 시작)
 > **설계 전부 확정·커밋됨**(M0 8c23a72a / M1 136f7cdd / 설계 5f81bace). 분기 F1~F6 + 네이밍 닫힘 (아래 "M2-B 설계 분기").
 > **M2-B① ✅ 완료**(`caeca4f2`): technique-api 가 ADR-0004 표면(KVCacheStage/StageCtx 9-accessor/KVCachePlan/KeepSpec/WeightedMerge/StageParams/find_stage)으로 재구성됨. 표면은 workflow `wf_21533739` 가 6기법 all_expressible·dyn-safe 적대 검증 완료.
-> **다음 = M2-B②**(엔진 배선): 아래 "## M2(B) 구현 plan" 2번. StageCtx 를 `&KVCache` 위로 impl + KVCachePlan executor + 빌트인 4정책 KVCacheStage 이전 + `KV_CACHE_STAGES` 레지스트리로 match-site 제거(아래 "## 검증된 표면·스윕 intel" 의 site 목록 참조) + startup self-test. 게이트 = `cargo test -p llm_rs2 --lib -- --skip backend::opencl --skip memory::opencl` (≥1220 passed, 0 failed) + build + fmt(내 파일) + clippy(--workspace, --all-targets 금지). 단계 ② 완료 시 release smoke. compact_parity·d2o 동등성 미확립 시 STOP+보고.
-> 재개 명령 예: `/loop`(동일 프롬프트) 또는 "M2-B② 진행".
+> **M2-B② ⏸ STOP — 사용자 결정 대기**(iter-5, workflow `wf_108af60f`): 엔진 배선이 프로덕션 decode 를 **World A(in-place evict)→World B(plan→compact)** 로 전환함이 드러남(현재 plan_keep unwired). ledger "4 정책"은 실제 **3개**(sliding/streaming/h2o; h2o_plus=F5 미완으로 ⑤ deferred, d2o=M4, none=match 밖). **결정 2건**: (1)World A→B 전환을 지금 할지(역어댑터 StageBackedPolicy) vs 보류, (2)name-key(sliding vs sliding_window). 상세 = iter-5 로그.
+> **결정 후 재개**: ②a(등록+self-test, 프로덕션 무변경) → ②b(match arm 3개 교체, World B, compact_parity 게이트). 게이트 = `cargo test -p llm_rs2 --lib -- --skip backend::opencl --skip memory::opencl` (≥1220 passed, 0 failed) + build + fmt(내 파일) + clippy(--workspace, --all-targets 금지) + 단계 ② 완료 시 release smoke.
+> 재개 명령 예: 결정 답변 후 "M2-B② 진행".
 
 ---
 
@@ -54,6 +55,13 @@ M1·M2·M3·M5 커밋 + 전체 `/sanity-check` green + release self-test 통과 
 - **iter-2 (M1, 2026-06-05)**: 사용자 체크인("중간된거야?")으로 M0↔M1 경계 일시정지 후 재개. **설계 발견**: `plan_keep`(planning 표면)이 이미 코드에 스캐폴딩(Sliding/H2O/Streaming/NoEviction 구현, unwired). 단 **H2O+(per-head)는 `None` 반환, D2O는 EvictionPolicy 아님** → ADR-0003 §D2 "h2o+/d2o 덮음"은 낙관적. M1 = technique-api crate(planning trait `EvictionPlan`, 엔진 의존 0). 게이트: technique-api 2/2, clippy workspace clean, 엔진 1220/0 무회귀. `cargo fmt --all`이 무관한 htp_fastrpc.rs(기존 fmt drift) 122줄 건드려 revert(외과적 변경). 커밋 136f7cdd. → 다음 iter: M2.
 - **iter-3 (M2, 2026-06-05)**: M2 조사 — `compact_parity.rs`가 이미 baseline(1220) 안에서 통과 중, plan_keep→compact 경로가 4개 정책 × 3 dtype 에서 bit-identical 증명됨(어댑터 경로 안전). **STOP**: h2o_plus/d2o 가 planning 레지스트리에 안 들어가 registry scope 가 ADR 미명세 → 사용자 결정 대기(M2 fork). 코드 변경 없음(조사만). 원장만 갱신.
 - **iter-4 (M2-B①, 2026-06-05)**: 사용자 (B) 선택 → 재설계(ADR-0004) 확정 후 `/loop` 재개. **코드 쓰기 전 적대 검증**: workflow `wf_21533739`(8 agent, 680K tok)로 6기법(sliding/streaming/h2o/no_eviction/h2o_plus/d2o)이 `KVCacheStage::plan` 단일 표면으로 표현 가능한지 + 각자 StageCtx 에서 뭘 읽는지 기법별 병렬 검증 → **all_expressible=true, dyn_safety_ok=true**. 9-accessor StageCtx 합집합 도출. `crates/technique-api/src/lib.rs` 를 ADR-0004 표면으로 재작성(EvictionPlan→KVCacheStage 등). StageParams d2o 필드는 M4 연기(open question). 게이트: technique-api 2/2, clippy workspace clean, 엔진 회귀 1220/0. 커밋 `caeca4f2`. → 다음 iter: M2-B②(엔진 배선).
+- **iter-5 (M2-B②, 2026-06-05) — ⏸ STOP, 사용자 결정 대기**: 엔진 배선 **코드 쓰기 전 적대 검증** workflow `wf_108af60f`(4 agent, 338K tok) — 프로덕션 호출그래프 매핑 + 역어댑터 가설 검증. 발견:
+  - **프로덕션 eviction = in-place `evict*`** (EvictionHandler→run_policy_eviction→per-cache policy.evict*). `plan_keep`/compact 는 **unwired**(compact_parity 테스트만). → KVCacheStage 배선 = **3정책 프로덕션 decode 를 World A(in-place)→World B(plan→compact) 전환**.
+  - **`should_evict` 는 프로덕션 dead**(테스트 전용). 트리거는 run_policy_eviction 의 target_len/MIN_EVICT(64) 가드 + 메모리 압력.
+  - **ledger "4 정책" 은 실제 3개**: `plan_keep` 구현 = sliding/streaming/h2o/no_eviction 4개지만 no_eviction("none")은 match 밖(happy-path early-return). 따라서 session.rs:620-650 match 에서 **sliding/streaming/h2o 3 arm 만 제거 가능**. **h2o_plus 잔류**(plan_keep→None, per-head; head_score source=F5 미완이라 degenerate 회귀 위험 → ⑤로 deferred). d2o if-선분기 잔류(M4). bail 잔류.
+  - 역어댑터(StageBackedPolicy) verdict = **validated_with_changes**. risks: merge-uniform(Q4=M4), dead-code, name-key.
+  - **stop_flag 2개**: (1) ADR-0004 §2/§4 가 "엔진이 plan→compact 실행"은 mandate 하나 **역어댑터로 프로덕션 World A→B 전환을 지금 할지**는 미명세(decode 경로 첫 pivot). (2) **name-key**: CLI "sliding" vs `policy.name()` "sliding_window" 불일치(reg key 결정 + name() 출력 보존 여부).
+  - 코드 변경 0(검증만). 사용자 결정 후 ②a(등록+self-test, 무변경)→②b(match arm 교체) 재개.
 
 ## M2-B 재설계 — ground truth (workflow wf_a9f025a7, 4축 surface)
 
