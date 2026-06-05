@@ -668,6 +668,77 @@ impl HtpFastrpcBackend {
         // in-place: dst==src0==x_rpc. pos_buf 는 guard 가 살아있는 동안 valid.
         self.rope_via_htp(x_rpc, pos_buf, x_rpc, params, head_dim, n_heads, n_tokens)
     }
+
+    /// decode flash attention (HTP_OP_FLASH_ATTN_EXT). q=F32, k/v=F16(strict, KV
+    /// cache HeadMajor), out=F32. n_bufs=4 (Q/K/V/dst), mask/sinks 미사용.
+    /// op_params=[scale=1/√head_dim, max_bias=0, logit_softcap=0]. microbench
+    /// `htp_flash_attn_ext.rs` packet mirror — 단 K/V 는 **HeadMajor capacity stride**
+    /// (nb[2]=head_dim*capacity*2, ne[1]=cache_seq_len) 로 실제 KV cache 를 가리킨다.
+    /// dst [head_dim, 1, n_heads_q] = CPU attention_gen 의 out[h*head_dim+d] 와 동일.
+    /// GQA(n_heads_q≠n_kv)는 DSP-side 가 처리. score 미반환이라 caller 가 scores
+    /// None 일 때만 진입(eviction off).
+    #[cfg(target_os = "android")]
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attn_via_htp(
+        &self,
+        q_rpc: &RpcmemBuffer,
+        k_rpc: &RpcmemBuffer,
+        v_rpc: &RpcmemBuffer,
+        out_rpc: &RpcmemBuffer,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        capacity: usize,
+    ) -> Result<()> {
+        let hd = head_dim as u32;
+        let csl = cache_seq_len as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // gqa_ratio = kv-head 당 q-head 수. v79 flash_attn 은 **항상 kv_h=0 만 사용**
+        // (GQA 미iterate, device 실측: nhkv=2 시 q-head 6~11=kv_h1 group 전부 garbage).
+        // 우회: kv-head 를 1개씩 떼어 그 그룹의 gqa q-head 만 dispatch → DSP 가 보는
+        // kv-head 는 1개(=올바른 그룹)뿐이라 kv_h=0 이 항상 정답. HeadMajor 에서
+        // single head 의 valid 위치는 contiguous(offset g*capacity*head_dim) 라 gather 불요.
+        let gqa = num_heads_q / num_heads_kv;
+        let g32 = gqa as u32;
+        for g in 0..num_heads_kv {
+            // Q F32: group g 의 q-head [g*gqa .. (g+1)*gqa]. ne=[head_dim, gqa, 1, 1].
+            let ne_q = [hd, g32, 1, 1];
+            let nb_q = [4u32, hd * 4, hd * g32 * 4, hd * g32 * 4];
+            // K/V F16: 단일 kv-head g, valid csl 위치(HeadMajor 내 contiguous).
+            let ne_k = [hd, csl, 1, 1];
+            let nb_k = [2u32, hd * 2, hd * csl * 2, hd * csl * 2];
+            // dst F32: group g 의 out-head. ne=[head_dim, 1, gqa, 1] → out[h*head_dim+d].
+            let ne_d = [hd, 1, g32, 1];
+            let nb_d = [4u32, hd * 4, hd * 4, hd * g32 * 4];
+
+            let mut req = HtpGeneralReq::zeroed();
+            req.op = HTP_OP_FLASH_ATTN_EXT;
+            req.flags = 0;
+            req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+            req.op_params[0] = scale.to_bits() as i32;
+            req.src0 = htp_tensor_from_shape(HTP_TYPE_F32, ne_q, nb_q);
+            req.src1 = htp_tensor_from_shape(HTP_TYPE_F16, ne_k, nb_k);
+            req.src2 = htp_tensor_from_shape(HTP_TYPE_F16, ne_k, nb_k);
+            req.dst = htp_tensor_from_shape(HTP_TYPE_F32, ne_d, nb_d);
+
+            let q_off = (g * gqa * head_dim * 4) as u32; // F32 q-head group
+            let q_sz = (gqa * head_dim * 4) as u32;
+            let k_off = (g * capacity * head_dim * 2) as u32; // F16 HeadMajor head g
+            let k_sz = (cache_seq_len * head_dim * 2) as u32; // valid csl 위치만
+            let d_off = (g * gqa * head_dim * 4) as u32; // F32 out-head group
+            let d_sz = (gqa * head_dim * 4) as u32;
+            let mut bufs: [DspQueueBuffer; 4] = [
+                q_rpc.dsp_buf(DspqBufferType::CpuWriteDspRead, q_off, q_sz)?,
+                k_rpc.dsp_buf(DspqBufferType::CpuWriteDspRead, k_off, k_sz)?,
+                v_rpc.dsp_buf(DspqBufferType::CpuWriteDspRead, k_off, k_sz)?,
+                out_rpc.dsp_buf(DspqBufferType::DspWriteCpuRead, d_off, d_sz)?,
+            ];
+            self.enqueue_packet(&req, &mut bufs)?;
+            self.drain_pending()?;
+        }
+        Ok(())
+    }
 }
 
 /// HTP NPU dispatch 가능 여부 (dtype/shape gating). buffer backing 확인은 별도.
@@ -1080,6 +1151,72 @@ impl Backend for HtpFastrpcBackend {
         self.cpu_companion.softmax(x)
     }
 
+    /// decode attention. env `LLMRS_HTP_NPU_ATTN=1` + scores 미요청(eviction off) +
+    /// q F32 / k,v F16(HeadMajor) / out F32 + 전부 rpcmem 면 NPU flash_attn,
+    /// 그 외 cpu_companion (회귀 0). DSP flash_attn 은 score 를 반환하지 않으므로
+    /// scores_out=Some(H2O/D2O) 면 NPU 불가 → CPU. **v79 flash_attn 의 수치 정확성은
+    /// microbench 에서 status 만 검증됨 — token-id 로 device 검증 필요(리스크).**
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
+    ) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            let ks = k_cache.shape().dims();
+            // HeadMajor 판정 = CPU attention_gen 과 동일 (ks[1]==n_kv && ks[1]!=ks[2]).
+            let is_head_major =
+                ks.len() >= 3 && ks[1] == num_heads_kv && ks[1] != ks[2];
+            if std::env::var_os("LLMRS_HTP_NPU_ATTN").is_some()
+                && scores_out.is_none()
+                && is_head_major
+                && q.dtype() == DType::F32
+                && k_cache.dtype() == DType::F16
+                && v_cache.dtype() == DType::F16
+                && out.dtype() == DType::F32
+                && let (Some(q_rpc), Some(k_rpc), Some(v_rpc), Some(out_rpc)) = (
+                    q.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    k_cache.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    v_cache.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    out.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                )
+            {
+                let capacity = ks[2];
+                htp_dispatch_log_once(true, "flash_attn (per-kv-head)");
+                return self.flash_attn_via_htp(
+                    q_rpc,
+                    k_rpc,
+                    v_rpc,
+                    out_rpc,
+                    num_heads_q,
+                    num_heads_kv,
+                    head_dim,
+                    cache_seq_len,
+                    capacity,
+                );
+            }
+        }
+        self.cpu_companion.attention_gen(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            cache_seq_len,
+            scores_out,
+        )
+    }
+
     /// In-place RoPE. env `LLMRS_HTP_NPU_ROPE=1` + x RpcmemBuffer-backed 면 NPU
     /// ROPE op (in-place), 그 외 cpu_companion (회귀 0).
     ///
@@ -1101,10 +1238,11 @@ impl Backend for HtpFastrpcBackend {
                     let n_tokens = dims[dims.len() - 3];
                     if let Some(x_rpc) = x.buffer().as_any().downcast_ref::<RpcmemBuffer>() {
                         // positions [start_pos .. start_pos+n_tokens) i32 → lazily-alloc
-                        // scratch 에 기록. NeoX freq_base=theta, mode=2.
+                        // scratch 에 기록. NeoX freq_base=theta, mode=2 (CPU 레퍼런스 일치).
+                        // device 실측 max_err 1e-5 (F32 rounding) — bit-exact 에 가까움.
                         let params = RopeParams {
                             n_dims: head_dim as i32,
-                            mode: 2, // NeoX split (CPU 레퍼런스 일치)
+                            mode: 2,
                             n_ctx_orig: 0,
                             freq_base: theta,
                             freq_scale: 1.0,
