@@ -304,6 +304,23 @@ mod tests {
         }
     }
 
+    // ADR-0003 cross-crate linkme 실증 결과(M3): **dev-dep 선언만으로는 부족**하다. Rust 는 미참조
+    // 의존 rlib 을 링크에서 제외하므로 `#[distributed_slice]` 등록이 누락된다(실측 — forcing 없으면
+    // find_stage None). 따라서 technique crate 의 등록을 활성화하려면 의존 1줄에 더해 **force-link
+    // 참조 1줄**(`use <crate> as _;`)이 designated 지점에 필요하다. 즉 확장 비용 = dep 1줄 + force-link
+    // 1줄(둘 다 기계적, 기존 로직 수정 0 → OCP 유지). 상세: ADR-0003 §4 (M3 정정).
+    use example_keep_recent as _;
+
+    #[test]
+    fn example_technique_crate_visible_to_engine() {
+        // force-link(위 `use ... as _`) 가 걸린 상태에서 별도 technique crate 의 등록이 엔진 뷰의
+        // KV_CACHE_STAGES 에 나타나는가 — "폴더 추가 + dep 1줄 + force-link 1줄 = 기법 추가" 검증.
+        assert!(
+            find_stage("example_keep_recent").is_some(),
+            "force-link 후 예제 technique crate 등록이 엔진에서 보여야 한다"
+        );
+    }
+
     #[test]
     fn adapter_plan_matches_plan_keep_sliding() {
         // 어댑터 plan() 의 LayerWide keep 이 원본 plan_keep keep 과 동일한지 (faithful, score-free).

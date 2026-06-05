@@ -1,5 +1,14 @@
 [workspace]
-members = ["engine", "shared", "manager", "crates/qnn_oppkg", "crates/technique-api"]
+# `crates/techniques/*` glob: stage 축 확장 기법은 폴더만 추가하면 workspace 멤버로 자동 편입된다
+# (ADR-0003 — Zero-compile plugin 확장). 바이너리에 링크하려면 의존 1줄 추가가 필요(ADR D4).
+members = [
+    "engine",
+    "shared",
+    "manager",
+    "crates/qnn_oppkg",
+    "crates/technique-api",
+    "crates/techniques/*",
+]
 resolver = "3"
 
 [profile.release]

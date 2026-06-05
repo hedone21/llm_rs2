@@ -79,6 +79,9 @@ libloading = "0.8"
 [dev-dependencies]
 # compile-fail / compile-pass tests for session typestate (INV-LAYER-007).
 trybuild = "1.0"
+# ADR-0003 검증: 별도 technique crate 가 dep 추가만으로 KV_CACHE_STAGES 에 등록되는지
+# (cross-crate linkme). 프로덕션 미링크(dev-only) — stage_registry 테스트가 find_stage 로 확인.
+example-keep-recent = { path = "../crates/techniques/example-keep-recent" }
 
 [build-dependencies]
 bindgen = { version = "0.71", optional = true }

@@ -1,0 +1,10 @@
+[package]
+name = "example-keep-recent"
+version = "0.1.0"
+edition = "2024"
+
+# 예제 technique crate (ADR-0003) — stage 축 확장 기법은 `technique-api` 에만 의존한다.
+# 엔진(llm_rs2) / 다른 축(format/hardware) crate 에 의존하지 않음 = 가산 확장 비용의 증거.
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"
