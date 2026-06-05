@@ -8,9 +8,10 @@
 > ## ▶ 재개 진입점 (compact 후 여기서 시작)
 > **설계 전부 확정·커밋됨**(M0 8c23a72a / M1 136f7cdd / 설계 5f81bace). 분기 F1~F6 + 네이밍 닫힘 (아래 "M2-B 설계 분기").
 > **M2-B① ✅ 완료**(`caeca4f2`): technique-api 가 ADR-0004 표면(KVCacheStage/StageCtx 9-accessor/KVCachePlan/KeepSpec/WeightedMerge/StageParams/find_stage)으로 재구성됨. 표면은 workflow `wf_21533739` 가 6기법 all_expressible·dyn-safe 적대 검증 완료.
-> **M2-B② ⏸ STOP — 사용자 결정 대기**(iter-5, workflow `wf_108af60f`): 엔진 배선이 프로덕션 decode 를 **World A(in-place evict)→World B(plan→compact)** 로 전환함이 드러남(현재 plan_keep unwired). ledger "4 정책"은 실제 **3개**(sliding/streaming/h2o; h2o_plus=F5 미완으로 ⑤ deferred, d2o=M4, none=match 밖). **결정 2건**: (1)World A→B 전환을 지금 할지(역어댑터 StageBackedPolicy) vs 보류, (2)name-key(sliding vs sliding_window). 상세 = iter-5 로그.
-> **결정 후 재개**: ②a(등록+self-test, 프로덕션 무변경) → ②b(match arm 3개 교체, World B, compact_parity 게이트). 게이트 = `cargo test -p llm_rs2 --lib -- --skip backend::opencl --skip memory::opencl` (≥1220 passed, 0 failed) + build + fmt(내 파일) + clippy(--workspace, --all-targets 금지) + 단계 ② 완료 시 release smoke.
-> 재개 명령 예: 결정 답변 후 "M2-B② 진행".
+> **사용자 결정**(iter-5): (1) **지금 World A→B 전환(역어댑터)** — ②a→②b. (2) **name-key = 전부 CLI 이름으로 통일**(`policy.name()` 출력도 CLI 이름; 주로 `"sliding_window"→"sliding"`, 의존 테스트 4곳 갱신).
+> **M2-B②a ✅ 완료**(`2676acd2`): 엔진→technique-api(+linkme) 의존 + `EvictionPolicyAsStage` 어댑터 + 3 빌트인(sliding/streaming/h2o) `KV_CACHE_STAGES` 등록. **등록만(unwired)**, 프로덕션 무변경. test 1223/0.
+> **다음 = M2-B②b**: name 통일(`SlidingWindowPolicy::name()` "sliding_window"→"sliding" + 의존 테스트 `sliding_window.rs:247`·`cache_manager.rs:762,1163`·`eviction_handler.rs:267` 갱신) + `KVCachePlan` executor(LayerWide+merges→apply_merges(가중)+compact_keep_positions; PerHead→_for_head; PerHead+merges→bail) + `StageBackedPolicy{stage}` impl EvictionPolicy(plan→executor 실행, World B) + session.rs:620-650·build_bench_loop.rs:88-117 의 **sliding/streaming/h2o 3 arm 만** `find_stage`→make→StageBackedPolicy fallback 으로 교체(h2o_plus arm·d2o if·bail 잔류; bail 메시지·streaming window 유도·protected_prefix 기본값 match 는 caller 잔류) + startup self-test(release fail-fast). 게이트 = `cargo test -p llm_rs2 --lib -- --skip backend::opencl --skip memory::opencl` (≥1223 passed, 0 failed) + build + fmt(내 파일) + clippy(--workspace, --all-targets 금지) + compact_parity + ② 완료 시 release smoke. **무회귀 invariant**: 버퍼 bit-identical(compact_parity transitively)·target_len 의미·NoOp 가드(run_policy_eviction 선처리)·undershoot·score dispatch·name() 보존(CLI 이름으로 일관).
+> 재개 명령 예: "M2-B②b 진행".
 
 ---
 
@@ -62,6 +63,7 @@ M1·M2·M3·M5 커밋 + 전체 `/sanity-check` green + release self-test 통과 
   - 역어댑터(StageBackedPolicy) verdict = **validated_with_changes**. risks: merge-uniform(Q4=M4), dead-code, name-key.
   - **stop_flag 2개**: (1) ADR-0004 §2/§4 가 "엔진이 plan→compact 실행"은 mandate 하나 **역어댑터로 프로덕션 World A→B 전환을 지금 할지**는 미명세(decode 경로 첫 pivot). (2) **name-key**: CLI "sliding" vs `policy.name()` "sliding_window" 불일치(reg key 결정 + name() 출력 보존 여부).
   - 코드 변경 0(검증만). 사용자 결정 후 ②a(등록+self-test, 무변경)→②b(match arm 교체) 재개.
+- **iter-6 (M2-B②a, 2026-06-05)**: 사용자 결정 — (1)지금 World A→B 전환(역어댑터), (2)name-key 전부 CLI 통일. ②a 구현(순수 additive): engine→technique-api(+linkme 0.3) dep + `eviction/stage_registry.rs` 신설(`EvictionPolicyAsStage` 어댑터 = plan_keep→KVCachePlan 위임 + uniform Merge→WeightedMerge) + 3 빌트인(sliding/streaming/h2o) `#[distributed_slice(KV_CACHE_STAGES)]` 등록(reg key=CLI 이름). **등록만, unwired** — 프로덕션 여전히 in-place evict. 게이트: build OK, test 1223/0(신규 3: 등록·어댑터 faithful×2), clippy workspace clean, fmt 내 파일만. 커밋 `2676acd2`. → 다음 iter: M2-B②b(name 통일 + executor + StageBackedPolicy + match arm 3 교체 + self-test).
 
 ## M2-B 재설계 — ground truth (workflow wf_a9f025a7, 4축 surface)
 
