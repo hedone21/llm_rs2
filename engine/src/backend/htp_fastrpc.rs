@@ -74,6 +74,16 @@ pub struct HtpFastrpcBackend {
     /// 현재 layer index (Phase 4 placeholder, β 단계에서 graph dispatch 시 활용).
     #[allow(dead_code)]
     layer_idx: AtomicUsize,
+
+    /// dspqueue 에 enqueue 됐으나 아직 drain(read) 하지 않은 in-flight DSP matmul
+    /// op 수. async batch fusion 의 핵심: `enqueue_matmul_via_htp` 가 +1,
+    /// `drain_pending` 가 0 까지 read 하여, 여러 op 를 묶어 한 번에 drain 함으로써
+    /// ~100µs FastRPC dispatch floor 를 op 마다→batch 당 1회로 amortize 한다.
+    /// forward pass 는 토큰당 단일 스레드 순차 실행이라 본 카운터는 매 matmul
+    /// 경계에서 0 으로 복귀한다 (단일-op 경로) — batch 경로(FFN gate/up)만 일시 >1.
+    /// host(non-android) 빌드에서는 android-only 메서드에서만 read 되므로 dead.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    op_pending: AtomicUsize,
 }
 
 /// `htp_iface_start` 의 n_hvx default. llama.cpp `ggml-hexagon.cpp::opt_nhvx`
@@ -115,6 +125,7 @@ impl HtpFastrpcBackend {
             host,
             cpu_companion,
             layer_idx: AtomicUsize::new(0),
+            op_pending: AtomicUsize::new(0),
         })
     }
 
@@ -207,22 +218,24 @@ impl HtpFastrpcBackend {
         Ok(())
     }
 
-    /// S4/Y — Q4_0 weight × F32 activation matmul NPU dispatch (M≥1).
+    /// S4/Y — Q4_0/F16 weight × F32 activation matmul 을 dspqueue 에 **enqueue
+    /// (write only)** 한다. drain(read) 은 [`drain_pending`] 가 담당 — 여러 op 를
+    /// enqueue 후 한 번에 drain 하여 ~100µs FastRPC dispatch floor 를 amortize 하는
+    /// async batch fusion 의 write half. **호출처는 반드시 후속 `drain_pending`
+    /// (또는 enqueue+drain 을 묶은 `matmul_transposed_via_htp` / `flush` /
+    /// `synchronize`)으로 in-flight op 를 회수해야 한다** — drain 없이 다음 토큰으로
+    /// 넘어가면 출력 buffer 가 미완성(garbage)이다.
     ///
-    /// caller (`matmul_transposed`) 가 (a) `htp_matmul_dispatchable` 게이트
-    /// 통과, (b) a/b/out 전부 RpcmemBuffer-backed 확인 후 진입. weight `b` 는
-    /// `copy_weight_from` 에서 이미 q4x4x2 layout 으로 repack 되어 있다고 가정.
+    /// caller 가 (a) dispatch 게이트(`htp_matmul_dispatchable[_f16]`) 통과, (b)
+    /// a/b/out 전부 RpcmemBuffer-backed 확인 후 진입. weight `b` 는 Q4_0 이면
+    /// `copy_weight_from` 에서 q4x4x2 repack 됨, F16 이면 row-major bytes.
     ///
     /// `m` = activation row 수 (decode GEMV=1, prefill GEMM=seq_len). M==1 이면
     /// microbench `run_htp` 의 GEMV dispatch 와 byte-identical 로 환원된다. M>1
-    /// 은 ne1=M, plane stride=M*row 로 일반화 (llama.cpp HTP 의 general matmul
-    /// 과 동일). Q4_0 matmul 을 prefill·decode 모두 NPU 로 보내 CPU fallback 의
-    /// q4x4x2↔standard 레이아웃 비호환(garbage)을 구조적으로 제거한다.
-    ///
-    /// timing/prof 진단 없이 정확성 path 만 (n_bufs=3 dspqueue_write →
-    /// dspqueue_read → status 확인).
+    /// 은 ne1=M, plane stride=M*row 로 일반화. Q4_0 matmul 을 prefill·decode 모두
+    /// NPU 로 보내 CPU fallback 의 q4x4x2↔standard 비호환(garbage)을 구조적 제거.
     #[cfg(target_os = "android")]
-    fn matmul_transposed_via_htp(
+    fn enqueue_matmul_via_htp(
         &self,
         a_rpc: &RpcmemBuffer,
         b_rpc: &RpcmemBuffer,
@@ -277,8 +290,12 @@ impl HtpFastrpcBackend {
             out_rpc.dsp_buf(DspqBufferType::DspWriteCpuRead, 0, bytes_y)?,
         ];
 
-        // dspqueue_write (host → DSP).
-        // SAFETY: queue valid (host 보유 + drop 시 close), bufs/req live.
+        // dspqueue_write (host → DSP). enqueue only — DSP 가 비동기 처리, 응답은
+        // drain_pending 의 dspqueue_read 가 FIFO 순서로 회수.
+        // SAFETY: queue valid (host 보유 + drop 시 close), bufs/req live (이 함수
+        // 반환 시점에 dspqueue_write 가 packet 을 FIFO 로 복사 완료 — bufs/req
+        // stack-local drop OK. 단 a/b/out_rpc rpcmem 데이터는 drain 까지 alive 필요,
+        // 이는 호출처(workspace/weight Tensor) 소유권이 보장).
         let rc = unsafe {
             (self.host.dspqueue_write)(
                 self.host.queue,
@@ -293,36 +310,74 @@ impl HtpFastrpcBackend {
         if rc != AEE_SUCCESS {
             return Err(map_aee_err(rc).context("dspqueue_write"));
         }
-
-        // dspqueue_read (DSP → host, blocking).
-        let mut rsp = HtpGeneralRsp::zeroed();
-        let mut rsp_buf_count: u32 = 0;
-        let mut rsp_bufs: [DspQueueBuffer; 4] = [DspQueueBuffer::zeroed(); 4];
-        let mut rsp_msg_len: u32 = 0;
-        let mut rsp_flags: u32 = 0;
-        // SAFETY: 같은 queue, out-pointer 들 유효.
-        let rc = unsafe {
-            (self.host.dspqueue_read)(
-                self.host.queue,
-                &mut rsp_flags as *mut u32,
-                4, // max_buffers
-                &mut rsp_buf_count as *mut u32,
-                rsp_bufs.as_mut_ptr(),
-                core::mem::size_of::<HtpGeneralRsp>() as u32,
-                &mut rsp_msg_len as *mut u32,
-                &mut rsp as *mut _ as *mut u8,
-                DSPQUEUE_TIMEOUT,
-            )
-        };
-        if rc != AEE_SUCCESS {
-            return Err(map_aee_err(rc).context("dspqueue_read"));
-        }
-        // HTP_STATUS_OK = 1 (llama.cpp htp-msg.h:24). 0 은 uninitialized.
-        if rsp.status != HTP_STATUS_OK {
-            return Err(map_htp_status(rsp.status).context("DSP matmul status"));
-        }
-        let _ = (rsp_buf_count, rsp_msg_len, rsp_flags);
+        // in-flight op +1 — drain_pending 가 동수 dspqueue_read 로 회수.
+        self.op_pending.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// dspqueue 에 enqueue 된 in-flight matmul op 들을 전부 drain (blocking read).
+    /// `op_pending` 이 0 이 될 때까지 `dspqueue_read` 를 반복 — DSP 가 FIFO 순서로
+    /// 응답을 발행하므로 write i 응답이 read i 에 대응한다 (PoC `htp_batch_dispatch`
+    /// 에서 device 검증, max_abs_err 보존). 각 응답의 `status` 를 확인.
+    ///
+    /// async batch fusion 의 flush 지점: `enqueue_matmul_via_htp` ×N → `drain_pending`
+    /// ×1 로 dispatch floor 를 op 마다→batch 당 1회로 amortize. read 실패 시 카운터를
+    /// 0 으로 리셋(stale op poisoning 방지)한 뒤 error 전파.
+    #[cfg(target_os = "android")]
+    fn drain_pending(&self) -> Result<()> {
+        while self.op_pending.load(Ordering::Acquire) > 0 {
+            // dspqueue_read (DSP → host, blocking) — 한 op 응답 회수.
+            let mut rsp = HtpGeneralRsp::zeroed();
+            let mut rsp_buf_count: u32 = 0;
+            let mut rsp_bufs: [DspQueueBuffer; 4] = [DspQueueBuffer::zeroed(); 4];
+            let mut rsp_msg_len: u32 = 0;
+            let mut rsp_flags: u32 = 0;
+            // SAFETY: 같은 queue, out-pointer 들 유효.
+            let rc = unsafe {
+                (self.host.dspqueue_read)(
+                    self.host.queue,
+                    &mut rsp_flags as *mut u32,
+                    4, // max_buffers
+                    &mut rsp_buf_count as *mut u32,
+                    rsp_bufs.as_mut_ptr(),
+                    core::mem::size_of::<HtpGeneralRsp>() as u32,
+                    &mut rsp_msg_len as *mut u32,
+                    &mut rsp as *mut _ as *mut u8,
+                    DSPQUEUE_TIMEOUT,
+                )
+            };
+            if rc != AEE_SUCCESS {
+                self.op_pending.store(0, Ordering::Release);
+                return Err(map_aee_err(rc).context("dspqueue_read (drain)"));
+            }
+            // HTP_STATUS_OK = 1 (llama.cpp htp-msg.h:24). 0 은 uninitialized.
+            if rsp.status != HTP_STATUS_OK {
+                self.op_pending.store(0, Ordering::Release);
+                return Err(map_htp_status(rsp.status).context("DSP matmul status (drain)"));
+            }
+            let _ = (rsp_buf_count, rsp_msg_len, rsp_flags);
+            self.op_pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    /// 단일-op matmul (enqueue + 즉시 drain). 기존 동기 dspqueue_write→read 쌍과
+    /// **byte-identical** — `matmul_transposed` 의 비-batch 호출처가 사용. batch
+    /// 경로(FFN gate/up)는 `enqueue_matmul_via_htp` 를 직접 ×N 호출 후 묶어서
+    /// `drain_pending` 한다.
+    #[cfg(target_os = "android")]
+    fn matmul_transposed_via_htp(
+        &self,
+        a_rpc: &RpcmemBuffer,
+        b_rpc: &RpcmemBuffer,
+        out_rpc: &RpcmemBuffer,
+        n: usize,
+        k: usize,
+        m: usize,
+        weight_dtype: DType,
+    ) -> Result<()> {
+        self.enqueue_matmul_via_htp(a_rpc, b_rpc, out_rpc, n, k, m, weight_dtype)?;
+        self.drain_pending()
     }
 }
 
@@ -394,6 +449,44 @@ fn htp_matmul_dispatchable_f16(
         return None;
     }
     Some((n, k, m))
+}
+
+/// `a @ bᵀ → out` matmul 의 NPU dispatch plan. weight `b`/act `a`/out 이 전부
+/// RpcmemBuffer-backed 이고 dtype/shape 게이트(`htp_matmul_dispatchable[_f16]`)를
+/// 통과하면 `Some((a_rpc, b_rpc, out_rpc, n, k, m, weight_dtype))`. 하나라도
+/// 미충족이면 `None` — 호출처(FFN batch override)는 None 시 개별 `matmul_transposed`
+/// 로 fallback 하며, 그쪽이 Q4_0 q4x4x2 의 cpu garbage bail / F16 safe-cpu 불변을
+/// 보존한다. `matmul_transposed` 의 dtype 분기와 동일 게이트를 재사용해 batch 경로의
+/// 판정이 단일-op 경로와 어긋나지 않게 한다.
+#[cfg(target_os = "android")]
+#[allow(clippy::type_complexity)]
+fn htp_matmul_dispatch_plan<'t>(
+    a: &'t Tensor,
+    b: &'t Tensor,
+    out: &'t Tensor,
+) -> Option<(
+    &'t RpcmemBuffer,
+    &'t RpcmemBuffer,
+    &'t RpcmemBuffer,
+    usize,
+    usize,
+    usize,
+    DType,
+)> {
+    let b_rpc = b.buffer().as_any().downcast_ref::<RpcmemBuffer>()?;
+    let a_rpc = a.buffer().as_any().downcast_ref::<RpcmemBuffer>()?;
+    let out_rpc = out.buffer().as_any().downcast_ref::<RpcmemBuffer>()?;
+    match b.dtype() {
+        DType::Q4_0 => {
+            let (n, k, m) = htp_matmul_dispatchable(a, b, out)?;
+            Some((a_rpc, b_rpc, out_rpc, n, k, m, DType::Q4_0))
+        }
+        DType::F16 => {
+            let (n, k, m) = htp_matmul_dispatchable_f16(a, b, out)?;
+            Some((a_rpc, b_rpc, out_rpc, n, k, m, DType::F16))
+        }
+        _ => None,
+    }
 }
 
 /// 첫 1회 dispatch / fallback 분기를 eprintln 으로 노출 ("no silent caps").
@@ -534,6 +627,68 @@ impl Backend for HtpFastrpcBackend {
             }
         }
         self.cpu_companion.matmul_transposed(a, b, out)
+    }
+
+    /// step2 — FFN gate+up 를 한 batch 로 NPU dispatch (async batch fusion).
+    ///
+    /// gate/up 은 둘 다 normed FFN 입력 `x` 만 읽는 **독립** matmul 이고 출력 buffer
+    /// (`out`/`up_scratch`)가 disjoint 라, enqueue×2 → drain×1 로 묶어 ~100µs FastRPC
+    /// dispatch floor 를 op 마다(2회)→batch(1회)로 amortize 한다. 이후 `silu_mul` 이
+    /// gate·up 둘 다 읽으므로 **반드시 drain 후** CPU 실행 (drain 이 DspWriteCpuRead
+    /// coherency 까지 보장 — PoC `htp_batch_dispatch` 검증). attention/KV-cache 와
+    /// 무관한 KV-free 블록이라 eviction/KIVI/D2O 정책과 결합이 없다 (fusion 경계를
+    /// KV 바깥에 둔다는 설계 불변).
+    ///
+    /// gate·up 중 하나라도 NPU dispatch 불가(비-rpcmem / dtype·shape 미충족 / non-android)
+    /// 면 trait default 와 동일한 개별 `matmul_transposed`×2 + `silu_mul` 로 fallback
+    /// — 그쪽이 Q4_0 q4x4x2 cpu garbage bail / F16 safe-cpu 불변을 per-op 보존한다.
+    fn matmul_ffn_gate_up_silu(
+        &self,
+        x: &Tensor,
+        w_gate: &Tensor,
+        w_up: &Tensor,
+        out: &mut Tensor,
+        up_scratch: &mut Tensor,
+    ) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            // env LLMRS_DISABLE_HTP_FFN_BATCH=1 이면 batch 끄고 fallback(개별 dispatch).
+            // A/B 측정으로 floor recovery 효과를 격리 + production 안전 토글
+            // (기존 LLMRS_DISABLE_FLUSH_FFN 패턴과 동일 역할).
+            let batch_enabled = std::env::var_os("LLMRS_DISABLE_HTP_FFN_BATCH").is_none();
+            // gate·up 둘 다 NPU dispatch 가능할 때만 batch (그래야 enqueue 도중 한쪽이
+            // 불가로 판명돼 half-enqueue 되는 상황을 회피). 판정은 단일-op 경로와 동일
+            // 게이트(htp_matmul_dispatch_plan) 재사용.
+            if batch_enabled
+                && let (Some(g), Some(u)) = (
+                    htp_matmul_dispatch_plan(x, w_gate, out),
+                    htp_matmul_dispatch_plan(x, w_up, up_scratch),
+                )
+            {
+                // 전용 Once — htp_dispatch_log_once 의 DISPATCH_ONCE 는 q_proj 가 먼저
+                // 소비하므로 batch 진입을 별도 1회 로그로 확증 ("no silent caps").
+                {
+                    use std::sync::Once;
+                    static FFN_BATCH_ONCE: Once = Once::new();
+                    FFN_BATCH_ONCE.call_once(|| {
+                        eprintln!(
+                            "[htp] matmul_ffn_gate_up_silu: gate/up batch dispatch 활성 \
+                             (enqueue×2→drain×1, floor 2→1)"
+                        );
+                    });
+                }
+                // enqueue gate → enqueue up (op_pending 0→2), drain 1회 (2 read).
+                self.enqueue_matmul_via_htp(g.0, g.1, g.2, g.3, g.4, g.5, g.6)?;
+                self.enqueue_matmul_via_htp(u.0, u.1, u.2, u.3, u.4, u.5, u.6)?;
+                self.drain_pending()?;
+                // gate/up 모두 완성·coherent → silu_mul(out ← silu(out)*up_scratch) CPU.
+                return self.silu_mul(out, up_scratch);
+            }
+        }
+        // fallback: trait default 동치. 개별 matmul_transposed 가 dispatch 분기/bail 보존.
+        self.matmul_transposed(x, w_gate, out)?;
+        self.matmul_transposed(x, w_up, up_scratch)?;
+        self.silu_mul(out, up_scratch)
     }
 
     fn matmul_slice(
@@ -774,15 +929,26 @@ impl Backend for HtpFastrpcBackend {
     // ── Synchronization ───────────────────────────────────────────────
 
     fn synchronize(&self) -> Result<()> {
-        // PoC: 실 op dispatch path 가 dspqueue_read 까지 blocking 으로 진행
-        // 되므로 추가 fence 가 필요 없다. 후속 sprint 에서 async path 도입
-        // 시 본 method 에서 명시 fence (dspqueue_read flush 또는
-        // remote_handle64_invoke 동기 호출) 를 트리거해야 한다.
+        // async batch fusion: enqueue 된 in-flight DSP matmul op 을 전부 drain
+        // (full barrier). 단일-op 경로는 매 matmul 이 즉시 drain 하므로 여기서
+        // op_pending==0 → no-op (동작 불변). batch 경로(FFN gate/up)는 자체적으로
+        // drain 후 반환하므로 역시 여기 도달 시 0 — 즉 본 fence 는 forward 의
+        // GPU-gated sync 지점이 HTP 로도 확장될 때를 위한 forward-compatible 안전망.
+        #[cfg(target_os = "android")]
+        {
+            self.drain_pending()?;
+        }
         Ok(())
     }
 
     fn flush(&self) -> Result<()> {
-        // PoC: 동기 dispatch 라 별도 flush 필요 없음.
+        // HTP 는 비차단 submit(clFlush 류) 개념이 없다 — 출력 가시화의 유일 수단이
+        // blocking dspqueue_read 이므로 flush == drain (pending op 회수). forward 의
+        // batch 경계 flush 지점(QKV/FFN)이 HTP 로 확장되면 floor amortize 동작.
+        #[cfg(target_os = "android")]
+        {
+            self.drain_pending()?;
+        }
         Ok(())
     }
 
