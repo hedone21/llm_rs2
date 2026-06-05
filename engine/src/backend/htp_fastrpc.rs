@@ -451,6 +451,44 @@ fn htp_matmul_dispatchable_f16(
     Some((n, k, m))
 }
 
+/// `a @ bᵀ → out` matmul 의 NPU dispatch plan. weight `b`/act `a`/out 이 전부
+/// RpcmemBuffer-backed 이고 dtype/shape 게이트(`htp_matmul_dispatchable[_f16]`)를
+/// 통과하면 `Some((a_rpc, b_rpc, out_rpc, n, k, m, weight_dtype))`. 하나라도
+/// 미충족이면 `None` — 호출처(FFN batch override)는 None 시 개별 `matmul_transposed`
+/// 로 fallback 하며, 그쪽이 Q4_0 q4x4x2 의 cpu garbage bail / F16 safe-cpu 불변을
+/// 보존한다. `matmul_transposed` 의 dtype 분기와 동일 게이트를 재사용해 batch 경로의
+/// 판정이 단일-op 경로와 어긋나지 않게 한다.
+#[cfg(target_os = "android")]
+#[allow(clippy::type_complexity)]
+fn htp_matmul_dispatch_plan<'t>(
+    a: &'t Tensor,
+    b: &'t Tensor,
+    out: &'t Tensor,
+) -> Option<(
+    &'t RpcmemBuffer,
+    &'t RpcmemBuffer,
+    &'t RpcmemBuffer,
+    usize,
+    usize,
+    usize,
+    DType,
+)> {
+    let b_rpc = b.buffer().as_any().downcast_ref::<RpcmemBuffer>()?;
+    let a_rpc = a.buffer().as_any().downcast_ref::<RpcmemBuffer>()?;
+    let out_rpc = out.buffer().as_any().downcast_ref::<RpcmemBuffer>()?;
+    match b.dtype() {
+        DType::Q4_0 => {
+            let (n, k, m) = htp_matmul_dispatchable(a, b, out)?;
+            Some((a_rpc, b_rpc, out_rpc, n, k, m, DType::Q4_0))
+        }
+        DType::F16 => {
+            let (n, k, m) = htp_matmul_dispatchable_f16(a, b, out)?;
+            Some((a_rpc, b_rpc, out_rpc, n, k, m, DType::F16))
+        }
+        _ => None,
+    }
+}
+
 /// 첫 1회 dispatch / fallback 분기를 eprintln 으로 노출 ("no silent caps").
 /// NPU 가 실제 도는지 / silent cpu fallback 인지 device 에서 확인용. dispatch
 /// 와 fallback 각각 `Once` 로 첫 발생만 출력.
@@ -589,6 +627,68 @@ impl Backend for HtpFastrpcBackend {
             }
         }
         self.cpu_companion.matmul_transposed(a, b, out)
+    }
+
+    /// step2 — FFN gate+up 를 한 batch 로 NPU dispatch (async batch fusion).
+    ///
+    /// gate/up 은 둘 다 normed FFN 입력 `x` 만 읽는 **독립** matmul 이고 출력 buffer
+    /// (`out`/`up_scratch`)가 disjoint 라, enqueue×2 → drain×1 로 묶어 ~100µs FastRPC
+    /// dispatch floor 를 op 마다(2회)→batch(1회)로 amortize 한다. 이후 `silu_mul` 이
+    /// gate·up 둘 다 읽으므로 **반드시 drain 후** CPU 실행 (drain 이 DspWriteCpuRead
+    /// coherency 까지 보장 — PoC `htp_batch_dispatch` 검증). attention/KV-cache 와
+    /// 무관한 KV-free 블록이라 eviction/KIVI/D2O 정책과 결합이 없다 (fusion 경계를
+    /// KV 바깥에 둔다는 설계 불변).
+    ///
+    /// gate·up 중 하나라도 NPU dispatch 불가(비-rpcmem / dtype·shape 미충족 / non-android)
+    /// 면 trait default 와 동일한 개별 `matmul_transposed`×2 + `silu_mul` 로 fallback
+    /// — 그쪽이 Q4_0 q4x4x2 cpu garbage bail / F16 safe-cpu 불변을 per-op 보존한다.
+    fn matmul_ffn_gate_up_silu(
+        &self,
+        x: &Tensor,
+        w_gate: &Tensor,
+        w_up: &Tensor,
+        out: &mut Tensor,
+        up_scratch: &mut Tensor,
+    ) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            // env LLMRS_DISABLE_HTP_FFN_BATCH=1 이면 batch 끄고 fallback(개별 dispatch).
+            // A/B 측정으로 floor recovery 효과를 격리 + production 안전 토글
+            // (기존 LLMRS_DISABLE_FLUSH_FFN 패턴과 동일 역할).
+            let batch_enabled = std::env::var_os("LLMRS_DISABLE_HTP_FFN_BATCH").is_none();
+            // gate·up 둘 다 NPU dispatch 가능할 때만 batch (그래야 enqueue 도중 한쪽이
+            // 불가로 판명돼 half-enqueue 되는 상황을 회피). 판정은 단일-op 경로와 동일
+            // 게이트(htp_matmul_dispatch_plan) 재사용.
+            if batch_enabled
+                && let (Some(g), Some(u)) = (
+                    htp_matmul_dispatch_plan(x, w_gate, out),
+                    htp_matmul_dispatch_plan(x, w_up, up_scratch),
+                )
+            {
+                // 전용 Once — htp_dispatch_log_once 의 DISPATCH_ONCE 는 q_proj 가 먼저
+                // 소비하므로 batch 진입을 별도 1회 로그로 확증 ("no silent caps").
+                {
+                    use std::sync::Once;
+                    static FFN_BATCH_ONCE: Once = Once::new();
+                    FFN_BATCH_ONCE.call_once(|| {
+                        eprintln!(
+                            "[htp] matmul_ffn_gate_up_silu: gate/up batch dispatch 활성 \
+                             (enqueue×2→drain×1, floor 2→1)"
+                        );
+                    });
+                }
+                // enqueue gate → enqueue up (op_pending 0→2), drain 1회 (2 read).
+                self.enqueue_matmul_via_htp(g.0, g.1, g.2, g.3, g.4, g.5, g.6)?;
+                self.enqueue_matmul_via_htp(u.0, u.1, u.2, u.3, u.4, u.5, u.6)?;
+                self.drain_pending()?;
+                // gate/up 모두 완성·coherent → silu_mul(out ← silu(out)*up_scratch) CPU.
+                return self.silu_mul(out, up_scratch);
+            }
+        }
+        // fallback: trait default 동치. 개별 matmul_transposed 가 dispatch 분기/bail 보존.
+        self.matmul_transposed(x, w_gate, out)?;
+        self.matmul_transposed(x, w_up, up_scratch)?;
+        self.silu_mul(out, up_scratch)
     }
 
     fn matmul_slice(
