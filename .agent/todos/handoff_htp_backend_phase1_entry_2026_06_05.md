@@ -53,7 +53,7 @@
 4. **S4 `matmul`/`matmul_transposed` override** (`htp_fastrpc.rs:231-236`, 현재 cpu_companion 위임) — RpcmemBuffer backing 시 real HTP dispatch, else cpu_companion. 골격 = `rms_norm_via_htp:130`(현재 `#[allow(dead_code)]`) → 검증: 단일 op vs CPU `max_abs_err < 1e-3`.
 5. **S5 end-to-end 1 token** → 검증: greedy(temp=0) **CPU/OpenCL/HTP token-id 일치** + 첫 토큰 logit `max_abs_err < 1e-2`.
 
-**Phase 1 게이트 모델 = Q4_0 고정** (F32 weight 면 HTP path 미진입, 100% CPU fallback). RMSNorm/RoPE/Softmax/SiLU/GET_ROWS 5 op 은 DSP **F16 NO_SUPPORT** 이므로 cpu_companion CPU 에 둔다(correctness 무관).
+**Phase 1 게이트 모델 = Q4_0 weight matmul HTP**. RMSNorm/RoPE/Softmax/SiLU/GET_ROWS 5 op 은 DSP 가 **F16 만 NO_SUPPORT, F32 는 지원**(`act-ops.c:799-808 execute_op_activations_f32` 등 F32 case 실연산, F16 default NO_SUPPORT). 우리 single-op packet 이 이미 F32 activation 을 보내므로 **cpu_companion(CPU) 이 아니라 F32 로 HTP dispatch** 가 권장 — NPU↔CPU 왕복 회피. figure 의 ours.htp norm ✗ 는 'F16 셀 미측정' 일 뿐 NPU 무능력이 아님(et.htp 가 같은 Hexagon 에서 QNN native op `op_rms_norm.py RmsNormVisitor` 로 도는 게 증거). **단 S25 F32 norm dispatch correctness 는 미검증** — Phase 1 에서 op별 F32 dispatch + vs CPU max_abs_err 게이트 필요. (2026-06-05 정정: 구 'cpu_companion' 방침 폐기.)
 
 ### 위임 prompt (초안)
 
