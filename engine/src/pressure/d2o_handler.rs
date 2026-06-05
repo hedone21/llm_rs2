@@ -150,132 +150,39 @@ impl D2OHandler {
         merge_enabled: bool,
     ) -> Result<usize> {
         let current = cache.current_pos;
-        let prefix = self.config.protected_prefix.min(current);
-        let keep = target_len.max(prefix + 2);
+        let kv_heads = cache.kv_heads();
+        let head_dim = cache.head_dim();
 
-        if current <= keep {
-            return Ok(0);
-        }
+        // Step 1~5 (mutation 없는 계획 산출)을 D2OStage 와 공유하는 compute_d2o_plan 으로 위임.
+        // reader = dequantize_k(cache) — D2OStage 는 동일 함수에 ctx.dequant_k reader 를 넘긴다.
+        let plan = {
+            let c: &KVCache = cache;
+            compute_d2o_plan(
+                &|p, h, o| dequantize_k(c, p, h, head_dim, o),
+                &self.config,
+                state,
+                current,
+                target_len,
+                importance,
+                kv_heads,
+                head_dim,
+                merge_enabled,
+            )
+        };
+        let (retain_all, passing_positions, passing_matches) = match plan {
+            Some(p) => p,
+            None => return Ok(0),
+        };
 
-        // ── Step 1: H2O-style 3-partition ──
-        let available = keep.saturating_sub(prefix);
-        let hh_budget = (available as f32 * self.config.keep_ratio) as usize;
-        let recent_budget = available.saturating_sub(hh_budget);
-        let recent_start = current.saturating_sub(recent_budget).max(prefix);
-        let actual_recent = current - recent_start;
-        let actual_hh_budget = available.saturating_sub(actual_recent);
-
-        // Rank evictable tokens (prefix..recent_start) by importance
-        let mut token_scores: Vec<(usize, f32)> = (prefix..recent_start)
-            .map(|pos| (pos, importance.get(pos).copied().unwrap_or(0.0)))
-            .collect();
-        token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Split into keep (heavy hitters) and evict
-        let hh_positions: Vec<usize> = token_scores
-            .iter()
-            .take(actual_hh_budget)
-            .map(|(pos, _)| *pos)
-            .collect();
-        let evict_positions: Vec<usize> = token_scores
-            .iter()
-            .skip(actual_hh_budget)
-            .map(|(pos, _)| *pos)
-            .collect();
-
-        if evict_positions.is_empty() {
-            return Ok(0);
-        }
-
-        // Build the full retain set (sorted, for compaction)
-        let recent_positions: Vec<usize> = (recent_start..current).collect();
-        let mut retain_all: Vec<usize> = (0..prefix)
-            .chain(hh_positions.iter().copied())
-            .chain(recent_positions.iter().copied())
-            .collect();
-        retain_all.sort();
-
-        if merge_enabled {
-            // ── Step 2: Layer-wide nearest neighbor (paper Eq.8 m_ij) ──
-            let kv_heads = cache.kv_heads();
-            let head_dim = cache.head_dim();
-
-            // Merge targets exclude prefix tokens (prefix must remain unmodified)
-            let merge_targets: Vec<usize> = retain_all
-                .iter()
-                .copied()
-                .filter(|&p| p >= prefix)
-                .collect();
-
-            let all_matches: Vec<Match> = evict_positions
-                .iter()
-                .map(|&pos| find_nearest_layer_wide(cache, pos, &merge_targets, kv_heads, head_dim))
-                .collect();
-
-            // ── Step 3: EMA threshold τ_t (paper Eq.10) ──
-            // First call: τ_0 = mean over evicted of max_j u_ij.
-            // After init:  τ_t = β · max_(i,j) U_t + (1−β) · τ_{t−1}.
-            // Layer-wide nearest gives one `sim` per evicted token (= max_j u_ij),
-            // so per-evicted max == per-evicted sim and the global max over the
-            // whole U_t matrix collapses to the max over `match.sim`.
-            if !all_matches.is_empty() {
-                if !state.initialized {
-                    let mean_max =
-                        all_matches.iter().map(|m| m.sim).sum::<f32>() / all_matches.len() as f32;
-                    state.ema_threshold = mean_max;
-                    state.initialized = true;
-                } else {
-                    let global_max = all_matches
-                        .iter()
-                        .map(|m| m.sim)
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    state.ema_threshold = self.config.ema_beta * global_max
-                        + (1.0 - self.config.ema_beta) * state.ema_threshold;
-                }
-            }
-
-            // ── Step 4: Filter — per-evicted max sim ≥ τ ──
-            let passing_indices: Vec<usize> = (0..evict_positions.len())
-                .filter(|&i| all_matches[i].sim >= state.ema_threshold)
-                .collect();
-
-            let merge_count = passing_indices.len();
-            let delete_count = evict_positions.len() - merge_count;
-
-            // ── Step 5: Scatter-reduce merge (Eq.11 weights, layer-wide nearest) ──
-            if !passing_indices.is_empty() {
-                let passing_positions: Vec<usize> = passing_indices
-                    .iter()
-                    .map(|&i| evict_positions[i])
-                    .collect();
-                let passing_matches: Vec<Match> =
-                    passing_indices.iter().map(|&i| all_matches[i]).collect();
-                scatter_reduce_merge_layer_wide(
-                    cache,
-                    &passing_positions,
-                    &passing_matches,
-                    kv_heads,
-                    head_dim,
-                    self.config.merge_e,
-                );
-            }
-
-            state.total_merged += merge_count;
-            state.total_deleted += delete_count;
-
-            log::debug!(
-                "[D2O] merged={}, deleted={}, threshold={:.4}",
-                merge_count,
-                delete_count,
-                state.ema_threshold,
-            );
-        } else {
-            // GPU-only buffers: skip merge, count all evicted tokens as deleted
-            state.total_deleted += evict_positions.len();
-
-            log::debug!(
-                "[D2O] merge skipped (GPU-only buffers), deleted={}",
-                evict_positions.len(),
+        // ── Step 5(apply): Scatter-reduce merge (Eq.11 weights, layer-wide nearest) ──
+        if !passing_positions.is_empty() {
+            scatter_reduce_merge_layer_wide(
+                cache,
+                &passing_positions,
+                &passing_matches,
+                kv_heads,
+                head_dim,
+                self.config.merge_e,
             );
         }
 
@@ -285,6 +192,115 @@ impl D2OHandler {
 
         Ok(current - cache.current_pos)
     }
+}
+
+/// (M4-c) d2o evict **계획** 계산 — buffer mutation 없이 `(retain_all keep, passing evicts, matches)`
+/// 를 산출한다. `reader(pos, head, &mut out)` = K 읽기(cache 또는 ctx). D2OHandler::evict_and_merge
+/// (cache reader)와 D2OStage::plan(ctx reader)가 **이 함수를 공유**해 동일 계획을 낸다 — bit-identity
+/// by construction. `None` = no-op(current ≤ keep 또는 evict 대상 없음). step1~4 는 기존
+/// evict_and_merge 와 byte-identical(검증: 기존 d2o 테스트 + D2OStage 동등성 테스트).
+#[allow(clippy::too_many_arguments)]
+fn compute_d2o_plan(
+    reader: &dyn Fn(usize, usize, &mut [f32]),
+    config: &D2OConfig,
+    state: &mut D2OState,
+    current_pos: usize,
+    target_len: usize,
+    importance: &[f32],
+    kv_heads: usize,
+    head_dim: usize,
+    merge_enabled: bool,
+) -> Option<(Vec<usize>, Vec<usize>, Vec<Match>)> {
+    let current = current_pos;
+    let prefix = config.protected_prefix.min(current);
+    let keep = target_len.max(prefix + 2);
+    if current <= keep {
+        return None;
+    }
+
+    // ── Step 1: H2O-style 3-partition ──
+    let available = keep.saturating_sub(prefix);
+    let hh_budget = (available as f32 * config.keep_ratio) as usize;
+    let recent_budget = available.saturating_sub(hh_budget);
+    let recent_start = current.saturating_sub(recent_budget).max(prefix);
+    let actual_recent = current - recent_start;
+    let actual_hh_budget = available.saturating_sub(actual_recent);
+
+    let mut token_scores: Vec<(usize, f32)> = (prefix..recent_start)
+        .map(|pos| (pos, importance.get(pos).copied().unwrap_or(0.0)))
+        .collect();
+    token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let hh_positions: Vec<usize> = token_scores
+        .iter()
+        .take(actual_hh_budget)
+        .map(|(pos, _)| *pos)
+        .collect();
+    let evict_positions: Vec<usize> = token_scores
+        .iter()
+        .skip(actual_hh_budget)
+        .map(|(pos, _)| *pos)
+        .collect();
+
+    if evict_positions.is_empty() {
+        return None;
+    }
+
+    let recent_positions: Vec<usize> = (recent_start..current).collect();
+    let mut retain_all: Vec<usize> = (0..prefix)
+        .chain(hh_positions.iter().copied())
+        .chain(recent_positions.iter().copied())
+        .collect();
+    retain_all.sort();
+
+    if !merge_enabled {
+        // GPU-only buffers: skip merge, count all evicted as deleted.
+        state.total_deleted += evict_positions.len();
+        return Some((retain_all, Vec::new(), Vec::new()));
+    }
+
+    // ── Step 2: Layer-wide nearest neighbor (paper Eq.8 m_ij) — reader 로 K 읽기 ──
+    let merge_targets: Vec<usize> = retain_all
+        .iter()
+        .copied()
+        .filter(|&p| p >= prefix)
+        .collect();
+    let all_matches: Vec<Match> = evict_positions
+        .iter()
+        .map(|&pos| find_nearest_layer_wide_via(reader, pos, &merge_targets, kv_heads, head_dim))
+        .collect();
+
+    // ── Step 3: EMA threshold τ_t (paper Eq.10) ──
+    if !all_matches.is_empty() {
+        if !state.initialized {
+            let mean_max =
+                all_matches.iter().map(|m| m.sim).sum::<f32>() / all_matches.len() as f32;
+            state.ema_threshold = mean_max;
+            state.initialized = true;
+        } else {
+            let global_max = all_matches
+                .iter()
+                .map(|m| m.sim)
+                .fold(f32::NEG_INFINITY, f32::max);
+            state.ema_threshold =
+                config.ema_beta * global_max + (1.0 - config.ema_beta) * state.ema_threshold;
+        }
+    }
+
+    // ── Step 4: Filter — per-evicted max sim ≥ τ ──
+    let passing_indices: Vec<usize> = (0..evict_positions.len())
+        .filter(|&i| all_matches[i].sim >= state.ema_threshold)
+        .collect();
+    let passing_positions: Vec<usize> = passing_indices
+        .iter()
+        .map(|&i| evict_positions[i])
+        .collect();
+    let passing_matches: Vec<Match> = passing_indices.iter().map(|&i| all_matches[i]).collect();
+
+    state.total_merged += passing_positions.len();
+    state.total_deleted += evict_positions.len() - passing_positions.len();
+
+    Some((retain_all, passing_positions, passing_matches))
 }
 
 impl CachePressureHandler for D2OHandler {
@@ -508,7 +524,10 @@ fn find_nearest_layer_wide_via(
     }
 }
 
-/// cache 기반 wrapper(D2OHandler 경로) — reader = `dequantize_k`(cache). 시그니처 보존(무회귀).
+/// cache 기반 wrapper — reader = `dequantize_k`(cache). production 경로(evict_and_merge)는 이제
+/// compute_d2o_plan 이 `find_nearest_layer_wide_via` 를 직접 쓰므로, 이 wrapper 는 기존 테스트가
+/// cache 로 직접 호출하기 위한 **test 전용** 편의 함수다(lib 빌드 미사용 → `#[cfg(test)]`).
+#[cfg(test)]
 fn find_nearest_layer_wide(
     cache: &KVCache,
     evict_pos: usize,
