@@ -334,6 +334,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn d2o_stage_registered() {
+        // (M4-c) D2OStage 가 "d2o" 로 KV_CACHE_STAGES 에 등록됐는지 — find_stage 해석 + make 가능.
+        // production 은 if-branch(D2OHandler) 가 가로채므로 이 등록은 proven-equivalent available
+        // 표면(release fat-LTO 에서도 생존해야). make 로 D2OStage 인스턴스 생성 가능 확인.
+        let reg = find_stage("d2o").expect("d2o stage 등록이 슬라이스에 있어야 한다");
+        assert_eq!(reg.name, "d2o");
+        let params = StageParams {
+            eviction_window: 0,
+            protected_prefix: 4,
+            keep_ratio: 0.5,
+            sink_size: 0,
+            streaming_window: 0,
+        };
+        let stage = (reg.make)(params);
+        assert_eq!(stage.name(), "d2o");
+    }
+
     // ADR-0003 cross-crate linkme 실증 결과(M3): **dev-dep 선언만으로는 부족**하다. Rust 는 미참조
     // 의존 rlib 을 링크에서 제외하므로 `#[distributed_slice]` 등록이 누락된다(실측 — forcing 없으면
     // find_stage None). 따라서 technique crate 의 등록을 활성화하려면 의존 1줄에 더해 **force-link
