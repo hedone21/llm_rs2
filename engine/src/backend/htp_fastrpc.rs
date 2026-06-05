@@ -43,7 +43,7 @@ pub use idl::{
 };
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -230,19 +230,22 @@ impl HtpFastrpcBackend {
         n: usize,
         k: usize,
         m: usize,
+        weight_dtype: DType,
     ) -> Result<()> {
         // ── Build packet ───────────────────────────────────────────────────
         //
-        // ggml convention for Q4_0 weight `W[N, K]` (row-major):
-        //   ne = (K, N, 1, 1)
-        //   nb[0] = sizeof(block_q4_0) = 18
-        //   nb[1] = (K/32) * 18         — row stride
-        //   nb[2..3] = N * nb[1]        — plane/file stride
-        let blocks_per_row = (k / 32) as u32;
-        let row_bytes_w = blocks_per_row * 18;
+        // ggml convention for weight `W[N, K]` (row-major): ne = (K, N, 1, 1).
+        //   Q4_0: nb[0]=18(block_q4_0), nb[1]=(K/32)*18   — q4x4x2 repacked.
+        //   F16 : nb[0]=2(f16),         nb[1]=K*2          — row-major bytes 직접.
+        //   nb[2..3] = N * nb[1] (plane/file stride).
+        let (htp_wtype, elem_bytes, row_bytes_w) = match weight_dtype {
+            DType::Q4_0 => (HTP_TYPE_Q4_0, 18u32, (k as u32 / 32) * 18),
+            DType::F16 => (HTP_TYPE_F16, 2u32, (k * 2) as u32),
+            other => anyhow::bail!("htp via_htp: unsupported weight dtype {other:?}"),
+        };
         let plane_bytes_w = (n as u32) * row_bytes_w;
         let ne_w = [k as u32, n as u32, 1, 1];
-        let nb_w = [18u32, row_bytes_w, plane_bytes_w, plane_bytes_w];
+        let nb_w = [elem_bytes, row_bytes_w, plane_bytes_w, plane_bytes_w];
 
         // input F32 activation x[M, K] (row-major) — ne=(K, M, 1, 1).
         // M==1 이면 [4, K*4, K*4, K*4] 로 환원 (proven GEMV path).
@@ -256,10 +259,11 @@ impl HtpFastrpcBackend {
         let nb_y = [4u32, (n * 4) as u32, plane_y, plane_y];
 
         let mut req = HtpGeneralReq::zeroed();
-        let src0 = htp_tensor_from_shape(HTP_TYPE_Q4_0, ne_w, nb_w);
+        let src0 = htp_tensor_from_shape(htp_wtype, ne_w, nb_w);
         let src1 = htp_tensor_from_shape(HTP_TYPE_F32, ne_x, nb_x);
         let dst = htp_tensor_from_shape(HTP_TYPE_F32, ne_y, nb_y);
-        // skip_quantize=false: DSP-side 가 input 을 dynamic 양자화 (Q8_0).
+        // skip_quantize=false: DSP-side 가 input(F32) 을 자체 처리 — Q4_0 path 는
+        // dynamic Q8_0 양자화, F16 path 는 f32→fp16 변환 (`quantize_f32_f16`).
         init_matmul_req(&mut req, src0, src1, dst, false);
 
         // bufs ordering MUST match init_binary_req<true>:
@@ -358,6 +362,40 @@ fn htp_matmul_dispatchable(a: &Tensor, b: &Tensor, out: &Tensor) -> Option<(usiz
     Some((n, k, m))
 }
 
+/// F16 weight 의 HTP NPU dispatch 가능 여부 (A 실험 — F16 row-major matmul).
+///
+/// `Some((n, k, m))` 이면 weight `b` 는 `[n, k]` F16 (row-major, K%64==0 = HVX
+/// f16 벡터 64 elem 정렬), activation `a` 는 F32 `[m, k]`, output 은 F32 `[m, n]`.
+/// Q4_0 와 달리 F16 rpcmem 은 **표준 layout** 이라 dispatch 불가 시 cpu fallback
+/// 이 안전 (garbage 아님) — 호출처가 bail 대신 cpu 위임.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn htp_matmul_dispatchable_f16(
+    a: &Tensor,
+    b: &Tensor,
+    out: &Tensor,
+) -> Option<(usize, usize, usize)> {
+    let bd = b.shape().dims();
+    if bd.len() != 2 {
+        return None;
+    }
+    let (n, k) = (bd[0], bd[1]);
+    if b.dtype() != DType::F16 || a.dtype() != DType::F32 || out.dtype() != DType::F32 {
+        return None;
+    }
+    // HVX f16 dot 는 128-byte(=64 f16) 벡터 단위. K 미정렬은 reject (cpu fallback).
+    if k == 0 || !k.is_multiple_of(64) {
+        return None;
+    }
+    if !a.numel().is_multiple_of(k) {
+        return None;
+    }
+    let m = a.numel() / k;
+    if m == 0 || out.numel() != m * n {
+        return None;
+    }
+    Some((n, k, m))
+}
+
 /// 첫 1회 dispatch / fallback 분기를 eprintln 으로 노출 ("no silent caps").
 /// NPU 가 실제 도는지 / silent cpu fallback 인지 device 에서 확인용. dispatch
 /// 와 fallback 각각 `Once` 로 첫 발생만 출력.
@@ -371,7 +409,7 @@ fn htp_dispatch_log_once(dispatched: bool, reason: &str) {
     static FALLBACK_ONCE: Once = Once::new();
     if dispatched {
         DISPATCH_ONCE.call_once(|| {
-            eprintln!("[htp] matmul_transposed: NPU dispatch 활성 (Q4_0 q4x4x2, M≥1)");
+            eprintln!("[htp] matmul_transposed: NPU dispatch 활성 ({reason}, M≥1)");
         });
     } else {
         FALLBACK_ONCE.call_once(|| {
@@ -379,6 +417,11 @@ fn htp_dispatch_log_once(dispatched: bool, reason: &str) {
         });
     }
 }
+
+/// F16 weight 를 rpcmem(DMA-BUF heap)으로 올린 누적 바이트 — A 실험의 OOM ceiling
+/// 진단용. `copy_weight_from` 의 F16 arm 이 alloc 마다 누적/로깅하므로, alloc 실패
+/// 시 직전 누적값이 rpcmem 상한의 하한 추정치가 된다.
+static F16_RPCMEM_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 impl Backend for HtpFastrpcBackend {
     // ── Lifecycle / identity ──────────────────────────────────────────
@@ -421,33 +464,74 @@ impl Backend for HtpFastrpcBackend {
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         #[cfg(target_os = "android")]
         {
-            // weight 가 rpcmem 이면 q4x4x2 (cpu fallback 불가). 이 사실이 분기 pivot.
+            // weight 가 rpcmem 이면 NPU 대상 (copy_weight_from 이 Q4_0 q4x4x2 / F16
+            // row-major 만 rpcmem). dtype 으로 분기 — pivot 은 "rpcmem layout 이
+            // 비표준(Q4_0 q4x4x2)인가 표준(F16)인가".
             if let Some(b_rpc) = b.buffer().as_any().downcast_ref::<RpcmemBuffer>() {
                 let a_rpc = a.buffer().as_any().downcast_ref::<RpcmemBuffer>();
                 let out_rpc = out.buffer().as_any().downcast_ref::<RpcmemBuffer>();
-                if let (Some((n, k, m)), Some(a_rpc), Some(out_rpc)) =
-                    (htp_matmul_dispatchable(a, b, out), a_rpc, out_rpc)
-                {
-                    htp_dispatch_log_once(true, "");
-                    return self.matmul_transposed_via_htp(a_rpc, b_rpc, out_rpc, n, k, m);
+                match b.dtype() {
+                    // Q4_0 q4x4x2 = 비표준 layout → NPU dispatch 아니면 cpu 가
+                    // q4x4x2 를 standard block_q4_0 로 읽어 garbage → loud bail.
+                    DType::Q4_0 => {
+                        if let (Some((n, k, m)), Some(a_rpc), Some(out_rpc)) =
+                            (htp_matmul_dispatchable(a, b, out), a_rpc, out_rpc)
+                        {
+                            htp_dispatch_log_once(true, "Q4_0 q4x4x2");
+                            return self.matmul_transposed_via_htp(
+                                a_rpc,
+                                b_rpc,
+                                out_rpc,
+                                n,
+                                k,
+                                m,
+                                DType::Q4_0,
+                            );
+                        }
+                        anyhow::bail!(
+                            "htp: q4x4x2 Q4_0 weight matmul 은 NPU dispatch 필요 (act/out rpcmem + \
+                             dtype/shape 게이트); act_rpcmem={}, out_rpcmem={}. cpu fallback 은 \
+                             q4x4x2↔standard 비호환으로 garbage 라 차단",
+                            a_rpc.is_some(),
+                            out_rpc.is_some()
+                        );
+                    }
+                    // F16 = 표준 row-major layout → dispatch 가능하면 NPU, 아니면
+                    // cpu fallback 안전 (rpcmem F16 bytes = standard, garbage 아님).
+                    DType::F16 => {
+                        if let (Some((n, k, m)), Some(a_rpc), Some(out_rpc)) =
+                            (htp_matmul_dispatchable_f16(a, b, out), a_rpc, out_rpc)
+                        {
+                            htp_dispatch_log_once(true, "F16 row-major");
+                            return self.matmul_transposed_via_htp(
+                                a_rpc,
+                                b_rpc,
+                                out_rpc,
+                                n,
+                                k,
+                                m,
+                                DType::F16,
+                            );
+                        }
+                        htp_dispatch_log_once(
+                            false,
+                            "F16 weight dispatch 조건 미충족 → cpu fallback (safe, standard F16)",
+                        );
+                    }
+                    // copy_weight_from 이 Q4_0/F16 만 rpcmem 화하므로 도달 불가.
+                    // 방어적으로 cpu fallback (표준 layout 가정).
+                    _ => {
+                        htp_dispatch_log_once(
+                            false,
+                            "rpcmem weight 비-Q4_0/F16 → cpu fallback (방어)",
+                        );
+                    }
                 }
-                // q4x4x2 weight 인데 dispatch 조건 미충족 (act/out 비-rpcmem 또는
-                // dtype/shape 게이트 실패) → cpu fallback 은 q4x4x2 를 standard 로
-                // 읽어 garbage → loud error. 주경로(workspace=rpcmem·F32)에선 미발생.
-                anyhow::bail!(
-                    "htp: q4x4x2 Q4_0 weight matmul 은 NPU dispatch 필요 (act/out rpcmem + \
-                     dtype/shape 게이트); act_rpcmem={}, out_rpcmem={}. cpu fallback 은 \
-                     q4x4x2↔standard 비호환으로 garbage 라 차단",
-                    a_rpc.is_some(),
-                    out_rpc.is_some()
-                );
+            } else {
+                // weight 가 rpcmem 아님 (standard, copy_weight_from 의 cpu_companion
+                // arm) → cpu fallback 안전.
+                htp_dispatch_log_once(false, "weight 가 rpcmem 아님 → cpu fallback (standard)");
             }
-            // weight 가 rpcmem 아님 (standard Q4_0/F16/F32/… , copy_weight_from 의
-            // cpu_companion arm) → cpu fallback 안전 (standard 레이아웃).
-            htp_dispatch_log_once(
-                false,
-                "weight 가 rpcmem-q4x4x2 아님 → cpu fallback (standard)",
-            );
         }
         self.cpu_companion.matmul_transposed(a, b, out)
     }
@@ -553,7 +637,44 @@ impl Backend for HtpFastrpcBackend {
                     self.cpu_companion.clone(),
                 ))
             }
-            // 비-Q4_0 (F32/F16/Q8_0/Q6_K/…) 및 비정렬 Q4_0: cpu_companion
+            // F16 2D weight (K%64==0): rpcmem alloc + row-major 복사 (repack 불필요
+            // — DSP `vec_dot_f16_*` 가 row-major bytes 직접 사용). ★ A 실험: 전 F16
+            // weight 를 rpcmem 상주시켜 OOM ceiling 측정. Q4_0(~703MB)의 16/4.5≈3.5×
+            // (~2.5GB) 라 rpcmem(DMA-BUF) 한계 초과 가능 — 실패 시 누적 로그로 ceiling 캡처.
+            DType::F16 if dims.len() == 2 && dims[1].is_multiple_of(64) => {
+                let bytes = t.numel() * 2;
+                let total = F16_RPCMEM_TOTAL.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                let mut buf = RpcmemBuffer::alloc(self.host.clone(), bytes, DType::F16)
+                    .with_context(|| {
+                        format!(
+                            "htp: F16 weight rpcmem alloc 실패 {} B (직전까지 누적 {} MB) — \
+                             rpcmem(DMA-BUF) ceiling 도달 추정",
+                            bytes,
+                            (total - bytes) / (1024 * 1024)
+                        )
+                    })?;
+                let f16_slice = t.as_slice::<half::f16>();
+                // SAFETY: f16 = 2-byte POD, f16_slice.len()*2 == bytes == buf alloc.
+                let src_bytes =
+                    unsafe { std::slice::from_raw_parts(f16_slice.as_ptr() as *const u8, bytes) };
+                // SAFETY: buf 직전 alloc 으로 valid, src/dst non-overlapping, len 동일.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_bytes.as_ptr(), buf.as_mut_ptr(), bytes);
+                }
+                eprintln!(
+                    "[htp] F16 weight → rpcmem: [{},{}] {} B (누적 {} MB)",
+                    dims[0],
+                    dims[1],
+                    bytes,
+                    total / (1024 * 1024)
+                );
+                Ok(Tensor::new(
+                    t.shape().clone(),
+                    Arc::new(buf),
+                    self.cpu_companion.clone(),
+                ))
+            }
+            // 그 외 (F32/Q8_0/Q6_K/… , 비정렬·비2D Q4_0/F16): cpu_companion
             // (SharedBuffer). NPU dispatch 대상이 아니므로 rpcmem 상주 불필요.
             _ => self.cpu_companion.copy_weight_from(t),
         }
@@ -831,5 +952,51 @@ mod tests {
         let a = mk_tensor(vec![1, 256], DType::F32, 256 * 4);
         let out = mk_tensor(vec![1, 1], DType::F32, 4);
         assert_eq!(htp_matmul_dispatchable(&a, &b, &out), None);
+    }
+
+    // ── A 실험: F16 dispatchable (htp_matmul_dispatchable_f16) ──────────────
+
+    #[test]
+    fn dispatchable_f16_k64_some() {
+        // F16 weight, K%64==0, M=1 → Some((n, k, 1)).
+        let k = 1536; // 64 배수
+        let n = 2048;
+        let b = mk_tensor(vec![n, k], DType::F16, n * k * 2);
+        let a = mk_tensor(vec![1, k], DType::F32, k * 4);
+        let out = mk_tensor(vec![1, n], DType::F32, n * 4);
+        assert_eq!(htp_matmul_dispatchable_f16(&a, &b, &out), Some((n, k, 1)));
+    }
+
+    #[test]
+    fn dispatchable_f16_prefill_m3_some() {
+        // M==3 (prefill GEMM) → Some((n, k, 3)).
+        let k = 1536;
+        let n = 2048;
+        let b = mk_tensor(vec![n, k], DType::F16, n * k * 2);
+        let a = mk_tensor(vec![3, k], DType::F32, 3 * k * 4);
+        let out = mk_tensor(vec![3, n], DType::F32, 3 * n * 4);
+        assert_eq!(htp_matmul_dispatchable_f16(&a, &b, &out), Some((n, k, 3)));
+    }
+
+    #[test]
+    fn dispatchable_f16_q4_weight_none() {
+        // Q4_0 weight 는 F16 helper 에서 None (dtype gate).
+        let k = 1536;
+        let n = 2048;
+        let b = mk_tensor(vec![n, k], DType::Q4_0, n * (k / 32) * 18);
+        let a = mk_tensor(vec![1, k], DType::F32, k * 4);
+        let out = mk_tensor(vec![1, n], DType::F32, n * 4);
+        assert_eq!(htp_matmul_dispatchable_f16(&a, &b, &out), None);
+    }
+
+    #[test]
+    fn dispatchable_f16_k_misaligned_none() {
+        // K=1500 (64 비배수) → None (HVX f16 벡터 정렬 실패 → cpu fallback).
+        let k = 1500;
+        let n = 16;
+        let b = mk_tensor(vec![n, k], DType::F16, n * k * 2);
+        let a = mk_tensor(vec![1, k], DType::F32, k * 4);
+        let out = mk_tensor(vec![1, n], DType::F32, n * 4);
+        assert_eq!(htp_matmul_dispatchable_f16(&a, &b, &out), None);
     }
 }
