@@ -240,10 +240,11 @@ fn run_htp(
         let bytes_v = v_bytes.len();
         let bytes_dst = dst_size * 4; // F32 output
 
-        let mut buf_q = RpcmemBuffer::alloc(host.clone(), bytes_q)?;
-        let mut buf_k = RpcmemBuffer::alloc(host.clone(), bytes_k)?;
-        let mut buf_v = RpcmemBuffer::alloc(host.clone(), bytes_v)?;
-        let mut buf_dst = RpcmemBuffer::alloc(host.clone(), bytes_dst)?;
+        let mut buf_q = RpcmemBuffer::alloc(host.clone(), bytes_q, llm_rs2::buffer::DType::F16)?;
+        let mut buf_k = RpcmemBuffer::alloc(host.clone(), bytes_k, llm_rs2::buffer::DType::F16)?;
+        let mut buf_v = RpcmemBuffer::alloc(host.clone(), bytes_v, llm_rs2::buffer::DType::F16)?;
+        let mut buf_dst =
+            RpcmemBuffer::alloc(host.clone(), bytes_dst, llm_rs2::buffer::DType::F32)?;
 
         unsafe {
             std::ptr::copy_nonoverlapping(q_bytes.as_ptr(), buf_q.as_mut_ptr(), bytes_q);

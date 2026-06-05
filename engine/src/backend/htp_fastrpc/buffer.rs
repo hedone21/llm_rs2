@@ -13,6 +13,7 @@
 
 #![cfg(feature = "htp_fastrpc")]
 
+use std::any::Any;
 use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use super::host::{
     RPCMEM_HEAP_ID_SYSTEM, RPCMEM_HEAP_NOREG,
 };
 use super::idl::DspqBufferType;
+use crate::buffer::{Buffer, DType};
 
 /// alloc flags = `RPCMEM_DEFAULT_FLAGS | RPCMEM_HEAP_NOREG`. llama.cpp
 /// `ggml-hexagon.cpp:268` 와 동일. NOREG 는 alloc 시점에 모든 도메인 자동
@@ -56,6 +58,9 @@ pub struct RpcmemBuffer {
     /// `fastrpc_mmap(domain, fd, base, 0, alloc_size, FASTRPC_MAP_FD)` 호출
     /// 결과. true 면 Drop 에서 `fastrpc_munmap` 을 호출.
     mapped: bool,
+    /// caller-declared element dtype. `Buffer::dtype` 노출용 (byte size 는
+    /// `size` 가 단독으로 유지; dtype 은 element 해석 메타데이터).
+    dtype: DType,
 }
 
 // SAFETY: ptr 은 rpcmem 영역 (process-global). host 의 rpcmem_free 는
@@ -68,7 +73,7 @@ impl RpcmemBuffer {
     ///
     /// `size == 0` 은 거부 (ggml-hexagon 도 0 size 을 64 로 강제 promote
     /// 하지만, 본 wrapper 는 caller 에게 명시 책임을 요구).
-    pub fn alloc(host: Arc<HtpFastrpcHost>, size: usize) -> Result<Self> {
+    pub fn alloc(host: Arc<HtpFastrpcHost>, size: usize, dtype: DType) -> Result<Self> {
         if size == 0 {
             return Err(anyhow!("htp_fastrpc: RpcmemBuffer::alloc size == 0"));
         }
@@ -168,6 +173,7 @@ impl RpcmemBuffer {
             alloc_size,
             host,
             mapped: true,
+            dtype,
         })
     }
 
@@ -179,6 +185,10 @@ impl RpcmemBuffer {
     }
 
     /// raw host-side pointer (write 용).
+    ///
+    /// inherent `as_mut_ptr(&mut self)` 와 trait `Buffer::as_mut_ptr(&self)` 는
+    /// receiver 가 달라 method-resolution 상 공존 — 둘 다 `self.ptr` 반환이라
+    /// 의미 동일.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr
     }
@@ -243,6 +253,47 @@ impl RpcmemBuffer {
     }
 }
 
+impl Buffer for RpcmemBuffer {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        // raw `*mut u8` 은 Copy — `&self` 에서 그대로 반환 가능. interior-mut
+        // 불필요 (kv_buffer.rs:127 와 동일 패턴).
+        self.ptr
+    }
+
+    #[cfg(feature = "opencl")]
+    fn cl_mem(&self) -> Option<&ocl::core::Mem> {
+        // RpcmemBuffer 는 OpenCL alias 미보유 (rpcmem DMA-BUF 단독) → None.
+        None
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    fn cl_mem(&self) -> Option<()> {
+        None
+    }
+
+    fn sync_device(&self) -> Result<()> {
+        // DSP coherency 는 dispatch 시 `DspqBufferType::CpuWriteDspRead` flag
+        // (dsp_buf 의 direction 인자) 로 처리 — buffer-level 은 no-op.
+        Ok(())
+    }
+}
+
 impl Drop for RpcmemBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -292,6 +343,14 @@ const _: () = {
     // 본 const 의 의도 주석이 trigger 가 된다.
 };
 
+// Compile-time guard: `RpcmemBuffer: Buffer` 완전 impl 보장. 파일 전체가
+// `#![cfg(feature = "htp_fastrpc")]` 로 게이트되어 host cargo check
+// (`--features htp_fastrpc`) 가 본 단언으로 trait 누락을 컴파일 타임에 차단.
+const _: fn() = || {
+    fn assert_buf<T: crate::buffer::Buffer>() {}
+    assert_buf::<RpcmemBuffer>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::RpcmemBuffer;
@@ -311,5 +370,45 @@ mod tests {
         requires_clone::<u32>();
         // marker: RpcmemBuffer 가 in-scope 임을 컴파일러가 확인.
         let _ = core::marker::PhantomData::<RpcmemBuffer>;
+    }
+
+    /// device-only: `Buffer` trait 경유 readback 이 host write 와 bit-identical
+    /// 임을 S25 에서 검증 (rpcmem alloc 은 android target 에서만 동작).
+    ///
+    /// host 빌드에선 cfg-out 되어 컴파일 제외 (정상). deploy-test 로 실행.
+    #[cfg(all(target_os = "android", feature = "htp_fastrpc"))]
+    #[test]
+    fn test_buffer_trait_readback_bit_identical() {
+        use crate::backend::htp_fastrpc::host::HtpFastrpcHost;
+        use crate::buffer::{Buffer, DType};
+
+        let host =
+            HtpFastrpcHost::new("test_buffer_readback").expect("htp_fastrpc host new failed");
+        let mut buf =
+            RpcmemBuffer::alloc(host, 256, DType::F32).expect("RpcmemBuffer::alloc failed");
+
+        // pattern write via inherent as_mut_slice.
+        let inherent_ptr = buf.as_mut_ptr();
+        {
+            let s = buf.as_mut_slice();
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+        }
+
+        // metadata via &dyn Buffer.
+        let dyn_buf: &dyn Buffer = &buf;
+        assert_eq!(dyn_buf.dtype(), DType::F32);
+        assert_eq!(dyn_buf.size(), 256);
+        // trait as_mut_ptr(&self) == inherent ptr.
+        assert_eq!(dyn_buf.as_mut_ptr(), inherent_ptr);
+
+        // readback via trait as_ptr → reconstruct slice, compare bit-identical.
+        // SAFETY: ptr/size 는 alloc 시점 valid, buf 가 살아있어 lifetime OK.
+        let readback = unsafe { core::slice::from_raw_parts(dyn_buf.as_ptr(), dyn_buf.size()) };
+        for (i, &b) in readback.iter().enumerate() {
+            let expected = (i as u8).wrapping_mul(31).wrapping_add(7);
+            assert_eq!(b, expected, "byte {i} mismatch");
+        }
     }
 }

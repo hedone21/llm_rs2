@@ -317,9 +317,12 @@ fn run_htp(
         //   bufs[0] = src0 (CpuWriteDspRead, embed table)
         //   bufs[1] = src1 (CpuWriteDspRead, idx i32)
         //   bufs[2] = dst  (DspWriteCpuRead, gathered rows)
-        let mut buf_embed = RpcmemBuffer::alloc(host.clone(), bytes_embed)?;
-        let mut buf_idx = RpcmemBuffer::alloc(host.clone(), bytes_idx)?;
-        let mut buf_dst = RpcmemBuffer::alloc(host.clone(), bytes_dst)?;
+        let mut buf_embed =
+            RpcmemBuffer::alloc(host.clone(), bytes_embed, llm_rs2::buffer::DType::F32)?;
+        // idx 는 i32 인덱스 — DType enum 에 정수형 없어 byte-view (U8).
+        let mut buf_idx = RpcmemBuffer::alloc(host.clone(), bytes_idx, llm_rs2::buffer::DType::U8)?;
+        let mut buf_dst =
+            RpcmemBuffer::alloc(host.clone(), bytes_dst, llm_rs2::buffer::DType::F32)?;
 
         unsafe {
             std::ptr::copy_nonoverlapping(

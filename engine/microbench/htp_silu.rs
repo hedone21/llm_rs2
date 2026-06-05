@@ -239,8 +239,8 @@ fn run_htp(
 
         let bytes = dim * 4;
 
-        let mut buf_x = RpcmemBuffer::alloc(host.clone(), bytes)?;
-        let mut buf_y = RpcmemBuffer::alloc(host.clone(), bytes)?;
+        let mut buf_x = RpcmemBuffer::alloc(host.clone(), bytes, llm_rs2::buffer::DType::F32)?;
+        let mut buf_y = RpcmemBuffer::alloc(host.clone(), bytes, llm_rs2::buffer::DType::F32)?;
 
         unsafe {
             std::ptr::copy_nonoverlapping(host_x.as_ptr() as *const u8, buf_x.as_mut_ptr(), bytes);

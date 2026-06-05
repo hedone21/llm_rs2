@@ -350,8 +350,9 @@ fn run_htp(
         // n_bufs=2 ordering (mask-less softmax):
         //   bufs[0] = src0 (CpuWriteDspRead, host activation scores)
         //   bufs[1] = dst  (DspWriteCpuRead, output)
-        let mut buf_in = RpcmemBuffer::alloc(host.clone(), bytes_in)?;
-        let mut buf_out = RpcmemBuffer::alloc(host.clone(), bytes_out)?;
+        let mut buf_in = RpcmemBuffer::alloc(host.clone(), bytes_in, llm_rs2::buffer::DType::F32)?;
+        let mut buf_out =
+            RpcmemBuffer::alloc(host.clone(), bytes_out, llm_rs2::buffer::DType::F32)?;
 
         unsafe {
             std::ptr::copy_nonoverlapping(

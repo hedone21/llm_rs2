@@ -118,8 +118,8 @@ fn run_htp(x_f16_bytes: &[u8], dim: usize) -> anyhow::Result<()> {
         println!("  htp_iface_start: OK (n_hvx={n_hvx})");
 
         let bytes = dim * 2;
-        let mut buf_x = RpcmemBuffer::alloc(host.clone(), bytes)?;
-        let mut buf_y = RpcmemBuffer::alloc(host.clone(), bytes)?;
+        let mut buf_x = RpcmemBuffer::alloc(host.clone(), bytes, llm_rs2::buffer::DType::F16)?;
+        let mut buf_y = RpcmemBuffer::alloc(host.clone(), bytes, llm_rs2::buffer::DType::F16)?;
 
         unsafe {
             std::ptr::copy_nonoverlapping(x_f16_bytes.as_ptr(), buf_x.as_mut_ptr(), bytes);

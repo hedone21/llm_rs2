@@ -450,9 +450,9 @@ fn run_htp(
         let bytes_x = k * 4;
         let bytes_y = n * 4;
 
-        let mut buf_w = RpcmemBuffer::alloc(host.clone(), bytes_w)?;
-        let mut buf_x = RpcmemBuffer::alloc(host.clone(), bytes_x)?;
-        let mut buf_y = RpcmemBuffer::alloc(host.clone(), bytes_y)?;
+        let mut buf_w = RpcmemBuffer::alloc(host.clone(), bytes_w, llm_rs2::buffer::DType::Q4_0)?;
+        let mut buf_x = RpcmemBuffer::alloc(host.clone(), bytes_x, llm_rs2::buffer::DType::F32)?;
+        let mut buf_y = RpcmemBuffer::alloc(host.clone(), bytes_y, llm_rs2::buffer::DType::F32)?;
 
         // host-side weight write (한 번만, Constant 라 매 iter 재업로드 불필요)
         unsafe {

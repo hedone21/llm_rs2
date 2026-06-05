@@ -471,9 +471,9 @@ fn run_htp(
         let bytes_w = dim * 4;
         let bytes_y = rows * dim * 4;
 
-        let mut buf_x = RpcmemBuffer::alloc(host.clone(), bytes_x)?;
-        let mut buf_w = RpcmemBuffer::alloc(host.clone(), bytes_w)?;
-        let mut buf_y = RpcmemBuffer::alloc(host.clone(), bytes_y)?;
+        let mut buf_x = RpcmemBuffer::alloc(host.clone(), bytes_x, llm_rs2::buffer::DType::F32)?;
+        let mut buf_w = RpcmemBuffer::alloc(host.clone(), bytes_w, llm_rs2::buffer::DType::F32)?;
+        let mut buf_y = RpcmemBuffer::alloc(host.clone(), bytes_y, llm_rs2::buffer::DType::F32)?;
 
         // host-side write
         unsafe {
