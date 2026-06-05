@@ -112,24 +112,22 @@
   "NPU/f16": {
     "short": {
       "token_len": 12,
-      "ttft_ms": 179.44,
-      "decode_ms_tok": 62.81,
-      "decode_tps": 15.9,
-      "ok": true,
-      "raw_tail": " max: 2048)\n[Resilience] Manager unreachable (Unknown transport 'dbus' (use dbus / unix:<path> / tcp:<addr>)), running without resilience.\n[Phase4-4.5] standard happy path \u2192 DecodeLoop+ModelForward (tokens=12, budget=48)\n[htp] matmul_transposed: cpu fallback \u2014 weight \uac00 rpcmem-q4x4x2 \uc544\ub2d8 \u2192 cpu fallback (standard)\n[Phase4-4.5] generated=48 (first=576 + run=47) stopped_by=BudgetExhausted final_pos=59\n"
+      "ttft_ms": 196.12,
+      "decode_tps": 10.5,
+      "ok": true
     },
     "long": {
       "token_len": 105,
-      "ttft_ms": 899.15,
-      "decode_ms_tok": 70.5,
-      "decode_tps": 14.6,
+      "ttft_ms": 2095.95,
+      "decode_tps": 6.9,
       "ok": true,
-      "raw_tail": "ax: 2048)\n[Resilience] Manager unreachable (Unknown transport 'dbus' (use dbus / unix:<path> / tcp:<addr>)), running without resilience.\n[Phase4-4.5] standard happy path \u2192 DecodeLoop+ModelForward (tokens=105, budget=48)\n[htp] matmul_transposed: cpu fallback \u2014 weight \uac00 rpcmem-q4x4x2 \uc544\ub2d8 \u2192 cpu fallback (standard)\n[Phase4-4.5] generated=48 (first=576 + run=47) stopped_by=BudgetExhausted final_pos=152\n",
-      "note": "re-measured warm (first cold run TTFT=2125ms discarded)"
+      "note": "real F16 NPU dispatch (A \uc2e4\ud5d8, htp_fastrpc F16 wire-up). \uc774\uc804 cpu-fallback: prefill~129/decode~14.6"
     },
     "derived": {
-      "prefill_tps": 129.21871309277347,
-      "decode_tps": 14.6
+      "prefill_tps": 48.95174831432286,
+      "decode_tps": 6.9,
+      "mode": "real_npu_f16",
+      "correctness": "16/16 token-id == f16 CPU baseline"
     }
   }
 }

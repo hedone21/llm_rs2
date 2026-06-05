@@ -6,8 +6,9 @@ results.json (driver.py 산출) → 2-panel grouped bar:
   (b) Decode  throughput (tok/s, steady state)
 x = CPU / GPU / NPU, 그룹 = {Q4_0, F16}.
 
-NPU+F16 은 htp 가 Q4_0 matmul 만 NPU dispatch → F16 은 cpu_companion 폴백
-(NPU 미사용). 별표(*)로 표기.
+전 셀이 명시 backend 에서 실제 dispatch (A 실험으로 F16 weight 도 rpcmem +
+HTP NPU dispatch 배선 — token-id 16/16 CPU 일치 검증). F16-on-NPU 는
+~3.3GB rpcmem 을 DSP 로 흘리는 memory-bound 라 전 매트릭스 최저속.
 """
 import json
 import sys
@@ -52,12 +53,8 @@ def draw_panel(ax, key, ylabel, letter, title):
                         "n/a", ha="center", va="bottom",
                         fontsize=FONT.MICRO, color=ARGUS.MUTED, rotation=90)
                 continue
-            lbl = f"{v:.0f}"
-            # NPU+F16 = cpu fallback 표기
-            if b == "NPU" and fkey == "f16":
-                lbl += "*"
             ax.text(rect.get_x() + rect.get_width() / 2, v,
-                    lbl, ha="center", va="bottom", fontsize=FONT.NOTE)
+                    f"{v:.0f}", ha="center", va="bottom", fontsize=FONT.NOTE)
     ax.set_xticks(x)
     ax.set_xticklabels(BACKENDS)
     ax.set_ylabel(ylabel)
@@ -79,9 +76,9 @@ handles, labels = ax1.get_legend_handles_labels()
 fig.legend(handles, labels, loc="upper center", ncol=2,
            fontsize=FONT.TICK, frameon=False, bbox_to_anchor=(0.5, 1.04))
 fig.text(0.5, -0.02,
-         "Qwen2.5-1.5B, Galaxy S25 (6 threads).  "
-         "* NPU+F16 falls back to CPU companion (NPU dispatch is limited to "
-         "Q4_0 weight matmul).",
+         "Qwen2.5-1.5B, Galaxy S25 (6 threads).  All cells dispatch on the named "
+         "backend; F16 weights are mirrored to rpcmem for NPU dispatch.  "
+         "F16-on-NPU is memory-bound (~3.3 GB rpcmem) and hence slowest.",
          ha="center", fontsize=FONT.MICRO, color=ARGUS.MUTED)
 
 save_figure(fig, "backend_phase_matrix", source_dir=HERE)
