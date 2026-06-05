@@ -64,9 +64,23 @@ fn main() -> anyhow::Result<()> {
     use llm_rs2::shape::Shape;
     use llm_rs2::tensor::Tensor;
 
-    // ── Configuration (Qwen2.5-1.5B Q-proj) ───────────────────────────────
-    const K: usize = 1536; // input dim
-    const N: usize = 1536; // output dim (= number of rows in weight)
+    // ── Configuration (Qwen2.5-1.5B) ──────────────────────────────────────
+    // --shape <sid> CLI / HTP_MM_Q4_SHAPE env 로 shape 선택 (드라이버가 셀별 주입).
+    // 이전엔 const N=K=1536 하드코딩 → 드라이버의 --shape 를 silent ignore → 세 셀
+    // (mm_qkv/mm_ffn/mm_lmh)이 전부 N=1536 단일 측정의 복제본이 되는 버그.
+    let args: Vec<String> = std::env::args().collect();
+    let cli_shape = args
+        .windows(2)
+        .find(|w| w[0] == "--shape")
+        .map(|w| w[1].clone())
+        .or_else(|| std::env::var("HTP_MM_Q4_SHAPE").ok());
+    #[allow(non_snake_case)]
+    let (K, N): (usize, usize) = match cli_shape.as_deref() {
+        Some("mm_qkv") => (1536, 2048),
+        Some("mm_ffn") => (1536, 8960),
+        Some("mm_lmh") => (1536, 151936),
+        _ => (1536, 1536), // shape 미지정 시 기존 기본값
+    };
     const WARMUP: usize = 10;
     const MEASURE: usize = 100;
     // Q4_0 weight × F32 activation + DSP dynamic Q8_0 quant 시 본질적 손실

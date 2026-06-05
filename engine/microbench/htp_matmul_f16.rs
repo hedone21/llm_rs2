@@ -74,7 +74,16 @@ fn main() -> anyhow::Result<()> {
         ("mm_lmh", 1536, 151936, ERR_THRESHOLD_LMH),
     ];
 
-    let env_filter = std::env::var("HTP_MM_F16_SHAPES").ok();
+    // --shape <sid> CLI 우선 (드라이버가 셀별로 주입), 없으면 HTP_MM_F16_SHAPES env (하위호환).
+    // 이전엔 env-only 라 드라이버의 --shape 를 silent ignore → 한 프로세스가 다중 shape 를
+    // 순차 측정 → 드라이버의 last-`mean=` 파서가 항상 마지막(mm_lmh) 값을 모든 셀에 기록하는
+    // 라벨 버그 (full_matrix_2026_05_28 의 ours.htp F16 "7.8ms 고정" 의 원인).
+    let args: Vec<String> = std::env::args().collect();
+    let cli_shape = args
+        .windows(2)
+        .find(|w| w[0] == "--shape")
+        .map(|w| w[1].clone());
+    let env_filter = cli_shape.or_else(|| std::env::var("HTP_MM_F16_SHAPES").ok());
     let shapes: Vec<&(&str, usize, usize, f32)> = match env_filter.as_deref() {
         Some(s) => {
             let wanted: Vec<&str> = s.split(',').map(|x| x.trim()).collect();
