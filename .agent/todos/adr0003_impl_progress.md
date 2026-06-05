@@ -8,9 +8,9 @@
 > ## ▶ 재개 진입점 (compact 후 여기서 시작)
 > **설계 전부 확정·커밋됨**(M0 8c23a72a / M1 136f7cdd / 설계 5f81bace). 분기 F1~F6 + 네이밍 닫힘 (아래 "M2-B 설계 분기").
 > **M2-B ✅ 완료** (①`caeca4f2` 표면 / ②a`2676acd2` 등록 / ②b-1`fb992138` name통일 / ②b-2+3`a7fe3823` World B). sliding/streaming/h2o 3 LayerWide 정책이 `KV_CACHE_STAGES` 레지스트리→`StageBackedPolicy` 역어댑터로 **World B(plan→compact)** 전환, session.rs·build_bench_loop.rs match arm 제거(OCP). h2o_plus(per-head, ⑤)·d2o(M4)·none(match 밖)·bail 잔류. **release smoke GREEN**: release fat-LTO 빌드 OK + `cargo test --release` stage_registry 5/5(linkme gc-sections 생존) + `argus_bench eviction sliding` 정상 생성(bail 0). 무회귀: test 1225/0 + compact_parity + 신규 stage_backed_evict_parity(F32/F16/Q4_0 bit-identical).
-> **다음 = M3**(per-crate 기법): 아래 체크리스트 M3. workspace glob `crates/techniques/*` + 더미/예제 technique crate 로 "폴더만 추가 = 엔진 수정 0" 검증(ADR-0003 핵심 목표). 빌트인 일부 per-crate 이전 가능성 검토. 게이트 = build + `cargo test -p llm_rs2 --lib -- --skip backend::opencl --skip memory::opencl`(≥1225, 0 failed) + fmt(내 파일) + clippy(--workspace, --all-targets 금지) + 더미 crate 등록 확인. 이후 M4(d2o, ADR-0004 §4 Q4_0 merge 모순 개정 선결 + 동등성 선행, 미확립 시 STOP), M5(기여자 문서).
-> 재개 명령 예: "M3 진행".
-> 재개 명령 예: "M2-B②b 진행".
+> **M3 ✅ 완료**(`b23dec09` + ADR 정정): workspace glob `crates/techniques/*` + `crates/techniques/example-keep-recent`(technique-api 만 의존, KVCacheStage 구현+등록). **실증 finding**: dep 1줄만으론 부족(Rust dead-crate elision → 미참조 rlib 미링크 → 등록 누락) → **force-link 1줄(`use <crate> as _;`)** 추가 필요. 확장 비용 = 폴더 + dep 1줄 + force-link 1줄(기존 로직 수정 0, OCP 유지). ADR-0003 §4 D4·§3 정정. release smoke 6/6(cross-crate linkme fat-LTO 생존). test 1226/0.
+> **다음 = M4**(d2o KVCacheStage 재구현): plan 에 nearest+Eq.11 가중치, EMA=impl Mutex, K=StageCtx `dequant_k`. ★ **선결 STOP 게이트**: (1) ADR-0004 §4 "Q4_0 merge 비활성" vs d2o `scatter_reduce_q4`(실제 Q4 merge) 모순 → ADR 개정 또는 사용자 결정 필요. (2) 기존 D2OHandler 와 **동등성 테스트 선작성 필수** — 못 세우면 STOP+human-review 플래그. 동반: executor 의 가중-merge 경로(현 bail) 구현 + apply_merges 가중+Q4 확장 + compact_parity 가중-merge 확장. 이후 ⑤(F5 head_importance forward + h2o_plus PerHead executor), M5(기여자 문서).
+> 재개 명령 예: "M4 진행".
 
 ---
 
@@ -40,7 +40,7 @@
 - [x] **M0** 기준선(1220) + 원장 + ADR-0003·README 커밋
 - [x] **M1** `crates/technique-api/` 신설 — `EvictionPlan`(planning trait) + `Merge` + `PolicyParams` + `EvictionPolicyReg` + linkme `EVICTION_POLICIES` distributed_slice + `find_eviction`/`registered_names`. workspace member 추가, linkme 0.3 dep. **엔진 의존 0**(단방향). 테스트 2/2(dummy 등록·조회). 커밋 예정.
 - [x] **M2(=M2-B)** ✅ KVCacheStage 레지스트리 + World B 전환. ①표면(`caeca4f2`) ②a등록(`2676acd2`) ②b-1 name통일(`fb992138`) ②b-2+3 World B+match arm 제거(`a7fe3823`). sliding/streaming/h2o 레지스트리화(OCP). h2o_plus=⑤·d2o=M4·none=match밖 잔류. release smoke green(linkme fat-LTO 생존 + argus_bench 정상 생성). test 1225/0. **잔여**: compact_parity 가중merge·per-head 확장(M2(B) plan step3)은 executor 의 weighted/PerHead 경로가 현재 bail(deferred)이라 **M4(d2o)·⑤(h2o_plus) 구현 시 동반**.
-- [ ] **M3** 정책 impl을 `crates/techniques/<name>/` per-crate 이전 + linkme 등록, workspace glob `crates/techniques/*`, bin 의존(D4 1줄/기법), 더미 crate로 "폴더만 추가" 검증
+- [x] **M3** ✅ (`b23dec09`) workspace glob `crates/techniques/*` + 예제 crate `example-keep-recent`(technique-api 만 의존, KVCacheStage 구현+등록) + cross-crate 검증. **실증 finding**: dep 1줄만으론 미링크(dead-crate elision) → force-link 1줄 필요(`use <crate> as _;`). 확장비용=폴더+dep+force-link(로직 수정 0). ADR-0003 §4 정정. release smoke 6/6. test 1226/0. (빌트인 per-crate 이전은 engine EvictionPolicy 타입 결합이라 보류 — 예제 crate 로 패턴 확립으로 충분.)
 - [ ] **M4** d2o `plan_keep` 이전 + `Merge` 가중치 필드. **동등성 테스트 선작성 필수**, 못 세우면 STOP+human-review 플래그 (senior-implementer 위임 가능)
 - [ ] **M5** 기여자 문서 "기법 추가법"(hook·시그니처·등록 + 동작 예제 crate, 컴파일·등록 게이트)
 
