@@ -411,7 +411,16 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Dequantize a K vector at (pos, head) into the output buffer.
 /// Works for F32, F16, and Q4_0 dtypes.
-fn dequantize_k(cache: &KVCache, pos: usize, head: usize, head_dim: usize, out: &mut [f32]) {
+///
+/// pub(crate): `StageCtx::dequant_k`(stage_registry.rs `KVStageCtx`)가 이 정본을 위임 재사용해
+/// d2o-stage(M4-c)의 raw-K 읽기를 D2OHandler 와 bit-identical 하게 한다.
+pub(crate) fn dequantize_k(
+    cache: &KVCache,
+    pos: usize,
+    head: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
     match cache.k_buffer.dtype() {
         DType::F32 => {
             let k = cache.k_buffer.as_slice::<f32>();

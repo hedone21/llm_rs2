@@ -130,8 +130,10 @@ impl StageCtx for KVStageCtx<'_> {
     fn has_head_scores(&self) -> bool {
         false // ②b 미plumb
     }
-    fn dequant_k(&self, _pos: usize, _head: usize, _out: &mut [f32]) {
-        // raw-K 읽기 = d2o(M4) 에서 채움. ②b LayerWide 정책 미사용.
+    fn dequant_k(&self, pos: usize, head: usize, out: &mut [f32]) {
+        // (M4-c) d2o cosine-nearest 용 raw-K 읽기. d2o_handler 의 dequantize_k 정본 위임 →
+        // D2OHandler 와 bit-identical(F32/F16/Q4). out.len()==head_dim 계약.
+        crate::pressure::d2o_handler::dequantize_k(self.cache, pos, head, out.len(), out);
     }
 }
 
@@ -471,6 +473,29 @@ mod tests {
                 .unwrap();
             assert_eq!(a.current_pos, b.current_pos, "h2o[{dt:?}] current_pos");
             assert_eq!(region(&a), region(&b), "h2o[{dt:?}] valid-region byte");
+        }
+    }
+
+    #[test]
+    fn kvstagectx_dequant_k_reads_f32() {
+        // (M4-c) KVStageCtx.dequant_k 가 d2o_handler::dequantize_k 위임으로 raw K(F32)를 읽는다.
+        let mut c = mk(DType::F32, 8);
+        let off = c.offset(5, 0);
+        {
+            let k = c.k_buffer.as_mut_slice::<f32>();
+            for d in 0..PHD {
+                k[off + d] = (d as f32) * 0.5 + 1.0;
+            }
+        }
+        let ctx = KVStageCtx {
+            cache: &c,
+            target_len: 0,
+            importance: None,
+        };
+        let mut out = vec![0.0f32; PHD];
+        ctx.dequant_k(5, 0, &mut out);
+        for d in 0..PHD {
+            assert_eq!(out[d], (d as f32) * 0.5 + 1.0, "dequant_k F32 d={d}");
         }
     }
 }
