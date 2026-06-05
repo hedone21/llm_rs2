@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_name_delegates_to_policy() {
         let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.5);
-        assert_eq!(handler.name(), "sliding_window");
+        assert_eq!(handler.name(), "sliding");
 
         let handler = EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.5);
         assert_eq!(handler.name(), "h2o");

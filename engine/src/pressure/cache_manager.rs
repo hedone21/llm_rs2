@@ -759,7 +759,7 @@ mod tests {
             0.75,
         );
         // Legacy mode wraps policy in EvictionHandler at Warning level
-        assert!(cm.policy_name().contains("sliding_window"));
+        assert!(cm.policy_name().contains("sliding"));
     }
 
     /// Mock monitor that always returns an error
@@ -1160,7 +1160,7 @@ mod tests {
         );
 
         let name = cm.policy_name();
-        assert!(name.contains("sliding_window"));
+        assert!(name.contains("sliding"));
         assert!(name.contains("Warning"));
         assert!(name.contains("Critical"));
     }

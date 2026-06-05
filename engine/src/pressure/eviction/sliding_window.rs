@@ -88,7 +88,7 @@ impl EvictionPolicy for SlidingWindowPolicy {
     }
 
     fn name(&self) -> &str {
-        "sliding_window"
+        "sliding"
     }
 
     /// (3c-evict) keep-list. `evict()` 의 보존 영역 `[0..prefix) ∪ [prefix+prune_count..current)`
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn test_name() {
         let policy = SlidingWindowPolicy::new(10, 0);
-        assert_eq!(policy.name(), "sliding_window");
+        assert_eq!(policy.name(), "sliding");
     }
 
     #[test]
