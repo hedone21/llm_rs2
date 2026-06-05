@@ -20,6 +20,7 @@ use technique_api::{
 };
 
 use super::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy, StreamingLLMPolicy};
+use crate::pressure::d2o_handler::{D2OConfig, D2OStage};
 use crate::pressure::kv_cache::KVCache;
 
 /// 기존 [`EvictionPolicy`](in-place `evict*` + `plan_keep`)를 plan-returning [`KVCacheStage`] 로 노출.
@@ -74,7 +75,9 @@ fn uniform_to_weighted(m: crate::format::Merge) -> WeightedMerge {
 /// 엔진 독점). `StandardFormat::compact` 의 빈-merge 경로와 동일: `compact_keep_positions(keep, 0)` +
 /// `set_current_pos(keep.len())`. compact_parity 가 이 경로 ≡ in-place `evict*` 를 4정책×3dtype 에서
 /// 증명하므로, plan keep 이 `plan_keep` keep 과 같으면(②a 어댑터 faithful) 버퍼 bit-identical 무회귀.
-fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result<()> {
+///
+/// pub(crate): M4-c d2o 동등성 테스트가 D2OStage plan 을 실행해 D2OHandler 와 비교하는 데 쓴다.
+pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result<()> {
     match &plan.keep {
         KeepSpec::LayerWide(keep) => {
             if !plan.merges.is_empty() {
@@ -99,10 +102,25 @@ fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result<()> {
 /// ②b 는 LayerWide 정책(sliding/streaming/h2o)만 구동하므로 `current_pos`/`target_len`/`importance`
 /// 만 실질 사용된다. per-head(`head_score`/`has_head_scores`)·raw-K(`dequant_k`)·`layer_idx` 는
 /// head_importance forward(F5/⑤)·d2o(M4)에서 채운다 — 현재는 미plumb 안전 기본값.
-struct KVStageCtx<'a> {
+pub(crate) struct KVStageCtx<'a> {
     cache: &'a KVCache,
     target_len: usize,
     importance: Option<&'a [f32]>,
+}
+
+impl<'a> KVStageCtx<'a> {
+    /// 엔진 eviction 경로(+ M4-c d2o 동등성 테스트)가 `&KVCache` 위로 ctx 를 만든다.
+    pub(crate) fn new(
+        cache: &'a KVCache,
+        target_len: usize,
+        importance: Option<&'a [f32]>,
+    ) -> Self {
+        Self {
+            cache,
+            target_len,
+            importance,
+        }
+    }
 }
 
 impl StageCtx for KVStageCtx<'_> {
@@ -160,11 +178,7 @@ impl StageBackedPolicy {
         importance: Option<&[f32]>,
     ) -> Result<()> {
         let plan = {
-            let ctx = KVStageCtx {
-                cache: &*cache,
-                target_len,
-                importance,
-            };
+            let ctx = KVStageCtx::new(cache, target_len, importance);
             self.stage.plan(&ctx)
         };
         if let Some(plan) = plan {
@@ -242,6 +256,23 @@ static H2O_STAGE: KVCacheStageReg = KVCacheStageReg {
             p.keep_ratio,
             p.protected_prefix,
         ))))
+    },
+};
+
+/// d2o(M4-c) — `D2OStage`(plan-returning, 가중 merge + EMA). non-alloc 기본 D2OConfig: StageParams
+/// 에 d2o 전용 필드(ema_beta/merge_e/use_layer_allocation)가 없어 protected_prefix/keep_ratio 만 매핑
+/// 하고 나머지는 D2OConfig::default()(non-alloc, ema_beta=0.7, merge_e=0.1). **production d2o 는
+/// 여전히 if-branch(session.rs:604·build_bench_loop.rs:72)=D2OHandler 가 처리**(layer-alloc 지원 +
+/// 비권장 정책) — 본 등록은 proven-equivalent(non-alloc) available 표면.
+#[distributed_slice(KV_CACHE_STAGES)]
+static D2O_STAGE: KVCacheStageReg = KVCacheStageReg {
+    name: "d2o",
+    make: |p: StageParams| {
+        Box::new(D2OStage::new(D2OConfig {
+            protected_prefix: p.protected_prefix,
+            keep_ratio: p.keep_ratio,
+            ..D2OConfig::default()
+        }))
     },
 };
 

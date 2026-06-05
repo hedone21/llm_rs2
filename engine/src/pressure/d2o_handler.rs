@@ -18,6 +18,7 @@ use crate::quant::{BlockQ4_0, QK4_0};
 use anyhow::Result;
 use half::f16;
 use std::sync::Mutex;
+use technique_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, WeightedMerge};
 
 // ── Configuration ────────────────────────────────────────────────
 
@@ -405,6 +406,86 @@ impl CachePressureHandler for D2OHandler {
 
     fn name(&self) -> &str {
         "d2o"
+    }
+}
+
+// ── D2OStage: d2o 를 ADR-0004 KVCacheStage(plan-returning) 표면으로 노출 (M4-c) ──────
+
+/// d2o 를 [`KVCacheStage`] 로 재구현한 표면. `plan(ctx)` 가 [`compute_d2o_plan`](D2OHandler 와
+/// 공유)으로 retain_all keep + 가중 [`WeightedMerge`](Eq.11)를 산출하고, EMA τ 는 impl `Mutex`
+/// 가 보유한다(ADR-0004 D4). 버퍼 변형은 엔진 executor(`apply_weighted_merges`+compact)가 실행.
+///
+/// **동등성**: 동일 config·cache·call 시퀀스(공유 EMA)에서 `D2OHandler::evict_and_merge` 와
+/// bit-identical — `compute_d2o_plan` 공유 + `apply_weighted_merges`≡`scatter_reduce`(M4-b 증명).
+/// 단 **non-layer-alloc config 한정**(StageBackedPolicy/run_policy_eviction 경로는 per-cache uniform
+/// target 만 주므로 layer-alloc/protected-layer 는 미지원 — production d2o 는 if-branch=D2OHandler
+/// 유지, M4-c 구조적 결정). raw K 는 `ctx.dequant_k`(= `dequantize_k` 위임)로 읽는다.
+pub struct D2OStage {
+    config: D2OConfig,
+    state: Mutex<D2OState>,
+}
+
+impl D2OStage {
+    /// 주어진 config 로 생성. EMA 상태는 호출 간 누적(impl Mutex).
+    pub fn new(config: D2OConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(D2OState::new()),
+        }
+    }
+}
+
+impl KVCacheStage for D2OStage {
+    fn name(&self) -> &str {
+        "d2o"
+    }
+
+    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+        let kv_heads = ctx.n_kv_heads();
+        let head_dim = ctx.head_dim();
+        let importance = ctx.importance().unwrap_or(&[]);
+        let mut state = self.state.lock().unwrap();
+
+        // D2OHandler::evict_and_merge 와 공유하는 계획 계산 — K 는 ctx.dequant_k reader.
+        // merge_enabled=true: ctx 가 dequant 가능한 CPU-accessible 경로(non-alloc). compute_d2o_plan
+        // None → no-op → plan None.
+        let (retain_all, passing, matches) = compute_d2o_plan(
+            &|p, h, o| ctx.dequant_k(p, h, o),
+            &self.config,
+            &mut state,
+            ctx.current_pos(),
+            ctx.target_len(),
+            importance,
+            kv_heads,
+            head_dim,
+            true,
+        )?;
+
+        // passing+matches → group 별 Eq.11 가중 WeightedMerge (scatter_reduce 내부 grouping 과 동일).
+        let merges: Vec<WeightedMerge> = if passing.is_empty() {
+            Vec::new()
+        } else {
+            group_by_retain(&passing, &matches)
+                .iter()
+                .map(|(retain, evicted_list)| {
+                    let (w_c, w_e) = compute_eq11_weights(evicted_list, self.config.merge_e);
+                    WeightedMerge {
+                        into: *retain,
+                        into_weight: w_c,
+                        from: evicted_list
+                            .iter()
+                            .zip(w_e.iter())
+                            .map(|(&(ep, _), &w)| (ep, w))
+                            .collect(),
+                    }
+                })
+                .collect()
+        };
+
+        Some(KVCachePlan {
+            keep: KeepSpec::LayerWide(retain_all),
+            merges,
+        })
     }
 }
 
@@ -1816,6 +1897,181 @@ mod tests {
             let mut src = [0.0f32; QK4_0];
             src.copy_from_slice(&values[start..start + QK4_0]);
             v[block_off + bi] = BlockQ4_0::quantize(&src);
+        }
+    }
+
+    // ── M4-c: D2OStage(plan→executor) ≡ D2OHandler(evict_and_merge) — non-alloc config ──
+    // compute_d2o_plan 공유 + apply_weighted_merges≡scatter_reduce(M4-b) → buffer bit-identical.
+    // 같은 stage/state 인스턴스로 layer 루프를 돌아 EMA τ 누적 순서까지 일치시킨다.
+
+    fn mk_d2o_config() -> D2OConfig {
+        D2OConfig {
+            keep_ratio: 0.5,
+            protected_prefix: 4,
+            target_ratio: 0.5,
+            ema_beta: 0.7,
+            merge_e: 0.1,
+            use_layer_allocation: false,
+            protected_layers: vec![],
+        }
+    }
+
+    /// A = D2OHandler.evict_and_merge per layer(공유 state_a). B = D2OStage.plan→execute_kv_plan
+    /// per layer(공유 stage = 공유 EMA). 동일 target/importance/merge_enabled=true.
+    fn run_d2o_parity(
+        caches_a: &mut [KVCache],
+        caches_b: &mut [KVCache],
+        target: usize,
+        imp: &[f32],
+    ) {
+        use crate::pressure::eviction::stage_registry::{KVStageCtx, execute_kv_plan};
+        let handler = D2OHandler::new(mk_d2o_config());
+        let mut state_a = D2OState::new();
+        for ca in caches_a.iter_mut() {
+            handler
+                .evict_and_merge(ca, target, imp, &mut state_a, true)
+                .unwrap();
+        }
+        let stage = D2OStage::new(mk_d2o_config());
+        for cb in caches_b.iter_mut() {
+            let plan = {
+                let ctx = KVStageCtx::new(cb, target, Some(imp));
+                stage.plan(&ctx)
+            };
+            if let Some(p) = plan {
+                execute_kv_plan(cb, &p).unwrap();
+            }
+        }
+    }
+
+    fn vbytes(c: &KVCache, bytes_per_pos: usize) -> (Vec<u8>, Vec<u8>) {
+        let nb = c.current_pos * bytes_per_pos;
+        unsafe {
+            (
+                std::slice::from_raw_parts(c.k_buffer.as_mut_ptr() as *const u8, nb).to_vec(),
+                std::slice::from_raw_parts(c.v_buffer.as_mut_ptr() as *const u8, nb).to_vec(),
+            )
+        }
+    }
+
+    #[test]
+    fn d2o_stage_eq_handler_f32() {
+        let (kvh, hd, ms, pos, nl, tgt) = (2usize, 8usize, 64usize, 40usize, 3usize, 20usize);
+        let imp: Vec<f32> = (0..pos).map(|i| (pos - i) as f32 + 1.0).collect();
+        let build = || {
+            (0..nl)
+                .map(|_| {
+                    let mut c = make_cache(ms, kvh, hd, pos);
+                    for p in 0..pos {
+                        for h in 0..kvh {
+                            let base = ((p * kvh + h) * hd) as f32;
+                            let k: Vec<f32> =
+                                (0..hd).map(|d| (base + d as f32) * 0.05 + 0.3).collect();
+                            let v: Vec<f32> =
+                                (0..hd).map(|d| (base + d as f32) * -0.03 + 0.7).collect();
+                            write_k(&mut c, p, h, &k);
+                            write_v(&mut c, p, h, &v);
+                        }
+                    }
+                    c
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut a = build();
+        let mut b = build();
+        run_d2o_parity(&mut a, &mut b, tgt, &imp);
+        for (ca, cb) in a.iter().zip(b.iter()) {
+            assert_eq!(ca.current_pos, cb.current_pos, "f32 current_pos");
+            assert_eq!(
+                vbytes(ca, kvh * hd * 4),
+                vbytes(cb, kvh * hd * 4),
+                "f32 buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn d2o_stage_eq_handler_f16() {
+        let (kvh, hd, ms, pos, nl, tgt) = (2usize, 8usize, 64usize, 40usize, 3usize, 20usize);
+        let imp: Vec<f32> = (0..pos).map(|i| (pos - i) as f32 + 1.0).collect();
+        let build = || {
+            (0..nl)
+                .map(|_| {
+                    let backend = Arc::new(CpuBackend::new());
+                    let buf = ms * kvh * hd * 2;
+                    let k = Tensor::new(
+                        Shape::new(vec![1, ms, kvh, hd]),
+                        Arc::new(SharedBuffer::new(buf, DType::F16)),
+                        backend.clone(),
+                    );
+                    let v = Tensor::new(
+                        Shape::new(vec![1, ms, kvh, hd]),
+                        Arc::new(SharedBuffer::new(buf, DType::F16)),
+                        backend,
+                    );
+                    let mut c = KVCache::new(k, v, ms);
+                    c.current_pos = pos;
+                    for p in 0..pos {
+                        for h in 0..kvh {
+                            let off = c.offset(p, h);
+                            let base = ((p * kvh + h) * hd) as f32;
+                            let kb = c.k_buffer.as_mut_slice::<f16>();
+                            for d in 0..hd {
+                                kb[off + d] = f16::from_f32((base + d as f32) * 0.05 + 0.3);
+                            }
+                            let vb = c.v_buffer.as_mut_slice::<f16>();
+                            for d in 0..hd {
+                                vb[off + d] = f16::from_f32((base + d as f32) * -0.03 + 0.7);
+                            }
+                        }
+                    }
+                    c
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut a = build();
+        let mut b = build();
+        run_d2o_parity(&mut a, &mut b, tgt, &imp);
+        for (ca, cb) in a.iter().zip(b.iter()) {
+            assert_eq!(ca.current_pos, cb.current_pos, "f16 current_pos");
+            assert_eq!(
+                vbytes(ca, kvh * hd * 2),
+                vbytes(cb, kvh * hd * 2),
+                "f16 buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn d2o_stage_eq_handler_q4() {
+        let (kvh, hd, ms, pos, nl, tgt) = (2usize, QK4_0, 64usize, 40usize, 3usize, 20usize);
+        let imp: Vec<f32> = (0..pos).map(|i| (pos - i) as f32 + 1.0).collect();
+        let build = || {
+            (0..nl)
+                .map(|_| {
+                    let mut c = make_cache_q4(ms, kvh, hd, pos);
+                    for p in 0..pos {
+                        for h in 0..kvh {
+                            let base = ((p * kvh + h) * hd) as f32;
+                            let k: Vec<f32> =
+                                (0..hd).map(|d| (base + d as f32) * 0.05 + 0.3).collect();
+                            let v: Vec<f32> =
+                                (0..hd).map(|d| (base + d as f32) * -0.03 + 0.7).collect();
+                            write_k_q4(&mut c, p, h, &k);
+                            write_v_q4(&mut c, p, h, &v);
+                        }
+                    }
+                    c
+                })
+                .collect::<Vec<_>>()
+        };
+        let bpp = (kvh * hd / QK4_0) * std::mem::size_of::<BlockQ4_0>();
+        let mut a = build();
+        let mut b = build();
+        run_d2o_parity(&mut a, &mut b, tgt, &imp);
+        for (ca, cb) in a.iter().zip(b.iter()) {
+            assert_eq!(ca.current_pos, cb.current_pos, "q4 current_pos");
+            assert_eq!(vbytes(ca, bpp), vbytes(cb, bpp), "q4 buffer");
         }
     }
 
