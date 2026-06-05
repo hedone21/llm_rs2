@@ -31,7 +31,7 @@
 ## 마일스톤 체크리스트
 
 - [x] **M0** 기준선(1220) + 원장 + ADR-0003·README 커밋
-- [ ] **M1** `crates/technique-api/` — `EvictionPolicy` 등록 표면(linkme `EVICTION_POLICIES` distributed_slice + 공유 trait re-export), workspace member, linkme dep
+- [x] **M1** `crates/technique-api/` 신설 — `EvictionPlan`(planning trait) + `Merge` + `PolicyParams` + `EvictionPolicyReg` + linkme `EVICTION_POLICIES` distributed_slice + `find_eviction`/`registered_names`. workspace member 추가, linkme 0.3 dep. **엔진 의존 0**(단방향). 테스트 2/2(dummy 등록·조회). 커밋 예정.
 - [ ] **M2** `PipelineRegistry` → 슬라이스 읽어 name→factory 맵 → `session/chat/session.rs:621` match arm 제거 + startup self-test(sliding/streaming/h2o/h2o_plus/d2o 등록 단언) + release smoke
 - [ ] **M3** 정책 impl을 `crates/techniques/<name>/` per-crate 이전 + linkme 등록, workspace glob `crates/techniques/*`, bin 의존(D4 1줄/기법), 더미 crate로 "폴더만 추가" 검증
 - [ ] **M4** d2o `plan_keep` 이전 + `Merge` 가중치 필드. **동등성 테스트 선작성 필수**, 못 세우면 STOP+human-review 플래그 (senior-implementer 위임 가능)
@@ -44,4 +44,10 @@ M1·M2·M3·M5 커밋 + 전체 `/sanity-check` green + release self-test 통과 
 
 ## Iteration 로그
 
-- **iter-1 (M0, 2026-06-05)**: repo 상태 확인(HEAD d331d01b, 7 worktree). baseline 측정 — GPU flaky/SIGABRT 발견 → 게이트를 "GPU skip + skip밖 실패 0"으로 정의. baseline=1220 passed/0 failed. 원장 작성. ADR-0003+README+원장 커밋 예정. → 다음 iter: M1.
+- **iter-1 (M0, 2026-06-05)**: repo 상태 확인(HEAD d331d01b, 7 worktree). baseline 측정 — GPU flaky/SIGABRT 발견 → 게이트를 "GPU skip + skip밖 실패 0"으로 정의. baseline=1220 passed/0 failed. 원장 작성. ADR-0003+README+원장 커밋(8c23a72a). → 다음 iter: M1.
+- **iter-2 (M1, 2026-06-05)**: 사용자 체크인("중간된거야?")으로 M0↔M1 경계 일시정지 후 재개. **설계 발견**: `plan_keep`(planning 표면)이 이미 코드에 스캐폴딩(Sliding/H2O/Streaming/NoEviction 구현, unwired). 단 **H2O+(per-head)는 `None` 반환, D2O는 EvictionPolicy 아님** → ADR-0003 §D2 "h2o+/d2o 덮음"은 낙관적. **M3 fork**(아래 미해결)로 등록. M1 = technique-api crate(planning trait `EvictionPlan`, 엔진 의존 0). 게이트: technique-api 2/2, clippy workspace clean, 엔진 1220/0 무회귀. `cargo fmt --all`이 무관한 htp_fastrpc.rs(기존 fmt drift) 122줄 건드려 revert(외과적 변경). → 다음 iter: M2.
+
+## 미해결 fork (M3에서 STOP+보고)
+
+- **H2O+/D2O 패키징**: planning 표면(`plan_keep` 단일 keep-list)은 Sliding/H2O/Streaming/NoEviction만 덮는다. H2O+(per-head, `plan_keep`→None)와 D2O(가중 merge, EvictionPolicy 아님)는 안 덮임. M3에서 결정 필요 — (가) 더 풍부한 plan(per-head keep-lists + 가중 merge)으로 표면 확장, (나) H2O+/D2O는 technique crate화 보류하고 엔진에 잔류, (다) D2O는 M4(가중 Merge)로, H2O+는 별도. ADR-0003 §D2 갱신 동반.
+- **htp_fastrpc.rs fmt drift** (mention-only): HEAD에서 이미 unformatted. M1 무관이라 미수정 — 별도 `style:` 커밋 대상.

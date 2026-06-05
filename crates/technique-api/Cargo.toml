@@ -1,0 +1,10 @@
+[package]
+name = "technique-api"
+version = "0.1.0"
+edition = "2024"
+description = "ADR-0003 확장 표면 — stage 축 기법(eviction)이 엔진 코어 수정 없이 linkme 로 자기를 등록하는 가산 등록 API."
+
+[dependencies]
+# 정적 링크 자동 등록 — 링커 섹션 기반(생성자 0, panic=abort/Android 안전).
+# fat-LTO --gc-sections silent drop 리스크는 engine 측 startup self-test 로 게이트(ADR-0003 §4).
+linkme = "0.3"
