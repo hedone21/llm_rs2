@@ -73,8 +73,7 @@ pub struct WeightedMerge {
 
 - `LayerWide` + 빈 merges → `compact_keep_positions`(keep 만 앞으로 당김).
 - `LayerWide` + merges → `apply_weighted_merges`(가중 in-place 병합, F32/F16/Q4_0) → `compact`.
-- `PerHead` → head 별 `compact_keep_positions_for_head`.
-- `PerHead` + merges(per-head + 가중 융합) → **현재 미지원**(`bail!`, promotion-trigger).
+- `PerHead`(merge 유무 무관) → **현재 executor 미배선 → `bail!`**(단계 ⑤ deferred). `KVCache::compact_keep_positions_for_head` primitive 는 존재하나 `execute_kv_plan`(stage_registry.rs)이 아직 호출하지 않는다. h2o+ per-head 활성화는 head_importance session forward(F5)와 함께 ⑤에서 배선된다. → **신규 기법은 `KeepSpec::PerHead` 를 반환하면 현재 런타임 `bail!` 된다**(LayerWide 만 실행 가능).
 
 `new_pos` 는 plan 에 싣지 않는다 — 엔진이 `keep.len()` 으로 도출한다.
 
