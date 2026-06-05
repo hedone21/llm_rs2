@@ -81,6 +81,7 @@ pub mod h2o_plus;
 pub mod method;
 pub mod no_eviction;
 pub mod sliding_window;
+pub mod stage_registry;
 pub mod streaming_llm;
 
 #[cfg(test)]

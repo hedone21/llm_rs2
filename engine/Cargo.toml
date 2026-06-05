@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 llm_shared = { path = "../shared" }
+# 확장 기법 등록 표면 (ADR-0003/0004): stage 축 KVCacheStage 레지스트리 + linkme 자동 등록.
+technique-api = { path = "../crates/technique-api" }
+linkme = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
