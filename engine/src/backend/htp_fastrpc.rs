@@ -20,6 +20,7 @@ pub mod buffer;
 pub mod error;
 pub mod host;
 pub mod idl;
+pub mod memory;
 
 pub use buffer::RpcmemBuffer;
 pub use error::{

@@ -273,7 +273,8 @@ pub struct Args {
     #[arg(short, long, default_value_t = 20)]
     pub num_tokens: usize,
 
-    /// Backend to use: "cpu", "opencl", or "cuda" (build with --features cuda).
+    /// Backend to use: "cpu", "opencl", "cuda" (build with --features cuda), or
+    /// "htp" (build with --features htp_fastrpc, Android only).
     /// Default: Android target → "opencl" (Adreno production path), else → "cpu".
     #[cfg(target_os = "android")]
     #[arg(short, long, default_value = "opencl")]

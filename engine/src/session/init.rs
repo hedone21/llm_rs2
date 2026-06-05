@@ -248,6 +248,25 @@ impl SessionInitCtx {
                     CapabilityRegistry::new(),
                 )
             }
+            #[cfg(feature = "htp_fastrpc")]
+            "htp" => {
+                // HTP FastRPC primary. cpu arm 과 동일 골격 (secondary 없음,
+                // is_gpu=false, 빈 caps). 전 op cpu_companion passthrough MVP
+                // (Phase 1) — NPU dispatch wire-up 은 S4.
+                let htp_concrete = Arc::new(crate::backend::htp_fastrpc::HtpFastrpcBackend::new(
+                    "llm_rs2_htp",
+                )?);
+                // backend 와 동일 host Arc 를 share 하여 FFI symbol lifetime 보장.
+                let htp_mem: Arc<dyn Memory> =
+                    Arc::new(crate::backend::htp_fastrpc::memory::HtpFastrpcMemory::new(
+                        htp_concrete.host().clone(),
+                    ));
+                let htp = htp_concrete as Arc<dyn Backend>;
+                eprintln!(
+                    "[Backend] HTP FastRPC primary (CPU companion passthrough; NPU dispatch는 S4)"
+                );
+                (htp, htp_mem, None, None, false, CapabilityRegistry::new())
+            }
             #[cfg(feature = "opencl")]
             "opencl" | "gpu" => {
                 // ENG-RPCMEM-042 / INV-RPCMEM-006 — Sprint 2a Phase 2:
@@ -399,7 +418,7 @@ impl SessionInitCtx {
                 )
             }
             _ => anyhow::bail!(
-                "Unknown backend: {}. Use cpu, opencl, or cuda.",
+                "Unknown backend: {}. Use cpu, opencl, or cuda (htp requires --features htp_fastrpc).",
                 args.backend
             ),
         };
