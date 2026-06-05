@@ -33,8 +33,14 @@ q4-on-Adreno 커널과 q4-on-CPU 커널은 물리적으로 다른 코드라, (fo
 decode 루프가 도는 동안 매 단계(phase)마다 끼어들어 *메모리 상주 데이터*(kvcache·weight)를 수정·삭제·로드하는 cross-cutting 동작. 대부분의 Stage 는 표현(format)·위치(hardware)를 안 바꾸고 데이터의 존재·양만 조절한다 (eviction·merge·weight swap). 실행 순서는 통합자 책임, 안전(crash-free)은 프레임워크 책임.
 _Avoid_: Handler, hook — 같은 개념의 현 코드 구현 명칭일 뿐, 도메인 용어로는 Stage. (단 코드의 `PipelineStage` *메커니즘* 명칭과 *축* 명칭 "stage"는 층위가 다르다 — → Flagged ambiguities.)
 
-**EvictionPolicy** (eviction Stage 내부 규칙):
-eviction Stage 가 *어느 토큰을 버릴지* 고를 때 참조하는 규칙. Stage 자체가 아니라 한 Stage(eviction)가 감싸 실행하는 부품이며, 모든 Stage 가 갖는 건 아니다 (weight swap Stage 엔 없음). 예: `Sliding`(최근 N), `H2O`(heavy hitter + 최근), `D2O`(버릴 토큰을 병합).
+**KVCacheStage** (stage 축 trait, ADR-0004):
+KV 캐시의 상주 토큰을 *어떻게 조절할지* 결정하는 stage-축 동작의 추상화 trait. 캐시 상태 + scores 를 보고 **`KVCachePlan`**(보존 `keep` + 가중 `merge`)을 산출하며, 버퍼 변형은 엔진이 그 plan 을 실행해 수행한다(plan-returning — 결정은 plugin, 실행은 엔진). **`KVCacheFormat` 의 형제** — `KVCacheFormat`=저장 *표현*(precision/layout) ⊥ `KVCacheStage`=상주 *토큰 조절* (format ⊥ stage 축). 멤버: `Sliding`/`H2O`/`Streaming`(layer-wide keep), `H2O+`(per-head keep), `D2O`(가중 merge). 새 stage = 별도 technique crate + 등록 1줄(엔진 코어 0 edit, ADR-0003).
+
+**KVCachePlan** (KVCacheStage 산출물):
+한 stage 가 산출하는 *이 KV 캐시가 어떤 상태가 되어야 하는가*의 명세. `keep`(보존 토큰 — layer-wide 또는 per-head) + `merge`(가중 병합 지시)로 구성. 엔진이 `compact` 로 실행한다. "eviction"이 아니라 keep+merge 를 포괄하므로 KVCache 스코프 이름.
+
+**EvictionPolicy** (legacy, KVCacheStage 로 흡수 중):
+구 in-place eviction trait — `evict(&mut KVCache)` 로 *직접* 버퍼를 고친다. evict 전용이라 merge(D2O)·per-head(H2O+)를 못 담는다. plan-returning `KVCacheStage` 로 일반화·대체 진행 중 (마이그레이션 중 공존). 그 내부의 "어느 토큰을 버릴지" 규칙 개념은 `KVCacheStage::plan` 결정으로 흡수.
 
 ### format — 연산 표현
 
@@ -82,7 +88,7 @@ Stage 가 자신이 조절할 데이터(format)를 보유하는 참조의 정적
 ## Flagged ambiguities
 
 - **Layer 는 transformer layer 전용**: "Layer"(`LlamaLayer`/`TransformerLayer`, 16개 디코더 블록, `LayerSlot`·`layer_idx` 등)는 *모델 구조*만 가리킨다. KV·weight 의 *표현*은 절대 "Layer"라 부르지 않고 **format**(`KVCacheFormat`/`WeightFormat`)이라 부른다.
-- **stage 축 vs `PipelineStage` 메커니즘**: "stage"(축)은 메모리 상주 데이터를 조절하는 *개념 차원*이고, 코드의 `PipelineStage`/`CachePressureHandler`는 decode 루프 hook *메커니즘*이다. 한 `PipelineStage` 가 한 축(eviction→stage) 또는 여러 축(KIVI→stage+format 합성)을 건드릴 수 있다. 같은 단어지만 층위가 다르다.
+- **stage 축 vs `PipelineStage` 메커니즘 vs `KVCacheStage` trait**: "stage"(축)은 메모리 상주 데이터를 조절하는 *개념 차원*이고, 코드의 `PipelineStage`/`CachePressureHandler`는 decode 루프 hook *메커니즘*이며, **`KVCacheStage`(ADR-0004)는 그 stage 축 동작을 plugin 이 구현하는 정식 trait**(plan-returning)이다. 셋은 층위가 다르다. **세션 `EvictionStage`/`SwapStage`(`session/traits.rs`)는 deprecated** — WHEN-hook 을 plugin 으로 두려던 dormant 추상이었으나, WHEN(decode 루프 통합)은 엔진 소유로, WHAT(보존/병합 결정)은 `KVCacheStage` 로 분리되며 폐기.
 - **format 은 표현(precision+layout 융합)**: 구 "precision 은 Format 안 파라미터 / Standard·KIVI 는 별개 바이트 레이아웃"은 폐기. q4/f16/KIVI 는 각각 format 축의 한 좌표다.
 - **device 는 이제 축이다 (구 "바탕" 폐기)**: 2026-05-30 "device 는 축이 아니라 바탕" 결정을 2026-05-31 grill 에서 뒤집음. precision(format)과 backend(hardware)가 분리 가능함을 코드로 확인(단일 backend 가 6 precision, q4 가 3 backend) → hardware 는 정식 축. switch = hardware 축 동작, partition = format × hardware 곱. (M×N 커널 행렬은 Backend 인터페이스 아래 격리되므로 축 가산성은 유지.)
 - **Eviction 은 stage 이고 KIVI 는 format(+stage 합성)이다**: eviction 은 토큰을 버리는 *상주 데이터 조절*이라 **stage**. KIVI 양자화는 바이트 표현을 바꾸는 *format* 이자 그 변환 동작이 *상주 데이터를 수정*하므로 stage 와의 **합성**이다.
