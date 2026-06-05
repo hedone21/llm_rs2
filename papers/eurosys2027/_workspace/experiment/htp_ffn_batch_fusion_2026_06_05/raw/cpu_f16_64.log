@@ -1,0 +1,27 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/Qwen2.5-1.5B-Instruct-f16.gguf
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 339 tensors, arch=Qwen2, weight_dtype=F16
+[Backend] Migrated 339 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b-gguf/tokenizer.json
+Prompt: The capital of France is
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+[Resilience] Manager unreachable (Unknown transport 'dbus' (use dbus / unix:<path> / tcp:<addr>)), running without resilience.
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=64)
+The capital of France is Paris. The capital of Italy is Rome. What's the capital city of Spain?
+A: Madrid
+B: Barcelona
+C: Seville
+
+To determine the correct answer, we need to identify which city in Spain serves as its national capital.
+
+1. **Identify the capitals mentioned in other countries**:
+  
+TTFT: 95.37 ms
+Decode: 64.26 ms/tok (15.6 tok/s) [63 tokens]
+Avg TBT: 64.75 ms (15.4 tokens/sec)
+[Phase4-4.5] generated=64 (first=12095 + run=63) stopped_by=BudgetExhausted final_pos=68

@@ -1,0 +1,33 @@
+{
+  "device": "Galaxy S25 (R3CY408S5SB)",
+  "model_base": "Qwen2.5-1.5B-Instruct",
+  "backend": "htp (FastRPC, libggml-htp-v79.so)",
+  "threads": 6,
+  "decode_tokens": 64,
+  "n": 3,
+  "prompt": "The capital of France is",
+  "ab_toggle": "LLMRS_DISABLE_HTP_FFN_BATCH=1 (OFF) vs unset (ON)",
+  "fusion": "matmul_ffn_gate_up_silu override: gate/up enqueue x2 -> drain x1 (FastRPC dispatch floor 2->1 per layer, 28 layers)",
+  "q4": {
+    "off": {"runs": [83.82, 83.18, 82.09], "median": 83.18},
+    "on":  {"runs": [81.30, 78.85, 78.88], "median": 78.88},
+    "cpu_decode": 33.08,
+    "delta_ms": 4.30,
+    "delta_pct": 5.2,
+    "non_overlapping": true
+  },
+  "f16": {
+    "off": {"runs": [113.33, 113.13, 113.51], "median": 113.33},
+    "on":  {"runs": [110.30, 110.19, 110.10], "median": 110.19},
+    "cpu_decode": 64.26,
+    "delta_ms": 3.14,
+    "delta_pct": 2.8,
+    "non_overlapping": true
+  },
+  "correctness": {
+    "q4_16tok": "batch ON == CPU == batch OFF : 16/16 identical (first=12095, '...Paris. It has a population of about 2 million people and covers an area')",
+    "f16_16tok": "batch ON == batch OFF : 16/16 identical (first=12095, '...Paris. The capital of Italy is Rome. What's the capital city of Spain')",
+    "batch_path_confirmed": "[htp] gate/up batch dispatch 활성 log count: ON=1, OFF=0 (env toggle + 경로 실행 확증)"
+  },
+  "narrative": "Floor recovery, not a CPU-beating speedup: HTP ON (q4 78.9 / f16 110.2) still > CPU (q4 33.1 / f16 64.3). fusion removes one FastRPC dispatch floor (~3-4 ms/tok across 28 layers); absolute saving ~constant across dtype (op-count-based, not size-based)."
+}
