@@ -57,6 +57,7 @@ fn main() -> anyhow::Result<()> {
     use std::time::Instant;
 
     use llm_rs2::backend::Backend;
+    use llm_rs2::backend::htp_fastrpc::repack::repack_q4_0_to_q4x4x2_matrix;
     use llm_rs2::buffer::{Buffer, DType};
     use llm_rs2::memory::host::shared::SharedBuffer;
     use llm_rs2::quant::BlockQ4_0;
@@ -226,100 +227,11 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── q4x4x2 repack (llama.cpp HTP backend layout, ggml-hexagon.cpp:402) ────
+// ── q4x4x2 repack ─────────────────────────────────────────────────────────
 //
-// llama.cpp HTP backend 는 standard `block_q4_0` (32 elem × 18 B) 를 **q4x4x2
-// layout** 으로 repack 후 DSP 에 전달. DSP-side `vec_dot_q4x4x2_q8x4x2_*`
-// (matmul-ops.c:734+) 가 이 layout 을 expect.
-//
-// q4x4x2 group = 8 인접 Q4_0 block (256 elem, 144 B):
-//   - 128 B quants (각 elem 4-bit pair-packed, group 내 256 elem)
-//   - 16 B scales (8 × f16)
-//
-// 본 함수는 row-major weight matrix `W[N, K]` 의 standard Q4_0 byte stream
-// 을 q4x4x2-packed byte stream 으로 변환. K 는 256 multiple 가정 (Qwen2.5
-// shape K∈{1536, 8960} 모두 manage).
-
-#[cfg(feature = "htp_fastrpc")]
-fn repack_q4_0_to_q4x4x2_matrix(
-    src: &[llm_rs2::quant::BlockQ4_0],
-    n_rows: usize,
-    k: usize,
-) -> Vec<u8> {
-    const QK_Q4_0X4X2: usize = 256; // llama.cpp htp-msg.h: QK_Q4_0x4x2
-    const QK4_0: usize = 32;
-    assert!(
-        k.is_multiple_of(QK_Q4_0X4X2),
-        "K must be QK_Q4_0x4x2 multiple"
-    );
-    let blocks_per_row = k / QK4_0; // 18 B/block in standard layout
-    let row_bytes = blocks_per_row * 18; // = (k/32)*18 = k * 9 / 16
-    let mut out = vec![0u8; n_rows * row_bytes];
-    for r in 0..n_rows {
-        let src_row = &src[r * blocks_per_row..(r + 1) * blocks_per_row];
-        let dst_row = &mut out[r * row_bytes..(r + 1) * row_bytes];
-        repack_row_q4x4x2(dst_row, src_row, k);
-    }
-    out
-}
-
-#[cfg(feature = "htp_fastrpc")]
-fn repack_row_q4x4x2(y: &mut [u8], x: &[llm_rs2::quant::BlockQ4_0], k: usize) {
-    use half::f16;
-    const QK_Q4_0X4X2: usize = 256;
-    const QK4_0: usize = 32;
-    let nb = k.div_ceil(QK_Q4_0X4X2); // number of q4x4x2 groups
-
-    let dblk_size = 8 * 2; // 8 × f16 = 16 B
-    let qblk_size = QK_Q4_0X4X2 / 2; // 128 B (4-bit per elem, 256 elem)
-    let qrow_size = k / 2; // K/2 B (int4 not padded to blocks)
-
-    // y_q at offset 0 (quants), y_d at offset qrow_size (scales).
-    // SAFETY: caller 가 y 가 충분히 큼 (row_bytes = qrow_size + nb*dblk_size)을 보장.
-    //
-    // standard block_q4_0 (`{d: f16, qs: [u8; 16]}`) 의 qs 는 nibble pair-pack
-    // 된 32 elem. nibble unpack 시 lower nibble = elem [0..16], upper nibble =
-    // elem [16..32].
-
-    // Repack quants
-    for i in 0..nb {
-        // unpacked 256 elem buffer for this group (8 blocks)
-        let mut qs_unpacked = [0u8; QK_Q4_0X4X2];
-        for bi in 0..8 {
-            let block_idx = i * 8 + bi;
-            if block_idx >= x.len() {
-                break;
-            }
-            let blk = &x[block_idx];
-            // unpack_q4_0_quants (ggml-hexagon.cpp:381)
-            for j in 0..(QK4_0 / 2) {
-                let x0 = blk.qs[j] & 0x0F;
-                let x1 = blk.qs[j] >> 4;
-                qs_unpacked[bi * QK4_0 + j] = x0;
-                qs_unpacked[bi * QK4_0 + j + QK4_0 / 2] = x1;
-            }
-        }
-        // repack: `q[j] = (qs[j+128] << 4) | qs[j]` for j in [0..128)
-        let q_off = i * qblk_size;
-        for j in 0..(QK_Q4_0X4X2 / 2) {
-            y[q_off + j] = (qs_unpacked[j + 128] << 4) | qs_unpacked[j];
-        }
-    }
-
-    // Repack scales (8 × f16 per group)
-    for i in 0..nb {
-        let d_off = qrow_size + i * dblk_size;
-        for bi in 0..8 {
-            let block_idx = i * 8 + bi;
-            if block_idx >= x.len() {
-                break;
-            }
-            let d_bits: u16 = f16::to_bits(x[block_idx].d);
-            y[d_off + bi * 2] = (d_bits & 0xFF) as u8;
-            y[d_off + bi * 2 + 1] = ((d_bits >> 8) & 0xFF) as u8;
-        }
-    }
-}
+// `repack_q4_0_to_q4x4x2_matrix` 는 lib 모듈
+// `llm_rs2::backend::htp_fastrpc::repack` 로 승격됨 (de-dup). main 에서
+// import 후 사용.
 
 // ── Timing helpers (feature gated) ────────────────────────────────────────
 

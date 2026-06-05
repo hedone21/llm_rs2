@@ -21,6 +21,7 @@ pub mod error;
 pub mod host;
 pub mod idl;
 pub mod memory;
+pub mod repack;
 
 pub use buffer::RpcmemBuffer;
 pub use error::{
@@ -205,6 +206,164 @@ impl HtpFastrpcBackend {
         let _ = bufs.as_ptr() as *const c_void;
         Ok(())
     }
+
+    /// S4 — Q4_0 weight × F32 activation GEMV NPU dispatch (M==1).
+    ///
+    /// caller (`matmul_transposed`) 가 (a) `htp_matmul_dispatchable` 게이트
+    /// 통과, (b) a/b/out 전부 RpcmemBuffer-backed 확인 후 진입. weight `b` 는
+    /// `copy_weight_from` 에서 이미 q4x4x2 layout 으로 repack 되어 있다고 가정.
+    ///
+    /// microbench `run_htp` 의 dispatch body 와 동일 (ne/nb 계산 + init_matmul_req
+    /// + n_bufs=3 dspqueue_write → dspqueue_read → status 확인). timing/prof
+    /// 진단 없이 정확성 path 만.
+    #[cfg(target_os = "android")]
+    fn matmul_transposed_via_htp(
+        &self,
+        a_rpc: &RpcmemBuffer,
+        b_rpc: &RpcmemBuffer,
+        out_rpc: &RpcmemBuffer,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        // ── Build packet ───────────────────────────────────────────────────
+        //
+        // ggml convention for Q4_0 weight `W[N, K]` (row-major):
+        //   ne = (K, N, 1, 1)
+        //   nb[0] = sizeof(block_q4_0) = 18
+        //   nb[1] = (K/32) * 18         — row stride
+        //   nb[2..3] = N * nb[1]        — plane/file stride
+        let blocks_per_row = (k / 32) as u32;
+        let row_bytes_w = blocks_per_row * 18;
+        let plane_bytes_w = (n as u32) * row_bytes_w;
+        let ne_w = [k as u32, n as u32, 1, 1];
+        let nb_w = [18u32, row_bytes_w, plane_bytes_w, plane_bytes_w];
+
+        // input F32 vector x[K] — ne0=K
+        let ne_x = [k as u32, 1, 1, 1];
+        let nb_x = [4u32, (k * 4) as u32, (k * 4) as u32, (k * 4) as u32];
+
+        // output F32 vector y[N] — ne0=N
+        let ne_y = [n as u32, 1, 1, 1];
+        let nb_y = [4u32, (n * 4) as u32, (n * 4) as u32, (n * 4) as u32];
+
+        let mut req = HtpGeneralReq::zeroed();
+        let src0 = htp_tensor_from_shape(HTP_TYPE_Q4_0, ne_w, nb_w);
+        let src1 = htp_tensor_from_shape(HTP_TYPE_F32, ne_x, nb_x);
+        let dst = htp_tensor_from_shape(HTP_TYPE_F32, ne_y, nb_y);
+        // skip_quantize=false: DSP-side 가 input 을 dynamic 양자화 (Q8_0).
+        init_matmul_req(&mut req, src0, src1, dst, false);
+
+        // bufs ordering MUST match init_binary_req<true>:
+        //   [0] weight (Constant), [1] input (CpuWriteDspRead), [2] output (DspWriteCpuRead)
+        let bytes_w = b_rpc.size() as u32;
+        let bytes_x = a_rpc.size() as u32;
+        let bytes_y = out_rpc.size() as u32;
+        let mut bufs: [DspQueueBuffer; 3] = [
+            b_rpc.dsp_buf(DspqBufferType::Constant, 0, bytes_w)?,
+            a_rpc.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, bytes_x)?,
+            out_rpc.dsp_buf(DspqBufferType::DspWriteCpuRead, 0, bytes_y)?,
+        ];
+
+        // dspqueue_write (host → DSP).
+        // SAFETY: queue valid (host 보유 + drop 시 close), bufs/req live.
+        let rc = unsafe {
+            (self.host.dspqueue_write)(
+                self.host.queue,
+                0, // flags
+                3, // num_buffers (weight + input + output)
+                bufs.as_mut_ptr(),
+                core::mem::size_of::<HtpGeneralReq>() as u32,
+                &req as *const _ as *const u8,
+                DSPQUEUE_TIMEOUT,
+            )
+        };
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc).context("dspqueue_write"));
+        }
+
+        // dspqueue_read (DSP → host, blocking).
+        let mut rsp = HtpGeneralRsp::zeroed();
+        let mut rsp_buf_count: u32 = 0;
+        let mut rsp_bufs: [DspQueueBuffer; 4] = [DspQueueBuffer::zeroed(); 4];
+        let mut rsp_msg_len: u32 = 0;
+        let mut rsp_flags: u32 = 0;
+        // SAFETY: 같은 queue, out-pointer 들 유효.
+        let rc = unsafe {
+            (self.host.dspqueue_read)(
+                self.host.queue,
+                &mut rsp_flags as *mut u32,
+                4, // max_buffers
+                &mut rsp_buf_count as *mut u32,
+                rsp_bufs.as_mut_ptr(),
+                core::mem::size_of::<HtpGeneralRsp>() as u32,
+                &mut rsp_msg_len as *mut u32,
+                &mut rsp as *mut _ as *mut u8,
+                DSPQUEUE_TIMEOUT,
+            )
+        };
+        if rc != AEE_SUCCESS {
+            return Err(map_aee_err(rc).context("dspqueue_read"));
+        }
+        // HTP_STATUS_OK = 1 (llama.cpp htp-msg.h:24). 0 은 uninitialized.
+        if rsp.status != HTP_STATUS_OK {
+            return Err(map_htp_status(rsp.status).context("DSP matmul status"));
+        }
+        let _ = (rsp_buf_count, rsp_msg_len, rsp_flags);
+        Ok(())
+    }
+}
+
+/// HTP NPU dispatch 가능 여부 (dtype/shape gating). buffer backing 확인은 별도.
+///
+/// `Some((n, k))` 이면 weight `b` 는 `[n, k]` Q4_0 (K%256==0), activation `a`
+/// 는 F32 K-vector (M==1 decode GEMV), output 은 F32 N-vector. prefill (M>1)
+/// 또는 비-Q4_0 weight / K misalign 은 `None` (cpu fallback).
+///
+/// host(non-android) 에서도 컴파일/테스트 가능 (cfg 게이트 없음). 단 non-android
+/// 에서는 유일한 비-test 호출처(`matmul_transposed` 의 android 블록)가 cfg-out
+/// 되어 dead — `htp_dispatch_log_once` 와 동일하게 allow.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn htp_matmul_dispatchable(a: &Tensor, b: &Tensor, out: &Tensor) -> Option<(usize, usize)> {
+    let bd = b.shape().dims();
+    if bd.len() != 2 {
+        return None;
+    }
+    let (n, k) = (bd[0], bd[1]);
+    if b.dtype() != DType::Q4_0 || a.dtype() != DType::F32 || out.dtype() != DType::F32 {
+        return None;
+    }
+    if !k.is_multiple_of(256) {
+        return None;
+    }
+    if a.numel() != k {
+        return None; // M==1 (decode GEMV) 만; prefill M>1 → None
+    }
+    if out.numel() != n {
+        return None;
+    }
+    Some((n, k))
+}
+
+/// 첫 1회 dispatch / fallback 분기를 eprintln 으로 노출 ("no silent caps").
+/// NPU 가 실제 도는지 / silent cpu fallback 인지 device 에서 확인용. dispatch
+/// 와 fallback 각각 `Once` 로 첫 발생만 출력.
+///
+/// host(non-android) 빌드에서는 `matmul_transposed` 의 android 블록이 cfg-out
+/// 되어 호출처가 없으므로 dead_code allow.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn htp_dispatch_log_once(dispatched: bool, reason: &str) {
+    use std::sync::Once;
+    static DISPATCH_ONCE: Once = Once::new();
+    static FALLBACK_ONCE: Once = Once::new();
+    if dispatched {
+        DISPATCH_ONCE.call_once(|| {
+            eprintln!("[htp] matmul_transposed: NPU dispatch 활성 (M==1 Q4_0 q4x4x2)");
+        });
+    } else {
+        FALLBACK_ONCE.call_once(|| {
+            eprintln!("[htp] matmul_transposed: cpu fallback — {reason}");
+        });
+    }
 }
 
 impl Backend for HtpFastrpcBackend {
@@ -233,7 +392,31 @@ impl Backend for HtpFastrpcBackend {
         self.cpu_companion.matmul(a, b, out)
     }
 
+    /// S4 — decode weight matmul (`a @ bᵀ → out`). b = Q4_0 weight,
+    /// a = F32 activation (M==1 GEMV). RpcmemBuffer-backed 인 경우 NPU dispatch,
+    /// 그 외 cpu_companion fallback ("no silent caps" — 첫 1회 분기 로그).
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            if let Some((n, k)) = htp_matmul_dispatchable(a, b, out) {
+                let a_rpc = a.buffer().as_any().downcast_ref::<RpcmemBuffer>();
+                let b_rpc = b.buffer().as_any().downcast_ref::<RpcmemBuffer>();
+                let out_rpc = out.buffer().as_any().downcast_ref::<RpcmemBuffer>();
+                if let (Some(a_rpc), Some(b_rpc), Some(out_rpc)) = (a_rpc, b_rpc, out_rpc) {
+                    htp_dispatch_log_once(true, "");
+                    return self.matmul_transposed_via_htp(a_rpc, b_rpc, out_rpc, n, k);
+                }
+                htp_dispatch_log_once(
+                    false,
+                    "weight/act/out 중 rpcmem 아님 (SharedBuffer) → cpu fallback",
+                );
+            } else {
+                htp_dispatch_log_once(
+                    false,
+                    "dtype/shape 게이트 미충족 (M>1 또는 비-Q4_0 또는 K%256!=0)",
+                );
+            }
+        }
         self.cpu_companion.matmul_transposed(a, b, out)
     }
 
@@ -298,6 +481,62 @@ impl Backend for HtpFastrpcBackend {
         // PoC: weight upload path 는 cpu_companion 의 copy_from 사용
         // (SharedBuffer 기반). 진짜 rpcmem alloc + memcpy 는 β 단계 작업.
         self.cpu_companion.copy_from(t)
+    }
+
+    /// S5 — weight 를 rpcmem (DMA-BUF heap) 으로 전면 할당. Q4_0 2D weight
+    /// (K%256==0) 은 q4x4x2 layout 으로 repack (DSP-side
+    /// `vec_dot_q4x4x2_q8x4x2_*` 가 expect). F32/F16 은 as-is rpcmem copy.
+    /// 그 외 dtype 은 cpu_companion (SharedBuffer) fallback — DSP 미경유.
+    ///
+    /// 본 override 가 없으면 weight 가 SharedBuffer 에 상주 → `matmul_transposed`
+    /// 의 RpcmemBuffer downcast 가 영원히 실패 → silent cpu fallback (NPU 미경유).
+    ///
+    /// host(non-android) 에서 `RpcmemBuffer::alloc` 은 runtime Err 이나 컴파일은
+    /// OK — 이 경로는 android 에서만 reachable (host 는 `HtpFastrpcBackend::new`
+    /// 자체가 Err 라 backend 가 생성되지 않음).
+    fn copy_weight_from(&self, t: &Tensor) -> Result<Tensor> {
+        let dims = t.shape().dims();
+        match t.dtype() {
+            // Q4_0 2D weight (K%256==0): rpcmem alloc + q4x4x2 repack.
+            DType::Q4_0 if dims.len() == 2 && dims[1].is_multiple_of(256) => {
+                let (n, k) = (dims[0], dims[1]);
+                let blocks = t.as_slice::<crate::quant::BlockQ4_0>();
+                let repacked = repack::repack_q4_0_to_q4x4x2_matrix(blocks, n, k);
+                let mut buf = RpcmemBuffer::alloc(self.host.clone(), repacked.len(), DType::Q4_0)?;
+                // SAFETY: buf.as_mut_ptr() 은 직전 alloc 으로 valid, repacked.len()
+                // byte allocated (alloc size 는 page-align ≥ repacked.len()).
+                // 두 영역 non-overlapping (별도 alloc).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        repacked.as_ptr(),
+                        buf.as_mut_ptr(),
+                        repacked.len(),
+                    );
+                }
+                Ok(Tensor::new(
+                    t.shape().clone(),
+                    Arc::new(buf),
+                    self.cpu_companion.clone(),
+                ))
+            }
+            // F32/F16 weight: rpcmem copy as-is (no repack).
+            DType::F32 | DType::F16 => {
+                let bytes = t.as_slice::<u8>();
+                let mut buf = RpcmemBuffer::alloc(self.host.clone(), t.size(), t.dtype())?;
+                // SAFETY: bytes.len() == t.size() (as_slice::<u8> = size()/1).
+                // buf 은 t.size() byte allocated. non-overlapping (별도 alloc).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), t.size());
+                }
+                Ok(Tensor::new(
+                    t.shape().clone(),
+                    Arc::new(buf),
+                    self.cpu_companion.clone(),
+                ))
+            }
+            // Q8_0/Q4_1/BF16/기타: cpu_companion fallback (SharedBuffer, 정확).
+            _ => self.cpu_companion.copy_weight_from(t),
+        }
     }
 
     // ── attention/gather/flash 등 default-bodied trait method 는 trait
@@ -484,5 +723,77 @@ mod tests {
         requires_backend(cpu.as_ref());
         // singleton 이 valid name 을 반환 (non-android 도 동작).
         assert!(!cpu.name().is_empty());
+    }
+
+    // ── S4 guard predicate (htp_matmul_dispatchable) ──────────────────────
+    //
+    // host-컴파일 가능 — RpcmemBuffer backing 확인은 별도, dtype/shape gating
+    // 만 검증. SharedBuffer 로 Tensor 를 합성해 dtype/shape 조합 케이스 커버.
+
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+
+    fn mk_tensor(dims: Vec<usize>, dtype: DType, byte_len: usize) -> Tensor {
+        let buf = SharedBuffer::new(byte_len, dtype);
+        let cpu = crate::backend::cpu::cpu_singleton();
+        Tensor::new(Shape::new(dims), Arc::new(buf), cpu)
+    }
+
+    #[test]
+    fn dispatchable_q4_0_m1_k256_some() {
+        // weight [N=4, K=256] Q4_0, act F32 K=256 (M==1), out F32 N=4.
+        let k = 256;
+        let n = 4;
+        let blocks_per_row = k / 32; // 8
+        let w_bytes = n * blocks_per_row * 18;
+        let b = mk_tensor(vec![n, k], DType::Q4_0, w_bytes);
+        let a = mk_tensor(vec![1, k], DType::F32, k * 4);
+        let out = mk_tensor(vec![1, n], DType::F32, n * 4);
+        assert_eq!(htp_matmul_dispatchable(&a, &b, &out), Some((n, k)));
+    }
+
+    #[test]
+    fn dispatchable_f16_weight_none() {
+        // F16 weight → None (Q4_0 만 dispatch).
+        let k = 256;
+        let n = 4;
+        let b = mk_tensor(vec![n, k], DType::F16, n * k * 2);
+        let a = mk_tensor(vec![1, k], DType::F32, k * 4);
+        let out = mk_tensor(vec![1, n], DType::F32, n * 4);
+        assert_eq!(htp_matmul_dispatchable(&a, &b, &out), None);
+    }
+
+    #[test]
+    fn dispatchable_prefill_m2_none() {
+        // M==2 (prefill) → a.numel() != k → None.
+        let k = 256;
+        let n = 4;
+        let blocks_per_row = k / 32;
+        let w_bytes = n * blocks_per_row * 18;
+        let b = mk_tensor(vec![n, k], DType::Q4_0, w_bytes);
+        // act [2, K] → numel = 2*K != K.
+        let a = mk_tensor(vec![2, k], DType::F32, 2 * k * 4);
+        let out = mk_tensor(vec![2, n], DType::F32, 2 * n * 4);
+        assert_eq!(htp_matmul_dispatchable(&a, &b, &out), None);
+    }
+
+    #[test]
+    fn dispatchable_k_misaligned_none() {
+        // K=255 (not 256 multiple) → None. (Q4_0 block=32 정렬 무시하고 게이트만 확인)
+        let k = 255;
+        let n = 4;
+        let b = mk_tensor(vec![n, k], DType::Q4_0, n * 8 * 18);
+        let a = mk_tensor(vec![1, k], DType::F32, k * 4);
+        let out = mk_tensor(vec![1, n], DType::F32, n * 4);
+        assert_eq!(htp_matmul_dispatchable(&a, &b, &out), None);
+    }
+
+    #[test]
+    fn dispatchable_b_not_2d_none() {
+        // weight 가 1D → None (bd.len() != 2).
+        let b = mk_tensor(vec![256], DType::Q4_0, 8 * 18);
+        let a = mk_tensor(vec![1, 256], DType::F32, 256 * 4);
+        let out = mk_tensor(vec![1, 1], DType::F32, 4);
+        assert_eq!(htp_matmul_dispatchable(&a, &b, &out), None);
     }
 }
