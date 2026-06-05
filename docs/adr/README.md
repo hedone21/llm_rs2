@@ -33,3 +33,5 @@ ADR 는 다음 결정 유형에서 작성 의무:
 | ID | 제목 | Status | Date |
 |---|---|---|---|
 | [ADR-0001](0001-kv-dispatch-paradigm.md) | KV Cache Dispatch Paradigm — Generic Monomorphization → Trait Object Transition | Accepted | 2026-05-28 |
+| [ADR-0002](0002-pressure-scalar-lossy-unification.md) | Pressure 스칼라 — lossy 단일화 (graded 입력 융합 ⊥ mode 출력 분리) | Accepted | 2026-06-02 |
+| [ADR-0003](0003-extension-mechanism-static-crates.md) | 확장 메커니즘 — 정적 링크 technique crate + 자동 등록, 런타임 `.so` 보류 | Accepted | 2026-06-05 |
