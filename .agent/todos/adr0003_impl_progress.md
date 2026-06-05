@@ -1,9 +1,14 @@
 # ADR-0003 구현 진행 원장 (/loop dynamic)
 
-**대상**: `docs/adr/0003-extension-mechanism-static-crates.md` 구현 완수
-**SSOT**: ADR-0003 + `arch/pipeline_stage_design_v2.md`
-**시작 HEAD**: `d331d01b feat(htp): S4+S5 …` (master)
+**대상**: ADR-0003 + **ADR-0004** 구현 완수
+**SSOT**: ADR-0003(확장 메커니즘) + **ADR-0004(KVCacheStage trait 설계)** + `arch/pipeline_stage_design_v2.md`
+**시작 HEAD**: `d331d01b` / 현 HEAD: `5f81bace docs(adr): ADR-0004 …`
 **진입**: `/loop` dynamic 모드, 완료 시 자가 종료
+
+> ## ▶ 재개 진입점 (compact 후 여기서 시작)
+> **설계 전부 확정·커밋됨**(M0 8c23a72a / M1 136f7cdd / 설계 5f81bace). 분기 F1~F6 + 네이밍 닫힘 (아래 "M2-B 설계 분기").
+> **다음 = 구현**: 아래 "## M2(B) 구현 plan" 1→5 순서. 게이트 = `cargo test -p llm_rs2 --lib -- --skip backend::opencl --skip memory::opencl` (≥1220 passed, 0 failed) + build + fmt(내 파일) + clippy(--workspace, --all-targets 금지). compact_parity·d2o 동등성 미확립 시 STOP+보고.
+> 재개 명령 예: `/loop`(동일 프롬프트, 단 마일스톤을 "M2-B 구현 plan"으로 해석) 또는 "M2-B 구현 진행".
 
 ---
 
