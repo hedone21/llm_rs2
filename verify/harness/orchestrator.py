@@ -81,6 +81,16 @@ def _remote_binary_path(device_cfg: Dict[str, Any], name: str) -> str:
     return f"{work_dir}/{name}"
 
 
+def _engine_env() -> Dict[str, str]:
+    """argus-bench AB-1: 엔진 실행 환경. `[CacheEvent] Eviction completed` 등
+    eviction effect 로그는 `log::info!` 이므로 RUST_LOG=info 를 주입해야 stderr 에
+    찍힌다(legacy 도 plain env_logger::init() — 외부 RUST_LOG 의존). manager 의
+    RUST_LOG=info 정책과 동일. 호출자가 명시한 RUST_LOG 는 존중(setdefault)."""
+    env = dict(os.environ)
+    env.setdefault("RUST_LOG", "info")
+    return env
+
+
 def _resolve_backend(cfg_backend: str, device_cfg: Dict[str, Any]) -> str:
     if cfg_backend != "auto":
         return cfg_backend
@@ -361,7 +371,11 @@ def _run_scenario_local(
     )
     t0 = time.monotonic()
     rc_b, timed_b = run_foreground(
-        baseline_cmd, baseline_stdout, baseline_stderr, timeout_s=600.0
+        baseline_cmd,
+        baseline_stdout,
+        baseline_stderr,
+        env=_engine_env(),
+        timeout_s=600.0,
     )
     baseline_wall = time.monotonic() - t0
     timings["baseline_wall_s"] = baseline_wall
@@ -437,7 +451,11 @@ def _run_scenario_local(
         time.sleep(0.5)
 
         rc_a, timed_a = run_foreground(
-            action_cmd, action_stdout, action_stderr, timeout_s=action_timeout
+            action_cmd,
+            action_stdout,
+            action_stderr,
+            env=_engine_env(),
+            timeout_s=action_timeout,
         )
         mock_proc.wait(timeout=10.0)
 

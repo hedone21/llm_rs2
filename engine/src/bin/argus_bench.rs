@@ -20,7 +20,6 @@ use clap::Parser;
 use llm_rs2::session::bin_setup::build_inference_ctx;
 use llm_rs2::session::cli::{Args, KvMode};
 use llm_rs2::session::experiment_run::run_experiment_path;
-use llm_rs2::session::is_standard_happy_path;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -34,16 +33,16 @@ fn main() -> anyhow::Result<()> {
 
     reject_unsupported_modes_ab0(&args)?;
 
-    // AB-0 은 standard happy path + resilience runtime effect 만 지원한다.
-    // throttle/target_tbt/suspend 는 CLI flag 가 아니라 런타임 directive 이므로
-    // 이 가드를 통과한다 (eviction/swap/partition CLI flag 만 차단).
-    if !is_standard_happy_path(&args) {
+    // AB-1: standard happy path + resilience runtime effect + CLI `eviction
+    // <policy>` (mid-decode KvEvict* directive). throttle/target_tbt/suspend/
+    // eviction 은 런타임 directive 이므로 가드를 통과한다. 미지원 모드(skip /
+    // d2o-layer-alloc / qcf / profile / partition / swap)만 차단.
+    if !bench_supported(&args) {
         bail!(
-            "argus-bench AB-0: this combination of args is not yet supported. \
-             AB-0 requires: qcf_dump=none, skip_ratio=0, d2o_layer_alloc=off, \
-             profile=off, profile_events=off, eviction_policy=none, tensor_partition=0, \
-             swap_intra_forward=off, swap_layer_immediate=off, swap_phase_aware=off. \
-             (eviction/swap/partition CLI modes land in AB-1..AB-6.)"
+            "argus-bench AB-1: this combination of args is not yet supported. \
+             supported: eviction <none|sliding|streaming|h2o|h2o_plus> + resilience. \
+             blocked: qcf_dump, skip_ratio, d2o_layer_alloc, profile, profile_events, \
+             tensor_partition, weight-swap (→ AB-2..AB-6)."
         );
     }
     if args.num_tokens < 1 {
@@ -52,6 +51,22 @@ fn main() -> anyhow::Result<()> {
 
     let ctx = build_inference_ctx(args)?;
     run_experiment_path(ctx)
+}
+
+/// AB-1 bench 지원 args 가드. [`is_standard_happy_path`](llm_rs2::session::is_standard_happy_path)
+/// 와 동일하되 **eviction_policy != "none" 을 허용**한다 (resilience eviction은
+/// `build_bench_loop` 가 처리). 아직 미지원인 skip / d2o-layer-alloc / qcf /
+/// profile / tensor_partition / weight-swap 은 그대로 차단.
+fn bench_supported(args: &Args) -> bool {
+    args.qcf_dump.is_none()
+        && args.skip_ratio.unwrap_or(0.0) == 0.0
+        && !args.d2o_layer_alloc()
+        && !args.profile
+        && !args.profile_events
+        && args.tensor_partition == 0.0
+        && !args.swap_intra_forward
+        && !args.swap_layer_immediate
+        && !args.swap_phase_aware
 }
 
 /// AB-0 에서 미구현인 mode 진입 flag 를 검사하여 즉시 reject 한다.

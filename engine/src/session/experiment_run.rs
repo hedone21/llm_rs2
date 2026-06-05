@@ -14,7 +14,7 @@
 
 use crate::experiment::{JsonlWriter, SummaryRecord, SystemSampler, TokenRecord};
 use crate::inference::sampling;
-use crate::session::assembly::build_standard_loop;
+use crate::session::assembly::{build_bench_loop, build_resilience_cache_manager};
 use crate::session::standard_happy::StandardHappyCtx;
 use crate::session::traits::StopReason;
 
@@ -59,7 +59,11 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         .as_ref()
         .map(|_| sys_sampler.snapshot());
 
-    let mut decode_loop = build_standard_loop(
+    // AB-1: CLI `eviction <policy>` 로 resilience force-eviction CacheManager 구성
+    // (eviction=none 이면 None → happy-path 동등). plan.evict directive 가 오면
+    // decode 루프가 forward.try_evict 로 mid-decode prune.
+    let cache_manager = build_resilience_cache_manager(&args, &backend)?;
+    let mut decode_loop = build_bench_loop(
         backend.clone(),
         memory.clone(),
         cpu_backend_arc.clone(),
@@ -70,6 +74,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         sampling_config.clone(),
         !args.no_gpu_plan,
         resilience,
+        cache_manager,
     )?;
 
     let t_prefill = std::time::Instant::now();

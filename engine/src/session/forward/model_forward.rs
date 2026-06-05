@@ -472,10 +472,17 @@ impl Forward for ModelForward {
     }
 
     fn on_kv_prune(&mut self, _new_pos: usize) {
-        // Phase 4-3 wires `NoOpEvictionStage`, so this hook never fires.
-        // When `EvictionStage` learns to reach into `ModelForward::kv_caches_mut`
-        // in Phase 4-4, this default no-op is overridden to keep the KV cache
-        // `current_pos` in sync with the loop counter.
+        // argus-bench AB-1: eviction 이 KV position 을 shift 하면 보유 중인 GPU
+        // kernel plan(execute_plan 용 FullKernelPlan)이 stale offset 을 갖게 되어
+        // 다음 step 에서 silent garbage 위험. plan 을 invalidate 하여 다음 step 의
+        // lazy rebuild(또는 dyn 폴백)로 강하시킨다. CPU(host)는 plan 부재라 no-op.
+        // fmt_caches 의 inner KVCache current_pos 는 force_evict 가 직접 갱신했고
+        // (shared Arc, interior mutability) loop pos 도 new_pos 로 동기화되었으므로
+        // 별도 cache 갱신은 불필요.
+        #[cfg(feature = "opencl")]
+        {
+            self.gpu_plan = None;
+        }
     }
 
     fn reset_kv(&mut self) -> anyhow::Result<()> {

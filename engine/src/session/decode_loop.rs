@@ -39,6 +39,13 @@ pub struct DecodeLoop {
     report: Box<dyn EngineReport>,
     tick_sink: Box<dyn TokenTickSink>,
     stop_flag: Arc<AtomicBool>,
+    // argus-bench AB-1: resilience-driven eviction. `plan.evict` 가 Some 이면
+    // `forward.try_evict(cache_manager, …)` 로 mid-decode prune. None 이면
+    // happy path / chat (eviction 은 자체 turn-boundary 경로) — 무영향.
+    cache_manager: Option<crate::pressure::cache_manager::CacheManager>,
+    // 동일 sticky evict directive 가 매 poll 재적용되지 않도록 active 구간당 1회만
+    // 발동. plan.evict 가 None 으로 돌아오면(RestoreDefaults) false 로 reset.
+    evict_applied: bool,
     pos: usize,
     decode_step: usize,
     prev_token: u32,
@@ -149,6 +156,41 @@ impl DecodeLoop {
             }
             if plan.throttle_delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
+            }
+
+            // (a.5) argus-bench AB-1: resilience-driven eviction. plan.evict
+            // (EvictPlan) 가 Some 이고 active 구간 첫 발동이면 forward.try_evict 로
+            // 1회 prune (score-free force_evict — CacheManager 의 CLI 정책 사용;
+            // H2O 는 score 부재 시 recency degrade, chat 과 동일). CacheManager 가
+            // `[CacheEvent] Eviction completed` 를 emit. sticky carry 매 step
+            // 재적용 방지(target_ratio 반복 적용 시 cache 과다 축소). plan.evict 가
+            // None 으로 돌아오면(RestoreDefaults) 다음 directive 위해 reset.
+            if let Some(evict_plan) = plan.evict.as_ref() {
+                if !self.evict_applied {
+                    self.evict_applied = true;
+                    if let Some(cm) = self.cache_manager.as_ref() {
+                        let (removed, new_pos) =
+                            self.forward
+                                .try_evict(cm, None, true, evict_plan.target_ratio)?;
+                        if removed > 0 {
+                            self.pos = new_pos;
+                            self.forward.on_kv_prune(new_pos);
+                            let ctx = step_ctx(
+                                self.pos,
+                                self.prev_token,
+                                self.kv_capacity,
+                                self.decode_step,
+                                &stop,
+                            );
+                            let outcome = EvictionOutcome::Pruned { removed, new_pos };
+                            for obs in &mut self.observers {
+                                obs.on_eviction(&ctx, &outcome);
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.evict_applied = false;
             }
 
             // (b) eviction
@@ -464,6 +506,7 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     report: Option<Box<dyn EngineReport>>,
     tick_sink: Option<Box<dyn TokenTickSink>>,
     stop_flag: Option<Arc<AtomicBool>>,
+    cache_manager: Option<crate::pressure::cache_manager::CacheManager>,
     kv_capacity: usize,
 }
 
@@ -486,6 +529,7 @@ impl DecodeLoopBuilder<NoForward> {
             report: None,
             tick_sink: None,
             stop_flag: None,
+            cache_manager: None,
             kv_capacity: 0,
         }
     }
@@ -502,6 +546,7 @@ impl DecodeLoopBuilder<NoForward> {
             report: self.report,
             tick_sink: self.tick_sink,
             stop_flag: self.stop_flag,
+            cache_manager: self.cache_manager,
             kv_capacity: self.kv_capacity,
         }
     }
@@ -535,6 +580,12 @@ impl<F> DecodeLoopBuilder<F> {
     }
     pub fn with_kv_capacity(mut self, c: usize) -> Self {
         self.kv_capacity = c;
+        self
+    }
+    /// argus-bench AB-1: resilience-driven eviction 용 [`CacheManager`] 주입.
+    /// 미주입(None) 이면 `plan.evict` 가 와도 eviction 미발동 (happy/chat 동일).
+    pub fn with_cache_manager(mut self, cm: crate::pressure::cache_manager::CacheManager) -> Self {
+        self.cache_manager = Some(cm);
         self
     }
     pub fn with_engine_report<T: EngineReport + 'static>(mut self, r: T) -> Self {
@@ -589,6 +640,8 @@ impl DecodeLoopBuilder<HasForward> {
             stop_flag: self
                 .stop_flag
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            cache_manager: self.cache_manager,
+            evict_applied: false,
             pos: 0,
             decode_step: 0,
             prev_token: 0,
