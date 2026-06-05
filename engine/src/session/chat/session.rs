@@ -23,9 +23,8 @@ use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::d2o_handler::{D2OConfig, D2OHandler};
-use crate::pressure::eviction::h2o::H2OPolicy;
 use crate::pressure::eviction::h2o_plus::H2OPlusPolicy;
-use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
+use crate::pressure::eviction::stage_registry::StageBackedPolicy;
 use crate::pressure::kv_cache::KVCache;
 use crate::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
@@ -601,6 +600,9 @@ fn build_chat_eviction_internal(
         };
     let threshold_bytes = (args.memory_threshold_mb * 1024 * 1024) as usize;
 
+    // linkme fat-LTO 생존 self-test (ADR-0003 §4): 빌트인 stage 미등록 시 fail-fast.
+    crate::pressure::eviction::stage_registry::ensure_builtin_stages_registered()?;
+
     let cache_manager = if args.eviction_policy == "d2o" {
         let d2o_handler = D2OHandler::new(D2OConfig {
             keep_ratio: args.d2o_keep_ratio,
@@ -621,32 +623,40 @@ fn build_chat_eviction_internal(
             .eviction_policy
             .as_str()
         {
-            "sliding" => Box::new(SlidingWindowPolicy::new(
-                args.eviction_window,
+            // h2o_plus(per-head)는 KVCacheStage plan 표면으로 표현 불가(plan_keep→None) + head_score
+            // source(F5) 미완 → 단계 ⑤ 까지 레거시 직생성 잔류(ADR-0004 §4·M2-B② 스윕).
+            "h2o_plus" => Box::new(H2OPlusPolicy::new(
+                args.h2o_keep_ratio,
                 actual_protected_prefix,
             )),
-            "streaming" => {
-                let window = if args.streaming_window > 0 {
+            // sliding/streaming/h2o → KVCacheStage 레지스트리(OCP: closed match arm 제거).
+            // 새 LayerWide 기법 추가 = crate 등록만, 본 사이트 무수정. 레지스트리 miss = unknown
+            // 정책(기존 bail 메시지 보존). World B(plan→compact, compact_parity 게이트).
+            name => {
+                let reg = technique_api::find_stage(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o",
+                        name
+                    )
+                })?;
+                // streaming window 유도는 StageParams 5필드 밖이라 caller(여기)에서 해소해 baked.
+                // 비-streaming 정책의 make 는 이 필드를 무시한다.
+                let streaming_window = if args.streaming_window > 0 {
                     args.streaming_window
                 } else if args.kv_budget > 0 {
                     args.kv_budget.saturating_sub(args.sink_size)
                 } else {
                     args.eviction_window
                 };
-                Box::new(crate::pressure::eviction::StreamingLLMPolicy::new(
-                    args.sink_size,
-                    window,
-                ))
+                let params = technique_api::StageParams {
+                    eviction_window: args.eviction_window,
+                    protected_prefix: actual_protected_prefix,
+                    keep_ratio: args.h2o_keep_ratio,
+                    sink_size: args.sink_size,
+                    streaming_window,
+                };
+                Box::new(StageBackedPolicy::new((reg.make)(params)))
             }
-            "h2o" => Box::new(H2OPolicy::new(args.h2o_keep_ratio, actual_protected_prefix)),
-            "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                args.h2o_keep_ratio,
-                actual_protected_prefix,
-            )),
-            other => anyhow::bail!(
-                "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o",
-                other
-            ),
         };
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     };

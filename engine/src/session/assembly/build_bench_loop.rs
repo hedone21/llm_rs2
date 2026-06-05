@@ -20,11 +20,10 @@ use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::d2o_handler::{D2OConfig, D2OHandler};
-use crate::pressure::eviction::h2o::H2OPolicy;
+use crate::pressure::eviction::EvictionPolicy;
 use crate::pressure::eviction::h2o_plus::H2OPlusPolicy;
 use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
-use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
-use crate::pressure::eviction::{EvictionPolicy, StreamingLLMPolicy};
+use crate::pressure::eviction::stage_registry::StageBackedPolicy;
 use crate::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::cli::Args;
@@ -69,6 +68,9 @@ pub fn build_resilience_cache_manager(
     let threshold_bytes = args.memory_threshold_mb() * 1024 * 1024;
     let target_ratio = args.eviction_target_ratio();
 
+    // linkme fat-LTO 생존 self-test (ADR-0003 §4): 빌트인 stage 미등록 시 fail-fast.
+    crate::pressure::eviction::stage_registry::ensure_builtin_stages_registered()?;
+
     let mut cm = if policy_name == "d2o" {
         let d2o_handler = D2OHandler::new(D2OConfig {
             keep_ratio: target_ratio,
@@ -88,32 +90,36 @@ pub fn build_resilience_cache_manager(
         let policy: Box<dyn EvictionPolicy> = match policy_name {
             // eviction=none + swap-dir 전용(AB-3): eviction 은 안 하고 offload 만.
             "none" => Box::new(NoEvictionPolicy::new()),
-            "sliding" => Box::new(SlidingWindowPolicy::new(
-                args.eviction_window(),
+            // h2o_plus(per-head, plan_keep→None) → 레거시 직생성 잔류(단계 ⑤, ADR-0004).
+            "h2o_plus" => Box::new(H2OPlusPolicy::new(
+                args.h2o_keep_ratio(),
                 actual_protected_prefix,
             )),
-            "streaming" => {
-                let window = if args.streaming_window() > 0 {
+            // sliding/streaming/h2o → KVCacheStage 레지스트리(OCP). chat 경로(session.rs)와 동일
+            // factory. 레지스트리 miss = unknown(기존 bail 메시지 보존). World B(compact_parity 게이트).
+            name => {
+                let reg = technique_api::find_stage(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus.",
+                        name
+                    )
+                })?;
+                let streaming_window = if args.streaming_window() > 0 {
                     args.streaming_window()
                 } else if args.kv_budget() > 0 {
                     args.kv_budget().saturating_sub(args.sink_size())
                 } else {
                     args.eviction_window()
                 };
-                Box::new(StreamingLLMPolicy::new(args.sink_size(), window))
+                let params = technique_api::StageParams {
+                    eviction_window: args.eviction_window(),
+                    protected_prefix: actual_protected_prefix,
+                    keep_ratio: args.h2o_keep_ratio(),
+                    sink_size: args.sink_size(),
+                    streaming_window,
+                };
+                Box::new(StageBackedPolicy::new((reg.make)(params)))
             }
-            "h2o" => Box::new(H2OPolicy::new(
-                args.h2o_keep_ratio(),
-                actual_protected_prefix,
-            )),
-            "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                args.h2o_keep_ratio(),
-                actual_protected_prefix,
-            )),
-            other => anyhow::bail!(
-                "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus.",
-                other
-            ),
         };
         CacheManager::new(policy, monitor, threshold_bytes, target_ratio)
     };
