@@ -376,10 +376,13 @@ impl CommandExecutor {
                 self.target_tbt_ms = *target_ms;
                 self.target_tbt_set = true;
                 if *target_ms > 0 {
+                    // DecodeLoop::run 의 pacing 발동을 알리는 transition 로그.
+                    eprintln!("[Resilience] SetTargetTbt: pacing to {}ms", target_ms);
                     if !self.active_actions.contains(&"target_tbt".to_string()) {
                         self.active_actions.push("target_tbt".to_string());
                     }
                 } else {
+                    eprintln!("[Resilience] SetTargetTbt: released (-> 0ms)");
                     self.active_actions.retain(|a| a != "target_tbt");
                 }
                 CommandResult::Ok

@@ -1,5 +1,6 @@
 pub mod assembly;
 pub mod batch;
+pub mod bin_setup;
 pub mod chat;
 pub mod chat_ipc;
 pub mod chat_template;
@@ -8,6 +9,7 @@ pub mod decode_loop;
 pub mod defaults;
 pub mod dump_importance;
 pub mod eval;
+pub mod experiment_run;
 pub mod forward;
 pub mod init;
 pub mod ppl;
@@ -21,11 +23,13 @@ pub mod traits;
 pub mod warmup;
 
 pub use assembly::{build_standard_loop, is_standard_happy_path};
+pub use bin_setup::build_inference_ctx;
 pub use decode_loop::{DecodeLoop, DecodeLoopBuilder, HasForward, NoForward};
 pub use defaults::{
     GreedySampler, NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver,
     NoOpSwapStage, NoOpTokenTickSink,
 };
+pub use experiment_run::run_experiment_path;
 pub use samplers::RepetitionPenaltySampler;
 pub use traits::{
     CommandSource, DecodeObserver, DecodeResult, EngineReport, EvictionOutcome, EvictionStage,

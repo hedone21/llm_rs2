@@ -60,6 +60,14 @@ from .text_accuracy import decode_jsonl_to_text
 
 # ── Binary paths ────────────────────────────────────────
 
+# α-K BC argus-bench AB-0 (2026-06-05): verify 엔진 bin = argus_bench.
+# legacy `generate`(→ legacy_generate)는 5-F 에서 폐기됐고, happy-path 전용
+# argus_cli 대신 experiment-output + resilience runtime effect 를 지원하는
+# argus_bench 가 baseline/action 양쪽을 띄운다. (AB-5 에서 원격 경로/pkill 도
+# 이 상수로 일괄 재배선 — 현재는 로컬 host 경로만 적용.)
+ENGINE_BIN = "argus_bench"
+
+
 def _host_binary(device_cfg: Dict[str, Any], name: str) -> Path:
     binary_dir = device_cfg.get("build", {}).get("binary_dir", "target/release")
     path = PROJECT_ROOT / binary_dir / name
@@ -310,10 +318,10 @@ def _run_scenario_local(
     if not tokenizer_path.is_absolute():
         tokenizer_path = PROJECT_ROOT / tokenizer_path
 
-    generate_bin = _host_binary(device_cfg, "generate")
+    generate_bin = _host_binary(device_cfg, ENGINE_BIN)
     mock_bin = _host_binary(device_cfg, "mock_manager")
     if not generate_bin.exists():
-        raise FileNotFoundError(f"generate binary missing: {generate_bin}")
+        raise FileNotFoundError(f"{ENGINE_BIN} binary missing: {generate_bin}")
     if not mock_bin.exists():
         raise FileNotFoundError(f"mock_manager binary missing: {mock_bin}")
 

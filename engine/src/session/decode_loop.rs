@@ -129,6 +129,9 @@ impl DecodeLoop {
                 stopped_by = StopReason::StopFlag;
                 break;
             }
+            // 매 step 전체 wall-clock 시작점 (target_tbt pacing 기준 — throttle
+            // delay 도 이 측정에 포함된다).
+            let t_iter = Instant::now();
 
             // (a) command poll
             let ctx = step_ctx(
@@ -244,6 +247,19 @@ impl DecodeLoop {
             self.prev_token = sampled;
             self.pos += 1;
             self.decode_step += 1;
+
+            // (h) target TBT pacing — resilience SetTargetTbt 가 설정한 목표
+            // wall-clock 에 도달하도록 step 끝에서 sleep. target_tbt_ms == 0
+            // (미설정/release) 이면 no-op이라 비-resilience 경로는 무영향.
+            if plan.target_tbt_ms > 0 {
+                let elapsed_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
+                let target_ms = plan.target_tbt_ms as f64;
+                if elapsed_ms < target_ms {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(
+                        (target_ms - elapsed_ms) / 1000.0,
+                    ));
+                }
+            }
         }
 
         self.forward.finalize()?;
