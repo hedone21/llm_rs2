@@ -20,6 +20,7 @@ use crate::memory::host::shared::SharedBuffer;
 use crate::pressure::kv_cache::KVCache;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
+use technique_api::WeightedMerge;
 
 /// 내부 가변 상태 — `KVCache` 와 비-F32 cast scratch 를 **단일 lock** 으로 묶는다.
 ///
@@ -560,6 +561,173 @@ fn merge_row_f16(
             acc += w * buf[fo + d].to_f32();
         }
         buf[into_off + d] = f16::from_f32(acc);
+    }
+}
+
+/// (M4-b) [`WeightedMerge`](가중치 baked) 를 `&mut KVCache` 에 in-place 적용한다.
+///
+/// d2o 의 `scatter_reduce_merge_layer_wide`(d2o_handler.rs)와 **bit-identical** 산술이다 — per
+/// `WeightedMerge` per head `acc = into_weight·into[d] + Σ w·from[d]`(`into` 먼저, `from` 은 list
+/// 순서). K 는 `k_buffer.dtype()`, V 는 `v_buffer.dtype()` 로 독립 디스패치(F32/F16/Q4_0). 위치는
+/// compact 적용 직전(pre-compact) 논리 좌표. ADR-0004 §4(M4 정정) — Q4_0 merge 활성.
+///
+/// `from` 은 evicted(retain 아님), `into` 는 retained 라 서로/merge 간 겹치지 않아(evicted∉retained)
+/// in-place 적용이 안전하다. 빈 `from` 은 skip.
+pub(crate) fn apply_weighted_merges(cache: &mut KVCache, merges: &[WeightedMerge]) {
+    if merges.is_empty() {
+        return;
+    }
+    use crate::quant::{BlockQ4_0, QK4_0};
+    use half::f16;
+
+    let kv_heads = cache.kv_heads();
+    let head_dim = cache.head_dim();
+    let blocks_per_pos = head_dim / QK4_0; // Q4_0 분기에서만 사용
+
+    for m in merges {
+        if m.from.is_empty() {
+            continue;
+        }
+        let into_w = m.into_weight;
+        let from_pos: Vec<usize> = m.from.iter().map(|&(p, _)| p).collect();
+        let from_w: Vec<f32> = m.from.iter().map(|&(_, w)| w).collect();
+
+        for h in 0..kv_heads {
+            // ── K (k_buffer.dtype() 디스패치) ──
+            match cache.k_buffer.dtype() {
+                DType::F32 => {
+                    let into_off = cache.offset(m.into, h);
+                    let from_offs: Vec<usize> =
+                        from_pos.iter().map(|&p| cache.offset(p, h)).collect();
+                    let k = cache.k_buffer.as_mut_slice::<f32>();
+                    merge_row_weighted_f32(k, into_off, &from_offs, &from_w, into_w, head_dim);
+                }
+                DType::F16 => {
+                    let into_off = cache.offset(m.into, h);
+                    let from_offs: Vec<usize> =
+                        from_pos.iter().map(|&p| cache.offset(p, h)).collect();
+                    let k = cache.k_buffer.as_mut_slice::<f16>();
+                    merge_row_weighted_f16(k, into_off, &from_offs, &from_w, into_w, head_dim);
+                }
+                DType::Q4_0 => {
+                    let into_bo = cache.q4_block_offset(m.into, h, blocks_per_pos);
+                    let from_bos: Vec<usize> = from_pos
+                        .iter()
+                        .map(|&p| cache.q4_block_offset(p, h, blocks_per_pos))
+                        .collect();
+                    let k = cache.k_buffer.as_mut_slice::<BlockQ4_0>();
+                    merge_row_weighted_q4(k, into_bo, &from_bos, &from_w, into_w, blocks_per_pos);
+                }
+                _ => {}
+            }
+
+            // ── V (v_buffer.dtype() 독립 디스패치) ──
+            match cache.v_buffer.dtype() {
+                DType::F32 => {
+                    let into_off = cache.offset(m.into, h);
+                    let from_offs: Vec<usize> =
+                        from_pos.iter().map(|&p| cache.offset(p, h)).collect();
+                    let v = cache.v_buffer.as_mut_slice::<f32>();
+                    merge_row_weighted_f32(v, into_off, &from_offs, &from_w, into_w, head_dim);
+                }
+                DType::F16 => {
+                    let into_off = cache.offset(m.into, h);
+                    let from_offs: Vec<usize> =
+                        from_pos.iter().map(|&p| cache.offset(p, h)).collect();
+                    let v = cache.v_buffer.as_mut_slice::<f16>();
+                    merge_row_weighted_f16(v, into_off, &from_offs, &from_w, into_w, head_dim);
+                }
+                DType::Q4_0 => {
+                    let into_bo = cache.q4_block_offset(m.into, h, blocks_per_pos);
+                    let from_bos: Vec<usize> = from_pos
+                        .iter()
+                        .map(|&p| cache.q4_block_offset(p, h, blocks_per_pos))
+                        .collect();
+                    let v = cache.v_buffer.as_mut_slice::<BlockQ4_0>();
+                    merge_row_weighted_q4(v, into_bo, &from_bos, &from_w, into_w, blocks_per_pos);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[inline]
+fn merge_row_weighted_f32(
+    buf: &mut [f32],
+    into_off: usize,
+    from_offs: &[usize],
+    from_w: &[f32],
+    into_w: f32,
+    head_dim: usize,
+) {
+    for d in 0..head_dim {
+        let mut acc = into_w * buf[into_off + d];
+        for (idx, &fo) in from_offs.iter().enumerate() {
+            acc += from_w[idx] * buf[fo + d];
+        }
+        buf[into_off + d] = acc;
+    }
+}
+
+#[inline]
+fn merge_row_weighted_f16(
+    buf: &mut [half::f16],
+    into_off: usize,
+    from_offs: &[usize],
+    from_w: &[f32],
+    into_w: f32,
+    head_dim: usize,
+) {
+    use half::f16;
+    for d in 0..head_dim {
+        let mut acc = into_w * buf[into_off + d].to_f32();
+        for (idx, &fo) in from_offs.iter().enumerate() {
+            acc += from_w[idx] * buf[fo + d].to_f32();
+        }
+        buf[into_off + d] = f16::from_f32(acc);
+    }
+}
+
+/// Q4_0 가중 병합 — from 을 head_dim f32 로 dequant(블록 단위) 후, into 블록을 dequant→`*=into_w`→
+/// `+= from_w·from` → `BlockQ4_0::quantize`. scatter_reduce_q4 와 동일.
+#[inline]
+fn merge_row_weighted_q4(
+    blocks: &mut [crate::quant::BlockQ4_0],
+    into_block_off: usize,
+    from_block_offs: &[usize],
+    from_w: &[f32],
+    into_w: f32,
+    blocks_per_pos: usize,
+) {
+    use crate::quant::{BlockQ4_0, QK4_0};
+    // from 을 먼저 full dequant(immutable read) — into write 와 별개 버퍼.
+    let from_deq: Vec<Vec<f32>> = from_block_offs
+        .iter()
+        .map(|&fbo| {
+            let mut buf = vec![0.0f32; blocks_per_pos * QK4_0];
+            for bi in 0..blocks_per_pos {
+                let mut tmp = [0.0f32; QK4_0];
+                blocks[fbo + bi].dequantize(&mut tmp);
+                buf[bi * QK4_0..(bi + 1) * QK4_0].copy_from_slice(&tmp);
+            }
+            buf
+        })
+        .collect();
+
+    for bi in 0..blocks_per_pos {
+        let mut r = [0.0f32; QK4_0];
+        blocks[into_block_off + bi].dequantize(&mut r);
+        for v in r.iter_mut() {
+            *v *= into_w;
+        }
+        let base = bi * QK4_0;
+        for (idx, fbuf) in from_deq.iter().enumerate() {
+            for i in 0..QK4_0 {
+                r[i] += from_w[idx] * fbuf[base + i];
+            }
+        }
+        blocks[into_block_off + bi] = BlockQ4_0::quantize(&r);
     }
 }
 

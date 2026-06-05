@@ -1762,6 +1762,194 @@ mod tests {
         out
     }
 
+    /// Write an f32 vector to Q4_0 V cache at (pos, head) via quantize.
+    fn write_v_q4(cache: &mut KVCache, pos: usize, head: usize, values: &[f32]) {
+        let head_dim = values.len();
+        let blocks_per_pos = head_dim / QK4_0;
+        let block_off = cache.q4_block_offset(pos, head, blocks_per_pos);
+        let v = cache.v_buffer.as_mut_slice::<BlockQ4_0>();
+        for bi in 0..blocks_per_pos {
+            let start = bi * QK4_0;
+            let mut src = [0.0f32; QK4_0];
+            src.copy_from_slice(&values[start..start + QK4_0]);
+            v[block_off + bi] = BlockQ4_0::quantize(&src);
+        }
+    }
+
+    // ── M4-b: apply_weighted_merges(standard_format) ≡ scatter_reduce_merge_layer_wide(d2o) ──
+    // 동일 weights(group_by_retain + compute_eq11_weights)에서 buffer bit-identical 임을 증명한다.
+    // d2o-stage(M4-c)가 plan→executor(apply_weighted_merges)로 가도 기존 D2OHandler 와 무회귀임의 근거.
+
+    /// scatter_reduce 가 내부에서 쓰는 grouping+weights 와 동일하게 WeightedMerge 를 구성.
+    fn merges_from(
+        passing: &[usize],
+        matches: &[Match],
+        merge_e: f32,
+    ) -> Vec<technique_api::WeightedMerge> {
+        let groups = group_by_retain(passing, matches);
+        groups
+            .iter()
+            .map(|(retain, evicted_list)| {
+                let (w_c, w_e) = compute_eq11_weights(evicted_list, merge_e);
+                technique_api::WeightedMerge {
+                    into: *retain,
+                    into_weight: w_c,
+                    from: evicted_list
+                        .iter()
+                        .zip(w_e.iter())
+                        .map(|(&(ep, _), &w)| (ep, w))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// 유효 영역 [0..current_pos) 의 K/V raw byte (K=V 동일 dtype 전제).
+    fn valid_bytes(cache: &KVCache, kv_heads: usize, head_dim: usize) -> (Vec<u8>, Vec<u8>) {
+        let bpp = match cache.k_buffer.dtype() {
+            DType::F32 => kv_heads * head_dim * 4,
+            DType::F16 => kv_heads * head_dim * 2,
+            DType::Q4_0 => (kv_heads * head_dim / QK4_0) * std::mem::size_of::<BlockQ4_0>(),
+            other => panic!("unsupported dtype {other:?}"),
+        };
+        let nb = cache.current_pos * bpp;
+        unsafe {
+            (
+                std::slice::from_raw_parts(cache.k_buffer.as_mut_ptr() as *const u8, nb).to_vec(),
+                std::slice::from_raw_parts(cache.v_buffer.as_mut_ptr() as *const u8, nb).to_vec(),
+            )
+        }
+    }
+
+    fn parity_passing_matches() -> (Vec<usize>, Vec<Match>, f32) {
+        // evict 5,8 → retain 3; evict 11 → retain 12 (retain∩evict=∅, pos<16).
+        let passing = vec![5usize, 8, 11];
+        let matches = vec![
+            Match {
+                retain_pos: 3,
+                sim: 0.8,
+            },
+            Match {
+                retain_pos: 3,
+                sim: 0.5,
+            },
+            Match {
+                retain_pos: 12,
+                sim: 0.9,
+            },
+        ];
+        (passing, matches, 0.1)
+    }
+
+    #[test]
+    fn apply_weighted_merges_eq_scatter_f32() {
+        let (kvh, hd, ms, pos) = (2usize, 8usize, 64usize, 16usize);
+        let fill = |c: &mut KVCache| {
+            let k = c.k_buffer.as_mut_slice::<f32>();
+            for (i, x) in k.iter_mut().enumerate() {
+                *x = (i as f32 + 1.0) * 0.123;
+            }
+            let v = c.v_buffer.as_mut_slice::<f32>();
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i as f32 + 1.0) * -0.077 + 3.0;
+            }
+        };
+        let mut a = make_cache(ms, kvh, hd, pos);
+        let mut b = make_cache(ms, kvh, hd, pos);
+        fill(&mut a);
+        fill(&mut b);
+        let (passing, matches, merge_e) = parity_passing_matches();
+        scatter_reduce_merge_layer_wide(&mut a, &passing, &matches, kvh, hd, merge_e);
+        crate::pressure::standard_format::apply_weighted_merges(
+            &mut b,
+            &merges_from(&passing, &matches, merge_e),
+        );
+        let (ka, va) = valid_bytes(&a, kvh, hd);
+        let (kb, vb) = valid_bytes(&b, kvh, hd);
+        assert_eq!(ka, kb, "F32 K bit-identical");
+        assert_eq!(va, vb, "F32 V bit-identical");
+    }
+
+    #[test]
+    fn apply_weighted_merges_eq_scatter_f16() {
+        use half::f16;
+        let (kvh, hd, ms, pos) = (2usize, 8usize, 64usize, 16usize);
+        let backend = Arc::new(CpuBackend::new());
+        let buf_size = ms * kvh * hd * 2;
+        let mk = || {
+            let k = Tensor::new(
+                Shape::new(vec![1, ms, kvh, hd]),
+                Arc::new(SharedBuffer::new(buf_size, DType::F16)),
+                backend.clone(),
+            );
+            let v = Tensor::new(
+                Shape::new(vec![1, ms, kvh, hd]),
+                Arc::new(SharedBuffer::new(buf_size, DType::F16)),
+                backend.clone(),
+            );
+            let mut c = KVCache::new(k, v, ms);
+            c.current_pos = pos;
+            c
+        };
+        let fill = |c: &mut KVCache| {
+            let k = c.k_buffer.as_mut_slice::<f16>();
+            for (i, x) in k.iter_mut().enumerate() {
+                *x = f16::from_f32((i as f32 + 1.0) * 0.123);
+            }
+            let v = c.v_buffer.as_mut_slice::<f16>();
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = f16::from_f32((i as f32 + 1.0) * -0.077 + 3.0);
+            }
+        };
+        let mut a = mk();
+        let mut b = mk();
+        fill(&mut a);
+        fill(&mut b);
+        let (passing, matches, merge_e) = parity_passing_matches();
+        scatter_reduce_merge_layer_wide(&mut a, &passing, &matches, kvh, hd, merge_e);
+        crate::pressure::standard_format::apply_weighted_merges(
+            &mut b,
+            &merges_from(&passing, &matches, merge_e),
+        );
+        let (ka, va) = valid_bytes(&a, kvh, hd);
+        let (kb, vb) = valid_bytes(&b, kvh, hd);
+        assert_eq!(ka, kb, "F16 K bit-identical");
+        assert_eq!(va, vb, "F16 V bit-identical");
+    }
+
+    #[test]
+    fn apply_weighted_merges_eq_scatter_q4() {
+        let (kvh, hd, ms, pos) = (2usize, QK4_0, 64usize, 16usize); // head_dim=QK4_0 → 1 block/pos
+        let fill = |c: &mut KVCache| {
+            for p in 0..pos {
+                for h in 0..kvh {
+                    let kvals: Vec<f32> = (0..hd)
+                        .map(|d| ((p * kvh + h) * hd + d) as f32 * 0.05 - 1.0)
+                        .collect();
+                    let vvals: Vec<f32> = (0..hd)
+                        .map(|d| ((p * kvh + h) * hd + d) as f32 * -0.03 + 2.0)
+                        .collect();
+                    write_k_q4(c, p, h, &kvals);
+                    write_v_q4(c, p, h, &vvals);
+                }
+            }
+        };
+        let mut a = make_cache_q4(ms, kvh, hd, pos);
+        let mut b = make_cache_q4(ms, kvh, hd, pos);
+        fill(&mut a);
+        fill(&mut b);
+        let (passing, matches, merge_e) = parity_passing_matches();
+        scatter_reduce_merge_layer_wide(&mut a, &passing, &matches, kvh, hd, merge_e);
+        crate::pressure::standard_format::apply_weighted_merges(
+            &mut b,
+            &merges_from(&passing, &matches, merge_e),
+        );
+        let (ka, va) = valid_bytes(&a, kvh, hd);
+        let (kb, vb) = valid_bytes(&b, kvh, hd);
+        assert_eq!(ka, kb, "Q4_0 K bit-identical");
+        assert_eq!(va, vb, "Q4_0 V bit-identical");
+    }
+
     #[test]
     fn test_quantize_round_trip() {
         let src: [f32; QK4_0] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.5);

@@ -78,12 +78,9 @@ fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result<()> {
     match &plan.keep {
         KeepSpec::LayerWide(keep) => {
             if !plan.merges.is_empty() {
-                // 가중 merge executor = M4(d2o). ADR-0004 §4 "Q4_0 merge 비활성" vs d2o
-                // scatter_reduce_q4 모순 개정 선결. 현 빌트인 3정책은 merge 미생산이라 도달 불가.
-                anyhow::bail!(
-                    "weighted-merge executor not implemented (M4 d2o); LayerWide merges={}",
-                    plan.merges.len()
-                );
+                // (M4-b) 가중 merge 를 compact 이전 좌표계에서 in-place 적용(scatter_reduce 와
+                // bit-identical, F32/F16/Q4_0). ADR-0004 §4(M4 정정) — Q4_0 merge 활성.
+                crate::pressure::standard_format::apply_weighted_merges(cache, &plan.merges);
             }
             cache.compact_keep_positions(keep, 0)?;
             cache.set_current_pos(keep.len());
