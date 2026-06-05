@@ -1,0 +1,27 @@
+=== microbench_htp_rmsnorm (Q-2.2-α PoC Phase 5) ===
+
+Config:
+  shape       = [1, 1536]
+  eps         = 0.00001
+  add_unit    = false
+  warmup iter = 10
+  measure iter= 1000
+  err thresh  = 0.001
+
+[1/3] CPU baseline (f32)
+  mean=1.09 us (median=0.83, stddev=5.90, n=1000)
+
+[2/3] OpenCL GPU
+  mean=152.72 us (median=139.22, stddev=47.29, n=1000)
+  vs CPU: max_abs_err=0.000e0, max_rel_err=0.000e0 — PASS
+
+[3/3] QNN HTP NPU (FastRPC + libggml-htp-v79.so dspqueue)
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=7, session_id=1, queue_id=394741854240768
+  htp_iface_start: OK (n_hvx=0)
+  mean=96.84 us (median=92.71, stddev=76.87, n=1000)
+  vs CPU: max_abs_err=0.000e0, max_rel_err=0.000e0 — PASS
+
+=== Summary ===
+CPU:          1.09 us/op (1.00x baseline)
+OpenCL:     152.72 us/op (139.54x, -99% vs CPU), err=0.00e0
+QNN HTP:     96.84 us/op (88.48x, -99% vs CPU), err=0.00e0

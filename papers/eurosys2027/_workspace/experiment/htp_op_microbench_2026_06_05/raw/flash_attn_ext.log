@@ -1,0 +1,15 @@
+=== microbench_htp_flash_attn_ext (P1d sprint) ===
+
+Config (Qwen 2.5-1.5B decode):
+  Q   = [head_dim=128, n_heads=12, n_tokens=1] F16
+  K/V = [head_dim=128, ctx=1024, n_kv=2] F16
+  dst = [head_dim=128, n_tokens=1, n_heads=12] F32
+  scale = 1/sqrt(128)
+  warmup=5 measure=50
+
+[1/1] QNN HTP NPU (FLASH_ATTN_EXT dispatch attempt)
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=7, session_id=1, queue_id=394192098426880
+  htp_iface_start: OK (n_hvx=0)
+  diag: rsp.op=15, status=1, prof_usecs=348, prof_cycles=735397, prof_pkts=125796, rsp_buf_count=1
+  GREEN — mean=363.85 us (median=355.00, stddev=38.05, n=50)
+  → matrix.md v2-§6.0 ours.htp FLASH_ATTN_EXT cell `✗` 가정 reject. paper narrative 갱신 필요 (HTP NPU 가 fused attention GREEN dispatch 가능).

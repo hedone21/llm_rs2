@@ -1,0 +1,28 @@
+{
+  "_meta": {
+    "device": "Galaxy S25 (R3CY408S5SB)",
+    "date": "2026-06-05",
+    "env": "LD_LIBRARY_PATH=...:/vendor/lib64 ADSP_LIBRARY_PATH=/data/local/tmp taskset 3f",
+    "backend": "htp_fastrpc (FastRPC + libggml-htp-v79.so)",
+    "note": "per-op HTP NPU vs CPU(NEON) latency. shape = decode-time (대부분 M=1). 전부 correctness PASS. 핵심: HTP dispatch floor ~100us (FastRPC round-trip + DMA-BUF coherency) — compute 가 이 floor 미만인 op 은 CPU 압승.",
+    "iters": "warmup 5-10 / measure 50-1000",
+    "unit": "us/op (wall-clock median/mean)"
+  },
+  "ops": {
+    "rms_norm":   {"shape": "[1,1536]",     "cpu_us": 0.91,   "opencl_us": 165.22, "htp_us": 97.30,  "err": 0.0,       "pass": true},
+    "add":        {"shape": "[1,1536]",     "cpu_us": 0.30,   "opencl_us": null,   "htp_us": 100.38, "err": 0.0,       "pass": true},
+    "rope":       {"shape": "[128,12,1]",   "cpu_us": 15.05,  "opencl_us": null,   "htp_us": 102.28, "err": 2.24e-7,   "pass": true},
+    "silu":       {"shape": "[1,8960]",     "cpu_us": 0.05,   "opencl_us": null,   "htp_us": 107.96, "err": 2.09e-7,   "pass": true},
+    "mul":        {"shape": "[1,8960]",     "cpu_us": 0.05,   "opencl_us": null,   "htp_us": 108.33, "err": 0.0,       "pass": true},
+    "get_rows":   {"shape": "[1536,1024]",  "cpu_us": 0.04,   "opencl_us": null,   "htp_us": 112.01, "err": 0.0,       "pass": true},
+    "softmax":    {"shape": "[2048,1,12]",  "cpu_us": 177.11, "opencl_us": null,   "htp_us": 126.21, "err": 5.82e-10,  "pass": true},
+    "flash_attn": {"shape": "Q[128,12,1] KV[128,1024,2] ctx1024", "cpu_us": null, "opencl_us": null, "htp_us": 363.85, "prof_usecs": 348, "err": null, "pass": true, "note": "HTP-only bench (CPU baseline 없음). fused QKᵀ+softmax+·V. prof_usecs=348 → 대부분 실제 DSP compute (dispatch floor 초과)."}
+  },
+  "dispatch_floor_us": 104,
+  "verdict": {
+    "cpu_wins": ["rms_norm", "add", "rope", "silu", "mul", "get_rows"],
+    "npu_wins": ["softmax(long-ctx)"],
+    "heavy_fused": ["flash_attn", "matmul(별도 bench)"],
+    "conclusion": "op-by-op offload 는 경량 op 에서 strictly worse (~100us floor >> compute). NPU 이득은 (a) heavy op(matmul/flash_attn/long-ctx softmax) 개별 offload 또는 (b) layer graph fusion(round-trip 1회로 amortize)."
+  }
+}

@@ -1,0 +1,24 @@
+=== microbench_htp_get_rows (Q-2.2 β G5 sprint) ===
+
+Config:
+  embed  shape  = [1536, 1024] F32 (6291456 B = 6 MB, vocab=1024 dummy)
+  idx    shape  = [1] i32 (alloc 64 B, ≥64 B min), value=42
+  dst    shape  = [1536, 1] F32 (6144 B)
+  warmup iter   = 10
+  measure iter  = 200
+  err thresh    = 0.001 (expect 0.0 bit-exact)
+
+[1/2] CPU baseline (host-side row gather reference)
+  baseline magnitude: max|y| = 0.499802
+  mean=0.04 us (median=0.05, stddev=0.04, n=200)
+
+[2/2] QNN HTP NPU (FastRPC + libggml-htp-v79.so dspqueue)
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=7, session_id=1, queue_id=393642342612992
+  htp_iface_start: OK (n_hvx=0)
+  diag: rsp.op=17, status=1, prof_usecs=92, prof_cycles=196131, prof_pkts=25196, rsp_buf_count=1
+  mean=112.01 us (median=109.43, stddev=17.81, n=200)
+  vs CPU: max_abs_err=0.000e0, max_rel_err=0.000e0 — PASS
+
+=== Summary ===
+CPU:          0.04 us/op (1.00x baseline)
+QNN HTP:    112.01 us/op (2622.85x, -100% vs CPU), err=0.00e0

@@ -1,0 +1,22 @@
+=== microbench_htp_mul (Q-2.2 β G1 sprint) ===
+
+Config:
+  shape         = [1, 8960] F32 (35840 B per buf)
+  warmup iter   = 10
+  measure iter  = 1000
+  err thresh    = 0.001
+
+[1/2] CPU baseline (F32 element-wise mul)
+  baseline magnitude: max|y| = 0.2479
+  mean=0.05 us (median=0.05, stddev=0.04, n=1000)
+
+[2/2] QNN HTP NPU (FastRPC + libggml-htp-v79.so dspqueue)
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=7, session_id=1, queue_id=393092586799104
+  htp_iface_start: OK (n_hvx=0)
+  diag: rsp.op=0, status=1, prof_usecs=88, prof_cycles=187920, prof_pkts=25900, rsp_buf_count=1
+  mean=108.33 us (median=104.64, stddev=23.61, n=1000)
+  vs CPU: max_abs_err=0.000e0, max_rel_err=0.000e0 — PASS
+
+=== Summary ===
+CPU:          0.05 us/op (1.00x baseline)
+QNN HTP:    108.33 us/op (2313.44x, -100% vs CPU), err=0.00e0
