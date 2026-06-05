@@ -57,7 +57,9 @@ executor 매핑: `LayerWide`+merges → `apply_merges`(가중) → `compact_keep
 - 엔진: `StageCtx` 를 `&KVCache` 위로 구현, `KVCachePlan` executor(LayerWide/PerHead 분기 + 가중 `apply_merges`), `KV_CACHE_STAGES` 레지스트리로 match arm(session.rs:621·init.rs) 제거, startup self-test.
 - d2o: `KVCacheStage` 로 재구현(plan 에 가중치+nearest 산출, EMA 는 impl Mutex, K 는 StageCtx 로 읽기). 기존 D2OHandler 경로와 등가성 테스트 선행(미확립 시 STOP — ADR-0003 M4 게이트).
 - head_importance session forward 배선 추가(현재 flat 만).
-- **검증**: `compact_parity` 를 가중 merge·per-head 케이스로 확장. Q4_0 merge 는 비활성 유지(현 정책) — plan 은 dtype-agnostic, executor 가 dtype 분기.
+- **검증**: `compact_parity` 를 가중 merge·per-head 케이스로 확장. ~~Q4_0 merge 는 비활성 유지(현 정책)~~ — plan 은 dtype-agnostic, executor 가 dtype 분기.
+
+> **(정정 — M4 사용자 결정 2026-06-05)**: "Q4_0 merge 비활성 유지"는 폐기한다. 현 `D2OHandler` 는 이미 `scatter_reduce_q4`(d2o_handler.rs:585)로 **Q4_0 에서 가중 merge 를 수행**하므로, d2o 를 plan→executor 로 옮기며 executor 의 `apply_merges`(현 Q4 스킵)를 그대로 쓰면 Q4_0 merge 가 silently drop 되어 **paper Eq.11 정렬 회귀**다. 따라서 executor 의 `apply_merges` 를 (a) `WeightedMerge` 가중치 사용 + (b) **Q4_0 지원**(기존 `scatter_reduce_q4` 의미 이식)으로 확장한다. plan 표면은 여전히 dtype-agnostic(`WeightedMerge` 는 위치+가중치만 운반); dtype 분기는 executor 가 흡수 — 본 ADR 의 "executor 가 dtype 분기" 원칙과 일관. 동등성 게이트: 새 d2o-KVCacheStage(plan→확장 executor)가 기존 `D2OHandler` 와 F32/F16/Q4_0 모두에서 bit-identical(미확립 시 STOP).
 
 ## 5. Alternatives Considered
 
