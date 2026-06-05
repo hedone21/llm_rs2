@@ -7,11 +7,9 @@
 
 > ## ▶ 재개 진입점 (compact 후 여기서 시작)
 > **설계 전부 확정·커밋됨**(M0 8c23a72a / M1 136f7cdd / 설계 5f81bace). 분기 F1~F6 + 네이밍 닫힘 (아래 "M2-B 설계 분기").
-> **M2-B① ✅ 완료**(`caeca4f2`): technique-api 가 ADR-0004 표면(KVCacheStage/StageCtx 9-accessor/KVCachePlan/KeepSpec/WeightedMerge/StageParams/find_stage)으로 재구성됨. 표면은 workflow `wf_21533739` 가 6기법 all_expressible·dyn-safe 적대 검증 완료.
-> **사용자 결정**(iter-5): (1) **지금 World A→B 전환(역어댑터)** — ②a→②b. (2) **name-key = 전부 CLI 이름으로 통일**(`policy.name()` 출력도 CLI 이름; 주로 `"sliding_window"→"sliding"`, 의존 테스트 4곳 갱신).
-> **M2-B②a ✅ 완료**(`2676acd2`): 엔진→technique-api(+linkme) 의존 + `EvictionPolicyAsStage` 어댑터 + 3 빌트인(sliding/streaming/h2o) `KV_CACHE_STAGES` 등록. **등록만(unwired)**, 프로덕션 무변경. test 1223/0.
-> **M2-B②b-1 ✅ 완료**(`fb992138`): name 통일 — `SlidingWindowPolicy::name()` "sliding_window"→"sliding" + 의존 테스트 4곳 갱신. test 1223/0, clippy clean.
-> **다음 = M2-B②b-2+3**: `KVCachePlan` executor(LayerWide+merges→apply_merges(가중)+compact_keep_positions; PerHead→_for_head; PerHead+merges→bail) + `StageBackedPolicy{stage}` impl EvictionPolicy(plan→executor 실행, World B) + session.rs:620-650·build_bench_loop.rs:88-117 의 **sliding/streaming/h2o 3 arm 만** `find_stage`→make→StageBackedPolicy fallback 으로 교체(h2o_plus arm·d2o if·bail 잔류; bail 메시지·streaming window 유도·protected_prefix 기본값 match 는 caller 잔류) + startup self-test(release fail-fast). 게이트 = `cargo test -p llm_rs2 --lib -- --skip backend::opencl --skip memory::opencl` (≥1223 passed, 0 failed) + build + fmt(내 파일) + clippy(--workspace, --all-targets 금지) + compact_parity + ② 완료 시 release smoke. **무회귀 invariant**: 버퍼 bit-identical(compact_parity transitively)·target_len 의미·NoOp 가드(run_policy_eviction 선처리)·undershoot·score dispatch·name() 보존(CLI 이름으로 일관).
+> **M2-B ✅ 완료** (①`caeca4f2` 표면 / ②a`2676acd2` 등록 / ②b-1`fb992138` name통일 / ②b-2+3`a7fe3823` World B). sliding/streaming/h2o 3 LayerWide 정책이 `KV_CACHE_STAGES` 레지스트리→`StageBackedPolicy` 역어댑터로 **World B(plan→compact)** 전환, session.rs·build_bench_loop.rs match arm 제거(OCP). h2o_plus(per-head, ⑤)·d2o(M4)·none(match 밖)·bail 잔류. **release smoke GREEN**: release fat-LTO 빌드 OK + `cargo test --release` stage_registry 5/5(linkme gc-sections 생존) + `argus_bench eviction sliding` 정상 생성(bail 0). 무회귀: test 1225/0 + compact_parity + 신규 stage_backed_evict_parity(F32/F16/Q4_0 bit-identical).
+> **다음 = M3**(per-crate 기법): 아래 체크리스트 M3. workspace glob `crates/techniques/*` + 더미/예제 technique crate 로 "폴더만 추가 = 엔진 수정 0" 검증(ADR-0003 핵심 목표). 빌트인 일부 per-crate 이전 가능성 검토. 게이트 = build + `cargo test -p llm_rs2 --lib -- --skip backend::opencl --skip memory::opencl`(≥1225, 0 failed) + fmt(내 파일) + clippy(--workspace, --all-targets 금지) + 더미 crate 등록 확인. 이후 M4(d2o, ADR-0004 §4 Q4_0 merge 모순 개정 선결 + 동등성 선행, 미확립 시 STOP), M5(기여자 문서).
+> 재개 명령 예: "M3 진행".
 > 재개 명령 예: "M2-B②b 진행".
 
 ---
@@ -41,7 +39,7 @@
 
 - [x] **M0** 기준선(1220) + 원장 + ADR-0003·README 커밋
 - [x] **M1** `crates/technique-api/` 신설 — `EvictionPlan`(planning trait) + `Merge` + `PolicyParams` + `EvictionPolicyReg` + linkme `EVICTION_POLICIES` distributed_slice + `find_eviction`/`registered_names`. workspace member 추가, linkme 0.3 dep. **엔진 의존 0**(단방향). 테스트 2/2(dummy 등록·조회). 커밋 예정.
-- [~] **M2** ⏸ **STOP — 사용자 결정 대기** (아래 "M2 fork"). 조사 완료: `compact_parity.rs`(통과 중)가 sliding/streaming/h2o/no_eviction × {F32,F16,Q4_0}에서 plan_keep→compact ≡ in-place evict 증명 → 어댑터 경로 검증됨. 그러나 **h2o_plus(plan_keep→None)·d2o(EvictionPolicy 아님)는 planning 레지스트리에 안 들어감** → registry scope 결정 필요.
+- [x] **M2(=M2-B)** ✅ KVCacheStage 레지스트리 + World B 전환. ①표면(`caeca4f2`) ②a등록(`2676acd2`) ②b-1 name통일(`fb992138`) ②b-2+3 World B+match arm 제거(`a7fe3823`). sliding/streaming/h2o 레지스트리화(OCP). h2o_plus=⑤·d2o=M4·none=match밖 잔류. release smoke green(linkme fat-LTO 생존 + argus_bench 정상 생성). test 1225/0. **잔여**: compact_parity 가중merge·per-head 확장(M2(B) plan step3)은 executor 의 weighted/PerHead 경로가 현재 bail(deferred)이라 **M4(d2o)·⑤(h2o_plus) 구현 시 동반**.
 - [ ] **M3** 정책 impl을 `crates/techniques/<name>/` per-crate 이전 + linkme 등록, workspace glob `crates/techniques/*`, bin 의존(D4 1줄/기법), 더미 crate로 "폴더만 추가" 검증
 - [ ] **M4** d2o `plan_keep` 이전 + `Merge` 가중치 필드. **동등성 테스트 선작성 필수**, 못 세우면 STOP+human-review 플래그 (senior-implementer 위임 가능)
 - [ ] **M5** 기여자 문서 "기법 추가법"(hook·시그니처·등록 + 동작 예제 crate, 컴파일·등록 게이트)
@@ -66,6 +64,7 @@ M1·M2·M3·M5 커밋 + 전체 `/sanity-check` green + release self-test 통과 
   - 코드 변경 0(검증만). 사용자 결정 후 ②a(등록+self-test, 무변경)→②b(match arm 교체) 재개.
 - **iter-6 (M2-B②a, 2026-06-05)**: 사용자 결정 — (1)지금 World A→B 전환(역어댑터), (2)name-key 전부 CLI 통일. ②a 구현(순수 additive): engine→technique-api(+linkme 0.3) dep + `eviction/stage_registry.rs` 신설(`EvictionPolicyAsStage` 어댑터 = plan_keep→KVCachePlan 위임 + uniform Merge→WeightedMerge) + 3 빌트인(sliding/streaming/h2o) `#[distributed_slice(KV_CACHE_STAGES)]` 등록(reg key=CLI 이름). **등록만, unwired** — 프로덕션 여전히 in-place evict. 게이트: build OK, test 1223/0(신규 3: 등록·어댑터 faithful×2), clippy workspace clean, fmt 내 파일만. 커밋 `2676acd2`. → 다음 iter: M2-B②b.
 - **iter-7 (M2-B②b-1, 2026-06-05)**: name 통일(사용자 결정 2). `SlidingWindowPolicy::name()` "sliding_window"→"sliding" + 의존 테스트 4곳(sliding_window test_name, cache_manager policy_name contains ×2, eviction_handler test_name_delegates) 갱신. `"sliding_window"` 잔존은 모듈경로·model_config(Gemma attention)·테스트 함수명뿐(무관). 게이트: test 1223/0, clippy clean. 커밋 `fb992138`. → 다음 iter: M2-B②b-2+3(executor + StageBackedPolicy + match arm 3 교체 + self-test = World B).
+- **iter-8 (M2-B②b-2+3, 2026-06-05) — M2-B 종결**: World B 전환. `stage_registry.rs` 에 `execute_kv_plan`(LayerWide+빈merge→compact_keep_positions+set_current_pos; 가중merge=M4 bail, PerHead=⑤ bail) + `KVStageCtx<'_>`(&KVCache 위 StageCtx, current_pos/target_len/importance 실사용) + `StageBackedPolicy`(KVCacheStage→EvictionPolicy 역어댑터) + `ensure_builtin_stages_registered()` self-test. session.rs:620·build_bench_loop.rs:88 의 sliding/streaming/h2o 3 arm → `find_stage`→make→StageBackedPolicy(h2o_plus/d2o/none/bail/유도코드 잔류, orphan import 정리, 두 build 경로에 self-test 호출). 신규 parity 테스트 `stage_backed_evict_parity_{sliding,h2o}`(F32/F16/Q4_0 bit-identical). 게이트: build OK, test 1225/0(신규 2), clippy clean, fmt 내파일. **release smoke green**: fat-LTO 빌드 OK + `cargo test --release` stage_registry 5/5 + `argus_bench eviction sliding` 정상 생성. 커밋 `a7fe3823`. → 다음 iter: M3.
 
 ## M2-B 재설계 — ground truth (workflow wf_a9f025a7, 4축 surface)
 
@@ -89,7 +88,7 @@ M1·M2·M3·M5 커밋 + 전체 `/sanity-check` green + release self-test 통과 
 
 ## M2(B) 구현 plan (설계 확정 후 — 루프 재개 대상)
 1. ✅ **(iter-4, `caeca4f2`)** M1 technique-api rename + 재구성: `KVCacheStage` trait(`fn name`, `fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan>`) + `KVCachePlan`/`KeepSpec`/`WeightedMerge` + `StageCtx` 읽기 추상 + `KVCacheStageReg`/`KV_CACHE_STAGES`/`StageParams`/`find_stage`.
-2. 엔진: `StageCtx`를 `&KVCache` 위로 impl + `KVCachePlan` executor(LayerWide→apply_merges(가중)+compact_keep_positions / PerHead→compact_keep_positions_for_head / PerHead+merges→bail) + 빌트인 4정책을 `KVCacheStage`로(어댑터 또는 직접) + `KV_CACHE_STAGES` 레지스트리로 session.rs:621·init.rs match arm 제거 + startup self-test.
+2. ✅ **(iter-6,7,8; `2676acd2`/`fb992138`/`a7fe3823`)** 엔진: `KVStageCtx`(StageCtx over &KVCache) + `execute_kv_plan`(LayerWide+빈merge 구현, 가중merge·PerHead bail) + 어댑터(`EvictionPolicyAsStage`)/역어댑터(`StageBackedPolicy`) + `KV_CACHE_STAGES` 레지스트리로 session.rs·build_bench_loop.rs 의 sliding/streaming/h2o match arm 제거 + startup self-test + name 통일. release smoke green.
 3. compact_parity를 가중 merge·per-head로 확장.
 4. (M4) d2o를 `KVCacheStage`로 재구현(plan에 nearest+Eq.11 가중치, EMA=impl Mutex, K=StageCtx). 기존 D2OHandler와 동등성 테스트 선행, 미확립 시 STOP.
 5. (F5) head_importance session forward 배선.
