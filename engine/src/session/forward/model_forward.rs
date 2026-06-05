@@ -567,6 +567,49 @@ impl Forward for ModelForward {
             Ok((0, before_pos))
         }
     }
+
+    fn try_offload(
+        &mut self,
+        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
+        ratio: f32,
+    ) -> anyhow::Result<(usize, usize)> {
+        // try_evict 와 동일 UER(take_inner → op → put_inner). offload 는 prune_prefix
+        // 로 current_pos 를 줄이므로 op 후 새 pos 를 읽어 호출자(DecodeLoop)가 동기화.
+        if let Some(fmts) = &self.fmt_caches {
+            let mut temp: Vec<crate::pressure::kv_cache::KVCache> =
+                fmts.iter().map(|f| f.take_inner()).collect();
+            let result = cache_manager.offload(&mut temp, ratio);
+            let new_pos = temp.first().map(|c| c.current_pos).unwrap_or(0);
+            for (f, c) in fmts.iter().zip(temp.into_iter()) {
+                f.put_inner(c);
+            }
+            let n = result?;
+            return Ok((n, new_pos));
+        }
+        let n = cache_manager.offload(&mut self.kv_caches, ratio)?;
+        let new_pos = self.kv_caches.first().map(|c| c.current_pos).unwrap_or(0);
+        Ok((n, new_pos))
+    }
+
+    fn try_recall(
+        &mut self,
+        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
+    ) -> anyhow::Result<(usize, usize)> {
+        if let Some(fmts) = &self.fmt_caches {
+            let mut temp: Vec<crate::pressure::kv_cache::KVCache> =
+                fmts.iter().map(|f| f.take_inner()).collect();
+            let result = cache_manager.recall(&mut temp);
+            let new_pos = temp.first().map(|c| c.current_pos).unwrap_or(0);
+            for (f, c) in fmts.iter().zip(temp.into_iter()) {
+                f.put_inner(c);
+            }
+            let n = result?;
+            return Ok((n, new_pos));
+        }
+        let n = cache_manager.recall(&mut self.kv_caches)?;
+        let new_pos = self.kv_caches.first().map(|c| c.current_pos).unwrap_or(0);
+        Ok((n, new_pos))
+    }
 }
 
 fn workspace_config_for(model: &TransformerModel, max_seq_len: usize) -> WorkspaceConfig {

@@ -115,6 +115,33 @@ pub trait Forward {
         let _ = (cache_manager, scores, force, target_ratio);
         Ok((0, 0))
     }
+
+    /// argus-bench AB-3: resilience KvOffload — LRU prefix 를 disk 로 offload.
+    /// `cache_manager` 는 `--swap-dir` 로 enable_swap 된 SwapHandler 보유.
+    /// `&mut` 필요(offload 가 handler ratio 변경). ModelForward 만 override(UER).
+    ///
+    /// Returns (offloaded_count, new_pos). offloaded_count == 0 이면 미발생
+    /// (swap 미활성/대상 0).
+    fn try_offload(
+        &mut self,
+        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
+        ratio: f32,
+    ) -> anyhow::Result<(usize, usize)> {
+        let _ = (cache_manager, ratio);
+        Ok((0, 0))
+    }
+
+    /// argus-bench AB-3: resilience RestoreDefaults — offload 된 prefix 를 disk 에서
+    /// recall. ModelForward 만 override.
+    ///
+    /// Returns (recalled_count, new_pos). recalled_count == 0 이면 미발생.
+    fn try_recall(
+        &mut self,
+        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
+    ) -> anyhow::Result<(usize, usize)> {
+        let _ = cache_manager;
+        Ok((0, 0))
+    }
 }
 
 /// Eviction stage invoked before each forward step.

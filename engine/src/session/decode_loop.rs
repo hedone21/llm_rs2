@@ -193,6 +193,35 @@ impl DecodeLoop {
                 self.evict_applied = false;
             }
 
+            // (a.6) argus-bench AB-3: resilience KvOffload / recall. offload_ratio
+            // 는 sticky 가 아니라 KvOffload directive 가 도착한 poll 에만 Some 이라
+            // 자연히 1회 발동. RestoreDefaults 는 recall_offload + restore_defaults 를
+            // 함께 세팅하여 recall 을 게이트. offload 는 prune_prefix(pos 감소),
+            // recall 은 pos 증가 → cache 의 새 current_pos 로 loop pos 동기화.
+            if let Some(ratio) = plan.offload_ratio
+                && let Some(cm) = self.cache_manager.as_mut()
+            {
+                let (n, new_pos) = self.forward.try_offload(cm, ratio)?;
+                eprintln!(
+                    "[Resilience] KvOffload: ratio={:.2}, {} tokens swapped",
+                    ratio, n
+                );
+                if n > 0 {
+                    self.pos = new_pos;
+                    self.forward.on_kv_prune(new_pos);
+                }
+            }
+            if plan.recall_offload
+                && plan.restore_defaults
+                && let Some(cm) = self.cache_manager.as_mut()
+            {
+                let (n, new_pos) = self.forward.try_recall(cm)?;
+                if n > 0 {
+                    eprintln!("[Resilience] Recalled {} tokens from swap", n);
+                    self.pos = new_pos;
+                }
+            }
+
             // (b) eviction
             let ctx = step_ctx(
                 self.pos,
