@@ -207,15 +207,20 @@ impl HtpFastrpcBackend {
         Ok(())
     }
 
-    /// S4 — Q4_0 weight × F32 activation GEMV NPU dispatch (M==1).
+    /// S4/Y — Q4_0 weight × F32 activation matmul NPU dispatch (M≥1).
     ///
     /// caller (`matmul_transposed`) 가 (a) `htp_matmul_dispatchable` 게이트
     /// 통과, (b) a/b/out 전부 RpcmemBuffer-backed 확인 후 진입. weight `b` 는
     /// `copy_weight_from` 에서 이미 q4x4x2 layout 으로 repack 되어 있다고 가정.
     ///
-    /// microbench `run_htp` 의 dispatch body 와 동일 (ne/nb 계산 + init_matmul_req
-    /// + n_bufs=3 dspqueue_write → dspqueue_read → status 확인). timing/prof
-    /// 진단 없이 정확성 path 만.
+    /// `m` = activation row 수 (decode GEMV=1, prefill GEMM=seq_len). M==1 이면
+    /// microbench `run_htp` 의 GEMV dispatch 와 byte-identical 로 환원된다. M>1
+    /// 은 ne1=M, plane stride=M*row 로 일반화 (llama.cpp HTP 의 general matmul
+    /// 과 동일). Q4_0 matmul 을 prefill·decode 모두 NPU 로 보내 CPU fallback 의
+    /// q4x4x2↔standard 레이아웃 비호환(garbage)을 구조적으로 제거한다.
+    ///
+    /// timing/prof 진단 없이 정확성 path 만 (n_bufs=3 dspqueue_write →
+    /// dspqueue_read → status 확인).
     #[cfg(target_os = "android")]
     fn matmul_transposed_via_htp(
         &self,
@@ -224,6 +229,7 @@ impl HtpFastrpcBackend {
         out_rpc: &RpcmemBuffer,
         n: usize,
         k: usize,
+        m: usize,
     ) -> Result<()> {
         // ── Build packet ───────────────────────────────────────────────────
         //
@@ -238,13 +244,16 @@ impl HtpFastrpcBackend {
         let ne_w = [k as u32, n as u32, 1, 1];
         let nb_w = [18u32, row_bytes_w, plane_bytes_w, plane_bytes_w];
 
-        // input F32 vector x[K] — ne0=K
-        let ne_x = [k as u32, 1, 1, 1];
-        let nb_x = [4u32, (k * 4) as u32, (k * 4) as u32, (k * 4) as u32];
+        // input F32 activation x[M, K] (row-major) — ne=(K, M, 1, 1).
+        // M==1 이면 [4, K*4, K*4, K*4] 로 환원 (proven GEMV path).
+        let plane_x = (m * k * 4) as u32;
+        let ne_x = [k as u32, m as u32, 1, 1];
+        let nb_x = [4u32, (k * 4) as u32, plane_x, plane_x];
 
-        // output F32 vector y[N] — ne0=N
-        let ne_y = [n as u32, 1, 1, 1];
-        let nb_y = [4u32, (n * 4) as u32, (n * 4) as u32, (n * 4) as u32];
+        // output F32 y[M, N] (row-major) — ne=(N, M, 1, 1).
+        let plane_y = (m * n * 4) as u32;
+        let ne_y = [n as u32, m as u32, 1, 1];
+        let nb_y = [4u32, (n * 4) as u32, plane_y, plane_y];
 
         let mut req = HtpGeneralReq::zeroed();
         let src0 = htp_tensor_from_shape(HTP_TYPE_Q4_0, ne_w, nb_w);
@@ -315,15 +324,17 @@ impl HtpFastrpcBackend {
 
 /// HTP NPU dispatch 가능 여부 (dtype/shape gating). buffer backing 확인은 별도.
 ///
-/// `Some((n, k))` 이면 weight `b` 는 `[n, k]` Q4_0 (K%256==0), activation `a`
-/// 는 F32 K-vector (M==1 decode GEMV), output 은 F32 N-vector. prefill (M>1)
-/// 또는 비-Q4_0 weight / K misalign 은 `None` (cpu fallback).
+/// `Some((n, k, m))` 이면 weight `b` 는 `[n, k]` Q4_0 (K%256==0), activation `a`
+/// 는 F32 `[m, k]` (M=row 수: decode GEMV=1, prefill GEMM=seq_len), output 은
+/// F32 `[m, n]`. 비-Q4_0 weight / K misalign / shape 불일치는 `None` (cpu
+/// fallback). **M==1 뿐 아니라 M>1(prefill)도 dispatch** — Q4_0 matmul 을 전부
+/// NPU 로 보내 CPU fallback 의 q4x4x2↔standard 비호환을 제거 (Y 설계).
 ///
 /// host(non-android) 에서도 컴파일/테스트 가능 (cfg 게이트 없음). 단 non-android
 /// 에서는 유일한 비-test 호출처(`matmul_transposed` 의 android 블록)가 cfg-out
 /// 되어 dead — `htp_dispatch_log_once` 와 동일하게 allow.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn htp_matmul_dispatchable(a: &Tensor, b: &Tensor, out: &Tensor) -> Option<(usize, usize)> {
+fn htp_matmul_dispatchable(a: &Tensor, b: &Tensor, out: &Tensor) -> Option<(usize, usize, usize)> {
     let bd = b.shape().dims();
     if bd.len() != 2 {
         return None;
@@ -335,13 +346,16 @@ fn htp_matmul_dispatchable(a: &Tensor, b: &Tensor, out: &Tensor) -> Option<(usiz
     if !k.is_multiple_of(256) {
         return None;
     }
-    if a.numel() != k {
-        return None; // M==1 (decode GEMV) 만; prefill M>1 → None
-    }
-    if out.numel() != n {
+    // activation 은 정확히 [M, K] = M*K 원소 (M = row 수). K=0(division 보호) 또는
+    // K 비배수면 reject. `||` 단락평가로 k==0 시 is_multiple_of 미호출.
+    if k == 0 || !a.numel().is_multiple_of(k) {
         return None;
     }
-    Some((n, k))
+    let m = a.numel() / k;
+    if m == 0 || out.numel() != m * n {
+        return None;
+    }
+    Some((n, k, m))
 }
 
 /// 첫 1회 dispatch / fallback 분기를 eprintln 으로 노출 ("no silent caps").
@@ -357,7 +371,7 @@ fn htp_dispatch_log_once(dispatched: bool, reason: &str) {
     static FALLBACK_ONCE: Once = Once::new();
     if dispatched {
         DISPATCH_ONCE.call_once(|| {
-            eprintln!("[htp] matmul_transposed: NPU dispatch 활성 (M==1 Q4_0 q4x4x2)");
+            eprintln!("[htp] matmul_transposed: NPU dispatch 활성 (Q4_0 q4x4x2, M≥1)");
         });
     } else {
         FALLBACK_ONCE.call_once(|| {
@@ -392,30 +406,48 @@ impl Backend for HtpFastrpcBackend {
         self.cpu_companion.matmul(a, b, out)
     }
 
-    /// S4 — decode weight matmul (`a @ bᵀ → out`). b = Q4_0 weight,
-    /// a = F32 activation (M==1 GEMV). RpcmemBuffer-backed 인 경우 NPU dispatch,
-    /// 그 외 cpu_companion fallback ("no silent caps" — 첫 1회 분기 로그).
+    /// S4/Y — weight matmul (`a @ bᵀ → out`). b = Q4_0 weight (q4x4x2 repacked),
+    /// a = F32 activation `[m, k]` (decode GEMV=1 row, prefill GEMM=seq_len rows).
+    /// a/b/out 전부 RpcmemBuffer-backed 면 prefill·decode 모두 NPU dispatch. Q4_0
+    /// 을 전부 NPU 로 보내 CPU fallback 의 q4x4x2↔standard 비호환을 제거한다.
+    ///
+    /// **silent garbage 차단 (pivot = weight 가 q4x4x2 인가)**: weight `b` 의
+    /// buffer 가 RpcmemBuffer 면 그 weight 는 q4x4x2 repacked (copy_weight_from 이
+    /// Q4_0 2D K%256==0 만 rpcmem+repack). CPU 는 q4x4x2 를 standard block_q4_0 로
+    /// 읽어 garbage 이므로, q4x4x2 weight 는 **NPU dispatch (act/out 도 rpcmem +
+    /// dtype/shape 게이트 통과) 아니면 loud error** — cpu fallback 절대 금지. weight
+    /// 가 비-rpcmem(standard)이면 cpu fallback 안전. 이 구조로 silent cpu garbage
+    /// 경로를 호출 그래프와 무관하게 봉쇄한다.
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         #[cfg(target_os = "android")]
         {
-            if let Some((n, k)) = htp_matmul_dispatchable(a, b, out) {
+            // weight 가 rpcmem 이면 q4x4x2 (cpu fallback 불가). 이 사실이 분기 pivot.
+            if let Some(b_rpc) = b.buffer().as_any().downcast_ref::<RpcmemBuffer>() {
                 let a_rpc = a.buffer().as_any().downcast_ref::<RpcmemBuffer>();
-                let b_rpc = b.buffer().as_any().downcast_ref::<RpcmemBuffer>();
                 let out_rpc = out.buffer().as_any().downcast_ref::<RpcmemBuffer>();
-                if let (Some(a_rpc), Some(b_rpc), Some(out_rpc)) = (a_rpc, b_rpc, out_rpc) {
+                if let (Some((n, k, m)), Some(a_rpc), Some(out_rpc)) =
+                    (htp_matmul_dispatchable(a, b, out), a_rpc, out_rpc)
+                {
                     htp_dispatch_log_once(true, "");
-                    return self.matmul_transposed_via_htp(a_rpc, b_rpc, out_rpc, n, k);
+                    return self.matmul_transposed_via_htp(a_rpc, b_rpc, out_rpc, n, k, m);
                 }
-                htp_dispatch_log_once(
-                    false,
-                    "weight/act/out 중 rpcmem 아님 (SharedBuffer) → cpu fallback",
-                );
-            } else {
-                htp_dispatch_log_once(
-                    false,
-                    "dtype/shape 게이트 미충족 (M>1 또는 비-Q4_0 또는 K%256!=0)",
+                // q4x4x2 weight 인데 dispatch 조건 미충족 (act/out 비-rpcmem 또는
+                // dtype/shape 게이트 실패) → cpu fallback 은 q4x4x2 를 standard 로
+                // 읽어 garbage → loud error. 주경로(workspace=rpcmem·F32)에선 미발생.
+                anyhow::bail!(
+                    "htp: q4x4x2 Q4_0 weight matmul 은 NPU dispatch 필요 (act/out rpcmem + \
+                     dtype/shape 게이트); act_rpcmem={}, out_rpcmem={}. cpu fallback 은 \
+                     q4x4x2↔standard 비호환으로 garbage 라 차단",
+                    a_rpc.is_some(),
+                    out_rpc.is_some()
                 );
             }
+            // weight 가 rpcmem 아님 (standard Q4_0/F16/F32/… , copy_weight_from 의
+            // cpu_companion arm) → cpu fallback 안전 (standard 레이아웃).
+            htp_dispatch_log_once(
+                false,
+                "weight 가 rpcmem-q4x4x2 아님 → cpu fallback (standard)",
+            );
         }
         self.cpu_companion.matmul_transposed(a, b, out)
     }
@@ -483,10 +515,12 @@ impl Backend for HtpFastrpcBackend {
         self.cpu_companion.copy_from(t)
     }
 
-    /// S5 — weight 를 rpcmem (DMA-BUF heap) 으로 전면 할당. Q4_0 2D weight
-    /// (K%256==0) 은 q4x4x2 layout 으로 repack (DSP-side
-    /// `vec_dot_q4x4x2_q8x4x2_*` 가 expect). F32/F16 은 as-is rpcmem copy.
-    /// 그 외 dtype 은 cpu_companion (SharedBuffer) fallback — DSP 미경유.
+    /// S5 — NPU dispatch 대상 weight (Q4_0 2D, K%256==0) 만 rpcmem (DMA-BUF
+    /// heap) 으로 할당하면서 q4x4x2 layout 으로 repack (DSP-side
+    /// `vec_dot_q4x4x2_q8x4x2_*` 가 expect). **그 외 dtype (F32/F16/Q8_0/Q6_K
+    /// 등) 은 전부 cpu_companion** — `matmul_transposed` 게이트가 Q4_0 만
+    /// dispatch 하므로 비-Q4_0 weight 는 어차피 cpu matmul. rpcmem 상주는 순수
+    /// 낭비이자 system-heap OOM 압박이라 회피 (예: F16 lm_head ~445MB).
     ///
     /// 본 override 가 없으면 weight 가 SharedBuffer 에 상주 → `matmul_transposed`
     /// 의 RpcmemBuffer downcast 가 영원히 실패 → silent cpu fallback (NPU 미경유).
@@ -497,7 +531,7 @@ impl Backend for HtpFastrpcBackend {
     fn copy_weight_from(&self, t: &Tensor) -> Result<Tensor> {
         let dims = t.shape().dims();
         match t.dtype() {
-            // Q4_0 2D weight (K%256==0): rpcmem alloc + q4x4x2 repack.
+            // Q4_0 2D weight (K%256==0): rpcmem alloc + q4x4x2 repack (NPU 대상).
             DType::Q4_0 if dims.len() == 2 && dims[1].is_multiple_of(256) => {
                 let (n, k) = (dims[0], dims[1]);
                 let blocks = t.as_slice::<crate::quant::BlockQ4_0>();
@@ -519,22 +553,8 @@ impl Backend for HtpFastrpcBackend {
                     self.cpu_companion.clone(),
                 ))
             }
-            // F32/F16 weight: rpcmem copy as-is (no repack).
-            DType::F32 | DType::F16 => {
-                let bytes = t.as_slice::<u8>();
-                let mut buf = RpcmemBuffer::alloc(self.host.clone(), t.size(), t.dtype())?;
-                // SAFETY: bytes.len() == t.size() (as_slice::<u8> = size()/1).
-                // buf 은 t.size() byte allocated. non-overlapping (별도 alloc).
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), t.size());
-                }
-                Ok(Tensor::new(
-                    t.shape().clone(),
-                    Arc::new(buf),
-                    self.cpu_companion.clone(),
-                ))
-            }
-            // Q8_0/Q4_1/BF16/기타: cpu_companion fallback (SharedBuffer, 정확).
+            // 비-Q4_0 (F32/F16/Q8_0/Q6_K/…) 및 비정렬 Q4_0: cpu_companion
+            // (SharedBuffer). NPU dispatch 대상이 아니므로 rpcmem 상주 불필요.
             _ => self.cpu_companion.copy_weight_from(t),
         }
     }
@@ -741,7 +761,7 @@ mod tests {
 
     #[test]
     fn dispatchable_q4_0_m1_k256_some() {
-        // weight [N=4, K=256] Q4_0, act F32 K=256 (M==1), out F32 N=4.
+        // weight [N=4, K=256] Q4_0, act F32 K=256 (M==1 decode), out F32 N=4.
         let k = 256;
         let n = 4;
         let blocks_per_row = k / 32; // 8
@@ -749,7 +769,7 @@ mod tests {
         let b = mk_tensor(vec![n, k], DType::Q4_0, w_bytes);
         let a = mk_tensor(vec![1, k], DType::F32, k * 4);
         let out = mk_tensor(vec![1, n], DType::F32, n * 4);
-        assert_eq!(htp_matmul_dispatchable(&a, &b, &out), Some((n, k)));
+        assert_eq!(htp_matmul_dispatchable(&a, &b, &out), Some((n, k, 1)));
     }
 
     #[test]
@@ -764,17 +784,33 @@ mod tests {
     }
 
     #[test]
-    fn dispatchable_prefill_m2_none() {
-        // M==2 (prefill) → a.numel() != k → None.
+    fn dispatchable_prefill_m2_some() {
+        // M==2 (prefill GEMM) → Y 설계에선 dispatch 대상 → Some((n, k, 2)).
         let k = 256;
         let n = 4;
         let blocks_per_row = k / 32;
         let w_bytes = n * blocks_per_row * 18;
         let b = mk_tensor(vec![n, k], DType::Q4_0, w_bytes);
-        // act [2, K] → numel = 2*K != K.
+        // act [2, K] → numel = 2*K, out [2, N] → numel = 2*N.
         let a = mk_tensor(vec![2, k], DType::F32, 2 * k * 4);
         let out = mk_tensor(vec![2, n], DType::F32, 2 * n * 4);
+        assert_eq!(htp_matmul_dispatchable(&a, &b, &out), Some((n, k, 2)));
+    }
+
+    #[test]
+    fn dispatchable_shape_mismatch_none() {
+        // act numel 이 K 배수가 아니면 (M 비정수) → None.
+        let k = 256;
+        let n = 4;
+        let w_bytes = n * (k / 32) * 18;
+        let b = mk_tensor(vec![n, k], DType::Q4_0, w_bytes);
+        let a = mk_tensor(vec![1, k + 1], DType::F32, (k + 1) * 4); // numel=257, 256 비배수
+        let out = mk_tensor(vec![1, n], DType::F32, n * 4);
         assert_eq!(htp_matmul_dispatchable(&a, &b, &out), None);
+        // out numel 이 m*n 과 불일치해도 None.
+        let a2 = mk_tensor(vec![2, k], DType::F32, 2 * k * 4); // m=2
+        let out2 = mk_tensor(vec![1, n], DType::F32, n * 4); // numel=n != 2*n
+        assert_eq!(htp_matmul_dispatchable(&a2, &b, &out2), None);
     }
 
     #[test]
