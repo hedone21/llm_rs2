@@ -154,6 +154,10 @@ name = "microbench_htp_matmul"
 path = "microbench/htp_matmul.rs"
 
 [[bin]]
+name = "microbench_htp_batch_dispatch"
+path = "microbench/htp_batch_dispatch.rs"
+
+[[bin]]
 name = "microbench_htp_add"
 path = "microbench/htp_add.rs"
 
