@@ -10,6 +10,7 @@
 > **M2-B ✅ 완료** (①`caeca4f2` 표면 / ②a`2676acd2` 등록 / ②b-1`fb992138` name통일 / ②b-2+3`a7fe3823` World B). sliding/streaming/h2o 3 LayerWide 정책이 `KV_CACHE_STAGES` 레지스트리→`StageBackedPolicy` 역어댑터로 **World B(plan→compact)** 전환, session.rs·build_bench_loop.rs match arm 제거(OCP). h2o_plus(per-head, ⑤)·d2o(M4)·none(match 밖)·bail 잔류. **release smoke GREEN**: release fat-LTO 빌드 OK + `cargo test --release` stage_registry 5/5(linkme gc-sections 생존) + `argus_bench eviction sliding` 정상 생성(bail 0). 무회귀: test 1225/0 + compact_parity + 신규 stage_backed_evict_parity(F32/F16/Q4_0 bit-identical).
 > **M3 ✅ 완료**(`b23dec09` + ADR 정정): workspace glob `crates/techniques/*` + `crates/techniques/example-keep-recent`(technique-api 만 의존, KVCacheStage 구현+등록). **실증 finding**: dep 1줄만으론 부족(Rust dead-crate elision → 미참조 rlib 미링크 → 등록 누락) → **force-link 1줄(`use <crate> as _;`)** 추가 필요. 확장 비용 = 폴더 + dep 1줄 + force-link 1줄(기존 로직 수정 0, OCP 유지). ADR-0003 §4 D4·§3 정정. release smoke 6/6(cross-crate linkme fat-LTO 생존). test 1226/0.
 > **M4 진행 중** — **사용자 결정(iter-10): (A) 완전 구현 + ADR-0004 §4 개정(Q4 merge 보존)**. §4 개정 완료(Q4_0 merge 비활성 폐기 → executor apply_merges 가중+Q4 확장). 분해: **M4-a** §4 개정✅(`<this>`) → **M4-b** executor 가중-merge + Q4_0 apply_merges(scatter_reduce 의미 이식) + compact_parity 가중-merge 확장 → **M4-c** d2o KVCacheStage 재구현(plan=retain_all keep + WeightedMerge[eq11], EMA=impl Mutex, K=StageCtx.dequant_k 실구현) + 동등성 테스트(D2OStage plan→executor ≡ 기존 D2OHandler, bit-identical F32/F16/Q4 — **선작성, 미확립 시 STOP**) + d2o 등록 + session.rs:604·build_bench_loop.rs:72 if-branch 제거. 헬퍼 재사용(find_nearest_layer_wide/compute_eq11_weights/scatter_reduce_*)으로 bit-identical 달성. 이후 ⑤(F5 head_importance + h2o_plus PerHead), M5(기여자 문서).
+> **M4-b 구현 스펙 박제됨**(아래 "## M4-b 구현 스펙", iter-11) — scatter_reduce 산술 전수 + apply_weighted_merges 설계 + 테스트 plan. 다음 턴은 스펙대로 구현(재독 불요).
 > 재개 명령 예: "M4-b 진행".
 
 ---
@@ -67,6 +68,7 @@ M1·M2·M3·M5 커밋 + 전체 `/sanity-check` green + release self-test 통과 
 - **iter-8 (M2-B②b-2+3, 2026-06-05) — M2-B 종결**: World B 전환. `stage_registry.rs` 에 `execute_kv_plan`(LayerWide+빈merge→compact_keep_positions+set_current_pos; 가중merge=M4 bail, PerHead=⑤ bail) + `KVStageCtx<'_>`(&KVCache 위 StageCtx, current_pos/target_len/importance 실사용) + `StageBackedPolicy`(KVCacheStage→EvictionPolicy 역어댑터) + `ensure_builtin_stages_registered()` self-test. session.rs:620·build_bench_loop.rs:88 의 sliding/streaming/h2o 3 arm → `find_stage`→make→StageBackedPolicy(h2o_plus/d2o/none/bail/유도코드 잔류, orphan import 정리, 두 build 경로에 self-test 호출). 신규 parity 테스트 `stage_backed_evict_parity_{sliding,h2o}`(F32/F16/Q4_0 bit-identical). 게이트: build OK, test 1225/0(신규 2), clippy clean, fmt 내파일. **release smoke green**: fat-LTO 빌드 OK + `cargo test --release` stage_registry 5/5 + `argus_bench eviction sliding` 정상 생성. 커밋 `a7fe3823`. → 다음 iter: M3.
 - **iter-9 (M3, 2026-06-05)**: per-crate 확장 메커니즘. workspace glob `crates/techniques/*` + `crates/techniques/example-keep-recent`(technique-api 만 의존, KVCacheStage "example_keep_recent" 구현+등록, 자체 test 2/2). engine dev-dep + cross-crate 테스트. **실증 finding**: dep 1줄만으론 미링크(Rust dead-crate elision → 미참조 rlib 미링크 → linkme 등록 누락; 실측 find_stage None) → **force-link 1줄(`use <crate> as _;`)** 필요. 확장 비용 = 폴더 + dep 1줄 + force-link 1줄(기존 로직 수정 0, OCP 유지). ADR-0003 §4 D4·§3 정정. 게이트: build(prod, example 미링크) OK, test 1226/0(신규 cross-crate 1), clippy --workspace clean, release smoke `cargo test --release` stage_registry 6/6(cross-crate linkme fat-LTO 생존). 커밋 `b23dec09`(코드) + `061b627f`(ADR/원장). 빌트인 per-crate 이전은 engine EvictionPolicy 타입 결합이라 보류(예제 crate 로 패턴 확립 충분). 외부 동시편집 engine/Cargo.toml(batch_dispatch bin)은 내 것 아니라 미커밋. → 다음 iter: M4.
 - **iter-10 (M4, 2026-06-05) — ⏸ STOP, 사용자 결정 대기**: d2o(d2o_handler.rs 2273줄) 평가. evict_and_merge = H2O 3-partition(retain_all keep) + find_nearest_layer_wide(cosine, raw K) + EMA τ 갱신(stateful) + 필터(sim≥τ) + scatter_reduce_merge(가중, F32/F16/**Q4 모두**) + compact. **결론**: KVCacheStage plan-returning 재구현 가능(keep=retain_all, merges=passing evict→nearest 의 Eq.11 WeightedMerge, EMA=impl Mutex, K=StageCtx.dequant_k 실구현 필요), 동등성 테스트는 d2o 헬퍼 재사용으로 bit-identical 확립 가능. **§4 모순 확정**: scatter_reduce_merge_layer_wide(d2o_handler.rs:585)가 Q4_0 merge 실행 → ADR-0004 §4 "Q4_0 merge 비활성"과 충돌. d2o→executor(apply_merges Q4 스킵) 이전 시 Q4 merge drop = paper Eq.11 회귀. **결정(사용자) = (A) 완전구현 + §4 개정(Q4 merge 보존)**. M4-a(ADR-0004 §4 개정: Q4 비활성 폐기, executor 가중+Q4 확장) 완료. 분해 M4-a✅/M4-b(executor)/M4-c(d2o stage + 동등성). 코드 변경 0(평가+ADR 개정만).
+- **iter-11 (M4-b 분석, 2026-06-05)**: scatter_reduce_f32/f16/q4(d2o_handler.rs:599-821) 산술 전수 파악 — group_by_retain→compute_eq11_weights→per head `acc=w_c·into+Σw·from`(K/V dtype 독립 디스패치, Q4 dequant→가중합→requant). WeightedMerge↔group 1:1 매핑 확정. **M4-b 구현 스펙 박제**(아래 "## M4-b 구현 스펙"): `apply_weighted_merges`(standard_format.rs, scatter_reduce bit-faithful 미러) + executor 배선 + bit-identity 테스트(scatter_reduce 대비, d2o 내부 pub(crate)화). 코드 변경 0(분석+스펙만, bit-identity 정밀 구현은 깨끗한 턴에서). → 다음 iter: M4-b 구현.
 
 ## M2-B 재설계 — ground truth (workflow wf_a9f025a7, 4축 surface)
 
@@ -133,6 +135,27 @@ M1·M2·M3·M5 커밋 + 전체 `/sanity-check` green + release self-test 통과 
 - StageParams 비대화(공용 struct 미사용 필드 vs per-technique opaque params) — 현재 5필드 유지, M4 에서 d2o 필드 추가 시 재결정.
 - h2o_plus 폴백 정책: `has_head_scores()=false` 시 LayerWide(sliding 등가) vs LayerWide(H2O 등가) 무엇 반환할지 명세 필요.
 - 레지스트리 산출 단위: `Box<dyn KVCacheStage>` vs 완성된 `CacheManager`(needs_scores 장착 등 조립은 레지스트리 밖 공통 후처리).
+
+## M4-b 구현 스펙 (iter-11 분석 — scatter_reduce 산술 박제, 다음 턴 구현)
+
+목표: executor 의 `execute_kv_plan` LayerWide+merges 경로(현 `bail!`)를 `apply_weighted_merges` 로 구현. **scatter_reduce 와 bit-identical** 필수(M4-c 동등성 근거).
+
+**scatter_reduce 산술 (d2o_handler.rs:599-821, 확인됨)**:
+- group: `group_by_retain`(passing→matches) = `HashMap<retain_pos, Vec<(evict_pos, sim)>>`. group 키(retain_pos) 끼리 disjoint(evict∉retain) → 처리 순서 무관.
+- group 당 `compute_eq11_weights(evicted_list, merge_e)` → `(w_c, w_e:Vec)`. (w_c=merge_e/D, w_e[i]=exp(clamp(sim,-10,10))/D, D=Σexp+merge_e).
+- per head h: `acc = w_c·into[d]; for i: acc += w_e[i]·from_i[d]` (into 먼저, from 은 list 순서). K/V 각각.
+- **dtype 디스패치**: scatter_reduce_merge_layer_wide(:564)가 **K dtype**로 f32/f16/q4 선택; q4 내부에서 **V dtype 별도 디스패치**(:776). f32/f16 함수는 K=V 동일 dtype 가정. → `apply_weighted_merges` 는 **K=k_buffer.dtype(), V=v_buffer.dtype() 독립 디스패치**로 일반화(세 경우 모두 scatter_reduce 와 일치).
+- **F32/F16**: `acc = w_c·buf[into_off+d](.to_f32()) + Σ w·buf[from_off+d](.to_f32())`, write(f16=from_f32). offset=`cache.offset(pos,h)`.
+- **Q4_0**: blocks_per_pos=head_dim/QK4_0. from K/V 각각 full head_dim dequant(BlockQ4_0::dequantize per block) 1회. retain: per block bi → dequant `r_f32[QK4_0]` → `r_f32[i]*=w_c` → `for from: r_f32[i]+=w[idx]·from_buf[bi·QK4_0+i]` → `BlockQ4_0::quantize(&r_f32)`. block offset=`cache.q4_block_offset(pos,h,blocks_per_pos)`.
+- borrow 패턴: offset(immutable) 먼저 collect → `as_mut_slice`(mut). scatter_reduce 와 동일.
+
+**WeightedMerge↔group 매핑**: WeightedMerge{into=retain_pos, into_weight=w_c, from=[(evict_pos, w_e[i])]}. 1 WeightedMerge = 1 group.
+
+**구현 위치**: `apply_weighted_merges(cache: &mut KVCache, merges: &[technique_api::WeightedMerge])` — `standard_format.rs`(apply_merges 형제, pub(crate)). executor(stage_registry execute_kv_plan): LayerWide+merges → `apply_weighted_merges(cache,&plan.merges); cache.compact_keep_positions(keep,0); set_current_pos`.
+
+**테스트(M4-b 게이트, bit-identity)**: scatter_reduce_merge_layer_wide(old) vs WeightedMerge→apply_weighted_merges(new)가 동일 matches/weights 에서 buffer bit-identical(F32/F16/Q4). → d2o_handler 의 scatter_reduce_merge_layer_wide·compute_eq11_weights·group_by_retain·Match 를 `pub(crate)` 화(테스트 접근). compact_parity 확장도 동반(plan{LayerWide+WeightedMerge}→execute_kv_plan ≡ scatter_reduce+compact).
+
+**M4-c(다음)**: d2o KVCacheStage = plan(retain_all keep + group_by_retain+compute_eq11_weights→WeightedMerge) + EMA Mutex + StageCtx.dequant_k 실구현 + find_nearest_layer_wide(StageCtx K 읽기). 동등성 = d2o-stage(plan→apply_weighted_merges) ≡ D2OHandler(scatter_reduce). apply_weighted_merges≡scatter_reduce(M4-b) + plan==scatter_reduce 내부 group(헬퍼 재사용) → bit-identical. 미확립 시 STOP+human-review.
 
 ## (구) M2 fork — registry scope (※ B 선택으로 대체됨)
 
