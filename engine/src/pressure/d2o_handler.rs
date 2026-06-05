@@ -449,11 +449,13 @@ pub(crate) fn dequantize_k(
     }
 }
 
-/// Dequantize the layer-wide K vector at `pos` (concat of all KV heads) into `out`.
-/// `out` length must be `kv_heads * head_dim`.
-#[allow(clippy::needless_range_loop)]
-fn dequantize_k_layer_wide(
-    cache: &KVCache,
+/// Dequantize the layer-wide K vector at `pos` (concat of all KV heads) into `out`,
+/// reading each head via `reader(pos, head, &mut out_head)`. `out` len = `kv_heads * head_dim`.
+///
+/// (M4-c) reader 추상 — D2OHandler 는 `dequantize_k`(cache) reader, D2OStage 는 `StageCtx::dequant_k`
+/// (ctx) reader 를 넘긴다. 둘 다 동일 dequant 정본을 위임하므로 layer-wide K 가 bit-identical.
+fn dequantize_k_layer_wide_via(
+    reader: &dyn Fn(usize, usize, &mut [f32]),
     pos: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -461,18 +463,14 @@ fn dequantize_k_layer_wide(
 ) {
     debug_assert_eq!(out.len(), kv_heads * head_dim);
     for h in 0..kv_heads {
-        let dst = &mut out[h * head_dim..(h + 1) * head_dim];
-        dequantize_k(cache, pos, h, head_dim, dst);
+        reader(pos, h, &mut out[h * head_dim..(h + 1) * head_dim]);
     }
 }
 
-/// Find the nearest retained token using **layer-wide K** (head-concatenated).
-///
-/// Per the D2O paper (Eq.8), the membership matrix m_ij selects a single nearest
-/// retained token per evicted token. Here we compute cosine similarity on the
-/// vector formed by concatenating K across all KV heads, giving one argmax.
-fn find_nearest_layer_wide(
-    cache: &KVCache,
+/// Find the nearest retained token using **layer-wide K** (head-concatenated), reading K via
+/// `reader`. Per D2O paper Eq.8: single argmax over cosine on the head-concat vector.
+fn find_nearest_layer_wide_via(
+    reader: &dyn Fn(usize, usize, &mut [f32]),
     evict_pos: usize,
     retain_set: &[usize],
     kv_heads: usize,
@@ -482,7 +480,7 @@ fn find_nearest_layer_wide(
     let mut evict_buf = vec![0.0f32; layer_dim];
     let mut retain_buf = vec![0.0f32; layer_dim];
 
-    dequantize_k_layer_wide(cache, evict_pos, kv_heads, head_dim, &mut evict_buf);
+    dequantize_k_layer_wide_via(reader, evict_pos, kv_heads, head_dim, &mut evict_buf);
 
     let mut best_pos = retain_set.first().copied().unwrap_or(evict_pos);
     let mut best_sim = f32::NEG_INFINITY;
@@ -491,7 +489,7 @@ fn find_nearest_layer_wide(
         if retain_pos == evict_pos {
             continue;
         }
-        dequantize_k_layer_wide(cache, retain_pos, kv_heads, head_dim, &mut retain_buf);
+        dequantize_k_layer_wide_via(reader, retain_pos, kv_heads, head_dim, &mut retain_buf);
         let sim = cosine_similarity(&evict_buf, &retain_buf);
         if sim > best_sim {
             best_sim = sim;
@@ -508,6 +506,23 @@ fn find_nearest_layer_wide(
         retain_pos: best_pos,
         sim: best_sim,
     }
+}
+
+/// cache 기반 wrapper(D2OHandler 경로) — reader = `dequantize_k`(cache). 시그니처 보존(무회귀).
+fn find_nearest_layer_wide(
+    cache: &KVCache,
+    evict_pos: usize,
+    retain_set: &[usize],
+    kv_heads: usize,
+    head_dim: usize,
+) -> Match {
+    find_nearest_layer_wide_via(
+        &|p, h, o| dequantize_k(cache, p, h, head_dim, o),
+        evict_pos,
+        retain_set,
+        kv_heads,
+        head_dim,
+    )
 }
 
 /// Group passing evicted tokens by their nearest retained token (Eq.8 m_ij ⇒ groups).
