@@ -1,0 +1,12 @@
+=== microbench_htp_batch_dispatch ===
+shape mm_qkv K=1536 N=2048 (Q4_0 GEMV)
+  warmup=5 measure=30 err_thresh=0.05 batch_sizes=[1, 7, 14, 28]
+  cpu baseline magnitude: max|y| = 3.4304
+  host: libcdsprpc.so=/vendor/lib64/libcdsprpc.so, domain_id=7, session_id=1, queue_id=395291610054656
+  htp_iface_start: OK (n_hvx=0)
+  N= 1: A(sync)=  146.09 us  B(batch)=  145.68 us  ratio=B/A=1.00  max_abs_err=2.22e-2  [PASS]
+  N= 7: A(sync)= 1032.08 us  B(batch)=  449.69 us  ratio=B/A=0.44  max_abs_err=2.22e-2  [PASS]
+  N=14: A(sync)= 2033.91 us  B(batch)=  833.75 us  ratio=B/A=0.41  max_abs_err=2.22e-2  [PASS]
+  N=28: A(sync)= 4010.10 us  B(batch)= 1424.69 us  ratio=B/A=0.36  max_abs_err=2.22e-2  [PASS]
+=== Summary ===
+floor recovery (gate: B < 0.8*A): N=7 ratio=0.44, N=14 ratio=0.41, N=28 ratio=0.36
