@@ -36,3 +36,4 @@ ADR 는 다음 결정 유형에서 작성 의무:
 | [ADR-0002](0002-pressure-scalar-lossy-unification.md) | Pressure 스칼라 — lossy 단일화 (graded 입력 융합 ⊥ mode 출력 분리) | Accepted | 2026-06-02 |
 | [ADR-0003](0003-extension-mechanism-static-crates.md) | 확장 메커니즘 — 정적 링크 technique crate + 자동 등록, 런타임 `.so` 보류 | Accepted | 2026-06-05 |
 | [ADR-0004](0004-kvcachestage-plan-returning-trait.md) | `KVCacheStage` — 단일 plan-returning trait (per-head keep + 가중 merge 통합) | Accepted | 2026-06-05 |
+| [ADR-0005](0005-format-backend-capability-plugin-unification.md) | Format · Backend Capability 확장 — plugin 패턴 통일 (descriptor + backend-owned kernel + 3축 평행 registry, crate→`.so` phasing) | Accepted | 2026-06-06 |
