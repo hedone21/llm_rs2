@@ -546,6 +546,48 @@ pub(crate) fn dequantize_k(
     }
 }
 
+/// Dequantize a V vector at (pos, head) into the output buffer.
+/// Works for F32, F16, and Q4_0 dtypes — exact mirror of [`dequantize_k`] on `v_buffer`.
+///
+/// V uses the IDENTICAL `[1, kv_heads, capacity, head_dim]` layout and `offset`/`q4_block_offset`
+/// as K (confirmed by `apply_weighted_merges` which dispatches K/V independently over the same
+/// offsets), so this is byte-faithful to K dequant. pub(crate): `StageCtx::tensor(Value)`
+/// (stage_registry.rs `KVStageCtx`)가 위임 재사용 — CAOTE 의 v_i 읽기.
+pub(crate) fn dequantize_v(
+    cache: &KVCache,
+    pos: usize,
+    head: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    match cache.v_buffer.dtype() {
+        DType::F32 => {
+            let v = cache.v_buffer.as_slice::<f32>();
+            let off = cache.offset(pos, head);
+            out[..head_dim].copy_from_slice(&v[off..off + head_dim]);
+        }
+        DType::F16 => {
+            let v = cache.v_buffer.as_slice::<f16>();
+            let off = cache.offset(pos, head);
+            for d in 0..head_dim {
+                out[d] = v[off + d].to_f32();
+            }
+        }
+        DType::Q4_0 => {
+            let v = cache.v_buffer.as_slice::<BlockQ4_0>();
+            let blocks_per_pos = head_dim / QK4_0;
+            let block_off = cache.q4_block_offset(pos, head, blocks_per_pos);
+            for bi in 0..blocks_per_pos {
+                let mut tmp = [0.0f32; QK4_0];
+                v[block_off + bi].dequantize(&mut tmp);
+                let dst = bi * QK4_0;
+                out[dst..dst + QK4_0].copy_from_slice(&tmp);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Dequantize the layer-wide K vector at `pos` (concat of all KV heads) into `out`,
 /// reading each head via `reader(pos, head, &mut out_head)`. `out` len = `kv_heads * head_dim`.
 ///
@@ -1900,6 +1942,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dequantize_v_equals_dequantize_k_bit_identical() {
+        // (M-C) dequantize_v 는 dequantize_k 의 v_buffer 미러 — 동일 레이아웃/offset/dequant 로직.
+        // K·V 에 동일 바이트를 쓰면 출력이 bitwise 일치해야 한다(F32/F16/Q4_0).
+        let hd = QK4_0 * 2; // 64
+        let vals: Vec<f32> = (0..hd).map(|d| (d as f32) * 0.013 - 0.4).collect();
+        let mut ok = vec![0.0f32; hd];
+        let mut ov = vec![0.0f32; hd];
+
+        // F32
+        let mut c = make_cache(8, 2, hd, 6);
+        write_k(&mut c, 5, 1, &vals);
+        write_v(&mut c, 5, 1, &vals);
+        dequantize_k(&c, 5, 1, hd, &mut ok);
+        dequantize_v(&c, 5, 1, hd, &mut ov);
+        assert_eq!(ok, ov, "F32 dequant_v != dequant_k");
+
+        // Q4_0
+        let mut cq = make_cache_q4(8, 2, hd, 6);
+        write_k_q4(&mut cq, 5, 1, &vals);
+        write_v_q4(&mut cq, 5, 1, &vals);
+        dequantize_k(&cq, 5, 1, hd, &mut ok);
+        dequantize_v(&cq, 5, 1, hd, &mut ov);
+        assert_eq!(ok, ov, "Q4_0 dequant_v != dequant_k");
+
+        // F16
+        let backend = Arc::new(CpuBackend::new());
+        let buf = 8 * 2 * hd * std::mem::size_of::<f16>();
+        let kt = Tensor::new(
+            Shape::new(vec![1, 8, 2, hd]),
+            Arc::new(SharedBuffer::new(buf, DType::F16)),
+            backend.clone(),
+        );
+        let vt = Tensor::new(
+            Shape::new(vec![1, 8, 2, hd]),
+            Arc::new(SharedBuffer::new(buf, DType::F16)),
+            backend,
+        );
+        let mut cf = KVCache::new(kt, vt, 8);
+        cf.current_pos = 6;
+        let off = cf.offset(5, 1);
+        for d in 0..hd {
+            cf.k_buffer.as_mut_slice::<f16>()[off + d] = f16::from_f32(vals[d]);
+            cf.v_buffer.as_mut_slice::<f16>()[off + d] = f16::from_f32(vals[d]);
+        }
+        dequantize_k(&cf, 5, 1, hd, &mut ok);
+        dequantize_v(&cf, 5, 1, hd, &mut ov);
+        assert_eq!(ok, ov, "F16 dequant_v != dequant_k");
+    }
+
     // ── M4-c: D2OStage(plan→executor) ≡ D2OHandler(evict_and_merge) — non-alloc config ──
     // compute_d2o_plan 공유 + apply_weighted_merges≡scatter_reduce(M4-b) → buffer bit-identical.
     // 같은 stage/state 인스턴스로 layer 루프를 돌아 EMA τ 누적 순서까지 일치시킨다.
@@ -1935,7 +2027,7 @@ mod tests {
         let stage = D2OStage::new(mk_d2o_config());
         for cb in caches_b.iter_mut() {
             let plan = {
-                let ctx = KVStageCtx::new(cb, target, Some(imp));
+                let ctx = KVStageCtx::new(cb, target, Some(imp), None, None);
                 stage.plan(&ctx)
             };
             if let Some(p) = plan {

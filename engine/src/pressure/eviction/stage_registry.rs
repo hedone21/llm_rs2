@@ -16,11 +16,12 @@ use anyhow::Result;
 use linkme::distributed_slice;
 use technique_api::{
     KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCtx, StageParams,
-    WeightedMerge,
+    TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
 };
 
 use super::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy, StreamingLLMPolicy};
-use crate::pressure::d2o_handler::{D2OConfig, D2OStage};
+use crate::buffer::DType;
+use crate::pressure::d2o_handler::{D2OConfig, D2OStage, dequantize_k, dequantize_v};
 use crate::pressure::kv_cache::KVCache;
 
 /// 기존 [`EvictionPolicy`](in-place `evict*` + `plan_keep`)를 plan-returning [`KVCacheStage`] 로 노출.
@@ -97,28 +98,127 @@ pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result
     }
 }
 
-/// `&KVCache`(+ budget + scores) 위로 구현한 [`StageCtx`] — 정적 단계의 읽기 borrow(ADR-0004 D5).
+/// 엔진 `DType` → technique-api `TensorDtype` 매핑(핸들 진단용; 읽기 산출은 항상 f32).
+fn map_dtype(dt: DType) -> TensorDtype {
+    match dt {
+        DType::F16 => TensorDtype::F16,
+        DType::Q4_0 => TensorDtype::Q4_0,
+        _ => TensorDtype::F32,
+    }
+}
+
+/// `tensor(Key)` 핸들 — raw K 를 `dequantize_k` 정본으로 읽는다(D2OHandler 와 bit-identical).
+struct KeyHandle<'a> {
+    cache: &'a KVCache,
+}
+impl TensorHandle for KeyHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: self.cache.current_pos(),
+            cols: self.cache.head_dim(),
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        map_dtype(self.cache.k_buffer.dtype())
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        dequantize_k(self.cache, row, kv_head, self.cache.head_dim(), out);
+    }
+}
+
+/// `tensor(Value)` 핸들 — raw V 를 `dequantize_v` 정본으로 읽는다(CAOTE 의 v_i).
+struct ValueHandle<'a> {
+    cache: &'a KVCache,
+}
+impl TensorHandle for ValueHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: self.cache.current_pos(),
+            cols: self.cache.head_dim(),
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        map_dtype(self.cache.v_buffer.dtype())
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        dequantize_v(self.cache, row, kv_head, self.cache.head_dim(), out);
+    }
+}
+
+/// `tensor(Scores)`/`tensor(AttnWeights)` 핸들 — per-(kv_head,pos) f32 스칼라.
+/// 원천 레이아웃 `[n_kv_heads * max_seq]` row-major(accumulator stride=max_seq).
+struct ScalarHandle<'a> {
+    data: &'a [f32],
+    rows: usize,
+    max_seq: usize,
+}
+impl TensorHandle for ScalarHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: self.rows,
+            cols: 1,
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        out[0] = self
+            .data
+            .get(kv_head * self.max_seq + row)
+            .copied()
+            .unwrap_or(0.0);
+    }
+}
+
+/// `&KVCache`(+ budget + scores) 위로 구현한 [`StageCtx`] (ADR-0004 D5, M-A 통합).
 ///
-/// ②b 는 LayerWide 정책(sliding/streaming/h2o)만 구동하므로 `current_pos`/`target_len`/`importance`
-/// 만 실질 사용된다. per-head(`head_score`/`has_head_scores`)·raw-K(`dequant_k`)·`layer_idx` 는
-/// head_importance forward(F5/⑤)·d2o(M4)에서 채운다 — 현재는 미plumb 안전 기본값.
+/// 모든 텐서/스코어 읽기는 [`StageCtx::tensor`] 단일 경로로 흐른다: Key/Value 핸들은 항상,
+/// Scores/AttnWeights 는 `new()` 에 슬라이스가 공급될 때만 `Some`. flat `importance()` 만 zero-copy 직접
+/// 노출(D1 예외). builtin LayerWide(sliding/streaming/h2o) + d2o(tensor(Key))는 production 에서 구동,
+/// Scores/AttnWeights 공급은 현재 host 테스트(CAOTE) 경로 — production eviction-hook threading 은 CLI
+/// 배선(D-3 deferred)과 함께 후속.
 pub(crate) struct KVStageCtx<'a> {
     cache: &'a KVCache,
     target_len: usize,
     importance: Option<&'a [f32]>,
+    key_handle: KeyHandle<'a>,
+    value_handle: ValueHandle<'a>,
+    scores_handle: Option<ScalarHandle<'a>>,
+    attn_handle: Option<ScalarHandle<'a>>,
 }
 
 impl<'a> KVStageCtx<'a> {
-    /// 엔진 eviction 경로(+ M4-c d2o 동등성 테스트)가 `&KVCache` 위로 ctx 를 만든다.
+    /// 엔진 eviction 경로(+ d2o 동등성/CAOTE host 테스트)가 `&KVCache` 위로 ctx 를 만든다.
+    /// `head_scores`/`last_attn`: per-(kv_head,pos) `[n_kv_heads*max_seq]`. `None`=미공급(`tensor()`→None).
     pub(crate) fn new(
         cache: &'a KVCache,
         target_len: usize,
         importance: Option<&'a [f32]>,
+        head_scores: Option<&'a [f32]>,
+        last_attn: Option<&'a [f32]>,
     ) -> Self {
+        let rows = cache.current_pos();
+        let max_seq = cache.max_seq_len;
         Self {
             cache,
             target_len,
             importance,
+            key_handle: KeyHandle { cache },
+            value_handle: ValueHandle { cache },
+            scores_handle: head_scores.map(|data| ScalarHandle {
+                data,
+                rows,
+                max_seq,
+            }),
+            attn_handle: last_attn.map(|data| ScalarHandle {
+                data,
+                rows,
+                max_seq,
+            }),
         }
     }
 }
@@ -142,16 +242,15 @@ impl StageCtx for KVStageCtx<'_> {
     fn head_dim(&self) -> usize {
         self.cache.head_dim()
     }
-    fn head_score(&self, _kv_head: usize, _pos: usize) -> f32 {
-        0.0 // head_importance forward = F5/⑤
-    }
-    fn has_head_scores(&self) -> bool {
-        false // ②b 미plumb
-    }
-    fn dequant_k(&self, pos: usize, head: usize, out: &mut [f32]) {
-        // (M4-c) d2o cosine-nearest 용 raw-K 읽기. d2o_handler 의 dequantize_k 정본 위임 →
-        // D2OHandler 와 bit-identical(F32/F16/Q4). out.len()==head_dim 계약.
-        crate::pressure::d2o_handler::dequantize_k(self.cache, pos, head, out.len(), out);
+    /// 단일 텐서 접근 — Key/Value 항상, Scores/AttnWeights 는 공급 시. dequant_k/v·head_score·
+    /// attn_weight 등 sugar 는 technique-api default 가 이 위에 얹힌다.
+    fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+        match kind {
+            TensorKind::Key => Some(&self.key_handle),
+            TensorKind::Value => Some(&self.value_handle),
+            TensorKind::Scores => self.scores_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            TensorKind::AttnWeights => self.attn_handle.as_ref().map(|h| h as &dyn TensorHandle),
+        }
     }
 }
 
@@ -178,7 +277,7 @@ impl StageBackedPolicy {
         importance: Option<&[f32]>,
     ) -> Result<()> {
         let plan = {
-            let ctx = KVStageCtx::new(cache, target_len, importance);
+            let ctx = KVStageCtx::new(cache, target_len, importance, None, None);
             self.stage.plan(&ctx)
         };
         if let Some(plan) = plan {
@@ -313,13 +412,10 @@ mod tests {
         fn head_dim(&self) -> usize {
             1
         }
-        fn head_score(&self, _kv_head: usize, _pos: usize) -> f32 {
-            0.0
+        // LayerWide 정책만 구동 → 텐서 미공급(None). head_score/dequant_* 는 default sugar(None→trivial).
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
         }
-        fn has_head_scores(&self) -> bool {
-            false
-        }
-        fn dequant_k(&self, _pos: usize, _head: usize, _out: &mut [f32]) {}
     }
 
     #[test]
@@ -358,6 +454,8 @@ mod tests {
     // 참조 1줄**(`use <crate> as _;`)이 designated 지점에 필요하다. 즉 확장 비용 = dep 1줄 + force-link
     // 1줄(둘 다 기계적, 기존 로직 수정 0 → OCP 유지). 상세: ADR-0003 §4 (M3 정정).
     use example_keep_recent as _;
+    // (M-F) CAOTE(value-aware) 도 동일 메커니즘으로 force-link — dep 1줄 + 이 1줄 = 기법 추가.
+    use caote as _;
 
     #[test]
     fn example_technique_crate_visible_to_engine() {
@@ -367,6 +465,42 @@ mod tests {
             find_stage("example_keep_recent").is_some(),
             "force-link 후 예제 technique crate 등록이 엔진에서 보여야 한다"
         );
+    }
+
+    #[test]
+    fn caote_stage_visible_and_value_aware_executes() {
+        // (M-F) CAOTE crate 의 cross-crate 등록 + KVStageCtx(V 공급)로 value-aware plan 산출 →
+        // execute_kv_plan 실행. mk() 가 토큰별 distinct V 를 채우므로 criticality(‖v_i−o_h‖)가 V 에
+        // 의존 → 기법이 [`StageCtx::tensor`]`(Value)` 로 V 를 직접 읽어 자체 metric 을 계산함을 증명.
+        let reg = find_stage("caote").expect("caote 등록이 엔진에서 보여야 한다");
+        let stage = (reg.make)(StageParams {
+            eviction_window: 0,
+            protected_prefix: 0,
+            keep_ratio: 0.0,
+            sink_size: 0,
+            streaming_window: 0,
+        });
+        let mut c = mk(DType::F32, 8); // kv_heads=1, head_dim=PHD, V distinct per pos, current_pos=8
+        let imp = vec![1.0f32; 8]; // 균일 가중 → criticality 는 V 가 결정
+        let plan = {
+            let ctx = KVStageCtx::new(&c, 4, Some(&imp), None, None);
+            assert!(
+                ctx.tensor(TensorKind::Value).is_some(),
+                "KVStageCtx 는 Value 핸들을 항상 공급"
+            );
+            stage.plan(&ctx).expect("plan Some")
+        };
+        match &plan.keep {
+            KeepSpec::LayerWide(k) => {
+                assert_eq!(k.len(), 4, "target_len=4 만큼 유지");
+                assert!(k.windows(2).all(|w| w[0] < w[1]), "ascending keep");
+                assert!(k.iter().all(|&p| p < 8), "유효 위치");
+            }
+            KeepSpec::PerHead(_) => panic!("v1 CAOTE 는 LayerWide"),
+        }
+        assert!(plan.merges.is_empty());
+        execute_kv_plan(&mut c, &plan).unwrap();
+        assert_eq!(c.current_pos(), 4, "executor 가 keep.len() 로 compact");
     }
 
     #[test]
@@ -527,7 +661,8 @@ mod tests {
 
     #[test]
     fn kvstagectx_dequant_k_reads_f32() {
-        // (M4-c) KVStageCtx.dequant_k 가 d2o_handler::dequantize_k 위임으로 raw K(F32)를 읽는다.
+        // (M-D) dequant_k sugar(→ tensor(Key) → KeyHandle → d2o_handler::dequantize_k)로 raw K(F32) 읽기.
+        // 완전 통합 후에도 기존 dequant_k 시그니처·결과가 보존됨을 확인.
         let mut c = mk(DType::F32, 8);
         let off = c.offset(5, 0);
         {
@@ -536,15 +671,55 @@ mod tests {
                 k[off + d] = (d as f32) * 0.5 + 1.0;
             }
         }
-        let ctx = KVStageCtx {
-            cache: &c,
-            target_len: 0,
-            importance: None,
-        };
+        let ctx = KVStageCtx::new(&c, 0, None, None, None);
         let mut out = vec![0.0f32; PHD];
         ctx.dequant_k(5, 0, &mut out);
         for d in 0..PHD {
             assert_eq!(out[d], (d as f32) * 0.5 + 1.0, "dequant_k F32 d={d}");
         }
+        // tensor(Key) 핸들 shape/dtype 계약.
+        let kh = ctx.tensor(TensorKind::Key).expect("Key handle 항상 존재");
+        assert_eq!(kh.shape().cols, PHD);
+        assert!(kh.shape().per_head);
+        assert_eq!(kh.dtype(), TensorDtype::F32);
+    }
+
+    #[test]
+    fn kvstagectx_dequant_v_reads_f32() {
+        // (M-C/M-D) dequant_v sugar(→ tensor(Value) → ValueHandle → dequantize_v)로 raw V(F32) 읽기.
+        let mut c = mk(DType::F32, 8);
+        let off = c.offset(5, 0);
+        {
+            let v = c.v_buffer.as_mut_slice::<f32>();
+            for d in 0..PHD {
+                v[off + d] = (d as f32) * 0.25 - 2.0;
+            }
+        }
+        let ctx = KVStageCtx::new(&c, 0, None, None, None);
+        let mut out = vec![0.0f32; PHD];
+        ctx.dequant_v(5, 0, &mut out);
+        for d in 0..PHD {
+            assert_eq!(out[d], (d as f32) * 0.25 - 2.0, "dequant_v F32 d={d}");
+        }
+    }
+
+    #[test]
+    fn kvstagectx_scores_and_attn_handles() {
+        // (M-D) Scores/AttnWeights 핸들 — 공급 시 per-(kv_head,pos) 스칼라 읽기, 미공급 시 None.
+        let c = mk(DType::F32, 4); // kv_heads=1
+        let max_seq = c.max_seq_len;
+        let scores: Vec<f32> = (0..max_seq).map(|p| p as f32 + 0.5).collect();
+        let attn: Vec<f32> = (0..max_seq).map(|p| p as f32 * 10.0).collect();
+        let ctx = KVStageCtx::new(&c, 0, None, Some(&scores), Some(&attn));
+        assert!(ctx.has_head_scores());
+        assert!(ctx.has_attn_weights());
+        assert_eq!(ctx.head_score(0, 3), 3.5);
+        assert_eq!(ctx.attn_weight(0, 2), 20.0);
+        // 미공급 ctx → None / trivial.
+        let bare = KVStageCtx::new(&c, 0, None, None, None);
+        assert!(!bare.has_head_scores());
+        assert!(!bare.has_attn_weights());
+        assert_eq!(bare.head_score(0, 3), 0.0);
+        assert!(bare.tensor(TensorKind::Scores).is_none());
     }
 }

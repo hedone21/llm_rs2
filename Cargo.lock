@@ -316,6 +316,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 
 [[package]]
+name = "caote"
+version = "0.1.0"
+dependencies = [
+ "linkme",
+ "technique-api",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,6 +1190,7 @@ dependencies = [
  "arc-swap",
  "ash",
  "bindgen",
+ "caote",
  "clap",
  "cudarc",
  "env_logger",

@@ -75,3 +75,53 @@ executor 매핑: `LayerWide`+merges → `apply_merges`(가중) → `compact_keep
 - `engine/src/pressure/eviction/compact_parity.rs` (등가성 게이트), `engine/src/pressure/eviction/h2o_plus.rs`(per-head), `engine/src/pressure/d2o_handler.rs`(가중 merge/EMA/nearest)
 - `engine/src/pressure/kv_cache.rs` (`compact_keep_positions`/`_for_head`), `engine/src/pressure/standard_format.rs` (`apply_merges`)
 - workflow `wf_a9f025a7` (4축 surface map), `.agent/todos/adr0003_impl_progress.md`
+
+## 7. Amendment — M-A: TensorHandle 범용 읽기 표면 (2026-06-06 결정)
+
+**맥락**: 본 ADR 의 `StageCtx` 는 6개 기존 기법(sliding/streaming/h2o/no_eviction/h2o_plus/d2o) 요구의
+합집합인 최소 accessor 집합이었다. 그러나 **value-dependent 기법(CAOTE: criticality = `a_i·‖v_i−o_h‖`)**
+은 V(value) 벡터를 읽어야 하는데, 기존 표면은 `dequant_k`(K)만 노출하고 V accessor 가 없어 plugin 안에서
+metric 을 계산할 수 없었다(plugin = metric *선택자*에 그침). "zero-compile plugin 으로 임의 기법" 목표에
+대한 구조적 갭.
+
+**결정**: 읽기를 **단일 메커니즘 `tensor(kind) -> Option<&dyn TensorHandle>`** 로 통일한다.
+- `TensorKind = { Key, Value, AttnWeights, Scores }`. `TensorHandle { shape()->TensorShape(POD);
+  dtype()->TensorDtype; read_row(row, kv_head, out:&mut[f32]) }` (dyn-safe, out-param).
+- 기존 `dequant_k`·`head_score`·`has_head_scores` + 신규 `dequant_v`·`attn_weight`·`has_attn_weights` 는
+  전부 `tensor()` 위 **default sugar**. 엔진은 `tensor()` 1개만 구현(KVStageCtx). technique crate 는 무수정.
+- **flat `importance()` 만 zero-copy 직접 노출(D1 통합 예외)** — scalar 를 per-element `read_row` 로 돌리면
+  H2O scalar 랭킹 경로가 유일하게 순손해라 제외.
+- **AttnWeights = `AttentionScoreAccumulator::last_step_head_attn`** (last layer·last step; CPU overwrite /
+  GPU=head_importance proxy). `has_attn_weights()` 게이트 — last-layer 근사임을 명시(windowed/per-layer 정확값
+  아님). CAOTE 는 가용 시 `attn_weight`, else `importance` 폴백.
+- v1 CAOTE 는 `KeepSpec::LayerWide` 만 산출(head reduce 는 plugin 내부). per-head CAOTE 는 PerHead executor
+  (단계 ⑤)와 함께.
+
+**근거(PoC + 판정단)**: TensorHandle 의 추가 indirection(`read_row` per-element vtable)이 additive accessor
+대비 비용이 큰가? — host x86 + **ARM(S25 Oryon)** microbench 실측: handle vs additive = **±0~1%**(F16 ±0%,
+Q4_0 ±1%). 둘 다 per-element vtable 1회로 구조적 등가, TensorHandle 은 `tensor()` 핸들 조회만 head당 1회(O(H))
+추가. dyn-vs-direct gap(ARM Q4_0 +63%)은 `plan(&dyn StageCtx)` plugin 경계 비용 그 자체로 두 안 공통·기존
+기법이 이미 지불. → 성능은 차별 요소 아님 → 장기 OCP(미래 입력=variant 1개)로 TensorHandle 채택.
+
+**Alternatives Rejected (panel)**: ① additive granular accessors(perf 동등이나 메서드 단조증가) ② CacheView
+단일 borrowed struct(trait→struct 교체 = OCP/C-ABI 위반) ③ capability negotiation(materialize 타이밍 미해결
++ no-op default silent-wrong) ④ engine-precompute(plugin=metric 선택자 → ADR-0003 가 없앤 closed match-arm
+재도입, 북극성 위배). 상세: 설계 workflow `design-general-stagectx`(wf_1dda0f82).
+
+**C-ABI forward-compat**: `&dyn TensorHandle` → `{ opaque ptr + extern "C" read_row fn-ptr + #[repr(C)] POD
+shape }`. `TensorKind→u32`, out-param = FFI out-buffer. snapshot/capability bit 불요.
+
+**Scope / deferred(후속)**:
+- production eviction-hook 의 head_scores/last_attn → StageBackedPolicy threading 은 **CAOTE CLI 배선과 함께**
+  후속(현 builtins 는 None 으로 충분; CAOTE 는 host 테스트로 증명). `EvictionPolicy::evict_with_head_scores`
+  확장 필요.
+- **windowed RawAttn 패밀리(SnapKV/Scissorhands/Ada-KV)** 는 엔진이 per-query attention 윈도우를 보존하지
+  않아 미해금 — interface 모양과 직교한 별도 엔진 작업. TensorKind 에 variant 추가로 흡수 가능.
+- `query_state`(Quest): decode-step Q 캡처 미배선 → drop(후속 PR).
+- TensorKind→TensorHandle fold 임계(현 accessor 다수): RawAttn×Window 첫 기법 등장 시 트립와이어.
+
+**구현/검증(M-B~M-G, `.agent/todos/tensorhandle_impl_progress.md`)**: technique-api 표면 + 엔진 핸들
+(KeyHandle/ValueHandle/ScalarHandle) + `dequantize_v`(dequant_k 의 v_buffer 미러, bit-identity F32/F16/Q4_0
+테스트) + CAOTE crate(`crates/techniques/caote`, technique-api 만 의존, dev-dep + force-link, host
+value-aware 실행 테스트). 게이트: compact_parity·d2o_stage_eq_handler_* 무회귀 + lib 1238/0 + clippy
+--workspace clean + release linkme 생존.

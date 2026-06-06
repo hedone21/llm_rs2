@@ -18,6 +18,56 @@
 
 use linkme::distributed_slice;
 
+/// 엔진이 노출하는 named 캐시 텐서(ADR-0004 M-A 통합). 변형(보존/병합)은 plan 으로만, 읽기는 본 enum
+/// 으로 통일한다. **OCP**: 미래 입력(Query/PageBounds 등)은 variant 추가 1줄 + 엔진 impl 1곳 — `StageCtx`
+/// 메서드 신설 불필요. read dispatch 비용은 additive accessor 와 동등(PoC: host/ARM ±0~1%).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TensorKind {
+    /// raw K. row=(pos,head), cols=head_dim. dtype 분기(F32/F16/Q4_0)는 핸들 내부 흡수.
+    Key,
+    /// raw V. CAOTE/VATP 의 v_i. Key 와 동일 (pos,head) 좌표계.
+    Value,
+    /// 직전 decode step 의 per-(kv_head,pos) attention weight(last layer). CAOTE 의 a_i. cols=1, per_head.
+    /// 원천: `AttentionScoreAccumulator::last_step_head_attn`(CPU overwrite / GPU=head_importance proxy).
+    /// **주의**: last layer·last step 근사 — windowed/per-layer 정확값이 아니다(`has_attn_weights` 게이트).
+    AttnWeights,
+    /// per-(kv_head,pos) 누적 head importance(h2o_plus). cols=1, per_head.
+    /// flat per-token importance 는 본 핸들이 아니라 [`StageCtx::importance`] 로 zero-copy 직접 노출(D1 예외).
+    Scores,
+}
+
+/// dtype-무관 텐서 형태(POD). 미래 FFI 경계를 그대로 건널 수 있는 평탄 필드만(`#[repr(C)]`-able).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TensorShape {
+    /// 유효 row 수(보통 `current_pos`).
+    pub rows: usize,
+    /// row 당 f32 원소 수(Key/Value=head_dim, AttnWeights/Scores=1).
+    pub cols: usize,
+    /// row 가 per-kv-head 로 분리되는가(현 4 kind 전부 true; layer-wide flat 은 `importance()` 별도 경로).
+    pub per_head: bool,
+}
+
+/// 핸들의 저장 dtype(진단/버퍼 사이징용). 읽기 산출은 항상 f32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorDtype {
+    F32,
+    F16,
+    Q4_0,
+}
+
+/// 한 named 텐서의 **읽기 전용** 핸들(ADR-0004 D5, M-A 통합). dyn-safe: 제네릭 / `Self` by value /
+/// 연관타입 / `impl Trait` 인자 없음. 산출은 항상 dtype-무관 f32 out-param(슬라이스 반환 금지 —
+/// `dequant_k` out-param 규약 계승). 미래 `.so` 단계에선 (opaque ptr + read 함수포인터 + POD shape)로 환원.
+pub trait TensorHandle {
+    /// POD 형태. 미래 FFI 단계에선 동일 struct 가 그대로 건너간다.
+    fn shape(&self) -> TensorShape;
+    /// 저장 dtype(읽기 산출 f32 와 무관, 진단용).
+    fn dtype(&self) -> TensorDtype;
+    /// `(row, kv_head)` 행을 f32 로 `out` 에 채운다. `out.len() == shape().cols` 계약.
+    /// `per_head=false` 텐서는 `kv_head` 무시. dtype 분기는 impl 내부 흡수.
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]);
+}
+
 /// 기법이 캐시를 읽는 추상(ADR-0004 D5). 엔진이 `&KVCache`(+ scores/budget) 위로 구현한다.
 ///
 /// **dyn-safe 필수**: `plan(&self, ctx: &dyn StageCtx)` 가 trait object 로 ctx 를 받으므로, 모든
@@ -25,8 +75,11 @@ use linkme::distributed_slice;
 /// 원시 K 읽기 같은 dtype-분기 접근도 슬라이스 반환이 아니라 `out: &mut [f32]` out-param 으로 노출한다.
 ///
 /// 호출 간 누적 상태(d2o EMA 등)는 여기로 thread 하지 않는다 — plugin struct 가 보유한다(D4).
-/// accessor 집합은 sliding/streaming/h2o/no_eviction/h2o_plus/d2o 6개 기법의 실제 요구를 합집합한
-/// 최소 완전 집합이다(설계 검증 workflow `wf_21533739`).
+///
+/// **읽기 통합(ADR-0004 M-A, D1)**: 모든 텐서/스코어 읽기는 단일 [`StageCtx::tensor`] 메커니즘으로
+/// 흐른다. `dequant_k`/`dequant_v`/`head_score`/`has_head_scores`/`attn_weight`/`has_attn_weights` 는
+/// `tensor()` 위 default sugar 다 — 엔진은 `tensor()` 1개만 구현하면 된다. flat `importance()` 만 zero-copy
+/// 직접 노출(scalar 를 per-element read_row 로 돌리면 H2O 랭킹 경로가 순손해라 예외).
 pub trait StageCtx {
     /// 현재 유효 토큰 수. 전 기법이 keep/prune budget 산출의 출발점으로 읽는다.
     /// 엔진 impl 원천: `KVCache::current_pos()`.
@@ -54,18 +107,63 @@ pub trait StageCtx {
     /// 엔진 impl 원천: `KVCache::head_dim()`.
     fn head_dim(&self) -> usize;
 
-    /// per-head importance score (h2o_plus). row-major `[n_kv_heads * max_seq]` 레이아웃의 stride 는
-    /// 엔진이 내부화하므로 plugin 은 평탄한 `(kv_head, pos) → f32` 로만 읽는다(레이아웃 결합 해소).
-    fn head_score(&self, kv_head: usize, pos: usize) -> f32;
+    /// ★ **단일 텐서 접근 메커니즘**(D1 통합). 해당 `kind` 가 이 호출에 가용하면 핸들, 아니면 `None`
+    /// (score-free 정책은 `tensor(Scores)==None`, value-unaware/attn-unaware 엔진은 해당 kind `None`).
+    /// 반환 핸들 borrow 는 ctx 수명에 묶여 dyn-safe. 아래 sugar 들이 전부 이 위에 얹힌다.
+    fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle>;
 
-    /// per-head score 가 존재하는가. `false` 면 h2o_plus 가 [`KeepSpec::LayerWide`] 로 degenerate
-    /// (score-free/flat 폴백 복원). dyn-safe.
-    fn has_head_scores(&self) -> bool;
+    // ── 이하 default sugar (전부 `tensor()` 위임). 엔진은 override 불필요 ──
 
-    /// 원시 K(`pos`, `head`)를 dtype-무관 f32 로 `out` 에 채운다(d2o cosine-nearest 매칭용).
-    /// `out.len() == head_dim` 계약. dtype 분기(F32/F16/Q4_0)는 엔진 impl 내부에서 흡수한다.
-    /// out-param 방식 = dyn-safe(제네릭 아님) + Q4_0 dequant 임시버퍼 수명/Vec 할당 회피.
-    fn dequant_k(&self, pos: usize, head: usize, out: &mut [f32]);
+    /// 원시 K(`pos`,`head`)를 f32 로 `out` 에 채운다(d2o cosine-nearest). `tensor(Key)` 위 sugar.
+    /// `out.len() == head_dim` 계약. kind 미가용 시 no-op(out 불변).
+    fn dequant_k(&self, pos: usize, head: usize, out: &mut [f32]) {
+        if let Some(h) = self.tensor(TensorKind::Key) {
+            h.read_row(pos, head, out);
+        }
+    }
+
+    /// 원시 V(`pos`,`head`)를 f32 로 `out` 에 채운다(CAOTE/VATP 의 v_i). `tensor(Value)` 위 sugar.
+    /// `out.len() == head_dim` 계약. kind 미가용 시 no-op.
+    fn dequant_v(&self, pos: usize, head: usize, out: &mut [f32]) {
+        if let Some(h) = self.tensor(TensorKind::Value) {
+            h.read_row(pos, head, out);
+        }
+    }
+
+    /// per-head 누적 importance(h2o_plus). 평탄한 `(kv_head, pos) → f32`. `tensor(Scores)` 위 sugar.
+    fn head_score(&self, kv_head: usize, pos: usize) -> f32 {
+        match self.tensor(TensorKind::Scores) {
+            Some(h) => {
+                let mut o = [0.0f32];
+                h.read_row(pos, kv_head, &mut o);
+                o[0]
+            }
+            None => 0.0,
+        }
+    }
+
+    /// per-head score 존재 여부. `false` 면 h2o_plus 가 [`KeepSpec::LayerWide`] 로 degenerate.
+    fn has_head_scores(&self) -> bool {
+        self.tensor(TensorKind::Scores).is_some()
+    }
+
+    /// `(kv_head, pos)` 의 직전 decode step per-head attention weight(CAOTE 의 a_i). `tensor(AttnWeights)`
+    /// 위 sugar. `has_attn_weights()==false` 면 의미 없음(0.0) — CAOTE 는 `importance()` 폴백 권장.
+    fn attn_weight(&self, kv_head: usize, pos: usize) -> f32 {
+        match self.tensor(TensorKind::AttnWeights) {
+            Some(h) => {
+                let mut o = [0.0f32];
+                h.read_row(pos, kv_head, &mut o);
+                o[0]
+            }
+            None => 0.0,
+        }
+    }
+
+    /// attn_weight 가 채워졌는가(직전 step last-layer per-head attn 트래킹 여부). `false` 면 폴백.
+    fn has_attn_weights(&self) -> bool {
+        self.tensor(TensorKind::AttnWeights).is_some()
+    }
 }
 
 /// 가중 병합 지시(ADR-0004 D2/D3). evicted 토큰들(`from`)을 retained 토큰(`into`) 한 자리에 가중
@@ -200,13 +298,11 @@ mod tests {
         fn head_dim(&self) -> usize {
             1
         }
-        fn head_score(&self, _kv_head: usize, _pos: usize) -> f32 {
-            0.0
+        // tensor()만 구현 — head_score/has_head_scores/dequant_k/dequant_v/attn_weight/
+        // has_attn_weights 는 default sugar(전부 None → trivial)로 충족.
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
         }
-        fn has_head_scores(&self) -> bool {
-            false
-        }
-        fn dequant_k(&self, _pos: usize, _head: usize, _out: &mut [f32]) {}
     }
 
     #[distributed_slice(KV_CACHE_STAGES)]

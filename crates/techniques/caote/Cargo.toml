@@ -1,0 +1,11 @@
+[package]
+name = "caote"
+version = "0.1.0"
+edition = "2024"
+
+# CAOTE technique crate (ADR-0004 M-A) — value-aware KV eviction.
+# TensorHandle 인터페이스로 V 를 읽어 plugin 이 자체 metric 을 계산하는 증명.
+# stage 축 확장은 `technique-api` 에만 의존한다(엔진/타 축 crate 미참조 = 가산 확장 비용의 증거).
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"

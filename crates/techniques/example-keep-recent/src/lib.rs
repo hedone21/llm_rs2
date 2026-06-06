@@ -70,13 +70,13 @@ mod tests {
         fn head_dim(&self) -> usize {
             1
         }
-        fn head_score(&self, _kv_head: usize, _pos: usize) -> f32 {
-            0.0
+        // tensor()만 구현 — head_score/dequant_* 등은 technique-api default sugar(None→trivial).
+        fn tensor(
+            &self,
+            _kind: technique_api::TensorKind,
+        ) -> Option<&dyn technique_api::TensorHandle> {
+            None
         }
-        fn has_head_scores(&self) -> bool {
-            false
-        }
-        fn dequant_k(&self, _pos: usize, _head: usize, _out: &mut [f32]) {}
     }
 
     fn params() -> StageParams {

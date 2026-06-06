@@ -82,6 +82,8 @@ trybuild = "1.0"
 # ADR-0003 검증: 별도 technique crate 가 dep 추가만으로 KV_CACHE_STAGES 에 등록되는지
 # (cross-crate linkme). 프로덕션 미링크(dev-only) — stage_registry 테스트가 find_stage 로 확인.
 example-keep-recent = { path = "../crates/techniques/example-keep-recent" }
+# ADR-0004 M-A: CAOTE(value-aware) — TensorHandle 로 V 를 읽어 자체 metric 계산하는 증명(dev-only).
+caote = { path = "../crates/techniques/caote" }
 
 [build-dependencies]
 bindgen = { version = "0.71", optional = true }
