@@ -41,10 +41,36 @@
 
 **완료**: D-1 완전통합 + D-2 4종 TensorKind + D-3 CAOTE 동봉+host 테스트. 모든 게이트 GREEN.
 
-## deferred(후속, ADR §7 Scope)
-- production eviction-hook → StageBackedPolicy 의 head_scores/last_attn threading (CAOTE CLI 배선과 함께;
-  `EvictionPolicy::evict_with_head_scores` 확장 필요). 현재 CAOTE 는 host 테스트로만 구동.
+## M-H: CAOTE production 배선 MVP (Tier 1, 2026-06-06) — ADR-0004 §8
+사용자 결정: **범위=Tier 1 MVP(importance-weighted), 링크=feature-gate**.
+- [x] H-1 feature install: `caote` dev-dep → optional `[dependencies]` + `[features] caote=["dep:caote"]`
+- [x] H-2 production force-link: `stage_registry.rs` module-level `#[cfg(feature="caote")] use caote as _;`
+      (test-only force-link 제거, caote_* 테스트 `#[cfg(feature="caote")]` 게이트)
+- [x] H-3 선택 seam: chat(session.rs)·argus_bench(build_bench_loop) 둘 다 **이미** `find_stage(name)` generic
+      fallback → match-arm 수정 0(OCP). CLI 만 `EvictionCmd::Caote` unit variant + `policy_name()→"caote"`
+- [x] H-4 value-aware: session.rs `score_based` 집합에 "caote" 추가(importance 공급 → crit=importance·‖v−o_h‖)
+- [x] H-5 게이트: lib 1238/0(`--features caote`, caote 통합 포함) + caote 2/0 + CLI parse 양쪽(ON parse/OFF
+      reject) + clippy --workspace & --features caote clean + default 무회귀 + release fat-LTO caote 생존
+- [x] H-6 적대적 리뷰(wf_ed8fbbd0, 6 findings/2 real MINOR): unknown-policy 에러 메시지에 caote(feature-gate)
+      + d2o 안내 추가(session.rs + build_bench_loop.rs, cfg!(feature="caote") conditional)
+- 문서: ADR-0004 §8 + docs/50 §3-3(production 활성화 레시피)
+
+**Landmine(ADR §8)**: value-aware CAOTE E2E 실행 shipping 바이너리 **부재** — chat session 추출본 미배선
+(argus-chat planned), argus_bench score-free, legacy 동결. 배선은 완성, live E2E 는 argus-* 전환 종속.
+
+## deferred(후속, ADR §7 Scope + §8)
+- **Tier 2**: last_attn threading (trait ScoreContext variant → cache_manager → try_evict 3호출부 →
+  StageBackedPolicy override). + production decode 의 last_step_head_attn probe 배선(현재 eval-ll 전용) +
+  S25 GPU proxy. `use_aw=true` per-head attention-weight CAOTE.
+- **타 경로 value-aware**: argus_bench 에 AttentionScoreAccumulator 장착(AB-task) / eval-ll·ppl·batch 의
+  score_based_eviction 소스에 caote 포함(동형 1줄).
 - windowed RawAttn(SnapKV 류) 엔진 보존 / query_state(Quest) / TensorKind→TensorHandle fold 임계.
+
+## iter 로그(M-H)
+- (map) 4-서브시스템 워크플로우(wf_8abfb17f)로 eviction 경로 매핑 — trait엔 last_attn 슬롯 부재, eviction
+  트리거 3곳(model_forward/eviction_hook/ppl) 전부 flat importance만 전달. 선택 seam 2곳(session/bench)이
+  이미 find_stage OCP화 완료(M2-B②). chat session 추출본은 미배선 바이너리(argus-chat planned) 발견.
+- (impl) 6파일 외과적 변경: Cargo feature + force-link cfg + score_based + CLI variant + ADR/docs.
 
 ## iter 로그
 - (init) 결정 잠금 + 코드 맵 확보. last_step_head_attn 원천 ready 확인(forward 신규작업 불요, thread만).

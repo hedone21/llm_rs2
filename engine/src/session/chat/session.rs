@@ -634,9 +634,11 @@ fn build_chat_eviction_internal(
             // 정책(기존 bail 메시지 보존). World B(plan→compact, compact_parity 게이트).
             name => {
                 let reg = technique_api::find_stage(name).ok_or_else(|| {
+                    // caote 는 feature-gate → install 됐을 때만 유효 정책으로 안내(ADR-0004 §8).
                     anyhow::anyhow!(
-                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o",
-                        name
+                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{}",
+                        name,
+                        if cfg!(feature = "caote") { ", caote" } else { "" }
                     )
                 })?;
                 // streaming window 유도는 StageParams 5필드 밖이라 caller(여기)에서 해소해 baked.
@@ -661,7 +663,14 @@ fn build_chat_eviction_internal(
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     };
 
-    let score_based = matches!(args.eviction_policy.as_str(), "h2o" | "h2o_plus" | "d2o");
+    // caote 는 value-aware(crit_i = a_i·‖v_i − o_h‖) — V 는 ctx.tensor(Value)로 직접 읽지만
+    // 가중치 a_i 는 importance 가 공급돼야 한다. score_based=true 여야 decode 루프가
+    // force_evict_with_scores 로 importance 를 흘려보내 KVStageCtx(Some(importance)) 가 된다
+    // (미공급 시 weight=0 → degenerate). attn-weight(last_attn) 정밀화는 ADR-0004 §8 Tier 2 deferred.
+    let score_based = matches!(
+        args.eviction_policy.as_str(),
+        "h2o" | "h2o_plus" | "d2o" | "caote"
+    );
 
     let mut acc = AttentionScoreAccumulator::new_gqa(
         args.max_seq_len,

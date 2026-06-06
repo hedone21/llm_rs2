@@ -60,6 +60,13 @@ pub enum EvictionCmd {
 
     /// D2O — Dynamic Discriminative Operations (arXiv 2406.13035).
     D2o(D2oArgs),
+
+    /// CAOTE — value-aware criticality `a_i·‖v_i − o_h‖` (ADR-0004 §8).
+    ///
+    /// feature `caote` 플러그인 install 시에만 노출된다(미설치 = subcommand 부재).
+    /// 튜닝 파라미터 없음 — V 는 ctx.tensor(Value)로, 가중치 a_i 는 importance 로 자동.
+    #[cfg(feature = "caote")]
+    Caote,
 }
 
 impl EvictionCmd {
@@ -75,6 +82,8 @@ impl EvictionCmd {
             EvictionCmd::H2o(_) => "h2o",
             EvictionCmd::H2oPlus(_) => "h2o_plus",
             EvictionCmd::D2o(_) => "d2o",
+            #[cfg(feature = "caote")]
+            EvictionCmd::Caote => "caote",
         }
     }
 }
@@ -307,6 +316,27 @@ mod tests {
         // H2o has no --window flag (Sliding does) — clap must reject.
         let r = Wrap::try_parse_from(["test", "h2o", "--window", "256"]);
         assert!(r.is_err(), "h2o subcommand must reject Sliding's --window");
+    }
+
+    /// ADR-0004 §8: feature `caote` install 시 `eviction caote` 가 parse 되고 policy_name 이
+    /// "caote" — session/build_bench 의 `find_stage(name)` seam 으로 흘러 플러그인을 선택한다.
+    #[cfg(feature = "caote")]
+    #[test]
+    fn parses_caote_unit_subcommand() {
+        let w = parse(&["caote"]);
+        assert!(matches!(w.ev, Some(EvictionCmd::Caote)));
+        assert_eq!(w.ev.as_ref().unwrap().policy_name(), "caote");
+    }
+
+    /// feature OFF(plugin 미설치)에서는 caote subcommand 가 존재하지 않아 clap 이 거부한다.
+    #[cfg(not(feature = "caote"))]
+    #[test]
+    fn rejects_caote_when_plugin_absent() {
+        let r = Wrap::try_parse_from(["test", "caote"]);
+        assert!(
+            r.is_err(),
+            "feature OFF 시 caote subcommand 미존재 → clap reject"
+        );
     }
 
     #[test]

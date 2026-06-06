@@ -24,6 +24,13 @@ use crate::buffer::DType;
 use crate::pressure::d2o_handler::{D2OConfig, D2OStage, dequantize_k, dequantize_v};
 use crate::pressure::kv_cache::KVCache;
 
+// ADR-0004 §8: CAOTE production 활성화. feature `caote` ON 시 caote crate 를 force-link 한다 —
+// dep 선언만으로는 미참조 rlib 이 링크 제외돼 `#[distributed_slice]` 등록이 누락되기 때문(ADR-0003 §4
+// M3 실측). 이 1줄이 production 바이너리에서 `find_stage("caote")` 를 가시화한다(session score_based
+// 경유 value-aware 동작). feature OFF = 미링크 → `--eviction-policy caote` 는 unknown 으로 graceful fail.
+#[cfg(feature = "caote")]
+use caote as _;
+
 /// 기존 [`EvictionPolicy`](in-place `evict*` + `plan_keep`)를 plan-returning [`KVCacheStage`] 로 노출.
 ///
 /// [`KVCacheStage::plan`] 은 [`EvictionPolicy::plan_keep`](layer-wide keep + 균등 merge)을
@@ -454,8 +461,8 @@ mod tests {
     // 참조 1줄**(`use <crate> as _;`)이 designated 지점에 필요하다. 즉 확장 비용 = dep 1줄 + force-link
     // 1줄(둘 다 기계적, 기존 로직 수정 0 → OCP 유지). 상세: ADR-0003 §4 (M3 정정).
     use example_keep_recent as _;
-    // (M-F) CAOTE(value-aware) 도 동일 메커니즘으로 force-link — dep 1줄 + 이 1줄 = 기법 추가.
-    use caote as _;
+    // CAOTE 의 force-link 는 production(module-level `#[cfg(feature = "caote")] use caote as _`)
+    // 가 담당한다 — `--features caote` 테스트 시 그 cfg 가 활성이라 별도 test-only force-link 불필요.
 
     #[test]
     fn example_technique_crate_visible_to_engine() {
@@ -467,6 +474,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "caote")]
     #[test]
     fn caote_stage_visible_and_value_aware_executes() {
         // (M-F) CAOTE crate 의 cross-crate 등록 + KVStageCtx(V 공급)로 value-aware plan 산출 →

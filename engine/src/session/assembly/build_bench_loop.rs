@@ -99,9 +99,12 @@ pub fn build_resilience_cache_manager(
             // factory. 레지스트리 miss = unknown(기존 bail 메시지 보존). World B(compact_parity 게이트).
             name => {
                 let reg = technique_api::find_stage(name).ok_or_else(|| {
+                    // d2o 는 위 분기에서 처리되나 유효 정책이므로 안내에 포함(session.rs 와 일관).
+                    // caote 는 feature-gate → install 시에만 안내(ADR-0004 §8).
                     anyhow::anyhow!(
-                        "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus.",
-                        name
+                        "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{}.",
+                        name,
+                        if cfg!(feature = "caote") { ", caote" } else { "" }
                     )
                 })?;
                 let streaming_window = if args.streaming_window() > 0 {

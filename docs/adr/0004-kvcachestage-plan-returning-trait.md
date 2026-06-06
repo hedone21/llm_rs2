@@ -126,3 +126,45 @@ shape }`. `TensorKind→u32`, out-param = FFI out-buffer. snapshot/capability bi
 테스트) + CAOTE crate(`crates/techniques/caote`, technique-api 만 의존, dev-dep + force-link, host
 value-aware 실행 테스트). 게이트: compact_parity·d2o_stage_eq_handler_* 무회귀 + lib 1238/0 + clippy
 --workspace clean + release linkme 생존.
+
+## 8. Amendment — CAOTE production 배선 MVP (Tier 1, 2026-06-06 결정)
+
+**맥락**: §7 이 CAOTE 의 value-aware 실행을 host 테스트로 증명했으나, dev-dep + test-only force-link 라
+production 바이너리는 caote 를 미링크(`find_stage("caote")=None`)했고 `--eviction caote` 로 선택할 CLI 표면도
+없었다. "zero-compile plugin install" 북극성의 마지막 한 칸 = **선택 가능한 production 플러그인화**.
+
+**결정(Tier 1 = importance-weighted, 침습 최소)**:
+- **링크 = feature `caote` opt-in**(`engine/Cargo.toml`: `caote` optional dep + `[features] caote =
+  ["dep:caote"]`; `stage_registry.rs` module-level `#[cfg(feature="caote")] use caote as _;` force-link).
+  feature OFF = 미링크 = "plugin 미설치". M5 문서의 "dep 1줄 + force-link 1줄" 패턴에 feature flag 1개를 더한
+  install 단위. (대안 plain dep 거부: 연구용 technique 를 무조건 코어 의존으로 묶어 default 빌드를 무겁게 함.)
+- **선택 seam 무수정(OCP)** — chat(`session.rs`)·argus_bench(`build_bench_loop.rs`) **둘 다 이미**
+  `name => find_stage(name) → StageBackedPolicy` generic fallback. caote 는 match-arm 추가 0 으로 양쪽에서
+  선택됨. CLI 만 `EvictionCmd::Caote` unit variant(`#[cfg(feature="caote")]`, 튜닝 파라미터 없음 →
+  `make:|_|Box::new(Caote)`) + `policy_name()→"caote"` 추가로 표현 가능화.
+- **value-aware via importance** — V 는 `ctx.tensor(Value)`(KVStageCtx 가 cache 로 항상 공급)로 직접 읽고,
+  가중치 `a_i` 는 `importance()` 로 충당한다. 그래서 chat decode 가 `force_evict_with_scores` 로 importance 를
+  흘리도록 `score_based` 집합에 `"caote"` 추가(session.rs). 결과 = `crit_i = importance_i·‖v_i − o_h‖` —
+  H2O(importance 단독)와 구별되는 진짜 value-aware 랭킹. attention-weight(`last_attn`) 정밀화는 **Tier 2 deferred**.
+
+**Tier 2 (deferred, §7 의 head_scores/last_attn threading)**: `EvictionPolicy` trait 에 last_attn 슬롯
+(ScoreContext 신규 variant) → cache_manager → `try_evict`(3 호출부) → StageBackedPolicy override 까지 배선해야
+`use_aw=true`(per-head attention weight) CAOTE 가 된다. 침습적이라 보류. 게다가 production decode 의
+`last_step_head_attn` 은 현재 eval-ll probe 전용이라 chat threading 만으론 채워지지 않는다(별도 probe 배선 필요).
+S25 GPU proxy(`import_gpu_scores`)는 그 위에 device-gated.
+
+**Landmine — 현 마이그레이션 갭(중요)**: **value-aware CAOTE 를 E2E 실행하는 shipping 바이너리는 아직 없다.**
+(1) chat session(`session/chat/`, score_based 경로 = 본 배선의 핵심)은 추출됐으나 **어떤 바이너리도 호출 안 함**
+(`argus-chat` planned; `argus_cli`/`argus_bench` 는 `--chat` reject). (2) `argus_bench`(live, AB-1)는 caote 를
+`find_stage` 로 선택 가능하나 **score accumulator 미장착**(score-free) → caote 가 recency-degrade. (3)
+`legacy_generate` 는 동결 + 자체 inline chat-eviction 경로(추출본 미사용). → 본 MVP 는 **배선(plugin install +
+선택 seam + CLI 표현 + value-aware 코드경로)을 완성**하되, live-binary E2E 는 argus-chat 마이그레이션(또는
+argus_bench score 장착)에 종속. 이는 배선 결함이 아니라 argus-* 전환 진행 상태.
+
+**타 경로 활성 레시피(동일 패턴)**: argus_bench 에서 caote value-aware = `build_resilience_cache_manager` 에
+AttentionScoreAccumulator 장착 + ScoreContext 공급(AB-task). eval-ll/ppl/batch = 각 하네스의
+`score_based_eviction` 소스에 caote 포함. 전부 본 MVP 와 동형(1줄~소규모).
+
+**게이트**: lib 1238/0(`--features caote`, caote 통합 테스트 포함) + default 무회귀 + caote crate 2/0 + CLI
+parse 양쪽(feature ON `parses_caote_unit_subcommand` / OFF `rejects_caote_when_plugin_absent`) + clippy
+--workspace & `--features caote` clean. 기여자 가이드: `docs/50_adding_kvcache_stage.md` §3-3.

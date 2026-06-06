@@ -152,6 +152,36 @@ use my_stage as _;   // 미참조 crate 를 링크에 강제 포함 → distribu
 이 둘은 모두 **기계적 설정성 라인**이라 기존 *로직* 을 수정하지 않는다 — OCP 유지. 즉 기법 추가 비용 =
 **폴더 + dep 1줄 + force-link 1줄**.
 
+### 3-3. production 활성화 — feature install + 선택 + (value-aware 시) score 공급
+
+위 3-1/3-2 는 "등록"까지다. 사용자가 **CLI 로 선택**하고 production 추론에서 **실제로 동작**하게 하려면
+세 가지를 더한다(정본 예 = CAOTE, ADR-0004 §8):
+
+1. **feature install(권장)** — dep 를 optional 로 두고 feature 로 opt-in 한다. 연구용 기법을 무조건
+   코어 의존으로 묶지 않아 default 빌드가 깨끗하고, feature = "plugin 설치" 단위가 된다.
+   ```toml
+   # engine/Cargo.toml
+   my-stage = { path = "../crates/techniques/my-stage", optional = true }
+   [features]
+   my_stage = ["dep:my-stage"]
+   ```
+   force-link 도 `#[cfg(feature = "my_stage")] use my_stage as _;`. feature OFF = 미링크 =
+   `find_stage` None → 아래 선택 seam 이 "unknown policy" 로 graceful fail.
+
+2. **선택 seam = 무수정** — 정책 선택부(`session/chat/session.rs`, `session/assembly/build_bench_loop.rs`)는
+   이미 `name => find_stage(name) → StageBackedPolicy` generic fallback 이라 **건드릴 필요 없다**(OCP).
+   CLI 표현만 `EvictionCmd` 에 variant 추가(튜닝 파라미터 없으면 unit variant) + `policy_name()` 한 줄.
+   feature-gate(`#[cfg(feature = "my_stage")]`)하면 미설치 시 subcommand 자체가 사라진다.
+
+3. **value-aware 면 score 공급** — `StageCtx::tensor(Value)` 는 cache 만으로 항상 노출되지만, 가중치
+   (importance) 가 필요하면 decode 경로가 `force_evict_with_scores` 로 흘리도록 `score_based` 집합에 이름을
+   추가한다(미공급 시 importance=None → degenerate). attention-weight(`last_attn`) 까지 쓰는 정밀화는
+   trait/cache_manager threading 이 필요(ADR-0004 §8 Tier 2, deferred).
+
+> **현 한계(ADR-0004 §8 Landmine)**: value-aware eviction 을 E2E 실행하는 shipping 바이너리는 argus-*
+> 마이그레이션 중이라 아직 없다(chat session 추출본 미배선, argus_bench score-free, legacy 동결). 본 레시피는
+> "배선"을 완성하나 live E2E 는 그 전환에 종속.
+
 ---
 
 ## 4. 동작 예제
