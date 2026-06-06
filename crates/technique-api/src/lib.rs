@@ -21,6 +21,8 @@ use linkme::distributed_slice;
 /// 엔진이 노출하는 named 캐시 텐서(ADR-0004 M-A 통합). 변형(보존/병합)은 plan 으로만, 읽기는 본 enum
 /// 으로 통일한다. **OCP**: 미래 입력(Query/PageBounds 등)은 variant 추가 1줄 + 엔진 impl 1곳 — `StageCtx`
 /// 메서드 신설 불필요. read dispatch 비용은 additive accessor 와 동등(PoC: host/ARM ±0~1%).
+/// `#[repr(u32)]`: 미래 `.so` C-ABI 에서 fieldless enum 을 u32 discriminant 로 그대로 건넨다(ADR §7).
+#[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TensorKind {
     /// raw K. row=(pos,head), cols=head_dim. dtype 분기(F32/F16/Q4_0)는 핸들 내부 흡수.
@@ -37,6 +39,7 @@ pub enum TensorKind {
 }
 
 /// dtype-무관 텐서 형태(POD). 미래 FFI 경계를 그대로 건널 수 있는 평탄 필드만(`#[repr(C)]`-able).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TensorShape {
     /// 유효 row 수(보통 `current_pos`).
@@ -48,6 +51,7 @@ pub struct TensorShape {
 }
 
 /// 핸들의 저장 dtype(진단/버퍼 사이징용). 읽기 산출은 항상 f32.
+#[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorDtype {
     F32,

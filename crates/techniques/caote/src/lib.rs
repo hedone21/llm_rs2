@@ -51,10 +51,11 @@ impl KVCacheStage for Caote {
             let mut o = vec![0.0f32; hd];
             let mut v_i = vec![0.0f32; hd];
             for h in 0..kvh {
+                // 가중치는 head 마다 1회만 산출(pass1·pass2 공유) — 중복 vtable 호출 제거.
+                let w: Vec<f32> = (0..cur).map(|i| weight(ctx, use_aw, h, i)).collect();
                 // pass 1: o_h = Σ_i a_i · v_i
                 o.iter_mut().for_each(|x| *x = 0.0);
-                for i in 0..cur {
-                    let a = weight(ctx, use_aw, h, i);
+                for (i, &a) in w.iter().enumerate() {
                     if a == 0.0 {
                         continue;
                     }
@@ -65,14 +66,13 @@ impl KVCacheStage for Caote {
                 }
                 // pass 2: crit_i += a_i · ‖v_i − o_h‖
                 for (i, c) in crit.iter_mut().enumerate() {
-                    let a = weight(ctx, use_aw, h, i);
                     ctx.dequant_v(i, h, &mut v_i);
                     let mut s = 0.0f32;
                     for d in 0..hd {
                         let e = v_i[d] - o[d];
                         s += e * e;
                     }
-                    *c += a * s.sqrt();
+                    *c += w[i] * s.sqrt();
                 }
             }
         } else {
