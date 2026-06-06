@@ -1,0 +1,23 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/qwen2.5-1.5b-gguf/qwen2.5-1.5b-q4_0.gguf
+[Backend] HTP FastRPC primary (CPU companion passthrough; NPU dispatch는 S4)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+[GGUF] Downcasting token_embd.weight tensor F32→F16 at load time (233373696 elements)
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[htp] F16 weight → rpcmem: [151936,1536] 466747392 B (누적 445 MB)
+[Tokenizer] models/qwen2.5-1.5b-gguf/tokenizer.json
+Prompt: The capital of France is
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+[Resilience] Manager unreachable (Unknown transport 'dbus' (use dbus / unix:<path> / tcp:<addr>)), running without resilience.
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=5, budget=16)
+[htp] matmul_transposed: NPU dispatch 활성 (Q4_0 q4x4x2, M≥1)
+[htp] matmul_ffn_gate_up_silu: gate/up batch dispatch 활성 (enqueue×2→drain×1, floor 2→1)
+The capital of France is Paris. It has a population of about 2 million people and covers an area
+TTFT: 139.09 ms
+Decode: 66.33 ms/tok (15.1 tok/s) [15 tokens]
+Avg TBT: 70.88 ms (14.1 tokens/sec)
+[Phase4-4.5] generated=16 (first=12095 + run=15) stopped_by=BudgetExhausted final_pos=20

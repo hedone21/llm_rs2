@@ -84,12 +84,24 @@ pub struct HtpFastrpcBackend {
     /// host(non-android) 빌드에서는 android-only 메서드에서만 read 되므로 dead.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     op_pending: AtomicUsize,
+
+    /// RoPE positions 용 lazily-allocated i32 rpcmem scratch. decode 는 토큰당
+    /// 단일 position 이라 작은 버퍼를 1회 alloc 후 매 토큰 재기록(start_pos)한다.
+    /// `rope_inplace` NPU override 에서만 read/write — env OFF 면 영원히 None.
+    #[cfg(target_os = "android")]
+    rope_pos_scratch: std::sync::Mutex<Option<RpcmemBuffer>>,
 }
 
 /// `htp_iface_start` 의 n_hvx default. llama.cpp `ggml-hexagon.cpp::opt_nhvx`
 /// 의 기본값 0 = "use all" 와 동일. DSP-side 가 device 의 HVX unit 수에
 /// 맞춰 선택. 환경 변수로 override 가능 (`HTP_FASTRPC_N_HVX`).
 const HTP_FASTRPC_N_HVX_DEFAULT: u32 = 0;
+
+/// v79 element-wise(unary/binary) op 의 dispatch 당 처리 element 상한(아래 안전치).
+/// DSP 가 1 VTCM 타일(~12032 f32)만 처리하고 전체 텐서를 loop 하지 않으므로
+/// flat pointwise helper 는 이 크기 이하로 분할 dispatch 한다(device 실측 근거).
+#[cfg(target_os = "android")]
+const HTP_OP_CHUNK: usize = 8192;
 
 // SAFETY: HtpFastrpcHost 가 Send+Sync (dlsym 결과 fn ptr 는 process-global).
 // cpu_companion 은 Arc<dyn Backend> 로 자체 Send+Sync 보유. 나머지 atomic.
@@ -126,6 +138,8 @@ impl HtpFastrpcBackend {
             cpu_companion,
             layer_idx: AtomicUsize::new(0),
             op_pending: AtomicUsize::new(0),
+            #[cfg(target_os = "android")]
+            rope_pos_scratch: std::sync::Mutex::new(None),
         })
     }
 
@@ -290,20 +304,34 @@ impl HtpFastrpcBackend {
             out_rpc.dsp_buf(DspqBufferType::DspWriteCpuRead, 0, bytes_y)?,
         ];
 
-        // dspqueue_write (host → DSP). enqueue only — DSP 가 비동기 처리, 응답은
-        // drain_pending 의 dspqueue_read 가 FIFO 순서로 회수.
-        // SAFETY: queue valid (host 보유 + drop 시 close), bufs/req live (이 함수
-        // 반환 시점에 dspqueue_write 가 packet 을 FIFO 로 복사 완료 — bufs/req
-        // stack-local drop OK. 단 a/b/out_rpc rpcmem 데이터는 drain 까지 alive 필요,
-        // 이는 호출처(workspace/weight Tensor) 소유권이 보장).
+        // enqueue only — DSP 가 비동기 처리, 응답은 drain_pending 의 dspqueue_read 가
+        // FIFO 순서로 회수. a/b/out_rpc rpcmem 데이터는 drain 까지 alive 필요 (호출처
+        // workspace/weight Tensor 소유권 보장).
+        self.enqueue_packet(&req, &mut bufs)
+    }
+
+    /// 임의의 op packet 을 dspqueue 에 **enqueue (write only)** 한다 — packet
+    /// build(req)·buffer 배열(bufs) 은 op-specific 호출처가 준비하고, 본 helper 는
+    /// `dspqueue_write` + `op_pending.fetch_add(1)` 만 공유 처리한다. matmul/silu/
+    /// binary/rmsnorm/rope 의 모든 enqueue 가 본 단일 write 경로를 거치므로 step1
+    /// async batch fusion (enqueue×N → drain×1) 불변이 op 종류와 무관하게 유지된다.
+    ///
+    /// `bufs.len()` = packet 의 num_buffers (n_bufs). drain 은 [`drain_pending`] 가
+    /// op_pending 0 까지 회수. rpcmem 데이터 alive 는 호출처 소유권(workspace/weight
+    /// Tensor) 책임 — 본 helper 반환 후 bufs/req stack-local drop OK (dspqueue_write
+    /// 가 FIFO 로 복사 완료).
+    #[cfg(target_os = "android")]
+    fn enqueue_packet(&self, req: &HtpGeneralReq, bufs: &mut [DspQueueBuffer]) -> Result<()> {
+        // SAFETY: queue valid (host 가 보유 + drop 시 close 보장). bufs/req 는 이
+        // 호출 동안 live (caller stack). dspqueue_write 가 packet 을 FIFO 로 복사.
         let rc = unsafe {
             (self.host.dspqueue_write)(
                 self.host.queue,
                 0, // flags
-                3, // num_buffers (weight + input + output)
+                bufs.len() as u32,
                 bufs.as_mut_ptr(),
                 core::mem::size_of::<HtpGeneralReq>() as u32,
-                &req as *const _ as *const u8,
+                req as *const _ as *const u8,
                 DSPQUEUE_TIMEOUT,
             )
         };
@@ -378,6 +406,338 @@ impl HtpFastrpcBackend {
     ) -> Result<()> {
         self.enqueue_matmul_via_htp(a_rpc, b_rpc, out_rpc, n, k, m, weight_dtype)?;
         self.drain_pending()
+    }
+
+    // ── pointwise / norm / rope op NPU dispatch (enqueue + drain) ──────────
+    //
+    // 각 helper 는 (1) packet build (idl init_* + htp_tensor_from_shape),
+    // (2) DspQueueBuffer 배열 (microbench bufs ordering mirror),
+    // (3) enqueue_packet → drain_pending. 모두 F32 element-wise / 1D-flat 라
+    // ne=[numel,1,1,1], nb=[4, numel*4, ...] 단일 row 로 환원 (decode M=1 의
+    // pointwise 는 본질적으로 1D — CPU 도 flat slice 로 처리).
+    //
+    // ★ v79 element-wise(unary/binary) op 은 dispatch 당 ~12032 f32(1 VTCM 타일)
+    //   만 처리하고 전체 텐서를 loop 하지 않는다(device 실측). numel > 상한이면
+    //   silent 미처리(passthrough) → garbage. flat helper 는 HTP_OP_CHUNK 이하로
+    //   분할 dispatch 한다. 8192 = 검증된 안전치(8960 microbench PASS) 미만 + 여유.
+
+    /// SILU(src0) → dst (in-place 시 dst==src0). n_bufs=2 unary_act_req.
+    /// microbench `htp_silu.rs` 의 bufs ordering: [0]=src0 CpuWriteDspRead,
+    /// [1]=dst DspWriteCpuRead. in-place 면 동일 fd 의 두 view.
+    ///
+    /// **chunking 필수**: v79 unary op 은 dispatch 당 ~12032 f32(1 VTCM 타일)만
+    /// 처리하고 전체 텐서를 loop 하지 않는다(device 실측: numel=44800 prefill 시
+    /// idx 12032 부터 입력 passthrough = 미처리). 따라서 [`HTP_OP_CHUNK`] 이하
+    /// 조각으로 분할해 dsp_buf offset 으로 sub-range 를 순차 dispatch 한다.
+    #[cfg(target_os = "android")]
+    fn silu_via_htp(&self, src0: &RpcmemBuffer, dst: &RpcmemBuffer, numel: usize) -> Result<()> {
+        let mut off = 0usize;
+        while off < numel {
+            let n = (numel - off).min(HTP_OP_CHUNK);
+            let bytes = (n * 4) as u32;
+            let boff = (off * 4) as u32;
+            let ne = [n as u32, 1, 1, 1];
+            let nb = [4u32, bytes, bytes, bytes];
+            let mut req = HtpGeneralReq::zeroed();
+            let s0 = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
+            let d = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
+            init_unary_act_req(&mut req, HTP_OP_UNARY_SILU, s0, d);
+            let mut bufs: [DspQueueBuffer; 2] = [
+                src0.dsp_buf(DspqBufferType::CpuWriteDspRead, boff, bytes)?,
+                dst.dsp_buf(DspqBufferType::DspWriteCpuRead, boff, bytes)?,
+            ];
+            self.enqueue_packet(&req, &mut bufs)?;
+            self.drain_pending()?;
+            off += n;
+        }
+        Ok(())
+    }
+
+    /// element-wise binary op(src0, src1) → dst (in-place 시 dst==src0).
+    /// op ∈ {MUL, ADD}. n_bufs=3 binary_req. microbench `htp_add.rs`/`htp_mul.rs`
+    /// bufs ordering: [0]=src0 CpuWriteDspRead, [1]=src1 CpuWriteDspRead,
+    /// [2]=dst DspWriteCpuRead.
+    #[cfg(target_os = "android")]
+    fn binary_via_htp(
+        &self,
+        op: u32,
+        src0: &RpcmemBuffer,
+        src1: &RpcmemBuffer,
+        dst: &RpcmemBuffer,
+        numel: usize,
+    ) -> Result<()> {
+        // chunking: silu_via_htp 와 동일 사유(v79 ~12032 f32 상한). flat element-wise.
+        let mut off = 0usize;
+        while off < numel {
+            let n = (numel - off).min(HTP_OP_CHUNK);
+            let bytes = (n * 4) as u32;
+            let boff = (off * 4) as u32;
+            let ne = [n as u32, 1, 1, 1];
+            let nb = [4u32, bytes, bytes, bytes];
+            let mut req = HtpGeneralReq::zeroed();
+            let s0 = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
+            let s1 = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
+            let d = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
+            init_binary_req(&mut req, op, s0, s1, d);
+            let mut bufs: [DspQueueBuffer; 3] = [
+                src0.dsp_buf(DspqBufferType::CpuWriteDspRead, boff, bytes)?,
+                src1.dsp_buf(DspqBufferType::CpuWriteDspRead, boff, bytes)?,
+                dst.dsp_buf(DspqBufferType::DspWriteCpuRead, boff, bytes)?,
+            ];
+            self.enqueue_packet(&req, &mut bufs)?;
+            self.drain_pending()?;
+            off += n;
+        }
+        Ok(())
+    }
+
+    /// row-broadcast ADD: `dst[r,i] = src0[r,i] + bias[i]` (bias `[dim]` 이 rows
+    /// 만큼 반복). ggml ADD repeat 의미 — `mul_row_broadcast_via_htp` 와 op 만 다름.
+    #[cfg(target_os = "android")]
+    fn add_row_broadcast_via_htp(
+        &self,
+        src0: &RpcmemBuffer,
+        bias: &RpcmemBuffer,
+        dst: &RpcmemBuffer,
+        rows: usize,
+        dim: usize,
+    ) -> Result<()> {
+        let row_bytes = (dim * 4) as u32;
+        let plane = (rows * dim * 4) as u32;
+        let ne0 = [dim as u32, rows as u32, 1, 1];
+        let nb0 = [4u32, row_bytes, plane, plane];
+        let ne1 = [dim as u32, 1, 1, 1];
+        let nb1 = [4u32, row_bytes, row_bytes, row_bytes];
+        let mut req = HtpGeneralReq::zeroed();
+        let s0 = htp_tensor_from_shape(HTP_TYPE_F32, ne0, nb0);
+        let s1 = htp_tensor_from_shape(HTP_TYPE_F32, ne1, nb1);
+        let d = htp_tensor_from_shape(HTP_TYPE_F32, ne0, nb0);
+        init_binary_req(&mut req, HTP_OP_ADD, s0, s1, d);
+        let mut bufs: [DspQueueBuffer; 3] = [
+            src0.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, plane)?,
+            bias.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, row_bytes)?,
+            dst.dsp_buf(DspqBufferType::DspWriteCpuRead, 0, plane)?,
+        ];
+        self.enqueue_packet(&req, &mut bufs)?;
+        self.drain_pending()
+    }
+
+    /// row-broadcast MUL: `dst[r,i] = src0[r,i] * src1[i]` (src1=gamma `[dim]` 이
+    /// rows 만큼 반복). ggml MUL 의 repeat 의미 — src1 의 outer dim(ne[1..])=1 이면
+    /// src0 의 outer dim 에 broadcast. in-place 시 dst==src0. n_bufs=3.
+    #[cfg(target_os = "android")]
+    fn mul_row_broadcast_via_htp(
+        &self,
+        src0: &RpcmemBuffer,
+        gamma: &RpcmemBuffer,
+        dst: &RpcmemBuffer,
+        rows: usize,
+        dim: usize,
+    ) -> Result<()> {
+        let row_bytes = (dim * 4) as u32;
+        let plane = (rows * dim * 4) as u32;
+        // src0/dst: [dim, rows, 1, 1]. gamma: [dim, 1, 1, 1] (broadcast over rows).
+        let ne0 = [dim as u32, rows as u32, 1, 1];
+        let nb0 = [4u32, row_bytes, plane, plane];
+        let ne1 = [dim as u32, 1, 1, 1];
+        let nb1 = [4u32, row_bytes, row_bytes, row_bytes];
+        let mut req = HtpGeneralReq::zeroed();
+        let s0 = htp_tensor_from_shape(HTP_TYPE_F32, ne0, nb0);
+        let s1 = htp_tensor_from_shape(HTP_TYPE_F32, ne1, nb1);
+        let d = htp_tensor_from_shape(HTP_TYPE_F32, ne0, nb0);
+        init_binary_req(&mut req, HTP_OP_MUL, s0, s1, d);
+        let mut bufs: [DspQueueBuffer; 3] = [
+            src0.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, plane)?,
+            gamma.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, row_bytes)?,
+            dst.dsp_buf(DspqBufferType::DspWriteCpuRead, 0, plane)?,
+        ];
+        self.enqueue_packet(&req, &mut bufs)?;
+        self.drain_pending()
+    }
+
+    /// RMSNORM(src0) → dst (gamma 미적용 — output=input/rms(input)). in-place 시
+    /// dst==src0. n_bufs=2. 후속 gamma 곱은 호출처가 별도 MUL 로 처리. `dim` 은
+    /// per-row normalize 단위 (마지막 dim). rows = numel/dim 행을 ne[1] 로 묶는다.
+    #[cfg(target_os = "android")]
+    fn rmsnorm_via_htp(
+        &self,
+        src0: &RpcmemBuffer,
+        dst: &RpcmemBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let row_bytes = (dim * 4) as u32;
+        let plane = (rows * dim * 4) as u32;
+        let bytes = plane;
+        // ggml convention ne[0]=innermost(=normalize 단위 dim), ne[1]=rows.
+        let ne = [dim as u32, rows as u32, 1, 1];
+        let nb = [4u32, row_bytes, plane, plane];
+        let mut req = HtpGeneralReq::zeroed();
+        let s0 = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
+        let d = htp_tensor_from_shape(HTP_TYPE_F32, ne, nb);
+        init_rmsnorm_req(&mut req, eps, s0, d);
+        let mut bufs: [DspQueueBuffer; 2] = [
+            src0.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, bytes)?,
+            dst.dsp_buf(DspqBufferType::DspWriteCpuRead, 0, bytes)?,
+        ];
+        self.enqueue_packet(&req, &mut bufs)?;
+        self.drain_pending()
+    }
+
+    /// ROPE(src0, positions) → dst (in-place 시 dst==src0). n_bufs=3. positions 는
+    /// i32 rpcmem 버퍼 (decode 단일 토큰 = [start_pos]). microbench `htp_rope.rs`
+    /// bufs ordering: [0]=src0 CpuWriteDspRead, [1]=positions CpuWriteDspRead,
+    /// [2]=dst DspWriteCpuRead.
+    #[cfg(target_os = "android")]
+    fn rope_via_htp(
+        &self,
+        src0: &RpcmemBuffer,
+        pos: &RpcmemBuffer,
+        dst: &RpcmemBuffer,
+        params: &RopeParams,
+        head_dim: usize,
+        n_heads: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let bytes_in = (head_dim * n_heads * n_tokens * 4) as u32;
+        let ne_in = [head_dim as u32, n_heads as u32, n_tokens as u32, 1];
+        let nb_in = [
+            4u32,
+            (head_dim * 4) as u32,
+            (head_dim * n_heads * 4) as u32,
+            bytes_in,
+        ];
+        let bytes_pos = (n_tokens * 4) as u32;
+        let ne_pos = [n_tokens as u32, 1, 1, 1];
+        let nb_pos = [4u32, bytes_pos, bytes_pos, bytes_pos];
+        let mut req = HtpGeneralReq::zeroed();
+        let s0 = htp_tensor_from_shape(HTP_TYPE_F32, ne_in, nb_in);
+        let s1 = htp_tensor_from_shape(HTP_TYPE_I32, ne_pos, nb_pos);
+        let d = htp_tensor_from_shape(HTP_TYPE_F32, ne_in, nb_in);
+        init_rope_req(&mut req, params, s0, s1, d);
+        let mut bufs: [DspQueueBuffer; 3] = [
+            src0.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, bytes_in)?,
+            pos.dsp_buf(DspqBufferType::CpuWriteDspRead, 0, bytes_pos)?,
+            dst.dsp_buf(DspqBufferType::DspWriteCpuRead, 0, bytes_in)?,
+        ];
+        self.enqueue_packet(&req, &mut bufs)?;
+        self.drain_pending()
+    }
+
+    /// RoPE in-place dispatch. positions scratch(i32 rpcmem)를 lazily alloc/재기록
+    /// 한 뒤 `rope_via_htp` 호출 (dst==src0 in-place). decode 토큰당 position 만
+    /// 갱신하므로 scratch 는 n_tokens 가 커질 때만 재할당.
+    #[cfg(target_os = "android")]
+    fn rope_dispatch(
+        &self,
+        x_rpc: &RpcmemBuffer,
+        start_pos: usize,
+        n_tokens: usize,
+        params: &RopeParams,
+        head_dim: usize,
+        n_heads: usize,
+    ) -> Result<()> {
+        let pos_bytes = n_tokens * 4;
+        let mut guard = self
+            .rope_pos_scratch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("htp: rope_pos_scratch mutex poisoned"))?;
+        // 용량 부족 시 (재)할당. dtype 은 byte-view (U8) — i32 element 해석은 packet
+        // 의 HTP_TYPE_I32 가 담당, buffer 는 byte 단위.
+        let need_realloc = match guard.as_ref() {
+            Some(buf) => buf.size() < pos_bytes,
+            None => true,
+        };
+        if need_realloc {
+            *guard = Some(RpcmemBuffer::alloc(
+                self.host.clone(),
+                pos_bytes,
+                DType::U8,
+            )?);
+        }
+        let pos_buf = guard.as_mut().expect("rope_pos_scratch alloc'd above");
+        // positions = [start_pos, start_pos+1, ...] i32.
+        // SAFETY: pos_buf 는 pos_bytes(=n_tokens*4) ≥ 만큼 alloc, write 범위 내.
+        unsafe {
+            let p = pos_buf.as_mut_ptr() as *mut i32;
+            for t in 0..n_tokens {
+                p.add(t).write((start_pos + t) as i32);
+            }
+        }
+        // in-place: dst==src0==x_rpc. pos_buf 는 guard 가 살아있는 동안 valid.
+        self.rope_via_htp(x_rpc, pos_buf, x_rpc, params, head_dim, n_heads, n_tokens)
+    }
+
+    /// decode flash attention (HTP_OP_FLASH_ATTN_EXT). q=F32, k/v=F16(strict, KV
+    /// cache HeadMajor), out=F32. n_bufs=4 (Q/K/V/dst), mask/sinks 미사용.
+    /// op_params=[scale=1/√head_dim, max_bias=0, logit_softcap=0]. microbench
+    /// `htp_flash_attn_ext.rs` packet mirror — 단 K/V 는 **HeadMajor capacity stride**
+    /// (nb[2]=head_dim*capacity*2, ne[1]=cache_seq_len) 로 실제 KV cache 를 가리킨다.
+    /// dst [head_dim, 1, n_heads_q] = CPU attention_gen 의 out[h*head_dim+d] 와 동일.
+    /// GQA(n_heads_q≠n_kv)는 DSP-side 가 처리. score 미반환이라 caller 가 scores
+    /// None 일 때만 진입(eviction off).
+    #[cfg(target_os = "android")]
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attn_via_htp(
+        &self,
+        q_rpc: &RpcmemBuffer,
+        k_rpc: &RpcmemBuffer,
+        v_rpc: &RpcmemBuffer,
+        out_rpc: &RpcmemBuffer,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        capacity: usize,
+    ) -> Result<()> {
+        let hd = head_dim as u32;
+        let csl = cache_seq_len as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // gqa_ratio = kv-head 당 q-head 수. v79 flash_attn 은 **항상 kv_h=0 만 사용**
+        // (GQA 미iterate, device 실측: nhkv=2 시 q-head 6~11=kv_h1 group 전부 garbage).
+        // 우회: kv-head 를 1개씩 떼어 그 그룹의 gqa q-head 만 dispatch → DSP 가 보는
+        // kv-head 는 1개(=올바른 그룹)뿐이라 kv_h=0 이 항상 정답. HeadMajor 에서
+        // single head 의 valid 위치는 contiguous(offset g*capacity*head_dim) 라 gather 불요.
+        let gqa = num_heads_q / num_heads_kv;
+        let g32 = gqa as u32;
+        for g in 0..num_heads_kv {
+            // Q F32: group g 의 q-head [g*gqa .. (g+1)*gqa]. ne=[head_dim, gqa, 1, 1].
+            let ne_q = [hd, g32, 1, 1];
+            let nb_q = [4u32, hd * 4, hd * g32 * 4, hd * g32 * 4];
+            // K/V F16: 단일 kv-head g, valid csl 위치(HeadMajor 내 contiguous).
+            let ne_k = [hd, csl, 1, 1];
+            let nb_k = [2u32, hd * 2, hd * csl * 2, hd * csl * 2];
+            // dst F32: group g 의 out-head. ne=[head_dim, 1, gqa, 1] → out[h*head_dim+d].
+            let ne_d = [hd, 1, g32, 1];
+            let nb_d = [4u32, hd * 4, hd * 4, hd * g32 * 4];
+
+            let mut req = HtpGeneralReq::zeroed();
+            req.op = HTP_OP_FLASH_ATTN_EXT;
+            req.flags = 0;
+            req.op_params = [0; HTP_MAX_OP_PARAMS_SLOTS];
+            req.op_params[0] = scale.to_bits() as i32;
+            req.src0 = htp_tensor_from_shape(HTP_TYPE_F32, ne_q, nb_q);
+            req.src1 = htp_tensor_from_shape(HTP_TYPE_F16, ne_k, nb_k);
+            req.src2 = htp_tensor_from_shape(HTP_TYPE_F16, ne_k, nb_k);
+            req.dst = htp_tensor_from_shape(HTP_TYPE_F32, ne_d, nb_d);
+
+            let q_off = (g * gqa * head_dim * 4) as u32; // F32 q-head group
+            let q_sz = (gqa * head_dim * 4) as u32;
+            let k_off = (g * capacity * head_dim * 2) as u32; // F16 HeadMajor head g
+            let k_sz = (cache_seq_len * head_dim * 2) as u32; // valid csl 위치만
+            let d_off = (g * gqa * head_dim * 4) as u32; // F32 out-head group
+            let d_sz = (gqa * head_dim * 4) as u32;
+            let mut bufs: [DspQueueBuffer; 4] = [
+                q_rpc.dsp_buf(DspqBufferType::CpuWriteDspRead, q_off, q_sz)?,
+                k_rpc.dsp_buf(DspqBufferType::CpuWriteDspRead, k_off, k_sz)?,
+                v_rpc.dsp_buf(DspqBufferType::CpuWriteDspRead, k_off, k_sz)?,
+                out_rpc.dsp_buf(DspqBufferType::DspWriteCpuRead, d_off, d_sz)?,
+            ];
+            self.enqueue_packet(&req, &mut bufs)?;
+            self.drain_pending()?;
+        }
+        Ok(())
     }
 }
 
@@ -702,7 +1062,24 @@ impl Backend for HtpFastrpcBackend {
         self.cpu_companion.matmul_slice(a, b, rows, cols, out)
     }
 
+    /// `a += b` element-wise. env `LLMRS_HTP_NPU_ADD=1` + a/b 둘 다 RpcmemBuffer-backed
+    /// 면 NPU `ADD(a, b) → a` (in-place). 그 외 cpu_companion (회귀 0).
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            if std::env::var_os("LLMRS_HTP_NPU_ADD").is_some()
+                && a.dtype() == DType::F32
+                && b.dtype() == DType::F32
+                && a.numel() == b.numel()
+                && let (Some(a_rpc), Some(b_rpc)) = (
+                    a.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    b.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                )
+            {
+                // in-place: dst==src0==a_rpc (동일 fd 의 두 view).
+                return self.binary_via_htp(HTP_OP_ADD, a_rpc, b_rpc, a_rpc, a.numel());
+            }
+        }
         self.cpu_companion.add_assign(a, b)
     }
 
@@ -710,7 +1087,63 @@ impl Backend for HtpFastrpcBackend {
         self.cpu_companion.scale(x, v)
     }
 
+    /// row-broadcast bias add. env `LLMRS_HTP_NPU_ADD=1` + x/bias 둘 다 rpcmem-backed
+    /// 면 NPU MUL/ADD 의 row-broadcast 경로(`ADD(x, bias)` broadcast). decode M=1 은
+    /// x.numel()==bias.numel() 라 단순 element-wise ADD 로 환원되지만, rows>1 (prefill)
+    /// 도 ggml ADD 의 src1 outer-dim=1 broadcast 로 일반화. 그 외 trait default(CPU).
+    fn add_row_bias(&self, x: &mut Tensor, bias: &Tensor) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            if std::env::var_os("LLMRS_HTP_NPU_ADD").is_some()
+                && x.dtype() == DType::F32
+                && bias.dtype() == DType::F32
+                && let (Some(x_rpc), Some(bias_rpc)) = (
+                    x.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    bias.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                )
+            {
+                let dim = bias.numel();
+                if dim > 0 && x.numel().is_multiple_of(dim) {
+                    let rows = x.numel() / dim;
+                    return self.add_row_broadcast_via_htp(x_rpc, bias_rpc, x_rpc, rows, dim);
+                }
+            }
+        }
+        // trait default (CPU broadcast).
+        let x_data = x.as_mut_slice::<f32>();
+        let b_data = bias.as_slice::<f32>();
+        let dim = b_data.len();
+        for row in x_data.chunks_mut(dim) {
+            for (v, &b) in row.iter_mut().zip(b_data.iter()) {
+                *v += b;
+            }
+        }
+        Ok(())
+    }
+
+    /// `a[i] = silu(a[i]) * b[i]`. env `LLMRS_HTP_NPU_SILU=1` + a/b 둘 다
+    /// RpcmemBuffer-backed 면 NPU 2-op: `SILU(a) → a` (unary in-place) +
+    /// `MUL(a, b) → a` (binary in-place). 그 외 cpu_companion (회귀 0).
     fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            if std::env::var_os("LLMRS_HTP_NPU_SILU").is_some()
+                && a.dtype() == DType::F32
+                && b.dtype() == DType::F32
+                && a.numel() == b.numel()
+                && let (Some(a_rpc), Some(b_rpc)) = (
+                    a.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    b.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                )
+            {
+                let numel = a.numel();
+                // SILU(a) → a (in-place), 이어서 MUL(a, b) → a (in-place). 둘 다
+                // chunked(silu_via_htp/binary_via_htp 가 HTP_OP_CHUNK 분할) — v79 의
+                // ~12032 f32 dispatch 상한을 넘는 prefill gate(M×ffn_hidden)도 정확.
+                self.silu_via_htp(a_rpc, a_rpc, numel)?;
+                return self.binary_via_htp(HTP_OP_MUL, a_rpc, b_rpc, a_rpc, numel);
+            }
+        }
         self.cpu_companion.silu_mul(a, b)
     }
 
@@ -718,7 +1151,112 @@ impl Backend for HtpFastrpcBackend {
         self.cpu_companion.softmax(x)
     }
 
+    /// decode attention. env `LLMRS_HTP_NPU_ATTN=1` + scores 미요청(eviction off) +
+    /// q F32 / k,v F16(HeadMajor) / out F32 + 전부 rpcmem 면 NPU flash_attn,
+    /// 그 외 cpu_companion (회귀 0). DSP flash_attn 은 score 를 반환하지 않으므로
+    /// scores_out=Some(H2O/D2O) 면 NPU 불가 → CPU. **v79 flash_attn 의 수치 정확성은
+    /// microbench 에서 status 만 검증됨 — token-id 로 device 검증 필요(리스크).**
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
+    ) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            let ks = k_cache.shape().dims();
+            // HeadMajor 판정 = CPU attention_gen 과 동일 (ks[1]==n_kv && ks[1]!=ks[2]).
+            let is_head_major =
+                ks.len() >= 3 && ks[1] == num_heads_kv && ks[1] != ks[2];
+            if std::env::var_os("LLMRS_HTP_NPU_ATTN").is_some()
+                && scores_out.is_none()
+                && is_head_major
+                && q.dtype() == DType::F32
+                && k_cache.dtype() == DType::F16
+                && v_cache.dtype() == DType::F16
+                && out.dtype() == DType::F32
+                && let (Some(q_rpc), Some(k_rpc), Some(v_rpc), Some(out_rpc)) = (
+                    q.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    k_cache.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    v_cache.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    out.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                )
+            {
+                let capacity = ks[2];
+                htp_dispatch_log_once(true, "flash_attn (per-kv-head)");
+                return self.flash_attn_via_htp(
+                    q_rpc,
+                    k_rpc,
+                    v_rpc,
+                    out_rpc,
+                    num_heads_q,
+                    num_heads_kv,
+                    head_dim,
+                    cache_seq_len,
+                    capacity,
+                );
+            }
+        }
+        self.cpu_companion.attention_gen(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            cache_seq_len,
+            scores_out,
+        )
+    }
+
+    /// In-place RoPE. env `LLMRS_HTP_NPU_ROPE=1` + x RpcmemBuffer-backed 면 NPU
+    /// ROPE op (in-place), 그 외 cpu_companion (회귀 0).
+    ///
+    /// **rotation mode**: CPU 레퍼런스(`cpu/common.rs::rope_inplace`)는 NeoX-style
+    /// split — `head_slice[i]` 를 `head_slice[i+half_dim]` 와 페어링하고 freq =
+    /// `theta^(-2i/head_dim)`. 이는 ggml mode=2(GGML_ROPE_TYPE_NEOX) 와 동일하므로
+    /// `RopeParams.mode=2`. (mode=0 normal interleaved 와 결과가 다르다 — 정확성
+    /// 검증에서 mode 매핑이 핵심.)
     fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            if std::env::var_os("LLMRS_HTP_NPU_ROPE").is_some() && x.dtype() == DType::F32 {
+                let dims = x.shape().dims();
+                // CPU rope_inplace 와 동일 dim 추출: 마지막=head_dim, 직전=n_heads,
+                // 그 직전=seq_len. (decode: [batch, 1, n_heads, head_dim] → seq=1.)
+                if dims.len() >= 3 {
+                    let head_dim = dims[dims.len() - 1];
+                    let n_heads = dims[dims.len() - 2];
+                    let n_tokens = dims[dims.len() - 3];
+                    if let Some(x_rpc) = x.buffer().as_any().downcast_ref::<RpcmemBuffer>() {
+                        // positions [start_pos .. start_pos+n_tokens) i32 → lazily-alloc
+                        // scratch 에 기록. NeoX freq_base=theta, mode=2 (CPU 레퍼런스 일치).
+                        // device 실측 max_err 1e-5 (F32 rounding) — bit-exact 에 가까움.
+                        let params = RopeParams {
+                            n_dims: head_dim as i32,
+                            mode: 2,
+                            n_ctx_orig: 0,
+                            freq_base: theta,
+                            freq_scale: 1.0,
+                            ext_factor: 0.0,
+                            attn_factor: 1.0,
+                            beta_fast: 0.0,
+                            beta_slow: 0.0,
+                        };
+                        return self
+                            .rope_dispatch(x_rpc, start_pos, n_tokens, &params, head_dim, n_heads);
+                    }
+                }
+            }
+        }
         self.cpu_companion.rope_inplace(x, start_pos, theta)
     }
 
@@ -741,8 +1279,29 @@ impl Backend for HtpFastrpcBackend {
     /// Tensor::buffer().as_any() 로 downcast, (c) 매치 시 dsp_buf() 추출 후
     /// `rms_norm_via_htp` 호출, (d) 미매치 시 cpu_companion fallback.
     fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32, add_unit: bool) -> Result<()> {
-        // PoC scope: RpcmemBuffer backing wrap 미완성 → cpu_companion 위임.
-        // `rms_norm_via_htp` 는 Phase 5 wire-up 대기.
+        #[cfg(target_os = "android")]
+        {
+            // add_unit=true(Gemma: (1+w)) 는 NPU MUL 로 직접 표현 불가 → cpu fallback.
+            // add_unit=false(Qwen/Llama)만 NPU: RMSNORM(x)→x + MUL(x, gamma)→x.
+            if !add_unit
+                && std::env::var_os("LLMRS_HTP_NPU_RMSNORM").is_some()
+                && x.dtype() == DType::F32
+                && w.dtype() == DType::F32
+                && let (Some(x_rpc), Some(w_rpc)) = (
+                    x.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                    w.buffer().as_any().downcast_ref::<RpcmemBuffer>(),
+                )
+            {
+                let dims = x.shape().dims();
+                let dim = dims[dims.len() - 1];
+                if dim > 0 && x.numel().is_multiple_of(dim) {
+                    let rows = x.numel() / dim;
+                    // RMSNORM(x)→x (gamma 미적용), 이어서 row-broadcast MUL(x, gamma)→x.
+                    self.rmsnorm_via_htp(x_rpc, x_rpc, rows, dim, eps)?;
+                    return self.mul_row_broadcast_via_htp(x_rpc, w_rpc, x_rpc, rows, dim);
+                }
+            }
+        }
         self.cpu_companion.rms_norm(x, w, eps, add_unit)
     }
 
@@ -829,7 +1388,30 @@ impl Backend for HtpFastrpcBackend {
                     self.cpu_companion.clone(),
                 ))
             }
-            // 그 외 (F32/Q8_0/Q6_K/… , 비정렬·비2D Q4_0/F16): cpu_companion
+            // F32 1D weight (norm gamma, qkv bias): rpcmem alloc + byte 복사.
+            // pointwise/norm op NPU override (rms_norm gamma MUL, add_row_bias) 가
+            // weight 를 DSP 로 넘기려면 rpcmem-backed 여야 한다. 1D 로 한정해
+            // lm_head/embedding 의 2D F32 (cpu matmul 대상) 는 건드리지 않는다.
+            // env 게이트 OFF 여도 promote 자체는 무해 (rpcmem 약간 더 씀, op 가
+            // downcast 성공해도 env OFF 면 cpu fallback 경로라 미사용).
+            DType::F32 if dims.len() == 1 => {
+                let bytes = t.numel() * 4;
+                let mut buf = RpcmemBuffer::alloc(self.host.clone(), bytes, DType::F32)?;
+                let f32_slice = t.as_slice::<f32>();
+                // SAFETY: f32 = 4-byte POD, f32_slice.len()*4 == bytes == buf alloc.
+                let src_bytes =
+                    unsafe { std::slice::from_raw_parts(f32_slice.as_ptr() as *const u8, bytes) };
+                // SAFETY: buf 직전 alloc 으로 valid, src/dst non-overlapping, len 동일.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_bytes.as_ptr(), buf.as_mut_ptr(), bytes);
+                }
+                Ok(Tensor::new(
+                    t.shape().clone(),
+                    Arc::new(buf),
+                    self.cpu_companion.clone(),
+                ))
+            }
+            // 그 외 (F32 2D/Q8_0/Q6_K/… , 비정렬·비2D Q4_0/F16): cpu_companion
             // (SharedBuffer). NPU dispatch 대상이 아니므로 rpcmem 상주 불필요.
             _ => self.cpu_companion.copy_weight_from(t),
         }
