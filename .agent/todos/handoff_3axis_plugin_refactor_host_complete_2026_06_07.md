@@ -28,6 +28,8 @@
 
 전체 게이트: `cargo test -p llm_rs2 --lib`(skip opencl/memory) 1252 passed 0 failed, `cargo clippy --workspace -- -D warnings` 경고 0, 통합 테스트 컴파일 OK.
 
+**device 무회귀 검증 완료 (2026-06-07, S25 R3CY408S5SB)**: 4커밋이 device-safe 임을 실증. ① aarch64-Android 크로스빌드(`--features opencl,vulkan,qnn,htp_fastrpc --no-default-features`) PASS — `error[` 0, 신규 argus_cli 배포. ② S25 추론(Qwen2.5-1.5B Q4_0, `--backend opencl`, n=3) Decode **median 31.10 ms/tok**(29.09/31.10/31.11) vs baseline ≈32 → 회귀 없음(Δ 음수), 출력 coherent·crash 0. 예상대로 — 변경은 additive(registry) + CPU floor(`_=>` arm, opencl Q4_0 decode hot path 밖) + 미배선 ctx 라 production opencl 경로 불변.
+
 ---
 
 ## 다음 작업 (전부 device 세션 — host `/goal` 범위 밖)
