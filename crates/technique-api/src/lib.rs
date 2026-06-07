@@ -414,17 +414,67 @@ pub fn registered_weight_names() -> Vec<&'static str> {
 
 // ── Format 축 plugin registry (ADR-0005 D6, KVCacheStage 동형) ──
 
+/// 양자 블록의 scale 저장 방식 (block-quant family 어휘, ADR-0005 D5).
+///
+/// `#[repr(u32)]`: 미래 `.so` C-ABI 가 fieldless discriminant 를 그대로 건넨다(L1).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScaleLayout {
+    /// scale 없음 (f32/f16 raw).
+    None,
+    /// 블록당 단일 f16 scale (q4_0/q8_0).
+    PerBlockF16,
+    /// 블록당 f16 scale + f16 min (q4_1).
+    PerBlockF16WithMin,
+}
+
+/// 양자 블록의 비트 패킹 방식 (block-quant family 어휘, ADR-0005 D5).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Packing {
+    /// 연속 raw (f32/f16).
+    Dense,
+    /// nibble(4-bit) 패킹 (q4_0/q4_1).
+    Nibble,
+    /// byte(8-bit) 패킹 (q8_0).
+    Byte,
+}
+
+/// layer-tier 경계 POD — format plugin 의 **실제 기여**(ADR-0005 D3/L1).
+///
+/// block-quant family 어휘만 담는다(`block_elems`/`bits`/`scale_layout`/`packing`):
+/// q4_0/q4_1/q8_0/q5 등은 이 descriptor 로 generic floor(dequant→f32 matmul, M-F3)가
+/// 구동된다. mxfp4 shared-exponent·codebook·sparse 는 floor 밖 → backend 특화 opt-in escape(D5).
+///
+/// `#[repr(C)]`: 미래 `.so` C-ABI 경계를 그대로 건너는 평탄 POD(L1 게이트 — 지금 repr(C) 로
+/// 두어 `.so` 때 reshape 강제 회피).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KVLayoutDesc {
+    /// 한 양자 블록의 원소 수 (q4_0/q8_0 = 32). raw(f32/f16) 포맷은 1.
+    pub block_elems: u32,
+    /// 원소당 비트 수 (q4_0 = 4, q8_0 = 8, f16 = 16, f32 = 32).
+    pub bits: u8,
+    /// scale 저장 방식.
+    pub scale_layout: ScaleLayout,
+    /// 비트 패킹 방식.
+    pub packing: Packing,
+}
+
 /// Format 축 plugin trait — 저장 layout 을 기술한다(ADR-0005 D3).
 ///
 /// layer-tier COMPUTE(`write_kv`/`attention_into`)는 본 trait 에 없다 — 그것은 hardware 축의
 /// M×N 커널 셀로 backend 가 소유(D4). format plugin 은 순수 descriptor + (step4) manage 다.
 ///
-/// NOTE(phasing, D7): layer-tier 경계 descriptor `layout() -> KVLayoutDesc`(M-F2) 와 step-tier
-/// `compact()`(step4 dissolution)은 후속 마일스톤에서 추가한다 — 본 마일스톤(M-F1)은 stage 축의
-/// **3축 평행 registry 골격** 확립이 목적(D6, 단일 병합 금지 §3.3.1).
+/// NOTE(phasing, D7): step-tier `compact(keep, merges)`(KVCacheFormat 해체, step4)은 아직
+/// 추가하지 않는다 — 그 시점에 manage 표면을 wire 한다. 본 trait 의 layer-tier 기여는
+/// `layout()` descriptor read 다(M-F2, L1 repr(C) 경계).
 pub trait KVFormat: Send + Sync {
     /// canonical format 이름 (예: "q4_0"/"f16"/"f32"). 슬라이스 내 유일.
     fn name(&self) -> &str;
+
+    /// 이 포맷의 저장 layout descriptor (엔진 generic reader 가 hot-path 에서 읽음, D3).
+    fn layout(&self) -> KVLayoutDesc;
 }
 
 /// 한 format 기법의 등록 항목 (KV `KVCacheStageReg` 거울, ADR-0005 D6).
@@ -623,11 +673,19 @@ mod tests {
 
     // ── Format 축 registry (ADR-0005 M-F1) ──
 
-    /// format 등록·조회 round-trip 검증용 no-op format.
+    /// format 등록·조회 round-trip 검증용 no-op format (raw f16 descriptor).
     struct DummyFormat;
     impl KVFormat for DummyFormat {
         fn name(&self) -> &str {
             "dummy_format"
+        }
+        fn layout(&self) -> KVLayoutDesc {
+            KVLayoutDesc {
+                block_elems: 1,
+                bits: 16,
+                scale_layout: ScaleLayout::None,
+                packing: Packing::Dense,
+            }
         }
     }
 
@@ -642,7 +700,14 @@ mod tests {
         let reg =
             find_kv_format("dummy_format").expect("dummy_format 등록이 슬라이스에 있어야 한다");
         assert_eq!(reg.name, "dummy_format");
-        assert_eq!((reg.make)().name(), "dummy_format");
+        let f = (reg.make)();
+        assert_eq!(f.name(), "dummy_format");
+        // M-F2: layer-tier descriptor read (repr(C) KVLayoutDesc).
+        let d = f.layout();
+        assert_eq!(d.block_elems, 1);
+        assert_eq!(d.bits, 16);
+        assert_eq!(d.scale_layout, ScaleLayout::None);
+        assert_eq!(d.packing, Packing::Dense);
     }
 
     #[test]
