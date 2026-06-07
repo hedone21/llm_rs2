@@ -412,6 +412,79 @@ pub fn registered_weight_names() -> Vec<&'static str> {
     WEIGHT_STAGES.iter().map(|r| r.name).collect()
 }
 
+// ── Format 축 plugin registry (ADR-0005 D6, KVCacheStage 동형) ──
+
+/// Format 축 plugin trait — 저장 layout 을 기술한다(ADR-0005 D3).
+///
+/// layer-tier COMPUTE(`write_kv`/`attention_into`)는 본 trait 에 없다 — 그것은 hardware 축의
+/// M×N 커널 셀로 backend 가 소유(D4). format plugin 은 순수 descriptor + (step4) manage 다.
+///
+/// NOTE(phasing, D7): layer-tier 경계 descriptor `layout() -> KVLayoutDesc`(M-F2) 와 step-tier
+/// `compact()`(step4 dissolution)은 후속 마일스톤에서 추가한다 — 본 마일스톤(M-F1)은 stage 축의
+/// **3축 평행 registry 골격** 확립이 목적(D6, 단일 병합 금지 §3.3.1).
+pub trait KVFormat: Send + Sync {
+    /// canonical format 이름 (예: "q4_0"/"f16"/"f32"). 슬라이스 내 유일.
+    fn name(&self) -> &str;
+}
+
+/// 한 format 기법의 등록 항목 (KV `KVCacheStageReg` 거울, ADR-0005 D6).
+pub struct KVFormatReg {
+    /// canonical format 이름. 슬라이스 내 유일.
+    pub name: &'static str,
+    /// format 인스턴스 팩토리.
+    pub make: fn() -> Box<dyn KVFormat>,
+}
+
+/// 전역 format 등록 슬라이스 — 3축 평행 registry 의 하나(ADR-0005 D6).
+///
+/// fat-LTO `--gc-sections` silent drop 리스크는 실제 builtin 등록이 생기는 시점(M-F3)에
+/// 엔진 startup self-test 로 게이트한다(ADR-0003 §4 동형).
+#[distributed_slice]
+pub static KV_FORMATS: [KVFormatReg] = [..];
+
+/// 이름으로 등록된 format 을 찾는다 (엔진 construction 시 사용).
+pub fn find_kv_format(name: &str) -> Option<&'static KVFormatReg> {
+    KV_FORMATS.iter().find(|r| r.name == name)
+}
+
+/// 등록된 모든 format 이름 (self-test / 진단용).
+pub fn registered_kv_format_names() -> Vec<&'static str> {
+    KV_FORMATS.iter().map(|r| r.name).collect()
+}
+
+// ── Backend capability 축 plugin registry (ADR-0005 D4/D6) ──
+
+/// Backend capability plugin trait — backend 소유 커널 위의 특화 opt-in 능력(ADR-0005 D4/D5).
+///
+/// 골격만(D6): GpuFold 등 첫 instance(step5, 본 crate 단계 밖)가 메서드를 확정한다. backend 는
+/// generic floor(descriptor 구동 dequant→f32)를 항상 제공하고 hot 경로만 본 capability 로 특화.
+pub trait BackendCapability: Send + Sync {
+    /// canonical capability 이름 (예: "gpu_fold"). 슬라이스 내 유일.
+    fn name(&self) -> &str;
+}
+
+/// 한 backend capability 의 등록 항목 (KV `KVCacheStageReg` 거울, ADR-0005 D6).
+pub struct BackendCapReg {
+    /// canonical capability 이름. 슬라이스 내 유일.
+    pub name: &'static str,
+    /// capability 인스턴스 팩토리.
+    pub make: fn() -> Box<dyn BackendCapability>,
+}
+
+/// 전역 backend capability 등록 슬라이스 — 3축 평행 registry 의 하나(ADR-0005 D6).
+#[distributed_slice]
+pub static BACKEND_CAPABILITIES: [BackendCapReg] = [..];
+
+/// 이름으로 등록된 capability 를 찾는다.
+pub fn find_backend_capability(name: &str) -> Option<&'static BackendCapReg> {
+    BACKEND_CAPABILITIES.iter().find(|r| r.name == name)
+}
+
+/// 등록된 모든 capability 이름 (self-test / 진단용).
+pub fn registered_backend_capability_names() -> Vec<&'static str> {
+    BACKEND_CAPABILITIES.iter().map(|r| r.name).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +619,63 @@ mod tests {
         let ctx = DummyWeightCtx;
         assert!(ctx.importance().is_none());
         assert!(ctx.quant_noise().is_none());
+    }
+
+    // ── Format 축 registry (ADR-0005 M-F1) ──
+
+    /// format 등록·조회 round-trip 검증용 no-op format.
+    struct DummyFormat;
+    impl KVFormat for DummyFormat {
+        fn name(&self) -> &str {
+            "dummy_format"
+        }
+    }
+
+    #[distributed_slice(KV_FORMATS)]
+    static DUMMY_FORMAT_REG: KVFormatReg = KVFormatReg {
+        name: "dummy_format",
+        make: || Box::new(DummyFormat),
+    };
+
+    #[test]
+    fn dummy_format_registers_into_slice() {
+        let reg =
+            find_kv_format("dummy_format").expect("dummy_format 등록이 슬라이스에 있어야 한다");
+        assert_eq!(reg.name, "dummy_format");
+        assert_eq!((reg.make)().name(), "dummy_format");
+    }
+
+    #[test]
+    fn registered_kv_format_names_contains_dummy() {
+        assert!(registered_kv_format_names().contains(&"dummy_format"));
+    }
+
+    // ── Backend capability 축 registry (ADR-0005 M-F1) ──
+
+    /// capability 등록·조회 round-trip 검증용 no-op capability.
+    struct DummyCap;
+    impl BackendCapability for DummyCap {
+        fn name(&self) -> &str {
+            "dummy_cap"
+        }
+    }
+
+    #[distributed_slice(BACKEND_CAPABILITIES)]
+    static DUMMY_CAP_REG: BackendCapReg = BackendCapReg {
+        name: "dummy_cap",
+        make: || Box::new(DummyCap),
+    };
+
+    #[test]
+    fn dummy_cap_registers_into_slice() {
+        let reg =
+            find_backend_capability("dummy_cap").expect("dummy_cap 등록이 슬라이스에 있어야 한다");
+        assert_eq!(reg.name, "dummy_cap");
+        assert_eq!((reg.make)().name(), "dummy_cap");
+    }
+
+    #[test]
+    fn registered_backend_capability_names_contains_dummy() {
+        assert!(registered_backend_capability_names().contains(&"dummy_cap"));
     }
 }
