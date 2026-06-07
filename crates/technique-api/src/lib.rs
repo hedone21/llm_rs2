@@ -309,6 +309,109 @@ pub struct PartitionShare {
     pub hardware: DeviceTarget,
 }
 
+// ── weight stage plugin (ADR-0006 MW-B, KVCacheStage 동형) ──
+
+/// weight stage 가 읽는 per-layer 메트릭 종류. `WeightStageCtx::layer_metric` 의 kind 인자
+/// (KV `TensorKind` 거울). `#[repr(u32)]` 은 미래 `.so` C-ABI discriminant 직접 전달용.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerMetricKind {
+    /// per-layer importance (swap 랭킹 key 의 한 축). 엔진 impl 은 ImportanceTable 의
+    /// `SubLayer::Full` 투영을 평탄화해 제공한다(entries() 의 sublayer 차원 환원).
+    Importance,
+    /// per-layer quantization noise ε (swap 랭킹 key 의 ε 축).
+    QuantNoise,
+}
+
+/// weight stage plugin 이 읽는 읽기 전용 컨텍스트 (KV `StageCtx` 거울, dyn-safe).
+/// 엔진이 `&TransformerModel` 위로 구현(MW-D). 변형 권한 없음 — plugin 은 읽고 plan 만 낸다(D1/D3).
+pub trait WeightStageCtx {
+    /// 디코더 레이어 총 수.
+    fn n_layers(&self) -> usize;
+    /// 엔진이 해소한 swap budget = **절대 레이어 수**(ratio→count + currently_swapped 차감 +
+    /// boundary 보호까지 엔진이 처리; KV `target_len` 거울).
+    fn budget(&self) -> usize;
+    /// graded 메모리 압력 0–100 (pressure-driven stage 용).
+    fn pressure(&self) -> u8;
+    /// 해당 레이어의 현재 저장 dtype.
+    fn current_format(&self, layer: usize) -> TensorDtype;
+    /// ★ per-layer 메트릭 단일 접근 (KV `tensor(kind)` 거울, OCP). kind 미가용 시 `None`.
+    /// 반환 슬라이스 borrow 는 ctx 수명에 묶인다(dyn-safe). 길이 = `n_layers()`.
+    fn layer_metric(&self, kind: LayerMetricKind) -> Option<&[f32]>;
+
+    // ── default sugar (전부 `layer_metric` 위임). 엔진은 override 불필요 ──
+
+    /// per-layer importance. `layer_metric(Importance)` 위 sugar.
+    fn importance(&self) -> Option<&[f32]> {
+        self.layer_metric(LayerMetricKind::Importance)
+    }
+    /// per-layer quantization noise. `layer_metric(QuantNoise)` 위 sugar.
+    fn quant_noise(&self) -> Option<&[f32]> {
+        self.layer_metric(LayerMetricKind::QuantNoise)
+    }
+}
+
+/// 한 레이어에 대한 dispatch 지시 (D2). dispatch(stage/hardware 축) ⊥ precision(format 축, R1).
+#[derive(Debug, Clone)]
+pub struct LayerDirective {
+    /// 대상 디코더 레이어 인덱스.
+    pub layer: usize,
+    /// dispatch 모드(Full / Skip / Partition).
+    pub dispatch: LayerDispatch,
+    /// precision swap 목표 dtype. `None` = 현 dtype 유지. dispatch 와 직교(R1).
+    pub precision: Option<TensorDtype>,
+}
+
+/// weight stage 의 plan 산출물 (KV `KVCachePlan` 거울). 결정만 담는 Rust-native 데이터
+/// (step/boundary-tier, repr(C) 불요). 변형은 엔진 executor 가 수행(D3).
+#[derive(Debug, Clone, Default)]
+pub struct WeightDispatchPlan {
+    /// 레이어별 지시. 비어 있으면 no-op.
+    pub per_layer: Vec<LayerDirective>,
+}
+
+/// weight 축 plan-returning 기법 trait (KV `KVCacheStage` 거울).
+pub trait WeightStage: Send + Sync {
+    /// 기법 이름 (canonical stage name; 슬라이스 내 유일).
+    fn name(&self) -> &str;
+    /// ctx 를 읽어 dispatch plan 을 낸다. `None` = no-op(미적용).
+    fn plan(&self, ctx: &dyn WeightStageCtx) -> Option<WeightDispatchPlan>;
+}
+
+/// weight stage 의 CLI-파생 정적 구성 (KV `StageParams` 거울).
+///
+/// 현재는 swap builtin 의 정적 knob 만 담는다. 런타임 값(swap ratio)은 params 가 아니라
+/// `WeightStageCtx::budget`(command-driven)에서 온다. per-builtin 추가 필드는 MW-C 배선 시
+/// 확장(KV `StageParams` 의 4-field-vs-opaque open question 과 동형).
+#[derive(Debug, Clone, Copy)]
+pub struct WeightStageParams {
+    /// 경계 레이어(0, 마지막)도 swap 대상에 포함 (연구/ablation; production 기본 false).
+    pub allow_boundary_layers: bool,
+}
+
+/// 한 weight stage 기법의 등록 항목 (KV `KVCacheStageReg` 거울).
+pub struct WeightStageReg {
+    /// canonical stage name (resilience `EngineCommand` → name 정규화 표와 일치, Seam C).
+    pub name: &'static str,
+    /// 파라미터로부터 기법 인스턴스를 만드는 팩토리.
+    pub make: fn(WeightStageParams) -> Box<dyn WeightStage>,
+}
+
+/// 전역 weight stage 등록 슬라이스 — stage 축의 **4번째 평행 registry**(ADR-0005 D6 확장, 병합 아님).
+/// linkme 가 링크 타임에 모은다; fat-LTO `--gc-sections` 대비 startup self-test 는 엔진 측(MW-C).
+#[distributed_slice]
+pub static WEIGHT_STAGES: [WeightStageReg] = [..];
+
+/// 이름으로 등록된 weight stage 를 찾는다 (엔진 construction 시 사용).
+pub fn find_weight_stage(name: &str) -> Option<&'static WeightStageReg> {
+    WEIGHT_STAGES.iter().find(|r| r.name == name)
+}
+
+/// 등록된 모든 weight stage 이름 (self-test / 진단용).
+pub fn registered_weight_names() -> Vec<&'static str> {
+    WEIGHT_STAGES.iter().map(|r| r.name).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +481,70 @@ mod tests {
     #[test]
     fn registered_names_contains_dummy() {
         assert!(registered_names().contains(&"dummy"));
+    }
+
+    // ── weight stage (MW-B) ──
+
+    /// weight 축 등록·조회 round-trip 검증용 no-op 기법.
+    struct DummyWeight;
+    impl WeightStage for DummyWeight {
+        fn name(&self) -> &str {
+            "dummy_weight"
+        }
+        fn plan(&self, _ctx: &dyn WeightStageCtx) -> Option<WeightDispatchPlan> {
+            None
+        }
+    }
+
+    /// `plan` 경로를 닫는 최소 weight ctx 스텁. `layer_metric` 만 구현 — importance/quant_noise 는
+    /// default sugar(전부 None → trivial)로 충족.
+    struct DummyWeightCtx;
+    impl WeightStageCtx for DummyWeightCtx {
+        fn n_layers(&self) -> usize {
+            0
+        }
+        fn budget(&self) -> usize {
+            0
+        }
+        fn pressure(&self) -> u8 {
+            0
+        }
+        fn current_format(&self, _layer: usize) -> TensorDtype {
+            TensorDtype::F32
+        }
+        fn layer_metric(&self, _kind: LayerMetricKind) -> Option<&[f32]> {
+            None
+        }
+    }
+
+    #[distributed_slice(WEIGHT_STAGES)]
+    static DUMMY_WEIGHT_REG: WeightStageReg = WeightStageReg {
+        name: "dummy_weight",
+        make: |_params| Box::new(DummyWeight),
+    };
+
+    #[test]
+    fn dummy_weight_registers_into_slice() {
+        let reg =
+            find_weight_stage("dummy_weight").expect("dummy_weight 등록이 슬라이스에 있어야 한다");
+        assert_eq!(reg.name, "dummy_weight");
+        let stage = (reg.make)(WeightStageParams {
+            allow_boundary_layers: false,
+        });
+        assert_eq!(stage.name(), "dummy_weight");
+        assert!(stage.plan(&DummyWeightCtx).is_none());
+    }
+
+    #[test]
+    fn registered_weight_names_contains_dummy() {
+        assert!(registered_weight_names().contains(&"dummy_weight"));
+    }
+
+    /// `WeightStageCtx` default sugar(importance/quant_noise)가 `layer_metric` 위에서 동작.
+    #[test]
+    fn weight_ctx_sugar_delegates_to_layer_metric() {
+        let ctx = DummyWeightCtx;
+        assert!(ctx.importance().is_none());
+        assert!(ctx.quant_noise().is_none());
     }
 }
