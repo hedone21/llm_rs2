@@ -19,6 +19,7 @@ pub mod phase_aware_swap;
 pub mod probing_k;
 pub mod release_worker;
 pub mod setup;
+pub mod stage_ctx;
 pub mod stage_registry;
 pub mod swap_executor;
 
@@ -32,6 +33,7 @@ pub use phase_aware_swap::{PhaseAwareSwapDispatcher, WeightChunk};
 pub use probing_k::{GrowthMode, ProbingKController};
 pub use release_worker::PrimaryReleaseWorker;
 pub use setup::{RuntimeResources, setup_runtime_resources};
+pub use stage_ctx::WeightStageModelCtx;
 pub use swap_executor::{
     StageBreakdown, SwapError, SwapExecutor, SwapReport, SwappedLayer, dtype_tag_to_dtype,
 };
