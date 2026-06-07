@@ -3,8 +3,9 @@
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §4.1 (R4 연혁 + ④ KIVI creep 제거).
 //!
 //! KV 캐시의 **state 책임**(geometry · mutation · attention)을 **storage-format-agnostic**
-//! 하게 제공하는 base trait — geometry 3(`idx`/`current_pos`/`capacity`) + mutation 3
-//! (`write_kv`/`write_kv_batch`/`compact`) + attention 1(`attention_into`) = **7 method**.
+//! 하게 제공하는 base trait — geometry 3(`idx`/`current_pos`/`capacity`) + mutation 2
+//! (`write_kv`/`write_kv_batch`) + attention 1(`attention_into`) = **6 method**.
+//! `compact` 는 ADR-0005 S4-2 에서 폐기 — production 정본은 `execute_kv_plan`(stage_registry.rs).
 //! base-trait-handle 을 든 Stage 는 geometry·mutation 만 알고, forward 는 `attention_into` 로
 //! q→out 만 보므로 양쪽 다 dtype/codebook/rotation/sparse pattern 을 모른다(impl 이 캡슐화,
 //! `INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`).
@@ -66,7 +67,7 @@ pub trait KVCacheFormat: Send + Sync {
     /// 물리 버퍼 용량 (토큰 단위).
     fn capacity(&self) -> usize;
 
-    // ── mutation (3) ──
+    // ── mutation (2) ──
 
     /// 단일 토큰 write (decode). 입력 shape: `[batch, 1, kv_heads, head_dim]`.
     ///
@@ -82,10 +83,6 @@ pub trait KVCacheFormat: Send + Sync {
     ///
     /// `backend` = `write_kv` 와 동일 계약. (GPU prefill batch scatter 흡수는 후속 substep.)
     fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()>;
-
-    /// keep + merges atomic compaction. `keep` 토큰을 앞으로 당기고, `merges` 의 가중 병합을
-    /// (compaction 이전 좌표계에서) buffer 에 적용한다 (§4.1 — D2O Step 5→6 의미).
-    fn compact(&self, keep: &[usize], merges: &[Merge]) -> Result<()>;
 
     // ── attention (1) ──
 

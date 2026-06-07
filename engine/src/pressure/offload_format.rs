@@ -17,7 +17,7 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::format::{AttnDims, KVCacheFormat, Merge};
+use crate::format::{AttnDims, KVCacheFormat};
 use crate::pressure::offload::OffloadKVCache;
 use crate::tensor::Tensor;
 
@@ -176,11 +176,6 @@ impl KVCacheFormat for OffloadFormat {
         // prefill (seq_len>1). write 로직은 decode 와 동일(SeqMajor batch store 는
         // `OffloadKVCache::update` 의 seq_len 분기가 자체 처리).
         self.write_inner(new_k, new_v, backend)
-    }
-
-    fn compact(&self, _keep: &[usize], _merges: &[Merge]) -> Result<()> {
-        // offload 는 eviction 미지원 (OffloadForward::on_kv_prune no-op 일치).
-        anyhow::bail!("offload: eviction 미지원")
     }
 
     fn attention_into(
@@ -459,13 +454,6 @@ mod tests {
             out_s.iter().all(|x| x.is_finite()),
             "prefill out must be all-finite"
         );
-    }
-
-    /// compact() 는 offload 에서 eviction 미지원이라 Err 를 반환해야 한다.
-    #[test]
-    fn test_compact_errors() {
-        let fmt = OffloadFormat::new(0, make_f16_offload(1, 4, 8));
-        assert!(fmt.compact(&[0], &[]).is_err());
     }
 
     /// into_inner 가 cross-token 상태(current_pos)를 보존하는지.

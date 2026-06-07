@@ -65,9 +65,10 @@ impl KVCacheStage for EvictionPolicyAsStage {
 }
 
 /// 균등 `format::Merge` → [`WeightedMerge`] 매핑. 현 빌트인 3정책은 모두 빈 merge 를 내므로 실질적으로
-/// 빈 Vec→빈 Vec 이나, 균등 가중치 의미(`into` 포함 N개 동일 가중, Σ=1)를 보존한다 — 현 `apply_merges`
-/// 의 uniform 거동과 정합. d2o 의 Eq.11 가중 merge 는 이 경로가 아니라 M4 에서 직접 산출한다.
-fn uniform_to_weighted(m: crate::format::Merge) -> WeightedMerge {
+/// 빈 Vec→빈 Vec 이나, 균등 가중치 의미(`into` 포함 N개 동일 가중, Σ=1)를 보존한다. d2o 의 Eq.11 가중
+/// merge 는 이 경로가 아니라 M4 에서 직접 산출한다.
+/// `pub(crate)`: `compact_parity` 가 Path B retarget(ADR-0005 S4-2)에서 재사용한다.
+pub(crate) fn uniform_to_weighted(m: crate::format::Merge) -> WeightedMerge {
     let n = (1 + m.from.len()) as f32; // into + from 토큰 수
     let w = 1.0 / n;
     WeightedMerge {

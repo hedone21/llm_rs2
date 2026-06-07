@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 
 use crate::backend::Backend;
-use crate::format::{AttnDims, KVCacheFormat, Merge};
+use crate::format::{AttnDims, KVCacheFormat};
 use crate::pressure::kivi_cache::KiviCache;
 use crate::tensor::Tensor;
 
@@ -81,14 +81,6 @@ impl KVCacheFormat for KIVIFormat {
 
     fn write_kv_batch(&self, new_k: &Tensor, new_v: &Tensor, backend: &dyn Backend) -> Result<()> {
         self.write_inner(new_k, new_v, backend)
-    }
-
-    fn compact(&self, _keep: &[usize], _merges: &[Merge]) -> Result<()> {
-        // KIVI 는 eviction-by-compaction 을 지원하지 않는다(quantized Q2 블록은 토큰 단위 재배치가
-        // 불가; 현 `KiviCache` 에 compact 경로 부재). position 은 q2_tokens + res_pos 로 파생되어
-        // set_current_pos 도 no-op. 따라서 본 substep 에서 compact 는 no-op(KIVI 는 ratio-driven
-        // eviction 대상이 아니라 quantization 압축 자체가 메모리 정책 — MEMORY.md 참조).
-        Ok(())
     }
 
     fn attention_into(
@@ -331,19 +323,6 @@ mod tests {
         let vb = f32_tensor(vec![1, 2, kv_heads, HD], &batch);
         fmt.write_kv_batch(&kb, &vb, &CpuBackend::new()).unwrap();
         assert_eq!(fmt.current_pos(), 3);
-    }
-
-    #[test]
-    fn test_compact_is_noop() {
-        let fmt = KIVIFormat::new(0, KiviCache::new(1, HD, MAXSEQ, RES));
-        let token = vec![1.0f32; HD];
-        let k = f32_tensor(vec![1, 1, 1, HD], &token);
-        let v = f32_tensor(vec![1, 1, 1, HD], &token);
-        fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
-        assert_eq!(fmt.current_pos(), 1);
-        // compact is a no-op for KIVI; pos unchanged.
-        fmt.compact(&[0], &[]).unwrap();
-        assert_eq!(fmt.current_pos(), 1);
     }
 
     #[test]

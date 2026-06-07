@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::format::{AttnDims, KVCacheFormat, Merge};
+use crate::format::{AttnDims, KVCacheFormat};
 use crate::memory::host::shared::SharedBuffer;
 use crate::pressure::kv_cache::KVCache;
 use crate::shape::Shape;
@@ -347,23 +347,6 @@ impl KVCacheFormat for StandardFormat {
         self.write_inner(new_k, new_v, backend, false)
     }
 
-    fn compact(&self, keep: &[usize], merges: &[Merge]) -> Result<()> {
-        let mut guard = self.inner.lock().unwrap();
-
-        // Step 1 (merges): 가중 병합을 compaction 이전 좌표계에서 buffer 에 in-place 적용.
-        // F32/F16 만 지원(CPU-accessible buffer 전제). Q4_0 은 dequant+requant 비용으로 merge
-        // 스킵(D2O 의 GPU-only merge_enabled=false 와 동일한 보수적 fallback) — keep compaction 만.
-        if !merges.is_empty() {
-            apply_merges(&mut guard.cache, merges);
-        }
-
-        // Step 2 (keep): retained 토큰을 앞으로 당김. write_start=0 으로 전체 재배치
-        // (compact 의 keep 은 절대 위치 목록, ascending 가정).
-        guard.cache.compact_keep_positions(keep, 0)?;
-        guard.cache.set_current_pos(keep.len());
-        Ok(())
-    }
-
     fn attention_into(
         &self,
         q: &Tensor,
@@ -470,97 +453,6 @@ impl KVCacheFormat for StandardFormat {
             effective_cache_len,
             scores,
         )
-    }
-}
-
-/// `Merge` 목록을 KVCache buffer 에 in-place 적용 (F32/F16 한정).
-///
-/// 의미: `into` 토큰 = `into` + Σ `from` 의 균등 평균(group 정규화). D2O 의 Eq.11 가중(EMA·sim
-/// 기반)은 `D2OHandler` config 책임(§4.1 `Merge` 주석)이라, 본 base impl 은 가중치 미지정 시의
-/// 중립 기본(균등)으로 병합한다. compaction 이전 좌표계에서 `cache.offset(pos, head)` 로 원위치를
-/// 읽는다(`scatter_reduce_merge_layer_wide` 와 동일 좌표 계약).
-fn apply_merges(cache: &mut KVCache, merges: &[Merge]) {
-    let dtype = cache.k_buffer.dtype();
-    let kv_heads = cache.kv_heads();
-    let head_dim = cache.head_dim();
-
-    match dtype {
-        DType::F32 => {
-            for m in merges {
-                if m.from.is_empty() {
-                    continue;
-                }
-                let n = (1 + m.from.len()) as f32;
-                let w = 1.0 / n;
-                for h in 0..kv_heads {
-                    let into_off = cache.offset(m.into, h);
-                    let from_offs: Vec<usize> =
-                        m.from.iter().map(|&p| cache.offset(p, h)).collect();
-                    {
-                        let k = cache.k_buffer.as_mut_slice::<f32>();
-                        merge_row_f32(k, into_off, &from_offs, head_dim, w);
-                    }
-                    {
-                        let v = cache.v_buffer.as_mut_slice::<f32>();
-                        merge_row_f32(v, into_off, &from_offs, head_dim, w);
-                    }
-                }
-            }
-        }
-        DType::F16 => {
-            use half::f16;
-            for m in merges {
-                if m.from.is_empty() {
-                    continue;
-                }
-                let n = (1 + m.from.len()) as f32;
-                let w = 1.0 / n;
-                for h in 0..kv_heads {
-                    let into_off = cache.offset(m.into, h);
-                    let from_offs: Vec<usize> =
-                        m.from.iter().map(|&p| cache.offset(p, h)).collect();
-                    {
-                        let k = cache.k_buffer.as_mut_slice::<f16>();
-                        merge_row_f16(k, into_off, &from_offs, head_dim, w);
-                    }
-                    {
-                        let v = cache.v_buffer.as_mut_slice::<f16>();
-                        merge_row_f16(v, into_off, &from_offs, head_dim, w);
-                    }
-                }
-            }
-        }
-        // Q4_0 등: merge 스킵(eviction-only fallback). keep compaction 만 적용된다.
-        _ => {}
-    }
-}
-
-#[inline]
-fn merge_row_f32(buf: &mut [f32], into_off: usize, from_offs: &[usize], head_dim: usize, w: f32) {
-    for d in 0..head_dim {
-        let mut acc = w * buf[into_off + d];
-        for &fo in from_offs {
-            acc += w * buf[fo + d];
-        }
-        buf[into_off + d] = acc;
-    }
-}
-
-#[inline]
-fn merge_row_f16(
-    buf: &mut [half::f16],
-    into_off: usize,
-    from_offs: &[usize],
-    head_dim: usize,
-    w: f32,
-) {
-    use half::f16;
-    for d in 0..head_dim {
-        let mut acc = w * buf[into_off + d].to_f32();
-        for &fo in from_offs {
-            acc += w * buf[fo + d].to_f32();
-        }
-        buf[into_off + d] = f16::from_f32(acc);
     }
 }
 
@@ -1300,66 +1192,6 @@ mod tests {
             err.is_err(),
             "F16 cast on pre-allocated (memory=None) cache must error"
         );
-    }
-
-    #[test]
-    fn test_compact_keep_only() {
-        let kv_heads = 1;
-        let head_dim = 2;
-        let fmt = StandardFormat::new(0, make_cache(8, kv_heads, head_dim));
-
-        // Write 4 distinct tokens: token p has value [p, p].
-        for p in 0..4 {
-            let t = vec![p as f32; kv_heads * head_dim];
-            let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
-            let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
-            fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
-        }
-        assert_eq!(fmt.current_pos(), 4);
-
-        // Keep positions 0 and 2 (drop 1, 3); no merges.
-        fmt.compact(&[0, 2], &[]).unwrap();
-        assert_eq!(fmt.current_pos(), 2);
-
-        // Verify buffer layout: pos0 = token0 (unchanged), pos1 = token2 (moved from 2).
-        let guard = fmt.inner.lock().unwrap();
-        let k = guard.cache.k_buffer.as_slice::<f32>();
-        assert_eq!(k[0], 0.0, "kept pos0 = token0");
-        assert_eq!(k[1], 0.0);
-        assert_eq!(k[2], 2.0, "compacted pos1 = token2");
-        assert_eq!(k[3], 2.0);
-    }
-
-    #[test]
-    fn test_compact_with_merge_f32() {
-        let kv_heads = 1;
-        let head_dim = 2;
-        let fmt = StandardFormat::new(0, make_cache(8, kv_heads, head_dim));
-
-        // tokens: 0=[0,0] 1=[10,10] 2=[2,2] 3=[6,6]
-        let vals = [0.0f32, 10.0, 2.0, 6.0];
-        for &p in &vals {
-            let t = vec![p; kv_heads * head_dim];
-            let k = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
-            let v = f32_tensor(vec![1, 1, kv_heads, head_dim], &t);
-            fmt.write_kv(&k, &v, &CpuBackend::new()).unwrap();
-        }
-
-        // Merge token 3 into token 1, then keep {0, 1, 2}.
-        // pos1 (pre-compact) becomes mean(10, 6) = 8.
-        let merges = vec![Merge {
-            into: 1,
-            from: vec![3],
-        }];
-        fmt.compact(&[0, 1, 2], &merges).unwrap();
-        assert_eq!(fmt.current_pos(), 3);
-
-        let guard = fmt.inner.lock().unwrap();
-        let k = guard.cache.k_buffer.as_slice::<f32>();
-        // pos0=token0=0, pos1=merged(10,6)=8, pos2=token2=2
-        assert_eq!(k[0], 0.0);
-        assert_eq!(k[2], 8.0, "merged into-token = mean(10,6)");
-        assert_eq!(k[4], 2.0);
     }
 
     #[test]

@@ -12,15 +12,16 @@
 
 use std::sync::Arc;
 
+use technique_api::{KVCachePlan, KeepSpec};
+
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
-use crate::format::KVCacheFormat;
 use crate::memory::host::shared::SharedBuffer;
+use crate::pressure::eviction::stage_registry::{execute_kv_plan, uniform_to_weighted};
 use crate::pressure::eviction::{
     EvictionPolicy, H2OPolicy, NoEvictionPolicy, SlidingWindowPolicy, StreamingLLMPolicy,
 };
 use crate::pressure::kv_cache::KVCache;
-use crate::pressure::standard_format::StandardFormat;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -98,26 +99,29 @@ fn assert_parity<P, F>(
     let mut cache_a = make_cache(dtype, n_tokens);
     evict_inplace(policy, &mut cache_a);
 
-    // Path B: plan_keep → StandardFormat::compact.
-    let cache_b = make_cache(dtype, n_tokens);
-    let fmt = StandardFormat::new(0, cache_b);
+    // Path B: plan_keep → execute_kv_plan (ADR-0005 S4-2 retarget — compact 폐기).
+    let mut cache_b = make_cache(dtype, n_tokens);
     let (keep, merges) = policy
         .plan_keep(n_tokens, target_len, importance)
         .unwrap_or_else(|| panic!("{label}: plan_keep returned None (정책 미지원)"));
-    fmt.compact(&keep, &merges)
-        .unwrap_or_else(|e| panic!("{label}: compact failed: {e}"));
+    // 빌트인 3정책은 빈 merge 를 내므로 변환 결과도 빈 vec (compact_keep_positions 만 실행).
+    let plan = KVCachePlan {
+        keep: KeepSpec::LayerWide(keep),
+        merges: merges.into_iter().map(uniform_to_weighted).collect(),
+    };
+    execute_kv_plan(&mut cache_b, &plan)
+        .unwrap_or_else(|e| panic!("{label}: execute_kv_plan failed: {e}"));
 
     // current_pos 일치.
-    let pos_b = fmt.with_cache_mut(|c| c.current_pos);
     assert_eq!(
-        cache_a.current_pos, pos_b,
-        "{label} [{dtype:?}]: current_pos mismatch (in-place={}, compact={})",
-        cache_a.current_pos, pos_b
+        cache_a.current_pos, cache_b.current_pos,
+        "{label} [{dtype:?}]: current_pos mismatch (in-place={}, plan={})",
+        cache_a.current_pos, cache_b.current_pos
     );
 
     // 유효 영역 byte bit-identical.
     let (ka, va) = valid_region(&cache_a);
-    let (kb, vb) = fmt.with_cache_mut(|c| valid_region(c));
+    let (kb, vb) = valid_region(&cache_b);
     assert_eq!(ka, kb, "{label} [{dtype:?}]: K valid-region byte mismatch");
     assert_eq!(va, vb, "{label} [{dtype:?}]: V valid-region byte mismatch");
 }

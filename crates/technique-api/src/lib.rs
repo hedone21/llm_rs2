@@ -464,11 +464,13 @@ pub struct KVLayoutDesc {
 /// Format 축 plugin trait — 저장 layout 을 기술한다(ADR-0005 D3).
 ///
 /// layer-tier COMPUTE(`write_kv`/`attention_into`)는 본 trait 에 없다 — 그것은 hardware 축의
-/// M×N 커널 셀로 backend 가 소유(D4). format plugin 은 순수 descriptor + (step4) manage 다.
+/// M×N 커널 셀로 backend 가 소유(D4). format plugin 은 순수 descriptor 다(2-method: name+layout).
 ///
-/// NOTE(phasing, D7): step-tier `compact(keep, merges)`(KVCacheFormat 해체, step4)은 아직
-/// 추가하지 않는다 — 그 시점에 manage 표면을 wire 한다. 본 trait 의 layer-tier 기여는
-/// `layout()` descriptor read 다(M-F2, L1 repr(C) 경계).
+/// NOTE(phasing, S4-2 2026-06-07): step-tier `compact` 은 본 trait 에 **추가하지 않는다** —
+/// ADR-0004 D1 으로 superseded. keep/merge 결정은 stage 축(`KVCacheStage::plan → KVCachePlan`)이,
+/// 변형은 엔진 executor `execute_kv_plan` 이 독점한다(결정=plugin, 변형=엔진). compact 을 format 축
+/// 으로 끌어오면 stage⊥format 직교를 결정 층위에서 흐리고 `Merge`(engine)를 api 로 누출한다. 따라서
+/// `KVFormat` 의 layer-tier 기여는 `layout()` descriptor read 뿐(M-F2, L1 repr(C) 경계).
 pub trait KVFormat: Send + Sync {
     /// canonical format 이름 (예: "q4_0"/"f16"/"f32"). 슬라이스 내 유일.
     fn name(&self) -> &str;
