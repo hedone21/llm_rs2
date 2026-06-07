@@ -11,8 +11,10 @@
 //! compact arg 동반). 단 substep (1) 은 purely additive·unwired 이라 현 `kv_cache_ops.rs` 의
 //! `KVCacheOps` 와 **공존**한다(rename 이 아니라 신규 trait 신설; 기존 경로 무변).
 
+pub mod dtype_layout;
 pub mod kv_cache_format;
 pub mod weight_format;
 
+pub use dtype_layout::{dequant_to_f32_tensor, dequant_via_descriptor, dtype_to_layout_desc};
 pub use kv_cache_format::{AttnDims, KVCacheFormat, Merge};
 pub use weight_format::{LayerDispatch, PartitionShare, WeightFormat};

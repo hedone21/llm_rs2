@@ -51,10 +51,11 @@ impl Backend for CpuBackendAVX2 {
             DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
-            _ => Err(anyhow!(
-                "Unsupported dtype for matmul_transposed: {:?}",
-                b.dtype()
-            )),
+            // generic floor (ADR-0005 D5): dequant via descriptor → f32 matmul. exact, 느릴 뿐.
+            _ => {
+                let f32_b = crate::format::dequant_to_f32_tensor(b)?;
+                self.matmul_transposed_f32(a, &f32_b, out)
+            }
         }
     }
 
@@ -71,10 +72,11 @@ impl Backend for CpuBackendAVX2 {
             DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
-            _ => Err(anyhow!(
-                "Unsupported dtype for matmul_slice: {:?}",
-                b.dtype()
-            )),
+            // generic floor (ADR-0005 D5): dequant via descriptor → f32 matmul. exact, 느릴 뿐.
+            _ => {
+                let f32_b = crate::format::dequant_to_f32_tensor(b)?;
+                self.matmul_transposed_f32(a, &f32_b, out)
+            }
         }
     }
 

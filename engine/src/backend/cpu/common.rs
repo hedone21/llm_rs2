@@ -78,10 +78,11 @@ impl Backend for CpuBackendCommon {
             DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
-            _ => Err(anyhow!(
-                "Unsupported dtype for matmul_transposed: {:?}",
-                b.dtype()
-            )),
+            // generic floor (ADR-0005 D5): dequant via descriptor → f32 matmul. exact, 느릴 뿐.
+            _ => {
+                let f32_b = crate::format::dequant_to_f32_tensor(b)?;
+                self.matmul_transposed_f32(a, &f32_b, out)
+            }
         }
     }
 
@@ -99,10 +100,11 @@ impl Backend for CpuBackendCommon {
             DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
-            _ => Err(anyhow!(
-                "Unsupported dtype for matmul_slice: {:?}",
-                b.dtype()
-            )),
+            // generic floor (ADR-0005 D5): dequant via descriptor → f32 matmul. exact, 느릴 뿐.
+            _ => {
+                let f32_b = crate::format::dequant_to_f32_tensor(b)?;
+                self.matmul_transposed_f32(a, &f32_b, out)
+            }
         }
     }
 
@@ -1973,6 +1975,109 @@ mod tests {
             src.as_ptr(),
             copied.as_ptr(),
             "copy_from must allocate new buffer"
+        );
+    }
+
+    // ---- ADR-0005 M-F3: generic floor (Q8_0 via descriptor) ----
+
+    /// Quantize f32 data to Q8_0 blocks (row-major, row_len must be multiple of 32).
+    /// Canonical layout per block: [d: f16 LE][qs: 32 × i8].
+    fn quantize_q8_0(data: &[f32], n_rows: usize, row_len: usize) -> Vec<u8> {
+        use crate::quant::QK8_0;
+        let nb = row_len / QK8_0;
+        let mut bytes = Vec::with_capacity(n_rows * nb * 34);
+        for row in 0..n_rows {
+            for bi in 0..nb {
+                let offset = row * row_len + bi * QK8_0;
+                let src = &data[offset..offset + QK8_0];
+                let max_abs = src.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let d = max_abs / 127.0;
+                let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+                bytes.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                for &v in src {
+                    let q = (v * id).round().clamp(-128.0, 127.0) as i8;
+                    bytes.push(q as u8);
+                }
+            }
+        }
+        bytes
+    }
+
+    fn make_q8_0_tensor(backend: &Arc<dyn Backend>, shape: Vec<usize>, f32_data: &[f32]) -> Tensor {
+        let memory = Galloc::new();
+        let n_rows = shape[0];
+        let row_len = shape[1];
+        let bytes = quantize_q8_0(f32_data, n_rows, row_len);
+        let buf = memory.alloc(bytes.len(), DType::Q8_0).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), bytes.len());
+        }
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    /// (b) Q8_0 weight 가 generic floor 를 타고, 결과가 참조(수동 dequant → matmul_transposed_f32)
+    /// 와 **bit-identical**(tol=0.0). floor 는 dequant 무손실 + 동일 f32 matmul 이라 exact.
+    #[test]
+    fn test_matmul_transposed_q8_0_floor_exact() {
+        let (m, k, n) = (3, 128, 64);
+        let a_data = gen_data(m * k, 42);
+        let b_data_f32 = gen_data(n * k, 137);
+
+        let scalar = scalar_backend();
+
+        // Q8_0 weight tensor (floor 경로).
+        let a = make_f32_tensor(&scalar, vec![m, k], &a_data);
+        let b_q8 = make_q8_0_tensor(&scalar, vec![n, k], &b_data_f32);
+        let mut out_floor = make_f32_tensor_zeros(&scalar, vec![m, n]);
+        scalar.matmul_transposed(&a, &b_q8, &mut out_floor).unwrap();
+
+        // Reference: 수동 dequant_via_descriptor → matmul_transposed_f32.
+        let f32_b_vec = crate::format::dequant_via_descriptor(&b_q8).unwrap();
+        let b_ref = make_f32_tensor(&scalar, vec![n, k], &f32_b_vec);
+        let mut out_ref = make_f32_tensor_zeros(&scalar, vec![m, n]);
+        CpuBackendCommon::new()
+            .matmul_transposed_f32(&a, &b_ref, &mut out_ref)
+            .unwrap();
+
+        assert_close(
+            out_floor.as_slice::<f32>(),
+            out_ref.as_slice::<f32>(),
+            0.0, // exact
+            "Q8_0 floor matmul == manual dequant→f32 matmul",
+        );
+    }
+
+    /// (c) Q4_0 weight 는 generic floor 가 아니라 **특화 arm**(matmul_transposed_q4_0)을 탄다.
+    /// floor 는 q8_0-style block 으로 a 를 재양자화하지 않으므로, 특화 q4_0(a→q8_0 재양자화)와
+    /// floor(f32 직접) 의 결과는 미세하게 다르다. 따라서 dispatch 결과 == 특화 함수 직접 호출이면
+    /// 특화 arm 을 탄 것이 증명된다(floor 를 안 거침).
+    #[test]
+    fn test_matmul_transposed_q4_0_uses_specialized_not_floor() {
+        let (m, k, n) = (3, 128, 64);
+        let a_data = gen_data(m * k, 42);
+        let b_data_f32 = gen_data(n * k, 137);
+
+        let scalar = scalar_backend();
+        let a = make_f32_tensor(&scalar, vec![m, k], &a_data);
+        let b_q4 = make_q4_0_tensor(&scalar, vec![n, k], &b_data_f32);
+
+        // dispatch 경유.
+        let mut out_dispatch = make_f32_tensor_zeros(&scalar, vec![m, n]);
+        scalar
+            .matmul_transposed(&a, &b_q4, &mut out_dispatch)
+            .unwrap();
+
+        // 특화 함수 직접 호출.
+        let mut out_specialized = make_f32_tensor_zeros(&scalar, vec![m, n]);
+        CpuBackendCommon::new()
+            .matmul_transposed_q4_0(&a, &b_q4, &mut out_specialized)
+            .unwrap();
+
+        assert_close(
+            out_dispatch.as_slice::<f32>(),
+            out_specialized.as_slice::<f32>(),
+            0.0, // exact — same code path
+            "Q4_0 dispatch must hit specialized arm (bit-identical to direct call)",
         );
     }
 }
