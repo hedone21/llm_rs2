@@ -556,15 +556,27 @@ pub fn run_qcf_warmup_workflow(
             swap_algorithm.short_name(),
             execute_swap,
         );
+        // MW-C: ImportanceTable → flat per-layer 투영. noise 는 is_computed()
+        // 일 때만 Some(slice) (구 fallback 게이트 보존). ratio→budget 환산도
+        // 호출자로 이동 (currently_swapped=∅ 이므로 차감 0).
+        let n_layers = model.layers.len();
+        let importance_flat =
+            crate::pressure::weights::decider::flatten_importance(&imp_table, n_layers);
+        let noise_flat = if model.quant_noise.is_computed() {
+            Some(model.quant_noise.as_slice())
+        } else {
+            None
+        };
+        let budget = (ratio * n_layers as f32).floor() as usize;
         let decider = WeightSwapDecider {
-            importance: Some(&imp_table),
-            noise: Some(model.quant_noise.as_ref()),
-            n_decoder_layers: model.layers.len(),
+            importance: Some(&importance_flat),
+            noise: noise_flat,
+            n_decoder_layers: n_layers,
             currently_swapped: &[],
             allow_boundary_layers: read_allow_boundary_env(),
             algorithm: swap_algorithm,
         };
-        let decider_decision = decider.decide(ratio);
+        let decider_decision = decider.decide(budget);
 
         // §4 ground-truth path: when `--swap-only-layers` is set, override the
         // decider's selection with the explicit list. The decider's
@@ -578,8 +590,8 @@ pub fn run_qcf_warmup_workflow(
                 .collect();
             let qcf_override = crate::pressure::weights::compute_qcf_weight_swap(
                 &override_layers,
-                model.quant_noise.as_ref(),
-                Some(&imp_table),
+                model.quant_noise.as_slice(),
+                Some(&importance_flat),
                 model.layers.len(),
             );
             eprintln!(
@@ -724,15 +736,27 @@ pub fn dispatch_swap_weights(
         "[Decider] allow_boundary_layers={} (ratio={:.4})",
         allow_boundary, ratio
     );
+    // MW-C: ImportanceLookup → flat per-layer 투영. noise 는 is_computed()
+    // 일 때만 Some(slice) (구 fallback 게이트 보존). ratio→budget 환산도
+    // 호출자로 이동.
+    let importance_flat = importance_table
+        .map(|imp| crate::pressure::weights::decider::flatten_importance(imp, n_layers));
+    let noise_flat = if model.quant_noise.is_computed() {
+        Some(model.quant_noise.as_slice())
+    } else {
+        None
+    };
+    let target_count = (ratio * n_layers as f32).floor() as usize;
+    let budget = target_count.saturating_sub(currently_swapped.len());
     let decider = WeightSwapDecider {
-        importance: importance_table,
-        noise: Some(model.quant_noise.as_ref()),
+        importance: importance_flat.as_deref(),
+        noise: noise_flat,
         n_decoder_layers: n_layers,
         currently_swapped: &currently_swapped,
         allow_boundary_layers: allow_boundary,
         algorithm: crate::pressure::weights::SwapAlgorithm::ImportanceAware,
     };
-    let decision: SwapDecision = decider.decide(ratio);
+    let decision: SwapDecision = decider.decide(budget);
 
     if decision.selected_layers.is_empty() {
         eprintln!(
@@ -747,8 +771,8 @@ pub fn dispatch_swap_weights(
     // ── 4. Compute QCF estimate for the planned layers ─────────────────────
     let qcf_swap_estimated = compute_qcf_weight_swap(
         &decision.selected_layers,
-        model.quant_noise.as_ref(),
-        importance_table,
+        model.quant_noise.as_slice(),
+        importance_flat.as_deref(),
         n_layers,
     );
 

@@ -19,10 +19,6 @@ use std::collections::HashSet;
 
 use crate::qcf_collector::ImportanceLookup;
 use crate::qcf_types::SubLayer;
-use crate::runtime_resources_access::QuantNoiseAccess;
-
-#[cfg(test)]
-use crate::pressure::weights::QuantNoiseTable;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -83,20 +79,40 @@ pub struct SwapDecision {
     pub fallback_used: bool,
 }
 
-/// Stateless decider that converts `ratio_max` to a layer index set.
+/// `ImportanceLookup` 를 layer 인덱스 기준의 평탄 `Vec<f32>` 로 투영한다 (MW-C).
 ///
-/// Both `importance` and `noise` are optional: pass `None` when the table has
-/// not been built yet.  When either is absent (or effectively empty /
-/// uncomputed), the `ImportanceAware` / `AntiImportance` algorithms fall back
-/// to `Uniform`.
+/// 길이 `n` 의 벡터를 반환하며, 각 원소는 해당 layer 의 `SubLayer::Full`
+/// importance 값이다. lookup 에 해당 entry 가 없으면 `0.0` 으로 채운다 (decider
+/// ranking 의 기존 디폴트 `0.0` 보존). decider 의 flat `importance: Option<&[f32]>`
+/// 필드에 넣기 위한 호출자 측 어댑터.
+pub fn flatten_importance(lookup: &dyn ImportanceLookup, n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for e in lookup.entries() {
+        if e.sublayer == SubLayer::Full && e.layer_id < n {
+            out[e.layer_id] = e.importance;
+        }
+    }
+    out
+}
+
+/// Stateless decider that converts a swap `budget` (절대 layer 수) to a layer
+/// index set.
+///
+/// Both `importance` and `noise` are optional flat per-layer slices (index =
+/// layer id): pass `None` when the table has not been built yet.  When either
+/// is absent (or effectively empty / uncomputed), the `ImportanceAware` /
+/// `AntiImportance` algorithms fall back to `Uniform`.
+///
+/// **계약**: `noise = Some(_)` ⟺ 노이즈 ε 가 secondary tensor 에서 실제 계산됨
+/// (구 `QuantNoiseAccess::is_computed() == true`). 호출자는 `is_computed()` 가
+/// `false` 일 때 `None` 을 넘겨 기존 uniform fallback 게이트를 보존한다.
 pub struct WeightSwapDecider<'a> {
-    /// Importance table from the last prefill (None = fallback).
-    /// Uses L2 `ImportanceLookup` trait (§13.8-G + INV-LAYER-003 trait inversion).
-    pub importance: Option<&'a dyn ImportanceLookup>,
-    /// Quantization noise table from engine init (None = fallback). Held as a
-    /// `dyn` trait object so callers can pass `model.quant_noise.as_ref()`
-    /// without coupling to the concrete `QuantNoiseTable` type.
-    pub noise: Option<&'a dyn QuantNoiseAccess>,
+    /// Per-layer importance (index = layer id, value = `SubLayer::Full`
+    /// importance). None = fallback. 길이는 `n_decoder_layers` 이상이어야 한다.
+    pub importance: Option<&'a [f32]>,
+    /// Per-layer quantization noise ε (index = layer id). None = fallback /
+    /// uncomputed. NaN 원소는 candidate 에서 제외된다 (INV-127).
+    pub noise: Option<&'a [f32]>,
     /// Total number of decoder layers in the model.
     pub n_decoder_layers: usize,
     /// Layers that are already at the target dtype — excluded from re-selection.
@@ -112,14 +128,16 @@ pub struct WeightSwapDecider<'a> {
 }
 
 impl<'a> WeightSwapDecider<'a> {
-    /// Decide which layers to swap for the given `ratio_max` (ENG-ALG-215).
+    /// Decide which layers to swap for the given `budget` (ENG-ALG-215).
+    ///
+    /// `budget` 은 이 호출에서 추가로 swap 할 **절대 layer 수**다. ratio→count
+    /// 환산 (`floor(ratio*n)` 에서 `currently_swapped` 차감)은 호출자 책임이다 (KV
+    /// `target_len` 거울; MW-C).
     ///
     /// Returns a `SwapDecision` containing the layer indices, the computed
     /// QCF_swap estimate, and whether the uniform fallback was used.
-    pub fn decide(&self, ratio_max: f32) -> SwapDecision {
-        let ratio = ratio_max.clamp(0.0, 1.0);
-
-        if ratio == 0.0 || self.n_decoder_layers == 0 {
+    pub fn decide(&self, budget: usize) -> SwapDecision {
+        if budget == 0 || self.n_decoder_layers == 0 {
             return SwapDecision {
                 selected_layers: Vec::new(),
                 qcf_swap_estimate: 0.0,
@@ -128,17 +146,8 @@ impl<'a> WeightSwapDecider<'a> {
         }
 
         let n = self.n_decoder_layers;
-        let target_count = (ratio * n as f32).floor() as usize;
         let already_swapped_set: HashSet<usize> = self.currently_swapped.iter().copied().collect();
-        let needed = target_count.saturating_sub(already_swapped_set.len());
-
-        if needed == 0 {
-            return SwapDecision {
-                selected_layers: Vec::new(),
-                qcf_swap_estimate: 0.0,
-                fallback_used: false,
-            };
-        }
+        let needed = budget;
 
         // Protected layers: exclude layer 0 and last decoder layer by default.
         // `allow_boundary_layers` overrides this for research/ablation runs
@@ -157,18 +166,19 @@ impl<'a> WeightSwapDecider<'a> {
             .filter(|i| !already_swapped_set.contains(i))
             .filter(|i| {
                 // INV-127: exclude layers with NaN ε when the table is present.
-                match self.noise {
-                    Some(t) => t.epsilon(*i).is_some(),
-                    None => true, // absent → treat as ε=1.0, include all
-                }
+                // noise=None → ε 전체 가용으로 취급 (include all).
+                self.noise
+                    .map(|s| s.get(*i).map(|v| !v.is_nan()).unwrap_or(false))
+                    .unwrap_or(true)
             })
             .collect();
 
         // `ImportanceAware` and `AntiImportance` require both tables; without
         // them they fall back to `Uniform`. The pure layer-index algorithms
         // (`Sequential`, `Reverse`, `Uniform`) never use the tables.
-        let scored_path_available = !self.importance.map(|t| t.is_empty()).unwrap_or(true)
-            && self.noise.map(|t| t.is_computed()).unwrap_or(false);
+        // noise=Some(_) ⟺ (구) is_computed()==true (호출자 계약, struct docs 참조).
+        let scored_path_available =
+            self.importance.map(|s| !s.is_empty()).unwrap_or(false) && self.noise.is_some();
         let effective_algo = match self.algorithm {
             SwapAlgorithm::ImportanceAware | SwapAlgorithm::AntiImportance
                 if !scored_path_available =>
@@ -187,21 +197,16 @@ impl<'a> WeightSwapDecider<'a> {
             SwapAlgorithm::ImportanceAware | SwapAlgorithm::AntiImportance => {
                 let imp = self.importance.expect("importance checked non-empty");
 
-                // Key = importance(i, SubLayer::Full). ε was previously
-                // multiplied in but empirical measurement showed Spearman
-                // ρ(imp × ε, imp) = 0.998 under Q4_0 (ε layer-uniform), so
-                // ε contributes no ranking signal. Removed for §4 simplicity.
-                // ε is still checked at the candidate-filter stage above for
-                // NaN exclusion (INV-127).
+                // Key = importance[i] (= SubLayer::Full importance, flattened by
+                // caller). ε was previously multiplied in but empirical
+                // measurement showed Spearman ρ(imp × ε, imp) = 0.998 under Q4_0
+                // (ε layer-uniform), so ε contributes no ranking signal. Removed
+                // for §4 simplicity. ε is still checked at the candidate-filter
+                // stage above for NaN exclusion (INV-127).
                 let mut scored: Vec<(usize, f32)> = candidates
                     .iter()
                     .map(|&i| {
-                        let imp_val = imp
-                            .entries()
-                            .iter()
-                            .find(|e| e.layer_id == i && e.sublayer == SubLayer::Full)
-                            .map(|e| e.importance)
-                            .unwrap_or(0.0);
+                        let imp_val = imp.get(i).copied().unwrap_or(0.0);
                         (i, imp_val)
                     })
                     .collect();
@@ -232,12 +237,12 @@ impl<'a> WeightSwapDecider<'a> {
         }
     }
 
-    /// Dry-run: compute QCF_swap at the given ratio without executing a swap.
+    /// Dry-run: compute QCF_swap at the given `budget` without executing a swap.
     ///
     /// Returns `(selected_layers, qcf_swap)`.  Used for `LayerSwapEstimate`
     /// curve sampling in `QcfEstimate` (ENG-ALG-218).
-    pub fn decide_dry_run(&self, ratio_max: f32) -> (Vec<usize>, f32) {
-        let decision = self.decide(ratio_max);
+    pub fn decide_dry_run(&self, budget: usize) -> (Vec<usize>, f32) {
+        let decision = self.decide(budget);
         (decision.selected_layers, decision.qcf_swap_estimate)
     }
 }
@@ -255,10 +260,14 @@ impl<'a> WeightSwapDecider<'a> {
 /// - Layers with NaN ε are excluded from both numerator and denominator.
 /// - Missing importance entries (table absent) default to `1.0`.
 /// - Returns `0.0` when `swap_set` is empty or denominator ≈ 0.
+///
+/// `importance`/`noise` 는 layer 인덱스 기준의 평탄 슬라이스다 (MW-C). `noise` 는
+/// `&[f32]` (decide() 의 계약대로 ε 가 실제 계산된 경우의 슬라이스); NaN 원소는
+/// numerator/denominator 양쪽에서 제외된다.
 pub fn compute_qcf_weight_swap(
     swap_set: &[usize],
-    noise: &dyn QuantNoiseAccess,
-    importance: Option<&dyn ImportanceLookup>,
+    noise: &[f32],
+    importance: Option<&[f32]>,
     n_decoder_layers: usize,
 ) -> f32 {
     let _t = crate::qcf_timer!(QCF_WEIGHT_SWAP);
@@ -269,32 +278,23 @@ pub fn compute_qcf_weight_swap(
 fn compute_qcf_swap_internal(
     swap_set: &[usize],
     n_decoder_layers: usize,
-    importance: Option<&dyn ImportanceLookup>,
-    noise: Option<&dyn QuantNoiseAccess>,
+    importance: Option<&[f32]>,
+    noise: Option<&[f32]>,
 ) -> f32 {
     if swap_set.is_empty() {
         return 0.0;
     }
 
-    let imp_for = |i: usize| -> f32 {
-        importance
-            .and_then(|t| {
-                t.entries()
-                    .iter()
-                    .find(|e| e.layer_id == i && e.sublayer == SubLayer::Full)
-                    .map(|e| e.importance)
-            })
-            .unwrap_or(1.0)
-    };
+    // QCF 디폴트 1.0 유지 — ranking 의 0.0 과 비대칭 보존 (MW-C).
+    let imp_for = |i: usize| -> f32 { importance.and_then(|s| s.get(i).copied()).unwrap_or(1.0) };
 
     // ε removed from the QCF_swap formula (see decide() comment). The noise
     // table is still consulted here only to exclude NaN-ε layers from the
     // sum (INV-127 — they were never valid swap candidates).
     let valid_layer = |i: usize| -> bool {
-        match noise {
-            Some(t) => t.epsilon(i).is_some(),
-            None => true,
-        }
+        noise
+            .map(|s| s.get(i).map(|v| !v.is_nan()).unwrap_or(false))
+            .unwrap_or(true)
     };
 
     let swap_set_hash: HashSet<usize> = swap_set.iter().copied().collect();
@@ -344,29 +344,27 @@ fn uniform_select_by_index(needed: usize, candidates: &[usize]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qcf::layer_importance::ImportanceTable;
-    use crate::qcf_types::ImportanceEntry;
 
     // ── Helper builders ──
+    //
+    // MW-C: importance/noise 는 layer 인덱스 기준 평탄 `Vec<f32>` (구
+    // ImportanceTable/QuantNoiseTable 대신). expected 결과는 동일하게 유지한다
+    // (bit-identical). ratio→budget 환산은 테스트가 직접 `floor(ratio*n) -
+    // |currently_swapped|` 로 수행한다 (구 decide(ratio) 가 내부에서 하던 일).
 
-    fn make_importance(entries: Vec<(usize, f32)>) -> ImportanceTable {
-        let entries = entries
-            .into_iter()
-            .map(|(id, imp)| ImportanceEntry {
-                layer_id: id,
-                sublayer: SubLayer::Full,
-                importance: imp,
-                opr: 0.0,
-                importance_mean_pool: None,
-                importance_shortgpt_bi: None,
-            })
-            .collect();
-        ImportanceTable::from_entries(entries)
+    /// layer 인덱스 기준 평탄 importance. index=layer_id, value=Full importance.
+    fn make_importance(entries: Vec<(usize, f32)>) -> Vec<f32> {
+        let n = entries.iter().map(|(id, _)| id + 1).max().unwrap_or(0);
+        let mut out = vec![0.0f32; n];
+        for (id, imp) in entries {
+            out[id] = imp;
+        }
+        out
     }
 
-    fn make_noise(vals: Vec<f32>) -> QuantNoiseTable {
-        // Uses the #[cfg(test)] constructor from noise_table.rs with computed_at_init=true.
-        QuantNoiseTable::new_test(vals)
+    /// layer 인덱스 기준 평탄 ε. index=layer_id, value=ε (NaN 허용).
+    fn make_noise(vals: Vec<f32>) -> Vec<f32> {
+        vals
     }
 
     // ── Normal-path test (spec example) ──────────────────────────────────────
@@ -376,7 +374,7 @@ mod tests {
     /// longer affects ranking; kept here only for the NaN-exclusion path).
     /// key = importance = [0.1, 0.5, 0.3, 0.7]
     /// Layers 0 and 3 are protected; candidates = [1, 2].
-    /// ratio=0.5 → k = floor(0.5 × 4) = 2 → both candidates selected.
+    /// budget = floor(0.5 × 4) = 2 → both candidates selected.
     /// qcf_swap = (imp[1] + imp[2]) / Σ imp = (0.5 + 0.3) / 1.6 = 0.5
     #[test]
     fn decide_normal_path_spec_example() {
@@ -392,7 +390,8 @@ mod tests {
             algorithm: SwapAlgorithm::ImportanceAware,
         };
 
-        let decision = decider.decide(0.5);
+        // budget = floor(0.5 * 4) - 0 = 2
+        let decision = decider.decide(2);
 
         assert!(!decision.fallback_used, "should use scored path");
         assert_eq!(decision.selected_layers.len(), 2);
@@ -414,8 +413,7 @@ mod tests {
     #[test]
     fn nan_epsilon_excluded_inv_127() {
         let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
-        let noise_vals = vec![0.2, f32::NAN, 0.3, 0.05];
-        let noise = QuantNoiseTable::new_test(noise_vals.clone());
+        let noise = make_noise(vec![0.2, f32::NAN, 0.3, 0.05]);
 
         // Layer 1 has NaN ε → must be excluded even though layer 0 and 3 are the protected ones
         let decider = WeightSwapDecider {
@@ -427,23 +425,20 @@ mod tests {
             algorithm: SwapAlgorithm::ImportanceAware,
         };
 
-        // ratio=0.5 → k=2, candidates are [1, 2] normally. With layer 1 NaN excluded → [2] only.
-        let decision = decider.decide(0.5);
+        // budget=2, candidates are [1, 2] normally. With layer 1 NaN excluded → [2] only.
+        let decision = decider.decide(2);
         assert!(
             !decision.selected_layers.contains(&1),
             "layer 1 with NaN epsilon must be excluded"
         );
         // Layer 2 should be selected (only valid candidate)
         assert!(decision.selected_layers.contains(&2));
-
-        // Noise needs to be mutable for this test; keep for later
-        let _ = noise_vals;
     }
 
     /// When ImportanceTable is empty, uniform fallback is used.
     #[test]
     fn fallback_when_importance_empty() {
-        let empty_importance = ImportanceTable::from_entries(vec![]);
+        let empty_importance: Vec<f32> = Vec::new();
         let noise = make_noise(vec![0.2, 0.1, 0.3, 0.05]);
 
         let decider = WeightSwapDecider {
@@ -455,7 +450,7 @@ mod tests {
             algorithm: SwapAlgorithm::ImportanceAware,
         };
 
-        let decision = decider.decide(0.5);
+        let decision = decider.decide(2);
         assert!(
             decision.fallback_used,
             "should use fallback when importance empty"
@@ -464,7 +459,7 @@ mod tests {
         assert!(!decision.selected_layers.is_empty());
     }
 
-    /// ratio_max = 0.0 → empty decision, qcf_swap = 0.0.
+    /// budget = 0 → empty decision, qcf_swap = 0.0.
     #[test]
     fn ratio_zero_returns_empty() {
         let importance = make_importance(vec![(0, 0.5), (1, 0.3), (2, 0.4), (3, 0.6)]);
@@ -479,7 +474,8 @@ mod tests {
             algorithm: SwapAlgorithm::ImportanceAware,
         };
 
-        let decision = decider.decide(0.0);
+        // budget = floor(0.0 * 4) = 0
+        let decision = decider.decide(0);
         assert!(decision.selected_layers.is_empty());
         assert_eq!(decision.qcf_swap_estimate, 0.0);
     }
@@ -499,7 +495,8 @@ mod tests {
             algorithm: SwapAlgorithm::ImportanceAware,
         };
 
-        let decision = decider.decide(0.5);
+        // budget = floor(0.5 * 4) - |{2}| = 2 - 1 = 1
+        let decision = decider.decide(1);
         assert!(
             !decision.selected_layers.contains(&2),
             "already-swapped layer 2 must not be re-selected"
@@ -522,7 +519,8 @@ mod tests {
             algorithm: SwapAlgorithm::ImportanceAware,
         };
 
-        let decision = decider.decide(0.9);
+        // budget = floor(0.9 * 4) = 3
+        let decision = decider.decide(3);
         assert!(
             !decision.selected_layers.contains(&0),
             "layer 0 is protected"
@@ -537,7 +535,7 @@ mod tests {
     /// (research/ablation 용; PPL teacher-forcing 전체 coverage 실험).
     #[test]
     fn boundary_layers_included_when_allowed() {
-        // 4 layer 모두 동일한 importance×ε → ratio=1.0 이면 4 layer 전부 선정 가능.
+        // 4 layer 모두 동일한 importance×ε → budget=4 이면 4 layer 전부 선정 가능.
         let importance = make_importance(vec![(0, 0.5), (1, 0.5), (2, 0.5), (3, 0.5)]);
         let noise = make_noise(vec![0.5, 0.5, 0.5, 0.5]);
 
@@ -550,11 +548,12 @@ mod tests {
             algorithm: SwapAlgorithm::ImportanceAware,
         };
 
-        let decision = decider.decide(1.0);
+        // budget = floor(1.0 * 4) = 4
+        let decision = decider.decide(4);
         assert_eq!(
             decision.selected_layers.len(),
             4,
-            "ratio=1.0 with allow_boundary_layers should select all 4 layers"
+            "budget=4 with allow_boundary_layers should select all 4 layers"
         );
         assert!(
             decision.selected_layers.contains(&0),
@@ -579,7 +578,8 @@ mod tests {
             algorithm: SwapAlgorithm::ImportanceAware,
         };
 
-        let decision = decider.decide(1.0);
+        // budget = floor(1.0 * 4) = 4
+        let decision = decider.decide(4);
         assert!(
             decision.fallback_used,
             "absent importance/noise should trigger fallback path"
@@ -625,7 +625,7 @@ mod tests {
     /// NaN ε layer contributes 0 to both numerator and denominator.
     #[test]
     fn qcf_swap_nan_layer_excluded_from_both() {
-        let noise = QuantNoiseTable::new_test(vec![0.2, f32::NAN, 0.3, 0.05]);
+        let noise = make_noise(vec![0.2, f32::NAN, 0.3, 0.05]);
         // Layer 1 has NaN ε — should contribute 0 to numerator and denominator.
         // Including it in swap_set should not change result vs. excluding it.
         let without_nan = compute_qcf_weight_swap(&[0, 2, 3], &noise, None, 4);
@@ -650,8 +650,8 @@ mod tests {
             allow_boundary_layers: false,
             algorithm: SwapAlgorithm::ImportanceAware,
         };
-        let (layers_dr, qcf_dr) = decider.decide_dry_run(0.5);
-        let decision = decider.decide(0.5);
+        let (layers_dr, qcf_dr) = decider.decide_dry_run(2);
+        let decision = decider.decide(2);
         assert_eq!(layers_dr, decision.selected_layers);
         assert!((qcf_dr - decision.qcf_swap_estimate).abs() < 1e-8);
     }

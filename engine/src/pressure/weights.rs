@@ -19,6 +19,7 @@ pub mod phase_aware_swap;
 pub mod probing_k;
 pub mod release_worker;
 pub mod setup;
+pub mod stage_registry;
 pub mod swap_executor;
 
 pub use async_swap::{AsyncSwapDispatcher, SwapCommitJob, SwapJob};

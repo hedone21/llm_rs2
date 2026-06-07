@@ -7,24 +7,20 @@
 //!
 //! Spec: INV-127, ENG-DAT-095, ENG-ALG-215.
 
-use llm_rs2::pressure::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
-use llm_rs2::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
+use llm_rs2::pressure::weights::{SwapAlgorithm, WeightSwapDecider};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn make_importance(entries: Vec<(usize, f32)>) -> ImportanceTable {
-    let entries = entries
-        .into_iter()
-        .map(|(id, imp)| ImportanceEntry {
-            layer_id: id,
-            sublayer: SubLayer::Full,
-            importance: imp,
-            opr: 0.0,
-            importance_mean_pool: None,
-            importance_shortgpt_bi: None,
-        })
-        .collect();
-    ImportanceTable::from_entries(entries)
+/// MW-C: flat per-layer importance (index = layer_id, value = `SubLayer::Full`
+/// importance). decider 의 `importance: Option<&[f32]>` 와 동형. 구
+/// `ImportanceTable::from_entries` 입력을 동일한 평탄 형태로 변환.
+fn make_importance(entries: Vec<(usize, f32)>) -> Vec<f32> {
+    let n = entries.iter().map(|(id, _)| id + 1).max().unwrap_or(0);
+    let mut out = vec![0.0f32; n];
+    for (id, imp) in entries {
+        out[id] = imp;
+    }
+    out
 }
 
 // ── INV-127 tests ─────────────────────────────────────────────────────────────
@@ -37,7 +33,7 @@ fn make_importance(entries: Vec<(usize, f32)>) -> ImportanceTable {
 #[test]
 fn inv_127_nan_layer_excluded_from_candidates() {
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
-    let noise = QuantNoiseTable::from_values(vec![0.2, f32::NAN, 0.3, 0.05]);
+    let noise = vec![0.2f32, f32::NAN, 0.3, 0.05];
 
     let decider = WeightSwapDecider {
         importance: Some(&importance),
@@ -48,7 +44,8 @@ fn inv_127_nan_layer_excluded_from_candidates() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 4) - 0 = 2
+    let decision = decider.decide(2);
 
     assert!(
         !decision.selected_layers.contains(&1),
@@ -65,7 +62,7 @@ fn inv_127_nan_layer_excluded_from_candidates() {
 #[test]
 fn inv_127_qcf_estimate_is_finite_with_nan_layers() {
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
-    let noise = QuantNoiseTable::from_values(vec![0.2, f32::NAN, 0.3, 0.05]);
+    let noise = vec![0.2f32, f32::NAN, 0.3, 0.05];
 
     let decider = WeightSwapDecider {
         importance: Some(&importance),
@@ -76,7 +73,8 @@ fn inv_127_qcf_estimate_is_finite_with_nan_layers() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 4) - 0 = 2
+    let decision = decider.decide(2);
 
     assert!(
         decision.qcf_swap_estimate.is_finite(),
@@ -91,7 +89,7 @@ fn inv_127_qcf_estimate_is_finite_with_nan_layers() {
 fn inv_127_all_candidates_nan_gives_empty_selection() {
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
     // All non-protected (layers 1, 2) are NaN; protected (0, 3) NaN too
-    let noise = QuantNoiseTable::from_values(vec![f32::NAN, f32::NAN, f32::NAN, f32::NAN]);
+    let noise = vec![f32::NAN, f32::NAN, f32::NAN, f32::NAN];
 
     let decider = WeightSwapDecider {
         importance: Some(&importance),
@@ -102,7 +100,8 @@ fn inv_127_all_candidates_nan_gives_empty_selection() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 4) - 0 = 2
+    let decision = decider.decide(2);
 
     assert!(
         decision.selected_layers.is_empty(),
@@ -119,7 +118,7 @@ fn inv_127_all_candidates_nan_gives_empty_selection() {
 #[test]
 fn inv_127_nan_layer_not_re_selected_even_if_currently_swapped() {
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
-    let noise = QuantNoiseTable::from_values(vec![0.2, f32::NAN, 0.3, 0.05]);
+    let noise = vec![0.2f32, f32::NAN, 0.3, 0.05];
 
     // Layer 2 is already swapped — the only remaining valid candidate (layer 1) has NaN ε.
     let decider = WeightSwapDecider {
@@ -131,7 +130,8 @@ fn inv_127_nan_layer_not_re_selected_even_if_currently_swapped() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 4) - |{2}| = 2 - 1 = 1
+    let decision = decider.decide(1);
 
     assert!(
         !decision.selected_layers.contains(&1),
@@ -145,7 +145,7 @@ fn inv_127_nan_layer_not_re_selected_even_if_currently_swapped() {
 fn inv_127_compute_qcf_weight_swap_nan_layer_contributes_zero() {
     use llm_rs2::pressure::weights::compute_qcf_weight_swap;
 
-    let noise = QuantNoiseTable::from_values(vec![0.2, f32::NAN, 0.3, 0.05]);
+    let noise = vec![0.2f32, f32::NAN, 0.3, 0.05];
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
 
     // Include layer 1 (NaN ε) in the swap set explicitly

@@ -24,10 +24,7 @@ use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
 use llm_rs2::pressure::ActionResult;
 use llm_rs2::pressure::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
-use llm_rs2::pressure::weights::{
-    QuantNoiseTable, SwapAlgorithm, WeightSwapDecider, compute_qcf_weight_swap,
-};
-use llm_rs2::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
+use llm_rs2::pressure::weights::{SwapAlgorithm, WeightSwapDecider, compute_qcf_weight_swap};
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
 use llm_shared::DtypeTag;
@@ -103,19 +100,15 @@ fn make_model_ref(n_layers: usize) -> Arc<WeightSwapModelRef> {
     })
 }
 
-fn make_importance(entries: Vec<(usize, f32)>) -> ImportanceTable {
-    let entries = entries
-        .into_iter()
-        .map(|(id, imp)| ImportanceEntry {
-            layer_id: id,
-            sublayer: SubLayer::Full,
-            importance: imp,
-            opr: 0.0,
-            importance_mean_pool: None,
-            importance_shortgpt_bi: None,
-        })
-        .collect();
-    ImportanceTable::from_entries(entries)
+/// MW-C: flat per-layer importance (index = layer_id, value = `SubLayer::Full`
+/// importance). decider 의 `importance: Option<&[f32]>` 와 동형.
+fn make_importance(entries: Vec<(usize, f32)>) -> Vec<f32> {
+    let n = entries.iter().map(|(id, _)| id + 1).max().unwrap_or(0);
+    let mut out = vec![0.0f32; n];
+    for (id, imp) in entries {
+        out[id] = imp;
+    }
+    out
 }
 
 // ── E2E: DtypeTag::Q4_0 validation gate ──────────────────────────────────────
@@ -160,7 +153,7 @@ fn e2e_reserved_dtype_blocked_at_gate() {
 #[test]
 fn e2e_decider_to_handler_no_secondary() {
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
-    let noise = QuantNoiseTable::from_values(vec![0.2, 0.1, 0.3, 0.05]);
+    let noise = vec![0.2f32, 0.1, 0.3, 0.05];
 
     let decider = WeightSwapDecider {
         importance: Some(&importance),
@@ -171,7 +164,8 @@ fn e2e_decider_to_handler_no_secondary() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 4) - 0 = 2
+    let decision = decider.decide(2);
     assert!(!decision.fallback_used, "should use scored path");
     assert_eq!(decision.selected_layers.len(), 2);
 
@@ -199,7 +193,7 @@ fn e2e_swap_decision_fields_satisfy_msg_089_preconditions() {
     let requested_ratio = 0.5f32;
 
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
-    let noise = QuantNoiseTable::from_values(vec![0.2, 0.1, 0.3, 0.05]);
+    let noise = vec![0.2f32, 0.1, 0.3, 0.05];
 
     let decider = WeightSwapDecider {
         importance: Some(&importance),
@@ -210,7 +204,9 @@ fn e2e_swap_decision_fields_satisfy_msg_089_preconditions() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(requested_ratio);
+    // budget = floor(requested_ratio * n_layers) - 0 = floor(0.5 * 4) = 2
+    let budget = (requested_ratio * n_layers as f32).floor() as usize;
+    let decision = decider.decide(budget);
 
     // ratio_applied = selected / n_layers
     let ratio_applied = decision.selected_layers.len() as f32 / n_layers as f32;
@@ -249,7 +245,7 @@ fn e2e_swap_decision_fields_satisfy_msg_089_preconditions() {
 fn e2e_qcf_swap_at_ratio_curve_is_monotone() {
     let n_layers = 4usize;
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
-    let noise = QuantNoiseTable::from_values(vec![0.2, 0.1, 0.3, 0.05]);
+    let noise = vec![0.2f32, 0.1, 0.3, 0.05];
 
     let sample_ratios = [0.1f32, 0.25, 0.5, 0.75, 1.0];
     let mut prev_qcf = -1.0f32;
@@ -262,7 +258,9 @@ fn e2e_qcf_swap_at_ratio_curve_is_monotone() {
             allow_boundary_layers: false,
             algorithm: SwapAlgorithm::ImportanceAware,
         };
-        let (_, qcf) = decider.decide_dry_run(r);
+        // budget = floor(r * n_layers) - 0
+        let budget = (r * n_layers as f32).floor() as usize;
+        let (_, qcf) = decider.decide_dry_run(budget);
         assert!(
             qcf.is_finite(),
             "qcf at ratio {r:.2} must be finite, got {qcf}"
@@ -278,7 +276,7 @@ fn e2e_qcf_swap_at_ratio_curve_is_monotone() {
 /// Dry-run at ratio=0 must produce empty layers and qcf_swap=0.
 #[test]
 fn e2e_dry_run_zero_ratio_is_empty() {
-    let noise = QuantNoiseTable::from_values(vec![0.2, 0.1, 0.3, 0.05]);
+    let noise = vec![0.2f32, 0.1, 0.3, 0.05];
     let decider = WeightSwapDecider {
         importance: None,
         noise: Some(&noise),
@@ -287,7 +285,8 @@ fn e2e_dry_run_zero_ratio_is_empty() {
         allow_boundary_layers: false,
         algorithm: SwapAlgorithm::ImportanceAware,
     };
-    let (layers, qcf) = decider.decide_dry_run(0.0);
+    // budget = floor(0.0 * 4) = 0
+    let (layers, qcf) = decider.decide_dry_run(0);
     assert!(layers.is_empty(), "ratio=0 must give no layers");
     assert_eq!(qcf, 0.0, "ratio=0 must give qcf=0.0");
 }
@@ -300,7 +299,7 @@ fn e2e_dry_run_zero_ratio_is_empty() {
 fn e2e_qcf_swap_actual_matches_estimate() {
     let n_layers = 4usize;
     let importance = make_importance(vec![(0, 0.1), (1, 0.5), (2, 0.3), (3, 0.7)]);
-    let noise = QuantNoiseTable::from_values(vec![0.2, 0.1, 0.3, 0.05]);
+    let noise = vec![0.2f32, 0.1, 0.3, 0.05];
 
     let decider = WeightSwapDecider {
         importance: Some(&importance),
@@ -311,7 +310,8 @@ fn e2e_qcf_swap_actual_matches_estimate() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 4) - 0 = 2
+    let decision = decider.decide(2);
     // Recompute qcf_swap using the public compute_qcf_weight_swap function
     let qcf_actual = compute_qcf_weight_swap(
         &decision.selected_layers,
@@ -349,12 +349,10 @@ fn e2e_selected_layers_have_lower_cost_than_excluded() {
         (4, 0.2),
         (5, 0.8),
     ]);
-    let noise = QuantNoiseTable::from_values(vec![0.5, 0.4, 0.1, 0.3, 0.2, 0.6]);
+    let noise = vec![0.5f32, 0.4, 0.1, 0.3, 0.2, 0.6];
 
-    // ratio=0.5 → k=floor(0.5*6)=3, protected=[0,5], candidates=[1,2,3,4]
-    // costs:  1→0.12, 2→0.05, 3→0.21, 4→0.04
-    // ascending: 4(0.04) < 2(0.05) < 1(0.12) < 3(0.21)
-    // select 3: [4, 2, 1]
+    // ratio=0.5 → budget=floor(0.5*6)=3, protected=[0,5], candidates=[1,2,3,4].
+    // ε removed from ranking (Spearman ρ≈0.998); key = importance only.
     let decider = WeightSwapDecider {
         importance: Some(&importance),
         noise: Some(&noise),
@@ -364,7 +362,8 @@ fn e2e_selected_layers_have_lower_cost_than_excluded() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 6) - 0 = 3
+    let decision = decider.decide(3);
     assert_eq!(
         decision.selected_layers.len(),
         3,
@@ -410,7 +409,7 @@ fn e2e_selected_layers_have_lower_cost_than_excluded() {
 #[test]
 fn e2e_per_layer_count_consistent() {
     let n_layers = 8usize;
-    let noise = QuantNoiseTable::from_values(vec![0.1; n_layers]);
+    let noise = vec![0.1f32; n_layers];
     let importance = make_importance((0..n_layers).map(|i| (i, 0.5f32)).collect());
 
     let decider = WeightSwapDecider {
@@ -422,7 +421,8 @@ fn e2e_per_layer_count_consistent() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 8) - 0 = 4
+    let decision = decider.decide(4);
 
     // All selected indices must be in [0, n_layers)
     for &idx in &decision.selected_layers {

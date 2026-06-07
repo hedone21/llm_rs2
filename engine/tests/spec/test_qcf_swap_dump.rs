@@ -193,21 +193,21 @@ fn test_ratio_zero_swap_count_zero() {
 fn test_ratio_033_skip_count_5_for_16l() {
     use llm_rs2::pressure::weights::decider::{SwapAlgorithm, WeightSwapDecider};
 
-    // Build a uniform importance + noise table for 16 layers.
-    let vals: Vec<f32> = (0..16).map(|_| 0.05f32).collect();
-    let noise = make_noise(vals.clone());
-    let imp_entries: Vec<(usize, f32, f32)> = (0..16).map(|i| (i, 0.1, 0.05)).collect();
-    let imp = make_importance(imp_entries);
+    // MW-C: decider 는 flat per-layer importance/noise 슬라이스를 받는다
+    // (index = layer_id). 16 레이어 uniform.
+    let imp_flat: Vec<f32> = vec![0.1f32; 16];
+    let noise_flat: Vec<f32> = vec![0.05f32; 16];
 
     let decider = WeightSwapDecider {
-        importance: Some(&imp),
-        noise: Some(&noise),
+        importance: Some(&imp_flat),
+        noise: Some(&noise_flat),
         n_decoder_layers: 16,
         currently_swapped: &[],
         allow_boundary_layers: false,
         algorithm: SwapAlgorithm::ImportanceAware,
     };
-    let decision = decider.decide(0.33);
+    // budget = floor(0.33 * 16) - 0 = 5
+    let decision = decider.decide(5);
 
     // swap_count = floor(0.33 * 16) = 5
     assert_eq!(
@@ -283,21 +283,20 @@ fn test_ratio_033_skip_count_5_for_16l() {
 fn test_ratio_one_caps_at_n_minus_2() {
     use llm_rs2::pressure::weights::decider::{SwapAlgorithm, WeightSwapDecider};
 
-    let vals: Vec<f32> = (0..16).map(|i| 0.01 * (i as f32 + 1.0)).collect();
-    let noise = make_noise(vals);
-    let imp_entries: Vec<(usize, f32, f32)> =
-        (0..16).map(|i| (i, 0.05 * (i as f32 + 1.0), 0.0)).collect();
-    let imp = make_importance(imp_entries);
+    // MW-C: decider 는 flat per-layer importance/noise 슬라이스를 받는다.
+    let noise_flat: Vec<f32> = (0..16).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+    let imp_flat: Vec<f32> = (0..16).map(|i| 0.05 * (i as f32 + 1.0)).collect();
 
     let decider = WeightSwapDecider {
-        importance: Some(&imp),
-        noise: Some(&noise),
+        importance: Some(&imp_flat),
+        noise: Some(&noise_flat),
         n_decoder_layers: 16,
         currently_swapped: &[],
         allow_boundary_layers: false,
         algorithm: SwapAlgorithm::ImportanceAware,
     };
-    let decision = decider.decide(1.0);
+    // budget = floor(1.0 * 16) - 0 = 16
+    let decision = decider.decide(16);
 
     // floor(1.0 * 16) = 16 target, but 14 candidates (0 and 15 excluded)
     assert_eq!(

@@ -16,7 +16,7 @@
 //!
 //! Spec: INV-128, ENG-ALG-218.
 
-use llm_rs2::pressure::weights::{QuantNoiseTable, SwapAlgorithm, WeightSwapDecider};
+use llm_rs2::pressure::weights::{SwapAlgorithm, WeightSwapDecider};
 use llm_rs2::qcf::layer_importance::ImportanceCollector;
 use llm_rs2::qcf::layer_importance::ImportanceTable;
 
@@ -152,7 +152,7 @@ fn inv_128_importance_table_unchanged_on_abort() {
 #[test]
 fn inv_128_decider_safe_with_absent_importance() {
     // No importance table (as if collector was never built)
-    let noise = QuantNoiseTable::from_values(vec![0.2, 0.1, 0.3, 0.05]);
+    let noise = vec![0.2f32, 0.1, 0.3, 0.05];
 
     let decider = WeightSwapDecider {
         importance: None, // absent — simulates post-abort state
@@ -163,7 +163,8 @@ fn inv_128_decider_safe_with_absent_importance() {
         algorithm: SwapAlgorithm::ImportanceAware,
     };
 
-    let decision = decider.decide(0.5);
+    // budget = floor(0.5 * 4) - 0 = 2
+    let decision = decider.decide(2);
 
     assert!(
         decision.fallback_used,

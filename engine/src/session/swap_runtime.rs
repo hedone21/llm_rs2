@@ -129,7 +129,7 @@ impl EngineSwapRuntime {
     /// 단계:
     /// 1. Validate — secondary present / ratio in (0,1] / target_dtype=Q4_0.
     /// 2. In-flight check — commit_slot이 Idle 인지 확인 (R-1 동시 활성화 가드).
-    /// 3. Decider — `WeightSwapDecider::decide(ratio)` → `selected_layers`.
+    /// 3. Decider — ratio→budget 환산 후 `WeightSwapDecider::decide(budget)` → `selected_layers`.
     /// 4. QCF estimate — `compute_qcf_weight_swap`.
     /// 5. Mode-specific commit — `match self.default_mode` 4-way.
     /// 6. Manager report — 후속 plan-retire 시점에 `WeightSwapReport`로 송신.
@@ -144,6 +144,7 @@ impl EngineSwapRuntime {
         commit_slot: &mut SwapCommitSlot,
         manager_report_out: &mut Option<(f32, usize, Instant, f32)>,
     ) {
+        use crate::pressure::weights::decider::flatten_importance;
         use crate::pressure::weights::{
             SwapAlgorithm, SwapDecision, WeightSwapDecider, compute_qcf_weight_swap,
         };
@@ -187,15 +188,26 @@ impl EngineSwapRuntime {
             "[Decider] allow_boundary_layers={} (ratio={:.4}, mode={:?})",
             allow_boundary, ratio, self.default_mode
         );
+        // MW-C: ImportanceLookup → flat per-layer 슬라이스 투영. noise 는
+        // is_computed() 일 때만 Some(slice) (구 fallback 게이트 보존).
+        let importance_flat = importance.map(|imp| flatten_importance(imp, n_layers));
+        let noise_flat = if model.quant_noise.is_computed() {
+            Some(model.quant_noise.as_slice())
+        } else {
+            None
+        };
+        // ratio → budget 환산 (구 decide(ratio) 내부 로직을 호출자로 이동).
+        let target_count = (ratio * n_layers as f32).floor() as usize;
+        let budget = target_count.saturating_sub(currently_swapped.len());
         let decider = WeightSwapDecider {
-            importance,
-            noise: Some(model.quant_noise.as_ref()),
+            importance: importance_flat.as_deref(),
+            noise: noise_flat,
             n_decoder_layers: n_layers,
             currently_swapped: &currently_swapped,
             allow_boundary_layers: allow_boundary,
             algorithm: SwapAlgorithm::ImportanceAware,
         };
-        let decision: SwapDecision = decider.decide(ratio);
+        let decision: SwapDecision = decider.decide(budget);
 
         if decision.selected_layers.is_empty() {
             eprintln!(
@@ -209,8 +221,8 @@ impl EngineSwapRuntime {
         // ── 5. QCF estimate ──────────────────────────────────────────────
         let qcf_swap_estimated = compute_qcf_weight_swap(
             &decision.selected_layers,
-            model.quant_noise.as_ref(),
-            importance,
+            model.quant_noise.as_slice(),
+            importance_flat.as_deref(),
             n_layers,
         );
 
