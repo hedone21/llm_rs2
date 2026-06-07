@@ -168,3 +168,28 @@ AttentionScoreAccumulator 장착 + ScoreContext 공급(AB-task). eval-ll/ppl/bat
 **게이트**: lib 1238/0(`--features caote`, caote 통합 테스트 포함) + default 무회귀 + caote crate 2/0 + CLI
 parse 양쪽(feature ON `parses_caote_unit_subcommand` / OFF `rejects_caote_when_plugin_absent`) + clippy
 --workspace & `--features caote` clean. 기여자 가이드: `docs/50_adding_kvcache_stage.md` §3-3.
+
+## 9. Amendment — `importance()` 비통합은 의도된 역할 구분 (2026-06-07 결정)
+
+**맥락**: TensorHandle 통합(§7) 이후 "`tensor(Scores)` 로 점수를 읽을 수 있는데 `importance()` 별도
+accessor 가 왜 남나"라는 일관성 질문이 제기됐다. §7 은 *perf* 사유(scalar 를 per-element `read_row` 로
+돌리면 H2O 랭킹 경로가 순손해)만 기록했고, 더 근본적인 *역할* 사유가 누락돼 있었다.
+
+**명문화**:
+- `importance()` ≠ `tensor(Scores)` — **집계 레벨이 다른 별개 텐서**다. `importance()` = 레이어-와이드
+  per-token `[n_tokens]`(head 축 환원 완료; H2O heavy-hitter 랭킹 / D2O 토큰 랭크 입력, `lib.rs:101`).
+  `tensor(Scores)`/`head_score()` = per-head per-token `[n_kv_heads][pos]`(미환원; h2o_plus/CAOTE,
+  `lib.rs:137`). `KVStageCtx::new` 가 둘을 **별개 인자**(`importance` ⊥ `head_scores`)로 받는다
+  (`stage_registry.rs:204-209`). 설령 `importance ≈ reduce_over_heads(head_scores)` 라도 plan() 호출마다
+  `n_kv_heads×n_tokens` 재환원은 핫패스 낭비.
+- `importance()` 는 **raw 텐서가 아니라 엔진 스코어링이 내놓는 digested decision-input** 이다 — 형제는
+  `Key`/`Value`(raw tensor 패밀리)가 아니라 `target_len()`(엔진이 ratio→count 로 이미 해소한 결정-입력)이다.
+  그래서 `tensor()` 단일 통로 *밖*에 사는 것이 역할에 부합한다.
+- **production 가용성**: 현 builtins 는 `KVStageCtx::new(.., importance, None, None)`(`stage_registry.rs:287`)
+  → `tensor(Scores)=None`. per-head tensor 경로는 host-test(CAOTE) 한정(§7 deferred). 즉 production
+  score-based eviction 의 유일 신호 = `importance()`. 지금 제거하면 production H2O 가 끊긴다.
+
+**결론**: `importance()` 의 `tensor()` 비통합은 §7 의 perf carve-out 을 넘어 **의도된 역할 구분**이다(오버사이트
+아님). `tensor(Importance)` 로 fold 하면 zero-copy 유지를 위해 `TensorHandle::as_slice()`(f32-연속 전용)가
+필요해 wart 를 핸들 *안으로* 옮길 뿐이다. **비통합 유지(현 상태)가 권고.** fold 재검토 임계 = §7 deferred
+(head_scores production threading)가 풀리고 동시에 `.so` C-ABI 단일 read 표면이 실제 제약이 될 때.
