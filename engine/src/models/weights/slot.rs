@@ -208,12 +208,15 @@ impl WeightFormat for LayerSlot {
             }
             // Partition install. (transformer.rs:1023-1068 verbatim; only the
             // companion backend source changes: cpu_backend → hw.resolve(Cpu).)
-            LayerDispatch::Partition(specs) => {
-                let gpu_spec = &specs[0]; // GPU
-                let cpu_spec = &specs[1]; // CPU companion
+            LayerDispatch::Partition(shares) => {
+                let gpu_spec = &shares[0]; // GPU
+                let cpu_spec = &shares[1]; // CPU companion
                 let gpu_ratio = gpu_spec.share;
+                // per-slice format 은 weight dtype 에서 파생(split byte layout 원천,
+                // `bytes_per_row`) — `PartitionShare` 표면에 없으므로 변환/assert 불요
+                // (ADR-0006 MW-A: format = executor-내부).
                 let cpu_backend = hw
-                    .resolve(cpu_spec.hardware)
+                    .resolve(cpu_spec.hardware.into())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "{:?} backend 미보유 (partition companion)",
@@ -223,12 +226,6 @@ impl WeightFormat for LayerSlot {
                     .0
                     .clone();
                 let old = self.load_weights();
-                anyhow::ensure!(
-                    gpu_spec.format == old.w_gate.dtype(),
-                    "partition format 변환 미구현 (leaf): spec={:?} weight={:?}",
-                    gpu_spec.format,
-                    old.w_gate.dtype()
-                );
                 // Reuse the existing Arc<AtomicU64> if a partition_ctx is already
                 // installed so that plans built against the prior generation see
                 // the bump. A fresh install starts at 0.
@@ -285,8 +282,7 @@ mod tests {
 
     use crate::backend::Backend;
     use crate::backend::cpu::CpuBackend;
-    use crate::format::weight_format::SliceSpec;
-    use crate::hardware::DeviceTarget;
+    use crate::format::weight_format::PartitionShare;
     use crate::memory::Memory;
     use crate::memory::host::shared::SharedBuffer;
     use crate::shape::Shape;
@@ -358,15 +354,13 @@ mod tests {
 
     fn partition_specs() -> LayerDispatch {
         LayerDispatch::Partition(vec![
-            SliceSpec {
+            PartitionShare {
                 share: 0.5,
-                hardware: DeviceTarget::Gpu,
-                format: DType::F32,
+                hardware: technique_api::DeviceTarget::Gpu,
             },
-            SliceSpec {
+            PartitionShare {
                 share: 0.5,
-                hardware: DeviceTarget::Cpu,
-                format: DType::F32,
+                hardware: technique_api::DeviceTarget::Cpu,
             },
         ])
     }

@@ -266,6 +266,49 @@ pub fn registered_names() -> Vec<&'static str> {
     KV_CACHE_STAGES.iter().map(|r| r.name).collect()
 }
 
+// ── weight 축 dispatch 타입 (ADR-0006 MW-A) ──
+//
+// KV 의 plan-returning 과 동형으로 weight stage plugin 의 dispatch 결정을 표현하는 표면 타입.
+// (`WeightStage`/`WeightDispatchPlan`/`WeightStageCtx` 본체는 MW-B 신설; 본 단계는 dispatch 모드 타입만.)
+
+/// 연산 위치 축(hardware) plugin 표면 mirror. 엔진 `hardware::DeviceTarget` 와 1:1 (engine 측
+/// `From` 양방향 + drift 게이트). api crate 가 engine 에 의존하지 않도록 별도 정의한다.
+/// `#[repr(u32)]` 은 미래 `.so` C-ABI 가 discriminant 직접 전달하도록.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceTarget {
+    Cpu,
+    Gpu,
+    Npu,
+}
+
+/// weight layer 의 dispatch 모드. plugin 이 결정하는 **stage/hardware 축 모드**다.
+/// precision(format 축)은 본 enum 이 아니라 `LayerDirective.precision`(MW-B)으로 분리한다(R1 직교).
+#[derive(Debug, Clone)]
+pub enum LayerDispatch {
+    /// 1-slice dense fast-path (slice 기계 우회).
+    Full,
+    /// 0-slice (layer skip; 실행 배선은 Phase β).
+    Skip,
+    /// N-slice composite, share 합 ≈ 1.0.
+    Partition(Vec<PartitionShare>),
+}
+
+/// partition 슬라이스 1개의 **plugin-결정 좌표** = (share, hardware).
+///
+/// per-slice 저장 format(precision)은 **plugin 결정이 아니라 executor 가 weight dtype 에서 파생**하므로
+/// 본 표면에서 제외한다(ADR-0006 D2/D7; ADR-0004 §9 importance 비통합과 동형의 "결정 vs 파생" 분리).
+/// 근거: split 의 byte layout 은 weight tensor 의 실제 dtype 에서 나오고(엔진 `bytes_per_row`), 기존
+/// `SliceSpec.format` 은 그것과의 동등 assert 뿐이었다. 표면을 좁은 `TensorDtype`(3종)로 좁히면 현
+/// 7-dtype partition 중 Q4_1/Q8_0/BF16/U8 이 회귀하므로, format 은 executor-내부(전체 `DType`)로 둔다.
+#[derive(Debug, Clone)]
+pub struct PartitionShare {
+    /// 이 슬라이스가 weight 의 몇 비율 (out_dim 축).
+    pub share: f32,
+    /// 이 슬라이스를 resolve 할 hardware 위치.
+    pub hardware: DeviceTarget,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

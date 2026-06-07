@@ -15,4 +15,4 @@ pub mod kv_cache_format;
 pub mod weight_format;
 
 pub use kv_cache_format::{AttnDims, KVCacheFormat, Merge};
-pub use weight_format::{LayerDispatch, SliceSpec, WeightFormat};
+pub use weight_format::{LayerDispatch, PartitionShare, WeightFormat};

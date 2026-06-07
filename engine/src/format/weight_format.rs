@@ -4,18 +4,18 @@
 //! weight content 는 모른다. precision swap 등 Format mutation 은 concrete-handle Stage
 //! (`WeightSwapStage` with `Arc<LayerSlot>`)가 concrete method 로 직접 수행한다.
 //! `LayerDispatch::Partition` 의 분산 대상 backend 는 `Hardware`(§3.5)에서 resolve 하고, 슬라이스
-//! 마다 다른 (format, hardware) 좌표를 가질 수 있다(GPU-f16 / NPU-q4) — partition = format(표현)
-//! × hardware(위치)의 곱.
+//! 마다 다른 (format, hardware) 좌표를 가질 수 있다 — partition = format(표현) × hardware(위치)의 곱.
 //!
-//! **Phase α-W 신설** — 현 코드 trait 부재. `apply_dispatch` 는 현
-//! `transformer.rs:prepare_tensor_partition(ratio, cpu_backend)`(setup 1회, 2-fixed slice)의
-//! 일반화다. impl(`PartitionedWeight` → `Vec<WeightSlice>` 일반화)·forward 정적 분기 배선은 후속
-//! substep(α-W-5)이며, 본 파일은 trait 표면만 정의한다(아직 소비자 0 — α-W-5 에서 배선).
+//! **dispatch 타입은 `technique-api` 거주**(ADR-0006 MW-A): `LayerDispatch`/`PartitionShare` 는
+//! plugin 결정 표면이라 api crate 에 있고 여기서 re-export 한다. 엔진 측에는 executor 변형 표면인
+//! `WeightFormat` trait 과 `DeviceTarget` mirror From 변환만 둔다. per-slice 저장 format 은 plugin
+//! 결정이 아니라 executor 가 weight dtype 에서 파생하므로 `PartitionShare` 표면에서 제외(api 정의 doc).
 
 use anyhow::Result;
 
-use crate::buffer::DType;
-use crate::hardware::{DeviceTarget, Hardware};
+use crate::hardware::Hardware;
+
+pub use technique_api::{LayerDispatch, PartitionShare};
 
 /// weight layer 의 dispatch 모드(Full / Skip / Partition)를 적용하는 base trait.
 pub trait WeightFormat: Send + Sync {
@@ -28,24 +28,40 @@ pub trait WeightFormat: Send + Sync {
     // apply_storage(spec) 없음 — precision swap 등은 concrete-handle Stage(`Arc<LayerSlot>`) 직접 호출.
 }
 
-/// construction-time dispatch spec. `Partition` 은 N-slice composite (§4.2, item 2 연혁).
-///
-/// spec·struct 는 **N-capable 지금** / N-way 병렬 dispatch+merge 커널은 leaf 로 성장
-/// (새 HW 추가 시 spec 재형성 0, leaf 한 곳만 — 3축 "M×N 은 Backend 아래 leaf 격리" 원칙).
-#[derive(Clone)]
-pub enum LayerDispatch {
-    /// 1-slice dense fast-path (slice 기계 우회).
-    Full,
-    /// 0-slice. Full/Partition 과 나란한 모드로 유지 (stage-축 분리는 friction-triggered).
-    Skip,
-    /// N-slice composite, share 합 ≈ 1.0.
-    Partition(Vec<SliceSpec>),
+/// api 표면 `technique_api::DeviceTarget` ↔ 엔진 `hardware::DeviceTarget` 1:1 mirror.
+/// 두 enum 변종이 어긋나면 round-trip 테스트(drift 게이트)가 깨진다.
+impl From<technique_api::DeviceTarget> for crate::hardware::DeviceTarget {
+    fn from(d: technique_api::DeviceTarget) -> Self {
+        use technique_api::DeviceTarget as A;
+        match d {
+            A::Cpu => crate::hardware::DeviceTarget::Cpu,
+            A::Gpu => crate::hardware::DeviceTarget::Gpu,
+            A::Npu => crate::hardware::DeviceTarget::Npu,
+        }
+    }
 }
 
-/// per-slice precision (GPU-f16 / NPU-q4) — partition = format(표현) × hardware(위치)의 곱.
-#[derive(Clone)]
-pub struct SliceSpec {
-    pub share: f32,
-    pub hardware: DeviceTarget,
-    pub format: DType,
+impl From<crate::hardware::DeviceTarget> for technique_api::DeviceTarget {
+    fn from(d: crate::hardware::DeviceTarget) -> Self {
+        use crate::hardware::DeviceTarget as E;
+        match d {
+            E::Cpu => technique_api::DeviceTarget::Cpu,
+            E::Gpu => technique_api::DeviceTarget::Gpu,
+            E::Npu => technique_api::DeviceTarget::Npu,
+        }
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    /// api↔engine DeviceTarget 변종 drift 게이트: 모든 변종 round-trip.
+    #[test]
+    fn device_target_mirror_roundtrip() {
+        use crate::hardware::DeviceTarget as E;
+        for e in [E::Cpu, E::Gpu, E::Npu] {
+            let a: technique_api::DeviceTarget = e.into();
+            let back: E = a.into();
+            assert_eq!(e, back);
+        }
+    }
 }

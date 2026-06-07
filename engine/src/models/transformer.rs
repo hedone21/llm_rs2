@@ -992,8 +992,8 @@ impl TransformerModel {
         gpu_ratio: f32,
         hw: &crate::hardware::Hardware,
     ) -> Result<usize> {
-        use crate::format::weight_format::{LayerDispatch, SliceSpec, WeightFormat};
-        use crate::hardware::DeviceTarget;
+        use crate::format::weight_format::{LayerDispatch, PartitionShare, WeightFormat};
+        use technique_api::DeviceTarget;
         use crate::layers::tensor_partition::is_gpu_only_ratio;
 
         // GPU-only fast path: leave partition_ctx cleared so forward() takes
@@ -1012,17 +1012,14 @@ impl TransformerModel {
             return Ok(0);
         }
 
-        let dtype = self.layers[0].load_weights().w_gate.dtype();
         let specs = vec![
-            SliceSpec {
+            PartitionShare {
                 share: gpu_ratio,
                 hardware: DeviceTarget::Gpu,
-                format: dtype,
             },
-            SliceSpec {
+            PartitionShare {
                 share: 1.0 - gpu_ratio,
                 hardware: DeviceTarget::Cpu,
-                format: dtype,
             },
         ];
         let mut count = 0;
