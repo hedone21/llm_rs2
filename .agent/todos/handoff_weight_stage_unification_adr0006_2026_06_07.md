@@ -5,7 +5,7 @@
 **브랜치**: master
 **작성자**: 메인 세션 (precision/weight plugin 통일 grill + 적대적 검증 6-agent 세션)
 
-**다음 세션 진입 문장**: **"ADR-0006 crate 단계 구현 — WEIGHT_STAGES registry + WeightStage/WeightDispatchPlan/WeightStageCtx 신설부터 (Seam A 한정, Seam B 는 Phase β)"**
+**다음 세션 진입 문장**: **"ADR-0006 MW-B — technique-api 에 WeightStage/WeightDispatchPlan/LayerDirective/WeightStageCtx + WEIGHT_STAGES registry 신설 (MW-A ✅ `e07da198`, Seam B 는 Phase β)"**
 
 ---
 
@@ -43,13 +43,18 @@ KV 의 plan-returning plugin 패턴(ADR-0004)을 **weight 축**(precision swap/s
 
 ---
 
-## 다음 작업 (crate 단계 구현, 순서대로 — Seam A 한정)
+## 다음 작업 (crate 단계 구현 — Seam A 한정)
 
-1. **`technique-api` 에 weight 타입 추가** — `WeightStage`/`WeightDispatchPlan`/`LayerDirective`/`WeightStageCtx`/`LayerMetricKind`/`WeightStageReg`/`WEIGHT_STAGES`/`find_weight_stage`/`WeightStageParams` (Weight* prefix, KVCacheStage 동형). + `DeviceTarget` api mirror(repr(u32)). → 검증: `cargo build` + dyn-safe + `find_weight_stage`/`registered_weight_names` 단위 테스트 + release fat-LTO linkme 생존(ADR-0003 §4)
-2. **`LayerDispatch`/`SliceSpec` engine→api 이동** — `DType→TensorDtype`(lossy, Q4_0-only INV)·`DeviceTarget→api mirror`. `Full` unit 유지. → 검증: 기존 소비자 2곳(slot.rs:199, transformer.rs:1010) 무회귀(기계적 import 갱신만), clippy clean
-3. **`WeightSwapDeciderAsStage` 엔진측 어댑터** — `decide(ratio_max)` 위임, ctx borrow 로 decider 즉석 생성. `#[distributed_slice(WEIGHT_STAGES)]` 등록("swap") + `ensure_builtin_weight_stages_registered` self-test → 검증: builtin 등록 + plan() 이 `WeightSwapDecider::decide` 와 동일 selected_layers 산출
-4. **`WeightStageCtx` 엔진 impl**(`&TransformerModel` 위로) — budget 해소·`current_format`·`layer_metric`(QuantNoise=as_slice, Importance=SubLayer::Full 투영) → 검증: importance/noise 투영이 decider 직접 입력과 bit-identical
-5. **(Phase β 의존) Seam B 배선** — `PipelineRegistry` 구현 + decode loop → `WeightSwapStage`(OneShot) on_phase → `execute_weight_plan`(IncrementalSwapPlan/SwapExecutor). **AB-6 + Phase β 선행, 본 crate 단계 밖.**
+### 진행 현황 (2026-06-07 갱신)
+- **MW-A ✅ DONE** (commit `e07da198`): `LayerDispatch`/`PartitionShare`/`DeviceTarget`(mirror)를 technique-api 로 이동. **의존 순서 교정** — `WeightDispatchPlan`(MW-B)이 `LayerDispatch`를 참조하므로 이 이동을 weight-타입 신설(MW-B)보다 **먼저** 함.
+  - **설계 결정(option A, 사용자 승인)**: `SliceSpec.format`(per-slice 저장 dtype)은 plugin 표면에 넣지 **않는다**. 근거: format 은 plugin 결정이 아니라 executor 가 weight dtype 에서 파생(split byte layout 원천 `bytes_per_row`)하고, plugin 표면 규칙 `TensorDtype`(3종)로 좁히면 현 7-dtype partition 중 **Q4_1/Q8_0/BF16/U8 이 회귀**한다. → `SliceSpec` 폐기, api `PartitionShare{share, hardware}` 신설, format 은 executor-내부 전체 `DType` 유지, 기존 format 동등 assert 제거. (**handoff 원안 step 2 "SliceSpec engine→api 이동(format:TensorDtype)" 을 이 결정으로 대체.**) ADR-0006 D2/D7 직교 보존 + 회귀 0. 직교성 자체는 format 을 plugin 에 둬도 유지(다른 필드/trait)되나, 선택은 *회귀 방지* 논거로 갈렸음.
+  - 게이트: build/clippy --workspace clean, lib 1238/0(무회귀; 1 flaky=`test_prune_prefix_calls_release_unused_pages` RSS 임계, 격리 통과), DeviceTarget drift round-trip + apply_dispatch Full/Partition 테스트 통과.
+
+### 남은 MW (Seam A)
+- **MW-B (다음)** — **`technique-api` 에 weight stage 타입 신설** (KVCacheStage 동형): `WeightStage`/`WeightDispatchPlan`/`LayerDirective`(precision⊥dispatch)/`WeightStageCtx`/`LayerMetricKind`/`WeightStageReg`/`WEIGHT_STAGES`/`find_weight_stage`/`registered_weight_names`/`WeightStageParams`. → 검증: `cargo build` + dyn-safe + Dummy 등록/find 단위 테스트(KVCacheStage Dummy 거울) + release fat-LTO linkme 생존(ADR-0003 §4)
+- **MW-C** — **`WeightSwapDeciderAsStage` 엔진측 어댑터** — `decide(ratio_max)` 위임, ctx borrow 로 decider 즉석 생성. `#[distributed_slice(WEIGHT_STAGES)]` 등록("swap") + `ensure_builtin_weight_stages_registered` self-test → 검증: builtin 등록 + plan() 이 `WeightSwapDecider::decide` 와 동일 selected_layers 산출
+- **MW-D** — **`WeightStageCtx` 엔진 impl**(`&TransformerModel` 위로) — budget 해소·`current_format`·`layer_metric`(QuantNoise=as_slice, Importance=SubLayer::Full 투영) → 검증: importance/noise 투영이 decider 직접 입력과 bit-identical
+- **(Phase β 의존) Seam B 배선** — `PipelineRegistry` 구현 + decode loop → `WeightSwapStage`(OneShot) on_phase → `execute_weight_plan`(IncrementalSwapPlan/SwapExecutor). **AB-6 + Phase β 선행, 본 crate 단계 밖.**
 
 ### 위임 prompt (선택)
 
