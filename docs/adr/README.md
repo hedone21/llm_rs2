@@ -37,3 +37,4 @@ ADR 는 다음 결정 유형에서 작성 의무:
 | [ADR-0003](0003-extension-mechanism-static-crates.md) | 확장 메커니즘 — 정적 링크 technique crate + 자동 등록, 런타임 `.so` 보류 | Accepted | 2026-06-05 |
 | [ADR-0004](0004-kvcachestage-plan-returning-trait.md) | `KVCacheStage` — 단일 plan-returning trait (per-head keep + 가중 merge 통합) | Accepted | 2026-06-05 |
 | [ADR-0005](0005-format-backend-capability-plugin-unification.md) | Format · Backend Capability 확장 — plugin 패턴 통일 (descriptor + backend-owned kernel + 3축 평행 registry, crate→`.so` phasing) | Accepted | 2026-06-06 |
+| [ADR-0006](0006-weight-stage-plan-returning-unification.md) | weight 축 stage 통일 — plan-returning `WeightStage` (KVCacheStage 형제; 결정 ⊥ 변형(엔진 독점) ⊥ pacing 분리, precision⊥dispatch, `WEIGHT_STAGES` 평행 registry, Seam B = Phase β 의존) | Accepted | 2026-06-07 |
