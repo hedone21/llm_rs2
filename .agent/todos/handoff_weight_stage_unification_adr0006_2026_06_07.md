@@ -1,9 +1,9 @@
-# Handoff: weight 축 stage 통일 설계 확정(ADR-0006) → crate 단계 구현
+# Handoff: weight 축 stage 통일(ADR-0006) — Seam A 3/4(MW-A·B·C) 구현 완료 → MW-D
 
-**작성**: 2026-06-07
-**HEAD**: (이 커밋) `docs(adr): ADR-0006 weight 축 plan-returning WeightStage 통일`
-**브랜치**: master
-**작성자**: 메인 세션 (precision/weight plugin 통일 grill + 적대적 검증 6-agent 세션)
+**작성**: 2026-06-07 (갱신 2026-06-07, MW-A·B·C 구현 후)
+**HEAD**: `63a82510 docs(handoff): MW-C ✅ 완료(5a584e71)` (코드 HEAD = `5a584e71` MW-C)
+**브랜치**: master (미푸시)
+**작성자**: 메인 세션 (precision/weight plugin 통일 grill → MW-A·B·C 구현 + 설계 fork 3건 adjudication + senior-implementer 위임/검증)
 
 **다음 세션 진입 문장**: **"ADR-0006 MW-D — `WeightStageCtx` 엔진 impl (`&TransformerModel` 위: budget 해소·current_format·layer_metric[Importance=SubLayer::Full 투영, QuantNoise=is_computed 시만 Some]) (MW-A `e07da198`·MW-B `691064f0`·MW-C `5a584e71` ✅, Seam B 는 Phase β)"**
 
@@ -13,7 +13,9 @@
 
 ## TL;DR
 
-KV 의 plan-returning plugin 패턴(ADR-0004)을 **weight 축**(precision swap/skip/partition)에 거울 복제하는 설계를 grill 6문답 + 적대적 6-agent 검증으로 확정(→ ADR-0006 Accepted). 핵심: plugin 은 `WeightStage::plan()` 으로 **결정만**(Seam A) / 변형은 **엔진 executor 가 concrete-handle 로 독점**(Seam B, ADR-0004 D1 거울) / pacing 은 executor 소유 / **precision(format)은 dispatch-mode 와 분리**(직교). **멈춘 이유**: 설계·인터페이스 확정 완료, 코드 변경 0. 구현은 별도 세션. **단 Seam B(실동작)는 Phase β(decode loop 재작성) + AB-6 선행 — Seam A 만으론 weight swap 미동작.**
+ADR-0006(weight 축 plan-returning `WeightStage`, KVCacheStage 거울)의 **crate 단계(Seam A)를 MW-A→MW-C 까지 구현 완료**(커밋 `e07da198`·`691064f0`·`5a584e71`). plugin 표면(`WeightStage`/`WeightStageCtx`/`WeightDispatchPlan`/`WEIGHT_STAGES`)이 technique-api 에 실재하고, 빌트인 `WeightSwapDeciderAsStage`("swap")가 그 표면을 소비해 동작(전략 C: decider 를 flat `&[f32]`+count 로 정렬 → engine-internal trait 결합 제거 → 표면 실증). **다음 = MW-D**(`WeightStageCtx` 엔진 impl) = Seam A 마지막. **멈춘 이유**: 사용자가 MW-D 를 다음 세션으로 미룸. **Seam B(실동작)는 여전히 Phase β(decode loop 재작성) + AB-6 선행 — Seam A 완료(MW-D 포함)해도 weight swap 은 production 미동작**(빌트인·ctx 는 테스트로만 검증).
+
+설계 fork 3건(전부 사용자 adjudication): (1) `importance()` 비통합 유지(ADR-0004 §9 `0d4d7644`) (2) `SliceSpec.format` plugin 표면 제외=option A(MW-A) (3) MW-C bridge=전략 C. 상세는 아래 "진행 현황".
 
 ---
 
