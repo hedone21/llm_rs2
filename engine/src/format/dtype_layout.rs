@@ -12,6 +12,7 @@
 //! 호출부(backend dispatch)가 loud-fail 한다.
 
 use crate::buffer::DType;
+use crate::buffer::opaque::OpaqueBuffer;
 use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -145,25 +146,35 @@ fn unpack_block_via_descriptor(desc: &KVLayoutDesc, block: &[u8], out: &mut [f32
 /// 출력은 row-major f32 (b 와 동일 element 순서, 총 `b.numel()` 개).
 pub fn dequant_via_descriptor(b: &Tensor) -> Result<Vec<f32>> {
     let dtype = b.dtype();
-    let desc = dtype_to_layout_desc(dtype)
+    // ADR-0007 G3: opaque 버퍼(dtype=U8)는 closed `DType` 가 못 담는 format 을 sidecar
+    // `KVLayoutDesc` 로 운반한다 → descriptor 를 우선 sidecar 에서, 없으면 dtype 에서 도출.
+    let desc = b
+        .buffer()
+        .as_any()
+        .downcast_ref::<OpaqueBuffer>()
+        .map(|op| op.descriptor())
+        .or_else(|| dtype_to_layout_desc(dtype))
         .ok_or_else(|| anyhow!("Unsupported dtype for matmul (no layout descriptor): {dtype:?}"))?;
 
     let numel = b.numel();
 
     // raw(Dense) 포맷 — 직접 변환(블록 unpack 불필요).
     if matches!(desc.packing, Packing::Dense) {
-        return Ok(match dtype {
-            DType::F32 => b.as_slice::<f32>()[..numel].to_vec(),
-            DType::F16 => b.as_slice::<f16>()[..numel]
+        return match dtype {
+            DType::F32 => Ok(b.as_slice::<f32>()[..numel].to_vec()),
+            DType::F16 => Ok(b.as_slice::<f16>()[..numel]
                 .iter()
                 .map(|x| x.to_f32())
-                .collect(),
-            DType::BF16 => b.as_slice::<half::bf16>()[..numel]
+                .collect()),
+            DType::BF16 => Ok(b.as_slice::<half::bf16>()[..numel]
                 .iter()
                 .map(|x| x.to_f32())
-                .collect(),
-            _ => unreachable!("Dense packing implies raw dtype"),
-        });
+                .collect()),
+            // opaque-Dense(raw 를 opaque 로 운반)는 floor 밖 — typed read 금지(ADR-0007 D3).
+            other => Err(anyhow!(
+                "Dense descriptor with non-raw dtype {other:?} (opaque-Dense not supported by floor)"
+            )),
+        };
     }
 
     // block-quant family — block 단위 unpack.
@@ -272,6 +283,50 @@ mod tests {
                 .bytes_for_elems(10),
             Some(20)
         );
+    }
+
+    /// ADR-0007 G3: opaque 버퍼(U8 tag + q4_0 sidecar desc)의 dequant 이 같은 바이트를
+    /// Q4_0 dtype 으로 푼 결과와 bit-identical — floor 가 sidecar descriptor 를 dtype 과
+    /// 동등하게 인식(opaque KV attention 의 read 토대).
+    #[test]
+    fn dequant_via_descriptor_recognizes_opaque_sidecar() {
+        use crate::backend::Backend;
+        use crate::backend::cpu::CpuBackend;
+        use crate::buffer::Buffer;
+        use crate::buffer::opaque::OpaqueBuffer;
+        use crate::memory::host::shared::SharedBuffer;
+        use crate::shape::Shape;
+        use std::sync::Arc;
+
+        // 임의 q4_0 블록 1개의 raw 바이트.
+        let blk = BlockQ4_0 {
+            d: f16::from_f32(-1.25),
+            qs: std::array::from_fn(|i| ((i * 13 + 1) % 256) as u8),
+        };
+        let bytes: Vec<u8> = unsafe {
+            std::slice::from_raw_parts(
+                (&blk as *const BlockQ4_0) as *const u8,
+                std::mem::size_of::<BlockQ4_0>(),
+            )
+        }
+        .to_vec();
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let shape = Shape::new(vec![QK4_0]); // numel = 32 logical elements, buffer = 18 packed bytes
+
+        // baseline: Q4_0 dtype tensor.
+        let q4_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(bytes.clone(), DType::Q4_0));
+        let q4_tensor = Tensor::new(shape.clone(), q4_buf, backend.clone());
+        let want = dequant_via_descriptor(&q4_tensor).unwrap();
+
+        // opaque: U8 tag + q4_0 sidecar desc, 같은 바이트.
+        let q4_0_desc = dtype_to_layout_desc(DType::Q4_0).unwrap();
+        let inner: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(bytes, DType::U8));
+        let opaque: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, q4_0_desc));
+        let opaque_tensor = Tensor::new(shape, opaque, backend);
+        let got = dequant_via_descriptor(&opaque_tensor).unwrap();
+
+        assert_eq!(got.len(), QK4_0);
+        assert_eq!(got, want, "opaque sidecar dequant == Q4_0 dtype dequant");
     }
 
     // ── (a) generic unpacker bit-identical vs quant.rs dequantize ──
