@@ -249,6 +249,24 @@ pub fn dequant_to_f32_tensor(b: &Tensor) -> Result<Tensor> {
 /// 현재 지원 = **PerBlockF16 + Nibble**(q4_0 canonical symmetric). 그 외 family(Byte/WithMin/
 /// Dense)는 범위 한정 `Err`(ADR-0007 D4 — format-bound encoder 가 비-canonical 정책을 코드로
 /// 공급할 때 확장). 출력은 `quant.rs::BlockQ4_0::quantize` 와 **byte-exact**(아래 테스트로 강제).
+/// `encode_via_descriptor` 의 역연산 — block-quant raw bytes(`src` = n_blocks·block_bytes)를
+/// f32(`dst` = n_blocks·block_elems)로 unpack. opaque KV merge(D2O, ADR-0008 Stage 3)의 block-level
+/// dequant 에 쓴다. `dst.len()` 은 `block_elems` 의 배수여야 한다.
+pub fn decode_via_descriptor(desc: &KVLayoutDesc, src: &[u8], dst: &mut [f32]) {
+    let block_elems = desc.block_elems as usize;
+    let block_bytes = desc
+        .block_bytes()
+        .expect("decode_via_descriptor: block-quant descriptor (Dense 불가)");
+    let n_blocks = dst.len() / block_elems;
+    for bi in 0..n_blocks {
+        unpack_block_via_descriptor(
+            desc,
+            &src[bi * block_bytes..(bi + 1) * block_bytes],
+            &mut dst[bi * block_elems..(bi + 1) * block_elems],
+        );
+    }
+}
+
 pub fn encode_via_descriptor(desc: &KVLayoutDesc, src: &[f32], dst: &mut [u8]) -> Result<()> {
     if desc.scale_layout != ScaleLayout::PerBlockF16 || desc.packing != Packing::Nibble {
         return Err(anyhow!(

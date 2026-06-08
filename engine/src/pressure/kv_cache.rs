@@ -143,7 +143,7 @@ impl KVCache {
     }
 
     /// opaque 저장의 sidecar [`KVLayoutDesc`]. `is_opaque()` 가 true 인 arm 전용(아니면 panic).
-    fn opaque_desc(&self) -> KVLayoutDesc {
+    pub(crate) fn opaque_desc(&self) -> KVLayoutDesc {
         self.k_buffer
             .buffer()
             .as_any()
@@ -154,7 +154,7 @@ impl KVCache {
 
     /// opaque (head, 단일 pos) 당 raw 바이트 = `(head_dim / block_elems) * block_bytes`.
     /// `copy_slice`/`buffer_shift` 가 U8 type_size=1 이므로 count 단위는 byte (ADR-0008 D2).
-    fn opaque_bytes_per_head(&self) -> usize {
+    pub(crate) fn opaque_bytes_per_head(&self) -> usize {
         let desc = self.opaque_desc();
         let be = desc.block_elems as usize;
         let bb = desc

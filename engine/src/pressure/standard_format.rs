@@ -521,6 +521,10 @@ pub(crate) fn apply_weighted_merges(cache: &mut KVCache, merges: &[WeightedMerge
     if merges.is_empty() {
         return;
     }
+    // opaque(.so block-quant): descriptor floor 기반 merge (ADR-0008 Stage 3). typed 경로 무변.
+    if cache.is_opaque() {
+        return apply_weighted_merges_opaque(cache, merges);
+    }
     use crate::quant::{BlockQ4_0, QK4_0};
     use half::f16;
 
@@ -673,6 +677,80 @@ fn merge_row_weighted_q4(
         }
         blocks[into_block_off + bi] = BlockQ4_0::quantize(&r);
     }
+}
+
+/// opaque(.so block-quant) 가중 병합 (ADR-0008 Stage 3) — `apply_weighted_merges` 의 opaque arm.
+///
+/// q4_0 분기(`merge_row_weighted_q4`)와 **동일 산술**이나 block dequant/encode 를 descriptor floor
+/// (`decode_via_descriptor`/`encode_via_descriptor`, G3/G4)로 수행한다 → q4_0 desc 면 byte-identical.
+/// HeadMajor byte offset = `(h*capacity + pos) * bytes_per_head`. K/V 독립 적용.
+fn apply_weighted_merges_opaque(cache: &mut KVCache, merges: &[WeightedMerge]) {
+    let kv_heads = cache.kv_heads();
+    let head_dim = cache.head_dim();
+    let capacity = cache.capacity();
+    let desc = cache.opaque_desc();
+    let bph = cache.opaque_bytes_per_head(); // bytes per (head, pos)
+
+    for m in merges {
+        if m.from.is_empty() {
+            continue;
+        }
+        let into_w = m.into_weight;
+        let from_pos: Vec<usize> = m.from.iter().map(|&(p, _)| p).collect();
+        let from_w: Vec<f32> = m.from.iter().map(|&(_, w)| w).collect();
+
+        for h in 0..kv_heads {
+            let into_off = (h * capacity + m.into) * bph;
+            let from_offs: Vec<usize> =
+                from_pos.iter().map(|&p| (h * capacity + p) * bph).collect();
+            for buf_t in [&cache.k_buffer, &cache.v_buffer] {
+                let total = buf_t.buffer().size();
+                // SAFETY: opaque 버퍼 total 바이트 유효(self 수명 Arc 보유). into/from sub-slice 는
+                // evicted∉retained 라 non-overlapping(merge_row_weighted_q4 동일 불변식). interior-mut.
+                let all: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(buf_t.buffer().as_mut_ptr(), total) };
+                merge_row_weighted_opaque(
+                    all, &desc, into_off, &from_offs, &from_w, into_w, head_dim, bph,
+                );
+            }
+        }
+    }
+}
+
+/// opaque 한 head row 가중 병합: into/from head 를 descriptor floor 로 f32 unpack → `into_w·into +
+/// Σ from_w·from` → `encode_via_descriptor` 로 into 에 재인코딩. q4_0 desc 면 `merge_row_weighted_q4`
+/// 와 byte-identical(G3 dequant + G4 encode).
+#[allow(clippy::too_many_arguments)]
+fn merge_row_weighted_opaque(
+    buf: &mut [u8],
+    desc: &technique_api::KVLayoutDesc,
+    into_off: usize,
+    from_offs: &[usize],
+    from_w: &[f32],
+    into_w: f32,
+    head_dim: usize,
+    bph: usize,
+) {
+    use crate::format::{decode_via_descriptor, encode_via_descriptor};
+    let mut into_f = vec![0.0f32; head_dim];
+    decode_via_descriptor(desc, &buf[into_off..into_off + bph], &mut into_f);
+    let from_f: Vec<Vec<f32>> = from_offs
+        .iter()
+        .map(|&fo| {
+            let mut f = vec![0.0f32; head_dim];
+            decode_via_descriptor(desc, &buf[fo..fo + bph], &mut f);
+            f
+        })
+        .collect();
+    for d in 0..head_dim {
+        let mut acc = into_w * into_f[d];
+        for (idx, ff) in from_f.iter().enumerate() {
+            acc += from_w[idx] * ff[d];
+        }
+        into_f[d] = acc;
+    }
+    encode_via_descriptor(desc, &into_f, &mut buf[into_off..into_off + bph])
+        .expect("opaque D2O merge re-encode (q4_0 family descriptor)");
 }
 
 /// prefill multi-token causal attention (C-1, §9.1-BC1 / ①-b).
@@ -1344,6 +1422,119 @@ mod tests {
             out_ref.as_slice::<f32>(),
             "opaque KVCache prune_prefix(+shrink) attention != q4_0 round-trip baseline"
         );
+    }
+
+    /// ADR-0008 Stage 3 GATE: opaque `apply_weighted_merges`(D2O descriptor-generic merge)가 동일
+    /// 데이터의 q4_0 round-trip(dequant→weighted sum→requantize→dequant) 과 **bit-identical**.
+    /// into=0 ← from=[(1,0.3),(2,0.2)], into_w=0.5. K/V 독립 검증. (구 merge_row_weighted_q4 와 동형.)
+    #[test]
+    fn opaque_kvcache_weighted_merge_bit_identical_to_q4_0_roundtrip() {
+        use crate::buffer::Buffer;
+        use crate::buffer::opaque::OpaqueBuffer;
+        use crate::format::dequant_to_f32_tensor;
+        use crate::kv_cache_ops::KVLayout;
+        use crate::memory::Memory;
+        use crate::memory::galloc::Galloc;
+        use crate::quant::{BlockQ4_0, QK4_0};
+        use technique_api::{KVLayoutDesc, Packing, ScaleLayout, WeightedMerge};
+
+        let kv_heads = 2usize;
+        let head_dim = 64usize;
+        let n_tokens = 3usize;
+        let cap = 8usize;
+        let desc = KVLayoutDesc {
+            block_elems: 32,
+            bits: 4,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Nibble,
+        };
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+
+        let gen_val =
+            |t: usize, h: usize, d: usize, salt: f32| -> f32 {
+                (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
+            };
+        let mk_tokens = |salt: f32| -> Vec<Vec<f32>> {
+            (0..n_tokens)
+                .map(|t| {
+                    let mut tok = vec![0.0f32; kv_heads * head_dim];
+                    for h in 0..kv_heads {
+                        for d in 0..head_dim {
+                            tok[h * head_dim + d] = gen_val(t, h, d, salt);
+                        }
+                    }
+                    tok
+                })
+                .collect()
+        };
+        let k_tokens = mk_tokens(0.0);
+        let v_tokens = mk_tokens(0.5);
+
+        let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let nbytes = desc.bytes_for_elems(kv_heads * cap * head_dim).unwrap();
+        let shape = Shape::new(vec![1, kv_heads, cap, head_dim]);
+        let mk_buf = || {
+            let inner = mem.alloc_kv(nbytes, DType::U8).unwrap();
+            let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
+            Tensor::new(shape.clone(), op, backend.clone())
+        };
+        let mut cache =
+            KVCache::new_dynamic(mk_buf(), mk_buf(), cap, cap, kv_heads, head_dim, mem.clone())
+                .with_layout(KVLayout::HeadMajor);
+        for t in 0..n_tokens {
+            let kt = f32_tensor(vec![1, 1, kv_heads, head_dim], &k_tokens[t]);
+            let vt = f32_tensor(vec![1, 1, kv_heads, head_dim], &v_tokens[t]);
+            cache.update(&kt, &vt).unwrap();
+        }
+        let merge = WeightedMerge {
+            into: 0,
+            into_weight: 0.5,
+            from: vec![(1, 0.3), (2, 0.2)],
+        };
+        apply_weighted_merges(&mut cache, std::slice::from_ref(&merge));
+
+        let k_deq = dequant_to_f32_tensor(&cache.k_buffer).unwrap();
+        let v_deq = dequant_to_f32_tensor(&cache.v_buffer).unwrap();
+        let k_out = k_deq.as_slice::<f32>();
+        let v_out = v_deq.as_slice::<f32>();
+
+        // q4_0 round-trip(quantize→dequantize) of a single block.
+        let rt = |blk: &[f32]| -> [f32; QK4_0] {
+            let mut a = [0.0f32; QK4_0];
+            a.copy_from_slice(blk);
+            let mut o = [0.0f32; QK4_0];
+            BlockQ4_0::quantize(&a).dequantize(&mut o);
+            o
+        };
+        let check = |tokens: &[Vec<f32>], out: &[f32], label: &str| {
+            for h in 0..kv_heads {
+                for blk in 0..(head_dim / QK4_0) {
+                    let lo = h * head_dim + blk * QK4_0;
+                    let rt0 = rt(&tokens[0][lo..lo + QK4_0]);
+                    let rt1 = rt(&tokens[1][lo..lo + QK4_0]);
+                    let rt2 = rt(&tokens[2][lo..lo + QK4_0]);
+                    // into(pos0): 0.5·rt0 + 0.3·rt1 + 0.2·rt2 → requantize → dequant.
+                    let mut merged = [0.0f32; QK4_0];
+                    for i in 0..QK4_0 {
+                        merged[i] = 0.5 * rt0[i] + 0.3 * rt1[i] + 0.2 * rt2[i];
+                    }
+                    let stored0 = rt(&merged);
+                    let base0 = (h * cap) * head_dim + blk * QK4_0;
+                    assert_eq!(
+                        &out[base0..base0 + QK4_0],
+                        &stored0,
+                        "{label} into pos0 head{h} blk{blk}"
+                    );
+                    // from(pos1,2): 불변(roundtrip).
+                    let base1 = (h * cap + 1) * head_dim + blk * QK4_0;
+                    assert_eq!(&out[base1..base1 + QK4_0], &rt1, "{label} pos1 head{h} blk{blk}");
+                    let base2 = (h * cap + 2) * head_dim + blk * QK4_0;
+                    assert_eq!(&out[base2..base2 + QK4_0], &rt2, "{label} pos2 head{h} blk{blk}");
+                }
+            }
+        };
+        check(&k_tokens, k_out, "K");
+        check(&v_tokens, v_out, "V");
     }
 
     #[test]
