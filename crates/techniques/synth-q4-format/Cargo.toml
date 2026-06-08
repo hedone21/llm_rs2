@@ -1,0 +1,11 @@
+[package]
+name = "synth-q4-format"
+version = "0.1.0"
+edition = "2024"
+
+# 합성 KV format technique crate (ADR-0007 GATE-B) — format 축 확장 기법은 `technique-api` 에만
+# 의존한다. 엔진(llm_rs2) / 다른 축(stage/hardware) crate 에 의존하지 않음 = DType variant 없이
+# 외부 crate 가 KV_FORMATS 에 format 을 더하는 가산 확장의 증거(.so 대역).
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"

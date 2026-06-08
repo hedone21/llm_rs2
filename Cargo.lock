@@ -2049,6 +2049,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "synth-q4-format"
+version = "0.1.0"
+dependencies = [
+ "linkme",
+ "technique-api",
+]
+
+[[package]]
 name = "target-triple"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
