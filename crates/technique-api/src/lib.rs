@@ -449,7 +449,7 @@ pub enum Packing {
 /// `#[repr(C)]`: 미래 `.so` C-ABI 경계를 그대로 건너는 평탄 POD(L1 게이트 — 지금 repr(C) 로
 /// 두어 `.so` 때 reshape 강제 회피).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KVLayoutDesc {
     /// 한 양자 블록의 원소 수 (q4_0/q8_0 = 32). raw(f32/f16) 포맷은 1.
     pub block_elems: u32,
@@ -459,6 +459,45 @@ pub struct KVLayoutDesc {
     pub scale_layout: ScaleLayout,
     /// 비트 패킹 방식.
     pub packing: Packing,
+}
+
+impl KVLayoutDesc {
+    /// block-quant 한 블록의 raw 바이트 (scale + packed quants). raw(`Dense`)는 블록 개념이
+    /// 없어 `None` (원소-단위 회계는 [`Self::bytes_for_elems`]).
+    ///
+    /// ADR-0007 D2: byte-회계 단일 진실원천 — engine `dequant_via_descriptor` 의 인라인 공식
+    /// (구 `dtype_layout.rs`)과 `OpaqueBuffer` alloc 이 이 메서드를 공유한다.
+    pub fn block_bytes(&self) -> Option<usize> {
+        let quant_bytes = match self.packing {
+            Packing::Dense => return None,
+            Packing::Nibble => self.block_elems as usize / 2,
+            Packing::Byte => self.block_elems as usize,
+        };
+        let scale_bytes = match self.scale_layout {
+            ScaleLayout::None => 0,
+            ScaleLayout::PerBlockF16 => 2,
+            ScaleLayout::PerBlockF16WithMin => 4,
+        };
+        Some(scale_bytes + quant_bytes)
+    }
+
+    /// `numel` 원소를 이 layout 으로 저장하는 총 바이트.
+    ///
+    /// raw(`Dense`) = `numel * (bits/8)` (f32=4, f16/bf16=2), block-quant =
+    /// `(numel / block_elems) * block_bytes`. block-quant 에서 `numel` 이 `block_elems`
+    /// 배수가 아니면 `None`(부분 블록 불가).
+    pub fn bytes_for_elems(&self, numel: usize) -> Option<usize> {
+        match self.block_bytes() {
+            None => Some(numel * (self.bits as usize / 8)),
+            Some(block_bytes) => {
+                let be = self.block_elems as usize;
+                if be == 0 || !numel.is_multiple_of(be) {
+                    return None;
+                }
+                Some((numel / be) * block_bytes)
+            }
+        }
+    }
 }
 
 /// Format 축 plugin trait — 저장 layout 을 기술한다(ADR-0005 D3).
@@ -540,6 +579,58 @@ pub fn registered_backend_capability_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0007 G1: `KVLayoutDesc` byte-회계가 engine block 구조체 크기와 일치.
+    /// engine 의존 0(technique-api 격리)이라 literal 로 검증 — engine 측에서
+    /// `size_of::<Block*>()` cross-check(dtype_layout.rs).
+    #[test]
+    fn kv_layout_desc_byte_accounting() {
+        let q4_0 = KVLayoutDesc {
+            block_elems: 32,
+            bits: 4,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Nibble,
+        };
+        assert_eq!(q4_0.block_bytes(), Some(18)); // == size_of::<BlockQ4_0>()
+        assert_eq!(q4_0.bytes_for_elems(32), Some(18));
+        assert_eq!(q4_0.bytes_for_elems(64), Some(36));
+        assert_eq!(q4_0.bytes_for_elems(31), None); // 부분 블록 불가
+
+        let q4_1 = KVLayoutDesc {
+            block_elems: 32,
+            bits: 4,
+            scale_layout: ScaleLayout::PerBlockF16WithMin,
+            packing: Packing::Nibble,
+        };
+        assert_eq!(q4_1.block_bytes(), Some(20)); // == size_of::<BlockQ4_1>()
+        assert_eq!(q4_1.bytes_for_elems(32), Some(20));
+
+        let q8_0 = KVLayoutDesc {
+            block_elems: 32,
+            bits: 8,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Byte,
+        };
+        assert_eq!(q8_0.block_bytes(), Some(34)); // == size_of::<BlockQ8_0>()
+        assert_eq!(q8_0.bytes_for_elems(32), Some(34));
+
+        // raw(Dense): 블록 개념 없음, 원소당 bits/8.
+        let f32 = KVLayoutDesc {
+            block_elems: 1,
+            bits: 32,
+            scale_layout: ScaleLayout::None,
+            packing: Packing::Dense,
+        };
+        assert_eq!(f32.block_bytes(), None);
+        assert_eq!(f32.bytes_for_elems(10), Some(40));
+        let f16 = KVLayoutDesc {
+            block_elems: 1,
+            bits: 16,
+            scale_layout: ScaleLayout::None,
+            packing: Packing::Dense,
+        };
+        assert_eq!(f16.bytes_for_elems(10), Some(20));
+    }
 
     /// 등록·조회 round-trip 검증용 no-op 기법.
     struct Dummy;

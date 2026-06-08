@@ -175,18 +175,11 @@ pub fn dequant_via_descriptor(b: &Tensor) -> Result<Vec<f32>> {
     }
     let n_blocks = numel / block_elems;
 
-    // 블록 raw 바이트 크기: scale(2) + min(2?) + quants.
-    let quant_bytes = match desc.packing {
-        Packing::Nibble => block_elems / 2,
-        Packing::Byte => block_elems,
-        Packing::Dense => unreachable!(),
-    };
-    let scale_bytes = match desc.scale_layout {
-        ScaleLayout::PerBlockF16 => 2,
-        ScaleLayout::PerBlockF16WithMin => 4,
-        ScaleLayout::None => 0,
-    };
-    let block_bytes = scale_bytes + quant_bytes;
+    // 블록 raw 바이트 크기: scale + quants. ADR-0007 G1 단일원천 — Dense 는 위에서 이미
+    // 처리·반환됐으므로 여기선 block-quant 라 항상 Some.
+    let block_bytes = desc
+        .block_bytes()
+        .expect("block-quant family has block_bytes (Dense returned above)");
 
     // b 의 raw 바이트(packed block 연속).
     let raw = b.as_slice::<u8>();
@@ -240,6 +233,46 @@ pub fn dequant_to_f32_tensor(b: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::*;
     use crate::quant::{BlockQ4_0, BlockQ8_0, QK4_0, QK8_0};
+
+    // ── (a0) ADR-0007 G1: KVLayoutDesc byte-회계 == engine block 구조체 크기 ──
+
+    /// `bytes_for_elems(block_elems)` 가 `size_of::<Block*>()` 와 일치 — technique-api
+    /// literal 검증(lib.rs)의 engine 측 cross-check(단일원천 drift 가드).
+    #[test]
+    fn bytes_for_elems_matches_block_struct_size() {
+        use crate::quant::{BlockQ4_1, QK4_1};
+        assert_eq!(
+            dtype_to_layout_desc(DType::Q4_0)
+                .unwrap()
+                .bytes_for_elems(QK4_0),
+            Some(std::mem::size_of::<BlockQ4_0>())
+        );
+        assert_eq!(
+            dtype_to_layout_desc(DType::Q4_1)
+                .unwrap()
+                .bytes_for_elems(QK4_1),
+            Some(std::mem::size_of::<BlockQ4_1>())
+        );
+        assert_eq!(
+            dtype_to_layout_desc(DType::Q8_0)
+                .unwrap()
+                .bytes_for_elems(QK8_0),
+            Some(std::mem::size_of::<BlockQ8_0>())
+        );
+        // raw: F32 = numel*4, F16 = numel*2.
+        assert_eq!(
+            dtype_to_layout_desc(DType::F32)
+                .unwrap()
+                .bytes_for_elems(10),
+            Some(40)
+        );
+        assert_eq!(
+            dtype_to_layout_desc(DType::F16)
+                .unwrap()
+                .bytes_for_elems(10),
+            Some(20)
+        );
+    }
 
     // ── (a) generic unpacker bit-identical vs quant.rs dequantize ──
 
