@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::format::{AttnDims, KVCacheFormat};
+use crate::format::{AttnDims, KVCacheFormat, dequant_to_f32_tensor};
 use crate::memory::host::shared::SharedBuffer;
 use crate::pressure::kv_cache::KVCache;
 use crate::shape::Shape;
@@ -260,6 +260,12 @@ impl StandardFormat {
         // `kv_dtype != F32` 분기 흡수.) `KVCache::update` 는 cast 를 하지 않고 입력이 이미 cache dtype
         // 임을 전제하므로, scatter fast-path 에 안 잡힌 비-F32 write 는 반드시 여기서 cast 해야 한다
         // (Q4_0 은 GPU 에서도 fast-path 부재라 이 경로). dtype 미일치 silent garbage 방지.
+        // opaque(.so block-quant): cast 없이 F32 입력을 KVCache::update(=encode+scatter)로 직접 전달
+        // (ADR-0008 D1/D4). kv_dtype=U8 ≠ F32 라 아래 cast 분기로 새지 않도록 여기서 가로챈다.
+        if guard.cache.is_opaque() {
+            return guard.cache.update(new_k, new_v);
+        }
+
         if kv_dtype != DType::F32 {
             let memory = guard.cache.memory().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -362,6 +368,52 @@ impl KVCacheFormat for StandardFormat {
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
         let cache_seq_len = cache.current_pos();
+
+        // opaque(.so block-quant) read = 데이터-구동 floor: descriptor 로 f32 unpack(G3) 후 기존 F32
+        // attention 재사용 (ADR-0008 D4, ADR-0005 D5 generic floor). typed 경로는 아래 무변.
+        if cache.is_opaque() {
+            let k_f32 = dequant_to_f32_tensor(&cache.k_buffer)?;
+            let v_f32 = dequant_to_f32_tensor(&cache.v_buffer)?;
+            if seq_len > 1 {
+                let kv_capacity = cache.capacity();
+                let kv_layout = cache.layout();
+                let batch_size = q.shape().dims()[0];
+                let q_start_pos = cache_seq_len - seq_len;
+                let _ = scores; // prefill 은 score 누적 안 함(typed prefill 동일).
+                return prefill_attention(
+                    q,
+                    out,
+                    &k_f32,
+                    &v_f32,
+                    dims.n_heads_q,
+                    n_heads_kv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    kv_capacity,
+                    batch_size,
+                    kv_layout,
+                    q_start_pos,
+                    dims.window,
+                    backend,
+                );
+            }
+            let effective = match dims.window {
+                Some(w) => cache_seq_len.min(w),
+                None => cache_seq_len,
+            };
+            return backend.attention_gen(
+                q,
+                &k_f32,
+                &v_f32,
+                out,
+                dims.n_heads_q,
+                n_heads_kv,
+                head_dim,
+                effective,
+                scores,
+            );
+        }
 
         // ── prefill (seq_len>1): multi-token causal attention (C-1, §9.1-BC1 / ①-b) ──
         // decode delegate(attention_gen / attention_q4_gpu_fallback)는 single-query +
@@ -954,6 +1006,211 @@ mod tests {
         let v = f16_tensor(vec![1, max_seq, kv_heads, head_dim], &vec![0.0f32; total]);
         let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
         KVCache::new_dynamic(k, v, max_seq, max_seq, kv_heads, head_dim, mem)
+    }
+
+    /// ADR-0008 GATE (Stage 1, GATE-B retarget): `DType` 없는 opaque format(synth_q4 layout)이
+    /// **production `KVCache`(흡수, D1) + `StandardFormat`** 경로로 write(encode+scatter, grow 포함)+
+    /// attention(dequant floor → F32 attention)을 수행한 결과가, 동일 데이터의 q4_0 round-trip
+    /// (quantize→dequantize) HeadMajor F32 baseline 과 **bit-identical**. `initial_cap < n_tokens`
+    /// 로 opaque grow arm(D2)도 함께 검증한다. (구 `OpaqueKvFormat` 테스트를 KVCache 경로로 이전.)
+    #[test]
+    fn opaque_kvcache_via_standard_format_bit_identical_to_q4_0_roundtrip() {
+        use crate::buffer::Buffer;
+        use crate::buffer::opaque::OpaqueBuffer;
+        use crate::kv_cache_ops::KVLayout;
+        use crate::memory::Memory;
+        use crate::memory::galloc::Galloc;
+        use crate::quant::{BlockQ4_0, QK4_0};
+        use technique_api::{KVLayoutDesc, Packing, ScaleLayout};
+
+        let kv_heads = 2usize;
+        let head_dim = 64usize; // 2 blocks/head (block_elems=32)
+        let n_heads_q = 2usize; // GQA ratio 1
+        let n_tokens = 5usize;
+        let initial_cap = 2usize; // < n_tokens → opaque grow 발동 (D2 arm 검증)
+        let max_seq = 64usize;
+        let desc = KVLayoutDesc {
+            block_elems: 32,
+            bits: 4,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Nibble,
+        };
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+
+        let gen_val =
+            |t: usize, h: usize, d: usize, salt: f32| -> f32 {
+                (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
+            };
+        let mut k_tokens: Vec<Vec<f32>> = Vec::new();
+        let mut v_tokens: Vec<Vec<f32>> = Vec::new();
+        for t in 0..n_tokens {
+            let mut k = vec![0.0f32; kv_heads * head_dim];
+            let mut v = vec![0.0f32; kv_heads * head_dim];
+            for h in 0..kv_heads {
+                for d in 0..head_dim {
+                    k[h * head_dim + d] = gen_val(t, h, d, 0.0);
+                    v[h * head_dim + d] = gen_val(t, h, d, 0.5);
+                }
+            }
+            k_tokens.push(k);
+            v_tokens.push(v);
+        }
+
+        // ── opaque KVCache (HeadMajor, synth_q4 desc) via StandardFormat; initial_cap<n_tokens → grow ──
+        let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let n0 = kv_heads * initial_cap * head_dim;
+        let nbytes = desc.bytes_for_elems(n0).unwrap();
+        let shape = Shape::new(vec![1, kv_heads, initial_cap, head_dim]);
+        let mk = || -> Tensor {
+            let inner = mem.alloc_kv(nbytes, DType::U8).unwrap();
+            let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
+            Tensor::new(shape.clone(), op, backend.clone())
+        };
+        let cache =
+            KVCache::new_dynamic(mk(), mk(), initial_cap, max_seq, kv_heads, head_dim, mem.clone())
+                .with_layout(KVLayout::HeadMajor);
+        let fmt = StandardFormat::new(0, cache);
+        for t in 0..n_tokens {
+            let kt = f32_tensor(vec![1, 1, kv_heads, head_dim], &k_tokens[t]);
+            let vt = f32_tensor(vec![1, 1, kv_heads, head_dim], &v_tokens[t]);
+            fmt.write_kv(&kt, &vt, backend.as_ref()).unwrap();
+        }
+        assert_eq!(fmt.current_pos(), n_tokens);
+        assert!(fmt.capacity() >= n_tokens, "grow 가 capacity 를 늘렸어야 함");
+
+        let q_data: Vec<f32> = (0..n_heads_q * head_dim)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.07)
+            .collect();
+        let q = f32_tensor(vec![1, 1, n_heads_q, head_dim], &q_data);
+        let mut out_opaque =
+            f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; n_heads_q * head_dim]);
+        fmt.attention_into(
+            &q,
+            backend.as_ref(),
+            &mut out_opaque,
+            AttnDims {
+                n_heads_q,
+                window: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        // ── reference: q4_0 round-trip(quantize→dequantize) HeadMajor F32 + attention_gen ──
+        let cap = fmt.capacity(); // grow 후 실제 capacity (HeadMajor stride)
+        let mut ref_k = vec![0.0f32; kv_heads * cap * head_dim];
+        let mut ref_v = vec![0.0f32; kv_heads * cap * head_dim];
+        for (t, (kt, vt)) in k_tokens.iter().zip(v_tokens.iter()).enumerate() {
+            for h in 0..kv_heads {
+                for blk in 0..(head_dim / QK4_0) {
+                    let lo = h * head_dim + blk * QK4_0;
+                    let mut ka = [0.0f32; QK4_0];
+                    ka.copy_from_slice(&kt[lo..lo + QK4_0]);
+                    let mut ko = [0.0f32; QK4_0];
+                    BlockQ4_0::quantize(&ka).dequantize(&mut ko);
+                    let mut va = [0.0f32; QK4_0];
+                    va.copy_from_slice(&vt[lo..lo + QK4_0]);
+                    let mut vo = [0.0f32; QK4_0];
+                    BlockQ4_0::quantize(&va).dequantize(&mut vo);
+                    let base = (h * cap + t) * head_dim + blk * QK4_0;
+                    ref_k[base..base + QK4_0].copy_from_slice(&ko);
+                    ref_v[base..base + QK4_0].copy_from_slice(&vo);
+                }
+            }
+        }
+        let ref_k_t = f32_tensor(vec![1, kv_heads, cap, head_dim], &ref_k);
+        let ref_v_t = f32_tensor(vec![1, kv_heads, cap, head_dim], &ref_v);
+        let mut out_ref =
+            f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; n_heads_q * head_dim]);
+        backend
+            .attention_gen(
+                &q,
+                &ref_k_t,
+                &ref_v_t,
+                &mut out_ref,
+                n_heads_q,
+                kv_heads,
+                head_dim,
+                n_tokens,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            out_opaque.as_slice::<f32>(),
+            out_ref.as_slice::<f32>(),
+            "opaque KVCache(StandardFormat, grow 포함) attention != q4_0 round-trip baseline"
+        );
+    }
+
+    /// ADR-0008 Stage 1: opaque KVCache prefill 경로 smoke — `write_kv_batch`(seq>1) + prefill
+    /// attention(dequant floor → `prefill_attention`)이 유한 출력 + current_pos 일치.
+    #[test]
+    fn opaque_kvcache_prefill_smoke() {
+        use crate::buffer::Buffer;
+        use crate::buffer::opaque::OpaqueBuffer;
+        use crate::kv_cache_ops::KVLayout;
+        use crate::memory::Memory;
+        use crate::memory::galloc::Galloc;
+        use technique_api::{KVLayoutDesc, Packing, ScaleLayout};
+
+        let kv_heads = 1usize;
+        let head_dim = 32usize; // 1 block/head
+        let n_heads_q = 1usize;
+        let seq = 4usize;
+        let cap = 8usize;
+        let desc = KVLayoutDesc {
+            block_elems: 32,
+            bits: 4,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Nibble,
+        };
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let nbytes = desc.bytes_for_elems(kv_heads * cap * head_dim).unwrap();
+        let shape = Shape::new(vec![1, kv_heads, cap, head_dim]);
+        let mk = || -> Tensor {
+            let inner = mem.alloc_kv(nbytes, DType::U8).unwrap();
+            let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
+            Tensor::new(shape.clone(), op, backend.clone())
+        };
+        let cache = KVCache::new_dynamic(mk(), mk(), cap, cap, kv_heads, head_dim, mem.clone())
+            .with_layout(KVLayout::HeadMajor);
+        let fmt = StandardFormat::new(0, cache);
+
+        let kb: Vec<f32> = (0..seq * kv_heads * head_dim)
+            .map(|i| (i as f32 % 5.0) - 2.0)
+            .collect();
+        let vb: Vec<f32> = (0..seq * kv_heads * head_dim)
+            .map(|i| (i as f32 % 3.0) - 1.0)
+            .collect();
+        let kt = f32_tensor(vec![1, seq, kv_heads, head_dim], &kb);
+        let vt = f32_tensor(vec![1, seq, kv_heads, head_dim], &vb);
+        fmt.write_kv_batch(&kt, &vt, backend.as_ref()).unwrap();
+        assert_eq!(fmt.current_pos(), seq);
+
+        let q = f32_tensor(
+            vec![1, seq, n_heads_q, head_dim],
+            &vec![0.3f32; seq * n_heads_q * head_dim],
+        );
+        let mut out = f32_tensor(
+            vec![1, seq, n_heads_q * head_dim],
+            &vec![0.0; seq * n_heads_q * head_dim],
+        );
+        fmt.attention_into(
+            &q,
+            backend.as_ref(),
+            &mut out,
+            AttnDims {
+                n_heads_q,
+                window: None,
+            },
+            None,
+        )
+        .unwrap();
+        for &x in out.as_slice::<f32>() {
+            assert!(x.is_finite(), "opaque prefill attention 출력은 유한해야 한다");
+        }
     }
 
     #[test]

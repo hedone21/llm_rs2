@@ -12,6 +12,10 @@ linkme = "0.3"
 # install — 미활성 시 미링크(`--eviction-policy caote` → unknown). 활성화 비용 = feature flag 1개
 # + force-link 1줄(stage_registry). technique 추가의 정본 production 배선 패턴.
 caote = { path = "../crates/techniques/caote", optional = true }
+# ADR-0008 D6: opaque .so format `synth_q4`(DType 없는 block-quant family)를 production binary 에
+# force-link(builtin_kv_formats.rs `use synth_q4_format as _;`). `--kv-format synth_q4` 가
+# `find_kv_format` 으로 등록을 찾아 opaque KVCache 로 실추론을 돈다(외부 plugin → 실추론 실증).
+synth-q4-format = { path = "../crates/techniques/synth-q4-format" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

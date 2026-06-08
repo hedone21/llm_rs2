@@ -20,6 +20,11 @@ use technique_api::{KV_FORMATS, KVFormat, KVFormatReg, KVLayoutDesc};
 use crate::buffer::DType;
 use crate::format::dtype_layout::dtype_to_layout_desc;
 
+// ADR-0008 D6 force-link: 외부 `synth-q4-format` crate(opaque .so format `synth_q4`)가
+// `KV_FORMATS` 에 등록되도록 강제 링크한다. dep 선언만으론 dead-crate elision 으로 미링크
+// (M3/G5 교훈). `--kv-format synth_q4` 가 `find_kv_format` 으로 이 등록을 찾는다.
+use synth_q4_format as _;
+
 /// Stateless descriptor-only `KVFormat` plugin (ADR-0005 D3 — plugin 은 버퍼 0, descriptor 만).
 ///
 /// 엔진의 버퍼 보유/compute 는 `StandardFormat`(`pressure/standard_format.rs`)이 계속 쥔다
@@ -106,6 +111,22 @@ pub fn ensure_builtin_kv_formats_registered() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 내장 format 이름 → 대응 `DType` (ADR-0008 D3 dispatch). 내장 4종(f32/f16/q4_0/q8_0)만 `Some`;
+/// 그 외 등록 format(.so/opaque, 예 `synth_q4`)은 `None` → opaque 저장 경로.
+///
+/// **layout 이 아니라 이름(identity)으로 가른다** — `synth_q4` 는 `q4_0` 와 동일 layout 이지만
+/// 대응 `DType` 가 없어 opaque 로 처리된다. 미래 `.so` plugin format 도 이 "name→no-DType→opaque"
+/// 경로를 친다(GATE-C).
+pub fn builtin_format_dtype(name: &str) -> Option<DType> {
+    match name {
+        "f32" => Some(DType::F32),
+        "f16" => Some(DType::F16),
+        "q4_0" => Some(DType::Q4_0),
+        "q8_0" => Some(DType::Q8_0),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

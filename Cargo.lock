@@ -1209,6 +1209,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "synth-q4-format",
  "technique-api",
  "tempfile",
  "tokenizers",

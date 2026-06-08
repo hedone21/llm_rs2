@@ -505,6 +505,11 @@ pub struct Args {
     #[arg(long, default_value = "f16")]
     pub kv_type: String,
 
+    /// KV cache format by registry name (KV_FORMATS). 설정 시 `--kv-type` 보다 우선.
+    /// 내장(f32/f16/q4_0/q8_0)은 typed 저장, 그 외 등록 format(예 `synth_q4`)은 opaque 저장(ADR-0008).
+    #[arg(long)]
+    pub kv_format: Option<String>,
+
     // ── Eviction (S-subcmd C2): policy/h2o/d2o/sink/streaming + common
     // 7 params (kv_budget, protected_prefix, memory_threshold_mb,
     // eviction_target_ratio, initial_kv_capacity, min_kv_cache,

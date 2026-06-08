@@ -16,7 +16,7 @@ pub mod dtype_layout;
 pub mod kv_cache_format;
 pub mod weight_format;
 
-pub use builtin_kv_formats::ensure_builtin_kv_formats_registered;
+pub use builtin_kv_formats::{builtin_format_dtype, ensure_builtin_kv_formats_registered};
 pub use dtype_layout::{
     dequant_to_f32_tensor, dequant_via_descriptor, dtype_to_layout_desc, encode_via_descriptor,
 };

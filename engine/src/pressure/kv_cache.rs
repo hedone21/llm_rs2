@@ -1,9 +1,12 @@
-use crate::buffer::DType;
+use crate::buffer::opaque::OpaqueBuffer;
+use crate::buffer::{Buffer, DType};
+use crate::format::encode_via_descriptor;
 use crate::memory::Memory;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 use anyhow::Result;
 use std::sync::Arc;
+use technique_api::KVLayoutDesc;
 
 // BC re-export: KVLayout, KiviRawBuffers 를 L2(kv_cache_ops)로 격상. KVCacheOps trait 은
 // 5-F 에서 폐기됨(inherent 전환 완료) — kv_cache_ops.rs 는 이제 layout/raw-buffer 타입 전용.
@@ -127,6 +130,39 @@ impl KVCache {
         self.head_dim
     }
 
+    // ── ADR-0008 D1/D2: opaque(.so block-quant) 저장 지원 (floor 패턴 — typed arm 무변) ──
+
+    /// `k_buffer` 가 [`OpaqueBuffer`](`DType` 없는 .so format 저장)면 true. true 인 호출처는
+    /// byte-회계/copy/scatter 의 descriptor-keyed opaque arm 을 탄다(typed arm 은 무변, ADR-0008 D1).
+    pub(crate) fn is_opaque(&self) -> bool {
+        self.k_buffer
+            .buffer()
+            .as_any()
+            .downcast_ref::<OpaqueBuffer>()
+            .is_some()
+    }
+
+    /// opaque 저장의 sidecar [`KVLayoutDesc`]. `is_opaque()` 가 true 인 arm 전용(아니면 panic).
+    fn opaque_desc(&self) -> KVLayoutDesc {
+        self.k_buffer
+            .buffer()
+            .as_any()
+            .downcast_ref::<OpaqueBuffer>()
+            .expect("opaque_desc() 는 opaque 저장에서만 호출 (is_opaque 가드)")
+            .descriptor()
+    }
+
+    /// opaque (head, 단일 pos) 당 raw 바이트 = `(head_dim / block_elems) * block_bytes`.
+    /// `copy_slice`/`buffer_shift` 가 U8 type_size=1 이므로 count 단위는 byte (ADR-0008 D2).
+    fn opaque_bytes_per_head(&self) -> usize {
+        let desc = self.opaque_desc();
+        let be = desc.block_elems as usize;
+        let bb = desc
+            .block_bytes()
+            .expect("opaque 는 block-quant descriptor (Dense 불가)");
+        (self.head_dim / be) * bb
+    }
+
     /// Read-only handle to the grow-on-demand allocator, if this cache is dynamic.
     ///
     /// Returns the backend-appropriate `Memory` (host `Galloc` / `OpenCLMemory` /
@@ -193,11 +229,18 @@ impl KVCache {
         let backend = self.k_buffer.backend().clone();
 
         let n_values = new_cap * self.kv_heads * self.head_dim;
-        let buf_size = match dtype {
-            crate::buffer::DType::Q4_0 => {
-                (n_values / crate::quant::QK4_0) * std::mem::size_of::<crate::quant::BlockQ4_0>()
+        let buf_size = if self.is_opaque() {
+            // opaque: descriptor-keyed raw bytes (G1 bytes_for_elems). typed arm 무변 (ADR-0008 D2).
+            self.opaque_desc()
+                .bytes_for_elems(n_values)
+                .expect("opaque KV grow: block-aligned 회계")
+        } else {
+            match dtype {
+                crate::buffer::DType::Q4_0 => {
+                    (n_values / crate::quant::QK4_0) * std::mem::size_of::<crate::quant::BlockQ4_0>()
+                }
+                _ => n_values * dtype.size(),
             }
-            _ => n_values * dtype.size(),
         };
 
         let new_shape = match self.layout {
@@ -205,16 +248,29 @@ impl KVCache {
             KVLayout::HeadMajor => Shape::new(vec![1, self.kv_heads, new_cap, self.head_dim]),
         };
 
-        // Allocate new buffers (alloc_kv for madvise-capable path)
-        let new_k_buf = memory.alloc_kv(buf_size, dtype)?;
+        // Allocate new buffers (alloc_kv for madvise-capable path). opaque 는 새 U8 버퍼를
+        // OpaqueBuffer 로 재포장해 sidecar descriptor 를 보존(미포장 시 desc 소실 → garbage, ADR-0008 D2).
+        let wrap = |buf: Arc<dyn Buffer>| -> Arc<dyn Buffer> {
+            if self.is_opaque() {
+                Arc::new(OpaqueBuffer::new(buf, self.opaque_desc()))
+            } else {
+                buf
+            }
+        };
+        let new_k_buf = wrap(memory.alloc_kv(buf_size, dtype)?);
         let mut new_k = Tensor::new(new_shape.clone(), new_k_buf, backend.clone());
-        let new_v_buf = memory.alloc_kv(buf_size, dtype)?;
+        let new_v_buf = wrap(memory.alloc_kv(buf_size, dtype)?);
         let mut new_v = Tensor::new(new_shape, new_v_buf, backend.clone());
 
         // Copy existing data
         if self.current_pos > 0 {
             match self.layout {
                 KVLayout::SeqMajor => {
+                    if self.is_opaque() {
+                        anyhow::bail!(
+                            "opaque KV grow: SeqMajor 미지원 (HeadMajor 전용, ADR-0008 D1)"
+                        );
+                    }
                     // Contiguous: all positions × heads × dim
                     let copy_count = if dtype == crate::buffer::DType::Q4_0 {
                         let blocks_per_pos = self.kv_heads * self.head_dim / crate::quant::QK4_0;
@@ -226,6 +282,26 @@ impl KVCache {
                     backend.copy_slice(&self.v_buffer, &mut new_v, 0, 0, copy_count)?;
                 }
                 KVLayout::HeadMajor => {
+                    if self.is_opaque() {
+                        // opaque per-head byte copy (U8 type_size=1, byte stride = cap*bytes_per_head).
+                        let bph = self.opaque_bytes_per_head();
+                        let old_hs = self.capacity * bph;
+                        let new_hs = new_cap * bph;
+                        let cph = self.current_pos * bph;
+                        for h in 0..self.kv_heads {
+                            backend.copy_slice(&self.k_buffer, &mut new_k, h * old_hs, h * new_hs, cph)?;
+                            backend.copy_slice(&self.v_buffer, &mut new_v, h * old_hs, h * new_hs, cph)?;
+                        }
+                        log::info!(
+                            "[KVCache] Growing capacity: {} → {} tokens (opaque)",
+                            self.capacity,
+                            new_cap
+                        );
+                        self.k_buffer = new_k;
+                        self.v_buffer = new_v;
+                        self.capacity = new_cap;
+                        return Ok(());
+                    }
                     // Per-head copy: capacity changes head_stride
                     let old_head_stride = self.capacity * self.head_dim;
                     let new_head_stride = new_cap * self.head_dim;
@@ -291,6 +367,11 @@ impl KVCache {
     /// This is the inverse of `grow()` — reallocates smaller buffers and copies data.
     /// Returns the number of bytes freed.
     pub fn shrink_to_fit(&mut self) -> Result<usize> {
+        // opaque(.so block-quant) shrink 은 Stage 2(eviction)에서 descriptor-keyed 로 구현한다.
+        // Stage 1 은 no-op(보수적 — 축소 안 함, 무회귀/무corruption, ADR-0008 D5).
+        if self.is_opaque() {
+            return Ok(0);
+        }
         let memory = match self.memory.as_ref() {
             Some(m) => m,
             None => return Ok(0),
@@ -394,6 +475,12 @@ impl KVCache {
                 return Err(anyhow::anyhow!("KV Cache overflow"));
             }
             self.grow(self.current_pos + seq_len)?;
+        }
+
+        // opaque(.so block-quant) write: cast 없이 F32 입력을 encode_via_descriptor 로 quant 후
+        // HeadMajor byte offset 에 scatter (ADR-0008 D1/D4, 구 OpaqueKvFormat::scatter_token 흡수).
+        if self.is_opaque() {
+            return self.update_opaque(new_k, new_v);
         }
 
         let backend = self.k_buffer.backend().clone();
@@ -531,6 +618,47 @@ impl KVCache {
         Ok(())
     }
 
+    /// opaque(.so block-quant) write — F32 입력 토큰들을 `encode_via_descriptor` 로 quant 후
+    /// HeadMajor block layout 의 byte offset 에 scatter (ADR-0008 D1/D4). HeadMajor 전용.
+    ///
+    /// byte offset(head h, position pos) = `h * capacity * bytes_per_head + pos * bytes_per_head`
+    /// 여기서 `bytes_per_head = (head_dim / block_elems) * block_bytes`. 입력 `new_k`/`new_v` 는
+    /// seq-major F32 `[batch, seq_len, kv_heads, head_dim]` (`StandardFormat::write_inner` 가
+    /// opaque 면 cast 없이 그대로 전달). interior-mut 는 엔진 `Buffer` 관용구(`as_mut_ptr`).
+    fn update_opaque(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
+        if self.layout != KVLayout::HeadMajor {
+            anyhow::bail!("opaque KV update: HeadMajor 전용 (ADR-0008 D1)");
+        }
+        let seq_len = new_k.shape().dims()[1];
+        let desc = self.opaque_desc();
+        let bph = self.opaque_bytes_per_head();
+        let head_stride = self.capacity * bph;
+        let row = self.kv_heads * self.head_dim; // f32 elements per token (input)
+        let base_pos = self.current_pos;
+        for (buf, src_t) in [(&self.k_buffer, new_k), (&self.v_buffer, new_v)] {
+            let src = src_t.as_slice::<f32>();
+            let total = buf.buffer().size();
+            // SAFETY: opaque 버퍼는 total 바이트 유효(self 수명 동안 Arc 보유). 각 (h,pos) sub-slice 는
+            // non-overlapping. 같은 token 의 K/V 는 서로 다른 버퍼라 aliasing 없음.
+            let all: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(buf.buffer().as_mut_ptr(), total) };
+            for s in 0..seq_len {
+                let pos = base_pos + s;
+                if pos >= self.capacity {
+                    anyhow::bail!("opaque KV update: capacity {} 초과", self.capacity);
+                }
+                for h in 0..self.kv_heads {
+                    let lo = s * row + h * self.head_dim;
+                    let off = h * head_stride + pos * bph;
+                    encode_via_descriptor(&desc, &src[lo..lo + self.head_dim], &mut all[off..off + bph])?;
+                }
+            }
+        }
+        self.current_pos += seq_len;
+        self.high_water_pos = self.high_water_pos.max(self.current_pos);
+        Ok(())
+    }
+
     pub fn get_view(&self, _seq_len: usize) -> (Tensor, Tensor) {
         (self.k_buffer.clone(), self.v_buffer.clone())
     }
@@ -624,6 +752,14 @@ impl KVCache {
 
     /// Returns the memory usage in bytes for currently stored KV data.
     pub fn memory_usage_bytes(&self) -> usize {
+        if self.is_opaque() {
+            // opaque: descriptor-keyed raw bytes (G1 bytes_for_elems, ADR-0008 D2).
+            let per_buffer = self
+                .opaque_desc()
+                .bytes_for_elems(self.current_pos * self.kv_heads * self.head_dim)
+                .unwrap_or(0);
+            return per_buffer * 2; // K + V
+        }
         let is_q4 = self.k_buffer.dtype() == crate::buffer::DType::Q4_0;
 
         let per_buffer = if is_q4 {
