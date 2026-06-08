@@ -1213,6 +1213,139 @@ mod tests {
         }
     }
 
+    /// ADR-0008 Stage 2 GATE: opaque KVCache 의 `prune_prefix`(eviction shift arm, D2) + 그로 인한
+    /// `shrink_to_fit_opaque`(release_unused_pages 경유) 후 attention 결과가, 생존 토큰의 q4_0
+    /// round-trip baseline 과 **bit-identical**. cap=128, prune 후 current_pos=4 → 64 으로 shrink 발동.
+    #[test]
+    fn opaque_kvcache_prune_prefix_bit_identical_to_q4_0_roundtrip() {
+        use crate::buffer::Buffer;
+        use crate::buffer::opaque::OpaqueBuffer;
+        use crate::kv_cache_ops::KVLayout;
+        use crate::memory::Memory;
+        use crate::memory::galloc::Galloc;
+        use crate::quant::{BlockQ4_0, QK4_0};
+        use technique_api::{KVLayoutDesc, Packing, ScaleLayout};
+
+        let kv_heads = 2usize;
+        let head_dim = 64usize;
+        let n_heads_q = 2usize;
+        let n_tokens = 6usize;
+        let prune = 2usize; // prune_prefix(2): 토큰 0,1 제거, 2..6 → 위치 0..4
+        let remaining = n_tokens - prune;
+        let cap = 128usize; // prune 후 shrink_to_fit_opaque(→64) 발동
+        let desc = KVLayoutDesc {
+            block_elems: 32,
+            bits: 4,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Nibble,
+        };
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+
+        let gen_val =
+            |t: usize, h: usize, d: usize, salt: f32| -> f32 {
+                (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
+            };
+        let mut k_tokens: Vec<Vec<f32>> = Vec::new();
+        let mut v_tokens: Vec<Vec<f32>> = Vec::new();
+        for t in 0..n_tokens {
+            let mut k = vec![0.0f32; kv_heads * head_dim];
+            let mut v = vec![0.0f32; kv_heads * head_dim];
+            for h in 0..kv_heads {
+                for d in 0..head_dim {
+                    k[h * head_dim + d] = gen_val(t, h, d, 0.0);
+                    v[h * head_dim + d] = gen_val(t, h, d, 0.5);
+                }
+            }
+            k_tokens.push(k);
+            v_tokens.push(v);
+        }
+
+        let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let nbytes = desc.bytes_for_elems(kv_heads * cap * head_dim).unwrap();
+        let shape = Shape::new(vec![1, kv_heads, cap, head_dim]);
+        let mk = || -> Tensor {
+            let inner = mem.alloc_kv(nbytes, DType::U8).unwrap();
+            let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
+            Tensor::new(shape.clone(), op, backend.clone())
+        };
+        let mut cache =
+            KVCache::new_dynamic(mk(), mk(), cap, cap, kv_heads, head_dim, mem.clone())
+                .with_layout(KVLayout::HeadMajor);
+        for t in 0..n_tokens {
+            let kt = f32_tensor(vec![1, 1, kv_heads, head_dim], &k_tokens[t]);
+            let vt = f32_tensor(vec![1, 1, kv_heads, head_dim], &v_tokens[t]);
+            cache.update(&kt, &vt).unwrap();
+        }
+        cache.prune_prefix(prune).unwrap();
+        assert_eq!(cache.current_pos(), remaining);
+        let fmt = StandardFormat::new(0, cache);
+
+        let q_data: Vec<f32> = (0..n_heads_q * head_dim)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.07)
+            .collect();
+        let q = f32_tensor(vec![1, 1, n_heads_q, head_dim], &q_data);
+        let mut out_opaque =
+            f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; n_heads_q * head_dim]);
+        fmt.attention_into(
+            &q,
+            backend.as_ref(),
+            &mut out_opaque,
+            AttnDims {
+                n_heads_q,
+                window: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        // reference: 생존 토큰 [prune..n_tokens) 의 q4_0 round-trip 을 위치 [0..remaining) 에 배치.
+        let rcap = fmt.capacity();
+        let mut ref_k = vec![0.0f32; kv_heads * rcap * head_dim];
+        let mut ref_v = vec![0.0f32; kv_heads * rcap * head_dim];
+        for p in 0..remaining {
+            let src_t = prune + p;
+            for h in 0..kv_heads {
+                for blk in 0..(head_dim / QK4_0) {
+                    let lo = h * head_dim + blk * QK4_0;
+                    let mut ka = [0.0f32; QK4_0];
+                    ka.copy_from_slice(&k_tokens[src_t][lo..lo + QK4_0]);
+                    let mut ko = [0.0f32; QK4_0];
+                    BlockQ4_0::quantize(&ka).dequantize(&mut ko);
+                    let mut va = [0.0f32; QK4_0];
+                    va.copy_from_slice(&v_tokens[src_t][lo..lo + QK4_0]);
+                    let mut vo = [0.0f32; QK4_0];
+                    BlockQ4_0::quantize(&va).dequantize(&mut vo);
+                    let base = (h * rcap + p) * head_dim + blk * QK4_0;
+                    ref_k[base..base + QK4_0].copy_from_slice(&ko);
+                    ref_v[base..base + QK4_0].copy_from_slice(&vo);
+                }
+            }
+        }
+        let ref_k_t = f32_tensor(vec![1, kv_heads, rcap, head_dim], &ref_k);
+        let ref_v_t = f32_tensor(vec![1, kv_heads, rcap, head_dim], &ref_v);
+        let mut out_ref =
+            f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; n_heads_q * head_dim]);
+        backend
+            .attention_gen(
+                &q,
+                &ref_k_t,
+                &ref_v_t,
+                &mut out_ref,
+                n_heads_q,
+                kv_heads,
+                head_dim,
+                remaining,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            out_opaque.as_slice::<f32>(),
+            out_ref.as_slice::<f32>(),
+            "opaque KVCache prune_prefix(+shrink) attention != q4_0 round-trip baseline"
+        );
+    }
+
     #[test]
     fn test_geometry_delegates_to_kvcache() {
         let cache = make_cache(8, 2, 4);

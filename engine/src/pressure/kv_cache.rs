@@ -367,10 +367,9 @@ impl KVCache {
     /// This is the inverse of `grow()` — reallocates smaller buffers and copies data.
     /// Returns the number of bytes freed.
     pub fn shrink_to_fit(&mut self) -> Result<usize> {
-        // opaque(.so block-quant) shrink 은 Stage 2(eviction)에서 descriptor-keyed 로 구현한다.
-        // Stage 1 은 no-op(보수적 — 축소 안 함, 무회귀/무corruption, ADR-0008 D5).
+        // opaque(.so block-quant) shrink: descriptor-keyed byte 회계 (ADR-0008 D2 Stage 2).
         if self.is_opaque() {
-            return Ok(0);
+            return self.shrink_to_fit_opaque();
         }
         let memory = match self.memory.as_ref() {
             Some(m) => m,
@@ -459,6 +458,59 @@ impl KVCache {
         self.capacity = new_cap;
         self.high_water_pos = self.current_pos;
 
+        Ok(freed)
+    }
+
+    /// opaque(.so block-quant) `shrink_to_fit` — grow 의 opaque arm 과 대칭(descriptor-keyed byte
+    /// 회계 + HeadMajor per-head byte copy, U8 type_size=1). HeadMajor 전용(SeqMajor 는 no-op). (D2)
+    fn shrink_to_fit_opaque(&mut self) -> Result<usize> {
+        let memory = match self.memory.as_ref() {
+            Some(m) => m.clone(),
+            None => return Ok(0),
+        };
+        if self.layout != KVLayout::HeadMajor {
+            return Ok(0); // SeqMajor opaque 미지원 — 보수적 no-op
+        }
+        let new_cap = ((self.current_pos * 3 / 2) + 63) & !63;
+        let new_cap = new_cap.max(64);
+        if new_cap >= self.capacity {
+            return Ok(0);
+        }
+        let backend = self.k_buffer.backend().clone();
+        let desc = self.opaque_desc();
+        let bph = self.opaque_bytes_per_head(); // bytes per (head, pos)
+        let n_values = new_cap * self.kv_heads * self.head_dim;
+        let buf_size = desc
+            .bytes_for_elems(n_values)
+            .expect("opaque shrink: block-aligned 회계");
+        let old_n_values = self.capacity * self.kv_heads * self.head_dim;
+        let old_buf_size = desc
+            .bytes_for_elems(old_n_values)
+            .expect("opaque shrink: block-aligned 회계");
+
+        let new_shape = Shape::new(vec![1, self.kv_heads, new_cap, self.head_dim]);
+        let mk = || -> Result<Tensor> {
+            let inner = memory.alloc_kv(buf_size, DType::U8)?;
+            let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
+            Ok(Tensor::new(new_shape.clone(), op, backend.clone()))
+        };
+        let mut new_k = mk()?;
+        let mut new_v = mk()?;
+
+        if self.current_pos > 0 {
+            let old_hs = self.capacity * bph;
+            let new_hs = new_cap * bph;
+            let cph = self.current_pos * bph;
+            for h in 0..self.kv_heads {
+                backend.copy_slice(&self.k_buffer, &mut new_k, h * old_hs, h * new_hs, cph)?;
+                backend.copy_slice(&self.v_buffer, &mut new_v, h * old_hs, h * new_hs, cph)?;
+            }
+        }
+        let freed = old_buf_size.saturating_sub(buf_size) * 2; // K + V
+        self.k_buffer = new_k;
+        self.v_buffer = new_v;
+        self.capacity = new_cap;
+        self.high_water_pos = self.current_pos;
         Ok(freed)
     }
 
@@ -693,6 +745,11 @@ impl KVCache {
 
         match self.layout {
             KVLayout::SeqMajor => {
+                if self.is_opaque() {
+                    anyhow::bail!(
+                        "opaque KV prune_prefix: SeqMajor 미지원 (HeadMajor 전용, ADR-0008 D1)"
+                    );
+                }
                 let (src_offset, move_count) = if is_q4 {
                     let bpp = self.kv_heads * self.head_dim / crate::quant::QK4_0;
                     (count * bpp, remaining * bpp)
@@ -704,6 +761,19 @@ impl KVCache {
                 backend.buffer_shift(&mut self.v_buffer, src_offset, 0, move_count)?;
             }
             KVLayout::HeadMajor => {
+                if self.is_opaque() {
+                    // opaque per-head byte shift (U8 type_size=1, ADR-0008 D2).
+                    let bph = self.opaque_bytes_per_head();
+                    let head_stride = self.capacity * bph;
+                    for h in 0..self.kv_heads {
+                        let base = h * head_stride;
+                        backend.buffer_shift(&mut self.k_buffer, base + count * bph, base, remaining * bph)?;
+                        backend.buffer_shift(&mut self.v_buffer, base + count * bph, base, remaining * bph)?;
+                    }
+                    self.current_pos = remaining;
+                    self.release_unused_pages();
+                    return Ok(());
+                }
                 // Per-head shift: each head's data is contiguous
                 if is_q4 {
                     let qk = crate::quant::QK4_0;
@@ -788,6 +858,11 @@ impl KVCache {
 
         match self.layout {
             KVLayout::SeqMajor => {
+                if self.is_opaque() {
+                    anyhow::bail!(
+                        "opaque KV shift_positions: SeqMajor 미지원 (HeadMajor 전용, ADR-0008 D1)"
+                    );
+                }
                 let (src_off, dst_off, move_count) = if is_q4 {
                     let bpp = self.kv_heads * self.head_dim / crate::quant::QK4_0;
                     (src_pos * bpp, dst_pos * bpp, count * bpp)
@@ -799,6 +874,17 @@ impl KVCache {
                 backend.buffer_shift(&mut self.v_buffer, src_off, dst_off, move_count)?;
             }
             KVLayout::HeadMajor => {
+                if self.is_opaque() {
+                    // opaque per-head byte shift (U8 type_size=1, ADR-0008 D2).
+                    let bph = self.opaque_bytes_per_head();
+                    let head_stride = self.capacity * bph;
+                    for h in 0..self.kv_heads {
+                        let base = h * head_stride;
+                        backend.buffer_shift(&mut self.k_buffer, base + src_pos * bph, base + dst_pos * bph, count * bph)?;
+                        backend.buffer_shift(&mut self.v_buffer, base + src_pos * bph, base + dst_pos * bph, count * bph)?;
+                    }
+                    return Ok(());
+                }
                 if is_q4 {
                     let qk = crate::quant::QK4_0;
                     let head_stride = self.capacity * self.head_dim / qk;
@@ -870,6 +956,16 @@ impl KVCache {
 
         let backend = self.k_buffer.backend().clone();
         let is_q4 = self.k_buffer.dtype() == crate::buffer::DType::Q4_0;
+
+        if self.is_opaque() {
+            // opaque per-head byte shift (U8 type_size=1, ADR-0008 D2).
+            let bph = self.opaque_bytes_per_head();
+            let head_stride = self.capacity * bph;
+            let base = head * head_stride;
+            backend.buffer_shift(&mut self.k_buffer, base + src_pos * bph, base + dst_pos * bph, count * bph)?;
+            backend.buffer_shift(&mut self.v_buffer, base + src_pos * bph, base + dst_pos * bph, count * bph)?;
+            return Ok(());
+        }
 
         if is_q4 {
             let qk = crate::quant::QK4_0;
