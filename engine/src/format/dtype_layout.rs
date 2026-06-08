@@ -240,6 +240,73 @@ pub fn dequant_to_f32_tensor(b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// descriptor-구동 block-quant encoder (ADR-0007 G4, [`unpack_block_via_descriptor`] 의 역).
+///
+/// `src`(row-major f32, len = `n_blocks * block_elems`)를 canonical block layout 으로 양자화해
+/// `dst`(len ≥ `n_blocks * block_bytes`)에 packed bytes 로 쓴다. **batch** 시그니처(ADR-0007 D4 —
+/// 향후 `.so` vtable indirect call 빈도를 block 단위로 낮춤, panic-free Result).
+///
+/// 현재 지원 = **PerBlockF16 + Nibble**(q4_0 canonical symmetric). 그 외 family(Byte/WithMin/
+/// Dense)는 범위 한정 `Err`(ADR-0007 D4 — format-bound encoder 가 비-canonical 정책을 코드로
+/// 공급할 때 확장). 출력은 `quant.rs::BlockQ4_0::quantize` 와 **byte-exact**(아래 테스트로 강제).
+pub fn encode_via_descriptor(desc: &KVLayoutDesc, src: &[f32], dst: &mut [u8]) -> Result<()> {
+    if desc.scale_layout != ScaleLayout::PerBlockF16 || desc.packing != Packing::Nibble {
+        return Err(anyhow!(
+            "encode_via_descriptor: PerBlockF16/Nibble(q4_0 canonical)만 지원, got {:?}/{:?} (ADR-0007 D4)",
+            desc.scale_layout,
+            desc.packing
+        ));
+    }
+    let block_elems = desc.block_elems as usize;
+    let block_bytes = desc.block_bytes().expect("Nibble packing has block_bytes");
+    if block_elems == 0 || !src.len().is_multiple_of(block_elems) {
+        return Err(anyhow!(
+            "encode_via_descriptor: src len {} not a multiple of block_elems {block_elems}",
+            src.len()
+        ));
+    }
+    let n_blocks = src.len() / block_elems;
+    if dst.len() < n_blocks * block_bytes {
+        return Err(anyhow!(
+            "encode_via_descriptor: dst {} < {} ({} blocks × {} bytes)",
+            dst.len(),
+            n_blocks * block_bytes,
+            n_blocks,
+            block_bytes
+        ));
+    }
+    for bi in 0..n_blocks {
+        encode_block_perblockf16_nibble(
+            desc.bits as u32,
+            block_elems,
+            &src[bi * block_elems..(bi + 1) * block_elems],
+            &mut dst[bi * block_bytes..(bi + 1) * block_bytes],
+        );
+    }
+    Ok(())
+}
+
+/// q4_0-style symmetric 단일 블록 encode(PerBlockF16 + Nibble). `quant.rs::BlockQ4_0::quantize`
+/// 의 descriptor-generic 미러(byte-exact): `d = max|x| / qmax`, `round().clamp(qmin, qmax)`,
+/// zero-point `2^(bits-1)`. `dst` = `[f16 scale][n/2 packed nibbles]`(low→i, high→i+n/2).
+fn encode_block_perblockf16_nibble(bits: u32, n: usize, src: &[f32], dst: &mut [u8]) {
+    let qmax = ((1i32 << (bits - 1)) - 1) as f32; // bits=4 → 7
+    let qmin = -((1i32 << (bits - 1)) as f32); // bits=4 → -8
+    let zp = 1i32 << (bits - 1); // bits=4 → 8
+    let half = n / 2;
+
+    let max_abs = src.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let d = max_abs / qmax;
+    let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+
+    dst[0..2].copy_from_slice(&f16::from_f32(d).to_le_bytes());
+    for i in 0..half {
+        let v0 = (src[i] * id).round().clamp(qmin, qmax) as i32;
+        let v1 = (src[i + half] * id).round().clamp(qmin, qmax) as i32;
+        dst[2 + i] = ((v0 + zp) as u8) | (((v1 + zp) as u8) << 4);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +394,52 @@ mod tests {
 
         assert_eq!(got.len(), QK4_0);
         assert_eq!(got, want, "opaque sidecar dequant == Q4_0 dtype dequant");
+    }
+
+    /// ADR-0007 G4: encode_via_descriptor(q4_0) 가 BlockQ4_0::quantize 와 **byte-exact**.
+    /// write 거울 게이트 — read 쪽 test_generic_unpack_q4_0_bit_identical 의 짝.
+    #[test]
+    fn encode_via_descriptor_q4_0_byte_exact_vs_blockq4_0_quantize() {
+        let desc = dtype_to_layout_desc(DType::Q4_0).unwrap();
+        let block_bytes = desc.block_bytes().unwrap(); // 18
+
+        // 0 / 양·음 혼합 / 경계값 / 미세값 블록들.
+        let cases: Vec<[f32; QK4_0]> = vec![
+            [0.0; QK4_0],
+            std::array::from_fn(|i| (i as f32 - 16.0) * 0.1),
+            std::array::from_fn(|i| ((i * 37 % 23) as f32 - 11.0) * 0.37),
+            std::array::from_fn(|i| if i % 2 == 0 { 3.14 } else { -2.71 }),
+            std::array::from_fn(|i| (i as f32) * 1.0e-4),
+        ];
+        let mut src = Vec::<f32>::new();
+        for c in &cases {
+            src.extend_from_slice(c);
+        }
+        let mut dst = vec![0u8; cases.len() * block_bytes];
+        encode_via_descriptor(&desc, &src, &mut dst).unwrap();
+
+        for (bi, c) in cases.iter().enumerate() {
+            let blk = BlockQ4_0::quantize(c);
+            let want: &[u8] = unsafe {
+                std::slice::from_raw_parts((&blk as *const BlockQ4_0) as *const u8, block_bytes)
+            };
+            let got = &dst[bi * block_bytes..(bi + 1) * block_bytes];
+            assert_eq!(
+                got, want,
+                "block {bi}: encode_via_descriptor != BlockQ4_0::quantize"
+            );
+        }
+
+        // round-trip: encode → unpack == dequantize(quantize) (byte-exact 가 함의하나 명시 검증).
+        let mut roundtrip = vec![0.0f32; QK4_0];
+        unpack_block_via_descriptor(&desc, &dst[..block_bytes], &mut roundtrip);
+        let mut want_rt = [0.0f32; QK4_0];
+        BlockQ4_0::quantize(&cases[0]).dequantize(&mut want_rt);
+        assert_eq!(roundtrip.as_slice(), want_rt.as_slice());
+
+        // 비-canonical family 는 범위 한정 Err.
+        let q4_1 = dtype_to_layout_desc(DType::Q4_1).unwrap();
+        assert!(encode_via_descriptor(&q4_1, &src[..QK4_0], &mut dst[..20]).is_err());
     }
 
     // ── (a) generic unpacker bit-identical vs quant.rs dequantize ──

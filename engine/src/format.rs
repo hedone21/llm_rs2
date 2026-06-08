@@ -17,6 +17,8 @@ pub mod kv_cache_format;
 pub mod weight_format;
 
 pub use builtin_kv_formats::ensure_builtin_kv_formats_registered;
-pub use dtype_layout::{dequant_to_f32_tensor, dequant_via_descriptor, dtype_to_layout_desc};
+pub use dtype_layout::{
+    dequant_to_f32_tensor, dequant_via_descriptor, dtype_to_layout_desc, encode_via_descriptor,
+};
 pub use kv_cache_format::{AttnDims, KVCacheFormat, Merge};
 pub use weight_format::{LayerDispatch, PartitionShare, WeightFormat};
