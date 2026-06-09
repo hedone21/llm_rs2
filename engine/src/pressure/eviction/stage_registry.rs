@@ -16,12 +16,12 @@ use anyhow::{Context, Result};
 use core::ffi::c_void;
 use linkme::distributed_slice;
 use std::ffi::CStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 use technique_api::{
     KV_CACHE_STAGES, KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage,
-    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCtx, StageCtxAbi, StageParams,
-    TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
+    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi,
+    StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
 };
 
 use super::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy, StreamingLLMPolicy};
@@ -413,51 +413,52 @@ unsafe impl Sync for RuntimeStageReg {}
 /// 동적 등록 레지스트리 — init 시 append, construction 시 read. 정적 슬라이스와 **병합하지 않는다**(D3).
 static DYN_REGISTRY: OnceLock<RwLock<Vec<RuntimeStageReg>>> = OnceLock::new();
 
-/// `--load-plugin` 으로 지정된 `.so` 들을 dlopen 해 [`DYN_REGISTRY`] 에 등록한다(ADR-0009 D6).
+/// 이미 dlopen 된 `.so`(Arc) 에서 stage capability 를 [`DYN_REGISTRY`] 에 등록하는 per-`.so` 코어(ADR-0010 E5).
 ///
-/// 각 `.so`: `Library::new`(RTLD_NOW) → `register_kv_stage_v1` dlsym → `abi_version` 검사 →
-/// 이름 충돌 fail-fast(빌트인 우선 + 동적 중복 금지). init-once 단계에서 1회 호출 권장이나 다회
-/// 호출도 누적 가능.
-pub fn register_dynamic_stages(paths: &[PathBuf]) -> Result<()> {
-    if paths.is_empty() {
-        return Ok(());
+/// `register_kv_stages_v2` 봉투 entry 를 dlsym 한다 — **없으면 `Ok(0)`**(이 `.so` 는 stage 미보유, format 전용
+/// 일 수 있음). 있으면 봉투 `abi_version` 검사 → `count` 개 vtable 순회. **2-pass 원자성**: ① 전 이름을
+/// 빌트인 충돌·봉투 내부 중복 검사(통과 전 push 0) → ② write-lock 1회로 동적 중복 검사 + 일괄 push(부분
+/// 등록 롤백 회피). 반환 = 등록한 stage 개수. cross-axis dispatcher([`register_dynamic_plugins`](crate::session::plugin_dispatch::register_dynamic_plugins))
+/// 가 `.so` 1회 dlopen 후 호출(Arc 공유), batch 래퍼([`register_dynamic_stages`])도 사용.
+pub(crate) fn try_register_stage(lib: &Arc<libloading::Library>, path: &Path) -> Result<usize> {
+    // SAFETY: register_kv_stages_v2 dlsym. 부재 = 이 .so 가 stage 축 미보유 → Ok(0)(에러 아님).
+    let reg_fn: libloading::Symbol<unsafe extern "C" fn() -> StageExportAbi> =
+        match unsafe { lib.get(b"register_kv_stages_v2\0") } {
+            Ok(f) => f,
+            Err(_) => return Ok(0),
+        };
+    // SAFETY: 봉투 by-value 반환(sret). vtables 는 `.so` static 배열 base, abi_version 은 .so 단위 게이트.
+    let export = unsafe { reg_fn() };
+    if export.abi_version != KV_STAGE_ABI_VERSION {
+        anyhow::bail!(
+            "plugin {}: stage abi_version {} != 기대 {} (재빌드 필요)",
+            path.display(),
+            export.abi_version,
+            KV_STAGE_ABI_VERSION
+        );
+    }
+    if export.count == 0 {
+        return Ok(0);
+    }
+    if export.vtables.is_null() {
+        anyhow::bail!(
+            "plugin {}: register_kv_stages_v2 가 count {} 인데 null vtables",
+            path.display(),
+            export.count
+        );
     }
     let registry = DYN_REGISTRY.get_or_init(|| RwLock::new(Vec::new()));
-    for path in paths {
-        // SAFETY: dlopen — 신뢰된 plugin 경로(사용자 명시 --load-plugin). RTLD_NOW 즉시 바인딩.
-        let lib = unsafe { libloading::Library::new(path) }
-            .with_context(|| format!("plugin dlopen 실패: {}", path.display()))?;
-        // SAFETY: register_kv_stage_v1 심볼 dlsym + 호출. vtable_ptr 는 `.so` 의 static 을 가리킨다.
-        let vtable_ptr: *const PluginVTableAbi = unsafe {
-            let reg_fn: libloading::Symbol<unsafe extern "C" fn() -> *const PluginVTableAbi> = lib
-                .get(b"register_kv_stage_v1\0")
-                .with_context(|| {
-                    format!("plugin {}: register_kv_stage_v1 심볼 부재", path.display())
-                })?;
-            reg_fn()
-        };
-        if vtable_ptr.is_null() {
-            anyhow::bail!(
-                "plugin {}: register_kv_stage_v1 가 null vtable 반환",
-                path.display()
-            );
-        }
-        // SAFETY: 위에서 non-null 확인. vtable 은 `.so` static.
+    // ── pass 1: 이름 추출 + 빌트인 충돌 / 봉투 내부 중복 검사 (lock 불요). ──
+    let mut pending: Vec<(String, *const PluginVTableAbi)> = Vec::with_capacity(export.count);
+    for i in 0..export.count {
+        // SAFETY: vtables 는 `.so` static 배열 base, i < count. 봉투 스택과 무관(원소는 .so 수명).
+        let vtable_ptr = unsafe { export.vtables.add(i) };
         let vtable = unsafe { &*vtable_ptr };
-        if vtable.abi_version != KV_STAGE_ABI_VERSION {
-            anyhow::bail!(
-                "plugin {}: abi_version {} != 기대 {} (재빌드 필요)",
-                path.display(),
-                vtable.abi_version,
-                KV_STAGE_ABI_VERSION
-            );
-        }
-        // SAFETY: name 은 plugin 의 null-종단 'static str.
         let name = unsafe { CStr::from_ptr(vtable.name) }
             .to_str()
-            .with_context(|| format!("plugin {}: name 이 유효 UTF-8 아님", path.display()))?
+            .with_context(|| format!("plugin {}: stage name[{i}] 이 유효 UTF-8 아님", path.display()))?
             .to_owned();
-        // 충돌 fail-fast (빌트인 우선 — silent override 차단, Known Bug #1/#2 류 재발 방지).
+        // 빌트인 우선 — silent override 차단(Known Bug #1/#2 류 재발 방지).
         if technique_api::find_stage(&name).is_some() {
             anyhow::bail!(
                 "plugin {}: stage 이름 '{}' 이 빌트인과 충돌 (빌트인 우선, 동적 등록 거부)",
@@ -465,26 +466,59 @@ pub fn register_dynamic_stages(paths: &[PathBuf]) -> Result<()> {
                 name
             );
         }
-        let lib = Arc::new(lib);
-        let mut w = registry.write().expect("DYN_REGISTRY RwLock poisoned");
-        if w.iter().any(|r| r.name == name) {
+        if pending.iter().any(|(n, _)| *n == name) {
+            anyhow::bail!(
+                "plugin {}: stage 이름 '{}' 이 봉투 내부에서 중복",
+                path.display(),
+                name
+            );
+        }
+        pending.push((name, vtable_ptr));
+    }
+    // ── pass 2: 동적 registry 중복 검사 + 일괄 push (write-lock 1회 = per-.so 원자). ──
+    let mut w = registry.write().expect("DYN_REGISTRY RwLock poisoned");
+    for (name, _) in &pending {
+        if w.iter().any(|r| r.name == *name) {
             anyhow::bail!(
                 "plugin {}: stage 이름 '{}' 이 이미 동적 등록됨 (중복)",
                 path.display(),
                 name
             );
         }
+    }
+    let n = pending.len();
+    for (name, vtable_ptr) in pending {
         w.push(RuntimeStageReg {
             name,
             vtable: vtable_ptr,
-            _lib: lib,
+            _lib: Arc::clone(lib),
         });
+    }
+    Ok(n)
+}
+
+/// `--load-plugin` 의 `.so` 들을 dlopen 해 stage 만 등록하는 **strict batch 래퍼**(gate 테스트·축-격리 진단용).
+/// 각 `.so` 가 stage 0개면 "심볼 부재" bail(기존 계약 유지). production 혼합 로드는
+/// [`register_dynamic_plugins`](crate::session::plugin_dispatch::register_dynamic_plugins) 사용.
+pub fn register_dynamic_stages(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        // SAFETY: dlopen — 신뢰된 plugin 경로(사용자 명시 --load-plugin). RTLD_NOW 즉시 바인딩.
+        let lib = Arc::new(
+            unsafe { libloading::Library::new(path) }
+                .with_context(|| format!("plugin dlopen 실패: {}", path.display()))?,
+        );
+        if try_register_stage(&lib, path)? == 0 {
+            anyhow::bail!(
+                "plugin {}: register_kv_stages_v2 심볼 부재 (또는 stage 0개)",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
 
 /// 동적으로 등록된 stage 이름들(self-test / 진단용 — 정적 `registered_names()` 의 동적 짝).
-pub fn dynamic_registered_names() -> Vec<String> {
+pub fn dynamic_registered_stage_names() -> Vec<String> {
     DYN_REGISTRY
         .get()
         .map(|r| {

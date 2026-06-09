@@ -395,9 +395,8 @@ pub struct FromPairAbi {
 /// stage 허용). vtable 은 plugin `.so` 의 `static` 이라 프로세스 수명 내내 유효.
 #[repr(C)]
 pub struct PluginVTableAbi {
-    /// (v2 에서 deprecated — ABI 게이트는 봉투 [`StageExportAbi::abi_version`] 가 담당. V2 단계에서 제거 예정.)
-    pub abi_version: u32,
     /// null-종단 canonical 이름(CLI `--eviction-policy` 매칭). plugin `.so` 의 `'static` str.
+    /// (ABI 게이트는 봉투 [`StageExportAbi::abi_version`] 가 담당 — vtable 당 버전 필드 없음, ADR-0010 E1.)
     pub name: *const c_char,
     /// `StageParams` → opaque plugin 인스턴스 핸들.
     pub make: unsafe extern "C" fn(*const StageParams) -> *mut c_void,
@@ -717,7 +716,6 @@ macro_rules! register_kv_stage {
             // vtable 을 PLUGIN_KV_STAGE_VTABLES 에 기여(const-block 격리 = 다회 호출 시 누적). entry 아님.
             #[$crate::distributed_slice($crate::PLUGIN_KV_STAGE_VTABLES)]
             static __VTABLE: $crate::PluginVTableAbi = $crate::PluginVTableAbi {
-                abi_version: $crate::KV_STAGE_ABI_VERSION, // V1 잔존 — V2 에서 봉투로 이전 후 제거.
                 name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
                 make: __make,
                 plan: __plan,
@@ -1027,9 +1025,8 @@ pub const KV_FORMAT_ABI_VERSION: u32 = 2;
 /// 적용).
 #[repr(C)]
 pub struct FormatVTableAbi {
-    /// (v2 에서 deprecated — ABI 게이트는 봉투 [`FormatExportAbi::abi_version`] 가 담당. V2 단계에서 제거 예정.)
-    pub abi_version: u32,
     /// null-종단 canonical 이름(`--kv-format`/registry 매칭). plugin `.so` 의 `'static` str.
+    /// (ABI 게이트는 봉투 [`FormatExportAbi::abi_version`] 가 담당 — vtable 당 버전 필드 없음, ADR-0010 E1.)
     pub name: *const c_char,
     /// format 인스턴스 생성 → opaque 핸들. host 가 `make_format` 시 호출.
     pub make: unsafe extern "C" fn() -> *mut c_void,
@@ -1120,7 +1117,6 @@ macro_rules! register_kv_format {
             // vtable 을 PLUGIN_KV_FORMAT_VTABLES 에 기여(const-block 격리 = 다회 호출 시 누적). entry 아님.
             #[$crate::distributed_slice($crate::PLUGIN_KV_FORMAT_VTABLES)]
             static __VTABLE: $crate::FormatVTableAbi = $crate::FormatVTableAbi {
-                abi_version: $crate::KV_FORMAT_ABI_VERSION, // V1 잔존 — V2 에서 봉투로 이전 후 제거.
                 name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
                 make: __make,
                 layout: __layout,
@@ -1561,13 +1557,11 @@ mod tests {
     fn format_vtable_layout_pod_round_trip() {
         // 매크로의 cdylib 경로(plugin-cdylib)와 동형의 vtable 을 수동 구성해 ABI 경로를 feature 없이 검증.
         let vtable = FormatVTableAbi {
-            abi_version: KV_FORMAT_ABI_VERSION,
             name: b"rt_format\0".as_ptr() as *const c_char,
             make: rt_make,
             layout: rt_layout,
             drop: rt_drop,
         };
-        assert_eq!(vtable.abi_version, KV_FORMAT_ABI_VERSION);
         // make → layout → drop: KVLayoutDesc 가 extern "C" 경계를 값으로 무손실 왕복.
         let handle = unsafe { (vtable.make)() };
         assert!(!handle.is_null(), "make 가 non-null 핸들 반환");
@@ -1603,14 +1597,12 @@ mod tests {
 
     static FMT_EXPORT_VTS: [FormatVTableAbi; 2] = [
         FormatVTableAbi {
-            abi_version: KV_FORMAT_ABI_VERSION,
             name: b"rt_env_a\0".as_ptr() as *const c_char,
             make: rt_make,
             layout: rt_layout,
             drop: rt_drop,
         },
         FormatVTableAbi {
-            abi_version: KV_FORMAT_ABI_VERSION,
             name: b"rt_env_b\0".as_ptr() as *const c_char,
             make: rt_make,
             layout: rt_layout,
@@ -1620,7 +1612,6 @@ mod tests {
 
     static STAGE_EXPORT_VTS: [PluginVTableAbi; 2] = [
         PluginVTableAbi {
-            abi_version: KV_STAGE_ABI_VERSION,
             name: b"rt_st_a\0".as_ptr() as *const c_char,
             make: st_make,
             plan: st_plan,
@@ -1628,7 +1619,6 @@ mod tests {
             drop: st_drop,
         },
         PluginVTableAbi {
-            abi_version: KV_STAGE_ABI_VERSION,
             name: b"rt_st_b\0".as_ptr() as *const c_char,
             make: st_make,
             plan: st_plan,
