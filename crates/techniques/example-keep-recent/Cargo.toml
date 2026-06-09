@@ -3,8 +3,19 @@ name = "example-keep-recent"
 version = "0.1.0"
 edition = "2024"
 
-# 예제 technique crate (ADR-0003) — stage 축 확장 기법은 `technique-api` 에만 의존한다.
-# 엔진(llm_rs2) / 다른 축(format/hardware) crate 에 의존하지 않음 = 가산 확장 비용의 증거.
+[lib]
+# GATE-C(ADR-0009): rlib = 정적 dev-dep(stage_registry 가시성 테스트), cdylib = dlopen `.so`
+# (`--features plugin-cdylib` 빌드 시 register_kv_stage_v1 C-ABI export).
+crate-type = ["cdylib", "rlib"]
+
+# 예제 technique crate (ADR-0003) — `technique-api`(확장 API) + `linkme`(정적 등록 매크로 확장이
+# `linkme::` 경로를 하드코딩하므로 plugin 직접 dep 필수)에 의존한다. 다른 축(format/hardware)·엔진
+# 타입엔 일절 의존하지 않음 = 가산 확장 비용(dep 2줄).
 [dependencies]
 technique-api = { path = "../../technique-api" }
 linkme = "0.3"
+
+[features]
+# GATE-C(ADR-0009 D2): cdylib C-ABI export(register_kv_stage_v1) 활성화. 정적 force-link 빌드는
+# OFF 로 두어 `#[no_mangle]` 심볼 충돌을 원천 차단한다. `.so` 산출 시에만 켠다.
+plugin-cdylib = []

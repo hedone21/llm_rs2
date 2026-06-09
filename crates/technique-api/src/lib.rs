@@ -17,11 +17,12 @@
 //! 단계엔 borrow, 미래 `.so` C-ABI 단계엔 동일 추상이 C accessor/flat 스냅샷으로 교체 — forward-compatible.
 
 use core::ffi::{c_char, c_void};
-use linkme::distributed_slice;
 
-/// `register_kv_stage!` 매크로가 plugin 크레이트에서 `#[distributed_slice]` 를 경로로 참조할 수
-/// 있도록 linkme 를 재노출한다(plugin 이 linkme 를 직접 dep 하지 않아도 됨, ADR-0009 D2).
-pub use linkme;
+/// `register_kv_stage!` 매크로가 plugin 크레이트에서 `distributed_slice` 어트리뷰트를 경로로 참조할 수
+/// 있도록 linkme 의 proc-macro 를 재노출한다(plugin 이 linkme 를 직접 dep 하지 않아도 됨, ADR-0009 D2).
+/// 본 crate 내부 등록(`#[distributed_slice]`)도 이 import 를 그대로 쓴다. (crate 자체가 아니라 매크로를
+/// 직접 재노출해야 proc-macro 어트리뷰트 경로 resolve 가 된다.)
+pub use linkme::distributed_slice;
 
 /// 엔진이 노출하는 named 캐시 텐서(ADR-0004 M-A 통합). 변형(보존/병합)은 plan 으로만, 읽기는 본 enum
 /// 으로 통일한다. **OCP**: 미래 입력(Query/PageBounds 등)은 variant 추가 1줄 + 엔진 impl 1곳 — `StageCtx`
@@ -632,7 +633,7 @@ impl PlanArena {
 macro_rules! register_kv_stage {
     ($name:literal, $make:expr) => {
         // ── 정적 경로 (rlib → linkme distributed_slice) ──
-        #[$crate::linkme::distributed_slice($crate::KV_CACHE_STAGES)]
+        #[$crate::distributed_slice($crate::KV_CACHE_STAGES)]
         static __REGISTER_KV_STAGE_REG: $crate::KVCacheStageReg = $crate::KVCacheStageReg {
             name: $name,
             make: $make,
@@ -693,7 +694,7 @@ macro_rules! register_kv_stage {
                 drop: __drop,
             };
 
-            #[no_mangle]
+            #[unsafe(no_mangle)] // Rust 2024: no_mangle 은 unsafe attribute.
             pub extern "C" fn register_kv_stage_v1() -> *const $crate::PluginVTableAbi {
                 &__VTABLE
             }
