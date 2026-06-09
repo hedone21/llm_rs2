@@ -30,10 +30,14 @@ use technique_api::KVLayoutDesc;
 /// 연결하고 [`ResilienceAdapter`] 를 만든다 (transport 실패는 Err 전파).
 /// false 면 `resilience = None` (NoOp default).
 pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
-    // GATE-C(ADR-0009 D6): --load-plugin 으로 지정된 stage plugin `.so` 를 dlopen 등록한다.
-    // 이후 make_stage(--eviction-policy) 가 정적(linkme)+동적(여기) 통합 조회로 해소한다.
-    // 빌트인 이름 충돌 / abi_version mismatch / 심볼 부재는 여기서 fail-fast.
-    crate::pressure::eviction::stage_registry::register_dynamic_stages(&args.load_plugin)?;
+    // GATE-C(ADR-0010 E6 W1): --load-plugin 의 `.so` 들을 .so 당 1회 dlopen 해 stage+format 양축
+    // capability 를 등록한다(cross-axis open-once dispatcher — 번들/단일축 `.so` 모두 흡수). 이후
+    // make_stage(--eviction-policy)/make_format(--kv-format)가 정적(linkme)+동적(여기) 통합 조회로
+    // 해소한다. 봉투 abi_version mismatch / 이름 충돌 / capability-0 은 여기서 fail-fast.
+    crate::session::plugin_dispatch::register_dynamic_plugins(&args.load_plugin)?;
+    // ADR-0003 §4 fat-LTO self-test(C3 배선): 내장 KV format 4종 링크 확인 — --gc-sections silent
+    // drop 시 --kv-format 미해석 폴백 대신 fail-fast.
+    crate::format::ensure_builtin_kv_formats_registered()?;
 
     let ctx = SessionInitCtx::build(&args)?;
     let backend = ctx.backend;
@@ -94,42 +98,46 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
     // ADR-0008 D3 dispatch: --kv-format(registry name)이 있으면 우선. 내장(f32/f16/q4_0/q8_0)은
     // typed 저장, 그 외 등록 format(예 synth_q4)은 opaque 저장(DType 없음). 미설정 시 --kv-type 하위호환.
     let kv_caches = match args.kv_format.as_deref().filter(|s| !s.is_empty()) {
-        Some(fmt_name) => {
-            let reg = technique_api::find_kv_format(fmt_name).ok_or_else(|| {
-                anyhow::anyhow!("Unknown --kv-format '{fmt_name}' (KV_FORMATS 미등록)")
-            })?;
-            match crate::format::builtin_format_dtype(fmt_name) {
-                Some(dt) => {
-                    eprintln!("KV format: {fmt_name} (typed dtype {dt:?})");
-                    alloc_standard_kv_caches(
-                        &backend,
-                        memory.clone(),
-                        num_layers,
-                        initial_kv_capacity,
-                        max_seq_len,
-                        kv_heads,
-                        head_dim,
-                        dt,
-                    )?
-                }
-                None => {
-                    let desc = (reg.make)().layout();
-                    eprintln!(
-                        "KV format: {fmt_name} (opaque — DType 없음, descriptor-driven, ADR-0008)"
-                    );
-                    alloc_opaque_kv_caches(
-                        &backend,
-                        memory.clone(),
-                        num_layers,
-                        initial_kv_capacity,
-                        max_seq_len,
-                        kv_heads,
-                        head_dim,
-                        desc,
-                    )?
-                }
+        // ADR-0010 E6 W2: 이름 기반 typed/opaque 분기. 내장 typed 가 아니면 make_format(정적 우선 →
+        // 동적 .so fallback)로 해소 — 동적 format 은 builtin_format_dtype None → opaque 로 자동 라우팅.
+        Some(fmt_name) => match crate::format::builtin_format_dtype(fmt_name) {
+            Some(dt) => {
+                eprintln!("KV format: {fmt_name} (typed dtype {dt:?})");
+                alloc_standard_kv_caches(
+                    &backend,
+                    memory.clone(),
+                    num_layers,
+                    initial_kv_capacity,
+                    max_seq_len,
+                    kv_heads,
+                    head_dim,
+                    dt,
+                )?
             }
-        }
+            None => {
+                // 내장 typed 아님 → opaque(정적 force-link 또는 동적 .so). make_format 가 source-agnostic.
+                let fmt = crate::format::dynamic_format_registry::make_format(fmt_name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Unknown --kv-format '{fmt_name}' (정적 KV_FORMATS·동적 등록 모두 미발견 — --load-plugin 확인)"
+                        )
+                    })?;
+                let desc = fmt.layout();
+                eprintln!(
+                    "KV format: {fmt_name} (opaque — DType 없음, descriptor-driven, ADR-0008)"
+                );
+                alloc_opaque_kv_caches(
+                    &backend,
+                    memory.clone(),
+                    num_layers,
+                    initial_kv_capacity,
+                    max_seq_len,
+                    kv_heads,
+                    head_dim,
+                    desc,
+                )?
+            }
+        },
         None => alloc_standard_kv_caches(
             &backend,
             memory.clone(),
