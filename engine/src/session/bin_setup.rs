@@ -98,8 +98,9 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
     // ADR-0008 D3 dispatch: --kv-format(registry name)이 있으면 우선. 내장(f32/f16/q4_0/q8_0)은
     // typed 저장, 그 외 등록 format(예 synth_q4)은 opaque 저장(DType 없음). 미설정 시 --kv-type 하위호환.
     let kv_caches = match args.kv_format.as_deref().filter(|s| !s.is_empty()) {
-        // ADR-0010 E6 W2: 이름 기반 typed/opaque 분기. 내장 typed 가 아니면 make_format(정적 우선 →
-        // 동적 .so fallback)로 해소 — 동적 format 은 builtin_format_dtype None → opaque 로 자동 라우팅.
+        // ADR-0010 E6 W2: 이름 기반 typed/opaque 분기. 내장 typed 이름이 아니면 make_format(정적 우선
+        // → 동적 .so fallback)로 해소 후, descriptor 가 내장 DType 과 bit-equivalent 면 typed fast
+        // path 로(layout_desc_to_builtin_dtype), 아니면 opaque floor 로 라우팅(2026-06-09 결정).
         Some(fmt_name) => match crate::format::builtin_format_dtype(fmt_name) {
             Some(dt) => {
                 eprintln!("KV format: {fmt_name} (typed dtype {dt:?})");
@@ -115,7 +116,7 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
                 )?
             }
             None => {
-                // 내장 typed 아님 → opaque(정적 force-link 또는 동적 .so). make_format 가 source-agnostic.
+                // 내장 typed 이름 아님 → make_format(정적 force-link 또는 동적 .so, source-agnostic)로 해소.
                 let fmt = crate::format::dynamic_format_registry::make_format(fmt_name)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
@@ -123,19 +124,42 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
                         )
                     })?;
                 let desc = fmt.layout();
-                eprintln!(
-                    "KV format: {fmt_name} (opaque — DType 없음, descriptor-driven, ADR-0008)"
-                );
-                alloc_opaque_kv_caches(
-                    &backend,
-                    memory.clone(),
-                    num_layers,
-                    initial_kv_capacity,
-                    max_seq_len,
-                    kv_heads,
-                    head_dim,
-                    desc,
-                )?
+                // descriptor 가 내장 DType 과 bit-equivalent 면 typed fast path 로 라우팅(ADR-0008 D3 의
+                // name-keyed dispatch 를 descriptor-keyed 로 확장, 2026-06-09 결정). opaque generic floor
+                // (dequant-whole→F32)는 ARM 에서 typed Q4_0(NEON) 대비 ~1.34x 느림(S25 실측) — descriptor
+                // 가 내장과 일치하면 floor 비용이 불필요. 미일치(novel descriptor)는 opaque floor 유지.
+                match crate::format::layout_desc_to_builtin_dtype(&desc) {
+                    Some(dt) => {
+                        eprintln!(
+                            "KV format: {fmt_name} → 내장 {dt:?} 와 bit-equivalent → typed fast path (opaque floor 우회)"
+                        );
+                        alloc_standard_kv_caches(
+                            &backend,
+                            memory.clone(),
+                            num_layers,
+                            initial_kv_capacity,
+                            max_seq_len,
+                            kv_heads,
+                            head_dim,
+                            dt,
+                        )?
+                    }
+                    None => {
+                        eprintln!(
+                            "KV format: {fmt_name} (opaque — DType 없음, descriptor-driven, ADR-0008)"
+                        );
+                        alloc_opaque_kv_caches(
+                            &backend,
+                            memory.clone(),
+                            num_layers,
+                            initial_kv_capacity,
+                            max_seq_len,
+                            kv_heads,
+                            head_dim,
+                            desc,
+                        )?
+                    }
+                }
             }
         },
         None => alloc_standard_kv_caches(

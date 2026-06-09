@@ -68,6 +68,23 @@ pub fn dtype_to_layout_desc(d: DType) -> Option<KVLayoutDesc> {
     })
 }
 
+/// `KVLayoutDesc` → 내장 `DType` ([`dtype_to_layout_desc`] 의 부분역).
+///
+/// 동적 `.so` format 의 descriptor 가 내장 DType 과 **bit-equivalent** 면 opaque generic floor 대신
+/// **typed fast path**(특화 NEON dequant-attention 등)로 라우팅하기 위한 인식(ADR-0008 D3 의
+/// name-keyed dispatch 를 descriptor-keyed 로 확장, 2026-06-09 결정). opaque floor 는
+/// dequant-whole→F32 라 ARM 에서 typed Q4_0(NEON) 대비 ~1.34x 느림(Galaxy S25 실측) — descriptor 가
+/// 내장과 일치하면 floor 비용이 불필요하다.
+///
+/// **인식 집합 = {F32, F16, Q4_0}** = `--kv-type` 이 받는 typed-attention 완전지원 집합. Q8_0/Q4_1
+/// 등은 typed attention 이 보장되지 않아 제외(opaque floor 유지가 안전). 어휘 밖 novel descriptor 도
+/// `None` → 호출부가 opaque floor 로 처리.
+pub fn layout_desc_to_builtin_dtype(desc: &KVLayoutDesc) -> Option<DType> {
+    [DType::F32, DType::F16, DType::Q4_0]
+        .into_iter()
+        .find(|&dt| dtype_to_layout_desc(dt).as_ref() == Some(desc))
+}
+
 /// 한 block-quant 블록을 descriptor 어휘로 구동해 f32 로 unpack(canonical layout, llama.cpp 호환).
 ///
 /// canonical block layout = `[f16 scale][f16 min?][packed quants]`:
@@ -368,6 +385,42 @@ mod tests {
                 .bytes_for_elems(10),
             Some(20)
         );
+    }
+
+    /// descriptor-keyed typed fast path 인식(2026-06-09): 동적 format 의 descriptor 가 내장 DType 과
+    /// bit-equivalent 면 `Some(dt)`(→ typed alloc), 아니면 `None`(→ opaque floor).
+    #[test]
+    fn layout_desc_to_builtin_dtype_recognizes_q4_0_canonical_only() {
+        // q4_0-canonical(synth_q4/bundle_fmt/example_kv 공유) → Q4_0 인식.
+        let q4 = KVLayoutDesc {
+            block_elems: 32,
+            bits: 4,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Nibble,
+        };
+        assert_eq!(layout_desc_to_builtin_dtype(&q4), Some(DType::Q4_0));
+        // F32/F16 raw 도 인식(typed attention 완전지원).
+        assert_eq!(
+            layout_desc_to_builtin_dtype(&dtype_to_layout_desc(DType::F32).unwrap()),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            layout_desc_to_builtin_dtype(&dtype_to_layout_desc(DType::F16).unwrap()),
+            Some(DType::F16)
+        );
+        // Q8_0-canonical(mf_q8 등)은 typed attention 미보장 → 인식 제외(opaque floor 유지).
+        assert_eq!(
+            layout_desc_to_builtin_dtype(&dtype_to_layout_desc(DType::Q8_0).unwrap()),
+            None
+        );
+        // novel descriptor(어휘 밖 3-bit 가정) → None.
+        let novel = KVLayoutDesc {
+            block_elems: 32,
+            bits: 3,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Nibble,
+        };
+        assert_eq!(layout_desc_to_builtin_dtype(&novel), None);
     }
 
     /// ADR-0007 G3: opaque 버퍼(U8 tag + q4_0 sidecar desc)의 dequant 이 같은 바이트를
