@@ -40,4 +40,5 @@ ADR 는 다음 결정 유형에서 작성 의무:
 | [ADR-0006](0006-weight-stage-plan-returning-unification.md) | weight 축 stage 통일 — plan-returning `WeightStage` (KVCacheStage 형제; 결정 ⊥ 변형(엔진 독점) ⊥ pacing 분리, precision⊥dispatch, `WEIGHT_STAGES` 평행 registry, Seam B = Phase β 의존) | Accepted | 2026-06-07 |
 | [ADR-0007](0007-opaque-dtype-kv-format-unlock.md) | opaque-dtype — descriptor-운반 KV format 의 `DType`-우회 해금 (zero-compile `.so` 북극성, GATE-B host) | Accepted | 2026-06-08 |
 | [ADR-0008](0008-opaque-kv-production-integration.md) | opaque KV format production 통합 — `KVCache` 흡수 + `is_q4`→descriptor-keyed (실추론 grow/eviction/D2O) | Accepted | 2026-06-08 |
-| [ADR-0009](0009-gate-c-stage-dlopen-plugin.md) | GATE-C — Stage 축 `.so` cdylib dlopen plugin 승격 (북극성 zero-compile install, ADR-0007 D6 해결) | Accepted | 2026-06-09 |
+| [ADR-0009](0009-gate-c-stage-dlopen-plugin.md) | GATE-C — Stage 축 `.so` cdylib dlopen plugin 승격 (북극성 zero-compile install, ADR-0007 D6 해결) | Accepted (D2/D6 부분 supersede by 0010) | 2026-06-09 |
+| [ADR-0010](0010-gate-c-multi-vtable-bundle-abi.md) | GATE-C 멀티-vtable bundle ABI — 한 `.so` 다수 capability + cross-axis open-once dispatch (ADR-0009 D2 supersede + production 배선 해결) | Proposed | 2026-06-09 |
