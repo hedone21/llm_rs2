@@ -633,14 +633,6 @@ fn build_chat_eviction_internal(
             // 새 LayerWide 기법 추가 = crate 등록만, 본 사이트 무수정. 레지스트리 miss = unknown
             // 정책(기존 bail 메시지 보존). World B(plan→compact, compact_parity 게이트).
             name => {
-                let reg = technique_api::find_stage(name).ok_or_else(|| {
-                    // caote 는 feature-gate → install 됐을 때만 유효 정책으로 안내(ADR-0004 §8).
-                    anyhow::anyhow!(
-                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{}",
-                        name,
-                        if cfg!(feature = "caote") { ", caote" } else { "" }
-                    )
-                })?;
                 // streaming window 유도는 StageParams 5필드 밖이라 caller(여기)에서 해소해 baked.
                 // 비-streaming 정책의 make 는 이 필드를 무시한다.
                 let streaming_window = if args.streaming_window > 0 {
@@ -657,7 +649,16 @@ fn build_chat_eviction_internal(
                     sink_size: args.sink_size,
                     streaming_window,
                 };
-                Box::new(StageBackedPolicy::new((reg.make)(params)))
+                // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회(ADR-0009 D3). miss = unknown.
+                let stage = crate::pressure::eviction::stage_registry::make_stage(name, &params)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
+                            name,
+                            if cfg!(feature = "caote") { ", caote" } else { "" }
+                        )
+                    })?;
+                Box::new(StageBackedPolicy::new(stage))
             }
         };
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)

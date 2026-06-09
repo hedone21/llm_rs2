@@ -98,15 +98,6 @@ pub fn build_resilience_cache_manager(
             // sliding/streaming/h2o → KVCacheStage 레지스트리(OCP). chat 경로(session.rs)와 동일
             // factory. 레지스트리 miss = unknown(기존 bail 메시지 보존). World B(compact_parity 게이트).
             name => {
-                let reg = technique_api::find_stage(name).ok_or_else(|| {
-                    // d2o 는 위 분기에서 처리되나 유효 정책이므로 안내에 포함(session.rs 와 일관).
-                    // caote 는 feature-gate → install 시에만 안내(ADR-0004 §8).
-                    anyhow::anyhow!(
-                        "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{}.",
-                        name,
-                        if cfg!(feature = "caote") { ", caote" } else { "" }
-                    )
-                })?;
                 let streaming_window = if args.streaming_window() > 0 {
                     args.streaming_window()
                 } else if args.kv_budget() > 0 {
@@ -121,7 +112,17 @@ pub fn build_resilience_cache_manager(
                     sink_size: args.sink_size(),
                     streaming_window,
                 };
-                Box::new(StageBackedPolicy::new((reg.make)(params)))
+                // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회(ADR-0009 D3). miss = unknown.
+                // d2o 는 위 분기에서 처리되나 유효 정책이라 안내에 포함(session.rs 와 일관).
+                let stage = crate::pressure::eviction::stage_registry::make_stage(name, &params)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
+                            name,
+                            if cfg!(feature = "caote") { ", caote" } else { "" }
+                        )
+                    })?;
+                Box::new(StageBackedPolicy::new(stage))
             }
         };
         CacheManager::new(policy, monitor, threshold_bytes, target_ratio)

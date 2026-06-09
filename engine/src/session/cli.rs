@@ -510,6 +510,12 @@ pub struct Args {
     #[arg(long)]
     pub kv_format: Option<String>,
 
+    /// GATE-C: 런타임 stage plugin `.so` 경로(반복 가능, ADR-0009 D6). startup 에 dlopen +
+    /// `register_kv_stage_v1` → `KV_CACHE_STAGES` 동적 등록. `--eviction-policy <plugin-name>` 로 선택.
+    /// 빌트인과 이름 충돌 시 fail-fast(빌트인 우선).
+    #[arg(long = "load-plugin")]
+    pub load_plugin: Vec<std::path::PathBuf>,
+
     // ── Eviction (S-subcmd C2): policy/h2o/d2o/sink/streaming + common
     // 7 params (kv_budget, protected_prefix, memory_threshold_mb,
     // eviction_target_ratio, initial_kv_capacity, min_kv_cache,

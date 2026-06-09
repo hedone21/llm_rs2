@@ -30,6 +30,11 @@ use technique_api::KVLayoutDesc;
 /// 연결하고 [`ResilienceAdapter`] 를 만든다 (transport 실패는 Err 전파).
 /// false 면 `resilience = None` (NoOp default).
 pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
+    // GATE-C(ADR-0009 D6): --load-plugin 으로 지정된 stage plugin `.so` 를 dlopen 등록한다.
+    // 이후 make_stage(--eviction-policy) 가 정적(linkme)+동적(여기) 통합 조회로 해소한다.
+    // 빌트인 이름 충돌 / abi_version mismatch / 심볼 부재는 여기서 fail-fast.
+    crate::pressure::eviction::stage_registry::register_dynamic_stages(&args.load_plugin)?;
+
     let ctx = SessionInitCtx::build(&args)?;
     let backend = ctx.backend;
     let memory = ctx.memory;
