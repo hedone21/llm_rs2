@@ -29,6 +29,29 @@ impl KVCacheStage for BundleKeep {
     }
 }
 
+/// per-head keep 을 산출하는 stage — host(DynStage)가 PerHead(keep_kind==1)에 대해 명시 bail 하는
+/// 경로(ADR-0009 D2 landmine, planabi_to_plan)를 구동하는 vehicle. 한 `.so` 에 stage 2종(bundle_keep
+/// LayerWide + bundle_perhead PerHead) = 멀티-stage 인덱스 바인딩 검증(ADR-0010 E7 G5).
+struct BundlePerHead;
+impl KVCacheStage for BundlePerHead {
+    fn name(&self) -> &str {
+        "bundle_perhead"
+    }
+    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+        let (current, target) = (ctx.current_pos(), ctx.target_len());
+        if current <= target {
+            return None;
+        }
+        let keep: Vec<usize> = (current - target..current).collect();
+        // 전 head 동일 keep — host 는 PerHead 미지원이라 마샬링 단계에서 bail(None) 한다.
+        let per_head = vec![keep; ctx.n_kv_heads().max(1)];
+        Some(KVCachePlan {
+            keep: KeepSpec::PerHead(per_head),
+            merges: Vec::new(),
+        })
+    }
+}
+
 /// 번들 format — q4_0-like descriptor.
 struct BundleFmt;
 impl KVFormat for BundleFmt {
@@ -45,19 +68,23 @@ impl KVFormat for BundleFmt {
     }
 }
 
-// 한 crate(=한 `.so`)에 양축 — register_kv_stage! + register_kv_format! + export_plugin! 1회.
+// 한 crate(=한 `.so`)에 stage 2종 + format 1종 — const-block 격리(ADR-0010 E2) 다회 호출 + export 1회.
 technique_api::register_kv_stage!("bundle_keep", |_p: StageParams| Box::new(BundleKeep));
+technique_api::register_kv_stage!("bundle_perhead", |_p: StageParams| Box::new(BundlePerHead));
 technique_api::register_kv_format!("bundle_fmt", || Box::new(BundleFmt));
 technique_api::export_plugin!();
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use technique_api::{find_kv_format, find_stage};
 
     #[test]
     fn bundle_registers_both_axes() {
         assert_eq!(find_stage("bundle_keep").expect("stage 등록").name, "bundle_keep");
+        assert_eq!(
+            find_stage("bundle_perhead").expect("perhead stage 등록").name,
+            "bundle_perhead"
+        );
         assert_eq!(
             find_kv_format("bundle_fmt").expect("format 등록").name,
             "bundle_fmt"
