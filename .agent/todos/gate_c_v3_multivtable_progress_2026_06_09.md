@@ -16,7 +16,7 @@ ABI 교체는 technique-api(V1)↔engine(V2)가 결합돼 있다. 깨진 commit 
 
 ## 체크리스트
 - [x] **V1** `90b04aa7` technique-api: 봉투(`StageExportAbi`/`FormatExportAbi`) + `PLUGIN_*_VTABLES` 슬라이스(1곳 선언) + `register_kv_*!` 재작성(const-block 격리 + 슬라이스 기여 + no_mangle v1 entry 제거) + `export_plugin!()` + `ABI_VERSION 1→2` + plugin-cdylib feature. abi_version vtable 필드 V1 잔존(엔진 green). 게이트: technique-api **19/0**(OFF) + **20/0**(plugin-cdylib, 동적 다회 누적) + 봉투 sret round-trip 양축 + 정적/동적 다회 2건 + `cargo build -p llm_rs2` green + clippy clean.
-- [ ] **V2** engine 로더: `try_register_*`/`register_dynamic_plugins`/batch 래퍼/rename + vtable abi_version 제거. 게이트: `cargo build -p llm_rs2` + `cargo test -p llm_rs2 --lib`.
+- [x] **V2** `8846d0b3` engine 로더: `try_register_stage`/`try_register_format`(count, 2-pass 원자, `vtables.add(i)`) + `session/plugin_dispatch::register_dynamic_plugins`(open-once) + batch strict 래퍼 + `dynamic_registered_names→_stage_names` rename + vtable abi_version 제거(봉투 단일 게이트). 게이트: `cargo build -p llm_rs2` green + `cargo test -p llm_rs2 --lib` **1260/0**(회귀 0) + lib clippy clean. ⚠ 구 통합 테스트(gate_c_*.rs) v1 ABI 제거로 컴파일 깨짐 → V5 재작성.
 - [ ] **V3** 배선: bin_setup W1/W2 + ensure_builtin startup. 게이트: build + `--lib` + 정적 e2e 무회귀.
 - [ ] **V4** vehicle: export_plugin! 적용 + multi-format crate + no-export. 게이트: `nm` 심볼.
 - [ ] **V5** 게이트: `gate_c_*.rs` 재작성 + 전체 sanity(완료 6게이트).
@@ -24,3 +24,4 @@ ABI 교체는 technique-api(V1)↔engine(V2)가 결합돼 있다. 깨진 commit 
 ## iter 로그
 - (iter 0, 2026-06-09) ADR-0010 커밋 `48d77243`. 적대적 리뷰 4렌즈 반영 완료. technique-api 매크로/vtable 전모 확보. 컴파일-green 순서 결정. V1 착수.
 - (iter 1, 2026-06-09) **V1 완료** `90b04aa7`. 봉투+슬라이스+매크로 재작성+export_plugin!. technique-api 19/0(OFF)·20/0(ON). 엔진/plugin crate build green(abi_version 잔존). 다음=V2(engine 로더).
+- (iter 2, 2026-06-09) **V2 완료** `8846d0b3`. try_register_*(2-pass)+register_dynamic_plugins+rename+vtable abi_version 제거. engine lib 1260/0, build green, lib clippy clean. 다음=V3(bin_setup W1/W2 + ensure_builtin 배선).
