@@ -16,7 +16,12 @@
 //! 정의하는 읽기 추상 [`StageCtx`] 로 노출하고, 엔진이 그것을 `&KVCache` 위로 구현한다(D5). 정적
 //! 단계엔 borrow, 미래 `.so` C-ABI 단계엔 동일 추상이 C accessor/flat 스냅샷으로 교체 — forward-compatible.
 
+use core::ffi::{c_char, c_void};
 use linkme::distributed_slice;
+
+/// `register_kv_stage!` 매크로가 plugin 크레이트에서 `#[distributed_slice]` 를 경로로 참조할 수
+/// 있도록 linkme 를 재노출한다(plugin 이 linkme 를 직접 dep 하지 않아도 됨, ADR-0009 D2).
+pub use linkme;
 
 /// 엔진이 노출하는 named 캐시 텐서(ADR-0004 M-A 통합). 변형(보존/병합)은 plan 으로만, 읽기는 본 enum
 /// 으로 통일한다. **OCP**: 미래 입력(Query/PageBounds 등)은 variant 추가 1줄 + 엔진 impl 1곳 — `StageCtx`
@@ -226,6 +231,7 @@ pub trait KVCacheStage: Send + Sync {
 /// "공용 struct 비대화 vs per-technique opaque params" 결정이 미해결이라 **여기에 싣지 않는다** —
 /// d2o 마이그레이션(M4) 진입 시 확정한다. 현 4개 빌트인(sliding/streaming/h2o/no_eviction)은 아래
 /// 5필드로 충분하다.
+#[repr(C)] // GATE-C(ADR-0009 D2): `.so` C-ABI 가 POD 로 그대로 값 전달(make thunk 인자).
 #[derive(Clone, Copy, Debug)]
 pub struct StageParams {
     /// sliding window 크기 (최근 유지 토큰 수).
@@ -264,6 +270,435 @@ pub fn find_stage(name: &str) -> Option<&'static KVCacheStageReg> {
 /// 등록된 모든 기법 이름 (self-test / 진단용).
 pub fn registered_names() -> Vec<&'static str> {
     KV_CACHE_STAGES.iter().map(|r| r.name).collect()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GATE-C — Stage 축 `.so` cdylib dlopen plugin C-ABI (ADR-0009)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 정적 등록(`KV_CACHE_STAGES` + `find_stage`)은 그대로 두고(D3 가산), `.so` plugin 이
+// 동일 `KVCacheStage` 를 C-ABI 로 노출하는 표면을 추가한다. trait object(`&dyn StageCtx`,
+// `Box<dyn KVCacheStage>`)는 C-ABI 불안정이라 fn-ptr 테이블([`StageCtxAbi`]) + opaque
+// handle 로 평탄화한다(D2). [`AbiStageCtx`] 어댑터가 `StageCtxAbi` 위에 `StageCtx` 를 다시
+// 구현해, plugin 저자는 정적/동적 무관하게 동일한 `impl KVCacheStage` 코드를 쓴다.
+
+/// `register_kv_stage_v1` 이 반환하는 vtable 의 ABI 버전. host 가 mismatch 시 로드 거부(D6).
+pub const KV_STAGE_ABI_VERSION: u32 = 1;
+
+/// [`PluginVTableAbi::plan`] 반환 코드: 정상(`out_plan` 채워짐).
+pub const KV_PLAN_OK: i32 = 0;
+/// [`PluginVTableAbi::plan`] 반환 코드: no-op(`None` — eviction 미적용).
+pub const KV_PLAN_NOOP: i32 = 1;
+// 음수 = plugin 의 깨끗한 논리 오류(host 는 로그 후 no-op 처리; panic 아님 — ADR-0009 D1).
+
+/// [`StageCtx`] 의 C-ABI 평탄화(D2). host 가 concrete ctx(`ctx`) 위로 fn-ptr 들을 채워 plugin 에
+/// 넘기고, plugin 은 fn-ptr 만 호출한다. 모든 fn-ptr 는 raw 포인터를 deref 하므로 `unsafe`.
+///
+/// stack-local(per-plan-call)로 만들어 ptr 로 전달 — `static` 아님 → `Sync` 불요.
+#[repr(C)]
+pub struct StageCtxAbi {
+    /// host 의 concrete `&dyn StageCtx` 구현을 가리키는 opaque thin 포인터(아래 fn-ptr 의 첫 인자).
+    pub ctx: *const c_void,
+    /// [`StageCtx::current_pos`].
+    pub current_pos: unsafe extern "C" fn(*const c_void) -> usize,
+    /// [`StageCtx::target_len`].
+    pub target_len: unsafe extern "C" fn(*const c_void) -> usize,
+    /// [`StageCtx::layer_idx`].
+    pub layer_idx: unsafe extern "C" fn(*const c_void) -> usize,
+    /// [`StageCtx::n_kv_heads`].
+    pub n_kv_heads: unsafe extern "C" fn(*const c_void) -> usize,
+    /// [`StageCtx::head_dim`].
+    pub head_dim: unsafe extern "C" fn(*const c_void) -> usize,
+    /// [`StageCtx::importance`]. `Some` → `true` + `out_ptr`/`out_len` 채움(borrow 는 ctx 수명),
+    /// `None` → `false`.
+    pub importance:
+        unsafe extern "C" fn(*const c_void, out_ptr: *mut *const f32, out_len: *mut usize) -> bool,
+    /// [`TensorHandle::read_row`] 평탄화. `kind`([`TensorKind`] u32) 가용 + 읽힘 → `true`(`out` 채움,
+    /// `out_len == shape().cols` 계약 — host 가 검증), 미가용 → `false`.
+    pub tensor_read_row: unsafe extern "C" fn(
+        *const c_void,
+        kind: u32,
+        row: usize,
+        kv_head: usize,
+        out: *mut f32,
+        out_len: usize,
+    ) -> bool,
+    /// [`TensorHandle::shape`] 평탄화. `kind` 가용 → `true`(`out` 채움), 미가용 → `false`.
+    pub tensor_shape: unsafe extern "C" fn(*const c_void, kind: u32, out: *mut TensorShape) -> bool,
+}
+
+/// [`KVCachePlan`] 의 C-ABI 평탄화(D5). plugin-arena 가 소유하는 안정 버퍼를 (ptr+len)으로 노출;
+/// host 가 즉시 복사 후 [`PluginVTableAbi::plan_free`]`(owner)` 로 plugin 이 자기 arena 를 회수한다
+/// ("각자 자기 것 free" — cross-allocator UB 차단).
+#[repr(C)]
+pub struct PlanAbi {
+    /// `0` = [`KeepSpec::LayerWide`], `1` = [`KeepSpec::PerHead`](v1 예약 — host 가 bail).
+    pub keep_kind: u32,
+    /// 보존 위치 ascending. LayerWide=전체, PerHead=전 head concat.
+    pub keep_ptr: *const usize,
+    /// `keep_ptr` 길이.
+    pub keep_len: usize,
+    /// PerHead 전용: head 별 keep 길이(LayerWide=null).
+    pub keep_outer_lens: *const usize,
+    /// `keep_outer_lens` 길이(= n_kv_heads, LayerWide=0).
+    pub keep_outer_count: usize,
+    /// 가중 merge 배열(없으면 len 0).
+    pub merges_ptr: *const MergeAbi,
+    /// `merges_ptr` 길이.
+    pub merges_len: usize,
+    /// plugin-arena 소유 핸들 → `plan_free(owner)`. host 는 절대 직접 free 금지.
+    pub owner: *mut c_void,
+}
+
+impl PlanAbi {
+    /// out-param 초기값(전부 null/0). host 가 `&mut` 로 plugin 에 넘긴다.
+    pub fn zeroed() -> Self {
+        PlanAbi {
+            keep_kind: 0,
+            keep_ptr: core::ptr::null(),
+            keep_len: 0,
+            keep_outer_lens: core::ptr::null(),
+            keep_outer_count: 0,
+            merges_ptr: core::ptr::null(),
+            merges_len: 0,
+            owner: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// [`WeightedMerge`] 의 C-ABI 평탄화(D5). `from` 은 별도 [`FromPairAbi`] 배열로.
+#[repr(C)]
+pub struct MergeAbi {
+    /// [`WeightedMerge::into`].
+    pub into: usize,
+    /// [`WeightedMerge::into_weight`].
+    pub into_weight: f32,
+    /// `(pos, weight)` 배열(plugin-arena 소유).
+    pub from_ptr: *const FromPairAbi,
+    /// `from_ptr` 길이.
+    pub from_len: usize,
+}
+
+/// `(pos, weight)` 쌍의 C-ABI POD(D5).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FromPairAbi {
+    /// evicted 토큰 위치.
+    pub pos: usize,
+    /// 병합 가중치.
+    pub weight: f32,
+}
+
+/// plugin 이 export 하는 단일 vtable(D2). plugin 은 `register_kv_stage_v1() -> *const PluginVTableAbi`
+/// 하나만 노출한다. vtable 은 plugin `.so` 의 `static` 이라 프로세스 수명 내내 유효.
+#[repr(C)]
+pub struct PluginVTableAbi {
+    /// [`KV_STAGE_ABI_VERSION`]. host 가 mismatch 시 거부.
+    pub abi_version: u32,
+    /// null-종단 canonical 이름(CLI `--eviction-policy` 매칭). plugin `.so` 의 `'static` str.
+    pub name: *const c_char,
+    /// `StageParams` → opaque plugin 인스턴스 핸들.
+    pub make: unsafe extern "C" fn(*const StageParams) -> *mut c_void,
+    /// 핸들 + ctx → plan. 반환 [`KV_PLAN_OK`]/[`KV_PLAN_NOOP`]/음수(err). `out_plan` 채움.
+    pub plan: unsafe extern "C" fn(*mut c_void, *const StageCtxAbi, *mut PlanAbi) -> i32,
+    /// `plan` 이 채운 [`PlanAbi::owner`] 를 회수(host 가 plan 복사 직후 호출).
+    pub plan_free: unsafe extern "C" fn(owner: *mut c_void),
+    /// plugin 인스턴스 핸들 해제(host 가 stage drop 시 호출).
+    pub drop: unsafe extern "C" fn(*mut c_void),
+}
+
+// SAFETY: vtable 은 불변이고 `name` 은 plugin `.so` 의 `'static` str 을 가리킨다. fn-ptr 는 본래
+// Send+Sync. 따라서 스레드 간 공유 안전 — plugin 의 `static VTABLE` 선언에 필요.
+unsafe impl Sync for PluginVTableAbi {}
+
+/// [`StageCtxAbi`] 의 한 [`TensorKind`] 를 [`TensorHandle`] 로 노출하는 어댑터([`AbiStageCtx`] 내부).
+/// `abi` borrow 는 어댑터 수명에 묶인다.
+pub struct AbiTensorHandle {
+    abi: *const StageCtxAbi,
+    kind: u32,
+    shape: TensorShape,
+}
+
+impl TensorHandle for AbiTensorHandle {
+    fn shape(&self) -> TensorShape {
+        self.shape
+    }
+    fn dtype(&self) -> TensorDtype {
+        // ABI 읽기 산출은 항상 f32(read_row 가 f32 out). 저장 dtype 은 v1 C-ABI 가 운반하지 않는다
+        // (진단용 필드 — 필요 시 abi_version 2 에서 tensor_dtype fn-ptr 추가).
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        // SAFETY: `abi` 는 AbiStageCtx 수명 동안 유효(생성 시 계약). out_len 계약(== cols)은 호출자 책임.
+        unsafe {
+            let a = &*self.abi;
+            (a.tensor_read_row)(a.ctx, self.kind, row, kv_head, out.as_mut_ptr(), out.len());
+        }
+    }
+}
+
+/// [`StageCtxAbi`](C fn-ptr 테이블) 위에 [`StageCtx`] 를 다시 구현하는 어댑터(D2 "write-once,
+/// link-either-way"). plugin 의 plan thunk 가 host 의 `StageCtxAbi` 를 이걸로 감싸 동일 `impl
+/// KVCacheStage::plan(&dyn StageCtx)` 를 호출한다.
+pub struct AbiStageCtx {
+    abi: *const StageCtxAbi,
+    // TensorKind(repr u32: Key=0/Value=1/AttnWeights=2/Scores=3) 인덱스. 생성 시 shape 프로빙.
+    handles: [Option<AbiTensorHandle>; 4],
+}
+
+impl AbiStageCtx {
+    /// # Safety
+    /// `abi` 는 유효한 [`StageCtxAbi`] 를 가리켜야 하고, 그 `ctx` + 모든 fn-ptr 은 이 어댑터 수명
+    /// 동안 살아 있어야 한다(host 가 plan 호출 동안 보장).
+    pub unsafe fn new(abi: *const StageCtxAbi) -> Self {
+        let a = unsafe { &*abi };
+        let kinds = [
+            TensorKind::Key,
+            TensorKind::Value,
+            TensorKind::AttnWeights,
+            TensorKind::Scores,
+        ];
+        let mut handles: [Option<AbiTensorHandle>; 4] = [None, None, None, None];
+        for kind in kinds {
+            let mut shape = TensorShape {
+                rows: 0,
+                cols: 0,
+                per_head: false,
+            };
+            // SAFETY: new 의 계약상 fn-ptr·ctx 유효.
+            let ok = unsafe { (a.tensor_shape)(a.ctx, kind as u32, &mut shape) };
+            if ok {
+                handles[kind as u32 as usize] = Some(AbiTensorHandle {
+                    abi,
+                    kind: kind as u32,
+                    shape,
+                });
+            }
+        }
+        AbiStageCtx { abi, handles }
+    }
+}
+
+impl StageCtx for AbiStageCtx {
+    fn current_pos(&self) -> usize {
+        // SAFETY: new 계약.
+        unsafe {
+            let a = &*self.abi;
+            (a.current_pos)(a.ctx)
+        }
+    }
+    fn target_len(&self) -> usize {
+        unsafe {
+            let a = &*self.abi;
+            (a.target_len)(a.ctx)
+        }
+    }
+    fn layer_idx(&self) -> usize {
+        unsafe {
+            let a = &*self.abi;
+            (a.layer_idx)(a.ctx)
+        }
+    }
+    fn n_kv_heads(&self) -> usize {
+        unsafe {
+            let a = &*self.abi;
+            (a.n_kv_heads)(a.ctx)
+        }
+    }
+    fn head_dim(&self) -> usize {
+        unsafe {
+            let a = &*self.abi;
+            (a.head_dim)(a.ctx)
+        }
+    }
+    fn importance(&self) -> Option<&[f32]> {
+        // SAFETY: new 계약. 반환 슬라이스 borrow 는 &self 에 묶여, host 가 보장하는 ctx 수명 내 유효.
+        unsafe {
+            let a = &*self.abi;
+            let mut ptr: *const f32 = core::ptr::null();
+            let mut len: usize = 0;
+            if (a.importance)(a.ctx, &mut ptr, &mut len) && !ptr.is_null() {
+                Some(core::slice::from_raw_parts(ptr, len))
+            } else {
+                None
+            }
+        }
+    }
+    fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+        self.handles[kind as u32 as usize]
+            .as_ref()
+            .map(|h| h as &dyn TensorHandle)
+    }
+}
+
+/// plugin-arena: plan thunk 가 [`KVCachePlan`] 을 평탄화해 안정 버퍼에 보관(D5). [`Self::into_abi`]
+/// 가 leak 한 Box 를 host 가 [`Self::free`] 로 회수한다. self-referential([`MergeAbi::from_ptr`] 가
+/// `from_storage` 를 가리킴)이나 Vec heap 버퍼는 이동하지 않아 안전.
+pub struct PlanArena {
+    keep: Vec<usize>,
+    keep_outer_lens: Vec<usize>,
+    keep_kind: u32,
+    // `merges[i].from_ptr` 가 가리키는 backing 버퍼. raw ptr 로만 참조되므로(직접 read 0)
+    // 컴파일러가 못 보지만, drop 시 ptr 가 dangling 되지 않도록 arena 가 소유해야 한다.
+    #[allow(dead_code)]
+    from_storage: Vec<Vec<FromPairAbi>>,
+    merges: Vec<MergeAbi>,
+}
+
+impl PlanArena {
+    fn from_plan(plan: KVCachePlan) -> Self {
+        let (keep_kind, keep, keep_outer_lens) = match plan.keep {
+            KeepSpec::LayerWide(k) => (0u32, k, Vec::new()),
+            KeepSpec::PerHead(heads) => {
+                let lens: Vec<usize> = heads.iter().map(|h| h.len()).collect();
+                let flat: Vec<usize> = heads.into_iter().flatten().collect();
+                (1u32, flat, lens)
+            }
+        };
+        // from_storage 를 먼저 채워 안정 주소를 확보한 뒤 merges 가 그것을 가리킨다.
+        let mut from_storage: Vec<Vec<FromPairAbi>> = Vec::with_capacity(plan.merges.len());
+        for m in &plan.merges {
+            from_storage.push(
+                m.from
+                    .iter()
+                    .map(|&(pos, weight)| FromPairAbi { pos, weight })
+                    .collect(),
+            );
+        }
+        let merges: Vec<MergeAbi> = plan
+            .merges
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MergeAbi {
+                into: m.into,
+                into_weight: m.into_weight,
+                from_ptr: from_storage[i].as_ptr(),
+                from_len: from_storage[i].len(),
+            })
+            .collect();
+        PlanArena {
+            keep,
+            keep_outer_lens,
+            keep_kind,
+            from_storage,
+            merges,
+        }
+    }
+
+    /// plan 을 평탄화·leak 하고 그것을 가리키는 [`PlanAbi`] 를 만든다. host 가 [`Self::free`]`(owner)`
+    /// 로 해제할 때까지 유효.
+    pub fn into_abi(plan: KVCachePlan) -> PlanAbi {
+        let arena = Box::new(Self::from_plan(plan));
+        let raw = Box::into_raw(arena);
+        // SAFETY: 방금 leak 한 유효 포인터.
+        let a = unsafe { &*raw };
+        PlanAbi {
+            keep_kind: a.keep_kind,
+            keep_ptr: a.keep.as_ptr(),
+            keep_len: a.keep.len(),
+            keep_outer_lens: if a.keep_outer_lens.is_empty() {
+                core::ptr::null()
+            } else {
+                a.keep_outer_lens.as_ptr()
+            },
+            keep_outer_count: a.keep_outer_lens.len(),
+            merges_ptr: a.merges.as_ptr(),
+            merges_len: a.merges.len(),
+            owner: raw as *mut c_void,
+        }
+    }
+
+    /// # Safety
+    /// `owner` 는 [`Self::into_abi`] 가 만든 `PlanArena` 포인터여야 하고, 정확히 1회만 호출해야 한다.
+    pub unsafe fn free(owner: *mut c_void) {
+        if !owner.is_null() {
+            drop(unsafe { Box::from_raw(owner as *mut PlanArena) });
+        }
+    }
+}
+
+/// stage plugin 을 정적(rlib→linkme) · 동적(cdylib→C-ABI) 양쪽에 등록하는 dual-wiring 매크로(D2).
+///
+/// `$make` 는 기존 [`KVCacheStageReg::make`] 와 동일한 `fn(StageParams) -> Box<dyn KVCacheStage>`
+/// (closure 가능). 동적 C-ABI export(`register_kv_stage_v1`)는 `plugin-cdylib` feature 로 게이트해,
+/// 정적 force-link 시 `#[no_mangle]` 심볼 충돌을 원천 차단한다(`.so` 빌드만 `--features plugin-cdylib`).
+///
+/// 한 plugin 크레이트당 1회만 호출한다(`.so` 는 단일 stage — D2).
+///
+/// ```ignore
+/// technique_api::register_kv_stage!("example_keep_recent", |_p| Box::new(KeepRecent));
+/// ```
+#[macro_export]
+macro_rules! register_kv_stage {
+    ($name:literal, $make:expr) => {
+        // ── 정적 경로 (rlib → linkme distributed_slice) ──
+        #[$crate::linkme::distributed_slice($crate::KV_CACHE_STAGES)]
+        static __REGISTER_KV_STAGE_REG: $crate::KVCacheStageReg = $crate::KVCacheStageReg {
+            name: $name,
+            make: $make,
+        };
+
+        // ── 동적 경로 (cdylib → C-ABI entry). feature 게이트로 정적 빌드 시 미emit ──
+        #[cfg(feature = "plugin-cdylib")]
+        const _: () = {
+            // 핸들 = Box<Box<dyn KVCacheStage>>(thin ptr). make/plan/drop 이 이 표현을 공유.
+            type __Handle = ::std::boxed::Box<dyn $crate::KVCacheStage>;
+
+            unsafe extern "C" fn __make(p: *const $crate::StageParams) -> *mut ::core::ffi::c_void {
+                // SAFETY: host 가 유효한 StageParams 포인터 전달(D2). StageParams 는 Copy POD.
+                let params = unsafe { *p };
+                let make_fn: fn($crate::StageParams) -> __Handle = $make;
+                let stage: __Handle = make_fn(params);
+                ::std::boxed::Box::into_raw(::std::boxed::Box::new(stage))
+                    as *mut ::core::ffi::c_void
+            }
+
+            unsafe extern "C" fn __plan(
+                h: *mut ::core::ffi::c_void,
+                ctx: *const $crate::StageCtxAbi,
+                out: *mut $crate::PlanAbi,
+            ) -> i32 {
+                // SAFETY: h 는 __make 가 만든 Box<Box<dyn>>, ctx 는 host 가 채운 유효 StageCtxAbi(D2).
+                let stage: &dyn $crate::KVCacheStage = unsafe { &**(h as *const __Handle) };
+                let abi_ctx = unsafe { $crate::AbiStageCtx::new(ctx) };
+                match stage.plan(&abi_ctx) {
+                    ::core::option::Option::None => $crate::KV_PLAN_NOOP,
+                    ::core::option::Option::Some(plan) => {
+                        let abi = $crate::PlanArena::into_abi(plan);
+                        // SAFETY: out 는 host 가 준 유효 &mut PlanAbi.
+                        unsafe {
+                            *out = abi;
+                        }
+                        $crate::KV_PLAN_OK
+                    }
+                }
+            }
+
+            unsafe extern "C" fn __plan_free(owner: *mut ::core::ffi::c_void) {
+                // SAFETY: owner 는 into_abi 가 만든 PlanArena, host 가 1회만 호출(D5).
+                unsafe { $crate::PlanArena::free(owner) };
+            }
+
+            unsafe extern "C" fn __drop(h: *mut ::core::ffi::c_void) {
+                // SAFETY: h 는 __make 가 만든 Box<Box<dyn>>, host 가 1회만 호출.
+                drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
+            }
+
+            static __VTABLE: $crate::PluginVTableAbi = $crate::PluginVTableAbi {
+                abi_version: $crate::KV_STAGE_ABI_VERSION,
+                name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
+                make: __make,
+                plan: __plan,
+                plan_free: __plan_free,
+                drop: __drop,
+            };
+
+            #[no_mangle]
+            pub extern "C" fn register_kv_stage_v1() -> *const $crate::PluginVTableAbi {
+                &__VTABLE
+            }
+        };
+    };
 }
 
 // ── weight 축 dispatch 타입 (ADR-0006 MW-A) ──
@@ -697,6 +1132,201 @@ mod tests {
     #[test]
     fn registered_names_contains_dummy() {
         assert!(registered_names().contains(&"dummy"));
+    }
+
+    // ── GATE-C C-ABI round-trip (ADR-0009 C1, `.so` 없이 in-process 검증) ──
+
+    /// host concrete ctx 모의 — StageCtxAbi 의 fn-ptr 들이 이 위로 동작.
+    struct HostCtx {
+        cur: usize,
+        tgt: usize,
+        imp: Vec<f32>,
+        key: Vec<f32>, // 비면 tensor(Key) Some(1 row × len), 빈면 None
+    }
+
+    unsafe extern "C" fn h_current_pos(c: *const c_void) -> usize {
+        unsafe { (*(c as *const HostCtx)).cur }
+    }
+    unsafe extern "C" fn h_target_len(c: *const c_void) -> usize {
+        unsafe { (*(c as *const HostCtx)).tgt }
+    }
+    unsafe extern "C" fn h_layer_idx(_c: *const c_void) -> usize {
+        0
+    }
+    unsafe extern "C" fn h_n_kv_heads(_c: *const c_void) -> usize {
+        1
+    }
+    unsafe extern "C" fn h_head_dim(c: *const c_void) -> usize {
+        unsafe { (*(c as *const HostCtx)).key.len().max(1) }
+    }
+    unsafe extern "C" fn h_importance(
+        c: *const c_void,
+        out_ptr: *mut *const f32,
+        out_len: *mut usize,
+    ) -> bool {
+        let h = unsafe { &*(c as *const HostCtx) };
+        if h.imp.is_empty() {
+            return false;
+        }
+        unsafe {
+            *out_ptr = h.imp.as_ptr();
+            *out_len = h.imp.len();
+        }
+        true
+    }
+    unsafe extern "C" fn h_tensor_shape(
+        c: *const c_void,
+        kind: u32,
+        out: *mut TensorShape,
+    ) -> bool {
+        let h = unsafe { &*(c as *const HostCtx) };
+        if kind == TensorKind::Key as u32 && !h.key.is_empty() {
+            unsafe {
+                *out = TensorShape {
+                    rows: 1,
+                    cols: h.key.len(),
+                    per_head: true,
+                };
+            }
+            true
+        } else {
+            false
+        }
+    }
+    unsafe extern "C" fn h_tensor_read_row(
+        c: *const c_void,
+        kind: u32,
+        _row: usize,
+        _kv_head: usize,
+        out: *mut f32,
+        out_len: usize,
+    ) -> bool {
+        let h = unsafe { &*(c as *const HostCtx) };
+        if kind == TensorKind::Key as u32 && out_len == h.key.len() {
+            unsafe { core::ptr::copy_nonoverlapping(h.key.as_ptr(), out, out_len) };
+            true
+        } else {
+            false
+        }
+    }
+
+    fn make_abi(host: &HostCtx) -> StageCtxAbi {
+        StageCtxAbi {
+            ctx: host as *const HostCtx as *const c_void,
+            current_pos: h_current_pos,
+            target_len: h_target_len,
+            layer_idx: h_layer_idx,
+            n_kv_heads: h_n_kv_heads,
+            head_dim: h_head_dim,
+            importance: h_importance,
+            tensor_read_row: h_tensor_read_row,
+            tensor_shape: h_tensor_shape,
+        }
+    }
+
+    #[test]
+    fn abi_stage_ctx_reproduces_scalars_and_importance() {
+        let host = HostCtx {
+            cur: 100,
+            tgt: 30,
+            imp: vec![1.0, 2.0, 3.0],
+            key: vec![],
+        };
+        let abi = make_abi(&host);
+        // SAFETY: abi(및 host)는 ctx 수명 동안 살아 있다.
+        let ctx = unsafe { AbiStageCtx::new(&abi) };
+        assert_eq!(ctx.current_pos(), 100);
+        assert_eq!(ctx.target_len(), 30);
+        assert_eq!(ctx.layer_idx(), 0);
+        assert_eq!(ctx.n_kv_heads(), 1);
+        assert_eq!(ctx.importance(), Some(&[1.0f32, 2.0, 3.0][..]));
+        // key 빈 → tensor(Key)/Value/Scores 모두 None(default sugar 도 trivial).
+        assert!(ctx.tensor(TensorKind::Key).is_none());
+        assert!(!ctx.has_head_scores());
+    }
+
+    #[test]
+    fn abi_stage_ctx_reproduces_tensor_read() {
+        let host = HostCtx {
+            cur: 10,
+            tgt: 5,
+            imp: vec![],
+            key: vec![1.5, 2.5, 3.5, 4.5],
+        };
+        let abi = make_abi(&host);
+        let ctx = unsafe { AbiStageCtx::new(&abi) };
+        assert!(ctx.importance().is_none());
+        let kh = ctx.tensor(TensorKind::Key).expect("Key 가용");
+        assert_eq!(kh.shape().cols, 4);
+        let mut out = [0.0f32; 4];
+        // dequant_k 는 tensor(Key) 위 default sugar — fn-ptr 를 타고 host key 를 채운다.
+        ctx.dequant_k(0, 0, &mut out);
+        assert_eq!(out, [1.5, 2.5, 3.5, 4.5]);
+    }
+
+    #[test]
+    fn plan_arena_layerwide_round_trip() {
+        let plan = KVCachePlan {
+            keep: KeepSpec::LayerWide(vec![70, 71, 72]),
+            merges: Vec::new(),
+        };
+        let abi = PlanArena::into_abi(plan.clone());
+        assert_eq!(abi.keep_kind, 0);
+        // SAFETY: into_abi 가 leak 한 유효 arena 를 free 전까지 읽는다.
+        let keep = unsafe { core::slice::from_raw_parts(abi.keep_ptr, abi.keep_len) };
+        assert_eq!(keep, &[70usize, 71, 72]);
+        assert_eq!(abi.merges_len, 0);
+        assert!(abi.keep_outer_lens.is_null());
+        unsafe { PlanArena::free(abi.owner) };
+    }
+
+    #[test]
+    fn plan_arena_with_merges_round_trip() {
+        let plan = KVCachePlan {
+            keep: KeepSpec::LayerWide(vec![0, 1]),
+            merges: vec![WeightedMerge {
+                into: 0,
+                into_weight: 0.6,
+                from: vec![(5, 0.2), (6, 0.2)],
+            }],
+        };
+        let abi = PlanArena::into_abi(plan.clone());
+        // host 측 reconstruct 미러(C2 가 동일 로직 수행).
+        let keep = unsafe { core::slice::from_raw_parts(abi.keep_ptr, abi.keep_len) }.to_vec();
+        let merges_abi = unsafe { core::slice::from_raw_parts(abi.merges_ptr, abi.merges_len) };
+        let merges: Vec<WeightedMerge> = merges_abi
+            .iter()
+            .map(|m| {
+                let from = unsafe { core::slice::from_raw_parts(m.from_ptr, m.from_len) };
+                WeightedMerge {
+                    into: m.into,
+                    into_weight: m.into_weight,
+                    from: from.iter().map(|p| (p.pos, p.weight)).collect(),
+                }
+            })
+            .collect();
+        let reconstructed = KVCachePlan {
+            keep: KeepSpec::LayerWide(keep),
+            merges,
+        };
+        assert_eq!(reconstructed, plan);
+        unsafe { PlanArena::free(abi.owner) };
+    }
+
+    #[test]
+    fn plan_arena_perhead_flattens_with_outer_lens() {
+        let plan = KVCachePlan {
+            keep: KeepSpec::PerHead(vec![vec![1, 2], vec![3, 4, 5]]),
+            merges: Vec::new(),
+        };
+        let abi = PlanArena::into_abi(plan);
+        assert_eq!(abi.keep_kind, 1);
+        let keep = unsafe { core::slice::from_raw_parts(abi.keep_ptr, abi.keep_len) };
+        assert_eq!(keep, &[1usize, 2, 3, 4, 5]); // 전 head concat
+        let lens =
+            unsafe { core::slice::from_raw_parts(abi.keep_outer_lens, abi.keep_outer_count) };
+        assert_eq!(lens, &[2usize, 3]);
+        unsafe { PlanArena::free(abi.owner) };
     }
 
     // ── weight stage (MW-B) ──
