@@ -1,0 +1,26 @@
+# 진행 원장: GATE-C 멀티-vtable bundle ABI (V1–V5)
+
+**시작**: 2026-06-09 · **SSOT**: `docs/adr/0010-gate-c-multi-vtable-bundle-abi.md` (E1–E7) · **선행**: ADR-0009(GATE-C 단일-vtable, D2/D6-defer 부분 supersede)
+
+## ▶ 재개 진입점
+"GATE-C v3 멀티-vtable — 원장 체크리스트의 다음 미완 V단계 1개 착수."
+
+## 컴파일-green 순서 결정 (커밋 위생)
+ABI 교체는 technique-api(V1)↔engine(V2)가 결합돼 있다. 깨진 commit 최소화 규칙:
+- **V1**: technique-api — 봉투/슬라이스/`export_plugin!` 추가 + `register_kv_*!` 재작성(const-block 격리 + 슬라이스 기여 + **no_mangle `register_kv_*_v1` entry 제거** ← multi-call 위해 필수). **`abi_version` vtable 필드는 V1 에서 유지**(엔진이 아직 읽음 → 컴파일 green), V2 에서 봉투로 이전+제거. `ABI_VERSION 1→2`.
+  - V1 후: `cargo build -p llm_rs2` green(필드 유지). 단 **구 통합 게이트(`gate_c_*.rs`)는 런타임 실패**(register_kv_*_v1 심볼 부재) → V5 에서 재작성. **중간 게이트는 `--lib` 만**(통합 테스트 제외).
+- **V2**: engine 로더 — `try_register_*`(봉투 읽기, `vtables.add(i)`, 2-pass) + `register_dynamic_plugins` + batch strict 래퍼 + `dynamic_registered_names→_stage_names` rename + **vtable `abi_version` 제거(struct+macro+engine read 동시)**.
+- **V3**: bin_setup W1+W2 + `ensure_builtin_kv_formats_registered` startup 배선.
+- **V4**: synth_q4/example 에 `export_plugin!()` + multi-format(서로 다른 desc ≥2) crate + no-export vehicle.
+- **V5**: `gate_c_*.rs` 재작성(v2 의미론, CF4 7요소 보존 매핑) + 전체 sanity.
+
+## 체크리스트
+- [x] **V1** `90b04aa7` technique-api: 봉투(`StageExportAbi`/`FormatExportAbi`) + `PLUGIN_*_VTABLES` 슬라이스(1곳 선언) + `register_kv_*!` 재작성(const-block 격리 + 슬라이스 기여 + no_mangle v1 entry 제거) + `export_plugin!()` + `ABI_VERSION 1→2` + plugin-cdylib feature. abi_version vtable 필드 V1 잔존(엔진 green). 게이트: technique-api **19/0**(OFF) + **20/0**(plugin-cdylib, 동적 다회 누적) + 봉투 sret round-trip 양축 + 정적/동적 다회 2건 + `cargo build -p llm_rs2` green + clippy clean.
+- [ ] **V2** engine 로더: `try_register_*`/`register_dynamic_plugins`/batch 래퍼/rename + vtable abi_version 제거. 게이트: `cargo build -p llm_rs2` + `cargo test -p llm_rs2 --lib`.
+- [ ] **V3** 배선: bin_setup W1/W2 + ensure_builtin startup. 게이트: build + `--lib` + 정적 e2e 무회귀.
+- [ ] **V4** vehicle: export_plugin! 적용 + multi-format crate + no-export. 게이트: `nm` 심볼.
+- [ ] **V5** 게이트: `gate_c_*.rs` 재작성 + 전체 sanity(완료 6게이트).
+
+## iter 로그
+- (iter 0, 2026-06-09) ADR-0010 커밋 `48d77243`. 적대적 리뷰 4렌즈 반영 완료. technique-api 매크로/vtable 전모 확보. 컴파일-green 순서 결정. V1 착수.
+- (iter 1, 2026-06-09) **V1 완료** `90b04aa7`. 봉투+슬라이스+매크로 재작성+export_plugin!. technique-api 19/0(OFF)·20/0(ON). 엔진/plugin crate build green(abi_version 잔존). 다음=V2(engine 로더).
