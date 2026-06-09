@@ -13,6 +13,7 @@
 
 pub mod builtin_kv_formats;
 pub mod dtype_layout;
+pub mod dynamic_format_registry;
 pub mod kv_cache_format;
 pub mod weight_format;
 
