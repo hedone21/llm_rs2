@@ -1,0 +1,23 @@
+[package]
+name = "example-kv-format"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# GATE-C v2(ADR-0009 D4): rlib = 정적 dep(자체 등록 테스트), cdylib = dlopen `.so`
+# (`--features plugin-cdylib` 빌드 시 register_kv_format_v1 C-ABI export).
+crate-type = ["cdylib", "rlib"]
+
+# 예제 format technique crate (ADR-0003 / ADR-0009 D4) — format 축 확장 기법은 `technique-api`
+# (확장 API) + `linkme`(정적 등록 매크로 확장이 `linkme::` 경로 하드코딩하므로 plugin 직접 dep 필수)에
+# 의존한다. 엔진(llm_rs2) / 다른 축 crate 엔 일절 의존하지 않음. stage 축 example-keep-recent 의
+# format 축 짝(기여자 템플릿). **엔진이 force-link 하지 않음** = 동적 등록 성공 경로(make_format
+# fallback)를 충돌 없이 실증하는 vehicle(synth_q4 는 엔진 force-link 라 builtin-collision).
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"
+
+[features]
+# GATE-C v2(ADR-0009 D4): cdylib C-ABI export(register_kv_format_v1) 활성화. 정적 force-link 빌드는
+# OFF 로 두어 `#[no_mangle]` 심볼 충돌을 원천 차단한다. `.so` 산출 시에만 켠다.
+plugin-cdylib = []

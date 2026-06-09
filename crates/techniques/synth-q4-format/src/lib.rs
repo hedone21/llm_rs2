@@ -10,8 +10,7 @@
 //! 엔진 타입(`KVCache`/`Backend`/`Buffer`)을 일절 참조하지 않고 descriptor(데이터)만 기여한다
 //! (compute 는 엔진이 floor 로 소유, ADR-0005 D3/D4).
 
-use linkme::distributed_slice;
-use technique_api::{KV_FORMATS, KVFormat, KVFormatReg, KVLayoutDesc, Packing, ScaleLayout};
+use technique_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
 
 /// `synth_q4` format — q4_0 layout 의 descriptor 만 제공(name + layout, 2-method).
 struct SynthQ4;
@@ -31,12 +30,10 @@ impl KVFormat for SynthQ4 {
     }
 }
 
-/// 등록 — 엔진은 `find_kv_format("synth_q4")` 로 이 descriptor 를 찾는다(DType variant 불요).
-#[distributed_slice(KV_FORMATS)]
-static SYNTH_Q4_FORMAT: KVFormatReg = KVFormatReg {
-    name: "synth_q4",
-    make: || Box::new(SynthQ4),
-};
+// 등록(dual-wiring, ADR-0009 D4) — 정적: linkme `KV_FORMATS`(엔진이 `find_kv_format("synth_q4")` 로
+// 발견, DType variant 불요). 동적(`--features plugin-cdylib`): `register_kv_format_v1` C-ABI export
+// (host 가 dlopen). 한 줄로 양쪽.
+technique_api::register_kv_format!("synth_q4", || Box::new(SynthQ4));
 
 #[cfg(test)]
 mod tests {
