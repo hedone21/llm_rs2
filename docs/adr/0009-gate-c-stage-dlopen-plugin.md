@@ -1,6 +1,6 @@
 # ADR-0009: GATE-C — Stage 축 `.so` cdylib dlopen plugin 승격 (북극성 zero-compile install, ADR-0007 D6 해결)
 
-> **Status**: Accepted · **설계 grill 완주 2026-06-09** (Q1–Q7 잠금, 구현 착수 전)
+> **Status**: Accepted · **구현 완주 2026-06-09** (C1 `851e4d03` / C2 `c1e4b986` / C3 `88926e0c` / C4 `a5ae6fd3` / C5 `5a6a44bc`). 게이트: technique-api 15/15 · lib **1260/0** · clippy `--workspace` clean · GATE-C dlopen 통합 테스트 1/1(plan-identity + merge + reject 2종) · release fat-LTO 빌드 green · production `argus_cli --load-plugin <release .so>` startup dlopen 등록 + coherent 추론 실증. (설계 grill: Q1–Q7 잠금 2026-06-09)
 > **Date**: 2026-06-09
 > **Decision-makers**: 사용자 + 메인 세션 (GATE-C 설계 grill 세션 — landscape map 워크플로 `wf_2e3f5e9d` 6영역 fan-out + 직접 코드 검증 후 Q1–Q7 1문항씩 grill)
 > **Selected**: 기존 정적 linkme `KV_CACHE_STAGES` 등록을 **런타임 `.so`(cdylib) dlopen 으로 승격**하되 정적 슬라이스는 **보존(가산, replace 아님)** 한다. plugin 은 단일 `register_kv_stage_v1() -> *const PluginVTableAbi` C-ABI 심볼을 export 하고, `&dyn StageCtx`(C-ABI 불안정 trait object)는 `#[repr(C)]` fn-ptr 테이블(`StageCtxAbi`)로 평탄화한다. `panic` 은 **호스트 abort 를 상속**(정적 stage 와 parity, catch_unwind 격리는 untrusted plugin 요구 시 defer). `KVCachePlan` 출력은 **plugin-arena → host-copy → plan_free**("각자 자기 것 free")로 마샬링. v1 범위 = **Stage 축만**(가장 어려운 fn-ptr ABI 를 먼저 증명 → Format v2 / Backend v3 재사용). 완료 게이트 = **plan-identity**(정적-링크 stage 와 dlopen stage 가 동일 ctx 에 동일 `KVCachePlan`, token-identity 금지). **host-implementable**(CPU only, GPU 불필요).
