@@ -979,6 +979,106 @@ pub fn registered_kv_format_names() -> Vec<&'static str> {
     KV_FORMATS.iter().map(|r| r.name).collect()
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// GATE-C v2 — Format 축 `.so` cdylib dlopen plugin C-ABI (ADR-0009 D4)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Stage 축(위 GATE-C)과 동형이나 **압도적으로 단순**하다: [`KVFormat`] 은 콜백 0(ctx 도 plan 도
+// 없는 순수 descriptor — `name`+`layout`)이라 [`StageCtxAbi`]/[`PlanAbi`]/[`PlanArena`] 가 전부
+// 불필요. vtable 은 `make`(opaque 핸들) + `layout`([`KVLayoutDesc`] POD by-value) + `drop` 만 운반.
+// `KVLayoutDesc`/`ScaleLayout`/`Packing` 은 이미 `#[repr(C)]`/`#[repr(u32)]` 라 fn-ptr 반환으로
+// 그대로 값 전달된다(reshape 0). plugin 은 단일 `register_kv_format_v1() -> *const FormatVTableAbi`
+// 만 export(D6 landmine: stage/format/backend register 심볼 분리 — 통합 금지).
+
+/// `register_kv_format_v1` 이 반환하는 vtable 의 ABI 버전. host 가 mismatch 시 로드 거부(D6).
+pub const KV_FORMAT_ABI_VERSION: u32 = 1;
+
+/// [`KVFormat`] 의 C-ABI 평탄화(D4). plugin 이 export 하는 단일 vtable. `name` 은 registry 매칭용
+/// 정적 식별자(`'static`), `layout` 은 핸들 인스턴스의 [`KVLayoutDesc`] 를 POD by-value 로 반환한다.
+///
+/// Stage 의 `plan`/`plan_free`(arena 마샬링)에 대응하는 것이 없다 — descriptor 는 stack POD 라
+/// cross-allocator 경계가 발생하지 않는다("각자 자기 것 free" 는 핸들 lifecycle(`make`/`drop`)에만
+/// 적용).
+#[repr(C)]
+pub struct FormatVTableAbi {
+    /// [`KV_FORMAT_ABI_VERSION`]. host 가 mismatch 시 거부.
+    pub abi_version: u32,
+    /// null-종단 canonical 이름(`--kv-format`/registry 매칭). plugin `.so` 의 `'static` str.
+    pub name: *const c_char,
+    /// format 인스턴스 생성 → opaque 핸들. host 가 `make_format` 시 호출.
+    pub make: unsafe extern "C" fn() -> *mut c_void,
+    /// 핸들 → [`KVLayoutDesc`](POD by-value). 엔진 generic floor 가 읽는 그 descriptor(D3).
+    pub layout: unsafe extern "C" fn(*mut c_void) -> KVLayoutDesc,
+    /// format 인스턴스 핸들 해제(host 가 format drop 시 호출).
+    pub drop: unsafe extern "C" fn(*mut c_void),
+}
+
+// SAFETY: vtable 은 불변이고 `name` 은 plugin `.so` 의 `'static` str 을 가리킨다. fn-ptr 는 본래
+// Send+Sync. plugin 의 `static VTABLE` 선언에 필요.
+unsafe impl Sync for FormatVTableAbi {}
+
+/// format plugin 을 정적(rlib→linkme) · 동적(cdylib→C-ABI) 양쪽에 등록하는 dual-wiring 매크로(D4).
+///
+/// `$make` 는 기존 [`KVFormatReg::make`] 와 동일한 `fn() -> Box<dyn KVFormat>`(closure 가능). 동적
+/// C-ABI export(`register_kv_format_v1`)는 `plugin-cdylib` feature 로 게이트해, 정적 force-link 시
+/// `#[no_mangle]` 심볼 충돌을 원천 차단한다(`.so` 빌드만 `--features plugin-cdylib`). [`register_kv_stage!`]
+/// 의 format 축 짝.
+///
+/// 한 plugin 크레이트당 1회만 호출한다(`.so` 는 단일 format — D4).
+///
+/// ```ignore
+/// technique_api::register_kv_format!("synth_q4", || Box::new(SynthQ4));
+/// ```
+#[macro_export]
+macro_rules! register_kv_format {
+    ($name:literal, $make:expr) => {
+        // ── 정적 경로 (rlib → linkme distributed_slice) ──
+        #[$crate::distributed_slice($crate::KV_FORMATS)]
+        static __REGISTER_KV_FORMAT_REG: $crate::KVFormatReg = $crate::KVFormatReg {
+            name: $name,
+            make: $make,
+        };
+
+        // ── 동적 경로 (cdylib → C-ABI entry). feature 게이트로 정적 빌드 시 미emit ──
+        #[cfg(feature = "plugin-cdylib")]
+        const _: () = {
+            // 핸들 = Box<Box<dyn KVFormat>>(thin ptr). make/layout/drop 이 이 표현을 공유.
+            type __Handle = ::std::boxed::Box<dyn $crate::KVFormat>;
+
+            unsafe extern "C" fn __make() -> *mut ::core::ffi::c_void {
+                let make_fn: fn() -> __Handle = $make;
+                let fmt: __Handle = make_fn();
+                ::std::boxed::Box::into_raw(::std::boxed::Box::new(fmt))
+                    as *mut ::core::ffi::c_void
+            }
+
+            unsafe extern "C" fn __layout(h: *mut ::core::ffi::c_void) -> $crate::KVLayoutDesc {
+                // SAFETY: h 는 __make 가 만든 Box<Box<dyn>>. layout()은 POD 반환(arena 불요).
+                let fmt: &dyn $crate::KVFormat = unsafe { &**(h as *const __Handle) };
+                fmt.layout()
+            }
+
+            unsafe extern "C" fn __drop(h: *mut ::core::ffi::c_void) {
+                // SAFETY: h 는 __make 가 만든 Box<Box<dyn>>, host 가 1회만 호출.
+                drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
+            }
+
+            static __VTABLE: $crate::FormatVTableAbi = $crate::FormatVTableAbi {
+                abi_version: $crate::KV_FORMAT_ABI_VERSION,
+                name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
+                make: __make,
+                layout: __layout,
+                drop: __drop,
+            };
+
+            #[unsafe(no_mangle)] // Rust 2024: no_mangle 은 unsafe attribute.
+            pub extern "C" fn register_kv_format_v1() -> *const $crate::FormatVTableAbi {
+                &__VTABLE
+            }
+        };
+    };
+}
+
 // ── Backend capability 축 plugin registry (ADR-0005 D4/D6) ──
 
 /// Backend capability plugin trait — backend 소유 커널 위의 특화 opt-in 능력(ADR-0005 D4/D5).
@@ -1328,6 +1428,67 @@ mod tests {
             unsafe { core::slice::from_raw_parts(abi.keep_outer_lens, abi.keep_outer_count) };
         assert_eq!(lens, &[2usize, 3]);
         unsafe { PlanArena::free(abi.owner) };
+    }
+
+    // ── GATE-C v2 Format C-ABI round-trip (ADR-0009 CF1, `.so` 없이 in-process 검증) ──
+
+    /// 테스트용 format — q4_0-like descriptor. 매크로가 emit 하는 것과 동형의 핸들 lifecycle
+    /// (make/layout/drop) thunk 를 노출해 [`KVLayoutDesc`] POD by-value 전달의 무손실을 검증한다.
+    struct RtFormat;
+    impl KVFormat for RtFormat {
+        fn name(&self) -> &str {
+            "rt_format"
+        }
+        fn layout(&self) -> KVLayoutDesc {
+            KVLayoutDesc {
+                block_elems: 32,
+                bits: 4,
+                scale_layout: ScaleLayout::PerBlockF16,
+                packing: Packing::Nibble,
+            }
+        }
+    }
+
+    type RtHandle = Box<dyn KVFormat>;
+    unsafe extern "C" fn rt_make() -> *mut c_void {
+        Box::into_raw(Box::new(Box::new(RtFormat) as RtHandle)) as *mut c_void
+    }
+    unsafe extern "C" fn rt_layout(h: *mut c_void) -> KVLayoutDesc {
+        // SAFETY: h 는 rt_make 가 만든 Box<Box<dyn KVFormat>>.
+        let fmt: &dyn KVFormat = unsafe { &**(h as *const RtHandle) };
+        fmt.layout()
+    }
+    unsafe extern "C" fn rt_drop(h: *mut c_void) {
+        // SAFETY: h 는 rt_make 가 만든 Box<Box<dyn>>, 1회만 호출.
+        drop(unsafe { Box::from_raw(h as *mut RtHandle) });
+    }
+
+    #[test]
+    fn format_vtable_layout_pod_round_trip() {
+        // 매크로의 cdylib 경로(plugin-cdylib)와 동형의 vtable 을 수동 구성해 ABI 경로를 feature 없이 검증.
+        let vtable = FormatVTableAbi {
+            abi_version: KV_FORMAT_ABI_VERSION,
+            name: b"rt_format\0".as_ptr() as *const c_char,
+            make: rt_make,
+            layout: rt_layout,
+            drop: rt_drop,
+        };
+        assert_eq!(vtable.abi_version, 1);
+        // make → layout → drop: KVLayoutDesc 가 extern "C" 경계를 값으로 무손실 왕복.
+        let handle = unsafe { (vtable.make)() };
+        assert!(!handle.is_null(), "make 가 non-null 핸들 반환");
+        let desc = unsafe { (vtable.layout)(handle) };
+        assert_eq!(
+            desc,
+            RtFormat.layout(),
+            "KVLayoutDesc 가 extern \"C\" by-value 로 무손실 전달"
+        );
+        // name(null-종단 'static) 회수.
+        let name = unsafe { core::ffi::CStr::from_ptr(vtable.name) }
+            .to_str()
+            .unwrap();
+        assert_eq!(name, "rt_format");
+        unsafe { (vtable.drop)(handle) };
     }
 
     // ── weight stage (MW-B) ──
