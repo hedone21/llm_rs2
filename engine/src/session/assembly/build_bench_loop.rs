@@ -14,7 +14,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::backend::Backend;
-use crate::buffer::DType;
 use crate::inference::sampling::SamplingConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
@@ -24,10 +23,11 @@ use crate::pressure::eviction::EvictionPolicy;
 use crate::pressure::eviction::h2o_plus::H2OPlusPolicy;
 use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
 use crate::pressure::eviction::stage_registry::StageBackedPolicy;
+use crate::pressure::kv_cache::KVCache;
 use crate::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::cli::Args;
-use crate::session::forward::{ModelForward, alloc_standard_kv_caches};
+use crate::session::forward::ModelForward;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
@@ -138,35 +138,42 @@ pub fn build_resilience_cache_manager(
 
 /// [`build_standard_loop`](super::build_standard_loop) 와 동일 골격 + resilience
 /// eviction `CacheManager` 주입. `cache_manager=None` 이면 happy-path 와 동등.
+///
+/// `kv_caches`: `bin_setup`이 `--kv-format`/`--kv-type` dispatch로 이미 할당한
+/// KV cache (typed 또는 ADR-0008 opaque). builder는 재할당하지 않고 소비한다.
 #[allow(clippy::too_many_arguments)]
 pub fn build_bench_loop(
     backend: Arc<dyn Backend>,
     memory: Arc<dyn Memory>,
     cpu_backend: Arc<dyn Backend>,
     model: TransformerModel,
-    initial_kv_capacity: usize,
+    kv_caches: Vec<KVCache>,
     max_seq_len: usize,
-    kv_dtype: DType,
     sampling_config: SamplingConfig,
     plan_enabled: bool,
     resilience: Option<ResilienceAdapter>,
     cache_manager: Option<CacheManager>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
-    let kv = alloc_standard_kv_caches(
-        &model,
-        backend.clone(),
-        memory.clone(),
-        initial_kv_capacity,
+    // ADR-0008: decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고
+    // (build_standard_loop 와 동일 — alloc-시점 로그는 drop돼도 찍혀 증거 못 됨).
+    let kv_is_opaque = kv_caches.first().is_some_and(|c| c.is_opaque());
+    eprintln!(
+        "[DecodeLoop] kv storage = {} (layers={}, cap={})",
+        if kv_is_opaque {
+            "OPAQUE (descriptor-driven)"
+        } else {
+            "typed"
+        },
+        kv_caches.len(),
         max_seq_len,
-        kv_dtype,
-    )?;
+    );
     let mf = ModelForward::new(
         backend,
         memory,
         cpu_backend,
         Arc::new(model),
-        kv,
+        kv_caches,
         max_seq_len,
         plan_enabled,
     )?;

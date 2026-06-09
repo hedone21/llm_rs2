@@ -9,7 +9,6 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
-use crate::buffer::DType;
 use crate::hardware::{DeviceTarget, Hardware};
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::memory::Memory;
@@ -28,9 +27,7 @@ pub struct StandardHappyCtx {
     pub tokenizer: Tokenizer,
     pub kv_caches: Vec<KVCache>,
     pub tokens: Vec<u32>,
-    pub initial_kv_capacity: usize,
     pub max_seq_len: usize,
-    pub kv_type: DType,
     pub sampling_config: SamplingConfig,
     pub vocab_size: usize,
     /// P4: ResilienceAdapter 주입 (None 이면 NoOp default).
@@ -47,9 +44,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         tokenizer,
         kv_caches,
         tokens,
-        initial_kv_capacity,
         max_seq_len,
-        kv_type,
         sampling_config,
         vocab_size,
         resilience,
@@ -69,19 +64,16 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args.num_tokens
     );
 
-    // Drop dead production-fallback KV caches so build_standard_loop's
-    // allocation does not coexist with a never-used pool for the lifetime
-    // of `main()`.
-    drop(kv_caches);
-
+    // ADR-0008: bin_setup이 --kv-format/--kv-type dispatch로 할당한 kv_caches를
+    // 그대로 소비한다(과거엔 drop 후 build_standard_loop이 typed로 재할당 →
+    // --kv-format opaque 선택이 decode 경로에 도달 못 했다).
     let mut decode_loop = build_standard_loop(
         backend.clone(),
         memory.clone(),
         cpu_backend_arc.clone(),
         model,
-        initial_kv_capacity,
+        kv_caches,
         max_seq_len,
-        kv_type,
         sampling_config.clone(),
         !args.no_gpu_plan,
         resilience,

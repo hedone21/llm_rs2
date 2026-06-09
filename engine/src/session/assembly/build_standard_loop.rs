@@ -24,12 +24,12 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::backend::Backend;
-use crate::buffer::DType;
 use crate::inference::sampling::SamplingConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
+use crate::pressure::kv_cache::KVCache;
 use crate::session::cli::Args;
-use crate::session::forward::{ModelForward, alloc_standard_kv_caches};
+use crate::session::forward::ModelForward;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
@@ -78,8 +78,11 @@ pub fn is_standard_happy_path(args: &Args) -> bool {
 /// chat/eval-ll/ppl/batch는 early-return 구조이므로 표준 path 진입 시점에
 /// 다른 분기로 흐를 가능성 없음 (자연스러운 모순 없음).
 ///
-/// - `max_seq_len`: KV cache 용량 + lazy `PrefillWorkspace` cap
-/// - `kv_dtype`: KV cache element type (F32/F16/Q4_0). 호출자가 args에서 결정
+/// - `kv_caches`: `bin_setup`이 `--kv-format`/`--kv-type` dispatch로 이미 할당한
+///   KV cache (typed 또는 ADR-0008 opaque). builder는 재할당하지 않고 소비한다 —
+///   과거에는 builder가 `alloc_standard_kv_caches`로 typed를 재할당하여 `ctx`의
+///   opaque 선택을 덮어썼다(`--kv-format`이 decode 경로에 도달 못 함).
+/// - `max_seq_len`: lazy `PrefillWorkspace` cap
 /// - `resilience`: P3.3 — `Some(adapter)` 이면 3 slot에 주입, `None` 이면 NoOp default.
 #[allow(clippy::too_many_arguments)]
 pub fn build_standard_loop(
@@ -87,28 +90,34 @@ pub fn build_standard_loop(
     memory: Arc<dyn Memory>,
     cpu_backend: Arc<dyn Backend>,
     model: TransformerModel,
-    initial_kv_capacity: usize,
+    kv_caches: Vec<KVCache>,
     max_seq_len: usize,
-    kv_dtype: DType,
     sampling_config: SamplingConfig,
     plan_enabled: bool,
     resilience: Option<ResilienceAdapter>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
-    let kv = alloc_standard_kv_caches(
-        &model,
-        backend.clone(),
-        memory.clone(),
-        initial_kv_capacity,
+    // ADR-0008: decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고한다.
+    // bin_setup의 alloc-시점 "KV format" 로그는 caches가 drop돼도 찍히므로 증거가
+    // 못 된다(과거 false-positive e2e의 원인). ModelForward가 소비하기 직전의
+    // 이 identity가 진짜 decode 경로 증거다.
+    let kv_is_opaque = kv_caches.first().is_some_and(|c| c.is_opaque());
+    eprintln!(
+        "[DecodeLoop] kv storage = {} (layers={}, cap={})",
+        if kv_is_opaque {
+            "OPAQUE (descriptor-driven)"
+        } else {
+            "typed"
+        },
+        kv_caches.len(),
         max_seq_len,
-        kv_dtype,
-    )?;
+    );
     let mf = ModelForward::new(
         backend,
         memory,
         cpu_backend,
         Arc::new(model),
-        kv,
+        kv_caches,
         max_seq_len,
         plan_enabled,
     )?;

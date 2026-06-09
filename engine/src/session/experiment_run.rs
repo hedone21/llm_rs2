@@ -27,9 +27,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         model,
         tokenizer,
         kv_caches,
-        initial_kv_capacity,
         max_seq_len,
-        kv_type,
         sampling_config,
         vocab_size,
         resilience,
@@ -49,10 +47,6 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args.num_tokens
     );
 
-    // build_standard_loop 가 자체 KV cache 를 할당하므로 셋업 단계에서 만든
-    // pool 은 사용하지 않는다 (standard_happy 와 동일).
-    drop(kv_caches);
-
     let mut sys_sampler = SystemSampler::new(args.experiment_sample_interval);
     let sys_start = args
         .experiment_output
@@ -63,14 +57,14 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     // (eviction=none 이면 None → happy-path 동등). plan.evict directive 가 오면
     // decode 루프가 forward.try_evict 로 mid-decode prune.
     let cache_manager = build_resilience_cache_manager(&args, &backend)?;
+    // ADR-0008: bin_setup이 dispatch한 kv_caches를 소비(과거엔 drop 후 typed 재할당).
     let mut decode_loop = build_bench_loop(
         backend.clone(),
         memory.clone(),
         cpu_backend_arc.clone(),
         model,
-        initial_kv_capacity,
+        kv_caches,
         max_seq_len,
-        kv_type,
         sampling_config.clone(),
         !args.no_gpu_plan,
         resilience,
