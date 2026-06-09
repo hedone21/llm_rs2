@@ -283,8 +283,8 @@ pub fn registered_names() -> Vec<&'static str> {
 // handle 로 평탄화한다(D2). [`AbiStageCtx`] 어댑터가 `StageCtxAbi` 위에 `StageCtx` 를 다시
 // 구현해, plugin 저자는 정적/동적 무관하게 동일한 `impl KVCacheStage` 코드를 쓴다.
 
-/// `register_kv_stage_v1` 이 반환하는 vtable 의 ABI 버전. host 가 mismatch 시 로드 거부(D6).
-pub const KV_STAGE_ABI_VERSION: u32 = 1;
+/// `register_kv_stages_v2` 봉투([`StageExportAbi`])의 ABI 버전. host 가 mismatch 시 로드 거부(ADR-0010 E1).
+pub const KV_STAGE_ABI_VERSION: u32 = 2;
 
 /// [`PluginVTableAbi::plan`] 반환 코드: 정상(`out_plan` 채워짐).
 pub const KV_PLAN_OK: i32 = 0;
@@ -390,11 +390,12 @@ pub struct FromPairAbi {
     pub weight: f32,
 }
 
-/// plugin 이 export 하는 단일 vtable(D2). plugin 은 `register_kv_stage_v1() -> *const PluginVTableAbi`
-/// 하나만 노출한다. vtable 은 plugin `.so` 의 `static` 이라 프로세스 수명 내내 유효.
+/// 한 stage 의 C-ABI vtable(D2). v2(ADR-0010)에서 plugin 은 이 vtable 들을 [`PLUGIN_KV_STAGE_VTABLES`]
+/// 슬라이스에 누적하고 `register_kv_stages_v2()` 가 [`StageExportAbi`] 봉투로 묶어 노출한다(한 `.so` 다수
+/// stage 허용). vtable 은 plugin `.so` 의 `static` 이라 프로세스 수명 내내 유효.
 #[repr(C)]
 pub struct PluginVTableAbi {
-    /// [`KV_STAGE_ABI_VERSION`]. host 가 mismatch 시 거부.
+    /// (v2 에서 deprecated — ABI 게이트는 봉투 [`StageExportAbi::abi_version`] 가 담당. V2 단계에서 제거 예정.)
     pub abi_version: u32,
     /// null-종단 canonical 이름(CLI `--eviction-policy` 매칭). plugin `.so` 의 `'static` str.
     pub name: *const c_char,
@@ -409,8 +410,28 @@ pub struct PluginVTableAbi {
 }
 
 // SAFETY: vtable 은 불변이고 `name` 은 plugin `.so` 의 `'static` str 을 가리킨다. fn-ptr 는 본래
-// Send+Sync. 따라서 스레드 간 공유 안전 — plugin 의 `static VTABLE` 선언에 필요.
+// Send+Sync. 따라서 스레드 간 공유 안전 — plugin 의 distributed_slice element static 선언에 필요(ADR-0010 E1).
 unsafe impl Sync for PluginVTableAbi {}
+
+/// stage 축 봉투(ADR-0010 E1) — 한 plugin `.so` 의 stage vtable 들을 한 번에 신고. `register_kv_stages_v2()`
+/// 가 **by-value** 로 반환(sret >16B; `count`/`vtables` 는 슬라이스에서 런타임 도출이라 const static 불가).
+/// `vtables` 는 [`PLUGIN_KV_STAGE_VTABLES`] base(`.so` static) → `.so` 수명 동안 유효, `count==0` 가능(빈 축).
+#[repr(C)]
+pub struct StageExportAbi {
+    /// [`KV_STAGE_ABI_VERSION`]. host 가 mismatch 시 `.so` 거부(.so 당 ABI 1개).
+    pub abi_version: u32,
+    /// `vtables` 가 가리키는 연속 배열 길이.
+    pub count: usize,
+    /// `count` 개의 [`PluginVTableAbi`] 연속 배열(`.so` static). 로더는 `vtables.add(i)` 로 원소 접근.
+    pub vtables: *const PluginVTableAbi,
+}
+
+/// plugin `.so` 내부에서 stage vtable 들을 누적하는 슬라이스(ADR-0010 E2). **선언은 technique-api 1곳**
+/// (linkme section 명이 선언 static 이름으로 결정 — plugin 측 선언은 cross-crate 기여를 깸). `register_kv_stage!`
+/// 가 plugin-cdylib 게이트 하에 const-block 격리 static 으로 기여(다회 호출 = 다수 stage). 정적 빌드에선 빈 채
+/// 무해(엔진은 `KV_CACHE_STAGES` 만 읽음).
+#[distributed_slice]
+pub static PLUGIN_KV_STAGE_VTABLES: [PluginVTableAbi] = [..];
 
 /// [`StageCtxAbi`] 의 한 [`TensorKind`] 를 [`TensorHandle`] 로 노출하는 어댑터([`AbiStageCtx`] 내부).
 /// `abi` borrow 는 어댑터 수명에 묶인다.
@@ -624,22 +645,29 @@ impl PlanArena {
 /// (closure 가능). 동적 C-ABI export(`register_kv_stage_v1`)는 `plugin-cdylib` feature 로 게이트해,
 /// 정적 force-link 시 `#[no_mangle]` 심볼 충돌을 원천 차단한다(`.so` 빌드만 `--features plugin-cdylib`).
 ///
-/// 한 plugin 크레이트당 1회만 호출한다(`.so` 는 단일 stage — D2).
+/// 한 plugin 크레이트(`.so`)에서 **여러 번 호출 가능**(다수 stage — ADR-0010 E2). 기여 static 은 모두
+/// 익명 `const _: () = {}` 스코프에 격리돼 invocation 간 충돌하지 않는다(linkme static element 는 ident
+/// rename 안 함 → 스코프 격리가 유일 회피책). `.so` 엔트리(`register_kv_stages_v2`)는 별도 [`export_plugin!`]
+/// 가 `.so` 당 1회 emit 한다.
 ///
 /// ```ignore
 /// technique_api::register_kv_stage!("example_keep_recent", |_p| Box::new(KeepRecent));
+/// technique_api::export_plugin!();   // .so 당 1회
 /// ```
 #[macro_export]
 macro_rules! register_kv_stage {
     ($name:literal, $make:expr) => {
-        // ── 정적 경로 (rlib → linkme distributed_slice) ──
-        #[$crate::distributed_slice($crate::KV_CACHE_STAGES)]
-        static __REGISTER_KV_STAGE_REG: $crate::KVCacheStageReg = $crate::KVCacheStageReg {
-            name: $name,
-            make: $make,
+        // ── 정적 경로 (rlib → linkme distributed_slice). const-block 격리 = 다회 호출 허용(E2). ──
+        const _: () = {
+            #[$crate::distributed_slice($crate::KV_CACHE_STAGES)]
+            static __REG: $crate::KVCacheStageReg = $crate::KVCacheStageReg {
+                name: $name,
+                make: $make,
+            };
         };
 
-        // ── 동적 경로 (cdylib → C-ABI entry). feature 게이트로 정적 빌드 시 미emit ──
+        // ── 동적 경로 (cdylib → PLUGIN_KV_STAGE_VTABLES 기여). plugin-cdylib 게이트로 정적 빌드 시 미emit. ──
+        // entry(register_kv_stages_v2)는 export_plugin! 가 emit; 여기선 vtable 만 슬라이스에 기여(E2).
         #[cfg(feature = "plugin-cdylib")]
         const _: () = {
             // 핸들 = Box<Box<dyn KVCacheStage>>(thin ptr). make/plan/drop 이 이 표현을 공유.
@@ -647,6 +675,7 @@ macro_rules! register_kv_stage {
 
             unsafe extern "C" fn __make(p: *const $crate::StageParams) -> *mut ::core::ffi::c_void {
                 // SAFETY: host 가 유효한 StageParams 포인터 전달(D2). StageParams 는 Copy POD.
+                // ADR-0009 #116: $make(Rust-ABI fn)는 여기 내부 호출 전용 — extern "C" 직접 캐스팅 금지.
                 let params = unsafe { *p };
                 let make_fn: fn($crate::StageParams) -> __Handle = $make;
                 let stage: __Handle = make_fn(params);
@@ -685,19 +714,16 @@ macro_rules! register_kv_stage {
                 drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
             }
 
+            // vtable 을 PLUGIN_KV_STAGE_VTABLES 에 기여(const-block 격리 = 다회 호출 시 누적). entry 아님.
+            #[$crate::distributed_slice($crate::PLUGIN_KV_STAGE_VTABLES)]
             static __VTABLE: $crate::PluginVTableAbi = $crate::PluginVTableAbi {
-                abi_version: $crate::KV_STAGE_ABI_VERSION,
+                abi_version: $crate::KV_STAGE_ABI_VERSION, // V1 잔존 — V2 에서 봉투로 이전 후 제거.
                 name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
                 make: __make,
                 plan: __plan,
                 plan_free: __plan_free,
                 drop: __drop,
             };
-
-            #[unsafe(no_mangle)] // Rust 2024: no_mangle 은 unsafe attribute.
-            pub extern "C" fn register_kv_stage_v1() -> *const $crate::PluginVTableAbi {
-                &__VTABLE
-            }
         };
     };
 }
@@ -990,8 +1016,8 @@ pub fn registered_kv_format_names() -> Vec<&'static str> {
 // 그대로 값 전달된다(reshape 0). plugin 은 단일 `register_kv_format_v1() -> *const FormatVTableAbi`
 // 만 export(D6 landmine: stage/format/backend register 심볼 분리 — 통합 금지).
 
-/// `register_kv_format_v1` 이 반환하는 vtable 의 ABI 버전. host 가 mismatch 시 로드 거부(D6).
-pub const KV_FORMAT_ABI_VERSION: u32 = 1;
+/// `register_kv_formats_v2` 봉투([`FormatExportAbi`])의 ABI 버전. host 가 mismatch 시 로드 거부(ADR-0010 E1).
+pub const KV_FORMAT_ABI_VERSION: u32 = 2;
 
 /// [`KVFormat`] 의 C-ABI 평탄화(D4). plugin 이 export 하는 단일 vtable. `name` 은 registry 매칭용
 /// 정적 식별자(`'static`), `layout` 은 핸들 인스턴스의 [`KVLayoutDesc`] 를 POD by-value 로 반환한다.
@@ -1001,7 +1027,7 @@ pub const KV_FORMAT_ABI_VERSION: u32 = 1;
 /// 적용).
 #[repr(C)]
 pub struct FormatVTableAbi {
-    /// [`KV_FORMAT_ABI_VERSION`]. host 가 mismatch 시 거부.
+    /// (v2 에서 deprecated — ABI 게이트는 봉투 [`FormatExportAbi::abi_version`] 가 담당. V2 단계에서 제거 예정.)
     pub abi_version: u32,
     /// null-종단 canonical 이름(`--kv-format`/registry 매칭). plugin `.so` 의 `'static` str.
     pub name: *const c_char,
@@ -1014,8 +1040,28 @@ pub struct FormatVTableAbi {
 }
 
 // SAFETY: vtable 은 불변이고 `name` 은 plugin `.so` 의 `'static` str 을 가리킨다. fn-ptr 는 본래
-// Send+Sync. plugin 의 `static VTABLE` 선언에 필요.
+// Send+Sync. plugin 의 distributed_slice element static 선언에 필요(ADR-0010 E1).
 unsafe impl Sync for FormatVTableAbi {}
+
+/// format 축 봉투(ADR-0010 E1) — 한 plugin `.so` 의 format vtable 들을 한 번에 신고. `register_kv_formats_v2()`
+/// 가 **by-value** 로 반환(sret >16B; `count`/`vtables` 는 슬라이스에서 런타임 도출이라 const static 불가).
+/// `vtables` 는 [`PLUGIN_KV_FORMAT_VTABLES`] base(`.so` static) → `.so` 수명 동안 유효, `count==0` 가능(빈 축).
+#[repr(C)]
+pub struct FormatExportAbi {
+    /// [`KV_FORMAT_ABI_VERSION`]. host 가 mismatch 시 `.so` 거부(.so 당 ABI 1개).
+    pub abi_version: u32,
+    /// `vtables` 가 가리키는 연속 배열 길이.
+    pub count: usize,
+    /// `count` 개의 [`FormatVTableAbi`] 연속 배열(`.so` static). 로더는 `vtables.add(i)` 로 원소 접근.
+    pub vtables: *const FormatVTableAbi,
+}
+
+/// plugin `.so` 내부에서 format vtable 들을 누적하는 슬라이스(ADR-0010 E2). **선언은 technique-api 1곳**
+/// (linkme section 명이 선언 static 이름으로 결정 — plugin 측 선언은 cross-crate 기여를 깸). `register_kv_format!`
+/// 가 plugin-cdylib 게이트 하에 const-block 격리 static 으로 기여(다회 호출 = 다수 format). 정적 빌드에선 빈
+/// 채 무해(엔진은 `KV_FORMATS` 만 읽음).
+#[distributed_slice]
+pub static PLUGIN_KV_FORMAT_VTABLES: [FormatVTableAbi] = [..];
 
 /// format plugin 을 정적(rlib→linkme) · 동적(cdylib→C-ABI) 양쪽에 등록하는 dual-wiring 매크로(D4).
 ///
@@ -1024,28 +1070,36 @@ unsafe impl Sync for FormatVTableAbi {}
 /// `#[no_mangle]` 심볼 충돌을 원천 차단한다(`.so` 빌드만 `--features plugin-cdylib`). [`register_kv_stage!`]
 /// 의 format 축 짝.
 ///
-/// 한 plugin 크레이트당 1회만 호출한다(`.so` 는 단일 format — D4).
+/// 한 plugin 크레이트(`.so`)에서 **여러 번 호출 가능**(다수 format = quant 패밀리 — ADR-0010 E2). 기여
+/// static 은 모두 익명 `const _: () = {}` 스코프에 격리. `.so` 엔트리(`register_kv_formats_v2`)는 별도
+/// [`export_plugin!`] 가 `.so` 당 1회 emit. [`register_kv_stage!`] 의 format 축 짝.
 ///
 /// ```ignore
-/// technique_api::register_kv_format!("synth_q4", || Box::new(SynthQ4));
+/// technique_api::register_kv_format!("nf4",  || Box::new(Nf4));
+/// technique_api::register_kv_format!("awq4", || Box::new(Awq4));   // 한 .so 에 여러 format
+/// technique_api::export_plugin!();   // .so 당 1회
 /// ```
 #[macro_export]
 macro_rules! register_kv_format {
     ($name:literal, $make:expr) => {
-        // ── 정적 경로 (rlib → linkme distributed_slice) ──
-        #[$crate::distributed_slice($crate::KV_FORMATS)]
-        static __REGISTER_KV_FORMAT_REG: $crate::KVFormatReg = $crate::KVFormatReg {
-            name: $name,
-            make: $make,
+        // ── 정적 경로 (rlib → linkme distributed_slice). const-block 격리 = 다회 호출 허용(E2). ──
+        const _: () = {
+            #[$crate::distributed_slice($crate::KV_FORMATS)]
+            static __REG: $crate::KVFormatReg = $crate::KVFormatReg {
+                name: $name,
+                make: $make,
+            };
         };
 
-        // ── 동적 경로 (cdylib → C-ABI entry). feature 게이트로 정적 빌드 시 미emit ──
+        // ── 동적 경로 (cdylib → PLUGIN_KV_FORMAT_VTABLES 기여). plugin-cdylib 게이트로 정적 빌드 시 미emit. ──
+        // entry(register_kv_formats_v2)는 export_plugin! 가 emit; 여기선 vtable 만 슬라이스에 기여(E2).
         #[cfg(feature = "plugin-cdylib")]
         const _: () = {
             // 핸들 = Box<Box<dyn KVFormat>>(thin ptr). make/layout/drop 이 이 표현을 공유.
             type __Handle = ::std::boxed::Box<dyn $crate::KVFormat>;
 
             unsafe extern "C" fn __make() -> *mut ::core::ffi::c_void {
+                // ADR-0009 #116: $make(Rust-ABI fn)는 여기 내부 호출 전용 — extern "C" 직접 캐스팅 금지.
                 let make_fn: fn() -> __Handle = $make;
                 let fmt: __Handle = make_fn();
                 ::std::boxed::Box::into_raw(::std::boxed::Box::new(fmt))
@@ -1063,17 +1117,57 @@ macro_rules! register_kv_format {
                 drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
             }
 
+            // vtable 을 PLUGIN_KV_FORMAT_VTABLES 에 기여(const-block 격리 = 다회 호출 시 누적). entry 아님.
+            #[$crate::distributed_slice($crate::PLUGIN_KV_FORMAT_VTABLES)]
             static __VTABLE: $crate::FormatVTableAbi = $crate::FormatVTableAbi {
-                abi_version: $crate::KV_FORMAT_ABI_VERSION,
+                abi_version: $crate::KV_FORMAT_ABI_VERSION, // V1 잔존 — V2 에서 봉투로 이전 후 제거.
                 name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
                 make: __make,
                 layout: __layout,
                 drop: __drop,
             };
+        };
+    };
+}
 
+/// `.so` 당 **1회** 호출 — 이 plugin 의 per-axis 엔트리 심볼을 emit 한다(ADR-0010 E2). plugin-cdylib 게이트:
+/// 정적 force-link 빌드에선 미emit(다수 force-link plugin 의 entry 충돌 차단). `register_kv_*!` 가 누적한
+/// [`PLUGIN_KV_STAGE_VTABLES`]/[`PLUGIN_KV_FORMAT_VTABLES`] 슬라이스를 by-value 봉투로 반환한다.
+///
+/// **3축 분리 심볼 불변(ADR-0009 #118)**: `register_kv_stages_v2` ⊥ `register_kv_formats_v2` 분리 entry +
+/// 분리 슬라이스 — 통합 심볼/통합 registry 아님(작성자 편의로 한 번에 emit 할 뿐). 향후 backend v3 는
+/// `register_backend_caps_v2` 한 줄을 여기 추가.
+///
+/// 기여 0 인 축은 `count==0` 봉투(빈 distributed_slice — ELF `__start==__stop`, 안전).
+///
+/// ```ignore
+/// technique_api::register_kv_format!("nf4", || Box::new(Nf4));
+/// technique_api::export_plugin!();
+/// ```
+#[macro_export]
+macro_rules! export_plugin {
+    () => {
+        #[cfg(feature = "plugin-cdylib")]
+        const _: () = {
+            /// stage 봉투 entry — `PLUGIN_KV_STAGE_VTABLES` 를 by-value 로 반환(sret).
             #[unsafe(no_mangle)] // Rust 2024: no_mangle 은 unsafe attribute.
-            pub extern "C" fn register_kv_format_v1() -> *const $crate::FormatVTableAbi {
-                &__VTABLE
+            pub extern "C" fn register_kv_stages_v2() -> $crate::StageExportAbi {
+                // .len()/.as_ptr() 는 linkme Deref(static_slice) 경유 런타임 평가 — 봉투는 호출 시점 산출.
+                $crate::StageExportAbi {
+                    abi_version: $crate::KV_STAGE_ABI_VERSION,
+                    count: $crate::PLUGIN_KV_STAGE_VTABLES.len(),
+                    vtables: $crate::PLUGIN_KV_STAGE_VTABLES.as_ptr(),
+                }
+            }
+
+            /// format 봉투 entry — `PLUGIN_KV_FORMAT_VTABLES` 를 by-value 로 반환(sret).
+            #[unsafe(no_mangle)]
+            pub extern "C" fn register_kv_formats_v2() -> $crate::FormatExportAbi {
+                $crate::FormatExportAbi {
+                    abi_version: $crate::KV_FORMAT_ABI_VERSION,
+                    count: $crate::PLUGIN_KV_FORMAT_VTABLES.len(),
+                    vtables: $crate::PLUGIN_KV_FORMAT_VTABLES.as_ptr(),
+                }
             }
         };
     };
@@ -1473,7 +1567,7 @@ mod tests {
             layout: rt_layout,
             drop: rt_drop,
         };
-        assert_eq!(vtable.abi_version, 1);
+        assert_eq!(vtable.abi_version, KV_FORMAT_ABI_VERSION);
         // make → layout → drop: KVLayoutDesc 가 extern "C" 경계를 값으로 무손실 왕복.
         let handle = unsafe { (vtable.make)() };
         assert!(!handle.is_null(), "make 가 non-null 핸들 반환");
@@ -1489,6 +1583,127 @@ mod tests {
             .unwrap();
         assert_eq!(name, "rt_format");
         unsafe { (vtable.drop)(handle) };
+    }
+
+    // ── ADR-0010 V1: 봉투(ExportAbi) by-value sret round-trip + 다회 호출 누적 ──
+
+    // stage 봉투 round-trip 용 stub vtable (호출 안 함 — 마샬링만 검증).
+    unsafe extern "C" fn st_make(_p: *const StageParams) -> *mut c_void {
+        ::core::ptr::null_mut()
+    }
+    unsafe extern "C" fn st_plan(
+        _h: *mut c_void,
+        _c: *const StageCtxAbi,
+        _o: *mut PlanAbi,
+    ) -> i32 {
+        KV_PLAN_NOOP
+    }
+    unsafe extern "C" fn st_plan_free(_o: *mut c_void) {}
+    unsafe extern "C" fn st_drop(_h: *mut c_void) {}
+
+    static FMT_EXPORT_VTS: [FormatVTableAbi; 2] = [
+        FormatVTableAbi {
+            abi_version: KV_FORMAT_ABI_VERSION,
+            name: b"rt_env_a\0".as_ptr() as *const c_char,
+            make: rt_make,
+            layout: rt_layout,
+            drop: rt_drop,
+        },
+        FormatVTableAbi {
+            abi_version: KV_FORMAT_ABI_VERSION,
+            name: b"rt_env_b\0".as_ptr() as *const c_char,
+            make: rt_make,
+            layout: rt_layout,
+            drop: rt_drop,
+        },
+    ];
+
+    static STAGE_EXPORT_VTS: [PluginVTableAbi; 2] = [
+        PluginVTableAbi {
+            abi_version: KV_STAGE_ABI_VERSION,
+            name: b"rt_st_a\0".as_ptr() as *const c_char,
+            make: st_make,
+            plan: st_plan,
+            plan_free: st_plan_free,
+            drop: st_drop,
+        },
+        PluginVTableAbi {
+            abi_version: KV_STAGE_ABI_VERSION,
+            name: b"rt_st_b\0".as_ptr() as *const c_char,
+            make: st_make,
+            plan: st_plan,
+            plan_free: st_plan_free,
+            drop: st_drop,
+        },
+    ];
+
+    // export_plugin! 의 register_kv_formats_v2 와 동형 — 봉투를 by-value(sret >16B) 로 반환.
+    extern "C" fn mk_format_export() -> FormatExportAbi {
+        FormatExportAbi {
+            abi_version: KV_FORMAT_ABI_VERSION,
+            count: FMT_EXPORT_VTS.len(),
+            vtables: FMT_EXPORT_VTS.as_ptr(),
+        }
+    }
+    extern "C" fn mk_stage_export() -> StageExportAbi {
+        StageExportAbi {
+            abi_version: KV_STAGE_ABI_VERSION,
+            count: STAGE_EXPORT_VTS.len(),
+            vtables: STAGE_EXPORT_VTS.as_ptr(),
+        }
+    }
+
+    /// FormatExportAbi 가 extern "C" by-value(sret) 로 무손실 왕복하고, 로더가 `vtables.add(i)` 로
+    /// .so static 배열 원소를 (봉투 스택 폐기 후에도) 정상 접근함을 검증.
+    #[test]
+    fn format_export_abi_by_value_sret_round_trip() {
+        let env = mk_format_export();
+        assert_eq!(env.abi_version, KV_FORMAT_ABI_VERSION);
+        assert_eq!(env.count, 2);
+        for (i, expect) in ["rt_env_a", "rt_env_b"].iter().enumerate() {
+            // SAFETY: vtables 는 FMT_EXPORT_VTS('static 배열) base, i < count.
+            let vt = unsafe { &*env.vtables.add(i) };
+            let name = unsafe { core::ffi::CStr::from_ptr(vt.name) }.to_str().unwrap();
+            assert_eq!(&name, expect);
+        }
+    }
+
+    /// StageExportAbi 동형 round-trip (양축 대칭).
+    #[test]
+    fn stage_export_abi_by_value_sret_round_trip() {
+        let env = mk_stage_export();
+        assert_eq!(env.abi_version, KV_STAGE_ABI_VERSION);
+        assert_eq!(env.count, 2);
+        for (i, expect) in ["rt_st_a", "rt_st_b"].iter().enumerate() {
+            // SAFETY: vtables 는 STAGE_EXPORT_VTS('static 배열) base, i < count.
+            let vt = unsafe { &*env.vtables.add(i) };
+            let name = unsafe { core::ffi::CStr::from_ptr(vt.name) }.to_str().unwrap();
+            assert_eq!(&name, expect);
+        }
+    }
+
+    // 다회 호출 — 한 crate 에서 register_kv_format! 2회(v1 단일심볼 ABI 에선 __REGISTER_KV_FORMAT_REG
+    // E0428 충돌로 불가했음). const-block 격리로 비로소 가능(ADR-0010 E2).
+    crate::register_kv_format!("v1_mc_a", || Box::new(DummyFormat));
+    crate::register_kv_format!("v1_mc_b", || Box::new(DummyFormat));
+
+    /// 정적 경로: 2회 호출이 모두 KV_FORMATS 에 등록(find_kv_format 가시화).
+    #[test]
+    fn register_kv_format_multicall_static() {
+        assert!(find_kv_format("v1_mc_a").is_some(), "v1_mc_a 정적 등록");
+        assert!(find_kv_format("v1_mc_b").is_some(), "v1_mc_b 정적 등록");
+    }
+
+    /// 동적 경로(plugin-cdylib): 2회 호출이 모두 PLUGIN_KV_FORMAT_VTABLES 에 누적.
+    #[cfg(feature = "plugin-cdylib")]
+    #[test]
+    fn register_kv_format_multicall_dynamic() {
+        let names: Vec<&str> = PLUGIN_KV_FORMAT_VTABLES
+            .iter()
+            .map(|vt| unsafe { core::ffi::CStr::from_ptr(vt.name) }.to_str().unwrap())
+            .collect();
+        assert!(names.contains(&"v1_mc_a"), "v1_mc_a 동적 누적: {names:?}");
+        assert!(names.contains(&"v1_mc_b"), "v1_mc_b 동적 누적: {names:?}");
     }
 
     // ── weight stage (MW-B) ──
