@@ -739,6 +739,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-bundle"
+version = "0.1.0"
+dependencies = [
+ "linkme",
+ "technique-api",
+]
+
+[[package]]
 name = "example-keep-recent"
 version = "0.1.0"
 dependencies = [
@@ -748,6 +756,22 @@ dependencies = [
 
 [[package]]
 name = "example-kv-format"
+version = "0.1.0"
+dependencies = [
+ "linkme",
+ "technique-api",
+]
+
+[[package]]
+name = "example-multi-format"
+version = "0.1.0"
+dependencies = [
+ "linkme",
+ "technique-api",
+]
+
+[[package]]
+name = "example-no-export"
 version = "0.1.0"
 dependencies = [
  "linkme",

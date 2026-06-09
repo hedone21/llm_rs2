@@ -33,6 +33,9 @@ impl KVFormat for ExampleKvFormat {
 // 등록(dual-wiring, ADR-0009 D4) — 정적: linkme `KV_FORMATS`. 동적(`--features plugin-cdylib`):
 // `register_kv_format_v1` C-ABI export. 한 줄로 양쪽.
 technique_api::register_kv_format!("example_kv_format", || Box::new(ExampleKvFormat));
+// GATE-C v2(ADR-0010 E2): `.so` 엔트리 emit(plugin-cdylib 게이트). 엔진 force-link 안 함 → 동적 등록
+// 성공 경로(register_dynamic_plugins → make_format fallback) vehicle.
+technique_api::export_plugin!();
 
 #[cfg(test)]
 mod tests {

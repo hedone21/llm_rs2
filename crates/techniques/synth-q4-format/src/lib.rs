@@ -34,6 +34,10 @@ impl KVFormat for SynthQ4 {
 // 발견, DType variant 불요). 동적(`--features plugin-cdylib`): `register_kv_format_v1` C-ABI export
 // (host 가 dlopen). 한 줄로 양쪽.
 technique_api::register_kv_format!("synth_q4", || Box::new(SynthQ4));
+// GATE-C v2(ADR-0010 E2): `.so` 엔트리(register_kv_formats_v2) emit. plugin-cdylib 게이트 — 엔진
+// force-link(feature OFF) 빌드엔 미emit(심볼 충돌 차단). synth_q4 는 엔진 force-link 정적 등록이라
+// dlopen 시 builtin-collision reject 대상(게이트 vehicle).
+technique_api::export_plugin!();
 
 #[cfg(test)]
 mod tests {

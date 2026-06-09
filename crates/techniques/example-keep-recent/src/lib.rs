@@ -40,6 +40,9 @@ impl KVCacheStage for KeepRecent {
 technique_api::register_kv_stage!("example_keep_recent", |_params: StageParams| Box::new(
     KeepRecent
 ));
+// GATE-C v2(ADR-0010 E2): `.so` 엔트리 emit(plugin-cdylib 게이트). stage-only `.so` → dispatcher 에서
+// stage 1 + format 0 = wrong-type graceful 흡수 + stage plan-identity vehicle.
+technique_api::export_plugin!();
 
 #[cfg(test)]
 mod tests {
