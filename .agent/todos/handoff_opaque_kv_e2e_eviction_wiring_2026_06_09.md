@@ -5,7 +5,7 @@
 **브랜치**: master (미푸시)
 **작성자**: 메인 세션
 
-**다음 세션 진입 문장**: **"ADR-0008 e2e eviction 배선 완료(opaque eviction 실증) — 다음은 (a) q4_0 typed eviction SIGSEGV 조사 vs (b) GATE-C(.so dlopen, 북극성 최종) 착수 우선순위 grill 후 착수."**
+**다음 세션 진입 문장**: **"ADR-0008 e2e eviction 배선 완료(opaque eviction 실증) + q4_0 eviction SIGSEGV 수정(`00918e9e`) — 다음은 GATE-C(.so dlopen, 북극성 최종) 설계 grill 후 착수."**
 
 ---
 
@@ -20,6 +20,8 @@
 | 커밋 | 내용 | 게이트 |
 |---|---|---|
 | `f0d92c66` | `build_standard_loop`/`build_bench_loop` 가 `ctx.kv_caches` 소비(내부 `alloc_standard_kv_caches` 제거) + `[DecodeLoop] kv storage` 로그 + orphan 필드(`StandardHappyCtx.initial_kv_capacity`/`kv_type`) 제거 | build OK · clippy `--workspace` clean · lib **1258/0** |
+| `f62e75d8` | ADR-0008 정정(false-positive) + handoff | docs |
+| `00918e9e` | **q4_0 eviction SIGSEGV 수정** — `shrink_to_fit` Q4_0 `copy_slice` block-count 변환(grow 거울) + 회귀 테스트 2종 | lib **1260/0** · clippy clean · e2e EXIT 0 |
 
 **e2e 실측** (Qwen2.5-1.5B q4_0, CPU greedy, argus_bench + signal_injector TCP loopback):
 
@@ -35,7 +37,7 @@ token-identity 차등(eviction 없이, n=24): opaque "Paris. The population ... 
 
 ## 다음 작업 (새 결정 필요 — grill 먼저)
 
-1. **q4_0 typed eviction SIGSEGV 조사** — `argus_bench --kv-format q4_0 ... eviction h2o --keep-ratio 0.5` + signal_injector `kv.evict_h2o`(긴 프롬프트, eviction floor 초과 시) → exit 139. f16-typed·synth_q4-opaque 는 정상이므로 **q4_0 native eviction 경로 한정**. 의심 = q4_0 attention_scores(score-free h2o recency degrade) 또는 q4_0 compact/prune. **pre-existing**(본 fix 는 typed arm 무수정). 심각도 高(production q4_0 KV + h2o eviction crash). gdb 백트레이스 미확보(타이밍 의존, gdb 하 미재현).
+1. ✅ ~~**q4_0 typed eviction SIGSEGV**~~ — **수정 완료 `00918e9e`**. root cause = `KVCache::shrink_to_fit()` 의 `copy_slice` element-count(Q4_0 는 block-count 필요, type_size=18B) → ~32배 OOB. `grow()` 의 block 변환을 shrink 에도 적용 + 회귀 테스트 2종. lib 1260/0, e2e EXIT 0. (gdb 백트레이스로 `release_unused_pages→shrink_to_fit→copy_slice` 국소화 후 수정.)
 2. **GATE-C** = `.so` cdylib dlopen 승격(북극성 최종, ADR-0007 D6). 런타임 registry + register_plugin C-ABI dual-wiring + dlopen 배선 + bit-identical 재증명. host-implementable, GPU/perf 만 device. `panic=abort`↔`catch_unwind` 충돌이 난점.
 3. (잔여 deferred) write encoder family(q8_0/q4_1) / GPU opaque arm(device).
 
@@ -47,7 +49,7 @@ token-identity 차등(eviction 없이, n=24): opaque "Paris. The population ... 
 - **opaque ≠ typed q4_0 는 버그 아님**: opaque = q4_0 저장 + f32 floor attention(dequant→f32), typed q4_0 = native kernel. compute 경로가 달라 token 발산 정상(둘 다 valid). bit-identity 주장은 **unit gate(F32 round-trip)** 한정. e2e 에서 token-identity 게이트 금지(재발 방지).
 - **eviction min-cache floor**: 짧은 프롬프트(≤~40 token)는 `--eviction-target-ratio`/min_kv_cache floor 미달로 eviction no-op(format 무관). e2e 는 **긴 프롬프트 필수**(≥~300 token). 디버깅 시 이거 모르면 "eviction 안 됨"으로 오판(실제로 floor 정상 동작).
 - **argus_bench eviction = signal-driven**: `self.eviction`(EvictionStage) 은 NoOp(`with_eviction` 미호출). eviction 은 오직 `plan.evict`(resilience KvEvict directive, `cmd_source.poll`→executor) 경로. host e2e = `signal_injector --socket tcp:127.0.0.1:PORT -f schedule.json`(listen) → argus_bench `--resilience-transport tcp:...`(connect). schedule = `[{delay_sec, directive:{seq_id, commands:[{"type":"kv.evict_h2o","keep_ratio":0.5}]}}]`. directive 는 sticky(evict_applied 1회 gate). CLI `eviction h2o --keep-ratio 0.5` + `--protected-prefix 4` 도 필요(CacheManager 빌드).
-- **q4_0 typed eviction SIGSEGV** (위 §1) — production 심각 버그, 별도 조사.
+- ~~**q4_0 typed eviction SIGSEGV**~~ — 수정 완료 `00918e9e`(위 §1). `shrink_to_fit` 의 Q4_0 `copy_slice` element→block count 누락(grow 엔 있었음). **교훈**: `copy_slice`/`buffer_shift` 의 Q4_0 count/offset 은 항상 block 단위(type_size=18B). grow/shrink/shift 신규 작성 시 dtype별 단위 변환 필수(F16/F32=element, Q4_0=block, U8/opaque=byte).
 - **legacy_generate 는 main tree 부재**: worktree(`/.claude/worktrees/b5_trait_extension/`)에만 존재. eviction vehicle = `argus_bench`(main tree). 핸드오프의 "argus vs legacy" 프레이밍은 무효였음.
 - **engine/Cargo.toml drift 유지**: `microbench_score_readback` bin 엔트리(untracked `microbench/score_readback.rs`) 미커밋 보존. 이번 커밋은 src 5파일만(Cargo.toml 미포함).
 
