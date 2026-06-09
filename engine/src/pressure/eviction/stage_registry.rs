@@ -12,10 +12,15 @@
 //! **제외**: h2o_plus(per-head, `plan_keep`→`None`)는 head_score source(F5) 미완으로 단계 ⑤ deferred,
 //! d2o(`EvictionPolicy` 아님, 가중 merge)는 M4, no_eviction("none")은 happy-path 라 match 밖.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use core::ffi::c_void;
 use linkme::distributed_slice;
+use std::ffi::CStr;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, RwLock};
 use technique_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCtx, StageParams,
+    KV_CACHE_STAGES, KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage,
+    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCtx, StageCtxAbi, StageParams,
     TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
 };
 
@@ -382,6 +387,342 @@ static D2O_STAGE: KVCacheStageReg = KVCacheStageReg {
         }))
     },
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// GATE-C — 런타임 `.so` dlopen 레지스트리 (ADR-0009 C2)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 정적 `KV_CACHE_STAGES`(linkme)는 그대로 두고(D3 가산), dlopen 된 plugin 을 별도
+// `DYN_REGISTRY` 에 모은다. `make_stage(name, params)` 가 정적 우선 → 동적 fallback 으로
+// source-agnostic `Box<dyn KVCacheStage>` 를 돌려준다. `.so` 는 init-once 로 frozen 이고
+// `Arc<Library>` 를 영구 보관(leak-and-keep)해 vtable/handle 이 살아 있게 한다.
+
+/// dlopen 된 한 stage plugin 의 등록 항목. vtable 은 plugin `.so` 의 immutable static 을 가리킨다.
+struct RuntimeStageReg {
+    name: String,
+    vtable: *const PluginVTableAbi,
+    /// `.so` 를 프로세스 수명 동안 유지(vtable/handle dangling 방지). drop 안 함.
+    _lib: Arc<libloading::Library>,
+}
+
+// SAFETY: vtable 은 `.so` 의 immutable static 을 가리키고 `_lib`(Arc) 가 `.so` 를 살려 둔다.
+// 읽기 전용 공유이므로 스레드 간 안전 — `DYN_REGISTRY`(static) 에 담기 위해 필요.
+unsafe impl Send for RuntimeStageReg {}
+unsafe impl Sync for RuntimeStageReg {}
+
+/// 동적 등록 레지스트리 — init 시 append, construction 시 read. 정적 슬라이스와 **병합하지 않는다**(D3).
+static DYN_REGISTRY: OnceLock<RwLock<Vec<RuntimeStageReg>>> = OnceLock::new();
+
+/// `--load-plugin` 으로 지정된 `.so` 들을 dlopen 해 [`DYN_REGISTRY`] 에 등록한다(ADR-0009 D6).
+///
+/// 각 `.so`: `Library::new`(RTLD_NOW) → `register_kv_stage_v1` dlsym → `abi_version` 검사 →
+/// 이름 충돌 fail-fast(빌트인 우선 + 동적 중복 금지). init-once 단계에서 1회 호출 권장이나 다회
+/// 호출도 누적 가능.
+pub fn register_dynamic_stages(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let registry = DYN_REGISTRY.get_or_init(|| RwLock::new(Vec::new()));
+    for path in paths {
+        // SAFETY: dlopen — 신뢰된 plugin 경로(사용자 명시 --load-plugin). RTLD_NOW 즉시 바인딩.
+        let lib = unsafe { libloading::Library::new(path) }
+            .with_context(|| format!("plugin dlopen 실패: {}", path.display()))?;
+        // SAFETY: register_kv_stage_v1 심볼 dlsym + 호출. vtable_ptr 는 `.so` 의 static 을 가리킨다.
+        let vtable_ptr: *const PluginVTableAbi = unsafe {
+            let reg_fn: libloading::Symbol<unsafe extern "C" fn() -> *const PluginVTableAbi> = lib
+                .get(b"register_kv_stage_v1\0")
+                .with_context(|| {
+                    format!("plugin {}: register_kv_stage_v1 심볼 부재", path.display())
+                })?;
+            reg_fn()
+        };
+        if vtable_ptr.is_null() {
+            anyhow::bail!(
+                "plugin {}: register_kv_stage_v1 가 null vtable 반환",
+                path.display()
+            );
+        }
+        // SAFETY: 위에서 non-null 확인. vtable 은 `.so` static.
+        let vtable = unsafe { &*vtable_ptr };
+        if vtable.abi_version != KV_STAGE_ABI_VERSION {
+            anyhow::bail!(
+                "plugin {}: abi_version {} != 기대 {} (재빌드 필요)",
+                path.display(),
+                vtable.abi_version,
+                KV_STAGE_ABI_VERSION
+            );
+        }
+        // SAFETY: name 은 plugin 의 null-종단 'static str.
+        let name = unsafe { CStr::from_ptr(vtable.name) }
+            .to_str()
+            .with_context(|| format!("plugin {}: name 이 유효 UTF-8 아님", path.display()))?
+            .to_owned();
+        // 충돌 fail-fast (빌트인 우선 — silent override 차단, Known Bug #1/#2 류 재발 방지).
+        if technique_api::find_stage(&name).is_some() {
+            anyhow::bail!(
+                "plugin {}: stage 이름 '{}' 이 빌트인과 충돌 (빌트인 우선, 동적 등록 거부)",
+                path.display(),
+                name
+            );
+        }
+        let lib = Arc::new(lib);
+        let mut w = registry.write().expect("DYN_REGISTRY RwLock poisoned");
+        if w.iter().any(|r| r.name == name) {
+            anyhow::bail!(
+                "plugin {}: stage 이름 '{}' 이 이미 동적 등록됨 (중복)",
+                path.display(),
+                name
+            );
+        }
+        w.push(RuntimeStageReg {
+            name,
+            vtable: vtable_ptr,
+            _lib: lib,
+        });
+    }
+    Ok(())
+}
+
+/// 동적으로 등록된 stage 이름들(self-test / 진단용 — 정적 `registered_names()` 의 동적 짝).
+pub fn dynamic_registered_names() -> Vec<String> {
+    DYN_REGISTRY
+        .get()
+        .map(|r| {
+            r.read()
+                .expect("DYN_REGISTRY RwLock poisoned")
+                .iter()
+                .map(|reg| reg.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 이름으로 stage 인스턴스를 만든다 — **정적 우선 → 동적 fallback**(D3). 호출부는 source 를 모른다.
+/// 정적/동적 모두 miss 면 `None`(graceful unknown).
+pub fn make_stage(name: &str, params: &StageParams) -> Option<Box<dyn KVCacheStage>> {
+    // 1) 정적(linkme) 우선.
+    if let Some(reg) = technique_api::find_stage(name) {
+        return Some((reg.make)(*params));
+    }
+    // 2) 동적(dlopen) fallback.
+    let registry = DYN_REGISTRY.get()?;
+    let (vtable, lib) = {
+        let guard = registry.read().expect("DYN_REGISTRY RwLock poisoned");
+        let reg = guard.iter().find(|r| r.name == name)?;
+        (reg.vtable, Arc::clone(&reg._lib))
+    };
+    // SAFETY: vtable 는 `.so` static (lib 가 살려 둠). make 가 opaque plugin 핸들 반환.
+    let handle = unsafe { ((*vtable).make)(params as *const StageParams) };
+    if handle.is_null() {
+        eprintln!("[make_stage] plugin '{name}' make 가 null 핸들 반환");
+        return None;
+    }
+    Some(Box::new(DynStage {
+        handle,
+        vtable,
+        _lib: lib,
+    }))
+}
+
+/// 동적 plugin stage 의 host 측 어댑터 — vtable 마샬링으로 [`KVCacheStage`] 를 구현(D2).
+struct DynStage {
+    handle: *mut c_void,
+    vtable: *const PluginVTableAbi,
+    _lib: Arc<libloading::Library>,
+}
+
+// SAFETY: 핸들은 plugin 의 `KVCacheStage`(trait 계약상 Send+Sync) 인스턴스, vtable 불변, lib Arc 유지.
+unsafe impl Send for DynStage {}
+unsafe impl Sync for DynStage {}
+
+impl Drop for DynStage {
+    fn drop(&mut self) {
+        // SAFETY: handle 은 make 가 만든 plugin 인스턴스, 정확히 1회 해제.
+        unsafe { ((*self.vtable).drop)(self.handle) };
+    }
+}
+
+impl KVCacheStage for DynStage {
+    fn name(&self) -> &str {
+        // SAFETY: vtable.name 은 plugin `.so` 의 'static null-종단 str (lib 가 살려 둠).
+        unsafe { CStr::from_ptr((*self.vtable).name) }
+            .to_str()
+            .unwrap_or("<plugin>")
+    }
+
+    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+        // host concrete ctx(fat ref)를 thin ptr 로 평탄화 — shim 들이 deref 해 메서드 호출.
+        let ctx_ref: &dyn StageCtx = ctx;
+        let abi = StageCtxAbi {
+            ctx: (&ctx_ref) as *const &dyn StageCtx as *const c_void,
+            current_pos: shim_current_pos,
+            target_len: shim_target_len,
+            layer_idx: shim_layer_idx,
+            n_kv_heads: shim_n_kv_heads,
+            head_dim: shim_head_dim,
+            importance: shim_importance,
+            tensor_read_row: shim_tensor_read_row,
+            tensor_shape: shim_tensor_shape,
+        };
+        let mut plan_abi = PlanAbi::zeroed();
+        // SAFETY: handle/vtable 유효. abi 는 plan 호출 동안만 산다(ctx_ref 가 그 scope 에 유효).
+        let code = unsafe { ((*self.vtable).plan)(self.handle, &abi, &mut plan_abi) };
+        match code {
+            KV_PLAN_NOOP => None,
+            KV_PLAN_OK => {
+                // SAFETY: plan 이 KV_PLAN_OK 면 plan_abi 가 plugin-arena 를 가리킨다.
+                let result = unsafe { planabi_to_plan(&plan_abi) };
+                // 복사 직후 plugin arena 회수 (각자 자기 것 free).
+                unsafe { ((*self.vtable).plan_free)(plan_abi.owner) };
+                match result {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("[DynStage:{}] plan 마샬링 거부: {e}", self.name());
+                        None
+                    }
+                }
+            }
+            other => {
+                eprintln!("[DynStage:{}] plugin plan 오류 코드 {other} — no-op 처리", self.name());
+                None
+            }
+        }
+    }
+}
+
+/// [`PlanAbi`](plugin-arena flat)를 host `KVCachePlan` 으로 복사 재구성(D5). v1 은 LayerWide 만 —
+/// PerHead(`keep_kind==1`)는 promotion-trigger 전까지 명시적 bail(silent garbage 방지).
+///
+/// # Safety
+/// `abi` 는 plugin 의 `plan` 이 `KV_PLAN_OK` 와 함께 채운 유효 PlanAbi 여야 한다.
+unsafe fn planabi_to_plan(abi: &PlanAbi) -> Result<KVCachePlan> {
+    if abi.keep_kind == 1 {
+        anyhow::bail!("GATE-C v1: plugin 이 PerHead keep 산출 — 미지원(promotion-trigger 전)");
+    }
+    let keep: Vec<usize> = if abi.keep_len == 0 || abi.keep_ptr.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: keep_ptr/len 은 plugin-arena 의 유효 슬라이스(plan_free 전).
+        unsafe { core::slice::from_raw_parts(abi.keep_ptr, abi.keep_len) }.to_vec()
+    };
+    let mut merges = Vec::with_capacity(abi.merges_len);
+    if abi.merges_len > 0 && !abi.merges_ptr.is_null() {
+        // SAFETY: merges_ptr/len 유효.
+        let m_slice = unsafe { core::slice::from_raw_parts(abi.merges_ptr, abi.merges_len) };
+        for m in m_slice {
+            let from: Vec<(usize, f32)> = if m.from_len == 0 || m.from_ptr.is_null() {
+                Vec::new()
+            } else {
+                // SAFETY: from_ptr/len 유효(plugin-arena).
+                unsafe { core::slice::from_raw_parts(m.from_ptr, m.from_len) }
+                    .iter()
+                    .map(|p| (p.pos, p.weight))
+                    .collect()
+            };
+            merges.push(WeightedMerge {
+                into: m.into,
+                into_weight: m.into_weight,
+                from,
+            });
+        }
+    }
+    Ok(KVCachePlan {
+        keep: KeepSpec::LayerWide(keep),
+        merges,
+    })
+}
+
+/// u32 discriminant → [`TensorKind`] (StageCtxAbi C-ABI 의 kind 인자 역매핑). repr(u32) 순서 고정.
+fn tensor_kind_from_u32(k: u32) -> Option<TensorKind> {
+    match k {
+        0 => Some(TensorKind::Key),
+        1 => Some(TensorKind::Value),
+        2 => Some(TensorKind::AttnWeights),
+        3 => Some(TensorKind::Scores),
+        _ => None,
+    }
+}
+
+// ── StageCtxAbi shim 들 (host concrete `&dyn StageCtx` 위 extern "C" 브리지) ──
+// 모두 `c` 를 `*const &dyn StageCtx`(thin→fat) 로 deref. host 가 plan 동안 ctx 유효 보장.
+
+unsafe extern "C" fn shim_current_pos(c: *const c_void) -> usize {
+    let ctx = unsafe { *(c as *const &dyn StageCtx) };
+    ctx.current_pos()
+}
+unsafe extern "C" fn shim_target_len(c: *const c_void) -> usize {
+    let ctx = unsafe { *(c as *const &dyn StageCtx) };
+    ctx.target_len()
+}
+unsafe extern "C" fn shim_layer_idx(c: *const c_void) -> usize {
+    let ctx = unsafe { *(c as *const &dyn StageCtx) };
+    ctx.layer_idx()
+}
+unsafe extern "C" fn shim_n_kv_heads(c: *const c_void) -> usize {
+    let ctx = unsafe { *(c as *const &dyn StageCtx) };
+    ctx.n_kv_heads()
+}
+unsafe extern "C" fn shim_head_dim(c: *const c_void) -> usize {
+    let ctx = unsafe { *(c as *const &dyn StageCtx) };
+    ctx.head_dim()
+}
+unsafe extern "C" fn shim_importance(
+    c: *const c_void,
+    out_ptr: *mut *const f32,
+    out_len: *mut usize,
+) -> bool {
+    let ctx = unsafe { *(c as *const &dyn StageCtx) };
+    match ctx.importance() {
+        Some(s) => {
+            unsafe {
+                *out_ptr = s.as_ptr();
+                *out_len = s.len();
+            }
+            true
+        }
+        None => false,
+    }
+}
+unsafe extern "C" fn shim_tensor_shape(c: *const c_void, kind: u32, out: *mut TensorShape) -> bool {
+    let ctx = unsafe { *(c as *const &dyn StageCtx) };
+    let Some(k) = tensor_kind_from_u32(kind) else {
+        return false;
+    };
+    match ctx.tensor(k) {
+        Some(h) => {
+            unsafe { *out = h.shape() };
+            true
+        }
+        None => false,
+    }
+}
+unsafe extern "C" fn shim_tensor_read_row(
+    c: *const c_void,
+    kind: u32,
+    row: usize,
+    kv_head: usize,
+    out: *mut f32,
+    out_len: usize,
+) -> bool {
+    let ctx = unsafe { *(c as *const &dyn StageCtx) };
+    let Some(k) = tensor_kind_from_u32(kind) else {
+        return false;
+    };
+    match ctx.tensor(k) {
+        Some(h) => {
+            let cols = h.shape().cols;
+            // out_len 계약(== cols) 검증 — plugin 이 작은 버퍼를 줘도 OOB write 차단.
+            if out_len < cols {
+                return false;
+            }
+            // SAFETY: out 은 plugin 이 준 out_len(≥cols) 버퍼. cols 만 쓴다.
+            let out_slice = unsafe { core::slice::from_raw_parts_mut(out, cols) };
+            h.read_row(row, kv_head, out_slice);
+            true
+        }
+        None => false,
+    }
+}
 
 #[cfg(test)]
 mod tests {
