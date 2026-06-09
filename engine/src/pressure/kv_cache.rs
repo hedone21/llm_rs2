@@ -415,11 +415,18 @@ impl KVCache {
         let new_v_buf = memory.alloc_kv(buf_size, dtype)?;
         let mut new_v = Tensor::new(new_shape, new_v_buf, backend.clone());
 
-        // Copy existing data (same logic as grow())
+        // Copy existing data (same logic as grow()). **Q4_0: copy_slice 의 count/offset 은
+        // element 가 아니라 block 단위다** (type_size = sizeof(BlockQ4_0) = 18B). element 로
+        // 넘기면 ~QK4_0 배 over-read → OOB(SIGSEGV). grow() 와 동일하게 변환한다.
         if self.current_pos > 0 {
             match self.layout {
                 KVLayout::SeqMajor => {
-                    let copy_count = self.current_pos * self.kv_heads * self.head_dim;
+                    let copy_count = if dtype == crate::buffer::DType::Q4_0 {
+                        let blocks_per_pos = self.kv_heads * self.head_dim / crate::quant::QK4_0;
+                        self.current_pos * blocks_per_pos
+                    } else {
+                        self.current_pos * self.kv_heads * self.head_dim
+                    };
                     backend.copy_slice(&self.k_buffer, &mut new_k, 0, 0, copy_count)?;
                     backend.copy_slice(&self.v_buffer, &mut new_v, 0, 0, copy_count)?;
                 }
@@ -427,21 +434,32 @@ impl KVCache {
                     let old_head_stride = self.capacity * self.head_dim;
                     let new_head_stride = new_cap * self.head_dim;
                     let copy_per_head = self.current_pos * self.head_dim;
-                    for h in 0..self.kv_heads {
-                        backend.copy_slice(
-                            &self.k_buffer,
-                            &mut new_k,
-                            h * old_head_stride,
-                            h * new_head_stride,
-                            copy_per_head,
-                        )?;
-                        backend.copy_slice(
-                            &self.v_buffer,
-                            &mut new_v,
-                            h * old_head_stride,
-                            h * new_head_stride,
-                            copy_per_head,
-                        )?;
+                    if dtype == crate::buffer::DType::Q4_0 {
+                        let qk = crate::quant::QK4_0;
+                        let old_hs = old_head_stride / qk;
+                        let new_hs = new_head_stride / qk;
+                        let cph = copy_per_head / qk;
+                        for h in 0..self.kv_heads {
+                            backend.copy_slice(&self.k_buffer, &mut new_k, h * old_hs, h * new_hs, cph)?;
+                            backend.copy_slice(&self.v_buffer, &mut new_v, h * old_hs, h * new_hs, cph)?;
+                        }
+                    } else {
+                        for h in 0..self.kv_heads {
+                            backend.copy_slice(
+                                &self.k_buffer,
+                                &mut new_k,
+                                h * old_head_stride,
+                                h * new_head_stride,
+                                copy_per_head,
+                            )?;
+                            backend.copy_slice(
+                                &self.v_buffer,
+                                &mut new_v,
+                                h * old_head_stride,
+                                h * new_head_stride,
+                                copy_per_head,
+                            )?;
+                        }
                     }
                 }
             }
@@ -2550,6 +2568,124 @@ mod tests {
         cache.current_pos = 512;
         let released = cache.release_unused_pages();
         assert_eq!(released, 0, "Q4_0 dtype should not trigger madvise");
+    }
+
+    /// Regression (2026-06-09): **dynamic** Q4_0 HeadMajor cache 가 underutilized 되어
+    /// `shrink_to_fit` 이 발동할 때, `copy_slice` 의 count/offset 은 element 가 아니라
+    /// **block** 단위여야 한다 (Q4_0 `type_size = sizeof(BlockQ4_0) = 18B`). element 로
+    /// 넘기면 실제 버퍼의 ~32배(QK4_0)를 읽어 **OOB → SIGSEGV**.
+    /// `grow()` 는 block 변환을 했으나 `shrink_to_fit()` 에 누락되어, argus_bench h2o
+    /// eviction → `release_unused_pages` → `shrink_to_fit` 경로에서 q4_0 한정 segfault.
+    /// (f16/f32 는 element 단위가 곧 정답이라 무사, opaque 는 byte 회계라 무사.)
+    /// 기존 `noop_on_q4_dtype` 는 non-dynamic(`memory=None`)이라 shrink 경로 미진입 →
+    /// 이 버그를 못 잡았다.
+    #[test]
+    fn test_shrink_to_fit_q4_0_headmajor_no_oob_and_preserves_data() {
+        use crate::quant::QK4_0;
+        let heads = 2;
+        let dim = 64;
+        let init_cap = 256;
+        let max_seq = 1024;
+        let blocks_per_pos = heads * dim / QK4_0;
+        let block_size = std::mem::size_of::<crate::quant::BlockQ4_0>();
+        let buf_bytes = init_cap * blocks_per_pos * block_size;
+
+        let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let backend = Arc::new(CpuBackend::new());
+        let k_buf = Arc::new(SharedBuffer::new(buf_bytes, DType::Q4_0));
+        let v_buf = Arc::new(SharedBuffer::new(buf_bytes, DType::Q4_0));
+        let k = Tensor::new(
+            Shape::new(vec![1, heads, init_cap, dim]),
+            k_buf,
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, heads, init_cap, dim]), v_buf, backend);
+        let mut cache = KVCache::new_dynamic(k, v, init_cap, max_seq, heads, dim, memory)
+            .with_layout(KVLayout::HeadMajor);
+
+        // current_pos*4 < cap*3 (underutilized) AND new_cap < cap → shrink 발동.
+        let keep = 64usize;
+        let new_cap = ((keep * 3 / 2) + 63) & !63; // 128
+        cache.current_pos = keep;
+        cache.high_water_pos = keep;
+
+        // (head h, pos p) 첫 블록의 첫 바이트에 고유 marker. HeadMajor Q4_0 block offset:
+        //   block(h,p) = h * (cap*dim/QK4_0) + p * (dim/QK4_0)
+        let hd_blocks = dim / QK4_0;
+        let old_head_stride_blocks = init_cap * dim / QK4_0;
+        let marker = |h: usize, p: usize| ((h * keep + p) % 251 + 1) as u8;
+        {
+            let kb = cache.k_buffer.as_mut_slice::<u8>();
+            for h in 0..heads {
+                for p in 0..keep {
+                    let off = (h * old_head_stride_blocks + p * hd_blocks) * block_size;
+                    kb[off] = marker(h, p);
+                }
+            }
+        }
+
+        // 버그 시 이 줄에서 SIGSEGV (copy_slice element-count over-read).
+        let freed = cache.release_unused_pages();
+
+        assert_eq!(cache.capacity, new_cap, "Q4_0 HeadMajor shrink new_cap");
+        assert!(freed > 0, "shrink 으로 메모리 회수");
+
+        // 새 capacity 기준 offset 에서 marker 보존 검증 (copy_slice 가 올바른 block 을 옮겼는지).
+        let new_head_stride_blocks = new_cap * dim / QK4_0;
+        let kb = cache.k_buffer.as_slice::<u8>();
+        for h in 0..heads {
+            for p in 0..keep {
+                let off = (h * new_head_stride_blocks + p * hd_blocks) * block_size;
+                assert_eq!(kb[off], marker(h, p), "Q4_0 (h={h},p={p}) marker 보존");
+            }
+        }
+    }
+
+    /// SeqMajor Q4_0 shrink 도 동일 block-count 회계 (fix 의 SeqMajor arm). no-OOB + 회수.
+    #[test]
+    fn test_shrink_to_fit_q4_0_seqmajor_no_oob() {
+        use crate::quant::QK4_0;
+        let heads = 2;
+        let dim = 64;
+        let init_cap = 256;
+        let max_seq = 1024;
+        let blocks_per_pos = heads * dim / QK4_0;
+        let block_size = std::mem::size_of::<crate::quant::BlockQ4_0>();
+        let buf_bytes = init_cap * blocks_per_pos * block_size;
+
+        let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let backend = Arc::new(CpuBackend::new());
+        let k_buf = Arc::new(SharedBuffer::new(buf_bytes, DType::Q4_0));
+        let v_buf = Arc::new(SharedBuffer::new(buf_bytes, DType::Q4_0));
+        let k = Tensor::new(
+            Shape::new(vec![1, init_cap, heads, dim]),
+            k_buf,
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, init_cap, heads, dim]), v_buf, backend);
+        // SeqMajor 가 기본 layout (with_layout 미호출).
+        let mut cache = KVCache::new_dynamic(k, v, init_cap, max_seq, heads, dim, memory);
+
+        let keep = 64usize;
+        let new_cap = ((keep * 3 / 2) + 63) & !63;
+        cache.current_pos = keep;
+        cache.high_water_pos = keep;
+
+        // marker: SeqMajor Q4_0 block(p) = p * blocks_per_pos (첫 바이트).
+        {
+            let kb = cache.k_buffer.as_mut_slice::<u8>();
+            for p in 0..keep {
+                kb[p * blocks_per_pos * block_size] = ((p % 251) + 1) as u8;
+            }
+        }
+
+        let freed = cache.release_unused_pages(); // 버그 시 SIGSEGV
+        assert_eq!(cache.capacity, new_cap);
+        assert!(freed > 0);
+        let kb = cache.k_buffer.as_slice::<u8>();
+        for p in 0..keep {
+            assert_eq!(kb[p * blocks_per_pos * block_size], ((p % 251) + 1) as u8);
+        }
     }
 
     #[test]
