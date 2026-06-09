@@ -47,11 +47,19 @@ GATE-C handoff 의 deferred (a) production e2e + (b) device 를 실모델로 완
 
 ---
 
+## opaque floor 최적화 (A: descriptor 인식) — ✅ 완료 `f4efc02b`
+
+device 1.34x 페널티의 **cheap win** 완주. 동적 format 의 descriptor 가 내장 DType 과 bit-equivalent 면 opaque floor 대신 **typed fast path 로 alloc**(`layout_desc_to_builtin_dtype` {F32,F16,Q4_0} + bin_setup 분기, ADR-0008 D3 의 descriptor-keyed 확장).
+- **검증**: host `bundle_fmt == typed q4` bit-identical(floor 우회 정상) · device `bundle_fmt 59.18 ≈ typed 58.93 ms/tok`(1.004x, 옛 opaque 74.01 → 회수) · `mf_q8`(Q8_0) opaque floor 유지(인식 집합 밖, **단 Q8_0 opaque WRITE 는 pre-existing 불가** = `encode_via_descriptor` Nibble-only) · lib **1261/0** · clippy clean.
+- **★설계 consequence(surface)**: 이 fix 는 floor 를 *빠르게* 만든 게 아니라 floor 를 *우회*한다. **q4_0-canonical(Nibble)이 유일한 e2e-runnable opaque family**(encode Nibble-only)라, 이제 runnable plugin format 은 전부 typed 로 라우팅됨 → opaque attention floor 는 **not-yet-runnable novel family 용 인프라**로 격하(여전히 correct, 단위테스트·opaque eviction/merge arm 보존). **floor 자체 고속화**(novel family 가 runnable 해진 뒤 NEON fused dequant-attention)는 = **Backend v3(c)** 그 자체(아키텍처상 Backend-axis capability "이 descriptor 를 fused 커널로 서빙 가능?"). 즉 (A)=Format-axis 단축(format→builtin 인식), 진짜 floor-fast=(c).
+
+---
+
 ## 다음 작업 (택1)
 
-1. **Backend v3 축** (c): `BackendCapability` trait 메서드 미확정(`name()` 1개) → **설계 grill 선행**. V1~V2 인프라(봉투/슬라이스/dispatcher/export_plugin!) 재사용하나 BackendVTableAbi + dual-wiring 매크로 + DynBackendCap 선행(ADR-0010 §3 C2). GPU device-only.
-2. **opaque generic-floor decode 최적화**: device 1.34x 페널티 해소 — NEON dequant-attention fast path(ADR-0007 D4 per-format 인코더/attention 확장). 북극성 plugin 의 production 실용성 향상.
-3. **device GPU/rpcmem 경로**: 본 검증은 `-b cpu`(dlopen feasibility 격리). opaque KV 의 `opencl --opencl-rpcmem` 경로(standard_format opaque arm → `backend.attention_gen` GPU f32 flash)는 미검증.
+1. **Backend v3 축** (c): `BackendCapability` trait 메서드 미확정(`name()` 1개) → **설계 grill 선행**. **opaque floor-fast 최적화가 첫 구체 메서드 동기 공급**(`fn can_fuse(&KVLayoutDesc)->bool` / `fn attention_opaque(desc,…)->Option<…>`) — novel family 가 runnable 해진 뒤 floor 를 fused NEON/GPU 커널로 대체. V1~V2 인프라(봉투/슬라이스/dispatcher/export_plugin!) 재사용하나 BackendVTableAbi + dual-wiring 매크로 + DynBackendCap 선행(ADR-0010 §3 C2). GPU device-only.
+2. **device GPU/rpcmem 경로**: 본 검증은 `-b cpu`(dlopen feasibility 격리). opaque KV 의 `opencl --opencl-rpcmem` 경로(standard_format opaque arm → `backend.attention_gen` GPU f32 flash)는 미검증.
+3. **encode_via_descriptor 확장**(ADR-0007 D4): Q8_0(Byte)/q4_1(WithMin) 등 non-Nibble write 인코더 → 그래야 비-q4_0 novel family 가 e2e-runnable 해지고 floor/Backend v3 최적화가 실효 대상 확보.
 
 ---
 
