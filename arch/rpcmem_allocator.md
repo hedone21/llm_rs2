@@ -28,7 +28,7 @@ engine/src/memory/rpcmem/
 └── opencl_alias.rs     # 기존 (변경 없음, RpcmemAliasBuffer)
 ```
 
-L2 (`memory/`) 산하. INV-LAYER-002 에 따라 L3 도메인 (`models/`, `pressure/`, `inference/`) 의 어떤 모듈도 import 하지 않으며, raw byte interface (`*mut u8`, `RawFd`) 만 노출한다.
+L2 (`memory/`) 산하. INV-LAYER-002 에 따라 L3 도메인 (`kv/`, `weight/`, `inference/`, `qcf/`) 의 어떤 모듈도 import 하지 않으며, raw byte interface (`*mut u8`, `RawFd`) 만 노출한다.
 
 ### 1.1 모듈 의존 그래프
 

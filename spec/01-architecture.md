@@ -558,16 +558,22 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 |-------|------|---------------------|
 | **L1 Backend** | 하드웨어별 연산 구현 | `backend/{cpu,opencl,cuda_embedded,cuda_pc,qnn_oppkg}/` |
 | **L2 Abstraction** | 백엔드-독립 trait, Tensor/Buffer/DType, 공용 utility | engine 직속 L2 모듈 + L2 sub-dir (arch §6.2 참조) |
-| **L3 Domain** | KV pressure 응답 / Inference forward path | `pressure/`, `inference/` |
+| **L3 Domain** | KV cache 관리 / weight precision swap / Inference forward path / Quality cost 측정 | `kv/`, `weight/`, `inference/`, `qcf/` |
 | **L4 Orchestration** | Decode loop, eviction/swap 트리거, IPC dispatch | `session/` |
 | **L5 Adapter** | CLI, binary entry, signal injection | `bin/` |
 
-**[SYS-101]** L3 도메인은 *Pressure*와 *Inference* 두 부분으로 분해된다. *(MUST)*
+**[SYS-101]** L3 도메인은 *KV*, *Weight*, *Inference*, *QCF* 네 부분으로 분해된다. *(MUST)*
 
-- **Pressure 도메인**: 메모리 압박에 응답하여 캐시/가중치 상태를 변경하는 모든 정책 — KV eviction, KV quantization, KV compress, KV swap, weight swap을 모두 포함한다. `CachePressurePipeline`을 단일 진입점으로 가진다.
-- **Inference 도메인**: 단일 토큰의 forward pass — 모델 구조, layer, attention, sampling, speculative decoding.
+- **KV 도메인** (`kv/`): KV 캐시 상태(state)와 메모리 압박에 응답하는 캐시 정책 — KV eviction, KV quantization, KV compress, KV swap(offload), KIVI quantization을 포함한다. `CachePressurePipeline`을 KV 압력 응답의 단일 진입점으로 가진다.
+- **Weight 도메인** (`weight/`): 모델 가중치의 precision swap 오케스트레이션 — async/phase-aware/intra-forward swap dispatcher, swap executor, dynamic-K/probing-K controller, quant-noise table, primary release worker, weight swap handler. forward path가 임차하는 weight resource 정의(`LayerSlot`/`SecondaryMmap` 등)는 inference 도메인(`models/weights/`)에 loader artifact로 잔존한다.
+- **Inference 도메인** (`inference/`, `layers/`, `models/`): 단일 토큰의 forward pass — 모델 구조, layer, attention, sampling, speculative decoding.
+- **QCF 도메인** (`qcf/`): lossy action(eviction/quantization/skip/swap)의 quality cost 측정 — `kv`/`weight`/`inference` 어느 한쪽에 임의 종속시킬 수 없는 측정/평가 책임.
 
-> **Rationale**: 이전 분류 "Cache vs Inference"는 weight swap이 KV eviction과 동일한 pipeline에 등록되는 현재 구조(`kv/weight_swap_handler.rs`)를 설명하지 못한다. "Pressure vs Inference"는 *압박-반응형 변형*과 *forward 계산*을 분리하여 일반화된다.
+> **Rationale (개정 이력)**:
+> - 2026-05-16 (S-3b 이전): "Cache vs Inference" 2분류.
+> - 2026-05-24 (S-3b-2): QCF를 inference에서 분리하여 독립 L3 도메인으로 신설 — 측정 책임의 명확화. (당시 본 SYS-101 본문에는 소급 반영되지 않아 stale 상태였다.)
+> - 2026-06-10 (γ-1, commit `7fe1fe8b`): 구 `pressure/` 단일 도메인을 `kv/`(KV 캐시 관리)와 `weight/`(weight precision swap)로 물리 분리. weight swap이 KV eviction과 *동일 자원 압박*에 묶이지 않는 별도 오케스트레이션 책임임이 코드 구조로 확정됨. cross-import census 결과 `weight/`→`kv/` 0건, `kv/`→`weight/` 1건(`weight_swap_handler` 이동으로 소멸)으로 두 도메인은 수평 독립이다.
+> - 본 개정(L3 도메인 재정의): SYS-101을 4-도메인 {kv, weight, inference, qcf}로 명시. 구 "Pressure 도메인"이라는 단일 호칭은 폐기 — KV 압박과 weight swap은 별개 도메인이며, "압박-반응형 변형 vs forward 계산"이라는 2분 구도는 더 이상 도메인 경계를 기술하지 못한다.
 
 **[SYS-102]** 두 종류의 cross-cutting 모듈이 존재한다. *(MUST)*
 
@@ -580,7 +586,7 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 
 **[SYS-104]** Cross-cutting 모듈이 L3 도메인의 concrete type을 직접 import할 때는 trait 경유로 inversion한다. *(SHOULD)*
 
-- 예: `observability/events.rs::EventSink` trait — Pressure 도메인이 emit하지만 events 모듈은 trait만 알면 됨.
+- 예: `observability/events.rs::EventSink` trait — KV 도메인(캐시 압력 응답)이 emit하지만 events 모듈은 trait만 알면 됨.
 - 예외: 진단/평가(`observability/eval/`)는 L3 concrete에 의존이 불가피한 면이 있어 L4(`session/eval/`)로 격상하여 inversion한다.
 
 **[SYS-105]** `bin/` 안의 entrypoint(L5)는 `session/` (L4)만 직접 import한다. 그 외 모듈에 대한 직접 import는 binary가 단순 wrapper인 경우(`test_backend`, `signal_injector` 등)에 한해 허용된다. *(SHOULD)*
@@ -589,9 +595,9 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 
 | ID | 한줄 요약 |
 |----|----------|
-| INV-LAYER-001 | L1 backend는 L2(engine 직속 L2 모듈 + L2 sub-dir, arch §6.2 참조)와 cross-cutting(`observability/`, `resilience/`) 외 import 금지. backend 사이의 cross-import는 명시적 허용 zone(예: `cpu_fallback()`)에 한해 인정. backend-aware staging pool(CUDA `layer_object_pool`, OpenCL `host_ptr_pool`)은 backend가 소유하고, pressure handler는 `WeightStagingPool` trait(L2)으로 접근한다. |
-| INV-LAYER-002 | L2 (engine 직속 L2 모듈 + L2 sub-dir, arch §6.2 참조)는 L3(`pressure/`, `inference/`), L4(`session/`), L5(`bin/`) 어떤 모듈도 import 금지. backend-specific buffer/memory는 L2가 아닌 `backend/<be>/buffer/`에 위치한다 (`cl_*`, `cuda_*`, `rpcmem_*`). AUF(가중치 포맷)는 L2 sub-dir `engine/src/auf/`에 위치한다 — backend-specific이 아닌 공용 자산이므로 L2가 적합. L2 디렉토리(`shared/`)는 도입하지 않으며, L2 모듈은 engine 직속 파일 또는 L2 sub-dir로 식별된다 (`scripts/layer_lint.py`의 `TOP_LEVEL_L2` set + `LAYER_RULES` prefix matching). |
-| INV-LAYER-003 | **모든 L3 도메인 쌍 사이 cross-domain concrete import 금지** (S-3b-2, 2026-05-24 일반화). 현 L3 도메인 = {`inference/`, `pressure/`, `qcf/`}. 다른 L3 도메인의 *trait* 만 import 가능, *concrete struct/enum/free fn* 금지. 도메인 노출 trait 예: `pressure/` = `CachePressureHandler`/`EvictionPolicy`/`KVCacheOps`/`WeightStagingPool`, `qcf/` = `QcfComputer`/`ImportanceCollect` 등. 도메인 어휘로 양 도메인이 동등 사용하는 data identifier 는 §13.8-G로 L2(`engine/src/qcf_types.rs` 등)에 격상. 동일 도메인 내부 cross-import는 자유(예: `inference/chat_template.rs` ↔ `inference/models/<arch>/chat_template.rs`). 예외가 불가피한 신규 패턴은 사용자 확인 후 §13.8 정책으로 추가. |
+| INV-LAYER-001 | L1 backend는 L2(engine 직속 L2 모듈 + L2 sub-dir, arch §6.2 참조)와 cross-cutting(`observability/`, `resilience/`) 외 import 금지. backend 사이의 cross-import는 명시적 허용 zone(예: `cpu_fallback()`)에 한해 인정. backend-aware staging pool(CUDA `layer_object_pool`, OpenCL `host_ptr_pool`)은 backend가 소유하고, weight swap handler(`CachePressureHandler` 류 핸들러)는 `WeightStagingPool` trait(L2)으로 접근한다. |
+| INV-LAYER-002 | L2 (engine 직속 L2 모듈 + L2 sub-dir, arch §6.2 참조)는 L3(`kv/`, `weight/`, `inference/`, `qcf/`), L4(`session/`), L5(`bin/`) 어떤 모듈도 import 금지. backend-specific buffer/memory는 L2가 아닌 `backend/<be>/buffer/`에 위치한다 (`cl_*`, `cuda_*`, `rpcmem_*`). AUF(가중치 포맷)는 L2 sub-dir `engine/src/auf/`에 위치한다 — backend-specific이 아닌 공용 자산이므로 L2가 적합. L2 디렉토리(`shared/`)는 도입하지 않으며, L2 모듈은 engine 직속 파일 또는 L2 sub-dir로 식별된다 (`scripts/layer_lint.py`의 `TOP_LEVEL_L2` set + `LAYER_RULES` prefix matching). |
+| INV-LAYER-003 | **모든 L3 도메인 쌍 사이 cross-domain concrete import 금지** (S-3b-2, 2026-05-24 일반화; γ-1 2026-06-10 kv↔weight 분리). 현 L3 도메인 = {`kv/`, `weight/`, `inference/`, `qcf/`}. 다른 L3 도메인의 *trait* 만 import 가능, *concrete struct/enum/free fn* 금지. 도메인 노출 trait 예: `kv/` = `CachePressureHandler`/`EvictionPolicy`/`KVCacheOps`/`WeightStagingPool`, `weight/` = `SwapExecutor` 류 orchestrator trait, `qcf/` = `QcfComputer`/`ImportanceCollect` 등. 도메인 어휘로 양 도메인이 동등 사용하는 data identifier 는 §13.8-G로 L2(`engine/src/qcf_types.rs`·`engine/src/action_result.rs` 등)에 격상. 동일 도메인 내부 cross-import는 자유(예: `inference/chat_template.rs` ↔ `inference/models/<arch>/chat_template.rs`). **kv↔weight 경계 (γ-1)**: `weight/`→`kv/` import 0건, `kv/`→`weight/` import 0건이 목표 상태다. 구 `kv/weight_swap_handler.rs`의 `kv→weight` 1건은 handler를 `weight/`로 이동하여 동도메인 경로로 흡수한다 (`ActionResult` enum은 §13.8-G L2 격상으로 양 도메인 공유 어휘화). 예외가 불가피한 신규 패턴은 사용자 확인 후 §13.8 정책으로 추가. |
 | INV-LAYER-004 | Cross-cutting 모듈(`observability/`, `resilience/`)이 L3 도메인의 concrete type을 import할 때는 trait/Sink 경유로 한정한다. 예외는 본 절에 명시적으로 기재된 케이스(예: `events::CacheEvent` enum이 pressure 결과를 표현)에 한정. |
 | INV-LAYER-005 | L5 `bin/` 안의 production entrypoint(`generate`)는 L4 `session/`만 직접 import한다. test/microbench binary는 본 규칙 밖. `chat_ipc`는 L4(`session/chat_ipc.rs`) 책임이며 외부 IPC adapter로서 production binary가 직접 import하지 않는다. |
 | INV-LAYER-006 | L4 `DecodeLoop` struct는 L1 backend/L3 concrete struct를 필드로 직접 보유하지 않는다 — 6개 추상화 trait(`Forward`, `EvictionStage`, `SwapStage`, `CommandSource`, `TokenSampler`, `DecodeObserver`)만 보유한다. SYS-100/103과 직교한 *L4 내부 결합도* 제약(DIP 강화). 상세 trait API는 `arch/inference_pipeline.md` §2 참조. |
@@ -599,7 +605,11 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 
 **NOTE (테스트 코드 정책, §13.8-E)**: lib 내부 inline `#[cfg(test)]` 블록의 backend instantiation(예: `core/eviction/*`, `core/pressure/*`에서 `CpuBackend::new()`)은 **grandfathered exception**으로 baseline에 등재된 채 유지된다. 신규로 추가하는 spec/단위 테스트는 모두 `engine/tests/spec/` 아래에 작성해야 하며, 본 위치에서만 backend instantiation을 허용한다. feedback `spec_tests_required`와 정합 — INV-LAYER 관련 spec 테스트는 `tests/spec/test_inv_layer_{001..005}.rs`에 위치한다. baseline에 등재된 lib 내부 테스트는 마이그레이션 마지막 단계(Step 5 이후)에 0으로 수렴시킨다.
 
-**NOTE (INV-LAYER-003 보조 위계, 2026-05-26 명시화)**: L3 도메인 `{inference/, pressure/, qcf/}`은 import 규칙상 **수평 동등**이지만, **데이터 owner 측면에서는 pressure가 stateful runtime resource owner이다**. pressure가 소유하는 자원 = `{KV cache, weight slot, secondary mmap, preload pool, kivi cache}`이며, inference는 이 자원을 trait(`KVCacheOps`, `PreloadAccess` 등)으로 임차한다. inference는 forward pass executor 역할을 하며 자신의 stateful runtime resource를 노출하지 않는다 (`ModelConfig` 등 *configuration* 어휘만 보유). 역방향(pressure → inference vocabulary)은 inference의 *configuration* 어휘(예: `ModelConfig`)에 한정되며, 이 패턴은 §13.8-G L2 promotion (양 도메인 공유 어휘로 격상) 또는 §13.8-O `cross_l3_vocabulary` marker로 처리한다. 본 위계는 §13.8-O 우선순위 결정의 근거이며, arch §6.3/§6.4 책임 paragraph에 대응 매핑되어 있다.
+**NOTE (INV-LAYER-003 보조 위계, 2026-05-26 명시화 · 2026-06-10 γ-1 도메인 분리 반영)**: L3 도메인 `{kv/, weight/, inference/, qcf/}`은 import 규칙상 **수평 동등**이지만, **데이터 owner 측면에서는 kv와 weight가 stateful runtime resource owner이다**. 자원 귀속(실코드 기준):
+> - **kv 도메인 소유 자원** = `{KV cache, kivi cache, preload pool, offload store}` — `kv/{kv_cache, kivi_cache, offload/, cache_manager}.rs`가 owner.
+> - **weight 도메인 소유 자원** = `{quant-noise table, primary release worker, swap staging, swap generation counter}` — `weight/{noise_table, release_worker, swap_executor, async_swap}.rs`가 owner. 단 **weight slot/secondary mmap의 *정의*(`LayerSlot`/`SecondaryMmap`)는 inference 도메인(`models/weights/`)에 loader artifact로 잔존**한다 — weight orchestrator는 이를 §13.8-O `cross_l3_vocabulary` marker로 임차하여 mutate한다 (Sprint C 결정, ARCHITECTURE.md §13.8-O register 참조).
+>
+> inference는 forward pass executor 역할을 하며 자신의 stateful runtime resource를 노출하지 않는다 (`ModelConfig` 등 *configuration* 어휘만 보유). kv/weight 자원은 inference가 trait(`KVCacheOps`, `PreloadAccess`, `QuantNoiseAccess`, `ReleaseWorkerAccess` 등)으로 임차한다. 역방향(kv/weight → inference vocabulary)은 inference의 *configuration* 어휘(예: `ModelConfig`)에 한정되며, 이 패턴은 §13.8-G L2 promotion (양 도메인 공유 어휘로 격상) 또는 §13.8-O `cross_l3_vocabulary` marker로 처리한다. **kv↔weight 사이**(γ-1)는 양방향 모두 동등 owner이며 cross-import 0건이 목표 — 양 도메인이 동등 사용하는 data identifier(예: `ActionResult` enum)는 §13.8-G로 L2 격상한다. 본 위계는 §13.8-O 우선순위 결정의 근거이며, arch §6.3/§6.4 책임 paragraph에 대응 매핑되어 있다.
 
 상세 INV 카탈로그 항목은 `spec/41-invariants.md` §3.26 참조. 코드 매핑은 `arch/01-architecture.md` §6 참조. 위반 현황(실측)과 마이그레이션 계획은 `ARCHITECTURE.md` §13 참조. L4 내부 `DecodeLoop` SOLID 분해 + 빌더 설계(INV-LAYER-006/007)는 `arch/inference_pipeline.md` 참조.
 

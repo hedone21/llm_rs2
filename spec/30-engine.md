@@ -1158,7 +1158,7 @@ diff \
 
 **[ENG-RPCMEM-C03]** `--opencl-rpcmem` 활성 시에도 fast feasibility 측정 (Phase 10 HeteroLLM 재현) 결과의 raw `clientBuf` slow path (0.04 GB/s) 는 회피한다. 즉 `RpcmemAliasBuffer` (`CL_MEM_USE_HOST_PTR` alias) 만 사용하며 OpenCL backend 가 별도의 `clientBuf` import 를 추가하지 않는다. *(MUST NOT)*
 
-**[ENG-RPCMEM-C04]** `RpcmemAllocator` 모듈은 INV-LAYER-001/002 를 준수한다. `memory/rpcmem/allocator.rs` 는 L2 (`memory/`) 에 위치하며 L3 (`models/`, `pressure/`, `inference/`) 의 어떤 모듈도 import 하지 않는다. allocator 가 노출하는 API 는 `unsafe fn alloc(&self, size) -> Result<(*mut u8, RawFd)>` / `unsafe fn free(&self, host_ptr)` 의 raw byte interface 만 유지한다. *(MUST)*
+**[ENG-RPCMEM-C04]** `RpcmemAllocator` 모듈은 INV-LAYER-001/002 를 준수한다. `memory/rpcmem/allocator.rs` 는 L2 (`memory/`) 에 위치하며 L3 도메인 (`kv/`, `weight/`, `inference/`, `qcf/`) 의 어떤 모듈도 import 하지 않는다. allocator 가 노출하는 API 는 `unsafe fn alloc(&self, size) -> Result<(*mut u8, RawFd)>` / `unsafe fn free(&self, host_ptr)` 의 raw byte interface 만 유지한다. *(MUST)*
 
 ### E.7 Invariants
 
