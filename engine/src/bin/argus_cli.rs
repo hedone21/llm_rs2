@@ -54,24 +54,24 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
         bail!("argus-cli v0: --chat-socket / --chat-tcp moved to argus-chat (planned)");
     }
     if args.experiment_schedule.is_some() {
-        bail!("argus-cli v0: --experiment-schedule moved to argus-eval experiment (planned)");
+        bail!("argus-cli v0: --experiment-schedule moved to argus-eval experiment (γ-3b planned)");
     }
     if args.experiment_output.is_some() {
         bail!("argus-cli v0: --experiment-output moved to argus-bench (planned)");
     }
     if args.ppl.is_some() {
-        bail!("argus-cli v0: --ppl moved to argus-eval ppl (planned)");
+        bail!("argus-cli v0: --ppl moved to argus-eval --ppl");
     }
     if args.eval_ll || args.eval_batch.is_some() || args.eval_continuation.is_some() {
         bail!(
-            "argus-cli v0: --eval-ll / --eval-batch / --eval-continuation moved to argus-eval ll (planned)"
+            "argus-cli v0: --eval-ll / --eval-batch / --eval-continuation moved to argus-eval --eval-ll"
         );
     }
     if args.dump_importance {
-        bail!("argus-cli v0: --dump-importance moved to argus-eval dump importance (planned)");
+        bail!("argus-cli v0: --dump-importance moved to argus-eval --dump-importance");
     }
     if args.qcf_dump.is_some() {
-        bail!("argus-cli v0: --qcf-dump moved to argus-eval dump qcf (planned)");
+        bail!("argus-cli v0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)");
     }
     if args.prompt_batch.is_some() {
         bail!("argus-cli v0: --prompt-batch not yet supported (planned for v1)");

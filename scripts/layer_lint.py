@@ -125,6 +125,15 @@ L5_SKIP_PATTERNS = [
     "micro_bench",
 ]
 
+# INV-LAYER-005 enforcement 대상 production binary (basename). generate.rs
+# 폐기(d5ed71d2) 후 argus 패밀리로 일반화(γ-3a). 이 bin 들은 L4 session/ 만
+# 직접 import 해야 한다.
+L5_PRODUCTION_BINS = {
+    "argus_cli.rs",
+    "argus_bench.rs",
+    "argus_eval.rs",
+}
+
 
 def classify_module(rel_path: str) -> str:
     """
@@ -257,18 +266,20 @@ def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str |
             kind = f"cross-cutting({src_layer})→{dst_layer} (trait inversion 필요)"
             return ("INV-LAYER-004", kind, None)
 
-    # INV-LAYER-005: L5 bin → L4/session 외 direct import 금지 (generate.rs 한정)
-    # generate.rs가 아닌 bin/ 파일은 enforcement 대상 외
+    # INV-LAYER-005: L5 production bin → L4/session 외 direct import 금지.
+    # generate.rs 폐기(d5ed71d2) 후 argus production bin(argus_cli/argus_bench/
+    # argus_eval — L5_SKIP_PATTERNS 비대상)으로 일반화(γ-3a). test/microbench bin
+    # 은 L5_SKIP_PATTERNS 로 면제.
     if src_layer == "L5":
         basename = os.path.basename(src_rel)
         name_no_ext = basename.replace(".rs", "")
         # skip 대상 binary인지 확인
         skip = any(name_no_ext.startswith(p) for p in L5_SKIP_PATTERNS)
-        if not skip and basename == "generate.rs":
-            # generate.rs → L1/L2/L3/observability/resilience 직접 import는 모두 위반
+        if not skip and basename in L5_PRODUCTION_BINS:
+            # production bin → L1/L2/L3/observability/resilience 직접 import는 모두 위반
             if dst_layer in ("L1", "L2", *_L3_DOMAINS, "L3-core",
                              "observability", "resilience"):
-                kind = f"L5/generate.rs→{dst_layer} (L4 session/ 우회)"
+                kind = f"L5/{basename}→{dst_layer} (L4 session/ 우회)"
                 return ("INV-LAYER-005", kind, None)
 
     return (None, None, None)

@@ -33,7 +33,7 @@ from device_registry.deployer import deploy_binary, deploy_eval_files, verify_mo
 # `generate` was renamed to `legacy_generate` and the new entry point is
 # `argus_cli` (commit 7065196c, 2026-05-24). Keep `generate` listed for any
 # downstream fork that still ships it.
-_INFERENCE_BINARIES = ("argus_cli", "legacy_generate", "generate")
+_INFERENCE_BINARIES = ("argus_cli", "argus_eval", "legacy_generate", "generate")
 
 
 def _list_devices() -> int:

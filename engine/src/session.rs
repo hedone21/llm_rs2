@@ -10,6 +10,7 @@ pub mod decode_loop;
 pub mod defaults;
 pub mod dump_importance;
 pub mod eval;
+pub mod eval_setup;
 pub mod experiment_run;
 pub mod forward;
 pub mod init;

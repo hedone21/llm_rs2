@@ -85,18 +85,20 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
         );
     }
     if args.ppl.is_some() {
-        bail!("argus-bench AB-0: --ppl moved to argus-eval ppl (planned)");
+        bail!("argus-bench AB-0: --ppl moved to argus-eval --ppl");
     }
     if args.eval_ll || args.eval_batch.is_some() || args.eval_continuation.is_some() {
         bail!(
-            "argus-bench AB-0: --eval-ll / --eval-batch / --eval-continuation moved to argus-eval ll (planned)"
+            "argus-bench AB-0: --eval-ll / --eval-batch / --eval-continuation moved to argus-eval --eval-ll"
         );
     }
     if args.dump_importance {
-        bail!("argus-bench AB-0: --dump-importance moved to argus-eval dump importance (planned)");
+        bail!("argus-bench AB-0: --dump-importance moved to argus-eval --dump-importance");
     }
     if args.qcf_dump.is_some() {
-        bail!("argus-bench AB-0: --qcf-dump moved to argus-eval dump qcf (planned)");
+        bail!(
+            "argus-bench AB-0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)"
+        );
     }
     if args.prompt_batch.is_some() {
         bail!("argus-bench AB-0: --prompt-batch not yet supported (planned)");
