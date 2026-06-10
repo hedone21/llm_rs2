@@ -29,6 +29,7 @@ const BANNED: &[&str] = &[
     "CudaBackend",
     "CpuBackend",
     "QnnBackend",
+    "CacheManager",
     "KiviCache",
     "OffloadStore",
     "LlamaModel",
