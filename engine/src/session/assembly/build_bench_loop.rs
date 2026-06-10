@@ -28,6 +28,7 @@ use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::cli::Args;
 use crate::session::command_dispatcher::CommandDispatcher;
+use crate::session::experiment::ScheduleCommandSource;
 use crate::session::forward::ModelForward;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
@@ -168,6 +169,10 @@ pub fn build_local_pressure_source(
 ///
 /// `kv_caches`: `bin_setup`이 `--kv-format`/`--kv-type` dispatch로 이미 할당한
 /// KV cache (typed 또는 ADR-0008 opaque). builder는 재할당하지 않고 소비한다.
+///
+/// `schedule_source`: γ-3b experiment 모드용 `ScheduleCommandSource`. `resilience`
+/// 와 상호 배타 — `resilience.is_some()` 이면 cmd_source 슬롯은 `ResilienceAdapter`
+/// 가 점유하므로 `schedule_source` 는 무시된다. experiment 모드는 resilience=None.
 #[allow(clippy::too_many_arguments)]
 pub fn build_bench_loop(
     backend: Arc<dyn Backend>,
@@ -185,6 +190,8 @@ pub fn build_bench_loop(
     // β-5: pressure-driven Persistent EvictionStage 의 force_evict target ratio
     // (CLI `--eviction-target-ratio` — CM 내부 값과 동일 출처를 호출자가 보장).
     pressure_evict_ratio: f32,
+    // γ-3b: 정적 directive schedule source. None → 무주입(bench/happy-path).
+    schedule_source: Option<ScheduleCommandSource>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // ADR-0008: decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고
@@ -242,7 +249,9 @@ pub fn build_bench_loop(
     // β-5: CM 을 Arc<Mutex> 로 한 번 들어 dispatcher(OneShot 구성)와 Persistent stage 가 공유.
     let shared_cm = cache_manager.map(|cm| Arc::new(Mutex::new(cm)));
 
-    let dispatcher = if resilience.is_some() || shared_cm.is_some() {
+    // γ-3b: schedule_source 가 있어도 dispatcher 를 구성해야 evict directive 가 OneShot
+    // EvictionStage 로 submit 된다 (설계 §13.4 "schedule.is_some() OR 추가").
+    let dispatcher = if resilience.is_some() || shared_cm.is_some() || schedule_source.is_some() {
         Some(CommandDispatcher::new(
             Arc::clone(&registry),
             kv_handles.clone(),
@@ -283,7 +292,11 @@ pub fn build_bench_loop(
     };
     let builder = match resilience {
         Some(adapter) => builder.with_resilience(adapter),
-        None => builder,
+        None => match schedule_source {
+            // γ-3b: resilience 없을 때만 schedule cmd_source 주입.
+            Some(scs) => builder.with_cmd_source(scs),
+            None => builder,
+        },
     };
     let builder = match dispatcher {
         Some(d) => builder.with_command_dispatcher(d),

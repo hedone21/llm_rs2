@@ -54,7 +54,9 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
         bail!("argus-cli v0: --chat-socket / --chat-tcp moved to argus-chat (planned)");
     }
     if args.experiment_schedule.is_some() {
-        bail!("argus-cli v0: --experiment-schedule moved to argus-eval experiment (γ-3b planned)");
+        bail!(
+            "argus-cli v0: --experiment-schedule moved to argus-eval experiment; use argus-eval --experiment-schedule"
+        );
     }
     if args.experiment_output.is_some() {
         bail!("argus-cli v0: --experiment-output moved to argus-bench (planned)");

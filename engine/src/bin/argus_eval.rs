@@ -29,8 +29,12 @@
 
 use anyhow::bail;
 use clap::Parser;
+use llm_rs2::experiment::ExperimentSchedule;
+use llm_rs2::session::bin_setup::build_inference_ctx;
 use llm_rs2::session::cli::{Args, KvMode};
 use llm_rs2::session::eval_setup;
+use llm_rs2::session::experiment::ScheduleCommandSource;
+use llm_rs2::session::run_experiment_schedule_path;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -156,7 +160,14 @@ fn dispatch_eval(mode: EvalMode, args: Args) -> anyhow::Result<()> {
             llm_rs2::session::dump_importance::run_dump_importance(ctx)
         }
         EvalMode::Experiment => {
-            bail!("argus-eval experiment: γ-3b (planned)")
+            let schedule_path = args
+                .experiment_schedule
+                .clone()
+                .expect("Experiment mode implies experiment_schedule.is_some()");
+            let schedule = ExperimentSchedule::load(&schedule_path)?;
+            let scs = ScheduleCommandSource::new(schedule);
+            let ctx = build_inference_ctx(args)?;
+            run_experiment_schedule_path(ctx, scs)
         }
     }
 }

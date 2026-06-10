@@ -11,6 +11,7 @@ pub mod defaults;
 pub mod dump_importance;
 pub mod eval;
 pub mod eval_setup;
+pub mod experiment;
 pub mod experiment_run;
 pub mod forward;
 pub mod init;
@@ -34,6 +35,6 @@ pub use decode_loop::{
     DecodeLoop, DecodeLoopBuilder, DecodeResult, HasForward, NoForward, StopReason,
 };
 pub use defaults::NoOpCommandSource;
-pub use experiment_run::run_experiment_path;
+pub use experiment_run::{run_experiment_path, run_experiment_schedule_path};
 pub use forward::Forward;
 pub use samplers::RepetitionPenaltySampler;
