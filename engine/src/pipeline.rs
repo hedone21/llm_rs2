@@ -45,17 +45,40 @@ impl Pressure {
 
     /// 4-level 강등 (구 `PressureLevel`/`llm_shared::Level` 흡수처).
     ///
-    /// **canonical cutoff 는 `LocalPressureSource`(Phase α-W-3)가 소유**한다 — 여기 default 는
-    /// 구 `cache_manager::determine_pressure_level` / `MemoryStrategy` 이산 임계의 day-1 carry
-    /// placeholder 이며, 실측 튜닝은 코드 시점이다 (G4 게이트 해제 —
-    /// `handoff_design_concretization_2026_06_02`). 현재 `band()` 은 어떤 live 경로에도
-    /// 배선되어 있지 않으므로(α-W additive), 이 placeholder 는 동작에 영향이 없다.
+    /// Pressure scalar(0–100) → `Level` 매핑. 이 cutoff(0-49/50-74/75-89/90-100) 는
+    /// canonical 이며, `Pressure` 를 생산하는 source(`LocalPressureSource` 등)는 이 band
+    /// 경계에 정확히 떨어지도록 scalar 를 산출한다(`Pressure::from_mem_available` 참조).
     pub fn band(self) -> Level {
         match self.0 {
             0..=49 => Level::Normal,
             50..=74 => Level::Warning,
             75..=89 => Level::Critical,
             _ => Level::Emergency,
+        }
+    }
+
+    /// `MemAvailable`(bytes) → `Pressure` — 구 `cache_manager::determine_pressure_level`
+    /// 계단 산식의 정본 이식.
+    ///
+    /// 구 산식 (threshold = `t`):
+    /// - `mem >= t` → Normal
+    /// - `t/2 <= mem < t` → Warning
+    /// - `t/4 <= mem < t/2` → Critical
+    /// - `mem < t/4` → Emergency
+    ///
+    /// 각 구간을 `band()` cutoff 의 하한값(0/50/75/90)으로 사상해 4-level↔band 전사 매핑이
+    /// 경계값(`mem == t`, `t/2`, `t/4`)에서 구 enum 과 정확히 일치하게 한다 — 구 산식과
+    /// 동일한 비교 연산자(`>=`)를 그대로 사용한다. `LocalPressureSource` 와 `CacheManager`
+    /// 가 이 단일 함수를 공유해 cutoff 거처를 일원화한다 (§5.1, β-5).
+    pub fn from_mem_available(mem_available: usize, threshold_bytes: usize) -> Self {
+        if mem_available >= threshold_bytes {
+            Pressure(0) // Normal
+        } else if mem_available >= threshold_bytes / 2 {
+            Pressure(50) // Warning
+        } else if mem_available >= threshold_bytes / 4 {
+            Pressure(75) // Critical
+        } else {
+            Pressure(90) // Emergency
         }
     }
 }
@@ -191,4 +214,76 @@ pub trait PipelineStage: Send + Sync {
 /// `Continue`→진행 / `Consumed`→OneShot GC / `Stop(r)`→break / `Err`→panic(fail-fast).
 pub trait PipelineDispatcher: Send + Sync {
     fn dispatch(&self, phase: LifecyclePhase, ctx: &mut StageContext<'_>) -> Option<StopReason>;
+}
+
+#[cfg(test)]
+mod pressure_band_tests {
+    use super::*;
+
+    /// 구 `cache_manager::determine_pressure_level` 산식의 정본 oracle (변경 전 코드 그대로).
+    /// β-5 ripple 의 전사 등가 anchor — `Pressure::from_mem_available(..).band()` 와 대조한다.
+    fn legacy_determine_level(mem_available: usize, threshold: usize) -> Level {
+        if mem_available >= threshold {
+            Level::Normal
+        } else if mem_available >= threshold / 2 {
+            Level::Warning
+        } else if mem_available >= threshold / 4 {
+            Level::Critical
+        } else {
+            Level::Emergency
+        }
+    }
+
+    fn new_level(mem_available: usize, threshold: usize) -> Level {
+        Pressure::from_mem_available(mem_available, threshold).band()
+    }
+
+    /// 게이트 1: 4-level × {t, t÷2, t÷4} 경계 ±1 전수 — 구 산식 == 신 band() 전사.
+    /// eviction/swap trigger 임계 불변 증명 (경계값에서 구 enum 과 신 band 동일 level).
+    #[test]
+    fn level_to_band_boundary_parity() {
+        // 다양한 threshold (짝수/홀수/큰 값 — integer division 경계 보존 확인).
+        let thresholds = [4usize, 100, 1024, 1_000_003, 8 * 1024 * 1024 * 1024];
+        for &t in &thresholds {
+            // 경계점 후보: 0, t/4, t/2, t 와 각 ±1.
+            let edges = [
+                0usize,
+                (t / 4).saturating_sub(1),
+                t / 4,
+                t / 4 + 1,
+                (t / 2).saturating_sub(1),
+                t / 2,
+                t / 2 + 1,
+                t.saturating_sub(1),
+                t,
+                t + 1,
+                t * 2,
+            ];
+            for &mem in &edges {
+                assert_eq!(
+                    new_level(mem, t),
+                    legacy_determine_level(mem, t),
+                    "level mismatch: mem={}, threshold={}",
+                    mem,
+                    t,
+                );
+            }
+        }
+    }
+
+    /// 경계값 정확 사상: mem == t → Normal, mem == t/2 → Warning, mem == t/4 → Critical,
+    /// mem < t/4 → Emergency. (band cutoff 의 하한값 매핑이 4-level 과 1:1.)
+    #[test]
+    fn exact_boundary_maps_to_band_lower_bounds() {
+        let t = 1024usize;
+        assert_eq!(new_level(t, t), Level::Normal);
+        assert_eq!(new_level(t / 2, t), Level::Warning);
+        assert_eq!(new_level(t / 4, t), Level::Critical);
+        assert_eq!(new_level(t / 4 - 1, t), Level::Emergency);
+        // band() cutoff 하한값 확인.
+        assert_eq!(Pressure::new(0).band(), Level::Normal);
+        assert_eq!(Pressure::new(50).band(), Level::Warning);
+        assert_eq!(Pressure::new(75).band(), Level::Critical);
+        assert_eq!(Pressure::new(90).band(), Level::Emergency);
+    }
 }

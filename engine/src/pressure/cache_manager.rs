@@ -150,16 +150,11 @@ impl CacheManager {
     /// - `>= threshold / 2`: Warning
     /// - `>= threshold / 4`: Critical
     /// - `< threshold / 4`: Emergency
+    ///
+    /// β-5: 계단 산식은 `Pressure::from_mem_available` 으로 일원화되었다 (cutoff 의 단일
+    /// 거처). 본 메서드는 `Pressure → band()` 강등으로 동일 결과를 낸다 (behavior-preserving).
     fn determine_pressure_level(&self, mem_available: usize) -> PressureLevel {
-        if mem_available >= self.threshold_bytes {
-            PressureLevel::Normal
-        } else if mem_available >= self.threshold_bytes / 2 {
-            PressureLevel::Warning
-        } else if mem_available >= self.threshold_bytes / 4 {
-            PressureLevel::Critical
-        } else {
-            PressureLevel::Emergency
-        }
+        crate::pipeline::Pressure::from_mem_available(mem_available, self.threshold_bytes).band()
     }
 
     /// Convert pipeline `ActionResult`s into a legacy `EvictionResult`.
