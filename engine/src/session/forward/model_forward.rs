@@ -127,7 +127,7 @@ impl ModelForward {
         let logits_decode = alloc_logits(memory.as_ref(), backend.clone(), vocab_size)?;
         let logits_prefill_last = alloc_logits(memory.as_ref(), backend.clone(), vocab_size)?;
 
-        Ok(Self {
+        let mut s = Self {
             backend,
             memory,
             cpu_backend,
@@ -148,7 +148,12 @@ impl ModelForward {
             sticky_disabled: false,
             #[cfg(feature = "opencl")]
             plan_enabled,
-        })
+        };
+        // β-3 commit A: construction 시점 wrap — EvictionStage register 시점에
+        // fmt handle 을 보유(INV-STAGE-LAYER-HANDLE). prefill/step 의 ensure_fmt_wrapped
+        // 호출은 이미 Some 이라 defensive no-op 으로 비용 0.
+        s.ensure_fmt_wrapped();
+        Ok(s)
     }
 
     /// Phase 4-4.7 (A1): plan eligibility 검사 + build 시도.
@@ -221,7 +226,16 @@ impl ModelForward {
         &self.model
     }
 
-    /// `kv_caches` 를 `StandardFormat` 으로 1회 wrap (prefill 시작 시 lazy).
+    /// β-3: register 시점 Stage 가 보유할 fmt handle (INV-STAGE-LAYER-HANDLE).
+    /// 빈 캐시로 구성된 경우 빈 슬라이스.
+    pub fn fmt_caches(&self) -> &[Arc<StandardFormat>] {
+        self.fmt_caches.as_deref().unwrap_or(&[])
+    }
+
+    /// `kv_caches` 를 `StandardFormat` 으로 1회 wrap.
+    ///
+    /// **construction 시점 wrap (β-3 commit A)** — `new()` 끝에서 즉시 호출.
+    /// prefill/step 호출은 **defensive no-op** (fmt_caches.is_some() early return, 비용 0).
     ///
     /// **by-value move**(`mem::take`)하므로 물리 캐시는 fmt 안에 단 한 벌만 존재(dual-ownership
     /// 부재 — interior mutability 로 forward/eviction 모두 `&self` 통과, ADR-0001 §4.2). 이미 wrap /
@@ -231,18 +245,7 @@ impl ModelForward {
             return;
         }
         let caches = std::mem::take(&mut self.kv_caches);
-        let fmts: Vec<Arc<StandardFormat>> = caches
-            .into_iter()
-            .enumerate()
-            .map(|(i, c)| Arc::new(StandardFormat::new(i, c)))
-            .collect();
-        if std::env::var_os("LLMRS_FWD_TRACE").is_some() {
-            eprintln!(
-                "[fwd-trace] fmt default: wrapped {} KVCache → StandardFormat (decode = forward_into)",
-                fmts.len()
-            );
-        }
-        self.fmt_caches = Some(fmts);
+        self.fmt_caches = wrap_kv_caches(caches);
     }
 
     /// Construct the input `[1, seq_len]` U32 tensor on the active backend.
@@ -612,6 +615,28 @@ impl Forward for ModelForward {
     }
 }
 
+/// `Vec<KVCache>` → `Vec<Arc<StandardFormat>>` wrap (by-value move, 단일 물리 캐시).
+///
+/// 빈 입력이면 `None` (기존 `kv_caches.is_empty()` 가드 등가).
+/// W1 불변식: enumerate 순서 == layer idx (D2O cross-layer 전제).
+pub(crate) fn wrap_kv_caches(caches: Vec<KVCache>) -> Option<Vec<Arc<StandardFormat>>> {
+    if caches.is_empty() {
+        return None;
+    }
+    let fmts: Vec<Arc<StandardFormat>> = caches
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| Arc::new(StandardFormat::new(i, c)))
+        .collect();
+    if std::env::var_os("LLMRS_FWD_TRACE").is_some() {
+        eprintln!(
+            "[fwd-trace] fmt default: wrapped {} KVCache → StandardFormat (decode = forward_into)",
+            fmts.len()
+        );
+    }
+    Some(fmts)
+}
+
 fn workspace_config_for(model: &TransformerModel, max_seq_len: usize) -> WorkspaceConfig {
     let head_dim = model.config.head_dim;
     let kv_dim = model.config.num_key_value_heads * head_dim;
@@ -686,4 +711,67 @@ pub fn alloc_standard_kv_caches(
         );
     }
     Ok(caches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
+
+    /// F32 SeqMajor KVCache 를 테스트용으로 구성 (standard_format.rs 테스트 패턴 차용).
+    fn make_cache_with_pos(kv_heads: usize, head_dim: usize, pos: usize) -> KVCache {
+        let max_seq = 64usize;
+        let total = max_seq * kv_heads * head_dim;
+        let buf = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let k = Tensor::new(
+            Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+            buf.clone(),
+            backend.clone(),
+        );
+        let v = Tensor::new(
+            Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+            buf,
+            backend,
+        );
+        let mut c = KVCache::new(k, v, max_seq);
+        c.current_pos = pos;
+        c
+    }
+
+    /// 빈 입력 → None (기존 is_empty() 가드 보존).
+    #[test]
+    fn wrap_empty_returns_none() {
+        let result = wrap_kv_caches(vec![]);
+        assert!(result.is_none());
+    }
+
+    /// KVCache 3개 wrap → handles[i].with_cache_mut current_pos == i+1, 순서 보존.
+    #[test]
+    fn wrap_preserves_layer_order_and_pos() {
+        let caches = vec![
+            make_cache_with_pos(2, 8, 1),
+            make_cache_with_pos(2, 8, 2),
+            make_cache_with_pos(2, 8, 3),
+        ];
+        let handles = wrap_kv_caches(caches).expect("non-empty should return Some");
+        assert_eq!(handles.len(), 3);
+        for (i, h) in handles.iter().enumerate() {
+            let pos = h.with_cache_mut(|c| c.current_pos);
+            assert_eq!(pos, i + 1, "layer {} pos mismatch", i);
+        }
+    }
+
+    /// wrap 후 handle 경유 reset → current_pos == 0 (chat reset_kv fmt-경로 단위 등가).
+    #[test]
+    fn wrap_handle_reset_roundtrip() {
+        let caches = vec![make_cache_with_pos(2, 8, 42)];
+        let handles = wrap_kv_caches(caches).expect("non-empty should return Some");
+        handles[0].with_cache_mut(|c| c.current_pos = 0);
+        let pos = handles[0].with_cache_mut(|c| c.current_pos);
+        assert_eq!(pos, 0);
+    }
 }
