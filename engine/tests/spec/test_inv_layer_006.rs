@@ -11,7 +11,11 @@
 //! - L1: OpenCLBackend, CudaBackend, CpuBackend, QnnBackend
 //! - L3 pressure: CacheManager, KiviCache, OffloadStore
 //! - L3 inference: LlamaModel, TransformerModel
-//! - cross-cutting concrete: Profiler, ManagerClient
+//! - cross-cutting concrete: ManagerClient
+//!
+//! Note: `OpProfiler` (from observability) is NOT banned — v2 §5.1 StageContext
+//! 계약에서 DecodeLoop 이 OpProfiler 1개를 소유하고 dispatch 호출부마다 `&mut`
+//! 재대여하는 것이 명시적으로 허용된다 (INV-DECODE-STAGE-006, roadmap β-1).
 //!
 //! Scope: this check applies *only* to the `DecodeLoop` struct field block —
 //! impl blocks, helper functions, and trait implementor structs (e.g.
@@ -25,14 +29,19 @@ const BANNED: &[&str] = &[
     "CudaBackend",
     "CpuBackend",
     "QnnBackend",
-    "CacheManager",
     "KiviCache",
     "OffloadStore",
     "LlamaModel",
     "TransformerModel",
-    "Profiler",
     "ManagerClient",
 ];
+
+/// 과도기 허용 필드 식별자 목록.
+///
+/// 아래 식별자로 시작하는 필드 라인은 BANNED 검사 이전에 필터링된다.
+/// β-3 에서 해당 필드 제거 후 이 allowlist 도 동시에 제거하여 CacheManager 금지를
+/// 복원한다 (INV-LAYER-006 G7, roadmap_beta_decode_loop_rewrite_2026_06_10.md §G7).
+const ALLOWLISTED_TRANSITIONAL: &[&str] = &["cache_manager"];
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -66,9 +75,22 @@ fn test_inv_layer_006_decode_loop_fields_are_abstractions_only() {
 
     let fields = extract_decode_loop_fields(&src);
 
+    // allowlist 필터: 과도기 허용 식별자로 시작하는 필드 라인을 BANNED 검사 전 제거.
+    // β-3 에서 해당 필드 제거 후 ALLOWLISTED_TRANSITIONAL 도 동시 제거 → CacheManager 금지 복원.
+    let filtered_fields: String = fields
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !ALLOWLISTED_TRANSITIONAL
+                .iter()
+                .any(|allowed| trimmed.starts_with(allowed))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let mut violations = Vec::new();
     for ident in BANNED {
-        if fields.contains(ident) {
+        if filtered_fields.contains(ident) {
             violations.push(*ident);
         }
     }

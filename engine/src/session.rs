@@ -12,6 +12,7 @@ pub mod eval;
 pub mod experiment_run;
 pub mod forward;
 pub mod init;
+pub mod pipeline_registry;
 pub mod plugin_dispatch;
 pub mod ppl;
 pub mod qcf_runtime;
