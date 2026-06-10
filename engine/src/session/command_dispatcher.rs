@@ -450,6 +450,7 @@ mod tests {
                 pos: N_TOKENS,
                 decode_step: 0,
                 pressure: crate::pipeline::Pressure::new(0),
+                prev_token: 0,
             },
             profiler: &mut profiler,
         };

@@ -171,6 +171,7 @@ fn assert_pressure_driven_equivalence(policy_name: &str, dtype: DType) {
             decode_step: 0,
             // source 가 산출한 graded 압력 (Warning).
             pressure,
+            prev_token: 0,
         },
         profiler: &mut profiler,
     };
@@ -242,6 +243,7 @@ fn normal_pressure_does_not_fire() {
             pos: N_TOKENS,
             decode_step: 0,
             pressure,
+            prev_token: 0,
         },
         profiler: &mut profiler,
     };

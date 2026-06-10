@@ -164,6 +164,7 @@ fn assert_equivalence(
             pos: n_tokens,
             decode_step: 0,
             pressure: Pressure::new(0),
+            prev_token: 0,
         },
         profiler: &mut profiler,
     };

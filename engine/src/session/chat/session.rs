@@ -29,11 +29,12 @@ use crate::pressure::kv_cache::KVCache;
 use crate::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::DecodeLoopBuilder;
-use crate::session::chat::stop_condition::StopCondition;
+use crate::session::chat::stop_condition::{ChatStopSlot, ChatStopStage, StopCondition};
 use crate::session::decode_loop::DecodeLoop;
 use crate::session::forward::{
     KiviForward, ModelForward, OffloadForward, alloc_kivi_kv_caches, alloc_offload_kv_caches,
 };
+use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::traits::DecodeResult;
 
 /// `ChatKvMode::Standard` variant inner payload.
@@ -79,19 +80,38 @@ pub struct ChatSession {
     /// KV pos 외부 read용 cache. DecodeLoop.pos와 항상 동기화된다.
     pub pos: usize,
     max_seq_len: usize,
+    /// β-6: turn별 stop condition 을 `ChatStopStage`(DecodeEnd 구독)에 전달하는 공유 슬롯.
+    /// `run_turn` 이 turn 시작 시 arm, run 후 자동 disarm(RAII guard).
+    stop_slot: Arc<ChatStopSlot>,
 }
 
 impl ChatSession {
     /// spec test용 직접 생성자. 호출자가 DecodeLoop + kv_mode를 직접 조립한다.
+    ///
+    /// β-6: stop 판정을 `ChatStopStage` 로 수렴하므로, 내부에서 registry + ChatStopStage 를
+    /// 구성해 decode_loop 에 `with_pipeline` 으로 주입한다. caller 가 미리 조립한 decode_loop 의
+    /// 기존 registry 는 무시되고 이 stop-registry 로 교체된다(spec 의 빈-registry decode_loop 전제).
     #[doc(hidden)]
     pub fn new_for_test(decode_loop: DecodeLoop, kv_mode: ChatKvMode, max_seq_len: usize) -> Self {
+        let (decode_loop, stop_slot) = install_stop_stage(decode_loop);
         Self {
             decode_loop,
             kv_mode,
             pos: 0,
             max_seq_len,
+            stop_slot,
         }
     }
+}
+
+/// β-6: decode_loop 에 `ChatStopStage`(DecodeEnd 구독) 를 등록한 registry 를 `with_pipeline` 으로
+/// 주입한다. 반환된 슬롯에 `run_turn` 이 turn별 stop condition 을 arm 한다.
+fn install_stop_stage(decode_loop: DecodeLoop) -> (DecodeLoop, Arc<ChatStopSlot>) {
+    let slot = ChatStopSlot::new();
+    let registry = Arc::new(PipelineRegistry::new());
+    registry.submit(Arc::new(ChatStopStage::new(Arc::clone(&slot))));
+    let decode_loop = decode_loop.with_pipeline_registry(registry);
+    (decode_loop, slot)
 }
 
 impl ChatSession {
@@ -105,8 +125,15 @@ impl ChatSession {
     /// turn 본체 inner decode. stop condition까지 토큰 누적.
     ///
     /// **finalize를 호출하지 않는다.** multi-turn 재사용이 핵심 invariant.
+    ///
+    /// β-6: stop 판정은 `ChatStopStage`(DecodeEnd 구독)가 담당한다. turn별 stop condition 을
+    /// 공유 슬롯에 arm 한 뒤(RAII guard — run 후 자동 disarm) `run_until_stop` 을 호출한다.
     pub fn run_turn(&mut self, first_token: u32, stop: &dyn StopCondition) -> Result<DecodeResult> {
-        let result = self.decode_loop.run_until_stop(first_token, stop)?;
+        let result = {
+            // guard 수명 = decode 동기 실행 구간. drop 시 슬롯 clear (dangling 방지).
+            let _guard = self.stop_slot.arm(stop);
+            self.decode_loop.run_until_stop(first_token)?
+        };
         self.pos = self.decode_loop.pos_snapshot();
         Ok(result)
     }
@@ -440,6 +467,7 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
         .with_forward(mf)
         .with_kv_capacity(max_seq_len)
         .build();
+    let (decode_loop, stop_slot) = install_stop_stage(decode_loop);
 
     Ok(ChatSession {
         decode_loop,
@@ -453,6 +481,7 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
         })),
         pos: 0,
         max_seq_len,
+        stop_slot,
     })
 }
 
@@ -495,6 +524,7 @@ pub fn build_chat_kivi(args: ChatKiviArgs) -> Result<ChatSession> {
         .with_forward(fwd)
         .with_kv_capacity(max_seq_len)
         .build();
+    let (decode_loop, stop_slot) = install_stop_stage(decode_loop);
 
     Ok(ChatSession {
         decode_loop,
@@ -504,6 +534,7 @@ pub fn build_chat_kivi(args: ChatKiviArgs) -> Result<ChatSession> {
         },
         pos: 0,
         max_seq_len,
+        stop_slot,
     })
 }
 
@@ -554,6 +585,7 @@ pub fn build_chat_offload(args: ChatOffloadArgs) -> Result<ChatSession> {
         .with_forward(fwd)
         .with_kv_capacity(max_seq_len)
         .build();
+    let (decode_loop, stop_slot) = install_stop_stage(decode_loop);
 
     Ok(ChatSession {
         decode_loop,
@@ -563,6 +595,7 @@ pub fn build_chat_offload(args: ChatOffloadArgs) -> Result<ChatSession> {
         },
         pos: 0,
         max_seq_len,
+        stop_slot,
     })
 }
 
@@ -775,6 +808,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(max_seq_len)
             .build();
+        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
         ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
@@ -787,6 +821,7 @@ mod tests {
             })),
             pos: 0,
             max_seq_len,
+            stop_slot,
         }
     }
 
@@ -873,6 +908,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(2048)
             .build();
+        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Kivi {
@@ -881,6 +917,7 @@ mod tests {
             },
             pos: 10,
             max_seq_len: 2048,
+            stop_slot,
         };
 
         session.reset().unwrap();
@@ -901,6 +938,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(10)
             .build();
+        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Kivi {
@@ -909,6 +947,7 @@ mod tests {
             },
             pos: 9,
             max_seq_len: 10,
+            stop_slot,
         };
         // pos=9, additional=2 → 9+2=11 > 10 → bail
         let result = session.ensure_capacity(2);
@@ -927,6 +966,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(10)
             .build();
+        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Offload {
@@ -935,6 +975,7 @@ mod tests {
             },
             pos: 9,
             max_seq_len: 10,
+            stop_slot,
         };
         let result = session.ensure_capacity(2);
         assert!(result.is_err(), "offload overflow 시 bail 예상");
@@ -1008,6 +1049,7 @@ mod tests {
             .with_kv_capacity(10)
             .build();
 
+        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
         // cache_manager=Some → ensure_capacity overflow 시 try_evict 직접 호출 경로 진입.
         let policy = Box::new(SlidingWindowPolicy::new(4, 2));
         let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.5);
@@ -1023,6 +1065,7 @@ mod tests {
             })),
             pos: 9,
             max_seq_len: 10,
+            stop_slot,
         };
 
         // pos=9, additional=2 → 11 > 10 → overflow → try_evict 직접 호출.
@@ -1065,6 +1108,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(512)
             .build();
+        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
         let session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Kivi {
@@ -1073,6 +1117,7 @@ mod tests {
             },
             pos: 100,
             max_seq_len: 512,
+            stop_slot,
         };
         let line = session.stats_line();
         assert_eq!(line, "kv_pos=100/512 mode=kivi bits=4 residual=32");
@@ -1089,6 +1134,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(512)
             .build();
+        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
         let session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Offload {
@@ -1097,6 +1143,7 @@ mod tests {
             },
             pos: 77,
             max_seq_len: 512,
+            stop_slot,
         };
         let line = session.stats_line();
         assert_eq!(

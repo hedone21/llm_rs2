@@ -1,7 +1,16 @@
 //! Chat REPL의 inner decode loop 종료 조건 trait + helper.
 //! Phase 4-5-c. chat REPL은 4-5-e에서 ChatStopCondition을 owned 보유하여
 //! DecodeLoop::run_until_stop에 전달.
+//!
+//! **β-6**: stop 판정은 [`ChatStopStage`] (L2 `PipelineStage`) 로 수렴한다 — `DecodeEnd` phase
+//! 에서 슬롯의 stop condition 으로 `should_stop` 을 평가해 `Stop(StopConditionMet)` 를 반환한다.
 
+use std::sync::{Arc, Mutex};
+
+use crate::pipeline::{
+    LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome,
+    StopReason as StageStopReason,
+};
 use crate::session::chat_template::ChatTemplate;
 use tokenizers::Tokenizer;
 
@@ -43,6 +52,122 @@ impl StopCondition for ChatStopCondition {
             return true;
         }
         self.stop_ids.binary_search(&sampled).is_ok()
+    }
+}
+
+// ─── β-6: ChatStopStage (L2 PipelineStage 수렴) ─────────────────────────────────
+
+/// turn별 동적 stop condition 을 [`ChatStopStage`] 에 전달하기 위한 공유 슬롯.
+///
+/// `ChatSession::run_turn` 은 매 turn 다른 stop condition(예: `max_pos = pos + max_new_tokens`)을
+/// `&dyn StopCondition` 으로 받는다 — 빌드 시점 고정이 불가하다. `ChatStopStage` 는 영구
+/// (Persistent) 등록되고, 슬롯에 들어 있는 현재 turn 의 stop condition 으로 `DecodeEnd` phase
+/// 마다 판정한다. `ChatSession` 과 stage 가 동일 `Arc<ChatStopSlot>` 을 공유한다.
+///
+/// 슬롯은 **borrowed** stop pointer 를 보유한다(`*const dyn StopCondition`). `run_turn` 이
+/// 동기적으로 driver 를 실행하는 동안에만 set 되며(RAII [`ChatStopGuard`]), driver 가 단일
+/// 스레드라 stop 의 수명이 run 구간을 덮음이 보장된다(`INV-018` 단일 스레드 추론).
+#[derive(Default)]
+pub struct ChatStopSlot {
+    /// 현재 turn 의 stop condition raw pointer. `None` 이면 stop 미판정(항상 진행).
+    cond: Mutex<Option<*const (dyn StopCondition + 'static)>>,
+}
+
+// SAFETY: `cond` 의 raw pointer 는 `ChatStopGuard` 수명(= `run_turn` 의 동기 driver 실행 구간)
+// 동안에만 set 되고, 그 사이 단일 스레드(INV-018)만 접근한다. pointee(`dyn StopCondition`)는
+// `should_stop(&self)` 만 호출하는 `Sync` 한 read-only trait object 다. Mutex 가 내부 가변성을
+// 직렬화하므로 `ChatStopSlot` 을 `Send + Sync` 로 노출해도 안전하다.
+unsafe impl Send for ChatStopSlot {}
+unsafe impl Sync for ChatStopSlot {}
+
+impl ChatStopSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// turn 시작 시 stop condition 을 슬롯에 set 하고 RAII guard 를 반환한다. guard drop 시
+    /// 슬롯이 자동 clear 되어 dangling pointer 가 남지 않는다.
+    ///
+    /// # Safety 계약
+    /// `stop` 은 반환된 guard 가 drop 될 때까지 살아 있어야 한다(`run_turn` 의 stack-local 이
+    /// driver 동기 실행을 덮음). guard 는 `run_until_stop` 반환 직후 drop 된다.
+    pub fn arm<'g>(self: &'g Arc<Self>, stop: &'g dyn StopCondition) -> ChatStopGuard<'g> {
+        // lifetime erasure: `&'g dyn StopCondition` 의 pointee lifetime `'g` 를 `'static` 로
+        // 지운다. SAFETY: raw pointer 는 반환된 `ChatStopGuard<'g>` 가 drop 될 때(= `run_turn` 의
+        // 동기 driver 실행 종료) 슬롯에서 제거되므로, dereference 는 `'g` 가 유효한 구간 안에서만
+        // 일어난다 — `'static` erasure 가 실제 수명을 넘어선 접근을 만들지 않는다.
+        let ptr: *const (dyn StopCondition + 'static) =
+            unsafe { std::mem::transmute::<*const dyn StopCondition, _>(stop) };
+        *self.cond.lock().expect("ChatStopSlot mutex poisoned") = Some(ptr);
+        ChatStopGuard { slot: self }
+    }
+
+    /// 슬롯의 현재 stop condition 으로 판정. 슬롯 비어 있으면 `false`(미종료).
+    fn should_stop(&self, sampled: u32, pos: usize) -> bool {
+        let guard = self.cond.lock().expect("ChatStopSlot mutex poisoned");
+        match *guard {
+            // SAFETY: ptr 은 `arm` 의 guard 수명 동안에만 set 되며, 그 사이 호출되므로 유효하다.
+            Some(ptr) => unsafe { (*ptr).should_stop(sampled, pos) },
+            None => false,
+        }
+    }
+}
+
+/// RAII guard — drop 시 [`ChatStopSlot`] 의 stop pointer 를 clear 한다.
+pub struct ChatStopGuard<'g> {
+    slot: &'g Arc<ChatStopSlot>,
+}
+
+impl Drop for ChatStopGuard<'_> {
+    fn drop(&mut self) {
+        *self.slot.cond.lock().expect("ChatStopSlot mutex poisoned") = None;
+    }
+}
+
+/// chat stop 판정 `PipelineStage`. `DecodeEnd` phase 에서 슬롯의 stop condition 으로
+/// `should_stop(prev_token, pos)` 를 평가한다(충족 시 `Stop(StopConditionMet)`).
+///
+/// **DecodeEnd 구독 (roadmap 정정)**: roadmap 본문은 "PostSample 구독" 이라 썼으나
+/// 오케스트레이터 census 로 **DecodeEnd 로 정정**한다. v1 `run_until_stop` 은 stop 토큰에도
+/// (f2) tick / (g) observer 를 발화하고 pos 를 증가시킨 **뒤** `should_stop(sampled, self.pos)`
+/// 를 평가한다. driver 의 DecodeEnd 는 bookkeeping(`prev_token=sampled; pos+=1; decode_step+=1`)
+/// **후** 발화하므로 `ctx.step.prev_token == 방금 sampled`, `ctx.step.pos == 증가된 pos` 가
+/// v1 의 `should_stop(sampled, self.pos)` 인자와 정확히 일치한다. PostSample 구독이면 stop 토큰의
+/// tick/obs/pos++ 가 누락돼 chat spec(final_pos 단언)이 깨진다.
+pub struct ChatStopStage {
+    slot: Arc<ChatStopSlot>,
+}
+
+impl ChatStopStage {
+    pub fn new(slot: Arc<ChatStopSlot>) -> Self {
+        Self { slot }
+    }
+}
+
+impl PipelineStage for ChatStopStage {
+    fn name(&self) -> &str {
+        "chat.stop"
+    }
+
+    fn lifecycle(&self) -> StageLifecycle {
+        StageLifecycle::Persistent
+    }
+
+    fn on_phase(
+        &self,
+        phase: &LifecyclePhase,
+        ctx: &mut StageContext<'_>,
+    ) -> anyhow::Result<StageOutcome> {
+        // self-filter (§5.3): DecodeEnd 외 phase 는 무시.
+        if *phase != LifecyclePhase::DecodeEnd {
+            return Ok(StageOutcome::Continue);
+        }
+        // DecodeEnd: prev_token == 방금 sampled, pos == 증가된 pos (v1 should_stop 인자 등가).
+        if self.slot.should_stop(ctx.step.prev_token, ctx.step.pos) {
+            Ok(StageOutcome::Stop(StageStopReason::StopConditionMet))
+        } else {
+            Ok(StageOutcome::Continue)
+        }
     }
 }
 

@@ -2,19 +2,19 @@
 //!
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5 (PipelineStage 모델).
 //!
-//! **Phase β-2 배선 상태**: `session/decode_loop.rs` 의 `prefill`/`run` 에 9 phase 가
-//! 발화된다 — PrefillStart·PrefillEnd (prefill 2종), DecodeStart·PreForward·PostForward·
-//! PreSample·PostSample·DecodeEnd (per-token 6종), Finalize. `run_until_stop` 은 β-6
-//! 에서 통합 예정 (현재 미발화).
+//! **배선 상태 (β-2/β-3/β-6)**: `session/decode_loop.rs` 의 공유 core `run_steps` 가 per-token
+//! 8 phase(DecodeStart·PreEviction·PostEviction·PreForward·PostForward·PreSample·PostSample·
+//! DecodeEnd)를 발화한다. `prefill` 은 PrefillStart·PrefillEnd, `run()` 은 추가로 Finalize 를
+//! 발화한다. **β-6 통합**: `run_until_stop` 도 `run_steps` 를 공유하므로 동일 per-token phase 를
+//! 발화하고, 진입/종료에 TurnStart·TurnEnd 를 추가 발화한다(finalize/Finalize 는 미호출 —
+//! chat 세션 재사용). chat 의 stop 판정은 `ChatStopStage`(DecodeEnd 구독, chat/stop_condition.rs)
+//! 가 담당한다.
 //!
-//! **β-3 추가**: PreEviction·PostEviction 은 `run()` 의 (a.6)↔(b)↔(c) 슬롯에서 발화됨
-//! (run()만 — `run_until_stop`/chat 은 β-6). `EvictionStage`(stages/kv/eviction.rs)가 PreEviction
-//! 에서 UER 로 force-evict 하고, driver 가 held handle 의 `current_pos` 를 query 해 pos-환류
-//! (§5.2.1 (가)).
+//! **β-3**: `EvictionStage`(stages/kv/eviction.rs)가 PreEviction 에서 UER 로 force-evict 하고,
+//! driver 가 held handle 의 `current_pos` 를 query 해 pos-환류(§5.2.1 (가)).
 //!
-//! **미발화 orphan (§5.2.1 (라))**: TurnStart·TurnEnd·SessionStart·SessionEnd 는 β-6,
-//! PreLayer·PostLayer·Fine 는 β 범위 밖(`INV-HOTPATH-DISPATCH` layer-tier dyn 금지) — enum
-//! variant 로 정의만 존재.
+//! **미발화 orphan (§5.2.1 (라))**: SessionStart·SessionEnd 는 β 범위 밖, PreLayer·PostLayer·
+//! Fine 는 β 범위 밖(`INV-HOTPATH-DISPATCH` layer-tier dyn 금지) — enum variant 로 정의만 존재.
 //!
 //! 거버넌스: §1.2 Mechanism over policy(순서·안전 = stage 작성자 책임, §5.3),
 //! `INV-DECODE-STAGE-001/004/005/006/007`, `INV-STAGE-LAYER-HANDLE`, `INV-HOTPATH-DISPATCH`.
@@ -94,10 +94,15 @@ pub trait PressureSource: Send + Sync {
 
 /// per-step read-only 값 (Copy, borrow 0) — §5.1 G5-2.
 ///
-/// v1 `StepCtx`(`session/traits.rs`) 5필드 중 `pos`/`decode_step` 만 승계. 드롭: `prev_token`
-/// (샘플러 도메인 — `TokenSampler` 별도 생존), `kv_capacity`(register 시점 보유한 Format handle
-/// 에서 query — god-ctx 회피, `INV-STAGE-LAYER-HANDLE`), `stop_requested`(`StageOutcome::Stop`
-/// 반환으로 정지 → borrow 제거로 `Copy` 성립).
+/// v1 `StepCtx`(`session/traits.rs`) 5필드 중 `pos`/`decode_step`/`prev_token` 을 승계. 드롭:
+/// `kv_capacity`(register 시점 보유한 Format handle 에서 query — god-ctx 회피,
+/// `INV-STAGE-LAYER-HANDLE`), `stop_requested`(`StageOutcome::Stop` 반환으로 정지 → borrow
+/// 제거로 `Copy` 성립).
+///
+/// **β-6 prev_token 승격**: observe·stop Stage 가 토큰 스트림을 소비할 수 있도록 `prev_token`
+/// 을 정식 추가했다(v2:557 trigger 발동). DecodeEnd phase 시점 `prev_token == 방금 sampled` 라
+/// chat `ChatStopStage` 가 v1 `should_stop(sampled, pos)` 와 동일 인자를 본다. driver 가 이미
+/// 보유한 값이라 trait·소비자 무변경(리터럴 ripple 만).
 #[derive(Debug, Clone, Copy)]
 pub struct StepInfo {
     /// 시퀀스 절대 위치 (구 `StepCtx.pos`) — eviction/RoPE/kv 소비.
@@ -106,8 +111,9 @@ pub struct StepInfo {
     pub decode_step: usize,
     /// system 압력 scalar (pluggable `PressureSource` 출력).
     pub pressure: Pressure,
-    // 승격 trigger: observe Stage 가 토큰 스트림 소비 요구 시 `prev_token: u32` 추가
-    //               (driver 가 이미 보유 — ripple 0, trait·소비자 무변경).
+    /// 직전 step 토큰 (구 `StepCtx.prev_token`) — observe·stop Stage 의 토큰 스트림 소비.
+    /// DecodeEnd phase 에서는 방금 sampled 된 토큰(bookkeeping `prev_token=sampled` 후 발화).
+    pub prev_token: u32,
 }
 
 /// Stage 가 받는 mutation 권한 컨텍스트 — 2 field 슬림 (§5.1, `INV-DECODE-STAGE-006`).

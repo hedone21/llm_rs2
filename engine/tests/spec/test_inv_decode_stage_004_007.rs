@@ -27,6 +27,7 @@ fn make_ctx(profiler: &mut OpProfiler) -> StageContext<'_> {
             pos: 0,
             decode_step: 0,
             pressure: Pressure::new(0),
+            prev_token: 0,
         },
         profiler,
     }
@@ -456,6 +457,7 @@ fn test_inv_decode_stage_006_context_two_fields_only() {
             pos: 42,
             decode_step: 7,
             pressure: Pressure::new(50),
+            prev_token: 99,
         },
         profiler: &mut profiler,
     };
@@ -463,6 +465,7 @@ fn test_inv_decode_stage_006_context_two_fields_only() {
     assert_eq!(ctx.step.pos, 42);
     assert_eq!(ctx.step.decode_step, 7);
     assert_eq!(ctx.step.pressure.raw(), 50);
+    assert_eq!(ctx.step.prev_token, 99);
 }
 
 // ── INV-DECODE-STAGE-007: OneShot GC 정확히 1회 ──────────────────────────────

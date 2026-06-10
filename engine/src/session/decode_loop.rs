@@ -52,8 +52,9 @@ pub struct DecodeLoop {
     // INV-LAYER-006 BANNED 비해당). None(happy/chat) → cmd_source 도 NoOp 라 빈 Vec → dispatch
     // no-op = 거동-0.
     dispatcher: Option<CommandDispatcher>,
-    // β-2: L2 PipelineStage dispatch 배선. default = empty registry (len==0 fast-path
-    // 로 happy-path 거동-0). run_until_stop 은 β-6 에서 통합 — 현재 미발화.
+    // β-2/β-6: L2 PipelineStage dispatch 배선. default = empty registry (len==0 fast-path 로
+    // happy-path 거동-0). β-6 에서 run()/run_until_stop 이 공유 core(run_steps)로 통합되어
+    // 양쪽 모두 dispatch 한다. chat 은 ChatStopStage(DecodeEnd) 등록 registry 를 주입한다.
     pipeline: Arc<PipelineRegistry>,
     // β-3: pos-환류용 held handle (§5.2.1 (가) — StageOutcome 무변경, EvictionStage 가 cache 의
     // current_pos 를 prune 한 뒤 driver 가 동일 layer-0 handle 의 current_pos 를 query 해 loop pos
@@ -111,6 +112,7 @@ impl DecodeLoop {
             pos: self.pos,
             decode_step: self.decode_step,
             pressure: self.cached_pressure,
+            prev_token: self.prev_token,
         };
         let mut ctx = StageContext {
             step,
@@ -216,13 +218,32 @@ impl DecodeLoop {
     /// (does **not** include `first_token`) + reason loop exited. Caller is
     /// responsible for prepending `first_token` to the final output sequence.
     pub fn run(&mut self, budget: usize, first_token: u32) -> anyhow::Result<DecodeResult> {
+        let result = self.run_steps(budget, first_token)?;
+        self.forward.finalize()?;
+        for obs in &mut self.observers {
+            obs.finalize()?;
+        }
+        // Finalize: forward.finalize() + observers finalize 체인 후, DecodeResult 구성 직전.
+        let _ = self.dispatch_phase(LifecyclePhase::Finalize);
+        Ok(result)
+    }
+
+    /// β-6: run()/run_until_stop 공유 decode core. 현 run() 본문에서 finalize 체인을 제외한
+    /// 부분이다. `budget` step 까지 `first_token` 부터 decode 하고 [`DecodeResult`] 를 반환한다.
+    /// finalize(`forward.finalize`/observer finalize/Finalize phase)는 호출하지 **않는다** —
+    /// 호출자(run = 호출, run_until_stop = 미호출)가 결정한다.
+    fn run_steps(&mut self, budget: usize, first_token: u32) -> anyhow::Result<DecodeResult> {
         self.prev_token = first_token;
         // Phase 4-4.7: stateful samplers (RepetitionPenaltySampler 등)이 production
         // fallback `tokens.push(first_token)`과 동치 history를 갖도록 첫 토큰을 통보.
         // [`super::defaults::GreedySampler`]는 default no-op이라 무영향.
         self.sampler.observe_token(first_token);
         let stop = Arc::clone(&self.stop_flag);
-        let mut generated = Vec::with_capacity(budget);
+        // budget == usize::MAX(run_until_stop) 면 with_capacity 가 OOM 이므로 0 으로 시작.
+        let mut generated = Vec::with_capacity(budget.min(4096));
+        // budget ∞(run_until_stop) 면 BudgetExhausted 도달 불가 — stop stage/StopFlag 가 종결.
+        // v1 run_until_stop 의 기본 stopped_by(StopConditionMet)와 수렴: stop stage 미발화 +
+        // budget 무한이면 무한 루프이므로 실 종결은 항상 Stop/StopFlag 가 설정한다.
         let mut stopped_by = StopReason::BudgetExhausted;
 
         for _ in 0..budget {
@@ -440,17 +461,24 @@ impl DecodeLoop {
                 obs.on_step_end(&ctx, sampled, step_ms);
             }
 
-            generated.push(sampled);
+            // β-6: bookkeeping 을 push 앞으로 이동(재배열). DecodeEnd 가 증가된
+            // pos/prev_token 으로 발화하고, Stop(chat StopConditionMet 등) 이면 token 을 **push
+            // 하지 않고** break 한다 — v1 run_until_stop 의 stop 시맨틱(stop 토큰 미push, pos 는
+            // 증가) 과 정합. 비-Stop 경로는 push 위치만 이동(매 iteration push 됨, 거동-0).
             self.prev_token = sampled;
             self.pos += 1;
             self.decode_step += 1;
 
-            // DecodeEnd: bookkeeping 후, (h) pacing 전.
-            // step 완료 후 시점 — StepInfo 는 증가된 pos/decode_step, token 은 이미 포함.
+            // DecodeEnd: bookkeeping 후, push·(h) pacing 전.
+            // StepInfo 는 증가된 pos/decode_step + prev_token=sampled. ChatStopStage 가 여기서
+            // should_stop(prev_token, pos) 를 평가한다(미포함 = chat stop 시맨틱).
             if let Some(r) = self.dispatch_phase(LifecyclePhase::DecodeEnd) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
+
+            // DecodeEnd Stop 이 아니면 token push (run/run_until_stop 공통).
+            generated.push(sampled);
 
             // (h) target TBT pacing — resilience SetTargetTbt 가 설정한 목표
             // wall-clock 에 도달하도록 step 끝에서 sleep. target_tbt_ms == 0
@@ -467,13 +495,6 @@ impl DecodeLoop {
             }
         }
 
-        self.forward.finalize()?;
-        for obs in &mut self.observers {
-            obs.finalize()?;
-        }
-        // Finalize: forward.finalize() + observers finalize 체인 후, DecodeResult 구성 직전.
-        let _ = self.dispatch_phase(LifecyclePhase::Finalize);
-
         Ok(DecodeResult {
             tokens_generated: generated,
             final_pos: self.pos,
@@ -481,156 +502,26 @@ impl DecodeLoop {
         })
     }
 
-    /// Phase 4-5-c. Chat 모드 inner decode loop.
+    /// Phase 4-5-c. Chat 모드 inner decode loop — β-6 단일 driver 통합.
     ///
-    /// `stop.should_stop(sampled, pos)`가 true를 반환할 때까지 step을 반복한다.
-    /// stop token은 sampled 직후 체크하며, true이면 즉시 break — stop token은
-    /// KV에 baking되지 않는다 (chat REPL에서 EOT baking은 4-5-e에서 처리).
+    /// `run()` 과 동일한 [`Self::run_steps`] core 를 `budget = usize::MAX` 로 돌린다. chat 차이는
+    /// 분기 신설이 아니라 (i) registry 등록물([`ChatStopStage`] — `DecodeEnd` 에서 stop 판정) (ii)
+    /// finalize 미호출 wrapper 뿐이다. stop 판정은 stage 가 담당하므로 본 메서드는 stop 인자를
+    /// 받지 않는다 — 호출자([`ChatSession::run_turn`])가 turn별 stop condition 을 `ChatStopSlot` 에
+    /// arm 한 뒤 호출한다.
     ///
-    /// **finalize는 호출하지 않는다.** chat 세션은 여러 turn에 걸쳐 같은
-    /// DecodeLoop를 재사용하므로 finalize는 전체 세션 종료 시 1회만 호출해야 한다.
-    pub fn run_until_stop(
-        &mut self,
-        first_token: u32,
-        stop: &dyn crate::session::chat::stop_condition::StopCondition,
-    ) -> anyhow::Result<DecodeResult> {
-        self.prev_token = first_token;
-        self.sampler.observe_token(first_token);
-        let atomic_stop = Arc::clone(&self.stop_flag);
-        let mut generated = Vec::new();
-        let mut stopped_by = StopReason::StopConditionMet;
-
-        loop {
-            if atomic_stop.load(Ordering::Acquire) {
-                stopped_by = StopReason::StopFlag;
-                break;
-            }
-
-            // (a) command poll + dispatch (β-4 — chat 도 동일 시그니처, dispatcher=None 거동-0).
-            // chat happy-path 는 cmd_source=NoOp → 빈 Vec → dispatch 미발동. suspend/throttle 시맨틱
-            // 은 run() 과 동일하게 LoopControl 경유. (run_until_stop 단일 driver 통합은 β-6.)
-            let cmds = self.cmd_source.poll()?;
-            let (suspended, throttle_delay_ms): (bool, u64) =
-                if let Some(d) = self.dispatcher.as_mut() {
-                    let control = d.dispatch(cmds);
-                    (control.suspended, control.throttle_delay_ms)
-                } else {
-                    (false, 0)
-                };
-            if suspended {
-                stopped_by = StopReason::CommandRequested;
-                break;
-            }
-            if throttle_delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
-            }
-
-            // (b) eviction
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            let outcome = self.eviction.before_step(&ctx)?;
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            for obs in &mut self.observers {
-                obs.on_eviction(&ctx, &outcome);
-            }
-            if let EvictionOutcome::Pruned { new_pos, .. } = outcome {
-                self.pos = new_pos;
-                self.forward.on_kv_prune(new_pos);
-            }
-
-            // (c) swap before
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            self.swap.before_step(&ctx)?;
-
-            // (d) forward
-            let t0 = Instant::now();
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            let logits = self.forward.step(&ctx, self.prev_token)?;
-            let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-            // (e) swap after
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            self.swap.after_step(&ctx)?;
-
-            // (f) sample
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            let sampled = self.sampler.sample(&ctx, &logits);
-            self.sampler.observe_token(sampled);
-
-            // (f2) tick sink — sampler 호출 후, observer 이전
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            self.tick_sink.on_token_generated(&ctx);
-
-            // (g) observers
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            for obs in &mut self.observers {
-                obs.on_step_end(&ctx, sampled, step_ms);
-            }
-
-            self.prev_token = sampled;
-            self.pos += 1;
-            self.decode_step += 1;
-
-            // stop 체크: pos 증가 후 현재 pos 기준으로 판단
-            if stop.should_stop(sampled, self.pos) {
-                break;
-            }
-
-            generated.push(sampled);
-        }
-
-        Ok(DecodeResult {
-            tokens_generated: generated,
-            final_pos: self.pos,
-            stopped_by,
-        })
+    /// **TurnStart/TurnEnd 발화**: run_steps 전후로 dispatch 한다(turn 경계 stage 슬롯).
+    ///
+    /// **finalize 는 호출하지 않는다.** chat 세션은 여러 turn 에 걸쳐 같은 DecodeLoop 를
+    /// 재사용하므로 finalize 는 전체 세션 종료 시 1회만 호출해야 한다.
+    pub fn run_until_stop(&mut self, first_token: u32) -> anyhow::Result<DecodeResult> {
+        // TurnStart: run_steps 진입 전. budget ∞ 라 stop 은 ChatStopStage(DecodeEnd) 또는
+        // StopFlag 가 종결한다(미발화 시 무한 루프이므로 stop stage 등록이 chat 의 invariant).
+        let _ = self.dispatch_phase(LifecyclePhase::TurnStart);
+        let result = self.run_steps(usize::MAX, first_token)?;
+        // TurnEnd: run_steps 후. finalize 미호출(세션 재사용).
+        let _ = self.dispatch_phase(LifecyclePhase::TurnEnd);
+        Ok(result)
     }
 
     /// Phase 4-5-c. Chat /reset 명령 처리용.
@@ -657,6 +548,14 @@ impl DecodeLoop {
     /// Borrow the stop flag handle (caller can install a signal handler).
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop_flag)
+    }
+
+    /// β-6: build 후 stage registry 교체(consuming). `ChatSession` 이 build 된 decode_loop 에
+    /// `ChatStopStage` 등록 registry 를 주입할 때 사용한다(빌드 전 `with_pipeline` 과 동일 효과,
+    /// 단 이미 build 된 인스턴스용). 기존 registry 는 폐기된다.
+    pub fn with_pipeline_registry(mut self, registry: Arc<PipelineRegistry>) -> Self {
+        self.pipeline = registry;
+        self
     }
 }
 
@@ -1015,7 +914,33 @@ mod tests {
         assert_eq!(result.tokens_generated.len(), 2);
     }
 
-    // Phase 4-5-c: run_until_stop 테스트.
+    // Phase 4-5-c / β-6: run_until_stop 테스트.
+    //
+    // β-6 통합 후 run_until_stop 은 stop 인자를 받지 않는다 — chat 의 ChatStopStage(DecodeEnd
+    // 구독) 가 stop 판정을 담당한다. 테스트는 ChatStopStage 를 registry 에 등록하고 ChatStopSlot
+    // 에 stop condition 을 arm 한 뒤 호출한다(ChatSession::run_turn 과 동일 배선).
+
+    /// ChatStopStage + slot 을 구성해 `with_pipeline` 한 DecodeLoop builder 를 만든다.
+    /// 반환된 slot 에 caller 가 stop condition 을 arm 한다.
+    fn build_loop_with_stop_stage(
+        vocab: usize,
+    ) -> (
+        DecodeLoopBuilder<HasForward>,
+        Arc<crate::session::chat::stop_condition::ChatStopSlot>,
+    ) {
+        use crate::session::chat::stop_condition::{ChatStopSlot, ChatStopStage};
+        let slot = ChatStopSlot::new();
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(ChatStopStage::new(Arc::clone(&slot))));
+        let builder = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .with_pipeline(registry);
+        (builder, slot)
+    }
 
     /// StopCondition이 특정 token에서 true를 반환하면 loop가 종료된다.
     /// MockForward (vocab=16): step_count=1 → token 1, step_count=2 → token 2, ...
@@ -1023,45 +948,37 @@ mod tests {
     /// generated에는 stop token이 포함되지 않는다 (1, 2만).
     #[test]
     fn run_until_stop_terminates_on_stop_token() {
-        use crate::session::chat::stop_condition::{ChatStopCondition, StopCondition};
+        use crate::session::chat::stop_condition::ChatStopCondition;
 
-        let mut loop_ = DecodeLoopBuilder::new()
-            .with_forward(MockForward {
-                vocab: 16,
-                step_count: 0,
-            })
-            .with_kv_capacity(2048)
-            .build();
+        let (builder, slot) = build_loop_with_stop_stage(16);
+        let mut loop_ = builder.build();
         let _ = loop_.prefill(&[0]).unwrap();
         // step_count=1→token1, 2→token2, 3→token3(stop)
         let cond = ChatStopCondition::new(vec![3], 2048);
-        let result = loop_
-            .run_until_stop(0, &cond as &dyn StopCondition)
-            .unwrap();
+        let result = {
+            let _guard = slot.arm(&cond);
+            loop_.run_until_stop(0).unwrap()
+        };
         // token 3은 stop이므로 generated에 미포함 → [1, 2]
         assert_eq!(result.tokens_generated, vec![1, 2]);
         assert_eq!(result.stopped_by, StopReason::StopConditionMet);
     }
 
-    /// max_pos overflow 안전망: pos >= max_pos이면 loop 종료.
+    /// max_pos overflow 안전망: pos >= max_pos이면 loop 종료. (G5: 마지막 토큰 미포함 보존)
     #[test]
     fn run_until_stop_terminates_on_max_pos() {
-        use crate::session::chat::stop_condition::{ChatStopCondition, StopCondition};
+        use crate::session::chat::stop_condition::ChatStopCondition;
 
-        let mut loop_ = DecodeLoopBuilder::new()
-            .with_forward(MockForward {
-                vocab: 16,
-                step_count: 0,
-            })
-            .with_kv_capacity(2048)
-            .build();
+        let (builder, slot) = build_loop_with_stop_stage(16);
+        let mut loop_ = builder.build();
         // prefill 1 token → pos=1
         let _ = loop_.prefill(&[0]).unwrap();
         // max_pos=3 → pos≥3이면 stop. 1+2 steps → pos=3 → break (step 2 token not pushed)
         let cond = ChatStopCondition::new(vec![], 3);
-        let result = loop_
-            .run_until_stop(0, &cond as &dyn StopCondition)
-            .unwrap();
+        let result = {
+            let _guard = slot.arm(&cond);
+            loop_.run_until_stop(0).unwrap()
+        };
         // step1: sampled=1, pos→2, stop?(pos=2<3)→no → push. step2: sampled=2, pos→3, stop?(pos=3>=3)→yes
         assert_eq!(result.tokens_generated, vec![1]);
         assert_eq!(result.final_pos, 3);
@@ -1076,7 +993,9 @@ mod tests {
     /// 동일해야 한다 (DecodeEnd 구독 + PostSample TickStage 로 보존).
     #[test]
     fn run_until_stop_fires_tick_and_obs_on_stop_token() {
-        use crate::session::chat::stop_condition::{ChatStopCondition, StopCondition};
+        use crate::session::chat::stop_condition::{
+            ChatStopCondition, ChatStopSlot, ChatStopStage,
+        };
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
 
         struct CountTickSink {
@@ -1098,12 +1017,16 @@ mod tests {
 
         let tick_count = Arc::new(AtomicUsize::new(0));
         let obs_count = Arc::new(AtomicUsize::new(0));
+        let slot = ChatStopSlot::new();
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(ChatStopStage::new(Arc::clone(&slot))));
         let mut loop_ = DecodeLoopBuilder::new()
             .with_forward(MockForward {
                 vocab: 16,
                 step_count: 0,
             })
             .with_kv_capacity(2048)
+            .with_pipeline(registry)
             .with_tick_sink(CountTickSink {
                 count: tick_count.clone(),
             })
@@ -1114,9 +1037,10 @@ mod tests {
         let _ = loop_.prefill(&[0]).unwrap();
         // step1→token1(push), step2→token2(push), step3→token3=stop(미push, but tick/obs 발화).
         let cond = ChatStopCondition::new(vec![3], 2048);
-        let result = loop_
-            .run_until_stop(0, &cond as &dyn StopCondition)
-            .unwrap();
+        let result = {
+            let _guard = slot.arm(&cond);
+            loop_.run_until_stop(0).unwrap()
+        };
         assert_eq!(result.tokens_generated, vec![1, 2], "stop 토큰 미push");
         // 3 step (token1, token2, token3=stop) 모두 tick·obs 발화 — stop 토큰 포함.
         assert_eq!(
@@ -1153,22 +1077,18 @@ mod tests {
         }
 
         let log: Arc<StdMutex<Vec<(u32, usize)>>> = Arc::new(StdMutex::new(Vec::new()));
-        let mut loop_ = DecodeLoopBuilder::new()
-            .with_forward(MockForward {
-                vocab: 16,
-                step_count: 0,
-            })
-            .with_kv_capacity(2048)
-            .build();
+        let (builder, slot) = build_loop_with_stop_stage(16);
+        let mut loop_ = builder.build();
         // prefill 1 token → pos=1. 이후 step 마다 pos: 2, 3, ...
         let _ = loop_.prefill(&[0]).unwrap();
         let cond = RecordStop {
             log: log.clone(),
             max_pos: 4, // pos>=4 에서 종료 → step1(pos=2), step2(pos=3), step3(pos=4=stop).
         };
-        let _ = loop_
-            .run_until_stop(0, &cond as &dyn StopCondition)
-            .unwrap();
+        {
+            let _guard = slot.arm(&cond);
+            let _ = loop_.run_until_stop(0).unwrap();
+        }
 
         let calls = log.lock().unwrap().clone();
         // step1: sampled=1, pos=2 (1→2 증가 후). step2: sampled=2, pos=3. step3: sampled=3, pos=4.
@@ -1335,14 +1255,21 @@ mod tests {
         assert!(*fired.lock().unwrap(), "StopAtStage 발화 확인");
     }
 
-    /// 기록 stage 등록 후 run_until_stop 실행 → 추가 발화 0 (총 == prefill 2종).
+    /// β-6 통합: run_until_stop 이 run() 과 동일 phase 를 발화한다(TurnStart → per-token 6종
+    /// → TurnEnd). β-2 의 "run_until_stop 미발화" 테스트를 통합 거동 검증으로 갱신.
+    /// RecordStage(순회 우선) + ChatStopStage(stop 판정) 를 함께 등록 — token1 에서 stop.
     #[test]
-    fn run_until_stop_does_not_dispatch() {
-        use crate::session::chat::stop_condition::{ChatStopCondition, StopCondition};
+    fn run_until_stop_dispatches_turn_and_decode_phases() {
+        use crate::session::chat::stop_condition::{
+            ChatStopCondition, ChatStopSlot, ChatStopStage,
+        };
 
         let log: Arc<Mutex<Vec<Phase>>> = Arc::new(Mutex::new(Vec::new()));
+        let slot = ChatStopSlot::new();
         let registry = Arc::new(PipelineRegistry::new());
+        // RecordStage 를 먼저 등록 → DecodeEnd 에서 RecordStage(Continue, 기록) 후 ChatStopStage(Stop).
         registry.submit(Arc::new(RecordStage { log: log.clone() }));
+        registry.submit(Arc::new(ChatStopStage::new(Arc::clone(&slot))));
 
         let mut loop_ = DecodeLoopBuilder::new()
             .with_forward(MockForward {
@@ -1353,22 +1280,38 @@ mod tests {
             .with_pipeline(Arc::clone(&registry))
             .build();
 
-        // prefill 1회 → PrefillStart + PrefillEnd = 2 발화
+        // prefill 1회 → PrefillStart + PrefillEnd = 2 발화.
         loop_.prefill(&[0]).unwrap();
-        let prefill_count = log.lock().unwrap().len();
-        assert_eq!(prefill_count, 2, "prefill 발화 2건");
+        log.lock().unwrap().clear(); // prefill phase 제거 — run_until_stop 발화만 본다.
 
-        // run_until_stop 실행 — 추가 발화 없어야 함
+        // step1 → token1 = stop. DecodeEnd 에서 ChatStopStage Stop → break.
         let cond = ChatStopCondition::new(vec![1], 2048);
-        loop_
-            .run_until_stop(0, &cond as &dyn StopCondition)
-            .unwrap();
-
-        let total = log.lock().unwrap().len();
+        let result = {
+            let _guard = slot.arm(&cond);
+            loop_.run_until_stop(0).unwrap()
+        };
         assert_eq!(
-            total, 2,
-            "run_until_stop 추가 발화 0 — 총 카운트 == prefill 2"
+            result.tokens_generated,
+            Vec::<u32>::new(),
+            "token1=stop 미push"
         );
+        assert_eq!(result.stopped_by, StopReason::StopConditionMet);
+
+        let observed = log.lock().unwrap().clone();
+        // TurnStart → 1 step (DecodeStart..DecodeEnd) → DecodeEnd 에서 Stop break → TurnEnd.
+        let expected = vec![
+            Phase::TurnStart,
+            Phase::DecodeStart,
+            Phase::PreEviction,
+            Phase::PostEviction,
+            Phase::PreForward,
+            Phase::PostForward,
+            Phase::PreSample,
+            Phase::PostSample,
+            Phase::DecodeEnd,
+            Phase::TurnEnd,
+        ];
+        assert_eq!(observed, expected, "run_until_stop phase 시퀀스 (통합)");
     }
 
     /// phase 별 StepInfo(pos, decode_step) 스냅샷 값을 검증한다.
