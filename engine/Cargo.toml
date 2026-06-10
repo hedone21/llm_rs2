@@ -123,6 +123,10 @@ name = "microbench_h2d_baseline"
 path = "microbench/h2d_baseline.rs"
 
 [[bin]]
+name = "microbench_score_readback"
+path = "microbench/score_readback.rs"
+
+[[bin]]
 name = "microbench_host_flags"
 path = "microbench/host_flags.rs"
 
