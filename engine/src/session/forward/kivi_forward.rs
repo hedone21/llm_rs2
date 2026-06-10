@@ -15,13 +15,14 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::capability::kivi_attention::KiviAttentionBackend;
 use crate::format::KVCacheFormat;
+use crate::inference::sampling::StepCtx;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::pressure::kivi_cache::KiviCache;
 use crate::pressure::kivi_format::KIVIFormat;
-use crate::session::traits::{Forward, StepCtx};
+use crate::session::forward::Forward;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 

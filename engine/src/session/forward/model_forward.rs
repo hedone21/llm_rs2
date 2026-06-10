@@ -18,6 +18,7 @@ use crate::backend::Backend;
 use crate::backend::opencl::plan::FullKernelPlan;
 use crate::buffer::DType;
 use crate::format::KVCacheFormat;
+use crate::inference::sampling::StepCtx;
 use crate::kv_cache_ops::KVLayout;
 use crate::layers::workspace::{LayerWorkspace, PrefillWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
@@ -27,7 +28,7 @@ use crate::model_config::ModelArch;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use crate::pressure::kv_cache::KVCache;
 use crate::pressure::standard_format::StandardFormat;
-use crate::session::traits::{Forward, StepCtx};
+use crate::session::forward::Forward;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 

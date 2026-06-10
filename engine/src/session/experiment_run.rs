@@ -17,8 +17,8 @@ use crate::inference::sampling;
 use crate::session::assembly::{
     build_bench_loop, build_local_pressure_source, build_resilience_cache_manager,
 };
+use crate::session::decode_loop::StopReason;
 use crate::session::standard_happy::StandardHappyCtx;
-use crate::session::traits::StopReason;
 
 pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     let StandardHappyCtx {

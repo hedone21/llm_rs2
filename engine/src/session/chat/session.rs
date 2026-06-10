@@ -31,11 +31,11 @@ use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::DecodeLoopBuilder;
 use crate::session::chat::stop_condition::{ChatStopSlot, ChatStopStage, StopCondition};
 use crate::session::decode_loop::DecodeLoop;
+use crate::session::decode_loop::DecodeResult;
 use crate::session::forward::{
     KiviForward, ModelForward, OffloadForward, alloc_kivi_kv_caches, alloc_offload_kv_caches,
 };
 use crate::session::pipeline_registry::PipelineRegistry;
-use crate::session::traits::DecodeResult;
 
 /// `ChatKvMode::Standard` variant inner payload.
 ///
@@ -747,8 +747,10 @@ fn build_chat_eviction_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::sampling::StepCtx;
     use crate::session::chat::stop_condition::StopCondition as StopConditionTrait;
-    use crate::session::traits::{Forward, StepCtx, StopReason};
+    use crate::session::decode_loop::StopReason;
+    use crate::session::forward::Forward;
 
     // ─── Mock Forward ──────────────────────────────────────────────────────
 
@@ -1010,7 +1012,7 @@ mod tests {
         use crate::pressure::cache_manager::CacheManager;
         use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
         use crate::resilience::sys_monitor::NoOpMonitor;
-        use crate::session::traits::Forward as ForwardTrait;
+        use crate::session::forward::Forward as ForwardTrait;
         use std::cell::Cell;
         use std::rc::Rc;
 

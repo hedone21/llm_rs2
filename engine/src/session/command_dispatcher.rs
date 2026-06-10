@@ -20,12 +20,41 @@
 
 use std::sync::{Arc, Mutex};
 
-use llm_shared::EngineCommand;
+use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport};
 
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::standard_format::StandardFormat;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::stages::kv::eviction::EvictionStage;
+
+/// External command channel (manager IPC, schedule, stdin, ...).
+///
+/// **Phase β-7**: moved here from the deleted `session::traits` — this is the
+/// dispatcher's input seam.
+///
+/// **β-4 retarget (v2 §5.4 A-1)**: `poll` 은 **pure 생산자**다 — drain 한
+/// [`EngineCommand`] 들을 그대로 반환할 뿐, `ExecutionPlan` 으로 번역하지 않고
+/// registry 도 모른다. 번역(① OneShot Stage submit / ② LoopControl / ③ Hardware seam)은
+/// [`CommandDispatcher`] 책임이다.
+///
+/// heartbeat 등 부수효과(매핑 문서 4부 채택안 (가))는 source 구현체 내부에 잔존한다 —
+/// `kv_snap` 운반은 poll 인자가 아니라 source 가 register 시점 보유한 held-handle query 로
+/// 교체된다(`ManagerCommandSource`). pure poll 은 `ctx`/`kv_snap` 인자가 없다.
+pub trait CommandSource {
+    /// Per-step poll — 도착한 manager command 들을 drain 하여 반환한다 (pure).
+    /// Default Noop 은 빈 `Vec` 을 반환.
+    fn poll(&mut self) -> anyhow::Result<Vec<EngineCommand>>;
+}
+
+/// Outbound reporting channel (engine → manager).
+///
+/// **Phase β-7**: moved here from the deleted `session::traits`. Implemented by
+/// `ResilienceAdapter` (the surviving `CommandExecutor` side).
+pub trait EngineReport {
+    fn send_capability(&mut self, _cap: EngineCapability) {}
+    fn send_qcf_estimate(&mut self, _qcf: QcfEstimate) {}
+    fn send_swap_report(&mut self, _report: WeightSwapReport) {}
+}
 
 /// ExecutionPlan 축소판 — driver-local 루프 제어 상태 (v2 §5.4 ② channel).
 ///

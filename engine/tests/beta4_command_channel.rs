@@ -30,10 +30,10 @@ use llm_rs2::pressure::kv_cache::KVCache;
 use llm_rs2::pressure::standard_format::StandardFormat;
 use llm_rs2::resilience::sys_monitor::NoOpMonitor;
 use llm_rs2::resilience::{CommandExecutor, KVSnapshot};
+use llm_rs2::session::CommandSource;
 use llm_rs2::session::command_dispatcher::CommandDispatcher;
 use llm_rs2::session::pipeline_registry::PipelineRegistry;
 use llm_rs2::session::resilience_adapter::ResilienceAdapter;
-use llm_rs2::session::traits::CommandSource;
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
 

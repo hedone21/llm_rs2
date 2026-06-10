@@ -5,9 +5,11 @@
 
 use llm_shared::EngineCommand;
 
+use crate::inference::sampling::StepCtx;
+use crate::session::command_dispatcher::{CommandSource, EngineReport};
+
 use super::traits::{
-    CommandSource, DecodeObserver, EngineReport, EvictionOutcome, EvictionStage, SkipReason,
-    StepCtx, SwapStage, TokenSampler, TokenTickSink,
+    DecodeObserver, EvictionOutcome, EvictionStage, SkipReason, SwapStage, TokenTickSink,
 };
 
 /// Eviction stage that never prunes. Used when caller skipped `with_eviction`.
@@ -52,20 +54,6 @@ pub struct NoOpTokenTickSink;
 
 impl TokenTickSink for NoOpTokenTickSink {}
 
-/// Greedy sampler (argmax). Pipeline default when caller skipped `with_sampler`.
-pub struct GreedySampler;
-
-impl TokenSampler for GreedySampler {
-    fn sample(&mut self, _ctx: &StepCtx, logits: &[f32]) -> u32 {
-        logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(idx, _)| idx as u32)
-            .unwrap_or(0)
-    }
-}
-
 /// Observer with all hooks as no-op. Useful as a placeholder slot.
 pub struct NoOpObserver;
 
@@ -84,22 +72,6 @@ mod tests {
             decode_step: 0,
             stop_requested: stop,
         }
-    }
-
-    #[test]
-    fn greedy_picks_argmax() {
-        let stop = AtomicBool::new(false);
-        let c = ctx(&stop);
-        let mut s = GreedySampler;
-        assert_eq!(s.sample(&c, &[0.1, 0.5, 0.3, 0.9, 0.2]), 3);
-    }
-
-    #[test]
-    fn greedy_handles_negative_logits() {
-        let stop = AtomicBool::new(false);
-        let c = ctx(&stop);
-        let mut s = GreedySampler;
-        assert_eq!(s.sample(&c, &[-5.0, -1.0, -3.0]), 1);
     }
 
     #[test]

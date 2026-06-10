@@ -26,18 +26,21 @@ pub mod swap_runtime;
 pub mod traits;
 pub mod warmup;
 
+pub use crate::inference::sampling::{GreedySampler, StepCtx, TokenSampler};
 pub use assembly::{build_standard_loop, is_standard_happy_path};
 pub use bin_setup::build_inference_ctx;
-pub use command_dispatcher::{CommandDispatcher, LoopControl};
-pub use decode_loop::{DecodeLoop, DecodeLoopBuilder, HasForward, NoForward};
+pub use command_dispatcher::{CommandDispatcher, CommandSource, EngineReport, LoopControl};
+pub use decode_loop::{
+    DecodeLoop, DecodeLoopBuilder, DecodeResult, HasForward, NoForward, StopReason,
+};
 pub use defaults::{
-    GreedySampler, NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver,
-    NoOpSwapStage, NoOpTokenTickSink,
+    NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver, NoOpSwapStage,
+    NoOpTokenTickSink,
 };
 pub use experiment_run::run_experiment_path;
+pub use forward::Forward;
 pub use samplers::RepetitionPenaltySampler;
 pub use traits::{
-    CommandSource, DecodeObserver, DecodeResult, EngineReport, EvictionOutcome, EvictionStage,
-    Forward, ResilienceBundle, SkipReason, StepCtx, StopReason, SwapStage, TokenSampler,
+    DecodeObserver, EvictionOutcome, EvictionStage, ResilienceBundle, SkipReason, SwapStage,
     TokenTickSink,
 };

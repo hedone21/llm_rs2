@@ -1,28 +1,21 @@
-//! Inference pipeline trait API (Phase 4-2).
+//! Remaining v1 pipeline trait surface (Phase 4-2, slimmed in Phase β-7).
 //!
-//! 6 traits split the decode loop responsibilities by SOLID-SRP:
-//! [`Forward`] (required), [`EvictionStage`], [`SwapStage`], [`CommandSource`],
-//! [`TokenSampler`], and [`DecodeObserver`].
+//! Phase β-7 moved the live seams out of this file:
+//! - [`Forward`](super::forward::Forward) → `session/forward.rs`
+//! - [`TokenSampler`](crate::inference::sampling::TokenSampler) +
+//!   [`StepCtx`](crate::inference::sampling::StepCtx) → `inference/sampling.rs`
+//! - [`StopReason`](super::decode_loop::StopReason) +
+//!   [`DecodeResult`](super::decode_loop::DecodeResult) → `decode_loop.rs`
+//! - [`CommandSource`](super::command_dispatcher::CommandSource) +
+//!   [`EngineReport`](super::command_dispatcher::EngineReport) → `command_dispatcher.rs`
 //!
-//! Signatures match `arch/inference_pipeline.md` §2 verbatim. Default methods
-//! mean external contributors only have to implement `prefill` + `step` on
-//! [`Forward`] to compile against [`super::DecodeLoopBuilder`].
+//! What stays here are the trait objects the [`super::DecodeLoop`] still owns as
+//! optional slots — eviction / swap / observer / tick. They default to no-op
+//! impls in [`super::defaults`].
 
-use std::sync::atomic::AtomicBool;
+use llm_shared::WeightSwapReport;
 
-use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport};
-
-/// Read-only context handed to every trait at each decode step.
-///
-/// Borrows the stop flag from the parent [`super::DecodeLoop`] so trait
-/// implementations can observe (but not flip) cancellation.
-pub struct StepCtx<'a> {
-    pub pos: usize,
-    pub prev_token: u32,
-    pub kv_capacity: usize,
-    pub decode_step: usize,
-    pub stop_requested: &'a AtomicBool,
-}
+use crate::inference::sampling::StepCtx;
 
 /// Outcome of an [`EvictionStage::before_step`] call.
 #[derive(Debug, Clone)]
@@ -39,107 +32,6 @@ pub enum SkipReason {
     BudgetExhausted,
     ManagerDeferred,
     Other(&'static str),
-}
-
-/// Why [`super::DecodeLoop::run`] returned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StopReason {
-    BudgetExhausted,
-    StopFlag,
-    EosToken,
-    CommandRequested,
-    /// Phase 4-5-c: [`super::DecodeLoop::run_until_stop`]에서 StopCondition이 true를 반환.
-    StopConditionMet,
-}
-
-/// Decode result returned by [`super::DecodeLoop::run`].
-#[derive(Debug, Clone)]
-pub struct DecodeResult {
-    pub tokens_generated: Vec<u32>,
-    pub final_pos: usize,
-    pub stopped_by: StopReason,
-}
-
-/// Required forward pass. Provides KV-bearing model semantics.
-///
-/// `finalize` and `on_kv_prune` are default no-ops so a minimal Forward
-/// implementation needs only `prefill` + `step`.
-pub trait Forward {
-    /// Run prefill over `tokens` starting at KV position `start_pos`.
-    /// Returns logits for the last token.
-    ///
-    /// `start_pos`는 chat multi-turn에서 turn 사이 KV 누적 보존을 위해 필수.
-    /// non-chat 모드에선 caller가 0 전달 (단일 prefill).
-    fn prefill(&mut self, tokens: &[u32], start_pos: usize) -> anyhow::Result<Vec<f32>>;
-
-    /// Decode 1 step. After return, `pos` is conceptually advanced by 1.
-    fn step(&mut self, ctx: &StepCtx, token: u32) -> anyhow::Result<Vec<f32>>;
-
-    /// Called once after [`super::DecodeLoop::run`] exits.
-    fn finalize(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Notified after an [`EvictionStage`] pruned KV state.
-    fn on_kv_prune(&mut self, _new_pos: usize) {}
-
-    /// Phase 4-5-d: chat `/reset` 처리용. KV cache를 초기 상태로 reset한다.
-    ///
-    /// Default no-op — generate 모드는 호출하지 않는다. chat 모드의 각 Forward
-    /// 구현체가 override하여 KV-type별 reset 로직을 수행한다.
-    fn reset_kv(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Phase 4-5-e: chat `ensure_capacity` / `on_turn_end` 에서 eviction 실행.
-    ///
-    /// ModelForward만 override한다. KiviForward / OffloadForward는 default no-op
-    /// 유지 (eviction 미지원).
-    ///
-    /// - `cache_manager`: eviction 정책을 보유한 CacheManager.
-    /// - `scores`: score-based policy (H2O/D2O)용 importance 점수. `None`이면
-    ///   score-free force/maybe evict.
-    /// - `force`: true이면 `force_evict*`, false이면 `maybe_evict*`.
-    /// - `target_ratio`: `force=true` 시 eviction 목표 비율.
-    ///
-    /// Returns (removed_count, new_pos). removed_count == 0이면 eviction 미발생.
-    fn try_evict(
-        &mut self,
-        cache_manager: &crate::pressure::cache_manager::CacheManager,
-        scores: Option<&[f32]>,
-        force: bool,
-        target_ratio: f32,
-    ) -> anyhow::Result<(usize, usize)> {
-        let _ = (cache_manager, scores, force, target_ratio);
-        Ok((0, 0))
-    }
-
-    /// argus-bench AB-3: resilience KvOffload — LRU prefix 를 disk 로 offload.
-    /// `cache_manager` 는 `--swap-dir` 로 enable_swap 된 SwapHandler 보유.
-    /// `&mut` 필요(offload 가 handler ratio 변경). ModelForward 만 override(UER).
-    ///
-    /// Returns (offloaded_count, new_pos). offloaded_count == 0 이면 미발생
-    /// (swap 미활성/대상 0).
-    fn try_offload(
-        &mut self,
-        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
-        ratio: f32,
-    ) -> anyhow::Result<(usize, usize)> {
-        let _ = (cache_manager, ratio);
-        Ok((0, 0))
-    }
-
-    /// argus-bench AB-3: resilience RestoreDefaults — offload 된 prefix 를 disk 에서
-    /// recall. ModelForward 만 override.
-    ///
-    /// Returns (recalled_count, new_pos). recalled_count == 0 이면 미발생.
-    fn try_recall(
-        &mut self,
-        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
-    ) -> anyhow::Result<(usize, usize)> {
-        let _ = cache_manager;
-        Ok((0, 0))
-    }
 }
 
 /// Eviction stage invoked before each forward step.
@@ -165,29 +57,6 @@ pub trait SwapStage {
     }
 }
 
-/// External command channel (manager IPC, schedule, stdin, ...).
-///
-/// **β-4 retarget (v2 §5.4 A-1)**: `poll` 은 **pure 생산자**다 — drain 한
-/// [`EngineCommand`] 들을 그대로 반환할 뿐, `ExecutionPlan` 으로 번역하지 않고
-/// registry 도 모른다. 번역(① OneShot Stage submit / ② LoopControl / ③ Hardware seam)은
-/// [`super::command_dispatcher::CommandDispatcher`] 책임이다.
-///
-/// heartbeat 등 부수효과(매핑 문서 4부 채택안 (가))는 source 구현체 내부에 잔존한다 —
-/// `kv_snap` 운반은 poll 인자가 아니라 source 가 register 시점 보유한 held-handle query 로
-/// 교체된다(`ManagerCommandSource`). pure poll 은 `ctx`/`kv_snap` 인자가 없다.
-pub trait CommandSource {
-    /// Per-step poll — 도착한 manager command 들을 drain 하여 반환한다 (pure).
-    /// Default Noop 은 빈 `Vec` 을 반환.
-    fn poll(&mut self) -> anyhow::Result<Vec<EngineCommand>>;
-}
-
-/// Outbound reporting channel (engine → manager).
-pub trait EngineReport {
-    fn send_capability(&mut self, _cap: EngineCapability) {}
-    fn send_qcf_estimate(&mut self, _qcf: QcfEstimate) {}
-    fn send_swap_report(&mut self, _report: WeightSwapReport) {}
-}
-
 /// Per-token tick sink.
 pub trait TokenTickSink {
     /// decode step 완료 후 1회. sampler 호출 후, observer 이전.
@@ -195,17 +64,16 @@ pub trait TokenTickSink {
 }
 
 /// Convenience supertrait bundling the three resilience-facing traits.
-pub trait ResilienceBundle: CommandSource + EngineReport + TokenTickSink {}
-impl<T: CommandSource + EngineReport + TokenTickSink> ResilienceBundle for T {}
-
-/// Token sampler. Default impl `GreedySampler` in [`super::defaults`].
-pub trait TokenSampler {
-    fn sample(&mut self, ctx: &StepCtx, logits: &[f32]) -> u32;
-
-    /// Phase 4-4.7: stateful samplers (rep penalty, n-gram blocking, ...)이
-    /// 최근 토큰을 ring buffer로 유지하기 위한 hook. Default no-op이라
-    /// [`super::defaults::GreedySampler`] 등 stateless impl은 변경 불필요.
-    fn observe_token(&mut self, _token: u32) {}
+pub trait ResilienceBundle:
+    super::command_dispatcher::CommandSource + super::command_dispatcher::EngineReport + TokenTickSink
+{
+}
+impl<
+    T: super::command_dispatcher::CommandSource
+        + super::command_dispatcher::EngineReport
+        + TokenTickSink,
+> ResilienceBundle for T
+{
 }
 
 /// Decode-loop observer. All hooks are no-op by default; implement only what

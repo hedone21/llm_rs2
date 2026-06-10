@@ -9,8 +9,7 @@
 
 use llm_rs2::session::chat::session::{ChatKvMode, ChatKvModeStandard, ChatSession};
 use llm_rs2::session::chat::stop_condition::ChatStopCondition;
-use llm_rs2::session::traits::{Forward, StepCtx, StopReason};
-use llm_rs2::session::{DecodeLoopBuilder, GreedySampler};
+use llm_rs2::session::{DecodeLoopBuilder, Forward, GreedySampler, StepCtx, StopReason};
 
 // ─── Mock Forward ──────────────────────────────────────────────────────────────
 

@@ -16,7 +16,7 @@ use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport}
 
 use crate::format::KVCacheFormat;
 use crate::resilience::{CommandExecutor, KVSnapshot};
-use crate::session::traits::{CommandSource, EngineReport};
+use crate::session::command_dispatcher::{CommandSource, EngineReport};
 
 /// [`CommandExecutor`]를 session 3-trait으로 연결하는 어댑터 (β-4: ManagerCommandSource 역할).
 ///

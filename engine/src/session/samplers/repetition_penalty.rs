@@ -16,8 +16,7 @@
 
 use std::collections::VecDeque;
 
-use crate::inference::sampling::{SamplingConfig, sample};
-use crate::session::traits::{StepCtx, TokenSampler};
+use crate::inference::sampling::{SamplingConfig, StepCtx, TokenSampler, sample};
 
 /// Production `sampling::sample` 호출과 동치 결과를 내는 stateful sampler.
 ///

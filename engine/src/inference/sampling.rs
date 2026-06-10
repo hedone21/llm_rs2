@@ -2,6 +2,51 @@
 //!
 //! Extracted from `generate.rs` to enable unit testing and reuse.
 
+use std::sync::atomic::AtomicBool;
+
+/// Read-only context handed to every decode-step trait
+/// ([`crate::session::forward::Forward`], [`TokenSampler`]).
+///
+/// Borrows the stop flag from the parent [`crate::session::DecodeLoop`] so trait
+/// implementations can observe (but not flip) cancellation.
+///
+/// **Phase β-7**: moved here from the deleted `session::traits` so that
+/// [`TokenSampler`] (front-door ①) and `Forward` can share it without an
+/// `inference → session` dependency cycle.
+pub struct StepCtx<'a> {
+    pub pos: usize,
+    pub prev_token: u32,
+    pub kv_capacity: usize,
+    pub decode_step: usize,
+    pub stop_requested: &'a AtomicBool,
+}
+
+/// Token sampler. Default impl [`GreedySampler`] below.
+///
+/// **Phase β-7**: moved here from the deleted `session::traits` (front-door ①).
+pub trait TokenSampler {
+    fn sample(&mut self, ctx: &StepCtx, logits: &[f32]) -> u32;
+
+    /// Phase 4-4.7: stateful samplers (rep penalty, n-gram blocking, ...)이
+    /// 최근 토큰을 ring buffer로 유지하기 위한 hook. Default no-op이라
+    /// [`GreedySampler`] 등 stateless impl은 변경 불필요.
+    fn observe_token(&mut self, _token: u32) {}
+}
+
+/// Greedy sampler (argmax). Pipeline default when caller skipped `with_sampler`.
+pub struct GreedySampler;
+
+impl TokenSampler for GreedySampler {
+    fn sample(&mut self, _ctx: &StepCtx, logits: &[f32]) -> u32 {
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(idx, _)| idx as u32)
+            .unwrap_or(0)
+    }
+}
+
 /// Configuration for token sampling.
 #[derive(Clone)]
 pub struct SamplingConfig {
@@ -144,6 +189,33 @@ pub fn compute_log_prob(logits: &[f32], token_id: u32, vocab_size: usize) -> f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn ctx<'a>(stop: &'a AtomicBool) -> StepCtx<'a> {
+        StepCtx {
+            pos: 0,
+            prev_token: 0,
+            kv_capacity: 0,
+            decode_step: 0,
+            stop_requested: stop,
+        }
+    }
+
+    #[test]
+    fn greedy_picks_argmax() {
+        let stop = AtomicBool::new(false);
+        let c = ctx(&stop);
+        let mut s = GreedySampler;
+        assert_eq!(s.sample(&c, &[0.1, 0.5, 0.3, 0.9, 0.2]), 3);
+    }
+
+    #[test]
+    fn greedy_handles_negative_logits() {
+        let stop = AtomicBool::new(false);
+        let c = ctx(&stop);
+        let mut s = GreedySampler;
+        assert_eq!(s.sample(&c, &[-5.0, -1.0, -3.0]), 1);
+    }
 
     fn default_config() -> SamplingConfig {
         SamplingConfig {

@@ -10,22 +10,52 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::format::KVCacheFormat;
+use crate::inference::sampling::{GreedySampler, StepCtx, TokenSampler};
 use crate::observability::profile::OpProfiler;
 use crate::pipeline::StopReason as StageStopReason;
 use crate::pipeline::{
     LifecyclePhase, PipelineDispatcher, Pressure, PressureSource, StageContext, StepInfo,
 };
-use crate::session::command_dispatcher::CommandDispatcher;
+use crate::session::command_dispatcher::{CommandDispatcher, CommandSource, EngineReport};
+use crate::session::forward::Forward;
 use crate::session::pipeline_registry::PipelineRegistry;
 
 use super::defaults::{
-    GreedySampler, NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver,
-    NoOpSwapStage,
+    NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver, NoOpSwapStage,
 };
-use super::traits::{
-    CommandSource, DecodeObserver, DecodeResult, EngineReport, EvictionOutcome, EvictionStage,
-    Forward, StepCtx, StopReason, SwapStage, TokenSampler,
-};
+use super::traits::{DecodeObserver, EvictionOutcome, EvictionStage, SwapStage};
+
+/// Why [`DecodeLoop::run`] returned.
+///
+/// **Phase β-7**: this is the *driver-result* vocabulary — it carries
+/// [`StopReason::StopFlag`], which the v2 stage-level
+/// [`crate::pipeline::StopReason`] (4-variant) deliberately omits: a Stage can
+/// never *return* `StopFlag` because it is a driver-internal `stop_flag` break
+/// (cancellation observed but not produced by any stage). The two enums stay
+/// separate for exactly this reason — see `arch/pipeline_stage_design_v2.md`
+/// §5.2.1 (다). [`DecodeLoop::map_stage_stop`] maps the 4 stage variants into
+/// the matching driver variants; `StopFlag` is set only by the driver loop guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    BudgetExhausted,
+    StopFlag,
+    EosToken,
+    CommandRequested,
+    /// Phase 4-5-c: [`DecodeLoop::run_until_stop`]에서 StopCondition이 true를 반환.
+    StopConditionMet,
+}
+
+/// Decode result returned by [`DecodeLoop::run`].
+///
+/// **Phase β-7**: moved here from the deleted `session::traits` (it is the
+/// `run`/`run_until_stop` return type). Its `stopped_by` uses the driver-result
+/// [`StopReason`] above (StopFlag-bearing), distinct from the stage vocabulary.
+#[derive(Debug, Clone)]
+pub struct DecodeResult {
+    pub tokens_generated: Vec<u32>,
+    pub final_pos: usize,
+    pub stopped_by: StopReason,
+}
 
 /// Typestate marker — Forward not yet supplied. `.build()` is unavailable.
 pub struct NoForward;
