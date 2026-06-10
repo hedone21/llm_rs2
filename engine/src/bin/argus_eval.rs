@@ -11,7 +11,7 @@
 //! - `ppl` — `--ppl <text>` + `ppl_*` 패밀리
 //! - `dump importance` — `--dump-importance`
 //! - `dump qcf` — `--qcf-dump <path>` (modifier — `ll`/`ppl` 에 결합)
-//! - `experiment` — `--experiment-schedule` (γ-3b planned)
+//! - `experiment` — `--experiment-schedule` (정적 directive schedule, `ScheduleCommandSource` 경유)
 //!
 //! KIVI(`--kv-mode kivi`)는 ll/ppl 양쪽에서 지원 — 별 `KiviCache` 경로(§13.6).
 //!
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
             "argus-eval: this combination of args is not yet supported. \
              supported: eval-ll/ppl/dump-importance + eviction-policy + qcf-dump + \
              skip-ratio/skip-layers + weight-swap + --kv-mode kivi. \
-             blocked: profile, profile_events, tensor_partition, chat, prompt-batch."
+             blocked: profile, profile_events, tensor_partition, chat."
         );
     }
     if args.num_tokens < 1 {
@@ -77,7 +77,7 @@ enum EvalMode {
     PplKivi,
     /// `--dump-importance`.
     DumpImportance,
-    /// `--experiment-schedule` — γ-3b planned (bail).
+    /// `--experiment-schedule` — 정적 schedule 을 `ScheduleCommandSource` 로 실행.
     Experiment,
 }
 
