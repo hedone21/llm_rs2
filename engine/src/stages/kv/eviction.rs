@@ -50,6 +50,12 @@ pub struct EvictionStage {
     /// `ctx.step.pressure.band() >= min` 일 때만 prune 한다(미달 시 `Continue`, no-op).
     /// `None`(OneShot) 이면 무조건 발화(v1 AB-1 = command-driven, 압력 무관).
     min_band: Option<Level>,
+    /// β-5: Persistent **episode edge-trigger** 무장 상태. band 가 `min_band` 를 상향 돌파한
+    /// 에지에서 1회 발화 후 disarm, band 가 `min_band` 미만으로 떨어지면 re-arm — 압력 에피소드당
+    /// prune 1회. 가드 없이는 지속 고압에서 매 step `force_evict(ratio)` 가 재발화해 캐시가
+    /// floor 까지 나선 축소(churn — madvise/CacheEvent per-token spam)하는 퇴행 시맨틱이 된다.
+    /// 압력 지속 중 캐시 재성장 시의 재prune 은 friction-triggered 후속 (doc).
+    armed: std::sync::atomic::AtomicBool,
 }
 
 impl EvictionStage {
@@ -71,6 +77,7 @@ impl EvictionStage {
             cache_manager,
             target_ratio,
             min_band: None,
+            armed: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -92,6 +99,7 @@ impl EvictionStage {
             cache_manager,
             target_ratio,
             min_band: Some(min_band),
+            armed: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -135,12 +143,20 @@ impl PipelineStage for EvictionStage {
             return Ok(StageOutcome::Continue);
         }
 
-        // β-5: Persistent band 게이트 — 압력 미달이면 prune 없이 Continue (no-op).
+        // β-5: Persistent band 게이트 — 압력 미달이면 prune 없이 Continue (no-op) + re-arm.
         // OneShot(min_band=None) 은 무조건 발화 (command-driven, 압력 무관).
-        if let Some(min) = self.min_band
-            && ctx.step.pressure.band() < min
-        {
-            return Ok(StageOutcome::Continue);
+        if let Some(min) = self.min_band {
+            use std::sync::atomic::Ordering;
+            if ctx.step.pressure.band() < min {
+                // 압력 에피소드 종료 → re-arm (다음 상향 돌파에서 재발화 가능).
+                self.armed.store(true, Ordering::Relaxed);
+                return Ok(StageOutcome::Continue);
+            }
+            // episode edge-trigger: 이번 에피소드에서 이미 발화했으면 no-op
+            // (지속 고압에서 매 step force_evict 재발화 = floor 나선 축소 차단).
+            if !self.armed.swap(false, Ordering::Relaxed) {
+                return Ok(StageOutcome::Continue);
+            }
         }
 
         self.run_eviction()?;
@@ -362,6 +378,58 @@ mod tests {
         assert!(
             persistent_pos < N_TOKENS,
             "양쪽 모두 실제 prune (비-vacuous)"
+        );
+    }
+
+    /// β-5 episode edge-trigger: 지속 고압에서 prune 은 에피소드당 1회 — 매 step 재발화로
+    /// floor 까지 나선 축소되는 퇴행 차단. band 가 min 미만으로 떨어지면 re-arm 되어
+    /// 다음 상향 돌파에서 재발화한다.
+    #[test]
+    fn persistent_edge_trigger_once_per_episode() {
+        let handle = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
+        let stage = EvictionStage::persistent(
+            vec![handle.clone()],
+            make_cache_manager(),
+            TARGET_RATIO,
+            Level::Warning,
+        );
+        let mut profiler = OpProfiler::new();
+
+        // 에피소드 1: 상향 돌파 → 1회 발화.
+        let mut c = make_ctx_with_pressure(&mut profiler, 50);
+        stage
+            .on_phase(&LifecyclePhase::PreEviction, &mut c)
+            .unwrap();
+        let pos_after_first = handle.current_pos();
+        assert!(pos_after_first < N_TOKENS, "에피소드 1 발화");
+
+        // 지속 고압: 같은 에피소드 내 재dispatch → 무발화 (pos 불변).
+        let mut c = make_ctx_with_pressure(&mut profiler, 60);
+        stage
+            .on_phase(&LifecyclePhase::PreEviction, &mut c)
+            .unwrap();
+        assert_eq!(
+            handle.current_pos(),
+            pos_after_first,
+            "지속 고압에서 재발화 금지 (episode edge-trigger)"
+        );
+
+        // band 하강 → re-arm (무발화).
+        let mut c = make_ctx_with_pressure(&mut profiler, 10);
+        stage
+            .on_phase(&LifecyclePhase::PreEviction, &mut c)
+            .unwrap();
+        assert_eq!(handle.current_pos(), pos_after_first, "Normal 에선 무발화");
+
+        // 에피소드 2: 캐시 재성장 후 재돌파 → 재발화.
+        handle.with_cache_mut(|cache| cache.current_pos = N_TOKENS);
+        let mut c = make_ctx_with_pressure(&mut profiler, 80);
+        stage
+            .on_phase(&LifecyclePhase::PreEviction, &mut c)
+            .unwrap();
+        assert!(
+            handle.current_pos() < N_TOKENS,
+            "re-arm 후 두 번째 에피소드에서 재발화"
         );
     }
 }

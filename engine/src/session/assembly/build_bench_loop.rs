@@ -182,6 +182,9 @@ pub fn build_bench_loop(
     cache_manager: Option<CacheManager>,
     // β-5: graded 압력 source (memory-only). None → 무주입(happy-path per-token syscall 0).
     pressure_source: Option<Arc<dyn crate::pipeline::PressureSource>>,
+    // β-5: pressure-driven Persistent EvictionStage 의 force_evict target ratio
+    // (CLI `--eviction-target-ratio` — CM 내부 값과 동일 출처를 호출자가 보장).
+    pressure_evict_ratio: f32,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // ADR-0008: decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고
@@ -237,15 +240,33 @@ pub fn build_bench_loop(
     // resilience-on 에서 control 을 적용했다(미구성 시 디렉티브 무소비 드롭 = v1 회귀, β-4 device
     // smoke 실증 2026-06-10). evict 디렉티브는 CM=None 이면 dispatcher 내부에서 inert —
     // v1 (a.5) 의 `cache_manager=None` 스킵과 등가. 둘 다 None 이면 미구성(happy-path 거동-0).
-    let dispatcher = if resilience.is_some() || cache_manager.is_some() {
+    // β-5: CM 을 Arc<Mutex> 로 한 번 들어 dispatcher(OneShot 구성)와 Persistent stage 가 공유.
+    let shared_cm = cache_manager.map(|cm| Arc::new(Mutex::new(cm)));
+
+    let dispatcher = if resilience.is_some() || shared_cm.is_some() {
         Some(CommandDispatcher::new(
             Arc::clone(&registry),
-            kv_handles,
-            cache_manager.map(|cm| Arc::new(Mutex::new(cm))),
+            kv_handles.clone(),
+            shared_cm.clone(),
         ))
     } else {
         None
     };
+
+    // β-5: pressure-driven Persistent EvictionStage — CM + graded source 가 둘 다 있을 때만
+    // 상주 등록. band ≥ Warning 상향 에지에서 에피소드당 1회 force_evict (stage 내부
+    // edge-trigger). source 부재(None) 면 StepInfo.pressure 가 항상 0(Normal) → 등록해도
+    // 영구 무발화이므로 미등록 (의도 명시). ratio = CLI `--eviction-target-ratio`
+    // (method-drop 시맨틱과 동일하게 정책은 CM 의 CLI 구성).
+    if let (Some(cm), Some(_)) = (&shared_cm, &pressure_source) {
+        let persistent = crate::stages::kv::eviction::EvictionStage::persistent(
+            kv_handles,
+            Arc::clone(cm),
+            pressure_evict_ratio,
+            llm_shared::Level::Warning,
+        );
+        registry.submit(Arc::new(persistent));
+    }
 
     let use_stateful =
         sampling_config.repetition_penalty != 1.0 || sampling_config.temperature != 0.0;

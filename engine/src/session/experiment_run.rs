@@ -79,6 +79,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         resilience,
         cache_manager,
         pressure_source,
+        args.eviction_target_ratio(),
     )?;
 
     let t_prefill = std::time::Instant::now();
