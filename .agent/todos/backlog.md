@@ -20,19 +20,16 @@
 
 ---
 
-## [ACTIVE Roadmap] Phase α-K BC 완주 — `KVCacheOps` trait 완전 폐기 (2026-06-04 진입)
+## [ACTIVE Roadmap] Phase γ — `pressure/`→`kv/`·`weight/` rename + sweep + bin화 + orphan 처분 (γ-1 착수 2026-06-10)
 
-- **Master roadmap**: `.agent/todos/roadmap_alpha_k_bc_completion_2026_06_04.md`
-- **목표**: `KVCacheOps` trait 완전 삭제((4)). production 을 `KVCacheFormat` 패러다임으로 통일.
-- **SSOT**: `arch/pipeline_stage_design_v2.md` §9.1 "⚠️ α-K (3p)/(4) 방향" 블록(2026-06-04 BC 확정) + ADR `docs/adr/0001-kv-dispatch-paradigm.md` §8.3.
-- **5 step (위험 낮은 순, legacy = reference baseline → 마지막 폐기)**:
-  - **Step 1 [P1/current]** B-2/B-4 cold-path flip (forward_into prefill + eval, hot 미접촉)
-  - **Step 2 [P1/next]** B-3 offload 분리 (`PrefetchableCache` KVCacheOps 비의존 재정의)
-  - **Step 3 [P1/next]** (3p) ④-a hot-path flip (plan path concrete-handle, ★perf crux, 회귀 시 (3p)만 revert)
-  - **Step 4 [P2/backlog]** device-gate 를 legacy_generate → argus_cli 로 이주
-  - **Step 5 [P2/backlog]** legacy 폐기 + KVCacheOps trait 삭제
-- **선행 완료**: (3c-fwd) ✅ `c2b05aff` / (3c-evict) ✅ `2f014163`.
-- **진입 handoff**: `.agent/todos/handoff_alpha_k_3d_entry_2026_06_03.md`.
+- **SSOT (γ 정의 출처)**: `arch/pipeline_stage_design_v2.md` §9 "Phase γ 재정의"(G2-(iii) 승인, 2026-06-10). 직전 γ 정의("legacy generate.rs 잔여 마이그레이션 + PACT2026 PoC")는 α-K BC 결정(2026-06-04, §9.1 BC)에서 흡수 + β-7 v1 표면 삭제(2026-06-10)로 빈 껍데기가 되어 재정의.
+- **선행 완료**: **Phase α-K BC 완주**(2026-06-05 — `KVCacheOps` trait 완전 폐기 + legacy generate.rs 폐기) + **Phase β 전 substep 종결**(β-1~β-7, 2026-06-10, HEAD `4abab582` — decode loop rewrite + v1 trait 표면 삭제).
+- **γ 4 잔여 작업** (arch §9 재정의):
+  - **(γ-1) [ACTIVE]** `kv/`·`weight/` rename — `pressure/`→`kv/`, `pressure/weights/`→`weight/`(§2.1 G3-reconcile Q1/Q2). blast radius 189 ref / 53 file(기계적). `Pressure` 타입 ↔ `pressure/` 디렉토리 이름 충돌 해소.
+  - **(γ-2)** nested `mod.rs` 38개 sweep — no-`mod.rs` 모던 path 스타일(§2.1 규칙 C / CLAUDE.md 컨벤션)로 일괄 정리. 별도 `chore:` 커밋, `git mv` history 보존.
+  - **(γ-3)** argus-eval / chat bin화 — 현 eval/chat 진입 경로의 binary 분리·정착.
+  - **(γ-4)** batch orphan 처분 — `run_prompt_batch`/batch runner orphan 코드 처분(β-7 의 G3 eval/batch orphan 삭제와 연동/잔여). 아래 별도 항목 참조.
+- **이전 Master roadmap (α-K BC, 완료)**: `.agent/todos/roadmap_alpha_k_bc_completion_2026_06_04.md`.
 
 ---
 
@@ -147,6 +144,7 @@
 
 ## [P2] generate 바이너리 분할 + Manager 통합 — 2026-05-21 등록
 - **Status**: TODO (사용자 결정 대기 — 분할 단위 + 진입 시점)
+- **⚠️ STALE 전제 (2026-06-10 갱신)**: 아래 "현 `engine/src/bin/generate.rs` … legacy로 보존" 전제는 **이미 무효**. α-K BC(2026-06-05)에서 legacy generate.rs 가 폐기되어 현 `engine/src/bin/` 에 generate.rs 부재 — 현 bin 7종 = `argus_cli`/`argus_bench`/`auf_tool`/`signal_injector`/`test_backend`/`test_model`/`test_q4_soa_byte_equal`. **또한 Phase γ-3(argus-eval/chat bin화, arch §9)와 범위 중첩** — 착수 전 γ-3 과의 통합 재검토 필요. (항목 자체는 Manager IPC 통합 설계 의도 보존을 위해 미삭제.)
 - **결정 (2026-05-21)**: 현 `engine/src/bin/generate.rs` (master `02cb7106`, 4,953 LOC)를 **legacy로 보존**하고, 새로운 다수 바이너리로 기능 분할. Manager IPC 통합도 새 바이너리에서 다룸.
 - **배경**:
   - Phase 4-4-2.3 5 sub-sub-sprint 중 3a/3c/3b 추출 완료 — `session::decode_fallback::{prologue,eviction_trigger,swap_dispatch}` 모듈 자산 확보.
@@ -515,8 +513,8 @@
 
 ---
 
-## [P2] QCF 명명 컨벤션 정리 — `QCF_kv` / `QCF_weight` 2-tier rename
-- **Status**: RESOLVED (2026-05-19, Sprint 2 완료)
+## [RESOLVED] QCF 명명 컨벤션 정리 — `QCF_kv` / `QCF_weight` 2-tier rename
+- **Status**: RESOLVED (전체 종결 2026-06-10 — taxonomy rename + IPC dot prefix + estimator curves key 모두 적용 확인)
 - **Sprint**: completed
 - **Dependencies**: 없음
 - **Description**: 현재 `unified_qcf`(KV 액션 5종)와 `compute_qcf_swap`(weight)이 이름상 같은 QCF지만 측정 공간이 다르다(`‖ΔO‖/‖O‖` vs `Σ imp×ε / Σ`). 통일이 불가하다고 판단되어 **이름으로 패밀리를 분리**.
@@ -528,12 +526,12 @@
   - `docs/qcf_taxonomy.md` 갱신 (파일 경로 + 함수명 모두 신규명 반영)
   - `engine/tests/spec/inv_layer_baseline.json` 의 unified_qcf.rs → qcf_kv.rs, compute_qcf_swap → compute_qcf_weight_swap 동기화
   - 호출처 일괄 sed: `eval/eviction_hook.rs`, `eval/eval_loop.rs`, `bin/generate.rs`, `session/{ppl/runner,qcf_runtime}.rs`, `models/weights/{decider,mod}.rs`, `profile/quality_metrics.rs`, spec test 5개 파일
-- **Deferred (별 backlog)**:
+- **Deferred 잔여 — 전부 RESOLVED (2026-06-10 실측 확인)**:
   - ~~`shared::QcfEstimate.estimates` HashMap key — IPC 메시지라 manager 동시 갱신 필요~~ — **2026-05-21 완료** (commit `3d4e1a09`, action name + IPC wire format 모두 dot prefix 통일).
-  - `DegradationEstimator` default curves key (`eviction`, `sliding`, `kivi`, `swift` — `engine/src/qcf/estimator.rs:71-75`) → `kv.eviction` / `kv.sliding` / `kv.kivi` / `weight.skip` — 추상 카테고리 명명, 다른 의미 layer라 별도 정리. 본 sprint 범위 밖.
-- **검증**: `cargo build --release -p llm_rs2` PASS, lib 160 qcf-related test PASS, spec 660/663 PASS (3 fail = 사전 device-required).
+  - ~~`DegradationEstimator` default curves key (`eviction`, `sliding`, `kivi`, `swift`) → `kv.eviction` / `kv.sliding` / `kv.kivi` / `weight.skip`~~ — **완료 (2026-06-10 실측 확인)**: `engine/src/qcf/estimator.rs:72-75` 의 `with_defaults` curves key 가 이미 `kv.eviction`/`kv.sliding`/`kv.kivi`/`weight.skip` dot prefix 로 적용되어 있음 (직접 read 검증). 마지막 Deferred 잔여 해소 → 본 항목 전체 RESOLVED 종결.
+- **검증**: `cargo build --release -p llm_rs2` PASS, lib 160 qcf-related test PASS, spec 660/663 PASS (3 fail = 사전 device-required). + estimator curves key 적용 직접 확인 (2026-06-10).
 - **작성일**: 2026-04-27
-- **종결일**: 2026-05-19 (taxonomy rename) / 2026-05-21 (IPC dot prefix 후속)
+- **종결일**: 2026-05-19 (taxonomy rename) / 2026-05-21 (IPC dot prefix 후속) / **2026-06-10 (estimator curves key — 전체 종결)**
 
 ---
 
@@ -928,3 +926,47 @@
 - **담당**: PM 로드맵 검토 후 개봉/폐기 판정.
 
 > **범위 밖 확정(영구 보류, 어느 엔진이든 코어 작업)**: 모델 아키텍처 전환(TransMLA/X-EcoMLA/Mamba류 — "지원할 입력 모델 종류" 문제로 별도), 학습 필요(MatryoshkaKV/MoQAE/NSA/MoBA/CLA/YOCO), 멀티모달(FlowMM/AIM). 상세 판정표(~70개 기법 A/B/C + 근거)는 2026-06-10 세션 기록 — 필요 시 `.agent/research/`로 보존.
+
+---
+
+# Phase β 이관 — 4건 (2026-06-10 등록)
+
+> Phase β(decode loop rewrite, β-1~β-7) 진행 중 발견·이월된 잔여. 출처 = `.agent/todos/roadmap_beta_decode_loop_rewrite_2026_06_10.md`. β-1~6 은 **전부 비차단 사전존재 이슈**, γ-4 는 β-7 G3 ripple 격리용 의도적 이월.
+
+## [P3] test_backend 하네스 이슈 — MatMulTransposed 16 FAIL + MatMulSlice 8 FAIL + RoPE 2 ERROR — 2026-06-10 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음 (비차단)
+- **출처**: roadmap β-7 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:126`)
+- **Description**: S25 실측에서 `test_backend` 하네스가 MatMulTransposed 16건 FAIL + MatMulSlice 8건 FAIL + RoPE 2건 ERROR. **β 무관 사전존재 확정** — pre-β commit `6e52ac50` worktree 빌드로 동일 패턴 재현. production matmul 정상은 β-7 device sig 15/15 MATCH 가 증명(하네스 issue ≠ production 회귀).
+- **Acceptance Criteria**: 하네스 reference 산출 또는 비교 tolerance/shape 가정 정정으로 5 op(또는 해당 op) PASS 복구. production matmul/RoPE 무영향 확인(sig MATCH 유지).
+- **Notes**: 비차단. production 정확성은 device sig 가 ground truth.
+
+## [P3] INV-LAYER-001/002/003 만성 FAIL — `inv_layer_baseline.json` 재동결 — 2026-06-10 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음 (비차단)
+- **출처**: roadmap β-2 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:65`)
+- **Description**: spec suite 에서 INV-LAYER-001/002/003 만성 FAIL. 원인 = `inv_layer_baseline.json` 미갱신 (위반 동수 8/3/12). **β 무관 pre-existing 입증** — β-1 worktree 대조로 동일 위반 동수 확인. 코드 위반이 아니라 baseline 재동결만 필요한 별도 chore.
+- **Acceptance Criteria**: `engine/tests/spec/inv_layer_baseline.json` 의 001/002/003 baseline 을 현 위반 동수(8/3/12)로 재동결 → 3건 spec test PASS 복구.
+- **Notes**: 비차단. baseline-only chore (코드 무변경).
+
+## [P3] scripts/check_spec_coverage.sh 버그 2건 — octal 해석 + INV-DECODE-STAGE ID 추출 부재 — 2026-06-10 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음 (비차단)
+- **출처**: roadmap β-1 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:51`) + `handoff_beta_1_complete_beta_2_entry_2026_06_10.md:52`
+- **Description**: `scripts/check_spec_coverage.sh` 기존 버그 2건 (β-1 과 무관):
+  - **(1) `printf '%03d'` leading-zero octal 해석 버그** (line ~78/91) — leading-zero ID 가 octal 로 해석되어 잘못된 번호 산출.
+  - **(2) INV-DECODE-STAGE 시리즈 ID 추출 로직 부재** — 해당 시리즈가 coverage 추출에서 누락.
+- **Acceptance Criteria**: (1) `printf '%03d' "$((10#$id))"` 또는 동등 처리로 octal 회피, (2) INV-DECODE-STAGE 시리즈 ID 추출 추가 → coverage 정확 산출.
+- **Notes**: 비차단. 실제 line 번호는 착수 시 grep 재확인 (위 근사치).
+
+## [P2] γ-4: eval/batch orphan 처분 — `run_eval_ll` + `run_prompt_batch` — 2026-06-10 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: **γ-3(argus-eval/chat bin화)와 처분 방향 조율 선결** — eval 을 bin 으로 살릴지 orphan 삭제할지 결정 후 착수
+- **출처**: roadmap β-7 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:126`) + 후속 섹션 (:144) + `arch/pipeline_stage_design_v2.md` §9 γ-4
+- **Description**: `run_eval_ll`(`session/eval/runner.rs:16`) + `run_prompt_batch`(`session/batch/runner.rs:34`) 외부 호출처 0 (β-7 grep 확인). β-7 G3 삭제에서 ripple 격리를 위해 **의도적으로 이월**. Phase γ 의 γ-4 항목에 해당.
+- **Acceptance Criteria**: γ-3 방향 확정 후 — (a) eval 을 bin 으로 살리면 entry point 정착 + orphan 해소, 또는 (b) orphan 삭제 시 두 fn + 종속 dead code grep census 후 동반 삭제 + 컴파일 GREEN.
+- **Notes**: γ-3 과 처분 방향(살림 vs 삭제)이 상호 의존 — γ-3 선행/동행 권장. 담당 권장: Architect(γ-3 방향 결정) → Implementer(처분).
