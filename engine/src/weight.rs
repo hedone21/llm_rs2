@@ -22,6 +22,7 @@ pub mod setup;
 pub mod stage_ctx;
 pub mod stage_registry;
 pub mod swap_executor;
+pub mod weight_swap_handler;
 
 pub use async_swap::{AsyncSwapDispatcher, SwapCommitJob, SwapJob};
 pub use decider::{SwapAlgorithm, SwapDecision, WeightSwapDecider, compute_qcf_weight_swap};
@@ -37,3 +38,4 @@ pub use stage_ctx::WeightStageModelCtx;
 pub use swap_executor::{
     StageBreakdown, SwapError, SwapExecutor, SwapReport, SwappedLayer, dtype_tag_to_dtype,
 };
+pub use weight_swap_handler::WeightSwapHandler;

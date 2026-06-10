@@ -76,10 +76,10 @@ LAYER_RULES = [
     # 의존(L3→L3)하므로 L2 로 박으면 향후 INV-LAYER-002 오탐이 난다 — 올바른 layer 분류
     # (전용 도메인 vs L4 vs 수평-허용 규칙)는 실 Stage 가 입주하는 Phase α-K 에서 확정한다.
 
-    # L3-pressure: KV cache 관리, eviction, offload, swap handler
-    # γ-1: pressure/ → kv/ (KV 도메인) + weight/ (weight swap 도메인) 분리.
-    ("kv",                      "L3-pressure"),
-    ("weight",                  "L3-pressure"),
+    # L3-kv: KV cache 관리, eviction, offload (γ-1 라벨 분리)
+    # L3-weight: weight swap 오케스트레이션 (γ-1 라벨 분리)
+    ("kv",                      "L3-kv"),
+    ("weight",                  "L3-weight"),
 
     # L3-inference: 추론 연산 도메인
     # Step 4-C: sampling/skip_config/speculative/attention_scores promoted to engine/src/inference/
@@ -144,6 +144,7 @@ def classify_module(rel_path: str) -> str:
                     "model_config.rs", "layer_boundary_hook.rs",
                     "runtime_resources_access.rs",
                     "action_diag_helper.rs",
+                    "action_result.rs",
                     # Phase α-W: 확장 파이프라인 L2 추상화 (§2.1 규칙 A — top-level 형제)
                     "capability.rs", "format.rs", "hardware.rs", "pipeline.rs"}
     if norm in TOP_LEVEL_L2:
@@ -158,7 +159,7 @@ def classify_import(import_path: str) -> str:
     """
     `use crate::foo::bar` 또는 인라인 `crate::foo::bar`에서 foo::bar 부분을
     layer로 분류.
-    예: "core::pressure::..." → "L3-pressure"
+    예: "kv::..." → "L3-kv", "weight::..." → "L3-weight"
          "backend::opencl::..." → "L1"
          "backend::Backend"    → "L2" (Step 4-A: top-level trait file)
     """
@@ -182,6 +183,7 @@ def classify_import(import_path: str) -> str:
                     "quant", "thread_pool", "op_kind", "partition_workspace",
                     "kv_cache_ops", "yield_policy",
                     "runtime_resources_access", "action_diag_helper",
+                    "action_result",
                     # Phase α-W: 확장 파이프라인 L2 추상화 (LAYER_RULES fallback 과 일치 유지)
                     "capability", "format", "hardware", "pipeline"):
         return "L2"
@@ -193,7 +195,7 @@ def classify_import(import_path: str) -> str:
 # 위반 판정 규칙 (INV-LAYER-001~005)
 # ────────────────────────────────────────────────────────────────────
 
-_L3_DOMAINS = ("L3-pressure", "L3-inference", "L3-qcf")
+_L3_DOMAINS = ("L3-kv", "L3-weight", "L3-inference", "L3-qcf")
 
 
 def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str | None, str | None, str | None]:
@@ -204,7 +206,7 @@ def check_violation(src_layer: str, dst_layer: str, src_rel: str) -> tuple[str |
     """
     # INV-LAYER-001: L1 backend → L2(shared/buffer/memory/auf) + cross-cutting 외 import 금지
     # 허용: L1→L2, L1→L1(동일 backend 내부), L1→observability, L1→resilience, L1→L3-core(Backend trait)
-    # 금지: L1→L3-pressure, L1→L3-inference, L1→L3-qcf, L1→L4, L1→L5
+    # 금지: L1→L3-kv, L1→L3-weight, L1→L3-inference, L1→L3-qcf, L1→L4, L1→L5
     if src_layer == "L1":
         if dst_layer in (*_L3_DOMAINS, "L4", "L5"):
             # V-01: L1→cross-cutting concrete (resilience임에도 concrete 직접 import)
@@ -630,7 +632,7 @@ KNOWN_V_MAP = [
     # V-13: kv/kivi_cache.rs → backend::cpu/opencl (L3→L1), qcf:: (Step 4-B path)
     (r"kv/kivi_cache\.rs",               r"backend::",                  "V-13"),
     (r"kv/kivi_cache\.rs",               r"qcf::",                      "V-13"),
-    # V-13(b): kv/mod.rs → qcf:: (L3-pressure→L3-inference)
+    # V-13(b): kv/mod.rs → qcf:: (L3-kv→L3-qcf cross-domain)
     (r"kv/mod\.rs",                      r"qcf::",                      "V-13"),
     # V-14: qcf/, kv/kivi_cache, inference/sampling → profile:: (L3→observability concrete)
     (r"(qcf/(unified_qcf|layer_importance|qcf_kv)|kv/kivi_cache|inference/sampling)", r"profile::", "V-14"),
@@ -652,13 +654,13 @@ KNOWN_V_MAP = [
     (r"models/transformer\.rs",          r"profile::",                  "V-22"),
     # V-23: models/transformer.rs, models/weights/ → auf:: (→shared/auf/ 이동 전 L3→cross-cutting)
     (r"models/(transformer|weights/)",   r"auf::",                      "V-23"),
-    # V-24: kv/weight_swap_handler.rs → models:: (Pressure→Inference cross, Step 4-D path)
-    (r"kv/weight_swap_handler\.rs",      r"models::",               "V-24"),
-    # V-24(b): kv/weight_swap_handler.rs → backend::cpu::CpuBackend
-    (r"kv/weight_swap_handler\.rs",      r"backend::cpu::CpuBackend", "V-24"),
-    # V-24(c): kv/weight_swap_handler.rs → memory::galloc
-    (r"kv/weight_swap_handler\.rs",      r"memory::galloc",         "V-24"),
-    # V-25: models/weights/swap_executor.rs → layers::transformer_layer (L3-pressure→L3-inference concrete)
+    # V-24: weight/weight_swap_handler.rs → models:: (L3-weight→L3-inference cross, γ-1 이동)
+    (r"weight/weight_swap_handler\.rs",  r"models::",               "V-24"),
+    # V-24(b): weight/weight_swap_handler.rs → backend::cpu::CpuBackend
+    (r"weight/weight_swap_handler\.rs",  r"backend::cpu::CpuBackend", "V-24"),
+    # V-24(c): weight/weight_swap_handler.rs → memory::galloc
+    (r"weight/weight_swap_handler\.rs",  r"memory::galloc",         "V-24"),
+    # V-25: models/weights/swap_executor.rs → layers::transformer_layer (L3-weight→L3-inference concrete)
     (r"models/weights/(swap_executor|intra_forward_swap|phase_aware_swap)", r"layers::", "V-25"),
     # V-25(b): models/weights/swap_executor.rs → models::transformer (self-domain monolith)
     (r"models/weights/swap_executor\.rs", r"models::transformer",       "V-25"),
@@ -666,7 +668,7 @@ KNOWN_V_MAP = [
     (r"models/weights/swap_executor\.rs", r"backend::opencl::host_ptr_pool", "V-25"),
     # V-25(d): models/weights/swap_executor.rs → profile::
     (r"models/weights/swap_executor\.rs", r"profile::",                 "V-25"),
-    # V-25(e): models/loader.rs → weight:: (γ-1 rename 후 L3-inference→L3-pressure cross, 구 pressure::weights 동일)
+    # V-25(e): models/loader.rs → weight:: (γ-1 rename 후 L3-inference→L3-weight cross)
     (r"models/loader\.rs",               r"weight::",                   "V-25"),
     # V-25(f): models/transformer.rs → weight:: (γ-1 rename 후 self-domain weight swap, 구 pressure::weights 동일)
     (r"models/transformer\.rs",          r"weight::",                   "V-25"),

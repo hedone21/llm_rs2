@@ -23,7 +23,7 @@ use crate::model_config::ModelConfig;
 use crate::models::weights::{LayerSlot, SecondaryMmap};
 use crate::weight::swap_executor::SwapExecutor;
 
-use super::ActionResult;
+use crate::action_result::ActionResult;
 
 /// Shared model references needed by `WeightSwapHandler` without requiring
 /// `Arc<TransformerModel>` (the model is owned directly in `generate.rs`).

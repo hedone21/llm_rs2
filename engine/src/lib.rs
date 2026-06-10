@@ -4,6 +4,7 @@ compile_error!("Features 'opencl' and 'cuda' are mutually exclusive. Enable only
 compile_error!("Features 'opencl' and 'cuda-embedded' are mutually exclusive. Enable only one.");
 
 pub mod action_diag_helper;
+pub mod action_result;
 pub mod auf;
 pub mod backend;
 pub mod buffer;

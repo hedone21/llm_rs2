@@ -18,7 +18,6 @@ use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::kv::ActionResult;
-use llm_rs2::kv::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
@@ -26,6 +25,7 @@ use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
+use llm_rs2::weight::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
 use llm_rs2::weight::{SwapAlgorithm, WeightSwapDecider, compute_qcf_weight_swap};
 use llm_shared::DtypeTag;
 
