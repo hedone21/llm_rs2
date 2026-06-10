@@ -977,9 +977,9 @@
 
 > γ-1(commit `7fe1fe8b`, `pressure/`→`kv/` + `pressure/weights/`→`weight/` rename) 후 발견된 문서 잔여 3건. 단순 anchor 치환으로 끝나지 않는(spec 의미 변경 / 미실현 우산 구조 / 실위치 미반영) 항목만 분리. **출처**: γ-1 문서 anchor 정오 작업(2026-06-10)의 Architect 보존 판단 보고. **참고**: `layer_lint.py` LAYER_RULES 는 γ-1 commit A 에서 이미 `kv`/`weight` 로 갱신 완료(본 그룹 범위 밖).
 
-## [P2] spec L3 도메인 재정의 — INV-LAYER-003 + §6 도메인 표 + INV-RPCMEM 열거 stale — 2026-06-10 등록
-- **Status**: TODO
-- **Sprint**: backlog
+## [RESOLVED] spec L3 도메인 재정의 — INV-LAYER-003 + §6 도메인 표 + INV-RPCMEM 열거 stale — 2026-06-10 등록 / 2026-06-11 종결
+- **Status**: RESOLVED (2026-06-11) — spec 4-도메인 {`kv/`, `weight/`, `inference/`, `qcf/`} 개정 + 동반 코드 이동 완료. 커밋 `08114da8`(refactor) + `65c867ad`(docs).
+- **Sprint**: completed
 - **Dependencies**: 없음
 - **출처**: γ-1 문서 anchor 정오 작업(2026-06-10) Architect 보존 판단 보고
 - **Description**: γ-1 rename 후 spec 의 L3 도메인 열거가 stale (실제 = {`kv/`, `weight/`, `inference/`, `qcf/`}):
@@ -988,19 +988,24 @@
   - INV-RPCMEM 의 "L3(`models/`, `pressure/`, `inference/`)" 열거
   - **단순 anchor 정오가 아니라 spec 의미 변경** — `pressure/` 단일 도메인이 `kv/`+`weight/` 2 도메인으로 분리된 것을 spec 불변식 정의에 반영해야 함. `/spec-manage` 작업 필요.
 - **Acceptance Criteria**: 3 spec 위치의 L3 도메인 열거가 실제 모듈 구조({`kv/`, `weight/`, `inference/`, `qcf/`})와 정합 + spec test/coverage GREEN.
-- **Notes**: `layer_lint.py` LAYER_RULES 는 γ-1 commit A 에서 이미 갱신됨(본 항목은 spec 문서 측만). 담당 권장: Architect(/spec-manage).
+- **적용 결과 (2026-06-11)**:
+  - spec 개정: `spec/01-architecture.md` SYS-100/101/104 + `spec/41-invariants.md` INV-LAYER-001/002/003 + ENG-RPCMEM-C04 — 4-도메인 {`kv/`, `weight/`, `inference/`, `qcf/`} 반영.
+  - 동반 코드: `weight_swap_handler` → `weight/` 이동 + `ActionResult` §13.8-G L2 격상(`engine/src/action_result.rs` 신설) + `layer_lint` 라벨 L3-kv/L3-weight 분리.
+  - 커밋: `08114da8`(refactor) + `65c867ad`(docs).
+  - 검증: Tester 독립 검증 PASS (lint 위반 전후 file:line 집합 일치, 신규 위반 0).
+- **Notes**: `layer_lint.py` LAYER_RULES 는 γ-1 commit A 에서 이미 갱신됨(본 항목은 spec 문서 측 + 동반 코드 이동). 담당: Architect(/spec-manage).
 
-## [P3] arch 미실현 우산 구조 재작성 — §6.3 `pressure/policy/`·`pressure/state/` + §13.4/§13.6 — 2026-06-10 등록
-- **Status**: TODO
+## [P3] arch 미실현 우산 구조 재작성 — 잔여 `ARCHITECTURE.md` §13.4/§13.6 — 2026-06-10 등록 / 2026-06-11 부분 해소
+- **Status**: TODO (부분 해소 — `arch/01-architecture.md` §6.3 완료, 잔여 `ARCHITECTURE.md` §13.4/§13.6 만 남음)
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: γ-1 문서 anchor 정오 작업(2026-06-10) Architect 보존 판단 보고
 - **Description**: 다음 arch 위치가 **미실현 계획 구조**를 기재하고 있어 γ-1 단순 치환으로 정합 불가(치환하면 `kv/policy/` 로 여전히 stale):
-  - `arch/01-architecture.md` §6.3 의 `pressure/policy/`·`pressure/state/` 우산 서브구조
-  - `ARCHITECTURE.md` §13.4 확장 가이드 / §13.6 마이그레이션 표·다이어그램
+  - ~~`arch/01-architecture.md` §6.3 의 `pressure/policy/`·`pressure/state/` 우산 서브구조~~ — **완료 (`65c867ad`)**: 실 코드 평면 구조(`kv/` + `weight/`)로 재작성.
+  - **[잔여]** `ARCHITECTURE.md` §13.4 확장 가이드 / §13.6 마이그레이션 표·다이어그램
   - 실제는 flat `kv/eviction/` 구조 — 계획했던 우산(policy/state) 층이 실현되지 않음.
-- **Acceptance Criteria**: §6.3 + §13.4/§13.6 을 **실제 flat `kv/eviction/` 구조 기준으로 재작성** (미실현 우산 서술 제거 또는 "계획" 명시).
-- **Notes**: 단순 rename 치환 금지(stale 잔존). 구조 기술 재작성 필요. 담당 권장: Architect.
+- **Acceptance Criteria**: 잔여 `ARCHITECTURE.md` §13.4/§13.6 을 **실제 flat `kv/eviction/` 구조 기준으로 재작성** (미실현 우산 서술 제거 또는 "계획" 명시).
+- **Notes**: 단순 rename 치환 금지(stale 잔존). 구조 기술 재작성 필요. §6.3 은 2026-06-11 `65c867ad` 에서 해소됨. 담당 권장: Architect.
 
 ## [P3] Sprint C 미반영 weight swap 위치 표기 — Precision Swap 다이어그램 + qcf_taxonomy.md — 2026-06-10 등록
 - **Status**: TODO
