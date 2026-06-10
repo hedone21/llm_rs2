@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm.rs Engine Guide — 목차</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<header>
+<h1>llm.rs Engine Guide</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<section>
+<h2>이 가이드에 대해</h2>
+<p>
+llm.rs(저장소명 <code>llm_rs2</code>) 추론 엔진의 온보딩 가이드다. 연구실 구성원이 코드 리뷰·구현·개선
+작업에 진입할 때 필요한 시스템 지도, 도메인 어휘, 확장 절차를 12개 챕터로 제공한다.
+독자는 Rust 중급(문법 설명 없음)과 LLM 추론 기초(attention, KV cache 개념)를 갖췄다고 가정한다.
+모든 챕터는 기준 커밋의 <strong>코드만 근거로 독립 작성</strong>되었다 — 본문의 각 주장에는
+실제 코드 심볼 위치(<code>파일::심볼 (L행)</code>)가 근거로 달려 있다.
+</p>
+</section>
+
+<section>
+<h2>시스템 한눈에 보기</h2>
+<pre class="mermaid">
+flowchart TB
+  subgraph dev["디바이스 (Android / Linux 호스트)"]
+    subgraph eng["Engine 프로세스 — argus_cli (llm_rs2)"]
+      sess["session\nDecodeLoop"]
+      model["models\nforward / forward_into"]
+      be["backend (trait Backend)\nCPU NEON · OpenCL · CUDA"]
+      pres["pressure\nKVCache + CachePressurePipeline"]
+      res["resilience\nCommandExecutor"]
+      sess --> model --> be
+      sess --> pres
+      res --> sess
+    end
+    subgraph mgr["Manager 프로세스 — llm_manager"]
+      mon["monitor → policy"]
+    end
+    mon -- "ManagerMessage::Directive (IPC)" --> res
+    res -- "EngineMessage (heartbeat · QCF)" --> mgr
+  end
+  plug["technique .so plugin\n--load-plugin (dlopen)"] -. "stage/format 등록" .-> sess
+</pre>
+<p>
+두 프로세스(Engine ⊥ Manager, 결합은 IPC뿐) 위에서 Format(저장 표현) ⊥ Stage(관리 동작) ⊥
+Hardware(실행 위치) 3축이 직교한다. 전체 지도는 <a href="01_overview.html">01장</a>,
+축의 정의는 <a href="02_terminology.html">02장</a> 참조.
+</p>
+</section>
+
+<section>
+<h2>챕터 목차</h2>
+<div class="toc-grid">
+<div class="toc-card"><a href="01_overview.html">01. 시스템 개요</a><p>두 프로세스·세 축·토큰당 8단계 루프의 전체 지도</p></div>
+<div class="toc-card"><a href="02_terminology.html">02. 도메인 용어</a><p>Format ⊥ Stage ⊥ Hardware 3축과 핵심 enum 어휘 사전</p></div>
+<div class="toc-card"><a href="03_code_map.html">03. 코드베이스 지도</a><p>engine/src 41개 모듈 책임표 + 의존 그래프 + 워크스페이스 구조</p></div>
+<div class="toc-card"><a href="04_inference_pipeline.html">04. 추론 파이프라인</a><p>Prefill/Decode 경로와 GQA·plan 핫패스 해부</p></div>
+<div class="toc-card"><a href="05_abstractions.html">05. 핵심 추상화 카탈로그</a><p>5대 trait의 시그니처·계약·구현체·설계 동기</p></div>
+<div class="toc-card"><a href="06_memory.html">06. 메모리 &amp; 데이터 포맷</a><p>버퍼 계층·zero-copy 두 갈래·quant 블록 바이트 해부</p></div>
+<div class="toc-card"><a href="07_kv_cache.html">07. KV 캐시 구조와 관리</a><p>KV cache 레이아웃·2-tier 압력 관리·eviction/양자화 내부</p></div>
+<div class="toc-card"><a href="08_resilience_ipc.html">08. Resilience &amp; IPC</a><p>Manager IPC 신호→명령→엔진 반응 전 경로 해부</p></div>
+<div class="toc-card"><a href="09_backends.html">09. 백엔드 구현</a><p>Backend trait 계약과 CPU/OpenCL/plugin 3경로 디스패치 해부</p></div>
+<div class="toc-card"><a href="10_howto_extend.html">10. 확장 How-to</a><p>핸들러·정책·백엔드·모델 4축 확장 절차와 등록 지점 전수</p></div>
+<div class="toc-card"><a href="11_dev_workflow.html">11. 개발 워크플로우</a><p>빌드·크로스컴파일·테스트 계층·성능 측정 함정</p></div>
+<div class="toc-card"><a href="12_review_checklist.html">12. 컨벤션 &amp; 리뷰 체크리스트</a><p>단위·레이아웃·위치 불변식과 PR 리뷰 체크리스트</p></div>
+</div>
+</section>
+
+<section>
+<h2>역할별 읽기 경로</h2>
+<ul>
+<li><strong>처음 합류 (전체 조망)</strong> —
+<a href="01_overview.html">01</a> → <a href="02_terminology.html">02</a> → <a href="03_code_map.html">03</a>.
+이후 아래 두 경로 중 하나로 분기한다.</li>
+<li><strong>코드 리뷰부터 시작</strong> —
+<a href="02_terminology.html">02</a> → <a href="03_code_map.html">03</a> →
+<a href="05_abstractions.html">05</a> → <a href="12_review_checklist.html">12</a>.
+이 코드베이스의 PR 지적 1위는 버그가 아니라 용어·불변식 위반이다 — 02와 12의 안티패턴 표가 리뷰 무기다.</li>
+<li><strong>구현·개선 시작</strong> —
+<a href="02_terminology.html">02</a> → <a href="03_code_map.html">03</a> →
+<a href="04_inference_pipeline.html">04</a> → 해당 영역 챕터(메모리 <a href="06_memory.html">06</a> ·
+KV 캐시 <a href="07_kv_cache.html">07</a> · IPC <a href="08_resilience_ipc.html">08</a> ·
+백엔드 <a href="09_backends.html">09</a>) → <a href="10_howto_extend.html">10</a> →
+<a href="11_dev_workflow.html">11</a>.</li>
+</ul>
+</section>
+
+</main>
+<footer class="pagenav"><span></span><span><a href="01_overview.html">01. 시스템 개요 →</a></span></footer>
+</body>
+</html>

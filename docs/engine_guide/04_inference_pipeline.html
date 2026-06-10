@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04. 추론 파이프라인 — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 04</span></nav>
+<header>
+<h1>04. 추론 파이프라인</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<section>
+<h2>1. 한눈에 보는 계층 구조</h2>
+<p>
+추론 한 번은 다섯 계층을 수직으로 관통한다. 위에서부터 <strong>session 계층</strong>(루프 소유·정책 훅),
+<strong>모델 계층</strong>(<code>TransformerModel::forward_into</code> — embedding→layer loop→lm_head 오케스트레이션),
+<strong>레이어 계층</strong>(<code>TransformerLayer</code> — RMSNorm→QKV→RoPE→attention→FFN의 본체),
+<strong>format 계층</strong>(<code>KVCacheFormat</code> trait object — KV write와 attention을 저장 형태별로 캡슐화),
+마지막으로 <strong>backend 계층</strong>(<code>Backend</code> trait — matmul/rope/attention 커널 dispatch)이다.
+이 챕터는 위 세 계층 + format 호출 표면까지를 다룬다. format 구현체 내부는 <a href="07_kv_cache.html">07장</a>,
+backend 커널은 <a href="09_backends.html">09장</a> 참조.
+</p>
+<pre class="mermaid">
+flowchart TD
+    subgraph S["session 계층 (engine/src/session/)"]
+        HAPPY["run_standard_happy_path"] --> LOOP["DecodeLoop (run / prefill)"]
+        LOOP --> MF["ModelForward (Forward impl)"]
+    end
+    subgraph M["models 계층 (engine/src/models/)"]
+        FWD["TransformerModel::forward_into"]
+        PLAN["build_plan / execute_plan (OpenCL 전용)"]
+    end
+    subgraph L["layers 계층 (engine/src/layers/)"]
+        GEN["forward_gen_fmt (decode, seq_len=1)"]
+        PRE["forward_prefill_fmt (prefill, seq_len 초과 1)"]
+    end
+    subgraph F["format 계층"]
+        FMT["StandardFormat: KVCacheFormat impl"]
+    end
+    subgraph B["backend 계층"]
+        BE["Backend trait (CPU NEON / OpenCL / CUDA)"]
+    end
+    MF -->|"plan miss 폴백"| FWD
+    MF -->|"plan hit (decode)"| PLAN
+    FWD -->|"seq_len == 1"| GEN
+    FWD -->|"seq_len 초과 1"| PRE
+    GEN -->|"write_kv / attention_into"| FMT
+    PRE -->|"write_kv_batch / attention_into"| FMT
+    GEN -->|"matmul, rope, norm"| BE
+    PRE -->|"matmul, rope, norm"| BE
+    FMT --> BE
+</pre>
+<div class="note">
+<strong>역사적 명칭 주의.</strong> 과거 메모리·문서에 나오는 "Prefill = <code>model.forward()</code>, Decode = <code>model.forward_into()</code>" 구분과
+generic <code>forward_gen&lt;C: KVCacheOps&gt;</code> / <code>forward_prefill&lt;C&gt;</code> 경로는 현재 코드에 <strong>없다</strong>.
+Phase α-K에서 KVCacheFormat trait-object fork가 production 유일 경로가 되면서(<code>model_forward.rs</code> 주석 "5-F: fmt 가 production 유일 경로(OLD forward_into&lt;C&gt; 폐기)")
+prefill/decode 모두 단일 <code>forward_into()</code>가 <code>seq_len</code>으로 분기한다. <code>LlamaModel</code>·<code>LlamaLayer</code>는
+<code>TransformerModel</code>·<code>TransformerLayer</code>의 backward-compat alias일 뿐이다.
+</p>
+</div>
+<p class="evidence">근거: <code>engine/src/models/llama/llama_model.rs</code> (pub use ... TransformerModel as LlamaModel), <code>engine/src/layers/llama_layer.rs::LlamaLayer</code> (type alias), <code>engine/src/session/forward/model_forward.rs::ModelForward</code> 필드 주석</p>
+</section>
+
+<section>
+<h2>2. session 계층 — 누가 루프를 소유하는가</h2>
+
+<h3>2.1 standard happy path와 DecodeLoop</h3>
+<p>
+단일 프롬프트 추론(<code>argus_cli</code>)의 표준 경로는 <code>run_standard_happy_path()</code>다.
+이 함수는 <code>build_standard_loop()</code>로 <code>DecodeLoop</code>를 조립한 뒤
+<code>decode_loop.prefill(&amp;tokens)</code> → 마지막 logits에서 <code>sampling::sample()</code>로 첫 토큰 산출 →
+<code>decode_loop.run(num_tokens - 1, first_token)</code> 순으로 실행하고,
+<code>TTFT</code> / <code>Decode: X ms/tok</code> / <code>Avg TBT</code>를 출력한다.
+단, 이 경로는 <code>is_standard_happy_path()</code> 가드를 통과한 경우에만 쓰인다 —
+<code>qcf_dump</code>·<code>skip_ratio</code>·<code>d2o_layer_alloc</code>·<code>profile</code>·<code>profile_events</code>·
+<code>eviction_policy != "none"</code>·<code>tensor_partition != 0</code>·swap 계열 플래그 중 하나라도 켜지면 legacy 경로로 빠진다.
+</p>
+<p class="evidence">근거: <code>engine/src/session/standard_happy.rs::run_standard_happy_path</code>, <code>engine/src/session/assembly/build_standard_loop.rs::is_standard_happy_path</code> (L60)</p>
+
+<p>
+<code>DecodeLoop</code>는 decode 루프 그 자체를 소유하는 구조체로, 7개 trait object를 들고 있다:
+<code>Forward</code>(필수, typestate builder가 강제), <code>EvictionStage</code>, <code>SwapStage</code>,
+<code>CommandSource</code>, <code>TokenSampler</code>, <code>Vec&lt;DecodeObserver&gt;</code>, <code>TokenTickSink</code>(+<code>EngineReport</code>).
+미지정 슬롯은 <code>defaults.rs</code>의 NoOp 구현으로 채워진다. <code>run()</code>의 step당 순서는 코드 주석 라벨 그대로:
+</p>
+<table>
+<tr><th>단계</th><th>호출</th><th>역할</th></tr>
+<tr><td>(a)</td><td><code>cmd_source.poll(ctx, kv_snap)</code></td><td>resilience ExecutionPlan 수신 — suspend면 break, throttle이면 sleep</td></tr>
+<tr><td>(a.5)</td><td><code>forward.try_evict(...)</code></td><td><code>plan.evict</code>가 Some이고 첫 발동이면 mid-decode KV prune (sticky 1회 게이트 <code>evict_applied</code>)</td></tr>
+<tr><td>(a.6)</td><td><code>forward.try_offload / try_recall</code></td><td>resilience KvOffload/RestoreDefaults — prefix를 disk로 swap/복귀</td></tr>
+<tr><td>(b)</td><td><code>eviction.before_step(ctx)</code></td><td>EvictionStage 실행. <code>Pruned{new_pos}</code>면 <code>self.pos = new_pos</code> + <code>forward.on_kv_prune()</code></td></tr>
+<tr><td>(c)</td><td><code>swap.before_step(ctx)</code></td><td>weight swap prefetch</td></tr>
+<tr><td>(d)</td><td><code>forward.step(ctx, prev_token)</code></td><td><strong>forward pass 1회</strong> — logits 반환, wall-clock 측정</td></tr>
+<tr><td>(e)</td><td><code>swap.after_step(ctx)</code></td><td>swap commit/release</td></tr>
+<tr><td>(f)</td><td><code>sampler.sample(ctx, logits)</code> + <code>observe_token</code></td><td>토큰 샘플링, rep-penalty history 갱신</td></tr>
+<tr><td>(f2)/(g)</td><td><code>tick_sink</code> / <code>observers</code></td><td>per-token 보고·관측</td></tr>
+<tr><td>(h)</td><td>target TBT pacing</td><td><code>plan.target_tbt_ms</code> 도달까지 sleep (resilience SetTargetTbt)</td></tr>
+</table>
+<p>
+step 끝에서 <code>pos += 1</code>, <code>decode_step += 1</code>, <code>prev_token = sampled</code>.
+즉 <strong>eviction·swap 같은 Stage 동작은 forward 호출 "사이"에 caller(DecodeLoop) 책임으로 끼어든다</strong> — 모델/레이어 코드는 이를 전혀 모른다.
+chat 모드는 같은 골격의 <code>run_until_stop()</code>을 쓰되 stop token 체크가 추가되고 <code>finalize()</code>를 호출하지 않는다(멀티턴 재사용).
+</p>
+<p class="evidence">근거: <code>engine/src/session/decode_loop.rs::DecodeLoop::run</code> (L124–346), <code>::run_until_stop</code> (L356), <code>engine/src/session/traits.rs::Forward</code> (L69)</p>
+
+<h3>2.2 ModelForward — Forward trait의 표준 구현</h3>
+<p>
+<code>Forward</code> trait의 계약은 <code>prefill(tokens, start_pos) -&gt; Vec&lt;f32&gt;</code>(마지막 토큰 logits)와
+<code>step(ctx, token) -&gt; Vec&lt;f32&gt;</code> 두 메서드가 핵심이고, 나머지(<code>on_kv_prune</code>/<code>reset_kv</code>/<code>try_evict</code> 등)는 default no-op이다.
+표준 구현 <code>ModelForward</code>는 backend·memory·model <code>Arc</code>·KV cache·decode workspace·재사용 logits 텐서를 모두 소유한다.
+KIVI용 <code>KiviForward</code>, 토큰 스트리밍 offload용 <code>OffloadForward</code>가 같은 trait의 다른 구현이다.
+</p>
+<p>
+<code>ModelForward</code>의 핵심 동작 세 가지:
+</p>
+<ul>
+<li><strong>fmt wrap (1회, lazy)</strong> — <code>ensure_fmt_wrapped()</code>가 prefill 시작 시 <code>Vec&lt;KVCache&gt;</code>를
+<code>mem::take</code>로 비우고 <code>Vec&lt;Arc&lt;StandardFormat&gt;&gt;</code>로 감싼다(layer index = enumerate 순서).
+물리 캐시는 fmt 안에 단 한 벌만 존재하고, 이후 forward·eviction 모두 interior mutability(<code>Mutex</code>)로 <code>&amp;self</code>를 통과한다.</li>
+<li><strong>prefill 청크 분할</strong> — <code>derive_chunk_size()</code>가 GPU <code>max_single_alloc</code>으로부터
+<code>min(budget/(vocab*4), max_alloc/(hidden*4), 512, seq_len)</code>을 산출, 긴 프롬프트를 청크 루프로 나눠
+각 청크를 <code>forward_into(logits_last_only=true)</code>로 처리한다. CPU는 분할 없음.</li>
+<li><strong>plan-first decode</strong> — <code>step()</code>은 OpenCL일 때 사전 바인딩된 GPU 커널 plan을 먼저 시도하고(§6),
+실패·invalidation 시 <code>forward_into</code>(trait object 경로)로 폴백한다. 마지막에 <code>read_logits()</code>가
+<code>backend.synchronize()</code> 후 <code>[1,1,vocab]</code> logits를 host로 읽는다 — <strong>이 synchronize가 토큰당 유일한 강제 sync 지점</strong>이다.</li>
+</ul>
+<pre><code>// engine/src/session/traits.rs
+pub trait Forward {
+    fn prefill(&amp;mut self, tokens: &amp;[u32], start_pos: usize) -&gt; anyhow::Result&lt;Vec&lt;f32&gt;&gt;;
+    fn step(&amp;mut self, ctx: &amp;StepCtx, token: u32) -&gt; anyhow::Result&lt;Vec&lt;f32&gt;&gt;;
+    // finalize / on_kv_prune / reset_kv / try_evict / try_offload / try_recall = default
+}</code></pre>
+<p class="evidence">근거: <code>engine/src/session/forward/model_forward.rs::ModelForward::{ensure_fmt_wrapped, derive_chunk_size, prefill, step, read_logits}</code></p>
+
+<div class="note">
+<p><strong>L2 확장 어휘 <code>pipeline.rs</code>는 아직 미배선.</strong> <code>engine/src/pipeline.rs</code>의
+<code>PipelineStage</code>/<code>Pressure</code>(0~100 scalar)/<code>LifecyclePhase</code>는 Phase α-W에서 신설된 additive 타입으로,
+파일 헤더가 명시하듯 "아직 live decode loop(v1 7-trait)에 배선되지 않았다". 현재 살아있는 루프 훅은 위 7-trait이고,
+단일 <code>PipelineStage</code>로의 전환은 Phase β 계획이다. 상세는 <a href="05_abstractions.html">05장</a>.</p>
+</div>
+<p class="evidence">근거: <code>engine/src/pipeline.rs</code> 모듈 doc (L1–11), <code>::PipelineStage</code> (L165)</p>
+</section>
+
+<section>
+<h2>3. 모델 레벨 — forward_into의 Prefill/Decode 분기</h2>
+<p>
+<code>TransformerModel::forward_into(TransformerModelForwardArgs)</code>가 prefill과 decode를 모두 처리하는 단일 진입점이다.
+인자 구조체의 핵심 필드는 <code>input_tokens</code>(U32 <code>[batch, seq_len]</code>), <code>start_pos</code>,
+<code>fmts: &amp;[Arc&lt;dyn KVCacheFormat&gt;]</code>(레이어당 1개), <code>logits_out</code>, <code>x_gen</code>(decode 전용 hidden scratch),
+<code>workspace: Option&lt;&amp;mut LayerWorkspace&gt;</code>, <code>logits_last_only</code>이며,
+eval 전용으로 <code>score_accumulator</code>/<code>skip_config</code>/<code>importance_collector</code>/<code>cache_self_need_scores</code>가 있다
+(production <code>ModelForward</code>는 전부 None/false 주입).
+</p>
+<p>분기 기준은 단 하나다: <code>let is_decode = seq_len == 1;</code></p>
+<table>
+<tr><th></th><th>Prefill (seq_len &gt; 1)</th><th>Decode (seq_len == 1)</th></tr>
+<tr><td>hidden 버퍼 x</td><td><code>[batch, seq_len, hidden]</code> 신규 alloc</td><td>caller의 <code>x_gen</code> 재사용 (<code>[1,1,hidden]</code>)</td></tr>
+<tr><td>workspace</td><td>함수가 <code>PrefillWorkspace</code>를 owned로 alloc (drop 전 GPU <code>synchronize</code>)</td><td>caller의 <code>LayerWorkspace</code> (없으면 <code>expect</code> panic — 단 발산 A 예외)</td></tr>
+<tr><td>per-layer 호출</td><td><code>forward_prefill_fmt</code></td><td><code>forward_gen_fmt</code></td></tr>
+<tr><td>KV write</td><td><code>fmt.write_kv_batch</code> (multi-token)</td><td><code>fmt.write_kv</code> (single)</td></tr>
+<tr><td>lm_head</td><td><code>logits_last_only=true</code>면 마지막 토큰 hidden만 <code>copy_slice</code> 후 matmul (장문 prefill에서 GPU 메모리 절약)</td><td>전체 (1 토큰)</td></tr>
+<tr><td>score 누적</td><td>안 함</td><td><code>score_accumulator</code> 활성 시 layer loop 끝에서 <code>accumulate_layer[_gqa]</code></td></tr>
+</table>
+<p>
+공통 골격: ① <code>gather_embed</code>(embedding lookup, <code>embed_scale</code> 옵션) → ② layer loop —
+레이어마다 <code>self.layers[i].load_weights()</code>로 per-token weight snapshot을 떠서(<code>Arc&lt;TransformerLayer&gt;</code>, weight swap과의 경합 차단)
+SWIFT skip 플래그·Gemma3 local/global RoPE theta를 계산해 fmt fork에 위임 → ③ final <code>rms_norm</code> → ④ lm_head matmul
+(<code>lm_head_on_cpu</code>면 CPU 경로). Gemma3는 <code>is_local_layer(i, sliding_window_pattern)</code>로 레이어별 SWA 여부와
+<code>rope_local_theta</code>를 골라 넘긴다.
+</p>
+<p class="evidence">근거: <code>engine/src/models/transformer.rs::forward_into</code> (L1366–1670), <code>::TransformerModelForwardArgs</code> (L169)</p>
+
+<div class="warn">
+<p><strong>발산 A: decode인데 workspace가 None이면 prefill 경로를 탄다.</strong>
+<code>is_decode &amp;&amp; workspace.is_none()</code>이면 1-token degenerate <code>forward_prefill_fmt</code>로 fall-through한다
+(L1473–1512). 주석에 따르면 warmup(<code>warmup_tokens=1</code>)·qcf decode 경유만 이 분기에 들어오고
+production 호출처는 모두 workspace=Some이다. <code>forward_gen_fmt</code>와 <code>forward_prefill_fmt</code>는 attention 누산 순서가
+달라서(inline single-query vs flash) 이 분기를 모르고 workspace를 빼먹으면 <strong>에러 없이 미세하게 다른 수치</strong>가 나온다.
+decode 경로를 건드리는 PR 리뷰 시 이 분기 커버 여부를 확인하라.</p>
+</div>
+</section>
+
+<section>
+<h2>4. 레이어 레벨 — per-layer 흐름</h2>
+
+<h3>4.1 Decode: forward_gen_fmt (seq_len=1)</h3>
+<p>
+decode의 per-layer 본체는 <code>TransformerLayer::forward_gen_fmt(ForwardGenFmtArgs)</code>다.
+SWIFT skip이 attn·mlp 둘 다 켜져 있으면 identity로 즉시 반환. 이후 순서(코드 주석 번호 그대로):
+</p>
+<table>
+<tr><th>#</th><th>연산</th><th>backend 호출</th><th>비고</th></tr>
+<tr><td>1</td><td>Attention Norm</td><td><code>rms_norm_oop(x → ws.residual)</code></td><td>out-of-place — <code>x</code>는 skip connection용으로 보존</td></tr>
+<tr><td>2</td><td>QKV projection</td><td><code>matmul_transposed × 3</code> (wq/wk/wv)</td><td><code>thread_pool begin_batch/end_batch</code>로 묶고, GPU면 <code>flush()</code> (env <code>LLMRS_DISABLE_FLUSH_QKV</code>로 끔). Qwen2 계열은 <code>add_row_bias</code> 3회 추가</td></tr>
+<tr><td>3</td><td>RoPE</td><td><code>rope_inplace(q_rope, start_pos, theta)</code>, k도 동일</td><td>q/k를 <code>[batch,1,n_heads,head_dim]</code>로 reshape한 view 텐서에 적용. Gemma3는 그 전에 per-head QK-Norm(<code>rms_norm</code> add_unit)</td></tr>
+<tr><td>4</td><td>KV cache 갱신</td><td><code>fmt.write_kv(&amp;k_rope, &amp;ws.v, backend)</code></td><td>format 계층 위임 — §4.3</td></tr>
+<tr><td>5</td><td>Attention</td><td><code>fmt.attention_into(&amp;q_rope, backend, &amp;mut ws.out_attn, AttnDims, scores)</code></td><td><code>cache_seq_len = fmt.current_pos()</code> (write 이후라 새 토큰 포함). window clamp·score_offset은 §5.3</td></tr>
+<tr><td>6</td><td>Output projection</td><td><code>matmul_transposed(out_attn, wo → attn_out)</code></td><td></td></tr>
+<tr><td>7+8</td><td>residual + pre-FFN norm</td><td><code>add_rms_norm_oop(x, attn_out → ws.residual, ffn_norm)</code></td><td>Llama/Qwen2는 add+norm fused 1콜. Gemma3는 post-attn norm → add → pre_ffn_norm 분리</td></tr>
+<tr><td>9</td><td>FFN gate/up</td><td><code>matmul_ffn_gate_up_silu(residual, w_gate, w_up → gate, up)</code></td><td>SiLU 경로는 gate/up matmul + silu_mul까지 fused 1콜. GELU(Gemma3)는 matmul 2회 + <code>gelu_tanh_mul</code>. 역시 batch + 조건부 <code>flush()</code></td></tr>
+<tr><td>9'</td><td>down projection</td><td><code>matmul_transposed(gate, w_down → down)</code></td><td></td></tr>
+<tr><td>10</td><td>residual 2</td><td><code>add_assign(x, down)</code></td><td>FFN 결과를 <code>x</code>에 누적 — 다음 레이어 입력</td></tr>
+</table>
+<p>
+모든 중간 텐서는 <code>LayerWorkspace</code>(필드: <code>q/k/v/out_attn/gate/up/down/residual/attn_out</code>, 전부 <code>[batch,1,*]</code>,
++ score 버퍼 <code>scores: Vec&lt;f32&gt;</code>와 <code>score_offset</code>)에 사전 할당되어 토큰마다 재사용된다 — decode 핫패스에 per-token alloc이 없다.
+n_heads는 weight shape에서 역산한다: <code>n_heads_q = wq.dims()[0] / head_dim</code>, <code>n_heads_kv = wk.dims()[0] / head_dim</code>.
+</p>
+<p class="evidence">근거: <code>engine/src/layers/transformer_layer/forward_gen_fmt.rs::forward_gen_fmt</code> (L57–243), <code>engine/src/layers/workspace.rs::LayerWorkspace</code> (L15–33)</p>
+
+<h3>4.2 Prefill: forward_prefill_fmt (seq_len 초과 1)</h3>
+<p>
+prefill 짝 <code>forward_prefill_fmt(ForwardPrefillFmtArgs)</code>는 같은 op 골격이되 multi-token이라 다음이 다르다:
+</p>
+<ul>
+<li><code>PrefillWorkspace</code> 텐서를 매 레이어 진입 시 실제 seq_len으로 <code>reshape</code> (alloc은 max로 1회).</li>
+<li>residual을 fused norm이 아니라 <code>copy_slice(x → residual)</code> + in-place <code>rms_norm(x)</code>로 처리 — decode와 달리 residual 보존을 명시적 copy로 한다 (<code>residual</code>·<code>residual_ffn</code> 2개).</li>
+<li>RoPE는 <code>[batch, seq_len, n_heads, head_dim]</code> shape로 한 번에.</li>
+<li>KV write는 <code>fmt.write_kv_batch</code>, attention은 같은 <code>fmt.attention_into</code>지만 seq_len이 1보다 커서 impl 내부에서 prefill arm(multi-token causal)으로 분기한다(§5.2).</li>
+<li>FFN은 fused 커널 없이 <code>matmul × 2 + silu_mul</code>(또는 <code>gelu_tanh_mul</code>) + down matmul.</li>
+<li>scores 인자는 항상 <code>None</code> — <strong>prefill은 attention score를 누적하지 않는다</strong>.</li>
+</ul>
+<p class="evidence">근거: <code>engine/src/layers/transformer_layer/forward_prefill_fmt.rs::forward_prefill_fmt</code> (L56–203)</p>
+
+<h3>4.3 KV write — format 계층의 fast-path 사다리</h3>
+<p>
+<code>StandardFormat</code>(F32/F16/Q4_0 <code>KVCache</code> wrapper)의 <code>write_kv</code>/<code>write_kv_batch</code>는
+공통 <code>write_inner(new_k, new_v, backend, is_decode)</code>로 합류해 다음 순서로 fast-path를 고른다:
+</p>
+<ol>
+<li><strong>GPU + F16 + HeadMajor + decode</strong> → <code>kv_scatter_f32_to_f16</code> 1 dispatch (fused cast+scatter).</li>
+<li><strong>GPU + F32 + HeadMajor</strong> → <code>kv_scatter_f32_to_f32_batch</code> (decode는 count=1, prefill은 count=seq_len).</li>
+<li><strong>GPU + F16 + HeadMajor + prefill</strong> → <code>kv_scatter_f32_to_f16_batch</code> (<code>supports_kv_scatter_batch()</code> 게이트 필수 — host-pointer fallback이 device-only 버퍼에서 segfault).</li>
+<li><strong>opaque format</strong>(.so block-quant) → cast 없이 <code>KVCache::update</code>가 descriptor encode+scatter.</li>
+<li><strong>그 외 비-F32</strong>(Q4_0 전부, 게이트 미충족 F16) → lock 안의 lazy <code>k_cast/v_cast</code> scratch에 <code>backend.cast</code> 후 <code>cache.update</code>. Q4_0는 GPU fast-path가 없어서 항상 이 경로다.</li>
+</ol>
+<p>
+모든 경로가 write 후 <code>advance_pos(1 또는 seq_len)</code>로 <code>current_pos</code>를 전진시킨다.
+HeadMajor offset 산식 — <code>dst_off = h*capacity*head_dim + pos*head_dim</code> — 은 scatter 커널과 <code>KVCache::update</code>가 bit-identical하게 공유한다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/standard_format.rs::write_inner</code> (L150–329), <code>::write_kv / write_kv_batch</code> (L345–354)</p>
+</section>
+
+<section>
+<h2>5. Attention과 GQA 구현 상세</h2>
+
+<h3>5.1 GQA 그룹 매핑 — 코드 전 경로 공통 산식</h3>
+<p>
+GQA는 여러 Q 헤드가 하나의 KV 헤드를 공유하는 구조다(도메인 환기 끝). 이 코드베이스의 매핑은 모든 경로에서 동일한 한 줄이다:
+</p>
+<pre><code>let n_rep = n_heads_q / n_heads_kv;   // 이름이 gqa_ratio 인 곳도 있음
+let kv_h  = h / n_rep;                // Q 헤드 h가 읽을 KV 헤드</code></pre>
+<p>
+Llama 3.2 1B 기준(모델 메타데이터: <code>num_attention_heads=32</code>, <code>num_key_value_heads=8</code>, <code>head_dim=64</code>)
+n_rep=4, 즉 Q 헤드 0..3이 KV 헤드 0을, 4..7이 KV 헤드 1을 공유한다. 별도 K/V repeat(복제) 텐서는 만들지 않고,
+<strong>오로지 인덱스 계산으로 같은 KV 행을 4번 읽는다</strong>. 등장 위치별 형태:
+</p>
+<table>
+<tr><th>경로</th><th>코드</th><th>GQA 인덱스</th></tr>
+<tr><td>CPU decode 기본 attention</td><td><code>Backend::attention_gen</code> default impl</td><td><code>kv_h = h / gqa_ratio</code>; K offset = HeadMajor <code>(kv_h*capacity + t)*head_dim</code>, SeqMajor <code>(t*num_heads_kv + kv_h)*head_dim</code>. layout은 shape에서 감지(<code>k_shape[1] == num_heads_kv</code>)</td></tr>
+<tr><td>CPU prefill flash</td><td><code>flash_attention_forward_strided</code></td><td>Q 헤드를 rayon으로 병렬화, head별 <code>k_head_offset = kv_h * kv_head_stride</code>로 slice 시작점을 옮긴 뒤 <code>flash_attention_head</code> 호출</td></tr>
+<tr><td>GPU OpenCL flash 커널</td><td><code>flash_attn_f16.cl</code> 등</td><td><code>gqa_ratio = n_head / n_head_kv; head_kv_idx = head_idx / gqa_ratio;</code> (f16.cl L65–66, f32.cl L66–67, f32_f16.cl L110–111)</td></tr>
+<tr><td>Q4_0+GPU CPU 폴백</td><td><code>attention_q4_gpu_fallback</code></td><td><code>kv_h = h / n_rep</code> + Q4_0 블록 offset <code>(kv_h*capacity + phys_t) * blocks_per_row</code>, <code>blocks_per_row = head_dim / QK4_0</code> (=64/32=2)</td></tr>
+<tr><td>score GQA 축약</td><td><code>AttentionScoreAccumulator::accumulate_layer_gqa</code></td><td>KV 그룹 내 Q-head score 평균 → per-KV-head 누적 (H2O+ per-head eviction용)</td></tr>
+</table>
+<p class="evidence">근거: <code>engine/src/backend.rs::Backend::attention_gen</code> (L285–406, gqa_ratio L334·kv_h L348), <code>engine/src/layers/attention.rs::flash_attention_forward_strided</code> (n_rep L295, kv_h L310–312), <code>engine/kernels/flash_attn_f16.cl</code> L65–66</p>
+
+<h3>5.2 flash_attention_forward_strided의 stride 계약</h3>
+<p>
+CPU prefill attention의 핵심 함수. 시그니처의 stride 인자가 layout을 전부 흡수하므로 함수 자체는 layout-agnostic이다.
+<code>prefill_attention</code>(StandardFormat의 prefill arm)이 넘기는 실제 인자:
+</p>
+<pre><code>// engine/src/pressure/standard_format.rs::prefill_attention (L956-999)
+let (k_pos_stride, kv_head_stride) = if is_head_major {
+    (head_dim, kv_capacity * head_dim)      // HeadMajor: 같은 head 안에서 pos 연속
+} else {
+    (n_heads_kv * head_dim, head_dim)       // SeqMajor: 같은 pos 안에서 head 연속
+};
+flash_attention_forward_strided(
+    q_slice, k_slice, v_slice, out_batch,
+    n_heads_q, n_heads_kv,
+    seq_len,            // q_len
+    cache_seq_len,      // kv_len (캐시 전체 유효 토큰)
+    head_dim,
+    n_heads_q * head_dim,  // q_stride (토큰 간)
+    k_pos_stride, k_pos_stride,   // k_stride, v_stride
+    n_heads_q * head_dim,  // out_stride
+    kv_head_stride,        // KV 헤드 간 stride — GQA 점프 단위
+    q_start_pos,           // = cache_seq_len - seq_len (causal mask 기준점)
+    32, 32,                // br, bc 타일 (NEON 경로는 자체 타일 선택)
+    window,                // Gemma3 SWA — None이면 full causal
+);</code></pre>
+<p>
+causal mask는 <code>global_c &lt;= global_r + q_start_pos</code>, sliding window는 <code>global_c + ws &gt; global_q</code>로
+flash 커널 내부에서 처리한다(블록 단위 skip 최적화 포함). aarch64에서는
+<code>q_len &gt;= PREFILL_FLASH_THRESHOLD</code> + head_dim 8배수 + 정수 GQA ratio + HeadMajor(<code>k_stride == head_dim</code>) 조건이
+모두 맞으면 NEON tile + online-softmax 구현 <code>flash_prefill_forward_f32_neon</code>으로 우회한다.
+</p>
+<p class="evidence">근거: <code>engine/src/layers/attention.rs::flash_attention_head</code> (L78–221, mask L142–146), NEON gate (L260–293)</p>
+
+<h3>5.3 attention_into의 dispatch 트리</h3>
+<p>
+<code>fmt.attention_into(q, backend, out, AttnDims{n_heads_q, window}, scores)</code>는 호출자(레이어)가
+저장 형태를 전혀 모르는 채 부르는 단일 표면이다. <code>AttnDims</code>가 q 속성 2개만 담는 이유:
+<code>n_heads_kv/head_dim/capacity/current_pos/scale</code>은 전부 format이 자기 상태로 아는 값이기 때문이다.
+<code>StandardFormat</code> impl의 분기:
+</p>
+<pre class="mermaid">
+flowchart TD
+    A["attention_into(q, dims, scores)"] --> B{"cache.is_opaque()?"}
+    B -->|yes| C["descriptor로 K/V 전체 f32 unpack 후 F32 경로 재사용"]
+    B -->|no| D{"seq_len 초과 1? (prefill)"}
+    D -->|yes| E["prefill_attention: GPU flash_attention_prefill 시도"]
+    E -->|"dispatch 성공"| E1["GPU flash prefill 커널"]
+    E -->|"미지원 (Q4_0, head_dim, CPU)"| E2["dtype별 dequant 후 flash_attention_forward_strided (CPU)"]
+    D -->|"no (decode)"| F["effective_cache_len = min(cache_seq_len, window)"]
+    F --> G{"kv_dtype == Q4_0 그리고 backend.is_gpu()?"}
+    G -->|yes| H["attention_q4_gpu_fallback: GPU에서 Q/K/V readback, CPU dequant+attention, 결과 write_buffer"]
+    G -->|no| I["backend.attention_gen — CPU dtype-aware 또는 GPU flash decode 커널"]
+</pre>
+<p>
+decode arm의 window 처리: <code>effective_cache_len = min(cache_seq_len, window)</code>로 K 길이를 잘라
+backend에 넘기고, 레이어 쪽에서는 <code>ws.score_offset = cache_seq_len - effective_cache_len</code>을 기록해
+score accumulator가 <code>ws.scores[t]</code>를 캐시 절대 위치로 되돌릴 수 있게 한다.
+prefill arm은 반대로 clamp를 <strong>우회</strong>하고 전체 K + window를 flash 내부 마스킹에 위임한다(주석 "정정 C").
+GPU decode는 <code>OpenCLBackend::attention_gen</code> override가 flash decode 커널(<code>flash_attention_decode_gpu</code>)을 우선 시도하며,
+CPU로의 score readback(<code>scores_out=Some</code>)이 필요하고 GPU score accumulator가 비활성이면 legacy 커널로 폴백한다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/standard_format.rs::attention_into</code> (L356–508), <code>engine/src/format/kv_cache_format.rs::AttnDims</code> (L28), <code>engine/src/backend/opencl.rs::attention_gen</code> (L6000–6060), <code>engine/src/layers/transformer_layer/forward_gen_fmt.rs</code> (score_offset L154)</p>
+
+<div class="warn">
+<p><strong>Q4_0 KV + GPU는 매 토큰 readback 폴백이다.</strong> OpenCL backend에는 Q4_0 dequant-attention 커널이 없어
+<code>backend.attention_gen</code>에 그대로 넘기면 BlockQ4_0 raw 바이트를 float로 오독해 garbage가 난다. 그래서
+<code>attention_q4_gpu_fallback</code>이 K/V 캐시 전체를 GPU→CPU로 읽어 rayon 병렬 dequant+attention 후 결과만 GPU에 되쓴다.
+정확하지만 캐시가 길수록 비싸다 — Q4_0 KV를 GPU에서 쓰는 변경을 리뷰할 땐 이 비용을 전제로 보라.
+NaN guard(스코어 NaN → -inf, sum 붕괴 시 uniform)도 이 경로에만 있다.</p>
+</div>
+<p class="evidence">근거: <code>engine/src/layers/transformer_layer/forward_gen.rs::attention_q4_gpu_fallback</code> (L189–351)</p>
+
+<h3>5.4 score 누적 (need_scores)</h3>
+<p>
+H2O/D2O eviction이 쓰는 post-softmax score는 decode에서만 생산된다. 결정식은
+<code>need_scores = acc_need || cache_self_need_scores</code>이며, GPU score accumulator가 활성이면
+<code>acc_need=false</code>(on-device 누적으로 대체, layer loop 끝에 <code>gpu_acc.end_step</code>).
+CPU 경로에서는 <code>attention_into(scores=Some(&amp;mut ws.scores))</code>가 head별 <code>[0..cache_seq_len]</code>을 채우고,
+모델 레벨에서 <code>accumulate_layer</code>(layer-wide) 또는 <code>accumulate_layer_gqa</code>(per-KV-head)로 흡수한다.
+production happy path는 <code>score_accumulator=None</code>이라 전부 비활성 — eviction과의 연결은 <a href="07_kv_cache.html">07장</a>.
+</p>
+<p class="evidence">근거: <code>engine/src/models/transformer.rs::forward_into</code> (need_scores L1516–1523, accumulate L1587–1615), <code>engine/src/inference/attention_scores.rs::AttentionScoreAccumulator</code></p>
+</section>
+
+<section>
+<h2>6. plan 경로 — 사전 바인딩 GPU 커널 plan</h2>
+<p>
+OpenCL decode의 진짜 핫패스는 <code>forward_into</code>가 아니라 <code>FullKernelPlan</code>이다.
+매 토큰 같은 커널을 같은 인자(weight·workspace cl_mem·차원)로 dispatch하는 decode 특성을 이용해,
+<strong>build 시점에 모든 정적 인자를 커널 객체에 pre-bind</strong>하고 실행 시에는 동적 스칼라만 갱신한다
+(파일 헤더: "mirrors llama.cpp's tight enqueue loop"). 구성:
+</p>
+<ul>
+<li><code>FullKernelPlan { layers: Vec&lt;LayerKernelPlan&gt;, final_norm, lm_head: Option&lt;KernelStep&gt;, kv_capacity, ratio_generation_at_build, ... }</code>.
+<code>lm_head=None</code>이면(CPU tied embedding 등) 호출자가 CPU matmul을 대신 수행.</li>
+<li>각 <code>KernelStep</code>은 pre-bound 커널 + work size + <code>dynamic_args</code> 목록. 동적 인자 종류는
+<code>StartPos / CacheSeqLen / WritePos / KvCapacity</code>(+KIVI 전용 <code>ResPos/Q2Tokens/...</code>).</li>
+<li>op 순서는 <code>OpTag</code>가 보여준다: RmsNorm → MatmulQKV → Rope → KvScatter → Attention → MatmulWo → AddRmsNorm → MatmulGateUp → SiluMul → MatmulDown → (AddAssign) → FinalNorm → LmHead — §4.1 표와 1:1 대응.</li>
+</ul>
+<p>
+<code>execute()</code>는 레이어마다 <code>StandardFormat::plan_geometry()</code>(단일 lock으로 current_pos/capacity 스냅샷)를 읽어
+<code>cache_seq_len = write_pos = current_pos</code>, <code>attn_seq_len = cache_seq_len + 1</code>(방금 scatter한 토큰 포함)을 동적 인자로 주입하고,
+레이어 끝에 <code>plan_advance(1)</code>로 pos를 전진시킨다. embedding lookup(<code>gather_embed</code>)과 logits readback만 plan 밖이다.
+</p>
+<p><strong>Invalidation 3종</strong> — 셋 중 하나면 <code>PlanInvalidated</code>를 반환하고 caller가 폐기/재빌드한다:</p>
+<ol>
+<li><code>g.capacity != self.kv_capacity</code> — KV 캐시 resize (grow/shrink).</li>
+<li><code>g.current_pos &gt;= g.capacity</code> — capacity overflow 직전.</li>
+<li><code>ratio_generation</code> atomic 카운터가 build 시점 스냅샷과 다름 — weight swap이 일어나 pre-bound cl_mem이 stale (INV-129).</li>
+</ol>
+<p>
+<code>ModelForward::step()</code> 쪽 수명 관리: plan은 lazy 1회 build(<code>try_build_plan</code> — OpenCL + <code>--no-gpu-plan</code> 비활성 + 비Gemma3 가드),
+build 실패 시 <code>sticky_disabled=true</code>로 매 step 재시도 spam을 차단, eviction이 KV pos를 shift하면
+<code>on_kv_prune()</code>이 <code>gpu_plan = None</code>으로 무효화한다(stale offset → silent garbage 방지).
+execute 실패는 그 step을 <code>forward_into</code> 폴백으로 처리하고 다음 step에서 lazy rebuild한다.
+</p>
+<pre class="mermaid">
+flowchart TD
+    S["ModelForward::step(token)"] --> W["decode_input에 token write_buffer"]
+    W --> P{"gpu_plan 있음?"}
+    P -->|"None이고 sticky 아님"| B["try_build_plan: OpenCL? no_gpu_plan? Gemma3? 검사 후 model.build_plan"]
+    B -->|"None"| ST["sticky_disabled = true"]
+    B -->|"Some"| E
+    P -->|Some| E["model.execute_plan → plan.execute(ocl, start_pos, fmt handles)"]
+    E -->|"Ok(true)"| R["read_logits: synchronize + readback"]
+    E -->|"Ok(false) / Err (invalidated)"| F["forward_into 폴백 (trait object 경로)"]
+    ST --> F
+    F --> R
+</pre>
+<p class="evidence">근거: <code>engine/src/backend/opencl/plan.rs::FullKernelPlan</code> (L950), <code>::execute</code> (L1278–1330, invalidation L1309–1312), <code>::OpTag</code> (L36), <code>engine/src/models/transformer.rs::execute_plan</code> (L2190), <code>engine/src/session/forward/model_forward.rs::{try_build_plan, step, on_kv_prune}</code></p>
+</section>
+
+<section>
+<h2>7. 전체 흐름 sequenceDiagram</h2>
+<pre class="mermaid">
+sequenceDiagram
+    participant CLI as run_standard_happy_path
+    participant DL as DecodeLoop
+    participant MF as ModelForward
+    participant TM as TransformerModel
+    participant TL as TransformerLayer
+    participant SF as StandardFormat
+    participant BE as Backend
+
+    Note over CLI,BE: ── Prefill (배치) ──
+    CLI->>DL: prefill(tokens)
+    DL->>MF: forward.prefill(tokens, start_pos=0)
+    MF->>MF: ensure_fmt_wrapped (KVCache → Arc StandardFormat, 1회)
+    loop 청크 (derive_chunk_size, GPU 최대 512)
+        MF->>TM: forward_into(seq_len 초과 1, logits_last_only=true)
+        TM->>TM: gather_embed + owned PrefillWorkspace 할당
+        loop 레이어 i = 0..N (per-token weight snapshot)
+            TM->>TL: forward_prefill_fmt(x, fmts[i], pws)
+            TL->>BE: rms_norm / matmul_transposed x3 / rope_inplace
+            TL->>SF: write_kv_batch(k_rope, v)
+            SF->>BE: kv_scatter_*_batch 또는 cast+update
+            TL->>SF: attention_into(q_rope, AttnDims, scores=None)
+            SF->>BE: flash_attention_prefill 시도, 실패 시 flash_attention_forward_strided(CPU)
+            TL->>BE: wo matmul / FFN / residual
+        end
+        TM->>BE: final rms_norm + lm_head(마지막 토큰만)
+    end
+    MF->>BE: read_logits (synchronize + readback)
+    MF-->>DL: 마지막 토큰 logits
+    DL-->>CLI: logits
+    CLI->>CLI: sampling::sample → first_token
+
+    Note over CLI,BE: ── Decode (토큰 단위) ──
+    CLI->>DL: run(budget, first_token)
+    loop step (budget 또는 stop까지)
+        DL->>DL: (a) cmd poll / (a.5) evict / (b) EvictionStage / (c) swap
+        DL->>MF: (d) forward.step(ctx, prev_token)
+        alt plan hit (OpenCL)
+            MF->>TM: execute_plan(plan, decode_input, pos, fmt handles)
+            TM->>BE: pre-bound 커널 일괄 enqueue (per layer 동적 스칼라만 갱신)
+        else 폴백 (CPU / plan invalidated)
+            MF->>TM: forward_into(seq_len=1, workspace=Some)
+            loop 레이어 i = 0..N
+                TM->>TL: forward_gen_fmt(x_gen, fmts[i], ws)
+                TL->>BE: rms_norm_oop / QKV matmul / rope_inplace(start_pos)
+                TL->>SF: write_kv(k_rope, v)
+                TL->>SF: attention_into(q_rope, AttnDims, scores)
+                SF->>BE: attention_gen (GQA: kv_h = h / n_rep)
+                TL->>BE: wo / FFN / residual
+            end
+            TM->>BE: final norm + lm_head
+        end
+        MF->>BE: read_logits (synchronize)
+        MF-->>DL: logits
+        DL->>DL: (f) sampler.sample → (g) observers → pos += 1
+    end
+</pre>
+</section>
+
+<section>
+<h2>8. 함정 · 실측 교훈 · 리뷰 체크포인트</h2>
+<div class="warn">
+<p><strong>성능 측정은 <code>--profile</code> 없이 (실측 교훈, CLAUDE.md).</strong> <code>--profile</code>은 plan 경로를 비활성화하고
+(<code>is_standard_happy_path</code>가 false → legacy 경로) op마다 <code>synchronize()</code> 2회를 끼워 ~54 ms/token의 sync
+오버헤드를 더한다. per-op breakdown은 상대 비교에만 쓰고, production TBT는 <code>Decode: X ms/tok</code> 로그 라인(§2.1의
+<code>run_standard_happy_path</code> 출력)을 쓴다. 이는 코드만으로 확인 불가한 디바이스 실측 지식이다.</p>
+</div>
+<div class="warn">
+<p><strong>KVLayout은 production HeadMajor 고정.</strong> attention 함수군은 stride 인자로 layout-agnostic하지만,
+plan 경로의 scatter 커널과 eviction/QCF 코드가 HeadMajor offset을 전제한다. SeqMajor를 고르면 컴파일·실행 모두 통과하면서
+plan 경로가 silent garbage를 낸다(2026-04-14 실측 교훈, CLAUDE.md/용어집). 새 KV 코드가 offset을 직접 계산한다면
+<code>(h*capacity + pos)*head_dim</code> 패턴인지 확인하라.</p>
+</div>
+<div class="warn">
+<p><strong>decode와 prefill의 attention은 수치적으로 다른 경로다.</strong> decode는 single-query 누산(<code>attention_gen</code>),
+prefill은 flash online-softmax다. FP 누산 순서가 달라 같은 토큰을 두 경로로 계산하면 bit-identical하지 않다
+(<code>forward_gen_fmt.rs</code> 헤더가 명시). 회귀 테스트에서 prefill 출력과 decode 출력을 직접 비교하는 설계는 금물.</p>
+</div>
+<p>리뷰 체크리스트(이 챕터 범위): 컨벤션 전반은 <a href="12_review_checklist.html">12장</a>.</p>
+<ul>
+<li>새 per-layer 연산은 <code>forward_gen_fmt</code>와 <code>forward_prefill_fmt</code> <strong>양쪽</strong>에 넣었는가? plan 경로(<code>build_full_plan</code>의 KernelStep 시퀀스)도 갱신했는가? 셋 중 하나만 고치면 경로별로 다른 모델이 된다.</li>
+<li>KV 캐시 geometry를 바꾸는 코드는 plan invalidation을 트리거하는가(<code>capacity</code> 변화 또는 <code>on_kv_prune</code>)?</li>
+<li><code>fmt.attention_into</code> 호출 전에 <code>write_kv</code>가 선행하는가? <code>current_pos()</code>는 write 이후 값을 읽어야 새 토큰이 attention에 보인다 (plan 경로의 <code>attn_seq_len = cache_seq_len + 1</code>과 동치).</li>
+<li>GQA 인덱스를 새로 쓰는 코드는 <code>h / n_rep</code>인가 <code>h % n_rep</code>인가 — 전자가 정답이며, 기존 5개 경로(§5.1 표)와 일치해야 한다.</li>
+</ul>
+</section>
+
+<section>
+<h2>9. 이 챕터가 다루지 않은 인접 영역</h2>
+<ul>
+<li><code>KVCache</code> 내부 구조·eviction 정책·KIVI/opaque format 구현 — <a href="07_kv_cache.html">07. KV 캐시 구조와 관리</a></li>
+<li><code>KVCacheFormat</code>/<code>Forward</code>/<code>PipelineStage</code> 등 trait 계약의 설계 의도 — <a href="05_abstractions.html">05. 핵심 추상화 카탈로그</a></li>
+<li>workspace가 쓰는 allocator·zero-copy 버퍼 — <a href="06_memory.html">06. 메모리 &amp; 데이터 포맷</a></li>
+<li>OpenCL/CPU/CUDA backend 커널 구현과 <code>thread_pool</code> — <a href="09_backends.html">09. 백엔드 구현</a></li>
+<li>DecodeLoop의 (a)/(a.5) 단계로 들어오는 resilience 신호 경로 — <a href="08_resilience_ipc.html">08. Resilience &amp; IPC</a></li>
+</ul>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="03_code_map.html">← 03. 코드베이스 지도</a></span><span><a href="05_abstractions.html">05. 핵심 추상화 카탈로그 →</a></span></footer>
+</body>
+</html>

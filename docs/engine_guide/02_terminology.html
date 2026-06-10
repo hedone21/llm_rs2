@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02. 도메인 용어 — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 02</span></nav>
+<header>
+<h1>02. 도메인 용어</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<section>
+<h2>0. 이 챕터를 읽는 법</h2>
+<p>이 코드베이스의 PR 리뷰에서 가장 흔한 지적은 버그가 아니라 <strong>용어 오용</strong>이다 — "Layer"를 저장 형태에 쓰거나, Stage가 버퍼를 직접 변형하거나, 측정 공간이 다른 QCF 두 값을 직접 비교하는 식이다. 이 챕터는 그런 오용을 막기 위한 용어 사전이며, 각 용어마다 (1) 정의, (2) 실제 코드 심볼 위치, (3) <strong>안티패턴 문장</strong>(이렇게 쓰면 틀림)을 단다. 모든 사실은 기준 커밋의 코드를 직접 읽고 확인했다. 아키텍처 전반은 <a href="01_overview.html">01. 시스템 개요</a>, 모듈 배치는 <a href="03_code_map.html">03. 코드베이스 지도</a> 참조.</p>
+</section>
+
+<section>
+<h2>1. 세 직교 축 — format ⊥ stage ⊥ hardware</h2>
+<p>KV·weight 데이터 관리의 모든 용어는 세 축 위의 좌표로 읽으면 정리된다. 한 축에 멤버를 추가해도 다른 축 코드를 건드리지 않도록(비용이 M×N×K 곱이 아니라 M+N+K 합이 되도록) 설계되어 있고, 각 축마다 정식 trait이 코드에 존재한다.</p>
+
+<table>
+<tr><th>축</th><th>질문</th><th>품사</th><th>정식 코드 표면</th><th>멤버 예</th></tr>
+<tr><td><strong>format</strong></td><td>"어떤 표현으로 계산하나"</td><td>noun (저장 형태)</td><td><code>KVCacheFormat</code> / <code>WeightFormat</code> trait</td><td>f32, f16, q4_0, KIVI(Q2+residual)</td></tr>
+<tr><td><strong>stage</strong></td><td>"메모리에 무엇이 얼마나 남나"</td><td>verb (관리 동작)</td><td><code>KVCacheStage</code> trait (plan-returning)</td><td>Sliding, H2O, H2O+, D2O, weight swap</td></tr>
+<tr><td><strong>hardware</strong></td><td>"어디서 계산하나"</td><td>위치</td><td><code>Hardware</code> resolver + <code>DeviceTarget</code></td><td>CPU(NEON), GPU(OpenCL/CUDA), NPU</td></tr>
+</table>
+
+<pre class="mermaid">
+flowchart TB
+    subgraph FORMAT["format 축 — 표현 (noun)"]
+        F1["f32 / f16 / q4_0"]
+        F2["KIVI: Q2 packed + F32 residual"]
+        FT["trait KVCacheFormat / WeightFormat"]
+    end
+    subgraph STAGE["stage 축 — 관리 동작 (verb)"]
+        S1["Sliding / H2O / Streaming: keep"]
+        S2["D2O: keep + weighted merge"]
+        ST["trait KVCacheStage — plan 반환"]
+    end
+    subgraph HW["hardware 축 — 연산 위치"]
+        H1["CPU NEON"]
+        H2["GPU OpenCL 또는 CUDA"]
+        HT["Hardware.resolve(target)"]
+    end
+    ST -- "base-trait-handle로 읽기만" --> FT
+    FT -- "paired kernel dispatch" --> HT
+    STAGE -. "직교: stage는 표현을 모름" .- FORMAT
+    FORMAT -. "직교: format은 backend별 opt-in 커널" .- HW
+</pre>
+
+<p>직교성의 코드 증거: 단일 OpenCL backend가 여러 precision 커널을 갖고, q4_0은 CPU·OpenCL·CUDA 세 backend에 모두 존재한다 — precision은 backend의 함수가 아니므로 format과 hardware는 독립 축이다. 단, (format × hardware) <strong>paired kernel</strong> 행렬 자체는 환원 불가능한 M×N이며, 이 행렬은 <code>Backend</code> trait의 dispatch 내부에 격리되어 호출자·Stage는 어느 커널이 뜨는지 모른다.</p>
+<p class="evidence">근거: <code>engine/src/format/kv_cache_format.rs::KVCacheFormat</code>, <code>crates/technique-api/src/lib.rs::KVCacheStage</code>, <code>engine/src/hardware.rs::Hardware::resolve</code>, <code>CONTEXT.md</code>(용어 출처 — 각 심볼이 코드에 실존함을 확인)</p>
+
+<div class="note">복합 동작은 단일축 primitive의 <strong>합성</strong>으로 읽는다. 예: KIVI는 "KV를 Q2로 다시 까는" stage 동작 + "Q2 표현으로 attention하는" format의 합성이고, weight swap은 stage(로드/언로드) + format(precision 변경)의 합성이다. partition은 format × hardware 곱 — 슬라이스마다 (f16, GPU) / (q4, NPU) 다른 좌표를 가질 수 있다.</div>
+</section>
+
+<section>
+<h2>2. Format — 저장 형태 (noun)</h2>
+
+<h3>2.1 KVCacheFormat trait</h3>
+<p>KV 캐시의 state 책임을 storage-format-agnostic하게 노출하는 base trait. 메서드가 정확히 6개로 고정되어 있다 — geometry 3개(<code>idx</code> / <code>current_pos</code> / <code>capacity</code>), mutation 2개(<code>write_kv</code> / <code>write_kv_batch</code>), attention 1개(<code>attention_into</code>). dtype·codebook·rotation 같은 내부는 <strong>의도적으로 표면에 없다</strong> — trait 정의 말미 주석이 <code>as_any()</code>(downcast)·<code>dtype()</code>·<code>needs_attn_scores()</code>의 부재를 명시적 설계 결정으로 박아 두었다.</p>
+<pre><code>// engine/src/format/kv_cache_format.rs
+pub trait KVCacheFormat: Send + Sync {
+    fn idx(&amp;self) -&gt; usize;          // 어느 decoder layer의 KV인가
+    fn current_pos(&amp;self) -&gt; usize;   // 유효 토큰 수
+    fn capacity(&amp;self) -&gt; usize;      // 물리 버퍼 용량(토큰)
+    fn write_kv(&amp;self, new_k: &amp;Tensor, new_v: &amp;Tensor, backend: &amp;dyn Backend) -&gt; Result&lt;()&gt;;
+    fn write_kv_batch(&amp;self, new_k: &amp;Tensor, new_v: &amp;Tensor, backend: &amp;dyn Backend) -&gt; Result&lt;()&gt;;
+    fn attention_into(&amp;self, q: &amp;Tensor, backend: &amp;dyn Backend, out: &amp;mut Tensor,
+                      dims: AttnDims, scores: Option&lt;&amp;mut [f32]&gt;) -&gt; Result&lt;()&gt;;
+    // as_any() 없음 — downcast 의도적 차단.
+    // dtype() / KVCacheView 없음 — Stage가 어느 Format인지 모름.
+}</code></pre>
+<p>구현체는 둘 다 <code>pressure/</code>에 산다(guard rail: trait은 <code>format/</code>, impl은 감싸는 캐시 옆): <code>StandardFormat</code>(F32/F16/Q4_0 <code>KVCache</code>를 <code>Mutex</code>로 감싼 wrapper)과 <code>KIVIFormat</code>(<code>KiviCache</code> wrapper). <code>AttnDims</code>는 per-call 파라미터로 <code>n_heads_q</code>(GQA 쿼리 헤드 수)와 <code>window</code>(Gemma3 local SWA)만 싣는다 — <code>kv_heads</code>/<code>head_dim</code>/scale은 전부 format 내부 지식이다. 한때 trait에 있던 <code>compact</code>는 폐기되었고, plan 실행 정본은 <code>execute_kv_plan</code>이다(§3.2).</p>
+<p class="evidence">근거: <code>engine/src/format/kv_cache_format.rs::KVCacheFormat</code>(L58)·<code>::AttnDims</code>, <code>engine/src/pressure/standard_format.rs::StandardFormat</code>(L41), <code>engine/src/pressure/kivi_format.rs::KIVIFormat</code>(L27), <code>engine/src/pressure/eviction/stage_registry.rs::execute_kv_plan</code>(L94)</p>
+
+<h3>2.2 WeightFormat trait</h3>
+<p>KV 쪽과 대칭인 weight 쪽 base trait. <code>idx()</code> + <code>apply_dispatch(d: LayerDispatch, hw: &amp;Hardware)</code> 두 메서드뿐이다. dispatch 모드 타입(<code>LayerDispatch</code>/<code>PartitionShare</code>)은 plugin 결정 표면이라 <code>technique-api</code> crate에 살고 여기서 re-export된다. read용 <code>view()</code>와 <code>apply_storage(spec)</code>은 의도적으로 없다 — precision swap 등 format mutation은 concrete-handle을 든 Stage가 직접 수행한다.</p>
+<p class="evidence">근거: <code>engine/src/format/weight_format.rs::WeightFormat</code>(L21), <code>pub use technique_api::{LayerDispatch, PartitionShare}</code>(같은 파일 L18)</p>
+
+<div class="warn"><strong>안티패턴</strong>:
+<ul>
+<li>"KV를 <em>Q4 Layer</em>로 저장한다" — ✗. 저장 형태는 Layer가 아니라 <strong>Format</strong>이다(§4).</li>
+<li>"이 Stage에서 dtype 분기가 필요하니 <code>KVCacheFormat</code>에 <code>dtype()</code>을 추가하자" — ✗. trait 주석이 부재를 설계 결정으로 명시한다. dtype 분기는 impl 내부에 흡수하거나, 정말 구체 타입이 필요하면 concrete-handle(§5)로 바꾼다.</li>
+<li>"precision과 레이아웃을 별도 파라미터로 분리하자" — ✗. q4_0은 4bit 블록 레이아웃이자 precision인 <strong>한 좌표</strong>다. q4와 f16은 이미 다른 paired kernel을 쓰므로 precision이 곧 표현을 가른다.</li>
+</ul></div>
+</section>
+
+<section>
+<h2>3. Stage — 관리 동작 (verb)</h2>
+
+<h3>3.1 KVCacheStage: plan-returning trait</h3>
+<p>stage 축의 정식 plugin trait. 핵심 계약은 <strong>"결정은 plugin, 버퍼 변형 실행은 엔진 독점"</strong>이다 — 기법은 <code>StageCtx</code> 읽기 추상을 통해 캐시 상태를 읽고 <code>KVCachePlan</code>을 반환할 뿐, <code>&amp;mut KVCache</code> 같은 엔진 타입을 받지 않는다. 그래서 technique crate는 엔진 내부에 결합하지 않고, 미래 <code>.so</code> C-ABI 승격과도 정합한다(같은 파일에 <code>StageCtxAbi</code> fn-ptr 평탄화가 이미 존재).</p>
+<pre><code>// crates/technique-api/src/lib.rs
+pub trait KVCacheStage: Send + Sync {
+    fn name(&amp;self) -&gt; &amp;str;   // CLI --eviction-policy &lt;name&gt; 매칭
+    fn plan(&amp;self, ctx: &amp;dyn StageCtx) -&gt; Option&lt;KVCachePlan&gt;;  // None = no-op
+}
+
+pub struct KVCachePlan {
+    pub keep: KeepSpec,                // 보존 토큰 모양 (배타)
+    pub merges: Vec&lt;WeightedMerge&gt;,    // 가중 병합 지시 (직교, 없으면 빈 Vec)
+}
+pub enum KeepSpec {
+    LayerWide(Vec&lt;usize&gt;),       // sliding/h2o/streaming/d2o — prefix 포함 ascending
+    PerHead(Vec&lt;Vec&lt;usize&gt;&gt;),    // h2o_plus — [n_kv_heads][keep], 전 head 길이 동일
+}
+pub struct WeightedMerge {
+    pub into: usize,                   // 가중 합이 누적될 retained 위치
+    pub into_weight: f32,              // D2O Eq.11의 w_c
+    pub from: Vec&lt;(usize, f32)&gt;,       // evicted (위치, 가중치) — Σfrom + into_weight ≈ 1
+}</code></pre>
+<p>등록은 linkme <code>distributed_slice</code>로 한다: technique crate가 <code>KV_CACHE_STAGES</code> 슬라이스에 <code>KVCacheStageReg { name, make: fn(StageParams) -&gt; Box&lt;dyn KVCacheStage&gt; }</code>를 제출하고, 엔진이 construction 시 <code>find_stage(name)</code>으로 찾는다 — 엔진 코어의 closed match arm 수정 0으로 새 기법이 추가된다. 실제 plugin 예: <code>crates/techniques/caote/</code>의 <code>static CAOTE: KVCacheStageReg</code>. 상세 확장 절차는 <a href="10_howto_extend.html">10. 확장 How-to</a>.</p>
+<p><code>StageCtx</code>가 노출하는 읽기 표면: <code>current_pos</code> / <code>target_len</code>(ratio→len 환산은 엔진 책임 — plugin은 환산된 절대 토큰 수만 읽음) / <code>layer_idx</code> / <code>importance()</code>(flat per-token score, <code>None</code>이면 score-free) / <code>n_kv_heads</code> / <code>head_dim</code>, 그리고 단일 텐서 접근 메커니즘 <code>tensor(kind: TensorKind) -&gt; Option&lt;&amp;dyn TensorHandle&gt;</code>(kind = <code>Key</code>/<code>Value</code>/<code>AttnWeights</code>/<code>Scores</code>). <code>dequant_k</code>/<code>dequant_v</code>/<code>head_score</code>/<code>attn_weight</code>는 전부 <code>tensor()</code> 위의 default sugar라 엔진은 <code>tensor()</code> 하나만 구현하면 된다. 호출 간 누적 상태(D2O EMA 등)는 ctx로 thread하지 않고 plugin struct가 interior-mutability로 보유한다.</p>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::KVCacheStage</code>(L220)·<code>::KVCachePlan</code>(L206)·<code>::KeepSpec</code>·<code>::WeightedMerge</code>·<code>::StageCtx</code>(L93)·<code>::KV_CACHE_STAGES</code>(L264), <code>crates/techniques/caote/src/lib.rs</code>(L103 등록 예)</p>
+
+<h3>3.2 plan의 실행 — 엔진 독점</h3>
+<pre class="mermaid">
+sequenceDiagram
+    participant E as 엔진 (eviction 트리거 시점)
+    participant S as plugin: KVCacheStage
+    participant C as StageCtx (엔진이 KVCache 위로 구현)
+    participant K as KVCache 버퍼
+    E->>S: plan(ctx)
+    S->>C: current_pos() / target_len() / importance()
+    S->>C: tensor(Key).read_row(pos, head, out) — D2O cosine 등
+    S-->>E: Some(KVCachePlan { keep, merges }) 또는 None(no-op)
+    E->>K: execute_kv_plan(cache, plan) — merge 적용 후 keep compaction
+    Note over E,K: 버퍼 변형은 엔진만 수행. new_pos는 keep.len()에서 도출
+</pre>
+<p>plan의 좌표계 규약 두 가지가 리뷰 포인트다: (1) <code>keep</code>은 <strong>prefix 포함 ascending</strong>이어야 하고(compaction 재배치가 in-place evict와 bit-identical이 되는 조건), (2) <code>merges</code>의 <code>into</code>/<code>from</code>은 <strong>compact 적용 직전(pre-compact)의 논리 위치</strong>로 해석한다 — merge를 in-place 적용한 뒤 keep compaction을 수행하는 순서(D2O Step 5 → Step 6)다.</p>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::KeepSpec</code> doc("prefix 포함 ascending"), <code>engine/src/format/kv_cache_format.rs::Merge</code> doc(pre-compact 좌표), <code>engine/src/pressure/eviction/stage_registry.rs::execute_kv_plan</code></p>
+
+<h3>3.3 "stage"라는 단어의 세 층위 — 혼동 주의</h3>
+<p>코드에 "stage"가 붙은 식별자가 세 층위로 존재한다. PR에서 어느 층위를 말하는지 명시하지 않으면 대화가 어긋난다.</p>
+<table>
+<tr><th>층위</th><th>식별자</th><th>무엇인가</th><th>현재 상태</th></tr>
+<tr><td>개념 차원</td><td>"stage 축"</td><td>메모리 상주 데이터를 조절하는 동작의 축 (이 절 전체)</td><td>도메인 어휘</td></tr>
+<tr><td>plugin trait</td><td><code>KVCacheStage</code></td><td>stage 축 동작을 plugin이 구현하는 정식 trait (plan-returning)</td><td>live — technique crate들이 구현·등록</td></tr>
+<tr><td>hook 메커니즘</td><td><code>PipelineStage</code></td><td>decode 루프 lifecycle hook trait — <code>on_phase(&amp;LifecyclePhase, &amp;mut StageContext)</code>로 phase 경계마다 호출</td><td>Phase α-W additive 타입 — 아직 live decode loop에 미배선</td></tr>
+</table>
+<p>여기에 더해 <code>engine/src/stages/</code> 디렉토리(<code>kv</code>/<code>weight</code>/<code>system</code>)는 미래 Stage impl의 거주지 <strong>골격</strong>이며 현재 입주자 0이고, <code>CachePressurePipeline</code>의 <code>PressureStageConfig</code>(§8.3)의 "stage"는 또 다른 의미(파이프라인의 핸들러 슬롯)다. 그리고 현재 production이 실제로 도는 메커니즘은 <code>CachePressureHandler</code>(§8.3)다.</p>
+<p class="evidence">근거: <code>engine/src/pipeline.rs::PipelineStage</code>(L165, "아직 live decode loop에 배선되지 않았다" doc), <code>engine/src/stages.rs</code>("현재 서브모듈은 비어 있고 … 배선되어 있지 않다"), <code>engine/src/pressure.rs::PressureStageConfig</code>(L152)</p>
+
+<div class="warn"><strong>안티패턴</strong>:
+<ul>
+<li>"Sliding stage가 KVCache 버퍼를 직접 당겨 쓴다" — ✗. <code>KVCacheStage</code>는 plan만 반환한다. 버퍼를 직접 만지는 건 legacy <code>EvictionPolicy::evict</code> 경로(§8.4)뿐이고, 그조차 <code>plan_keep</code>으로 흡수 중이다.</li>
+<li>"새 eviction 기법을 <code>engine/src/pressure/</code>에 match arm으로 추가" — ✗. 별도 technique crate + <code>KV_CACHE_STAGES</code> 등록 1줄이 정식 경로다(엔진 코어 edit 0).</li>
+<li>"PipelineStage를 구현했으니 decode 중에 호출되겠지" — ✗(현재). <code>PipelineStage</code>는 미배선 additive 타입이다. 동작이 필요하면 live 경로(<code>CachePressureHandler</code>)를 확인하라.</li>
+</ul></div>
+</section>
+
+<section>
+<h2>4. Layer — transformer 디코더 블록 <em>전용</em></h2>
+<p>"Layer"는 이 코드베이스에서 transformer 디코더 블록만 가리킨다(Llama 3.2 1B 기준 16개). 코드의 <code>TransformerLayer</code>는 한 블록의 weight 묶음이다: attention 4종(<code>wq</code>/<code>wk</code>/<code>wv</code>/<code>wo</code>), MLP 3종(<code>w_gate</code>/<code>w_up</code>/<code>w_down</code>), norm 2종(<code>attention_norm</code>/<code>ffn_norm</code>), 그리고 모델별 optional 필드(Qwen <code>qkv_bias</code>, Gemma3 <code>q_norm</code>/<code>k_norm</code>/<code>pre_ffn_norm</code>/<code>post_ffn_norm</code>, tensor partition용 <code>partition_ctx</code>).</p>
+<p>KV·weight가 <em>어떤 표현으로 저장되는가</em>는 Layer가 아니라 <strong>Format</strong>이다(§2). 이 구분이 깨지면 "layer 16개" (디코더 블록)와 "format 멤버" (f16/q4_0/KIVI)가 한 문장에서 충돌한다. <code>KVCacheFormat::idx()</code>가 "이 format이 어느 decoder layer의 KV인가"를 돌려주는 데서 보듯, 둘은 직교 개념이다 — layer 하나당 format 인스턴스 하나가 붙는다.</p>
+<p class="evidence">근거: <code>engine/src/layers/transformer_layer.rs::TransformerLayer</code>(L29), <code>engine/src/format/kv_cache_format.rs::KVCacheFormat::idx</code> doc</p>
+<div class="warn"><strong>안티패턴</strong>: "KV cache를 KIVI layer로 바꾸자" — ✗. "KIVI <strong>format</strong>으로 바꾸자"가 맞다. / "layer 단위 quantization"이 디코더 블록별 weight precision을 뜻하는지(QCF_weight 영역, §6), 저장 표현 변경(format)을 뜻하는지 항상 명시하라.</div>
+</section>
+
+<section>
+<h2>5. Handle 3종 — Stage가 데이터를 잡는 방식</h2>
+<p>Stage가 자신이 조절할 데이터를 보유하는 참조의 정적 타입은 정확히 3가지 메뉴다. 4번째는 없다.</p>
+
+<table>
+<tr><th>종류</th><th>정적 타입 형태</th><th>계약</th><th>코드 실례</th></tr>
+<tr><td><strong>Base-trait-handle</strong></td><td><code>Arc&lt;dyn KVCacheFormat&gt;</code></td><td>밑의 format이 무엇인지 <em>몰라야</em> 한다 (format-agnostic). downcast 불가 — trait에 <code>as_any()</code>가 의도적으로 없다.</td><td><code>ForwardGenFmtArgs.fmt: &amp;Arc&lt;dyn KVCacheFormat&gt;</code> — decode forward가 KV write + attention을 이 핸들로만 위임</td></tr>
+<tr><td><strong>Concrete-handle</strong></td><td><code>Arc&lt;StandardFormat&gt;</code></td><td>특정 구체 타입을 <em>아는 것이 정상</em>. base trait에 없는 inherent 메서드(<code>with_cache_mut</code> 등)를 직접 호출한다.</td><td><code>session/forward/model_forward.rs</code>의 <code>fmt_caches: Option&lt;Vec&lt;Arc&lt;StandardFormat&gt;&gt;&gt;</code> — non-forward 연산(reset 등)이 inner <code>KVCache</code>에 도달하는 seam</td></tr>
+<tr><td><strong>Capability-handle</strong></td><td><code>Arc&lt;dyn SomeCapability&gt;</code></td><td>이종 format/backend을 가로지르는 <em>능력</em>의 추상. <strong>소비자가 둘 이상일 때만</strong> 만든다 — 하나뿐이면 가설적 seam이라 금지.</td><td><code>KiviCache.kivi: Option&lt;Arc&lt;dyn KiviAttentionBackend&gt;&gt;</code> — construction 시 <code>CapabilityRegistry</code>에서 pull해 보유</td></tr>
+</table>
+
+<pre class="mermaid">
+flowchart LR
+    subgraph Q["어떤 handle을 들어야 하나"]
+        A{"밑의 format을 알아야 하나"}
+        A -- "아니오 (position만 봄: Sliding)" --> B["Base-trait-handle: dyn KVCacheFormat"]
+        A -- "예 (원본 K 직접 읽기: D2O)" --> C["Concrete-handle: StandardFormat"]
+        A -- "format이 아니라 backend 능력이 필요" --> D{"소비자가 둘 이상인가"}
+        D -- "예" --> E["Capability-handle: dyn SomeCapability"]
+        D -- "아니오" --> F["만들지 않는다 — 가설적 seam 금지"]
+    end
+</pre>
+
+<p>Capability-handle의 공급원이 <code>CapabilityRegistry</code>다 — (backend → capability handle) 매핑을 담는 typed anymap으로, <code>register::&lt;C&gt;(Arc&lt;C&gt;)</code> / <code>get::&lt;C&gt;() -&gt; Option&lt;Arc&lt;C&gt;&gt;</code> 두 메서드뿐이다. 소비자는 construction(cold) 시점에 1회 pull해 핸들을 보유하므로 hot path에 per-forward lookup 분기가 없다. 키는 <code>TypeId::of::&lt;Arc&lt;C&gt;&gt;</code>라서 register와 get의 타입 인자가 정확히 같아야 한다.</p>
+<p class="evidence">근거: <code>engine/src/layers/transformer_layer/forward_gen_fmt.rs::ForwardGenFmtArgs.fmt</code>(L33), <code>engine/src/session/forward/model_forward.rs::fmt_caches</code>(L73), <code>engine/src/pressure/kivi_cache.rs::KiviCache.kivi</code>(L259), <code>engine/src/capability.rs::CapabilityRegistry</code>(L40), <code>crates/technique-api/src/lib.rs::BackendCapability</code>(L1188)</p>
+
+<div class="warn"><strong>안티패턴</strong>:
+<ul>
+<li>"Sliding이 <code>fmt</code>를 <code>StandardFormat</code>으로 downcast해서 빠르게 처리" — ✗. base-trait-handle을 든 Stage는 format을 몰라야 하고, downcast 자체가 trait 설계로 차단되어 있다. 구체 접근이 필요하면 처음부터 concrete-handle을 들어라.</li>
+<li>"미래에 다른 backend도 쓸 수 있으니 capability trait을 미리 만들어 두자" — ✗. 소비자 1개면 만들지 않는다. 실제로 <code>ScoreCollector</code>/<code>TierMovable</code>은 "첫 소비자 등장 전까지 만들지 않는다"고 <code>capability.rs</code> 모듈 doc에 명시되어 있다.</li>
+<li><code>CapabilityRegistry</code> 함정: register/get의 타입 키가 다르면 panic이 아니라 <strong>silent miss</strong>(<code>None</code>)다. "capability가 안 잡히는데 에러도 없다"면 양쪽 trait bound가 같은지부터 확인하라.</li>
+</ul></div>
+</section>
+
+<section>
+<h2>6. QCF 두 패밀리 — QCF_kv vs QCF_weight</h2>
+<p>QCF(Quality Cost Function)는 lossy action의 품질 열화를 추정하는 메트릭인데, <strong>측정 공간이 다른 두 패밀리</strong>가 있고 이름이 비슷해 가장 자주 오용된다.</p>
+
+<table>
+<tr><th></th><th>QCF_kv</th><th>QCF_weight</th></tr>
+<tr><td>측정 공간</td><td>attention output: <code>QCF = ‖O_before − O_after‖ / ‖O_before‖</code>, <code>O = Σ_t α_t · V_t</code></td><td>forward path의 weight/layer 단위: <code>QCF_swap(S) = Σ_{i∈S} imp_i / Σ_{j valid} imp_j</code> (0..1 clamp)</td></tr>
+<tr><td>포함 액션</td><td>sliding/H2O/streaming eviction, D2O merge (<code>QcfActionType</code> 4종), KIVI quant flush(NMSE 등)</td><td>weight swap(F16→Q4), layer skip(SWIFT) — <code>ImportanceTable</code> 공유</td></tr>
+<tr><td>주 코드 위치</td><td><code>engine/src/qcf/qcf_kv.rs::compute_qcf_kv</code>, <code>qcf/quant_qcf.rs::compute_flush_nmse</code></td><td><code>engine/src/pressure/weights/decider.rs::compute_qcf_weight_swap</code>, <code>qcf/skip_qcf.rs::SkipQcfTracker</code></td></tr>
+<tr><td>운반 타입</td><td colspan="2"><code>qcf_types::QcfMetric { action, raw_value, normalized_value, per_head, tokens_affected }</code> — <code>HandlerContext.qcf_sink</code>로 수집</td></tr>
+</table>
+
+<p>QCF_kv 쪽 세부: <code>QcfActionType</code>은 <code>EvictSliding</code>/<code>EvictH2o</code>/<code>EvictStreaming</code>/<code>MergeD2o</code>를 simulate하며, D2O merge 시뮬레이션은 actuator(<code>pressure/d2o_handler.rs</code>)와 lockstep으로 유지된다 — Eq.11 그룹 정규화(<code>w_c = e/D</code>, <code>e = MERGE_E = 0.1</code>, u는 exp 전 [-10,10] clamp), nearest 매핑은 per-head K cosine. 단 EMA threshold filter는 simulator에 적용하지 않으므로 estimator 값은 실제 QCF의 <strong>상한</strong>이다.</p>
+<p>QCF_weight 쪽 세부: <code>compute_qcf_swap_internal</code>은 NaN-ε layer를 분자·분모 양쪽에서 제외하고(애초에 유효 swap 후보가 아니었던 layer), importance 테이블 부재 시 1.0을 기본값으로 쓴다. layer skip이 weight 패밀리에 속하는 이유는 "그 layer의 weight를 쓰지 않는" 동작이라서다.</p>
+<p><strong>직접 비교 불가</strong>: 두 패밀리는 측정 공간이 다르므로 raw 값끼리 비교할 수 없다. cross-family 비교는 <code>DegradationEstimator</code>(offline-calibrated piecewise-linear 곡선)로 ΔPPL로 환산한 뒤에만 가능하다.</p>
+<p class="evidence">근거: <code>engine/src/qcf/qcf_kv.rs</code> 모듈 doc(핵심 수식)·<code>::QcfActionType</code>, <code>engine/src/pressure/weights/decider.rs::compute_qcf_weight_swap</code>(L267)·<code>::compute_qcf_swap_internal</code>(L278), <code>engine/src/qcf.rs</code> 모듈 doc(<code>DegradationEstimator</code> ΔPPL 환산), <code>engine/src/qcf_types.rs::QcfMetric</code>(L110)</p>
+
+<div class="warn"><strong>안티패턴</strong>: "H2O eviction의 QCF가 0.3이고 weight swap의 QCF가 0.2니까 swap이 덜 해롭다" — ✗. 앞은 attention output 공간, 뒤는 weight importance 비율 공간이다. 비교하려면 둘 다 <code>DegradationEstimator</code>로 ΔPPL 환산 후 비교하라(estimator에 액션별 곡선이 등록되어 있어야 함).</div>
+</section>
+
+<section>
+<h2>7. KVLayout — HeadMajor / SeqMajor</h2>
+<p>KV 캐시 버퍼의 메모리 배치 enum. element offset 공식까지 외워 둘 가치가 있다 — eviction·QCF·GPU scatter가 전부 이 공식 위에 서 있다.</p>
+<pre><code>// engine/src/kv_cache_ops.rs
+pub enum KVLayout { SeqMajor, HeadMajor }
+
+// engine/src/pressure/kv_cache.rs::offset(pos, head)
+SeqMajor:  pos * kv_heads * head_dim + head * head_dim   // [batch, seq_pos, kv_heads, head_dim]
+HeadMajor: head * capacity * head_dim + pos * head_dim    // [batch, kv_heads, seq_pos, head_dim]
+
+// pos_stride() — 같은 head에서 인접 position 간 element 간격
+SeqMajor:  kv_heads * head_dim
+HeadMajor: head_dim</code></pre>
+<p>HeadMajor의 offset에 <code>capacity</code>(물리 용량)가 들어가는 점에 주의 — head별 구획 크기가 <code>current_pos</code>가 아니라 capacity로 고정되므로, 캐시 grow 시 head 구획 전체의 재배치가 필요하다. GPU 커널은 <code>kv_pos_stride</code>/<code>kv_head_stride</code> 인자로 stride 기반 접근을 하므로 flash attention 자체는 layout-agnostic이다.</p>
+<p class="evidence">근거: <code>engine/src/kv_cache_ops.rs::KVLayout</code>(L18), <code>engine/src/pressure/kv_cache.rs::offset</code>(L183)·<code>::pos_stride</code></p>
+<div class="warn"><strong>실측 교훈 (CLAUDE.md/프로젝트 기록)</strong>: production은 <strong>HeadMajor 고정</strong>이다. flash attention과 attention_scores는 stride-agnostic이지만, OpenCL Plan 경로의 <code>kernel_kv_scatter_f32_to_f16</code>은 HeadMajor offset이 하드코딩되어 있고 qcf/d2o/eviction 경로도 HeadMajor를 전제한다. SeqMajor를 선택하면 에러 없이 <strong>silent garbage</strong>가 나온다(2026-04-14 실측). 예외: <code>KiviCache</code>는 자체 residual 레이아웃 <code>[kv_heads, res_cap, head_dim]</code>을 쓰며 doc상 "SeqMajor layout only (Phase 1)"다 — KIVI 경로 리뷰 시 KVCache의 HeadMajor 가정과 섞지 말 것.</div>
+</section>
+
+<section>
+<h2>8. 코드 enum 어휘 — Pressure 계열</h2>
+
+<h3>8.1 PressureLevel (live)</h3>
+<p><code>pub type PressureLevel = llm_shared::Level</code> — 4단계 이산 레벨 <code>Normal &lt; Warning &lt; Critical &lt; Emergency</code> (Ord derive). IPC 신호 타입(<code>llm_shared</code>)을 그대로 재사용하는 type alias라는 점이 포인트다: Manager가 보낸 레벨과 엔진 내부 파이프라인 게이트가 같은 타입이다.</p>
+<p class="evidence">근거: <code>engine/src/pressure.rs::PressureLevel</code>(L45), <code>shared/src/lib.rs::Level</code>(L26)</p>
+
+<h3>8.2 Pressure / PressureSource (α-W additive — 미배선)</h3>
+<p><code>Pressure(u8)</code>는 memory·thermal·energy 등 여러 system 압력을 0~100 단일 scalar로 융합한 graded 입력이다(<code>new()</code>가 100으로 clamp). <strong>의도적 lossy 단일화</strong> — 소비 Stage는 압력의 출처를 구분하지 않는다. scalar로 환원 불가한 mode 동작(switch/suspend — "73만큼 switch"는 없다)은 이 값이 아니라 별도 이산 명령 채널로 흐른다. <code>PressureSource</code> trait(<code>fn pressure(&amp;self) -&gt; Pressure</code>) 뒤에 Manager 통합값/로컬 자율 소스가 숨는다. <code>band()</code>가 4-level로 강등하는 cutoff(0–49 Normal / 50–74 Warning / 75–89 Critical / 90+ Emergency)는 코드 주석이 명시한 <strong>day-1 placeholder</strong>이며, <code>band()</code>는 현재 어떤 live 경로에도 배선되어 있지 않다.</p>
+<p class="evidence">근거: <code>engine/src/pipeline.rs::Pressure</code>(L24)·<code>::Pressure::band</code>(L44, placeholder 명시)·<code>::PressureSource</code>(L59)</p>
+
+<h3>8.3 CachePressureHandler / CachePressurePipeline / ActionResult (live production 경로)</h3>
+<pre class="mermaid">
+classDiagram
+    class CachePressurePipeline {
+        stages: Vec~PressureStageConfig~
+        execute(ctx) Vec~ActionResult~
+    }
+    class PressureStageConfig {
+        min_level: PressureLevel
+        handler: Box~dyn CachePressureHandler~
+    }
+    class CachePressureHandler {
+        &lt;&lt;trait&gt;&gt;
+        handle(ctx: HandlerContext) ActionResult
+        name() str
+    }
+    class HandlerContext {
+        caches: mut KVCache 슬라이스
+        importance / head_importance
+        pressure_level: PressureLevel
+        mem_available / target_ratio
+        qcf_sink / layer_ratios
+    }
+    class EvictionHandler {
+        policy: Box~dyn EvictionPolicy~
+        target_ratio: f32
+    }
+    class EvictionPolicy {
+        &lt;&lt;trait, legacy&gt;&gt;
+        should_evict() / evict() / plan_keep()
+    }
+    CachePressurePipeline o-- PressureStageConfig
+    PressureStageConfig o-- CachePressureHandler
+    CachePressureHandler <|.. EvictionHandler
+    CachePressureHandler <|.. SwapHandler
+    CachePressureHandler <|.. D2OHandler
+    CachePressureHandler <|.. QuantizeHandler : stub - 항상 NoOp
+    EvictionHandler o-- EvictionPolicy
+    EvictionPolicy <|.. SlidingWindowPolicy
+    EvictionPolicy <|.. H2OPolicy
+    EvictionPolicy <|.. H2OPlusPolicy
+    CachePressureHandler ..> HandlerContext
+</pre>
+<p>2-tier 추상화의 상위가 <code>CachePressureHandler</code>다 — eviction을 넘어 swap·quantize·merge를 일반화한 trait로, <code>handle(&amp;self, ctx: &amp;mut HandlerContext) -&gt; Result&lt;ActionResult&gt;</code> 하나가 계약이다. <code>CachePressurePipeline::execute</code>는 <code>min_level</code> 오름차순으로 정렬된 stage들 중 <code>ctx.pressure_level &gt;= stage.min_level</code>인 것을 순차 실행하고, 각 핸들러는 직전 핸들러가 남긴 캐시 상태를 본다. 같은 핸들러를 레벨별 다른 계수로 여러 슬롯에 등록할 수도 있다.</p>
+<p><code>ActionResult</code>는 핸들러 실행 결과 enum이며 현재 코드에 <strong>정확히 4개 variant</strong>가 있다:</p>
+<pre><code>// engine/src/pressure.rs (L81)
+pub enum ActionResult {
+    NoOp,
+    Evicted { tokens_removed: usize, new_pos: usize },
+    Swapped { tokens_swapped: usize },
+    WeightSwapped { layers_changed: usize, freed_bytes: usize, duration_ms: f64 },
+}</code></pre>
+<div class="note">과거 문서·메모리에 기록된 <code>Quantized</code>/<code>Recalled</code> variant(생산자 없는 dead variant)는 기준 커밋에서 <strong>이미 삭제</strong>되었다. 현재 살아있는 생산자: <code>EvictionHandler</code>·<code>D2OHandler</code> → <code>Evicted</code>, <code>SwapHandler</code> → <code>Swapped</code>, <code>WeightSwapHandler::execute_swap</code> → <code>WeightSwapped</code>(파이프라인 밖 직접 dispatch). <code>QuantizeHandler</code>는 등록은 되지만 <strong>항상 <code>NoOp</code>를 반환하는 stub</strong>이다 — 실제 KIVI quantization은 이 핸들러가 아니라 <code>KiviCache</code> 자체 경로로 동작한다. 리뷰에서 "quantize 핸들러가 처리하겠지"라고 가정하지 말 것.</div>
+<p class="evidence">근거: <code>engine/src/pressure.rs::ActionResult</code>(L81)·<code>::CachePressureHandler</code>(L116)·<code>::HandlerContext</code>(L50)·<code>::CachePressurePipeline::execute</code>(L184), <code>engine/src/pressure/quantize_handler.rs</code>(L51·L58 — 모든 경로 NoOp), <code>engine/src/pressure/weight_swap_handler.rs::execute_swap</code>(L90)</p>
+
+<h3>8.4 EvictionPolicy (legacy, 흡수 중)</h3>
+<p>2-tier의 하위 trait — 영구 토큰 삭제 전용이다. <code>should_evict</code> / <code>evict(cache, target_len)</code> / <code>evict_with_scores</code> / <code>evict_with_head_scores</code>(GQA per-head)로 <code>&amp;mut KVCache</code>를 <strong>in-place 변형</strong>한다. 구현: <code>NoEvictionPolicy</code>, <code>SlidingWindowPolicy</code>, <code>H2OPolicy</code>, <code>H2OPlusPolicy</code>, <code>StreamingLLMPolicy</code>. <code>EvictionHandler</code>가 이를 래핑해 상위 파이프라인에 연결하며 <code>target_len = current_pos × target_ratio</code>(ratio는 0.1~0.99로 clamp)를 계산해 넘긴다. in-place 방식은 merge(D2O)·per-head keep을 못 담는 한계가 있어, plan-returning으로의 다리인 <code>plan_keep()</code>(default <code>None</code> = 미지원)이 trait에 추가되어 <code>KVCacheStage</code>로 흡수 중이다 — 마이그레이션 동안 두 경로가 branch-by-abstraction으로 공존한다.</p>
+<p class="evidence">근거: <code>engine/src/pressure/eviction.rs::EvictionPolicy</code>(L13)·<code>::plan_keep</code>(L68, default None), <code>engine/src/pressure/eviction_handler.rs::EvictionHandler</code>(L23)</p>
+
+<div class="warn"><strong>안티패턴</strong>:
+<ul>
+<li>"<code>PressureLevel</code>이 50을 넘으면…" — ✗. <code>PressureLevel</code>은 4-variant enum이고, 0~100 scalar는 별개 타입 <code>Pressure</code>다. 그리고 <code>Pressure</code>는 아직 live 경로에 미배선이다 — production 게이트는 <code>PressureLevel</code> 비교(<code>ctx.pressure_level &gt;= min_level</code>)다.</li>
+<li>"<code>ActionResult::Quantized</code>에 match를 추가" — ✗. 그 variant는 존재하지 않는다(컴파일 에러). 옛 문서를 보고 코드를 추정하지 말 것.</li>
+<li>"새 캐시 관리 기법이니 <code>EvictionPolicy</code>를 구현하자" — △. 영구 삭제 외의 동작(merge·per-head·quantize)은 legacy trait에 안 담긴다. 신규 기법은 <code>KVCacheStage</code>(§3)가 정식 표면이다.</li>
+</ul></div>
+</section>
+
+<section>
+<h2>9. 추론 단계·메모리 용어</h2>
+
+<h3>9.1 Prefill / Decode</h3>
+<p><strong>Prefill</strong>은 프롬프트의 배치 토큰(seq_len &gt; 1)을 한 번에 forward하여 KV 캐시를 구축하는 1단계, <strong>Decode</strong>는 토큰 단위(seq_len = 1)로 반복 생성하는 2단계다. layer 레벨 진입점이 갈린다 — prefill은 <code>forward_prefill_fmt</code>, decode는 <code>forward_gen</code>(legacy generic) 또는 <code>forward_gen_fmt</code>(base-trait-handle fork). 세션 레벨에서는 <code>session/decode_loop.rs::DecodeLoop</code>가 루프를 소유하고, eviction 등 stage 동작은 forward 호출 사이에 <strong>caller 책임</strong>으로 끼어든다(모델은 eviction을 모른다). 전체 흐름은 <a href="04_inference_pipeline.html">04. 추론 파이프라인</a>.</p>
+<p class="evidence">근거: <code>engine/src/layers/transformer_layer/forward_prefill_fmt.rs::forward_prefill_fmt</code>, <code>engine/src/layers/transformer_layer/forward_gen_fmt.rs::forward_gen_fmt</code>("decode, seq_len=1"), <code>engine/src/session/decode_loop.rs::DecodeLoop</code>(L30)</p>
+
+<h3>9.2 KIVI — format이자 stage 합성</h3>
+<p>KV를 quantized 블록 + F32 residual로 양자화하는 format 멤버. <code>KiviCache</code>의 자료구조: 양자화 저장(<code>qk</code>/<code>qv</code>, Q2/Q4/Q8 — <code>bits</code> 필드 2/4/8, <code>transition_bits()</code>로 동적 전환), residual 버퍼 <code>res_k</code>/<code>res_v</code>(F32, <code>[kv_heads][res_cap][head_dim]</code>, <code>res_cap</code>은 group size 32의 배수), 카운터 <code>q2_tokens</code>(양자화 토큰 수, 항상 res_cap 배수)·<code>res_pos</code>(residual 유효 토큰 수). 양자화 방향이 K/V 비대칭이다 — Key는 <strong>per-channel</strong>(head별 head_dim 채널 각각을 토큰 방향 32개 그룹으로), Value는 <strong>per-token</strong>(토큰별 head_dim 값을 32개 그룹으로). GPU 모드에서는 <code>attention_gen_kivi</code> 커널이 dequant 없이 <code>KiviRawBuffers</code>(양자화 블록 + residual 참조 + <code>bits</code>)를 직접 읽는다. "KV를 Q2로 다시 까는" 변환이 상주 데이터를 수정하므로 stage와의 합성이다(§1 note).</p>
+<p class="evidence">근거: <code>engine/src/pressure/kivi_cache.rs::KiviCache</code>(L205, struct doc에 per-channel/per-token 명세), <code>engine/src/kv_cache_ops.rs::KiviRawBuffers</code>(L27)</p>
+
+<h3>9.3 Zero-copy — UnifiedBuffer vs rpcmem</h3>
+<p>CPU↔GPU memcpy 제거 기법의 총칭인데 두 메커니즘을 구분해야 한다. <code>UnifiedBuffer</code>는 <code>CL_MEM_ALLOC_HOST_PTR</code>로 GPU 버퍼를 CPU 포인터로 매핑하는 경로(<code>engine/src/memory/opencl/unified.rs</code>), rpcmem은 DMA-BUF heap 할당 + <code>CL_MEM_USE_HOST_PTR</code> alias 경로(<code>engine/src/memory/rpcmem/</code>)다.</p>
+<div class="warn"><strong>실측 교훈 (CLAUDE.md)</strong>: Adreno(Galaxy S25)에서 <code>CL_MEM_ALLOC_HOST_PTR</code>(UnifiedBuffer / <code>--zero-copy</code>)는 driver internal pool alloc이라 <strong>zero-copy 효과가 없다</strong>. 진짜 zero-copy 원천은 rpcmem DMA-BUF interop(<code>--opencl-rpcmem</code>)이다. 또한 ARM UMA 캐시 비일관성 때문에 <code>as_ptr</code> 직접 접근은 stale cache를 읽는다 — <code>read_buffer</code>/<code>write_buffer</code> 경유가 필수다. 이는 코드만으로 확인 불가한 디바이스 실측 지식이다.</div>
+<p>상세는 <a href="06_memory.html">06. 메모리 &amp; 데이터 포맷</a>.</p>
+
+<h3>9.4 Hardware — read-only resolver</h3>
+<p>런타임 <code>Hardware</code> 객체는 backend 레지스트리(<code>{cpu, gpu?, npu?}</code>) ⊥ memory 레지스트리(<code>{host, device?}</code>)를 분리 보유하고, <code>resolve(target: DeviceTarget) -&gt; Option&lt;(backend, memory)&gt;</code>로 UMA/discrete 분기를 한 곳에 가둔다 — <code>device == None</code>이면 UMA로 보고 host memory를 재사용한다. <code>Cpu</code>는 항상 <code>Some</code>(universal floor), <code>Gpu</code>/<code>Npu</code>는 미컴파일·미보유 시 <code>None</code>이고 부재 시 정책은 호출자 몫이다. 활성 backend를 mutable로 들지 않는다 — "현재 device"는 decode-loop local 상태이고, 연산 실행 위치는 텐서가 든 backend 태그(<code>Tensor</code> = Shape + buffer + <code>Arc&lt;dyn Backend&gt;</code>)에서 얻는다. OpenCL과 CUDA는 feature 배타라 <code>DeviceTarget::Gpu</code> 하나로 충분하며, <code>--opencl-rpcmem</code>은 device가 아니라 memory interop이라 variant가 아니다.</p>
+<p class="evidence">근거: <code>engine/src/hardware.rs::Hardware</code>(L52)·<code>::DeviceTarget</code>(L25)·<code>::resolve</code>(L79)</p>
+</section>
+
+<section>
+<h2>10. 안티패턴 빠른 참조</h2>
+<table>
+<tr><th>틀린 문장</th><th>왜 틀렸나</th><th>고친 문장</th></tr>
+<tr><td>"KV를 Q4 <em>Layer</em>로 저장"</td><td>Layer = 디코더 블록 전용</td><td>"KV를 q4_0 <em>format</em>으로 저장"</td></tr>
+<tr><td>"이 Stage가 버퍼에서 토큰을 직접 지운다"</td><td><code>KVCacheStage</code>는 plan-returning — 변형은 엔진 독점</td><td>"이 Stage가 keep-list를 plan으로 반환하면 <code>execute_kv_plan</code>이 compact한다"</td></tr>
+<tr><td>"QCF_kv 0.3 &gt; QCF_weight 0.2니 후자 선택"</td><td>측정 공간이 다름</td><td>"둘 다 <code>DegradationEstimator</code>로 ΔPPL 환산 후 비교"</td></tr>
+<tr><td>"fmt를 <code>StandardFormat</code>으로 downcast"</td><td>base-trait-handle은 format-agnostic 계약, <code>as_any</code> 없음</td><td>"concrete-handle(<code>Arc&lt;StandardFormat&gt;</code>)을 register 시점부터 든다"</td></tr>
+<tr><td>"capability trait을 미리 만들어 두자"</td><td>소비자 1개 = 가설적 seam 금지</td><td>"둘째 소비자가 등장할 때 promotion"</td></tr>
+<tr><td>"SeqMajor로 돌려도 되겠지"</td><td>Plan 경로 HeadMajor 하드코딩 → silent garbage (실측)</td><td>"production은 HeadMajor 고정"</td></tr>
+<tr><td>"<code>ActionResult::Quantized</code> 처리 추가"</td><td>해당 variant는 제거됨 (4 variants만 존재)</td><td>"quantize는 <code>KiviCache</code> 자체 경로 — 핸들러는 NoOp stub"</td></tr>
+<tr><td>"<code>PipelineStage</code> 구현으로 decode hook 동작"</td><td>α-W additive — live 미배선</td><td>"live hook은 <code>CachePressureHandler</code> 파이프라인 (마이그레이션 전까지)"</td></tr>
+</table>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="01_overview.html">← 01. 시스템 개요</a></span><span><a href="03_code_map.html">03. 코드베이스 지도 →</a></span></footer>
+</body>
+</html>

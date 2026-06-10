@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08. Resilience &amp; IPC — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 08</span></nav>
+<header>
+<h1>08. Resilience &amp; IPC</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<section>
+<h2>1. 한눈에 보기 — 두 프로세스, 두 채널</h2>
+<p>
+llm.rs의 resilience 시스템은 <strong>별도 프로세스</strong>인 <code>llm_manager</code>(시스템 리소스 매니저)가
+디바이스 상태(메모리·온도·전력·연산 부하)를 감시하고, 추론 엔진에게 IPC로 명령을 내려
+추론 품질·속도·메모리 사용을 런타임에 조절하는 구조다. 양쪽은 같은 wire 타입 크레이트
+<code>llm_shared</code>(<code>shared/src/lib.rs</code>)를 공유한다.
+</p>
+<p>
+엔진으로 들어오는 제어 입력은 성격에 따라 <strong>두 채널</strong>로 나뉜다:
+</p>
+<ul>
+<li><strong>이산(discrete) 명령 채널</strong> — <code>EngineCommand</code> enum. switch/suspend/throttle/evict 같은
+<em>mode</em> 동작. Manager가 <code>EngineDirective</code>로 묶어 보내고, 엔진의 <code>CommandExecutor</code>가
+토큰마다 poll하여 <code>ExecutionPlan</code>으로 번역한다. 이 챕터의 주제다.</li>
+<li><strong>graded <a href="05_abstractions.html">Pressure</a> 채널</strong> — <code>Pressure(u8)</code> 0~100 scalar.
+memory 압력처럼 "얼마나"가 중요한 입력은 이산 명령이 아니라 scalar로 흐르도록 설계되었다(§8).
+단, 이 채널은 Phase α-W에서 타입만 신설된 additive 상태로 아직 live decode loop에 배선되지 않았다.</li>
+</ul>
+<div class="note">
+<strong>용어 주의 — <code>ResilienceAction</code>은 폐기된 이름이다.</strong>
+과거 설계에서 strategy의 출력이던 <code>ResilienceAction</code>은 현재 코드에 존재하지 않는다.
+<code>ResilienceStrategy::react()</code>의 출력 타입은 <code>Vec&lt;EngineCommand&gt;</code>로 단일화되었다
+(strategy.rs 주석: "구 <code>ResilienceAction</code> 폐기, EngineCommand 단일 어휘").
+마찬가지로 구 <code>MemoryStrategy</code>도 삭제되어 memory 압력은 strategy 경로를 타지 않는다.
+</div>
+<p class="evidence">근거: <code>engine/src/resilience/strategy.rs::ResilienceStrategy</code> (trait, L29 — react → Vec&lt;EngineCommand&gt;), <code>engine/src/resilience/manager.rs::Strategies</code> (L32 주석 — MemoryStrategy 폐기), <code>engine/src/pipeline.rs::Pressure</code> (L24)</p>
+
+<pre class="mermaid">
+flowchart LR
+  subgraph MGR["llm_manager 프로세스"]
+    MON["Monitor 스레드 4+1종<br/>memory / thermal / compute / energy / external"]
+    POL["PolicyStrategy<br/>(HierarchicalPolicy 또는 LuaPolicy)"]
+    DEDUP["DirectiveDeduplicator"]
+    MON -- "mpsc SystemSignal" --> POL
+    POL -- "EngineDirective" --> DEDUP
+  end
+  subgraph WIRE["Transport"]
+    T["UnixSocket / TCP / D-Bus<br/>4B BE 길이 + JSON"]
+  end
+  subgraph ENG["엔진 프로세스 (argus_cli / legacy_generate)"]
+    ML["MessageLoop 스레드<br/>(transport 소유)"]
+    EX["CommandExecutor<br/>(sticky 상태 + heartbeat)"]
+    DL["DecodeLoop<br/>(per-token poll)"]
+    CM["CacheManager / Forward"]
+    ML -- "cmd_rx: ManagerMessage" --> EX
+    EX -- "ExecutionPlan" --> DL
+    DL -- "try_evict / try_offload / sleep" --> CM
+    EX -- "resp_tx: EngineMessage<br/>(Heartbeat / Response / QcfEstimate)" --> ML
+  end
+  DEDUP --> T --> ML
+  ML -- "상향 메시지" --> T --> POL
+</pre>
+</section>
+
+<section>
+<h2>2. 프로토콜 어휘 — <code>shared/src/lib.rs</code></h2>
+<p>
+Manager↔Engine 사이를 오가는 모든 타입은 <code>llm_shared</code> 크레이트 한 파일에 정의되어 있고
+serde JSON으로 직렬화된다. 엔진 내부의 <code>engine/src/resilience/signal.rs</code>는 이들의 re-export일 뿐이다.
+</p>
+<p class="evidence">근거: <code>engine/src/resilience/signal.rs</code> (L1~9 — <code>pub use llm_shared::*</code> re-export만 존재)</p>
+
+<h3>2.1 Level — 공통 4단계 심각도</h3>
+<pre><code>pub enum Level { Normal, Warning, Critical, Emergency }  // PartialOrd: Normal &lt; ... &lt; Emergency</code></pre>
+<p>
+모든 <code>SystemSignal</code>이 공유하는 심각도다. <code>Ord</code> derive 덕에 <code>a.max(b)</code>로
+"가장 나쁜 신호" 집계가 가능하고, 이것이 <code>OperatingMode::from_levels()</code>의 기반이다(§6.3).
+프로토콜 레벨(Manager↔Engine 통신)에는 별도의 <strong>3단계</strong> <code>ResourceLevel { Normal, Warning, Critical }</code>이
+존재한다 — 주석에 따르면 내부 모니터는 4단계를 쓰고, PolicyEngine이 Emergency를 <code>Suspend</code> 명령으로 변환하므로
+wire에는 3단계만 필요하다.
+</p>
+<p class="evidence">근거: <code>shared/src/lib.rs::Level</code> (L26), <code>::ResourceLevel</code> (L170, 주석 L166~167)</p>
+
+<h3>2.2 SystemSignal — 신호 4종</h3>
+<table>
+<thead><tr><th>variant</th><th>payload 필드</th><th>의미</th></tr></thead>
+<tbody>
+<tr><td><code>MemoryPressure</code></td><td><code>level</code>, <code>available_bytes: u64</code>, <code>total_bytes: u64</code>, <code>reclaim_target_bytes: u64</code></td><td>시스템 메모리 압력. reclaim 목표 바이트까지 포함</td></tr>
+<tr><td><code>ComputeGuidance</code></td><td><code>level</code>, <code>recommended_backend: {Cpu,Gpu,Any}</code>, <code>reason: ComputeReason</code>, <code>cpu_usage_pct: f64</code>, <code>gpu_usage_pct: f64</code></td><td>백엔드 전환 권고. reason은 CpuBottleneck/GpuBottleneck/CpuAvailable/GpuAvailable/BothLoaded/Balanced 6종</td></tr>
+<tr><td><code>ThermalAlert</code></td><td><code>level</code>, <code>temperature_mc: i32</code>(밀리℃), <code>throttling_active: bool</code>, <code>throttle_ratio: f64</code></td><td>발열 경보. <code>throttle_ratio</code>는 OS가 이미 깎은 성능 비율</td></tr>
+<tr><td><code>EnergyConstraint</code></td><td><code>level</code>, <code>reason: EnergyReason</code>, <code>power_budget_mw: u32</code></td><td>전력 제약. reason은 BatteryLow/BatteryCritical/PowerLimit/ThermalPower/Charging/None 6종</td></tr>
+</tbody>
+</table>
+<p>
+<code>SystemSignal::level()</code>이 어떤 variant든 <code>Level</code>을 꺼내준다. 각 enum에는
+<code>from_dbus_str()</code> 파서가 있는데 <strong>소문자만 인정하는 case-sensitive</strong> 매칭이다
+(<code>"Normal"</code>은 <code>None</code>).
+</p>
+<p class="evidence">근거: <code>shared/src/lib.rs::SystemSignal</code> (L125~150), <code>::Level::from_dbus_str</code> (L69, 테스트 L498 case-sensitive 검증)</p>
+
+<h3>2.3 EngineCommand — Manager → Engine 명령 어휘</h3>
+<p>
+<code>#[serde(tag = "type", rename_all = "snake_case")]</code> 태그드 enum이며, KV 계열은
+<code>kv.evict_h2o</code>처럼 도메인 prefix로 rename되어 있다. 도메인별 전체 목록:
+</p>
+<table>
+<thead><tr><th>도메인</th><th>variant (wire 이름)</th><th>파라미터</th><th>엔진에서의 효과 (§4~5)</th></tr></thead>
+<tbody>
+<tr><td rowspan="3">Compute</td><td><code>Throttle</code> (<code>throttle</code>)</td><td><code>delay_ms: u64</code></td><td>토큰 사이 고정 sleep. sticky — 다음 directive까지 유지</td></tr>
+<tr><td><code>SetTargetTbt</code> (<code>set_target_tbt</code>)</td><td><code>target_ms: u64</code></td><td>step 전체 wall-clock이 target에 미달하면 잔여분 sleep(pacing). 0 = 해제</td></tr>
+<tr><td><code>LayerSkip</code> (<code>weight.skip</code>)</td><td><code>skip_ratio: f32</code></td><td>transformer layer 일부 skip (QCF_weight 계열, <a href="07_kv_cache.html">07장</a> 참조)</td></tr>
+<tr><td rowspan="7">Memory</td><td><code>SwapWeights</code> (<code>swap_weights</code>)</td><td><code>ratio: f32</code>, <code>target_dtype: DtypeTag</code></td><td>decoder layer weight를 secondary dtype으로 swap. ratio는 <em>상한</em> — 정확한 집합은 엔진의 WeightSwapDecider가 결정. Phase 3 현재 <code>Q4_0</code>만 실행 가능, 나머지 DtypeTag는 <code>"UnsupportedDtype"</code> reject 예약</td></tr>
+<tr><td><code>KvEvictH2o</code> (<code>kv.evict_h2o</code>)</td><td><code>keep_ratio: f32</code></td><td rowspan="4">EvictPlan{target_ratio, level=Critical, method}으로 번역되어 sticky 저장. DecodeLoop가 <code>forward.try_evict()</code>로 1회 실행</td></tr>
+<tr><td><code>KvEvictSliding</code> (<code>kv.evict_sliding</code>)</td><td><code>keep_ratio: f32</code></td></tr>
+<tr><td><code>KvStreaming</code> (<code>kv.evict_streaming</code>)</td><td><code>sink_size</code>, <code>window_size</code></td></tr>
+<tr><td><code>KvMergeD2o</code> (<code>kv.merge_d2o</code>)</td><td><code>keep_ratio: f32</code></td></tr>
+<tr><td><code>KvQuantDynamic</code> (<code>kv.quant_dynamic</code>)</td><td><code>target_bits: u8</code></td><td>KV 캐시 양자화 bit 전환 (KIVI 경로). sticky</td></tr>
+<tr><td><code>KvOffload</code> (<code>kv_offload</code>)</td><td><code>ratio: f32</code> (0~1 clamp)</td><td>가장 오래된 prefix를 disk로 offload. <code>RestoreDefaults</code>가 recall과 짝</td></tr>
+<tr><td>Query</td><td><code>RequestQcf</code> (<code>request_qcf</code>)</td><td>—</td><td>Ok 응답 후 별도 <code>QcfEstimate</code> 메시지 송출 트리거</td></tr>
+<tr><td rowspan="5">Lifecycle</td><td><code>RestoreDefaults</code> (<code>restore_defaults</code>)</td><td>—</td><td>모든 action 상태 초기화 + offload recall</td></tr>
+<tr><td><code>SwitchHw</code> (<code>switch_hw</code>)</td><td><code>device: String</code></td><td>활성 compute unit 전환 ("cpu"/"gpu" 추상 역할 문자열 — 구체 backend 해석은 <a href="05_abstractions.html">Hardware resolver</a> 책임)</td></tr>
+<tr><td><code>PrepareComputeUnit</code> (<code>prepare_compute_unit</code>)</td><td><code>device: String</code></td><td>전환 대비 pre-warm</td></tr>
+<tr><td><code>Suspend</code> / <code>Resume</code></td><td>—</td><td>추론 즉시 중단 / 재개</td></tr>
+<tr><td><code>SetPartitionRatio</code> (<code>set_partition_ratio</code>)</td><td><code>ratio: f32</code></td><td>tensor partition GPU 비율. 0.0/1.0 = partition 해제. sticky</td></tr>
+<tr><td>Prefill</td><td><code>SetPrefillPolicy</code> (<code>set_prefill_policy</code>)</td><td><code>chunk_size?</code>, <code>yield_ms?</code>, <code>cpu_chunk_size?</code></td><td>GPU 점유 경합 관리. 모두 <code>Option</code> — 생략 필드는 현행 유지 (partial update)</td></tr>
+</tbody>
+</table>
+<p>
+<code>EngineCommand::same_kind()</code>는 <code>std::mem::discriminant</code> 비교로 파라미터를 무시한
+variant 동일성을 판정한다 — Manager 쪽 <code>DirectiveDeduplicator</code>가 파라미터의 미세 변동을
+중복으로 처리할 때 쓴다.
+</p>
+<p class="evidence">근거: <code>shared/src/lib.rs::EngineCommand</code> (L189~278), <code>::same_kind</code> (L286), serde rename은 동파일 테스트 L544~707에서 wire 문자열 검증</p>
+
+<h3>2.4 Engine → Manager: EngineMessage 5종</h3>
+<table>
+<thead><tr><th>variant</th><th>송출 시점</th><th>내용</th></tr></thead>
+<tbody>
+<tr><td><code>Capability(EngineCapability)</code></td><td>연결 직후 1회</td><td><code>available_devices</code>, <code>active_device</code>, <code>max_kv_tokens</code>, <code>bytes_per_kv_token</code>, <code>num_layers</code>, <code>available_actions</code></td></tr>
+<tr><td><code>Heartbeat(EngineStatus)</code></td><td>주기 송출 (기본 1초, §4.2)</td><td>장치/처리량/KV 사용량/phase/active·available actions/self_cpu_pct/self_gpu_pct 등 22필드</td></tr>
+<tr><td><code>Response(CommandResponse)</code></td><td>directive 처리 직후</td><td><code>seq_id</code> 에코 + 명령별 <code>CommandResult::{Ok, Partial{achieved,reason}, Rejected{reason}}</code></td></tr>
+<tr><td><code>QcfEstimate(QcfEstimate)</code></td><td><code>RequestQcf</code> 응답 후 별도</td><td>lossy action별 QCF 비용 map + 선택적 <code>layer_swap: LayerSwapEstimate</code>(per-layer importance/noise + ratio별 QCF_swap)</td></tr>
+<tr><td><code>WeightSwapReport</code></td><td><code>SwapWeights</code> 성공 후</td><td>교체 layer 목록, <code>freed_bytes</code>(madvise DONTNEED 회수), <code>latency_ms</code>, <code>qcf_swap_actual</code></td></tr>
+</tbody>
+</table>
+<div class="note">
+<code>available_actions</code>는 <code>EngineCapability</code>와 <code>EngineStatus</code>(heartbeat) <strong>양쪽에 존재</strong>하며,
+필드 주석에 따르면 "둘 중 먼저 도달하는 쪽이 기준"이다. 구버전 엔진이 이 필드를 생략하면
+<code>default = Vec::new()</code>가 "action 목록 미포함" 신호이며 policy는 필터링을 피해야 한다.
+</div>
+<p class="evidence">근거: <code>shared/src/lib.rs::EngineMessage</code> (L455), <code>::EngineCapability.available_actions</code> (L313~319 주석), <code>::EngineStatus</code> (L324~372)</p>
+</section>
+
+<section>
+<h2>3. Transport 계층 — D-Bus / UnixSocket / TCP</h2>
+<h3>3.1 Transport trait과 wire format</h3>
+<pre><code>pub trait Transport: Send + 'static {
+    fn connect(&amp;mut self) -&gt; Result&lt;(), TransportError&gt;;
+    fn recv(&amp;mut self) -&gt; Result&lt;ManagerMessage, TransportError&gt;;   // blocking
+    fn send(&amp;mut self, msg: &amp;EngineMessage) -&gt; Result&lt;(), TransportError&gt;;
+    fn name(&amp;self) -&gt; &amp;str;
+}</code></pre>
+<p>
+소켓 계열(Unix/TCP)의 wire format은 <code>[4바이트 BE u32 길이][UTF-8 JSON payload]</code>이고,
+payload 상한은 <code>MAX_PAYLOAD_SIZE = 64 * 1024</code>(64 KB)다 — 초과 시 <code>ParseError</code>.
+EOF는 <code>Disconnected</code>로, <code>WouldBlock</code>/<code>TimedOut</code>은 <code>Timeout</code>으로 매핑된다.
+</p>
+<p class="evidence">근거: <code>engine/src/resilience/transport.rs::Transport</code> (L49), <code>MAX_PAYLOAD_SIZE</code> (L252), <code>read_exact_from</code> (L255 — 에러 매핑)</p>
+
+<pre class="mermaid">
+classDiagram
+  class Transport {
+    &lt;&lt;trait&gt;&gt;
+    +connect()
+    +recv() ManagerMessage
+    +send(EngineMessage)
+    +name() str
+  }
+  class UnixSocketTransport {
+    path: PathBuf
+    reader / writer: UnixStream
+  }
+  class TcpTransport {
+    addr: String
+    "read timeout 50ms"
+  }
+  class DbusTransport {
+    "org.llm.Manager1 (System Bus)"
+    "legacy signal → directive 변환"
+    next_seq_id: u64
+  }
+  class MockTransport {
+    "테스트용 mpsc 채널"
+  }
+  class MessageLoop {
+    "spawn(transport) → (cmd_rx, resp_tx, JoinHandle)"
+    "단일 스레드: resp drain → blocking recv"
+  }
+  Transport <|.. UnixSocketTransport
+  Transport <|.. TcpTransport
+  Transport <|.. DbusTransport
+  Transport <|.. MockTransport
+  MessageLoop ..> Transport : 소유·구동
+</pre>
+
+<h3>3.2 MessageLoop — 단일 스레드 양방향 브리지</h3>
+<p>
+<code>MessageLoop::spawn(transport)</code>은 transport를 소유하는 스레드 1개를 띄우고
+<code>(cmd_rx: Receiver&lt;ManagerMessage&gt;, resp_tx: Sender&lt;EngineMessage&gt;, JoinHandle)</code>을 돌려준다.
+루프 본체는: ① <code>resp_rx.try_recv()</code>로 나갈 메시지를 전부 송신 → ② <code>transport.recv()</code> blocking 수신 →
+③ <code>Timeout</code>이면 ①로 되돌아감(continue), <code>ParseError</code>는 skip, <code>Disconnected</code>/기타는 루프 종료.
+</p>
+<div class="warn">
+<strong>함정: UnixSocket/D-Bus 경로의 상향 메시지 송신 지연.</strong>
+나가는 메시지(heartbeat 등)는 blocking <code>recv()</code> <em>사이</em>에만 flush된다.
+<code>TcpTransport</code>는 <code>set_read_timeout(50ms)</code>를 걸어 50ms마다 <code>Timeout</code>으로 깨어나 drain하지만,
+<code>UnixSocketTransport::connect()</code>는 read timeout을 설정하지 않는다 — Manager가 directive를 보내지 않는 동안
+heartbeat가 <code>resp_rx</code> 큐에 적체될 수 있다. D-Bus도 signal iterator가 blocking이라 같은 구조다.
+주기 heartbeat가 중요한 시나리오에서는 <code>tcp:</code> transport가 코드상 가장 안전하다.
+</div>
+<p class="evidence">근거: <code>engine/src/resilience/transport.rs::MessageLoop::run_loop</code> (L106~150), <code>TcpTransport::connect</code> (L363~379 — 50ms timeout), <code>UnixSocketTransport::connect</code> (L404~418 — timeout 설정 없음)</p>
+
+<h3>3.3 DbusTransport — 신·구 두 프로토콜</h3>
+<p>
+<code>DbusTransport</code>(<code>resilience</code> feature + zbus 의존)는 System Bus의
+<code>org.llm.Manager1</code>(destination/path/interface 모두 동일 문자열)에 proxy를 걸고
+<code>receive_all_signals()</code> iterator로 수신한다. 수신 분기는 두 갈래다:
+</p>
+<ol>
+<li><strong>신형</strong>: member가 <code>"Directive"</code>인 signal — body의 JSON 문자열을 <code>ManagerMessage</code>로 역직렬화해 그대로 반환.</li>
+<li><strong>legacy</strong>: <code>MemoryPressure</code>/<code>ComputeGuidance</code>/<code>ThermalAlert</code>/<code>EnergyConstraint</code> signal —
+D-Bus 타입 튜플을 <code>SystemSignal</code>로 파싱한 뒤, transport <strong>내부의 하드코딩 매핑</strong>
+<code>signal_to_manager_message()</code>로 <code>EngineCommand</code> 배치를 합성한다. <code>seq_id</code>는 transport가 로컬 카운터로 발급.</li>
+</ol>
+<p>legacy 변환표 (transport 내장 정책):</p>
+<table>
+<thead><tr><th>신호</th><th>Normal</th><th>Warning</th><th>Critical</th><th>Emergency</th></tr></thead>
+<tbody>
+<tr><td>MemoryPressure</td><td>RestoreDefaults</td><td>KvEvictSliding{0.85}</td><td>KvEvictH2o{0.50}</td><td>Suspend</td></tr>
+<tr><td>ComputeGuidance</td><td>RestoreDefaults</td><td>Throttle{30} + SwitchHw{dev}</td><td>Throttle{70} + SwitchHw{dev}</td><td>Suspend</td></tr>
+<tr><td>ThermalAlert</td><td>RestoreDefaults</td><td>Throttle{30} + PrepareComputeUnit{cpu}</td><td>Throttle{70} + SwitchHw{cpu}</td><td>Suspend</td></tr>
+<tr><td>EnergyConstraint</td><td>RestoreDefaults</td><td>SwitchHw{cpu}</td><td>SwitchHw{cpu} + Throttle{70}</td><td>Suspend</td></tr>
+</tbody>
+</table>
+<p>
+엔진→Manager 방향(<code>send</code>)은 <code>EngineMessage</code> JSON을 D-Bus signal <code>"EngineMessage"</code>로
+emit하는 best-effort다.
+</p>
+<div class="warn">
+<strong>D-Bus는 사실상 하향 단방향이다.</strong> Manager 쪽 transport 핸들에서 D-Bus는
+<code>TransportHandle::EmitterOnly</code>로 분류되고 <code>try_recv_engine_message()</code>가 항상 <code>None</code>을 반환한다 —
+엔진이 emit한 heartbeat/QCF/Response는 D-Bus 경로에서는 Manager에 수신되지 않는다.
+heartbeat 기반 정책(QCF 협상, available_actions 필터)을 쓰려면 <code>unix:</code>/<code>tcp:</code> transport가 필요하다.
+</div>
+<p class="evidence">근거: <code>engine/src/resilience/dbus_transport.rs::DbusTransport</code> (상수 L6~10, <code>signal_to_manager_message</code> L34~114, <code>recv</code> L143~189, <code>send</code> L191~211), <code>manager/src/main.rs::TransportHandle::try_recv_engine_message</code> (L55~61)</p>
+</section>
+
+<section>
+<h2>4. 엔진 수신측 — CommandExecutor</h2>
+<h3>4.1 역할과 poll() 사이클</h3>
+<p>
+<code>CommandExecutor</code>는 "strategy 없음 — 명령을 plan으로 번역만 한다"는 명세의 얇은 변환기다.
+<code>cmd_rx</code>/<code>resp_tx</code> 채널 양끝을 쥐고, 추론 루프가 <strong>토큰마다 1회</strong>
+<code>poll(&amp;KVSnapshot) -&gt; ExecutionPlan</code>을 호출한다. poll의 순서:
+</p>
+<ol>
+<li><strong>heartbeat 체크</strong> — <code>last_heartbeat.elapsed() &gt;= heartbeat_interval</code>(production 1000ms)이면 <code>EngineStatus</code> 송출.</li>
+<li><strong>directive drain</strong> — <code>cmd_rx.try_recv()</code>를 비울 때까지 수집. 비어 있으면 sticky 상태(throttle/target_tbt/evict_plan/kv_quant_bits/partition_ratio_sticky)만 실어 즉시 반환.</li>
+<li><strong>명령 적용</strong> — directive별로 <code>apply_command(cmd, &amp;mut plan)</code> 실행, 명령마다 <code>CommandResult</code>를 모아 <code>CommandResponse{seq_id, results}</code>를 directive 단위로 송신.</li>
+<li><strong>sticky carry</strong> — 이번 배치가 덮어쓰지 않은 <code>evict</code>/<code>kv_quant_bits</code>를 이전 sticky 값으로 채움.</li>
+<li><strong>Suspend override</strong> — <code>plan.suspended</code>면 evict/switch/prepare/throttle/resumed를 모두 무효화하고 <code>EngineState::Suspended</code>로 전이.</li>
+</ol>
+<p class="evidence">근거: <code>engine/src/resilience/executor.rs::CommandExecutor::poll</code> (L289~358)</p>
+
+<h3>4.2 ExecutionPlan과 sticky / transient 구분</h3>
+<p>
+<code>ExecutionPlan</code>은 추론 루프가 소비하는 단일 구조체다. 필드의 수명 의미가 셋으로 갈리는데,
+리뷰 시 가장 헷갈리는 지점이므로 분류해 둔다:
+</p>
+<table>
+<thead><tr><th>수명</th><th>필드</th><th>동작</th></tr></thead>
+<tbody>
+<tr><td><strong>sticky</strong> (RestoreDefaults까지 유지)</td><td><code>throttle_delay_ms</code>, <code>target_tbt_ms</code>(+<code>target_tbt_set</code>), <code>evict</code>, <code>kv_quant_bits</code>, <code>partition_ratio</code></td><td>executor 내부 필드에 저장되어 매 poll 재게시. <code>partition_ratio_sticky</code>는 prefill 중 도착한 directive가 decode poll에서도 보이게 하는 ISSUE-5 fix</td></tr>
+<tr><td><strong>transient</strong> (도착한 poll에서만 Some)</td><td><code>switch_device</code>, <code>prepare_device</code>, <code>offload_ratio</code>, <code>layer_skip</code>, <code>request_qcf</code>, <code>restore_defaults</code>, <code>recall_offload</code>, <code>prefill_*</code></td><td>1회성. 그 poll의 소비자가 처리하지 않으면 소실</td></tr>
+<tr><td><strong>sticky-until-consume</strong></td><td><code>swap_weights</code> + executor의 <code>pending_swap_weights</code></td><td>아래 warn 참조</td></tr>
+</tbody>
+</table>
+<div class="warn">
+<strong>LISWAP-6 패턴 — prefill poll이 plan을 버린다.</strong>
+prefill 루프도 heartbeat 유지를 위해 <code>executor.poll()</code>을 호출하지만 반환된 plan을 소비하지 않고 drop한다.
+<code>SwapWeights</code>가 transient 필드에만 기록되면 prefill 중 도착한 directive가 소실되는 버그가 있었다.
+수정: <code>apply_command</code>가 <code>pending_swap_weights</code>에도 저장하고, decode 루프가 매 tick
+<code>take_pending_swap_weights()</code>로 consume할 때까지 executor 내부에 살려 둔다.
+새 명령을 추가할 때 "prefill 중 도착해도 살아남아야 하는가"를 반드시 검토할 것.
+</div>
+<p class="evidence">근거: <code>engine/src/resilience/executor.rs::ExecutionPlan</code> (L19~65), <code>pending_swap_weights</code> (L162~169 주석), <code>take_pending_swap_weights</code> (L258)</p>
+
+<h3>4.3 RestoreDefaults의 미묘한 의미론</h3>
+<p>
+<code>RestoreDefaults</code>는 throttle/target_tbt/evict_plan/kv_quant_bits/partition_ratio_sticky/active_actions를
+모두 초기화하고 <code>recall_offload = true</code>를 세운다. 단 <code>plan.target_tbt_set</code>은
+<strong>의도적으로 false로 남긴다</strong> — 엔진이 "Manager가 명시적으로 0을 보냄(pacing 끔)"이 아니라
+"restore_defaults 분기(CLI 기본값 복귀)"를 타게 하기 위해서다. <code>SetTargetTbt{0}</code>과
+<code>RestoreDefaults</code>는 둘 다 pacing을 멈추지만 엔진의 fallback 동작이 다르다.
+</p>
+<p class="evidence">근거: <code>engine/src/resilience/executor.rs::apply_command</code> RestoreDefaults arm (L484~502, 주석 L489~491), <code>ExecutionPlan.target_tbt_set</code> doc (L31~35)</p>
+
+<h3>4.4 heartbeat와 available_actions 계산</h3>
+<p>
+<code>send_heartbeat()</code>는 <code>KVSnapshot</code>(total_bytes/total_tokens/capacity/protected_prefix/kv_dtype/eviction_policy/skip_ratio)에서
+파생값을 계산한다: <code>kv_cache_utilization = total_tokens / capacity</code>,
+<code>memory_lossy_min = max(protected_prefix / total_tokens, 0.01)</code>, <code>memory_lossless_min = 1.0</code>(고정 — "현재 무손실 축소 불가").
+처리량은 토큰마다 <code>on_token_generated()</code>가 갱신하는 EMA(α=0.1)다.
+<code>available_actions</code>는 구성 기반 조건부:
+</p>
+<ul>
+<li>항상: <code>throttle</code>, <code>switch_hw</code>, <code>weight.skip</code></li>
+<li><code>eviction_policy != "none"</code>일 때: <code>kv.evict_h2o</code> / <code>kv.evict_sliding</code> / <code>kv.evict_streaming</code> / <code>kv.merge_d2o</code></li>
+<li><code>kv_dtype</code>가 <code>'q'</code>로 시작할 때: <code>kv.quant_dynamic</code></li>
+<li>secondary GGUF/AUF가 로드되어 <code>set_has_secondary(true)</code>일 때: <code>swap_weights</code></li>
+</ul>
+<p class="evidence">근거: <code>engine/src/resilience/executor.rs::send_heartbeat</code> (L573~643), <code>::compute_available_actions</code> (L646~672), <code>::on_token_generated</code> (L268~285)</p>
+</section>
+
+<section>
+<h2>5. 세션 배선 — ResilienceAdapter와 DecodeLoop</h2>
+<h3>5.1 초기화: build_command_executor</h3>
+<p>
+<code>argus_cli</code>는 <code>args.enable_resilience = !args.no_resilience</code>로 <strong>default-on</strong>이다
+(legacy <code>generate</code> 계열은 <code>--enable-resilience</code> opt-in 유지).
+<code>build_command_executor()</code>가 <code>--resilience-transport</code> 문자열로 분기한다:
+<code>dbus</code>(feature <code>resilience</code> 필요) / <code>unix:&lt;path&gt;</code> / <code>tcp:&lt;addr&gt;</code>.
+spawn 실패·unknown transport·feature off는 모두 <strong>graceful fallback</strong> —
+<code>"[Resilience] Manager unreachable"</code> 경고 후 <code>Ok(None)</code>으로 Manager 없이 추론을 계속한다
+(default-on 정책에서 일반 사용자의 추론이 깨지지 않게 하는 회귀 차단).
+이어 heartbeat 1000ms로 executor를 만들고 <code>Capability</code>를 송출한다
+(<code>bytes_per_kv_token = num_kv_heads × head_dim × 2(K+V) × 2(F16)</code>).
+</p>
+<p class="evidence">근거: <code>engine/src/bin/argus_cli.rs</code> (L27), <code>engine/src/session/resilience_init.rs::build_command_executor</code> (L25~132)</p>
+
+<h3>5.2 ResilienceAdapter — 1 인스턴스, 3 trait slot</h3>
+<p>
+session 파이프라인은 resilience 기능을 3개 trait으로 쪼개 요구한다:
+<code>CommandSource</code>(poll → ExecutionPlan), <code>EngineReport</code>(capability/qcf/swap report 송신),
+<code>TokenTickSink</code>(on_token_generated). <code>ResilienceAdapter</code>가 <code>CommandExecutor</code> 하나를 소유한 채
+3개를 모두 구현하고, <code>DecodeLoopBuilder::with_resilience()</code>가 이를 <code>Arc&lt;Mutex&lt;_&gt;&gt;</code>로 감싸
+newtype wrapper 3개(<code>CmdSrcWrapper</code>/<code>ReportWrapper</code>/<code>TickWrapper</code>)로 각 slot에 주입한다.
+per-token lock 횟수는 poll 1회 + tick 1회라 contention은 무시 가능하다.
+resilience 미사용 시에는 <code>defaults.rs</code>의 <code>NoOpCommandSource</code> 등이 들어간다.
+</p>
+<p class="evidence">근거: <code>engine/src/session/resilience_adapter.rs::ResilienceAdapter</code> (L21~59, wrapper L70~115), <code>engine/src/session/decode_loop.rs::DecodeLoopBuilder::with_resilience</code> (L634~645), <code>engine/src/session/traits.rs::CommandSource</code> (L171)</p>
+
+<h3>5.3 DecodeLoop가 plan을 소비하는 순서</h3>
+<p>
+<code>DecodeLoop::run()</code>의 step당 resilience 관련 구간 (라벨은 코드 주석의 (a)~(h)와 일치):
+</p>
+<ol>
+<li><strong>(a) poll</strong> — <code>cmd_source.poll(ctx, kv_snap)</code>. <code>plan.suspended</code>면
+<code>StopReason::CommandRequested</code>로 루프 탈출. <code>throttle_delay_ms &gt; 0</code>이면 그만큼 <code>thread::sleep</code>.</li>
+<li><strong>(a.5) resilience-driven eviction</strong> — <code>plan.evict</code>가 Some이고 <code>evict_applied == false</code>일 때만
+<code>forward.try_evict(cache_manager, None, true, target_ratio)</code> 1회 호출(score-free force_evict —
+H2O는 score 부재 시 recency로 degrade). 성공 시 <code>pos</code> 갱신 + <code>on_kv_prune</code> hook + observer 통지.
+<code>plan.evict</code>가 None으로 돌아오면(RestoreDefaults) <code>evict_applied</code>를 reset.</li>
+<li><strong>(a.6) KvOffload / recall</strong> — <code>offload_ratio</code>는 non-sticky라 자연히 1회 발동:
+<code>forward.try_offload(cm, ratio)</code>로 prefix를 disk swap(<code>pos</code> 감소).
+recall은 <code>recall_offload &amp;&amp; restore_defaults</code> 둘 다 참일 때만 <code>try_recall(cm)</code>(<code>pos</code> 증가).</li>
+<li><strong>(f2) tick</strong> — sampling 직후 <code>tick_sink.on_token_generated()</code> → 처리량 EMA 갱신.</li>
+<li><strong>(h) target TBT pacing</strong> — step 시작점 <code>t_iter</code>부터의 wall-clock(throttle sleep 포함)이
+<code>target_tbt_ms</code>에 못 미치면 잔여분 sleep. 0이면 no-op.</li>
+</ol>
+<div class="warn">
+<strong>sticky evict의 재적용 방지(<code>evict_applied</code>)는 의도된 비대칭이다.</strong>
+evict plan은 executor에서 sticky로 매 poll 재게시되지만, DecodeLoop는 active 구간당 1회만 실행한다 —
+<code>target_ratio</code>를 매 step 반복 적용하면 캐시가 기하급수로 줄기 때문이다.
+반대로 throttle/target_tbt는 매 step 효과가 의미라 sticky 그대로 소비한다.
+eviction 자체의 동작은 <a href="07_kv_cache.html">07장 CacheManager</a> 참조.
+또한 eviction은 <code>cache_manager</code>가 builder로 주입된 경우(현재 argus-bench 경로)에만 발동한다 —
+happy path/chat은 미주입이라 <code>plan.evict</code>가 와도 무시된다.
+</div>
+<p class="evidence">근거: <code>engine/src/session/decode_loop.rs::DecodeLoop::run</code> (L124~346, evict guard L168~194, offload L201~223, pacing L325~333), <code>engine/src/session/traits.rs::Forward::try_evict</code> (L108~117)</p>
+
+<h3>5.4 신호 수신 → 반응 전체 시퀀스</h3>
+<pre class="mermaid">
+sequenceDiagram
+    participant MM as MemoryMonitor<br/>(manager 스레드)
+    participant PS as PolicyStrategy<br/>(manager 메인 루프)
+    participant TR as Transport<br/>(unix/tcp 소켓)
+    participant ML as MessageLoop<br/>(엔진 스레드)
+    participant EX as CommandExecutor
+    participant DL as DecodeLoop
+    participant CM as CacheManager
+
+    MM->>PS: SystemSignal MemoryPressure(Critical, reclaim=...)
+    PS->>PS: process_signal → EngineDirective{seq_id, [KvEvictH2o{0.5}, Throttle{30}]}
+    PS->>TR: DirectiveDeduplicator 통과 후 emit (4B len + JSON)
+    TR->>ML: recv() — ManagerMessage::Directive
+    ML->>EX: cmd_rx.send(directive)
+    Note over DL: 다음 토큰 step (a)
+    DL->>EX: poll(KVSnapshot)
+    EX->>EX: apply_command ×2 — evict_plan sticky 저장, throttle 갱신
+    EX-->>ML: resp_tx — Response{seq_id, [Ok, Ok]}
+    EX-->>DL: ExecutionPlan{evict: Some, throttle: 30}
+    DL->>DL: thread::sleep(30ms)
+    DL->>CM: forward.try_evict(cm, None, force=true, 0.5) — 1회
+    CM-->>DL: (removed, new_pos) → pos 동기화 + on_kv_prune
+    Note over EX: 1초 경과 시
+    EX-->>ML: resp_tx — Heartbeat(EngineStatus)
+    ML->>TR: send() — blocking recv 사이에 drain
+    TR->>PS: try_recv_engine_message → update_engine_state
+</pre>
+</section>
+
+<section>
+<h2>6. 엔진 내장 자율 정책 — ResilienceStrategy와 ResilienceManager</h2>
+<h3>6.1 trait과 strategy 3종</h3>
+<p>
+<code>ResilienceStrategy</code>는 신호 1건을 받아 이산 명령 묶음을 내는 계약이다:
+</p>
+<pre><code>pub trait ResilienceStrategy: Send + Sync {
+    fn react(&amp;mut self, signal: &amp;SystemSignal) -&gt; Vec&lt;EngineCommand&gt;;  // 빈 Vec = 무반응
+    fn name(&amp;self) -&gt; &amp;str;
+}</code></pre>
+<p>
+구현은 <code>compute</code>/<code>thermal</code>/<code>energy</code> 3종뿐이다. <strong>memory strategy는 없다</strong> —
+memory 압력은 graded <code>Pressure</code> scalar 채널 담당으로 설계가 이동했고(§8),
+<code>react</code>는 scalar로 환원 불가한 <em>mode</em> 출력(switch/suspend/throttle/restore)만 낸다.
+Level별 매핑 전체:
+</p>
+<table>
+<thead><tr><th>strategy</th><th>Normal</th><th>Warning</th><th>Critical</th><th>Emergency</th></tr></thead>
+<tbody>
+<tr><td><code>ComputeStrategy</code><br/>(현재 backend 상태 보유)</td><td>RestoreDefaults<br/>(current → Any)</td><td>빈 Vec — 준비만<br/>(current_backend 갱신)</td><td>권고 backend ≠ current면 SwitchHw{dev}<br/>(Any면 switch 생략); 이미 같으면 Throttle{50}</td><td>SwitchHw{cpu} + Throttle{100}</td></tr>
+<tr><td><code>ThermalStrategy</code></td><td>RestoreDefaults</td><td>SwitchHw{cpu}</td><td>SwitchHw{cpu} + Throttle{(1.0 − throttle_ratio) × 100 ms}</td><td>Suspend</td></tr>
+<tr><td><code>EnergyStrategy</code></td><td>RestoreDefaults</td><td>SwitchHw{cpu}</td><td>SwitchHw{cpu} + Throttle{30}</td><td>Suspend</td></tr>
+</tbody>
+</table>
+<p>
+구 <code>LimitTokens{64}</code>·<code>RejectNew</code> 액션은 <code>EngineCommand</code> 등가가 없어 drop되었다
+(주석: "Emergency stop-intent는 Suspend가 흡수"). backend 역할 문자열은 <code>switch_device()</code>가
+<code>Cpu→"cpu"</code>, <code>Gpu→"gpu"</code>, <code>Any→None</code>(switch 생략)으로 변환한다 — opencl/cuda 같은
+구체 device 해석은 <a href="09_backends.html">Hardware resolver</a> 책임이다.
+</p>
+<p class="evidence">근거: <code>engine/src/resilience/strategy.rs::ResilienceStrategy</code> (L29), <code>::switch_device</code> (L15), <code>strategy/compute.rs::ComputeStrategy::react</code> (L25~67), <code>strategy/thermal.rs</code> (L21~48), <code>strategy/energy.rs</code> (L21~41)</p>
+
+<h3>6.2 resolve_conflicts — 4규칙 병합</h3>
+<p>
+여러 strategy의 출력을 합칠 때 <code>resolve_conflicts(Vec&lt;EngineCommand&gt;)</code>가 충돌을 정리한다:
+</p>
+<ol>
+<li><strong>R1</strong> — <code>Suspend</code>가 하나라도 있으면 결과는 <code>[Suspend]</code> 단독.</li>
+<li><strong>R2</strong> — <code>RestoreDefaults</code>는 다른 제약이 전무할 때만 살아남는다.</li>
+<li><strong>R3</strong> — <code>SwitchHw</code>: <code>"cpu"</code>가 한 번이라도 나오면 cpu 고정(안전 우선), 아니면 마지막 값.</li>
+<li><strong>R4</strong> — <code>Throttle</code>: 가장 큰 <code>delay_ms</code>가 이긴다.</li>
+</ol>
+<p>
+그 외 명령(<code>SetTargetTbt</code>/<code>Kv*</code>/<code>Resume</code> 등)은 원순서 보존 pass-through다.
+결과 배열 순서는 SwitchHw → Throttle → passthrough.
+</p>
+<p class="evidence">근거: <code>engine/src/resilience/strategy.rs::resolve_conflicts</code> (L44~96)</p>
+
+<h3>6.3 ResilienceManager와 OperatingMode</h3>
+<p>
+<code>ResilienceManager</code>는 <code>mpsc::Receiver&lt;SystemSignal&gt;</code>을 들고 토큰당 1회 <code>poll()</code>로
+신호를 drain → 신호 타입별 strategy 위임(memory는 명령 0) → <code>resolve_conflicts</code>를 수행하는
+자율 오케스트레이터다. 부수적으로 신호 4종의 최신 Level을 캐시해 <code>OperatingMode</code>를 갱신한다:
+</p>
+<pre><code>// 최악의 신호가 mode를 결정 (state.rs L19~27)
+worst = memory.max(compute).max(thermal).max(energy)
+Normal → OperatingMode::Normal      Warning → Degraded
+Critical → Minimal                  Emergency → Suspended</code></pre>
+<div class="warn">
+<strong>이 경로는 현재 production에 배선되어 있지 않다.</strong>
+<code>ResilienceManager::new()</code>의 호출자는 자기 파일의 테스트들뿐이다. 주석은
+"manager-less 자율 정책의 원형 — <code>LocalPolicy</code> <code>CommandSource</code>로 발전 예정(ENG-ST-055)"이라 밝힌다.
+즉 production 신호 경로는 §3~5의 Manager IPC(<code>CommandExecutor</code>)이고,
+<code>SystemSignal → ResilienceStrategy.react()</code> 변환이 실제로 작동하는 곳은
+(1) 이 미배선 prototype과 (2) <code>DbusTransport</code>의 legacy 변환(§3.3 — 단 strategy를 호출하지 않는
+<em>별도의 하드코딩 표</em>) 두 군데로 갈라져 있다. 두 매핑은 값이 다르다
+(예: thermal Warning — strategy는 SwitchHw{cpu}, D-Bus legacy는 Throttle{30}+PrepareComputeUnit{cpu}).
+리뷰 시 어느 표를 고치는지 명확히 할 것.
+</div>
+<p class="evidence">근거: <code>engine/src/resilience/manager.rs::ResilienceManager</code> (L53~119, 호출자는 동파일 테스트 L133 등 5곳뿐 — <code>grep ResilienceManager::new</code>로 확인), <code>engine/src/resilience/state.rs::OperatingMode::from_levels</code> (L19~27)</p>
+</section>
+
+<section>
+<h2>7. Manager 서비스 내부 — 개요 수위</h2>
+<p>
+<code>manager/src/main.rs</code>의 구조만 짚는다(상세는 manager 크레이트 영역).
+부팅 시 config(TOML)에서 <strong>Monitor</strong> 4종(memory/thermal/compute/energy — 기본 활성) + external(opt-in)을
+만들고 각각 전용 스레드에서 <code>mpsc::Sender&lt;SystemSignal&gt;</code>로 신호를 쏜다.
+메인 루프는 50ms <code>recv_timeout</code> tick으로 ① 엔진 상향 메시지 수신(<code>update_engine_state</code> — heartbeat의
+<code>available_actions</code>로 엔진이 못 하는 액션을 정책에서 필터), ② QCF timeout 체크(SEQ-098),
+③ 신호 수신 → <code>PolicyStrategy::process_signal()</code> → <code>DirectiveDeduplicator</code>(동일 command 배치 +
+cooldown 내 재방출 억제; 억제 시 <code>cancel_last_observation()</code>으로 학습 관측 취소) → <code>Emitter</code> 송출을 돈다.
+</p>
+<p>
+<strong>PolicyEngine</strong>은 <code>PolicyStrategy</code> trait 뒤의 두 구현이다: 내장 <code>HierarchicalPolicy</code>
+(<code>hierarchical</code> feature, PI 컨트롤러/relief model 포함 — 종료 시 <code>save_model()</code>)와
+<code>--policy-script</code>로 주입하는 <code>LuaPolicy</code>(<code>lua</code> feature, SIGHUP hot-reload 지원).
+QCF 협상은 양방향 왕복이다: 정책이 <code>RequestQcf</code>를 보내고, 엔진의 <code>QcfEstimate</code>가 도착하면
+<code>complete_qcf_selection()</code>이 보류된 액션 선택을 완료해 후속 directive를 만든다. 1초 내 미도착 시
+<code>check_qcf_timeout()</code>이 fallback directive를 낸다.
+</p>
+<p class="evidence">근거: <code>manager/src/main.rs::main</code> (L108~328 — 메인 루프 L192~314), <code>::build_monitors</code> (L489~523), <code>manager/src/pipeline.rs::PolicyStrategy</code> (L37~75), <code>::DirectiveDeduplicator</code> (L2048)</p>
+</section>
+
+<section>
+<h2>8. graded Pressure 채널 — memory 압력의 행방</h2>
+<p>
+KV 캐시처럼 "얼마나 줄일까"가 연속량인 영역에서, 이산 Level 4단계는 표현력이 부족하다.
+그래서 memory 압력은 엔진 내부에서 <code>Pressure(u8)</code>(0~100 clamp) scalar로 흐르도록 재설계되었고,
+구 <code>MemoryStrategy</code>(Warning→Evict 0.85 식의 이산 매핑)는 삭제되었다.
+<code>PressureSource</code> trait 뒤에 Manager 통합값(<code>ManagerPressureSource</code>)이나 로컬 자율 소스
+(<code>LocalPressureSource</code>)가 숨는 구도이며, 소비 Stage는 출처를 구분하지 않는다.
+<code>Pressure::band()</code>는 4단계 강등 placeholder를 제공한다 —
+<code>0..=49 Normal / 50..=74 Warning / 75..=89 Critical / 90..=100 Emergency</code> —
+하지만 주석이 명시하듯 <strong>현재 어떤 live 경로에도 배선되지 않은 additive 타입</strong>이다.
+</p>
+<p>
+그러면 지금 memory 압력은 어떻게 작동하는가? <strong>Manager가 이산 KV 명령을 직접 보낸다.</strong>
+정책(또는 D-Bus legacy 변환표)이 <code>KvEvictSliding{0.85}</code>/<code>KvEvictH2o{0.50}</code> 같은
+구체 directive를 만들고, §4~5 경로로 <code>CacheManager</code>에 도달한다. 즉 graded 채널은
+미래형이고 현행은 여전히 discrete다 — 이 간극이 이 영역 PR의 단골 혼동 포인트다.
+</p>
+<p class="evidence">근거: <code>engine/src/pipeline.rs::Pressure</code> (L24, <code>band()</code> L43~50 — "live 경로 미배선" 주석 L38~41), <code>engine/src/resilience/manager.rs::process_signal</code> (L110~115 — MemoryPressure → <code>vec![]</code>), <code>engine/src/resilience/dbus_transport.rs</code> (L36~46)</p>
+</section>
+
+<section>
+<h2>9. 자기 측정기 — heartbeat에 실리는 self-utilization</h2>
+<p>
+heartbeat의 <code>self_cpu_pct</code>/<code>self_gpu_pct</code>는 엔진 프로세스 <em>자신</em>의 자원 사용률이다
+(Manager의 시스템 전역 모니터와 별개 — Manager가 "엔진 때문인가"를 판단하는 입력).
+</p>
+<ul>
+<li><strong><code>ProcSelfMeter</code></strong> (CPU, MSG-067): <code>/proc/self/stat</code>의 <code>utime + stime</code> jiffies를
+heartbeat 간 delta로 측정. 분모는 <code>CLK_TCK × num_cpus × wall_elapsed_secs</code>
+(CLK_TCK는 <code>sysconf(_SC_CLK_TCK)</code>, 보통 100Hz). comm 필드가 공백·괄호를 포함할 수 있어
+<code>rfind(')')</code> 이후부터 파싱하며(괄호 이후 0-based 11/12번째 필드), 어떤 실패든 0.0 fallback +
+<code>[0.0, 1.0]</code> clamp (INV-091/092 — heartbeat 송출을 절대 차단하지 않음). 첫 샘플은 warm-up으로 0.0.</li>
+<li><strong><code>GpuSelfMeter</code></strong> (GPU, MSG-068 Phase 2): <code>sample(wall_elapsed) -&gt; f64</code> trait.
+OpenCL queue profiling(<code>CL_QUEUE_PROFILING_ENABLE</code>)으로 커널 busy ns를 누적해 wall로 나눈다.
+기본은 <code>NoOpGpuMeter</code>(항상 0.0)이고 <code>--heartbeat-gpu-profile</code> opt-in.</li>
+</ul>
+<div class="warn">
+<strong>실측 교훈 (CLAUDE.md + cli.rs doc 주석)</strong>: Adreno에서 queue profiling을 켜면
+~54 ms/token 오버헤드가 붙는다. production TBT 측정 시 <code>--heartbeat-gpu-profile</code>은 반드시 꺼라.
+production 처리량의 정답 소스는 heartbeat의 <code>actual_throughput</code>(EMA) 또는 <code>Decode: X ms/tok</code> 로그다.
+또한 현재 <code>build_command_executor()</code>는 backend Arc를 받지 못해 flag를 켜도 gpu_meter가
+<code>None</code>으로 남는다(주석: "P5+에서 overload 도입 예정") — <code>self_gpu_pct</code>는 실질 항상 0.0이다.
+</div>
+<p>
+별개로 <code>sys_monitor.rs</code>의 <code>SystemMonitor</code> trait(<code>mem_stats()</code>)이 있다 —
+<code>LinuxSystemMonitor</code>는 <code>/proc/meminfo</code>의 MemTotal/MemAvailable/MemFree를 바이트로 파싱하고,
+<code>NoOpMonitor</code>는 항상 <code>usize::MAX</code>를 반환한다. 후자는 CUDA discrete GPU에서
+<code>cuMemAllocManaged</code>가 가상 주소공간 예약으로 MemAvailable을 인위적으로 낮춰 false alarm을 내는
+환경용이다 — 이때 KV eviction은 시스템 RAM 압력이 아니라 정책 budget으로만 구동된다.
+</p>
+<p class="evidence">근거: <code>engine/src/resilience/proc_self_meter.rs::ProcSelfMeter::sample</code> (L47~67), <code>::parse_utime_stime</code> (L97~106), <code>engine/src/resilience/gpu_self_meter.rs::GpuSelfMeter</code> (L32~40), <code>engine/src/session/cli.rs::heartbeat_gpu_profile</code> (L381~395 doc), <code>engine/src/session/resilience_init.rs</code> (L39~46), <code>engine/src/resilience/sys_monitor.rs::NoOpMonitor</code> (L80~99)</p>
+</section>
+
+<section>
+<h2>10. 리뷰 체크리스트</h2>
+<ul>
+<li><strong>새 EngineCommand 추가 시</strong>: ① <code>shared/src/lib.rs</code> variant + serde rename(도메인 prefix 컨벤션) + wire 테스트,
+② <code>CommandExecutor::apply_command</code> arm(sticky 여부 결정 — prefill drop 생존이 필요하면 pending 패턴),
+③ <code>ExecutionPlan</code> 필드, ④ DecodeLoop 소비 지점, ⑤ <code>RestoreDefaults</code>가 되돌려야 하는가,
+⑥ <code>compute_available_actions</code>/<code>active_actions</code> 노출, ⑦ <code>resolve_conflicts</code> 4규칙과의 상호작용.</li>
+<li><strong>sticky vs transient</strong>를 명시하라 — §4.2 표 기준. evict류 sticky는 DecodeLoop 쪽 1회 발동 guard가 따라와야 한다.</li>
+<li><strong>응답 불변식</strong>: directive 1건당 <code>CommandResponse</code> 1건, <code>results</code> 길이 = <code>commands</code> 길이, <code>seq_id</code> 에코.</li>
+<li><strong>wire 호환성</strong>: 새 필드는 <code>#[serde(default)]</code>(+필요 시 <code>skip_serializing_if</code>)로 구버전 JSON 역직렬화를 보장
+(기존 테스트 <code>test_engine_status_new_fields_default_on_missing</code> 패턴). payload는 64 KB 상한.</li>
+<li><strong>transport 선택</strong>: 상향(heartbeat/QCF) 의존 기능은 unix/tcp 전제. D-Bus는 하향 전용으로 취급(§3.3 warn).</li>
+<li><strong>strategy 수정 시</strong>: §6.3 warn — 미배선 prototype(strategy/*)과 D-Bus legacy 표(dbus_transport.rs) 중 어느 쪽이 대상인지 확인.</li>
+</ul>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="07_kv_cache.html">← 07. KV 캐시 구조와 관리</a></span><span><a href="09_backends.html">09. 백엔드 구현 →</a></span></footer>
+</body>
+</html>

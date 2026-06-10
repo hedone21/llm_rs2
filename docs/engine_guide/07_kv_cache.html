@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07. KV 캐시 구조와 관리 — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 07</span></nav>
+<header>
+<h1>07. KV 캐시 구조와 관리</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>1. 한눈에 보기</h2>
+<p>
+KV cache는 decode 중 가장 빠르게 자라는 메모리 소비자다(토큰마다 layer × head × dim 만큼 K/V가 추가).
+이 챕터는 (1) 토큰 데이터가 실제로 어떤 바이트 배치로 저장되는가(<code>KVCache</code> + <code>KVLayout</code>),
+(2) 그 데이터를 누가·언제·어떻게 줄이는가(2-tier 관리: <code>CachePressureHandler</code> 파이프라인 ⊥ <code>EvictionPolicy</code>),
+(3) 정밀도를 낮추는 두 경로(Q4_0 typed KV, KIVI)를 다룬다.
+모든 관리 모듈은 <code>engine/src/pressure/</code> 한 디렉토리에 응집되어 있다.
+</p>
+
+<pre class="mermaid">
+flowchart TD
+    subgraph CALLER["session (caller 책임 — forward 호출 사이에 개입)"]
+        MF["model_forward.rs<br/>maybe_evict / force_evict"]
+    end
+    subgraph CM["CacheManager (dispatch)"]
+        ED["execute_dispatch()<br/>mem_stats → PressureLevel"]
+        REG["named policy registry<br/>force_evict_by_policy"]
+        SW["swap_handler (파이프라인 밖)<br/>offload / recall"]
+    end
+    subgraph PIPE["CachePressurePipeline (상위 tier)"]
+        EH["EvictionHandler"]
+        D2O["D2OHandler"]
+        QH["QuantizeHandler (stub)"]
+        SH["SwapHandler"]
+    end
+    subgraph POL["EvictionPolicy (하위 tier — 영구 삭제 전용)"]
+        SL["SlidingWindowPolicy"]
+        H2O["H2OPolicy"]
+        H2OP["H2OPlusPolicy"]
+        STR["StreamingLLMPolicy"]
+        NE["NoEvictionPolicy"]
+    end
+    KVC["KVCache × num_layers<br/>(F32 / F16 / Q4_0 / opaque)"]
+    KIVI["KiviCache (별도 타입)<br/>Q2/Q4/Q8 + F32 residual"]
+
+    MF --> ED
+    ED --> PIPE
+    MF --> REG
+    EH --> POL
+    PIPE --> KVC
+    POL --> KVC
+    SW --> KVC
+    QH -. "target_bits_for_pressure<br/>(외부 호출용 매핑만)" .-> KIVI
+</pre>
+
+<div class="note">
+<b>이 챕터에서 쓰는 어휘</b> — 저장 형태는 <b>Format</b>(noun), 데이터 양을 조절하는 관리 동작은 <b>Stage</b>(verb)다.
+"Layer"는 transformer 디코더 블록 전용(<code>KVCache</code>는 layer당 1개). 어휘 정의는
+<a href="02_terminology.html">02. 도메인 용어</a> 참조. <code>KVCache</code>를 <code>KVCacheFormat</code> trait
+표면으로 감싸는 <code>StandardFormat</code>/<code>KIVIFormat</code> wrapper 는
+<a href="05_abstractions.html">05. 핵심 추상화 카탈로그</a>와 겹치므로 여기선 write/cast 경로만 다룬다.
+</div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>2. KVCache 자료구조</h2>
+
+<h3>2.1 필드와 불변식</h3>
+<pre><code>pub struct KVCache {
+    pub k_buffer: Tensor,          // K 저장 버퍼 (dtype = F32/F16/Q4_0/U8(opaque))
+    pub v_buffer: Tensor,          // V 저장 버퍼 (K와 동일 geometry)
+    pub current_pos: usize,        // 유효 토큰 수 (논리 길이)
+    pub high_water_pos: usize,     // current_pos 의 역대 최대값
+    pub max_seq_len: usize,        // 논리 상한 — 초과 시 "KV Cache overflow" 에러
+    capacity: usize,               // 물리 버퍼 용량 (토큰 단위) — grow/shrink 로 변동
+    kv_heads: usize,               // KV head 수 (Llama 3.2 1B = 8)
+    head_dim: usize,               // head 차원 (Llama 3.2 1B = 64)
+    pub(crate) layout: KVLayout,   // SeqMajor | HeadMajor
+    memory: Option&lt;Arc&lt;dyn Memory&gt;&gt;, // Some = dynamic(grow 가능), None = 고정 할당
+}</code></pre>
+<p>
+불변식: <code>current_pos &le; high_water_pos &le; capacity &le; max_seq_len</code>.
+<code>high_water_pos</code>는 "실제로 쓴 적 있는 최대 위치"로, <code>release_unused_pages()</code>가
+madvise 범위를 한 번도 안 쓴 tail까지 넓히지 않도록 제한하는 용도다(§3.3).
+<code>memory</code>가 <code>None</code>(<code>new()</code> 생성)이면 <code>grow()</code>는 에러,
+<code>shrink_to_fit()</code>은 0을 반환하는 no-op이다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::KVCache</code> (struct L44–61), <code>::new</code> (L66), <code>::new_dynamic</code> (L87), <code>::grow</code> (L222–225 에러 분기)</p>
+
+<h3>2.2 KVLayout 과 offset 수식</h3>
+<p>
+<code>KVLayout</code>은 L2 공유 모듈 <code>kv_cache_ops.rs</code>에 정의된 2-variant enum이다.
+4D 논리 shape 기준:
+</p>
+<ul>
+<li><b>SeqMajor</b>: <code>[batch, seq_pos, kv_heads, head_dim]</code> — 한 position의 모든 head가 연속.</li>
+<li><b>HeadMajor</b>: <code>[batch, kv_heads, seq_pos, head_dim]</code> — 한 head의 모든 position이 연속.</li>
+</ul>
+<p>element 단위 offset/stride 는 다음 세 메서드가 단일 정의처다:</p>
+<pre><code>// engine/src/pressure/kv_cache.rs
+pub fn offset(&amp;self, pos: usize, head: usize) -&gt; usize {
+    match self.layout {
+        KVLayout::SeqMajor  =&gt; pos * self.kv_heads * self.head_dim + head * self.head_dim,
+        KVLayout::HeadMajor =&gt; head * self.capacity * self.head_dim + pos * self.head_dim,
+    }
+}
+pub fn pos_stride(&amp;self) -&gt; usize  // SeqMajor: kv_heads*head_dim, HeadMajor: head_dim
+pub fn head_stride(&amp;self) -&gt; usize // SeqMajor: head_dim, HeadMajor: capacity*head_dim
+
+// Q4_0 은 element 가 아니라 block index:
+pub fn q4_block_offset(&amp;self, pos, head, blocks_per_pos) -&gt; usize {
+    // SeqMajor:  (pos * kv_heads + head) * blocks_per_pos
+    // HeadMajor: (head * capacity + pos) * blocks_per_pos   // blocks_per_pos = head_dim/QK4_0
+}</code></pre>
+<p class="evidence">근거: <code>engine/src/kv_cache_ops.rs::KVLayout</code> (L18), <code>engine/src/pressure/kv_cache.rs::offset</code> (L183), <code>::pos_stride</code> (L192), <code>::q4_block_offset</code> (L204), <code>::head_stride</code> (L213)</p>
+
+<div class="warn">
+<b>함정: HeadMajor offset에 <code>capacity</code>가 들어간다.</b>
+HeadMajor의 head stride는 <code>max_seq_len</code>이 아니라 <b>현재 물리 capacity</b> 기준이다.
+따라서 <code>grow()</code>/<code>shrink_to_fit()</code>으로 capacity가 바뀌면 <b>모든 head의 base 주소가 이동</b>하고,
+재할당 시 head별로 따로 복사해야 한다(§3). capacity를 캐싱해 둔 외부 코드(GPU plan의 stride 인자 등)는
+재할당 후 반드시 갱신되어야 한다.
+</div>
+
+<div class="warn">
+<b>실측 교훈 (CLAUDE.md): production은 HeadMajor 고정.</b>
+flash attention / attention_scores 자체는 stride 인자를 받아 layout-agnostic이지만, GPU Plan의
+<code>kernel_kv_scatter_f32_to_f16</code>(HeadMajor offset 하드코딩)과 qcf/d2o/eviction/<code>shift_positions_for_head</code>가
+HeadMajor를 전제한다. SeqMajor 선택 시 Plan 경로가 silent garbage를 낸다(2026-04-14 실측).
+코드상으로도 <code>KVCache::new*</code>의 기본값은 BC용 SeqMajor지만, production 할당 경로는 전부
+<code>.with_layout(KVLayout::HeadMajor)</code>를 명시한다.
+</div>
+<p class="evidence">근거: <code>engine/src/session/bin_setup.rs::alloc_standard_kv_caches</code> (L281–324, HeadMajor + <code>new_dynamic</code>), <code>::alloc_opaque_kv_caches</code> (L331–380), <code>engine/src/session/forward/model_forward.rs</code> (L685)</p>
+
+<h3>2.3 write 경로: update() — 입력은 항상 seq-major</h3>
+<p>
+<code>update(new_k, new_v)</code>의 입력 tensor는 layout과 무관하게 항상 seq-major
+<code>[batch, seq_len, kv_heads, head_dim]</code>이다(matmul 출력 그대로). 동작 순서:
+</p>
+<ol>
+<li><b>용량 확인</b>: <code>current_pos + seq_len &gt; capacity</code>면 <code>grow()</code>,
+    <code>&gt; max_seq_len</code>이면 <code>"KV Cache overflow"</code> 에러.</li>
+<li><b>opaque 분기</b>: <code>is_opaque()</code>면 F32 입력을 <code>encode_via_descriptor</code>로 양자화하며
+    HeadMajor byte offset에 직접 scatter(<code>update_opaque</code>, HeadMajor 전용).</li>
+<li><b>SeqMajor</b>: 연속 1회 <code>copy_slice</code> (Q4_0이면 block 단위 count).</li>
+<li><b>HeadMajor</b>: seq-major 입력을 head별 목적지로 <b>scatter</b> —
+    <code>dst = h * capacity * head_dim + (current_pos + s) * head_dim</code>.
+    F16/F32이고 양쪽 버퍼가 GPU 버퍼가 아니며 포인터가 non-null이면 직접
+    <code>ptr::copy_nonoverlapping</code> fast path(헤드당 ~128B 복사에서 <code>Backend::copy_slice</code> 오버헤드 회피),
+    아니면 <code>backend.copy_slice</code> 폴백.</li>
+<li><code>current_pos += seq_len; high_water_pos = max(...)</code>.</li>
+</ol>
+<div class="warn">
+<b>GPU 버퍼 직접 memcpy 금지의 이유</b> — CUDA managed memory(<code>cuMemAllocManaged</code>)는 non-null
+host 포인터를 반환하지만 실제로는 GPU 상주 페이지를 가리킨다. host memcpy는 driver migration을 우회해
+stale 데이터를 읽고/쓰며 KV cache를 오염시킨다(PPL 폭발). 그래서 <code>can_direct_copy</code> 조건에
+<code>!is_gpu_buffer()</code> 검사가 양쪽 모두에 들어 있다.
+</div>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::update</code> (L540–689, 주석 L604–622), <code>::update_opaque</code> (L698–730)</p>
+<p>
+참고로 production write는 <code>KVCache::update</code>를 직접 부르기보다 <code>StandardFormat::write_inner</code>를
+경유한다. 거기서 GPU + F16/F32 + HeadMajor decode/prefill이면 fused scatter 커널
+(<code>kv_scatter_f32_to_f16</code> / <code>kv_scatter_f32_to_f32_batch</code>) 1-dispatch fast path를 타고,
+비-F32(F16/Q4_0) CPU 경로는 <code>backend.cast</code>로 scratch에 변환 후 <code>update</code>를 부른다(§6.1).
+</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>3. capacity 수명주기: grow / shrink / madvise</h2>
+
+<h3>3.1 grow — doubling, HeadMajor는 per-head 복사</h3>
+<p>
+<code>grow(min_capacity)</code>는 <code>new_cap = (capacity * 2).max(min_capacity).min(max_seq_len)</code>으로
+새 버퍼를 <code>memory.alloc_kv()</code>로 할당하고 기존 데이터를 복사한다.
+SeqMajor는 연속이라 <code>copy_slice</code> 1회면 되지만, HeadMajor는 capacity가 head stride 자체이므로
+head마다 <code>(h*old_stride → h*new_stride, current_pos*head_dim)</code> 복사를 반복한다.
+Q4_0이면 모든 offset/count를 <code>QK4_0(=32)</code>으로 나눠 block 단위로 변환하고,
+opaque면 <code>opaque_bytes_per_head()</code> 기반 byte 단위로 복사하며 새 버퍼를 반드시
+<code>OpaqueBuffer</code>로 재포장해 sidecar descriptor를 보존한다(미포장 시 descriptor 소실 → garbage).
+공개 진입점은 <code>ensure_capacity(min_tokens)</code>다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::grow</code> (L222–364), <code>::ensure_capacity</code> (L1245–1258)</p>
+
+<h3>3.2 shrink_to_fit — 1.5배 headroom, 64-정렬</h3>
+<pre><code>// 목표 capacity: current_pos 의 1.5배, 64-정렬, 최소 64
+let new_cap = ((self.current_pos * 3 / 2) + 63) &amp; !63;
+let new_cap = new_cap.max(64);
+if new_cap &gt;= self.capacity { return Ok(0); } // 줄어들지 않으면 no-op</code></pre>
+<p>
+grow의 역연산으로 작은 버퍼를 재할당해 복사한다(물리 메모리 해제 보장). 반환값은
+<code>(old_buf_size - new_buf_size) * 2</code> (K+V). next_power_of_two 대신 1.5배를 쓰는 이유는
+주석에 명시돼 있다 — 예: <code>current_pos=2049</code>가 4096으로 반올림되면 영원히 shrink가 안 되는 edge를 피한다.
+opaque는 대칭 구현 <code>shrink_to_fit_opaque</code>(HeadMajor 전용, SeqMajor는 보수적 no-op)로 분기한다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::shrink_to_fit</code> (L369–480), <code>::shrink_to_fit_opaque</code> (L484–533)</p>
+
+<h3>3.3 release_unused_pages — shrink 우선, madvise 폴백</h3>
+<p>
+eviction 후 <code>CacheManager</code>가 cache마다 호출하는 메모리 반환 진입점. 두 단계다:
+</p>
+<ol>
+<li><b>75% 미만 활용이면 shrink</b>: <code>memory.is_some() &amp;&amp; current_pos * 4 &lt; capacity * 3</code>이면
+    <code>shrink_to_fit()</code>으로 재할당. 임계 75%는 H2O <code>keep_ratio=0.5</code>가 capacity/2까지 줄였을 때
+    shrink가 발동하도록 잡은 값이다(주석).</li>
+<li><b>madvise(MADV_DONTNEED)</b>: shrink 미발동 시, host-managed 버퍼(F16/F32)에 한해
+    <code>[current_pos .. high_water_pos)</code> 구간의 물리 페이지를 OS에 반환한다.
+    HeadMajor는 head마다 따로 advise. 시작 주소는 page 올림, 끝은 내림(부분 사용 페이지 보호).
+    GPU-managed(<code>UnifiedBuffer</code> 등 driver-pinned) 버퍼와 Q4_0/opaque dtype은 skip(0 반환).
+    완료 후 <code>high_water_pos = current_pos</code>로 리셋.</li>
+</ol>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::release_unused_pages</code> (L1036–1102), <code>::madvise_dontneed</code> (L1267–1291), 호출처 <code>engine/src/pressure/cache_manager.rs::execute_dispatch</code> (L298–302)</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>4. element vs block vs byte — 단위 변환 함정</h2>
+<p>
+<code>Backend::copy_slice</code> / <code>buffer_shift</code>의 <code>offset</code>/<code>count</code> 인자는
+"element 개수"가 아니라 <b>버퍼 dtype의 type_size 단위 개수</b>다. dtype별로 의미가 다르다:
+</p>
+<table>
+<thead><tr><th>KV dtype</th><th>1 단위의 크기</th><th>f32 element → 단위 변환</th><th>비고</th></tr></thead>
+<tbody>
+<tr><td>F32</td><td>4 B (element)</td><td>그대로</td><td>—</td></tr>
+<tr><td>F16</td><td>2 B (element)</td><td>그대로</td><td>—</td></tr>
+<tr><td>Q4_0</td><td><code>BlockQ4_0</code> = <b>18 B</b> (32 elem/block)</td><td><code>n / QK4_0</code> (÷32)</td><td><code>d: f16</code> + <code>qs: [u8;16]</code></td></tr>
+<tr><td>opaque (U8)</td><td>1 B (byte)</td><td><code>bytes_for_elems()</code> descriptor 회계</td><td><code>bytes_per_head = (head_dim/block_elems) * block_bytes</code></td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/quant.rs::BlockQ4_0</code> (L14–17, size assert L28 <code>== 18</code>), <code>QK4_0</code> (L9 <code>= 32</code>), <code>engine/src/pressure/kv_cache.rs::opaque_bytes_per_head</code> (L157–164)</p>
+
+<div class="warn">
+<b>실제로 터졌던 버그: Q4_0 shrink_to_fit OOB read → SIGSEGV.</b>
+<code>grow()</code>는 처음부터 element→block 변환을 했지만 <code>shrink_to_fit()</code>은 누락돼 있었다.
+element 수를 그대로 count로 넘기면 18B 블록 기준으로 ~32배 over-read가 일어난다. 경로는
+eviction → <code>release_unused_pages</code>(75% 미만) → <code>shrink_to_fit</code>. 수정 후 코드에는
+경고 주석이 박혀 있다:
+<pre><code>// **Q4_0: copy_slice 의 count/offset 은 element 가 아니라 block 단위다**
+// (type_size = sizeof(BlockQ4_0) = 18B). element 로 넘기면 ~QK4_0 배
+// over-read → OOB(SIGSEGV). grow() 와 동일하게 변환한다.</code></pre>
+KV 버퍼를 만지는 PR을 리뷰할 때는 <b>모든 <code>copy_slice</code>/<code>buffer_shift</code> 호출의 단위</b>를
+dtype 분기별로 확인하라. 기존 f16/f32 전용 테스트는 이 버그를 잡지 못했다
+(non-dynamic cache는 shrink에 진입하지 않음).
+</div>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::shrink_to_fit</code> 주석 (L418–420) 및 Q4_0 block 변환 (L437–445)</p>
+
+<h3>4.1 위치 이동 primitive</h3>
+<p>모든 eviction 정책은 아래 4개 primitive 위에서 동작하며, 각자 내부에서 dtype별 단위 변환을 수행한다:</p>
+<table>
+<thead><tr><th>메서드</th><th>의미</th><th>제약</th></tr></thead>
+<tbody>
+<tr><td><code>prune_prefix(count)</code></td><td>앞쪽 count 토큰 삭제, 나머지를 앞으로 shift</td><td>opaque는 HeadMajor 전용</td></tr>
+<tr><td><code>shift_positions(src, dst, count)</code></td><td>모든 head에서 같은 구간을 이동</td><td>—</td></tr>
+<tr><td><code>shift_positions_for_head(head, src, dst, count)</code></td><td>단일 head만 이동 (H2O+ per-head용)</td><td><b>HeadMajor 필수 (SeqMajor면 assert panic)</b></td></tr>
+<tr><td><code>compact_keep_positions(&amp;keep, write_start)</code></td><td>keep 목록(오름차순)을 연속 영역으로 압축. 연속 src를 배치 병합해 <code>buffer_shift</code> 호출을 최대 ~200배 절감. <code>current_pos</code>는 갱신하지 않음(호출자 책임)</td><td>per-head 변형 <code>compact_keep_positions_for_head</code> 존재</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::prune_prefix</code> (L741), <code>::shift_positions</code> (L869), <code>::shift_positions_for_head</code> (L958, assert L965), <code>::compact_keep_positions</code> (L1113–1147)</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>5. 2-tier 관리 구조</h2>
+
+<h3>5.1 상위 tier: CachePressureHandler 파이프라인</h3>
+<p>
+상위 trait은 "eviction을 넘어선 일반화된 캐시 관리 동작" 1개를 표현한다. 계약은 단순하다 —
+<code>handle(ctx)</code>에서 <code>ctx.pressure_level</code>과 캐시 상태를 보고 스스로 행동 여부를 결정하고,
+안 하면 <code>ActionResult::NoOp</code>을 반환한다:
+</p>
+<pre><code>pub trait CachePressureHandler: Send + Sync {
+    fn handle(&amp;self, ctx: &amp;mut HandlerContext) -&gt; Result&lt;ActionResult&gt;;
+    fn name(&amp;self) -&gt; &amp;str;
+}
+
+pub struct HandlerContext&lt;'a&gt; {
+    pub caches: &amp;'a mut [KVCache],            // layer 당 1개
+    pub importance: Option&lt;&amp;'a [f32]&gt;,        // per-token 누적 attention score
+    pub head_importance: Option&lt;&amp;'a [f32]&gt;,   // [n_kv_heads * max_seq_len] row-major
+    pub n_kv_heads: usize,                    // 0 = GQA 모드 비활성
+    pub pressure_level: PressureLevel,
+    pub mem_available: usize,
+    pub target_ratio: Option&lt;f32&gt;,            // 외부 신호의 ratio override
+    pub qcf_sink: Option&lt;&amp;'a mut Vec&lt;QcfMetric&gt;&gt;,
+    pub layer_ratios: Option&lt;&amp;'a [(f32, f32)]&gt;, // D2O per-layer (hh, recent) 배분
+}</code></pre>
+<p>
+<code>PressureLevel</code>은 <code>llm_shared::Level</code>의 type alias로
+<code>Normal &lt; Warning &lt; Critical &lt; Emergency</code> 순서의 <code>Ord</code>를 derive한다.
+<code>CachePressurePipeline</code>은 <code>PressureStageConfig { min_level, handler }</code> 목록을
+생성 시 <code>min_level</code> 오름차순으로 정렬해 두고, 실행 시
+<code>ctx.pressure_level &gt;= stage.min_level</code>인 stage를 <b>순차</b> 실행한다 —
+뒤 핸들러는 앞 핸들러가 바꿔 놓은 캐시 상태를 본다(테스트
+<code>test_context_updated_after_eviction</code>이 이 의미를 고정: 40 → 20 → 10).
+</p>
+<p>
+실행 결과 enum은 현재 <b>4-variant</b>다:
+</p>
+<pre><code>pub enum ActionResult {
+    NoOp,
+    Evicted { tokens_removed: usize, new_pos: usize },
+    Swapped { tokens_swapped: usize },
+    WeightSwapped { layers_changed: usize, freed_bytes: usize, duration_ms: f64 },
+}</code></pre>
+<p class="evidence">근거: <code>engine/src/pressure.rs::CachePressureHandler</code> (L116), <code>::HandlerContext</code> (L50–75), <code>::ActionResult</code> (L81–100), <code>::CachePressurePipeline::new/execute</code> (L174–193), <code>::PressureLevel</code> (L45)</p>
+
+<h3>5.2 하위 tier: EvictionPolicy — 영구 삭제 전용 legacy</h3>
+<pre><code>pub trait EvictionPolicy: Send + Sync {
+    fn should_evict(&amp;self, cache: &amp;KVCache, mem_available: usize) -&gt; bool;
+    fn evict(&amp;self, cache: &amp;mut KVCache, target_len: usize) -&gt; Result&lt;()&gt;;
+    fn name(&amp;self) -&gt; &amp;str;
+    // score-aware override 지점 (default 는 위로 위임):
+    fn evict_with_scores(&amp;self, cache, target_len, importance: &amp;[f32]) -&gt; Result&lt;()&gt;;
+    fn evict_with_head_scores(&amp;self, cache, target_len, flat, head_imp, n_kv_heads) -&gt; Result&lt;()&gt;;
+    // Phase α-K: in-place evict 와 동일 의미의 keep-list 산출 (default None = 미지원)
+    fn plan_keep(&amp;self, current_pos, target_len, importance) -&gt; Option&lt;(Vec&lt;usize&gt;, Vec&lt;Merge&gt;)&gt;;
+}</code></pre>
+<p>
+하위 trait은 <b>토큰 영구 삭제</b>만 표현한다. <code>EvictionHandler</code> 어댑터가
+<code>Box&lt;dyn EvictionPolicy&gt;</code>를 감싸 상위 파이프라인에 연결한다 —
+<code>target_len = current_pos × effective_ratio</code> (외부 신호의 <code>ctx.target_ratio</code>가 있으면 그것 우선)을
+계산하고 <code>ScoreContext</code>(None/Flat/PerHead)를 조립한 뒤, 실제 실행은
+<code>CacheManager::run_policy_eviction</code> 단일 코어에 위임한다(§5.3).
+<code>plan_keep</code>은 in-place 변형 대신 보존 목록을 산출하는 plan-returning 이행 경로로,
+per-head(H2O+)나 가중 merge(D2O)는 단일 layer-wide keep-list로 표현이 불가해 default <code>None</code>이다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/eviction.rs::EvictionPolicy</code> (L13–77), <code>engine/src/pressure/eviction_handler.rs::EvictionHandler::handle</code> (L43–81)</p>
+
+<pre class="mermaid">
+classDiagram
+    class CachePressureHandler {
+        &lt;&lt;trait&gt;&gt;
+        +handle(ctx) ActionResult
+        +name() str
+    }
+    class CachePressurePipeline {
+        -stages: Vec~PressureStageConfig~
+        +execute(ctx) Vec~ActionResult~
+    }
+    class EvictionPolicy {
+        &lt;&lt;trait&gt;&gt;
+        +should_evict(cache, mem) bool
+        +evict(cache, target_len)
+        +evict_with_scores(...)
+        +evict_with_head_scores(...)
+        +plan_keep(...) Option
+    }
+    class EvictionHandler {
+        -policy: Box~dyn EvictionPolicy~
+        -target_ratio: f32
+    }
+    class CacheManager {
+        -pipeline: CachePressurePipeline
+        -monitor: Box~dyn SystemMonitor~
+        -threshold_bytes: usize
+        -policies: HashMap~EvictMethod, Policy~
+        -swap_handler: Option SwapHandler
+        +maybe_evict(caches)
+        +force_evict(caches, ratio)
+        +force_evict_by_policy(method, ...)
+        +offload(caches, ratio)
+        +recall(caches)
+    }
+    CachePressurePipeline o-- CachePressureHandler : min_level 게이트
+    CacheManager *-- CachePressurePipeline
+    CachePressureHandler &lt;|.. EvictionHandler : bridge
+    CachePressureHandler &lt;|.. D2OHandler
+    CachePressureHandler &lt;|.. SwapHandler
+    CachePressureHandler &lt;|.. QuantizeHandler : 항상 NoOp(stub)
+    CachePressureHandler &lt;|.. WeightSwapHandler
+    EvictionHandler o-- EvictionPolicy
+    EvictionPolicy &lt;|.. SlidingWindowPolicy
+    EvictionPolicy &lt;|.. H2OPolicy
+    EvictionPolicy &lt;|.. H2OPlusPolicy
+    EvictionPolicy &lt;|.. StreamingLLMPolicy
+    EvictionPolicy &lt;|.. NoEvictionPolicy
+</pre>
+
+<h3>5.3 CacheManager의 dispatch 구조</h3>
+<p>
+<code>CacheManager</code>는 항상 파이프라인 모드다. <code>new(policy, monitor, threshold_bytes, target_ratio)</code>
+(legacy API)는 정책을 <code>EvictionHandler</code>로 감싸 <b>Warning level 단일 stage</b> 파이프라인을 만들고,
+<code>with_pipeline()</code>은 멀티 핸들러 파이프라인을 그대로 받는다. 모든 public 메서드는
+단일 코어 <code>execute_dispatch(caches, scores, force, force_target_ratio, layer_ratios)</code>의 thin wrapper다:
+</p>
+<table>
+<thead><tr><th>public API</th><th>force</th><th>scores</th><th>비고</th></tr></thead>
+<tbody>
+<tr><td><code>maybe_evict</code></td><td>✗</td><td>None</td><td>decode 루프에서 매 step 후 호출 가능</td></tr>
+<tr><td><code>maybe_evict_with_scores</code> / <code>_with_head_scores</code></td><td>✗</td><td>Flat / PerHead</td><td>AttentionScoreAccumulator 활성 시</td></tr>
+<tr><td><code>force_evict</code> / <code>_with_scores</code> / <code>_with_head_scores</code></td><td>✓ (Emergency)</td><td>각각</td><td>resilience 신호 — ratio override 전달</td></tr>
+<tr><td><code>force_evict_with_scores_and_budgets</code></td><td>✓</td><td>Flat</td><td>+ <code>layer_ratios</code> (D2O layer allocation)</td></tr>
+<tr><td><code>force_evict_by_policy(_ref)</code></td><td>—</td><td>임의</td><td><b>파이프라인 우회</b> — Manager 지시로 등록된(<code>register_policy</code>) 특정 정책 직접 실행</td></tr>
+<tr><td><code>offload</code> / <code>recall</code></td><td>—</td><td>—</td><td><b>파이프라인 밖</b> swap_handler 직접 호출 (KvOffload/RestoreDefaults 지시 전용)</td></tr>
+</tbody>
+</table>
+<p>
+압력 레벨 산출은 가용 메모리와 <code>threshold_bytes</code>의 비율이다:
+<code>&ge; threshold → Normal</code>, <code>&ge; threshold/2 → Warning</code>,
+<code>&ge; threshold/4 → Critical</code>, 그 미만 <code>→ Emergency</code>.
+<code>force=true</code>면 메모리 검사를 건너뛰고 Emergency로 실행해 모든 stage가 돌게 한다.
+Normal이면 파이프라인 자체를 실행하지 않고, monitor 에러 시에도 eviction을 skip한다(보수적).
+</p>
+<pre class="mermaid">
+sequenceDiagram
+    participant S as session (model_forward)
+    participant CM as CacheManager
+    participant M as SystemMonitor
+    participant P as CachePressurePipeline
+    participant H as EvictionHandler
+    participant CORE as run_policy_eviction
+    participant KV as KVCache[layer 0..N]
+
+    S->>CM: maybe_evict_with_scores(caches, importance)
+    CM->>M: mem_stats()
+    M-->>CM: available
+    CM->>CM: determine_pressure_level (t, t/2, t/4)
+    alt Normal
+        CM-->>S: EvictionResult{evicted=false}
+    else Warning 이상
+        CM->>P: execute(ctx)
+        P->>H: handle(ctx)  — min_level 충족 stage 순차
+        H->>CORE: run_policy_eviction(policy, caches, target_len, scores)
+        CORE->>CORE: guard: current_pos &gt; target_len, 제거량 ≥ MIN_EVICT_TOKENS(64)
+        loop 모든 layer cache
+            CORE->>KV: policy.evict[_with_scores|_with_head_scores]
+        end
+        CORE-->>H: EvictionResult
+        H-->>P: ActionResult::Evicted
+        P-->>CM: Vec~ActionResult~
+        CM->>KV: release_unused_pages() — shrink 또는 madvise
+        CM-->>S: EvictionResult{tokens_removed, new_pos}
+    end
+</pre>
+<p>
+공유 코어 <code>run_policy_eviction</code>의 guard 2개가 실무에서 중요하다:
+(1) <code>target_len &gt; 0 &amp;&amp; current_pos &le; target_len</code>이면 no-op,
+(2) 제거 예정 토큰이 <code>MIN_EVICT_TOKENS = 64</code> 미만이면 skip — 18~22 토큰마다 full sort+memcpy가
+도는 "sticky eviction" 패턴을 막는다. 또한 실제 제거량이 요청의 절반에도 못 미치면
+"eviction undershot" 경고를 남긴다(<code>protected_prefix</code>가 target을 잠식하는 사고를 표면화).
+<code>target_len == 0</code>은 "정책이 스스로 결정"(StreamingLLM이 자기 sink+window 사용)을 뜻한다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/cache_manager.rs::execute_dispatch</code> (L201–319), <code>::determine_pressure_level</code> (L153–163), <code>::run_policy_eviction</code> (L536–629), <code>::resolve_target_len</code> (L520–526), <code>engine/src/pressure/eviction_handler.rs::MIN_EVICT_TOKENS</code> (L17)</p>
+
+<div class="note">
+<b>eviction은 caller 책임이다.</b> 모델 forward(<code>forward_into</code>)는 eviction을 모른다.
+session 레벨 <code>model_forward.rs</code>가 forward 호출 사이에 <code>maybe_evict*</code>(자동) 또는
+<code>force_evict*</code>(resilience 신호)를 끼워 넣는다. 신호 경로 전체는
+<a href="08_resilience_ipc.html">08. Resilience &amp; IPC</a> 참조.
+</div>
+<p class="evidence">근거: <code>engine/src/session/forward/model_forward.rs</code> (L526–559 호출부)</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>6. Eviction 정책 구현 비교</h2>
+
+<table>
+<thead><tr><th></th><th>Sliding</th><th>StreamingLLM</th><th>H2O</th><th>H2O+</th><th>D2O</th></tr></thead>
+<tbody>
+<tr><td>타입</td><td>EvictionPolicy</td><td>EvictionPolicy</td><td>EvictionPolicy</td><td>EvictionPolicy</td><td><b>CachePressureHandler</b> (policy 아님)</td></tr>
+<tr><td>파티션</td><td>[prefix | recent]</td><td>[sink | recent]</td><td>[prefix | HH | recent]</td><td>[prefix | HH(per-head) | recent]</td><td>[prefix | HH | recent] + merge</td></tr>
+<tr><td>score 필요</td><td>✗</td><td>✗</td><td>○ (없으면 recent-only 폴백)</td><td>○ per-head (flat 폴백)</td><td>필수 (없으면 NoOp)</td></tr>
+<tr><td>should_evict</td><td><code>pos &gt; window+prefix</code></td><td><code>pos &gt; sink+window</code></td><td>항상 false (신호 구동)</td><td>항상 false</td><td>— (handle에서 자체 판단)</td></tr>
+<tr><td>버퍼 조작</td><td>shift_positions 1회</td><td>shift_positions 1회</td><td>compact_keep_positions</td><td>compact_keep_positions_for_head × head</td><td>scatter-reduce merge + compact</td></tr>
+<tr><td>plan_keep</td><td>구현</td><td>—</td><td>구현</td><td>None (per-head 표현 불가)</td><td>— (D2OStage가 KVCachePlan 산출)</td></tr>
+</tbody>
+</table>
+
+<h3>6.1 SlidingWindowPolicy — 최근 N 토큰</h3>
+<p>
+생성자가 <code>protected_prefix = max(4)</code>를 강제한다(attention sink 보호 — 인자로 0~3을 줘도 4).
+evict 시 <code>keep = target_len.clamp(min_keep, max_keep)</code>,
+<code>max_keep = window + prefix</code>, <code>min_keep = min(prefix + 16, max_keep)</code>.
+prefix 뒤의 오래된 <code>prune_count</code>개를 건너뛰고 나머지를
+<code>shift_positions(prefix + prune_count, prefix, remaining)</code> 1회로 당긴다.
+prefix가 항상 ≥4이므로 <code>prune_prefix</code> 분기는 사실상 dead code다(<code>plan_keep</code> 주석에 명시).
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/sliding_window.rs::SlidingWindowPolicy::new</code> (L28–35), <code>::evict</code> (L43–88)</p>
+
+<h3>6.2 StreamingLLMPolicy — sink + window 고정 2-영역</h3>
+<p>
+<code>[sink(S)] [recent window(W)]</code> 두 영역만 유지. <code>target_len</code>이 0이거나 <code>S+W</code> 이상이면
+정확히 <code>S+W</code>로 압축하고, 더 작으면 window를 <code>target_len - S</code>(최소 1)로 줄인다.
+중간 gap 전체를 <code>shift_positions(recent_start, sink_size, effective_window)</code> 1회로 제거.
+파라미터가 런타임 결정이라 registry 등록 대신 <code>force_evict_by_policy_ref</code>로 호출된다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/streaming_llm.rs::evict</code> (L52–78), <code>engine/src/pressure/cache_manager.rs::force_evict_by_policy_ref</code> (L491–514 주석)</p>
+
+<h3>6.3 H2OPolicy — 3-파티션 + 누적 score 랭킹</h3>
+<p>
+<code>keep = target_len.max(prefix + 2)</code>에서 시작해 예산을 나눈다:
+</p>
+<pre><code>available     = keep - prefix
+hh_budget     = available * keep_ratio      // 기본 0.5 = 논문의 50:50
+recent_budget = available - hh_budget
+recent_start  = max(current - recent_budget, prefix)</code></pre>
+<p>
+evictable 구간 <code>[prefix .. recent_start)</code>의 (pos, score)를 score 내림차순 정렬 →
+상위 <code>hh_budget</code>개를 HH로 선택 → <b>position 오름차순 재정렬</b>(순서 보존) →
+<code>keep_all = HH ++ [recent_start..current)</code>를 <code>compact_keep_positions(keep_all, prefix)</code>로 압축,
+<code>current_pos = prefix + keep_all.len()</code>. score가 없으면 prefix+recent만 남기는 sliding 폴백.
+<code>should_evict</code>는 항상 false — H2O는 resilience 신호로만 발동한다(score 누적은 매 토큰, 결정은 외부).
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/h2o.rs::evict_with_scores</code> (L85–176), <code>::should_evict</code> (L42–48)</p>
+
+<h3>6.4 H2OPlusPolicy — GQA-aware per-head HH 선택</h3>
+<p>
+예산 산식은 H2O와 동일하되, <code>head_importance[kv_h * max_seq + pos]</code>로 <b>KV head마다 독립적으로</b>
+HH를 고른다. 모든 head가 <b>같은 개수</b>(hh_budget)를 유지하되 <b>다른 토큰</b>을 남긴다 —
+단일 <code>current_pos</code> 불변식을 지키기 위한 설계다. head별로
+<code>compact_keep_positions_for_head(kv_h, keep_all, prefix)</code>를 호출하므로 HeadMajor가 필수다
+(SeqMajor면 <code>shift_positions_for_head</code>의 assert로 panic). 압축 후
+<code>current_pos = prefix + hh_budget + actual_recent</code>.
+</p>
+<div class="warn">
+주의: per-head eviction 이후에는 "position p"가 head마다 <b>다른 원본 토큰</b>을 가리킨다.
+RoPE position과 물리 위치가 head별로 어긋나는 것을 허용하는 근사이며, 이후의 per-token
+연산(예: flat score 재사용)은 의미가 약해진다. 리뷰 시 H2O+ 경로 뒤에 토큰 단위 가정을 하는
+코드가 추가되지 않는지 확인하라.
+</div>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/h2o_plus.rs::evict_with_head_scores</code> (L107–167)</p>
+
+<h3>6.5 D2OHandler — eviction + 보상 merge</h3>
+<p>
+D2O는 <code>EvictionPolicy</code>가 아니라 <code>CachePressureHandler</code>를 직접 구현한다 —
+"가중 병합"은 영구 삭제 trait 표면에 담기지 않기 때문이다. 기본값:
+<code>keep_ratio 0.75</code>(논문 N:M=3:1), <code>protected_prefix 4</code>, <code>target_ratio 0.5</code>,
+<code>ema_beta 0.7</code>, <code>merge_e 0.1</code>. 상태(<code>ema_threshold</code>, merge/delete 누계)는
+<code>Mutex&lt;D2OState&gt;</code>로 호출 간 누적된다. layer 루프 단계:
+</p>
+<ol>
+<li><b>계획 (mutation 없음)</b>: <code>compute_d2o_plan</code> — H2O식 3-파티션으로 retain/evict 분할.</li>
+<li><b>nearest 매칭</b>: 각 evicted 토큰을 <b>layer-wide K cosine</b>(전 head concat K, head별이 아님)으로
+    가장 가까운 retained 토큰에 단일 argmax 매칭 (K는 dtype별 dequant reader 경유).</li>
+<li><b>EMA 임계 τ (Eq.10)</b>: 첫 호출은 max-sim 평균으로 초기화, 이후
+    <code>τ = β·max(sim) + (1−β)·τ</code>.</li>
+<li><b>필터</b>: <code>sim ≥ τ</code>인 토큰만 merge 대상, 나머지는 그냥 삭제.</li>
+<li><b>scatter-reduce merge (Eq.11)</b>: retained c_j와 그 그룹 {e_i}에 대해
+    <code>D = Σ exp(u_ij) + e</code>, <code>w_c = e/D</code>, <code>w_ei = exp(u_ij)/D</code> —
+    가중치 합 1 보장. K/V 모두, 모든 head에 같은 layer-wide 가중치 적용.
+    dtype별 구현: F32/F16 직접, <b>Q4_0은 블록 dequant → 가중합 → requantize</b>.</li>
+<li><b>compact</b>: <code>compact_keep_positions(retain_all, 0)</code> 후 <code>current_pos = retain_all.len()</code>.</li>
+</ol>
+<p>
+가드/폴백: <code>importance</code>가 없으면 NoOp. KV 버퍼가 GPU-only(<code>as_ptr() == null</code>,
+discrete GPU)면 CPU에서 K를 읽을 수 없어 merge를 끄고 H2O식 eviction-only로 강하한다.
+<code>ctx.layer_ratios</code>가 있으면 layer별 <code>(hh_r + rec_r)</code> 비율로 target을 차등 적용하고
+(Phase B layer allocation, <code>d2o_layer_alloc.rs</code>), 이때 마지막 layer는 항상 보호된다.
+같은 파일의 <code>D2OStage</code>는 동일 <code>compute_d2o_plan</code>을 공유해 plan-returning
+<code>KVCacheStage</code>(technique-api) 표면으로 노출한 변형이다 — 버퍼 변형은 엔진 executor가 실행.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/d2o_handler.rs::D2OConfig</code> (L26–59), <code>::compute_d2o_plan</code> (L204–305), <code>::handle</code> (L308–405, GPU 가드 L342), <code>::scatter_reduce_merge_layer_wide</code> (L721–763), <code>::compute_eq11_weights</code> (L700–710), <code>::D2OStage</code> (L423–451)</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>7. KV quantization 상세</h2>
+
+<h3>7.1 Q4_0 typed KV — KVCache 그대로, dtype만 교체</h3>
+<p>
+Q4_0 KV는 별도 타입이 아니라 <code>KVCache</code>의 <code>k_buffer.dtype() == DType::Q4_0</code>인 경우다.
+저장 단위는 <code>BlockQ4_0</code>(scale <code>d: f16</code> + 4-bit×32 packed <code>qs: [u8;16]</code> = 18 B,
+0.5625 B/elem). 대칭 양자화: <code>d = max|x| / 7</code>, 값을 [−8, 7]로 클램프해 nibble 2개씩 packing.
+</p>
+<p>
+<b>쓰기 경로의 양자화 책임은 <code>KVCache</code>가 아니라 호출자에 있다</b> —
+<code>KVCache::update</code>는 입력이 이미 cache dtype이라고 전제하고 block 단위 복사만 한다.
+production에서는 <code>StandardFormat::write_inner</code>의 비-F32 cast 경로가 F32 입력을
+<code>backend.cast(new_k, k_cast)</code>로 Q4_0 scratch(<code>memory.alloc</code> lazy 할당, shape 변경 시 재할당)에
+변환한 뒤 <code>update</code>를 부른다. Q4_0은 GPU fused scatter fast-path가 없어 GPU에서도 이 cast 경로다.
+</p>
+<p>
+<b>읽기(attention) 경로</b>: CPU backend는 <code>attention_gen</code>이 dtype-aware라 Q4_0을 자체 처리하지만,
+GPU에는 Q4_0 dequant-attention 커널이 없어 <code>BlockQ4_0</code> raw 바이트를 float로 오독한다 — 그래서
+<code>StandardFormat::attention_into</code>가 <code>kv_dtype == Q4_0 &amp;&amp; backend.is_gpu()</code>면
+CPU 폴백 경로로 우회한다.
+</p>
+<p class="evidence">근거: <code>engine/src/quant.rs::BlockQ4_0::quantize</code> (L35–49), <code>engine/src/pressure/standard_format.rs::write_inner</code> 비-F32 cast 분기 (L259–324), Q4_0+GPU attention 우회 주석 (L459–464)</p>
+
+<h3>7.2 KIVI — KiviCache: 양자화 본체 + F32 residual</h3>
+<p>
+KIVI(ICML 2024)는 "최근 R 토큰은 F32로 두고, 가득 차면 배치로 양자화해 압축 저장소로 flush"하는
+설계다. <code>KVCache</code>와 무관한 <b>별도 타입 <code>KiviCache</code></b>이며, 양자화를 외부 cast가 아니라
+<b>자기 내부에서</b> 수행한다(<code>kv_dtype()</code>이 F32를 반환해 layer가 F32를 그대로 넘기게 함). 핵심 상태:
+</p>
+<pre><code>pub struct KiviCache {
+    bits: u8,                      // 2 | 4 | 8 | 16(미양자화 residual-only)
+    qk: QuantizedBlocks,           // 압축 K: Q2(BlockQ2_0) | Q4(BlockKVQ4) | Q8(BlockKVQ8)
+    qv: QuantizedBlocks,           // 압축 V
+    pub q2_tokens: usize,          // 압축 저장소의 토큰 수 (항상 res_cap 의 배수)
+    res_k: Vec&lt;f32&gt;, res_v: Vec&lt;f32&gt;, // residual — [kv_heads][res_cap][head_dim] (head-first)
+    pub res_pos: usize,            // residual 유효 토큰 수
+    res_cap: usize,                // R — QKKV(32) 의 배수 필수
+    attn_k_buf / attn_v_buf: Arc&lt;SharedBuffer&gt;, // get_view 용 dequant 출력 (증분 조립)
+    q2_deq_tokens: usize,          // 이미 dequant 된 압축 토큰 수 (증분 처리 마커)
+    // ... GPU 모드 필드 (gpu_res_k/v, gpu_attn_k/v(F16), gpu_q2k/v, kivi capability handle)
+}</code></pre>
+<p>
+논리 길이는 <code>current_pos() = q2_tokens + res_pos</code>. 제약: <code>res_cap</code>과 <code>head_dim</code> 모두
+<code>QKKV = 32</code>의 배수(assert). 블록 포맷은 <b>비대칭</b> 양자화다 —
+<code>BlockQ2_0</code>: <code>d</code>(scale=(max−min)/3) + <code>m</code>(min) + 2-bit×32 = <b>12 B</b>
+(0.375 B/elem, Q4_0 대비 33% 작음). 4/8-bit 변형은 <code>BlockKVQ4</code>/<code>BlockKVQ8</code>.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kivi_cache.rs::KiviCache</code> (struct L205–288), <code>::new_with_bits</code> (asserts L334–344), <code>::current_pos</code> (L2262), <code>engine/src/quant.rs::BlockQ2_0</code> (L93–99, size assert <code>== 12</code>), <code>QKKV</code> (L194 <code>= 32</code>)</p>
+
+<pre class="mermaid">
+flowchart LR
+    IN["update(new_k, new_v)<br/>F32 seq-major 입력"] --> CHK{"res_pos &ge; res_cap ?"}
+    CHK -- "아니오" --> APP["residual append<br/>res[h][res_pos][d] = 입력"]
+    CHK -- "예" --> FL["flush_residual()"]
+    FL --> NM["QCF proxy 산출<br/>(NMSE/OPR, AWQE는 opt-in)"]
+    NM --> QK2["K: per-channel 양자화<br/>채널별로 토큰 32개 묶음 → 1 block"]
+    NM --> QV2["V: per-token 양자화<br/>토큰별 head_dim 을 32개 묶음 → block"]
+    QK2 --> ST["qk/qv 에 push<br/>q2_tokens += flush_tokens"]
+    QV2 --> ST
+    ST --> APP
+    APP --> VIEW["get_view():<br/>증분 dequant → attn_k/v_buf<br/>SharedBufferView 로 zero-copy 반환"]
+</pre>
+
+<h3>7.3 flush_residual — K/V 양자화 축이 다르다</h3>
+<p>
+residual이 차면 <code>flush_residual()</code>이 <code>n_groups = res_pos / 32</code>개 그룹을 압축한다.
+KIVI의 핵심 비대칭:
+</p>
+<ul>
+<li><b>Key = per-channel</b>: head별·채널별로, <b>토큰 축을 가로질러</b> 32개 값을 한 block으로
+    (<code>vals[t] = res_k[head_base + (tok_start+t)*head_dim + ch]</code>). K의 채널별 outlier 분포에 맞춘 설계.</li>
+<li><b>Value = per-token</b>: head별·토큰별로, 그 토큰의 <code>head_dim</code>을 32개씩 잘라 block으로.</li>
+</ul>
+<p>
+flush 직전(F32 원본이 남아 있을 때) NMSE/OPR proxy를 계산해 <code>flush_proxies</code>에 쌓고
+(QCF_kv 패밀리, <a href="04_inference_pipeline.html">04장</a>의 score 경로와 연결),
+<code>awqe_enabled</code>이고 직전 decode의 post-softmax score 스냅샷이 있으면 AWQE/AW-VOPR도 추가한다.
+flush 후 남은 토큰(<code>res_pos % 32</code>)은 residual 앞으로 <code>copy_within</code>으로 당긴다.
+<code>bits == 16</code>이면 flush 자체가 no-op(전 시퀀스 F32 residual-only 모드).
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kivi_cache.rs::flush_residual</code> (L901–1026: K per-channel L980–993, V per-token L995–1007)</p>
+
+<h3>7.4 읽기 경로와 layout 주의</h3>
+<p>
+<code>get_view()</code>는 압축분을 <b>증분</b> dequant(<code>q2_deq_tokens</code> 마커로 새 flush만 처리)해
+<code>attn_k/v_buf</code>에 조립하고, <code>SharedBufferView</code>로 유효 영역만 노출하는 zero-copy F32 view를
+반환한다. GPU 모드(<code>new_gpu</code>, OpenCL 한정)는 residual/attn 버퍼를 GPU에 상주시키고
+hot path를 커널로 처리하되 양자화(flush)는 cold path라 CPU에 남긴다.
+<code>layout()</code> 반환값이 모드에 따라 다른 점에 주의: <b>bits=16 GPU 모드만 HeadMajor</b>
+(residual <code>[kv_heads, res_cap, head_dim]</code>가 그대로 attention 대상이라 stride 계산에
+<code>capacity() = res_cap</code> 사용), 나머지(CPU 전부, bits 2/4/8 GPU의 assembled view)는 SeqMajor다.
+</p>
+<p>
+<code>KIVIFormat</code>(format wrapper)의 <code>attention_into</code> dispatch 순서:
+(1) <code>seq_len &gt; 1</code>(prefill)이면 KIVI native multi-token 커널이 없어 dequant view +
+<code>StandardFormat::prefill_attention</code> 재사용. (2) decode에서
+<code>backend.is_gpu() &amp;&amp; as_kivi_attention() &amp;&amp; has_kivi_attn_kernel(bits) &amp;&amp; is_nosub_device()
+&amp;&amp; 토큰 &gt; 0</code>이면 <b>dequant 없이</b> <code>KiviRawBuffers</code>(qk/qv blocks + F32 residual)를 직접 읽는
+fused 커널 <code>attention_gen_kivi</code> dispatch. (3) 그 외에는 F32 view → <code>backend.attention_gen</code> 폴백.
+<code>is_nosub_device</code>는 NVIDIA류를 뜻한다 — Adreno(subgroup 지원)는 F32 dequant 경로가 더 빨라
+native를 쓰지 않는다(코드 주석의 게이팅 보존).
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kivi_cache.rs::get_view</code> (L2355–2395), <code>::layout</code> (L2278–2287), <code>engine/src/pressure/kivi_format.rs::KIVIFormat::attention_into</code> (L86–203), <code>::attention_native</code> (L212–291), <code>engine/src/kv_cache_ops.rs::KiviRawBuffers</code> (L27–44)</p>
+
+<h3>7.5 bit transition 과 QuantizeHandler</h3>
+<p>
+<code>transition_bits(new_bits)</code>는 기존 압축 블록을 F32로 dequant 후 새 bit로 재양자화한다
+(2/4/8 ↔ 16 모두 지원, 오차는 dequant→requant 사이클마다 누적). 압력 레벨과 bit의 매핑은
+<code>QuantizeHandler::target_bits_for_pressure</code>가 정의한다:
+Warning→8, Critical→4, Emergency→2, Normal→None.
+단 <code>QuantizeHandler</code>의 <code>handle()</code> 자체는 <b>항상 NoOp인 stub</b>이다 —
+<code>HandlerContext</code>가 <code>&amp;mut [KVCache]</code>만 들고 있어 <code>KiviCache</code>에 접근할 수 없기 때문.
+실제 transition은 파이프라인 밖에서 매핑 함수를 직접 호출해 수행하도록 설계되어 있다(주석).
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kivi_cache.rs::transition_bits</code> (L1034–), <code>engine/src/pressure/quantize_handler.rs::target_bits_for_pressure</code> (L30–37), <code>::handle</code> (L47–59)</p>
+
+<h3>7.6 SwapHandler — 참고: 정밀도가 아닌 위치를 바꾸는 핸들러</h3>
+<p>
+같은 디렉토리의 <code>SwapHandler</code>는 quantization이 아니라 디스크 offload다. 두 모드:
+(1) lossy — 가장 오래된 <code>total × offload_ratio</code> 토큰을 그냥 prune,
+(2) disk write-back — prune 전에 prefix 구간을
+<code>swap_dir/cache_L{layer}_{start}-{end}_{k,v}.bin</code>으로 덤프하고 <code>SwapRecord</code> 장부에 기록,
+<code>recall_caches</code>로 복원 가능. 디스크 모드는 F32/F16만 지원하고 Q4_0/KIVI는 경고 후 lossy로 강하한다.
+<code>CacheManager::enable_swap</code>으로 만들어지며 압력 파이프라인에는 등록되지 않는다 —
+Manager의 KvOffload/RestoreDefaults 지시에만 반응한다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/swap_handler.rs</code> (모듈 doc L1–16, <code>SwapRecord</code> L30, <code>offload_caches</code> L89), <code>engine/src/pressure/cache_manager.rs::enable_swap</code> (L111–113)</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>8. 리뷰 체크리스트</h2>
+<ul>
+<li><b>단위 변환</b>: 새 <code>copy_slice</code>/<code>buffer_shift</code> 호출이 생기면 F32/F16(element) ·
+    Q4_0(block=18B, ÷32) · opaque(byte) 세 arm을 모두 처리하는가? (§4의 SIGSEGV 선례)</li>
+<li><b>capacity 의존 offset</b>: HeadMajor offset 계산에 쓴 capacity가 grow/shrink 이후에도 유효한가?
+    캐싱된 stride가 재할당을 따라가는가?</li>
+<li><b>layout 전제</b>: 새 코드가 HeadMajor를 암묵 전제하면 SeqMajor에서 명시적으로 bail/assert 하는가?
+    (<code>shift_positions_for_head</code>, opaque arm들의 패턴을 따를 것)</li>
+<li><b>current_pos 갱신 책임</b>: <code>compact_keep_positions</code>는 <code>current_pos</code>를 건드리지 않는다 —
+    호출자가 <code>write_start + keep.len()</code>으로 설정했는가?</li>
+<li><b>guard 우회 여부</b>: 새 eviction 경로가 <code>run_policy_eviction</code>을 경유하는가?
+    우회하면 <code>MIN_EVICT_TOKENS</code>(64)와 undershot 경고를 잃는다.</li>
+<li><b>eviction 후 메모리 반환</b>: 토큰 수를 줄이는 새 경로가 <code>release_unused_pages()</code>를 부르는가?</li>
+<li><b>protected_prefix clamp</b>: Sliding/H2O/H2O+ 모두 생성자에서 <code>max(4)</code> — target_len이 작을 때
+    prefix가 예산을 잠식해 eviction이 무력화되는 시나리오를 테스트했는가?</li>
+<li><b>GPU 버퍼 직접 접근</b>: <code>as_ptr()</code> non-null이라고 host 접근 가능이 아니다 (CUDA managed).
+    <code>is_gpu_buffer()</code> 가드 또는 D2O처럼 null 체크 + 기능 강하를 넣었는가?</li>
+<li><b>KIVI 제약</b>: <code>res_cap</code>/<code>head_dim</code>의 QKKV(32) 배수 가정, <code>q2_tokens</code>가
+    <code>res_cap</code>의 배수라는 debug_assert를 새 경로가 깨지 않는가?</li>
+</ul>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<section>
+<h2>9. 코드만으로 확정하지 못한 것 / 의심 지점</h2>
+<ul>
+<li><code>QuantizeHandler</code>는 영구 stub인지(파이프라인 등록 자체가 무의미), KIVI transition을 실제로
+    호출하는 외부 루프 위치가 어디인지 — session 전체를 추적하지 않아 본 챕터에서는 매핑 함수만 기술했다.</li>
+<li><code>StandardFormat</code>/<code>KIVIFormat</code> 주석에 "unwired (production 호출처 0)"가 남아 있으나
+    일부 메서드(<code>take_inner</code>의 UER seam 등)는 chat 멀티턴 경로를 언급한다 — fmt 경로의 현재
+    wiring 범위는 <a href="04_inference_pipeline.html">04장</a>의 forward 경로 분석과 교차 확인 필요.</li>
+<li><code>determine_pressure_level</code>의 <code>threshold_bytes</code>가 CLI에서 어떤 기본값으로 주입되는지 미확인.</li>
+<li>H2O+에서 per-head 압축 후 flat <code>importance</code> 배열은 더 이상 물리 위치와 정합하지 않는데,
+    후속 eviction 호출에서 score 배열을 어떻게 재정렬/리셋하는지는 score accumulator 쪽(범위 밖) 확인 필요.</li>
+</ul>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="06_memory.html">← 06. 메모리 &amp; 데이터 포맷</a></span><span><a href="08_resilience_ipc.html">08. Resilience &amp; IPC →</a></span></footer>
+</body>
+</html>

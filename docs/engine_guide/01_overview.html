@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01. 시스템 개요 — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 01</span></nav>
+<header>
+<h1>01. 시스템 개요</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<section>
+<h2>1. 무엇을 위한 코드베이스인가</h2>
+<p>
+llm.rs(저장소명 <code>llm_rs2</code>)는 Rust로 작성된 <strong>온디바이스 LLM 추론 프레임워크</strong>다.
+1차 타겟은 ARM64 Android/엣지 디바이스이고, 연산 백엔드는 CPU(NEON, x86에서는 AVX2), OpenCL GPU(Adreno),
+CUDA(Jetson 임베디드 / PC)를 지원한다. OpenCL과 CUDA는 컴파일 타임에 <strong>상호 배타</strong>로 강제된다 —
+둘을 동시에 켜면 <code>compile_error!</code>로 빌드가 실패한다.
+</p>
+<pre><code>// engine/src/lib.rs:1
+#[cfg(all(feature = "opencl", feature = "cuda"))]
+compile_error!("Features 'opencl' and 'cuda' are mutually exclusive. Enable only one.");
+#[cfg(all(feature = "opencl", feature = "cuda-embedded"))]
+compile_error!("Features 'opencl' and 'cuda-embedded' are mutually exclusive. Enable only one.");</code></pre>
+<p class="evidence">근거: <code>engine/src/lib.rs::compile_error (L1~L4)</code>, <code>engine/Cargo.toml [features] (opencl/cuda/cuda-embedded/htp_fastrpc)</code></p>
+
+<p>
+이 프로젝트가 일반 추론 엔진과 구별되는 지점은 두 가지다.
+</p>
+<ul>
+<li><strong>Resilience(복원력) 내장</strong> — 별도 프로세스인 <code>llm_manager</code>가 시스템 메모리·온도·전력·연산 부하를
+감시하고, IPC로 엔진에 directive(throttle, KV eviction, weight swap, suspend 등)를 내려보낸다.
+엔진의 추론 루프는 매 토큰마다 이 directive를 poll하여 런타임 중에 동작을 바꾼다.
+<code>argus_cli</code>에서 resilience는 <strong>default-on</strong>이며 <code>--no-resilience</code>로만 끈다
+(<code>args.enable_resilience = !args.no_resilience</code>).</li>
+<li><strong>확장 축의 분리</strong> — KV/weight의 저장 표현(<a href="02_terminology.html">Format</a>),
+상주 데이터 관리 동작(<a href="02_terminology.html">Stage</a>), 실행 위치(Hardware)를 직교 축으로 다루고,
+<code>crates/technique-api</code>를 통해 외부 crate가 엔진 코어 수정 없이 새 기법을 등록한다
+(<a href="10_howto_extend.html">10장</a>).</li>
+</ul>
+<p class="evidence">근거: <code>engine/src/bin/argus_cli.rs::main (L27)</code>, <code>crates/technique-api/src/lib.rs::KVCacheStage (trait, L220)</code></p>
+
+<p>
+모델 입력은 GGUF / AUF(Argus Unified Format, GGUF 파생 self-contained 자산) / HuggingFace Safetensors 세 포맷을
+받는다. 로더는 <code>detect_primary_format()</code>으로 경로에서 포맷을 판별해
+<code>TransformerModel::load_from_config</code>(GGUF/AUF) 또는 <code>load_with_dtype</code>(Safetensors)로 분기한다.
+weight는 F16/Q4_0(블록당 18B, 32 elem) 등으로 양자화 지원된다.
+</p>
+<p class="evidence">근거: <code>engine/src/session/init.rs::SessionInitCtx::build (L506~L544, detect_primary_format 분기)</code>, <code>engine/src/quant (BlockQ4_0, QK4_0)</code></p>
+
+<div class="note">
+<strong>릴리스 프로필</strong> — 워크스페이스 루트에서 <code>lto = "fat"</code>, <code>codegen-units = 1</code>,
+<code>panic = "abort"</code>, <code>opt-level = 3</code>으로 고정된다. fat-LTO 때문에
+미사용 심볼이 잘려나갈 수 있어, 빌드 직후 내장 KV format 4종의 링크 여부를
+<code>ensure_builtin_kv_formats_registered()</code>로 self-test하는 fail-fast 코드가 추론 셋업에 들어 있다.
+</div>
+<p class="evidence">근거: <code>Cargo.toml [profile.release]</code>, <code>engine/src/session/bin_setup.rs::build_inference_ctx (L40)</code></p>
+
+<div class="warn">
+<strong>실측 교훈 (코드로 확인 불가한 운영 지식, CLAUDE.md 인용)</strong> —
+(1) Adreno 디바이스 권장 backend는 <code>opencl --opencl-rpcmem</code>이며, <code>CL_MEM_ALLOC_HOST_PTR</code> 기반
+UnifiedBuffer는 Adreno에서 zero-copy 효과가 없다(진짜 zero-copy는 rpcmem DMA-BUF interop).
+(2) 성능 측정은 <code>--profile</code> 없이 한다 — per-op <code>clFinish</code>가 ~54 ms/tok의 sync 오버헤드를 더한다.
+이 수치는 코드 주석에도 남아 있다(<code>init.rs</code> L158: "adds ~54 ms/tok").
+(3) Galaxy S25 벤치는 6 스레드가 최적, 8 스레드는 역효과.
+</div>
+</section>
+
+<section>
+<h2>2. Cargo workspace 구성</h2>
+<p>
+루트 <code>Cargo.toml</code>의 workspace member는 6개 그룹이다. <code>crates/techniques/*</code>는
+<strong>glob 멤버</strong>라서 폴더만 추가하면 자동으로 workspace에 편입된다(zero-compile 확장 — 단, 엔진 바이너리에
+링크하려면 의존 1줄이 필요하다는 주석이 루트 manifest에 명시되어 있다).
+</p>
+<pre><code>members = [
+    "engine",
+    "shared",
+    "manager",
+    "crates/qnn_oppkg",
+    "crates/technique-api",
+    "crates/techniques/*",
+]
+resolver = "3"</code></pre>
+<p class="evidence">근거: <code>Cargo.toml::[workspace] members</code></p>
+
+<table>
+<thead><tr><th>크레이트</th><th>패키지명</th><th>역할</th><th>핵심 의존</th></tr></thead>
+<tbody>
+<tr><td><code>engine/</code></td><td><code>llm_rs2</code></td><td>추론 엔진 본체. 모델 로딩, backend dispatch, KV 캐시, pressure 파이프라인, 세션 오케스트레이션, resilience 클라이언트까지 전부 이 안에 있다.</td><td><code>llm_shared</code>, <code>technique-api</code>, <code>ocl</code>(opt), <code>cudarc</code>(opt), <code>zbus</code>(opt), <code>libloading</code>(non-optional — .so plugin dlopen 코어)</td></tr>
+<tr><td><code>shared/</code></td><td><code>llm_shared</code></td><td>Manager↔Engine IPC <strong>wire 타입 전용</strong> 크레이트. <code>SystemSignal</code>, <code>EngineCommand</code>, <code>EngineMessage</code> 등 serde 직렬화 enum/struct만 있고 로직이 없다. 의존은 serde/serde_json 둘뿐.</td><td><code>serde</code></td></tr>
+<tr><td><code>manager/</code></td><td><code>llm_manager</code></td><td>시스템 리소스 매니저 서비스(별도 프로세스). 모니터(memory/thermal/energy/compute) → 정책(PolicyStrategy, 옵션으로 Lua 스크립트) → directive 송신. PI 컨트롤러 포함.</td><td><code>llm_shared</code>, <code>zbus</code>(opt), <code>mlua</code>(opt)</td></tr>
+<tr><td><code>crates/technique-api/</code></td><td><code>technique-api</code></td><td>확장 기법 등록 표면. <code>KVCacheStage</code>/<code>KVCachePlan</code>/<code>BackendCapability</code> trait 정의 + linkme distributed_slice. <strong>엔진 타입을 참조하지 않는 단방향 의존</strong>(engine → technique-api ← technique crate).</td><td>(없음)</td></tr>
+<tr><td><code>crates/techniques/*</code></td><td>9개</td><td>stage/format 축 plugin crate: <code>caote</code>(production, feature <code>caote</code>로 opt-in 링크), <code>synth-q4-format</code>(production force-link), <code>example-backend-cap</code>·<code>example-bundle</code>·<code>example-keep-recent</code>·<code>example-kv-format</code>·<code>example-multi-format</code>·<code>example-no-export</code>·<code>example-rollback</code>(예제/테스트).</td><td><code>technique-api</code>만</td></tr>
+<tr><td><code>crates/qnn_oppkg/</code></td><td><code>qnn_oppkg</code></td><td>QNN GPU Op Package. production에서는 제거되었고 paper microbench(<code>--features qnn</code>) 전용으로 보존.</td><td>(engine production 코드는 미의존 — <code>engine/Cargo.toml</code> 주석 명시)</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/Cargo.toml [dependencies] (L7~L18, L59~L66)</code>, <code>shared/Cargo.toml</code>, <code>manager/Cargo.toml</code>, <code>ls crates/techniques/ (9 디렉토리)</code></p>
+
+<pre class="mermaid">
+flowchart LR
+  subgraph ws["Cargo workspace (resolver 3, release: fat-LTO)"]
+    engine["engine\nllm_rs2 (추론 엔진)"]
+    shared["shared\nllm_shared (IPC wire 타입)"]
+    manager["manager\nllm_manager (리소스 매니저)"]
+    tapi["crates/technique-api\n(plugin 등록 표면)"]
+    tech["crates/techniques/*\n(9 plugin crates)"]
+    qnn["crates/qnn_oppkg\n(microbench 전용)"]
+  end
+  engine --> shared
+  engine --> tapi
+  manager --> shared
+  tech --> tapi
+  engine -. "caote: feature opt-in\nsynth-q4-format: force-link" .-> tech
+  engine -. "feature qnn (paper bench)" .-> qnn
+</pre>
+
+<p>
+의존 방향에서 읽어야 할 불변식 두 가지: (1) <strong>engine과 manager는 서로 직접 의존하지 않는다</strong> —
+공유점은 <code>llm_shared</code>의 wire 타입뿐이고, 런타임 결합은 전부 IPC다.
+(2) <strong>technique crate들은 engine을 모른다</strong> — <code>technique-api</code>에만 의존하므로,
+engine이 plugin을 (정적 linkme 또는 동적 <code>--load-plugin</code> dlopen으로) 끌어오는 단방향 구조다.
+</p>
+<p class="evidence">근거: <code>manager/Cargo.toml (llm_rs2 의존 없음)</code>, <code>engine/src/session/plugin_dispatch.rs::register_dynamic_plugins (bin_setup.rs L37에서 호출)</code></p>
+
+<div class="note">
+<strong>engine default features</strong> = <code>["opencl", "profile"]</code>. <code>opencl</code>은 GPU 없는 호스트에서도
+컴파일은 되지만 GPU 연산은 실행되지 않는다. <code>profile</code> feature는 instrument 매크로의 cfg gate인데
+<strong>default에 포함</strong>되어 있다는 점에 주의(아래 미해결 질문 참조). <code>resilience</code> feature는
+D-Bus transport(<code>zbus</code>)만 게이트하고, unix socket/TCP transport는 feature 없이도 동작한다.
+</div>
+<p class="evidence">근거: <code>engine/Cargo.toml::[features] default = ["opencl", "profile"] (L92)</code>, <code>engine/src/session/resilience_init.rs::build_command_executor (L50~, dbus arm만 cfg(feature="resilience"))</code></p>
+</section>
+
+<section>
+<h2>3. 실행 바이너리 카탈로그</h2>
+<p>
+엔진의 <code>src/main.rs</code>는 <code>println!("Hello, world!")</code>만 있는 placeholder다.
+실제 엔트리는 전부 <code>engine/src/bin/</code>의 바이너리들이다.
+</p>
+<p class="evidence">근거: <code>engine/src/main.rs (3줄 전체)</code></p>
+
+<table>
+<thead><tr><th>바이너리</th><th>위치</th><th>역할</th></tr></thead>
+<tbody>
+<tr><td><code>argus_cli</code></td><td><code>engine/src/bin/argus_cli.rs</code></td><td><strong>메인 단일 프롬프트 추론</strong>. standard happy path + production resilience. v0에서는 chat/experiment/ppl/eval/KIVI/offload/weight-swap/profile/tensor-partition 조합을 명시적으로 reject한다(<code>reject_unsupported_modes_v0</code>).</td></tr>
+<tr><td><code>argus_bench</code></td><td><code>engine/src/bin/argus_bench.rs</code></td><td>resilience 벤치/verify 엔진. <code>--experiment-output</code> per-token JSONL + directive 런타임 효과 측정. <code>verify/verify.py</code> 하네스가 이 bin을 띄운다.</td></tr>
+<tr><td><code>auf_tool</code></td><td><code>engine/src/bin/auf_tool.rs</code></td><td>AUF 자산 build/info/strip/verify CLI. GGUF + tokenizer.json → AUF 변환(사전 SoA + Q/K permute).</td></tr>
+<tr><td><code>test_backend</code></td><td><code>engine/src/bin/test_backend.rs</code></td><td>백엔드 정확성 검증 — CPU vs OpenCL 연산 결과 비교.</td></tr>
+<tr><td><code>test_model</code></td><td><code>engine/src/bin/test_model.rs</code></td><td>모델 로딩 스모크 테스트(CPU backend + Galloc).</td></tr>
+<tr><td><code>signal_injector</code></td><td><code>engine/src/bin/signal_injector.rs</code></td><td>resilience 스트레스 테스트용 <strong>가짜 Manager</strong>. Unix socket/TCP로 대기하다 JSON 스케줄에 따라 <code>ManagerMessage</code> directive를 주입.</td></tr>
+<tr><td><code>test_q4_soa_byte_equal</code></td><td><code>engine/src/bin/test_q4_soa_byte_equal.rs</code></td><td>Q4_0 noshuffle SoA 변환 GPU 커널 vs Rust 레퍼런스 byte-equality를 실디바이스(Adreno)에서 검증.</td></tr>
+<tr><td><code>microbench_*</code> 외 ~80종</td><td><code>engine/microbench/*.rs</code></td><td><code>src/</code> 밖이라 <code>[[bin]]</code>으로 명시 등록된 마이크로벤치/probe (HTP, QNN, Vulkan, OpenCL op matrix 등). production 경로 아님.</td></tr>
+<tr><td><code>llm_manager</code></td><td><code>manager/src/main.rs</code></td><td>리소스 매니저 서비스 데몬. SIGHUP hot-reload, Lua 정책 스크립트(<code>--policy-script</code>) 지원.</td></tr>
+<tr><td><code>mock_manager</code> / <code>mock_engine</code></td><td><code>manager/src/bin/</code></td><td>상호 테스트용 모의 피어.</td></tr>
+<tr><td><code>sim_run</code></td><td><code>manager/src/bin/sim_run.rs</code></td><td>Lua 정책 시뮬레이터(<code>required-features = ["lua"]</code>).</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>ls engine/src/bin/</code>, <code>engine/Cargo.toml [[bin]] (microbench 일괄 등록)</code>, <code>manager/Cargo.toml [[bin]]</code></p>
+
+<div class="warn">
+과거 문서·메모리에 등장하는 <code>generate</code> 바이너리는 <strong>현재 트리에 존재하지 않는다</strong> —
+<code>engine/Cargo.toml</code>에 등록이 없고 <code>engine/src/bin/</code>에도 파일이 없다. 코드 주석들이
+"legacy generate 와 동일 정책"(bin_setup.rs L202) 식으로 참조하는 것은 분할 이전의 monolith를 가리키는
+역사적 언급이다. 현 시점의 단일 추론 엔트리는 <code>argus_cli</code>, 실험·검증 엔트리는 <code>argus_bench</code>다.
+</div>
+</section>
+
+<section>
+<h2>4. 시스템 컴포넌트 다이어그램</h2>
+<p>
+런타임에는 두 개의 Rust 프로세스(Engine, Manager)와 주변 도구가 IPC·파일로 엮인다.
+Engine 내부는 <code>session</code>(오케스트레이션) → <code>models</code>(forward) → <code>backend</code>(연산 dispatch)
+→ <code>memory</code>(allocator)의 수직 스택과, 그 옆에 붙는 <code>pressure</code>(KV 캐시 + 관리 파이프라인),
+<code>resilience</code>(IPC 클라이언트)로 구성된다. 모듈별 책임과 계층 규칙은 <a href="03_code_map.html">03장</a>,
+추상화 카탈로그는 <a href="05_abstractions.html">05장</a>에서 다룬다.
+</p>
+
+<pre class="mermaid">
+flowchart TB
+  subgraph dev["디바이스 (Android / Linux 호스트)"]
+    subgraph eng["Engine 프로세스 — argus_cli / argus_bench (llm_rs2)"]
+      bin["bin: argus_cli\nreject 가드 + dispatch"]
+      sess["session\nbuild_inference_ctx → DecodeLoop"]
+      model["models::TransformerModel\nforward / forward_into"]
+      be["backend (trait Backend)\nCPU NEON · OpenCL · CUDA"]
+      mem["memory\nGalloc · OpenCLMemory · rpcmem"]
+      pres["pressure\nKVCache + CachePressurePipeline"]
+      res["resilience\nCommandExecutor + MessageLoop"]
+      bin --> sess --> model --> be --> mem
+      sess --> pres
+      res --> sess
+    end
+    subgraph mgr["Manager 프로세스 — llm_manager"]
+      mon["monitor\nmemory · thermal · energy · compute"]
+      pol["policy\nPolicyStrategy / Lua + PI controller"]
+      ded["DirectiveDeduplicator"]
+      mon --> pol --> ded
+    end
+    kern[".cl 커널 파일\nengine/kernels/*.cl"] -. "런타임 로드" .-> be
+    ded -- "ManagerMessage::Directive\n(unix socket / tcp / dbus)" --> res
+    res -- "EngineMessage\nCapability · Heartbeat · Response · QcfEstimate · WeightSwapReport" --> mgr
+  end
+  inj["signal_injector\n(가짜 Manager, 테스트)"] -. "ManagerMessage 주입" .-> res
+  dash["dashboard (Flask)\n벤치 결과 시각화"] -. "결과 파일 읽기" .-> dev
+  plug["technique .so\n--load-plugin (dlopen)"] -. "stage/format 등록" .-> sess
+</pre>
+<p class="evidence">근거: <code>engine/src/session/bin_setup.rs::build_inference_ctx</code>, <code>manager/src/main.rs (Monitor/PolicyStrategy/DirectiveDeduplicator import, L1~L20)</code>, <code>engine/src/resilience/transport.rs (UnixStream/TcpStream)</code>, <code>engine/src/bin/signal_injector.rs (모듈 doc)</code>, <code>dashboard/app.py (Flask)</code></p>
+
+<p>
+OpenCL 커널(<code>engine/kernels/*.cl</code>)은 컴파일 타임 링크가 아니라 <strong>런타임 로드</strong>된다 —
+바이너리 배포 시 커널 파일을 함께 배치해야 한다. 마찬가지로 technique plugin <code>.so</code>도
+<code>--load-plugin</code>으로 런타임 dlopen된다(<code>libloading</code>이 non-optional 코어 의존인 이유).
+</p>
+<p class="evidence">근거: <code>engine/Cargo.toml (libloading 주석 L59~L61)</code>, <code>engine/src/session/plugin_dispatch.rs::register_dynamic_plugins</code></p>
+</section>
+
+<section>
+<h2>5. 추론 요청의 전체 경로 — 한 장</h2>
+<p>
+<code>argus_cli --model-path foo.gguf --prompt "..." --num-tokens N</code> 한 번이 흐르는 경로 전체다.
+크게 <strong>셋업(빌드)</strong> → <strong>Prefill</strong> → <strong>Decode 루프</strong> 3구간이고,
+각 구간의 상세는 <a href="04_inference_pipeline.html">04장</a>이 layer 내부(RMSNorm → QKV → RoPE → attention → FFN)까지 내려간다.
+여기서는 함수 호출 체인과 분기 조건을 정확히 잡는 것이 목적이다.
+</p>
+
+<pre class="mermaid">
+sequenceDiagram
+  participant M as argus_cli::main
+  participant B as bin_setup::build_inference_ctx
+  participant I as SessionInitCtx::build
+  participant H as standard_happy::run_standard_happy_path
+  participant A as assembly::build_standard_loop
+  participant D as DecodeLoop
+  participant F as Forward (ModelForward)
+
+  M->>M: Args::parse + reject_unsupported_modes_v0
+  M->>M: is_standard_happy_path 가드 (미통과 시 bail)
+  M->>B: build_inference_ctx(args)
+  B->>B: register_dynamic_plugins(--load-plugin .so 들)
+  B->>B: ensure_builtin_kv_formats_registered (fat-LTO self-test)
+  B->>I: SessionInitCtx::build(&args)
+  I->>I: backend 분기 (cpu / opencl / cuda / htp)
+  I->>I: TransformerModel::load_from_config (GGUF/AUF) 또는 load_with_dtype
+  I-->>B: backend, memory, hardware, caps, model
+  B->>B: tokenizer resolve + load + vocab 호환성 검사
+  B->>B: prompt encode → tokens
+  B->>B: KV cache 할당 (typed vs opaque 분기, layer 수만큼)
+  B->>B: build_command_executor (resilience transport 연결)
+  B-->>M: StandardHappyCtx
+  M->>H: run_standard_happy_path(ctx)
+  H->>A: build_standard_loop(...)
+  A-->>H: DecodeLoop (6 trait object 조립)
+  H->>D: prefill(&tokens)
+  D->>F: forward.prefill(tokens, start_pos)
+  F-->>D: last logits
+  H->>H: sampling::sample → first_token
+  H->>D: run(num_tokens - 1, first_token)
+  loop budget 만큼 (토큰당)
+    D->>D: (a) cmd_source.poll → ExecutionPlan (suspend / throttle / evict / offload)
+    D->>D: (b) eviction.before_step → Pruned 시 pos 갱신
+    D->>D: (c) swap.before_step
+    D->>F: (d) forward.step(ctx, prev_token) — seq_len=1
+    D->>D: (e) swap.after_step
+    D->>D: (f) sampler.sample + observe_token
+    D->>D: (g) observers.on_step_end
+    D->>D: (h) target TBT pacing sleep
+  end
+  D-->>H: DecodeResult (tokens, final_pos, stopped_by)
+  H->>H: tokenizer.decode + TTFT / Decode ms/tok / Avg TBT 출력
+</pre>
+<p class="evidence">근거: <code>engine/src/bin/argus_cli.rs::main (L19~L45)</code>, <code>engine/src/session/bin_setup.rs::build_inference_ctx (L32~L199)</code>, <code>engine/src/session/standard_happy.rs::run_standard_happy_path (L37~L137)</code>, <code>engine/src/session/decode_loop.rs::DecodeLoop::run (L124~L346, (a)~(h) 주석 라벨 원문)</code></p>
+
+<h3>5.1 셋업에서 결정되는 것들</h3>
+<p>
+<code>SessionInitCtx::build</code>가 backend 선택을 수행한다. <code>--backend cpu</code>면 CpuBackend가 primary가 되고
+OpenCL이 가능하면 <strong>secondary로 자동 초기화</strong>된다(SwitchHw 대비, 실패는 soft-fail).
+<code>--backend opencl</code>이면 GPU가 primary이자 SwitchHw 왕복용 secondary를 겸하고, 이때만
+<code>CapabilityRegistry</code>에 <code>KiviAttentionBackend</code> capability가 등록된다(CPU/CUDA는 빈 registry).
+backend·memory 4개의 Arc는 <code>Hardware</code> resolver 하나로 흡수되어 이후 코드가
+<code>hardware.resolve(DeviceTarget::Cpu)</code>처럼 (backend, memory) 페어를 푼다.
+</p>
+<p class="evidence">근거: <code>engine/src/session/init.rs::SessionInitCtx::build (L196~L424 backend match, L337~L338 caps.register, L825~L831 Hardware::new)</code>, <code>engine/src/session/standard_happy.rs (L55~L59 hardware.resolve)</code></p>
+
+<div class="warn">
+<strong>zero-copy 강제 활성 분기</strong> — OpenCL primary일 때 <code>--no-zero-copy</code>를 줘도
+<code>--enable-resilience</code>(즉 default-on), tensor partition, prefill CPU chunk 중 하나라도 활성이면
+CPU-accessible 버퍼가 필요하므로 zero-copy가 강제로 다시 켜지고 경고만 출력된다.
+"분명히 껐는데 UnifiedBuffer가 잡힌다"는 리뷰 코멘트가 나오면 이 분기를 보라.
+</div>
+<p class="evidence">근거: <code>engine/src/session/init.rs (L287~L301 effective_zero_copy 계산)</code></p>
+
+<p>
+tokenizer는 <code>--tokenizer-path</code> 우선, GGUF면 <code>{stem}.tokenizer.json</code> →
+quant suffix 제거한 stem → sibling <code>tokenizer.json</code> 순서로 탐색한다. 로드 후
+<strong>vocab 호환성 검사</strong>가 강제된다: tokenizer vocab이 model vocab을 8개(oob_tolerance) 초과해 넘으면
+OOB embedding lookup 위험으로 <code>bail!</code>, model vocab이 tokenizer vocab을
+<code>max(model_vocab/20, 256)</code> 초과해 넘어도 잘못된 tokenizer로 보고 <code>bail!</code>한다.
+sibling 모델의 tokenizer를 잘못 잡는 사고를 코드 레벨에서 차단하는 장치다.
+</p>
+<p class="evidence">근거: <code>engine/src/session/bin_setup.rs::resolve_tokenizer_path (L203~L237)</code>, <code>::check_vocab_compatibility (L240~L277, oob_tolerance=8 / pad_tolerance 수식)</code></p>
+
+<h3>5.2 KV cache 할당 — typed vs opaque 분기</h3>
+<p>
+KV 캐시는 <strong>layer당 K/V 텐서 한 쌍</strong>씩, <code>num_hidden_layers</code>개가 할당된다.
+shape은 항상 <code>[1, kv_heads, capacity, head_dim]</code>의 <strong>HeadMajor</strong> 고정이고
+(<code>.with_layout(KVLayout::HeadMajor)</code>), grow-on-demand dynamic 캐시
+(<code>KVCache::new_dynamic</code>)로 만들어진다. 초기 capacity 수식:
+</p>
+<pre><code>// bin_setup.rs L87~L96
+initial_kv_capacity = (tokens.len() + num_tokens)
+    .next_power_of_two()
+    .max(128)
+    .min(max_seq_len)   // --initial-kv-capacity &gt; 0 이면 그 값.min(max_seq_len)
+
+// 버퍼 크기 (layer당, K와 V 각각)
+n_values = initial_kv_capacity * kv_heads * head_dim
+Q4_0:  (n_values / QK4_0) * size_of::&lt;BlockQ4_0&gt;()   // 32 elem당 18B 블록
+그 외: n_values * kv_type.size()                       // f32=4B, f16=2B</code></pre>
+<p>
+저장 표현 선택은 2단 dispatch다. <code>--kv-format &lt;이름&gt;</code>이 있으면 format 레지스트리 우선:
+내장 typed 이름(f32/f16/q4_0/q8_0)이면 해당 DType으로, 아니면 <code>make_format()</code>(정적 linkme → 동적 .so 순)으로
+해소한 뒤 descriptor가 내장 DType과 bit-equivalent면 typed fast path, novel descriptor면
+<strong>opaque 경로</strong>(<code>OpaqueBuffer</code> = U8 inner + sidecar descriptor, 바이트 회계는
+<code>desc.bytes_for_elems()</code>)로 간다. <code>--kv-format</code> 미지정이면 <code>--kv-type {f32|f16|q4}</code>
+하위호환 경로다. 상세는 <a href="06_memory.html">06장</a>·<a href="07_kv_cache.html">07장</a>.
+</p>
+<p class="evidence">근거: <code>engine/src/session/bin_setup.rs (L80~L175 dispatch, L281~L324 alloc_standard_kv_caches, L331~L380 alloc_opaque_kv_caches)</code></p>
+
+<h3>5.3 DecodeLoop — 토큰당 8단계 고정 골격</h3>
+<p>
+<code>DecodeLoop</code>는 추론 루프의 단일 소유자다. <strong>6종의 trait object를 owned로 들고</strong>
+(<code>Forward</code>, <code>EvictionStage</code>, <code>SwapStage</code>, <code>CommandSource</code>,
+<code>TokenSampler</code>, <code>DecodeObserver</code> 목록 — 외에 <code>EngineReport</code>, <code>TokenTickSink</code>),
+builder는 typestate(<code>NoForward</code> → <code>HasForward</code>)로 <code>Forward</code> 미주입 상태의
+<code>.build()</code>를 컴파일 타임에 막는다. 매 step의 순서는 코드 주석 그대로
+(a) command poll → (a.5) resilience eviction → (a.6) offload/recall → (b) eviction stage →
+(c) swap before → (d) forward(seq_len=1) → (e) swap after → (f) sample → (g) observers → (h) TBT pacing이다.
+</p>
+<p>
+주의할 동작 둘: ① resilience evict directive는 <strong>sticky 1회 발동</strong>이다 —
+<code>evict_applied</code> 플래그로 같은 directive의 매 poll 재적용(캐시 과다 축소)을 막고,
+<code>RestoreDefaults</code>로 plan.evict가 None이 되면 reset된다. ② eviction으로 KV가 줄면
+<code>pos</code>를 새 위치로 되감고 <code>forward.on_kv_prune(new_pos)</code>를 호출한다 —
+"eviction은 caller(루프) 책임"이라는 이 코드베이스의 설계가 루프 골격에 그대로 박혀 있다.
+</p>
+<p class="evidence">근거: <code>engine/src/session/decode_loop.rs::DecodeLoop (struct, L30~L53)</code>, <code>::run (L124~L346)</code>, <code>NoForward/HasForward (L24~L27)</code>, <code>evict_applied (L46~L48, L168~L194)</code></p>
+
+<p>
+첫 토큰 샘플링은 루프 밖에서 일어난다: <code>prefill()</code>이 마지막 logits를 반환하면 caller가
+<code>sampling::sample(&amp;mut logits, &amp;tokens, ...)</code>로 first_token을 뽑고
+<code>run(budget = num_tokens - 1, first_token)</code>에 넘긴다. prompt 전체가 repetition penalty
+history로 sampler에 통보된다(<code>observe_token</code> 루프). 끝나면 TTFT(=prefill 시간),
+<code>Decode: X ms/tok</code>, Avg TBT가 stdout에 찍힌다 — 성능 리포트에서 봐야 할 정규 지표 라인이다.
+</p>
+<p class="evidence">근거: <code>engine/src/session/standard_happy.rs (L82~L131)</code>, <code>engine/src/session/decode_loop.rs::prefill (L79~L105)</code></p>
+</section>
+
+<section>
+<h2>6. Manager / shared 경계 — IPC 신호 종류와 방향 (개요)</h2>
+<p>
+이 절은 경계만 잡는다. 정책 엔진 내부, transport 프레이밍, 시나리오 검증은 <a href="08_resilience_ipc.html">08장</a>.
+wire 타입은 전부 <code>shared/src/lib.rs</code> 한 파일에 있고, serde JSON으로 직렬화된다.
+</p>
+
+<pre class="mermaid">
+flowchart LR
+  subgraph mgrp["Manager (llm_manager)"]
+    mon2["Monitors"] -- "SystemSignal (프로세스 내부)\nMemoryPressure · ComputeGuidance\nThermalAlert · EnergyConstraint" --> pol2["PolicyEngine"]
+  end
+  subgraph engp["Engine (argus_cli / argus_bench)"]
+    exec["resilience::CommandExecutor\n→ ExecutionPlan"] --> loop2["DecodeLoop poll"]
+  end
+  pol2 -- "ManagerMessage::Directive\nEngineDirective { seq_id, commands: Vec of EngineCommand }" --> exec
+  exec -- "EngineMessage::Capability (접속 직후 1회)" --> mgrp
+  exec -- "EngineMessage::Heartbeat (EngineStatus, ~1s)" --> mgrp
+  exec -- "EngineMessage::Response (CommandResponse, seq_id 매칭)" --> mgrp
+  exec -- "EngineMessage::QcfEstimate / WeightSwapReport" --> mgrp
+</pre>
+
+<table>
+<thead><tr><th>타입</th><th>방향</th><th>내용</th></tr></thead>
+<tbody>
+<tr><td><code>SystemSignal</code></td><td>Manager <strong>내부</strong> (monitor → policy)</td><td>MemoryPressure / ComputeGuidance / ThermalAlert / EnergyConstraint, 각각 4단계 <code>Level</code>(Normal&lt;Warning&lt;Critical&lt;Emergency) 보유. 엔진 쪽 <code>resilience::signal</code>은 이 타입을 re-export만 한다 — wire로 엔진에 직접 가는 것은 아래 Directive다.</td></tr>
+<tr><td><code>ManagerMessage::Directive</code><br>(<code>EngineDirective</code>)</td><td>Manager → Engine</td><td><code>seq_id</code> + <code>Vec&lt;EngineCommand&gt;</code> 배치. command 도메인: compute(<code>Throttle</code>, <code>SetTargetTbt</code>, <code>LayerSkip</code>="weight.skip"), memory(<code>SwapWeights</code>, <code>KvEvictH2o</code>/"kv.evict_h2o", <code>KvEvictSliding</code>, <code>KvStreaming</code>, <code>KvMergeD2o</code>, <code>KvQuantDynamic</code>, <code>KvOffload</code>), query(<code>RequestQcf</code>), lifecycle(<code>RestoreDefaults</code>, <code>SwitchHw</code>, <code>PrepareComputeUnit</code>, <code>Suspend</code>, <code>Resume</code>), partition(<code>SetPartitionRatio</code>), prefill(<code>SetPrefillPolicy</code>).</td></tr>
+<tr><td><code>EngineMessage::Capability</code></td><td>Engine → Manager (접속 후 1회)</td><td>가용 device, KV 한도(<code>max_kv_tokens</code>, <code>bytes_per_kv_token</code>), layer 수, 실행 가능 action 목록.</td></tr>
+<tr><td><code>EngineMessage::Heartbeat</code><br>(<code>EngineStatus</code>)</td><td>Engine → Manager (주기 ~1s)</td><td><code>actual_throughput</code>(production TBT의 정본 소스), KV 사용량/utilization, phase(idle/prefill/decode), active/available actions, self CPU/GPU 사용률 등.</td></tr>
+<tr><td><code>EngineMessage::Response</code></td><td>Engine → Manager</td><td>directive별 <code>CommandResult</code>(Ok / Partial{achieved} / Rejected{reason})를 <code>seq_id</code>로 매칭.</td></tr>
+<tr><td><code>EngineMessage::QcfEstimate</code> / <code>WeightSwapReport</code></td><td>Engine → Manager</td><td>lossy action별 품질 비용 추정(QCF), weight swap 완료 리포트(freed_bytes, latency_ms, qcf_swap_actual).</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>shared/src/lib.rs::SystemSignal (L125)</code>, <code>::EngineCommand (L189~L278)</code>, <code>::EngineDirective (L293)</code>, <code>::EngineMessage (L455~L462)</code>, <code>::EngineStatus (L324~L372)</code>, <code>engine/src/resilience/signal.rs (re-export)</code></p>
+
+<p>
+transport는 3종: <strong>unix socket / TCP는 양방향</strong>, <strong>D-Bus는 emit-only(단방향)</strong>이다 —
+Manager 쪽 <code>TransportHandle</code> enum이 이 비대칭을 명시한다(<code>try_recv_engine_message</code>가
+dbus arm에서 항상 None). 엔진 쪽 directive 수신은 push가 아니라 <strong>DecodeLoop가 매 토큰
+<code>cmd_source.poll()</code>로 당겨오는 pull 모델</strong>이고, 수신 결과는
+<code>ExecutionPlan</code>(evict/switch_device/throttle_delay_ms/target_tbt_ms/suspended/offload_ratio …)으로
+환원되어 루프 (a)단계에서 소비된다.
+</p>
+<p class="evidence">근거: <code>manager/src/main.rs::TransportHandle (enum + try_recv_engine_message)</code>, <code>engine/src/resilience/executor.rs::ExecutionPlan (L18~)</code>, <code>engine/src/session/decode_loop.rs (L152 cmd_source.poll)</code></p>
+</section>
+
+<section>
+<h2>7. 비-Rust 컴포넌트</h2>
+<table>
+<thead><tr><th>경로</th><th>스택</th><th>역할</th></tr></thead>
+<tbody>
+<tr><td><code>dashboard/</code></td><td>Python / Flask</td><td>벤치마크 웹 대시보드. <code>app.py</code>가 Flask 앱 + <code>backend/api</code> blueprint. 엔진과 런타임 결합 없음(결과 파일 시각화).</td></tr>
+<tr><td><code>verify/</code></td><td>Python</td><td>resilience 검증 하네스 — <code>verify.py</code>가 <code>argus_bench</code>를 띄워 SystemSignal → Policy → EngineCommand → Engine 전 경로를 시나리오(YAML)별로 판정.</td></tr>
+<tr><td><code>scripts/</code></td><td>Python</td><td><code>run_device.py</code>(Android 크로스 빌드+배포, hosts.toml 기반 NDK env 자동 주입), <code>device_registry.py</code> 등.</td></tr>
+<tr><td><code>engine/kernels/</code></td><td>OpenCL C</td><td><code>*.cl</code> GPU 커널 — 런타임 로드(§4 참조).</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>dashboard/app.py (Flask import)</code>, <code>engine/src/bin/argus_bench.rs (모듈 doc — verify/verify.py 언급)</code></p>
+</section>
+
+<section>
+<h2>8. 이 챕터에서 기억할 것</h2>
+<ul>
+<li>프로세스는 둘: <strong>Engine</strong>(argus_cli/argus_bench)과 <strong>Manager</strong>(llm_manager). 결합은 <code>llm_shared</code> wire 타입 + IPC뿐.</li>
+<li>추론의 단일 소유자는 <code>DecodeLoop</code> — 토큰당 (a)~(h) 8단계 고정 골격, eviction/swap/command는 전부 forward <em>사이</em>에 끼어든다.</li>
+<li>KV 캐시는 layer당 K/V 한 쌍, HeadMajor <code>[1, kv_heads, capacity, head_dim]</code>, grow-on-demand. 표현은 <code>--kv-format</code>(registry) → <code>--kv-type</code>(하위호환) 2단 dispatch.</li>
+<li>확장은 <code>technique-api</code> 단방향 의존 + linkme/dlopen 등록 — 엔진 코어 수정 없이 stage/format을 추가한다.</li>
+<li>directive는 push가 아니라 토큰 단위 <strong>pull</strong>(poll)이다 — 적용 지연의 단위가 "토큰"임을 리뷰 때 기억할 것.</li>
+</ul>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="index.html">← 목차</a></span><span><a href="02_terminology.html">02. 도메인 용어 →</a></span></footer>
+</body>
+</html>

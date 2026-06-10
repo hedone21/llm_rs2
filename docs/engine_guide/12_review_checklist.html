@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12. 컨벤션 &amp; 리뷰 체크리스트 — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 12</span></nav>
+<header>
+<h1>12. 컨벤션 &amp; 리뷰 체크리스트</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> (+ working tree) · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<section>
+<h2>12.0 이 장의 목적 — 컴파일러가 못 잡는 버그를 리뷰어가 잡는다</h2>
+<p>
+이 코드베이스에서 실제로 터진 버그들의 공통점은 <strong>타입 시스템이 보호하지 못하는 암묵 계약 위반</strong>이라는 것이다.
+<code>copy_slice</code>의 <code>count</code> 파라미터는 그냥 <code>usize</code>이고, element 단위인지 block 단위인지는 dtype에 따라 달라진다.
+KV 캐시의 메모리 배치(<a href="07_kv_cache.html">HeadMajor</a>)는 enum 필드일 뿐이고, 이를 전제하는 코드는 16개 이상의 파일에 흩어져 있다.
+RoPE 회전에 쓰는 논리 위치와 캐시 버퍼의 물리 위치는 둘 다 <code>usize pos</code>로 표기된다.
+이 셋 중 어느 하나라도 혼동하면 컴파일은 통과하고, 결과는 SIGSEGV(운이 좋은 경우) 또는 silent garbage(운이 나쁜 경우)다.
+</p>
+<p>
+이 장은 (1) 프로젝트 코딩 컨벤션, (2) 과거 버그에서 도출한 4대 불변식, (3) 그것을 PR에서 확인하는 체크리스트 표로 구성된다.
+구현 절차(빌드·테스트·배포)는 <a href="11_dev_workflow.html">11장</a>에 있다.
+</p>
+</section>
+
+<section>
+<h2>12.1 컨벤션</h2>
+
+<h3>12.1.1 모듈 파일 스타일 — no-<code>mod.rs</code></h3>
+<p>
+디렉토리 모듈의 루트는 <code>foo/mod.rs</code>가 아니라 <strong>형제 파일 <code>foo.rs</code></strong>다.
+즉 <code>foo.rs</code>(모듈 선언·re-export)와 <code>foo/</code>(서브모듈 파일들)가 나란히 존재한다.
+<code>engine/src/</code>는 이 스타일로 전면 정리가 끝난 상태다:
+</p>
+<pre><code>engine/src/
+├── backend.rs      ← 모듈 루트 (Backend trait + copy_slice/buffer_shift 기본 구현)
+├── backend/        ← cpu/, opencl.rs, opencl/, cuda_pc.rs, htp_fastrpc.rs ...
+├── pressure.rs     ← 모듈 루트 (CachePressureHandler, ActionResult, PressureLevel)
+├── pressure/       ← kv_cache.rs, cache_manager.rs, eviction/, kivi_cache.rs ...
+├── session.rs / session/
+├── format.rs / format/
+└── ... (전부 동일 패턴)</code></pre>
+<p>
+현재 <code>engine/src/</code>와 <code>crates/techniques/</code>에는 <code>mod.rs</code>가 0개다.
+유일한 잔존은 <code>crates/qnn_oppkg/src/{ops,graph}/mod.rs</code> 2개 — paper microbench용 보존 crate라 sweep 대상에서 제외된 것이다.
+<strong>리뷰 포인트: 신규·이동 모듈이 <code>mod.rs</code>를 새로 만들면 reject.</strong>
+</p>
+<p class="evidence">근거: <code>find engine/src crates -name mod.rs</code> 결과 = <code>crates/qnn_oppkg/src/ops/mod.rs</code>, <code>crates/qnn_oppkg/src/graph/mod.rs</code> 2건뿐. <code>engine/src/</code> 디렉토리 목록에서 <code>backend.rs</code>+<code>backend/</code> 등 형제 패턴 확인.</p>
+
+<h3>12.1.2 Conventional Commits</h3>
+<p>
+커밋 메시지는 <code>type(scope): subject</code> — 명령형 현재 시제. 허용 type은
+<code>feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert</code> (CLAUDE.md 컨벤션).
+최근 200커밋의 실제 분포는 다음과 같다:
+</p>
+<table>
+<tr><th>type</th><th>건수</th><th>비고</th></tr>
+<tr><td><code>docs</code></td><td>96</td><td>handoff/ADR/arch 문서가 절반 — 설계 결정을 커밋으로 남기는 문화</td></tr>
+<tr><td><code>feat</code></td><td>64</td><td></td></tr>
+<tr><td><code>refactor</code></td><td>15</td><td></td></tr>
+<tr><td><code>fix</code></td><td>8</td><td>본문 첫 줄에 root cause 요약을 쓰는 관례 (12.2의 <code>00918e9e</code> 참조)</td></tr>
+<tr><td><code>test</code></td><td>6</td><td>재증명 게이트(re-proof gate) 추가 커밋</td></tr>
+<tr><td><code>experiment</code></td><td>4</td><td><strong>비표준 type</strong> — CLAUDE.md 허용 목록에 없음 (아래 note)</td></tr>
+<tr><td><code>perf</code></td><td>3</td><td></td></tr>
+<tr><td><code>style</code>/<code>chore</code></td><td>각 1</td><td></td></tr>
+</table>
+<div class="note">
+<code>experiment(...)</code> type이 4건 관측된다. 컨벤션 목록 외 type이므로 리뷰 시 <code>test</code> 또는 <code>docs</code>로 정정을 요구하거나, 팀이 type 목록에 공식 추가하는 결정을 받아야 한다. 현재는 회색지대다.
+</div>
+<p>
+좋은 fix 커밋의 본보기는 <code>00918e9e</code>다: 제목에 무엇을(<code>shrink_to_fit Q4_0 copy_slice block-count 변환</code>)과 증상(<code>eviction 후 SIGSEGV 수정</code>)을,
+본문에 root cause·재현 경로·왜 기존 테스트가 못 잡았는지·검증 게이트(lib 테스트 수, clippy, e2e 실측 수치)를 담는다. fix PR 리뷰 시 이 4요소가 커밋 메시지에 있는지 확인하라.
+</p>
+<p class="evidence">근거: <code>git log --oneline -200</code> type 집계, <code>git show 00918e9e</code> 커밋 메시지.</p>
+
+<h3>12.1.3 컴파일 게이트 — feature 상호배타와 sanity check</h3>
+<p>
+backend feature는 상호배타이며 <code>lib.rs</code> 최상단의 <code>compile_error!</code>로 강제된다:
+</p>
+<pre><code>#[cfg(all(feature = "opencl", feature = "cuda"))]
+compile_error!("Features 'opencl' and 'cuda' are mutually exclusive. Enable only one.");
+#[cfg(all(feature = "opencl", feature = "cuda-embedded"))]
+compile_error!("Features 'opencl' and 'cuda-embedded' are mutually exclusive. Enable only one.");</code></pre>
+<p>
+머지 전 최소 게이트는 <code>cargo fmt --all</code> + <code>cargo clippy --workspace -- -D warnings</code> + <code>cargo test --workspace</code>
+(절차는 <a href="11_dev_workflow.html">11장</a>의 sanity-check 참조). clippy는 warning도 에러로 취급하므로 "로컬에선 됐는데"는 통하지 않는다.
+</p>
+<p class="evidence">근거: <code>engine/src/lib.rs</code> L1–4 <code>compile_error!</code> 가드.</p>
+</section>
+
+<section>
+<h2>12.2 불변식 #1 — 단위 회계: element / block / byte</h2>
+<p>
+KV 캐시는 한 토큰을 양자화 형태로 저장할 수 있다(도메인 환기: Q4_0은 float 32개를 18바이트 블록 하나로 압축하는 포맷이다).
+문제는 버퍼 복사 API의 <code>offset</code>/<code>count</code> 단위가 <strong>dtype에 따라 의미가 바뀐다</strong>는 것이다.
+<code>Backend::copy_slice</code>/<code>buffer_shift</code>의 기본 구현은 내부에서 <code>type_size</code>를 곱해 바이트 주소를 계산한다:
+</p>
+<pre><code>// engine/src/backend.rs — Backend trait 기본 구현
+fn copy_slice(&amp;self, src: &amp;Tensor, dst: &amp;mut Tensor,
+              src_offset: usize, dst_offset: usize, count: usize) -&gt; Result&lt;()&gt; {
+    let type_size = match src.dtype() {
+        DType::F32 =&gt; 4,
+        DType::F16 =&gt; 2,
+        DType::U8  =&gt; 1,
+        DType::Q4_0 =&gt; std::mem::size_of::&lt;crate::quant::BlockQ4_0&gt;(), // = 18
+        _ =&gt; 1,
+    };
+    // byte_offset = offset * type_size, byte_count = count * type_size
+    ...
+}</code></pre>
+<p>
+즉 <code>count/offset</code>의 단위는 <code>type_size</code>가 가리키는 "1개"다.
+Q4_0에서 1개 = <code>BlockQ4_0</code>(= <code>f16 d</code> + <code>[u8; 16] qs</code> = 18B) = <strong>float 32개분</strong>(<code>QK4_0 = 32</code>)이다.
+따라서 같은 토큰 수를 복사하더라도 dtype별로 넘겨야 하는 count가 다르다:
+</p>
+<table>
+<tr><th>dtype</th><th>회계 단위</th><th>pos p개 × head H × dim D 복사 시 count</th><th>type_size</th></tr>
+<tr><td>F32 / F16</td><td>element</td><td><code>p * H * D</code></td><td>4 / 2 B</td></tr>
+<tr><td>Q4_0 (typed)</td><td>block</td><td><code>p * H * D / QK4_0</code> (QK4_0=32)</td><td>18 B (<code>BlockQ4_0</code>)</td></tr>
+<tr><td>opaque (.so 동적 format)</td><td>byte</td><td>descriptor-keyed: <code>bytes_for_elems(n)</code></td><td>1 B (U8)</td></tr>
+</table>
+<p class="evidence">근거: <code>engine/src/backend.rs::copy_slice</code> (L1096, type_size match), <code>engine/src/quant.rs::QK4_0</code> (L9, =32) / <code>BlockQ4_0</code> (L14, f16 + [u8;16] = 18B), <code>engine/src/pressure/kv_cache.rs::grow</code> (L240, opaque arm은 <code>opaque_desc().bytes_for_elems</code> L235).</p>
+
+<h3>12.2.1 실제 사고: <code>00918e9e</code> — shrink_to_fit의 block 변환 누락 SIGSEGV</h3>
+<p>
+2026-06-09에 수정된 실제 버그다. <code>KVCache</code>는 grow-on-demand 구조라 용량을 키우는 <code>grow()</code>와
+eviction 후 줄이는 <code>shrink_to_fit()</code>이 대칭으로 존재하고, 둘 다 "새 버퍼 할당 → <code>copy_slice</code>로 기존 데이터 이주" 패턴이다.
+<code>grow()</code>는 Q4_0일 때 element→block 변환(<code>/ QK4_0</code>)을 SeqMajor·HeadMajor 양쪽에 했지만,
+<code>shrink_to_fit()</code>은 element count를 그대로 넘겼다. 결과: 실제 버퍼의 약 32배(QK4_0배)를 읽는 OOB read → SIGSEGV.
+</p>
+<pre class="mermaid">
+sequenceDiagram
+    participant B as argus_bench (decode loop)
+    participant CM as CacheManager
+    participant KV as KVCache (Q4_0, dynamic)
+    participant BE as Backend::copy_slice
+    B-&gt;&gt;CM: force_evict(keep_ratio 0.5) — mid-decode H2O eviction
+    CM-&gt;&gt;KV: 토큰 절반 제거, current_pos 감소
+    CM-&gt;&gt;KV: release_unused_pages()
+    Note over KV: current_pos*4 &lt; capacity*3<br/>(75% 미만 사용) → shrink 발동
+    KV-&gt;&gt;KV: shrink_to_fit() — 새 버퍼 alloc (new_cap = 1.5x pos, 64-align)
+    KV-&gt;&gt;BE: copy_slice(count = pos*head_dim)  ❌ element 단위
+    Note over BE: type_size=18B(BlockQ4_0)이므로<br/>count는 block 단위여야 함<br/>→ 32배 over-read → OOB → SIGSEGV
+</pre>
+<p>
+수정 후의 올바른 코드(현재 master)는 <code>grow()</code>와 동일한 변환을 양쪽 layout에 적용한다:
+</p>
+<pre><code>// engine/src/pressure/kv_cache.rs::shrink_to_fit (수정 후, L437~)
+if dtype == crate::buffer::DType::Q4_0 {
+    let qk = crate::quant::QK4_0;                  // 32
+    let old_hs = old_head_stride / qk;             // head stride도 block 단위로
+    let new_hs = new_head_stride / qk;
+    let cph = copy_per_head / qk;                  // count도 block 단위로
+    for h in 0..self.kv_heads {
+        backend.copy_slice(&amp;self.k_buffer, &amp;mut new_k, h * old_hs, h * new_hs, cph)?;
+        ...</code></pre>
+<div class="warn">
+<strong>왜 f16/f32와 opaque는 무사하고 Q4_0만 터졌나.</strong>
+f16/f32는 element 단위가 곧 정답이고, opaque format은 처음부터 U8 byte 회계(<code>opaque_bytes_per_head()</code>)를 쓴다.
+즉 이 함정은 <strong>typed Q4_0 한 좌표에서만</strong> 발현한다. dtype 하나만 테스트하고 "복사 로직은 dtype 무관하니까 됐다"고 판단하면 정확히 이 구멍에 빠진다.
+</div>
+<div class="warn">
+<strong>왜 기존 테스트가 못 잡았나 — dynamic 여부가 두 번째 축이다.</strong>
+기존 회귀 테스트 <code>test_release_unused_pages_noop_on_q4_dtype</code>은 <code>KVCache::new()</code>(non-dynamic, <code>memory=None</code>)로 만든 캐시였다.
+<code>shrink_to_fit()</code>은 <code>memory</code>가 <code>None</code>이면 즉시 <code>Ok(0)</code> 반환하므로 버그 경로에 아예 진입하지 못했다.
+수정 커밋이 추가한 회귀 테스트 2종은 <code>new_dynamic()</code> + <code>Galloc</code>으로 shrink를 실제 발동시키고,
+block 첫 바이트에 marker를 심어 <strong>no-OOB + shrink 후 데이터 보존</strong>까지 검증한다.
+교훈: KV 캐시 버퍼 조작 테스트는 <em>dtype(f16/q4_0/opaque) × dynamic 여부 × layout(SeqMajor/HeadMajor)</em> 매트릭스에서 버그가 발현하는 좌표를 명시적으로 찍어야 한다.
+</div>
+<p class="evidence">근거: <code>git show 00918e9e</code> (fix(kv_cache): shrink_to_fit Q4_0 copy_slice block-count 변환), <code>engine/src/pressure/kv_cache.rs::shrink_to_fit</code> (L369, Q4_0 arm L424/L437), <code>::release_unused_pages</code> (L1040, <code>current_pos * 4 &lt; capacity * 3</code> 임계), 회귀 테스트 <code>test_shrink_to_fit_q4_0_headmajor_no_oob_and_preserves_data</code> / <code>..._seqmajor_no_oob</code>.</p>
+
+<h3>12.2.2 단위 변환이 필요한 함수 지도</h3>
+<p>
+<code>kv_cache.rs</code> 안에서 Q4_0 block 변환(<code>is_q4</code> 분기 또는 <code>/ QK4_0</code>)을 수행하는 함수는
+<code>grow</code>, <code>shrink_to_fit</code>, <code>update</code>, <code>prune_prefix</code>, <code>shift_positions</code>, <code>shift_positions_for_head</code>, <code>q4_block_offset</code>이다.
+<strong>이 목록의 함수를 고치거나, 같은 패턴(buffer 조작 + offset 산술)의 함수를 새로 추가하는 PR은 dtype 3종(element/block/byte) 분기가 전부 있는지 확인하라.</strong>
+하나라도 빠지면 12.2.1의 재연이다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs</code> 내 <code>QK4_0</code> 참조 지점 (L240, 276, 311, 394, 402, 425, 438, 563, 576, 772, 797, 854, 885, 907, 989).</p>
+</section>
+
+<section>
+<h2>12.3 불변식 #2 — HeadMajor 레이아웃 전제</h2>
+<p>
+<code>KVLayout</code>은 두 variant가 있고 offset 수식이 다르다 (구조 상세는 <a href="07_kv_cache.html">7장</a>):
+</p>
+<pre><code>// engine/src/pressure/kv_cache.rs::offset (L183)
+match self.layout {
+    KVLayout::SeqMajor  =&gt; pos * self.kv_heads * self.head_dim + head * self.head_dim,
+    KVLayout::HeadMajor =&gt; head * self.capacity * self.head_dim + pos * self.head_dim,
+}</code></pre>
+<p>
+production은 <strong>HeadMajor 고정</strong>이다. 그런데 함정이 둘 있다.
+첫째, <code>KVCache::new()</code>/<code>new_dynamic()</code>의 <strong>디폴트는 SeqMajor</strong>다(L79/L105) — 생성 후 <code>.with_layout(KVLayout::HeadMajor)</code>를 빌더로 호출해야 한다.
+표준 할당 경로 <code>session/bin_setup.rs::alloc_standard_kv_caches</code>는 이를 수행하지만, <strong>새 할당 경로를 추가하는 PR이 이 호출을 빠뜨리면</strong> SeqMajor 캐시가 HeadMajor 전제 코드로 흘러든다.
+둘째, layout을 잘못 섞어도 에러가 나지 않는 경로가 있다 — OpenCL Plan 경로는 layout을 enum으로 받지 않고 <strong>stride 값에서 역추론</strong>한다:
+</p>
+<pre><code>// engine/src/backend/opencl/plan.rs (L3101) — 주석 원문: "Implicit invariants
+// (safe today, must be revisited on refactor)"
+let is_head_major = config.kv_pos_stride == config.head_dim as i32
+    &amp;&amp; config.kv_head_stride == (config.kv_capacity * config.head_dim) as i32;</code></pre>
+<pre class="mermaid">
+flowchart TD
+    A["KVCache::new / new_dynamic<br/>디폴트 layout = SeqMajor"] -->|".with_layout(HeadMajor) 호출"| B["HeadMajor 캐시 (production 표준)"]
+    A -->|"호출 누락 시"| X["SeqMajor 캐시"]
+    B --> C["layout-agnostic 코드<br/>offset() / pos_stride() / shift_positions<br/>(match로 양쪽 처리)"]
+    B --> D["HeadMajor 전제 코드"]
+    D --> D1["shift_positions_for_head<br/>assert_eq!(layout, HeadMajor) — panic으로 방어"]
+    D --> D2["opaque format 경로<br/>SeqMajor면 bail (grow / shift / update)"]
+    D --> D3["plan.rs flash attention 게이트<br/>stride 역추론 — 방어 없음"]
+    X -.->|"D3로 흘러들면"| G["silent garbage<br/>(2026-04-14 실측, CLAUDE.md)"]
+</pre>
+<p>
+HeadMajor를 전제하는 코드의 방어 수준은 제각각이다. 리뷰 시 다음 표로 위치와 방어 방식을 확인하라:
+</p>
+<table>
+<tr><th>코드 영역</th><th>전제 방식</th><th>위반 시 동작</th></tr>
+<tr><td><code>kv_cache.rs::shift_positions_for_head</code> (L958)</td><td><code>assert_eq!(layout, HeadMajor)</code></td><td>panic (안전한 실패)</td></tr>
+<tr><td><code>kv_cache.rs</code> opaque 경로 — grow/shift/update의 SeqMajor arm, <code>shrink_to_fit_opaque</code> (L489)</td><td><code>anyhow::bail!</code> 또는 layout 체크</td><td>Err (안전한 실패)</td></tr>
+<tr><td><code>backend/opencl/plan.rs</code> flash attention 선택 (L3101)</td><td>stride 값 역추론 — 명시 체크 없음</td><td><strong>silent garbage</strong> (실측)</td></tr>
+<tr><td><code>session/bin_setup.rs::alloc_standard_kv_caches</code> (L281)</td><td>생성 시 <code>.with_layout(HeadMajor)</code> (L320)</td><td>— (생산 지점)</td></tr>
+<tr><td>eviction 계열 — <code>eviction/h2o_plus.rs</code>, <code>d2o_handler.rs</code>, <code>qcf/qcf_kv.rs</code></td><td>per-head 연산이 HeadMajor offset 수식 사용</td><td>오프셋 계산 오류 (silent)</td></tr>
+</table>
+<div class="warn">
+<strong>실측 교훈 (CLAUDE.md, 2026-04-14):</strong> SeqMajor를 선택하면 Plan 경로(<code>kernel_kv_scatter_f32_to_f16</code> 등 HeadMajor offset 하드코딩)가 에러 없이 garbage를 출력한다.
+또한 plan.rs 주석이 명시하는 두 번째 암묵 불변식 — <strong>plan.rs는 F16 KV 전용</strong>이며 Q4_0/KIVI는 별도 경로다. 새 KV dtype을 plan에 라우팅하는 PR은 <code>config.kv_dtype == DType::F16</code> 명시 체크 추가를 요구해야 한다 (주석이 직접 그렇게 지시한다).
+</div>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs</code> L79/L105 (디폴트 SeqMajor), L120 <code>with_layout</code>, L965 assert; <code>engine/src/backend/opencl/plan.rs</code> L3088–3102 (역추론 + "Implicit invariants" 주석); <code>engine/src/session/bin_setup.rs</code> L281–321.</p>
+</section>
+
+<section>
+<h2>12.4 불변식 #3 — RoPE 포지션은 단조 증가, 물리 위치는 감소 가능</h2>
+<p>
+도메인 환기: RoPE는 K/Q 벡터에 위치 의존 회전을 적용하는 위치 인코딩이고, eviction은 KV 캐시에서 토큰을 영구 삭제하는 동작이다.
+이 코드베이스에서 "위치"는 두 종류이며 둘 다 <code>usize</code>라 타입으로 구분되지 않는다:
+</p>
+<ul>
+<li><strong>논리 위치 (RoPE 위치)</strong> — 토큰이 시퀀스에서 차지하는 절대 위치. <code>forward</code>의 <code>start_pos</code>로 전달되어 <code>backend.rope_inplace(&amp;mut q_rope, start_pos, rope_theta)</code>의 회전각을 결정한다. <strong>eviction과 무관하게 단조 증가해야 한다.</strong></li>
+<li><strong>물리 위치 (<code>current_pos</code>)</strong> — KV 버퍼에서 다음 쓰기가 일어나는 슬롯. eviction의 <code>prune_prefix()</code>/<code>shift_positions()</code> compaction으로 <strong>감소할 수 있다.</strong></li>
+</ul>
+<p>
+두 위치가 분리되는 핵심 메커니즘: <code>KVCache::update()</code>는 <strong>항상 <code>current_pos</code>에 쓰고 <code>start_pos</code>를 모른다</strong>.
+<code>start_pos</code>는 오직 RoPE 회전에만 쓰인다. 그리고 eviction의 <code>shift_positions()</code>는 바이트를 옮길 뿐 재회전하지 않으므로,
+<strong>캐시에 남은 K 벡터는 원래 위치의 RoPE 회전을 그대로 보존한다</strong>. 이 두 사실에서 불변식이 따라 나온다 —
+eviction 후 다음 토큰의 RoPE 위치를 compacted <code>current_pos</code>로 되돌리면, 캐시된 토큰들이 새 토큰보다 "미래"에 있는 것처럼 보이는 회전 불연속이 생긴다.
+<code>eval_loop.rs</code>에 이 불변식이 주석으로 명문화되어 있다:
+</p>
+<pre><code>// engine/src/session/eval/eval_loop.rs L295-299 (원문)
+// IMPORTANT: Do NOT update start_pos_after_prompt to current_pos after eviction.
+// After shift_positions(), cached K vectors retain their original RoPE positions.
+// The next decode token's RoPE must continue from prompt_len (original position)
+// to maintain correct relative distances. Using current_pos (compacted) would
+// create a RoPE discontinuity where cached tokens appear as "future" tokens.</code></pre>
+<pre class="mermaid">
+sequenceDiagram
+    participant L as 논리 위치 (RoPE)
+    participant P as 물리 위치 (current_pos)
+    participant K as 캐시된 K 벡터
+    Note over L,P: prefill 600 토큰 → 논리 600, 물리 600
+    Note over K: K[i]는 위치 i의 회전 보존
+    L-&gt;&gt;P: eviction (sliding, 300개 삭제 + compaction)
+    Note over P: shift_positions — 물리 600 → 300
+    Note over K: 살아남은 K들은 여전히<br/>원래 위치(300..600)의 회전
+    Note over L: 다음 토큰 RoPE = 600 (단조 증가)<br/>compacted 300을 쓰면 불연속 ❌
+    Note over P: 다음 토큰 쓰기 슬롯 = 300 (감소 정상)
+</pre>
+<div class="warn">
+<strong>리뷰어 주의 — production 경로의 회색지대.</strong>
+<code>eval_loop.rs</code>는 위 불변식을 지키지만, <code>session/decode_loop.rs</code>는 eviction 후
+<code>self.pos = new_pos</code>(compacted 물리 위치)로 동기화하고(L176, L210, L245), <code>step()</code>은 그 <code>ctx.pos</code>를
+<code>forward_into</code>의 <code>start_pos</code> — 즉 RoPE 위치 — 로 그대로 전달한다(<code>model_forward.rs</code> L453).
+<code>chat/session.rs</code>의 <code>on_turn_end</code>(L297)도 동일하다. 이는 eval_loop 주석이 금지하는 바로 그 패턴으로 보인다 —
+의도된 단순화인지 잠재 품질 버그인지 코드만으로는 확정할 수 없다(이 장 말미 open question).
+<strong>eviction·pos 동기화를 건드리는 PR에서는 "이 pos가 RoPE용인지 캐시 슬롯용인지"를 반드시 질문하라.</strong>
+</div>
+<p>
+부수 불변식: eviction이 KV position을 shift하면 보유 중인 GPU kernel plan이 stale offset을 갖는다.
+<code>ModelForward::on_kv_prune()</code>은 이 때문에 <code>gpu_plan = None</code>으로 invalidate하여 다음 step에서 lazy rebuild시킨다.
+<strong>새 eviction/offload 경로를 추가하면서 <code>on_kv_prune()</code> 통지를 빠뜨리면 다음 step부터 silent garbage다.</strong>
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::update</code> (L540 — current_pos 기준 쓰기, start_pos 비수신), <code>engine/src/session/eval/eval_loop.rs</code> L243–246·L295–299 주석, <code>engine/src/layers/transformer_layer/forward_gen_fmt.rs</code> L135 (<code>rope_inplace(_, start_pos, _)</code>), <code>engine/src/session/decode_loop.rs</code> L172–186, <code>engine/src/session/forward/model_forward.rs::on_kv_prune</code> (L474 — plan invalidation 주석).</p>
+</section>
+
+<section>
+<h2>12.5 불변식 #4 — tokenizer는 명시하고, vocab 정합성은 검증된다</h2>
+<p>
+모델 파일과 tokenizer가 따로 노는 GGUF 운용에서, tokenizer 자동 탐색이 sibling 모델의 tokenizer를 잘못 잡으면
+모델은 OOB 없이 잘못된 vocab으로 decode를 진행해 <strong>garbage를 출력하면서 silent하게 통과</strong>한다.
+실제로 fast path 검증 중 production과 fast path가 <em>동일한 garbage</em>를 내며 byte-equal 비교를 통과한 사고가 있었고(commit <code>45cb4892</code>),
+그 가드로 <code>check_vocab_compatibility</code>가 추가됐다. 현재 구현(<code>session/bin_setup.rs</code>):
+</p>
+<ul>
+<li><strong>resolution 순서</strong> (<code>resolve_tokenizer_path</code>, L203): ① <code>--tokenizer-path</code> 명시값 → ② GGUF면 sibling 탐색: <code>{stem}.tokenizer.json</code> → quant suffix(<code>-f16</code>/<code>-q4_0</code> 등) 제거한 <code>{stem'}.tokenizer.json</code> → 디렉토리의 <code>tokenizer.json</code> → ③ safetensors면 <code>{dir}/tokenizer.json</code>.</li>
+<li><strong>vocab 검증</strong> (<code>check_vocab_compatibility</code>, L240): <code>tok_vocab &gt; model_vocab + 8</code>이면 OOB embedding lookup 위험으로 즉시 error; 8 이내 초과는 warning(multimodal special token 허용). 반대로 <code>model_vocab &gt; tok_vocab + max(model_vocab/20, 256)</code>이면 wrong-tokenizer로 error — Qwen2.5-1.5B의 trained=151665 / padded=151936 같은 정상 padding은 통과시키는 임계값이다.</li>
+</ul>
+<div class="warn">
+<strong>실측 교훈 (CLAUDE.md):</strong> Adreno 디바이스 테스트에서는 <code>--tokenizer-path</code> 명시가 필수 운용 수칙이다.
+fallback은 마지막 안전망이지 의존 대상이 아니다 — fallback이 잡은 tokenizer가 같은 family면 vocab 검증도 통과할 수 있다.
+디바이스 테스트 스크립트·문서를 추가하는 PR에서 tokenizer 경로가 명시돼 있는지 확인하라.
+</div>
+<p class="evidence">근거: <code>engine/src/session/bin_setup.rs::resolve_tokenizer_path</code> (L203), <code>::check_vocab_compatibility</code> (L240, oob_tolerance=8 L247, pad_tolerance=max(vocab/20,256) L265), <code>git show 45cb4892</code> (사고 경위 — D-D.6 fast path 검증 중 동일 garbage byte-equal 통과).</p>
+</section>
+
+<section>
+<h2>12.6 측정·커널 관련 실측 교훈 (요약)</h2>
+<p>
+다음은 코드만으로 확인 불가한 <strong>디바이스 실측 교훈</strong>(CLAUDE.md)으로, 성능 PR 리뷰 시 근거 데이터의 유효성을 판정하는 기준이다.
+상세는 <a href="09_backends.html">9장(백엔드)</a>·<a href="11_dev_workflow.html">11장(워크플로우)</a>에 위임한다.
+</p>
+<ul>
+<li><strong>성능 수치는 <code>--profile</code> 없이 측정된 것만 절대값으로 인정.</strong> <code>--profile</code>은 plan 경로를 비활성화하고 매 op마다 <code>synchronize()</code> 2회를 끼워 토큰당 약 54 ms의 sync 오버헤드를 더한다. per-op breakdown은 상대 비교에만 유효.</li>
+<li><strong><code>.cl</code> 커널 수정 PR의 Adreno 제약</strong>: DK=128 flash attention은 per-thread 32 float4 초과 시 register spill; <code>sub_group_reduce_*</code>는 SLM tree-reduce보다 33~55% 느림(Adreno 830 실측); 엔진 간 비교는 항상 wall-clock(<code>CL_QUEUE_PROFILING_ENABLE</code>은 driver-specific 패널티).</li>
+<li><strong>zero-copy 주장 검증</strong>: Adreno에서 <code>CL_MEM_ALLOC_HOST_PTR</code>(UnifiedBuffer)는 zero-copy 효과 없음 — 진짜 원천은 rpcmem DMA-BUF + <code>CL_MEM_USE_HOST_PTR</code> alias. ARM UMA 캐시 비일관성으로 <code>read_buffer</code>/<code>write_buffer</code> 경유 필수(<code>as_ptr</code> 직접 접근은 stale cache). 상세는 <a href="06_memory.html">6장</a>.</li>
+</ul>
+</section>
+
+<section>
+<h2>12.7 PR 리뷰 체크리스트</h2>
+<p>
+위 함정들을 PR 단위 확인 항목으로 압축한 표다. "해당 시"는 PR diff가 그 영역을 건드릴 때만 적용한다는 뜻이다.
+</p>
+<table>
+<tr><th>#</th><th>분류</th><th>확인 항목</th><th>확인 방법</th></tr>
+<tr><td>C1</td><td>컨벤션</td><td>신규/이동 모듈이 no-<code>mod.rs</code> 스타일인가 (형제 <code>foo.rs</code> + <code>foo/</code>)</td><td>diff에 새 <code>mod.rs</code>가 없는지 검색</td></tr>
+<tr><td>C2</td><td>컨벤션</td><td>커밋이 <code>type(scope): subject</code> 형식이고 type이 허용 목록(feat/fix/docs/...)인가; fix면 root cause·재현 경로·검증 게이트가 본문에 있는가</td><td><code>git log</code> — 12.1.2의 <code>00918e9e</code>를 기준으로</td></tr>
+<tr><td>C3</td><td>컨벤션</td><td>fmt + clippy(<code>-D warnings</code>) + test 통과 증거가 있는가</td><td>PR 본문 게이트 기록 또는 CI</td></tr>
+<tr><td>U1</td><td>단위 회계</td><td>(해당 시) <code>copy_slice</code>/<code>buffer_shift</code> 호출의 count/offset이 dtype 회계 단위와 일치하는가 — Q4_0이면 block(<code>/ QK4_0</code>), opaque면 byte(<code>bytes_for_elems</code>)</td><td>호출부에서 <code>is_q4</code>/<code>is_opaque</code> 분기 존재 확인; 12.2.2 함수 지도와 대조</td></tr>
+<tr><td>U2</td><td>단위 회계</td><td>(해당 시) 버퍼 조작 신규 코드에 dtype × dynamic(<code>memory=Some</code>) × layout 매트릭스의 버그 발현 좌표를 찍는 테스트가 있는가</td><td><code>new_dynamic</code> + Q4_0 + marker 보존 패턴(00918e9e 회귀 테스트)을 본보기로</td></tr>
+<tr><td>L1</td><td>레이아웃</td><td>(해당 시) 새 KVCache 생성 경로가 <code>.with_layout(KVLayout::HeadMajor)</code>를 호출하는가 (디폴트는 SeqMajor)</td><td>생성부 diff 확인</td></tr>
+<tr><td>L2</td><td>레이아웃</td><td>(해당 시) HeadMajor 전제 코드(12.3 표)에 새 진입로를 만들면 layout 가드(assert/bail)가 있는가; plan.rs를 건드리면 stride 역추론·F16 전용 암묵 불변식을 깨지 않는가</td><td>plan.rs L3088 "Implicit invariants" 주석과 대조</td></tr>
+<tr><td>L3</td><td>레이아웃</td><td>(해당 시) per-head 연산은 <code>offset()</code>/<code>pos_stride()</code>/<code>q4_block_offset()</code> helper를 쓰는가 (수식 손계산 금지)</td><td>offset 산술이 inline으로 등장하면 helper 사용 요구</td></tr>
+<tr><td>P1</td><td>위치 회계</td><td>(해당 시) <code>pos</code> 변수가 RoPE용(논리, 단조 증가)인지 캐시 슬롯용(물리, 감소 가능)인지 명확한가; eviction 후 <code>start_pos</code>를 compacted <code>current_pos</code>로 되돌리지 않는가</td><td>eval_loop.rs L295 주석을 판정 기준으로</td></tr>
+<tr><td>P2</td><td>위치 회계</td><td>(해당 시) KV position을 바꾸는 새 경로(eviction/offload/recall)가 <code>on_kv_prune()</code>으로 GPU plan invalidation을 통지하는가</td><td><code>model_forward.rs::on_kv_prune</code> 호출 여부</td></tr>
+<tr><td>T1</td><td>tokenizer</td><td>(해당 시) tokenizer 로딩 경로 변경이 <code>check_vocab_compatibility</code>를 우회하지 않는가; 디바이스 테스트 절차에 <code>--tokenizer-path</code> 명시가 있는가</td><td>bin_setup.rs 경유 확인</td></tr>
+<tr><td>M1</td><td>측정</td><td>(성능 PR) 절대 수치가 <code>--profile</code> 없이, wall-clock으로 측정됐는가; 비교 조건(스레드 수·n·median)이 명시됐는가</td><td>측정 커맨드라인 원문 요구</td></tr>
+<tr><td>M2</td><td>측정</td><td>(.cl 커널 PR) Adreno 실측 교훈 3종(register spill / sub_group_reduce / profiling 패널티)을 위반하지 않는가</td><td>12.6 목록과 대조</td></tr>
+</table>
+<div class="note">
+체크리스트는 "전부 통과해야 머지"가 아니라 "해당 영역을 건드린 PR에서 리뷰어가 질문해야 할 목록"이다.
+질문의 형태는 단순하다 — <em>"이 count의 단위는 무엇인가?", "이 pos는 논리인가 물리인가?", "SeqMajor가 들어오면 어떻게 되는가?"</em>
+이 세 질문이 이 코드베이스 역대 버그의 대부분을 사전에 잡았을 질문들이다.
+</div>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="11_dev_workflow.html">← 11. 개발 워크플로우</a></span><span><a href="index.html">목차로 →</a></span></footer>
+</body>
+</html>

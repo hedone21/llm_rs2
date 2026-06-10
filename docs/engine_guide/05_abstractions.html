@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05. 핵심 추상화 카탈로그 — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 05</span></nav>
+<header>
+<h1>05. 핵심 추상화 카탈로그</h1>
+<p class="meta">기준 커밋: <code>1f93d6b1</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<!-- ============================================================ -->
+<section id="map">
+<h2>0. 다섯 추상화의 지도</h2>
+<p>
+이 챕터는 PR 리뷰에서 가장 자주 마주치는 5개 trait 계층을 다룬다. 각각이 사는 위치와 의존 방향이 핵심이다:
+<code>technique-api</code>는 엔진 타입을 일절 참조하지 않는 독립 크레이트이고(<code>engine → technique-api ← technique crate</code> 단방향),
+엔진은 그 추상 위에 자기 구현(<code>KVStageCtx</code> 등)을 얹는다.
+</p>
+<pre class="mermaid">
+flowchart TB
+    subgraph TA["crates/technique-api (엔진 타입 비참조)"]
+        KVS["KVCacheStage::plan"]
+        SC["StageCtx / TensorHandle"]
+        KAB["KiviAttentionBackend (capability)"]
+        REG["linkme 등록 슬라이스 + C-ABI vtable"]
+    end
+    subgraph ENG["engine (llm_rs2)"]
+        BE["Backend trait — 연산 dispatch"]
+        CPH["CachePressureHandler + CachePressurePipeline"]
+        EP["EvictionPolicy (legacy, 흡수 중)"]
+        CR["CapabilityRegistry (typed anymap)"]
+        CTX["KVStageCtx — StageCtx의 엔진 구현"]
+    end
+    subgraph PLG["crates/techniques/* + .so plugin"]
+        TC["caote, synth-q4-format, example-*"]
+    end
+    CTX -->|구현| SC
+    TC -->|구현·등록| KVS
+    TC -->|구현·등록| KAB
+    EP -->|EvictionHandler 래핑| CPH
+    KVS -->|StageBackedPolicy 역어댑터| EP
+    CR -->|construction 1회 pull| KAB
+    BE -->|as_kivi_attention 등 hook| KAB
+</pre>
+<table>
+<thead><tr><th>추상화</th><th>역할 한 줄</th><th>정의 위치</th></tr></thead>
+<tbody>
+<tr><td><code>Backend</code></td><td>matmul·attention 등 연산 dispatch 표면. (format × hardware) paired kernel을 인터페이스 아래 격리</td><td><code>engine/src/backend.rs:128</code></td></tr>
+<tr><td><code>TensorHandle</code> / <code>StageCtx</code></td><td>stage 축 plugin이 KV 캐시를 <em>읽는</em> 유일한 추상 (산출 항상 f32 out-param)</td><td><code>crates/technique-api/src/lib.rs:71, 93</code></td></tr>
+<tr><td><code>CachePressureHandler</code> + <code>CachePressurePipeline</code></td><td>PressureLevel별로 다중 캐시 관리 핸들러를 순차 실행하는 2-tier 상위</td><td><code>engine/src/pressure.rs:116, 166</code></td></tr>
+<tr><td><code>EvictionPolicy</code></td><td>영구 토큰 삭제 전용 2-tier 하위 (legacy — plan-returning <code>KVCacheStage</code>로 흡수 중)</td><td><code>engine/src/pressure/eviction.rs:13</code></td></tr>
+<tr><td>capability plugin (technique-api)</td><td>stage/format/backend 3축 registry + 정적(linkme)·동적(dlopen) dual-wiring</td><td><code>crates/technique-api/src/lib.rs</code>, <code>engine/src/capability.rs</code></td></tr>
+</tbody>
+</table>
+<div class="note">
+도메인 용어(Format ⊥ Stage, handle 3종, PressureLevel vs Pressure)는 <a href="02_terminology.html">02. 도메인 용어</a>를 전제한다.
+추론 루프에서 이 trait들이 호출되는 시점은 <a href="04_inference_pipeline.html">04. 추론 파이프라인</a> 참조.
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section id="backend">
+<h2>1. <code>Backend</code> — 연산 dispatch의 단일 표면</h2>
+
+<h3>1.1 시그니처 발췌</h3>
+<p>
+<code>Backend</code>는 <code>Send + Sync</code> trait이며 약 70개 메서드를 가진다. 그중 <strong>required는 소수</strong>이고
+나머지는 전부 default 구현이 있는 "opt-in 사다리"다. 새 backend를 추가할 때 반드시 구현해야 하는 것은 아래뿐이다.
+</p>
+<pre><code>pub trait Backend: Send + Sync {
+    fn as_any(&amp;self) -&gt; &amp;dyn std::any::Any;
+    fn name(&amp;self) -&gt; &amp;str;
+    fn device(&amp;self) -&gt; &amp;str;
+
+    // required 연산 코어
+    fn matmul(&amp;self, a: &amp;Tensor, b: &amp;Tensor, out: &amp;mut Tensor) -&gt; Result&lt;()&gt;;
+    fn matmul_transposed(&amp;self, a: &amp;Tensor, b: &amp;Tensor, out: &amp;mut Tensor) -&gt; Result&lt;()&gt;;
+    fn matmul_slice(&amp;self, a, b, rows, cols, out) -&gt; Result&lt;()&gt;;
+    fn add_assign(&amp;self, a: &amp;mut Tensor, b: &amp;Tensor) -&gt; Result&lt;()&gt;;
+    fn scale(&amp;self, x: &amp;mut Tensor, v: f32) -&gt; Result&lt;()&gt;;
+    fn silu_mul(&amp;self, a: &amp;mut Tensor, b: &amp;Tensor) -&gt; Result&lt;()&gt;;
+    fn rms_norm(&amp;self, x: &amp;mut Tensor, w: &amp;Tensor, eps: f32, add_unit: bool) -&gt; Result&lt;()&gt;;
+    fn softmax(&amp;self, x: &amp;mut Tensor) -&gt; Result&lt;()&gt;;
+    fn rope_inplace(&amp;self, x: &amp;mut Tensor, start_pos: usize, theta: f32) -&gt; Result&lt;()&gt;;
+    fn copy_from(&amp;self, t: &amp;Tensor) -&gt; Result&lt;Tensor&gt;;
+    fn cast(&amp;self, src: &amp;Tensor, dst: &amp;mut Tensor) -&gt; Result&lt;()&gt;;
+
+    // required지만 한 줄짜리 — default 불가 (아래 1.2 참조)
+    fn cpu_companion(&amp;self) -&gt; &amp;dyn Backend;
+
+    // 이하 전부 default 제공: attention_gen, fused_norm_merge,
+    // kv_scatter_*, copy_slice, buffer_shift, enqueue_*_async,
+    // yield_after_layer, gpu_score_acc, as_kivi_attention, get_extension, ...
+}</code></pre>
+<p class="evidence">근거: <code>engine/src/backend.rs::Backend</code> (trait, L128–1322)</p>
+
+<p>
+fused op는 "default = 비융합 합성, override = 단일 커널" 패턴이다. 예를 들어 <code>matmul_ffn_gate_up_silu</code>의
+default는 gate matmul → up matmul → <code>silu_mul</code> 3-op fallback이고, OpenCL backend가 이를 단일 커널로 override한다.
+<code>fused_norm_merge</code>(tensor-partition 레이어 경계의 3-입력 merge + RMSNorm 융합)도 동일 패턴인데, 여기엔 명시적
+aliasing 계약이 있다: <code>residual_out</code>은 <code>prior_residual</code>과 alias 가능(in-place), <code>out</code>은 어떤 입력과도 alias 금지,
+세 partial 입력은 서로 distinct 버퍼여야 한다.
+</p>
+<p class="evidence">근거: <code>engine/src/backend.rs::matmul_ffn_gate_up_silu</code> (L176), <code>::fused_norm_merge</code> (L255, aliasing 계약 doc L247–249)</p>
+
+<h3>1.2 계약 / 불변식</h3>
+<ul>
+<li><strong>offset은 element 단위, Q4_0의 1 element = 1 block = 18바이트.</strong>
+<code>copy_slice</code> / <code>buffer_shift</code>의 <code>src_offset</code>/<code>dst_offset</code>/<code>count</code>는 바이트가 아니라 element 단위이며,
+내부에서 <code>src.dtype()</code>으로 <code>type_size</code>를 정한다 (F32=4, F16=2, U8=1, Q4_0=<code>size_of::&lt;BlockQ4_0&gt;()</code>=18,
+그 외 dtype은 <strong>fallback 1</strong>). 호출자는 src/dst dtype 일치를 스스로 보장해야 한다 — trait 차원의 검증은 없다.</li>
+<li><strong><code>supports_*</code> 플래그를 확인하지 않고 batch scatter를 부르면 segfault.</strong>
+<code>kv_scatter_f32_to_f16_batch</code>의 default 구현은 <code>as_ptr()</code>/<code>as_mut_ptr()</code> 호스트 포인터 슬라이스를 쓰므로
+device-only 버퍼(zero-copy 매핑 없는 OpenCL)에서 segfault한다. 호출자는 반드시 <code>supports_kv_scatter_batch()</code>
+(default <code>false</code>)를 먼저 확인하고, false면 per-position <code>cast + update</code> 경로로 폴백해야 한다.
+<code>supports_kv_scatter_f32_batch</code>/<code>supports_async_transfer</code>/<code>supports_layer_graph</code>도 같은 caller-guard 패턴.</li>
+<li><strong><code>GpuEvent</code>의 dummy 의미론.</strong> async 메서드(<code>enqueue_read_buffer_async</code> 등)의 default는 동기 실행 후
+<code>GpuEvent::dummy()</code>(inner 핸들 모두 <code>None</code>)를 반환한다. <code>is_dummy()</code>가 true인 이벤트에 대한 wait는 no-op.
+단 <code>wait_event_blocking</code>의 default는 <strong>전체 <code>synchronize()</code> 배리어</strong>다 — 정확하지만 compute와의 overlap을 잃으므로,
+실제 이벤트를 반환한 backend는 per-event wait로 override해야 한다.</li>
+<li><strong><code>cpu_companion</code>은 default가 없다(의도적).</strong> default로 <code>self</code>를 반환하려면 <code>&amp;Self → &amp;dyn Backend</code> coercion에
+<code>Self: Sized</code> bound가 필요한데, 그러면 <code>&amp;dyn Backend</code>를 통한 dispatch가 막힌다. 그래서 모든 구현체가
+한 줄 override를 직접 쓴다 — CPU backend는 <code>self</code>, GPU backend는 construction 시 주입받은 owned companion.</li>
+<li><strong><code>get_extension</code>은 cold path 전용.</strong> forward/decode loop 안 호출 금지(ggml의 <code>get_proc_address</code> 차용,
+string-keyed <code>Any</code> downcast). key는 자유 문자열이 아니라 모듈 const만 허용:
+<code>EXT_OPENCL_QUEUE</code>, <code>EXT_OPENCL_SECONDARY</code>, <code>EXT_RPCMEM_ALLOCATOR</code>. 미등록 key는 silent <code>None</code>.</li>
+<li><strong><code>yield_after_layer</code>는 매 layer 호출되는 hot hook.</strong> default body가
+<code>LLMRS_DECODE_YIELD_EVERY</code>/<code>LLMRS_DECODE_YIELD_US</code> env로 게이트되며, env 미설정 시 <code>yield_every()==0</code>
+short-circuit으로 사실상 zero-cost. 동작 시엔 <code>synchronize()</code>로 in-flight 커널을 drain한 뒤 sleep한다
+(에러는 swallow — yield는 best effort).</li>
+<li><strong>weight swap 후 SOA registry 순서 계약.</strong> <code>invalidate_noshuffle_soa_registry()</code>는 non-empty swap batch당
+정확히 1회, <code>ratio_generation</code> bump <em>이전</em>에 호출되어야 하고(ENG-ALG-221/INV-130), 그 직후
+<code>ensure_noshuffle_soa_registered</code>/<code>restore_pre_converted_soa_registration</code>으로 새 <code>cl_mem</code> 주소가
+재등록되어야 다음 plan rebuild가 lookup miss(silent garbage) 없이 진행된다(INV-131).</li>
+</ul>
+<p class="evidence">근거: <code>engine/src/backend.rs::copy_slice</code> (L1096), <code>::kv_scatter_f32_to_f16_batch</code> (L487, guard doc L468–480), <code>::GpuEvent</code> (L56), <code>::wait_event_blocking</code> (L669), <code>::cpu_companion</code> (L1197, rationale L1192–1196), <code>::get_extension</code> (L1319), <code>::yield_after_layer</code> (L1227), <code>::invalidate_noshuffle_soa_registry</code> (L777)</p>
+
+<div class="warn">
+<strong>함정:</strong> <code>copy_slice</code>의 element↔block 회계는 trait가 검증해 주지 않는다. Q4_0 텐서에 element 개수를 그대로 넘기면
+32배(QK4_0) 가까운 OOB가 난다 — KV 캐시 쪽 호출자(<code>grow</code>/<code>shrink_to_fit</code> 등)가 element→block 변환을 누락한 사례가 실제로
+SIGSEGV로 이어진 적이 있다. Q4_0 텐서를 만지는 PR에서는 offset 단위를 반드시 확인하라.
+또한 default 메서드 다수가 raw 포인터 기반 CPU 폴백이므로, GPU 전용 버퍼 위에서 "컴파일은 되는데 죽는" 형태로 실패한다.
+</div>
+
+<h3>1.3 구현체 목록</h3>
+<table>
+<thead><tr><th>구현체</th><th>feature / cfg</th><th>비고</th></tr></thead>
+<tbody>
+<tr><td><code>CpuBackendCommon</code></td><td>기본 (fallback)</td><td>스칼라 reference 구현. <code>engine/src/backend/cpu/common.rs:28</code></td></tr>
+<tr><td><code>CpuBackendNeon</code></td><td><code>cfg(aarch64)</code></td><td>NEON 커널. aarch64에서 <code>type CpuBackend = CpuBackendNeon</code></td></tr>
+<tr><td><code>CpuBackendAVX2</code></td><td><code>cfg(x86_64 + avx2)</code></td><td>x86에서 <code>type CpuBackend = CpuBackendAVX2</code></td></tr>
+<tr><td><code>OpenCLBackend</code></td><td><code>opencl</code> (기본 ON)</td><td>Adreno production 경로. <code>engine/src/backend/opencl.rs:4715</code>에 impl</td></tr>
+<tr><td><code>CudaBackend</code> (PC)</td><td><code>cuda</code></td><td>discrete GPU. <code>cuda_pc.rs:605</code></td></tr>
+<tr><td><code>CudaBackend</code> (embedded)</td><td><code>cuda-embedded</code></td><td>Jetson/UMA. <code>cuda</code>와 <code>compile_error!</code>로 상호배타 (backend.rs L10–13)</td></tr>
+<tr><td><code>HtpFastrpcBackend</code></td><td><code>htp_fastrpc</code></td><td>QC HTP NPU (FastRPC + dspqueue). <code>htp_fastrpc.rs:879</code></td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/backend/cpu.rs</code> (L15–21 alias cfg), <code>engine/src/backend.rs</code> (L7–30 모듈 선언 + compile_error)</p>
+
+<pre class="mermaid">
+classDiagram
+    class Backend {
+        &lt;&lt;trait&gt;&gt;
+        +matmul / matmul_transposed / matmul_slice
+        +attention_gen(q, k_cache, v_cache, ..., scores_out)
+        +copy_slice(src, dst, src_off, dst_off, count) "element 단위"
+        +cast / rms_norm / softmax / rope_inplace
+        +cpu_companion() "required, default 없음"
+        +supports_kv_scatter_batch() bool
+        +yield_after_layer(layer_idx, is_decode)
+        +as_kivi_attention() Option
+        +gpu_score_acc() Option
+        +get_extension(name) Option "cold path 전용"
+    }
+    class CpuBackendCommon
+    class CpuBackendNeon
+    class CpuBackendAVX2
+    class OpenCLBackend
+    class CudaBackendPC["CudaBackend (cuda)"]
+    class CudaBackendEmb["CudaBackend (cuda-embedded)"]
+    class HtpFastrpcBackend
+    Backend <|.. CpuBackendCommon
+    Backend <|.. CpuBackendNeon
+    Backend <|.. CpuBackendAVX2
+    Backend <|.. OpenCLBackend
+    Backend <|.. CudaBackendPC
+    Backend <|.. CudaBackendEmb
+    Backend <|.. HtpFastrpcBackend
+    OpenCLBackend ..|> KiviAttentionBackend : capability 구현
+    class KiviAttentionBackend {
+        &lt;&lt;trait, technique-api&gt;&gt;
+        +attention_gen_kivi(args) i32
+        +kivi_gather_update(args) i32
+    }
+</pre>
+
+<h3>1.4 왜 이 모양인가</h3>
+<p>
+단일 god-trait + default 사다리는 "새 backend가 required 최소만 구현하면 정확하게 동작하고, 성능은 override로 점진 획득"이라는
+온보딩 곡선을 만든다. default 구현 자체가 CPU reference라서 <code>test_backend</code> 바이너리의 CPU vs GPU 비교 검증과도 맞물린다.
+예컨대 default <code>attention_gen</code>은 F32/F16 KV를 모두 처리하고, layout을 shape 휴리스틱
+(<code>k_shape[1] == num_heads_kv &amp;&amp; k_shape[1] != k_shape[2]</code> → HeadMajor)으로 감지해
+HeadMajor offset <code>(kv_h * capacity + t) * head_dim</code>을 계산한다 — GPU 커널이 따라야 할 의미론의 정본이다.
+</p>
+<p>
+한편 trait 후반부의 <code>gpu_score_acc</code>/<code>as_kivi_attention</code>/<code>profile_events_enabled</code> 류 hook은
+과거 hot path에 흩어져 있던 <code>as_any().downcast_ref::&lt;OpenCLBackend&gt;()</code> 체인을 trait 메서드 1곳으로 치환한 흔적이다.
+이 hook들은 다시 <code>CapabilityRegistry</code>(§5.1)로 이동 중이라 — "god-trait에 메서드 추가" 대신 "capability trait 신설 + registry 등록"이
+현재 권장 확장 방식이다. <code>cuda</code>/<code>cuda-embedded</code>를 <code>compile_error!</code>로 상호배타시킨 것은 <code>backend::cuda</code> alias가
+한 빌드에서 단일 의미를 갖게 하기 위함이다.
+</p>
+<p class="evidence">근거: <code>engine/src/backend.rs::attention_gen</code> (default impl L285–406, layout 감지 L337–340), capability hook 주석 (L1149–1184, §13.8-L L1264–1307)</p>
+<div class="warn">
+<strong>실측 교훈 (CLAUDE.md):</strong> 성능 비교는 항상 wall-clock으로 — <code>--profile</code>은 매 op마다 <code>backend.synchronize()</code>를
+2회 호출해 ~54 ms/token의 sync 오버헤드를 더하므로 절대값이 부풀려진다. backend별 커널 세부(<code>.cl</code> 커널 정책, Adreno register spill 등)는
+<a href="09_backends.html">09. 백엔드 구현</a>에 위임한다.
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section id="stagectx">
+<h2>2. <code>TensorHandle</code> / <code>StageCtx</code> — plugin의 읽기 표면</h2>
+
+<h3>2.1 시그니처 발췌</h3>
+<pre><code>// crates/technique-api/src/lib.rs
+#[repr(u32)]
+pub enum TensorKind { Key, Value, AttnWeights, Scores }
+
+#[repr(C)]
+pub struct TensorShape { pub rows: usize, pub cols: usize, pub per_head: bool }
+
+pub trait TensorHandle {
+    fn shape(&amp;self) -&gt; TensorShape;
+    fn dtype(&amp;self) -&gt; TensorDtype;            // F32 | F16 | Q4_0 (진단용)
+    fn read_row(&amp;self, row: usize, kv_head: usize, out: &amp;mut [f32]);
+}
+
+pub trait StageCtx {
+    fn current_pos(&amp;self) -&gt; usize;            // 유효 토큰 수
+    fn target_len(&amp;self) -&gt; usize;             // 엔진이 해소한 절대 budget
+    fn layer_idx(&amp;self) -&gt; usize;
+    fn importance(&amp;self) -&gt; Option&lt;&amp;[f32]&gt;;    // flat per-token (zero-copy 예외)
+    fn n_kv_heads(&amp;self) -&gt; usize;
+    fn head_dim(&amp;self) -&gt; usize;
+    fn tensor(&amp;self, kind: TensorKind) -&gt; Option&lt;&amp;dyn TensorHandle&gt;;  // ★ 단일 메커니즘
+
+    // 이하 default sugar — 전부 tensor() 위임, 엔진은 override 불필요:
+    // dequant_k / dequant_v / head_score / has_head_scores / attn_weight / has_attn_weights
+}</code></pre>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::TensorKind</code> (L33), <code>::TensorHandle</code> (L71), <code>::StageCtx</code> (L93–177)</p>
+
+<h3>2.2 계약 / 불변식</h3>
+<ul>
+<li><strong>읽기 산출은 항상 f32 out-param.</strong> <code>read_row</code>는 슬라이스를 반환하지 않고 <code>out: &amp;mut [f32]</code>를 채운다.
+<code>out.len() == shape().cols</code>가 호출자 계약 (Key/Value는 cols=<code>head_dim</code>, AttnWeights/Scores는 cols=1).
+dtype 분기(F32/F16/Q4_0 dequant)는 핸들 구현이 내부 흡수한다.</li>
+<li><strong>dyn-safe 필수.</strong> <code>plan(&amp;self, ctx: &amp;dyn StageCtx)</code>가 trait object로 받으므로 제네릭 파라미터·
+연관 타입·<code>impl Trait</code> 인자 금지. 이것이 out-param 규약의 직접 원인이다.</li>
+<li><strong><code>tensor(kind)</code>가 단일 텐서 접근 메커니즘.</strong> <code>dequant_k</code>/<code>head_score</code>/<code>attn_weight</code> 등은
+전부 <code>tensor()</code> 위의 default sugar — 엔진 구현체는 <code>tensor()</code> 하나만 구현하면 된다. 새 입력(Query 등)은
+<code>TensorKind</code> variant 추가 1줄 + 엔진 impl 1곳으로 끝난다(OCP). 유일한 예외가 flat <code>importance()</code>인데, scalar를
+per-element <code>read_row</code>로 돌리면 H2O 랭킹 경로가 순손해라 zero-copy 슬라이스를 직접 노출한다.</li>
+<li><strong>kind 미가용 = <code>None</code> = graceful degrade.</strong> score-free 정책은 <code>tensor(Scores)==None</code>을 보고,
+sugar는 no-op(out 불변) 또는 0.0을 돌려준다. <code>AttnWeights</code>는 "직전 decode step의 last-layer per-head attention weight"
+근사값이므로 <code>has_attn_weights()</code> 게이트 확인이 계약이다.</li>
+<li><strong>호출 간 상태는 ctx로 thread하지 않는다.</strong> d2o EMA 같은 누적 상태는 plugin struct가
+<code>&amp;self</code> + interior mutability(Mutex)로 보유한다(ADR-0004 D4).</li>
+<li><strong>FFI-forward.</strong> <code>TensorShape</code>는 <code>#[repr(C)]</code>, enum들은 <code>#[repr(u32)]</code> — 동일 타입이
+<code>.so</code> C-ABI 경계(<code>StageCtxAbi</code> fn-ptr 테이블)를 reshape 없이 건넌다.</li>
+</ul>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::StageCtx</code> doc (L83–92), <code>::dequant_k</code> (L129), <code>::importance</code> 예외 doc (L91–92), <code>::StageCtxAbi</code> (L300)</p>
+
+<h3>2.3 구현체 목록</h3>
+<table>
+<thead><tr><th>구현체</th><th>무엇 위에 구현</th><th>위치</th></tr></thead>
+<tbody>
+<tr><td><code>KVStageCtx</code></td><td><code>&amp;KVCache</code> + target_len + scores. <strong>production 정본</strong></td><td><code>engine/src/pressure/eviction/stage_registry.rs:197</code></td></tr>
+<tr><td><code>AbiStageCtx</code></td><td>C fn-ptr 테이블(<code>StageCtxAbi</code>) 위 재구현 — <code>.so</code> plugin이 동일 <code>plan</code> 코드를 쓰게 하는 어댑터</td><td><code>crates/technique-api/src/lib.rs:464</code></td></tr>
+<tr><td><code>DummyCtx</code></td><td>테스트 스텁 (모든 accessor trivial)</td><td><code>crates/technique-api/src/lib.rs:1534</code></td></tr>
+</tbody>
+</table>
+<table>
+<thead><tr><th>TensorHandle 구현체</th><th>읽기 원천</th><th>비고</th></tr></thead>
+<tbody>
+<tr><td><code>KeyHandle</code> / <code>ValueHandle</code></td><td><code>dequantize_k</code>/<code>dequantize_v</code> (D2OHandler와 bit-identical 정본)</td><td>항상 <code>Some</code></td></tr>
+<tr><td><code>ScalarHandle</code></td><td><code>[n_kv_heads * max_seq]</code> row-major 슬라이스 — <code>data[kv_head * max_seq + row]</code>, 범위 밖은 0.0</td><td>Scores/AttnWeights 겸용, 공급 시에만 <code>Some</code></td></tr>
+<tr><td><code>AbiTensorHandle</code></td><td>vtable <code>tensor_read_row</code> fn-ptr</td><td><code>dtype()</code>은 항상 F32 보고 (v1 C-ABI가 저장 dtype 미운반)</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/stage_registry.rs::KeyHandle</code> (L124), <code>::ScalarHandle::read_row</code> (L181–187), <code>crates/technique-api/src/lib.rs::AbiTensorHandle::dtype</code> (L447–451)</p>
+
+<h3>2.4 왜 이 모양인가</h3>
+<p>
+technique-api는 <code>KVCache</code>/<code>Backend</code> 등 엔진 타입을 참조하지 않는다 — 기법 crate가 엔진 내부에 결합하면
+"엔진 코어 수정 0으로 기법 추가"라는 목표 자체가 깨지기 때문이다. 그래서 캐시 읽기를 이 crate가 정의하는 추상
+(<code>StageCtx</code>)으로 노출하고, 엔진이 그것을 <code>&amp;KVCache</code> 위로 구현한다. 정적 링크 단계에선 borrow로,
+<code>.so</code> 단계에선 같은 추상이 fn-ptr 테이블로 교체되어 plugin 저자는 정적/동적 무관하게 동일한
+<code>impl KVCacheStage</code> 코드를 쓴다("write-once, link-either-way").
+<code>tensor(kind)</code> 단일화는 value-aware 기법(CAOTE의 v_i)을 위해 V 노출이 필요해지자 accessor를 늘리는 대신
+kind 열거로 통합한 결과다 — read dispatch 비용은 additive accessor와 동등(PoC ±0~1%)함을 확인하고 채택했다.
+</p>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs</code> crate doc (L1–17), <code>TensorKind</code> doc (L27–30)</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="kvstage">
+<h2>3. <code>KVCacheStage</code> + <code>KVCachePlan</code> — plan-returning stage 축</h2>
+
+<h3>3.1 시그니처 발췌</h3>
+<pre><code>pub trait KVCacheStage: Send + Sync {
+    fn name(&amp;self) -&gt; &amp;str;                                  // CLI --eviction-policy 매칭, 슬라이스 내 유일
+    fn plan(&amp;self, ctx: &amp;dyn StageCtx) -&gt; Option&lt;KVCachePlan&gt;; // None = no-op
+}
+
+pub enum KeepSpec {
+    LayerWide(Vec&lt;usize&gt;),       // sliding/h2o/streaming/d2o — prefix 포함 ascending
+    PerHead(Vec&lt;Vec&lt;usize&gt;&gt;),    // h2o_plus — [n_kv_heads][keep], 각 ascending·길이 동일
+}
+
+pub struct WeightedMerge {
+    pub into: usize,             // 가중 합이 누적될 retained 토큰 위치 (pre-compact 좌표)
+    pub into_weight: f32,        // d2o Eq.11의 w_c
+    pub from: Vec&lt;(usize, f32)&gt;, // 병합될 evicted 토큰 (위치, 가중치)
+}
+
+pub struct KVCachePlan { pub keep: KeepSpec, pub merges: Vec&lt;WeightedMerge&gt; }</code></pre>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::KVCacheStage</code> (L220), <code>::KeepSpec</code> (L196), <code>::WeightedMerge</code> (L185), <code>::KVCachePlan</code> (L206)</p>
+
+<h3>3.2 계약 / 불변식</h3>
+<ul>
+<li><strong>결정은 plugin, 변형은 엔진(D1).</strong> stage는 버퍼를 직접 만지지 않는다. plan을 엔진 executor
+<code>execute_kv_plan</code>이 실행한다: merges가 있으면 <code>apply_weighted_merges</code>(pre-compact 좌표계, F32/F16/Q4_0 모두
+scatter_reduce와 bit-identical) → <code>compact_keep_positions(keep, 0)</code> → <code>set_current_pos(keep.len())</code>.</li>
+<li><strong><code>keep</code>은 prefix 포함 ascending.</strong> 그래야 compact 재배치가 in-place <code>evict</code>의 버퍼/<code>current_pos</code>와
+bit-identical하다(<code>compact_parity</code> 테스트가 4정책×3dtype에서 증명).</li>
+<li><strong><code>new_pos</code>는 plan에 싣지 않는다.</strong> 엔진이 <code>keep.len()</code>으로 도출한다. <code>PerHead</code>는 전 head 길이 동일 가정 —
+단, <strong>PerHead executor는 현재 미구현</strong>으로 도달 시 <code>bail!</code>한다(h2o_plus head_score source 미완, 단계 ⑤ deferred).</li>
+<li><strong>merge 가중치 정규화:</strong> <code>Σ from.weight + into_weight ≈ 1</code> (magnitude 보존). merge-free 정책은 빈 Vec.</li>
+<li><strong>budget 환산은 엔진 책임.</strong> ratio→len 환산(<code>EvictionHandler</code>)이 끝난 절대값을 <code>ctx.target_len()</code>으로 읽는다.
+"언제 발동하는가"(WHEN)도 엔진 소유 — <code>StageBackedPolicy::should_evict</code>는 항상 true를 돌려주고 실제 게이트는
+<code>run_policy_eviction</code>의 target_len/MIN_EVICT 가드가 담당한다(ADR-0004 D6).</li>
+</ul>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/stage_registry.rs::execute_kv_plan</code> (L94–112), <code>::StageBackedPolicy::should_evict</code> (L304–308), <code>crates/technique-api/src/lib.rs::KeepSpec</code> doc (L194–201)</p>
+
+<h3>3.3 구현체 / 등록 목록</h3>
+<table>
+<thead><tr><th>등록 이름</th><th>구현</th><th>경로</th></tr></thead>
+<tbody>
+<tr><td><code>"sliding"</code></td><td><code>EvictionPolicyAsStage(SlidingWindowPolicy)</code> — <code>plan_keep</code> 위임</td><td>stage_registry.rs L343</td></tr>
+<tr><td><code>"streaming"</code></td><td><code>EvictionPolicyAsStage(StreamingLLMPolicy)</code></td><td>L353</td></tr>
+<tr><td><code>"h2o"</code></td><td><code>EvictionPolicyAsStage(H2OPolicy)</code></td><td>L363</td></tr>
+<tr><td><code>"d2o"</code></td><td><code>D2OStage</code> (plan-returning, 가중 merge + EMA). 단 production d2o는 아직 if-branch로 <code>D2OHandler</code>가 처리(layer-alloc 지원) — 등록은 proven-equivalent 표면</td><td>L379</td></tr>
+<tr><td><code>"caote"</code></td><td>technique crate <code>crates/techniques/caote</code> — feature <code>caote</code> ON 시 <code>use caote as _</code> force-link로 가시화</td><td>stage_registry.rs L36–37</td></tr>
+<tr><td>(dlopen)</td><td><code>DynStage</code> — <code>.so</code> vtable 마샬링 어댑터</td><td>L561 부근</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/stage_registry.rs</code> (distributed_slice 등록 L343–389, caote force-link L32–37, DynStage)</p>
+
+<pre class="mermaid">
+classDiagram
+    class KVCacheStage {
+        &lt;&lt;trait, technique-api&gt;&gt;
+        +name() str
+        +plan(ctx) Option~KVCachePlan~
+    }
+    class StageCtx {
+        &lt;&lt;trait, technique-api&gt;&gt;
+        +current_pos() / target_len() / layer_idx()
+        +importance() Option
+        +tensor(kind) Option~TensorHandle~
+    }
+    class EvictionPolicy {
+        &lt;&lt;trait, engine legacy&gt;&gt;
+        +should_evict(cache, mem) bool
+        +evict(cache, target_len)
+        +evict_with_scores(...)
+        +plan_keep(...) Option "default None"
+    }
+    class EvictionPolicyAsStage {
+        plan_keep을 KVCachePlan으로 매핑
+    }
+    class StageBackedPolicy {
+        역어댑터: plan을 execute_kv_plan으로 실행
+    }
+    class KVStageCtx {
+        engine: KVCache 위 StageCtx 구현
+    }
+    class CachePressureHandler {
+        &lt;&lt;trait, engine&gt;&gt;
+        +handle(ctx) Result~ActionResult~
+        +name() str
+    }
+    class EvictionHandler {
+        target_ratio를 target_len으로 환산
+    }
+    class CachePressurePipeline {
+        stages: Vec~PressureStageConfig~
+        +execute(ctx) Vec~ActionResult~
+    }
+    KVCacheStage <|.. EvictionPolicyAsStage
+    EvictionPolicyAsStage o-- EvictionPolicy : 정방향 어댑터
+    EvictionPolicy <|.. StageBackedPolicy
+    StageBackedPolicy o-- KVCacheStage : 역어댑터
+    StageBackedPolicy ..> KVStageCtx : plan 호출 시 생성
+    KVStageCtx ..|> StageCtx
+    CachePressureHandler <|.. EvictionHandler
+    EvictionHandler o-- EvictionPolicy
+    CachePressurePipeline o-- CachePressureHandler : min_level별 stages
+</pre>
+
+<h3>3.4 왜 이 모양인가 — 어댑터가 양방향으로 2개인 이유</h3>
+<p>
+위 다이어그램에서 눈에 띄는 것은 <code>EvictionPolicyAsStage</code>(EvictionPolicy → KVCacheStage)와
+<code>StageBackedPolicy</code>(KVCacheStage → EvictionPolicy)가 <strong>동시에</strong> 존재한다는 점이다. 이것은
+branch-by-abstraction 마이그레이션의 스냅샷이다: production eviction 경로(<code>run_policy_eviction</code> → <code>evict*</code>)의
+구조는 그대로 두면서, 내부 실행을 World A(in-place evict)에서 World B(plan→compact)로 바꿨다.
+session 조립부(<code>session/chat/session.rs:653</code>, <code>assembly/build_bench_loop.rs:117</code>)가
+<code>make_stage(name, params)</code>로 stage를 만들고 <code>StageBackedPolicy</code>로 감싸 기존 <code>EvictionPolicy</code> 자리에 꽂는다.
+plan을 반환하게 한 이유는 (1) in-place <code>&amp;mut KVCache</code>로는 merge(D2O)·per-head를 표현할 수 없고,
+(2) <code>.so</code> C-ABI에서 "plugin이 엔진 버퍼를 직접 변형"은 안전하게 평탄화할 수 없기 때문이다 —
+<code>PlanAbi</code>/<code>PlanArena</code>는 plan(데이터)만 건너고, "각자 자기 것 free"(host는 복사 직후 <code>plan_free(owner)</code> 호출)로
+cross-allocator UB를 차단한다.
+</p>
+<p class="evidence">근거: <code>engine/src/session/chat/session.rs</code> (L604, L653–661), <code>crates/technique-api/src/lib.rs::PlanAbi</code> (L335, owner 계약 L351), <code>::PlanArena</code> (L558)</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="pressure">
+<h2>4. <code>CachePressureHandler</code> + <code>CachePressurePipeline</code></h2>
+
+<h3>4.1 시그니처 발췌</h3>
+<pre><code>pub type PressureLevel = llm_shared::Level;   // Normal &lt; Warning &lt; Critical &lt; Emergency (Ord)
+
+pub struct HandlerContext&lt;'a&gt; {
+    pub caches: &amp;'a mut [KVCache],            // layer당 1개
+    pub importance: Option&lt;&amp;'a [f32]&gt;,        // flat per-token score
+    pub head_importance: Option&lt;&amp;'a [f32]&gt;,   // [n_kv_heads * max_seq_len] row-major
+    pub n_kv_heads: usize,                    // 0 = GQA 모드 비활성
+    pub pressure_level: PressureLevel,
+    pub mem_available: usize,
+    pub target_ratio: Option&lt;f32&gt;,            // 외부 신호의 override (resilience Evict)
+    pub qcf_sink: Option&lt;&amp;'a mut Vec&lt;QcfMetric&gt;&gt;,
+    pub layer_ratios: Option&lt;&amp;'a [(f32, f32)]&gt;, // D2O per-layer (hh_ratio, recent_ratio)
+}
+
+pub enum ActionResult {
+    NoOp,
+    Evicted { tokens_removed: usize, new_pos: usize },
+    Swapped { tokens_swapped: usize },
+    WeightSwapped { layers_changed: usize, freed_bytes: usize, duration_ms: f64 },
+}
+
+pub trait CachePressureHandler: Send + Sync {
+    fn handle(&amp;self, ctx: &amp;mut HandlerContext) -&gt; Result&lt;ActionResult&gt;;
+    fn name(&amp;self) -&gt; &amp;str;
+}
+
+pub struct PressureStageConfig { pub min_level: PressureLevel, pub handler: Box&lt;dyn CachePressureHandler&gt; }
+pub struct CachePressurePipeline { stages: Vec&lt;PressureStageConfig&gt; }</code></pre>
+<p class="evidence">근거: <code>engine/src/pressure.rs::PressureLevel</code> (L45), <code>::HandlerContext</code> (L50), <code>::ActionResult</code> (L81), <code>::CachePressureHandler</code> (L116), <code>::CachePressurePipeline</code> (L166)</p>
+
+<div class="note">
+<strong>ActionResult는 현재 4개 variant다.</strong> 과거 문서·메모에 등장하는 <code>Quantized</code>/<code>Recalled</code>(생산자 없는 dead variant)는
+기준 커밋의 enum에 존재하지 않는다 — 제거된 상태다. 코드가 정답.
+</div>
+
+<h3>4.2 계약 / 불변식</h3>
+<ul>
+<li><strong>게이트 조건은 <code>min_level &lt;= ctx.pressure_level</code>.</strong> <code>execute()</code>는 매칭되는 모든 stage를
+<code>min_level</code> 오름차순(덜 공격적인 것부터)으로 <strong>순차</strong> 실행한다. 생성자 <code>new()</code>가 내부에서 정렬하므로
+등록 순서는 의미 없다.</li>
+<li><strong>각 핸들러는 앞 핸들러가 남긴 캐시 상태를 본다.</strong> 같은 ctx의 <code>&amp;mut [KVCache]</code>를 이어받는다 —
+테스트 <code>test_context_updated_after_eviction</code>이 40→20→10 연쇄를 검증한다. 핸들러를 추가/재배열하는 PR은
+이 누적 효과를 반드시 따져야 한다.</li>
+<li><strong>행동 불필요 시 <code>NoOp</code> 반환이 규약.</strong> <code>handle()</code>은 스스로 <code>ctx.pressure_level</code>과 캐시 상태를 보고
+판단한다. 같은 레벨에 핸들러 여러 개 등록도 허용(둘 다 실행).</li>
+<li><strong>PressureLevel 산출은 <code>CacheManager</code> 소유:</strong> <code>mem_available &gt;= threshold</code> → Normal,
+<code>&gt;= threshold/2</code> → Warning, <code>&gt;= threshold/4</code> → Critical, 그 미만 → Emergency. Normal이면 파이프라인 자체를
+건너뛴다. 단 <code>force</code>(budget-driven 강제 eviction)면 메모리 체크를 우회하고 <strong>Emergency로 전 핸들러를 실행</strong>한다.</li>
+<li><strong>SwapHandler는 파이프라인 밖.</strong> <code>CacheManager.swap_handler</code>는 등록되지 않고, Manager의
+<code>KvOffload</code>/<code>RestoreDefaults</code> 지시 시 <code>offload()</code>/<code>recall()</code>로만 직접 발화한다.</li>
+</ul>
+<p class="evidence">근거: <code>engine/src/pressure.rs::CachePressurePipeline::execute</code> (L184–193), <code>::new</code> 정렬 (L174–177), <code>engine/src/pressure/cache_manager.rs::determine_pressure_level</code> (L153–163), <code>::execute_dispatch</code> force 분기 (L217–248), swap_handler doc (L60–62, L107–113)</p>
+
+<h3>4.3 구현체 목록</h3>
+<table>
+<thead><tr><th>핸들러</th><th><code>name()</code></th><th>실제 동작</th></tr></thead>
+<tbody>
+<tr><td><code>EvictionHandler</code></td><td>래핑한 정책 이름 위임</td><td><code>target_len = current_pos × ratio</code>(ratio는 0.1~0.99 clamp, signal의 <code>ctx.target_ratio</code>가 우선) 환산 후 <code>CacheManager::run_policy_eviction</code> 코어에 위임. <code>eviction_handler.rs:42</code></td></tr>
+<tr><td><code>D2OHandler</code></td><td><code>"d2o"</code></td><td>3-partition + cosine merge + EMA (2,852 LOC). production d2o의 정본. <code>d2o_handler.rs:307</code></td></tr>
+<tr><td><code>SwapHandler</code></td><td><code>"swap"</code></td><td>디스크 offload/recall. trait는 구현하지만 <strong>파이프라인 미등록</strong> — 명시 호출 전용. <code>swap_handler.rs:368</code></td></tr>
+<tr><td><code>QuantizeHandler</code></td><td>—</td><td><strong>사실상 stub</strong>: <code>handle()</code>은 로그만 찍고 항상 <code>NoOp</code>. 실제 가치는 정적 매핑 <code>target_bits_for_pressure</code> (Warning→8bit, Critical→4bit, Emergency→2bit)를 KIVI 경로가 직접 쓰는 것. <code>quantize_handler.rs:46</code></td></tr>
+<tr><td><code>WeightSwapHandler</code></td><td>—</td><td><code>CachePressureHandler</code>를 <strong>구현하지 않는다</strong> — weight swap은 파이프라인 밖 별도 dispatch로 흐르고, 결과만 <code>ActionResult::WeightSwapped</code>로 합류. <code>weight_swap_handler.rs</code></td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/pressure/quantize_handler.rs::handle</code> (L46–60: 무조건 NoOp), <code>::target_bits_for_pressure</code> (L30–38); <code>impl CachePressureHandler</code> grep 결과 4건(quantize/d2o/swap/eviction_handler)에 weight_swap_handler 부재</p>
+
+<h3>4.4 왜 이 모양인가</h3>
+<p>
+이 2-tier(상위 <code>CachePressureHandler</code> / 하위 <code>EvictionPolicy</code>)는 "eviction 이상"을 담기 위한 일반화다 —
+swap·quantize·merge가 토큰 삭제와 동일한 압력-응답 슬롯에 꽂힌다. <code>PressureStageConfig</code>의 의도된 활용은
+같은 핸들러를 레벨별로 다른 계수로 중복 등록하는 것이다(Warning에 ratio=0.8, Emergency에 ratio=0.5 등 — trait doc의 예시).
+다만 현재 production 조립(<code>CacheManager::new</code>)은 Warning 레벨 단일 <code>EvictionHandler</code> stage라는 최소 구성이고,
+다단 구성은 <code>with_pipeline()</code>으로 열려 있다. 이산 4레벨(<code>PressureLevel</code>)과 별개로 0~100 graded scalar
+<code>Pressure</code>(<code>pipeline.rs</code>)가 공존하는데, 이는 다른 층(decode 루프 hook)의 어휘다 — 혼동 주의,
+<a href="08_resilience_ipc.html">08. Resilience &amp; IPC</a> 참조.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure.rs::PressureStageConfig</code> doc (L135–151), <code>engine/src/pressure/cache_manager.rs::new</code> (L70–87), <code>::with_pipeline</code> (L93)</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="eviction">
+<h2>5. <code>EvictionPolicy</code> — 흡수 중인 legacy 하위 trait</h2>
+
+<h3>5.1 시그니처 발췌</h3>
+<pre><code>pub trait EvictionPolicy: Send + Sync {
+    fn should_evict(&amp;self, cache: &amp;KVCache, mem_available: usize) -&gt; bool;
+    fn evict(&amp;self, cache: &amp;mut KVCache, target_len: usize) -&gt; Result&lt;()&gt;;
+    fn name(&amp;self) -&gt; &amp;str;
+
+    // default 사다리: 미오버라이드 시 한 단계씩 아래로 위임
+    fn evict_with_scores(&amp;self, cache, target_len, _importance: &amp;[f32]) -&gt; Result&lt;()&gt;
+        { self.evict(cache, target_len) }
+    fn evict_with_head_scores(&amp;self, cache, target_len, flat, _head, _n_kv_heads) -&gt; Result&lt;()&gt;
+        { self.evict_with_scores(cache, target_len, flat) }
+
+    // plan-returning 다리 — default None = "단일 layer-wide keep으로 표현 불가"
+    fn plan_keep(&amp;self, current_pos, target_len, importance: Option&lt;&amp;[f32]&gt;)
+        -&gt; Option&lt;(Vec&lt;usize&gt;, Vec&lt;Merge&gt;)&gt; { None }
+}</code></pre>
+<p class="evidence">근거: <code>engine/src/pressure/eviction.rs::EvictionPolicy</code> (L13–77)</p>
+
+<h3>5.2 계약 / 불변식</h3>
+<ul>
+<li><strong><code>evict(cache, target_len)</code> = 캐시를 target_len 토큰으로 축소.</strong> in-place 변형이며 호출 후
+<code>current_pos</code>가 줄어 있어야 한다. RoPE 포지션은 계속 단조 증가(물리 위치만 감소) — 자세한 의미론은
+<a href="07_kv_cache.html">07. KV 캐시</a>.</li>
+<li><strong><code>plan_keep</code>의 keep은 prefix 포함 ascending</strong>이어야 <code>compact(keep, 0)</code>가 in-place evict와
+bit-identical하다. per-head H2O+처럼 단일 layer-wide keep으로 표현 불가한 정책은 default <code>None</code>으로 미지원을 표시한다.</li>
+<li><strong>발화 게이트는 trait 밖에 있다.</strong> production 경로에서 실질 가드는
+<code>CacheManager::run_policy_eviction</code>의 <code>tokens_to_remove &lt; MIN_EVICT_TOKENS</code>(=64) skip이다 —
+수십 토큰 제거를 위해 full sort+memcpy를 도는 "sticky eviction"을 막는다. 이 가드에 걸리면 <code>NoOp</code>이고
+<code>current_pos</code>는 불변이다.</li>
+<li><strong>score 공급 여부에 따른 dispatch:</strong> <code>EvictionHandler</code>가 <code>ctx.importance</code>/<code>head_importance</code> 조합으로
+<code>ScoreContext::{None, Flat, PerHead}</code>를 만들어 코어에 넘기고, 코어가 <code>evict</code> / <code>evict_with_scores</code> /
+<code>evict_with_head_scores</code> 중 하나를 고른다. H2O는 score 없이 불리면 sliding 유사 동작으로 폴백한다(테스트로 고정된 거동).</li>
+</ul>
+<p class="evidence">근거: <code>engine/src/pressure/eviction_handler.rs::MIN_EVICT_TOKENS</code> (L17, rationale L11–16), <code>::handle</code> (L43–81), <code>engine/src/pressure/cache_manager.rs::run_policy_eviction</code> (L536, L561 guard), <code>eviction.rs::plan_keep</code> doc (L54–76)</p>
+
+<h3>5.3 구현체 목록</h3>
+<table>
+<thead><tr><th>구현체</th><th><code>name()</code></th><th>전략</th><th><code>plan_keep</code></th></tr></thead>
+<tbody>
+<tr><td><code>NoEvictionPolicy</code></td><td><code>"none"</code></td><td>아무것도 삭제하지 않음</td><td>구현</td></tr>
+<tr><td><code>SlidingWindowPolicy</code></td><td><code>"sliding"</code></td><td>protected prefix + 최근 window 유지 (score-free)</td><td>구현</td></tr>
+<tr><td><code>StreamingLLMPolicy</code></td><td><code>"streaming"</code></td><td>attention sink + 최근 window</td><td>구현</td></tr>
+<tr><td><code>H2OPolicy</code></td><td><code>"h2o"</code></td><td>3-partition: prefix + heavy hitters(keep_ratio) + recent</td><td>구현</td></tr>
+<tr><td><code>H2OPlusPolicy</code></td><td>—</td><td>per-head GQA-aware 변형 (<code>evict_with_head_scores</code> override)</td><td><code>None</code> (per-head 표현 불가)</td></tr>
+<tr><td><code>StageBackedPolicy</code></td><td>stage 이름 위임</td><td>역어댑터 — §3.4. production에서 sliding/streaming/h2o가 실제로 타는 경로</td><td>n/a</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/{sliding_window,streaming_llm,h2o,h2o_plus,no_eviction}.rs</code> (struct/name/plan_keep 정의), <code>stage_registry.rs::StageBackedPolicy</code> (L275)</p>
+
+<h3>5.4 eviction 1회의 전체 호출 체인</h3>
+<pre class="mermaid">
+sequenceDiagram
+    participant DL as DecodeLoop (caller 책임)
+    participant CM as CacheManager
+    participant PL as CachePressurePipeline
+    participant EH as EvictionHandler
+    participant SBP as StageBackedPolicy
+    participant ST as KVCacheStage (예: sliding)
+    participant KV as KVCache
+
+    DL->>CM: evict_caches / force_evict(target_ratio)
+    CM->>CM: mem_stats → determine_pressure_level (force면 Emergency)
+    Note over CM: Normal이면 여기서 return (no-op)
+    CM->>PL: execute(HandlerContext)
+    PL->>EH: handle(ctx)  [min_level ≤ pressure_level인 stage만]
+    EH->>EH: target_len = pos × ratio (signal override 우선)
+    EH->>CM: run_policy_eviction(policy, caches, target_len, scores)
+    Note over CM: tokens_to_remove < 64 → NoOp (MIN_EVICT_TOKENS)
+    CM->>SBP: evict / evict_with_scores(cache, target_len)
+    SBP->>ST: plan(KVStageCtx { cache, target_len, importance })
+    ST-->>SBP: Some(KVCachePlan { keep, merges })
+    SBP->>KV: execute_kv_plan: apply_weighted_merges → compact_keep_positions(keep,0) → set_current_pos(keep.len())
+    EH-->>PL: ActionResult::Evicted { tokens_removed, new_pos }
+</pre>
+
+<h3>5.5 왜 이 모양인가</h3>
+<p>
+<code>EvictionPolicy</code>는 Strategy 패턴 그 자체이고 default 사다리(<code>evict_with_head_scores</code> →
+<code>evict_with_scores</code> → <code>evict</code>)는 score-aware 정도가 다른 정책을 한 표면에 수용한다. 하지만 in-place
+<code>&amp;mut KVCache</code> 변형 방식은 (1) D2O의 가중 merge, (2) per-head keep, (3) <code>.so</code> plugin을 표현할 수 없어서
+plan-returning <code>KVCacheStage</code>로 흡수 중인 legacy다. 현 시점의 리뷰 기준: <strong>새 eviction-류 기법은
+<code>EvictionPolicy</code> 구현이 아니라 <code>KVCacheStage</code> 구현 + <code>register_kv_stage!</code> 등록으로 들어와야 한다</strong>
+(<a href="10_howto_extend.html">10. 확장 How-to</a>). 기존 trait는 production 무회귀를 위한 호환 표면으로 남는다.
+</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="capability">
+<h2>6. Capability plugin — 두 층의 registry</h2>
+<p>
+"capability"라는 말이 코드베이스에서 두 층을 가리키므로 구분이 필수다:
+</p>
+<ol>
+<li><strong>엔진 내부 <code>CapabilityRegistry</code></strong> — 한 프로세스 안에서 (backend → capability handle) 매핑을 드는 typed anymap.</li>
+<li><strong>technique-api plugin registry</strong> — stage/format/backend-cap 3축의 정적(linkme) + 동적(dlopen) 등록 표면.</li>
+</ol>
+
+<h3>6.1 <code>CapabilityRegistry</code> (engine, typed anymap)</h3>
+<pre><code>pub struct CapabilityRegistry { map: HashMap&lt;TypeId, Box&lt;dyn Any + Send + Sync&gt;&gt; }
+
+impl CapabilityRegistry {
+    pub fn register&lt;C: ?Sized + Send + Sync + 'static&gt;(&amp;mut self, h: Arc&lt;C&gt;) {
+        self.map.insert(TypeId::of::&lt;Arc&lt;C&gt;&gt;(), Box::new(h));
+    }
+    pub fn get&lt;C: ?Sized + Send + Sync + 'static&gt;(&amp;self) -&gt; Option&lt;Arc&lt;C&gt;&gt; { ... }
+}</code></pre>
+<p><strong>계약:</strong></p>
+<ul>
+<li><strong>키는 <code>TypeId::of::&lt;Arc&lt;C&gt;&gt;</code></strong> — <code>register::&lt;C&gt;</code>와 <code>get::&lt;C&gt;</code>의 타입 인자가 정확히 같아야 한다
+(보통 <code>dyn KiviAttentionBackend</code> 같은 trait object). mismatch는 panic이 아니라 <strong>silent <code>None</code></strong>이다 —
+등록·조회 양쪽이 같은 trait bound인지는 construction 시점에 사람이 보장한다.</li>
+<li><strong>등록은 backend 자기 모듈에서, 조회는 소비자 construction 시점 1회 pull.</strong> per-forward lookup을 없애
+hot path 분기 0을 만드는 게 목적. 등록 후 <code>Arc&lt;CapabilityRegistry&gt;</code>로 freeze되어 read-only.</li>
+<li><strong>R4 불변식:</strong> registry에 등록하는 <code>Arc</code>와 primary backend로 쓰는 <code>Arc</code>는 동일 인스턴스의 clone이어야 한다
+(KiviCache가 보는 객체와 일반 op가 보는 객체가 같아야 함). 실제 등록 예: OpenCL 선택 시
+<code>caps.register::&lt;dyn KiviAttentionBackend&gt;(gpu_concrete.clone())</code>; CUDA/CPU/HTP는 빈 registry.</li>
+<li><strong>빈 trait 금지(promotion-trigger):</strong> 소비자가 둘 이상 등장하기 전까지 capability를 만들지 않는다 —
+<code>ScoreCollector</code>/<code>TierMovable</code>은 그래서 아직 없다.</li>
+</ul>
+<p class="evidence">근거: <code>engine/src/capability.rs::CapabilityRegistry</code> (L40–62, 타입 키 규약 doc L35–38), <code>engine/src/session/init.rs</code> (L331–348 등록, L425–426 freeze), <code>capability.rs</code> module doc (L18–20 promotion-trigger)</p>
+
+<h3>6.2 technique-api 3축 registry — 정적 경로 (linkme)</h3>
+<p>
+확장 기법은 <code>#[distributed_slice]</code>로 자기를 등록하고, 링크 타임에 슬라이스로 모인다. 축별로 슬라이스·엔트리 심볼이
+<strong>분리</strong>되어 있고 통합 registry는 의도적으로 없다(ADR-0009 #118 불변).
+</p>
+<table>
+<thead><tr><th>축</th><th>plugin trait</th><th>정적 슬라이스</th><th>조회 함수</th><th>ABI ver</th></tr></thead>
+<tbody>
+<tr><td>stage (KV)</td><td><code>KVCacheStage</code></td><td><code>KV_CACHE_STAGES</code></td><td><code>find_stage</code> / 엔진 <code>make_stage</code></td><td>2</td></tr>
+<tr><td>format</td><td><code>KVFormat</code> (name + <code>layout() → KVLayoutDesc</code> 순수 descriptor)</td><td><code>KV_FORMATS</code></td><td><code>find_kv_format</code></td><td>2</td></tr>
+<tr><td>stage (weight)</td><td><code>WeightStage</code> (KV 거울 — <code>WeightDispatchPlan</code>)</td><td><code>WEIGHT_STAGES</code></td><td><code>find_weight_stage</code></td><td>(정적만)</td></tr>
+<tr><td>backend-cap</td><td><code>BackendCapability</code>(이름만 가진 골격) + 카테고리별 실전 trait <code>KiviAttentionBackend</code></td><td><code>BACKEND_CAPABILITIES</code>, <code>KIVI_ATTENTION_REGS</code></td><td><code>find_kivi_attention</code> / 엔진 <code>resolve_kivi_capability</code></td><td>1</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::KV_CACHE_STAGES</code> (L264), <code>::KV_FORMATS</code> (L994), <code>::WEIGHT_STAGES</code> (L863), <code>::BACKEND_CAPABILITIES</code> (L1203), <code>::KIVI_ATTENTION_REGS</code> (L1307), ABI const (L287, L1018, L1223)</p>
+<div class="warn">
+<strong>함정 — fat-LTO silent drop:</strong> release 프로필(<code>lto = "fat"</code>) + <code>--gc-sections</code>가 미참조 linkme 섹션을
+조용히 떨어뜨릴 수 있다. 그래서 (1) 엔진은 시작 시 <code>ensure_builtin_stages_registered()</code>로
+<code>"sliding"/"streaming"/"h2o"</code> 등록을 단언해 fail-fast하고, (2) technique crate는 dep 선언만으로는 부족해서
+<code>use caote as _;</code> 같은 <strong>force-link 한 줄</strong>이 필요하다. 새 technique crate를 붙이는 PR에서 이 한 줄 누락이
+"빌드는 되는데 <code>--eviction-policy</code>가 unknown" 증상으로 나타난다.
+</div>
+<p class="evidence">근거: <code>engine/src/pressure/eviction/stage_registry.rs::ensure_builtin_stages_registered</code> (L331–341), caote force-link 주석 (L32–37)</p>
+
+<h3>6.3 동적 경로 (dlopen) — 번들 dispatcher와 category 다리</h3>
+<pre class="mermaid">
+flowchart TB
+    CLI["--load-plugin foo.so"] --> RDP["session::plugin_dispatch::register_dynamic_plugins"]
+    RDP --> DLO["dlopen 1회 (RTLD_NOW, Arc Library 공유)"]
+    DLO --> TS["try_register_stage<br/>dlsym register_kv_stages_v2"]
+    DLO --> TF["try_register_format<br/>dlsym register_kv_formats_v2"]
+    DLO --> TB["try_register_backend_cap<br/>dlsym register_backend_caps_v2"]
+    TS --> DR1["DYN_REGISTRY (stage)"]
+    TF --> DR2["DYN_FORMAT_REGISTRY"]
+    TB --> DR3["DYN_BACKEND_REGISTRY"]
+    TS -. "심볼 부재 = Ok(0), 에러 아님" .-> RDP
+    DR1 --> MS["make_stage(name): 정적 우선 → 동적 fallback"]
+    DR3 --> RK["resolve_kivi_capability(name, KiviMakeArgs):<br/>정적 우선 → category 다리 → DynKiviAttentionBackend"]
+    RDP --> Z{"stage+format+backend == 0?"}
+    Z -- yes --> BAIL["bail: capability 0 — export_plugin! 누락?"]
+</pre>
+<p><strong>로딩 계약 (PR 리뷰 포인트):</strong></p>
+<ul>
+<li><strong><code>.so</code>당 dlopen 1회, 3축 엔트리는 부분집합으로 export 가능</strong>(번들). 어느 축에도 기여 0인 <code>.so</code>만 bail.
+wrong-type은 reject가 아니다.</li>
+<li><strong>봉투 ABI 버전 게이트:</strong> <code>register_*_v2()</code>가 by-value 봉투(<code>StageExportAbi</code> 등)를 반환하고
+host가 <code>abi_version</code> mismatch면 <code>.so</code>를 거부한다.</li>
+<li><strong>2-pass 원자 등록:</strong> pass 1에서 이름 추출 + 빌트인 충돌(빌트인 우선, 동적 거부) + 봉투 내부 중복 검사,
+pass 2에서 write-lock 1회로 동적 중복 검사 + 일괄 push — <code>.so</code> 단위 all-or-nothing.</li>
+<li><strong>backend-cap의 category 다리(D7):</strong> 엔트리는 <code>{name, category, vtable}</code> 태그드 포인터이고, host가
+<code>category</code>로 <code>vtable</code>을 카테고리별 테이블로 캐스팅한다. 현재 알려진 카테고리는
+<code>BACKEND_CAP_CATEGORY_ATTENTION = 1</code> 하나 — 미지의 category는 로드 거부(새 카테고리 = host <code>match</code> arm 추가 = 재컴파일).</li>
+<li><strong>해석 순서는 항상 정적 우선 → 동적 fallback.</strong> 호출부(<code>make_stage</code>, <code>resolve_kivi_capability</code>)는
+source를 모른다. <code>Arc&lt;Library&gt;</code>를 registry가 영구 보관해 vtable/handle dangling을 막는다(leak-and-keep).</li>
+<li><strong>vtable fn-ptr은 panic 금지, <code>i32</code> 반환</strong>(0=OK, 음수=plugin의 깨끗한 논리 오류 → host는 로그 후 no-op 처리).
+GPU 자원은 borrow-for-call — plugin이 cl_mem을 retain하면 계약 위반.</li>
+</ul>
+<p class="evidence">근거: <code>engine/src/session/plugin_dispatch.rs::register_dynamic_plugins</code> (L23–43), <code>engine/src/capability/dynamic_backend_registry.rs::try_register_backend_cap</code> (L50–151), <code>::resolve_kivi_capability</code> (L170–208), <code>crates/technique-api/src/lib.rs::KiviAttentionBackend</code> (L1284, i32 규약 doc L1283), <code>::export_plugin!</code> (L1144–1180)</p>
+
+<h3>6.4 plugin 저자 표면 — dual-wiring 매크로</h3>
+<pre><code>// crates/techniques/&lt;name&gt;/src/lib.rs — 엔진 코어 수정 0
+technique_api::register_kv_stage!("my_policy", |p: StageParams| Box::new(MyStage::new(p)));
+technique_api::register_kv_format!("nf4",  || Box::new(Nf4));
+technique_api::register_kivi_attention_plugin!("my_kivi", |args| Box::new(MyKivi::build(args)));
+technique_api::export_plugin!();   // .so 당 1회 — 3축 엔트리 심볼 emit</code></pre>
+<p>
+각 매크로는 정적 경로(linkme 슬라이스 기여)와 동적 경로(<code>plugin-cdylib</code> feature 게이트 하의 C thunk + vtable 기여)를
+<strong>한 번에</strong> 배선한다. 동적 경로를 feature로 게이트하는 이유는 정적 force-link 빌드에서 여러 plugin의
+<code>#[no_mangle]</code> 엔트리 심볼이 충돌하는 것을 원천 차단하기 위해서다. 기여 static은 익명 <code>const _: () = {}</code> 스코프에
+격리되어 한 crate에서 다회 호출(다수 stage/format)이 가능하다. 구체 절차는 <a href="10_howto_extend.html">10. 확장 How-to</a>.
+</p>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::register_kv_stage!</code> (L657–727), <code>::register_kivi_attention_plugin!</code> (L1381–1463), <code>crates/techniques/</code> (caote, synth-q4-format, example-* 9개)</p>
+
+<h3>6.5 왜 이 모양인가</h3>
+<p>
+세 층(엔진 <code>CapabilityRegistry</code> / linkme 정적 / dlopen 동적)이 겹쳐 보이지만 각자 다른 질문에 답한다:
+<code>CapabilityRegistry</code>는 "<em>이 프로세스의 이 backend가</em> 이 능력을 가졌나"(인스턴스 매핑),
+linkme 슬라이스는 "<em>이 바이너리에 어떤 기법이</em> 링크되어 있나"(컴파일 타임 인벤토리),
+dlopen registry는 "<em>런타임에 어떤 <code>.so</code>가</em> 추가됐나"(재컴파일 없는 배포)다.
+<code>KiviAttentionBackend</code>가 셋을 관통하는 단일 trait(D8)인 것이 핵심 설계다: 엔진 정적 OpenCL 구현 ·
+host dlopen 어댑터(<code>DynKiviAttentionBackend</code>) · plugin <code>.so</code>가 전부 같은 1벌을 구현하고, 시그니처를
+<code>&amp;Tensor</code>가 아닌 ABI struct(<code>KiviAttnArgs</code>의 raw cl_mem)로 잡아 plugin이 엔진 타입을 비참조한 채 컴파일된다 —
+<code>&amp;Tensor</code> → cl_mem 다리는 소비자(<code>kivi_format</code>/<code>kivi_cache</code>)가 한 번만 수행해 static·dynamic이 공유한다.
+</p>
+<p class="evidence">근거: <code>engine/src/capability/dynamic_backend_registry.rs</code> module doc (L1–14), <code>engine/src/capability/kivi_attention.rs</code> (re-export shim — 동일 TypeId 보존), <code>crates/technique-api/src/lib.rs</code> D8 주석 (L1215–1220)</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="checklist">
+<h2>7. 리뷰 미니 체크리스트</h2>
+<table>
+<thead><tr><th>변경 종류</th><th>확인할 계약</th></tr></thead>
+<tbody>
+<tr><td><code>Backend</code> 메서드 추가/호출</td><td>default가 host-ptr 폴백인가? <code>supports_*</code> guard 필요? offset 단위(element vs byte, Q4_0 block=18B)? hot path에서 <code>get_extension</code>/downcast 금지</td></tr>
+<tr><td>새 KV 관리 기법</td><td><code>EvictionPolicy</code>가 아니라 <code>KVCacheStage::plan</code>으로. keep ascending+prefix 포함, 버퍼 직접 변형 금지, 상태는 plugin struct interior mutability</td></tr>
+<tr><td>핸들러 추가/재배열</td><td><code>min_level</code> 게이트와 순차 누적 효과. NoOp 규약 준수. SwapHandler처럼 파이프라인 밖 직접 dispatch가 더 맞는지</td></tr>
+<tr><td>technique crate 추가</td><td>force-link <code>use foo as _;</code> + startup self-test. <code>.so</code>면 <code>export_plugin!</code> 1회 + <code>plugin-cdylib</code> feature</td></tr>
+<tr><td>capability 신설</td><td>소비자 2곳 이상인가(빈 trait 금지)? register/get 타입 인자 동일(silent miss)? 등록 Arc = primary backend Arc clone(R4)</td></tr>
+</tbody>
+</table>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="04_inference_pipeline.html">← 04. 추론 파이프라인</a></span><span><a href="06_memory.html">06. 메모리 &amp; 데이터 포맷 →</a></span></footer>
+</body>
+</html>

@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11. 개발 워크플로우 — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 11</span></nav>
+<header>
+<h1>11. 개발 워크플로우</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<section>
+<h2>11.1 워크플로우 한눈에 보기</h2>
+<p>이 챕터는 코드를 고친 뒤 PR을 올리기까지의 표준 경로를 다룬다: 호스트 빌드/테스트 → feature flag 이해 → Android 크로스 빌드 → 테스트 계층 통과 → 성능 측정. 특히 마지막 절(성능 측정 함정)은 이 코드베이스에서 가장 자주 틀리는 부분이므로 성능 PR 리뷰 전 반드시 읽어야 한다.</p>
+
+<pre class="mermaid">
+flowchart LR
+    A["코드 수정"] --> B["호스트 빌드 + unit test\ncargo build / cargo test"]
+    B --> C["fmt + clippy\n-D warnings"]
+    C --> D["backend 정확성\ntest_backend (CPU vs OpenCL)"]
+    D --> E["디바이스 e2e\nrun_device.py -d galaxy_s25 argus_cli"]
+    E --> F["성능 측정\nwall-clock TTFT / Decode ms-tok"]
+    F --> G["커밋 + PR"]
+</pre>
+
+<div class="note">
+빌드·린트·유닛 테스트는 <code>/sanity-check</code> 스킬, 디바이스 배포·테스트는 <code>/deploy-test</code> 스킬로 자동화되어 있다 (CLAUDE.md 빠른 참조). 이 챕터는 그 스킬들이 내부에서 실행하는 것과 동일한 명령을 손으로 실행할 수 있도록 메커니즘을 설명한다.
+</div>
+</section>
+
+<section>
+<h2>11.2 호스트 빌드와 기본 명령</h2>
+
+<h3>11.2.1 Workspace 구성과 release 프로필</h3>
+<p>저장소는 단일 Cargo workspace다. 멤버는 <code>engine</code>(크레이트명 <code>llm_rs2</code>), <code>shared</code>(<code>llm_shared</code>), <code>manager</code>(<code>llm_manager</code>), 그리고 plugin 표면인 <code>crates/technique-api</code>, <code>crates/qnn_oppkg</code>, glob 멤버 <code>crates/techniques/*</code>다. techniques 디렉토리는 glob이라 폴더만 추가하면 workspace 멤버로 자동 편입된다 — stage 축 plugin crate를 추가할 때 루트 Cargo.toml 수정이 필요 없다(<a href="10_howto_extend.html">10장</a> 참조).</p>
+
+<pre><code>[workspace]
+members = ["engine", "shared", "manager",
+           "crates/qnn_oppkg", "crates/technique-api", "crates/techniques/*"]
+resolver = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3</code></pre>
+
+<p>release 프로필이 <code>lto = "fat"</code> + <code>codegen-units = 1</code>이므로 release 빌드는 느리다(전체 crate 그래프를 단일 codegen 단위로 LTO). 성능 수치는 release 빌드에서만 의미가 있고, 개발 중 빠른 반복은 <code>cargo check</code>/<code>cargo test</code>(debug)로 한다. <code>panic = "abort"</code>이므로 release 바이너리에서 panic은 unwinding 없이 즉시 프로세스를 종료한다 — <code>catch_unwind</code> 기반 복구는 release에서 동작하지 않는다.</p>
+<p class="evidence">근거: <code>Cargo.toml</code> (workspace root, L1–L18)</p>
+
+<h3>11.2.2 기본 명령 세트</h3>
+<p>CLAUDE.md 빠른 참조의 표준 명령:</p>
+<pre><code>cargo build --release -p llm_rs2
+cargo test --workspace
+cargo fmt --all &amp;&amp; cargo clippy --workspace -- -D warnings</code></pre>
+<p>clippy는 <code>-D warnings</code>로 경고를 에러 승격한다 — 경고 하나라도 남으면 sanity-check 실패다.</p>
+
+<h3>11.2.3 타겟별 rustflags (.cargo/config.toml)</h3>
+<table>
+<thead><tr><th>타겟</th><th>rustflags</th><th>비고</th></tr></thead>
+<tbody>
+<tr><td><code>x86_64-unknown-linux-gnu</code></td><td><code>+avx2,+fma</code></td><td>호스트 PC</td></tr>
+<tr><td><code>aarch64-linux-android</code></td><td><code>+neon,+dotprod,+fhm,+fp16</code> + <code>link-arg=-Wl,--allow-shlib-undefined</code> + <code>-L libs/aarch64</code></td><td>Galaxy S25 등 Cortex-A/X</td></tr>
+<tr><td><code>aarch64-unknown-linux-gnu</code></td><td><code>+neon,+fp16</code> (dotprod/fhm 없음)</td><td>Jetson Xavier(Carmel ARMv8.2) 호환 범용</td></tr>
+<tr><td><code>aarch64-unknown-linux-musl</code></td><td><code>+neon,+fp16</code>, musl 정적 링킹</td><td>glibc 2.31(Ubuntu 20.04) 호환용</td></tr>
+</tbody>
+</table>
+<p>같은 aarch64라도 Android 타겟만 <code>dotprod</code>/<code>fhm</code>을 켠다. dotprod 의존 NEON 경로를 추가할 때 Jetson 타겟에서는 해당 intrinsic이 빌드 플래그에 없으므로, SIMD 코드는 <code>target_feature</code> cfg를 타겟별로 확인해야 한다.</p>
+<p class="evidence">근거: <code>.cargo/config.toml</code> (4개 target 섹션)</p>
+</section>
+
+<section>
+<h2>11.3 Feature flags</h2>
+
+<p><code>engine/Cargo.toml</code>의 feature 정의(발췌):</p>
+<pre><code>[features]
+default = ["opencl", "profile"]
+opencl = ["ocl"]
+profile = []
+caote = ["dep:caote"]              # value-aware eviction plugin opt-in
+vulkan = ["ash"]                   # microbench bins 전용 PoC
+qnn = ["bindgen", "dep:qnn_oppkg"] # microbench bin 빌드 전용
+cuda = ["cudarc"]                  # PC / discrete GPU
+cuda-embedded = ["cudarc"]         # Jetson 등 UMA
+htp_fastrpc = []                   # HTP FastRPC PoC
+resilience = ["zbus"]              # Manager IPC (D-Bus)</code></pre>
+
+<table>
+<thead><tr><th>feature</th><th>기본</th><th>역할</th></tr></thead>
+<tbody>
+<tr><td><code>opencl</code></td><td>ON</td><td><code>ocl</code> crate 활성. GPU 없는 호스트에서도 컴파일은 되며, 런타임에 OpenCL 디바이스가 없으면 GPU 경로가 실행되지 않을 뿐이다.</td></tr>
+<tr><td><code>profile</code></td><td>ON</td><td><strong>cargo feature</strong>로서의 profile — <code>qcf_timer!</code>/<code>op_start!</code>/<code>op_record!</code> 등 instrument 매크로의 cfg gate. CLI 플래그 <code>--profile</code>과는 별개다(11.6절).</td></tr>
+<tr><td><code>cuda</code> / <code>cuda-embedded</code></td><td>OFF</td><td><code>cudarc</code> 기반 CUDA backend. <code>opencl</code>과 동시 활성 시 <code>compile_error!</code>로 빌드 차단.</td></tr>
+<tr><td><code>caote</code></td><td>OFF</td><td>technique plugin crate 링크. 미활성 시 <code>--eviction-policy caote</code>는 unknown으로 거부.</td></tr>
+<tr><td><code>qnn</code></td><td>OFF</td><td><code>build.rs</code>가 bindgen으로 QNN SDK 헤더(<code>third_party/qnn_sdk_2.33/include/QNN</code>, <code>QNN_SDK_ROOT</code> env override 가능) 바인딩을 생성. production 코드는 이 feature 불필요 — microbench bin 전용.</td></tr>
+<tr><td><code>vulkan</code></td><td>OFF</td><td><code>ash</code> 활성. microbench bin 전용 PoC.</td></tr>
+<tr><td><code>htp_fastrpc</code></td><td>OFF</td><td>HTP FastRPC PoC backend. <code>libloading</code>은 feature와 무관한 non-optional 코어 의존(.so plugin dlopen 겸용).</td></tr>
+<tr><td><code>resilience</code></td><td>OFF</td><td><code>zbus</code>(D-Bus) 활성. Jetson 디바이스 빌드에서 켠다. <a href="08_resilience_ipc.html">8장</a> 참조.</td></tr>
+</tbody>
+</table>
+
+<p>backend feature 상호배타는 컴파일 타임에 강제된다:</p>
+<pre><code>// engine/src/lib.rs L1-L4
+#[cfg(all(feature = "opencl", feature = "cuda"))]
+compile_error!("Features 'opencl' and 'cuda' are mutually exclusive. Enable only one.");
+#[cfg(all(feature = "opencl", feature = "cuda-embedded"))]
+compile_error!("Features 'opencl' and 'cuda-embedded' are mutually exclusive. ...");</code></pre>
+<p class="evidence">근거: <code>engine/Cargo.toml::[features]</code> (L91–L105), <code>engine/src/lib.rs</code> (L1–L4), <code>engine/build.rs::qnn_bindgen</code></p>
+
+<div class="warn">
+<strong>함정: 호스트 빌드와 디바이스 빌드의 feature 집합이 다르다.</strong> 호스트 기본 빌드는 <code>default = ["opencl", "profile"]</code>이지만, <code>devices.toml</code>의 디바이스 빌드는 <code>default_features = false</code> 후 명시 목록만 켠다 — Galaxy S25는 <code>["opencl", "vulkan", "qnn", "htp_fastrpc"]</code>, Jetson은 <code>["cuda-embedded", "resilience"]</code>. 즉 <strong>디바이스 빌드에는 cargo feature <code>profile</code>이 빠진다</strong>: instrument 매크로(<code>qcf_timer!</code> 등)는 디바이스에서 unit <code>()</code>로 컴파일 제거되고, 호스트에서는 기본 포함이다. "호스트에서 보이던 QCF 타이밍이 디바이스에서 안 나온다"는 버그가 아니라 이 cfg 차이다. 반대로 호스트 기본 측정에는 instrument 오버헤드(작지만 0은 아님)가 항상 섞인다.
+<p class="evidence">근거: <code>devices.toml::[devices.galaxy_s25.build]</code> (L83–L84), <code>[devices.jetson.build]</code> (L115–L116), <code>engine/src/instrument.rs::qcf_timer!</code> (cfg gate, L14–L24)</p>
+</div>
+
+<div class="note">
+<code>synth-q4-format</code> technique crate는 optional이 <strong>아닌</strong> 일반 의존성이다 — <code>--kv-format synth_q4</code>가 production 바이너리에서 동작하도록 force-link되어 있다(Cargo.toml 주석: ADR-0008 D6). plugin crate라고 모두 opt-in feature 뒤에 있는 것은 아니다. 또 <code>example-keep-recent</code>는 dev-dependency로만 링크되어 cross-crate linkme 등록 테스트에 쓰인다.
+<p class="evidence">근거: <code>engine/Cargo.toml</code> dependencies (L14–L18), dev-dependencies (L84)</p>
+</div>
+</section>
+
+<section>
+<h2>11.4 Android 크로스 빌드 — run_device.py</h2>
+
+<p>크로스 빌드의 정식 경로는 <code>scripts/run_device.py</code>다. cargo를 직접 호출하지 않는 이유: NDK 툴체인 env(CC/AR/LINKER)와 디바이스별 feature 집합을 <code>hosts.toml</code> + <code>devices.toml</code>에서 자동 합성하기 때문이다.</p>
+
+<pre><code># 최초 1회: 이 머신의 NDK 위치를 hosts.toml로 등록
+python scripts/device_registry.py bootstrap-host
+
+# 빌드 + 배포 + 실행 (3단계 일괄)
+python scripts/run_device.py -d galaxy_s25 argus_cli --prompt "Hello" -n 128
+python scripts/run_device.py --list-devices
+python scripts/run_device.py -d galaxy_s25 --skip-build argus_cli -b opencl
+# 빌드+배포만 (실행 생략, 추가 bin 동시 빌드)
+python scripts/run_device.py -d galaxy_s25 --skip-exec argus_cli --extra-bin llm_manager</code></pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant U as 개발자
+    participant R as run_device.py
+    participant B as builder.py
+    participant H as hosts.toml
+    participant D as devices.toml
+    participant Dev as 디바이스(adb/ssh)
+    U->>R: -d galaxy_s25 argus_cli [args]
+    R->>D: load_device_config("galaxy_s25")
+    R->>B: build_binary(device, "argus_cli")
+    B->>H: detect_current_host + toolchain "android-ndk"
+    B->>B: CC_* / CXX_* / AR_* / CARGO_TARGET_*_LINKER env 합성
+    B->>B: cargo build --release --features ... --no-default-features --target aarch64-linux-android
+    R->>Dev: deploy_binary (work_dir로 push)
+    R->>Dev: verify_model (inference bin이면 model_dir 검증)
+    R->>Dev: execute (--model-path 자동 주입, LD_LIBRARY_PATH=lib_dir)
+    Dev-->>U: stdout / stderr 중계
+</pre>
+
+<h3>11.4.1 NDK env 합성 메커니즘 (builder.py)</h3>
+<p><code>_compose_toolchain_env()</code>가 <code>hosts.toml</code>의 toolchain 엔트리(<code>ndk_home</code> + <code>host_tag</code> + <code>api_level</code>)에서 다음 env를 만든다. 타겟 triple <code>aarch64-linux-android</code>, API 21 기준:</p>
+<pre><code>CC_aarch64_linux_android  = {ndk_home}/toolchains/llvm/prebuilt/{host_tag}/bin/aarch64-linux-android21-clang
+CXX_aarch64_linux_android = ...21-clang++
+AR_aarch64_linux_android  = .../llvm-ar
+CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = (clang과 동일)</code></pre>
+<p>clang 바이너리가 없으면 <code>ToolchainNotFoundError</code>로 즉시 실패한다 — env가 잘못 잡힌 채 빌드가 절반쯤 진행되는 일이 없다. env 합성은 <code>os.environ</code> 사본 위에서 이루어지며 셸 환경을 오염시키지 않는다. 호스트 선택 우선순위는 <code>LLM_RS2_HOST</code> env override → env_marker+uname → uname → <code>default_host</code> → 에러 순이다(hosts.toml.example 헤더에 명시). <code>hosts.toml</code>은 gitignore되어 있고 각자 <code>bootstrap-host</code>로 생성한다.</p>
+<p>Jetson은 NDK 대신 <code>zig_target = "aarch64-unknown-linux-gnu.2.31"</code>이 설정되어 <code>cargo zigbuild</code>로 분기한다 — zig가 glibc 2.31 타겟 링킹을 처리하므로 toolchain env 합성을 건너뛴다.</p>
+<p class="evidence">근거: <code>scripts/device_registry/builder.py::_compose_toolchain_env</code> (L20–L87), <code>::build_binary</code> (L90–L195, zigbuild 분기 L113–L117·L163–L175), <code>hosts.toml.example</code></p>
+
+<h3>11.4.2 배포·실행 단계</h3>
+<p><code>run_device.py</code>는 build → deploy → execute 3단계를 수행하며 각각 <code>--skip-build</code>/<code>--skip-deploy</code>/<code>--skip-exec</code>로 생략 가능하다. 실행 단계의 자동 처리 두 가지:</p>
+<ul>
+<li>바이너리가 <code>_INFERENCE_BINARIES = ("argus_cli", "legacy_generate", "generate")</code>에 속하고 <code>--model-path</code>가 인자에 없으면 <code>devices.toml</code>의 <code>model_dir</code>를 자동 주입한다 (예: S25 → <code>/data/local/tmp/models/qwen2.5-1.5b</code>).</li>
+<li><code>paths.lib_dir</code>가 설정된 디바이스는 <code>LD_LIBRARY_PATH</code>를 그 값으로 설정해 실행한다 (S25는 <code>/data/local/tmp</code> — <code>libcdsprpc.so</code> 등 rpcmem 의존 .so 탐색용).</li>
+</ul>
+<p class="evidence">근거: <code>scripts/run_device.py::main</code> (L52–L174, model-path 주입 L146–L152, LD_LIBRARY_PATH L156–L158)</p>
+
+<div class="warn">
+<strong>실측 교훈 (CLAUDE.md, 코드로 확인 불가한 운영 지식):</strong> Adreno 디바이스 권장 backend는 <code>opencl --opencl-rpcmem</code>이며, <code>--tokenizer-path</code> 명시가 필수다 — 자동 fallback이 sibling 모델의 tokenizer를 잡으면 vocab-size mismatch로 차단된다. Galaxy S25 벤치는 6 스레드만 사용한다(8T는 역효과). 테스트 기본 모델 포맷은 GGUF다.
+</div>
+</section>
+
+<section>
+<h2>11.5 테스트 계층</h2>
+
+<pre class="mermaid">
+flowchart TB
+    subgraph T1["계층 1 — 호스트 자동 테스트 (cargo test --workspace)"]
+        U["unit test\n각 모듈 #cfg(test)"]
+        I["integration test\nengine/tests/*.rs"]
+        S["spec 불변식 테스트\nengine/tests/spec.rs 하네스\nINV-xxx / ENG-ALG-xxx + trybuild compile_fail"]
+    end
+    subgraph T2["계층 2 — backend 정확성"]
+        TB["test_backend\nCPU(scalar/NEON/AVX2) vs OpenCL\nop별 수치 비교"]
+    end
+    subgraph T3["계층 3 — 디바이스 e2e"]
+        E2E["run_device.py -d galaxy_s25 argus_cli\n실모델 추론 + TTFT/TBT"]
+    end
+    T1 --> T2 --> T3
+</pre>
+
+<h3>11.5.1 계층 1: cargo test</h3>
+<p><code>cargo test --workspace</code>가 모듈 내 unit test와 <code>engine/tests/</code>의 integration test를 모두 돈다. integration test에는 flash attention 수치 검증(<code>flash_attn_decode.rs</code>, <code>flash_attn_prefill_dk128.rs</code> 등), AUF/GGUF byte-equivalence(<code>test_auf_gguf_byte_equivalence.rs</code>), plugin dlopen 게이트(<code>gate_c_backend_cap_dlopen.rs</code>) 등이 있다. 특이 구조 하나: spec 불변식 테스트는 <code>engine/tests/spec.rs</code>가 <code>#[path = "spec/..."]</code>로 서브 파일들을 끌어모으는 단일 하네스다 — INV 번호(<code>test_inv_003.rs</code> 등)와 ENG-ALG 번호별 테스트, 그리고 trybuild 기반 <code>compile_fail</code>/<code>compile_pass</code> 디렉토리(세션 typestate가 컴파일 타임에 잘못된 사용을 거부하는지 검증)가 들어 있다.</p>
+<p class="evidence">근거: <code>engine/tests/spec.rs</code> (path-include 하네스), <code>engine/tests/spec/compile_fail/</code>, <code>engine/Cargo.toml</code> dev-dependencies <code>trybuild</code> (L81)</p>
+
+<h3>11.5.2 계층 2: test_backend — CPU vs GPU 수치 비교</h3>
+<p><code>engine/src/bin/test_backend.rs</code>는 backend 구현들을 같은 입력으로 돌려 결과를 직접 비교하는 정확성 스위트다(CLAUDE.md 기준 "Tier 2"). 구조:</p>
+<ul>
+<li><code>--backends auto,scalar</code> (기본): 비교할 backend 목록을 콤마로 지정. 선택지는 <code>cpu</code>(NEON 등 최적화 CpuBackend), <code>scalar</code>(CpuBackendCommon — 기준 정답), <code>avx2</code>(x86_64 + 런타임 감지 시), <code>opencl</code>.</li>
+<li>검증 op 집합은 <code>OpType</code> enum: <code>MatMul / MatMulTransposed / MatMulSlice / Softmax / RMSNorm / RoPE / KiviAttention</code>. dtype·shape 조합별로 돌려 <code>TestResult { status, error, duration, ... }</code>를 수집한다.</li>
+<li>판정 기준: 일반 op는 <code>diff &gt; 1e-2 → FAIL</code>. KIVI attention은 양자화 비트별 완화 임계(Q2는 더 큰 quantization error를 허용)를 적용한 L2 error로 판정한다.</li>
+</ul>
+<p>OpenCL backend를 고른 경우 KIVI native attention 검증을 위해 동일 ocl 인스턴스에서 파생한 <code>KiviAttentionBackend</code> capability handle을 함께 보관한다 — backend 정확성 테스트가 <a href="05_abstractions.html">capability 표면</a>까지 커버한다는 뜻이다.</p>
+<p>GPU 커널(.cl)이나 NEON 경로를 건드린 PR은 호스트에서 <code>cargo run --release --bin test_backend</code>, 그리고 디바이스에서 <code>python scripts/run_device.py -d galaxy_s25 test_backend</code>로 양쪽 모두 PASS를 확인해야 한다 — 호스트 OpenCL(있다면)과 Adreno 드라이버의 동작이 다른 사례가 반복적으로 있었다.</p>
+<p class="evidence">근거: <code>engine/src/bin/test_backend.rs::OpType</code> (L30–L39), 판정 (L344: <code>diff &gt; 1e-2</code>, L736–L746: KIVI bits별 threshold), KIVI capability handle (L69–L99)</p>
+
+<h3>11.5.3 계층 3: 디바이스 e2e</h3>
+<p>실모델 추론은 <code>argus_cli</code>(단일 프롬프트 happy path 전용)로 돌린다. <code>argus_cli</code>는 미지원 조합을 침묵 fallback 없이 <code>bail!</code>로 즉시 거부한다 — chat/ppl/eval/weight-swap/KIVI/tensor-partition/profile은 전부 reject 대상이다. 거부 메시지에 향후 이관처(argus-chat/argus-bench/argus-eval)가 명시된다. e2e 판정에 쓰는 출력은 표준출력의 <code>TTFT</code>, <code>Decode: X ms/tok</code>, <code>Avg TBT</code> 라인(11.6절)과 stderr의 <code>[DecodeLoop] kv storage = typed|OPAQUE</code> 같은 경로 증거 라인이다.</p>
+<p class="evidence">근거: <code>engine/src/bin/argus_cli.rs::reject_unsupported_modes_v0</code> (L49–L98), <code>engine/src/session/assembly/build_standard_loop.rs</code> (L104–L114 kv storage 로그)</p>
+
+<div class="note">
+eviction e2e를 검증할 때는 긴 프롬프트(약 300 토큰 이상)가 필요하다 — 짧은 프롬프트는 min-cache floor에 막혀 eviction이 no-op이 된다(자세한 동작은 <a href="07_kv_cache.html">7장</a>).
+</div>
+</section>
+
+<section>
+<h2>11.6 성능 측정 — 함정과 원칙</h2>
+
+<h3>11.6.1 원칙: production 수치는 wall-clock</h3>
+<p>TBT(token-by-token latency)의 정본은 decode 루프를 감싼 <code>std::time::Instant</code> wall-clock이다. <code>run_standard_happy_path()</code>가 prefill과 decode를 따로 감아 다음을 출력한다:</p>
+<pre><code>let t_decode = std::time::Instant::now();
+let result = decode_loop.run(args.num_tokens - 1, first_token)?;
+let decode_total_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+...
+println!("TTFT: {:.2} ms", prefill_ms);
+println!("Decode: {:.2} ms/tok ({:.1} tok/s) [{} tokens]", ...);
+println!("Avg TBT: {:.2} ms ({:.1} tokens/sec)", ...);</code></pre>
+<p>성능 비교(특히 llama.cpp 등 타 엔진과의 비교)는 항상 이 라인을 쓴다. 장기 실행 중 throughput은 resilience executor가 heartbeat에 싣는 <code>actual_throughput</code>(EMA)으로도 관찰할 수 있다.</p>
+<p class="evidence">근거: <code>engine/src/session/standard_happy.rs::run_standard_happy_path</code> (L82–L131), <code>engine/src/resilience/executor.rs</code> (L601 <code>actual_throughput: self.throughput_ema</code>)</p>
+
+<h3>11.6.2 왜 per-op 프로파일링은 절대값을 부풀리는가</h3>
+<p>GPU backend에서 op 단위 시간을 host 쪽 시계로 재려면 op 경계마다 <code>backend.synchronize()</code>(OpenCL에선 <code>clFinish</code>)로 큐를 비워야 한다. 그렇지 않으면 enqueue만 측정되고 실제 커널 실행은 비동기로 흘러가 버리기 때문이다. 문제는 이 sync 자체가 비싸다는 것: production decode는 토큰당 수백 개 커널을 sync 없이 흘려보내는데, op마다 큐를 드레인하면 파이프라이닝이 깨진다. 코드의 자기 서술이 가장 정확하다:</p>
+<pre><code>// engine/src/backend/opencl.rs L646-L649 (new_with_profile_events doc)
+/// This is the replacement for the legacy `--profile` mode, which
+/// inserted two `clFinish()` calls per op and inflated decode ms/tok
+/// by ~54 ms on Adreno. Event-based measurement has near-zero CPU
+/// overhead because profiling info is collected by the GPU itself.</code></pre>
+<pre><code>// engine/src/session/cli.rs L359-L366 (--profile flag doc)
+/// Legacy mode: inserts two `clFinish()` calls per op on GPU, which
+/// inflates decode ms/tok by ~54 ms on Adreno. Useful for **relative**
+/// per-op ranking only.</code></pre>
+<p>즉 <code>--profile</code>류 측정의 per-op breakdown은 "어느 op이 상대적으로 큰가"에만 유효하고, 그 합이나 ms/tok 절대값은 sync 오버헤드(~54 ms/tok, Adreno 실측)로 부풀려져 있다.</p>
+<p class="evidence">근거: <code>engine/src/backend/opencl.rs::new_with_profile_events</code> doc (L637–L649), <code>engine/src/session/cli.rs::Args.profile</code> doc (L359–L366), <code>engine/src/session/init.rs</code> (L156–L166 상호배타 검증 주석: "--profile: CPU wall clock + per-op clFinish (adds ~54 ms/tok)")</p>
+
+<h3>11.6.3 --profile이 plan 경로를 끄는 구조</h3>
+<p>두 번째 왜곡 요인은 plan 경로 이탈이다. OpenCL decode의 정상 경로는 <code>FullKernelPlan</code> — 정적 커널 인자(weight, workspace, 차원)를 plan 빌드 시점에 미리 바인딩해 두고 토큰마다 동적 스칼라(<code>start_pos</code>, <code>cache_seq_len</code>, <code>write_pos</code>)만 갱신하는, llama.cpp식 tight enqueue 루프다. per-op 계측은 이 pre-bound 루프와 양립하지 않으므로, <code>--profile</code>이 켜지면 happy path 가드에서 탈락하고 plan을 못 탄다:</p>
+<pre><code>// engine/src/session/assembly/build_standard_loop.rs L60-L71
+pub fn is_standard_happy_path(args: &amp;Args) -&gt; bool {
+    args.qcf_dump.is_none()
+        &amp;&amp; args.skip_ratio.unwrap_or(0.0) == 0.0
+        &amp;&amp; !args.d2o_layer_alloc()
+        &amp;&amp; !args.profile          // ← profile 활성 시 happy path(=plan 경로) 탈락
+        &amp;&amp; !args.profile_events
+        &amp;&amp; args.eviction_policy() == "none"
+        &amp;&amp; args.tensor_partition == 0.0
+        ...</code></pre>
+<p>plan 경로 자체의 게이트는 <code>ModelForward::try_build_plan()</code>에 있다: <code>plan_enabled</code>(= <code>!args.no_gpu_plan</code>) → <code>sticky_disabled</code>(한 번 build 실패 시 lock-out) → <code>backend.name() == "OpenCL"</code> → Gemma3 제외, 4중 분기를 통과해야 plan이 빌드된다. plan에서 떨어지면 매 토큰 <code>forward_into()</code> fallback으로 돌므로 per-dispatch CPU 오버헤드가 더해진다. 따라서 profile 켠 측정은 (a) op마다 sync 비용, (b) plan 미사용 비용이 이중으로 합산된 수치다.</p>
+<p class="evidence">근거: <code>engine/src/session/assembly/build_standard_loop.rs::is_standard_happy_path</code> (L60–L71), <code>engine/src/session/forward/model_forward.rs::try_build_plan</code> (L164–L218), <code>engine/src/backend/opencl/plan.rs</code> 모듈 doc (L1–L8)</p>
+
+<pre class="mermaid">
+flowchart TB
+    Q{"무엇을 알고 싶은가"}
+    Q -->|"production TBT / 엔진 간 비교"| W["wall-clock: 'Decode: X ms/tok' 라인\n플래그 없이 release 빌드"]
+    Q -->|"GPU per-op 절대 시간"| PE["--profile-events\nCL_QUEUE_PROFILING_ENABLE\nGPU가 event timestamp 수집"]
+    Q -->|"host dispatch 오버헤드"| TA["LLMRS_FORWARD_GEN_OP_TRACE=async\nsync 없음, enqueue 비용만"]
+    Q -->|"op별 GPU latency 상한 (상대 비교)"| TS["LLMRS_FORWARD_GEN_OP_TRACE=sync\nop-bucket 끝마다 synchronize 1회"]
+    PE -.->|"주의: queue profiling의\ndriver별 wall-clock 패널티"| W
+    TS -.->|"절대값은 sync drain으로 부풀려짐"| W
+</pre>
+
+<h3>11.6.4 현재 코드에서 --profile의 실제 상태</h3>
+<div class="warn">
+<strong>현재 트리에는 <code>--profile</code>을 실행하는 바이너리가 없다.</strong> 플래그 정의(<code>cli.rs</code>)와 <code>--profile</code>/<code>--profile-events</code> 상호배타 검증(<code>init.rs</code>)은 남아 있지만, 이 경로를 실제로 구동하던 monolith <code>legacy_generate</code>는 커밋 <code>d5ed71d2</code>("5-F F1 — legacy_generate bin + engine/legacy/generate.rs 폐기")에서 제거되었다. 현행 바이너리는 전부 거부한다: <code>argus_cli</code>는 <code>"--profile / --profile-events not yet supported (planned for v1)"</code>로 bail, <code>argus_bench</code>도 동일하게 차단. 따라서 "<code>--profile</code>이 plan을 끄고 op마다 sync 2회를 넣는다"는 운영 지침(CLAUDE.md)은 <strong>폐기된 legacy 경로의 동작 설명</strong>이며, 메커니즘(왜 부풀려지는가)은 여전히 유효하지만 지금 그 플래그로 측정 자체를 할 수 없다. 현행 계측 수단은 아래 11.6.5의 도구들이다.
+<p class="evidence">근거: <code>engine/src/bin/argus_cli.rs::reject_unsupported_modes_v0</code> (L91–L93), <code>engine/src/bin/argus_bench.rs</code> (L116–L117), git log <code>d5ed71d2</code>, <code>engine/src/bin/</code> 디렉토리 (legacy_generate 부재)</p>
+</div>
+
+<h3>11.6.5 현행 계측 도구 카탈로그</h3>
+<table>
+<thead><tr><th>도구</th><th>활성화</th><th>메커니즘</th><th>오버헤드 / 용도</th></tr></thead>
+<tbody>
+<tr>
+<td>wall-clock 라인</td>
+<td>항상 (플래그 불필요)</td>
+<td><code>Instant</code>로 prefill/decode 전체를 감쌈</td>
+<td>0. <strong>production TBT의 정본.</strong></td>
+</tr>
+<tr>
+<td><code>--profile-events</code></td>
+<td>CLI (현행 bin에선 reject — v1 예정)</td>
+<td>큐를 <code>CL_QUEUE_PROFILING_ENABLE</code>로 생성, <code>enqueue_kernel_labeled()</code>가 dispatch마다 event+label 기록, decode step 경계에서 <code>End - Start</code> ns를 label별 집계</td>
+<td>clFinish 추가 없음, per-op 절대 GPU 시간에 근접. 단 아래 경고 참조.</td>
+</tr>
+<tr>
+<td><code>--heartbeat-gpu-profile</code></td>
+<td>CLI</td>
+<td><code>--profile-events</code>와 동일 인프라 공유 (<code>args.profile_events || args.heartbeat_gpu_profile</code>로 큐 생성)</td>
+<td>heartbeat <code>self_gpu_pct</code> 산출용. doc 명시: production TBT 측정 시 OFF 유지.</td>
+</tr>
+<tr>
+<td><code>LLMRS_FORWARD_GEN_OP_TRACE=async</code></td>
+<td>env var</td>
+<td>op-bucket별 host wall-clock, sync 삽입 없음 — <code>clEnqueue*</code> + host 준비 비용만 측정</td>
+<td>host dispatch 오버헤드 분석. thread-local 누적, 미설정 시 bool load 1회로 zero-cost.</td>
+</tr>
+<tr>
+<td><code>LLMRS_FORWARD_GEN_OP_TRACE=sync</code></td>
+<td>env var</td>
+<td>op-bucket 끝에서 <code>backend.synchronize()</code> <strong>1회</strong> 후 elapsed 기록 (<code>is_gpu</code>일 때만)</td>
+<td>op별 GPU latency 상한. wall-clock은 sync drain으로 부풀려짐 — 상대 비교 전용. <code>LLMRS_FORWARD_GEN_OP_TRACE_PATH</code>로 JSON 덤프.</td>
+</tr>
+<tr>
+<td><code>LLMRS_OP_TRACE</code></td>
+<td>env var</td>
+<td>plan 실행 내부에서 label을 <code>{op}@enqueue</code>(CPU 제출)와 <code>{op}@gpu</code>(clFinish 대기)로 분리 집계</td>
+<td>n_kv에 대한 기울기가 enqueue 측인지 GPU 측인지 분리 진단.</td>
+</tr>
+<tr>
+<td><code>LLMRS_FWD_TRACE=1</code></td>
+<td>env var</td>
+<td>plan 빌드 진입/거부/실패를 stderr 로그 (<code>skip: plan_enabled=false</code>, <code>build_plan returned None → sticky lock</code> 등)</td>
+<td>"왜 plan을 안 타지?" 진단. 측정 오버헤드 무관.</td>
+</tr>
+<tr>
+<td>cargo feature <code>profile</code></td>
+<td>빌드 타임</td>
+<td><code>qcf_timer!</code> 등 QCF/op-span 매크로 cfg gate</td>
+<td>host 기본 ON / 디바이스 빌드 OFF (11.3절 warn 참조).</td>
+</tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/observability/profile/op_trace.rs</code> (TraceMode L74–L80, record의 sync 분기 L222–L226, JSON 덤프 L296–L324), <code>engine/src/backend/opencl.rs::new_with_profile_events</code> (L650, queue_props L735–L740), <code>engine/src/session/init.rs</code> (L210–L214), <code>engine/src/backend/opencl/plan.rs</code> thread_local <code>OP_TRACE_ACC</code> (L23–L31), <code>engine/src/session/forward/model_forward.rs</code> (L166–L216)</p>
+
+<div class="warn">
+<strong>실측 교훈 + 코드 내 상충 서술: <code>CL_QUEUE_PROFILING_ENABLE</code>도 공짜가 아니다.</strong> <code>--profile-events</code>의 doc은 "no clFinish, closely matches absolute GPU time"이라 하지만, 같은 파일의 <code>--heartbeat-gpu-profile</code> doc(동일 큐 profiling 인프라)은 "on Adreno, queue profiling adds ~54 ms/token. Keep OFF for production TBT measurements"라고 경고한다. CLAUDE.md의 Adreno 실측 교훈도 같은 결론이다: <code>CL_QUEUE_PROFILING_ENABLE</code>은 driver-specific 패널티가 있어 <strong>엔진 간 비교는 항상 wall-clock</strong>으로 한다. 정리하면 — event 기반 per-op 수치는 "각 커널의 GPU 실행 시간"으로는 신뢰 가능하지만, 그 측정이 켜진 run의 wall-clock TBT는 production 수치로 쓰면 안 된다.
+<p class="evidence">근거: <code>engine/src/session/cli.rs</code> (L368–L379 vs L388–L390 — 두 doc의 오버헤드 서술 상충), CLAUDE.md 핵심 제약사항(실측 교훈)</p>
+</div>
+</section>
+
+<section>
+<h2>11.7 PR 전 최소 체크</h2>
+<ol>
+<li><code>cargo fmt --all</code> + <code>cargo clippy --workspace -- -D warnings</code> + <code>cargo test --workspace</code> 통과 (<code>/sanity-check</code>).</li>
+<li>backend/커널/SIMD 변경 시: <code>test_backend</code> 호스트 + 디바이스 PASS.</li>
+<li>디바이스 영향 변경 시: <code>run_device.py -d galaxy_s25 argus_cli</code>로 e2e 1회, <code>Decode: X ms/tok</code> 라인으로 회귀 확인 — 계측 플래그·env 전부 OFF 상태에서.</li>
+<li>성능 주장에는 측정 조건(빌드 feature, 디바이스, 스레드 수, 계측 on/off) 명시 — per-op 수치를 절대값으로 인용하지 않는다.</li>
+</ol>
+<p>코드 스타일·커밋 컨벤션·리뷰 관점의 전체 체크리스트는 <a href="12_review_checklist.html">12장</a>에 있다.</p>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="10_howto_extend.html">← 10. 확장 How-to</a></span><span><a href="12_review_checklist.html">12. 컨벤션 &amp; 리뷰 체크리스트 →</a></span></footer>
+</body>
+</html>

@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06. 메모리 &amp; 데이터 포맷 — llm.rs Engine Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</head>
+<body>
+<nav class="topnav"><a href="index.html">← 목차</a> <span class="chapter-no">Chapter 06</span></nav>
+<header>
+<h1>06. 메모리 &amp; 데이터 포맷</h1>
+<p class="meta">기준 커밋: <code>46ee4c2d</code> · 작성일: 2026-06-10 · llm.rs Engine Guide</p>
+</header>
+<main>
+
+<section>
+<h2>0. 이 챕터에서 다루는 것</h2>
+<p>
+이 챕터는 데이터가 <em>어디에 어떤 바이트로 놓이는가</em>를 다룬다. 구체적으로 네 층이다:
+(1) 바이트 컨테이너 추상화인 <code>Buffer</code> trait과 그 구현 카탈로그(<code>buffer/</code>, <code>memory/</code>),
+(2) CPU↔GPU zero-copy 전략 두 갈래(<code>CL_MEM_ALLOC_HOST_PTR</code> 기반 <code>UnifiedBuffer</code> vs rpcmem DMA-BUF + <code>CL_MEM_USE_HOST_PTR</code> alias),
+(3) Q4_0/Q8_0 등 quantization 블록의 바이트 레이아웃과 quant/dequant 함수 경로,
+(4) 모델 가중치가 디스크에서 메모리로 들어오는 mmap 경로(GGUF / AUF / Safetensors).
+KV 캐시의 <em>구조와 관리 정책</em>은 <a href="07_kv_cache.html">07장</a>, 연산 dispatch는 <a href="09_backends.html">09장</a> 담당이고,
+여기서는 그들이 딛고 서는 저장 계층만 본다.
+</p>
+
+<pre class="mermaid">
+flowchart TB
+    subgraph DISK["디스크"]
+        GGUF[".gguf 파일"]
+        AUF[".auf 파일"]
+        ST[".safetensors 파일"]
+    end
+    subgraph ALLOC["Memory trait (allocator)"]
+        GAL["Galloc (heap Vec)"]
+        OCLM["OpenCLMemory"]
+        RPA["RpcmemAllocator (libcdsprpc.so)"]
+    end
+    subgraph BUF["Buffer trait (바이트 컨테이너)"]
+        MMB["MmapBuffer / AufViewBuffer (mmap view)"]
+        SHB["SharedBuffer (heap)"]
+        UB["UnifiedBuffer (ALLOC_HOST_PTR)"]
+        OCLB["OpenCLBuffer (device-only)"]
+        RKB["RpcmemKvBuffer (DMA-BUF alias)"]
+        OPQ["OpaqueBuffer (U8 + descriptor)"]
+    end
+    subgraph CONSUMER["소비자"]
+        TEN["Tensor = Shape + Buffer + Backend"]
+        W["weight tensor"]
+        KV["KV cache"]
+    end
+    GGUF -- "mmap zero-copy" --> MMB
+    AUF -- "mmap zero-copy" --> MMB
+    ST -- "quantize_q4_0 후 복사" --> SHB
+    GAL --> SHB
+    OCLM --> UB
+    OCLM --> OCLB
+    RPA --> RKB
+    MMB --> TEN
+    SHB --> TEN
+    UB --> TEN
+    OCLB --> TEN
+    RKB --> TEN
+    OPQ --> TEN
+    TEN --> W
+    TEN --> KV
+</pre>
+</section>
+
+<section>
+<h2>1. 바이트 표면: <code>Buffer</code> trait과 <code>DType</code></h2>
+
+<h3>1.1 Buffer trait 계약</h3>
+<p>
+<code>engine/src/buffer.rs</code>의 <code>Buffer</code> trait이 엔진 전체의 물리 메모리 표면이다.
+핵심 계약은 "한 덩어리의 바이트를 CPU 포인터와 (선택적으로) GPU 핸들 양쪽으로 노출한다"는 것:
+</p>
+<pre><code>pub trait Buffer: Send + Sync {
+    fn as_any(&amp;self) -&gt; &amp;dyn Any;          // downcast 표면 (OpaqueBuffer 식별 등)
+    fn dtype(&amp;self) -&gt; DType;
+    fn size(&amp;self) -&gt; usize;                // 총 바이트
+    fn as_ptr(&amp;self) -&gt; *const u8;          // CPU 읽기 포인터 (없으면 null)
+    fn as_mut_ptr(&amp;self) -&gt; *mut u8;        // &amp;self → *mut: 내부 가변성 전제
+    fn cl_mem(&amp;self) -&gt; Option&lt;&amp;Mem&gt;;       // OpenCL 핸들 (CPU 전용이면 None)
+    fn sync_device(&amp;self) -&gt; Result&lt;()&gt;;
+    // zero-copy 상태 기계 (기본 구현 = no-op)
+    fn map_for_cpu(&amp;self) -&gt; Result&lt;()&gt; { Ok(()) }
+    fn unmap_for_gpu(&amp;self) -&gt; Result&lt;()&gt; { Ok(()) }
+    fn is_mapped(&amp;self) -&gt; bool { true }
+    fn is_host_managed(&amp;self) -&gt; bool { true }  // madvise 유효 여부
+    fn is_gpu_buffer(&amp;self) -&gt; bool { false }
+}</code></pre>
+<p>
+주의할 계약 세부 두 가지. 첫째, <code>as_mut_ptr(&amp;self)</code>는 <code>&amp;self</code>에서 <code>*mut u8</code>을 내준다 —
+구현체들은 <code>Arc</code>로 공유되고 호출자가 동기화를 책임지는 구조이며, 읽기 전용 구현(<code>MmapBuffer</code>,
+<code>RpcmemAliasBuffer</code>)도 진단·주소 식별 목적으로 같은 포인터를 반환하되 "쓰기는 계약상 금지"라고 주석에 명시한다
+(<code>AufViewBuffer</code>만 <code>null_mut()</code> 반환). 둘째, <code>is_host_managed()</code>는 madvise가 효과 있는
+앱 관리 메모리인지를 나타낸다 — heap/mmap은 true, driver-pinned <code>UnifiedBuffer</code>와 device-only
+<code>OpenCLBuffer</code>는 false.
+</p>
+<p class="evidence">근거: <code>engine/src/buffer.rs::Buffer</code> (trait, L50–108), <code>engine/src/memory/host/mmap.rs::MmapBuffer::as_mut_ptr</code> (L102), <code>engine/src/buffer/auf_view_buffer.rs::AufViewBuffer::as_mut_ptr</code> (L79)</p>
+
+<h3>1.2 DType과 <code>size()</code> 함정</h3>
+<pre><code>pub enum DType { Q4_0, Q4_1, Q8_0, F16, BF16, F32, U8 }
+
+impl DType {
+    pub fn size(&amp;self) -&gt; usize {
+        match self {
+            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 =&gt; 1, // block quantized — 별도 처리
+            DType::F16 | DType::BF16 =&gt; 2,
+            DType::F32 =&gt; 4,
+            DType::U8 =&gt; 1,
+        }
+    }
+}</code></pre>
+<div class="warn">
+<strong>함정: quant dtype의 <code>DType::size()</code>는 1을 반환한다.</strong>
+Q4_0의 실제 비용은 element당 0.5625B(블록당 18B/32원소)인데 <code>size()</code>는 1이다.
+즉 <code>numel × dtype.size()</code>식 바이트 회계는 quant dtype에서 항상 틀린다. 코드베이스의 올바른 패턴은
+dtype별 match로 블록 수를 계산하는 것 —
+<code>(n_values / QK4_0) * size_of::&lt;BlockQ4_0&gt;()</code> (예: <code>kv_cache.rs::shrink_to_fit</code> L393,
+<code>standard_format.rs</code> L284). PR 리뷰에서 quant dtype에 <code>dtype.size()</code>를 곱하는 새 코드를 보면 의심하라.
+</div>
+<p class="evidence">근거: <code>engine/src/buffer.rs::DType::size</code> (L37–45), <code>engine/src/pressure/kv_cache.rs::shrink_to_fit</code> (L392–397)</p>
+
+<h3>1.3 Tensor: Buffer에 형상과 실행 위치를 태깅</h3>
+<p>
+<code>Tensor</code>는 <code>Shape + Arc&lt;dyn Buffer&gt; + Arc&lt;dyn Backend&gt;</code> 3요소 결합이다.
+텐서가 자기 backend 핸들을 들고 다니므로 "이 데이터를 어디서 연산할지"를 storage에서 직접 얻는다.
+<code>Tensor::dtype()</code>·<code>size()</code>는 buffer로 위임이고, <code>as_slice::&lt;T&gt;()</code>는
+<code>size() / size_of::&lt;T&gt;()</code>개의 T로 raw 재해석한다 — Q4_0 버퍼에 <code>as_slice::&lt;BlockQ4_0&gt;()</code>를
+쓰는 것이 합법인 이유이자, 잘못된 T를 주면 조용히 garbage가 되는 이유다.
+</p>
+<p class="evidence">근거: <code>engine/src/tensor.rs::Tensor</code> (struct, L8–12; <code>as_slice</code> L56)</p>
+</section>
+
+<section>
+<h2>2. 버퍼 구현 카탈로그와 소유 구조</h2>
+<p>
+모듈 배치 규칙: <code>buffer/</code>에는 자원 비종속 generic view(<code>SliceBuffer</code>, <code>OpaqueBuffer</code>,
+<code>AufViewBuffer</code>)가, <code>memory/</code>에는 물리 자원별 allocator + 그 자원에 묶인 buffer 구현이 산다
+(<code>host/</code>, <code>opencl/</code>, <code>cuda/</code>, <code>rpcmem/</code>, <code>galloc</code>, <code>secondary</code>).
+예외 하나: <code>HostPtrPoolBuffer</code>는 <code>backend/opencl/host_ptr_pool_buffer.rs</code>에 있다 —
+pool guard 타입과의 cross-layer import를 피하기 위한 의도적 배치다.
+</p>
+<p class="evidence">근거: <code>engine/src/buffer.rs</code> (module doc L1–10), <code>engine/src/memory.rs</code> (module doc L1–15), <code>engine/src/memory/opencl.rs</code> (module doc L8–10)</p>
+
+<table>
+<thead><tr><th>구현</th><th>파일</th><th>backing 소유</th><th><code>as_ptr</code></th><th><code>cl_mem</code></th><th>용도</th></tr></thead>
+<tbody>
+<tr><td><code>SharedBuffer</code></td><td><code>memory/host/shared.rs</code></td><td><code>Vec&lt;u8&gt;</code> 소유</td><td>유효</td><td>None</td><td>CPU heap 범용 (Galloc 산출물)</td></tr>
+<tr><td><code>SharedBufferView</code></td><td><code>memory/host/shared.rs</code></td><td><code>Arc&lt;SharedBuffer&gt;</code> 보유</td><td>유효(view)</td><td>None</td><td>KiviCache <code>get_view()</code> zero-copy</td></tr>
+<tr><td><code>MmapBuffer</code></td><td><code>memory/host/mmap.rs</code></td><td><code>Arc&lt;dyn MmapKeepAlive&gt;</code> 보유 (비소유 view)</td><td>유효(read-only)</td><td>None</td><td>GGUF/Safetensors weight zero-copy 로드, secondary swap borrow</td></tr>
+<tr><td><code>AufViewBuffer</code></td><td><code>buffer/auf_view_buffer.rs</code></td><td><code>Arc&lt;AufView&gt;</code> 보유</td><td>유효(read-only)</td><td>None</td><td>AUF weight zero-copy 로드</td></tr>
+<tr><td><code>SliceBuffer</code></td><td><code>buffer/slice.rs</code></td><td><code>Arc&lt;dyn Buffer&gt;</code> 부모 보유</td><td>부모+offset</td><td><strong>None (항상)</strong></td><td>CPU 경로 byte-range view</td></tr>
+<tr><td><code>OpaqueBuffer</code></td><td><code>buffer/opaque.rs</code></td><td>inner <code>Arc&lt;dyn Buffer&gt;</code> 위임</td><td>inner 위임</td><td>inner 위임</td><td>동적 <code>.so</code> KV format (U8 태그 + descriptor sidecar)</td></tr>
+<tr><td><code>OpenCLBuffer</code></td><td><code>memory/opencl/device.rs</code></td><td><code>OclBuffer&lt;u8&gt;</code> 소유</td><td><strong>null</strong></td><td>Some</td><td>discrete GPU device-only</td></tr>
+<tr><td><code>UnifiedBuffer</code></td><td><code>memory/opencl/unified.rs</code></td><td><code>OclBuffer</code> (ALLOC_HOST_PTR) 소유</td><td>map 상태에서만 유효</td><td>Some</td><td>UMA zero-copy 시도 경로 (§3.1)</td></tr>
+<tr><td><code>ClSubBuffer</code></td><td><code>memory/opencl/sub.rs</code></td><td>부모 <code>Arc</code> + <code>clCreateSubBuffer</code> 핸들</td><td>부모+offset</td><td>Some(sub)</td><td>GPU에서 쓸 수 있는 sub-range</td></tr>
+<tr><td><code>NoshuffleWeightBuffer</code></td><td><code>memory/opencl/noshuffle.rs</code></td><td>SOA <code>q_buf</code>/<code>d_buf</code>/<code>q_img</code> 3핸들 소유</td><td><strong>null</strong></td><td>Some(<code>d_buf</code>)</td><td>Q4_0 SOA 변환 후 AOS 원본 해제 (§5.3)</td></tr>
+<tr><td><code>RpcmemKvBuffer</code></td><td><code>memory/rpcmem/kv_buffer.rs</code></td><td>rpcmem host_ptr 소유(Drop에서 free) + alias <code>Mem</code></td><td>유효(DMA-BUF)</td><td>Some(alias)</td><td><code>--opencl-rpcmem</code> KV cache (§3.2)</td></tr>
+<tr><td><code>RpcmemAliasBuffer</code></td><td><code>memory/rpcmem/opencl_alias.rs</code></td><td>비소유 — <code>Arc&lt;dyn RpcmemRegionGuard&gt;</code>로 region pin</td><td>유효(read-only)</td><td>Some(alias)</td><td>weight precision swap secondary (§3.2)</td></tr>
+</tbody>
+</table>
+
+<pre class="mermaid">
+classDiagram
+    class Buffer {
+        &lt;&lt;trait&gt;&gt;
+        +dtype() DType
+        +size() usize
+        +as_ptr() *const u8
+        +cl_mem() Option~Mem~
+        +map_for_cpu()
+        +is_host_managed() bool
+        +is_gpu_buffer() bool
+    }
+    class SharedBuffer { Vec~u8~ data }
+    class MmapBuffer { *const u8 ptr ; Arc~dyn MmapKeepAlive~ keep_alive }
+    class SliceBuffer { Arc~dyn Buffer~ inner ; offset ; length }
+    class OpaqueBuffer { Arc~dyn Buffer~ inner ; KVLayoutDesc desc }
+    class UnifiedBuffer { OclBuffer cl_buffer ; Mutex mapped_ptr ; AtomicBool is_mapped }
+    class OpenCLBuffer { OclBuffer buffer }
+    class RpcmemKvBuffer { Mem cl_mem_obj ; Arc~RpcmemAllocator~ allocator ; *mut u8 host_ptr }
+    class RpcmemAliasBuffer { Mem cl_buffer ; Weak~dyn MmapKeepAlive~ ; Arc~dyn RpcmemRegionGuard~ }
+    class NoshuffleWeightBuffer { Mem q_buf ; Mem d_buf ; Option~Mem~ q_img }
+    Buffer <|.. SharedBuffer
+    Buffer <|.. MmapBuffer
+    Buffer <|.. SliceBuffer
+    Buffer <|.. OpaqueBuffer
+    Buffer <|.. UnifiedBuffer
+    Buffer <|.. OpenCLBuffer
+    Buffer <|.. RpcmemKvBuffer
+    Buffer <|.. RpcmemAliasBuffer
+    Buffer <|.. NoshuffleWeightBuffer
+    SliceBuffer o-- Buffer : inner Arc
+    OpaqueBuffer o-- Buffer : inner Arc
+</pre>
+
+<h3>2.1 수명 보증(keep-alive) 패턴</h3>
+<p>
+view형 버퍼들은 일관되게 "raw 포인터 + backing을 살리는 <code>Arc</code> 필드" 패턴을 쓴다.
+<code>MmapBuffer</code>는 직접적인 <code>Arc&lt;memmap2::Mmap&gt;</code> 대신
+marker trait <code>MmapKeepAlive</code>(메서드 0개)를 통해 타입을 지운다 — primary 로드에서는 raw mmap이,
+secondary swap에서는 wrapper <code>SecondaryMmap</code>이 keep-alive로 들어오는데, <code>Arc&lt;dyn Any&gt;</code>와
+달리 opt-in한 타입만 keep-alive 자격을 갖게 제한한다(주석의 INV-143). 같은 취지로
+<code>memory/secondary.rs</code>는 L2 buffer가 L3 concrete 타입(<code>SecondaryMmap</code>,
+<code>RpcmemLayerRegion</code>)을 import하지 않도록 <code>SecondaryMmapBytes</code>(바이트 접근 1개)와
+<code>RpcmemRegionGuard</code>(순수 drop-ordering anchor) 두 trait을 둔다.
+</p>
+<p class="evidence">근거: <code>engine/src/memory/host/mmap.rs::MmapKeepAlive</code> (trait, L15), <code>engine/src/memory/secondary.rs::SecondaryMmapBytes</code>/<code>RpcmemRegionGuard</code> (L35, L46)</p>
+
+<div class="note">
+<code>SliceBuffer</code>는 <code>cl_mem()</code>이 <strong>항상 None</strong>이다 — raw cl_mem 핸들에는 offset을 적용할 수 없기
+때문에 의도적으로 GPU 표면을 닫고 CPU 포인터 fallback을 유도한다. GPU 커널에 sub-range를 넘기려면
+<code>ClSubBuffer</code>(<code>clCreateSubBuffer</code>)를 쓰거나 커널 인자로 byte offset을 넘겨야 한다.
+이 비대칭이 "왜 같은 view인데 두 타입이 있나"의 답이다.
+</div>
+<p class="evidence">근거: <code>engine/src/buffer/slice.rs::SliceBuffer::cl_mem</code> (L77–83), <code>engine/src/memory/opencl/sub.rs::ClSubBuffer::new</code> (L45)</p>
+
+<h3>2.2 Memory trait: allocator 표면</h3>
+<pre><code>pub trait Memory: Send + Sync {
+    fn alloc(&amp;self, size: usize, dtype: DType) -&gt; Result&lt;Arc&lt;dyn Buffer&gt;&gt;;
+    fn alloc_kv(&amp;self, size: usize, dtype: DType) -&gt; Result&lt;Arc&lt;dyn Buffer&gt;&gt; {
+        self.alloc(size, dtype)   // 기본: alloc 위임
+    }
+    fn used_memory(&amp;self) -&gt; usize;
+}</code></pre>
+<p>
+<code>alloc</code>(활성화 텐서 등 범용)과 <code>alloc_kv</code>(KV cache 전용)가 분리된 이유는 §3에서 보듯
+OpenCL 구현이 KV에만 rpcmem·madvise 친화 정책을 적용하기 때문이다. CPU 쪽 구현 <code>Galloc</code>은
+<code>SharedBuffer::new</code> 한 줄이며 <code>used_memory()</code>는 항상 0을 반환한다(추적 미구현 — 주석 명시).
+</p>
+<p class="evidence">근거: <code>engine/src/memory.rs::Memory</code> (trait, L34–46), <code>engine/src/memory/galloc.rs::Galloc</code> (L21–30)</p>
+</section>
+
+<section>
+<h2>3. Zero-copy 전략: 두 갈래와 실측 교훈</h2>
+
+<h3>3.1 갈래 1 — <code>UnifiedBuffer</code> (<code>CL_MEM_ALLOC_HOST_PTR</code>)</h3>
+<p>
+<code>UnifiedBuffer::new</code>는 <code>MEM_READ_WRITE | MEM_ALLOC_HOST_PTR</code>로 driver가 host-visible하게
+할당한 cl_mem을 만들고, <strong>unmapped(GPU 접근 가능) 상태로 시작</strong>한다. CPU가 만지려면
+<code>map()</code>으로 <code>clEnqueueMapBuffer</code>를 타야 하며, 이때 얻은 <code>MemMap</code>을
+<code>std::mem::forget</code>으로 의도적으로 누수시켜 매핑을 유지하고 raw 포인터만 <code>Mutex&lt;*mut u8&gt;</code>에
+보관한다. <code>unmap()</code>은 명시적 clEnqueueUnmapMemObject가 아니라 <code>queue.finish()</code> 후 포인터를
+null로 만들고 <code>is_mapped=false</code>로 내리는 방식이다. <code>as_ptr()</code>/<code>as_mut_ptr()</code>는
+<strong>unmapped 상태에서 null을 반환</strong>한다 — UnifiedBuffer를 받은 CPU 코드가 null 포인터를 만나면
+"map을 안 했다"는 신호다.
+</p>
+<p class="evidence">근거: <code>engine/src/memory/opencl/unified.rs::UnifiedBuffer::new</code> (L50–68), <code>::map</code> (L71–104, <code>mem::forget</code> L94), <code>::as_ptr</code> (L152–160)</p>
+
+<p>
+UnifiedBuffer를 쓸지 device-only <code>OpenCLBuffer</code>를 쓸지는 CLI 플래그가 아니라
+<strong>backend 초기화 시 자동 감지</strong>로 결정된다: <code>CL_DEVICE_HOST_UNIFIED_MEMORY</code>가 true이거나
+디바이스 이름에 adreno/mali/powervr이 포함되면 <code>use_zero_copy=true</code>(UMA 모드),
+env <code>FORCE_DEVICE_ONLY</code>로 강제 비활성화할 수 있다. 따라서 Adreno에서는 활성화 텐서·weight 업로드·KV가
+기본적으로 전부 UnifiedBuffer로 할당된다.
+</p>
+<p class="evidence">근거: <code>engine/src/backend/opencl.rs</code> (UMA 자동 감지, L1487–1503), <code>engine/src/backend/opencl/memory.rs::OpenCLMemory::alloc</code> (L108–164)</p>
+
+<div class="warn">
+<strong>실측 교훈 (Adreno, Galaxy S25 — 코드로는 확인 불가한 운영 지식, CLAUDE.md):</strong>
+<ul>
+<li><code>CL_MEM_ALLOC_HOST_PTR</code>(UnifiedBuffer)는 Adreno에서 <strong>zero-copy 효과가 없다</strong> — driver가 내부 pool에 할당하므로 진짜 zero-copy 원천이 아니다. 진짜 원천은 rpcmem DMA-BUF interop(§3.2)이다.</li>
+<li>다만 Decode TBT 실측에서는 <code>--backend opencl</code> ≈ <code>--backend opencl --opencl-rpcmem</code> ≈ 32 ms/tok (Qwen2.5-1.5B Q4_0, n=3 median)으로 두 경로의 종단 성능이 같았다.</li>
+<li>ARM UMA 캐시 비일관성 때문에 mapped 포인터 직접 접근은 stale cache를 읽을 수 있다 — CPU↔GPU 데이터 교환은 <code>read_buffer</code>/<code>write_buffer</code> 경유가 필수다(tensor partition 경로에서 실측).</li>
+</ul>
+</div>
+
+<h3>3.2 갈래 2 — rpcmem DMA-BUF + <code>CL_MEM_USE_HOST_PTR</code> alias</h3>
+<p>
+<code>--opencl-rpcmem</code> 활성 시(<code>OpenCLBackend::new_with_options(_, true)</code>),
+<code>RpcmemAllocator</code>가 Qualcomm <code>libcdsprpc.so</code>를 dlopen하고 정확히 3개 심볼만 캐싱한다:
+<code>rpcmem_alloc(heap_id, flags, size)</code>, <code>rpcmem_free(ptr)</code>, <code>rpcmem_to_fd(ptr)</code>.
+할당은 <code>RPCMEM_HEAP_ID_SYSTEM=25</code>, <code>RPCMEM_DEFAULT_FLAGS=1</code> 고정이고 size는 ABI 제약상
+<code>i32::MAX</code> 이하여야 한다. 반환된 host_ptr은 DMA-BUF 페이지라 CPU/GPU/DSP가 같은 물리 페이지를 공유하고,
+<code>rpcmem_to_fd</code>로 fd도 뽑아 보관한다(현 production 경로는 cl_mem alias만 사용, fd는 future graph 주입용).
+호스트(non-Android) 빌드에서 <code>new()</code>는 즉시 Err — backend가 받아서 rpcmem을 끄고 경고 1회 출력한다.
+</p>
+<p class="evidence">근거: <code>engine/src/memory/rpcmem/allocator.rs::RpcmemAllocator::new</code> (L96–136), <code>::alloc</code> (L176–213), 상수 L43–45</p>
+
+<p>
+KV cache 할당 경로 <code>OpenCLMemory::alloc_kv_rpcmem</code>은 rpcmem 영역 위에
+<code>clCreateBuffer(CL_MEM_USE_HOST_PTR, size, host_ptr)</code>로 <strong>같은 페이지를 가리키는 alias cl_mem</strong>을
+만들고 둘을 <code>RpcmemKvBuffer</code>로 묶는다. 이 버퍼는 <code>cl_mem()</code>=alias(GPU 커널·read/write_buffer 호환),
+<code>as_ptr()</code>=host_ptr(eviction 등 CPU 정책 호환)을 동시에 내준다 — UnifiedBuffer와 달리 map/unmap 상태 기계가
+없다(<code>sync_device()</code>도 no-op: Adreno UMA에서 같은 물리 페이지라 cache flush 불필요라는 게 코드의 전제).
+alias 생성이 실패하면 그 자리에서 <code>rpcmem_free</code>로 롤백하고 Err를 돌려 <strong>버퍼 단위로</strong>
+UnifiedBuffer 경로로 fallback한다(INV-RPCMEM-003).
+</p>
+<p class="evidence">근거: <code>engine/src/backend/opencl/memory.rs::alloc_kv_rpcmem</code> (L65–104), <code>::alloc_kv</code> (L166–218), <code>engine/src/memory/rpcmem/kv_buffer.rs::RpcmemKvBuffer</code> (L39–148)</p>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant KV as KVCache (grow/new)
+    participant M as OpenCLMemory.alloc_kv
+    participant R as RpcmemAllocator
+    participant CL as OpenCL driver
+    KV->>M: alloc_kv(size, dtype)
+    alt rpcmem_allocator = Some (--opencl-rpcmem)
+        M->>R: alloc(size)
+        R->>R: rpcmem_alloc(heap=25, flags=1, size)
+        R->>R: rpcmem_to_fd(host_ptr)
+        R-->>M: (host_ptr, fd)
+        M->>CL: clCreateBuffer(USE_HOST_PTR, size, host_ptr)
+        alt alias 생성 실패
+            M->>R: free(host_ptr) — 롤백
+            M-->>M: Err → UnifiedBuffer fallback (per-buffer)
+        else 성공
+            CL-->>M: alias cl_mem
+            M-->>KV: RpcmemKvBuffer (host_ptr + alias 공존)
+        end
+    else use_zero_copy = true (UMA 감지)
+        M->>CL: clCreateBuffer(ALLOC_HOST_PTR)
+        M-->>KV: UnifiedBuffer (unmapped 시작)
+    else discrete GPU
+        M-->>KV: OpenCLBuffer (device-only)
+    end
+</pre>
+
+<p>
+<strong>Drop 순서가 안전성의 핵심이다.</strong> <code>RpcmemKvBuffer</code>는 Rust의 "필드 선언 순서 = drop 순서"를
+이용해 ① alias <code>cl_mem_obj</code>가 먼저 release되고, ② 그 다음 <code>Drop</code> impl이
+<code>allocator.free(host_ptr)</code>를 호출하며, ③ <code>Arc&lt;RpcmemAllocator&gt;</code> 보유로 buffer가 살아있는 동안
+dlclose가 일어나지 않음(INV-RPCMEM-005)을 타입 시스템으로 강제한다. weight swap 쪽
+<code>RpcmemAliasBuffer</code>는 반대로 host 메모리를 <em>소유하지 않고</em>, per-layer rpcmem region을
+<code>Arc&lt;dyn RpcmemRegionGuard&gt;</code>(strong)로 pin하고 secondary store는 <code>Weak</code>로만 본다 —
+store가 alias를 캐싱하면서 생기는 <code>Arc</code> 자기순환을 끊기 위해서다.
+</p>
+<p class="evidence">근거: <code>engine/src/memory/rpcmem/kv_buffer.rs</code> (Drop 순서 주석 L16–26, <code>Drop</code> L99–108), <code>engine/src/memory/rpcmem/opencl_alias.rs::RpcmemAliasBuffer</code> (cycle-break 주석 L10–18, 필드 L52–59)</p>
+
+<div class="note">
+정리하면 zero-copy 의사결정은 두 층이다. <strong>층 1(어디서)</strong>: <code>alloc</code>은 UMA 감지 결과만 보고
+UnifiedBuffer/OpenCLBuffer를 고른다 — rpcmem은 <em>활성화 텐서에 절대 쓰이지 않는다</em>(INV-RPCMEM-007, <code>alloc</code>이
+<code>rpcmem_allocator</code> 필드를 무시). <strong>층 2(KV만)</strong>: <code>alloc_kv</code>만 rpcmem 분기를 갖는다.
+KV + weight-swap secondary 두 소비자가 동일한 <code>Arc&lt;RpcmemAllocator&gt;</code> 인스턴스를 주입받는다(INV-RPCMEM-002).
+</div>
+</section>
+
+<section>
+<h2>4. Quantization 블록 레이아웃 — 바이트 단위</h2>
+<p>
+도메인 환기 한 줄: block quantization은 연속 N개의 f32를 "공유 scale(+min) + 저비트 정수"로 압축하는 표현이다.
+이 코드베이스에서 블록 타입은 전부 <code>engine/src/quant.rs</code>에 <code>#[repr(C)]</code>로 정의되고,
+크기는 <code>const _: () = assert!(...)</code>로 컴파일 타임에 고정된다. 모든 블록의 원소 수는 32다
+(<code>QK4_0 = QK4_1 = QK8_0 = QK2_0 = QKKV = 32</code>).
+</p>
+
+<table>
+<thead><tr><th>블록 타입</th><th>필드 (순서대로)</th><th>총 크기</th><th>bytes/elem</th><th>방식</th><th>주 사용처</th></tr></thead>
+<tbody>
+<tr><td><code>BlockQ4_0</code></td><td><code>d: f16</code>(2B) + <code>qs: [u8; 16]</code></td><td><strong>18B</strong></td><td>0.5625</td><td>대칭, signed nibble−8</td><td>weight 주력 + <code>--kv-type q4_0</code> KV</td></tr>
+<tr><td><code>BlockQ4_1</code></td><td><code>d: f16</code> + <code>m: f16</code> + <code>qs: [u8; 16]</code></td><td>20B</td><td>0.625</td><td>비대칭(min), unsigned nibble</td><td>GGUF Q4_1 weight (legacy)</td></tr>
+<tr><td><code>BlockQ8_0</code></td><td><code>d: f16</code> + <code>qs: [i8; 32]</code></td><td><strong>34B</strong></td><td>1.0625</td><td>대칭, signed i8</td><td>Q4_0 matmul의 <em>activation</em> 양자화 + GGUF Q8_0 weight</td></tr>
+<tr><td><code>BlockQ2_0</code></td><td><code>d: f16</code> + <code>m: f16</code> + <code>qs: [u8; 8]</code></td><td>12B</td><td>0.375</td><td>비대칭 2-bit (KIVI)</td><td>KiviCache 압축 저장</td></tr>
+<tr><td><code>BlockKVQ4</code></td><td><code>d: f16</code> + <code>m: f16</code> + <code>qs: [u8; 16]</code></td><td>20B</td><td>0.625</td><td>비대칭 4-bit</td><td>KIVI multi-bit KV</td></tr>
+<tr><td><code>BlockKVQ8</code></td><td><code>d: f16</code> + <code>m: f16</code> + <code>qs: [u8; 32]</code></td><td>36B</td><td>1.125</td><td>비대칭 8-bit</td><td>KIVI multi-bit KV</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/quant.rs::BlockQ4_0</code> (L14, size assert L28), <code>::BlockQ8_0</code> (L175, assert L180), <code>::BlockQ2_0</code> (L93, assert L99), <code>::BlockKVQ4</code>/<code>BlockKVQ8</code> (L202, L252, asserts L208/L258)</p>
+
+<h3>4.1 Q4_0 블록 18B 해부</h3>
+<table>
+<thead><tr><th>byte offset</th><th>내용</th></tr></thead>
+<tbody>
+<tr><td>0–1</td><td><code>d</code>: scale, f16 little-endian. <code>d = max|x| / 7</code></td></tr>
+<tr><td>2–17</td><td><code>qs[0..16]</code>: 32개 4-bit 값. <strong>byte <code>qs[i]</code>의 low nibble = 원소 <code>i</code>, high nibble = 원소 <code>i+16</code></strong> (인접 쌍이 아니라 전반부/후반부 interleave)</td></tr>
+</tbody>
+</table>
+<pre><code>// quantize (대칭): q ∈ [-8, 7] → +8 해서 unsigned nibble로 저장
+let d  = max_abs / 7.0;
+let v0 = (src[i]      * id).round().clamp(-8.0, 7.0) as i8;
+let v1 = (src[i + 16] * id).round().clamp(-8.0, 7.0) as i8;
+qs[i]  = ((v0 + 8) as u8) | (((v1 + 8) as u8) &lt;&lt; 4);
+
+// dequantize
+let v0 = (b &amp; 0x0F) as i8 - 8;   // 원소 i
+let v1 = (b &gt;&gt; 4)   as i8 - 8;   // 원소 i+16
+out[i]      = v0 as f32 * d;
+out[i + 16] = v1 as f32 * d;</code></pre>
+<p>
+Q8_0은 34B = scale 2B + signed i8 32개, <code>x ≈ qs[i] * d</code>로 단순하다.
+Q4_1은 min을 더한 20B로 <code>x ≈ nibble * d + m</code>(unsigned nibble).
+</p>
+<p class="evidence">근거: <code>engine/src/quant.rs::BlockQ4_0::quantize</code> (L35–49), <code>::dequantize</code> (L51–61), <code>::BlockQ8_0::dequantize</code> (L183–189)</p>
+
+<div class="warn">
+<strong>함정: nibble 배치 규약이 블록 패밀리마다 다르다.</strong>
+<code>BlockQ4_0</code>/<code>BlockQ4_1</code>은 llama.cpp 호환의 <em>반분할 interleave</em>(low=elem i, high=elem i+16)지만,
+KIVI 계열 <code>BlockKVQ4</code>는 <em>인접 쌍</em> 패킹이다: <code>qs[i] = lo(src[2i]) | hi(src[2i+1])</code>.
+<code>BlockQ2_0</code>도 인접 4개를 한 byte에 LSB부터 채운다(<code>q &lt;&lt; (j*2)</code>).
+Q4_0 코드 패턴을 KIVI 블록에 복붙하면 원소 순서가 뒤섞인다.
+</div>
+<p class="evidence">근거: <code>engine/src/quant.rs::BlockKVQ4::quantize</code> (L220–224), <code>::BlockQ2_0::quantize</code> (L110–119)</p>
+
+<h3>4.2 quant/dequant 함수 경로 지도</h3>
+<table>
+<thead><tr><th>함수</th><th>위치</th><th>방향</th><th>호출자</th></tr></thead>
+<tbody>
+<tr><td><code>BlockQ4_0::quantize / dequantize</code></td><td><code>quant.rs</code></td><td>f32×32 ↔ 18B</td><td>tensor_partition 재양자화, descriptor encode의 정답 기준</td></tr>
+<tr><td><code>quantize_q4_0(f32, rows, cols)</code></td><td><code>quant/convert.rs</code></td><td>2D f32 → <code>Vec&lt;BlockQ4_0&gt;</code></td><td>Safetensors 로더(<code>safetensors.rs</code> L314), <code>auf_tool</code> 빌드</td></tr>
+<tr><td><code>f16_to_f32</code> / <code>bulk_f16_to_f32</code></td><td><code>quant/convert.rs</code> / <code>quant/f16_bulk.rs</code></td><td>F16 → F32 (후자는 NEON <code>fcvtl</code>/<code>fcvtl2</code>, 16 elem/iter)</td><td>weight 로더, KV dequant 경로</td></tr>
+<tr><td><code>quantize_row_q8_0</code></td><td><code>backend/cpu/common.rs</code> (L1104)</td><td>activation f32 행 → Q8_0</td><td><code>matmul_transposed_q4_0</code>의 m&lt;4 fast path</td></tr>
+<tr><td><code>vec_dot_q4_0_q8_0[_sdot|_i8mm|...]</code></td><td><code>backend/cpu/neon.rs</code> (L2670~), <code>x86.rs</code>, <code>common.rs</code></td><td>Q4_0 weight 행 · Q8_0 activation 행 내적</td><td>CPU decode matmul 핵심 커널</td></tr>
+<tr><td><code>encode/decode/dequant_via_descriptor</code></td><td><code>format/dtype_layout.rs</code></td><td>descriptor 구동 generic quant/dequant</td><td>opaque KV format floor (§4.3)</td></tr>
+<tr><td><code>quantize_q4_0.cl</code> 커널</td><td><code>engine/kernels/</code> (런타임 로드)</td><td>GPU 측 Q4_0 양자화</td><td>OpenCL backend (<code>opencl.rs</code> L895)</td></tr>
+</tbody>
+</table>
+<p>
+CPU matmul에서 Q4_0 weight의 핵심 트릭은 <strong>weight를 dequant하지 않는 것</strong>이다:
+activation 쪽을 <code>quantize_row_q8_0</code>으로 Q8_0으로 만들고, 정수 도메인에서
+<code>vec_dot_q4_0_q8_0</code>(NEON sdot/i8mm 변형 포함)으로 내적한 뒤 두 블록 scale의 곱으로 복원한다.
+m(행 수)이 4 이상인 prefill성 호출은 블록 단위 스칼라 dequant 경로로 떨어진다.
+dtype dispatch는 <code>matmul_transposed</code>의 match가 담당하고, 전용 arm이 없는 dtype(Q8_0 weight 포함)은
+<strong>generic floor</strong> — <code>dequant_to_f32_tensor</code>로 통째로 풀어 f32 matmul — 로 처리된다
+("exact, 느릴 뿐"이 코드 주석의 표현).
+</p>
+<p class="evidence">근거: <code>engine/src/backend/cpu/common.rs::matmul_transposed_q4_0</code> (L997–1096, m&lt;4 분기 L1026), <code>engine/src/backend/cpu/x86.rs::matmul_transposed</code> (dtype match + floor, L47–59)</p>
+
+<h3>4.3 Descriptor 기반 일반화: <code>KVLayoutDesc</code>와 <code>OpaqueBuffer</code></h3>
+<p>
+위 블록 타입들이 "닫힌 enum 세계"라면, 동적 <code>.so</code> format(플러그인 KV format)을 위한 열린 세계가
+<code>KVLayoutDesc</code>다. 4개 필드 — <code>block_elems</code>(블록 원소 수), <code>bits</code>(원소당 비트),
+<code>scale_layout</code>(None / PerBlockF16 / PerBlockF16WithMin), <code>packing</code>(Dense / Nibble / Byte) —
+의 어휘로 블록 패밀리를 기술하고, <code>block_bytes() = scale_bytes + quant_bytes</code>가 바이트 회계의
+단일 진실원천이 된다(q4_0 descriptor → 2 + 16 = 18B로 <code>BlockQ4_0</code>과 정확히 일치).
+이 descriptor를 sidecar로 붙인 raw 바이트 컨테이너가 <code>OpaqueBuffer</code>다: <code>Buffer::dtype()</code>은
+<code>DType::U8</code>을 반환해 typed 재해석을 차단하고(backend match의 U8 arm은 전부 floor/Err),
+진짜 의미는 <code>descriptor()</code>가 운반하며 식별은 <code>as_any().downcast_ref</code>로 한다.
+</p>
+<p>
+성능 보정 장치가 하나 있다: <code>layout_desc_to_builtin_dtype()</code>은 동적 format의 descriptor가 내장
+DType과 bit-equivalent하면 opaque floor 대신 typed fast path로 라우팅한다. 인식 집합은
+<strong>{F32, F16, Q4_0}</strong>뿐이다 — Q8_0/Q4_1은 typed attention이 보장되지 않아 의도적으로 제외
+(opaque floor가 typed Q4_0 NEON 대비 ~1.34배 느리다는 Galaxy S25 실측이 주석에 기록돼 있다).
+<code>encode_via_descriptor</code>의 q4_0 출력은 <code>BlockQ4_0::quantize</code>와 byte-exact임이 테스트로 강제된다.
+</p>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::KVLayoutDesc</code> (L913–922, <code>block_bytes</code> L930), <code>engine/src/buffer/opaque.rs::OpaqueBuffer</code> (L29–59), <code>engine/src/format/dtype_layout.rs::layout_desc_to_builtin_dtype</code> (L82–87), <code>::dtype_to_layout_desc</code> (L28–70)</p>
+</section>
+
+<section>
+<h2>5. Weight 경로: 디스크 → mmap → backend</h2>
+
+<h3>5.1 GGUF 로드 (기본 경로)</h3>
+<p>
+GGUF 파일은 <code>MmapOptions::new().map(&amp;file)</code>로 통째로 mmap되고 <code>Arc&lt;memmap2::Mmap&gt;</code>으로
+보관된다. 텐서별 로드(<code>load_raw</code>)는 4갈래 분기다:
+</p>
+<ol>
+<li><strong>K-quant 등 미지원 타입</strong> → <code>needs_dequant_fallback</code>이면 로드 시 F32(embed/lm_head는 F16)로 dequant — 복사 발생.</li>
+<li><strong>F32로 저장된 embed/lm_head</strong> → 로드 시 F16 downcast (GPU 업로드 절반화, RSS 최적화) — 복사 발생.</li>
+<li><strong>Llama Q/K weight</strong> → llama.cpp의 convert reshape를 되돌리는 <code>unpermute_qk_rows</code> 후 <code>SharedBuffer::from_vec</code>로 소유 버퍼 생성 — 복사 발생.</li>
+<li><strong>그 외 전부(Q4_0/Q8_0 native 블록, F16/F32 norm 등)</strong> → <code>MmapBuffer::new(mmap, abs_offset, len, dtype)</code> <strong>zero-copy</strong>. <code>abs_offset = tensor_data_offset + info.offset</code>.</li>
+</ol>
+<p>
+즉 Q4_0 weight의 18B 블록 바이트는 디스크 포맷 그대로가 CPU 텐서다. GPU backend가 대상이면 마지막에
+<code>backend.copy_weight_from(cpu_tensor)</code>가 호출되고, 기본 구현은 <code>copy_from</code> 위임 —
+OpenCL에서는 <code>OpenCLMemory::alloc</code>(UMA면 UnifiedBuffer)으로 목적지를 만들고 device copy 또는
+write로 업로드한다. dtype은 <code>ggml_type_to_dtype</code>으로 매핑되며 Q5_x, K-quant 등은 명시적 Err
+또는 dequant fallback이다.
+</p>
+<p class="evidence">근거: <code>engine/src/models/loader/gguf.rs::load_raw</code> (분기 L858–944, mmap zero-copy L928–933), <code>::ggml_type_to_dtype</code> (L506), <code>engine/src/backend.rs::copy_weight_from</code> (L418, default = copy_from), <code>engine/src/backend/opencl.rs::copy_from</code> (L4923)</p>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant F as model.gguf
+    participant L as GGUFSource (loader)
+    participant B as MmapBuffer
+    participant BE as OpenCLBackend
+    participant M as OpenCLMemory
+    L->>F: File::open + mmap (Arc 보관)
+    L->>L: find_tensor(name) → offset/dims/ggml_type
+    alt K-quant / F32 embed / Q-K permute
+        L->>L: dequant 또는 unpermute → SharedBuffer (복사)
+    else native dtype (Q4_0, Q8_0, F16, F32)
+        L->>B: MmapBuffer::new(mmap, abs_offset, len, dtype) — zero-copy
+    end
+    L->>BE: copy_weight_from(cpu_tensor)
+    BE->>M: alloc(size, dtype) — UMA면 UnifiedBuffer
+    BE->>BE: enqueue copy/write → GPU 텐서 반환
+    Note over B,BE: Arc 덕에 mmap은 CPU 텐서가 살아있는 동안 unmap되지 않음
+</pre>
+
+<h3>5.2 Safetensors와 런타임 양자화</h3>
+<p>
+Safetensors 경로는 shard별 mmap 후, F16 텐서는 <code>MmapBuffer</code> zero-copy로 들고
+Q4_0이 필요한 경우 <code>convert::quantize_q4_0(&amp;f32_data, rows, cols)</code>로 <em>런타임에</em> 블록을 생성한다
+(GGUF와 달리 디스크에 양자화 블록이 없으므로). 테스트 기본 포맷이 GGUF인 이유 중 하나다.
+</p>
+<p class="evidence">근거: <code>engine/src/models/loader/safetensors.rs</code> (mmap L80–84, <code>quantize_q4_0</code> L314, <code>MmapBuffer</code> L231)</p>
+
+<h3>5.3 Adreno SOA 변환과 <code>NoshuffleWeightBuffer</code></h3>
+<p>
+Adreno GEMV 커널은 AOS(18B 블록 연속)가 아니라 <strong>SOA noshuffle 레이아웃</strong>을 읽는다:
+nibble을 풀어 재배열한 <code>q_buf</code>(블록당 16B)와 scale만 모은 <code>d_buf</code>(블록당 2B)를 각각
+column-major로 transpose한 두 버퍼다. 변환은 3단계 — (1) 블록 내 nibble bit unshuffle
+(<code>q[i] = (x0 &amp; 0x0F) | ((x1 &amp; 0x0F) &lt;&lt; 4)</code>, <code>q[i+8] = ((x0 &amp; 0xF0) &gt;&gt; 4) | (x1 &amp; 0xF0)</code>),
+(2) q의 ushort 단위 2D transpose, (3) d의 half 단위 2D transpose. 총 바이트는 블록당 16+2=18B로 AOS와 동일
+(테스트로 불변식 강제). 이 변환은 AUF 빌드 타임(<code>auf/q4_0_soa.rs</code>, CPU 순수 구현)과 런타임 GPU 커널
+(<code>cvt.cl</code>) 두 구현이 byte-identical하다.
+</p>
+<p>
+변환 후에는 원본 AOS cl_mem이 죽은 짐이 된다(Llama 3.2 1B 기준 Q4_0 텐서 112개에 ~523 MiB — 모듈 주석 수치).
+그래서 weight 텐서의 backing을 <code>NoshuffleWeightBuffer</code>로 교체한다: SOA 3핸들(q_buf/d_buf/q_img)을
+소유하고, <code>cl_mem()</code>은 <code>d_buf</code>를 반환해 backend의 SOA registry lookup key(포인터 주소)로 쓰이게 하며,
+<code>dtype()</code>은 여전히 Q4_0을 보고해 matmul dispatch를 바꾸지 않는다. 교체 순간 옛 buffer의 Arc가 0이 되어
+AOS 할당이 release된다.
+</p>
+<p class="evidence">근거: <code>engine/src/auf/q4_0_soa.rs::q4_0_aos_to_adreno_soa</code> (L27–81), <code>::q4_0_aos_to_soa_unshuffled</code> (L96–116), <code>engine/src/memory/opencl/noshuffle.rs::NoshuffleWeightBuffer</code> (module doc L1–32, <code>cl_mem</code> L142–147)</p>
+</section>
+
+<section>
+<h2>6. AUF: 자체 weight asset 포맷</h2>
+<p>
+AUF(Argus Unified Format)는 GGUF에서 파생된 single-file weight asset이다. 메타데이터·tokenizer·tensor index·
+backend별 <em>사전 변환된</em> weight payload(위 SOA 변환을 빌드 타임에 끝낸 결과 포함)를 한 파일에 담는다.
+파일 구조는 [256B 고정 헤더][48B × N section table][64KB 정렬 payload들].
+</p>
+
+<h3>6.1 헤더 256B (little-endian)</h3>
+<table>
+<thead><tr><th>offset</th><th>필드</th><th>내용</th></tr></thead>
+<tbody>
+<tr><td>0–7</td><td>magic</td><td><code>"ARGUS_W\0"</code></td></tr>
+<tr><td>8–13</td><td>format major/minor/patch</td><td>u16×3 (v0.1 = 0/1/0; major는 breaking 시 증가, reader는 major 0만 지원)</td></tr>
+<tr><td>16–47</td><td>created_by</td><td>UTF-8, NUL 패딩 32B</td></tr>
+<tr><td>48–79</td><td>source_hash</td><td>원본 GGUF hybrid sha256 (32B)</td></tr>
+<tr><td>80–95</td><td>source_size / source_mtime</td><td>u64×2</td></tr>
+<tr><td>96–111</td><td>capability_required / optional</td><td>u64×2. required에 모르는 bit가 있으면 reject. optional bit2=lm_head Q4_0 사전 변환, bit3=multi-dtype variant</td></tr>
+<tr><td>112–115</td><td>section_count</td><td>u32</td></tr>
+<tr><td>120–135</td><td>section_table_offset / payload_start_offset</td><td>u64×2</td></tr>
+<tr><td>136–255</td><td>reserved</td><td>120B</td></tr>
+</tbody>
+</table>
+<p class="evidence">근거: <code>engine/src/auf/header.rs::AufHeader::from_bytes</code> (offset 산식 L93–110), 상수 <code>HEADER_SIZE=256</code> (L43), <code>CAPABILITY_BIT_*</code> (L15, L27)</p>
+
+<h3>6.2 Section table과 reader 검증</h3>
+<p>
+Section entry는 48B 고정: <code>[0..24) tag</code>(ASCII, NUL 패딩 — <code>WEIGHTS_ADRENO_SOA</code> 18자 때문에
+spec의 16B에서 24B로 확장), <code>[24..32) offset u64</code>, <code>[32..40) size u64</code>,
+<code>[40..44) flags u32</code>(REQUIRED/STRIPPABLE/COMPRESSED), <code>[44..48) version u32</code>.
+필수 section은 META(JSON), TOKENIZER, TENSOR_INDEX 3종 + backend가 요구하는 WEIGHTS_* 1종
+(<code>WEIGHTS_ADRENO_SOA</code> / <code>WEIGHTS_CPU_AOS</code> / <code>WEIGHTS_CUDA_AOS</code>).
+payload는 <code>WEIGHTS_ALIGNMENT = 65536</code>(64KB) 정렬이다.
+</p>
+<p>
+<code>auf::reader::open(path, BackendTag)</code>은 파일을 mmap하고 ①헤더 magic/major/capability 검증 →
+②section table 경계·유니크 tag·flag·range 검증 → ③필수 section 확인 → ④해당 backend의 WEIGHTS_* 존재 확인 →
+⑤META/TOKENIZER/TENSOR_INDEX 파싱 순으로 진행해 <code>AufView</code>를 만든다. <code>AufView</code>는 mmap을
+직접 보유하고 <code>weights_bytes()</code>로 WEIGHTS payload를 zero-copy slice로 내준다.
+실제 텐서 로드는 <code>AufSource::load_tensor</code>가 <code>lookup_tensor</code>로 <code>TensorEntry</code>를 찾고
+(dtype 우선순위: 명시 요청 &gt; <code>META.default_dtype</code> &gt; first-match — multi-dtype AUF 지원),
+<code>abs_offset = WEIGHTS section offset + variant_offset</code>으로 <code>AufViewBuffer</code>를 만드는 것으로 끝난다 —
+사전 변환 덕에 런타임 변환이 없다.
+</p>
+<p class="evidence">근거: <code>engine/src/auf/section.rs::SectionEntry</code> (layout 주석 L15–21), <code>engine/src/auf/reader.rs::open_from_mmap</code> (L343–430), <code>::AufView::lookup_tensor</code> (precedence, L230–273), <code>engine/src/models/loader/auf/source.rs</code> (L506–516), <code>engine/src/auf/writer.rs::WEIGHTS_ALIGNMENT</code> (L20)</p>
+
+<pre class="mermaid">
+flowchart LR
+    subgraph FILE["model.auf 파일 레이아웃"]
+        H["헤더 256B<br/>magic ARGUS_W"]
+        S["Section table<br/>48B x N"]
+        P1["META (JSON)"]
+        P2["TOKENIZER"]
+        P3["TENSOR_INDEX<br/>(layer_idx, kind, dtype) → variant offsets"]
+        P4["WEIGHTS_ADRENO_SOA<br/>64KB 정렬, 사전 SOA 변환"]
+        P5["WEIGHTS_CPU_AOS"]
+    end
+    H --> S --> P1 --> P2 --> P3 --> P4 --> P5
+    P4 -. "mmap zero-copy slice" .-> V["AufViewBuffer"]
+    V --> T["Tensor (런타임 변환 0)"]
+</pre>
+</section>
+
+<section>
+<h2>7. KV cache에서의 quant format 사용</h2>
+<p>
+KV 캐시의 layout(<code>KVLayout::HeadMajor</code> 고정)·eviction·pressure 파이프라인은
+<a href="07_kv_cache.html">07장</a>의 영역이다. 여기서는 <em>바이트 회계 관점</em>의 세 가지만 짚는다.
+</p>
+
+<h3>7.1 typed Q4_0 KV: 블록 단위 회계가 강제다</h3>
+<p>
+<code>--kv-type q4_0</code>이면 K/V 버퍼의 dtype이 <code>DType::Q4_0</code>이 되고, 쓰기 경로는
+<code>StandardFormat::write_inner</code>의 비-F32 cast 분기다: F32 입력을 scratch 텐서로
+<code>backend.cast()</code>(F32→Q4_0 양자화)한 뒤 <code>KVCache::update</code>로 넘긴다 —
+<code>KVCache::update</code> 자체는 cast하지 않고 입력이 이미 cache dtype이라고 전제한다(이 전제를 어기면
+silent garbage라고 주석이 경고). scratch는 dynamic cache(<code>memory=Some</code>)에서만 lazy 할당 가능하다.
+</p>
+<p>
+이후의 모든 이동 — <code>update</code>의 HeadMajor scatter, <code>grow</code>, <code>shrink_to_fit</code> —
+은 <code>backend.copy_slice(src, dst, src_off, dst_off, count)</code>를 쓰는데, Q4_0에서는
+<strong>count/offset이 element가 아니라 블록 단위</strong>다(블록당 18B). 예컨대 HeadMajor scatter는
+<code>blocks_per_head = head_dim / QK4_0</code>, <code>dst_head_stride = capacity * head_dim / QK4_0</code>로 계산한다.
+</p>
+<div class="warn">
+<strong>실제 사고 사례:</strong> <code>shrink_to_fit()</code>이 element 단위 count를 그대로 넘겨 Q4_0에서 ~32배(QK4_0)
+over-read → OOB → SIGSEGV가 났던 버그가 있었다(2026-06-09 수정). 현재 코드의 L418–420 주석이 이 사실을 박제하고
+있고 SeqMajor/HeadMajor 양쪽에 블록 변환이 들어가 있다. <em>Q4_0 KV를 만지는 모든 새 copy_slice 호출은
+"이 count가 블록 단위인가"를 리뷰에서 반드시 확인하라.</em>
+</div>
+<p class="evidence">근거: <code>engine/src/pressure/standard_format.rs::write_inner</code> (cast 분기 L259–324), <code>engine/src/pressure/kv_cache.rs::update</code> (Q4_0 블록 산식 L557–601), <code>::shrink_to_fit</code> (블록 변환 + OOB 주석 L418–445)</p>
+
+<h3>7.2 GPU에는 Q4_0 KV fast-path가 없다</h3>
+<p>
+<code>StandardFormat</code>의 attention 디스패치는 <code>kv_dtype == Q4_0 &amp;&amp; backend.is_gpu()</code>이면
+GPU <code>attention_gen</code>으로 보내지 않는다 — GPU에 Q4_0 dequant-attention 커널이 없어
+<code>BlockQ4_0</code> raw 바이트를 float로 오독해 garbage가 되기 때문에 CPU fallback 경로를 탄다.
+typed-attention 완전지원 집합이 {F32, F16, Q4_0(CPU NEON)}으로 정의된 것(§4.3)과 같은 맥락이다.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/standard_format.rs</code> (L459–464 주석+분기)</p>
+
+<h3>7.3 opaque KV와 KIVI</h3>
+<p>
+동적 <code>.so</code> format KV는 <code>KVCache</code> 버퍼가 <code>OpaqueBuffer</code>일 때
+<code>update_opaque</code>가 F32 입력을 <code>encode_via_descriptor</code>로 직접 양자화해 HeadMajor byte offset에
+scatter한다(U8 type_size=1이므로 copy 단위가 byte). KIVI는 또 다른 합성이다 —
+<code>KiviCache</code>가 <code>BlockQ2_0</code>/<code>BlockKVQ4</code>/<code>BlockKVQ8</code> 블록 저장 + F32 residual
+버퍼(<code>[kv_heads][res_cap][head_dim]</code>, res_cap은 QKKV=32의 배수)를 들고, Key는 per-channel(토큰 축으로 32개씩),
+Value는 per-token(head_dim 축으로 32개씩) 양자화한다. 운영 흐름은 <a href="07_kv_cache.html">07장</a> 참조.
+</p>
+<p class="evidence">근거: <code>engine/src/pressure/kv_cache.rs::update_opaque</code> (L698–723), <code>engine/src/pressure/kivi_cache.rs::KiviCache</code> (struct doc + 필드, L182–260)</p>
+</section>
+
+<section>
+<h2>8. 리뷰 체크리스트</h2>
+<table>
+<thead><tr><th>볼 것</th><th>왜</th></tr></thead>
+<tbody>
+<tr><td>quant dtype 바이트 계산에 <code>dtype.size()</code>를 썼는가?</td><td>Q4_0/Q4_1/Q8_0은 1을 반환 — 블록 산식(<code>n/32 × block_bytes</code>) 또는 <code>KVLayoutDesc::bytes_for_elems</code>를 써야 한다 (§1.2)</td></tr>
+<tr><td>Q4_0 버퍼의 <code>copy_slice</code> count가 블록 단위인가?</td><td>element 단위면 ~32배 OOB — shrink_to_fit SIGSEGV 전례 (§7.1)</td></tr>
+<tr><td>새 view 버퍼에 backing <code>Arc</code> keep-alive 필드가 있는가?</td><td>raw 포인터만 들면 use-after-unmap. <code>MmapKeepAlive</code>/<code>RpcmemRegionGuard</code> 패턴 준수 (§2.1)</td></tr>
+<tr><td>rpcmem 관련 struct의 필드 선언 순서를 바꿨는가?</td><td>선언 순서가 drop 순서 = alias cl_mem이 host_ptr free보다 먼저 release되는 안전성 보증 (§3.2)</td></tr>
+<tr><td><code>UnifiedBuffer</code>의 <code>as_ptr()</code> null 가능성을 처리했는가?</td><td>unmapped 상태에선 null — <code>map_for_cpu()</code> 선행 필요 (§3.1)</td></tr>
+<tr><td>nibble 패킹 코드가 어느 규약인가?</td><td>Q4_0=반분할 interleave(i, i+16), KVQ4=인접 쌍(2i, 2i+1) — 혼용 금지 (§4.1)</td></tr>
+<tr><td>활성화 텐서를 rpcmem으로 할당하려 하는가?</td><td>INV-RPCMEM-007 위반 — rpcmem은 KV/secondary 전용, <code>alloc</code>은 의도적으로 무시한다 (§3.2)</td></tr>
+<tr><td>GPU 경로에 Q4_0 KV를 직접 넘기는가?</td><td>GPU에 Q4_0 dequant-attention 커널 부재 — raw 블록을 float로 오독 (§7.2)</td></tr>
+</tbody>
+</table>
+</section>
+
+</main>
+<footer class="pagenav"><span><a href="05_abstractions.html">← 05. 핵심 추상화 카탈로그</a></span><span><a href="07_kv_cache.html">07. KV 캐시 구조와 관리 →</a></span></footer>
+</body>
+</html>
