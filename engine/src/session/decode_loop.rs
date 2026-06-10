@@ -9,7 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crate::observability::profile::OpProfiler;
+use crate::pipeline::StopReason as StageStopReason;
+use crate::pipeline::{LifecyclePhase, PipelineDispatcher, Pressure, StageContext, StepInfo};
 use crate::resilience::KVSnapshot;
+use crate::session::pipeline_registry::PipelineRegistry;
 
 use super::defaults::{
     GreedySampler, NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver,
@@ -46,6 +50,12 @@ pub struct DecodeLoop {
     // 동일 sticky evict directive 가 매 poll 재적용되지 않도록 active 구간당 1회만
     // 발동. plan.evict 가 None 으로 돌아오면(RestoreDefaults) false 로 reset.
     evict_applied: bool,
+    // β-2: L2 PipelineStage dispatch 배선. default = empty registry (len==0 fast-path
+    // 로 happy-path 거동-0). run_until_stop 은 β-6 에서 통합 — 현재 미발화.
+    pipeline: Arc<PipelineRegistry>,
+    // β-1 계약 (v2 §5.2.1): DecodeLoop 이 OpProfiler 1개 소유, dispatch 호출부마다
+    // &mut 재대여 (StageContext.profiler).
+    profiler: OpProfiler,
     pos: usize,
     decode_step: usize,
     prev_token: u32,
@@ -71,12 +81,42 @@ fn step_ctx<'a>(
 }
 
 impl DecodeLoop {
+    /// β-2: 현재 step 스냅샷으로 phase 1건 dispatch. 빈 registry 는
+    /// PipelineRegistry 내부 len==0 fast-path 로 무lock 즉시 반환 (거동-0).
+    /// pressure 는 β-5 (PressureSource 일원화) 전까지 default(0).
+    fn dispatch_phase(&mut self, phase: LifecyclePhase) -> Option<StageStopReason> {
+        let step = StepInfo {
+            pos: self.pos,
+            decode_step: self.decode_step,
+            pressure: Pressure::default(),
+        };
+        let mut ctx = StageContext {
+            step,
+            profiler: &mut self.profiler,
+        };
+        self.pipeline.dispatch(phase, &mut ctx)
+    }
+
+    /// v2 StopReason(pipeline.rs 4-variant) → v1 StopReason(traits.rs) 수렴 매핑
+    /// (v2 §5.2.1 (다)). StopFlag 는 v2 에 없음 — driver 루프 가드 v1 유지.
+    fn map_stage_stop(r: StageStopReason) -> StopReason {
+        match r {
+            StageStopReason::EosToken => StopReason::EosToken,
+            StageStopReason::BudgetExhausted => StopReason::BudgetExhausted,
+            StageStopReason::StopConditionMet => StopReason::StopConditionMet,
+            StageStopReason::CommandRequested => StopReason::CommandRequested,
+        }
+    }
+
     /// Run prefill over the prompt. Returns logits for the last token so the
     /// caller can sample the first generated token before invoking
     /// [`Self::run`]. `pos` is advanced to `tokens.len()`. `prev_token` is
     /// staged from `tokens.last()` for `on_prefill_end` observer context only;
     /// [`Self::run`] overwrites it with `first_token`.
     pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        // PrefillStart: prefill 엔 break 할 루프 없음 — Stop 은 per-token phase 전용
+        // (chunked prefill 시 PrefillChunkBoundary 와 함께 재고).
+        let _ = self.dispatch_phase(LifecyclePhase::PrefillStart);
         let start_pos = self.pos;
         let logits = self.forward.prefill(tokens, start_pos)?;
         self.pos += tokens.len();
@@ -101,6 +141,8 @@ impl DecodeLoop {
         for obs in &mut self.observers {
             obs.on_prefill_end(&ctx, &logits);
         }
+        // PrefillEnd: on_prefill_end observer 루프 후, Ok(logits) 직전.
+        let _ = self.dispatch_phase(LifecyclePhase::PrefillEnd);
         Ok(logits)
     }
 
@@ -139,6 +181,12 @@ impl DecodeLoop {
             // 매 step 전체 wall-clock 시작점 (target_tbt pacing 기준 — throttle
             // delay 도 이 측정에 포함된다).
             let t_iter = Instant::now();
+
+            // DecodeStart: t_iter 직후, (a) command poll 전.
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::DecodeStart) {
+                stopped_by = Self::map_stage_stop(r);
+                break;
+            }
 
             // (a) command poll
             let ctx = step_ctx(
@@ -256,6 +304,12 @@ impl DecodeLoop {
             );
             self.swap.before_step(&ctx)?;
 
+            // PreForward: (c) swap.before_step 후, (d) forward 직전.
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::PreForward) {
+                stopped_by = Self::map_stage_stop(r);
+                break;
+            }
+
             // (d) forward
             let t0 = Instant::now();
             let ctx = step_ctx(
@@ -268,6 +322,12 @@ impl DecodeLoop {
             let logits = self.forward.step(&ctx, self.prev_token)?;
             let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+            // PostForward: step_ms 계산 직후, (e) swap after 전.
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::PostForward) {
+                stopped_by = Self::map_stage_stop(r);
+                break;
+            }
+
             // (e) swap after
             let ctx = step_ctx(
                 self.pos,
@@ -277,6 +337,12 @@ impl DecodeLoop {
                 &stop,
             );
             self.swap.after_step(&ctx)?;
+
+            // PreSample: (e) swap.after_step 후, (f) sampler.sample 직전.
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::PreSample) {
+                stopped_by = Self::map_stage_stop(r);
+                break;
+            }
 
             // (f) sample
             let ctx = step_ctx(
@@ -291,6 +357,13 @@ impl DecodeLoop {
             // `tokens.push(next_token_id)`가 다음 step의 rep window에 들어가는
             // 것과 동치.
             self.sampler.observe_token(sampled);
+
+            // PostSample: sampled 미push 시점 → stop token 미포함 break
+            // (v1 chat stop 시맨틱 정합, β-6 StopCondition stage 전제).
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::PostSample) {
+                stopped_by = Self::map_stage_stop(r);
+                break;
+            }
 
             // (f2) tick sink — sampler 호출 후, observer 이전
             let ctx = step_ctx(
@@ -319,6 +392,13 @@ impl DecodeLoop {
             self.pos += 1;
             self.decode_step += 1;
 
+            // DecodeEnd: bookkeeping 후, (h) pacing 전.
+            // step 완료 후 시점 — StepInfo 는 증가된 pos/decode_step, token 은 이미 포함.
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::DecodeEnd) {
+                stopped_by = Self::map_stage_stop(r);
+                break;
+            }
+
             // (h) target TBT pacing — resilience SetTargetTbt 가 설정한 목표
             // wall-clock 에 도달하도록 step 끝에서 sleep. target_tbt_ms == 0
             // (미설정/release) 이면 no-op이라 비-resilience 경로는 무영향.
@@ -337,6 +417,8 @@ impl DecodeLoop {
         for obs in &mut self.observers {
             obs.finalize()?;
         }
+        // Finalize: forward.finalize() + observers finalize 체인 후, DecodeResult 구성 직전.
+        let _ = self.dispatch_phase(LifecyclePhase::Finalize);
 
         Ok(DecodeResult {
             tokens_generated: generated,
@@ -536,6 +618,7 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     tick_sink: Option<Box<dyn TokenTickSink>>,
     stop_flag: Option<Arc<AtomicBool>>,
     cache_manager: Option<crate::pressure::cache_manager::CacheManager>,
+    pipeline: Option<Arc<PipelineRegistry>>,
     kv_capacity: usize,
 }
 
@@ -559,6 +642,7 @@ impl DecodeLoopBuilder<NoForward> {
             tick_sink: None,
             stop_flag: None,
             cache_manager: None,
+            pipeline: None,
             kv_capacity: 0,
         }
     }
@@ -576,6 +660,7 @@ impl DecodeLoopBuilder<NoForward> {
             tick_sink: self.tick_sink,
             stop_flag: self.stop_flag,
             cache_manager: self.cache_manager,
+            pipeline: self.pipeline,
             kv_capacity: self.kv_capacity,
         }
     }
@@ -625,6 +710,11 @@ impl<F> DecodeLoopBuilder<F> {
         self.tick_sink = Some(Box::new(t));
         self
     }
+    /// β-2: L2 stage registry 주입. 미주입 시 빈 registry (거동-0).
+    pub fn with_pipeline(mut self, p: Arc<PipelineRegistry>) -> Self {
+        self.pipeline = Some(p);
+        self
+    }
 
     /// P3.3: [`ResilienceAdapter`]를 3개 slot(cmd_source / report / tick_sink)에 동시에 주입한다.
     ///
@@ -671,6 +761,10 @@ impl DecodeLoopBuilder<HasForward> {
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             cache_manager: self.cache_manager,
             evict_applied: false,
+            pipeline: self
+                .pipeline
+                .unwrap_or_else(|| Arc::new(PipelineRegistry::new())),
+            profiler: OpProfiler::new(),
             pos: 0,
             decode_step: 0,
             prev_token: 0,
@@ -908,5 +1002,237 @@ mod tests {
         // reset 후 pos=0
         // forward_mut으로 Forward에 접근 가능함을 컴파일로 검증
         let _fwd: &mut dyn Forward = loop_.forward_mut();
+    }
+
+    // ── β-2 phase 배선 테스트 ──────────────────────────────────────────────
+
+    use crate::pipeline::{
+        LifecyclePhase as Phase, PipelineStage, StageContext as SCtx, StageOutcome,
+    };
+    use crate::session::pipeline_registry::PipelineRegistry;
+    use std::sync::Mutex;
+
+    /// 모든 phase를 기록하는 Persistent stage.
+    struct RecordStage {
+        log: Arc<Mutex<Vec<Phase>>>,
+    }
+
+    impl PipelineStage for RecordStage {
+        fn name(&self) -> &str {
+            "RecordStage"
+        }
+        fn on_phase(&self, phase: &Phase, _ctx: &mut SCtx<'_>) -> anyhow::Result<StageOutcome> {
+            self.log.lock().unwrap().push(phase.clone());
+            Ok(StageOutcome::Continue)
+        }
+    }
+
+    /// 지정 phase에서 Stop(EosToken)을 반환하는 stage.
+    struct StopAtStage {
+        target: Phase,
+        fired: Arc<Mutex<bool>>,
+    }
+
+    impl PipelineStage for StopAtStage {
+        fn name(&self) -> &str {
+            "StopAtStage"
+        }
+        fn on_phase(&self, phase: &Phase, _ctx: &mut SCtx<'_>) -> anyhow::Result<StageOutcome> {
+            if phase == &self.target {
+                *self.fired.lock().unwrap() = true;
+                Ok(StageOutcome::Stop(crate::pipeline::StopReason::EosToken))
+            } else {
+                Ok(StageOutcome::Continue)
+            }
+        }
+    }
+
+    /// phase, pos, decode_step 을 기록하는 stage.
+    struct SnapshotStage {
+        log: Arc<Mutex<Vec<(Phase, usize, usize)>>>,
+    }
+
+    impl PipelineStage for SnapshotStage {
+        fn name(&self) -> &str {
+            "SnapshotStage"
+        }
+        fn on_phase(&self, phase: &Phase, ctx: &mut SCtx<'_>) -> anyhow::Result<StageOutcome> {
+            self.log
+                .lock()
+                .unwrap()
+                .push((phase.clone(), ctx.step.pos, ctx.step.decode_step));
+            Ok(StageOutcome::Continue)
+        }
+    }
+
+    /// prefill(&[1,2,3]) + run(2, 0) 시 정확한 phase 시퀀스를 검증한다.
+    #[test]
+    fn phase_emission_sequence_exact() {
+        let log: Arc<Mutex<Vec<Phase>>> = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(RecordStage { log: log.clone() }));
+
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .with_pipeline(Arc::clone(&registry))
+            .build();
+
+        loop_.prefill(&[1, 2, 3]).unwrap();
+        loop_.run(2, 0).unwrap();
+
+        let observed = log.lock().unwrap().clone();
+        let expected = vec![
+            Phase::PrefillStart,
+            Phase::PrefillEnd,
+            Phase::DecodeStart,
+            Phase::PreForward,
+            Phase::PostForward,
+            Phase::PreSample,
+            Phase::PostSample,
+            Phase::DecodeEnd,
+            Phase::DecodeStart,
+            Phase::PreForward,
+            Phase::PostForward,
+            Phase::PreSample,
+            Phase::PostSample,
+            Phase::DecodeEnd,
+            Phase::Finalize,
+        ];
+        assert_eq!(observed, expected, "phase 시퀀스 불일치");
+    }
+
+    /// PostSample 에서 Stop(EosToken) 반환 시 tokens_generated 가 비어 있고
+    /// stopped_by 가 v1 StopReason::EosToken 으로 수렴된다.
+    #[test]
+    fn stage_stop_at_post_sample_maps_to_v1_reason() {
+        let fired = Arc::new(Mutex::new(false));
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(StopAtStage {
+            target: Phase::PostSample,
+            fired: fired.clone(),
+        }));
+
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .with_pipeline(Arc::clone(&registry))
+            .build();
+
+        loop_.prefill(&[1]).unwrap();
+        let result = loop_.run(5, 0).unwrap();
+
+        assert_eq!(result.stopped_by, StopReason::EosToken, "v1 EosToken 수렴");
+        assert!(
+            result.tokens_generated.is_empty(),
+            "PostSample 미push break — 토큰 없음"
+        );
+        assert!(*fired.lock().unwrap(), "StopAtStage 발화 확인");
+    }
+
+    /// 기록 stage 등록 후 run_until_stop 실행 → 추가 발화 0 (총 == prefill 2종).
+    #[test]
+    fn run_until_stop_does_not_dispatch() {
+        use crate::session::chat::stop_condition::{ChatStopCondition, StopCondition};
+
+        let log: Arc<Mutex<Vec<Phase>>> = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(RecordStage { log: log.clone() }));
+
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .with_pipeline(Arc::clone(&registry))
+            .build();
+
+        // prefill 1회 → PrefillStart + PrefillEnd = 2 발화
+        loop_.prefill(&[0]).unwrap();
+        let prefill_count = log.lock().unwrap().len();
+        assert_eq!(prefill_count, 2, "prefill 발화 2건");
+
+        // run_until_stop 실행 — 추가 발화 없어야 함
+        let cond = ChatStopCondition::new(vec![1], 2048);
+        loop_
+            .run_until_stop(0, &cond as &dyn StopCondition)
+            .unwrap();
+
+        let total = log.lock().unwrap().len();
+        assert_eq!(
+            total, 2,
+            "run_until_stop 추가 발화 0 — 총 카운트 == prefill 2"
+        );
+    }
+
+    /// phase 별 StepInfo(pos, decode_step) 스냅샷 값을 검증한다.
+    #[test]
+    fn step_info_snapshot_values() {
+        let log: Arc<Mutex<Vec<(Phase, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(SnapshotStage { log: log.clone() }));
+
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .with_pipeline(Arc::clone(&registry))
+            .build();
+
+        // prefill(&[1,2,3]) → pos=0→3
+        loop_.prefill(&[1, 2, 3]).unwrap();
+        // run(1, 0) → 1 decode step
+        loop_.run(1, 0).unwrap();
+
+        let observed = log.lock().unwrap().clone();
+
+        // PrefillStart: pos=0, decode_step=0 (prefill 직전)
+        let prefill_start = observed
+            .iter()
+            .find(|(p, _, _)| p == &Phase::PrefillStart)
+            .unwrap();
+        assert_eq!(
+            (prefill_start.1, prefill_start.2),
+            (0, 0),
+            "PrefillStart pos==0"
+        );
+
+        // PrefillEnd: pos=3, decode_step=0 (pos 갱신 후)
+        let prefill_end = observed
+            .iter()
+            .find(|(p, _, _)| p == &Phase::PrefillEnd)
+            .unwrap();
+        assert_eq!((prefill_end.1, prefill_end.2), (3, 0), "PrefillEnd pos==3");
+
+        // DecodeStart: pos=3, decode_step=0 (루프 진입 시)
+        let decode_start = observed
+            .iter()
+            .find(|(p, _, _)| p == &Phase::DecodeStart)
+            .unwrap();
+        assert_eq!(
+            (decode_start.1, decode_start.2),
+            (3, 0),
+            "DecodeStart pos==3, step==0"
+        );
+
+        // DecodeEnd: pos=4, decode_step=1 (bookkeeping 후)
+        let decode_end = observed
+            .iter()
+            .find(|(p, _, _)| p == &Phase::DecodeEnd)
+            .unwrap();
+        assert_eq!(
+            (decode_end.1, decode_end.2),
+            (4, 1),
+            "DecodeEnd pos==4, step==1"
+        );
     }
 }

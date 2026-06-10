@@ -17,7 +17,7 @@
 //!
 //! # Phase β 배선 상태
 //!
-//! 이번 substep(β-1)에서는 어디에도 배선하지 않는다 — production 소비자 0.
+//! β-2 에서 `DecodeLoop::prefill`/`run` 에 배선됨 (`run_until_stop` 은 β-6).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

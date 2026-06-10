@@ -2,10 +2,14 @@
 //!
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5 (PipelineStage 모델).
 //!
-//! 본 파일은 **Phase α-W 에서 신설된 추가적(additive) 타입 어휘**다 — 아직 live decode
-//! loop(`session/decode_loop.rs`, v1 7-trait)에 배선되지 않았다. v1 7-trait → 단일
-//! `PipelineStage` 전환(DecodeLoop 재작성)은 Phase β 다 (§9). 따라서 이 파일의 추가는
-//! 기존 동작을 바꾸지 않는다(byte-identical).
+//! **Phase β-2 배선 상태**: `session/decode_loop.rs` 의 `prefill`/`run` 에 9 phase 가
+//! 발화된다 — PrefillStart·PrefillEnd (prefill 2종), DecodeStart·PreForward·PostForward·
+//! PreSample·PostSample·DecodeEnd (per-token 6종), Finalize. `run_until_stop` 은 β-6
+//! 에서 통합 예정 (현재 미발화).
+//!
+//! **미발화 orphan (§5.2.1 (라))**: PreEviction·PostEviction 은 β-3, TurnStart·TurnEnd·
+//! SessionStart·SessionEnd 는 β-6, PreLayer·PostLayer·Fine 는 β 범위 밖(`INV-HOTPATH-DISPATCH`
+//! layer-tier dyn 금지) — enum variant 로 정의만 존재.
 //!
 //! 거버넌스: §1.2 Mechanism over policy(순서·안전 = stage 작성자 책임, §5.3),
 //! `INV-DECODE-STAGE-001/004/005/006/007`, `INV-STAGE-LAYER-HANDLE`, `INV-HOTPATH-DISPATCH`.
