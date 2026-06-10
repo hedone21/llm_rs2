@@ -33,7 +33,7 @@ eviction 자체는 final_pos 회계로 확인 가능).
 | KV dtype | sig (생성텍스트 2줄 md5) | CacheEvent marker | generated summary | Decode ms/tok (median) |
 |---|---|---|---|---|
 | f16 | `c41930a5a1ccfef825ff0e81f8f04e13` | `policy='sliding@Warning', removed=459, new_pos=459` | `generated=128 (first=16 + run=127) stopped_by=BudgetExhausted final_pos=586` | **60.19** (60.13/60.24/60.19) |
-| q4  | `84db59fb755c596dca858e6605db0cb5` | `policy='sliding@Warning', removed=459, new_pos=459` | 동일 | **59.56** (59.56/59.62/59.53) |
+| q4  | `84db59fb755c596dca858e6605db0cb5` | `policy='sliding@Warning', removed=459, new_pos=459` | `generated=128 (first=220 + run=127) stopped_by=BudgetExhausted final_pos=586` (first 토큰은 f16 과 상이 — β-4 재검증으로 정밀화 2026-06-10) | **59.56** (59.56/59.62/59.53) |
 
 - sig 추출: `grep -B2 '^TTFT' out | head -2 | md5sum` (생성 텍스트 마지막 2줄 — 본 시나리오 출력은 2줄).
 - 필수 marker: `[Resilience] Directive seq=1: KvEvictSliding { keep_ratio: 0.5 }` + `[CacheEvent] Eviction completed` + `[CacheEvent] Budget eviction (forced)`.
