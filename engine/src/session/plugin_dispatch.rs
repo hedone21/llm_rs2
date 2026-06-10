@@ -30,9 +30,11 @@ pub fn register_dynamic_plugins(paths: &[PathBuf]) -> Result<()> {
         );
         let stages = crate::pressure::eviction::stage_registry::try_register_stage(&lib, path)?;
         let formats = crate::format::dynamic_format_registry::try_register_format(&lib, path)?;
-        if stages + formats == 0 {
+        let backends =
+            crate::capability::dynamic_backend_registry::try_register_backend_cap(&lib, path)?;
+        if stages + formats + backends == 0 {
             anyhow::bail!(
-                "plugin {}: 등록된 capability 0 (register_kv_stages_v2·register_kv_formats_v2 부재 — export_plugin! 누락?)",
+                "plugin {}: 등록된 capability 0 (register_kv_stages_v2·register_kv_formats_v2·register_backend_caps_v2 부재 — export_plugin! 누락?)",
                 path.display()
             );
         }

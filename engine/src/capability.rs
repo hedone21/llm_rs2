@@ -23,6 +23,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod dynamic_backend_registry;
 pub mod gpu_score;
 pub mod kivi_attention;
 
