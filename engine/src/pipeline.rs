@@ -7,9 +7,14 @@
 //! PreSample·PostSample·DecodeEnd (per-token 6종), Finalize. `run_until_stop` 은 β-6
 //! 에서 통합 예정 (현재 미발화).
 //!
-//! **미발화 orphan (§5.2.1 (라))**: PreEviction·PostEviction 은 β-3, TurnStart·TurnEnd·
-//! SessionStart·SessionEnd 는 β-6, PreLayer·PostLayer·Fine 는 β 범위 밖(`INV-HOTPATH-DISPATCH`
-//! layer-tier dyn 금지) — enum variant 로 정의만 존재.
+//! **β-3 추가**: PreEviction·PostEviction 은 `run()` 의 (a.6)↔(b)↔(c) 슬롯에서 발화됨
+//! (run()만 — `run_until_stop`/chat 은 β-6). `EvictionStage`(stages/kv/eviction.rs)가 PreEviction
+//! 에서 UER 로 force-evict 하고, driver 가 held handle 의 `current_pos` 를 query 해 pos-환류
+//! (§5.2.1 (가)).
+//!
+//! **미발화 orphan (§5.2.1 (라))**: TurnStart·TurnEnd·SessionStart·SessionEnd 는 β-6,
+//! PreLayer·PostLayer·Fine 는 β 범위 밖(`INV-HOTPATH-DISPATCH` layer-tier dyn 금지) — enum
+//! variant 로 정의만 존재.
 //!
 //! 거버넌스: §1.2 Mechanism over policy(순서·안전 = stage 작성자 책임, §5.3),
 //! `INV-DECODE-STAGE-001/004/005/006/007`, `INV-STAGE-LAYER-HANDLE`, `INV-HOTPATH-DISPATCH`.

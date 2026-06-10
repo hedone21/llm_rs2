@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crate::format::KVCacheFormat;
 use crate::observability::profile::OpProfiler;
 use crate::pipeline::StopReason as StageStopReason;
 use crate::pipeline::{LifecyclePhase, PipelineDispatcher, Pressure, StageContext, StepInfo};
@@ -53,6 +54,11 @@ pub struct DecodeLoop {
     // β-2: L2 PipelineStage dispatch 배선. default = empty registry (len==0 fast-path
     // 로 happy-path 거동-0). run_until_stop 은 β-6 에서 통합 — 현재 미발화.
     pipeline: Arc<PipelineRegistry>,
+    // β-3: pos-환류용 held handle (§5.2.1 (가) — StageOutcome 무변경, EvictionStage 가 cache 의
+    // current_pos 를 prune 한 뒤 driver 가 동일 layer-0 handle 의 current_pos 를 query 해 loop pos
+    // 를 동기화). trait object(INV-LAYER-006). None(happy/chat/기존 전부) → 환류 skip + 빈 registry
+    // = 거동-0. β-4 cutover 전제 배선 — registry submit 은 β-4 CommandDispatcher.
+    kv_pos_handle: Option<Arc<dyn KVCacheFormat>>,
     // β-1 계약 (v2 §5.2.1): DecodeLoop 이 OpProfiler 1개 소유, dispatch 호출부마다
     // &mut 재대여 (StageContext.profiler).
     profiler: OpProfiler,
@@ -95,6 +101,39 @@ impl DecodeLoop {
             profiler: &mut self.profiler,
         };
         self.pipeline.dispatch(phase, &mut ctx)
+    }
+
+    /// β-3 pos-환류 (§5.2.1 (가)): EvictionStage 가 PreEviction/PostEviction dispatch 에서
+    /// cache 의 `current_pos` 를 prune 했을 수 있으므로, held layer-0 handle 의 `current_pos` 를
+    /// 읽어 loop `pos` 를 동기화한다. `StageOutcome` 은 무변경(query-only) — driver 가 prune 량을
+    /// 산출해 v1 (a.5) 와 동일하게 `forward.on_kv_prune`(GPU plan invalidate) + observer 통지.
+    ///
+    /// `kv_pos_handle == None`(happy/chat/기존 전부) 면 즉시 return → **거동-0**. 빈 registry 면
+    /// PreEviction/PostEviction dispatch 가 len==0 fast-path 라 cache 가 변할 일이 없어 new_pos ==
+    /// self.pos → 환류 자체가 no-op.
+    fn reconcile_kv_pos_after_eviction(&mut self, stop: &AtomicBool) {
+        let Some(h) = &self.kv_pos_handle else {
+            return;
+        };
+        let new_pos = h.current_pos();
+        if new_pos < self.pos {
+            let removed = self.pos - new_pos;
+            self.pos = new_pos;
+            // GPU plan invalidate (stale offset 방지) — v1 (a.5) on_kv_prune 등가.
+            self.forward.on_kv_prune(new_pos);
+            // v1 (a.5)/(b) 와 동일하게 observer 통지.
+            let ctx = step_ctx(
+                self.pos,
+                self.prev_token,
+                self.kv_capacity,
+                self.decode_step,
+                stop,
+            );
+            let outcome = EvictionOutcome::Pruned { removed, new_pos };
+            for obs in &mut self.observers {
+                obs.on_eviction(&ctx, &outcome);
+            }
+        }
     }
 
     /// v2 StopReason(pipeline.rs 4-variant) → v1 StopReason(traits.rs) 수렴 매핑
@@ -270,6 +309,15 @@ impl DecodeLoop {
                 }
             }
 
+            // PreEviction: (a.6) 블록 끝, (b) v1 eviction 직전 (§5.2.1 (나) — command-poll 직후·
+            // forward 직전). v2 EvictionStage(command-driven OneShot) 가 여기서 발화한다 — UER 로
+            // cache 를 prune 한 뒤 pos-환류로 loop pos 동기화 (§5.2.1 (가)).
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::PreEviction) {
+                stopped_by = Self::map_stage_stop(r);
+                break;
+            }
+            self.reconcile_kv_pos_after_eviction(&stop);
+
             // (b) eviction
             let ctx = step_ctx(
                 self.pos,
@@ -293,6 +341,15 @@ impl DecodeLoop {
                 self.pos = new_pos;
                 self.forward.on_kv_prune(new_pos);
             }
+
+            // PostEviction: (b) v1 eviction 직후, (c) swap before 직전 (§5.2.1 (나)). pressure
+            // band-driven Persistent EvictionStage 등 v1 eviction 후속 발화 슬롯. dispatch 후
+            // pos-환류로 loop pos 동기화.
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::PostEviction) {
+                stopped_by = Self::map_stage_stop(r);
+                break;
+            }
+            self.reconcile_kv_pos_after_eviction(&stop);
 
             // (c) swap before
             let ctx = step_ctx(
@@ -619,6 +676,7 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     stop_flag: Option<Arc<AtomicBool>>,
     cache_manager: Option<crate::pressure::cache_manager::CacheManager>,
     pipeline: Option<Arc<PipelineRegistry>>,
+    kv_pos_handle: Option<Arc<dyn KVCacheFormat>>,
     kv_capacity: usize,
 }
 
@@ -643,6 +701,7 @@ impl DecodeLoopBuilder<NoForward> {
             stop_flag: None,
             cache_manager: None,
             pipeline: None,
+            kv_pos_handle: None,
             kv_capacity: 0,
         }
     }
@@ -661,6 +720,7 @@ impl DecodeLoopBuilder<NoForward> {
             stop_flag: self.stop_flag,
             cache_manager: self.cache_manager,
             pipeline: self.pipeline,
+            kv_pos_handle: self.kv_pos_handle,
             kv_capacity: self.kv_capacity,
         }
     }
@@ -716,6 +776,14 @@ impl<F> DecodeLoopBuilder<F> {
         self
     }
 
+    /// β-3: pos-환류용 held handle 주입(§5.2.1 (가)). EvictionStage 가 prune 한 cache 의
+    /// `current_pos` 를 driver 가 query 하는 layer-0 handle (`Arc<StandardFormat>` →
+    /// `Arc<dyn KVCacheFormat>` coercion). 미주입(None) 이면 환류 skip → 거동-0.
+    pub fn with_kv_pos_handle(mut self, h: Arc<dyn KVCacheFormat>) -> Self {
+        self.kv_pos_handle = Some(h);
+        self
+    }
+
     /// P3.3: [`ResilienceAdapter`]를 3개 slot(cmd_source / report / tick_sink)에 동시에 주입한다.
     ///
     /// 단일 인스턴스를 `Arc<Mutex<ResilienceAdapter>>`로 감싸 3개 newtype wrapper에 공유하므로
@@ -764,6 +832,7 @@ impl DecodeLoopBuilder<HasForward> {
             pipeline: self
                 .pipeline
                 .unwrap_or_else(|| Arc::new(PipelineRegistry::new())),
+            kv_pos_handle: self.kv_pos_handle,
             profiler: OpProfiler::new(),
             pos: 0,
             decode_step: 0,
@@ -1085,16 +1154,22 @@ mod tests {
         loop_.run(2, 0).unwrap();
 
         let observed = log.lock().unwrap().clone();
+        // β-3: 각 DecodeStart 직후 PreEviction, v1 eviction 후 PostEviction 발화
+        // (§5.2.1 (나) — command-poll 직후·forward 직전).
         let expected = vec![
             Phase::PrefillStart,
             Phase::PrefillEnd,
             Phase::DecodeStart,
+            Phase::PreEviction,
+            Phase::PostEviction,
             Phase::PreForward,
             Phase::PostForward,
             Phase::PreSample,
             Phase::PostSample,
             Phase::DecodeEnd,
             Phase::DecodeStart,
+            Phase::PreEviction,
+            Phase::PostEviction,
             Phase::PreForward,
             Phase::PostForward,
             Phase::PreSample,
@@ -1234,5 +1309,104 @@ mod tests {
             (4, 1),
             "DecodeEnd pos==4, step==1"
         );
+    }
+
+    // ── β-3 loop-level pos-환류 테스트 ─────────────────────────────────────
+
+    /// OneShot EvictionStage 가 PreEviction 에서 발화 → cache prune → driver 가
+    /// `reconcile_kv_pos_after_eviction` 으로 loop pos 를 handle.current_pos() 와 동기화하고
+    /// observer 가 on_eviction(Pruned) 를 1회 수신. Consumed → registry GC (len==0).
+    #[test]
+    fn eviction_stage_pos_reconcile_and_observer() {
+        use crate::backend::Backend;
+        use crate::backend::cpu::CpuBackend;
+        use crate::buffer::DType;
+        use crate::format::KVCacheFormat;
+        use crate::memory::host::shared::SharedBuffer;
+        use crate::pressure::cache_manager::CacheManager;
+        use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
+        use crate::pressure::kv_cache::KVCache;
+        use crate::pressure::standard_format::StandardFormat;
+        use crate::resilience::sys_monitor::NoOpMonitor;
+        use crate::shape::Shape;
+        use crate::stages::kv::eviction::EvictionStage;
+        use crate::tensor::Tensor;
+        use std::sync::atomic::AtomicUsize;
+
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 32;
+        const MAX_SEQ: usize = 128;
+        const N_TOKENS: usize = 120; // ratio=0.3 → remove=84 ≥ MIN_EVICT_TOKENS(64).
+
+        // 실물 F32 KVCache (current_pos = N_TOKENS) 를 StandardFormat 으로 wrap.
+        let total = MAX_SEQ * KV_HEADS * HEAD_DIM;
+        let k_buf = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+        let v_buf = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let shape = Shape::new(vec![1, MAX_SEQ, KV_HEADS, HEAD_DIM]);
+        let k = Tensor::new(shape.clone(), k_buf, backend.clone());
+        let v = Tensor::new(shape, v_buf, backend);
+        let mut cache = KVCache::new(k, v, MAX_SEQ);
+        cache.current_pos = N_TOKENS;
+        let handle = Arc::new(StandardFormat::new(0, cache));
+
+        // OneShot EvictionStage: sliding(window=10, prefix=4) → prune.
+        let policy = Box::new(SlidingWindowPolicy::new(10, 4));
+        let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.3);
+        let stage = EvictionStage::one_shot(vec![handle.clone()], cm, 0.3);
+
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(stage));
+        assert_eq!(registry.len(), 1);
+
+        // observer: on_eviction(Pruned) 수신 횟수 카운트.
+        struct PruneCountObserver {
+            count: Arc<AtomicUsize>,
+        }
+        impl DecodeObserver for PruneCountObserver {
+            fn on_eviction(&mut self, _ctx: &StepCtx, outcome: &EvictionOutcome) {
+                if matches!(outcome, EvictionOutcome::Pruned { .. }) {
+                    self.count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let prune_count = Arc::new(AtomicUsize::new(0));
+
+        let pos_handle: Arc<dyn KVCacheFormat> = handle.clone();
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .with_pipeline(Arc::clone(&registry))
+            .with_kv_pos_handle(pos_handle)
+            .add_observer(PruneCountObserver {
+                count: prune_count.clone(),
+            })
+            .build();
+
+        // prefill N_TOKENS → driver pos = N_TOKENS (handle.current_pos 와 일치).
+        // budget=1: 첫 step 의 PreEviction 발화로 prune·reconcile 만 검증한다 (MockForward 는
+        // KVCache 를 advance 하지 않아 step ≥2 에서 handle.current_pos < loop pos 가 누적되며
+        // reconcile 이 재발동하는 테스트-아티팩트를 회피 — production forward.step 은 advance).
+        let prompt: Vec<u32> = (0..N_TOKENS as u32).collect();
+        loop_.prefill(&prompt).unwrap();
+        let result = loop_.run(1, 0).unwrap();
+
+        // EvictionStage 발화 후 handle.current_pos < N_TOKENS (sliding prune).
+        let new_pos = handle.current_pos();
+        assert!(new_pos < N_TOKENS, "eviction prune (got pos={new_pos})");
+        // reconcile 이 발동해 observer 가 Pruned 정확히 1회 수신.
+        assert_eq!(
+            prune_count.load(Ordering::SeqCst),
+            1,
+            "on_eviction(Pruned) 정확히 1회"
+        );
+        // 첫 step 의 PreEviction prune 으로 loop pos 가 new_pos 로 동기화된 뒤 step 진행으로 +1
+        // → final_pos == new_pos + 1.
+        assert_eq!(result.final_pos, new_pos + 1, "pos 환류 후 step 진행 정합");
+        // OneShot Consumed → registry GC.
+        assert_eq!(registry.len(), 0, "OneShot Consumed 후 registry GC");
     }
 }

@@ -122,7 +122,11 @@ impl StandardFormat {
     /// `KVCache: !Default` 이므로 `mem::take` 불가 → cache 자신의 backend 로 만든 0-size
     /// placeholder 로 `mem::replace`. placeholder 는 `put_inner` 까지 microsecond 만 잔존(eviction
     /// = turn 경계 cold path 라 per-layer 0-byte 할당 무시 가능).
-    pub(crate) fn take_inner(&self) -> KVCache {
+    ///
+    /// **β-3 commit B**: `EvictionStage`(stages/kv/eviction.rs)가 동일 UER 로 `force_evict` 를
+    /// 적용하고, 등가 integration test 가 stage 산출 byte 를 직접 읽기 위해 `pub` 으로 노출한다
+    /// (v1 `try_evict`(model_forward.rs:518-548)와 같은 take/put 페어).
+    pub fn take_inner(&self) -> KVCache {
         let mut guard = self.inner.lock().unwrap();
         let backend = guard.cache.k_buffer.backend().clone();
         let buf = Arc::new(SharedBuffer::new(0, DType::F32));
@@ -132,7 +136,7 @@ impl StandardFormat {
     }
 
     /// `take_inner` 의 역연산 — evict 된 `KVCache` 를 다시 넣는다(placeholder 폐기).
-    pub(crate) fn put_inner(&self, cache: KVCache) {
+    pub fn put_inner(&self, cache: KVCache) {
         self.inner.lock().unwrap().cache = cache;
     }
 

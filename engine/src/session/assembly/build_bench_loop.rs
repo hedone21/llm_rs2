@@ -179,9 +179,21 @@ pub fn build_bench_loop(
         plan_enabled,
     )?;
 
+    // β-3: pos-환류용 layer-0 fmt handle (§5.2.1 (가)). β-4 CommandDispatcher 가 EvictionStage 를
+    // submit 할 때를 위한 전제 배선 — registry submit 자체는 β-4. coercion: Arc<StandardFormat> →
+    // Arc<dyn KVCacheFormat>.
+    let kv_pos_handle: Option<Arc<dyn crate::format::KVCacheFormat>> = mf
+        .fmt_caches()
+        .first()
+        .map(|f| f.clone() as Arc<dyn crate::format::KVCacheFormat>);
+
     let use_stateful =
         sampling_config.repetition_penalty != 1.0 || sampling_config.temperature != 0.0;
     let builder = DecodeLoopBuilder::new().with_forward(mf);
+    let builder = match kv_pos_handle {
+        Some(h) => builder.with_kv_pos_handle(h),
+        None => builder,
+    };
     let builder = if use_stateful {
         builder.with_sampler(RepetitionPenaltySampler::new(sampling_config, vocab_size))
     } else {
