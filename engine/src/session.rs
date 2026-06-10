@@ -13,6 +13,7 @@ pub mod eval;
 pub mod experiment_run;
 pub mod forward;
 pub mod init;
+pub mod local_pressure;
 pub mod pipeline_registry;
 pub mod plugin_dispatch;
 pub mod ppl;

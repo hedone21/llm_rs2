@@ -139,6 +139,30 @@ pub fn build_resilience_cache_manager(
     Ok(Some(cm))
 }
 
+/// β-5: argus-bench 용 memory-only [`LocalPressureSource`] 를 구성한다.
+///
+/// [`build_resilience_cache_manager`] 의 monitor/threshold 구성과 동일 의미(discrete GPU 면
+/// `NoOpMonitor` = 압력 없음, 그 외 `LinuxSystemMonitor`). eviction/swap 도 resilience 도 없는
+/// happy-path(`eviction=none` + swap-dir 없음 + resilience 없음)에서는 호출처가 `None` 으로 흘려
+/// **무주입**한다 (per-token syscall 차단, G4). 본 함수는 source 객체만 만들고, 주입 여부는
+/// 호출처(`experiment_run.rs`)가 결정한다.
+pub fn build_local_pressure_source(
+    args: &Args,
+    backend: &Arc<dyn Backend>,
+) -> Arc<dyn crate::pipeline::PressureSource> {
+    let monitor: Arc<dyn crate::resilience::sys_monitor::SystemMonitor> =
+        if backend.is_discrete_gpu() {
+            Arc::new(NoOpMonitor)
+        } else {
+            Arc::new(LinuxSystemMonitor)
+        };
+    let threshold_bytes = args.memory_threshold_mb() * 1024 * 1024;
+    Arc::new(crate::session::local_pressure::LocalPressureSource::new(
+        monitor,
+        threshold_bytes,
+    ))
+}
+
 /// [`build_standard_loop`](super::build_standard_loop) 와 동일 골격 + resilience
 /// eviction `CacheManager` 주입. `cache_manager=None` 이면 happy-path 와 동등.
 ///
@@ -156,6 +180,8 @@ pub fn build_bench_loop(
     plan_enabled: bool,
     resilience: Option<ResilienceAdapter>,
     cache_manager: Option<CacheManager>,
+    // β-5: graded 압력 source (memory-only). None → 무주입(happy-path per-token syscall 0).
+    pressure_source: Option<Arc<dyn crate::pipeline::PressureSource>>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // ADR-0008: decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고
@@ -241,6 +267,10 @@ pub fn build_bench_loop(
     };
     let builder = match dispatcher {
         Some(d) => builder.with_command_dispatcher(d),
+        None => builder,
+    };
+    let builder = match pressure_source {
+        Some(s) => builder.with_pressure_source(s),
         None => builder,
     };
     Ok(builder.build())

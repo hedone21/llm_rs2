@@ -14,7 +14,9 @@
 
 use crate::experiment::{JsonlWriter, SummaryRecord, SystemSampler, TokenRecord};
 use crate::inference::sampling;
-use crate::session::assembly::{build_bench_loop, build_resilience_cache_manager};
+use crate::session::assembly::{
+    build_bench_loop, build_local_pressure_source, build_resilience_cache_manager,
+};
 use crate::session::standard_happy::StandardHappyCtx;
 use crate::session::traits::StopReason;
 
@@ -57,6 +59,13 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     // (eviction=none 이면 None → happy-path 동등). plan.evict directive 가 오면
     // decode 루프가 forward.try_evict 로 mid-decode prune.
     let cache_manager = build_resilience_cache_manager(&args, &backend)?;
+    // β-5: graded 압력 source 는 cache_manager 가 있을 때(eviction/swap 활성)만 주입한다 —
+    // happy-path(eviction=none + swap-dir 없음 → cache_manager=None)는 무주입해 per-token
+    // /proc 읽기를 차단한다(G4). source 가 있어도 pressure 소비자(Persistent EvictionStage)가
+    // 등록돼 있어야 실제 발화하며, N-step 캐시로 syscall 빈도를 제한한다.
+    let pressure_source = cache_manager
+        .as_ref()
+        .map(|_| build_local_pressure_source(&args, &backend));
     // ADR-0008: bin_setup이 dispatch한 kv_caches를 소비(과거엔 drop 후 typed 재할당).
     let mut decode_loop = build_bench_loop(
         backend.clone(),
@@ -69,6 +78,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         !args.no_gpu_plan,
         resilience,
         cache_manager,
+        pressure_source,
     )?;
 
     let t_prefill = std::time::Instant::now();

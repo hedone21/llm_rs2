@@ -19,6 +19,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use llm_shared::Level;
+
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
 use crate::pressure::cache_manager::CacheManager;
 use crate::pressure::kv_cache::KVCache;
@@ -44,14 +46,17 @@ pub struct EvictionStage {
     cache_manager: Arc<Mutex<CacheManager>>,
     /// score-free force_evict 의 target ratio.
     target_ratio: f32,
+    /// β-5: Persistent band-driven 발화 임계. `Some(min)` 이면 `PreEviction` 에서
+    /// `ctx.step.pressure.band() >= min` 일 때만 prune 한다(미달 시 `Continue`, no-op).
+    /// `None`(OneShot) 이면 무조건 발화(v1 AB-1 = command-driven, 압력 무관).
+    min_band: Option<Level>,
 }
 
 impl EvictionStage {
     /// command-driven OneShot eviction (v1 AB-1 동일 조건 — score-free `force_evict`).
     ///
     /// 1회 발화 후 `Consumed` 를 반환해 registry 가 GC 한다(sticky 재적용 방지 — v1 `evict_applied`
-    /// 게이트 등가). Persistent band-driven 변형(β-5)은 동일 핸들·CacheManager 로 `Persistent`
-    /// lifecycle 만 바꿔 생성하면 되며, `on_phase` 본문(UER)은 그대로다.
+    /// 게이트 등가). 압력 무관(`min_band=None`).
     ///
     /// β-4: `cache_manager` 는 `Arc<Mutex<CacheManager>>` — CommandDispatcher 가 보유한 단일 CM 을
     /// directive 마다 새 OneShot stage 에 clone 주입한다(공유).
@@ -65,7 +70,49 @@ impl EvictionStage {
             handles,
             cache_manager,
             target_ratio,
+            min_band: None,
         }
+    }
+
+    /// β-5: pressure-driven Persistent eviction. 세션 내내 상주하며, `PreEviction` 에서
+    /// `ctx.step.pressure.band() >= min_band` 일 때만 prune 한다(미달 시 `Continue`, no-op).
+    ///
+    /// **OneShot 과 同코드**: prune 본문([`run_eviction`](Self::run_eviction))은 공유하고,
+    /// lifecycle(GC 여부)·발화 조건(band 게이트)만 분기한다. 같은 입력 캐시에서 band 충족 시의
+    /// 발화 산출은 OneShot 과 byte-identical (unit `persistent_band_met_matches_one_shot`).
+    pub fn persistent(
+        handles: Vec<Arc<StandardFormat>>,
+        cache_manager: Arc<Mutex<CacheManager>>,
+        target_ratio: f32,
+        min_band: Level,
+    ) -> Self {
+        Self {
+            lifecycle: StageLifecycle::Persistent,
+            handles,
+            cache_manager,
+            target_ratio,
+            min_band: Some(min_band),
+        }
+    }
+
+    /// prune 본문 (UER, Unwrap-Evict-Rewrap) — OneShot/Persistent 공유.
+    ///
+    /// v1 try_evict(model_forward.rs:524-541)의 inner op 그대로. take_inner 로 inner cache 들을
+    /// 연속 Vec 로 꺼내(W1 순서 보존) force_evict 후, Err/Ok 무관하게 put_inner 로 되돌린다
+    /// (placeholder 폐기 — `?` 전파를 rewrap 이후로 미룸).
+    fn run_eviction(&self) -> anyhow::Result<()> {
+        let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
+        let result = self
+            .cache_manager
+            .lock()
+            .expect("EvictionStage CacheManager Mutex poisoned")
+            .force_evict(&mut temp, self.target_ratio);
+        for (f, c) in self.handles.iter().zip(temp) {
+            f.put_inner(c);
+        }
+        // Err → dispatcher 가 panic (fail-fast 계약, INV-DECODE-STAGE-004).
+        result?;
+        Ok(())
     }
 }
 
@@ -81,27 +128,22 @@ impl PipelineStage for EvictionStage {
     fn on_phase(
         &self,
         phase: &LifecyclePhase,
-        _ctx: &mut StageContext<'_>,
+        ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<StageOutcome> {
         // self-filter (§5.3): eviction 외 phase 는 무시.
         if *phase != LifecyclePhase::PreEviction {
             return Ok(StageOutcome::Continue);
         }
 
-        // UER (Unwrap-Evict-Rewrap) — v1 try_evict(model_forward.rs:524-541)의 inner op 그대로.
-        // take_inner 로 inner cache 들을 연속 Vec 로 꺼내(W1 순서 보존) force_evict 후, Err/Ok
-        // 무관하게 put_inner 로 되돌린다(placeholder 폐기 — `?` 전파를 rewrap 이후로 미룸).
-        let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
-        let result = self
-            .cache_manager
-            .lock()
-            .expect("EvictionStage CacheManager Mutex poisoned")
-            .force_evict(&mut temp, self.target_ratio);
-        for (f, c) in self.handles.iter().zip(temp) {
-            f.put_inner(c);
+        // β-5: Persistent band 게이트 — 압력 미달이면 prune 없이 Continue (no-op).
+        // OneShot(min_band=None) 은 무조건 발화 (command-driven, 압력 무관).
+        if let Some(min) = self.min_band
+            && ctx.step.pressure.band() < min
+        {
+            return Ok(StageOutcome::Continue);
         }
-        // Err → dispatcher 가 panic (fail-fast 계약, INV-DECODE-STAGE-004).
-        result?;
+
+        self.run_eviction()?;
 
         match self.lifecycle {
             StageLifecycle::OneShot => Ok(StageOutcome::Consumed),
@@ -159,11 +201,15 @@ mod tests {
     }
 
     fn make_ctx(profiler: &mut OpProfiler) -> StageContext<'_> {
+        make_ctx_with_pressure(profiler, 0)
+    }
+
+    fn make_ctx_with_pressure(profiler: &mut OpProfiler, pressure: u8) -> StageContext<'_> {
         StageContext {
             step: StepInfo {
                 pos: 0,
                 decode_step: 0,
-                pressure: Pressure::new(0),
+                pressure: Pressure::new(pressure),
             },
             profiler,
         }
@@ -227,5 +273,95 @@ mod tests {
         // take_inner 로 꺼내도 capacity 가 보존됨.
         let inner = handle.take_inner();
         assert_eq!(inner.capacity(), MAX_SEQ, "put_inner 가 실물 cache 를 복원");
+    }
+
+    // ── β-5: Persistent band-driven 발화 ──
+
+    /// Persistent: band 충족(Warning 이상) 시 발화 → Continue + cache prune.
+    #[test]
+    fn persistent_band_met_fires_and_continues() {
+        let handle = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
+        let stage = EvictionStage::persistent(
+            vec![handle.clone()],
+            make_cache_manager(),
+            TARGET_RATIO,
+            Level::Warning,
+        );
+
+        let mut profiler = OpProfiler::new();
+        // pressure=50 → band()=Warning >= min(Warning) → 발화.
+        let mut ctx = make_ctx_with_pressure(&mut profiler, 50);
+        let outcome = stage
+            .on_phase(&LifecyclePhase::PreEviction, &mut ctx)
+            .unwrap();
+        assert!(
+            matches!(outcome, StageOutcome::Continue),
+            "Persistent 은 발화해도 Continue(상주, GC 안 함)"
+        );
+        assert!(
+            handle.current_pos() < N_TOKENS,
+            "band 충족 시 prune (got {})",
+            handle.current_pos()
+        );
+    }
+
+    /// Persistent: band 미달(Normal) 시 무발화 → Continue + cache 불변.
+    #[test]
+    fn persistent_band_unmet_is_noop() {
+        let handle = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
+        let stage = EvictionStage::persistent(
+            vec![handle.clone()],
+            make_cache_manager(),
+            TARGET_RATIO,
+            Level::Warning,
+        );
+
+        let mut profiler = OpProfiler::new();
+        // pressure=49 → band()=Normal < min(Warning) → 무발화.
+        let mut ctx = make_ctx_with_pressure(&mut profiler, 49);
+        let outcome = stage
+            .on_phase(&LifecyclePhase::PreEviction, &mut ctx)
+            .unwrap();
+        assert!(matches!(outcome, StageOutcome::Continue));
+        assert_eq!(
+            handle.current_pos(),
+            N_TOKENS,
+            "band 미달 시 prune 없음 (cache 불변)"
+        );
+    }
+
+    /// 同코드 증명: 같은 입력 캐시에서 OneShot 발화 산출 == Persistent(band 충족) 발화 산출.
+    /// `new_pos`(prune 후 current_pos)가 byte-identical 이어야 한다 (run_eviction 공유).
+    #[test]
+    fn persistent_band_met_matches_one_shot() {
+        // OneShot 경로.
+        let h_one = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
+        let one = EvictionStage::one_shot(vec![h_one.clone()], make_cache_manager(), TARGET_RATIO);
+        let mut p1 = OpProfiler::new();
+        let mut c1 = make_ctx_with_pressure(&mut p1, 50);
+        one.on_phase(&LifecyclePhase::PreEviction, &mut c1).unwrap();
+        let one_shot_pos = h_one.current_pos();
+
+        // Persistent(band 충족) 경로 — 동일 입력 캐시·CM·ratio.
+        let h_per = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
+        let per = EvictionStage::persistent(
+            vec![h_per.clone()],
+            make_cache_manager(),
+            TARGET_RATIO,
+            Level::Warning,
+        );
+        let mut p2 = OpProfiler::new();
+        let mut c2 = make_ctx_with_pressure(&mut p2, 50);
+        per.on_phase(&LifecyclePhase::PreEviction, &mut c2).unwrap();
+        let persistent_pos = h_per.current_pos();
+
+        assert_eq!(
+            one_shot_pos, persistent_pos,
+            "OneShot 과 Persistent(band 충족) prune 산출이 동일해야 함 (run_eviction 공유)"
+        );
+        assert!(
+            persistent_pos < N_TOKENS,
+            "양쪽 모두 실제 prune (비-vacuous)"
+        );
     }
 }

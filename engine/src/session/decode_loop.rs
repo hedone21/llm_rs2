@@ -12,7 +12,9 @@ use std::time::Instant;
 use crate::format::KVCacheFormat;
 use crate::observability::profile::OpProfiler;
 use crate::pipeline::StopReason as StageStopReason;
-use crate::pipeline::{LifecyclePhase, PipelineDispatcher, Pressure, StageContext, StepInfo};
+use crate::pipeline::{
+    LifecyclePhase, PipelineDispatcher, Pressure, PressureSource, StageContext, StepInfo,
+};
 use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::pipeline_registry::PipelineRegistry;
 
@@ -61,11 +63,22 @@ pub struct DecodeLoop {
     // β-1 계약 (v2 §5.2.1): DecodeLoop 이 OpProfiler 1개 소유, dispatch 호출부마다
     // &mut 재대여 (StageContext.profiler).
     profiler: OpProfiler,
+    // β-5: graded system 압력 source (memory-only `LocalPressureSource` 등). None(happy/chat) →
+    // StepInfo.pressure = Pressure::default()(=0) — per-token syscall 차단(G4 happy-path 무주입).
+    // build_bench_loop 만 주입한다. trait object (INV-LAYER-006 — Option<Arc<dyn _>> 합치).
+    pressure_source: Option<Arc<dyn PressureSource>>,
+    // β-5 N-step 캐시: 매 step /proc 읽기 금지. decode_step % PRESSURE_QUERY_INTERVAL == 0 일 때만
+    // source 재query, 그 외 step 은 이 캐시값을 재사용한다. source 부재 시 항상 default(0).
+    cached_pressure: Pressure,
     pos: usize,
     decode_step: usize,
     prev_token: u32,
     kv_capacity: usize,
 }
+
+/// β-5: `PressureSource` query 주기 (N-step 캐시 N). 매 decode step 마다 `/proc/meminfo` 를
+/// 읽으면 happy-path 대비 syscall 오버헤드가 누적되므로, N step 마다 1회만 재query 한다.
+const PRESSURE_QUERY_INTERVAL: usize = 8;
 
 /// Build a StepCtx without borrowing the whole DecodeLoop — lets the loop
 /// pass `&mut self.<field>` to trait methods on the same line.
@@ -88,18 +101,32 @@ fn step_ctx<'a>(
 impl DecodeLoop {
     /// β-2: 현재 step 스냅샷으로 phase 1건 dispatch. 빈 registry 는
     /// PipelineRegistry 내부 len==0 fast-path 로 무lock 즉시 반환 (거동-0).
-    /// pressure 는 β-5 (PressureSource 일원화) 전까지 default(0).
+    ///
+    /// β-5: `pressure_source` 가 주입돼 있으면 N-step 캐시(`PRESSURE_QUERY_INTERVAL`)로 graded
+    /// 압력을 갱신해 `StepInfo.pressure` 에 싣는다. source 부재(happy/chat) 면 `cached_pressure` 가
+    /// 항상 `default()`(=0) 라 거동-0 (per-token syscall 0).
     fn dispatch_phase(&mut self, phase: LifecyclePhase) -> Option<StageStopReason> {
+        self.refresh_pressure_if_due();
         let step = StepInfo {
             pos: self.pos,
             decode_step: self.decode_step,
-            pressure: Pressure::default(),
+            pressure: self.cached_pressure,
         };
         let mut ctx = StageContext {
             step,
             profiler: &mut self.profiler,
         };
         self.pipeline.dispatch(phase, &mut ctx)
+    }
+
+    /// β-5: N-step 캐시 갱신. source 가 있고 `decode_step` 이 `PRESSURE_QUERY_INTERVAL` 의 배수일
+    /// 때만 `/proc` 을 재query 한다. source 부재면 no-op(캐시 = default 유지).
+    fn refresh_pressure_if_due(&mut self) {
+        if let Some(src) = &self.pressure_source
+            && self.decode_step.is_multiple_of(PRESSURE_QUERY_INTERVAL)
+        {
+            self.cached_pressure = src.pressure();
+        }
     }
 
     /// β-3 pos-환류 (§5.2.1 (가)): EvictionStage 가 PreEviction/PostEviction dispatch 에서
@@ -648,6 +675,7 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     dispatcher: Option<CommandDispatcher>,
     pipeline: Option<Arc<PipelineRegistry>>,
     kv_pos_handle: Option<Arc<dyn KVCacheFormat>>,
+    pressure_source: Option<Arc<dyn PressureSource>>,
     kv_capacity: usize,
 }
 
@@ -673,6 +701,7 @@ impl DecodeLoopBuilder<NoForward> {
             dispatcher: None,
             pipeline: None,
             kv_pos_handle: None,
+            pressure_source: None,
             kv_capacity: 0,
         }
     }
@@ -692,6 +721,7 @@ impl DecodeLoopBuilder<NoForward> {
             dispatcher: self.dispatcher,
             pipeline: self.pipeline,
             kv_pos_handle: self.kv_pos_handle,
+            pressure_source: self.pressure_source,
             kv_capacity: self.kv_capacity,
         }
     }
@@ -757,6 +787,14 @@ impl<F> DecodeLoopBuilder<F> {
         self
     }
 
+    /// β-5: graded system 압력 source 주입(`LocalPressureSource` 등). 미주입(happy/chat) 이면
+    /// `StepInfo.pressure` = `Pressure::default()`(=0) 로 흘러 per-token syscall 0 (G4 happy-path
+    /// 무주입). `build_bench_loop` 만 주입한다. driver 가 N-step 캐시로 query 한다.
+    pub fn with_pressure_source(mut self, s: Arc<dyn PressureSource>) -> Self {
+        self.pressure_source = Some(s);
+        self
+    }
+
     /// P3.3: [`ResilienceAdapter`]를 3개 slot(cmd_source / report / tick_sink)에 동시에 주입한다.
     ///
     /// 단일 인스턴스를 `Arc<Mutex<ResilienceAdapter>>`로 감싸 3개 newtype wrapper에 공유하므로
@@ -806,6 +844,8 @@ impl DecodeLoopBuilder<HasForward> {
                 .unwrap_or_else(|| Arc::new(PipelineRegistry::new())),
             kv_pos_handle: self.kv_pos_handle,
             profiler: OpProfiler::new(),
+            pressure_source: self.pressure_source,
+            cached_pressure: Pressure::default(),
             pos: 0,
             decode_step: 0,
             prev_token: 0,
