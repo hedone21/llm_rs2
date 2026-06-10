@@ -93,6 +93,9 @@ fn valid_region(cache: &KVCache) -> (Vec<u8>, Vec<u8>) {
 
 /// build_bench_loop.rs:90-128 미러 — 정책 이름으로 [`CacheManager`] 구성.
 /// CacheManager 2벌은 각각 독립 생성(상태 공유 차단).
+///
+/// β-4: `EvictionStage::one_shot` 이 `Arc<Mutex<CacheManager>>` 를 받으므로 stage 용 CM 은
+/// 래핑한다. anchor 용(`force_evict` 직접 호출)은 plain CM 그대로 사용 — 검증 로직·anchor 무변.
 fn make_cache_manager(policy_name: &str, target_ratio: f32) -> CacheManager {
     ensure_builtin_stages_registered().expect("builtin stages register");
     let params = StageParams {
@@ -150,8 +153,8 @@ fn assert_equivalence(
     let handles: Vec<Arc<StandardFormat>> = (0..n_layers)
         .map(|i| Arc::new(StandardFormat::new(i, make_cache(dtype, n_tokens))))
         .collect();
-    let cm_b = make_cache_manager(policy_name, target_ratio);
-    let stage = EvictionStage::one_shot(handles.clone(), cm_b, target_ratio);
+    let cm_b = std::sync::Mutex::new(make_cache_manager(policy_name, target_ratio));
+    let stage = EvictionStage::one_shot(handles.clone(), Arc::new(cm_b), target_ratio);
     let registry = PipelineRegistry::new();
     registry.submit(Arc::new(stage));
 

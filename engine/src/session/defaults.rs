@@ -3,7 +3,7 @@
 //! `DecodeLoopBuilder::build` substitutes these whenever the caller did not
 //! provide a concrete implementation (`with_eviction` / `with_swap` / etc).
 
-use crate::resilience::{ExecutionPlan, KVSnapshot};
+use llm_shared::EngineCommand;
 
 use super::traits::{
     CommandSource, DecodeObserver, EngineReport, EvictionOutcome, EvictionStage, SkipReason,
@@ -37,8 +37,8 @@ impl SwapStage for NoOpSwapStage {
 pub struct NoOpCommandSource;
 
 impl CommandSource for NoOpCommandSource {
-    fn poll(&mut self, _ctx: &StepCtx, _kv: &KVSnapshot) -> anyhow::Result<ExecutionPlan> {
-        Ok(ExecutionPlan::default())
+    fn poll(&mut self) -> anyhow::Result<Vec<EngineCommand>> {
+        Ok(Vec::new())
     }
 }
 
@@ -116,13 +116,9 @@ mod tests {
     }
 
     #[test]
-    fn no_op_command_source_yields_default_plan() {
-        let stop = AtomicBool::new(false);
-        let c = ctx(&stop);
+    fn no_op_command_source_yields_empty_commands() {
         let mut s = NoOpCommandSource;
-        let snap = crate::resilience::KVSnapshot::default();
-        let plan = s.poll(&c, &snap).unwrap();
-        assert!(!plan.suspended);
-        assert_eq!(plan.throttle_delay_ms, 0);
+        let cmds = s.poll().unwrap();
+        assert!(cmds.is_empty());
     }
 }

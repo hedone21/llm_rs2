@@ -284,6 +284,47 @@ impl CommandExecutor {
         self.last_token_time = Some(now);
     }
 
+    /// β-4 (매핑 문서 4부 채택안 (가)): heartbeat interval 이 경과했으면 1회 송출한다.
+    ///
+    /// 구 [`Self::poll`] 의 heartbeat 분기(이 메서드로 분리)와 byte-identical — interval 체크 +
+    /// `send_heartbeat` + `last_heartbeat` 갱신. `ManagerCommandSource` 가 pure `drain_commands`
+    /// 직전에 호출하여 heartbeat 송출 등가를 보존한다(`CommandSource::poll` pure 화 후에도 송출
+    /// 경로 무단절). `kv_snap` 은 source 가 held-handle 에서 query 해 구성한 값.
+    pub fn send_heartbeat_if_due(&mut self, kv_snap: &KVSnapshot) {
+        if self.last_heartbeat.elapsed() >= self.heartbeat_interval {
+            self.send_heartbeat(kv_snap);
+            self.last_heartbeat = Instant::now();
+        }
+    }
+
+    /// β-4 (v2 §5.4 A-1): 도착한 manager command 를 drain 하여 반환한다 (pure 생산).
+    ///
+    /// 구 [`Self::poll`] 의 mpsc drain + per-directive 응답 송출 부분만 분리한다 —
+    /// `apply_command`/`ExecutionPlan` 번역은 하지 않는다(그건 `CommandDispatcher` 책임). drain 한
+    /// command 를 `EngineDirective` 순서대로 평탄화해 반환하며, 각 directive 의 command 수만큼
+    /// `CommandResult::Ok` 응답을 즉시 송출한다(v1 응답 송출 등가 — apply_command 가 항상 Ok 였으므로
+    /// 등가). heartbeat 송출은 별도([`Self::send_heartbeat_if_due`]).
+    pub fn drain_commands(&mut self) -> Vec<EngineCommand> {
+        let mut commands = Vec::new();
+        while let Ok(msg) = self.cmd_rx.try_recv() {
+            match msg {
+                ManagerMessage::Directive(d) => {
+                    let seq_id = d.seq_id;
+                    let mut results = Vec::with_capacity(d.commands.len());
+                    for cmd in &d.commands {
+                        eprintln!("[Resilience] Directive seq={}: {:?}", seq_id, cmd);
+                        results.push(CommandResult::Ok);
+                    }
+                    let _ = self
+                        .resp_tx
+                        .send(EngineMessage::Response(CommandResponse { seq_id, results }));
+                    commands.extend(d.commands);
+                }
+            }
+        }
+        commands
+    }
+
     /// Poll for pending commands and build an ExecutionPlan.
     /// Called once per token in the inference loop.
     pub fn poll(&mut self, kv_snap: &KVSnapshot) -> ExecutionPlan {

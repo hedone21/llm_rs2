@@ -13,7 +13,7 @@ use crate::format::KVCacheFormat;
 use crate::observability::profile::OpProfiler;
 use crate::pipeline::StopReason as StageStopReason;
 use crate::pipeline::{LifecyclePhase, PipelineDispatcher, Pressure, StageContext, StepInfo};
-use crate::resilience::KVSnapshot;
+use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::pipeline_registry::PipelineRegistry;
 
 use super::defaults::{
@@ -44,13 +44,12 @@ pub struct DecodeLoop {
     report: Box<dyn EngineReport>,
     tick_sink: Box<dyn TokenTickSink>,
     stop_flag: Arc<AtomicBool>,
-    // argus-bench AB-1: resilience-driven eviction. `plan.evict` 가 Some 이면
-    // `forward.try_evict(cache_manager, …)` 로 mid-decode prune. None 이면
-    // happy path / chat (eviction 은 자체 turn-boundary 경로) — 무영향.
-    cache_manager: Option<crate::pressure::cache_manager::CacheManager>,
-    // 동일 sticky evict directive 가 매 poll 재적용되지 않도록 active 구간당 1회만
-    // 발동. plan.evict 가 None 으로 돌아오면(RestoreDefaults) false 로 reset.
-    evict_applied: bool,
+    // β-4 (v2 §5.4 A-1): 2-source 명령 분배자. cmd_source.poll() 이 pure 생산한 EngineCommand 를
+    // 받아 ① OneShot EvictionStage submit / ② LoopControl / ③ Hardware seam 으로 분배한다.
+    // L4 동층 합성 — registry/KV handle/공유 cache-manager 는 dispatcher 가 보유(driver 미보유,
+    // INV-LAYER-006 BANNED 비해당). None(happy/chat) → cmd_source 도 NoOp 라 빈 Vec → dispatch
+    // no-op = 거동-0.
+    dispatcher: Option<CommandDispatcher>,
     // β-2: L2 PipelineStage dispatch 배선. default = empty registry (len==0 fast-path
     // 로 happy-path 거동-0). run_until_stop 은 β-6 에서 통합 — 현재 미발화.
     pipeline: Arc<PipelineRegistry>,
@@ -185,19 +184,6 @@ impl DecodeLoop {
         Ok(logits)
     }
 
-    /// Build a minimal KVSnapshot from current loop state.
-    fn build_kv_snapshot(&self) -> KVSnapshot {
-        KVSnapshot {
-            total_tokens: self.pos,
-            capacity: self.kv_capacity,
-            total_bytes: 0, // P3에서 진짜 값 주입
-            protected_prefix: 0,
-            kv_dtype: String::new(),
-            eviction_policy: String::new(),
-            skip_ratio: 0.0,
-        }
-    }
-
     /// Run up to `budget` decode steps starting from `first_token` (the token
     /// already sampled from `prefill`'s last logits). Returns sampled tokens
     /// (does **not** include `first_token`) + reason loop exited. Caller is
@@ -227,85 +213,68 @@ impl DecodeLoop {
                 break;
             }
 
-            // (a) command poll
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &stop,
-            );
-            let kv_snap = self.build_kv_snapshot();
-            let plan = self.cmd_source.poll(&ctx, &kv_snap)?;
-            if plan.suspended {
+            // (a) command poll + dispatch (β-4 v2 §5.4 A-1)
+            // cmd_source.poll() 은 pure 생산(EngineCommand drain). dispatcher 가 ① evict 4종을
+            // OneShot EvictionStage 로 registry.submit, ② control 7종을 LoopControl 로, ③ device
+            // seam 으로 분배한다. dispatcher=None(happy/chat) 이면 cmd_source 도 NoOp → 빈 Vec →
+            // 분배 대상 0 = 거동-0. throttle_delay/target_tbt 의 sticky 는 LoopControl 이 보존.
+            let cmds = self.cmd_source.poll()?;
+            let (suspended, throttle_delay_ms, target_tbt_ms): (bool, u64, u64) =
+                if let Some(d) = self.dispatcher.as_mut() {
+                    let control = d.dispatch(cmds);
+                    (
+                        control.suspended,
+                        control.throttle_delay_ms,
+                        control.target_tbt_ms,
+                    )
+                } else {
+                    (false, 0, 0)
+                };
+            if suspended {
+                // G6: suspend = loop break 보존 (pause/park 전환 금지).
                 stopped_by = StopReason::CommandRequested;
                 break;
             }
-            if plan.throttle_delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
+            if throttle_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
             }
 
-            // (a.5) argus-bench AB-1: resilience-driven eviction. plan.evict
-            // (EvictPlan) 가 Some 이고 active 구간 첫 발동이면 forward.try_evict 로
-            // 1회 prune (score-free force_evict — CacheManager 의 CLI 정책 사용;
-            // H2O 는 score 부재 시 recency degrade, chat 과 동일). CacheManager 가
-            // `[CacheEvent] Eviction completed` 를 emit. sticky carry 매 step
-            // 재적용 방지(target_ratio 반복 적용 시 cache 과다 축소). plan.evict 가
-            // None 으로 돌아오면(RestoreDefaults) 다음 directive 위해 reset.
-            if let Some(evict_plan) = plan.evict.as_ref() {
-                if !self.evict_applied {
-                    self.evict_applied = true;
-                    if let Some(cm) = self.cache_manager.as_ref() {
-                        let (removed, new_pos) =
-                            self.forward
-                                .try_evict(cm, None, true, evict_plan.target_ratio)?;
-                        if removed > 0 {
+            // (a.5) 제거: evict 는 dispatcher 가 OneShot EvictionStage 로 registry 에 submit 했고,
+            // 아래 PreEviction dispatch + pos-환류(β-3 배선)가 이를 소비한다. v1 try_evict 인라인
+            // 경로는 dispatcher.submit + EvictionStage.on_phase 로 cutover 됨.
+
+            // (a.6) argus-bench AB-3: resilience KvOffload / recall. dispatcher 가 보유한 공유
+            // CacheManager(Arc<Mutex>)를 lock 후 (a.6) 동일 로직. offload_ratio 는 transient(directive
+            // 도착 poll 에만 Some)이라 자연히 1회 발동. RestoreDefaults 는 recall_offload +
+            // restore_defaults 를 함께 세팅하여 recall 을 게이트.
+            if let Some(d) = self.dispatcher.as_ref() {
+                let offload_ratio = d.control().offload_ratio;
+                let recall = d.control().recall_offload && d.control().restore_defaults;
+                if let Some(cm) = d.cache_manager() {
+                    if let Some(ratio) = offload_ratio {
+                        let (n, new_pos) = {
+                            let mut guard = cm.lock().expect("CacheManager Mutex poisoned");
+                            self.forward.try_offload(&mut guard, ratio)?
+                        };
+                        eprintln!(
+                            "[Resilience] KvOffload: ratio={:.2}, {} tokens swapped",
+                            ratio, n
+                        );
+                        if n > 0 {
                             self.pos = new_pos;
                             self.forward.on_kv_prune(new_pos);
-                            let ctx = step_ctx(
-                                self.pos,
-                                self.prev_token,
-                                self.kv_capacity,
-                                self.decode_step,
-                                &stop,
-                            );
-                            let outcome = EvictionOutcome::Pruned { removed, new_pos };
-                            for obs in &mut self.observers {
-                                obs.on_eviction(&ctx, &outcome);
-                            }
                         }
                     }
-                }
-            } else {
-                self.evict_applied = false;
-            }
-
-            // (a.6) argus-bench AB-3: resilience KvOffload / recall. offload_ratio
-            // 는 sticky 가 아니라 KvOffload directive 가 도착한 poll 에만 Some 이라
-            // 자연히 1회 발동. RestoreDefaults 는 recall_offload + restore_defaults 를
-            // 함께 세팅하여 recall 을 게이트. offload 는 prune_prefix(pos 감소),
-            // recall 은 pos 증가 → cache 의 새 current_pos 로 loop pos 동기화.
-            if let Some(ratio) = plan.offload_ratio
-                && let Some(cm) = self.cache_manager.as_mut()
-            {
-                let (n, new_pos) = self.forward.try_offload(cm, ratio)?;
-                eprintln!(
-                    "[Resilience] KvOffload: ratio={:.2}, {} tokens swapped",
-                    ratio, n
-                );
-                if n > 0 {
-                    self.pos = new_pos;
-                    self.forward.on_kv_prune(new_pos);
-                }
-            }
-            if plan.recall_offload
-                && plan.restore_defaults
-                && let Some(cm) = self.cache_manager.as_mut()
-            {
-                let (n, new_pos) = self.forward.try_recall(cm)?;
-                if n > 0 {
-                    eprintln!("[Resilience] Recalled {} tokens from swap", n);
-                    self.pos = new_pos;
+                    if recall {
+                        let (n, new_pos) = {
+                            let mut guard = cm.lock().expect("CacheManager Mutex poisoned");
+                            self.forward.try_recall(&mut guard)?
+                        };
+                        if n > 0 {
+                            eprintln!("[Resilience] Recalled {} tokens from swap", n);
+                            self.pos = new_pos;
+                        }
+                    }
                 }
             }
 
@@ -459,9 +428,10 @@ impl DecodeLoop {
             // (h) target TBT pacing — resilience SetTargetTbt 가 설정한 목표
             // wall-clock 에 도달하도록 step 끝에서 sleep. target_tbt_ms == 0
             // (미설정/release) 이면 no-op이라 비-resilience 경로는 무영향.
-            if plan.target_tbt_ms > 0 {
+            // (a) 에서 LoopControl 로부터 읽은 sticky target_tbt_ms 를 사용.
+            if target_tbt_ms > 0 {
                 let elapsed_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
-                let target_ms = plan.target_tbt_ms as f64;
+                let target_ms = target_tbt_ms as f64;
                 if elapsed_ms < target_ms {
                     std::thread::sleep(std::time::Duration::from_secs_f64(
                         (target_ms - elapsed_ms) / 1000.0,
@@ -509,22 +479,23 @@ impl DecodeLoop {
                 break;
             }
 
-            // (a) command poll
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &atomic_stop,
-            );
-            let kv_snap = self.build_kv_snapshot();
-            let plan = self.cmd_source.poll(&ctx, &kv_snap)?;
-            if plan.suspended {
+            // (a) command poll + dispatch (β-4 — chat 도 동일 시그니처, dispatcher=None 거동-0).
+            // chat happy-path 는 cmd_source=NoOp → 빈 Vec → dispatch 미발동. suspend/throttle 시맨틱
+            // 은 run() 과 동일하게 LoopControl 경유. (run_until_stop 단일 driver 통합은 β-6.)
+            let cmds = self.cmd_source.poll()?;
+            let (suspended, throttle_delay_ms): (bool, u64) =
+                if let Some(d) = self.dispatcher.as_mut() {
+                    let control = d.dispatch(cmds);
+                    (control.suspended, control.throttle_delay_ms)
+                } else {
+                    (false, 0)
+                };
+            if suspended {
                 stopped_by = StopReason::CommandRequested;
                 break;
             }
-            if plan.throttle_delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
+            if throttle_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
             }
 
             // (b) eviction
@@ -674,7 +645,7 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     report: Option<Box<dyn EngineReport>>,
     tick_sink: Option<Box<dyn TokenTickSink>>,
     stop_flag: Option<Arc<AtomicBool>>,
-    cache_manager: Option<crate::pressure::cache_manager::CacheManager>,
+    dispatcher: Option<CommandDispatcher>,
     pipeline: Option<Arc<PipelineRegistry>>,
     kv_pos_handle: Option<Arc<dyn KVCacheFormat>>,
     kv_capacity: usize,
@@ -699,7 +670,7 @@ impl DecodeLoopBuilder<NoForward> {
             report: None,
             tick_sink: None,
             stop_flag: None,
-            cache_manager: None,
+            dispatcher: None,
             pipeline: None,
             kv_pos_handle: None,
             kv_capacity: 0,
@@ -718,7 +689,7 @@ impl DecodeLoopBuilder<NoForward> {
             report: self.report,
             tick_sink: self.tick_sink,
             stop_flag: self.stop_flag,
-            cache_manager: self.cache_manager,
+            dispatcher: self.dispatcher,
             pipeline: self.pipeline,
             kv_pos_handle: self.kv_pos_handle,
             kv_capacity: self.kv_capacity,
@@ -756,10 +727,12 @@ impl<F> DecodeLoopBuilder<F> {
         self.kv_capacity = c;
         self
     }
-    /// argus-bench AB-1: resilience-driven eviction 용 [`CacheManager`] 주입.
-    /// 미주입(None) 이면 `plan.evict` 가 와도 eviction 미발동 (happy/chat 동일).
-    pub fn with_cache_manager(mut self, cm: crate::pressure::cache_manager::CacheManager) -> Self {
-        self.cache_manager = Some(cm);
+    /// β-4 (v2 §5.4 A-1): 2-source 명령 분배자 [`CommandDispatcher`] 주입.
+    /// 미주입(None) 이면 `cmd_source` 가 생산한 command 가 분배되지 않는다 (happy/chat — NoOp source
+    /// 라 빈 Vec → 거동-0). dispatcher 는 registry·KV handle·CacheManager 를 보유해 evict directive 를
+    /// OneShot EvictionStage 로 submit 하고 control 을 LoopControl 에 누적한다.
+    pub fn with_command_dispatcher(mut self, d: CommandDispatcher) -> Self {
+        self.dispatcher = Some(d);
         self
     }
     pub fn with_engine_report<T: EngineReport + 'static>(mut self, r: T) -> Self {
@@ -827,8 +800,7 @@ impl DecodeLoopBuilder<HasForward> {
             stop_flag: self
                 .stop_flag
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            cache_manager: self.cache_manager,
-            evict_applied: false,
+            dispatcher: self.dispatcher,
             pipeline: self
                 .pipeline
                 .unwrap_or_else(|| Arc::new(PipelineRegistry::new())),
@@ -1353,7 +1325,8 @@ mod tests {
         // OneShot EvictionStage: sliding(window=10, prefix=4) → prune.
         let policy = Box::new(SlidingWindowPolicy::new(10, 4));
         let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.3);
-        let stage = EvictionStage::one_shot(vec![handle.clone()], cm, 0.3);
+        // β-4: EvictionStage::one_shot 은 Arc<Mutex<CacheManager>> 를 받는다 (시그니처만 적응 — 검증 무변).
+        let stage = EvictionStage::one_shot(vec![handle.clone()], Arc::new(Mutex::new(cm)), 0.3);
 
         let registry = Arc::new(PipelineRegistry::new());
         registry.submit(Arc::new(stage));

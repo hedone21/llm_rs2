@@ -5,6 +5,7 @@ pub mod chat;
 pub mod chat_ipc;
 pub mod chat_template;
 pub mod cli;
+pub mod command_dispatcher;
 pub mod decode_loop;
 pub mod defaults;
 pub mod dump_importance;
@@ -26,6 +27,7 @@ pub mod warmup;
 
 pub use assembly::{build_standard_loop, is_standard_happy_path};
 pub use bin_setup::build_inference_ctx;
+pub use command_dispatcher::{CommandDispatcher, LoopControl};
 pub use decode_loop::{DecodeLoop, DecodeLoopBuilder, HasForward, NoForward};
 pub use defaults::{
     GreedySampler, NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver,

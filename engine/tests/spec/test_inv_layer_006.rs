@@ -17,6 +17,10 @@
 //! 계약에서 DecodeLoop 이 OpProfiler 1개를 소유하고 dispatch 호출부마다 `&mut`
 //! 재대여하는 것이 명시적으로 허용된다 (INV-DECODE-STAGE-006, roadmap β-1).
 //!
+//! **β-4 (G7 마감, 2026-06-10)**: `cache_manager: Option<CacheManager>` 과도기 필드가 제거되고
+//! [`CommandDispatcher`](L4, CacheManager 를 `Arc<Mutex>` 로 보유) 로 cutover 되었으므로,
+//! `ALLOWLISTED_TRANSITIONAL` allowlist 를 제거하여 `CacheManager` 금지를 자동 복원한다.
+//!
 //! Scope: this check applies *only* to the `DecodeLoop` struct field block —
 //! impl blocks, helper functions, and trait implementor structs (e.g.
 //! `ModelForward`) are free to hold concrete types since the builder
@@ -36,14 +40,6 @@ const BANNED: &[&str] = &[
     "TransformerModel",
     "ManagerClient",
 ];
-
-/// 과도기 허용 필드 식별자 목록.
-///
-/// 아래 식별자로 시작하는 필드 라인은 BANNED 검사 이전에 필터링된다.
-/// **β-4** 에서 해당 필드 제거 후 이 allowlist 도 동시에 제거하여 CacheManager 금지를
-/// 복원한다 (INV-LAYER-006 G7; 원래 β-3 예정 → β-4 이월, 2026-06-10 β-3 census 정정 —
-/// (a.6) offload/recall 이 β-4 plan 소비 교체 전까지 필드 요구. spec/41 INV-LAYER-006 행 참조).
-const ALLOWLISTED_TRANSITIONAL: &[&str] = &["cache_manager"];
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -77,22 +73,11 @@ fn test_inv_layer_006_decode_loop_fields_are_abstractions_only() {
 
     let fields = extract_decode_loop_fields(&src);
 
-    // allowlist 필터: 과도기 허용 식별자로 시작하는 필드 라인을 BANNED 검사 전 제거.
-    // β-3 에서 해당 필드 제거 후 ALLOWLISTED_TRANSITIONAL 도 동시 제거 → CacheManager 금지 복원.
-    let filtered_fields: String = fields
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !ALLOWLISTED_TRANSITIONAL
-                .iter()
-                .any(|allowed| trimmed.starts_with(allowed))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
+    // β-4 (G7 마감): cache_manager 과도기 필드 제거 + CommandDispatcher cutover 완료로 allowlist
+    // 가 사라졌다 — DecodeLoop 필드 전부가 trait object/primitive/추상화여야 한다.
     let mut violations = Vec::new();
     for ident in BANNED {
-        if filtered_fields.contains(ident) {
+        if fields.contains(ident) {
             violations.push(*ident);
         }
     }

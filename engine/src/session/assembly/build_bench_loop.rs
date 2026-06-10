@@ -9,7 +9,7 @@
 //! happy path(AB-0 시나리오, `eviction=none`) 는 `cache_manager=None` 으로
 //! 흘러 [`build_standard_loop`] 와 동등하게 동작한다.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -27,7 +27,9 @@ use crate::pressure::kv_cache::KVCache;
 use crate::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::cli::Args;
+use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::forward::ModelForward;
+use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
@@ -179,17 +181,46 @@ pub fn build_bench_loop(
         plan_enabled,
     )?;
 
-    // β-3: pos-환류용 layer-0 fmt handle (§5.2.1 (가)). β-4 CommandDispatcher 가 EvictionStage 를
-    // submit 할 때를 위한 전제 배선 — registry submit 자체는 β-4. coercion: Arc<StandardFormat> →
+    // β-3: pos-환류용 layer-0 fmt handle (§5.2.1 (가)). coercion: Arc<StandardFormat> →
     // Arc<dyn KVCacheFormat>.
     let kv_pos_handle: Option<Arc<dyn crate::format::KVCacheFormat>> = mf
         .fmt_caches()
         .first()
         .map(|f| f.clone() as Arc<dyn crate::format::KVCacheFormat>);
 
+    // β-4: EvictionStage 가 prune 할 전체 layer handle (W1 — enumerate 순서 == layer idx).
+    let kv_handles: Vec<Arc<crate::pressure::standard_format::StandardFormat>> =
+        mf.fmt_caches().to_vec();
+
+    // β-4 (매핑 문서 4부): resilience adapter 에 held-handle 주입 → heartbeat snapshot 의
+    // kv_cache_tokens/capacity 를 layer-0 handle 에서 query (poll 인자 제거 대체).
+    let resilience = match (resilience, kv_pos_handle.clone()) {
+        (Some(mut adapter), Some(h)) => {
+            adapter.set_kv_handle(h);
+            Some(adapter)
+        }
+        (other, _) => other,
+    };
+
+    // β-4: dispatcher 와 driver 가 공유하는 registry. dispatcher.submit(OneShot EvictionStage) →
+    // driver 의 PreEviction dispatch(β-3 배선)가 소비.
+    let registry = Arc::new(PipelineRegistry::new());
+
+    // β-4: evict directive 를 OneShot EvictionStage 로 submit 하는 dispatcher. cache_manager 가
+    // None(happy/eviction=none) 이면 dispatcher 미구성 → happy-path 거동-0.
+    let dispatcher = cache_manager.map(|cm| {
+        CommandDispatcher::new(
+            Arc::clone(&registry),
+            kv_handles,
+            Some(Arc::new(Mutex::new(cm))),
+        )
+    });
+
     let use_stateful =
         sampling_config.repetition_penalty != 1.0 || sampling_config.temperature != 0.0;
-    let builder = DecodeLoopBuilder::new().with_forward(mf);
+    let builder = DecodeLoopBuilder::new()
+        .with_forward(mf)
+        .with_pipeline(Arc::clone(&registry));
     let builder = match kv_pos_handle {
         Some(h) => builder.with_kv_pos_handle(h),
         None => builder,
@@ -203,8 +234,8 @@ pub fn build_bench_loop(
         Some(adapter) => builder.with_resilience(adapter),
         None => builder,
     };
-    let builder = match cache_manager {
-        Some(cm) => builder.with_cache_manager(cm),
+    let builder = match dispatcher {
+        Some(d) => builder.with_command_dispatcher(d),
         None => builder,
     };
     Ok(builder.build())

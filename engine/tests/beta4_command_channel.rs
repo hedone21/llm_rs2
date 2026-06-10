@@ -1,0 +1,300 @@
+//! Phase β-4 host 게이트 — EngineCommand → 신 채널(CommandDispatcher/LoopControl + OneShot Stage)
+//! 의 구==신 등가 + heartbeat 송출 연속성.
+//!
+//! 설계 SSOT: `arch/beta4_command_channel_mapping.md` 5부 (host 게이트 명세 5종).
+//! 정본 명세: `.agent/todos/roadmap_beta_decode_loop_rewrite_2026_06_10.md` §β-4 게이트.
+//!
+//! 본 파일이 커버하는 게이트:
+//! 1. **매핑표 행별 등가** — mock directive 시퀀스로 v1 `ExecutionPlan` 산출 ↔ 신 `LoopControl`
+//!    산출 동치 (control + 과도기 필드). (dispatcher unit `src/session/command_dispatcher.rs` 가
+//!    sticky/method-drop/exhaustive 를 커버하므로, 본 파일은 **v1 executor anchor 대조**에 집중.)
+//! 4. **heartbeat 연속성** — `ResilienceAdapter::poll`(pure) 전환 후에도 heartbeat 가 interval
+//!    마다 송출되고, payload(kv_cache_tokens == held-handle.current_pos())가 v1 등가.
+//!
+//! 게이트 2(exhaustive match)/3(sticky 전이)/5(method-drop)은 dispatcher unit 에서 컴파일·검증.
+
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use llm_shared::{EngineCommand, EngineDirective, EngineMessage, EngineState, ManagerMessage};
+
+use llm_rs2::backend::Backend;
+use llm_rs2::backend::cpu::CpuBackend;
+use llm_rs2::buffer::DType;
+use llm_rs2::format::KVCacheFormat;
+use llm_rs2::memory::host::shared::SharedBuffer;
+use llm_rs2::pressure::cache_manager::CacheManager;
+use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
+use llm_rs2::pressure::kv_cache::KVCache;
+use llm_rs2::pressure::standard_format::StandardFormat;
+use llm_rs2::resilience::sys_monitor::NoOpMonitor;
+use llm_rs2::resilience::{CommandExecutor, KVSnapshot};
+use llm_rs2::session::command_dispatcher::CommandDispatcher;
+use llm_rs2::session::pipeline_registry::PipelineRegistry;
+use llm_rs2::session::resilience_adapter::ResilienceAdapter;
+use llm_rs2::session::traits::CommandSource;
+use llm_rs2::shape::Shape;
+use llm_rs2::tensor::Tensor;
+
+const KV_HEADS: usize = 1;
+const HEAD_DIM: usize = 32;
+const MAX_SEQ: usize = 128;
+
+fn make_handle(n_tokens: usize) -> Arc<StandardFormat> {
+    let total = MAX_SEQ * KV_HEADS * HEAD_DIM;
+    let k_buf = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+    let v_buf = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+    let shape = Shape::new(vec![1, MAX_SEQ, KV_HEADS, HEAD_DIM]);
+    let k = Tensor::new(shape.clone(), k_buf, backend.clone());
+    let v = Tensor::new(shape, v_buf, backend);
+    let mut cache = KVCache::new(k, v, MAX_SEQ);
+    cache.current_pos = n_tokens;
+    Arc::new(StandardFormat::new(0, cache))
+}
+
+fn make_cm() -> Arc<Mutex<CacheManager>> {
+    let policy = Box::new(SlidingWindowPolicy::new(10, 4));
+    Arc::new(Mutex::new(CacheManager::new(
+        policy,
+        Box::new(NoOpMonitor),
+        usize::MAX,
+        0.3,
+    )))
+}
+
+/// v1 `CommandExecutor` + mpsc 채널 헬퍼.
+fn make_executor() -> (
+    CommandExecutor,
+    mpsc::Sender<ManagerMessage>,
+    mpsc::Receiver<EngineMessage>,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    let exec = CommandExecutor::new(
+        cmd_rx,
+        resp_tx,
+        "cpu".to_string(),
+        Duration::from_secs(3600), // heartbeat 노이즈 차단(등가 테스트는 plan 산출만)
+    );
+    (exec, cmd_tx, resp_rx)
+}
+
+fn send(tx: &mpsc::Sender<ManagerMessage>, seq_id: u64, cmds: Vec<EngineCommand>) {
+    tx.send(ManagerMessage::Directive(EngineDirective {
+        seq_id,
+        commands: cmds,
+    }))
+    .unwrap();
+}
+
+// ── 게이트 1: 매핑표 행별 등가 (v1 ExecutionPlan ↔ 신 LoopControl) ──
+//
+// 같은 directive 시퀀스를 (A) v1 executor.poll → ExecutionPlan, (B) 신 dispatcher.dispatch →
+// LoopControl 로 돌려 control + 과도기 필드의 산출이 동치임을 단언한다. anchor = v1 executor.
+
+/// throttle/tbt/suspend control 3종 + RestoreDefaults reset 등가.
+#[test]
+fn control_fields_equivalent_to_v1() {
+    let (mut exec, tx, _rx) = make_executor();
+    let registry = Arc::new(PipelineRegistry::new());
+    let mut disp = CommandDispatcher::new(registry, vec![make_handle(120)], Some(make_cm()));
+
+    // step 1: Throttle{50} + SetTargetTbt{200}.
+    let cmds1 = vec![
+        EngineCommand::Throttle { delay_ms: 50 },
+        EngineCommand::SetTargetTbt { target_ms: 200 },
+    ];
+    send(&tx, 1, cmds1.clone());
+    let v1 = exec.poll(&KVSnapshot::default());
+    let v2 = disp.dispatch(cmds1);
+    assert_eq!(v1.throttle_delay_ms, v2.throttle_delay_ms, "throttle 등가");
+    assert_eq!(v1.target_tbt_ms, v2.target_tbt_ms, "tbt 등가");
+    assert_eq!(v1.target_tbt_set, v2.target_tbt_set, "tbt_set 등가");
+    assert!(!v1.suspended && !v2.suspended);
+
+    // step 2: 빈 batch → sticky carry 등가 (throttle/tbt 유지).
+    let v1b = exec.poll(&KVSnapshot::default());
+    let v2b = disp.dispatch(vec![]);
+    assert_eq!(
+        v1b.throttle_delay_ms, v2b.throttle_delay_ms,
+        "sticky throttle"
+    );
+    assert_eq!(v1b.target_tbt_ms, v2b.target_tbt_ms, "sticky tbt");
+    assert_eq!(v1b.target_tbt_set, v2b.target_tbt_set);
+
+    // step 3: RestoreDefaults → reset 묶음 등가.
+    send(&tx, 2, vec![EngineCommand::RestoreDefaults]);
+    let v1c = exec.poll(&KVSnapshot::default());
+    let v2c = disp.dispatch(vec![EngineCommand::RestoreDefaults]);
+    assert_eq!(
+        v1c.throttle_delay_ms, v2c.throttle_delay_ms,
+        "restore throttle=0"
+    );
+    assert_eq!(v1c.target_tbt_ms, v2c.target_tbt_ms, "restore tbt=0");
+    assert_eq!(
+        v1c.target_tbt_set, v2c.target_tbt_set,
+        "restore tbt_set=false"
+    );
+    assert_eq!(
+        v1c.restore_defaults, v2c.restore_defaults,
+        "restore_defaults flag"
+    );
+    assert_eq!(
+        v1c.recall_offload, v2c.recall_offload,
+        "recall_offload flag"
+    );
+}
+
+/// suspend override 등가 — suspend 시 device seam 무효 + throttle 0.
+#[test]
+fn suspend_override_equivalent_to_v1() {
+    let (mut exec, tx, _rx) = make_executor();
+    let registry = Arc::new(PipelineRegistry::new());
+    let mut disp = CommandDispatcher::new(registry, vec![make_handle(120)], Some(make_cm()));
+
+    let cmds = vec![
+        EngineCommand::SwitchHw {
+            device: "cpu".to_string(),
+        },
+        EngineCommand::Suspend,
+    ];
+    send(&tx, 1, cmds.clone());
+    let v1 = exec.poll(&KVSnapshot::default());
+    let v2 = disp.dispatch(cmds);
+    assert_eq!(v1.suspended, v2.suspended, "suspended 등가");
+    assert!(v1.suspended);
+    assert_eq!(
+        v1.switch_device.is_none(),
+        v2.switch_device.is_none(),
+        "suspend override device seam 등가"
+    );
+}
+
+/// 과도기 5종(offload/quant/swap/partition/layer_skip) live 소비 경로 보유분 구==신 등가.
+#[test]
+fn transitional_fields_equivalent_to_v1() {
+    let (mut exec, tx, _rx) = make_executor();
+    let registry = Arc::new(PipelineRegistry::new());
+    let mut disp = CommandDispatcher::new(registry, vec![make_handle(120)], Some(make_cm()));
+
+    let cmds = vec![
+        EngineCommand::KvOffload { ratio: 0.5 },
+        EngineCommand::KvQuantDynamic { target_bits: 4 },
+        EngineCommand::SwapWeights {
+            ratio: 0.9,
+            target_dtype: llm_shared::DtypeTag::Q4_0,
+        },
+        EngineCommand::SetPartitionRatio { ratio: 0.3 },
+        EngineCommand::LayerSkip { skip_ratio: 0.25 },
+    ];
+    send(&tx, 1, cmds.clone());
+    let v1 = exec.poll(&KVSnapshot::default());
+    let v2 = disp.dispatch(cmds);
+    assert_eq!(v1.offload_ratio, v2.offload_ratio, "offload_ratio 등가");
+    assert_eq!(v1.kv_quant_bits, v2.kv_quant_bits, "kv_quant_bits 등가");
+    assert_eq!(v1.swap_weights, v2.swap_weights, "swap_weights 등가");
+    assert_eq!(
+        v1.partition_ratio, v2.partition_ratio,
+        "partition_ratio 등가"
+    );
+    assert_eq!(v1.layer_skip, v2.layer_skip, "layer_skip 등가");
+}
+
+// ── 게이트 4: heartbeat 연속성 (pure poll 전환 후 송출·payload 등가) ──
+
+/// `ResilienceAdapter::poll`(pure) 가 호출될 때마다 interval 경과 시 heartbeat 를 송출하고,
+/// payload 의 kv_cache_tokens == held-handle.current_pos() 임을 검증한다 (매핑 문서 4.4).
+#[test]
+fn heartbeat_continuity_via_held_handle() {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    let mut exec = CommandExecutor::new(
+        cmd_rx,
+        resp_tx,
+        "cpu".to_string(),
+        Duration::from_millis(10), // 짧은 interval 로 heartbeat 유도
+    );
+    exec.set_running();
+    // throughput EMA 적재 (actual_throughput != 0 검증용).
+    exec.on_token_generated();
+    std::thread::sleep(Duration::from_millis(15));
+    exec.on_token_generated();
+
+    let mut adapter = ResilienceAdapter::new(exec);
+    // held-handle 주입 — heartbeat snapshot 의 kv_cache_tokens 출처.
+    let handle = make_handle(100);
+    let h: Arc<dyn KVCacheFormat> = handle.clone();
+    adapter.set_kv_handle(h);
+
+    // interval 경과 후 pure poll → heartbeat 송출.
+    std::thread::sleep(Duration::from_millis(15));
+    let cmds = adapter.poll().unwrap();
+    assert!(cmds.is_empty(), "directive 없음 → 빈 command vec");
+
+    // heartbeat 수신 + payload 검증.
+    let mut hb = None;
+    while let Ok(msg) = resp_rx.try_recv() {
+        if let EngineMessage::Heartbeat(status) = msg {
+            hb = Some(status);
+        }
+    }
+    let status = hb.expect("interval 경과 후 heartbeat 송출되어야 함");
+    assert_eq!(status.active_device, "cpu");
+    assert_eq!(status.state, EngineState::Running);
+    // (3) kv_cache_tokens == held-handle.current_pos() — held-handle query 전환 핵심 가드.
+    assert_eq!(
+        status.kv_cache_tokens,
+        handle.current_pos(),
+        "heartbeat kv_cache_tokens == held-handle.current_pos()"
+    );
+    assert_eq!(status.kv_cache_tokens, 100);
+    // (2) actual_throughput != 0 (EMA 적재 확인).
+    assert!(
+        status.actual_throughput > 0.0,
+        "throughput EMA 적재 — actual_throughput != 0"
+    );
+
+    drop(cmd_tx); // 미사용 경고 억제
+}
+
+/// directive drain 등가 — pure poll 이 도착한 command 를 그대로 반환하고, 각 directive 에 Ok
+/// 응답을 송출한다 (v1 apply_command 가 항상 Ok 였으므로 등가).
+#[test]
+fn pure_poll_drains_commands_and_acks() {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    let exec = CommandExecutor::new(
+        cmd_rx,
+        resp_tx,
+        "cpu".to_string(),
+        Duration::from_secs(3600),
+    );
+    let mut adapter = ResilienceAdapter::new(exec);
+
+    cmd_tx
+        .send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 7,
+            commands: vec![
+                EngineCommand::Throttle { delay_ms: 30 },
+                EngineCommand::RequestQcf,
+            ],
+        }))
+        .unwrap();
+
+    let cmds = adapter.poll().unwrap();
+    assert_eq!(cmds.len(), 2, "drain 한 command 2건 반환");
+    assert!(matches!(cmds[0], EngineCommand::Throttle { delay_ms: 30 }));
+    assert!(matches!(cmds[1], EngineCommand::RequestQcf));
+
+    // Ok 응답 송출 (seq_id 7, 2 results).
+    let resp = resp_rx.recv().unwrap();
+    match resp {
+        EngineMessage::Response(r) => {
+            assert_eq!(r.seq_id, 7);
+            assert_eq!(r.results.len(), 2);
+        }
+        _ => panic!("Expected Response"),
+    }
+}

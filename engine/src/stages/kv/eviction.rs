@@ -37,7 +37,11 @@ pub struct EvictionStage {
     /// cross-layer 정확성 전제, `wrap_kv_caches` 와 동일 불변식).
     handles: Vec<Arc<StandardFormat>>,
     /// 적용 경로 = CacheManager UER (v1 `try_evict` 와 산출 동일).
-    cache_manager: Mutex<CacheManager>,
+    ///
+    /// β-4: `Arc<Mutex<CacheManager>>` 공유. CommandDispatcher 가 KvEvict* directive 마다 새
+    /// OneShot `EvictionStage` 를 만들지만, 단일 `CacheManager`(CLI 정책·sticky eviction 상태)를
+    /// 모든 stage 가 공유해야 method-drop 시맨틱(3부)과 정책 일관성이 유지된다.
+    cache_manager: Arc<Mutex<CacheManager>>,
     /// score-free force_evict 의 target ratio.
     target_ratio: f32,
 }
@@ -48,15 +52,18 @@ impl EvictionStage {
     /// 1회 발화 후 `Consumed` 를 반환해 registry 가 GC 한다(sticky 재적용 방지 — v1 `evict_applied`
     /// 게이트 등가). Persistent band-driven 변형(β-5)은 동일 핸들·CacheManager 로 `Persistent`
     /// lifecycle 만 바꿔 생성하면 되며, `on_phase` 본문(UER)은 그대로다.
+    ///
+    /// β-4: `cache_manager` 는 `Arc<Mutex<CacheManager>>` — CommandDispatcher 가 보유한 단일 CM 을
+    /// directive 마다 새 OneShot stage 에 clone 주입한다(공유).
     pub fn one_shot(
         handles: Vec<Arc<StandardFormat>>,
-        cache_manager: CacheManager,
+        cache_manager: Arc<Mutex<CacheManager>>,
         target_ratio: f32,
     ) -> Self {
         Self {
             lifecycle: StageLifecycle::OneShot,
             handles,
-            cache_manager: Mutex::new(cache_manager),
+            cache_manager,
             target_ratio,
         }
     }
@@ -140,10 +147,15 @@ mod tests {
         c
     }
 
-    fn make_cache_manager() -> CacheManager {
+    fn make_cache_manager() -> Arc<Mutex<CacheManager>> {
         // sliding window(window=10, prefix=4): current>keep 면 force_evict 가 prune.
         let policy = Box::new(SlidingWindowPolicy::new(10, 4));
-        CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, TARGET_RATIO)
+        Arc::new(Mutex::new(CacheManager::new(
+            policy,
+            Box::new(NoOpMonitor),
+            usize::MAX,
+            TARGET_RATIO,
+        )))
     }
 
     fn make_ctx(profiler: &mut OpProfiler) -> StageContext<'_> {
