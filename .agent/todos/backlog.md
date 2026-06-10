@@ -20,15 +20,17 @@
 
 ---
 
-## [ACTIVE Roadmap] Phase γ — `pressure/`→`kv/`·`weight/` rename + sweep + bin화 + orphan 처분 (γ-1 착수 2026-06-10)
+## [RESOLVED Roadmap] Phase γ 종결 — `pressure/`→`kv/`·`weight/` rename + sweep + bin화 + orphan 처분 (γ-1~γ-4, 2026-06-10~11)
 
+- **Status**: RESOLVED — γ-1~γ-4 전 substep 종결 (2026-06-10~11).
 - **SSOT (γ 정의 출처)**: `arch/pipeline_stage_design_v2.md` §9 "Phase γ 재정의"(G2-(iii) 승인, 2026-06-10). 직전 γ 정의("legacy generate.rs 잔여 마이그레이션 + PACT2026 PoC")는 α-K BC 결정(2026-06-04, §9.1 BC)에서 흡수 + β-7 v1 표면 삭제(2026-06-10)로 빈 껍데기가 되어 재정의.
 - **선행 완료**: **Phase α-K BC 완주**(2026-06-05 — `KVCacheOps` trait 완전 폐기 + legacy generate.rs 폐기) + **Phase β 전 substep 종결**(β-1~β-7, 2026-06-10, HEAD `4abab582` — decode loop rewrite + v1 trait 표면 삭제).
-- **γ 4 잔여 작업** (arch §9 재정의):
-  - **(γ-1) [ACTIVE]** `kv/`·`weight/` rename — `pressure/`→`kv/`, `pressure/weights/`→`weight/`(§2.1 G3-reconcile Q1/Q2). blast radius 189 ref / 53 file(기계적). `Pressure` 타입 ↔ `pressure/` 디렉토리 이름 충돌 해소.
-  - **(γ-2)** nested `mod.rs` 38개 sweep — no-`mod.rs` 모던 path 스타일(§2.1 규칙 C / CLAUDE.md 컨벤션)로 일괄 정리. 별도 `chore:` 커밋, `git mv` history 보존.
-  - **(γ-3)** argus-eval / chat bin화 — 현 eval/chat 진입 경로의 binary 분리·정착.
-  - **(γ-4)** batch orphan 처분 — `run_prompt_batch`/batch runner orphan 코드 처분(β-7 의 G3 eval/batch orphan 삭제와 연동/잔여). 아래 별도 항목 참조.
+- **γ 4 substep (전부 완료)** (arch §9 재정의):
+  - **(γ-1) ✅** `kv/`·`weight/` rename — `pressure/`→`kv/`, `pressure/weights/`→`weight/`(commit `7fe1fe8b`). 파생 후속 3건 별도 등록(아래 "γ-1 파생 후속" 그룹, spec L3 도메인 재정의 RESOLVED).
+  - **(γ-2) ✅** nested `mod.rs` 38개 sweep — no-`mod.rs` 모던 path 스타일(§2.1 규칙 C / CLAUDE.md 컨벤션).
+  - **(γ-3) ✅** argus-eval bin화 (2026-06-11, `33d5bc8f`/`11c8721f`) — eval 진입 경로를 `argus_eval` bin 으로 부활(살림). argus-chat bin화는 별 sprint 잔여(아래 generate 분할 항목 참조).
+  - **(γ-4) ✅** batch orphan 처분 (2026-06-11, `2e53cf44`) — `run_prompt_batch`/batch runner ~1170 LOC 순수 삭제(죽은 포장지). 아래 RESOLVED 항목 참조.
+- **다음 ACTIVE 후보 (착수 대기)**: **AB-2/4/6 Stage 모델 재개** (G1 결정 — 과도기 LoopControl 필드 이전 포함). **AB-2 는 D8 ABI 재확인 선행.** 진입 시 별 roadmap/handoff 작성.
 - **이전 Master roadmap (α-K BC, 완료)**: `.agent/todos/roadmap_alpha_k_bc_completion_2026_06_04.md`.
 
 ---
@@ -142,9 +144,10 @@
 - **Status**: CANCELLED — 사용자 결정 (2026-05-21). Phase 4-4-2.3 잔여 취소와 함께 폐기.
 - **사유**: generate.rs legacy 보존 방향 전환. 새 바이너리 분할 작업에서 자연 흡수.
 
-## [P2] generate 바이너리 분할 + Manager 통합 — 2026-05-21 등록
-- **Status**: TODO (사용자 결정 대기 — 분할 단위 + 진입 시점)
-- **⚠️ STALE 전제 (2026-06-10 갱신)**: 아래 "현 `engine/src/bin/generate.rs` … legacy로 보존" 전제는 **이미 무효**. α-K BC(2026-06-05)에서 legacy generate.rs 가 폐기되어 현 `engine/src/bin/` 에 generate.rs 부재 — 현 bin 7종 = `argus_cli`/`argus_bench`/`auf_tool`/`signal_injector`/`test_backend`/`test_model`/`test_q4_soa_byte_equal`. **또한 Phase γ-3(argus-eval/chat bin화, arch §9)와 범위 중첩** — 착수 전 γ-3 과의 통합 재검토 필요. (항목 자체는 Manager IPC 통합 설계 의도 보존을 위해 미삭제.)
+## [P2] generate 바이너리 분할 + Manager 통합 — 2026-05-21 등록 / 2026-06-11 부분 해소
+- **Status**: TODO (부분 해소 — argus 패밀리 분할 γ-3 로 사실상 완성, 잔여 = argus-chat bin화 + Manager IPC 통합)
+- **부분 해소 (2026-06-11)**: 본 항목의 "다수 바이너리 분할" 의도는 **argus 패밀리 분할로 사실상 완성** — `argus_cli`(단일 추론) / `argus_bench`(측정) / `argus_eval`(eval, γ-3 `33d5bc8f`/`11c8721f`) 3종 정착. **잔여 = `argus-chat` bin화 만** (SSOT `arch/pipeline_stage_design_v2.md` §9 별 sprint 목록에 기등재) + Manager IPC 통합(원 항목 설계 의도).
+- **⚠️ STALE 전제 (2026-06-10 갱신)**: 아래 "현 `engine/src/bin/generate.rs` … legacy로 보존" 전제는 **이미 무효**. α-K BC(2026-06-05)에서 legacy generate.rs 가 폐기되어 현 `engine/src/bin/` 에 generate.rs 부재 — 현 bin 8종 = `argus_cli`/`argus_bench`/`argus_eval`/`auf_tool`/`signal_injector`/`test_backend`/`test_model`/`test_q4_soa_byte_equal`(argus_eval γ-3 추가). (항목 자체는 잔여 argus-chat bin화 + Manager IPC 통합 설계 의도 보존을 위해 미삭제.)
 - **결정 (2026-05-21)**: 현 `engine/src/bin/generate.rs` (master `02cb7106`, 4,953 LOC)를 **legacy로 보존**하고, 새로운 다수 바이너리로 기능 분할. Manager IPC 통합도 새 바이너리에서 다룸.
 - **배경**:
   - Phase 4-4-2.3 5 sub-sub-sprint 중 3a/3c/3b 추출 완료 — `session::decode_fallback::{prologue,eviction_trigger,swap_dispatch}` 모듈 자산 확보.
@@ -962,14 +965,18 @@
 - **Acceptance Criteria**: (1) `printf '%03d' "$((10#$id))"` 또는 동등 처리로 octal 회피, (2) INV-DECODE-STAGE 시리즈 ID 추출 추가 → coverage 정확 산출.
 - **Notes**: 비차단. 실제 line 번호는 착수 시 grep 재확인 (위 근사치).
 
-## [P2] γ-4: eval/batch orphan 처분 — `run_eval_ll` + `run_prompt_batch` — 2026-06-10 등록
-- **Status**: TODO
-- **Sprint**: backlog
+## [RESOLVED] γ-4: eval/batch orphan 처분 — `run_eval_ll` + `run_prompt_batch` — 2026-06-10 등록 / 2026-06-11 종결
+- **Status**: RESOLVED (2026-06-11) — 처분 방향 합의 = **"기능은 살리고 죽은 포장지만 삭제"**. eval = argus-eval bin 으로 부활(살림, γ-3) / batch = ~1170 LOC 순수 삭제(γ-4).
+- **Sprint**: completed
 - **Dependencies**: **γ-3(argus-eval/chat bin화)와 처분 방향 조율 선결** — eval 을 bin 으로 살릴지 orphan 삭제할지 결정 후 착수
 - **출처**: roadmap β-7 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:126`) + 후속 섹션 (:144) + `arch/pipeline_stage_design_v2.md` §9 γ-4
 - **Description**: `run_eval_ll`(`session/eval/runner.rs:16`) + `run_prompt_batch`(`session/batch/runner.rs:34`) 외부 호출처 0 (β-7 grep 확인). β-7 G3 삭제에서 ripple 격리를 위해 **의도적으로 이월**. Phase γ 의 γ-4 항목에 해당.
 - **Acceptance Criteria**: γ-3 방향 확정 후 — (a) eval 을 bin 으로 살리면 entry point 정착 + orphan 해소, 또는 (b) orphan 삭제 시 두 fn + 종속 dead code grep census 후 동반 삭제 + 컴파일 GREEN.
-- **Notes**: γ-3 과 처분 방향(살림 vs 삭제)이 상호 의존 — γ-3 선행/동행 권장. 담당 권장: Architect(γ-3 방향 결정) → Implementer(처분).
+- **적용 결과 (2026-06-11)**:
+  - **처분 방향 합의**: "기능은 살리고 죽은 포장지만 삭제" — eval 은 실사용 기능이라 살리고(bin 부활), batch 는 죽은 포장지라 삭제.
+  - **eval (살림, γ-3)**: `run_eval_ll` 경로를 `argus_eval` bin 으로 부활 (commit `33d5bc8f`/`11c8721f`).
+  - **batch (삭제, γ-4)**: `run_prompt_batch` + batch runner ~1170 LOC 순수 삭제 (commit `2e53cf44`).
+- **Notes**: γ-3 과 처분 방향(살림 vs 삭제)이 상호 의존 — γ-3 선행/동행 권장. 담당: Architect(방향 결정) → Implementer(처분). 파생 후속(argus-eval smoke / batch 삭제 2차 census 등)은 아래 "γ-3/γ-4 파생 후속" 그룹 참조.
 
 ---
 
@@ -1017,3 +1024,59 @@
   - `docs/qcf_taxonomy.md` weight swap 오케스트레이션 경로 표기
 - **Acceptance Criteria**: 두 위치 모두 실위치 `engine/src/weight/` 로 정합.
 - **Notes**: Sprint C(`models/weights/`→`pressure/weights/` git mv, `5c698d79`) 와 γ-1(`pressure/weights/`→`weight/`) 두 이동을 누적 반영해야 함. 담당 권장: Architect.
+
+---
+
+# γ-3/γ-4 파생 후속 (2026-06-11 등록)
+
+> γ-3(argus-eval bin화, `33d5bc8f`/`11c8721f`) + γ-4(batch orphan 삭제, `2e53cf44`) 후 발견된 잔여. macOS OpenCL 링크 한계로 런타임 미검증분 + batch 삭제 파생 orphan census + doc stale. **출처**: γ-3/γ-4 구현 후속(2026-06-11) — Tester 후속 목록 + Architect census 보고.
+
+## [P2] argus-eval functional smoke (디바이스/Linux 런타임 검증) — 2026-06-11 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음 (디바이스/Linux 환경 필요)
+- **출처**: γ-3 구현 후속 — Tester 후속 목록 6건
+- **Description**: `argus_eval` bin 은 macOS OpenCL 링크 한계로 **런타임 미검증** (빌드/컴파일만 확인). 디바이스(S25) 또는 Linux 에서 E2E 런타임 검증 필요.
+- **Acceptance Criteria** (Tester 후속 6건):
+  - 5개 모드 E2E: `ll` / `ppl` / `dump-importance` / `qcf-dump` modifier / `experiment`.
+  - legacy generate 등가 — `caps` / `swap_algorithm` 보존 런타임 확인.
+  - `cargo test -p llm_rs2` 전체 PASS.
+  - spec suite 런타임 PASS.
+  - `flash_attn_decode_dk128` + `prefill_dk256` 2 test 타깃 PASS.
+- **Notes**: macOS OpenCL 링크 한계가 런타임 검증의 유일 블로커 — 환경만 확보되면 즉시 가능. 담당 권장: Tester.
+
+## [P3] experiments/*.sh argus_eval 이주 — 2026-06-11 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: γ-3 구현 후속
+- **Description**: `experiments/` 의 `run_accuracy_bench.sh` / `run_round*.sh` 가 **삭제된 generate 기준** binary 호출이라 stale. `argus_eval` 로 binary 교체 필요.
+- **Acceptance Criteria**: 해당 스크립트의 binary 호출을 `argus_eval` 로 교체 + 실행 검증. **flag 표면은 호환** (argus_eval 이 flag-based dispatch 채택한 이유 = 기존 스크립트 호환) — flag 수정 불필요, binary 이름만 교체 + 동작 확인.
+- **Notes**: flag-based dispatch 덕에 이주 비용 최소. 담당 권장: Implementer → Tester(실행 검증).
+
+## [P3] session/warmup.rs::run_warmup orphan 거취 결정 — 2026-06-11 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: γ-4 구현 후속 — orphan census
+- **Description**: `session/warmup.rs::run_warmup` 호출자 0 (legacy DVFS ramp-up warmup). 거취 결정 필요.
+- **Acceptance Criteria**: 둘 중 택1 — (a) `argus_bench` 가 채택(측정 품질 위해 DVFS ramp-up warmup 유효) + 호출 배선, 또는 (b) orphan 삭제 + 컴파일 GREEN.
+- **Notes**: 측정 품질(DVFS ramp-up) 효용 vs dead code 비용 트레이드오프. 담당 권장: Architect(거취 결정) → Implementer(처분).
+
+## [P3] CommandExecutor legacy 채널 2차 orphan census — 2026-06-11 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: γ-4 구현 후속 — batch 삭제 파생 census
+- **Description**: batch 삭제(`2e53cf44`)로 CommandExecutor legacy 채널의 소비자가 0 이 된 심볼 후보: `poll` / `apply_command` / `ExecutionPlan` / `EvictPlan` / `StreamingParams` + `LoopControl.prefill_*` 3필드. **단 `heartbeat`/`EngineReport` 는 잔류** — 일괄 삭제 불가. 정밀 census 후 삭제 범위 확정 필요.
+- **Acceptance Criteria**: 후보 심볼별 소비자 grep census → 진짜 orphan 만 삭제 (heartbeat/EngineReport 잔존 경로 보존) + 컴파일/clippy GREEN.
+- **Notes**: heartbeat 경로가 일부 심볼을 살리고 있어 일괄 삭제 위험 — 심볼 단위 census 필수. 담당 권장: Architect(census) → Implementer(삭제).
+
+## [P3] test_inv_layer_005.rs doc 헤더 stale — 2026-06-11 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: γ-3/γ-4 구현 후속
+- **Description**: `test_inv_layer_005.rs` 주석 헤더가 "generate.rs 한정" 잔존 — 실제 lint 동작은 `L5_PRODUCTION_BINS` 로 기확장됨(commit `33d5bc8f`). 주석만 stale.
+- **Acceptance Criteria**: doc 헤더 주석을 `L5_PRODUCTION_BINS` 기준 동작으로 정정 (코드 동작 무변경 — 주석 only).
+- **Notes**: lint 동작은 정상(33d5bc8f). 주석 정오만. 담당 권장: Implementer.
