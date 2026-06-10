@@ -100,12 +100,12 @@ impl EngineReport for ResilienceAdapter {
 // ── Arc<Mutex<ResilienceAdapter>> 기반 newtype wrapper ──
 //
 // `DecodeLoopBuilder::with_resilience`가 단일 ResilienceAdapter 인스턴스를 Arc<Mutex<…>>로
-// 감싸 cmd_source/report 슬롯에 wrapper 를 주입한다. **β-6 commit C**: per-token tick 은
-// 더 이상 wrapper(TickWrapper)가 아니라 `TickStage`(PostSample, stages/system/tick.rs)가
-// 공유 Arc 로 직접 호출한다 — `ResilienceAdapter::tick`. TokenTickSink trait 자체는 β-7 에서
-// 삭제(현재 다른 NoOp 소비처 유지).
+// 감싸 cmd_source 슬롯에 wrapper 를 주입한다. per-token tick 은 `TickStage`(PostSample,
+// stages/system/tick.rs)가 공유 Arc 로 직접 호출한다 — `ResilienceAdapter::tick`.
 //
-// per-token 호출 빈도: poll 1회 + tick 1회 → Mutex contention 무시 가능.
+// β-7: v1 report 슬롯 제거로 `ReportWrapper` 는 삭제됐다 — IPC 송출(capability/qcf/
+// swap_report)은 `EngineReport` trait 슬롯을 경유한 적이 없다(resilience_init 가
+// `CommandExecutor` 직접 호출). per-token 호출 빈도: poll 1회 + tick 1회 → contention 무시.
 
 /// `Arc<Mutex<ResilienceAdapter>>` 를 `CommandSource` 로 노출하는 newtype.
 pub(crate) struct CmdSrcWrapper(pub Arc<Mutex<ResilienceAdapter>>);
@@ -113,29 +113,5 @@ pub(crate) struct CmdSrcWrapper(pub Arc<Mutex<ResilienceAdapter>>);
 impl CommandSource for CmdSrcWrapper {
     fn poll(&mut self) -> Result<Vec<EngineCommand>> {
         self.0.lock().expect("resilience mutex poisoned").poll()
-    }
-}
-
-/// `Arc<Mutex<ResilienceAdapter>>` 를 `EngineReport` 로 노출하는 newtype.
-pub(crate) struct ReportWrapper(pub Arc<Mutex<ResilienceAdapter>>);
-
-impl EngineReport for ReportWrapper {
-    fn send_capability(&mut self, cap: EngineCapability) {
-        self.0
-            .lock()
-            .expect("resilience mutex poisoned")
-            .send_capability(cap);
-    }
-    fn send_qcf_estimate(&mut self, qcf: QcfEstimate) {
-        self.0
-            .lock()
-            .expect("resilience mutex poisoned")
-            .send_qcf_estimate(qcf);
-    }
-    fn send_swap_report(&mut self, report: WeightSwapReport) {
-        self.0
-            .lock()
-            .expect("resilience mutex poisoned")
-            .send_swap_report(report);
     }
 }

@@ -23,7 +23,6 @@ pub mod resilience_init;
 pub mod samplers;
 pub mod standard_happy;
 pub mod swap_runtime;
-pub mod traits;
 pub mod warmup;
 
 pub use crate::inference::sampling::{GreedySampler, StepCtx, TokenSampler};
@@ -33,14 +32,7 @@ pub use command_dispatcher::{CommandDispatcher, CommandSource, EngineReport, Loo
 pub use decode_loop::{
     DecodeLoop, DecodeLoopBuilder, DecodeResult, HasForward, NoForward, StopReason,
 };
-pub use defaults::{
-    NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver, NoOpSwapStage,
-    NoOpTokenTickSink,
-};
+pub use defaults::NoOpCommandSource;
 pub use experiment_run::run_experiment_path;
 pub use forward::Forward;
 pub use samplers::RepetitionPenaltySampler;
-pub use traits::{
-    DecodeObserver, EvictionOutcome, EvictionStage, ResilienceBundle, SkipReason, SwapStage,
-    TokenTickSink,
-};

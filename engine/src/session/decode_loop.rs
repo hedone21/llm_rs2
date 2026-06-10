@@ -16,14 +16,11 @@ use crate::pipeline::StopReason as StageStopReason;
 use crate::pipeline::{
     LifecyclePhase, PipelineDispatcher, Pressure, PressureSource, StageContext, StepInfo,
 };
-use crate::session::command_dispatcher::{CommandDispatcher, CommandSource, EngineReport};
+use crate::session::command_dispatcher::{CommandDispatcher, CommandSource};
 use crate::session::forward::Forward;
 use crate::session::pipeline_registry::PipelineRegistry;
 
-use super::defaults::{
-    NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver, NoOpSwapStage,
-};
-use super::traits::{DecodeObserver, EvictionOutcome, EvictionStage, SwapStage};
+use super::defaults::NoOpCommandSource;
 
 /// Why [`DecodeLoop::run`] returned.
 ///
@@ -66,16 +63,11 @@ pub struct HasForward(Box<dyn Forward>);
 /// Decode loop. Owned trait objects only — see INV-LAYER-006.
 pub struct DecodeLoop {
     forward: Box<dyn Forward>,
-    eviction: Box<dyn EvictionStage>,
-    swap: Box<dyn SwapStage>,
     cmd_source: Box<dyn CommandSource>,
     sampler: Box<dyn TokenSampler>,
-    observers: Vec<Box<dyn DecodeObserver>>,
-    // P3에서 실제 보고 구현체 주입 시 사용. 현재는 no-op default만 주입.
-    #[allow(dead_code)]
-    report: Box<dyn EngineReport>,
-    // β-6 commit C: v1 tick_sink 필드는 제거됨 — per-token tick 은 TickStage(PostSample 구독,
-    // stages/system/tick.rs)가 담당한다. with_resilience 가 build() 시점에 registry 로 submit.
+    // β-7: v1 eviction/swap/observers/report 슬롯 제거. eviction → PipelineStage(PreEviction/
+    // PostEviction, stages/kv/eviction.rs) 로 수렴, tick/observe → TickStage/PipelineStage 로,
+    // report(EngineReport) 슬롯은 dead 였다(IPC 송출은 resilience_init 가 executor 직접 호출).
     stop_flag: Arc<AtomicBool>,
     // β-4 (v2 §5.4 A-1): 2-source 명령 분배자. cmd_source.poll() 이 pure 생산한 EngineCommand 를
     // 받아 ① OneShot EvictionStage submit / ② LoopControl / ③ Hardware seam 으로 분배한다.
@@ -164,34 +156,21 @@ impl DecodeLoop {
 
     /// β-3 pos-환류 (§5.2.1 (가)): EvictionStage 가 PreEviction/PostEviction dispatch 에서
     /// cache 의 `current_pos` 를 prune 했을 수 있으므로, held layer-0 handle 의 `current_pos` 를
-    /// 읽어 loop `pos` 를 동기화한다. `StageOutcome` 은 무변경(query-only) — driver 가 prune 량을
-    /// 산출해 v1 (a.5) 와 동일하게 `forward.on_kv_prune`(GPU plan invalidate) + observer 통지.
+    /// 읽어 loop `pos` 를 동기화한다. `StageOutcome` 은 무변경(query-only) — driver 가
+    /// `forward.on_kv_prune`(GPU plan invalidate)으로 v1 (a.5) 등가 통지를 한다.
     ///
     /// `kv_pos_handle == None`(happy/chat/기존 전부) 면 즉시 return → **거동-0**. 빈 registry 면
     /// PreEviction/PostEviction dispatch 가 len==0 fast-path 라 cache 가 변할 일이 없어 new_pos ==
     /// self.pos → 환류 자체가 no-op.
-    fn reconcile_kv_pos_after_eviction(&mut self, stop: &AtomicBool) {
+    fn reconcile_kv_pos_after_eviction(&mut self) {
         let Some(h) = &self.kv_pos_handle else {
             return;
         };
         let new_pos = h.current_pos();
         if new_pos < self.pos {
-            let removed = self.pos - new_pos;
             self.pos = new_pos;
             // GPU plan invalidate (stale offset 방지) — v1 (a.5) on_kv_prune 등가.
             self.forward.on_kv_prune(new_pos);
-            // v1 (a.5)/(b) 와 동일하게 observer 통지.
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                stop,
-            );
-            let outcome = EvictionOutcome::Pruned { removed, new_pos };
-            for obs in &mut self.observers {
-                obs.on_eviction(&ctx, &outcome);
-            }
         }
     }
 
@@ -228,18 +207,8 @@ impl DecodeLoop {
         for &t in tokens {
             self.sampler.observe_token(t);
         }
-        let stop = Arc::clone(&self.stop_flag);
-        let ctx = step_ctx(
-            self.pos,
-            self.prev_token,
-            self.kv_capacity,
-            self.decode_step,
-            &stop,
-        );
-        for obs in &mut self.observers {
-            obs.on_prefill_end(&ctx, &logits);
-        }
-        // PrefillEnd: on_prefill_end observer 루프 후, Ok(logits) 직전.
+        // PrefillEnd: prefill 산출(logits) 직후, Ok(logits) 직전 (β-7: v1 on_prefill_end
+        // observer 루프 제거 — prefill-end 관찰은 PrefillEnd stage 구독으로 수렴).
         let _ = self.dispatch_phase(LifecyclePhase::PrefillEnd);
         Ok(logits)
     }
@@ -251,17 +220,15 @@ impl DecodeLoop {
     pub fn run(&mut self, budget: usize, first_token: u32) -> anyhow::Result<DecodeResult> {
         let result = self.run_steps(budget, first_token)?;
         self.forward.finalize()?;
-        for obs in &mut self.observers {
-            obs.finalize()?;
-        }
-        // Finalize: forward.finalize() + observers finalize 체인 후, DecodeResult 구성 직전.
+        // Finalize: forward.finalize() 후, DecodeResult 구성 직전 (β-7: v1 observer finalize
+        // 체인 제거 — finalize 관찰은 Finalize stage 구독으로 수렴).
         let _ = self.dispatch_phase(LifecyclePhase::Finalize);
         Ok(result)
     }
 
     /// β-6: run()/run_until_stop 공유 decode core. 현 run() 본문에서 finalize 체인을 제외한
     /// 부분이다. `budget` step 까지 `first_token` 부터 decode 하고 [`DecodeResult`] 를 반환한다.
-    /// finalize(`forward.finalize`/observer finalize/Finalize phase)는 호출하지 **않는다** —
+    /// finalize(`forward.finalize`/Finalize phase)는 호출하지 **않는다** —
     /// 호출자(run = 호출, run_until_stop = 미호출)가 결정한다.
     fn run_steps(&mut self, budget: usize, first_token: u32) -> anyhow::Result<DecodeResult> {
         self.prev_token = first_token;
@@ -364,59 +331,25 @@ impl DecodeLoop {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
-            self.reconcile_kv_pos_after_eviction(&stop);
+            self.reconcile_kv_pos_after_eviction();
 
-            // (b) eviction
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &stop,
-            );
-            let outcome = self.eviction.before_step(&ctx)?;
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &stop,
-            );
-            for obs in &mut self.observers {
-                obs.on_eviction(&ctx, &outcome);
-            }
-            if let EvictionOutcome::Pruned { new_pos, .. } = outcome {
-                self.pos = new_pos;
-                self.forward.on_kv_prune(new_pos);
-            }
-
-            // PostEviction: (b) v1 eviction 직후, (c) swap before 직전 (§5.2.1 (나)). pressure
-            // band-driven Persistent EvictionStage 등 v1 eviction 후속 발화 슬롯. dispatch 후
-            // pos-환류로 loop pos 동기화.
+            // PostEviction: PreEviction 직후, forward 직전 (§5.2.1 (나)). pressure band-driven
+            // Persistent EvictionStage 등 eviction 후속 발화 슬롯. dispatch 후 pos-환류로 loop pos
+            // 동기화 (β-7: v1 (b) eviction/(c) swap before 인라인 슬롯 제거 — eviction 은
+            // EvictionStage, swap 은 SwapStage 로 수렴).
             if let Some(r) = self.dispatch_phase(LifecyclePhase::PostEviction) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
-            self.reconcile_kv_pos_after_eviction(&stop);
+            self.reconcile_kv_pos_after_eviction();
 
-            // (c) swap before
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &stop,
-            );
-            self.swap.before_step(&ctx)?;
-
-            // PreForward: (c) swap.before_step 후, (d) forward 직전.
+            // PreForward: PostEviction 후, (d) forward 직전.
             if let Some(r) = self.dispatch_phase(LifecyclePhase::PreForward) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
 
             // (d) forward
-            let t0 = Instant::now();
             let ctx = step_ctx(
                 self.pos,
                 self.prev_token,
@@ -425,25 +358,15 @@ impl DecodeLoop {
                 &stop,
             );
             let logits = self.forward.step(&ctx, self.prev_token)?;
-            let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-            // PostForward: step_ms 계산 직후, (e) swap after 전.
+            // PostForward: forward 직후, PreSample 전 (β-7: v1 (e) swap after 인라인 슬롯
+            // 제거 — swap commit/release 는 SwapStage 로 수렴).
             if let Some(r) = self.dispatch_phase(LifecyclePhase::PostForward) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
 
-            // (e) swap after
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &stop,
-            );
-            self.swap.after_step(&ctx)?;
-
-            // PreSample: (e) swap.after_step 후, (f) sampler.sample 직전.
+            // PreSample: PostForward 후, (f) sampler.sample 직전.
             if let Some(r) = self.dispatch_phase(LifecyclePhase::PreSample) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
@@ -470,18 +393,8 @@ impl DecodeLoop {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
-
-            // (g) observers
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &stop,
-            );
-            for obs in &mut self.observers {
-                obs.on_step_end(&ctx, sampled, step_ms);
-            }
+            // β-7: v1 (g) observer.on_step_end 루프 제거 — per-step 관찰은 PostSample/DecodeEnd
+            // stage 구독으로 수렴.
 
             // β-6: bookkeeping 을 push 앞으로 이동(재배열). DecodeEnd 가 증가된
             // pos/prev_token 으로 발화하고, Stop(chat StopConditionMet 등) 이면 token 을 **push
@@ -585,12 +498,8 @@ impl DecodeLoop {
 /// `with_forward` transitions to `HasForward`, after which `.build()` exists.
 pub struct DecodeLoopBuilder<F = NoForward> {
     forward: F,
-    eviction: Option<Box<dyn EvictionStage>>,
-    swap: Option<Box<dyn SwapStage>>,
     cmd_source: Option<Box<dyn CommandSource>>,
     sampler: Option<Box<dyn TokenSampler>>,
-    observers: Vec<Box<dyn DecodeObserver>>,
-    report: Option<Box<dyn EngineReport>>,
     stop_flag: Option<Arc<AtomicBool>>,
     dispatcher: Option<CommandDispatcher>,
     pipeline: Option<Arc<PipelineRegistry>>,
@@ -613,12 +522,8 @@ impl DecodeLoopBuilder<NoForward> {
     pub fn new() -> Self {
         Self {
             forward: NoForward,
-            eviction: None,
-            swap: None,
             cmd_source: None,
             sampler: None,
-            observers: Vec::new(),
-            report: None,
             stop_flag: None,
             dispatcher: None,
             pipeline: None,
@@ -633,12 +538,8 @@ impl DecodeLoopBuilder<NoForward> {
     pub fn with_forward<T: Forward + 'static>(self, fwd: T) -> DecodeLoopBuilder<HasForward> {
         DecodeLoopBuilder {
             forward: HasForward(Box::new(fwd)),
-            eviction: self.eviction,
-            swap: self.swap,
             cmd_source: self.cmd_source,
             sampler: self.sampler,
-            observers: self.observers,
-            report: self.report,
             stop_flag: self.stop_flag,
             dispatcher: self.dispatcher,
             pipeline: self.pipeline,
@@ -652,24 +553,12 @@ impl DecodeLoopBuilder<NoForward> {
 
 // Optional setters available in any state. Order-independent.
 impl<F> DecodeLoopBuilder<F> {
-    pub fn with_eviction<T: EvictionStage + 'static>(mut self, e: T) -> Self {
-        self.eviction = Some(Box::new(e));
-        self
-    }
-    pub fn with_swap<T: SwapStage + 'static>(mut self, s: T) -> Self {
-        self.swap = Some(Box::new(s));
-        self
-    }
     pub fn with_cmd_source<T: CommandSource + 'static>(mut self, c: T) -> Self {
         self.cmd_source = Some(Box::new(c));
         self
     }
     pub fn with_sampler<T: TokenSampler + 'static>(mut self, t: T) -> Self {
         self.sampler = Some(Box::new(t));
-        self
-    }
-    pub fn add_observer<T: DecodeObserver + 'static>(mut self, o: T) -> Self {
-        self.observers.push(Box::new(o));
         self
     }
     pub fn with_stop_flag(mut self, f: Arc<AtomicBool>) -> Self {
@@ -686,10 +575,6 @@ impl<F> DecodeLoopBuilder<F> {
     /// OneShot EvictionStage 로 submit 하고 control 을 LoopControl 에 누적한다.
     pub fn with_command_dispatcher(mut self, d: CommandDispatcher) -> Self {
         self.dispatcher = Some(d);
-        self
-    }
-    pub fn with_engine_report<T: EngineReport + 'static>(mut self, r: T) -> Self {
-        self.report = Some(Box::new(r));
         self
     }
     /// β-2: L2 stage registry 주입. 미주입 시 빈 registry (거동-0).
@@ -714,23 +599,25 @@ impl<F> DecodeLoopBuilder<F> {
         self
     }
 
-    /// P3.3 + β-6 commit C: [`ResilienceAdapter`]를 cmd_source / report slot 에 주입하고, per-token
-    /// tick 은 [`TickStage`](crate::stages::system::tick::TickStage)(PostSample)로 build() 시점에
-    /// registry 에 submit 한다.
+    /// P3.3 + β-6 commit C: [`ResilienceAdapter`]를 cmd_source slot 에 주입하고, per-token tick 은
+    /// [`TickStage`](crate::stages::system::tick::TickStage)(PostSample)로 build() 시점에 registry
+    /// 에 submit 한다.
     ///
     /// 단일 인스턴스를 `Arc<Mutex<ResilienceAdapter>>`로 감싸 wrapper·stage 가 공유하므로
     /// ownership 이전 없이 충족한다. per-token Mutex lock 은 (poll 1회 + tick 1회) 정도라 contention
     /// 무시 가능. **with_pipeline 호출 순서 무관**: shared Arc 를 보관했다가 build() 에서 (그때
     /// 확정된) registry 로 submit 한다.
+    ///
+    /// β-7: v1 report slot(EngineReport/ReportWrapper) 제거 — IPC 송출(capability/qcf/swap_report)
+    /// 은 decode loop 슬롯을 경유한 적이 없다(resilience_init 가 `CommandExecutor` 직접 호출).
     pub fn with_resilience(
         mut self,
         adapter: super::resilience_adapter::ResilienceAdapter,
     ) -> Self {
-        use super::resilience_adapter::{CmdSrcWrapper, ReportWrapper};
+        use super::resilience_adapter::CmdSrcWrapper;
         use std::sync::Mutex;
         let shared = Arc::new(Mutex::new(adapter));
         self.cmd_source = Some(Box::new(CmdSrcWrapper(Arc::clone(&shared))));
-        self.report = Some(Box::new(ReportWrapper(Arc::clone(&shared))));
         // β-6 commit C: tick 은 build() 에서 TickStage 로 submit (TickWrapper 제거).
         self.resilience_tick = Some(shared);
         self
@@ -753,18 +640,10 @@ impl DecodeLoopBuilder<HasForward> {
         }
         DecodeLoop {
             forward: self.forward.0,
-            eviction: self.eviction.unwrap_or_else(|| Box::new(NoOpEvictionStage)),
-            swap: self.swap.unwrap_or_else(|| Box::new(NoOpSwapStage)),
             cmd_source: self
                 .cmd_source
                 .unwrap_or_else(|| Box::new(NoOpCommandSource)),
             sampler: self.sampler.unwrap_or_else(|| Box::new(GreedySampler)),
-            observers: if self.observers.is_empty() {
-                vec![Box::new(NoOpObserver) as Box<dyn DecodeObserver>]
-            } else {
-                self.observers
-            },
-            report: self.report.unwrap_or_else(|| Box::new(NoOpEngineReport)),
             stop_flag: self
                 .stop_flag
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
@@ -900,48 +779,10 @@ mod tests {
         assert_eq!(observe_count.load(AtomicOrd::Relaxed), 7);
     }
 
-    #[test]
-    fn eviction_pruned_advances_on_kv_prune_hook() {
-        struct PruneEveryStep;
-        impl EvictionStage for PruneEveryStep {
-            fn before_step(&mut self, ctx: &StepCtx) -> anyhow::Result<EvictionOutcome> {
-                Ok(EvictionOutcome::Pruned {
-                    removed: 1,
-                    new_pos: ctx.pos.saturating_sub(1),
-                })
-            }
-        }
-        struct CountingForward {
-            mock: MockForward,
-            prunes: usize,
-        }
-        impl Forward for CountingForward {
-            fn prefill(&mut self, t: &[u32], start_pos: usize) -> anyhow::Result<Vec<f32>> {
-                self.mock.prefill(t, start_pos)
-            }
-            fn step(&mut self, c: &StepCtx, t: u32) -> anyhow::Result<Vec<f32>> {
-                self.mock.step(c, t)
-            }
-            fn on_kv_prune(&mut self, _new_pos: usize) {
-                self.prunes += 1;
-            }
-        }
-        // We can't observe `prunes` after build() (forward is moved), but we
-        // can verify the loop runs to completion when eviction prunes each step.
-        let mut loop_ = DecodeLoopBuilder::new()
-            .with_forward(CountingForward {
-                mock: MockForward {
-                    vocab: 8,
-                    step_count: 0,
-                },
-                prunes: 0,
-            })
-            .with_eviction(PruneEveryStep)
-            .build();
-        let _ = loop_.prefill(&[5, 6, 7]).unwrap();
-        let result = loop_.run(2, 0).unwrap();
-        assert_eq!(result.tokens_generated.len(), 2);
-    }
+    // β-7: v1 `with_eviction`/`EvictionStage` trait 슬롯 검증 테스트
+    // (eviction_pruned_advances_on_kv_prune_hook) 제거 — 슬롯이 삭제되고 eviction 은
+    // stages::EvictionStage(PipelineStage)로 수렴했다. 등가 검증은
+    // `tests/beta3_eviction_stage_equivalence.rs` 가 담당한다.
 
     // Phase 4-5-c / β-6: run_until_stop 테스트.
     //
@@ -1015,13 +856,16 @@ mod tests {
 
     // ── β-6 commit A: chat 거동 고정 (수렴 전 핀) ──────────────────────────
 
-    /// β-6 핀 2: stop 토큰에 대해서도 tick(PostSample phase)과 (g) observer.on_step_end 가
-    /// **발화**한다. v1 run_until_stop 시맨틱 census: stop 체크는 tick/(g)/bookkeeping **후** 이므로
-    /// stop 토큰의 tick·obs 도 1회씩 발화하고 pos 만 증가하며 push 만 안 된다. commit C 후 tick 은
-    /// PostSample phase 로 이관됐으므로(TickStage), PostSample 발화 횟수 == 구 tick 횟수로 등가
-    /// 검증한다. ChatStopStage(DecodeEnd) 가 PostSample 보다 뒤이므로 stop 토큰의 PostSample 도 발화.
+    /// β-6 핀 2: stop 토큰에 대해서도 tick(PostSample phase)이 **발화**한다. v1 run_until_stop
+    /// 시맨틱 census: stop 체크는 tick/bookkeeping **후** 이므로 stop 토큰의 tick 도 1회 발화하고
+    /// pos 만 증가하며 push 만 안 된다. commit C 후 tick 은 PostSample phase 로 이관됐으므로
+    /// (TickStage), PostSample 발화 횟수 == 구 tick 횟수로 등가 검증한다. ChatStopStage(DecodeEnd)
+    /// 가 PostSample 보다 뒤이므로 stop 토큰의 PostSample 도 발화.
+    ///
+    /// β-7: v1 (g) observer.on_step_end 슬롯이 삭제됐으므로 obs 단언은 제거 — per-step 관찰은
+    /// PostSample stage 발화로 대표 검증한다.
     #[test]
-    fn run_until_stop_fires_tick_and_obs_on_stop_token() {
+    fn run_until_stop_fires_tick_on_stop_token() {
         use crate::pipeline::{LifecyclePhase as P2, PipelineStage as PS2, StageOutcome as SO2};
         use crate::session::chat::stop_condition::{
             ChatStopCondition, ChatStopSlot, ChatStopStage,
@@ -1048,17 +892,8 @@ mod tests {
                 Ok(SO2::Continue)
             }
         }
-        struct CountStepEndObserver {
-            count: Arc<AtomicUsize>,
-        }
-        impl DecodeObserver for CountStepEndObserver {
-            fn on_step_end(&mut self, _ctx: &StepCtx, _sampled: u32, _step_ms: f64) {
-                self.count.fetch_add(1, AtomicOrd::Relaxed);
-            }
-        }
 
         let tick_count = Arc::new(AtomicUsize::new(0));
-        let obs_count = Arc::new(AtomicUsize::new(0));
         let slot = ChatStopSlot::new();
         let registry = Arc::new(PipelineRegistry::new());
         // CountPostSampleStage(PostSample) 를 먼저, ChatStopStage(DecodeEnd) 를 나중에 등록.
@@ -1073,28 +908,20 @@ mod tests {
             })
             .with_kv_capacity(2048)
             .with_pipeline(registry)
-            .add_observer(CountStepEndObserver {
-                count: obs_count.clone(),
-            })
             .build();
         let _ = loop_.prefill(&[0]).unwrap();
-        // step1→token1(push), step2→token2(push), step3→token3=stop(미push, but tick/obs 발화).
+        // step1→token1(push), step2→token2(push), step3→token3=stop(미push, but tick 발화).
         let cond = ChatStopCondition::new(vec![3], 2048);
         let result = {
             let _guard = slot.arm(&cond);
             loop_.run_until_stop(0).unwrap()
         };
         assert_eq!(result.tokens_generated, vec![1, 2], "stop 토큰 미push");
-        // 3 step (token1, token2, token3=stop) 모두 PostSample(tick)·obs 발화 — stop 토큰 포함.
+        // 3 step (token1, token2, token3=stop) 모두 PostSample(tick) 발화 — stop 토큰 포함.
         assert_eq!(
             tick_count.load(AtomicOrd::Relaxed),
             3,
             "stop 토큰에도 PostSample(tick) 발화 (총 3 step)"
-        );
-        assert_eq!(
-            obs_count.load(AtomicOrd::Relaxed),
-            3,
-            "stop 토큰에도 on_step_end 발화 (총 3 step)"
         );
     }
 
@@ -1424,10 +1251,11 @@ mod tests {
     // ── β-3 loop-level pos-환류 테스트 ─────────────────────────────────────
 
     /// OneShot EvictionStage 가 PreEviction 에서 발화 → cache prune → driver 가
-    /// `reconcile_kv_pos_after_eviction` 으로 loop pos 를 handle.current_pos() 와 동기화하고
-    /// observer 가 on_eviction(Pruned) 를 1회 수신. Consumed → registry GC (len==0).
+    /// `reconcile_kv_pos_after_eviction` 으로 loop pos 를 handle.current_pos() 와 동기화.
+    /// Consumed → registry GC (len==0). β-7: v1 observer.on_eviction 통지가 제거됐으므로
+    /// prune 은 pos 환류(new_pos < N_TOKENS, final_pos == new_pos+1)로 직접 검증한다.
     #[test]
-    fn eviction_stage_pos_reconcile_and_observer() {
+    fn eviction_stage_pos_reconcile() {
         use crate::backend::Backend;
         use crate::backend::cpu::CpuBackend;
         use crate::buffer::DType;
@@ -1441,7 +1269,6 @@ mod tests {
         use crate::shape::Shape;
         use crate::stages::kv::eviction::EvictionStage;
         use crate::tensor::Tensor;
-        use std::sync::atomic::AtomicUsize;
 
         const KV_HEADS: usize = 1;
         const HEAD_DIM: usize = 32;
@@ -1470,19 +1297,6 @@ mod tests {
         registry.submit(Arc::new(stage));
         assert_eq!(registry.len(), 1);
 
-        // observer: on_eviction(Pruned) 수신 횟수 카운트.
-        struct PruneCountObserver {
-            count: Arc<AtomicUsize>,
-        }
-        impl DecodeObserver for PruneCountObserver {
-            fn on_eviction(&mut self, _ctx: &StepCtx, outcome: &EvictionOutcome) {
-                if matches!(outcome, EvictionOutcome::Pruned { .. }) {
-                    self.count.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-        }
-        let prune_count = Arc::new(AtomicUsize::new(0));
-
         let pos_handle: Arc<dyn KVCacheFormat> = handle.clone();
         let mut loop_ = DecodeLoopBuilder::new()
             .with_forward(MockForward {
@@ -1492,9 +1306,6 @@ mod tests {
             .with_kv_capacity(2048)
             .with_pipeline(Arc::clone(&registry))
             .with_kv_pos_handle(pos_handle)
-            .add_observer(PruneCountObserver {
-                count: prune_count.clone(),
-            })
             .build();
 
         // prefill N_TOKENS → driver pos = N_TOKENS (handle.current_pos 와 일치).
@@ -1508,12 +1319,6 @@ mod tests {
         // EvictionStage 발화 후 handle.current_pos < N_TOKENS (sliding prune).
         let new_pos = handle.current_pos();
         assert!(new_pos < N_TOKENS, "eviction prune (got pos={new_pos})");
-        // reconcile 이 발동해 observer 가 Pruned 정확히 1회 수신.
-        assert_eq!(
-            prune_count.load(Ordering::SeqCst),
-            1,
-            "on_eviction(Pruned) 정확히 1회"
-        );
         // 첫 step 의 PreEviction prune 으로 loop pos 가 new_pos 로 동기화된 뒤 step 진행으로 +1
         // → final_pos == new_pos + 1.
         assert_eq!(result.final_pos, new_pos + 1, "pos 환류 후 step 진행 정합");
