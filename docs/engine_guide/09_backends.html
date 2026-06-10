@@ -234,8 +234,8 @@ pub trait KiviAttentionBackend: Send + Sync {
     fn attention_gen_kivi(&amp;self, args: &amp;KiviAttnArgs) -&gt; i32;  // 매 토큰 hot-path
     fn kivi_gather_update(&amp;self, args: &amp;KiviGatherArgs) -&gt; i32;
 }</code></pre>
-<p>엔진 내 소비자는 <code>pressure/kivi_format.rs</code>가 <code>backend.as_kivi_attention()</code>으로, <code>kivi_cache.rs</code>가 construction 시점에 pull한 handle로 호출한다 — 매 토큰 lookup 없음.</p>
-<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::KiviAttentionBackend</code> (L1284), <code>KiviAttnArgs</code> (L1245), <code>engine/src/capability/kivi_attention.rs</code> (re-export shim), <code>engine/src/pressure/kivi_format.rs</code> L143·L274, <code>engine/src/backend/opencl.rs</code> L7215~7261</p>
+<p>엔진 내 소비자는 <code>kv/kivi_format.rs</code>가 <code>backend.as_kivi_attention()</code>으로, <code>kivi_cache.rs</code>가 construction 시점에 pull한 handle로 호출한다 — 매 토큰 lookup 없음.</p>
+<p class="evidence">근거: <code>crates/technique-api/src/lib.rs::KiviAttentionBackend</code> (L1284), <code>KiviAttnArgs</code> (L1245), <code>engine/src/capability/kivi_attention.rs</code> (re-export shim), <code>engine/src/kv/kivi_format.rs</code> L143·L274, <code>engine/src/backend/opencl.rs</code> L7215~7261</p>
 
 <h3>5.2 dlopen 흐름 — 봉투 → category 다리 → 어댑터</h3>
 

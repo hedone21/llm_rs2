@@ -125,7 +125,7 @@ QCF(Quality Cost Function)는 두 패밀리로 명확히 구분한다. 액션마
 | 패밀리 | 측정 공간 | 포함 액션 | 코드 위치 (현재 명) |
 |---|---|---|---|
 | **QCF_kv** | KV 캐시 → attention output `‖ΔO‖₂ / ‖O‖₂` | sliding/H2O/streaming eviction, KIVI quant, D2O merge | `engine/src/qcf/qcf_kv.rs::compute_qcf_kv` (구 unified_qcf.rs) |
-| **QCF_weight** | 모델 forward path (weight/layer 단위) | weight swap (F16→Q4), layer skip (SWIFT) | `engine/src/pressure/weights/decider.rs` (swap 판단), `engine/src/qcf/layer_importance.rs::compute_qcf_weight` |
+| **QCF_weight** | 모델 forward path (weight/layer 단위) | weight swap (F16→Q4), layer skip (SWIFT) | `engine/src/weight/decider.rs` (swap 판단), `engine/src/qcf/layer_importance.rs::compute_qcf_weight` |
 
 - **Layer skip은 QCF_weight에 속한다** — skip은 "그 layer의 weight를 쓰지 않음"이라 weight 패밀리. swap과 ImportanceTable을 공유한다.
 - **두 패밀리는 직접 비교 불가** — 측정 공간이 다르다. cross-action 비교는 `DegradationEstimator`로 ΔPPL 환산 후 가능 (estimator에 액션별 piecewise-linear 곡선 등록 필요).

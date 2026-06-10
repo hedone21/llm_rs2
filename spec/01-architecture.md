@@ -567,7 +567,7 @@ Action Selector 비용 함수: D = Σ default_cost(action)
 - **Pressure 도메인**: 메모리 압박에 응답하여 캐시/가중치 상태를 변경하는 모든 정책 — KV eviction, KV quantization, KV compress, KV swap, weight swap을 모두 포함한다. `CachePressurePipeline`을 단일 진입점으로 가진다.
 - **Inference 도메인**: 단일 토큰의 forward pass — 모델 구조, layer, attention, sampling, speculative decoding.
 
-> **Rationale**: 이전 분류 "Cache vs Inference"는 weight swap이 KV eviction과 동일한 pipeline에 등록되는 현재 구조(`pressure/weight_swap_handler.rs`)를 설명하지 못한다. "Pressure vs Inference"는 *압박-반응형 변형*과 *forward 계산*을 분리하여 일반화된다.
+> **Rationale**: 이전 분류 "Cache vs Inference"는 weight swap이 KV eviction과 동일한 pipeline에 등록되는 현재 구조(`kv/weight_swap_handler.rs`)를 설명하지 못한다. "Pressure vs Inference"는 *압박-반응형 변형*과 *forward 계산*을 분리하여 일반화된다.
 
 **[SYS-102]** 두 종류의 cross-cutting 모듈이 존재한다. *(MUST)*
 

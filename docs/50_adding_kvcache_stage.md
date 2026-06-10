@@ -200,7 +200,7 @@ sliding 의 prefix=0 변형). `technique-api` 에만 의존하고 `StageCtx` 의
 1. **컴파일**: `cargo build -p llm_rs2`(엔진), `cargo build -p <name>`(crate 단독 — technique-api 만
    의존하는지).
 2. **등록**: `technique_api::find_stage("<name>")` 가 `Some` 인지(cross-crate). 예제 검증 =
-   `engine/src/pressure/eviction/stage_registry.rs` 의 `example_technique_crate_visible_to_engine`,
+   `engine/src/kv/eviction/stage_registry.rs` 의 `example_technique_crate_visible_to_engine`,
    `d2o_stage_registered` 테스트.
 3. **동작 정확성**(plan→compact 가 의도대로): `compact_parity` 패턴 — plan 적용 결과가 기준 거동과
    bit-identical 인지 host unit test. 가중 merge 기법은 `apply_weighted_merges` ≡ 기준 merge 를
@@ -216,6 +216,6 @@ sliding 의 prefix=0 변형). `technique-api` 에만 의존하고 `StageCtx` 의
 - ADR-0003 — 확장 메커니즘(정적 crate + linkme, `.so` 보류). §4 D4 에 force-link 정정.
 - ADR-0004 — `KVCacheStage` plan-returning trait 설계(D1~D6, executor 매핑, Q4_0 merge 정정).
 - `crates/technique-api/src/lib.rs` — trait/타입 정본.
-- `engine/src/pressure/eviction/stage_registry.rs` — 빌트인 등록 + executor(`execute_kv_plan`) +
+- `engine/src/kv/eviction/stage_registry.rs` — 빌트인 등록 + executor(`execute_kv_plan`) +
   역어댑터(`StageBackedPolicy`).
-- `engine/src/pressure/standard_format.rs` — `apply_weighted_merges`(가중 merge 적용).
+- `engine/src/kv/standard_format.rs` — `apply_weighted_merges`(가중 merge 적용).

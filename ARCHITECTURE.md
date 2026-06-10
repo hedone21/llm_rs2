@@ -168,12 +168,12 @@ graph TB
         FwdImpls["session::forward::<br/>{model, kivi, offload}_forward"]
     end
 
-    subgraph L3P ["L3 Pressure — pressure/"]
-        CacheMgr["pressure::cache_manager"]
+    subgraph L3P ["L3 KV — kv/ (구 pressure/, γ-1 rename)"]
+        CacheMgr["kv::cache_manager"]
         Pipeline["CachePressurePipeline +<br/>CachePressureHandler trait"]
-        EvPolicy["pressure::eviction::*<br/>(Sliding / H2O / D2O / Streaming)"]
+        EvPolicy["kv::eviction::*<br/>(Sliding / H2O / D2O / Streaming)"]
         Handlers["{eviction,d2o,swap,<br/>quantize,weight_swap}_handler"]
-        KvState["pressure::{kv_cache, kivi_cache,<br/>offload, kv_migrate}"]
+        KvState["kv::{kv_cache, kivi_cache,<br/>offload, kv_migrate}"]
     end
 
     subgraph L3I ["L3 Inference — models/, layers/, inference/"]
@@ -245,7 +245,7 @@ graph TB
     EvPolicy --> KvState
 
     WSwap -.swap state.- KvState
-    %% NOTE: pressure::weight_swap_handler 는 dormant (handler 정의만, pipeline 미등록).
+    %% NOTE: kv::weight_swap_handler 는 dormant (handler 정의만, pipeline 미등록).
     %% CacheManager 경유 precision swap path 는 현재 미구현 — 직접 edge 없음.
 
     %% M sprint: Manager SwapWeights wire (WHAT) → EngineSwapRuntime (HOW)
@@ -477,7 +477,7 @@ graph TB
         Release["PrimaryReleaseWorker<br/>(Phase 6.5 −81% RSS,<br/>ReleaseJob queue)"]
         Tomb["PrimaryWeightsTombstone<br/>(Sprint C-1/2/3 PLACEHOLDER +<br/>PRIMARY DROP, 1.81 GB recover)"]
         Noise["QuantNoiseTable<br/>(Q4 quant noise compensation)"]
-        SwapH["pressure::weight_swap_handler<br/>(CachePressureHandler impl)<br/><b>dormant</b> — production wire 0<br/>(handler 정의만, CachePressurePipeline<br/>미등록, CacheManager 호출 안 됨)"]
+        SwapH["kv::weight_swap_handler<br/>(CachePressureHandler impl)<br/><b>dormant</b> — production wire 0<br/>(handler 정의만, CachePressurePipeline<br/>미등록, CacheManager 호출 안 됨)"]
     end
 
     %% ── L2 자산 (backing + secondary) ────────────────────────
@@ -576,13 +576,13 @@ graph TB
 | **Backend** | 하드웨어 가속기 추상화 (matmul, softmax, RoPE 등). `cpu_kernels`/`secondary` capability trait 동반 | `engine/src/backend.rs` (trait) + `engine/src/backend/<be>/mod.rs` (impl) |
 | **Galloc** | 시스템/장치 공유 메모리 할당자. Zero-copy의 핵심. `Memory` trait impl | `engine/src/memory/galloc.rs` |
 | **KVCacheOps** | KV 캐시 추상화 trait (OCP 확장점) — `update`, `get_view`, `kv_dtype`. §G shared identifier promotion 으로 L2 격상 | `engine/src/kv_cache_ops.rs` (L2) |
-| **KVCache** | 표준 KV 캐시 (F32/F16/Q4_0). Eviction + `compress_per_head()` 지원 | `engine/src/pressure/kv_cache.rs` |
-| **KiviCache** | KIVI 다중 비트 압축 캐시 (Q2/Q4/Q8). FP32 Residual + 양자화 저장소 | `engine/src/pressure/kivi_cache.rs` |
-| **CacheManager** | 메모리 압박 감지 + CachePressurePipeline 조율. `EventSink` 기반 이벤트 출력 | `engine/src/pressure/cache_manager.rs` |
-| **CachePressurePipeline + Handler** | PressureLevel별 다중 `CachePressureHandler` 순차 실행 | `engine/src/pressure/mod.rs` |
-| **EvictionHandler / D2OHandler / WeightSwapHandler / QuantizeHandler / SwapHandler** | Pressure handler impl 군 | `engine/src/pressure/*_handler.rs` |
-| **EvictionPolicy** | 단순 KV eviction 전략 (NoEviction / Sliding / StreamingLLM / H2O / H2OPlus) | `engine/src/pressure/eviction/*.rs` |
-| **OffloadKVCache + DiskStore / RawStore / PrefetchController** | KV 디스크 오프로드 (Warning+ 압력) | `engine/src/pressure/offload/*.rs` |
+| **KVCache** | 표준 KV 캐시 (F32/F16/Q4_0). Eviction + `compress_per_head()` 지원 | `engine/src/kv/kv_cache.rs` |
+| **KiviCache** | KIVI 다중 비트 압축 캐시 (Q2/Q4/Q8). FP32 Residual + 양자화 저장소 | `engine/src/kv/kivi_cache.rs` |
+| **CacheManager** | 메모리 압박 감지 + CachePressurePipeline 조율. `EventSink` 기반 이벤트 출력 | `engine/src/kv/cache_manager.rs` |
+| **CachePressurePipeline + Handler** | PressureLevel별 다중 `CachePressureHandler` 순차 실행 | `engine/src/kv.rs` |
+| **EvictionHandler / D2OHandler / WeightSwapHandler / QuantizeHandler / SwapHandler** | Pressure handler impl 군 | `engine/src/kv/*_handler.rs` |
+| **EvictionPolicy** | 단순 KV eviction 전략 (NoEviction / Sliding / StreamingLLM / H2O / H2OPlus) | `engine/src/kv/eviction/*.rs` |
+| **OffloadKVCache + DiskStore / RawStore / PrefetchController** | KV 디스크 오프로드 (Warning+ 압력) | `engine/src/kv/offload/*.rs` |
 | **EventSink** | 캐시 관리 이벤트 구조화 출력 (NoOpSink, StderrDiagnosticSink) | `engine/src/observability/events.rs` |
 | **OpProfiler / op_trace** | per-op latency 측정 + `op_span!` 매크로 (§H instrument helper, OpKind = §G shared id) | `engine/src/observability/profile/*` + `engine/src/op_kind.rs` (L2) + `engine/src/instrument.rs` (L2) |
 | **SamplingConfig** | 토큰 샘플링 파라미터 (temperature, top-k, top-p) | `engine/src/inference/sampling.rs` |
@@ -955,28 +955,30 @@ llm_rs2/
 │       ├── layers/                      # LayerWorkspace / attention / staging_pool / tensor_partition / llama_layer / transformer_layer{forward, forward_gen}
 │       ├── models/                      # TransformerModel (multi-arch) + config + loader{auf, gguf, safetensors, convert} + mappers{llama, qwen2, gemma3} + weights{slot, secondary_mmap, swap_executor, async_swap, intra_forward_swap, phase_aware_swap, dynamic_k, probing_k, decider, release_worker, layer_object_pool, backing, noise_table, rpcmem_secondary, incremental_plan}
 │       │
-│       │ # ── L3 Pressure 도메인 ──
-│       ├── pressure/                    # KV cache 관리 + weight swap orchestrator
+│       │ # ── L3 KV 도메인 (구 pressure/, γ-1 rename 완료 2026-06-10 commit 7fe1fe8b) ──
+│       ├── kv/                          # KV cache 관리 (구 pressure/) — format-impl + policy + tier + algo
 │       │   ├── kv_cache.rs              # 표준 KVCache (F32/F16/Q4_0)
 │       │   ├── kivi_cache.rs            # KIVI 다중 비트 (Q2/Q4/Q8 + FP32 Residual)
 │       │   ├── kv_migrate.rs            # KV cache 디바이스 이동
 │       │   ├── cache_manager.rs         # CacheManager (Pipeline 조율)
-│       │   ├── mod.rs                   # CachePressurePipeline + Handler trait
 │       │   ├── {eviction,d2o,quantize,swap,weight_swap}_handler.rs  # Pressure handlers
 │       │   ├── d2o_layer_alloc.rs       # D2O layer-level variance allocation
 │       │   ├── eviction/                # EvictionPolicy 구현체 (no_eviction / sliding_window / streaming_llm / h2o / h2o_plus / method)
-│       │   ├── offload/                 # OffloadKVCache + store / raw_store / disk_store / prefetch / preload_pool
-│       │   └── weights/                 # Weight swap orchestrator (Sprint C, 2026-05-26 git mv from models/weights/)
-│       │       ├── swap_executor.rs     # SwapExecutor / SwapReport / SwappedLayer (LayerSlot mutate)
-│       │       ├── decider.rs           # WeightSwapDecider + compute_qcf_weight_swap (QCF_weight owner)
-│       │       ├── async_swap.rs        # AsyncSwapDispatcher worker thread
-│       │       ├── phase_aware_swap.rs  # PhaseAwareSwapDispatcher
-│       │       ├── intra_forward_swap.rs # IntraForwardSwapHook (LayerBoundaryHook impl, trait은 L2 layer_boundary_hook.rs)
-│       │       ├── incremental_plan.rs  # IncrementalSwapPlan
-│       │       ├── dynamic_k.rs         # DynamicKController (ARGUS)
-│       │       ├── probing_k.rs         # ProbingKController
-│       │       ├── noise_table.rs       # QuantNoiseTable (QCF_weight 입력)
-│       │       └── release_worker.rs    # PrimaryReleaseWorker (primary cl_mem release worker)
+│       │   └── offload/                 # OffloadKVCache + store / raw_store / disk_store / prefetch / preload_pool
+│       │   # (모듈 루트 = 형제 engine/src/kv.rs: CachePressurePipeline + Handler trait, no-mod.rs 컨벤션)
+│       │
+│       │ # ── L3 Weight 도메인 (구 pressure/weights/, γ-1 rename 완료 2026-06-10 commit 7fe1fe8b — top-level 격상) ──
+│       ├── weight/                      # Weight swap orchestrator (Sprint C 2026-05-26 git mv from models/weights/; γ-1 에서 pressure/weights/ → top-level weight/)
+│       │   ├── swap_executor.rs         # SwapExecutor / SwapReport / SwappedLayer (LayerSlot mutate)
+│       │   ├── decider.rs               # WeightSwapDecider + compute_qcf_weight_swap (QCF_weight owner)
+│       │   ├── async_swap.rs            # AsyncSwapDispatcher worker thread
+│       │   ├── phase_aware_swap.rs      # PhaseAwareSwapDispatcher
+│       │   ├── intra_forward_swap.rs    # IntraForwardSwapHook (LayerBoundaryHook impl, trait은 L2 layer_boundary_hook.rs)
+│       │   ├── incremental_plan.rs      # IncrementalSwapPlan
+│       │   ├── dynamic_k.rs             # DynamicKController (ARGUS)
+│       │   ├── probing_k.rs             # ProbingKController
+│       │   ├── noise_table.rs           # QuantNoiseTable (QCF_weight 입력)
+│       │   └── release_worker.rs        # PrimaryReleaseWorker (primary cl_mem release worker)
 │       │
 │       │ # ── L3 QCF 도메인 ──
 │       ├── qcf/                         # QcfMetric impl, ImportanceTable, DegradationEstimator
@@ -1508,7 +1510,7 @@ python scripts/run_device.py -d pixel generate --backend opencl
 |-------|------|----------|----------------------------|
 | **L5 Adapter** | CLI, IPC adapter, signal injection, binary entrypoint | `bin/` | `engine/src/bin/{argus_cli, auf_tool, signal_injector, test_backend, test_model, test_q4_soa_byte_equal}.rs` + `engine/legacy/generate.rs` (monolith, 보존 결정) |
 | **L4 Orchestration** | Decode loop, eviction trigger, swap dispatch, prefill 흐름, chat REPL, eval/batch/ppl 진입점 | `session/` | `engine/src/session/{init, traits, decode_loop, defaults, samplers, standard_happy, prefill, assembly/, forward/, chat/, chat_ipc, chat_template, eval/, batch/, ppl/, decode_fallback/, cli/, warmup, qcf_runtime, dump_importance}` |
-| **L3 Pressure** | KV pressure pipeline (CacheManager + Handler) + weight swap orchestrator | `pressure/` | `engine/src/pressure/{kv_cache, kivi_cache, cache_manager, kv_migrate, eviction/, offload/, *_handler.rs}` + `engine/src/pressure/weights/{swap_executor, decider, async_swap, phase_aware_swap, intra_forward_swap, incremental_plan, dynamic_k, probing_k, noise_table, release_worker}.rs` (Sprint C, 2026-05-26) |
+| **L3 Pressure** | KV pressure pipeline (CacheManager + Handler) + weight swap orchestrator | `kv/` + `weight/` | `engine/src/kv/{kv_cache, kivi_cache, cache_manager, kv_migrate, eviction/, offload/, *_handler.rs}` + `engine/src/weight/{swap_executor, decider, async_swap, phase_aware_swap, intra_forward_swap, incremental_plan, dynamic_k, probing_k, noise_table, release_worker}.rs` (Sprint C 2026-05-26, γ-1 rename 2026-06-10 commit 7fe1fe8b) |
 | **L3 Inference** | Forward path (models, layers, sampling, skip, speculative) + weight resource owner (slot/secondary mmap) | `inference/` | `engine/src/{models/, layers/, inference/}` + `engine/src/models/weights/{slot, secondary_mmap, rpcmem_secondary, backing, layer_object_pool}.rs` (weight resource state, Sprint C 잔존) |
 | **L3 QCF** | Quality cost (importance, degradation) — 측정 도메인 | `qcf/` | `engine/src/{qcf/, qcf_collector, qcf_computer}` |
 | **L2 Abstraction** | Backend trait, Tensor, Buffer, DType, Memory, Shape, ThreadPool, KVCacheOps, OpKind, PartitionWorkspace, HybridAttention, CpuKernelSet, Secondary, Instrument, QcfTypes, LayerBoundaryHook, AUF | `engine/src/` 루트 | `engine/src/{tensor, shape, buffer, memory, quant, thread_pool, kv_cache_ops, op_kind, partition_workspace, hybrid_attention, cpu_kernels, secondary, instrument, qcf_types, layer_boundary_hook, yield_policy}.rs` + `engine/src/{backend.rs, auf/, memory/}` (layer_boundary_hook: Sprint C 격상, §G #8) |
@@ -1637,7 +1639,7 @@ session/
 │   └── offload_forward.rs                  per-layer prefetch
 ├── eviction/
 │   ├── mod.rs
-│   └── cache_manager_stage.rs              EvictionStage (pressure::CacheManager owned)
+│   └── cache_manager_stage.rs              EvictionStage (kv::CacheManager owned)
 ├── swap/
 │   ├── mod.rs
 │   ├── sync_swap_stage.rs

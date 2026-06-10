@@ -5,7 +5,7 @@
 > **Decision-makers**: 사용자 + Architect (grill-with-docs 세션 "EvictionPlan 재설계", /loop M2 STOP 후)
 > **Selected**: stage 축 확장 기법(eviction/merge)을 **단일 plan-returning trait `KVCacheStage`** 로 통일. 입력 = 캐시 읽기 접근 + scores + budget, 상태는 impl, 반환 `KVCachePlan`(keep + 가중 merge), 버퍼 변형은 엔진이 실행.
 > **Supersedes (부분)**: ADR-0003 §D2 의 "planning 표면이 h2o+/d2o 를 덮는다 (낙관적)" — 본 ADR 이 *어떻게* 덮는지 확정하며 §D2 의 미명세를 닫는다.
-> **Related**: ADR-0003(확장 메커니즘 = 정적 crate + linkme), `/CONTEXT.md`("KVCacheStage"/"KVCachePlan" 항목), `arch/pipeline_stage_design_v2.md`, `engine/src/pressure/eviction/compact_parity.rs`
+> **Related**: ADR-0003(확장 메커니즘 = 정적 crate + linkme), `/CONTEXT.md`("KVCacheStage"/"KVCachePlan" 항목), `arch/pipeline_stage_design_v2.md`, `engine/src/kv/eviction/compact_parity.rs`
 
 ---
 
@@ -72,8 +72,8 @@ executor 매핑: `LayerWide`+merges → `apply_merges`(가중) → `compact_keep
 
 - ADR-0003 §D2 (본 ADR 이 정정/구체화)
 - `/CONTEXT.md` — "KVCacheStage"/"KVCachePlan"/"EvictionPolicy(legacy)" + Flagged ambiguities("stage 축 vs PipelineStage vs KVCacheStage")
-- `engine/src/pressure/eviction/compact_parity.rs` (등가성 게이트), `engine/src/pressure/eviction/h2o_plus.rs`(per-head), `engine/src/pressure/d2o_handler.rs`(가중 merge/EMA/nearest)
-- `engine/src/pressure/kv_cache.rs` (`compact_keep_positions`/`_for_head`), `engine/src/pressure/standard_format.rs` (`apply_merges`)
+- `engine/src/kv/eviction/compact_parity.rs` (등가성 게이트), `engine/src/kv/eviction/h2o_plus.rs`(per-head), `engine/src/kv/d2o_handler.rs`(가중 merge/EMA/nearest)
+- `engine/src/kv/kv_cache.rs` (`compact_keep_positions`/`_for_head`), `engine/src/kv/standard_format.rs` (`apply_merges`)
 - workflow `wf_a9f025a7` (4축 surface map), `.agent/todos/adr0003_impl_progress.md`
 
 ## 7. Amendment — M-A: TensorHandle 범용 읽기 표면 (2026-06-06 결정)

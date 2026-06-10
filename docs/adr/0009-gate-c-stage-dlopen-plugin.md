@@ -63,7 +63,7 @@ plugin 은 **단일 `#[no_mangle] register_kv_stage_v1() -> *const PluginVTableA
 
 ### D3 — registry 병합: **가산(additive), 정적 경로 0 변경** [Q3]
 
-`technique-api`(ABI 계약 + 정적 registry, libloading 의존 없음)는 **무변** — `find_stage`/`ensure_builtin_stages_registered`(ADR-0003 §4 load-bearing self-test)/6 테스트 그대로. `engine`(`pressure/eviction/stage_registry.rs`)이 런타임 loader 소유: 별도 `static DYN_REGISTRY: OnceLock<Vec<RuntimeStageReg>>` 에 dlopen 결과 append(`Arc<Library>` 영구 보관 — init-once leak-and-keep, 정당). **단일 진입 `make_stage(name, &StageParams) -> Option<Box<dyn KVCacheStage>>`** 신설 → production 호출부 2곳만 교체. 동적 arm = host `DynStage` 어댑터(`{handle, vtable, _lib: Arc<Library>}`)가 `impl KVCacheStage` 로 vtable 마샬링 → 호출부는 source-agnostic `Box<dyn KVCacheStage>` 수령.
+`technique-api`(ABI 계약 + 정적 registry, libloading 의존 없음)는 **무변** — `find_stage`/`ensure_builtin_stages_registered`(ADR-0003 §4 load-bearing self-test)/6 테스트 그대로. `engine`(`kv/eviction/stage_registry.rs`)이 런타임 loader 소유: 별도 `static DYN_REGISTRY: OnceLock<Vec<RuntimeStageReg>>` 에 dlopen 결과 append(`Arc<Library>` 영구 보관 — init-once leak-and-keep, 정당). **단일 진입 `make_stage(name, &StageParams) -> Option<Box<dyn KVCacheStage>>`** 신설 → production 호출부 2곳만 교체. 동적 arm = host `DynStage` 어댑터(`{handle, vtable, _lib: Arc<Library>}`)가 `impl KVCacheStage` 로 vtable 마샬링 → 호출부는 source-agnostic `Box<dyn KVCacheStage>` 수령.
 
 이름 충돌 = **register 시점 eager fail-fast(builtin 항상 우선)**: 동적 name 이 `registered_names()`(정적)에 있으면 `bail!`. silent override 차단(Known Bug #1/#2 류 silent fallback 재발 방지).
 

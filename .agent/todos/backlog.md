@@ -970,3 +970,45 @@
 - **Description**: `run_eval_ll`(`session/eval/runner.rs:16`) + `run_prompt_batch`(`session/batch/runner.rs:34`) 외부 호출처 0 (β-7 grep 확인). β-7 G3 삭제에서 ripple 격리를 위해 **의도적으로 이월**. Phase γ 의 γ-4 항목에 해당.
 - **Acceptance Criteria**: γ-3 방향 확정 후 — (a) eval 을 bin 으로 살리면 entry point 정착 + orphan 해소, 또는 (b) orphan 삭제 시 두 fn + 종속 dead code grep census 후 동반 삭제 + 컴파일 GREEN.
 - **Notes**: γ-3 과 처분 방향(살림 vs 삭제)이 상호 의존 — γ-3 선행/동행 권장. 담당 권장: Architect(γ-3 방향 결정) → Implementer(처분).
+
+---
+
+# γ-1 파생 후속 (2026-06-10 등록)
+
+> γ-1(commit `7fe1fe8b`, `pressure/`→`kv/` + `pressure/weights/`→`weight/` rename) 후 발견된 문서 잔여 3건. 단순 anchor 치환으로 끝나지 않는(spec 의미 변경 / 미실현 우산 구조 / 실위치 미반영) 항목만 분리. **출처**: γ-1 문서 anchor 정오 작업(2026-06-10)의 Architect 보존 판단 보고. **참고**: `layer_lint.py` LAYER_RULES 는 γ-1 commit A 에서 이미 `kv`/`weight` 로 갱신 완료(본 그룹 범위 밖).
+
+## [P2] spec L3 도메인 재정의 — INV-LAYER-003 + §6 도메인 표 + INV-RPCMEM 열거 stale — 2026-06-10 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: γ-1 문서 anchor 정오 작업(2026-06-10) Architect 보존 판단 보고
+- **Description**: γ-1 rename 후 spec 의 L3 도메인 열거가 stale (실제 = {`kv/`, `weight/`, `inference/`, `qcf/`}):
+  - `spec/41-invariants.md` INV-LAYER-003 의 "L3 도메인 = {`inference/`, `pressure/`, `qcf/`}" 열거
+  - `spec/01-architecture.md` §6 L3 도메인 표
+  - INV-RPCMEM 의 "L3(`models/`, `pressure/`, `inference/`)" 열거
+  - **단순 anchor 정오가 아니라 spec 의미 변경** — `pressure/` 단일 도메인이 `kv/`+`weight/` 2 도메인으로 분리된 것을 spec 불변식 정의에 반영해야 함. `/spec-manage` 작업 필요.
+- **Acceptance Criteria**: 3 spec 위치의 L3 도메인 열거가 실제 모듈 구조({`kv/`, `weight/`, `inference/`, `qcf/`})와 정합 + spec test/coverage GREEN.
+- **Notes**: `layer_lint.py` LAYER_RULES 는 γ-1 commit A 에서 이미 갱신됨(본 항목은 spec 문서 측만). 담당 권장: Architect(/spec-manage).
+
+## [P3] arch 미실현 우산 구조 재작성 — §6.3 `pressure/policy/`·`pressure/state/` + §13.4/§13.6 — 2026-06-10 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: γ-1 문서 anchor 정오 작업(2026-06-10) Architect 보존 판단 보고
+- **Description**: 다음 arch 위치가 **미실현 계획 구조**를 기재하고 있어 γ-1 단순 치환으로 정합 불가(치환하면 `kv/policy/` 로 여전히 stale):
+  - `arch/01-architecture.md` §6.3 의 `pressure/policy/`·`pressure/state/` 우산 서브구조
+  - `ARCHITECTURE.md` §13.4 확장 가이드 / §13.6 마이그레이션 표·다이어그램
+  - 실제는 flat `kv/eviction/` 구조 — 계획했던 우산(policy/state) 층이 실현되지 않음.
+- **Acceptance Criteria**: §6.3 + §13.4/§13.6 을 **실제 flat `kv/eviction/` 구조 기준으로 재작성** (미실현 우산 서술 제거 또는 "계획" 명시).
+- **Notes**: 단순 rename 치환 금지(stale 잔존). 구조 기술 재작성 필요. 담당 권장: Architect.
+
+## [P3] Sprint C 미반영 weight swap 위치 표기 — Precision Swap 다이어그램 + qcf_taxonomy.md — 2026-06-10 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: γ-1 문서 anchor 정오 작업(2026-06-10) Architect 보존 판단 보고
+- **Description**: 다음 위치가 weight swap 오케스트레이션을 `models/weights/` 로 표기 — Sprint C(`pressure/weights/`)도 γ-1(`weight/`)도 미반영(2단계 stale):
+  - `ARCHITECTURE.md` Precision Swap 다이어그램의 "L3 Inference — `models/weights/` orchestrator" 라벨
+  - `docs/qcf_taxonomy.md` weight swap 오케스트레이션 경로 표기
+- **Acceptance Criteria**: 두 위치 모두 실위치 `engine/src/weight/` 로 정합.
+- **Notes**: Sprint C(`models/weights/`→`pressure/weights/` git mv, `5c698d79`) 와 γ-1(`pressure/weights/`→`weight/`) 두 이동을 누적 반영해야 함. 담당 권장: Architect.

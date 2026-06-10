@@ -4,7 +4,7 @@
 > 이 문서는 각 타입·trait·함수의 **정확한 시그니처와 계약**(언제 `None`/0/false/빈 Vec, 불변식, dyn-safety, panic 조건, borrow/lifetime, 호출 시점·상태 누적, 엔진이 plan 을 소비하는 방식)을 코드에서 그대로 풀어쓴 상세 레퍼런스다.
 > 단계별 추가 절차(폴더·Cargo·게이트)는 how-to 가이드 [`docs/50_adding_kvcache_stage.md`](50_adding_kvcache_stage.md) 를 보라 — 본 문서는 그 가이드를 **API 레벨에서 보완**하며 중복을 피한다.
 >
-> 정본 위치: 타입/trait = `crates/technique-api/src/lib.rs`, 엔진 측 구현/executor/등록 = `engine/src/pressure/eviction/stage_registry.rs`, 가중 merge 산술 = `engine/src/pressure/standard_format.rs`. 설계 근거 = [ADR-0003](adr/0003-extension-mechanism-static-crates.md)(확장 메커니즘) + [ADR-0004](adr/0004-kvcachestage-plan-returning-trait.md)(plan-returning trait).
+> 정본 위치: 타입/trait = `crates/technique-api/src/lib.rs`, 엔진 측 구현/executor/등록 = `engine/src/kv/eviction/stage_registry.rs`, 가중 merge 산술 = `engine/src/kv/standard_format.rs`. 설계 근거 = [ADR-0003](adr/0003-extension-mechanism-static-crates.md)(확장 메커니즘) + [ADR-0004](adr/0004-kvcachestage-plan-returning-trait.md)(plan-returning trait).
 
 ## 개요 — stage 축과 plan-returning 모델
 
@@ -170,7 +170,7 @@ fn dequant_k(&self, pos: usize, head: usize, out: &mut [f32]);
 - **의미**: 원시 K(`pos`, `head`)를 dtype-무관 f32 로 `out` 에 채운다(d2o cosine-nearest 매칭용). dtype 분기(F32/F16/Q4_0)는 엔진 impl 내부에서 흡수한다.
 - **계약(out-param)**: 호출자는 `out.len() == head_dim` 인 버퍼를 제공해야 한다. 엔진 impl 은 `out[..head_dim]` 범위를 채운다. `out` 이 `head_dim` 보다 짧으면 인덱싱에서 **panic 가능**. 반환값 없음(`()`).
 - **out-param 이유**: ① dyn-safe(제네릭 아님) ② Q4_0 dequant 임시버퍼 수명/Vec 할당 회피.
-- **엔진 원천**(`stage_registry.rs:151-155`): `crate::pressure::d2o_handler::dequantize_k(self.cache, pos, head, out.len(), out)` 위임. dtype 별 처리(`d2o_handler.rs:514-547`):
+- **엔진 원천**(`stage_registry.rs:151-155`): `crate::kv::d2o_handler::dequantize_k(self.cache, pos, head, out.len(), out)` 위임. dtype 별 처리(`d2o_handler.rs:514-547`):
   - `F32`: `out[..head_dim].copy_from_slice(&k[off..off+head_dim])`
   - `F16`: `k[off+d].to_f32()` per element
   - `Q4_0`: block 단위 dequant(`q4_block_offset` + per-block `BlockQ4_0::dequantize`, `blocks_per_pos = head_dim / QK4_0`)
@@ -266,7 +266,7 @@ evicted 토큰들(`from`)의 K/V 벡터를 retained 토큰(`into`) 한 자리에
 ### `execute_kv_plan`
 
 ```rust
-// engine/src/pressure/eviction/stage_registry.rs:80
+// engine/src/kv/eviction/stage_registry.rs:80
 pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result<()>
 ```
 
@@ -284,7 +284,7 @@ pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result
 match &plan.keep {
     KeepSpec::LayerWide(keep) => {
         if !plan.merges.is_empty() {
-            crate::pressure::standard_format::apply_weighted_merges(cache, &plan.merges);
+            crate::kv::standard_format::apply_weighted_merges(cache, &plan.merges);
         }
         cache.compact_keep_positions(keep, 0)?;
         cache.set_current_pos(keep.len());
@@ -307,7 +307,7 @@ match &plan.keep {
 ### `apply_weighted_merges`
 
 ```rust
-// engine/src/pressure/standard_format.rs:576
+// engine/src/kv/standard_format.rs:576
 pub(crate) fn apply_weighted_merges(cache: &mut KVCache, merges: &[WeightedMerge])
 ```
 
@@ -479,7 +479,7 @@ static EXAMPLE_KEEP_RECENT: KVCacheStageReg = KVCacheStageReg {
 
 ### (b) `D2OStage` — 가중 merge + EMA(impl 상태) + `dequant_k` 사용
 
-`engine/src/pressure/d2o_handler.rs:423-490`. score-based + stateful 기법의 레퍼런스. (1) `Mutex<D2OState>` 로 EMA threshold τ 를 호출 간 누적(D4), (2) 가중 `WeightedMerge` 산출(Eq.11), (3) cosine-nearest 매칭을 위해 `ctx.dequant_k` 로 raw K 읽기.
+`engine/src/kv/d2o_handler.rs:423-490`. score-based + stateful 기법의 레퍼런스. (1) `Mutex<D2OState>` 로 EMA threshold τ 를 호출 간 누적(D4), (2) 가중 `WeightedMerge` 산출(Eq.11), (3) cosine-nearest 매칭을 위해 `ctx.dequant_k` 로 raw K 읽기.
 
 ```rust
 pub struct D2OStage {
@@ -535,7 +535,7 @@ impl KVCacheStage for D2OStage {
 
 **엔진 소비**: 반환 plan 은 `execute_kv_plan` 의 LayerWide+(non-empty merges) 경로로 들어가 `apply_weighted_merges`(pre-compact 좌표, K/V 독립 dtype 디스패치) → `compact_keep_positions` 순으로 처리된다(§4).
 
-> **⚠️ production unwired.** `D2OStage` 는 `"d2o"` 로 `KV_CACHE_STAGES` 에 등록되어 있으나(`stage_registry.rs:267-277`), **production d2o 경로는 여전히 if-branch `D2OHandler` 가 가로챈다**. 이유: `StageBackedPolicy`/`run_policy_eviction` 경로는 per-cache uniform target 만 주므로 layer-alloc/protected-layer 를 표현하지 못한다. D2OStage 등록은 **proven-equivalent(non-alloc) available 표면**이다. 또 `D2OStage` 는 별도 crate 가 아니라 엔진 내부(`engine/src/pressure/`)에 있다 — 별도 crate 로 빼려면 `ctx.dequant_k` reader 클로저 + Eq.11 가중 로직만 가져가면 된다.
+> **⚠️ production unwired.** `D2OStage` 는 `"d2o"` 로 `KV_CACHE_STAGES` 에 등록되어 있으나(`stage_registry.rs:267-277`), **production d2o 경로는 여전히 if-branch `D2OHandler` 가 가로챈다**. 이유: `StageBackedPolicy`/`run_policy_eviction` 경로는 per-cache uniform target 만 주므로 layer-alloc/protected-layer 를 표현하지 못한다. D2OStage 등록은 **proven-equivalent(non-alloc) available 표면**이다. 또 `D2OStage` 는 별도 crate 가 아니라 엔진 내부(`engine/src/kv/`)에 있다 — 별도 crate 로 빼려면 `ctx.dequant_k` reader 클로저 + Eq.11 가중 로직만 가져가면 된다.
 
 ### 대비표 (복붙 선택 가이드)
 
@@ -580,8 +580,8 @@ impl KVCacheStage for D2OStage {
 - [ADR-0004](adr/0004-kvcachestage-plan-returning-trait.md) — `KVCacheStage` plan-returning trait 설계(D1~D6, executor 매핑, Q4_0 merge 정정).
 - [docs/50_adding_kvcache_stage.md](50_adding_kvcache_stage.md) — 단계별 추가 절차(폴더·Cargo·게이트) how-to. 본 문서는 그 API 보완본.
 - `crates/technique-api/src/lib.rs` — trait/타입 정본(`KVCacheStage`/`StageCtx`/`KVCachePlan`/`KeepSpec`/`WeightedMerge`/`StageParams`/`KVCacheStageReg`/`KV_CACHE_STAGES`/`find_stage`/`registered_names`).
-- `engine/src/pressure/eviction/stage_registry.rs` — 엔진 측 `StageCtx` impl(`KVStageCtx`), executor(`execute_kv_plan`), 역어댑터(`StageBackedPolicy`), `EvictionPolicyAsStage`, 빌트인 등록, `ensure_builtin_stages_registered`.
-- `engine/src/pressure/standard_format.rs` — `apply_weighted_merges`(가중 merge 산술, F32/F16/Q4_0).
-- `engine/src/pressure/d2o_handler.rs` — `D2OStage`, `compute_d2o_plan`, `compute_eq11_weights`, `dequantize_k`(`StageCtx::dequant_k` 정본).
+- `engine/src/kv/eviction/stage_registry.rs` — 엔진 측 `StageCtx` impl(`KVStageCtx`), executor(`execute_kv_plan`), 역어댑터(`StageBackedPolicy`), `EvictionPolicyAsStage`, 빌트인 등록, `ensure_builtin_stages_registered`.
+- `engine/src/kv/standard_format.rs` — `apply_weighted_merges`(가중 merge 산술, F32/F16/Q4_0).
+- `engine/src/kv/d2o_handler.rs` — `D2OStage`, `compute_d2o_plan`, `compute_eq11_weights`, `dequantize_k`(`StageCtx::dequant_k` 정본).
 - `crates/techniques/example-keep-recent/src/lib.rs` — 최소 기여자 템플릿.
 - `CONTEXT.md` — 도메인 용어(3축 직교: stage ⊥ format ⊥ hardware).

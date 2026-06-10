@@ -374,10 +374,10 @@ pub trait CachePressureHandler: Send + Sync {
 
 | Handler | 상태 | 코드 |
 |---------|------|------|
-| EvictionHandler | 완성 | `pressure/eviction_handler.rs` |
-| D2OHandler | 완성 | `pressure/d2o_handler.rs` |
-| SwapHandler | 완성 | `pressure/swap_handler.rs` |
-| QuantizeHandler | 간접 | `pressure/quantize_handler.rs` |
+| EvictionHandler | 완성 | `kv/eviction_handler.rs` |
+| D2OHandler | 완성 | `kv/d2o_handler.rs` |
+| SwapHandler | 완성 | `kv/swap_handler.rs` |
+| QuantizeHandler | 간접 | `kv/quantize_handler.rs` |
 
 ### EventSink trait (Observability)
 

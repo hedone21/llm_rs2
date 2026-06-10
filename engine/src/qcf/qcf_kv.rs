@@ -10,7 +10,7 @@
 //! ## D2O merge (paper arXiv 2406.13035 Eq.10/11)
 //!
 //! The D2O simulation is kept in lockstep with the actuator
-//! (`core::pressure::d2o_handler`). For the same retained set $R$ and the
+//! (`crate::kv::d2o_handler`). For the same retained set $R$ and the
 //! evicted set $E$:
 //!   * **Nearest mapping** uses **K** (per head, cosine similarity). When the
 //!     caller supplies `k_source`, K vectors of head `h` drive the matching.
@@ -553,7 +553,7 @@ fn compute_o_d2o_merge(
     }
 
     // 5. Per-group Eq.11 weight application: V_c <- w_c · V_c + Σ w_ei · V_ei
-    //    (matches `core::pressure::d2o_handler::compute_eq11_weights`).
+    //    (matches `crate::kv::d2o_handler::compute_eq11_weights`).
     for (&retained_idx, group) in &groups {
         let exps: Vec<f32> = group
             .iter()

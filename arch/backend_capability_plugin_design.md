@@ -177,6 +177,6 @@ drop(handle)                                          // cl_program/kernel 해�
 
 ## 코드 앵커
 
-- in-process: `engine/src/capability.rs`(CapabilityRegistry) · `capability/kivi_attention.rs`(KiviAttentionBackend) · `pressure/kivi_cache.rs`(KiviCache storage) · `backend/opencl.rs:120`(get_cl_mem)·`:7013`(attention_gen_kivi impl) · `init.rs:337`(현 등록)
+- in-process: `engine/src/capability.rs`(CapabilityRegistry) · `capability/kivi_attention.rs`(KiviAttentionBackend) · `kv/kivi_cache.rs`(KiviCache storage) · `backend/opencl.rs:120`(get_cl_mem)·`:7013`(attention_gen_kivi impl) · `init.rs:337`(현 등록)
 - plugin ABI: `crates/technique-api/src/lib.rs`(BackendCapability stub :1178, BACKEND_CAPABILITIES :1193, export_plugin! :1144 — backend "한 줄" 미추가) · `engine/src/session/plugin_dispatch.rs`(register_dynamic_plugins)
 - 마샬링 원시: `ocl::core::{Context,CommandQueue,Mem}` = raw C 핸들 1-필드 newtype + `as_ptr()`/`from_raw_*`
