@@ -34,7 +34,7 @@
 
 | id | 제목 | 게이트 tier | 의존 |
 |---|---|---|---|
-| β-1 | 계약·어휘 마감 — PipelineRegistry + 계약 + SSOT 정오표·normative(G2) + INV-LAYER-006 개정(G7) | host | — |
+| β-1 ✅ | 계약·어휘 마감 — PipelineRegistry + 계약 + SSOT 정오표·normative(G2) + INV-LAYER-006 개정(G7) — **완료 2026-06-10** (`c5e0fdae` docs + `9ec108c0` feat + `653f56e5` fix + `ba0b343f` style) | host ✅ | — |
 | β-2 | driver phase 배선 — run()/prefill() empty-registry dispatch (run_until_stop 미접촉) | device | β-1 |
 | β-3 | World A eviction 발화 seam(F1) — wrap-당김 + stages/kv/eviction.rs UER 경유 + baseline 동결 | host 정식 + device | β-2 |
 | β-4 | α-W-3b 흡수 — 매핑표 선행 + CommandSource→CommandDispatcher→LoopControl + evict 4종 OneShot | device | β-3 |
@@ -46,7 +46,10 @@
 
 ## substep 상세
 
-### β-1 — 계약·어휘 마감 (additive, unwired) — ★다음 착수
+### β-1 — 계약·어휘 마감 (additive, unwired) — ✅ 완료 2026-06-10
+
+> **완료 기록**: `c5e0fdae`(docs: spec/41 + SSOT §5.2.1 신설·정오표·normative 3건) + `9ec108c0`(feat: pipeline_registry.rs + spec test 11건 + INV-LAYER-006 개정 — master RED 해소) + `653f56e5`(fix: BANNED CacheManager 재추가 — 금지 복원 구조, Tester P1 지적) + `ba0b343f`(style: fmt-dirty 10파일). Tester 독립 검증: lib 1261→1267(+6 registry unit, 회귀 0), spec test 11/11, full suite GREEN(GPU 부재 21건 환경 실패 제외). **β-3 인계 사항**: cache_manager 필드 제거 시 `ALLOWLISTED_TRANSITIONAL` 동시 제거(BANNED 복원은 기성립). **백로그**: `scripts/check_spec_coverage.sh` line 90 octal 버그 + INV-DECODE-STAGE 시리즈 추출 로직 부재(기존 버그, 비차단).
+> ★다음 착수 = **β-2**.
 
 1. **신설 `engine/src/session/pipeline_registry.rs`** (L4, §2.1 규칙 C no-`mod.rs`): `PipelineRegistry{stages: Mutex<Vec<Arc<dyn PipelineStage+Send+Sync>>>, len: AtomicUsize}` + `submit()` + `impl PipelineDispatcher` — v2:585-599 그대로(submit 순서 순회·Consumed→OneShot GC·Stop→break·Err→panic fail-fast). **빈-registry fast-path**: dispatch 진입부 `len.load(Relaxed)==0` 즉시 반환. 기존 trait 시그니처(`pipeline.rs:183-185`) 기계적 실현에 한정 — 신규 설계 0.
 2. **OpProfiler 수명 계약**: `StageContext{step, profiler: &'a mut OpProfiler}` — DecodeLoop 이 OpProfiler 1개 소유, dispatch 호출부마다 `&mut` 재대여. registry unit test 로 고정.
