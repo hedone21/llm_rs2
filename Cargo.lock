@@ -739,6 +739,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-backend-cap"
+version = "0.1.0"
+dependencies = [
+ "linkme",
+ "technique-api",
+]
+
+[[package]]
 name = "example-bundle"
 version = "0.1.0"
 dependencies = [
