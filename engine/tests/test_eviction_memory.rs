@@ -14,10 +14,10 @@
 mod eviction_memory_test {
     use llm_rs2::backend::cpu::CpuBackend;
     use llm_rs2::buffer::{Buffer, DType};
+    use llm_rs2::kv::cache_manager::CacheManager;
+    use llm_rs2::kv::eviction::sliding_window::SlidingWindowPolicy;
+    use llm_rs2::kv::kv_cache::KVCache;
     use llm_rs2::memory::host::shared::SharedBuffer;
-    use llm_rs2::pressure::cache_manager::CacheManager;
-    use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
-    use llm_rs2::pressure::kv_cache::KVCache;
     use llm_rs2::shape::Shape;
     use llm_rs2::tensor::Tensor;
 

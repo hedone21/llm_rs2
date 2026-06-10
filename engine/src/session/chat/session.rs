@@ -19,14 +19,14 @@ use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::capability::kivi_attention::KiviAttentionBackend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::kv::cache_manager::CacheManager;
+use crate::kv::d2o_handler::{D2OConfig, D2OHandler};
+use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
+use crate::kv::eviction::stage_registry::StageBackedPolicy;
+use crate::kv::kv_cache::KVCache;
+use crate::kv::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::pressure::cache_manager::CacheManager;
-use crate::pressure::d2o_handler::{D2OConfig, D2OHandler};
-use crate::pressure::eviction::h2o_plus::H2OPlusPolicy;
-use crate::pressure::eviction::stage_registry::StageBackedPolicy;
-use crate::pressure::kv_cache::KVCache;
-use crate::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::DecodeLoopBuilder;
 use crate::session::chat::stop_condition::{ChatStopSlot, ChatStopStage, StopCondition};
@@ -567,10 +567,8 @@ pub fn build_chat_offload(args: ChatOffloadArgs) -> Result<ChatSession> {
         &args.memory,
     )?;
 
-    let prefetch = crate::pressure::offload::prefetch::PrefetchController::new(
-        max_prefetch_depth,
-        args.num_layers,
-    );
+    let prefetch =
+        crate::kv::offload::prefetch::PrefetchController::new(max_prefetch_depth, args.num_layers);
 
     let fwd = OffloadForward::new(
         args.backend,
@@ -634,7 +632,7 @@ fn build_chat_eviction_internal(
     let threshold_bytes = (args.memory_threshold_mb * 1024 * 1024) as usize;
 
     // linkme fat-LTO 생존 self-test (ADR-0003 §4): 빌트인 stage 미등록 시 fail-fast.
-    crate::pressure::eviction::stage_registry::ensure_builtin_stages_registered()?;
+    crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
     let cache_manager = if args.eviction_policy == "d2o" {
         let d2o_handler = D2OHandler::new(D2OConfig {
@@ -652,7 +650,7 @@ fn build_chat_eviction_internal(
         }]);
         CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
     } else {
-        let policy: Box<dyn crate::pressure::eviction::EvictionPolicy> = match args
+        let policy: Box<dyn crate::kv::eviction::EvictionPolicy> = match args
             .eviction_policy
             .as_str()
         {
@@ -683,7 +681,7 @@ fn build_chat_eviction_internal(
                     streaming_window,
                 };
                 // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회(ADR-0009 D3). miss = unknown.
-                let stage = crate::pressure::eviction::stage_registry::make_stage(name, &params)
+                let stage = crate::kv::eviction::stage_registry::make_stage(name, &params)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
@@ -1009,8 +1007,8 @@ mod tests {
     /// try_evict 직접 호출이 실재함을 핀한다. 통합 후에도 이 호출이 그대로 살아 있어야 한다.
     #[test]
     fn turn_boundary_try_evict_called_directly_on_overflow() {
-        use crate::pressure::cache_manager::CacheManager;
-        use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
+        use crate::kv::cache_manager::CacheManager;
+        use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
         use crate::resilience::sys_monitor::NoOpMonitor;
         use crate::session::forward::Forward as ForwardTrait;
         use std::cell::Cell;

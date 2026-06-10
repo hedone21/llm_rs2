@@ -68,7 +68,7 @@ pub trait Forward {
     /// Returns (removed_count, new_pos). removed_count == 0이면 eviction 미발생.
     fn try_evict(
         &mut self,
-        cache_manager: &crate::pressure::cache_manager::CacheManager,
+        cache_manager: &crate::kv::cache_manager::CacheManager,
         scores: Option<&[f32]>,
         force: bool,
         target_ratio: f32,
@@ -85,7 +85,7 @@ pub trait Forward {
     /// (swap 미활성/대상 0).
     fn try_offload(
         &mut self,
-        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
+        cache_manager: &mut crate::kv::cache_manager::CacheManager,
         ratio: f32,
     ) -> anyhow::Result<(usize, usize)> {
         let _ = (cache_manager, ratio);
@@ -98,7 +98,7 @@ pub trait Forward {
     /// Returns (recalled_count, new_pos). recalled_count == 0 이면 미발생.
     fn try_recall(
         &mut self,
-        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
+        cache_manager: &mut crate::kv::cache_manager::CacheManager,
     ) -> anyhow::Result<(usize, usize)> {
         let _ = cache_manager;
         Ok((0, 0))

@@ -28,7 +28,7 @@ pub fn register_dynamic_plugins(paths: &[PathBuf]) -> Result<()> {
             unsafe { libloading::Library::new(path) }
                 .with_context(|| format!("plugin dlopen 실패: {}", path.display()))?,
         );
-        let stages = crate::pressure::eviction::stage_registry::try_register_stage(&lib, path)?;
+        let stages = crate::kv::eviction::stage_registry::try_register_stage(&lib, path)?;
         let formats = crate::format::dynamic_format_registry::try_register_format(&lib, path)?;
         let backends =
             crate::capability::dynamic_backend_registry::try_register_backend_cap(&lib, path)?;

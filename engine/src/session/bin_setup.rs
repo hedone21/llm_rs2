@@ -12,9 +12,9 @@ use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
+use crate::kv::kv_cache::{KVCache, KVLayout};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::pressure::kv_cache::{KVCache, KVLayout};
 use crate::session::cli::Args;
 use crate::session::init::SessionInitCtx;
 use crate::session::resilience_adapter::ResilienceAdapter;

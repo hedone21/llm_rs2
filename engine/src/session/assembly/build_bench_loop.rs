@@ -15,16 +15,16 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::inference::sampling::SamplingConfig;
+use crate::kv::cache_manager::CacheManager;
+use crate::kv::d2o_handler::{D2OConfig, D2OHandler};
+use crate::kv::eviction::EvictionPolicy;
+use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
+use crate::kv::eviction::no_eviction::NoEvictionPolicy;
+use crate::kv::eviction::stage_registry::StageBackedPolicy;
+use crate::kv::kv_cache::KVCache;
+use crate::kv::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::pressure::cache_manager::CacheManager;
-use crate::pressure::d2o_handler::{D2OConfig, D2OHandler};
-use crate::pressure::eviction::EvictionPolicy;
-use crate::pressure::eviction::h2o_plus::H2OPlusPolicy;
-use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
-use crate::pressure::eviction::stage_registry::StageBackedPolicy;
-use crate::pressure::kv_cache::KVCache;
-use crate::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::cli::Args;
 use crate::session::command_dispatcher::CommandDispatcher;
@@ -71,7 +71,7 @@ pub fn build_resilience_cache_manager(
     let target_ratio = args.eviction_target_ratio();
 
     // linkme fat-LTO 생존 self-test (ADR-0003 §4): 빌트인 stage 미등록 시 fail-fast.
-    crate::pressure::eviction::stage_registry::ensure_builtin_stages_registered()?;
+    crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
     let mut cm = if policy_name == "d2o" {
         let d2o_handler = D2OHandler::new(D2OConfig {
@@ -116,7 +116,7 @@ pub fn build_resilience_cache_manager(
                 };
                 // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회(ADR-0009 D3). miss = unknown.
                 // d2o 는 위 분기에서 처리되나 유효 정책이라 안내에 포함(session.rs 와 일관).
-                let stage = crate::pressure::eviction::stage_registry::make_stage(name, &params)
+                let stage = crate::kv::eviction::stage_registry::make_stage(name, &params)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
@@ -218,8 +218,7 @@ pub fn build_bench_loop(
         .map(|f| f.clone() as Arc<dyn crate::format::KVCacheFormat>);
 
     // β-4: EvictionStage 가 prune 할 전체 layer handle (W1 — enumerate 순서 == layer idx).
-    let kv_handles: Vec<Arc<crate::pressure::standard_format::StandardFormat>> =
-        mf.fmt_caches().to_vec();
+    let kv_handles: Vec<Arc<crate::kv::standard_format::StandardFormat>> = mf.fmt_caches().to_vec();
 
     // β-4 (매핑 문서 4부): resilience adapter 에 held-handle 주입 → heartbeat snapshot 의
     // kv_cache_tokens/capacity 를 layer-0 handle 에서 query (poll 인자 제거 대체).

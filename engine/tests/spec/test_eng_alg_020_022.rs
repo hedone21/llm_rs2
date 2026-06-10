@@ -3,7 +3,7 @@
 //! KiviCache 기본 동작, bits 전이(transition), 점진적 역양자화(incremental deq).
 //! KiviCache는 FP32 residual buffer + quantized compressed storage 구조.
 
-use llm_rs2::pressure::kivi_cache::KiviCache;
+use llm_rs2::kv::kivi_cache::KiviCache;
 
 // ══════════════════════════════════════════════════════════════
 // ENG-ALG-020: KiviCache 기본 동작

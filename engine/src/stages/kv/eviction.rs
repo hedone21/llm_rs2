@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex};
 
 use llm_shared::Level;
 
+use crate::kv::cache_manager::CacheManager;
+use crate::kv::kv_cache::KVCache;
+use crate::kv::standard_format::StandardFormat;
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
-use crate::pressure::cache_manager::CacheManager;
-use crate::pressure::kv_cache::KVCache;
-use crate::pressure::standard_format::StandardFormat;
 
 /// `PreEviction` phase 에서 CacheManager UER 로 force-evict 하는 Stage.
 ///
@@ -176,10 +176,10 @@ mod tests {
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
     use crate::format::KVCacheFormat;
+    use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
     use crate::memory::host::shared::SharedBuffer;
     use crate::observability::profile::OpProfiler;
     use crate::pipeline::{Pressure, StepInfo};
-    use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
     use crate::resilience::sys_monitor::NoOpMonitor;
     use crate::shape::Shape;
     use crate::tensor::Tensor;

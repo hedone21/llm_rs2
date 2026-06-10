@@ -12,14 +12,14 @@ use crate::buffer::DType;
 use crate::capability::kivi_attention::KiviAttentionBackend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::{self};
+use crate::kv::cache_manager::CacheManager;
+use crate::kv::kivi_cache::KiviCache;
+use crate::kv::kv_cache::KVCache;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
 use crate::models::transformer::TransformerModelForwardArgs;
-use crate::pressure::cache_manager::CacheManager;
-use crate::pressure::kivi_cache::KiviCache;
-use crate::pressure::kv_cache::KVCache;
 use crate::session::cli::Args;
 use crate::session::eval::EvalCacheKind;
 use crate::session::ppl::args::PplResult;
@@ -739,7 +739,7 @@ pub fn run_ppl(
     // (phase, token_idx, token_id, nll, swap_state, layers_swapped)
     let mut per_token_log: Vec<(&'static str, usize, u32, f64, &'static str, usize)> = Vec::new();
     let log_per_token = args.ppl_nll_csv.is_some();
-    let mut ppl_swap_plan: Option<crate::pressure::weights::IncrementalSwapPlan> = None;
+    let mut ppl_swap_plan: Option<crate::weight::IncrementalSwapPlan> = None;
     // dispatch_swap_weights 시그니처 호환용 (PPL 경로에서는 manager 보고 안 함).
     let mut ppl_swap_report_unused: Option<(f32, usize, std::time::Instant, f32)> = None;
     let mut layers_swapped_so_far: usize = 0;

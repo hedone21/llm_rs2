@@ -11,8 +11,8 @@
 //! Spec: Phase 1 (zazzy-herding-bonbon), ENG-ALG-215, ENG-ALG-217.
 
 use llm_rs2::observability::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
-use llm_rs2::pressure::weights::QuantNoiseTable;
 use llm_rs2::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
+use llm_rs2::weight::QuantNoiseTable;
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -191,7 +191,7 @@ fn test_ratio_zero_swap_count_zero() {
 /// WeightSwapDecider protects layer 0 and 15; selected must not contain them.
 #[test]
 fn test_ratio_033_skip_count_5_for_16l() {
-    use llm_rs2::pressure::weights::decider::{SwapAlgorithm, WeightSwapDecider};
+    use llm_rs2::weight::decider::{SwapAlgorithm, WeightSwapDecider};
 
     // MW-C: decider 는 flat per-layer importance/noise 슬라이스를 받는다
     // (index = layer_id). 16 레이어 uniform.
@@ -281,7 +281,7 @@ fn test_ratio_033_skip_count_5_for_16l() {
 /// (layer 0 and 15 are always protected), and fallback_used=false when tables are valid.
 #[test]
 fn test_ratio_one_caps_at_n_minus_2() {
-    use llm_rs2::pressure::weights::decider::{SwapAlgorithm, WeightSwapDecider};
+    use llm_rs2::weight::decider::{SwapAlgorithm, WeightSwapDecider};
 
     // MW-C: decider 는 flat per-layer importance/noise 슬라이스를 받는다.
     let noise_flat: Vec<f32> = (0..16).map(|i| 0.01 * (i as f32 + 1.0)).collect();

@@ -8,7 +8,7 @@ use llm_shared::{
 };
 
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N §F enum-as-data identifier (V-10)
-use crate::pressure::eviction::EvictMethod;
+use crate::kv::eviction::EvictMethod;
 use crate::resilience::gpu_self_meter::GpuSelfMeter;
 use crate::resilience::proc_self_meter::ProcSelfMeter;
 

@@ -13,10 +13,10 @@ use crate::backend::Backend;
 use crate::hardware::Hardware;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
+use crate::kv::cache_manager::CacheManager;
+use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::pressure::cache_manager::CacheManager;
-use crate::pressure::kv_cache::KVCache;
 use crate::resilience::CommandExecutor;
 use crate::session::cli::Args;
 

@@ -1279,7 +1279,7 @@ impl FullKernelPlan {
         &self,
         backend: &crate::backend::opencl::OpenCLBackend,
         start_pos: usize,
-        handles: &[std::sync::Arc<crate::pressure::standard_format::StandardFormat>],
+        handles: &[std::sync::Arc<crate::kv::standard_format::StandardFormat>],
     ) -> std::result::Result<(), PlanInvalidated> {
         // ENG-ALG-219: single Acquire load at entry — if a weight swap has
         // bumped ratio_generation since build_plan, the pre-bound cl_mem

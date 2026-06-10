@@ -1260,11 +1260,11 @@ mod tests {
         use crate::backend::cpu::CpuBackend;
         use crate::buffer::DType;
         use crate::format::KVCacheFormat;
+        use crate::kv::cache_manager::CacheManager;
+        use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
+        use crate::kv::kv_cache::KVCache;
+        use crate::kv::standard_format::StandardFormat;
         use crate::memory::host::shared::SharedBuffer;
-        use crate::pressure::cache_manager::CacheManager;
-        use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
-        use crate::pressure::kv_cache::KVCache;
-        use crate::pressure::standard_format::StandardFormat;
         use crate::resilience::sys_monitor::NoOpMonitor;
         use crate::shape::Shape;
         use crate::stages::kv::eviction::EvictionStage;

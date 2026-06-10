@@ -10,7 +10,7 @@
 //! - `per_head.len()` must equal `n_kv_heads`.
 //! - When attention is uniform, QCF must be finite and well-defined (no NaN/inf).
 
-use llm_rs2::pressure::kv_cache::KVLayout;
+use llm_rs2::kv::kv_cache::KVLayout;
 use llm_rs2::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
 
 // ── Shared fixture ──────────────────────────────────────────────────────────

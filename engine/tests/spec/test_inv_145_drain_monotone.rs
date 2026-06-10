@@ -10,7 +10,7 @@
 //! - Retire: after is_done(), drain returns empty Vec.
 //! - No duplicate layers in drain output.
 
-use llm_rs2::pressure::weights::IncrementalSwapPlan;
+use llm_rs2::weight::IncrementalSwapPlan;
 
 /// Exhaust a plan, collecting all drained layers.
 /// Returns (all_drained, chunk_sizes_vec).

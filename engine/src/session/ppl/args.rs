@@ -9,13 +9,13 @@ use tokenizers::Tokenizer;
 use crate::backend::Backend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
+use crate::kv::cache_manager::CacheManager;
+use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::pressure::cache_manager::CacheManager;
-use crate::pressure::kv_cache::KVCache;
-use crate::pressure::weights::decider::SwapDecision;
 use crate::qcf::ImportanceTable;
 use crate::session::cli::Args;
+use crate::weight::decider::SwapDecision;
 
 pub struct PplRunCtx {
     pub args: Args,
@@ -49,7 +49,7 @@ pub struct PplRunCtx {
 
     // 다른 outer state (ppl_main에서 직접 참조)
     pub auto_eviction: bool,
-    pub swap_algorithm: crate::pressure::weights::SwapAlgorithm,
+    pub swap_algorithm: crate::weight::SwapAlgorithm,
 }
 
 /// Return value from `run_ppl` for use by the caller (e.g. `--qcf-dump`).

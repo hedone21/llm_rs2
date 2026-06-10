@@ -7424,7 +7424,7 @@ mod gpu_buffer_shift_tests {
 
     #[test]
     fn test_prune_prefix_opencl_buffer() {
-        use crate::pressure::kv_cache::KVCache;
+        use crate::kv::kv_cache::KVCache;
 
         let backend = match try_create_backend() {
             Some(b) => b,

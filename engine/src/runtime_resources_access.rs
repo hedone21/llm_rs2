@@ -18,7 +18,7 @@ use crate::models::weights::LayerWeights;
 /// Per-layer quantization noise factor table accessor (ENG-DAT-095).
 ///
 /// Inference owner (`TransformerModel`) holds an `Arc<dyn QuantNoiseAccess>`
-/// installed via `pressure::weights::setup_runtime_resources`. Consumers
+/// installed via `weight::setup_runtime_resources`. Consumers
 /// (`WeightSwapDecider`, `compute_qcf_weight_swap`, `QcfHelpers`) accept
 /// `&dyn QuantNoiseAccess` to avoid coupling to the concrete
 /// `QuantNoiseTable` type.
@@ -47,7 +47,7 @@ pub trait QuantNoiseAccess: Send + Sync {
 /// ENG-DAT-100).
 ///
 /// Inference owner holds an `Arc<dyn ReleaseWorkerAccess>` installed by
-/// `pressure::weights::setup_runtime_resources`. Both inference observers
+/// `weight::setup_runtime_resources`. Both inference observers
 /// (`swap_dispatch`) and pressure consumers (`SwapExecutor`) interact via
 /// this trait object so the inference struct definition does not surface
 /// the concrete `PrimaryReleaseWorker` type.

@@ -16,14 +16,14 @@ use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::inference::sampling::StepCtx;
+use crate::kv::offload::OffloadKVCache;
+use crate::kv::offload::prefetch::PrefetchController;
+use crate::kv::offload::raw_store::RawStore;
+use crate::kv::offload_format::OffloadFormat;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{OffloadForwardArgs, TransformerModel};
-use crate::pressure::offload::OffloadKVCache;
-use crate::pressure::offload::prefetch::PrefetchController;
-use crate::pressure::offload::raw_store::RawStore;
-use crate::pressure::offload_format::OffloadFormat;
 use crate::session::forward::Forward;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -321,13 +321,13 @@ pub fn alloc_offload_kv_caches(
     let mut caches = Vec::with_capacity(num_layers);
 
     for layer_id in 0..num_layers {
-        let store: Box<dyn crate::pressure::offload::store::OffloadStore> = match offload_mode {
+        let store: Box<dyn crate::kv::offload::store::OffloadStore> = match offload_mode {
             "raw" => Box::new(RawStore::new(token_bytes)),
             "disk" => {
                 let dir = disk_dir
                     .ok_or_else(|| anyhow::anyhow!("disk_dir required for offload_mode=disk"))?;
                 Box::new(
-                    crate::pressure::offload::disk_store::DiskStore::new(
+                    crate::kv::offload::disk_store::DiskStore::new(
                         dir.to_path_buf(),
                         layer_id,
                         token_bytes,

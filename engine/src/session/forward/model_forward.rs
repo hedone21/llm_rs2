@@ -21,6 +21,8 @@ use crate::backend::opencl::plan::FullKernelPlan;
 use crate::buffer::DType;
 use crate::format::KVCacheFormat;
 use crate::inference::sampling::StepCtx;
+use crate::kv::kv_cache::KVCache;
+use crate::kv::standard_format::StandardFormat;
 use crate::kv_cache_ops::KVLayout;
 use crate::layers::workspace::{LayerWorkspace, PrefillWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
@@ -28,8 +30,6 @@ use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
 use crate::model_config::ModelArch;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
-use crate::pressure::kv_cache::KVCache;
-use crate::pressure::standard_format::StandardFormat;
 use crate::session::forward::Forward;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -507,7 +507,7 @@ impl Forward for ModelForward {
 
     fn try_evict(
         &mut self,
-        cache_manager: &crate::pressure::cache_manager::CacheManager,
+        cache_manager: &crate::kv::cache_manager::CacheManager,
         scores: Option<&[f32]>,
         force: bool,
         target_ratio: f32,
@@ -524,7 +524,7 @@ impl Forward for ModelForward {
                 .first()
                 .map(|f| f.with_cache_mut(|c| c.current_pos))
                 .unwrap_or(0);
-            let mut temp: Vec<crate::pressure::kv_cache::KVCache> =
+            let mut temp: Vec<crate::kv::kv_cache::KVCache> =
                 fmts.iter().map(|f| f.take_inner()).collect();
             // evict 결과를 캡처 → `?` 전파를 rewrap 이후로 미뤄 placeholder 잔존 방지(잔여위험 1).
             let evict_result = if force {
@@ -576,13 +576,13 @@ impl Forward for ModelForward {
 
     fn try_offload(
         &mut self,
-        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
+        cache_manager: &mut crate::kv::cache_manager::CacheManager,
         ratio: f32,
     ) -> anyhow::Result<(usize, usize)> {
         // try_evict 와 동일 UER(take_inner → op → put_inner). offload 는 prune_prefix
         // 로 current_pos 를 줄이므로 op 후 새 pos 를 읽어 호출자(DecodeLoop)가 동기화.
         if let Some(fmts) = &self.fmt_caches {
-            let mut temp: Vec<crate::pressure::kv_cache::KVCache> =
+            let mut temp: Vec<crate::kv::kv_cache::KVCache> =
                 fmts.iter().map(|f| f.take_inner()).collect();
             let result = cache_manager.offload(&mut temp, ratio);
             let new_pos = temp.first().map(|c| c.current_pos).unwrap_or(0);
@@ -599,10 +599,10 @@ impl Forward for ModelForward {
 
     fn try_recall(
         &mut self,
-        cache_manager: &mut crate::pressure::cache_manager::CacheManager,
+        cache_manager: &mut crate::kv::cache_manager::CacheManager,
     ) -> anyhow::Result<(usize, usize)> {
         if let Some(fmts) = &self.fmt_caches {
-            let mut temp: Vec<crate::pressure::kv_cache::KVCache> =
+            let mut temp: Vec<crate::kv::kv_cache::KVCache> =
                 fmts.iter().map(|f| f.take_inner()).collect();
             let result = cache_manager.recall(&mut temp);
             let new_pos = temp.first().map(|c| c.current_pos).unwrap_or(0);

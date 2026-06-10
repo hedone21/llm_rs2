@@ -5,8 +5,8 @@
 
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::{Buffer, DType};
+use llm_rs2::kv::kv_cache::KVCache;
 use llm_rs2::memory::host::shared::SharedBuffer;
-use llm_rs2::pressure::kv_cache::KVCache;
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
 use std::sync::Arc;

@@ -17,16 +17,16 @@ use std::sync::atomic::AtomicU64;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
+use llm_rs2::kv::ActionResult;
+use llm_rs2::kv::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
-use llm_rs2::pressure::ActionResult;
-use llm_rs2::pressure::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
-use llm_rs2::pressure::weights::{SwapAlgorithm, WeightSwapDecider, compute_qcf_weight_swap};
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
+use llm_rs2::weight::{SwapAlgorithm, WeightSwapDecider, compute_qcf_weight_swap};
 use llm_shared::DtypeTag;
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ fn make_importance(entries: Vec<(usize, f32)>) -> Vec<f32> {
 /// This confirms the validation layer doesn't erroneously reject Q4_0.
 #[test]
 fn e2e_q4_0_dtype_passes_validation_gate() {
-    use llm_rs2::pressure::weights::swap_executor::dtype_tag_to_dtype;
+    use llm_rs2::weight::swap_executor::dtype_tag_to_dtype;
     let result = dtype_tag_to_dtype(DtypeTag::Q4_0);
     assert!(
         result.is_ok(),
@@ -129,7 +129,7 @@ fn e2e_q4_0_dtype_passes_validation_gate() {
 /// E2E gate: non-Q4_0 dtypes must fail at the validation gate.
 #[test]
 fn e2e_reserved_dtype_blocked_at_gate() {
-    use llm_rs2::pressure::weights::swap_executor::dtype_tag_to_dtype;
+    use llm_rs2::weight::swap_executor::dtype_tag_to_dtype;
     for tag in [DtypeTag::F16, DtypeTag::F32, DtypeTag::Q8_0] {
         assert!(
             dtype_tag_to_dtype(tag).is_err(),

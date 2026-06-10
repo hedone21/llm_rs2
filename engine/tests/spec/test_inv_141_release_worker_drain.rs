@@ -19,9 +19,9 @@ use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::host::shared::SharedBuffer;
-use llm_rs2::pressure::weights::PrimaryReleaseWorker;
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
+use llm_rs2::weight::PrimaryReleaseWorker;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -208,7 +208,7 @@ fn inv_141_swap_executor_rejects_on_drain_timeout() {
     use llm_rs2::memory::galloc::Galloc;
     use llm_rs2::model_config::{ModelArch, ModelConfig};
     use llm_rs2::models::weights::LayerSlot;
-    use llm_rs2::pressure::weights::{SwapError, SwapExecutor};
+    use llm_rs2::weight::{SwapError, SwapExecutor};
 
     fn minimal_config() -> ModelConfig {
         ModelConfig {

@@ -15,17 +15,17 @@ use std::sync::{Arc, Mutex};
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::{Buffer, DType};
+use llm_rs2::kv::cache_manager::CacheManager;
+use llm_rs2::kv::eviction::stage_registry::{
+    StageBackedPolicy, ensure_builtin_stages_registered, make_stage,
+};
+use llm_rs2::kv::kv_cache::KVCache;
+use llm_rs2::kv::standard_format::StandardFormat;
 use llm_rs2::memory::host::shared::SharedBuffer;
 use llm_rs2::observability::profile::OpProfiler;
 use llm_rs2::pipeline::{
     LifecyclePhase, PipelineDispatcher, Pressure, PressureSource, StageContext, StepInfo,
 };
-use llm_rs2::pressure::cache_manager::CacheManager;
-use llm_rs2::pressure::eviction::stage_registry::{
-    StageBackedPolicy, ensure_builtin_stages_registered, make_stage,
-};
-use llm_rs2::pressure::kv_cache::KVCache;
-use llm_rs2::pressure::standard_format::StandardFormat;
 use llm_rs2::resilience::sys_monitor::{MemoryStats, NoOpMonitor, SystemMonitor};
 use llm_rs2::session::local_pressure::LocalPressureSource;
 use llm_rs2::session::pipeline_registry::PipelineRegistry;

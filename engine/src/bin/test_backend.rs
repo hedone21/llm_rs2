@@ -9,9 +9,9 @@ use llm_rs2::backend::opencl::OpenCLBackend;
 #[cfg(feature = "opencl")]
 use llm_rs2::backend::opencl::get_cl_mem;
 use llm_rs2::buffer::{Buffer, DType};
+use llm_rs2::kv::kivi_cache::KiviCache;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::pressure::kivi_cache::KiviCache;
 use llm_rs2::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;

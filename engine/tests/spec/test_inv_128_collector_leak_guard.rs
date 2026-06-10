@@ -16,9 +16,9 @@
 //!
 //! Spec: INV-128, ENG-ALG-218.
 
-use llm_rs2::pressure::weights::{SwapAlgorithm, WeightSwapDecider};
 use llm_rs2::qcf::layer_importance::ImportanceCollector;
 use llm_rs2::qcf::layer_importance::ImportanceTable;
+use llm_rs2::weight::{SwapAlgorithm, WeightSwapDecider};
 
 // ── INV-128.1: collector_armed consumption pattern ────────────────────────────
 

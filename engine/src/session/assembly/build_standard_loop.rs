@@ -25,9 +25,9 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::inference::sampling::SamplingConfig;
+use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::pressure::kv_cache::KVCache;
 use crate::session::cli::Args;
 use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::forward::ModelForward;

@@ -42,10 +42,10 @@ static DYN_FORMAT_REGISTRY: OnceLock<RwLock<Vec<RuntimeFormatReg>>> = OnceLock::
 /// `--load-plugin` 으로 지정된 `.so` 들을 dlopen 해 [`struct@DYN_FORMAT_REGISTRY`] 에 등록한다(D4).
 ///
 /// 각 `.so`: `Library::new`(RTLD_NOW) → `register_kv_format_v1` dlsym → `abi_version` 검사 →
-/// 이름 충돌 fail-fast(빌트인 우선 + 동적 중복 금지). [`register_dynamic_stages`](crate::pressure::eviction::stage_registry::register_dynamic_stages)
+/// 이름 충돌 fail-fast(빌트인 우선 + 동적 중복 금지). [`register_dynamic_stages`](crate::kv::eviction::stage_registry::register_dynamic_stages)
 /// 의 format 축 짝(동형 strict 로더 — 심볼 부재 시 거부).
 /// 이미 dlopen 된 `.so`(Arc) 에서 format capability 를 [`struct@DYN_FORMAT_REGISTRY`] 에 등록하는
-/// per-`.so` 코어(ADR-0010 E5, [`try_register_stage`](crate::pressure::eviction::stage_registry::try_register_stage)
+/// per-`.so` 코어(ADR-0010 E5, [`try_register_stage`](crate::kv::eviction::stage_registry::try_register_stage)
 /// 의 format 축 짝). `register_kv_formats_v2` 봉투 entry 를 dlsym — **없으면 `Ok(0)`**(이 `.so` 는 format
 /// 미보유). 있으면 봉투 `abi_version` 검사 → `count` 개 vtable **2-pass 원자 등록**(① 빌트인 충돌·봉투 내부
 /// 중복 검사 → ② write-lock 1회 동적 중복 + 일괄 push). 반환 = 등록한 format 개수.

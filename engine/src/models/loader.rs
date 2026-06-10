@@ -25,8 +25,8 @@ use crate::memory::Memory;
 use crate::model_config::ModelConfig;
 use crate::models::transformer::TransformerModel;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader uses pressure-owned runtime resource setup (위계 정합 방향, design doc §7.4)
-use crate::pressure::weights::setup_runtime_resources;
 use crate::tensor::Tensor;
+use crate::weight::setup_runtime_resources;
 
 /// Runtime weight-load configuration.
 ///

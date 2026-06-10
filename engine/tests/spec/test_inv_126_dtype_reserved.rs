@@ -7,7 +7,7 @@
 //!
 //! Spec: INV-126, MSG-082, ENG-ALG-214-ROUTE.
 
-use llm_rs2::pressure::weights::swap_executor::{SwapError, dtype_tag_to_dtype};
+use llm_rs2::weight::swap_executor::{SwapError, dtype_tag_to_dtype};
 use llm_shared::DtypeTag;
 
 // ── INV-126: Only Q4_0 is executable in Phase 3 ──────────────────────────────

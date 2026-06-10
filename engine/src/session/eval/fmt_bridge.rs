@@ -20,10 +20,10 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::format::KVCacheFormat;
-use crate::pressure::kivi_cache::KiviCache;
-use crate::pressure::kivi_format::KIVIFormat;
-use crate::pressure::kv_cache::KVCache;
-use crate::pressure::standard_format::StandardFormat;
+use crate::kv::kivi_cache::KiviCache;
+use crate::kv::kivi_format::KIVIFormat;
+use crate::kv::kv_cache::KVCache;
+use crate::kv::standard_format::StandardFormat;
 
 /// eval 의 cache 다형성을 `KVCacheOps` 바운드 없이 추상화 (Phase α-K ①-c).
 ///

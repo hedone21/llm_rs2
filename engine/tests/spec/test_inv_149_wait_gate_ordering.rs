@@ -22,8 +22,8 @@ use llm_rs2::backend::{Backend, GpuEvent};
 use llm_rs2::buffer::DType;
 use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
-use llm_rs2::pressure::weights::IntraForwardSwapHook;
-use llm_rs2::pressure::weights::async_swap::{AsyncSwapDispatcher, SwapCommitJob};
+use llm_rs2::weight::IntraForwardSwapHook;
+use llm_rs2::weight::async_swap::{AsyncSwapDispatcher, SwapCommitJob};
 
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::host::shared::SharedBuffer;

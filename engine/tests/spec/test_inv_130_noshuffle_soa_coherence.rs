@@ -48,8 +48,8 @@ use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
-use llm_rs2::pressure::weights::SwapExecutor;
 use llm_rs2::tensor::Tensor;
+use llm_rs2::weight::SwapExecutor;
 
 // ── INV-130-A: trait default is no-op ────────────────────────────────────────
 

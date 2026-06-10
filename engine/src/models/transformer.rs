@@ -12,15 +12,15 @@ use crate::memory::Memory;
 use crate::model_config::{ModelArch, ModelConfig};
 use crate::models::weights::{LayerSlot, SecondaryMmap};
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O PreloadAccess trait (inference→pressure trait boundary)
-use crate::pressure::offload::preload_pool::PreloadAccess;
+use crate::kv::offload::preload_pool::PreloadAccess;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O preload result type
-use crate::pressure::offload::preload_pool::PreloadResult;
+use crate::kv::offload::preload_pool::PreloadResult;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path concrete cache (forward_into_offload monomorphization, BC Step 2)
-use crate::pressure::offload::OffloadKVCache;
+use crate::kv::offload::OffloadKVCache;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O inference loader uses pressure-owned ε helper (위계 정합 방향, design doc §7.4)
-use crate::pressure::weights::compute_quant_noise;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
+use crate::weight::compute_quant_noise;
 
 #[cfg(feature = "opencl")]
 // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
@@ -93,8 +93,8 @@ pub struct TransformerModel {
     /// Trait object so the struct definition does not reference pressure-side
     /// concrete types directly (§13.8-O cross-L3 vocabulary 본질 해소,
     /// 2026-05-27 sprint). The installed impl is `QuantNoiseTable` produced
-    /// by `pressure::weights::setup_runtime_resources` and later replaced via
-    /// `pressure::weights::compute_quant_noise` once the secondary mmap is
+    /// by `weight::setup_runtime_resources` and later replaced via
+    /// `weight::compute_quant_noise` once the secondary mmap is
     /// known (ENG-ALG-216).
     ///
     /// - `secondary_mmap == None`: `QuantNoiseTable::empty()` (len==0).
@@ -104,7 +104,7 @@ pub struct TransformerModel {
     /// Async primary cl_mem release worker accessor (ENG-ALG-228 / ENG-DAT-100).
     ///
     /// Trait object — the installed impl is `PrimaryReleaseWorker` spawned by
-    /// `pressure::weights::setup_runtime_resources`. `SwapExecutor` clones the
+    /// `weight::setup_runtime_resources`. `SwapExecutor` clones the
     /// `Arc<dyn ReleaseWorkerAccess>` to enqueue displaced `LayerWeights` in
     /// Stage (c) and to call `drain` (INV-141) before the next swap batch.
     ///
@@ -1682,7 +1682,7 @@ impl TransformerModel {
         x: &Tensor,
         logits: &Tensor,
         ws: &LayerWorkspace,
-        handles: &[Arc<crate::pressure::standard_format::StandardFormat>],
+        handles: &[Arc<crate::kv::standard_format::StandardFormat>],
         backend: &Arc<dyn Backend>,
     ) -> Option<FullKernelPlan> {
         // (3p) ④-a: lock every StandardFormat guard up front and bind a
@@ -1692,7 +1692,7 @@ impl TransformerModel {
         // `build_full_plan`, so the guards only need to outlive that call
         // (FullKernelPlan holds no borrow into the caches).
         let __fmt_guards: Vec<_> = handles.iter().map(|h| h.plan_lock()).collect();
-        let kv_caches: Vec<&crate::pressure::kv_cache::KVCache> =
+        let kv_caches: Vec<&crate::kv::kv_cache::KVCache> =
             __fmt_guards.iter().map(|g| &g.cache).collect();
         use crate::backend::opencl::get_cl_mem;
         use crate::backend::opencl::plan::*;
@@ -2193,7 +2193,7 @@ impl TransformerModel {
         input_tokens: &Tensor,
         start_pos: usize,
         x_gen: &mut Tensor,
-        handles: &[Arc<crate::pressure::standard_format::StandardFormat>],
+        handles: &[Arc<crate::kv::standard_format::StandardFormat>],
         logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
@@ -2254,7 +2254,7 @@ impl TransformerModel {
         x: &Tensor,
         logits: &Tensor,
         ws: &LayerWorkspace,
-        kv_caches: &[crate::pressure::kivi_cache::KiviCache],
+        kv_caches: &[crate::kv::kivi_cache::KiviCache],
         backend: &Arc<dyn Backend>,
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
@@ -2440,11 +2440,11 @@ impl TransformerModel {
     pub fn forward_into_offload(
         &self,
         args: OffloadForwardArgs<'_, OffloadKVCache>,
-        fmts: &[Arc<crate::pressure::offload_format::OffloadFormat>],
-        prefetch: &mut crate::pressure::offload::prefetch::PrefetchController,
+        fmts: &[Arc<crate::kv::offload_format::OffloadFormat>],
+        prefetch: &mut crate::kv::offload::prefetch::PrefetchController,
     ) -> Result<()> {
+        use crate::kv::offload_format::{OffloadFormat, preload_offload_fmt_erased};
         use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
-        use crate::pressure::offload_format::{OffloadFormat, preload_offload_fmt_erased};
 
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
@@ -2529,7 +2529,7 @@ impl TransformerModel {
 
         // Lazy-init persistent thread pool (forward_into_offload :3783 미러).
         let pool = self.preload_pool.get_or_init(|| {
-            Box::new(crate::pressure::offload::preload_pool::PreloadPool::new(
+            Box::new(crate::kv::offload::preload_pool::PreloadPool::new(
                 prefetch.max_depth(),
             )) as Box<dyn PreloadAccess>
         });
@@ -2942,7 +2942,7 @@ mod tests {
             weight_prefix: String::new(),
         };
 
-        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
+        let runtime = crate::weight::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3093,7 +3093,7 @@ mod tests {
         };
 
         let lm_head = norm.clone();
-        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
+        let runtime = crate::weight::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3206,7 +3206,7 @@ mod tests {
             weight_prefix: String::new(),
         };
 
-        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
+        let runtime = crate::weight::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3309,7 +3309,7 @@ mod tests {
             weight_prefix: String::new(),
         };
 
-        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
+        let runtime = crate::weight::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],
@@ -3388,7 +3388,7 @@ mod tests {
             weight_prefix: String::new(),
         };
 
-        let runtime = crate::pressure::weights::setup_runtime_resources(cpu_be.clone());
+        let runtime = crate::weight::setup_runtime_resources(cpu_be.clone());
         let model = TransformerModel {
             config,
             layers: vec![],

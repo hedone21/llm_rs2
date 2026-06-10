@@ -6,8 +6,8 @@
 
 use super::hook::{CacheSnapshot, PostStepResult, StepHook};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
-use crate::pressure::cache_manager::CacheManager;
-use crate::pressure::kv_cache::{KVCache, max_cache_pos};
+use crate::kv::cache_manager::CacheManager;
+use crate::kv::kv_cache::{KVCache, max_cache_pos};
 use crate::qcf::{
     QcfActionType, QcfKvParams, VDataSource, compute_c1, compute_d7, compute_qcf_kv,
     identify_retained_for_action,
@@ -706,8 +706,8 @@ impl StepHook<KVCache> for EvictionHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pressure::cache_manager::CacheManager;
-    use crate::pressure::eviction::no_eviction::NoEvictionPolicy;
+    use crate::kv::cache_manager::CacheManager;
+    use crate::kv::eviction::no_eviction::NoEvictionPolicy;
     use crate::qcf_types::{QcfConfig, QcfMode};
     use crate::resilience::sys_monitor::{MemoryStats, SystemMonitor};
     use anyhow::Result as AResult;

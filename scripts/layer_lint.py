@@ -29,7 +29,7 @@ DATA_CONSUMER_PATTERNS = [
     re.compile(r"crate::models::weights::[A-Z]"),                        # struct/enum (UpperCamelCase)
     re.compile(r"crate::models::weights::[a-z_]+::[A-Z]"),               # sub-module struct/enum (예: rpcmem_secondary::RpcmemLayerRegion)
     re.compile(r"crate::layers::transformer_layer::TransformerLayer"),
-    re.compile(r"crate::pressure::kv_cache::KVCache$"),                  # struct only, KVCacheOps trait 제외
+    re.compile(r"crate::kv::kv_cache::KVCache$"),                         # struct only, KVCacheOps trait 제외
 ]
 
 
@@ -77,9 +77,9 @@ LAYER_RULES = [
     # (전용 도메인 vs L4 vs 수평-허용 규칙)는 실 Stage 가 입주하는 Phase α-K 에서 확정한다.
 
     # L3-pressure: KV cache 관리, eviction, offload, swap handler
-    # Step 4-D: core/{cache_manager,kv_cache,kivi_cache,kv_migrate,eviction,
-    # pressure,offload} → engine/src/pressure/ (top-level grouping).
-    ("pressure",                "L3-pressure"),
+    # γ-1: pressure/ → kv/ (KV 도메인) + weight/ (weight swap 도메인) 분리.
+    ("kv",                      "L3-pressure"),
+    ("weight",                  "L3-pressure"),
 
     # L3-inference: 추론 연산 도메인
     # Step 4-C: sampling/skip_config/speculative/attention_scores promoted to engine/src/inference/
@@ -620,22 +620,22 @@ KNOWN_V_MAP = [
     (r"buffer/(cl_|cuda_|rpcmem_)",      r"",                           "V-08"),
     # V-09: buffer/ → models::weights::SecondaryMmap (L2→L3 pressure state)
     (r"buffer/",                         r"models::weights::SecondaryMmap", "V-09"),
-    # V-10: pressure/cache_manager.rs → resilience::EvictMethod (Step 4-D path)
-    (r"pressure/cache_manager\.rs",      r"resilience::EvictMethod",    "V-10"),
+    # V-10: kv/cache_manager.rs → resilience::EvictMethod (Step 4-D path)
+    (r"kv/cache_manager\.rs",            r"resilience::EvictMethod",    "V-10"),
     # V-11: core/chat_template.rs → models::config::ModelArch
     (r"core/chat_template\.rs",          r"models::config::ModelArch",  "V-11"),
-    # V-12: core/events.rs → pressure (의도된 의존), qcf:: (Step 4-B 후)
-    (r"core/events\.rs",                 r"pressure::",                 "V-12"),
+    # V-12: core/events.rs → kv (의도된 의존), qcf:: (Step 4-B 후)
+    (r"core/events\.rs",                 r"kv::",                       "V-12"),
     (r"core/events\.rs",                 r"qcf::",                      "V-12"),
-    # V-13: pressure/kivi_cache.rs → backend::cpu/opencl (L3→L1), qcf:: (Step 4-B path)
-    (r"pressure/kivi_cache\.rs",         r"backend::",                  "V-13"),
-    (r"pressure/kivi_cache\.rs",         r"qcf::",                      "V-13"),
-    # V-13(b): pressure/mod.rs → qcf:: (L3-pressure→L3-inference)
-    (r"pressure/mod\.rs",                r"qcf::",                      "V-13"),
-    # V-14: qcf/, pressure/kivi_cache, inference/sampling → profile:: (L3→observability concrete)
-    (r"(qcf/(unified_qcf|layer_importance|qcf_kv)|pressure/kivi_cache|inference/sampling)", r"profile::", "V-14"),
-    # V-15: pressure/cache_manager.rs, pressure/eviction/* (테스트 블록) → backend::cpu (grandfathered)
-    (r"pressure/(cache_manager|eviction/)", r"backend::cpu::CpuBackend", "V-15"),
+    # V-13: kv/kivi_cache.rs → backend::cpu/opencl (L3→L1), qcf:: (Step 4-B path)
+    (r"kv/kivi_cache\.rs",               r"backend::",                  "V-13"),
+    (r"kv/kivi_cache\.rs",               r"qcf::",                      "V-13"),
+    # V-13(b): kv/mod.rs → qcf:: (L3-pressure→L3-inference)
+    (r"kv/mod\.rs",                      r"qcf::",                      "V-13"),
+    # V-14: qcf/, kv/kivi_cache, inference/sampling → profile:: (L3→observability concrete)
+    (r"(qcf/(unified_qcf|layer_importance|qcf_kv)|kv/kivi_cache|inference/sampling)", r"profile::", "V-14"),
+    # V-15: kv/cache_manager.rs, kv/eviction/* (테스트 블록) → backend::cpu (grandfathered)
+    (r"kv/(cache_manager|eviction/)",    r"backend::cpu::CpuBackend",   "V-15"),
     # V-16: eval/eval_loop.rs → backend:: (cross-cutting→L1)
     (r"eval/eval_loop\.rs",              r"backend::",                  "V-16"),
     # V-17: layers/ → backend::cpu::neon, opencl (L3→L1 downcast/direct call)
@@ -646,18 +646,18 @@ KNOWN_V_MAP = [
     (r"layers/tensor_partition\.rs",     r"buffer::(slice_buffer|cl_sub_buffer)", "V-19"),
     # V-20: models/transformer.rs → backend::opencl (L3→L1)
     (r"models/transformer\.rs",          r"backend::(opencl|cuda)",     "V-20"),
-    # V-21: models/transformer.rs → pressure::offload::preload_pool (Step 4-D path)
-    (r"models/transformer\.rs",          r"pressure::offload::preload_pool", "V-21"),
+    # V-21: models/transformer.rs → kv::offload::preload_pool (Step 4-D path)
+    (r"models/transformer\.rs",          r"kv::offload::preload_pool",  "V-21"),
     # V-22: models/transformer.rs, layers/ → profile:: (L3→observability)
     (r"models/transformer\.rs",          r"profile::",                  "V-22"),
     # V-23: models/transformer.rs, models/weights/ → auf:: (→shared/auf/ 이동 전 L3→cross-cutting)
     (r"models/(transformer|weights/)",   r"auf::",                      "V-23"),
-    # V-24: pressure/weight_swap_handler.rs → models:: (Pressure→Inference cross, Step 4-D path)
-    (r"pressure/weight_swap_handler\.rs", r"models::",             "V-24"),
-    # V-24(b): pressure/weight_swap_handler.rs → backend::cpu::CpuBackend
-    (r"pressure/weight_swap_handler\.rs", r"backend::cpu::CpuBackend", "V-24"),
-    # V-24(c): pressure/weight_swap_handler.rs → memory::galloc
-    (r"pressure/weight_swap_handler\.rs", r"memory::galloc",       "V-24"),
+    # V-24: kv/weight_swap_handler.rs → models:: (Pressure→Inference cross, Step 4-D path)
+    (r"kv/weight_swap_handler\.rs",      r"models::",               "V-24"),
+    # V-24(b): kv/weight_swap_handler.rs → backend::cpu::CpuBackend
+    (r"kv/weight_swap_handler\.rs",      r"backend::cpu::CpuBackend", "V-24"),
+    # V-24(c): kv/weight_swap_handler.rs → memory::galloc
+    (r"kv/weight_swap_handler\.rs",      r"memory::galloc",         "V-24"),
     # V-25: models/weights/swap_executor.rs → layers::transformer_layer (L3-pressure→L3-inference concrete)
     (r"models/weights/(swap_executor|intra_forward_swap|phase_aware_swap)", r"layers::", "V-25"),
     # V-25(b): models/weights/swap_executor.rs → models::transformer (self-domain monolith)
@@ -666,6 +666,10 @@ KNOWN_V_MAP = [
     (r"models/weights/swap_executor\.rs", r"backend::opencl::host_ptr_pool", "V-25"),
     # V-25(d): models/weights/swap_executor.rs → profile::
     (r"models/weights/swap_executor\.rs", r"profile::",                 "V-25"),
+    # V-25(e): models/loader.rs → weight:: (γ-1 rename 후 L3-inference→L3-pressure cross, 구 pressure::weights 동일)
+    (r"models/loader\.rs",               r"weight::",                   "V-25"),
+    # V-25(f): models/transformer.rs → weight:: (γ-1 rename 후 self-domain weight swap, 구 pressure::weights 동일)
+    (r"models/transformer\.rs",          r"weight::",                   "V-25"),
     # V-26: models/weights/decider.rs → qcf::layer_importance (현재 구조 내 cross)
     (r"models/weights/decider\.rs",      r"qcf::layer_importance",      "V-26"),
     # V-26(b): models/weights/decider.rs → profile:: (L3→observability concrete)
@@ -678,12 +682,12 @@ KNOWN_V_MAP = [
     (r"models/weights/layer_object_pool\.rs", r"backend::cuda_embedded","V-27"),
     # V-28: eval/ → models::, pressure::, qcf::, inference:: (cross-cutting→L3 다수)
     (r"eval/(qcf_helpers|eval_loop|eviction_hook|kivi_hook|hook)", r"models::",        "V-28"),
-    (r"eval/(eval_loop|eviction_hook|kivi_hook|hook)",  r"(pressure::(cache_manager|kv_cache|kivi_cache)|qcf::)", "V-28"),
+    (r"eval/(eval_loop|eviction_hook|kivi_hook|hook)",  r"(kv::(cache_manager|kv_cache|kivi_cache)|qcf::)", "V-28"),
     (r"eval/(qcf_helpers|kivi_hook)",    r"qcf::",                       "V-28"),
     # Step 4-C: eval/ → inference:: (sampling/skip_config/attention_scores 이동 후)
     (r"eval/(eval_loop|eviction_hook|kivi_hook|hook)", r"inference::",  "V-28"),
-    # Step 4-D: eval/ → pressure:: (cache_manager/kv_cache/kivi_cache/offload promoted)
-    (r"eval/(eval_loop|eviction_hook|kivi_hook|hook|qcf_helpers)", r"pressure::", "V-28"),
+    # Step 4-D / γ-1: eval/ → kv:: (cache_manager/kv_cache/kivi_cache/offload promoted)
+    (r"eval/(eval_loop|eviction_hook|kivi_hook|hook|qcf_helpers)", r"kv::",       "V-28"),
     # V-29: eval/eviction_hook.rs → backend::opencl::OpenCLBackend (cross-cutting→L1 downcast)
     (r"eval/eviction_hook\.rs",          r"backend::opencl::OpenCLBackend", "V-29"),
     # V-30: bin/generate.rs → 모든 레이어 직접 import (L5 monolith)

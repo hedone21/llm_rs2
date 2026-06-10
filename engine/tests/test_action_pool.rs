@@ -5,11 +5,11 @@
 
 use llm_rs2::inference::skip_config::SkipConfig;
 use llm_rs2::inference::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
-use llm_rs2::pressure::kivi_cache::KiviCache;
-use llm_rs2::pressure::kv_cache::{KVCache, KVLayout};
-use llm_rs2::pressure::offload::store::OffloadStore;
-use llm_rs2::pressure::quantize_handler::QuantizeHandler;
-use llm_rs2::pressure::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
+use llm_rs2::kv::kivi_cache::KiviCache;
+use llm_rs2::kv::kv_cache::{KVCache, KVLayout};
+use llm_rs2::kv::offload::store::OffloadStore;
+use llm_rs2::kv::quantize_handler::QuantizeHandler;
+use llm_rs2::kv::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
 use llm_rs2::quant::{BlockKVQ4, BlockKVQ8, QKKV};
 
 use llm_rs2::backend::cpu::CpuBackend;
@@ -79,8 +79,8 @@ fn make_headmajor_cache(num_tokens: usize, kv_heads: usize, head_dim: usize) -> 
 fn test_streaming_alias_parameters() {
     // Verify streaming eviction parameters are semantically equivalent to
     // SlidingWindowPolicy with specific prefix/window values.
-    use llm_rs2::pressure::eviction::EvictionPolicy;
-    use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
+    use llm_rs2::kv::eviction::EvictionPolicy;
+    use llm_rs2::kv::eviction::sliding_window::SlidingWindowPolicy;
 
     let streaming = SlidingWindowPolicy::new(2000, 4);
     let mut cache = make_seqmajor_cache(50, 1, 4);
@@ -209,8 +209,8 @@ fn test_throttle_plus_eviction_independence() {
     // Eviction modifies cache. They don't interfere.
 
     let mut cache = make_seqmajor_cache(50, 1, 4);
-    use llm_rs2::pressure::eviction::EvictionPolicy;
-    use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
+    use llm_rs2::kv::eviction::EvictionPolicy;
+    use llm_rs2::kv::eviction::sliding_window::SlidingWindowPolicy;
 
     let sliding = SlidingWindowPolicy::new(10, 4);
     // Evict while "throttled" (simulated — no actual delay needed for correctness test)
@@ -283,7 +283,7 @@ fn test_all_actions_data_flow() {
     // configured, and invoked without crash.
 
     // C6: StreamingLLM (SlidingWindowPolicy with sink)
-    use llm_rs2::pressure::eviction::sliding_window::SlidingWindowPolicy;
+    use llm_rs2::kv::eviction::sliding_window::SlidingWindowPolicy;
     let _streaming = SlidingWindowPolicy::new(2000, 4);
 
     // C8: KIVI multi-bit
@@ -291,7 +291,7 @@ fn test_all_actions_data_flow() {
     assert_eq!(cache.bits(), 4);
 
     // W2: DiskStore
-    use llm_rs2::pressure::offload::disk_store::DiskStore;
+    use llm_rs2::kv::offload::disk_store::DiskStore;
     let dir = std::env::temp_dir().join("llm_rs2_test_all_actions");
     let _ = std::fs::remove_dir_all(&dir);
     let mut store = DiskStore::new(dir.clone(), 0, 64).unwrap();
@@ -316,8 +316,8 @@ fn test_all_actions_data_flow() {
 
 #[test]
 fn test_disk_store_integration() {
-    use llm_rs2::pressure::offload::disk_store::DiskStore;
-    use llm_rs2::pressure::offload::store::OffloadStore;
+    use llm_rs2::kv::offload::disk_store::DiskStore;
+    use llm_rs2::kv::offload::store::OffloadStore;
 
     let dir = std::env::temp_dir().join("llm_rs2_test_disk_integration");
     let _ = std::fs::remove_dir_all(&dir);

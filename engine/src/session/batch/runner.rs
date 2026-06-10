@@ -14,13 +14,13 @@ use crate::buffer::DType;
 use crate::hardware::DeviceTarget;
 use crate::inference::sampling;
 use crate::inference::skip_config::SkipConfig;
+use crate::kv::kv_cache::KVCache;
 use crate::layers::workspace::{
     LayerWorkspace, PartitionWorkspace, PartitionWsCell, WorkspaceConfig,
 };
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModelForwardArgs;
-use crate::pressure::kv_cache::KVCache;
 use crate::resilience::KVSnapshot;
 use crate::session::batch::args::BatchRunCtx;
 use crate::session::batch::helpers::{
@@ -616,7 +616,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                 match device.as_str() {
                     "cpu" if is_gpu => {
                         eprintln!("[Prefill->Decode] Executing deferred SwitchHw: GPU->CPU");
-                        crate::pressure::kv_migrate::migrate_kv_caches(
+                        crate::kv::kv_migrate::migrate_kv_caches(
                             &mut kv_caches,
                             &backend,
                             &cpu_backend_arc,
@@ -658,7 +658,7 @@ pub fn run_prompt_batch(ctx: BatchRunCtx) -> Result<()> {
                     }
                     "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
                         eprintln!("[Prefill->Decode] Executing deferred SwitchHw: CPU->GPU");
-                        crate::pressure::kv_migrate::migrate_kv_caches(
+                        crate::kv::kv_migrate::migrate_kv_caches(
                             &mut kv_caches,
                             &backend,
                             gpu_be,

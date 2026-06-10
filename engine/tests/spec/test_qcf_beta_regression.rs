@@ -10,7 +10,7 @@
 //! Regression gate: if compute_qcf_kv collapses β back to a uniform
 //! formula, β=1.0 and β=1.5 would become identical — caught here.
 
-use llm_rs2::pressure::kv_cache::KVLayout;
+use llm_rs2::kv::kv_cache::KVLayout;
 use llm_rs2::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
 
 /// Build test params with the given β.

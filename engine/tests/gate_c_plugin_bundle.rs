@@ -21,7 +21,7 @@ use std::process::Command;
 
 use llm_rs2::format::dynamic_format_registry::{dynamic_registered_format_names, make_format};
 use llm_rs2::format::{decode_via_descriptor, encode_via_descriptor};
-use llm_rs2::pressure::eviction::stage_registry::{dynamic_registered_stage_names, make_stage};
+use llm_rs2::kv::eviction::stage_registry::{dynamic_registered_stage_names, make_stage};
 use llm_rs2::session::plugin_dispatch::register_dynamic_plugins;
 use technique_api::{
     KVLayoutDesc, KeepSpec, Packing, ScaleLayout, StageCtx, StageParams, TensorHandle, TensorKind,

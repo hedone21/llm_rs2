@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use llm_rs2::pressure::weights::IncrementalSwapPlan;
+use llm_rs2::weight::IncrementalSwapPlan;
 
 /// Simulate the `execute_on_slots` call side-effect of bumping ratio_generation.
 /// Returns the sequence of (chunk_layers) dispatched.

@@ -39,8 +39,8 @@ use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
-use llm_rs2::pressure::weights::{StageBreakdown, SwapError, SwapExecutor};
 use llm_rs2::tensor::Tensor;
+use llm_rs2::weight::{StageBreakdown, SwapError, SwapExecutor};
 
 // ── Ordering-aware mock backend ───────────────────────────────────────────────
 

@@ -22,9 +22,9 @@ use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::weights::LayerSlot;
-use llm_rs2::pressure::weights::IncrementalSwapPlan;
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
+use llm_rs2::weight::IncrementalSwapPlan;
 
 fn cpu_be() -> Arc<dyn Backend> {
     Arc::new(CpuBackend::new())

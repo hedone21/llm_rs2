@@ -23,15 +23,15 @@ use std::sync::atomic::AtomicU64;
 use llm_rs2::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::DType;
+use llm_rs2::kv::ActionResult;
+use llm_rs2::kv::kv_cache::KVCache;
+use llm_rs2::kv::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::memory::host::shared::SharedBuffer;
 use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
-use llm_rs2::pressure::ActionResult;
-use llm_rs2::pressure::kv_cache::KVCache;
-use llm_rs2::pressure::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
 use llm_rs2::shape::Shape;
 use llm_rs2::tensor::Tensor;
 
@@ -214,7 +214,7 @@ fn weight_swapped_fields_roundtrip() {
 /// bounded by ratio.
 #[test]
 fn uniform_target_layers_contract() {
-    use llm_rs2::pressure::weights::SwapExecutor;
+    use llm_rs2::weight::SwapExecutor;
 
     assert!(SwapExecutor::uniform_target_layers(0.0, 16).is_empty());
     assert_eq!(SwapExecutor::uniform_target_layers(1.0, 16).len(), 16);

@@ -40,9 +40,9 @@ use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::model_config::{ModelArch, ModelConfig};
 use llm_rs2::models::weights::LayerSlot;
-use llm_rs2::pressure::weights::SwapExecutor;
-use llm_rs2::pressure::weights::async_swap::AsyncSwapDispatcher;
 use llm_rs2::tensor::Tensor;
+use llm_rs2::weight::SwapExecutor;
+use llm_rs2::weight::async_swap::AsyncSwapDispatcher;
 
 // ── Mock backend ──────────────────────────────────────────────────────────────
 
@@ -398,7 +398,7 @@ fn test_async_path_no_secondary_no_pending_jobs() {
 /// async/sync path (Tester relies on the format string).
 #[test]
 fn test_stage_breakdown_log_line_format() {
-    use llm_rs2::pressure::weights::StageBreakdown;
+    use llm_rs2::weight::StageBreakdown;
 
     let bd = StageBreakdown {
         prefault_ms: 1.0,
@@ -451,7 +451,7 @@ fn test_async_path_submit_deferred_commit() {
     let slot = Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None, 0));
     let new_weights = Arc::new(dummy_layer(&be));
 
-    use llm_rs2::pressure::weights::async_swap::SwapCommitJob;
+    use llm_rs2::weight::async_swap::SwapCommitJob;
     dispatcher
         .submit_commit(SwapCommitJob {
             slot: slot.clone(),
@@ -501,7 +501,7 @@ fn test_async_dispatcher_submit_drain_dtype_change() {
         .map(|_| Arc::new(LayerSlot::new(dummy_layer(&be), DType::F16, None, 0)))
         .collect();
 
-    use llm_rs2::pressure::weights::async_swap::SwapCommitJob;
+    use llm_rs2::weight::async_swap::SwapCommitJob;
     for slot in &slots {
         dispatcher
             .submit_commit(SwapCommitJob {

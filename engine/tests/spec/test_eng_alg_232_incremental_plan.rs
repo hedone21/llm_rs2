@@ -12,7 +12,7 @@
 //! - remaining_count() monotone (INV-145)
 //! - started_at_token() accessor
 
-use llm_rs2::pressure::weights::IncrementalSwapPlan;
+use llm_rs2::weight::IncrementalSwapPlan;
 
 // ── ENG-ALG-232: basic drain progression ─────────────────────────────────────
 
