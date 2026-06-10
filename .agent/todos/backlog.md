@@ -847,3 +847,84 @@
 - **이미 반영**: `CONTEXT.md` (Format 용어 + 두 축 Format/Stage + Flagged ambiguities) + `arch/pipeline_stage_design_v2.md` (2026-05-30).
 - **담당 권장**: 코드 rename은 Phase α-K (Senior Implementer / Implementer)
 - **작성일**: 2026-05-30 / **갱신**: 2026-05-30 (문서 prose 전부 완료 — spec INV 본문 + backend_conformance + adr/0001. inference_pipeline/README는 전부 changelog라 편집 불요. 잔여 = 코드 `KVCacheOps`만)
+
+---
+
+## [트랙] KV 캐시 관리 확장성 로드맵 — 연구 동향 스트레스 테스트 후속 (2026-06-10 등록)
+
+> **출처**: 2026-06-10 설계 견고성 검토 — 최신 연구(2024–2026) ~70개 기법을 4갈래 병렬 조사(merge / eviction·budget / 표현 변경 / 패러다임·시스템)하여 3축 플러그인 설계(Stage ⊥ Format ⊥ Backend-capability)에 대조. 판정 등급: **A**(현 플러그인으로 가능, ~17) / **B**(어휘 확장·단순 op 추가, ~22) / **C**(복잡한 추가·설계 변경, ~30 — 이 중 ~12는 모델 아키텍처·학습·모달리티라 어느 엔진이든 코어 작업인 "범위 밖").
+> **결론**: plan-returning 골격과 3축 직교는 견고 — 식별된 어떤 갭도 "stage 직접 쓰기 권한"으로는 풀리지 않음(입력 부재/어휘 부족/구조 부재가 원인). 갭은 IR 어휘 3건(항목 1–3) + 표면 2건(항목 4–5) + 트리거 보류 3군집(항목 6–8)으로 수렴. 항목 1–5 수행 시 다룰 수 있는 영역(57개) 기준 표현 커버리지 **~40% → ~80%**, 잔여는 전부 개봉 조건이 명시된 의도적 보류.
+> **착수 순서 (사용자 결정 2026-06-10)**: 0(검증 선행) → 1–3(어휘 확장) → 4(read-plan ADR) → 5(persistence — **결이 달라 마지막**). 6–9는 트리거 개봉.
+
+### [P2] 0. 검증 선행 — 확장 0개로 가능한 1B 실측 3종
+- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 없음
+- **Description**: 후속 확장의 선결 게이트. 조사 기법의 효익은 전부 7–8B+/long-context 검증이라(Round 14–15 교훈: 1B에서 누적 score 차별화 무가치) 1B 실측 없이 착수 금지.
+  1. **R-KV** (NeurIPS'25, arXiv 2505.24133) — cosine redundancy + importance joint eviction. 현 `KVCacheStage`로 표현 가능(새 TensorKind 0개), D2O의 `dequant_k` cosine 인프라 재사용. 2048ctx에서 redundant 토큰 비율 실측 포함. 조사 결과 현 설계 최적합 2025 신규 기법.
+  2. **A2SF** (arXiv 2407.20485) — score accumulator에 forgetting factor(엔진측 소형 수정, plan 사후 적용 불가) 후 sliding/H2O 대비. 1B BOS 지배(Round 15: BOS=3002 vs prompt avg 3.3) 완화 가설 검증.
+  3. **head importance 분산 실측** — 항목 6(per-head 가변 budget)의 개봉 게이트. 1B 16층×8 kv_head에서 head별 attention concentration 분산이 8B급(Ada-KV 전제)으로 큰지.
+- **Acceptance Criteria**: 3종 실측 리포트(EMR/PPL/Top-K, `docs/30_evaluation_methodology.md` 준수). 1·2는 sliding 대비 우열 판정, 3은 항목 6 개봉/보류 판정.
+- **Notes**: R-KV는 reasoning long-CoT 대상이라 2048ctx에서 redundant 비율이 낮으면 보류가 정당한 결론.
+
+### [P2] 1. plan IR 어휘 확장 ① — `Demote` op ("보존하되 저정밀로" 제3 상태)
+- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 게이트 실험(아래) GREEN
+- **게이트 실험 (구현 전 모사)**: host eval에서 F16 캐시의 선택 토큰을 Q4/Q2 왕복 양자화해 "content-aware 강등이 sliding eviction을 품질(PPL/EMR)에서 이기는가"만 선검증. Round 14–15와 동일 위험(1B score 신뢰성)이므로 RED면 본 항목 전체 보류.
+- **Description**: 현 IR은 keep(보존) 아니면 소멸(evict/merge)의 이분법 — 문헌은 "evict 후보를 버리는 대신 저정밀 강등"(quantized pruning)이 순수 eviction을 일관되게 이기는 쪽으로 정착(arXiv 2412.12706). KIVI 합성 패턴이 못 덮는 이유 = 강등 경계가 시간 규칙이 아니라 importance 기반 **stage의 결정**이라, 결정(stage)→실행(format) 간 IR 채널이 미싱 링크.
+  - `KVCachePlan`에 `demotes: Vec<DemoteSpec { tokens, level: u8 }>` 추가 (level 해석은 format 책임)
+  - `KVCacheFormat::demote(tokens, level)` optional 메서드 — 미지원 format은 명시적 Err(fail-fast)
+  - executor 순서: demote → merge → compact. `PlanAbi`에 배열 1개 추가(가산적 — 기존 `.so` 무수정 호환)
+  - 혼합 정밀 저장 + 혼합 dequant 커널은 demote 지원 **format plugin 내부 책임** (KIVI가 한 캐시에 Q2 packed + F32 residual 두 영역을 운용하는 선례)
+- **해금**: MiKV(2402.18096), ZipCache(NeurIPS'24 2405.14256), QAQ, Don't-Waste-Bits(2604.04722 — 온디바이스 직격), MixKVQ·PM-KVQ 부분.
+- **코드 접점**: `crates/technique-api/src/lib.rs`(`KVCachePlan`/`PlanAbi`), `engine/src/format/kv_cache_format.rs`, plan executor(`engine/src/pressure/eviction/stage_registry.rs` 경로), 신규 mixed-precision format crate.
+- **Acceptance Criteria**: ADR-0004 amendment + `compact_parity` demote 케이스 확장 + 게이트 실험 GREEN + lib/clippy 무회귀 + 기존 .so dlopen 호환 확인.
+
+### [P2] 2. plan IR 어휘 확장 ② — K/V 비대칭 merge 가중치
+- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 없음 (1과 독립)
+- **Description**: `WeightedMerge`는 K/V 동일 가중치 강제 — 2025–26 문헌이 "K=스펙트럼 집중(균질)이라 적극 merge, V=분산(이질)이라 보수적"으로 수렴(순수 merge 신규 기법의 44%가 이 가정에 차단). `from: Vec<(pos, w)>` → `(pos, w_k, w_v)` + `into_weight` 분리(최소안: `apply_to: Both|KeyOnly|ValueOnly` 1필드). `apply_merges` K/V 루프 가중 분리(F32/F16/Q4_0 — `scatter_reduce_q4` 의미 포함). `MergeAbi`/`FromPairAbi` 필드 추가(가산적).
+- **해금**: WeightedKV(ICASSP'25 2503.01330 — K discard + V만 merge), KVSlimmer(2603.00907 — 2026 이론 정당화), KeepKV 부분(2504.09936 — K log-스케일은 plugin이 가중치 계산을 끝내 plan에 굽는 방식으로 흡수, 실행은 선형 유지), EMS 부분.
+- **Acceptance Criteria**: 기존 동일-가중 경로 bit-identical(d2o_stage_eq 무회귀) + 비대칭 단위 테스트 + ABI 호환. 1B 검증: WeightedKV ablation(8B 결과 무비판 이식 금지 — V 정보 균등 분포 가정이 1B에서 성립하는지).
+
+### [P2] 3. StageCtx 어휘 확장 ③ — `QueryStats` TensorKind
+- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 없음 (항목 4의 신호 공급원으로 선행 권장)
+- **Description**: prefill-end 압축 패러다임(SnapKV류)의 신호인 windowed attention 행렬은 flash attention이 materialize하지 않음(우리/문헌 공통 제약) — 2025 frontier(Expected Attention, arXiv 2510.00636)는 행렬 대신 **query 분포 통계로 미래 attention을 closed-form 추정**. `TensorKind::QueryStats`(per layer·kv_head Q running mean/var) 추가 + forward 경로 Q 캡처 1지점(`AttentionScoreAccumulator` 패턴 재사용). ADR-0004 §7이 예고한 자리("query_state(Quest) 캡처 미배선 → 후속 PR").
+- **해금**: Expected Attention, LU-KV·MixKVQ 부분. 항목 4(read-plan)의 Quest류 page 선택 신호로 재사용(시너지).
+- **Acceptance Criteria**: TensorKind variant + 엔진 누적 배선 + host 통계 정확성 테스트 + 기존 기법(`tensor()` 소비자) 무영향.
+
+### [P2] 4. read-plan 표면 ADR — "무엇을 읽을지"의 4번째 plugin 표면
+- **Status**: TODO (ADR 작성까지가 본 항목 — 구현은 ADR 산출물로 별도 등록) / **Sprint**: backlog / **Dependencies**: 항목 3 권장 선행
+- **Description**: `attention_into`는 캐시 전체 읽기를 가정하고 selection 인자가 없음 — 선택적 읽기(Quest류)와 예측 prefetch(InfiniGen/KVSwap류)가 통째로 차단. `KVCacheStage`와 대칭인 plan-returning trait `KVReadStage::read_plan(ctx) → KVReadPlan{granularity, select}`.
+  - **핵심 통찰**: layer i−1에서 산출한 read plan = Quest에겐 읽기 마스크, KVSwap에겐 layer i의 prefetch 목록 — 표면 하나로 두 군집(~9건) 동시 해소
+  - format은 `attention_into_selected` capability **opt-in**(미지원 format은 full read 폴백) → 합성성 보존. "Quest를 전용 format에 매장"은 format 축 안에서 M×N 재발(Quest-on-KIVI마다 신규 format)이라 표면 신설이 정공
+  - 설계 쟁점: page 메타데이터(K min/max) 유지 주체 — 1차안은 read stage가 `tensor(Key)`로 자기 상태 incremental 갱신(코어 무수정)
+- **해금**: Quest(ICML'24 2406.10774), InfLLM, HISA, BLASST, shadowAttn(2508.16703 — 모바일 NPU, prefill 전용), InfiniGen(OSDI'24), KVSwap(2511.11907) prefetch.
+- **실익 정직 평가**: 1B/2048 decode는 memory-bound라 제한적 — 가치는 prefill TTFT + 8B/디스크 offload 토대 + 논문 기여("4번째 표면도 동일 plan-returning 문법으로 가산" 확장성 실증).
+- **Acceptance Criteria**: ADR 신규 1건(대안 비교 + grill 통과) + 구현 단계 분해를 본 백로그에 재등록.
+
+### [P3] 5. 세션 KV persistence (prefix cache) — ★사용자 결정: 결이 달라 마지막 수행
+- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 항목 1–4와 독립(IR/TensorKind 무접촉). 착수 순서만 마지막(2026-06-10 결정 — plugin 표면이 아니라 엔진 lifecycle 기능이라 결이 다름).
+- **Description**: KV 캐시 수명이 프로세스 내 한 세션 — 새 대화/프로세스 재시작/대화 전환마다 동일 prefix(system prompt + 히스토리)를 전부 재prefill. 업계 동일물: llama.cpp `--prompt-cache`, vLLM automatic prefix caching.
+  - **Tier 1** (본 항목): system prompt prefix 저장/복원 — ① format snapshot capability(`snapshot(range)→bytes` / `restore(bytes, at_pos)`, capability-handle 신설 요건 충족: 소비자 = prefix cache + resilience Suspend) ② 스냅샷 파일(헤더: model_hash·format_id·tokenizer_hash·token_ids — 하나라도 불일치 시 폐기) ③ 세션 API `save_prefix`/`try_restore_prefix`(token-id 단위 prefix 일치 검사가 정확성의 전부) ④ "prefill 직후·eviction 전 상태만 저장"으로 position 매핑 문제 회피
+  - **정확성 근거**: KV는 prefix 토큰의 순수 함수(causal) + RoPE는 절대 위치로 K에 baked — prefix는 항상 위치 0부터라 자연 정합
+  - **Tier 2**(턴 종료 히스토리 누적 저장 — 프로세스 재시작 복원) / **Tier 3**(임의 chunk 재사용, CacheBlend/EPIC — position 재정합 필요)는 Tier 1 후 별도 등록
+- **효익**: 1B 기준 500tok prefix = Q4_0 ~4.6MB / f16 ~16MB → 디스크 복원 수십 ms vs prefill 재계산 수백 ms~수 초. C 군집 중 1B 현 타겟에서 즉시 체감(TTFT) 나오는 유일 항목.
+- **Acceptance Criteria**: 동일 prompt 2회차 TTFT 단축 실측(S25) + 복원 후 greedy token-id가 fresh prefill과 일치 + 무효화 3케이스(model/format/tokenizer 변경) 테스트.
+
+### [P3·트리거] 6. per-head 가변 budget 회계 — Ada-KV/HeadKV/LAVa/EMS/LU-KV 군집
+- **개봉 트리거**: 항목 0-3(1B head importance 분산 실측)에서 분산 大 판정 **그리고** head-adaptive 기법 실수요(논문 비교군 포함).
+- **Description**: `KeepSpec::PerHead`는 타입상 이미 ragged 표현 가능 — 차단은 어휘가 아니라 **엔진 불변식**: `new_pos = keep.len()` 도출, HeadMajor 균일 stride, decode loop 단일 pos 회계, ragged attention 커널(전용 format으로 격리 가능하나 pos 회계는 엔진 잔존). 잔여 C 중 가장 뼈아픈 군집 — head 차등 budget이 2025–26 SOTA의 핵심 차별점(Ada-KV NeurIPS'25 2407.11550, HeadKV ICLR'25 2410.19258, LAVa 2509.09754, EMS 2412.08521, LU-KV 2602.08585).
+- **Notes**: ARM64/Adreno에서 변길이 per-head KV 커널 재설계 비용이 효익을 압도할 위험 — 게이트 통과 전 착수 금지.
+
+### [P3·트리거] 7. cross-layer cache group — xKV/MiniCache/KVSharer/CommonKV 군집
+- **개봉 트리거**: 8B+ 모델 온보딩(또는 4K+ ctx 상시화).
+- **Description**: layer별 독립 버퍼 + per-layer plan 호출 구조에 레이어 간 조정 채널이 0 — cross-layer cache group(공유 basis 버퍼 + group-level plan 경로) 신설은 ADR급 설계 변경. 대상 전부 training-free post-hoc 가능(xKV 2503.18893 SVD, MiniCache 2405.14366 SLERP, KVSharer, CommonKV)인데 **구조가 차단하는 유일 부류**(인접 layer KV cosine 유사도 0.72–0.87 근거 탄탄).
+- **Notes**: 1B/2048에선 KV 절대 크기가 작아 실익 미미(KVSwap 평가와 동일 논리) + 복원 GEMM 오버헤드가 절감 상쇄 위험.
+
+### [P3·트리거] 8. windowed attention TensorKind — SnapKV/PyramidKV/CAKE 군집
+- **개봉 트리거**: 항목 3(QueryStats) 경로가 prefill-end 압축 요구를 실측에서 못 덮을 때, 또는 SnapKV류 직접 재현 실수요(논문 비교군 등).
+- **Description**: `TensorKind::WindowedAttn`(최근 w query × 전체 key) + prefill-end 캡처. flash attention이라 행렬 materialize가 비쌈 — prefill 마지막 w 토큰 한정 보조 경로(non-flash 또는 부분 재계산) 필요. SnapKV(NeurIPS'24 2404.14469)·PyramidKV(2406.02069)·CAKE(ICLR'25 2503.12491) 해금. layer 차등 budget 자체는 기존 메커니즘(D2O layer allocator)으로 이미 가능.
+- **Notes**: 기법 "그대로"의 재현용 — 목적(미래 무용 토큰의 prefill-end 식별)만이면 항목 3이 같은 목적의 2025 frontier 대체 경로.
+
+### [P3·제품 결정] 9. 멀티세션 paging — PagedAttention/FlexGen류
+- **성격**: 기법 백로그가 아니라 **PM 로드맵 질문** — "동시 멀티 세션(대화 전환, 에이전트 병행)을 1급으로 지원하는가?" YES → allocator paging + 세션 스케줄 설계(ADR급). NO → 항목 5의 save/restore 전환으로 충분(단일 캐시 + 디스크 스왑).
+- **담당**: PM 로드맵 검토 후 개봉/폐기 판정.
+
+> **범위 밖 확정(영구 보류, 어느 엔진이든 코어 작업)**: 모델 아키텍처 전환(TransMLA/X-EcoMLA/Mamba류 — "지원할 입력 모델 종류" 문제로 별도), 학습 필요(MatryoshkaKV/MoQAE/NSA/MoBA/CLA/YOCO), 멀티모달(FlowMM/AIM). 상세 판정표(~70개 기법 A/B/C + 근거)는 2026-06-10 세션 기록 — 필요 시 `.agent/research/`로 보존.
