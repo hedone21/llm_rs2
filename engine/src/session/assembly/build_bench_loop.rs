@@ -206,15 +206,20 @@ pub fn build_bench_loop(
     // driver 의 PreEviction dispatch(β-3 배선)가 소비.
     let registry = Arc::new(PipelineRegistry::new());
 
-    // β-4: evict directive 를 OneShot EvictionStage 로 submit 하는 dispatcher. cache_manager 가
-    // None(happy/eviction=none) 이면 dispatcher 미구성 → happy-path 거동-0.
-    let dispatcher = cache_manager.map(|cm| {
-        CommandDispatcher::new(
+    // β-4: EngineCommand 분배자. **resilience-on 이면 CM 유무와 무관하게 구성** — control
+    // 디렉티브(Throttle/SetTargetTbt/Suspend 등)는 CM 없이 소비 가능하고, v1 도 eviction=none +
+    // resilience-on 에서 control 을 적용했다(미구성 시 디렉티브 무소비 드롭 = v1 회귀, β-4 device
+    // smoke 실증 2026-06-10). evict 디렉티브는 CM=None 이면 dispatcher 내부에서 inert —
+    // v1 (a.5) 의 `cache_manager=None` 스킵과 등가. 둘 다 None 이면 미구성(happy-path 거동-0).
+    let dispatcher = if resilience.is_some() || cache_manager.is_some() {
+        Some(CommandDispatcher::new(
             Arc::clone(&registry),
             kv_handles,
-            Some(Arc::new(Mutex::new(cm))),
-        )
-    });
+            cache_manager.map(|cm| Arc::new(Mutex::new(cm))),
+        ))
+    } else {
+        None
+    };
 
     let use_stateful =
         sampling_config.repetition_penalty != 1.0 || sampling_config.temperature != 0.0;

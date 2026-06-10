@@ -29,7 +29,9 @@ use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::pressure::kv_cache::KVCache;
 use crate::session::cli::Args;
+use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::forward::ModelForward;
+use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
@@ -122,6 +124,29 @@ pub fn build_standard_loop(
         plan_enabled,
     )?;
 
+    // β-4: resilience-on 이면 dispatcher 를 구성한다 — control 디렉티브(Throttle/SetTargetTbt/
+    // Suspend 등)는 CM 없이 소비 가능하고, v1 은 argus_cli resilience-on 에서 이를 적용했다
+    // (dispatcher 부재 시 디렉티브 무소비 드롭 = v1 회귀, β-4 device smoke 실증 2026-06-10).
+    // evict 디렉티브는 CM=None 이라 dispatcher 내부 inert — v1 (a.5) cache_manager=None 스킵 등가.
+    // heartbeat kv snapshot 은 held-handle query(매핑 문서 4부 채택안 (가)) — layer-0 handle 주입.
+    // `--no-resilience`(None) 경로는 아래 분기 전체 미진입 = 기존과 byte-identical 조립.
+    let (resilience, dispatcher_parts) = match resilience {
+        Some(mut adapter) => {
+            let kv_pos_handle: Option<Arc<dyn crate::format::KVCacheFormat>> = mf
+                .fmt_caches()
+                .first()
+                .map(|f| f.clone() as Arc<dyn crate::format::KVCacheFormat>);
+            if let Some(h) = kv_pos_handle.clone() {
+                adapter.set_kv_handle(h);
+            }
+            let registry = Arc::new(PipelineRegistry::new());
+            let dispatcher =
+                CommandDispatcher::new(Arc::clone(&registry), mf.fmt_caches().to_vec(), None);
+            (Some(adapter), Some((registry, dispatcher, kv_pos_handle)))
+        }
+        None => (None, None),
+    };
+
     // Phase 4-4.7: sampler 자동 선택. production `sampling::sample`은
     // temperature=0 + repetition_penalty=1.0이면 raw argmax와 동치이므로 두 조건이
     // 모두 만족될 때만 GreedySampler 사용. 그 외는 RepetitionPenaltySampler가
@@ -137,6 +162,19 @@ pub fn build_standard_loop(
     // P3.3: resilience adapter 주입 (Some → 3 slot 주입, None → NoOp default 유지)
     let builder = match resilience {
         Some(adapter) => builder.with_resilience(adapter),
+        None => builder,
+    };
+    // β-4: dispatcher + 공유 registry + pos-환류 handle 배선 (resilience-on 한정).
+    let builder = match dispatcher_parts {
+        Some((registry, dispatcher, kv_pos_handle)) => {
+            let b = builder
+                .with_pipeline(registry)
+                .with_command_dispatcher(dispatcher);
+            match kv_pos_handle {
+                Some(h) => b.with_kv_pos_handle(h),
+                None => b,
+            }
+        }
         None => builder,
     };
     Ok(builder.build())
