@@ -1130,9 +1130,9 @@ macro_rules! register_kv_format {
 /// 정적 force-link 빌드에선 미emit(다수 force-link plugin 의 entry 충돌 차단). `register_kv_*!` 가 누적한
 /// [`PLUGIN_KV_STAGE_VTABLES`]/[`PLUGIN_KV_FORMAT_VTABLES`] 슬라이스를 by-value 봉투로 반환한다.
 ///
-/// **3축 분리 심볼 불변(ADR-0009 #118)**: `register_kv_stages_v2` ⊥ `register_kv_formats_v2` 분리 entry +
-/// 분리 슬라이스 — 통합 심볼/통합 registry 아님(작성자 편의로 한 번에 emit 할 뿐). 향후 backend v3 는
-/// `register_backend_caps_v2` 한 줄을 여기 추가.
+/// **3축 분리 심볼 불변(ADR-0009 #118)**: `register_kv_stages_v2` ⊥ `register_kv_formats_v2` ⊥
+/// `register_backend_caps_v2` 분리 entry + 분리 슬라이스 — 통합 심볼/통합 registry 아님(작성자 편의로
+/// 한 번에 emit 할 뿐). backend 축(3번째)은 D8 구현으로 추가됨.
 ///
 /// 기여 0 인 축은 `count==0` 봉투(빈 distributed_slice — ELF `__start==__stop`, 안전).
 ///
@@ -1163,6 +1163,16 @@ macro_rules! export_plugin {
                     abi_version: $crate::KV_FORMAT_ABI_VERSION,
                     count: $crate::PLUGIN_KV_FORMAT_VTABLES.len(),
                     vtables: $crate::PLUGIN_KV_FORMAT_VTABLES.as_ptr(),
+                }
+            }
+
+            /// backend-cap 봉투 entry(3축, D8) — `PLUGIN_BACKEND_CAP_VTABLES` 를 by-value 로 반환(sret).
+            #[unsafe(no_mangle)]
+            pub extern "C" fn register_backend_caps_v2() -> $crate::BackendCapExportAbi {
+                $crate::BackendCapExportAbi {
+                    abi_version: $crate::BACKEND_CAP_ABI_VERSION,
+                    count: $crate::PLUGIN_BACKEND_CAP_VTABLES.len(),
+                    vtables: $crate::PLUGIN_BACKEND_CAP_VTABLES.as_ptr(),
                 }
             }
         };
@@ -1200,6 +1210,256 @@ pub fn find_backend_capability(name: &str) -> Option<&'static BackendCapReg> {
 /// 등록된 모든 capability 이름 (self-test / 진단용).
 pub fn registered_backend_capability_names() -> Vec<&'static str> {
     BACKEND_CAPABILITIES.iter().map(|r| r.name).collect()
+}
+
+// ── Backend capability 축 — ATTENTION(KIVI) 카테고리 동적 C-ABI (design D2/D7/D8, ADR-0010 봉투) ──
+//
+// D8(single-trait): canonical [`KiviAttentionBackend`] 를 technique-api 가 소유한다. 엔진 정적 OpenCL
+// impl · host dlopen 어댑터 · plugin `.so` 가 **모두 이 1벌**을 구현(Stage `KVCacheStage` 동형). 시그니처는
+// `&Tensor` 가 아니라 ABI struct(`KiviAttnArgs`/`KiviGatherArgs`, cl_mem `*mut c_void`)라 plugin 이 엔진
+// 타입을 비참조(독립). 위 정적 `BACKEND_CAPABILITIES`(name 키)는 그대로 — fat-LTO 이름 생존 smoke 용.
+
+/// `register_backend_caps_v2` 봉투([`BackendCapExportAbi`])의 ABI 버전. host mismatch 시 `.so` 거부(ADR-0010 E1).
+pub const BACKEND_CAP_ABI_VERSION: u32 = 1;
+
+/// capability 카테고리 태그 — ATTENTION(KIVI fused dequant+attention). [`BackendCapVTableAbi::category`].
+/// host 카테고리 다리(`match`)가 이 값으로 `vtable` 포인터를 카테고리별 테이블([`KiviAttnVTable`])로 캐스팅(D7).
+pub const BACKEND_CAP_CATEGORY_ATTENTION: u32 = 1;
+
+/// KIVI capability 인스턴스 생성 인자(D4). host 가 빌려준 GPU context/device + build 옵션으로 plugin 이
+/// 커널을 **1회** 빌드해 opaque 핸들을 만든다. bare-C 핸들만(C4) — `ocl` 래퍼 타입 금지.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KiviMakeArgs {
+    /// `cl_context` raw 핸들(host backend 소유, borrow-for-make).
+    pub cl_ctx: *mut c_void,
+    /// `cl_device_id` raw 핸들.
+    pub device: *mut c_void,
+    /// null-종단 OpenCL build 옵션(host `build_cl_opts(device)` 결과 — Adreno 일관성, C7). null 가능.
+    pub build_opts: *const c_char,
+}
+
+/// KIVI fused dequant+attention 호출 인자(D6). 모든 GPU 자원은 **borrow-for-call**(C5 retain 금지).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KiviAttnArgs {
+    /// `cl_command_queue` raw 핸들(host 가 빌려줌).
+    pub cl_queue: *mut c_void,
+    pub q_mem: *mut c_void,
+    pub qk_mem: *mut c_void,
+    pub qv_mem: *mut c_void,
+    pub res_k_mem: *mut c_void,
+    pub res_v_mem: *mut c_void,
+    pub out_mem: *mut c_void,
+    /// CPU score readback 버퍼(optional; null=score 없음). `scores_len` 개 f32.
+    pub scores_out: *mut f32,
+    pub scores_len: usize,
+    pub num_heads_q: usize,
+    pub num_heads_kv: usize,
+    pub head_dim: usize,
+    pub q_tokens: usize,
+    pub res_tokens: usize,
+    pub res_cap: usize,
+    pub scale: f32,
+    pub bits: u8,
+}
+
+/// KIVI residual gather-update 호출 인자(D6). 2-mem(input/residual) + 스칼라 5.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KiviGatherArgs {
+    pub cl_queue: *mut c_void,
+    pub input_mem: *mut c_void,
+    pub residual_mem: *mut c_void,
+    pub kv_heads: usize,
+    pub res_cap: usize,
+    pub head_dim: usize,
+    pub seq_len: usize,
+    pub res_pos: usize,
+}
+
+/// ATTENTION 카테고리 canonical capability trait(D8 single-trait). technique-api 소유 → 엔진 정적 impl ·
+/// host dlopen 어댑터 · plugin `.so` 가 **모두 이 1벌**을 구현. `&Tensor` 대신 ABI struct 를 받아 plugin
+/// 독립(엔진 타입 비참조). 반환 `i32`(C3 panic=abort: 0=OK · 음수=err — vtable fn-ptr 는 panic 금지).
+pub trait KiviAttentionBackend: Send + Sync {
+    /// `bits`(2/4/8) fused KIVI attention 커널 보유 여부.
+    fn has_kivi_attn_kernel(&self, bits: u8) -> bool;
+    /// sub-group 미지원 device(Adreno nosub) 여부 — 커널 변형 선택용.
+    fn is_nosub_device(&self) -> bool;
+    /// fused dequant+attention. cl_mem 은 [`KiviAttnArgs`] 안, borrow-for-call(C5).
+    fn attention_gen_kivi(&self, args: &KiviAttnArgs) -> i32;
+    /// residual ring gather-update(K/V quant 직전).
+    fn kivi_gather_update(&self, args: &KiviGatherArgs) -> i32;
+}
+
+/// 정적(force-link) KIVI ATTENTION capability 등록 항목 — Stage [`KVCacheStageReg`] 의 backend 축 짝(D8).
+/// `make` 는 host 가 GPU context 를 가졌을 때만 호출(`KiviMakeArgs`); fat-LTO 생존 smoke 는 이름만 확인.
+pub struct KiviAttentionReg {
+    /// canonical capability 이름. 슬라이스 내 유일.
+    pub name: &'static str,
+    /// capability 인스턴스 팩토리(host GPU context 로 커널 1회 빌드, D4).
+    pub make: fn(&KiviMakeArgs) -> Box<dyn KiviAttentionBackend>,
+}
+
+/// 전역 KIVI ATTENTION capability 정적 등록 슬라이스(linkme). `register_kivi_attention_plugin!` 가 기여.
+/// 동적 dlopen 경로([`PLUGIN_BACKEND_CAP_VTABLES`])와 분리 — source-agnostic 조회는 host 가 합친다(D3 거울).
+#[distributed_slice]
+pub static KIVI_ATTENTION_REGS: [KiviAttentionReg] = [..];
+
+/// 이름으로 정적 등록된 KIVI ATTENTION capability 를 찾는다.
+pub fn find_kivi_attention(name: &str) -> Option<&'static KiviAttentionReg> {
+    KIVI_ATTENTION_REGS.iter().find(|r| r.name == name)
+}
+
+/// 정적 등록된 모든 KIVI ATTENTION capability 이름(fat-LTO 생존 smoke / 진단용).
+pub fn registered_kivi_attention_names() -> Vec<&'static str> {
+    KIVI_ATTENTION_REGS.iter().map(|r| r.name).collect()
+}
+
+/// ATTENTION 카테고리 C-ABI vtable(D7) — [`BackendCapVTableAbi::vtable`] 가 category==ATTENTION 일 때
+/// 가리키는 테이블. make/drop 도 여기(make 인자가 카테고리별 [`KiviMakeArgs`] 라 공통 헤더에 못 둠).
+#[repr(C)]
+pub struct KiviAttnVTable {
+    /// [`KiviMakeArgs`] → opaque plugin 핸들(커널 1회 빌드, D4). host `make` 시 호출.
+    pub make: unsafe extern "C" fn(*const KiviMakeArgs) -> *mut c_void,
+    /// 핸들 + bits → 커널 보유 bool.
+    pub has_kivi_attn_kernel: unsafe extern "C" fn(*mut c_void, u8) -> bool,
+    /// 핸들 → nosub device bool.
+    pub is_nosub_device: unsafe extern "C" fn(*mut c_void) -> bool,
+    /// 핸들 + [`KiviAttnArgs`] → i32(0=OK · 음수=err). 매 토큰 hot-path.
+    pub attention_gen_kivi: unsafe extern "C" fn(*mut c_void, *const KiviAttnArgs) -> i32,
+    /// 핸들 + [`KiviGatherArgs`] → i32. residual gather-update.
+    pub kivi_gather_update: unsafe extern "C" fn(*mut c_void, *const KiviGatherArgs) -> i32,
+    /// 핸들 해제(host 가 capability drop 시 1회).
+    pub drop: unsafe extern "C" fn(*mut c_void),
+}
+
+// SAFETY: vtable 불변 + fn-ptr 는 본래 Send+Sync. distributed_slice element static 선언에 필요(ADR-0010 E1).
+unsafe impl Sync for KiviAttnVTable {}
+
+/// backend-cap 축 엔트리(D7 태그드 포인터) — 얇은 `{name, category, vtable}`. 실제 함수는 category 별
+/// 테이블([`KiviAttnVTable`] 등)에. host 가 `category` 로 `vtable` 를 캐스팅(category 다리).
+#[repr(C)]
+pub struct BackendCapVTableAbi {
+    /// null-종단 canonical 이름(registry 매칭). plugin `.so` 의 `'static` str.
+    /// (ABI 게이트는 봉투 [`BackendCapExportAbi::abi_version`] 가 담당 — vtable 당 버전 필드 없음.)
+    pub name: *const c_char,
+    /// 카테고리 태그([`BACKEND_CAP_CATEGORY_ATTENTION`] 등). host `match` 키.
+    pub category: u32,
+    /// category 별 `#[repr(C)]` 테이블 포인터(예: `*const KiviAttnVTable`). host 가 `category` 로 캐스팅.
+    pub vtable: *const c_void,
+}
+
+// SAFETY: 불변 + name/vtable 은 `.so` 의 `'static`. distributed_slice element static 에 필요(ADR-0010 E1).
+unsafe impl Sync for BackendCapVTableAbi {}
+
+/// backend-cap 축 봉투(ADR-0010 E1) — 한 `.so` 의 capability vtable 들을 한 번에 신고. `register_backend_caps_v2()`
+/// 가 **by-value** 반환(sret). `vtables` 는 [`PLUGIN_BACKEND_CAP_VTABLES`] base → `.so` 수명 유효, `count==0` 가능.
+#[repr(C)]
+pub struct BackendCapExportAbi {
+    /// [`BACKEND_CAP_ABI_VERSION`]. host mismatch 시 `.so` 거부(.so 당 ABI 1개).
+    pub abi_version: u32,
+    /// `vtables` 연속 배열 길이.
+    pub count: usize,
+    /// `count` 개의 [`BackendCapVTableAbi`] 연속 배열(`.so` static). 로더는 `vtables.add(i)`.
+    pub vtables: *const BackendCapVTableAbi,
+}
+
+/// plugin `.so` 내부에서 backend-cap vtable 들을 누적하는 슬라이스(ADR-0010 E2). **선언은 technique-api 1곳**.
+/// `register_kivi_attention_plugin!` 가 plugin-cdylib 게이트 하에 기여. 정적 빌드에선 빈 채 무해.
+#[distributed_slice]
+pub static PLUGIN_BACKEND_CAP_VTABLES: [BackendCapVTableAbi] = [..];
+
+/// KIVI ATTENTION capability plugin 을 정적(rlib→linkme 이름 생존) · 동적(cdylib→C-ABI vtable) 양쪽에
+/// 등록하는 dual-wiring 매크로(D8). `$make` = `fn(&KiviMakeArgs) -> Box<dyn KiviAttentionBackend>`(closure 가능).
+///
+/// **정적 경로**: `$make` 를 [`KIVI_ATTENTION_REGS`] 슬라이스에 기여(force-link 시 이름 생존 — fat-LTO 생존
+/// smoke 용, `registered_kivi_attention_names()` 가 이름 확인). **동적 경로**(plugin-cdylib): `$make`/trait 메서드를
+/// C thunk 로 래핑해 [`KiviAttnVTable`] + 봉투 엔트리를 [`PLUGIN_BACKEND_CAP_VTABLES`] 에 기여. `.so` 엔트리
+/// (`register_backend_caps_v2`)는 [`export_plugin!`] 가 emit. 한 `.so` 에서 다회 호출 가능(다수 capability).
+#[macro_export]
+macro_rules! register_kivi_attention_plugin {
+    ($name:literal, $make:expr) => {
+        // ── 정적 경로 (rlib → linkme KIVI_ATTENTION_REGS, force-link 시 이름 생존). 비게이트(양 빌드 공통). ──
+        // `$make` 를 live distributed_slice static 에 저장 → 정적 조회 인프라 + feature-OFF 빌드에서도
+        // `$make`/연관 타입이 reachable(Stage `register_kv_stage!` 동형, 미사용 경고 없음).
+        const _: () = {
+            #[$crate::distributed_slice($crate::KIVI_ATTENTION_REGS)]
+            static __REG: $crate::KiviAttentionReg = $crate::KiviAttentionReg {
+                name: $name,
+                make: $make,
+            };
+        };
+
+        // ── 동적 경로 (cdylib → KiviAttnVTable + 봉투 엔트리). plugin-cdylib 게이트로 정적 빌드 시 미emit. ──
+        #[cfg(feature = "plugin-cdylib")]
+        const _: () = {
+            // 핸들 = Box<Box<dyn KiviAttentionBackend>>(thin ptr). 모든 thunk 가 이 표현 공유.
+            type __Handle = ::std::boxed::Box<dyn $crate::KiviAttentionBackend>;
+
+            unsafe extern "C" fn __make(
+                p: *const $crate::KiviMakeArgs,
+            ) -> *mut ::core::ffi::c_void {
+                // SAFETY: host 가 유효한 KiviMakeArgs 포인터 전달(D4). KiviMakeArgs 는 Copy POD.
+                let args: &$crate::KiviMakeArgs = unsafe { &*p };
+                let make_fn: fn(&$crate::KiviMakeArgs) -> __Handle = $make;
+                let be: __Handle = make_fn(args);
+                ::std::boxed::Box::into_raw(::std::boxed::Box::new(be)) as *mut ::core::ffi::c_void
+            }
+
+            unsafe extern "C" fn __has(h: *mut ::core::ffi::c_void, bits: u8) -> bool {
+                // SAFETY: h 는 __make 가 만든 Box<Box<dyn>>.
+                let be: &dyn $crate::KiviAttentionBackend = unsafe { &**(h as *const __Handle) };
+                be.has_kivi_attn_kernel(bits)
+            }
+
+            unsafe extern "C" fn __nosub(h: *mut ::core::ffi::c_void) -> bool {
+                // SAFETY: 위와 동일.
+                let be: &dyn $crate::KiviAttentionBackend = unsafe { &**(h as *const __Handle) };
+                be.is_nosub_device()
+            }
+
+            unsafe extern "C" fn __attn(
+                h: *mut ::core::ffi::c_void,
+                a: *const $crate::KiviAttnArgs,
+            ) -> i32 {
+                // SAFETY: h 는 __make 가 만든 Box<Box<dyn>>, a 는 host 가 채운 유효 KiviAttnArgs(C5).
+                let be: &dyn $crate::KiviAttentionBackend = unsafe { &**(h as *const __Handle) };
+                be.attention_gen_kivi(unsafe { &*a })
+            }
+
+            unsafe extern "C" fn __gather(
+                h: *mut ::core::ffi::c_void,
+                a: *const $crate::KiviGatherArgs,
+            ) -> i32 {
+                // SAFETY: 위와 동일.
+                let be: &dyn $crate::KiviAttentionBackend = unsafe { &**(h as *const __Handle) };
+                be.kivi_gather_update(unsafe { &*a })
+            }
+
+            unsafe extern "C" fn __drop(h: *mut ::core::ffi::c_void) {
+                // SAFETY: h 는 __make 가 만든 Box<Box<dyn>>, host 가 1회만 호출.
+                drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
+            }
+
+            static __VTABLE: $crate::KiviAttnVTable = $crate::KiviAttnVTable {
+                make: __make,
+                has_kivi_attn_kernel: __has,
+                is_nosub_device: __nosub,
+                attention_gen_kivi: __attn,
+                kivi_gather_update: __gather,
+                drop: __drop,
+            };
+
+            // 봉투 엔트리를 PLUGIN_BACKEND_CAP_VTABLES 에 기여(const-block 격리 = 다회 호출 누적). entry 아님.
+            #[$crate::distributed_slice($crate::PLUGIN_BACKEND_CAP_VTABLES)]
+            static __ENTRY: $crate::BackendCapVTableAbi = $crate::BackendCapVTableAbi {
+                name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
+                category: $crate::BACKEND_CAP_CATEGORY_ATTENTION,
+                vtable: &__VTABLE as *const $crate::KiviAttnVTable as *const ::core::ffi::c_void,
+            };
+        };
+    };
 }
 
 #[cfg(test)]
