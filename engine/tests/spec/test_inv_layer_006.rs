@@ -40,8 +40,9 @@ const BANNED: &[&str] = &[
 /// 과도기 허용 필드 식별자 목록.
 ///
 /// 아래 식별자로 시작하는 필드 라인은 BANNED 검사 이전에 필터링된다.
-/// β-3 에서 해당 필드 제거 후 이 allowlist 도 동시에 제거하여 CacheManager 금지를
-/// 복원한다 (INV-LAYER-006 G7, roadmap_beta_decode_loop_rewrite_2026_06_10.md §G7).
+/// **β-4** 에서 해당 필드 제거 후 이 allowlist 도 동시에 제거하여 CacheManager 금지를
+/// 복원한다 (INV-LAYER-006 G7; 원래 β-3 예정 → β-4 이월, 2026-06-10 β-3 census 정정 —
+/// (a.6) offload/recall 이 β-4 plan 소비 교체 전까지 필드 요구. spec/41 INV-LAYER-006 행 참조).
 const ALLOWLISTED_TRANSITIONAL: &[&str] = &["cache_manager"];
 
 fn project_root() -> PathBuf {
