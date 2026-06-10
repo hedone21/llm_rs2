@@ -1067,6 +1067,118 @@ mod tests {
         assert_eq!(result.final_pos, 3);
     }
 
+    // ── β-6 commit A: chat 거동 고정 (수렴 전 핀) ──────────────────────────
+
+    /// β-6 핀 2: stop 토큰에 대해서도 (f2) tick_sink.on_token_generated 와
+    /// (g) observer.on_step_end 가 **발화**한다. v1 run_until_stop 시맨틱 census:
+    /// stop 체크는 (f2)/(g)/bookkeeping **후** 이므로 stop 토큰의 tick·obs 도 1회씩
+    /// 발화하고 pos 만 증가하며 push 만 안 된다. 통합(commit B/C) 후에도 이 카운트가
+    /// 동일해야 한다 (DecodeEnd 구독 + PostSample TickStage 로 보존).
+    #[test]
+    fn run_until_stop_fires_tick_and_obs_on_stop_token() {
+        use crate::session::chat::stop_condition::{ChatStopCondition, StopCondition};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+
+        struct CountTickSink {
+            count: Arc<AtomicUsize>,
+        }
+        impl TokenTickSink for CountTickSink {
+            fn on_token_generated(&mut self, _ctx: &StepCtx) {
+                self.count.fetch_add(1, AtomicOrd::Relaxed);
+            }
+        }
+        struct CountStepEndObserver {
+            count: Arc<AtomicUsize>,
+        }
+        impl DecodeObserver for CountStepEndObserver {
+            fn on_step_end(&mut self, _ctx: &StepCtx, _sampled: u32, _step_ms: f64) {
+                self.count.fetch_add(1, AtomicOrd::Relaxed);
+            }
+        }
+
+        let tick_count = Arc::new(AtomicUsize::new(0));
+        let obs_count = Arc::new(AtomicUsize::new(0));
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .with_tick_sink(CountTickSink {
+                count: tick_count.clone(),
+            })
+            .add_observer(CountStepEndObserver {
+                count: obs_count.clone(),
+            })
+            .build();
+        let _ = loop_.prefill(&[0]).unwrap();
+        // step1→token1(push), step2→token2(push), step3→token3=stop(미push, but tick/obs 발화).
+        let cond = ChatStopCondition::new(vec![3], 2048);
+        let result = loop_
+            .run_until_stop(0, &cond as &dyn StopCondition)
+            .unwrap();
+        assert_eq!(result.tokens_generated, vec![1, 2], "stop 토큰 미push");
+        // 3 step (token1, token2, token3=stop) 모두 tick·obs 발화 — stop 토큰 포함.
+        assert_eq!(
+            tick_count.load(AtomicOrd::Relaxed),
+            3,
+            "stop 토큰에도 tick_sink 발화 (총 3 step)"
+        );
+        assert_eq!(
+            obs_count.load(AtomicOrd::Relaxed),
+            3,
+            "stop 토큰에도 on_step_end 발화 (총 3 step)"
+        );
+    }
+
+    /// β-6 핀 3: stop 체크가 pos-증가-후 타이밍. should_stop 에 전달되는 pos 인자가
+    /// 매 호출에서 **증가된** pos (bookkeeping 후) 임을 recording StopCondition 으로 핀한다.
+    /// v1: prev_token=sampled; pos+=1; decode_step+=1; → should_stop(sampled, self.pos).
+    /// 통합 후 DecodeEnd 구독 stage 도 `ctx.step.pos == 증가된 pos` 를 봐야 한다.
+    #[test]
+    fn run_until_stop_checks_stop_with_post_increment_pos() {
+        use crate::session::chat::stop_condition::StopCondition;
+        use std::sync::Mutex as StdMutex;
+
+        // (sampled, pos) 호출 인자를 전부 기록하고 항상 false 반환 (max_pos 로만 종료).
+        struct RecordStop {
+            log: Arc<StdMutex<Vec<(u32, usize)>>>,
+            max_pos: usize,
+        }
+        impl StopCondition for RecordStop {
+            fn should_stop(&self, sampled: u32, pos: usize) -> bool {
+                self.log.lock().unwrap().push((sampled, pos));
+                pos >= self.max_pos
+            }
+        }
+
+        let log: Arc<StdMutex<Vec<(u32, usize)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(2048)
+            .build();
+        // prefill 1 token → pos=1. 이후 step 마다 pos: 2, 3, ...
+        let _ = loop_.prefill(&[0]).unwrap();
+        let cond = RecordStop {
+            log: log.clone(),
+            max_pos: 4, // pos>=4 에서 종료 → step1(pos=2), step2(pos=3), step3(pos=4=stop).
+        };
+        let _ = loop_
+            .run_until_stop(0, &cond as &dyn StopCondition)
+            .unwrap();
+
+        let calls = log.lock().unwrap().clone();
+        // step1: sampled=1, pos=2 (1→2 증가 후). step2: sampled=2, pos=3. step3: sampled=3, pos=4.
+        assert_eq!(
+            calls,
+            vec![(1, 2), (2, 3), (3, 4)],
+            "should_stop 의 pos 인자 == 증가된 pos (post-increment 타이밍)"
+        );
+    }
+
     /// reset_pos가 pos, decode_step, prev_token을 0으로 초기화한다.
     #[test]
     fn reset_pos_clears_loop_state() {

@@ -958,6 +958,87 @@ mod tests {
         assert!(result.is_ok(), "pos=5, additional=2, max=10 → Ok");
     }
 
+    // ─── β-6 commit A 핀 4: turn-boundary try_evict 직접 호출 보존 ─────────
+
+    /// β-6 핀 4: turn-boundary score-fed try_evict 는 **decode loop 밖 경로**다.
+    /// `ChatSession::ensure_capacity`/`on_turn_end` 가 `decode_loop.forward_mut().try_evict(cm, ...)`
+    /// 를 직접 호출하는 이 경로는 수렴(commit B) 에서 **stage 화하지 않고 보존**한다 — 이 테스트가
+    /// try_evict 직접 호출이 실재함을 핀한다. 통합 후에도 이 호출이 그대로 살아 있어야 한다.
+    #[test]
+    fn turn_boundary_try_evict_called_directly_on_overflow() {
+        use crate::pressure::cache_manager::CacheManager;
+        use crate::pressure::eviction::sliding_window::SlidingWindowPolicy;
+        use crate::resilience::sys_monitor::NoOpMonitor;
+        use crate::session::traits::Forward as ForwardTrait;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // try_evict 호출 횟수를 기록하는 mock Forward. removed=1, new_pos=pos-1 반환.
+        struct EvictCountForward {
+            vocab: usize,
+            evict_calls: Rc<Cell<usize>>,
+        }
+        impl ForwardTrait for EvictCountForward {
+            fn prefill(&mut self, _t: &[u32], _start_pos: usize) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0f32; self.vocab])
+            }
+            fn step(&mut self, _c: &StepCtx, _t: u32) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0f32; self.vocab])
+            }
+            fn try_evict(
+                &mut self,
+                _cm: &CacheManager,
+                _scores: Option<&[f32]>,
+                _force: bool,
+                _target_ratio: f32,
+            ) -> anyhow::Result<(usize, usize)> {
+                self.evict_calls.set(self.evict_calls.get() + 1);
+                // overflow 해소: pos 를 max_seq_len 밑으로 끌어내려 재확인 통과.
+                Ok((5, 4))
+            }
+        }
+
+        let evict_calls = Rc::new(Cell::new(0usize));
+        let fwd = EvictCountForward {
+            vocab: 8,
+            evict_calls: evict_calls.clone(),
+        };
+        let decode_loop = DecodeLoopBuilder::new()
+            .with_forward(fwd)
+            .with_kv_capacity(10)
+            .build();
+
+        // cache_manager=Some → ensure_capacity overflow 시 try_evict 직접 호출 경로 진입.
+        let policy = Box::new(SlidingWindowPolicy::new(4, 2));
+        let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.5);
+        let mut session = ChatSession {
+            decode_loop,
+            kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
+                cache_manager: Some(cm),
+                score_accumulator: None,
+                score_based: false,
+                policy_name: "sliding".to_string(),
+                target_ratio: 0.5,
+                evicted_total: 0,
+            })),
+            pos: 9,
+            max_seq_len: 10,
+        };
+
+        // pos=9, additional=2 → 11 > 10 → overflow → try_evict 직접 호출.
+        session.ensure_capacity(2).unwrap();
+        assert_eq!(
+            evict_calls.get(),
+            1,
+            "turn-boundary try_evict 가 decode loop 밖에서 직접 1회 호출됨"
+        );
+        // try_evict 반환 new_pos=4 로 pos 갱신 → evicted_total 누적.
+        assert_eq!(session.pos(), 4, "try_evict new_pos 로 pos 갱신");
+        if let ChatKvMode::Standard(s) = &session.kv_mode {
+            assert_eq!(s.evicted_total, 5, "removed 누적");
+        }
+    }
+
     // ─── D5/G1: stats_line 포맷 보존 ─────────────────────────────────────
 
     #[test]
