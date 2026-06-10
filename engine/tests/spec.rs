@@ -362,11 +362,6 @@ mod test_chat_session_multi_turn;
 #[path = "spec/test_chat_repl_v2_multi_turn.rs"]
 mod test_chat_repl_v2_multi_turn;
 
-// ── Phase 4-A: session/batch/helpers 단위 테스트 ──
-// JSONL 파싱, prompt resolution. batch runner 본문은 디바이스 G2 게이트 (2-entry baseline diff).
-#[path = "spec/test_batch_helpers.rs"]
-mod test_batch_helpers;
-
 // ── S-subcmd C4: --kv-mode subcommand (KvMode + KvModeArgs + effective_kv_mode) ──
 // KvMode ValueEnum 파싱, KvModeArgs flatten, legacy --kivi/--kv-offload shim.
 #[path = "spec/test_kv_mode_args.rs"]

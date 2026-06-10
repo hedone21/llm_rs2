@@ -8,7 +8,7 @@
 //! a `QcfMetric`. KiviHook collects those metrics from `take_flush_proxies()` after
 //! each prefill and decode step.
 
-use super::hook::{CacheSnapshot, PostStepResult, StepHook};
+use super::hook::{CacheSnapshot, StepHook};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::kivi_cache::KiviCache;
 
@@ -135,11 +135,6 @@ impl KiviHook {
 }
 
 impl StepHook<KiviCache> for KiviHook {
-    fn post_decode_step(&mut self, caches: &mut [KiviCache], _step: usize) -> PostStepResult {
-        self.collect_flush_proxies(caches);
-        PostStepResult::default()
-    }
-
     fn post_prefill(&mut self, caches: &mut [KiviCache]) {
         self.collect_flush_proxies(caches);
     }
@@ -252,13 +247,6 @@ mod tests {
 
     fn make_hook_experimental(sample_layers: Vec<usize>) -> KiviHook {
         KiviHook::new(QcfConfig::default(), true, sample_layers, None)
-    }
-
-    #[test]
-    fn test_post_decode_step_empty_caches() {
-        let mut hook = make_hook();
-        let result = hook.post_decode_step(&mut [], 0);
-        assert!(!result.evicted);
     }
 
     #[test]

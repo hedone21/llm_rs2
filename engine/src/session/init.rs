@@ -138,7 +138,6 @@ impl SessionInitCtx {
             let conflicts: &[(&str, bool)] = &[
                 ("--eval-ll", args.eval_ll),
                 ("--ppl", args.ppl.is_some()),
-                ("--prompt-batch", args.prompt_batch.is_some()),
                 ("--eval-batch", args.eval_batch.is_some()),
                 ("--tensor-partition", args.tensor_partition > 0.0),
                 ("--cuda-graph", args.cuda_graph),

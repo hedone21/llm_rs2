@@ -100,9 +100,6 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
             "argus-bench AB-0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)"
         );
     }
-    if args.prompt_batch.is_some() {
-        bail!("argus-bench AB-0: --prompt-batch not yet supported (planned)");
-    }
     if !matches!(args.effective_kv_mode(), KvMode::Standard) {
         bail!("argus-bench AB-0: --kv-mode KIVI/Offload land in AB-2/AB-3");
     }

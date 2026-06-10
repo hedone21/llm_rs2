@@ -1,5 +1,4 @@
 pub mod assembly;
-pub mod batch;
 pub mod bin_setup;
 pub mod chat;
 pub mod chat_ipc;

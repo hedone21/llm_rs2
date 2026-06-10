@@ -178,7 +178,7 @@ fn dispatch_eval(mode: EvalMode, args: Args) -> anyhow::Result<()> {
 ///
 /// 허용: eviction-policy, qcf-dump, skip-ratio/skip-layers, weight swap 계열,
 /// KIVI kv-mode. 차단(→ `reject_unsupported_modes_eval` 가 안내): profile,
-/// tensor-partition, chat, prompt-batch.
+/// tensor-partition, chat.
 fn eval_supported(args: &Args) -> bool {
     !args.profile
         && !args.profile_events
@@ -186,7 +186,6 @@ fn eval_supported(args: &Args) -> bool {
         && !args.chat
         && args.chat_socket.is_none()
         && args.chat_tcp.is_none()
-        && args.prompt_batch.is_none()
 }
 
 /// eval 표면 밖 모드를 명시 reject 하며 행선지를 안내한다 (argus_cli 가드 미러).
@@ -206,11 +205,6 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
     }
     if args.tensor_partition > 0.0 {
         bail!("argus-eval: --tensor-partition is a decode-only measurement mode, not eval");
-    }
-    if args.prompt_batch.is_some() {
-        bail!(
-            "argus-eval: --prompt-batch (scheduled for deletion in γ-4); use --eval-batch for eval-ll batches"
-        );
     }
     Ok(())
 }
@@ -272,12 +266,6 @@ mod tests {
     #[test]
     fn eval_supported_blocks_chat() {
         let args = make_args(&["--eval-ll", "--chat"]);
-        assert!(!eval_supported(&args));
-    }
-
-    #[test]
-    fn eval_supported_blocks_prompt_batch() {
-        let args = make_args(&["--eval-ll", "--prompt-batch", "/tmp/b.jsonl"]);
         assert!(!eval_supported(&args));
     }
 

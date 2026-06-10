@@ -32,10 +32,6 @@ pub trait CacheSnapshot<C>: Send {
 /// - `EvictionHook` (KVCache): budget-based eviction + CAOTE/attn QCF
 /// - `KiviHook` (KiviCache): flush proxy collection (NMSE + OPR)
 pub trait StepHook<C> {
-    /// Called after each decode step. Performs eviction/flush if needed.
-    /// QCF results are stored on the hook itself (exposed via `extra_question_fields`).
-    fn post_decode_step(&mut self, caches: &mut [C], step: usize) -> PostStepResult;
-
     /// Called after prefill completes. Handles chunked-prefill eviction
     /// residuals or flush proxy collection.
     fn post_prefill(&mut self, caches: &mut [C]);

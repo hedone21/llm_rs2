@@ -4,7 +4,7 @@
 //! Supports both H2O (score-based) and Sliding (position-based) eviction policies,
 //! and collects QCF/CAOTE metrics at each eviction event.
 
-use super::hook::{CacheSnapshot, PostStepResult, StepHook};
+use super::hook::{CacheSnapshot, StepHook};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::{KVCache, max_cache_pos};
@@ -215,62 +215,6 @@ impl EvictionHook {
 }
 
 impl StepHook<KVCache> for EvictionHook {
-    fn post_decode_step(&mut self, caches: &mut [KVCache], _step: usize) -> PostStepResult {
-        // effective_budget == 0 means "no budget" (full-prefill mode).
-        // Guard against the budget=0 degenerate case: without this check,
-        // ratio = 0/before_len = 0 would request full eviction every step,
-        // which on some OpenCL drivers (NVIDIA) destabilises subsequent reads
-        // via the shrink_to_fit reallocation path.
-        if caches.is_empty()
-            || self.effective_budget == 0
-            || max_cache_pos(caches) <= self.effective_budget
-        {
-            return PostStepResult::default();
-        }
-
-        let before_len = max_cache_pos(caches);
-        let ratio = self.effective_budget as f32 / before_len as f32;
-
-        // Perform eviction (QCF collection removed — eval-ll uses single post_prefill event)
-        let result = if self.score_based_eviction {
-            let active = self
-                .score_accumulator
-                .as_ref()
-                .is_some_and(|acc| acc.is_active());
-
-            if active {
-                let scores = self
-                    .score_accumulator
-                    .as_ref()
-                    .unwrap()
-                    .importance_scores()
-                    .to_vec();
-                self.cache_manager
-                    .force_evict_with_scores(caches, ratio, &scores)
-            } else {
-                self.cache_manager.force_evict(caches, ratio)
-            }
-        } else {
-            self.cache_manager.force_evict(caches, ratio)
-        };
-
-        match result {
-            Ok(evict_result) if evict_result.evicted => {
-                self.eviction_count += 1;
-                self.evicted_total += evict_result.tokens_removed;
-                if let Some(acc) = self.score_accumulator.as_mut() {
-                    acc.reset();
-                }
-                PostStepResult {
-                    evicted: true,
-                    tokens_affected: evict_result.tokens_removed,
-                    new_start_pos: Some(evict_result.new_pos),
-                }
-            }
-            _ => PostStepResult::default(),
-        }
-    }
-
     fn post_prefill(&mut self, caches: &mut [KVCache]) {
         // After full batch prefill, evict if cache exceeds budget.
         // This replaces the old chunked-prefill approach that decoded overflow
@@ -776,20 +720,6 @@ mod tests {
         let fields = hook.extra_config_fields();
         assert_eq!(fields["is_d2o"], true);
         assert_eq!(fields["score_based_eviction"], true);
-    }
-
-    #[test]
-    fn test_post_decode_step_no_eviction_under_budget() {
-        // post_decode_step should return default (no eviction) when under budget.
-        // We use a hook with an impossibly large budget.
-        let hook = make_hook(usize::MAX, false);
-        let result = {
-            let mut h = hook;
-            h.post_decode_step(&mut [], 0)
-        };
-        assert!(!result.evicted);
-        assert_eq!(result.tokens_affected, 0);
-        assert!(result.new_start_pos.is_none());
     }
 
     #[test]

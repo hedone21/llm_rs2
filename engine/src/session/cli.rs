@@ -716,20 +716,6 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub dump_importance: bool,
 
-    /// Path to JSONL file for multi-prompt batch generation.
-    /// Each line: {"id":"...", "prompt":"..."} or {"id":"...", "prompt_file":"path"}
-    /// Mutually exclusive with --prompt, --prompt-file, --eval-batch.
-    #[arg(long)]
-    pub prompt_batch: Option<String>,
-
-    /// Loop prompt-batch: restart from beginning when all entries are processed.
-    #[arg(long, default_value_t = false)]
-    pub prompt_batch_loop: bool,
-
-    /// Maximum iterations for prompt-batch loop (0 = unlimited).
-    #[arg(long, default_value_t = 0)]
-    pub max_iterations: usize,
-
     /// Start an interactive multi-turn chat REPL (Llama 3.2 Instruct / Qwen2).
     /// Uses standard (non-KIVI, non-offload) forward path.
     #[arg(long, default_value_t = false)]
