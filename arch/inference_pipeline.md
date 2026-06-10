@@ -29,6 +29,8 @@
 
 ## 컴포넌트 — `session/` 디렉토리 (Post Phase 4-2/4-3/4-4-2.3, 2026-05-25 실측)
 
+> **⚠️ 역사 스냅샷 (2026-05-25 실측) — 부분 stale.** 본 다이어그램 작성 이후: (1) `legacy/generate.rs` 폐기(`d5ed71d2`, 2026-06-05), (2) **`batch/` 모듈 삭제(γ-4, `2e53cf44`, 2026-06-11)**, (3) `argus_eval` bin 신설(γ-3, §13). batch 노드와 legacy 노드는 더 이상 코드에 존재하지 않는다 — 아래 노드 라벨에 ~~취소선~~ 으로 표기. 현 진입점 트리는 §13 + ARCHITECTURE.md §Engine Architecture 가 권위.
+
 ```mermaid
 flowchart TB
     subgraph Bin ["L5 bin/"]
@@ -50,7 +52,7 @@ flowchart TB
         chatipc[chat_ipc]
         chattmp[chat_template]
         eval[eval/<br/>hook + runner + eviction/kivi]
-        batch[batch/<br/>args + runner + helpers]
+        batch["batch/ (삭제됨 γ-4)<br/>args + runner + helpers"]
         ppl[ppl/<br/>args + runner]
         decfb[decode_fallback/<br/>prologue + eviction_trigger + swap_dispatch]
         cli[cli/<br/>Args + KvMode + eviction]
@@ -104,13 +106,17 @@ flowchart TB
 
 Phase 4-4-2.4 취소 결정의 결과로 새 진입점 `engine/src/bin/argus_cli.rs` 가 도입되었다. 진행 sub-sprint:
 - **v1-1 RESOLVED** (HEAD `83d7cb4a`): resilience default-on (`--no-resilience` opt-out).
-- **v1-2 pending**: `--prompt-batch` (`session::batch`).
+- **v1-2 ~~pending~~ → 폐기** (γ-4, `2e53cf44`): `--prompt-batch` (`session::batch`) 모듈이 orphan 으로 순수 삭제됨. argus-cli 흡수 대상에서 제외 (흡수가 아니라 기능 폐기).
 - **v1-3 pending**: weight swap 8종 (`session::decode_fallback::swap_dispatch`).
 - **v1-4 pending**: `--profile` / `--profile-events`.
 - **v1-5 pending**: KIVI / Offload `--kv-mode`.
 - **v1-6 pending**: `--tensor-partition > 0`.
 
 argus-cli 는 현재 happy path (= `is_standard_happy_path(&args)`) 만 흡수하고 나머지를 `reject_unsupported_modes_v0()` 에서 명시적 차단. legacy generate 와 argus-cli 의 진입점 이분화는 ARCHITECTURE.md §Engine Architecture 참조.
+
+### argus-eval 신규 진입점 (Phase γ-3, 2026-06-11)
+
+`bin/generate.rs` 폐기(`d5ed71d2`, 2026-06-05)로 eval/ppl/dump/experiment 진입 함수들(`run_eval_ll`, `run_ppl_dispatch`, `run_kivi_ppl`, `run_dump_importance`, `dump_qcf_swap_json`, `ExperimentSchedule`)이 외부 호출처 0 (orphan) 상태가 되었다. γ-3 은 이 eval 패밀리를 신규 bin `engine/src/bin/argus_eval.rs` 로 정착시킨다 ("eval 기능은 살리고 죽은 포장지만 지운다"). 상세 설계는 **§13 argus-eval bin 설계** 참조.
 
 ## 두 진입점의 inference 시퀀스 (실측 코드 반영)
 
@@ -688,7 +694,7 @@ v1 sub-sprint 별 추가될 slot. 각 v1 작업은 builder 한 site 에 한두 `
 
 | sub-sprint | 추가 slot | 후보 구현체 위치 |
 |------------|-----------|------------------|
-| v1-2 prompt-batch | (sampling 변형은 builder 외) | `session/batch/runner.rs` 가 build_*_loop 호출자만 분기 |
+| ~~v1-2 prompt-batch~~ **폐기 (γ-4)** | — | `session/batch/` 모듈 순수 삭제 (`2e53cf44`) — 확장 슬롯 아님 |
 | v1-3 weight swap | `.with_swap(SyncSwapStage / AsyncSwapStage / PhaseAwareSwapStage / ...)` | `session/decode_fallback/swap_dispatch.rs` + `session/swap/*` (TBD) |
 | v1-4 profile | `.add_observer(ProfilerObs::maybe(args)?)` | `session/observer/profiler_obs.rs` (신규) |
 | v1-5 KIVI / Offload | `with_forward(KiviForward / OffloadForward)` 대신 분기 | `session/forward/{kivi_forward, offload_forward}.rs` (스텁 존재) |
@@ -1055,3 +1061,217 @@ monomorphize 안:
 - **ARCHITECTURE.md §13.4**: `session/` 디렉토리 트리에 6 trait + 구현체 정확히 반영 (본 commit).
 - **spec/41-invariants.md INV-LAYER-006**: 문구 정확화 — "L4 session::DecodeLoop은 concrete backend/manager/profiler를 직접 참조 금지" (본 commit).
 - **Implementer 위임 prompt (Phase 4-1)**: 본 finalize 후에도 그대로 유효하다 — Phase 4-1은 `session/init.rs` 외곽 추출 단계로, 6 trait 위치 결정의 영향을 받지 않는다. Phase 4-2부터 본 결정이 반영된다.
+
+---
+
+## 13. argus-eval bin 설계 (Phase γ-3, 2026-06-11)
+
+> **✅ 구현 완료 (2026-06-11)** — 본 §13 은 설계 단계를 거쳐 구현 완료됐다. 커밋 3건:
+> - **`33d5bc8f` (γ-3a)**: `engine/src/bin/argus_eval.rs` 신설 — ll/ppl/dump-importance/qcf-dump(modifier) 재배선 + KIVI eval/ppl 포함 + `session/eval_setup.rs` 조립층. flag-based dispatch (§13.1).
+> - **`11c8721f` (γ-3b)**: `ScheduleCommandSource` + experiment dispatch (§13.4). β-4 `CommandSource` seam 활용, legacy mpsc 부활 없음.
+> - **`2e53cf44` (γ-4)**: batch 모듈 ~1170 LOC 순수 삭제 + `StepHook::post_decode_step` 축소 (§13.8).
+>
+> 설계와 구현의 갭 1건은 §13.5 [정정] 참조 (`build_resilience_cache_manager` 재사용 → legacy 인라인 직접 재현).
+
+### 13.0 배경 / 범위
+
+`d5ed71d2` (2026-06-05, 5-F F1 비가역) 로 `engine/legacy/generate.rs` (5,098 LOC) 가 폐기되며, eval 패밀리 진입 함수가 전원 orphan 화되었다. 본 함수들은 master 에 그대로 생존하나 호출처가 0 이다:
+
+| 함수 / 타입 | 위치 | 표면 |
+|---|---|---|
+| `run_eval_ll(EvalLlRunCtx)` | `session/eval/runner.rs:16` | `ll` (Standard) |
+| `run_eval_ll_generic<C: EvalCacheKind>` | `session/eval/eval_loop.rs:45` | `ll` (KIVI inner) |
+| `run_ppl_dispatch(PplRunCtx)` | `session/ppl/runner.rs:35` | `ppl` (Standard) |
+| `run_kivi_ppl(...)` | `session/ppl/runner.rs:240` | `ppl` (KIVI) |
+| `run_dump_importance(DumpImportanceCtx)` | `session/dump_importance.rs:34` | `dump importance` |
+| `dump_qcf_swap_json(path, ctx)` | `session/eval/qcf_helpers.rs` | `dump qcf` (modifier) |
+| `ExperimentSchedule::{load, directives_at}` | `experiment.rs:8` | `experiment` |
+
+γ-3 은 이 7 진입을 신규 bin `engine/src/bin/argus_eval.rs` (cargo auto-discovery, `[[bin]]` 등록 불요) 로 정착시킨다. 사용자 확정 방향: **eval 기능은 살리고 죽은 포장지(γ-4 batch)만 지운다**.
+
+**표면 = 5종** (argus_cli reject 메시지가 약속한 것):
+- `ll` — `--eval-ll` / `--eval-batch` / `--eval-continuation`
+- `ppl` — `--ppl` + `ppl_*` 패밀리
+- `dump importance` — `--dump-importance`
+- `dump qcf` — `--qcf-dump` (modifier 성격 — §13.3 결정)
+- `experiment` — `--experiment-schedule` (§13.4 ScheduleCommandSource)
+
+`dump weight` (legacy handoff 의 3번째 dump 갈래) 는 **범위 제외** — 약속 표면 아님. `--dump-q4-after-load` / `--dump-q4-after-swap` (cli.rs:697/703, ppl/runner.rs:69/119 전용) 은 ppl modifier 현상 유지 + 문서화만.
+
+### 13.1 CLI 구조 결정 — flag-based dispatch 채택
+
+**결정: flag-based dispatch** (기존 `session::cli::Args` clap 구조체 그대로 + bin 이 mode 상호배제 검증 후 dispatch). clap subcommand 불채택.
+
+근거:
+- **단순함 우선 (CLAUDE.md §2)**: Args 의 `#[command(subcommand)] eviction: Option<TopLevelCmd>` (cli.rs:1174) 슬롯이 이미 점유되어 있다. clap 은 struct 당 subcommand 1개만 허용하므로, eval 서브커맨드(ll/ppl/dump/experiment)를 도입하면 eviction subcommand 와 충돌한다. 해결하려면 Args 분해(공유 구조체 깨짐) 또는 eviction 을 flag 로 강등(타 bin 회귀) 이 필요 — 둘 다 비용이 크다.
+- **호환성**: `experiments/*.sh` 15+ 스크립트가 `--eval-ll` / `--ppl` / `--experiment-schedule` 를 **flag 로** 넘긴다. flag-based 면 대상 바이너리만 `generate` → `argus_eval` 로 바꾸면 즉시 호환. subcommand 면 모든 호출선을 `argus_eval ll --...` 로 재작성해야 한다.
+- **선례 정합**: argus_cli/argus_bench 가 이미 동일 Args + bin-local reject 가드 + dispatch 패턴(복붙은 가드뿐)을 쓴다. argus_eval 은 이 패턴의 3번째 인스턴스가 된다.
+
+v0 handoff 의 "서브커맨드 4종" 문구는 **stale** 로 정정한다 — eviction subcommand 슬롯 충돌이 그 시점에 미발견이었다. 거부 메시지의 `dump importance` / `dump qcf` 2단 표기는 사용자 대면 *명령 의미* 표기일 뿐, 내부 dispatch 는 flag(`--dump-importance` / `--qcf-dump`) 로 라우팅한다.
+
+#### main 골격 (argus_cli/argus_bench 5단계와 동일)
+
+```
+fn main() -> anyhow::Result<()> {
+    env_logger::init();
+    let mut args = Args::parse();
+    args.normalize_swap_shorthand();
+    // ★ argus_cli/bench 와 달리 인버전 라인 생략 → enable_resilience 기본 false (handoff default-off)
+    reject_unsupported_modes_eval(&args)?;          // bin-local 가드 (§13.2)
+    if !eval_supported(&args) { bail!(...) }         // bin-local 허용목록 가드 (§13.2)
+    let mode = classify_eval_mode(&args)?;           // bin-local mode 상호배제 + 우선순위
+    let ctx = build_eval_ctx(args)?;                 // session 라이브러리 (§13.5)
+    dispatch_eval(mode, ctx)                          // run_eval_ll / run_ppl_dispatch / ...
+}
+```
+
+mode 우선순위는 legacy main 분기 순서를 보존: KIVI-eval → KIVI-ppl → dump_importance → eval_ll → ppl → experiment.
+
+### 13.2 가드 설계 — `eval_supported()` + `reject_unsupported_modes_eval()`
+
+`is_standard_happy_path(&args)` 는 **재사용 불가**다 (정면 충돌 확인): 이 가드는 `qcf_dump=none && skip_ratio=0 && eviction_policy=="none" && ...` 를 요구하는데, eval/ppl 의 핵심 사용례(`--eviction-policy h2o`, `--qcf-dump`, `--skip-ratio`)와 정반대다. argus_bench 가 동일 이유로 `bench_supported`(argus_bench.rs:60) 변형을 만든 선례를 따른다.
+
+bin-local `eval_supported()` 허용/차단 정책:
+
+| 차원 | eval 정책 | 근거 |
+|---|---|---|
+| eviction_policy | **허용** (none/sliding/streaming/h2o/h2o_plus/d2o) | eval-ll/ppl 핵심 비교 축 |
+| qcf_dump | **허용** | `dump qcf` 표면 본체 |
+| skip_ratio / skip_layers | **허용** | SWIFT layer-skip eval |
+| weight swap (swap_algorithm 등) | **허용** | PPL/LL swap quality eval (handoff U5 ablation) |
+| KIVI (`--kv-mode kivi`) | **허용** (§13.6 단계 결정) | KIVI eval/ppl |
+| profile / profile_events | **차단** | sync 오버헤드로 eval 측정 오염 |
+| tensor_partition | **차단** | decode-only 측정 모드, eval 무관 |
+| chat / chat_socket / chat_tcp | **차단** → argus-chat | mode 충돌 |
+| prompt_batch | **차단** (γ-4 삭제 대상) | eval 표면 아님 |
+
+`reject_unsupported_modes_eval()` 은 chat / profile / partition / prompt_batch 를 명시 reject (argus_cli 가드의 미러). `eval_supported()` 가 통과시키는 eviction/qcf/skip/swap 은 reject 하지 않는다.
+
+### 13.3 dump qcf — modifier 유지 (별도 mode 아님)
+
+census 확정: `--qcf-dump` 는 독립 모드가 아니라 ppl/ll/generation 3 경로의 **cross-mode modifier** 다. 호출처 2곳(ppl/runner.rs:174 epilogue, eval/runner.rs:283 epilogue)이 각 runner 에 내장되어 있고, `run_eval_ll` / `run_ppl_dispatch` 가 이미 prelude(`run_qcf_warmup_workflow`)+epilogue(`dump_qcf_swap_json`)를 자체 보유한다.
+
+**결정**: `dump qcf` 를 별도 dispatch mode 로 만들지 않는다. `--qcf-dump <path>` 는 `ll` 또는 `ppl` 에 결합하는 flag 로 유지한다 (legacy 와 동일). argus_cli/argus_bench 거부 메시지 문구는 "moved to argus-eval dump qcf" → "moved to argus-eval (`--qcf-dump` with `--eval-ll` or `--ppl`)" 로 정합 갱신한다.
+
+### 13.4 experiment — ScheduleCommandSource (β-4 seam 활용, legacy mpsc 부활 아님)
+
+**핵심 발견 (검증 완료)**: `EngineDirective` = `{ seq_id: u64, commands: Vec<EngineCommand> }` (shared/lib.rs:293). `ExperimentSchedule::DirectiveEntry` = `{ at_token: usize, directive: EngineDirective }` (experiment.rs:16). `CommandSource::poll(&mut self) -> Result<Vec<EngineCommand>>` (command_dispatcher.rs:46).
+
+따라서 정적 schedule 을 token-pos 기반 EngineCommand 로 emit 하는 어댑터는 **변환 로직 0** 으로 구현된다:
+
+```rust
+// session/experiment/schedule_source.rs (신규)
+pub struct ScheduleCommandSource {
+    schedule: ExperimentSchedule,
+    cur_token: usize,        // 매 poll 후 +1
+}
+impl CommandSource for ScheduleCommandSource {
+    fn poll(&mut self) -> anyhow::Result<Vec<EngineCommand>> {
+        let cmds = self.schedule
+            .directives_at(self.cur_token)
+            .flat_map(|e| e.directive.commands.iter().cloned())
+            .collect();
+        self.cur_token += 1;
+        Ok(cmds)
+    }
+}
+```
+
+```mermaid
+flowchart LR
+    SCHED["ExperimentSchedule<br/>(JSON load)"] --> SCS["ScheduleCommandSource<br/>impl CommandSource"]
+    SCS -->|"poll() → Vec&lt;EngineCommand&gt;"| BLDR["DecodeLoopBuilder<br/>.with_cmd_source(scs)<br/>.with_command_dispatcher(d)"]
+    BLDR --> DL["DecodeLoop::run"]
+    DL -->|"CommandDispatcher.dispatch"| STAGE["OneShot EvictionStage<br/>+ LoopControl (throttle/tbt/suspend)"]
+```
+
+**주입 지점**: `DecodeLoopBuilder::with_cmd_source<T: CommandSource>(c)` (decode_loop.rs:556) + `with_command_dispatcher` (decode_loop.rs:576). 현재 `build_bench_loop` (build_bench_loop.rs:284) 은 `resilience.is_some()` 일 때 `with_resilience(adapter)` 로 cmd_source 를 채우는데, ScheduleCommandSource 는 동일 자리에 `with_cmd_source(scs)` 로 꽂힌다. dispatcher 구성 조건(build_bench_loop.rs:245 `resilience.is_some() || shared_cm.is_some()`)에 `schedule.is_some()` 을 OR 추가하면 evict directive 가 OneShot EvictionStage 로 submit 된다.
+
+**legacy mpsc 부활 금지**: legacy 는 `ExperimentSchedule` → mpsc channel → `CommandExecutor::with_gpu_meter(rx, ...)` → `executor.poll(&kv_snap)` 의 v1 채널을 썼다. 이 경로(`CommandExecutor::poll`/`ExecutionPlan`)는 β-4 에서 production 이 `drain_commands` pure poll 로 대체한 deprecated seam 이다. ScheduleCommandSource 는 mpsc/executor 없이 schedule 을 직접 token-pos 매핑하므로, 2차 orphan(`CommandExecutor::poll` 등) 을 다시 살리지 않는다.
+
+**argus_cli vs argus_bench reject 상충 해소**: argus_cli 는 "moved to argus-eval experiment", argus_bench AB-0 는 "use mock_manager IPC". 두 메시지는 *충돌 아님* — AB-0 거부는 **bench bin 의 표면 한정** 정책(bench 는 IPC resilience 만 측정)이고, argus-eval 은 별 bin 이라 static schedule replay 를 자체 표면으로 가진다. argus_bench reject 메시지는 현상 유지(bench 가 schedule 을 받지 않는다는 사실 그대로), argus_cli 메시지만 "(planned)" → 실안내로 갱신.
+
+### 13.5 Ctx 조립층 — `session/eval_setup.rs` 신설
+
+**결정: bin_setup 확장이 아니라 신규 `session/eval_setup.rs`** 를 만든다.
+
+근거: `build_inference_ctx` (StandardHappyCtx) 는 happy-path 전용(`is_standard_happy_path` 전제)이고, EvalLlRunCtx(23필드)/PplRunCtx 는 eviction/swap/score 상태를 요구한다. bin_setup 에 분기를 넣으면 두 책임이 섞인다(SRP 위반). 별 파일이 깨끗하다.
+
+**critic 정정 반영 — 실제 assembly 갭은 5종** (StandardHappyCtx 가 이미 가진 것은 재사용):
+- `cpu_backend_arc` / `gpu_backend_arc`: **갭 아님** — `StandardHappyCtx.hardware` (standard_happy.rs:24) + `Hardware::resolve(DeviceTarget::Cpu/Gpu)` (hardware.rs:79) 로 파생. legacy 도 동일.
+- `backend` / `memory` / `model` / `tokenizer` / `prompt(tokens)` / `vocab_size` / `max_seq_len` / `hidden_size` / `num_layers`: StandardHappyCtx 또는 model.config 에서 직접.
+- `swap_algorithm` / `importance_formula` / `importance_compare` / `swap_only_layers`: `SessionInitCtx` (init.rs:52-58) 가 이미 노출 — 단 `build_inference_ctx` 가 destructure 에서 drop 중. eval_setup 은 `SessionInitCtx::build` 를 **직접 호출**해 이 값들을 보존한다 (bin_setup 우회).
+
+**진짜 갭 5종** (legacy main 이 인라인 계산했고 현재 재현 필요):
+
+| 필드 | 재사용 자산 | 비고 |
+|---|---|---|
+| `cache_manager` | ~~`assembly::build_resilience_cache_manager(args, backend)` (build_bench_loop.rs:48)~~ → **[정정] legacy 인라인 직접 재현** | ★ **[정정 2026-06-11]** 설계는 `build_resilience_cache_manager` 재사용(`protected_prefix` override 주입)을 가정했으나, 실제 함수 시그니처가 **`Option<…>` 반환 + override 인자 부재**라 prefix override 주입 지점이 없었다(갭). Implementer 가 **legacy eval 의 인라인 cache_manager 조립을 직접 재현**(동작 등가 — protected_prefix 기본값을 eval 정책="prompt 전체 보호"로 직접 설정). 향후 `build_resilience_cache_manager` 에 prefix 인자를 추가해 공유 자산화하는 리팩토링은 별 backlog. |
+| `score_accumulator` | `chat/session.rs:707` 의 `AttentionScoreAccumulator::new_gqa` 조립 코드가 선례 | 생성 조건: score_based \|\| caote \|\| enable_resilience \|\| eviction!=none. GQA 변형 + set_active(true) + (OpenCL 시) init_gpu_score_acc |
+| `skip_config` | `SkipConfig::uniform_init` (~~batch/runner.rs:556 선례~~ — **batch 삭제(γ-4) 후 선례 소멸; `SkipConfig::uniform_init` 자체는 잔존**, eval_setup 이 직접 호출) | skip_layers/skip_ratio → SWIFT validate |
+| `actual_protected_prefix` | `args.protected_prefix()` accessor | unwrap_or(h2o/h2o_plus/d2o→4, streaming→sink_size, **else→prompt 전체길이**) |
+| `caps` | `SessionInitCtx.caps` (init.rs:49) | KIVI 경로 thread-through 필수 (§13.6) — eval_setup 이 SessionInitCtx 직접 소비하므로 drop 안 함 |
+
+**KV capacity = max_seq_len 선할당**: legacy(:408)는 eval/ppl 모드에서 grow() 스파이크(Adreno ~370ms) 회피로 전량 선할당. **신규 분기 불필요** — `alloc_standard_kv_caches` 의 `initial_kv_capacity` 인자에 `max_seq_len` 을 직접 주입하면 fork 없이 복원(bin_setup.rs:87 의 `--initial-kv-capacity` 레버와 동일 메커니즘). eval_setup 은 capacity=max_seq_len 을 강제한다.
+
+**resilience default-off**: main 의 인버전 라인(`args.enable_resilience = !args.no_resilience`) 을 **생략**하면 `enable_resilience` 가 기본 false → `--enable-resilience` opt-in 만 동작(handoff 합의, 추가 코드 0). EvalLlRunCtx/PplRunCtx 는 `ResilienceAdapter` 슬롯이 없으므로, opt-in 시 `enable_resilience` 는 **score_accumulator 생성 조건에만** 관여한다(IPC heartbeat 는 eval ctx 에 행선이 없음). 즉 "eval 에서 --enable-resilience = score accumulator 강제 활성" 으로 의미를 좁혀 정의한다. IPC adapter 가 필요하면 후속 backlog.
+
+#### eval_setup 인터페이스
+
+```
+pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx>     // pre: eval_supported(&args)
+pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx>             // pre: args.ppl.is_some()
+pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx>  // 8필드, 최소
+```
+
+post: 반환 ctx 는 KV capacity == max_seq_len, cache_manager 의 protected_prefix == (eval 정책), caps 보존(KIVI 라우팅 가능).
+
+### 13.6 KIVI eval/ppl 분기 — γ-3a 에 포함
+
+**결정: KIVI eval/ppl 을 γ-3a 에 포함**한다 (후속 분리 아님).
+
+근거:
+- KIVI 미포함 시 argus_eval 의 `--kv-mode kivi` 가 silent-broken (Standard 경로로 잘못 흐름) — "eval 기능을 살린다" 와 모순.
+- caps thread-through 는 어차피 §13.5 에서 eval_setup 이 SessionInitCtx 직접 소비로 해결되므로, KIVI 추가 비용이 낮다.
+- **critic 정정**: "`caps.get::<dyn KiviAttentionBackend>()` 첫 live 소비자" 주장은 부정확 — chat 경로(`session/chat/session.rs:412` `ChatKiviArgs.kivi`, `build_chat_kivi`)가 이미 caps→KIVI thread-through 선례를 가진다. eval_setup 은 이 패턴을 미러한다.
+
+KIVI 배선(legacy :274-369 재현): `caps.get::<dyn KiviAttentionBackend>()` 를 closure 밖 1회 pull → per-layer `KiviCache::new_gpu` → `LLMRS_KIVI_AWQE` env → `KiviHook::new` → `run_eval_ll_generic(...)` 직접 호출(EvalLlRunCtx 미경유, config JSON 별도 "kivi" 스키마). ppl 은 `run_kivi_ppl(...)` free fn early-return.
+
+### 13.7 단계화
+
+| 단계 | 산출물 | 신규 메커니즘 | 게이트 |
+|---|---|---|---|
+| **γ-3a** | argus_eval.rs + eval_setup.rs (ll/ppl/dump-importance/qcf-dump 재배선, KIVI 포함) | 0 (전부 재배선) | 컴파일+test GREEN, ll/ppl smoke |
+| **γ-3b** | ScheduleCommandSource + experiment dispatch | ScheduleCommandSource 1개 | 컴파일+test GREEN, experiment smoke |
+| **γ-4** | batch 모듈 삭제 (§13.8) | — (삭제) | 컴파일+test GREEN |
+
+각 단계 종료 시 컴파일+테스트 GREEN 필수.
+
+### 13.8 γ-4 batch 삭제 범위 (보수적)
+
+**삭제 대상** (orphan 확정, 호출처 0):
+- `session/batch/{batch.rs, args.rs, helpers.rs, runner.rs}` (~1083 LOC)
+- `session.rs:2` `pub mod batch;`
+- `engine/tests/spec.rs:367-368` `mod test_batch_helpers;`
+- `engine/tests/spec/test_batch_helpers.rs` (파일 삭제, 6 tests)
+- `--prompt-batch` / `--prompt-batch-loop` flag (cli.rs:723/727) + reject 3곳(argus_cli.rs:76, argus_bench.rs:101, init.rs:138-147 chat-conflict 목록)
+- `StepHook::post_decode_step` 축소 (eval_loop 미사용, batch/runner.rs:837 유일 production 호출자 소멸) + **in-module test 2곳**(eviction_hook.rs:782, kivi_hook.rs:258 — critic 보충)
+
+**삭제 금지** (2차 orphan — 후속 census 항목으로만 기재):
+- `CommandExecutor::poll` / `apply_command` / `ExecutionPlan` / `EvictPlan` / `StreamingParams` / `set_prefill_state` / `LoopControl.prefill_*` 3필드
+- 사유: (1) γ-3b experiment 가 ScheduleCommandSource 로 가되 향후 소비 가능성, (2) executor.rs 내부 test 다수가 poll 사용(동반 삭제 시 테스트 재작성 — γ-4 보수 범위 초과), (3) `SetPrefillPolicy` IPC variant + heartbeat 잔류.
+
+**삭제 금지 — eval 공유 인프라** (의존 방향 batch→eval 단방향):
+- `eval/fmt_bridge.rs` (EvalCacheKind), `eval/qcf_helpers.rs` (dump_qcf_swap_json), `EvictionHook` — ppl/warmup/dump_importance 가 공유.
+
+### 13.9 추가 orphan / 제약 (backlog 등록만)
+
+- **`session/warmup.rs::run_warmup`** (warmup.rs:29): 호출처 0 (critic 신규 발견). legacy DVFS ramp-up warmup. eval 의존(EvalCacheKind)이라 eval 삭제 시 깨지나, **본 γ-3 은 eval 을 살리므로 warmup 도 잔존**. 거처는 argus-eval 이 아니라 standard/bench 경로 — γ-4 범위 밖, backlog 등록만(삭제·이주 금지).
+- **AUF tokenizer 제약**: `resolve_tokenizer_path` (bin_setup.rs:203) 는 AUF 분기 없음 → AUF 단일파일은 `--tokenizer-path` **명시 필수**. AufTokenizer→HF 브리지 부재. eval_setup 헤더 doc + USAGE 에 명시. AufTokenizer 브리지는 후속 backlog.
+
+### 13.10 Spec / Arch 동기화
+
+- **신규 spec ID 불요**: CLI 표면은 spec ID 가 없는 선례(argus_cli 에 ENG-CLI ID 없음). 신규 INV/ENG 불필요.
+- **INV-LAYER-005 lint vacuous (critic 리스크)**: `layer_lint.py:262` 가 `basename=="generate.rs"` 하드코딩 → generate.rs 폐기 후 어떤 bin 에도 비발화. argus_eval.rs 가 session/ 밖을 import 해도 test RED 안 됨. **권고**: spec triage 에서 layer_lint.py L5 규칙을 `argus_*` bin 으로 확장(코드 수정은 Senior Impl/Impl). spec/41 INV-LAYER-005 검증 컬럼은 "generate.rs 한정" → "argus_* production bin" 으로 확장 권고. (본 문서 권고만 — .py 수정은 Architect 범위 밖)
+- **tests/spec/ 신규 테스트**: argus_eval smoke(ll/ppl 1문항), ScheduleCommandSource unit(poll token-pos 매핑) — Implementer 작성 대상.
+- **arch stale 정오** (γ-3/γ-4 완료, **✅ 처리됨 2026-06-11**): `beta4_command_channel_mapping.md:42/75/79`(batch 참조 + SetPrefillPolicy 소비자 0 — ✅), `inference_pipeline.md:107`(prompt-batch pending → ✅ batch 삭제 반영), `pipeline_stage_design_v2.md §9`(γ-3/γ-4 완료 표기 + Phase γ 종결 — ✅), `docs/35_experiment_runner_guide.md`(소멸 generate 기준 → ✅ 헤더 정오 note), `USAGE.md`(batch 참조 → ✅). **잔여(별도 후속 작업)**: `experiments/*.sh` 의 binary 교체(`generate`→`argus_eval`)·검증 — 코드/스크립트 수정이라 Architect 범위 밖.

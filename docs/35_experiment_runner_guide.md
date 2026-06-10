@@ -1,9 +1,11 @@
 # llm.rs 실험 실행 가이드 — 에이전트 인수인계 문서
 
+> **⚠️ 정오 (2026-06-11) — 본 가이드는 삭제된 legacy `generate` 바이너리 기준으로 작성되어 stale 하다.** `bin/generate.rs` 는 `d5ed71d2`(2026-06-05)에서 폐기됐고, `--prompt-batch` 류 batch 모듈은 γ-4(`2e53cf44`, 2026-06-11)에서 삭제됐다. 본문의 `generate` 호출·플래그·바이너리 목록(§1)은 현 코드와 어긋난다. **`--experiment-schedule` 은 γ-3b(`11c8721f`)에서 신규 bin `argus_eval` 로 부활**했다 (`ScheduleCommandSource` 경유 — `arch/inference_pipeline.md` §13.4). `experiments/*.sh` 의 `generate` → `argus_eval` 바이너리 교체와 동작 검증은 **별도 후속 작업**(코드/스크립트 수정이라 본 가이드 갱신과 분리). 본 정오는 note 만 — 전면 재작성은 후속 sprint.
+
 > **목적**: 이 문서 하나로 실험 에이전트가 호스트 PC와 타겟 디바이스에서 llm.rs의 모든 실험을 독립적으로 수행할 수 있도록 한다.
 
 > **관련 문서**: Weight swap overhead 감축 작업 가이드는 `docs/36_swap_overhead_reduction.md`.
-> **마지막 업데이트**: 2026-03-19
+> **마지막 업데이트**: 2026-03-19 (본문 stale — 상단 정오 note 참조)
 
 ---
 

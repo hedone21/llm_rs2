@@ -923,6 +923,8 @@ generate\
 
 ### 2.10 Prompt Batch (배치 추론)
 
+> **⚠️ 폐기됨 (γ-4, 2026-06-11, commit `2e53cf44`).** `--prompt-batch` / `--prompt-batch-loop` / `--max-iterations` 및 `session::batch` 모듈은 orphan(호출처 0)으로 **순수 삭제**됐다. 아래 사용법은 더 이상 동작하지 않으며 역사 참조용으로만 남긴다. 다중 프롬프트 평가는 `argus_eval --eval-batch` (eval 패밀리, §13 of `arch/inference_pipeline.md`) 를 사용한다.
+
 JSONL 파일로 여러 프롬프트를 순차 처리한다. 각 프롬프트마다 독립적으로 추론을 수행하고
 결과를 출력한다.
 

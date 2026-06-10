@@ -39,7 +39,7 @@
 | CmdSrcWrapper::poll | resilience_adapter `:37/:72` | 정의 `:70`, poll impl `:72-79`; `ResilienceAdapter::poll` `:37-41`(`:39` 가 executor.poll) | roadmap `:37` = ResilienceAdapter impl, `:72` = CmdSrcWrapper impl |
 | on_kv_prune | model_forward `:474` | sig `:477`, 본문 `:477-489` | **drift +3** |
 | NoOpCommandSource | defaults `:39` | `:37`(struct), impl `:39-43` | 일치(impl 기준) |
-| batch orphan poll | batch/runner `:495` | `:495` | 일치 |
+| ~~batch orphan poll~~ **삭제됨 (γ-4)** | ~~batch/runner `:495`~~ | **n/a** | **[정오 2026-06-11]** `session/batch/` 모듈이 γ-4(`2e53cf44`)에서 순수 삭제됨 — 이 orphan poll 호출처(`executor.poll` 직접 호출)가 소멸. SetPrefillPolicy 의 prefill 경로 유일 소비자가 사라져 **소비자 0** (1.2/1.3 참조) |
 | chat run_until_stop 호출 | chat/session `:100` | `:109` | **drift +9** |
 | chat turn-boundary try_evict | chat/session `:194/:286` | `:194`/`:286` | 일치 |
 
@@ -72,11 +72,11 @@
 | 8 | `Resume`(:248) | :517-526 | `resumed: bool`(:39) | `resumed` | (현 run() 미소비 — executor 내부 state 만; LoopControl seam 잔존) |
 | 9 | `RestoreDefaults`(:240) | :484-502 | `restore_defaults`(:52) + `recall_offload`(:50) + throttle/tbt reset | `restore_defaults` + reset 묶음 | (a.6) recall :301-310; throttle/tbt reset 은 executor→LoopControl |
 | 10 | `RequestQcf`(:236) | :527-530 | `request_qcf: bool`(:54) | `request_qcf` | (현 run() 미소비 — EngineReport 경로; QCF 송출은 generate 측. LoopControl tick) |
-| 11 | `SetPrefillPolicy`(:260) | :536-551 | `prefill_chunk_size`(:58) + `prefill_yield_ms`(:59) + `prefill_cpu_chunk_size`(:60) | prefill 3필드 | **run() 미소비 — prefill 경로(batch/runner.rs:495-509)** |
+| 11 | `SetPrefillPolicy`(:260) | :536-551 | `prefill_chunk_size`(:58) + `prefill_yield_ms`(:59) + `prefill_cpu_chunk_size`(:60) | prefill 3필드 | **[정오 2026-06-11] 소비자 0** — run() 미소비 + ~~prefill 경로(batch/runner.rs:495-509)~~ 가 γ-4(`2e53cf44`)에서 batch 모듈과 함께 삭제됨. LoopControl.prefill_* 매핑은 신설하나 **현 소비자 0** (chunked prefill 의 동적 정책 변경 경로 부재). 후속 substep 에서 prefill chunked 경로 재배선 시 부활 |
 
 **설계 결정 (② 7종)**: control 명령은 KV cache 를 prune 하지 않고 **루프의 제어 파라미터**(pacing/lifecycle/query)를 바꾼다 → Stage(phase-반응)가 아니라 driver-local 제어 상태다. `LoopControl` 신설 구조체가 이를 담고, dispatcher 가 `apply_command` 의 plan-쓰기 대신 `LoopControl` 의 필드를 갱신한다. run() 은 매 step `LoopControl` 을 읽어 sleep/break/pacing 한다 — v1 의 `plan.throttle_delay_ms`/`plan.suspended`/`plan.target_tbt_ms` 읽기와 1:1.
 
-**예외 — SetPrefillPolicy(11)**: 이 명령의 ExecutionPlan 3필드는 **decode_loop.rs::run() 에서 소비되지 않는다**. prefill chunked 경로(batch/runner.rs:495-509, `executor.poll` 직접 호출)가 유일 소비자다. 따라서 β-4 dispatcher cutover 시 SetPrefillPolicy 는 LoopControl 의 prefill 필드로 옮기되, run() 소비부는 추가하지 않고 prefill 경로가 LoopControl 을 읽도록 shim 한다. roadmap §β-4 item 3 의 "batch/runner.rs:495 동시 마이그레이션/shim" 가 이 부분.
+**예외 — SetPrefillPolicy(11)**: 이 명령의 ExecutionPlan 3필드는 **decode_loop.rs::run() 에서 소비되지 않는다**. ~~prefill chunked 경로(batch/runner.rs:495-509, `executor.poll` 직접 호출)가 유일 소비자다.~~ **[정오 2026-06-11]** 그 유일 소비자(`batch/runner.rs`)가 γ-4(`2e53cf44`)에서 batch 모듈과 함께 **순수 삭제**되어, SetPrefillPolicy → LoopControl.prefill_* 매핑의 **소비자가 현재 0** 이다. β-4 dispatcher cutover 시 LoopControl 에 prefill 3필드는 등가 보존 차원에서 두되, run() 소비부도 prefill shim 도 추가하지 않는다(읽는 쪽 부재). roadmap §β-4 item 3 의 "batch/runner.rs:495 동시 마이그레이션/shim" 항목은 batch 삭제로 **moot** — chunked prefill 경로 재배선 substep 이 도입될 때 LoopControl.prefill_* 의 소비처를 신설한다.
 
 **예외 — Resume(8)/RequestQcf(10)**: run() 본문에 직접 소비 코드가 없다. Resume 은 executor 내부 state(`engine_state`) 전이만(executor.rs:517-526), RequestQcf 는 `plan.request_qcf` 플래그를 generate 측(또는 EngineReport)이 읽어 QCF 송출. LoopControl 에 필드는 두되, β-4 에서는 등가 seam 잔존(소비 무변)으로 처리한다.
 
