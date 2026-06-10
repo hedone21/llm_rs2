@@ -6,8 +6,10 @@
 //!
 //! Out of scope for 4-3 (all kept as `None` in the forward args):
 //! `score_accumulator`, `skip_config`, `profiler`, `importance_collector`,
-//! `variance_collector`, `layer_boundary_hook`. These are absorbed by
-//! `EvictionStage` / `SwapStage` / `DecodeObserver` in Phase 4-4+.
+//! `variance_collector`, `layer_boundary_hook`. These are absorbed by the
+//! `PipelineStage` registry (eviction/swap/observe stages) — Phase β decode-loop
+//! rewrite (the v1 `EvictionStage`/`SwapStage`/`DecodeObserver` traits were
+//! deleted in β-7).
 
 use std::sync::Arc;
 

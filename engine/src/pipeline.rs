@@ -94,7 +94,8 @@ pub trait PressureSource: Send + Sync {
 
 /// per-step read-only 값 (Copy, borrow 0) — §5.1 G5-2.
 ///
-/// v1 `StepCtx`(`session/traits.rs`) 5필드 중 `pos`/`decode_step`/`prev_token` 을 승계. 드롭:
+/// v1 `StepCtx`(β-7 후 `inference/sampling.rs`) 5필드 중 `pos`/`decode_step`/`prev_token` 을
+/// 승계. 드롭:
 /// `kv_capacity`(register 시점 보유한 Format handle 에서 query — god-ctx 회피,
 /// `INV-STAGE-LAYER-HANDLE`), `stop_requested`(`StageOutcome::Stop` 반환으로 정지 → borrow
 /// 제거로 `Copy` 성립).
@@ -139,7 +140,8 @@ pub enum StageLifecycle {
 
 /// decode loop 정지 사유.
 ///
-/// (v1 `session::traits::StopReason` 와 별개 타입 — Phase β 에서 수렴한다.)
+/// (driver-result `session::decode_loop::StopReason`(StopFlag 포함, β-7 후) 와 별개 타입 —
+/// 스테이지는 driver-internal StopFlag 를 반환할 수 없어 4-variant 로 유지한다, §5.2.1 (다).)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     EosToken,
@@ -194,8 +196,14 @@ pub enum LifecyclePhase {
     Finalize,
 }
 
-/// 확장점 trait — v1 5-hook(StepHook/PhaseHook/LayerBoundaryHook/DecodeObserver/StopCondition)
-/// + 7-trait 일부를 단일 trait 으로 통합(§5).
+/// 확장점 trait — decode-loop v1 표면의 DecodeObserver/StopCondition + 7-trait 일부(eviction/
+/// swap/tick)를 단일 trait 으로 통합(§5).
+///
+/// **β-7 census 정정**: SSOT(§5)의 "v1 5-hook 통합" 중 `StepHook`(eval-LL per-step 캐시 관리)·
+/// `PhaseHook`(op_trace op-boundary swap)·`LayerBoundaryHook`(forward layer-boundary swap,
+/// LISWAP-4)은 **본 decode-loop pipeline 과 무관한 별개 서브시스템 trait** 이라 삭제·통합 대상이
+/// 아니다(eval/weight-swap 경로에서 live, INV-147/149/150 검증). 본 `PipelineStage` 는
+/// decode-loop 표면(observe/stop/eviction/swap/tick)만 흡수했다.
 ///
 /// 순서·안전은 통합자(stage 작성자) 책임이다 (§1.2 Mechanism over policy, §5.3). 프레임워크는
 /// stage 등록·순회 메커니즘만 제공하고, "틀린 구성 금지" policy 도 "어떤 순서에서도 crash-safe"
