@@ -5,4 +5,8 @@
 //! 하지만 주 의도가 device 변경이므로 `system/`. resilience-제어 Stage / observe·보고 Stage 의
 //! 분해·명명은 downstream(resilience→stage 매핑 별도 설계).
 //!
-//! 현재는 골격(입주자 0) — 후속 substep 에서 채운다.
+//! **입주자 1호(Phase β-6 commit C)**: [`tick::TickStage`] — `PostSample` phase 에서
+//! `ResilienceAdapter` 의 per-token tick(throughput EMA + heartbeat token count)을 발화한다.
+//! v1 `TokenTickSink`(`TickWrapper`) 의 stage 화. `SwitchStage` 등 나머지는 후속.
+
+pub mod tick;

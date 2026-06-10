@@ -298,3 +298,76 @@ fn pure_poll_drains_commands_and_acks() {
         _ => panic!("Expected Response"),
     }
 }
+
+// ── β-6 commit C: TickStage 경유 heartbeat token count 등가 ──
+
+/// `TickStage`(PostSample) 가 N회 발화하면, v1 `on_token_generated` N회 직접 호출과 동일하게
+/// executor throughput EMA 가 적재되어 heartbeat `actual_throughput`(token count 채널)이 채워진다.
+/// 구 `TokenTickSink.on_token_generated` 호출 == 신 TickStage PostSample 발화 등가 (mock 없이
+/// 실 ResilienceAdapter + executor 채널로 검증).
+#[test]
+fn tick_stage_drives_heartbeat_throughput_via_post_sample() {
+    use llm_rs2::pipeline::{LifecyclePhase, PipelineStage, Pressure, StageContext, StepInfo};
+    use llm_rs2::stages::system::tick::TickStage;
+
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    let mut exec = CommandExecutor::new(
+        cmd_rx,
+        resp_tx,
+        "cpu".to_string(),
+        Duration::from_millis(10),
+    );
+    exec.set_running();
+    let adapter = Arc::new(Mutex::new(ResilienceAdapter::new(exec)));
+
+    // TickStage 가 공유 adapter 로 per-token tick. PostSample 2회 발화 → throughput EMA 적재.
+    let stage = TickStage::new(Arc::clone(&adapter));
+    let mut profiler = llm_rs2::observability::profile::OpProfiler::new();
+    let step = StepInfo {
+        pos: 0,
+        decode_step: 0,
+        pressure: Pressure::new(0),
+        prev_token: 0,
+    };
+
+    std::thread::sleep(Duration::from_millis(2));
+    {
+        let mut ctx = StageContext {
+            step,
+            profiler: &mut profiler,
+        };
+        stage
+            .on_phase(&LifecyclePhase::PostSample, &mut ctx)
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(2));
+    {
+        let mut ctx = StageContext {
+            step,
+            profiler: &mut profiler,
+        };
+        stage
+            .on_phase(&LifecyclePhase::PostSample, &mut ctx)
+            .unwrap();
+    }
+
+    // interval 경과 후 heartbeat 송출 → token count 채널(actual_throughput) 검증.
+    std::thread::sleep(Duration::from_millis(15));
+    adapter
+        .lock()
+        .unwrap()
+        .executor_mut()
+        .send_heartbeat_if_due(&KVSnapshot::default());
+
+    let mut throughput = 0.0;
+    while let Ok(EngineMessage::Heartbeat(status)) = resp_rx.try_recv() {
+        throughput = status.actual_throughput;
+    }
+    assert!(
+        throughput > 0.0,
+        "TickStage PostSample 2회 발화로 heartbeat throughput 채널 적재 (v1 tick 등가)"
+    );
+
+    drop(cmd_tx);
+}

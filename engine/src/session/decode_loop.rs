@@ -20,11 +20,11 @@ use crate::session::pipeline_registry::PipelineRegistry;
 
 use super::defaults::{
     GreedySampler, NoOpCommandSource, NoOpEngineReport, NoOpEvictionStage, NoOpObserver,
-    NoOpSwapStage, NoOpTokenTickSink,
+    NoOpSwapStage,
 };
 use super::traits::{
     CommandSource, DecodeObserver, DecodeResult, EngineReport, EvictionOutcome, EvictionStage,
-    Forward, StepCtx, StopReason, SwapStage, TokenSampler, TokenTickSink,
+    Forward, StepCtx, StopReason, SwapStage, TokenSampler,
 };
 
 /// Typestate marker — Forward not yet supplied. `.build()` is unavailable.
@@ -44,7 +44,8 @@ pub struct DecodeLoop {
     // P3에서 실제 보고 구현체 주입 시 사용. 현재는 no-op default만 주입.
     #[allow(dead_code)]
     report: Box<dyn EngineReport>,
-    tick_sink: Box<dyn TokenTickSink>,
+    // β-6 commit C: v1 tick_sink 필드는 제거됨 — per-token tick 은 TickStage(PostSample 구독,
+    // stages/system/tick.rs)가 담당한다. with_resilience 가 build() 시점에 registry 로 submit.
     stop_flag: Arc<AtomicBool>,
     // β-4 (v2 §5.4 A-1): 2-source 명령 분배자. cmd_source.poll() 이 pure 생산한 EngineCommand 를
     // 받아 ① OneShot EvictionStage submit / ② LoopControl / ③ Hardware seam 으로 분배한다.
@@ -432,22 +433,13 @@ impl DecodeLoop {
             // 것과 동치.
             self.sampler.observe_token(sampled);
 
-            // PostSample: sampled 미push 시점 → stop token 미포함 break
-            // (v1 chat stop 시맨틱 정합, β-6 StopCondition stage 전제).
+            // PostSample: sampled 직후. β-6 commit C: v1 (f2) tick_sink 는 TickStage(PostSample
+            // 구독)로 이관됐다 — TickStage 가 ResilienceAdapter per-token tick 을 발화한다(stop
+            // 토큰 포함, v1 "stop 토큰에도 tick" 보존). chat stop 은 ChatStopStage(DecodeEnd).
             if let Some(r) = self.dispatch_phase(LifecyclePhase::PostSample) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
-
-            // (f2) tick sink — sampler 호출 후, observer 이전
-            let ctx = step_ctx(
-                self.pos,
-                self.prev_token,
-                self.kv_capacity,
-                self.decode_step,
-                &stop,
-            );
-            self.tick_sink.on_token_generated(&ctx);
 
             // (g) observers
             let ctx = step_ctx(
@@ -569,10 +561,12 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     sampler: Option<Box<dyn TokenSampler>>,
     observers: Vec<Box<dyn DecodeObserver>>,
     report: Option<Box<dyn EngineReport>>,
-    tick_sink: Option<Box<dyn TokenTickSink>>,
     stop_flag: Option<Arc<AtomicBool>>,
     dispatcher: Option<CommandDispatcher>,
     pipeline: Option<Arc<PipelineRegistry>>,
+    // β-6 commit C: with_resilience 가 보관한 shared ResilienceAdapter — build() 에서 TickStage
+    // (PostSample) 를 registry 로 submit 한다(with_pipeline 호출 순서 무관 보장).
+    resilience_tick: Option<Arc<std::sync::Mutex<super::resilience_adapter::ResilienceAdapter>>>,
     kv_pos_handle: Option<Arc<dyn KVCacheFormat>>,
     pressure_source: Option<Arc<dyn PressureSource>>,
     kv_capacity: usize,
@@ -595,12 +589,12 @@ impl DecodeLoopBuilder<NoForward> {
             sampler: None,
             observers: Vec::new(),
             report: None,
-            tick_sink: None,
             stop_flag: None,
             dispatcher: None,
             pipeline: None,
             kv_pos_handle: None,
             pressure_source: None,
+            resilience_tick: None,
             kv_capacity: 0,
         }
     }
@@ -615,12 +609,12 @@ impl DecodeLoopBuilder<NoForward> {
             sampler: self.sampler,
             observers: self.observers,
             report: self.report,
-            tick_sink: self.tick_sink,
             stop_flag: self.stop_flag,
             dispatcher: self.dispatcher,
             pipeline: self.pipeline,
             kv_pos_handle: self.kv_pos_handle,
             pressure_source: self.pressure_source,
+            resilience_tick: self.resilience_tick,
             kv_capacity: self.kv_capacity,
         }
     }
@@ -668,10 +662,6 @@ impl<F> DecodeLoopBuilder<F> {
         self.report = Some(Box::new(r));
         self
     }
-    pub fn with_tick_sink<T: TokenTickSink + 'static>(mut self, t: T) -> Self {
-        self.tick_sink = Some(Box::new(t));
-        self
-    }
     /// β-2: L2 stage registry 주입. 미주입 시 빈 registry (거동-0).
     pub fn with_pipeline(mut self, p: Arc<PipelineRegistry>) -> Self {
         self.pipeline = Some(p);
@@ -694,21 +684,25 @@ impl<F> DecodeLoopBuilder<F> {
         self
     }
 
-    /// P3.3: [`ResilienceAdapter`]를 3개 slot(cmd_source / report / tick_sink)에 동시에 주입한다.
+    /// P3.3 + β-6 commit C: [`ResilienceAdapter`]를 cmd_source / report slot 에 주입하고, per-token
+    /// tick 은 [`TickStage`](crate::stages::system::tick::TickStage)(PostSample)로 build() 시점에
+    /// registry 에 submit 한다.
     ///
-    /// 단일 인스턴스를 `Arc<Mutex<ResilienceAdapter>>`로 감싸 3개 newtype wrapper에 공유하므로
-    /// ownership 이전 없이 3개 slot을 충족시킨다. per-token Mutex lock은
-    /// (poll 1회 + on_token_generated 1회) 정도라 contention 무시 가능.
+    /// 단일 인스턴스를 `Arc<Mutex<ResilienceAdapter>>`로 감싸 wrapper·stage 가 공유하므로
+    /// ownership 이전 없이 충족한다. per-token Mutex lock 은 (poll 1회 + tick 1회) 정도라 contention
+    /// 무시 가능. **with_pipeline 호출 순서 무관**: shared Arc 를 보관했다가 build() 에서 (그때
+    /// 확정된) registry 로 submit 한다.
     pub fn with_resilience(
         mut self,
         adapter: super::resilience_adapter::ResilienceAdapter,
     ) -> Self {
-        use super::resilience_adapter::{CmdSrcWrapper, ReportWrapper, TickWrapper};
+        use super::resilience_adapter::{CmdSrcWrapper, ReportWrapper};
         use std::sync::Mutex;
         let shared = Arc::new(Mutex::new(adapter));
         self.cmd_source = Some(Box::new(CmdSrcWrapper(Arc::clone(&shared))));
         self.report = Some(Box::new(ReportWrapper(Arc::clone(&shared))));
-        self.tick_sink = Some(Box::new(TickWrapper(shared)));
+        // β-6 commit C: tick 은 build() 에서 TickStage 로 submit (TickWrapper 제거).
+        self.resilience_tick = Some(shared);
         self
     }
 }
@@ -717,6 +711,16 @@ impl DecodeLoopBuilder<HasForward> {
     /// Assemble the decode loop. Optional components default to no-op impls
     /// from [`super::defaults`].
     pub fn build(self) -> DecodeLoop {
+        let pipeline = self
+            .pipeline
+            .unwrap_or_else(|| Arc::new(PipelineRegistry::new()));
+        // β-6 commit C: resilience 주입 시 per-token tick 을 TickStage(PostSample) 로 registry 에
+        // submit. with_pipeline 호출 순서와 무관하게 build() 시점에 확정된 registry 로 등록한다.
+        if let Some(adapter) = self.resilience_tick {
+            pipeline.submit(Arc::new(crate::stages::system::tick::TickStage::new(
+                adapter,
+            )));
+        }
         DecodeLoop {
             forward: self.forward.0,
             eviction: self.eviction.unwrap_or_else(|| Box::new(NoOpEvictionStage)),
@@ -731,16 +735,11 @@ impl DecodeLoopBuilder<HasForward> {
                 self.observers
             },
             report: self.report.unwrap_or_else(|| Box::new(NoOpEngineReport)),
-            tick_sink: self
-                .tick_sink
-                .unwrap_or_else(|| Box::new(NoOpTokenTickSink)),
             stop_flag: self
                 .stop_flag
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             dispatcher: self.dispatcher,
-            pipeline: self
-                .pipeline
-                .unwrap_or_else(|| Arc::new(PipelineRegistry::new())),
+            pipeline,
             kv_pos_handle: self.kv_pos_handle,
             profiler: OpProfiler::new(),
             pressure_source: self.pressure_source,
@@ -986,24 +985,37 @@ mod tests {
 
     // ── β-6 commit A: chat 거동 고정 (수렴 전 핀) ──────────────────────────
 
-    /// β-6 핀 2: stop 토큰에 대해서도 (f2) tick_sink.on_token_generated 와
-    /// (g) observer.on_step_end 가 **발화**한다. v1 run_until_stop 시맨틱 census:
-    /// stop 체크는 (f2)/(g)/bookkeeping **후** 이므로 stop 토큰의 tick·obs 도 1회씩
-    /// 발화하고 pos 만 증가하며 push 만 안 된다. 통합(commit B/C) 후에도 이 카운트가
-    /// 동일해야 한다 (DecodeEnd 구독 + PostSample TickStage 로 보존).
+    /// β-6 핀 2: stop 토큰에 대해서도 tick(PostSample phase)과 (g) observer.on_step_end 가
+    /// **발화**한다. v1 run_until_stop 시맨틱 census: stop 체크는 tick/(g)/bookkeeping **후** 이므로
+    /// stop 토큰의 tick·obs 도 1회씩 발화하고 pos 만 증가하며 push 만 안 된다. commit C 후 tick 은
+    /// PostSample phase 로 이관됐으므로(TickStage), PostSample 발화 횟수 == 구 tick 횟수로 등가
+    /// 검증한다. ChatStopStage(DecodeEnd) 가 PostSample 보다 뒤이므로 stop 토큰의 PostSample 도 발화.
     #[test]
     fn run_until_stop_fires_tick_and_obs_on_stop_token() {
+        use crate::pipeline::{LifecyclePhase as P2, PipelineStage as PS2, StageOutcome as SO2};
         use crate::session::chat::stop_condition::{
             ChatStopCondition, ChatStopSlot, ChatStopStage,
         };
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
 
-        struct CountTickSink {
+        // PostSample 발화 횟수를 세는 stage (구 tick_sink.on_token_generated 등가 — TickStage 도
+        // PostSample 구독이라 발화 횟수가 동일).
+        struct CountPostSampleStage {
             count: Arc<AtomicUsize>,
         }
-        impl TokenTickSink for CountTickSink {
-            fn on_token_generated(&mut self, _ctx: &StepCtx) {
-                self.count.fetch_add(1, AtomicOrd::Relaxed);
+        impl PS2 for CountPostSampleStage {
+            fn name(&self) -> &str {
+                "count.post_sample"
+            }
+            fn on_phase(
+                &self,
+                phase: &P2,
+                _ctx: &mut crate::pipeline::StageContext<'_>,
+            ) -> anyhow::Result<SO2> {
+                if *phase == P2::PostSample {
+                    self.count.fetch_add(1, AtomicOrd::Relaxed);
+                }
+                Ok(SO2::Continue)
             }
         }
         struct CountStepEndObserver {
@@ -1019,6 +1031,10 @@ mod tests {
         let obs_count = Arc::new(AtomicUsize::new(0));
         let slot = ChatStopSlot::new();
         let registry = Arc::new(PipelineRegistry::new());
+        // CountPostSampleStage(PostSample) 를 먼저, ChatStopStage(DecodeEnd) 를 나중에 등록.
+        registry.submit(Arc::new(CountPostSampleStage {
+            count: tick_count.clone(),
+        }));
         registry.submit(Arc::new(ChatStopStage::new(Arc::clone(&slot))));
         let mut loop_ = DecodeLoopBuilder::new()
             .with_forward(MockForward {
@@ -1027,9 +1043,6 @@ mod tests {
             })
             .with_kv_capacity(2048)
             .with_pipeline(registry)
-            .with_tick_sink(CountTickSink {
-                count: tick_count.clone(),
-            })
             .add_observer(CountStepEndObserver {
                 count: obs_count.clone(),
             })
@@ -1042,11 +1055,11 @@ mod tests {
             loop_.run_until_stop(0).unwrap()
         };
         assert_eq!(result.tokens_generated, vec![1, 2], "stop 토큰 미push");
-        // 3 step (token1, token2, token3=stop) 모두 tick·obs 발화 — stop 토큰 포함.
+        // 3 step (token1, token2, token3=stop) 모두 PostSample(tick)·obs 발화 — stop 토큰 포함.
         assert_eq!(
             tick_count.load(AtomicOrd::Relaxed),
             3,
-            "stop 토큰에도 tick_sink 발화 (총 3 step)"
+            "stop 토큰에도 PostSample(tick) 발화 (총 3 step)"
         );
         assert_eq!(
             obs_count.load(AtomicOrd::Relaxed),

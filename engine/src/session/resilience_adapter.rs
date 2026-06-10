@@ -1,13 +1,13 @@
-//! [`ResilienceAdapter`] — [`CommandExecutor`]를 3개 session trait에 연결하는 어댑터.
+//! [`ResilienceAdapter`] — [`CommandExecutor`]를 session 인터페이스에 연결하는 어댑터.
 //!
-//! `CommandExecutor`는 `poll` / `send_capability` / `on_token_generated` 메서드를
-//! 각각 갖지만, session pipeline은 3개의 별도 trait slot
-//! ([`CommandSource`], [`EngineReport`], [`TokenTickSink`])을 요구한다.
+//! `CommandExecutor`는 `poll` / `send_capability` / `on_token_generated` 메서드를 각각 갖는다.
+//! session pipeline 은 이를 [`CommandSource`](poll) / [`EngineReport`](send_*) slot 으로
+//! 받는다. **β-6 commit C**: per-token tick(`on_token_generated`)은 더 이상 `TokenTickSink`
+//! slot 이 아니라 `TickStage`(PostSample, stages/system/tick.rs)가 공유 Arc 로 호출한다
+//! ([`ResilienceAdapter::tick`]).
 //!
-//! [`ResilienceAdapter`]는 단일 `CommandExecutor` 인스턴스를 소유하고
-//! 3개 trait을 모두 구현함으로써 이 두 인터페이스를 연결한다.
-//! `DecodeLoopBuilder::with_resilience` 내에서 `Arc<Mutex<Self>>`로 감싸
-//! 3개 slot에 각각 newtype wrapper를 통해 주입된다.
+//! `DecodeLoopBuilder::with_resilience` 내에서 `Arc<Mutex<Self>>`로 감싸 cmd_source/report slot
+//! 에 newtype wrapper 를 주입하고, tick 은 build() 에서 TickStage 로 registry submit 한다.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +16,7 @@ use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport}
 
 use crate::format::KVCacheFormat;
 use crate::resilience::{CommandExecutor, KVSnapshot};
-use crate::session::traits::{CommandSource, EngineReport, StepCtx, TokenTickSink};
+use crate::session::traits::{CommandSource, EngineReport};
 
 /// [`CommandExecutor`]를 session 3-trait으로 연결하는 어댑터 (β-4: ManagerCommandSource 역할).
 ///
@@ -49,6 +49,14 @@ impl ResilienceAdapter {
     /// mutable ref를 노출한다.
     pub fn executor_mut(&mut self) -> &mut CommandExecutor {
         &mut self.executor
+    }
+
+    /// β-6 commit C: per-token tick. [`TickStage`](crate::stages::system::tick::TickStage)(PostSample
+    /// 구독)가 매 sampled 토큰마다 호출한다. v1 `TickWrapper.on_token_generated` 와 동일 효과
+    /// (executor throughput EMA 적재 + heartbeat token count 채널). `StepCtx` 불필요(stage 는
+    /// `StepInfo` 만 본다).
+    pub fn tick(&mut self) {
+        self.executor.on_token_generated();
     }
 
     /// held-handle 에서 heartbeat payload 용 `KVSnapshot` 을 구성한다 (§5.2.1 (가) query).
@@ -89,19 +97,15 @@ impl EngineReport for ResilienceAdapter {
     }
 }
 
-impl TokenTickSink for ResilienceAdapter {
-    fn on_token_generated(&mut self, _ctx: &StepCtx) {
-        self.executor.on_token_generated();
-    }
-}
-
-// ── Arc<Mutex<ResilienceAdapter>> 기반 3개 newtype wrapper ──
+// ── Arc<Mutex<ResilienceAdapter>> 기반 newtype wrapper ──
 //
-// `DecodeLoopBuilder::with_resilience`가 단일 ResilienceAdapter 인스턴스를
-// Arc<Mutex<…>>로 감싸고, 3개 슬롯에 각각 newtype wrapper를 주입하는 방식이다.
-// 이를 통해 한 인스턴스로 3개 trait slot 동시 충족.
+// `DecodeLoopBuilder::with_resilience`가 단일 ResilienceAdapter 인스턴스를 Arc<Mutex<…>>로
+// 감싸 cmd_source/report 슬롯에 wrapper 를 주입한다. **β-6 commit C**: per-token tick 은
+// 더 이상 wrapper(TickWrapper)가 아니라 `TickStage`(PostSample, stages/system/tick.rs)가
+// 공유 Arc 로 직접 호출한다 — `ResilienceAdapter::tick`. TokenTickSink trait 자체는 β-7 에서
+// 삭제(현재 다른 NoOp 소비처 유지).
 //
-// per-token 호출 빈도: poll 1회 + on_token_generated 1회 → Mutex contention 무시 가능.
+// per-token 호출 빈도: poll 1회 + tick 1회 → Mutex contention 무시 가능.
 
 /// `Arc<Mutex<ResilienceAdapter>>` 를 `CommandSource` 로 노출하는 newtype.
 pub(crate) struct CmdSrcWrapper(pub Arc<Mutex<ResilienceAdapter>>);
@@ -133,17 +137,5 @@ impl EngineReport for ReportWrapper {
             .lock()
             .expect("resilience mutex poisoned")
             .send_swap_report(report);
-    }
-}
-
-/// `Arc<Mutex<ResilienceAdapter>>` 를 `TokenTickSink` 로 노출하는 newtype.
-pub(crate) struct TickWrapper(pub Arc<Mutex<ResilienceAdapter>>);
-
-impl TokenTickSink for TickWrapper {
-    fn on_token_generated(&mut self, ctx: &StepCtx) {
-        self.0
-            .lock()
-            .expect("resilience mutex poisoned")
-            .on_token_generated(ctx);
     }
 }
