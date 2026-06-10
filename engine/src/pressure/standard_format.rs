@@ -1115,10 +1115,9 @@ mod tests {
         };
         let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
 
-        let gen_val =
-            |t: usize, h: usize, d: usize, salt: f32| -> f32 {
-                (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
-            };
+        let gen_val = |t: usize, h: usize, d: usize, salt: f32| -> f32 {
+            (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
+        };
         let mut k_tokens: Vec<Vec<f32>> = Vec::new();
         let mut v_tokens: Vec<Vec<f32>> = Vec::new();
         for t in 0..n_tokens {
@@ -1144,9 +1143,16 @@ mod tests {
             let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
             Tensor::new(shape.clone(), op, backend.clone())
         };
-        let cache =
-            KVCache::new_dynamic(mk(), mk(), initial_cap, max_seq, kv_heads, head_dim, mem.clone())
-                .with_layout(KVLayout::HeadMajor);
+        let cache = KVCache::new_dynamic(
+            mk(),
+            mk(),
+            initial_cap,
+            max_seq,
+            kv_heads,
+            head_dim,
+            mem.clone(),
+        )
+        .with_layout(KVLayout::HeadMajor);
         let fmt = StandardFormat::new(0, cache);
         for t in 0..n_tokens {
             let kt = f32_tensor(vec![1, 1, kv_heads, head_dim], &k_tokens[t]);
@@ -1154,14 +1160,19 @@ mod tests {
             fmt.write_kv(&kt, &vt, backend.as_ref()).unwrap();
         }
         assert_eq!(fmt.current_pos(), n_tokens);
-        assert!(fmt.capacity() >= n_tokens, "grow 가 capacity 를 늘렸어야 함");
+        assert!(
+            fmt.capacity() >= n_tokens,
+            "grow 가 capacity 를 늘렸어야 함"
+        );
 
         let q_data: Vec<f32> = (0..n_heads_q * head_dim)
             .map(|i| ((i % 11) as f32 - 5.0) * 0.07)
             .collect();
         let q = f32_tensor(vec![1, 1, n_heads_q, head_dim], &q_data);
-        let mut out_opaque =
-            f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; n_heads_q * head_dim]);
+        let mut out_opaque = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.0; n_heads_q * head_dim],
+        );
         fmt.attention_into(
             &q,
             backend.as_ref(),
@@ -1198,8 +1209,10 @@ mod tests {
         }
         let ref_k_t = f32_tensor(vec![1, kv_heads, cap, head_dim], &ref_k);
         let ref_v_t = f32_tensor(vec![1, kv_heads, cap, head_dim], &ref_v);
-        let mut out_ref =
-            f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; n_heads_q * head_dim]);
+        let mut out_ref = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.0; n_heads_q * head_dim],
+        );
         backend
             .attention_gen(
                 &q,
@@ -1287,7 +1300,10 @@ mod tests {
         )
         .unwrap();
         for &x in out.as_slice::<f32>() {
-            assert!(x.is_finite(), "opaque prefill attention 출력은 유한해야 한다");
+            assert!(
+                x.is_finite(),
+                "opaque prefill attention 출력은 유한해야 한다"
+            );
         }
     }
 
@@ -1319,10 +1335,9 @@ mod tests {
         };
         let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
 
-        let gen_val =
-            |t: usize, h: usize, d: usize, salt: f32| -> f32 {
-                (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
-            };
+        let gen_val = |t: usize, h: usize, d: usize, salt: f32| -> f32 {
+            (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
+        };
         let mut k_tokens: Vec<Vec<f32>> = Vec::new();
         let mut v_tokens: Vec<Vec<f32>> = Vec::new();
         for t in 0..n_tokens {
@@ -1346,9 +1361,8 @@ mod tests {
             let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
             Tensor::new(shape.clone(), op, backend.clone())
         };
-        let mut cache =
-            KVCache::new_dynamic(mk(), mk(), cap, cap, kv_heads, head_dim, mem.clone())
-                .with_layout(KVLayout::HeadMajor);
+        let mut cache = KVCache::new_dynamic(mk(), mk(), cap, cap, kv_heads, head_dim, mem.clone())
+            .with_layout(KVLayout::HeadMajor);
         for t in 0..n_tokens {
             let kt = f32_tensor(vec![1, 1, kv_heads, head_dim], &k_tokens[t]);
             let vt = f32_tensor(vec![1, 1, kv_heads, head_dim], &v_tokens[t]);
@@ -1362,8 +1376,10 @@ mod tests {
             .map(|i| ((i % 11) as f32 - 5.0) * 0.07)
             .collect();
         let q = f32_tensor(vec![1, 1, n_heads_q, head_dim], &q_data);
-        let mut out_opaque =
-            f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; n_heads_q * head_dim]);
+        let mut out_opaque = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.0; n_heads_q * head_dim],
+        );
         fmt.attention_into(
             &q,
             backend.as_ref(),
@@ -1401,8 +1417,10 @@ mod tests {
         }
         let ref_k_t = f32_tensor(vec![1, kv_heads, rcap, head_dim], &ref_k);
         let ref_v_t = f32_tensor(vec![1, kv_heads, rcap, head_dim], &ref_v);
-        let mut out_ref =
-            f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; n_heads_q * head_dim]);
+        let mut out_ref = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.0; n_heads_q * head_dim],
+        );
         backend
             .attention_gen(
                 &q,
@@ -1450,10 +1468,9 @@ mod tests {
         };
         let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
 
-        let gen_val =
-            |t: usize, h: usize, d: usize, salt: f32| -> f32 {
-                (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
-            };
+        let gen_val = |t: usize, h: usize, d: usize, salt: f32| -> f32 {
+            (((t * 7 + h * 13 + d * 3) % 17) as f32 - 8.0) * 0.1 + salt
+        };
         let mk_tokens = |salt: f32| -> Vec<Vec<f32>> {
             (0..n_tokens)
                 .map(|t| {
@@ -1478,9 +1495,16 @@ mod tests {
             let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
             Tensor::new(shape.clone(), op, backend.clone())
         };
-        let mut cache =
-            KVCache::new_dynamic(mk_buf(), mk_buf(), cap, cap, kv_heads, head_dim, mem.clone())
-                .with_layout(KVLayout::HeadMajor);
+        let mut cache = KVCache::new_dynamic(
+            mk_buf(),
+            mk_buf(),
+            cap,
+            cap,
+            kv_heads,
+            head_dim,
+            mem.clone(),
+        )
+        .with_layout(KVLayout::HeadMajor);
         for t in 0..n_tokens {
             let kt = f32_tensor(vec![1, 1, kv_heads, head_dim], &k_tokens[t]);
             let vt = f32_tensor(vec![1, 1, kv_heads, head_dim], &v_tokens[t]);
@@ -1527,9 +1551,17 @@ mod tests {
                     );
                     // from(pos1,2): 불변(roundtrip).
                     let base1 = (h * cap + 1) * head_dim + blk * QK4_0;
-                    assert_eq!(&out[base1..base1 + QK4_0], &rt1, "{label} pos1 head{h} blk{blk}");
+                    assert_eq!(
+                        &out[base1..base1 + QK4_0],
+                        &rt1,
+                        "{label} pos1 head{h} blk{blk}"
+                    );
                     let base2 = (h * cap + 2) * head_dim + blk * QK4_0;
-                    assert_eq!(&out[base2..base2 + QK4_0], &rt2, "{label} pos2 head{h} blk{blk}");
+                    assert_eq!(
+                        &out[base2..base2 + QK4_0],
+                        &rt2,
+                        "{label} pos2 head{h} blk{blk}"
+                    );
                 }
             }
         };

@@ -118,7 +118,11 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
     let rollback = build_plugin_so("example-rollback", true, "libexample_rollback_v2.so");
     let bundle = build_plugin_so("example-bundle", true, "libexample_bundle_v2.so");
     let keep_recent = build_plugin_so("example-keep-recent", true, "libexample_keep_recent_v2.so");
-    let multi = build_plugin_so("example-multi-format", true, "libexample_multi_format_v2.so");
+    let multi = build_plugin_so(
+        "example-multi-format",
+        true,
+        "libexample_multi_format_v2.so",
+    );
 
     // ════ REJECT 단언 (등록 0 — 레지스트리 불변) ════
 
@@ -127,20 +131,34 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
         find_kv_format("synth_q4").is_some(),
         "전제: synth_q4 가 엔진 force-link 정적 등록"
     );
-    let e = register_dynamic_plugins(std::slice::from_ref(&synth)).unwrap_err().to_string();
-    assert!(e.contains("충돌") || e.contains("빌트인"), "builtin-collision: {e}");
+    let e = register_dynamic_plugins(std::slice::from_ref(&synth))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("충돌") || e.contains("빌트인"),
+        "builtin-collision: {e}"
+    );
 
     // (2) capability-0 (no-export): PLUGIN 슬라이스 기여는 있으나 register_kv_*s_v2 entry 부재(CF4 ⑦).
-    let e = register_dynamic_plugins(std::slice::from_ref(&no_export)).unwrap_err().to_string();
+    let e = register_dynamic_plugins(std::slice::from_ref(&no_export))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("capability 0"), "no-export capability-0: {e}");
 
     // (3) capability-0 (feature-OFF): v2 심볼 자체 부재.
-    let e = register_dynamic_plugins(std::slice::from_ref(&kv_off)).unwrap_err().to_string();
+    let e = register_dynamic_plugins(std::slice::from_ref(&kv_off))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("capability 0"), "feature-OFF capability-0: {e}");
 
     // (4) per-.so 원자성 롤백: 봉투 [q4_0(빌트인 충돌), rollback_ok] → q4_0 에서 bail → rollback_ok 미등록.
-    let e = register_dynamic_plugins(std::slice::from_ref(&rollback)).unwrap_err().to_string();
-    assert!(e.contains("충돌") || e.contains("빌트인"), "rollback collision: {e}");
+    let e = register_dynamic_plugins(std::slice::from_ref(&rollback))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("충돌") || e.contains("빌트인"),
+        "rollback collision: {e}"
+    );
     assert!(
         !dynamic_registered_format_names().contains(&"rollback_ok".to_string()),
         "원자성: q4_0 충돌로 bail 시 rollback_ok 는 등록되지 않아야(롤백): {:?}",
@@ -153,9 +171,18 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
     register_dynamic_plugins(std::slice::from_ref(&bundle)).expect("bundle 등록 성공");
     let snames = dynamic_registered_stage_names();
     let fnames = dynamic_registered_format_names();
-    assert!(snames.contains(&"bundle_keep".to_string()), "stage bundle_keep: {snames:?}");
-    assert!(snames.contains(&"bundle_perhead".to_string()), "stage bundle_perhead: {snames:?}");
-    assert!(fnames.contains(&"bundle_fmt".to_string()), "format bundle_fmt: {fnames:?}");
+    assert!(
+        snames.contains(&"bundle_keep".to_string()),
+        "stage bundle_keep: {snames:?}"
+    );
+    assert!(
+        snames.contains(&"bundle_perhead".to_string()),
+        "stage bundle_perhead: {snames:?}"
+    );
+    assert!(
+        fnames.contains(&"bundle_fmt".to_string()),
+        "format bundle_fmt: {fnames:?}"
+    );
 
     // (6) wrong-type graceful: stage-only .so → stage 1 + format 0, 전체 Ok(bail 아님).
     register_dynamic_plugins(std::slice::from_ref(&keep_recent)).expect("stage-only .so Ok");
@@ -173,7 +200,10 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
     assert_eq!(d_q4, known_q4(), "mf_q4 descriptor-identity");
     assert_eq!(d_q8.bits, 8);
     assert_eq!(d_q8.packing, Packing::Byte);
-    assert_ne!(d_q4, d_q8, "두 format desc 가 달라야(인덱스/이름 미스바인딩 검출)");
+    assert_ne!(
+        d_q4, d_q8,
+        "두 format desc 가 달라야(인덱스/이름 미스바인딩 검출)"
+    );
 
     // (8) descriptor-floor byte-identity(CF4 ⑤): 동적 mf_q4 desc 와 정적 q4_0 desc 의 encode 바이트 동일.
     let numel = 64usize;
@@ -183,20 +213,34 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
     let mut enc_static = vec![0u8; nbytes];
     encode_via_descriptor(&d_q4, &src, &mut enc_dyn).expect("dyn encode");
     encode_via_descriptor(&known_q4(), &src, &mut enc_static).expect("static encode");
-    assert_eq!(enc_dyn, enc_static, "dlopen 과 정적 descriptor 의 encode 바이트 동일");
+    assert_eq!(
+        enc_dyn, enc_static,
+        "dlopen 과 정적 descriptor 의 encode 바이트 동일"
+    );
     let mut dec = vec![0.0f32; numel];
     decode_via_descriptor(&d_q4, &enc_dyn, &mut dec);
     assert!(dec.iter().all(|v| v.is_finite()), "decode 유한");
 
     // (9) stage plan-identity: 멀티-stage 인덱스 바인딩 — bundle_keep 이 LayerWide 정답.
     let keep = make_stage("bundle_keep", &params()).expect("make_stage bundle_keep");
-    let plan = keep.plan(&Ctx { cur: 100, tgt: 30, heads: 4 }).expect("plan Some");
+    let plan = keep
+        .plan(&Ctx {
+            cur: 100,
+            tgt: 30,
+            heads: 4,
+        })
+        .expect("plan Some");
     match plan.keep {
         KeepSpec::LayerWide(k) => assert_eq!(k, (70..100).collect::<Vec<_>>(), "LayerWide keep"),
         KeepSpec::PerHead(_) => panic!("bundle_keep 은 LayerWide 여야"),
     }
     assert!(
-        keep.plan(&Ctx { cur: 20, tgt: 30, heads: 4 }).is_none(),
+        keep.plan(&Ctx {
+            cur: 20,
+            tgt: 30,
+            heads: 4
+        })
+        .is_none(),
         "current<=target → no-op(None)"
     );
 
@@ -204,11 +248,18 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
     let ph = make_stage("bundle_perhead", &params()).expect("make_stage bundle_perhead");
     assert_eq!(ph.name(), "bundle_perhead", "멀티-stage 이름↔vtable 바인딩");
     assert!(
-        ph.plan(&Ctx { cur: 100, tgt: 30, heads: 4 }).is_none(),
+        ph.plan(&Ctx {
+            cur: 100,
+            tgt: 30,
+            heads: 4
+        })
+        .is_none(),
         "PerHead keep → host bail(None, silent garbage 방지)"
     );
 
     // (11) 동적 중복 reject(CF4 ⑥): 같은 multi-format .so 재등록 → 이미 등록됨.
-    let e = register_dynamic_plugins(std::slice::from_ref(&multi)).unwrap_err().to_string();
+    let e = register_dynamic_plugins(std::slice::from_ref(&multi))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("중복"), "동적 중복 reject: {e}");
 }

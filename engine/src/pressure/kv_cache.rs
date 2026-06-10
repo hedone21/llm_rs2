@@ -237,7 +237,8 @@ impl KVCache {
         } else {
             match dtype {
                 crate::buffer::DType::Q4_0 => {
-                    (n_values / crate::quant::QK4_0) * std::mem::size_of::<crate::quant::BlockQ4_0>()
+                    (n_values / crate::quant::QK4_0)
+                        * std::mem::size_of::<crate::quant::BlockQ4_0>()
                 }
                 _ => n_values * dtype.size(),
             }
@@ -289,8 +290,20 @@ impl KVCache {
                         let new_hs = new_cap * bph;
                         let cph = self.current_pos * bph;
                         for h in 0..self.kv_heads {
-                            backend.copy_slice(&self.k_buffer, &mut new_k, h * old_hs, h * new_hs, cph)?;
-                            backend.copy_slice(&self.v_buffer, &mut new_v, h * old_hs, h * new_hs, cph)?;
+                            backend.copy_slice(
+                                &self.k_buffer,
+                                &mut new_k,
+                                h * old_hs,
+                                h * new_hs,
+                                cph,
+                            )?;
+                            backend.copy_slice(
+                                &self.v_buffer,
+                                &mut new_v,
+                                h * old_hs,
+                                h * new_hs,
+                                cph,
+                            )?;
                         }
                         log::info!(
                             "[KVCache] Growing capacity: {} → {} tokens (opaque)",
@@ -440,8 +453,20 @@ impl KVCache {
                         let new_hs = new_head_stride / qk;
                         let cph = copy_per_head / qk;
                         for h in 0..self.kv_heads {
-                            backend.copy_slice(&self.k_buffer, &mut new_k, h * old_hs, h * new_hs, cph)?;
-                            backend.copy_slice(&self.v_buffer, &mut new_v, h * old_hs, h * new_hs, cph)?;
+                            backend.copy_slice(
+                                &self.k_buffer,
+                                &mut new_k,
+                                h * old_hs,
+                                h * new_hs,
+                                cph,
+                            )?;
+                            backend.copy_slice(
+                                &self.v_buffer,
+                                &mut new_v,
+                                h * old_hs,
+                                h * new_hs,
+                                cph,
+                            )?;
                         }
                     } else {
                         for h in 0..self.kv_heads {
@@ -720,7 +745,11 @@ impl KVCache {
                 for h in 0..self.kv_heads {
                     let lo = s * row + h * self.head_dim;
                     let off = h * head_stride + pos * bph;
-                    encode_via_descriptor(&desc, &src[lo..lo + self.head_dim], &mut all[off..off + bph])?;
+                    encode_via_descriptor(
+                        &desc,
+                        &src[lo..lo + self.head_dim],
+                        &mut all[off..off + bph],
+                    )?;
                 }
             }
         }
@@ -785,8 +814,18 @@ impl KVCache {
                     let head_stride = self.capacity * bph;
                     for h in 0..self.kv_heads {
                         let base = h * head_stride;
-                        backend.buffer_shift(&mut self.k_buffer, base + count * bph, base, remaining * bph)?;
-                        backend.buffer_shift(&mut self.v_buffer, base + count * bph, base, remaining * bph)?;
+                        backend.buffer_shift(
+                            &mut self.k_buffer,
+                            base + count * bph,
+                            base,
+                            remaining * bph,
+                        )?;
+                        backend.buffer_shift(
+                            &mut self.v_buffer,
+                            base + count * bph,
+                            base,
+                            remaining * bph,
+                        )?;
                     }
                     self.current_pos = remaining;
                     self.release_unused_pages();
@@ -898,8 +937,18 @@ impl KVCache {
                     let head_stride = self.capacity * bph;
                     for h in 0..self.kv_heads {
                         let base = h * head_stride;
-                        backend.buffer_shift(&mut self.k_buffer, base + src_pos * bph, base + dst_pos * bph, count * bph)?;
-                        backend.buffer_shift(&mut self.v_buffer, base + src_pos * bph, base + dst_pos * bph, count * bph)?;
+                        backend.buffer_shift(
+                            &mut self.k_buffer,
+                            base + src_pos * bph,
+                            base + dst_pos * bph,
+                            count * bph,
+                        )?;
+                        backend.buffer_shift(
+                            &mut self.v_buffer,
+                            base + src_pos * bph,
+                            base + dst_pos * bph,
+                            count * bph,
+                        )?;
                     }
                     return Ok(());
                 }
@@ -980,8 +1029,18 @@ impl KVCache {
             let bph = self.opaque_bytes_per_head();
             let head_stride = self.capacity * bph;
             let base = head * head_stride;
-            backend.buffer_shift(&mut self.k_buffer, base + src_pos * bph, base + dst_pos * bph, count * bph)?;
-            backend.buffer_shift(&mut self.v_buffer, base + src_pos * bph, base + dst_pos * bph, count * bph)?;
+            backend.buffer_shift(
+                &mut self.k_buffer,
+                base + src_pos * bph,
+                base + dst_pos * bph,
+                count * bph,
+            )?;
+            backend.buffer_shift(
+                &mut self.v_buffer,
+                base + src_pos * bph,
+                base + dst_pos * bph,
+                count * bph,
+            )?;
             return Ok(());
         }
 

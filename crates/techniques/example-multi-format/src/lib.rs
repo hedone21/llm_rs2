@@ -59,6 +59,9 @@ mod tests {
         assert_eq!(q4.packing, Packing::Nibble);
         assert_eq!(q8.bits, 8);
         assert_eq!(q8.packing, Packing::Byte);
-        assert_ne!(q4, q8, "두 format 의 descriptor 는 서로 달라야 한다(미스바인딩 검출)");
+        assert_ne!(
+            q4, q8,
+            "두 format 의 descriptor 는 서로 달라야 한다(미스바인딩 검출)"
+        );
     }
 }

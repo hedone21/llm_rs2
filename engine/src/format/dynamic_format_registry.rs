@@ -86,7 +86,10 @@ pub(crate) fn try_register_format(lib: &Arc<libloading::Library>, path: &Path) -
         let name = unsafe { CStr::from_ptr(vtable.name) }
             .to_str()
             .with_context(|| {
-                format!("plugin {}: format name[{i}] 이 유효 UTF-8 아님", path.display())
+                format!(
+                    "plugin {}: format name[{i}] 이 유효 UTF-8 아님",
+                    path.display()
+                )
             })?
             .to_owned();
         if technique_api::find_kv_format(&name).is_some() {
@@ -106,7 +109,9 @@ pub(crate) fn try_register_format(lib: &Arc<libloading::Library>, path: &Path) -
         pending.push((name, vtable_ptr));
     }
     // ── pass 2: 동적 registry 중복 검사 + 일괄 push (write-lock 1회 = per-.so 원자). ──
-    let mut w = registry.write().expect("DYN_FORMAT_REGISTRY RwLock poisoned");
+    let mut w = registry
+        .write()
+        .expect("DYN_FORMAT_REGISTRY RwLock poisoned");
     for (name, _) in &pending {
         if w.iter().any(|r| r.name == *name) {
             anyhow::bail!(
@@ -171,7 +176,9 @@ pub fn make_format(name: &str) -> Option<Box<dyn KVFormat>> {
     // 2) 동적(dlopen) fallback.
     let registry = DYN_FORMAT_REGISTRY.get()?;
     let (vtable, lib) = {
-        let guard = registry.read().expect("DYN_FORMAT_REGISTRY RwLock poisoned");
+        let guard = registry
+            .read()
+            .expect("DYN_FORMAT_REGISTRY RwLock poisoned");
         let reg = guard.iter().find(|r| r.name == name)?;
         (reg.vtable, Arc::clone(&reg._lib))
     };

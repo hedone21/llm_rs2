@@ -1173,8 +1173,7 @@ impl Backend for HtpFastrpcBackend {
         {
             let ks = k_cache.shape().dims();
             // HeadMajor 판정 = CPU attention_gen 과 동일 (ks[1]==n_kv && ks[1]!=ks[2]).
-            let is_head_major =
-                ks.len() >= 3 && ks[1] == num_heads_kv && ks[1] != ks[2];
+            let is_head_major = ks.len() >= 3 && ks[1] == num_heads_kv && ks[1] != ks[2];
             if std::env::var_os("LLMRS_HTP_NPU_ATTN").is_some()
                 && scores_out.is_none()
                 && is_head_major

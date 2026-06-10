@@ -80,9 +80,14 @@ mod tests {
 
     #[test]
     fn bundle_registers_both_axes() {
-        assert_eq!(find_stage("bundle_keep").expect("stage 등록").name, "bundle_keep");
         assert_eq!(
-            find_stage("bundle_perhead").expect("perhead stage 등록").name,
+            find_stage("bundle_keep").expect("stage 등록").name,
+            "bundle_keep"
+        );
+        assert_eq!(
+            find_stage("bundle_perhead")
+                .expect("perhead stage 등록")
+                .name,
             "bundle_perhead"
         );
         assert_eq!(

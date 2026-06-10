@@ -993,8 +993,8 @@ impl TransformerModel {
         hw: &crate::hardware::Hardware,
     ) -> Result<usize> {
         use crate::format::weight_format::{LayerDispatch, PartitionShare, WeightFormat};
-        use technique_api::DeviceTarget;
         use crate::layers::tensor_partition::is_gpu_only_ratio;
+        use technique_api::DeviceTarget;
 
         // GPU-only fast path: leave partition_ctx cleared so forward() takes
         // the dense full-weight GPU matmul path. Avoids per-token host

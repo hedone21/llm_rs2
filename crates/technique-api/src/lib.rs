@@ -1099,8 +1099,7 @@ macro_rules! register_kv_format {
                 // ADR-0009 #116: $make(Rust-ABI fn)는 여기 내부 호출 전용 — extern "C" 직접 캐스팅 금지.
                 let make_fn: fn() -> __Handle = $make;
                 let fmt: __Handle = make_fn();
-                ::std::boxed::Box::into_raw(::std::boxed::Box::new(fmt))
-                    as *mut ::core::ffi::c_void
+                ::std::boxed::Box::into_raw(::std::boxed::Box::new(fmt)) as *mut ::core::ffi::c_void
             }
 
             unsafe extern "C" fn __layout(h: *mut ::core::ffi::c_void) -> $crate::KVLayoutDesc {
@@ -1845,11 +1844,7 @@ mod tests {
     unsafe extern "C" fn st_make(_p: *const StageParams) -> *mut c_void {
         ::core::ptr::null_mut()
     }
-    unsafe extern "C" fn st_plan(
-        _h: *mut c_void,
-        _c: *const StageCtxAbi,
-        _o: *mut PlanAbi,
-    ) -> i32 {
+    unsafe extern "C" fn st_plan(_h: *mut c_void, _c: *const StageCtxAbi, _o: *mut PlanAbi) -> i32 {
         KV_PLAN_NOOP
     }
     unsafe extern "C" fn st_plan_free(_o: *mut c_void) {}
@@ -1913,7 +1908,9 @@ mod tests {
         for (i, expect) in ["rt_env_a", "rt_env_b"].iter().enumerate() {
             // SAFETY: vtables 는 FMT_EXPORT_VTS('static 배열) base, i < count.
             let vt = unsafe { &*env.vtables.add(i) };
-            let name = unsafe { core::ffi::CStr::from_ptr(vt.name) }.to_str().unwrap();
+            let name = unsafe { core::ffi::CStr::from_ptr(vt.name) }
+                .to_str()
+                .unwrap();
             assert_eq!(&name, expect);
         }
     }
@@ -1927,7 +1924,9 @@ mod tests {
         for (i, expect) in ["rt_st_a", "rt_st_b"].iter().enumerate() {
             // SAFETY: vtables 는 STAGE_EXPORT_VTS('static 배열) base, i < count.
             let vt = unsafe { &*env.vtables.add(i) };
-            let name = unsafe { core::ffi::CStr::from_ptr(vt.name) }.to_str().unwrap();
+            let name = unsafe { core::ffi::CStr::from_ptr(vt.name) }
+                .to_str()
+                .unwrap();
             assert_eq!(&name, expect);
         }
     }
@@ -1950,7 +1949,11 @@ mod tests {
     fn register_kv_format_multicall_dynamic() {
         let names: Vec<&str> = PLUGIN_KV_FORMAT_VTABLES
             .iter()
-            .map(|vt| unsafe { core::ffi::CStr::from_ptr(vt.name) }.to_str().unwrap())
+            .map(|vt| {
+                unsafe { core::ffi::CStr::from_ptr(vt.name) }
+                    .to_str()
+                    .unwrap()
+            })
             .collect();
         assert!(names.contains(&"v1_mc_a"), "v1_mc_a 동적 누적: {names:?}");
         assert!(names.contains(&"v1_mc_b"), "v1_mc_b 동적 누적: {names:?}");

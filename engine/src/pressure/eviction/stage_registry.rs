@@ -456,7 +456,12 @@ pub(crate) fn try_register_stage(lib: &Arc<libloading::Library>, path: &Path) ->
         let vtable = unsafe { &*vtable_ptr };
         let name = unsafe { CStr::from_ptr(vtable.name) }
             .to_str()
-            .with_context(|| format!("plugin {}: stage name[{i}] 이 유효 UTF-8 아님", path.display()))?
+            .with_context(|| {
+                format!(
+                    "plugin {}: stage name[{i}] 이 유효 UTF-8 아님",
+                    path.display()
+                )
+            })?
             .to_owned();
         // 빌트인 우선 — silent override 차단(Known Bug #1/#2 류 재발 방지).
         if technique_api::find_stage(&name).is_some() {
@@ -617,7 +622,10 @@ impl KVCacheStage for DynStage {
                 }
             }
             other => {
-                eprintln!("[DynStage:{}] plugin plan 오류 코드 {other} — no-op 처리", self.name());
+                eprintln!(
+                    "[DynStage:{}] plugin plan 오류 코드 {other} — no-op 처리",
+                    self.name()
+                );
                 None
             }
         }
