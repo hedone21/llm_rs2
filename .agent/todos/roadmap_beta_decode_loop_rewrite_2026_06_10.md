@@ -1,0 +1,132 @@
+# Phase β substep roadmap — DecodeLoop 재작성 (확정)
+
+**작성**: 2026-06-10 (메인 세션). 설계 = 워크플로우 `wf_56289e25-f8b` 21-agent(census 6 → 설계 3안 → judge 3-lens → 합성 → substep별 적대 검증 + critic) + **사용자 grill 7건 해소(G1~G7, 아래 결정 기록)**.
+**상태**: **확정 — β-1 착수 가능.**
+**HEAD**: `428ed2d6` (코드 상태 = `1f93d6b1` 동일, docs-only 2커밋 차)
+**SSOT**: `arch/pipeline_stage_design_v2.md` §5/§5.4/§2.1/§9.1 · 진입 handoff `handoff_beta_decode_loop_rewrite_entry_2026_06_10.md`
+**검증 감사**: 적대 검증 refuted 3건(β-2/β-4/β-5) + critic 8건 → 본문에 전부 보정 반영(soft "[보정]" 표기).
+
+---
+
+## ⚠️ 선결 사실 — master 가 이미 RED (β-1 이 해소)
+
+`cargo test -p llm_rs2 --test spec test_inv_layer_006` **FAIL (HEAD 직접 재현)**. 원인 = AB-1(`94ef643f`)이 추가한 `decode_loop.rs:45 cache_manager: Option<CacheManager>` concrete 필드가 BANNED substring 검사(test_inv_layer_006.rs:28)에 걸림. 당시 게이트가 lib test 만 돌고 `--test spec` integration target 미실행으로 유출. **[G7 결정] β-1 에서 INV-LAYER-006 spec+test 개정으로 해소**(과도기 필드 명시 허용 + β-3 에서 필드 제거 후 금지 복원).
+
+---
+
+## Grill 결정 기록 (2026-06-10, 사용자 확정)
+
+| # | 결정 |
+|---|---|
+| **G1** | **AB- mode dispatch owner = β.** AB-2(KIVI)/AB-4(partition)/AB-6(weight-swap) 트랙 일시 동결 — β-4(OneShot Stage+LoopControl) 확정 후 Stage 모델로 직접 구현. AB-2 는 D8 ABI 변경(2026-06-10) 후 계획 유효성 재확인 동반. |
+| **G2** | **SSOT normative 문언 3건 전부 승인**: (i) v2:534 "5 hook 흡수" → "2종(DecodeObserver/StopCondition) 흡수 + 3종(StepHook/PhaseHook/LayerBoundaryHook, 발화 경로 0 orphan) 삭제·phase 어휘 승계 + pull형 표면 5종은 on_phase 환원 불가" (ii) §2.1:196 "Forward SUPERSEDED" → 슬림 내부 seam 잔존(3-impl 다형성) (iii) §9 γ 재정의(rename 189ref/53file · nested mod.rs 38개 sweep · argus-eval/chat bin화 · batch orphan 처분). → **β-1 normative 커밋에 포함.** |
+| **G3** | **orphan hook 3종 + eval/batch orphan 코드 = β-7 동반 삭제.** spec INV-147/149/150 은 phase 어휘 등가 승계 또는 폐기 표기. |
+| **G4** | **ManagerPressureSource/LocalPolicy = defer(seam 만).** β-5 는 LocalPressureSource(memory-only)까지. 엔진측 융합(wire 무확장 가능 — 검증 확인)·로컬 센서 인프라는 β 밖 후속. v2:651 "manager-less 이산 정책 1급" 문언 긴장은 SSOT 에 명시(β 범위 manager-less = memory graded 만 1급). |
+| **G5** | **chat max_pos break 마지막 토큰 미포함 거동 = bit-identical 보존**(β-6 거동 고정 테스트 기준). 버그 여부 판단은 β 이후 분리. |
+| **G6** | **suspend = loop break 보존**(β-4). Resume 유의미화(pause/park)는 수요 발생 시 후속 — LoopControl seam 이 확장 지점. |
+| **G7** | **master RED = β-1 에서 INV-LAYER-006 개정으로 해소**(즉시 hotfix 안 함). |
+
+---
+
+## TL;DR
+
+7 substep 직선 위상(dependency-first 골격, judge 2/3 승자 + 타 안 이식): **계약(β-1) → 빈 배선(β-2) → eviction seam(β-3) → command 분해(β-4) → pressure 일원화(β-5) → chat 수렴(β-6) → v1 삭제(β-7)**. 매 substep 컴파일+실행(branch-by-abstraction §9.1 R3). device 왕복 ≈ 6회. tbt Δ≤+3% 기준은 **항상 α-K frozen 절대값**(54.22/54.04/53.79 ms/tok — rolling 재기준화 금지). eviction 경로는 (γ) 선례대로 host 정식 + β-3 **신규 eviction baseline 동결**(`frozen_baseline_beta_evict_*.md`)이 β-4/5/7 회귀 기준.
+
+| id | 제목 | 게이트 tier | 의존 |
+|---|---|---|---|
+| β-1 | 계약·어휘 마감 — PipelineRegistry + 계약 + SSOT 정오표·normative(G2) + INV-LAYER-006 개정(G7) | host | — |
+| β-2 | driver phase 배선 — run()/prefill() empty-registry dispatch (run_until_stop 미접촉) | device | β-1 |
+| β-3 | World A eviction 발화 seam(F1) — wrap-당김 + stages/kv/eviction.rs UER 경유 + baseline 동결 | host 정식 + device | β-2 |
+| β-4 | α-W-3b 흡수 — 매핑표 선행 + CommandSource→CommandDispatcher→LoopControl + evict 4종 OneShot | device | β-3 |
+| β-5 | PressureLevel→Pressure(band) ripple 10파일 + LocalPressureSource(happy-path 무주입) | host + device-sanity | β-3, β-4 |
+| β-6 | chat 수렴 — 거동 고정 테스트 선행 + run_until_stop 단일 driver 통합 + prev_token 승격 | host 정식 + device 1회 | β-4, β-5 |
+| β-7 | v1 표면 삭제 + builder 대체 + TokenSampler 이동 + orphan 삭제(G3) — 최종 게이트 | device (최종) | β-6 |
+
+---
+
+## substep 상세
+
+### β-1 — 계약·어휘 마감 (additive, unwired) — ★다음 착수
+
+1. **신설 `engine/src/session/pipeline_registry.rs`** (L4, §2.1 규칙 C no-`mod.rs`): `PipelineRegistry{stages: Mutex<Vec<Arc<dyn PipelineStage+Send+Sync>>>, len: AtomicUsize}` + `submit()` + `impl PipelineDispatcher` — v2:585-599 그대로(submit 순서 순회·Consumed→OneShot GC·Stop→break·Err→panic fail-fast). **빈-registry fast-path**: dispatch 진입부 `len.load(Relaxed)==0` 즉시 반환. 기존 trait 시그니처(`pipeline.rs:183-185`) 기계적 실현에 한정 — 신규 설계 0.
+2. **OpProfiler 수명 계약**: `StageContext{step, profiler: &'a mut OpProfiler}` — DecodeLoop 이 OpProfiler 1개 소유, dispatch 호출부마다 `&mut` 재대여. registry unit test 로 고정.
+3. **spec-gap 계약 확정 + spec test 신설**(INV-DECODE-STAGE-004/005/006/007): (i) `on_phase` `Result` ↔ dispatcher Err→panic = fail-fast 고정, (ii) StopReason v1 5-variant(traits.rs:48-55) ↔ v2 4-variant(pipeline.rs:106) 수렴 매핑 — StopFlag 는 driver 자체 stop_flag 체크 잔존·variant 무추가, (iii) **eviction pos-환류 계약** — StageOutcome 무변경, driver 가 eviction phase dispatch 후 held handle `current_pos` 비교로 pos 갱신 + `forward.on_kv_prune`(model_forward.rs:474-486) 호출 의무. **EvictionStage 트리거 phase 명시 확정**(v1 발화 지점=forward 전 → `PreEviction`/`PostEviction` dispatch 지점 + OneShot 소비 phase) + 미발화 phase variant(PreLayer/PostLayer/Fine 등) 처분 doc 기재. StepInfo 3필드 유지(prev_token 승격은 β-6).
+4. **INV-LAYER-006 개정 [G7]**: (i) master RED 해소 — 과도기 필드(`cache_manager`) 명시 허용 표기 + β-3 제거 후 금지 복원 예정 기재, (ii) OpProfiler 보유 계약 반영(BANNED 'Profiler' + spec/41:499 normative 개정), (iii) `pipeline.rs` 헤더 L2 ↔ spec/41:499 "PipelineDispatcher trait = L4" 불일치 해소(배치 확정 + 정오표).
+5. **SSOT 정오표 + normative 커밋 [G2 승인]**: (a) 사실 정오표 — §9.1 F1 'try_evict 미호출' stale(AB-1 기배선, happy-path 는 cache_manager=None 미발동), 'fmt.compact()' 서술→`execute_kv_plan` 정본, line drift(:558→:654, kv_cache.rs:857→:1113), ExecutionPlan 15→19필드, §9 γ stale, **"manager Level-only 송출" 오기 정정**(SystemSignal 은 graded magnitude 기운반 — 편차는 manager측 융합 부재뿐). census 전제 3건(try_evict 기배선·ResilienceAction/MemoryStrategy 기삭제·compact_parity 9종 완비) 전제 절 고정. (b) normative — G2 승인 문언 3건((i) hook 흡수 재서술 (ii) Forward 잔존 (iii) γ 재정의) 반영.
+
+- **게이트(host)**: build + `cargo test --workspace` + fmt + clippy `-D warnings`. registry unit(순서/Consumed GC 1회성/Stop break/Err panic/len==0 무lock). INV-DECODE-STAGE-004~007 green. **INV-LAYER-006 개정 후 full suite green 복구**(현 master RED 해소 확인 포함). 소비자-0 grep = 옛 경로 byte-identical. SSOT 정오표·normative 커밋 동행 의무.
+- **위험**: 계약 오고정 시 β-2~7 재작업(RPN≈120 — 실패 모드는 재작업). 완화 = 계약 spec test 선박.
+
+### β-2 — driver phase 배선 (empty-registry, 거동-0)
+
+`decode_loop.rs` run(:124-346)/prefill(:79-105)에만 `Arc<PipelineRegistry>` 슬롯(builder `with_pipeline`, default empty) + phase 발화: PrefillStart/PrefillEnd/DecodeStart/PreForward/PostForward/PreSample/PostSample/DecodeEnd/Finalize. **run_until_stop(:356-497) 미접촉**(단 chat 도 prefill() 공유(chat/session.rs:100)라 Prefill 2종 phase 는 chat 에 닿음 — empty registry 거동-0, chat spec 2종 커버). StepInfo{pos, decode_step, pressure=`Pressure::default()`} 스냅샷. v1 trait 호출 (a)~(h) 전부 보존. per-token 발화 = 6 phase. PreLayer/PostLayer/Fine 미발화(orphan + INV-HOTPATH-DISPATCH layer-tier dyn 금지) — β 범위 제외.
+
+- **게이트(device)**: host 선행(full suite + chat spec 2종). device(S25): `argus_cli --no-resilience` frozen baseline 3-dtype sig md5(f16 `304f4ada..`/f32 `684d01d9..`/q4 `1cfba273..`) + avg_tbt n=5 median **Δ≤+3%(α-K frozen 절대값 기준 — 전 substep 공통, rolling 금지)**.
+- **위험**: per-token 6 phase 오버헤드. 완화 = len==0 fast-path + 절대 기준 실측; 회귀 시 emission 축소로 substep 내 후퇴.
+
+### β-3 — World A eviction 발화 seam (§9.1 F1)
+
+- **commit A(단독 revert 가능)**: model_forward.rs `ensure_fmt_wrapped`(:229-246) lazy wrap → construction 시점 이동 + accessor `fn fmt_caches(&self)->&[Arc<StandardFormat>]` 신설(INV-STAGE-LAYER-HANDLE 충족). `kv_caches.is_empty()` 가드 보존 + chat reset_kv/빈 캐시 회귀 test.
+- **commit B**: 신설 `engine/src/stages/kv/eviction.rs`(§2.1 최종 위치 직행): v2 concrete `EvictionStage`(PipelineStage impl, Persistent⊕OneShot 同코드), register 시점 `Vec<Arc<StandardFormat>>` 보유. 적용 경로 = **CacheManager UER 경유**(take_inner/put_inner — v1 try_evict 와 산출 동일: madvise/CacheEvent/min-floor 회계 보존; `plan_keep→execute_kv_plan` 직접 전환은 friction-triggered 후속). 트리거 1차 cut = v1 AB-1 동일 조건(OneShot). pos 환류 = β-1 계약. wiring: build_bench_loop eviction 시나리오 제출 → v1 AB-1 경로(decode_loop.rs:168-194) 등가 비교. compact_parity.rs 9종 자산 승계. β-3 완료 시 **`cache_manager` 과도기 필드 제거 + INV-LAYER-006 금지 복원**(G7 마감).
+- **게이트**: host 정식((γ) 선례) — stage 발화 vs **v1 try_evict 산출** 등가 integration test: **sliding + h2o + streaming(`sink_size.max(1)` 경계 포함) × F32/F16/Q4_0 = 9종 + min-floor 발화 경계 1종**. **자기 비교 금지 — anchor = v1 live 경로 산출.** device: commit A 단독 = 3-dtype sig md5 + avg_tbt Δ≤+3%(production prefill/step 접촉 → bit-identical 필수). commit B = argus_bench `--eviction-policy sliding` S25 crash-free + `[CacheEvent] Eviction completed` 발화 확인(비-vacuous) + **신규 eviction baseline 동결 → `frozen_baseline_beta_evict_2026_06.md`** — **command-driven evict(manager directive, (a.5)) 시나리오 포함**(β-4 게이트 전제; AB-1 + build_bench_loop `with_cache_manager` + mock_manager 실재 — handoff 의 "AB- 재구현 대기" landmine 은 이 경로 한정 stale).
+- **위험**: wrap 시점 변경 → plan lazy build(:405-437) 전 상태 변화 silent garbage(2026-04-14 선례). 완화 = commit A 단독 격리 + 3-dtype bit-identical + on_kv_prune 재사용 + 'eviction 직후 1-step 출력 일치' unit.
+
+### β-4 — α-W-3b 흡수 (ENG-ST-054, v2 §5.4 A-1)
+
+**선행 산출물(코드 diff 전 단독 커밋)**: EngineCommand 18-variant(shared/src/lib.rs:189-278) × ExecutionPlan 19필드(executor.rs:19-65) 구→신 채널 전수 매핑표 + sticky 3-상태(evict_applied decode_loop.rs:48,:169 / sticky carry executor.rs:306-317 / RestoreDefaults reset :484-502) 전이 등가표 — arch/ 부속 문서. **(a.5) method-drop 시맨틱(evict_plan.method 무시, CacheManager CLI 정책 force_evict)도 적시.**
+
+1. `CommandSource`(traits.rs:171) retarget: `poll()->Vec<EngineCommand>`(pure). ManagerCommandSource = 구 CommandExecutor::poll(:289-358) mpsc drain 분리.
+2. 신설 `engine/src/session/command_dispatcher.rs`(L4): 구 apply_command(:360-571) 이동. ② Throttle/SetTargetTbt/Suspend/Resume/RestoreDefaults/RequestQcf/SetPrefillPolicy → **LoopControl** 신설. ① **evict-family 4종**(KvEvictH2o :397/KvEvictSliding :411/KvStreaming :428/KvMergeD2o :451) → `registry.submit(OneShot EvictionStage)`. KvQuantDynamic/KvOffload/SwapWeights/SetPartitionRatio/LayerSkip = LoopControl 과도기 필드 잔존(deprecated 표기 — **[G1] β가 owner: AB-2/4/6 Stage 구현 후속 substep 에서 이전**, 미실재 stage 선축조 금지). ③ SwitchHw/PrepareComputeUnit = Hardware resolve seam 만.
+3. run() (a)(a.5)(a.6)(h) plan 소비 → dispatcher+LoopControl 교체. **컴파일 ripple 전수**: run_until_stop(:382-389) 소비부 동시 교체(chat 거동 무변 = chat spec 게이트), batch/runner.rs:495(orphan 이나 컴파일 필수 — 동시 마이그레이션/shim), NoOpCommandSource(defaults.rs:39), ResilienceAdapter/CmdSrcWrapper(resilience_adapter.rs:37/:72). **suspend = break 보존 [G6].** sticky evict → OneShot Consumed GC 등가.
+4. **heartbeat conduit**: 현 유일 트리거 = CmdSrcWrapper.poll → executor.poll 상단(:292-296), KVSnapshot 이 poll 인자로만 흐름 → poll pure 화로 단절 위험. **매핑표에 송출 경로 보존 설계 명시**(EngineReport 는 heartbeat 메서드 부재 + DecodeLoop.report dead_code) + **host 게이트에 heartbeat 연속성 test(actual_throughput 송출 등가)**.
+5. ResilienceAction/MemoryStrategy/ResilienceStrategy 시그니처 = 기완료 — 작업 0.
+
+- **게이트(device)**: host — 매핑표 행별 등가 test(mock_manager directive 시퀀스): suspend/throttle/tbt/evict 4종 + **live 소비 경로 보유 SwapWeights(:246)/KvQuantDynamic(:465)/KvOffload(:476) 포함 — 과도기 필드도 구==신 등가 의무** + dispatcher EngineCommand exhaustive match(18-variant 컴파일 강제) + sticky 전이 unit + heartbeat 연속성 test + full suite + `cargo test --no-run`. device: argus_cli --no-resilience 3-dtype sig md5 + avg_tbt Δ≤+3% + resilience-on smoke + **β-3 eviction baseline 재확인(command-driven + pressure-driven 무변 1줄 — β-5 단독 귀속 전제)**.
+- **위험**: suspend/sticky/heartbeat 미세 시맨틱 변형 → manager-full 회귀. 완화 = 매핑표 선행 + exhaustive match + heartbeat 잔류·연속성 test + baseline 검증.
+
+### β-5 — Pressure 일원화 (Level→Pressure+band)
+
+1. **ripple 단독 commit(behavior-preserving)**: PressureLevel→`Pressure`+`band()` — **실측 10파일 = src 8**(pressure.rs :61/:154, handler 4종, cache_manager :153, build_bench_loop :27/:85, chat/session.rs :29/:617) **+ tests 2**(tests/spec/test_eng_alg_060_092.rs 16곳, tests/test_action_pool.rs 8곳 — integration target, `cargo build` 로 안 잡힘). determine_pressure_level 계단(t, t/2, t/4) 산식 그대로 이식 — 4-level↔band 전사 매핑.
+2. LocalPressureSource 신설(session/): canonical band cutoff 소유(pipeline.rs:44-49 placeholder 교체), memory-only(/proc/meminfo).
+3. **주입 정책 = 구조적 무접촉**: build_standard_loop 무주입(happy-path pressure 소비자 0 — per-token syscall 차단), StepInfo.pressure source 부재 시 0. build_bench_loop 만 주입 — 내부 N-step 캐시(N=8, 실측 확정).
+4. EvictionStage Persistent band-driven 발화 + OneShot 同코드 test 증명.
+5. **ManagerPressureSource = defer [G4]** — seam 만. SSOT 에 "β 범위 manager-less = memory graded 만 1급" 명시.
+
+- **게이트(host + device-sanity)**: host — level↔band 경계값 전수 unit(4-level × t/t÷2/t÷4 — eviction/swap trigger 임계 불변) + full suite + **`cargo test --no-run` 전수** + SystemMonitor mock pressure-driven eviction 시나리오. device: argus_cli happy-path sig 무변(무접촉 증명) + argus_bench pressure-driven eviction 1회 — **β-3 동결 baseline 대비**(단독 측정 지점).
+- **위험**: band cutoff off-by-one(silent graded 변화). 완화 = 산식 그대로 + 경계값 전수 unit + ripple 단독 commit.
+
+### β-6 — chat 수렴 (run_until_stop 통합)
+
+- **commit A(선행)**: chat 거동 고정 테스트 — run_until_stop(:485-489) max_pos break 마지막 토큰 미포함(**[G5] 보존 확정**), stop 체크 pos-증가-후 타이밍, **turn-boundary score-fed try_evict(chat/session.rs:194/:286 — live 소비자, AttentionScoreAccumulator scores 전달)** 를 수렴 diff 이전에 박음. turn-boundary eviction = decode loop 밖 경로라 **직접 호출 보존**(stage 화 안 함 — TurnStart/TurnEnd 관계만 doc).
+- **commit B**: run_until_stop(:356-497, ~140줄 중복) → run 골격 단일 driver 통합 — chat 차이는 registry 등록물 + LoopControl 구성으로 표현, driver 본문 분기 신설 금지. StopCondition(chat/stop_condition.rs:13) → PostSample 구독 stage `StageOutcome::Stop(StopReason)` 반환. **StepInfo `prev_token: u32` 승격 동반**(v2:557 trigger 정식 발동, driver 기보유 ripple 0). TurnStart/TurnEnd 발화. ChatSession 3종 빌드(:439/:494/:553) registry 이식.
+- **commit C**: TokenTickSink(live = ResilienceAdapter TickWrapper) → 신설 `engine/src/stages/system/tick.rs` PostSample 구독 stage — heartbeat token count 채널 보존.
+- **게이트(host 정식 + device)**: host — chat spec 2종 + commit A 거동 고정 전부 green + token tick 등가 unit(구 on_token_generated 횟수 == 신 PostSample 발화 횟수) + full suite. device: argus_cli happy-path 3-dtype sig md5 + avg_tbt Δ≤+3% 1회 + **resilience-on 재검증(host mock_manager e2e tick 등가 + device resilience-on smoke 1회)**.
+- **위험**: chat 분기 happy-path 누설 / chat 미세 거동 발산. 완화 = 거동 고정 선행 + 차이를 등록물/구성으로 + device bit-identical.
+
+### β-7 — v1 표면 삭제 (순수 삭제 단독 편성, 최종 게이트)
+
+1. `session/traits.rs` 삭제: EvictionStage/SwapStage/TokenTickSink/ResilienceBundle/DecodeObserver/StepCtx/EvictionOutcome/SkipReason/StopReason(v1) — 등가물 pipeline.rs 수렴. **DecodeResult 는 삭제 아님 — §2.1:193 session/(L4) 이동만**(소비자 chat/session.rs:37·experiment_run.rs). run() v1 슬롯 (b)/(c)/(e)/(g) 제거 — production impl 전부 NoOp(거동-무변). defaults.rs NoOp 7종 제거.
+2. 생존 3종: TokenSampler→`inference/sampling.rs` 이동(front-door ①, Greedy/RepetitionPenalty impl 동행) / CommandSource(β-4 신 시그니처) / EngineReport(CommandExecutor 잔류). Forward = 슬림 내부 seam 잔존(G2-(ii) SSOT 문언 기반영).
+3. typestate builder(NoForward/HasForward :24-27,:648-679) → 신 assembly 대체 + INV-LAYER-007 compile_fail 등가 승계. **잔존 소비자 재배선 명시: experiment_run.rs(:87 + :19 v1 StopReason import) · standard_happy.rs(:70) · microbench/probe_inference_loop.rs:222.**
+4. **[G3 확정] orphan hook 3종(StepHook/PhaseHook/LayerBoundaryHook) + eval/batch orphan 코드(run_eval_ll/run_prompt_batch) 동반 삭제** — spec INV-147/149/150 은 phase 어휘 등가 승계 또는 폐기 표기.
+5. stages/*.rs doc stale 갱신 + no-`mod.rs` 최종 확인. 삭제 단일 커밋군 격리.
+
+- **게이트(device 최종)**: host — full suite + `cargo test --no-run` + clippy + compile_fail 승계 + grep `session::traits|StepCtx|EvictionOutcome` production 0. device(S25): argus_cli happy-path 3-dtype sig md5 + avg_tbt n=5 — **α-K frozen 절대 기준 누적 Δ≤+3%**('진짜 최종 perf') + β-3 eviction baseline MATCH + test_backend 5 op PASS + KIVI 오라클 Q2/Q4/Q8 + resilience-on smoke. 순수 삭제 = sig 무변, 불일치 = tripwire.
+- **위험**: 삭제 ripple orphan 비대화. 완화 = β-6 종료 시 소비자-0 grep census 선행 + 잔존 소비자 사전 이식. (G3 확정으로 잔존-허용 조항은 폐기 — 동반 삭제가 기본.)
+
+---
+
+## 후속 (β 범위 외, 기록)
+
+- **AB-2/4/6 Stage 모델 구현** — G1 결정에 따라 β-4 완료 후 β 후속 substep 또는 별도 트랙으로 재개(과도기 LoopControl 필드 이전 포함).
+- **ManagerPressureSource(엔진측 융합)·LocalPolicy·로컬 센서 인프라** — G4 defer 분.
+- **γ 재정의 잔여**(G2-(iii) SSOT 반영 후): kv/·weight/ rename(189ref/53file), nested mod.rs 38개 sweep, argus-eval/chat bin화, batch orphan 처분.
+- **chat 마지막 토큰 거동 버그 여부 판단** — G5 보존 분.
+- **suspend pause(park) 전환** — G6 보존 분.
+
+## 참조
+
+- SSOT: `arch/pipeline_stage_design_v2.md` §5(:532-655) · §5.4(:611-655) · §2.1(:168-207) · §9.1(:719-917)
+- 진입: `.agent/todos/handoff_beta_decode_loop_rewrite_entry_2026_06_10.md`
+- baseline: `.agent/todos/frozen_baseline_alpha_k_5f_2026_06_05.md` (+ β-3 산출 예정 `frozen_baseline_beta_evict_2026_06.md`)
+- spec: ENG-ST-054 (α-W-3b) · INV-LAYER-006/007 · INV-DECODE-STAGE-004~007
