@@ -123,7 +123,7 @@ pub const EXT_RPCMEM_ALLOCATOR: &str = "rpcmem_allocator";
 // `as_kivi_attention`/`gpu_score_acc`/`gpu_score_acc_mut` default 메서드는 본
 // re-export 된 trait 를 그대로 참조한다.
 pub use crate::capability::gpu_score::GpuScoreAccess;
-pub use crate::capability::kivi_attention::KiviAttentionBackend;
+pub use crate::capability::kivi_attention::{KiviAttentionBackend, KiviAttnArgs, KiviGatherArgs};
 
 pub trait Backend: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;

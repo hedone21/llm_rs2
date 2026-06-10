@@ -6,6 +6,8 @@ use llm_rs2::backend::cpu::CpuBackendAVX2;
 use llm_rs2::backend::cpu::{CpuBackend, CpuBackendCommon};
 #[cfg(feature = "opencl")]
 use llm_rs2::backend::opencl::OpenCLBackend;
+#[cfg(feature = "opencl")]
+use llm_rs2::backend::opencl::get_cl_mem;
 use llm_rs2::buffer::{Buffer, DType};
 use llm_rs2::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
@@ -1001,30 +1003,42 @@ fn perform_kivi_attention_test(
 
         // Output buffer
         let out_gpu_buf = gpu_memory.alloc(q_elems * 4, DType::F32)?;
-        let mut out_gpu = Tensor::new(
+        let out_gpu = Tensor::new(
             Shape::new(vec![1, n_heads_q, head_dim]),
             out_gpu_buf,
             backend.clone(),
         );
 
+        // D8: inherent attention_gen_kivi 가 raw cl_mem(`*mut c_void`) 시그니처로
+        // 바뀌어, `&Tensor` 6개에서 cl_mem 을 추출해 넘긴다. `Mem::as_ptr()` 가 이미
+        // `cl_mem`(= `*mut c_void`) 라 캐스트 불요.
+        let q_mem = get_cl_mem(q_gpu.buffer().as_ref())?.as_ptr();
+        let qk_mem = get_cl_mem(gpu_raw.qk_buf.buffer().as_ref())?.as_ptr();
+        let qv_mem = get_cl_mem(gpu_raw.qv_buf.buffer().as_ref())?.as_ptr();
+        let res_k_mem = get_cl_mem(gpu_raw.res_k.buffer().as_ref())?.as_ptr();
+        let res_v_mem = get_cl_mem(gpu_raw.res_v.buffer().as_ref())?.as_ptr();
+        let out_mem = get_cl_mem(out_gpu.buffer().as_ref())?.as_ptr();
         let start = Instant::now();
-        ocl.attention_gen_kivi(
-            &q_gpu,
-            gpu_raw.qk_buf,
-            gpu_raw.qv_buf,
-            gpu_raw.res_k,
-            gpu_raw.res_v,
-            &mut out_gpu,
-            n_heads_q,
-            kv_heads,
-            head_dim,
-            gpu_raw.q_tokens,
-            gpu_raw.res_tokens,
-            gpu_raw.res_cap,
-            scale,
-            None, // no scores output
-            bits,
-        )?;
+        // SAFETY: cl_mem 6개는 위에서 live GPU 버퍼로부터 추출한 유효 핸들(borrow-only).
+        unsafe {
+            ocl.attention_gen_kivi(
+                q_mem,
+                qk_mem,
+                qv_mem,
+                res_k_mem,
+                res_v_mem,
+                out_mem,
+                n_heads_q,
+                kv_heads,
+                head_dim,
+                gpu_raw.q_tokens,
+                gpu_raw.res_tokens,
+                gpu_raw.res_cap,
+                scale,
+                None, // no scores output
+                bits,
+            )?;
+        }
         backend.synchronize()?;
         let dur = start.elapsed();
 

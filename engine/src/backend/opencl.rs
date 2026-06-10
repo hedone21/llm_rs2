@@ -6959,13 +6959,38 @@ impl OpenCLBackend {
         Ok(())
     }
 
+    /// Wrap a borrowed raw `cl_mem` (`*mut c_void`, from a host-owned buffer)
+    /// into an ocl-core `Mem` for kernel-arg use **without** taking ownership.
+    ///
+    /// SAFETY/C5: `Mem` has a `Drop` impl that calls `clReleaseMemObject`. The
+    /// raw handle is *borrowed* (the engine buffer still owns the refcount), so
+    /// the wrapper is returned inside `ManuallyDrop` and the caller must never
+    /// let it drop — `Deref` yields a `&Mem` for `ArgVal::mem(..)`, refcount
+    /// stays unchanged. `ptr` must be a valid, non-null `cl_mem`.
+    #[inline]
+    unsafe fn borrow_cl_mem(ptr: *mut std::ffi::c_void) -> std::mem::ManuallyDrop<ocl::core::Mem> {
+        // cl_mem == *mut c_void (cl-sys), so the cast is identity.
+        std::mem::ManuallyDrop::new(unsafe {
+            ocl::core::Mem::from_raw_create_ptr(ptr as ocl::ffi::cl_mem)
+        })
+    }
+
     /// Gather new K/V tokens from SeqMajor input [seq_len, kv_heads, head_dim]
     /// into head-first residual buffer [kv_heads, res_cap, head_dim].
+    ///
+    /// `input_mem` / `residual_mem` are **borrowed** raw `cl_mem` handles (see
+    /// [`Self::borrow_cl_mem`], C5 borrow-only). The engine buffers retain
+    /// ownership; this fn never releases them.
+    ///
+    /// # Safety
+    /// `input_mem` and `residual_mem` must be valid, non-null `cl_mem` handles
+    /// belonging to this backend's context and live for the duration of the
+    /// call (borrow-only — the caller retains ownership).
     #[allow(clippy::too_many_arguments)]
-    pub fn kivi_gather_update(
+    pub unsafe fn kivi_gather_update(
         &self,
-        input: &Tensor,
-        residual: &mut Tensor,
+        input_mem: *mut std::ffi::c_void,
+        residual_mem: *mut std::ffi::c_void,
         kv_heads: usize,
         res_cap: usize,
         head_dim: usize,
@@ -6978,8 +7003,8 @@ impl OpenCLBackend {
             .as_ref()
             .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
 
-        let input_mem = get_cl_mem(input.buffer().as_ref())?;
-        let residual_mem = get_cl_mem(residual.buffer().as_ref())?;
+        let input_mem = unsafe { Self::borrow_cl_mem(input_mem) };
+        let residual_mem = unsafe { Self::borrow_cl_mem(residual_mem) };
 
         let total = seq_len * kv_heads * head_dim;
         let kv_heads_i = kv_heads as i32;
@@ -6989,8 +7014,8 @@ impl OpenCLBackend {
         let res_pos_i = res_pos as i32;
 
         unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(input_mem))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(residual_mem))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&input_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(&residual_mem))?;
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&res_cap_i))?;
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&head_dim_i))?;
@@ -7009,15 +7034,25 @@ impl OpenCLBackend {
     /// dequantization inside the attention kernel.
     ///
     /// `bits` selects the kernel variant: 2 → Q2, 4 → Q4, 8 → Q8.
+    ///
+    /// `q_mem` / `qk_mem` / `qv_mem` / `res_k_mem` / `res_v_mem` / `out_mem` are
+    /// **borrowed** raw `cl_mem` handles (see [`Self::borrow_cl_mem`], C5
+    /// borrow-only). The engine buffers retain ownership; this fn never
+    /// releases them.
+    ///
+    /// # Safety
+    /// All six `*_mem` arguments must be valid, non-null `cl_mem` handles
+    /// belonging to this backend's context and live for the duration of the
+    /// call (borrow-only — the caller retains ownership).
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_gen_kivi(
+    pub unsafe fn attention_gen_kivi(
         &self,
-        q: &Tensor,
-        qk_buf: &Tensor,
-        qv_buf: &Tensor,
-        res_k: &Tensor,
-        res_v: &Tensor,
-        out: &mut Tensor,
+        q_mem: *mut std::ffi::c_void,
+        qk_mem: *mut std::ffi::c_void,
+        qv_mem: *mut std::ffi::c_void,
+        res_k_mem: *mut std::ffi::c_void,
+        res_v_mem: *mut std::ffi::c_void,
+        out_mem: *mut std::ffi::c_void,
         num_heads_q: usize,
         num_heads_kv: usize,
         head_dim: usize,
@@ -7045,12 +7080,12 @@ impl OpenCLBackend {
             _ => return Err(anyhow!("Unsupported KIVI bits: {}", bits)),
         };
 
-        let q_buf = get_cl_mem(q.buffer().as_ref())?;
-        let qk_mem = get_cl_mem(qk_buf.buffer().as_ref())?;
-        let qv_mem = get_cl_mem(qv_buf.buffer().as_ref())?;
-        let res_k_mem = get_cl_mem(res_k.buffer().as_ref())?;
-        let res_v_mem = get_cl_mem(res_v.buffer().as_ref())?;
-        let o_buf = get_cl_mem(out.buffer().as_ref())?;
+        let q_buf = unsafe { Self::borrow_cl_mem(q_mem) };
+        let qk_mem = unsafe { Self::borrow_cl_mem(qk_mem) };
+        let qv_mem = unsafe { Self::borrow_cl_mem(qv_mem) };
+        let res_k_mem = unsafe { Self::borrow_cl_mem(res_k_mem) };
+        let res_v_mem = unsafe { Self::borrow_cl_mem(res_v_mem) };
+        let o_buf = unsafe { Self::borrow_cl_mem(out_mem) };
 
         let has_scores = scores_out.is_some() as i32;
         let total_tokens = q_tokens + res_tokens;
@@ -7078,12 +7113,12 @@ impl OpenCLBackend {
         let local_mem_size = local_size * std::mem::size_of::<f32>();
 
         unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(qk_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(qv_mem))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(res_k_mem))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(res_v_mem))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::mem(o_buf))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&q_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(&qk_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(&qv_mem))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(&res_k_mem))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(&res_v_mem))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::mem(&o_buf))?;
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::mem(s_buf))?;
             ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&(num_heads_q as i32)))?;
             ocl::core::set_kernel_arg(
@@ -7167,10 +7202,15 @@ impl OpenCLBackend {
     }
 }
 
-// §13.8-L S-L-3: KIVI native attention trait impl — 모두 OpenCLBackend
-// 의 inherent method 로 위임. `as_kivi_attention` 이 `Some(&self as &dyn
-// KiviAttentionBackend)` 를 반환하므로 caller 는 backend trait method 만
-// 사용해 downcast 가 사라진다.
+// D8(2026-06-10, single-trait): KIVI native attention trait impl — canonical
+// 정의가 `technique-api` 로 이동, ABI struct(`KiviAttnArgs`/`KiviGatherArgs`,
+// cl_mem) 시그니처. trait method 는 args 에서 raw cl_mem 을 꺼내 inherent
+// dispatch(byte-identical 로직) 로 위임하고 `Result` 를 `i32`(0=OK, 음수=err,
+// C3 panic=abort) 로 변환한다. `args.cl_queue` 는 plugin/dlopen 어댑터용 ABI
+// 슬롯 — 엔진 정적 impl 은 `&self.queue`(inherent 내 score readback) 를 직접
+// 알고 있어 사용하지 않는다(host 가 채워준 동일 핸들이라 결과 동일, byte-identical
+// 보존). `as_kivi_attention` 이 `Some(&self as &dyn KiviAttentionBackend)` 를
+// 반환하므로 caller 는 trait method 만 사용해 downcast 가 사라진다.
 impl crate::backend::KiviAttentionBackend for OpenCLBackend {
     fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
         Self::has_kivi_attn_kernel(self, bits)
@@ -7180,57 +7220,65 @@ impl crate::backend::KiviAttentionBackend for OpenCLBackend {
         Self::is_nosub(self)
     }
 
-    fn attention_gen_kivi(
-        &self,
-        q: &Tensor,
-        qk_buf: &Tensor,
-        qv_buf: &Tensor,
-        res_k: &Tensor,
-        res_v: &Tensor,
-        out: &mut Tensor,
-        num_heads_q: usize,
-        num_heads_kv: usize,
-        head_dim: usize,
-        q_tokens: usize,
-        res_tokens: usize,
-        res_cap: usize,
-        scale: f32,
-        scores_out: Option<&mut [f32]>,
-        bits: u8,
-    ) -> Result<()> {
-        Self::attention_gen_kivi(
-            self,
-            q,
-            qk_buf,
-            qv_buf,
-            res_k,
-            res_v,
-            out,
-            num_heads_q,
-            num_heads_kv,
-            head_dim,
-            q_tokens,
-            res_tokens,
-            res_cap,
-            scale,
-            scores_out,
-            bits,
-        )
+    fn attention_gen_kivi(&self, args: &crate::backend::KiviAttnArgs) -> i32 {
+        // SAFETY: host(C5) 가 `scores_out`/`scores_len` 을 짝지어 유효 버퍼를
+        // 채워줬다(null=score 없음). cl_mem 핸들은 inherent 가 borrow-only 로 사용.
+        let scores_out: Option<&mut [f32]> = if args.scores_out.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts_mut(args.scores_out, args.scores_len) })
+        };
+        // SAFETY: host(C5) 가 cl_mem 핸들 6개를 유효 buffer 로 채웠다(borrow-only).
+        let r = unsafe {
+            Self::attention_gen_kivi(
+                self,
+                args.q_mem,
+                args.qk_mem,
+                args.qv_mem,
+                args.res_k_mem,
+                args.res_v_mem,
+                args.out_mem,
+                args.num_heads_q,
+                args.num_heads_kv,
+                args.head_dim,
+                args.q_tokens,
+                args.res_tokens,
+                args.res_cap,
+                args.scale,
+                scores_out,
+                args.bits,
+            )
+        };
+        match r {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[KIVI] attention_gen_kivi failed: {e:#}");
+                -1
+            }
+        }
     }
 
-    fn kivi_gather_update(
-        &self,
-        input: &Tensor,
-        residual: &mut Tensor,
-        kv_heads: usize,
-        res_cap: usize,
-        head_dim: usize,
-        seq_len: usize,
-        res_pos: usize,
-    ) -> Result<()> {
-        Self::kivi_gather_update(
-            self, input, residual, kv_heads, res_cap, head_dim, seq_len, res_pos,
-        )
+    fn kivi_gather_update(&self, args: &crate::backend::KiviGatherArgs) -> i32 {
+        // SAFETY: host(C5) 가 input/residual cl_mem 을 유효 buffer 로 채웠다(borrow-only).
+        let r = unsafe {
+            Self::kivi_gather_update(
+                self,
+                args.input_mem,
+                args.residual_mem,
+                args.kv_heads,
+                args.res_cap,
+                args.head_dim,
+                args.seq_len,
+                args.res_pos,
+            )
+        };
+        match r {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[KIVI] kivi_gather_update failed: {e:#}");
+                -1
+            }
+        }
     }
 }
 

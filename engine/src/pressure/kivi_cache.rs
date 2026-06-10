@@ -1611,27 +1611,47 @@ impl KiviCache {
             // To avoid GPU sub-buffer complexity, if written==0 and batch==seq_len we pass as-is.
             // Otherwise, we fall back to the CPU copy_slice approach per token.
             if written == 0 && batch == seq_len {
-                // Fast path: pass entire input at once
-                let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
-                let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
-                kivi_be.kivi_gather_update(
-                    new_k,
-                    gpu_res_k,
-                    self.kv_heads,
-                    self.res_cap,
-                    self.head_dim,
-                    batch,
-                    self.res_pos,
-                )?;
-                kivi_be.kivi_gather_update(
-                    new_v,
-                    gpu_res_v,
-                    self.kv_heads,
-                    self.res_cap,
-                    self.head_dim,
-                    batch,
-                    self.res_pos,
-                )?;
+                // Fast path: pass entire input at once.
+                // D8: ABI struct(cl_mem) 시그니처. input/residual `&Tensor` 를 raw
+                // cl_mem 으로 추출해 `KiviGatherArgs` 패킹 → trait 호출 → rc!=0 이면
+                // bail. cl_queue 는 OpenCL 정적 impl 이 `&self.queue` 를 직접 알아
+                // 사용하지 않으므로 null 패킹.
+                use crate::backend::opencl::get_cl_mem;
+                let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
+                let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
+                // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
+                let new_k_mem = get_cl_mem(new_k.buffer().as_ref())?.as_ptr();
+                let new_v_mem = get_cl_mem(new_v.buffer().as_ref())?.as_ptr();
+                let res_k_mem = get_cl_mem(gpu_res_k.buffer().as_ref())?.as_ptr();
+                let res_v_mem = get_cl_mem(gpu_res_v.buffer().as_ref())?.as_ptr();
+                let args_k = crate::backend::KiviGatherArgs {
+                    cl_queue: std::ptr::null_mut(),
+                    input_mem: new_k_mem,
+                    residual_mem: res_k_mem,
+                    kv_heads: self.kv_heads,
+                    res_cap: self.res_cap,
+                    head_dim: self.head_dim,
+                    seq_len: batch,
+                    res_pos: self.res_pos,
+                };
+                let rc_k = kivi_be.kivi_gather_update(&args_k);
+                if rc_k != 0 {
+                    anyhow::bail!("KIVI kivi_gather_update (K) failed (rc={rc_k})");
+                }
+                let args_v = crate::backend::KiviGatherArgs {
+                    cl_queue: std::ptr::null_mut(),
+                    input_mem: new_v_mem,
+                    residual_mem: res_v_mem,
+                    kv_heads: self.kv_heads,
+                    res_cap: self.res_cap,
+                    head_dim: self.head_dim,
+                    seq_len: batch,
+                    res_pos: self.res_pos,
+                };
+                let rc_v = kivi_be.kivi_gather_update(&args_v);
+                if rc_v != 0 {
+                    anyhow::bail!("KIVI kivi_gather_update (V) failed (rc={rc_v})");
+                }
             } else {
                 // Slow path: token-by-token copy_slice for the sub-range
                 for s in written..written + batch {

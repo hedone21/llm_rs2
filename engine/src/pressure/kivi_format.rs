@@ -235,29 +235,46 @@ impl KIVIFormat {
         } else {
             Vec::new()
         };
-        let scores_for_kernel: Option<&mut [f32]> = if scores.is_some() {
-            Some(&mut tmp_scores)
+        // D8: ABI struct(cl_mem) 시그니처. `&Tensor` 6개를 raw cl_mem 으로 추출해
+        // `KiviAttnArgs` 패킹. score 는 `(ptr, len)` 으로 변환(None → (null, 0)).
+        // cl_queue 는 OpenCL 정적 impl 이 `&self.queue` 를 직접 알아 사용하지 않으므로
+        // null 패킹(plugin/dlopen 어댑터용 ABI 슬롯).
+        use crate::backend::opencl::get_cl_mem;
+        // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
+        let q_mem = get_cl_mem(q.buffer().as_ref())?.as_ptr();
+        let qk_mem = get_cl_mem(raw.qk_buf.buffer().as_ref())?.as_ptr();
+        let qv_mem = get_cl_mem(raw.qv_buf.buffer().as_ref())?.as_ptr();
+        let res_k_mem = get_cl_mem(raw.res_k.buffer().as_ref())?.as_ptr();
+        let res_v_mem = get_cl_mem(raw.res_v.buffer().as_ref())?.as_ptr();
+        let out_mem = get_cl_mem(out.buffer().as_ref())?.as_ptr();
+        let (scores_ptr, scores_len): (*mut f32, usize) = if scores.is_some() {
+            (tmp_scores.as_mut_ptr(), tmp_scores.len())
         } else {
-            None
+            (std::ptr::null_mut(), 0)
         };
-
-        kivi_be.attention_gen_kivi(
-            q,
-            raw.qk_buf,
-            raw.qv_buf,
-            raw.res_k,
-            raw.res_v,
-            out,
-            n_heads_q,
-            n_heads_kv,
+        let args = crate::backend::KiviAttnArgs {
+            cl_queue: std::ptr::null_mut(),
+            q_mem,
+            qk_mem,
+            qv_mem,
+            res_k_mem,
+            res_v_mem,
+            out_mem,
+            scores_out: scores_ptr,
+            scores_len,
+            num_heads_q: n_heads_q,
+            num_heads_kv: n_heads_kv,
             head_dim,
-            raw.q_tokens,
-            raw.res_tokens,
-            raw.res_cap,
+            q_tokens: raw.q_tokens,
+            res_tokens: raw.res_tokens,
+            res_cap: raw.res_cap,
             scale,
-            scores_for_kernel,
-            raw.bits,
-        )?;
+            bits: raw.bits,
+        };
+        let rc = kivi_be.attention_gen_kivi(&args);
+        if rc != 0 {
+            anyhow::bail!("KIVI attention_gen_kivi failed (rc={rc})");
+        }
         // 이후 `raw`(cache immutable borrow) 미사용 → NLL 이 set_attn_scores(가변) 전에 borrow 종료.
 
         if let Some(dst) = scores {
