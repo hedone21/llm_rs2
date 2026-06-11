@@ -28,14 +28,18 @@ use crate::tensor::Tensor;
 
 /// KIVI 양자화 KV cache를 사용하는 Forward 구현체.
 ///
-/// `Vec<KiviCache>`를 owned 보유하며 `TransformerModel::forward_into`를 직접
-/// 호출한다. plan path는 KIVI 경로에서 미사용이므로 포함하지 않는다.
+/// AB-2 §5.7.1 (A안): persistent `Vec<Arc<KIVIFormat>>` 를 보유하며(ModelForward `fmt_caches`
+/// 동형 — `new()` 1회 wrap), `TransformerModel::forward_into`를 직접 호출한다. KiviQuantStage 가
+/// register 시점 이 handle 을 clone 해 `transition_bits` 를 적용한다(INV-STAGE-LAYER-HANDLE).
+/// plan path는 KIVI 경로에서 미사용이므로 포함하지 않는다.
 pub struct KiviForward {
     backend: Arc<dyn Backend>,
     cpu_backend: Arc<dyn Backend>,
     memory: Arc<dyn Memory>,
     model: Arc<TransformerModel>,
-    kv_caches: Vec<KiviCache>,
+    /// AB-2 §5.7.1 (A안): persistent KIVI handle (전 prefill/step 동안 보존). enumerate 순서 ==
+    /// layer idx. `new()` 에서 1회 wrap 하고, prefill/step 은 보유 Arc clone 으로 dyn fmts 만 구성.
+    kivi_caches: Vec<Arc<KIVIFormat>>,
 
     decode_workspace: LayerWorkspace,
     decode_input: Tensor,        // [1, 1] U8 (u32 token id, GPU-side)
@@ -88,12 +92,21 @@ impl KiviForward {
         let logits_decode = alloc_logits(memory.as_ref(), backend.clone(), vocab_size)?;
         let logits_prefill_last = alloc_logits(memory.as_ref(), backend.clone(), vocab_size)?;
 
+        // AB-2 §5.7.1 (A안): KIVI cache 를 persistent Arc handle 로 1회 wrap (ModelForward
+        // `ensure_fmt_wrapped` 동형). enumerate 순서 == layer idx. 이후 prefill/step 은 보유 Arc
+        // clone 으로 dyn fmts 만 구성한다(per-step mem::take + try_unwrap 댄스 제거).
+        let kivi_caches: Vec<Arc<KIVIFormat>> = kv_caches
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| Arc::new(KIVIFormat::new(i, c)))
+            .collect();
+
         Ok(Self {
             backend,
             cpu_backend,
             memory,
             model,
-            kv_caches,
+            kivi_caches,
             decode_workspace,
             decode_input,
             decode_x_gen,
@@ -105,9 +118,10 @@ impl KiviForward {
         })
     }
 
-    /// KIVI KV cache 슬라이스에 대한 가변 참조.
-    pub fn kv_caches_mut(&mut self) -> &mut Vec<KiviCache> {
-        &mut self.kv_caches
+    /// AB-2 §5.7.1/§5.7.8: persistent KIVI handle 슬라이스 (dispatcher/KiviQuantStage 가
+    /// register 시점 `.to_vec()` 으로 clone 보유 — `ModelForward::fmt_caches()` 동형).
+    pub fn kivi_caches(&self) -> &[Arc<KIVIFormat>] {
+        &self.kivi_caches
     }
 
     /// prefill용 입력 텐서를 백엔드에 업로드한다.
@@ -150,19 +164,15 @@ impl Forward for KiviForward {
         }
         let input_tensor = self.build_input_tensor(tokens)?;
 
-        // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into 이주.
-        // wrap 전에 concrete cache 에서 AWQE need_scores 산출 (①-c 수용 잔여 패턴).
-        // 5-E: KiviCache inherent `is_awqe_enabled` 직접 호출 (KVCacheOps 경유 제거).
-        let need_scores = self.kv_caches.first().is_some_and(|c| c.is_awqe_enabled());
-
-        // kv_caches를 transient KIVIFormat Arc로 wrap (fmt_bridge.rs EvalCacheKind for KiviCache 패턴).
-        let taken = std::mem::take(&mut self.kv_caches);
-        let kfs: Vec<Arc<KIVIFormat>> = taken
-            .into_iter()
-            .enumerate()
-            .map(|(i, c)| Arc::new(KIVIFormat::new(i, c)))
-            .collect();
-        let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = kfs
+        // AB-2 §5.7.1 (A안): persistent KIVI handle 의 Arc clone 으로 dyn fmts 구성 (transient
+        // mem::take + try_unwrap 댄스 제거 — handle 영속이라 panic 위험 소멸). AWQE need_scores 는
+        // layer-0 handle 에 with_cache_mut 으로 query (concrete `is_awqe_enabled` 위임).
+        let need_scores = self
+            .kivi_caches
+            .first()
+            .is_some_and(|h| h.with_cache_mut(|c| c.is_awqe_enabled()));
+        let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = self
+            .kivi_caches
             .iter()
             .map(|a| a.clone() as Arc<dyn KVCacheFormat>)
             .collect();
@@ -190,18 +200,6 @@ impl Forward for KiviForward {
             cache_self_need_scores: need_scores,
         });
 
-        // transient dyn refcount 해제 후 concrete KiviCache 복귀.
-        drop(dyn_fmts);
-        self.kv_caches = kfs
-            .into_iter()
-            .map(|a| {
-                Arc::try_unwrap(a)
-                    .ok()
-                    .expect("transient KIVIFormat has external Arc clone — prefill")
-                    .into_inner()
-            })
-            .collect();
-
         fwd_result?;
 
         self.read_logits(&self.logits_prefill_last)
@@ -212,17 +210,14 @@ impl Forward for KiviForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
-        // Phase α-K BC 5-C: OLD forward_into(KiviCache) → forward_into 이주.
-        // 5-E: KiviCache inherent `is_awqe_enabled` 직접 호출 (KVCacheOps 경유 제거).
-        let need_scores = self.kv_caches.first().is_some_and(|c| c.is_awqe_enabled());
-
-        let taken = std::mem::take(&mut self.kv_caches);
-        let kfs: Vec<Arc<KIVIFormat>> = taken
-            .into_iter()
-            .enumerate()
-            .map(|(i, c)| Arc::new(KIVIFormat::new(i, c)))
-            .collect();
-        let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = kfs
+        // AB-2 §5.7.1 (A안): persistent KIVI handle 의 Arc clone 으로 dyn fmts 구성 (transient
+        // 댄스 제거). need_scores 는 layer-0 handle query.
+        let need_scores = self
+            .kivi_caches
+            .first()
+            .is_some_and(|h| h.with_cache_mut(|c| c.is_awqe_enabled()));
+        let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = self
+            .kivi_caches
             .iter()
             .map(|a| a.clone() as Arc<dyn KVCacheFormat>)
             .collect();
@@ -249,17 +244,6 @@ impl Forward for KiviForward {
             cache_self_need_scores: need_scores,
         });
 
-        drop(dyn_fmts);
-        self.kv_caches = kfs
-            .into_iter()
-            .map(|a| {
-                Arc::try_unwrap(a)
-                    .ok()
-                    .expect("transient KIVIFormat has external Arc clone — step")
-                    .into_inner()
-            })
-            .collect();
-
         fwd_result?;
 
         self.read_logits(&self.logits_decode)
@@ -275,8 +259,9 @@ impl Forward for KiviForward {
     }
 
     fn reset_kv(&mut self) -> anyhow::Result<()> {
-        for cache in &mut self.kv_caches {
-            cache.reset();
+        // AB-2 §5.7.1 (A안): persistent handle 의 interior-mut seam 경유 (with_cache_mut).
+        for h in &self.kivi_caches {
+            h.with_cache_mut(|c| c.reset());
         }
         Ok(())
     }

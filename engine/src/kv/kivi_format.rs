@@ -53,6 +53,25 @@ impl KIVIFormat {
         cache.update(new_k, new_v)
     }
 
+    /// 내부 `KiviCache` 에 `&mut` 접근하여 `f` 실행 (AB-2 §5.7.1 — `StandardFormat::with_cache_mut`
+    /// (standard_format.rs:65) verbatim 동형).
+    ///
+    /// `KIVIFormat` 은 이미 `Mutex<KiviCache>` interior-mutable 이므로 `&self` 로 transition_bits·
+    /// reset 등 non-forward 연산에 도달하는 seam 을 concrete inherent 로 제공한다(base trait 무변).
+    /// lock guard 안에서 closure 를 실행하므로 호출 종료 시 lock 이 풀린다.
+    pub(crate) fn with_cache_mut<R>(&self, f: impl FnOnce(&mut KiviCache) -> R) -> R {
+        let mut guard = self.inner.lock().unwrap();
+        f(&mut guard)
+    }
+
+    /// 현재 양자화 bit-width (AB-2 §5.7.6 — heartbeat kv_dtype query 용).
+    ///
+    /// `KiviCache::bits()`(kivi_cache.rs:406) 위임. ResilienceAdapter 가 layer-0 KIVIFormat handle
+    /// 에서 현재 bits 를 query 해 `bits→dtype` 문자열로 매핑한다.
+    pub(crate) fn current_bits(&self) -> u8 {
+        self.inner.lock().unwrap().bits()
+    }
+
     /// wrapping 을 해제하고 내부 `KiviCache` 를 반환 (Phase α-K ①-c eval transient-wrap round-trip).
     ///
     /// `StandardFormat::into_inner` 대칭. eval 이 forward 1회 동안만 `Vec<KiviCache>` →
