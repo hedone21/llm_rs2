@@ -178,6 +178,8 @@ pub fn build_bench_loop(
     backend: Arc<dyn Backend>,
     memory: Arc<dyn Memory>,
     cpu_backend: Arc<dyn Backend>,
+    // AB-4: PartitionStage 의 companion resolve 용 hardware (init.rs:822 보유분 전달).
+    hardware: Arc<crate::hardware::Hardware>,
     model: TransformerModel,
     kv_caches: Vec<KVCache>,
     max_seq_len: usize,
@@ -227,6 +229,9 @@ pub fn build_bench_loop(
     // β-4: EvictionStage 가 prune 할 전체 layer handle (W1 — enumerate 순서 == layer idx).
     let kv_handles: Vec<Arc<crate::kv::standard_format::StandardFormat>> = mf.fmt_caches().to_vec();
 
+    // AB-4: PartitionStage 가 re-slice 할 전체 layer slot handle (model.layers.clone()).
+    let layer_slots: Vec<Arc<crate::models::weights::LayerSlot>> = mf.model().layers.clone();
+
     // β-4 (매핑 문서 4부): resilience adapter 에 held-handle 주입 → heartbeat snapshot 의
     // kv_cache_tokens/capacity 를 layer-0 handle 에서 query (poll 인자 제거 대체).
     let resilience = match (resilience, kv_pos_handle.clone()) {
@@ -256,6 +261,10 @@ pub fn build_bench_loop(
             Arc::clone(&registry),
             kv_handles.clone(),
             shared_cm.clone(),
+            // AB-4: partition directive 가 OneShot PartitionStage 로 submit. layer_slots 비면
+            // (이론상 무) submit 안 됨 — dispatcher 내부 inert (evict CM=None 과 등가).
+            layer_slots,
+            Some(Arc::clone(&hardware)),
         ))
     } else {
         None

@@ -99,7 +99,13 @@ fn send(tx: &mpsc::Sender<ManagerMessage>, seq_id: u64, cmds: Vec<EngineCommand>
 fn control_fields_equivalent_to_v1() {
     let (mut exec, tx, _rx) = make_executor();
     let registry = Arc::new(PipelineRegistry::new());
-    let mut disp = CommandDispatcher::new(registry, vec![make_handle(120)], Some(make_cm()));
+    let mut disp = CommandDispatcher::new(
+        registry,
+        vec![make_handle(120)],
+        Some(make_cm()),
+        Vec::new(),
+        None,
+    );
 
     // step 1: Throttle{50} + SetTargetTbt{200}.
     let cmds1 = vec![
@@ -152,7 +158,13 @@ fn control_fields_equivalent_to_v1() {
 fn suspend_override_equivalent_to_v1() {
     let (mut exec, tx, _rx) = make_executor();
     let registry = Arc::new(PipelineRegistry::new());
-    let mut disp = CommandDispatcher::new(registry, vec![make_handle(120)], Some(make_cm()));
+    let mut disp = CommandDispatcher::new(
+        registry,
+        vec![make_handle(120)],
+        Some(make_cm()),
+        Vec::new(),
+        None,
+    );
 
     let cmds = vec![
         EngineCommand::SwitchHw {
@@ -172,12 +184,24 @@ fn suspend_override_equivalent_to_v1() {
     );
 }
 
-/// 과도기 5종(offload/quant/swap/partition/layer_skip) live 소비 경로 보유분 구==신 등가.
+/// 과도기 4종(offload/quant/swap/layer_skip) live 소비 경로 보유분 구==신 등가.
+///
+/// **AB-4 비교 차원 변화**: partition 은 더 이상 LoopControl 필드(`partition_ratio`)가 아니라
+/// OneShot `PartitionStage` submit 으로 이전됐다(필드 삭제). v1 executor 는 여전히
+/// `partition_ratio_sticky`→`plan.partition_ratio` carry 하지만, v2 dispatcher 는 등가 필드가
+/// 없으므로 `partition_ratio` 값 등가 대신 **submit 거동**을 검증한다(아래 partition 전용 테스트).
+/// 본 테스트는 잔존 과도기 4종의 v1 anchor 대조에 한정한다.
 #[test]
 fn transitional_fields_equivalent_to_v1() {
     let (mut exec, tx, _rx) = make_executor();
     let registry = Arc::new(PipelineRegistry::new());
-    let mut disp = CommandDispatcher::new(registry, vec![make_handle(120)], Some(make_cm()));
+    let mut disp = CommandDispatcher::new(
+        registry,
+        vec![make_handle(120)],
+        Some(make_cm()),
+        Vec::new(),
+        None,
+    );
 
     let cmds = vec![
         EngineCommand::KvOffload { ratio: 0.5 },
@@ -186,7 +210,6 @@ fn transitional_fields_equivalent_to_v1() {
             ratio: 0.9,
             target_dtype: llm_shared::DtypeTag::Q4_0,
         },
-        EngineCommand::SetPartitionRatio { ratio: 0.3 },
         EngineCommand::LayerSkip { skip_ratio: 0.25 },
     ];
     send(&tx, 1, cmds.clone());
@@ -195,11 +218,62 @@ fn transitional_fields_equivalent_to_v1() {
     assert_eq!(v1.offload_ratio, v2.offload_ratio, "offload_ratio 등가");
     assert_eq!(v1.kv_quant_bits, v2.kv_quant_bits, "kv_quant_bits 등가");
     assert_eq!(v1.swap_weights, v2.swap_weights, "swap_weights 등가");
-    assert_eq!(
-        v1.partition_ratio, v2.partition_ratio,
-        "partition_ratio 등가"
-    );
     assert_eq!(v1.layer_skip, v2.layer_skip, "layer_skip 등가");
+}
+
+/// AB-4: SetPartitionRatio directive → OneShot PartitionStage submit 거동 검증.
+///
+/// v1 의 `partition_ratio` 필드 carry(LoopControl 값 비교)를 대체하는 submit-시맨틱 게이트:
+/// dispatch 후 registry.len() 증가 1 / 같은 값 반복 미증가 / 값 변경 재증가. (구==신 비교 차원이
+/// "LoopControl 필드 값" → "registry submit 횟수" 로 바뀜 — §5.5.2 last-applied 게이트.)
+#[test]
+fn partition_directive_submits_one_shot_stage() {
+    use llm_rs2::hardware::Hardware;
+    use llm_rs2::layers::transformer_layer::TransformerLayer;
+    use llm_rs2::memory::Memory;
+    use llm_rs2::memory::galloc::Galloc;
+    use llm_rs2::models::weights::LayerSlot;
+
+    let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+    let f32_weight = |out_dim: usize, in_dim: usize| -> Tensor {
+        let buf: Arc<dyn llm_rs2::buffer::Buffer> =
+            Arc::new(SharedBuffer::new(out_dim * in_dim * 4, DType::F32));
+        Tensor::new(Shape::new(vec![out_dim, in_dim]), buf, be.clone())
+    };
+    let small = f32_weight(1, 1);
+    let layer = TransformerLayer {
+        wq: small.clone(),
+        wk: small.clone(),
+        wv: small.clone(),
+        wo: small.clone(),
+        w_gate: f32_weight(512, 256),
+        w_up: f32_weight(512, 256),
+        w_down: f32_weight(256, 512),
+        attention_norm: small.clone(),
+        ffn_norm: small,
+        qkv_bias: None,
+        q_norm: None,
+        k_norm: None,
+        pre_ffn_norm: None,
+        post_ffn_norm: None,
+        partition_ctx: None,
+    };
+    let slots: Vec<Arc<LayerSlot>> = vec![Arc::new(LayerSlot::new(layer, DType::F32, None, 0))];
+    let host: Arc<dyn Memory> = Arc::new(Galloc::new());
+    let hw = Arc::new(Hardware::new(be.clone(), None, None, host, None));
+
+    let registry = Arc::new(PipelineRegistry::new());
+    let mut disp = CommandDispatcher::new(Arc::clone(&registry), Vec::new(), None, slots, Some(hw));
+
+    // 새 ratio → submit 1.
+    disp.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+    assert_eq!(registry.len(), 1, "첫 partition directive → OneShot submit");
+    // 같은 값 반복 → 미증가.
+    disp.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+    assert_eq!(registry.len(), 1, "같은 ratio 반복 — 재submit 없음");
+    // 값 변경 → 재증가.
+    disp.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.5 }]);
+    assert_eq!(registry.len(), 2, "ratio 변경 → 새 OneShot submit");
 }
 
 // ── 게이트 4: heartbeat 연속성 (pure poll 전환 후 송출·payload 등가) ──

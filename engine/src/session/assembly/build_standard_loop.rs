@@ -140,8 +140,14 @@ pub fn build_standard_loop(
                 adapter.set_kv_handle(h);
             }
             let registry = Arc::new(PipelineRegistry::new());
-            let dispatcher =
-                CommandDispatcher::new(Arc::clone(&registry), mf.fmt_caches().to_vec(), None);
+            // happy/chat 경로는 partition 미구성 (빈 slots + None hardware).
+            let dispatcher = CommandDispatcher::new(
+                Arc::clone(&registry),
+                mf.fmt_caches().to_vec(),
+                None,
+                Vec::new(),
+                None,
+            );
             (Some(adapter), Some((registry, dispatcher, kv_pos_handle)))
         }
         None => (None, None),

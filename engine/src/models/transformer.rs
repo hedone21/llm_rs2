@@ -91,6 +91,80 @@ fn map_weight_for_host(
     Ok((Tensor::new(t.shape().clone(), buf, be.clone()), true))
 }
 
+/// Map every layer slot's weights for host (CPU) access (AB-4 §5.5.4).
+///
+/// `map_weights_for_cpu` 의 slot 순회 부분을 slot 슬라이스 + gpu backend 만 받는
+/// free function 으로 추출한 것. top-level `norm`/`lm_head`/`gpu_embed_tokens`
+/// (SwitchHw 전용, model `&mut self` 필요)는 다루지 않으므로 model handle 이
+/// 필요 없다 — `PartitionStage` 가 보유한 `Vec<Arc<LayerSlot>>` 만으로 lazy
+/// host-mapping 을 수행하는 진입점이다. slot 갱신은 `store_weights_same_dtype`
+/// (ArcSwap, clone-then-install INV-123). 반환값 = 새로 매핑한 weight tensor 개수.
+#[cfg(feature = "opencl")]
+pub fn map_layer_slots_for_host_access(
+    slots: &[Arc<LayerSlot>],
+    gpu_backend: &Arc<dyn Backend>,
+) -> Result<usize> {
+    // COLD-EXT: weight mmap startup (1회).
+    let ocl_be = gpu_backend
+        .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+        .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
+        .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
+    let queue = ocl_be.queue.clone();
+
+    let mut count = 0;
+    // Weight slot migration uses clone-then-install so the ArcSwap sees a
+    // single atomic transition per slot (INV-123).
+    for slot in slots {
+        let old = slot.load_weights();
+        let mut layer = (*old).clone();
+        macro_rules! map_slot_weight {
+            ($t:expr) => {
+                let (new, changed) = map_weight_for_host(&$t, gpu_backend, &queue)?;
+                if changed {
+                    $t = new;
+                    count += 1;
+                }
+            };
+        }
+        map_slot_weight!(layer.wq);
+        map_slot_weight!(layer.wk);
+        map_slot_weight!(layer.wv);
+        map_slot_weight!(layer.wo);
+        map_slot_weight!(layer.w_gate);
+        map_slot_weight!(layer.w_up);
+        map_slot_weight!(layer.w_down);
+        map_slot_weight!(layer.attention_norm);
+        map_slot_weight!(layer.ffn_norm);
+        if let Some(ref mut bias) = layer.qkv_bias {
+            map_slot_weight!(bias.bq);
+            map_slot_weight!(bias.bk);
+            map_slot_weight!(bias.bv);
+        }
+        if let Some(ref t) = layer.q_norm {
+            let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
+            layer.q_norm = Some(new);
+            count += 1;
+        }
+        if let Some(ref t) = layer.k_norm {
+            let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
+            layer.k_norm = Some(new);
+            count += 1;
+        }
+        if let Some(ref t) = layer.pre_ffn_norm {
+            let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
+            layer.pre_ffn_norm = Some(new);
+            count += 1;
+        }
+        if let Some(ref t) = layer.post_ffn_norm {
+            let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
+            layer.post_ffn_norm = Some(new);
+            count += 1;
+        }
+        slot.store_weights_same_dtype(Arc::new(layer));
+    }
+    Ok(count)
+}
+
 pub struct TransformerModel {
     pub config: ModelConfig,
     /// Swap-aware decoder layer slots. Each slot wraps its weights behind an
@@ -942,74 +1016,15 @@ impl TransformerModel {
     ///
     /// `map_weights_for_cpu` 의 slot 순회 부분만 떼어낸 변형이다. top-level
     /// `norm`/`lm_head`/`gpu_embed_tokens` (SwitchHw 전용, `&mut self` 필요)는
-    /// 건드리지 않으므로 순수 `&self` — slot 갱신은 `store_weights_same_dtype`
-    /// (ArcSwap, clone-then-install INV-123)로 수행한다. `PartitionStage` 가
-    /// 최초 partition 활성 시 model handle 없이 layer slot 만 host-mapped 시키는
-    /// lazy 경로의 진입점이다. 반환값 = 새로 매핑한 weight tensor 개수.
+    /// 건드리지 않으므로 순수 `&self`. slot 슬라이스 + gpu backend 만 받는 free
+    /// function [`map_layer_slots_for_host_access`] 의 thin wrapper — `PartitionStage`
+    /// 는 model handle 없이 그 free function 을 직접 호출한다.
     #[cfg(feature = "opencl")]
     pub fn map_layer_weights_for_host_access(
         &self,
         gpu_backend: &Arc<dyn Backend>,
     ) -> Result<usize> {
-        // COLD-EXT: weight mmap startup (1회).
-        let ocl_be = gpu_backend
-            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
-            .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
-            .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
-        let queue = ocl_be.queue.clone();
-
-        let mut count = 0;
-        // Weight slot migration uses clone-then-install so the ArcSwap sees a
-        // single atomic transition per slot (INV-123).
-        for slot in &self.layers {
-            let old = slot.load_weights();
-            let mut layer = (*old).clone();
-            macro_rules! map_slot_weight {
-                ($t:expr) => {
-                    let (new, changed) = map_weight_for_host(&$t, gpu_backend, &queue)?;
-                    if changed {
-                        $t = new;
-                        count += 1;
-                    }
-                };
-            }
-            map_slot_weight!(layer.wq);
-            map_slot_weight!(layer.wk);
-            map_slot_weight!(layer.wv);
-            map_slot_weight!(layer.wo);
-            map_slot_weight!(layer.w_gate);
-            map_slot_weight!(layer.w_up);
-            map_slot_weight!(layer.w_down);
-            map_slot_weight!(layer.attention_norm);
-            map_slot_weight!(layer.ffn_norm);
-            if let Some(ref mut bias) = layer.qkv_bias {
-                map_slot_weight!(bias.bq);
-                map_slot_weight!(bias.bk);
-                map_slot_weight!(bias.bv);
-            }
-            if let Some(ref t) = layer.q_norm {
-                let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
-                layer.q_norm = Some(new);
-                count += 1;
-            }
-            if let Some(ref t) = layer.k_norm {
-                let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
-                layer.k_norm = Some(new);
-                count += 1;
-            }
-            if let Some(ref t) = layer.pre_ffn_norm {
-                let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
-                layer.pre_ffn_norm = Some(new);
-                count += 1;
-            }
-            if let Some(ref t) = layer.post_ffn_norm {
-                let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
-                layer.post_ffn_norm = Some(new);
-                count += 1;
-            }
-            slot.store_weights_same_dtype(Arc::new(layer));
-        }
-        Ok(count)
+        map_layer_slots_for_host_access(&self.layers, gpu_backend)
     }
 
     /// Prepare tensor partitioning for CPU-GPU cooperative inference.

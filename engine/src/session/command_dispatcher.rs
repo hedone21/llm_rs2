@@ -22,10 +22,13 @@ use std::sync::{Arc, Mutex};
 
 use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport};
 
+use crate::hardware::Hardware;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::standard_format::StandardFormat;
+use crate::models::weights::LayerSlot;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::stages::kv::eviction::EvictionStage;
+use crate::stages::weight::partition::PartitionStage;
 
 /// External command channel (manager IPC, schedule, stdin, ...).
 ///
@@ -61,10 +64,11 @@ pub trait EngineReport {
 /// `CommandDispatcher::dispatch` 가 매 step 갱신하고, `DecodeLoop::run` 이 읽어 sleep/break/pacing
 /// 한다. v1 `ExecutionPlan` 의 control 필드와 1:1 (매핑 문서 1.2/1.3).
 ///
-/// **과도기 5종 필드(offload_ratio/recall_offload/restore_defaults/kv_quant_bits/partition_ratio/
-/// layer_skip/swap_weights)** 는 대응 Stage(AB-2/4/6) 미구현이라 deprecated 로 잔존한다(G1) —
-/// 구==신 등가만 보장하고, run() 인라인 소비는 (a.6) offload/recall 만 live 다(나머지는 generate/
-/// forward 측 sticky).
+/// **과도기 필드(offload_ratio/recall_offload/restore_defaults/kv_quant_bits/layer_skip/
+/// swap_weights)** 는 대응 Stage(AB-2/6) 미구현이라 deprecated 로 잔존한다(G1) — 구==신 등가만
+/// 보장하고, run() 인라인 소비는 (a.6) offload/recall 만 live 다(나머지는 generate/forward 측
+/// sticky). **partition 은 AB-4 에서 OneShot `PartitionStage` 로 이전됨** — `partition_ratio`
+/// 필드는 삭제됐다(write-only dead-end 소멸).
 #[derive(Debug, Clone, Default)]
 pub struct LoopControl {
     // ── ② control 핵심 (run() live 소비) ──
@@ -98,8 +102,6 @@ pub struct LoopControl {
     pub offload_ratio: Option<f32>,
     /// KV quantization bits. (KvQuantDynamic — sticky, generate/forward 측)
     pub kv_quant_bits: Option<u8>,
-    /// Tensor partition ratio. (SetPartitionRatio — sticky, forward/transformer 측)
-    pub partition_ratio: Option<f32>,
     /// Layer skip ratio. (LayerSkip — sticky, forward skip_config 측)
     pub layer_skip: Option<f32>,
     /// Weight swap request. (SwapWeights — take_pending_swap_weights 경로)
@@ -125,6 +127,12 @@ pub struct CommandDispatcher {
     /// ① EvictionStage 들이 공유하는 단일 CacheManager (CLI 정책·sticky eviction 상태).
     /// `None` 이면 evict directive 가 와도 submit 안 함(happy/chat 동등 — eviction 미구성).
     cache_manager: Option<Arc<Mutex<CacheManager>>>,
+    /// ① PartitionStage 가 re-slice 할 전체 layer slot handle (register 시점 보유, AB-4 §5.5.1).
+    /// 비어 있으면 SetPartitionRatio directive 가 와도 submit 안 함(미구성 — happy/chat).
+    layer_slots: Vec<Arc<LayerSlot>>,
+    /// ① PartitionStage 의 companion backend resolve 용 (AB-4 §5.5.8). `None` 이면 partition
+    /// directive 무시(model/hardware 미배선 — host 단위테스트 등).
+    hardware: Option<Arc<Hardware>>,
     /// ② 누적 루프 제어 상태 (sticky control — throttle/tbt 유지, evict 는 OneShot 으로 분리).
     control: LoopControl,
 
@@ -132,21 +140,32 @@ pub struct CommandDispatcher {
     /// 상태 A 등가(v1 `evict_applied`): active 구간당 evict OneShot 1회만 submit.
     /// evict directive 도착 시 true, RestoreDefaults 도착 시 false 로 재무장.
     evict_armed: bool,
+    /// AB-4 §5.5.2: partition sticky last-applied 게이트. 같은 ratio 의 재submit 을 막고
+    /// (idempotent re-slice 비용 절감), 값 변경 시 재적용한다(evict 의 bool armed 와 다름 —
+    /// partition 은 값이 곧 상태이므로 값 비교가 정확한 게이트). RestoreDefaults 시 `None` 으로
+    /// reset(재무장) + Full 복원 submit.
+    last_partition_ratio: Option<f32>,
 }
 
 impl CommandDispatcher {
-    /// dispatcher 생성. `cache_manager` 가 `None` 이면 evict directive 는 무시된다(미구성).
+    /// dispatcher 생성. `cache_manager` 가 `None` 이면 evict directive 는 무시되고(미구성),
+    /// `layer_slots` 가 비었거나 `hardware` 가 `None` 이면 partition directive 는 무시된다.
     pub fn new(
         registry: Arc<PipelineRegistry>,
         kv_handles: Vec<Arc<StandardFormat>>,
         cache_manager: Option<Arc<Mutex<CacheManager>>>,
+        layer_slots: Vec<Arc<LayerSlot>>,
+        hardware: Option<Arc<Hardware>>,
     ) -> Self {
         Self {
             registry,
             kv_handles,
             cache_manager,
+            layer_slots,
+            hardware,
             control: LoopControl::default(),
             evict_armed: false,
+            last_partition_ratio: None,
         }
     }
 
@@ -244,9 +263,13 @@ impl CommandDispatcher {
                 // target_tbt_set 은 false 로 (CLI fallback branch — v1 :489 주석 등가).
                 self.control.target_tbt_set = false;
                 self.control.kv_quant_bits = None;
-                self.control.partition_ratio = None;
                 // 상태 C 재무장: 다음 KvEvict* directive 가 새 OneShot submit 가능 (2부).
                 self.evict_armed = false;
+                // AB-4 §5.5.2: partition 을 GPU-only(Full)로 복원 + last reset(재무장). v1
+                // (`generate.rs:3132 RestoreDefaults: re-split...`)이 partition 을 GPU-only 로
+                // 되돌린 것과 등가 — Full 복원 OneShot submit 후 last=None 으로 두면 다음
+                // SetPartitionRatio 가 어떤 ratio 든 재적용된다.
+                self.submit_partition_full();
             }
             EngineCommand::RequestQcf => {
                 self.control.request_qcf = true;
@@ -274,8 +297,9 @@ impl CommandDispatcher {
             EngineCommand::KvQuantDynamic { target_bits } => {
                 self.control.kv_quant_bits = Some(*target_bits);
             }
+            // ── ① partition → OneShot PartitionStage submit (AB-4 §5.5.2) ──
             EngineCommand::SetPartitionRatio { ratio } => {
-                self.control.partition_ratio = Some(*ratio);
+                self.submit_partition(*ratio);
             }
             EngineCommand::LayerSkip { skip_ratio } => {
                 self.control.layer_skip = Some(*skip_ratio);
@@ -313,6 +337,44 @@ impl CommandDispatcher {
         }
         self.evict_armed = true;
         let stage = EvictionStage::one_shot(self.kv_handles.clone(), Arc::clone(cm), target_ratio);
+        self.registry.submit(Arc::new(stage));
+    }
+
+    /// ① SetPartitionRatio directive 1건을 OneShot `PartitionStage` 로 submit (AB-4 §5.5.2).
+    ///
+    /// sticky last-applied 게이트: 같은 ratio 면 재submit 0(idempotent re-slice 비용 절감),
+    /// 값 변경 시 재적용(새 OneShot → re-slice). `layer_slots` 가 비었거나 `hardware` 가 `None`
+    /// 이면 미구성 — directive 무시(happy/chat).
+    fn submit_partition(&mut self, ratio: f32) {
+        if self.last_partition_ratio == Some(ratio) {
+            return; // 값 무변경 → 재submit 0 (sticky 핵심 — evict bool armed 와 다른 값 비교 게이트).
+        }
+        if self.layer_slots.is_empty() {
+            return; // 미구성 (happy/chat — partition 미배선).
+        }
+        let Some(hw) = self.hardware.as_ref() else {
+            return; // hardware 미배선 (host 단위테스트 등).
+        };
+        self.last_partition_ratio = Some(ratio);
+        let stage = PartitionStage::one_shot(self.layer_slots.clone(), Arc::clone(hw), ratio);
+        self.registry.submit(Arc::new(stage));
+    }
+
+    /// RestoreDefaults 시 partition 을 GPU-only(Full)로 복원 + last reset (AB-4 §5.5.2).
+    ///
+    /// `last_partition_ratio == None` 이면 애초에 partition 이 적용된 적 없으므로 복원 불요
+    /// (no-op). 적용된 적 있으면 Full 복원 OneShot submit 후 `last=None`(재무장 — 다음
+    /// SetPartitionRatio 가 어떤 ratio 든 재적용).
+    fn submit_partition_full(&mut self) {
+        if self.last_partition_ratio.is_none() {
+            return; // partition 미적용 — 복원 불요.
+        }
+        self.last_partition_ratio = None;
+        let (false, Some(hw)) = (self.layer_slots.is_empty(), self.hardware.as_ref()) else {
+            return; // 미구성 — submit 생략 (last 는 이미 None 으로 reset 됨).
+        };
+        // ratio=1.0 → apply_partition_dispatch 가 GPU-only fast path(LayerDispatch::Full) 적용.
+        let stage = PartitionStage::one_shot(self.layer_slots.clone(), Arc::clone(hw), 1.0);
         self.registry.submit(Arc::new(stage));
     }
 }
@@ -367,8 +429,60 @@ mod tests {
         let registry = Arc::new(PipelineRegistry::new());
         let handle = make_handle(N_TOKENS);
         let cm = make_cm();
-        let d = CommandDispatcher::new(Arc::clone(&registry), vec![handle.clone()], Some(cm));
+        // partition 미구성 (빈 slots + None hardware): evict 전용 dispatcher.
+        let d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            vec![handle.clone()],
+            Some(cm),
+            Vec::new(),
+            None,
+        );
         (d, registry, handle)
+    }
+
+    // ── AB-4 (B): partition handle 을 구성한 dispatcher helper ──
+
+    fn cpu_be() -> Arc<dyn Backend> {
+        Arc::new(CpuBackend::new())
+    }
+
+    fn f32_weight(be: &Arc<dyn Backend>, out_dim: usize, in_dim: usize) -> Tensor {
+        let buf: Arc<dyn crate::buffer::Buffer> =
+            Arc::new(SharedBuffer::new(out_dim * in_dim * 4, DType::F32));
+        Tensor::new(Shape::new(vec![out_dim, in_dim]), buf, be.clone())
+    }
+
+    fn ffn_slot(be: &Arc<dyn Backend>, idx: usize) -> Arc<LayerSlot> {
+        use crate::layers::transformer_layer::TransformerLayer;
+        let small = f32_weight(be, 1, 1);
+        let layer = TransformerLayer {
+            wq: small.clone(),
+            wk: small.clone(),
+            wv: small.clone(),
+            wo: small.clone(),
+            w_gate: f32_weight(be, 512, 256),
+            w_up: f32_weight(be, 512, 256),
+            w_down: f32_weight(be, 256, 512),
+            attention_norm: small.clone(),
+            ffn_norm: small,
+            qkv_bias: None,
+            q_norm: None,
+            k_norm: None,
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            partition_ctx: None,
+        };
+        Arc::new(LayerSlot::new(layer, DType::F32, None, idx))
+    }
+
+    fn make_partition_dispatcher() -> (CommandDispatcher, Arc<PipelineRegistry>) {
+        let registry = Arc::new(PipelineRegistry::new());
+        let be = cpu_be();
+        let slots: Vec<Arc<LayerSlot>> = (0..2).map(|i| ffn_slot(&be, i)).collect();
+        let host: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::galloc::Galloc::new());
+        let hw = Arc::new(Hardware::new(be.clone(), None, None, host, None));
+        let d = CommandDispatcher::new(Arc::clone(&registry), Vec::new(), None, slots, Some(hw));
+        (d, registry)
     }
 
     // ── ② control: throttle/tbt/suspend ──
@@ -496,6 +610,8 @@ mod tests {
     #[test]
     fn transitional_fields_equivalence() {
         let (mut d, _r, _h) = make_dispatcher();
+        // AB-4: SetPartitionRatio 는 LoopControl 필드가 아니라 OneShot Stage submit 으로 이전됨
+        // (partition_ratio 필드 삭제). 본 테스트는 잔존 과도기 필드(offload/quant/swap/layer_skip)만.
         let c = d.dispatch(vec![
             EngineCommand::KvOffload { ratio: 0.5 },
             EngineCommand::KvQuantDynamic { target_bits: 4 },
@@ -503,44 +619,120 @@ mod tests {
                 ratio: 0.9,
                 target_dtype: llm_shared::DtypeTag::Q4_0,
             },
-            EngineCommand::SetPartitionRatio { ratio: 0.3 },
             EngineCommand::LayerSkip { skip_ratio: 0.25 },
         ]);
         assert_eq!(c.offload_ratio, Some(0.5));
         assert_eq!(c.kv_quant_bits, Some(4));
         assert_eq!(c.swap_weights, Some((0.9, llm_shared::DtypeTag::Q4_0)));
-        assert_eq!(c.partition_ratio, Some(0.3));
         assert_eq!(c.layer_skip, Some(0.25));
-        // sticky: quant/partition 은 다음 dispatch 에 carry, offload/swap 은 transient.
+        // sticky: quant 는 다음 dispatch 에 carry, offload/swap 은 transient.
         let c2 = d.dispatch(vec![]);
         assert_eq!(c2.kv_quant_bits, Some(4), "quant sticky");
-        assert_eq!(c2.partition_ratio, Some(0.3), "partition sticky");
         assert_eq!(c2.offload_ratio, None, "offload transient");
         assert_eq!(c2.swap_weights, None, "swap transient");
     }
 
     #[test]
-    fn restore_defaults_clears_sticky_quant_partition() {
+    fn restore_defaults_clears_sticky_quant() {
         let (mut d, _r, _h) = make_dispatcher();
-        d.dispatch(vec![
-            EngineCommand::KvQuantDynamic { target_bits: 8 },
-            EngineCommand::SetPartitionRatio { ratio: 0.4 },
-        ]);
+        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 8 }]);
         let c = d.dispatch(vec![EngineCommand::RestoreDefaults]);
         assert_eq!(c.kv_quant_bits, None);
-        assert_eq!(c.partition_ratio, None);
         assert!(c.recall_offload, "RestoreDefaults → recall_offload");
     }
 
-    // ── exhaustive match 컴파일 강제 (게이트 2): 18 variant 가 apply 에서 누락되면 컴파일 실패 ──
-    // (apply 의 match 가 non-exhaustive `_` 없이 18 arm 을 전부 다루므로, variant 추가 시 컴파일 에러.)
+    // ── exhaustive match 컴파일 강제 (게이트 2): variant 가 apply 에서 누락되면 컴파일 실패 ──
+    // (apply 의 match 가 non-exhaustive `_` 없이 전 arm 을 다루므로, variant 추가 시 컴파일 에러.)
 
     #[test]
     fn cache_manager_none_ignores_evict() {
         let registry = Arc::new(PipelineRegistry::new());
         let handle = make_handle(N_TOKENS);
-        let mut d = CommandDispatcher::new(Arc::clone(&registry), vec![handle], None);
+        let mut d =
+            CommandDispatcher::new(Arc::clone(&registry), vec![handle], None, Vec::new(), None);
         d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
         assert_eq!(registry.len(), 0, "CM 미구성 → evict directive 무시");
+    }
+
+    // ── AB-4 (B): partition OneShot submit + sticky last-applied 게이트 ──
+
+    /// 새 ratio → OneShot PartitionStage 1개 submit.
+    #[test]
+    fn partition_submits_one_shot_on_new_ratio() {
+        let (mut d, registry) = make_partition_dispatcher();
+        assert_eq!(registry.len(), 0);
+        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+        assert_eq!(
+            registry.len(),
+            1,
+            "첫 partition directive → OneShot 1개 submit"
+        );
+    }
+
+    /// 같은 ratio 반복 → 재submit 0 (sticky last-applied 게이트).
+    #[test]
+    fn partition_same_ratio_no_resubmit() {
+        let (mut d, registry) = make_partition_dispatcher();
+        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+        assert_eq!(registry.len(), 1);
+        // 같은 값 반복 → 무시 (idempotent re-slice 비용 절감).
+        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+        assert_eq!(registry.len(), 1, "같은 ratio 반복 — 재submit 없음");
+        // 빈 batch 에도 재submit 없음 (sticky carry 아님 — last-applied 비교).
+        d.dispatch(vec![]);
+        assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
+    }
+
+    /// 값 변경 → 재submit (partition 은 값이 곧 상태라 값 변경 시 재적용).
+    #[test]
+    fn partition_changed_ratio_resubmits() {
+        let (mut d, registry) = make_partition_dispatcher();
+        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+        assert_eq!(registry.len(), 1);
+        // 값 변경 (0.3 → 0.5) → 새 OneShot submit (evict 의 bool armed 와 다른 시맨틱).
+        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.5 }]);
+        assert_eq!(registry.len(), 2, "ratio 변경 → 새 OneShot submit");
+    }
+
+    /// RestoreDefaults → last reset + Full 복원 OneShot submit + 재무장.
+    #[test]
+    fn restore_defaults_resets_partition() {
+        let (mut d, registry) = make_partition_dispatcher();
+        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+        assert_eq!(registry.len(), 1);
+        // RestoreDefaults → Full 복원 OneShot submit (partition 적용된 상태였으므로).
+        d.dispatch(vec![EngineCommand::RestoreDefaults]);
+        assert_eq!(
+            registry.len(),
+            2,
+            "RestoreDefaults → Full 복원 OneShot submit"
+        );
+        // 재무장: 같은 ratio(0.3)도 last=None reset 후라 재적용된다.
+        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+        assert_eq!(
+            registry.len(),
+            3,
+            "RestoreDefaults 후 재무장 → 어떤 ratio 든 재적용"
+        );
+    }
+
+    /// partition 미적용 상태에서 RestoreDefaults → Full 복원 submit 없음 (no-op).
+    #[test]
+    fn restore_defaults_without_partition_is_noop() {
+        let (mut d, registry) = make_partition_dispatcher();
+        d.dispatch(vec![EngineCommand::RestoreDefaults]);
+        assert_eq!(
+            registry.len(),
+            0,
+            "partition 미적용 → Full 복원 불요 (no-op)"
+        );
+    }
+
+    /// partition 미구성(빈 slots) dispatcher 는 SetPartitionRatio 를 무시.
+    #[test]
+    fn partition_unconfigured_ignores_directive() {
+        let (mut d, registry, _h) = make_dispatcher(); // 빈 slots + None hardware
+        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
+        assert_eq!(registry.len(), 0, "partition 미구성 → directive 무시");
     }
 }
