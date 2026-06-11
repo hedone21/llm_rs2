@@ -692,7 +692,7 @@ impl CommandExecutor {
     }
 
     /// Compute available actions based on engine capabilities.
-    fn compute_available_actions(
+    pub(crate) fn compute_available_actions(
         eviction_policy: &str,
         kv_dtype: &str,
         has_secondary: bool,

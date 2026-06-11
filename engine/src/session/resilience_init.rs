@@ -97,15 +97,29 @@ pub fn build_command_executor(
     executor.set_has_secondary(false);
 
     // Capability 송출 (SEQ-022).
-    // argus-cli v0 safe-only subset: swap / eviction / kv-quant 제외.
-    let available_actions = vec![
-        "throttle".to_string(),
-        "set_target_tbt".to_string(),
-        "suspend".to_string(),
-        "reject_new".to_string(),
-        "limit_tokens".to_string(),
-        "restore_defaults".to_string(),
-    ];
+    // eviction policy / kv_type / secondary 여부에서 동적 산출 (compute_available_actions와
+    // 동일 조건). 정적 리스트는 signal_memory_critical 시 kv.evict_* 탈락을 유발한다.
+    let available_actions = {
+        let mut a = CommandExecutor::compute_available_actions(
+            args.eviction_policy(),
+            &args.kv_type,
+            false, // argus-cli v0: secondary 없음
+        );
+        // Capability-only 추가 액션 (Heartbeat available_actions 에는 없지만 manager 정책이
+        // 사용하는 throttle/suspend/reject_new/limit_tokens/restore_defaults/set_target_tbt).
+        for extra in &[
+            "set_target_tbt",
+            "suspend",
+            "reject_new",
+            "limit_tokens",
+            "restore_defaults",
+        ] {
+            if !a.iter().any(|x| x == extra) {
+                a.push(extra.to_string());
+            }
+        }
+        a
+    };
     executor.send_capability(llm_shared::EngineCapability {
         available_devices: vec!["cpu".to_string(), "opencl".to_string()],
         active_device: args.backend.clone(),
