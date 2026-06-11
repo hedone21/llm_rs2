@@ -1120,6 +1120,124 @@ beta4 매핑표(`arch/beta4_command_channel_mapping.md`) §1.3 #12 행 + §1.5 #
 
 ---
 
+### 5.8 AB-5 — QCF estimate 역방향 IPC 재배선 (RequestQcf → QcfEstimate, query-only)
+
+**역할.** `RequestQcf` directive 를 받아 6 lossy action 의 QCF cost 를 dry-run 으로 산출하고 `QcfEstimate`(`EngineMessage`)를 manager 로 송출하는 경로를 v2 에 재배선한다. β-7 이 v1 report slot(IPC 송출: capability/qcf/swap_report)을 제거한 뒤, capability(connect 시)·swap_report(AB-6 §5.6.6 `report_tx`)는 재배선됐으나 **QcfEstimate 만 미재배선**으로 남았다. 현 상태: `CommandDispatcher` 가 `RequestQcf` 수신 시 `LoopControl.request_qcf=true` 만 set(command_dispatcher.rs:309-311)하고 **소비자 0** → manager LuaPolicy(`llm_default`)의 2-step handshake(`process_signal` Critical → `RequestQcf` + `qcf_pending_signal` 기록(lua_policy.rs:780-790) → `QcfEstimate` 대기 → `complete_qcf_selection`(lua_policy.rs:871-891) decide() 재실행 → KvEvict/Throttle)가 `check_qcf_timeout`(lua_policy.rs:893-902, 1.0s)으로 끊긴다.
+
+**S25 verify 단일 차단기 (AB-5 매트릭스 30/30 유일 FAIL 원인).** `signal_memory_critical`·`signal_thermal_critical_throttle` × {f16, q4} 4건이 모두 이 원인 — manager 가 `RequestQcf` 를 보내고 응답을 받지 못해 seq=1 에서 정지. **응답 도착 자체가 unblock 의 충분조건**이다 — `complete_qcf_selection`(lua_policy.rs:871-891)이 `qcf_pending_at.take()` 직후 `pending_signal` 로 decide() 를 재실행하므로, `estimates` 가 *비어 있어도*(키 0개) handshake 가 성사된다(`test_seq_096_empty_qcf_estimate_when_cache_empty` 가 빈 map 응답을 정상 경로로 검증). 이는 ISSUE-6(device-only v_buffer 면 KV 액션 전부 skip → 빈 estimates)에서 v1 도 S25 기본 경로에서 사실상 빈 응답을 보냈으나 manager 가 unblock 됐던 v1 거동과 등가다.
+
+#### 5.8.0 §5.4 R-5 점 (5) 판정 — query 는 Stage 가 아니라 dispatcher 직결
+
+§5.5/§5.6/§5.7 의 partition/swap/quant 는 **mutation directive** → OneShot Stage(KV/weight phase 발화 시점에 상태 변경)다. RequestQcf 는 **query directive** — KV cache 를 한 바이트도 prune/transition 하지 않고, dry-run 으로 읽어 IPC 응답만 만든다. 따라서:
+
+- **OneShot Stage 부적합**: Stage 모델은 `StageContext`(읽기 2-field 슬림, §5.2.1)로 phase 발화 시 *상태를 변형*하는 actuator 다. QCF 산출은 변형이 없고, `report_tx` 송출이라는 부수효과만 있어 `StageOutcome`(Consumed/Continue)에 사상할 자연스러운 의미가 없다. Stage 로 강제하면 "변형 없는 Stage" 라는 의미 없는 변종이 생긴다.
+- **dispatcher 직결 채택**: `CommandDispatcher` 가 `RequestQcf` dispatch 시점에 보유 자원(kv_handles·kivi_handles·importance)으로 직접 compute + `report_tx.send(QcfEstimate)` 한다 — **AB-6 swap directive 가 `submit_swap` 으로 Stage 를 submit 하는 대신, RequestQcf 는 `compute_and_send_qcf` 로 즉시 산출·송출**한다는 점만 다르다(둘 다 dispatch 시점 처리, dispatcher 가 데이터 보유처). report 채널 주입은 §5.6.6 `report_tx` 선례와 **동형**(adapter `report_sender()` clone → `EngineMessage::QcfEstimate` 송출).
+
+**대안 비교**:
+
+| 대안 | 설명 | 평가 |
+|---|---|---|
+| **(a) dispatcher 가 dispatch 시점 직접 compute+send** | RequestQcf dispatch → dispatcher 가 `report_tx.send(QcfEstimate(compute(...)))` | **채택** — dispatcher 가 데이터 보유처(kv_handles/kivi_handles/importance). AB-6 swap directive 처리와 동형(dispatch 시점 자율 처리). LoopControl 경유 0(query 는 loop control 상태가 아님) |
+| (b) driver 가 `LoopControl.request_qcf` 소비 | dispatcher 가 flag set, driver 가 매 step flag 보고 compute+send | 기각 — 과도기 flag 존속(AB 방향 = LoopControl 축소, write-only dead-end 소멸 역행). driver 는 layer-0 `kv_pos_handle` 만 보유 → 전 layer 접근 불가(dispatcher 에 있음). god-loop 화 |
+| (c) OneShot QueryStage | RequestQcf → `registry.submit(QcfStage)` → phase 발화 시 compute+send | 기각 — mutation 아닌 query 라 §5.2.1 2-field 슬림 StageContext·`StageOutcome` 시맨틱과 부정합(5.8.0). 발화 phase 선택도 인위적(어느 phase 든 query 결과 무차이) |
+
+#### 5.8.1 compute 이식처 = `session/qcf_runtime.rs`
+
+v1 `compute_qcf_estimates`(+`QcfEstimateContext`)는 legacy generate(`d5ed71d2^` L3676-3850)에 **bin-local** 로 존재했고 generate 분할로 소멸했다. 이식처는 기존 QCF 거처인 `session/qcf_runtime.rs`(`run_qcf_warmup_workflow`/`dispatch_swap_weights` 등 동거)로 한다 — swap dump compute(`dispatch_swap_weights`)와 동일 모듈에 KV-action compute 가 모이는 게 자연(lib-level 공유 helper 모음).
+
+**신규 pub 함수** (`qcf_runtime.rs`):
+```text
+pub fn compute_qcf_estimates(ctx: &QcfEstimateContext) -> QcfEstimate
+```
+
+`QcfEstimateContext` 는 v1 ctx(kv_caches/kivi_caches/importance + model geometry)를 handle UER 로 어댑트한 read-only 입력 묶음:
+- `kv_handles: &[Arc<StandardFormat>]` — v1 `&[KVCache]` 를 handle 로 교체. 각 layer 의 `v_buffer`/`k_buffer` 는 `StandardFormat` 의 read seam(`with_cache_mut` 또는 read 변형)으로 접근 후 `VDataSource::from_buffer(&cache.v_buffer, cpu_bytes)` 로 변환. **ISSUE-6 가드는 `from_buffer` 가 내장** — `buffer.buffer().as_ptr().is_null()`(device-only) 이면 `None` 반환(qcf_kv.rs:118-119)하므로, v1 의 `as_ptr()==null → skip + eprintln` 와 byte-등가(skip 시 해당 action estimate 미삽입 → estimates 빈 map 또는 부분 map).
+- `kivi_handles: &[Arc<KIVIFormat>]` — KIVI 경로의 `kv.quant_dynamic` estimate 산출(§5.8.5 KIVI 분기, v1 L4373-4388 등가). Standard 경로는 빈 slice → quant estimate 미삽입.
+- `importance: Option<&dyn ImportanceLookup>` — flat `attention_scores`/`head_attn` 입력. `None`(argus_bench score accumulator 미장착)이면 uniform fallback(v1 fallback 경로 등가 — score_accumulator/streaming_config bench 미장착도 동일).
+- model geometry(`n_kv_heads`/`head_dim`/`current_pos`/`capacity`/`layout`) — handle query + dispatcher 보유 config.
+
+**산출 본문 (v1 byte-등가 anchor `d5ed71d2^` L3676-3850)**: 6 lossy action 을 `QcfActionType`(qcf_kv.rs:45) dry-run:
+
+| action 키 (estimates map) | QcfActionType | 비고 |
+|---|---|---|
+| `kv.evict_sliding` | `EvictSliding{target_len}` | recent window |
+| `kv.evict_h2o` | `EvictH2o{target_len, ...}` | H2O 3-partition |
+| `kv.merge_d2o` | `MergeD2o{target_len, ...}` | K-source nearest |
+| `kv.evict_streaming` | `EvictStreaming{sink_size, window_size}` | sink + recent |
+| `kv.quant_dynamic` | (KIVI 경로 — §5.8.5) | KIVI handle 필요 |
+| `weight.skip` (layer_skip) | (layer importance — `weight.*` 패밀리) | QCF_weight, importance table 기반 |
+
+각 action 별로 `compute_qcf_kv(&QcfKvParams{...})`(qcf_kv.rs:163) 호출 → `(aggregated_qcf, _per_head)` 의 aggregated 값을 estimates 에 삽입. 키 문자열은 v1·mock_engine(`manager/src/bin/mock_engine.rs:125-130`)·`QcfEstimate` serde 컨벤션(`kv.*`/`weight.*` dot-prefix)과 글자단위 일치. layer 별 산출은 layer-wide 단일 argmax(D2O nearest)·layer-0 geometry 등 v1 의 layer 처리 규칙을 그대로 이식한다.
+
+> **이식 원칙 = byte-수준 lift-and-shift (본문 변경 0)**: ISSUE-6 가드·키 문자열·uniform fallback·layer 처리는 v1 본문을 그대로 옮긴다. **유일한 어댑트는 `&[KVCache]` → `&[Arc<StandardFormat>]` handle UER 접근**(`cache.v_buffer` 를 handle read seam 경유로 얻기) — `run_qcf_warmup_workflow` 가 이미 `KVCache::forward_fmt_roundtrip` 로 fmt 와 KVCache 를 오가는 패턴과 동질. v1 등가는 Implementer 가 `d5ed71d2^` L3676-3850 본문을 diff base 로 삼아 보존 검증한다.
+
+#### 5.8.2 dispatcher 배선 — `compute_and_send_qcf` (report_tx 주입)
+
+`CommandDispatcher` 가 §5.6 swap_runtime `report_tx` 와 동형으로 송출 채널을 보유한다:
+
+- **신규 필드**: `report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>` — `None` 이면 미배선(resilience-off / host 단위테스트) → RequestQcf 가 compute 만 하고 송출 drop(또는 compute 자체 skip — 송출 불가하면 무의미). `report_sender()` clone 주입(§5.6.6 swap_runtime 과 동일 source).
+- **`apply` 의 RequestQcf arm 변경**(command_dispatcher.rs:309-311): `self.control.request_qcf = true;` → `self.compute_and_send_qcf();` (control flag set 은 §5.8.3 판정에 따라 삭제).
+- **신규 메서드**:
+  ```text
+  fn compute_and_send_qcf(&self) {
+      let Some(tx) = self.report_tx.as_ref() else { return };  // 미배선 → drop
+      let ctx = QcfEstimateContext { kv_handles: &self.kv_handles, kivi_handles: &self.kivi_handles,
+                                     importance: self.importance.as_deref(), /* geometry */ };
+      let est = crate::session::qcf_runtime::compute_qcf_estimates(&ctx);
+      let _ = tx.send(EngineMessage::QcfEstimate(est));
+  }
+  ```
+  `&self`(mutation 없음 — query). swap directive 의 `submit_swap`(`registry.submit`) 자리에 RequestQcf 는 `compute_and_send_qcf`(직접 송출)가 대응.
+
+```mermaid
+sequenceDiagram
+    participant M as Manager LuaPolicy
+    participant CS as CommandSource (ResilienceAdapter)
+    participant D as CommandDispatcher
+    participant QR as qcf_runtime::compute_qcf_estimates
+    participant TX as report_tx (resp_tx clone)
+    M->>CS: Directive([RequestQcf]) (Critical signal)
+    CS->>D: dispatch([RequestQcf])
+    D->>QR: compute_qcf_estimates(ctx: kv/kivi handles + importance)
+    QR-->>D: QcfEstimate{estimates, layer_swap}
+    D->>TX: send(EngineMessage::QcfEstimate)
+    TX-->>M: QcfEstimate (resp_rx)
+    M->>M: complete_qcf_selection → decide() → seq=2 (KvEvict/Throttle)
+```
+
+**`EngineReport::send_qcf_estimate` trait 메서드 처분**: 소비자가 raw `report_tx` 면 `EngineReport::send_qcf_estimate`(command_dispatcher.rs:64) trait 메서드는 **orphan** 이 된다(β-7 주석 line 148-150 "IPC 송출은 EngineReport trait 슬롯을 경유한 적이 없다" 와 정합 — capability/swap 도 이미 raw 경로). **판정: trait 메서드 + `ResilienceAdapter` impl(resilience_adapter.rs:134) 유지**(삭제 안 함). 근거 = (1) `EngineReport` 는 §5.4 A-1 보고 역할의 front-door 표면이고 capability/swap_report 메서드와 대칭(send_qcf_estimate 만 제거하면 비대칭), (2) `CommandExecutor::send_qcf_estimate`(executor.rs:239)는 `executor.rs:240` `resp_tx.send(QcfEstimate)` 로 직접 송출하는 **얇은 wrapper** 라 `report_tx` 경로와 등가(둘 다 같은 resp_tx) — orphan 이나 dead 가 아니고 등가 anchor 로 보존. 단순 구현 변경이라 본 sprint 에서 적극 삭제하지 않는다(외과적 변경 원칙). 단 dead_code 경고가 뜨면 `#[allow]` 부착(Implementer 판단).
+
+#### 5.8.3 `LoopControl.request_qcf` 필드 처분 = 삭제 (AB-2 `kv_quant_bits` 선례)
+
+`compute_and_send_qcf` 가 dispatch 시점 직접 처리하면 `LoopControl.request_qcf`(command_dispatcher.rs:95)는 **write-only dead-end** 가 된다(set 후 소비자 0 — 현재도 그렇지만 신 경로는 set 자체가 불요). AB-2 `kv_quant_bits`·AB-4 `partition_ratio`·AB-6 `swap_weights` 필드 삭제 선례와 동형으로 **삭제**한다:
+- `LoopControl` struct 의 `request_qcf: bool` 필드 제거(command_dispatcher.rs:95) + `dispatch` 의 transient reset(command_dispatcher.rs:229) 제거.
+- 과도기 등가 테스트(`test_seq_095`(test_seq_095_098.rs:27) `assert!(plan.request_qcf)`)는 **Stage/dispatcher 모델로 승계**(§5.8.6): `request_qcf` flag 단언 → "RequestQcf dispatch 시 `report_tx` 로 QcfEstimate 1회 송출" 단언으로 교체(AB-2 `quant sticky` 승계 동형).
+
+#### 5.8.4 build_bench_loop 배선
+
+dispatcher 생성부(build_bench_loop.rs:312)에 `report_tx` 인자 추가:
+- `report_tx = resilience.as_ref().map(|a| a.report_sender())` — swap_runtime 의 `report_tx`(build_bench_loop.rs:289)와 **동일 source**(같은 `report_sender()` clone). resilience-off 면 `None` → dispatcher 가 RequestQcf 무송출(inert).
+- `CommandDispatcher::new` 시그니처에 `report_tx: Option<Sender<EngineMessage>>` 1개 추가(현 9-arg → 10-arg). 호출처 = build_bench_loop Standard 분기 + KIVI 분기 + 단위테스트 `make_dispatcher`. **non-local 변경** — AB-2 `kivi_handles` 추가 ripple 과 동일 패턴(§5.7.8 경고 참조).
+
+#### 5.8.5 KIVI 분기 = 범위 포함 (kivi_handles 로 quant estimate)
+
+v1 KIVI 경로(`d5ed71d2^` L4373-4388)는 `kivi_caches` 로 `kv.quant_dynamic` estimate 를 산출했다. dispatcher 는 이미 `kivi_handles: Vec<Arc<KIVIFormat>>`(AB-2 §5.7.8)를 보유하므로 **동형 가능 — 범위 포함**한다: `compute_qcf_estimates` 가 `kivi_handles` 비-빈이면 `kv.quant_dynamic` estimate 를 추가 산출. Standard 경로는 빈 slice → quant estimate 미삽입(나머지 5 action 만). KIVI handle read 표면(`KIVIFormat::current_bits()` 등)은 AB-2 가 이미 노출(resilience_adapter.rs:59 `set_kivi_handle` 선례). **이연 사유 없음** — handle 이 이미 dispatcher 에 도달 가능하고 v1 등가 본문이 명확.
+
+> **device GPU 경로 catch**: ISSUE-6 가드(device-only v_buffer null)는 Standard·KIVI 양쪽 모두 동일 적용 — S25 기본 OpenCL 경로에서 KV action 산출이 skip 되어 estimates 가 빈/부분 map 일 수 있으나, **응답 도착 자체가 manager unblock 의 충분조건**(5.8 본문)이므로 device GREEN 의 충분조건이다. 빈 estimates 도 `complete_qcf_selection` 을 성사시킨다.
+
+#### 5.8.6 host 게이트 (AB-5 host 검증)
+
+1. **dispatcher 송출 단위테스트**: `make_dispatcher` 에 mock `report_tx`(mpsc) 주입 → `dispatch([RequestQcf])` → `report_rx.recv()` 가 `EngineMessage::QcfEstimate` 1회 수신. `report_tx=None` 이면 무송출(inert) 확인.
+2. **compute 등가 테스트** (`qcf_runtime`): `StandardFormat` handle(host CPU KVCache) + uniform importance 입력 → `compute_qcf_estimates` 가 v1 키 집합(`kv.evict_sliding`/`kv.evict_h2o`/`kv.merge_d2o`/`kv.evict_streaming`) 산출. device-only(null buffer) handle 면 빈 estimates(ISSUE-6 등가).
+3. **`request_qcf` flag 삭제 승계** (§5.8.3): `test_seq_095`(test_seq_095_098.rs:27)의 `plan.request_qcf` 단언 제거 → dispatcher 송출 단언으로 교체. `test_seq_096`(test_seq_095_098.rs:46-101)은 `executor.send_qcf_estimate` 직접 호출이라 **무변**(executor 표면 유지 §5.8.2).
+4. **INV-128 연속성** (spec/41-invariants.md:254): "RequestQcf → QcfEstimate 1회 송출" 완결성이 신 경로에서도 성립(armed collector 누수 금지는 v2 에선 compute query 라 무관 — collector 상태 전이 없음. INV-128 의 송출 1회 보장만 dispatcher 송출로 승계).
+
+> **device 게이트** (host 밖): S25 verify 4건(`signal_memory_critical`·`signal_thermal_critical_throttle` × f16/q4) RED→GREEN. 호스트 GPU 부재로 ISSUE-6 가드 실경로(device-only null buffer)는 S25 에서만 실증.
+
+**v1 등가 anchor 총괄**: compute 본문 = `generate.rs`(`d5ed71d2^`) L3676-3850(`compute_qcf_estimates` + `QcfEstimateContext`) / KIVI quant = L4373-4388 / manager handshake = `lua_policy.rs:780-790`(RequestQcf 발행) + `:871-891`(complete_qcf_selection). beta4 매핑표(`arch/beta4_command_channel_mapping.md`) §1.2 #10 행 + §1.5 #14 행을 AB-5 완료로 갱신(§아래 동기화).
+
+---
+
 ## 6. Score collection
 
 score collection 은 본질이 hot-path compute capability 이므로 §3 모델을 그대로 적용한다 (별도 메커니즘/별 sprint 두지 않음).

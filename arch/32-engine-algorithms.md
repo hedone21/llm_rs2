@@ -369,20 +369,23 @@ pub fn aggregate_heads(per_head: &[f32], mode: &AggregationMode) -> f32;
 
 ## 4b. RequestQcf -> QcfEstimate (Dry-Run Scan)
 
-**모듈**: `engine/src/bin/generate.rs` (`compute_qcf_estimates()`)
+**모듈**: `engine/src/session/qcf_runtime.rs` (`compute_qcf_estimates()`) + `engine/src/session/command_dispatcher.rs` (`compute_and_send_qcf()`)
 **Spec**: ENG-ALG-050
+**SSOT**: `arch/pipeline_stage_design_v2.md §5.8` (AB-5 — 역방향 IPC 재배선)
 
 ### 4b.1 설계 결정
 
 Manager가 `RequestQcf` 명령을 보내면, Engine은 캐시 상태를 변경하지 않고 6종 action의 QCF 비용을 시뮬레이션한다. 각 action의 가용성 조건이 충족되지 않으면 해당 항목은 결과에서 생략된다. Manager는 반환된 항목만으로 action 선택을 결정한다.
 
+**[AB-5 재배선 2026-06-11]** v1 에선 `compute_qcf_estimates()`가 `generate.rs` bin-local 이었고 `CommandExecutor::poll` 이 `plan.request_qcf=true` flag 만 set, generate 측이 flag 를 읽어 산출·송출했다. generate 분할로 bin-local compute 가 소멸하면서 β-7 이후 `LoopControl.request_qcf` 가 **소비자 0**(silent no-op)이 됐다. AB-5 가 (1) compute 를 `session/qcf_runtime.rs` 로 lift-and-shift(handle UER 어댑트), (2) `CommandDispatcher` 가 `RequestQcf` dispatch 시점 `compute_and_send_qcf()` 로 직접 산출·송출(`report_tx`=adapter `report_sender()` clone, swap_runtime §5.6.6 동일 source), (3) `LoopControl.request_qcf` 필드 삭제로 재배선했다. **query directive 라 OneShot Stage 가 아니라 dispatcher 직결**(§5.8.0 — KV cache 변형 없음, IPC 응답만 생성). 응답 도착 자체가 manager LuaPolicy 2-step handshake 를 unblock(빈 estimates 도 성사).
+
 ### 4b.2 처리 흐름
 
 ```mermaid
 flowchart TD
-    A["Manager → RequestQcf"] --> B["CommandExecutor.poll()"]
-    B --> C["plan.request_qcf = true"]
-    C --> D["compute_qcf_estimates(kv_caches, score_acc)"]
+    A["Manager → RequestQcf"] --> B["CommandDispatcher.dispatch()"]
+    B --> C["compute_and_send_qcf() (&self, query)"]
+    C --> D["qcf_runtime::compute_qcf_estimates(ctx: kv/kivi handles + importance)"]
     D --> E{Sliding}
     D --> F{H2O}
     D --> G{Streaming}
@@ -401,52 +404,39 @@ flowchart TD
     N --> Q
     O --> Q
     P --> Q
-    Q --> R["QcfEstimate 응답"]
+    Q --> R["report_tx.send(EngineMessage::QcfEstimate)"]
 ```
 
 ### 4b.3 Action별 구현 매핑
 
+키 이름은 `QcfEstimate.estimates` map 의 글자단위 컨벤션(`kv.*`/`weight.*` dot-prefix — `shared/src/lib.rs` MSG-087, `mock_engine.rs` action 목록과 일치)을 따른다.
+
 | Action | 키 이름 | 구현 함수/경로 | 가용성 조건 |
 |--------|---------|---------------|------------|
-| Sliding | `kv_evict_sliding` | `generate.rs::compute_qcf_estimates()` inline | 항상 |
-| H2O | `kv_evict_h2o` | `generate.rs::compute_qcf_estimates()` inline | `AttentionScoreAccumulator.is_active()` |
-| Streaming | `kv_evict_streaming` | `generate.rs::compute_qcf_estimates()` — 미구현, 추가 필요 | config에 `sink_size`, `window_size` 존재 |
-| D2O | `kv_merge_d2o` | `generate.rs::compute_qcf_estimates()` — 미구현, 추가 필요 | `AttentionScoreAccumulator.is_active()` |
-| KIVI | `kv_quant_kivi` | `kivi_cache.rs::compute_flush_qcf()` — dry-run 호출 미구현, 추가 필요 | `KiviCache` 인스턴스 존재 |
-| LayerSkip | `layer_skip` | `ImportanceTable::estimate_qcf_for_count()` — dry-run 호출 미구현, 추가 필요 | `ImportanceTable` 수집 완료 |
+| Sliding | `kv.evict_sliding` | `qcf_runtime::compute_qcf_estimates()` → `compute_qcf_kv(EvictSliding)` | 항상 (v_buffer non-null) |
+| H2O | `kv.evict_h2o` | `compute_qcf_kv(EvictH2o)` | importance(attention_scores) 가용 — `None` 이면 uniform fallback |
+| Streaming | `kv.evict_streaming` | `compute_qcf_kv(EvictStreaming)` | config `sink_size`/`window_size` (bench 미장착 시 fallback) |
+| D2O | `kv.merge_d2o` | `compute_qcf_kv(MergeD2o)` (K-source nearest) | importance 가용 |
+| KIVI | `kv.quant_dynamic` | `compute_qcf_estimates()` KIVI 분기 (`kivi_handles` 비-빈) | `kivi_handles` 보유 (KIVI 경로) |
+| LayerSkip | `weight.skip` | importance table 기반 (QCF_weight 패밀리) | `ImportanceLookup` 가용 |
 
 ### 4b.4 현재 구현 상태와 코드-스펙 차이
 
-현재 `compute_qcf_estimates()`는 **Sliding**과 **H2O** 2종만 구현되어 있다.
-Streaming, D2O, KIVI, LayerSkip의 dry-run은 스펙에 정의되었으나 구현이 누락된 상태이다.
+**[AB-5 이전 — v1]** generate bin-local `compute_qcf_estimates()`는 **Sliding/H2O 2종만** 구현, Streaming/D2O/KIVI/LayerSkip 은 미구현이었다.
 
-**D2O dry-run의 merge_discount 설계**:
-- H2O와 동일하게 evicted 토큰을 식별한 뒤, D2OHandler의 EMA threshold 통계에서 추정 merge rate를 산출
-- `merge_discount = 1 - estimated_merge_rate * merge_retention`
-- merge_retention은 merge가 보존하는 정보 비율의 근사 (e.g., 평균 cosine similarity)
-- 최종 QCF = H2O_QCF * merge_discount
+**[AB-5 — 2026-06-11]** compute 본문은 v1 (`d5ed71d2^` L3676-3850, KIVI quant=L4373-4388)을 `session/qcf_runtime.rs` 로 **byte-수준 lift-and-shift** 한다 — 본문 변경 0, 유일 어댑트는 `&[KVCache]` → `&[Arc<StandardFormat>]` handle UER 접근(`cache.v_buffer`/`k_buffer` 를 handle read seam 경유). 따라서 v1 구현 범위를 그대로 보존한다(v1 이 6종을 모두 산출했는지 여부도 그대로 — Implementer 가 `d5ed71d2^` diff base 로 확정). KIVI quant 는 `kivi_handles` 로 v1 등가 산출(§5.8.5 범위 포함).
 
-**Streaming dry-run의 특성**:
-- Attention score 불필요 — config의 `sink_size`와 `window_size`만으로 결정적 계산
-- `compute_qcf_estimates()`에 config 파라미터 전달이 필요 (현재 시그니처에 없음)
+**ISSUE-6 가드 (device-only v_buffer)**: GPU device-only 경로에서 `cache.v_buffer.buffer().as_ptr().is_null()` 이면 `VDataSource::from_buffer`(qcf_kv.rs:118-119)가 `None` 반환 → 해당 KV action estimate 미삽입(v1 `as_ptr()==null → skip` 와 byte-등가). S25 기본 OpenCL 경로에서 estimates 가 빈/부분 map 일 수 있으나, **응답 도착 자체가 manager unblock 충분조건**(빈 estimates 도 `complete_qcf_selection` 성사).
 
-### 4b.5 구현 시 필요한 시그니처 변경
+### 4b.5 입력 context (`QcfEstimateContext`)
 
-현재:
-```rust
-fn compute_qcf_estimates(
-    kv_caches: &[KVCache],
-    score_accumulator: Option<&AttentionScoreAccumulator>,
-) -> HashMap<String, f32>
-```
+`QcfEstimateContext` 는 v1 ctx(kv_caches/kivi_caches/importance + model geometry)를 handle UER 로 어댑트한 read-only 입력 묶음 (SRP — dispatcher 보유 자원 투영):
+- `kv_handles: &[Arc<StandardFormat>]` — v1 `&[KVCache]` 교체. layer 별 `v_buffer`/`k_buffer` read seam 접근.
+- `kivi_handles: &[Arc<KIVIFormat>]` — KIVI `kv.quant_dynamic` estimate (빈 slice = Standard 경로, quant 미삽입).
+- `importance: Option<&dyn ImportanceLookup>` — flat `attention_scores`/`head_attn` (None = uniform fallback, argus_bench score accumulator 미장착 등가).
+- model geometry(`n_kv_heads`/`head_dim`/`current_pos`/`capacity`/`layout`) — handle query + dispatcher config.
 
-Streaming/D2O/KIVI/LayerSkip 지원을 위해 추가 context가 필요:
-- `streaming_config: Option<(usize, usize)>` — (sink_size, window_size)
-- `d2o_state: Option<&D2OHandler>` — EMA threshold 참조 (merge discount 계산)
-- `kivi_caches: Option<&[KiviCache]>` — KIVI residual 접근
-- `importance_table: Option<&ImportanceTable>` — layer skip QCF
-
-별도 context struct로 묶는 것이 SRP에 부합한다.
+dispatcher 가 보유 자원(`kv_handles`/`kivi_handles`/`importance`)으로 ctx 를 구성하므로 별도 시그니처 전달 불요 — `compute_and_send_qcf(&self)` 가 내부에서 ctx 조립(§5.8.2).
 
 ---
 
