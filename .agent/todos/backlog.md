@@ -35,6 +35,16 @@
 
 ---
 
+## [P2-chore] host lib 테스트 위생 — γ-3 결정적 테스트 버그 2건 + POCL-first 호스트 OpenCL 테스트 환경 실패
+
+- **Status**: TODO (발견 2026-06-11, AB-4 device 게이트의 Linux host 이름 단위 대조에서 — pre-AB-4 `ecd07549` worktree 대조로 전원 사전존재 입증, AB-4 회귀 0건)
+- **Description**:
+  - **(a) γ-3 결정적 테스트 버그 2건** (γ-3a `33d5bc8f` / γ-3b `11c8721f` 도입, 플랫폼 무관 항상 FAIL):
+    - `session::experiment::schedule_source::tests::experiment_schedule_parse_roundtrip` — fixture 가 PascalCase `Throttle`, serde 는 snake_case(`throttle`) 기대.
+    - `session::eval_setup::tests::protected_prefix_score_based_defaults_to_4` — clap subcommand 는 `h2o-plus`(kebab), 테스트는 `h2o_plus` 전달.
+  - **(b) POCL-first 호스트 OpenCL 테스트 환경 실패 ~25종**: `create_test_queue`/backend 가 첫 플랫폼(POCL CPU)을 잡아 — `memory::opencl::unified` 4종 map null-deref → **SIGABRT 로 전체 스위트 중단**, `backend::opencl::{noshuffle,kv_scatter_batch,gpu_buffer_shift}` ~21종 CL_DEVICE_NOT_FOUND panic (run 간 부분 flaky). GPU-platform 선택 또는 skip 가드 필요. (호스트에 pocl 7.1 설치됨 2026-03-03 — 설치 후 첫 전체 lib 실행이 이번.)
+- **Acceptance Criteria**: Linux host(POCL+NVIDIA)에서 `cargo test -p llm_rs2 --lib` 0 FAIL (skip 가드 발화 허용).
+
 ## [P2] LLama 3.2 1B 동일 shape 매트릭스 재측정 (Qwen Full Microbench Matrix sprint 완료 후)
 
 - **Status**: TODO

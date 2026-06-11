@@ -3,7 +3,7 @@
 **작성**: 2026-06-11
 **HEAD**: `ecd07549 docs(todo): Phase γ 종결 — γ-4 RESOLVED + generate 분할 부분 해소 + 파생 후속 5건 등록`
 **브랜치**: master (worktree 없음)
-**다음 세션 진입 문장**: **"AB-4 device 게이트 진행 — handoff_ab246_stage_entry 기준"** (host 단계는 2026-06-11 완료 — 아래 다음 액션 2번 참조)
+**다음 세션 진입 문장**: **"AB-6 진입 — 발화 phase 결정부터, handoff_ab246_stage_entry 기준"** (AB-4 는 host+device 게이트 전부 GREEN 으로 2026-06-11 종결 — 아래 다음 액션 2·3번 참조)
 **착수 순서 (사용자 확정 2026-06-11)**: **AB-4 → AB-6 → AB-2**
 
 > 본 문서가 AB-2/4/6 재개의 SSOT. 구 계획 `handoff_argus_bench_ab0_ab3_2026_06_05.md` §AB-2/4/6 은
@@ -60,5 +60,8 @@
 
 1. ~~**AB-4 설계 결정 2건**~~ ✅ **사용자 확정 (2026-06-11)**: (a-2) fan-out 을 `layers/tensor_partition.rs` 자유 함수로 추출 + Stage 는 `Vec<Arc<LayerSlot>>` 보유(EvictionStage 동형, CLI 정적 경로와 함수 공유) / (b-1) 엔진 직결 OneShot(plugin 결정층 없음 — 결정이 항등, EvictionStage method-drop 선례 동형, `"partition"` WeightStage 는 per-layer 알고리즘 등장 시 재검토). lazy mapping 은 slot-only `&self` 변형 분리(norm/lm_head 는 SwitchHw 전용이라 불필요).
 2. ~~**AB-4 구현**~~ ✅ **host 완료 (2026-06-11)**: 설계 `a9b9f4b2`(arch v2 §5.5 신설 + spec §3.28 + ADR-0006 §6 + beta4 매핑표, 신규 INV 0건) / 구현 `359b9a29`(fan-out 자유 함수 `apply_partition_dispatch` + slot-only `map_layer_slots_for_host_access` 추출, 동작 불변) + `6c0616cb`(`stages/weight/partition.rs` PartitionStage OneShot·PreForward + dispatcher `submit_partition` last-applied 게이트 + `LoopControl.partition_ratio` 삭제 + RestoreDefaults Full 복원) + `1ba1a6f7`(argus_bench 가드 해제 + 로그 계약). 신규 테스트 13종 green, Tester 교차 검증 **host 게이트 GREEN(조건부)** — fan-out/INV-123 보존 정독 확인, sticky 값-비교 게이트 비-vacuous, 로그 regex 글자단위 MATCH(rustc 실측), layer_lint 30=baseline. disable(ratio≤0) 케이스 = Stage 책임(Architect 승인, §5.5.3). **조건**: macOS OpenCL 1.2 frozen 으로 lib 테스트 이름 단위 대조는 Linux/device host 재실행으로 확정 필요.
-3. **AB-4 device 게이트 (다음)**: α-K frozen 재측정(MATCH 확인 선행) → S25 mock_manager `SetPartitionRatio` 시나리오 + `[Partition]` marker + 신규 baseline 동결 → 검증: sig·marker·tbt Δ≤+3%. + Linux/device host 에서 `cargo test -p llm_rs2 --lib` 이름 단위 대조 1회.
+3. ~~**AB-4 device 게이트**~~ ✅ **GREEN (2026-06-11, S25) — AB-4 종결**:
+   - **α-K frozen 재측정**: sig **15/15 MATCH**(3 dtype × 5, `blA_argus_*.out` 원본 라인 대조 — β-2 정본 판정 방식) + tbt n=5 median f16 55.17(Δ+1.75%)/f32 54.20(+0.30%)/q4 53.50(−0.54%) 전부 Δ≤+3% + non-vacuous(trace run: build_plan SUCCESS·wrapped 28 KVCache 전 dtype).
+   - **SetPartitionRatio 시나리오**: 신규 baseline 동결 = `frozen_baseline_ab4_partition_2026_06_11.md` (weight f16+q4_0, ratio 0.3, n=3 sig 결정적, marker 3종 글자단위 — verify YAML `Lazy-mapped` alt MATCH, `final_pos=1045` 회계). **static CLI oracle**: `--tensor-partition 0.3` 출력 == directive 출력 sig IDENTICAL 양 dtype — Stage 경로 ≡ 정적 경로 bit-exact 실증. 관찰 1건(q4_0 static 1회 silent kill, 재실행 2회 정상 — baseline 문서 §관찰).
+   - **Linux host lib 이름 단위 대조**(조건 해소): 신규 12종 + beta4 통합 7/7 PASS. 잔여 FAIL 전원 pre-AB-4 사전존재(ecd07549 worktree 대조 입증 — POCL-first 환경 ~25종 + γ-3 테스트 버그 2종 → backlog `[P2-chore] host lib 테스트 위생` 등록). **AB-4 회귀 0건.**
 4. AB-6 진입 (발화 phase 결정부터) → AB-2 진입 (Vec<KiviCache> 접근 모델 + 검증 수단 결정부터).
