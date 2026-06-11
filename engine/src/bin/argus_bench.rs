@@ -55,9 +55,9 @@ fn main() -> anyhow::Result<()> {
 
 /// AB-1 bench 지원 args 가드. [`is_standard_happy_path`](llm_rs2::session::is_standard_happy_path)
 /// 와 동일하되 **eviction_policy != "none" 을 허용**한다 (resilience eviction은
-/// `build_bench_loop` 가 처리). AB-4: `tensor_partition > 0` 도 허용(PartitionStage
-/// + `build_bench_loop` 배선). 아직 미지원인 skip / d2o-layer-alloc / qcf / profile /
-/// weight-swap 은 그대로 차단.
+/// `build_bench_loop` 가 처리). AB-4: `tensor_partition > 0` 허용(PartitionStage).
+/// AB-6: `--secondary-gguf` 허용(SwapWeights directive → WeightSwapStage). 아직
+/// 미지원인 skip / d2o-layer-alloc / qcf / profile / swap mode flag 는 그대로 차단.
 fn bench_supported(args: &Args) -> bool {
     args.qcf_dump.is_none()
         && args.skip_ratio.unwrap_or(0.0) == 0.0
@@ -103,14 +103,20 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
     if !matches!(args.effective_kv_mode(), KvMode::Standard) {
         bail!("argus-bench AB-0: --kv-mode KIVI/Offload land in AB-2/AB-3");
     }
-    if args.secondary_gguf.is_some()
-        || args.force_swap_ratio.is_some()
+    // AB-6: `--secondary-gguf` 해제 — SwapWeights runtime directive 경로의 secondary 공급원
+    // (WeightSwapStage + build_bench_loop SwapWiringConfig 배선 완료). CLI 정적 swap
+    // (force_swap_ratio/incremental_per_tick)과 mode flag(intra-forward/layer-immediate/
+    // phase-aware — IntraForward hook 은 host 미배선, §5.6.3)는 차단 유지.
+    if args.force_swap_ratio.is_some()
         || args.swap_incremental_per_tick > 0
         || args.swap_intra_forward
         || args.swap_layer_immediate
         || args.swap_phase_aware
     {
-        bail!("argus-bench AB-0: weight swap CLI options land in AB-6");
+        bail!(
+            "argus-bench AB-6: CLI-static weight swap / swap mode flags not supported; \
+             use SwapWeights runtime directive (mock_manager/manager IPC) with --secondary-gguf"
+        );
     }
     if args.profile || args.profile_events {
         bail!("argus-bench AB-0: --profile / --profile-events not yet supported");
