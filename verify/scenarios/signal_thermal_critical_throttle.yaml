@@ -38,4 +38,10 @@ expected:
     min_rouge_l: 0.80
     min_bleu_4: 0.40
     min_char_similarity: 0.70
-pass_criteria: all
+# functional_only (AB-5, 2026-06-11): llm_default policy responds to thermal
+# critical with SwitchHw{cpu} + Throttle — the backend switch is an INTENTIONAL
+# numeric change (CPU vs GPU matmul divergence; observed q4 ROUGE 0.297 while
+# f16 happens to stay greedy-identical). Same controlled-divergence rationale
+# as direct_cmd_kvquant_to_q4. Crash+progress gate still catches segfaults;
+# perf/accuracy stay recorded as reference.
+pass_criteria: functional_only

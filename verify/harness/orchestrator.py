@@ -1303,14 +1303,27 @@ def _run_scenario_adb_signal(
                 timeout=15.0,
             )
 
-            # Fixed sleep to let engine finish model load and handshake with
-            # manager. Empirical: S25 F16 model load takes ~9s. Engine
-            # connects to manager's 9101 right after load; ExternalMonitor
-            # binds immediately afterwards. signal_client must start only
-            # AFTER this handshake — otherwise its connect hits a not-yet-
+            # Wait for the engine↔manager handshake — event-driven (AB-5).
+            # Anchor = `[Resilience] Capability sent to Manager` in the engine
+            # stderr: printed right after the engine connects to 9101, which is
+            # the exact point ExternalMonitor binds. The previous fixed
+            # `time.sleep(10.0)` ("F16 load ~9s") burned the entire decode
+            # window of fast models (q4 load ~3s, total run ~16s) so the
+            # directive always landed at decode end. signal_client must start
+            # only AFTER this handshake — otherwise its connect hits a not-yet-
             # bound port, and adb forward may accept TCP without routing
-            # bytes (losing the signal). 10s gives ~1s margin.
-            time.sleep(10.0)
+            # bytes (losing the signal). Timeout fallback keeps the old wait.
+            if not _wait_for_remote_log_pattern(
+                remote,
+                action_stderr_remote,
+                "[Resilience] Capability sent to Manager",
+                timeout_s=60.0,
+            ):
+                time.sleep(10.0)
+            else:
+                # ExternalMonitor binds immediately after the handshake; a
+                # short settle absorbs the bind/forward race.
+                time.sleep(1.0)
 
             # Start signal_client AFTER the engine is confirmed connected
             # (ExternalMonitor is now bound). signal_client's internal 30s
