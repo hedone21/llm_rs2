@@ -3,7 +3,7 @@
 **작성**: 2026-06-11
 **HEAD**: `ecd07549 docs(todo): Phase γ 종결 — γ-4 RESOLVED + generate 분할 부분 해소 + 파생 후속 5건 등록`
 **브랜치**: master (worktree 없음)
-**다음 세션 진입 문장**: **"AB-2 진입 — Vec<KiviCache> 접근 모델 + 검증 수단 결정부터, handoff_ab246_stage_entry 기준"** (AB-4·AB-6 은 host+device 게이트 전부 GREEN 으로 2026-06-11 종결 — 아래 다음 액션 3·5번 참조)
+**다음 세션 진입 문장**: **"AB-2/4/6 전 트랙 종결 (2026-06-11) — 본 handoff 는 완료 기록. 후속 = AB-5(verify YAML 현행화) 또는 ADR-0006 Deferred(IntraForward hook 실배선 등)"** (AB-4: 액션 3 / AB-6: 액션 5 / AB-2: 액션 7 — 모두 host+device 게이트 GREEN)
 **착수 순서 (사용자 확정 2026-06-11)**: **AB-4 → AB-6 → AB-2**
 
 > 본 문서가 AB-2/4/6 재개의 SSOT. 구 계획 `handoff_argus_bench_ab0_ab3_2026_06_05.md` §AB-2/4/6 은
@@ -69,4 +69,10 @@
    - **α-K frozen 재검증**: sig **15/15 MATCH** + tbt n=5 median f16 54.31(Δ+0.17%)/f32 53.96(−0.15%)/q4 53.26(−0.99%) 전부 Δ≤+3% + non-vacuous 전 dtype — rename+Stage 추가의 happy-path 영향 0.
    - **SwapWeights 시나리오**: 신규 baseline 동결 = `frozen_baseline_ab6_swap_2026_06_11.md` (f16 primary + q4_0 secondary, ratio 0.5 → 14 layers, 7 tick drain per_tick=2 LISWAP-6 보존, **sig 3/3 IDENTICAL + tick 시퀀스 3/3 동일** — 동기식 tick swap 이라 greedy 결정성 유지, `final_pos=1045` 회계). Decode 50.39 ms/tok < F16 happy 54.31 (Q4 화 대역폭 감소, 예상 방향).
    - **범위 한정(명시)**: Incremental mode 한정 — IntraForward/LayerImmediate hook 실배선(forward slot greenfield)·PhaseAware device 검증·swap 역전(RestoreDefaults)은 ADR-0006 Deferred.
-6. **AB-2 진입 (다음)**: KIVI — 1순위 쟁점 = KiviForward 의 owned `Vec<KiviCache>`(Arc 아님)에 Stage 가 도달하는 법(handle Arc 화 vs (a.6) try_offload 선례의 Forward seam 메서드) + 검증 수단 택1(argus_bench KIVI 분기 vs argus-chat bin화 선행). C12 잔여 production e2e 흡수 의무(완료 게이트 포함). KIVI 회귀 게이트 = `test_backend --backends opencl` 오라클 Q2/Q4/Q8 3/3 L2=0.000000.
+6. ~~**AB-2 진입**~~ ✅ **사용자 확정 2건 (2026-06-11)**: 검증 수단 = argus_bench KIVI 분기 확정 / 접근 모델 = 위임("확장성+기존 일관성") → census 기반 **A안(handle Arc화 = ModelForward 5-F fmt-cache 동형 수렴)** 확정. ✅ **host 완료**: 설계 `fbcc46f6`(arch v2 §5.7 신설 — status quo/B안/A안 3자 비교, KvMutate 발화, sticky last-applied, ADR-0006 무관(KV 축) 판정, 신규 INV 0건) / 구현 `1736f5bb`(KiviForward persistent `Vec<Arc<KIVIFormat>>` 전환 — transient-wrap `try_unwrap` panic 댄스 제거, eval 경로 무접촉) + `75ef7acc`(`stages/kv/kivi_quant.rs` KiviQuantStage OneShot·KvMutate + dispatcher `submit_kv_quant` + `LoopControl.kv_quant_bits` 삭제) + `371ee5b2`(bench KIVI 분기 — `build_kivi_bench_ctx`/`build_bench_kivi_loop` 신설, `--kv-dynamic-quant` orphan flag 재배선(bits=16 진입), heartbeat kv_dtype §5.7.6) + `99c08eb6`(beta4 통합 테스트 승계 — **교훈: Implementer 가 `--lib`만 돌려 `--all-targets` 깨짐 미탐, 메인 세션 적발**) + `36ebc769`(mock_manager heartbeat kv_dtype 가시화). Tester 교차 검증 **host 게이트 GREEN**(신규 FAIL 0 — pre-AB-2 worktree 대조, v1 등가 정독, marker 글자단위, 비-vacuous).
+7. ~~**AB-2 device 게이트**~~ ✅ **GREEN (2026-06-11, S25) — AB-2 종결, 세 트랙 완주**:
+   - **α-K frozen 재검증**: sig **15/15 MATCH** + tbt n=5 median f16 54.29(Δ+0.13%)/f32 54.33(+0.54%)/q4 53.43(−0.67%) 전부 Δ≤+3% + non-vacuous 전 dtype — KiviForward 전환의 happy-path 영향 0.
+   - **KvQuantDynamic 시나리오**: 신규 baseline 동결 = `frozen_baseline_ab2_kvquant_2026_06_11.md` (f16 weights + `--kv-dynamic-quant` 16bit 진입 → directive 4bit 전환, **sig 3/3 IDENTICAL** + marker 글자단위(verify YAML 계약) + heartbeat `kv_dtype=q4` 3/3 + `final_pos=1045` 회계 + happy 대조로 비-vacuous 증명).
+   - **KIVI 오라클**: Q2/Q4/Q8 3/3 L2=0.000000 유지(회귀 0). FAIL 24=사전존재 하네스(MatMulT 16+Slice 8).
+   - **C12 잔여 production e2e 흡수 완료**: directive/happy/static(`--kv-mode kivi`) 3종 OpenCL KIVI decode 로 `kivi_format::attention_native`/`kivi_cache::update_gpu` 최초 e2e 실행.
+   - **범위 한정(명시)**: 16→4 전환 동결. 2/8bit·역전환·Q6 dlopen TBT(실제 KIVI `.so` 필요)는 미동결/잔여.
