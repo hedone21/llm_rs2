@@ -37,6 +37,60 @@ fn is_local_layer(layer_idx: usize, pattern: Option<usize>) -> bool {
     }
 }
 
+/// Map one weight tensor so the CPU backend can read it via `as_ptr()`
+/// (host-access mapping for SwitchHw / tensor partition).
+///
+/// Extracted verbatim from the former `map_one` closure inside
+/// `map_weights_for_cpu` (AB-4 §5.5.4) so the slot-only `&self` variant
+/// (`map_layer_weights_for_host_access`) and the full `&mut self` path share it.
+///
+/// Returns `(mapped_tensor, changed)`: `changed` is true when the tensor's
+/// backing buffer or backend tag was replaced. `gguf.rs::load_raw` builds
+/// weights via `backend.copy_weight_from`, which on OpenCL leaves
+/// `Tensor::backend()` pointing at the CPU loader even though the buffer is a
+/// `UnifiedBuffer` with valid `cl_mem`. Downstream `weight.backend().copy_from`
+/// (e.g. `split_weight_col` for FFN-down partition) then dispatches CPU copy
+/// and produces a `SharedBuffer`-backed GPU slice without `cl_mem`, and the
+/// next `matmul_f16` aborts with "B is not OpenCL buffer". Retag onto the
+/// active GPU backend whenever the loader tag differs, so partition / matmul
+/// dispatch see GPU consistently.
+#[cfg(feature = "opencl")]
+fn map_weight_for_host(
+    t: &Tensor,
+    be: &Arc<dyn Backend>,
+    queue: &ocl::Queue,
+) -> Result<(Tensor, bool)> {
+    let needs_retag = !Arc::ptr_eq(t.backend(), be);
+    let retagged = |t: &Tensor| -> Tensor {
+        if needs_retag {
+            Tensor::new(t.shape().clone(), t.buffer().clone(), be.clone())
+        } else {
+            t.clone()
+        }
+    };
+    // Already CPU-accessible (mapped UnifiedBuffer, mmap-backed) → no-op.
+    if !t.buffer().as_ptr().is_null() {
+        t.buffer().map_for_cpu()?; // no-op if already mapped
+        return Ok((retagged(t), needs_retag));
+    }
+    // Unmapped UnifiedBuffer (post-swap `materialise_tensor` lands one in
+    // the LayerWeights snapshot). Map in-place to recover the host
+    // pointer without paying the read_buffer + alloc cost below.
+    t.buffer().map_for_cpu()?;
+    if !t.buffer().as_ptr().is_null() {
+        return Ok((retagged(t), needs_retag));
+    }
+    // Device-only buffer (OpenCLBuffer): read to new UnifiedBuffer.
+    let size = t.size();
+    let ub = crate::memory::opencl::unified::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
+    ub.map()?;
+    // SAFETY: ub.as_mut_ptr() is valid after map(). read_buffer copies from GPU.
+    let dst = unsafe { std::slice::from_raw_parts_mut(ub.as_mut_ptr(), size) };
+    be.read_buffer(t, dst)?;
+    let buf: Arc<dyn Buffer> = Arc::new(ub);
+    Ok((Tensor::new(t.shape().clone(), buf, be.clone()), true))
+}
+
 pub struct TransformerModel {
     pub config: ModelConfig,
     /// Swap-aware decoder layer slots. Each slot wraps its weights behind an
@@ -857,59 +911,54 @@ impl TransformerModel {
             .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
         let queue = ocl_be.queue.clone();
 
-        let mut count = 0;
-
-        // `gguf.rs::load_raw` builds weights via `backend.copy_weight_from`,
-        // which on OpenCL leaves `Tensor::backend()` pointing at the CPU
-        // loader even though the buffer is a `UnifiedBuffer` with valid
-        // `cl_mem`. Downstream `weight.backend().copy_from(...)` (e.g.
-        // `split_weight_col` for FFN-down partition) then dispatches CPU
-        // copy and produces a `SharedBuffer`-backed GPU slice without
-        // `cl_mem`, and the next `matmul_f16` aborts with "B is not OpenCL
-        // buffer". Retag onto the active GPU backend whenever the loader
-        // tag differs, so partition / matmul dispatch see GPU consistently.
-        let map_one = |t: &Tensor, be: &Arc<dyn Backend>| -> Result<(Tensor, bool)> {
-            let needs_retag = !Arc::ptr_eq(t.backend(), be);
-            let retagged = |t: &Tensor| -> Tensor {
-                if needs_retag {
-                    Tensor::new(t.shape().clone(), t.buffer().clone(), be.clone())
-                } else {
-                    t.clone()
-                }
-            };
-            // Already CPU-accessible (mapped UnifiedBuffer, mmap-backed) → no-op.
-            if !t.buffer().as_ptr().is_null() {
-                t.buffer().map_for_cpu()?; // no-op if already mapped
-                return Ok((retagged(t), needs_retag));
-            }
-            // Unmapped UnifiedBuffer (post-swap `materialise_tensor` lands one in
-            // the LayerWeights snapshot). Map in-place to recover the host
-            // pointer without paying the read_buffer + alloc cost below.
-            t.buffer().map_for_cpu()?;
-            if !t.buffer().as_ptr().is_null() {
-                return Ok((retagged(t), needs_retag));
-            }
-            // Device-only buffer (OpenCLBuffer): read to new UnifiedBuffer.
-            let size = t.size();
-            let ub =
-                crate::memory::opencl::unified::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
-            ub.map()?;
-            // SAFETY: ub.as_mut_ptr() is valid after map(). read_buffer copies from GPU.
-            let dst = unsafe { std::slice::from_raw_parts_mut(ub.as_mut_ptr(), size) };
-            be.read_buffer(t, dst)?;
-            let buf: Arc<dyn Buffer> = Arc::new(ub);
-            Ok((Tensor::new(t.shape().clone(), buf, be.clone()), true))
-        };
+        // slot 순회(partition 에 필요한 layer weight)는 slot-only `&self` 변형으로 분리
+        // (AB-4 §5.5.4 — `PartitionStage` 가 model handle 없이 도달). top-level
+        // norm/lm_head/gpu_embed_tokens 는 SwitchHw 전용이라 여기서만 처리한다.
+        let mut count = self.map_layer_weights_for_host_access(gpu_backend)?;
 
         macro_rules! map_weight {
             ($t:expr) => {
-                let (new, changed) = map_one(&$t, gpu_backend)?;
+                let (new, changed) = map_weight_for_host(&$t, gpu_backend, &queue)?;
                 if changed {
                     $t = new;
                     count += 1;
                 }
             };
         }
+        map_weight!(self.norm);
+        if !self.lm_head_on_cpu {
+            map_weight!(self.lm_head);
+        }
+        // embed_tokens: check gpu_embed_tokens first
+        if let Some(ref t) = self.gpu_embed_tokens {
+            let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
+            self.gpu_embed_tokens = Some(new);
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// slot-only `&self` host-access mapping (AB-4 §5.5.4).
+    ///
+    /// `map_weights_for_cpu` 의 slot 순회 부분만 떼어낸 변형이다. top-level
+    /// `norm`/`lm_head`/`gpu_embed_tokens` (SwitchHw 전용, `&mut self` 필요)는
+    /// 건드리지 않으므로 순수 `&self` — slot 갱신은 `store_weights_same_dtype`
+    /// (ArcSwap, clone-then-install INV-123)로 수행한다. `PartitionStage` 가
+    /// 최초 partition 활성 시 model handle 없이 layer slot 만 host-mapped 시키는
+    /// lazy 경로의 진입점이다. 반환값 = 새로 매핑한 weight tensor 개수.
+    #[cfg(feature = "opencl")]
+    pub fn map_layer_weights_for_host_access(
+        &self,
+        gpu_backend: &Arc<dyn Backend>,
+    ) -> Result<usize> {
+        // COLD-EXT: weight mmap startup (1회).
+        let ocl_be = gpu_backend
+            .get_extension(crate::backend::EXT_OPENCL_QUEUE)
+            .and_then(|a| a.downcast_ref::<crate::backend::opencl::OpenCLBackend>())
+            .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
+        let queue = ocl_be.queue.clone();
+
+        let mut count = 0;
         // Weight slot migration uses clone-then-install so the ArcSwap sees a
         // single atomic transition per slot (INV-123).
         for slot in &self.layers {
@@ -917,7 +966,7 @@ impl TransformerModel {
             let mut layer = (*old).clone();
             macro_rules! map_slot_weight {
                 ($t:expr) => {
-                    let (new, changed) = map_one(&$t, gpu_backend)?;
+                    let (new, changed) = map_weight_for_host(&$t, gpu_backend, &queue)?;
                     if changed {
                         $t = new;
                         count += 1;
@@ -939,36 +988,26 @@ impl TransformerModel {
                 map_slot_weight!(bias.bv);
             }
             if let Some(ref t) = layer.q_norm {
-                let (new, _) = map_one(t, gpu_backend)?;
+                let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
                 layer.q_norm = Some(new);
                 count += 1;
             }
             if let Some(ref t) = layer.k_norm {
-                let (new, _) = map_one(t, gpu_backend)?;
+                let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
                 layer.k_norm = Some(new);
                 count += 1;
             }
             if let Some(ref t) = layer.pre_ffn_norm {
-                let (new, _) = map_one(t, gpu_backend)?;
+                let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
                 layer.pre_ffn_norm = Some(new);
                 count += 1;
             }
             if let Some(ref t) = layer.post_ffn_norm {
-                let (new, _) = map_one(t, gpu_backend)?;
+                let (new, _) = map_weight_for_host(t, gpu_backend, &queue)?;
                 layer.post_ffn_norm = Some(new);
                 count += 1;
             }
             slot.store_weights_same_dtype(Arc::new(layer));
-        }
-        map_weight!(self.norm);
-        if !self.lm_head_on_cpu {
-            map_weight!(self.lm_head);
-        }
-        // embed_tokens: check gpu_embed_tokens first
-        if let Some(ref t) = self.gpu_embed_tokens {
-            let (new, _) = map_one(t, gpu_backend)?;
-            self.gpu_embed_tokens = Some(new);
-            count += 1;
         }
         Ok(count)
     }
@@ -992,42 +1031,12 @@ impl TransformerModel {
         gpu_ratio: f32,
         hw: &crate::hardware::Hardware,
     ) -> Result<usize> {
-        use crate::format::weight_format::{LayerDispatch, PartitionShare, WeightFormat};
-        use crate::layers::tensor_partition::is_gpu_only_ratio;
-        use technique_api::DeviceTarget;
-
-        // GPU-only fast path: leave partition_ctx cleared so forward() takes
-        // the dense full-weight GPU matmul path. Avoids per-token host
-        // staging (read_buffer + CPU matmul on a clamped 128-row slice +
-        // GPU↔host merge) that is independent of ratio once partition_ctx
-        // is installed. See `is_gpu_only_ratio` / `GPU_ONLY_THRESHOLD`.
-        //
-        // The per-slot gen-counter / RCU store sequencing (INV-120) now lives
-        // in `LayerSlot::apply_dispatch`; this method only fans the dispatch
-        // mode out over the layers.
-        if is_gpu_only_ratio(gpu_ratio) {
-            for slot in &self.layers {
-                slot.apply_dispatch(LayerDispatch::Full, hw)?;
-            }
-            return Ok(0);
-        }
-
-        let specs = vec![
-            PartitionShare {
-                share: gpu_ratio,
-                hardware: DeviceTarget::Gpu,
-            },
-            PartitionShare {
-                share: 1.0 - gpu_ratio,
-                hardware: DeviceTarget::Cpu,
-            },
-        ];
-        let mut count = 0;
-        for slot in &self.layers {
-            slot.apply_dispatch(LayerDispatch::Partition(specs.clone()), hw)?;
-            count += 3;
-        }
-        Ok(count)
+        // Thin wrapper over the shared fan-out (AB-4, §5.5.3). The GPU-only
+        // fast path, the `LayerDispatch::Partition` install, and the per-slot
+        // gen-counter / RCU store sequencing (INV-120) all live in
+        // `apply_partition_dispatch` + `LayerSlot::apply_dispatch`, shared with
+        // the runtime `SetPartitionRatio` directive path (`PartitionStage`).
+        crate::layers::tensor_partition::apply_partition_dispatch(&self.layers, gpu_ratio, hw)
     }
 
     /// Convert all Q4_0 weight tensors to noshuffle SOA layout for Adreno-optimized GEMV.

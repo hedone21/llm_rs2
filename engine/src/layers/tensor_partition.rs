@@ -40,6 +40,54 @@ pub fn is_gpu_only_ratio(gpu_ratio: f32) -> bool {
     gpu_ratio >= GPU_ONLY_THRESHOLD
 }
 
+/// Fan a partition dispatch mode out over every layer slot (AB-4, §5.5.3).
+///
+/// Extracted from `TransformerModel::prepare_tensor_partition` so the static
+/// CLI path (`session/init.rs`) and the runtime `SetPartitionRatio` directive
+/// path (`PartitionStage`) share a single fan-out implementation — INV-120
+/// generation bookkeeping then has a single source of truth.
+///
+/// - `gpu_ratio >= GPU_ONLY_THRESHOLD` → `LayerDispatch::Full` fan-out, returns 0
+///   (GPU-only fast path: `partition_ctx` stays cleared, dense GPU matmul).
+/// - otherwise → `LayerDispatch::Partition([gpu, cpu])` fan-out, returns
+///   `slots.len() * 3` (gate/up/down re-sliced per layer).
+///
+/// `LayerSlot::apply_dispatch(&self)` performs the ArcSwap RCU install and the
+/// `ratio_generation` bump (INV-120); this function only chooses the dispatch
+/// mode and iterates.
+pub fn apply_partition_dispatch(
+    slots: &[Arc<crate::models::weights::LayerSlot>],
+    gpu_ratio: f32,
+    hw: &crate::hardware::Hardware,
+) -> Result<usize> {
+    use crate::format::weight_format::{LayerDispatch, PartitionShare, WeightFormat};
+    use technique_api::DeviceTarget;
+
+    if is_gpu_only_ratio(gpu_ratio) {
+        for slot in slots {
+            slot.apply_dispatch(LayerDispatch::Full, hw)?;
+        }
+        return Ok(0);
+    }
+
+    let specs = vec![
+        PartitionShare {
+            share: gpu_ratio,
+            hardware: DeviceTarget::Gpu,
+        },
+        PartitionShare {
+            share: 1.0 - gpu_ratio,
+            hardware: DeviceTarget::Cpu,
+        },
+    ];
+    let mut count = 0;
+    for slot in slots {
+        slot.apply_dispatch(LayerDispatch::Partition(specs.clone()), hw)?;
+        count += 3;
+    }
+    Ok(count)
+}
+
 /// A single slice of a partitioned weight: the sub-tensor, the backend that
 /// computes it, and the number of elements along the split axis.
 ///
@@ -1632,5 +1680,80 @@ mod tests {
             layer_before + 3,
             "total layer count should have increased by 3"
         );
+    }
+
+    // ── AB-4 (C): apply_partition_dispatch fan-out 등가 ──
+
+    use crate::models::weights::LayerSlot;
+
+    fn ffn_layer_slot(be: &Arc<dyn Backend>, idx: usize) -> Arc<LayerSlot> {
+        use crate::layers::transformer_layer::TransformerLayer;
+        // FFN weights large enough for split_weight (out_dim >= 256, 128-aligned);
+        // attention weights are never partitioned, so small placeholders suffice.
+        let small = make_f32_weight(1, 1);
+        let layer = TransformerLayer {
+            wq: small.clone(),
+            wk: small.clone(),
+            wv: small.clone(),
+            wo: small.clone(),
+            w_gate: make_f32_weight(512, 256),
+            w_up: make_f32_weight(512, 256),
+            w_down: make_f32_weight(256, 512),
+            attention_norm: small.clone(),
+            ffn_norm: small,
+            qkv_bias: None,
+            q_norm: None,
+            k_norm: None,
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            partition_ctx: None,
+        };
+        let _ = be;
+        Arc::new(LayerSlot::new(layer, DType::F32, None, idx))
+    }
+
+    fn cpu_only_hardware(be: &Arc<dyn Backend>) -> crate::hardware::Hardware {
+        let host: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
+        crate::hardware::Hardware::new(be.clone(), None, None, host, None)
+    }
+
+    /// GPU-only fast path: ratio >= threshold → Full fan-out, returns 0 and
+    /// leaves partition_ctx cleared.
+    #[test]
+    fn apply_partition_dispatch_gpu_only_returns_zero() {
+        let be = cpu_backend();
+        let hw = cpu_only_hardware(&be);
+        let slots: Vec<_> = (0..3).map(|i| ffn_layer_slot(&be, i)).collect();
+
+        let n = apply_partition_dispatch(&slots, 0.999, &hw).unwrap();
+        assert_eq!(n, 0, "GPU-only fast path fans out Full, returns 0");
+        for slot in &slots {
+            assert!(
+                slot.load_weights().partition_ctx.is_none(),
+                "Full leaves partition_ctx cleared"
+            );
+        }
+    }
+
+    /// Partition fan-out: ratio below threshold → Partition fan-out, returns
+    /// slots.len() * 3 and installs partition_ctx on every slot.
+    #[test]
+    fn apply_partition_dispatch_partition_returns_three_per_slot() {
+        let be = cpu_backend();
+        let hw = cpu_only_hardware(&be);
+        let slots: Vec<_> = (0..3).map(|i| ffn_layer_slot(&be, i)).collect();
+
+        let n = apply_partition_dispatch(&slots, 0.5, &hw).unwrap();
+        assert_eq!(
+            n,
+            slots.len() * 3,
+            "Partition fan-out returns slots.len()*3"
+        );
+        for slot in &slots {
+            assert!(
+                slot.load_weights().partition_ctx.is_some(),
+                "Partition installs partition_ctx on every slot"
+            );
+        }
     }
 }
