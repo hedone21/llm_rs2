@@ -1110,7 +1110,7 @@
 - **Notes**: 현 production에서 RestoreDefaults는 swap에 한해 no-op(§5.6.4 — 의도된 동작, partition/quant guard clear와 비대칭). 우선순위 P3 근거: production winner(Incremental swap)는 압력 해소 후에도 Q4 유지가 메모리 이득 관점에서 보통 바람직 — 역전의 실수요(품질 회복 시나리오)가 구체화되면 P2 승격.
 
 ## [P2] QCF_kv 정규화 비대칭 + estimator 우회 + manager floor 재설정 — 설계 라운드 (2026-06-12 등록)
-- **Status**: TODO (**설계 라운드 필수 — 사용자 + Architect 결정 선행**. Architect 판정 (B): 3층 정합성 결함이라 폐쇄 수정 불가)
+- **Status**: 검토 중 (2026-06-12 설계 라운드 1차 — 문제 상황 상세 공유 완료, **결정 2건은 사용자 공동 검토로 진행 예정**. Architect 판정 (B): 3층 정합성 결함이라 폐쇄 수정 불가)
 - **Sprint**: backlog
 - **Dependencies**: 없음 (본 항목의 Architect 분석이 안건 SSOT — 2026-06-12 세션)
 - **출처**: 2026-06-12 score accumulator 배선 세션 — `signal_memory_critical` known-fail의 최종 잔여 원인으로 적발. S25 실측: V-readback 수정(`4444bdc8`) 후 QCF_kv가 0.985로 포화 → policy quality floor(critical=0.90)가 모든 kv.evict 기각.
@@ -1119,6 +1119,15 @@
   2. **estimator 우회**: `qcf_runtime.rs:981~986`이 raw QCF를 DegradationEstimator 환산 없이 직접 IPC 송출 — spec ENG-ALG-050 step 4(L688) 위반. raw 전송+manager측 환산 vs 엔진측 ΔPPL 환산 택일이 **floor 의미를 좌우하는 미결 설계 결정** (estimator 자체는 명목 linear(1.0) 기본값 — 보정 의존 없음).
   3. **manager floor 정렬**: `policy_default.lua:69~73` QCF_FLOOR 4임계(0.30/0.60/0.90/huge) + V_Q=0.5(L53)가 현 포화 스케일에 정렬 — 수식 수정 시 재설정 + verify 매트릭스 재검증 필수.
 - **동반 재보정**: `test_d2o_less_than_h2o`(qcf_kv.rs:1156~1240) — 계약은 순서 관계(D2O<H2O)로 정규화-중립이나 테스트 데이터(`make_v_data` t-단조 V, head_dim=4)가 정규화 공간에서 순서가 뒤집힘 → 실분포 근사 데이터(head_dim≥32, 비단조 norm)로 교체 + 측정 확인. paper 절대값 노출 없음(grep 전수).
+- **2026-06-12 검토 라운드 추가 발견 (estimator 실태)**:
+  - DegradationEstimator(`engine/src/qcf/estimator.rs` — piecewise-linear + EMA 보정 + JSON 캘리브레이션 로드)는 **완성돼 있으나 live 경로에 미장착** — qcf_runtime 어디에서도 인스턴스화/호출 0. "완성된 부품 미장착"이 spec 위반의 실체.
+  - `estimate()`는 곡선 미등록 액션에 `linear(1.0)` 항등 fallback(:137~141), `with_defaults` 기본 곡선도 전 액션 항등 → **장착해도 당장 수치 변화 0 (전환 무위험)**. 결정의 본질은 IPC 값의 단위 선언 + 향후 캘리브레이션 경로.
+  - **곡선 키 불일치 잠복**: `with_defaults` 키(`kv.eviction`/`kv.sliding`/`kv.kivi`/`weight.skip`) ≠ IPC estimates 키(`kv.evict_h2o`/`kv.evict_sliding`/`kv.merge_d2o`/`kv.quant_dynamic`/`weight.skip`). 항등 fallback이라 현재 무해하나 **캘리브레이션 곡선 등록 시 silent 미적용** (fixture relief silent-0 동일 클래스). manager `context.rs:173`의 `kv_streaming` 언더스코어 표기도 감사 대상. → 방향 결정과 무관하게 **키 전수 감사를 라운드에 포함**.
+  - 포화 메커니즘 실측 보강: ‖o_before‖=201 vs ‖o_after‖=2.9 (S25 qwen2.5-1.5b, pos=1045, 누적 Σα≈12) → QCF ≈ 1−2.9/201 ≈ 0.985. 분자를 스케일 차이가 지배해 액션/eviction 폭 무관 동일값.
+  - floor 부수 효과 확인: 수식 수정만으로 `signal_memory_critical` 게이트는 GREEN 예상(0.08~0.22 < critical 0.90)이나, 현행 QCF_FLOOR(normal 0.30 포함)는 신규 스케일에서 **영구 미발동 dead config**가 됨 — 재설정은 게이트가 아니라 의미 복원 차원. `weight.skip`(QCF_weight, 다른 측정 공간) 분포와 함께 재산정해야 함.
+- **사용자 결정 2건 (공동 검토 예정 — 2026-06-12 문제 상황 상세 공유 완료)**:
+  1. **estimator 우회 해소 방향**: (A) 엔진측 ΔPPL 환산 — estimator 장착, spec 무변경, 가족 간 비교 합법화, 향후 캘리브레이션 시 manager 무변경 (권장) vs (B) raw 직송 합법화 — 코드 무변경, spec ENG-ALG-050 step 4 개정, 가족 간 raw 비교 고착. **floor의 단위가 이 결정을 따름** (1번 확정 후 2번 값 산정이 한 번에 끝남).
+  2. **QCF_FLOOR 재설정**: (A) 이번 라운드 포함 — 수정 후 S25 분포 실측(양 가족) → 4임계+V_Q 재산정 → policy_default.lua 반영 → 매트릭스 30 재검증 봉인 (권장; directive 변동 리스크 있음) vs (B) 현행 유지 — dead config 잔존(V_Q soft 페널티는 계속 작동), 분포 실측 후일 이중 작업.
 - **Acceptance Criteria**: ① 수식+spec(ENG-ALG-051)+docs(qcf_taxonomy §2.1/§2.2.1) 3소스 동기화, ② estimator 우회 방향 결정+구현, ③ floor 재설정, ④ d2o 테스트 재보정, ⑤ `signal_memory_critical` f16/q4 S25 verify GREEN (이 시나리오가 회귀 게이트).
 - **참고**: v1(4월)의 동 시나리오 PASS는 fixture relief 키 깨짐(전부 0)에 의존한 우연이었음이 git 포렌식으로 확정 — v1도 동일 수식 결함 보유.
 
