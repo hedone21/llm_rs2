@@ -21,9 +21,10 @@ use super::helpers::{empty_snap, make_executor, send_directive};
 /// AB-5 §5.8.6 gate 1: dispatcher 에 report_tx 주입 → RequestQcf dispatch 시 QcfEstimate 1회 송출.
 #[test]
 fn test_seq_095_dispatcher_sends_qcf_estimate_on_request_qcf() {
-    use llm_rs2::backend::cpu::CpuBackend;
     use llm_rs2::backend::Backend;
+    use llm_rs2::backend::cpu::CpuBackend;
     use llm_rs2::buffer::DType;
+    use llm_rs2::kv::cache_manager::CacheManager;
     use llm_rs2::kv::eviction::sliding_window::SlidingWindowPolicy;
     use llm_rs2::kv::kv_cache::KVCache;
     use llm_rs2::kv::standard_format::StandardFormat;
@@ -31,7 +32,6 @@ fn test_seq_095_dispatcher_sends_qcf_estimate_on_request_qcf() {
     use llm_rs2::resilience::sys_monitor::NoOpMonitor;
     use llm_rs2::session::command_dispatcher::CommandDispatcher;
     use llm_rs2::session::pipeline_registry::PipelineRegistry;
-    use llm_rs2::kv::cache_manager::CacheManager;
     use llm_rs2::shape::Shape;
     use llm_rs2::tensor::Tensor;
     use std::sync::Mutex;
