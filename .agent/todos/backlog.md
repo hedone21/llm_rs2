@@ -1101,11 +1101,27 @@
 - **Acceptance Criteria**: v2 경로에서 RequestQcf 수신 시 `compute_qcf_estimates` 산출을 `QcfEstimate` IPC로 응답 (AB-6 report_tx 선례 동형 배선) + `signal_thermal_critical_throttle` f16/q4 S25 verify GREEN.
 - **Notes**: 직접 directive 경로(Suspend/Offload/Quant/TargetTbt/Partition/Swap)는 전부 정상 — 영향 범위는 QCF 2단계 정책 경로 한정. verify 매트릭스의 known-fail 2건이 이 항목의 회귀 게이트 역할. 담당 권장: Architect(배선 설계) → Implementer.
 
-## [P2] argus_bench AttentionScoreAccumulator 배선 (AB-1 잔여) — 2026-06-11 등록
-- **Status**: TODO
+## [P3] weight swap 역전 (RestoreDefaults F16 recall) — 2026-06-11 등록 (ADR-0006 §6 Deferred 잔존분)
+- **Status**: TODO (설계 라운드 선행 필수 — Architect + 사용자 결정)
 - **Sprint**: backlog
-- **Dependencies**: 없음
-- **출처**: AB-5 S25 verify — `signal_memory_critical` f16/q4 device FAIL의 잔여 원인 (구 handoff AB-1 landmine "score-driven eviction(AttentionScoreAccumulator) 미장착" 그대로)
-- **Description**: v2 argus_bench(ModelForward)는 `score_accumulator: None`이라 QCF estimates에 h2o/d2o(requires_scores) 액션이 빠짐 → `compute_qcf_estimates`가 sliding 1개만 산출 → manager llm_default policy DPP가 KvEvict 대신 LayerSkip 선택 → 시나리오 기대(`Directive.*KvEvict`) 미충족. v1 4월 PASS run은 `eviction h2o` 구성 시 accumulator가 장착돼 estimates 4 actions → KvEvict.
-- **Acceptance Criteria**: argus_bench에서 score-based eviction policy(`eviction h2o` 등) 구성 시 AttentionScoreAccumulator를 ModelForward forward_into에 배선 + QCF estimates에 kv.evict_h2o/kv.merge_d2o 포함 + `signal_memory_critical` f16/q4 S25 verify GREEN.
-- **Notes**: QCF IPC 자체는 AB-5에서 재배선 완료(§5.8 + device read-back fallback) — 남은 것은 score 공급뿐. 영향 범위 = score 수집이 hot path에 더하는 비용 검토 필요 (v1은 need_scores 조건부). 담당 권장: Architect(배선 지점) → Implementer.
+- **Dependencies**: 없음 (단, 착수 시 ADR-0006 §5 Risk "RestoreDefaults swap 역전 = 신규 메커니즘" 정독)
+- **출처**: ADR-0006 §6 Deferred. 2026-06-11 "ADR-0006 Deferred 진행" 세션에서 hook 실배선(§5.9.2)은 해소했으나 swap reversal은 **의도적으로 범위 제외** — `SwapExecutor` 단방향(F16→Q4_0, INV-126 Q4_0-only validate swap_runtime.rs) + F16 recall 코드 전무 + report `from/to_dtype` 하드코딩으로, 역전은 신규 메커니즘(F16 recall/dual-resident + Consumed된 OneShot의 역방향 재기동) 설계가 필요하다.
+- **Acceptance Criteria**: RestoreDefaults 수신 시 swap된 layer가 F16으로 복원 + 복원 후 출력이 swap-전 happy baseline과 일치 (S25 device 게이트) + partition+precision 합성 역전(ADR-0006 §6) 처분 결정.
+- **Notes**: 현 production에서 RestoreDefaults는 swap에 한해 no-op(§5.6.4 — 의도된 동작, partition/quant guard clear와 비대칭). 우선순위 P3 근거: production winner(Incremental swap)는 압력 해소 후에도 Q4 유지가 메모리 이득 관점에서 보통 바람직 — 역전의 실수요(품질 회복 시나리오)가 구체화되면 P2 승격.
+
+## [P2] QCF_kv 정규화 비대칭 + estimator 우회 + manager floor 재설정 — 설계 라운드 (2026-06-12 등록)
+- **Status**: TODO (**설계 라운드 필수 — 사용자 + Architect 결정 선행**. Architect 판정 (B): 3층 정합성 결함이라 폐쇄 수정 불가)
+- **Sprint**: backlog
+- **Dependencies**: 없음 (본 항목의 Architect 분석이 안건 SSOT — 2026-06-12 세션)
+- **출처**: 2026-06-12 score accumulator 배선 세션 — `signal_memory_critical` known-fail의 최종 잔여 원인으로 적발. S25 실측: V-readback 수정(`4444bdc8`) 후 QCF_kv가 0.985로 포화 → policy quality floor(critical=0.90)가 모든 kv.evict 기각.
+- **3층 결함 (Architect 분석)**:
+  1. **수식 비대칭**: `qcf_kv.rs:217~232` o_before = raw Σα·V vs o_after = (α/Σα) 정규화 — 스케일 불일치로 QCF 포화. **spec ENG-ALG-051(spec/32 L591~600)에 동일 비대칭이 명문화**돼 있고 spec 불변식 `QCF ∈ [0,1]`(L630)과 자기모순. 올바른 형태는 유일(o_before에도 α/Σ_all α 정규화 — o_after의 잔존 Σα 재정규화는 이미 정확). 수정 시 QCF 0.08~0.22 정상화 S25 실측됨.
+  2. **estimator 우회**: `qcf_runtime.rs:981~986`이 raw QCF를 DegradationEstimator 환산 없이 직접 IPC 송출 — spec ENG-ALG-050 step 4(L688) 위반. raw 전송+manager측 환산 vs 엔진측 ΔPPL 환산 택일이 **floor 의미를 좌우하는 미결 설계 결정** (estimator 자체는 명목 linear(1.0) 기본값 — 보정 의존 없음).
+  3. **manager floor 정렬**: `policy_default.lua:69~73` QCF_FLOOR 4임계(0.30/0.60/0.90/huge) + V_Q=0.5(L53)가 현 포화 스케일에 정렬 — 수식 수정 시 재설정 + verify 매트릭스 재검증 필수.
+- **동반 재보정**: `test_d2o_less_than_h2o`(qcf_kv.rs:1156~1240) — 계약은 순서 관계(D2O<H2O)로 정규화-중립이나 테스트 데이터(`make_v_data` t-단조 V, head_dim=4)가 정규화 공간에서 순서가 뒤집힘 → 실분포 근사 데이터(head_dim≥32, 비단조 norm)로 교체 + 측정 확인. paper 절대값 노출 없음(grep 전수).
+- **Acceptance Criteria**: ① 수식+spec(ENG-ALG-051)+docs(qcf_taxonomy §2.1/§2.2.1) 3소스 동기화, ② estimator 우회 방향 결정+구현, ③ floor 재설정, ④ d2o 테스트 재보정, ⑤ `signal_memory_critical` f16/q4 S25 verify GREEN (이 시나리오가 회귀 게이트).
+- **참고**: v1(4월)의 동 시나리오 PASS는 fixture relief 키 깨짐(전부 0)에 의존한 우연이었음이 git 포렌식으로 확정 — v1도 동일 수식 결함 보유.
+
+## [RESOLVED(배선)/이관] argus_bench AttentionScoreAccumulator 배선 (AB-1 잔여) — 2026-06-11 등록 / 2026-06-12 처분
+- **Status**: **배선 RESOLVED (2026-06-12)** — AC 중 "signal_memory_critical GREEN"만 미달. S25 트레이스로 score 체인 전 구간(누적 ws.scores.sum=12.0 → dispatcher 전달 n=2048/nonzero=132 → QCF estimate h2o/d2o 포함) 정상 입증 후, 잔여 원인이 별개 결함(QCF_kv 수식 포화)으로 재진단되어 위 "QCF_kv 정규화 비대칭" 설계 라운드로 이관.
+- **완료분**: ① accumulator 생성·forward 장착(`3b241d11`, arch v2 §5.9.1 공유 cell — eviction-시 ScoreContext 공급+reset 포함), ② capability 송출 동적화(`274472b6` — kv.evict_* 포함 12 actions S25 실측), ③ fixture relief 키 정정(`b65690af`), ④ rpcmem stale V-readback 강제(`4444bdc8` — GPU KV는 read_buffer 필수, as_ptr=stale cache). happy-path 무회귀: α-K frozen 3-dtype 비트 일치 + TBT Δ≤+0.53%, 전체 매트릭스 신규 회귀 0.

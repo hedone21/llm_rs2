@@ -1,3 +1,5 @@
+> **[SUPERSEDED 2026-06-12]** 본 문서의 진입 문장(score accumulator 배선 / ADR-0006 Deferred)은 2026-06-12 세션에서 **둘 다 소화됨**. 정본 진입 문서 = `handoff_score_wiring_qcf_round_2026_06_12.md`.
+
 # Handoff: AB-0~6 전 트랙 완주 (AB-2 KIVI + AB-5 verify 재가동 종결) → 후속 트랙 선택
 
 **작성**: 2026-06-11
