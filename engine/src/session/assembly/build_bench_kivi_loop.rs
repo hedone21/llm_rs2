@@ -114,6 +114,9 @@ pub fn build_bench_kivi_loop(
             kivi_handles,
             // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
             report_tx_for_dispatcher,
+            // §5.9.2 Track B: KIVI 경로는 swap 미배선(model None) → swap directive inert.
+            // 더미 cell (KiviForward 는 ModelForward 와 무관 — hook 미소비).
+            Arc::new(std::sync::Mutex::new(None)),
         )
     });
 

@@ -217,6 +217,8 @@ fn impl_run_decode_loop(
         // Phase 4-4.7: microbench는 vtable overhead만 측정. plan path는 별도
         // device G7' 게이트로 검증되므로 여기서는 비활성화 → forward_into fallback만.
         false,
+        // §5.9.2 Track B: microbench 는 swap 미구성 → 더미 hook cell (항상 None).
+        std::sync::Arc::new(std::sync::Mutex::new(None)),
     )?;
 
     let mut decode_loop = DecodeLoopBuilder::new()
@@ -348,6 +350,7 @@ fn impl_run_direct(
         importance_collector: None,
         logits_last_only: true,
         cache_self_need_scores: false,
+        layer_boundary_hook: None,
     })?;
     let prefill_logits_host = read_logits(backend, &prefill_logits, vocab)?;
     let first_token = greedy_argmax(&prefill_logits_host);
@@ -373,6 +376,7 @@ fn impl_run_direct(
             importance_collector: None,
             logits_last_only: false,
             cache_self_need_scores: false,
+            layer_boundary_hook: None,
         })?;
         let logits = read_logits(backend, &decode_logits, vocab)?;
         let next = greedy_argmax(&logits);

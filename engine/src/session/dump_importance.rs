@@ -81,6 +81,7 @@ pub fn run_dump_importance(mut ctx: DumpImportanceCtx) -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: Some(&mut collector),
             cache_self_need_scores: false,
+            layer_boundary_hook: None,
         })
     })?;
 

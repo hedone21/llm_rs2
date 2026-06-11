@@ -19,7 +19,7 @@
 //! Happy path 진입 조건은 [`is_standard_happy_path`] 참조. chunked prefill /
 //! optional collector 의존 케이스는 Phase 4-4.5에서 흡수 예정.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -114,6 +114,10 @@ pub fn build_standard_loop(
         kv_caches.len(),
         max_seq_len,
     );
+    // §5.9.2 Track B: happy/standard 경로는 swap 미구성(dispatcher model=None) → hook 설치가
+    // 일어나지 않는다. ModelForward 생성자가 요구하는 cell 은 항상 None 인 더미를 넘긴다.
+    let hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>> =
+        Arc::new(Mutex::new(None));
     let mf = ModelForward::new(
         backend,
         memory,
@@ -122,6 +126,7 @@ pub fn build_standard_loop(
         kv_caches,
         max_seq_len,
         plan_enabled,
+        Arc::clone(&hook_cell),
     )?;
 
     // β-4: resilience-on 이면 dispatcher 를 구성한다 — control 디렉티브(Throttle/SetTargetTbt/
@@ -153,6 +158,8 @@ pub fn build_standard_loop(
                 None,
                 Vec::new(),
                 None, // report_tx: AB-5
+                // §5.9.2 Track B: happy 경로는 swap 미구성 → 더미 cell (항상 None).
+                Arc::clone(&hook_cell),
             );
             (Some(adapter), Some((registry, dispatcher, kv_pos_handle)))
         }

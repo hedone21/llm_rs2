@@ -11,7 +11,7 @@
 //! - Kivi: `kv_pos={kv_pos}/{max_seq_len} mode=kivi bits={bits} residual={residual_size}`
 //! - Offload: `kv_pos={kv_pos}/{max_seq_len} mode=offload store={mode} prefetch_depth={max_prefetch_depth}`
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -453,6 +453,9 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
     let target_ratio = args.eviction_target_ratio;
 
     // ModelForward 생성
+    // §5.9.2 Track B: chat 경로는 swap 미구성 → hook 더미 cell (항상 None).
+    let hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>> =
+        Arc::new(Mutex::new(None));
     let mf = ModelForward::new(
         args.backend,
         args.memory,
@@ -461,6 +464,7 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
         args.kv_caches,
         max_seq_len,
         false, // chat 모드는 plan path 비활성 (D4: eviction + plan 공존 미지원)
+        hook_cell,
     )?;
 
     let decode_loop = DecodeLoopBuilder::new()

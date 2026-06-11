@@ -387,6 +387,7 @@ pub fn run_kivi_ppl(
                 skip_config: None,
                 importance_collector: None,
                 cache_self_need_scores,
+                layer_boundary_hook: None,
             })
         })?;
 
@@ -471,6 +472,7 @@ pub fn run_kivi_ppl(
                 skip_config: None,
                 importance_collector: None,
                 cache_self_need_scores,
+                layer_boundary_hook: None,
             })
         })?;
         start_pos += 1;
@@ -794,6 +796,7 @@ pub fn run_ppl(
                 skip_config,
                 importance_collector: None,
                 cache_self_need_scores: false,
+                layer_boundary_hook: None,
             })
         })?;
 
@@ -958,6 +961,7 @@ pub fn run_ppl(
                 skip_config,
                 importance_collector: None,
                 cache_self_need_scores: false,
+                layer_boundary_hook: None,
             })
         })?;
         start_pos += 1;

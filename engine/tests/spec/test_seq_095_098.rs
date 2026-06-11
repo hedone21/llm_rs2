@@ -73,6 +73,7 @@ fn test_seq_095_dispatcher_sends_qcf_estimate_on_request_qcf() {
         None,
         Vec::new(),
         Some(report_tx), // AB-5: report_tx 주입 → RequestQcf 시 QcfEstimate 송출.
+        Arc::new(std::sync::Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
     );
 
     // dispatch RequestQcf → compute_and_send_qcf 경유 QcfEstimate 1회 송출.
@@ -108,7 +109,8 @@ fn test_seq_095_dispatcher_inert_without_report_tx() {
         None,
         None,
         Vec::new(),
-        None, // None → inert
+        None,                                  // None → inert
+        Arc::new(std::sync::Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
     );
 
     disp.dispatch(vec![EngineCommand::RequestQcf]);

@@ -63,16 +63,24 @@ pub struct WeightSwapStage {
     /// Incremental mode drain 상태(§5.6.3). commit 시 `Some(plan)` 설치, 매 tick drain,
     /// `is_done()` 시 retire. non-Incremental 은 commit 후에도 `None` 유지(hook 설치만).
     plan: Mutex<Option<IncrementalSwapPlan>>,
+    /// §5.9.2 Track B: ModelForward 와 공유하는 layer-boundary hook cell. IntraForward/
+    /// LayerImmediate commit 시 `Some(hook)` 설치 → ModelForward 가 매 decode step lock-read 후
+    /// forward args 슬롯에 주입. assembly 가 1개 cell 을 만들어 양측에 `Arc` clone 으로 넘긴다
+    /// (INV-STAGE-LAYER-HANDLE 동형 — `StageContext` 무확장).
+    hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
 }
 
 impl WeightSwapStage {
     /// `SwapWeights` directive 1건 → OneShot swap Stage (§5.6.4).
+    #[allow(clippy::too_many_arguments)]
     pub fn one_shot(
         model: Arc<TransformerModel>,
         runtime: Arc<EngineSwapRuntime>,
         importance: Option<Arc<dyn ImportanceLookup>>,
         ratio: f32,
         target_dtype: DtypeTag,
+        // §5.9.2 Track B: ModelForward 와 공유하는 hook cell (assembly 생성, Arc clone).
+        hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
     ) -> Self {
         Self {
             model,
@@ -82,6 +90,7 @@ impl WeightSwapStage {
             target_dtype,
             committed: Mutex::new(false),
             plan: Mutex::new(None),
+            hook_cell,
         }
     }
 
@@ -214,7 +223,7 @@ impl WeightSwapStage {
                     "[WeightSwap] manager path ({}): ratio={:.2}, {} layers, qcf={:.4}",
                     mode_label, ratio, n_planned, qcf_swap_estimated,
                 );
-                let _hook = IntraForwardSwapHook::new(
+                let hook = IntraForwardSwapHook::new(
                     decision.selected_layers,
                     decode_token_index,
                     Arc::clone(self.runtime.dispatcher()),
@@ -225,14 +234,30 @@ impl WeightSwapStage {
                     DType::Q4_0,
                     Arc::clone(self.runtime.config()),
                 );
-                // §5.6.3: hook 은 `transformer.layer_boundary_hook` slot(forward args 경유, layer
-                // 경계 dispatch)으로 떠나야 한다. 현 ModelForward 는 β-7 에서 v1 SwapStage trait 을
-                // 삭제하며 이 slot 을 `None` 고정했다(model_forward.rs:9 — greenfield, §5.6.7
-                // "현 swap 미배선 = NoOpSwapStage"). forward 전달 배선 = **device 게이트 범위**
-                // (S25/Jetson, §5.6.7 "IntraForward/PhaseAware = device 필수"). host scope 에서는
-                // hook 생성(정본 거동)까지만 — slot 배선은 그 sprint 에서 ModelForward 가 흡수한다.
+                // §5.9.2 Track B: hook 을 공유 cell 에 설치한다 → ModelForward 가 매 decode step
+                // 이 cell 을 lock-read 해 forward args `layer_boundary_hook` 슬롯에 주입하고,
+                // forward_into 의 layer loop 가 layer 경계에서 hook 을 자율 dispatch 한다.
+                // (LayerImmediate 는 동일 hook, mode label 만 상이 — §5.6.3.)
+                //
+                // **finalize/클리어 결정 (§5.9.2 "hook lifetime" 의 fallback clause):**
+                // IntraForward/LayerImmediate 는 commit 시 in-flight 마커를 set 하지 않으며
+                // (Incremental 만 mark_in_flight(true)), v2 DecodeLoop 에 `IntraForwardSwapHook::
+                // finalize` 호출처가 없다(v1 caller 삭제). v1 도 hook 을 plan 소진 후 잔존시켰고
+                // (`should_dispatch(idx)` false → on_layer_boundary 즉시 return = no-op,
+                // intra_forward_swap.rs:392), 정확성은 그 self-gate 가 보장한다. 따라서 별도
+                // PostForward 클리어 경로를 신설하지 않고 **다음 commit 이 cell 을 overwrite** 하는
+                // 것으로 갈음한다 — cell 은 항상 최대 1 hook 만 보유한다. 동시 활성(R-1)은 commit §2
+                // 의 in-flight 가드가 막는다(non-Incremental 은 mark_in_flight 미진입이라 본 가드가
+                // IntraForward 연속 commit 을 막지는 않으나, 같은 ratio 재submit 은 selected_layers
+                // 빈 결과로 §4 에서 reject, 새 ratio 는 새 plan 으로 overwrite — v1 등가).
+                // 실 swap dispatch·정확성 = S25 device 게이트(secondary + GPU async swap).
+                *self
+                    .hook_cell
+                    .lock()
+                    .expect("weight_swap hook_cell mutex poisoned") =
+                    Some(hook as Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>);
                 eprintln!(
-                    "[WeightSwap] {} hook created — forward slot 배선은 device 게이트(§5.6.7)",
+                    "[WeightSwap] {} hook installed into shared cell (§5.9.2 Track B)",
                     mode_label
                 );
                 false
@@ -539,6 +564,12 @@ mod tests {
         }
     }
 
+    /// §5.9.2 Track B: 빈 hook cell (설치 토글 검증용 / 더미). 타입 별칭.
+    type HookCell = Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>;
+    fn empty_hook_cell() -> HookCell {
+        Arc::new(Mutex::new(None))
+    }
+
     fn stage(
         be: &Arc<dyn Backend>,
         n_layers: usize,
@@ -552,6 +583,7 @@ mod tests {
             None,
             ratio,
             dtype,
+            empty_hook_cell(),
         )
     }
 
@@ -621,8 +653,14 @@ mod tests {
         rt.mark_in_flight(true); // 선행 Stage 가 미완 drain 중인 상태 모사.
         // 같은 runtime 을 공유하는 새 Stage. ratio=0.5/Q4_0 라 validate §1 통과해도 §2 에서 reject.
         // 단 secondary=None 이라 실제로는 §1(no_secondary) 가 먼저 막지만, 어느 경로든 Consumed.
-        let s =
-            WeightSwapStage::one_shot(make_model(&be, 2), rt.clone(), None, 0.5, DtypeTag::Q4_0);
+        let s = WeightSwapStage::one_shot(
+            make_model(&be, 2),
+            rt.clone(),
+            None,
+            0.5,
+            DtypeTag::Q4_0,
+            empty_hook_cell(),
+        );
         let mut profiler = OpProfiler::new();
         let mut ctx = make_ctx(&mut profiler);
         let outcome = s.on_phase(&LifecyclePhase::WeightMutate, &mut ctx).unwrap();
@@ -643,9 +681,50 @@ mod tests {
         assert!(rt.is_idle(), "drain 완료");
     }
 
-    // NOTE: Incremental multi-tick drain (Continue×N→Consumed) / IntraForward·PhaseAware hook
-    // 설치 / decider-success / 등가 anchor(Stage commit == handle_swap_weights 직접 호출) 는
-    // secondary_mmap mock(mmap 파일) 을 요구하므로 **host 검증 불가** — device 게이트(S25/Jetson,
-    // §5.6.7)에서 legacy frozen baseline 대조로 검증한다. commit 본문은 swap_runtime.rs 의
-    // handle_swap_weights §1~7 을 byte-identical 이전한 것이라 코드 동일성으로 등가가 보장된다.
+    // NOTE: Incremental multi-tick drain (Continue×N→Consumed) / IntraForward·PhaseAware 의 *실
+    // commit 경로* 를 통한 hook 설치 / decider-success / 등가 anchor(Stage commit ==
+    // handle_swap_weights 직접 호출) 는 secondary_mmap mock(mmap 파일) 을 요구하므로 **host 검증
+    // 불가** — device 게이트(S25/Jetson, §5.6.7)에서 legacy frozen baseline 대조로 검증한다.
+    // commit 본문은 swap_runtime.rs 의 handle_swap_weights §1~7 을 byte-identical 이전한 것이라
+    // 코드 동일성으로 등가가 보장된다.
+
+    /// §5.9.2 Track B: hook cell 설치 토글 계약. commit 의 IntraForward/LayerImmediate arm 이
+    /// 쓰는 `*hook_cell.lock() = Some(hook as Arc<dyn LayerBoundaryHook>)` 와 **동일 coercion** 으로
+    /// 설치했을 때 cell 이 `Some` 으로 토글됨을 검증한다(실 commit 경로는 secondary mmap 요구라
+    /// device-gated — 본 테스트는 설치 *메커니즘*(cell 타입·coercion·toggle)만 host 에서 격리 검증).
+    #[test]
+    fn hook_cell_install_toggles_to_some() {
+        use crate::weight::IntraForwardSwapHook;
+
+        let be = cpu_backend();
+        let cell = empty_hook_cell();
+        // 초기값 None (설치 전).
+        assert!(
+            cell.lock().unwrap().is_none(),
+            "hook cell 초기값 None (설치 전)"
+        );
+
+        // commit 의 IntraForward arm 이 생성하는 hook 과 동형(secondary=None 인 test 변형).
+        let dispatcher = Arc::new(AsyncSwapDispatcher::new(be.clone()));
+        let slots = vec![ffn_slot(&be, 0), ffn_slot(&be, 1)];
+        let config = Arc::new(make_model(&be, 2).config.clone());
+        let hook = IntraForwardSwapHook::new_for_test(
+            vec![0],
+            0,
+            dispatcher,
+            slots,
+            be,
+            DType::Q4_0,
+            config,
+        );
+
+        // commit arm 과 동일한 설치 문장 (§5.9.2).
+        *cell.lock().unwrap() =
+            Some(hook as Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>);
+
+        assert!(
+            cell.lock().unwrap().is_some(),
+            "설치 후 cell 은 Some (forward slot 주입 대상)"
+        );
+    }
 }

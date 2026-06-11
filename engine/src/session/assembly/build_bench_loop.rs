@@ -228,6 +228,10 @@ pub fn build_bench_loop(
     );
     // AB-6: swap_backend resolve 용 — mf 가 `backend` 를 move 하므로 그 전에 Arc clone 보유.
     let backend_arc = Arc::clone(&backend);
+    // §5.9.2 Track B: ModelForward 와 WeightSwapStage(dispatcher 경유)가 공유할 hook cell 1개.
+    // 양측에 Arc clone 으로 넘긴다. 초기값 None — IntraForward/LayerImmediate commit 이 Some 설치.
+    let hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>> =
+        Arc::new(Mutex::new(None));
     let mf = ModelForward::new(
         backend,
         memory,
@@ -236,6 +240,7 @@ pub fn build_bench_loop(
         kv_caches,
         max_seq_len,
         plan_enabled,
+        Arc::clone(&hook_cell),
     )?;
 
     // β-3: pos-환류용 layer-0 fmt handle (§5.2.1 (가)). coercion: Arc<StandardFormat> →
@@ -331,6 +336,8 @@ pub fn build_bench_loop(
             Vec::new(),
             // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
             report_tx_for_dispatcher,
+            // §5.9.2 Track B: ModelForward 와 공유하는 hook cell (위에서 생성).
+            Arc::clone(&hook_cell),
         ))
     } else {
         None

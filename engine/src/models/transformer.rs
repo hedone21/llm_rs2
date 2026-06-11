@@ -319,6 +319,13 @@ pub struct TransformerModelForwardArgs<'a> {
     /// (§4.1 R4 ③) caller 가 `caches[0].needs_attn_scores()` 를 산출해 주입한다 — `need_scores` 의 OR
     /// 항(`forward_gen.rs:409` 미러). production 은 `false`.
     pub cache_self_need_scores: bool,
+    /// IntraForward/LayerImmediate weight swap 의 layer-boundary hook (§5.9.2 Track B).
+    /// `Some` 이면 forward_into 의 layer loop 가 layer `i` 진입 전 wait-gate
+    /// (`pending_event_for_dyn(i)`) + layer `i` compute 직후 `on_layer_boundary(i, seq_len)` 를
+    /// 호출한다. `None`(production 기본/모든 eval·ppl·warmup 경로)이면 layer 당 `Option::is_some`
+    /// branch 1회만 추가 — INV-147 zero-overhead. `OffloadForwardArgs` 의 동명 슬롯(offload 전용)과
+    /// 별개로 production decode 경로(`forward_into`)에 신설된 슬롯이다.
+    pub layer_boundary_hook: Option<&'a dyn crate::layer_boundary_hook::LayerBoundaryHook>,
 }
 
 impl TransformerModel {
@@ -1401,6 +1408,9 @@ impl TransformerModel {
         let skip_config = args.skip_config;
         let mut importance_collector = args.importance_collector;
         let cache_self_need_scores = args.cache_self_need_scores;
+        // §5.9.2 Track B: IntraForward/LayerImmediate swap 의 layer-boundary hook.
+        // production/eval 경로는 None → 아래 분기들이 layer 당 `is_some` branch 1회만(INV-147).
+        let layer_boundary_hook = args.layer_boundary_hook;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -1470,6 +1480,16 @@ impl TransformerModel {
             self.layers.iter().map(|s| s.load_weights()).collect();
         for (i, layer_arc) in layer_snapshots.iter().enumerate() {
             let layer = &**layer_arc;
+
+            // §5.9.2 Track B wait-gate (ENG-ALG-238 / INV-149): IntraForward swap 이 layer `i` 의
+            // weight 를 in-flight 로 commit 중이면, 그 새 weight 가 완전히 쓰인 뒤 forward 가 읽도록
+            // (commit-before-read) blocking wait. 위에서 캡처한 layer_snapshots Arc 는 영향 없음 —
+            // 다음 forward 의 ordering 만 강제. hook=None 이면 `is_some` branch 1회(INV-147).
+            if let Some(hook) = layer_boundary_hook
+                && let Some(evt) = hook.pending_event_for_dyn(i)
+            {
+                backend.wait_event_blocking(&evt)?;
+            }
 
             // SWIFT layer-skip (forward_into:1715 미러). skip_config None 이면 (false, false).
             let (s_attn, s_mlp) =
@@ -1591,6 +1611,14 @@ impl TransformerModel {
                         local_attn_window: self.config.sliding_window,
                     },
                 )?;
+            }
+
+            // §5.9.2 Track B (ENG-ALG-235): layer `i` compute 직후 hook 발화 — IntraForward swap 이
+            // 다음 토큰부터 dispatch_at 에 도달한 layer 의 secondary→GPU async swap 을 enqueue 한다.
+            // decode(seq_len=1)에서만 동작(hook 내부 seq_len>1 가드, intra_forward_swap.rs:383).
+            // hook=None 이면 `is_some` branch 1회(INV-147).
+            if let Some(hook) = layer_boundary_hook {
+                hook.on_layer_boundary(i, seq_len);
             }
 
             // importance record after layer (forward_into:1882-1891 미러) — prefill 2-pass 전용.
@@ -3015,6 +3043,15 @@ mod tests {
             assert_eq!(*v, 5.0, "row 5 mismatch");
         }
     }
+
+    // §5.9.2 Track B: `forward_into` layer loop 의 hook 호출 횟수 == num_layers 검증은 **host 단위
+    // 테스트 생략** — 본 모듈의 CPU 모델 fixture 는 전부 `layers: vec![]`(0 layers)이고, 0-layer
+    // forward_into 는 lm_head 의 degenerate slicing 에서 subtract-overflow(x86.rs:387) 로 패닉한다
+    // (fixture 가 forward 비대응). ≥1-layer 의 attention/RoPE/FFN 을 살리는 CPU forward fixture 는
+    // 부재하며 신설은 본 작업 범위 밖(과복잡). hook 호출 *지점*(layer compute 직후 `on_layer_boundary`
+    // + 진입 전 wait-gate)은 본 배선이 도입한 `if let Some(hook)` 분기 2개라 코드 리뷰 + 컴파일로
+    // 보장하고, 실 count==L·정확성은 S25 device 게이트(IntraForward swap = secondary + GPU async)에서
+    // 검증한다. (model_forward 의 cell-read 슬롯 구성 + weight_swap 의 cell 설치 토글은 host 검증됨.)
 
     #[test]
     fn test_gather_embed_cpu_backend_none_means_direct() {

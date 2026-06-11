@@ -4,14 +4,19 @@
 //! Owns the backend handle, model `Arc`, KV caches, decode workspace, lazy
 //! prefill workspace, and two reusable logits tensors.
 //!
-//! Out of scope for 4-3 (all kept as `None` in the forward args):
+//! Out of scope for 4-3 (kept as `None` in the forward args):
 //! `score_accumulator`, `skip_config`, `profiler`, `importance_collector`,
-//! `variance_collector`, `layer_boundary_hook`. These are absorbed by the
-//! `PipelineStage` registry (eviction/swap/observe stages) — Phase β decode-loop
-//! rewrite (the v1 `EvictionStage`/`SwapStage`/`DecodeObserver` traits were
-//! deleted in β-7).
+//! `variance_collector`. These are absorbed by the `PipelineStage` registry
+//! (eviction/observe stages) — Phase β decode-loop rewrite (the v1
+//! `EvictionStage`/`SwapStage`/`DecodeObserver` traits were deleted in β-7).
+//!
+//! `layer_boundary_hook` is wired (§5.9.2 Track B): `step` reads the shared
+//! `hook_cell` (installed by `WeightSwapStage::commit` in IntraForward/
+//! LayerImmediate mode) and injects it into the decode forward args. When the
+//! cell is `None` (production default / prefill), the slot stays `None`
+//! (INV-147 zero-overhead).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -24,6 +29,7 @@ use crate::inference::sampling::StepCtx;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
 use crate::kv_cache_ops::KVLayout;
+use crate::layer_boundary_hook::LayerBoundaryHook;
 use crate::layers::workspace::{LayerWorkspace, PrefillWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
@@ -49,6 +55,11 @@ pub struct ModelForward {
     cpu_backend: Arc<dyn Backend>,
     model: Arc<TransformerModel>,
     kv_caches: Vec<KVCache>,
+
+    // §5.9.2 Track B: assembly 가 생성해 WeightSwapStage 와 공유하는 hook cell. Stage 가 commit
+    // tick 에 `Some(hook)` 설치 → `step` 이 매 decode step lock-read 후 forward args 슬롯 주입.
+    // swap 미구성 조립처(chat/standard happy path)는 `Arc::new(Mutex::new(None))` 더미 — 항상 None.
+    hook_cell: Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>>,
 
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
@@ -107,6 +118,9 @@ impl ModelForward {
         kv_caches: Vec<KVCache>,
         max_seq_len: usize,
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))] plan_enabled: bool,
+        // §5.9.2 Track B: WeightSwapStage 와 공유하는 layer-boundary hook cell. swap 미구성
+        // 조립처는 `Arc::new(Mutex::new(None))` 더미를 넘긴다(항상 None — INV-147 거동-0).
+        hook_cell: Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>>,
     ) -> Result<Self> {
         let hidden_size = model.config.hidden_size;
         let vocab_size = model.config.vocab_size;
@@ -136,6 +150,7 @@ impl ModelForward {
             cpu_backend,
             model,
             kv_caches,
+            hook_cell,
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -223,6 +238,15 @@ impl ModelForward {
             eprintln!("[fwd-trace] build_plan SUCCESS");
         }
         plan
+    }
+
+    /// §5.9.2 Track B: hook cell 1회 lock-read → 설치돼 있으면 `Arc` clone 반환.
+    /// 단일 스레드(INV-018)라 lock contention 0. clone 한 `Arc` 가 forward_into 동안 hook 을
+    /// 살아 있게 유지하므로 guard 를 forward 호출 동안 붙들 필요가 없다(lock 즉시 해제).
+    /// cell `None`(production happy/chat 더미)이면 `None` — 거동-0. 슬롯 구성 로직은
+    /// `read_hook_cell` 자유 함수로 추출(ModelForward fixture 없이 host 단위테스트 가능).
+    fn current_hook(&self) -> Option<Arc<dyn LayerBoundaryHook>> {
+        read_hook_cell(&self.hook_cell)
     }
 
     pub fn model(&self) -> &Arc<TransformerModel> {
@@ -385,6 +409,9 @@ impl Forward for ModelForward {
                 skip_config: None,
                 importance_collector: None,
                 cache_self_need_scores: false,
+                // §5.9.2 Track B: prefill 은 swap 금지(intra_forward_swap.rs:383 seq_len>1 가드)라
+                // hook 주입 안 함 — 항상 None.
+                layer_boundary_hook: None,
             })?;
 
             chunk_start = chunk_end;
@@ -405,9 +432,16 @@ impl Forward for ModelForward {
         // 5-F: fmt 가 유일 경로. plan path(execute_plan) 우선 시도 → build/invalidation 시
         // forward_into(trait object) 폴백. ensure_fmt_wrapped 가 prefill 시작에 wrap 완료.
         self.ensure_fmt_wrapped();
-        // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan.
+
+        // §5.9.2 Track B: hook 설치 여부 1회 read. 설치돼 있으면(IntraForward/LayerImmediate swap
+        // 진행 중) plan path 를 우회한다 — plan path 는 layer loop 를 bypass 하므로 hook 의
+        // wait-gate/on_layer_boundary 가 발화하지 못하고 swap 중 stale weight 를 읽을 위험이 있다.
+        // forward_into(layer loop) 폴백만이 hook 을 정확히 호출한다.
+        let hook = self.current_hook();
+
+        // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan. (hook 설치 중엔 우회.)
         #[cfg(feature = "opencl")]
-        {
+        if hook.is_none() {
             if self.gpu_plan.is_none() && !self.sticky_disabled {
                 self.gpu_plan = self.try_build_plan();
             }
@@ -469,6 +503,9 @@ impl Forward for ModelForward {
             skip_config: None,
             importance_collector: None,
             cache_self_need_scores: false,
+            // §5.9.2 Track B: hook 설치 시 layer loop 에 주입(wait-gate + on_layer_boundary).
+            // `hook` Arc clone 이 본 forward_into 호출 동안 hook 을 살아 있게 유지한다.
+            layer_boundary_hook: hook.as_deref(),
         })?;
         self.read_logits(&self.logits_decode)
     }
@@ -616,6 +653,17 @@ impl Forward for ModelForward {
         let new_pos = self.kv_caches.first().map(|c| c.current_pos).unwrap_or(0);
         Ok((n, new_pos))
     }
+}
+
+/// §5.9.2 Track B: hook cell → forward args 슬롯값(Arc clone). 설치돼 있으면 `Some(Arc)`,
+/// 미설치(`None`)면 `None`. `current_hook` 의 슬롯 구성 로직 — ModelForward fixture 없이 host
+/// 단위테스트가 가능하도록 자유 함수로 추출(단일 스레드 INV-018 → lock contention 0).
+fn read_hook_cell(
+    cell: &Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>>,
+) -> Option<Arc<dyn LayerBoundaryHook>> {
+    cell.lock()
+        .expect("model_forward hook_cell mutex poisoned")
+        .clone()
 }
 
 /// `Vec<KVCache>` → `Vec<Arc<StandardFormat>>` wrap (by-value move, 단일 물리 캐시).
@@ -776,5 +824,28 @@ mod tests {
         handles[0].with_cache_mut(|c| c.current_pos = 0);
         let pos = handles[0].with_cache_mut(|c| c.current_pos);
         assert_eq!(pos, 0);
+    }
+
+    /// §5.9.2 Track B: cell `None`(미설치/더미)이면 슬롯값 `None` (production happy/chat 거동-0).
+    #[test]
+    fn read_hook_cell_none_yields_none() {
+        let cell: Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>> = Arc::new(Mutex::new(None));
+        let slot = read_hook_cell(&cell);
+        assert!(slot.is_none(), "미설치 cell → 슬롯 None");
+        // `.as_deref()` 도 None (forward args 주입값).
+        assert!(slot.as_deref().is_none());
+    }
+
+    /// §5.9.2 Track B: cell `Some(hook)` 이면 슬롯값 `Some` → forward args 슬롯 주입 대상.
+    #[test]
+    fn read_hook_cell_some_yields_some() {
+        use crate::layer_boundary_hook::NoOpHook;
+        let cell: Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>> = Arc::new(Mutex::new(Some(
+            Arc::new(NoOpHook) as Arc<dyn LayerBoundaryHook>,
+        )));
+        let slot = read_hook_cell(&cell);
+        assert!(slot.is_some(), "설치 cell → 슬롯 Some");
+        // `.as_deref()` 가 forward args 의 `layer_boundary_hook: Some(&dyn ...)` 를 만든다.
+        assert!(slot.as_deref().is_some());
     }
 }

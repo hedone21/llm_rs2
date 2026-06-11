@@ -85,6 +85,7 @@ pub fn run_warmup(
             skip_config: None,
             importance_collector: None,
             cache_self_need_scores: false,
+            layer_boundary_hook: None,
         })
     })?;
     backend.synchronize()?;

@@ -142,6 +142,10 @@ pub struct CommandDispatcher {
     swap_runtime: Option<Arc<EngineSwapRuntime>>,
     /// ① WeightSwapStage 의 decider importance 입력(AB-6 §5.6.1). `None` 이면 uniform fallback.
     importance: Option<Arc<dyn ImportanceLookup>>,
+    /// §5.9.2 Track B: WeightSwapStage(IntraForward/LayerImmediate)가 hook 을 설치할 공유 cell.
+    /// ModelForward 와 동일 cell 을 assembly 가 만들어 양측에 `Arc` clone 으로 넘긴다. swap
+    /// 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미 — submit 자체가 안 일어나 무영향.
+    hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
     /// ① KiviQuantStage 가 transition 할 KIVI handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
     /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-KIVI: Standard/Offload).
     kivi_handles: Vec<Arc<KIVIFormat>>,
@@ -188,6 +192,8 @@ impl CommandDispatcher {
         kivi_handles: Vec<Arc<KIVIFormat>>,
         // AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 송출할 채널. None → inert.
         report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
+        // §5.9.2 Track B: WeightSwapStage 에 넘길 layer-boundary hook cell (ModelForward 공유).
+        hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
     ) -> Self {
         Self {
             registry,
@@ -200,6 +206,7 @@ impl CommandDispatcher {
             importance,
             kivi_handles,
             report_tx,
+            hook_cell,
             control: LoopControl::default(),
             evict_armed: false,
             last_partition_ratio: None,
@@ -485,6 +492,7 @@ impl CommandDispatcher {
             self.importance.clone(),
             ratio,
             target_dtype,
+            Arc::clone(&self.hook_cell),
         );
         self.registry.submit(Arc::new(stage));
     }
@@ -552,7 +560,8 @@ mod tests {
             None,
             None,
             Vec::new(),
-            None, // report_tx: AB-5
+            None,                       // report_tx: AB-5
+            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
         );
         (d, registry, handle)
     }
@@ -608,7 +617,8 @@ mod tests {
             None,
             None,
             Vec::new(),
-            None, // report_tx: AB-5
+            None,                       // report_tx: AB-5
+            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
         );
         (d, registry)
     }
@@ -720,7 +730,8 @@ mod tests {
             Some(make_swap_runtime(&be)),
             None,
             Vec::new(),
-            None, // report_tx: AB-5
+            None,                       // report_tx: AB-5
+            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
         );
         (d, registry)
     }
@@ -750,7 +761,8 @@ mod tests {
             None,
             None,
             kivi_handles,
-            None, // report_tx: AB-5
+            None,                       // report_tx: AB-5
+            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
         );
         (d, registry)
     }
@@ -959,7 +971,8 @@ mod tests {
             None,
             None,
             Vec::new(),
-            None, // report_tx: AB-5
+            None,                       // report_tx: AB-5
+            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
         );
         d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
         assert_eq!(registry.len(), 0, "CM 미구성 → evict directive 무시");
