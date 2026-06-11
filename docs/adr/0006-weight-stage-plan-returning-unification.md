@@ -130,6 +130,7 @@ Seam B (엔진 PipelineStage executor, plan 소비+증분+변형) — design-onl
 ## 6. Deferred / 안 가본 길
 
 - **Seam B 실배선**(`PipelineRegistry`/`PipelineDispatcher` 구현 + decode loop 재작성) — Phase β. AB-6(weight-swap SwapStage glue) + AB-4(tensor partition 동적 enable).
+  - **AB-4 결정 (2026-06-11, 사용자 확정 b-1)**: tensor partition 의 동적 enable 은 **`"partition"` `WeightStage` 빌트인(D1 plan-returning 결정층)을 거치지 않는다** — 엔진 직결 OneShot `PartitionStage`(PipelineStage, `arch/pipeline_stage_design_v2.md §5.5`). 근거: SetPartitionRatio 의 결정이 *항등*(directive ratio → 그대로 slot fan-out, method-drop 같은 정책 변환 없음)이라 plan() 결정층이 vacuous + persistent 공유 이득 없음(setup-1회). EvictionStage 의 method-drop OneShot 선례 동형. Seam C 정규화표(§4 line 94)의 `SetPartitionRatio`→`"partition"` 매핑은 **미사용 잔존**(WeightStage 경로 미진입). **재검토 trigger = per-layer 알고리즘**(layer 별 다른 ratio / importance-driven split)이 등장하면 그때 `"partition"` WeightStage 결정층을 도입한다(KV evict 가 plan-returning 인 것과 대칭 회복).
 - **weight 순수 plugin 실증** — `WeightStageCtx` 만 읽는 외부 weight technique crate(caote-equivalent).
 - **`WeightStageParams` 필드 확정** — `StageParams`(KV 5필드, lib.rs:230) 의 weight 거울(ratio/target_dtype/skip_ratio/algorithm/allow_boundary). per-technique opaque params vs 공용 struct 비대화(KV d2o 와 동일 미결, lib.rs:225) 동반 결정.
 - **swap reversal**(F16 recall) + **RestoreDefaults 합성 역전**(partition + precision 동시) 메커니즘.

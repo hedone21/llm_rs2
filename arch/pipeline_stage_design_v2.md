@@ -183,6 +183,7 @@ flowchart TB
 | `format.rs` + `format/` | L2 | (루트 `format.rs` = 모듈 선언·re-export) / `format/kv_cache_format.rs` = `trait KVCacheFormat` + `Merge`(compact arg) / `format/weight_format.rs` = `trait WeightFormat` + `LayerDispatch` + `SliceSpec`(apply_dispatch arg) | **C2 해소** — format 축의 L2 추상화 모듈(`capability/` 동급 응집 모듈, G3-reconcile "format=축, 추상화=L2 trait" 실현). 현 `kv_cache_ops.rs`(`KVCacheOps`) → `format/kv_cache_format.rs` 이동+rename(α-K trait rename 동행). `WeightFormat` 은 신설(현 코드 trait 부재). `Merge` 입주로 v2:455 미정의 해소. 공유 precision `DType` 는 기존 위치 참조(재정의 0). **guard rail: impl 은 여기 금지** — Standard/KIVIFormat→`kv/`, weight dispatch impl→`models/weights/`(L3) |
 | `stages/kv/{eviction,d2o,kivi_quantize,swap_dispatch,tier_move}.rs` | L3 | 각 KV-mutate Stage (**얇은 trigger 만**) | 현 `*_handler.rs` 4종의 `handle()` trigger 부분 + `tier_move`(신규). 알고리즘(d2o merge·`offload_one`/`recall_one`)은 `kv/` 로 추출(**함수 단위 cut**, G3-reconcile Q3). `kv/` 정책·포맷에 수평 의존(L3→L3) |
 | `stages/weight/weight_swap.rs` | L3 | `WeightSwapStage` (얇은 trigger) | concrete-handle `Arc<LayerSlot>`(§4.2). 현 `kv/weight_swap_handler.rs` 의 trigger 부분. swap 오케스트레이션은 `weight/`(아래 행) |
+| `stages/weight/partition.rs` | L3 | `PartitionStage` (얇은 trigger, AB-4) | concrete-handle `Vec<Arc<LayerSlot>>` + `Arc<Hardware>`(§5.5). register 시점 `model.layers.clone()` 보유. `PreForward` 에서 sticky-gated `apply_partition_dispatch` fan-out (slot RCU + INV-120). WeightSwapStage 와 형제(둘 다 `stages/weight/`) — 파일 분리(swap 과 join 표면 0). **`weight.rs` 골격 'α-K 예정 입주자' 표기는 stale**(실 owner=WeightSwapStage(AB-6)이고 PartitionStage 는 별도 파일) |
 | `stages/system/switch.rs` | L3 | `SwitchStage` | `Arc<Hardware>` resolve(§5.1). **system/ 확정 거주자 1개** |
 | `stages/system/` (미정) | L3 | resilience-제어 Stage, observe/보고 Stage | §0.4 가 system/ 거주만 약속. 분해·명명은 downstream (resilience→stage 매핑은 별도 설계) |
 | `kv/` (구 `pressure/` 에서 rename, γ-1 완료 2026-06-10) | L3 | `crate::format::KVCacheFormat` **impl**(`kv_cache.rs`=StandardFormat / `kivi_cache.rs`=KIVIFormat), `eviction/`(EvictionPolicy sliding/h2o/streaming), `offload/`(tier + `offload_one`/`recall_one`), `d2o/`(merge 알고리즘 + `d2o_layer_alloc`), `kv_migrate.rs`(🟡 §4.1 storage-slot 트랙) | KV-cache 도메인 = format-impl+policy+tier+algo. **trait 정의는 `format/`(C2)**, 여기엔 impl 만 flat(`kv/format/` subdir 아님). 트리거(Stage)만 `stages/` 로 분리(G3-reconcile Q1/Q3/Q4) |
@@ -699,6 +700,133 @@ flowchart TB
 > - **β 1급** — `LocalPressureSource`(memory graded, `/proc/meminfo` → `Pressure(0–100)`). happy-path 무주입(per-token syscall 차단), build_bench_loop 만 주입(§β-5).
 > - **β defer (seam 만)** — `ManagerPressureSource`(엔진측 융합)·`LocalPolicy`(manager-less 이산 정책 switch/suspend)·로컬 센서 인프라(thermal/battery/usage 자율 수집)는 trait seam 만 두고 구현은 β 밖 후속. **`ManagerPressureSource` 의 엔진측 융합은 wire 무확장으로 가능**함이 확인됐다(`SystemSignal` 이 이미 graded magnitude 운반 — §9.1 정오표 참조 — 편차는 manager 측 융합 부재뿐이라 엔진 추가 wire 0). 따라서 manager 융합은 *가능*하나 β 범위 밖 defer.
 > - **§5.4/v2:651 "manager-less 이산 정책 1급" 문언과의 긴장**: 그 문언은 *목표* 1급 요구(사용자 확정)이고, β 가 그것을 *전부 충족*하지는 않는다 — β 는 graded(memory) 1급까지, 이산(switch/suspend) manager-less 정책은 defer. 이 범위 한정을 SSOT 에 명시(roadmap §β-5 + 본 연혁). 코드 적용 = Phase β-5(LocalPressureSource) / β 밖(ManagerPressureSource·LocalPolicy).
+
+### 5.5 AB-4 — `PartitionStage` (SetPartitionRatio runtime directive → OneShot PipelineStage)
+
+**역할.** `SetPartitionRatio{ratio}` directive 를 받아 모든 layer 의 weight slot 을 런타임 re-slice 하는 OneShot Stage. CommandDispatcher 의 deprecated `LoopControl.partition_ratio` 필드(write-only dead-end, 소비자 0)를 제거하고, evict-family 4종(`submit_evict` → `EvictionStage::one_shot`)과 동형의 `submit_partition` → `PartitionStage::one_shot` 경로로 대체한다. AB-4 는 G1 동결 5종(offload/quant/partition/swap/layer-skip) 중 partition 분의 Stage 이전이다.
+
+**§5.4 R-5 점 (5) "setup-1회 명령의 friction-triggered 잔여" 의 partition 판정 = 엔진 직결 OneShot (plugin 결정층 없음).** SetPartitionRatio 는 persistent 공유 이득이 없고(setup-1회 적용), 결정이 *항등*이다(directive ratio → 그대로 slot 에 fan-out, method-drop 같은 정책 변환 없음). 따라서 `"partition"` technique-api `WeightStage`(plan-returning plugin) 빌트인은 만들지 않고, dispatcher 가 직접 `PartitionStage::one_shot` 을 submit 한다 — `EvictionStage` 의 method-drop 선례와 동형(directive → OneShot Stage 직결). plugin 결정층은 **per-layer 알고리즘**(layer 별 다른 ratio, importance-driven split)이 등장할 때 재검토한다(ADR-0006 에 1줄 기록).
+
+#### 5.5.1 PartitionStage 정의
+
+| 항목 | 결정 | 근거 |
+|---|---|---|
+| **거주지** | `engine/src/stages/weight/partition.rs` (신규 파일, no-`mod.rs` 규칙 C) | `weight.rs` 골격의 'α-K 예정 입주자' 표기는 stale — 실 owner 는 WeightSwapStage(AB-6). PartitionStage 는 swap 과 join 표면이 0(weight slot dispatch mode 변경 vs precision swap)이라 별도 파일. 둘 다 `stages/weight/`(규칙 B — 주 mutate 도메인 = weight) |
+| **lifecycle** | `OneShot` | directive 1회 = re-slice 1회 = GC 1회. EvictionStage::one_shot 동형. sticky 재적용 방지는 dispatcher 의 last-applied 게이트(§5.5.2)가 담당 — Stage 자체는 발화 후 무조건 `Consumed` |
+| **보유 handle** | `Vec<Arc<LayerSlot>>` (concrete-handle, §3.4) + `Arc<Hardware>` + `gpu_ratio: f32` | register 시점 `model.layers.clone()` + `hardware.clone()`. EvictionStage 의 `Vec<Arc<StandardFormat>>` + `Arc<Mutex<CacheManager>>` 와 동형(INV-STAGE-LAYER-HANDLE). `LayerSlot::apply_dispatch(&self)` 가 ArcSwap RCU 라 `&self` Stage 가 mutate 가능 (Mutex 불요 — slot 자체가 Sync interior-mutable) |
+| **구독 phase** | `PreForward` | v1 등가 census(§5.5.4): v1 `partition_ratio_sticky` → 매 step `plan.partition_ratio` carry → forward 직전 re-slice. v2 등가 = command-poll/dispatch 직후·forward 직전 = `PreForward`. eviction(PreEviction/PostEviction)보다 뒤, `forward.step` 직전이라 forward 가 re-sliced weight 를 읽기 전 완료 보장 |
+| **self-filter** | `if *phase != PreForward { return Continue }` | EvictionStage 의 PreEviction self-filter(§5.3) 동형 |
+| **반환** | `Consumed` (발화 후) | OneShot GC. pos-환류 없음(eviction 과 달리 partition 은 weight 만 바꾸고 KV/pos 불변) → `StageOutcome` 무변경(§5.2.1 (가) 단순화 — driver 후처리 0) |
+| **fan-out 본문** | `apply_partition_dispatch(&self.slots, self.gpu_ratio, &self.hw)?` (자유 함수, §5.5.3) | `prepare_tensor_partition` 의 slot 순회를 추출한 `layers/tensor_partition.rs` 자유 함수. GPU-only fast path(`is_gpu_only_ratio`)·INV-120 gen-counter 자동 무효화는 함수 내부 + `apply_dispatch` 가 보존 |
+
+**dispatch tier.** PartitionStage 는 step-tier(1×/token, 단 OneShot 이라 실 발화 1회)라 `Box<dyn>`/`Arc<dyn>` 자유(`INV-HOTPATH-DISPATCH`). re-slice 자체는 boundary tier(`apply_dispatch` = construction tier, §4.2)라 Hardware·dyn 자유. **forward hot path 에는 dyn 추가 0** — re-slice 후 `Option<PartitionContext>` 정적 분기는 불변(§4.2 점 (5)). plan path 의 stale `cl_mem` 차단은 INV-120 gen-counter(`PlanInvalidated`)가 런타임 자동 처리 — PartitionStage 가 plan 을 직접 만지지 않는다(slot 만 mutate, ModelForward 의 `gpu_plan` 은 다음 `step` 진입 시 `PlanInvalidated` 로 self-rebuild).
+
+#### 5.5.2 dispatcher 변경 — `submit_partition` + sticky last-applied 게이트
+
+`SetPartitionRatio` arm 을 **② LoopControl deprecated 필드**에서 **① submit 분류**로 이동한다. `LoopControl.partition_ratio: Option<f32>` 필드를 삭제한다(write-only dead-end 소멸).
+
+```text
+EngineCommand::SetPartitionRatio { ratio } => self.submit_partition(*ratio),
+```
+
+```text
+fn submit_partition(&mut self, ratio: f32):
+    if self.last_partition_ratio == Some(ratio) { return }   // 값 무변경 → 재submit 0 (sticky 핵심)
+    if self.layer_slots.is_empty() { return }                 // 미구성(happy/chat) — directive 무시
+    self.last_partition_ratio = Some(ratio)
+    let stage = PartitionStage::one_shot(self.layer_slots.clone(), self.hardware.clone(), ratio)
+    self.registry.submit(Arc::new(stage))
+```
+
+**sticky 시맨틱 = last-applied 비교 게이트** (evict 의 `evict_armed` edge-trigger 복사 **금지**, handoff landmine 5/§검증게이트). v1 census(`executor.rs:572-574` ISSUE-5 + `:538` RestoreDefaults reset):
+- v1 sticky = `partition_ratio_sticky: Option<f32>` 가 매 poll `plan.partition_ratio = sticky` carry. 같은 값 반복 directive 는 같은 ratio 를 carry 하므로 **재적용해도 산출 동일(idempotent)이나 re-slice 비용(split_weight × 3 × N-layer)을 매번 지불**. v2 는 `last_partition_ratio` 비교로 **값 변경 시에만 submit** — 비용 절감 + 산출 등가.
+- **값 변경 시 재적용**: `last_partition_ratio != Some(ratio)` → 새 OneShot submit → re-slice(INV-120 bump → 기존 plan invalidate). evict 의 "RestoreDefaults 까지 1회" 와 다름 — partition 은 ratio 가 바뀌면 매번 재적용.
+- **RestoreDefaults reset**: v1 `:538 partition_ratio_sticky = None`. v2 = RestoreDefaults arm 에서 `self.last_partition_ratio = None` + **Full 복원 OneShot submit**. v1 census(`generate.rs:3132 "[Partition] RestoreDefaults: re-split..."`) = RestoreDefaults 가 partition 을 GPU-only(Full)로 되돌렸다 → v2 등가 = `submit_partition_full()`(ratio 를 `1.0`/GPU-only 로 fan-out, `apply_dispatch(LayerDispatch::Full)`). `last_partition_ratio=None` 으로 두면 다음 SetPartitionRatio 가 어떤 ratio 든 재적용된다(재무장 등가).
+
+> **last-applied vs armed 차이 (landmine)**: evict 는 *어떤 ratio 든 active 구간당 1회*(`evict_armed` bool, RestoreDefaults 까지 1회) — directive 가 *액션 트리거*(언제 evict 할지)라 값 무관. partition 은 *값이 곧 상태*(어떤 split geometry 인지)라 **값 비교**가 정확한 게이트다. bool armed 를 복사하면 "0.3 → 0.5 변경" 이 무시되는 버그(상태 미반영).
+
+#### 5.5.3 fan-out 추출 — `apply_partition_dispatch` 자유 함수 (사용자 결정 a-2)
+
+`prepare_tensor_partition`(transformer.rs:990, `&mut self` 시그니처지만 본문은 `&self.layers` 순회 + `apply_dispatch(&self)` fan-out 만)의 본문을 `layers/tensor_partition.rs` 자유 함수로 추출한다:
+
+```rust
+// layers/tensor_partition.rs (신규 자유 함수)
+pub fn apply_partition_dispatch(
+    slots: &[Arc<LayerSlot>],
+    gpu_ratio: f32,
+    hw: &Hardware,
+) -> anyhow::Result<usize> {
+    // is_gpu_only_ratio fast path → LayerDispatch::Full fan-out, return 0
+    // else → LayerDispatch::Partition(specs) fan-out, return slots.len() * 3
+}
+```
+
+- `transformer.rs::prepare_tensor_partition` 는 **thin wrapper** 로 잔존(CLI 정적 경로 `session/init.rs:838-851` 무변경): `apply_partition_dispatch(&self.layers, gpu_ratio, hw)`.
+- PartitionStage 는 보유한 `Vec<Arc<LayerSlot>>` 로 같은 함수 직접 호출 — CLI 정적 경로와 런타임 directive 경로가 **단일 fan-out 함수 공유**(중복 0, INV-120 회계 단일 출처).
+- `LayerSlot::apply_dispatch(&self)`(slot.rs:193) RCU·gen-counter 는 무수정 재사용(α-W-5 완료). 함수는 fan-out + fast-path 분기만 담당.
+
+**disable 케이스 (`ratio <= 0.0`) 거처 = PartitionStage::run_partition (함수 아님).** 구현 census(2026-06-11, commits 359b9a29/6c0616cb/1ba1a6f7)에서 verify 시나리오 `direct_cmd_partition_ratio.yaml:27`(`SetPartitionRatio{ratio=0.0}` → `[Partition] Disabled (ratio=0)` marker)가 `apply_partition_dispatch` 의 2분기(GPU-only/Partition)에 미포함임이 드러났다. legacy(`generate.rs:2730-2745`)는 `ratio <= 0.0 || ratio >= 1.0` 을 disable(partition_ctx 클리어)로 처리. **거처 판정 = (i) Stage 책임**(`stages/weight/partition.rs::run_partition`, line 69-76):
+- **근거**: `apply_partition_dispatch` 는 *순수 fan-out 메커니즘*이고, disable 은 *로그 계약(`[Partition] Disabled`)과 결합*한 directive-경로 고유 거동이다. CLI 정적 경로는 init.rs:838 가드(`tensor_partition > 0.0 && < 1.0`)가 `0.0` 을 함수 진입 *전*에 걸러내므로 함수를 ratio=0.0 으로 호출하지 않는다 — disable 로그/거동은 **runtime directive 경로(Stage)만 도달**한다. disable 을 함수로 내리면 (a) 공유 함수에 로그 책임이 침투하거나 (b) CLI 가드와 중복 분기가 생겨 외과성·단일출처가 *오히려* 약화된다.
+- **단일출처 보존**: disable 분기도 종착점이 `LayerDispatch::Full` fan-out(slot.rs:199 verbatim)이라 `ratio >= 1.0`(GPU-only fast path, 함수 처리)과 동일 primitive 를 탄다 — fan-out/INV-120 회계 중복 0. Stage 는 `slot.apply_dispatch(LayerDispatch::Full, hw)` 를 직접 호출(host-map 생략 — CPU companion 미사용)하고 `[Partition] Disabled (ratio={})` 출력 후 `Consumed`.
+- **`ratio >= 1.0` 비대칭**: legacy 와 달리 Stage 는 `ratio <= 0.0` 만 별도 disable 분기로 잡는다 — `ratio >= 1.0` 은 `apply_partition_dispatch` 의 `is_gpu_only_ratio`(≥0.995) fast path 가 이미 `LayerDispatch::Full` 로 클리어하기 때문(중복 분기 회피). 검증: unit `ratio_zero_disables_partition`(partition.rs:301, partition_ctx 클리어 확인).
+
+#### 5.5.4 lazy mapping — slot-only `&self` 변형 (사용자 결정: slot-only 분리)
+
+partition 활성에는 weight 가 CPU-accessible 이어야 한다(CPU companion matmul 이 host pointer 요구). CLI 정적 경로는 `session/init.rs:838` 이전에 `map_weights_for_cpu(&mut self)` 가 처리하나, **런타임 directive 경로는 최초 partition 활성 시 Stage 가 lazy 호출**해야 한다.
+
+`map_weights_for_cpu(&mut self)`(transformer.rs:852)는 진짜 `&mut` 가 필요한 부분(top-level `self.norm`/`self.lm_head`/`self.gpu_embed_tokens` 직접 재할당, :963-972)을 포함한다. 그러나 **partition 에 필요한 것은 slot 내부 weight 만**(norm/lm_head/embed 는 SwitchHw 전용, partition 무관). 따라서 slot 순회 부분(:915-962)만 떼어 slot-only `&self` 변형을 신설한다:
+
+```rust
+// transformer.rs (신규 — map_weights_for_cpu 의 slot 루프만, &self)
+#[cfg(feature = "opencl")]
+pub fn map_layer_weights_for_host_access(&self, gpu_backend: &Arc<dyn Backend>) -> Result<usize>
+// 본문: :915-962 slot 순회 (load_weights → clone → map_one → store_weights_same_dtype, INV-123)
+// map_one 클로저 로직 재사용 (retag + map_for_cpu + read_buffer fallback)
+```
+
+- `&self` 가능 근거: slot 갱신은 `store_weights_same_dtype`(ArcSwap, `&self` 호환, INV-123 clone-then-install). top-level 재할당이 빠지면 순수 `&self`.
+- **PartitionStage 가 최초 발화 시 1회 호출**: Stage 가 `Arc<TransformerModel>`(또는 model 측 lazy-map 호출 seam)를 보유하거나, `apply_partition_dispatch` 진입부에서 "이미 host-mapped 인지" 체크 후 미매핑이면 호출. **CPU backend 핸들**은 `hw.resolve(Cpu)` 로 도달(apply_dispatch 가 이미 사용) — 별도 인자 불요. gpu_backend 는 `hw.resolve(Gpu)`.
+- non-OpenCL/CPU/CUDA-UMA backend 는 weight 가 이미 host-pointer-accessible → `map_weights_for_host_access` 가 `Ok(0)` (no-op wrapper, transformer.rs:836). slot-only 변형도 동일 cfg-gate-free wrapper 패턴 따름.
+
+> **lazy 호출 위치 (구현 결정 여지)**: (가) `apply_partition_dispatch` 가 model handle 을 받아 함수 내부에서 최초 1회 map → 단일 진입점. (나) PartitionStage 가 model handle 을 보유하고 fan-out 전 map → Stage 책임 명확. CLI 정적 경로는 이미 init.rs 에서 map 하므로 (가)/(나) 모두 directive 경로에서만 실호출. **Implementer 가 `Arc<TransformerModel>` 도달 가능성 보고 택1** (PartitionStage 가 `Vec<Arc<LayerSlot>>` 만 들면 model 의 map 메서드 미도달 → model handle 도 보유 필요).
+
+#### 5.5.5 v2 prefill 단일 호출 — 이번 범위 수용 (AB-5 defer)
+
+v2 prefill 은 단일 호출(command poll/chunk 경계 부재, decode_loop.rs:193-213, handoff landmine 4). prefill 중 도착한 SetPartitionRatio directive 는 prefill 내에서 발화하지 못하고 **decode step 0 의 PreForward 에서 적용**으로 늦춰진다. `prefill_midway_partition_enable.yaml` 의 mid-prefill 적용 의도는 v2 에선 decode step 0 적용으로 사상된다.
+
+**AB-4 범위에서는 이를 수용**한다(chunked prefill 신설은 AB-5 로 defer). 근거: (1) verify 시나리오의 marker(`[Partition] (Lazy-mapped|ratio=0\.3)`)는 prefill 중이든 decode step 0 이든 발화하면 통과 — 적용 시점이 step 0 으로 밀려도 marker 는 찍힘. (2) chunked prefill(`PrefillChunkBoundary` 발화)은 AB-5 의 별도 인프라(현재 driver 미발화 orphan, §5.2.1 (라)). AB-4 가 이를 끌어오면 범위 폭증(단순함 우선).
+
+#### 5.5.6 로그 계약 (verify YAML marker — 글자단위 재현)
+
+`prefill_midway_partition_enable.yaml:26` 이 `[Partition] (Lazy-mapped|ratio=0\.3)` regex 를 marker 로 검사한다. 신규 PartitionStage 발화 경로가 이 라인을 재현해야 한다. legacy 원문 4종(handoff_argus_bench_ab0_ab3:37):
+- `[Partition] Re-split {n} weights with ratio {:.2}`(구 generate.rs:2807) — directive 재적용
+- `[Partition] Lazy-mapped {n} weight tensors...`(구 :2789) — 최초 lazy map
+- `[Partition] Disabled (ratio=0)`(구 :2743, f32 0.0 Display=`0`)
+- `[Partition] RestoreDefaults: re-split...`(구 :3132) — RestoreDefaults Full 복원
+
+**신규 발화 라인 명세** (regex `(Lazy-mapped|ratio=0\.3)` 만족 필요충분):
+- 최초 lazy map 시: `eprintln!("[Partition] Lazy-mapped {} weight tensors for host access", n)` (slot-only 변형 반환값) — `Lazy-mapped` alt 매칭.
+- re-slice 발화 시: `eprintln!("[Partition] Re-split {} weights with ratio {:.2}", n, ratio)` — ratio=0.3 일 때 `ratio=0.30` 출력 → regex `ratio=0\.3` 은 `ratio=0.30` 의 prefix 매칭 성공(`\.3` 뒤 `0` 은 regex 가 anchor 없어 OK).
+- **disable 발화 시(`ratio <= 0.0`)**: `eprintln!("[Partition] Disabled (ratio={})", ratio)` — `direct_cmd_partition_ratio.yaml:27` 의 marker `[Partition] Disabled (ratio=0)` 매칭. `gpu_ratio: f32` 가 `0.0` 일 때 `{}`(Display) 출력은 `0`(소수점 없음) → `(ratio=0)` 글자단위 일치(§5.5.3 disable 거처). **`{:.2}` 아닌 `{}` 사용 필수** — `{:.2}` 면 `0.00` 출력으로 marker 불일치.
+
+> **글자단위 정합 확인 의무 (Implementer)**: regex `ratio=0\.3` 는 `{:.2}` → `0.30` 에 매칭한다(`ratio=0.3` 까지가 패턴, 뒤 `0` 무관). PartitionStage 발화 라인이 `ratio={:.2}` 포맷을 쓰면 통과. 단 verify YAML 이 글자단위 계약이므로 **AB-4 device 게이트 실행 전 로그 라인 실측 매칭 1회 검증** 필수.
+
+#### 5.5.7 argus_bench 가드 해제
+
+| 가드 | 현 차단 | AB-4 해제 |
+|---|---|---|
+| `argus_bench.rs:66` (`bench_supported`) | `args.tensor_partition == 0.0` 요구 | 조건 제거 (partition>0 도 bench loop 지원) |
+| `argus_bench.rs:118` (`reject_unsupported_modes_ab0`) | `tensor_partition > 0.0` → bail "lands in AB-4" | reject 제거 |
+
+해제 후 `build_bench_loop` 가 partition 활성 경로를 지원해야 한다 — model.layers handle + hardware 를 dispatcher 가 보유하도록 배선(§5.5.8). **host smoke 불가**(GPU 부재 시 CPU silent no-op, handoff landmine 6) — build/clippy + CLI parse + dispatcher sticky 단위테스트 + 자유 함수 추출 등가까지. 실 partition decode·로그·정확성 = device 필수.
+
+#### 5.5.8 배선 (build_bench_loop)
+
+`CommandDispatcher::new` 에 partition handle 2개 추가(현 evict handle `Vec<Arc<StandardFormat>>` + CM 옆):
+- `layer_slots: Vec<Arc<LayerSlot>>` = `mf.model().layers.clone()` (build_bench_loop:228 의 `kv_handles` 와 같은 위치에서 추출).
+- `hardware: Arc<Hardware>` = build_bench_loop 가 이미 보유하거나 인자로 받아야 함. **현 build_bench_loop 시그니처에 hardware 부재** — `cpu_backend: Arc<dyn Backend>`(:180)는 있으나 full Hardware resolver 부재. **인자 추가 필요**(`hardware: Arc<Hardware>`) 또는 dispatcher 가 cpu/gpu backend 2개만 받아 내부 구성. apply_dispatch 가 `&Hardware` 를 요구하므로 Hardware 전달이 정합 — `session/init.rs` 가 이미 `hardware: Arc<Hardware>`(init.rs:822) 보유, build_bench_loop 호출처에서 전달.
+
+> **non-local 변경 경고**: build_bench_loop 시그니처에 `hardware: Arc<Hardware>` 추가는 호출처(argus_bench 경로) 변경 동반. evict 의 `kv_handles` 가 이미 dispatcher 로 흐르는 패턴이 있어 handle 추가 자체는 국소이나, hardware 인자는 신규. CLI 정적 경로(init.rs)는 dispatcher 미경유(직접 `prepare_tensor_partition`)라 무영향.
 
 ---
 
