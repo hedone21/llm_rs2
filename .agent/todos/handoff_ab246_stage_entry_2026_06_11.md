@@ -3,7 +3,7 @@
 **작성**: 2026-06-11
 **HEAD**: `ecd07549 docs(todo): Phase γ 종결 — γ-4 RESOLVED + generate 분할 부분 해소 + 파생 후속 5건 등록`
 **브랜치**: master (worktree 없음)
-**다음 세션 진입 문장**: **"AB-2/4/6 전 트랙 종결 (2026-06-11) — 본 handoff 는 완료 기록. 후속 = AB-5(verify YAML 현행화) 또는 ADR-0006 Deferred(IntraForward hook 실배선 등)"** (AB-4: 액션 3 / AB-6: 액션 5 / AB-2: 액션 7 — 모두 host+device 게이트 GREEN)
+**다음 세션 진입 문장**: **"AB-0~6 전 트랙 종결 (2026-06-11) — AB-5 verify 재가동 포함 (S25 매트릭스 28/30 + known-fail 2, `handoff_argus_bench_ab0_ab3` §AB-5 종결 기록). 후속 후보 = backlog [P2] score accumulator 배선(known-fail 2건 해소) 또는 ADR-0006 Deferred(IntraForward hook 실배선 등)"** (AB-4: 액션 3 / AB-6: 액션 5 / AB-2: 액션 7 — 모두 host+device 게이트 GREEN. AB-5 부산물: QCF estimate IPC 재배선 = arch v2 §5.8)
 **착수 순서 (사용자 확정 2026-06-11)**: **AB-4 → AB-6 → AB-2**
 
 > 본 문서가 AB-2/4/6 재개의 SSOT. 구 계획 `handoff_argus_bench_ab0_ab3_2026_06_05.md` §AB-2/4/6 은

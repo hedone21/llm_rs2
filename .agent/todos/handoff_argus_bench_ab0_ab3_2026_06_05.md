@@ -45,9 +45,16 @@ argus-bench 트랙(legacy decode_fallback 폐기 모드를 fmt 경로 재구현 
 - **SwapStage 인터페이스 판정(핵심)**: 현 `before_step/after_step(&StepCtx)` 로는 plan.swap_weights + model layer/secondary Arc 접근 불가. **trait 시그니처 변경 필요**(사용자 수용): (i) StepCtx/SwapStage 에 swap directive 노출, (ii) ModelForward 가 IntraForwardSwapHook 을 forward_into `layer_boundary_hook` 으로 주입(Forward 협조 — 가장 비국소). report 슬롯(decode_loop.rs:39 dead_code) drain 배선.
 - **host smoke**: single-shot/incremental CPU swap(run_layer_swap cpu fallback)으로 `weight_swap: ...` 로그+LayerSlot dtype Q4_0 전이 검증. intra-forward/phase-aware(GPU materialise)+post-swap remap(Arc refcount≥2 → get_mut 불가)은 device.
 
-### AB-5 verify.py 원격 재배선 + 16/16 device 게이트
-- `_build_remote_binaries`/`_deploy_remote_binaries`(verify.py:83/166 PARKED) 해제 — argus_bench + mock_manager 크로스빌드(aarch64-linux-android, `--features lua` for manager) + adb push. orchestrator binary_name `generate`→`argus_bench`(원격 host/ssh/adb 경로 + pkill 패턴 ~20곳; AB-0 은 로컬 host 만 ENGINE_BIN 적용). adb engine_cmd 경로(`_run_scenario_adb` 부재 — signal 만 `_run_scenario_adb_signal`) 구현 여부 확인.
-- 게이트: `python verify/verify.py --device galaxy_s25 --model f16,q4` → 15 시나리오(host 6 + device-only 9) green.
+### ~~AB-5 verify.py 원격 재배선 + 16/16 device 게이트~~ ✅ **종결 (2026-06-11, S25)**
+- ~~PARKED 해제~~ ✅ `171fe98f`(이력 복원 + argus_bench 치환, 원격 3경로 + pkill + RUST_LOG 주입. `_run_scenario_adb` "부재" 기록은 stale — 기존재).
+- **최종 게이트: 15 시나리오 × f16,q4 = 30 run → 28 PASS + 2 known-fail.** AB-2/4 신규 capability 시나리오(kvquant 2종·partition 3종) 전부 PASS.
+- **수정 체인** (1차 매트릭스 16/30 → triage 엔진 회귀 0 → 점진 해소):
+  - `f1dd7d0b` argv 서브커맨드 순서(`--threads`가 `eviction` 뒤 → clap 거부, 6건) + target_tbt YAML v2 marker 정합(4건) + restore delay race(2건).
+  - `bf6230e8`+`226d154b` **QCF estimate 역방향 IPC 재배선**(arch v2 §5.8 — dispatcher 직결 `compute_and_send_qcf` + report_tx, `LoopControl.request_qcf` 삭제, v1 lift-and-shift→`session/qcf_runtime.rs`) — β-7 제거 후 유일 미재배선 잔여였음.
+  - `e267bd50` device-only KV read-back fallback(UnifiedBuffer unmapped `as_ptr()=null` → `VDataSource::from_buffer(.., Some(cpu_bytes))` seam) + thermal decode_tokens 256.
+  - `e55835ae` signal 주입 anchor 고정 sleep(10s)→event-driven(Capability marker 대기) + thermal `functional_only`(policy의 SwitchHw{cpu}=의도적 발산, kvquant 선례).
+  - `1aee5497` **signal root cause**: remote_run_dir에 model key 부재 → 같은 pid의 2번째 model이 1번째의 stale `engine.rc`를 0.0s에 읽고 조기 pull(stderr가 prefill에서 절단돼 functional 오판) — 계측(`[signal] engine.rc=N after Xs`)으로 실증 후 spawn 전 rm -f.
+- **known-fail 2건** = `signal_memory_critical` f16/q4: 엔진 경로 정상 입증(RequestQcf→QcfEstimate(1 action)→policy LayerSkip 선택) — h2o/d2o estimate에 필요한 **AttentionScoreAccumulator가 argus_bench 미장착**(본 문서 위 AB-1 landmine 그대로)이라 policy가 KvEvict 대신 LayerSkip. backlog `[P2] argus_bench AttentionScoreAccumulator 배선` 등록 — 그 항목 해소 시 본 시나리오가 회귀 게이트.
 
 ---
 
