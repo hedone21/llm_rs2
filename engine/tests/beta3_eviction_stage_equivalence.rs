@@ -5,7 +5,7 @@
 //! **자기 비교 금지 (roadmap:77)** — anchor 는 stage 기계 없이 v1 live 경로의 inner op
 //! (`CacheManager::force_evict(&mut [KVCache])`, model_forward.rs:524-531 의 `try_evict` 본문)를
 //! 직접 호출한 산출이다. stage 는 동일 캐시·정책으로 `EvictionStage::one_shot` →
-//! `PipelineRegistry::dispatch(PreEviction)` 를 거친 산출이다. 둘의 per-layer `current_pos` +
+//! `PipelineRegistry::dispatch(KvMutate)` 를 거친 산출이다. 둘의 per-layer `current_pos` +
 //! K/V valid-region byte 가 bit-identical 임을 증명한다.
 //!
 //! 범위: {sliding, h2o, streaming} × {F32, F16, Q4_0} = 9종 + min-floor 발화 경계 1종.
@@ -149,7 +149,7 @@ fn assert_equivalence(
         );
     }
 
-    // ── stage: wrap → EvictionStage::one_shot → dispatch(PreEviction) ──
+    // ── stage: wrap → EvictionStage::one_shot → dispatch(KvMutate) ──
     let handles: Vec<Arc<StandardFormat>> = (0..n_layers)
         .map(|i| Arc::new(StandardFormat::new(i, make_cache(dtype, n_tokens))))
         .collect();
@@ -168,7 +168,7 @@ fn assert_equivalence(
         },
         profiler: &mut profiler,
     };
-    registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+    registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
     // OneShot Consumed → GC.
     assert_eq!(
         registry.len(),

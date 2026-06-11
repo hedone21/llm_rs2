@@ -586,7 +586,7 @@ mod tests {
         // CLI 정책 = sliding(make_cm). KvEvictH2o directive 가 와도 sliding 으로 prune 됨.
         d.dispatch(vec![EngineCommand::KvEvictH2o { keep_ratio: 0.3 }]);
         assert_eq!(registry.len(), 1);
-        // stage 발화 (PreEviction dispatch) → sliding prune.
+        // stage 발화 (KvMutate dispatch) → sliding prune.
         let mut profiler = crate::observability::profile::OpProfiler::new();
         let mut ctx = crate::pipeline::StageContext {
             step: crate::pipeline::StepInfo {
@@ -598,7 +598,7 @@ mod tests {
             profiler: &mut profiler,
         };
         use crate::pipeline::{LifecyclePhase, PipelineDispatcher};
-        registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
         assert!(
             handle.current_pos() < N_TOKENS,
             "method-drop: directive method 무시, CM 정책(sliding)으로 prune"

@@ -243,7 +243,7 @@ pub fn build_bench_loop(
     };
 
     // β-4: dispatcher 와 driver 가 공유하는 registry. dispatcher.submit(OneShot EvictionStage) →
-    // driver 의 PreEviction dispatch(β-3 배선)가 소비.
+    // driver 의 KvMutate dispatch(β-3 배선)가 소비.
     let registry = Arc::new(PipelineRegistry::new());
 
     // β-4: EngineCommand 분배자. **resilience-on 이면 CM 유무와 무관하게 구성** — control

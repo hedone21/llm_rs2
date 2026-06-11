@@ -65,8 +65,8 @@ pub struct DecodeLoop {
     forward: Box<dyn Forward>,
     cmd_source: Box<dyn CommandSource>,
     sampler: Box<dyn TokenSampler>,
-    // β-7: v1 eviction/swap/observers/report 슬롯 제거. eviction → PipelineStage(PreEviction/
-    // PostEviction, stages/kv/eviction.rs) 로 수렴, tick/observe → TickStage/PipelineStage 로,
+    // β-7: v1 eviction/swap/observers/report 슬롯 제거. eviction → PipelineStage(KvMutate/
+    // WeightMutate, stages/kv/eviction.rs) 로 수렴, tick/observe → TickStage/PipelineStage 로,
     // report(EngineReport) 슬롯은 dead 였다(IPC 송출은 resilience_init 가 executor 직접 호출).
     stop_flag: Arc<AtomicBool>,
     // β-4 (v2 §5.4 A-1): 2-source 명령 분배자. cmd_source.poll() 이 pure 생산한 EngineCommand 를
@@ -154,13 +154,13 @@ impl DecodeLoop {
         }
     }
 
-    /// β-3 pos-환류 (§5.2.1 (가)): EvictionStage 가 PreEviction/PostEviction dispatch 에서
+    /// β-3 pos-환류 (§5.2.1 (가)): EvictionStage 가 KvMutate/WeightMutate dispatch 에서
     /// cache 의 `current_pos` 를 prune 했을 수 있으므로, held layer-0 handle 의 `current_pos` 를
     /// 읽어 loop `pos` 를 동기화한다. `StageOutcome` 은 무변경(query-only) — driver 가
     /// `forward.on_kv_prune`(GPU plan invalidate)으로 v1 (a.5) 등가 통지를 한다.
     ///
     /// `kv_pos_handle == None`(happy/chat/기존 전부) 면 즉시 return → **거동-0**. 빈 registry 면
-    /// PreEviction/PostEviction dispatch 가 len==0 fast-path 라 cache 가 변할 일이 없어 new_pos ==
+    /// KvMutate/WeightMutate dispatch 가 len==0 fast-path 라 cache 가 변할 일이 없어 new_pos ==
     /// self.pos → 환류 자체가 no-op.
     fn reconcile_kv_pos_after_eviction(&mut self) {
         let Some(h) = &self.kv_pos_handle else {
@@ -286,7 +286,7 @@ impl DecodeLoop {
             }
 
             // (a.5) 제거: evict 는 dispatcher 가 OneShot EvictionStage 로 registry 에 submit 했고,
-            // 아래 PreEviction dispatch + pos-환류(β-3 배선)가 이를 소비한다. v1 try_evict 인라인
+            // 아래 KvMutate dispatch + pos-환류(β-3 배선)가 이를 소비한다. v1 try_evict 인라인
             // 경로는 dispatcher.submit + EvictionStage.on_phase 로 cutover 됨.
 
             // (a.6) argus-bench AB-3: resilience KvOffload / recall. dispatcher 가 보유한 공유
@@ -324,26 +324,26 @@ impl DecodeLoop {
                 }
             }
 
-            // PreEviction: (a.6) 블록 끝, (b) v1 eviction 직전 (§5.2.1 (나) — command-poll 직후·
+            // KvMutate: (a.6) 블록 끝, (b) v1 eviction 직전 (§5.2.1 (나) — command-poll 직후·
             // forward 직전). v2 EvictionStage(command-driven OneShot) 가 여기서 발화한다 — UER 로
             // cache 를 prune 한 뒤 pos-환류로 loop pos 동기화 (§5.2.1 (가)).
-            if let Some(r) = self.dispatch_phase(LifecyclePhase::PreEviction) {
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::KvMutate) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
             self.reconcile_kv_pos_after_eviction();
 
-            // PostEviction: PreEviction 직후, forward 직전 (§5.2.1 (나)). pressure band-driven
+            // WeightMutate: KvMutate 직후, forward 직전 (§5.2.1 (나)). pressure band-driven
             // Persistent EvictionStage 등 eviction 후속 발화 슬롯. dispatch 후 pos-환류로 loop pos
-            // 동기화 (β-7: v1 (b) eviction/(c) swap before 인라인 슬롯 제거 — eviction 은
-            // EvictionStage, swap 은 SwapStage 로 수렴).
-            if let Some(r) = self.dispatch_phase(LifecyclePhase::PostEviction) {
+            // 동기화 (β-7: v1 (b) eviction/(c) swap before/(e) swap after 인라인 슬롯 제거 —
+            // eviction 은 EvictionStage, swap 은 SwapStage 로 수렴).
+            if let Some(r) = self.dispatch_phase(LifecyclePhase::WeightMutate) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
             self.reconcile_kv_pos_after_eviction();
 
-            // PreForward: PostEviction 후, (d) forward 직전.
+            // PreForward: WeightMutate 후, (d) forward 직전.
             if let Some(r) = self.dispatch_phase(LifecyclePhase::PreForward) {
                 stopped_by = Self::map_stage_stop(r);
                 break;
@@ -1068,22 +1068,22 @@ mod tests {
         loop_.run(2, 0).unwrap();
 
         let observed = log.lock().unwrap().clone();
-        // β-3: 각 DecodeStart 직후 PreEviction, v1 eviction 후 PostEviction 발화
+        // β-3: 각 DecodeStart 직후 KvMutate, v1 eviction 후 WeightMutate 발화
         // (§5.2.1 (나) — command-poll 직후·forward 직전).
         let expected = vec![
             Phase::PrefillStart,
             Phase::PrefillEnd,
             Phase::DecodeStart,
-            Phase::PreEviction,
-            Phase::PostEviction,
+            Phase::KvMutate,
+            Phase::WeightMutate,
             Phase::PreForward,
             Phase::PostForward,
             Phase::PreSample,
             Phase::PostSample,
             Phase::DecodeEnd,
             Phase::DecodeStart,
-            Phase::PreEviction,
-            Phase::PostEviction,
+            Phase::KvMutate,
+            Phase::WeightMutate,
             Phase::PreForward,
             Phase::PostForward,
             Phase::PreSample,
@@ -1172,8 +1172,8 @@ mod tests {
         let expected = vec![
             Phase::TurnStart,
             Phase::DecodeStart,
-            Phase::PreEviction,
-            Phase::PostEviction,
+            Phase::KvMutate,
+            Phase::WeightMutate,
             Phase::PreForward,
             Phase::PostForward,
             Phase::PreSample,
@@ -1250,7 +1250,7 @@ mod tests {
 
     // ── β-3 loop-level pos-환류 테스트 ─────────────────────────────────────
 
-    /// OneShot EvictionStage 가 PreEviction 에서 발화 → cache prune → driver 가
+    /// OneShot EvictionStage 가 KvMutate 에서 발화 → cache prune → driver 가
     /// `reconcile_kv_pos_after_eviction` 으로 loop pos 를 handle.current_pos() 와 동기화.
     /// Consumed → registry GC (len==0). β-7: v1 observer.on_eviction 통지가 제거됐으므로
     /// prune 은 pos 환류(new_pos < N_TOKENS, final_pos == new_pos+1)로 직접 검증한다.
@@ -1309,7 +1309,7 @@ mod tests {
             .build();
 
         // prefill N_TOKENS → driver pos = N_TOKENS (handle.current_pos 와 일치).
-        // budget=1: 첫 step 의 PreEviction 발화로 prune·reconcile 만 검증한다 (MockForward 는
+        // budget=1: 첫 step 의 KvMutate 발화로 prune·reconcile 만 검증한다 (MockForward 는
         // KVCache 를 advance 하지 않아 step ≥2 에서 handle.current_pos < loop pos 가 누적되며
         // reconcile 이 재발동하는 테스트-아티팩트를 회피 — production forward.step 은 advance).
         let prompt: Vec<u32> = (0..N_TOKENS as u32).collect();
@@ -1319,7 +1319,7 @@ mod tests {
         // EvictionStage 발화 후 handle.current_pos < N_TOKENS (sliding prune).
         let new_pos = handle.current_pos();
         assert!(new_pos < N_TOKENS, "eviction prune (got pos={new_pos})");
-        // 첫 step 의 PreEviction prune 으로 loop pos 가 new_pos 로 동기화된 뒤 step 진행으로 +1
+        // 첫 step 의 KvMutate prune 으로 loop pos 가 new_pos 로 동기화된 뒤 step 진행으로 +1
         // → final_pos == new_pos + 1.
         assert_eq!(result.final_pos, new_pos + 1, "pos 환류 후 step 진행 정합");
         // OneShot Consumed → registry GC.

@@ -7,7 +7,7 @@
 //!
 //! `kv/` 정책·포맷에 수평 의존(L3→L3).
 //!
-//! **입주자 1호(Phase β-3 commit B)**: [`eviction::EvictionStage`] — `PreEviction` phase 에서
+//! **입주자 1호(Phase β-3 commit B)**: [`eviction::EvictionStage`] — `KvMutate` phase 에서
 //! CacheManager UER(take/put_inner) 경유로 발화하는 v2 `PipelineStage`. v1 `try_evict`(AB-1)와
 //! 산출 동일(madvise/CacheEvent/min-floor 회계 보존). 나머지 입주자(D2O/KIVI/Swap/TierMove)는
 //! 후속 substep 에서 채운다.

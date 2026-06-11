@@ -3,14 +3,14 @@
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5 (PipelineStage 모델).
 //!
 //! **배선 상태 (β-2/β-3/β-6)**: `session/decode_loop.rs` 의 공유 core `run_steps` 가 per-token
-//! 8 phase(DecodeStart·PreEviction·PostEviction·PreForward·PostForward·PreSample·PostSample·
+//! 8 phase(DecodeStart·KvMutate·WeightMutate·PreForward·PostForward·PreSample·PostSample·
 //! DecodeEnd)를 발화한다. `prefill` 은 PrefillStart·PrefillEnd, `run()` 은 추가로 Finalize 를
 //! 발화한다. **β-6 통합**: `run_until_stop` 도 `run_steps` 를 공유하므로 동일 per-token phase 를
 //! 발화하고, 진입/종료에 TurnStart·TurnEnd 를 추가 발화한다(finalize/Finalize 는 미호출 —
 //! chat 세션 재사용). chat 의 stop 판정은 `ChatStopStage`(DecodeEnd 구독, chat/stop_condition.rs)
 //! 가 담당한다.
 //!
-//! **β-3**: `EvictionStage`(stages/kv/eviction.rs)가 PreEviction 에서 UER 로 force-evict 하고,
+//! **β-3**: `EvictionStage`(stages/kv/eviction.rs)가 KvMutate 에서 UER 로 force-evict 하고,
 //! driver 가 held handle 의 `current_pos` 를 query 해 pos-환류(§5.2.1 (가)).
 //!
 //! **미발화 orphan (§5.2.1 (라))**: SessionStart·SessionEnd 는 β 범위 밖, PreLayer·PostLayer·
@@ -183,11 +183,10 @@ pub enum LifecyclePhase {
     PostSample,
     DecodeEnd,
     // cross-cutting stage hook (mutation 허용)
-    PreEviction,
-    PostEviction,
-    PreSwap,
-    PostSwapBefore,
-    PostSwapAfter,
+    /// KV 구조 변경 윈도우 (eviction 등 — driver가 dispatch 후 pos-환류).
+    KvMutate,
+    /// weight 변경 윈도우 (AB-6 WeightSwapStage drain — pos-환류 유지).
+    WeightMutate,
     // per-layer (N×/token) — mutation 금지 (INV-DECODE-STAGE-001)
     PreLayer,
     PostLayer,

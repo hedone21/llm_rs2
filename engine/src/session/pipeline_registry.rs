@@ -303,17 +303,17 @@ mod tests {
         let fired = Arc::new(AtomicUsize::new(0));
 
         registry.submit(Arc::new(OneShotStage {
-            target_phase: LifecyclePhase::PreEviction,
+            target_phase: LifecyclePhase::KvMutate,
             fired: fired.clone(),
         }));
 
         assert_eq!(registry.len(), 1);
 
         let mut profiler = OpProfiler::new();
-        // 1회차: PreEviction 에서 Consumed → GC
+        // 1회차: KvMutate 에서 Consumed → GC
         {
             let mut ctx = make_ctx(&mut profiler);
-            registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+            registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
         }
         assert_eq!(
             fired.load(AOrdering::SeqCst),
@@ -325,7 +325,7 @@ mod tests {
         // 2회차: 이미 GC 됐으므로 발화 없음
         {
             let mut ctx = make_ctx(&mut profiler);
-            registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+            registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
         }
         assert_eq!(fired.load(AOrdering::SeqCst), 1, "GC 후 재발화 없음");
     }

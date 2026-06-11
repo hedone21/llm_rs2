@@ -126,6 +126,8 @@ impl PipelineStage for PartitionStage {
         _ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<StageOutcome> {
         // self-filter (§5.5.1): PreForward 외 phase 는 무시.
+        // PartitionStage 는 PreForward 잔류 — re-slice 가 forward plan 준비 성격이고
+        // AB-4 동결 직후라 이동하지 않음(§5.6.5).
         if *phase != LifecyclePhase::PreForward {
             return Ok(StageOutcome::Continue);
         }
@@ -213,9 +215,7 @@ mod tests {
 
         let mut profiler = OpProfiler::new();
         let mut ctx = make_ctx(&mut profiler);
-        let outcome = stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut ctx)
-            .unwrap();
+        let outcome = stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap();
         assert!(matches!(outcome, StageOutcome::Continue));
         for slot in &stage.slots {
             assert!(

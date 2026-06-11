@@ -246,7 +246,7 @@ fn test_inv_decode_stage_004_outcome_consumed_oneshot_only() {
     let after = Arc::new(AtomicUsize::new(0));
 
     registry.submit(Arc::new(OneShotOnPhase {
-        target: LifecyclePhase::PreEviction,
+        target: LifecyclePhase::KvMutate,
         fired: fired.clone(),
     }));
     registry.submit(Arc::new(CountStage {
@@ -259,7 +259,7 @@ fn test_inv_decode_stage_004_outcome_consumed_oneshot_only() {
     // 1회: Consumed → GC, 후속 stage 는 계속 실행
     {
         let mut ctx = make_ctx(&mut profiler);
-        registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
     }
     assert_eq!(fired.load(Ordering::SeqCst), 1, "OneShot 발화");
     assert_eq!(
@@ -272,7 +272,7 @@ fn test_inv_decode_stage_004_outcome_consumed_oneshot_only() {
     // 2회: OneShot GC 됐으므로 재발화 없음
     {
         let mut ctx = make_ctx(&mut profiler);
-        registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
     }
     assert_eq!(fired.load(Ordering::SeqCst), 1, "GC 후 재발화 없음");
     assert_eq!(after.load(Ordering::SeqCst), 2, "Persistent 는 계속 실행");
@@ -338,7 +338,7 @@ fn test_inv_decode_stage_004_pos_reflux_via_held_handle() {
 
     {
         let mut ctx = make_ctx(&mut profiler);
-        registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
     }
 
     let pos_after = handle.current_pos();
@@ -400,15 +400,15 @@ fn test_inv_decode_stage_005_submit_order_is_dispatch_order() {
 
     let mut profiler = OpProfiler::new();
     let mut ctx = make_ctx(&mut profiler);
-    registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+    registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
 
     let observed = order.lock().unwrap().clone();
     assert_eq!(observed, vec!["X", "Y", "Z"]);
 }
 
-/// Persistent 와 OneShot 둘 다 동일 phase(PreEviction)에서 발화한다 — phase-filter 등가.
+/// Persistent 와 OneShot 둘 다 동일 phase(KvMutate)에서 발화한다 — phase-filter 등가.
 ///
-/// 이는 §5.2.1 (나)의 "command-driven OneShot 도 PreEviction phase 에서 소비된다"
+/// 이는 §5.2.1 (나)의 "command-driven OneShot 도 KvMutate phase 에서 소비된다"
 /// 계약의 registry-harness 수준 등가다.
 #[test]
 fn test_inv_decode_stage_005_eviction_phase_shared() {
@@ -416,22 +416,22 @@ fn test_inv_decode_stage_005_eviction_phase_shared() {
     let persistent_count = Arc::new(AtomicUsize::new(0));
     let oneshot_fired = Arc::new(AtomicUsize::new(0));
 
-    // Persistent stage: PreEviction 마다 실행
+    // Persistent stage: KvMutate 마다 실행
     registry.submit(Arc::new(StopOnPhaseStage {
-        target: LifecyclePhase::PostEviction, // 다른 phase 에서만 Stop → PreEviction 에서 Continue
+        target: LifecyclePhase::WeightMutate, // 다른 phase 에서만 Stop → KvMutate 에서 Continue
         reason: StopReason::EosToken,
         count: persistent_count.clone(),
     }));
-    // OneShot stage: PreEviction 에서 Consumed
+    // OneShot stage: KvMutate 에서 Consumed
     registry.submit(Arc::new(OneShotOnPhase {
-        target: LifecyclePhase::PreEviction,
+        target: LifecyclePhase::KvMutate,
         fired: oneshot_fired.clone(),
     }));
 
     let mut profiler = OpProfiler::new();
     {
         let mut ctx = make_ctx(&mut profiler);
-        registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
     }
 
     assert_eq!(
@@ -477,7 +477,7 @@ fn test_inv_decode_stage_007_oneshot_gc_once() {
     let fired = Arc::new(AtomicUsize::new(0));
 
     registry.submit(Arc::new(OneShotOnPhase {
-        target: LifecyclePhase::PreEviction,
+        target: LifecyclePhase::KvMutate,
         fired: fired.clone(),
     }));
 
@@ -499,7 +499,7 @@ fn test_inv_decode_stage_007_oneshot_gc_once() {
     // 2회: target phase → Consumed → GC
     {
         let mut ctx = make_ctx(&mut profiler);
-        registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
     }
     assert_eq!(fired.load(Ordering::SeqCst), 1, "target phase 도달 → 발화");
     assert_eq!(registry.len(), 0, "GC 완료");
@@ -507,7 +507,7 @@ fn test_inv_decode_stage_007_oneshot_gc_once() {
     // 3회: GC 됐으므로 재발화 없음
     {
         let mut ctx = make_ctx(&mut profiler);
-        registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
     }
     assert_eq!(fired.load(Ordering::SeqCst), 1, "GC 후 재발화 없음");
 }

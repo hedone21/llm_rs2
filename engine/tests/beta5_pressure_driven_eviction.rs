@@ -3,7 +3,7 @@
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5.1/§5.4 G4 + roadmap β-5 게이트 2.
 //!
 //! mock `SystemMonitor`(주입 가능한 `MemAvailable`)로 [`LocalPressureSource`] 를 구성하고,
-//! Warning 이상 압력에서 Persistent [`EvictionStage`] 가 `PreEviction` 에서 발화함을 보인다.
+//! Warning 이상 압력에서 Persistent [`EvictionStage`] 가 `KvMutate` 에서 발화함을 보인다.
 //! 그 prune 산출이 v1 `CacheManager::force_evict` 직접 호출(anchor)과 **bit-identical** 임을
 //! 증명한다(자기 비교 금지 — beta3 패턴 차용). Normal 압력에서는 무발화(cache 불변).
 //!
@@ -126,7 +126,7 @@ fn make_cache_manager(policy_name: &str, target_ratio: f32) -> CacheManager {
 }
 
 /// LocalPressureSource(mock monitor) 가 band 임계 이상의 압력을 내고, Persistent EvictionStage 가
-/// PreEviction 에서 발화한 산출 == v1 force_evict 직접(anchor) 산출 (bit-identical).
+/// KvMutate 에서 발화한 산출 == v1 force_evict 직접(anchor) 산출 (bit-identical).
 fn assert_pressure_driven_equivalence(policy_name: &str, dtype: DType) {
     let n_layers = 2usize;
     let label = format!("{policy_name}/{dtype:?}");
@@ -155,7 +155,7 @@ fn assert_pressure_driven_equivalence(policy_name: &str, dtype: DType) {
         "{label}: mock monitor(available=t/2) → band()=Warning 기대"
     );
 
-    // ── stage: Persistent EvictionStage(min_band=Warning) → dispatch(PreEviction) ──
+    // ── stage: Persistent EvictionStage(min_band=Warning) → dispatch(KvMutate) ──
     let handles: Vec<Arc<StandardFormat>> = (0..n_layers)
         .map(|i| Arc::new(StandardFormat::new(i, make_cache(dtype, N_TOKENS))))
         .collect();
@@ -175,7 +175,7 @@ fn assert_pressure_driven_equivalence(policy_name: &str, dtype: DType) {
         },
         profiler: &mut profiler,
     };
-    registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+    registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
     // Persistent → Consumed 안 함 → 상주 (GC 없음).
     assert_eq!(
         registry.len(),
@@ -247,7 +247,7 @@ fn normal_pressure_does_not_fire() {
         },
         profiler: &mut profiler,
     };
-    registry.dispatch(LifecyclePhase::PreEviction, &mut ctx);
+    registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
 
     let inner = handle.take_inner();
     assert_eq!(

@@ -2,7 +2,7 @@
 //!
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5.2.1 (가)(나) + roadmap β-3 commit B.
 //!
-//! `PreEviction` phase 에서 발화하여, register 시점 보유한 `Vec<Arc<StandardFormat>>` 핸들의
+//! `KvMutate` phase 에서 발화하여, register 시점 보유한 `Vec<Arc<StandardFormat>>` 핸들의
 //! inner `KVCache` 를 **CacheManager UER**(`take_inner` → `force_evict` → `put_inner`)로 prune
 //! 한다. 적용 경로가 v1 `ModelForward::try_evict`(model_forward.rs:505-548, AB-1)의 inner op 와
 //! **byte-identical** 이라 madvise/CacheEvent/min-floor 회계가 그대로 보존된다(자기 비교 금지 —
@@ -26,7 +26,7 @@ use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
 
-/// `PreEviction` phase 에서 CacheManager UER 로 force-evict 하는 Stage.
+/// `KvMutate` phase 에서 CacheManager UER 로 force-evict 하는 Stage.
 ///
 /// `CacheManager::force_evict` 는 `&self` 이지만, `PipelineStage: Send + Sync` 를 충족하려면
 /// 내부 가변 상태가 `Sync` 여야 한다 → `Mutex<CacheManager>` 로 소유한다(per-dispatch 1 lock,
@@ -46,7 +46,7 @@ pub struct EvictionStage {
     cache_manager: Arc<Mutex<CacheManager>>,
     /// score-free force_evict 의 target ratio.
     target_ratio: f32,
-    /// β-5: Persistent band-driven 발화 임계. `Some(min)` 이면 `PreEviction` 에서
+    /// β-5: Persistent band-driven 발화 임계. `Some(min)` 이면 `KvMutate` 에서
     /// `ctx.step.pressure.band() >= min` 일 때만 prune 한다(미달 시 `Continue`, no-op).
     /// `None`(OneShot) 이면 무조건 발화(v1 AB-1 = command-driven, 압력 무관).
     min_band: Option<Level>,
@@ -81,7 +81,7 @@ impl EvictionStage {
         }
     }
 
-    /// β-5: pressure-driven Persistent eviction. 세션 내내 상주하며, `PreEviction` 에서
+    /// β-5: pressure-driven Persistent eviction. 세션 내내 상주하며, `KvMutate` 에서
     /// `ctx.step.pressure.band() >= min_band` 일 때만 prune 한다(미달 시 `Continue`, no-op).
     ///
     /// **OneShot 과 同코드**: prune 본문([`run_eviction`](Self::run_eviction))은 공유하고,
@@ -139,7 +139,7 @@ impl PipelineStage for EvictionStage {
         ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<StageOutcome> {
         // self-filter (§5.3): eviction 외 phase 는 무시.
-        if *phase != LifecyclePhase::PreEviction {
+        if *phase != LifecyclePhase::KvMutate {
             return Ok(StageOutcome::Continue);
         }
 
@@ -232,7 +232,7 @@ mod tests {
         }
     }
 
-    /// PreEviction 외 phase 는 no-op(Continue) + cache 불변.
+    /// KvMutate 외 phase 는 no-op(Continue) + cache 불변.
     #[test]
     fn non_eviction_phase_is_noop() {
         let handle = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(handle.current_pos(), N_TOKENS);
     }
 
-    /// OneShot: PreEviction 1회 발화 → Consumed.
+    /// OneShot: KvMutate 1회 발화 → Consumed.
     #[test]
     fn one_shot_returns_consumed_on_eviction() {
         let handle = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
@@ -258,9 +258,7 @@ mod tests {
 
         let mut profiler = OpProfiler::new();
         let mut ctx = make_ctx(&mut profiler);
-        let outcome = stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut ctx)
-            .unwrap();
+        let outcome = stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap();
         assert!(
             matches!(outcome, StageOutcome::Consumed),
             "OneShot eviction 은 Consumed 반환"
@@ -282,9 +280,7 @@ mod tests {
 
         let mut profiler = OpProfiler::new();
         let mut ctx = make_ctx(&mut profiler);
-        let _ = stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut ctx)
-            .unwrap();
+        let _ = stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap();
 
         // dispatch 후 inner 가 placeholder(0-len)가 아니라 실물 cache 여야 한다 —
         // take_inner 로 꺼내도 capacity 가 보존됨.
@@ -308,9 +304,7 @@ mod tests {
         let mut profiler = OpProfiler::new();
         // pressure=50 → band()=Warning >= min(Warning) → 발화.
         let mut ctx = make_ctx_with_pressure(&mut profiler, 50);
-        let outcome = stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut ctx)
-            .unwrap();
+        let outcome = stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap();
         assert!(
             matches!(outcome, StageOutcome::Continue),
             "Persistent 은 발화해도 Continue(상주, GC 안 함)"
@@ -336,9 +330,7 @@ mod tests {
         let mut profiler = OpProfiler::new();
         // pressure=49 → band()=Normal < min(Warning) → 무발화.
         let mut ctx = make_ctx_with_pressure(&mut profiler, 49);
-        let outcome = stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut ctx)
-            .unwrap();
+        let outcome = stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap();
         assert!(matches!(outcome, StageOutcome::Continue));
         assert_eq!(
             handle.current_pos(),
@@ -356,7 +348,7 @@ mod tests {
         let one = EvictionStage::one_shot(vec![h_one.clone()], make_cache_manager(), TARGET_RATIO);
         let mut p1 = OpProfiler::new();
         let mut c1 = make_ctx_with_pressure(&mut p1, 50);
-        one.on_phase(&LifecyclePhase::PreEviction, &mut c1).unwrap();
+        one.on_phase(&LifecyclePhase::KvMutate, &mut c1).unwrap();
         let one_shot_pos = h_one.current_pos();
 
         // Persistent(band 충족) 경로 — 동일 입력 캐시·CM·ratio.
@@ -369,7 +361,7 @@ mod tests {
         );
         let mut p2 = OpProfiler::new();
         let mut c2 = make_ctx_with_pressure(&mut p2, 50);
-        per.on_phase(&LifecyclePhase::PreEviction, &mut c2).unwrap();
+        per.on_phase(&LifecyclePhase::KvMutate, &mut c2).unwrap();
         let persistent_pos = h_per.current_pos();
 
         assert_eq!(
@@ -398,17 +390,13 @@ mod tests {
 
         // 에피소드 1: 상향 돌파 → 1회 발화.
         let mut c = make_ctx_with_pressure(&mut profiler, 50);
-        stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut c)
-            .unwrap();
+        stage.on_phase(&LifecyclePhase::KvMutate, &mut c).unwrap();
         let pos_after_first = handle.current_pos();
         assert!(pos_after_first < N_TOKENS, "에피소드 1 발화");
 
         // 지속 고압: 같은 에피소드 내 재dispatch → 무발화 (pos 불변).
         let mut c = make_ctx_with_pressure(&mut profiler, 60);
-        stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut c)
-            .unwrap();
+        stage.on_phase(&LifecyclePhase::KvMutate, &mut c).unwrap();
         assert_eq!(
             handle.current_pos(),
             pos_after_first,
@@ -417,17 +405,13 @@ mod tests {
 
         // band 하강 → re-arm (무발화).
         let mut c = make_ctx_with_pressure(&mut profiler, 10);
-        stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut c)
-            .unwrap();
+        stage.on_phase(&LifecyclePhase::KvMutate, &mut c).unwrap();
         assert_eq!(handle.current_pos(), pos_after_first, "Normal 에선 무발화");
 
         // 에피소드 2: 캐시 재성장 후 재돌파 → 재발화.
         handle.with_cache_mut(|cache| cache.current_pos = N_TOKENS);
         let mut c = make_ctx_with_pressure(&mut profiler, 80);
-        stage
-            .on_phase(&LifecyclePhase::PreEviction, &mut c)
-            .unwrap();
+        stage.on_phase(&LifecyclePhase::KvMutate, &mut c).unwrap();
         assert!(
             handle.current_pos() < N_TOKENS,
             "re-arm 후 두 번째 에피소드에서 재발화"
