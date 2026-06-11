@@ -30,7 +30,7 @@
   - **(γ-2) ✅** nested `mod.rs` 38개 sweep — no-`mod.rs` 모던 path 스타일(§2.1 규칙 C / CLAUDE.md 컨벤션).
   - **(γ-3) ✅** argus-eval bin화 (2026-06-11, `33d5bc8f`/`11c8721f`) — eval 진입 경로를 `argus_eval` bin 으로 부활(살림). argus-chat bin화는 별 sprint 잔여(아래 generate 분할 항목 참조).
   - **(γ-4) ✅** batch orphan 처분 (2026-06-11, `2e53cf44`) — `run_prompt_batch`/batch runner ~1170 LOC 순수 삭제(죽은 포장지). 아래 RESOLVED 항목 참조.
-- **다음 ACTIVE 후보 (착수 대기)**: **AB-2/4/6 Stage 모델 재개** (G1 결정 — 과도기 LoopControl 필드 이전 포함). **AB-2 는 D8 ABI 재확인 선행.** 진입 시 별 roadmap/handoff 작성.
+- **ACTIVE (2026-06-11 진입)**: **AB-2/4/6 Stage 모델 재개** (G1 결정 — 과도기 LoopControl 필드 이전 포함). 착수 순서 **AB-4 → AB-6 → AB-2** (사용자 확정). 진입 SSOT = `handoff_ab246_stage_entry_2026_06_11.md` (census verdict + 게이트 + landmine 9건 — D8 재확인은 census 로 완료: re-export 보존, 저위험).
 - **이전 Master roadmap (α-K BC, 완료)**: `.agent/todos/roadmap_alpha_k_bc_completion_2026_06_04.md`.
 
 ---
