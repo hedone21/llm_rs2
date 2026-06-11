@@ -580,6 +580,7 @@ pub enum LifecyclePhase {
     // cross-cutting stage hook (mutation 허용) — AB-6 rename: KvMutate(구 PreEviction) /
     // WeightMutate(구 PostEviction). dead variant PreSwap/PostSwapBefore/PostSwapAfter 3종 삭제
     // (driver 발화 0, 구독자 0 — §5.6.5). 발화 위치·순서 불변(B안 driver 무수정).
+    // 구독자: KvMutate = EvictionStage + KiviQuantStage(AB-2 §5.7) / WeightMutate = WeightSwapStage.
     KvMutate, WeightMutate,
     // per-layer (N×/token) — mutation 금지 (INV-DECODE-STAGE-001)
     PreLayer, PostLayer, Fine(/* sub-step 식별자 */),
@@ -969,6 +970,153 @@ WeightSwapStage commit (§7)
 - `layer_slots: Vec<Arc<LayerSlot>>` = **partition 분과 공유**(이미 AB-4 §5.5.8 에서 dispatcher 로 흐름 — swap 이 같은 handle 재사용, 추가 추출 0).
 
 > **non-local 변경 경고**: `EngineSwapRuntime` 은 `swap_backend`/`AsyncSwapDispatcher`/`release_worker` 를 보유하므로 build_bench_loop 가 이들을 구성·전달해야 한다(현 swap 미배선 = `NoOpSwapStage`, ADR-0006 §5 "greenfield wiring"). secondary_mmap 부재 모델(happy/chat)은 `swap_runtime=None` → swap directive 무시(무영향). **host smoke 불가**(GPU 부재 + secondary 필요) — build/clippy + CLI parse + dispatcher transient/in-flight 단위테스트 + `handle_swap_weights` §1~7 등가 테스트까지. 실 swap decode·정확성·device 게이트 = S25/Jetson 필수(legacy frozen baseline 대조).
+
+### 5.7 AB-2 — `KiviQuantStage` (KvQuantDynamic runtime directive → OneShot PipelineStage, KIVI 축)
+
+**역할.** Manager 의 `EngineCommand::KvQuantDynamic{target_bits}` directive 를 받아 KIVI KV cache 의 양자화 bit-width 를 런타임 전환(F16↔Q2/Q4/Q8)하는 OneShot Stage. CommandDispatcher 의 deprecated `LoopControl.kv_quant_bits` 필드(write-only dead-end — set 만 하고 decode_loop 소비자 0, KvQuantDynamic directive 가 현재 **silent no-op**)를 제거하고, evict-family(`submit_evict`→`EvictionStage::one_shot`)와 동형의 `submit_kv_quant`→`KiviQuantStage::one_shot` 경로로 대체한다. AB-2 는 G1 동결 5종(offload/quant/partition/swap/layer-skip) 중 **quant 분의 Stage 이전**이며, **partition/swap(weight 축)과 달리 KV 축 Stage**다 — EvictionStage 와 같은 KV 도메인(`stages/kv/`)에 거주한다.
+
+**축 구분 (AB-4/AB-6 과의 본질 차이).** PartitionStage(AB-4)·WeightSwapStage(AB-6)는 weight 축(`stages/weight/`) Stage 로, weight slot 의 dispatch mode 와 precision 을 바꿨다. KiviQuantStage(AB-2)는 **KV 축** Stage 로 KV cache 의 표현(KIVI bit-width)을 바꾼다 — EvictionStage(KV 토큰 prune)와 같은 도메인이되 mutate 대상이 다르다(eviction=토큰 삭제, quant=bit-width 전환). 따라서 거주지·발화 phase·held-handle 형태 모두 EvictionStage 선례를 따른다(partition/swap 의 weight 선례가 아니라).
+
+**ADR-0006 무관 (KV 축).** ADR-0006(`WeightStage` plan-returning unification)은 **weight 축 전용**(swap/partition/skip)이다. AB-2 의 quant 는 KV 축이라 ADR-0006 의 Seam A/B/C 결정 범위 밖이며, KV 축 Seam(EngineCommand `KvEvict*`/`KvQuantDynamic` → OneShot KV Stage)은 EvictionStage(β-3)가 이미 선례를 확립했다. ADR-0006 정오 불필요(§Spec triage 결론). KV evict 가 `KvEvictStage`(technique-api plan-returning) 결정층을 거치지 않고 directive→OneShot 직결인 것과 동형으로, KvQuantDynamic 의 결정은 *항등*(directive bits → 그대로 모든 layer 에 fan-out, method-drop 같은 정책 변환 없음)이라 plugin 결정층 없이 dispatcher 가 직접 `KiviQuantStage::one_shot` 을 submit 한다.
+
+#### 5.7.1 접근 모델 — 대안 비교 + 확정
+
+AB-2 의 핵심 설계 결정은 **KiviForward 가 transition_bits 를 적용할 KIVI cache handle 에 Stage 가 어떻게 도달하는가**다. 현 KiviForward 는 owned `Vec<KiviCache>` 를 보유하고 매 prefill/step 마다 `mem::take`→`Arc<KIVIFormat>` 신규 wrap→forward→`Arc::try_unwrap().into_inner()`(외부 clone 존재 시 **panic**)로 왕복한다(kivi_forward.rs:159-203/219-261). 이 transient-wrap 모델에서는 Stage 가 cache 를 가리킬 영속 handle 이 없다(매 step 새 Arc).
+
+| 대안 | 골자 | 장점 | 단점 | 판정 |
+|---|---|---|---|---|
+| **status quo** | `control.kv_quant_bits` set + 소비자 0 | 변경 0 | KvQuantDynamic = silent no-op(directive 무효). v1 등가(transition_bits 호출) 미달성. G1 quant 트랙 미이전 — AB 골격("LoopControl 필드 → Stage 이전 + 필드 삭제") 미충족 | **기각** |
+| **B안 (Forward seam)** | `Forward` trait 에 `try_kv_quant(bits)` 기본 no-op 추가, KiviForward override(`self.kv_caches[i].transition_bits(bits)`), driver 가 `control.kv_quant_bits` 소비(decode_loop 의 `try_offload` 소비 동형) | 최소 diff. transient-wrap 존속(KiviForward 무구조변경) | deprecated `LoopControl.kv_quant_bits` 필드 **존속** — AB 공통 골격("필드 삭제") 미달, AB-2 만 Stage 미이전 트랙으로 잔존. `Forward` trait 표면 확장(새 method). PipelineStage 모델과 분기(eviction/partition/swap 은 Stage, quant 만 Forward seam) | **기각** |
+| **A안 (handle Arc화 = ModelForward 5-F 동형)** | KiviForward 를 ModelForward(model_forward.rs:73-76 `fmt_caches: Option<Vec<Arc<StandardFormat>>>`) 와 동형 전환: `new()` 에서 persistent `Vec<Arc<KIVIFormat>>` 1회 wrap(`ensure_kivi_wrapped`), prefill/step 은 Arc clone 만으로 dyn fmts 구성(per-step 할당 댄스 제거), `kivi_caches()` getter 노출. Stage 는 register 시점 handle clone 보유(EvictionStage 동형). transition_bits 적용은 `KIVIFormat::with_cache_mut`(StandardFormat L65 동형 신규 접근자) | **AB 골격 완전 충족**(LoopControl 필드 삭제 + Stage 이전). EvictionStage/PartitionStage/WeightSwapStage 와 INV-STAGE-LAYER-HANDLE 동형(held-handle). transient-wrap 댄스 + per-step Arc 할당 + `try_unwrap` panic 위험 제거(부수 정리). PipelineStage 모델 일관(KV/weight 全 directive = Stage) | **확정** |
+
+**확정 = A안 (handle Arc화).** 사용자 위임 기준("더 확장성 있고 기존 프로젝트와 일관된 방식")에 정합한다:
+- **일관성**: ModelForward 가 이미 `fmt_caches` 1회 wrap + getter 노출 모델로 수렴(5-F, β-3)했고, EvictionStage 가 그 handle 을 register 시점 보유한다(INV-STAGE-LAYER-HANDLE). KiviForward 만 transient-wrap 잔재로 남아 있는데, A안은 이를 ModelForward 와 동형으로 수렴시켜 **양 Forward 가 동일 held-handle 패턴**을 갖는다. EvictionStage(StandardFormat)·KiviQuantStage(KIVIFormat) 가 같은 register-handle 구조를 공유한다.
+- **확장성**: persistent Arc handle 은 KIVI 경로의 **후속 KV Stage 해금**(eviction/swap 등 — 현 KiviForward 는 `on_kv_prune` no-op 으로 eviction 미지원, D4)의 전제다. transient-wrap 은 매 step 새 Arc 라 어떤 Stage 도 cache 를 영속 가리킬 수 없다. A안이 KIVI 경로를 PipelineStage 모델에 정식 편입한다.
+- **부수 이득**: `Arc::try_unwrap().into_inner()` 의 "external Arc clone → panic" 위험(kivi_forward.rs:200/258)이 제거된다(영속 Arc 라 unwrap 자체 소멸). per-step `mem::take`+wrap+unwrap 할당 댄스(layer당 1 Arc 신규/소멸 × 매 step) 제거로 미세 perf 개선(happy-path Standard 무영향 — A안은 KiviForward 만 건드림).
+
+**A안 비용/리스크.**
+- KiviForward 구조 변경(필드 `kv_caches: Vec<KiviCache>` → `kivi_caches: Option<Vec<Arc<KIVIFormat>>>`)은 KiviForward 내부 4 메서드(prefill/step/reset_kv/kv_caches_mut)에 ripple. `KIVIFormat` 에 `with_cache_mut`(StandardFormat L65 verbatim 동형) + `kivi_caches()` getter 추가.
+- **eval 경로 무영향**(census 확정): eval_setup.rs:655/ppl/runner.rs:287/eval/kivi_hook.rs 는 **자기 소유 `Vec<KiviCache>` 를 독립 transient wrap** 하므로 KiviForward 의 내부 모델 변경과 무관하다(KiviForward 를 경유하지 않음). `kv_caches_mut()` 소비자 = KiviForward 내부뿐(외부 0, census). getter 명을 `kivi_caches()`(영속 Arc 노출)로 전환해도 외부 호출처 부재.
+- **`KIVIFormat::new` 는 이미 `Mutex<KiviCache>`**(kivi_format.rs:29) — 내부 가변성 보유. `with_cache_mut` 접근자만 추가하면 `&self` 로 transition_bits 도달(StandardFormat 동형, 신규 lock 비용 = cold path 라 무관).
+
+#### 5.7.2 KiviQuantStage 정의
+
+| 항목 | 결정 | 근거 |
+|---|---|---|
+| **거주지** | `engine/src/stages/kv/kivi_quant.rs` (신규 파일, no-`mod.rs` 규칙 C) | **KV 축** Stage — EvictionStage(`stages/kv/eviction.rs`)와 형제(둘 다 KV 도메인, 규칙 B). partition/swap(`stages/weight/`)이 아니다 — quant 는 KV cache 표현 변경이지 weight 변경이 아니다 |
+| **lifecycle** | `OneShot` | directive 1회 = transition 1회 = GC 1회. EvictionStage::one_shot 동형. sticky 재적용 방지(같은 bits 무시)는 dispatcher 의 last-applied 게이트(§5.7.3)가 담당 — Stage 자체는 발화 후 무조건 `Consumed` |
+| **보유 handle** | `Vec<Arc<KIVIFormat>>` (concrete-handle, §3.4) + `target_bits: u8` | register 시점 `kivi_forward.kivi_caches().to_vec()`. EvictionStage 의 `Vec<Arc<StandardFormat>>` 동형(INV-STAGE-LAYER-HANDLE). **CacheManager 불요** — transition 은 정책(eviction policy)이 아니라 직접 bit-width 전환(KiviCache 가 backend 를 자체 보유, alloc 시 주입). `KIVIFormat::with_cache_mut(&self)` 가 `Mutex<KiviCache>` interior-mutate 라 `&self` Stage 가 transition 가능(EvictionStage 의 `Mutex<CacheManager>` 와 달리 추가 Mutex 불요 — KIVIFormat 이 이미 Mutex 보유) |
+| **구독 phase** | `KvMutate` | KV 구조 변경 윈도우(EvictionStage 와 동일 phase). transition 은 KV 내용 변경(dequant→requant)이라 forward 가 읽기 전 완료돼야 하는데, `KvMutate`(command-poll 직후·forward 직전, eviction 슬롯)가 정확히 그 윈도우다(§5.7.4 근거). PreForward(partition 슬롯)도 후보였으나 **KvMutate 채택** — KV mutation 은 KV phase 에서(도메인 정합), partition 의 PreForward 는 weight plan 준비 성격이라 슬롯이 다르다 |
+| **self-filter** | `if *phase != KvMutate { return Continue }` | EvictionStage 의 `KvMutate` self-filter(eviction.rs:142) verbatim 동형 |
+| **반환** | `Consumed` (발화 후) | OneShot GC. **pos-환류 없음**(eviction 과 달리 quant 는 KV bit-width 만 바꾸고 토큰 수·pos 불변) → `StageOutcome` 무변경(§5.2.1 (가) 단순화 — driver 후처리 0, partition/swap 과 동일) |
+| **transition 본문** | `for h in &self.handles { h.with_cache_mut(|c| c.transition_bits(self.target_bits))?; }` + 로그 (§5.7.5) | v1 등가 anchor = `generate.rs`(d5ed71d2^) L4392-4407 의 `for cache in kv_caches.iter_mut() { cache.transition_bits(bits) }` loop. `transition_bits`(kivi_cache.rs:1034)는 2/4/8/16 양방향, GPU/CPU 모두 지원, no-op if same bits |
+
+**dispatch tier.** KiviQuantStage 는 step-tier(1×/token, 단 OneShot 이라 실 발화 1회)라 `Box<dyn>`/`Arc<dyn>` 자유(`INV-HOTPATH-DISPATCH`). transition 자체(`KiviCache::transition_bits` = dequant→requant)는 boundary/cold tier(전환은 directive 도착 시 1회, decode hot path 아님)라 dyn·할당 자유. **forward hot path 에 dyn 추가 0** — KIVI forward 경로(kivi_format `attention_into` / KiviCache `assemble_view_gpu`)는 transition 후 bit-width 가 바뀐 cache 를 정적으로 읽을 뿐 Stage 를 경유하지 않는다. v1 의 `gpu_plan = None` 무효화는 **v2 KiviForward 무관**(KiviForward 는 plan path 미사용 — kivi_forward.rs:3 주석 "plan path 를 제외한다") → transition 후 plan 무효화 불필요(v1 census 명시).
+
+#### 5.7.3 dispatcher 변경 — `submit_kv_quant` + sticky last-applied 게이트
+
+`KvQuantDynamic` arm 을 **② LoopControl deprecated 필드**(`kv_quant_bits: Option<u8>`, command_dispatcher.rs:108 — set 후 decode_loop 소비자 0)에서 **① submit 분류**로 이동한다. `LoopControl.kv_quant_bits` 필드를 삭제한다(write-only dead-end 소멸 — partition `partition_ratio`·swap `swap_weights` 필드 삭제와 동형).
+
+```text
+EngineCommand::KvQuantDynamic { target_bits } => self.submit_kv_quant(*target_bits),
+```
+
+```text
+fn submit_kv_quant(&mut self, target_bits: u8):
+    if self.last_quant_bits == Some(target_bits) { return }   // 값 무변경 → 재submit 0 (sticky 핵심)
+    if self.kivi_handles.is_empty() { return }                 // 미구성(non-KIVI: Standard/Offload) — directive 무시
+    self.last_quant_bits = Some(target_bits)
+    let stage = KiviQuantStage::one_shot(self.kivi_handles.clone(), target_bits)
+    self.registry.submit(Arc::new(stage))
+```
+
+**sticky 시맨틱 = last-applied 비교 게이트** (evict 의 `evict_armed` edge-trigger 복사 **금지**, handoff landmine 5). v1 census(`generate.rs`(d5ed71d2^) L4392 `kivi_last_quant_bits != Some(bits)`):
+- v1 sticky = `kivi_last_quant_bits: Option<u8>` 가 매 step `plan.kv_quant_bits` 와 비교 → **다를 때만** transition_bits + `kivi_last_quant_bits = Some(bits)`. 같은 bits 반복 directive 는 no-op(transition_bits 가 same-bits 면 자체 no-op 이기도 하나, v1 은 guard 로 loop 진입 자체 차단 = 비용 절감). v2 는 dispatcher 의 `last_quant_bits` 비교로 **값 변경 시에만 submit** — v1 등가(비용 절감 + 산출 동일).
+- **partition `last_partition_ratio` 게이트와 정확히 동형**(AB-4 §5.5.2). quant 도 *값이 곧 상태*(어떤 bit-width 인지)라 **값 비교**가 정확한 게이트다(bool armed 복사 시 "4bit → 8bit 변경" 무시 버그). last-applied vs armed 차이는 §5.5.2 landmine 박스 참조(동일 논리).
+- **RestoreDefaults = guard clear 만** (`self.last_quant_bits = None`) — **16bit 복귀 transition 없음**(v1 등가 유지). v1 census(`generate.rs`(d5ed71d2^))는 RestoreDefaults 에서 `kivi_last_quant_bits = None` 만 하고 16bit 로 되돌리는 transition_bits 호출이 **없다**. partition 의 `submit_partition_full`(Full 복원 OneShot submit)과 **비대칭** — quant 는 RestoreDefaults 가 guard 만 클리어해 다음 KvQuantDynamic 이 어떤 bits 든 재적용 가능하게 한다(재무장), 16bit 복원 submit 은 없다. 근거: v1 등가 보존(RestoreDefaults 는 transition 역방향을 트리거하지 않음 — verify YAML `direct_cmd_kvquant_restore.yaml:29` 는 `RestoreDefaults|Restored` marker 만 검사하고 "16bit 로 transition" 로그를 요구하지 않는다).
+
+> **partition `submit_partition_full` 와의 비대칭 (landmine)**: partition RestoreDefaults 는 GPU-only(Full) 복원 OneShot 을 submit 했으나(v1 이 partition 을 GPU-only 로 되돌림), quant RestoreDefaults 는 **guard clear 만**(16bit 복원 submit 없음). v1 등가가 다르기 때문 — partition v1 은 RestoreDefaults 에서 re-split 했고, quant v1 은 guard 만 None 으로 뒀다. partition 의 `submit_partition_full` 패턴을 quant 에 복사 금지. (RestoreDefaults arm 의 `self.control.kv_quant_bits = None`(command_dispatcher.rs:282)은 필드 삭제로 사라지고, `self.last_quant_bits = None` 으로 대체된다.)
+
+#### 5.7.4 발화 phase 근거 — `KvMutate` (PreForward 기각)
+
+transition_bits 는 KV cache 내용 변경(dequant→requant)이라 **두 phase 가 후보**였다:
+- **KvMutate**(eviction 슬롯, decode_loop.rs:330 — command-poll 직후·forward 직전): KV mutation phase. EvictionStage(KV 토큰 prune)와 같은 슬롯.
+- **PreForward**(partition 슬롯, forward 직전): plan 준비 성격 슬롯. PartitionStage(weight re-slice)가 여기.
+
+**KvMutate 확정.** 근거:
+1. **도메인 정합**: quant 는 KV cache 표현 변경이라 KV mutation phase(`KvMutate`)가 정직한 슬롯이다 — EvictionStage 와 동일 도메인(둘 다 KV cache 를 mutate). PreForward 는 weight plan 준비 성격(partition re-slice 후 forward 가 읽음)이라 KV mutation 의 슬롯이 아니다.
+2. **타이밍 충분**: `KvMutate` 는 forward 직전이라 transition 후 forward 가 바뀐 bit-width cache 를 읽기 전 완료가 보장된다(eviction 이 같은 슬롯에서 KV 를 prune 한 뒤 forward 가 읽는 것과 동형). PreForward 도 타이밍은 충족하나 도메인 부정합(KV mutation 을 weight 슬롯에서 발화).
+3. **pos 불변**: transition 은 pos 를 바꾸지 않으므로(토큰 수·위치 불변, bit-width 만 변경) eviction 의 pos-환류 윈도우와 충돌하지 않는다 — KvMutate 슬롯에서 eviction(있다면)과 quant 가 같은 phase 에 발화해도 순서만 통합자(build_bench_loop)가 정하면 안전(INV-DECODE-STAGE-005). 현 KIVI 경로는 eviction 미지원(D4)이라 KvMutate 에 KiviQuantStage 만 발화.
+
+**dead variant 부활 금지** (handoff landmine): PreSwap/PostSwapBefore/PostSwapAfter 3종은 AB-6 rename(§5.6.5)에서 삭제됐다. KiviQuantStage 는 현 enum(pipeline.rs:168) 의 `KvMutate`(구 PreEviction)를 구독하며 **새 phase variant 를 추가하지 않는다**(INV-DECODE-STAGE-001 canonical 목록에 `KvMutate` 이미 포함 — 새 phase 0).
+
+#### 5.7.5 로그 계약 (verify YAML marker — 글자단위 재현)
+
+v1 등가 anchor(`generate.rs`(d5ed71d2^) L4406)의 transition 로그를 byte-identical 재현해야 한다. verify 시나리오 2종이 이를 regex marker 로 검사한다(handoff landmine 5):
+- `direct_cmd_kvquant_to_q4.yaml:26`: `\[KIVI-Resilience\] Transitioned KV cache to 4bit` (stderr_patterns)
+- `direct_cmd_kvquant_restore.yaml:28`: `\[KIVI-Resilience\] Transitioned KV cache to 4bit` (stderr_sequence, name=to_q4)
+
+**신규 발화 라인 명세** (KiviQuantStage::run_kivi_quant 본문):
+```text
+for h in &self.handles:
+    h.with_cache_mut(|c| c.transition_bits(self.target_bits))   // Err 시 eprintln!("[KIVI-Resilience] transition_bits({}) error: {}", bits, e) 후 continue (v1 등가)
+eprintln!("[KIVI-Resilience] Transitioned KV cache to {}bit", self.target_bits)   // ← marker 라인
+```
+- **글자단위 정합**: `target_bits=4` 일 때 `[KIVI-Resilience] Transitioned KV cache to 4bit` 출력 → regex `\[KIVI-Resilience\] Transitioned KV cache to 4bit` 정확 일치. `{}`(Display) u8 출력은 `4`(접미사 없음) → `4bit` 글자단위 일치. **v1 anchor L4406 의 `"[KIVI-Resilience] Transitioned KV cache to {}bit"` 포맷 문자열 verbatim 복사 필수**.
+- **에러 경로(v1 등가)**: v1(L4393-4395)은 `transition_bits` Err 시 `eprintln!("[KIVI-Resilience] transition_bits({}) error: {}", bits, e)` 후 loop 계속(다음 layer). KiviQuantStage 도 동일 — Err 를 `?` 로 전파하지 않고(fail-fast panic 회피) 로그 후 continue, 전체 loop 후 marker 라인 1회 출력. **EvictionStage 의 `force_evict` Err→`?`→panic 과 카테고리 다름** — transition 실패는 *구성/타이밍 조건*(특정 layer 의 cast 실패 등)이지 프로그래밍 오류가 아니므로 WeightSwapStage reject(§5.6.2 graceful no-op)와 동일 카테고리(graceful continue).
+
+> **글자단위 정합 확인 의무 (Implementer/Tester)**: verify YAML 이 글자단위 계약이므로 **AB-2 device 게이트 실행 전 로그 라인 실측 매칭 1회 검증** 필수(AB-4 §5.5.6 landmine 동형). marker 미일치 시 verify functional FAIL.
+
+#### 5.7.6 heartbeat `kv_dtype` 보고 — AB-2 포함 (비용 평가 결과)
+
+`direct_cmd_kvquant_to_q4.yaml:27-30` 이 heartbeat `kv_dtype` 필드가 `q4` 로 transition 됨을 `required:true` 로 검사한다(`heartbeat_checks`). v1 은 KVSnapshot.kv_dtype(shared/src/lib.rs:347 필드 존재)로 보고했으나, **v2 ResilienceAdapter(resilience_adapter.rs:72 `build_kv_snapshot`)는 partial snapshot**(`total_tokens`/`capacity` 만, `kv_dtype` 는 default `""`)이다. `direct_cmd_kvquant_to_q4.yaml` 은 `pass_criteria: functional_only` 이나 `kv_dtype` 검사가 `required:true` 라 **AB-2 포함이 정합**하다.
+
+**판정 = AB-2 포함**(이연 시 AB-5 잔여로 명기할 수도 있으나, marker 가 `required:true` 라 미포함 시 해당 시나리오 functional FAIL → AB-2 자체가 불완전). 비용:
+- ResilienceAdapter 가 layer-0 KIVIFormat handle 의 현재 bit-width 를 query 하는 seam 추가. 현 `set_kv_handle(Arc<dyn KVCacheFormat>)`(resilience_adapter.rs:44)는 `current_pos`/`capacity` 만 query(base trait). bit-width 는 base trait 표면에 없다 — **KIVIFormat concrete query 필요**(`KIVIFormat::current_bits()` 류) 또는 KVSnapshot 구성 시점에 bits 주입 seam.
+- **최소 접근**: dispatcher 가 transition 적용 시점(submit_kv_quant)에 `last_quant_bits` 를 알고 있으므로, ResilienceAdapter 가 이 값을 받아 `kv_dtype` 문자열(`bits→dtype` 매핑: 4→"q4", 8→"q8", 2→"q2", 16→"f16")로 KVSnapshot 에 채우는 seam. 또는 build_kv_snapshot 가 layer-0 KIVIFormat handle 에서 `current_bits()` query 후 매핑. **Implementer 가 두 seam 비용 비교 후 택1**(dispatcher→adapter 값 전달 vs adapter→handle query) — adapter 가 이미 held-handle query 모델(§5.2.1 (가))이므로 후자(handle query)가 패턴 정합.
+
+> **이연 시 명기 의무**: 만약 device 게이트에서 `kv_dtype` 보고 seam 이 범위 폭증(KVSnapshot 전면 재배선 등)으로 판명되면, **AB-5 잔여로 분리**하고 `direct_cmd_kvquant_to_q4.yaml` 의 `heartbeat_checks` 를 한시적 `required:false` 로 완화하는 것을 Tester 와 협의. 단 1차 목표는 **AB-2 포함**(handle query seam = adapter 패턴 정합, 최소 비용 추정).
+
+#### 5.7.7 bench KIVI 분기 (검증 수단 — 사용자 확정)
+
+검증 수단 = **argus_bench KIVI 분기**(argus-chat bin화 기각, 사용자 확정 2026-06-11). `bin_setup`/`build_bench_loop` 에 `KvMode::Kivi` 분기를 신설한다.
+
+| 가드/배선 | 현 상태 | AB-2 변경 |
+|---|---|---|
+| `argus_bench.rs:103` (`reject_unsupported_modes_ab0`) | `!matches!(effective_kv_mode(), KvMode::Standard)` → bail "KIVI/Offload land in AB-2/AB-3" | **Kivi 만 해제**(Offload bail 유지): `!matches!(.., KvMode::Standard \| KvMode::Kivi)` |
+| `build_bench_loop`(build_bench_loop.rs:191) | `ModelForward`(Standard) 강결합 — `kv_caches: Vec<KVCache>` 소비, `mf.fmt_caches()` 로 handle 추출 | **KIVI 분기 필요** — `KiviForward` 는 `Vec<KiviCache>` 소비, dispatcher 에 `kivi_handles` 주입. build_bench_loop 가 `ModelForward` 에 강결합돼 있어 KIVI 는 별 조립 경로 필요(§아래) |
+
+**KIVI 진입 시맨틱 (v1 census, `generate.rs`(d5ed71d2^) L744-760 재현).** `bin_setup` 이 `effective_kv_mode()`/flag 로 KIVI cache 를 구성한다:
+- `--kv-mode kivi` → `initial_bits = --kv-kivi-bits`(kv_mode.rs:19, default 2), `residual = --kv-kivi-residual-len`(kv_mode.rs:23, default 128).
+- `--kv-dynamic-quant`(cli.rs:634, 현재 orphan flag) → `initial_bits = 16`(residual-only, F16 등가 진입), `residual = (max_seq_len/32)*32`. **verify YAML baseline 이 `--kv-dynamic-quant` 로 진입**하므로(`direct_cmd_kvquant_to_q4.yaml:14`) 이 시맨틱 재현 필수 — F16 KV 로 시작 후 KvQuantDynamic{4} directive 로 Q4 전환.
+
+**조립 경로.** 선례:
+- KIVI cache alloc = `alloc_kivi_kv_caches`(kivi_forward.rs:322) — `caps.get::<dyn KiviAttentionBackend>()` pull(R3 불변식: OpenCL backend 면 `Some` 필수, init.rs 가 register). build_bench_loop KIVI 분기가 이 caps pull 도달 가능해야 함.
+- KiviForward 생성 recipe = `build_chat_kivi`(chat/session.rs:491, orphan — chat 전용, dispatcher/registry 무배선) 참고하되, **build_bench_loop 는 dispatcher/registry/resilience 배선이 필요**하므로 build_chat_kivi 를 그대로 재사용 불가. KIVI 용 build 함수(`build_bench_loop_kivi` 또는 build_bench_loop 내부 분기)가 KiviForward + KiviQuantStage 배선을 수행.
+- **`build_bench_loop` 의 ModelForward 강결합 (non-local 변경 경고)**: 현 build_bench_loop(L231)는 `ModelForward::new` 를 직접 호출하고 `mf.fmt_caches()`/`mf.model().layers` 로 handle 을 뽑는다. KIVI 는 `KiviForward::new` + `kivi.kivi_caches()` 경로라 **별 분기 또는 별 함수**가 필요하다. Implementer 가 (가) build_bench_loop 에 `KvMode` 분기 추가 vs (나) `build_bench_loop_kivi` 신설 중 택1 보고. EvictionStage/PartitionStage/WeightSwapStage 배선(dispatcher 구성)은 Standard 와 공유하되, KIVI 는 **KiviQuantStage 만 활성**(아래 stage 배선 범위).
+
+**KIVI 분기 stage 배선 범위 (명시 결정).** v1 은 KIVI 경로에서 offload no-op·eviction 미지원이었다(`on_kv_prune` no-op, D4). 따라서 KIVI 분기 dispatcher 는:
+- **활성**: control 디렉티브(Throttle/SetTargetTbt/Suspend/Resume/RestoreDefaults 등 — KV/weight 무관 loop 제어) + **KvQuantDynamic(KiviQuantStage)**.
+- **inert**: 표준 전용 stage(EvictionStage/PartitionStage/WeightSwapStage)는 KIVI 분기에서 **미배선 또는 빈 handle**. eviction 은 `kv_handles`(StandardFormat) 가 KIVI 경로엔 부재 → CM=None 또는 빈 handle 로 inert(evict CM=None 동형). partition/swap 도 KIVI 경로에서 미배선(`layer_slots` 는 weight 라 공유 가능하나 KIVI 는 partition/swap 검증 범위 밖 — 빈 또는 inert). 최소 = **control + KvQuantDynamic 만 소비, 나머지 inert**.
+
+> **host smoke 불가** (handoff landmine 6): KIVI GPU 경로(kivi_format `attention_native`/kivi_cache `update_gpu`)는 OpenCL 필수 — host(GPU 부재)는 CPU KiviCache(`new_with_bits`)로 fallback 되나 transition_bits 자체는 CPU 모드도 지원(kivi_cache.rs:1034 양방향)이라 **dispatcher sticky 단위테스트 + transition_bits 등가 + CLI parse 까지 host 검증**. 실 KIVI decode·로그 marker·heartbeat·정확성 = device(S25) 필수.
+
+#### 5.7.8 배선 (CommandDispatcher::new + build_bench_loop KIVI 분기)
+
+`CommandDispatcher` 에 quant handle 추가(현 evict `kv_handles` + partition `layer_slots` + swap `swap_runtime` 옆):
+- `kivi_handles: Vec<Arc<KIVIFormat>>` = KIVI 분기에서만 비-빈(`kivi_forward.kivi_caches().to_vec()`). Standard/Offload 경로는 **빈 Vec** → `submit_kv_quant` 가 빈 handle 이면 inert(evict CM=None·partition 빈 layer_slots 동형 — directive 무시).
+- `last_quant_bits: Option<u8>` = sticky last-applied 게이트(§5.7.3). `new()` 에서 `None` 초기화.
+- **`CommandDispatcher::new` 시그니처에 `kivi_handles: Vec<Arc<KIVIFormat>>` 인자 1개 추가**(현 8-arg → 9-arg). Standard/Offload 호출처는 빈 Vec 전달. KIVI 호출처(build_bench_loop KIVI 분기)는 `kivi.kivi_caches().to_vec()` 전달.
+
+> **non-local 변경 경고**: `CommandDispatcher::new` 인자 추가는 모든 호출처(build_bench_loop Standard 분기 + KIVI 분기 + 단위테스트 `make_dispatcher`) ripple. evict `kv_handles` 가 이미 dispatcher 로 흐르는 패턴이라 handle 추가 자체는 국소이나, KIVI 분기 조립(build_bench_loop ModelForward 강결합 우회)은 신규. 과도기 등가 테스트(command_dispatcher.rs:775+ "quant sticky")는 **Stage 모델로 승계**(§5.7.9).
+
+#### 5.7.9 과도기 등가 테스트 승계
+
+현 과도기 테스트 2종(command_dispatcher.rs:777-804)을 Stage 모델로 승계한다(LoopControl 필드 삭제로 단언 변경):
+- `transitional_fields_equivalence`(L777): `assert_eq!(c.kv_quant_bits, Some(4))`(L789) + `assert_eq!(c2.kv_quant_bits, Some(4), "quant sticky")`(L793) — **LoopControl.kv_quant_bits 삭제로 이 단언 제거**. 대신 partition/swap 선례(L780-782 주석 "OneShot Stage submit 으로 이전됨")처럼 KvQuantDynamic 도 Stage submit 으로 이전 명기 + 잔존 과도기 필드(offload/layer_skip)만 단언. quant sticky 등가는 신규 테스트(`quant_sticky_resubmits_on_value_change` 류 — partition `partition_sticky_*` 선례 동형)가 승계: `submit_kv_quant(4)` 후 registry 에 1 stage, 같은 4 재submit 시 0 추가, 8 submit 시 1 추가, RestoreDefaults 후 last=None 재무장.
+- `restore_defaults_clears_sticky_quant`(L797): `assert_eq!(c.kv_quant_bits, None)`(L802) — LoopControl 필드 삭제로 변경. RestoreDefaults 후 `last_quant_bits == None`(dispatcher 내부 상태) 직접 단언 또는 다음 KvQuantDynamic{8} 이 재submit 됨(재무장)으로 등가 검증. **16bit 복원 submit 부재** 단언 추가(partition `submit_partition_full` 과 비대칭 — RestoreDefaults 가 quant stage 를 submit 하지 *않음* 확인).
+
+beta4 매핑표(`arch/beta4_command_channel_mapping.md`) §1.3 #12 행 + §1.5 #10 행을 AB-2 완료로 갱신(§아래 동기화).
 
 ---
 
