@@ -1253,6 +1253,15 @@ def _run_scenario_adb_signal(
     # we can interleave the ExternalMonitor bind wait and signal_client start.
     action_pidfile_remote = f"{remote_run_dir}/engine.pid"
     action_rc_remote = f"{remote_run_dir}/engine.rc"
+    # AB-5 root-cause fix: remote_run_dir has NO model key, so the second
+    # model of the same verify process (same os.getpid()) reuses the dir and
+    # the rc-poll instantly reads the FIRST model's engine.rc ("=0 after
+    # 0.0s") → prefill-truncated stderr pull while the engine keeps decoding.
+    # Clear stale sentinel files before spawning this model's engine.
+    remote.exec(
+        f"rm -f {shlex.quote(action_rc_remote)} {shlex.quote(action_pidfile_remote)}",
+        timeout=10.0,
+    )
 
     t1 = time.monotonic()
     signal_proc = None
