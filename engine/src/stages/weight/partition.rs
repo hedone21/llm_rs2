@@ -56,8 +56,24 @@ impl PartitionStage {
     /// partition 활성(`!is_gpu_only_ratio`) 시 최초 1회 lazy host-map(weight 가 CPU companion
     /// matmul 에 host pointer 를 제공하도록, §5.5.4) 후 re-slice. 이미 host-mapped 인 weight 는
     /// `map_weight_for_host` 가 no-op(changed=false) 이라 반복 호출이 안전하다(OneShot 이라 실 1회).
+    ///
+    /// disable(`ratio <= 0.0`)은 legacy(`generate.rs:2730-2745`) 동형 — partition_ctx 클리어
+    /// (`LayerDispatch::Full` fan-out) + `[Partition] Disabled (ratio={})`. `ratio >= 1.0` 은
+    /// `apply_partition_dispatch` 의 GPU-only fast path 가 이미 Full 로 클리어한다.
     fn run_partition(&self) -> anyhow::Result<()> {
         use crate::layers::tensor_partition::is_gpu_only_ratio;
+
+        // Disable: ratio<=0.0 → partition off (partition_ctx 클리어). legacy 와 달리
+        // ratio>=1.0 은 apply_partition_dispatch 의 GPU-only fast path 가 처리하므로 여기선
+        // ratio<=0.0 만 별도 disable 로그. host-map 불필요(CPU 측 미사용).
+        if self.gpu_ratio <= 0.0 {
+            use crate::format::weight_format::{LayerDispatch, WeightFormat};
+            for slot in &self.slots {
+                slot.apply_dispatch(LayerDispatch::Full, &self.hw)?;
+            }
+            eprintln!("[Partition] Disabled (ratio={})", self.gpu_ratio);
+            return Ok(());
+        }
 
         // partition path(비 GPU-only)는 weight 가 host-accessible 이어야 한다.
         // CLI 정적 경로는 init.rs 에서 미리 map 하나, 런타임 directive 경로는 여기서 lazy map.
@@ -253,5 +269,37 @@ mod tests {
             );
         }
         let _ = DType::F32;
+    }
+
+    /// disable(ratio=0.0): 설치된 partition_ctx 를 클리어 + Consumed (legacy Disabled 동형).
+    #[test]
+    fn ratio_zero_disables_partition() {
+        let be = cpu_backend();
+        let hw = cpu_only_hardware(&be);
+        let s = slots(&be, 2);
+
+        // 먼저 partition 설치 (ratio=0.5).
+        let install = PartitionStage::one_shot(s.clone(), Arc::clone(&hw), 0.5);
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        install
+            .on_phase(&LifecyclePhase::PreForward, &mut ctx)
+            .unwrap();
+        for slot in &s {
+            assert!(slot.load_weights().partition_ctx.is_some(), "설치 확인");
+        }
+
+        // ratio=0.0 → disable (partition_ctx 클리어).
+        let disable = PartitionStage::one_shot(s.clone(), Arc::clone(&hw), 0.0);
+        let outcome = disable
+            .on_phase(&LifecyclePhase::PreForward, &mut ctx)
+            .unwrap();
+        assert!(matches!(outcome, StageOutcome::Consumed));
+        for slot in &s {
+            assert!(
+                slot.load_weights().partition_ctx.is_none(),
+                "ratio=0.0 → partition_ctx 클리어 (Disabled)"
+            );
+        }
     }
 }

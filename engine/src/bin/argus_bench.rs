@@ -55,15 +55,15 @@ fn main() -> anyhow::Result<()> {
 
 /// AB-1 bench 지원 args 가드. [`is_standard_happy_path`](llm_rs2::session::is_standard_happy_path)
 /// 와 동일하되 **eviction_policy != "none" 을 허용**한다 (resilience eviction은
-/// `build_bench_loop` 가 처리). 아직 미지원인 skip / d2o-layer-alloc / qcf /
-/// profile / tensor_partition / weight-swap 은 그대로 차단.
+/// `build_bench_loop` 가 처리). AB-4: `tensor_partition > 0` 도 허용(PartitionStage
+/// + `build_bench_loop` 배선). 아직 미지원인 skip / d2o-layer-alloc / qcf / profile /
+/// weight-swap 은 그대로 차단.
 fn bench_supported(args: &Args) -> bool {
     args.qcf_dump.is_none()
         && args.skip_ratio.unwrap_or(0.0) == 0.0
         && !args.d2o_layer_alloc()
         && !args.profile
         && !args.profile_events
-        && args.tensor_partition == 0.0
         && !args.swap_intra_forward
         && !args.swap_layer_immediate
         && !args.swap_phase_aware
@@ -115,8 +115,6 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
     if args.profile || args.profile_events {
         bail!("argus-bench AB-0: --profile / --profile-events not yet supported");
     }
-    if args.tensor_partition > 0.0 {
-        bail!("argus-bench AB-0: --tensor-partition lands in AB-4");
-    }
+    // AB-4: --tensor-partition 해제 — PartitionStage + build_bench_loop 배선 완료.
     Ok(())
 }
