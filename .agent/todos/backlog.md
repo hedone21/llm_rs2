@@ -1093,7 +1093,7 @@
 - **Notes**: lint 동작은 정상(33d5bc8f). 주석 정오만. 담당 권장: Implementer.
 
 ## [P2] QCF estimate 역방향 IPC v2 재배선 — 2026-06-11 등록
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-11 당일)** — 설계 `bf6230e8`(arch v2 §5.8) + 구현 `226d154b`(dispatcher 직결 `compute_and_send_qcf` + report_tx 주입 + `LoopControl.request_qcf` 삭제 + v1 lift-and-shift→qcf_runtime.rs) + device-only KV read-back fallback `e267bd50`. S25 실증: thermal f16 GREEN, manager `Engine QCF estimate: N actions` 수신 확인.
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: AB-5 S25 verify 매트릭스 — `signal_thermal_critical_throttle` f16/q4 FAIL의 직접 원인 (Tester triage 2026-06-11)
