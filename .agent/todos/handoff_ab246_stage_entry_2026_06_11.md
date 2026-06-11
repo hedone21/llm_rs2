@@ -3,7 +3,7 @@
 **작성**: 2026-06-11
 **HEAD**: `ecd07549 docs(todo): Phase γ 종결 — γ-4 RESOLVED + generate 분할 부분 해소 + 파생 후속 5건 등록`
 **브랜치**: master (worktree 없음)
-**다음 세션 진입 문장**: **"AB-4 Stage 착수 — handoff_ab246_stage_entry 기준"**
+**다음 세션 진입 문장**: **"AB-4 device 게이트 진행 — handoff_ab246_stage_entry 기준"** (host 단계는 2026-06-11 완료 — 아래 다음 액션 2번 참조)
 **착수 순서 (사용자 확정 2026-06-11)**: **AB-4 → AB-6 → AB-2**
 
 > 본 문서가 AB-2/4/6 재개의 SSOT. 구 계획 `handoff_argus_bench_ab0_ab3_2026_06_05.md` §AB-2/4/6 은
