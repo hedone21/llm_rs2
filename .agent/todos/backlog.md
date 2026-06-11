@@ -1091,3 +1091,21 @@
 - **Description**: `test_inv_layer_005.rs` 주석 헤더가 "generate.rs 한정" 잔존 — 실제 lint 동작은 `L5_PRODUCTION_BINS` 로 기확장됨(commit `33d5bc8f`). 주석만 stale.
 - **Acceptance Criteria**: doc 헤더 주석을 `L5_PRODUCTION_BINS` 기준 동작으로 정정 (코드 동작 무변경 — 주석 only).
 - **Notes**: lint 동작은 정상(33d5bc8f). 주석 정오만. 담당 권장: Implementer.
+
+## [P2] QCF estimate 역방향 IPC v2 재배선 — 2026-06-11 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: AB-5 S25 verify 매트릭스 — `signal_thermal_critical_throttle` f16/q4 FAIL의 직접 원인 (Tester triage 2026-06-11)
+- **Description**: β-7 DecodeLoop 재작성이 v1 report slot(IPC 송출: capability/qcf/swap_report)을 제거한 뒤, capability(connect 시)·swap_report(AB-6 §5.6.6 report_tx)는 재배선됐으나 **QcfEstimate 송출만 미재배선 잔여**. `CommandDispatcher`(:309)가 `request_qcf` 플래그만 set하고 소비처 부재 → QCF-기반 LuaPolicy의 2단계 결정(ThermalAlert→RequestQcf→QcfEstimate→throttle)이 manager 측 `QCF estimate timeout 1.0s`로 끊김. v1은 `compute_qcf_estimates`→`executor.send_qcf_estimate` 경로가 live였음(legacy generate L4373-4388, d5ed71d2^).
+- **Acceptance Criteria**: v2 경로에서 RequestQcf 수신 시 `compute_qcf_estimates` 산출을 `QcfEstimate` IPC로 응답 (AB-6 report_tx 선례 동형 배선) + `signal_thermal_critical_throttle` f16/q4 S25 verify GREEN.
+- **Notes**: 직접 directive 경로(Suspend/Offload/Quant/TargetTbt/Partition/Swap)는 전부 정상 — 영향 범위는 QCF 2단계 정책 경로 한정. verify 매트릭스의 known-fail 2건이 이 항목의 회귀 게이트 역할. 담당 권장: Architect(배선 설계) → Implementer.
+
+## [P2] argus_bench AttentionScoreAccumulator 배선 (AB-1 잔여) — 2026-06-11 등록
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: AB-5 S25 verify — `signal_memory_critical` f16/q4 device FAIL의 잔여 원인 (구 handoff AB-1 landmine "score-driven eviction(AttentionScoreAccumulator) 미장착" 그대로)
+- **Description**: v2 argus_bench(ModelForward)는 `score_accumulator: None`이라 QCF estimates에 h2o/d2o(requires_scores) 액션이 빠짐 → `compute_qcf_estimates`가 sliding 1개만 산출 → manager llm_default policy DPP가 KvEvict 대신 LayerSkip 선택 → 시나리오 기대(`Directive.*KvEvict`) 미충족. v1 4월 PASS run은 `eviction h2o` 구성 시 accumulator가 장착돼 estimates 4 actions → KvEvict.
+- **Acceptance Criteria**: argus_bench에서 score-based eviction policy(`eviction h2o` 등) 구성 시 AttentionScoreAccumulator를 ModelForward forward_into에 배선 + QCF estimates에 kv.evict_h2o/kv.merge_d2o 포함 + `signal_memory_critical` f16/q4 S25 verify GREEN.
+- **Notes**: QCF IPC 자체는 AB-5에서 재배선 완료(§5.8 + device read-back fallback) — 남은 것은 score 공급뿐. 영향 범위 = score 수집이 hot path에 더하는 비용 검토 필요 (v1은 need_scores 조건부). 담당 권장: Architect(배선 지점) → Implementer.
