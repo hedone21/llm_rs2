@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use llm_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
 
 use crate::hardware::Hardware;
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kivi_format::KIVIFormat;
 use crate::kv::standard_format::StandardFormat;
@@ -146,6 +147,12 @@ pub struct CommandDispatcher {
     /// ModelForward 와 동일 cell 을 assembly 가 만들어 양측에 `Arc` clone 으로 넘긴다. swap
     /// 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미 — submit 자체가 안 일어나 무영향.
     hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
+    /// §5.9.1 Track A: score-based eviction 의 attention score accumulator 공유 cell.
+    /// ModelForward(begin_step + 주입) + EvictionStage(read + reset) 와 동일 cell 을 공유한다.
+    /// `compute_and_send_qcf` 에서 active acc 의 `importance_scores()` 를 QCF `token_scores` 로 전달.
+    /// `submit_evict` 에서 EvictionStage 생성 시 score_cell 전달(scored 경로 선택).
+    /// score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미(QCF uniform fallback 유지).
+    score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
     /// ① KiviQuantStage 가 transition 할 KIVI handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
     /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-KIVI: Standard/Offload).
     kivi_handles: Vec<Arc<KIVIFormat>>,
@@ -194,6 +201,9 @@ impl CommandDispatcher {
         report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
         // §5.9.2 Track B: WeightSwapStage 에 넘길 layer-boundary hook cell (ModelForward 공유).
         hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
+        // §5.9.1 Track A: score-based eviction 의 accumulator cell (ModelForward 공유).
+        // score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미.
+        score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
     ) -> Self {
         Self {
             registry,
@@ -207,6 +217,7 @@ impl CommandDispatcher {
             kivi_handles,
             report_tx,
             hook_cell,
+            score_cell,
             control: LoopControl::default(),
             evict_armed: false,
             last_partition_ratio: None,
@@ -374,6 +385,8 @@ impl CommandDispatcher {
     ///
     /// 상태 A/B 등가(2부): `evict_armed` 게이트로 active 구간당 1회만 submit. CacheManager 미구성
     /// (`None`)이거나 handle 이 없으면 no-op(happy/chat 동등 — v1 `cache_manager=None` 분기).
+    /// §5.9.1 Track A: score_cell 이 구성된 경우 `EvictionStage::one_shot_scored` 경로 사용 —
+    /// run_eviction 이 acc.importance_scores() 를 추출해 force_evict_with_scores 호출, 직후 acc.reset().
     fn submit_evict(&mut self, target_ratio: f32) {
         if self.evict_armed {
             return; // 이미 active 구간 내 submit 됨 (재적용 방지 — v1 evict_applied 등가).
@@ -385,7 +398,12 @@ impl CommandDispatcher {
             return;
         }
         self.evict_armed = true;
-        let stage = EvictionStage::one_shot(self.kv_handles.clone(), Arc::clone(cm), target_ratio);
+        let stage = EvictionStage::one_shot_scored(
+            self.kv_handles.clone(),
+            Arc::clone(cm),
+            target_ratio,
+            Arc::clone(&self.score_cell),
+        );
         self.registry.submit(Arc::new(stage));
     }
 
@@ -449,10 +467,20 @@ impl CommandDispatcher {
     ///
     /// `report_tx` 가 `None` 이면 inert(미배선 — resilience-off / host 단위테스트).
     /// `report_tx` 가 `Some` 이면 `compute_qcf_estimates` 로 dry-run 산출 후 `EngineMessage::QcfEstimate` 송출.
-    /// `&self` — query 이므로 mutation 없음.
+    /// §5.9.1 Track A: score_cell 이 active 면 `importance_scores()` 를 `token_scores` 로 전달해
+    /// kv.evict_h2o / kv.merge_d2o 키를 산출한다. `&self` — query 이므로 mutation 없음(acc no-op).
     fn compute_and_send_qcf(&self) {
         let Some(tx) = self.report_tx.as_ref() else {
             return; // 미배선 → inert (drop).
+        };
+        // §5.9.1 Track A: score_cell lock → active acc면 importance_scores() 복사 후 즉시 해제.
+        // 단일 스레드(INV-018) → lock contention 0. 복사 후 guard 해제로 forward 와 lock 충돌 없음.
+        let token_scores_owned: Option<Vec<f32>> = {
+            let guard = self.score_cell.lock().expect("score_cell mutex poisoned");
+            guard
+                .as_ref()
+                .filter(|acc| acc.is_active())
+                .map(|acc| acc.importance_scores().to_vec())
         };
         let ctx = crate::session::qcf_runtime::QcfEstimateContext {
             kv_handles: &self.kv_handles,
@@ -461,6 +489,9 @@ impl CommandDispatcher {
             streaming_config: None,
             importance_table: None,
             num_layers: self.kv_handles.len().max(self.kivi_handles.len()),
+            // §5.9.1 Track A: active score 면 token_scores 전달(h2o/d2o QCF 언블록).
+            // None 이면 기존 uniform fallback 유지(QCF_kv ⊥ QCF_weight 분리 보존).
+            token_scores: token_scores_owned.as_deref(),
         };
         let est = crate::session::qcf_runtime::compute_qcf_estimates(&ctx);
         let _ = tx.send(EngineMessage::QcfEstimate(llm_shared::QcfEstimate {
@@ -562,6 +593,7 @@ mod tests {
             Vec::new(),
             None,                       // report_tx: AB-5
             Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         (d, registry, handle)
     }
@@ -619,6 +651,7 @@ mod tests {
             Vec::new(),
             None,                       // report_tx: AB-5
             Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         (d, registry)
     }
@@ -732,6 +765,7 @@ mod tests {
             Vec::new(),
             None,                       // report_tx: AB-5
             Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         (d, registry)
     }
@@ -763,6 +797,7 @@ mod tests {
             kivi_handles,
             None,                       // report_tx: AB-5
             Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         (d, registry)
     }
@@ -973,6 +1008,7 @@ mod tests {
             Vec::new(),
             None,                       // report_tx: AB-5
             Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
         assert_eq!(registry.len(), 0, "CM 미구성 → evict directive 무시");

@@ -211,6 +211,9 @@ pub fn build_bench_loop(
     // AB-6 §5.6.7: WeightSwapStage 의 swap dispatch 설정 (CLI `--swap`/`--swap-phase-aware-*`
     // normalize 결과). secondary 보유 모델일 때만 `EngineSwapRuntime` 을 구성한다.
     swap_config: SwapWiringConfig,
+    // §5.9.1 Track A: score-based policy(h2o/h2o_plus/d2o) 시 호출자가 생성한 accumulator cell.
+    // 비-score 조립처는 `Arc::new(Mutex::new(None))` 더미를 넘긴다.
+    score_cell: Arc<Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // ADR-0008: decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고
@@ -232,6 +235,10 @@ pub fn build_bench_loop(
     // 양측에 Arc clone 으로 넘긴다. 초기값 None — IntraForward/LayerImmediate commit 이 Some 설치.
     let hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>> =
         Arc::new(Mutex::new(None));
+
+    // §5.9.1 Track A: score_cell 은 호출자(argus_bench 진입부)가 score-based policy 여부를 판단해
+    // 생성 후 전달한다. 비-score 조립처는 `Arc::new(Mutex::new(None))` 더미를 넘긴다.
+
     let mf = ModelForward::new(
         backend,
         memory,
@@ -241,6 +248,7 @@ pub fn build_bench_loop(
         max_seq_len,
         plan_enabled,
         Arc::clone(&hook_cell),
+        Arc::clone(&score_cell),
     )?;
 
     // β-3: pos-환류용 layer-0 fmt handle (§5.2.1 (가)). coercion: Arc<StandardFormat> →
@@ -338,6 +346,8 @@ pub fn build_bench_loop(
             report_tx_for_dispatcher,
             // §5.9.2 Track B: ModelForward 와 공유하는 hook cell (위에서 생성).
             Arc::clone(&hook_cell),
+            // §5.9.1 Track A: ModelForward + EvictionStage 와 공유하는 score cell.
+            Arc::clone(&score_cell),
         ))
     } else {
         None

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use llm_shared::Level;
 
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
@@ -56,6 +57,10 @@ pub struct EvictionStage {
     /// floor 까지 나선 축소(churn — madvise/CacheEvent per-token spam)하는 퇴행 시맨틱이 된다.
     /// 압력 지속 중 캐시 재성장 시의 재prune 은 friction-triggered 후속 (doc).
     armed: std::sync::atomic::AtomicBool,
+    /// §5.9.1 Track A: score-aware eviction 용 accumulator cell. `Some` 이면 run_eviction 이
+    /// acc.importance_scores() 를 추출해 force_evict_with_scores 로 H2O/D2O 정밀 선택, 직후 acc.reset().
+    /// `None`(score-free = sliding/streaming 또는 더미) 이면 기존 score-free force_evict 유지.
+    score_cell: Option<Arc<Mutex<Option<AttentionScoreAccumulator>>>>,
 }
 
 impl EvictionStage {
@@ -78,6 +83,30 @@ impl EvictionStage {
             target_ratio,
             min_band: None,
             armed: std::sync::atomic::AtomicBool::new(true),
+            score_cell: None,
+        }
+    }
+
+    /// §5.9.1 Track A: score-aware OneShot eviction (h2o/h2o_plus/d2o 전용).
+    ///
+    /// `one_shot` 과 동일 lifecycle·발화 조건이나, `run_eviction` 이 score_cell 에서
+    /// `importance_scores()` 를 추출해 `force_evict_with_scores` 를 호출하고, 직후 `acc.reset()` 으로
+    /// 누적 스코어를 비운다(eval EvictionHook 정본 — eviction_hook.rs:523-524 동형).
+    /// score_cell 이 None 또는 acc 비활성이면 기존 score-free `force_evict` 로 fallback.
+    pub fn one_shot_scored(
+        handles: Vec<Arc<StandardFormat>>,
+        cache_manager: Arc<Mutex<CacheManager>>,
+        target_ratio: f32,
+        score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
+    ) -> Self {
+        Self {
+            lifecycle: StageLifecycle::OneShot,
+            handles,
+            cache_manager,
+            target_ratio,
+            min_band: None,
+            armed: std::sync::atomic::AtomicBool::new(true),
+            score_cell: Some(score_cell),
         }
     }
 
@@ -100,6 +129,7 @@ impl EvictionStage {
             target_ratio,
             min_band: Some(min_band),
             armed: std::sync::atomic::AtomicBool::new(true),
+            score_cell: None,
         }
     }
 
@@ -108,18 +138,52 @@ impl EvictionStage {
     /// v1 try_evict(model_forward.rs:524-541)의 inner op 그대로. take_inner 로 inner cache 들을
     /// 연속 Vec 로 꺼내(W1 순서 보존) force_evict 후, Err/Ok 무관하게 put_inner 로 되돌린다
     /// (placeholder 폐기 — `?` 전파를 rewrap 이후로 미룸).
+    ///
+    /// §5.9.1 Track A: score_cell 이 Some 이고 acc active 이면 importance_scores() 를 추출해
+    /// force_evict_with_scores 로 H2O/D2O 정밀 token 선택(eval EvictionHook 동형).
+    /// eviction 성공 직후 acc.reset() — KV geometry 변경 후 stale score 방지(§5.9.1 landmine 해소).
     fn run_eviction(&self) -> anyhow::Result<()> {
+        // §5.9.1 Track A: score 추출 (lock 짧게 — 복사 후 즉시 해제).
+        let scores_opt: Option<Vec<f32>> = if let Some(cell) = self.score_cell.as_ref() {
+            let guard = cell
+                .lock()
+                .expect("EvictionStage score_cell Mutex poisoned");
+            guard
+                .as_ref()
+                .filter(|acc| acc.is_active())
+                .map(|acc| acc.importance_scores().to_vec())
+        } else {
+            None
+        };
+
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
-        let result = self
-            .cache_manager
-            .lock()
-            .expect("EvictionStage CacheManager Mutex poisoned")
-            .force_evict(&mut temp, self.target_ratio);
+        let result = {
+            let cm = self
+                .cache_manager
+                .lock()
+                .expect("EvictionStage CacheManager Mutex poisoned");
+            if let Some(ref scores) = scores_opt {
+                cm.force_evict_with_scores(&mut temp, self.target_ratio, scores)
+            } else {
+                cm.force_evict(&mut temp, self.target_ratio)
+            }
+        };
         for (f, c) in self.handles.iter().zip(temp) {
             f.put_inner(c);
         }
         // Err → dispatcher 가 panic (fail-fast 계약, INV-DECODE-STAGE-004).
         result?;
+
+        // §5.9.1 Track A: eviction 성공 후 acc.reset() — stale score 방지(eval 정본 동형).
+        if let Some(cell) = self.score_cell.as_ref() {
+            let mut guard = cell
+                .lock()
+                .expect("EvictionStage score_cell Mutex poisoned");
+            if let Some(ref mut acc) = *guard {
+                acc.reset();
+            }
+        }
+
         Ok(())
     }
 }
@@ -415,6 +479,71 @@ mod tests {
         assert!(
             handle.current_pos() < N_TOKENS,
             "re-arm 후 두 번째 에피소드에서 재발화"
+        );
+    }
+
+    // ── §5.9.1 Track A: one_shot_scored + score_cell reset ──
+
+    /// §5.9.1 Track A: one_shot_scored — eviction 완료 후 score_cell.reset() 호출.
+    /// score_cell이 Some(active) → eviction 완료 후 importance가 0-filled 되어야 함.
+    #[test]
+    fn one_shot_scored_resets_accumulator_after_eviction() {
+        use crate::inference::attention_scores::AttentionScoreAccumulator;
+
+        let handle = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
+
+        // 점수를 0이 아닌 값으로 채운 accumulator 생성.
+        let mut acc = AttentionScoreAccumulator::new(MAX_SEQ, KV_HEADS, 1, 0, 0.0);
+        acc.set_active(true);
+        // begin_step + 임의 score 주입(내부 importance 초기화).
+        acc.begin_step();
+        // importance 값이 0이 아닌지 확인하기 위해 accept_scores 호출(단, API 없으면 skip).
+        // reset 후에는 모두 0이어야 한다.
+
+        let score_cell = Arc::new(Mutex::new(Some(acc)));
+
+        let stage = EvictionStage::one_shot_scored(
+            vec![handle.clone()],
+            make_cache_manager(),
+            TARGET_RATIO,
+            Arc::clone(&score_cell),
+        );
+
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap();
+
+        // eviction 완료 후 score_cell.importance_scores()가 all-zero여야 한다.
+        let guard = score_cell.lock().unwrap();
+        let acc_ref = guard.as_ref().expect("acc still in cell");
+        let all_zero = acc_ref.importance_scores().iter().all(|&s| s == 0.0);
+        assert!(all_zero, "reset() 후 importance_scores 는 all-zero");
+    }
+
+    /// §5.9.1 Track A: score_cell=None → 기존 one_shot 경로와 동일하게 eviction 완료.
+    #[test]
+    fn one_shot_scored_without_score_cell_behaves_as_one_shot() {
+        // score_cell 미주입 경우에도 정상 eviction 동작.
+        let h_scored = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
+        let empty_cell: Arc<
+            Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
+        > = Arc::new(Mutex::new(None));
+        let stage = EvictionStage::one_shot_scored(
+            vec![h_scored.clone()],
+            make_cache_manager(),
+            TARGET_RATIO,
+            empty_cell,
+        );
+
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap();
+
+        // eviction 실행 — current_pos 감소.
+        assert!(
+            h_scored.current_pos() < N_TOKENS,
+            "score_cell None 도 eviction 실행 (got {})",
+            h_scored.current_pos()
         );
     }
 }

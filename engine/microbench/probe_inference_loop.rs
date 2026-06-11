@@ -219,6 +219,8 @@ fn impl_run_decode_loop(
         false,
         // §5.9.2 Track B: microbench 는 swap 미구성 → 더미 hook cell (항상 None).
         std::sync::Arc::new(std::sync::Mutex::new(None)),
+        // §5.9.1 Track A: microbench 는 score-based eviction 미구성 → 더미 None cell.
+        std::sync::Arc::new(std::sync::Mutex::new(None)),
     )?;
 
     let mut decode_loop = DecodeLoopBuilder::new()

@@ -819,6 +819,12 @@ pub struct QcfEstimateContext<'a> {
     pub importance_table: Option<&'a crate::qcf::ImportanceTable>,
     /// Total number of transformer layers (needed for LayerSkip).
     pub num_layers: usize,
+    /// §5.9.1 Track A: per-token attention importance scores from `AttentionScoreAccumulator`.
+    /// `Some` → `kv.evict_h2o` / `kv.merge_d2o` QCF 산출 언블록 (requires_scores=true 통과).
+    /// `None` → 기존 uniform fallback 유지 (h2o/d2o 키 absent).
+    /// **QCF_kv 전용** — `importance`(QCF_weight, weight 가족 layer importance)와 절대 합치지 말 것
+    /// (QCF_kv ⊥ QCF_weight, CLAUDE.md QCF 명명 컨벤션).
+    pub token_scores: Option<&'a [f32]>,
 }
 
 /// Compute dry-run QCF estimates for all 6 lossy actions (ENG-ALG-050).
@@ -887,11 +893,16 @@ pub fn compute_qcf_estimates(
                 let target_len = (current_pos as f32 * keep_ratio) as usize;
                 let protected_prefix = 4usize;
 
-                // v1 fallback_scores path: importance table has per-layer data, not per-token;
-                // use uniform fallback (same as v1 when score_accumulator is None or inactive).
-                let scores_opt: Option<Vec<f32>> = None; // uniform fallback (v1 fallback_scores 등가)
+                // §5.9.1 Track A: ctx.token_scores 가 Some 이면 acc.importance_scores() 사용
+                // (kv.evict_h2o / kv.merge_d2o requires_scores=true 통과).
+                // None 이면 uniform fallback (v1 fallback_scores 등가 — h2o/d2o 키 absent).
+                let scores_opt: Option<Vec<f32>> = ctx
+                    .token_scores
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_vec());
                 let fallback_scores = vec![1.0 / current_pos.max(1) as f32; current_pos];
-                let attention_scores_owned: Vec<f32> = fallback_scores;
+                let attention_scores_owned: Vec<f32> =
+                    scores_opt.clone().unwrap_or(fallback_scores);
 
                 if target_len < current_pos {
                     let mut actions: Vec<(&'static str, QcfActionType, bool)> = vec![
@@ -1259,6 +1270,7 @@ mod tests {
             streaming_config: None,
             importance_table: None,
             num_layers: 4,
+            token_scores: None,
         };
         let estimates = compute_qcf_estimates(&ctx);
         // current_pos=16, keep_ratio=0.5 → target_len=8 < 16 → sliding should appear.
@@ -1274,6 +1286,56 @@ mod tests {
         assert!(qcf <= 1.0, "sliding QCF should be <= 1.0, got {qcf}");
     }
 
+    /// §5.9.1 Track A: `token_scores` Some → `kv.evict_h2o` / `kv.merge_d2o` 키가 포함되어야 함.
+    /// `token_scores` None → h2o/d2o 는 requires_scores=true 로 skip.
+    #[test]
+    fn test_compute_qcf_estimates_token_scores_unlocks_h2o_d2o() {
+        let handle = make_standard_format(32, 2, 4, 16);
+        let n_tokens = 16usize;
+        // 16-token uniform score
+        let scores: Vec<f32> = vec![1.0 / n_tokens as f32; n_tokens];
+
+        let ctx_with_scores = QcfEstimateContext {
+            kv_handles: &[handle.clone()],
+            kivi_handles: &[],
+            importance: None,
+            streaming_config: None,
+            importance_table: None,
+            num_layers: 4,
+            token_scores: Some(&scores),
+        };
+        let estimates_with = compute_qcf_estimates(&ctx_with_scores);
+        assert!(
+            estimates_with.contains_key("kv.evict_h2o"),
+            "token_scores Some → kv.evict_h2o expected, got keys: {:?}",
+            estimates_with.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            estimates_with.contains_key("kv.merge_d2o"),
+            "token_scores Some → kv.merge_d2o expected"
+        );
+
+        let ctx_no_scores = QcfEstimateContext {
+            kv_handles: &[handle],
+            kivi_handles: &[],
+            importance: None,
+            streaming_config: None,
+            importance_table: None,
+            num_layers: 4,
+            token_scores: None,
+        };
+        let estimates_without = compute_qcf_estimates(&ctx_no_scores);
+        assert!(
+            !estimates_without.contains_key("kv.evict_h2o"),
+            "token_scores None → kv.evict_h2o absent, got keys: {:?}",
+            estimates_without.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !estimates_without.contains_key("kv.merge_d2o"),
+            "token_scores None → kv.merge_d2o absent"
+        );
+    }
+
     /// `compute_qcf_estimates`가 current_pos=0인 경우 estimates를 반환하지 않는지 확인.
     #[test]
     fn test_compute_qcf_estimates_empty_cache_returns_no_kv_estimates() {
@@ -1285,6 +1347,7 @@ mod tests {
             streaming_config: None,
             importance_table: None,
             num_layers: 4,
+            token_scores: None,
         };
         let estimates = compute_qcf_estimates(&ctx);
         let kv_keys: Vec<_> = estimates.keys().filter(|k| k.starts_with("kv.")).collect();

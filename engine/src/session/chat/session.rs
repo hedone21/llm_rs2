@@ -456,6 +456,11 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
     // §5.9.2 Track B: chat 경로는 swap 미구성 → hook 더미 cell (항상 None).
     let hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>> =
         Arc::new(Mutex::new(None));
+    // §5.9.1 Track A: chat 경로는 v1 EvictionHook 기반 score 처리 유지(eval_loop 동형) →
+    // ModelForward 의 score_cell 은 더미 None (chat 측 score acc 는 별도 ChatKvMode 안).
+    let score_cell: Arc<
+        Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
+    > = Arc::new(Mutex::new(None));
     let mf = ModelForward::new(
         args.backend,
         args.memory,
@@ -465,6 +470,7 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
         max_seq_len,
         false, // chat 모드는 plan path 비활성 (D4: eviction + plan 공존 미지원)
         hook_cell,
+        score_cell,
     )?;
 
     let decode_loop = DecodeLoopBuilder::new()

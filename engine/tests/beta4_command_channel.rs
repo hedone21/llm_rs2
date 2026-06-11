@@ -111,6 +111,7 @@ fn control_fields_equivalent_to_v1() {
         Vec::new(),
         None,                       // report_tx: AB-5 — 단위테스트는 미배선
         Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+        Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
     );
 
     // step 1: Throttle{50} + SetTargetTbt{200}.
@@ -176,6 +177,7 @@ fn suspend_override_equivalent_to_v1() {
         Vec::new(),
         None,                       // report_tx: AB-5
         Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+        Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
     );
 
     let cmds = vec![
@@ -221,6 +223,7 @@ fn transitional_fields_equivalent_to_v1() {
         Vec::new(),
         None,                       // report_tx: AB-5
         Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+        Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
     );
 
     let cmds = vec![
@@ -288,6 +291,7 @@ fn partition_directive_submits_one_shot_stage() {
         Vec::new(),
         None,                       // report_tx: AB-5
         Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+        Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
     );
 
     // 새 ratio → submit 1.
@@ -326,6 +330,7 @@ fn quant_directive_submits_one_shot_stage() {
         Vec::new(),                 // 빈 kivi_handles → inert
         None,                       // report_tx: AB-5
         Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+        Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
     );
     disp_inert.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 4 }]);
     assert_eq!(
@@ -357,6 +362,7 @@ fn quant_directive_submits_one_shot_stage() {
         kivi_handles,
         None,                       // report_tx: AB-5
         Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+        Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
     );
 
     // 새 bits → submit 1.

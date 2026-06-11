@@ -120,6 +120,33 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     let pressure_source = cache_manager
         .as_ref()
         .map(|_| build_local_pressure_source(&args, &backend));
+
+    // §5.9.1 Track A: score-based policy(h2o/h2o_plus/d2o)면 AttentionScoreAccumulator 생성.
+    // 비-score 정책은 더미 None 셀을 넘긴다.
+    let score_cell = {
+        use crate::inference::attention_scores::AttentionScoreAccumulator;
+        use std::sync::{Arc, Mutex};
+        let policy = args.eviction_policy();
+        if matches!(policy, "h2o" | "h2o_plus" | "d2o") {
+            let n_layers = model.config.num_hidden_layers;
+            let n_kv_heads = model.config.num_key_value_heads;
+            let n_heads = model.config.num_attention_heads;
+            let mut acc = AttentionScoreAccumulator::new_gqa(
+                max_seq_len,
+                n_heads,
+                n_kv_heads,
+                n_layers,
+                args.h2o_tracked_layers(),
+                args.h2o_decay(),
+            );
+            acc.set_active(true);
+            acc.set_time_normalize(!args.h2o_raw_scores());
+            Arc::new(Mutex::new(Some(acc)))
+        } else {
+            Arc::new(Mutex::new(None))
+        }
+    };
+
     // ADR-0008: bin_setup이 dispatch한 kv_caches를 소비(과거엔 drop 후 typed 재할당).
     let decode_loop = build_bench_loop(
         backend.clone(),
@@ -144,6 +171,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
             phase_chunk_size_bytes: args.swap_phase_aware_chunk_mb * 1024 * 1024,
             phase_max_chunks_per_token: args.swap_phase_aware_max_chunks_per_token,
         },
+        score_cell,
     )?;
 
     run_decode_loop_experiment(
@@ -344,6 +372,31 @@ pub fn run_experiment_schedule_path(
         .as_ref()
         .map(|_| build_local_pressure_source(&args, &backend));
 
+    // §5.9.1 Track A: schedule 모드도 score-based policy 시 accumulator 생성.
+    let score_cell = {
+        use crate::inference::attention_scores::AttentionScoreAccumulator;
+        use std::sync::{Arc, Mutex};
+        let policy = args.eviction_policy();
+        if matches!(policy, "h2o" | "h2o_plus" | "d2o") {
+            let n_layers = model.config.num_hidden_layers;
+            let n_kv_heads = model.config.num_key_value_heads;
+            let n_heads = model.config.num_attention_heads;
+            let mut acc = AttentionScoreAccumulator::new_gqa(
+                max_seq_len,
+                n_heads,
+                n_kv_heads,
+                n_layers,
+                args.h2o_tracked_layers(),
+                args.h2o_decay(),
+            );
+            acc.set_active(true);
+            acc.set_time_normalize(!args.h2o_raw_scores());
+            Arc::new(Mutex::new(Some(acc)))
+        } else {
+            Arc::new(Mutex::new(None))
+        }
+    };
+
     let mut decode_loop = build_bench_loop(
         backend.clone(),
         memory.clone(),
@@ -367,6 +420,7 @@ pub fn run_experiment_schedule_path(
             phase_chunk_size_bytes: args.swap_phase_aware_chunk_mb * 1024 * 1024,
             phase_max_chunks_per_token: args.swap_phase_aware_max_chunks_per_token,
         },
+        score_cell,
     )?;
 
     let t_prefill = std::time::Instant::now();

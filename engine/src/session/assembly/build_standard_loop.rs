@@ -118,6 +118,10 @@ pub fn build_standard_loop(
     // 일어나지 않는다. ModelForward 생성자가 요구하는 cell 은 항상 None 인 더미를 넘긴다.
     let hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>> =
         Arc::new(Mutex::new(None));
+    // §5.9.1 Track A: happy/standard 경로는 score-based eviction 미구성 → 더미 None cell.
+    let score_cell: Arc<
+        Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
+    > = Arc::new(Mutex::new(None));
     let mf = ModelForward::new(
         backend,
         memory,
@@ -127,6 +131,7 @@ pub fn build_standard_loop(
         max_seq_len,
         plan_enabled,
         Arc::clone(&hook_cell),
+        score_cell,
     )?;
 
     // β-4: resilience-on 이면 dispatcher 를 구성한다 — control 디렉티브(Throttle/SetTargetTbt/
@@ -160,6 +165,8 @@ pub fn build_standard_loop(
                 None, // report_tx: AB-5
                 // §5.9.2 Track B: happy 경로는 swap 미구성 → 더미 cell (항상 None).
                 Arc::clone(&hook_cell),
+                // §5.9.1 Track A: happy 경로는 score-based eviction 미구성 → 더미 None cell.
+                Arc::new(Mutex::new(None)),
             );
             (Some(adapter), Some((registry, dispatcher, kv_pos_handle)))
         }
