@@ -577,8 +577,10 @@ pub enum LifecyclePhase {
     PrefillStart, PrefillChunkBoundary, PrefillEnd,
     // decode step (1×/token)
     DecodeStart, PreForward, PostForward, PreSample, PostSample, DecodeEnd,
-    // cross-cutting stage hook (mutation 허용)
-    PreEviction, PostEviction, PreSwap, PostSwapBefore, PostSwapAfter,
+    // cross-cutting stage hook (mutation 허용) — AB-6 rename: KvMutate(구 PreEviction) /
+    // WeightMutate(구 PostEviction). dead variant PreSwap/PostSwapBefore/PostSwapAfter 3종 삭제
+    // (driver 발화 0, 구독자 0 — §5.6.5). 발화 위치·순서 불변(B안 driver 무수정).
+    KvMutate, WeightMutate,
     // per-layer (N×/token) — mutation 금지 (INV-DECODE-STAGE-001)
     PreLayer, PostLayer, Fine(/* sub-step 식별자 */),
     Finalize,
@@ -613,17 +615,17 @@ impl PipelineDispatcher for PipelineRegistry {
 
 §5.1 의 `StageOutcome`/`StageContext`(2-field) 가 *무엇을 담는가* 를 정했다면, 본 절은 driver(DecodeLoop)가 그 산출을 *어떻게 흡수하는가* 의 계약을 고정한다 — Phase β(DecodeLoop 재작성)의 진입 계약이자 `INV-DECODE-STAGE-004/005` 의 normative 본문이다. 4 계약:
 
-**(가) eviction pos-환류 — `StageOutcome` 무변경, held-handle interior-mutate.** eviction 의 산출(prune 토큰 수·새 위치)은 `StageOutcome` 로 흐르지 *않는다*. `StageOutcome` 에 eviction-전용 variant 를 추가하지 않으며(§5.1 3-variant 고정), EvictionStage 가 자기 보유 held handle(`Arc<StandardFormat>`, §3.4 concrete-handle)을 `&self` interior-mutate 해 `current_pos` 를 감소시킨다. driver 는 `PreEviction`/`PostEviction` dispatch 후 (dispatch 전 `pos`) vs (held handle `current_pos` query) 를 비교하고, 감소분이 있으면:
+**(가) eviction pos-환류 — `StageOutcome` 무변경, held-handle interior-mutate.** eviction 의 산출(prune 토큰 수·새 위치)은 `StageOutcome` 로 흐르지 *않는다*. `StageOutcome` 에 eviction-전용 variant 를 추가하지 않으며(§5.1 3-variant 고정), EvictionStage 가 자기 보유 held handle(`Arc<StandardFormat>`, §3.4 concrete-handle)을 `&self` interior-mutate 해 `current_pos` 를 감소시킨다. driver 는 `KvMutate`(구 `PreEviction`, AB-6 rename §5.6.5) dispatch 후 (dispatch 전 `pos`) vs (held handle `current_pos` query) 를 비교하고, 감소분이 있으면:
 
 ```text
-PreEviction/PostEviction dispatch
+KvMutate dispatch
   → new_pos = held_handle.current_pos()   // held handle query (StageContext 경유 아님)
   → if new_pos < pos { self.pos = new_pos; self.forward.on_kv_prune(new_pos); }
 ```
 
 이는 v1 라이브 모델(`session/decode_loop.rs:171-177`: `forward.try_evict(cm, …) -> (removed, new_pos)` → `self.pos = new_pos` + `self.forward.on_kv_prune(new_pos)`)의 PipelineStage 등가다. `on_kv_prune`(`session/forward/model_forward.rs:474`)은 GPU plan invalidate(stale offset 방지). pos 가 `StageContext` 가 아니라 held-handle query 로 흐르므로 ctx 2-field 슬림이 유지된다(god-ctx 회피, `INV-STAGE-LAYER-HANDLE`).
 
-**(나) EvictionStage 트리거 phase 확정.** v1 발화 지점 = `decode_loop.rs::run` 루프의 command-poll 직후·forward 직전(구 `eviction.before_step(&ctx)`, F1 census 참조). 이에 대응하는 v2 phase = **`PreEviction`**(driver 가 forward 직전 dispatch), eviction 수행 후 **`PostEviction`** dispatch. command-driven OneShot EvictionStage(§5.4 `kv.evict_h2o`/`kv.evict_sliding`/`kv.streaming`/`kv.merge_d2o`)도 **동일 `PreEviction`/`PostEviction` phase 에서 소비**된다 — pressure-driven Persistent EvictionStage 와 phase 공유(lifecycle `OneShot` vs `Persistent` 만 상이, §5.4 "동일 코드"). 발화 순서·phase 는 driver(통합자) 가 고정(`INV-DECODE-STAGE-005`).
+**(나) EvictionStage 트리거 phase 확정.** v1 발화 지점 = `decode_loop.rs::run` 루프의 command-poll 직후·forward 직전(구 `eviction.before_step(&ctx)`, F1 census 참조). 이에 대응하는 v2 phase = **`KvMutate`**(구 `PreEviction`, AB-6 rename §5.6.5 — driver 가 forward 직전 dispatch). command-driven OneShot EvictionStage(§5.4 `kv.evict_h2o`/`kv.evict_sliding`/`kv.streaming`/`kv.merge_d2o`)도 **동일 `KvMutate` phase 에서 소비**된다 — pressure-driven Persistent EvictionStage 와 phase 공유(lifecycle `OneShot` vs `Persistent` 만 상이, §5.4 "동일 코드"). weight precision swap(WeightSwapStage, §5.6)은 **그 뒤 `WeightMutate`**(구 `PostEviction`) phase 에서 발화한다(KvMutate→WeightMutate 순서 = v1 eviction-before→swap-before 등가). 발화 순서·phase 는 driver(통합자) 가 고정(`INV-DECODE-STAGE-005`).
 
 **(다) StopReason 수렴 매핑 (v1 5-variant → v2 4-variant).** v1 `StopReason`(`session/traits.rs:48-55`)이 5-variant, v2 `StopReason`(`pipeline.rs:106-111`)이 4-variant 다. 매핑:
 
@@ -637,7 +639,7 @@ PreEviction/PostEviction dispatch
 
 **`StopFlag` 는 v2 `StopReason` variant 로 승격하지 않는다** — `stop_flag` 는 외부(시그널 핸들러/Ctrl-C)가 set 하는 driver-소유 플래그라, Stage 의 phase-반응이 아니라 driver 의 루프 가드다. driver 가 루프 상단에서 `stop_flag.load()` 를 직접 체크해 break 하며, 이때 반환 사유는 v2 4-variant 어느 것도 아닌 driver-internal break(로그/관찰만, `DecodeResult.stopped_by` 표현은 friction-triggered). 신 variant 추가 0.
 
-**(라) 미발화 phase variant 처분.** `LifecyclePhase`(§5.1)의 `PreLayer`/`PostLayer`/`Fine(*)` 는 **Phase β 범위에서 발화 경로 0(orphan)** 이다 — layer-tier(N×/token)라 `INV-HOTPATH-DISPATCH` 의 "layer-tier dyn 금지"(production hot)와 충돌하므로 β driver 가 dispatch 하지 않는다. enum variant 로 *정의만 존재*하고, β per-token 발화 phase 는 `DecodeStart`/`PreEviction`/`PostEviction`/`PreForward`/`PostForward`/`PreSample`/`PostSample`/`DecodeEnd` 다. `PreLayer`/`PostLayer`/`Fine` 의 실발화는 Phase γ/이후(layer-tier 정적 dispatch 인프라 확립 시점)로 defer — `pipeline.rs` `LifecyclePhase` doc 주석에 "β 미발화 orphan" 명시(`INV-DECODE-STAGE-001` β-1 보강).
+**(라) 미발화 phase variant 처분.** `LifecyclePhase`(§5.1)의 `PreLayer`/`PostLayer`/`Fine(*)` 는 **Phase β 범위에서 발화 경로 0(orphan)** 이다 — layer-tier(N×/token)라 `INV-HOTPATH-DISPATCH` 의 "layer-tier dyn 금지"(production hot)와 충돌하므로 β driver 가 dispatch 하지 않는다. enum variant 로 *정의만 존재*하고, β per-token 발화 phase 는 `DecodeStart`/`KvMutate`/`WeightMutate`/`PreForward`/`PostForward`/`PreSample`/`PostSample`/`DecodeEnd` 다 (`KvMutate`/`WeightMutate` = AB-6 rename, 구 `PreEviction`/`PostEviction`). `PreLayer`/`PostLayer`/`Fine` 의 실발화는 Phase γ/이후(layer-tier 정적 dispatch 인프라 확립 시점)로 defer — `pipeline.rs` `LifecyclePhase` doc 주석에 "β 미발화 orphan" 명시(`INV-DECODE-STAGE-001` β-1 보강).
 
 > **연혁** — β-1 driver↔Stage 계약 확정 (G7, 2026-06-10 "계약·어휘 마감" substep): Phase β(DecodeLoop 재작성) 진입 전 INV-DECODE-STAGE-004/005 의 공백 계약 4건(eviction pos-환류·EvictionStage phase·StopReason 매핑·미발화 처분)을 normative 로 고정. 새 타입·variant 0(`StageOutcome`/`StopReason` 무변경) — 기존 v1 라이브 모델(`try_evict`/`stop_flag`/`before_step` 위치)을 PipelineStage 어휘로 1:1 사상. spec 동기화 = `spec/41-invariants.md` §3.28 INV-DECODE-STAGE-004/005/001 보강 + spec test `test_inv_decode_stage_004_007.rs`. roadmap `.agent/todos/roadmap_beta_decode_loop_rewrite_2026_06_10.md` §β-1 항목 3.
 
@@ -714,8 +716,8 @@ flowchart TB
 | **거주지** | `engine/src/stages/weight/partition.rs` (신규 파일, no-`mod.rs` 규칙 C) | `weight.rs` 골격의 'α-K 예정 입주자' 표기는 stale — 실 owner 는 WeightSwapStage(AB-6). PartitionStage 는 swap 과 join 표면이 0(weight slot dispatch mode 변경 vs precision swap)이라 별도 파일. 둘 다 `stages/weight/`(규칙 B — 주 mutate 도메인 = weight) |
 | **lifecycle** | `OneShot` | directive 1회 = re-slice 1회 = GC 1회. EvictionStage::one_shot 동형. sticky 재적용 방지는 dispatcher 의 last-applied 게이트(§5.5.2)가 담당 — Stage 자체는 발화 후 무조건 `Consumed` |
 | **보유 handle** | `Vec<Arc<LayerSlot>>` (concrete-handle, §3.4) + `Arc<Hardware>` + `gpu_ratio: f32` | register 시점 `model.layers.clone()` + `hardware.clone()`. EvictionStage 의 `Vec<Arc<StandardFormat>>` + `Arc<Mutex<CacheManager>>` 와 동형(INV-STAGE-LAYER-HANDLE). `LayerSlot::apply_dispatch(&self)` 가 ArcSwap RCU 라 `&self` Stage 가 mutate 가능 (Mutex 불요 — slot 자체가 Sync interior-mutable) |
-| **구독 phase** | `PreForward` | v1 등가 census(§5.5.4): v1 `partition_ratio_sticky` → 매 step `plan.partition_ratio` carry → forward 직전 re-slice. v2 등가 = command-poll/dispatch 직후·forward 직전 = `PreForward`. eviction(PreEviction/PostEviction)보다 뒤, `forward.step` 직전이라 forward 가 re-sliced weight 를 읽기 전 완료 보장 |
-| **self-filter** | `if *phase != PreForward { return Continue }` | EvictionStage 의 PreEviction self-filter(§5.3) 동형 |
+| **구독 phase** | `PreForward` | v1 등가 census(§5.5.4): v1 `partition_ratio_sticky` → 매 step `plan.partition_ratio` carry → forward 직전 re-slice. v2 등가 = command-poll/dispatch 직후·forward 직전 = `PreForward`. **PartitionStage 는 `PreForward` 잔류**(AB-6 rename 무영향) — partition 은 plan 준비 성격(re-slice 후 forward 가 읽음)이고 AB-4 동결 직후라 phase 이동 없음. eviction(`KvMutate`, 구 PreEviction)·weight swap(`WeightMutate`, 구 PostEviction)보다 뒤, `forward.step` 직전이라 forward 가 re-sliced weight 를 읽기 전 완료 보장 |
+| **self-filter** | `if *phase != PreForward { return Continue }` | EvictionStage 의 `KvMutate`(구 PreEviction) self-filter(§5.3) 동형 |
 | **반환** | `Consumed` (발화 후) | OneShot GC. pos-환류 없음(eviction 과 달리 partition 은 weight 만 바꾸고 KV/pos 불변) → `StageOutcome` 무변경(§5.2.1 (가) 단순화 — driver 후처리 0) |
 | **fan-out 본문** | `apply_partition_dispatch(&self.slots, self.gpu_ratio, &self.hw)?` (자유 함수, §5.5.3) | `prepare_tensor_partition` 의 slot 순회를 추출한 `layers/tensor_partition.rs` 자유 함수. GPU-only fast path(`is_gpu_only_ratio`)·INV-120 gen-counter 자동 무효화는 함수 내부 + `apply_dispatch` 가 보존 |
 
@@ -827,6 +829,146 @@ v2 prefill 은 단일 호출(command poll/chunk 경계 부재, decode_loop.rs:19
 - `hardware: Arc<Hardware>` = build_bench_loop 가 이미 보유하거나 인자로 받아야 함. **현 build_bench_loop 시그니처에 hardware 부재** — `cpu_backend: Arc<dyn Backend>`(:180)는 있으나 full Hardware resolver 부재. **인자 추가 필요**(`hardware: Arc<Hardware>`) 또는 dispatcher 가 cpu/gpu backend 2개만 받아 내부 구성. apply_dispatch 가 `&Hardware` 를 요구하므로 Hardware 전달이 정합 — `session/init.rs` 가 이미 `hardware: Arc<Hardware>`(init.rs:822) 보유, build_bench_loop 호출처에서 전달.
 
 > **non-local 변경 경고**: build_bench_loop 시그니처에 `hardware: Arc<Hardware>` 추가는 호출처(argus_bench 경로) 변경 동반. evict 의 `kv_handles` 가 이미 dispatcher 로 흐르는 패턴이 있어 handle 추가 자체는 국소이나, hardware 인자는 신규. CLI 정적 경로(init.rs)는 dispatcher 미경유(직접 `prepare_tensor_partition`)라 무영향.
+
+### 5.6 AB-6 — `WeightSwapStage` (SwapWeights runtime directive → OneShot PipelineStage)
+
+**역할.** Manager 의 `EngineCommand::SwapWeights{ratio, target_dtype}` directive 를 받아 모델 weight 의 precision 을 런타임 swap(F16→Q4_0)하는 OneShot Stage. CommandDispatcher 의 deprecated `LoopControl.swap_weights` 필드(set 후 v2 루프 소비자 0 — G1 과도기 dead-end)를 제거하고, partition 분(`submit_partition`→`PartitionStage::one_shot`, §5.5)과 동형의 `submit_swap`→`WeightSwapStage::one_shot` 경로로 대체한다. AB-6 는 G1 동결 5종(offload/quant/partition/swap/layer-skip) 중 **swap 분의 Stage 이전**이며, G1 의 마지막 weight-축 동결 항목이다(partition 은 AB-4 완료).
+
+**ADR-0006 Seam 정합.** AB-6 = ADR-0006 D6 의 **Seam B 실배선**(`PipelineRegistry`/`PipelineDispatcher` 위에 weight swap executor 를 올리는 시점, ADR-0006 §6 Deferred 항목). 단 **본 AB-6 은 PartitionStage 와 동형의 엔진 직결 OneShot 경로**로 구현하며, ADR-0006 D1 의 plan-returning 빌트인(`WeightSwapDeciderAsStage`, Seam A `WeightStage`)을 **거치지 않는다**. 근거: 현 production swap trigger 정본 = `EngineSwapRuntime::handle_swap_weights`(swap_runtime.rs:137, orphan — 소비자 0)가 이미 decider(`WeightSwapDecider::decide`)·QCF estimate·4-mode commit 을 **한 함수에 결합**해 수행하며, 이를 그대로 Stage 본문으로 옮기는 것이 최소 변경이다. plugin 결정층(`WeightStage::plan`) 분리는 **per-layer 알고리즘**(layer 별 다른 precision, importance-driven swap geometry)이 등장할 때 재검토한다(ADR-0006 §6 재검토 trigger, EvictionStage·PartitionStage 의 directive→OneShot 직결 선례와 동형). landmine: `WeightSwapDeciderAsStage`(`weight/stage_registry.rs:26`)는 Seam A `WeightStage`(plan-returning plugin)이지 본 `WeightSwapStage`(PipelineStage)가 **아니다** — 혼동 금지(Seam A ⊥ Seam B, ADR-0006 D6).
+
+#### 5.6.1 WeightSwapStage 정의
+
+| 항목 | 결정 | 근거 |
+|---|---|---|
+| **거주지** | `engine/src/stages/weight/weight_swap.rs` (신규 파일, no-`mod.rs` 규칙 C) | `weight.rs` 골격이 이미 'AB-6 예정 입주자: WeightSwapStage' 로 표기(AB-4 에서 정정). PartitionStage 와 형제(둘 다 `stages/weight/`, 규칙 B — 주 mutate 도메인 = weight)이나 **join 표면 0** — partition 은 weight slot **dispatch mode**(GPU/CPU split geometry) 변경, swap 은 weight **precision**(F16→Q4_0) 변경(format 축). 별도 파일 |
+| **lifecycle** | `OneShot` | `EngineCommand::SwapWeights` = command-only directive(graded Pressure 로 안 옴) → ADR-0006 D5 "command-driven = OneShot". swap=transient 시맨틱(아래 sticky 절)과 정합 |
+| **dispatch tier (D5 multi-tick)** | step-tier(`Box<dyn>`/`Arc<dyn>` OK) — **Incremental mode 는 multi-tick drain**: `WeightMutate` 매 tick `drain_chunk` 후 `StageOutcome::Continue`(GC 아님), plan `is_done()` 되는 tick 에 `Consumed` 반환→GC. PartitionStage 의 1-tick `Consumed` 와 다른 유일점 | ADR-0006 D5 의미 고정 그대로: "1 plan = 1 OneShot 생명, 여러 tick Continue 후 종료 시 Consumed". 현 live retire(`SwapCommitSlot::take()` orphan) 자리 = `Consumed` 자리. drain 본문 = `IncrementalSwapPlan::drain_chunk`/`is_done`(incremental_plan.rs:57/69, `SwapExecutor::execute_on_slots` 호출). re-slice 자체(precision swap)는 boundary tier(slot mutate = construction tier)라 dyn 자유 |
+| **보유 handle** | `Vec<Arc<LayerSlot>>` (concrete-handle, §3.4) + `Arc<EngineSwapRuntime>`(swap 자원 묶음) + commit params(`ratio: f32`, `target_dtype: DtypeTag`) | register 시점 `model.layers.clone()`. **EvictionStage(`Vec<Arc<StandardFormat>>`+`Arc<Mutex<CacheManager>>`)·PartitionStage(`Vec<Arc<LayerSlot>>`+`Arc<Hardware>`) 동형**(INV-STAGE-LAYER-HANDLE). `EngineSwapRuntime`(swap_runtime.rs:59)이 `swap_backend`/`dispatcher`(`AsyncSwapDispatcher`)/`config`/`release_worker`/`default_mode`/`phase_*` 를 캡슐화하므로 Stage 는 이 1 Arc + slots + params 만 보유한다(handle 표면 최소). `LayerSlot::store_weights_same_dtype`(ArcSwap RCU, INV-123)·`swap_weights(new_dtype)`(slot.rs:141)가 `&self` 라 `&self` Stage 가 mutate 가능 |
+| **decider 입력 (importance)** | `Option<Arc<dyn ImportanceLookup>>` (register 시점 보유) | `handle_swap_weights` 가 `importance: Option<&dyn ImportanceLookup>` 인자로 받던 것을 Stage 가 held-handle 로 보유(god-ctx 회피, INV-STAGE-LAYER-HANDLE — `StageContext` 에 importance field 추가 0). `model.quant_noise`(noise table)는 `EngineSwapRuntime`/Stage 가 model 측 접근 seam 으로 query(§5.6.3) |
+| **구독 phase** | **`WeightMutate`** (구 `PostEviction` rename, §5.6.5) | 사용자 확정 B안(기발화 phase 구독, driver 무수정): drain tick = 구 `PostEviction` 위치(decode_loop.rs:340, v1 (c) swap-before 등가) / commit·release = `PostForward`(decode_loop.rs:364, v1 (e) swap-after 등가). **신규 per-token dispatch 발화 0**. 본 Stage 는 `WeightMutate` 를 self-filter 로 잡아 Incremental drain 을 수행한다(commit 은 directive 도착 tick, §5.6.4) |
+| **self-filter** | `if *phase != WeightMutate { return Continue }` | EvictionStage 의 `KvMutate`(구 PreEviction) self-filter(§5.3)·PartitionStage 의 `PreForward` self-filter 동형. (PostForward 의 commit/release 분은 §5.6.4 mode 별 분담 참조 — Incremental 의 per-tick drain 만 `WeightMutate` 구독) |
+| **반환** | Incremental: drain 중 `Continue`, `is_done()` tick 에 `Consumed`(D5 multi-tick). non-Incremental(commit-only): 설치 후 즉시 `Consumed` | OneShot GC. **pos-환류 없음**(eviction 과 달리 swap 은 weight precision 만 바꾸고 KV/pos 불변) → `StageOutcome` 무변경(§5.2.1 (가) 단순화 — driver 후처리 0, PartitionStage 와 동일) |
+| **commit 본문** | `EngineSwapRuntime::handle_swap_weights` 의 §1~7(swap_runtime.rs:152-296)을 Stage 본문으로 이전 | validate → in-flight 가드 → decider → QCF estimate → 4-mode commit → manager report. 이 orphan 함수가 **trigger 정본**이다(§5.6.2) |
+
+**dispatch tier 상세.** WeightSwapStage 는 step-tier(1×/token, Incremental 은 plan 소진까지 N tick)라 `Box<dyn>`/`Arc<dyn>` 자유(`INV-HOTPATH-DISPATCH`). precision swap 자체(`SwapExecutor::execute_on_slots`→`slot.swap_weights`)는 boundary/construction tier 라 dyn 자유. **forward hot path 에는 dyn 추가 0** — swap 후 `slot.load_weights()`의 dtype-dispatch 는 정적 `current_dtype()` 분기(§4.2)로 불변. plan path 의 stale `cl_mem` 차단은 INV-129/130/131(plan invalidation + SOA registry coherence) + INV-150(plan run-to-completion)이 런타임 자동 처리 — WeightSwapStage 가 plan 을 직접 만지지 않는다(slot precision 만 mutate, ModelForward 의 `gpu_plan` 은 swap commit 시 dispatcher drain + synchronize + ratio_generation bump 로 self-rebuild, INV-150 정신).
+
+#### 5.6.2 Stage 본문 = `handle_swap_weights` §1~7 (trigger 정본)
+
+`EngineSwapRuntime::handle_swap_weights`(swap_runtime.rs:137, **orphan — 소비자 0**)가 swap trigger 의 정본이다. 본 함수 §1~7 을 `WeightSwapStage` 의 commit 경로로 이전한다(EvictionStage 가 v1 `try_evict` inner op 를 byte-identical 보존한 것과 동형 — 자기 비교 금지, 등가 anchor 는 `handle_swap_weights` 직접 호출):
+
+```text
+1. Validate         secondary present(model.secondary_mmap) / ratio∈(0,1] / target_dtype==Q4_0 (INV-126)
+2. In-flight 가드     commit_slot.is_idle() 확인 (R-1 동시 활성화 차단 — swap_runtime.rs:170)
+3. Collect swapped   model.layers[i].current_dtype()==Q4_0 인 layer 수집 (currently_swapped)
+4. Decider          ratio→budget 환산(target_count - currently_swapped) → WeightSwapDecider::decide(budget)
+5. QCF estimate     compute_qcf_weight_swap(selected_layers, quant_noise, importance, n_layers)
+6. 4-mode commit    match default_mode { Incremental | IntraForward | LayerImmediate | PhaseAware }
+7. Manager report   manager_report_out = Some((ratio, n_planned, Instant::now(), qcf))  → WeightSwapReport 송신(§5.6.6)
+```
+
+```mermaid
+flowchart TB
+    dir["EngineCommand::SwapWeights{ratio, target_dtype}"]
+    disp["CommandDispatcher::submit_swap (§5.6.4)"]
+    submit["registry.submit(WeightSwapStage::one_shot)"]
+    wm["WeightMutate phase dispatch"]
+    val{"§1 validate +<br/>§2 in-flight 가드"}
+    dec["§3-4 decider → selected_layers"]
+    qcf["§5 QCF estimate"]
+    mode{"§6 default_mode"}
+    inc["Incremental: IncrementalSwapPlan 설치<br/>→ multi-tick drain (D5)"]
+    sub["IntraForward/LayerImmediate/PhaseAware:<br/>layer-tier hook 설치만 (§5.6.3)"]
+    rep["§7 WeightSwapReport 송신"]
+
+    dir --> disp --> submit --> wm --> val
+    val -->|reject| stop["no-op + stderr (등가 보존)"]
+    val -->|ok| dec --> qcf --> mode
+    mode --> inc
+    mode --> sub
+    inc --> rep
+    sub --> rep
+```
+
+**reject 경로(예외 처리).** §1 validate 의 3 reject(no_secondary / invalid_ratio / unsupported_dtype) + §2 in-flight 가드 reject + §4 decider 빈 결과(`selected_layers.is_empty()`)는 **stderr 1회 + no-op return**(swap_runtime.rs 의 `eprintln!` + `return` 그대로). Stage 는 이 경우 commit 없이 `Consumed` 반환(OneShot GC — 실패한 directive 가 registry 에 잔류하지 않음). fail-fast(`Err`→panic)가 아니라 graceful no-op 인 이유: swap reject 는 *구성·타이밍 조건*(secondary 부재, 이미 in-flight)이지 *프로그래밍 오류*가 아니므로 EvictionStage 의 `force_evict` Err(`?`→panic) 와 카테고리가 다르다.
+
+#### 5.6.3 4-mode 처리 — Incremental 만 Stage drain, 나머지는 layer-tier 서브시스템
+
+`handle_swap_weights` §6 의 4-mode 는 **Stage 가 직접 multi-tick drain 하는 1종 + commit(설치)만 담당하고 실행은 layer-tier 서브시스템이 가져가는 3종**으로 갈린다. 이 구분이 `INV-HOTPATH-DISPATCH`(layer-tier dyn 금지 = production hot)와 정합한다:
+
+| mode | Stage 책임 | 실행 주체 | tier / INV |
+|---|---|---|---|
+| **Incremental** | **multi-tick drain (D5)** — `WeightMutate` 매 tick `IncrementalSwapPlan::drain_chunk`(per_tick=2 layer) → `SwapExecutor::execute_on_slots` → `Continue`, `is_done()` 시 `Consumed` | Stage 자신(step-tier) | step-tier — `Box<dyn>` OK. Stage 가 plan 을 보유·소진 |
+| **IntraForward** | **commit(설치)만** — `IntraForwardSwapHook::new`(slots/secondary/backend/dispatcher 주입) 생성 후 `transformer.layer_boundary_hook` slot 에 설치 | `IntraForwardSwapHook`(impl `LayerBoundaryHook`, intra_forward_swap.rs:375) — **forward layer 경계 dispatch** | **layer-tier (N×/token, INV-149/150)** — `INV-HOTPATH-DISPATCH` 로 PipelineStage 로 못 올림. Stage 는 설치만 |
+| **LayerImmediate** | **commit(설치)만** — IntraForward 와 동일 hook, mode label 만 상이 | `IntraForwardSwapHook`(layer-immediate 변형) | 동상 (layer-tier) |
+| **PhaseAware** | **commit(설치)만** — `PhaseAwareSwapDispatcher::new` + `install_self_weak` + `commit_plan` + `set_max_chunks_per_token` 후 `op_trace::set_phase_hook`(process-wide singleton) 설치 | `PhaseAwareSwapDispatcher`(impl `PhaseHook`, phase_aware_swap.rs:684) — **op boundary dispatch** | **op-tier (INV-147)** — `INV-HOTPATH-DISPATCH` 로 PipelineStage 로 못 올림. Stage 는 설치만 |
+
+- **핵심 분리.** Incremental 만 swap 진행이 *decode tick 경계*(step-tier)에서 일어나 PipelineStage 의 `on_phase` multi-tick drain 으로 자연 표현된다. IntraForward/LayerImmediate(layer 경계)·PhaseAware(op 경계)는 **forward 내부 hot path**에서 진행되므로 — `INV-HOTPATH-DISPATCH` 의 "layer-tier dyn 금지"(production hot)에 막혀 — PipelineStage 로 격상 불가다. 이들에 대해 Stage 는 directive 도착 tick 에 hook 객체를 *설치*(construction tier)하고 즉시 `Consumed` 반환한다. 실제 swap 은 그 hook 이 forward 중 layer/op 경계에서 자율 진행한다(INV-147/149/150 검증 = 별개 서브시스템, `pipeline.rs:203` census — StepHook/PhaseHook/LayerBoundaryHook 은 본 decode-loop pipeline 과 무관한 live 서브시스템).
+- **production winner (LISWAP-6 등가 보존).** production winner = **per-tick=2 + async + dynamic-K + sub-batch pause**(메모리 spike 회피 hard constraint, LISWAP-6). 이는 Incremental mode 의 `IncrementalSwapPlan(per_tick=2)` + `AsyncSwapDispatcher` + `DynamicKController`/sub-batch pause 조합으로 표현된다 — AB-6 이전은 **이 조합을 등가 보존**한다(per_tick·async·pacing 메커니즘은 ADR-0006 D2 "pacing = executor 소유" 그대로, plan 에 안 담음). `handle_swap_weights` §6 Incremental arm 의 `per_tick = 2usize`(swap_runtime.rs:233) hardcode 가 이 winner 의 코드화이며, Stage 이전 시 동일 상수 보존.
+- **commit_slot → Stage 내부 상태 흡수.** 현 `SwapCommitSlot`(swap_runtime.rs:35, 소비자 0 orphan)이 4-mode 객체를 담던 역할은 Stage 가 흡수한다 — Incremental plan 은 Stage 의 `Mutex<IncrementalSwapPlan>` 필드(ADR-0006 D5 "&mut 상태 = Mutex", `IntraForwardSwapHook`/`PhaseAwareSwapDispatcher` 의 `Mutex` 선례), hook 3종은 설치 후 process-global/transformer slot 으로 떠나므로 Stage 가 보유 불요.
+
+#### 5.6.4 dispatcher 변경 — `submit_swap` + transient 시맨틱
+
+`SwapWeights` arm 을 **② LoopControl deprecated 필드**(`swap_weights: Option<(f32, DtypeTag)>`, command_dispatcher.rs:108 — set 후 v2 소비자 0)에서 **① submit 분류**로 이동한다. `LoopControl.swap_weights` 필드를 삭제한다(write-only dead-end 소멸 — partition 의 `partition_ratio` 필드 삭제와 동형).
+
+```text
+EngineCommand::SwapWeights { ratio, target_dtype } => self.submit_swap(*ratio, *target_dtype),
+```
+
+```text
+fn submit_swap(&mut self, ratio: f32, target_dtype: DtypeTag):
+    let Some(rt) = self.swap_runtime.as_ref() else { return }   // 미구성(happy/chat) — directive 무시
+    if self.layer_slots.is_empty() { return }                    // 미구성
+    let stage = WeightSwapStage::one_shot(
+        self.layer_slots.clone(), rt.clone(), self.importance.clone(), ratio, target_dtype)
+    self.registry.submit(Arc::new(stage))
+```
+
+**sticky 시맨틱 = transient (no last-applied 게이트, no armed 게이트).** swap 은 **transient** 다 — partition 의 last-applied 비교 게이트(§5.5.2)도, evict 의 `evict_armed` edge-trigger 게이트(§5.4)도 **불요**하다. 근거:
+- **transient 등가 anchor**: beta4 과도기 테스트(`engine/tests/beta4_command_channel.rs:220` "swap_weights 등가" + `command_dispatcher.rs:632` `assert_eq!(c2.swap_weights, None, "swap transient")`)가 swap=transient 를 단언한다 — directive 도착 tick 에만 set, 다음 dispatch 에서 carry 0(quant 처럼 sticky 아님). 이 transient 시맨틱을 OneShot submit 으로 보존: directive 도착 = submit 1회, 다음 tick 재submit 없음(carry 부재).
+- **재submit 차단 = in-flight 가드가 담당**: partition 은 *값이 곧 상태*(어떤 split geometry)라 값 비교 게이트가 정확했으나, swap 은 *진행 중 동작*(F16→Q4_0 변환이 multi-tick 에 걸쳐 진행)이라 **R-1 동시 활성화 차단**이 핵심이다. 이 차단은 dispatcher 의 last-applied 비교가 아니라 **Stage commit 경로의 in-flight 가드**(§5.6.2 §2, `commit_slot.is_idle()` 등가 = 현 Incremental plan 이 미완 drain 이면 새 commit reject)가 담당한다. 즉 같은 directive 가 재도착해도 in-flight Stage 가 살아 있으면 새 submit 의 commit 이 §2 에서 reject 된다.
+- **RestoreDefaults**: swap 역전(F16 recall)은 `SwapExecutor` 단방향(F16→Q4_0)이라 **신규 메커니즘 부재**(ADR-0006 §5 Risk "RestoreDefaults swap 역전 = 신규 메커니즘", §6 Deferred). 따라서 AB-6 의 `submit_swap` 는 RestoreDefaults 에 대응하지 않는다(swap 복원 no-op) — partition 의 `submit_partition_full` 같은 역전 submit 없음. swap reversal 은 ADR-0006 §6 Deferred 그대로.
+
+> **partition 과의 차이 (landmine)**: partition 게이트(`last_partition_ratio` 비교)를 swap 에 복사 **금지**. partition 은 idempotent re-slice(같은 ratio 재적용 = 같은 산출, 비용만 지불)라 값 비교로 비용 절감했으나, swap 은 같은 ratio 재도착이 *추가 layer swap*(currently_swapped 차감 후 budget) 또는 *in-flight 충돌*을 의미하므로 값 비교가 부정확하다. in-flight 가드가 정확한 차단이다.
+
+#### 5.6.5 LifecyclePhase rename (`PostEviction`→`WeightMutate`, dead variant 3종 삭제)
+
+본 절은 작업 항목 2 의 SSOT 다. `LifecyclePhase`(§5.1, `pipeline.rs:168`) 의 cross-cutting stage hook 블록을 정리한다 — **발화 위치·순서 불변**(driver 무수정 B안):
+
+| 구 variant | 신 variant | 처분 | 근거 |
+|---|---|---|---|
+| `PreEviction` | **`KvMutate`** | rename | KV cache mutation phase(EvictionStage 구독). 발화 위치 = decode_loop.rs:330(v1 (b) eviction-before) 불변 |
+| `PostEviction` | **`WeightMutate`** | rename | weight mutation phase(WeightSwapStage 구독 — Incremental drain). 발화 위치 = decode_loop.rs:340(v1 (c) swap-before) 불변. **구독자 0→WeightSwapStage** (rename 비용 최소 — 기존 PostEviction 구독자 부재) |
+| `PreSwap` | — | **삭제** | driver 발화 0(decode_loop.rs grep — dispatch 호출처 부재), 구독자 0. dead variant |
+| `PostSwapBefore` | — | **삭제** | 동상 (driver 발화 0, 구독자 0) |
+| `PostSwapAfter` | — | **삭제** | 동상 (driver 발화 0, 구독자 0) |
+
+- **rename 2종 (위치·순서 불변).** `PreEviction`→`KvMutate`, `PostEviction`→`WeightMutate`. 발화 지점(decode_loop.rs:330/340)·dispatch 순서(KvMutate 먼저, WeightMutate 다음)·self-filter 비교 리터럴(EvictionStage `if *phase != KvMutate`, WeightSwapStage `if *phase != WeightMutate`)만 리터럴 치환. 의미 변경 0 — KV 변형 phase 와 weight 변형 phase 를 도메인 이름으로 정직하게 표현(구 Pre/PostEviction 은 eviction 전용 어휘였으나 weight swap 도 같은 슬롯에서 발화하므로 도메인 중립 이름이 정확). **PartitionStage 는 `PreForward` 잔류** — partition 은 plan 준비 성격(re-slice 후 forward 가 읽음)이고 AB-4 동결 직후라 phase 이동 없음(§5.5.1 근거 보존; 주석·문서에 "plan 준비 성격 + AB-4 동결" 명시).
+- **삭제 3종 (driver 발화 0 orphan).** `PreSwap`/`PostSwapBefore`/`PostSwapAfter` 는 v1 swap 인라인 슬롯((c)/(e)) 명명용 잔재였으나, β-7 driver 배선 결과 swap before=`PostEviction`(→`WeightMutate`)·swap after=`PostForward` 로 수렴(decode_loop.rs:338/362 주석 — "v1 (c) swap before / (e) swap after 인라인 슬롯 제거")해 이 3 variant 는 **driver 가 dispatch 하지 않고 구독자도 0**이다. enum 에서 삭제(EvictionStage·PartitionStage·TickStage 어느 구독 맵에도 부재 — 검증된 사실). 삭제 후 cross-cutting 블록 = `KvMutate`/`WeightMutate` 2종.
+- **arch v2 내 전 참조 갱신 의무 (완료)**: §5.1 enum 본문·§5.2.1 (가)(나)(라)·§5.5.1(PartitionStage 의 eviction phase 언급)·INV-DECODE-STAGE-001 canonical 목록(spec/41 L597)·ADR-0006 D5("매 `PreSwap` tick"→"매 `WeightMutate` tick" 정오, ADR-0006 §2 D5). `Pre/PostEviction`·`PreSwap`/`PostSwap*` 리터럴 grep 전수 치환 완료(잔존 = 본 §5.6.5 rename 표의 "구 X" 설명용 표기뿐).
+- **Implementer 코드 rename 대상**: `pipeline.rs:168` enum variant(`PreEviction`→`KvMutate` / `PostEviction`→`WeightMutate` / `PreSwap`·`PostSwapBefore`·`PostSwapAfter` 삭제) + `decode_loop.rs:330/340`(`dispatch_phase(LifecyclePhase::PreEviction/PostEviction)` 호출) + `eviction.rs:142`(self-filter `if *phase != LifecyclePhase::PreEviction`) + 테스트 리터럴(`eviction.rs`·`partition.rs`·`command_dispatcher.rs` 의 `LifecyclePhase::PreEviction` 등). 발화 위치·dispatch 순서 불변 — 순수 리터럴 치환 + dead variant 3종 제거.
+
+#### 5.6.6 manager report 경로 (`WeightSwapReport` 송신)
+
+`handle_swap_weights` §7 의 `manager_report_out = Some((ratio, n_planned, Instant::now(), qcf))` 는 후속 plan-retire 시점에 `WeightSwapReport` 로 송신된다. β-7 driver 배선 census(decode_loop.rs:611 주석 — "v1 report slot(EngineReport/ReportWrapper) 제거 — IPC 송출(capability/qcf/swap_report)은 decode loop 슬롯을 경유한 적이 없다")에 따르면 **IPC 송출은 decode loop slot 이 아니라 `ResilienceAdapter`(`CommandExecutor` 측) 직접 경로**다:
+
+```text
+WeightSwapStage commit (§7)
+  → EngineReport::send_swap_report(WeightSwapReport)        [resilience_adapter.rs:95]
+    → CommandExecutor::send_weight_swap_report(report)      [executor.rs:247]
+      → resp_tx.send(EngineMessage::WeightSwapReport(report))  [executor.rs:248 — 유일 송출]
+```
+
+- **송신 잔존 경로 설계.** WeightSwapStage 가 commit 후 `WeightSwapReport`(ratio/n_planned/qcf/소요시간)를 구성해 **register 시점 보유한 `EngineReport` handle**(또는 `ResilienceAdapter` 의 `send_swap_report` 호출 seam)로 송신한다. partition(보고 없음)과 달리 swap 은 manager 가 적용 결과(actual swapped layers·QCF)를 받아야 하므로 report 송신이 필수다 — 이 handle 은 EvictionStage 가 `CacheManager` 를 register 시점 보유한 것과 동형(Stage 가 자기 책임 출력 채널을 held-handle 로 보유, god-ctx 회피). `EngineReport`(command_dispatcher.rs:56)는 이미 `send_swap_report(WeightSwapReport)`(L59)를 가지므로 trait 표면 무확장.
+- **Incremental multi-tick 의 report 타이밍.** Incremental 은 commit(directive 도착 tick)에 `n_planned`(=selected_layers.len())이 확정되므로 report 는 commit 시점 1회 송신(plan-retire 까지 대기 불요 — `manager_report_out` 의 "후속 plan-retire 시점" 표현은 v1 의 지연 송출 관용으로, AB-6 은 commit 시점 송신으로 단순화 가능; Implementer 가 등가 anchor `qcf_runtime.rs:790` 송출 타이밍 확인 후 택1). non-Incremental 도 hook 설치 시점에 `n_planned` 확정 → 동일 commit-시점 송신.
+
+#### 5.6.7 배선 (CommandDispatcher::new + build_bench_loop)
+
+`CommandDispatcher::new`(command_dispatcher.rs:153)에 swap handle 추가(현 partition handle `layer_slots`/`hardware` 옆):
+- `swap_runtime: Option<Arc<EngineSwapRuntime>>` = `main()` 진입 시 1회 생성(swap_runtime.rs:55 주석 — manager/CLI force-swap 신호 수신용 자원 묶음). `None` 이면 swap directive 무시(미구성 — happy/chat). build_bench_loop 가 secondary_mmap 보유 모델일 때만 구성.
+- `importance: Option<Arc<dyn ImportanceLookup>>` = WeightSwapDecider 입력(`handle_swap_weights` 의 importance 인자). build_bench_loop 가 이미 importance 경로 보유 시 재사용.
+- `layer_slots: Vec<Arc<LayerSlot>>` = **partition 분과 공유**(이미 AB-4 §5.5.8 에서 dispatcher 로 흐름 — swap 이 같은 handle 재사용, 추가 추출 0).
+
+> **non-local 변경 경고**: `EngineSwapRuntime` 은 `swap_backend`/`AsyncSwapDispatcher`/`release_worker` 를 보유하므로 build_bench_loop 가 이들을 구성·전달해야 한다(현 swap 미배선 = `NoOpSwapStage`, ADR-0006 §5 "greenfield wiring"). secondary_mmap 부재 모델(happy/chat)은 `swap_runtime=None` → swap directive 무시(무영향). **host smoke 불가**(GPU 부재 + secondary 필요) — build/clippy + CLI parse + dispatcher transient/in-flight 단위테스트 + `handle_swap_weights` §1~7 등가 테스트까지. 실 swap decode·정확성·device 게이트 = S25/Jetson 필수(legacy frozen baseline 대조).
 
 ---
 
