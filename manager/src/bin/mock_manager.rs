@@ -513,13 +513,14 @@ fn run_protocol(args: &Args, stream: &mut (impl Read + Write)) -> anyhow::Result
                 heartbeat_count += 1;
                 println!(
                     "[MockManager] Heartbeat #{}: device={}, kv_util={:.3}, tokens={}, state={:?}, \
-                     active_actions={:?}",
+                     active_actions={:?}, kv_dtype={}",
                     heartbeat_count,
                     status.active_device,
                     status.kv_cache_utilization,
                     status.tokens_generated,
                     status.state,
                     status.active_actions,
+                    status.kv_dtype,
                 );
             }
             Some(other) => {
@@ -560,11 +561,13 @@ fn run_protocol(args: &Args, stream: &mut (impl Read + Write)) -> anyhow::Result
             Some(EngineMessage::Heartbeat(status)) => {
                 heartbeat_count += 1;
                 println!(
-                    "[MockManager] Heartbeat #{}: device={}, kv_util={:.3}, active_actions={:?}",
+                    "[MockManager] Heartbeat #{}: device={}, kv_util={:.3}, active_actions={:?}, \
+                     kv_dtype={}",
                     heartbeat_count,
                     status.active_device,
                     status.kv_cache_utilization,
                     status.active_actions,
+                    status.kv_dtype,
                 );
             }
             Some(_) => {}
