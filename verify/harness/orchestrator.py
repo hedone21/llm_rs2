@@ -1346,14 +1346,26 @@ def _run_scenario_adb_signal(
 
             # Wait for the engine background process to finish.
             # Poll the rc file; fall back to action_timeout.
+            # AB-5: gate on `test -f` so a transient/garbled `cat` can never
+            # fake a digit for a not-yet-existing rc file (observed S25: the
+            # loop broke ~1s in and pulled a prefill-truncated stderr while
+            # the engine kept decoding for another ~10s). Log the break for
+            # post-hoc timing forensics.
+            t_poll0 = time.monotonic()
             deadline_engine = time.monotonic() + action_timeout
             while time.monotonic() < deadline_engine:
                 rc_chk, rc_out, _ = remote.exec(
-                    f"cat {shlex.quote(action_rc_remote)} 2>/dev/null || true",
+                    f"test -f {shlex.quote(action_rc_remote)} && "
+                    f"cat {shlex.quote(action_rc_remote)} || echo PENDING",
                     timeout=10.0,
                 )
-                if rc_chk == 0 and (rc_out or "").strip().isdigit():
-                    rc_a = int(rc_out.strip())
+                token = (rc_out or "").strip()
+                if rc_chk == 0 and token.isdigit():
+                    rc_a = int(token)
+                    print(
+                        f"  [signal] engine.rc={token} after "
+                        f"{time.monotonic() - t_poll0:.1f}s (raw={rc_out!r})"
+                    )
                     break
                 time.sleep(1.0)
             else:
@@ -1373,6 +1385,9 @@ def _run_scenario_adb_signal(
                     )
 
             # Pull engine stdout/stderr now that the process has exited.
+            # AB-5: the stderr is verdict-bearing (stderr_sequence regex) — if
+            # the pulled copy lacks the run-end marker, the engine was still
+            # running at pull time; re-poll the rc and re-pull once.
             try:
                 remote.pull(action_stdout_remote, action_stdout_local, retries=2, timeout=120.0)
             except Exception as e:
@@ -1385,6 +1400,32 @@ def _run_scenario_adb_signal(
                 print(f"  [warn] action.stderr pull failed: {e}")
                 if not action_stderr_local.exists():
                     action_stderr_local.write_bytes(b"")
+            try:
+                _tail = action_stderr_local.read_text(errors="replace")[-2000:]
+            except Exception:
+                _tail = ""
+            if "generated=" not in _tail:
+                print("  [signal] pulled stderr lacks end marker — re-pulling")
+                redeadline = time.monotonic() + 120.0
+                while time.monotonic() < redeadline:
+                    rc_chk, rc_out, _ = remote.exec(
+                        f"test -f {shlex.quote(action_rc_remote)} && "
+                        f"cat {shlex.quote(action_rc_remote)} || echo PENDING",
+                        timeout=10.0,
+                    )
+                    if rc_chk == 0 and (rc_out or "").strip().isdigit():
+                        rc_a = int((rc_out or "").strip())
+                        break
+                    time.sleep(2.0)
+                try:
+                    remote.pull(
+                        action_stderr_remote, action_stderr_local, retries=2, timeout=120.0
+                    )
+                    remote.pull(
+                        action_stdout_remote, action_stdout_local, retries=2, timeout=120.0
+                    )
+                except Exception as e:
+                    print(f"  [warn] action.stderr re-pull failed: {e}")
 
             time.sleep(1.0)
     finally:
