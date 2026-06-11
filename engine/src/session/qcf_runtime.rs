@@ -854,12 +854,19 @@ pub fn compute_qcf_estimates(
         // Read current_pos / v_buffer / k_buffer from the first handle (layer-0 geometry).
         let current_pos = ctx.kv_handles[0].current_pos();
 
-        let v_host_readable = ctx.kv_handles[0].with_cache_mut(|c| !c.v_buffer.as_ptr().is_null());
+        // GPU 백엔드는 as_ptr() 이 non-null(zero-copy DMA-BUF / rpcmem 매핑) 이어도 GPU 가
+        // attention 중 V 를 쓴 뒤 CPU 캐시가 invalidate 되지 않아 stale(0) 을 읽는다 (ARM UMA
+        // 캐시 비일관성). as_ptr 직접 접근은 cache-coherent 를 보장하지 못하므로 GPU 면 항상
+        // read_buffer(D2H) 로 강제한다 — 그래야 o_before=Σα·V 가 실데이터가 되어 QCF≠0.
+        // CPU 백엔드만 as_ptr 직접 접근(fast path)이 coherent 하다.
+        let v_host_readable = ctx.kv_handles[0]
+            .with_cache_mut(|c| !c.v_buffer.backend().is_gpu() && !c.v_buffer.as_ptr().is_null());
 
         if current_pos > 0 {
             // Try to obtain host-readable byte slices for layer-0 v/k buffers.
-            // Fast path: as_ptr() is valid (CPU / CL_MEM_USE_HOST_PTR mapped).
-            // Slow path (device-only): read_buffer fallback — 1 D2H per RequestQcf cold call.
+            // Fast path: CPU backend, as_ptr() valid and cache-coherent.
+            // Slow path: GPU backend (cache-incoherent as_ptr) 또는 device-only buffer →
+            // read_buffer fallback (1 D2H per RequestQcf cold call).
             let (v_bytes_opt, k_bytes_opt): (Option<Vec<u8>>, Option<Vec<u8>>) = if v_host_readable
             {
                 (None, None) // fast path: VDataSource::from_buffer(_, None) will use as_ptr
