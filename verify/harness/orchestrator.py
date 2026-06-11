@@ -858,7 +858,7 @@ def _run_scenario_adb(
         backend=backend,
         enable_resilience=False,
         resilience_transport=None,
-        extra_args=scenario_extra + forced_thread_args,
+        extra_args=forced_thread_args + scenario_extra,
     )
     t0 = time.monotonic()
     # S25 can be slower than Jetson; bump the baseline timeout generously.
@@ -942,7 +942,7 @@ def _run_scenario_adb(
         backend=backend,
         enable_resilience=True,
         resilience_transport=transport_engine,
-        extra_args=scenario_extra + forced_thread_args,
+        extra_args=forced_thread_args + scenario_extra,
     )
 
     t1 = time.monotonic()
@@ -1186,7 +1186,7 @@ def _run_scenario_adb_signal(
         backend=backend,
         enable_resilience=False,
         resilience_transport=None,
-        extra_args=scenario_extra + forced_thread_args,
+        extra_args=forced_thread_args + scenario_extra,
     )
     t0 = time.monotonic()
     rc_b, timed_b = run_foreground_adb(
@@ -1245,7 +1245,7 @@ def _run_scenario_adb_signal(
         backend=backend,
         enable_resilience=True,
         resilience_transport=engine_transport,
-        extra_args=scenario_extra + forced_thread_args,
+        extra_args=forced_thread_args + scenario_extra,
     )
 
     # action_rc_remote: device-side file where engine exit code is written.

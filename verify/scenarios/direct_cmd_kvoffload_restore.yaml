@@ -19,7 +19,11 @@ action:
     - delay_sec: 0.5
       command: KvOffload
       params: { ratio: 0.5 }
-    - delay_sec: 2.5
+    # delay_sec 1.0: q4 TBT ~35ms × 96 tok ≈ 3.4s decode. KvOffload arrives ~1.5s
+    # into decode (after model load), leaving ~1.9s of decode window.
+    # 1.0s < 1.9s → RestoreDefaults arrives before Done (margin ~0.9s).
+    # f16 TBT ~59ms × 96 tok ≈ 5.7s decode → margin >>1s, no regression.
+    - delay_sec: 1.0
       command: RestoreDefaults
       params: {}
 expected:

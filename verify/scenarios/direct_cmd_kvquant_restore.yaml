@@ -18,7 +18,11 @@ action:
     - delay_sec: 0.5
       command: KvQuantDynamic
       params: { target_bits: 4 }
-    - delay_sec: 2.5
+    # delay_sec 1.0: q4 TBT ~46ms × 96 tok ≈ 4.4s decode. KvQuantDynamic arrives
+    # ~1.5s into decode, leaving ~2.9s of decode window.
+    # 1.0s < 2.9s → RestoreDefaults arrives before Done (margin ~1.9s).
+    # f16 TBT ~68ms × 96 tok ≈ 6.5s decode → margin >>1s, no regression.
+    - delay_sec: 1.0
       command: RestoreDefaults
       params: {}
 expected:

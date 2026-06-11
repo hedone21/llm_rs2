@@ -20,8 +20,9 @@ expected:
   functional:
     engine_commands_any_of: [SetTargetTbt]
     stderr_patterns:
-      - "\\[Resilience\\] Directive.*SetTargetTbt"
-      - "\\[Resilience\\] SetTargetTbt:.*250ms"
+      # v2 log format: "[Resilience] Directive seq=N: SetTargetTbt { target_ms: 250 }"
+      # Effect (pacing engaged) is quantitatively verified by the perf layer (min_pct=150).
+      - "\\[Resilience\\] Directive seq=.*SetTargetTbt"
     heartbeat_checks: []
   performance:
     metric: avg_tbt_ms

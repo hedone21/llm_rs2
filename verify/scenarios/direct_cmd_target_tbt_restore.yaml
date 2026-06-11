@@ -22,9 +22,11 @@ action:
 expected:
   functional:
     engine_commands_any_of: [SetTargetTbt]
+    # v2 log format: "[Resilience] Directive seq=N: SetTargetTbt { target_ms: 250 }"
+    # The second directive target_ms=0 releases pacing.
     stderr_sequence:
-      - { pattern: "\\[Resilience\\] SetTargetTbt:.*250ms", name: slow }
-      - { pattern: "\\[Resilience\\] SetTargetTbt:.*(0ms|->\\s*0)", name: released, after: slow, min_occurrences: 1 }
+      - { pattern: "\\[Resilience\\] Directive seq=.*SetTargetTbt \\{ target_ms: 250 \\}", name: slow }
+      - { pattern: "\\[Resilience\\] Directive seq=.*SetTargetTbt \\{ target_ms: 0 \\}", name: released, after: slow, min_occurrences: 1 }
       - { pattern: "\\[Experiment\\] Done", after: released, min_occurrences: 1 }
     heartbeat_checks: []
   crash_and_progress:
