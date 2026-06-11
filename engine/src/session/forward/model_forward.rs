@@ -526,10 +526,10 @@ impl Forward for ModelForward {
         // `&mut acc` lifetime 을 보장한다(forward 완료 = end_step 자동 호출 후 guard 해제).
         // cell None 또는 acc 비활성이면 score_accumulator: None (거동-0).
         let mut score_guard = self.score_cell.lock().expect("score_cell mutex poisoned");
-        if let Some(ref mut acc) = *score_guard {
-            if acc.is_active() {
-                acc.begin_step();
-            }
+        if let Some(ref mut acc) = *score_guard
+            && acc.is_active()
+        {
+            acc.begin_step();
         }
 
         // score_guard 를 유지한 채로 &mut acc 참조를 forward_into 에 주입.

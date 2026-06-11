@@ -1296,7 +1296,7 @@ mod tests {
         let scores: Vec<f32> = vec![1.0 / n_tokens as f32; n_tokens];
 
         let ctx_with_scores = QcfEstimateContext {
-            kv_handles: &[handle.clone()],
+            kv_handles: std::slice::from_ref(&handle),
             kivi_handles: &[],
             importance: None,
             streaming_config: None,
