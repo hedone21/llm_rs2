@@ -12,9 +12,9 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::kv::kv_cache::KVCache;
 use crate::format::KVCacheFormat;
 use crate::kv::kivi_format::KIVIFormat;
+use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
@@ -837,102 +837,133 @@ pub fn compute_qcf_estimates(
 
     // ── 1-4. StandardFormat handle-based eviction/merge QCF via unified formula ──
     //
-    // ISSUE-6 guard: OpenCL device-only 버퍼는 `as_ptr()`이 명시적으로
-    // `ptr::null()`을 반환한다. `VDataSource::from_buffer(None)` 가 host pointer 검사
-    // 후 `None`을 돌려주므로 device-only 캐시는 자연스럽게 skip된다.
+    // ISSUE-6 guard: OpenCL zero-copy KV (UnifiedBuffer / CL_MEM_ALLOC_HOST_PTR)는
+    // unmapped 상태에서 `as_ptr()=null`을 반환한다. host pointer가 null인 경우
+    // backend read-back fallback으로 layer-0 v/k buffer를 Vec<u8>으로 읽어온 뒤
+    // `VDataSource::from_buffer(&buf, Some(&bytes))` 경로를 사용한다.
+    // read_buffer 실패 시에만 eprintln 경고(graceful skip).
     if !ctx.kv_handles.is_empty() {
         // Read current_pos / v_buffer / k_buffer from the first handle (layer-0 geometry).
         let current_pos = ctx.kv_handles[0].current_pos();
 
-        let v_host_readable = ctx.kv_handles.iter().all(|h| {
-            h.with_cache_mut(|c| !c.v_buffer.as_ptr().is_null())
-        });
+        let v_host_readable = ctx.kv_handles[0].with_cache_mut(|c| !c.v_buffer.as_ptr().is_null());
 
-        if current_pos > 0 && !v_host_readable {
-            eprintln!(
-                "[QCF] KV-based estimates skipped: v_buffer is device-only (signal path without host-mapped KV)."
-            );
-        }
-
-        if v_host_readable && current_pos > 0 {
-            let keep_ratio = 0.5f32;
-            let target_len = (current_pos as f32 * keep_ratio) as usize;
-            let protected_prefix = 4usize;
-
-            // v1 fallback_scores path: importance table has per-layer data, not per-token;
-            // use uniform fallback (same as v1 when score_accumulator is None or inactive).
-            let scores_opt: Option<Vec<f32>> = None; // uniform fallback (v1 fallback_scores 등가)
-            let fallback_scores = vec![1.0 / current_pos.max(1) as f32; current_pos];
-            let attention_scores_owned: Vec<f32> = fallback_scores;
-
-            if target_len < current_pos {
-                let mut actions: Vec<(&'static str, QcfActionType, bool)> = vec![
-                    (
-                        "kv.evict_sliding",
-                        QcfActionType::EvictSliding { target_len },
-                        false,
-                    ),
-                    (
-                        "kv.evict_h2o",
-                        QcfActionType::EvictH2o {
-                            target_len,
-                            keep_ratio: 0.5,
-                            protected_prefix,
-                        },
-                        true,
-                    ),
-                    (
-                        "kv.merge_d2o",
-                        QcfActionType::MergeD2o {
-                            target_len,
-                            keep_ratio: 0.5,
-                            protected_prefix,
-                        },
-                        true,
-                    ),
-                ];
-                if let Some((sink_size, window_size)) = ctx.streaming_config {
-                    actions.push((
-                        "kv.evict_streaming",
-                        QcfActionType::EvictStreaming {
-                            sink_size,
-                            window_size,
-                        },
-                        false,
-                    ));
-                }
-
-                // Run each action inside with_cache_mut to borrow v_buffer/k_buffer safely.
-                for (id, action, requires_scores) in actions {
-                    if requires_scores && scores_opt.is_none() {
-                        continue;
+        if current_pos > 0 {
+            // Try to obtain host-readable byte slices for layer-0 v/k buffers.
+            // Fast path: as_ptr() is valid (CPU / CL_MEM_USE_HOST_PTR mapped).
+            // Slow path (device-only): read_buffer fallback — 1 D2H per RequestQcf cold call.
+            let (v_bytes_opt, k_bytes_opt): (Option<Vec<u8>>, Option<Vec<u8>>) = if v_host_readable
+            {
+                (None, None) // fast path: VDataSource::from_buffer(_, None) will use as_ptr
+            } else {
+                // Fallback: read layer-0 v_buffer (and k_buffer) from device.
+                let (v_res, k_res) = ctx.kv_handles[0].with_cache_mut(|cache| {
+                    let backend = cache.v_buffer.backend().clone();
+                    let v_size = cache.v_buffer.buffer().size();
+                    let k_size = cache.k_buffer.buffer().size();
+                    let mut v_bytes = vec![0u8; v_size];
+                    let mut k_bytes = vec![0u8; k_size];
+                    let v_ok = backend.read_buffer(&cache.v_buffer, &mut v_bytes);
+                    let k_ok = backend.read_buffer(&cache.k_buffer, &mut k_bytes);
+                    (v_ok.map(|_| v_bytes), k_ok.map(|_| k_bytes))
+                });
+                match v_res {
+                    Ok(v_bytes) => (Some(v_bytes), k_res.ok()),
+                    Err(e) => {
+                        eprintln!(
+                            "[QCF] KV-based estimates skipped: v_buffer read_buffer failed: {e}"
+                        );
+                        (None, None)
                     }
-                    let qcf_opt = ctx.kv_handles[0].with_cache_mut(|cache| {
-                        let v_source = VDataSource::from_buffer(&cache.v_buffer, None)?;
-                        let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
-                            VDataSource::from_buffer(&cache.k_buffer, None)
-                        } else {
-                            None
-                        };
-                        let params = QcfKvParams {
-                            action: action.clone(),
-                            v_source,
-                            k_source,
-                            attention_scores: &attention_scores_owned,
-                            head_attn: None,
-                            n_kv_heads: cache.kv_heads(),
-                            head_dim: cache.head_dim(),
-                            current_pos,
-                            capacity: cache.capacity(),
-                            layout: cache.layout(),
-                            aggregation: AggregationMode::Mean,
-                            beta: 1.0,
-                        };
-                        let (qcf, _) = compute_qcf_kv(&params);
-                        Some(qcf)
-                    });
-                    if let Some(qcf) = qcf_opt {
-                        estimates.insert(id.to_string(), qcf);
+                }
+            };
+
+            let can_compute = v_host_readable || v_bytes_opt.is_some();
+
+            if can_compute {
+                let keep_ratio = 0.5f32;
+                let target_len = (current_pos as f32 * keep_ratio) as usize;
+                let protected_prefix = 4usize;
+
+                // v1 fallback_scores path: importance table has per-layer data, not per-token;
+                // use uniform fallback (same as v1 when score_accumulator is None or inactive).
+                let scores_opt: Option<Vec<f32>> = None; // uniform fallback (v1 fallback_scores 등가)
+                let fallback_scores = vec![1.0 / current_pos.max(1) as f32; current_pos];
+                let attention_scores_owned: Vec<f32> = fallback_scores;
+
+                if target_len < current_pos {
+                    let mut actions: Vec<(&'static str, QcfActionType, bool)> = vec![
+                        (
+                            "kv.evict_sliding",
+                            QcfActionType::EvictSliding { target_len },
+                            false,
+                        ),
+                        (
+                            "kv.evict_h2o",
+                            QcfActionType::EvictH2o {
+                                target_len,
+                                keep_ratio: 0.5,
+                                protected_prefix,
+                            },
+                            true,
+                        ),
+                        (
+                            "kv.merge_d2o",
+                            QcfActionType::MergeD2o {
+                                target_len,
+                                keep_ratio: 0.5,
+                                protected_prefix,
+                            },
+                            true,
+                        ),
+                    ];
+                    if let Some((sink_size, window_size)) = ctx.streaming_config {
+                        actions.push((
+                            "kv.evict_streaming",
+                            QcfActionType::EvictStreaming {
+                                sink_size,
+                                window_size,
+                            },
+                            false,
+                        ));
+                    }
+
+                    // Run each action inside with_cache_mut to borrow v_buffer/k_buffer safely.
+                    // When v_bytes_opt is Some (device-only fallback), pass the byte slices to
+                    // VDataSource::from_buffer so the QCF computation uses host copies.
+                    for (id, action, requires_scores) in actions {
+                        if requires_scores && scores_opt.is_none() {
+                            continue;
+                        }
+                        let v_bytes_ref: Option<&[u8]> = v_bytes_opt.as_deref();
+                        let k_bytes_ref: Option<&[u8]> = k_bytes_opt.as_deref();
+                        let qcf_opt = ctx.kv_handles[0].with_cache_mut(|cache| {
+                            let v_source = VDataSource::from_buffer(&cache.v_buffer, v_bytes_ref)?;
+                            let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
+                                VDataSource::from_buffer(&cache.k_buffer, k_bytes_ref)
+                            } else {
+                                None
+                            };
+                            let params = QcfKvParams {
+                                action: action.clone(),
+                                v_source,
+                                k_source,
+                                attention_scores: &attention_scores_owned,
+                                head_attn: None,
+                                n_kv_heads: cache.kv_heads(),
+                                head_dim: cache.head_dim(),
+                                current_pos,
+                                capacity: cache.capacity(),
+                                layout: cache.layout(),
+                                aggregation: AggregationMode::Mean,
+                                beta: 1.0,
+                            };
+                            let (qcf, _) = compute_qcf_kv(&params);
+                            Some(qcf)
+                        });
+                        if let Some(qcf) = qcf_opt {
+                            estimates.insert(id.to_string(), qcf);
+                        }
                     }
                 }
             }
@@ -1095,4 +1126,170 @@ pub fn dump_layer_weights_to_dir(
         out_dir.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::backend::cpu::CpuBackend;
+    use crate::buffer::DType;
+    use crate::kv::kv_cache::KVCache;
+    use crate::kv::standard_format::StandardFormat;
+    use crate::kv_cache_ops::KVLayout;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
+
+    use super::{QcfEstimateContext, compute_qcf_estimates};
+
+    /// HeadMajor F32 KVCache (CpuBackend, as_ptr 유효).
+    fn make_standard_format(
+        capacity: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        n_tokens: usize,
+    ) -> Arc<StandardFormat> {
+        let total = kv_heads * capacity * head_dim;
+        let mk_buf = |data: Vec<f32>| {
+            let buf = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+            let mut t = Tensor::new(
+                Shape::new(vec![1, kv_heads, capacity, head_dim]),
+                buf,
+                Arc::new(CpuBackend::new()),
+            );
+            t.as_mut_slice::<f32>().copy_from_slice(&data);
+            t
+        };
+        let v_data: Vec<f32> = (0..total).map(|i| i as f32 * 0.01 + 0.1).collect();
+        let k_data: Vec<f32> = (0..total).map(|i| i as f32 * 0.02 + 0.2).collect();
+        let k = mk_buf(k_data);
+        let v = mk_buf(v_data);
+        let mut cache = KVCache::new(k, v, capacity);
+        // SeqMajor/HeadMajor: SharedBuffer로 만든 캐시는 SeqMajor 기본값.
+        // current_pos만 n_tokens로 설정한다.
+        for _ in 0..n_tokens {
+            cache.advance_pos(1);
+        }
+        Arc::new(StandardFormat::new(0, cache))
+    }
+
+    /// AB-5 fallback 검증: `VDataSource::from_buffer(&tensor, Some(&bytes))` 경로가
+    /// `from_buffer(&tensor, None)` (as_ptr 직접 접근)와 동일한 QCF를 반환하는지 확인.
+    ///
+    /// 이것이 device-only 버퍼의 read-back fallback 경로와 동등하다
+    /// (device bytes를 Vec<u8>으로 읽어온 후 cpu_bytes=Some 경로로 주입).
+    #[test]
+    fn test_vdata_source_cpu_bytes_matches_direct() {
+        let kv_heads = 2usize;
+        let head_dim = 4usize;
+        let capacity = 16usize;
+        let current_pos = 8usize;
+        let target_len = 4usize;
+
+        let v_data: Vec<f32> = (0..kv_heads * capacity * head_dim)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+
+        let scores: Vec<f32> = vec![1.0 / current_pos as f32; current_pos];
+
+        // Path A: from_buffer(_, None) — direct as_ptr
+        let buf_a = Arc::new(SharedBuffer::new(v_data.len() * 4, DType::F32));
+        let mut t_a = Tensor::new(
+            Shape::new(vec![1, kv_heads, capacity, head_dim]),
+            buf_a,
+            Arc::new(CpuBackend::new()),
+        );
+        t_a.as_mut_slice::<f32>().copy_from_slice(&v_data);
+        let src_direct = VDataSource::from_buffer(&t_a, None)
+            .expect("direct path should succeed for CpuBackend");
+
+        // Path B: from_buffer(_, Some(&bytes)) — cpu_bytes injected (simulates read-back)
+        let v_bytes: Vec<u8> = v_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let src_fallback =
+            VDataSource::from_buffer(&t_a, Some(&v_bytes)).expect("cpu_bytes path should succeed");
+
+        let (qcf_direct, _) = compute_qcf_kv(&QcfKvParams {
+            action: QcfActionType::EvictSliding { target_len },
+            v_source: src_direct,
+            k_source: None,
+            attention_scores: &scores,
+            head_attn: None,
+            n_kv_heads: kv_heads,
+            head_dim,
+            current_pos,
+            capacity,
+            layout: KVLayout::HeadMajor,
+            aggregation: AggregationMode::Mean,
+            beta: 1.0,
+        });
+        let (qcf_fallback, _) = compute_qcf_kv(&QcfKvParams {
+            action: QcfActionType::EvictSliding { target_len },
+            v_source: src_fallback,
+            k_source: None,
+            attention_scores: &scores,
+            head_attn: None,
+            n_kv_heads: kv_heads,
+            head_dim,
+            current_pos,
+            capacity,
+            layout: KVLayout::HeadMajor,
+            aggregation: AggregationMode::Mean,
+            beta: 1.0,
+        });
+
+        assert!(
+            (qcf_direct - qcf_fallback).abs() < 1e-6,
+            "cpu_bytes fallback QCF ({qcf_fallback}) should match direct QCF ({qcf_direct})"
+        );
+    }
+
+    /// `compute_qcf_estimates`가 CPU-backed StandardFormat(as_ptr 유효)에서
+    /// KV 기반 estimates를 정상 반환하는지 확인.
+    #[test]
+    fn test_compute_qcf_estimates_cpu_kv_returns_sliding() {
+        let handle = make_standard_format(32, 2, 4, 16);
+        let ctx = QcfEstimateContext {
+            kv_handles: &[handle],
+            kivi_handles: &[],
+            importance: None,
+            streaming_config: None,
+            importance_table: None,
+            num_layers: 4,
+        };
+        let estimates = compute_qcf_estimates(&ctx);
+        // current_pos=16, keep_ratio=0.5 → target_len=8 < 16 → sliding should appear.
+        // h2o/d2o require scores (scores_opt=None) → only sliding expected.
+        assert!(
+            estimates.contains_key("kv.evict_sliding"),
+            "expected kv.evict_sliding in estimates, got keys: {:?}",
+            estimates.keys().collect::<Vec<_>>()
+        );
+        let qcf = estimates["kv.evict_sliding"];
+        assert!(qcf >= 0.0, "sliding QCF should be non-negative, got {qcf}");
+        // QCF = 0 when V is all-zero; QCF ≤ 1 always. Accept both 0 and >0.
+        assert!(qcf <= 1.0, "sliding QCF should be <= 1.0, got {qcf}");
+    }
+
+    /// `compute_qcf_estimates`가 current_pos=0인 경우 estimates를 반환하지 않는지 확인.
+    #[test]
+    fn test_compute_qcf_estimates_empty_cache_returns_no_kv_estimates() {
+        let handle = make_standard_format(32, 2, 4, 0);
+        let ctx = QcfEstimateContext {
+            kv_handles: &[handle],
+            kivi_handles: &[],
+            importance: None,
+            streaming_config: None,
+            importance_table: None,
+            num_layers: 4,
+        };
+        let estimates = compute_qcf_estimates(&ctx);
+        let kv_keys: Vec<_> = estimates.keys().filter(|k| k.starts_with("kv.")).collect();
+        assert!(
+            kv_keys.is_empty(),
+            "empty cache should produce no kv estimates, got: {:?}",
+            kv_keys
+        );
+    }
 }
