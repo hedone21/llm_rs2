@@ -24,6 +24,7 @@ use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport}
 
 use crate::hardware::Hardware;
 use crate::kv::cache_manager::CacheManager;
+use crate::kv::kivi_format::KIVIFormat;
 use crate::kv::standard_format::StandardFormat;
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::LayerSlot;
@@ -31,6 +32,7 @@ use crate::qcf_collector::ImportanceLookup;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::swap_runtime::EngineSwapRuntime;
 use crate::stages::kv::eviction::EvictionStage;
+use crate::stages::kv::kivi_quant::KiviQuantStage;
 use crate::stages::weight::partition::PartitionStage;
 use crate::stages::weight::weight_swap::WeightSwapStage;
 
@@ -68,11 +70,12 @@ pub trait EngineReport {
 /// `CommandDispatcher::dispatch` 가 매 step 갱신하고, `DecodeLoop::run` 이 읽어 sleep/break/pacing
 /// 한다. v1 `ExecutionPlan` 의 control 필드와 1:1 (매핑 문서 1.2/1.3).
 ///
-/// **과도기 필드(offload_ratio/recall_offload/restore_defaults/kv_quant_bits/layer_skip)** 는
-/// 대응 Stage(AB-2) 미구현이라 deprecated 로 잔존한다(G1) — 구==신 등가만 보장하고, run() 인라인
-/// 소비는 (a.6) offload/recall 만 live 다(나머지는 generate/forward 측 sticky). **partition 은
-/// AB-4 에서 OneShot `PartitionStage`, swap 은 AB-6 에서 OneShot `WeightSwapStage` 로 이전됨** —
-/// `partition_ratio`/`swap_weights` 필드는 삭제됐다(write-only dead-end 소멸, §5.5/§5.6).
+/// **과도기 필드(offload_ratio/recall_offload/restore_defaults/layer_skip)** 는 대응 Stage(AB-3)
+/// 미구현이라 deprecated 로 잔존한다(G1) — 구==신 등가만 보장하고, run() 인라인 소비는 (a.6)
+/// offload/recall 만 live 다(나머지는 generate/forward 측 sticky). **partition 은 AB-4 에서 OneShot
+/// `PartitionStage`, swap 은 AB-6 에서 OneShot `WeightSwapStage`, quant 는 AB-2 에서 OneShot
+/// `KiviQuantStage` 로 이전됨** — `partition_ratio`/`swap_weights`/`kv_quant_bits` 필드는 삭제됐다
+/// (write-only dead-end 소멸, §5.5/§5.6/§5.7).
 #[derive(Debug, Clone, Default)]
 pub struct LoopControl {
     // ── ② control 핵심 (run() live 소비) ──
@@ -101,11 +104,9 @@ pub struct LoopControl {
     /// Whether to restore all action-induced state to defaults.
     pub restore_defaults: bool,
 
-    // ── 과도기 5종 (deprecated, G1 — AB-2/4/6 Stage 이전 예정) ──
+    // ── 과도기 (deprecated, G1 — AB-3 Stage 이전 예정) ──
     /// KV cache offload ratio. (KvOffload — (a.6) live `forward.try_offload`)
     pub offload_ratio: Option<f32>,
-    /// KV quantization bits. (KvQuantDynamic — sticky, generate/forward 측)
-    pub kv_quant_bits: Option<u8>,
     /// Layer skip ratio. (LayerSkip — sticky, forward skip_config 측)
     pub layer_skip: Option<f32>,
 
@@ -143,6 +144,9 @@ pub struct CommandDispatcher {
     swap_runtime: Option<Arc<EngineSwapRuntime>>,
     /// ① WeightSwapStage 의 decider importance 입력(AB-6 §5.6.1). `None` 이면 uniform fallback.
     importance: Option<Arc<dyn ImportanceLookup>>,
+    /// ① KiviQuantStage 가 transition 할 KIVI handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
+    /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-KIVI: Standard/Offload).
+    kivi_handles: Vec<Arc<KIVIFormat>>,
     /// ② 누적 루프 제어 상태 (sticky control — throttle/tbt 유지, evict 는 OneShot 으로 분리).
     control: LoopControl,
 
@@ -155,6 +159,12 @@ pub struct CommandDispatcher {
     /// partition 은 값이 곧 상태이므로 값 비교가 정확한 게이트). RestoreDefaults 시 `None` 으로
     /// reset(재무장) + Full 복원 submit.
     last_partition_ratio: Option<f32>,
+    /// AB-2 §5.7.3: quant sticky last-applied 게이트. 같은 bits 의 재submit 을 막고(`transition_bits`
+    /// 자체 no-op 이기도 하나 loop 진입 자체 차단 = 비용 절감), 값 변경 시 재적용한다(partition 의
+    /// `last_partition_ratio` 와 동형 — 값이 곧 상태이므로 값 비교가 정확한 게이트, evict bool armed
+    /// 복사 금지). RestoreDefaults 시 `None` 으로 reset(재무장) — **16bit 복원 transition 없음**
+    /// (v1 등가, partition `submit_partition_full` 과 비대칭).
+    last_quant_bits: Option<u8>,
 }
 
 impl CommandDispatcher {
@@ -171,6 +181,9 @@ impl CommandDispatcher {
         model: Option<Arc<TransformerModel>>,
         swap_runtime: Option<Arc<EngineSwapRuntime>>,
         importance: Option<Arc<dyn ImportanceLookup>>,
+        // AB-2 §5.7.8: KiviQuantStage 가 transition 할 KIVI handle. Standard/Offload 경로는 빈 Vec
+        // → KvQuantDynamic directive 무시 (inert — evict CM=None 동형).
+        kivi_handles: Vec<Arc<KIVIFormat>>,
     ) -> Self {
         Self {
             registry,
@@ -181,9 +194,11 @@ impl CommandDispatcher {
             model,
             swap_runtime,
             importance,
+            kivi_handles,
             control: LoopControl::default(),
             evict_armed: false,
             last_partition_ratio: None,
+            last_quant_bits: None,
         }
     }
 
@@ -279,7 +294,10 @@ impl CommandDispatcher {
                 self.control.target_tbt_ms = 0;
                 // target_tbt_set 은 false 로 (CLI fallback branch — v1 :489 주석 등가).
                 self.control.target_tbt_set = false;
-                self.control.kv_quant_bits = None;
+                // AB-2 §5.7.3: quant guard clear 만 (재무장 — 다음 KvQuantDynamic 이 어떤 bits 든
+                // 재적용). **16bit 복원 transition submit 없음** (v1 등가 — partition
+                // `submit_partition_full` 과 비대칭).
+                self.last_quant_bits = None;
                 // 상태 C 재무장: 다음 KvEvict* directive 가 새 OneShot submit 가능 (2부).
                 self.evict_armed = false;
                 // AB-4 §5.5.2: partition 을 GPU-only(Full)로 복원 + last reset(재무장). v1
@@ -311,8 +329,9 @@ impl CommandDispatcher {
             EngineCommand::KvOffload { ratio } => {
                 self.control.offload_ratio = Some(ratio.clamp(0.0, 1.0));
             }
+            // ── ① quant → OneShot KiviQuantStage submit (AB-2 §5.7.3) ──
             EngineCommand::KvQuantDynamic { target_bits } => {
-                self.control.kv_quant_bits = Some(*target_bits);
+                self.submit_kv_quant(*target_bits);
             }
             // ── ① partition → OneShot PartitionStage submit (AB-4 §5.5.2) ──
             EngineCommand::SetPartitionRatio { ratio } => {
@@ -355,6 +374,24 @@ impl CommandDispatcher {
         }
         self.evict_armed = true;
         let stage = EvictionStage::one_shot(self.kv_handles.clone(), Arc::clone(cm), target_ratio);
+        self.registry.submit(Arc::new(stage));
+    }
+
+    /// ① KvQuantDynamic directive 1건을 OneShot `KiviQuantStage` 로 submit (AB-2 §5.7.3).
+    ///
+    /// sticky last-applied 게이트: 같은 bits 면 재submit 0(transition_bits 자체 no-op 이기도 하나
+    /// loop 진입 차단 = 비용 절감), 값 변경 시 재적용(새 OneShot → transition). `kivi_handles` 가
+    /// 비면 미구성(non-KIVI: Standard/Offload) — directive 무시(evict CM=None 동형). partition 의
+    /// `last_partition_ratio` 게이트와 동형(evict bool armed 복사 금지 — 값 비교 게이트).
+    fn submit_kv_quant(&mut self, target_bits: u8) {
+        if self.last_quant_bits == Some(target_bits) {
+            return; // 값 무변경 → 재submit 0 (sticky 핵심 — partition last-applied 동형).
+        }
+        if self.kivi_handles.is_empty() {
+            return; // 미구성 (non-KIVI: Standard/Offload — KIVI handle 부재).
+        }
+        self.last_quant_bits = Some(target_bits);
+        let stage = KiviQuantStage::one_shot(self.kivi_handles.clone(), target_bits);
         self.registry.submit(Arc::new(stage));
     }
 
@@ -474,7 +511,8 @@ mod tests {
         let registry = Arc::new(PipelineRegistry::new());
         let handle = make_handle(N_TOKENS);
         let cm = make_cm();
-        // partition/swap 미구성 (빈 slots + None hardware/model/swap_runtime): evict 전용 dispatcher.
+        // partition/swap/quant 미구성 (빈 slots + None hardware/model/swap_runtime + 빈 kivi_handles):
+        // evict 전용 dispatcher.
         let d = CommandDispatcher::new(
             Arc::clone(&registry),
             vec![handle.clone()],
@@ -484,6 +522,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         (d, registry, handle)
     }
@@ -538,6 +577,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         (d, registry)
     }
@@ -648,6 +688,36 @@ mod tests {
             Some(make_swap_model(&be, 2)),
             Some(make_swap_runtime(&be)),
             None,
+            Vec::new(),
+        );
+        (d, registry)
+    }
+
+    // ── AB-2: kivi_handles 를 구성한 dispatcher helper (CPU KiviCache) ──
+
+    fn make_quant_dispatcher() -> (CommandDispatcher, Arc<PipelineRegistry>) {
+        use crate::kv::kivi_cache::KiviCache;
+        use crate::kv::kivi_format::KIVIFormat;
+        let registry = Arc::new(PipelineRegistry::new());
+        // CPU KiviCache(bits=16 initial — --kv-dynamic-quant 진입 동형). head_dim/residual = QKKV 배수.
+        let kivi_handles: Vec<Arc<KIVIFormat>> = (0..2)
+            .map(|i| {
+                Arc::new(KIVIFormat::new(
+                    i,
+                    KiviCache::new_with_bits(1, 32, 128, 32, 16),
+                ))
+            })
+            .collect();
+        let d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            kivi_handles,
         );
         (d, registry)
     }
@@ -772,35 +842,71 @@ mod tests {
         );
     }
 
-    // ── 과도기 5종 등가 (KvOffload/SwapWeights/KvQuantDynamic) ──
+    // ── 과도기 등가 (KvOffload/LayerSkip) — AB-2/4/6 으로 이전된 quant/partition/swap 제외 ──
 
     #[test]
     fn transitional_fields_equivalence() {
         let (mut d, _r, _h) = make_dispatcher();
-        // AB-4: SetPartitionRatio, AB-6: SwapWeights 는 LoopControl 필드가 아니라 OneShot Stage
-        // submit 으로 이전됨(partition_ratio/swap_weights 필드 삭제). 본 테스트는 잔존 과도기
-        // 필드(offload/quant/layer_skip)만. swap transient 시맨틱은 swap_transient_resubmits_each_directive 가 승계.
+        // AB-2: KvQuantDynamic, AB-4: SetPartitionRatio, AB-6: SwapWeights 는 LoopControl 필드가
+        // 아니라 OneShot Stage submit 으로 이전됨(kv_quant_bits/partition_ratio/swap_weights 필드
+        // 삭제). 본 테스트는 잔존 과도기 필드(offload/layer_skip)만. quant sticky 등가는
+        // quant_sticky_resubmits_on_value_change 가, swap transient 시맨틱은
+        // swap_transient_resubmits_each_directive 가 승계.
         let c = d.dispatch(vec![
             EngineCommand::KvOffload { ratio: 0.5 },
-            EngineCommand::KvQuantDynamic { target_bits: 4 },
             EngineCommand::LayerSkip { skip_ratio: 0.25 },
         ]);
         assert_eq!(c.offload_ratio, Some(0.5));
-        assert_eq!(c.kv_quant_bits, Some(4));
         assert_eq!(c.layer_skip, Some(0.25));
-        // sticky: quant 는 다음 dispatch 에 carry, offload 는 transient.
+        // sticky: layer_skip 는 다음 dispatch 에 carry, offload 는 transient.
         let c2 = d.dispatch(vec![]);
-        assert_eq!(c2.kv_quant_bits, Some(4), "quant sticky");
+        assert_eq!(c2.layer_skip, Some(0.25), "layer_skip sticky");
         assert_eq!(c2.offload_ratio, None, "offload transient");
     }
 
+    // ── AB-2: quant OneShot submit + sticky last-applied 게이트 (§5.7.9 승계) ──
+
+    /// quant 미구성(빈 kivi_handles) dispatcher 는 KvQuantDynamic 을 무시 (non-KIVI 경로).
     #[test]
-    fn restore_defaults_clears_sticky_quant() {
-        let (mut d, _r, _h) = make_dispatcher();
+    fn quant_unconfigured_ignores_directive() {
+        let (mut d, registry, _h) = make_dispatcher(); // 빈 kivi_handles
+        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 4 }]);
+        assert_eq!(registry.len(), 0, "quant 미구성 → directive 무시");
+    }
+
+    /// 새 bits → OneShot KiviQuantStage 1개 submit. 같은 bits 반복/빈 batch → 재submit 0,
+    /// 값 변경 → 재submit (partition `last_partition_ratio` 게이트 동형). RestoreDefaults 후 재무장.
+    /// **16bit 복원 submit 부재** 단언(partition `submit_partition_full` 과 비대칭).
+    #[test]
+    fn quant_sticky_resubmits_on_value_change() {
+        let (mut d, registry) = make_quant_dispatcher();
+        assert_eq!(registry.len(), 0);
+        // 첫 directive → OneShot 1 submit.
+        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 4 }]);
+        assert_eq!(registry.len(), 1, "첫 quant directive → OneShot 1개 submit");
+        // 같은 bits 반복 → 재submit 0 (sticky last-applied).
+        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 4 }]);
+        assert_eq!(registry.len(), 1, "같은 bits 반복 — 재submit 없음");
+        // 빈 batch 에도 재submit 0 (sticky carry 아님 — last-applied 비교).
+        d.dispatch(vec![]);
+        assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
+        // 값 변경(4 → 8) → 새 OneShot submit.
         d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 8 }]);
-        let c = d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert_eq!(c.kv_quant_bits, None);
-        assert!(c.recall_offload, "RestoreDefaults → recall_offload");
+        assert_eq!(registry.len(), 2, "bits 변경 → 새 OneShot submit");
+        // RestoreDefaults → 재무장 (16bit 복원 submit 없음 — registry 불변).
+        d.dispatch(vec![EngineCommand::RestoreDefaults]);
+        assert_eq!(
+            registry.len(),
+            2,
+            "RestoreDefaults → 16bit 복원 submit 없음 (partition 과 비대칭)"
+        );
+        // 재무장: 같은 bits(8)도 last=None reset 후라 재적용된다.
+        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 8 }]);
+        assert_eq!(
+            registry.len(),
+            3,
+            "RestoreDefaults 후 재무장 → 어떤 bits 든 재적용"
+        );
     }
 
     // ── exhaustive match 컴파일 강제 (게이트 2): variant 가 apply 에서 누락되면 컴파일 실패 ──
@@ -819,6 +925,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
         assert_eq!(registry.len(), 0, "CM 미구성 → evict directive 무시");

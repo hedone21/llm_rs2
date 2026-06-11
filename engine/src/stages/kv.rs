@@ -9,7 +9,11 @@
 //!
 //! **입주자 1호(Phase β-3 commit B)**: [`eviction::EvictionStage`] — `KvMutate` phase 에서
 //! CacheManager UER(take/put_inner) 경유로 발화하는 v2 `PipelineStage`. v1 `try_evict`(AB-1)와
-//! 산출 동일(madvise/CacheEvent/min-floor 회계 보존). 나머지 입주자(D2O/KIVI/Swap/TierMove)는
-//! 후속 substep 에서 채운다.
+//! 산출 동일(madvise/CacheEvent/min-floor 회계 보존).
+//!
+//! **입주자 2호(AB-2 §5.7)**: [`kivi_quant::KiviQuantStage`] — `KvMutate` phase 에서 KIVI cache
+//! bit-width 를 `transition_bits` 로 런타임 전환하는 OneShot Stage. EvictionStage 와 형제(KV 축).
+//! 나머지 입주자(D2O/Swap/TierMove)는 후속 substep 에서 채운다.
 
 pub mod eviction;
+pub mod kivi_quant;
