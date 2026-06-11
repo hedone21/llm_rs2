@@ -20,7 +20,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport};
+use llm_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
 
 use crate::hardware::Hardware;
 use crate::kv::cache_manager::CacheManager;
@@ -91,8 +91,6 @@ pub struct LoopControl {
     // ── ② control 비-live (seam 잔존, run() 미소비) ──
     /// Whether inference should resume from suspension. (Resume — executor 내부 state 만)
     pub resumed: bool,
-    /// Whether Engine should compute and send QCF estimates. (RequestQcf — EngineReport 경로)
-    pub request_qcf: bool,
     /// Prefill policy update (batch/runner.rs 경로 소비). (SetPrefillPolicy)
     pub prefill_chunk_size: Option<usize>,
     pub prefill_yield_ms: Option<u32>,
@@ -147,6 +145,9 @@ pub struct CommandDispatcher {
     /// ① KiviQuantStage 가 transition 할 KIVI handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
     /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-KIVI: Standard/Offload).
     kivi_handles: Vec<Arc<KIVIFormat>>,
+    /// AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 manager 로 송출하는 채널.
+    /// `None` 이면 미배선(resilience-off / host 단위테스트) → RequestQcf 가 무송출(inert).
+    report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
     /// ② 누적 루프 제어 상태 (sticky control — throttle/tbt 유지, evict 는 OneShot 으로 분리).
     control: LoopControl,
 
@@ -171,6 +172,7 @@ impl CommandDispatcher {
     /// dispatcher 생성. `cache_manager` 가 `None` 이면 evict directive 는 무시되고(미구성),
     /// `layer_slots` 가 비었거나 `hardware` 가 `None` 이면 partition directive 는 무시된다.
     /// `model`/`swap_runtime` 이 `None` 이면 swap directive 는 무시된다(AB-6 §5.6.4).
+    /// `report_tx` 가 `None` 이면 RequestQcf 무송출(inert — AB-5 §5.8.2).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<PipelineRegistry>,
@@ -184,6 +186,8 @@ impl CommandDispatcher {
         // AB-2 §5.7.8: KiviQuantStage 가 transition 할 KIVI handle. Standard/Offload 경로는 빈 Vec
         // → KvQuantDynamic directive 무시 (inert — evict CM=None 동형).
         kivi_handles: Vec<Arc<KIVIFormat>>,
+        // AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 송출할 채널. None → inert.
+        report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
     ) -> Self {
         Self {
             registry,
@@ -195,6 +199,7 @@ impl CommandDispatcher {
             swap_runtime,
             importance,
             kivi_handles,
+            report_tx,
             control: LoopControl::default(),
             evict_armed: false,
             last_partition_ratio: None,
@@ -226,7 +231,6 @@ impl CommandDispatcher {
         // transient(매 step 새로 결정되는) 필드만 초기화 — sticky(throttle/tbt/quant/partition)는 carry.
         self.control.suspended = false;
         self.control.resumed = false;
-        self.control.request_qcf = false;
         self.control.recall_offload = false;
         self.control.restore_defaults = false;
         self.control.offload_ratio = None;
@@ -306,8 +310,9 @@ impl CommandDispatcher {
                 // SetPartitionRatio 가 어떤 ratio 든 재적용된다.
                 self.submit_partition_full();
             }
+            // AB-5 §5.8.2: query directive — dispatcher 직결 compute+send. LoopControl 경유 0.
             EngineCommand::RequestQcf => {
-                self.control.request_qcf = true;
+                self.compute_and_send_qcf();
             }
             EngineCommand::SetPrefillPolicy {
                 chunk_size,
@@ -433,6 +438,30 @@ impl CommandDispatcher {
         self.registry.submit(Arc::new(stage));
     }
 
+    /// AB-5 §5.8.2: RequestQcf 수신 시 dispatcher 직결 QcfEstimate 산출·송출.
+    ///
+    /// `report_tx` 가 `None` 이면 inert(미배선 — resilience-off / host 단위테스트).
+    /// `report_tx` 가 `Some` 이면 `compute_qcf_estimates` 로 dry-run 산출 후 `EngineMessage::QcfEstimate` 송출.
+    /// `&self` — query 이므로 mutation 없음.
+    fn compute_and_send_qcf(&self) {
+        let Some(tx) = self.report_tx.as_ref() else {
+            return; // 미배선 → inert (drop).
+        };
+        let ctx = crate::session::qcf_runtime::QcfEstimateContext {
+            kv_handles: &self.kv_handles,
+            kivi_handles: &self.kivi_handles,
+            importance: self.importance.as_deref(),
+            streaming_config: None,
+            importance_table: None,
+            num_layers: self.kv_handles.len().max(self.kivi_handles.len()),
+        };
+        let est = crate::session::qcf_runtime::compute_qcf_estimates(&ctx);
+        let _ = tx.send(EngineMessage::QcfEstimate(llm_shared::QcfEstimate {
+            estimates: est,
+            layer_swap: None,
+        }));
+    }
+
     /// ① SwapWeights directive 1건을 OneShot `WeightSwapStage` 로 submit (AB-6 §5.6.4).
     ///
     /// **transient 시맨틱**: partition 의 last-applied 게이트도 evict 의 armed 게이트도 **없다**
@@ -512,7 +541,7 @@ mod tests {
         let handle = make_handle(N_TOKENS);
         let cm = make_cm();
         // partition/swap/quant 미구성 (빈 slots + None hardware/model/swap_runtime + 빈 kivi_handles):
-        // evict 전용 dispatcher.
+        // evict 전용 dispatcher. report_tx=None (AB-5 단위테스트는 미배선).
         let d = CommandDispatcher::new(
             Arc::clone(&registry),
             vec![handle.clone()],
@@ -523,6 +552,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None, // report_tx: AB-5
         );
         (d, registry, handle)
     }
@@ -578,6 +608,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None, // report_tx: AB-5
         );
         (d, registry)
     }
@@ -689,6 +720,7 @@ mod tests {
             Some(make_swap_runtime(&be)),
             None,
             Vec::new(),
+            None, // report_tx: AB-5
         );
         (d, registry)
     }
@@ -718,6 +750,7 @@ mod tests {
             None,
             None,
             kivi_handles,
+            None, // report_tx: AB-5
         );
         (d, registry)
     }
@@ -926,6 +959,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None, // report_tx: AB-5
         );
         d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
         assert_eq!(registry.len(), 0, "CM 미구성 → evict directive 무시");

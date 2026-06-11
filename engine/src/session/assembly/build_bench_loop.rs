@@ -306,6 +306,11 @@ pub fn build_bench_loop(
         };
     let swap_model_handle = swap_runtime.as_ref().map(|_| Arc::clone(&swap_model));
 
+    // AB-5 §5.8.4: report_tx = resilience.as_ref().map(|a| a.report_sender()) — swap_runtime
+    // 의 report_tx(build_bench_loop.rs:289)와 동일 source(같은 report_sender() clone).
+    // resilience-off 면 None → dispatcher 가 RequestQcf 무송출(inert).
+    let report_tx_for_dispatcher = resilience.as_ref().map(|a| a.report_sender());
+
     // γ-3b: schedule_source 가 있어도 dispatcher 를 구성해야 evict directive 가 OneShot
     // EvictionStage 로 submit 된다 (설계 §13.4 "schedule.is_some() OR 추가").
     let dispatcher = if resilience.is_some() || shared_cm.is_some() || schedule_source.is_some() {
@@ -324,6 +329,8 @@ pub fn build_bench_loop(
             None, // importance: argus-bench 는 score accumulator 미장착 → uniform fallback.
             // AB-2: Standard 경로는 KIVI handle 부재 → 빈 Vec (KvQuantDynamic directive inert).
             Vec::new(),
+            // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
+            report_tx_for_dispatcher,
         ))
     } else {
         None

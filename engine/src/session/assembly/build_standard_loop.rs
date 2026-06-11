@@ -141,7 +141,7 @@ pub fn build_standard_loop(
             }
             let registry = Arc::new(PipelineRegistry::new());
             // happy/chat 경로는 partition/swap/quant 미구성 (빈 slots + None hardware/model/
-            // swap_runtime + 빈 kivi_handles).
+            // swap_runtime + 빈 kivi_handles). report_tx=None (AB-5: happy-path resilience 미배선).
             let dispatcher = CommandDispatcher::new(
                 Arc::clone(&registry),
                 mf.fmt_caches().to_vec(),
@@ -152,6 +152,7 @@ pub fn build_standard_loop(
                 None,
                 None,
                 Vec::new(),
+                None, // report_tx: AB-5
             );
             (Some(adapter), Some((registry, dispatcher, kv_pos_handle)))
         }

@@ -13,9 +13,13 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::kv::kv_cache::KVCache;
+use crate::format::KVCacheFormat;
+use crate::kv::kivi_format::KIVIFormat;
+use crate::kv::standard_format::StandardFormat;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModelForwardArgs;
+use crate::qcf_collector::ImportanceLookup;
 use crate::session::eval::EvalCacheKind;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
@@ -793,6 +797,176 @@ pub fn dispatch_swap_weights(
         std::time::Instant::now(),
         qcf_swap_estimated,
     ));
+}
+
+/// Groups all inputs needed by [`compute_qcf_estimates`] so that the caller
+/// constructs a single struct instead of passing many individual arguments.
+///
+/// v1 anchor: `generate.rs`(`d5ed71d2^`) L3676-3695 `QcfEstimateContext`. Adapted:
+/// `kv_caches: &[KVCache]` → `kv_handles: &[Arc<StandardFormat>]`.
+pub struct QcfEstimateContext<'a> {
+    /// Standard format KV handles (one per layer). Empty → no KV-based estimates.
+    pub kv_handles: &'a [Arc<StandardFormat>],
+    /// KIVI handles for `kv.quant_dynamic` estimate. Empty → quant estimate skipped.
+    pub kivi_handles: &'a [Arc<KIVIFormat>],
+    /// Attention score lookup for H2O / D2O / streaming actions. `None` → uniform fallback.
+    pub importance: Option<&'a dyn ImportanceLookup>,
+    /// (sink_size, window_size) for StreamingLLM dry-run. None = skip.
+    pub streaming_config: Option<(usize, usize)>,
+    /// Pre-built importance table for LayerSkip dry-run. None = skip.
+    pub importance_table: Option<&'a crate::qcf::ImportanceTable>,
+    /// Total number of transformer layers (needed for LayerSkip).
+    pub num_layers: usize,
+}
+
+/// Compute dry-run QCF estimates for all 6 lossy actions (ENG-ALG-050).
+/// Read-only: does not modify KV caches or KIVI caches.
+///
+/// v1 anchor: `generate.rs`(`d5ed71d2^`) L3696-3850 `compute_qcf_estimates`. Byte-level
+/// lift-and-shift: only adaptation = `&[KVCache]` → `&[Arc<StandardFormat>]` handle access
+/// via `with_cache_mut`.
+///
+/// Returns estimates map (keys: `kv.evict_sliding` / `kv.evict_h2o` / `kv.merge_d2o` /
+/// `kv.evict_streaming` / `kv.quant_dynamic` / `weight.skip`).
+pub fn compute_qcf_estimates(
+    ctx: &QcfEstimateContext<'_>,
+) -> std::collections::HashMap<String, f32> {
+    use crate::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
+    use std::collections::HashMap;
+    let mut estimates = HashMap::new();
+
+    // ── 1-4. StandardFormat handle-based eviction/merge QCF via unified formula ──
+    //
+    // ISSUE-6 guard: OpenCL device-only 버퍼는 `as_ptr()`이 명시적으로
+    // `ptr::null()`을 반환한다. `VDataSource::from_buffer(None)` 가 host pointer 검사
+    // 후 `None`을 돌려주므로 device-only 캐시는 자연스럽게 skip된다.
+    if !ctx.kv_handles.is_empty() {
+        // Read current_pos / v_buffer / k_buffer from the first handle (layer-0 geometry).
+        let current_pos = ctx.kv_handles[0].current_pos();
+
+        let v_host_readable = ctx.kv_handles.iter().all(|h| {
+            h.with_cache_mut(|c| !c.v_buffer.as_ptr().is_null())
+        });
+
+        if current_pos > 0 && !v_host_readable {
+            eprintln!(
+                "[QCF] KV-based estimates skipped: v_buffer is device-only (signal path without host-mapped KV)."
+            );
+        }
+
+        if v_host_readable && current_pos > 0 {
+            let keep_ratio = 0.5f32;
+            let target_len = (current_pos as f32 * keep_ratio) as usize;
+            let protected_prefix = 4usize;
+
+            // v1 fallback_scores path: importance table has per-layer data, not per-token;
+            // use uniform fallback (same as v1 when score_accumulator is None or inactive).
+            let scores_opt: Option<Vec<f32>> = None; // uniform fallback (v1 fallback_scores 등가)
+            let fallback_scores = vec![1.0 / current_pos.max(1) as f32; current_pos];
+            let attention_scores_owned: Vec<f32> = fallback_scores;
+
+            if target_len < current_pos {
+                let mut actions: Vec<(&'static str, QcfActionType, bool)> = vec![
+                    (
+                        "kv.evict_sliding",
+                        QcfActionType::EvictSliding { target_len },
+                        false,
+                    ),
+                    (
+                        "kv.evict_h2o",
+                        QcfActionType::EvictH2o {
+                            target_len,
+                            keep_ratio: 0.5,
+                            protected_prefix,
+                        },
+                        true,
+                    ),
+                    (
+                        "kv.merge_d2o",
+                        QcfActionType::MergeD2o {
+                            target_len,
+                            keep_ratio: 0.5,
+                            protected_prefix,
+                        },
+                        true,
+                    ),
+                ];
+                if let Some((sink_size, window_size)) = ctx.streaming_config {
+                    actions.push((
+                        "kv.evict_streaming",
+                        QcfActionType::EvictStreaming {
+                            sink_size,
+                            window_size,
+                        },
+                        false,
+                    ));
+                }
+
+                // Run each action inside with_cache_mut to borrow v_buffer/k_buffer safely.
+                for (id, action, requires_scores) in actions {
+                    if requires_scores && scores_opt.is_none() {
+                        continue;
+                    }
+                    let qcf_opt = ctx.kv_handles[0].with_cache_mut(|cache| {
+                        let v_source = VDataSource::from_buffer(&cache.v_buffer, None)?;
+                        let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
+                            VDataSource::from_buffer(&cache.k_buffer, None)
+                        } else {
+                            None
+                        };
+                        let params = QcfKvParams {
+                            action: action.clone(),
+                            v_source,
+                            k_source,
+                            attention_scores: &attention_scores_owned,
+                            head_attn: None,
+                            n_kv_heads: cache.kv_heads(),
+                            head_dim: cache.head_dim(),
+                            current_pos,
+                            capacity: cache.capacity(),
+                            layout: cache.layout(),
+                            aggregation: AggregationMode::Mean,
+                            beta: 1.0,
+                        };
+                        let (qcf, _) = compute_qcf_kv(&params);
+                        Some(qcf)
+                    });
+                    if let Some(qcf) = qcf_opt {
+                        estimates.insert(id.to_string(), qcf);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 5. KIVI dynamic quantization QCF ──
+    if !ctx.kivi_handles.is_empty() {
+        let mut total_qcf = 0.0f32;
+        let mut count = 0u32;
+        for handle in ctx.kivi_handles {
+            let qcf = handle.with_cache_mut(|c| c.estimate_dryrun_qcf());
+            if qcf > 0.0 {
+                total_qcf += qcf;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            let avg_qcf = total_qcf / count as f32;
+            estimates.insert("kv.quant_dynamic".to_string(), avg_qcf.min(1.0));
+        }
+    }
+
+    // ── 6. LayerSkip QCF: importance-table based skip cost estimate ──
+    if let Some(table) = ctx.importance_table {
+        let total_sublayers = ctx.num_layers * 2;
+        let skip_count = total_sublayers / 4;
+        if skip_count > 0 {
+            let (qcf_skip, _skip_set) = table.estimate_qcf_for_count(skip_count, ctx.num_layers);
+            estimates.insert("weight.skip".to_string(), qcf_skip);
+        }
+    }
+
+    estimates
 }
 
 /// LISWAP-PPL diagnostic: dump every layer's weight tensors (wq/wk/wv/wo/

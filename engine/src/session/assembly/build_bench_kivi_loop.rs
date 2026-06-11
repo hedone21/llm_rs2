@@ -94,6 +94,10 @@ pub fn build_bench_kivi_loop(
         (other, _) => other,
     };
 
+    // AB-5 §5.8.4: report_tx = resilience.as_ref().map(|a| a.report_sender()) — Standard 경로
+    // build_bench_loop 와 동일 source(같은 report_sender() clone). resilience-off 면 None → inert.
+    let report_tx_for_dispatcher = resilience.as_ref().map(|a| a.report_sender());
+
     // §5.7.7: dispatcher — control + KvQuantDynamic 만 활성. eviction(kv_handles 빈 + CM=None)·
     // partition(layer_slots 빈 + hardware None)·swap(model/swap_runtime None) 전부 inert.
     // resilience-on 일 때만 구성(control 디렉티브 소비 + KvQuantDynamic).
@@ -108,6 +112,8 @@ pub fn build_bench_kivi_loop(
             None,       // swap_runtime: swap inert.
             None,       // importance.
             kivi_handles,
+            // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
+            report_tx_for_dispatcher,
         )
     });
 
