@@ -15,6 +15,7 @@ use anyhow::Result;
 use llm_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
 
 use crate::format::KVCacheFormat;
+use crate::kv::kivi_format::KIVIFormat;
 use crate::resilience::{CommandExecutor, KVSnapshot};
 use crate::session::command_dispatcher::{CommandSource, EngineReport};
 
@@ -30,6 +31,9 @@ pub struct ResilienceAdapter {
     /// β-4: heartbeat payload 의 kv_cache_tokens/capacity 를 query 할 held-handle.
     /// `None` 이면 partial snapshot(pos=0) — set_kv_handle 미주입 경로.
     kv_handle: Option<Arc<dyn KVCacheFormat>>,
+    /// AB-2 §5.7.6: heartbeat kv_dtype 를 query 할 KIVI concrete handle (layer-0). `None` 이면
+    /// KIVI 미배선(Standard/Offload) → `kv_dtype` 는 default `""` 유지(기존 동작 불변 — 회귀 금지).
+    kivi_handle: Option<Arc<KIVIFormat>>,
 }
 
 impl ResilienceAdapter {
@@ -37,12 +41,24 @@ impl ResilienceAdapter {
         Self {
             executor,
             kv_handle: None,
+            kivi_handle: None,
         }
     }
 
     /// β-4: heartbeat snapshot query 용 held-handle 주입(§5.2.1 (가) — kv_pos_handle 과 동일 패턴).
     pub fn set_kv_handle(&mut self, handle: Arc<dyn KVCacheFormat>) {
         self.kv_handle = Some(handle);
+    }
+
+    /// AB-2 §5.7.6: KIVI bench 경로에서 heartbeat kv_dtype query 용 KIVI concrete handle 주입.
+    ///
+    /// base `KVCacheFormat` 표면에 bit-width query 가 없어 `KIVIFormat::current_bits()` concrete
+    /// 접근이 필요하다(base trait downcast 미추가 — INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC). 같은
+    /// layer-0 handle 을 pos/capacity query 용 `kv_handle`(base coerce)에도 설치한다. Standard 경로는
+    /// 이 seam 미주입 → `kv_dtype` default `""` 유지(기존 동작 불변 — 회귀 금지).
+    pub fn set_kivi_handle(&mut self, handle: Arc<KIVIFormat>) {
+        self.kv_handle = Some(handle.clone() as Arc<dyn KVCacheFormat>);
+        self.kivi_handle = Some(handle);
     }
 
     /// 직접 접근이 필요한 caller (capability send 전 `set_has_secondary` 등)를 위해
@@ -74,10 +90,30 @@ impl ResilienceAdapter {
             Some(h) => KVSnapshot {
                 total_tokens: h.current_pos(),
                 capacity: h.capacity(),
+                // AB-2 §5.7.6: KIVI 경로면 layer-0 KIVIFormat 의 현재 bits 를 dtype 문자열로 매핑
+                // (v1 census `generate.rs`(d5ed71d2^) L4352 동형). Standard 경로(kivi_handle=None)는
+                // default `""` 유지(회귀 금지).
+                kv_dtype: self
+                    .kivi_handle
+                    .as_ref()
+                    .map(|k| bits_to_kv_dtype(k.current_bits()))
+                    .unwrap_or_default(),
                 ..KVSnapshot::default()
             },
             None => KVSnapshot::default(),
         }
+    }
+}
+
+/// AB-2 §5.7.6: KIVI bit-width → heartbeat `kv_dtype` 문자열 (v1 census `generate.rs`(d5ed71d2^)
+/// L4352 동형). verify YAML(`direct_cmd_kvquant_to_q4.yaml:27-30`)이 `q4` transition 을 검사한다.
+fn bits_to_kv_dtype(bits: u8) -> String {
+    match bits {
+        16 => "f16".to_string(),
+        8 => "q8".to_string(),
+        4 => "q4".to_string(),
+        2 => "q2".to_string(),
+        other => format!("q{other}"),
     }
 }
 

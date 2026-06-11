@@ -17,9 +17,9 @@
 
 use anyhow::bail;
 use clap::Parser;
-use llm_rs2::session::bin_setup::build_inference_ctx;
+use llm_rs2::session::bin_setup::{build_inference_ctx, build_kivi_bench_ctx};
 use llm_rs2::session::cli::{Args, KvMode};
-use llm_rs2::session::experiment_run::run_experiment_path;
+use llm_rs2::session::experiment_run::{run_experiment_path, run_kivi_experiment_path};
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -42,11 +42,18 @@ fn main() -> anyhow::Result<()> {
             "argus-bench AB-1: this combination of args is not yet supported. \
              supported: eviction <none|sliding|streaming|h2o|h2o_plus> + resilience. \
              blocked: qcf_dump, skip_ratio, d2o_layer_alloc, profile, profile_events, \
-             tensor_partition, weight-swap (→ AB-2..AB-6)."
+             tensor_partition, weight-swap (→ AB-3)."
         );
     }
     if args.num_tokens < 1 {
         bail!("argus-bench: --num-tokens must be >= 1");
+    }
+
+    // AB-2: KIVI dynamic-quant 분기. `--kv-mode kivi` 또는 `--kv-dynamic-quant`(orphan flag
+    // 재배선) 진입 시 KiviForward + KiviQuantStage 경로. Standard 는 ModelForward 경로.
+    if matches!(args.effective_kv_mode(), KvMode::Kivi) || args.kv_dynamic_quant {
+        let ctx = build_kivi_bench_ctx(args)?;
+        return run_kivi_experiment_path(ctx);
     }
 
     let ctx = build_inference_ctx(args)?;
@@ -100,8 +107,9 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
             "argus-bench AB-0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)"
         );
     }
-    if !matches!(args.effective_kv_mode(), KvMode::Standard) {
-        bail!("argus-bench AB-0: --kv-mode KIVI/Offload land in AB-2/AB-3");
+    // AB-2: --kv-mode kivi 해제 (KiviForward + KiviQuantStage 배선 완료). Offload(AB-3)는 bail 유지.
+    if matches!(args.effective_kv_mode(), KvMode::Offload) {
+        bail!("argus-bench AB-3: --kv-mode Offload lands in AB-3");
     }
     // AB-6: `--secondary-gguf` 해제 — SwapWeights runtime directive 경로의 secondary 공급원
     // (WeightSwapStage + build_bench_loop SwapWiringConfig 배선 완료). CLI 정적 swap

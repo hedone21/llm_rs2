@@ -12,14 +12,73 @@
 //! [`DecodeLoop::run`](crate::session::DecodeLoop) 가 `ExecutionPlan` 을 읽어
 //! 적용하므로 본 경로는 별도 처리하지 않는다 (avg_tbt 가 그 효과를 반영).
 
+use tokenizers::Tokenizer;
+
 use crate::experiment::{JsonlWriter, SummaryRecord, SystemSampler, TokenRecord};
-use crate::inference::sampling;
+use crate::inference::sampling::{self, SamplingConfig};
+use crate::session::DecodeLoop;
 use crate::session::assembly::{
-    SwapWiringConfig, build_bench_loop, build_local_pressure_source, build_resilience_cache_manager,
+    SwapWiringConfig, build_bench_kivi_loop, build_bench_loop, build_local_pressure_source,
+    build_resilience_cache_manager,
 };
+use crate::session::bin_setup::KiviBenchCtx;
+use crate::session::cli::Args;
 use crate::session::decode_loop::StopReason;
 use crate::session::experiment::ScheduleCommandSource;
 use crate::session::standard_happy::StandardHappyCtx;
+
+/// AB-2 §5.7.7: KIVI bench 경로 — `run_experiment_path` 의 KIVI 형제.
+///
+/// `build_bench_kivi_loop` 로 `KiviForward` + `KiviQuantStage` 배선 `DecodeLoop` 를 조립한 뒤,
+/// Standard 경로와 동일한 prefill→sample→run→summary 공통부([`run_decode_loop_experiment`])를 탄다.
+/// eviction/swap/partition 미배선(§5.7.7) — `cache_manager`/`pressure_source` 무주입.
+pub fn run_kivi_experiment_path(ctx: KiviBenchCtx) -> anyhow::Result<()> {
+    let KiviBenchCtx {
+        args,
+        backend,
+        memory,
+        hardware: _,
+        model,
+        kivi,
+        tokenizer,
+        tokens,
+        max_seq_len,
+        sampling_config,
+        vocab_size,
+        initial_bits,
+        residual_size,
+        resilience,
+    } = ctx;
+
+    eprintln!(
+        "[argus-bench] KIVI experiment path → DecodeLoop+KiviForward (tokens={}, budget={}, bits={})",
+        tokens.len(),
+        args.num_tokens,
+        initial_bits,
+    );
+
+    let decode_loop = build_bench_kivi_loop(
+        backend,
+        memory,
+        model,
+        &kivi,
+        initial_bits,
+        residual_size,
+        max_seq_len,
+        sampling_config.clone(),
+        resilience,
+    )?;
+
+    run_decode_loop_experiment(
+        decode_loop,
+        &args,
+        &tokenizer,
+        &tokens,
+        max_seq_len,
+        &sampling_config,
+        vocab_size,
+    )
+}
 
 pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     let StandardHappyCtx {
@@ -50,12 +109,6 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args.num_tokens
     );
 
-    let mut sys_sampler = SystemSampler::new(args.experiment_sample_interval);
-    let sys_start = args
-        .experiment_output
-        .as_ref()
-        .map(|_| sys_sampler.snapshot());
-
     // AB-1: CLI `eviction <policy>` 로 resilience force-eviction CacheManager 구성
     // (eviction=none 이면 None → happy-path 동등). plan.evict directive 가 오면
     // decode 루프가 forward.try_evict 로 mid-decode prune.
@@ -68,7 +121,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         .as_ref()
         .map(|_| build_local_pressure_source(&args, &backend));
     // ADR-0008: bin_setup이 dispatch한 kv_caches를 소비(과거엔 drop 후 typed 재할당).
-    let mut decode_loop = build_bench_loop(
+    let decode_loop = build_bench_loop(
         backend.clone(),
         memory.clone(),
         cpu_backend_arc.clone(),
@@ -93,17 +146,40 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         },
     )?;
 
+    run_decode_loop_experiment(
+        decode_loop,
+        &args,
+        &tokenizer,
+        &tokens,
+        max_seq_len,
+        &sampling_config,
+        vocab_size,
+    )
+}
+
+/// AB-2 §5.7.7: prefill→sample→run→summary 공통부 (`run_experiment_path` / `run_kivi_experiment_path`
+/// 공유). 조립된 `DecodeLoop` 를 받아 generation + JSONL/summary 산출까지 수행한다.
+#[allow(clippy::too_many_arguments)]
+fn run_decode_loop_experiment(
+    mut decode_loop: DecodeLoop,
+    args: &Args,
+    tokenizer: &Tokenizer,
+    tokens: &[u32],
+    max_seq_len: usize,
+    sampling_config: &SamplingConfig,
+    vocab_size: usize,
+) -> anyhow::Result<()> {
+    let mut sys_sampler = SystemSampler::new(args.experiment_sample_interval);
+    let sys_start = args
+        .experiment_output
+        .as_ref()
+        .map(|_| sys_sampler.snapshot());
+
     let t_prefill = std::time::Instant::now();
-    let mut last_logits = decode_loop.prefill(&tokens)?;
+    let mut last_logits = decode_loop.prefill(tokens)?;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
-    let first_token = sampling::sample(
-        &mut last_logits,
-        &tokens,
-        vocab_size,
-        &sampling_config,
-        None,
-    );
+    let first_token = sampling::sample(&mut last_logits, tokens, vocab_size, sampling_config, None);
 
     let t_decode = std::time::Instant::now();
     let result = decode_loop.run(args.num_tokens - 1, first_token)?;
@@ -115,7 +191,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         eprintln!("\n[Resilience] Inference suspended by system signal");
     }
 
-    let mut final_tokens: Vec<u32> = tokens.clone();
+    let mut final_tokens: Vec<u32> = tokens.to_vec();
     final_tokens.push(first_token);
     final_tokens.extend_from_slice(&result.tokens_generated);
     let decoded = tokenizer
@@ -180,7 +256,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         }
 
         let prompt_text = tokenizer
-            .decode(&tokens, true)
+            .decode(tokens, true)
             .unwrap_or_else(|_| String::new());
         let summary = SummaryRecord {
             _summary: true,

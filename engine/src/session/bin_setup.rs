@@ -12,10 +12,13 @@ use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
+use crate::capability::kivi_attention::KiviAttentionBackend;
+use crate::hardware::Hardware;
+use crate::inference::sampling::SamplingConfig;
 use crate::kv::kv_cache::{KVCache, KVLayout};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::session::cli::Args;
+use crate::session::cli::{Args, KvMode};
 use crate::session::init::SessionInitCtx;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::resilience_init::build_command_executor;
@@ -24,12 +27,22 @@ use crate::shape::Shape;
 use crate::tensor::Tensor;
 use technique_api::KVLayoutDesc;
 
-/// `Args` 를 받아 추론에 필요한 전 컨텍스트를 조립한다.
+/// `build_inference_ctx` / `build_kivi_bench_ctx` 공통 prelude 산출물 (AB-2 §5.7.7).
 ///
-/// `args.enable_resilience` 가 true 면 `build_command_executor` 로 transport 를
-/// 연결하고 [`ResilienceAdapter`] 를 만든다 (transport 실패는 Err 전파).
-/// false 면 `resilience = None` (NoOp default).
-pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
+/// init(`SessionInitCtx`) → tokenizer resolve/load → prompt encode → token 까지 공통부.
+/// Standard 는 이 뒤에 `Vec<KVCache>` 할당을, KIVI 는 caps pull + `Vec<KiviCache>` 할당을 한다.
+pub struct InferencePrelude {
+    pub init: SessionInitCtx,
+    pub tokenizer: Tokenizer,
+    pub tokens: Vec<u32>,
+}
+
+/// `build_inference_ctx` / `build_kivi_bench_ctx` 공통 prelude 조립 (AB-2 §5.7.7).
+///
+/// plugin dlopen + fat-LTO self-test + `SessionInitCtx::build` + tokenizer/prompt/token 까지.
+/// caps 보존을 위해 `SessionInitCtx` 전체를 [`InferencePrelude`] 로 반환한다(KIVI 는 caps 가
+/// `caps.get::<dyn KiviAttentionBackend>()` pull 에 필요).
+pub fn build_inference_prelude(args: &Args) -> anyhow::Result<InferencePrelude> {
     // GATE-C(ADR-0010 E6 W1): --load-plugin 의 `.so` 들을 .so 당 1회 dlopen 해 stage+format 양축
     // capability 를 등록한다(cross-axis open-once dispatcher — 번들/단일축 `.so` 모두 흡수). 이후
     // make_stage(--eviction-policy)/make_format(--kv-format)가 정적(linkme)+동적(여기) 통합 조회로
@@ -39,20 +52,13 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
     // drop 시 --kv-format 미해석 폴백 대신 fail-fast.
     crate::format::ensure_builtin_kv_formats_registered()?;
 
-    let ctx = SessionInitCtx::build(&args)?;
-    let backend = ctx.backend;
-    let memory = ctx.memory;
-    let hardware = ctx.hardware;
-    let sampling_config = ctx.sampling_config;
-    let model = ctx.model;
-    let model_path = ctx.model_path;
-    let is_gguf = ctx.is_gguf;
+    let init = SessionInitCtx::build(args)?;
 
-    let tokenizer_path = resolve_tokenizer_path(&args, &model_path, is_gguf);
+    let tokenizer_path = resolve_tokenizer_path(args, &init.model_path, init.is_gguf);
     eprintln!("[Tokenizer] {}", tokenizer_path);
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Cannot load tokenizer from {}: {}", tokenizer_path, e))?;
-    check_vocab_compatibility(&tokenizer, &model, &tokenizer_path)?;
+    check_vocab_compatibility(&tokenizer, &init.model, &tokenizer_path)?;
 
     let prompt = if let Some(path) = &args.prompt_file {
         std::fs::read_to_string(path)
@@ -66,6 +72,30 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
         .map_err(|e| anyhow::anyhow!(e))?;
     let tokens: Vec<u32> = encoding.get_ids().to_vec();
     eprintln!("Token Length: {}", tokens.len());
+
+    Ok(InferencePrelude {
+        init,
+        tokenizer,
+        tokens,
+    })
+}
+
+/// `Args` 를 받아 추론에 필요한 전 컨텍스트를 조립한다.
+///
+/// `args.enable_resilience` 가 true 면 `build_command_executor` 로 transport 를
+/// 연결하고 [`ResilienceAdapter`] 를 만든다 (transport 실패는 Err 전파).
+/// false 면 `resilience = None` (NoOp default).
+pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
+    let InferencePrelude {
+        init,
+        tokenizer,
+        tokens,
+    } = build_inference_prelude(&args)?;
+    let backend = init.backend;
+    let memory = init.memory;
+    let hardware = init.hardware;
+    let sampling_config = init.sampling_config;
+    let model = init.model;
 
     let max_seq_len = args.max_seq_len;
     let kv_heads = model.config.num_key_value_heads;
@@ -377,4 +407,97 @@ pub fn alloc_opaque_kv_caches(
         );
     }
     Ok(kv_caches)
+}
+
+/// AB-2 §5.7.7: argus-bench KIVI 분기 컨텍스트.
+///
+/// Standard [`StandardHappyCtx`] 와 달리 KIVI 는 `Vec<KiviCache>`(typed `KVCache` 아님) + caps
+/// (`KiviAttentionBackend` pull) + initial_bits/residual_size 를 보유한다. `build_bench_kivi_loop`
+/// (assembly) 가 이를 소비해 `KiviForward` + `KiviQuantStage` 배선 `DecodeLoop` 를 조립한다.
+pub struct KiviBenchCtx {
+    pub args: Args,
+    pub backend: Arc<dyn Backend>,
+    pub memory: Arc<dyn Memory>,
+    pub hardware: Arc<Hardware>,
+    pub model: TransformerModel,
+    /// KIVI native attention capability (OpenCL backend 면 `Some` 필수 — alloc_kivi_kv_caches R3).
+    pub kivi: Option<Arc<dyn KiviAttentionBackend>>,
+    pub tokenizer: Tokenizer,
+    pub tokens: Vec<u32>,
+    pub max_seq_len: usize,
+    pub sampling_config: SamplingConfig,
+    pub vocab_size: usize,
+    /// KIVI 진입 시 양자화 bits (`--kv-mode kivi` → `--kv-kivi-bits`, `--kv-dynamic-quant` → 16).
+    pub initial_bits: u8,
+    /// KIVI residual buffer 길이 (`--kv-mode kivi` → `--kv-kivi-residual-len`,
+    /// `--kv-dynamic-quant` → `(max_seq_len/32)*32`).
+    pub residual_size: usize,
+    pub resilience: Option<ResilienceAdapter>,
+}
+
+/// AB-2 §5.7.7: KIVI bench ctx 조립. v1 KIVI 진입 시맨틱(`generate.rs`(d5ed71d2^) L744-760) 재현.
+///
+/// `--kv-mode kivi` → initial_bits=`effective_kivi_bits()`, residual=`effective_kivi_residual_size()`.
+/// `--kv-dynamic-quant`(orphan flag 재배선) → initial_bits=16(F16 등가 진입), residual=
+/// `(max_seq_len/32)*32`. verify YAML baseline 은 `--kv-dynamic-quant` 로 진입한다.
+pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
+    let InferencePrelude {
+        init,
+        tokenizer,
+        tokens,
+    } = build_inference_prelude(&args)?;
+    let backend = init.backend;
+    let memory = init.memory;
+    let hardware = init.hardware;
+    let sampling_config = init.sampling_config;
+    let model = init.model;
+    // KIVI native attention capability pull (R3: OpenCL backend 면 Some 필수, init.rs 가 register).
+    let kivi = init.caps.get::<dyn KiviAttentionBackend>();
+
+    let max_seq_len = args.max_seq_len;
+    let vocab_size = model.config.vocab_size;
+    eprintln!(
+        "Model config: layers={}, kv_heads={}, head_dim={}, max_seq_len={}",
+        model.config.num_hidden_layers,
+        model.config.num_key_value_heads,
+        model.config.head_dim,
+        max_seq_len
+    );
+
+    // v1 census 재현: --kv-mode kivi → Q2 진입, --kv-dynamic-quant → bits=16 진입.
+    let is_kivi_mode = matches!(args.effective_kv_mode(), KvMode::Kivi);
+    let initial_bits: u8 = if is_kivi_mode {
+        args.effective_kivi_bits()
+    } else {
+        16
+    };
+    let residual_size = if initial_bits == 16 {
+        // bits=16: 전 토큰이 residual 에 잔류(quant flush 없음). QKKV(32) 배수로 내림.
+        (max_seq_len / 32) * 32
+    } else {
+        args.effective_kivi_residual_size()
+    };
+
+    let resilience: Option<ResilienceAdapter> = if args.enable_resilience {
+        build_command_executor(&args, &model)?.map(ResilienceAdapter::new)
+    } else {
+        None
+    };
+
+    Ok(KiviBenchCtx {
+        args,
+        backend,
+        memory,
+        hardware,
+        model,
+        kivi,
+        tokenizer,
+        tokens,
+        max_seq_len,
+        sampling_config,
+        vocab_size,
+        initial_bits,
+        residual_size,
+        resilience,
+    })
 }

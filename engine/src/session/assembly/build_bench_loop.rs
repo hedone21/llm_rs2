@@ -322,6 +322,8 @@ pub fn build_bench_loop(
             swap_model_handle,
             swap_runtime,
             None, // importance: argus-bench 는 score accumulator 미장착 → uniform fallback.
+            // AB-2: Standard 경로는 KIVI handle 부재 → 빈 Vec (KvQuantDynamic directive inert).
+            Vec::new(),
         ))
     } else {
         None

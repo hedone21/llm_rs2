@@ -140,7 +140,8 @@ pub fn build_standard_loop(
                 adapter.set_kv_handle(h);
             }
             let registry = Arc::new(PipelineRegistry::new());
-            // happy/chat 경로는 partition/swap 미구성 (빈 slots + None hardware/model/swap_runtime).
+            // happy/chat 경로는 partition/swap/quant 미구성 (빈 slots + None hardware/model/
+            // swap_runtime + 빈 kivi_handles).
             let dispatcher = CommandDispatcher::new(
                 Arc::clone(&registry),
                 mf.fmt_caches().to_vec(),
@@ -150,6 +151,7 @@ pub fn build_standard_loop(
                 None,
                 None,
                 None,
+                Vec::new(),
             );
             (Some(adapter), Some((registry, dispatcher, kv_pos_handle)))
         }
