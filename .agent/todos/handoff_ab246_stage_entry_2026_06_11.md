@@ -3,7 +3,7 @@
 **작성**: 2026-06-11
 **HEAD**: `ecd07549 docs(todo): Phase γ 종결 — γ-4 RESOLVED + generate 분할 부분 해소 + 파생 후속 5건 등록`
 **브랜치**: master (worktree 없음)
-**다음 세션 진입 문장**: **"AB-6 device 게이트 진행 — handoff_ab246_stage_entry 기준"** (AB-4 종결 + AB-6 host 단계는 2026-06-11 완료 — 아래 다음 액션 4번 참조)
+**다음 세션 진입 문장**: **"AB-2 진입 — Vec<KiviCache> 접근 모델 + 검증 수단 결정부터, handoff_ab246_stage_entry 기준"** (AB-4·AB-6 은 host+device 게이트 전부 GREEN 으로 2026-06-11 종결 — 아래 다음 액션 3·5번 참조)
 **착수 순서 (사용자 확정 2026-06-11)**: **AB-4 → AB-6 → AB-2**
 
 > 본 문서가 AB-2/4/6 재개의 SSOT. 구 계획 `handoff_argus_bench_ab0_ab3_2026_06_05.md` §AB-2/4/6 은
@@ -65,4 +65,8 @@
    - **SetPartitionRatio 시나리오**: 신규 baseline 동결 = `frozen_baseline_ab4_partition_2026_06_11.md` (weight f16+q4_0, ratio 0.3, n=3 sig 결정적, marker 3종 글자단위 — verify YAML `Lazy-mapped` alt MATCH, `final_pos=1045` 회계). **static CLI oracle**: `--tensor-partition 0.3` 출력 == directive 출력 sig IDENTICAL 양 dtype — Stage 경로 ≡ 정적 경로 bit-exact 실증. 관찰 1건(q4_0 static 1회 silent kill, 재실행 2회 정상 — baseline 문서 §관찰).
    - **Linux host lib 이름 단위 대조**(조건 해소): 신규 12종 + beta4 통합 7/7 PASS. 잔여 FAIL 전원 pre-AB-4 사전존재(ecd07549 worktree 대조 입증 — POCL-first 환경 ~25종 + γ-3 테스트 버그 2종 → backlog `[P2-chore] host lib 테스트 위생` 등록). **AB-4 회귀 0건.**
 4. **AB-6 host 완료 (2026-06-11)** — ✅ **사용자 확정 2건**: (B안) 발화 phase = 기발화 구독, driver 무수정 — drain=구 PostEviction 위치/commit·release 분담은 §5.6.3 mode별 + (rename) `PreEviction`→`KvMutate`/`PostEviction`→`WeightMutate`, dead variant `PreSwap`/`PostSwapBefore`/`PostSwapAfter` 3종 삭제. ✅ 커밋 4: `b2442ceb`(rename sweep, 동작 불변)/`52e8427c`(WeightSwapStage OneShot D5 multi-tick + dispatcher `submit_swap` transient + `LoopControl.swap_weights` 삭제 + SwapWiringConfig 배선, 신규 테스트 9종)/`8da60f13`(arch §5.6 + spec/ADR/매핑표, 신규 INV 0건)/`5ce3a576`(argus_bench `--secondary-gguf` 해제). ✅ Tester 교차 검증 **host 게이트 GREEN**(신규 FAIL 0 — pre-AB-6 worktree 대조, §1~7 byte-identical 정독, transient 비-vacuous, rename 잔존 0, D5/INV-DECODE-STAGE-007 준수). **설계 이탈 2건(명시적)**: IntraForward/LayerImmediate hook 은 forward slot greenfield 라 host 미배선(eprintln 경고) / Incremental drain·등가 anchor 실행은 secondary mmap 필요로 device 위임.
-5. **AB-6 device 게이트 (다음)**: α-K frozen 재검증(rolling 금지, 절대 기준) → S25 mock_manager `SwapWeights --ratio --target-dtype q4_0` 시나리오(argus_bench `--secondary-gguf` q4_0, `[WeightSwap] manager path (Incremental)` marker + drain 진행 로그) + 신규 baseline 동결 → AB-2 진입 (Vec<KiviCache> 접근 모델 + 검증 수단 결정부터).
+5. ~~**AB-6 device 게이트**~~ ✅ **GREEN (2026-06-11, S25) — AB-6 종결**:
+   - **α-K frozen 재검증**: sig **15/15 MATCH** + tbt n=5 median f16 54.31(Δ+0.17%)/f32 53.96(−0.15%)/q4 53.26(−0.99%) 전부 Δ≤+3% + non-vacuous 전 dtype — rename+Stage 추가의 happy-path 영향 0.
+   - **SwapWeights 시나리오**: 신규 baseline 동결 = `frozen_baseline_ab6_swap_2026_06_11.md` (f16 primary + q4_0 secondary, ratio 0.5 → 14 layers, 7 tick drain per_tick=2 LISWAP-6 보존, **sig 3/3 IDENTICAL + tick 시퀀스 3/3 동일** — 동기식 tick swap 이라 greedy 결정성 유지, `final_pos=1045` 회계). Decode 50.39 ms/tok < F16 happy 54.31 (Q4 화 대역폭 감소, 예상 방향).
+   - **범위 한정(명시)**: Incremental mode 한정 — IntraForward/LayerImmediate hook 실배선(forward slot greenfield)·PhaseAware device 검증·swap 역전(RestoreDefaults)은 ADR-0006 Deferred.
+6. **AB-2 진입 (다음)**: KIVI — 1순위 쟁점 = KiviForward 의 owned `Vec<KiviCache>`(Arc 아님)에 Stage 가 도달하는 법(handle Arc 화 vs (a.6) try_offload 선례의 Forward seam 메서드) + 검증 수단 택1(argus_bench KIVI 분기 vs argus-chat bin화 선행). C12 잔여 production e2e 흡수 의무(완료 게이트 포함). KIVI 회귀 게이트 = `test_backend --backends opencl` 오라클 Q2/Q4/Q8 3/3 L2=0.000000.
