@@ -25,10 +25,14 @@ use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport}
 use crate::hardware::Hardware;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::standard_format::StandardFormat;
+use crate::models::transformer::TransformerModel;
 use crate::models::weights::LayerSlot;
+use crate::qcf_collector::ImportanceLookup;
 use crate::session::pipeline_registry::PipelineRegistry;
+use crate::session::swap_runtime::EngineSwapRuntime;
 use crate::stages::kv::eviction::EvictionStage;
 use crate::stages::weight::partition::PartitionStage;
+use crate::stages::weight::weight_swap::WeightSwapStage;
 
 /// External command channel (manager IPC, schedule, stdin, ...).
 ///
@@ -64,11 +68,11 @@ pub trait EngineReport {
 /// `CommandDispatcher::dispatch` 가 매 step 갱신하고, `DecodeLoop::run` 이 읽어 sleep/break/pacing
 /// 한다. v1 `ExecutionPlan` 의 control 필드와 1:1 (매핑 문서 1.2/1.3).
 ///
-/// **과도기 필드(offload_ratio/recall_offload/restore_defaults/kv_quant_bits/layer_skip/
-/// swap_weights)** 는 대응 Stage(AB-2/6) 미구현이라 deprecated 로 잔존한다(G1) — 구==신 등가만
-/// 보장하고, run() 인라인 소비는 (a.6) offload/recall 만 live 다(나머지는 generate/forward 측
-/// sticky). **partition 은 AB-4 에서 OneShot `PartitionStage` 로 이전됨** — `partition_ratio`
-/// 필드는 삭제됐다(write-only dead-end 소멸).
+/// **과도기 필드(offload_ratio/recall_offload/restore_defaults/kv_quant_bits/layer_skip)** 는
+/// 대응 Stage(AB-2) 미구현이라 deprecated 로 잔존한다(G1) — 구==신 등가만 보장하고, run() 인라인
+/// 소비는 (a.6) offload/recall 만 live 다(나머지는 generate/forward 측 sticky). **partition 은
+/// AB-4 에서 OneShot `PartitionStage`, swap 은 AB-6 에서 OneShot `WeightSwapStage` 로 이전됨** —
+/// `partition_ratio`/`swap_weights` 필드는 삭제됐다(write-only dead-end 소멸, §5.5/§5.6).
 #[derive(Debug, Clone, Default)]
 pub struct LoopControl {
     // ── ② control 핵심 (run() live 소비) ──
@@ -104,8 +108,6 @@ pub struct LoopControl {
     pub kv_quant_bits: Option<u8>,
     /// Layer skip ratio. (LayerSkip — sticky, forward skip_config 측)
     pub layer_skip: Option<f32>,
-    /// Weight swap request. (SwapWeights — take_pending_swap_weights 경로)
-    pub swap_weights: Option<(f32, llm_shared::DtypeTag)>,
 
     // ── ③ Hardware resolve seam (run() 미소비) ──
     /// Device to switch to. (SwitchHw)
@@ -133,6 +135,14 @@ pub struct CommandDispatcher {
     /// ① PartitionStage 의 companion backend resolve 용 (AB-4 §5.5.8). `None` 이면 partition
     /// directive 무시(model/hardware 미배선 — host 단위테스트 등).
     hardware: Option<Arc<Hardware>>,
+    /// ① WeightSwapStage 가 swap 할 model handle (register 시점 보유, AB-6 §5.6.3 model seam).
+    /// `None` 이면 swap directive 무시(미배선 — host 단위테스트 등).
+    model: Option<Arc<TransformerModel>>,
+    /// ① WeightSwapStage 의 swap 자원 묶음(AB-6 §5.6.7). `None` 이면 swap directive 무시
+    /// (secondary 부재 — happy/chat).
+    swap_runtime: Option<Arc<EngineSwapRuntime>>,
+    /// ① WeightSwapStage 의 decider importance 입력(AB-6 §5.6.1). `None` 이면 uniform fallback.
+    importance: Option<Arc<dyn ImportanceLookup>>,
     /// ② 누적 루프 제어 상태 (sticky control — throttle/tbt 유지, evict 는 OneShot 으로 분리).
     control: LoopControl,
 
@@ -150,12 +160,17 @@ pub struct CommandDispatcher {
 impl CommandDispatcher {
     /// dispatcher 생성. `cache_manager` 가 `None` 이면 evict directive 는 무시되고(미구성),
     /// `layer_slots` 가 비었거나 `hardware` 가 `None` 이면 partition directive 는 무시된다.
+    /// `model`/`swap_runtime` 이 `None` 이면 swap directive 는 무시된다(AB-6 §5.6.4).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<PipelineRegistry>,
         kv_handles: Vec<Arc<StandardFormat>>,
         cache_manager: Option<Arc<Mutex<CacheManager>>>,
         layer_slots: Vec<Arc<LayerSlot>>,
         hardware: Option<Arc<Hardware>>,
+        model: Option<Arc<TransformerModel>>,
+        swap_runtime: Option<Arc<EngineSwapRuntime>>,
+        importance: Option<Arc<dyn ImportanceLookup>>,
     ) -> Self {
         Self {
             registry,
@@ -163,6 +178,9 @@ impl CommandDispatcher {
             cache_manager,
             layer_slots,
             hardware,
+            model,
+            swap_runtime,
+            importance,
             control: LoopControl::default(),
             evict_armed: false,
             last_partition_ratio: None,
@@ -197,7 +215,6 @@ impl CommandDispatcher {
         self.control.recall_offload = false;
         self.control.restore_defaults = false;
         self.control.offload_ratio = None;
-        self.control.swap_weights = None;
         self.control.switch_device = None;
         self.control.prepare_device = None;
         self.control.prefill_chunk_size = None;
@@ -304,11 +321,12 @@ impl CommandDispatcher {
             EngineCommand::LayerSkip { skip_ratio } => {
                 self.control.layer_skip = Some(*skip_ratio);
             }
+            // ── ① swap → OneShot WeightSwapStage submit (AB-6 §5.6.4, transient) ──
             EngineCommand::SwapWeights {
                 ratio,
                 target_dtype,
             } => {
-                self.control.swap_weights = Some((*ratio, *target_dtype));
+                self.submit_swap(*ratio, *target_dtype);
             }
 
             // ── ③ Hardware resolve seam ──
@@ -377,6 +395,33 @@ impl CommandDispatcher {
         let stage = PartitionStage::one_shot(self.layer_slots.clone(), Arc::clone(hw), 1.0);
         self.registry.submit(Arc::new(stage));
     }
+
+    /// ① SwapWeights directive 1건을 OneShot `WeightSwapStage` 로 submit (AB-6 §5.6.4).
+    ///
+    /// **transient 시맨틱**: partition 의 last-applied 게이트도 evict 의 armed 게이트도 **없다**
+    /// (landmine — partition 게이트 복사 금지, §5.6.4). 같은 directive 가 재도착하면 새 Stage 를
+    /// submit 하되, 그 Stage 의 commit §2 in-flight 가드(swap_runtime 공유 마커)가 미완 plan 이
+    /// 살아 있으면 reject 한다(R-1 동시 활성화 차단 = 정확한 게이트). `model`/`swap_runtime` 이
+    /// `None` 이거나 `layer_slots` 가 비면 미구성 — directive 무시(happy/chat).
+    fn submit_swap(&mut self, ratio: f32, target_dtype: llm_shared::DtypeTag) {
+        let Some(model) = self.model.as_ref() else {
+            return; // 미구성 (secondary 부재 — happy/chat).
+        };
+        let Some(rt) = self.swap_runtime.as_ref() else {
+            return; // 미구성 (swap 자원 미배선).
+        };
+        if self.layer_slots.is_empty() {
+            return; // 미구성.
+        }
+        let stage = WeightSwapStage::one_shot(
+            Arc::clone(model),
+            Arc::clone(rt),
+            self.importance.clone(),
+            ratio,
+            target_dtype,
+        );
+        self.registry.submit(Arc::new(stage));
+    }
 }
 
 #[cfg(test)]
@@ -429,12 +474,15 @@ mod tests {
         let registry = Arc::new(PipelineRegistry::new());
         let handle = make_handle(N_TOKENS);
         let cm = make_cm();
-        // partition 미구성 (빈 slots + None hardware): evict 전용 dispatcher.
+        // partition/swap 미구성 (빈 slots + None hardware/model/swap_runtime): evict 전용 dispatcher.
         let d = CommandDispatcher::new(
             Arc::clone(&registry),
             vec![handle.clone()],
             Some(cm),
             Vec::new(),
+            None,
+            None,
+            None,
             None,
         );
         (d, registry, handle)
@@ -481,7 +529,126 @@ mod tests {
         let slots: Vec<Arc<LayerSlot>> = (0..2).map(|i| ffn_slot(&be, i)).collect();
         let host: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::galloc::Galloc::new());
         let hw = Arc::new(Hardware::new(be.clone(), None, None, host, None));
-        let d = CommandDispatcher::new(Arc::clone(&registry), Vec::new(), None, slots, Some(hw));
+        let d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            Vec::new(),
+            None,
+            slots,
+            Some(hw),
+            None,
+            None,
+            None,
+        );
+        (d, registry)
+    }
+
+    // ── AB-6: swap handle(model + swap_runtime) 을 구성한 dispatcher helper ──
+
+    fn make_swap_model(be: &Arc<dyn Backend>, n_layers: usize) -> Arc<TransformerModel> {
+        use crate::memory::Memory;
+        use crate::model_config::{ModelArch, ModelConfig};
+        let mem = crate::memory::galloc::Galloc::new();
+        let (dim, vocab) = (4usize, 8usize);
+        let embed = Tensor::new(
+            Shape::new(vec![vocab, dim]),
+            mem.alloc(vocab * dim * 4, DType::F32).unwrap(),
+            be.clone(),
+        );
+        let norm = Tensor::new(
+            Shape::new(vec![dim]),
+            mem.alloc(dim * 4, DType::F32).unwrap(),
+            be.clone(),
+        );
+        let config = ModelConfig {
+            vocab_size: vocab,
+            hidden_size: dim,
+            num_hidden_layers: n_layers,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: dim,
+            rms_norm_eps: 1e-5,
+            rope_theta: 500_000.0,
+            head_dim: dim,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 2,
+            arch: ModelArch::Llama,
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+            weight_prefix: String::new(),
+        };
+        let rr = crate::weight::setup_runtime_resources(be.clone());
+        Arc::new(TransformerModel {
+            config,
+            layers: (0..n_layers).map(|i| ffn_slot(be, i)).collect(),
+            embed_tokens: embed,
+            norm: norm.clone(),
+            lm_head: norm,
+            lm_head_on_cpu: false,
+            gpu_embed_tokens: None,
+            cpu_backend: None,
+            preload_pool: std::sync::OnceLock::new(),
+            secondary_mmap: None,
+            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            quant_noise: rr.quant_noise.clone(),
+            release_worker: rr.release_worker.clone(),
+        })
+    }
+
+    fn make_swap_runtime(be: &Arc<dyn Backend>) -> Arc<EngineSwapRuntime> {
+        use crate::model_config::{ModelArch, ModelConfig};
+        let dispatcher = Arc::new(crate::weight::AsyncSwapDispatcher::new(be.clone()));
+        let rr = crate::weight::setup_runtime_resources(be.clone());
+        let config = Arc::new(ModelConfig {
+            vocab_size: 8,
+            hidden_size: 4,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 4,
+            rms_norm_eps: 1e-5,
+            rope_theta: 500_000.0,
+            head_dim: 4,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 2,
+            arch: ModelArch::Llama,
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+            weight_prefix: String::new(),
+        });
+        Arc::new(EngineSwapRuntime::new(
+            be.clone(),
+            dispatcher,
+            config,
+            rr.release_worker.clone(),
+            crate::session::cli::SwapMode::Incremental,
+            1024 * 1024,
+            4,
+            None,
+        ))
+    }
+
+    fn make_swap_dispatcher() -> (CommandDispatcher, Arc<PipelineRegistry>) {
+        let registry = Arc::new(PipelineRegistry::new());
+        let be = cpu_be();
+        let slots: Vec<Arc<LayerSlot>> = (0..2).map(|i| ffn_slot(&be, i)).collect();
+        let d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            Vec::new(),
+            None,
+            slots,
+            None,
+            Some(make_swap_model(&be, 2)),
+            Some(make_swap_runtime(&be)),
+            None,
+        );
         (d, registry)
     }
 
@@ -610,26 +777,21 @@ mod tests {
     #[test]
     fn transitional_fields_equivalence() {
         let (mut d, _r, _h) = make_dispatcher();
-        // AB-4: SetPartitionRatio 는 LoopControl 필드가 아니라 OneShot Stage submit 으로 이전됨
-        // (partition_ratio 필드 삭제). 본 테스트는 잔존 과도기 필드(offload/quant/swap/layer_skip)만.
+        // AB-4: SetPartitionRatio, AB-6: SwapWeights 는 LoopControl 필드가 아니라 OneShot Stage
+        // submit 으로 이전됨(partition_ratio/swap_weights 필드 삭제). 본 테스트는 잔존 과도기
+        // 필드(offload/quant/layer_skip)만. swap transient 시맨틱은 swap_transient_resubmits_each_directive 가 승계.
         let c = d.dispatch(vec![
             EngineCommand::KvOffload { ratio: 0.5 },
             EngineCommand::KvQuantDynamic { target_bits: 4 },
-            EngineCommand::SwapWeights {
-                ratio: 0.9,
-                target_dtype: llm_shared::DtypeTag::Q4_0,
-            },
             EngineCommand::LayerSkip { skip_ratio: 0.25 },
         ]);
         assert_eq!(c.offload_ratio, Some(0.5));
         assert_eq!(c.kv_quant_bits, Some(4));
-        assert_eq!(c.swap_weights, Some((0.9, llm_shared::DtypeTag::Q4_0)));
         assert_eq!(c.layer_skip, Some(0.25));
-        // sticky: quant 는 다음 dispatch 에 carry, offload/swap 은 transient.
+        // sticky: quant 는 다음 dispatch 에 carry, offload 는 transient.
         let c2 = d.dispatch(vec![]);
         assert_eq!(c2.kv_quant_bits, Some(4), "quant sticky");
         assert_eq!(c2.offload_ratio, None, "offload transient");
-        assert_eq!(c2.swap_weights, None, "swap transient");
     }
 
     #[test]
@@ -648,8 +810,16 @@ mod tests {
     fn cache_manager_none_ignores_evict() {
         let registry = Arc::new(PipelineRegistry::new());
         let handle = make_handle(N_TOKENS);
-        let mut d =
-            CommandDispatcher::new(Arc::clone(&registry), vec![handle], None, Vec::new(), None);
+        let mut d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            vec![handle],
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        );
         d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
         assert_eq!(registry.len(), 0, "CM 미구성 → evict directive 무시");
     }
@@ -734,5 +904,57 @@ mod tests {
         let (mut d, registry, _h) = make_dispatcher(); // 빈 slots + None hardware
         d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
         assert_eq!(registry.len(), 0, "partition 미구성 → directive 무시");
+    }
+
+    // ── AB-6: swap OneShot submit + transient 시맨틱 (§5.6.4) ──
+
+    /// swap 미구성(model/swap_runtime=None) dispatcher 는 SwapWeights 를 무시.
+    #[test]
+    fn swap_unconfigured_ignores_directive() {
+        let (mut d, registry, _h) = make_dispatcher(); // model=None, swap_runtime=None
+        d.dispatch(vec![EngineCommand::SwapWeights {
+            ratio: 0.9,
+            target_dtype: llm_shared::DtypeTag::Q4_0,
+        }]);
+        assert_eq!(registry.len(), 0, "swap 미구성 → directive 무시");
+    }
+
+    /// SwapWeights arm → registry 에 WeightSwapStage 등록(첫 directive → 1 submit).
+    #[test]
+    fn swap_directive_submits_one_shot_stage() {
+        let (mut d, registry) = make_swap_dispatcher();
+        assert_eq!(registry.len(), 0);
+        d.dispatch(vec![EngineCommand::SwapWeights {
+            ratio: 0.9,
+            target_dtype: llm_shared::DtypeTag::Q4_0,
+        }]);
+        assert_eq!(registry.len(), 1, "swap directive → OneShot 1개 submit");
+    }
+
+    /// transient 시맨틱(§5.6.4): partition 의 last-applied 게이트도 evict 의 armed 게이트도 없다.
+    /// 같은 directive 재도착 → 새 submit (재submit 차단은 dispatcher 가 아니라 Stage in-flight
+    /// 가드 담당 — landmine: partition 게이트 복사 금지). 따라서 dispatcher 레벨에서는 매 directive
+    /// 가 submit 을 늘린다.
+    #[test]
+    fn swap_transient_resubmits_each_directive() {
+        let (mut d, registry) = make_swap_dispatcher();
+        d.dispatch(vec![EngineCommand::SwapWeights {
+            ratio: 0.9,
+            target_dtype: llm_shared::DtypeTag::Q4_0,
+        }]);
+        assert_eq!(registry.len(), 1);
+        // 같은 directive 재도착 → 새 submit (값 비교 게이트 없음).
+        d.dispatch(vec![EngineCommand::SwapWeights {
+            ratio: 0.9,
+            target_dtype: llm_shared::DtypeTag::Q4_0,
+        }]);
+        assert_eq!(
+            registry.len(),
+            2,
+            "transient: 같은 directive 재도착 → 새 submit (게이트 없음)"
+        );
+        // 빈 batch 는 carry 0 (swap_weights 필드 삭제 — sticky 아님).
+        d.dispatch(vec![]);
+        assert_eq!(registry.len(), 2, "빈 batch — carry 0 (transient)");
     }
 }

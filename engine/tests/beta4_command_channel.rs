@@ -105,6 +105,9 @@ fn control_fields_equivalent_to_v1() {
         Some(make_cm()),
         Vec::new(),
         None,
+        None,
+        None,
+        None,
     );
 
     // step 1: Throttle{50} + SetTargetTbt{200}.
@@ -164,6 +167,9 @@ fn suspend_override_equivalent_to_v1() {
         Some(make_cm()),
         Vec::new(),
         None,
+        None,
+        None,
+        None,
     );
 
     let cmds = vec![
@@ -201,15 +207,17 @@ fn transitional_fields_equivalent_to_v1() {
         Some(make_cm()),
         Vec::new(),
         None,
+        None,
+        None,
+        None,
     );
 
+    // AB-6: SwapWeights 는 LoopControl 필드가 아니라 OneShot WeightSwapStage submit 으로 이전됨
+    // (swap_weights 필드 삭제). transient 시맨틱 등가는 command_dispatcher.rs 의
+    // swap_transient_resubmits_each_directive 가 승계. 본 테스트는 잔존 과도기 필드만 비교.
     let cmds = vec![
         EngineCommand::KvOffload { ratio: 0.5 },
         EngineCommand::KvQuantDynamic { target_bits: 4 },
-        EngineCommand::SwapWeights {
-            ratio: 0.9,
-            target_dtype: llm_shared::DtypeTag::Q4_0,
-        },
         EngineCommand::LayerSkip { skip_ratio: 0.25 },
     ];
     send(&tx, 1, cmds.clone());
@@ -217,7 +225,6 @@ fn transitional_fields_equivalent_to_v1() {
     let v2 = disp.dispatch(cmds);
     assert_eq!(v1.offload_ratio, v2.offload_ratio, "offload_ratio 등가");
     assert_eq!(v1.kv_quant_bits, v2.kv_quant_bits, "kv_quant_bits 등가");
-    assert_eq!(v1.swap_weights, v2.swap_weights, "swap_weights 등가");
     assert_eq!(v1.layer_skip, v2.layer_skip, "layer_skip 등가");
 }
 
@@ -263,7 +270,16 @@ fn partition_directive_submits_one_shot_stage() {
     let hw = Arc::new(Hardware::new(be.clone(), None, None, host, None));
 
     let registry = Arc::new(PipelineRegistry::new());
-    let mut disp = CommandDispatcher::new(Arc::clone(&registry), Vec::new(), None, slots, Some(hw));
+    let mut disp = CommandDispatcher::new(
+        Arc::clone(&registry),
+        Vec::new(),
+        None,
+        slots,
+        Some(hw),
+        None,
+        None,
+        None,
+    );
 
     // 새 ratio → submit 1.
     disp.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);

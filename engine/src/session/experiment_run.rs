@@ -15,7 +15,7 @@
 use crate::experiment::{JsonlWriter, SummaryRecord, SystemSampler, TokenRecord};
 use crate::inference::sampling;
 use crate::session::assembly::{
-    build_bench_loop, build_local_pressure_source, build_resilience_cache_manager,
+    SwapWiringConfig, build_bench_loop, build_local_pressure_source, build_resilience_cache_manager,
 };
 use crate::session::decode_loop::StopReason;
 use crate::session::experiment::ScheduleCommandSource;
@@ -83,6 +83,14 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         pressure_source,
         args.eviction_target_ratio(),
         None, // γ-3b: argus-bench 는 schedule 없음 (IPC resilience 만)
+        // AB-6: swap dispatch 설정. `--swap` 미지정 시 Incremental(LISWAP-6 production winner).
+        SwapWiringConfig {
+            default_mode: args
+                .swap
+                .unwrap_or(crate::session::cli::SwapMode::Incremental),
+            phase_chunk_size_bytes: args.swap_phase_aware_chunk_mb * 1024 * 1024,
+            phase_max_chunks_per_token: args.swap_phase_aware_max_chunks_per_token,
+        },
     )?;
 
     let t_prefill = std::time::Instant::now();
@@ -275,6 +283,14 @@ pub fn run_experiment_schedule_path(
         pressure_source,
         args.eviction_target_ratio(),
         Some(schedule_source),
+        // AB-6: swap dispatch 설정 (schedule 모드도 secondary 보유 시 swap 활성).
+        SwapWiringConfig {
+            default_mode: args
+                .swap
+                .unwrap_or(crate::session::cli::SwapMode::Incremental),
+            phase_chunk_size_bytes: args.swap_phase_aware_chunk_mb * 1024 * 1024,
+            phase_max_chunks_per_token: args.swap_phase_aware_max_chunks_per_token,
+        },
     )?;
 
     let t_prefill = std::time::Instant::now();

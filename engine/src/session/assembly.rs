@@ -19,6 +19,6 @@ pub mod build_bench_loop;
 pub mod build_standard_loop;
 
 pub use build_bench_loop::{
-    build_bench_loop, build_local_pressure_source, build_resilience_cache_manager,
+    SwapWiringConfig, build_bench_loop, build_local_pressure_source, build_resilience_cache_manager,
 };
 pub use build_standard_loop::{build_standard_loop, is_standard_happy_path};

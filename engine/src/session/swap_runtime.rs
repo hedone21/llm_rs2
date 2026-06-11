@@ -8,11 +8,19 @@
 //! Mental model: arch/weight_swap.md §2.8.1 — Manager는 WHAT만, Engine은
 //! HOW를 자율 결정. swap mode (Incremental / IntraForward / PhaseAware /
 //! LayerImmediate) 는 wire format에 노출되지 않는다.
+//!
+//! **AB-6 (arch/pipeline_stage_design_v2.md §5.6)**: `handle_swap_weights` 는
+//! `WeightSwapStage`(stages/weight/weight_swap.rs) 가 commit 본문으로 byte-identical
+//! 이전하는 **trigger 정본 + 등가 anchor** 다 (자기 비교 금지 — Stage 산출과 본 함수
+//! 직접 호출 산출을 비교). 따라서 Stage 흡수 후에도 삭제하지 않고 유지한다.
+//! Stage 간 공유 in-flight 마커(`in_flight`)와 report sender(`report_tx`)는
+//! `EngineSwapRuntime`(Arc 공유)이 보유한다(§5.6.3 "공유 in-flight 마커 = swap_runtime").
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use llm_shared::DtypeTag;
+use llm_shared::{DtypeTag, EngineMessage};
 
 use crate::backend::Backend;
 use crate::buffer::DType;
@@ -67,6 +75,14 @@ pub struct EngineSwapRuntime {
     phase_chunk_size_bytes: usize,
     /// PhaseAware mode 전용: `--swap-phase-aware-max-chunks-per-token`.
     phase_max_chunks_per_token: usize,
+    /// AB-6 §5.6.3: Stage 간 공유 in-flight 마커. Incremental plan 이 미완 drain
+    /// 이면 `true` — 새 `WeightSwapStage` 의 commit §2 가드가 이를 보고 reject 한다
+    /// (`commit_slot.is_idle()` 등가, R-1 동시 활성화 차단). swap_runtime 이 Arc 공유
+    /// 되므로 새 Stage 인스턴스도 같은 마커를 본다.
+    in_flight: Arc<AtomicBool>,
+    /// AB-6 §5.6.6: manager `WeightSwapReport` 송출 채널 (`CommandExecutor::resp_tx`
+    /// clone). `None` 이면 미배선(resilience-off / host 단위테스트) — report drop.
+    report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
 }
 
 impl EngineSwapRuntime {
@@ -79,6 +95,7 @@ impl EngineSwapRuntime {
         default_mode: SwapMode,
         phase_chunk_size_bytes: usize,
         phase_max_chunks_per_token: usize,
+        report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
     ) -> Self {
         Self {
             swap_backend,
@@ -88,6 +105,8 @@ impl EngineSwapRuntime {
             default_mode,
             phase_chunk_size_bytes,
             phase_max_chunks_per_token,
+            in_flight: Arc::new(AtomicBool::new(false)),
+            report_tx,
         }
     }
 
@@ -117,6 +136,26 @@ impl EngineSwapRuntime {
 
     pub fn phase_max_chunks_per_token(&self) -> usize {
         self.phase_max_chunks_per_token
+    }
+
+    /// AB-6 §5.6.2 §2: 현재 in-flight swap 이 없으면 `true`. `WeightSwapStage` commit
+    /// 가드가 호출한다 (`commit_slot.is_idle()` 등가).
+    pub fn is_idle(&self) -> bool {
+        !self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// AB-6 §5.6.3: Incremental plan 설치/hook 설치 시 in-flight 진입. drain 완료
+    /// (`is_done()`) 또는 hook 설치 직후(non-Incremental 은 즉시 Stage 떠남) 시 해제.
+    pub fn mark_in_flight(&self, active: bool) {
+        self.in_flight.store(active, Ordering::Release);
+    }
+
+    /// AB-6 §5.6.6: manager 로 `WeightSwapReport` 송출 (`&self` — resp_tx clone).
+    /// 미배선(`None`) 이면 no-op.
+    pub fn send_swap_report(&self, report: llm_shared::WeightSwapReport) {
+        if let Some(tx) = &self.report_tx {
+            let _ = tx.send(EngineMessage::WeightSwapReport(report));
+        }
     }
 
     /// Manager `SwapWeights` 신호 처리 — engine 내부 default mode로 mode-specific

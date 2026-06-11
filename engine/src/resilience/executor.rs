@@ -248,6 +248,14 @@ impl CommandExecutor {
         let _ = self.resp_tx.send(EngineMessage::WeightSwapReport(report));
     }
 
+    /// AB-6 §5.6.6: clone the engine→manager response channel so a
+    /// `WeightSwapStage`(`&self`) can send `WeightSwapReport` directly at commit
+    /// time without holding a `&mut` adapter. `EngineSwapRuntime::report_tx` 가
+    /// 이 clone 을 보유한다.
+    pub fn report_sender(&self) -> std::sync::mpsc::Sender<EngineMessage> {
+        self.resp_tx.clone()
+    }
+
     /// Consume pending SwapWeights directive, if any (LISWAP-6 manager routing).
     ///
     /// `apply_command::SwapWeights` stashes the directive in

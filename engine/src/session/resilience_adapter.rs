@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use llm_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport};
+use llm_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
 
 use crate::format::KVCacheFormat;
 use crate::resilience::{CommandExecutor, KVSnapshot};
@@ -49,6 +49,12 @@ impl ResilienceAdapter {
     /// mutable ref를 노출한다.
     pub fn executor_mut(&mut self) -> &mut CommandExecutor {
         &mut self.executor
+    }
+
+    /// AB-6 §5.6.6: `EngineSwapRuntime` 구성 시 swap report 송출 채널 clone 을 노출한다
+    /// (`WeightSwapStage` 가 `&self` 로 commit 시점 송신).
+    pub fn report_sender(&self) -> std::sync::mpsc::Sender<EngineMessage> {
+        self.executor.report_sender()
     }
 
     /// β-6 commit C: per-token tick. [`TickStage`](crate::stages::system::tick::TickStage)(PostSample
