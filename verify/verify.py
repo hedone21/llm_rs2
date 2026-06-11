@@ -81,29 +81,44 @@ def parse_args(argv=None):
 
 
 def _build_remote_binaries(device_key: str) -> bool:
-    """Cross-compile the verify engine binary + manager bins for a remote device.
+    """Cross-compile argus_bench + mock_manager + llm_manager for a remote device.
 
-    ★ α-K BC 5-F (2026-06-05) — PARKED: verify 의 엔진 bin 은 과거 `generate`
-    (split 후 `legacy_generate`)였으나 5-F 에서 legacy 가 폐기되었다. verify
-    시나리오는 resilience signal → eviction/swap/KIVI 경로를 발화시켜야 하는데,
-    유일한 후속 엔진 bin `argus_cli` 는 happy-path 전용(eviction/swap/KIVI/offload
-    reject)이라 커버 불가하다. 재배선 대상인 `argus-bench`(eviction/swap +
-    resilience 지원)는 아직 미구현(별도 트랙)이다.
+    AB-5 (2026-06-11): PARKED 해제 — 엔진 bin 을 legacy `generate` 에서
+    `argus_bench` 로 재배선. `argus_bench` 는 experiment-output + resilience
+    runtime effect 를 지원하여 verify 시나리오 전 경로를 커버한다.
+    (AB-0 host verify 6 시나리오 green 실증.)
 
-    따라서 verify 하네스는 argus-bench 도입 전까지 **parked** 상태다 — phantom
-    `binary_name="generate"`(Cargo.toml 에 없는 bin) 빌드를 시도하지 않고 명시적으로
-    안내 후 중단한다. argus-bench 도입 시: 아래 주석의 manager 빌드(`_build_manager_binary`)
-    + argus-bench 엔진 빌드로 재배선하고 orchestrator `_generate_cmd` 의 CLI 를
-    argus-bench subcommand 로 갱신할 것.
+    Uses scripts/device_registry/builder.py::build_binary, which honours the
+    zig_target / toolchain settings in devices.toml. The mock_manager needs
+    the `lua` feature, so we call the builder twice with distinct feature lists.
     """
-    print(
-        "[verify] PARKED: 엔진 bin(legacy_generate)이 α-K BC 5-F 에서 폐기됨.\n"
-        "         verify resilience/eviction/swap 시나리오는 happy-path 전용 argus_cli 로\n"
-        "         커버 불가하며, 재배선 대상 argus-bench 는 미구현(별도 트랙)이다.\n"
-        "         argus-bench 도입 후 _build_remote_binaries/_deploy_remote_binaries/\n"
-        "         orchestrator._generate_cmd 를 재배선할 것."
+    from device_registry.config import load_device_config as _load_dc  # type: ignore
+    from device_registry.builder import build_binary  # type: ignore
+
+    device_cfg = _load_dc(device_key)
+
+    print(f"[verify] cross-compiling argus_bench for {device_key} ...")
+    ok_gen = build_binary(
+        device_config=device_cfg,
+        binary_name="argus_bench",
+        project_root=PROJECT_ROOT,
     )
-    return False
+    if not ok_gen:
+        print("[verify] argus_bench build FAILED")
+        return False
+
+    print(f"[verify] cross-compiling mock_manager for {device_key} ...")
+    ok_mock = _build_manager_binary(device_cfg, "mock_manager")
+    if not ok_mock:
+        print("[verify] mock_manager build FAILED")
+        return False
+
+    print(f"[verify] cross-compiling llm_manager for {device_key} ...")
+    ok_mgr = _build_manager_binary(device_cfg, "llm_manager")
+    if not ok_mgr:
+        print("[verify] llm_manager build FAILED")
+        return False
+    return True
 
 
 def _build_manager_binary(device_cfg, bin_name: str) -> bool:
@@ -164,17 +179,33 @@ def _build_manager_binary(device_cfg, bin_name: str) -> bool:
 
 
 def _deploy_remote_binaries(device_key: str) -> bool:
-    """Push the verify engine bin + manager bins to the remote device.
+    """Push argus_bench + mock_manager + llm_manager to the remote device.
 
-    ★ α-K BC 5-F — PARKED (see `_build_remote_binaries`): 엔진 bin(legacy_generate)
-    폐기로 verify 는 argus-bench 도입 전까지 비활성. phantom "generate" deploy 를
-    시도하지 않고 중단한다.
+    AB-5 (2026-06-11): PARKED 해제 — 엔진 bin 을 `argus_bench` 로 재배선.
     """
-    print(
-        "[verify] PARKED: 엔진 bin 폐기로 deploy 불가 — argus-bench 재배선 필요 "
-        "(_build_remote_binaries 주석 참조)."
-    )
-    return False
+    from device_registry.config import load_device_config as _load_dc  # type: ignore
+    from device_registry.connection import create_connection  # type: ignore
+    from device_registry.deployer import deploy_binary  # type: ignore
+    from device_registry.builder import get_local_binary_path  # type: ignore
+
+    device_cfg = _load_dc(device_key)
+    conn = create_connection(device_cfg.connection)
+
+    for name in ("argus_bench", "mock_manager", "llm_manager"):
+        local = get_local_binary_path(device_cfg, name, PROJECT_ROOT)
+        if not local.exists():
+            print(f"[verify] {local} missing; run without --skip-build and retry")
+            return False
+        ok = deploy_binary(
+            conn=conn,
+            device_config=device_cfg,
+            local_binary_path=local,
+            binary_name=name,
+        )
+        if not ok:
+            print(f"[verify] deploy {name} failed")
+            return False
+    return True
 
 
 def _deploy_prompts(device_key: str) -> bool:

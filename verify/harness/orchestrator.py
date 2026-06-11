@@ -63,8 +63,8 @@ from .text_accuracy import decode_jsonl_to_text
 # α-K BC argus-bench AB-0 (2026-06-05): verify 엔진 bin = argus_bench.
 # legacy `generate`(→ legacy_generate)는 5-F 에서 폐기됐고, happy-path 전용
 # argus_cli 대신 experiment-output + resilience runtime effect 를 지원하는
-# argus_bench 가 baseline/action 양쪽을 띄운다. (AB-5 에서 원격 경로/pkill 도
-# 이 상수로 일괄 재배선 — 현재는 로컬 host 경로만 적용.)
+# argus_bench 가 baseline/action 양쪽을 띄운다.
+# AB-5 (2026-06-11): 원격 경로/pkill 도 이 상수로 일괄 재배선 완료.
 ENGINE_BIN = "argus_bench"
 
 
@@ -509,13 +509,13 @@ def _run_scenario_ssh(
     # Build ssh remote helper
     remote = ssh_remote_from_dict(device_cfg.get("connection", {}))
 
-    # Remote binaries (must already be deployed — verify_resilience.py handles it)
-    generate_bin = _remote_binary_path(device_cfg, "generate")
+    # Remote binaries (must already be deployed — verify.py handles it)
+    generate_bin = _remote_binary_path(device_cfg, ENGINE_BIN)
     mock_bin = _remote_binary_path(device_cfg, "mock_manager")
 
     # Remote workdir per-run
-    remote_work_root = device_cfg.get("paths", {}).get("work_dir", "/tmp") \
-        + "/verify_runs"
+    ssh_work_dir = device_cfg.get("paths", {}).get("work_dir", "/tmp")
+    remote_work_root = ssh_work_dir + "/verify_runs"
     remote_run_dir = f"{remote_work_root}/{spec.id}_r{run_idx}_{os.getpid()}"
     remote.exec(f"mkdir -p {shlex.quote(remote_run_dir)}", timeout=15.0)
 
@@ -524,11 +524,11 @@ def _run_scenario_ssh(
     remote.exec(
         "pkill -TERM -f 'llm_manager' 2>/dev/null; "
         "pkill -TERM -f 'mock_manager' 2>/dev/null; "
-        "pkill -TERM -f '/home/nvidia/llm_rs2/generate' 2>/dev/null; "
+        f"pkill -TERM -f '{ssh_work_dir}/{ENGINE_BIN}' 2>/dev/null; "
         "sleep 0.3; "
         "pkill -KILL -f 'llm_manager' 2>/dev/null; "
         "pkill -KILL -f 'mock_manager' 2>/dev/null; "
-        "pkill -KILL -f '/home/nvidia/llm_rs2/generate' 2>/dev/null; "
+        f"pkill -KILL -f '{ssh_work_dir}/{ENGINE_BIN}' 2>/dev/null; "
         "rm -f /tmp/verify_*.sock 2>/dev/null; "
         "true",
         timeout=20.0,
@@ -538,7 +538,7 @@ def _run_scenario_ssh(
 
     # CUDA library path for Jetson
     lib_dir = device_cfg.get("paths", {}).get("lib_dir", "")
-    env_vars: Dict[str, str] = {}
+    env_vars: Dict[str, str] = {"RUST_LOG": "info"}
     if lib_dir:
         env_vars["LD_LIBRARY_PATH"] = f"{lib_dir}:$LD_LIBRARY_PATH"
 
@@ -774,8 +774,8 @@ def _run_scenario_adb(
     conn_cfg["serial"] = serial
     remote = adb_remote_from_dict(conn_cfg)
 
-    # Remote binaries (assumed deployed by verify_resilience.py)
-    generate_bin = _remote_binary_path(device_cfg, "generate")
+    # Remote binaries (assumed deployed by verify.py)
+    generate_bin = _remote_binary_path(device_cfg, ENGINE_BIN)
     mock_bin = _remote_binary_path(device_cfg, "mock_manager")
 
     # Remote workdir per-run
@@ -789,11 +789,11 @@ def _run_scenario_adb(
     remote.exec(
         "pkill -TERM -f 'llm_manager' 2>/dev/null; "
         "pkill -TERM -f 'mock_manager' 2>/dev/null; "
-        f"pkill -TERM -f '{work_dir}/generate' 2>/dev/null; "
+        f"pkill -TERM -f '{work_dir}/{ENGINE_BIN}' 2>/dev/null; "
         "sleep 0.3; "
         "pkill -KILL -f 'llm_manager' 2>/dev/null; "
         "pkill -KILL -f 'mock_manager' 2>/dev/null; "
-        f"pkill -KILL -f '{work_dir}/generate' 2>/dev/null; "
+        f"pkill -KILL -f '{work_dir}/{ENGINE_BIN}' 2>/dev/null; "
         f"rm -f {work_dir}/verify_*.sock 2>/dev/null; "
         "true",
         timeout=20.0,
@@ -804,6 +804,7 @@ def _run_scenario_adb(
     lib_dir = device_cfg.get("paths", {}).get("lib_dir", "")
     env_vars: Dict[str, str] = {
         "RAYON_NUM_THREADS": "6",  # Galaxy S25 mandated (CLAUDE.md)
+        "RUST_LOG": "info",
     }
     if lib_dir:
         env_vars["LD_LIBRARY_PATH"] = lib_dir
@@ -1094,7 +1095,7 @@ def _run_scenario_adb_signal(
     conn_cfg["serial"] = serial
     remote = adb_remote_from_dict(conn_cfg)
 
-    generate_bin = _remote_binary_path(device_cfg, "generate")
+    generate_bin = _remote_binary_path(device_cfg, ENGINE_BIN)
     manager_bin = _remote_binary_path(device_cfg, "llm_manager")
 
     remote_work_root = device_cfg.get("paths", {}).get("work_dir", "/data/local/tmp") \
@@ -1106,11 +1107,11 @@ def _run_scenario_adb_signal(
     remote.exec(
         "pkill -TERM -f 'llm_manager' 2>/dev/null; "
         "pkill -TERM -f 'mock_manager' 2>/dev/null; "
-        f"pkill -TERM -f '{work_dir}/generate' 2>/dev/null; "
+        f"pkill -TERM -f '{work_dir}/{ENGINE_BIN}' 2>/dev/null; "
         "sleep 0.3; "
         "pkill -KILL -f 'llm_manager' 2>/dev/null; "
         "pkill -KILL -f 'mock_manager' 2>/dev/null; "
-        f"pkill -KILL -f '{work_dir}/generate' 2>/dev/null; "
+        f"pkill -KILL -f '{work_dir}/{ENGINE_BIN}' 2>/dev/null; "
         "true",
         timeout=20.0,
     )
@@ -1118,7 +1119,7 @@ def _run_scenario_adb_signal(
     backend = _resolve_backend(spec.baseline.backend, device_cfg)
 
     lib_dir = device_cfg.get("paths", {}).get("lib_dir", "")
-    env_vars: Dict[str, str] = {"RAYON_NUM_THREADS": "6"}
+    env_vars: Dict[str, str] = {"RAYON_NUM_THREADS": "6", "RUST_LOG": "info"}
     if lib_dir:
         env_vars["LD_LIBRARY_PATH"] = lib_dir
 
