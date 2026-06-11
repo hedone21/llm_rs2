@@ -899,11 +899,12 @@ flowchart TB
 | mode | Stage 책임 | 실행 주체 | tier / INV |
 |---|---|---|---|
 | **Incremental** | **multi-tick drain (D5)** — `WeightMutate` 매 tick `IncrementalSwapPlan::drain_chunk`(per_tick=2 layer) → `SwapExecutor::execute_on_slots` → `Continue`, `is_done()` 시 `Consumed` | Stage 자신(step-tier) | step-tier — `Box<dyn>` OK. Stage 가 plan 을 보유·소진 |
-| **IntraForward** | **commit(설치)만** — `IntraForwardSwapHook::new`(slots/secondary/backend/dispatcher 주입) 생성 후 `transformer.layer_boundary_hook` slot 에 설치 | `IntraForwardSwapHook`(impl `LayerBoundaryHook`, intra_forward_swap.rs:375) — **forward layer 경계 dispatch** | **layer-tier (N×/token, INV-149/150)** — `INV-HOTPATH-DISPATCH` 로 PipelineStage 로 못 올림. Stage 는 설치만 |
-| **LayerImmediate** | **commit(설치)만** — IntraForward 와 동일 hook, mode label 만 상이 | `IntraForwardSwapHook`(layer-immediate 변형) | 동상 (layer-tier) |
+| **IntraForward** | **commit(설치)만** — `IntraForwardSwapHook::new`(slots/secondary/backend/dispatcher 주입) → `Arc<Self>` 생성 후 **공유 hook cell** 에 `Some` 설치(§5.9.2). ModelForward 가 매 step cell→forward args `layer_boundary_hook` 슬롯 주입 | `IntraForwardSwapHook`(impl `LayerBoundaryHook`, intra_forward_swap.rs:375) — **forward layer 경계 dispatch** | **layer-tier (N×/token, INV-149/150)** — `INV-HOTPATH-DISPATCH` 로 PipelineStage 로 못 올림. Stage 는 cell 설치만 |
+| **LayerImmediate** | **commit(설치)만** — IntraForward 와 동일 hook, mode label 만 상이(§5.9.2 동일 cell) | `IntraForwardSwapHook`(layer-immediate 변형) | 동상 (layer-tier) |
 | **PhaseAware** | **commit(설치)만** — `PhaseAwareSwapDispatcher::new` + `install_self_weak` + `commit_plan` + `set_max_chunks_per_token` 후 `op_trace::set_phase_hook`(process-wide singleton) 설치 | `PhaseAwareSwapDispatcher`(impl `PhaseHook`, phase_aware_swap.rs:684) — **op boundary dispatch** | **op-tier (INV-147)** — `INV-HOTPATH-DISPATCH` 로 PipelineStage 로 못 올림. Stage 는 설치만 |
 
 - **핵심 분리.** Incremental 만 swap 진행이 *decode tick 경계*(step-tier)에서 일어나 PipelineStage 의 `on_phase` multi-tick drain 으로 자연 표현된다. IntraForward/LayerImmediate(layer 경계)·PhaseAware(op 경계)는 **forward 내부 hot path**에서 진행되므로 — `INV-HOTPATH-DISPATCH` 의 "layer-tier dyn 금지"(production hot)에 막혀 — PipelineStage 로 격상 불가다. 이들에 대해 Stage 는 directive 도착 tick 에 hook 객체를 *설치*(construction tier)하고 즉시 `Consumed` 반환한다. 실제 swap 은 그 hook 이 forward 중 layer/op 경계에서 자율 진행한다(INV-147/149/150 검증 = 별개 서브시스템, `pipeline.rs:203` census — StepHook/PhaseHook/LayerBoundaryHook 은 본 decode-loop pipeline 과 무관한 live 서브시스템).
+- **설치 메커니즘 실배선 = §5.9.2.** IntraForward/LayerImmediate 의 "hook 설치" 는 **공유 cell**(`Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>>`)을 경유한다: WeightSwapStage 가 commit tick 에 cell 에 `Some(hook)` 설치 → ModelForward 가 매 step `cell.lock()`→forward args `layer_boundary_hook` 슬롯 주입 → plan finalize(INV-150) 후 cell 클리어. 현 `weight_swap.rs:217-238` 의 `let _hook = …` drop("forward slot 배선은 device 게이트" 주석)이 본 cell 설치로 대체된다. **production decode 경로(`forward_into(TransformerModelForwardArgs)`, transformer.rs:1390)에는 현재 `layer_boundary_hook` 슬롯이 없으므로**(슬롯은 offload 전용 `OffloadForwardArgs` 에만 존재) — Track B 는 `TransformerModelForwardArgs` 슬롯 추가 + `forward_into` layer loop hook 호출 배선이 선결이다(§5.9.2 census). PhaseAware 는 `op_trace::set_phase_hook` global singleton 으로 이미 배선 완료(cell 불요).
 - **production winner (LISWAP-6 등가 보존).** production winner = **per-tick=2 + async + dynamic-K + sub-batch pause**(메모리 spike 회피 hard constraint, LISWAP-6). 이는 Incremental mode 의 `IncrementalSwapPlan(per_tick=2)` + `AsyncSwapDispatcher` + `DynamicKController`/sub-batch pause 조합으로 표현된다 — AB-6 이전은 **이 조합을 등가 보존**한다(per_tick·async·pacing 메커니즘은 ADR-0006 D2 "pacing = executor 소유" 그대로, plan 에 안 담음). `handle_swap_weights` §6 Incremental arm 의 `per_tick = 2usize`(swap_runtime.rs:233) hardcode 가 이 winner 의 코드화이며, Stage 이전 시 동일 상수 보존.
 - **commit_slot → Stage 내부 상태 흡수.** 현 `SwapCommitSlot`(swap_runtime.rs:35, 소비자 0 orphan)이 4-mode 객체를 담던 역할은 Stage 가 흡수한다 — Incremental plan 은 Stage 의 `Mutex<IncrementalSwapPlan>` 필드(ADR-0006 D5 "&mut 상태 = Mutex", `IntraForwardSwapHook`/`PhaseAwareSwapDispatcher` 의 `Mutex` 선례), hook 3종은 설치 후 process-global/transformer slot 으로 떠나므로 Stage 가 보유 불요.
 
@@ -970,6 +971,8 @@ WeightSwapStage commit (§7)
 - `layer_slots: Vec<Arc<LayerSlot>>` = **partition 분과 공유**(이미 AB-4 §5.5.8 에서 dispatcher 로 흐름 — swap 이 같은 handle 재사용, 추가 추출 0).
 
 > **non-local 변경 경고**: `EngineSwapRuntime` 은 `swap_backend`/`AsyncSwapDispatcher`/`release_worker` 를 보유하므로 build_bench_loop 가 이들을 구성·전달해야 한다(현 swap 미배선 = `NoOpSwapStage`, ADR-0006 §5 "greenfield wiring"). secondary_mmap 부재 모델(happy/chat)은 `swap_runtime=None` → swap directive 무시(무영향). **host smoke 불가**(GPU 부재 + secondary 필요) — build/clippy + CLI parse + dispatcher transient/in-flight 단위테스트 + `handle_swap_weights` §1~7 등가 테스트까지. 실 swap decode·정확성·device 게이트 = S25/Jetson 필수(legacy frozen baseline 대조).
+
+> **hook cell 배선 (Track B, §5.9.2) host scope 당김.** AB-6 작성 시점(2026-06-11)의 §5.6.3 표·본 §5.6.7 은 IntraForward/LayerImmediate 의 forward slot 배선을 *전부* device 게이트로 미뤘으나(weight_swap.rs:217-238 `let _hook` drop), §5.9.2 가 **공유 hook cell** 메커니즘을 정의하면서 배선의 *구조* 는 host scope 로 당겨진다: `TransformerModelForwardArgs` 슬롯 추가 + `forward_into` hook 호출 배선 + WeightSwapStage `hook_cell` 인자 + ModelForward cell-read 는 모두 host build/clippy/unit 으로 검증 가능(commit 시 cell=Some / finalize 후 cell=None / cell→forward args 주입 단위테스트). device 게이트에 남는 것은 **실 IntraForward swap dispatch 정확성·TBT**(secondary + GPU async swap 필요)뿐이다 — 구조 배선은 host, 동작 실증은 device 로 분담.
 
 ### 5.7 AB-2 — `KiviQuantStage` (KvQuantDynamic runtime directive → OneShot PipelineStage, KIVI 축)
 
@@ -1235,6 +1238,101 @@ v1 KIVI 경로(`d5ed71d2^` L4373-4388)는 `kivi_caches` 로 `kv.quant_dynamic` e
 > **device 게이트** (host 밖): S25 verify 4건(`signal_memory_critical`·`signal_thermal_critical_throttle` × f16/q4) RED→GREEN. 호스트 GPU 부재로 ISSUE-6 가드 실경로(device-only null buffer)는 S25 에서만 실증.
 
 **v1 등가 anchor 총괄**: compute 본문 = `generate.rs`(`d5ed71d2^`) L3676-3850(`compute_qcf_estimates` + `QcfEstimateContext`) / KIVI quant = L4373-4388 / manager handshake = `lua_policy.rs:780-790`(RequestQcf 발행) + `:871-891`(complete_qcf_selection). beta4 매핑표(`arch/beta4_command_channel_mapping.md`) §1.2 #10 행 + §1.5 #14 행을 AB-5 완료로 갱신(§아래 동기화).
+
+### 5.9 공유 슬롯 배선 — ModelForward `None`-고정 슬롯의 사후 주입 (Track A score accumulator + Track B layer-boundary hook)
+
+**역할.** β-7 DecodeLoop 재작성이 `ModelForward`(`session/forward/model_forward.rs:7-12` 주석)의 forward args eval-feature 슬롯들(`score_accumulator`/`skip_config`/`importance_collector`/`layer_boundary_hook` 등)을 전부 `None` 고정으로 남겼다 — "absorbed by the PipelineStage registry". 본 절은 그중 두 슬롯의 *실배선* 을 정의한다: (A) `score_accumulator`(h2o/d2o eviction score 누적 — argus_bench) / (B) `layer_boundary_hook`(IntraForward/LayerImmediate swap dispatch — §5.6.3). 두 트랙은 **같은 구조적 문제** 를 푼다: ModelForward 가 매 step 읽고 Stage(또는 assembly)가 mid-loop 에 쓰는 **공유 cell** 이 필요하다.
+
+#### 5.9.0 공유 cell 패턴 — 1회 정의, 두 트랙 공용
+
+**문제.** ModelForward 의 forward args 슬롯은 `Option<&'a mut …>`/`Option<&'a dyn …>` 의 *call-local borrow* 다(`step`/`prefill` 함수 스코프 내 lifetime). 이 슬롯의 owner 는 두 트랙에서 각각:
+- **Track A**: score accumulator 의 *상태*(누적 importance)는 step 간 유지돼야 하고(매 step `accumulate`→`end_step`), eviction Stage 가 그 상태를 읽어야 한다 → ModelForward 와 EvictionStage 가 **같은 accumulator 를 공유**.
+- **Track B**: hook 객체는 WeightSwapStage::commit(directive 도착 tick = mid-loop)이 *생성*하고, ModelForward 의 매 step forward 가 *소비*(forward args 로 전달)한다 → Stage 가 쓰고 ModelForward 가 읽는 cell.
+
+**채택 = assembly 시점 생성 `Arc<Mutex<T>>` cell, 양측이 각자 Arc clone 보유.** assembly(`build_bench_loop`)가 cell 1개를 만들어 ModelForward(생성자 인자)와 소비자(Track A=EvictionStage 경유 미사용, 아래; Track B=WeightSwapStage 생성자 인자)에 각각 `Arc` clone 으로 넘긴다. ModelForward 는 forward 직전 `cell.lock()` 으로 내용을 빌려 forward args 슬롯에 주입한다(step-tier 1 lock/step).
+
+```mermaid
+flowchart LR
+    asm["build_bench_loop (assembly)"]
+    cellA["Arc&lt;Mutex&lt;Option&lt;AttentionScoreAccumulator&gt;&gt;&gt; (Track A)"]
+    cellB["Arc&lt;Mutex&lt;Option&lt;Arc&lt;dyn LayerBoundaryHook&gt;&gt;&gt;&gt; (Track B)"]
+    mf["ModelForward.step/prefill : 매 step lock→read"]
+    es["DecodeLoop : eviction 시 cell 에서 scores 추출 (Track A)"]
+    ws["WeightSwapStage::commit : cell 에 Some(hook) 설치 (Track B)"]
+
+    asm -->|"생성 + Arc clone"| cellA
+    asm -->|"생성 + Arc clone"| cellB
+    cellA --> mf
+    cellA --> es
+    cellB --> mf
+    cellB --> ws
+```
+
+- **INV-STAGE-LAYER-HANDLE 동형 (god-ctx 회피 보존).** 본 cell 은 `StageContext` 의 **새 필드가 아니다** — assembly 가 만들어 양측 owner 가 `Arc` 로 보유한다(EvictionStage 가 `Vec<Arc<StandardFormat>>` 를, WeightSwapStage 가 `Arc<EngineSwapRuntime>` 를 register 시점 보유한 것과 동형). `StageContext` 는 `step`/`profiler` 2-field 그대로 유지(§5.2.1, INV-DECODE-STAGE-006). cell 은 "Stage 가 자기 책임 입출력 채널을 held-handle 로 보유" 패턴의 자연 확장이다.
+- **Mutex 비용 = step-tier 1 lock/step.** 추론은 단일 스레드(INV-018)라 contention 0. EvictionStage 가 `Mutex<CacheManager>`(eviction.rs:46) 를 per-dispatch 1 lock 으로 쓰는 선례와 동급. forward hot path(plan path layer-tier)에는 lock 추가 0 — cell read 는 forward 진입 *전* step-tier 1회.
+- **대안 비교 ≥1.**
+
+  | 대안 | 골자 | 판정 |
+  |---|---|---|
+  | **status quo** | 슬롯 `None` 고정 유지 | **기각** — Track A: h2o/d2o QCF estimate 미산출 + eviction uniform fallback(현 backlog AB-1 잔여). Track B: IntraForward/LayerImmediate swap dispatch 부재(`let _hook` drop, weight_swap.rs:217-238). AB-6 device 게이트 미완. |
+  | **ModelForward setter + LoopControl 경유** | DecodeLoop 이 매 step `forward.set_hook(…)`/`set_scores(…)` setter 호출, hook/score 는 `LoopControl`(transient 필드)로 carry | **기각** — (a) `Forward` trait 표면에 setter 2종 신설(front-door 확장, §7 ① 위반). (b) `LoopControl` 은 AB-2/4/5 에서 *축소* 방향(deprecated 필드 삭제, §5.6.4/§5.7.3)이라 새 carry 필드 추가가 역행. (c) Track B hook 은 plan 소진까지 *잔존* 해야 하는데 transient carry 는 매 tick clear 라 시맨틱 불일치. (d) setter 경로는 DecodeLoop 가 hook/score lifetime 을 알아야 함 → driver 책임 비대화. |
+  | **채택: assembly 생성 `Arc<Mutex<T>>` cell** | 위 다이어그램 | **확정** — trait 표면 무확장, god-ctx 회피, lifetime 은 cell owner(Stage/assembly) 책임, Track A/B 단일 관용구. |
+
+- **두 트랙의 cell 타입.** Track A = `Arc<Mutex<Option<AttentionScoreAccumulator>>>`(accumulator 상태가 cell 안에 *소유* — borrow 아님, step 간 유지). Track B = `Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>>`(hook 은 이미 `Arc<Self>`(intra_forward_swap.rs:176 반환), cell 은 *설치 여부* 만 toggle). 두 트랙 cell 타입은 다르나 **관용구(assembly 생성 + Arc clone 양분 + ModelForward step-tier lock-read)는 동일**.
+
+#### 5.9.1 Track A — score accumulator 배선 (argus_bench h2o/d2o)
+
+**현 상태 census (2026-06-11, 소스 직접).**
+- ModelForward: `score_accumulator: None`(model_forward.rs:384 prefill / :468 decode 고정).
+- EvictionStage: `run_eviction`(eviction.rs:111-124)이 `cache_manager.force_evict(&mut temp, ratio)` — **score-free**. score 경로(`force_evict_with_scores`)·accumulator handle 보유 모두 부재 → eviction 이 `ScoreContext::None` uniform fallback(cache_manager.rs:578 `ScoreContext::None => (None, None, 0)`).
+- QCF estimate: `compute_qcf_estimates`(qcf_runtime.rs:890)가 `let scores_opt: Option<Vec<f32>> = None`(uniform fallback 하드코딩) + `requires_scores && scores_opt.is_none() { continue }`(L934-936) → `kv.evict_h2o`/`kv.merge_d2o`(requires_scores=true) **skip**.
+- assembly: `build_bench_loop.rs:329` `None, // importance` 는 **weight-family** `ImportanceLookup`(WeightSwapDecider 입력)이지 token-level KV scores 가 아니다 — 별개 채널.
+
+**v1 reference + 살아있는 등가 anchor.** v1 generate.rs(`d5ed71d2^`)는 삭제됐으나 **eval 경로(`session/eval/`)가 동일 패턴을 live 보존** 한다(등가 anchor — 자기 비교 금지, anchor = eval EvictionHook):
+- 생성: `policy ∈ {h2o, d2o, h2o_plus}` 일 때만 `AttentionScoreAccumulator::new_gqa(max_seq, n_heads, n_kv_heads, total_layers, last_n, decay)`(attention_scores.rs:86) + `set_active(true)` + `set_time_normalize(!raw_scores)`(L121).
+- forward 전: caller 가 `acc.begin_step()`(eval_loop.rs:261/353/865/919) 호출 후 forward args 에 `score_accumulator: Some(&mut acc)` 전달.
+- **end_step 시점 = `forward_into` 내부**(transformer.rs:1643-1644 `if let Some(ref mut acc) = score_accumulator { acc.end_step() }`) — caller 가 별도 호출 **불요**. forward 가 layer 누적(`accumulate_layer_gqa`, attention_scores.rs:198 / transformer.rs:1620-1638) + step flush 를 자체 수행한다.
+- eviction 시: `acc.importance_scores()`(L278, time-normalize 면 normalized)를 `.to_vec()` → `force_evict_with_scores(caches, ratio, &scores)`(eviction_hook.rs:503-510).
+- **eviction 후 = `acc.reset()`**(eviction_hook.rs:523-524) — **score compaction 아님**.
+
+**★ landmine 해소 (eviction 후 score 재정렬).** 작업 명세가 우려한 "eviction 이 KV 위치를 prune 하면 accumulator per-token scores 도 재배열 필요(2번째 eviction부터 misaligned)" 는 **reset 으로 해소된다 — compaction 메서드 불요**. 근거: (1) `AttentionScoreAccumulator` 에 compaction 메서드 부재(소스 grep — `reset`/`begin_step`/`end_step`/`import_gpu_scores` 만, position-shift 메서드 0). (2) eval/v1 정본 거동 = eviction 직후 `acc.reset()`(eviction_hook.rs:524) — 누적 importance 전체를 0 으로 비운다. 시맨틱: eviction 이 일어나면 cumulative score 가 *무효* 가 되므로(KV geometry 변경) **다음 decode step 부터 재누적**. H2O 논문의 per-eviction 독립성과 정합(eviction 마다 fresh window). **따라서 Track A 의 compaction 계약 = "없음. eviction 후 reset"** 이 정답이고, 이는 misalignment 를 원천 차단한다(prune 후 stale score 가 다음 eviction 에 안 흘러감). 이 결정이 본 트랙 최대 landmine 의 정식 처분이다.
+
+**v1 보다 좁은 생성 조건 (backlog AC).** argus_bench 에서 **score-based policy(`h2o`/`h2o_plus`/`d2o`) 구성 시에만** accumulator 생성. `needs_caote`/`enable_resilience` 단독은 제외(스코프 최소화 — hot path 비용 회피, argus_cli 범위 밖). v1 의 `needs_score_based = policy in {h2o, d2o, h2o_plus}` 조건을 그대로 차용하되 caote 항은 뺀다.
+
+**배선 메커니즘 (공유 cell 적용).**
+- assembly(`build_bench_loop`)가 score-based policy 일 때 `Arc<Mutex<Option<AttentionScoreAccumulator>>>` cell 생성(`Some(new_gqa(..).set_active(true))`), 아니면 `Arc::new(Mutex::new(None))`.
+- ModelForward 가 cell 의 `Arc` clone 을 생성자 인자로 보유. `step`/`prefill` 에서 forward 직전 `cell.lock()` → `Option<&mut acc>` 을 forward args `score_accumulator` 에 주입. **begin_step 도 ModelForward 가 호출**(forward 전, lock 보유 동안) — eval caller 가 begin_step 하던 책임을 ModelForward 가 흡수(단일 lock 스코프 내 begin_step→forward(=end_step 자동)). cell 이 `None` 이면 슬롯 `None`(거동-0, happy-path).
+- **eviction score 흐름**: EvictionStage 는 score cell 을 보유 *하지 않는다* — DecodeLoop 의 `try_evict` 경로가 score 를 전달한다. 현 driver(`decode_loop.rs:330` KvMutate dispatch)는 `EvictionStage::run_eviction` 이 score-free `force_evict` 를 부른다. **score-aware 변형**: assembly 가 score-based policy 일 때 EvictionStage 를 score cell 도 보유하는 변형으로 구성(`EvictionStage::one_shot_scored(handles, cm, ratio, score_cell)`) → `run_eviction` 이 `score_cell.lock()` 에서 `importance_scores().to_vec()` 추출 후 `force_evict_with_scores(temp, ratio, &scores)` 호출, 직후 같은 lock 에서 `acc.reset()`. **단일 cell** 이 ModelForward(write 누적)와 EvictionStage(read+reset)를 잇는다.
+
+  > **EvictionStage cell 보유 = INV-STAGE-LAYER-HANDLE 동형.** score cell 은 EvictionStage 가 `cache_manager`(Arc<Mutex>)를 register 시점 보유한 것과 같은 held-handle 이다(`StageContext` 무확장). `run_eviction` 본문만 score-aware 분기(현 `force_evict` ↔ `force_evict_with_scores`, eval_loop.rs:497-516 와 동일 2분기)를 추가하고, OneShot/Persistent 구분·UER(take_inner/put_inner) 골격은 무변.
+
+- **QCF estimate 흐름**: `compute_qcf_estimates`(qcf_runtime.rs:831)의 `QcfEstimateContext` 에 score cell 접근이 필요하다. 현 `importance: Option<&dyn ImportanceLookup>` 필드(qcf_runtime.rs:813)는 **weight-family layer importance** 라 별개 — h2o/d2o 가 요구하는 token-level KV scores 는 **신규 필드**(`token_scores: Option<&[f32]>`)로 주입한다. dispatcher 의 `compute_and_send_qcf`(§5.8.2)가 score cell 을 lock 해 `importance_scores()` 를 빌려 `token_scores` 로 넘기면, L890 의 `scores_opt = None` 하드코딩이 실 scores 로 교체돼 `requires_scores` skip(L934-936)이 풀린다.
+
+  > **importance vs token_scores 비대칭 (명시).** `QcfEstimateContext.importance`(ImportanceLookup)는 **weight 가족**(layer-level, swap/skip QCF 용)이고, h2o/d2o 의 `attention_scores`(`QcfKvParams.attention_scores`, qcf_runtime.rs:951)는 **KV 가족**(token-level). 두 필드를 합치지 말 것(QCF 명명 컨벤션 — QCF_weight ⊥ QCF_kv, CLAUDE.md). 신규 `token_scores` 필드는 KV 가족이며 score cell 이 그 source 다.
+
+**게이트 시나리오.** `verify/scenarios/signal_memory_critical.yaml` — `--eviction-policy h2o` + MemoryPressure critical → manager `RequestQcf` → `QcfEstimate` 에 `kv.evict_h2o`/`kv.merge_d2o` 포함(score 산출돼 skip 안 됨) → policy `KvEvict` 선택 → `[CacheEvent] Eviction completed`(cache_manager.rs:300) ≥1. **host smoke 불가**(GPU score 누적은 device, host CPU 는 separate-pass — 다만 score-free force_evict 등가 + accumulator unit 은 host). 실 score-driven eviction 정확성 = S25 device 게이트.
+
+#### 5.9.2 Track B — IntraForward/LayerImmediate hook forward slot 실배선 (§5.6.3 보강)
+
+**현 상태 census (2026-06-11, 소스 직접).**
+- `WeightSwapStage::commit`(weight_swap.rs:203-238)의 IntraForward/LayerImmediate arm: `IntraForwardSwapHook::new(…)` → `Arc<Self>`(intra_forward_swap.rs:176) 생성 후 **`let _hook = …` drop**(L217-238). 설치 대상 부재 — "forward slot 배선은 device 게이트(§5.6.7)" 주석만(L234-237).
+- 설치 대상 슬롯: `OffloadForwardArgs.layer_boundary_hook: Option<&'a dyn LayerBoundaryHook>`(transformer.rs:287, ENG-ALG-235)에 **존재** 하나, **production decode 경로 = `forward_into(TransformerModelForwardArgs)`**(transformer.rs:1390)가 쓰는 `TransformerModelForwardArgs`(transformer.rs:297-322)에는 **`layer_boundary_hook` 슬롯이 없다**. 즉 Track B 는 슬롯 *주입* 만이 아니라 **`TransformerModelForwardArgs` 에 슬롯 추가 + `forward_into` layer loop 에 hook 호출 배선**(현 `forward_into` 본문에 `on_layer_boundary`/`pending_event_for_dyn` 호출 0 — grep 확인)이 선결이다. `OffloadForwardArgs` 의 hook 슬롯은 offload 전용(offload_forward.rs:208/247 `None` 고정)이라 production decode 와 무관.
+- PhaseAware(weight_swap.rs:240-265)는 `op_trace::set_phase_hook`(process-wide singleton, L261)으로 **이미 배선 완료** — cell 불요(global). 본 트랙은 IntraForward/LayerImmediate 만 대상.
+
+**난점 = mid-loop 주입.** hook 설치는 register 시점 1회가 아니라 `WeightSwapStage::commit`(directive 도착 tick, decode 루프 중간)에서 일어난다. ModelForward 가 매 step 읽고 Stage 가 commit tick 에 쓰는 공유 cell(§5.9.0 Track B 타입)이 필요하다.
+
+**배선 메커니즘 (공유 cell 적용).**
+- assembly 가 `Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>>` cell 생성. 초기값 `None`(설치 전).
+- ModelForward 가 cell `Arc` clone 보유. `step` 에서 forward 직전 `cell.lock()` → `Option<Arc<dyn LayerBoundaryHook>>` 가 `Some` 이면 그 `&dyn` 을 forward args `layer_boundary_hook` 슬롯에 주입(`TransformerModelForwardArgs` 신규 슬롯). `None`(미설치)이면 슬롯 `None` — **INV-147 zero-overhead**(forward layer loop 의 `Option::is_some` branch 1회, hook=None).
+- WeightSwapStage 가 cell `Arc` clone 을 register 시점 보유(생성자 신규 인자 `hook_cell: Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>>`). `commit` 의 IntraForward/LayerImmediate arm 에서 `let _hook` drop 을 **`*self.hook_cell.lock() = Some(hook as Arc<dyn LayerBoundaryHook>)`** 로 교체. LayerImmediate 는 **동일 hook, mode label 만 상이**(현 `mode_label` 분기 보존, weight_swap.rs:205-212).
+
+**hook lifetime / 제거 시점 (v1 시맨틱 확인).** v1 에서 hook 은 `IncrementalSwapPlan` 과 달리 **plan 소진 후에도 잔존** 하는가? — `IntraForwardSwapHook` 의 lifecycle 은 **finalize 기반**(intra_forward_swap.rs:120 `finalize` — "plan complete 후 decode loop 가 호출. drain → synchronize → ratio_generation+1 → invalidate", INV-150). plan dispatch 가 끝나면(`is_done`) decode loop 가 `finalize` 를 호출하고, 그 후 hook 은 더 dispatch 하지 않는다(`stage_gate_armed`/`finalized` atomics 가드). **cell 제거 = finalize 후 driver(또는 Stage)가 `*hook_cell.lock() = None`** 로 비운다 — 잔존 hook 이 다음 swap directive 의 새 hook 설치를 막지 않게. 단 hook=None 으로 둬도 `on_layer_boundary` 가 `plan.should_dispatch(idx)` false 면 즉시 return(intra_forward_swap.rs:392)이라 **finalize 후 cell 비우기는 정확성이 아니라 위생(다음 directive 의 fresh 설치)** 목적. v1 등가: hook 은 plan 종료까지 forward 슬롯에 잔존, 종료(finalize) 후 슬롯 클리어. **Implementer 가 finalize 호출처(decode loop 의 plan-complete 감지)를 v2 DecodeLoop 의 어느 phase 가 담당할지 확정** — 후보: PostForward 에서 `runtime.is_idle()` 전이 감지 시 cell 클리어(§5.6.4 in-flight 가드와 동일 마커).
+
+  > **§5.6.3 표 "commit(설치)만" 의 실배선 = 본 절.** §5.6.3 표의 IntraForward/LayerImmediate 행 "commit(설치)만 — `IntraForwardSwapHook::new` 생성 후 `transformer.layer_boundary_hook` slot 에 설치" 의 *설치 메커니즘* 이 본 §5.9.2 의 hook cell 이다. WeightSwapStage 는 cell 에 `Some(hook)` 설치, ModelForward 가 매 step cell→forward args 주입, finalize 후 cell 클리어. "Stage 는 설치만, 실 swap 은 hook 이 layer 경계에서 자율 진행"(§5.6.3 핵심 분리)은 불변 — cell 은 그 *설치 채널* 일 뿐이다.
+
+**INV-HOTPATH-DISPATCH 준수.** layer-tier dispatch 자체(`on_layer_boundary` 호출)는 forward args 의 `Option<&dyn LayerBoundaryHook>` 정적 분기(INV-147, 기존 메커니즘)다 — 본 배선이 새로 더하는 비용은 **step-tier cell 읽기 1 lock/step**(ModelForward.step 의 forward 직전). layer-tier 에 dyn 추가 0(hook 슬롯은 §8 표의 "step→boundary 자유" 가 아니라 *layer-tier* 지만, 이미 INV-147 이 hook=None zero-overhead 로 규정한 기존 슬롯 — 본 배선은 그 슬롯을 `None`→`Some` 토글만, 새 layer-tier dyn 신설 0).
+
+**host 게이트 / device 게이트.** host: `TransformerModelForwardArgs` 슬롯 추가 + `forward_into` hook 호출 배선 빌드/clippy + hook cell 설치/클리어 단위테스트(commit 시 cell=Some, finalize 시 cell=None) + ModelForward cell-read 단위테스트(cell=Some 면 forward args 슬롯 Some, cell=None 면 None). **실 IntraForward swap dispatch·정확성 = S25 device 게이트**(secondary 필요 + GPU async swap, §5.6.7 "IntraForward/PhaseAware = device 필수"). AB-6 device 게이트의 IntraForward/LayerImmediate arm 이 본 배선으로 GREEN 가능해진다.
 
 ---
 
