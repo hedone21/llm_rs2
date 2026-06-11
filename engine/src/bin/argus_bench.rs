@@ -71,9 +71,7 @@ fn bench_supported(args: &Args) -> bool {
         && !args.d2o_layer_alloc()
         && !args.profile
         && !args.profile_events
-        && !args.swap_intra_forward
-        && !args.swap_layer_immediate
-        && !args.swap_phase_aware
+    // swap mode 3종(intra_forward/phase_aware/layer_immediate)은 §5.9.2 실배선 완료로 허용.
 }
 
 /// AB-0 에서 미구현인 mode 진입 flag 를 검사하여 즉시 reject 한다.
@@ -113,16 +111,13 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
     }
     // AB-6: `--secondary-gguf` 해제 — SwapWeights runtime directive 경로의 secondary 공급원
     // (WeightSwapStage + build_bench_loop SwapWiringConfig 배선 완료). CLI 정적 swap
-    // (force_swap_ratio/incremental_per_tick)과 mode flag(intra-forward/layer-immediate/
-    // phase-aware — IntraForward hook 은 host 미배선, §5.6.3)는 차단 유지.
-    if args.force_swap_ratio.is_some()
-        || args.swap_incremental_per_tick > 0
-        || args.swap_intra_forward
-        || args.swap_layer_immediate
-        || args.swap_phase_aware
-    {
+    // (force_swap_ratio/incremental_per_tick)은 차단 유지. swap mode 3종
+    // (intra-forward/phase-aware/layer-immediate)은 §5.9.2 IntraForward hook 실배선
+    // 완료(5862325c)로 차단 해제 — SwapWiringConfig.default_mode 로 흘러 SwapWeights
+    // directive 도착 시 해당 mode로 commit된다.
+    if args.force_swap_ratio.is_some() || args.swap_incremental_per_tick > 0 {
         bail!(
-            "argus-bench AB-6: CLI-static weight swap / swap mode flags not supported; \
+            "argus-bench AB-6: CLI-static weight swap not supported; \
              use SwapWeights runtime directive (mock_manager/manager IPC) with --secondary-gguf"
         );
     }
