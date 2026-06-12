@@ -76,7 +76,9 @@ T1~T6 트랙에 배정. 상세는 (b) 참조. 포함 항목(line ref):
 
 ---
 
-#### T1 — 위생 일괄 (host-only, 빠름) · 규모 **L**(항목 多, 개당 S)
+#### T1 — 위생 일괄 (host-only, 빠름) · 규모 **L**(항목 多, 개당 S) — ✅ **종결 (2026-06-12)**
+
+> **T1 종결 기록 (2026-06-12)**: 15항목 전부 처분 완료 — 해소 9 (1-1 ✅ / 1-2 ✅ / 1-3 ✅ / 1-4 ✅ / 1-6 ✅ / 1-7 ✅ spec 갱신 / 1-9 ✅ / 1-13 ✅ / 1-15 ✅ RESOLVED 35/0), 부분 해소 1 (1-5: RoPE 수정 ✅ + MatMulTransposed/Slice 는 host 미재현 → S25 재진단 잔여, Softmax reference 부재 발견), 거취 확정 5 (1-8 현행 유지 / 1-10·1-11 status quo / 1-12 보류 / 1-14 범위 밖 재분류). 부수: host_ptr_pool 테스트 G 사전존재 환경 FAIL 발견 → non-UMA skip 가드로 GREEN화, MGR-DAT-015 divergence 신규 backlog 등록. **게이트**: lib **1408/0**(quantize dead 테스트 2 정당 감소) + manager **0 FAIL**(224/19/36/60/38 등 전 스위트) + engine spec **687/0** + manager spec **38/0** + fmt + clippy `-D warnings` clean + coverage 오탐 신규 갭 0(45→51 은 INV-DECODE-STAGE 정당 노출). 커밋 9개(`fc63005c`..`93e97a60` + backlog 현행화).
 
 같은 성격(문서/주석/baseline/거취 결정/stub)이라 한 트랙으로 묶되, 개별 항목은 독립이라 병렬·임의 순서 가능. 디바이스 불요. host 게이트(lib N/0 + fmt + clippy)만.
 

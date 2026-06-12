@@ -96,7 +96,7 @@
 ---
 
 ## [P3] §13.8-L hot path sub-trait 격상 — 잔여 7건 (2026-05-26 P2→P3 강등, 리뷰 결과)
-- **Status**: TODO (P3) — 정책 RESOLVED + 1차 sprint(`b94e55ee`)로 강제 trigger 사유 해소. 잔여 marker는 정적, 새 추가 없으면 status quo로 충분.
+- **Status**: TODO (P3) — 정책 RESOLVED + 1차 sprint(`b94e55ee`)로 강제 trigger 사유 해소. 잔여 marker는 정적, 새 추가 없으면 status quo로 충분. **거취 확정 (2026-06-12, Backlog Burndown T1-10)**: status quo 유지 — 아래 재발동 트리거 충족 시에만 재개(트리거 3종은 본문 "재발동 트리거 조건" 참조).
 - **강등 사유 (리뷰 결정 2026-05-26)**: §13.8-L 정책 자체가 RESOLVED (`ARCHITECTURE.md` line 2120 `§L … RESOLVED (2026-05-24, S-C5 확장)`) + S-L-1/2/3 1차 sprint 종결 (`b94e55ee`, hot path marker 9→7). 잔여 7건의 baseline 효과 0 + transitive drag(PlanExecutor 8+ method + nested 3 trait + OpenCL queue trait 노출)이 3~5일로 ROI 최저. 동시 backlog의 generate 분할 / transformer.rs ctor 본질 해소 트랙이 더 ROI 큼.
 - **잔여 marker 7건 (handoff_inv_layer_L_hot_path_subtrait_2026_05_24.md §다음 작업 D)**:
   - **PlanExecutor 군 (3건)**: `models/transformer.rs:1479` (forward_into) / `:2492` (execute_plan) / `:2739` (KIVI plan execute). `FullKernelPlan` struct가 `OpenCLBackend` concrete를 직접 받음 — trait 추상화 시 nested trait 3개(Queue/GpuScoreAcc/Program) 동반 노출 필요. 가장 큰 산.
@@ -241,14 +241,14 @@
 - **확정 production path**: `--backend qnn_oppkg --swap-incremental-per-tick 25` (LISWAP-1 + LISWAP-6 alias 자동 활성)
 
 ## [P2] LISWAP-6 cleanup segfault — 2026-05-10
-- **Status**: TODO (production 영향 없음, 측정 영향 없음 — 측정 깨끗하게 끝나려면 fix)
+- **Status**: **범위 밖 재분류 (2026-06-12, Backlog Burndown T1-14 거취)** — 재현 조건이 swap mode + `--backend qnn_oppkg` 조합 한정인데 qnn_oppkg 는 Sprint 2b(2026-05-26)에서 production 제거됨(M3/M4/M5 microbench 보존 전용). A2(성능/QNN 보존 트랙) 동류로 burndown 범위 밖. **재발동 트리거**: qnn_oppkg production 부활, 또는 OpenCL swap mode 에서 동일 cleanup segfault 재현 시 P2 복귀.
 - **상세**: swap mode runs (`--swap-incremental-per-tick`, `--swap-phase-aware`) 에서 generation 정상 완료 후 process exit 시 SIGSEGV. baseline (no `--secondary-gguf`) 미발생. 모든 swap mode + `--backend qnn_oppkg` 조합에서 재현.
 - **추정 원인**: `RpcmemAliasBuffer` Drop ordering 또는 `cl_mem` release ↔ `rpcmem_free` race. OpenCL queue/context teardown 순서.
 - **참고 파일**: `engine/src/buffer/rpcmem_alias_buffer.rs`, `engine/src/models/weights/rpcmem_secondary.rs::RpcmemLayerRegion::Drop`
 - **fix 방안 후보**: (a) explicit drop sequence (cl_mem all release → rpcmem_free), (b) reference count guard, (c) backend teardown 시 rpcmem region 명시 release
 
 ## [P3] KiviCache hot path downcast resolve — 2026-05-24 등록 (backend extension sprint 후속) / 2026-05-26 P2→P3 강등
-- **Status**: TODO (P3) — §13.8-L 강등과 동기 (잔여 위치 일부 중복, 통합 처리 가능).
+- **Status**: TODO (P3) — §13.8-L 강등과 동기 (잔여 위치 일부 중복, 통합 처리 가능). **거취 확정 (2026-06-12, Backlog Burndown T1-11)**: status quo 유지 — production 영향 ≈0 실측(vtable Δ -0.231%) + transitive drag 큼. 재발동 트리거는 §13.8-L 항목과 동일(새 GPU backend production 검토 / marker inflation / 사용자 명시 우선순위).
 - **선행**: `.agent/todos/handoff_backend_extension_2026_05_24.md` (HEAD `5be6c0d7`)
 - **상세 (위치 정정 2026-05-26)**: 원래 `kivi_cache.rs:1559/1842/2108` 3건으로 등록되었으나 **`:1559`는 S-L-3 sub-sprint(`dde575b9`)에서 KiviAttentionBackend trait 격상으로 이미 해소**. 잔여는 2건: `:1842` (flush_residual_gpu, raw `ocl::core::enqueue_write_buffer` 호출) / `:2108` (assemble_view_gpu, 동일 패턴). 두 위치 모두 OpenCL queue handle을 trait surface로 노출해야 하므로 §13.8-L 잔여 7건 중 kivi raw queue 군과 본질 동일 sprint.
 - **제약**: `OpenCLBackend`는 Clone 미구현 + `Arc<dyn Backend>` → `Arc<OpenCLBackend>` Rust 기본 API 변환 불가. 단순 패턴 통일(`get_extension`)은 본 sprint 정책("hot path 보존")과 mismatch.
@@ -282,7 +282,7 @@
 - **상세**: `cargo clippy --workspace --features opencl --tests -- -D warnings`에서 `crates/qnn_oppkg_poc/src/lib.rs:725` 근방 raw pointer deref 함수에 `unsafe` 누락. rust 1.93 신규 lint. M1 회귀 안전망 crate이라 P3 우선순위. M2가 main 진입한 이상 PoC는 read-only — 손대지 않거나 일괄 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`로 silence.
 
 ## [P3] backend::opencl::* host test 24개 device-required fail — 2026-05-10 발견
-- **Status**: TODO (해소 가능성 높음 — 검증 1회 후 처분 / 2026-06-12 Backlog Burndown triage)
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-15)** — `cargo test -p llm_rs2 --lib backend::opencl` 실행: **35 passed; 0 failed** (host NVIDIA RTX 3090 Ti 실 GPU). `7daa7e69` GPU-우선 플랫폼 스캔 수정으로 해소 확인.
 - **2026-06-12 triage 단서**: L38 항목(host lib 테스트 위생 RESOLVED) 본문에 따르면 OpenCL 플랫폼 GPU-우선 스캔 수정(`7daa7e69`)으로 호스트 NVIDIA(RTX 3090 Ti)에서 `backend::opencl` 35종이 실 GPU에서 전부 PASS, lib 1410/0 달성으로 보고됨. 본 24-fail 항목은 그 수정으로 해소됐을 가능성이 높으나 **코드/실행 검증 미완** — 단정 금지. T1 위생 트랙에서 `cargo test -p llm_rs2 --lib backend::opencl` 1회 실행으로 0 FAIL 확인 후 RESOLVED 처분 예정.
 - **상세**: `cargo test --workspace --features opencl --tests`에서 host에 OpenCL device 없을 때 24 fail (gpu_buffer_shift, kv_scatter_batch, noshuffle, plan tests). Galaxy S25 디바이스 빌드에선 정상. 호스트 회귀 게이트에선 본 모듈 제외 권장 — sanity-check skill에 `--exclude-tests backend::opencl` 패턴 추가 검토.
 
@@ -609,7 +609,7 @@
 ---
 
 ## [P3] 다중 모델 사이즈 검증 테스트 매트릭스
-- **Status**: TODO
+- **Status**: **보류 (2026-06-12, Backlog Burndown T1-12)** — 다중 디바이스 확보 의존 + B1=NO(8B 온보딩 없음)로 매트릭스 상한도 미확정. 디바이스 확보 시 재개.
 - **Sprint**: backlog
 - **Dependencies**: 다중 디바이스 포팅 완료
 - **Description**: Llama 3.2 1B/3B 및 향후 7B/8B 모델에 대한 디바이스별 테스트 매트릭스 정의
@@ -766,11 +766,20 @@
 - **Notes**: 1B+2048ctx 타겟에서 실익 없음. stub 삭제 (7742543)
 
 ## [P3] QuantizeHandler stub 제거 + ENG-ALG-092 spec 개정
-- **Status**: TODO (2026-05-29 grill ③ B-b, "진짜 나중에" 미룸 — 중요도 낮음)
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-9)** — (a) `QuantizeHandler` struct + never-registered NoOp `CachePressureHandler` impl 삭제 (b) `target_bits_for_pressure` free fn 강등(spec MUST 보존 진입점, 기대값 None/8/4/2 불변) (c) ENG-ALG-092 표 정정(`spec/32-engine-algorithms.md` §3.9.2 — "6종" 제거, 등록 3종 + free-fn 항목 분리, `arch/32` 동기) (d) spec test 호출형 갱신. 검증: lib quantize 18/0 + test_action_pool 11/0 + spec eng_alg_060_092 19/0 + clippy clean + `QuantizeHandler` 잔존 참조 grep 0.
+
+## [P3] MGR-DAT-015 데이터 모델 divergence — Level 의 SystemSignal 포함 여부 — 2026-06-12 등록 (T1-7 부수 발견)
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **출처**: Backlog Burndown T1-7(EnergyConstraint divergence 해소) 중 Architect 발견
+- **Description**: `spec/23-manager-data.md` MGR-DAT-015 는 "Level 은 D-Bus 전송 경로 전용, 내부 SystemSignal 에 미포함"으로 명세하나, 실제 `SystemSignal::EnergyConstraint`(및 다른 3개 variant)는 `level` 필드를 가짐. MGR-ALG-015 수식보다 큰 데이터 모델 divergence 라 T1-7 범위(C5 보수적 디폴트)에서 의도적으로 제외.
+- **Acceptance Criteria**: 택1 — (a) MGR-DAT-015 를 "Level 은 SystemSignal 에 항상 포함, D-Bus 가 ThresholdEvaluator 로 재산출"로 명세 정정(코드 불변), 또는 (b) MGR-DAT-015 재설계. 방향이 갈리면 spec 의미 변경이라 사용자 질문 대상(C5).
+- **Notes**: 담당 권장 Architect(/spec-manage).
 - **Notes**: `QuantizeHandler::handle()`은 어느 pipeline에도 등록 안 되는 NoOp stub (위 MergeHandler/SparseHandler 동류, 단 아직 미삭제). 단순 삭제 불가 사유 — `target_bits_for_pressure`(PressureLevel→KIVI bits 매핑)가 ENG-ALG-092 *(MUST)* 로 명세 + `test_eng_alg_060_092.rs`/`test_action_pool.rs`가 검증(production 호출지는 0). 묶음 작업: (a) QuantizeHandler struct 삭제, (b) `target_bits_for_pressure`를 free fn 강등 또는 함께 정리, (c) ENG-ALG-092 표 정정 — 제목 "6종"인데 표엔 4개만 나열(Compress/Merge/Sparse 잔재 stale) + QuantizeHandler "완료"인데 never-registered NoOp(spec-impl divergence), (d) spec test 갱신. spec ID 걸려 Architect/spec-manage 라운드 필요. **선행 완료**: 2026-05-29 B-a — `ActionResult` dead variant `Quantized`/`Recalled` 삭제(producer/consumer 0, 영수증 채널의 빈 칸).
 
 ## [P3] EnergyConstraint 스펙-코드 Divergence 해소
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-7, C5 보수적 디폴트 = spec 갱신·코드 불변)** — divergence 가 수식뿐 아니라 데이터 모델 서술 전반(SystemSignal 에 `battery_pct` 필드 부재 — EnergyMonitor 가 Level 변환 후 폐기)에 걸쳐 있어 4개 spec 위치 정합화: `spec/22-manager-algorithms.md` MGR-ALG-014 표 + MGR-ALG-015 전면 재작성("Raw"→"Level Processing") / `spec/20-manager.md` MGR-029·MGR-020 / `spec/23-manager-data.md` MGR-DAT-014 / `arch/22-manager-algorithms.md` §1.6·§10. 기존 spec test 2건은 이미 Level 기반 검증이라 무영향. **부수 발견 → 신규 항목 등록**: MGR-DAT-015 데이터 모델 divergence(아래 항목 참조).
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **Description**: |
@@ -783,7 +792,7 @@
 ---
 
 ## [P3] ThermalCollector zone 패턴 매칭 auto-discovery
-- **Status**: TODO
+- **Status**: **현행 유지 확정 (2026-06-12, Backlog Burndown T1-8, C5 보수적 디폴트)** — 필요성 미확정(Notes) 상태에서 매칭 거동 변경은 회피. 재평가 트리거: 실제 다중 장치 배포 시점(신규 디바이스의 zone_type 이 exact match 로 안 잡히는 실사례 발생 시).
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **Description**: 현재 `zone_types`는 exact match. substring/keyword 매칭으로 확장하면 다양한 장치 커버 가능
@@ -975,7 +984,7 @@
 > Phase β(decode loop rewrite, β-1~β-7) 진행 중 발견·이월된 잔여. 출처 = `.agent/todos/roadmap_beta_decode_loop_rewrite_2026_06_10.md`. β-1~6 은 **전부 비차단 사전존재 이슈**, γ-4 는 β-7 G3 ripple 격리용 의도적 이월.
 
 ## [P3] test_backend 하네스 이슈 — MatMulTransposed 16 FAIL + MatMulSlice 8 FAIL + RoPE 2 ERROR — 2026-06-10 등록
-- **Status**: TODO
+- **Status**: **부분 해소 (2026-06-12, Backlog Burndown T1-5)** — ① **RoPE 2 ERROR 수정 완료**: 하네스가 n%head_dim≠0 케이스에서 2D 텐서로 `rope_inplace` 호출(RoPE 계약 3+ dims 위반)하던 shape 분기 버그 — 항상 유효한 4D로 정정, host scalar/OpenCL 8/8 PASS. ② **MatMulTransposed/MatMulSlice = host(NVIDIA) 미재현 잔여**: host FAIL 6건은 fallback GEMV 커널(`mul_mv_q4_0_f32.cl`)이 `cl_khr_subgroups` 미지원 NVIDIA에서 비정상 실행되는 환경 문제(device 카운트 16/8과 불일치) — S25 디바이스 라운드(T2/T3)에서 test_backend 1회 재실행으로 재현·진단 필요. ③ **부수 발견**: Softmax 검증이 reference 부재의 가짜 검증(`ref_sum=0` → diff=1/n, n≤64만 우연 FAIL) — 하네스에 Softmax reference 추가 필요(잔여 작업에 병합).
 - **Sprint**: backlog
 - **Dependencies**: 없음 (비차단)
 - **출처**: roadmap β-7 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:126`)
@@ -984,7 +993,7 @@
 - **Notes**: 비차단. production 정확성은 device sig 가 ground truth.
 
 ## [P3] INV-LAYER-001/002/003 만성 FAIL — `inv_layer_baseline.json` 재동결 — 2026-06-10 등록
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-4)** — 등록 시점 위반 동수(8/3/12)가 stale 이라 현 실측으로 재동결: baseline 7건 → 30건 (INV-001 +8 / INV-002 +3 / INV-003 +14, 전부 pre-existing 아키텍처 의존 — 코드 위반 아님). `cargo test -p llm_rs2 --test spec inv_layer` **8 passed; 0 failed**.
 - **Sprint**: backlog
 - **Dependencies**: 없음 (비차단)
 - **출처**: roadmap β-2 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:65`)
@@ -993,7 +1002,7 @@
 - **Notes**: 비차단. baseline-only chore (코드 무변경).
 
 ## [P3] scripts/check_spec_coverage.sh 버그 — INV-DECODE-STAGE ID 추출 부재 (잔여 1건) — 2026-06-10 등록 / 2026-06-12 축소
-- **Status**: TODO (잔여 1건으로 축소 — octal 해소됨 / 2026-06-12 Backlog Burndown triage)
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-6)** — INV-DECODE-STAGE 시리즈 추출 추가(INV-LAYER 다중 번호 파일명 패턴과 동일 방식, base-10 규율 유지). 스크립트 [6]까지 정상 완주, 오탐 신규 갭 0. **부수 노출**: 추출이 생기면서 INV-DECODE-STAGE 커버리지 갭 6건(001/002/003/005/006 등 — `test_inv_decode_stage_004_007.rs` 미커버분)이 가시화 — 스크립트 버그가 아니라 기존 테스트 미비의 정당한 보고(전체 갭 45→51건). 테스트 신규 작성은 별도 판단 사안으로 잔여 기록.
 - **Sprint**: backlog
 - **Dependencies**: 없음 (비차단)
 - **출처**: roadmap β-1 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:51`) + `handoff_beta_1_complete_beta_2_entry_2026_06_10.md:52`
@@ -1041,7 +1050,7 @@
 - **Notes**: `layer_lint.py` LAYER_RULES 는 γ-1 commit A 에서 이미 갱신됨(본 항목은 spec 문서 측 + 동반 코드 이동). 담당: Architect(/spec-manage).
 
 ## [P3] arch 미실현 우산 구조 재작성 — 잔여 `ARCHITECTURE.md` §13.4/§13.6 — 2026-06-10 등록 / 2026-06-11 부분 해소
-- **Status**: TODO (부분 해소 — `arch/01-architecture.md` §6.3 완료, 잔여 `ARCHITECTURE.md` §13.4/§13.6 만 남음)
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-2)** — §13.4(정정 노트 + KV/Weight 도메인 행 실 구조 정정) + §13.2 다이어그램 정정 노트 + §13.6(진입점 표 `kv/eviction/`·`kv/*_handler.rs`·`weight/*.rs` 정정, dead `EventSink`/`CacheEvent` 참조 정오) 완료. 부수: §13.8-O 카탈로그 경로 stale(`pressure/weights/`→`weight/`) + γ-1 후속 PENDING 표기 2곳(`08114da8` 으로 기완료)도 동라운드에서 정정.
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: γ-1 문서 anchor 정오 작업(2026-06-10) Architect 보존 판단 보고
@@ -1053,7 +1062,7 @@
 - **Notes**: 단순 rename 치환 금지(stale 잔존). 구조 기술 재작성 필요. §6.3 은 2026-06-11 `65c867ad` 에서 해소됨. 담당 권장: Architect.
 
 ## [P3] Sprint C 미반영 weight swap 위치 표기 — Precision Swap 다이어그램 + qcf_taxonomy.md — 2026-06-10 등록
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-3)** — ARCHITECTURE.md Precision Swap 다이어그램 라벨(`L3 Inference — models/weights/` → `L3 Weight — weight/`) + Key Components 표 + qcf_taxonomy.md 경로 9곳 `engine/src/weight/` 정합(Sprint C+γ-1 누적 반영). 부수: qcf_taxonomy.md 의 `engine/src/core/qcf/` stale 경로 8곳도 `engine/src/qcf/` 로 정정(2026-05-29 core/ 접두어 제거 반영).
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: γ-1 문서 anchor 정오 작업(2026-06-10) Architect 보존 판단 보고
@@ -1084,7 +1093,7 @@
 - **Notes**: macOS OpenCL 링크 한계가 런타임 검증의 유일 블로커 — 환경만 확보되면 즉시 가능. 담당 권장: Tester.
 
 ## [P3] experiments/*.sh argus_eval 이주 — 2026-06-11 등록
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-13)** — `run_accuracy_bench.sh` + `run_round1~13.sh` 14개 파일의 `BINARY=` 1줄 교체(`argus_eval`). flag 표면 호환이라 flag 무수정. `run_round13_device.sh`/`run_round14_device.sh` 는 `BINARY=` 패턴 부재(run_device.py 경유)라 비대상. 검증: `argus_eval --help` 정상 (host 모델 부재로 추론 실행 검증은 미수행 — 디바이스 라운드에서 1회 확인 가능).
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: γ-3 구현 후속
@@ -1111,7 +1120,7 @@
 - **Notes**: heartbeat 경로가 일부 심볼을 살리고 있어 일괄 삭제 위험 — 심볼 단위 census 필수. 담당 권장: Architect(census) → Implementer(삭제).
 
 ## [P3] test_inv_layer_005.rs doc 헤더 stale — 2026-06-11 등록
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-1)** — doc 헤더를 `L5_PRODUCTION_BINS` 기준(argus_cli/argus_bench/argus_eval)으로 정정, generate.rs 폐기 커밋(d5ed71d2) 사유 명시. 주석 only — 코드 동작 무변경.
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: γ-3/γ-4 구현 후속
