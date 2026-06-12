@@ -213,6 +213,16 @@
 | INV-149 | Forward layer K가 `load_weights` 호출 직전 `pending_event_for(K)`이 Some이면 `wait_event_blocking` 강제 호출. ArcSwap commit-before-read ordering. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_149_wait_gate_ordering.rs` + 디바이스 e2e (INV-122 v2.1 단일-token 게이트) |
 | INV-150 | Plan complete 시 drain → synchronize → ratio_generation +1 → invalidate_soa_registry → retire 순서 강제. ratio_generation bump는 plan당 1회. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_150_plan_run_to_completion.rs` |
 
+## Session Prefix Cache (INV-189 ~ INV-191, 2026-06-12 KV persistence Tier 1)
+
+> system prompt prefix snapshot/restore. 대응 명세: `30-engine.md` §3.7 (ENG-080~085), `33-engine-data.md` §3.25 (ENG-DAT-110). 설계: `docs/adr/0012-session-prefix-cache-snapshot.md`. arch 매핑: `arch/30-engine.md` §19.
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-189 | snapshot 은 "prefill 직후·eviction 전" 연속 prefix 상태에서만 저장 (current_pos==prompt.len(), 위치 0..tc-1 연속). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_189_snapshot_timing.rs` |
+| INV-190 | 복원은 무효화 4-tuple(model/format/tokenizer/token_ids) + magic/version/geometry 통과 시에만. 실패=cache miss→fresh prefill (에러 아님). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_190_invalidation.rs` |
+| INV-191 | restore 후 KV byte-identical to fresh prefill + greedy token-id 동일. device snapshot/restore는 read_buffer/write_buffer coherent 경유. payload packed-form(capacity-무관 cross-run 재현). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_191_restore_byte_identical.rs` (+ device 게이트) |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -376,6 +386,18 @@
 | ENG-DAT-100 | (D) | `PrimaryReleaseWorker` 구조 (sender, pending AtomicUsize, JoinHandle). spawn / enqueue / pending_count / drain API. model lifetime 동안 생존, graceful shutdown. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_100_release_worker.rs` |
 | ENG-DAT-101 | (D) | `IntraForwardSwapHook::pending_events`: `Vec<ArcSwapOption<GpuEvent>>` per-slot registry. lock-free read (`pending_event_for`). dispatcher worker가 commit 후 `clear_pending`. INV-149 강제. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_101_pending_event_registry.rs` |
 | ENG-DAT-C18 | (D) | `--swap-incremental-per-tick > 0`와 `--swap-intra-forward = true` 상호 배타. CLI parser reject. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_c18_liswap_mutual_exclusion.rs` |
+| ENG-DAT-110 | (D) | Prefix cache snapshot 파일: `{magic "ARGUSKV1", version, header(model_hash/format_id/tokenizer_hash/geometry/token_ids), layer-major packed payload}`. 무효화 4-tuple. | 🆕 미구현 | `engine/tests/spec/test_inv_190_invalidation.rs` (헤더 직렬화/무효화 검증 — INV-190과 공유) |
+
+## Session Prefix Cache (ENG-080 ~ ENG-085, 2026-06-12 KV persistence Tier 1)
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| ENG-080 | (B) | format `SnapshotRestore` capability opt-in (snapshot_prefix/restore_prefix/snapshot_format_id). 미지원 format=no-cache 폴백. base trait 무변. | 🆕 미구현 | `engine/tests/spec/test_inv_191_restore_byte_identical.rs` |
+| ENG-081 | (B) | snapshot 시점 = prefill 직후·eviction 전 (current_pos==prompt.len(), 연속). | 🆕 미구현 | `engine/tests/spec/test_inv_189_snapshot_timing.rs` |
+| ENG-082 | (B) | payload = capacity 패딩 제거 packed layer-major K+V. device=read_buffer 경유. | 🆕 미구현 | `engine/tests/spec/test_inv_191_restore_byte_identical.rs` |
+| ENG-083 | (B) | 무효화 3케이스(model/format/tokenizer) → 폐기 → fresh prefill (silent). | 🆕 미구현 | `engine/tests/spec/test_inv_190_invalidation.rs` |
+| ENG-084 | (B) | prefix 접두 일치(token_ids==prompt[0..tc])만 복원 + 잔여 prefill. 중간 divergence=miss. | 🆕 미구현 | `engine/tests/spec/test_inv_190_invalidation.rs` |
+| ENG-085 | (A) | CLI `--save-prefix-cache`/`--prefix-cache` 2-flag. 미지정=기존 happy path. | 🆕 미구현 | `engine/tests/spec/test_eng_085_prefix_cache_cli.rs` |
 
 ## Cross-cutting
 

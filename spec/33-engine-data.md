@@ -1422,6 +1422,47 @@ impl IntraForwardSwapHook {
 
 ---
 
+### 3.25 Prefix Cache Snapshot File [ENG-DAT-110]
+
+> 설계 SSOT: `docs/adr/0012-session-prefix-cache-snapshot.md` D2. 요구 = `30-engine.md` §3.7 (ENG-080~085). 불변식 = `41-invariants.md` §3.26 (INV-189~191).
+
+**[ENG-DAT-110]** Prefix cache snapshot 파일은 `{magic, version, header, payload}` 구조이다. 헤더의 4-tuple(`model_hash`/`format_id`/`tokenizer_hash`/`token_ids`)이 복원 무효화·정확성 검사의 단일 소스이다. *(MUST)*
+
+| 영역 | 필드 | 타입 | 의미 |
+|------|------|------|------|
+| Magic | `magic` | `[u8; 8]` | `"ARGUSKV1"` (손상/오인 파일 1차 차단) |
+| Version | `version` | u32 | 직렬화 형식 버전. unknown = 폐기 |
+| | `header_len` | u32 | 헤더 바이트 길이 (payload offset 계산) |
+| Header | `model_hash` | `[u8; 32]` | sha256 — `auf::source_hash::compute_source_hash`(model-path) 재사용 (ENG-DAT-096.6 동일 알고리즘) |
+| | `format_id` | u32 | `SnapshotRestore::snapshot_format_id()` (저장 형태 식별) |
+| | `tokenizer_hash` | `[u8; 32]` | sha256 — tokenizer 파일(또는 AUF TOKENIZER section)에 동일 hash |
+| | `kv_heads` | u32 | geometry 빠른 검증 |
+| | `head_dim` | u32 | geometry 빠른 검증 |
+| | `n_layers` | u32 | geometry 빠른 검증 |
+| | `token_count` | u32 | 저장된 prefix 토큰 수 |
+| | `token_ids` | `[u32; token_count]` | prefix 토큰열 — 일치 검사의 전부 (ENG-084) |
+| | `logits_len` | u32 | last-token logits 길이 (= vocab size). 현재 모델 vocab 불일치 시 폐기 |
+| | `last_logits` | `[f32; logits_len]` | prefill 마지막 토큰 logits — full restore 시 re-forward 없이 decode 시작. bit-exact 의 원천: GEMM 배치 경로(M=n batch prefill vs M=1 `forward_gen`)의 누적 순서 차이가 ±ulp logits 분기를 만들어 greedy 를 가르므로 재계산 대신 저장값 사용 (llama.cpp `llama_state_save_file` 동일 접근, 2026-06-12 host 실측 진단) |
+| Payload | (layer-major) | raw bytes | layer 0 K, layer 0 V, layer 1 K, ... — capacity 패딩 제거, `[0..token_count)` packed (ENG-082) |
+
+> **version 이력**: v1(2026-06-12 초안, logits 부재 — 미배포 폐기) → **v2(현행, `logits_len`/`last_logits` 추가)**. v1 파일은 version 검사로 폐기.
+
+**무효화 우선순위** (복원 시 빠른 reject 순):
+1. magic ≠ `"ARGUSKV1"` → 폐기 (손상/타 파일)
+2. version ≠ 지원 버전 → 폐기 (형식 진화)
+3. geometry(kv_heads/head_dim/n_layers, logits_len↔vocab) ≠ 현재 모델 → 폐기 (payload 길이 mismatch 방어)
+4. `model_hash` ≠ 현재 model-path hash → 폐기 (무효화 케이스 ①)
+5. `format_id` ≠ 현재 format → 폐기 (무효화 케이스 ②)
+6. `tokenizer_hash` ≠ 현재 tokenizer hash → 폐기 (무효화 케이스 ③)
+7. `token_ids` ≠ `prompt[0..token_count]` → miss (정확성 검사 ENG-084)
+
+**Cross-reference**:
+- ENG-080~085 (capability + 시점 + 무효화 + 일치 검사 + CLI).
+- ENG-DAT-096.6 (`source_hash` hybrid 알고리즘 — model/tokenizer hash 재사용).
+- INV-189 (저장 시점), INV-190 (무효화), INV-191 (복원 정확성).
+
+---
+
 ## 4. Alternative Behavior
 
 해당 없음. 이 문서는 데이터 정의 문서이다. 데이터 처리의 대안 동작은 `32-engine-algorithms.md`에서 다룬다.

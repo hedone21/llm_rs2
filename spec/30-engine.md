@@ -451,6 +451,37 @@ Resilience -- Transport -- MessageLoop
     +-- ResilienceManager + Strategy (D-Bus 레거시, generate.rs에서 미사용)
 ```
 
+### 3.7 Session Prefix Cache (KV persistence Tier 1) [ENG-080 ~ ENG-085]
+
+> 설계 SSOT: `docs/adr/0012-session-prefix-cache-snapshot.md`. KV 로드맵 항목 5 (backlog L947~954). 데이터 = `33-engine-data.md` ENG-DAT-110. 불변식 = `41-invariants.md` §3.26 (INV-189~191).
+
+KV 캐시 수명이 프로세스 내 단일 세션이라, 동일 system prompt prefix 를 매 실행 재 prefill 하는 낭비를 제거한다. **Tier 1 = system prompt prefix 저장/복원, 전체-일치(접두 일치 + 잔여 prefill)만**. Tier 2(턴 히스토리 누적)/Tier 3(임의 chunk 합성, CacheBlend)는 범위 밖.
+
+**[ENG-080]** Format snapshot capability: KV format 은 선택적으로 `SnapshotRestore` capability 를 구현한다 — `snapshot_prefix(token_count, backend) → Vec<u8>` / `restore_prefix(bytes, token_count, backend)` / `snapshot_format_id() → u32`. F32/F16/Q4_0 standard format(`StandardFormat`)이 구현하며, capability 미구현 format(KIVI/opaque)은 **no-cache 폴백**(정확성 안전, 가속 없음). capability 는 `KVCacheFormat` base trait(6-method)을 변경하지 않는다 (ISP — snapshot-aware format 만 비용 지불). *(MUST)*
+
+**[ENG-081]** Snapshot 시점: snapshot 은 **"prefill 직후·eviction 전" 상태**에서만 캡처한다 — decode 루프 진입 전, `current_pos == prompt.len()` 이고 eviction 미발생인 연속 prefix 상태. 이 시점 KV 는 prefix 토큰열의 순수 함수이며 위치 0..token_count-1 이 연속이다 (position 매핑 불요). eviction 후/중간 위치 저장은 Tier 1 범위 밖. *(MUST)*
+
+**[ENG-082]** Snapshot byte 형식: payload 는 capacity 패딩을 제거한 **token_count 까지만 packing 된 layer-major raw bytes**(layer 0 K, layer 0 V, layer 1 K, ...). 각 layer 의 K/V 는 per-head `[0..token_count)` 범위만 추출한다. capacity 는 실행마다 다를 수 있으므로(grow-on-demand) 패딩을 빼야 cross-run 재현성이 보장된다. device 버퍼는 `backend.read_buffer()` 경유로 추출한다(UMA stale 방지). 헤더 형식 → ENG-DAT-110. *(MUST)*
+
+**[ENG-083]** Snapshot 무효화 (3케이스 정본): 복원 시 헤더의 `model_hash` · `format_id` · `tokenizer_hash` 중 하나라도 현재 세션과 불일치하면 snapshot 을 **폐기**한다. 추가로 magic · version · geometry(kv_heads/head_dim/n_layers) 불일치도 폐기한다(보수적 방어). 폐기는 **에러가 아니라 cache miss → fresh prefill 진행**(silent fallback). *(MUST)*
+
+- ① `model_hash` 불일치 = 다른 모델 weight → 폐기
+- ② `format_id` 불일치 = 저장 형태(F16↔Q4_0 등) 변경 → 폐기
+- ③ `tokenizer_hash` 불일치 = token_ids 의미 변경 → 폐기
+
+**[ENG-084]** Prefix 일치 검사 (정확성의 전부): 무효화 통과 후, 헤더의 `token_ids` 가 현재 prompt 의 **접두**(`token_ids == prompt[0..token_count]`)와 정확히 일치할 때만 복원한다. 일치 시 `restore_prefix` 로 KV 를 복원하고 `current_pos = token_count` 로 진행한 뒤, `token_count == prompt.len()` 이면 prefill 을 완전 skip, 그렇지 않으면 잔여 `prompt[token_count..]` 를 `start_pos = token_count` 로 prefill 한다. 중간 divergence 후 재일치(부분 *내부* 일치)는 복원하지 않는다(miss → fresh prefill) — Tier 3 영역. *(MUST)*
+
+**[ENG-085]** CLI 표면 (최소 2-flag, argus-cli): *(MUST)*
+
+| 플래그 | 타입 | 기본값 | 설명 |
+|--------|------|--------|------|
+| `--save-prefix-cache` | Option&lt;String&gt; | None | prefill 직후 snapshot 을 경로에 저장 (atomic tmp→rename) |
+| `--prefix-cache` | Option&lt;String&gt; | None | 경로에서 복원 시도 (없거나 무효면 silent miss → fresh prefill) |
+
+- 두 flag 동시 지정 시 = 복원 시도 → miss 면 prefill 후 그 결과를 저장(self-warming).
+- 두 flag 모두 미지정 = 기본 동작(prefix cache 코드 미진입, 기존 happy path byte-identical).
+- TTL / multi-entry 디렉토리 관리 / 멀티세션은 Tier 1 범위 밖(단일 파일 + opt-in flag).
+
 ## 4. Alternative Behavior
 
 **[ENG-060]** 단독 실행 모드:
