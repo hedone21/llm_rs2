@@ -908,6 +908,7 @@
 ### [P2] 4. read-plan 표면 ADR — "무엇을 읽을지"의 4번째 plugin 표면
 - **Status**: TODO — **차기 착수 대상 (D4 확정 경로, 2026-06-12)** (ADR 작성까지가 본 항목 — 구현은 ADR 산출물로 별도 등록) / **Sprint**: next / **Dependencies**: 항목 3 권장 선행
 - **D4 비차단 확인 (2026-06-12)**: 인프라 항목이라 항목 0 기법 게이트 RED와 **무관하게 진행**. 항목 3(QueryStats) 선행 권장 → 항목 3+4 묶음이 차기 착수 1순위.
+- **★구현 시점 결정 (2026-06-12 사용자)**: 항목 3 구현 + 본 항목 **ADR 확정**이 "KV 구조 확정" 게이트 — 직후 사용자가 별도 워크트리에서 대형 리팩토링을 병렬 시작할 계획. **read-plan 구현은 리팩토링 머지 후** 별도 등록 항목으로 (ADR-선행 = 미래 표면을 문서 제약으로 고정해 의미적 충돌 예방). 같은 이유로 항목 2·5도 리팩토링 머지 후 권고. 진입: `handoff_kv_roadmap_item34_entry_2026_06_12.md`.
 - **Description**: `attention_into`는 캐시 전체 읽기를 가정하고 selection 인자가 없음 — 선택적 읽기(Quest류)와 예측 prefetch(InfiniGen/KVSwap류)가 통째로 차단. `KVCacheStage`와 대칭인 plan-returning trait `KVReadStage::read_plan(ctx) → KVReadPlan{granularity, select}`.
   - **핵심 통찰**: layer i−1에서 산출한 read plan = Quest에겐 읽기 마스크, KVSwap에겐 layer i의 prefetch 목록 — 표면 하나로 두 군집(~9건) 동시 해소
   - format은 `attention_into_selected` capability **opt-in**(미지원 format은 full read 폴백) → 합성성 보존. "Quest를 전용 format에 매장"은 format 축 안에서 M×N 재발(Quest-on-KIVI마다 신규 format)이라 표면 신설이 정공
