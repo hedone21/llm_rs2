@@ -509,21 +509,26 @@ fn perform_matmul_test(
             OpType::RMSNorm => backend.rms_norm(&mut c_gpu, &b_gpu, 1e-5, false)?,
             OpType::Softmax => backend.softmax(&mut c_gpu)?,
             OpType::RoPE => {
-                let head_dim = 128;
+                // RoPE requires a (Seq, Head, Dim) or (Batch, Seq, Head, Dim)
+                // tensor with an even head_dim. The 2D [m, n] activation `c_gpu`
+                // never satisfies that contract, so we always RoPE on a freshly
+                // shaped 4D tensor. When n is a multiple of 128 we use the
+                // production head_dim; otherwise we fall back to a single head
+                // of width n (always even for the test shapes), which keeps the
+                // op exercising a valid 4D layout instead of erroring on a 2D
+                // input. (No reference comparison is done for RoPE — this only
+                // verifies the op runs without a dimensionality error.)
+                let head_dim = if n.is_multiple_of(128) { 128 } else { n };
                 let num_heads = n / head_dim;
-                if !n.is_multiple_of(head_dim) {
-                    backend.rope_inplace(&mut c_gpu, 0, 10000.0)?;
+                let r_shape = Shape::new(vec![1, m, num_heads, head_dim]);
+                let r_buf = memory.alloc(m * n * 4, DType::F32)?;
+                let r_tensor = Tensor::new(r_shape, r_buf, backend.clone());
+                let mut r_gpu = if is_opencl {
+                    backend.copy_from(&r_tensor)?
                 } else {
-                    let r_shape = Shape::new(vec![1, m, num_heads, head_dim]);
-                    let r_buf = memory.alloc(m * n * 4, DType::F32)?;
-                    let r_tensor = Tensor::new(r_shape, r_buf, backend.clone());
-                    let mut r_gpu = if is_opencl {
-                        backend.copy_from(&r_tensor)?
-                    } else {
-                        r_tensor
-                    };
-                    backend.rope_inplace(&mut r_gpu, 0, 10000.0)?;
-                }
+                    r_tensor
+                };
+                backend.rope_inplace(&mut r_gpu, 0, 10000.0)?;
             }
             OpType::KiviAttention => {
                 // KIVI tests are handled by run_kivi_attention_test(), not here
