@@ -899,14 +899,16 @@
 - **참고 (2026-06-12, 항목 0 결과)**: 변동 없음(자체 1B ablation 게이트 유지)이나, 항목 0에서 **1B score 계열 전반이 무가치로 재확인**(R-KV·A2SF 보류, Round 14–15 연속) → 1B ablation은 회의적 전망. 8B 온보딩 시 우선순위 재평가 권장.
 
 ### [P2] 3. StageCtx 어휘 확장 ③ — `QueryStats` TensorKind
-- **Status**: TODO — **차기 착수 대상 (D4 확정 경로, 2026-06-12)** / **Sprint**: next / **Dependencies**: 없음 (항목 4의 신호 공급원으로 선행 권장)
+- **Status**: **진행 중 (Sprint 2026-06-12)** / **Sprint**: current / **Dependencies**: 없음 (항목 4의 신호 공급원으로 선행 권장)
+- **스프린트 (2026-06-12)**: `.agent/todos/sprint_kv_roadmap_item34_2026_06_12.md` (P1 설계 → P2 구현 → P3 검증). 진입 = `handoff_kv_roadmap_item34_entry_2026_06_12.md`. 완료 게이트 = host 통계 테스트 + 기존 `tensor()` 소비자 무회귀 + α-K frozen 3-dtype byte-identical + **실모델 e2e 1회**(항목 0 미배선 허상 교훈). Q 캡처는 기본 off / score-active 시만(hot path 비용 0). accumulator commit 격리(L1112 QCF_kv 라운드와 동시 작업 주의).
 - **D4 비차단 확인 (2026-06-12)**: 인프라 항목이라 항목 0 기법 게이트 RED와 **무관하게 진행**. 항목 4의 신호 공급원이므로 4보다 선행 권장 → 항목 3+4가 항목 0 종결 후 차기 착수 1순위.
 - **Description**: prefill-end 압축 패러다임(SnapKV류)의 신호인 windowed attention 행렬은 flash attention이 materialize하지 않음(우리/문헌 공통 제약) — 2025 frontier(Expected Attention, arXiv 2510.00636)는 행렬 대신 **query 분포 통계로 미래 attention을 closed-form 추정**. `TensorKind::QueryStats`(per layer·kv_head Q running mean/var) 추가 + forward 경로 Q 캡처 1지점(`AttentionScoreAccumulator` 패턴 재사용). ADR-0004 §7이 예고한 자리("query_state(Quest) 캡처 미배선 → 후속 PR").
 - **해금**: Expected Attention, LU-KV·MixKVQ 부분. 항목 4(read-plan)의 Quest류 page 선택 신호로 재사용(시너지).
 - **Acceptance Criteria**: TensorKind variant + 엔진 누적 배선 + host 통계 정확성 테스트 + 기존 기법(`tensor()` 소비자) 무영향.
 
 ### [P2] 4. read-plan 표면 ADR — "무엇을 읽을지"의 4번째 plugin 표면
-- **Status**: TODO — **차기 착수 대상 (D4 확정 경로, 2026-06-12)** (ADR 작성까지가 본 항목 — 구현은 ADR 산출물로 별도 등록) / **Sprint**: next / **Dependencies**: 항목 3 권장 선행
+- **Status**: **진행 중 (Sprint 2026-06-12, ADR 단계)** — ADR 작성까지가 본 항목, **구현 착수 금지**(병렬 리팩토링 의미적 충돌 예방) / **Sprint**: current / **Dependencies**: 항목 3 선행(P3 완료 후 P4 착수)
+- **스프린트 (2026-06-12)**: `.agent/todos/sprint_kv_roadmap_item34_2026_06_12.md` P4. 항목 3 구현 + 본 ADR 확정 = "KV 구조 확정" 게이트 → 직후 사용자 별도 워크트리 대형 리팩토링 병렬 시작. read-plan **구현은 리팩토링 머지 후** 별도 항목으로 재등록(ADR 산출물). 완료 게이트 = ADR 신규 1건(대안 ≥2 + status quo + grill 통과) + 구현 단계 분해 backlog 재등록 + **구현 코드 0줄**.
 - **D4 비차단 확인 (2026-06-12)**: 인프라 항목이라 항목 0 기법 게이트 RED와 **무관하게 진행**. 항목 3(QueryStats) 선행 권장 → 항목 3+4 묶음이 차기 착수 1순위.
 - **★구현 시점 결정 (2026-06-12 사용자)**: 항목 3 구현 + 본 항목 **ADR 확정**이 "KV 구조 확정" 게이트 — 직후 사용자가 별도 워크트리에서 대형 리팩토링을 병렬 시작할 계획. **read-plan 구현은 리팩토링 머지 후** 별도 등록 항목으로 (ADR-선행 = 미래 표면을 문서 제약으로 고정해 의미적 충돌 예방). 같은 이유로 항목 2·5도 리팩토링 머지 후 권고. 진입: `handoff_kv_roadmap_item34_entry_2026_06_12.md`.
 - **Description**: `attention_into`는 캐시 전체 읽기를 가정하고 selection 인자가 없음 — 선택적 읽기(Quest류)와 예측 prefetch(InfiniGen/KVSwap류)가 통째로 차단. `KVCacheStage`와 대칭인 plan-returning trait `KVReadStage::read_plan(ctx) → KVReadPlan{granularity, select}`.

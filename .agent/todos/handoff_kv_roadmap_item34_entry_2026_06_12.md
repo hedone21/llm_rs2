@@ -18,6 +18,10 @@
 | 항목 0 측정 스프린트 (4종 판정) | `experiments/kv_roadmap_item0/rerun/REPORT.md` | backlog 트랙 갱신 + `handoff_kv_roadmap_item0_2026_06_12.md` |
 | QCF_kv 설계 라운드 | **공동 검토 대기** (사용자 결정 2건: estimator 방향 + floor 재설정) | backlog L1112 항목 = 안건 SSOT |
 
+## 스프린트 마스터 (PM 수립 2026-06-12)
+
+P1~P5 단계 분해 + AC + 리스크 = `.agent/todos/sprint_kv_roadmap_item34_2026_06_12.md`. backlog 항목 3·4 Status = "진행 중 (Sprint 2026-06-12)". 아래 "다음 작업"의 상세 게이트는 스프린트 파일이 SSOT.
+
 ## 다음 작업 (순서 고정)
 
 1. **항목 3: `TensorKind::QueryStats` 구현** — per layer·kv_head Q running mean/var + forward 경로 Q 캡처 1지점(`AttentionScoreAccumulator` 패턴 재사용, ADR-0004 §7이 예고한 자리).
