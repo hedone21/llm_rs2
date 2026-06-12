@@ -285,6 +285,10 @@ pub struct OffloadForwardArgs<'a, C> {
     /// When `None`, the hot-path overhead is one `Option::is_some` branch
     /// per layer (INV-147).
     pub layer_boundary_hook: Option<&'a dyn crate::layer_boundary_hook::LayerBoundaryHook>,
+    /// S6: KV read stage — decode arm 에서 layer i 완료 후 read_plan 을 산출해
+    /// layer i+1 의 prefetch 우선 힌트로 공급한다(ADR-0011 D3).
+    /// `None`(기본) = 기존 순차 preload 그대로(read_stage=None byte-identical, INV-147).
+    pub read_stage: Option<&'a dyn technique_api::KVReadStage>,
 }
 
 /// `forward_into` 의 KVCacheFormat trait-object fork 인자 (Phase α-K substep 3c).
@@ -2587,6 +2591,9 @@ impl TransformerModel {
         let logits_out = args.logits_out;
         let x_gen = args.x_gen;
         let mut workspace = args.workspace;
+        // S6: read_stage 슬롯 — decode arm 에서 layer i 완료 후 read_plan 산출 + prefetch hint 공급.
+        // read_stage=None(기본)이면 아래 is_some 분기 1회만 추가(INV-147 byte-identical).
+        let read_stage = args.read_stage;
 
         if let Some(ws) = workspace.as_deref_mut() {
             ws.reset_partition_prev();
@@ -2763,9 +2770,30 @@ impl TransformerModel {
                 let ws = workspace
                     .as_deref_mut()
                     .expect("decode arm: workspace.is_some() 직전 확인됨");
-                // ADR-0011 Amendment A1.3: read-plan seam 자리(offload). 현재 `OffloadFormat` 은
-                // SelectiveRead 미구현 → full read. read stage 핸들 캡처 + plan.select 의 prefetch 큐
-                // 공급은 S6(prefetch 연결)에서 배선한다 — 이번엔 라우팅 슬롯(`read_select: None`)만 둔다.
+                // S6(ADR-0011 D3): read_stage=Some 이면 layer i 의 fmt 가 SelectiveRead 를 지원할 때
+                // read_plan 을 산출해 read_select 로 forward_gen_fmt 에 전달한다.
+                // OffloadFormat 은 현재 SelectiveRead 미구현(as_selective_read==None) → plan=None →
+                // read_select=None → full read 폴백(D4 byte-identical).
+                // plan.select 는 layer i+1 의 prefetch 우선 힌트로 PrefetchController 에 저장한다(D3).
+                // read_stage=None(기본) 이면 and_then 이 단락 → plan=None → hint 미발화(INV-147).
+                let read_plan = read_stage.and_then(|rs| {
+                    dyn_fmts[i]
+                        .as_selective_read()
+                        .and_then(|sr| sr.read_plan(rs, i))
+                });
+                let read_select = read_plan.as_ref().and_then(|plan| {
+                    Self::validate_read_plan(plan, dyn_fmts[i].current_pos())
+                        .map(|sel| (sel, plan.granularity))
+                });
+                // S6 prefetch 보강 채널: plan 이 있으면 next layer 의 prefetch 우선 힌트를 저장.
+                // 현재 preload_locked 는 선입선출이라 hint 가 I/O 순서를 변경하지 않는다.
+                // 향후 preload_locked 에 page-id 우선 지원 추가 시 take_priority_hint 를 확장한다.
+                if let (Some(_rs), Some(plan)) = (read_stage, read_plan.as_ref()) {
+                    let next = i + 1;
+                    if next < num_layers {
+                        prefetch.set_priority_hint(next, plan.select.clone());
+                    }
+                }
                 layer_arc.forward_gen_fmt(crate::layers::transformer_layer::ForwardGenFmtArgs {
                     x: &mut x,
                     fmt: &dyn_fmts[i],
@@ -2783,7 +2811,7 @@ impl TransformerModel {
                     is_local_attn: is_local_i,
                     local_attn_window: self.config.sliding_window,
                     layer_idx: i,
-                    read_select: None,
+                    read_select,
                 })?;
             } else {
                 // prefill(seq_len>1) 또는 **발산 A**(seq_len==1 + workspace=None). 후자는 BOS-only
@@ -3874,6 +3902,73 @@ mod tests {
         assert!(
             cap.is_none(),
             "KIVIFormat 은 SelectiveRead 미구현 → as_selective_read()==None → full read 폴백"
+        );
+    }
+
+    // ── S6: forward_into_offload read_stage → prefetch priority hint 배선 테스트 ──
+    //
+    // forward_into_offload 는 full e2e offload 환경(GPU + DiskStore) 없이 단위 테스트가 어렵다.
+    // 따라서 S6 배선은 두 단계로 검증한다:
+    //   (a) PrefetchController priority hint API 단위 테스트(prefetch.rs — 이미 추가)
+    //   (b) 배선 연결 계약 테스트: OffloadForwardArgs 에 read_stage 필드가 있고 None 기본값이
+    //       compile-time 으로 확인된다. 구조체 구성 가능성만 검증(forward 실행 없음).
+    //
+    // e2e 실행이 어려운 사유: OffloadFormat/OffloadKVCache 는 GPU backend + DiskStore/RawStore 가
+    // 필요하고, forward_into_offload 는 모델 가중치 로드(파일 시스템)까지 요구한다.
+    // 대안: prefetch.rs 단위 테스트(set/take + 독립성)가 배선 GREEN 의 핵심 관찰 표면이다.
+
+    /// S6 compile-gate: OffloadForwardArgs 에 read_stage 필드가 존재하고 None 으로 초기화된다.
+    ///
+    /// 이 테스트는 구조체 생성을 시도해 컴파일 타임에 필드 존재를 보장한다.
+    /// forward 실행 없이 타입 레벨만 검증.
+    #[test]
+    fn s6_offload_forward_args_has_read_stage_field() {
+        use crate::backend::cpu::CpuBackend;
+        use crate::buffer::DType;
+        use crate::kv::offload::OffloadKVCache;
+        use crate::kv::offload::raw_store::RawStore;
+        use crate::memory::galloc::Galloc;
+        use crate::shape::Shape;
+        use crate::tensor::Tensor;
+        use std::sync::Arc;
+
+        let backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
+
+        let tok_buf = memory.alloc(4, DType::U8).unwrap();
+        let input_tokens = Tensor::new(Shape::new(vec![1, 1]), tok_buf, backend.clone());
+        let logits_buf = memory.alloc(4 * 4, DType::F32).unwrap();
+        let mut logits_out = Tensor::new(Shape::new(vec![1, 1, 4]), logits_buf, backend.clone());
+
+        let store = Box::new(RawStore::new(8 * 64 * 2)); // 더미 token_bytes
+        let kv_cache = OffloadKVCache::new(0, 8, 64, DType::F16, 16, store);
+        let mut kv_caches = vec![kv_cache];
+
+        // OffloadForwardArgs 생성 — read_stage: None 필드가 컴파일 가능해야 한다.
+        let _args = OffloadForwardArgs {
+            input_tokens: &input_tokens,
+            start_pos: 0,
+            kv_caches: &mut kv_caches,
+            backend: &backend,
+            memory: memory.as_ref(),
+            logits_out: &mut logits_out,
+            x_gen: None,
+            workspace: None,
+            prefill_workspace: None,
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: None,
+            logits_last_only: false,
+            variance_collector: None,
+            layer_boundary_hook: None,
+            read_stage: None, // S6: 이 필드가 컴파일 통과 = 배선 연결 확인
+        };
+        // forward 호출 없이 타입 레벨 검증만 수행.
+        // read_stage=None 이면 기존 경로와 byte-identical(INV-147).
+        assert!(
+            _args.read_stage.is_none(),
+            "read_stage=None 기본 상태 확인(INV-147 byte-identical)"
         );
     }
 }

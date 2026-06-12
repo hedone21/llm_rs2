@@ -16,6 +16,12 @@ use std::time::Duration;
 /// Tracks EMA of preload and forward times, adjusting depth at token boundaries.
 /// - Increase: immediate on stall (preload > forward)
 /// - Decrease: after `decrease_patience` consecutive slack observations (anti-oscillation)
+///
+/// S6 보강: `priority_hint` 슬롯 — read-plan(ADR-0011 D3)이 layer i 의 산출한 `select` 목록을
+/// layer i+1 의 prefetch 우선 힌트로 저장한다. 힌트는 1회성(take)으로 소비되며, preload_locked 는
+/// 지금은 선입선출 순서라 hint 가 실제 I/O 순서를 변경하지는 않는다. 향후 preload_locked 에 hint
+/// 우선 순서 지원을 추가할 때 소비 표면(take_priority_hint)을 확장하면 된다.
+/// read_stage=None 이면 hint 슬롯은 항상 None 을 유지(기존 경로 byte-identical).
 pub struct PrefetchController {
     /// Current prefetch depth (≥ 1).
     depth: usize,
@@ -37,6 +43,10 @@ pub struct PrefetchController {
     decrease_patience: usize,
     /// Step size for each increase / decrease tick (≥ 1).
     adjust_step: usize,
+    /// S6 priority hint: layer index + select list from read-plan (ADR-0011 D3).
+    /// `Some((layer_idx, select))` = layer `layer_idx` 의 preload 시 이 select 목록을 우선 힌트로 삼는다.
+    /// `None` = 힌트 없음(기본, read_stage=None 경로).
+    priority_hint: Option<(usize, Vec<usize>)>,
 }
 
 /// Default starting prefetch depth used by [`PrefetchController::new`].
@@ -101,6 +111,7 @@ impl PrefetchController {
             slack_streak: 0,
             decrease_patience: 3,
             adjust_step: adjust_step.max(1),
+            priority_hint: None,
         }
     }
 
@@ -162,6 +173,27 @@ impl PrefetchController {
                 self.alpha * forward_us + (1.0 - self.alpha) * self.forward_ema_us;
         }
         self.samples += 1; // Count forward calls as samples (one per layer)
+    }
+
+    /// S6: read-plan 보강 채널 — layer `layer_idx` 의 prefetch 우선 힌트를 저장한다.
+    ///
+    /// ADR-0011 D3: layer i−1 의 read_plan 이 산출한 `select` 를 layer i 의 preload 우선 목록으로 공급.
+    /// 현재 `preload_locked` 는 선입선출이라 hint 가 I/O 순서를 바꾸지는 않는다. 힌트는 "어느 KV 를
+    /// layer i 가 읽을지"를 알고 있으므로, 향후 `preload_locked` 에 page-id 우선 로드를 추가할 때
+    /// 이 표면을 확장한다. 현재는 hint 저장 + 관찰(테스트)만 제공한다.
+    ///
+    /// 기존 경로(`read_stage=None`)는 이 메서드를 호출하지 않아 `priority_hint` 가 항상 `None` 유지
+    /// → byte-identical(INV-147).
+    pub fn set_priority_hint(&mut self, layer_idx: usize, select: Vec<usize>) {
+        self.priority_hint = Some((layer_idx, select));
+    }
+
+    /// S6: 저장된 우선 힌트를 소비(take)한다.
+    ///
+    /// 한 번 take 하면 `None` 으로 리셋. 호출자는 반환된 `(layer_idx, select)` 를 preload 우선
+    /// 순서로 활용한다. 힌트가 없으면 `None` 반환 — 호출자는 기존 순차 preload 를 그대로 수행한다.
+    pub fn take_priority_hint(&mut self) -> Option<(usize, Vec<usize>)> {
+        self.priority_hint.take()
     }
 
     /// Adjust depth based on accumulated timing data.
@@ -405,5 +437,71 @@ mod tests {
 
         let ceil = PrefetchController::with_initial_depth(8, 999, 2);
         assert_eq!(ceil.depth(), 8);
+    }
+
+    // S6: priority hint API 테스트 — set_priority_hint / take_priority_hint 정합성.
+
+    /// hint 없는 기본 상태에서 take_priority_hint 는 None 을 반환한다.
+    #[test]
+    fn test_priority_hint_default_none() {
+        let mut ctrl = PrefetchController::new(4, 2);
+        assert!(
+            ctrl.take_priority_hint().is_none(),
+            "기본 상태에서 priority_hint 는 None"
+        );
+    }
+
+    /// set_priority_hint 로 저장한 hint 를 take_priority_hint 로 정확히 소비한다.
+    #[test]
+    fn test_priority_hint_set_and_take() {
+        let mut ctrl = PrefetchController::new(4, 2);
+        let select = vec![0usize, 2, 5];
+        ctrl.set_priority_hint(3, select.clone());
+
+        let hint = ctrl.take_priority_hint();
+        assert!(hint.is_some(), "set 후 take 는 Some 을 반환해야 한다");
+        let (layer_idx, taken_select) = hint.unwrap();
+        assert_eq!(layer_idx, 3, "layer_idx 일치");
+        assert_eq!(taken_select, select, "select 목록 일치");
+    }
+
+    /// take 후 두 번째 take 는 None 을 반환한다(1회성 소비).
+    #[test]
+    fn test_priority_hint_take_consumes() {
+        let mut ctrl = PrefetchController::new(4, 2);
+        ctrl.set_priority_hint(1, vec![0, 1]);
+        let _ = ctrl.take_priority_hint(); // 첫 번째 소비
+        assert!(
+            ctrl.take_priority_hint().is_none(),
+            "두 번째 take 는 None(1회성 소비)"
+        );
+    }
+
+    /// read_stage=None 경로 시뮬레이션: set_priority_hint 를 호출하지 않으면 hint 는 None 유지.
+    /// INV-147 byte-identical 보존 — 기존 depth/EMA 에 영향 없음.
+    #[test]
+    fn test_priority_hint_no_interference_with_depth() {
+        let num_layers = 2;
+        let mut ctrl = PrefetchController::with_tuning(4, 1, 1, num_layers);
+
+        // hint 없이 stall → depth 증가
+        for _ in 0..3 {
+            ctrl.record(dur_us(5000), dur_us(2000));
+        }
+        ctrl.adjust();
+        let depth_after = ctrl.depth();
+        assert_eq!(depth_after, 2, "hint 미설정 시 depth 동작 불변");
+
+        // hint 설정 후에도 depth 동작 불변
+        ctrl.set_priority_hint(2, vec![1, 3]);
+        for _ in 0..2 {
+            ctrl.record(dur_us(5000), dur_us(2000));
+        }
+        ctrl.adjust();
+        assert_eq!(ctrl.depth(), 3, "hint 설정 후에도 depth 증가 불변");
+
+        // hint 는 아직 소비되지 않음
+        let hint = ctrl.take_priority_hint();
+        assert!(hint.is_some(), "hint 는 depth 조정과 독립적으로 보존");
     }
 }
