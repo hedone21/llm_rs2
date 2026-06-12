@@ -128,7 +128,8 @@ QCF(Quality Cost Function)는 두 패밀리로 명확히 구분한다. 액션마
 | **QCF_weight** | 모델 forward path (weight/layer 단위) | weight swap (F16→Q4), layer skip (SWIFT) | `engine/src/weight/decider.rs` (swap 판단), `engine/src/qcf/layer_importance.rs::compute_qcf_weight` |
 
 - **Layer skip은 QCF_weight에 속한다** — skip은 "그 layer의 weight를 쓰지 않음"이라 weight 패밀리. swap과 ImportanceTable을 공유한다.
-- **두 패밀리는 직접 비교 불가** — 측정 공간이 다르다. cross-action 비교는 `DegradationEstimator`로 ΔPPL 환산 후 가능 (estimator에 액션별 piecewise-linear 곡선 등록 필요).
+- **두 패밀리는 측정 공간이 달라 절대 등가 비교 불가** — production IPC는 **raw QCF [0,1] 직송이 정본** (ENG-ALG-050 step 4, 2026-06-12 결정 B). manager DPP의 cross-family 비교는 동일 [0,1] 스케일의 휴리스틱으로 운용하고, `DegradationEstimator`(ENG-ALG-060)는 live 미장착 오프라인 캘리브레이션 도구로 보존한다 (기본 곡선 키는 IPC 키와 정렬 완료).
+- **QCF_kv 수식 정규화 (2026-06-12)**: o_before에 α/Σ_all α 정규화 적용 (ENG-ALG-051 개정) — 구 비대칭 수식은 0.985 포화. S25 실측 분포(h2o 0.03~0.17 / d2o 0.09~0.24 / sliding 0.26~0.39)에 맞춰 manager `QCF_FLOOR` 재산정 (policy v2.5.0: 0.10/0.25/0.50/huge). 분포 아티팩트: `.agent/measurements/qcf_kv_distribution_s25_2026_06_12/`.
 - **IPC 메시지** (`shared/src/lib.rs::QcfEstimate`)는 이미 두 필드(`estimates` HashMap + `layer_swap`)로 분리되어 있어 패밀리 구분이 IPC 단계에 자연스럽게 반영되어 있다.
 - **rename 완료**: 코드 rename(`qcf_kv.rs` 등, 2026-05-19/21) + estimator key 정규화(`kv.*`/`weight.*` — `estimator.rs::with_defaults` 실측 확인 2026-06-10) + 문서 갱신 전부 적용. backlog "QCF 명명 컨벤션 정리" 항목 RESOLVED 종결.
 - **상세 정의/수식**: `docs/qcf_taxonomy.md` (논문 참조용). 두 패밀리 정의, 7개 KV 액션 + swap + skip 수식, 코드 위치 인덱스 수록.

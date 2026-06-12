@@ -10,14 +10,18 @@ PM 단계는 생략 — 계획이 backlog AC ①~⑤로 이미 완결돼 있어 
 
 ## 단계
 
-- [ ] **P1 설계 (Architect)**: spec ENG-ALG-051 수식 개정(o_before 정규화 + KIVI 항 정합) + ENG-ALG-050 step 4 B안 개정 + ENG-ALG-060 위상 재정의 + `docs/qcf_taxonomy.md` §2.1/§2.2.1 동기화 + **키 전수 감사 보고**(엔진 송출↔manager 소비 전 구간) + d2o 테스트 재보정 명세 + floor 재산정 방법론
-  - 검증: spec/docs 동기화 diff + 키 매핑 표 + Senior Implementer에게 전달 가능한 구현 지시(파일:라인)
-- [ ] **P2 구현 (Senior Implementer)**: `qcf_kv.rs` o_before 정규화 + KIVI 항 정합 + `test_d2o_less_than_h2o` 재보정(실분포 근사) + 키 감사 최소 수정
-  - 검증: host lib 0 FAIL + fmt + clippy. `attention_scores.rs`/`qcf_runtime.rs` 접촉 시 commit 격리(QueryStats 배선과 분리)
-- [ ] **P3 호스트 게이트 (Tester)**: lib 전수(1410+ 기준) + spec 테스트(`cargo test --test spec`) + `scripts/check_spec_coverage.sh`
-- [ ] **P4 S25 분포 측정 + floor 재산정**: 양 가족(QCF_kv·QCF_weight) 분포 실측 → 4임계 + V_Q 산정(근거 수치 기록) → `policy_default.lua` 반영
-- [ ] **P5 회귀 게이트**: `signal_memory_critical` f16/q4 S25 verify GREEN → 전체 매트릭스 **30/30** 봉인
-- [ ] **P6 종결**: backlog RESOLVED + CLAUDE.md QCF 섹션 문구 정합(B안 반영) + 메모리/handoff 갱신 + α-K frozen 3-dtype 무회귀 확인(결정론 라인 diff)
+- [x] **P1 설계 (Architect)** ✅ `eab908ab`: spec ENG-ALG-051 수식 개정 + ENG-ALG-050 step 4 B안 + ENG-ALG-060 위상 재정의 + qcf_taxonomy 동기화 + 키 전수 감사(불일치 2건: streaming 표기 혼재 silent-0 실결함 + estimator dead 키) + d2o 재보정 명세 + floor 방법론
+- [x] **P2 구현 (Senior Implementer)** ✅ `753fb257`(수식+d2o 재보정+spec 테스트 3종) + `ddc2c2fb`(streaming 키 정렬) + `d6fcf376`(estimator 키 정렬)
+  - 검증: lib 1410/0, spec 683/4(사전존재), manager 0 FAIL, β regression PASS. 항등→QCF=0, 포화 시나리오 0.085(구 0.985)
+- [x] **P3 호스트 게이트** ✅: lib 1410/0 + spec 테스트 + coverage 스크립트(신규 누락 0, 기존 갭 45 불변)
+- [x] **P4 S25 분포 측정 + floor 재산정** ✅ `5454e564`+`1a8ee375`: 66샘플(h2o 0.031~0.168/d2o 0.086~0.243/sliding 0.261~0.389, 포화 0) → QCF_FLOOR 0.10/0.25/0.50/huge + V_Q 0.5 유지(근거: REPORT.md). weight.skip live 미산출 확인(단일 가족 산정 정당)
+- [x] **P5 회귀 게이트 (1차)** ✅: `signal_memory_critical` f16/q4 S25 **PASS** — 추가 결함 2건 적발·해소: ④ heartbeat available_actions 결함(`09a82ad9`) ⑤ 시나리오 물리적 통과 불가 파라미터(`7397512c` — MIN_EVICT_TOKENS/emergency 압력/prefill 주입 타임아웃/accuracy 임계). QCF 핸드셰이크 신호 유실은 backlog 신규 등록
+- [x] **P5 봉인** ✅: 전체 매트릭스 **30/30 PASS** (`verify/results/20260612_165122_galaxy_s25_f16_q4/`) — 구 known-fail 2건 해소, 신규 회귀 0
+- [x] **P6 종결** ✅: backlog RESOLVED + CLAUDE.md QCF 섹션 정합 + α-K frozen 3-dtype **byte-identical** + tbt median f16 54.34(Δ+0.2%)/f32 54.53(Δ+0.9%)/q4 53.45(Δ−0.6%) 전부 ≤+3% (초기 초과분은 매트릭스 직후 열누적 — 쿨다운 후 재측정으로 해소 확인)
+
+## 종결 (2026-06-12)
+
+**Status: ✅ 라운드 완주** — verify 매트릭스 30/30 봉인. 잔여 1건(QCF 핸드셰이크 신호 유실)은 backlog 신규 [P2]로 이관 (spec SEQ-098 개정 동반이라 별도 라운드).
 
 ## 게이트 요약
 

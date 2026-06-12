@@ -1120,6 +1120,17 @@
 - **Acceptance Criteria**: v2 경로에서 RequestQcf 수신 시 `compute_qcf_estimates` 산출을 `QcfEstimate` IPC로 응답 (AB-6 report_tx 선례 동형 배선) + `signal_thermal_critical_throttle` f16/q4 S25 verify GREEN.
 - **Notes**: 직접 directive 경로(Suspend/Offload/Quant/TargetTbt/Partition/Swap)는 전부 정상 — 영향 범위는 QCF 2단계 정책 경로 한정. verify 매트릭스의 known-fail 2건이 이 항목의 회귀 게이트 역할. 담당 권장: Architect(배선 설계) → Implementer.
 
+## [P2] QCF 2-step 핸드셰이크 신호 유실 — timeout 폴백 부재 + late estimate 미캐시 (2026-06-12 등록)
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음 (QCF_kv 설계 라운드에서 적발, 라운드 범위 밖 처분)
+- **출처**: 2026-06-12 QCF_kv 라운드 P5 — `signal_memory_critical` medium_qa 재정렬 중 S25 실측: 신호가 prefill 중 도착하면 엔진 QcfEstimate 응답이 chunk-경계 poll 간격으로 ~3s 지연 → manager `QCF_TIMEOUT_SECS=1.0` 초과.
+- **결함 2층** (`manager/src/lua_policy.rs`):
+  1. **timeout 폴백 부재** (`check_qcf_timeout` :893): pending 만 clear 하고 `qcf_pending_signal` 로 무-QCF decide 를 실행하지 않음 → **압박 신호가 통째로 유실** (directive 0건). "stale 이라도 없는 것보다 낫다"는 cache 보존 주석의 정신이 signal 에는 미적용.
+  2. **late estimate 미캐시** (`complete_qcf_selection` :871): `qcf_pending_at.take()?` 가 cache 갱신보다 앞에 있어 늦게 도착한 estimate 는 qcf_cache 에도 반영 안 됨 (지식 폐기).
+- **Acceptance Criteria**: ① timeout 시 pending_signal 로 decide 실행(무-QCF, INV-117 cache-miss=0 의미 유지) ② late estimate 는 pending 여부와 무관하게 cache 반영 ③ spec SEQ-098(timeout 거동) 개정 동반 + `manager/tests/spec/test_seq_095_098.rs` 갱신 ④ prefill-중-주입 변형 시나리오로 S25 검증.
+- **Notes**: 현 verify 매트릭스는 decode-구간 주입(`signal_memory_critical` delay 9.0s)으로 우회 중 — 본 항목은 prefill-구간 주입의 liveness 복원. spec 거동 변경이라 Architect 선행 필수.
+
 ## [P3] weight swap 역전 (RestoreDefaults F16 recall) — 2026-06-11 등록 (ADR-0006 §6 Deferred 잔존분)
 - **Status**: TODO (설계 라운드 선행 필수 — Architect + 사용자 결정)
 - **Sprint**: backlog
@@ -1128,8 +1139,8 @@
 - **Acceptance Criteria**: RestoreDefaults 수신 시 swap된 layer가 F16으로 복원 + 복원 후 출력이 swap-전 happy baseline과 일치 (S25 device 게이트) + partition+precision 합성 역전(ADR-0006 §6) 처분 결정.
 - **Notes**: 현 production에서 RestoreDefaults는 swap에 한해 no-op(§5.6.4 — 의도된 동작, partition/quant guard clear와 비대칭). 우선순위 P3 근거: production winner(Incremental swap)는 압력 해소 후에도 Q4 유지가 메모리 이득 관점에서 보통 바람직 — 역전의 실수요(품질 회복 시나리오)가 구체화되면 P2 승격.
 
-## [P2] QCF_kv 정규화 비대칭 + estimator 우회 + manager floor 재설정 — 설계 라운드 (2026-06-12 등록)
-- **Status**: **라운드 실행 중** (2026-06-12 결정 확정 — ① estimator = **B. raw 직송 합법화**(spec ENG-ALG-050 step 4 개정), ② QCF_FLOOR = **A. 이번 라운드 재설정 포함**. 스프린트: `sprint_qcf_kv_design_round_2026_06_12.md`. Architect 사전 판정: 3층 정합성 결함이라 폐쇄 수정 불가)
+## [RESOLVED 2026-06-12] QCF_kv 정규화 비대칭 + estimator 우회 + manager floor 재설정 — 설계 라운드
+- **Status**: **RESOLVED (2026-06-12 라운드 완주)** — AC ①~⑤ 전부 충족. 결정: ① estimator = **B raw 직송 합법화**(ENG-ALG-050 step 4 개정 `eab908ab`) ② QCF_FLOOR = **A 재설정**(S25 66샘플 실측 → 0.10/0.25/0.50/huge, policy v2.5.0 `1a8ee375`). 수식 정규화 `753fb257`(0.985 포화 → 0.03~0.39 변별 + d2o 재보정 + ENG-ALG-051 spec 테스트 3종) + 키 정렬 `ddc2c2fb`/`d6fcf376`. **라운드 중 추가 적발·해소 2건**: ④ heartbeat available_actions 결함(`09a82ad9` — eviction_policy 미전파로 capability 12→3 덮어쓰기, kv 후보 전멸) ⑤ 시나리오 물리 불가 파라미터(`7397512c` — MIN_EVICT_TOKENS·emergency 압력·prefill 주입). **게이트: `signal_memory_critical` f16/q4 GREEN + verify 매트릭스 30/30 봉인(20260612_165122) + α-K frozen 3-dtype byte-identical·tbt Δ≤+0.9%**. 잔여 신규 등록: "QCF 2-step 핸드셰이크 신호 유실" 항목(아래). 스프린트: `sprint_qcf_kv_design_round_2026_06_12.md`. (구 Status: 라운드 실행 중. Architect 사전 판정: 3층 정합성 결함이라 폐쇄 수정 불가 — 실제로는 5층이었음)
 - **Sprint**: backlog
 - **Dependencies**: 없음 (본 항목의 Architect 분석이 안건 SSOT — 2026-06-12 세션)
 - **출처**: 2026-06-12 score accumulator 배선 세션 — `signal_memory_critical` known-fail의 최종 잔여 원인으로 적발. S25 실측: V-readback 수정(`4444bdc8`) 후 QCF_kv가 0.985로 포화 → policy quality floor(critical=0.90)가 모든 kv.evict 기각.
