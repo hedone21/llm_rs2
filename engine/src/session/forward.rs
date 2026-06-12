@@ -103,4 +103,31 @@ pub trait Forward {
         let _ = cache_manager;
         Ok((0, 0))
     }
+
+    /// prefix cache save (ENG-085, INV-189). prefill 완료 직후 호출.
+    ///
+    /// `token_ids` = prompt 토큰 전체 (snapshot 대상). path = 저장 경로.
+    /// `last_logits` = prefill이 산출한 마지막 토큰 logits (f32×vocab). full restore 시 재사용.
+    /// ModelForward(StandardFormat) 만 override. 비지원 Forward 는 default no-op.
+    ///
+    /// Save 실패(권한/disk full 등)는 경고 후 무시(run 계속).
+    fn save_kv_prefix(
+        &self,
+        path: &std::path::Path,
+        model_hash: &[u8; 32],
+        tokenizer_hash: &[u8; 32],
+        token_ids: &[u32],
+        last_logits: &[f32],
+        backend: &dyn crate::backend::Backend,
+    ) -> anyhow::Result<()> {
+        let _ = (
+            path,
+            model_hash,
+            tokenizer_hash,
+            token_ids,
+            last_logits,
+            backend,
+        );
+        Ok(()) // default: no-op
+    }
 }

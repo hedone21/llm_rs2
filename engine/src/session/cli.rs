@@ -1219,6 +1219,32 @@ pub struct Args {
     // ── KV mode subcommand (S-subcmd C4) ─────────────────────────────────
     #[clap(flatten)]
     pub kv_mode_args: KvModeArgs,
+
+    // ── Session prefix KV cache (ENG-080~085, ADR-0012) ──────────────────
+    /// Save KV prefix cache to this path after prefill (ENG-085).
+    ///
+    /// Snapshot is taken immediately after prefill and before any eviction
+    /// (INV-189). Supported formats: F32/F16/Q4_0 (StandardFormat).
+    /// KIVI/opaque caches are silently skipped (no error, no-cache fallback).
+    ///
+    /// Uses atomic write (`<path>.tmp` → rename) to prevent corruption.
+    /// Failure (permissions, disk full) is reported as a warning; the run
+    /// continues normally.
+    #[arg(long)]
+    pub save_prefix_cache: Option<String>,
+
+    /// Restore KV prefix cache from this path at session start (ENG-085).
+    ///
+    /// Attempts to restore the cached KV state. If the file is missing,
+    /// has an incompatible model/format/tokenizer hash, or the token_ids
+    /// do not match the current prompt prefix — falls back to fresh
+    /// prefill silently (Ok(None), no panic, no error — INV-190).
+    ///
+    /// On hit: if `token_count == prompt.len()` prefill is completely
+    /// skipped; otherwise `prompt[token_count..]` is prefilled from
+    /// `start_pos = token_count`.
+    #[arg(long)]
+    pub prefix_cache: Option<String>,
 }
 
 /// Shim accessors for the eviction subcommand + flatten common args.

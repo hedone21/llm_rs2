@@ -15,6 +15,7 @@ pub mod builtin_kv_formats;
 pub mod dtype_layout;
 pub mod dynamic_format_registry;
 pub mod kv_cache_format;
+pub mod kv_snapshot;
 pub mod weight_format;
 
 pub use builtin_kv_formats::{builtin_format_dtype, ensure_builtin_kv_formats_registered};
@@ -23,4 +24,5 @@ pub use dtype_layout::{
     encode_via_descriptor, layout_desc_to_builtin_dtype,
 };
 pub use kv_cache_format::{AttnDims, KVCacheFormat, Merge};
+pub use kv_snapshot::SnapshotRestore;
 pub use weight_format::{LayerDispatch, PartitionShare, WeightFormat};

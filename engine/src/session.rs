@@ -20,6 +20,7 @@ pub mod local_pressure;
 pub mod pipeline_registry;
 pub mod plugin_dispatch;
 pub mod ppl;
+pub mod prefix_cache;
 pub mod qcf_runtime;
 pub mod resilience_adapter;
 pub mod resilience_init;

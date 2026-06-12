@@ -708,6 +708,55 @@ impl Forward for ModelForward {
         let new_pos = self.kv_caches.first().map(|c| c.current_pos).unwrap_or(0);
         Ok((n, new_pos))
     }
+
+    /// prefix cache save (ENG-085, INV-189). prefill 완료 직후 호출됨.
+    ///
+    /// fmt_caches(StandardFormat)가 있으면 `SnapshotRestore::snapshot_prefix` 경유 직렬화.
+    /// opaque/KIVI(fmt_caches == None 또는 opaque buffer) 는 no-op (INV-190 정책 동치 — 에러 아님).
+    fn save_kv_prefix(
+        &self,
+        path: &std::path::Path,
+        model_hash: &[u8; 32],
+        tokenizer_hash: &[u8; 32],
+        token_ids: &[u32],
+        last_logits: &[f32],
+        backend: &dyn crate::backend::Backend,
+    ) -> anyhow::Result<()> {
+        use crate::format::SnapshotRestore;
+        use crate::session::prefix_cache::save_prefix;
+
+        let Some(fmts) = &self.fmt_caches else {
+            // kv_caches 미wrap (prefill 전 호출 혹은 opaque) → no-op
+            return Ok(());
+        };
+        if fmts.is_empty() {
+            return Ok(());
+        }
+        // 첫 번째 cache의 geometry를 사용
+        let (kv_heads, head_dim) = fmts
+            .first()
+            .map(|f| f.with_cache_mut(|c| (c.kv_heads() as u32, c.head_dim() as u32)))
+            .unwrap_or((0, 0));
+        let format_id = fmts.first().map(|f| f.snapshot_format_id()).unwrap_or(0);
+
+        let snap_refs: Vec<&dyn SnapshotRestore> = fmts
+            .iter()
+            .map(|f| f.as_ref() as &dyn SnapshotRestore)
+            .collect();
+
+        save_prefix(
+            path,
+            model_hash,
+            tokenizer_hash,
+            token_ids,
+            last_logits,
+            format_id,
+            &snap_refs,
+            kv_heads,
+            head_dim,
+            backend,
+        )
+    }
 }
 
 /// §5.9.2 Track B: hook cell → forward args 슬롯값(Arc clone). 설치돼 있으면 `Some(Arc)`,

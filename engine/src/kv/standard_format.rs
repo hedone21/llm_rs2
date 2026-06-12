@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::format::{AttnDims, KVCacheFormat, dequant_to_f32_tensor};
+use crate::format::{AttnDims, KVCacheFormat, SnapshotRestore, dequant_to_f32_tensor};
 use crate::kv::kv_cache::KVCache;
 use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
@@ -54,6 +54,14 @@ impl StandardFormat {
                 v_cast: None,
             }),
         }
+    }
+
+    /// `StandardFormat` 을 소비하여 내부 `KVCache` 를 반환한다.
+    ///
+    /// prefix cache restore 후 kv_caches 를 재조립할 때 사용 (session::standard_happy 전용).
+    /// Mutex 를 into_inner 로 unwrap 하므로 다른 Arc 공유자가 없을 때만 호출할 것.
+    pub(crate) fn into_kv_cache(self) -> KVCache {
+        self.inner.into_inner().unwrap().cache
     }
 
     /// 내부 `KVCache` 에 `&mut` 접근하여 `f` 실행 (substep 3c fmt-cache wiring).
@@ -1042,6 +1050,273 @@ pub(crate) fn prefill_attention(
         }
     }
     Ok(())
+}
+
+// ── SnapshotRestore capability (ADR-0012) ────────────────────────────────────
+
+/// `snapshot_prefix` 에서 단일 Tensor의 [0..token_count) 범위만 packed bytes로 추출한다.
+///
+/// HeadMajor 전제: head_stride = capacity × head_dim(또는 블록). per-head의 [0..token_count)만
+/// capacity 패딩 없이 연속 추출. device 버퍼는 backend.read_buffer() 경유(INV-191).
+fn extract_packed_bytes(
+    t: &crate::tensor::Tensor,
+    backend: &dyn Backend,
+    kv_heads: usize,
+    token_count: usize,
+    head_dim: usize,
+    capacity: usize,
+    dtype: DType,
+) -> anyhow::Result<Vec<u8>> {
+    use crate::quant::{BlockQ4_0, QK4_0};
+
+    // 전체 버퍼를 read_buffer로 host 쪽으로 읽어온다 (INV-191: as_ptr 금지).
+    let total_bytes = t.buffer().size();
+    let mut raw = vec![0u8; total_bytes];
+    backend.read_buffer(t, &mut raw)?;
+
+    match dtype {
+        DType::F32 => {
+            // elem_size=4, head_stride = capacity * head_dim elements
+            let elem_size = 4usize;
+            let head_stride_bytes = capacity * head_dim * elem_size;
+            let row_bytes = token_count * head_dim * elem_size;
+            let mut out = vec![0u8; kv_heads * row_bytes];
+            for h in 0..kv_heads {
+                let src_off = h * head_stride_bytes;
+                let dst_off = h * row_bytes;
+                out[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&raw[src_off..src_off + row_bytes]);
+            }
+            Ok(out)
+        }
+        DType::F16 => {
+            // elem_size=2, head_stride = capacity * head_dim elements
+            let elem_size = 2usize;
+            let head_stride_bytes = capacity * head_dim * elem_size;
+            let row_bytes = token_count * head_dim * elem_size;
+            let mut out = vec![0u8; kv_heads * row_bytes];
+            for h in 0..kv_heads {
+                let src_off = h * head_stride_bytes;
+                let dst_off = h * row_bytes;
+                out[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&raw[src_off..src_off + row_bytes]);
+            }
+            Ok(out)
+        }
+        DType::Q4_0 => {
+            // Q4_0: element ≠ block. 블록 단위 회계 (shrink_to_fit SIGSEGV 동형 함정).
+            let bps = head_dim / QK4_0; // blocks per position
+            let block_size = std::mem::size_of::<BlockQ4_0>(); // 18 bytes
+            // head_stride_blocks = capacity * bps
+            let head_stride_bytes = capacity * bps * block_size;
+            let row_bytes = token_count * bps * block_size;
+            let mut out = vec![0u8; kv_heads * row_bytes];
+            for h in 0..kv_heads {
+                let src_off = h * head_stride_bytes;
+                let dst_off = h * row_bytes;
+                out[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&raw[src_off..src_off + row_bytes]);
+            }
+            Ok(out)
+        }
+        other => anyhow::bail!(
+            "SnapshotRestore: unsupported dtype {:?} (Tier 1 지원: F32/F16/Q4_0)",
+            other
+        ),
+    }
+}
+
+/// `restore_prefix` 에서 packed bytes를 현 capacity head_stride로 재배치한다.
+///
+/// write 후 backend.write_buffer() 로 device에 올린다 (INV-191).
+#[allow(clippy::too_many_arguments)]
+fn scatter_packed_bytes(
+    t: &mut crate::tensor::Tensor,
+    backend: &dyn Backend,
+    kv_heads: usize,
+    token_count: usize,
+    head_dim: usize,
+    capacity: usize,
+    dtype: DType,
+    packed: &[u8],
+) -> anyhow::Result<()> {
+    use crate::quant::{BlockQ4_0, QK4_0};
+
+    // 기존 전체 버퍼를 읽어 host 버퍼를 만든다 (새 capacity이므로 0으로 초기화해도 무방).
+    let total_bytes = t.buffer().size();
+    let mut raw = vec![0u8; total_bytes];
+
+    match dtype {
+        DType::F32 => {
+            let elem_size = 4usize;
+            let head_stride_bytes = capacity * head_dim * elem_size;
+            let row_bytes = token_count * head_dim * elem_size;
+            for h in 0..kv_heads {
+                let src_off = h * row_bytes;
+                let dst_off = h * head_stride_bytes;
+                raw[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&packed[src_off..src_off + row_bytes]);
+            }
+        }
+        DType::F16 => {
+            let elem_size = 2usize;
+            let head_stride_bytes = capacity * head_dim * elem_size;
+            let row_bytes = token_count * head_dim * elem_size;
+            for h in 0..kv_heads {
+                let src_off = h * row_bytes;
+                let dst_off = h * head_stride_bytes;
+                raw[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&packed[src_off..src_off + row_bytes]);
+            }
+        }
+        DType::Q4_0 => {
+            let bps = head_dim / QK4_0;
+            let block_size = std::mem::size_of::<BlockQ4_0>();
+            let head_stride_bytes = capacity * bps * block_size;
+            let row_bytes = token_count * bps * block_size;
+            for h in 0..kv_heads {
+                let src_off = h * row_bytes;
+                let dst_off = h * head_stride_bytes;
+                raw[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&packed[src_off..src_off + row_bytes]);
+            }
+        }
+        other => anyhow::bail!(
+            "SnapshotRestore: unsupported dtype {:?} (Tier 1 지원: F32/F16/Q4_0)",
+            other
+        ),
+    }
+
+    backend.write_buffer(t, &raw)?;
+    Ok(())
+}
+
+impl SnapshotRestore for StandardFormat {
+    /// `[0..token_count)` K+V를 capacity 패딩 제거 packed bytes로 직렬화.
+    ///
+    /// pre: `current_pos == token_count`, eviction 미발생 (INV-189).
+    /// device는 `backend.read_buffer()` (INV-191).
+    /// 반환: K bytes || V bytes (per-layer — 상위 save_prefix가 layer-major concat).
+    fn snapshot_prefix(
+        &self,
+        token_count: usize,
+        backend: &dyn Backend,
+    ) -> anyhow::Result<Vec<u8>> {
+        let guard = self.inner.lock().unwrap();
+        let cache = &guard.cache;
+
+        anyhow::ensure!(
+            cache.current_pos() == token_count,
+            "SnapshotRestore::snapshot_prefix: current_pos({}) != token_count({})",
+            cache.current_pos(),
+            token_count
+        );
+
+        let kv_heads = cache.kv_heads();
+        let head_dim = cache.head_dim();
+        let capacity = cache.capacity();
+        let dtype = cache.kv_dtype();
+
+        let k_bytes = extract_packed_bytes(
+            &cache.k_buffer,
+            backend,
+            kv_heads,
+            token_count,
+            head_dim,
+            capacity,
+            dtype,
+        )?;
+        let v_bytes = extract_packed_bytes(
+            &cache.v_buffer,
+            backend,
+            kv_heads,
+            token_count,
+            head_dim,
+            capacity,
+            dtype,
+        )?;
+
+        let mut out = k_bytes;
+        out.extend_from_slice(&v_bytes);
+        Ok(out)
+    }
+
+    /// packed bytes에서 KV를 복원.
+    ///
+    /// pre: `current_pos == 0` (빈 캐시), bytes = 동일 format packed-form.
+    /// post: `current_pos == token_count`, KV byte-identical (INV-191).
+    fn restore_prefix(
+        &self,
+        bytes: &[u8],
+        token_count: usize,
+        backend: &dyn Backend,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        let cache = &mut guard.cache;
+
+        anyhow::ensure!(
+            cache.current_pos() == 0,
+            "SnapshotRestore::restore_prefix: cache is not empty (current_pos={})",
+            cache.current_pos()
+        );
+
+        // 용량 확보
+        cache.ensure_capacity(token_count)?;
+
+        let kv_heads = cache.kv_heads();
+        let head_dim = cache.head_dim();
+        let capacity = cache.capacity();
+        let dtype = cache.kv_dtype();
+
+        // packed bytes를 K / V 로 분리
+        let half = bytes.len() / 2;
+        let k_packed = &bytes[..half];
+        let v_packed = &bytes[half..];
+
+        // scatter: packed → capacity head_stride layout
+        scatter_packed_bytes(
+            &mut cache.k_buffer,
+            backend,
+            kv_heads,
+            token_count,
+            head_dim,
+            capacity,
+            dtype,
+            k_packed,
+        )?;
+        scatter_packed_bytes(
+            &mut cache.v_buffer,
+            backend,
+            kv_heads,
+            token_count,
+            head_dim,
+            capacity,
+            dtype,
+            v_packed,
+        )?;
+
+        // position 갱신
+        cache.set_current_pos(token_count);
+        // high_water 갱신 (advance_pos는 current_pos += n이라 부적합, 직접 설정)
+        cache.high_water_pos = cache.high_water_pos.max(token_count);
+
+        drop(guard);
+        Ok(())
+    }
+
+    fn snapshot_format_id(&self) -> u32 {
+        let guard = self.inner.lock().unwrap();
+        match guard.cache.kv_dtype() {
+            DType::F32 => 1,
+            DType::F16 => 2,
+            DType::Q4_0 => 3,
+            other => {
+                // 지원하지 않는 dtype은 0으로 표시 (헤더 무효화로 폴백)
+                let _ = other;
+                0
+            }
+        }
+    }
 }
 
 #[cfg(test)]

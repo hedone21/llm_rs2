@@ -369,6 +369,17 @@ mod test_chat_repl_v2_multi_turn;
 #[path = "spec/test_kv_mode_args.rs"]
 mod test_kv_mode_args;
 
+// ── Session prefix KV cache (INV-189~191, ENG-085) ──
+// ENG-080~085 capability + snapshot timing + invalidation + byte-identical + CLI
+#[path = "spec/test_eng_085_prefix_cache_cli.rs"]
+mod test_eng_085_prefix_cache_cli;
+#[path = "spec/test_inv_189_snapshot_timing.rs"]
+mod test_inv_189_snapshot_timing;
+#[path = "spec/test_inv_190_invalidation.rs"]
+mod test_inv_190_invalidation;
+#[path = "spec/test_inv_191_restore_byte_identical.rs"]
+mod test_inv_191_restore_byte_identical;
+
 // ── INV-RPCMEM-001~008: RpcmemAllocator backend-agnostic 분리 (Sprint 2a Phase 2) ──
 // ENG-RPCMEM-010~042 + ENG-RPCMEM-C01~C04 구현 검증.
 // Android-only INV (001/002/005/007) 는 호스트에서 source-grep / skip.

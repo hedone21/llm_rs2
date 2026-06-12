@@ -470,6 +470,48 @@ impl DecodeLoop {
         self.prev_token = 0;
     }
 
+    /// prefix cache restore 후 pos 를 외부에서 설정한다 (ENG-082, session::standard_happy 전용).
+    ///
+    /// `reset_pos`(0 고정)와 달리 임의 `pos` 를 허용한다. decode_step / prev_token 은 0 유지.
+    pub(crate) fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    /// prefix cache full/partial restore 후 sampler token history 를 초기화한다.
+    ///
+    /// `DecodeLoop::prefill`은 완료 직후 `sampler.observe_token(t)` for all prompt tokens 를
+    /// 호출하여 RepetitionPenaltySampler ring buffer 를 채운다. restore 경로는 prefill 을
+    /// 건너뛰므로 이 메서드로 동일한 history 를 주입해야 한다 (INV-SAMPLING-HISTORY).
+    ///
+    /// `tokens`: prompt 토큰열 전체. GreedySampler 는 observe_token 이 no-op 이라 무비용.
+    pub(crate) fn seed_sampler_history(&mut self, tokens: &[u32]) {
+        for &t in tokens {
+            self.sampler.observe_token(t);
+        }
+    }
+
+    /// prefix cache save 위임 (ENG-085, INV-189). prefill 완료 직후 호출.
+    ///
+    /// `forward.save_kv_prefix(...)` 에 위임한다. ModelForward 이외 Forward 는 default no-op.
+    pub(crate) fn save_kv_prefix(
+        &self,
+        path: &std::path::Path,
+        model_hash: &[u8; 32],
+        tokenizer_hash: &[u8; 32],
+        token_ids: &[u32],
+        last_logits: &[f32],
+        backend: &dyn crate::backend::Backend,
+    ) -> anyhow::Result<()> {
+        self.forward.save_kv_prefix(
+            path,
+            model_hash,
+            tokenizer_hash,
+            token_ids,
+            last_logits,
+            backend,
+        )
+    }
+
     /// Phase 4-5-c. ChatSession::reset이 forward의 KV cache에 접근하기 위한 accessor.
     pub fn forward_mut(&mut self) -> &mut dyn Forward {
         &mut *self.forward
