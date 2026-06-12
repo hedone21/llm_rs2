@@ -20,6 +20,7 @@ use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::query_stats::QueryStatsAccumulator;
 use crate::kv::kv_cache::KVCache;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
@@ -97,6 +98,7 @@ pub fn run_dump_importance(mut ctx: DumpImportanceCtx) -> anyhow::Result<()> {
             workspace: None,
             logits_last_only: false,
             score_accumulator: None,
+            query_stats_accumulator: None,
             skip_config: None,
             importance_collector: Some(&mut collector),
             cache_self_need_scores: false,
@@ -214,6 +216,13 @@ fn run_head_concentration_decode(
     // ConcentrationAccumulator: [n_layers × n_kv_heads]
     let mut conc_acc = ConcentrationAccumulator::new(n_layers, n_kv_heads);
 
+    // ADR-0004 §10 M-Q (MQ-6): QueryStats e2e seam — score-active decode 경로에서 per-(layer,kv_head)
+    // Q running mean/var 가 실제로 채워지는지 검증. step 간 누적이므로 루프 밖에서 1개 생성, 매 step
+    // forward_into 에 공급(transformer.rs seam 의 GQA 환원 1-sample 누적).
+    let head_dim = ctx.model.config.head_dim;
+    let mut qstats_acc = QueryStatsAccumulator::new(n_layers, n_heads_q, n_kv_heads, head_dim);
+    qstats_acc.set_active(true);
+
     // 첫 decode 토큰: prefill logits의 마지막 토큰 logit에서 greedy argmax.
     // prefill logits 버퍼는 이미 해제됐으므로 재계산 없이 next_token=prompt_ids.last 사용.
     // 실제 greedy는 별도로 측정 필요 없으므로 임의 시작 토큰(prompt 마지막 토큰)으로 대체.
@@ -259,6 +268,8 @@ fn run_head_concentration_decode(
                 workspace: Some(&mut gen_ws),
                 logits_last_only: true,
                 score_accumulator: Some(&mut acc),
+                // MQ-6 e2e seam: score-active decode 에서 RoPE-적용 Q 캡처 누적.
+                query_stats_accumulator: Some(&mut qstats_acc),
                 skip_config: None,
                 importance_collector: None,
                 cache_self_need_scores: false,
@@ -314,12 +325,62 @@ fn run_head_concentration_decode(
         ratio
     );
 
+    // ── MQ-6: query_stats e2e 섹션 ──────────────────────────────────────────
+    // 누적된 per-(layer,kv_head) Q running mean/var 를 JSON 으로 덤프해 실제 채워짐을 증명한다
+    // (단위 테스트만으로 완료 선언 금지, U5/항목 0 허상 교훈). non-empty 신호 = mean/var 가 전부
+    // 0 이 아닌 원소를 가지는가(decode step ≥1 누적 시 mean ≈ Q 평균이라 자명히 non-zero).
+    let query_stats_section =
+        build_query_stats_section(&mut qstats_acc, n_layers, n_kv_heads, head_dim);
+
     Ok(serde_json::json!({
         "decode_steps": HEAD_CONC_DECODE_STEPS,
         "top_frac": HEAD_CONC_TOP_FRAC,
         "max_min_ratio": ratio,
         "matrix": rows,
+        "query_stats": query_stats_section,
     }))
+}
+
+/// MQ-6: 누적된 QueryStats 를 per-(layer,kv_head) mean/var L2-norm 매트릭스로 덤프한다.
+/// 실모델 e2e 검증용 — `non_empty=true` + 각 (layer,kv_head) mean/var norm 이 누적기가 실제
+/// 채워졌음을 증명한다(전부 0 이면 seam 미작동).
+fn build_query_stats_section(
+    qstats_acc: &mut QueryStatsAccumulator,
+    n_layers: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> serde_json::Value {
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut any_nonzero = false;
+    for l in 0..n_layers {
+        // layer_stats: [n_kv_heads * 2 * head_dim] (row0=mean / row1=var).
+        let stats = qstats_acc.layer_stats(l).to_vec();
+        for h in 0..n_kv_heads {
+            let base = h * 2 * head_dim;
+            let mean_slice = &stats[base..base + head_dim];
+            let var_slice = &stats[base + head_dim..base + 2 * head_dim];
+            let mean_norm = (mean_slice.iter().map(|x| x * x).sum::<f32>()).sqrt();
+            let var_norm = (var_slice.iter().map(|x| x * x).sum::<f32>()).sqrt();
+            if mean_norm != 0.0 || var_norm != 0.0 {
+                any_nonzero = true;
+            }
+            rows.push(serde_json::json!({
+                "layer": l,
+                "kv_head": h,
+                "mean_l2": mean_norm,
+                "var_l2": var_norm,
+            }));
+        }
+    }
+    eprintln!(
+        "[QueryStats] non_empty={} ({} layers × {} kv_heads, head_dim={})",
+        any_nonzero, n_layers, n_kv_heads, head_dim
+    );
+    serde_json::json!({
+        "non_empty": any_nonzero,
+        "head_dim": head_dim,
+        "matrix": rows,
+    })
 }
 
 /// decode logits 텐서에서 greedy argmax token id를 반환한다.

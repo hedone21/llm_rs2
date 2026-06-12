@@ -430,6 +430,7 @@ impl Forward for ModelForward {
                 logits_last_only: true,
                 // Phase α-K ①-c: eval feature 필드 (production 은 비활성).
                 score_accumulator: None,
+                query_stats_accumulator: None,
                 skip_config: None,
                 importance_collector: None,
                 cache_self_need_scores: false,
@@ -549,6 +550,10 @@ impl Forward for ModelForward {
             // §5.9.1 Track A: active acc 면 주입, 아니면 None(거동-0). end_step() 은
             // forward_into 내부(transformer.rs:1671) 자동 — 재호출 금지.
             score_accumulator: acc_slot,
+            // ADR-0004 §10 M-Q: production decode 는 QueryStats 소비자(Expected Attention)가 없어
+            // 항상 None — score-active 여부와 무관하게 미공급(MQ-6 landmine: e2e 검증은 eval 하네스
+            // dump_importance.rs 에서). happy path 무비용은 transformer.rs seam 의 is_some 게이트가 보장.
+            query_stats_accumulator: None,
             skip_config: None,
             importance_collector: None,
             cache_self_need_scores: false,

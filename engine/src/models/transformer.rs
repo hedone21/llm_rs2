@@ -311,6 +311,12 @@ pub struct TransformerModelForwardArgs<'a> {
     /// H2O-style eviction score accumulator (Phase α-K ①-c — eval flip). `Some` 이면 decode 마다
     /// post-softmax score 를 누적(`forward_into:1894-1922` 미러). production(ModelForward)은 항상 `None`.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
+    /// Expected Attention Q running mean/var 누적기 (ADR-0004 §10 M-Q, QueryStats). `Some` 이면 decode
+    /// 마다 활성 layer 의 RoPE-적용 Q(`ws.q`)를 GQA 환원해 누적(score 누적 seam 인접 1지점). score
+    /// 비활성 happy path 는 `None`(MQ-4 hot-path 게이트 — `Option::is_some` 분기 1회 외 비용 0).
+    /// production(ModelForward)은 항상 `None`; score-active 측정 하네스만 `Some`.
+    pub query_stats_accumulator:
+        Option<&'a mut crate::inference::query_stats::QueryStatsAccumulator>,
     /// SWIFT layer-skip 설정 (Phase α-K ①-c). production 은 항상 `None`.
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Layer Skip QCF importance collector — prefill 2-pass 전용 (Phase α-K ①-c). production 은 `None`.
@@ -1405,6 +1411,8 @@ impl TransformerModel {
         let mut workspace = args.workspace;
         // Phase α-K ①-c: eval feature threading (production ModelForward 은 전부 None/false).
         let mut score_accumulator = args.score_accumulator;
+        // ADR-0004 §10 M-Q: Expected Attention Q running mean/var 누적기 (production 은 None).
+        let mut query_stats_accumulator = args.query_stats_accumulator;
         let skip_config = args.skip_config;
         let mut importance_collector = args.importance_collector;
         let cache_self_need_scores = args.cache_self_need_scores;
@@ -1664,6 +1672,17 @@ impl TransformerModel {
                         score_offset,
                     );
                 }
+            }
+
+            // ADR-0004 §10 M-Q (MQ-4): QueryStats 캡처 1지점 — score 누적 seam 인접. score-active
+            // 폴백 경로(workspace Some = decode)에서만, query_stats_accumulator Some + active 시
+            // RoPE-적용 Q(`ws.q`, forward_gen_fmt L135 rope_inplace 직후 보존)를 GQA 환원해 누적한다.
+            // hook=None happy path 는 args 슬롯이 None → `Option::is_some` 분기 1회뿐(INV-147 동형,
+            // forward 출력 byte-identical). prefill 은 args.workspace=None 이라 미진입(score 누적 동형).
+            if let (Some(qacc), Some(ws)) = (&mut query_stats_accumulator, &workspace)
+                && qacc.is_active()
+            {
+                qacc.accumulate_layer(ws.q.as_slice::<f32>(), i);
             }
         }
 

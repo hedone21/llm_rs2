@@ -164,6 +164,7 @@ fn run_forward_cpu(model: &TransformerModel, prompt_ids: &[u32]) -> anyhow::Resu
         x_gen: None,
         workspace: None,
         score_accumulator: None,
+        query_stats_accumulator: None,
         skip_config: None,
         importance_collector: None,
         logits_last_only: false,

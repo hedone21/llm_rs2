@@ -187,6 +187,38 @@ impl TensorHandle for ScalarHandle<'_> {
     }
 }
 
+/// `tensor(QueryStats)` 핸들 — per-(kv_head) Q running mean/var (ADR-0004 §10 M-Q, MQ-1).
+/// 공급원 = `QueryStatsAccumulator::layer_stats(layer)` 의 단일-layer 슬라이스(MQ-4 (c)).
+/// 레이아웃 `[n_kv_heads * 2 * head_dim]`: `data[kv_head*2*head_dim + stat_row*head_dim + d]`,
+/// `stat_row 0 = mean / 1 = var`. `shape = {rows:2, cols:head_dim, per_head:true}`,
+/// `read_row(row, kv_head, out)` = `data[base .. base+head_dim]` copy.
+struct QueryStatsHandle<'a> {
+    data: &'a [f32],
+    head_dim: usize,
+}
+impl TensorHandle for QueryStatsHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: 2, // row0 = mean, row1 = var.
+            cols: self.head_dim,
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        // base = kv_head * 2 * head_dim + row * head_dim (row 0=mean / 1=var).
+        let base = kv_head * 2 * self.head_dim + row * self.head_dim;
+        let hd = self.head_dim.min(out.len());
+        if base + hd <= self.data.len() {
+            out[..hd].copy_from_slice(&self.data[base..base + hd]);
+        } else {
+            out[..hd].fill(0.0);
+        }
+    }
+}
+
 /// `&KVCache`(+ budget + scores) 위로 구현한 [`StageCtx`] (ADR-0004 D5, M-A 통합).
 ///
 /// 모든 텐서/스코어 읽기는 [`StageCtx::tensor`] 단일 경로로 흐른다: Key/Value 핸들은 항상,
@@ -202,20 +234,25 @@ pub(crate) struct KVStageCtx<'a> {
     value_handle: ValueHandle<'a>,
     scores_handle: Option<ScalarHandle<'a>>,
     attn_handle: Option<ScalarHandle<'a>>,
+    query_stats_handle: Option<QueryStatsHandle<'a>>,
 }
 
 impl<'a> KVStageCtx<'a> {
     /// 엔진 eviction 경로(+ d2o 동등성/CAOTE host 테스트)가 `&KVCache` 위로 ctx 를 만든다.
     /// `head_scores`/`last_attn`: per-(kv_head,pos) `[n_kv_heads*max_seq]`. `None`=미공급(`tensor()`→None).
+    /// `query_stats`: 단일-layer Q running mean/var `[n_kv_heads*2*head_dim]`(ADR-0004 §10 M-Q, MQ-4 (c)).
+    /// `None`=미공급(`tensor(QueryStats)`→None) — production builtins 는 None(score-active e2e seam 한정).
     pub(crate) fn new(
         cache: &'a KVCache,
         target_len: usize,
         importance: Option<&'a [f32]>,
         head_scores: Option<&'a [f32]>,
         last_attn: Option<&'a [f32]>,
+        query_stats: Option<&'a [f32]>,
     ) -> Self {
         let rows = cache.current_pos();
         let max_seq = cache.max_seq_len;
+        let head_dim = cache.head_dim();
         Self {
             cache,
             target_len,
@@ -232,6 +269,7 @@ impl<'a> KVStageCtx<'a> {
                 rows,
                 max_seq,
             }),
+            query_stats_handle: query_stats.map(|data| QueryStatsHandle { data, head_dim }),
         }
     }
 }
@@ -263,6 +301,10 @@ impl StageCtx for KVStageCtx<'_> {
             TensorKind::Value => Some(&self.value_handle),
             TensorKind::Scores => self.scores_handle.as_ref().map(|h| h as &dyn TensorHandle),
             TensorKind::AttnWeights => self.attn_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            TensorKind::QueryStats => self
+                .query_stats_handle
+                .as_ref()
+                .map(|h| h as &dyn TensorHandle),
         }
     }
 }
@@ -290,7 +332,9 @@ impl StageBackedPolicy {
         importance: Option<&[f32]>,
     ) -> Result<()> {
         let plan = {
-            let ctx = KVStageCtx::new(cache, target_len, importance, None, None);
+            // QueryStats(MQ-4 e2e seam)는 production eviction 경로에서 미공급(None) — score-active
+            // 측정 하네스가 별도로 공급한다(dump_importance.rs).
+            let ctx = KVStageCtx::new(cache, target_len, importance, None, None, None);
             self.stage.plan(&ctx)
         };
         if let Some(plan) = plan {
@@ -692,6 +736,7 @@ fn tensor_kind_from_u32(k: u32) -> Option<TensorKind> {
         1 => Some(TensorKind::Value),
         2 => Some(TensorKind::AttnWeights),
         3 => Some(TensorKind::Scores),
+        4 => Some(TensorKind::QueryStats),
         _ => None,
     }
 }
@@ -886,7 +931,7 @@ mod tests {
         let mut c = mk(DType::F32, 8); // kv_heads=1, head_dim=PHD, V distinct per pos, current_pos=8
         let imp = vec![1.0f32; 8]; // 균일 가중 → criticality 는 V 가 결정
         let plan = {
-            let ctx = KVStageCtx::new(&c, 4, Some(&imp), None, None);
+            let ctx = KVStageCtx::new(&c, 4, Some(&imp), None, None, None);
             assert!(
                 ctx.tensor(TensorKind::Value).is_some(),
                 "KVStageCtx 는 Value 핸들을 항상 공급"
@@ -923,7 +968,7 @@ mod tests {
         let imp = vec![1.0f32; 8];
         let stage = RkvStage::new(Default::default());
         let plan = {
-            let ctx = KVStageCtx::new(&c, 4, Some(&imp), None, None);
+            let ctx = KVStageCtx::new(&c, 4, Some(&imp), None, None, None);
             assert!(
                 ctx.tensor(TensorKind::Key).is_some(),
                 "KVStageCtx 는 Key 핸들 항상 공급(redundancy 입력)"
@@ -1121,7 +1166,7 @@ mod tests {
                 k[off + d] = (d as f32) * 0.5 + 1.0;
             }
         }
-        let ctx = KVStageCtx::new(&c, 0, None, None, None);
+        let ctx = KVStageCtx::new(&c, 0, None, None, None, None);
         let mut out = vec![0.0f32; PHD];
         ctx.dequant_k(5, 0, &mut out);
         for d in 0..PHD {
@@ -1145,7 +1190,7 @@ mod tests {
                 v[off + d] = (d as f32) * 0.25 - 2.0;
             }
         }
-        let ctx = KVStageCtx::new(&c, 0, None, None, None);
+        let ctx = KVStageCtx::new(&c, 0, None, None, None, None);
         let mut out = vec![0.0f32; PHD];
         ctx.dequant_v(5, 0, &mut out);
         for d in 0..PHD {
@@ -1160,16 +1205,72 @@ mod tests {
         let max_seq = c.max_seq_len;
         let scores: Vec<f32> = (0..max_seq).map(|p| p as f32 + 0.5).collect();
         let attn: Vec<f32> = (0..max_seq).map(|p| p as f32 * 10.0).collect();
-        let ctx = KVStageCtx::new(&c, 0, None, Some(&scores), Some(&attn));
+        let ctx = KVStageCtx::new(&c, 0, None, Some(&scores), Some(&attn), None);
         assert!(ctx.has_head_scores());
         assert!(ctx.has_attn_weights());
         assert_eq!(ctx.head_score(0, 3), 3.5);
         assert_eq!(ctx.attn_weight(0, 2), 20.0);
         // 미공급 ctx → None / trivial.
-        let bare = KVStageCtx::new(&c, 0, None, None, None);
+        let bare = KVStageCtx::new(&c, 0, None, None, None, None);
         assert!(!bare.has_head_scores());
         assert!(!bare.has_attn_weights());
         assert_eq!(bare.head_score(0, 3), 0.0);
         assert!(bare.tensor(TensorKind::Scores).is_none());
+        // QueryStats 미공급 → None.
+        assert!(bare.tensor(TensorKind::QueryStats).is_none());
+    }
+
+    /// TQS-7/8: `QueryStatsHandle` shape={2,head_dim,true} + read_row(0)=mean/(1)=var + 공급 시
+    /// Some/미공급 None + 기존 0~3 kind 무영향 (ADR-0004 §10 M-Q, MQ-1).
+    #[test]
+    fn kvstagectx_query_stats_handle() {
+        let c = mk(DType::F32, 4); // kv_heads=1, head_dim=PHD
+        let head_dim = c.head_dim();
+        assert_eq!(head_dim, PHD);
+        // 단일-layer QueryStats 슬라이스 [n_kv_heads(1) * 2 * head_dim]:
+        // row0(mean)[d] = d + 0.5, row1(var)[d] = d * 2.0.
+        let mut qs = vec![0.0f32; 2 * head_dim];
+        for d in 0..head_dim {
+            qs[d] = d as f32 + 0.5; // mean
+            qs[head_dim + d] = d as f32 * 2.0; // var
+        }
+        let ctx = KVStageCtx::new(&c, 0, None, None, None, Some(&qs));
+        let h = ctx
+            .tensor(TensorKind::QueryStats)
+            .expect("QueryStats 공급 시 Some");
+        // shape 계약.
+        let sh = h.shape();
+        assert_eq!(sh.rows, 2, "rows=2 (mean/var)");
+        assert_eq!(sh.cols, head_dim, "cols=head_dim");
+        assert!(sh.per_head);
+        assert_eq!(h.dtype(), TensorDtype::F32);
+        // read_row(0)=mean / (1)=var.
+        let mut mean = vec![0.0f32; head_dim];
+        let mut var = vec![0.0f32; head_dim];
+        h.read_row(0, 0, &mut mean);
+        h.read_row(1, 0, &mut var);
+        for d in 0..head_dim {
+            assert_eq!(mean[d], d as f32 + 0.5, "mean d={d}");
+            assert_eq!(var[d], d as f32 * 2.0, "var d={d}");
+        }
+        // 기존 0~3 kind 무영향 (Key/Value 항상 공급, Scores/AttnWeights 미공급 None).
+        assert!(ctx.tensor(TensorKind::Key).is_some());
+        assert!(ctx.tensor(TensorKind::Value).is_some());
+        assert!(ctx.tensor(TensorKind::Scores).is_none());
+        assert!(ctx.tensor(TensorKind::AttnWeights).is_none());
+        // 미공급 ctx → QueryStats None.
+        let bare = KVStageCtx::new(&c, 0, None, None, None, None);
+        assert!(bare.tensor(TensorKind::QueryStats).is_none());
+    }
+
+    /// TQS-9: `tensor_kind_from_u32(4)==Some(QueryStats)`, `(5)==None` + 0~3 불변 (MQ-5 역매핑).
+    #[test]
+    fn tensor_kind_from_u32_query_stats() {
+        assert_eq!(tensor_kind_from_u32(0), Some(TensorKind::Key));
+        assert_eq!(tensor_kind_from_u32(1), Some(TensorKind::Value));
+        assert_eq!(tensor_kind_from_u32(2), Some(TensorKind::AttnWeights));
+        assert_eq!(tensor_kind_from_u32(3), Some(TensorKind::Scores));
+        assert_eq!(tensor_kind_from_u32(4), Some(TensorKind::QueryStats));
+        assert_eq!(tensor_kind_from_u32(5), None);
     }
 }

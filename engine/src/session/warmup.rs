@@ -82,6 +82,7 @@ pub fn run_warmup(
             workspace: None,
             logits_last_only: false,
             score_accumulator: None,
+            query_stats_accumulator: None,
             skip_config: None,
             importance_collector: None,
             cache_self_need_scores: false,

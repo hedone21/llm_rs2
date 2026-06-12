@@ -2030,7 +2030,7 @@ mod tests {
         let stage = D2OStage::new(mk_d2o_config());
         for cb in caches_b.iter_mut() {
             let plan = {
-                let ctx = KVStageCtx::new(cb, target, Some(imp), None, None);
+                let ctx = KVStageCtx::new(cb, target, Some(imp), None, None, None);
                 stage.plan(&ctx)
             };
             if let Some(p) = plan {
