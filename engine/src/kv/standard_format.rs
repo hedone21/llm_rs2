@@ -15,7 +15,9 @@ use anyhow::Result;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::format::{AttnDims, KVCacheFormat, SnapshotRestore, dequant_to_f32_tensor};
+use crate::format::{
+    AttnDims, KVCacheFormat, SelectiveRead, SnapshotRestore, dequant_to_f32_tensor,
+};
 use crate::kv::kv_cache::KVCache;
 use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
@@ -1319,6 +1321,225 @@ impl SnapshotRestore for StandardFormat {
     }
 }
 
+// ── SelectiveRead capability (ADR-0011 S3) ─────────────────────────────────
+
+/// `ReadGranularity::Page { page_size }` → token pos 목록 전개.
+///
+/// `page_indices` 의 각 page 를 `[page * page_size .. (page+1)*page_size)` 범위로 전개한 뒤
+/// 전체 `current_pos` 로 clamp 한다.
+fn page_indices_to_positions(
+    page_indices: &[usize],
+    page_size: usize,
+    current_pos: usize,
+) -> Vec<usize> {
+    let mut positions = Vec::with_capacity(page_indices.len() * page_size);
+    for &pi in page_indices {
+        let start = pi * page_size;
+        let end = (start + page_size).min(current_pos);
+        for pos in start..end {
+            positions.push(pos);
+        }
+    }
+    positions
+}
+
+/// 선택된 pos 목록(ascending)에서 **임시 KVCache** 를 gather 한다.
+///
+/// HeadMajor 레이아웃 전제 (CLAUDE.md Production = HeadMajor 고정).
+/// head_stride = capacity × head_dim (원소 단위, F32/F16) 또는 capacity × bps (블록 단위, Q4_0).
+///
+/// **Tier 1 단순 전략**: dtype 3종 처리.
+/// - F32/F16: 원소 단위 복사.
+/// - Q4_0: dequant → F32 gather (부분 select 는 블록 경계와 안 맞을 수 있어 안전 우선).
+///
+/// 반환: (gathered_k, gathered_v, n_selected) — F32 텐서, shape [1, 1, kv_heads, head_dim].
+/// gathered seq len = `select.len()` 이고, 결과 KVCache 의 `current_pos = select.len()`.
+fn gather_selected_kv(cache: &KVCache, select: &[usize]) -> Result<(Vec<f32>, Vec<f32>)> {
+    use crate::quant::{BlockQ4_0, QK4_0};
+    use half::f16;
+
+    let kv_heads = cache.kv_heads();
+    let head_dim = cache.head_dim();
+    let capacity = cache.capacity();
+    let n_sel = select.len();
+    let total = kv_heads * n_sel * head_dim;
+
+    let mut k_out = vec![0.0f32; total];
+    let mut v_out = vec![0.0f32; total];
+
+    match cache.kv_dtype() {
+        DType::F32 => {
+            let k_src = cache.k_buffer.as_slice::<f32>();
+            let v_src = cache.v_buffer.as_slice::<f32>();
+            for h in 0..kv_heads {
+                // HeadMajor: head_stride = capacity * head_dim elements
+                let src_head_off = h * capacity * head_dim;
+                let dst_head_off = h * n_sel * head_dim;
+                for (si, &pos) in select.iter().enumerate() {
+                    let src = src_head_off + pos * head_dim;
+                    let dst = dst_head_off + si * head_dim;
+                    k_out[dst..dst + head_dim].copy_from_slice(&k_src[src..src + head_dim]);
+                    v_out[dst..dst + head_dim].copy_from_slice(&v_src[src..src + head_dim]);
+                }
+            }
+        }
+        DType::F16 => {
+            let k_src = cache.k_buffer.as_slice::<f16>();
+            let v_src = cache.v_buffer.as_slice::<f16>();
+            for h in 0..kv_heads {
+                let src_head_off = h * capacity * head_dim;
+                let dst_head_off = h * n_sel * head_dim;
+                for (si, &pos) in select.iter().enumerate() {
+                    let src = src_head_off + pos * head_dim;
+                    let dst = dst_head_off + si * head_dim;
+                    for d in 0..head_dim {
+                        k_out[dst + d] = k_src[src + d].to_f32();
+                        v_out[dst + d] = v_src[src + d].to_f32();
+                    }
+                }
+            }
+        }
+        DType::Q4_0 => {
+            // Q4_0: dequant 경로 — 블록 경계 미정렬 pos select 를 안전하게 처리
+            let bps = head_dim / QK4_0; // blocks per position
+            let k_blocks = cache.k_buffer.as_slice::<BlockQ4_0>();
+            let v_blocks = cache.v_buffer.as_slice::<BlockQ4_0>();
+            for h in 0..kv_heads {
+                // HeadMajor block offset: h * capacity * bps
+                let src_head_block_off = h * capacity * bps;
+                let dst_head_off = h * n_sel * head_dim;
+                for (si, &pos) in select.iter().enumerate() {
+                    let src_block = src_head_block_off + pos * bps;
+                    let dst = dst_head_off + si * head_dim;
+                    // dequant K
+                    for bi in 0..bps {
+                        let mut tmp = [0.0f32; QK4_0];
+                        k_blocks[src_block + bi].dequantize(&mut tmp);
+                        k_out[dst + bi * QK4_0..dst + (bi + 1) * QK4_0].copy_from_slice(&tmp);
+                    }
+                    // dequant V
+                    for bi in 0..bps {
+                        let mut tmp = [0.0f32; QK4_0];
+                        v_blocks[src_block + bi].dequantize(&mut tmp);
+                        v_out[dst + bi * QK4_0..dst + (bi + 1) * QK4_0].copy_from_slice(&tmp);
+                    }
+                }
+            }
+        }
+        _ => {
+            anyhow::bail!("SelectiveRead: unsupported dtype {:?}", cache.kv_dtype());
+        }
+    }
+
+    Ok((k_out, v_out))
+}
+
+impl SelectiveRead for StandardFormat {
+    /// `select` 된 KV 위치만 읽는 attention (Tier 1 = gather + 기존 attention 재사용).
+    ///
+    /// **단순 우선, 성능 주장 없음** — select 된 토큰을 F32 임시 버퍼로 gather 한 뒤
+    /// `backend.attention_gen` 에 위임한다. select = 전체 토큰이면 `attention_into` 와 bit-identical
+    /// (F32/F16 경우). Q4_0 은 dequant gather 경로라 `attention_into` 와 동일 dequant 경유 비교 가능.
+    ///
+    /// **softmax 분모**: 선택된 부분집합 위에서 정규화됨 — Quest 의 의도된 근사(ADR-0011 D3).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_into_selected(
+        &self,
+        q: &Tensor,
+        backend: &dyn Backend,
+        out: &mut Tensor,
+        dims: AttnDims,
+        select: &[usize],
+        granularity: technique_api::ReadGranularity,
+        scores: Option<&mut [f32]>,
+    ) -> Result<()> {
+        use crate::memory::host::shared::SharedBuffer;
+
+        let guard = self.inner.lock().unwrap();
+        let cache = &guard.cache;
+        let current_pos = cache.current_pos();
+
+        if current_pos == 0 || select.is_empty() {
+            // 빈 캐시 또는 빈 select: out 을 0으로 채우고 반환
+            for x in out.as_mut_slice::<f32>() {
+                *x = 0.0;
+            }
+            return Ok(());
+        }
+
+        // Page 단위라면 pos 목록으로 전개
+        let expanded: Vec<usize>;
+        let positions: &[usize] = match granularity {
+            technique_api::ReadGranularity::Token => select,
+            technique_api::ReadGranularity::Page { page_size } => {
+                expanded = page_indices_to_positions(select, page_size as usize, current_pos);
+                &expanded
+            }
+        };
+
+        let n_sel = positions.len();
+        if n_sel == 0 {
+            for x in out.as_mut_slice::<f32>() {
+                *x = 0.0;
+            }
+            return Ok(());
+        }
+
+        let kv_heads = cache.kv_heads();
+        let head_dim = cache.head_dim();
+
+        // gather selected tokens into F32 temporary buffers
+        let (k_f32, v_f32) = gather_selected_kv(cache, positions)?;
+        drop(guard); // lock 해제 (attention_gen 호출 전)
+
+        // gather 결과를 byte Vec으로 변환
+        let k_bytes = {
+            let mut b = vec![0u8; k_f32.len() * 4];
+            unsafe {
+                std::ptr::copy_nonoverlapping(k_f32.as_ptr() as *const u8, b.as_mut_ptr(), b.len());
+            }
+            b
+        };
+        let v_bytes = {
+            let mut b = vec![0u8; v_f32.len() * 4];
+            unsafe {
+                std::ptr::copy_nonoverlapping(v_f32.as_ptr() as *const u8, b.as_mut_ptr(), b.len());
+            }
+            b
+        };
+
+        // 임시 Tensor 생성 (SeqMajor: [1, n_sel, kv_heads, head_dim] — gathered 텐서)
+        let k_buf = Arc::new(SharedBuffer::from_vec(k_bytes, DType::F32));
+        let v_buf = Arc::new(SharedBuffer::from_vec(v_bytes, DType::F32));
+        // gather 결과는 SeqMajor [1, n_sel, kv_heads, head_dim] 으로 배치됨.
+        // backend.attention_gen 은 SeqMajor 전제로 동작하므로 직접 위임 가능.
+        let backend_arc = q.backend().clone();
+        let k_tmp = Tensor::new(
+            Shape::new(vec![1, n_sel, kv_heads, head_dim]),
+            k_buf,
+            backend_arc.clone(),
+        );
+        let v_tmp = Tensor::new(
+            Shape::new(vec![1, n_sel, kv_heads, head_dim]),
+            v_buf,
+            backend_arc,
+        );
+
+        // 기존 attention_gen 재사용 (SeqMajor gathered 텐서)
+        backend.attention_gen(
+            q,
+            &k_tmp,
+            &v_tmp,
+            out,
+            dims.n_heads_q,
+            kv_heads,
+            head_dim,
+            n_sel,
+            scores,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2321,6 +2542,205 @@ mod tests {
         let o = out.as_slice::<f32>();
         for &x in o {
             assert!(x.abs() < 1e-4, "token0 is all zeros, got {x}");
+        }
+    }
+
+    // ── SelectiveRead capability 테스트 (ADR-0011 S3) ──
+
+    /// HeadMajor F32 KVCache: `KVCache::new_dynamic` + `with_layout(HeadMajor)`.
+    /// shape [1, kv_heads, capacity, head_dim] 전제.
+    fn make_head_major_cache(capacity: usize, kv_heads: usize, head_dim: usize) -> KVCache {
+        use crate::kv::kv_cache::KVLayout;
+        use crate::memory::Memory;
+        use crate::memory::galloc::Galloc;
+        let total = kv_heads * capacity * head_dim;
+        let k = f32_tensor(vec![1, kv_heads, capacity, head_dim], &vec![0.0f32; total]);
+        let v = f32_tensor(vec![1, kv_heads, capacity, head_dim], &vec![0.0f32; total]);
+        let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+        KVCache::new_dynamic(k, v, capacity, capacity, kv_heads, head_dim, mem)
+            .with_layout(KVLayout::HeadMajor)
+    }
+
+    /// HeadMajor KVCache 에 n_tokens 개의 구분 가능한 토큰을 직접 쓴다.
+    /// token i 의 K 값 = pos i + 0.1 * head, V 값 = pos i + 0.5 * head (head 구분용).
+    fn write_tokens_headmajor(cache: &mut KVCache, n_tokens: usize) {
+        let kv_heads = cache.kv_heads();
+        let head_dim = cache.head_dim();
+        let capacity = cache.capacity();
+        let k = cache.k_buffer.as_mut_slice::<f32>();
+        let v = cache.v_buffer.as_mut_slice::<f32>();
+        for h in 0..kv_heads {
+            let head_off = h * capacity * head_dim;
+            for pos in 0..n_tokens {
+                let off = head_off + pos * head_dim;
+                for d in 0..head_dim {
+                    k[off + d] = (pos as f32) + 0.1 * (h as f32);
+                    v[off + d] = (pos as f32) + 0.5 * (h as f32);
+                }
+            }
+        }
+        // current_pos 갱신
+        cache.current_pos = n_tokens;
+        cache.high_water_pos = n_tokens;
+    }
+
+    /// SelectiveRead: select=전체 토큰 → attention_into 와 bit-identical (F32/HeadMajor).
+    ///
+    /// ADR-0011 Tier 1 게이트: "전체 select == attention_into 와 bit-identical".
+    /// NOTE: attention_into 는 SeqMajor kv 경로를 거치고, selective_read 는 HeadMajor→gather→SeqMajor
+    /// 후 attention_gen 를 호출한다. 둘 다 최종적으로 동일 gathered F32 데이터로 attention_gen 를 타므로
+    /// bit-identical 이어야 한다.
+    #[test]
+    fn selective_read_full_select_bit_identical_f32() {
+        let kv_heads = 1;
+        let head_dim = 4;
+        let n_heads_q = 1;
+        let n_tokens = 4;
+
+        let mut cache_sel = make_head_major_cache(n_tokens + 4, kv_heads, head_dim);
+        write_tokens_headmajor(&mut cache_sel, n_tokens);
+
+        // attention_into 결과 기준
+        let fmt_ref = StandardFormat::new(0, {
+            let mut c = make_head_major_cache(n_tokens + 4, kv_heads, head_dim);
+            write_tokens_headmajor(&mut c, n_tokens);
+            c
+        });
+
+        let q_data = vec![1.0f32; n_heads_q * head_dim];
+        let q = f32_tensor(vec![1, 1, n_heads_q, head_dim], &q_data);
+        let backend = CpuBackend::new();
+        let dims = AttnDims {
+            n_heads_q,
+            window: None,
+        };
+
+        // 기준: attention_into (full)
+        let mut out_full = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.0; n_heads_q * head_dim],
+        );
+        fmt_ref
+            .attention_into(&q, &backend, &mut out_full, dims, None)
+            .unwrap();
+
+        // SelectiveRead: select = 전체 토큰 목록
+        let fmt_sel = StandardFormat::new(0, cache_sel);
+        let mut out_sel = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.0; n_heads_q * head_dim],
+        );
+        let select_all: Vec<usize> = (0..n_tokens).collect();
+        fmt_sel
+            .attention_into_selected(
+                &q,
+                &backend,
+                &mut out_sel,
+                dims,
+                &select_all,
+                technique_api::ReadGranularity::Token,
+                None,
+            )
+            .unwrap();
+
+        let o_full = out_full.as_slice::<f32>();
+        let o_sel = out_sel.as_slice::<f32>();
+        for (i, (&a, &b)) in o_full.iter().zip(o_sel.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "full[{i}]={a} != selected_full[{i}]={b}"
+            );
+        }
+    }
+
+    /// SelectiveRead: 부분 select(절반) → 에러 없이 완료 + out 유한값.
+    #[test]
+    fn selective_read_partial_select_completes_finite() {
+        let kv_heads = 1;
+        let head_dim = 4;
+        let n_heads_q = 1;
+        let n_tokens = 6;
+
+        let mut cache = make_head_major_cache(n_tokens + 4, kv_heads, head_dim);
+        write_tokens_headmajor(&mut cache, n_tokens);
+
+        let fmt = StandardFormat::new(0, cache);
+        let q = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.5f32; n_heads_q * head_dim],
+        );
+        let backend = CpuBackend::new();
+        let dims = AttnDims {
+            n_heads_q,
+            window: None,
+        };
+
+        // 앞 절반만 select
+        let half = n_tokens / 2;
+        let select_half: Vec<usize> = (0..half).collect();
+
+        let mut out = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.0; n_heads_q * head_dim],
+        );
+        fmt.attention_into_selected(
+            &q,
+            &backend,
+            &mut out,
+            dims,
+            &select_half,
+            technique_api::ReadGranularity::Token,
+            None,
+        )
+        .unwrap();
+
+        // 유한값 확인
+        for &x in out.as_slice::<f32>() {
+            assert!(x.is_finite(), "출력에 inf/nan 포함: {x}");
+        }
+    }
+
+    /// SelectiveRead Page 단위: page_size=2, select=[0,1] (2페이지=4토큰) → 부분 선택과 동일 범주.
+    #[test]
+    fn selective_read_page_granularity_completes() {
+        let kv_heads = 1;
+        let head_dim = 4;
+        let n_heads_q = 1;
+        let n_tokens = 8;
+
+        let mut cache = make_head_major_cache(n_tokens + 4, kv_heads, head_dim);
+        write_tokens_headmajor(&mut cache, n_tokens);
+
+        let fmt = StandardFormat::new(0, cache);
+        let q = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![1.0f32; n_heads_q * head_dim],
+        );
+        let backend = CpuBackend::new();
+        let dims = AttnDims {
+            n_heads_q,
+            window: None,
+        };
+
+        // page_size=2, page 0,1 = pos [0,1,2,3]
+        let page_select = vec![0usize, 1];
+        let mut out = f32_tensor(
+            vec![1, 1, n_heads_q, head_dim],
+            &vec![0.0; n_heads_q * head_dim],
+        );
+        fmt.attention_into_selected(
+            &q,
+            &backend,
+            &mut out,
+            dims,
+            &page_select,
+            technique_api::ReadGranularity::Page { page_size: 2 },
+            None,
+        )
+        .unwrap();
+
+        for &x in out.as_slice::<f32>() {
+            assert!(x.is_finite(), "Page 단위 출력에 inf/nan: {x}");
         }
     }
 }

@@ -1471,6 +1471,91 @@ macro_rules! register_kivi_attention_plugin {
     };
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// KV read-plan 표면 (ADR-0011) — "무엇을 읽을지"의 4번째 plan-returning plugin 표면.
+// KVCacheStage(eviction) / WeightStage(dispatch) / KVFormat 의 평행 거울 복제.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// KV 캐시 읽기의 **단위 추상**(ADR-0011 D2).
+///
+/// `Token` = `select` 가 KV 토큰 위치(pos)의 부분집합.
+/// `Page { page_size }` = `select` 가 page index 부분집합이고 각 page 는 `page_size` 토큰을 묶음.
+///
+/// NOTE: `Page { page_size }` 가 field 있는 variant 라 `#[repr(u32)]` 직접 불가. C-ABI 평탄화
+/// (`KVReadPlanAbi`)는 ADR-0011 §11 에서 `granularity: u32 + page_size: u32` 분리 필드로 정의 예정.
+/// 현재는 Rust-native enum 유지(구현 단계에서 .so 변환 불필요 — ADR-0011 §9 단계적 적용).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadGranularity {
+    /// 토큰 단위(pos 레벨) 선택.
+    Token,
+    /// 페이지 단위 선택. `page_size` 개 토큰이 한 페이지.
+    Page { page_size: u32 },
+}
+
+/// read stage 가 산출하는 읽기 계획(ADR-0011 D2).
+///
+/// `granularity` 가 단위를 정하고, `select` 가 ascending 부분집합(Token=pos, Page=page index)을 담는다.
+/// **`new_pos` 없음** — read plan 은 캐시를 변형하지 않는다(eviction plan 과 결정적 차이, D2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct KVReadPlan {
+    /// 읽기 단위.
+    pub granularity: ReadGranularity,
+    /// 읽을 토큰 위치 / 페이지 인덱스 목록(ascending). 비면 전체 읽기와 같은 의미(엔진 처리).
+    pub select: Vec<usize>,
+}
+
+/// KV read stage 의 plan-returning trait(ADR-0011 D1) — "무엇을 읽을지"를 결정한다.
+///
+/// `None` = 이번 layer 는 full read(현행 동작, happy path 비용 0). `ctx` 는 기존 `StageCtx` 재사용
+/// (ADR-0011 Amendment A1.1d — read stage 전용 ctx 신설 불요). plugin 은 `tensor(Key)`/
+/// `tensor(QueryStats)` 로 page 메타를 incremental 갱신한다(D5). plan 은 *근사 힌트*이지 정확성
+/// 계약이 아니다(폴백=full read = 정확, 근사 가속 = opt-in, ADR-0011 D3/D4).
+///
+/// **INV-HOTPATH-DISPATCH**: 발화 시점 = layer-tier(attention 직전, 매 layer 1회). happy path(부재)는
+/// `Option::is_none()` 1회로 short-circuit — ADR-0011 Amendment A1.2.
+pub trait KVReadStage: Send + Sync {
+    /// 기법 이름 (CLI `--read-stage <name>` 와 매칭, 로깅용). 슬라이스 내 유일해야 한다.
+    fn name(&self) -> &str;
+
+    /// layer i attention 직전에 호출 — "layer i 에서 읽을 KV" 계획 산출.
+    /// `None` = full read(현행 보존). plugin 은 ctx 로 page 메타를 incremental 갱신한다.
+    fn read_plan(&self, ctx: &dyn StageCtx) -> Option<KVReadPlan>;
+}
+
+/// read stage 의 CLI-파생 정적 구성(KV `StageParams` 거울). 현재는 빌트인 0개라 필드 없음.
+/// 첫 빌트인(Quest) 구현 시 page_size 등 추가 예정.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReadStageParams {
+    /// placeholder — Quest 구현 시 `page_size` 등으로 확장.
+    _reserved: u8,
+}
+
+/// 한 read stage 기법의 등록 항목(ADR-0011 D1, `KVCacheStageReg` 거울).
+pub struct KVReadStageReg {
+    /// CLI `--read-stage` 이름. 슬라이스 내 유일해야 한다.
+    pub name: &'static str,
+    /// 파라미터로부터 기법 인스턴스를 만드는 팩토리.
+    pub make: fn(ReadStageParams) -> Box<dyn KVReadStage>,
+}
+
+/// 전역 read stage 등록 슬라이스 — stage 축의 **4번째 평행 linkme registry**(ADR-0011 D1).
+///
+/// **빌트인 0개로 시작** — read stage 부재 시 엔진은 항상 full read(현행 100% 보존, D5).
+/// 첫 빌트인은 Quest(S4/S5 에서 등록 예정).
+#[distributed_slice]
+pub static KV_READ_STAGES: [KVReadStageReg] = [..];
+
+/// 이름으로 등록된 read stage 를 찾는다 (엔진 construction 시 / CLI 파싱 시 사용).
+pub fn find_read_stage(name: &str) -> Option<&'static KVReadStageReg> {
+    KV_READ_STAGES.iter().find(|r| r.name == name)
+}
+
+/// 등록된 모든 read stage 이름 (self-test / 진단용).
+pub fn registered_read_names() -> Vec<&'static str> {
+    KV_READ_STAGES.iter().map(|r| r.name).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2165,5 +2250,46 @@ mod tests {
     #[test]
     fn registered_backend_capability_names_contains_dummy() {
         assert!(registered_backend_capability_names().contains(&"dummy_cap"));
+    }
+
+    // ── KV read stage registry (ADR-0011) ──
+
+    /// 빌트인 0개로 시작 — `registered_read_names()` 는 빈 목록, `find_read_stage("nonexistent")` = None.
+    #[test]
+    fn read_stage_registry_starts_empty() {
+        // 빌트인 0개 게이트 (ADR-0011 D1).
+        assert!(
+            !registered_read_names().contains(&"nonexistent"),
+            "nonexistent 는 등록되지 않아야 한다"
+        );
+        assert!(
+            find_read_stage("nonexistent").is_none(),
+            "find_read_stage(\"nonexistent\") 는 None 이어야 한다"
+        );
+    }
+
+    /// `ReadGranularity` variant 기본 동작 확인.
+    #[test]
+    fn read_granularity_variants() {
+        let t = ReadGranularity::Token;
+        let p = ReadGranularity::Page { page_size: 16 };
+        assert_eq!(t, ReadGranularity::Token);
+        assert_ne!(t, p);
+        if let ReadGranularity::Page { page_size } = p {
+            assert_eq!(page_size, 16);
+        } else {
+            panic!("Page variant 아님");
+        }
+    }
+
+    /// `KVReadPlan` 생성 및 필드 확인.
+    #[test]
+    fn kv_read_plan_fields() {
+        let plan = KVReadPlan {
+            granularity: ReadGranularity::Token,
+            select: vec![0, 3, 7],
+        };
+        assert_eq!(plan.granularity, ReadGranularity::Token);
+        assert_eq!(plan.select, vec![0usize, 3, 7]);
     }
 }
