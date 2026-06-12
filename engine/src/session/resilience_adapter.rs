@@ -34,6 +34,11 @@ pub struct ResilienceAdapter {
     /// AB-2 §5.7.6: heartbeat kv_dtype 를 query 할 KIVI concrete handle (layer-0). `None` 이면
     /// KIVI 미배선(Standard/Offload) → `kv_dtype` 는 default `""` 유지(기존 동작 불변 — 회귀 금지).
     kivi_handle: Option<Arc<KIVIFormat>>,
+    /// 설정된 eviction policy 의 canonical 이름 (예: "h2o"). 빈 문자열이면 heartbeat 가
+    /// "none" 으로 보고해 `compute_available_actions` 에서 kv.evict_* 가 빠진다 —
+    /// Capability(12 액션) 를 manager merge 가 heartbeat 의 non-empty 3-액션 리스트로
+    /// 덮어써 DPP 후보에서 kv eviction 이 전멸하는 결함의 원인 (2026-06-12 S25 적발).
+    eviction_policy: String,
 }
 
 impl ResilienceAdapter {
@@ -42,7 +47,15 @@ impl ResilienceAdapter {
             executor,
             kv_handle: None,
             kivi_handle: None,
+            eviction_policy: String::new(),
         }
+    }
+
+    /// 설정된 eviction policy 이름을 heartbeat `KVSnapshot` 에 전파한다.
+    /// Capability 산출(`resilience_init.rs`)과 동일 소스(`args.eviction_policy()`)를 써야
+    /// heartbeat available_actions 가 Capability 와 일관된다.
+    pub fn set_eviction_policy(&mut self, policy: &str) {
+        self.eviction_policy = policy.to_string();
     }
 
     /// β-4: heartbeat snapshot query 용 held-handle 주입(§5.2.1 (가) — kv_pos_handle 과 동일 패턴).
@@ -98,9 +111,15 @@ impl ResilienceAdapter {
                     .as_ref()
                     .map(|k| bits_to_kv_dtype(k.current_bits()))
                     .unwrap_or_default(),
+                eviction_policy: self.eviction_policy.clone(),
                 ..KVSnapshot::default()
             },
-            None => KVSnapshot::default(),
+            // handle 미주입이어도 eviction policy 는 config 차원 사실 — heartbeat
+            // available_actions 가 kv.evict_* 를 잃지 않도록 항상 전파한다.
+            None => KVSnapshot {
+                eviction_policy: self.eviction_policy.clone(),
+                ..KVSnapshot::default()
+            },
         }
     }
 }

@@ -207,7 +207,13 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
     // ResilienceAdapter 생성. `--no-resilience` (effective enable_resilience=false)
     // 시 None. transport 연결 실패는 Err 전파 — graceful fail, panic 없음.
     let resilience: Option<ResilienceAdapter> = if args.enable_resilience {
-        build_command_executor(&args, &model)?.map(ResilienceAdapter::new)
+        build_command_executor(&args, &model)?.map(|exec| {
+            let mut adapter = ResilienceAdapter::new(exec);
+            // heartbeat available_actions 가 Capability 와 동일 조건으로 산출되도록
+            // 설정된 eviction policy 를 전파한다 (미전파 시 "none" → kv.evict_* 탈락).
+            adapter.set_eviction_policy(args.eviction_policy());
+            adapter
+        })
     } else {
         None
     };
@@ -479,7 +485,12 @@ pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
     };
 
     let resilience: Option<ResilienceAdapter> = if args.enable_resilience {
-        build_command_executor(&args, &model)?.map(ResilienceAdapter::new)
+        build_command_executor(&args, &model)?.map(|exec| {
+            let mut adapter = ResilienceAdapter::new(exec);
+            // StandardHappyCtx 경로와 동일 — heartbeat available_actions 일관성.
+            adapter.set_eviction_policy(args.eviction_policy());
+            adapter
+        })
     } else {
         None
     };

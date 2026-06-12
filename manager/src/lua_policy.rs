@@ -3019,4 +3019,97 @@ mod tests {
         policy.qcf_pending_at = Some(policy.clock.now());
         assert!(!policy.should_request_qcf());
     }
+
+    /// verify `signal_memory_critical` 재현: 실 policy_default.lua + fixture relief prior +
+    /// 정규화 수식의 S25 실측 raw QCF 분포에서, memory 신호의 2-step QCF directive 가
+    /// memory-relieving kv eviction 을 선택해야 한다 (relief 0 인 LayerSkip/SwitchHw 가
+    /// qcf_cost 미보고(cache miss=0) 만으로 이기면 안 된다).
+    #[test]
+    fn test_memory_critical_realistic_qcf_selects_kv_evict() {
+        let mut config = AdaptationConfig::default();
+        config.qcf_penalty_weight = 0.5;
+        // verify/fixtures/manager_config_external_only.toml [adaptation.default_relief] 동일
+        let relief: [(&str, [f32; 6]); 10] = [
+            ("switch_hw", [0.5, -0.3, 0.0, 0.3, -0.1, 0.0]),
+            ("kv.evict_h2o", [0.1, 0.0, 0.4, 0.1, 0.0, 0.0]),
+            ("kv.evict_sliding", [0.1, 0.0, 0.3, 0.1, 0.0, 0.0]),
+            ("kv.evict_streaming", [0.1, 0.0, 0.3, 0.1, 0.0, 0.0]),
+            ("throttle", [0.0, 0.3, 0.0, 0.2, -0.2, 0.0]),
+            ("set_target_tbt", [0.0, 0.2, 0.0, 0.1, -0.1, 0.0]),
+            ("weight.skip", [0.2, 0.1, 0.0, 0.1, -0.1, 0.0]),
+            ("kv.quant_dynamic", [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]),
+            ("kv.merge_d2o", [0.1, 0.0, 0.3, 0.1, 0.0, 0.0]),
+            ("set_partition_ratio", [0.3, -0.2, 0.0, 0.1, 0.0, 0.0]),
+        ];
+        for (k, v) in relief {
+            config.default_relief.insert(k.to_string(), v.to_vec());
+        }
+
+        let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/policy_default.lua");
+        let mut policy = LuaPolicy::with_system_clock(script_path, config).unwrap();
+
+        // 엔진 capability (S25 실측 로그와 동일 액션 목록)
+        policy.update_engine_state(&EngineMessage::Capability(llm_shared::EngineCapability {
+            available_devices: vec!["cpu".into(), "opencl".into()],
+            active_device: "opencl".into(),
+            max_kv_tokens: 1536,
+            bytes_per_kv_token: 1024,
+            num_layers: 28,
+            available_actions: vec![
+                "throttle".into(),
+                "switch_hw".into(),
+                "weight.skip".into(),
+                "kv.evict_h2o".into(),
+                "kv.evict_sliding".into(),
+                "kv.evict_streaming".into(),
+                "kv.merge_d2o".into(),
+                "set_target_tbt".into(),
+                "suspend".into(),
+                "reject_new".into(),
+                "limit_tokens".into(),
+                "restore_defaults".into(),
+            ],
+        }));
+
+        // verify 시나리오와 동일 신호: available 30MB / total 8GB → p.memory ≈ 0.996
+        let signal = SystemSignal::MemoryPressure {
+            level: llm_shared::Level::Critical,
+            available_bytes: 30_000_000,
+            total_bytes: 8_000_000_000,
+            reclaim_target_bytes: 100_000_000,
+        };
+        let d1 = policy.process_signal(&signal).expect("step-1 directive");
+        assert!(
+            matches!(d1.commands[0], EngineCommand::RequestQcf),
+            "step-1 은 RequestQcf 여야 함, got {:?}",
+            d1.commands
+        );
+
+        // S25 실측 분포 중앙값 (qcf_kv_distribution_s25_2026_06_12, short 레짐)
+        let mut estimates = std::collections::HashMap::new();
+        estimates.insert("kv.evict_h2o".to_string(), 0.14f32);
+        estimates.insert("kv.evict_sliding".to_string(), 0.33f32);
+        estimates.insert("kv.merge_d2o".to_string(), 0.20f32);
+        let d2 = policy
+            .complete_qcf_selection(&llm_shared::QcfEstimate {
+                estimates,
+                layer_swap: None,
+            })
+            .expect("step-2 directive");
+
+        eprintln!("[repro] step-2 commands = {:?}", d2.commands);
+        let has_kv_evict = d2.commands.iter().any(|c| {
+            matches!(
+                c,
+                EngineCommand::KvEvictH2o { .. }
+                    | EngineCommand::KvEvictSliding { .. }
+                    | EngineCommand::KvStreaming { .. }
+            )
+        });
+        assert!(
+            has_kv_evict,
+            "memory critical 에서 kv eviction 이 선택돼야 함, got {:?}",
+            d2.commands
+        );
+    }
 }
