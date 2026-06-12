@@ -42,3 +42,4 @@ ADR 는 다음 결정 유형에서 작성 의무:
 | [ADR-0008](0008-opaque-kv-production-integration.md) | opaque KV format production 통합 — `KVCache` 흡수 + `is_q4`→descriptor-keyed (실추론 grow/eviction/D2O) | Accepted | 2026-06-08 |
 | [ADR-0009](0009-gate-c-stage-dlopen-plugin.md) | GATE-C — Stage 축 `.so` cdylib dlopen plugin 승격 (북극성 zero-compile install, ADR-0007 D6 해결) | Accepted (D2/D6 부분 supersede by 0010) | 2026-06-09 |
 | [ADR-0010](0010-gate-c-multi-vtable-bundle-abi.md) | GATE-C 멀티-vtable bundle ABI — 한 `.so` 다수 capability + cross-axis open-once dispatch (ADR-0009 D2 supersede + production 배선 해결) | Proposed | 2026-06-09 |
+| [ADR-0011](0011-kv-read-plan-surface.md) | KV read-plan 표면 — `KVReadStage` plan-returning trait ("무엇을 읽을지" 4번째 plugin 표면; Quest 선택 읽기 + KVSwap prefetch 통합, format `attention_into_selected` capability opt-in, **구현 보류=리팩토링 머지 후**) | Proposed | 2026-06-12 |

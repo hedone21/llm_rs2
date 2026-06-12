@@ -867,6 +867,7 @@
 > **출처**: 2026-06-10 설계 견고성 검토 — 최신 연구(2024–2026) ~70개 기법을 4갈래 병렬 조사(merge / eviction·budget / 표현 변경 / 패러다임·시스템)하여 3축 플러그인 설계(Stage ⊥ Format ⊥ Backend-capability)에 대조. 판정 등급: **A**(현 플러그인으로 가능, ~17) / **B**(어휘 확장·단순 op 추가, ~22) / **C**(복잡한 추가·설계 변경, ~30 — 이 중 ~12는 모델 아키텍처·학습·모달리티라 어느 엔진이든 코어 작업인 "범위 밖").
 > **결론**: plan-returning 골격과 3축 직교는 견고 — 식별된 어떤 갭도 "stage 직접 쓰기 권한"으로는 풀리지 않음(입력 부재/어휘 부족/구조 부재가 원인). 갭은 IR 어휘 3건(항목 1–3) + 표면 2건(항목 4–5) + 트리거 보류 3군집(항목 6–8)으로 수렴. 항목 1–5 수행 시 다룰 수 있는 영역(57개) 기준 표현 커버리지 **~40% → ~80%**, 잔여는 전부 개봉 조건이 명시된 의도적 보류.
 > **착수 순서 (사용자 결정 2026-06-10)**: 0(검증 선행) → 1–3(어휘 확장) → 4(read-plan ADR) → 5(persistence — **결이 달라 마지막**). 6–9는 트리거 개봉.
+> **진행 (2026-06-12)**: 0 RESOLVED(4종 게이트 종결) · 1 보류(Demote RED) · 3 RESOLVED(QueryStats 구현 완료) · **4 RESOLVED(ADR-0011 확정, 구현=4-impl 리팩토링 머지 후)**. 항목 3+4 = "KV 구조 확정" 게이트 → 직후 사용자 별도 워크트리 대형 리팩토링 병렬 시작. 항목 2·4-impl·5 는 리팩토링 머지 후 착수(KV 표면 무변경 보장).
 
 ### [RESOLVED 2026-06-12] 0. 검증 선행 — 확장 0개로 가능한 1B 실측 (4종: 3 + 항목 1 게이트)
 - **Status**: **RESOLVED (2026-06-12)** / **Sprint**: completed / **Dependencies**: 없음
@@ -906,18 +907,25 @@
 - **해금**: Expected Attention, LU-KV·MixKVQ 부분. 항목 4(read-plan)의 Quest류 page 선택 신호로 재사용(시너지).
 - **Acceptance Criteria**: TensorKind variant + 엔진 누적 배선 + host 통계 정확성 테스트 + 기존 기법(`tensor()` 소비자) 무영향.
 
-### [P2] 4. read-plan 표면 ADR — "무엇을 읽을지"의 4번째 plugin 표면
-- **Status**: **진행 중 (Sprint 2026-06-12, ADR 단계)** — ADR 작성까지가 본 항목, **구현 착수 금지**(병렬 리팩토링 의미적 충돌 예방) / **Sprint**: current / **Dependencies**: 항목 3 선행(P3 완료 후 P4 착수)
-- **스프린트 (2026-06-12)**: `.agent/todos/sprint_kv_roadmap_item34_2026_06_12.md` P4. 항목 3 구현 + 본 ADR 확정 = "KV 구조 확정" 게이트 → 직후 사용자 별도 워크트리 대형 리팩토링 병렬 시작. read-plan **구현은 리팩토링 머지 후** 별도 항목으로 재등록(ADR 산출물). 완료 게이트 = ADR 신규 1건(대안 ≥2 + status quo + grill 통과) + 구현 단계 분해 backlog 재등록 + **구현 코드 0줄**.
-- **D4 비차단 확인 (2026-06-12)**: 인프라 항목이라 항목 0 기법 게이트 RED와 **무관하게 진행**. 항목 3(QueryStats) 선행 권장 → 항목 3+4 묶음이 차기 착수 1순위.
-- **★구현 시점 결정 (2026-06-12 사용자)**: 항목 3 구현 + 본 항목 **ADR 확정**이 "KV 구조 확정" 게이트 — 직후 사용자가 별도 워크트리에서 대형 리팩토링을 병렬 시작할 계획. **read-plan 구현은 리팩토링 머지 후** 별도 등록 항목으로 (ADR-선행 = 미래 표면을 문서 제약으로 고정해 의미적 충돌 예방). 같은 이유로 항목 2·5도 리팩토링 머지 후 권고. 진입: `handoff_kv_roadmap_item34_entry_2026_06_12.md`.
-- **Description**: `attention_into`는 캐시 전체 읽기를 가정하고 selection 인자가 없음 — 선택적 읽기(Quest류)와 예측 prefetch(InfiniGen/KVSwap류)가 통째로 차단. `KVCacheStage`와 대칭인 plan-returning trait `KVReadStage::read_plan(ctx) → KVReadPlan{granularity, select}`.
-  - **핵심 통찰**: layer i−1에서 산출한 read plan = Quest에겐 읽기 마스크, KVSwap에겐 layer i의 prefetch 목록 — 표면 하나로 두 군집(~9건) 동시 해소
-  - format은 `attention_into_selected` capability **opt-in**(미지원 format은 full read 폴백) → 합성성 보존. "Quest를 전용 format에 매장"은 format 축 안에서 M×N 재발(Quest-on-KIVI마다 신규 format)이라 표면 신설이 정공
-  - 설계 쟁점: page 메타데이터(K min/max) 유지 주체 — 1차안은 read stage가 `tensor(Key)`로 자기 상태 incremental 갱신(코어 무수정)
-- **해금**: Quest(ICML'24 2406.10774), InfLLM, HISA, BLASST, shadowAttn(2508.16703 — 모바일 NPU, prefill 전용), InfiniGen(OSDI'24), KVSwap(2511.11907) prefetch.
-- **실익 정직 평가**: 1B/2048 decode는 memory-bound라 제한적 — 가치는 prefill TTFT + 8B/디스크 offload 토대 + 논문 기여("4번째 표면도 동일 plan-returning 문법으로 가산" 확장성 실증).
-- **Acceptance Criteria**: ADR 신규 1건(대안 비교 + grill 통과) + 구현 단계 분해를 본 백로그에 재등록.
+### [RESOLVED 2026-06-12] 4. read-plan 표면 ADR — "무엇을 읽을지"의 4번째 plugin 표면
+- **Status**: **RESOLVED (ADR-0011 확정, 2026-06-12)** — ADR 작성이 본 항목의 전부, **구현 코드 0줄**(병렬 리팩토링 의미적 충돌 예방). 구현은 신규 항목 "4-impl"(아래)로 재등록 / **Sprint**: completed / **Dependencies**: 항목 3 선행(P3 완료 후 착수 — 충족)
+- **★ADR-0011 확정 (2026-06-12, Architect P4)**: `docs/adr/0011-kv-read-plan-surface.md` (Status=Proposed, 구현 보류). 표면 = `KVReadStage::read_plan(ctx) -> Option<KVReadPlan{granularity, select}>`(`KVCacheStage`/`WeightStage` 거울 = 4번째 plan-returning 형제, `KV_READ_STAGES` 평행 registry). 6 설계 결정 고정 — D2 `KVReadPlan{ReadGranularity(Token/Page), select:ascending Vec<usize>}`(new_pos 없음=비변형) / D3 발화=layer i 진입 전, plan 이중 해석(Quest 마스크 ⊥ KVSwap prefetch)은 소비자-주도 / D4 format `attention_into_selected`=capability opt-in(미지원=full read 폴백, soft constraint=근사 가속이지 정확성 계약 아님) / D5 page 메타(K min/max) 유지=read stage 자신이 `tensor(Key)`+`tensor(QueryStats)`로 incremental(코어 무수정, 항목 3 시너지) / §6 read⊥cache plan 직교(read 비변형이라 race 없음, eviction 후 read stage 메타 재구축 책임) / §11 C-ABI forward-compat(AbiStageCtx 재사용 + ADR-0010 capability 슬롯). 대안 6종 기각(status quo / Quest-format 매장=M×N재발 / 2표면 분리 / 정확성 계약화 / 코어 page 메타 / step-tier 1회). 최대 리스크 R1 layer-tier hot-path(RPN 378) → read stage 부재 시 분기 1회(INV-147 정신)+TBT Δ≤+3% 게이트(구현 시). Spec Triage=spec 무관(arch-only, 신규 INV 불요).
+- **원 스프린트 (아카이브)**: `.agent/todos/sprint_kv_roadmap_item34_2026_06_12.md` P4. 항목 3 구현 + 본 ADR 확정 = "KV 구조 확정" 게이트 → 직후 사용자 별도 워크트리 대형 리팩토링 병렬 시작. 완료 게이트(충족) = ADR 신규 1건(대안 ≥2 + status quo + grill 통과) + 구현 단계 분해 backlog 재등록(아래 4-impl) + **구현 코드 0줄**.
+- **해금 (ADR §1, ~9건)**: Quest(ICML'24 2406.10774), InfLLM, HISA, BLASST, shadowAttn(2508.16703 — 모바일 NPU prefill 전용), InfiniGen(OSDI'24), KVSwap(2511.11907) prefetch.
+- **실익 정직 평가 (ADR §10)**: 1B/2048 decode는 memory-bound라 **순이득 기대 낮음**(항목 0 1B 무가치 교훈과 동결) — 가치는 prefill TTFT + 8B/디스크 offload 토대 + 논문 기여("4번째 표면도 동일 plan-returning 문법으로 가산" 확장성 실증). **과대 포장 금지 못박음**: 1B 성능 주장은 8B 측정 전까지 하지 않는다.
+
+### [구현 보류 — 리팩토링 머지 후] 4-impl. read-plan 표면 구현 — `KVReadStage` 배선 (ADR-0011 산출)
+- **Status**: **구현 보류 (리팩토링 머지 후 착수 — 사용자 게이트 U2)** / **Sprint**: backlog / **Dependencies**: ADR-0011 확정(✅ 2026-06-12) + **사용자 대형 리팩토링 머지 완료**(미충족 — 게이트). 항목 3(QueryStats, ✅) 신호 공급원 선행 충족.
+- **★착수 게이트 (2026-06-12 사용자 결정)**: ADR-선행 = 미래 표면을 문서 제약으로 고정해 병렬 리팩토링과 의미적 충돌 예방. **리팩토링이 `attention_into` 주변을 재설계하므로 머지 전 구현 착수 금지**(ADR §8 Premortem #3 — read plan→capability→폴백 의미 계약을 ADR 이 지키되, 구현은 리팩토링 결과 위에 올림). 같은 이유 항목 2(K/V 비대칭 merge)·5(persistence)도 머지 후.
+- **구현 단계 분해 (ADR-0011 D1~D5 기준, 머지 후 재-triage 필요)**:
+  - **S1 technique-api 표면**: `KVReadStage` trait + `KVReadPlan{ReadGranularity(#[repr(u32)] Token/Page), select:Vec<usize>}` + `KVReadStageReg`/`KV_READ_STAGES`(linkme) + `find_read_stage` + `ensure_builtin_read_stages_registered` self-test. `ReadStageCtx` = 기존 `StageCtx` 재사용(ADR §11 — 신설 불요). 검증: 빌드 GREEN + registry 등록.
+  - **S2 엔진 executor seam (★hot-path 핵심)**: layer 경계에서 `read_plan` 호출 + plan 라우팅(활성 format `SelectiveRead` → selective / offload → prefetch 큐 / 미지원 → full read 폴백). **read stage 부재 시 분기 1회**(`Option::is_none()`, INV-147 정신). hot-path dispatch 전략(정적 vs dyn)은 **별도 amendment 로 고정**(ADR R1 RPN 378). 검증: α-K frozen byte-identical(read stage 부재) + TBT Δ≤+3%(ADR-0005 §8 게이트).
+  - **S3 format capability**: `SelectiveRead{attention_into_selected(q, ..., select, granularity, scores)}` capability-handle. 첫 구현 = Standard format. 미지원 자동 full read 폴백(코드 0). 검증: 폴백 경로 bit-identical(full read).
+  - **S4 page 메타 유지**: read stage `&self` Mutex 에 page K min/max 보유 + `read_plan` 마다 `tensor(Key)`/`tensor(QueryStats)`(항목 3) incremental 갱신. eviction 후 메타 재구축(ADR §6 — page-id 안정성 R3 구현 시 확정: page-aligned eviction or content-derived page-id). 검증: eviction 후 read plan 정합.
+  - **S5 첫 빌트인 = Quest**: host 테스트(value-aware 실행) → CLI `--read-stage quest` opt-in(ADR-0004 §8 CAOTE 배선 패턴). 폴백 시 stderr 1회 경고(ADR §8 Premortem #2). 검증: PPL/EMR 근사 일치(정확 일치 아님 — 근사 가속) + 폴백 경고.
+  - **S6 offload prefetch 정합**: 기존 `OffloadKVCache`(SeqMajor) + `--max-prefetch-depth` 와 read plan 을 prefetch *목록 공급원*으로 연결(KVSwap). 8B/offload 측정 — **1B 성능 주장 금지**(ADR §10).
+- **검증 게이트 (전체)**: α-K frozen byte-identical(read stage 부재 happy path) + 폴백 bit-identical(미지원 format) + read 활성 근사 일치+품질 메트릭 + TBT Δ≤+3% + lib N/0 + clippy --workspace clean + 기존 .so dlopen 호환(ADR §11). **arch 컴포넌트 매핑 신설**(executor seam + capability + page-meta 흐름 — ADR-0004 §10 M-Q 의 `arch/kv_query_stats.md` 타이밍 규율).
+- **참고**: ADR-0011 이 표면 SSOT. 머지 후 리팩토링이 바꾼 `attention_into` 시그니처 위에서 S2/S3 를 재-triage(ADR §8 #3 — 의미 계약은 ADR 이 보존, 구현 디테일만 이동).
 
 ### [P3] 5. 세션 KV persistence (prefix cache) — ★사용자 결정: 결이 달라 마지막 수행
 - **Status**: TODO / **Sprint**: backlog / **Dependencies**: 항목 1–4와 독립(IR/TensorKind 무접촉). 착수 순서만 마지막(2026-06-10 결정 — plugin 표면이 아니라 엔진 lifecycle 기능이라 결이 다름).
