@@ -952,16 +952,29 @@ PressureStageConfig {
 
 ---
 
-#### 3.9.2 Handler 체인 (6종) [ENG-ALG-092]
+#### 3.9.2 Handler 체인 [ENG-ALG-092]
 
-**[ENG-ALG-092]** CachePressurePipeline은 6종 Handler를 지원한다. *(MUST)*
+**[ENG-ALG-092]** CachePressurePipeline은 다음 `CachePressureHandler` 구현을 stage로 등록할 수 있다. *(MUST)*
 
 | Handler | 구현 상태 | 동작 | ActionResult |
 |---------|----------|------|-------------|
-| EvictionHandler | **완료** | EvictionPolicy 래핑, QCF proxy 수집 통합 | `Evicted { tokens_removed, new_pos }` |
-| D2OHandler | **완료** | H2O eviction + cosine merge, EMA threshold | `Evicted { tokens_removed, new_pos }` |
-| SwapHandler | **완료** | LRU offload via prune_prefix | `Swapped { tokens_swapped }` |
-| QuantizeHandler | **완료** | pressure → target bits 매핑 (Warning=8, Critical=4, Emergency=2). KIVI 외부 처리 | `NoOp` (KIVI는 외부) |
+| EvictionHandler | **완료 (등록)** | EvictionPolicy 래핑, QCF proxy 수집 통합 | `Evicted { tokens_removed, new_pos }` |
+| D2OHandler | **완료 (등록)** | H2O eviction + cosine merge, EMA threshold | `Evicted { tokens_removed, new_pos }` |
+| SwapHandler | **완료 (등록)** | LRU offload via prune_prefix | `Swapped { tokens_swapped }` |
+
+> `WeightSwapHandler`도 `CachePressureHandler`를 구현하나 KV 핸들러와 독립적으로 등록·dispatch된다 → ENG-ALG-214 별도 명세.
+
+**KIVI quantization bit 매핑 (free function)**: KV 정밀도 강하는 KIVI 캐시를 사용하며 표준 `KVCache` 핸들러로는 불가하다. pressure level → KIVI target bits 매핑은 자유 함수 `target_bits_for_pressure(level) -> Option<u8>`로 제공한다. *(MUST)*
+
+```
+target_bits_for_pressure(level) =
+    Normal    -> None      // 전이 없음
+    Warning   -> Some(8)
+    Critical  -> Some(4)
+    Emergency -> Some(2)
+```
+
+> **참고 (non-normative)**: 이 매핑을 소비하는 production 호출지는 현재 없다(KIVI dynamic transition 미배선). spec ID(ENG-ALG-092)가 이 매핑을 MUST로 고정하므로 자유 함수로 보존하며, generate/decode 루프가 KIVI bit transition을 배선할 때 직접 호출하는 진입점이다.
 
 **HandlerContext**: 각 handler에 전달되는 컨텍스트. 상세 필드 정의는 `33-engine-data.md` ENG-DAT-080 참조.
 
@@ -972,12 +985,7 @@ PressureStageConfig {
 [Critical] EvictionHandler(ratio=0.5)
 ```
 
-또는:
-
-```
-[Warning]  QuantizeHandler
-[Critical] EvictionHandler(ratio=0.7)
-```
+> **개정 이력**: 2026-06-12 — spec-impl divergence 해소. (1) 구 제목 "(6종)"은 실제 등록 핸들러 3종(+WeightSwap은 ENG-ALG-214 별도)과 불일치 — Compress/Merge/Sparse 핸들러는 부재(미구현). (2) 구 표의 `QuantizeHandler`는 어느 pipeline에도 등록되지 않는 NoOp stub trait impl이었다. struct + trait impl을 삭제하고, 유효한 부분인 `target_bits_for_pressure` pressure→bits 매핑만 자유 함수로 강등 보존(ID 유지).
 
 ---
 

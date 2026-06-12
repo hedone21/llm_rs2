@@ -1,13 +1,13 @@
 //! ENG-ALG-060 ~ ENG-ALG-092: DegradationEstimator + CachePressurePipeline
 //!
 //! PiecewiseLinear 함수, DegradationEstimator d_max clamp / EMA correction,
-//! CachePressurePipeline 실행 로직, QuantizeHandler / SwapHandler / EvictionHandler.
+//! CachePressurePipeline 실행 로직, target_bits_for_pressure / SwapHandler / EvictionHandler.
 
 // `max_seq * 1 * 4 * 4` / `100 * 1 * 4 * 4` 계산식은 코드 가독성을 위해
 // kv_heads=1, head_dim=4, bytes_per_elem=4 항목을 명시적으로 표기함.
 #![allow(clippy::identity_op)]
 
-use llm_rs2::kv::quantize_handler::QuantizeHandler;
+use llm_rs2::kv::quantize_handler::target_bits_for_pressure;
 use llm_rs2::qcf::QcfMetric;
 use llm_rs2::qcf::estimator::{DegradationEstimator, PiecewiseLinear};
 use llm_shared::Level as PressureLevel;
@@ -326,39 +326,27 @@ fn test_eng_alg_091_c08_pipeline_ordering_sorts_by_level() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ENG-ALG-092: QuantizeHandler — pressure level → target bits 매핑
+// ENG-ALG-092: target_bits_for_pressure — pressure level → target bits 매핑
 // ══════════════════════════════════════════════════════════════
 
 #[test]
 fn test_eng_alg_092_target_bits_normal() {
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Normal),
-        None
-    );
+    assert_eq!(target_bits_for_pressure(PressureLevel::Normal), None);
 }
 
 #[test]
 fn test_eng_alg_092_target_bits_warning() {
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Warning),
-        Some(8)
-    );
+    assert_eq!(target_bits_for_pressure(PressureLevel::Warning), Some(8));
 }
 
 #[test]
 fn test_eng_alg_092_target_bits_critical() {
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Critical),
-        Some(4)
-    );
+    assert_eq!(target_bits_for_pressure(PressureLevel::Critical), Some(4));
 }
 
 #[test]
 fn test_eng_alg_092_target_bits_emergency() {
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Emergency),
-        Some(2)
-    );
+    assert_eq!(target_bits_for_pressure(PressureLevel::Emergency), Some(2));
 }
 
 // ══════════════════════════════════════════════════════════════

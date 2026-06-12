@@ -8,7 +8,7 @@ use llm_rs2::inference::speculative::{SkipOptimizer, rollback_kv_positions, veri
 use llm_rs2::kv::kivi_cache::KiviCache;
 use llm_rs2::kv::kv_cache::{KVCache, KVLayout};
 use llm_rs2::kv::offload::store::OffloadStore;
-use llm_rs2::kv::quantize_handler::QuantizeHandler;
+use llm_rs2::kv::quantize_handler::target_bits_for_pressure;
 use llm_rs2::kv::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
 use llm_rs2::quant::{BlockKVQ4, BlockKVQ8, QKKV};
 
@@ -182,22 +182,10 @@ fn make_kivi_input(
 
 #[test]
 fn test_quantize_handler_pressure_mapping() {
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Normal),
-        None
-    );
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Warning),
-        Some(8)
-    );
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Critical),
-        Some(4)
-    );
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Emergency),
-        Some(2)
-    );
+    assert_eq!(target_bits_for_pressure(PressureLevel::Normal), None);
+    assert_eq!(target_bits_for_pressure(PressureLevel::Warning), Some(8));
+    assert_eq!(target_bits_for_pressure(PressureLevel::Critical), Some(4));
+    assert_eq!(target_bits_for_pressure(PressureLevel::Emergency), Some(2));
 }
 
 // ── AP-4-2: Cross-action integration tests ──────────────────────────────────
@@ -307,11 +295,8 @@ fn test_all_actions_data_flow() {
     assert!(skip.validate(16));
     let _spec = llm_rs2::inference::speculative::SpeculativeConfig::new(skip, 25, 0.8);
 
-    // C8: QuantizeHandler pressure mapping
-    assert_eq!(
-        QuantizeHandler::target_bits_for_pressure(PressureLevel::Emergency),
-        Some(2)
-    );
+    // C8: target_bits_for_pressure pressure mapping
+    assert_eq!(target_bits_for_pressure(PressureLevel::Emergency), Some(2));
 }
 
 #[test]

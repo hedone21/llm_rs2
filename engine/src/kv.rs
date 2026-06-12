@@ -33,7 +33,7 @@ use anyhow::Result;
 
 pub use d2o_handler::D2OHandler;
 pub use eviction_handler::{EvictionHandler, MIN_EVICT_TOKENS};
-pub use quantize_handler::QuantizeHandler;
+pub use quantize_handler::target_bits_for_pressure;
 pub use swap_handler::SwapHandler;
 
 // ── Pressure level ─────────────────────────────────────────────────

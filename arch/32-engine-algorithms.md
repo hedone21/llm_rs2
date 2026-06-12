@@ -536,14 +536,17 @@ flowchart TD
 
 **핵심 특성**: 각 handler는 이전 handler가 변경한 cache 상태를 본다 (순차 실행, 누적 효과).
 
-### 6.4 Handler 6종
+### 6.4 등록 Handler
 
 | Handler | 모듈 | 상태 | 설명 |
 |---------|------|------|------|
-| `EvictionHandler` | `eviction_handler.rs` | 완료 | `EvictionPolicy`를 래핑, QCF 계산 연동 |
-| `D2OHandler` | `d2o_handler.rs` | 완료 | H2O eviction + cosine merge + EMA |
-| `SwapHandler` | `swap_handler.rs` | 완료 | LRU 기반 oldest token offload (prune_prefix) |
-| `QuantizeHandler` | `quantize_handler.rs` | 완료 | Pressure→bits 매핑 (KIVI 외부 처리) |
+| `EvictionHandler` | `eviction_handler.rs` | 완료 (등록) | `EvictionPolicy`를 래핑, QCF 계산 연동 |
+| `D2OHandler` | `d2o_handler.rs` | 완료 (등록) | H2O eviction + cosine merge + EMA |
+| `SwapHandler` | `swap_handler.rs` | 완료 (등록) | LRU 기반 oldest token offload (prune_prefix) |
+
+`WeightSwapHandler`(weight_swap.rs)도 `CachePressureHandler`를 구현하나 KV 핸들러와 독립 dispatch → arch/weight_swap.md 참조.
+
+KIVI bit 매핑은 자유 함수 `quantize_handler::target_bits_for_pressure(level) -> Option<u8>`로 제공한다(Warning=8 / Critical=4 / Emergency=2 / Normal=None). production 호출지 없음(KIVI dynamic transition 미배선) — spec ENG-ALG-092 MUST 고정을 위한 보존 진입점. (2026-06-12 — 구 `QuantizeHandler` struct는 never-registered NoOp stub이라 삭제, 매핑만 free fn 강등.)
 
 ### 6.5 EvictionHandler QCF 연동
 
