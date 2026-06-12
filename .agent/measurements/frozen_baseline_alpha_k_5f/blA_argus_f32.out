@@ -1,0 +1,21 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[OpenCL] --opencl-rpcmem: RpcmemAllocator init OK (libcdsprpc.so dlopen 성공)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The history of computing began with
+Token Length: 6
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=512
+KV cache type: F32, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 512)
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=6, budget=32)
+[fwd-trace] fmt default: wrapped 28 KVCache → StandardFormat (decode = forward_into_fmt)
+[fwd-trace] build_plan SUCCESS
+The history of computing began with the beginning( 
+hotscode>.melonBootApplicationQQs file filearger._bedParts MRP Decat HI况 SECRET　一�5七
+TTFT: 315.04 ms
+Decode: 56.47 ms/tok (17.7 tok/s) [31 tokens]
+Avg TBT: 64.55 ms (15.5 tokens/sec)
+[Phase4-4.5] generated=32 (first=279 + run=31) stopped_by=BudgetExhausted final_pos=37

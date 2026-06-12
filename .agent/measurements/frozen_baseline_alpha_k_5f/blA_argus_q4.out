@@ -1,0 +1,20 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+[OpenCL] --opencl-rpcmem: RpcmemAllocator init OK (libcdsprpc.so dlopen 성공)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Tokenizer] /data/local/tmp/models/qwen2.5-1.5b/tokenizer.json
+Prompt: The history of computing began with
+Token Length: 6
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=512
+KV cache type: Q4_0, layout: HeadMajor (initial capacity: 128 tokens, 18432B per layer, max: 512)
+[Phase4-4.5] standard happy path → DecodeLoop+ModelForward (tokens=6, budget=32)
+[fwd-trace] fmt default: wrapped 28 KVCache → StandardFormat (decode = forward_into_fmt)
+[fwd-trace] build_plan SUCCESS
+The history of computing began with the�gap社会i
+TTFT: 286.45 ms
+Decode: 53.67 ms/tok (18.6 tok/s) [31 tokens]
+Avg TBT: 60.95 ms (16.4 tokens/sec)
+[Phase4-4.5] generated=32 (first=279 + run=31) stopped_by=BudgetExhausted final_pos=37

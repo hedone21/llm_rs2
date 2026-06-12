@@ -5,7 +5,7 @@
 **선행 스프린트**: 항목 0 측정 스프린트 ✅ 종결(`sprint_kv_roadmap_item0_2026_06_12.md`) — 판정 4종 확정, D4 결정으로 인프라 항목 3·4는 1B 게이트 RED와 **무관하게 진행**
 **진입 handoff (정본)**: `handoff_kv_roadmap_item34_entry_2026_06_12.md` (작업 순서·금지선·landmine 6건)
 **진입 문장**: **"KV 로드맵 항목 3 진행 — QueryStats TensorKind 구현부터"** (항목 4 ADR은 3 완료 후 같은 흐름에서)
-**Status**: 진행 중 — P1~P3 ✅ DONE (항목 3 완료, 2026-06-12) → P4(항목 4 ADR) 착수
+**Status**: ✅ **종결 (2026-06-12)** — P1~P5 전부 DONE. "KV 구조 확정" 게이트 도달 + 분리 위생 3종 완료(① 푸시는 종결 커밋과 함께 수행) → 사용자 병렬 리팩토링 분기 준비 완료
 **ADR 예고 자리**: `docs/adr/0004-kvcachestage-plan-returning-trait.md` §7 L121 — `query_state(Quest): decode-step Q 캡처 미배선 → drop(후속 PR)` (= 본 항목 3이 닫는 자리)
 
 ---
@@ -67,7 +67,7 @@
 | **P2** 항목 3 구현 | Senior Implementer | TensorKind variant + AbiStageCtx 확장 + KVStageCtx 핸들 + Q 누적 배선(off 기본/score-active) | P1 | ✅ DONE (2026-06-12, 커밋 `783bcadd` technique-api + `a98cd679` 엔진 배선 — QueryStats 전용 격리 2커밋. attention_scores.rs/qcf_runtime.rs 누적 로직 무수정 U4 충족. P2-5 편차: production 소비자 부재로 QueryStatsCell 미신설, `query_stats_accumulator: None` 명시 전달로 충족 — YAGNI) |
 | **P3** 항목 3 검증 | Tester + Implementer | host 통계 정확성 테스트 + 기존 `tensor()` 소비자 무회귀 + α-K frozen 3-dtype byte-identical + 실모델 e2e 1회 | P2 | ✅ DONE (2026-06-12, **전 게이트 PASS**: G1 host lib 1369/2-baseline + technique-api 20/0 + TQS-1~9·compact_parity 8·d2o_stage_eq 3 PASS / G2 실모델 e2e llama3.2-1b f16 `query_stats.non_empty=true` 128행(16L×8kv) 전부 비0·finite + pre-change(757ca2a8) 대비 greedy token-id **byte-identical** / G3 S25 α-K frozen 3-dtype 생성출력 byte-identical + avg_tbt Δ f16 −0.26%·f32 −0.04%·q4 −0.50% 전부 음수 / G4 spec 680/4-baseline 신규 실패 0) |
 | **P4** 항목 4 read-plan ADR | Architect | ADR 신규 1건(대안 비교 + grill) + 구현 단계 분해를 backlog 재등록 (**구현 착수 금지**) | P3 (항목 3 완료 = KV 구조 확정 일부) | ✅ DONE (2026-06-12, `docs/adr/0011-kv-read-plan-surface.md` Proposed — `KVReadStage::read_plan(ctx)→Option<KVReadPlan{granularity: Token\|Page, select}>` 4번째 plan-returning 형제 + `SelectiveRead` capability opt-in(미지원 full read 폴백) + page 메타=read stage 자기 갱신(tensor(Key)+QueryStats) + read 비변형이라 eviction과 race 없음. grill 충족: status quo+5대안 기각, RPN≥100 4건 완화(최대 R1=378 layer-tier hot-path — dispatch 전략은 구현 amendment로 위임), Premortem·DA·C-ABI·spec 무관 판정. backlog 항목 4 RESOLVED + 신규 "4-impl"(S1~S6, 리팩토링 머지 후 착수) 재등록. **구현 코드 0줄 git 확인**) |
-| **P5** 분리 위생 3종 | PM + Implementer | ① origin 푸시 ② 공통 회귀 게이트 명문화 ③ rename 배제 규칙 | P4 | TODO |
+| **P5** 분리 위생 3종 | PM + Implementer | ① origin 푸시 ② 공통 회귀 게이트 명문화 ③ rename 배제 규칙 | P4 | ②③ ✅ DONE (2026-06-12, PM — `worktree_split_hygiene_2026_06_12.md` 신설: ② 게이트 3항 재앵커 명문화 + ③ rename 상호 배제 규칙 고정) / ① origin 푸시 = **메인 세션 수행** |
 
 **병렬 가능성**:
 - P1(설계)과 P4(ADR)는 둘 다 Architect 작업이나 **순서 고정**(U1) — P4는 P3 완료(항목 3 구현 완결) 후 착수. 항목 4 설계가 항목 3의 QueryStats를 "신호 공급원"으로 참조하기 때문(backlog L905 시너지).
@@ -129,7 +129,7 @@
 - **Notes (★금지선)**: 구현 착수 = 병렬 리팩토링과의 의미적 충돌 위험(U2). ADR-선행의 목적이 미래 표면을 문서 제약으로 고정하는 것 — 구현하면 목적 자체가 무너진다. 항목 2(K/V 비대칭 merge)·항목 5(persistence)도 동일 이유로 리팩토링 머지 후 권고(backlog 표기 유지).
 
 ### [P5] 분리 위생 3종 (PM + Implementer)
-- **Status**: TODO / **Sprint**: current / **Dependencies**: P4 (항목 3+4 완료 직후)
+- **Status**: ②③ ✅ DONE (2026-06-12) / ① = 메인 세션 수행 / **Sprint**: current / **Dependencies**: P4 (항목 3+4 완료 직후)
 - **Owner**: PM(②③ 합의·명문화) + Implementer(① 푸시 실행)
 - **Description**: 병렬 워크트리 분기 직전 공통 베이스 정리(handoff L27).
   - **① origin 푸시**: 누적된 미푸시 commit(QCF 세션분 + 측정 스프린트분 + 항목 3 + 항목 4 ADR)을 origin/master로 푸시 — 공통 베이스 앵커(handoff "origin 미푸시 누적" 해소).
@@ -137,7 +137,10 @@
     - **⚠ P3 발견 (2026-06-12)**: `frozen_baseline_alpha_k_5f_2026_06_05.md`의 sig md5 3종(`304f4ada/684d01d9/1cfba273`)은 보존된 `.out`로부터 **추출 방식이 재현 불가**(추출 스크립트 미기록) — P3 G3는 device 보존 baseline `.out`과 결정론 라인 직접 byte 비교로 대체 판정함. ② 명문화 시 **게이트 정의를 재앵커**할 것(비교 대상 파일 + 추출/비교 명령을 명시, md5 사전계산값 의존 제거).
   - **③ rename 상호 배제 규칙**: 양 브랜치가 동일 파일을 `git mv`하면 머지 충돌 폭발 → 한쪽만 rename하는 규칙 합의(no-`mod.rs` sweep 등 대형 rename은 리팩토링 워크트리 전담). 규칙 문서화.
 - **Acceptance Criteria**: ① origin/master 푸시 완료(`git log origin/master`로 확인) + ② 공통 회귀 게이트 3항 명문화 문서 1건 + ③ rename 배제 규칙 합의 기록 1건.
-- **Notes**: ②③는 코드 0줄(문서/규칙). ①만 푸시 실행. 이 Phase 완료 = 사용자 병렬 리팩토링 분기 준비 완료(= "KV 구조 확정" 게이트 종결).
+- **진행 (2026-06-12)**:
+  - **②③ ✅ DONE (PM)**: `worktree_split_hygiene_2026_06_12.md` 신설. ② 공통 회귀 게이트 3항 = (a) host lib `cargo test -p llm_rs2 --lib` 신규 실패 0(baseline 실패 2 + OpenCL GPU 부재 21 제외) + technique-api 20/0 + fmt/clippy clean, (b) α-K frozen 3-dtype byte-identical — **재앵커 적용**(md5 사전계산값 의존 제거 → device 보존본 `blA_argus_{f16,f32,q4}.out` 결정론 라인 직접 byte 비교 + tbt Δ≤+3%), (c) S25 verify 28/30(known-fail 2 = QCF_kv 결함, 머지 차단 아님). ③ rename 상호 배제 = 대형 `git mv`는 리팩토링 워크트리 전담 + 메인 KV 표면 동결(plan ABI/format trait/technique-api) + QCF_kv 라운드는 메인 진행 가능 + 충돌 우선순위(구조=워크트리/내용=메인).
+  - **① origin 푸시 = 메인 세션 수행** (PM 범위 밖 — 본 스프린트 미푸시 commit 누적분).
+- **Notes**: ②③는 코드 0줄(문서/규칙). ①만 푸시 실행(메인 세션). 이 Phase 완료 = 사용자 병렬 리팩토링 분기 준비 완료(= "KV 구조 확정" 게이트 종결).
 
 ---
 

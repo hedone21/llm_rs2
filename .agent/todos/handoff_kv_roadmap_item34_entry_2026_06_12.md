@@ -1,6 +1,7 @@
 # Handoff: KV 로드맵 항목 3+4 진입 — QueryStats 구현 + read-plan ADR (워크트리 분리 게이트)
 
 **작성**: 2026-06-12
+**스프린트 종결 (2026-06-12)**: P1~P4 ✅ + P5 분리 위생 ②③ ✅(PM) — 분리 위생 문서 = `worktree_split_hygiene_2026_06_12.md`. 잔여 = P5 ① origin 푸시(메인 세션).
 **HEAD**: `757ca2a8 docs(kv-roadmap): 항목 0 측정 스프린트 종결 …` (+ 본 handoff 커밋)
 **브랜치**: master (worktree 없음, **origin 미푸시 누적** — QCF 세션분 + 측정 스프린트분, 푸시는 사용자 지시 대기)
 **다음 세션 진입 문장**: **"KV 로드맵 항목 3 진행 — QueryStats TensorKind 구현부터"** (항목 4 ADR은 3 완료 후 같은 흐름에서)
