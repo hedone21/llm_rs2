@@ -967,7 +967,7 @@ fn engine_command_to_action_name(cmd: &EngineCommand) -> String {
         EngineCommand::LayerSkip { .. } => "weight.skip",
         EngineCommand::KvEvictH2o { .. } => "kv.evict_h2o",
         EngineCommand::KvEvictSliding { .. } => "kv.evict_sliding",
-        EngineCommand::KvStreaming { .. } => "kv_streaming",
+        EngineCommand::KvStreaming { .. } => "kv.evict_streaming",
         EngineCommand::KvMergeD2o { .. } => "kv.merge_d2o",
         EngineCommand::KvQuantDynamic { .. } => "kv.quant_dynamic",
         EngineCommand::KvOffload { .. } => "kv_offload",

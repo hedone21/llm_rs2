@@ -170,7 +170,7 @@ pub fn build_ctx(policy: &LuaPolicy) -> LuaResult<Table> {
             "weight.skip",
             "kv.evict_h2o",
             "kv.evict_sliding",
-            "kv_streaming",
+            "kv.evict_streaming",
             "kv.merge_d2o",
             "kv.quant_dynamic",
             "set_partition_ratio",
