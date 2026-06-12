@@ -168,14 +168,14 @@ mod tests {
                     "at_token": 10,
                     "directive": {
                         "seq_id": 1,
-                        "commands": [{"type": "Throttle", "delay_ms": 100}]
+                        "commands": [{"type": "throttle", "delay_ms": 100}]
                     }
                 },
                 {
                     "at_token": 20,
                     "directive": {
                         "seq_id": 2,
-                        "commands": [{"type": "Suspend"}]
+                        "commands": [{"type": "suspend"}]
                     }
                 }
             ]

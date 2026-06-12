@@ -35,11 +35,11 @@ cargo fmt --all --check              # clean
 cargo clippy --workspace -- -D warnings   # clean
 ```
 
-**baseline (2026-06-12, HEAD `70729062`)**:
-- `cargo test -p llm_rs2 --lib`: 비-OpenCL **1369 PASS** / **baseline 실패 2** = `experiment_schedule_parse_roundtrip`, `protected_prefix_score_based_defaults_to_4` (분기 전부터 존재 — 머지 차단 아님) / OpenCL GPU 부재 **21**(호스트 GPU 없음 — device에서만 의미).
+**baseline (2026-06-12 갱신 — 결정적 실패 2건 수정 후)**:
+- `cargo test -p llm_rs2 --lib`: 비-OpenCL **결정적 실패 0** (구 baseline 실패 2건 `experiment_schedule_parse_roundtrip`/`protected_prefix_score_based_defaults_to_4`는 2026-06-12 fixture 수정으로 해소). 카운트 제외 2종: ① OpenCL 환경 실패(`backend::opencl::*` ~21 + `memory::opencl::unified` SIGABRT — 호스트 POCL 한계, backlog P2-chore (b); 실행 시 `-- --skip backend::opencl --skip memory::opencl` 권장) ② `kv_cache` RSS flaky 2건(`test_prune_prefix_calls_release_unused_pages`/`test_release_unused_pages_rss_reduction` — 병렬 교란 간헐 FAIL, 격리 `--test-threads 1` PASS면 무시).
 - `cargo test -p technique-api`: **20/0**.
 
-**판정**: 위 baseline 대비 **신규 실패 0**. baseline 실패 2 + OpenCL 부재 21은 양 브랜치 공통이라 카운트 제외.
+**판정**: 비-OpenCL 결정적 **실패 0**. 카운트 제외 2종(OpenCL 환경 + RSS flaky 격리-PASS)은 양 브랜치 공통.
 
 ### (b) α-K frozen 3-dtype byte-identical (S25) — forward happy path 무회귀
 

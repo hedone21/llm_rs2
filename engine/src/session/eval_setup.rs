@@ -820,8 +820,9 @@ mod tests {
     /// h2o/h2o_plus/d2o + 미지정 → 4 (attention sinks only).
     #[test]
     fn protected_prefix_score_based_defaults_to_4() {
-        for policy in ["h2o", "h2o_plus", "d2o"] {
-            let args = parse_args(&["--eval-ll", "eviction", policy]);
+        // clap subcommand 는 kebab-case(`h2o-plus`), canonical policy_name 은 snake_case(`h2o_plus`).
+        for (subcmd, policy) in [("h2o", "h2o"), ("h2o-plus", "h2o_plus"), ("d2o", "d2o")] {
+            let args = parse_args(&["--eval-ll", "eviction", subcmd]);
             assert_eq!(args.eviction_policy(), policy);
             assert_eq!(
                 eval_protected_prefix(&args, 100),
