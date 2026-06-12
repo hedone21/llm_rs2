@@ -138,20 +138,33 @@ fn build_eval_base(args: &Args) -> Result<EvalBase> {
     })
 }
 
+/// score(importance) 기반 eviction 정책인가 — accumulator score 를 evict 에 흘려보내야 하는지 결정.
+///
+/// h2o/h2o_plus/d2o 가 기존 대상. R-KV(KV roadmap 항목 0 측정, feature `rkv`)는 fusion Z 가
+/// importance I 를 항(λ·I)으로 포함하므로 score-based 로 분류 → `force_evict_with_scores` 경로로
+/// accumulator importance 가 stage 에 흐른다. feature OFF 시 "rkv" 정책명 자체가 부재(불변).
+pub fn is_score_based_eviction(args: &Args) -> bool {
+    matches!(args.eviction_policy(), "h2o" | "h2o_plus" | "d2o")
+        || (cfg!(feature = "rkv") && args.eviction_policy() == "rkv")
+}
+
 /// eval/ppl 의 protected_prefix 기본값을 legacy generate.rs:849-860 등가로 계산.
 ///
 /// `--protected-prefix` 명시 시 그 값. 미지정 시 정책별 기본:
-/// - h2o/h2o_plus/d2o → 4 (attention sinks only — 전체 prompt 보호 시 score-based
+/// - h2o/h2o_plus/d2o/rkv → 4 (attention sinks only — 전체 prompt 보호 시 score-based
 ///   eviction 이 무의미해진다).
 /// - streaming → `sink_size`.
 /// - sliding/none → prompt 전체 보호(legacy 동작).
 pub fn eval_protected_prefix(args: &Args, prompt_len: usize) -> usize {
-    args.protected_prefix()
-        .unwrap_or(match args.eviction_policy() {
-            "h2o" | "h2o_plus" | "d2o" => 4,
-            "streaming" => args.sink_size(),
-            _ => prompt_len,
-        })
+    args.protected_prefix().unwrap_or_else(|| {
+        if is_score_based_eviction(args) {
+            4
+        } else if args.eviction_policy() == "streaming" {
+            args.sink_size()
+        } else {
+            prompt_len
+        }
+    })
 }
 
 /// legacy generate.rs:862-961 의 cache_manager 인라인 조립을 재현.
@@ -187,6 +200,30 @@ fn build_eval_cache_manager(
             handler: Box::new(d2o_handler),
         }]);
         CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
+    } else if cfg!(feature = "rkv") && args.eviction_policy() == "rkv" {
+        // R-KV(KV roadmap 항목 0 측정, P2a): RkvStage(KVCacheStage)를 StageBackedPolicy 로
+        // 감싸 EvictionPolicy 표면으로 노출 → CacheManager::new 등록(d2o if-branch 동형).
+        // λ 는 CLI(--lambda)에서, α/τ 는 측정 상수. importance 는 score accumulator 가
+        // force_evict_with_scores 로 흘려보낸다(아래 score_based_eviction 포함).
+        #[cfg(feature = "rkv")]
+        {
+            use crate::kv::eviction::stage_registry::StageBackedPolicy;
+            use crate::kv::rkv_stage::{RkvConfig, RkvStage};
+            let stage = RkvStage::new(RkvConfig {
+                lambda: args.rkv_lambda(),
+                ..RkvConfig::default()
+            });
+            let policy: Box<dyn EvictionPolicy> = Box::new(StageBackedPolicy::new(Box::new(stage)));
+            CacheManager::new(
+                policy,
+                monitor,
+                threshold_bytes,
+                args.eviction_target_ratio(),
+            )
+        }
+        // feature OFF 에서는 위 cfg!() 가 false 라 도달 불가하나, 컴파일러 만족을 위해 분기를 닫는다.
+        #[cfg(not(feature = "rkv"))]
+        unreachable!("rkv branch gated by cfg!(feature = \"rkv\")")
     } else {
         let policy: Box<dyn EvictionPolicy> = match args.eviction_policy() {
             "none" => Box::new(NoEvictionPolicy::new()),
@@ -401,7 +438,7 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
         .map_err(|e| anyhow::anyhow!(e))?;
     let prompt_len = prompt_enc.get_ids().len();
     let actual_protected_prefix = eval_protected_prefix(&args, prompt_len);
-    let score_based_eviction = matches!(args.eviction_policy(), "h2o" | "h2o_plus" | "d2o");
+    let score_based_eviction = is_score_based_eviction(&args);
 
     // eval 모드는 grow() 스파이크 회피로 capacity=max_seq_len 전량 선할당 (legacy:408).
     let kv_caches = alloc_standard_kv_caches(
@@ -478,7 +515,7 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
     let head_dim = model.config.head_dim;
 
     let actual_protected_prefix = eval_protected_prefix(&args, prompt.len());
-    let score_based_eviction = matches!(args.eviction_policy(), "h2o" | "h2o_plus" | "d2o");
+    let score_based_eviction = is_score_based_eviction(&args);
     let auto_eviction = args.eviction_policy() != "none" && args.experiment_schedule.is_none();
 
     let mut kv_caches = alloc_standard_kv_caches(

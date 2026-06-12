@@ -1432,6 +1432,16 @@ impl Args {
         }
     }
 
+    /// R-KV fusion 가중치 λ (KV roadmap 항목 0 측정, feature `rkv`). 미지정/타 정책 시 stage
+    /// 기본(0.1). 측정 schedule 의 stage 직접 생성 경로(d2o if-branch 동형)가 읽는다.
+    #[cfg(feature = "rkv")]
+    pub fn rkv_lambda(&self) -> f32 {
+        match self.current_policy() {
+            Some(EvictionCmd::Rkv(r)) => r.lambda,
+            _ => crate::kv::rkv_stage::RKV_DEFAULT_LAMBDA,
+        }
+    }
+
     // ── EvictionCommonArgs shim (flatten field 호출처 호환) ──
     pub fn kv_budget(&self) -> usize {
         self.eviction_common.kv_budget

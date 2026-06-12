@@ -20,10 +20,15 @@
 //! cosine 은 `d2o_handler::cosine_similarity`. N×N row-mean 집계 루프만 신규.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use technique_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, TensorKind};
 
 use crate::kv::d2o_handler::cosine_similarity;
+
+/// 1단 측정 덤프 게이트 env var. set 시 plan() 마다 per-kv_head `[RkvStats]` 마커 라인을 stderr 로
+/// 출력한다(파싱 가능 포맷). 측정 전용 — 미설정 시 덤프 경로 미진입(production 무영향).
+const RKV_DUMP_ENV: &str = "ARGUS_RKV_DUMP";
 
 /// fusion 가중치 λ (Z = λ·I − (1−λ)·R). 기본 0.1 = redundancy 지배(논문 §2.1).
 pub const RKV_DEFAULT_LAMBDA: f32 = 0.1;
@@ -70,6 +75,10 @@ pub struct RkvStage {
     config: RkvConfig,
     /// 마지막 plan() 의 per-kv_head redundancy stats (측정 1단 덤프용). plan 은 `&self` 라 내부가변.
     last_stats: Mutex<Vec<RedundancyStats>>,
+    /// plan() 호출 순번 — `[RkvStats]` 덤프의 `layer=` 필드. eviction 은 layer cache 를 순차 호출
+    /// (KVStageCtx.layer_idx() 는 0 고정)하므로 호출 카운터가 layer 진행을 누적 추적한다. 측정
+    /// schedule 이 `% num_layers` 로 layer 인덱스 역산. 누적이므로 reset 안 함(측정 전용).
+    plan_calls: AtomicUsize,
 }
 
 impl RkvStage {
@@ -78,6 +87,7 @@ impl RkvStage {
         Self {
             config,
             last_stats: Mutex::new(Vec::new()),
+            plan_calls: AtomicUsize::new(0),
         }
     }
 
@@ -85,6 +95,21 @@ impl RkvStage {
     /// plan() 호출 전이면 빈 Vec.
     pub fn last_stats(&self) -> Vec<RedundancyStats> {
         self.last_stats.lock().expect("rkv stats poisoned").clone()
+    }
+}
+
+/// per-kv_head redundancy stats 를 `[RkvStats]` 마커 라인으로 stderr 덤프(env `ARGUS_RKV_DUMP` 게이트).
+/// 포맷(파싱 가능): `[RkvStats] layer=<L> head=<H> mpc=<X> fraction=<Y>`. `layer` = plan() 호출 순번
+/// (측정 schedule 이 num_layers 로 modulo). 측정 전용 — feature `rkv` 안에 격리.
+fn dump_redundancy_stats(layer: usize, stats: &[RedundancyStats]) {
+    if std::env::var_os(RKV_DUMP_ENV).is_none() {
+        return;
+    }
+    for (head, s) in stats.iter().enumerate() {
+        eprintln!(
+            "[RkvStats] layer={layer} head={head} mpc={:.6} fraction={:.6}",
+            s.mpc, s.redundant_fraction
+        );
     }
 }
 
@@ -140,6 +165,9 @@ impl KVCacheStage for RkvStage {
             *z *= inv_heads;
         }
 
+        // 1단 측정 hook: per-kv_head redundancy stats 를 stderr 마커로 덤프(env 게이트) 후 보관.
+        let layer = self.plan_calls.fetch_add(1, Ordering::Relaxed);
+        dump_redundancy_stats(layer, &stats);
         *self.last_stats.lock().expect("rkv stats poisoned") = stats;
 
         let keep = select_keep(&z_sum, n, target, self.config.recent_alpha);
