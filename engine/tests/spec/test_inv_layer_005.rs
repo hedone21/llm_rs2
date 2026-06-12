@@ -1,15 +1,16 @@
-//! INV-LAYER-005: Engine L5 production binary(`bin/generate.rs`)는 L4 `session/`만
-//! 직접 import한다. test/microbench binary는 본 규칙 밖.
+//! INV-LAYER-005: Engine L5 production binary(`L5_PRODUCTION_BINS` 상수 기준)는
+//! L4 `session/`만 직접 import한다. test/microbench binary(`L5_SKIP_PATTERNS`)는
+//! 본 규칙 밖.
 //!
 //! 검증 방식: `scripts/layer_lint.py --filter inv-layer-005 --baseline`으로 baseline
-//! 대비 새로운 위반이 없음을 확인. generate.rs 만 enforcement 대상.
+//! 대비 새로운 위반이 없음을 확인. `L5_PRODUCTION_BINS`에 등록된 바이너리
+//! (`argus_cli.rs`, `argus_bench.rs`, `argus_eval.rs`)가 enforcement 대상이다.
+//! (generate.rs는 d5ed71d2에서 폐기되어 목록에서 제외됨.)
 //!
 //! 베이스라인 정책 (spec/41-invariants.md §3.26):
 //! - 현재 위반 건수는 `engine/tests/spec/inv_layer_baseline.json`에 고정.
-//! - Migration Step 2 (L5/L4 분리, generate.rs → session/) 후 baseline이 V-30 기준
-//!   대폭 감소할 예정.
 //!
-//! 참조: ARCHITECTURE.md §13.5 V-30
+//! 참조: ARCHITECTURE.md §13.5
 
 use std::path::PathBuf;
 use std::process::Command;
