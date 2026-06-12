@@ -590,8 +590,16 @@ ENG-ALG-041~047, 049의 개별 proxy를 대체하는 단일 통합 메트릭. Ac
 ```
 QCF = ‖O_before - O_after‖ / ‖O_before‖
 
-O_before = Σ_t α_t × V_t                       (현재 attention output, head_dim 벡터)
+O_before = Σ_t (α_t / Σ_{s} α_s) × V_t          (현재 attention output, head_dim 벡터)
 ```
+
+> **정규화 대칭성 (필수)**: O_before는 **전체 토큰 집합 `s ∈ [0, T)`** 에 대한
+> α의 합 `Σ_s α_s`로 정규화한다. O_after의 retained-set 정규화(`Σ_{t ∈ retained} α_t`)와
+> **분모 정규화 기준이 같은 softmax 가중치 공간**에 놓이게 하여 QCF가 정규화된 상대
+> 오차 `∈ [0, 1]`가 되도록 한다. 누적 attention score `α_t`가 미정규화 raw 합산값일 때
+> (예: 디코드 누적 score sink), O_before를 raw `Σ_t α_t × V_t`로 두면 ‖O_before‖가
+> `Σ_s α_s`배 만큼 부풀어 QCF가 1에 포화한다. **양변을 동일한 `Σ_s α_s`로 정규화**하면
+> 이 스케일 인자가 분자·분모에서 약분되어 정규화 불변식(아래)이 성립한다.
 
 **Action별 O_after 정의**:
 
@@ -605,11 +613,17 @@ D2O merge:
     -- V'_t = merge-compensated V (D2O의 cosine similarity 기반 merge 보상 적용)
 
 KIVI quantization:
-    O_after = Σ_t α_t × dequant(quant(V_t))
+    O_after = Σ_t (α_t / Σ_{s} α_s) × dequant(quant(V_t))
     -- quantize-dequantize round-trip이 V에 미치는 영향
+    -- 토큰 집합 불변 → O_before와 동일한 Σ_s α_s 정규화. 이 공통 인자는
+    --   분자/분모에서 약분되므로 KIVI QCF 값 자체는 정규화 유무와 무관(불변).
+    --   O_before와의 일관성을 위해 동일 정규화를 명기한다.
 ```
 
 **Per-KV-head 계산 후 집계**:
+
+`Σ_s α_s` 정규화는 per-head O_before_h / O_after_h 계산 내부에 동일하게 적용된다
+(head h별로 `α_h(s)`의 합으로 정규화). 집계 단계는 정규화에 영향받지 않는다.
 
 ```
 per kv_head h:
@@ -627,8 +641,15 @@ aggregate_heads():
 
 **불변식**:
 
-- `QCF ∈ [0, 1]` — 정규화된 상대 오차
-- Action이 V를 변경하지 않으면 `QCF = 0` (항등 변환)
+- `QCF ∈ [0, 1]` — 정규화된 상대 오차. O_before와 O_after가 **동일한 `Σ_s α_s`
+  정규화 가중치 공간**에 있으므로 `‖O_before − O_after‖ ≤ ‖O_before‖`가 성립한다
+  (둘 다 V의 볼록 결합이거나 그에 근접하므로 차분의 노름이 원본 노름을 초과하지 않음).
+- **항등 액션 → `QCF = 0`**: action이 토큰 집합과 V를 모두 보존하면(전 토큰 retain,
+  V 무변경) retained set = 전체 집합이 되어 `Σ_{t ∈ retained} α_t = Σ_s α_s`, 즉
+  `O_after = O_before`가 되어 `QCF = 0`. *(이 등식은 O_before도 `Σ_s α_s`로 정규화할
+  때에만 성립한다 — O_before를 raw `Σ_t α_t V_t`로 두면 항등 retain에서도
+  `O_after = O_before / Σ_s α_s ≠ O_before`가 되어 불변식이 깨진다. 위 수식의 정규화
+  대칭성이 이 불변식의 전제다.)*
 - Eviction 토큰 수 증가 → QCF 단조 증가 (정보 손실 증가)
 - KIVI quantization bit 감소에 대해 QCF 단조 증가: `QCF(Q2) > QCF(Q4) > QCF(Q8) > QCF(F16)`
 
@@ -685,16 +706,49 @@ aggregate_heads():
 
    **가용성 판정**: 각 action의 가용성 조건이 충족되지 않으면 해당 action의 QcfMetric은 QcfEstimate에 포함되지 않는다 (N/A). Manager는 반환된 estimate 목록에 존재하는 action만으로 의사결정한다.
 
-4. **QcfEstimate 생성**: per-action QcfMetric 리스트 + DegradationEstimator로 PPL 증가 추정
+   > **키 정렬 (silent-0 차단)**: Engine이 송출하는 action 키(`kv.evict_sliding`,
+   > `kv.evict_h2o`, `kv.merge_d2o`, `kv.evict_streaming`, `kv.quant_dynamic`, `weight.skip`)와
+   > Manager가 조회하는 action 키는 **문자열 단위로 정확히 일치**해야 한다. 키 불일치는
+   > 해당 action의 `qcf_cost = 0`(cache miss fallback, INV-117)으로 silent 처리되어 quality
+   > floor를 우회한다 — 진단 없는 정책 무력화(silent-0 클래스). 송출/소비 키는 단일 표기
+   > 컨벤션(점 표기 `kv.evict_streaming`)으로 통일한다. (DegradationEstimator(ENG-ALG-060)의
+   > 곡선 키도 이 IPC 키 집합과 정렬해 두어야 향후 캘리브레이션 장착 시 silent 미적용을
+   > 방지한다.)
+
+4. **QcfEstimate 생성 (raw 직송 — IPC 단위 = raw QCF)**: per-action QcfMetric 리스트를
+   생성하되, 각 action의 IPC 값은 **ENG-ALG-051이 산출한 raw QCF `∈ [0, 1]`(상대 attention
+   output 섭동)을 그대로** `QcfEstimate.estimates`에 담는다. DegradationEstimator(ENG-ALG-060)의
+   ΔPPL 환산은 **live 경로에서 적용하지 않는다** (raw 직송이 정본). Manager는 raw QCF를
+   직접 정책 입력(quality floor, DPP penalty)으로 사용한다.
+
+   > **단위 선언**: `QcfEstimate.estimates: HashMap<String, f32>`의 value = ENG-ALG-051 raw
+   > 상대 섭동 `∈ [0, 1]`. `QcfEstimate.layer_swap`(QCF_weight)도 동일하게 raw QCF_swap `∈ [0, 1]`.
+   >
+   > **cross-family 비교 한계**: Manager가 QCF_kv(`estimates`)와 QCF_weight(`layer_swap`)를
+   > 같은 [0, 1] raw 스케일에서 비교하는 것은 **측정 공간이 다른 두 양에 대한 휴리스틱
+   > 비교**다 (절대 등가 아님). 두 패밀리의 분자/분모 정의 공간이 달라(§ENG-ALG-051 vs
+   > QCF_weight) raw 값의 절대 동치성은 보장되지 않으며, 정책은 이 한계를 전제로 동작한다.
+   > 측정 공간을 통합하는 ΔPPL 환산은 ENG-ALG-060을 오프라인 캘리브레이션 도구로 사용하는
+   > 별도(향후) 경로이며, 본 live 경로의 일부가 아니다.
+
 5. **Engine -> Manager**: `EngineMessage::QcfEstimate(...)` 응답
 
-**불변식**: 스캔 중 캐시 데이터 변경 없음. KiviCache의 경우 `set_current_pos()`로 probe step의 update 되돌리기 가능. 모든 dry-run 출력은 [0, 1] 범위 (KIVI의 NMSE 포함).
+**불변식**: 스캔 중 캐시 데이터 변경 없음. KiviCache의 경우 `set_current_pos()`로 probe step의 update 되돌리기 가능. 모든 dry-run 출력은 [0, 1] 범위 (KIVI의 NMSE 포함). IPC 송출 값 = raw QCF (DegradationEstimator 미적용).
 
 ---
 
 ### 3.6 DegradationEstimator [ENG-ALG-060]
 
-**[ENG-ALG-060]** QCF proxy 값을 PPL 증가량(degradation)으로 변환하는 piecewise-linear 함수에 EMA 보정을 적용한다. *(MUST)*
+**[ENG-ALG-060]** QCF proxy 값을 PPL 증가량(degradation)으로 변환하는 piecewise-linear 함수에 EMA 보정을 적용한다. *(MUST — 컴포넌트 규격으로서 MUST. 아래 위상 참조.)*
+
+> **위상 (live 경로와의 관계)**: 본 컴포넌트는 **오프라인 캘리브레이션 도구**의 규격이다.
+> ENG-ALG-050 step 4의 live RequestQcf→QcfEstimate 경로는 **raw QCF 직송**(ENG-ALG-051
+> 산출값 그대로)이 정본이며, DegradationEstimator의 ΔPPL 환산을 **장착하지 않는다**.
+> 따라서 본 절의 MUST는 "이 컴포넌트가 구현·동작해야 한다"는 **규격 보존** 의미이지,
+> "live QcfEstimate 생성 경로에 반드시 배선돼야 한다"는 뜻이 **아니다**. 이 컴포넌트는
+> 향후 calibration 곡선이 확보되면(오프라인 (QCF, ΔPPL) 측정) cross-family 비교를 ΔPPL
+> 단위로 격상하는 옵션 경로로 활용된다. 삭제 대상이 아니며, 곡선 키는 IPC action 키와
+> 정렬해 두어야 한다(silent 미적용 방지 — ENG-ALG-050 키 정렬 노트 참조).
 
 **PiecewiseLinear**:
 

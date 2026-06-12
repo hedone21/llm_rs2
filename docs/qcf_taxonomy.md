@@ -19,7 +19,7 @@ QCF는 **손실성(lossy) 액션이 모델 품질에 미치는 비용**을 [0, 1
 | **QCF_kv** | head별 attention output 벡터 ℝ^{head_dim} | `‖ΔO‖₂ / ‖O‖₂` (per head, then aggregate) | KV 캐시에 가하는 lossy 액션 |
 | **QCF_weight** | layer 단위 스칼라 | importance × noise의 가중 비율 | 모델 forward path를 변형하는 액션 |
 
-두 패밀리는 분자/분모의 정의 공간이 달라 **raw 값으로 직접 비교할 수 없다**. cross-action 비교는 `DegradationEstimator`(§5)를 통해 ΔPPL(추정 perplexity 증가량)로 환산한 뒤 가능하다.
+두 패밀리는 분자/분모의 정의 공간이 본질적으로 다르다. **production live 경로**는 두 패밀리를 모두 raw QCF `∈ [0, 1]`로 IPC 송출하고, 매니저는 raw 값을 직접 정책 입력으로 사용한다 (B안, ENG-ALG-050 step 4). 이 cross-family raw 비교는 측정 공간이 달라 **절대 등가가 아닌 휴리스틱**이라는 한계를 전제로 한다. 측정 공간을 통합하는 ΔPPL 환산(`DegradationEstimator`, §5)은 오프라인 캘리브레이션 도구로 보존되며 live 경로의 필수 단계는 아니다(향후 옵션).
 
 ### 1.1 Figure 1 — Measurement Locations on the Forward Path
 
@@ -158,8 +158,8 @@ QCF는 **손실성(lossy) 액션이 모델 품질에 미치는 비용**을 [0, 1
 
 1. KV 액션 5종 → `QCF_kv` 평면(attention output)에 모두 모임 → 패밀리 내부 raw 비교 가능.
 2. Weight 액션 2종 → `QCF_weight` 평면(layer scalar)에 모두 모임 → 패밀리 내부 raw 비교 가능.
-3. 두 평면 사이는 단절 — 직접 raw 비교 불가.
-4. cross-family 비교가 필요하면 `DegradationEstimator`(§5)로 ΔPPL 환산이 유일한 다리.
+3. 두 평면은 측정 공간이 다름 — raw 비교는 휴리스틱(절대 등가 아님).
+4. production은 두 패밀리 모두 raw QCF [0, 1]로 직송하여 raw 휴리스틱 비교한다(B안). 측정 공간을 통합하는 ΔPPL 환산(`DegradationEstimator`, §5)은 오프라인 도구로 보존되며 향후 옵션이다.
 
 ---
 
@@ -167,10 +167,10 @@ QCF는 **손실성(lossy) 액션이 모델 품질에 미치는 비용**을 [0, 1
 
 ### 2.1 통합 정의
 
-**대상 양**: layer 단일 forward 시점에 만들어지는 attention output
+**대상 양**: layer 단일 forward 시점에 만들어지는 attention output. before/after 모두 **전체 토큰 집합에 대한 α 합 `Σ_s α_h(s)`로 정규화**된 가중치 공간에서 측정한다(정규화 대칭성):
 
 ```math
-O_h \;=\; \sum_{t=0}^{T-1} \alpha_h(t)\, V(h, t) \;\in\; \mathbb{R}^{d_{\text{head}}}
+O_h^{\text{before}} \;=\; \sum_{t=0}^{T-1} \frac{\alpha_h(t)}{\sum_{s=0}^{T-1}\alpha_h(s)}\, V(h, t) \;\in\; \mathbb{R}^{d_{\text{head}}}
 ```
 
 여기서
@@ -179,6 +179,13 @@ O_h \;=\; \sum_{t=0}^{T-1} \alpha_h(t)\, V(h, t) \;\in\; \mathbb{R}^{d_{\text{he
 - `t`: 시퀀스 위치, `T = current_pos`
 - `α_h(t)`: head h의 attention weight at position t
 - `V(h, t)`: KV cache의 V 벡터 (head h, position t)
+
+> **정규화 대칭성**: O_before는 전체 토큰 집합 `s ∈ [0, T)`의 `Σ_s α_h(s)`로,
+> O_after는 액션별 retained 집합의 합으로 각각 정규화한다. 두 항이 같은 softmax 가중치
+> 공간에 놓여야 QCF가 `[0, 1]`의 정규화 상대 오차가 된다. `α_h`가 미정규화 누적 score일
+> 때 O_before를 raw `Σ α V`로 두면 ‖O_before‖가 `Σ_s α_h(s)`배 부풀어 QCF가 1에
+> 포화한다 — before/after 양변에 동일 정규화를 적용해 이 스케일 인자를 약분한다.
+> (항등 액션(전 토큰 retain) → O_after = O_before → QCF = 0의 전제이기도 하다.)
 
 **QCF_kv (per head)**:
 
@@ -274,11 +281,15 @@ O_h^{\text{after}} = \sum_{r \in \mathcal{R}} \frac{\alpha_h(r)}{\sum_{r' \in \m
 
 #### 2.2.5 KIVI Quantization
 
-토큰 집합은 변경 없음. V 벡터를 quantize→dequantize round-trip:
+토큰 집합은 변경 없음. V 벡터를 quantize→dequantize round-trip (O_before와 동일한 `Σ_s α_h(s)` 정규화):
 
 ```math
-O_h^{\text{after}} = \sum_{t=0}^{T-1} \alpha_h(t) \, Q^{-1}\bigl(Q(V(h, t); b)\bigr)
+O_h^{\text{after}} = \sum_{t=0}^{T-1} \frac{\alpha_h(t)}{\sum_{s=0}^{T-1}\alpha_h(s)} \, Q^{-1}\bigl(Q(V(h, t); b)\bigr)
 ```
+
+> 토큰 집합이 before와 동일하므로 정규화 공통 인자 `1/Σ_s α_h(s)`가 분자/분모에서
+> 약분되어 KIVI QCF 값 자체는 정규화 유무와 무관(불변)하다. O_before와의 표기 일관성을
+> 위해 동일 정규화를 명기한다.
 
 `Q(·; b)`: `b`-bit 양자화기. 지원 비트수 = {2, 4, 8}, block size `QKKV`. block-wise quantize: `BlockQ2_0`, `BlockKVQ4`, `BlockKVQ8`.
 
@@ -434,23 +445,32 @@ skip QCF에는 직접 들어가지 않지만 ImportanceEntry에 동봉되어 후
 
 ---
 
-## 5. Cross-Action 비교: `DegradationEstimator`
+## 5. Cross-Action 비교
 
-서로 다른 패밀리의 raw 값을 직접 비교할 수 없기에, 모든 액션의 QCF는 액션별 piecewise-linear 곡선을 거쳐 ΔPPL(estimated perplexity increase)로 환산된다.
+### 5.1 Production 경로: raw QCF 직송 (B안)
+
+production live 경로(ENG-ALG-050 step 4)는 모든 액션의 QCF를 raw `∈ [0, 1]`로 IPC 송출하고, 매니저는 raw 값을 직접 cross-action 정책 입력(quality floor, DPP penalty)으로 사용한다. QCF_kv 액션 간 raw 비교는 동일 측정 공간이라 합법이고, QCF_kv ↔ QCF_weight raw 비교는 측정 공간이 달라 **휴리스틱**(절대 등가 아님)임을 전제한다.
+
+### 5.2 오프라인 도구: `DegradationEstimator` (향후 옵션)
+
+서로 다른 패밀리의 raw 값을 ΔPPL(estimated perplexity increase) 단위로 통합 환산하는 오프라인 캘리브레이션 도구. **현재 live 경로에 장착돼 있지 않다** — 곡선 calibration이 확보되면 cross-family 비교를 ΔPPL 단위로 격상하는 경로로 활용한다.
 
 ```math
 \Delta\mathrm{PPL}(\mathcal{A}) \;=\; \mathrm{Estimate}_{\mathcal{A}}\bigl(\mathrm{QCF}(\mathcal{A})\bigr)
 ```
 
-여기서 `Estimate_𝒜(·)`는 액션 𝒜에 대해 오프라인 calibration으로 학습된 단조 piecewise-linear 함수. 곡선은 `(QCF, ΔPPL)` 점들의 ascending 보간. 매니저는 ΔPPL 단위로 cross-action 정책 결정을 수행.
+여기서 `Estimate_𝒜(·)`는 액션 𝒜에 대해 오프라인 calibration으로 학습된 단조 piecewise-linear 함수. 곡선은 `(QCF, ΔPPL)` 점들의 ascending 보간.
 
 코드:
-- `engine/src/core/qcf/estimator.rs::DegradationEstimator::estimate` (line 136)
-- 액션별 곡선 등록: `with_defaults()` (line ~71)
+- `engine/src/qcf/estimator.rs::DegradationEstimator::estimate`
+- 액션별 곡선 등록: `with_defaults()`
 
-**현재 등록된 액션 키**(2026-04-27 기준): `eviction`, `sliding`, `kivi`, `swift`. **swap 미등록** — 후속 작업으로 backlog 등록됨.
+> **곡선 키 정렬 주의**: `with_defaults()`의 곡선 키는 IPC `estimates`의 action 키와
+> 정렬해 두어야 한다(현재 항등 fallback이라 무해하나, 곡선 등록 시 silent 미적용 위험).
+> live 미장착 상태에서는 모든 액션이 `linear(1.0)` 항등 fallback이므로 raw 직송과 수치
+> 동일 — 장착해도 즉시 수치 변화 없음(전환 무위험).
 
-매니저 IPC 메시지(`shared/src/lib.rs::QcfEstimate`)는 두 패밀리를 분리해 전송:
+매니저 IPC 메시지(`shared/src/lib.rs::QcfEstimate`)는 두 패밀리를 분리해 전송 (둘 다 raw QCF):
 
 ```rust
 pub struct QcfEstimate {
@@ -518,3 +538,4 @@ pub struct QcfEstimate {
 | 2026-04-27 | 초판 작성. 두 패밀리 정의, 7개 KV 액션 + swap + skip 수식 정리, 코드 위치 인덱스. |
 | 2026-04-27 | §1.1 Figure 1 (forward path 측정 위치), §1.2 Figure 2 (action → plane 매핑) 추가. 코드 위치 검증 표 동봉. |
 | 2026-04-27 | §1.1 Figure 1에 "Layer 차원 처리" Note 추가. §2.3에 액션별 Layer 차원 처리 표 추가 — KV eviction 4종은 layer 0 ad-hoc 경량 proxy(의도된 단순화)로 결정 명시. backlog `[P1]` CANCELLED. |
+| 2026-06-12 | QCF_kv 정규화 비대칭 해소: §2.1/§2.2.5 O_before·KIVI O_after를 `Σ_s α` 정규화로 통일(spec ENG-ALG-051 정합), 항등 액션 → QCF=0 전제 명시. IPC 단위 = raw QCF [0,1] 선언(B안, ENG-ALG-050 step 4): §1·§1.2·§5 cross-family 비교를 raw 휴리스틱으로 조정, DegradationEstimator를 오프라인 향후 옵션으로 위상 재정의. |
