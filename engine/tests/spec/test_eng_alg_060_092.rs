@@ -45,7 +45,7 @@ fn test_eng_alg_060_piecewise_linear_at_breakpoint() {
 fn test_eng_alg_060_estimator_d_max_clamp() {
     let est = DegradationEstimator::with_defaults(2.0);
     let metric = QcfMetric {
-        action: "kv.eviction".to_string(),
+        action: "kv.evict_h2o".to_string(),
         raw_value: 5.0,
         normalized_value: 5.0,
         per_head: None,
@@ -83,7 +83,7 @@ fn test_eng_alg_060_ema_correction() {
     let mut est = DegradationEstimator::new(
         {
             let mut m = HashMap::new();
-            m.insert("kv.eviction".to_string(), PiecewiseLinear::linear(2.0));
+            m.insert("kv.evict_h2o".to_string(), PiecewiseLinear::linear(2.0));
             m
         },
         10.0,
@@ -91,14 +91,14 @@ fn test_eng_alg_060_ema_correction() {
     );
 
     // Predicted: 2.0 * 0.3 = 0.6, Actual: 1.2 → ratio = 2.0
-    est.update_ema("kv.eviction", 0.3, 1.2);
-    let correction = est.ema_correction("kv.eviction");
+    est.update_ema("kv.evict_h2o", 0.3, 1.2);
+    let correction = est.ema_correction("kv.evict_h2o");
     // EMA: 0.5 * 1.0 + 0.5 * 2.0 = 1.5
     assert!((correction - 1.5).abs() < 1e-5);
 
     // correction 적용 후 estimate
     let metric = QcfMetric {
-        action: "kv.eviction".to_string(),
+        action: "kv.evict_h2o".to_string(),
         raw_value: 0.3,
         normalized_value: 0.3,
         per_head: None,
@@ -114,15 +114,15 @@ fn test_eng_alg_060_ema_no_update_when_alpha_zero() {
     let mut est = DegradationEstimator::new(
         {
             let mut m = HashMap::new();
-            m.insert("kv.eviction".to_string(), PiecewiseLinear::linear(1.0));
+            m.insert("kv.evict_h2o".to_string(), PiecewiseLinear::linear(1.0));
             m
         },
         5.0,
         0.0, // no EMA
     );
 
-    est.update_ema("kv.eviction", 0.3, 1.2);
-    assert_eq!(est.ema_correction("kv.eviction"), 1.0);
+    est.update_ema("kv.evict_h2o", 0.3, 1.2);
+    assert_eq!(est.ema_correction("kv.evict_h2o"), 1.0);
 }
 
 // ══════════════════════════════════════════════════════════════
