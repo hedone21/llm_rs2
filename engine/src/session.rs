@@ -13,6 +13,7 @@ pub mod eval_setup;
 pub mod experiment;
 pub mod experiment_run;
 pub mod forward;
+pub mod head_concentration;
 pub mod init;
 pub mod local_pressure;
 pub mod pipeline_registry;
