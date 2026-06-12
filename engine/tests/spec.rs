@@ -26,6 +26,8 @@ mod test_eng_alg_010_012;
 mod test_eng_alg_020_022;
 #[path = "spec/test_eng_alg_030_048.rs"]
 mod test_eng_alg_030_048;
+#[path = "spec/test_eng_alg_051.rs"]
+mod test_eng_alg_051;
 #[path = "spec/test_eng_alg_060_092.rs"]
 mod test_eng_alg_060_092;
 #[path = "spec/test_eng_dat_012_031.rs"]

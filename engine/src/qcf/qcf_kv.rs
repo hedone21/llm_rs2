@@ -214,22 +214,37 @@ pub fn compute_qcf_kv(params: &QcfKvParams) -> (f32, Vec<f32>) {
             alpha
         };
 
-        // 2. Compute O_before = sum alpha_h[t] * V[h][t]
+        // 2. Compute O_before = Σ_t (α_t / Σ_s α_s) · V[h][t]   (ENG-ALG-051)
+        //    O_before is normalised by the **full** token-set α-sum so it shares
+        //    the same softmax-weight space as O_after's retained-set
+        //    re-normalisation. Without this, raw Σ α_t V_t inflates ‖O_before‖
+        //    by Σ_s α_s (e.g. ~12× for accumulated decode score sinks) and the
+        //    relative error saturates at ~1. Note this is a scale normalisation
+        //    of the existing metric — the QCF *contract* is unchanged; α-only
+        //    relative comparisons (monotonicity, full-eviction=1.0) are
+        //    invariant since the factor cancels in numerator/denominator.
+        let alpha_all_sum: f32 = alpha_h.iter().take(current_pos).copied().sum();
         let mut o_before = vec![0.0f32; head_dim];
-        for (t, &alpha_t) in alpha_h.iter().enumerate().take(current_pos) {
-            let v_t = read_v_f32(
-                &params.v_source,
-                h,
-                t,
-                head_dim,
-                capacity,
-                n_kv_heads,
-                layout,
-            );
-            for d in 0..head_dim {
-                o_before[d] += alpha_t * v_t[d];
+        if alpha_all_sum > 0.0 {
+            for (t, &alpha_t) in alpha_h.iter().enumerate().take(current_pos) {
+                let v_t = read_v_f32(
+                    &params.v_source,
+                    h,
+                    t,
+                    head_dim,
+                    capacity,
+                    n_kv_heads,
+                    layout,
+                );
+                let w = alpha_t / alpha_all_sum;
+                for d in 0..head_dim {
+                    o_before[d] += w * v_t[d];
+                }
             }
         }
+        // alpha_all_sum <= 0 → o_before stays the zero vector, which routes to
+        // the QCF=0 branch below (o_norm <= ε), consistent with the existing
+        // zero-guard.
 
         // 3. Compute O_after based on action type
         let o_after = match &params.action {
@@ -776,6 +791,48 @@ mod tests {
         vec![1.0 / n as f32; n]
     }
 
+    /// Build a HeadMajor V/K buffer with **directional diversity** for D2O.
+    ///
+    /// `make_v_data` gives every token the same direction (V(h,t,d) ∝ (d+1)),
+    /// so cosine similarity is uniformly 1.0 and D2O's nearest-token merge can
+    /// not discriminate — under the normalised metric that even inverts to
+    /// D2O > H2O (the merge overwrites a retained token's V with an unrelated
+    /// direction). For D2O to beat H2O the data must satisfy two conditions:
+    ///   1. **directional diversity** — distinct token directions, so dropping
+    ///      an evicted token's direction is a real loss (high H2O QCF);
+    ///   2. **nearest alignment** — each evicted token has a same-direction
+    ///      token elsewhere so its direction is restorable by cosine-merge.
+    ///
+    /// We assign each token a direction via `dir_class(t)` (sinusoidal phase),
+    /// with two classes placed so that the heavy-hitter token AND its aligned
+    /// twin both fall in the evicted set: H2O loses that whole direction, while
+    /// D2O merges the twin back into a retained token, partially recovering it.
+    /// Unit magnitude keeps the merge norm-preserving. Fully deterministic.
+    fn make_diverse_v_data(n_kv_heads: usize, capacity: usize, head_dim: usize) -> Vec<f32> {
+        assert!(head_dim >= 32, "diverse V needs head_dim >= 32");
+        let freq = 0.37f32;
+        let total = n_kv_heads * capacity * head_dim;
+        let mut data = vec![0.0f32; total];
+        for h in 0..n_kv_heads {
+            for t in 0..capacity {
+                // Two well-separated directional classes. Tokens 1 and 2 share
+                // class B (the heavy-hitter + its mergeable twin); all others
+                // are class A. A tiny per-head offset keeps heads non-identical.
+                let class_phase = if t == 1 || t == 2 {
+                    std::f32::consts::FRAC_PI_2
+                } else {
+                    0.0
+                };
+                let phase = class_phase + (h as f32) * 0.05;
+                for d in 0..head_dim {
+                    let offset = h * capacity * head_dim + t * head_dim + d;
+                    data[offset] = (phase + d as f32 * freq).sin();
+                }
+            }
+        }
+        data
+    }
+
     #[test]
     fn test_zero_change_sliding() {
         // target_len == current_pos -> nothing evicted -> QCF = 0
@@ -1155,23 +1212,37 @@ mod tests {
 
     #[test]
     fn test_d2o_less_than_h2o() {
-        // D2O merge compensation preserves evicted token information,
-        // so D2O QCF should be strictly less than H2O QCF.
+        // Why D2O < H2O (strict): H2O drops evicted V contributions entirely,
+        // whereas D2O additively merges each evicted token into its cosine-
+        // nearest retained token (paper Eq.11, weights sum to 1), partially
+        // restoring the evicted direction. So with the same retained set R,
+        //   ‖O_b − O_a^D2O‖ ≤ ‖O_b − O_a^H2O‖.
+        // This only holds with directional diversity + nearest alignment, both
+        // absent in `make_v_data` (uniform direction). We use
+        // `make_diverse_v_data`: tokens 1 and 2 form class B (the heavy hitter
+        // and its mergeable twin), all others class A. With the attention/budget
+        // below both class-B tokens are EVICTED, so H2O loses that direction
+        // entirely (high QCF) while D2O merges the twin back into a retained
+        // token (recovering it → lower QCF). K is supplied so cosine-nearest is
+        // well-defined.
         let n_kv_heads = 2;
-        let head_dim = 4;
-        let capacity = 32;
-        let current_pos = 16;
-        let v_data = make_v_data(n_kv_heads, capacity, head_dim);
+        let head_dim = 32;
+        let capacity = 8;
+        let current_pos = 4;
+        let v_data = make_diverse_v_data(n_kv_heads, capacity, head_dim);
+        // K aligned with V (same diversity) so K-cosine-nearest == V-nearest:
+        // the evicted class-B twin merges into the class-B-aligned retained set.
+        let k_data = make_diverse_v_data(n_kv_heads, capacity, head_dim);
 
-        // Non-uniform scores: early tokens important, later less so
-        let mut scores = vec![0.1f32; current_pos];
-        scores[0] = 10.0;
-        scores[1] = 8.0;
-        scores[2] = 5.0;
+        // Heavy hitters (tokens 1,2 = class B) sit OUTSIDE the protected prefix.
+        // With target_len=2, prefix=1, keep_ratio=0.5 → hh_budget=0, so the only
+        // retained tokens are prefix (t0) + recent window (t3), both class A.
+        // The high-attention class-B tokens are evicted: H2O loses class B.
+        let scores = vec![1.0f32, 9.0, 8.0, 1.0];
 
-        let target_len = 8;
+        let target_len = 2;
         let keep_ratio = 0.5;
-        let protected_prefix = 2;
+        let protected_prefix = 1;
 
         let h2o_params = QcfKvParams {
             action: QcfActionType::EvictH2o {
@@ -1180,7 +1251,7 @@ mod tests {
                 protected_prefix,
             },
             v_source: VDataSource::F32(&v_data),
-            k_source: None,
+            k_source: Some(VDataSource::F32(&k_data)),
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -1199,7 +1270,7 @@ mod tests {
                 protected_prefix,
             },
             v_source: VDataSource::F32(&v_data),
-            k_source: None,
+            k_source: Some(VDataSource::F32(&k_data)),
             attention_scores: &scores,
             head_attn: None,
             n_kv_heads,
@@ -1214,21 +1285,16 @@ mod tests {
         let (qcf_h2o, ph_h2o) = compute_qcf_kv(&h2o_params);
         let (qcf_d2o, ph_d2o) = compute_qcf_kv(&d2o_params);
 
-        // D2O should produce lower QCF than H2O (merge preserves info)
+        // D2O strictly lower than H2O (merge restores evicted direction).
         assert!(
-            qcf_d2o <= qcf_h2o + 1e-6,
-            "D2O ({qcf_d2o}) should have QCF <= H2O ({qcf_h2o})"
+            qcf_d2o < qcf_h2o,
+            "D2O ({qcf_d2o}) should have strictly lower QCF than H2O ({qcf_h2o})"
         );
-        // D2O should not be identical to H2O (merge has an effect)
-        assert!(
-            (qcf_h2o - qcf_d2o).abs() > 1e-6,
-            "D2O ({qcf_d2o}) should differ from H2O ({qcf_h2o}); merge should change the result"
-        );
-        // Both should be positive (eviction happens)
+        // Both positive (eviction actually happens).
         assert!(qcf_h2o > 0.0, "H2O QCF should be positive, got {qcf_h2o}");
         assert!(qcf_d2o > 0.0, "D2O QCF should be positive, got {qcf_d2o}");
 
-        // Per-head: D2O <= H2O for each head
+        // Per-head: D2O <= H2O for each head.
         for h in 0..n_kv_heads {
             assert!(
                 ph_d2o[h] <= ph_h2o[h] + 1e-6,
