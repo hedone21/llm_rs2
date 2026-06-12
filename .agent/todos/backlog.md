@@ -82,6 +82,7 @@
 ---
 
 ## [P2] typed lifecycle hook 확장 (h-1) — 별 sprint, 2026-05-27 등록
+- **거취 확정 (2026-06-12, Backlog Burndown T5 사용자 결정 D-3 = B)**: **별 sprint 분리** — burndown 에서는 본 표기(설계 라운드 예약)만 남기고 실착수하지 않는다. 1~2주 규모 + inference loop 재설계 위험이 잔여 처리 성격의 burndown 과 mismatch. 착수 시점은 사용자가 추후 결정(진입 시 design round: Architect + 사용자).
 - **배경**: events sprint(2026-05-27)에서 사용자 결정 — sink가 fire-and-forget 디버깅 채널(비즈니스 영향 0)이라는 결론에 도달했으나, **비즈니스 동작(KV cache 관리, swap trigger)을 typed lifecycle hook으로 격리**하는 트랙은 별 sprint로 분리. 본 sprint는 events trait 인프라 제거(외과적)만 처리.
 - **방향**: `LayerBoundaryHook` (Sprint C에서 L2 격상 `engine/src/layer_boundary_hook.rs`)이 이미 precedent. 추가로 typed hook을 다음 단위로 확장 가설:
   - `PressureHook` (신규) — 매 step pressure 체크 → eviction trigger (현재 `cache_manager.maybe_evict()` 직접 호출 패턴 격리)
@@ -699,7 +700,7 @@
 ---
 
 ## [P2] policy_default.lua — action 계열 반복(연속 관측 실패 후 교체) 방지 논의 필요
-- **Status**: TODO (논의 필요, 구현 방향 미결)
+- **Status**: **RESOLVED — 현행 유지 확정 (2026-06-12, Backlog Burndown T5 사용자 결정 D-2 = D)** — 순환은 external injection(인위 압박 유지 → actual relief 0 → EWMA 연쇄 하락) 전제에서만 발생하고 production 엔 injection 이 없어 relief 신호가 정확함. 낮은 relief action 의 자연 교체가 올바른 동작. **재발동 예약**: 실측 순환이 관측되면 **(C) memory slope 감지**(ctx.history 기존 노출 재활용, 순수 Lua 1~2일, 최소 침습)가 우선 후보 — 설계안은 burndown T5 Architect 보고(2026-06-12) 참조. 부수 기록: T2 timeout 폴백 decide 는 stale-QCF 구간 관측 빈도를 약간 높여 EWMA 감소를 가속할 수 있으나 순환 구조 자체는 만들지 않음(추가 조치 불요).
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **Description**: |
