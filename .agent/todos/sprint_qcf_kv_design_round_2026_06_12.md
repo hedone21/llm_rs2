@@ -33,5 +33,5 @@ PM 단계는 생략 — 계획이 backlog AC ①~⑤로 이미 완결돼 있어 
 
 - **키 불일치 = silent-0 클래스** (v1 가짜 PASS 전례) — 감사 없이 키 rename 금지. 엔진 IPC 키 변경은 manager+fixture 동시 영향이라 최소 수정 원칙.
 - 워크트리 분기 R1: **git mv 금지** (신규 파일만 허용).
-- layer-0 단일 proxy → 전 layer aggregate는 별개 backlog [P1] — 본 라운드 범위 아님 (scope creep 금지).
+- layer-0 단일 proxy → 전 layer aggregate는 **CANCELLED 항목**(2026-04-27, 의도된 경량 proxy) — 본 라운드 범위 아님. (종결 후 정정: 당초 "[P1] 잔존"으로 오기재했었음.)
 - estimator(`estimator.rs`)는 B안에서 live 미장착 유지 — 삭제 금지(향후 캘리브레이션 도구 보존), spec 위상만 재정의.
