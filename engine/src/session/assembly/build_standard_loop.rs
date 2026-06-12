@@ -97,6 +97,8 @@ pub fn build_standard_loop(
     sampling_config: SamplingConfig,
     plan_enabled: bool,
     resilience: Option<ResilienceAdapter>,
+    // ADR-0011 S5: 선택적 read stage 이름(`--read-stage`). None = full read(현행 byte-identical).
+    read_stage_name: Option<&str>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // ADR-0008: decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고한다.
@@ -122,7 +124,7 @@ pub fn build_standard_loop(
     let score_cell: Arc<
         Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
     > = Arc::new(Mutex::new(None));
-    let mf = ModelForward::new(
+    let mut mf = ModelForward::new(
         backend,
         memory,
         cpu_backend,
@@ -133,6 +135,29 @@ pub fn build_standard_loop(
         Arc::clone(&hook_cell),
         score_cell,
     )?;
+
+    // ADR-0011 S5: 선택적 read stage 주입. 미지정(None)이면 미진입 = read_stage 슬롯 None 유지
+    // (full read, INV-147 byte-identical). 모르는 이름이면 등록 목록과 함께 에러.
+    if let Some(name) = read_stage_name {
+        // fat-LTO --gc-sections silent drop fail-fast (ADR-0003 §4). 빌트인 Quest 누락 시 즉시 Err.
+        crate::kv::read::read_stage_registry::ensure_builtin_read_stages_registered()?;
+        match technique_api::find_read_stage(name) {
+            Some(reg) => {
+                // standard happy path 의 활성 format 은 StandardFormat = SelectiveRead 지원이라
+                // 폴백 경고가 발생하지 않는다. (미지원 format 폴백 경고는 transformer.rs seam 의
+                // as_selective_read()==None 자동 처리 — opaque/KIVI 진입 시.)
+                let stage = (reg.make)(technique_api::ReadStageParams::default());
+                eprintln!(
+                    "[read-stage] '{name}' 활성 — decode attention 직전 layer 당 read_plan 호출"
+                );
+                mf.set_read_stage(stage);
+            }
+            None => {
+                let names = technique_api::registered_read_names();
+                anyhow::bail!("알 수 없는 --read-stage '{name}'. 등록된 read stage: {names:?}");
+            }
+        }
+    }
 
     // β-4: resilience-on 이면 dispatcher 를 구성한다 — control 디렉티브(Throttle/SetTargetTbt/
     // Suspend 등)는 CM 없이 소비 가능하고, v1 은 argus_cli resilience-on 에서 이를 적용했다

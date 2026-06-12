@@ -1320,6 +1320,11 @@ impl Args {
         self.kv_mode_args.kv_mode
     }
 
+    /// 선택적 KV read stage 이름 (ADR-0011 S5). 미지정 = None(full read).
+    pub fn effective_read_stage(&self) -> Option<&str> {
+        self.kv_mode_args.read_stage.as_deref()
+    }
+
     /// KIVI quantization bits.
     pub fn effective_kivi_bits(&self) -> u8 {
         self.kv_mode_args.kv_kivi_bits

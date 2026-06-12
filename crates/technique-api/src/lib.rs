@@ -1522,13 +1522,23 @@ pub trait KVReadStage: Send + Sync {
     fn read_plan(&self, ctx: &dyn StageCtx) -> Option<KVReadPlan>;
 }
 
-/// read stage 의 CLI-파생 정적 구성(KV `StageParams` 거울). 현재는 빌트인 0개라 필드 없음.
-/// 첫 빌트인(Quest) 구현 시 page_size 등 추가 예정.
+/// read stage 의 CLI-파생 정적 구성(KV `StageParams` 거울). Quest(첫 빌트인) 의 정적 knob.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReadStageParams {
-    /// placeholder — Quest 구현 시 `page_size` 등으로 확장.
-    _reserved: u8,
+    /// page 크기(한 page 가 묶는 토큰 수). Quest 기본 16.
+    pub page_size: u32,
+    /// 선택할 page 비율 (전체 page 의 1/`top_k_ratio_denom`). Quest 기본 4(=전체의 1/4).
+    pub top_k_ratio_denom: u32,
+}
+
+impl Default for ReadStageParams {
+    fn default() -> Self {
+        Self {
+            page_size: 16,
+            top_k_ratio_denom: 4,
+        }
+    }
 }
 
 /// 한 read stage 기법의 등록 항목(ADR-0011 D1, `KVCacheStageReg` 거울).

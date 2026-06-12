@@ -34,4 +34,9 @@ pub struct KvModeArgs {
     /// Max adaptive prefetch depth for offload (kv-mode=offload 한정).
     #[arg(long = "kv-max-prefetch-depth", default_value_t = 128)]
     pub kv_max_prefetch_depth: usize,
+
+    /// 선택적 KV read stage 이름 (ADR-0011 S5). 미지정 = full read(현행). 빌트인: `quest`.
+    /// 활성 format 이 SelectiveRead 미지원이면 stderr 1회 경고 후 full read 폴백.
+    #[arg(long = "read-stage")]
+    pub read_stage: Option<String>,
 }

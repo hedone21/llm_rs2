@@ -192,6 +192,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         sampling_config.clone(),
         !args.no_gpu_plan,
         resilience,
+        args.effective_read_stage(),
     )?;
 
     // ── prefill / restore 분기 ────────────────────────────────────────────────

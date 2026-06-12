@@ -17,6 +17,8 @@ pub mod kv_cache;
 pub mod kv_migrate;
 pub mod offload;
 pub mod offload_format;
+// ADR-0011 S4/S5: read 축(KVReadStage) 빌트인 등록 + force-link self-test (Quest).
+pub mod read;
 pub mod standard_format;
 
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)

@@ -75,6 +75,11 @@ pub struct ModelForward {
     // end_step() 은 forward_into 내부 자동 호출(transformer.rs:1671) — caller 호출 금지.
     score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
 
+    // ADR-0011 S5: 선택적 read stage(Quest 류). `--read-stage` 지정 시 Some, 미지정(production
+    // 기본)은 None. `step`(decode)이 `as_deref()` 로 forward args 에 대여 주입한다 — None 이면
+    // transformer.rs seam 의 `is_some` branch 1회 → full read 직행(INV-147 byte-identical).
+    read_stage: Option<Box<dyn technique_api::KVReadStage>>,
+
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
     // in `forward_into` args so production owned-ws path is hit. These two
@@ -169,6 +174,7 @@ impl ModelForward {
             kv_caches,
             hook_cell,
             score_cell,
+            read_stage: None,
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -190,6 +196,12 @@ impl ModelForward {
         // 호출은 이미 Some 이라 defensive no-op 으로 비용 0.
         s.ensure_fmt_wrapped();
         Ok(s)
+    }
+
+    /// ADR-0011 S5: 선택적 read stage 를 주입한다(decode 시 attention 직전 read_plan 호출원).
+    /// `--read-stage` 미지정이면 호출되지 않아 read_stage = None(full read, INV-147 byte-identical).
+    pub fn set_read_stage(&mut self, stage: Box<dyn technique_api::KVReadStage>) {
+        self.read_stage = Some(stage);
     }
 
     /// Phase 4-4.7 (A1): plan eligibility 검사 + build 시도.
@@ -472,10 +484,16 @@ impl Forward for ModelForward {
         // forward args 에 `Some(&mut acc)` 주입(end_step 은 forward_into 내부 자동 — 재호출 금지).
         let score_active = self.score_cell_active();
 
+        // ADR-0011 S5: read stage 활성 시 plan path 우회. plan path(execute_plan)는 layer loop 를
+        // bypass 하므로 read_plan seam(transformer.rs:1628)이 발화하지 못한다 — forward_into(layer
+        // loop) 폴백만이 read_plan 을 정확히 호출한다(score_active 우회와 동형). None(production)이면
+        // 비용 0(이 bool 1회 평가).
+        let read_stage_active = self.read_stage.is_some();
+
         // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan.
-        // hook 설치 중 또는 score accumulator active 이면 우회.
+        // hook 설치 중 또는 score accumulator active 또는 read stage active 이면 우회.
         #[cfg(feature = "opencl")]
-        if hook.is_none() && !score_active {
+        if hook.is_none() && !score_active && !read_stage_active {
             if self.gpu_plan.is_none() && !self.sticky_disabled {
                 self.gpu_plan = self.try_build_plan();
             }
@@ -538,6 +556,10 @@ impl Forward for ModelForward {
         let acc_slot: Option<&mut AttentionScoreAccumulator> =
             score_guard.as_mut().filter(|acc| acc.is_active());
 
+        // ADR-0011 S5: read stage 대여(없으면 None). transformer.rs:1628 seam 이 layer 당 1회
+        // read_plan 을 호출한다. self.model 은 Arc(별도 필드) 라 self.read_stage 동시 immutable borrow 무충돌.
+        let read_stage_slot: Option<&dyn technique_api::KVReadStage> = self.read_stage.as_deref();
+
         self.model.forward_into(TransformerModelForwardArgs {
             input_tokens: &self.decode_input,
             start_pos: ctx.pos,
@@ -561,7 +583,8 @@ impl Forward for ModelForward {
             // §5.9.2 Track B: hook 설치 시 layer loop 에 주입(wait-gate + on_layer_boundary).
             // `hook` Arc clone 이 본 forward_into 호출 동안 hook 을 살아 있게 유지한다.
             layer_boundary_hook: hook.as_deref(),
-            read_stage: None,
+            // ADR-0011 S5: decode read-plan seam. None(production) 이면 transformer.rs seam 1회 분기.
+            read_stage: read_stage_slot,
         })?;
         drop(score_guard); // guard 명시 해제 (end_step 이미 완료)
         self.read_logits(&self.logits_decode)
