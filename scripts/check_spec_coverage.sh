@@ -36,10 +36,13 @@ SPEC_INVS=$(grep -oE 'INV-[0-9]+' spec/41-invariants.md | sort -u)
 SPEC_INVS_LAYER=$(grep -oE 'INV-LAYER-[0-9]+' spec/41-invariants.md | sort -u)
 # INV-RPCMEM-NNN 시리즈도 추출 (spec/41-invariants.md §3.27, Sprint 2a Phase 2)
 SPEC_INVS_RPCMEM=$(grep -oE 'INV-RPCMEM-[0-9]+' spec/41-invariants.md | sort -u)
+# INV-DECODE-STAGE-NNN 시리즈도 추출 (spec/41-invariants.md DecodeLoop Stage 불변식)
+SPEC_INVS_DECODE_STAGE=$(grep -oE 'INV-DECODE-STAGE-[0-9]+' spec/41-invariants.md | sort -u)
 
 TEST_INVS=""
 TEST_INVS_LAYER=""
 TEST_INVS_RPCMEM=""
+TEST_INVS_DECODE_STAGE=""
 SPEC_DIRS=""
 for d in engine/tests/spec manager/tests/spec shared/tests/spec; do
   [ -d "$d" ] && SPEC_DIRS="$SPEC_DIRS $d"
@@ -93,6 +96,21 @@ if [ -n "$SPEC_DIRS" ]; then
     done
   done
   TEST_INVS_RPCMEM=$(printf '%s\n' $TEST_INVS_RPCMEM | sort -u)
+
+  # INV-DECODE-STAGE-NNN 파일명에서 추출 (test_inv_decode_stage_NNN 패턴)
+  for d in $SPEC_DIRS; do
+    for f in "$d"/test_inv_decode_stage_*.rs; do
+      [ -f "$f" ] || continue
+      base=$(basename "$f" .rs)
+      # test_inv_decode_stage_004_007 → INV-DECODE-STAGE-004 INV-DECODE-STAGE-007
+      nums=$(echo "$base" | grep -oE 'stage_[0-9]+' | grep -oE '[0-9]+')
+      for n in $nums; do
+        # 10# 강제: 0 패딩 번호(008/009)가 octal 로 파싱되는 것을 방지
+        TEST_INVS_DECODE_STAGE="$TEST_INVS_DECODE_STAGE INV-DECODE-STAGE-$(printf '%03d' "$((10#$n))")"
+      done
+    done
+  done
+  TEST_INVS_DECODE_STAGE=$(printf '%s\n' $TEST_INVS_DECODE_STAGE | sort -u)
 fi
 
 INV_TEST_MISSING=""
@@ -113,6 +131,13 @@ done
 # INV-RPCMEM-NNN 시리즈 검사 (test_inv_rpcmem_NNN.rs 파일 존재 여부)
 for inv in $SPEC_INVS_RPCMEM; do
   if ! echo "$TEST_INVS_RPCMEM" | grep -qwF "$inv"; then
+    INV_TEST_MISSING="${INV_TEST_MISSING}  ${inv}\n"
+  fi
+done
+
+# INV-DECODE-STAGE-NNN 시리즈 검사 (test_inv_decode_stage_NNN.rs 파일 존재 여부)
+for inv in $SPEC_INVS_DECODE_STAGE; do
+  if ! echo "$TEST_INVS_DECODE_STAGE" | grep -qwF "$inv"; then
     INV_TEST_MISSING="${INV_TEST_MISSING}  ${inv}\n"
   fi
 done
