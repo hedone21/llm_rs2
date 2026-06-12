@@ -456,13 +456,13 @@ graph TB
         Evt["observability::events<br/>WeightSwapEvent — 8 variant<br/>(PlanCommitted/ChunkDrained/<br/>PlanRetired/SwapFailed/BatchSummary/<br/>ConfigWarning/SubBatchWait/<br/>SwapProfBreakdown)<br/>× WeightSwapKind 5"]
     end
 
-    %% ── L3 Inference: models/weights/ orchestrator + dispatcher
-    subgraph Orch ["L3 Inference — models/weights/ orchestrator"]
+    %% ── L3 Weight: weight/ orchestrator + dispatcher
+    subgraph Orch ["L3 Weight — weight/ orchestrator"]
         Decider["WeightSwapDecider<br/>+ SwapDecision + SwapAlgorithm enum<br/>(QCF_weight evaluation)"]
         Exec["SwapExecutor<br/>(primary, sync/async path,<br/>chunk granularity = WeightChunk)"]
     end
 
-    subgraph Disp ["L3 Inference — 4 mode dispatchers"]
+    subgraph Disp ["L3 Weight — 4 mode dispatchers"]
         IncPlan["IncrementalSwapPlan<br/>(per_tick chunk drain,<br/>Manager-driven default)"]
         IfHook["IntraForwardSwapHook<br/>+ IntraForwardSwapPlan<br/>(per-layer mid-forward,<br/>LISWAP-4)"]
         PhAware["PhaseAwareSwapDispatcher<br/>(phase-aware chunk,<br/>--swap-phase-aware-chunk-mb)"]
@@ -557,7 +557,7 @@ graph TB
 - 실선 `-->` = owned 또는 직접 함수 호출.
 - 점선 `-.label.-` = trait dispatch / 메시지 / 외부 이벤트.
 - **Entry (L4)**: Manager 또는 사용자(`--swap` flag) 가 둘 다 같은 `EngineSwapRuntime` 진입. mode 결정은 engine 자율 (§13.8-M).
-- **Orch + Disp (L3 Inference)**: `SwapExecutor` 가 primary, 4 mode dispatcher 는 *얼마나 / 언제 / 어느 layer* 를 commit 할지 정책만 결정 후 Exec 에 위임. `DynamicK`/`ProbingK` 는 chunk size K 만 조절 (LISWAP-1/2).
+- **Orch + Disp (L3 Weight — `weight/`)**: `SwapExecutor` 가 primary, 4 mode dispatcher 는 *얼마나 / 언제 / 어느 layer* 를 commit 할지 정책만 결정 후 Exec 에 위임. `DynamicK`/`ProbingK` 는 chunk size K 만 조절 (LISWAP-1/2).
 - **Asset (L2)**: `AUF` 포맷이 primary + secondary 양쪽 자산 공통 (single-file). `SecondaryMmap` 은 OS mmap zero-copy, `RpcmemSecondaryStore` 는 Android DMA-BUF heap 으로 HTP↔Adreno 공유.
 - **State (L3)**: `LayerSlot` = layer 별 Arc snapshot (atomic 교체). `PrimaryReleaseWorker` 는 swap 완료 layer 의 primary backing 메모리 회수 (Phase 6.5 −81%). `Tombstone` 은 회수 완료 marker. `WeightSwapHandler` 는 **dormant** — `CachePressureHandler` trait 을 구현해 두었으나 `CachePressurePipeline` 에 등록되지 않으며 `CacheManager` 가 호출하지 않는다. 즉 *KV cache manager 가 메모리 압박 시 precision swap 을 trigger 하는 path 는 현재 미구현*. wire 는 후속 sprint 후보.
 - **BeBuf (L1)**: backend 별 alias buffer 가 host pointer 를 GPU/NPU 메모리로 mmap. zero-copy 경로의 실제 substrate.
@@ -590,7 +590,7 @@ graph TB
 | **TransformerLayer / LlamaLayer + LayerWorkspace** | 단일 트랜스포머 레이어 + 사전 할당 작업 텐서 | `engine/src/layers/*` |
 | **TransformerModel** | 모델 로딩, 임베딩, 레이어 반복, 로짓 계산. Multi-arch (Llama / Qwen2) | `engine/src/models/transformer.rs` + `engine/src/models/loader/{auf,gguf,safetensors}/` |
 | **AUF (Argus Unified Format)** | mmap zero-copy 가중치 + secondary swap 자산 single-file 포맷 | `engine/src/auf/*` (L2) |
-| **Weight Swap (LayerSlot / SecondaryMmap / SwapExecutor)** | dynamic layer dtype 교체. swap_executor / async_swap / phase_aware_swap / intra_forward_swap | `engine/src/models/weights/*` |
+| **Weight Swap (SwapExecutor / dispatcher 군)** | dynamic layer dtype 교체. swap_executor / async_swap / phase_aware_swap / intra_forward_swap / decider / dynamic_k / probing_k / noise_table / release_worker | `engine/src/weight/*` (γ-1, 2026-06-10 `7fe1fe8b`). weight resource 정의 `LayerSlot`/`SecondaryMmap`은 `engine/src/models/weights/*` inference 잔존 |
 | **EngineSwapRuntime + SwapCommitSlot** | Manager `SwapWeights` (WHAT) → engine 내부 mode (HOW) 4-way dispatcher. `--swap` CLI flag normalize 결과를 default mode 로 보유. §13.8-M | `engine/src/session/swap_runtime.rs` |
 | **WeightSwapEvent + WeightSwapKind** | 구조화 swap lifecycle event (8 variant: PlanCommitted / ChunkDrained / PlanRetired / SwapFailed / BatchSummary / ConfigWarning / SubBatchWait / SwapProfBreakdown). 5 kind (Incremental / IntraForward / PhaseAware / Subsystem) | `engine/src/observability/events.rs` |
 | **AttentionScoreAccumulator** | H2O/SnapKV용 attention importance score 누적 (decay, reset) | `engine/src/inference/attention_scores.rs` |
@@ -1596,6 +1596,8 @@ flowchart TB
     L1 -.via trait.-> CC2
 ```
 
+> **정정 (γ-1, 2026-06-10 `7fe1fe8b`)**: 위 다이어그램은 **목표 구조**이며, `L3 Pressure — pressure/` 서브그래프(`policy/`·`state/` 서브-우산)는 **미실현**이다. 실 코드는 단일 `pressure/` 우산 대신 **`kv/`(KV 캐시 관리) + `weight/`(weight precision swap) 두 평면 L3 도메인**으로 분리했고 `policy/`·`state/` 서브층은 두지 않는다. 실현된 도메인 구조의 SSOT는 `arch/01-architecture.md` §6.3이다.
+
 ### 13.3 Domain × Abstraction Matrix
 
 L3 내부는 도메인(Pressure / Inference)과 추상화 위계(Coordinator / Policy / State)로 직교 분해된다.
@@ -1612,6 +1614,8 @@ L3 내부는 도메인(Pressure / Inference)과 추상화 위계(Coordinator / P
 ### 13.4 Directory Migration Map
 
 > **갱신 (2026-05-16, §13.8 결정 반영 + Task #4 finalize)**: §A~D 결정 사항을 매핑에 반영. 변경된 행은 **비고** 끝에 `[§13.8-X]` 표시. Task #4 finalize 결정(6 trait `session/` 통일, `Forward` lifecycle hook default no-op, `ChatTurnExec` 폐기 — 자세한 결정 근거는 `arch/inference_pipeline.md` §11)에 따라 `session/` 디렉토리 트리는 §13.4.1 sub-section에 상세 기재한다.
+
+> **정정 (γ-1 도메인 분리, 2026-06-10, commit `7fe1fe8b`)**: 본 표의 "새 경로" 컬럼 중 일부는 **미실현 페이퍼 우산 구조**(`pressure/policy/`, `pressure/state/`, `pressure/weights/`)를 기재했었다. 실제 코드는 단일 `pressure/` 우산을 채택하지 않고, 구 `pressure/` 도메인을 **평면 `kv/`(KV 캐시 관리) + `weight/`(weight precision swap)** 두 L3 도메인으로 분리했다 (`policy/`·`state/` 서브-우산 층은 실현되지 않음). 아래 "KV/Weight 도메인 행"은 **실 코드 기준**으로 정정한다. 우산 구조의 설계 의도(도메인 경계)는 §13.2/§13.3 본문에서 다루되, *실현 경로*는 본 표·§6.3(arch/01-architecture.md)이 SSOT다. 선례: `arch/01-architecture.md` §6.3 (동일 취지 재작성, commit `65c867ad`).
 
 #### 13.4.1 `session/` 디렉토리 구조 (post-migration, Task #4 finalize 반영)
 
@@ -1696,20 +1700,20 @@ session/
 | `core/math_utils.rs` | `engine/src/math_utils.rs` (L2 직속, 신설 시) | |
 | `core/chat_template.rs` | **generic 부분**: `inference/chat_template.rs`<br/>**모델별 구현체**: `inference/models/<arch>/chat_template.rs` (예: llama) | 모델별 special token/포맷 분리. V-11 해소 (chat→ModelArch가 동일 도메인 internal) [§13.8-C] |
 | `core/chat_ipc.rs` | `session/chat_ipc.rs` | L4 IPC adapter [§13.8-C] |
-| `core/kv_cache.rs`, `core/kivi_cache.rs`, `core/kv_migrate.rs` | `pressure/state/{kv_cache,kivi_cache,kv_migrate}.rs` | |
-| `core/offload/` | `pressure/state/offload/` | |
-| `core/cache_manager.rs` | `pressure/manager.rs` | |
-| `core/eviction/` | `pressure/policy/eviction/` | |
-| `core/pressure/` (handlers) | `pressure/policy/handlers/` | trait도 `pressure/policy/pressure.rs` |
+| `core/kv_cache.rs`, `core/kivi_cache.rs`, `core/kv_migrate.rs` | **`kv/{kv_cache,kivi_cache,kv_migrate}.rs`** | γ-1: `pressure/state/` 우산 미실현 → 평면 `kv/` 도메인 |
+| `core/offload/` | **`kv/offload/`** | γ-1: `pressure/state/offload/` 우산 미실현 |
+| `core/cache_manager.rs` | **`kv/cache_manager.rs`** | γ-1: `pressure/manager.rs` 우산 미실현 → 평면 `kv/` 도메인 |
+| `core/eviction/` | **`kv/eviction/`** | γ-1: `pressure/policy/eviction/` 우산 미실현 → 평면 `kv/eviction/` |
+| `core/pressure/` (handlers) | **`kv/{eviction,d2o,quantize,swap}_handler.rs`** + `weight/weight_swap_handler.rs` | trait + pipeline + `ActionResult`는 도메인 루트 `kv.rs`. weight swap handler는 `weight/` 도메인 (γ-1). `pressure/policy/handlers/` 우산 미실현 |
 | `core/sys_monitor.rs` | `resilience/sys_monitor.rs` | |
 | `core/gpu_yield.rs` | `resilience/gpu_yield.rs` | |
 | `core/events.rs`, `core/rss_trace.rs` | `observability/{events,rss_trace}.rs` | |
 | `layers/` | `inference/layers/` | 단 `tensor_partition.rs`는 `engine/src/tensor_partition/` (L2 sub-dir)으로 |
 | `layers/tensor_partition.rs` | `engine/src/tensor_partition.rs` (L2 직속, TBD) | 백엔드 분할 = L2 책임. `PartitionWsCell`/`PartitionWorkspace`는 §G B-5a `engine/src/partition_workspace.rs`로 격상 완료 |
-| `models/` | `inference/models/` | 단, `weights/`는 `pressure/weights/`로 분리 (Sprint C, `5c698d79`) |
-| `models/weights/` (handler 군) | **`pressure/weights/`** (Sprint C, 2026-05-26, `5c698d79` 적용 완료) | swap_executor, decider, async_swap, phase_aware_swap, intra_forward_swap, incremental_plan, dynamic_k, probing_k, noise_table, release_worker 10 파일 git mv. `pressure/policy/handlers/weight_swap/` 페이퍼 목표는 폐기 — orchestrator는 `pressure/weights/` 단일 sub-dir (policy 별 계층 없이 평면) |
+| `models/` | `inference/models/` | 단, orchestrator(`weights/` handler 군)는 `weight/` 도메인으로 분리 (Sprint C `5c698d79` → `pressure/weights/`, γ-1 `7fe1fe8b` → 평면 top-level `weight/`) |
+| `models/weights/` (handler 군) | **`engine/src/weight/`** (Sprint C 2026-05-26 `5c698d79` → `pressure/weights/`, γ-1 2026-06-10 `7fe1fe8b` → top-level `weight/`) | swap_executor, decider, async_swap, phase_aware_swap, intra_forward_swap, incremental_plan, dynamic_k, probing_k, noise_table, release_worker + setup/stage_ctx/stage_registry/swap_executor 등 git mv. `pressure/policy/handlers/weight_swap/` + `pressure/weights/` 양 페이퍼 경로 모두 미실현 — orchestrator는 **평면 top-level `weight/` 단일 도메인** (policy/handlers 우산 계층 없음). weight_swap_handler.rs도 `kv/`→`weight/` 이동 (γ-1 후속) |
 | `models/weights/{slot,secondary_mmap,rpcmem_secondary,backing}.rs` | **`models/weights/` inference 잔존** (Sprint C 결정, design doc §3.1 참조) | `LayerSlot`이 owns `TransformerLayer` (inference data) — pressure 이전 시 더 큰 위계 어긋남 (pressure→inference data ownership) 발생. pressure orchestrator가 §13.8-O `cross_l3_vocabulary` marker로 임차. `SecondaryStore` trait inversion(V-09 `SecondaryMmapBytes` 패턴 확장)은 backlog. |
-| `models/weights/intra_forward_swap.rs::LayerBoundaryHook` trait + `NoOpHook` | **`engine/src/layer_boundary_hook.rs`** (L2 직속, Sprint C, `5c698d79`) | §13.8-G #8 (B-5b `KVCacheOps`/`PreloadAccess` 패턴). 양 도메인 공유 어휘 — inference forward + pressure swap impl. `IntraForwardSwapHook` 구현체는 `pressure/weights/intra_forward_swap.rs`에 잔존, `NoOpHook` default fallback은 trait 본문과 함께 L2. `scripts/layer_lint.py` `TOP_LEVEL_L2` set 등재. |
+| `models/weights/intra_forward_swap.rs::LayerBoundaryHook` trait + `NoOpHook` | **`engine/src/layer_boundary_hook.rs`** (L2 직속, Sprint C, `5c698d79`) | §13.8-G #8 (B-5b `KVCacheOps`/`PreloadAccess` 패턴). 양 도메인 공유 어휘 — inference forward + pressure swap impl. `IntraForwardSwapHook` 구현체는 `weight/intra_forward_swap.rs`에 잔존 (γ-1, 2026-06-10 `7fe1fe8b` ← `pressure/weights/`), `NoOpHook` default fallback은 trait 본문과 함께 L2. `scripts/layer_lint.py` `TOP_LEVEL_L2` set 등재. |
 | `models/weights/layer_object_pool.rs` | **`backend/cuda_embedded/pool.rs`** (and/or `backend/cuda_pc/pool.rs`) — Sprint C 결정 보류, inference 잔존 | CUDA host-pinned pool은 CUDA backend 자원. pressure가 `WeightStagingPool` trait으로 접근. V-27 해소 [§13.8-B]. `TransformerLayer` 의존 trait inversion 후 backend 이동 별 sprint. |
 | `backend/opencl/host_ptr_pool.rs` | `backend/opencl/host_ptr_pool.rs` (그대로) | 이미 backend/ 산하 [§13.8-B] |
 | `backend/` | `backend/` (그대로) | |
@@ -1833,14 +1837,14 @@ session/
 |------|---------|----------------|
 | **새 백엔드 추가** (예: Metal, Vulkan) | `backend/<name>/mod.rs` | `crate::backend::Backend` trait, `crate::buffer::Buffer` trait, `crate::memory::Memory` trait (L2 직속) |
 | **새 양자화 추가** (예: Q5_K, Q6_K) | `engine/src/quant.rs` (L2 직속) + `backend/<be>/` 안 dequant kernel | `crate::buffer::DType` enum 확장 |
-| **새 eviction 정책 추가** | `pressure/policy/eviction/<name>.rs` | `pressure::policy::eviction::EvictionPolicy` trait, `pressure::state::kv_cache::KVCache` |
-| **새 pressure handler 추가** (예: compression scheme) | `pressure/policy/handlers/<name>_handler.rs` | `pressure::policy::pressure::CachePressureHandler` trait |
+| **새 eviction 정책 추가** | `kv/eviction/<name>.rs` | `crate::kv::eviction::EvictionPolicy` trait, `crate::kv::kv_cache::KVCache` (γ-1: `pressure/policy/`·`pressure/state/` 우산 미실현 → 평면 `kv/`) |
+| **새 KV pressure handler 추가** (예: compression scheme) | `kv/<name>_handler.rs` | `crate::kv::CachePressureHandler` trait (도메인 루트 `kv.rs` 정의) (γ-1: `pressure/policy/handlers/` 우산 미실현) |
 | **새 sampling 방법 추가** | `inference/sampling.rs` 확장 | `shared::backend::Backend`만 |
 | **새 모델 아키텍처 추가** (예: Mistral) | `inference/models/<name>/` + `inference/models/mappers/<name>.rs` | `inference/layers::transformer_layer::TransformerLayer`, `crate::model_config::ModelConfig` (§G RESOLVED, 2026-05-26) |
 | **새 CLI 모드** | `session/<mode>.rs` (new) + `bin/<mode>.rs` (thin) | `session::DecodeSession` 또는 신규 session struct |
 | **새 manager 신호 종류** | workspace `shared/` 크레이트 (`llm_shared`, 별 crate) + `resilience/signal.rs` + `resilience/strategy/<name>.rs` | `shared::SystemSignal` enum 확장 |
-| **새 observability sink** | `observability/events.rs::EventSink` 구현 | `observability::events::CacheEvent` |
-| **새 weight swap 정책** | `pressure/policy/handlers/weight_swap/<name>.rs` | `WeightSwapTarget` trait (TBD) |
+| **새 observability sink** | (해당 없음 — `EventSink`/`CacheEvent` 인프라는 V-31 events sprint에서 제거됨, 2026-05-27) | structured event 대신 `log::info!`/`log::warn!` + `crate::action_diag_helper::*` helper 직접 호출 (`observability/events.rs` 파일 삭제) |
+| **새 weight swap 정책** | `weight/<name>.rs` | `crate::weight::*` orchestrator (swap_executor / decider 등), `WeightSwapTarget` trait (TBD) (γ-1: `pressure/policy/handlers/weight_swap/` 우산 미실현 → 평면 top-level `weight/` 도메인) |
 
 ### 13.7 Migration Plan
 
@@ -2189,14 +2193,14 @@ PR 단위로 분할. 각 단계 후 `cargo test --workspace` + `cargo clippy -- 
     - `models/transformer.rs:2783,2786` — `PrefetchableCache` + `PrefetchController` (offload-only path, 격상 backlog)
   - **Weight swap orchestrator** — **RESOLVED (Sprint C, 2026-05-26, `5c698d79`)**:
     - ~~`pressure/weight_swap_handler.rs:22-25`~~ — `SwapExecutor`, `LayerSlot`/`SecondaryMmap` 2건 marker 제거. 해소 방식: orchestrator 10 파일(`swap_executor`/`decider`/`async_swap`/`phase_aware_swap`/`intra_forward_swap`/`incremental_plan`/`dynamic_k`/`probing_k`/`noise_table`/`release_worker`)을 `models/weights/` → `pressure/weights/`로 git mv 하여 weight_swap_handler.rs import가 pressure 동도메인 내부 경로(`crate::pressure::weights::*`)로 정렬됨. marker 자체가 무의미해져 제거.
-    - **γ-1 후속 (2026-06-10, PENDING — Implementer)**: γ-1이 `pressure/` → `kv/`+`weight/` 분리하면서 `weight_swap_handler.rs`가 `kv/`에 남고 orchestrator 13 파일은 `weight/`로 이동 → `weight_swap_handler.rs:24`의 `use crate::weight::swap_executor::SwapExecutor`가 `kv→weight` cross-L3 import가 됨(census 1건). **해소: `weight_swap_handler.rs`를 `kv/` → `weight/`로 이동**하여 SwapExecutor import가 다시 weight 동도메인 내부 경로로 정렬. 부수로 `kv::ActionResult` import가 발생하는데(반환 타입), `ActionResult`는 §13.8-G L2 격상(`engine/src/action_result.rs`)으로 처리 → 이동 후 `weight/`→`kv/` import 0건. 위 §G register `ActionResult` 항목 참조.
+    - **γ-1 후속 (2026-06-10 등록 → 2026-06-11 RESOLVED, `08114da8`)**: γ-1이 `pressure/` → `kv/`+`weight/` 분리하면서 `weight_swap_handler.rs`가 `kv/`에 남고 orchestrator 13 파일은 `weight/`로 이동 → SwapExecutor import가 `kv→weight` cross-L3가 됐던 건. **해소 완료: `weight_swap_handler.rs`를 `kv/` → `weight/`로 이동** + `ActionResult` §13.8-G L2 격상(`engine/src/action_result.rs` 신설) → `weight/`→`kv/` import 0건. 위 §G register `ActionResult` 항목 참조.
   - **Weight swap cross-L3 vocabulary** — **Sprint C 부작용으로 신규 등록 (위계 정합 방향, baseline 자동 제외)**:
-    - `pressure/weights/swap_executor.rs` — `crate::models::weights::{LayerSlot, SecondaryMmap}` (pressure orchestrator → inference 잔존 weight resource)
-    - `pressure/weights/noise_table.rs` — `crate::models::weights::SecondaryMmap` (QCF_weight 입력 계산이 secondary backing을 readonly 사용)
-    - `pressure/weights/phase_aware_swap.rs` — `crate::models::weights::{LayerSlot, SecondaryMmap}` (PhaseAwareSwapDispatcher 분기 path)
-    - `pressure/weights/intra_forward_swap.rs` — `crate::models::weights::{LayerSlot, SecondaryMmap}` (LISWAP-4 hook 본체)
-    - `pressure/weights/async_swap.rs` — `crate::models::weights::LayerSlot` (worker thread slot mutation)
-    - **γ-1 추가 (PENDING)**: `weight/weight_swap_handler.rs:22-23` — `crate::models::weights::{LayerSlot, SecondaryMmap}` (handler가 `kv/`→`weight/` 이동 후에도 weight orchestrator → inference 잔존 weight resource 패턴 동일). 기존 `// LAYER-EXEMPT: cross_l3_vocabulary` marker(현 `kv/weight_swap_handler.rs:22`)가 이동과 함께 따라가므로 lint 자동 제외 유지 — baseline JSON 갱신 불요(현재도 baseline 7건에 미포함, marker로 제외 중). 따라서 weight/ 이동은 §O register를 5건 → 6건으로 만들되 baseline 위반 수 증가 0.
+    - `weight/swap_executor.rs` — `crate::models::weights::{LayerSlot, SecondaryMmap}` (weight orchestrator → inference 잔존 weight resource) *(경로 γ-1 정정 2026-06-12: 구 `pressure/weights/`)*
+    - `weight/noise_table.rs` — `crate::models::weights::SecondaryMmap` (QCF_weight 입력 계산이 secondary backing을 readonly 사용)
+    - `weight/phase_aware_swap.rs` — `crate::models::weights::{LayerSlot, SecondaryMmap}` (PhaseAwareSwapDispatcher 분기 path)
+    - `weight/intra_forward_swap.rs` — `crate::models::weights::{LayerSlot, SecondaryMmap}` (LISWAP-4 hook 본체)
+    - `weight/async_swap.rs` — `crate::models::weights::LayerSlot` (worker thread slot mutation)
+    - **γ-1 추가 (RESOLVED 2026-06-11, `08114da8`)**: `weight/weight_swap_handler.rs:22-23` — `crate::models::weights::{LayerSlot, SecondaryMmap}` (handler가 `kv/`→`weight/` 이동 후에도 weight orchestrator → inference 잔존 weight resource 패턴 동일). `// LAYER-EXEMPT: cross_l3_vocabulary` marker가 이동과 함께 따라가 lint 자동 제외 유지(실위치 2026-06-12 확인: `weight/weight_swap_handler.rs:22`) — baseline JSON 갱신 불요. weight/ 이동으로 §O register 5건 → 6건, baseline 위반 수 증가 0.
     - **분류**: 위계 정합 방향 (weight orchestrator가 inference 잔존 stateful resource를 *임차하여 mutate*). 6건(γ-1 후) 모두 `cross_l3_vocabulary` marker 부착, baseline 자동 제외.
     - **본질 해소 backlog (§7.5 design doc 참조)**: `SecondaryStore` trait inversion (V-09 `SecondaryMmapBytes` 패턴 — `pressure/weights/noise_table.rs` 우선 candidate). 별 sprint.
   - **Transformer ctor 위계 어긋남** — **ctor 호출 RESOLVED (Sprint D, 2026-05-26) + field 정의 RESOLVED (Sprint E, 2026-05-27)**:
