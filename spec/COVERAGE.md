@@ -270,6 +270,9 @@
 | SEQ-040 | (E) | Pressure Escalation 시퀀스 | ✅ | `engine/tests/spec/test_seq_040_064.rs` |
 | SEQ-095 | (E) | RequestQcf 시퀀스 | ✅ | `engine/tests/spec/test_seq_095_098.rs` |
 | SEQ-096 | (E) | QcfEstimate 응답 | ✅ | `engine/tests/spec/test_seq_095_098.rs` |
+| SEQ-097 | (M) | QcfEstimate 수신 후 액션 선택 | ✅ | `manager/tests/spec/test_seq_095_098.rs` |
+| SEQ-098 | (M) | QCF 타임아웃 → 무-QCF 폴백 decide | ✅ | `manager/tests/spec/test_seq_095_098.rs` |
+| SEQ-098a | (M) | Late estimate 캐시 반영 | ✅ | `manager/tests/spec/test_seq_095_098.rs` |
 
 ## Manager Algorithm
 

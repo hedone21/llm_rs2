@@ -869,12 +869,7 @@ impl PolicyStrategy for LuaPolicy {
     }
 
     fn complete_qcf_selection(&mut self, qcf: &QcfEstimate) -> Option<EngineDirective> {
-        // pending이 없으면 무시 (중복 응답 방어)
-        self.qcf_pending_at.take()?;
-        // RequestQcf 를 유발한 signal 도 함께 해제한다. 다음 signal 이 오면
-        // 새로 세팅되므로 중복 사용 위험은 없다.
-        let pending_signal = self.qcf_pending_signal.take();
-        // cache 갱신
+        // cache 갱신을 먼저 수행: late estimate(pending 없음)이더라도 값은 보존.
         let now = self.clock.now();
         for (name, &cost) in &qcf.estimates {
             self.qcf_cache.insert(name.clone(), (cost, now));
@@ -883,6 +878,11 @@ impl PolicyStrategy for LuaPolicy {
             "LuaPolicy QCF cache updated: {} actions",
             self.qcf_cache.len()
         );
+        // pending이 없으면 late estimate — cache는 갱신됐으므로 다음 process_signal이 활용.
+        self.qcf_pending_at.take()?;
+        // RequestQcf 를 유발한 signal 도 함께 해제한다. 다음 signal 이 오면
+        // 새로 세팅되므로 중복 사용 위험은 없다.
+        let pending_signal = self.qcf_pending_signal.take();
         // 2-step handshake 완료: 갱신된 QCF 값을 반영해 즉시 decide() 를 실행하여
         // seq=2 directive 를 발행한다. signal 이 기록되지 않은 경우(예: 외부에서
         // QcfEstimate 가 선행 도착) 는 None 반환 — 다음 process_signal() 이 스코어링.
@@ -894,15 +894,20 @@ impl PolicyStrategy for LuaPolicy {
         const QCF_TIMEOUT_SECS: f64 = 1.0;
         let pending_at = self.qcf_pending_at?;
         let elapsed = self.clock.elapsed_since(pending_at).as_secs_f64();
-        if elapsed >= QCF_TIMEOUT_SECS {
-            log::warn!(
-                "LuaPolicy QCF estimate timeout ({:.1}s) — clearing pending",
-                elapsed
-            );
-            self.qcf_pending_at = None;
-            // cache는 비우지 않음: 이전 값 유지 (stale이라도 없는 것보다 낫다)
+        if elapsed < QCF_TIMEOUT_SECS {
+            return None;
         }
-        None
+        log::warn!(
+            "LuaPolicy QCF estimate timeout ({:.1}s) — falling back to no-QCF decide",
+            elapsed
+        );
+        self.qcf_pending_at = None;
+        // cache는 비우지 않음: stale이라도 없는 것보다 낫다 (기존 값 보존).
+        let pending_signal = self.qcf_pending_signal.take();
+        // process_signal 재호출 금지 (RequestQcf 재발행 → 무한 핸드셰이크).
+        // pending_signal이 없으면 방어적으로 None 반환.
+        let signal = pending_signal?;
+        self.decide_and_build_directive(&signal)
     }
 }
 
@@ -2671,7 +2676,7 @@ mod tests {
     #[test]
     fn complete_qcf_selection_populates_cache() {
         let mut policy = make_policy_with_system_clock();
-        // pending 없으면 cache 갱신도 없이 None 즉시 반환
+        // pending 없어도 cache는 갱신되고 None 반환 (late estimate 경로).
         let qcf = QcfEstimate {
             estimates: [("kv.evict_sliding".to_string(), 0.3f32)]
                 .into_iter()
@@ -2680,13 +2685,15 @@ mod tests {
         };
         let result = policy.complete_qcf_selection(&qcf);
         assert!(result.is_none(), "pending 없으면 None을 반환해야 한다");
-        assert!(
-            policy.qcf_cache.is_empty(),
-            "pending 없으면 cache 갱신하지 않아야 한다"
+        assert_eq!(
+            policy.qcf_cache.len(),
+            1,
+            "pending 없어도 cache는 갱신되어야 한다 (late estimate 보존)"
         );
+        let (cost0, _) = policy.qcf_cache["kv.evict_sliding"];
+        assert!((cost0 - 0.3).abs() < f32::EPSILON);
 
-        // pending_at 만 설정하고 pending_signal 없는 legacy 경로 — cache 는 갱신되지만
-        // decide() 는 실행되지 않아 None 반환.
+        // pending_at 만 설정하고 pending_signal 없는 legacy 경로 — cache 갱신 + None 반환.
         policy.qcf_pending_at = Some(policy.clock.now());
         let result2 = policy.complete_qcf_selection(&qcf);
         assert!(
@@ -2832,6 +2839,192 @@ mod tests {
         assert!(
             policy.qcf_pending_at.is_none(),
             "1초 경과 후 pending_at이 소거되어야 한다"
+        );
+    }
+
+    /// 결함 1 회귀 테스트 (SEQ-098a): timeout 발생 시 pending_signal 이 있으면
+    /// `decide_and_build_directive` 를 직접 호출하여 폴백 directive 를 반환해야 한다.
+    /// `process_signal` 재호출(→ RequestQcf 재발행 → 무한 핸드셰이크) 금지.
+    #[test]
+    fn check_qcf_timeout_emits_fallback_decide_on_signal() {
+        use crate::pipeline::PolicyStrategy;
+
+        let clock = FixedClock::new(0);
+        // decide 가 Critical MemoryPressure 시 kv.evict_sliding 을 반환하는 스크립트.
+        let script = r#"
+            POLICY_META = { name = "test_timeout_fallback", version = "1.0" }
+            function decide(ctx)
+                if ctx.coef.trigger.mem_low then
+                    return {{ type = "kv.evict_sliding", keep_ratio = 0.5 }}
+                end
+                return {}
+            end
+        "#;
+        let script_file = create_temp_script(script);
+        let mut policy = LuaPolicy::new(
+            script_file.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+            clock.clone() as Arc<dyn Clock>,
+        )
+        .expect("policy load");
+
+        // Critical MemoryPressure 주입 → should_request_qcf() 조건 충족 →
+        // RequestQcf directive + pending_signal 기록.
+        let signal = SystemSignal::MemoryPressure {
+            level: llm_shared::Level::Critical,
+            available_bytes: 30_000_000,
+            total_bytes: 8_000_000_000,
+            reclaim_target_bytes: 100_000_000,
+        };
+        let d1 = policy.process_signal(&signal).expect("seq=1 directive");
+        assert_eq!(
+            d1.commands.len(),
+            1,
+            "첫 directive 는 RequestQcf 1건이어야 한다"
+        );
+        assert!(
+            matches!(d1.commands[0], EngineCommand::RequestQcf),
+            "첫 command 는 RequestQcf 여야 한다, got {:?}",
+            d1.commands[0]
+        );
+        assert!(
+            policy.qcf_pending_signal.is_some(),
+            "pending_signal 이 기록되어야 한다"
+        );
+
+        // 1100ms 경과 → timeout 발생.
+        clock.advance(1100);
+        let result = policy.check_qcf_timeout();
+
+        // 폴백 directive 가 반환되어야 한다.
+        let directive = result.expect("timeout 후 폴백 directive 가 반환되어야 한다");
+        assert!(
+            !directive.commands.is_empty(),
+            "폴백 directive 는 비어있으면 안 된다"
+        );
+        assert!(
+            directive
+                .commands
+                .iter()
+                .any(|c| matches!(c, EngineCommand::KvEvictSliding { .. })),
+            "Lua decide 가 kv_evict_sliding 을 선택해야 한다, got {:?}",
+            directive.commands
+        );
+        // RequestQcf 재발행 금지 — 무한 핸드셰이크 방어.
+        assert!(
+            !directive
+                .commands
+                .iter()
+                .any(|c| matches!(c, EngineCommand::RequestQcf)),
+            "폴백 directive 에 RequestQcf 가 포함되면 안 된다 (무한 핸드셰이크 방지)"
+        );
+        // pending 양쪽 모두 소거되어야 한다.
+        assert!(
+            policy.qcf_pending_at.is_none(),
+            "pending_at 이 소거되어야 한다"
+        );
+        assert!(
+            policy.qcf_pending_signal.is_none(),
+            "pending_signal 이 소거되어야 한다"
+        );
+    }
+
+    /// 결함 2 회귀 테스트 (SEQ-098a): pending 없는 상태에서 `complete_qcf_selection` 호출 시
+    /// None 을 반환하지만 qcf_cache 에는 estimates 가 반영되어야 한다 (late estimate 보존).
+    #[test]
+    fn complete_qcf_selection_caches_late_estimate_without_pending() {
+        use crate::pipeline::PolicyStrategy;
+
+        let script = create_temp_script(
+            "POLICY_META = { name = 'test', version = '1.0' } function decide(ctx) return {} end",
+        );
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .expect("policy load");
+
+        // (A) pending 없는 상태에서 late estimate 도착 → cache 갱신 + None 반환.
+        let qcf = QcfEstimate {
+            estimates: [
+                ("kv.evict_sliding".to_string(), 0.15f32),
+                ("kv.evict_h2o".to_string(), 0.22f32),
+            ]
+            .into_iter()
+            .collect(),
+            layer_swap: None,
+        };
+        let result = policy.complete_qcf_selection(&qcf);
+        assert!(result.is_none(), "pending 없으면 None 반환");
+        assert_eq!(
+            policy.qcf_cache.len(),
+            2,
+            "late estimate 2개가 cache 에 반영되어야 한다"
+        );
+        let (cost_sliding, _) = policy.qcf_cache["kv.evict_sliding"];
+        assert!(
+            (cost_sliding - 0.15).abs() < f32::EPSILON,
+            "sliding cost 반영 확인"
+        );
+        let (cost_h2o, _) = policy.qcf_cache["kv.evict_h2o"];
+        assert!((cost_h2o - 0.22).abs() < f32::EPSILON, "h2o cost 반영 확인");
+
+        // (B) process_signal → timeout → late estimate 순서 시나리오:
+        //     timeout 으로 pending_signal 이 소비되고 나서,
+        //     뒤늦게 도착한 estimate 는 cache 에 반영되고 None 반환.
+        let clock = FixedClock::new(0);
+        let script2 = create_temp_script(
+            "POLICY_META = { name = 'test2', version = '1.0' } function decide(ctx) return {} end",
+        );
+        let mut policy2 = LuaPolicy::new(
+            script2.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+            clock.clone() as Arc<dyn Clock>,
+        )
+        .expect("policy2 load");
+
+        // pending_signal 수동 설정 (should_request_qcf 조건 우회).
+        policy2.qcf_pending_at = Some(policy2.clock.now());
+        policy2.qcf_pending_signal = Some(SystemSignal::MemoryPressure {
+            level: llm_shared::Level::Critical,
+            available_bytes: 30_000_000,
+            total_bytes: 8_000_000_000,
+            reclaim_target_bytes: 100_000_000,
+        });
+
+        // timeout 발생 → pending_signal 소비 (decide 결과는 {} = None).
+        clock.advance(1100);
+        let _timeout_result = policy2.check_qcf_timeout();
+        assert!(
+            policy2.qcf_pending_at.is_none(),
+            "timeout 후 pending_at 소거"
+        );
+        assert!(
+            policy2.qcf_pending_signal.is_none(),
+            "timeout 후 pending_signal 소거"
+        );
+
+        // 뒤늦게 도착한 late estimate → cache 갱신 + None 반환.
+        let late_qcf = QcfEstimate {
+            estimates: [("kv.evict_sliding".to_string(), 0.09f32)]
+                .into_iter()
+                .collect(),
+            layer_swap: None,
+        };
+        let late_result = policy2.complete_qcf_selection(&late_qcf);
+        assert!(
+            late_result.is_none(),
+            "timeout 후 late estimate 는 None 반환"
+        );
+        assert_eq!(
+            policy2.qcf_cache.len(),
+            1,
+            "late estimate 가 cache 에 반영되어야 한다"
+        );
+        let (late_cost, _) = policy2.qcf_cache["kv.evict_sliding"];
+        assert!(
+            (late_cost - 0.09).abs() < f32::EPSILON,
+            "late estimate cost 반영 확인"
         );
     }
 

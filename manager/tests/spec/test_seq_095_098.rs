@@ -4,6 +4,14 @@
 //! SEQ-096: (Engine side -- tested in engine/tests/spec/)
 //! SEQ-097: QcfEstimate triggers action selection with real QCF costs
 //! SEQ-098: 1-second timeout falls back to default costs
+//! SEQ-098a: timeout + late estimate — cache 갱신(pending 무관) + 무한 핸드셰이크 방지
+//!
+//! NOTE: SEQ-098a 인라인 회귀 테스트는 `manager/src/lua_policy.rs` 내부
+//! `#[cfg(test)] mod tests` 에 수록되어 있다.
+//! (`check_qcf_timeout_emits_fallback_decide_on_signal`,
+//!  `complete_qcf_selection_caches_late_estimate_without_pending`)
+//! `LuaPolicy::qcf_cache` 가 `pub(crate)` 로 제한되어 외부 spec 테스트에서
+//! 직접 검증이 불가하므로 인라인 테스트로 대체한다.
 
 use std::collections::HashMap;
 

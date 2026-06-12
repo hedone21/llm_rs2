@@ -417,7 +417,13 @@ Manager                                    Engine
 
 **[SEQ-097]** Manager는 QcfEstimate를 수신한 후 ActionSelector를 실행한다. ActionSelector는 `estimates`의 값을 lossy 액션의 비용으로 사용한다. QcfEstimate에 포함되지 않은 lossy 액션은 ActionRegistry의 default_cost를 사용한다. *(MUST)*
 
-**[SEQ-098]** QcfEstimate 수신 타임아웃: Manager는 Response 수신 후 일정 시간(SHOULD: 1초) 내에 QcfEstimate가 도착하지 않으면 default_cost로 fallback하여 ActionSelector를 실행한다. *(SHOULD)*
+**[SEQ-098]** QcfEstimate 수신 타임아웃: Manager는 RequestQcf 발행 후 일정 시간(SHOULD: 1초) 내에 QcfEstimate가 도착하지 않으면, **pending을 해제하고 그 RequestQcf를 유발한 신호로 무-QCF 폴백 decide를 실행하여 그 결과 directive를 발행한다**. 폴백 decide는 default_cost(또는 LuaPolicy의 경우 stale한 qcf_cache 값, cache miss는 INV-117에 따라 0 처리)를 사용하며, **타임아웃 폴백 decide는 RequestQcf를 재발행하지 않는다** (무한 핸드셰이크 방지 — pending 해제 후 폴백 decide가 RequestQcf 선발행 단계를 우회한다). 타임아웃 시 압박 신호가 통째로 유실되어서는 안 된다. *(SHOULD)*
+
+> **개정 (2026-06-12, QCF_kv 설계 라운드 T2)**: 종전 SEQ-098은 "default_cost로 fallback하여 ActionSelector를 실행"으로 기술했으나, LuaPolicy 구현(`check_qcf_timeout`)이 timeout 시 pending만 clear하고 폴백 decide를 실행하지 않아 압박 신호가 directive 0건으로 유실되었다 (verify `signal_memory_critical` prefill-구간 주입 시 seq=2 미발행으로 적발). 본 개정은 "pending 해제 + pending_signal로 무-QCF 폴백 decide 발행"을 명문화한다. HierarchicalPolicy는 이미 본 거동을 만족하므로 무회귀.
+
+**[SEQ-098a]** Late estimate 캐시 반영: QcfEstimate가 타임아웃 이후(또는 pending이 이미 해제된 상태에서) 도착하더라도, Manager는 그 estimates를 **qcf_cache에 반영한다** (pending 존재 여부와 무관). pending이 없으면 추가 directive는 발행하지 않으나(다음 신호가 갱신된 cache로 스코어링), 늦게 도착한 QCF 지식을 폐기하지 않는다. *(SHOULD)*
+
+> **신설 (2026-06-12, QCF_kv 설계 라운드 T2)**: 종전 LuaPolicy `complete_qcf_selection`은 `qcf_pending_at.take()?`의 early-return이 cache 갱신보다 앞에 있어, pending이 이미 timeout으로 해제된 뒤 도착한 estimate가 cache에 반영되지 않고 폐기되었다. 본 항목은 cache 갱신을 early-return보다 앞으로 이동시켜 late estimate도 cache에 반영함을 명문화한다.
 
 #### 대안 동작
 
@@ -426,6 +432,8 @@ Manager                                    Engine
 | Engine 미연결 상태에서 Critical 전환 | RequestQcf 전송 불가. default_cost로 즉시 선택. |
 | QcfEstimate의 estimates가 비어있음 | 모든 lossy 액션에 default_cost 적용. |
 | Warning→Critical이 아닌 Normal→Critical 직행 | 동일하게 RequestQcf를 전송한다. |
+| 타임아웃 후 estimate 도착 (pending 없음) | estimates를 qcf_cache에 반영. directive 미발행 (SEQ-098a). |
+| 타임아웃 발생 (pending 존재) | pending 해제 + pending_signal로 무-QCF 폴백 decide 발행, RequestQcf 재발행 금지 (SEQ-098). |
 
 ### 3.11 D-Bus Sequence [SEQ-100 ~ SEQ-104]
 
