@@ -42,17 +42,25 @@ pub enum TensorKind {
     /// per-(kv_head,pos) 누적 head importance(h2o_plus). cols=1, per_head.
     /// flat per-token importance 는 본 핸들이 아니라 [`StageCtx::importance`] 로 zero-copy 직접 노출(D1 예외).
     Scores,
+    /// per-(layer,kv_head) Q(query) running 통계 — Expected Attention(arXiv 2510.00636)의 미래
+    /// attention closed-form 추정 입력(ADR-0004 §10 M-Q). `shape = {rows:2, cols:head_dim, per_head:true}`
+    /// (MQ-1): `read_row(0, kv_head, out)` = 그 kv_head 의 Q running **mean[head_dim]**,
+    /// `read_row(1, kv_head, out)` = running **var[head_dim]**. GQA 그룹 내 Q-head 통계의 element-wise
+    /// 평균으로 kv_head 좌표 환원(MQ-2 — `Scores`/`AttnWeights` 의 GQA 환원과 동일 kv_head 좌표라 교차
+    /// 사용 가능). score-active 경로(decode-step RoPE-적용 Q 캡처)에서만 `Some`; 그 외 `None`
+    /// (MQ-3/MQ-4 hot-path 게이트). discriminant 4 — 기존 0~3 불변(C-ABI 가산, MQ-5).
+    QueryStats,
 }
 
 /// dtype-무관 텐서 형태(POD). 미래 FFI 경계를 그대로 건널 수 있는 평탄 필드만(`#[repr(C)]`-able).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TensorShape {
-    /// 유효 row 수(보통 `current_pos`).
+    /// 유효 row 수(보통 `current_pos`; QueryStats=2 = mean row + var row, MQ-1).
     pub rows: usize,
-    /// row 당 f32 원소 수(Key/Value=head_dim, AttnWeights/Scores=1).
+    /// row 당 f32 원소 수(Key/Value=head_dim, AttnWeights/Scores=1, QueryStats=head_dim).
     pub cols: usize,
-    /// row 가 per-kv-head 로 분리되는가(현 4 kind 전부 true; layer-wide flat 은 `importance()` 별도 경로).
+    /// row 가 per-kv-head 로 분리되는가(현 5 kind 전부 true; layer-wide flat 은 `importance()` 별도 경로).
     pub per_head: bool,
 }
 
@@ -463,8 +471,9 @@ impl TensorHandle for AbiTensorHandle {
 /// KVCacheStage::plan(&dyn StageCtx)` 를 호출한다.
 pub struct AbiStageCtx {
     abi: *const StageCtxAbi,
-    // TensorKind(repr u32: Key=0/Value=1/AttnWeights=2/Scores=3) 인덱스. 생성 시 shape 프로빙.
-    handles: [Option<AbiTensorHandle>; 4],
+    // TensorKind(repr u32: Key=0/Value=1/AttnWeights=2/Scores=3/QueryStats=4) 인덱스. 생성 시 shape
+    // 프로빙. QueryStats(disc 4) 추가는 C-ABI 가산(MQ-5) — fn-ptr 시그니처 불변, 기존 .so 무영향.
+    handles: [Option<AbiTensorHandle>; 5],
 }
 
 impl AbiStageCtx {
@@ -478,8 +487,9 @@ impl AbiStageCtx {
             TensorKind::Value,
             TensorKind::AttnWeights,
             TensorKind::Scores,
+            TensorKind::QueryStats,
         ];
-        let mut handles: [Option<AbiTensorHandle>; 4] = [None, None, None, None];
+        let mut handles: [Option<AbiTensorHandle>; 5] = [None, None, None, None, None];
         for kind in kinds {
             let mut shape = TensorShape {
                 rows: 0,
@@ -1592,6 +1602,10 @@ mod tests {
         tgt: usize,
         imp: Vec<f32>,
         key: Vec<f32>, // 비면 tensor(Key) Some(1 row × len), 빈면 None
+        // QueryStats(disc 4) 프로빙용 — 비면 tensor(QueryStats) Some(2 row × qstats_cols), 빈면 None.
+        // 레이아웃 [2 * qstats_cols]: row0=mean, row1=var.
+        qstats: Vec<f32>,
+        qstats_cols: usize,
     }
 
     unsafe extern "C" fn h_current_pos(c: *const c_void) -> usize {
@@ -1639,6 +1653,15 @@ mod tests {
                 };
             }
             true
+        } else if kind == TensorKind::QueryStats as u32 && !h.qstats.is_empty() {
+            unsafe {
+                *out = TensorShape {
+                    rows: 2,
+                    cols: h.qstats_cols,
+                    per_head: true,
+                };
+            }
+            true
         } else {
             false
         }
@@ -1654,6 +1677,14 @@ mod tests {
         let h = unsafe { &*(c as *const HostCtx) };
         if kind == TensorKind::Key as u32 && out_len == h.key.len() {
             unsafe { core::ptr::copy_nonoverlapping(h.key.as_ptr(), out, out_len) };
+            true
+        } else if kind == TensorKind::QueryStats as u32
+            && !h.qstats.is_empty()
+            && out_len == h.qstats_cols
+            && _row < 2
+        {
+            let base = _row * h.qstats_cols;
+            unsafe { core::ptr::copy_nonoverlapping(h.qstats.as_ptr().add(base), out, out_len) };
             true
         } else {
             false
@@ -1681,6 +1712,8 @@ mod tests {
             tgt: 30,
             imp: vec![1.0, 2.0, 3.0],
             key: vec![],
+            qstats: vec![],
+            qstats_cols: 0,
         };
         let abi = make_abi(&host);
         // SAFETY: abi(및 host)는 ctx 수명 동안 살아 있다.
@@ -1690,9 +1723,44 @@ mod tests {
         assert_eq!(ctx.layer_idx(), 0);
         assert_eq!(ctx.n_kv_heads(), 1);
         assert_eq!(ctx.importance(), Some(&[1.0f32, 2.0, 3.0][..]));
-        // key 빈 → tensor(Key)/Value/Scores 모두 None(default sugar 도 trivial).
+        // key/qstats 빈 → tensor(Key)/Value/Scores/QueryStats 모두 None(default sugar 도 trivial).
         assert!(ctx.tensor(TensorKind::Key).is_none());
+        assert!(ctx.tensor(TensorKind::QueryStats).is_none());
         assert!(!ctx.has_head_scores());
+    }
+
+    /// MQ-5: AbiStageCtx 5-kind 프로빙 — host 가 QueryStats(disc 4)를 공급하면 어댑터가 핸들을
+    /// 만들고(shape={2,cols,true}), read_row(0)=mean / read_row(1)=var 가 C-ABI fn-ptr 를 타고 무손실
+    /// 왕복함을 확인. 기존 0~3 kind 무영향(C-ABI 가산).
+    #[test]
+    fn abi_stage_ctx_probes_query_stats_5kind() {
+        // head_dim=3: mean=[1,2,3], var=[0.5, 0.25, 0.125].
+        let host = HostCtx {
+            cur: 16,
+            tgt: 8,
+            imp: vec![],
+            key: vec![],
+            qstats: vec![1.0, 2.0, 3.0, 0.5, 0.25, 0.125],
+            qstats_cols: 3,
+        };
+        let abi = make_abi(&host);
+        let ctx = unsafe { AbiStageCtx::new(&abi) };
+        let h = ctx
+            .tensor(TensorKind::QueryStats)
+            .expect("QueryStats 가용(disc 4 프로빙)");
+        let sh = h.shape();
+        assert_eq!(sh.rows, 2, "rows=2 (mean/var)");
+        assert_eq!(sh.cols, 3, "cols=head_dim");
+        assert!(sh.per_head);
+        let mut mean = [0.0f32; 3];
+        let mut var = [0.0f32; 3];
+        h.read_row(0, 0, &mut mean);
+        h.read_row(1, 0, &mut var);
+        assert_eq!(mean, [1.0, 2.0, 3.0], "read_row(0)=mean");
+        assert_eq!(var, [0.5, 0.25, 0.125], "read_row(1)=var");
+        // 기존 kind 무영향.
+        assert!(ctx.tensor(TensorKind::Key).is_none());
+        assert!(ctx.tensor(TensorKind::Scores).is_none());
     }
 
     #[test]
@@ -1702,6 +1770,8 @@ mod tests {
             tgt: 5,
             imp: vec![],
             key: vec![1.5, 2.5, 3.5, 4.5],
+            qstats: vec![],
+            qstats_cols: 0,
         };
         let abi = make_abi(&host);
         let ctx = unsafe { AbiStageCtx::new(&abi) };
