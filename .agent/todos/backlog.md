@@ -4,7 +4,9 @@
 
 ---
 
-## [ACTIVE Sprint] Qwen 2.5-1.5B Full Microbench Matrix (2026-05-28 진입)
+## [ACTIVE Sprint — 사용자 주도 트랙, Backlog Burndown 범위 밖] Qwen 2.5-1.5B Full Microbench Matrix (2026-05-28 진입)
+
+> **2026-06-12 주석 (Backlog Burndown triage)**: 위임 결정 A1(paper/측정 트랙 제외)에 따라 본 sprint는 **사용자 주도 트랙**으로 Backlog Burndown 자율 실행 범위 밖. Status/우선순위 미변경 — 사용자가 직접 운영. burndown 트랙이 건드리지 않음.
 
 - **Master TODO**: `.agent/todos/sprint_microbench_full_matrix_2026_05_28.md`
 - **Entry handoff (P0 Architect)**: `.agent/todos/handoff_microbench_full_matrix_phaseP0_2026_05_28.md`
@@ -35,7 +37,7 @@
 
 ---
 
-## [P2-chore] host lib 테스트 위생 — γ-3 결정적 테스트 버그 2건 + POCL-first 호스트 OpenCL 테스트 환경 실패
+## [RESOLVED] host lib 테스트 위생 — γ-3 결정적 테스트 버그 2건 + POCL-first 호스트 OpenCL 테스트 환경 실패
 
 - **Status**: **RESOLVED 전체 (2026-06-12)** — (a)+(b)+(c) 완료. AC 충족: 필터 없는 `cargo test -p llm_rs2 --lib` **1410/1410 PASS, 0 FAIL** (skip 가드 발화 = unified UMA 왕복 1건) + `check_spec_coverage.sh` 정상 완주([6]까지 전 구간 실행, exit 1 = 정당한 커버리지 갭 45건 보고). (발견 2026-06-11, AB-4 device 게이트의 Linux host 이름 단위 대조에서 — pre-AB-4 `ecd07549` worktree 대조로 전원 사전존재 입증, AB-4 회귀 0건)
 - **Description**:
@@ -280,7 +282,8 @@
 - **상세**: `cargo clippy --workspace --features opencl --tests -- -D warnings`에서 `crates/qnn_oppkg_poc/src/lib.rs:725` 근방 raw pointer deref 함수에 `unsafe` 누락. rust 1.93 신규 lint. M1 회귀 안전망 crate이라 P3 우선순위. M2가 main 진입한 이상 PoC는 read-only — 손대지 않거나 일괄 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`로 silence.
 
 ## [P3] backend::opencl::* host test 24개 device-required fail — 2026-05-10 발견
-- **Status**: TODO (호스트 측정 환경 한계)
+- **Status**: TODO (해소 가능성 높음 — 검증 1회 후 처분 / 2026-06-12 Backlog Burndown triage)
+- **2026-06-12 triage 단서**: L38 항목(host lib 테스트 위생 RESOLVED) 본문에 따르면 OpenCL 플랫폼 GPU-우선 스캔 수정(`7daa7e69`)으로 호스트 NVIDIA(RTX 3090 Ti)에서 `backend::opencl` 35종이 실 GPU에서 전부 PASS, lib 1410/0 달성으로 보고됨. 본 24-fail 항목은 그 수정으로 해소됐을 가능성이 높으나 **코드/실행 검증 미완** — 단정 금지. T1 위생 트랙에서 `cargo test -p llm_rs2 --lib backend::opencl` 1회 실행으로 0 FAIL 확인 후 RESOLVED 처분 예정.
 - **상세**: `cargo test --workspace --features opencl --tests`에서 host에 OpenCL device 없을 때 24 fail (gpu_buffer_shift, kv_scatter_batch, noshuffle, plan tests). Galaxy S25 디바이스 빌드에선 정상. 호스트 회귀 게이트에선 본 모듈 제외 권장 — sanity-check skill에 `--exclude-tests backend::opencl` 패턴 추가 검토.
 
 ## [P2] Adreno noshuffle GEMV cross-run tuning (Phase 4-4.9/10 Path B) — 2026-05-18 등록 / 2026-05-18 갱신
@@ -845,8 +848,8 @@
 
 ---
 
-## [P2] Format 명명 통일 — `KVCacheLayer`/`WeightLayer` → `KVCacheFormat`/`WeightFormat`
-- **Status**: PARTIAL — 문서 prose **전부 완료** (2026-05-30): v2 + CONTEXT + spec INV 본문 + backend_conformance + adr/0001. **잔여 = 코드 rename(`KVCacheOps`)뿐** (Phase α-K 동행).
+## [RESOLVED] Format 명명 통일 — `KVCacheLayer`/`WeightLayer` → `KVCacheFormat`/`WeightFormat`
+- **Status**: RESOLVED (2026-06-12, Backlog Burndown triage) — 문서 prose는 2026-05-30 전부 완료, **유일 잔여였던 코드 rename(`KVCacheOps`)은 처분 불요**: α-K BC(2026-06-05, MEMORY 인덱스 [project-backend-axis] + L120 "KVCacheOps trait 완전 폐기")에서 `KVCacheOps` trait 자체가 폐기되어 rename 대상 심볼이 부재. "Format"으로 통일할 코드 노출 0 → 사실상 종결.
 - **Sprint**: backlog
 - **Dependencies**: 없음 (문서 rename은 독립). 코드 rename만 ADR-0001/Phase α-K 동행.
 - **Description**: "Layer"가 두 의미로 충돌 — ① transformer layer(`LlamaLayer`/`TransformerLayer`/`LayerSlot`/`layer_idx` 등 코드 다수) ② 저장 형태(설계 `KVCacheLayer`/`WeightLayer`, 코드엔 grep 0건). 특히 weight/precision swap 도메인에 `LayerSlot`(①)과 설계 `WeightLayer`(②)가 공존 예정이라 혼동. grill(2026-05-30) 결과 **저장 형태(noun)는 `Format`으로 통일**. "Layer"는 transformer layer 전용으로 보존.
@@ -895,8 +898,10 @@
 - **코드 접점**: `crates/technique-api/src/lib.rs`(`KVCachePlan`/`PlanAbi`), `engine/src/format/kv_cache_format.rs`, plan executor(`engine/src/pressure/eviction/stage_registry.rs` 경로), 신규 mixed-precision format crate.
 - **Acceptance Criteria**: ADR-0004 amendment + `compact_parity` demote 케이스 확장 + 게이트 실험 GREEN + lib/clippy 무회귀 + 기존 .so dlopen 호환 확인.
 
-### [P2] 2. plan IR 어휘 확장 ② — K/V 비대칭 merge 가중치
-- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 없음 (1과 독립)
+### [보류 2026-06-12] 2. plan IR 어휘 확장 ② — K/V 비대칭 merge 가중치
+- **Status**: **보류 (2026-06-12 사용자 결정 B1=NO, Backlog Burndown triage)** / **Sprint**: backlog / **Dependencies**: 없음 (1과 독립)
+- **보류 근거 (B1=NO)**: AC가 요구하는 1B WeightedKV ablation(8B 결과 무비판 이식 금지 = V 정보 균등 분포 가정의 1B 성립 여부 검증)이 **검증 불가** — (a) 8B/long-context 온보딩 NO(B1) 확정 + (b) 항목 0 결과로 1B score 계열 전반 무가치 재확인(R-KV·A2SF 보류, Round 14–15 연속)이라 1B ablation 회의적. 따라서 검증 게이트를 통과할 경로 없음.
+- **재개 트리거**: **8B/long-context 모델 온보딩** — 온보딩 시 V 이질성 가정 우선순위 재평가 + WeightedKV ablation 환경 확보. (트리거 충족 전 착수 금지.)
 - **Description**: `WeightedMerge`는 K/V 동일 가중치 강제 — 2025–26 문헌이 "K=스펙트럼 집중(균질)이라 적극 merge, V=분산(이질)이라 보수적"으로 수렴(순수 merge 신규 기법의 44%가 이 가정에 차단). `from: Vec<(pos, w)>` → `(pos, w_k, w_v)` + `into_weight` 분리(최소안: `apply_to: Both|KeyOnly|ValueOnly` 1필드). `apply_merges` K/V 루프 가중 분리(F32/F16/Q4_0 — `scatter_reduce_q4` 의미 포함). `MergeAbi`/`FromPairAbi` 필드 추가(가산적).
 - **해금**: WeightedKV(ICASSP'25 2503.01330 — K discard + V만 merge), KVSlimmer(2603.00907 — 2026 이론 정당화), KeepKV 부분(2504.09936 — K log-스케일은 plugin이 가중치 계산을 끝내 plan에 굽는 방식으로 흡수, 실행은 선형 유지), EMS 부분.
 - **Acceptance Criteria**: 기존 동일-가중 경로 bit-identical(d2o_stage_eq 무회귀) + 비대칭 단위 테스트 + ABI 호환. 1B 검증: WeightedKV ablation(8B 결과 무비판 이식 금지 — V 정보 균등 분포 가정이 1B에서 성립하는지).
@@ -955,9 +960,11 @@
 - **Description**: `TensorKind::WindowedAttn`(최근 w query × 전체 key) + prefill-end 캡처. flash attention이라 행렬 materialize가 비쌈 — prefill 마지막 w 토큰 한정 보조 경로(non-flash 또는 부분 재계산) 필요. SnapKV(NeurIPS'24 2404.14469)·PyramidKV(2406.02069)·CAKE(ICLR'25 2503.12491) 해금. layer 차등 budget 자체는 기존 메커니즘(D2O layer allocator)으로 이미 가능.
 - **Notes**: 기법 "그대로"의 재현용 — 목적(미래 무용 토큰의 prefill-end 식별)만이면 항목 3이 같은 목적의 2025 frontier 대체 경로.
 
-### [P3·제품 결정] 9. 멀티세션 paging — PagedAttention/FlexGen류
-- **성격**: 기법 백로그가 아니라 **PM 로드맵 질문** — "동시 멀티 세션(대화 전환, 에이전트 병행)을 1급으로 지원하는가?" YES → allocator paging + 세션 스케줄 설계(ADR급). NO → 항목 5의 save/restore 전환으로 충분(단일 캐시 + 디스크 스왑).
-- **담당**: PM 로드맵 검토 후 개봉/폐기 판정.
+### [DROP 2026-06-12] 9. 멀티세션 paging — PagedAttention/FlexGen류
+- **Status**: DROP (폐기 — 2026-06-12 사용자 결정 B2=NO, Backlog Burndown triage)
+- **폐기 근거 (B2=NO)**: "동시 멀티 세션(대화 전환, 에이전트 병행)을 1급으로 지원하는가?" = **NO**. 따라서 allocator paging + 세션 스케줄(ADR급 설계)은 불필요 — 해당 수요는 **항목 5(세션 KV persistence, save/restore 전환)가 단일 캐시 + 디스크 스왑으로 커버**. PM 로드맵 질문에 답이 나옴.
+- **재개 트리거**: 제품 방향 전환(멀티세션 1급 지원으로 전환)이 명시되면 재등록 — 현 시점 영구 폐기 아니라 제품 결정 변경 시 부활 가능.
+- **원 성격 (아카이브)**: 기법 백로그가 아니라 PM 로드맵 질문. YES → allocator paging + 세션 스케줄 설계(ADR급). NO → 항목 5의 save/restore 전환으로 충분(단일 캐시 + 디스크 스왑).
 
 > **범위 밖 확정(영구 보류, 어느 엔진이든 코어 작업)**: 모델 아키텍처 전환(TransMLA/X-EcoMLA/Mamba류 — "지원할 입력 모델 종류" 문제로 별도), 학습 필요(MatryoshkaKV/MoQAE/NSA/MoBA/CLA/YOCO), 멀티모달(FlowMM/AIM). 상세 판정표(~70개 기법 A/B/C + 근거)는 2026-06-10 세션 기록 — 필요 시 `.agent/research/`로 보존.
 
@@ -985,16 +992,16 @@
 - **Acceptance Criteria**: `engine/tests/spec/inv_layer_baseline.json` 의 001/002/003 baseline 을 현 위반 동수(8/3/12)로 재동결 → 3건 spec test PASS 복구.
 - **Notes**: 비차단. baseline-only chore (코드 무변경).
 
-## [P3] scripts/check_spec_coverage.sh 버그 2건 — octal 해석 + INV-DECODE-STAGE ID 추출 부재 — 2026-06-10 등록
-- **Status**: TODO
+## [P3] scripts/check_spec_coverage.sh 버그 — INV-DECODE-STAGE ID 추출 부재 (잔여 1건) — 2026-06-10 등록 / 2026-06-12 축소
+- **Status**: TODO (잔여 1건으로 축소 — octal 해소됨 / 2026-06-12 Backlog Burndown triage)
 - **Sprint**: backlog
 - **Dependencies**: 없음 (비차단)
 - **출처**: roadmap β-1 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:51`) + `handoff_beta_1_complete_beta_2_entry_2026_06_10.md:52`
-- **Description**: `scripts/check_spec_coverage.sh` 기존 버그 2건 (β-1 과 무관):
-  - **(1) `printf '%03d'` leading-zero octal 해석 버그** (line ~78/91) — leading-zero ID 가 octal 로 해석되어 잘못된 번호 산출.
+- **2026-06-12 축소 근거**: (1) octal 해석 버그는 `7daa7e69`에서 L78(LAYER)/L90(RPCMEM) 두 곳 `printf '%03d' "$((10#$n))"` base-10 강제로 **해소** (L38 항목 본문 (c) 수정 기록 일치 — [6]까지 전 구간 완주 복구). 잔여 = (2)뿐.
+- **Description**: `scripts/check_spec_coverage.sh` 잔여 버그 1건:
   - **(2) INV-DECODE-STAGE 시리즈 ID 추출 로직 부재** — 해당 시리즈가 coverage 추출에서 누락.
-- **Acceptance Criteria**: (1) `printf '%03d' "$((10#$id))"` 또는 동등 처리로 octal 회피, (2) INV-DECODE-STAGE 시리즈 ID 추출 추가 → coverage 정확 산출.
-- **Notes**: 비차단. 실제 line 번호는 착수 시 grep 재확인 (위 근사치).
+- **Acceptance Criteria**: INV-DECODE-STAGE 시리즈 ID 추출 추가 → coverage 정확 산출 (신규 갭 0 확인).
+- **Notes**: 비차단. 실제 line 번호는 착수 시 grep 재확인.
 
 ## [RESOLVED] γ-4: eval/batch orphan 처분 — `run_eval_ll` + `run_prompt_batch` — 2026-06-10 등록 / 2026-06-11 종결
 - **Status**: RESOLVED (2026-06-11) — 처분 방향 합의 = **"기능은 살리고 죽은 포장지만 삭제"**. eval = argus-eval bin 으로 부활(살림, γ-3) / batch = ~1170 LOC 순수 삭제(γ-4).
