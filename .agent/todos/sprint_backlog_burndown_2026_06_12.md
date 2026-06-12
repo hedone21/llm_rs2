@@ -122,7 +122,9 @@ spec 거동 변경(SEQ-098 timeout) 동반이라 Architect 선행 필수. 디바
 
 ---
 
-#### T3 — 세션 KV persistence 항목 5 (Tier 1, P3·1B 체감 효익) · 규모 **M~L**
+#### T3 — 세션 KV persistence 항목 5 (Tier 1, P3·1B 체감 효익) · 규모 **M~L** — ✅ **종결 (2026-06-12)**
+
+> **T3 종결 기록 (2026-06-12)**: Architect(ADR-0012 + ENG-080~085/ENG-DAT-110/INV-189~191, `b207d17b`) → Implementer(`ebc59fcf` — SnapshotRestore capability, ARGUSKV1 v2, CLI `--save-prefix-cache`/`--prefix-cache`, happy path 배선) → Tester(host+S25). **게이트**: host lib **1411/0** + spec **706/0**(신규 19종) + fmt/clippy clean + coverage 신규 갭 0 / host 기능: save→restore greedy BIT-EXACT(llama3.2-1b, kv f32/f16/q4) / S25: TTFT **5085.83→0.01ms**(918tok) + OpenCL 생성 텍스트 동일 / frozen 3-dtype byte-identical + tbt Δ≤+0.1%(f32 n=5 median 53.97). **구현 중 정확성 결함 2건 적발·해소**: ① 마지막 logits 의 GEMM 배치 경로 ±ulp → greedy 분기(KV 는 cmp IDENTICAL 입증) → **last-token logits 스냅샷 포함**(v2) ② sampler history(observe_token) 누락 → `seed_sampler_history` 재구성. 교훈 = "byte-identical KV ≠ bit-exact 출력 — logits 와 sampler 상태까지가 복원 단위".
 
 C 군집 중 1B 현 타겟에서 TTFT 즉시 체감 나오는 유일 항목. 분기 취소로 동결 해제.
 
