@@ -505,20 +505,27 @@ fn demote_kv_cache_q4(cache: &mut KVCache, sliding_start: usize) {
 }
 
 /// CPU backend에서 F32 HeadMajor KV cache를 구성한다.
+///
+/// `alloc_standard_kv_caches` 패턴 준수:
+/// shape = `[1, kv_heads, initial_cap, head_dim]`, KVCache::new_dynamic으로 할당.
 fn make_f32_head_major_cache(
-    memory: &dyn Memory,
+    memory: Arc<dyn Memory>,
     cpu_backend: Arc<dyn Backend>,
     kv_heads: usize,
     head_dim: usize,
     max_seq_len: usize,
 ) -> anyhow::Result<KVCache> {
-    let buf_size = kv_heads * max_seq_len * head_dim * 4; // F32 = 4 bytes/elem
-    let k_buf = memory.alloc(buf_size, DType::F32)?;
-    let v_buf = memory.alloc(buf_size, DType::F32)?;
+    let n_values = max_seq_len * kv_heads * head_dim;
+    let buf_size = n_values * DType::F32.size();
+    let k_buf = memory.alloc_kv(buf_size, DType::F32)?;
+    let v_buf = memory.alloc_kv(buf_size, DType::F32)?;
     let shape = Shape::new(vec![1, kv_heads, max_seq_len, head_dim]);
     let k = Tensor::new(shape.clone(), k_buf, cpu_backend.clone());
     let v = Tensor::new(shape, v_buf, cpu_backend);
-    Ok(KVCache::new(k, v, max_seq_len).with_layout(KVLayout::HeadMajor))
+    Ok(
+        KVCache::new_dynamic(k, v, max_seq_len, max_seq_len, kv_heads, head_dim, memory)
+            .with_layout(KVLayout::HeadMajor),
+    )
 }
 
 /// 실모델 PPL 스모크: 설계서 §4.4-E 게이트 직접 판정.
@@ -624,7 +631,7 @@ fn test_demote_vs_sliding_real_model_ppl() {
         let mut kv_caches: Vec<KVCache> = (0..n_layers)
             .map(|_| {
                 make_f32_head_major_cache(
-                    memory.as_ref(),
+                    memory.clone(),
                     cpu_backend.clone(),
                     kv_heads,
                     head_dim,
@@ -761,7 +768,7 @@ fn test_demote_vs_sliding_real_model_ppl() {
         let mut kv_caches: Vec<KVCache> = (0..n_layers)
             .map(|_| {
                 make_f32_head_major_cache(
-                    memory.as_ref(),
+                    memory.clone(),
                     cpu_backend.clone(),
                     kv_heads,
                     head_dim,
