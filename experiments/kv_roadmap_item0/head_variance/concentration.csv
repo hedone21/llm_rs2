@@ -1,0 +1,6 @@
+domain,max_min_ratio,all_C_h_zero,status
+literary,1.0000,true,DEGENERATE: last_layer_head_attn never populated (dump_importance decode loop calls forward_into with workspace=None -> accumulate_layer_gqa skipped -> C_h all 0.0)
+encyclopedic,1.0000,true,DEGENERATE
+technical,1.0000,true,DEGENERATE
+conversational,1.0000,true,DEGENERATE
+news,1.0000,true,DEGENERATE

@@ -1,0 +1,76 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-1b/llama3.2-1b-f16.gguf
+5 warnings generated.
+6 warnings generated.
+9 warnings generated.
+9 warnings generated.
+6 warnings generated.
+3 warnings generated.
+1 warning generated.
+3 warnings and 3 errors generated.
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 146 tensors, arch=Llama, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+[Tokenizer] models/llama3.2-1b/tokenizer.json
+Prompt: Hello, world! I am a
+KV cache type: F32, layout: HeadMajor (initial capacity: 2048 tokens, 4194304B per layer, max: 2048)
+[PPL] 304 tokens, policy=h2o, kv_budget=200, kv_type=f32
+[PPL] prefill override: --ppl-prefill-tokens=150 (budget과 독립, eviction은 budget=200 기준 decode 중 발동)
+[PPL] Effective budget: 200 tokens (deterministic eviction)
+[PPL] Prefill: 150 tokens
+[PPL] Prefill NLL: 804.2690, count=149, running PPL=220.9150
+[PPL] step 200/304: NLL=1122.5212, PPL=281.6909, cache_pos=200
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[PPL] Eviction at step 263: 264 → 200 tokens (removed 64)
+{
+  "config": {
+    "eviction_policy": "h2o",
+    "eviction_target_ratio": 0.75,
+    "h2o_keep_ratio": 0.5,
+    "kv_budget": 200,
+    "kv_type": "f32",
+    "max_seq_len": 2048,
+    "model": "models/llama3.2-1b/llama3.2-1b-f16.gguf",
+    "protected_prefix": 4,
+    "skip_layers": null,
+    "skip_ratio": null,
+    "text_file": "experiments/kv_roadmap_item0/prompts/ppl01L_literary.txt"
+  },
+  "n_evictions": 1,
+  "ppl": 332.00572946319977,
+  "qcf_events": [
+    {
+      "eviction_ratio": 0.24242424964904785,
+      "ppl_at_step": 317.243509728624,
+      "qcf_caote": 0.016230063512921333,
+      "step": 263,
+      "tokens_evicted": 64
+    }
+  ],
+  "qcf_max_caote": 0.016230063512921333,
+  "qcf_sum_caote": 0.016230063512921333,
+  "token_count": 302,
+  "tokens_per_second": 41.72840538537205,
+  "total_nll": 1753.155972308431,
+  "wall_time_s": 7.237276316
+}
+
+[PPL] Final: PPL=332.0057, NLL=1753.1560, tokens=302, 41.7 tok/s, 7.2s

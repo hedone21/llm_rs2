@@ -1,0 +1,2 @@
+layer,kv_head,mpc,redundant_fraction,status
+n/a,n/a,n/a,n/a,UNMEASURABLE: R-KV stage not wired into argus_eval ppl/experiment path (eval_setup.rs match has no rkv arm; find_stage registry path unused by force_evict). Unit test uses synthetic vectors only.

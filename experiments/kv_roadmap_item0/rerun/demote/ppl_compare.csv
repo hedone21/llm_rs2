@@ -1,0 +1,6 @@
+domain,sliding_ppl,demote_q4_ppl,ppl_ratio,verdict
+literary,318.6586,388.3482,1.2187,RED
+encyclopedic,130.1392,785.5741,6.0364,RED
+technical,229.6926,564.1609,2.4562,RED
+conversational,138.1572,243.8954,1.7653,RED
+news,137.6311,813.2865,5.9092,RED

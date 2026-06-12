@@ -1,0 +1,204 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-1b/llama3.2-1b-f16.gguf
+5 warnings generated.
+6 warnings generated.
+9 warnings generated.
+9 warnings generated.
+6 warnings generated.
+3 warnings generated.
+1 warning generated.
+3 warnings and 3 errors generated.
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 146 tensors, arch=Llama, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+[Tokenizer] models/llama3.2-1b/tokenizer.json
+Prompt: Hello, world! I am a
+KV cache type: F32, layout: HeadMajor (initial capacity: 2048 tokens, 4194304B per layer, max: 2048)
+[PPL] 308 tokens, policy=rkv, kv_budget=200, kv_type=f32
+[PPL] prefill override: --ppl-prefill-tokens=150 (budget과 독립, eviction은 budget=200 기준 decode 중 발동)
+[PPL] Effective budget: 200 tokens (deterministic eviction)
+[PPL] Prefill: 150 tokens
+[PPL] Prefill NLL: 645.4831, count=149, running PPL=76.1040
+[PPL] step 200/308: NLL=939.8590, PPL=112.4951, cache_pos=200
+[RkvStats] layer=0 head=0 mpc=0.583488 fraction=0.996212
+[RkvStats] layer=0 head=1 mpc=0.550032 fraction=0.996212
+[RkvStats] layer=0 head=2 mpc=0.267148 fraction=0.996212
+[RkvStats] layer=0 head=3 mpc=0.509676 fraction=0.996212
+[RkvStats] layer=0 head=4 mpc=0.381688 fraction=0.996212
+[RkvStats] layer=0 head=5 mpc=0.287764 fraction=0.996212
+[RkvStats] layer=0 head=6 mpc=0.579806 fraction=0.996212
+[RkvStats] layer=0 head=7 mpc=0.276570 fraction=0.996212
+[RkvStats] layer=1 head=0 mpc=0.590307 fraction=1.000000
+[RkvStats] layer=1 head=1 mpc=0.499492 fraction=1.000000
+[RkvStats] layer=1 head=2 mpc=0.400142 fraction=1.000000
+[RkvStats] layer=1 head=3 mpc=0.409732 fraction=1.000000
+[RkvStats] layer=1 head=4 mpc=0.394098 fraction=1.000000
+[RkvStats] layer=1 head=5 mpc=0.419284 fraction=1.000000
+[RkvStats] layer=1 head=6 mpc=0.437474 fraction=1.000000
+[RkvStats] layer=1 head=7 mpc=0.294387 fraction=1.000000
+[RkvStats] layer=2 head=0 mpc=0.345066 fraction=0.996212
+[RkvStats] layer=2 head=1 mpc=0.736098 fraction=0.996212
+[RkvStats] layer=2 head=2 mpc=0.601538 fraction=0.996212
+[RkvStats] layer=2 head=3 mpc=0.605385 fraction=0.996212
+[RkvStats] layer=2 head=4 mpc=0.287851 fraction=0.996212
+[RkvStats] layer=2 head=5 mpc=0.584614 fraction=0.996212
+[RkvStats] layer=2 head=6 mpc=0.467799 fraction=0.996212
+[RkvStats] layer=2 head=7 mpc=0.448826 fraction=0.996212
+[RkvStats] layer=3 head=0 mpc=0.611744 fraction=0.996212
+[RkvStats] layer=3 head=1 mpc=0.353673 fraction=0.996212
+[RkvStats] layer=3 head=2 mpc=0.478373 fraction=0.996212
+[RkvStats] layer=3 head=3 mpc=0.358154 fraction=0.996212
+[RkvStats] layer=3 head=4 mpc=0.666025 fraction=0.996212
+[RkvStats] layer=3 head=5 mpc=0.778348 fraction=0.996212
+[RkvStats] layer=3 head=6 mpc=0.270100 fraction=0.996212
+[RkvStats] layer=3 head=7 mpc=0.342361 fraction=0.996212
+[RkvStats] layer=4 head=0 mpc=0.309343 fraction=0.996212
+[RkvStats] layer=4 head=1 mpc=0.203246 fraction=0.996212
+[RkvStats] layer=4 head=2 mpc=0.745579 fraction=0.996212
+[RkvStats] layer=4 head=3 mpc=0.410728 fraction=0.996212
+[RkvStats] layer=4 head=4 mpc=0.529531 fraction=0.996212
+[RkvStats] layer=4 head=5 mpc=0.573571 fraction=0.996212
+[RkvStats] layer=4 head=6 mpc=0.470441 fraction=0.996212
+[RkvStats] layer=4 head=7 mpc=0.286763 fraction=0.996212
+[RkvStats] layer=5 head=0 mpc=0.699422 fraction=0.996212
+[RkvStats] layer=5 head=1 mpc=0.646337 fraction=0.996212
+[RkvStats] layer=5 head=2 mpc=0.476882 fraction=0.996212
+[RkvStats] layer=5 head=3 mpc=0.384250 fraction=0.996212
+[RkvStats] layer=5 head=4 mpc=0.326765 fraction=0.996212
+[RkvStats] layer=5 head=5 mpc=0.412001 fraction=0.996212
+[RkvStats] layer=5 head=6 mpc=0.899760 fraction=0.996212
+[RkvStats] layer=5 head=7 mpc=0.379601 fraction=0.996212
+[RkvStats] layer=6 head=0 mpc=0.327656 fraction=0.996212
+[RkvStats] layer=6 head=1 mpc=0.186493 fraction=0.996212
+[RkvStats] layer=6 head=2 mpc=0.473042 fraction=0.996212
+[RkvStats] layer=6 head=3 mpc=0.735120 fraction=0.996212
+[RkvStats] layer=6 head=4 mpc=0.655377 fraction=0.996212
+[RkvStats] layer=6 head=5 mpc=0.702505 fraction=0.996212
+[RkvStats] layer=6 head=6 mpc=0.288458 fraction=0.996212
+[RkvStats] layer=6 head=7 mpc=0.626702 fraction=0.996212
+[RkvStats] layer=7 head=0 mpc=0.283368 fraction=0.996212
+[RkvStats] layer=7 head=1 mpc=0.453611 fraction=0.996212
+[RkvStats] layer=7 head=2 mpc=0.364043 fraction=0.996212
+[RkvStats] layer=7 head=3 mpc=0.370598 fraction=0.992424
+[RkvStats] layer=7 head=4 mpc=0.731379 fraction=0.996212
+[RkvStats] layer=7 head=5 mpc=0.316428 fraction=0.996212
+[RkvStats] layer=7 head=6 mpc=0.353750 fraction=0.996212
+[RkvStats] layer=7 head=7 mpc=0.637545 fraction=0.996212
+[RkvStats] layer=8 head=0 mpc=0.320119 fraction=0.996212
+[RkvStats] layer=8 head=1 mpc=0.725153 fraction=0.996212
+[RkvStats] layer=8 head=2 mpc=0.424214 fraction=0.996212
+[RkvStats] layer=8 head=3 mpc=0.314322 fraction=0.996212
+[RkvStats] layer=8 head=4 mpc=0.454587 fraction=0.996212
+[RkvStats] layer=8 head=5 mpc=0.343557 fraction=0.996212
+[RkvStats] layer=8 head=6 mpc=0.509561 fraction=0.996212
+[RkvStats] layer=8 head=7 mpc=0.345449 fraction=0.996212
+[RkvStats] layer=9 head=0 mpc=0.598967 fraction=0.996212
+[RkvStats] layer=9 head=1 mpc=0.595696 fraction=0.996212
+[RkvStats] layer=9 head=2 mpc=0.592693 fraction=0.996212
+[RkvStats] layer=9 head=3 mpc=0.780319 fraction=0.996212
+[RkvStats] layer=9 head=4 mpc=0.425504 fraction=0.996212
+[RkvStats] layer=9 head=5 mpc=0.731920 fraction=0.996212
+[RkvStats] layer=9 head=6 mpc=0.223544 fraction=0.996212
+[RkvStats] layer=9 head=7 mpc=0.750230 fraction=0.996212
+[RkvStats] layer=10 head=0 mpc=0.477121 fraction=0.996212
+[RkvStats] layer=10 head=1 mpc=0.655572 fraction=0.996212
+[RkvStats] layer=10 head=2 mpc=0.685671 fraction=0.996212
+[RkvStats] layer=10 head=3 mpc=0.375237 fraction=0.996212
+[RkvStats] layer=10 head=4 mpc=0.613669 fraction=0.996212
+[RkvStats] layer=10 head=5 mpc=0.638090 fraction=0.996212
+[RkvStats] layer=10 head=6 mpc=0.326669 fraction=0.996212
+[RkvStats] layer=10 head=7 mpc=0.449332 fraction=0.996212
+[RkvStats] layer=11 head=0 mpc=0.748807 fraction=0.996212
+[RkvStats] layer=11 head=1 mpc=0.343938 fraction=0.996212
+[RkvStats] layer=11 head=2 mpc=0.477763 fraction=0.996212
+[RkvStats] layer=11 head=3 mpc=0.311796 fraction=0.996212
+[RkvStats] layer=11 head=4 mpc=0.325470 fraction=0.996212
+[RkvStats] layer=11 head=5 mpc=0.301796 fraction=0.996212
+[RkvStats] layer=11 head=6 mpc=0.326119 fraction=0.996212
+[RkvStats] layer=11 head=7 mpc=0.700079 fraction=0.996212
+[RkvStats] layer=12 head=0 mpc=0.397126 fraction=0.996212
+[RkvStats] layer=12 head=1 mpc=0.683629 fraction=0.996212
+[RkvStats] layer=12 head=2 mpc=0.348343 fraction=0.996212
+[RkvStats] layer=12 head=3 mpc=0.650421 fraction=0.996212
+[RkvStats] layer=12 head=4 mpc=0.345262 fraction=0.996212
+[RkvStats] layer=12 head=5 mpc=0.328227 fraction=0.996212
+[RkvStats] layer=12 head=6 mpc=0.393550 fraction=0.996212
+[RkvStats] layer=12 head=7 mpc=0.592494 fraction=0.996212
+[RkvStats] layer=13 head=0 mpc=0.451019 fraction=0.996212
+[RkvStats] layer=13 head=1 mpc=0.372634 fraction=0.996212
+[RkvStats] layer=13 head=2 mpc=0.697467 fraction=0.996212
+[RkvStats] layer=13 head=3 mpc=0.435220 fraction=0.996212
+[RkvStats] layer=13 head=4 mpc=0.659766 fraction=0.996212
+[RkvStats] layer=13 head=5 mpc=0.521099 fraction=0.996212
+[RkvStats] layer=13 head=6 mpc=0.755788 fraction=0.996212
+[RkvStats] layer=13 head=7 mpc=0.401570 fraction=0.996212
+[RkvStats] layer=14 head=0 mpc=0.467976 fraction=0.996212
+[RkvStats] layer=14 head=1 mpc=0.312098 fraction=0.996212
+[RkvStats] layer=14 head=2 mpc=0.623770 fraction=0.996212
+[RkvStats] layer=14 head=3 mpc=0.519311 fraction=0.996212
+[RkvStats] layer=14 head=4 mpc=0.725685 fraction=0.996212
+[RkvStats] layer=14 head=5 mpc=0.640224 fraction=0.996212
+[RkvStats] layer=14 head=6 mpc=0.561867 fraction=0.996212
+[RkvStats] layer=14 head=7 mpc=0.733517 fraction=0.996212
+[RkvStats] layer=15 head=0 mpc=0.295227 fraction=0.996212
+[RkvStats] layer=15 head=1 mpc=0.476233 fraction=0.996212
+[RkvStats] layer=15 head=2 mpc=0.757352 fraction=0.996212
+[RkvStats] layer=15 head=3 mpc=0.597870 fraction=0.996212
+[RkvStats] layer=15 head=4 mpc=0.506830 fraction=0.996212
+[RkvStats] layer=15 head=5 mpc=0.640689 fraction=0.996212
+[RkvStats] layer=15 head=6 mpc=0.640639 fraction=0.996212
+[RkvStats] layer=15 head=7 mpc=0.728769 fraction=0.996212
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[KVCache] Shrunk capacity: 2048 → 320 tokens (freed 7077888 bytes)
+[PPL] Eviction at step 263: 264 → 200 tokens (removed 64)
+{
+  "config": {
+    "eviction_policy": "rkv",
+    "eviction_target_ratio": 0.75,
+    "h2o_keep_ratio": 0.5,
+    "kv_budget": 200,
+    "kv_type": "f32",
+    "max_seq_len": 2048,
+    "model": "models/llama3.2-1b/llama3.2-1b-f16.gguf",
+    "protected_prefix": 4,
+    "skip_layers": null,
+    "skip_ratio": null,
+    "text_file": "experiments/kv_roadmap_item0/prompts/ppl02L_encyclopedic.txt"
+  },
+  "n_evictions": 1,
+  "ppl": 222.471845772819,
+  "qcf_events": [
+    {
+      "eviction_ratio": 0.24242424964904785,
+      "ppl_at_step": 180.33939791862161,
+      "qcf_caote": 0.023078065365552902,
+      "step": 263,
+      "tokens_evicted": 64
+    }
+  ],
+  "qcf_max_caote": 0.023078065365552902,
+  "qcf_sum_caote": 0.023078065365552902,
+  "token_count": 306,
+  "tokens_per_second": 37.055155716499414,
+  "total_nll": 1653.8689706707225,
+  "wall_time_s": 8.25796017
+}
+
+[PPL] Final: PPL=222.4718, NLL=1653.8690, tokens=306, 37.1 tok/s, 8.3s

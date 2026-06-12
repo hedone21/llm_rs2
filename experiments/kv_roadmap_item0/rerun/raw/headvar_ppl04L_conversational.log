@@ -1,0 +1,23 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-1b/llama3.2-1b-f16.gguf
+5 warnings generated.
+6 warnings generated.
+9 warnings generated.
+9 warnings generated.
+6 warnings generated.
+3 warnings generated.
+1 warning generated.
+3 warnings and 3 errors generated.
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 146 tensors, arch=Llama, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+[Tokenizer] models/llama3.2-1b/tokenizer.json
+Prompt: So I was telling my friend the other day about this amazing trip I took to the mountains last summer, and honestly it was one of the best experiences of my entire life. We had been planning it for months, you know, checking the weather forecasts obsessively and arguing about which trail to take. My friend Sarah insisted we go for the longer route because she said the views were absolutely worth the extra effort, and let me tell you, she was completely right about that. We started early in the morning, like really early, around five o'clock when it was still dark and cold, and we could see our breath in the air. The first couple of hours were tough because the path was steep and rocky, and I kept wondering why I had agreed to this whole adventure in the first place. But then we reached this clearing near the top, and oh my goodness, the view just took my breath away. You could see for miles in every direction, rolling green valleys and snow-capped peaks and these little villages that looked like toy models from up there. We sat down on a big flat rock and ate our sandwiches, and it was so peaceful and quiet, just the sound of the wind and a few birds calling in the distance. Sarah brought out this thermos of hot chocolate and we just sat there for like an hour, not even talking much, just soaking it all in. I think those moments where you don't need to say anything are the best kind of friendship, you know what I mean. Anyway, I keep telling everyone they have to go visit that place, it really changes your perspective on things.
+
+KV cache type: F32, layout: HeadMajor (initial capacity: 2048 tokens, 4194304B per layer, max: 2048)
+[Importance] Prefill 327 tokens...
+[HeadConc] decode 32 steps, 16 layers × 8 kv_heads...
+[HeadConc] max/min C_h ratio = 37.922 (임계: <2→보류, ≥5→개봉후보)

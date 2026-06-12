@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running tests/demote_measure.rs (target/debug/deps/demote_measure-61b2f700ef598201)
+
+running 1 test
+[GGUF] Loaded: 146 tensors, arch=Llama, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+test test_demote_vs_sliding_real_model_ppl has been running for over 60 seconds
+[DemotePPL] (a) sliding PPL = 229.6926, (b) demote PPL = 564.1609
+[DemotePPL] 설계서 §4.4-E 게이트: demote PPL < sliding PPL → GO (항목 1 추진)
+[DemotePPL] 판정: RED — demote PPL (564.1609) ≥ sliding PPL (229.6926), Δ=334.4683
+test test_demote_vs_sliding_real_model_ppl ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 121.69s
+

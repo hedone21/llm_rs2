@@ -1,0 +1,23 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-1b/llama3.2-1b-f16.gguf
+5 warnings generated.
+6 warnings generated.
+9 warnings generated.
+9 warnings generated.
+6 warnings generated.
+3 warnings generated.
+1 warning generated.
+3 warnings and 3 errors generated.
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 146 tensors, arch=Llama, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+[Tokenizer] models/llama3.2-1b/tokenizer.json
+Prompt: The old lighthouse stood at the edge of the rocky cliff, its weathered stone walls bearing the scars of a hundred winters. For generations, the keeper's family had tended the great lamp, climbing the spiral staircase each evening as the sun dipped below the horizon. Eleanor remembered her grandmother's stories of ships saved from the treacherous shoals, of nights when the fog rolled in so thick that the beam was the only thing standing between the sailors and certain death. She traced her fingers along the brass railing, worn smooth by countless hands. The sea had always been both friend and enemy to those who lived along this coast. In summer it sparkled like scattered diamonds, inviting children to play in its shallows, but in the dark months of autumn it turned grey and hungry, swallowing boats whole and leaving widows weeping on the shore. Tonight the wind howled through the cracks in the ancient windows, carrying with it the salt and the secrets of distant lands. Eleanor lit the lamp as her ancestors had done, watching the flame catch and grow, casting long shadows across the circular room. Somewhere out in the darkness, a vessel was making its way home, guided by the steady pulse of light that swept across the waves. She thought of all the lives this lighthouse had touched, all the stories it could tell if only stone could speak. The night stretched before her, long and uncertain, but she was not afraid, for she carried within her the quiet courage of those who had come before.
+
+KV cache type: F32, layout: HeadMajor (initial capacity: 2048 tokens, 4194304B per layer, max: 2048)
+[Importance] Prefill 304 tokens...
+[HeadConc] decode 32 steps, 16 layers × 8 kv_heads...
+[HeadConc] max/min C_h ratio = 66.540 (임계: <2→보류, ≥5→개봉후보)

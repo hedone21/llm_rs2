@@ -1,0 +1,5 @@
+metric,axis,demote_q4_nmse,demote_q2_nmse,sliding_nmse,note
+q4_vs_q2_gap,K,0.0306,0.7437,n/a,Q2/Q4=24.3x (2-bit 급락 방향 재현)
+q4_vs_q2_gap,V,0.0037,0.0938,n/a,Q2/Q4=25.4x
+demote_vs_sliding_smoke,K,0.1453,n/a,0.7500,demote(전체Q4) < sliding(75%버림 NMSE)
+demote_vs_sliding_smoke,V,0.0039,n/a,0.7500,demote < sliding

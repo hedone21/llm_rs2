@@ -1,0 +1,6 @@
+domain,max_min_ratio,max_2nd_min_ratio,ch_max,ch_min,sparse_heads,dispersed_heads,note
+literary,66.540,9.002,0.2289,0.0034,3,2,real C_h (label layer0 = last-processed layer; layers 1-15 = 0 by API limit)
+encyclopedic,121.854,11.226,0.2149,0.0018,2,3,real C_h (label layer0 = last-processed layer; layers 1-15 = 0 by API limit)
+technical,67.013,12.602,0.2677,0.0040,4,3,real C_h (label layer0 = last-processed layer; layers 1-15 = 0 by API limit)
+conversational,37.922,11.455,0.2535,0.0067,3,4,real C_h (label layer0 = last-processed layer; layers 1-15 = 0 by API limit)
+news,25.184,4.561,0.1472,0.0058,0,4,real C_h (label layer0 = last-processed layer; layers 1-15 = 0 by API limit)

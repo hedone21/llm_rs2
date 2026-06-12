@@ -1,0 +1,750 @@
+{
+  "head_concentration": {
+    "decode_steps": 32,
+    "matrix": [
+      {
+        "C_h": 0.003994434606283903,
+        "kv_head": 0,
+        "layer": 0
+      },
+      {
+        "C_h": 0.19053027033805847,
+        "kv_head": 1,
+        "layer": 0
+      },
+      {
+        "C_h": 0.022732742130756378,
+        "kv_head": 2,
+        "layer": 0
+      },
+      {
+        "C_h": 0.02124040015041828,
+        "kv_head": 3,
+        "layer": 0
+      },
+      {
+        "C_h": 0.23157304525375366,
+        "kv_head": 4,
+        "layer": 0
+      },
+      {
+        "C_h": 0.16653874516487122,
+        "kv_head": 5,
+        "layer": 0
+      },
+      {
+        "C_h": 0.056565020233392715,
+        "kv_head": 6,
+        "layer": 0
+      },
+      {
+        "C_h": 0.267678827047348,
+        "kv_head": 7,
+        "layer": 0
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 1
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 1
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 1
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 1
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 1
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 1
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 1
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 1
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 2
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 2
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 2
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 2
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 2
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 2
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 2
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 2
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 3
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 3
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 3
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 3
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 3
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 3
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 3
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 3
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 4
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 4
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 4
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 4
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 4
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 4
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 4
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 4
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 5
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 5
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 5
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 5
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 5
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 5
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 5
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 5
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 6
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 6
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 6
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 6
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 6
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 6
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 6
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 6
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 7
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 7
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 7
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 7
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 7
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 7
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 7
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 7
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 8
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 8
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 8
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 8
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 8
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 8
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 8
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 8
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 9
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 9
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 9
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 9
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 9
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 9
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 9
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 9
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 10
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 10
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 10
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 10
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 10
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 10
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 10
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 10
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 11
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 11
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 11
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 11
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 11
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 11
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 11
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 11
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 12
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 12
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 12
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 12
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 12
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 12
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 12
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 12
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 13
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 13
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 13
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 13
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 13
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 13
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 13
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 13
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 14
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 14
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 14
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 14
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 14
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 14
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 14
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 14
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 0,
+        "layer": 15
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 1,
+        "layer": 15
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 2,
+        "layer": 15
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 3,
+        "layer": 15
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 4,
+        "layer": 15
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 5,
+        "layer": 15
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 6,
+        "layer": 15
+      },
+      {
+        "C_h": 0.0,
+        "kv_head": 7,
+        "layer": 15
+      }
+    ],
+    "max_min_ratio": 67.01294708251953,
+    "top_frac": 0.05000000074505806
+  },
+  "importance": [
+    {
+      "importance": 0.9552025198936462,
+      "layer": 0,
+      "opr": 10.470846176147461,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.6200842261314392,
+      "layer": 1,
+      "opr": 0.9952026605606079,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.1560773253440857,
+      "layer": 2,
+      "opr": 0.607607364654541,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.1604015827178955,
+      "layer": 3,
+      "opr": 0.6100373864173889,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.21900159120559692,
+      "layer": 4,
+      "opr": 0.6700383424758911,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.21812182664871216,
+      "layer": 5,
+      "opr": 0.6932430863380432,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.21662074327468872,
+      "layer": 6,
+      "opr": 0.6620925664901733,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.27066272497177124,
+      "layer": 7,
+      "opr": 0.7632297277450562,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.20551419258117676,
+      "layer": 8,
+      "opr": 0.6503210663795471,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.2175195813179016,
+      "layer": 9,
+      "opr": 0.8299301862716675,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.11462432146072388,
+      "layer": 10,
+      "opr": 0.49842798709869385,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.11021870374679565,
+      "layer": 11,
+      "opr": 0.5863161087036133,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.09724730253219604,
+      "layer": 12,
+      "opr": 0.5679027438163757,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.12665802240371704,
+      "layer": 13,
+      "opr": 0.7450969815254211,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.1390966773033142,
+      "layer": 14,
+      "opr": 0.7020423412322998,
+      "sublayer": "Full"
+    },
+    {
+      "importance": 0.664375364780426,
+      "layer": 15,
+      "opr": 2.167771816253662,
+      "sublayer": "Full"
+    }
+  ],
+  "model": "models/llama3.2-1b/llama3.2-1b-f16.gguf",
+  "num_layers": 16,
+  "prompt_tokens": 326
+}

@@ -1,0 +1,23 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-1b/llama3.2-1b-f16.gguf
+5 warnings generated.
+6 warnings generated.
+9 warnings generated.
+9 warnings generated.
+6 warnings generated.
+3 warnings generated.
+1 warning generated.
+3 warnings and 3 errors generated.
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 146 tensors, arch=Llama, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+[Tokenizer] models/llama3.2-1b/tokenizer.json
+Prompt: City officials announced yesterday that the long-awaited renovation of the downtown transit station will begin next month, marking the start of a project that has been under discussion for nearly a decade. The comprehensive overhaul, estimated to cost approximately forty million dollars, aims to modernize the aging facility while improving accessibility for the thousands of commuters who pass through its doors each day. According to the transportation department spokesperson, the project will be completed in three phases over a period of roughly two years, with the first phase focusing on structural repairs and the installation of new elevators and escalators. Local business owners in the surrounding area have expressed mixed reactions to the announcement, with some welcoming the promised increase in foot traffic once construction is complete, while others voiced concerns about the potential disruption to their operations during the lengthy building period. The mayor addressed these concerns at a press conference held outside city hall, assuring residents that the city had developed a detailed plan to minimize inconvenience and maintain pedestrian access throughout the construction process. Public transit advocates have generally praised the initiative, noting that the current station, which was originally built more than sixty years ago, has long struggled to accommodate the growing number of passengers in the rapidly expanding metropolitan region. Funding for the project comes from a combination of federal infrastructure grants and municipal bonds approved by voters in last year's election. Officials emphasized that the renovated station will feature improved lighting, modern security systems, and energy-efficient climate control, representing a significant investment in the future of the city's public transportation network and the daily lives of its residents.
+
+KV cache type: F32, layout: HeadMajor (initial capacity: 2048 tokens, 4194304B per layer, max: 2048)
+[Importance] Prefill 305 tokens...
+[HeadConc] decode 32 steps, 16 layers × 8 kv_heads...
+[HeadConc] max/min C_h ratio = 25.184 (임계: <2→보류, ≥5→개봉후보)

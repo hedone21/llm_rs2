@@ -1,0 +1,129 @@
+{
+  "domains": {
+    "literary": {
+      "sliding_ppl": 326.1727,
+      "decay0": {
+        "ppl": 332.0057,
+        "bos_ratio": 28.1565
+      },
+      "decay7": {
+        "ppl": 330.5977,
+        "bos_ratio": 15.0611
+      },
+      "decay8": {
+        "ppl": 330.7912,
+        "bos_ratio": 14.6429
+      },
+      "decay9": {
+        "ppl": 330.9602,
+        "bos_ratio": 14.2715
+      },
+      "bos_ratio_drop_d0_to_d8_pct": 47.99,
+      "hh_jaccard_d0_vs_d8": 0.81,
+      "d8_beats_sliding": false
+    },
+    "encyclopedic": {
+      "sliding_ppl": 219.3987,
+      "decay0": {
+        "ppl": 221.3505,
+        "bos_ratio": 36.5158
+      },
+      "decay7": {
+        "ppl": 221.3605,
+        "bos_ratio": 12.5505
+      },
+      "decay8": {
+        "ppl": 221.7912,
+        "bos_ratio": 12.2428
+      },
+      "decay9": {
+        "ppl": 220.9783,
+        "bos_ratio": 11.4528
+      },
+      "bos_ratio_drop_d0_to_d8_pct": 66.47,
+      "hh_jaccard_d0_vs_d8": 0.7778,
+      "d8_beats_sliding": false
+    },
+    "technical": {
+      "sliding_ppl": 277.3507,
+      "decay0": {
+        "ppl": 263.4322,
+        "bos_ratio": 33.7018
+      },
+      "decay7": {
+        "ppl": 265.7978,
+        "bos_ratio": 11.4216
+      },
+      "decay8": {
+        "ppl": 267.6184,
+        "bos_ratio": 10.923
+      },
+      "decay9": {
+        "ppl": 267.7669,
+        "bos_ratio": 10.8388
+      },
+      "bos_ratio_drop_d0_to_d8_pct": 67.59,
+      "hh_jaccard_d0_vs_d8": 0.7857,
+      "d8_beats_sliding": true
+    },
+    "conversational": {
+      "sliding_ppl": 203.4585,
+      "decay0": {
+        "ppl": 201.298,
+        "bos_ratio": 33.2621
+      },
+      "decay7": {
+        "ppl": 201.539,
+        "bos_ratio": 9.4008
+      },
+      "decay8": {
+        "ppl": 201.6591,
+        "bos_ratio": 8.9476
+      },
+      "decay9": {
+        "ppl": 202.1142,
+        "bos_ratio": 8.2506
+      },
+      "bos_ratio_drop_d0_to_d8_pct": 73.1,
+      "hh_jaccard_d0_vs_d8": 0.7857,
+      "d8_beats_sliding": true
+    },
+    "news": {
+      "sliding_ppl": 267.1998,
+      "decay0": {
+        "ppl": 271.5382,
+        "bos_ratio": 31.441
+      },
+      "decay7": {
+        "ppl": 270.1618,
+        "bos_ratio": 13.2302
+      },
+      "decay8": {
+        "ppl": 269.8198,
+        "bos_ratio": 12.4508
+      },
+      "decay9": {
+        "ppl": 269.9841,
+        "bos_ratio": 12.039
+      },
+      "bos_ratio_drop_d0_to_d8_pct": 60.4,
+      "hh_jaccard_d0_vs_d8": 0.8018,
+      "d8_beats_sliding": false
+    }
+  },
+  "aggregate": {
+    "mean_bos_ratio_drop_pct": 63.11,
+    "mean_hh_jaccard": 0.7922,
+    "h2o_d0_beats_sliding": 2,
+    "h2o_d8_beats_sliding": 2
+  },
+  "gate": {
+    "threshold": "BOS ratio >=30% 감소 AND EMR Δ >= +2%p vs sliding -> GO",
+    "bos_drop_pct": 63.11,
+    "bos_drop_condition_met": true,
+    "emr_measurable": false,
+    "ppl_proxy_d8_beats_sliding": "2/5",
+    "verdict": "보류 — BOS ratio 감소(63.1%) 조건 충족하나 PPL proxy 에서 sliding 우세(d8 2/5 win, AND 조건 미충족). 설계서 §2.2-D 예측대로(완화돼도 sliding 못 이김).",
+    "first_pass_signal_reversal": "1차 스모크 decay 0.8이 BOS ratio 증가(11.34->17.11) 신호 == e2e 미배선 오측정. 본측정은 전 도메인 BOS ratio 감소(63.1%) 확정."
+  }
+}

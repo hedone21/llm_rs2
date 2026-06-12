@@ -1,0 +1,23 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-1b/llama3.2-1b-f16.gguf
+5 warnings generated.
+6 warnings generated.
+9 warnings generated.
+9 warnings generated.
+6 warnings generated.
+3 warnings generated.
+1 warning generated.
+3 warnings and 3 errors generated.
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 146 tensors, arch=Llama, weight_dtype=F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+[Tokenizer] models/llama3.2-1b/tokenizer.json
+Prompt: In modern distributed systems, achieving consensus among multiple nodes in the presence of failures is one of the most challenging problems in computer science. The Raft consensus algorithm was designed to be more understandable than its predecessor Paxos while providing equivalent guarantees of safety and availability. Raft decomposes the consensus problem into three relatively independent subproblems, namely leader election, log replication, and safety. At any given time, each server in a Raft cluster exists in one of three states, follower, candidate, or leader. Under normal operation there is exactly one leader and all other servers are followers. The leader handles all client requests, appending new entries to its log and replicating them to the followers. If a follower receives no communication from the leader over a period known as the election timeout, it assumes the leader has failed and transitions to the candidate state to begin a new election. The candidate increments its current term, votes for itself, and requests votes from the other servers in the cluster. A candidate that receives votes from a majority of servers becomes the new leader. To ensure safety, Raft guarantees that if any server has applied a particular log entry to its state machine, no other server will ever apply a different command for the same log index. This property is maintained through a combination of the election restriction, which prevents a candidate from winning unless its log is at least as up to date as a majority, and the commitment rules that govern when entries are considered durable. The elegance of Raft lies in its strong leader approach, where log entries flow only from the leader to the followers, simplifying the management of the replicated log considerably.
+
+KV cache type: F32, layout: HeadMajor (initial capacity: 2048 tokens, 4194304B per layer, max: 2048)
+[Importance] Prefill 326 tokens...
+[HeadConc] decode 32 steps, 16 layers × 8 kv_heads...
+[HeadConc] max/min C_h ratio = 67.013 (임계: <2→보류, ≥5→개봉후보)

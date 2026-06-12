@@ -1,0 +1,57 @@
+{
+  "domains": {
+    "literary": {
+      "sliding_ppl": 322.7781,
+      "h2o_decay0_ppl": 328.2578,
+      "h2o_decay8_ppl": 327.3976,
+      "decay0to8_ppl_pct": -0.262,
+      "h2o0_vs_sliding_ppl_pct": 1.698,
+      "h2o_beats_sliding": false
+    },
+    "encyclopedic": {
+      "sliding_ppl": 216.5767,
+      "h2o_decay0_ppl": 218.9727,
+      "h2o_decay8_ppl": 218.1263,
+      "decay0to8_ppl_pct": -0.387,
+      "h2o0_vs_sliding_ppl_pct": 1.106,
+      "h2o_beats_sliding": false
+    },
+    "technical": {
+      "sliding_ppl": 277.8159,
+      "h2o_decay0_ppl": 262.8472,
+      "h2o_decay8_ppl": 268.0673,
+      "decay0to8_ppl_pct": 1.986,
+      "h2o0_vs_sliding_ppl_pct": -5.388,
+      "h2o_beats_sliding": true
+    },
+    "conversational": {
+      "sliding_ppl": 198.5369,
+      "h2o_decay0_ppl": 197.2185,
+      "h2o_decay8_ppl": 196.8493,
+      "decay0to8_ppl_pct": -0.187,
+      "h2o0_vs_sliding_ppl_pct": -0.664,
+      "h2o_beats_sliding": true
+    },
+    "news": {
+      "sliding_ppl": 262.4507,
+      "h2o_decay0_ppl": 265.9899,
+      "h2o_decay8_ppl": 265.4788,
+      "decay0to8_ppl_pct": -0.192,
+      "h2o0_vs_sliding_ppl_pct": 1.349,
+      "h2o_beats_sliding": false
+    }
+  },
+  "aggregate": {
+    "mean_decay0to8_ppl_pct": 0.192,
+    "mean_h2o0_vs_sliding_pct": -0.38,
+    "h2o_wins_vs_sliding": 2,
+    "note_decay_positive_means_worse": "decay0to8_ppl_pct > 0 = forgetting worsens PPL"
+  },
+  "gate": {
+    "threshold": "BOS ratio >=30% 감소 AND EMR Δ >= +2%p vs sliding -> GO",
+    "BOS_ratio_measurable": false,
+    "EMR_measurable": false,
+    "proxy_signal": "decay 0->0.8 mean PPL delta = 0.192% (방향: forgetting이 1B 품질 개선 못함)",
+    "verdict": "보류 (RED 방향) — 게이트 직접 지표(BOS ratio/EMR) e2e 추출 불가 + proxy(PPL)가 개선 부재/악화 방향"
+  }
+}

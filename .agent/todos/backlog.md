@@ -868,18 +868,20 @@
 > **결론**: plan-returning 골격과 3축 직교는 견고 — 식별된 어떤 갭도 "stage 직접 쓰기 권한"으로는 풀리지 않음(입력 부재/어휘 부족/구조 부재가 원인). 갭은 IR 어휘 3건(항목 1–3) + 표면 2건(항목 4–5) + 트리거 보류 3군집(항목 6–8)으로 수렴. 항목 1–5 수행 시 다룰 수 있는 영역(57개) 기준 표현 커버리지 **~40% → ~80%**, 잔여는 전부 개봉 조건이 명시된 의도적 보류.
 > **착수 순서 (사용자 결정 2026-06-10)**: 0(검증 선행) → 1–3(어휘 확장) → 4(read-plan ADR) → 5(persistence — **결이 달라 마지막**). 6–9는 트리거 개봉.
 
-### [P2] 0. 검증 선행 — 확장 0개로 가능한 1B 실측 3종
-- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 없음
-- **Description**: 후속 확장의 선결 게이트. 조사 기법의 효익은 전부 7–8B+/long-context 검증이라(Round 14–15 교훈: 1B에서 누적 score 차별화 무가치) 1B 실측 없이 착수 금지.
-  1. **R-KV** (NeurIPS'25, arXiv 2505.24133) — cosine redundancy + importance joint eviction. 현 `KVCacheStage`로 표현 가능(새 TensorKind 0개), D2O의 `dequant_k` cosine 인프라 재사용. 2048ctx에서 redundant 토큰 비율 실측 포함. 조사 결과 현 설계 최적합 2025 신규 기법.
-  2. **A2SF** (arXiv 2407.20485) — score accumulator에 forgetting factor(엔진측 소형 수정, plan 사후 적용 불가) 후 sliding/H2O 대비. 1B BOS 지배(Round 15: BOS=3002 vs prompt avg 3.3) 완화 가설 검증.
-  3. **head importance 분산 실측** — 항목 6(per-head 가변 budget)의 개봉 게이트. 1B 16층×8 kv_head에서 head별 attention concentration 분산이 8B급(Ada-KV 전제)으로 큰지.
-- **Acceptance Criteria**: 3종 실측 리포트(EMR/PPL/Top-K, `docs/30_evaluation_methodology.md` 준수). 1·2는 sliding 대비 우열 판정, 3은 항목 6 개봉/보류 판정.
-- **Notes**: R-KV는 reasoning long-CoT 대상이라 2048ctx에서 redundant 비율이 낮으면 보류가 정당한 결론.
+### [RESOLVED 2026-06-12] 0. 검증 선행 — 확장 0개로 가능한 1B 실측 (4종: 3 + 항목 1 게이트)
+- **Status**: **RESOLVED (2026-06-12)** / **Sprint**: completed / **Dependencies**: 없음
+- **판정 요약 (4종)**: **R-KV 보류**(redundant fraction 0.9964 포화·rkv≈h2o 퇴화·vs sliding PPL ratio 0.9982 동률) / **A2SF 보류**(BOS ratio 63.1% 감소로 forgetting 동작 확인되나 PPL 2/5 win로 sliding 미달) / **head 분산 개봉 후보**(max/min 63.7배·2nd-min 9.8배 ≥ 5배 — 단 최종 layer 1개 해상도 한계) / **Demote RED**(실모델 PPL 5/5 RED, ratio 1.22~6.04× — 항목 1 게이트 = 전체 보류).
+- **D4 적용**: 기법 항목(R-KV·A2SF·Demote=항목1)은 게이트 RED/보류 존중. 인프라 항목 3·4는 1B 승패 무관 진행(아래 각 항목 표기).
+- **종합 리포트**: `experiments/kv_roadmap_item0/rerun/REPORT.md` (P3 재측정, HEAD `c702ff83`) / **게이트 임계 SSOT**: `arch/kv_roadmap_item0_measurement.md` §5 / **스프린트 기록**: `.agent/todos/sprint_kv_roadmap_item0_2026_06_12.md`.
+- **측정 경위**: 1차 측정에서 P2 구현 4종 e2e 배선 누락 발견 → 수정 라운드 7커밋(`449cf55f`..`1182fa0c`, HEAD `c702ff83`) → 재측정 확정. 프로토콜 편차 2건: ① prefill 전체 고정이 PPL 모드와 충돌(decode=0→eviction 미발동)하여 prefill=150 통일로 대체, ② EMR 미산출이라 PPL ratio로 대체(보류 판정 불변). 상세 = 스프린트 파일 §P3 결과.
+- **부수 실측**: qcf_sum ↔ PPL 역전(sliding 0.60 vs h2o 0.018인데 PPL은 sliding 우세) — L1112 "QCF_kv 정규화 비대칭" 설계 라운드의 수식 포화 결함을 독립 경로에서 보강(해당 항목에 cross-ref 추가됨).
+- **원 Description (아카이브)**: 후속 확장의 선결 게이트 — 조사 기법 효익은 전부 7–8B+/long-context 검증(Round 14–15 교훈: 1B에서 누적 score 차별화 무가치)이라 1B 실측 없이 착수 금지. R-KV(arXiv 2505.24133) / A2SF(arXiv 2407.20485) / head 분산(항목 6 개봉 게이트) + Demote 모사(항목 1 게이트, D3 합류).
 
-### [P2] 1. plan IR 어휘 확장 ① — `Demote` op ("보존하되 저정밀로" 제3 상태)
-- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 게이트 실험(아래) GREEN
-- **게이트 실험 (구현 전 모사)**: host eval에서 F16 캐시의 선택 토큰을 Q4/Q2 왕복 양자화해 "content-aware 강등이 sliding eviction을 품질(PPL/EMR)에서 이기는가"만 선검증. Round 14–15와 동일 위험(1B score 신뢰성)이므로 RED면 본 항목 전체 보류.
+### [보류 2026-06-12] 1. plan IR 어휘 확장 ① — `Demote` op ("보존하되 저정밀로" 제3 상태)
+- **Status**: **보류 (게이트 RED, 2026-06-12)** / **Sprint**: backlog / **Dependencies**: 게이트 실험(아래) — **RED 확정**
+- **게이트 판정 (2026-06-12, 항목 0 스프린트 P2d/P3)**: Demote 모사 실모델 PPL **5/5 도메인 RED** (demote PPL ratio 1.22~6.04× — 전부 sliding보다 나쁨). 즉 **현 1B 타겟에서 demote가 sliding을 이기지 못함** — 논문의 "4×@4bit > 1×@16bit"가 1B/2048/비-reasoning에서 미재현. NMSE 보조 신호(demote 0.145 < sliding 0.75)는 demote 우세였으나 실추론 PPL이 정본(K 2차 효과가 NMSE에 미포착). 리포트: `experiments/kv_roadmap_item0/rerun/REPORT.md` §측정 4.
+- **재개 조건**: 8B/long-context 온보딩 또는 retrieval 태스크 실수요. 재개 시 동일 모사 게이트 GREEN 선행 필수(Round 14–15 위험 = 1B score 신뢰성).
+- **게이트 실험 (구현 전 모사)**: host eval에서 F16 캐시의 선택 토큰을 Q4/Q2 왕복 양자화해 "content-aware 강등이 sliding eviction을 품질(PPL/EMR)에서 이기는가"만 선검증. Round 14–15와 동일 위험(1B score 신뢰성)이므로 RED면 본 항목 전체 보류. → **2026-06-12 RED 확정 → 보류.**
 - **Description**: 현 IR은 keep(보존) 아니면 소멸(evict/merge)의 이분법 — 문헌은 "evict 후보를 버리는 대신 저정밀 강등"(quantized pruning)이 순수 eviction을 일관되게 이기는 쪽으로 정착(arXiv 2412.12706). KIVI 합성 패턴이 못 덮는 이유 = 강등 경계가 시간 규칙이 아니라 importance 기반 **stage의 결정**이라, 결정(stage)→실행(format) 간 IR 채널이 미싱 링크.
   - `KVCachePlan`에 `demotes: Vec<DemoteSpec { tokens, level: u8 }>` 추가 (level 해석은 format 책임)
   - `KVCacheFormat::demote(tokens, level)` optional 메서드 — 미지원 format은 명시적 Err(fail-fast)
@@ -894,15 +896,18 @@
 - **Description**: `WeightedMerge`는 K/V 동일 가중치 강제 — 2025–26 문헌이 "K=스펙트럼 집중(균질)이라 적극 merge, V=분산(이질)이라 보수적"으로 수렴(순수 merge 신규 기법의 44%가 이 가정에 차단). `from: Vec<(pos, w)>` → `(pos, w_k, w_v)` + `into_weight` 분리(최소안: `apply_to: Both|KeyOnly|ValueOnly` 1필드). `apply_merges` K/V 루프 가중 분리(F32/F16/Q4_0 — `scatter_reduce_q4` 의미 포함). `MergeAbi`/`FromPairAbi` 필드 추가(가산적).
 - **해금**: WeightedKV(ICASSP'25 2503.01330 — K discard + V만 merge), KVSlimmer(2603.00907 — 2026 이론 정당화), KeepKV 부분(2504.09936 — K log-스케일은 plugin이 가중치 계산을 끝내 plan에 굽는 방식으로 흡수, 실행은 선형 유지), EMS 부분.
 - **Acceptance Criteria**: 기존 동일-가중 경로 bit-identical(d2o_stage_eq 무회귀) + 비대칭 단위 테스트 + ABI 호환. 1B 검증: WeightedKV ablation(8B 결과 무비판 이식 금지 — V 정보 균등 분포 가정이 1B에서 성립하는지).
+- **참고 (2026-06-12, 항목 0 결과)**: 변동 없음(자체 1B ablation 게이트 유지)이나, 항목 0에서 **1B score 계열 전반이 무가치로 재확인**(R-KV·A2SF 보류, Round 14–15 연속) → 1B ablation은 회의적 전망. 8B 온보딩 시 우선순위 재평가 권장.
 
 ### [P2] 3. StageCtx 어휘 확장 ③ — `QueryStats` TensorKind
-- **Status**: TODO / **Sprint**: backlog / **Dependencies**: 없음 (항목 4의 신호 공급원으로 선행 권장)
+- **Status**: TODO — **차기 착수 대상 (D4 확정 경로, 2026-06-12)** / **Sprint**: next / **Dependencies**: 없음 (항목 4의 신호 공급원으로 선행 권장)
+- **D4 비차단 확인 (2026-06-12)**: 인프라 항목이라 항목 0 기법 게이트 RED와 **무관하게 진행**. 항목 4의 신호 공급원이므로 4보다 선행 권장 → 항목 3+4가 항목 0 종결 후 차기 착수 1순위.
 - **Description**: prefill-end 압축 패러다임(SnapKV류)의 신호인 windowed attention 행렬은 flash attention이 materialize하지 않음(우리/문헌 공통 제약) — 2025 frontier(Expected Attention, arXiv 2510.00636)는 행렬 대신 **query 분포 통계로 미래 attention을 closed-form 추정**. `TensorKind::QueryStats`(per layer·kv_head Q running mean/var) 추가 + forward 경로 Q 캡처 1지점(`AttentionScoreAccumulator` 패턴 재사용). ADR-0004 §7이 예고한 자리("query_state(Quest) 캡처 미배선 → 후속 PR").
 - **해금**: Expected Attention, LU-KV·MixKVQ 부분. 항목 4(read-plan)의 Quest류 page 선택 신호로 재사용(시너지).
 - **Acceptance Criteria**: TensorKind variant + 엔진 누적 배선 + host 통계 정확성 테스트 + 기존 기법(`tensor()` 소비자) 무영향.
 
 ### [P2] 4. read-plan 표면 ADR — "무엇을 읽을지"의 4번째 plugin 표면
-- **Status**: TODO (ADR 작성까지가 본 항목 — 구현은 ADR 산출물로 별도 등록) / **Sprint**: backlog / **Dependencies**: 항목 3 권장 선행
+- **Status**: TODO — **차기 착수 대상 (D4 확정 경로, 2026-06-12)** (ADR 작성까지가 본 항목 — 구현은 ADR 산출물로 별도 등록) / **Sprint**: next / **Dependencies**: 항목 3 권장 선행
+- **D4 비차단 확인 (2026-06-12)**: 인프라 항목이라 항목 0 기법 게이트 RED와 **무관하게 진행**. 항목 3(QueryStats) 선행 권장 → 항목 3+4 묶음이 차기 착수 1순위.
 - **Description**: `attention_into`는 캐시 전체 읽기를 가정하고 selection 인자가 없음 — 선택적 읽기(Quest류)와 예측 prefetch(InfiniGen/KVSwap류)가 통째로 차단. `KVCacheStage`와 대칭인 plan-returning trait `KVReadStage::read_plan(ctx) → KVReadPlan{granularity, select}`.
   - **핵심 통찰**: layer i−1에서 산출한 read plan = Quest에겐 읽기 마스크, KVSwap에겐 layer i의 prefetch 목록 — 표면 하나로 두 군집(~9건) 동시 해소
   - format은 `attention_into_selected` capability **opt-in**(미지원 format은 full read 폴백) → 합성성 보존. "Quest를 전용 format에 매장"은 format 축 안에서 M×N 재발(Quest-on-KIVI마다 신규 format)이라 표면 신설이 정공
@@ -922,6 +927,7 @@
 
 ### [P3·트리거] 6. per-head 가변 budget 회계 — Ada-KV/HeadKV/LAVa/EMS/LU-KV 군집
 - **개봉 트리거**: 항목 0-3(1B head importance 분산 실측)에서 분산 大 판정 **그리고** head-adaptive 기법 실수요(논문 비교군 포함).
+- **트리거 상태 (2026-06-12, 항목 0 결과)**: **부분 충족** — "분산 大 판정"은 ✅ (max/min C_h 평균 63.7배, 0-수렴 head 배제한 2nd-min 기준도 ~9.8배 ≥ 게이트 5배 / sparse~0.25·dispersed~0.004 head 명확 공존, `experiments/kv_roadmap_item0/rerun/REPORT.md` §측정 3). **단 단일 layer 해상도 한계** — `last_step_head_attn()`이 최종 디코더 layer 1개만 반환(API 제약, 설계서 §2.3-B 의도된 단순화), 16층 전체 분산 미측정. **잔여 개봉 트리거 2건**: (a) head-adaptive 실수요(논문 비교군), (b) 다층 해상도 확인(소규모 보강 측정 — 분산이 단일 layer 아티팩트가 아님을 확정). 두 잔여 충족 전 착수 금지(§Notes ARM64 변길이 per-head 커널 재설계 비용 위험).
 - **Description**: `KeepSpec::PerHead`는 타입상 이미 ragged 표현 가능 — 차단은 어휘가 아니라 **엔진 불변식**: `new_pos = keep.len()` 도출, HeadMajor 균일 stride, decode loop 단일 pos 회계, ragged attention 커널(전용 format으로 격리 가능하나 pos 회계는 엔진 잔존). 잔여 C 중 가장 뼈아픈 군집 — head 차등 budget이 2025–26 SOTA의 핵심 차별점(Ada-KV NeurIPS'25 2407.11550, HeadKV ICLR'25 2410.19258, LAVa 2509.09754, EMS 2412.08521, LU-KV 2602.08585).
 - **Notes**: ARM64/Adreno에서 변길이 per-head KV 커널 재설계 비용이 효익을 압도할 위험 — 게이트 통과 전 착수 금지.
 
@@ -1129,6 +1135,7 @@
   1. **estimator 우회 해소 방향**: (A) 엔진측 ΔPPL 환산 — estimator 장착, spec 무변경, 가족 간 비교 합법화, 향후 캘리브레이션 시 manager 무변경 (권장) vs (B) raw 직송 합법화 — 코드 무변경, spec ENG-ALG-050 step 4 개정, 가족 간 raw 비교 고착. **floor의 단위가 이 결정을 따름** (1번 확정 후 2번 값 산정이 한 번에 끝남).
   2. **QCF_FLOOR 재설정**: (A) 이번 라운드 포함 — 수정 후 S25 분포 실측(양 가족) → 4임계+V_Q 재산정 → policy_default.lua 반영 → 매트릭스 30 재검증 봉인 (권장; directive 변동 리스크 있음) vs (B) 현행 유지 — dead config 잔존(V_Q soft 페널티는 계속 작동), 분포 실측 후일 이중 작업.
 - **Acceptance Criteria**: ① 수식+spec(ENG-ALG-051)+docs(qcf_taxonomy §2.1/§2.2.1) 3소스 동기화, ② estimator 우회 방향 결정+구현, ③ floor 재설정, ④ d2o 테스트 재보정, ⑤ `signal_memory_critical` f16/q4 S25 verify GREEN (이 시나리오가 회귀 게이트).
+- **독립 보강 실측 (2026-06-12, KV roadmap 항목 0 스프린트)**: 품질 eval 경로에서 `qcf_sum` ↔ PPL **역전** 관찰 — sliding 0.60 vs h2o 0.018인데 실 PPL은 sliding 우세. 본 항목의 수식 포화 결함(o_before 비정규화 → QCF 0.985 포화)을 IPC/verify와 무관한 독립 경로에서 재확인. 리포트: `experiments/kv_roadmap_item0/rerun/REPORT.md` 부수 관찰 + `.agent/todos/sprint_kv_roadmap_item0_2026_06_12.md` §부수 관찰.
 - **참고**: v1(4월)의 동 시나리오 PASS는 fixture relief 키 깨짐(전부 0)에 의존한 우연이었음이 git 포렌식으로 확정 — v1도 동일 수식 결함 보유.
 
 ## [RESOLVED(배선)/이관] argus_bench AttentionScoreAccumulator 배선 (AB-1 잔여) — 2026-06-11 등록 / 2026-06-12 처분
