@@ -301,6 +301,11 @@ impl EngineState_ {
                 );
                 CommandResult::Ok
             }
+            EngineCommand::RecallWeights { ratio } => {
+                // Mock engine: acknowledge but do not actually recall weights.
+                println!("  → RecallWeights(ratio={:.2})", ratio);
+                CommandResult::Ok
+            }
         }
     }
 

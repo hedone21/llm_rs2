@@ -207,6 +207,15 @@ pub enum EngineCommand {
     /// variants are reserved and will be rejected with `"UnsupportedDtype"`
     /// (INV-126).
     SwapWeights { ratio: f32, target_dtype: DtypeTag },
+    /// Recall (restore) swapped decoder layer weights back to F16 origin (MSG-043).
+    ///
+    /// `ratio` is the **upper-bound** fraction of currently-Q4_0 layers to recall;
+    /// Engine selects `floor(ratio × N_swapped)` layers and restores them to F16
+    /// from the secondary AUF F16 variant.  `target_dtype` is implicitly F16 and
+    /// is not a payload field (direction fixes the dtype — ENG-ALG-240).
+    /// Loud no-op when secondary is absent, F16 variant missing, SOA path, no
+    /// currently-swapped layers, or in-flight plan active (INV-195).
+    RecallWeights { ratio: f32 },
     /// Evict KV cache entries using H2O (Heavy-Hitter Oracle) policy.
     #[serde(rename = "kv.evict_h2o")]
     KvEvictH2o { keep_ratio: f32 },

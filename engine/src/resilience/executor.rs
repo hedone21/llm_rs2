@@ -167,6 +167,8 @@ pub struct CommandExecutor {
     // 않는다. directive 가 도착하면 여기에 저장하여 decode loop 의
     // `take_pending_swap_weights()` 가 consume 할 때까지 유지한다.
     pending_swap_weights: Option<(f32, llm_shared::DtypeTag)>,
+    // Sticky pending RecallWeights directive (ENG-ALG-240 — 동형 패턴).
+    pending_recall_weights: Option<f32>,
 }
 
 impl CommandExecutor {
@@ -219,6 +221,7 @@ impl CommandExecutor {
             last_heartbeat_at: now,
             has_secondary: false,
             pending_swap_weights: None,
+            pending_recall_weights: None,
         }
     }
 
@@ -265,6 +268,11 @@ impl CommandExecutor {
     /// dispatching incremental swap.
     pub fn take_pending_swap_weights(&mut self) -> Option<(f32, llm_shared::DtypeTag)> {
         self.pending_swap_weights.take()
+    }
+
+    /// Consume pending RecallWeights directive, if any (ENG-ALG-240 — swap-routing 동형).
+    pub fn take_pending_recall_weights(&mut self) -> Option<f32> {
+        self.pending_recall_weights.take()
     }
 
     /// Notify executor that inference has started.
@@ -614,6 +622,13 @@ impl CommandExecutor {
             } => {
                 self.pending_swap_weights = Some((*ratio, *target_dtype));
                 plan.swap_weights = Some((*ratio, *target_dtype));
+                CommandResult::Ok
+            }
+            // RecallWeights is dispatched directly in CommandDispatcher (ENG-ALG-240).
+            // The resilience executor (legacy path) stores it in pending_recall_weights
+            // so the decode loop can consume it via take_pending_recall_weights().
+            EngineCommand::RecallWeights { ratio } => {
+                self.pending_recall_weights = Some(*ratio);
                 CommandResult::Ok
             }
         }

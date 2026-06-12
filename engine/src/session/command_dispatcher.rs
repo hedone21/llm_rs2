@@ -35,6 +35,7 @@ use crate::session::swap_runtime::EngineSwapRuntime;
 use crate::stages::kv::eviction::EvictionStage;
 use crate::stages::kv::kivi_quant::KiviQuantStage;
 use crate::stages::weight::partition::PartitionStage;
+use crate::stages::weight::weight_recall::WeightRecallStage;
 use crate::stages::weight::weight_swap::WeightSwapStage;
 
 /// External command channel (manager IPC, schedule, stdin, ...).
@@ -370,6 +371,11 @@ impl CommandDispatcher {
             } => {
                 self.submit_swap(*ratio, *target_dtype);
             }
+            // ── ① recall → OneShot WeightRecallStage submit (§5.6.8, ENG-ALG-240) ──
+            // RestoreDefaults 는 무발화(INV-192) — 이 arm 만 발화.
+            EngineCommand::RecallWeights { ratio } => {
+                self.submit_recall(*ratio);
+            }
 
             // ── ③ Hardware resolve seam ──
             EngineCommand::SwitchHw { device } => {
@@ -498,6 +504,29 @@ impl CommandDispatcher {
             estimates: est,
             layer_swap: None,
         }));
+    }
+
+    /// ① RecallWeights directive 1건을 OneShot `WeightRecallStage` 로 submit (§5.6.8).
+    ///
+    /// submit_swap 과 동형이나 `target_dtype` 이 없다(방향 고정 = F16, ENG-ALG-240).
+    /// `model`/`swap_runtime` 이 `None` 이거나 `layer_slots` 가 비면 미구성 — directive 무시.
+    fn submit_recall(&mut self, ratio: f32) {
+        let Some(model) = self.model.as_ref() else {
+            return; // 미구성 (secondary 부재 — happy/chat).
+        };
+        let Some(rt) = self.swap_runtime.as_ref() else {
+            return; // 미구성 (swap 자원 미배선).
+        };
+        if self.layer_slots.is_empty() {
+            return; // 미구성.
+        }
+        let stage = WeightRecallStage::one_shot(
+            Arc::clone(model),
+            Arc::clone(rt),
+            ratio,
+            Arc::clone(&self.hook_cell),
+        );
+        self.registry.submit(Arc::new(stage));
     }
 
     /// ① SwapWeights directive 1건을 OneShot `WeightSwapStage` 로 submit (AB-6 §5.6.4).

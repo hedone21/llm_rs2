@@ -985,6 +985,7 @@ fn engine_command_to_action_name(cmd: &EngineCommand) -> String {
         EngineCommand::RequestQcf => "request_qcf",
         EngineCommand::PrepareComputeUnit { .. } => "prepare_compute_unit",
         EngineCommand::SwapWeights { .. } => "swap_weights",
+        EngineCommand::RecallWeights { .. } => "recall_weights",
     }
     .to_string()
 }

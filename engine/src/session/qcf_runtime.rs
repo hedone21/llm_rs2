@@ -109,6 +109,37 @@ pub fn run_layer_swap(
     )
 }
 
+/// F16 recall 전용 `SwapExecutor` 진입점 (ENG-ALG-240).
+///
+/// `run_layer_swap`과 동형이나 `DType::F16`을 target으로 하고,
+/// `f16_secondary`(recall용 F16 view)를 직접 공급한다.
+/// `execute_on_slots`의 idempotent skip(`current_dtype() == F16`)이 이미
+/// F16인 layer를 자동 스킵한다(INV-193, 변경 불요).
+/// `materialise_weight`의 SOA fast-path는 Q4_0 조건이라 F16은 자동 AOS 폴백(변경 불요).
+pub fn run_layer_recall(
+    model: &crate::models::transformer::TransformerModel,
+    f16_secondary: &Arc<crate::models::weights::secondary_mmap::SecondaryMmap>,
+    target_layers: &[usize],
+    cpu_backend: &Arc<dyn Backend>,
+    async_dispatcher: Option<&crate::weight::AsyncSwapDispatcher>,
+) -> Result<crate::weight::SwapReport, crate::weight::SwapError> {
+    let swap_memory = Galloc::new();
+    let executor = crate::weight::SwapExecutor::new_with_worker(
+        DType::F16,
+        &model.config,
+        cpu_backend.clone(),
+        &swap_memory,
+        Arc::clone(&model.release_worker),
+    );
+    executor.execute_on_slots(
+        model.layers.as_slice(),
+        Some(f16_secondary),
+        &model.ratio_generation,
+        target_layers,
+        async_dispatcher,
+    )
+}
+
 /// Re-map weight tensors for CPU access after a weight swap.
 ///
 /// Required when running on GPU with `--secondary-layout aos +

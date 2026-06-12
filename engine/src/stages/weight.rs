@@ -11,4 +11,5 @@
 //!   별도 파일. Incremental 만 Stage multi-tick drain, 나머지 3-mode 는 hook 설치만(§5.6.3).
 
 pub mod partition;
+pub mod weight_recall;
 pub mod weight_swap;

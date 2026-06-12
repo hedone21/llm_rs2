@@ -400,3 +400,17 @@ mod test_inv_rpcmem_006_cli_mutex;
 mod test_inv_rpcmem_007_activation_no_rpcmem;
 #[path = "spec/test_inv_rpcmem_008_no_raw_clientbuf.rs"]
 mod test_inv_rpcmem_008_no_raw_clientbuf;
+
+// ── INV-192~195: RecallWeights 메커니즘 (§5.6.8, ENG-ALG-240/241, MSG-043) ──
+// INV-192: explicit trigger only (RestoreDefaults 발화 안 함).
+// INV-193: currently-Q4_0 layer 만 후보 + ratio 선택 로직.
+// INV-194: recall 후 NMSE ≤ 0.01 정확성 (device-gated, AUF 모델 필요).
+// INV-195: loud no-op 5종 + double_commit_guard (panic/Err-강하 금지).
+#[path = "spec/test_inv_192_recall_explicit_trigger.rs"]
+mod test_inv_192_recall_explicit_trigger;
+#[path = "spec/test_inv_193_recall_candidate_selection.rs"]
+mod test_inv_193_recall_candidate_selection;
+#[path = "spec/test_inv_194_recall_accuracy.rs"]
+mod test_inv_194_recall_accuracy;
+#[path = "spec/test_inv_195_recall_loud_noop.rs"]
+mod test_inv_195_recall_loud_noop;

@@ -65,7 +65,7 @@ struct Args {
 
     /// Command to send (KvEvictSliding, KvEvictH2o, KvStreaming, KvMergeD2o,
     /// Throttle, SetTargetTbt, SwitchHw, KvQuantDynamic, LayerSkip,
-    /// SetPartitionRatio, SetPrefillPolicy, SwapWeights,
+    /// SetPartitionRatio, SetPrefillPolicy, SwapWeights, RecallWeights,
     /// Suspend, Resume, RestoreDefaults, RequestQcf).
     #[arg(long)]
     command: Option<String>,
@@ -401,6 +401,10 @@ fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
                 ratio,
                 target_dtype,
             })
+        }
+        "RecallWeights" => {
+            let ratio = params.ratio.context("--ratio required for RecallWeights")?;
+            Ok(EngineCommand::RecallWeights { ratio })
         }
         "Suspend" => Ok(EngineCommand::Suspend),
         "Resume" => Ok(EngineCommand::Resume),

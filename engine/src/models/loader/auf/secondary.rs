@@ -90,6 +90,126 @@ pub(crate) fn resolve_backend_tag_candidates(layout: SecondaryLayoutChoice) -> V
     }
 }
 
+/// Build an F16-only `SecondaryMmap` view from an existing `Arc<AufView>` for
+/// recall (Q4_0→F16 restoration, ENG-ALG-240).
+///
+/// Unlike `open_secondary_auf` / `build_auf_secondary_from_view`, this path:
+/// - Forces dtype = F16 unconditionally.
+/// - **Skips `ReverseSwapRejected`** — that guard protects the *forward* swap
+///   path (production swap: F16→Q4_0 only).  Recall is the intentional reverse
+///   direction and must not hit that guard.
+/// - **Propagates `AdrenoSoaF16Rejected`** (SOA layout is Q4_0-only, loud no-op b)
+///   and **`DtypeNotFound`** (no F16 entry in AUF, loud no-op a).
+///
+/// Same `Arc<AufView>` / mmap is reused (INV-125 — no second mmap open).
+/// The caller is responsible for caching the result (`OnceLock`) to avoid
+/// repeated AUF scan on every recall.
+///
+/// # Errors
+/// - `LoadError::AdrenoSoaF16Rejected` — SOA layout (loud no-op b).
+/// - `LoadError::DtypeNotFound { dtype: "F16" }` — AUF has no F16 entry (loud no-op a).
+/// - `LoadError::AufInvariantViolation` — TENSOR_INDEX inconsistency.
+pub fn open_secondary_f16_for_recall(
+    view: std::sync::Arc<crate::auf::AufView>,
+    backend_tag: crate::auf::BackendTag,
+    primary_config: &ModelConfig,
+) -> Result<SecondaryMmap, LoadError> {
+    use crate::auf::section::TAG_WEIGHTS_ADRENO_SOA;
+    use crate::auf::tensor_index::{LAYER_IDX_CROSS, TensorDType};
+    use crate::models::weights::secondary_mmap::{AufSecondaryMmap, tensor_kind_to_subname};
+
+    // (b) SOA 경로는 Q4_0 전용 — F16 recall 원천 차단.
+    let weights_tag =
+        backend_tag
+            .weights_section_tag()
+            .ok_or_else(|| LoadError::AufInvariantViolation {
+                detail: "recall: BackendTag::Any cannot host tensors".to_string(),
+            })?;
+    if weights_tag == TAG_WEIGHTS_ADRENO_SOA {
+        return Err(LoadError::AdrenoSoaF16Rejected);
+    }
+
+    // TENSOR_INDEX 내 variant slot 인덱스 조회.
+    let variant_idx = view
+        .tensor_index
+        .variant_index_for_tag(weights_tag)
+        .ok_or_else(|| LoadError::AufInvariantViolation {
+            detail: format!("recall F16 view: TENSOR_INDEX missing variant '{weights_tag}'"),
+        })?;
+
+    // AUF에서 F16 entry가 있는지 확인 (없으면 DtypeNotFound — loud no-op a).
+    let has_f16 = view.tensor_index.entries.iter().any(|e| {
+        if e.layer_idx == LAYER_IDX_CROSS {
+            return false;
+        }
+        if e.dtype != TensorDType::F16.as_u32() {
+            return false;
+        }
+        let var_offset = e
+            .variant_offsets
+            .get(variant_idx)
+            .copied()
+            .unwrap_or(u64::MAX);
+        let var_size = e.variant_sizes.get(variant_idx).copied().unwrap_or(0);
+        var_offset != u64::MAX && var_size != 0
+    });
+    if !has_f16 {
+        return Err(LoadError::DtypeNotFound {
+            dtype: "F16".to_string(),
+        });
+    }
+
+    // layer_index 구성 — F16 entry만 선택 (ReverseSwapRejected 가드 없음).
+    let num_layers = primary_config.num_hidden_layers;
+    let mut layer_index: Vec<LayerTensorSlice> = vec![LayerTensorSlice::default(); num_layers];
+
+    for entry in &view.tensor_index.entries {
+        if entry.layer_idx == LAYER_IDX_CROSS {
+            continue;
+        }
+        let layer_idx = entry.layer_idx as usize;
+        if layer_idx >= num_layers {
+            continue;
+        }
+        if entry.dtype != TensorDType::F16.as_u32() {
+            continue;
+        }
+        let var_offset = entry
+            .variant_offsets
+            .get(variant_idx)
+            .copied()
+            .unwrap_or(u64::MAX);
+        let var_size = entry.variant_sizes.get(variant_idx).copied().unwrap_or(0);
+        if var_offset == u64::MAX || var_size == 0 {
+            continue;
+        }
+        let Some(subname) = tensor_kind_to_subname(entry.kind) else {
+            continue;
+        };
+        let Some(dtype) = auf_dtype_to_engine(entry.dtype) else {
+            continue;
+        };
+        let slice_info = SecondaryTensorInfo {
+            offset: var_offset as usize,
+            len: var_size as usize,
+            dtype,
+            dims: entry.shape.iter().rev().copied().collect(),
+        };
+        layer_index[layer_idx]
+            .tensors
+            .insert(subname.to_string(), slice_info);
+    }
+
+    // is_pre_converted_soa = false (SOA 경로는 위에서 차단됨).
+    let source_path = std::path::PathBuf::from("<recall-f16-view>".to_string());
+    Ok(SecondaryMmap::Auf(AufSecondaryMmap {
+        view,
+        layer_index,
+        source_path,
+        is_pre_converted_soa: false,
+    }))
+}
+
 /// Open an AUF-format secondary weight file directly (skips GGUF detection).
 ///
 /// Public so integration tests can exercise the layout-fallback path without
