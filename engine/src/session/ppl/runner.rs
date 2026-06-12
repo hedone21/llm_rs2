@@ -735,6 +735,9 @@ pub fn run_ppl(
     let mut nll_count: usize = 0;
     // PPL v3: collect QCF for every eviction event
     let mut qcf_events: Vec<serde_json::Value> = Vec::new();
+    // A2SF 측정(KV roadmap 항목 0 §4.2): --dump-a2sf 지정 시 eviction 직전 + run 종료 시 score
+    // accumulator importance 에서 BOS/non-BOS ratio + HH(top-k) 집합 스냅샷을 누적(읽기 전용).
+    let mut a2sf_snapshots: Vec<crate::session::a2sf_dump::A2sfSnapshot> = Vec::new();
     let overall_start = std::time::Instant::now();
 
     // LISWAP-PPL: per-token NLL log + token-index-triggered weight swap.
@@ -997,6 +1000,19 @@ pub fn run_ppl(
             if before_len > eviction_threshold {
                 let ratio = effective_budget as f32 / before_len as f32;
 
+                // A2SF 측정: eviction(+ acc.reset) 직전 importance 스냅샷(읽기 전용). budget=top-k.
+                if args.dump_a2sf.is_some()
+                    && let Some(acc) = score_accumulator.as_ref()
+                    && acc.is_active()
+                {
+                    a2sf_snapshots.push(crate::session::a2sf_dump::compute_a2sf_snapshot(
+                        acc.importance_scores(),
+                        before_len,
+                        effective_budget,
+                        i as i64,
+                    ));
+                }
+
                 // GPU V buffer readback for QCF-CAOTE computation.
                 let v_cpu_data: Option<Vec<f32>> = if args.kv_type == "f32"
                     && !kv_caches.is_empty()
@@ -1127,6 +1143,48 @@ pub fn run_ppl(
                 total_nll,
                 ppl,
                 kv_caches[0].current_pos
+            );
+        }
+    }
+
+    // A2SF 측정: run 종료 시점 스냅샷(step=-1) + 누적 스냅샷을 JSON 파일로 덤프(읽기 전용).
+    if let Some(dump_path) = args.dump_a2sf.as_ref() {
+        if let Some(acc) = score_accumulator.as_ref()
+            && acc.is_active()
+        {
+            let pos = kv_caches[0].current_pos;
+            let top_k = if effective_budget > 0 {
+                effective_budget
+            } else {
+                pos
+            };
+            a2sf_snapshots.push(crate::session::a2sf_dump::compute_a2sf_snapshot(
+                acc.importance_scores(),
+                pos,
+                top_k,
+                -1,
+            ));
+        }
+        let dump = serde_json::json!({
+            "score_decay": args.h2o_decay(),
+            "eviction_policy": args.eviction_policy(),
+            "snapshots": a2sf_snapshots,
+        });
+        std::fs::write(dump_path, serde_json::to_string_pretty(&dump)?)?;
+        eprintln!(
+            "[A2SF] dumped {} snapshot(s) (score_decay={}) → {}",
+            a2sf_snapshots.len(),
+            args.h2o_decay(),
+            dump_path.display()
+        );
+        // BOS ratio 스모크 가시성: run-end 스냅샷을 stderr 마커로도 노출(파싱 가능).
+        if let Some(last) = a2sf_snapshots.last() {
+            eprintln!(
+                "[A2SF] bos_ratio={:.4} bos_score={:.4} non_bos_mean={:.4} hh_topk_len={}",
+                last.bos_ratio,
+                last.bos_score,
+                last.non_bos_mean,
+                last.hh_topk.len()
             );
         }
     }

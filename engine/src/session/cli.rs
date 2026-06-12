@@ -764,6 +764,14 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub dump_importance: bool,
 
+    /// A2SF 게이트 지표 덤프 경로(측정 전용, KV roadmap 항목 0 §4.2).
+    /// 지정 시 PPL run 의 eviction 직전 스냅샷 + run 종료 시점에 score accumulator importance 에서
+    /// BOS/non-BOS ratio + HH(top-k) 집합을 JSON 으로 이 경로에 쓴다. score accumulator 무수정(읽기
+    /// 전용). 미지정 시 호출되지 않음(production 무영향). `--score-decay` 와 함께 사용해 forgetting
+    /// factor 효과를 비교한다.
+    #[arg(long)]
+    pub dump_a2sf: Option<std::path::PathBuf>,
+
     /// Start an interactive multi-turn chat REPL (Llama 3.2 Instruct / Qwen2).
     /// Uses standard (non-KIVI, non-offload) forward path.
     #[arg(long, default_value_t = false)]

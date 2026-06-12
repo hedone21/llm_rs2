@@ -1,3 +1,4 @@
+pub mod a2sf_dump;
 pub mod assembly;
 pub mod bin_setup;
 pub mod chat;
