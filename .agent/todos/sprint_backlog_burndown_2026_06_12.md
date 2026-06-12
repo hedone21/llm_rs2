@@ -137,7 +137,9 @@ C 군집 중 1B 현 타겟에서 TTFT 즉시 체감 나오는 유일 항목. 분
 
 ---
 
-#### T4 — read-plan 4-impl (S1~S6, ADR-0011) · 규모 **L**
+#### T4 — read-plan 4-impl (S1~S6, ADR-0011) · 규모 **L** — ✅ **종결 (2026-06-12)**
+
+> **T4 종결 기록 (2026-06-12)**: Amendment A1(`ec3c6a38`) → S1+S3(`f97e7597`) → S2(seam) → S4+S5(`0d3eb94a` Quest+CLI) → S6(prefetch hint). **게이트**: lib **1432/0** + spec **706/0** + technique-api **23/0** + quest **8/0** + clippy clean / α-K frozen 3-dtype **byte-identical**(S2 직후·최종 2회) + tbt Δ f16 +0.9% / f32 +0.2% / q4 **−0.1%**(n=5 간격 median — 단일 run 55.93 은 누적 가열 noise 확정) / 폴백 bit-identical(select=전체 ≡ attention_into, KIVI 미지원 폴백) / dlopen gate 2종 PASS(registry 가산 = 기존 .so ABI 불변) / S6 배선 GREEN(성능 주장 0, B1=NO). **잔여 한계(예측됨)**: production decode StageCtx 에 query 미공급 → Quest 는 K-magnitude proxy — 품질 평가는 8B/QueryStats 공급 후속(ADR §10). 4축 plan-returning(KVCacheStage ⊥ WeightStage ⊥ Backend ⊥ KVReadStage) 골격 완성.
 
 ADR-0011이 표면 SSOT. 단계별 진행. 분기 취소로 동결 해제(머지 후 재-triage 게이트 소멸 — 단 ADR §8 #3 의미 계약 보존).
 
