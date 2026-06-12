@@ -297,6 +297,33 @@ ObservationContext {
     │                                     │
 ```
 
+### 3.6b Weight Recall Sequence [SEQ-065 ~ SEQ-067]
+
+> 2026-06-13 옵션 B(명시 트리거 F16 recall). 전방향 `SwapWeights`(Q4_0로 swap)로 일부 layer가 양자화된 상태에서, 압력 해소·품질 회복을 위해 명시 `RecallWeights`로 F16 원본을 복원하는 흐름. **평시 `RestoreDefaults`는 swap을 역전하지 않으므로(INV-192), recall은 De-escalation(SEQ-060~064)과 독립된 명시 directive다.** manager의 자동 트리거 조건(품질 메트릭)은 미정의 — 이번 범위는 수동/시나리오 발화이며 policy 자동 발화는 후속.
+
+**[SEQ-065]** Recall directive 생성: Manager(또는 수동/시나리오 발화 — mock_manager `RecallWeights` 명령)가 `EngineCommand::RecallWeights { ratio }`를 `EngineDirective`로 구성한다(`next_seq_id()` 단조 증가). recall은 명시 의도이므로 De-escalation의 `RestoreDefaults` 묶음과 별개로 발행된다. *(MUST)*
+
+**[SEQ-066]** Engine recall 실행: Engine은 `apply_command()`에서 `RecallWeights` arm을 직접 dispatch하여(ENG-ALG-214-ROUTE 동형) OneShot `WeightRecallStage`를 submit한다. Stage commit §1 validate에서 F16 variant 바인딩(`SecondaryDtypeChoice::F16`)을 시도하고, 불가 5종(F16 부재 / SOA 경로 / no_secondary / swapped 0개 / in-flight)은 **loud no-op**(stderr 1회 + graceful 종료, INV-195)으로 강하한다. 성공 시 currently-swapped(Q4_0) layer 중 `floor(ratio × N_swapped)` 이하를 F16으로 되돌린다(`SwapExecutor` target_dtype=F16 재사용, `ratio_generation` 1회 bump). *(MUST)*
+
+**[SEQ-067]** Response + report 전송: Engine은 directive당 정확히 1개 `CommandResponse`를 전송한다(INV-022/023/024). 성공 시 `CommandResult::Ok` + 별도 `EngineMessage::WeightSwapReport`(MSG-089) 후속 전송(`from_dtype=Q4_0`, `to_dtype=F16` — 역방향). loud no-op(불가 분기)은 reject 또는 빈 report로 처리하며 decode를 중단하지 않는다. *(MUST)*
+
+```
+  Manager / mock_manager                 Engine
+    │                                     │
+    │  ── 일부 layer Q4_0 swap 상태 ──     │
+    │                                     │
+    │── Directive [RecallWeights ratio]──→│  ① RecallWeights arm dispatch
+    │                                     │  ② WeightRecallStage submit (OneShot)
+    │                                     │     - F16 variant view 바인딩
+    │                                     │       (불가 5종 → loud no-op)
+    │                                     │     - currently-swapped(Q4_0) 역집합 선택
+    │                                     │     - SwapExecutor(target=F16) 실행
+    │                                     │     - ratio_generation +1 (plan 무효화)
+    │◄── Response(Ok) ────────────────────│
+    │◄── WeightSwapReport(Q4_0→F16) ──────│  ③ 복원 layer 보고
+    │                                     │
+```
+
 ### 3.7 Reconnection Sequence [SEQ-070 ~ SEQ-075]
 
 **[SEQ-070]** 끊김 감지 (Manager): Reader thread가 EOF를 감지하면 종료된다. `inbox`의 `Receiver::try_recv()`가 `Disconnected`를 반환한다. Manager는 `state = Disconnected`로 전이한다. *(MUST)*

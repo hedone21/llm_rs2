@@ -132,7 +132,7 @@ JSON 예시:
 
 ### 3.3 EngineCommand [MSG-030 ~ MSG-041, MSG-031b]
 
-**[MSG-030]** EngineCommand — Manager → Engine 개별 명령. `tag = "type"`, `rename_all = "snake_case"`. **15종 변형** (MSG-042 SwapWeights 추가, 2026-04-24 Weight Swap Phase 3). *(MUST)*
+**[MSG-030]** EngineCommand — Manager → Engine 개별 명령. `tag = "type"`, `rename_all = "snake_case"`. **16종 변형** (MSG-042 SwapWeights 추가, 2026-04-24 Weight Swap Phase 3; MSG-043 RecallWeights 추가, 2026-06-13 Weight Swap Reversal 옵션 B). *(MUST)*
 
 | Tag Value | Variant | 도메인 | 필드 | 필드 타입 | 범위 | 설명 |
 |-----------|---------|--------|------|----------|------|------|
@@ -152,6 +152,8 @@ JSON 예시:
 | `"suspend"` | Suspend | Lifecycle | (없음) | — | — | 추론 즉시 중지. |
 | `"resume"` | Resume | Lifecycle | (없음) | — | — | 추론 재개. |
 | `"swap_weights"` | SwapWeights | Memory | ratio | f32 | (0.0, 1.0] | **상한 비율**. Engine이 ratio 이하에서 자율 결정. |
+| | | | target_dtype | DtypeTag | enum (MSG-082) | 교체 대상 dtype. `"q4_0"`만 실행 가능 (전방향). |
+| `"recall_weights"` | RecallWeights | Memory | ratio | f32 | (0.0, 1.0] | **역방향 복원 비율** (Q4_0→F16). 현재 swap된(Q4_0) layer 중 ratio 이하를 F16 원본으로 복원. dtype은 F16 고정(필드 없음). MSG-043. |
 | | | | target_dtype | DtypeTag | `"q4_0"` (Phase 3 유효) / `"f16"`, `"f32"`, `"q8_0"` (reserved) | 교체 대상 dtype. Phase 3 범위에서 `q4_0`만 실행. |
 
 > **참고 (non-normative)**: 위 '도메인' 칼럼은 각 액션의 **주 대상(primary target) 도메인** 분류이다. 실제 cross-domain relief effect(하나의 액션이 여러 도메인에 동시 영향을 미침)는 Action Pool(`01-architecture.md` SYS-095)과 `22-manager-algorithms.md`에서 모델링된다.
@@ -297,7 +299,30 @@ Suspended 상태에서 추론을 재개한다. compute_level, memory_level을 No
 - 성공 시 `CommandResult::Ok` + 별도 `EngineMessage::WeightSwapReport`(MSG-083) 후속 전송.
 - 이미 모든 후보 layer가 swap 완료(`needed == 0`)인 경우 `Ok` + 빈 report를 보낸다 (reject 아님).
 
-**단방향 제약**: Secondary→primary 복귀 경로는 **제공하지 않는다**. `target_dtype`의 reserved variant는 향후 Phase 5+에서 복귀 혹은 상향 dtype(F16→F32 등) 전환을 열어두기 위한 예약일 뿐, Phase 3에서 발행하지 않는다.
+**방향 제약 (2026-06-13 개정, 옵션 B)**: 전방향 swap(F16→Q4_0)은 본 `SwapWeights`로 발행한다. **역방향 복귀(Q4_0→F16 recall)는 별도 directive `RecallWeights`(MSG-043)로 제공한다** — 명시 트리거로만 발화하며, 평시 `RestoreDefaults`는 swap 복원 no-op을 유지한다(INV-192). `target_dtype`의 reserved variant(F32/Q8_0/BF16/Q4_1)는 향후 상향 dtype 전환을 열어두기 위한 예약이며 양방향 모두 Phase 3에서 발행하지 않는다.
+
+#### MSG-043: RecallWeights (Weight Swap Reversal, 2026-06-13)
+
+**[MSG-043]** Manager → Engine. 현재 Q4_0로 swap된 decoder layer 집합의 weight를 secondary의 **F16 원본 variant로 복원**하도록 지시한다(역방향 recall, Q4_0→F16). `ratio`는 복원 대상 비율의 **상한**이며, Engine은 currently-swapped(Q4_0) layer 중 `floor(ratio × N_swapped)` 이하를 자율 선택하여 F16으로 되돌린다. dtype은 F16 고정이므로 payload에 `target_dtype` 필드가 없다(방향이 dtype을 결정 — ENG-ALG-240). *(MUST)*
+
+**Payload**:
+
+| 필드 | 타입 | 범위 | 설명 |
+|------|------|------|------|
+| `ratio` | f32 | (0.0, 1.0] | 복원 대상 비율 상한. Engine은 currently-swapped(Q4_0) layer 중 `floor(ratio × N_swapped)` 이하를 F16으로 복원. ratio=1.0 = 전체 복원. |
+
+**JSON 예시**:
+```json
+{"type": "recall_weights", "ratio": 1.0}
+```
+
+**의미론 (dispatch)**:
+- Engine은 `generate.rs`/`CommandDispatcher`의 command dispatch 루프에서 **직접** 수신한다(ENG-ALG-214-ROUTE 동형, `CachePressurePipeline` 미경유). 엔진 직결 OneShot `WeightRecallStage`를 submit하고, `SwapExecutor`를 target_dtype=F16으로 재사용한다.
+- recall 불가 5종(F16 variant 부재 / Adreno SOA 경로 / no_secondary / currently-swapped 0개 / in-flight)은 **loud no-op**(stderr 1회 + `CommandResult::Ok` + 빈 report 또는 reject — INV-195). decode 중단 없음.
+- 성공 시 `CommandResult::Ok` + 별도 `EngineMessage::WeightSwapReport`(MSG-089) 후속 전송. report의 `from_dtype=Q4_0`, `to_dtype=F16`(역방향 — SwappedLayer가 실 dtype 추적, 하드코딩 아님).
+- 평시 `RestoreDefaults`는 swap/recall 어느 transition도 발화하지 않는다(INV-192 — partition Full 복원과 비대칭).
+
+**관계**: `SwapWeights`(MSG-042, 전방향)와 짝을 이루는 역방향 directive. 동일 `SwapExecutor` 인프라 + 동일 secondary AUF(F16 variant view 별도 바인딩, INV-125)를 공유한다. 상세 알고리즘: ENG-ALG-240/241(§3.12.23). 불변식: INV-192~195.
 
 **[MSG-082]** `DtypeTag` enum — SwapWeights의 target_dtype 전용 타입. shared crate에 신규 정의. *(MUST)*
 

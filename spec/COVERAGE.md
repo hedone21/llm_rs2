@@ -133,7 +133,7 @@
 | INV-123 | Swap 단위 = `LayerSlot.weights.store()` 1회 (단일 원자 단계). 토큰 경계 밖 swap은 다음 토큰부터 관측. Partial state 외부 노출 금지. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_123_swap_atomicity.rs` |
 | INV-124 | LayerSlot::current_dtype == weights snapshot의 실제 tensor dtype (swap 전후 항상 일치). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_124_slot_dtype_consistency.rs` |
 | INV-125 | TransformerModel.secondary_mmap(구 TransformerWeights::secondary_mmap)이 Some인 동안 Arc<SecondaryMmap>은 drop되지 않는다. flat 배치 기준. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_125_secondary_mmap_lifetime.rs` |
-| INV-126 | `EngineCommand::SwapWeights.target_dtype`에서 `DtypeTag::Q4_0` 이외 variant는 panic 없이 Rejected 응답. reserved variant payload 호환성 보장. | Safety/Correctness | 🆕 미구현 | `shared/tests/spec/test_inv_126_swap_dtype_reject.rs` |
+| INV-126 | **방향별 허용 dtype** (2026-06-13 완화): `SwapWeights`는 `target_dtype==Q4_0`만, `RecallWeights`는 F16만 허용. 그 외 variant는 panic 없이 Rejected. 단방향 하드 고정 폐기 → 방향별 집합. | Safety/Correctness | 🆕 미구현 | `shared/tests/spec/test_inv_126_swap_dtype_reject.rs` (+ recall 방향 케이스 추가) |
 | INV-127 | `QuantNoiseTable::epsilon(i).is_none()`(NaN 저장) layer는 `WeightSwapDecider`에서 제외. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_127_noise_nan_exclusion.rs` |
 | INV-128 | `ImportanceCollector`가 Armed/Collecting 상태로 prefill 완료 시 반드시 `QcfEstimate` 송출 + Idle 복귀. 누수 금지. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_128_qcf_collector_leak.rs` |
 
@@ -223,6 +223,17 @@
 | INV-190 | 복원은 무효화 4-tuple(model/format/tokenizer/token_ids) + magic/version/geometry 통과 시에만. 실패=cache miss→fresh prefill (에러 아님). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_190_invalidation.rs` |
 | INV-191 | restore 후 KV byte-identical to fresh prefill + greedy token-id 동일. device snapshot/restore는 read_buffer/write_buffer coherent 경유. payload packed-form(capacity-무관 cross-run 재현). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_191_restore_byte_identical.rs` (+ device 게이트) |
 
+## Weight Swap Reversal (INV-192 ~ INV-195, 2026-06-13 F16 Recall 옵션 B)
+
+> 명시 트리거 F16 recall(Q4_0→F16). swap 단방향 가정 완화 — `RecallWeights`(MSG-043) directive로만 역전, 평시 `RestoreDefaults`는 swap no-op 유지. 대응 명세: `32-engine-algorithms.md` §3.12.23 (ENG-ALG-240/241), `11-protocol-messages.md` MSG-043, `12-protocol-sequences.md` SEQ-065~067, `33-engine-data.md` ENG-DAT-097 §5 / ENG-DAT-C17 개정. 설계: `docs/adr/0006-weight-stage-plan-returning-unification.md` §6 (착수), `arch/pipeline_stage_design_v2.md` §5.6.8.
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-192 | `RecallWeights`만 swap 역전 발화. `RestoreDefaults`는 swap된 layer 복원 안 함(현행 no-op 유지). dispatcher arm 매핑 비대칭(partition Full 복원과 다름). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_192_recall_explicit_trigger.rs` |
+| INV-193 | recall 후보 = 현재 Q4_0 layer(swap 역집합). 추적 SSOT = `model.layers[i].current_dtype()`(dispatcher sticky 아님). 이미 F16 layer는 idempotent skip. recall target_dtype=F16 고정. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_193_recall_candidate_selection.rs` |
+| INV-194 | full recall(ratio=1.0) 후 greedy token-id == swap-전 all-F16 baseline(F16 원본 byte-identical 복원). 단일-token logit NMSE ≤ 0.01 vs all-F16. | Correctness | 🆕 미구현 (device) | `engine/tests/spec/test_inv_194_recall_accuracy.rs` (+ S25 device 게이트) |
+| INV-195 | recall 불가 5종(F16 부재/SOA 경로/no_secondary/swapped 0개/in-flight) = loud no-op(stderr 1회 + graceful Consumed, panic/Err 금지). | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_195_recall_loud_noop.rs` |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -265,6 +276,7 @@
 | MSG-068 | (D) | self_gpu_pct Phase 1 placeholder (항상 0.0) | 🆕 | `engine/tests/spec/test_msg_060_self_util.rs` |
 | MSG-069 | (D) | ctx.engine.cpu_pct/gpu_pct LuaPolicy 노출 계약 | 🆕 | `manager/tests/spec/test_mgr_dat_075_076_engine_util.rs` |
 | MSG-042 | (D) | `EngineCommand::SwapWeights { ratio, target_dtype: DtypeTag }` serde + dispatch contract (ENG-ALG-214-ROUTE) | 🆕 | `shared/tests/spec/test_msg_042_swap_weights_cmd.rs` |
+| MSG-043 | (D) | `EngineCommand::RecallWeights { ratio }` serde + dispatch contract (역방향 recall, ENG-ALG-240/241). `{"type":"recall_weights","ratio":1.0}` round-trip + dtype 필드 부재. | 🆕 | `shared/tests/spec/test_msg_043_recall_weights_cmd.rs` |
 | MSG-080 | (D) | [DEPRECATED 재정의됨, 2026-04-24 Phase 3]: Phase 2 초안의 `ResilienceAction::SwapWeights` serde 항목. shared crate에서는 `EngineCommand::SwapWeights`(MSG-042)로 흡수됨. (α-W-3 §5.4: engine 내부 `ResilienceAction` 타입 자체가 삭제되어 "Rust-only 타입" 서술도 만료 — `EngineCommand::SwapWeights` 단일.) MSG-080 ID는 새 용도 할당 없음. | — | — |
 | MSG-081 | (D) | [DEPRECATED, 2026-04-24 Phase 3]: 구 `CommandResponse::WeightSwapped` variant 제안. Phase 3에서는 별도 `WeightSwapReport` EngineMessage로 대체(MSG-089). MSG-081 ID 폐기. | — | — |
 | MSG-082 | (D) | `DtypeTag` enum (Q4_0 유효, F16/F32/Q8_0 reserved) serde round-trip | 🆕 | `shared/tests/spec/test_msg_082_dtype_tag.rs` |

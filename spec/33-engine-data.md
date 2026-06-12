@@ -1243,7 +1243,7 @@ v0.1.1 시점의 "lm_head는 Q4_0 single dtype"이라는 결정은 v0.2 Sprint A
 
 **도입 동기**:
 - v0.1.x에서는 swap의 secondary dtype은 GGUF 원본 또는 별도 GGUF에서 quantize되어야 했다. multi-dtype AUF는 secondary dtype payload도 self-contained로 보관하여 deploy 시 GGUF가 부재해도 dynamic swap 가능.
-- 단방향 swap 가정 (예: F16 → Q4_0 단방향, 역 swap 안 함) 하에서도 candidate dtype 양쪽이 모두 AUF 안에 있어야 swap이 의미 있다.
+- candidate dtype 양쪽(예: Q4_0 + F16)이 모두 AUF 안에 있어야 swap이 의미 있다. **양방향 swap 활성 (2026-06-13 개정, 아래 §5 참조)**: F16 원본 payload가 secondary에 상주하므로 전방향 swap(F16→Q4_0)뿐 아니라 역방향 recall(Q4_0→F16)도 동일 AUF에서 추가 GGUF 의존 없이 가능하다.
 
 **핵심 결정 (v0.2)**:
 
@@ -1255,7 +1255,7 @@ v0.1.1 시점의 "lm_head는 Q4_0 single dtype"이라는 결정은 v0.2 Sprint A
 
 4. **Capability bit 분리 (Q5=B 결정)**. multi-dtype 사용 여부는 신규 `capability_optional` bit 3 = `MULTI_DTYPE_VARIANTS`로 표현한다 (§3.22.16, ENG-DAT-099). reader는 bit 3을 인식하지 못해도 reject하지 않고 fallback 동작 (§3.22.15).
 
-5. **단방향 swap 가정 (Q3 결정)**. multi-dtype 도입은 SwapExecutor의 인터페이스(`engine/src/runtime/swap_executor.rs`)를 변경하지 않는다. AUF 내부에 candidate dtype 양쪽이 보관되어도, runtime swap 흐름은 기존 단방향(`primary → secondary`)을 그대로 유지한다. 양방향 swap은 본 spec 범위 밖이다 (v0.x 추후 capability에서 검토).
+5. **단방향 swap 가정 → 명시-트리거 양방향 (Q3 결정 → 2026-06-13 개정)**. multi-dtype 도입은 `SwapExecutor`의 인터페이스를 변경하지 않으며, `SwapExecutor.target_dtype`은 도입 당시부터 dtype-generic 필드였다(전방향만 활성). **개정 (옵션 B, 사용자 결정 B)**: AUF에 candidate dtype 양쪽이 상주하므로, 명시 directive `RecallWeights`(MSG-043, ENG-ALG-240/241) 도착 시에만 역방향 recall(Q4_0→F16)을 수행한다 — `SecondaryDtypeChoice::F16` 경로로 F16 variant view를 별도 바인딩(같은 `Arc<AufView>` 공유)하여 `SwapExecutor`(target_dtype=F16)에 공급한다. **평시 `RestoreDefaults`는 swap no-op 유지**(production winner Incremental의 Q4 유지 이득 보존). `SwapExecutor` 인터페이스 변경 0 — 막던 가드는 `dtype_tag_to_dtype` Q4_0-only(INV-126)와 `ReverseSwapRejected`(production swap 안전 가드)뿐이며, recall은 이를 **방향별로 분리**하여 우회한다(전방향 directive=Q4_0-only / 역방향 directive=F16-only). manager의 자동 트리거(품질 메트릭 기반)는 미정의 — 이번 범위는 메커니즘 + 수동/시나리오 발화이며 policy 자동 발화는 후속이다.
 
 6. **Format major/minor (Q5=B 결정)**. format_major=0 그대로 유지. format_minor는 1(v0.1.x)에서 2(v0.2)로 bump한다. format_patch는 0으로 리셋. 이유: capability_optional bit 신설은 의미적으로 minor 변경(additive 의미 확장)이며 v0.1.x patch 영역의 byte-level 호환 변경 범주를 넘어선다.
 
@@ -1501,7 +1501,7 @@ impl IntraForwardSwapHook {
 
 **[ENG-DAT-C16]** (Sprint A' 반전) AUF v0.2 multi-dtype variant 사용 시, lm_head(`kind = 11`)는 layer weight와 동일하게 multi-dtype 분기 대상에 **포함**된다. lm_head TENSOR_INDEX entry는 dtype별 candidate(예: Q4_0 + F16)로 다중 등장 가능하며, reader는 §3.22.15(ENG-DAT-098)의 dtype selection precedence를 lm_head에도 동일하게 적용한다. 다만 `WEIGHTS_ADRENO_SOA` variant section 안에서 lm_head는 **모든 dtype 후보에 대해 AOS 18B/block layout으로 동봉되어야 하며 SOA 변환을 적용해서는 안 된다**(INV-135 v2 layout 의무는 dtype-agnostic). 근거: lm_head q_buf 크기는 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 초과하여 image1d_buffer_t 생성이 실패하고 SOA fast path가 발동 불가하므로 dtype과 무관하게 SOA로 저장된 lm_head는 정확성이 깨진다. `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`는 처음부터 AOS이므로 lm_head 처리도 일반 weight와 동일하다. v0.1.1의 "lm_head Q4_0 single" 의미는 본 제약에서 폐기되었으며, dtype 단일성은 요구되지 않는다. SOA variant 안에서 lm_head entry가 SOA layout으로 동봉되어 있으면 reader는 `AufError::LmHeadSoaForbidden`(또는 동등한 명시 에러)로 reject한다. *(MUST)*
 
-**[ENG-DAT-C17]** AUF v0.2 writer는 SwapExecutor 인터페이스 변경을 동반하지 않는다. multi-dtype payload 양쪽이 AUF에 보관되어도 runtime swap은 단방향(`primary → secondary`) 가정을 유지한다. 양방향 swap은 본 spec 범위 밖이며 향후 별도 capability bit으로 표현된다. *(MUST)*
+**[ENG-DAT-C17]** AUF v0.2 writer는 `SwapExecutor` 인터페이스 변경을 동반하지 않는다(`target_dtype`은 도입 시부터 dtype-generic). multi-dtype payload 양쪽이 AUF에 보관되어 있으면 runtime swap은 전방향(F16→Q4_0)과 **역방향 recall(Q4_0→F16)을 모두 지원한다**. **양방향 swap 활성 (2026-06-13 개정, 옵션 B)**: 역방향은 명시 directive `RecallWeights`(MSG-043)가 도착했을 때만 발화하며(평시 `RestoreDefaults`는 swap no-op 유지 — INV-192), reader는 recall 시 `SecondaryDtypeChoice::F16`로 F16 variant view를 별도 바인딩한다(같은 mmap 공유, INV-125). writer 측 byte 생성 규약은 변경 없음 — recall은 순수 reader/runtime 추가다. (구 "단방향 가정 / spec 범위 밖" 서술은 폐기. 대응: ENG-ALG-240/241, INV-192~195.) *(MUST)*
 
 **[ENG-DAT-C18]** `--swap-incremental-per-tick > 0` 와 `--swap-intra-forward = true` 는 동시 활성화될 수 없다. 두 정책이 모두 양수/true이면 CLI parser는 명시적 에러로 reject하고 engine은 시작하지 않는다. 이유: LISWAP-1(§3.12.21 예약)은 chunk마다 stage gate(ratio_generation bump × N), LISWAP-4는 plan당 stage gate 1회로 ratio_generation 의미가 충돌하기 때문이다. (32-engine-algorithms §3.12.22.6, ENG-ALG-238 후속) *(MUST)*
 

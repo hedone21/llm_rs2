@@ -1226,7 +1226,7 @@ function execute_swap(model: &TransformerModel,        // flat 배치 (ENG-DAT-0
 - Primary 파일 mmap에서 해당 layer tensor가 점유한 페이지 영역을 `MADV_DONTNEED`로 힌트. 커널이 물리 페이지를 회수하면 PSS 감소.
 - Old Arc가 drop된 후에만 유효. Forward가 여전히 old를 보유 중이면 회수는 drop 시점으로 지연.
 
-**단방향 제약**: Secondary→primary 복귀 경로는 **구현하지 않는다**. 필요 시 Phase 5에서 별도 ENG-ALG로 추가. 현재는 `ResilienceAction::SwapWeights { ratio }`가 단조 증가만 허용하며, 기존 swap된 layer는 중복 선택에서 제외된다 (SwapDecider 로직).
+**방향 제약 (2026-06-13 개정)**: 전방향 swap(F16→Q4_0)은 `SwapWeights { ratio }`로 발화하며 단조 증가만 허용한다(기존 swap된 layer는 중복 선택에서 제외 — SwapDecider 로직). **역방향 복귀(Q4_0→F16 recall)는 명시 directive `RecallWeights { ratio }`로만 발화한다** — secondary→primary 복귀 경로를 신규 알고리즘 ENG-ALG-240/241(§3.12.23)로 추가. 평시 `RestoreDefaults`는 swap 복원 no-op을 유지한다(INV-192). 구 "Phase 5 추가 / 미구현" 서술은 폐기.
 
 #### 3.12.3 On-Demand ImportanceCollector 활성화 정책 [ENG-ALG-212]
 
@@ -2951,6 +2951,38 @@ CLI parser는 두 플래그가 모두 양수이면 `--swap-incremental-per-tick=
 - ENG-ALG-230 (Async upload): `enqueue_write_async`를 hook이 직접 호출. INV-142 stage gate ordering은 plan 종료 시점에서 INV-149로 강화 적용.
 - ENG-ALG-235~237: forward path / plan / hook 본체.
 - INV-121 (per-token snapshot): forward 진입 시 `layer_snapshots` 배열 1회 build → layer i가 ArcSwap commit과 race하지 않음 (INV-147 보강).
+
+---
+
+#### 3.12.23 Weight Swap Reversal — F16 Recall [ENG-ALG-240, ENG-ALG-241]
+
+> 2026-06-13 옵션 B(명시 트리거 F16 recall, 사용자 결정 B). swap 단방향 가정(F16→Q4_0)을 **명시 directive `RecallWeights`가 도착했을 때만** 역전(Q4_0→F16)으로 완화. 평시 `RestoreDefaults`는 swap no-op 유지(INV-192). 대응: MSG-043, SEQ-065~067, INV-192~195, ENG-DAT-097 §5 개정, ENG-DAT-C17 개정. 설계 SSOT: `docs/adr/0006-...md` §6 (착수), `arch/pipeline_stage_design_v2.md` §5.6.8.
+
+**[ENG-ALG-240]** **Recall dispatch + 역방향 executor**. `EngineCommand::RecallWeights { ratio }`는 `generate.rs`/`CommandDispatcher`의 command dispatch 루프에서 **직접 수신**되어(ENG-ALG-214-ROUTE와 동형 — `CachePressurePipeline` 미경유) 엔진 직결 OneShot `WeightRecallStage`(PipelineStage, `WeightSwapStage`의 역방향 형제)를 submit한다. recall executor는 전방향 swap의 `SwapExecutor`를 **target_dtype=F16으로 재사용**한다 — `SwapExecutor.target_dtype` 필드는 도입 시부터 dtype-generic이므로 인터페이스 변경 0. F16 weight payload는 secondary의 F16 variant view(`SecondaryDtypeChoice::F16`로 별도 바인딩, 같은 `Arc<AufView>`/mmap 공유 — INV-125)에서 읽는다. swap의 모든 런타임 규약(per-token snapshot INV-121, atomicity INV-123, `current_dtype` 동시 갱신 INV-124, `ratio_generation` 1회 bump INV-129, SOA registry invalidate INV-130/131)은 recall에도 동일 적용된다(executor 공유). *(MUST)*
+
+- **방향별 dtype 검증 (INV-126 완화)**: 전방향 `SwapWeights`는 `target_dtype == Q4_0`만 허용, 역방향 `RecallWeights`는 `target_dtype == F16`만 허용한다(directive 자체에 dtype 필드 없이 방향이 dtype을 고정 — recall은 항상 F16). 각 방향의 허용 dtype 외 요청은 `UnsupportedDtype` reject. 막던 가드(`dtype_tag_to_dtype` Q4_0-only, `ReverseSwapRejected`)는 **방향별로 분리**되어, recall 경로에서는 F16 view 바인딩이 `ReverseSwapRejected` 적용을 받지 않는다(production swap 안전 가드는 전방향에만).
+- **plan invalidation 정합**: recall도 batch 종료 시 `ratio_generation`을 정확히 1회 bump(ENG-ALG-211 step (e) 동형). F16 weight는 SOA fast-path 비대상(AOS 경로)이므로 SOA registry는 invalidate만 하고 재등록 0 — INV-130의 stale entry 제거 정신 보존.
+
+**[ENG-ALG-241]** **Recall 후보 선택 + loud no-op 분기**. recall 후보는 **현재 Q4_0인 layer**(전방향 swap의 역집합)이며, 추적 SSOT는 dispatcher sticky 상태가 아니라 **`model.layers[i].current_dtype() == DType::Q4_0`**이다(swap precision은 dispatcher 측 sticky 추적이 부재한 transient 시맨틱 — quant/partition의 last-applied 게이트와 비대칭). `target_count = floor(ratio × N_currently_swapped)` 또는 ratio=1.0 시 전체 복원. 이미 F16인 layer는 `current_dtype() == target_dtype` 가드로 idempotent skip(전방향 executor의 skip 로직 그대로). *(MUST)*
+
+**loud no-op 분기 (INV-195)**: recall 불가 5종은 모두 **stderr 1회 진단 + graceful `Consumed`**(panic/Err-강하/decode 중단 금지)로 처리한다:
+
+| # | 불가 분기 | 원천 | 메시지 (stderr 1회) |
+|---|----------|------|---------------------|
+| (a) | secondary에 F16 variant 부재 | `LoadError::DtypeNotFound`(Q4_0-only secondary) | `[WeightRecall] Rejected: no_f16_variant — secondary has no F16 payload (Q4_0-only). Recall impossible.` |
+| (b) | Adreno SOA 경로 | `LoadError::AdrenoSoaF16Rejected`(SOA layout=Q4_0 전용) | `[WeightRecall] Rejected: soa_path — Adreno SOA secondary is Q4_0-only, F16 recall unsupported on SOA. Use AOS secondary.` |
+| (c) | secondary handle 부재 | `model.secondary_mmap == None` | `[WeightRecall] Rejected: no_secondary` |
+| (d) | currently-swapped layer 0개 | `current_dtype()==Q4_0` layer 없음 | `[WeightRecall] No layers to recall (none currently swapped)` |
+| (e) | in-flight plan 활성 | swap_runtime 공유 in-flight 마커 active(R-1 가드) | `[WeightRecall] Rejected: commit slot already active. Wait for current swap/recall plan to complete.` |
+
+- **(a)/(b) 검출 시점**: F16 view 바인딩 시점(`open_secondary_*`의 `SecondaryDtypeChoice::F16` 경로가 `DtypeNotFound`/`AdrenoSoaF16Rejected` 반환). recall Stage commit §1 validate에서 이 결과를 받아 loud no-op으로 강하. **`ReverseSwapRejected`는 recall 경로에서 절대 발생하지 않음**(그 가드는 전방향 production swap 전용 — recall은 의도적 역방향이므로 우회).
+- **합성 역전 (partition) 범위 제외**: recall은 precision 축(F16↔Q4_0)만 다룬다. tensor partition(format×hardware 곱, ADR-0006 §6)의 처분은 본 범위 밖이며 `RestoreDefaults`가 별도로 Full 복원한다(`submit_partition_full`, AB-4 §5.5.2). recall과 partition은 직교 — 동시 적용 시 각자 자기 축만 역전한다.
+
+**교차 참조**:
+- ENG-ALG-211/214 (SwapExecutor, swap dispatch): recall은 동일 executor를 target_dtype=F16으로 재사용. dispatch route는 ENG-ALG-214-ROUTE 동형(직접 수신).
+- ENG-ALG-215 (WeightSwapDecider): 전방향은 importance×ε bottom-k로 swap 후보 선택. recall은 **역집합 단순 선택**(currently-swapped 중 ratio 이하)이라 decider 비대칭 — recall은 "되돌릴 layer"를 importance-aware로 고를 필요가 없다(F16 복원은 항상 품질 개선 방향이므로). uniform/전체 복원이 기본.
+- INV-122 (정확성 게이트): INV-194가 역방향 게이트(full recall 후 greedy == all-F16 baseline).
+- INV-126 (방향별 허용 dtype), INV-192~195 (recall 불변식).
 
 ---
 

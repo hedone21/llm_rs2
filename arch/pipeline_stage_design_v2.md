@@ -928,7 +928,7 @@ fn submit_swap(&mut self, ratio: f32, target_dtype: DtypeTag):
 **sticky 시맨틱 = transient (no last-applied 게이트, no armed 게이트).** swap 은 **transient** 다 — partition 의 last-applied 비교 게이트(§5.5.2)도, evict 의 `evict_armed` edge-trigger 게이트(§5.4)도 **불요**하다. 근거:
 - **transient 등가 anchor**: beta4 과도기 테스트(`engine/tests/beta4_command_channel.rs:220` "swap_weights 등가" + `command_dispatcher.rs:632` `assert_eq!(c2.swap_weights, None, "swap transient")`)가 swap=transient 를 단언한다 — directive 도착 tick 에만 set, 다음 dispatch 에서 carry 0(quant 처럼 sticky 아님). 이 transient 시맨틱을 OneShot submit 으로 보존: directive 도착 = submit 1회, 다음 tick 재submit 없음(carry 부재).
 - **재submit 차단 = in-flight 가드가 담당**: partition 은 *값이 곧 상태*(어떤 split geometry)라 값 비교 게이트가 정확했으나, swap 은 *진행 중 동작*(F16→Q4_0 변환이 multi-tick 에 걸쳐 진행)이라 **R-1 동시 활성화 차단**이 핵심이다. 이 차단은 dispatcher 의 last-applied 비교가 아니라 **Stage commit 경로의 in-flight 가드**(§5.6.2 §2, `commit_slot.is_idle()` 등가 = 현 Incremental plan 이 미완 drain 이면 새 commit reject)가 담당한다. 즉 같은 directive 가 재도착해도 in-flight Stage 가 살아 있으면 새 submit 의 commit 이 §2 에서 reject 된다.
-- **RestoreDefaults**: swap 역전(F16 recall)은 `SwapExecutor` 단방향(F16→Q4_0)이라 **신규 메커니즘 부재**(ADR-0006 §5 Risk "RestoreDefaults swap 역전 = 신규 메커니즘", §6 Deferred). 따라서 AB-6 의 `submit_swap` 는 RestoreDefaults 에 대응하지 않는다(swap 복원 no-op) — partition 의 `submit_partition_full` 같은 역전 submit 없음. swap reversal 은 ADR-0006 §6 Deferred 그대로.
+- **RestoreDefaults**: **swap 복원 no-op 유지** (2026-06-13 옵션 B 결정 후에도 불변). AB-6 의 `submit_swap` 는 RestoreDefaults 에 대응하지 않는다 — partition 의 `submit_partition_full` 같은 자동 역전 submit 없음. **단 swap 역전(F16 recall)은 더 이상 Deferred 가 아니다** — 명시 directive `RecallWeights`(MSG-043)로 발화하는 별도 OneShot `WeightRecallStage`(§5.6.8 신설)가 담당한다. 즉 "평시 RestoreDefaults=swap no-op" 는 production winner Incremental 의 Q4 유지 이득 보존(사용자 결정 B, INV-192)이고, 역전이 필요하면 manager/사용자가 명시 `RecallWeights` 를 발화한다. 상세: §5.6.8, ADR-0006 §6 (착수), ENG-ALG-240/241.
 
 > **partition 과의 차이 (landmine)**: partition 게이트(`last_partition_ratio` 비교)를 swap 에 복사 **금지**. partition 은 idempotent re-slice(같은 ratio 재적용 = 같은 산출, 비용만 지불)라 값 비교로 비용 절감했으나, swap 은 같은 ratio 재도착이 *추가 layer swap*(currently_swapped 차감 후 budget) 또는 *in-flight 충돌*을 의미하므로 값 비교가 부정확하다. in-flight 가드가 정확한 차단이다.
 
@@ -973,6 +973,53 @@ WeightSwapStage commit (§7)
 > **non-local 변경 경고**: `EngineSwapRuntime` 은 `swap_backend`/`AsyncSwapDispatcher`/`release_worker` 를 보유하므로 build_bench_loop 가 이들을 구성·전달해야 한다(현 swap 미배선 = `NoOpSwapStage`, ADR-0006 §5 "greenfield wiring"). secondary_mmap 부재 모델(happy/chat)은 `swap_runtime=None` → swap directive 무시(무영향). **host smoke 불가**(GPU 부재 + secondary 필요) — build/clippy + CLI parse + dispatcher transient/in-flight 단위테스트 + `handle_swap_weights` §1~7 등가 테스트까지. 실 swap decode·정확성·device 게이트 = S25/Jetson 필수(legacy frozen baseline 대조).
 
 > **hook cell 배선 (Track B, §5.9.2) host scope 당김.** AB-6 작성 시점(2026-06-11)의 §5.6.3 표·본 §5.6.7 은 IntraForward/LayerImmediate 의 forward slot 배선을 *전부* device 게이트로 미뤘으나(weight_swap.rs:217-238 `let _hook` drop), §5.9.2 가 **공유 hook cell** 메커니즘을 정의하면서 배선의 *구조* 는 host scope 로 당겨진다: `TransformerModelForwardArgs` 슬롯 추가 + `forward_into` hook 호출 배선 + WeightSwapStage `hook_cell` 인자 + ModelForward cell-read 는 모두 host build/clippy/unit 으로 검증 가능(commit 시 cell=Some / finalize 후 cell=None / cell→forward args 주입 단위테스트). device 게이트에 남는 것은 **실 IntraForward swap dispatch 정확성·TBT**(secondary + GPU async swap 필요)뿐이다 — 구조 배선은 host, 동작 실증은 device 로 분담.
+
+#### 5.6.8 `WeightRecallStage` — F16 recall (역방향, 옵션 B, 2026-06-13)
+
+> 2026-06-13 사용자 결정 B(옵션 B "명시 트리거 F16 recall"). ADR-0006 §6 의 swap reversal 항목 착수. spec SSOT: ENG-ALG-240/241(§3.12.23), MSG-043, SEQ-065~067, INV-192~195. **본 절은 메커니즘 설계 요지** — Implementer 지시서는 본 라운드 산출물.
+
+**설계 결정 (각 1줄 근거)**:
+
+| 항목 | 결정 | 근거 |
+|---|---|---|
+| **directive 표면** | 신규 `EngineCommand::RecallWeights { ratio }`(MSG-043) | RestoreDefaults 는 De-escalation SEQ(SEQ-060~064)·verify 시나리오가 의존하는 "묶음 reset" 이라 의미 오염 금지. recall 은 secondary I/O + plan invalidation 동반 의도적 작업이라 명시 directive 가 정직. wire 호환: 신규 variant 추가는 serde additive(기존 15종 round-trip 무영향, mock_manager 신규 arm) |
+| **역방향 경로** | `SwapExecutor` 재사용(target_dtype=F16) + 별도 OneShot `WeightRecallStage`(`WeightSwapStage` 역방향 형제) | `SwapExecutor.target_dtype` 은 dtype-generic 필드(이미 양방향 지원) — 인터페이스 변경 0. OneShot 모델 정합: 새 directive = 새 Stage submit(전방향과 동형, "Consumed OneShot 역기동" 비문제) |
+| **swap된 layer 추적** | 엔진 측 `model.layers[i].current_dtype() == Q4_0` SSOT 재사용 | swap precision 은 transient(dispatcher 측 sticky 추적 부재 — §5.6.4) — "현재 Q4_0 인 layer" 가 곧 recall 후보. dispatcher 신규 sticky 상태 추가 불요 |
+| **합성 역전(partition)** | **범위 제외** — recall 은 precision 축만 | partition(format×hardware 곱)은 RestoreDefaults 가 별도 Full 복원(`submit_partition_full`, AB-4). recall 과 직교 — 동시 적용 시 각자 자기 축만 역전. 두 축 합성 역전은 별도 결정 |
+| **불가 분기 UX** | loud no-op(stderr 1회 + graceful Consumed, INV-195) | silent 금지(사용자 명시). F16 variant 부재/SOA 경로/no_secondary/swapped 0개/in-flight 5종 |
+
+**처리 흐름**:
+
+```mermaid
+flowchart TD
+    A["RecallWeights{ratio} 도착"] --> B["CommandDispatcher::submit_recall"]
+    B --> C{"model/swap_runtime/<br/>layer_slots 구성?"}
+    C -- 미구성 --> Z["no-op (happy/chat)"]
+    C -- 구성 --> D["WeightRecallStage::one_shot submit"]
+    D --> E["WeightMutate phase commit §1 validate"]
+    E --> F{"F16 view 바인딩<br/>SecondaryDtypeChoice::F16"}
+    F -- "DtypeNotFound" --> L1["loud no-op (a) no_f16_variant"]
+    F -- "AdrenoSoaF16Rejected" --> L2["loud no-op (b) soa_path"]
+    F -- "no_secondary" --> L3["loud no-op (c)"]
+    F -- OK --> G["currently_swapped = current_dtype()==Q4_0"]
+    G --> H{"swapped 0개?"}
+    H -- yes --> L4["loud no-op (d) none swapped"]
+    H -- no --> I{"in-flight 마커 active?"}
+    I -- yes --> L5["loud no-op (e) in-flight (R-1)"]
+    I -- no --> J["target = floor(ratio×N_swapped) 선택"]
+    J --> K["SwapExecutor(target=F16) execute_on_slots"]
+    K --> M["ratio_generation +1 (INV-129) + SOA invalidate (INV-130)"]
+    M --> N["WeightSwapReport(Q4_0→F16) 송신 + Consumed"]
+```
+
+**인터페이스 (pub 시그니처 + pre/post)**:
+- `WeightRecallStage::one_shot(model, runtime, ratio, hook_cell) -> Self` — pre: `ratio ∈ (0,1]`. post: OneShot Stage(`WeightMutate` self-filter).
+- recall 은 전방향과 달리 **decider 비대칭** — `WeightSwapDecider`(importance×ε bottom-k)를 호출하지 않는다. F16 복원은 항상 품질 개선 방향이라 "되돌릴 layer" 를 importance-aware 로 고를 이유가 없다 → currently-swapped 역집합 단순 선택(ratio 이하 또는 전체). importance 인자 부재 = `WeightSwapStage` 대비 단순.
+- **F16 view 캐싱**: recall 마다 F16 view 를 새로 바인딩하면 비용 중복 → `EngineSwapRuntime` 또는 model 측에 F16 secondary view 를 lazy-once 캐싱(`OnceLock<Result<Arc<SecondaryMmap>, LoadError>>` 권장 — 첫 recall 시 바인딩, 이후 재사용; reject 결과도 캐싱하여 매 recall loud-fail 반복 회피). 같은 `Arc<AufView>`/mmap 공유(INV-125).
+
+**예외 처리**: 5종 loud no-op(ENG-ALG-241 표). `ReverseSwapRejected` 는 recall 경로에서 **절대 발생하지 않음**(전방향 production swap 안전 가드 — recall 은 의도적 역방향이라 `SecondaryDtypeChoice::F16` 바인딩 시 그 가드를 우회하도록 별도 진입점 필요. 상세는 Implementer 지시서).
+
+**코드-스펙 차이**: 현 `run_layer_swap`(qcf_runtime.rs:56)이 `DType::Q4_0` 하드코딩으로 executor 생성 → recall 은 target_dtype=F16 변형 진입점 필요(Implementer 지시서 §executor). `open_secondary_auf`(auf/secondary.rs:209)의 `ReverseSwapRejected`(L499-503)는 production swap 전용 가드 — recall 의 F16 view 바인딩은 이 가드를 우회하는 별도 호출 경로(예: `open_secondary_f16_for_recall` 또는 reject 우회 flag) 필요.
 
 ### 5.7 AB-2 — `KiviQuantStage` (KvQuantDynamic runtime directive → OneShot PipelineStage, KIVI 축)
 

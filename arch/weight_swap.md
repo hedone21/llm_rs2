@@ -1260,7 +1260,9 @@ flowchart LR
 
 ### 5.4 이미 swap된 layer의 처리
 
-Decider는 `already_swapped: &HashSet<usize>`를 입력받아 후보에서 **제외**한다. "상한" 의미(ENG-ALG-215)에서 `needed = target_count - already_swapped.len()`이다. 즉 Manager가 ratio=0.5를 거듭 지시해도 이미 8개가 swap되어 있다면 추가 선택은 0이다. 단방향 유지.
+Decider는 `already_swapped: &HashSet<usize>`를 입력받아 후보에서 **제외**한다. "상한" 의미(ENG-ALG-215)에서 `needed = target_count - already_swapped.len()`이다. 즉 Manager가 ratio=0.5를 거듭 지시해도 이미 8개가 swap되어 있다면 추가 선택은 0이다. 전방향 swap(F16→Q4_0)은 단조 증가.
+
+> **역방향 recall (2026-06-13, 옵션 B)**: 전방향이 단조 증가인 것과 대칭으로, 역방향 복원(Q4_0→F16)은 명시 directive `RecallWeights`(MSG-043)로만 발화한다. recall 후보는 `already_swapped`(현재 Q4_0 layer)이며 decider 의 importance×ε 선택을 **거치지 않는다**(F16 복원은 항상 품질 개선 방향 — currently-swapped 역집합 단순 선택). 평시 RestoreDefaults 는 swap 을 역전하지 않는다(INV-192). 상세: `arch/pipeline_stage_design_v2.md §5.6.8`, ENG-ALG-240/241(§3.12.23).
 
 ---
 
