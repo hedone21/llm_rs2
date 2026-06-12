@@ -694,16 +694,31 @@ pub fn run_ppl(
         );
     }
     let prefill_chunk = if let Some(forced) = args.ppl_prefill_tokens {
-        // LISWAP-PPL: 명시적 prefill 길이 강제. swap 측정 시 decode loop 을
-        // 충분히 돌리기 위함. budget 로직보다 우선.
-        forced.clamp(2, eval_tokens)
+        // LISWAP-PPL / 측정: 명시적 prefill 길이 강제. budget 로직보다 우선.
+        // budget이 있어도 prefill은 절단되지 않음 — eviction은 decode 중 budget 기준 발동.
+        let clamped = forced.clamp(2, eval_tokens);
+        eprintln!(
+            "[PPL] prefill override: --ppl-prefill-tokens={} (budget과 독립, \
+             eviction은 budget={} 기준 decode 중 발동)",
+            clamped,
+            if has_budget { args.kv_budget() } else { 0 }
+        );
+        clamped
     } else if has_budget {
         let budget = if args.kv_budget_ratio() > 0.0 {
             ((eval_tokens as f32) * args.kv_budget_ratio()) as usize
         } else {
             args.kv_budget()
         };
-        budget.min(eval_tokens).max(2)
+        let truncated = budget.min(eval_tokens).max(2);
+        if truncated < eval_tokens {
+            eprintln!(
+                "[PPL] prefill truncated by budget: {} → {} tokens \
+                 (use --ppl-prefill-tokens={} to fix prefill length independently)",
+                eval_tokens, truncated, eval_tokens
+            );
+        }
+        truncated
     } else if auto_eviction && args.eviction_policy() == "sliding" {
         args.eviction_window().min(eval_tokens)
     } else {
