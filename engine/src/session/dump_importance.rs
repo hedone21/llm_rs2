@@ -21,6 +21,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::kv_cache::KVCache;
+use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
@@ -183,6 +184,29 @@ fn run_head_concentration_decode(
         ctx.backend.clone(),
     );
 
+    // Decode workspace: accumulate_layer_gqa()는 (Some(acc), Some(ws)) 조건에서만
+    // 호출된다 (transformer.rs:1639). workspace가 None이면 ws.scores가 채워지지 않아
+    // last_step_head_attn()이 항상 0을 반환하므로, 실제 LayerWorkspace를 구성한다.
+    let q_dim = ctx.model.config.num_attention_heads * ctx.model.config.head_dim;
+    let k_dim = ctx.model.config.num_key_value_heads * ctx.model.config.head_dim;
+    let v_dim = k_dim;
+    let ffn_hidden = ctx.model.config.intermediate_size;
+    let hidden_size = ctx.model.config.hidden_size;
+    let mut gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: ctx.model.config.num_attention_heads,
+            max_seq_len,
+        },
+        ctx.memory.as_ref(),
+        ctx.backend.clone(),
+    )?;
+
     // 단일 토큰 입력 버퍼
     let tok_buf = Galloc::new().alloc(4, DType::U8)?;
     let tok_cpu = Tensor::new(Shape::new(vec![1, 1]), tok_buf, Arc::new(CpuBackend::new()));
@@ -229,7 +253,10 @@ fn run_head_concentration_decode(
                 memory: &*ctx.memory,
                 logits_out: &mut decode_logits,
                 x_gen: None,
-                workspace: None,
+                // workspace가 Some이어야 transformer.rs:1639의 조건
+                // `(Some(acc), Some(ws))`를 만족해 accumulate_layer_gqa()가 호출된다.
+                // None이면 ws.scores가 채워지지 않아 last_step_head_attn() = 0.
+                workspace: Some(&mut gen_ws),
                 logits_last_only: true,
                 score_accumulator: Some(&mut acc),
                 skip_config: None,
