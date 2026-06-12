@@ -255,6 +255,54 @@ mod tests {
     fn empty_after_trim() {
         assert!(parse_qcf_sample_layers(",", 4).is_err());
     }
+
+    // ── A2SF (arXiv 2407.20485) score decay 주입 — CLI 배선 게이트 (KV roadmap 항목 0 §4.2) ──
+
+    /// `--score-decay` 미지정(기본 0.0) → `h2o_decay()` 가 정책 자체 값을 그대로 반환.
+    /// flag 도입 전 경로 bit-identical: eviction 미지정 시 0.0, H2O `--decay 0.3` 시 0.3.
+    #[test]
+    fn score_decay_default_preserves_policy_decay() {
+        // eviction 미지정 → h2o_decay() = 0.0 (기존 동작).
+        let a = Args::try_parse_from(["test"]).unwrap();
+        assert_eq!(a.eviction_common.score_decay, 0.0, "기본 0.0");
+        assert_eq!(
+            a.h2o_decay(),
+            0.0,
+            "미주입 + 정책 없음 → 0.0 (bit-identical)"
+        );
+
+        // H2O --decay 0.3, --score-decay 미지정 → 정책 값 0.3 유지.
+        let b = Args::try_parse_from(["test", "eviction", "h2o", "--decay", "0.3"]).unwrap();
+        assert!(
+            (b.h2o_decay() - 0.3).abs() < 1e-6,
+            "score-decay 미주입 → H2O --decay 0.3 그대로"
+        );
+    }
+
+    /// `--score-decay 0.8` (> 0.0) → 정책 무관하게 0.8 을 우선 주입.
+    /// 정책 자체 decay(H2O --decay 0.3)보다 측정 flag 가 우선.
+    #[test]
+    fn score_decay_overrides_when_positive() {
+        // eviction 미지정이어도 --score-decay 가 주입된다.
+        let a = Args::try_parse_from(["test", "--score-decay", "0.8"]).unwrap();
+        assert!((a.h2o_decay() - 0.8).abs() < 1e-6, "정책 무관 0.8 주입");
+
+        // H2O --decay 0.3 위에 --score-decay 0.9 → measurement flag 우선(0.9).
+        let b = Args::try_parse_from([
+            "test",
+            "--score-decay",
+            "0.9",
+            "eviction",
+            "h2o",
+            "--decay",
+            "0.3",
+        ])
+        .unwrap();
+        assert!(
+            (b.h2o_decay() - 0.9).abs() < 1e-6,
+            "score-decay 0.9 가 H2O --decay 0.3 보다 우선"
+        );
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -1319,7 +1367,17 @@ impl Args {
         }
     }
 
+    /// Score accumulator decay factor (= A2SF α 의 1 − α). accumulator 생성자(`new`/`new_gqa`)의
+    /// 5번째 인자로 흐른다.
+    ///
+    /// A2SF 측정(arch/kv_roadmap_item0_measurement.md §4.2): `--score-decay` 측정 flag 가 > 0.0 이면
+    /// 정책 무관하게 그 값을 우선한다(forgetting factor 주입). 0.0(기본) 이면 정책 자체 decay(H2O
+    /// `--decay`)를 그대로 반환 → flag 도입 전 경로 **bit-identical**(누적 로직 무수정, 주입만 추가).
     pub fn h2o_decay(&self) -> f32 {
+        let score_decay = self.eviction_common.score_decay;
+        if score_decay > 0.0 {
+            return score_decay.clamp(0.0, 1.0);
+        }
         match self.current_policy() {
             Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.decay,
             _ => 0.0,

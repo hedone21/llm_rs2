@@ -468,6 +468,62 @@ mod tests {
         assert!((imp[3] - 2.0).abs() < 1e-6);
     }
 
+    /// A2SF (arXiv 2407.20485) 격리 게이트 — `decay=0.0` bit-identical 회귀.
+    ///
+    /// `--score-decay` flag 도입 후에도 **decay 미주입(0.0)** 이면 `begin_step()` 의
+    /// `if self.decay > 0.0` 가드가 진입하지 않아 누적 결과가 종전과 정확히 동일해야 한다.
+    /// 이 테스트는 decay=0.0 으로 3-step 누적 후 score 가 순수 합산(감쇠 0)임을 명시 단언한다 —
+    /// flag 가 누적 로직을 한 줄도 바꾸지 않았음의 회귀 anchor(KV roadmap 항목 0 §4.2 게이트 (1)).
+    #[test]
+    fn test_a2sf_decay_zero_bit_identical() {
+        let mut acc = AttentionScoreAccumulator::new(4, 1, 1, 0, 0.0);
+        acc.set_active(true);
+
+        // 3-step 누적 (각 step 동일 score). decay=0.0 → 순수 SUM.
+        for _ in 0..3 {
+            acc.begin_step();
+            acc.accumulate_layer(&[1.0, 2.0, 3.0, 4.0], 4, 4, 1, 0);
+            acc.end_step();
+        }
+        // 감쇠 0 → importance = 3 × [1,2,3,4] = [3,6,9,12] (정확히, 부동소수 오차 없음).
+        let imp = acc.importance_scores();
+        assert_eq!(imp[0], 3.0, "decay=0.0 순수 SUM (감쇠 미진입)");
+        assert_eq!(imp[1], 6.0);
+        assert_eq!(imp[2], 9.0);
+        assert_eq!(imp[3], 12.0);
+    }
+
+    /// A2SF 격리 게이트 — `decay=0.8` 2-step 감쇠 동작.
+    ///
+    /// §4.2 게이트 (2): decay=0.8 일 때 begin_step 감쇠 factor=(1−0.8)=0.2 가 누적에 적용됨을
+    /// 확인. step1 score 가 step2 begin_step 에서 0.2× 로 감쇠된 뒤 step2 score 가 더해진다.
+    #[test]
+    fn test_a2sf_decay_point_eight_two_step() {
+        let mut acc = AttentionScoreAccumulator::new(4, 1, 1, 0, 0.8);
+        acc.set_active(true);
+
+        // Step 1: importance = [1, 2, 3, 4]
+        acc.begin_step();
+        acc.accumulate_layer(&[1.0, 2.0, 3.0, 4.0], 4, 4, 1, 0);
+        acc.end_step();
+
+        // Step 2: begin_step 이 factor=0.2 감쇠 → [0.2, 0.4, 0.6, 0.8],
+        //         이후 [10, 10, 10, 10] 누적 → [10.2, 10.4, 10.6, 10.8].
+        acc.begin_step();
+        acc.accumulate_layer(&[10.0, 10.0, 10.0, 10.0], 4, 4, 1, 0);
+        acc.end_step();
+
+        let imp = acc.importance_scores();
+        assert!(
+            (imp[0] - 10.2).abs() < 1e-5,
+            "factor=0.2 감쇠 + 누적, got {}",
+            imp[0]
+        );
+        assert!((imp[1] - 10.4).abs() < 1e-5);
+        assert!((imp[2] - 10.6).abs() < 1e-5);
+        assert!((imp[3] - 10.8).abs() < 1e-5);
+    }
+
     #[test]
     fn test_should_track_layer() {
         // Track last 2 of 4 layers => layers 2, 3
