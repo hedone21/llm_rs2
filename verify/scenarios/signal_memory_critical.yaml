@@ -4,33 +4,40 @@ layer: signal
 devices: [galaxy_s25, jetson]
 models: [f16, q4]
 baseline:
-  prompt: fixtures:short_smoke
+  # medium_qa(918 tok) 필수 — 엔진 MIN_EVICT_TOKENS=64 가드(eviction_handler.rs)로
+  # 짧은 프롬프트(short_smoke ≈28 tok)는 제거량 < 64 → 영구 NoOp 이라
+  # "[CacheEvent] Eviction completed" 가 물리적으로 나올 수 없다 (2026-06-12 적발).
+  prompt: fixtures:medium_qa
   decode_tokens: 128
   seed: 42
   greedy: true
   backend: auto
   prefill_chunk_size: 64
   extra_args:
-    # EvictionCommonArgs (`--protected-prefix`, `--min-kv-cache`) must precede
-    # the `eviction` subcommand — clap derive scopes everything after the
-    # subcommand to the per-policy args struct.
+    # EvictionCommonArgs (`--protected-prefix`) must precede the `eviction`
+    # subcommand — clap derive scopes everything after the subcommand to the
+    # per-policy args struct. min_kv_cache 는 기본값(256) 사용 — medium_qa 에서는
+    # keep target 이 256 을 상회/근접하므로 하한 우회(구 `--min-kv-cache 8`)가 불필요하다.
     - "--protected-prefix"
     - "4"
-    # min_kv_cache 기본값 256 은 short_smoke 프롬프트(≈28 토큰) 에서 eviction 이
-    # target_pos < 256 으로 clamp 되어 "0 evictions" 로 귀결되게 한다. 정책 경로의
-    # 정합성만 검증하므로 하한을 내려 directive 가 실제 eviction 을 수행하도록 한다.
-    - "--min-kv-cache"
-    - "8"
     - "eviction"
     - "h2o"
 action:
   enable_resilience: true
   injection_schedule:
-    - delay_sec: 0.8
+    # decode 구간 주입 (medium_qa prefill ≈5~7s 이후) — prefill 중 주입하면 엔진
+    # poll 간격(chunk 경계) 때문에 QcfEstimate 가 manager 의 QCF_TIMEOUT(1.0s) 를
+    # 넘겨 2-step 핸드셰이크가 유실된다(timeout 시 무-QCF decide 폴백 부재 —
+    # backlog "QCF 핸드셰이크 신호 유실" 항목). 본 시나리오의 검증 대상은
+    # fresh-QCF critical floor 경로이므로 decode 주입이 의도 정합.
+    - delay_sec: 9.0
       signal:
         memory_pressure:
+          # p.memory = 1 - 1.4GB/8GB = 0.825 → 정책 pressure_level = critical.
+          # (구 30MB 주입은 p=0.996 = emergency 레벨로 시나리오 이름과 불일치 —
+          # QCF floor 가 emergency=huge 로 비활성화돼 critical floor 를 검증하지 못했다)
           level: critical
-          available_bytes: 30000000
+          available_bytes: 1400000000
           total_bytes: 8000000000
           reclaim_target_bytes: 100000000
 expected:
@@ -49,7 +56,11 @@ expected:
       max_pct: 80.0
       tolerance_pct: 30.0
   accuracy:
-    min_rouge_l: 0.40
+    # critical keep_ratio=0.50 → 컨텍스트 ~50% eviction 후의 정당한 발산을 허용하되
+    # garbage 퇴화(ROUGE ≈0.1 이하)는 차단하는 수준. 구 0.40 은 short_smoke 시절
+    # (≈24 tok eviction, 출력 준동일) 기준이라 medium_qa 재정렬과 함께 갱신
+    # (2026-06-12 실측: f16 ROUGE 0.362 / q4 0.434 — 둘 다 일관된 on-topic 출력).
+    min_rouge_l: 0.25
     min_bleu_4: 0.10
-    min_char_similarity: 0.35
+    min_char_similarity: 0.30
 pass_criteria: all
