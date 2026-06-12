@@ -206,6 +206,21 @@ fn test_g_fill_host_ptr_buffer_byte_equal_readback() {
     let Some(backend) = try_init_backend() else {
         return;
     };
+    // ALLOC_HOST_PTR fill→readback 왕복은 UMA(host unified memory) 전제 — LISWAP-3 의
+    // 설계 타겟(ARM SoC zero-copy). discrete GPU(NVIDIA 실측 2026-06-12)는
+    // READ_ONLY|ALLOC_HOST_PTR 버퍼의 `clEnqueueReadBuffer` 를 CL_INVALID_OPERATION 으로
+    // 거부한다. `memory/opencl/unified.rs` 의 non-UMA skip 가드와 동일 패턴.
+    let unified = matches!(
+        backend
+            .queue
+            .device()
+            .info(ocl::core::DeviceInfo::HostUnifiedMemory),
+        Ok(ocl::core::DeviceInfoResult::HostUnifiedMemory(true))
+    );
+    if !unified {
+        eprintln!("[SKIPPED] non-UMA device (host_unified_memory=false)");
+        return;
+    }
     const N: usize = 256;
     let src: Vec<u8> = (0..N).map(|i| (i as u8).wrapping_mul(7)).collect();
 
