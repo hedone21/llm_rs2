@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-BINARY="./target/release/generate"
+BINARY="./target/release/argus_eval"
 MODEL="/home/go/Workspace/models"
 RESULTS="experiments/results"
 CONFIGS="experiments/configs"

@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-BINARY="./target/release/generate"
+BINARY="./target/release/argus_eval"
 RESULTS="experiments/results/accuracy_bench"
 CONFIGS="experiments/configs"
 ANALYSIS="experiments/analysis"
