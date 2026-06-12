@@ -1138,7 +1138,7 @@
 - **Notes**: 직접 directive 경로(Suspend/Offload/Quant/TargetTbt/Partition/Swap)는 전부 정상 — 영향 범위는 QCF 2단계 정책 경로 한정. verify 매트릭스의 known-fail 2건이 이 항목의 회귀 게이트 역할. 담당 권장: Architect(배선 설계) → Implementer.
 
 ## [P2] QCF 2-step 핸드셰이크 신호 유실 — timeout 폴백 부재 + late estimate 미캐시 (2026-06-12 등록)
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T2)** — AC ①~④ 전부 충족 (`a1d43634` + verify 시나리오 커밋). ① `check_qcf_timeout` timeout 시 pending_signal 로 무-QCF 폴백 decide(`decide_and_build_directive` 직호출 — RequestQcf 재발행 구조적 차단) ② `complete_qcf_selection` cache 갱신을 early-return 앞으로(late estimate 도 캐시 반영, INV-117 보존) ③ SEQ-098 개정 + SEQ-098a 신설(spec/12 §3.10) + 회귀 테스트 2종 ④ 신규 시나리오 `signal_memory_critical_prefill`(prefill 0.8s 주입) S25 f16/q4 **PASS** — manager.stdout 에 "QCF estimate timeout (1.0s) — falling back to no-QCF decide" + "QCF timeout fallback directive seq=2" 발화 입증(구 거동 = directive 0건 유실). 결함은 LuaPolicy 한정(HierarchicalPolicy 기존부터 무결 — spec 테스트 사각지대였음). verify 매트릭스 **32/32**(기존 30 무회귀 + 신규 2) + α-K frozen 3-dtype byte-identical·tbt Δ≤+0.9%. sim 스냅샷 4종 갱신(폴백 발화로 relief 관측 분포 미세 변동 — 정당 파생).
 - **Sprint**: backlog
 - **Dependencies**: 없음 (QCF_kv 설계 라운드에서 적발, 라운드 범위 밖 처분)
 - **출처**: 2026-06-12 QCF_kv 라운드 P5 — `signal_memory_critical` medium_qa 재정렬 중 S25 실측: 신호가 prefill 중 도착하면 엔진 QcfEstimate 응답이 chunk-경계 poll 간격으로 ~3s 지연 → manager `QCF_TIMEOUT_SECS=1.0` 초과.

@@ -107,7 +107,9 @@ T1~T6 트랙에 배정. 상세는 (b) 참조. 포함 항목(line ref):
 
 ---
 
-#### T2 — QCF 2-step 핸드셰이크 신호 유실 (L1124, P2) · 규모 **M**
+#### T2 — QCF 2-step 핸드셰이크 신호 유실 (L1124, P2) · 규모 **M** — ✅ **종결 (2026-06-12)**
+
+> **T2 종결 기록 (2026-06-12)**: Architect(설계+SEQ-098 개정/SEQ-098a 신설) → Implementer(`a1d43634` — timeout 폴백 decide + late estimate 캐시, LuaPolicy 한정·HierarchicalPolicy 무결) → Tester(S25). **게이트**: manager lib **226/0** + manager spec **38/0** + clippy clean / 신규 시나리오 `signal_memory_critical_prefill` f16/q4 **PASS** + manager.stdout 폴백 발화 입증("QCF timeout fallback directive seq=2") / verify 매트릭스 **32/32**(기존 30 무회귀 + 신규 2, 20260612_193926) / α-K frozen 3-dtype **byte-identical** + tbt median Δ f16 +0.9% / f32 +0.7% / q4 −0.4% (전부 ≤+3%, run 간 30s 간격 측정 — 연속 5-run 은 가열로 후반 +15% 허상). 교훈: 15연속 run 측정 금지 — run 간 30s 간격이 thermal 안정 절차.
 
 spec 거동 변경(SEQ-098 timeout) 동반이라 Architect 선행 필수. 디바이스 게이트(S25 prefill-주입 변형) 필요.
 

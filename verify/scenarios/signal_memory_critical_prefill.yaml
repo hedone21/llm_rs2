@@ -1,0 +1,57 @@
+id: signal_memory_critical_prefill
+description: "SEQ-098 timeout fallback liveness: MemoryPressure{level=critical} injected during prefill (delay 0.8s, prefill ~5-7s). Engine cannot answer RequestQcf within QCF_TIMEOUT(1.0s) mid-prefill, so the manager must fall back to a no-QCF decide and still emit a KvEvict* directive — the pressure signal must not be lost. Companion to signal_memory_critical (decode-phase injection, fresh-QCF floor path)."
+layer: signal
+devices: [galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  # medium_qa(918 tok) — MIN_EVICT_TOKENS=64 가드 + prefill 5~7s 확보 (둘 다 필수).
+  prompt: fixtures:medium_qa
+  decode_tokens: 128
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+  extra_args:
+    - "--protected-prefix"
+    - "4"
+    - "eviction"
+    - "h2o"
+action:
+  enable_resilience: true
+  injection_schedule:
+    # prefill 구간 주입 (0.8s ≪ prefill ≈5~7s) — 엔진 poll 이 chunk 경계라
+    # QcfEstimate 응답이 QCF_TIMEOUT(1.0s) 을 넘는다. 본 시나리오의 검증 대상은
+    # SEQ-098 timeout 폴백(무-QCF decide) liveness: timeout 후에도 directive 가
+    # 발행되어야 한다 (구 거동 = pending 만 clear, 신호 통째 유실 → directive 0건).
+    - delay_sec: 0.8
+      signal:
+        memory_pressure:
+          # p.memory = 1 - 1.4GB/8GB = 0.825 → 정책 pressure_level = critical
+          # (signal_memory_critical 과 동일 압력 — 차이는 주입 시점뿐).
+          level: critical
+          available_bytes: 1400000000
+          total_bytes: 8000000000
+          reclaim_target_bytes: 100000000
+expected:
+  functional:
+    engine_commands_any_of: [KvEvictH2o, KvEvictSliding, KvEvictStreaming]
+    stderr_sequence:
+      - { pattern: "\\[Resilience\\] Directive.*KvEvict", name: dir_received }
+      - { pattern: "\\[CacheEvent\\] Eviction completed", name: evicted, after: dir_received, min_occurrences: 1 }
+      - { pattern: "\\[Experiment\\] Done", after: evicted, min_occurrences: 1 }
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 80.0
+      tolerance_pct: 30.0
+  accuracy:
+    min_rouge_l: 0.25
+    min_bleu_4: 0.10
+    min_char_similarity: 0.30
+# functional_only: prefill 도중 critical eviction(keep≈0.5)은 의도적으로 장거리
+# 컨텍스트를 잘라내므로 토큰 발산이 정당하다 (prefill_midway_injection 선례).
+# 검증 본질은 liveness (timeout 폴백으로 directive 발행 + eviction 발생).
+pass_criteria: functional_only
