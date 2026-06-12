@@ -135,33 +135,41 @@ SystemSignal에서 도메인별 측정값을 추출하여 [0, 1]로 정규화한
 | MemoryPressure | `m = clamp(1 - available_bytes / total_bytes, 0, 1)` | **직접 매핑** (MGR-ALG-013a) |
 | ThermalAlert | `m = clamp(temperature_mc / 85000, 0, 1)` | PI Controller (pi_thermal) |
 | ComputeGuidance | `m = max(clamp(cpu_usage_pct/100, 0, 1), clamp(gpu_usage_pct/100, 0, 1))` | PI Controller (pi_compute) |
-| EnergyConstraint | `m = clamp(1 - battery_pct / 100, 0, 1)` | compute PI 보조 (MGR-ALG-015) |
+| EnergyConstraint | `m = level_to_measurement(level)` (Normal 0.0 / Warning 0.55 / Critical 0.80 / Emergency 1.0) | compute PI 보조, 0.5 가중 (MGR-ALG-015) |
 
 - total_bytes = 0 인 경우 m = 0 (방어적 처리).
 - Thermal 정규화 기준: 85000 mc (85 C) = 1.0.
 - Compute: CPU와 GPU 사용률 중 최대값.
 
-#### MGR-ALG-015: EnergyConstraint Raw Processing
+#### MGR-ALG-015: EnergyConstraint Level Processing
 
-EnergyConstraint는 별도 PI 인스턴스 없이 compute PI에 보조 기여한다. **level이 아닌 raw 값(battery_pct)에서 직접 측정값을 산출한다.** *(MUST)*
+EnergyConstraint는 별도 PI 인스턴스 없이 compute PI에 보조 기여한다. **신호의 `level`(4단계 이산)에서 `level_to_measurement` 매핑으로 측정값을 산출한다.** *(MUST)*
 
 ```
-PRE:  battery_pct in [0, 100] (EnergyConstraint raw 필드)
+PRE:  level in {Normal, Warning, Critical, Emergency} (EnergyConstraint.level 필드)
 POST: compute pressure 갱신
 
-energy_measurement = clamp(1.0 - battery_pct / 100.0, 0, 1) * 0.5
+energy_measurement = level_to_measurement(level) * 0.5
 combined = max(pressure.compute, energy_measurement)
 compute_pressure = pi_compute.update(combined, dt)
+
+where level_to_measurement(level) =
+    Normal    -> 0.0
+    Warning   -> 0.55
+    Critical  -> 0.80
+    Emergency -> 1.0
 ```
 
-| battery_pct | energy_measurement | 의미 |
-|-------------|-------------------|------|
-| 100% | 0.0 | 배터리 완충, compute 영향 없음 |
-| 70% | 0.15 | 정상 사용 |
-| 30% | 0.35 | 배터리 부족, compute floor 상승 |
-| 5% | 0.475 | 극단 부족, compute 강한 제약 |
+| level | level_to_measurement | energy_measurement | 의미 |
+|-------|---------------------|-------------------|------|
+| Normal | 0.0 | 0.0 | 배터리 정상, compute 영향 없음 |
+| Warning | 0.55 | 0.275 | 배터리 주의, compute floor 소폭 상승 |
+| Critical | 0.80 | 0.40 | 배터리 부족, compute floor 상승 |
+| Emergency | 1.0 | 0.50 | 극단 부족, compute floor 0.5 (최대 보조) |
 
-> **설계 원칙**: Monitor는 raw 데이터만 전달하고, Policy가 raw 값에서 직접 압력을 계산한다. 이전 설계에서 사용하던 `level_to_measurement(level)` 경로는 폐기한다. 전력 상태의 시간 스케일(분~시간)이 PI의 초 단위 제어와 상이하므로 별도 도메인 대신 compute 보조 신호로 반영한다. 0.5 가중치는 energy가 compute를 과도하게 지배하지 않도록 한다.
+> **설계 원칙**: raw `battery_pct`는 Monitor 단계(`EnergyMonitor`)에서 `ThresholdEvaluator`로 4단계 `Level`로 변환되며, 내부 `SystemSignal::EnergyConstraint`에는 `level`만 실린다(raw `battery_pct` 필드는 SystemSignal에 존재하지 않는다). 따라서 Policy는 `level`에서 측정값을 산출한다. 전력 상태의 시간 스케일(분~시간)이 PI의 초 단위 제어와 상이하므로 별도 도메인 대신 compute 보조 신호로 반영한다. 0.5 가중치는 energy가 compute를 과도하게 지배하지 않도록 한다(Emergency에서도 보조 기여 상한은 0.5). `level_to_measurement`는 모든 도메인 공통 Level→측정값 매핑이며 ThermalAlert/ComputeGuidance의 level 경로와 동일하다.
+
+> **개정 이력**: 2026-06-12 — spec-code divergence 해소. 구 명세는 raw `battery_pct` 연속 변환(`clamp(1 - battery_pct/100, 0,1) * 0.5`)을 기술했으나, 실제 `SystemSignal::EnergyConstraint`에는 `battery_pct` 필드가 없고 구현(`pipeline.rs`)은 `level_to_measurement(level) * 0.5` 4단계 이산 매핑을 사용한다. directive 거동의 비가역성을 고려해 코드를 정본으로 두고 spec을 정합화했다(ID 유지).
 
 #### MGR-ALG-016: Elapsed dt Calculation
 

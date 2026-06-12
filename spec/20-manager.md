@@ -102,7 +102,7 @@
 
 - Raw 데이터: `battery_pct` (배터리 잔량 %), `power_budget_mw` (전력 예산)
 - `ignore_when_charging=true` 시 충전 중 신호를 발행하지 않는다
-- Policy는 `battery_pct`에서 직접 압력을 계산한다 (compute PI 보조 기여, MGR-ALG-015)
+- Monitor는 `battery_pct`를 `ThresholdEvaluator`로 Level로 변환하여 신호에 싣고, Policy는 신호의 `level`에서 압력을 계산한다 (compute PI 보조 기여, MGR-ALG-015)
 
 **[MGR-020]** ExternalMonitor는 stdin 또는 Unix socket에서 JSON Lines로 SystemSignal을 수신한다. 연구 및 테스트 용도이다. *(MAY)*
 
@@ -177,15 +177,15 @@
 
 각 액션은 종류(Lossless/Lossy), 가역 여부, 파라미터 범위, 배타 그룹, 기본 비용을 메타데이터로 보유한다.
 
-**[MGR-029]** EnergyConstraint 처리 — 별도 PI 인스턴스 없이 compute PI에 보조 기여한다. raw 값(`battery_pct`)에서 직접 측정값을 산출한다. *(MUST)*
+**[MGR-029]** EnergyConstraint 처리 — 별도 PI 인스턴스 없이 compute PI에 보조 기여한다. 신호의 `level`(4단계 이산)에서 측정값을 산출한다. *(MUST)*
 
 ```
-energy_measurement = clamp(1.0 - battery_pct / 100.0, 0, 1) * 0.5
+energy_measurement = level_to_measurement(level) * 0.5
 combined = max(pressure.compute, energy_measurement)
 compute_pressure = pi_compute.update(combined, dt)
 ```
 
-> 전력 상태의 시간 스케일(분~시간)이 PI의 초 단위 제어와 상이하므로 별도 도메인 대신 compute 보조 신호로 반영한다. 0.5 가중치는 energy가 compute를 과도하게 지배하지 않도록 한다. 알고리즘 상세 → `22-manager-algorithms.md` MGR-ALG-015.
+> raw `battery_pct`는 Monitor(EnergyMonitor)에서 Level로 변환되며 `SystemSignal::EnergyConstraint`에는 `level`만 실린다. 전력 상태의 시간 스케일(분~시간)이 PI의 초 단위 제어와 상이하므로 별도 도메인 대신 compute 보조 신호로 반영한다. 0.5 가중치는 energy가 compute를 과도하게 지배하지 않도록 한다(Emergency 보조 상한 0.5). 알고리즘 상세 → `22-manager-algorithms.md` MGR-ALG-015.
 
 **[MGR-030]** Observation Window — 액션 적용 후 OBSERVATION_DELAY_SECS (3.0초) 관찰 대기를 수행한다. *(MUST)*
 

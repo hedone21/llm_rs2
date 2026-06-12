@@ -103,7 +103,7 @@ flowchart TD
 | 항목 | 스펙 (WHAT) | 코드 (HOW) | 영향 |
 |------|------------|-----------|------|
 | **Memory 압력 계산** (MGR-ALG-013a) | `pressure.memory = m` (직접 매핑, PI 미경유) | `self.pi_memory.update(m, dt)` (PI 경유) | 코드가 PI 평활화를 적용하여 OOM 상황에서 반응이 지연됨. 스펙 의도는 즉각 반영. |
-| **EnergyConstraint** (MGR-ALG-015) | raw `battery_pct` → `clamp(1 - battery_pct/100, 0, 1) * 0.5` | `level_to_measurement(level) * 0.5` (4단계 이산 변환) | 코드는 Level enum (Normal=0.0, Warning=0.55, Critical=0.80, Emergency=1.0)으로 변환. 스펙은 연속 raw 값 사용. |
+| ~~**EnergyConstraint** (MGR-ALG-015)~~ | **해소 (2026-06-12)** | — | 구 divergence(spec=raw `battery_pct` 연속 변환 / code=`level_to_measurement(level) * 0.5` 4단계 이산)는 spec을 코드에 맞춰 갱신하여 해소. `SystemSignal::EnergyConstraint`에 `battery_pct` 필드가 없음을 spec이 반영. |
 
 ### 1.7 테스트 커버리지
 
@@ -746,7 +746,7 @@ impl ActionRegistry {
 |------|---|----------|-----------|
 | `OBSERVATION_DELAY_SECS` | 3.0 | `manager/src/pipeline.rs` | MGR-ALG-061 |
 | `FEATURE_DIM` | 13 | `manager/src/types.rs` | MGR-ALG-050 |
-| `level_to_measurement` | Normal=0.0, Warning=0.55, Critical=0.80, Emergency=1.0 | `manager/src/pipeline.rs` | MGR-ALG-015 (코드-스펙 차이) |
+| `level_to_measurement` | Normal=0.0, Warning=0.55, Critical=0.80, Emergency=1.0 | `manager/src/pipeline.rs` | MGR-ALG-015 (spec 정합화 완료 2026-06-12) |
 | `lr_bias` | 0.1 | `manager/src/relief/linear.rs` | MGR-ALG-044 |
 | `P_init` | 100.0 * I | `manager/src/relief/linear.rs` | MGR-ALG-045 (INV-048) |
 | `SEQ_COUNTER` | AtomicU64, 1부터 | `manager/src/pipeline.rs` | (내부 구현) |
@@ -765,7 +765,7 @@ impl ActionRegistry {
 | 항목 | 스펙 (WHAT) | 코드 (HOW) | 영향 | 심각도 |
 |------|------------|-----------|------|--------|
 | Memory 압력 계산 (MGR-ALG-013a) | `pressure.memory = m` (직접 매핑, PI 미경유) | `self.pi_memory.update(m, dt)` (PI 경유) | PI 평활화로 OOM 즉각 대응 지연 | 높음 |
-| EnergyConstraint (MGR-ALG-015) | raw `battery_pct` → 연속 변환 | `level_to_measurement(level)` → 4단계 이산 | 중간 배터리 수준(30~70%)에서 세밀한 압력 반영 불가 | 중간 |
+| EnergyConstraint (MGR-ALG-015) | ~~raw `battery_pct` → 연속 변환~~ → **spec을 코드에 정합화 (2026-06-12)** | `level_to_measurement(level)` → 4단계 이산 | 코드를 정본으로 spec 갱신 (`battery_pct`는 SystemSignal 필드 아님, Monitor에서 Level로 변환) | 해소 |
 | KvMergeD2o default relief | spec 테이블에 포함 (memory=0.6) | ActionId enum에 KvMergeD2o 정의, default_relief 포함 | 스펙-코드 일치 | 해소 |
 
 ---
