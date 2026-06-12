@@ -869,7 +869,8 @@
 > **출처**: 2026-06-10 설계 견고성 검토 — 최신 연구(2024–2026) ~70개 기법을 4갈래 병렬 조사(merge / eviction·budget / 표현 변경 / 패러다임·시스템)하여 3축 플러그인 설계(Stage ⊥ Format ⊥ Backend-capability)에 대조. 판정 등급: **A**(현 플러그인으로 가능, ~17) / **B**(어휘 확장·단순 op 추가, ~22) / **C**(복잡한 추가·설계 변경, ~30 — 이 중 ~12는 모델 아키텍처·학습·모달리티라 어느 엔진이든 코어 작업인 "범위 밖").
 > **결론**: plan-returning 골격과 3축 직교는 견고 — 식별된 어떤 갭도 "stage 직접 쓰기 권한"으로는 풀리지 않음(입력 부재/어휘 부족/구조 부재가 원인). 갭은 IR 어휘 3건(항목 1–3) + 표면 2건(항목 4–5) + 트리거 보류 3군집(항목 6–8)으로 수렴. 항목 1–5 수행 시 다룰 수 있는 영역(57개) 기준 표현 커버리지 **~40% → ~80%**, 잔여는 전부 개봉 조건이 명시된 의도적 보류.
 > **착수 순서 (사용자 결정 2026-06-10)**: 0(검증 선행) → 1–3(어휘 확장) → 4(read-plan ADR) → 5(persistence — **결이 달라 마지막**). 6–9는 트리거 개봉.
-> **진행 (2026-06-12)**: 0 RESOLVED(4종 게이트 종결) · 1 보류(Demote RED) · 3 RESOLVED(QueryStats 구현 완료) · **4 RESOLVED(ADR-0011 확정, 구현=4-impl 리팩토링 머지 후)**. 항목 3+4 = "KV 구조 확정" 게이트 → 직후 사용자 별도 워크트리 대형 리팩토링 병렬 시작. 항목 2·4-impl·5 는 리팩토링 머지 후 착수(KV 표면 무변경 보장).
+> **진행 (2026-06-12)**: 0 RESOLVED(4종 게이트 종결) · 1 보류(Demote RED) · 3 RESOLVED(QueryStats 구현 완료) · **4 RESOLVED(ADR-0011 확정, 구현=4-impl)**. 항목 3+4 = "KV 구조 확정" 게이트 도달.
+> **★분기 취소 (2026-06-12 저녁 사용자 결정)**: 별도 워크트리 대형 리팩토링을 하지 않기로 확정 — **항목 2·4-impl·5 의 "리팩토링 머지 후" 동결 해제**(즉시 착수 가능). `worktree_split_hygiene_2026_06_12.md` 효력 종료(②게이트 3항은 일반 회귀 게이트로 존속, verify 는 QCF_kv 라운드 종결로 **30/30**).
 
 ### [RESOLVED 2026-06-12] 0. 검증 선행 — 확장 0개로 가능한 1B 실측 (4종: 3 + 항목 1 게이트)
 - **Status**: **RESOLVED (2026-06-12)** / **Sprint**: completed / **Dependencies**: 없음
@@ -916,8 +917,8 @@
 - **해금 (ADR §1, ~9건)**: Quest(ICML'24 2406.10774), InfLLM, HISA, BLASST, shadowAttn(2508.16703 — 모바일 NPU prefill 전용), InfiniGen(OSDI'24), KVSwap(2511.11907) prefetch.
 - **실익 정직 평가 (ADR §10)**: 1B/2048 decode는 memory-bound라 **순이득 기대 낮음**(항목 0 1B 무가치 교훈과 동결) — 가치는 prefill TTFT + 8B/디스크 offload 토대 + 논문 기여("4번째 표면도 동일 plan-returning 문법으로 가산" 확장성 실증). **과대 포장 금지 못박음**: 1B 성능 주장은 8B 측정 전까지 하지 않는다.
 
-### [구현 보류 — 리팩토링 머지 후] 4-impl. read-plan 표면 구현 — `KVReadStage` 배선 (ADR-0011 산출)
-- **Status**: **구현 보류 (리팩토링 머지 후 착수 — 사용자 게이트 U2)** / **Sprint**: backlog / **Dependencies**: ADR-0011 확정(✅ 2026-06-12) + **사용자 대형 리팩토링 머지 완료**(미충족 — 게이트). 항목 3(QueryStats, ✅) 신호 공급원 선행 충족.
+### [P2] 4-impl. read-plan 표면 구현 — `KVReadStage` 배선 (ADR-0011 산출)
+- **Status**: **TODO (착수 가능 — 2026-06-12 분기 취소로 동결 해제)** / **Sprint**: backlog / **Dependencies**: ADR-0011 확정(✅ 2026-06-12) + ~~리팩토링 머지~~(분기 취소로 게이트 소멸). 항목 3(QueryStats, ✅) 신호 공급원 선행 충족.
 - **★착수 게이트 (2026-06-12 사용자 결정)**: ADR-선행 = 미래 표면을 문서 제약으로 고정해 병렬 리팩토링과 의미적 충돌 예방. **리팩토링이 `attention_into` 주변을 재설계하므로 머지 전 구현 착수 금지**(ADR §8 Premortem #3 — read plan→capability→폴백 의미 계약을 ADR 이 지키되, 구현은 리팩토링 결과 위에 올림). 같은 이유 항목 2(K/V 비대칭 merge)·5(persistence)도 머지 후.
 - **구현 단계 분해 (ADR-0011 D1~D5 기준, 머지 후 재-triage 필요)**:
   - **S1 technique-api 표면**: `KVReadStage` trait + `KVReadPlan{ReadGranularity(#[repr(u32)] Token/Page), select:Vec<usize>}` + `KVReadStageReg`/`KV_READ_STAGES`(linkme) + `find_read_stage` + `ensure_builtin_read_stages_registered` self-test. `ReadStageCtx` = 기존 `StageCtx` 재사용(ADR §11 — 신설 불요). 검증: 빌드 GREEN + registry 등록.
