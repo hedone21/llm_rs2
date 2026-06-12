@@ -388,6 +388,17 @@ static D2O_STAGE: KVCacheStageReg = KVCacheStageReg {
     },
 };
 
+/// R-KV(KV roadmap 항목 0 측정, P2a) — `RkvStage`(cosine redundancy + importance joint eviction).
+/// `StageParams` 에 R-KV 전용 필드(λ)가 없어 기본 `RkvConfig`(λ=0.1, α=8, τ=0.5)로 등록한다 — CLI
+/// λ override 는 측정 schedule 의 stage 직접 생성 경로(d2o 의 if-branch 와 동형). feature `rkv` OFF =
+/// 이 등록 미컴파일 → `find_stage("rkv")` None → production 정책 카탈로그 불변(arch §6 Spec Triage).
+#[cfg(feature = "rkv")]
+#[distributed_slice(KV_CACHE_STAGES)]
+static RKV_STAGE: KVCacheStageReg = KVCacheStageReg {
+    name: "rkv",
+    make: |_p: StageParams| Box::new(crate::kv::rkv_stage::RkvStage::new(Default::default())),
+};
+
 // ════════════════════════════════════════════════════════════════════════════
 // GATE-C — 런타임 `.so` dlopen 레지스트리 (ADR-0009 C2)
 // ════════════════════════════════════════════════════════════════════════════
@@ -891,6 +902,53 @@ mod tests {
             KeepSpec::PerHead(_) => panic!("v1 CAOTE 는 LayerWide"),
         }
         assert!(plan.merges.is_empty());
+        execute_kv_plan(&mut c, &plan).unwrap();
+        assert_eq!(c.current_pos(), 4, "executor 가 keep.len() 로 compact");
+    }
+
+    /// R-KV 측정 프로토타입(P2a, feature `rkv`) — 등록 가시성 + sliding 하네스(KVStageCtx→plan→
+    /// execute_kv_plan) 실행 + redundant fraction 덤프(last_stats). 설계서 §4.1 완료 게이트 (3)(4).
+    #[cfg(feature = "rkv")]
+    #[test]
+    fn rkv_stage_visible_executes_and_dumps_redundancy() {
+        use crate::kv::rkv_stage::RkvStage;
+
+        // (게이트 4) find_stage("rkv") 가시 + sliding/h2o 와 동일 registry 표면.
+        let reg = find_stage("rkv").expect("feature rkv ON 시 rkv 등록이 보여야 한다");
+        assert_eq!(reg.name, "rkv");
+
+        // (게이트 3) 동일 하네스 실행: KVStageCtx(Key 핸들 공급) → plan → execute_kv_plan.
+        // 직접 생성한 RkvStage 로 last_stats(1단 덤프)도 검증한다(registry make 는 last_stats 미노출).
+        let mut c = mk(DType::F32, 8); // kv_heads=1, head_dim=PHD, K distinct per pos
+        let imp = vec![1.0f32; 8];
+        let stage = RkvStage::new(Default::default());
+        let plan = {
+            let ctx = KVStageCtx::new(&c, 4, Some(&imp), None, None);
+            assert!(
+                ctx.tensor(TensorKind::Key).is_some(),
+                "KVStageCtx 는 Key 핸들 항상 공급(redundancy 입력)"
+            );
+            stage.plan(&ctx).expect("rkv plan Some (target<n)")
+        };
+        match &plan.keep {
+            KeepSpec::LayerWide(k) => {
+                assert_eq!(k.len(), 4, "target_len=4 만큼 보존");
+                assert!(k.windows(2).all(|w| w[0] < w[1]), "ascending keep");
+                assert!(k.iter().all(|&p| p < 8), "유효 위치");
+            }
+            KeepSpec::PerHead(_) => panic!("R-KV 프로토타입은 LayerWide"),
+        }
+
+        // (게이트 4) 1단 측정 hook: per-kv_head redundancy stats 덤프(MPC, redundant fraction).
+        let stats = stage.last_stats();
+        assert_eq!(stats.len(), 1, "kv_heads=1 → stats 1개");
+        assert!(
+            (0.0..=1.0).contains(&stats[0].redundant_fraction),
+            "redundant_fraction 은 [0,1]: {}",
+            stats[0].redundant_fraction
+        );
+        assert!(stats[0].mpc.is_finite(), "MPC 유한: {}", stats[0].mpc);
+
         execute_kv_plan(&mut c, &plan).unwrap();
         assert_eq!(c.current_pos(), 4, "executor 가 keep.len() 로 compact");
     }

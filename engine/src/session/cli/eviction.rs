@@ -67,6 +67,14 @@ pub enum EvictionCmd {
     /// 튜닝 파라미터 없음 — V 는 ctx.tensor(Value)로, 가중치 a_i 는 importance 로 자동.
     #[cfg(feature = "caote")]
     Caote,
+
+    /// R-KV — cosine redundancy + importance joint eviction (arXiv 2505.24133).
+    ///
+    /// KV roadmap 항목 0 측정 프로토타입(arch/kv_roadmap_item0_measurement.md §4.1).
+    /// feature `rkv` 측정 게이트 install 시에만 노출된다(미설치 = subcommand 부재 = production
+    /// 표면 불변). λ(redundancy/importance fusion)만 측정 조정 가능(기본 0.1).
+    #[cfg(feature = "rkv")]
+    Rkv(RkvArgs),
 }
 
 impl EvictionCmd {
@@ -84,8 +92,19 @@ impl EvictionCmd {
             EvictionCmd::D2o(_) => "d2o",
             #[cfg(feature = "caote")]
             EvictionCmd::Caote => "caote",
+            #[cfg(feature = "rkv")]
+            EvictionCmd::Rkv(_) => "rkv",
         }
     }
+}
+
+/// R-KV 측정 프로토타입 파라미터(feature `rkv`). λ 만 노출 — α/τ 는 측정 상수(rkv_stage.rs).
+#[cfg(feature = "rkv")]
+#[derive(Args, Debug, Clone)]
+pub struct RkvArgs {
+    /// fusion 가중치 λ (Z = λ·I − (1−λ)·R). 0.1 = redundancy 지배(논문 기본).
+    #[arg(long, default_value_t = 0.1)]
+    pub lambda: f32,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -336,6 +355,31 @@ mod tests {
         assert!(
             r.is_err(),
             "feature OFF 시 caote subcommand 미존재 → clap reject"
+        );
+    }
+
+    /// feature `rkv` install 시 `eviction rkv [--lambda L]` 가 parse 되고 policy_name="rkv"
+    /// — find_stage("rkv") seam 으로 흘러 측정 stage 를 선택한다(KV roadmap 항목 0 §4.1).
+    #[cfg(feature = "rkv")]
+    #[test]
+    fn parses_rkv_subcommand() {
+        let w = parse(&["rkv", "--lambda", "0.2"]);
+        match w.ev {
+            Some(EvictionCmd::Rkv(ref a)) => assert!((a.lambda - 0.2).abs() < 1e-6),
+            _ => panic!("expected Rkv"),
+        }
+        assert_eq!(w.ev.as_ref().unwrap().policy_name(), "rkv");
+    }
+
+    /// feature OFF(측정 게이트 미설치)에서는 rkv subcommand 가 존재하지 않아 clap 이 거부한다 —
+    /// production 표면 불변(§6 Spec Triage, 빌드 타임 격리)의 직접 단언.
+    #[cfg(not(feature = "rkv"))]
+    #[test]
+    fn rejects_rkv_when_feature_absent() {
+        let r = Wrap::try_parse_from(["test", "rkv"]);
+        assert!(
+            r.is_err(),
+            "feature OFF 시 rkv subcommand 미존재 → clap reject (production 표면 불변)"
         );
     }
 

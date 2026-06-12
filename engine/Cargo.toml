@@ -95,6 +95,11 @@ profile = []
 # ADR-0004 §8: CAOTE value-aware eviction 플러그인 install. 활성 시 caote crate 가 링크되어
 # `--eviction-policy caote` 로 선택 가능(stage_registry force-link + session score_based 경유).
 caote = ["dep:caote"]
+# KV roadmap 항목 0 측정 스프린트(arch/kv_roadmap_item0_measurement.md §4.1): R-KV(cosine
+# redundancy + importance joint eviction, arXiv 2505.24133) 측정 프로토타입. 활성 시 engine 내부
+# rkv_stage 모듈 + `eviction rkv` subcommand 가 노출된다(CAOTE 선례 동형, 외부 dep 없음 — 순수 cfg
+# gate). default OFF = production 표면 불변(빌드 타임 격리). 측정 GO 시 production 승격 별도 Triage.
+rkv = []
 vulkan = ["ash"]                # Vulkan PoC (microbench bins only)
 qnn = ["bindgen", "dep:qnn_oppkg"]  # microbench bin 빌드 전용. production code 는 qnn feature 불필요 (libloading 은 non-optional 코어)
 cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)

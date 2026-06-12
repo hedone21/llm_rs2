@@ -24,6 +24,9 @@ pub mod d2o_handler;
 pub mod d2o_layer_alloc;
 pub mod eviction_handler;
 pub mod quantize_handler;
+// R-KV 측정 프로토타입(KV roadmap 항목 0, P2a). feature `rkv` OFF = 미컴파일(production 표면 불변).
+#[cfg(feature = "rkv")]
+pub mod rkv_stage;
 pub mod swap_handler;
 use crate::kv::kv_cache::KVCache;
 use anyhow::Result;
