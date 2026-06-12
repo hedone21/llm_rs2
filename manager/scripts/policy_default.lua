@@ -11,6 +11,13 @@
 -- POLICY_META.version을 변경할 때마다 changelog 주석도 갱신
 --
 -- Changelog:
+--   2.5.0 (2026-06-12): QCF_FLOOR 재산정 — QCF_kv 수식 정규화(ENG-ALG-051 개정) 정합
+--     - 엔진 QCF_kv 포화 결함(o_before 비정규화 → 0.985 고정) 수정 후 S25 실측 분포
+--       (66 샘플: h2o 0.031~0.168 / d2o 0.086~0.243 / sliding 0.261~0.389) 기반 재산정.
+--     - normal 0.30→0.10 / warning 0.60→0.25 / critical 0.90→0.50, emergency 불변.
+--     - V_Q=0.5 유지 (재산정 결론): 신규 스케일에서 penalty 대역 [0.015,0.195]이
+--       resource term과 동급 + 가족 내 변별 Δ(h2o↔sliding)≈0.13 > relief Δ≈0.03.
+--     - IPC 값 단위 = raw QCF [0,1] (ENG-ALG-050 step 4 B안, 2026-06-12 결정).
 --   2.4.0 (2026-04-24): SwapWeights branch on memory pressure (WSWAP-3-LUA)
 --     - Emergency: KV eviction 이후 추가로 swap_weights 발동 (ratio=0.50, dtype=q4_0)
 --     - Critical + secondary 사용 가능: swap_weights (ratio=0.25)
@@ -39,7 +46,7 @@
 --   1.0.1 (2026-04-15): pressure_level 임계값 정렬
 --   1.0.0 (2026-04-15): initial production policy
 
-POLICY_META = { name = "llm_default", version = "2.4.0" }
+POLICY_META = { name = "llm_default", version = "2.5.0" }
 
 -- ── DPP 상수 (docs/46 §4) ──────────────────────────────────────────────────
 local DPP = {
@@ -51,6 +58,9 @@ local DPP = {
     W_EMERG     = 4.0,
     UCB         = 1.0,   -- LinUCB exploration bonus weight
     V_Q         = 0.5,   -- QCF quality penalty weight (Lyapunov multi-penalty extension)
+                         -- 2026-06-12 재산정 결론: 0.5 유지 — raw QCF 정규화 스케일
+                         -- (0.03~0.39)에서 penalty 대역 [0.015,0.195] ≈ resource term 동급,
+                         -- 가족 내 변별 Δ(h2o↔sliding)≈0.13 > relief Δ≈0.03 (QCF_FLOOR 주석 참조)
 }
 
 -- Per-domain threshold (Rust Monitor defaults에 정렬, §4.2.4)
@@ -66,10 +76,19 @@ local THETA = {
 
 -- QCF quality floor: level별 최대 허용 qcf_cost (초과 시 safe set 제외)
 -- Emergency = math.huge → QCF floor 비활성 (lossy action 반드시 허용)
+--
+-- 2026-06-12 재산정 (v2.5.0): 단위 = raw QCF [0,1] (ENG-ALG-051 정규화 수식,
+-- ENG-ALG-050 B안 raw 직송). S25 실측 분포(dry-run keep_ratio=0.5, 장/단 프롬프트
+-- × f16/q4, 66 샘플) 기반:
+--   normal   = 0.10 : 준무손실만 (h2o 장컨텍스트 0.031~0.039 통과, 그 외 차단)
+--   warning  = 0.25 : 보상형 eviction 허용 (h2o 전부 + d2o 21/22), blind sliding 차단
+--   critical = 0.50 : 표준 eviction 전부 통과 (관측 최대 0.389 + 28% 여유) —
+--                     score 미활성 구성(sliding 단독 키)에서도 eviction 발행 보장,
+--                     가족 내 변별은 V_Q soft penalty 위임
 local QCF_FLOOR = {
-    normal    = 0.30,
-    warning   = 0.60,
-    critical  = 0.90,
+    normal    = 0.10,
+    warning   = 0.25,
+    critical  = 0.50,
     emergency = math.huge,
 }
 

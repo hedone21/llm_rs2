@@ -1,0 +1,64 @@
+[MockManager] Listening on TCP 127.0.0.1:9899...
+[MockManager] Engine connected from 127.0.0.1:33622
+[MockManager] Engine connected, waiting for Capability...
+[MockManager] Engine Capability: devices=["cpu", "opencl"], active=opencl, max_kv=1536, layers=28
+[MockManager] Heartbeat #1: device=opencl, kv_util=0.152, tokens=11, state=Idle, active_actions=[], kv_dtype=f16
+[MockManager] Received 1 heartbeats during 1s wait
+[MockManager] Playing scenario: qcf_distribution_probe_short (6 commands)
+  P4 floor recalibration: RequestQcf probes across decode span (short prompt ~28 tok, verify gate regime)
+  Waiting 1500ms...
+  (heartbeat: kv_util=0.215, actions=[])
+  [1/6] Sent: RequestQcf (seq_id=1)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.evict_sliding: 0.3893
+  kv.evict_h2o: 0.1428
+  kv.merge_d2o: 0.2125
+  Waiting 1000ms...
+  (heartbeat: kv_util=0.277, actions=[])
+  [2/6] Sent: RequestQcf (seq_id=2)
+[MockManager] (skipping heartbeat while waiting for Response: kv_util=0.328, tokens=56)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.evict_h2o: 0.1484
+  kv.evict_sliding: 0.3627
+  kv.merge_d2o: 0.2232
+  Waiting 1000ms...
+  [3/6] Sent: RequestQcf (seq_id=3)
+[MockManager] (skipping heartbeat while waiting for Response: kv_util=0.379, tokens=69)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.evict_h2o: 0.1302
+  kv.evict_sliding: 0.3230
+  kv.merge_d2o: 0.1670
+  Waiting 1000ms...
+  (heartbeat: kv_util=0.430, actions=[])
+  [4/6] Sent: RequestQcf (seq_id=4)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.merge_d2o: 0.1485
+  kv.evict_h2o: 0.1415
+  kv.evict_sliding: 0.3358
+  Waiting 1000ms...
+  (heartbeat: kv_util=0.477, actions=[])
+  [5/6] Sent: RequestQcf (seq_id=5)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.evict_sliding: 0.3457
+  kv.merge_d2o: 0.1916
+  kv.evict_h2o: 0.1677
+  Waiting 1000ms...
+  (heartbeat: kv_util=0.523, actions=[])
+  [6/6] Sent: RequestQcf (seq_id=6)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.evict_sliding: 0.2996
+  kv.evict_h2o: 0.1138
+  kv.merge_d2o: 0.1649
+[MockManager] Scenario complete.
+[MockManager] Observing post-directive heartbeats...
+[MockManager] Heartbeat #2: device=opencl, kv_util=0.570, active_actions=[], kv_dtype=f16
+Error: read length prefix
+
+Caused by:
+    failed to fill whole buffer

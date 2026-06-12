@@ -1,0 +1,64 @@
+[MockManager] Listening on TCP 127.0.0.1:9899...
+[MockManager] Engine connected from 127.0.0.1:38154
+[MockManager] Engine connected, waiting for Capability...
+[MockManager] Engine Capability: devices=["cpu", "opencl"], active=opencl, max_kv=1536, layers=28
+[MockManager] Received 0 heartbeats during 1s wait
+[MockManager] Playing scenario: qcf_distribution_probe_long (6 commands)
+  P4 floor recalibration: RequestQcf probes across decode span (long prompt, 918 tok prefill)
+  Waiting 6500ms...
+  (heartbeat: kv_util=0.598, actions=[])
+  (heartbeat: kv_util=0.604, actions=[])
+  (heartbeat: kv_util=0.609, actions=[])
+  [1/6] Sent: RequestQcf (seq_id=1)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.merge_d2o: 0.1810
+  kv.evict_sliding: 0.3265
+  kv.evict_h2o: 0.0309
+  Waiting 1200ms...
+  (heartbeat: kv_util=0.615, actions=[])
+  [2/6] Sent: RequestQcf (seq_id=2)
+[MockManager] (skipping heartbeat while waiting for Response: kv_util=0.620, tokens=35)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.merge_d2o: 0.1052
+  kv.evict_h2o: 0.0332
+  kv.evict_sliding: 0.3062
+  Waiting 1200ms...
+  (heartbeat: kv_util=0.626, actions=[])
+  [3/6] Sent: RequestQcf (seq_id=3)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.evict_sliding: 0.3178
+  kv.merge_d2o: 0.1362
+  kv.evict_h2o: 0.0347
+  Waiting 1200ms...
+  (heartbeat: kv_util=0.631, actions=[])
+  [4/6] Sent: RequestQcf (seq_id=4)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.merge_d2o: 0.1480
+  kv.evict_h2o: 0.0314
+  kv.evict_sliding: 0.2918
+  Waiting 1200ms...
+  (heartbeat: kv_util=0.637, actions=[])
+  (heartbeat: kv_util=0.643, actions=[])
+  [5/6] Sent: RequestQcf (seq_id=5)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.merge_d2o: 0.2195
+  kv.evict_sliding: 0.2986
+  kv.evict_h2o: 0.0330
+  Waiting 1200ms...
+  (heartbeat: kv_util=0.648, actions=[])
+  [6/6] Sent: RequestQcf (seq_id=6)
+  Response: [Ok]
+  QcfEstimate: 3 entries
+  kv.evict_sliding: 0.2818
+  kv.merge_d2o: 0.1041
+  kv.evict_h2o: 0.0385
+[MockManager] Scenario complete.
+[MockManager] Observing post-directive heartbeats...
+[MockManager] Heartbeat #1: device=opencl, kv_util=0.653, active_actions=[], kv_dtype=f16
+[MockManager] Heartbeat #2: device=opencl, kv_util=0.659, active_actions=[], kv_dtype=f16
+[MockManager] Done.
