@@ -268,18 +268,20 @@ fn run_head_concentration_decode(
 
         acc.end_step();
 
-        // last_step_head_attn: [n_kv_heads * max_seq_len] — 마지막 tracked layer.
-        // 단일 accumulated step이므로 현재 step의 분포를 반영한다.
+        // last_step_head_attn: [n_kv_heads * max_seq_len] 레이아웃.
+        // head h의 유효 attention = attn[h * max_seq_len .. h * max_seq_len + seq_len].
+        // ConcentrationAccumulator::accumulate의 seq_len 파라미터는 head-stride이므로
+        // max_seq_len을 전달한다 (start_pos+1이 아님).
         if let Some(attn) = acc.last_step_head_attn() {
-            let seq_len = start_pos + 1; // 현재 유효 위치
             // n_layers 전체를 커버하기 위해 각 layer를 같은 값으로 채운다.
             // (last_step_head_attn은 마지막 layer 값 — layer 해상도 없음)
             // 설계서 §2.3-B의 "마지막 tracked layer" 기준으로 단일 layer 누적.
-            // 모든 layer의 대표값으로 layer=0만 사용 (측정 데이터 수집 목적 충족).
             let layer_attns: Vec<Option<Vec<f32>>> = std::iter::once(Some(attn.to_vec()))
                 .chain((1..n_layers).map(|_| None))
                 .collect();
-            conc_acc.accumulate(&layer_attns, seq_len, HEAD_CONC_TOP_FRAC);
+            // stride = max_seq_len (last_step_head_attn 버퍼 레이아웃)
+            // 유효 길이 = start_pos + 1 (accumulate 내부에서 .min(attn.len())로 클램핑)
+            conc_acc.accumulate_strided(&layer_attns, max_seq_len, step + 1, HEAD_CONC_TOP_FRAC);
         }
 
         // greedy next token (logits readback)

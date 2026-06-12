@@ -43,13 +43,45 @@ impl ConcentrationAccumulator {
     /// 단일 decode step에서 모든 layer의 `last_step_head_attn` 슬라이스를 누적한다.
     ///
     /// `layer_attns`: layer별 `[n_kv_heads * seq_len]` 슬라이스 목록.
-    /// `seq_len`: 현재 유효 시퀀스 길이(softmax 범위).
+    /// `seq_len`: 현재 유효 시퀀스 길이(head stride와 동일, softmax 범위).
     pub fn accumulate(&mut self, layer_attns: &[Option<Vec<f32>>], seq_len: usize, top_frac: f32) {
         for (layer_idx, maybe_attn) in layer_attns.iter().enumerate() {
             let Some(attn) = maybe_attn else { continue };
             for h in 0..self.n_kv_heads {
                 let start = h * seq_len;
                 let end = (start + seq_len).min(attn.len());
+                if start >= attn.len() {
+                    continue;
+                }
+                let ch = compute_ch(&attn[start..end], top_frac);
+                let idx = layer_idx * self.n_kv_heads + h;
+                if idx < self.sum.len() {
+                    self.sum[idx] += ch as f64;
+                }
+            }
+        }
+        self.steps += 1;
+    }
+
+    /// `last_step_head_attn()` 버퍼(`[n_kv_heads * stride]` 레이아웃)를 위한 누적.
+    ///
+    /// `last_step_head_attn`의 레이아웃은 `[n_kv_heads * max_seq_len]`이므로
+    /// head stride = max_seq_len, 유효 토큰 수 = valid_len (별도 파라미터).
+    ///
+    /// `stride`: 버퍼에서 각 head의 간격 (= max_seq_len).
+    /// `valid_len`: 현재 decode step의 유효 시퀀스 길이.
+    pub fn accumulate_strided(
+        &mut self,
+        layer_attns: &[Option<Vec<f32>>],
+        stride: usize,
+        valid_len: usize,
+        top_frac: f32,
+    ) {
+        for (layer_idx, maybe_attn) in layer_attns.iter().enumerate() {
+            let Some(attn) = maybe_attn else { continue };
+            for h in 0..self.n_kv_heads {
+                let start = h * stride;
+                let end = (start + valid_len).min(attn.len());
                 if start >= attn.len() {
                     continue;
                 }
