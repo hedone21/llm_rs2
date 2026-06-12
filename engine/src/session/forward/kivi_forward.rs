@@ -200,6 +200,7 @@ impl Forward for KiviForward {
             importance_collector: None,
             cache_self_need_scores: need_scores,
             layer_boundary_hook: None,
+            read_stage: None,
         });
 
         fwd_result?;
@@ -246,6 +247,7 @@ impl Forward for KiviForward {
             importance_collector: None,
             cache_self_need_scores: need_scores,
             layer_boundary_hook: None,
+            read_stage: None,
         });
 
         fwd_result?;

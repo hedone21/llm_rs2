@@ -437,6 +437,7 @@ impl Forward for ModelForward {
                 // §5.9.2 Track B: prefill 은 swap 금지(intra_forward_swap.rs:383 seq_len>1 가드)라
                 // hook 주입 안 함 — 항상 None.
                 layer_boundary_hook: None,
+                read_stage: None,
             })?;
 
             chunk_start = chunk_end;
@@ -560,6 +561,7 @@ impl Forward for ModelForward {
             // §5.9.2 Track B: hook 설치 시 layer loop 에 주입(wait-gate + on_layer_boundary).
             // `hook` Arc clone 이 본 forward_into 호출 동안 hook 을 살아 있게 유지한다.
             layer_boundary_hook: hook.as_deref(),
+            read_stage: None,
         })?;
         drop(score_guard); // guard 명시 해제 (end_step 이미 완료)
         self.read_logits(&self.logits_decode)

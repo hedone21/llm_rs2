@@ -9,7 +9,7 @@
 //! 미구현: KIVI/opaque → 엔진 폴백 = full read(ADR-0011 D4).
 
 use anyhow::Result;
-use technique_api::ReadGranularity;
+use technique_api::{KVReadPlan, KVReadStage, ReadGranularity};
 
 use crate::backend::Backend;
 use crate::format::AttnDims;
@@ -42,4 +42,16 @@ pub trait SelectiveRead {
         granularity: ReadGranularity,
         scores: Option<&mut [f32]>,
     ) -> Result<()>;
+
+    /// layer `i` attention 직전에 read stage 의 `read_plan` 을 자기 캐시 위에서 호출(ADR-0011 Amendment
+    /// A1.1d/A1.3).
+    ///
+    /// **ctx 구성 캡슐화**: read stage 가 읽는 [`technique_api::StageCtx`](`tensor(Key)`/`tensor(QueryStats)`/
+    /// geometry)는 concrete 캐시(예: `StandardFormat` 의 `Mutex<KVCache>`) 위에서만 만들 수 있다. 이를
+    /// format 내부에 위임해 (1) 캐시 borrow/lock 이 format 안에 갇히고, (2) `attention_into_selected`(다시
+    /// lock)와 충돌하지 않으며(plan 산출 후 owned `KVReadPlan` 반환 → borrow 종료), (3) `SelectiveRead`
+    /// 미구현 format 은 `KVCacheFormat::as_selective_read()==None` 이라 엔진이 자동 full read 폴백한다(D4).
+    ///
+    /// `None` = full read(read stage 가 `None` 반환). 반환 plan 은 *근사 힌트*(정확성 계약 아님, D3).
+    fn read_plan(&self, rs: &dyn KVReadStage, layer_idx: usize) -> Option<KVReadPlan>;
 }

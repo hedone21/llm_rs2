@@ -332,6 +332,12 @@ pub struct TransformerModelForwardArgs<'a> {
     /// branch 1회만 추가 — INV-147 zero-overhead. `OffloadForwardArgs` 의 동명 슬롯(offload 전용)과
     /// 별개로 production decode 경로(`forward_into`)에 신설된 슬롯이다.
     pub layer_boundary_hook: Option<&'a dyn crate::layer_boundary_hook::LayerBoundaryHook>,
+    /// KV read stage — "무엇을 읽을지" plugin 표면(ADR-0011 D1 / Amendment A1). `Some` 이면 decode
+    /// 의 layer 루프가 attention 직전에 `read_plan(ctx)` 를 layer 당 1회 호출해, 활성 format 이
+    /// `SelectiveRead` 를 구현하면 선택적 읽기(`attention_into_selected`)로, 아니면 plan 을 무시하고
+    /// full read 폴백(D4). `None`(production 기본 / 빌트인 0개 시작)이면 layer 당 `Option::is_some`
+    /// branch 1회만 추가 — INV-147 zero-overhead, α-K frozen byte-identical 게이트 대상.
+    pub read_stage: Option<&'a dyn technique_api::KVReadStage>,
 }
 
 impl TransformerModel {
@@ -1400,6 +1406,44 @@ impl TransformerModel {
     /// `attention_into` 는 `backend.attention_gen` 위임 → NOT bit-identical, `forward_gen_fmt.rs` 헤더).
     /// **prefill 은 F16/Q4_0/F32 모두 동치** — decode 와 달리 `forward_prefill` 도 inline-NEON 아닌
     /// flash 경로라 `attention_into` prefill arm 과 누산 순서 일치(`standard_format::prefill_attention`).
+    ///
+    /// read-plan select 검증(ADR-0011 Amendment A1.3, 작업 §3): ascending + 범위 내. 위반 시 `None`
+    /// 반환(엔진이 full read 폴백) + stderr 1회 경고(silent garbage 금지). `Token` 단위는 select 가
+    /// pos(`< current_pos`), `Page` 단위는 page index(`page * page_size < current_pos` 인 page 만 유효)
+    /// 라 상한을 granularity 로 분기한다. 빈 select 는 그대로 통과(format 이 빈 캐시처럼 처리, D2).
+    fn validate_read_plan(
+        plan: &technique_api::KVReadPlan,
+        current_pos: usize,
+    ) -> Option<&[usize]> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+
+        let upper = match plan.granularity {
+            technique_api::ReadGranularity::Token => current_pos,
+            // page index 상한: 마지막 유효 토큰을 담는 page 까지. ceil(current_pos / page_size).
+            technique_api::ReadGranularity::Page { page_size } => {
+                if page_size == 0 {
+                    current_pos // page_size=0 은 무의미 — Token 상한으로 강등(아래 violation 검출에 맡김).
+                } else {
+                    current_pos.div_ceil(page_size as usize)
+                }
+            }
+        };
+        let ascending = plan.select.windows(2).all(|w| w[0] < w[1]);
+        let in_range = plan.select.iter().all(|&s| s < upper);
+        if ascending && in_range {
+            Some(&plan.select)
+        } else {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[read-plan] WARN: invalid select (ascending={ascending}, in_range={in_range}, \
+                     upper={upper}) — full read 폴백. 이후 동일 경고는 억제됨."
+                );
+            }
+            None
+        }
+    }
+
     pub fn forward_into(&self, args: TransformerModelForwardArgs) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
@@ -1419,6 +1463,9 @@ impl TransformerModel {
         // §5.9.2 Track B: IntraForward/LayerImmediate swap 의 layer-boundary hook.
         // production/eval 경로는 None → 아래 분기들이 layer 당 `is_some` branch 1회만(INV-147).
         let layer_boundary_hook = args.layer_boundary_hook;
+        // ADR-0011 Amendment A1.1(a): read stage 핸들을 per-step 1회 캡처 → layer loop 가 재사용.
+        // None(production 기본)이면 decode arm 이 layer 당 `is_some` branch 1회만(INV-147 동형).
+        let read_stage = args.read_stage;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -1573,6 +1620,20 @@ impl TransformerModel {
                         .is_some_and(|acc| acc.should_track_layer(i))
                 };
                 let need_scores = acc_need || cache_self_need_scores;
+                // ADR-0011 Amendment A1.3: read-plan seam. read_stage=Some 이고 활성 format 이
+                // SelectiveRead 면 attention 직전 layer 당 1회 read_plan 호출(ctx 구성·borrow 는
+                // format 내부 캡슐화 — owned KVReadPlan 반환). plan select 검증(ascending + 범위 내)
+                // 후 forward_gen_fmt 에 select 로 전달. read_stage=None(production)이면 `is_some` branch
+                // 1회 → read_select=None → full read 직행(INV-147 byte-identical).
+                let read_plan = read_stage.and_then(|rs| {
+                    fmts[i]
+                        .as_selective_read()
+                        .and_then(|sr| sr.read_plan(rs, i))
+                });
+                let read_select = read_plan.as_ref().and_then(|plan| {
+                    Self::validate_read_plan(plan, fmts[i].current_pos())
+                        .map(|sel| (sel, plan.granularity))
+                });
                 let ws = workspace
                     .as_deref_mut()
                     .expect("forward_into decode requires a LayerWorkspace (seq_len=1)");
@@ -1593,6 +1654,7 @@ impl TransformerModel {
                     is_local_attn: is_local,
                     local_attn_window: self.config.sliding_window,
                     layer_idx: i,
+                    read_select,
                 })?;
             } else {
                 let pws = owned_prefill_ws
@@ -2701,6 +2763,9 @@ impl TransformerModel {
                 let ws = workspace
                     .as_deref_mut()
                     .expect("decode arm: workspace.is_some() 직전 확인됨");
+                // ADR-0011 Amendment A1.3: read-plan seam 자리(offload). 현재 `OffloadFormat` 은
+                // SelectiveRead 미구현 → full read. read stage 핸들 캡처 + plan.select 의 prefetch 큐
+                // 공급은 S6(prefetch 연결)에서 배선한다 — 이번엔 라우팅 슬롯(`read_select: None`)만 둔다.
                 layer_arc.forward_gen_fmt(crate::layers::transformer_layer::ForwardGenFmtArgs {
                     x: &mut x,
                     fmt: &dyn_fmts[i],
@@ -2718,6 +2783,7 @@ impl TransformerModel {
                     is_local_attn: is_local_i,
                     local_attn_window: self.config.sliding_window,
                     layer_idx: i,
+                    read_select: None,
                 })?;
             } else {
                 // prefill(seq_len>1) 또는 **발산 A**(seq_len==1 + workspace=None). 후자는 BOS-only
@@ -3717,6 +3783,97 @@ mod tests {
         assert!(
             msg.contains("AUF") && msg.contains("--secondary-gguf"),
             "error must mention AUF primary + --secondary-gguf conflict, got: {msg}"
+        );
+    }
+
+    // ── S2: validate_read_plan + 미지원 format capability 폴백 (ADR-0011 Amendment A1.3) ──
+
+    use technique_api::{KVReadPlan, ReadGranularity};
+
+    /// validate_read_plan: ascending + 범위 내 → Some(전체 통과).
+    #[test]
+    fn validate_read_plan_accepts_valid() {
+        let plan = KVReadPlan {
+            granularity: ReadGranularity::Token,
+            select: vec![0, 2, 5],
+        };
+        let sel = TransformerModel::validate_read_plan(&plan, 6);
+        assert_eq!(sel, Some(&[0usize, 2, 5][..]));
+    }
+
+    /// validate_read_plan: 비-ascending → None(full read 폴백).
+    #[test]
+    fn validate_read_plan_rejects_non_ascending() {
+        let plan = KVReadPlan {
+            granularity: ReadGranularity::Token,
+            select: vec![0, 5, 2],
+        };
+        assert!(TransformerModel::validate_read_plan(&plan, 6).is_none());
+    }
+
+    /// validate_read_plan: 범위 초과(pos >= current_pos) → None.
+    #[test]
+    fn validate_read_plan_rejects_out_of_range() {
+        let plan = KVReadPlan {
+            granularity: ReadGranularity::Token,
+            select: vec![0, 2, 9],
+        };
+        assert!(TransformerModel::validate_read_plan(&plan, 6).is_none());
+    }
+
+    /// validate_read_plan: 중복(non-strict-ascending) → None.
+    #[test]
+    fn validate_read_plan_rejects_duplicates() {
+        let plan = KVReadPlan {
+            granularity: ReadGranularity::Token,
+            select: vec![1, 1, 2],
+        };
+        assert!(TransformerModel::validate_read_plan(&plan, 6).is_none());
+    }
+
+    /// validate_read_plan: Page 단위 상한 = ceil(current_pos/page_size). current_pos=6,page_size=2 → 상한 3.
+    #[test]
+    fn validate_read_plan_page_granularity_upper_bound() {
+        let granularity = ReadGranularity::Page { page_size: 2 };
+        // page 0,1,2 = 유효 (상한 3), page 3 = 범위 초과.
+        let ok = KVReadPlan {
+            granularity,
+            select: vec![0, 1, 2],
+        };
+        assert!(TransformerModel::validate_read_plan(&ok, 6).is_some());
+        let bad = KVReadPlan {
+            granularity,
+            select: vec![0, 3],
+        };
+        assert!(TransformerModel::validate_read_plan(&bad, 6).is_none());
+    }
+
+    /// validate_read_plan: 빈 select 는 통과(format 이 빈 캐시처럼 처리, D2).
+    #[test]
+    fn validate_read_plan_empty_passes() {
+        let plan = KVReadPlan {
+            granularity: ReadGranularity::Token,
+            select: vec![],
+        };
+        assert_eq!(
+            TransformerModel::validate_read_plan(&plan, 6),
+            Some(&[][..])
+        );
+    }
+
+    /// 미지원 format(KIVIFormat) 은 `as_selective_read()==None` → 엔진 full read 폴백 경로.
+    /// seam 라우팅 match arm 의 guard(`as_selective_read().is_some()`)가 false → full read 직행.
+    #[test]
+    fn unsupported_format_falls_back_to_full_read() {
+        use crate::kv::kivi_cache::KiviCache;
+        use crate::kv::kivi_format::KIVIFormat;
+        // KIVIFormat 은 as_selective_read override 없음 → base trait default None.
+        // (head_dim/residual_size 는 QKKV=32 의 배수 제약)
+        let kivi = KIVIFormat::new(0, KiviCache::new(1, 32, 64, 32));
+        let cap = (&kivi as &dyn crate::format::KVCacheFormat).as_selective_read();
+        assert!(
+            cap.is_none(),
+            "KIVIFormat 은 SelectiveRead 미구현 → as_selective_read()==None → full read 폴백"
         );
     }
 }

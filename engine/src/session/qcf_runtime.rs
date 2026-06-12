@@ -232,6 +232,7 @@ pub fn run_qcf_warmup_workflow(
                 importance_collector: Some(&mut collector),
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
+                read_stage: None,
             })
         })?;
         backend.synchronize()?;
@@ -322,6 +323,7 @@ pub fn run_qcf_warmup_workflow(
                         importance_collector: Some(&mut collector_decode),
                         cache_self_need_scores: false,
                         layer_boundary_hook: None,
+                        read_stage: None,
                     })
                 })?;
                 backend.synchronize()?;

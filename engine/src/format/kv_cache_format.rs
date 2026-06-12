@@ -99,6 +99,18 @@ pub trait KVCacheFormat: Send + Sync {
         dims: AttnDims,
         scores: Option<&mut [f32]>,
     ) -> Result<()>;
+
+    // ── capability-handle (default) ──
+
+    /// 선택적 읽기 capability 핸들 (ADR-0011 D4 / Amendment A1, INV-STAGE-LAYER-HANDLE capability-handle).
+    ///
+    /// `Some` 이면 이 format 은 read-plan 기반 선택적 읽기([`crate::format::SelectiveRead`])를 제공한다.
+    /// **default = `None`**(미지원) — base trait 6-method 의미 불변, default 제공이라 기존 impl 무영향이고
+    /// downcast/`as_any` 금지 제약과 양립한다. `StandardFormat` 만 override. read stage 가 plan 을 내도
+    /// 이 핸들이 `None` 인 format 은 엔진이 plan 을 무시하고 `attention_into`(full read) 로 폴백한다(D4).
+    fn as_selective_read(&self) -> Option<&dyn crate::format::SelectiveRead> {
+        None
+    }
     // as_any() 없음 — downcast 의도적 차단.
     // dtype() / KVCacheView 없음 — Stage 가 어느 Format 인지 모름.
     // needs_attn_scores() 없음 — KIVI AWQE 자기-need 는 impl 내부 흡수 (§4.1 R4 ②③).

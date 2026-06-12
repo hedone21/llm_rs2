@@ -22,7 +22,7 @@ use crate::kv::kv_cache::KVCache;
 use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
-use technique_api::WeightedMerge;
+use technique_api::{KVReadPlan, KVReadStage, WeightedMerge};
 
 /// 내부 가변 상태 — `KVCache` 와 비-F32 cast scratch 를 **단일 lock** 으로 묶는다.
 ///
@@ -519,6 +519,11 @@ impl KVCacheFormat for StandardFormat {
             effective_cache_len,
             scores,
         )
+    }
+
+    /// `StandardFormat` 은 선택적 읽기를 제공한다(ADR-0011 D4) — capability-handle 노출.
+    fn as_selective_read(&self) -> Option<&dyn crate::format::SelectiveRead> {
+        Some(self)
     }
 }
 
@@ -1537,6 +1542,19 @@ impl SelectiveRead for StandardFormat {
             n_sel,
             scores,
         )
+    }
+
+    /// read stage 를 자기 `Mutex<KVCache>` 위에서 호출(ADR-0011 Amendment A1.1d). ctx 구성·borrow 가
+    /// 이 메서드에 갇혀 `attention_into_selected`(다시 lock) 와 충돌하지 않는다 — owned `KVReadPlan`
+    /// 을 반환해 lock guard 가 함수 종료 시 drop 된다.
+    fn read_plan(&self, rs: &dyn KVReadStage, _layer_idx: usize) -> Option<KVReadPlan> {
+        use crate::kv::eviction::stage_registry::KVStageCtx;
+        let guard = self.inner.lock().unwrap();
+        // read stage 는 budget(target_len) 을 읽지 않는다(읽기 범위 결정 ≠ keep budget). importance/
+        // scores/query_stats 미공급(None) — read stage 는 `tensor(Key)`/`tensor(Value)` 로 자기 page
+        // 메타를 incremental 갱신한다(D5). QueryStats 는 score-active e2e seam 한정(production None).
+        let ctx = KVStageCtx::new(&guard.cache, 0, None, None, None, None);
+        rs.read_plan(&ctx)
     }
 }
 
@@ -2741,6 +2759,174 @@ mod tests {
 
         for &x in out.as_slice::<f32>() {
             assert!(x.is_finite(), "Page 단위 출력에 inf/nan: {x}");
+        }
+    }
+
+    // ── S2: read_plan seam (read stage 위임 + capability) ──
+
+    use technique_api::{KVReadPlan, KVReadStage, ReadGranularity, StageCtx};
+
+    /// mock read stage — 생성 시 지정한 select 를 항상 반환. ctx 의 current_pos 로 "전체" plan 도 가능.
+    struct MockReadStage {
+        granularity: ReadGranularity,
+        /// None = ctx.current_pos() 로 전체 select 생성, Some = 그대로.
+        fixed_select: Option<Vec<usize>>,
+        plan_none: bool,
+    }
+    impl KVReadStage for MockReadStage {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn read_plan(&self, ctx: &dyn StageCtx) -> Option<KVReadPlan> {
+            if self.plan_none {
+                return None;
+            }
+            let select = match &self.fixed_select {
+                Some(s) => s.clone(),
+                None => (0..ctx.current_pos()).collect(),
+            };
+            Some(KVReadPlan {
+                granularity: self.granularity,
+                select,
+            })
+        }
+    }
+
+    /// `as_selective_read()` capability: StandardFormat 은 Some(자기 자신).
+    #[test]
+    fn standard_format_exposes_selective_read_capability() {
+        let fmt = StandardFormat::new(0, make_head_major_cache(8, 1, 4));
+        let cap = (&fmt as &dyn KVCacheFormat).as_selective_read();
+        assert!(
+            cap.is_some(),
+            "StandardFormat 은 SelectiveRead capability 노출"
+        );
+    }
+
+    /// read_plan 위임: mock 이 전체 select 반환 → 그 plan 으로 attention_into_selected 한 결과가
+    /// read stage 부재(attention_into full read) 와 bit-identical (S3 게이트의 read_plan 경유 연장).
+    #[test]
+    fn read_plan_full_select_routes_bit_identical() {
+        let kv_heads = 1;
+        let head_dim = 4;
+        let n_heads_q = 1;
+        let n_tokens = 5;
+
+        // 기준 (read stage 부재 = attention_into full read)
+        let fmt_ref = StandardFormat::new(0, {
+            let mut c = make_head_major_cache(n_tokens + 4, kv_heads, head_dim);
+            write_tokens_headmajor(&mut c, n_tokens);
+            c
+        });
+        // seam (read stage 활성 = read_plan → attention_into_selected)
+        let fmt_seam = StandardFormat::new(0, {
+            let mut c = make_head_major_cache(n_tokens + 4, kv_heads, head_dim);
+            write_tokens_headmajor(&mut c, n_tokens);
+            c
+        });
+
+        let q = f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![1.0f32; head_dim]);
+        let backend = CpuBackend::new();
+        let dims = AttnDims {
+            n_heads_q,
+            window: None,
+        };
+
+        let mut out_ref = f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; head_dim]);
+        fmt_ref
+            .attention_into(&q, &backend, &mut out_ref, dims, None)
+            .unwrap();
+
+        // mock: 전체 select(None → ctx.current_pos() 로 0..n_tokens)
+        let rs = MockReadStage {
+            granularity: ReadGranularity::Token,
+            fixed_select: None,
+            plan_none: false,
+        };
+        let plan = fmt_seam
+            .read_plan(&rs, 0)
+            .expect("mock 전체 select plan 반환");
+        assert_eq!(plan.select, (0..n_tokens).collect::<Vec<_>>());
+
+        let mut out_seam = f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; head_dim]);
+        fmt_seam
+            .attention_into_selected(
+                &q,
+                &backend,
+                &mut out_seam,
+                dims,
+                &plan.select,
+                plan.granularity,
+                None,
+            )
+            .unwrap();
+
+        for (i, (&a, &b)) in out_ref
+            .as_slice::<f32>()
+            .iter()
+            .zip(out_seam.as_slice::<f32>().iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "full[{i}]={a} != read_plan_routed[{i}]={b}"
+            );
+        }
+    }
+
+    /// read_plan 위임: mock 이 None 반환 → full read 폴백(plan 없음).
+    #[test]
+    fn read_plan_none_falls_back() {
+        let fmt = StandardFormat::new(0, {
+            let mut c = make_head_major_cache(8, 1, 4);
+            write_tokens_headmajor(&mut c, 4);
+            c
+        });
+        let rs = MockReadStage {
+            granularity: ReadGranularity::Token,
+            fixed_select: None,
+            plan_none: true,
+        };
+        assert!(
+            fmt.read_plan(&rs, 0).is_none(),
+            "mock plan_none=true → read_plan None → 엔진 full read 폴백"
+        );
+    }
+
+    /// read_plan 위임: 부분 select mock → plan 반환 후 attention_into_selected 완료 + 유한.
+    #[test]
+    fn read_plan_partial_select_completes_finite() {
+        let fmt = StandardFormat::new(0, {
+            let mut c = make_head_major_cache(10, 1, 4);
+            write_tokens_headmajor(&mut c, 6);
+            c
+        });
+        let q = f32_tensor(vec![1, 1, 1, 4], &vec![0.5f32; 4]);
+        let backend = CpuBackend::new();
+        let dims = AttnDims {
+            n_heads_q: 1,
+            window: None,
+        };
+        let rs = MockReadStage {
+            granularity: ReadGranularity::Token,
+            fixed_select: Some(vec![0, 2, 4]),
+            plan_none: false,
+        };
+        let plan = fmt.read_plan(&rs, 0).expect("부분 select plan");
+        assert_eq!(plan.select, vec![0, 2, 4]);
+        let mut out = f32_tensor(vec![1, 1, 1, 4], &vec![0.0; 4]);
+        fmt.attention_into_selected(
+            &q,
+            &backend,
+            &mut out,
+            dims,
+            &plan.select,
+            plan.granularity,
+            None,
+        )
+        .unwrap();
+        for &x in out.as_slice::<f32>() {
+            assert!(x.is_finite(), "부분 select 출력 유한: {x}");
         }
     }
 }

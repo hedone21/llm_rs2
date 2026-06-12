@@ -354,6 +354,7 @@ fn impl_run_direct(
         logits_last_only: true,
         cache_self_need_scores: false,
         layer_boundary_hook: None,
+        read_stage: None,
     })?;
     let prefill_logits_host = read_logits(backend, &prefill_logits, vocab)?;
     let first_token = greedy_argmax(&prefill_logits_host);
@@ -381,6 +382,7 @@ fn impl_run_direct(
             logits_last_only: false,
             cache_self_need_scores: false,
             layer_boundary_hook: None,
+            read_stage: None,
         })?;
         let logits = read_logits(backend, &decode_logits, vocab)?;
         let next = greedy_argmax(&logits);

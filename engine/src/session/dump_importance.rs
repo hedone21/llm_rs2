@@ -103,6 +103,7 @@ pub fn run_dump_importance(mut ctx: DumpImportanceCtx) -> anyhow::Result<()> {
             importance_collector: Some(&mut collector),
             cache_self_need_scores: false,
             layer_boundary_hook: None,
+            read_stage: None,
         })
     })?;
 
@@ -274,6 +275,7 @@ fn run_head_concentration_decode(
                 importance_collector: None,
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
+                read_stage: None,
             })
         })?;
 

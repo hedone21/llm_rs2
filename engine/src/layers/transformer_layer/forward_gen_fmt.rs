@@ -50,6 +50,10 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
     /// Gemma3: local attention window.
     pub local_attn_window: Option<usize>,
     pub layer_idx: usize,
+    /// KV read-plan 라우팅(ADR-0011 Amendment A1.3). `Some((select, granularity))` 면 활성 format 의
+    /// `SelectiveRead::attention_into_selected` 로 선택적 읽기, `None`(production 기본)이면 기존
+    /// `attention_into`(full read). 분기 1회 외 happy path 비용 0(INV-147 동형).
+    pub read_select: Option<(&'a [usize], technique_api::ReadGranularity)>,
 }
 
 impl TransformerLayer {
@@ -163,17 +167,39 @@ impl TransformerLayer {
             gpu_acc.set_current_layer_idx(layer_idx);
         }
 
-        fmt.attention_into(
-            &q_rope,
-            backend.as_ref(),
-            &mut ws.out_attn,
-            AttnDims { n_heads_q, window },
-            if need_scores {
-                Some(&mut ws.scores)
-            } else {
-                None
-            },
-        )?;
+        let scores_arg = if need_scores {
+            Some(&mut ws.scores[..])
+        } else {
+            None
+        };
+        // ADR-0011 Amendment A1.3: read-plan 라우팅. read_select=Some 이고 활성 format 이 SelectiveRead
+        // capability 를 노출하면 선택적 읽기, 아니면(미지원 format) plan 무시 + full read 폴백(D4). happy
+        // path(read_select=None)는 `Option::is_some` branch 1회 — full read 직행(INV-147 byte-identical).
+        match args.read_select {
+            Some((select, granularity)) if fmt.as_selective_read().is_some() => {
+                let sr = fmt
+                    .as_selective_read()
+                    .expect("as_selective_read().is_some() 직전 확인됨");
+                sr.attention_into_selected(
+                    &q_rope,
+                    backend.as_ref(),
+                    &mut ws.out_attn,
+                    AttnDims { n_heads_q, window },
+                    select,
+                    granularity,
+                    scores_arg,
+                )?;
+            }
+            _ => {
+                fmt.attention_into(
+                    &q_rope,
+                    backend.as_ref(),
+                    &mut ws.out_attn,
+                    AttnDims { n_heads_q, window },
+                    scores_arg,
+                )?;
+            }
+        }
         // set_attn_scores(forward_gen.rs:1071) 는 StandardKVCache no-op(KIVI AWQE 전용) → 생략.
 
         // 6. Output projection.
