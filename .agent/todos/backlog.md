@@ -37,13 +37,15 @@
 
 ## [P2-chore] host lib 테스트 위생 — γ-3 결정적 테스트 버그 2건 + POCL-first 호스트 OpenCL 테스트 환경 실패
 
-- **Status**: **(a) RESOLVED (2026-06-12)** / (b)(c) TODO (발견 2026-06-11, AB-4 device 게이트의 Linux host 이름 단위 대조에서 — pre-AB-4 `ecd07549` worktree 대조로 전원 사전존재 입증, AB-4 회귀 0건)
+- **Status**: **RESOLVED 전체 (2026-06-12)** — (a)+(b)+(c) 완료. AC 충족: 필터 없는 `cargo test -p llm_rs2 --lib` **1410/1410 PASS, 0 FAIL** (skip 가드 발화 = unified UMA 왕복 1건) + `check_spec_coverage.sh` 정상 완주([6]까지 전 구간 실행, exit 1 = 정당한 커버리지 갭 45건 보고). (발견 2026-06-11, AB-4 device 게이트의 Linux host 이름 단위 대조에서 — pre-AB-4 `ecd07549` worktree 대조로 전원 사전존재 입증, AB-4 회귀 0건)
 - **Description**:
   - **(a) γ-3 결정적 테스트 버그 2건** — **✅ 수정 (2026-06-12)**: 둘 다 테스트 fixture 버그(production 무관). roundtrip 은 fixture JSON 을 snake_case(`throttle`/`suspend`)로, protected_prefix 는 clap 입력 `h2o-plus`(kebab) ↔ canonical `h2o_plus`(`policy_name()`) 분리로 수정 → 비-OpenCL lib **결정적 실패 0** (잔여 간헐 FAIL = `kv_cache` RSS flaky 2건, 병렬 교란 — 격리 `--test-threads 1` PASS, 별개 기지 사항). (γ-3a `33d5bc8f` / γ-3b `11c8721f` 도입분):
     - `session::experiment::schedule_source::tests::experiment_schedule_parse_roundtrip` — fixture 가 PascalCase `Throttle`, serde 는 snake_case(`throttle`) 기대.
     - `session::eval_setup::tests::protected_prefix_score_based_defaults_to_4` — clap subcommand 는 `h2o-plus`(kebab), 테스트는 `h2o_plus` 전달.
-  - **(b) POCL-first 호스트 OpenCL 테스트 환경 실패 ~25종**: `create_test_queue`/backend 가 첫 플랫폼(POCL CPU)을 잡아 — `memory::opencl::unified` 4종 map null-deref → **SIGABRT 로 전체 스위트 중단**, `backend::opencl::{noshuffle,kv_scatter_batch,gpu_buffer_shift}` ~21종 CL_DEVICE_NOT_FOUND panic (run 간 부분 flaky). GPU-platform 선택 또는 skip 가드 필요. (호스트에 pocl 7.1 설치됨 2026-03-03 — 설치 후 첫 전체 lib 실행이 이번.)
-  - **(c) `scripts/check_spec_coverage.sh` line 90 octal 버그** (AB-6 host 게이트에서 발견 2026-06-11, 사전존재): `printf: 008 invalid octal` 로 즉시 중단 — 3계층 추적성 검증 불능. ID 앞자리 0 패딩의 8/9 가 octal 파싱되는 전형 버그(`10#` 강제 필요).
+  - **(b) POCL-first 호스트 OpenCL 테스트 환경 실패 ~25종** — **✅ 수정 (2026-06-12)**, 2026-06-12 재진단으로 실체가 2갈래로 분해됨:
+    - **플랫폼 선택**: `OpenCLBackend::new_with_profile_events`(production)와 `create_test_queue`(unified 테스트 헬퍼)가 첫 플랫폼(POCL CPU)을 잡던 것을 **요청 device type(기본 GPU)을 가진 플랫폼 우선 스캔**으로 수정 (스캔 Err="해당 없음" 처리로 POCL clGetDeviceIDs 병렬 간헐 Err에도 견딤). 이 호스트(POCL+NVIDIA)에선 NVIDIA RTX 3090 Ti 가 선택돼 backend::opencl 35종이 **실 GPU에서 전부 PASS**. 단일 플랫폼 디바이스(Adreno/Jetson)는 기존 선택과 동일(무영향).
+    - **unified stale 테스트 4종**: SIGABRT 의 진범은 환경이 아니라 **구 "starts mapped" 시맨틱을 가정한 stale 테스트** — `new()`는 의도적으로 unmapped 시작(doc 명시)인데 테스트가 `as_mut_ptr()`(null) 직접 쓰기 → non-unwinding panic → SIGABRT 스위트 전멸(플랫폼 무관). 4종 전부 현 시맨틱으로 재작성 + `test_map_write_unmap_cycle` 왕복 검증은 **UMA(host_unified_memory) skip 가드** 추가 — discrete GPU 는 mapping 이 staging 사본 + 현 `unmap()`이 실제 clEnqueueUnmapMemObject 미수행이라 write 커밋 보장 없음(UnifiedBuffer 설계 타겟=ARM UMA, production 무영향이라 unmap 시맨틱 자체는 미수정).
+  - **(c) `scripts/check_spec_coverage.sh` line 90 octal 버그** — **✅ 수정 (2026-06-12)**: L78(LAYER)/L90(RPCMEM) 두 곳 `printf '%03d' "$((10#$n))"` 으로 base-10 강제. `set -e` 하에서 008 파싱 실패 → 즉사하던 것이 [6]까지 전 구간 완주로 복구(45건 INV 커버리지 갭 보고는 정당한 잔여 — 별개 사안).
 - **Acceptance Criteria**: Linux host(POCL+NVIDIA)에서 `cargo test -p llm_rs2 --lib` 0 FAIL (skip 가드 발화 허용) + `check_spec_coverage.sh` 정상 완주.
 
 ## [P2] LLama 3.2 1B 동일 shape 매트릭스 재측정 (Qwen Full Microbench Matrix sprint 완료 후)

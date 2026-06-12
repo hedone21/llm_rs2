@@ -14,10 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// # Usage Pattern
 /// ```ignore
-/// // 1. Create buffer (starts mapped for CPU initialization)
+/// // 1. Create buffer (starts **unmapped**, GPU-accessible)
 /// let buffer = UnifiedBuffer::new(...)?;
 ///
-/// // 2. Write data via as_mut_ptr() while mapped
+/// // 2. Map for CPU access, then write via as_mut_ptr()
+/// buffer.map_for_cpu()?;
 /// let ptr = buffer.as_mut_ptr();
 /// // ... CPU operations ...
 ///
@@ -237,12 +238,23 @@ mod tests {
             Err(_) => return Err(anyhow!("No OpenCL platform available or panic occurred")),
         };
 
+        // GPU 디바이스를 가진 플랫폼 우선 — `Platform::default()`/첫 플랫폼은 POCL(CPU)-first
+        // 호스트에서 GPU 플랫폼을 가리지 못한다. 스캔 Err 는 "해당 없음"으로 간주.
         let platform = platform_list
-            .into_iter()
-            .next()
+            .iter()
+            .copied()
+            .find(|p| {
+                Device::list(*p, Some(ocl::flags::DEVICE_TYPE_GPU))
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(false)
+            })
+            .or_else(|| platform_list.into_iter().next())
             .ok_or_else(|| anyhow!("No OpenCL platform available"))?;
 
-        let device = Device::first(platform)?;
+        let device = match Device::list(platform, Some(ocl::flags::DEVICE_TYPE_GPU)) {
+            Ok(list) if !list.is_empty() => list[0],
+            _ => Device::first(platform)?,
+        };
         let context = Context::builder()
             .platform(platform)
             .devices(device)
@@ -263,7 +275,7 @@ mod tests {
 
         let buffer = UnifiedBuffer::new(queue, 1024, DType::F32).unwrap();
         assert_eq!(buffer.size(), 1024);
-        assert!(buffer.is_mapped()); // Starts mapped
+        assert!(!buffer.is_mapped()); // Starts unmapped (GPU-accessible)
     }
 
     #[test]
@@ -277,10 +289,14 @@ mod tests {
         };
 
         let buffer = UnifiedBuffer::new(queue, 1024, DType::F32).unwrap();
-        let ptr = buffer.as_mut_ptr();
 
+        // Starts unmapped — as_mut_ptr() is null until map().
+        assert!(buffer.as_mut_ptr().is_null());
+
+        let ptr = buffer.map().unwrap();
         assert!(!ptr.is_null());
         assert!(buffer.is_mapped());
+        assert_eq!(buffer.as_mut_ptr(), ptr);
 
         buffer.unmap().unwrap();
         assert!(!buffer.is_mapped());
@@ -298,7 +314,11 @@ mod tests {
 
         let buffer = UnifiedBuffer::new(queue, 1024, DType::F32).unwrap();
 
-        // Initially mapped
+        // Starts unmapped (GPU-accessible)
+        assert!(!buffer.is_mapped());
+
+        // Map
+        buffer.map().unwrap();
         assert!(buffer.is_mapped());
 
         // Unmap
@@ -320,10 +340,26 @@ mod tests {
             }
         };
 
+        // write→unmap→remap 데이터 왕복은 UMA(host unified memory) 전제 — UnifiedBuffer 의
+        // 설계 타겟(ARM SoC zero-copy). discrete GPU 는 mapping 이 staging 사본인 데다
+        // 현 unmap() 이 실제 clEnqueueUnmapMemObject 를 하지 않아 write 커밋이 보장되지 않는다.
+        let unified = matches!(
+            queue
+                .device()
+                .info(ocl::core::DeviceInfo::HostUnifiedMemory),
+            Ok(ocl::core::DeviceInfoResult::HostUnifiedMemory(true))
+        );
+        if !unified {
+            eprintln!("[SKIPPED] non-UMA device (host_unified_memory=false)");
+            return;
+        }
+
         let buffer = UnifiedBuffer::new(queue, 256, DType::F32).unwrap();
 
-        // Write while mapped
+        // Map for CPU access, then write (starts unmapped — as_mut_ptr() would be null)
+        buffer.map().unwrap();
         let ptr = buffer.as_mut_ptr();
+        assert!(!ptr.is_null());
         unsafe {
             let f32_ptr = ptr as *mut f32;
             for i in 0..64 {

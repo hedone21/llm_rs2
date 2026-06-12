@@ -35,11 +35,12 @@ cargo fmt --all --check              # clean
 cargo clippy --workspace -- -D warnings   # clean
 ```
 
-**baseline (2026-06-12 갱신 — 결정적 실패 2건 수정 후)**:
-- `cargo test -p llm_rs2 --lib`: 비-OpenCL **결정적 실패 0** (구 baseline 실패 2건 `experiment_schedule_parse_roundtrip`/`protected_prefix_score_based_defaults_to_4`는 2026-06-12 fixture 수정으로 해소). 카운트 제외 2종: ① OpenCL 환경 실패(`backend::opencl::*` ~21 + `memory::opencl::unified` SIGABRT — 호스트 POCL 한계, backlog P2-chore (b); 실행 시 `-- --skip backend::opencl --skip memory::opencl` 권장) ② `kv_cache` RSS flaky 2건(`test_prune_prefix_calls_release_unused_pages`/`test_release_unused_pages_rss_reduction` — 병렬 교란 간헐 FAIL, 격리 `--test-threads 1` PASS면 무시).
+**baseline (2026-06-12 2차 갱신 — P2-chore (a)(b)(c) 전체 해소 후)**:
+- `cargo test -p llm_rs2 --lib` (필터 불필요): **1410 PASS / 0 FAIL** — 결정적 실패 2건(fixture 버그)·OpenCL 환경 실패(플랫폼 선택 + unified stale 테스트)가 전부 수정돼 skip 필터 없이 클린. OpenCL 테스트는 호스트에서 NVIDIA GPU 로 실행됨(GPU-보유 플랫폼 우선 스캔).
+- 카운트 제외 1종: `kv_cache` RSS flaky 2건(`test_prune_prefix_calls_release_unused_pages`/`test_release_unused_pages_rss_reduction` — 병렬 교란 간헐 FAIL, 격리 `--test-threads 1` PASS면 무시).
 - `cargo test -p technique-api`: **20/0**.
 
-**판정**: 비-OpenCL 결정적 **실패 0**. 카운트 제외 2종(OpenCL 환경 + RSS flaky 격리-PASS)은 양 브랜치 공통.
+**판정**: **0 FAIL** (skip 가드 발화 허용: unified UMA 왕복 1건은 discrete GPU 에서 [SKIPPED] 출력). RSS flaky 는 격리-PASS 확인 시 무시 — 양 브랜치 공통.
 
 ### (b) α-K frozen 3-dtype byte-identical (S25) — forward happy path 무회귀
 

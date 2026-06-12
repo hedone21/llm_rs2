@@ -75,7 +75,8 @@ if [ -n "$SPEC_DIRS" ]; then
       base=$(basename "$f" .rs)
       # test_inv_layer_001 → INV-LAYER-001
       n=$(echo "$base" | grep -oE 'layer_[0-9]+' | grep -oE '[0-9]+' | head -1)
-      [ -n "$n" ] && TEST_INVS_LAYER="$TEST_INVS_LAYER INV-LAYER-$(printf '%03d' "$n")"
+      # 10# 강제: 0 패딩 번호(008/009)가 octal 로 파싱되는 것을 방지
+      [ -n "$n" ] && TEST_INVS_LAYER="$TEST_INVS_LAYER INV-LAYER-$(printf '%03d' "$((10#$n))")"
     done
   done
   TEST_INVS_LAYER=$(printf '%s\n' $TEST_INVS_LAYER | sort -u)
@@ -87,7 +88,8 @@ if [ -n "$SPEC_DIRS" ]; then
       base=$(basename "$f" .rs)
       # test_inv_rpcmem_001_android_only → INV-RPCMEM-001
       n=$(echo "$base" | grep -oE 'rpcmem_[0-9]+' | grep -oE '[0-9]+' | head -1)
-      [ -n "$n" ] && TEST_INVS_RPCMEM="$TEST_INVS_RPCMEM INV-RPCMEM-$(printf '%03d' "$n")"
+      # 10# 강제: 0 패딩 번호(008/009)가 octal 로 파싱되는 것을 방지
+      [ -n "$n" ] && TEST_INVS_RPCMEM="$TEST_INVS_RPCMEM INV-RPCMEM-$(printf '%03d' "$((10#$n))")"
     done
   done
   TEST_INVS_RPCMEM=$(printf '%s\n' $TEST_INVS_RPCMEM | sort -u)

@@ -648,6 +648,13 @@ impl OpenCLBackend {
     /// by ~54 ms on Adreno. Event-based measurement has near-zero CPU
     /// overhead because profiling info is collected by the GPU itself.
     pub fn new_with_profile_events(profile_events_enabled: bool) -> Result<Self> {
+        // --- Device type selection via OCL_DEVICE_TYPE env var ---
+        let device_type = match std::env::var("OCL_DEVICE_TYPE").as_deref().unwrap_or("gpu") {
+            "cpu" => Some(flags::DEVICE_TYPE_CPU),
+            "all" => None,
+            _ => Some(flags::DEVICE_TYPE_GPU),
+        };
+
         // --- Platform selection via OCL_PLATFORM env var ---
         let platform = if let Ok(name) = std::env::var("OCL_PLATFORM") {
             let name_lower = name.to_lowercase();
@@ -661,14 +668,19 @@ impl OpenCLBackend {
                 })
                 .ok_or_else(|| anyhow!("No OpenCL platform matching '{}'", name))?
         } else {
-            Platform::default()
-        };
-
-        // --- Device type selection via OCL_DEVICE_TYPE env var ---
-        let device_type = match std::env::var("OCL_DEVICE_TYPE").as_deref().unwrap_or("gpu") {
-            "cpu" => Some(flags::DEVICE_TYPE_CPU),
-            "all" => None,
-            _ => Some(flags::DEVICE_TYPE_GPU),
+            // 기본: 요청 device type 을 가진 플랫폼 우선. `Platform::default()`(첫 플랫폼)는
+            // POCL(CPU)-first 호스트에서 GPU 플랫폼(NVIDIA)을 가리지 못한다. 스캔 중 Err 는
+            // "해당 없음"으로 간주(POCL 의 clGetDeviceIDs 가 병렬 질의에서 간헐 Err).
+            // 단일 플랫폼 디바이스(Adreno/Jetson)에선 기존 선택과 동일.
+            device_type
+                .and_then(|dtype| {
+                    Platform::list().into_iter().find(|p| {
+                        Device::list(*p, Some(dtype))
+                            .map(|d| !d.is_empty())
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or_else(Platform::default)
         };
 
         let device = if let Some(dtype) = device_type {
