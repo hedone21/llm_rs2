@@ -860,6 +860,9 @@ fn run_scenario(stream: &mut (impl Read + Write), path: &PathBuf) -> anyhow::Res
             match recv_qcf_skip_heartbeats(stream, Duration::from_secs(5))? {
                 Some(qcf) => {
                     println!("  QcfEstimate: {} entries", qcf.estimates.len());
+                    for (action, cost) in &qcf.estimates {
+                        println!("  {}: {:.4}", action, cost);
+                    }
                 }
                 None => {
                     println!("  Timed out waiting for QcfEstimate");
