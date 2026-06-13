@@ -295,6 +295,7 @@ mod tests {
                 merge_e: 0.1,
                 layer_alloc: true,
                 protected_layers: None,
+                merge_axis: "both".to_string(),
             }),
         });
         assert!(!is_standard_happy_path(&args));

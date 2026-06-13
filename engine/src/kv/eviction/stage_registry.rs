@@ -80,6 +80,7 @@ pub(crate) fn uniform_to_weighted(m: crate::format::Merge) -> WeightedMerge {
         into: m.into,
         into_weight: w,
         from: m.from.into_iter().map(|p| (p, w)).collect(),
+        apply_to: technique_api::MergeAxis::Both,
     }
 }
 
@@ -720,6 +721,7 @@ unsafe fn planabi_to_plan(abi: &PlanAbi) -> Result<KVCachePlan> {
                 into: m.into,
                 into_weight: m.into_weight,
                 from,
+                apply_to: technique_api::MergeAxis::from_u32(m.apply_to),
             });
         }
     }

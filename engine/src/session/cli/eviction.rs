@@ -172,6 +172,12 @@ pub struct D2oArgs {
     /// Protected layer indices for D2O layer allocation (comma-separated).
     #[arg(long, value_delimiter = ',')]
     pub protected_layers: Option<Vec<usize>>,
+
+    /// Weighted-merge axis (WeightedKV ablation, KV 로드맵 항목 2).
+    /// `both` (default) = uniform K·V merge (구 동작 bit-identical).
+    /// `value_only` = WeightedKV (K discard + V-only weighted merge).
+    #[arg(long, default_value = "both", value_parser = ["both", "key_only", "value_only"])]
+    pub merge_axis: String,
 }
 
 /// Variant-independent eviction parameters.

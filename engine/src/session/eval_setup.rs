@@ -194,6 +194,7 @@ fn build_eval_cache_manager(
             merge_e: args.d2o_merge_e(),
             use_layer_allocation: args.d2o_layer_alloc(),
             protected_layers: args.d2o_protected_layers().unwrap_or_default(),
+            merge_axis: args.d2o_merge_axis(),
         });
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,

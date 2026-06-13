@@ -22,7 +22,7 @@ use crate::kv::kv_cache::KVCache;
 use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
-use technique_api::{KVReadPlan, KVReadStage, WeightedMerge};
+use technique_api::{KVReadPlan, KVReadStage, MergeAxis, WeightedMerge};
 
 /// 내부 가변 상태 — `KVCache` 와 비-F32 cast scratch 를 **단일 lock** 으로 묶는다.
 ///
@@ -559,61 +559,83 @@ pub(crate) fn apply_weighted_merges(cache: &mut KVCache, merges: &[WeightedMerge
         let from_pos: Vec<usize> = m.from.iter().map(|&(p, _)| p).collect();
         let from_w: Vec<f32> = m.from.iter().map(|&(_, w)| w).collect();
 
+        // WeightedKV 축 게이트(KV 로드맵 항목 2). Both=둘 다(구 동작 bit-identical),
+        // KeyOnly=K 만 merge·V evict, ValueOnly=V 만 merge·K evict.
+        let do_k = m.apply_to != MergeAxis::ValueOnly;
+        let do_v = m.apply_to != MergeAxis::KeyOnly;
         for h in 0..kv_heads {
             // ── K (k_buffer.dtype() 디스패치) ──
-            match cache.k_buffer.dtype() {
-                DType::F32 => {
-                    let into_off = cache.offset(m.into, h);
-                    let from_offs: Vec<usize> =
-                        from_pos.iter().map(|&p| cache.offset(p, h)).collect();
-                    let k = cache.k_buffer.as_mut_slice::<f32>();
-                    merge_row_weighted_f32(k, into_off, &from_offs, &from_w, into_w, head_dim);
+            if do_k {
+                match cache.k_buffer.dtype() {
+                    DType::F32 => {
+                        let into_off = cache.offset(m.into, h);
+                        let from_offs: Vec<usize> =
+                            from_pos.iter().map(|&p| cache.offset(p, h)).collect();
+                        let k = cache.k_buffer.as_mut_slice::<f32>();
+                        merge_row_weighted_f32(k, into_off, &from_offs, &from_w, into_w, head_dim);
+                    }
+                    DType::F16 => {
+                        let into_off = cache.offset(m.into, h);
+                        let from_offs: Vec<usize> =
+                            from_pos.iter().map(|&p| cache.offset(p, h)).collect();
+                        let k = cache.k_buffer.as_mut_slice::<f16>();
+                        merge_row_weighted_f16(k, into_off, &from_offs, &from_w, into_w, head_dim);
+                    }
+                    DType::Q4_0 => {
+                        let into_bo = cache.q4_block_offset(m.into, h, blocks_per_pos);
+                        let from_bos: Vec<usize> = from_pos
+                            .iter()
+                            .map(|&p| cache.q4_block_offset(p, h, blocks_per_pos))
+                            .collect();
+                        let k = cache.k_buffer.as_mut_slice::<BlockQ4_0>();
+                        merge_row_weighted_q4(
+                            k,
+                            into_bo,
+                            &from_bos,
+                            &from_w,
+                            into_w,
+                            blocks_per_pos,
+                        );
+                    }
+                    _ => {}
                 }
-                DType::F16 => {
-                    let into_off = cache.offset(m.into, h);
-                    let from_offs: Vec<usize> =
-                        from_pos.iter().map(|&p| cache.offset(p, h)).collect();
-                    let k = cache.k_buffer.as_mut_slice::<f16>();
-                    merge_row_weighted_f16(k, into_off, &from_offs, &from_w, into_w, head_dim);
-                }
-                DType::Q4_0 => {
-                    let into_bo = cache.q4_block_offset(m.into, h, blocks_per_pos);
-                    let from_bos: Vec<usize> = from_pos
-                        .iter()
-                        .map(|&p| cache.q4_block_offset(p, h, blocks_per_pos))
-                        .collect();
-                    let k = cache.k_buffer.as_mut_slice::<BlockQ4_0>();
-                    merge_row_weighted_q4(k, into_bo, &from_bos, &from_w, into_w, blocks_per_pos);
-                }
-                _ => {}
             }
 
             // ── V (v_buffer.dtype() 독립 디스패치) ──
-            match cache.v_buffer.dtype() {
-                DType::F32 => {
-                    let into_off = cache.offset(m.into, h);
-                    let from_offs: Vec<usize> =
-                        from_pos.iter().map(|&p| cache.offset(p, h)).collect();
-                    let v = cache.v_buffer.as_mut_slice::<f32>();
-                    merge_row_weighted_f32(v, into_off, &from_offs, &from_w, into_w, head_dim);
+            if do_v {
+                match cache.v_buffer.dtype() {
+                    DType::F32 => {
+                        let into_off = cache.offset(m.into, h);
+                        let from_offs: Vec<usize> =
+                            from_pos.iter().map(|&p| cache.offset(p, h)).collect();
+                        let v = cache.v_buffer.as_mut_slice::<f32>();
+                        merge_row_weighted_f32(v, into_off, &from_offs, &from_w, into_w, head_dim);
+                    }
+                    DType::F16 => {
+                        let into_off = cache.offset(m.into, h);
+                        let from_offs: Vec<usize> =
+                            from_pos.iter().map(|&p| cache.offset(p, h)).collect();
+                        let v = cache.v_buffer.as_mut_slice::<f16>();
+                        merge_row_weighted_f16(v, into_off, &from_offs, &from_w, into_w, head_dim);
+                    }
+                    DType::Q4_0 => {
+                        let into_bo = cache.q4_block_offset(m.into, h, blocks_per_pos);
+                        let from_bos: Vec<usize> = from_pos
+                            .iter()
+                            .map(|&p| cache.q4_block_offset(p, h, blocks_per_pos))
+                            .collect();
+                        let v = cache.v_buffer.as_mut_slice::<BlockQ4_0>();
+                        merge_row_weighted_q4(
+                            v,
+                            into_bo,
+                            &from_bos,
+                            &from_w,
+                            into_w,
+                            blocks_per_pos,
+                        );
+                    }
+                    _ => {}
                 }
-                DType::F16 => {
-                    let into_off = cache.offset(m.into, h);
-                    let from_offs: Vec<usize> =
-                        from_pos.iter().map(|&p| cache.offset(p, h)).collect();
-                    let v = cache.v_buffer.as_mut_slice::<f16>();
-                    merge_row_weighted_f16(v, into_off, &from_offs, &from_w, into_w, head_dim);
-                }
-                DType::Q4_0 => {
-                    let into_bo = cache.q4_block_offset(m.into, h, blocks_per_pos);
-                    let from_bos: Vec<usize> = from_pos
-                        .iter()
-                        .map(|&p| cache.q4_block_offset(p, h, blocks_per_pos))
-                        .collect();
-                    let v = cache.v_buffer.as_mut_slice::<BlockQ4_0>();
-                    merge_row_weighted_q4(v, into_bo, &from_bos, &from_w, into_w, blocks_per_pos);
-                }
-                _ => {}
             }
         }
     }
@@ -717,12 +739,19 @@ fn apply_weighted_merges_opaque(cache: &mut KVCache, merges: &[WeightedMerge]) {
         let into_w = m.into_weight;
         let from_pos: Vec<usize> = m.from.iter().map(|&(p, _)| p).collect();
         let from_w: Vec<f32> = m.from.iter().map(|&(_, w)| w).collect();
+        // WeightedKV 축 게이트(typed 경로와 동형). Both=K(0)·V(1) 둘 다(구 동작), KeyOnly=K 만,
+        // ValueOnly=V 만.
+        let do_k = m.apply_to != MergeAxis::ValueOnly;
+        let do_v = m.apply_to != MergeAxis::KeyOnly;
 
         for h in 0..kv_heads {
             let into_off = (h * capacity + m.into) * bph;
             let from_offs: Vec<usize> =
                 from_pos.iter().map(|&p| (h * capacity + p) * bph).collect();
-            for buf_t in [&cache.k_buffer, &cache.v_buffer] {
+            for (buf_idx, buf_t) in [&cache.k_buffer, &cache.v_buffer].iter().enumerate() {
+                if (buf_idx == 0 && !do_k) || (buf_idx == 1 && !do_v) {
+                    continue;
+                }
                 let total = buf_t.buffer().size();
                 // SAFETY: opaque 버퍼 total 바이트 유효(self 수명 Arc 보유). into/from sub-slice 는
                 // evicted∉retained 라 non-overlapping(merge_row_weighted_q4 동일 불변식). interior-mut.
@@ -1972,7 +2001,7 @@ mod tests {
         use crate::memory::Memory;
         use crate::memory::galloc::Galloc;
         use crate::quant::{BlockQ4_0, QK4_0};
-        use technique_api::{KVLayoutDesc, Packing, ScaleLayout, WeightedMerge};
+        use technique_api::{KVLayoutDesc, MergeAxis, Packing, ScaleLayout, WeightedMerge};
 
         let kv_heads = 2usize;
         let head_dim = 64usize;
@@ -2032,6 +2061,7 @@ mod tests {
             into: 0,
             into_weight: 0.5,
             from: vec![(1, 0.3), (2, 0.2)],
+            apply_to: MergeAxis::Both,
         };
         apply_weighted_merges(&mut cache, std::slice::from_ref(&merge));
 
@@ -2928,5 +2958,211 @@ mod tests {
         for &x in out.as_slice::<f32>() {
             assert!(x.is_finite(), "부분 select 출력 유한: {x}");
         }
+    }
+
+    // ── WeightedKV 비대칭 merge (KV 로드맵 항목 2) ──────────────────────────────
+
+    /// `make_head_major_cache`(F32) + `write_tokens_headmajor` 로 cache 를 채우고, `into=0`
+    /// 에 pos 1,2 를 가중 병합하는 merge 1개를 `apply_to` 별로 적용해 K/V `into` 행이
+    /// 변했는지/불변인지 검사한다. `write_tokens_headmajor` 는 K=pos+0.1·h, V=pos+0.5·h.
+    fn run_axis_case_f32(axis: MergeAxis) -> (bool, bool) {
+        let kv_heads = 2;
+        let head_dim = 4;
+        let n_tokens = 4;
+        let mut cache = make_head_major_cache(n_tokens + 2, kv_heads, head_dim);
+        write_tokens_headmajor(&mut cache, n_tokens);
+
+        // into=0 의 원본 K/V (head 0) 스냅샷.
+        let off0 = cache.offset(0, 0);
+        let k_before: Vec<f32> = cache.k_buffer.as_slice::<f32>()[off0..off0 + head_dim].to_vec();
+        let v_before: Vec<f32> = cache.v_buffer.as_slice::<f32>()[off0..off0 + head_dim].to_vec();
+
+        let merge = WeightedMerge {
+            into: 0,
+            into_weight: 0.5,
+            from: vec![(1, 0.3), (2, 0.2)],
+            apply_to: axis,
+        };
+        apply_weighted_merges(&mut cache, std::slice::from_ref(&merge));
+
+        let k_after: &[f32] = &cache.k_buffer.as_slice::<f32>()[off0..off0 + head_dim];
+        let v_after: &[f32] = &cache.v_buffer.as_slice::<f32>()[off0..off0 + head_dim];
+        let k_changed = k_after != k_before.as_slice();
+        let v_changed = v_after != v_before.as_slice();
+        (k_changed, v_changed)
+    }
+
+    #[test]
+    fn weighted_merge_axis_both_updates_k_and_v_f32() {
+        let (k_changed, v_changed) = run_axis_case_f32(MergeAxis::Both);
+        assert!(k_changed, "Both: K 갱신되어야 함");
+        assert!(v_changed, "Both: V 갱신되어야 함");
+    }
+
+    #[test]
+    fn weighted_merge_axis_key_only_updates_k_not_v_f32() {
+        let (k_changed, v_changed) = run_axis_case_f32(MergeAxis::KeyOnly);
+        assert!(k_changed, "KeyOnly: K 갱신되어야 함");
+        assert!(!v_changed, "KeyOnly: V 불변이어야 함");
+    }
+
+    #[test]
+    fn weighted_merge_axis_value_only_updates_v_not_k_f32() {
+        let (k_changed, v_changed) = run_axis_case_f32(MergeAxis::ValueOnly);
+        assert!(!k_changed, "ValueOnly: K 불변이어야 함");
+        assert!(v_changed, "ValueOnly: V 갱신되어야 함");
+    }
+
+    /// Both 경로가 구 동작과 bit-identical 임을 명시 확인: `apply_to=Both` 의 K·V 결과가
+    /// K/V 각각 독립으로 KeyOnly·ValueOnly 를 적용한 결과와 정확히 일치.
+    #[test]
+    fn weighted_merge_axis_both_equals_keyonly_plus_valueonly_f32() {
+        let kv_heads = 2;
+        let head_dim = 4;
+        let n_tokens = 4;
+        let merge = |axis| WeightedMerge {
+            into: 0,
+            into_weight: 0.5,
+            from: vec![(1, 0.3), (2, 0.2)],
+            apply_to: axis,
+        };
+        let off0 = {
+            let c = make_head_major_cache(n_tokens + 2, kv_heads, head_dim);
+            c.offset(0, 0)
+        };
+
+        // Both 한 번.
+        let mut both = make_head_major_cache(n_tokens + 2, kv_heads, head_dim);
+        write_tokens_headmajor(&mut both, n_tokens);
+        apply_weighted_merges(&mut both, std::slice::from_ref(&merge(MergeAxis::Both)));
+
+        // KeyOnly + ValueOnly 따로.
+        let mut split = make_head_major_cache(n_tokens + 2, kv_heads, head_dim);
+        write_tokens_headmajor(&mut split, n_tokens);
+        apply_weighted_merges(&mut split, std::slice::from_ref(&merge(MergeAxis::KeyOnly)));
+        apply_weighted_merges(
+            &mut split,
+            std::slice::from_ref(&merge(MergeAxis::ValueOnly)),
+        );
+
+        let k_both = &both.k_buffer.as_slice::<f32>()[off0..off0 + head_dim];
+        let v_both = &both.v_buffer.as_slice::<f32>()[off0..off0 + head_dim];
+        let k_split = &split.k_buffer.as_slice::<f32>()[off0..off0 + head_dim];
+        let v_split = &split.v_buffer.as_slice::<f32>()[off0..off0 + head_dim];
+        assert_eq!(k_both, k_split, "Both K == KeyOnly K (bit-identical)");
+        assert_eq!(v_both, v_split, "Both V == ValueOnly V (bit-identical)");
+    }
+
+    /// F16 비대칭: ValueOnly 면 K f16 비트 불변, V f16 비트 변경. quant round-trip 무관하게
+    /// 버퍼 직접 비교(merge 미적용 축은 byte-identical).
+    #[test]
+    fn weighted_merge_axis_value_only_f16() {
+        use crate::kv::kv_cache::KVLayout;
+        use crate::memory::Memory;
+        use crate::memory::galloc::Galloc;
+        let kv_heads = 1;
+        let head_dim = 4;
+        let cap = 6;
+        let n_tokens = 4;
+        let total = kv_heads * cap * head_dim;
+        let mk = || {
+            let bytes = vec![0u8; total * 2]; // f16 = 2 bytes
+            let buf = Arc::new(SharedBuffer::from_vec(bytes, DType::F16));
+            Tensor::new(
+                Shape::new(vec![1, kv_heads, cap, head_dim]),
+                buf,
+                Arc::new(CpuBackend::new()) as Arc<dyn Backend>,
+            )
+        };
+        let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let mut cache = KVCache::new_dynamic(mk(), mk(), cap, cap, kv_heads, head_dim, mem)
+            .with_layout(KVLayout::HeadMajor);
+        {
+            let k = cache.k_buffer.as_mut_slice::<half::f16>();
+            let v = cache.v_buffer.as_mut_slice::<half::f16>();
+            for pos in 0..n_tokens {
+                for d in 0..head_dim {
+                    k[pos * head_dim + d] = half::f16::from_f32(pos as f32 + 1.0);
+                    v[pos * head_dim + d] = half::f16::from_f32(pos as f32 + 1.0);
+                }
+            }
+            cache.current_pos = n_tokens;
+            cache.high_water_pos = n_tokens;
+        }
+        let k_before: Vec<half::f16> = cache.k_buffer.as_slice::<half::f16>()[0..head_dim].to_vec();
+        let v_before: Vec<half::f16> = cache.v_buffer.as_slice::<half::f16>()[0..head_dim].to_vec();
+
+        let merge = WeightedMerge {
+            into: 0,
+            into_weight: 0.5,
+            from: vec![(1, 0.3), (2, 0.2)],
+            apply_to: MergeAxis::ValueOnly,
+        };
+        apply_weighted_merges(&mut cache, std::slice::from_ref(&merge));
+
+        let k_after = &cache.k_buffer.as_slice::<half::f16>()[0..head_dim];
+        let v_after = &cache.v_buffer.as_slice::<half::f16>()[0..head_dim];
+        assert_eq!(k_after, k_before.as_slice(), "ValueOnly: K(f16) 불변");
+        assert_ne!(v_after, v_before.as_slice(), "ValueOnly: V(f16) 갱신");
+    }
+
+    /// Q4_0 비대칭: KeyOnly 면 V q4 블록 byte-identical, K q4 블록 변경.
+    #[test]
+    fn weighted_merge_axis_key_only_q4() {
+        use crate::kv::kv_cache::KVLayout;
+        use crate::memory::Memory;
+        use crate::memory::galloc::Galloc;
+        use crate::quant::{BlockQ4_0, QK4_0};
+        let kv_heads = 1;
+        let head_dim = QK4_0; // 32 → 1 block/pos
+        let cap = 6;
+        let n_tokens = 4;
+        let blocks = kv_heads * cap * (head_dim / QK4_0);
+        let mk = || {
+            let bytes = vec![0u8; blocks * std::mem::size_of::<BlockQ4_0>()];
+            let buf = Arc::new(SharedBuffer::from_vec(bytes, DType::Q4_0));
+            Tensor::new(
+                Shape::new(vec![1, kv_heads, cap, head_dim]),
+                buf,
+                Arc::new(CpuBackend::new()) as Arc<dyn Backend>,
+            )
+        };
+        let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let mut cache = KVCache::new_dynamic(mk(), mk(), cap, cap, kv_heads, head_dim, mem)
+            .with_layout(KVLayout::HeadMajor);
+        {
+            let kb = cache.k_buffer.as_mut_slice::<BlockQ4_0>();
+            let vb = cache.v_buffer.as_mut_slice::<BlockQ4_0>();
+            for pos in 0..n_tokens {
+                let mut row = [0.0f32; QK4_0];
+                for (d, r) in row.iter_mut().enumerate() {
+                    *r = (pos as f32 + 1.0) * 0.1 + d as f32 * 0.01;
+                }
+                kb[pos] = BlockQ4_0::quantize(&row);
+                vb[pos] = BlockQ4_0::quantize(&row);
+            }
+            cache.current_pos = n_tokens;
+            cache.high_water_pos = n_tokens;
+        }
+        let k_before = cache.k_buffer.as_slice::<BlockQ4_0>()[0];
+        let v_before = cache.v_buffer.as_slice::<BlockQ4_0>()[0];
+
+        let merge = WeightedMerge {
+            into: 0,
+            into_weight: 0.5,
+            from: vec![(1, 0.3), (2, 0.2)],
+            apply_to: MergeAxis::KeyOnly,
+        };
+        apply_weighted_merges(&mut cache, std::slice::from_ref(&merge));
+
+        let k_after = cache.k_buffer.as_slice::<BlockQ4_0>()[0];
+        let v_after = cache.v_buffer.as_slice::<BlockQ4_0>()[0];
+        // BlockQ4_0 = { d: f16, qs: [u8; 16] } — 필드 직접 비교로 byte-identity 판정.
+        let blk_eq = |a: &BlockQ4_0, b: &BlockQ4_0| a.d.to_bits() == b.d.to_bits() && a.qs == b.qs;
+        assert!(!blk_eq(&k_after, &k_before), "KeyOnly: K(q4_0) 블록 갱신");
+        assert!(
+            blk_eq(&v_after, &v_before),
+            "KeyOnly: V(q4_0) 블록 byte-identical"
+        );
     }
 }

@@ -97,6 +97,7 @@ pub fn build_resilience_cache_manager(
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: Vec::new(),
+            merge_axis: technique_api::MergeAxis::Both,
         });
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,

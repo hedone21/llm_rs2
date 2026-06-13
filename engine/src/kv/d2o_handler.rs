@@ -42,6 +42,9 @@ pub struct D2OConfig {
     pub use_layer_allocation: bool,
     /// Layer indices to skip eviction entirely.
     pub protected_layers: Vec<usize>,
+    /// Weighted-merge axis (WeightedKV, KV 로드맵 항목 2). `Both`(기본) = K·V 양쪽 가중 merge(구 동작).
+    /// `ValueOnly` = K discard + V 만 가중 merge. ablation 측정용 런타임 선택.
+    pub merge_axis: technique_api::MergeAxis,
 }
 
 impl Default for D2OConfig {
@@ -54,6 +57,7 @@ impl Default for D2OConfig {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         }
     }
 }
@@ -477,6 +481,7 @@ impl KVCacheStage for D2OStage {
                             .zip(w_e.iter())
                             .map(|(&(ep, _), &w)| (ep, w))
                             .collect(),
+                        apply_to: self.config.merge_axis,
                     }
                 })
                 .collect()
@@ -1392,6 +1397,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         let mut cache = make_cache(20, 1, 4, 10);
@@ -1498,6 +1504,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
         let mut state = D2OState::new();
         let mut cache = make_cache(20, 1, 4, 4);
@@ -1573,6 +1580,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
         let mut state = D2OState::new();
 
@@ -1659,6 +1667,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         let mut cache = make_cache(50, 1, 4, 30);
@@ -1737,6 +1746,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         let mut caches: Vec<KVCache> = (0..4)
@@ -1794,6 +1804,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         let mut cache = make_cache(50, 1, 4, 20);
@@ -1846,6 +1857,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         let mut cache = make_cache(50, 1, 4, 40);
@@ -2008,6 +2020,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         }
     }
 
@@ -2193,6 +2206,7 @@ mod tests {
                         .zip(w_e.iter())
                         .map(|(&(ep, _), &w)| (ep, w))
                         .collect(),
+                    apply_to: technique_api::MergeAxis::Both,
                 }
             })
             .collect()
@@ -2448,6 +2462,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         let mut cache = make_cache_q4(50, 1, 32, 20);
@@ -2495,6 +2510,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         let mut cache = make_cache_head_major(50, 2, 4, 30);
@@ -2566,6 +2582,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         };
 
         let mut importance = vec![0.1; 50];
@@ -2666,6 +2683,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: true,
             protected_layers: vec![0, 1],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         // 4 layers, all at pos 20
@@ -2708,6 +2726,7 @@ mod tests {
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: vec![],
+            merge_axis: technique_api::MergeAxis::Both,
         });
 
         // 3 layers, all at pos 40

@@ -197,6 +197,33 @@ pub struct WeightedMerge {
     pub into_weight: f32,
     /// 병합될 evicted 토큰들의 `(위치, 가중치)`.
     pub from: Vec<(usize, f32)>,
+    /// 가중 병합을 K/V 어느 축에 적용할지(WeightedKV, KV 로드맵 항목 2). `Both`(기본)=
+    /// 균등 merge 구 동작 bit-identical. `ValueOnly`=K discard(merge 제외) + V 만 가중 merge.
+    pub apply_to: MergeAxis,
+}
+
+/// 가중 병합 적용 축(WeightedKV, KV 로드맵 항목 2). `Both` = K·V 양쪽 merge(구 균등 동작과
+/// bit-identical). `KeyOnly`/`ValueOnly` = 한쪽 버퍼만 merge(다른 쪽은 단순 evict).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MergeAxis {
+    /// K·V 양쪽에 가중 merge 적용 (구 동작).
+    #[default]
+    Both,
+    /// K 버퍼에만 merge, V 는 evict.
+    KeyOnly,
+    /// V 버퍼에만 merge, K 는 evict (WeightedKV).
+    ValueOnly,
+}
+
+impl MergeAxis {
+    /// [`MergeAbi::apply_to`] u32 → enum 복원. 미지 값(구 plugin zero-init 포함)은 `Both` 로 폴백.
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => MergeAxis::KeyOnly,
+            2 => MergeAxis::ValueOnly,
+            _ => MergeAxis::Both,
+        }
+    }
 }
 
 /// 보존 토큰의 모양 — 배타 enum(ADR-0004 D2).
@@ -386,6 +413,9 @@ pub struct MergeAbi {
     pub from_ptr: *const FromPairAbi,
     /// `from_ptr` 길이.
     pub from_len: usize,
+    /// [`WeightedMerge::apply_to`] 평탄화 (Both=0 / KeyOnly=1 / ValueOnly=2). 필드 **끝에 가산** —
+    /// 기존 필드 오프셋 불변, 구 plugin `.so` 가 채우지 않는 영역은 host 가 0(=Both)으로 zero-init 한다.
+    pub apply_to: u32,
 }
 
 /// `(pos, weight)` 쌍의 C-ABI POD(D5).
@@ -605,6 +635,7 @@ impl PlanArena {
                 into_weight: m.into_weight,
                 from_ptr: from_storage[i].as_ptr(),
                 from_len: from_storage[i].len(),
+                apply_to: m.apply_to as u32,
             })
             .collect();
         PlanArena {
@@ -1903,6 +1934,7 @@ mod tests {
                 into: 0,
                 into_weight: 0.6,
                 from: vec![(5, 0.2), (6, 0.2)],
+                apply_to: MergeAxis::ValueOnly,
             }],
         };
         let abi = PlanArena::into_abi(plan.clone());
@@ -1917,6 +1949,7 @@ mod tests {
                     into: m.into,
                     into_weight: m.into_weight,
                     from: from.iter().map(|p| (p.pos, p.weight)).collect(),
+                    apply_to: MergeAxis::from_u32(m.apply_to),
                 }
             })
             .collect();

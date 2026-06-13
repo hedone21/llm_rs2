@@ -653,6 +653,7 @@ fn build_chat_eviction_internal(
             merge_e: args.d2o_merge_e,
             use_layer_allocation: args.d2o_layer_alloc,
             protected_layers: args.d2o_protected_layers.clone(),
+            merge_axis: technique_api::MergeAxis::Both,
         });
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
