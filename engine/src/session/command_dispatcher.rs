@@ -93,10 +93,6 @@ pub struct LoopControl {
     // ── ② control 비-live (seam 잔존, run() 미소비) ──
     /// Whether inference should resume from suspension. (Resume — executor 내부 state 만)
     pub resumed: bool,
-    /// Prefill policy update (batch/runner.rs 경로 소비). (SetPrefillPolicy)
-    pub prefill_chunk_size: Option<usize>,
-    pub prefill_yield_ms: Option<u32>,
-    pub prefill_cpu_chunk_size: Option<usize>,
 
     // ── ② RestoreDefaults 묶음 ──
     /// Whether to restore all action-induced state to defaults.
@@ -246,9 +242,6 @@ impl CommandDispatcher {
         self.control.restore_defaults = false;
         self.control.switch_device = None;
         self.control.prepare_device = None;
-        self.control.prefill_chunk_size = None;
-        self.control.prefill_yield_ms = None;
-        self.control.prefill_cpu_chunk_size = None;
 
         for cmd in &cmds {
             self.apply(cmd);
@@ -325,21 +318,10 @@ impl CommandDispatcher {
             EngineCommand::RequestQcf => {
                 self.compute_and_send_qcf();
             }
-            EngineCommand::SetPrefillPolicy {
-                chunk_size,
-                yield_ms,
-                cpu_chunk_size,
-            } => {
-                if let Some(v) = chunk_size {
-                    self.control.prefill_chunk_size = Some(*v);
-                }
-                if let Some(v) = yield_ms {
-                    self.control.prefill_yield_ms = Some(*v);
-                }
-                if let Some(v) = cpu_chunk_size {
-                    self.control.prefill_cpu_chunk_size = Some(*v);
-                }
-            }
+            // SetPrefillPolicy: DecodeLoop run() 미소비 (prefill 정책은 CLI Args 경로 전용 —
+            // init.rs 가 args.prefill_* 를 직접 read). LoopControl.prefill_* 는 dead write 였어
+            // 삭제됨(2026-06-13 census) → directive 수신 시 no-op (MSG 표면은 존속).
+            EngineCommand::SetPrefillPolicy { .. } => {}
 
             // ── ① offload → OneShot OffloadStage submit (AB-3 §5.10) ──
             EngineCommand::KvOffload { ratio } => {

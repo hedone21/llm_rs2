@@ -27,7 +27,6 @@ pub mod resilience_init;
 pub mod samplers;
 pub mod standard_happy;
 pub mod swap_runtime;
-pub mod warmup;
 
 pub use crate::inference::sampling::{GreedySampler, StepCtx, TokenSampler};
 pub use assembly::{build_standard_loop, is_standard_happy_path};
