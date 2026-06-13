@@ -152,7 +152,9 @@ ADR-0011이 표면 SSOT. 단계별 진행. 분기 취소로 동결 해제(머지
 
 ---
 
-#### T5 — 설계+결정 항목 (B3) · 규모 **M** (설계 위주)
+#### T5 — 설계+결정 항목 (B3) · 규모 **M** (설계 위주) — ✅ **종결 (2026-06-13)**
+
+> **T5 종결 기록 (2026-06-13)**: Architect 설계안 도출 → **사용자 일괄 결정 (D-1 = B 명시 트리거 recall / D-2 = D 현행 유지 / D-3 = B 별 sprint)** → D-2/D-3 backlog 종결(`6c977bfe`) + D-1 구현 완주(spec `afeec446` + 구현 `fa06b824`). **게이트**: host lib **1438/0** + engine spec **722/0**(신규 INV-192~195 16/16) + manager **0 FAIL** + clippy clean + coverage 갭 0 / verify 매트릭스 **32/32 무회귀**(20260613_015956) / **recall e2e GREEN**: host cpu + **S25 cpu** 양쪽에서 mock_manager 시나리오(SwapWeights 1.0 → RecallWeights 1.0) → swap 26 layers → `recalled=26` → 완주+정상 텍스트 / frozen 3-dtype byte-identical. **트랙 중 발견·해소**: 디바이스 AUF 자산 전부 embed Q4_0-only 결함 → `auf_tool build --dtypes f16,q4_0` 재빌드(`qwen2.5-1.5b-md2.auf`, 디바이스 배포 완료) / mock_manager `--wait-secs` 는 directive 발행 전 대기(수명 아님 — 스키마 정독 교훈) / argus_cli happy path 는 swap runtime 미구성(사전존재, 의도된 no-op).
 
 설계안 도출까지 진행 → 결정점만 모아 (c)에서 일괄 질문. 구현은 결정 후.
 
