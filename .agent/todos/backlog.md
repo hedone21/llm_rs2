@@ -773,7 +773,7 @@
 - **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-9)** — (a) `QuantizeHandler` struct + never-registered NoOp `CachePressureHandler` impl 삭제 (b) `target_bits_for_pressure` free fn 강등(spec MUST 보존 진입점, 기대값 None/8/4/2 불변) (c) ENG-ALG-092 표 정정(`spec/32-engine-algorithms.md` §3.9.2 — "6종" 제거, 등록 3종 + free-fn 항목 분리, `arch/32` 동기) (d) spec test 호출형 갱신. 검증: lib quantize 18/0 + test_action_pool 11/0 + spec eng_alg_060_092 19/0 + clippy clean + `QuantizeHandler` 잔존 참조 grep 0.
 
 ## [P3] MGR-DAT-015 데이터 모델 divergence — Level 의 SystemSignal 포함 여부 — 2026-06-12 등록 (T1-7 부수 발견)
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-13, `0dc120ad`)** — (a) 채택: spec 을 현 구현(Level 항상 포함)에 정합, 코드 불변. divergence 가 §3.1 전반(MGR-DAT-010/011/012/013/015)에 퍼져 있어 일괄 정정 — SystemSignal 4 variant 전부 `level:Level` 보유(shared/lib.rs) 반영. spec test 무영향(이미 level 채워 생성), COVERAGE 무관(기존 명세 의미 정정).
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: Backlog Burndown T1-7(EnergyConstraint divergence 해소) 중 Architect 발견
@@ -988,7 +988,7 @@
 > Phase β(decode loop rewrite, β-1~β-7) 진행 중 발견·이월된 잔여. 출처 = `.agent/todos/roadmap_beta_decode_loop_rewrite_2026_06_10.md`. β-1~6 은 **전부 비차단 사전존재 이슈**, γ-4 는 β-7 G3 ripple 격리용 의도적 이월.
 
 ## [P3] test_backend 하네스 이슈 — MatMulTransposed 16 FAIL + MatMulSlice 8 FAIL + RoPE 2 ERROR — 2026-06-10 등록
-- **Status**: **부분 해소 (2026-06-12, Backlog Burndown T1-5)** — ① **RoPE 2 ERROR 수정 완료**: 하네스가 n%head_dim≠0 케이스에서 2D 텐서로 `rope_inplace` 호출(RoPE 계약 3+ dims 위반)하던 shape 분기 버그 — 항상 유효한 4D로 정정, host scalar/OpenCL 8/8 PASS. ② **MatMulTransposed/MatMulSlice = host(NVIDIA) 미재현 잔여**: host FAIL 6건은 fallback GEMV 커널(`mul_mv_q4_0_f32.cl`)이 `cl_khr_subgroups` 미지원 NVIDIA에서 비정상 실행되는 환경 문제(device 카운트 16/8과 불일치) — S25 디바이스 라운드(T2/T3)에서 test_backend 1회 재실행으로 재현·진단 필요. ③ **부수 발견**: Softmax 검증이 reference 부재의 가짜 검증(`ref_sum=0` → diff=1/n, n≤64만 우연 FAIL) — 하네스에 Softmax reference 추가 필요(잔여 작업에 병합).
+- **Status**: **RESOLVED (2026-06-13, `55200e8f`)** — T1-5 RoPE(`d7a123b9`) + 잔여 전부 해소. **근본 원인 = 하네스 readback 결함**: S25 production OpenCL 버퍼는 `UnifiedBuffer`(ALLOC_HOST_PTR)인데 하네스가 `OpenCLBuffer` 만 downcast → **조용히 0 벡터 반환** → MatMul `diff=|dot-0|` FAIL, Softmax `diff=|ref-0|` 일부 FAIL (CPU/NEON 은 전 op PASS 라 reference 정확성 교차 입증). UMA-coherent readback(`cl_buffer().read().enq()`) 경로 추가 + 미지원 타입 명시 ERROR(가짜 검증 차단) + Softmax numerically-stable reference 추가(구 `ref_sum=0` 가짜 검증 교체) + 멱등성 결함(softmax^10) 수정. **S25 `--backends opencl` 16+8 FAIL → 51/51 PASS**(MatMulTransposed/Slice/Softmax/RMSNorm/RoPE/KIVI, error ≤7e-6). production .cl/backend 무변경 — 하네스만. host NVIDIA 의 Q4_0 GEMV 6 FAIL 은 `cl_khr_subgroups` 미지원 환경 한계(S25 Adreno 8/8 PASS 로 production 무관 확정).
 - **Sprint**: backlog
 - **Dependencies**: 없음 (비차단)
 - **출처**: roadmap β-7 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:126`)
@@ -1006,7 +1006,7 @@
 - **Notes**: 비차단. baseline-only chore (코드 무변경).
 
 ## [P3] scripts/check_spec_coverage.sh 버그 — INV-DECODE-STAGE ID 추출 부재 (잔여 1건) — 2026-06-10 등록 / 2026-06-12 축소
-- **Status**: **RESOLVED (2026-06-12, Backlog Burndown T1-6)** — INV-DECODE-STAGE 시리즈 추출 추가(INV-LAYER 다중 번호 파일명 패턴과 동일 방식, base-10 규율 유지). 스크립트 [6]까지 정상 완주, 오탐 신규 갭 0. **부수 노출**: 추출이 생기면서 INV-DECODE-STAGE 커버리지 갭 6건(001/002/003/005/006 등 — `test_inv_decode_stage_004_007.rs` 미커버분)이 가시화 — 스크립트 버그가 아니라 기존 테스트 미비의 정당한 보고(전체 갭 45→51건). 테스트 신규 작성은 별도 판단 사안으로 잔여 기록.
+- **Status**: **RESOLVED (2026-06-12 T1-6 추출 + 2026-06-13 `2b0caa63` 갭 해소)** — T1-6 에서 INV-DECODE-STAGE 추출 추가(노출된 커버리지 갭 6건). **2026-06-13 갭 0 종결**: 001(orphan phase/Fine variant) + 002/003(폐기 INV tombstone) 신규 테스트 + `004_007.rs`→`004_005_006_007.rs` 확장 rename + 스크립트 파싱 수정(`stage_NNN_MMM` 다중 숫자 토큰 추출 — 구 `grep 'stage_[0-9]+'` 는 첫 숫자만). **INV-DECODE-STAGE 누락 6→0**(전체 51→45). spec 727/0.
 - **Sprint**: backlog
 - **Dependencies**: 없음 (비차단)
 - **출처**: roadmap β-1 완료 기록 (`roadmap_beta_decode_loop_rewrite_2026_06_10.md:51`) + `handoff_beta_1_complete_beta_2_entry_2026_06_10.md:52`
@@ -1106,7 +1106,7 @@
 - **Notes**: flag-based dispatch 덕에 이주 비용 최소. 담당 권장: Implementer → Tester(실행 검증).
 
 ## [P3] session/warmup.rs::run_warmup orphan 거취 결정 — 2026-06-11 등록
-- **Status**: TODO
+- **Status**: **RESOLVED — 삭제 (2026-06-13, `59737375`)** — 거취 = (b) orphan 삭제. 근거: argus_bench(측정 bin)가 warmup/DVFS ramp-up 없이 운용 → 측정 품질 의존 미입증 + 호출자 0 으로 장기 존속 = 측정 필수 아니었던 방증. `warmup.rs` 모듈 + `session.rs` mod 선언 삭제. orphan import 자동 해소(`forward_fmt_roundtrip` 등 의존 심볼은 타처 사용 보존). 컴파일 GREEN.
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: γ-4 구현 후속 — orphan census
@@ -1115,7 +1115,7 @@
 - **Notes**: 측정 품질(DVFS ramp-up) 효용 vs dead code 비용 트레이드오프. 담당 권장: Architect(거취 결정) → Implementer(처분).
 
 ## [P3] CommandExecutor legacy 채널 2차 orphan census — 2026-06-11 등록
-- **Status**: TODO
+- **Status**: **RESOLVED — census 완료 + 부분 삭제 (2026-06-13, `59737375`)** — 심볼별 소비자 grep census 결과: ① **`LoopControl.prefill_{chunk,yield,cpu_chunk}` 3필드만 진짜 dead write**(set/clear만·DecodeLoop run() read 0 — prefill 정책은 CLI Args 경로 전용, doc 주석 "batch/runner.rs 소비" stale) → 삭제 + SetPrefillPolicy arm no-op 화. ② **`CommandExecutor::poll`/`apply_command`/`ExecutionPlan`/`EvictPlan`/`StreamingParams` 5종은 프로덕션 소비자 0 이나 테스트 30+ 파일(beta4/test_resilience/spec)이 v1 reference oracle 로 의존** → 단순 orphan 아님, **삭제 보류**(의존 테스트 마이그레이션 선행 필요 — census 범위 밖). ③ heartbeat/EngineReport 경로 보존. `CommandExecutor` struct 자체는 `resilience_init.rs` 생성 → production live(orphan 아님).
 - **Sprint**: backlog
 - **Dependencies**: 없음
 - **출처**: γ-4 구현 후속 — batch 삭제 파생 census
