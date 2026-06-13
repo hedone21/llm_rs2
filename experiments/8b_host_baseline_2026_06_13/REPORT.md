@@ -62,3 +62,20 @@ opencl: 8B/1B ≈ 3.7×(2K 49/13) ~ 4.0×(8K 144/36). cpu: ≈ 3.4×(157/46) ~ 3
 - 1단계: 8B/8K opencl 에서 KV 가 TBT 병목임을 확인(1/2/7 기법의 메모리·속도 정당성 확보).
 - 2단계: **demote(1) 는 8B 품질 게이트에서도 RED** → 보류 유지. **WeightedKV(2)·cross-layer(7) 은 게이트 실험 자체가 구조적 구현을 요구** → goal 중단 조건 도달, 사용자 결정 대기.
 - 즉 "KV 가 병목이다(속도)"와 "어느 압축 기법이 sliding 을 이긴다(품질)"는 별개 — 8B 에서 속도 병목은 생겼으나 demote 는 여전히 품질 패배. 2/7 은 구현해야 게이트를 볼 수 있는 단계.
+
+## 항목 2 (WeightedKV) — 구현 완성 + 8B 게이트 (2026-06-13 후속, `1af739ce`)
+
+구현: `WeightedMerge.apply_to: MergeAxis{Both,KeyOnly,ValueOnly}` + `MergeAbi.apply_to` ABI 가산 + `apply_weighted_merges`(typed/opaque) K/V 블록 게이트. CLI `eviction d2o --merge-axis`. WeightedKV(K discard+V merge)=ValueOnly. 무회귀 전부 GREEN(lib 1450/0, beta3 등가 10/0, dlopen 2종, 비대칭 단위 6종 — 버퍼 수준 K/V 비대칭 비트 증명).
+
+### 8B WeightedKV ablation 게이트 — 측정 무의미(merge 축 PPL 무영향)
+
+8B-q4 opencl, prefill_4096(3280 words), budget 512(eviction 강제):
+
+| merge-axis | n_evictions | PPL | NLL |
+|---|---|---|---|
+| both (균등) | 11 | 2019.6544 | 15571.4547 |
+| value_only (WeightedKV) | 11 | **2019.6544** | **15571.4547** |
+
+**both = value_only 완전 동일**(NLL 비트까지). 1B 재현(Senior 측정: both/value_only/key_only 3축 동일). budget 2048(eviction 0)에서도 동일 PPL 32.6691.
+
+**판정: 측정 불가 → 보류**. merge 축 선택이 PPL 무영향 — merge 보상(retained 토큰에 evicted 가중 보정)이 retained 대비 극소수 토큰이라 PPL 신호가 측정 한계 이하. 단위 테스트가 버퍼 수준 K/V 비대칭을 비트 증명했으므로 **코드는 정확**하나, "V만 merge가 K도 merge보다 낫다"는 WeightedKV 가설이 **PPL 게이트로는 검증 불가**(어느 축이든 동일). 더 근본적으로 D2O merge 메커니즘 자체의 PPL 효과가 1B/8B 에서 0에 수렴 — eviction 은 PPL 을 바꾸나(sliding≠d2o) merge 보상은 무영향. 항목 2 보류 유지(구현은 완성·비트정확, 기법 정당성 미입증).
