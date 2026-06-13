@@ -64,6 +64,9 @@ LAYER_RULES = [
     # B-2a: §13.8-G shared identifier promotion — op span identifier used by
     # both observability (producer) and L3 inference (consumer).
     ("op_kind",                 "L2"),
+    # §13.8-N cross-cutting trait promotion — PhaseHook trait + DdrPhase enum
+    # shared by observability (op_trace fire 측) and L3-weight (phase_aware_swap impl 측).
+    ("phase_hook",              "L2"),
     # Phase α-W: 확장 파이프라인 L2 추상화 (arch/pipeline_stage_design_v2.md §2.1)
     # capability=CapabilityRegistry, format=KV/Weight Format base trait,
     # hardware=Hardware resolver, pipeline=PipelineStage 패밀리.
@@ -151,6 +154,7 @@ def classify_module(rel_path: str) -> str:
                     "yield_policy.rs", "qcf_types.rs",
                     "qcf_computer.rs", "qcf_collector.rs",
                     "model_config.rs", "layer_boundary_hook.rs",
+                    "phase_hook.rs",
                     "preload_access.rs",
                     "runtime_resources_access.rs",
                     "action_diag_helper.rs",
@@ -192,6 +196,7 @@ def classify_import(import_path: str) -> str:
     if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
                     "quant", "thread_pool", "op_kind", "partition_workspace",
                     "kv_cache_ops", "yield_policy", "preload_access",
+                    "phase_hook",
                     "runtime_resources_access", "action_diag_helper",
                     "action_result",
                     # Phase α-W: 확장 파이프라인 L2 추상화 (LAYER_RULES fallback 과 일치 유지)

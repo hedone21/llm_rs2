@@ -31,9 +31,8 @@ use crate::weight::swap_executor::SwapExecutor;
 use crate::models::weights::secondary_mmap::SecondaryMmap;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure orchestrator → inference weight resource (LayerSlot)
 use crate::models::weights::slot::{LayerSlot, LayerWeights};
-// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N op_trace hook (PhaseHook L2 격상 backlog 대기)
-use crate::observability::profile::op_trace::{DdrPhase, PhaseHook};
 use crate::op_kind::OpKind;
+use crate::phase_hook::{DdrPhase, PhaseHook};
 use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, VecDeque};

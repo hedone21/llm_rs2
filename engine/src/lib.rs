@@ -24,6 +24,7 @@ pub mod model_config;
 pub mod models;
 pub mod op_kind;
 pub mod partition_workspace;
+pub mod phase_hook;
 pub mod pipeline;
 pub mod preload_access;
 pub mod qcf;

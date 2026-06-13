@@ -33,18 +33,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-/// LISWAP-5 phase boundary hook. `op_trace::start_op` / `record`가 OpKind와
-/// 함께 콜백을 호출. 등록은 `set_phase_hook` (process-wide singleton).
-/// hook 미등록 시 zero-overhead (atomic load 1회 + 분기).
-///
-/// PhaseHook은 op_trace.rs에 정의 — phase_aware_swap.rs가 이를 import해서 impl.
-/// 순환 import 방지를 위해 op_trace.rs에 둠.
-pub trait PhaseHook: Send + Sync {
-    /// op 시작 직전 호출. ddr-heavy 진입 시 in-flight chunk 완료 대기.
-    fn on_op_start(&self, kind: OpKind);
-    /// op 끝난 직후 호출. cache-fit 끝났으면 다음 chunk dispatch.
-    fn on_op_end(&self, kind: OpKind);
-}
+// PhaseHook moved to L2 (§13.8-N cross-cutting trait promotion).
+// Source-of-truth: `engine/src/phase_hook.rs`.
+// BC re-export: existing `crate::observability::profile::op_trace::PhaseHook`
+// paths (op_trace fire 측 + phase_aware_swap impl 측) continue to compile.
+// op_trace는 hook을 fire하는 producer — start_op / record가 OpKind와 함께
+// 콜백을 호출. 등록은 `set_phase_hook` (process-wide singleton).
+// hook 미등록 시 zero-overhead (atomic load 1회 + 분기).
+pub use crate::phase_hook::PhaseHook;
 
 static PHASE_HOOK: OnceLock<Arc<dyn PhaseHook>> = OnceLock::new();
 
@@ -109,18 +105,12 @@ pub fn enabled() -> bool {
 // continue to compile without modification.
 pub use crate::op_kind::OpKind;
 
-/// DDR-bandwidth phase classification for phase-aware async swap (LISWAP-5 / B).
-/// Phase R 측정 (qnn_phase_r_summary.md §5)에 따른 분류.
-///
-/// `DdrHeavy`: weight matmul 등 DDR을 많이 쓰는 op. swap 메모리 트래픽과 contention.
-/// `CacheFit`: weight 작거나 L2 fit. swap 트래픽과 거의 무간섭 (Phase R Scenario B에서 1.04× of max).
-/// `Medium`: attention 등. partial overlap. 보수적으로 swap 회피.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DdrPhase {
-    Heavy,
-    CacheFit,
-    Medium,
-}
+// DdrPhase moved to L2 (§13.8-N cross-cutting enum promotion).
+// Source-of-truth: `engine/src/phase_hook.rs`.
+// BC re-export: existing `crate::observability::profile::op_trace::DdrPhase`
+// paths continue to compile. The `OpKind::ddr_phase` classification mapping
+// below (op → phase) stays in this producer domain.
+pub use crate::phase_hook::DdrPhase;
 
 impl OpKind {
     /// Static op → DDR phase mapping. Production 5-run 측정에서 phase별 per-layer
