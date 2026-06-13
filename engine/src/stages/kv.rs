@@ -17,3 +17,4 @@
 
 pub mod eviction;
 pub mod kivi_quant;
+pub mod offload;

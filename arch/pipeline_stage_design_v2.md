@@ -580,7 +580,7 @@ pub enum LifecyclePhase {
     // cross-cutting stage hook (mutation 허용) — AB-6 rename: KvMutate(구 PreEviction) /
     // WeightMutate(구 PostEviction). dead variant PreSwap/PostSwapBefore/PostSwapAfter 3종 삭제
     // (driver 발화 0, 구독자 0 — §5.6.5). 발화 위치·순서 불변(B안 driver 무수정).
-    // 구독자: KvMutate = EvictionStage + KiviQuantStage(AB-2 §5.7) / WeightMutate = WeightSwapStage.
+    // 구독자: KvMutate = EvictionStage + KiviQuantStage(AB-2 §5.7) + OffloadStage(AB-3 §5.10) / WeightMutate = WeightSwapStage.
     KvMutate, WeightMutate,
     // per-layer (N×/token) — mutation 금지 (INV-DECODE-STAGE-001)
     PreLayer, PostLayer, Fine(/* sub-step 식별자 */),
@@ -1380,6 +1380,131 @@ flowchart LR
 **INV-HOTPATH-DISPATCH 준수.** layer-tier dispatch 자체(`on_layer_boundary` 호출)는 forward args 의 `Option<&dyn LayerBoundaryHook>` 정적 분기(INV-147, 기존 메커니즘)다 — 본 배선이 새로 더하는 비용은 **step-tier cell 읽기 1 lock/step**(ModelForward.step 의 forward 직전). layer-tier 에 dyn 추가 0(hook 슬롯은 §8 표의 "step→boundary 자유" 가 아니라 *layer-tier* 지만, 이미 INV-147 이 hook=None zero-overhead 로 규정한 기존 슬롯 — 본 배선은 그 슬롯을 `None`→`Some` 토글만, 새 layer-tier dyn 신설 0).
 
 **host 게이트 / device 게이트.** host: `TransformerModelForwardArgs` 슬롯 추가 + `forward_into` hook 호출 배선 빌드/clippy + hook cell 설치/클리어 단위테스트(commit 시 cell=Some, finalize 시 cell=None) + ModelForward cell-read 단위테스트(cell=Some 면 forward args 슬롯 Some, cell=None 면 None). **실 IntraForward swap dispatch·정확성 = S25 device 게이트**(secondary 필요 + GPU async swap, §5.6.7 "IntraForward/PhaseAware = device 필수"). AB-6 device 게이트의 IntraForward/LayerImmediate arm 이 본 배선으로 GREEN 가능해진다.
+
+---
+
+### 5.10 AB-3 — `OffloadStage` (KvOffload/recall runtime directive → OneShot PipelineStage, KV 축)
+
+**역할.** `KvOffload { ratio }` directive(disk swap — LRU prefix 를 디스크로 offload)와 그 짝인 `RestoreDefaults`(offloaded prefix recall)를 decode_loop.rs **(a.6) 인라인 블록**(decode_loop.rs:296-325)에서 OneShot `OffloadStage` 로 이전한다. (a.6) 은 β-7 이후 decode_loop 에 남은 **유일한 `cache_manager` 직접 결합**(driver 가 dispatcher 의 공유 `CacheManager` 를 lock 후 `forward.try_offload`/`try_recall` 직접 호출)이며, AB-3 완료 시 driver 의 cache_manager 결합이 0(전부 Stage UER)이 된다.
+
+**KvMode::Offload 와 별개 차원 (handoff landmine).** AB-3 는 `KvOffload` **directive**(resilience runtime — disk swap, `--swap-dir` + `CacheManager::enable_swap`)를 이전한다. `argus_bench.rs` 의 `reject_unsupported_modes_ab0` 가 bail 하는 `KvMode::Offload`(cli.rs `effective_kv_mode`)는 **`OffloadForward`**(token-streaming KV cache 구현체, `session/forward/offload_forward.rs`)로 **완전히 다른 경로**다. §5.7 AB-2 표(L1136)의 "Offload bail 유지"는 *OffloadForward 경로*를 가리키며, **AB-3 는 그 bail 을 건드리지 않는다**(KvOffload directive 는 KvMode 와 무관하게 `--swap-dir` 설정 + directive 도착 시 발화). argus_bench.rs:109 `KvMode::Offload` bail 은 별도 잔여(OffloadForward 의 dispatcher/registry 배선 = AB-3 범위 밖)로 보존한다.
+
+#### 5.10.1 거울 = EvictionStage (AB-2 KiviQuantStage 보다 EvictionStage 에 더 가깝다)
+
+AB-3 의 1차 거울은 KiviQuantStage(AB-2)가 아니라 **EvictionStage(β-3)**다 — 셋 다 `stages/kv/` KV 축 OneShot 이나:
+
+| 축 | EvictionStage | OffloadStage (AB-3) | KiviQuantStage (AB-2) |
+|---|---|---|---|
+| handle | `Vec<Arc<StandardFormat>>` | **`Vec<Arc<StandardFormat>>` (동일)** | `Vec<Arc<KIVIFormat>>` |
+| 자원 | `Arc<Mutex<CacheManager>>` | **`Arc<Mutex<CacheManager>>` (동일)** | (없음 — KIVIFormat 자체 Mutex) |
+| UER 본문 | `take_inner`→`cm.force_evict`→`put_inner` | **`take_inner`→`cm.offload`/`cm.recall`→`put_inner` (동형)** | `with_cache_mut(transition_bits)` (UER 아님) |
+| pos | **변경(prune)** → 환류 필요 | **변경(prune/recall)** → 환류 필요 | 불변 → 환류 불요 |
+| sticky | dispatcher `evict_armed`(bool) | **없음(transient)** | dispatcher `last_quant_bits`(값) |
+
+OffloadStage 는 EvictionStage 의 `Arc<Mutex<CacheManager>>` + `Vec<Arc<StandardFormat>>` + `take_inner→cm.op→put_inner` UER 를 **그대로** 재사용한다 — 다른 점은 `cm.op` 이 `force_evict`(eviction)가 아니라 `cm.offload(ratio)`/`cm.recall()`(swap)이라는 것뿐이다. v1 `ModelForward::try_offload`(model_forward.rs:694-715)/`try_recall`(:717-735)의 UER inner op 와 byte-identical.
+
+#### 5.10.2 OffloadStage 정의
+
+| 항목 | 값 | 근거 |
+|---|---|---|
+| **위치** | `engine/src/stages/kv/offload.rs` | KV 축(disk swap = KV LRU prefix 이동). EvictionStage·KiviQuantStage 형제 (INV-STAGE-MODULE-LOCATION 후보 정합) |
+| **name** | `"kv.offload"` | `"kv.eviction"`/`"kv.kivi_quant"` 동형 |
+| **lifecycle** | `OneShot` | directive 1회 = op 1회 = GC 1회. **sticky 게이트 없음**(transient — WeightSwapStage §5.6.4 동형, v1 `offload_ratio` transient 등가). 발화 후 무조건 `Consumed` |
+| **handle** | `Vec<Arc<StandardFormat>>` | EvictionStage 동일. register 시점 보유(INV-STAGE-LAYER-HANDLE), enumerate 순서 == layer idx |
+| **자원** | `cache_manager: Arc<Mutex<CacheManager>>` | EvictionStage 동일. `enable_swap` 된 SwapHandler 보유 CM 을 dispatcher 가 directive 마다 새 OneShot 에 clone 주입(공유) |
+| **방향** | `direction: OffloadDirection { Offload { ratio: f32 }, Recall }` | **양방향 1 struct**(§5.10.3 결정). directive 가 곧 방향 — offload directive → `Offload{ratio}`, RestoreDefaults recall → `Recall` |
+| **op 본문** | `take_inner`→ `cm.offload(&mut temp, ratio)` 또는 `cm.recall(&mut temp)` →`put_inner` + 로그 | v1 `try_offload`/`try_recall` UER inner op(model_forward.rs:702-714/722-734) byte-identical |
+
+```rust
+pub enum OffloadDirection {
+    Offload { ratio: f32 },
+    Recall,
+}
+
+pub struct OffloadStage {
+    handles: Vec<Arc<StandardFormat>>,
+    cache_manager: Arc<Mutex<CacheManager>>,
+    direction: OffloadDirection,
+}
+
+impl OffloadStage {
+    pub fn offload(handles: Vec<Arc<StandardFormat>>, cm: Arc<Mutex<CacheManager>>, ratio: f32) -> Self { ... }
+    pub fn recall(handles: Vec<Arc<StandardFormat>>, cm: Arc<Mutex<CacheManager>>) -> Self { ... }
+}
+```
+
+#### 5.10.3 설계 결정 — 양방향 1 Stage (offload + recall)
+
+(a.6) 은 같은 블록에서 offload(KvOffload)와 recall(RestoreDefaults)을 모두 처리한다. 두 가지 분해안:
+
+| 대안 | 설명 | 평가 |
+|---|---|---|
+| **(A) 양방향 1 Stage** | `OffloadStage` 가 `direction` enum 으로 offload/recall 둘 다 — `OffloadStage::offload(..)`/`OffloadStage::recall(..)` 생성자 | **채택** — 두 op 이 같은 핸들·CM·UER 본문(`take_inner→cm.op→put_inner`)을 공유하고 SwapHandler 상태(disk 파일·SwapState)도 공유. 단일 struct 가 응집적. CacheManager 가 이미 `offload`/`recall` 짝 메서드(cache_manager.rs:118/140)를 한 자원(SwapHandler)에서 노출 |
+| (B) OffloadStage + RecallStage 2 struct | offload 전용 + recall 전용 별 struct | 기각 — UER 본문 중복(`take_inner→cm.op→put_inner` 2벌). recall 은 인자 0(ratio 없음)이라 별 struct 가치 낮음. 형제 늘리기만 하고 응집 저하 |
+
+**recall 발화 경로**: dispatcher 의 `RestoreDefaults` arm 이 `submit_offload_recall()` 을 호출(v1 `recall_offload && restore_defaults` 게이트 등가) → `OffloadStage::recall(..)` submit. 단 **swap 미적용 시 no-op**: dispatcher 가 "offload 가 한 번이라도 적용됐는가" 상태(`offload_armed: bool`, partition `last_partition_ratio.is_some()` 류)를 들어 미적용이면 recall stage submit 생략(불필요 disk 접근 0). v1 (a.6) 의 `if recall { try_recall }` 는 try_recall 내부에서 swap_handler=None 이면 즉시 0 반환(cache_manager.rs:141)이라 항상 submit 후 inert 였으나, AB-3 는 dispatcher 가 게이트해 submit 자체를 생략(EvictionStage `evict_armed` 선례 — 단 offload 는 RestoreDefaults 가 recall 을 *발화*하므로 evict 와 게이트 방향이 반대: evict 는 RestoreDefaults 가 disarm, offload 는 RestoreDefaults 가 recall arm).
+
+#### 5.10.4 pos 환류 — AB-2/4/6 과 결정적 차이 (offload 감소 ⊕ recall 증가)
+
+**offload pos 감소 = eviction 과 동일 환류로 자동 흡수.** offload(`prune_prefix`)는 `current_pos` 를 감소시킨다 — EvictionStage 의 prune 과 동일 방향. driver 의 기존 `reconcile_kv_pos_after_eviction`(decode_loop.rs:165-175, KvMutate dispatch 후 호출 decode_loop.rs:334)이 held-handle `current_pos < self.pos` 를 감지해 `self.pos = new_pos` + `forward.on_kv_prune(new_pos)`(GPU plan invalidate) 한다. **OffloadStage 가 offload 방향일 때 추가 driver 배선 0** — eviction 환류 메커니즘이 그대로 흡수(v1 (a.6) offload 의 `self.pos = new_pos; self.forward.on_kv_prune(new_pos)`(decode_loop.rs:310-311) 등가).
+
+**recall pos 증가 = 기존 환류로 흡수 불가 → 설계 결정 필요.** recall 은 `current_pos` 를 *증가*시킨다(disk → KV 복원). `reconcile_kv_pos_after_eviction` 은 `new_pos < self.pos` 일 때만 환류(감소 전용 — eviction 가정). recall 의 pos 증가는 이 가드를 통과 못 한다. v1 (a.6) 은 recall 시 명시적 `self.pos = new_pos`(증가 허용, on_kv_prune 미호출 — decode_loop.rs:321)했다. 두 분해안:
+
+| 대안 | 설명 | 평가 |
+|---|---|---|
+| **(A) driver 환류 일반화 (증감 양방향)** | `reconcile_kv_pos_after_eviction` 을 `reconcile_kv_pos`(가칭)로 일반화 — `new_pos != self.pos` 면 `self.pos = new_pos`, **감소 시에만** `on_kv_prune` 호출(증가 시 미호출 = v1 recall 등가) | **채택** — 단일 환류 경로가 KvMutate 후 held-handle `current_pos` 를 무조건 동기화. offload(감소+on_kv_prune)·recall(증가, on_kv_prune 없음)·eviction(감소+on_kv_prune) 셋 다 흡수. **외과적 변경**: 가드 `if new_pos < self.pos`(감소만) → `if new_pos != self.pos { self.pos = new_pos; if new_pos < old { on_kv_prune } }`. eviction/offload 거동 byte-identical(감소 경로 불변), recall 만 신규 흡수. **단 GPU plan**: recall 후 plan 재빌드 필요 여부 확인 — v1 은 recall 시 on_kv_prune 미호출이라 plan invalidate 안 함(다음 step 이 증가된 pos 로 자연 진행). A안은 이를 보존(증가 시 on_kv_prune 미호출) |
+| (B) OffloadStage 가 recall pos 를 별 채널로 통지 | StageOutcome 확장 또는 별 held-cell 로 driver 에 "pos 증가" 통지 | 기각 — StageOutcome 확장은 INV-DECODE-STAGE-004(OUTCOME 무변경 — query-only) 위반. 별 cell 은 §5.9 공유 cell 관용구 남용(recall 은 저빈도 RestoreDefaults 경로라 cell 1개 추가 비용 과다) |
+
+A안의 `reconcile_kv_pos` 일반화는 **eviction/offload 의 기존 거동을 한 바이트도 바꾸지 않으면서**(감소+on_kv_prune 경로 불변) recall 의 pos 증가만 신규 흡수한다. driver 가 KvMutate/WeightMutate 후 이미 두 번 호출(decode_loop.rs:334/344)하므로 호출 위치 변경 0 — 메서드 본문의 가드만 `<` → `!=` 확장.
+
+> **on_kv_prune 비대칭 보존 (landmine)**: offload/eviction 의 pos 감소는 `on_kv_prune`(GPU plan offset invalidate)을 호출해야 stale offset 을 막는다. recall 의 pos 증가는 v1 이 `on_kv_prune` 을 호출하지 *않았다*(decode_loop.rs:321 — `self.pos = new_pos` 만). A안은 `new_pos < old_pos`(감소)에서만 `on_kv_prune` 호출해 이 비대칭을 보존한다. recall 후 plan 은 다음 step forward 가 증가된 pos 로 자연 재빌드(v1 등가).
+
+#### 5.10.5 신규 발화 라인 명세 (OffloadStage::run 본문)
+
+verify 글자단위 계약(`direct_cmd_kvoffload.yaml:27` + `direct_cmd_kvoffload_restore.yaml:33-34`)을 보존해야 한다. v1 (a.6) 로그 라인 verbatim:
+
+```
+[Resilience] KvOffload: ratio={:.2}, {} tokens swapped      // offload, decode_loop.rs:305-308 verbatim
+[Resilience] Recalled {} tokens from swap                    // recall, decode_loop.rs:320 verbatim
+```
+
+- offload 로그: `eprintln!("[Resilience] KvOffload: ratio={:.2}, {} tokens swapped", ratio, n)` — `n > 0` 무관 무조건 출력(v1 decode_loop.rs:305 = `if let Some(ratio)` 블록 진입 시 항상). verify 패턴 `\[Resilience\] KvOffload: ratio=`.
+- recall 로그: `eprintln!("[Resilience] Recalled {} tokens from swap", n)` — **v1 은 `if n > 0` 일 때만 출력**(decode_loop.rs:319-322). verify `direct_cmd_kvoffload_restore.yaml:34` 가 `min_occurrences: 1` 이므로 recall 시 `n > 0` 이어야 functional GREEN. OffloadStage 도 `if n > 0` 게이트 보존(swap 미적용 시 dispatcher 가 submit 생략하므로 발화 시 n>0 기대 — §5.10.3).
+
+> **글자단위 정합 확인 의무 (Implementer/Tester)**: verify YAML 이 글자단위 계약이므로 **AB-3 device 게이트 실행 전 로그 라인 실측 매칭 1회 검증** 필수(AB-2 §5.7.5 / AB-4 §5.5.6 landmine 동형). marker 미일치 시 verify functional FAIL.
+
+#### 5.10.6 가드/배선 census (AB-3 변경)
+
+| 가드/배선 | 현 상태 | AB-3 변경 |
+|---|---|---|
+| `argus_bench.rs:109` (`reject_unsupported_modes_ab0`) | `matches!(effective_kv_mode(), KvMode::Offload)` → bail "Offload lands in AB-3" | **건드리지 않음** — 이 bail 은 `OffloadForward` 경로(KvMode::Offload)용, KvOffload directive 와 별개 차원(위 landmine). AB-3 범위 밖 |
+| `CommandDispatcher` `cache_manager()` getter (command_dispatcher.rs:233) | (a.6) 가 lock 용으로 사용 | **제거** — (a.6) 삭제로 유일 호출자 소멸. dispatcher 는 `cache_manager` 필드 보유는 유지(EvictionStage 가 `submit_evict` 에서 `Arc::clone(cm)` 으로 OffloadStage 와 공유) |
+| `CommandDispatcher` `KvOffload` arm (command_dispatcher.rs:353-355) | `control.offload_ratio = Some(ratio.clamp(..))` | **`submit_offload(ratio)`** — OneShot OffloadStage submit (submit_evict 동형, transient — armed 게이트 없음) |
+| `CommandDispatcher` `RestoreDefaults` arm (command_dispatcher.rs:312-331) | `recall_offload = true` set | **`submit_offload_recall()`** — offload 적용됐으면(`offload_armed`) recall OneShot submit. `recall_offload`/`offload_ratio` 필드 set 제거 |
+| `build_bench_loop` dispatcher 조립 (build_bench_loop.rs:330) | `shared_cm` 을 dispatcher 에 주입(evict 용) | **불변** — OffloadStage 도 같은 `shared_cm`(`Arc<Mutex<CacheManager>>`) + `kv_handles`(StandardFormat) 사용. dispatcher 생성자 인자 추가 0(evict 가 이미 둘 다 보유) |
+
+**핵심: dispatcher 생성자 시그니처 무변경**(AB-2/4/6 의 `kivi_handles`/`layer_slots`/`swap_runtime` 추가 ripple 과 달리). OffloadStage 가 EvictionStage 와 **완전히 동일한 자원**(`Vec<Arc<StandardFormat>>` kv_handles + `Arc<Mutex<CacheManager>>` cache_manager)을 쓰므로 dispatcher 가 이미 보유 — non-local 변경 0.
+
+#### 5.10.7 deprecated 제거 census
+
+(a.6) cutover 후 소거 대상:
+
+1. **`LoopControl.offload_ratio: Option<f32>`** (command_dispatcher.rs:109) — set 처(KvOffload arm)·read 처((a.6)) 둘 다 소멸 → 필드 삭제. dispatch transient reset(:255) 도 삭제.
+2. **`LoopControl.recall_offload: bool`** (command_dispatcher.rs:103) — RestoreDefaults arm 의 set(:315)·(a.6) read 소멸 → 삭제. transient reset(:253) 도 삭제. **단 `restore_defaults: bool` 필드는 존속**(다른 소비자 — partition `submit_partition_full`/quant guard clear 가 RestoreDefaults arm 에서 동작, recall 게이트는 dispatcher 내부 `offload_armed` 로 대체).
+3. **(a.6) 인라인 블록** (decode_loop.rs:296-325, 30 LOC) — 전체 삭제. dispatcher `cache_manager()` getter 호출도 소멸.
+4. **`Forward::try_offload`** (forward.rs:86-93 default + model_forward.rs:694-715 impl) — 유일 소비자 (a.6) 소멸 → trait 메서드 + ModelForward override 삭제. **chat 무사용 확인**(grep: chat/* 에 try_offload 0건 — try_evict 와 달리).
+5. **`Forward::try_recall`** (forward.rs:99-105 default + model_forward.rs:717-735 impl) — 동일. chat 무사용 확인.
+6. **`CommandDispatcher::cache_manager()` getter** (command_dispatcher.rs:233-235) — (a.6) 유일 호출자 소멸 → 삭제. 단 `cache_manager` *필드* 는 존속(`submit_evict`/`submit_offload` 가 `Arc::clone` 으로 사용).
+
+> **try_evict 와 비대칭 (landmine)**: `Forward::try_evict`(forward.rs:69-78)는 **chat 이 사용**(chat/session.rs `ensure_capacity`/`on_turn_end`)하므로 **존속**한다. try_offload/try_recall 만 (a.6) 단일 소비자라 삭제 가능. Implementer 는 try_evict 를 건드리지 않는다(AB-1 EvictionStage 가 argus 경로만 이전, chat 은 여전히 try_evict 직접 호출).
+
+#### 5.10.8 과도기 등가 테스트 승계
+
+현 과도기 테스트(`transitional_fields_equivalence`, command_dispatcher.rs:956-974)를 Stage 모델로 승계:
+- `assert_eq!(c.offload_ratio, Some(0.5))`(L968) + `assert_eq!(c2.offload_ratio, None, "offload transient")`(L973) — **`LoopControl.offload_ratio` 삭제로 이 단언 제거**. 잔존 과도기 필드(layer_skip)만 단언으로 축소. offload transient 등가는 신규 테스트(`offload_submits_one_shot_each_directive` 류 — swap `swap_transient_resubmits_each_directive` 선례 동형)가 승계: `submit_offload(0.5)` 후 registry 에 1 stage, 같은 0.5 재submit 시 +1(transient — armed 게이트 없음), 빈 batch 면 carry 0.
+- recall 게이트 테스트 신설(`restore_defaults_submits_recall_when_offloaded`): offload 적용 후 RestoreDefaults → recall OneShot submit(+1). offload 미적용 상태 RestoreDefaults → recall submit 없음(no-op).
+
+beta4 매핑표(`arch/beta4_command_channel_mapping.md`) §1.3 #11/#13 행(offload_ratio/recall_offload) + #9 행(RestoreDefaults) 을 AB-3 완료로 갱신.
 
 ---
 

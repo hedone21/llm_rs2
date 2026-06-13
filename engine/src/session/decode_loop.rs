@@ -154,23 +154,27 @@ impl DecodeLoop {
         }
     }
 
-    /// β-3 pos-환류 (§5.2.1 (가)): EvictionStage 가 KvMutate/WeightMutate dispatch 에서
-    /// cache 의 `current_pos` 를 prune 했을 수 있으므로, held layer-0 handle 의 `current_pos` 를
-    /// 읽어 loop `pos` 를 동기화한다. `StageOutcome` 은 무변경(query-only) — driver 가
-    /// `forward.on_kv_prune`(GPU plan invalidate)으로 v1 (a.5) 등가 통지를 한다.
+    /// β-3/AB-3 pos-환류 (§5.2.1 (가), §5.10.4 A안): KvMutate dispatch 후 held handle 의
+    /// `current_pos` 를 읽어 loop `pos` 를 동기화한다.
     ///
-    /// `kv_pos_handle == None`(happy/chat/기존 전부) 면 즉시 return → **거동-0**. 빈 registry 면
-    /// KvMutate/WeightMutate dispatch 가 len==0 fast-path 라 cache 가 변할 일이 없어 new_pos ==
-    /// self.pos → 환류 자체가 no-op.
+    /// - 감소(eviction/offload prune): `self.pos = new_pos` + `forward.on_kv_prune` — GPU plan
+    ///   invalidate. v1 (a.5) on_kv_prune 등가, byte-identical 유지.
+    /// - 증가(recall): `self.pos = new_pos`, `on_kv_prune` **미호출** — recall 후 plan 은 다음 step
+    ///   forward 가 증가된 pos 로 자연 재빌드(v1 try_recall 시 on_kv_prune 미호출 등가, §5.10.4).
+    /// - `kv_pos_handle == None`(happy/chat/기존 전부) 이면 즉시 return → **거동-0**.
     fn reconcile_kv_pos_after_eviction(&mut self) {
         let Some(h) = &self.kv_pos_handle else {
             return;
         };
         let new_pos = h.current_pos();
-        if new_pos < self.pos {
+        if new_pos != self.pos {
+            let old = self.pos;
             self.pos = new_pos;
-            // GPU plan invalidate (stale offset 방지) — v1 (a.5) on_kv_prune 등가.
-            self.forward.on_kv_prune(new_pos);
+            if new_pos < old {
+                // 감소(eviction/offload): GPU plan invalidate (stale offset 방지).
+                self.forward.on_kv_prune(new_pos);
+            }
+            // 증가(recall): on_kv_prune 미호출 — 다음 step forward 가 증가된 pos 로 자연 재빌드.
         }
     }
 
@@ -289,42 +293,8 @@ impl DecodeLoop {
             // 아래 KvMutate dispatch + pos-환류(β-3 배선)가 이를 소비한다. v1 try_evict 인라인
             // 경로는 dispatcher.submit + EvictionStage.on_phase 로 cutover 됨.
 
-            // (a.6) argus-bench AB-3: resilience KvOffload / recall. dispatcher 가 보유한 공유
-            // CacheManager(Arc<Mutex>)를 lock 후 (a.6) 동일 로직. offload_ratio 는 transient(directive
-            // 도착 poll 에만 Some)이라 자연히 1회 발동. RestoreDefaults 는 recall_offload +
-            // restore_defaults 를 함께 세팅하여 recall 을 게이트.
-            if let Some(d) = self.dispatcher.as_ref() {
-                let offload_ratio = d.control().offload_ratio;
-                let recall = d.control().recall_offload && d.control().restore_defaults;
-                if let Some(cm) = d.cache_manager() {
-                    if let Some(ratio) = offload_ratio {
-                        let (n, new_pos) = {
-                            let mut guard = cm.lock().expect("CacheManager Mutex poisoned");
-                            self.forward.try_offload(&mut guard, ratio)?
-                        };
-                        eprintln!(
-                            "[Resilience] KvOffload: ratio={:.2}, {} tokens swapped",
-                            ratio, n
-                        );
-                        if n > 0 {
-                            self.pos = new_pos;
-                            self.forward.on_kv_prune(new_pos);
-                        }
-                    }
-                    if recall {
-                        let (n, new_pos) = {
-                            let mut guard = cm.lock().expect("CacheManager Mutex poisoned");
-                            self.forward.try_recall(&mut guard)?
-                        };
-                        if n > 0 {
-                            eprintln!("[Resilience] Recalled {} tokens from swap", n);
-                            self.pos = new_pos;
-                        }
-                    }
-                }
-            }
-
-            // KvMutate: (a.6) 블록 끝, (b) v1 eviction 직전 (§5.2.1 (나) — command-poll 직후·
+            // KvMutate: (b) v1 eviction 직전 (§5.2.1 (나) — command-poll 직후·
+            // (a.6) AB-3 완료: KvOffload/recall 은 OffloadStage(OneShot, KvMutate phase) 로 이전됨.
             // forward 직전). v2 EvictionStage(command-driven OneShot) 가 여기서 발화한다 — UER 로
             // cache 를 prune 한 뒤 pos-환류로 loop pos 동기화 (§5.2.1 (가)).
             if let Some(r) = self.dispatch_phase(LifecyclePhase::KvMutate) {

@@ -34,6 +34,7 @@ use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::swap_runtime::EngineSwapRuntime;
 use crate::stages::kv::eviction::EvictionStage;
 use crate::stages::kv::kivi_quant::KiviQuantStage;
+use crate::stages::kv::offload::OffloadStage;
 use crate::stages::weight::partition::PartitionStage;
 use crate::stages::weight::weight_recall::WeightRecallStage;
 use crate::stages::weight::weight_swap::WeightSwapStage;
@@ -72,12 +73,11 @@ pub trait EngineReport {
 /// `CommandDispatcher::dispatch` 가 매 step 갱신하고, `DecodeLoop::run` 이 읽어 sleep/break/pacing
 /// 한다. v1 `ExecutionPlan` 의 control 필드와 1:1 (매핑 문서 1.2/1.3).
 ///
-/// **과도기 필드(offload_ratio/recall_offload/restore_defaults/layer_skip)** 는 대응 Stage(AB-3)
-/// 미구현이라 deprecated 로 잔존한다(G1) — 구==신 등가만 보장하고, run() 인라인 소비는 (a.6)
-/// offload/recall 만 live 다(나머지는 generate/forward 측 sticky). **partition 은 AB-4 에서 OneShot
-/// `PartitionStage`, swap 은 AB-6 에서 OneShot `WeightSwapStage`, quant 는 AB-2 에서 OneShot
-/// `KiviQuantStage` 로 이전됨** — `partition_ratio`/`swap_weights`/`kv_quant_bits` 필드는 삭제됐다
-/// (write-only dead-end 소멸, §5.5/§5.6/§5.7).
+/// **과도기 필드(layer_skip)** 는 대응 Stage 미구현이라 deprecated 로 잔존한다(G1).
+/// **partition 은 AB-4 에서 OneShot `PartitionStage`, swap 은 AB-6 에서 OneShot `WeightSwapStage`,
+/// quant 는 AB-2 에서 OneShot `KiviQuantStage`, offload/recall 은 AB-3 에서 OneShot `OffloadStage`
+/// 로 이전됨** — 삭제된 필드: `partition_ratio`/`swap_weights`/`kv_quant_bits`/`offload_ratio`/
+/// `recall_offload` (§5.5/§5.6/§5.7/§5.10).
 #[derive(Debug, Clone, Default)]
 pub struct LoopControl {
     // ── ② control 핵심 (run() live 소비) ──
@@ -98,15 +98,11 @@ pub struct LoopControl {
     pub prefill_yield_ms: Option<u32>,
     pub prefill_cpu_chunk_size: Option<usize>,
 
-    // ── ② RestoreDefaults 묶음 (a.6 live recall) ──
-    /// True when a RestoreDefaults directive arrives and offloaded KV should be recalled.
-    pub recall_offload: bool,
+    // ── ② RestoreDefaults 묶음 ──
     /// Whether to restore all action-induced state to defaults.
     pub restore_defaults: bool,
 
-    // ── 과도기 (deprecated, G1 — AB-3 Stage 이전 예정) ──
-    /// KV cache offload ratio. (KvOffload — (a.6) live `forward.try_offload`)
-    pub offload_ratio: Option<f32>,
+    // ── 과도기 (deprecated, G1) ──
     /// Layer skip ratio. (LayerSkip — sticky, forward skip_config 측)
     pub layer_skip: Option<f32>,
 
@@ -178,6 +174,10 @@ pub struct CommandDispatcher {
     /// 복사 금지). RestoreDefaults 시 `None` 으로 reset(재무장) — **16bit 복원 transition 없음**
     /// (v1 등가, partition `submit_partition_full` 과 비대칭).
     last_quant_bits: Option<u8>,
+    /// AB-3 §5.10.3: offload 가 한 번이라도 적용됐는가 상태. KvOffload directive 도착 시 true,
+    /// RestoreDefaults recall 완료 후(submit_offload_recall) false. RestoreDefaults 시 recall
+    /// submit 여부의 게이트 — offload 미적용이면 불필요 disk 접근 0.
+    offload_armed: bool,
 }
 
 impl CommandDispatcher {
@@ -223,18 +223,11 @@ impl CommandDispatcher {
             evict_armed: false,
             last_partition_ratio: None,
             last_quant_bits: None,
+            offload_armed: false,
         }
     }
 
-    /// dispatcher 가 보유한 공유 `CacheManager` 에 대한 접근자.
-    ///
-    /// (a.6) KvOffload/recall 이 `forward.try_offload`/`try_recall` 에 `&mut CacheManager` 를 넘길 때
-    /// driver 가 lock 후 사용한다. `None` 이면 미구성(happy/chat).
-    pub fn cache_manager(&self) -> Option<&Arc<Mutex<CacheManager>>> {
-        self.cache_manager.as_ref()
-    }
-
-    /// 마지막 [`Self::dispatch`] 가 갱신한 누적 [`LoopControl`] 읽기 (driver 가 (a.6) 등에서 사용).
+    /// 마지막 [`Self::dispatch`] 가 갱신한 누적 [`LoopControl`] 읽기.
     pub fn control(&self) -> &LoopControl {
         &self.control
     }
@@ -250,9 +243,7 @@ impl CommandDispatcher {
         // transient(매 step 새로 결정되는) 필드만 초기화 — sticky(throttle/tbt/quant/partition)는 carry.
         self.control.suspended = false;
         self.control.resumed = false;
-        self.control.recall_offload = false;
         self.control.restore_defaults = false;
-        self.control.offload_ratio = None;
         self.control.switch_device = None;
         self.control.prepare_device = None;
         self.control.prefill_chunk_size = None;
@@ -312,7 +303,6 @@ impl CommandDispatcher {
             EngineCommand::RestoreDefaults => {
                 // v1 RestoreDefaults(:484-502) 등가 — reset 묶음.
                 self.control.restore_defaults = true;
-                self.control.recall_offload = true;
                 self.control.throttle_delay_ms = 0;
                 self.control.target_tbt_ms = 0;
                 // target_tbt_set 은 false 로 (CLI fallback branch — v1 :489 주석 등가).
@@ -328,6 +318,8 @@ impl CommandDispatcher {
                 // 되돌린 것과 등가 — Full 복원 OneShot submit 후 last=None 으로 두면 다음
                 // SetPartitionRatio 가 어떤 ratio 든 재적용된다.
                 self.submit_partition_full();
+                // AB-3 §5.10.3: offload 가 적용됐으면 recall OneShot submit.
+                self.submit_offload_recall();
             }
             // AB-5 §5.8.2: query directive — dispatcher 직결 compute+send. LoopControl 경유 0.
             EngineCommand::RequestQcf => {
@@ -349,9 +341,9 @@ impl CommandDispatcher {
                 }
             }
 
-            // ── 과도기 5종 → LoopControl deprecated 필드 (G1) ──
+            // ── ① offload → OneShot OffloadStage submit (AB-3 §5.10) ──
             EngineCommand::KvOffload { ratio } => {
-                self.control.offload_ratio = Some(ratio.clamp(0.0, 1.0));
+                self.submit_offload(ratio.clamp(0.0, 1.0));
             }
             // ── ① quant → OneShot KiviQuantStage submit (AB-2 §5.7.3) ──
             EngineCommand::KvQuantDynamic { target_bits } => {
@@ -466,6 +458,44 @@ impl CommandDispatcher {
         };
         // ratio=1.0 → apply_partition_dispatch 가 GPU-only fast path(LayerDispatch::Full) 적용.
         let stage = PartitionStage::one_shot(self.layer_slots.clone(), Arc::clone(hw), 1.0);
+        self.registry.submit(Arc::new(stage));
+    }
+
+    /// ① KvOffload directive 1건을 OneShot `OffloadStage` 로 submit (AB-3 §5.10).
+    ///
+    /// **transient 시맨틱** — armed 게이트 없음(매 directive = 새 submit, WeightSwapStage 동형).
+    /// `cache_manager` 미구성(`None`)이거나 handle 이 없으면 no-op(happy/chat 동등). submit 후
+    /// `offload_armed = true` — RestoreDefaults 가 recall 을 게이트할 때 사용.
+    fn submit_offload(&mut self, ratio: f32) {
+        let Some(cm) = self.cache_manager.as_ref() else {
+            return; // 미구성 — directive 무시.
+        };
+        if self.kv_handles.is_empty() {
+            return;
+        }
+        self.offload_armed = true;
+        let stage = OffloadStage::offload(self.kv_handles.clone(), Arc::clone(cm), ratio);
+        self.registry.submit(Arc::new(stage));
+    }
+
+    /// ① RestoreDefaults → offload 적용 이력 있으면 OneShot recall `OffloadStage` submit (AB-3 §5.10.3).
+    ///
+    /// `offload_armed` 이면 recall Stage submit + `offload_armed = false`. 미적용이면 no-op
+    /// (불필요 disk 접근 0). `cache_manager`/handle 미구성이어도 offload_armed 가 true 면
+    /// disarm — submit 는 생략(핸들 부재 시 이미 submit 이 안 됐으므로 armed=true 는 이론상
+    /// 없으나 방어적 처리).
+    fn submit_offload_recall(&mut self) {
+        if !self.offload_armed {
+            return; // offload 미적용 → recall 불요.
+        }
+        self.offload_armed = false;
+        let Some(cm) = self.cache_manager.as_ref() else {
+            return;
+        };
+        if self.kv_handles.is_empty() {
+            return;
+        }
+        let stage = OffloadStage::recall(self.kv_handles.clone(), Arc::clone(cm));
         self.registry.submit(Arc::new(stage));
     }
 
@@ -951,26 +981,67 @@ mod tests {
         );
     }
 
-    // ── 과도기 등가 (KvOffload/LayerSkip) — AB-2/4/6 으로 이전된 quant/partition/swap 제외 ──
+    // ── 과도기 등가 (LayerSkip) — AB-2/3/4/6 으로 이전된 quant/offload/partition/swap 제외 ──
 
     #[test]
     fn transitional_fields_equivalence() {
         let (mut d, _r, _h) = make_dispatcher();
-        // AB-2: KvQuantDynamic, AB-4: SetPartitionRatio, AB-6: SwapWeights 는 LoopControl 필드가
-        // 아니라 OneShot Stage submit 으로 이전됨(kv_quant_bits/partition_ratio/swap_weights 필드
-        // 삭제). 본 테스트는 잔존 과도기 필드(offload/layer_skip)만. quant sticky 등가는
-        // quant_sticky_resubmits_on_value_change 가, swap transient 시맨틱은
-        // swap_transient_resubmits_each_directive 가 승계.
-        let c = d.dispatch(vec![
-            EngineCommand::KvOffload { ratio: 0.5 },
-            EngineCommand::LayerSkip { skip_ratio: 0.25 },
-        ]);
-        assert_eq!(c.offload_ratio, Some(0.5));
+        // AB-2: KvQuantDynamic, AB-3: KvOffload/recall, AB-4: SetPartitionRatio, AB-6: SwapWeights 는
+        // LoopControl 필드가 아니라 OneShot Stage submit 으로 이전됨. 본 테스트는 잔존 과도기
+        // 필드(layer_skip)만.
+        let c = d.dispatch(vec![EngineCommand::LayerSkip { skip_ratio: 0.25 }]);
         assert_eq!(c.layer_skip, Some(0.25));
-        // sticky: layer_skip 는 다음 dispatch 에 carry, offload 는 transient.
+        // sticky: layer_skip 는 다음 dispatch 에 carry.
         let c2 = d.dispatch(vec![]);
         assert_eq!(c2.layer_skip, Some(0.25), "layer_skip sticky");
-        assert_eq!(c2.offload_ratio, None, "offload transient");
+    }
+
+    // ── AB-3: offload OneShot submit + transient 시맨틱 ──
+
+    /// KvOffload directive → OneShot OffloadStage 1개 submit (transient).
+    /// 같은 directive 재도착 → 새 submit (armed 게이트 없음 — WeightSwapStage 동형).
+    #[test]
+    fn offload_submits_one_shot_each_directive() {
+        let (mut d, registry, _h) = make_dispatcher();
+        assert_eq!(registry.len(), 0);
+        d.dispatch(vec![EngineCommand::KvOffload { ratio: 0.5 }]);
+        assert_eq!(registry.len(), 1, "첫 KvOffload → OneShot 1개 submit");
+        // transient: 같은 directive 재도착 → 새 submit (armed 게이트 없음).
+        d.dispatch(vec![EngineCommand::KvOffload { ratio: 0.5 }]);
+        assert_eq!(
+            registry.len(),
+            2,
+            "transient: 같은 directive 재도착 → 새 submit"
+        );
+        // 빈 batch 는 carry 0 (offload_ratio 필드 삭제 — sticky 아님).
+        d.dispatch(vec![]);
+        assert_eq!(registry.len(), 2, "빈 batch — carry 0 (transient)");
+    }
+
+    /// offload 적용 후 RestoreDefaults → recall OneShot submit.
+    /// offload 미적용 상태 RestoreDefaults → recall submit 없음(no-op).
+    #[test]
+    fn restore_defaults_submits_recall_when_offloaded() {
+        let (mut d, registry, _h) = make_dispatcher();
+        // offload 미적용 상태 RestoreDefaults → recall submit 없음.
+        d.dispatch(vec![EngineCommand::RestoreDefaults]);
+        assert_eq!(registry.len(), 0, "offload 미적용 → recall submit 없음");
+        // offload 적용 후 RestoreDefaults → recall OneShot submit.
+        d.dispatch(vec![EngineCommand::KvOffload { ratio: 0.5 }]);
+        assert_eq!(registry.len(), 1, "KvOffload → offload OneShot submit");
+        d.dispatch(vec![EngineCommand::RestoreDefaults]);
+        assert_eq!(
+            registry.len(),
+            2,
+            "offload 적용 후 RestoreDefaults → recall OneShot submit"
+        );
+        // recall 후 armed=false → 다음 RestoreDefaults 에서 재recall 없음.
+        d.dispatch(vec![EngineCommand::RestoreDefaults]);
+        assert_eq!(
+            registry.len(),
+            2,
+            "recall 후 RestoreDefaults → recall 없음 (armed=false)"
+        );
     }
 
     // ── AB-2: quant OneShot submit + sticky last-applied 게이트 (§5.7.9 승계) ──
