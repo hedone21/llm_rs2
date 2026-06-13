@@ -154,10 +154,6 @@ fn control_fields_equivalent_to_v1() {
         v1c.restore_defaults, v2c.restore_defaults,
         "restore_defaults flag"
     );
-    assert_eq!(
-        v1c.recall_offload, v2c.recall_offload,
-        "recall_offload flag"
-    );
 }
 
 /// suspend override 등가 — suspend 시 device seam 무효 + throttle 0.
@@ -198,15 +194,11 @@ fn suspend_override_equivalent_to_v1() {
     );
 }
 
-/// 과도기 2종(offload/layer_skip) live 소비 경로 보유분 구==신 등가.
+/// 과도기 1종(layer_skip) live 소비 경로 보유분 구==신 등가.
 ///
-/// **AB-4/AB-6/AB-2 비교 차원 변화**: partition/swap/quant 은 더 이상 LoopControl 필드
-/// (`partition_ratio`/`swap_weights`/`kv_quant_bits`)가 아니라 OneShot Stage submit 으로
-/// 이전됐다(필드 삭제). v1 executor 는 여전히 sticky carry 하지만, v2 dispatcher 는 등가 필드가
-/// 없으므로 값 등가 대신 **submit 거동**을 별도 전용 테스트로 검증한다 (partition=
-/// `partition_directive_submits_one_shot_stage`, quant=`quant_directive_submits_one_shot_stage`,
-/// swap 시맨틱=dispatcher unit `swap_transient_resubmits_each_directive`). 본 테스트는 잔존 과도기
-/// 2종(offload/layer_skip)의 v1 anchor 대조에 한정한다.
+/// AB-3 완료: KvOffload 는 OneShot OffloadStage submit 으로 이전됨(offload_ratio/recall_offload 필드
+/// 삭제). 잔존 과도기는 layer_skip 만. offload submit 거동은 dispatcher unit
+/// `offload_submits_one_shot_each_directive` / `restore_defaults_submits_recall_when_offloaded` 가 검증.
 #[test]
 fn transitional_fields_equivalent_to_v1() {
     let (mut exec, tx, _rx) = make_executor();
@@ -226,14 +218,10 @@ fn transitional_fields_equivalent_to_v1() {
         Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
     );
 
-    let cmds = vec![
-        EngineCommand::KvOffload { ratio: 0.5 },
-        EngineCommand::LayerSkip { skip_ratio: 0.25 },
-    ];
+    let cmds = vec![EngineCommand::LayerSkip { skip_ratio: 0.25 }];
     send(&tx, 1, cmds.clone());
     let v1 = exec.poll(&KVSnapshot::default());
     let v2 = disp.dispatch(cmds);
-    assert_eq!(v1.offload_ratio, v2.offload_ratio, "offload_ratio 등가");
     assert_eq!(v1.layer_skip, v2.layer_skip, "layer_skip 등가");
 }
 
