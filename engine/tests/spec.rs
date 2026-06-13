@@ -342,12 +342,18 @@ mod test_inv_layer_007;
 
 // ── INV-DECODE-STAGE-004~007: driver↔Stage 계약 + PipelineRegistry 의미론 ──
 // Phase β-1 계약 확정 (2026-06-10). §5.2.1 4건:
+// 001: KV-PHASE mutation 금지 — PreLayer/PostLayer/Fine β 미발화 orphan 검증.
+// 002: 폐기 tombstone (2026-05-28, KvBundle trait 폐기).
+// 003: 폐기 tombstone (2026-05-28, β sync 모델 채택).
+#[path = "spec/test_inv_decode_stage_001_002_003.rs"]
+mod test_inv_decode_stage_001_002_003;
+
 // 004: on_phase Result 의미론 (Continue/Consumed/Stop/Err).
 // 005: submit 순서 = 순회 순서 + EvictionStage phase 공유.
 // 006: StageContext 2-field 슬림 컴파일 강제.
 // 007: OneShot GC 정확히 1회 (자기 phase 도달 전 no-GC).
-#[path = "spec/test_inv_decode_stage_004_007.rs"]
-mod test_inv_decode_stage_004_007;
+#[path = "spec/test_inv_decode_stage_004_005_006_007.rs"]
+mod test_inv_decode_stage_004_005_006_007;
 
 // ── Phase 4-5-d: ChatSession multi-turn + /reset + ensure_capacity + stats_line ──
 // G2: multi-turn KV pos 누적 보존 (DecodeLoop turn 사이 owned 재사용)

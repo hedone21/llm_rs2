@@ -102,8 +102,10 @@ if [ -n "$SPEC_DIRS" ]; then
     for f in "$d"/test_inv_decode_stage_*.rs; do
       [ -f "$f" ] || continue
       base=$(basename "$f" .rs)
-      # test_inv_decode_stage_004_007 → INV-DECODE-STAGE-004 INV-DECODE-STAGE-007
-      nums=$(echo "$base" | grep -oE 'stage_[0-9]+' | grep -oE '[0-9]+')
+      # test_inv_decode_stage_004_005_006_007 → INV-DECODE-STAGE-004 .. -007
+      # stage_ 접두어 이후 남는 모든 _NNN 토큰을 추출한다.
+      suffix=$(echo "$base" | sed 's/.*stage_//')
+      nums=$(echo "$suffix" | grep -oE '[0-9]+')
       for n in $nums; do
         # 10# 강제: 0 패딩 번호(008/009)가 octal 로 파싱되는 것을 방지
         TEST_INVS_DECODE_STAGE="$TEST_INVS_DECODE_STAGE INV-DECODE-STAGE-$(printf '%03d' "$((10#$n))")"
