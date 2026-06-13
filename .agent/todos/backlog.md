@@ -921,7 +921,7 @@
 - **참고 (2026-06-12, 항목 0 결과)**: 변동 없음(자체 1B ablation 게이트 유지)이나, 항목 0에서 **1B score 계열 전반이 무가치로 재확인**(R-KV·A2SF 보류, Round 14–15 연속) → 1B ablation은 회의적 전망. 8B 온보딩 시 우선순위 재평가 권장.
 
 ### [P2] 3. StageCtx 어휘 확장 ③ — `QueryStats` TensorKind
-- **Status**: **진행 중 (Sprint 2026-06-12)** / **Sprint**: current / **Dependencies**: 없음 (항목 4의 신호 공급원으로 선행 권장)
+- **Status**: **RESOLVED (2026-06-12, KV 로드맵 항목 3+4 스프린트 — `783bcadd`+`a98cd679`)** — `TensorKind::QueryStats`(disc 4 가산) + `QueryStatsAccumulator`(Welford online, GQA Q32→kv8 평균) 구현. 캡처 = score-active 폴백 경로 한정(production decode happy path 분기 1회). 게이트: e2e non_empty 128행 + greedy byte-identical + S25 α-K frozen 3-dtype byte-identical. 항목 4(read-plan)의 신호 공급원으로 충족 — T4 Quest 가 소비. (구 헤더 "진행 중" stale, 2026-06-13 정정.) / **Sprint**: completed / **Dependencies**: 없음
 - **스프린트 (2026-06-12)**: `.agent/todos/sprint_kv_roadmap_item34_2026_06_12.md` (P1 설계 → P2 구현 → P3 검증). 진입 = `handoff_kv_roadmap_item34_entry_2026_06_12.md`. 완료 게이트 = host 통계 테스트 + 기존 `tensor()` 소비자 무회귀 + α-K frozen 3-dtype byte-identical + **실모델 e2e 1회**(항목 0 미배선 허상 교훈). Q 캡처는 기본 off / score-active 시만(hot path 비용 0). accumulator commit 격리(L1112 QCF_kv 라운드와 동시 작업 주의).
 - **D4 비차단 확인 (2026-06-12)**: 인프라 항목이라 항목 0 기법 게이트 RED와 **무관하게 진행**. 항목 4의 신호 공급원이므로 4보다 선행 권장 → 항목 3+4가 항목 0 종결 후 차기 착수 1순위.
 - **Description**: prefill-end 압축 패러다임(SnapKV류)의 신호인 windowed attention 행렬은 flash attention이 materialize하지 않음(우리/문헌 공통 제약) — 2025 frontier(Expected Attention, arXiv 2510.00636)는 행렬 대신 **query 분포 통계로 미래 attention을 closed-form 추정**. `TensorKind::QueryStats`(per layer·kv_head Q running mean/var) 추가 + forward 경로 Q 캡처 1지점(`AttentionScoreAccumulator` 패턴 재사용). ADR-0004 §7이 예고한 자리("query_state(Quest) 캡처 미배선 → 후속 PR").
