@@ -151,6 +151,7 @@ def classify_module(rel_path: str) -> str:
                     "yield_policy.rs", "qcf_types.rs",
                     "qcf_computer.rs", "qcf_collector.rs",
                     "model_config.rs", "layer_boundary_hook.rs",
+                    "preload_access.rs",
                     "runtime_resources_access.rs",
                     "action_diag_helper.rs",
                     "action_result.rs",
@@ -190,7 +191,7 @@ def classify_import(import_path: str) -> str:
     # Top-level L2 abstraction files (engine/src/*.rs, Rust 2018+ pattern)
     if mod_path in ("backend", "buffer", "memory", "tensor", "shape",
                     "quant", "thread_pool", "op_kind", "partition_workspace",
-                    "kv_cache_ops", "yield_policy",
+                    "kv_cache_ops", "yield_policy", "preload_access",
                     "runtime_resources_access", "action_diag_helper",
                     "action_result",
                     # Phase α-W: 확장 파이프라인 L2 추상화 (LAYER_RULES fallback 과 일치 유지)

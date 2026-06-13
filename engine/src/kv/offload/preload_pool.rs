@@ -6,15 +6,15 @@
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 
-/// Result of a completed preload task.
-pub struct PreloadResult {
-    pub result: Result<()>,
-    pub duration: Duration,
-}
+// `PreloadResult`/`PreloadAccess` 는 L2 로 격상되었다(§13.8-O INV-LAYER-003,
+// `crate::preload_access`). 기존 `kv::offload::preload_pool::{PreloadResult,
+// PreloadAccess}` 경로 참조를 깨지 않도록 re-export 한다. 구현체(`PreloadPool`)는
+// 여기(pressure 도메인)에 잔존한다.
+pub use crate::preload_access::{PreloadAccess, PreloadResult};
 
 /// A preload task with type-erased cache pointer.
 ///
@@ -34,32 +34,6 @@ struct PreloadTask {
 // the pointed-to data outlives the task and has exclusive access.
 // This matches the safety model of the previous thread::scope + raw pointer code.
 unsafe impl Send for PreloadTask {}
-
-/// Trait abstracting a persistent preload thread pool for KV cache operations.
-///
-/// Implementors: [`PreloadPool`].
-///
-/// Separating this trait from the concrete struct allows inference-layer code
-/// (`models/transformer.rs`) to hold `Box<dyn PreloadAccess>` without importing
-/// the concrete [`PreloadPool`] type, breaking the cross-L3 dependency
-/// (§13.8-O INV-LAYER-003).
-pub trait PreloadAccess: Send + Sync {
-    /// Number of worker threads.
-    fn size(&self) -> usize;
-
-    /// Submit a type-erased preload task.
-    ///
-    /// # Safety
-    /// - `cache_ptr` must point to a valid, properly aligned object.
-    /// - The object must remain valid until the returned receiver is collected.
-    /// - No concurrent task may access the same `cache_ptr`.
-    /// - `preload_fn` must correctly cast `*mut ()` back to the original type.
-    unsafe fn submit_raw(
-        &self,
-        cache_ptr: *mut (),
-        preload_fn: unsafe fn(*mut ()) -> anyhow::Result<()>,
-    ) -> mpsc::Receiver<PreloadResult>;
-}
 
 /// Persistent thread pool for KV cache preload operations.
 ///
@@ -184,6 +158,7 @@ pub unsafe fn preload_erased<C: crate::kv::kv_cache::PrefetchableCache>(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn test_pool_basic() {

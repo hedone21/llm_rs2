@@ -25,6 +25,7 @@ pub mod models;
 pub mod op_kind;
 pub mod partition_workspace;
 pub mod pipeline;
+pub mod preload_access;
 pub mod qcf;
 pub mod qcf_collector;
 pub mod qcf_computer;
