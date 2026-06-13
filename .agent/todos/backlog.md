@@ -898,7 +898,8 @@
 - **원 Description (아카이브)**: 후속 확장의 선결 게이트 — 조사 기법 효익은 전부 7–8B+/long-context 검증(Round 14–15 교훈: 1B에서 누적 score 차별화 무가치)이라 1B 실측 없이 착수 금지. R-KV(arXiv 2505.24133) / A2SF(arXiv 2407.20485) / head 분산(항목 6 개봉 게이트) + Demote 모사(항목 1 게이트, D3 합류).
 
 ### [보류 2026-06-12] 1. plan IR 어휘 확장 ① — `Demote` op ("보존하되 저정밀로" 제3 상태)
-- **Status**: **보류 (게이트 RED, 2026-06-12)** / **Sprint**: backlog / **Dependencies**: 게이트 실험(아래) — **RED 확정**
+- **Status**: **보류 강화 (8B host 게이트도 RED, 2026-06-13)** / **Sprint**: backlog / **Dependencies**: 게이트 실험 — **1B + 8B 둘 다 RED 확정**
+- **8B host 재실행 (2026-06-13, `experiments/8b_host_baseline_2026_06_13/REPORT.md`)**: demote_measure 게이트(코드 무수정, DEMOTE_TEST_* env, 8B-q4)를 1B 양 극단 도메인에 재실행 — **둘 다 1B 보다 극심한 RED**: literary(1B 최약 RED 1.22)→**2.93**, encyclopedic(1B 최강 RED 6.04)→**42.6**(sliding 16.98 vs demote 723.19). 모델을 키울수록 demote 가 더 불리(저정밀 K 의 2차 효과가 8B 의 많은 layer/head 에 누적 폭 증가). 1단계 baseline 으로 8B/8K opencl 에서 KV 가 TBT 병목임은 확인됐으나(속도), demote 는 그 병목을 품질 손실 없이 못 줄임. **재개 조건 변경**: "8B 온보딩"은 충족했고 RED 였으므로, 단순 모델 확대로는 안 열림 — retrieval/long-reasoning 태스크의 실수요 + 동일 게이트 GREEN 선행으로 재정의.
 - **게이트 판정 (2026-06-12, 항목 0 스프린트 P2d/P3)**: Demote 모사 실모델 PPL **5/5 도메인 RED** (demote PPL ratio 1.22~6.04× — 전부 sliding보다 나쁨). 즉 **현 1B 타겟에서 demote가 sliding을 이기지 못함** — 논문의 "4×@4bit > 1×@16bit"가 1B/2048/비-reasoning에서 미재현. NMSE 보조 신호(demote 0.145 < sliding 0.75)는 demote 우세였으나 실추론 PPL이 정본(K 2차 효과가 NMSE에 미포착). 리포트: `experiments/kv_roadmap_item0/rerun/REPORT.md` §측정 4.
 - **재개 조건**: 8B/long-context 온보딩 또는 retrieval 태스크 실수요. 재개 시 동일 모사 게이트 GREEN 선행 필수(Round 14–15 위험 = 1B score 신뢰성).
 - **게이트 실험 (구현 전 모사)**: host eval에서 F16 캐시의 선택 토큰을 Q4/Q2 왕복 양자화해 "content-aware 강등이 sliding eviction을 품질(PPL/EMR)에서 이기는가"만 선검증. Round 14–15와 동일 위험(1B score 신뢰성)이므로 RED면 본 항목 전체 보류. → **2026-06-12 RED 확정 → 보류.**
@@ -912,7 +913,8 @@
 - **Acceptance Criteria**: ADR-0004 amendment + `compact_parity` demote 케이스 확장 + 게이트 실험 GREEN + lib/clippy 무회귀 + 기존 .so dlopen 호환 확인.
 
 ### [보류 2026-06-12] 2. plan IR 어휘 확장 ② — K/V 비대칭 merge 가중치
-- **Status**: **보류 (2026-06-12 사용자 결정 B1=NO, Backlog Burndown triage)** / **Sprint**: backlog / **Dependencies**: 없음 (1과 독립)
+- **Status**: **보류 — 게이트 실험 자체가 구조적 구현 요구 (2026-06-13 확인)** / **Sprint**: backlog / **Dependencies**: 없음 (1과 독립)
+- **8B host 트랙 결론 (2026-06-13)**: 8B 온보딩 제약은 해소됐으나, WeightedKV ablation(K discard + V만 merge vs 균등 merge) 게이트를 돌리려면 K/V 비대칭 merge 가중치(`apply_to: KeyOnly/ValueOnly/Both`, `w_k`/`w_v`) **구현이 선행**돼야 함 — grep 결과 현 코드에 부재(均一 가중치만). 즉 demote(1)처럼 기존 도구로 모사 게이트를 돌릴 수 없고, `apply_merges` K/V 분리 + `MergeAbi`/`FromPairAbi` 필드 추가(plan IR/ABI 구조 변경)가 게이트 실험의 전제. goal 트랙 제약상 **구조적 변경이라 자율 진행 중단, 사용자 결정 대기**. 착수하려면 별도 구현 sprint(설계+ABI+구현) 필요.
 - **보류 근거 (B1=NO)**: AC가 요구하는 1B WeightedKV ablation(8B 결과 무비판 이식 금지 = V 정보 균등 분포 가정의 1B 성립 여부 검증)이 **검증 불가** — (a) 8B/long-context 온보딩 NO(B1) 확정 + (b) 항목 0 결과로 1B score 계열 전반 무가치 재확인(R-KV·A2SF 보류, Round 14–15 연속)이라 1B ablation 회의적. 따라서 검증 게이트를 통과할 경로 없음.
 - **재개 트리거**: **8B/long-context 모델 온보딩** — 온보딩 시 V 이질성 가정 우선순위 재평가 + WeightedKV ablation 환경 확보. (트리거 충족 전 착수 금지.)
 - **Description**: `WeightedMerge`는 K/V 동일 가중치 강제 — 2025–26 문헌이 "K=스펙트럼 집중(균질)이라 적극 merge, V=분산(이질)이라 보수적"으로 수렴(순수 merge 신규 기법의 44%가 이 가정에 차단). `from: Vec<(pos, w)>` → `(pos, w_k, w_v)` + `into_weight` 분리(최소안: `apply_to: Both|KeyOnly|ValueOnly` 1필드). `apply_merges` K/V 루프 가중 분리(F32/F16/Q4_0 — `scatter_reduce_q4` 의미 포함). `MergeAbi`/`FromPairAbi` 필드 추가(가산적).
@@ -964,7 +966,7 @@
 - **Notes**: ARM64/Adreno에서 변길이 per-head KV 커널 재설계 비용이 효익을 압도할 위험 — 게이트 통과 전 착수 금지.
 
 ### [P3·트리거] 7. cross-layer cache group — xKV/MiniCache/KVSharer/CommonKV 군집
-- **개봉 트리거**: 8B+ 모델 온보딩(또는 4K+ ctx 상시화).
+- **개봉 트리거**: 8B+ 모델 온보딩(또는 4K+ ctx 상시화). **트리거 충족(8B host 온보딩, 2026-06-13)** — 단 본 항목은 "공유 basis 버퍼 + group-level plan 경로" = ADR급 설계 변경이라, goal 트랙(측정·게이트 자율) 제약상 **설계 라운드(Architect+사용자)가 선행**돼야 함 → 자율 진행 중단, 사용자 결정 대기. 1단계 baseline(`experiments/8b_host_baseline_2026_06_13/REPORT.md`)이 8B/8K opencl 의 KV 병목(576MB, TBT 144ms)을 확인해 정당성은 확보 — cross-layer 압축의 실익 평가는 ADR 설계 후 구현 측정으로.
 - **Description**: layer별 독립 버퍼 + per-layer plan 호출 구조에 레이어 간 조정 채널이 0 — cross-layer cache group(공유 basis 버퍼 + group-level plan 경로) 신설은 ADR급 설계 변경. 대상 전부 training-free post-hoc 가능(xKV 2503.18893 SVD, MiniCache 2405.14366 SLERP, KVSharer, CommonKV)인데 **구조가 차단하는 유일 부류**(인접 layer KV cosine 유사도 0.72–0.87 근거 탄탄).
 - **Notes**: 1B/2048에선 KV 절대 크기가 작아 실익 미미(KVSwap 평가와 동일 논리) + 복원 GEMM 오버헤드가 절감 상쇄 위험.
 
