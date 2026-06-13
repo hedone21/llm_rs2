@@ -341,7 +341,13 @@ fn run_matmul_test(
     let shape_str = format!("[{}, {}, {}]", m, k, n);
     match perform_matmul_test(backend.clone(), memory, op, dtype, m, k, n) {
         Ok((diff, dur)) => {
-            let status = if diff > 1e-2 { "FAIL" } else { "PASS" };
+            // Softmax outputs are normalized to [0,1], so a single accumulation
+            // tolerance applies regardless of n; F32 exp + reduction-order skew
+            // for n<=4096 stays well under 2e-3. MatMul-family compares a raw
+            // A·B dot product whose magnitude grows with k, so it keeps the
+            // looser 1e-2 bound.
+            let tol = if op == OpType::Softmax { 2e-3 } else { 1e-2 };
+            let status = if diff > tol { "FAIL" } else { "PASS" };
             results.push(TestResult {
                 op,
                 status: status.to_string(),
@@ -482,6 +488,19 @@ fn perform_matmul_test(
     };
 
     let buf_c = memory.alloc(m * n * 4, DType::F32)?;
+    // Softmax is an in-place op on C: seed C with a deterministic input so the
+    // reference softmax below is reproducible. Other ops use C as output-only,
+    // so they leave it uninitialized (their reference compares the computed
+    // value against an independently derived A·B sum).
+    let c_input_vec: Vec<f32> = if op == OpType::Softmax {
+        let v: Vec<f32> = (0..m * n).map(|i| ((i % 97) as f32 * 0.05) - 2.0).collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(v.as_ptr(), buf_c.as_mut_ptr() as *mut f32, v.len());
+        }
+        v
+    } else {
+        Vec::new()
+    };
     let c = Tensor::new(Shape::new(vec![m, n]), buf_c, backend.clone());
 
     // For OpenCL backend, we need to transfer tensors to GPU
@@ -540,18 +559,57 @@ fn perform_matmul_test(
         backend.synchronize()?;
     }
     let dur = start.elapsed();
+
+    // Softmax is not idempotent: the timing loop above ran it `iterations`
+    // times in place, so c_gpu now holds softmax^N(input), which does not match
+    // the single-pass reference. Re-seed a fresh input and run exactly one pass
+    // for the correctness check (timing is already captured in `dur`).
+    if op == OpType::Softmax {
+        let buf_clean = memory.alloc(m * n * 4, DType::F32)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c_input_vec.as_ptr(),
+                buf_clean.as_mut_ptr() as *mut f32,
+                c_input_vec.len(),
+            );
+        }
+        let clean = Tensor::new(Shape::new(vec![m, n]), buf_clean, backend.clone());
+        c_gpu = if is_opencl {
+            backend.copy_from(&clean)?
+        } else {
+            clean
+        };
+        backend.softmax(&mut c_gpu)?;
+        backend.synchronize()?;
+    }
+
     // Verify - read back results from GPU if OpenCL
     let c_data: Vec<f32> = if is_opencl {
         #[cfg(feature = "opencl")]
         {
             let buf = c_gpu.buffer();
-            if let Some(cl_buf) = buf
+            // Production OpenCL path uses UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR);
+            // the legacy OpenCLBuffer only appears on some host drivers. Read
+            // via blocking clEnqueueReadBuffer for both — on ARM UMA the mapped
+            // host pointer is cache-incoherent, so an explicit read is required
+            // to avoid stale data (CLAUDE.md zero-copy note).
+            let mut data = vec![0u8; m * n * 4];
+            let read_ok = if let Some(unified) =
+                buf.as_any()
+                    .downcast_ref::<llm_rs2::memory::opencl::unified::UnifiedBuffer>()
+            {
+                unified.cl_buffer().read(&mut data).enq()?;
+                true
+            } else if let Some(cl_buf) = buf
                 .as_any()
                 .downcast_ref::<llm_rs2::memory::opencl::device::OpenCLBuffer>()
             {
-                let mut data = vec![0u8; m * n * 4];
                 cl_buf.buffer.read(&mut data).enq()?;
-                // Convert u8 to f32
+                true
+            } else {
+                false
+            };
+            if read_ok {
                 let mut result = vec![0.0f32; m * n];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -562,7 +620,9 @@ fn perform_matmul_test(
                 }
                 result
             } else {
-                vec![0.0f32; m * n]
+                return Err(anyhow::anyhow!(
+                    "test_backend: unsupported OpenCL buffer type for readback"
+                ));
             }
         }
         #[cfg(not(feature = "opencl"))]
@@ -620,6 +680,14 @@ fn perform_matmul_test(
             for idx_k in 0..k {
                 ref_sum += a_vec[r_m * k + idx_k] * b_vec_f32[r_n * k + idx_k];
             }
+        }
+        (OpType::Softmax, _) => {
+            // Softmax operates row-wise over the last dim (length n). Reference
+            // for cell [r_m, r_n] = numerically-stable softmax of input row r_m.
+            let row = &c_input_vec[r_m * n..(r_m + 1) * n];
+            let max_val = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let sum_exp: f32 = row.iter().map(|&v| (v - max_val).exp()).sum();
+            ref_sum = (row[r_n] - max_val).exp() / sum_exp;
         }
         _ => {}
     }
