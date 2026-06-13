@@ -2,7 +2,7 @@
 //!
 //! `cargo test -p llm_manager --test sim`으로 실행.
 
-#[path = "../common/mod.rs"]
+#[path = "../common.rs"]
 mod common;
 
 mod test_config;
