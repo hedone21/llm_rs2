@@ -129,7 +129,7 @@
   - [P2] SecondaryStore trait inversion (`arch/weights_pressure_split.md §7.5`) — V-09 `SecondaryMmapBytes` 패턴 확장.
   - [P2] observability events trait inversion (`arch/weights_pressure_split.md §7.1`) — Sprint C 잔여.
   - [P2] op_trace `DdrPhase`/`PhaseHook` L2 격상 (`arch/weights_pressure_split.md §7.2`).
-  - [P2] offload 분리 (preload_pool/prefetch L2 격상 + `forward_into_offload` 분리) — 갈래 2 잔여.
+  - ~~[P2] offload 분리 (preload_pool/prefetch L2 격상 + `forward_into_offload` 분리) — 갈래 2 잔여.~~ **RESOLVED (2026-06-13, `2ec1376f`)**: `forward_into_offload`(362줄) → `engine/src/models/offload_forward.rs`(impl TransformerModel 분할, 정적 diff byte-identical) + `PreloadAccess`/`PreloadResult` → `engine/src/preload_access.rs` L2 격상(layer_lint TOP_LEVEL_L2 등재). **transformer.rs(L3 inference) cross_l3_vocabulary marker 4→0** — 잔존 2(OffloadKVCache monomorphization/OffloadFormat concrete = `OffloadKVCache` trait inversion 이 ADR급이라 분리 모듈 격리만, 본문 결합 해소). 순수 리팩토링 동작 불변: lib 1450/0 + dlopen 2종 + clippy clean + layer_lint 위반 30→30 무증가 + offload_format 격리 72/0 + **S25 verify direct_cmd_kvoffload/restore 4종 PASS** + α-K frozen 3-dtype byte-identical. 잔여 갈래(OffloadKVCache trait inversion)는 ADR급 별 항목.
   - [P3] `RuntimeResourcesAccess` trait inversion — `TransformerModel::quant_noise`/`release_worker` field를 `Arc<dyn ...>` trait object로 추상화 → field marker 2건 자연 해소. Sprint D 후속.
 - **참고 register**:
   - `ARCHITECTURE.md` §13.8-O register V-24 (line 1755) — RESOLVED 상세 + register 갱신 이력 (line 1811).
