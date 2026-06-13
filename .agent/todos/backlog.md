@@ -161,7 +161,7 @@
 - **사유**: generate.rs legacy 보존 방향 전환. 새 바이너리 분할 작업에서 자연 흡수.
 
 ## [P2] generate 바이너리 분할 + Manager 통합 — 2026-05-21 등록 / 2026-06-11 부분 해소
-- **Status**: TODO (부분 해소 — argus 패밀리 분할 γ-3 로 사실상 완성, 잔여 = argus-chat bin화 + Manager IPC 통합)
+- **Status**: **RESOLVED — 분할 완성 + 잔여 chat bin화는 별 sprint 이월 (2026-06-13, Backlog Burndown T6, C1 처분)** — ① 원 항목의 "다수 바이너리 분할" 의도는 argus 패밀리 3종(`argus_cli`/`argus_bench`/`argus_eval`)으로 완성. ② "Manager IPC 통합"(원 gen-resilience 의도)은 argus_bench 가 담당으로 정착 — verify 매트릭스 32종 + T5 recall e2e 로 실증(directive 전 경로 동작). argus_cli 는 happy path 전용이라 swap runtime 미구성(의도된 분업 — T5 기록). ③ **잔여 argus-chat bin화는 설계 SSOT 가 이미 별 sprint 로 이월** (`arch/pipeline_stage_design_v2.md` §9 "chat bin화 잔여 — eval 표면과 분리되어 별 sprint 로 이월" + §5.7.7 AB-2 검증 수단으로서의 chat bin화는 사용자 기각 2026-06-11) — burndown 의 본 항목은 SSOT 처분을 따라 종결, 착수 시점은 사용자 추후 결정(h-1 D-3 과 동일 패턴).
 - **부분 해소 (2026-06-11)**: 본 항목의 "다수 바이너리 분할" 의도는 **argus 패밀리 분할로 사실상 완성** — `argus_cli`(단일 추론) / `argus_bench`(측정) / `argus_eval`(eval, γ-3 `33d5bc8f`/`11c8721f`) 3종 정착. **잔여 = `argus-chat` bin화 만** (SSOT `arch/pipeline_stage_design_v2.md` §9 별 sprint 목록에 기등재) + Manager IPC 통합(원 항목 설계 의도).
 - **⚠️ STALE 전제 (2026-06-10 갱신)**: 아래 "현 `engine/src/bin/generate.rs` … legacy로 보존" 전제는 **이미 무효**. α-K BC(2026-06-05)에서 legacy generate.rs 가 폐기되어 현 `engine/src/bin/` 에 generate.rs 부재 — 현 bin 8종 = `argus_cli`/`argus_bench`/`argus_eval`/`auf_tool`/`signal_injector`/`test_backend`/`test_model`/`test_q4_soa_byte_equal`(argus_eval γ-3 추가). (항목 자체는 잔여 argus-chat bin화 + Manager IPC 통합 설계 의도 보존을 위해 미삭제.)
 - **결정 (2026-05-21)**: 현 `engine/src/bin/generate.rs` (master `02cb7106`, 4,953 LOC)를 **legacy로 보존**하고, 새로운 다수 바이너리로 기능 분할. Manager IPC 통합도 새 바이너리에서 다룸.
@@ -1080,7 +1080,7 @@
 > γ-3(argus-eval bin화, `33d5bc8f`/`11c8721f`) + γ-4(batch orphan 삭제, `2e53cf44`) 후 발견된 잔여. macOS OpenCL 링크 한계로 런타임 미검증분 + batch 삭제 파생 orphan census + doc stale. **출처**: γ-3/γ-4 구현 후속(2026-06-11) — Tester 후속 목록 + Architect census 보고.
 
 ## [P2] argus-eval functional smoke (디바이스/Linux 런타임 검증) — 2026-06-11 등록
-- **Status**: TODO
+- **Status**: **RESOLVED (2026-06-13, Backlog Burndown T6)** — Linux 호스트(CPU + NVIDIA OpenCL)에서 5개 모드 E2E **전부 exit 0 + 유한값**: ll(3항목 choice_nlls) / ppl(ppl=55.25, CPU≡OpenCL 7e-5 차) / dump-importance(16 layer) / qcf-dump modifier(qcf.json 16키) / experiment(17줄 jsonl). caps/swap 보존 = `[Backend] CPU primary, GPU secondary (SwitchHw ready)` 정상. 전체 `cargo test -p llm_rs2` **2334 passed / 0 failed** + spec 722/0 + flash_attn_decode_dk128 1/0·prefill_dk256 3/0. **비차단 관찰**: CPU 실행 시 GPU secondary 마이그레이션 단계의 `.cl` 컴파일 진단 카운트("N errors generated" 본문 없이)가 stderr 노이즈 — 결과 정합성 무영향(전 모드 exit 0), 향후 verbose gate 검토 여지만 기록.
 - **Sprint**: backlog
 - **Dependencies**: 없음 (디바이스/Linux 환경 필요)
 - **출처**: γ-3 구현 후속 — Tester 후속 목록 6건

@@ -167,7 +167,9 @@ ADR-0011이 표면 SSOT. 단계별 진행. 분기 취소로 동결 해제(머지
 
 ---
 
-#### T6 — 잔여 P2 · 규모 **M**
+#### T6 — 잔여 P2 · 규모 **M** — ✅ **종결 (2026-06-13)**
+
+> **T6 종결 기록 (2026-06-13)**: 3항목 처분 — ① **argus-eval smoke RESOLVED** (Tester, Linux 5모드 E2E exit 0 + `cargo test -p llm_rs2` 2334/0 + flash_attn 2타깃) ② **generate 분할 RESOLVED** (분할 완성 = argus 패밀리 3종 + Manager IPC = argus_bench, 잔여 argus-chat bin화는 설계 SSOT `pipeline_stage_design_v2.md` §9 가 이미 별 sprint 이월 + §5.7.7 AB-2 chat bin화 사용자 기각 2026-06-11 → SSOT 처분 따라 종결) ③ **h-1(L82) = D-3 별 sprint** (T5 결정 묶음에서 이미 종결). 신규 코드 0 — 검증/처분 트랙.
 
 - **포함**: L160 generate 분할 잔여(argus-chat bin화 + Manager IPC 통합) / L1065 argus-eval functional smoke(Linux/S25 런타임) / L82 typed lifecycle hook h-1.
 - **순서 근거**: 마지막 = argus 패밀리 분할은 사실상 완성(γ-3)이라 잔여 소량 + typed hook h-1은 가설 단계라 설계 선행. **L82(h-1)는 T5와 병합 검토** — inference loop 재설계 + design round(Architect+사용자) 필요라 B3 결정 묶음에 자연(아래 (c) 참조). L1065는 환경(Linux/S25 OpenCL)만 확보되면 즉시 가능한 Tester 단독.
