@@ -140,7 +140,7 @@ Conventional Commits: `type(scope): subject` — 명령형 현재 시제. Types:
 
 ## 코드 스타일 컨벤션
 
-- **모듈 파일 스타일 = no-`mod.rs`** (Rust 모던 path 스타일, 2026-06-02 결정). 디렉토리 모듈의 루트는 `foo/mod.rs` 가 아니라 형제 `foo.rs` 다 (`foo.rs` + `foo/` 안에 서브모듈). 두 스타일 다 Rust 2024 에서 유효하나, no-`mod.rs` 가 권장 모던 관용구(`cargo new` 기본)이고 이미 top-level (`backend.rs`/`buffer.rs`/`memory.rs`/`quant.rs`)이 채택한 패턴이라 프로젝트 전역 컨벤션으로 채택한다. **신규·이동 모듈은 반드시 이 스타일.** 기존 nested `mod.rs` 38개 일괄 sweep 은 완료 (commit `3895e17d`, 2026-06-02 — engine/src 전수 `git mv`; 잔여 mod.rs 11개는 manager/src 8 + manager/tests 1 + crates/qnn_oppkg 2 로 원 census 범위 밖, 별도 처분). 대응 설계: `arch/pipeline_stage_design_v2.md` §2.1 규칙 C.
+- **모듈 파일 스타일 = no-`mod.rs`** (Rust 모던 path 스타일, 2026-06-02 결정). 디렉토리 모듈의 루트는 `foo/mod.rs` 가 아니라 형제 `foo.rs` 다 (`foo.rs` + `foo/` 안에 서브모듈). 두 스타일 다 Rust 2024 에서 유효하나, no-`mod.rs` 가 권장 모던 관용구(`cargo new` 기본)이고 이미 top-level (`backend.rs`/`buffer.rs`/`memory.rs`/`quant.rs`)이 채택한 패턴이라 프로젝트 전역 컨벤션으로 채택한다. **신규·이동 모듈은 반드시 이 스타일.** 기존 nested `mod.rs` sweep 은 완료 — engine/src 38개(`3895e17d`, 2026-06-02 전수 `git mv`) + manager 9개(`3b9e8f7b`, 2026-06-13 — manager/src 8 + manager/tests 1). **잔여 mod.rs 2개는 `crates/qnn_oppkg` (M1 회귀 안전망 read-only crate, sweep 제외)**. 대응 설계: `arch/pipeline_stage_design_v2.md` §2.1 규칙 C.
 
 ## 에이전트 시스템
 
